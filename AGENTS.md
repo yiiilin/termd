@@ -137,7 +137,12 @@ ping/pong
 
 # 4. 代码结构约定
 
+以下结构描述目标模块边界，不表示目录在当前阶段都已经完全实现。当前已存在的 Rust crate 是
+`/proto`、`/termd`、`/termctl` 和 `/termrelay`；`/termui/frontend` 是 Web MVP，`/termui/native` 是 Flutter 架构骨架。
+
 ```text
+/proto
+
 /termd
   /session
   /pty

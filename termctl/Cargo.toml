@@ -1,0 +1,24 @@
+[package]
+name = "termctl"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+base64 = "0.22"
+clap = { version = "4.5", features = ["derive"] }
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+serde.workspace = true
+serde_json.workspace = true
+termd = { path = "../termd" }
+termd-proto = { path = "../proto" }
+thiserror.workspace = true
+tokio = { version = "1", features = ["io-std", "io-util", "macros", "rt-multi-thread", "time"] }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

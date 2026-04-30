@@ -1,0 +1,289 @@
+:root {
+  color-scheme: dark;
+  font-family: "IBM Plex Sans", "Aptos", "Segoe UI", sans-serif;
+  background: #0c1210;
+  color: #dbe8e2;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  background:
+    linear-gradient(90deg, rgba(214, 255, 95, 0.05) 1px, transparent 1px),
+    linear-gradient(180deg, rgba(214, 255, 95, 0.035) 1px, transparent 1px),
+    #0c1210;
+  background-size: 26px 26px;
+}
+
+button,
+input {
+  font: inherit;
+}
+
+button {
+  border: 1px solid #405049;
+  border-radius: 6px;
+  min-height: 34px;
+  padding: 0 11px;
+  background: #18231f;
+  color: #e4f4ed;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  cursor: pointer;
+}
+
+button:hover:not(:disabled) {
+  border-color: #d6ff5f;
+  color: #f5ffe0;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+input {
+  width: 100%;
+  border: 1px solid #34413c;
+  border-radius: 6px;
+  min-height: 34px;
+  padding: 7px 9px;
+  background: #09110f;
+  color: #e9fff5;
+}
+
+label {
+  display: grid;
+  gap: 5px;
+  color: #95aaa0;
+  font-size: 12px;
+}
+
+.app-shell {
+  height: 100%;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(280px, 340px) 1fr;
+}
+
+.sidebar {
+  border-right: 1px solid #25312d;
+  background: rgba(11, 18, 16, 0.96);
+  padding: 14px;
+  display: grid;
+  align-content: start;
+  gap: 12px;
+  overflow: auto;
+}
+
+.brand-row,
+.toolbar-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.brand-row {
+  min-height: 32px;
+  color: #d6ff5f;
+  font-weight: 700;
+  letter-spacing: 0;
+}
+
+.panel {
+  border: 1px solid #2b3934;
+  border-radius: 8px;
+  padding: 11px;
+  display: grid;
+  gap: 10px;
+  background: #101815;
+}
+
+.server-identity,
+.empty-list {
+  color: #90a59b;
+  font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.panel-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.session-list {
+  display: grid;
+  gap: 8px;
+}
+
+.session-row {
+  width: 100%;
+  min-height: 72px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-rows: auto auto;
+  align-items: center;
+  text-align: left;
+  gap: 6px 8px;
+  padding: 10px;
+  border: 1px solid #405049;
+  border-radius: 6px;
+  background: #18231f;
+  cursor: pointer;
+}
+
+.session-row.selected {
+  border-color: #d6ff5f;
+  background: #1d2a24;
+}
+
+.session-row strong,
+.status-bar,
+.toolbar,
+.terminal-role {
+  font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+}
+
+.session-row strong {
+  display: block;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.session-row span {
+  color: #9eb3aa;
+  font-size: 12px;
+}
+
+.icon-action {
+  grid-column: 1 / -1;
+  justify-self: start;
+  min-height: 30px;
+}
+
+.workspace {
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: 46px minmax(420px, 1fr) 30px;
+}
+
+.toolbar {
+  border-bottom: 1px solid #25312d;
+  background: #111a17;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 0 14px;
+  color: #bdd0c8;
+  font-size: 12px;
+}
+
+.toolbar-group {
+  min-width: 0;
+  max-width: 42vw;
+}
+
+.toolbar-group span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.toolbar button {
+  margin-left: auto;
+}
+
+.terminal-pane {
+  position: relative;
+  min-height: 0;
+  background: #08110f;
+  overflow: hidden;
+}
+
+.terminal-host {
+  position: absolute;
+  inset: 0;
+  padding: 12px;
+}
+
+.terminal-placeholder {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  color: #536760;
+  font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+}
+
+.terminal-role {
+  position: absolute;
+  right: 10px;
+  top: 10px;
+  border: 1px solid #34413c;
+  border-radius: 6px;
+  padding: 4px 7px;
+  background: rgba(8, 17, 15, 0.88);
+  color: #d6ff5f;
+  font-size: 12px;
+}
+
+.status-bar {
+  border-top: 1px solid #25312d;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 0 12px;
+  color: #92a79d;
+  background: #101815;
+  font-size: 12px;
+  overflow: hidden;
+}
+
+.status-bar span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.status-error {
+  color: #ffb3a7;
+}
+
+@media (max-width: 760px) {
+  .app-shell {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto 1fr;
+  }
+
+  .sidebar {
+    border-right: 0;
+    border-bottom: 1px solid #25312d;
+  }
+
+  .workspace {
+    grid-template-rows: 44px minmax(360px, calc(100vh - 360px)) 30px;
+  }
+
+  .toolbar-group {
+    max-width: 36vw;
+  }
+}

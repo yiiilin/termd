@@ -1,0 +1,37 @@
+# Rust 构建产物。
+/target/
+
+# 强审流程记录是本地协作审计材料，不作为仓库源码提交。
+.strict-review/
+
+# 本地 daemon / CLI 状态文件，可能包含设备身份和信任状态。
+.termd/
+.termctl-state.json
+termd-state.json
+termd-config.json
+
+# 前端依赖、构建产物和浏览器测试报告。
+node_modules/
+dist/
+test-results/
+playwright-report/
+*.tsbuildinfo
+
+# Flutter / Dart 本地生成物。
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+build/
+coverage/
+
+# 本地环境和日志。
+.env
+.env.*
+!.env.example
+*.log
+*.tmp
+
+# 系统 / 编辑器噪声。
+.DS_Store
+Thumbs.db

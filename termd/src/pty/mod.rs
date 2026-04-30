@@ -1,0 +1,326 @@
+//! termd 的 PTY 抽象层。
+//!
+//! 这个模块只负责“如何启动并驱动一个伪终端进程”。认证、控制权、relay 路由、
+//! WebSocket 协议和 E2EE 都在更外层处理，避免 PTY 后端意外承担业务权限逻辑。
+
+pub mod portable;
+
+use std::collections::BTreeMap;
+use std::error::Error;
+use std::fmt::{self, Display};
+use std::io;
+use std::path::{Path, PathBuf};
+
+/// PTY 模块统一使用的 Result 类型。
+pub type PtyResult<T> = Result<T, PtyError>;
+
+/// PTY 层错误。
+///
+/// 这里刻意保持轻量，不引入额外错误依赖；上层可以按需把它转换成 daemon 自己的错误类型。
+#[derive(Debug)]
+pub enum PtyError {
+    /// 命令规格本身不合法，例如 program 为空。
+    InvalidCommand(String),
+    /// 标准 IO 读写或等待子进程时发生错误。
+    Io(io::Error),
+    /// 具体 PTY 后端返回的错误。后端细节不泄漏到 session/auth/relay 层。
+    Backend(String),
+}
+
+impl PtyError {
+    /// 将后端错误压平为字符串，保持公共抽象不绑定具体后端错误类型。
+    pub fn backend(error: impl Display) -> Self {
+        Self::Backend(error.to_string())
+    }
+}
+
+impl Display for PtyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidCommand(message) => write!(f, "invalid PTY command: {message}"),
+            Self::Io(error) => write!(f, "PTY IO error: {error}"),
+            Self::Backend(message) => write!(f, "PTY backend error: {message}"),
+        }
+    }
+}
+
+impl Error for PtyError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            Self::InvalidCommand(_) | Self::Backend(_) => None,
+        }
+    }
+}
+
+impl From<io::Error> for PtyError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+/// 要在 PTY 中启动的命令。
+///
+/// `CommandSpec` 只描述进程启动参数，不决定默认 shell；默认 shell 应由 CLI 或集成层显式选择。
+/// 这样可以避免 PTY 模块暗中读取用户环境并影响 session 状态机的可测试性。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommandSpec {
+    program: String,
+    args: Vec<String>,
+    env: BTreeMap<String, String>,
+    cwd: Option<PathBuf>,
+}
+
+impl CommandSpec {
+    /// 创建命令规格。`program` 必须在真正启动前通过 `validate` 校验为非空。
+    pub fn new(program: impl Into<String>) -> Self {
+        Self {
+            program: program.into(),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            cwd: None,
+        }
+    }
+
+    /// 追加一个命令行参数。
+    pub fn arg(mut self, arg: impl Into<String>) -> Self {
+        self.args.push(arg.into());
+        self
+    }
+
+    /// 批量追加命令行参数。
+    pub fn args<I, S>(mut self, args: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.args.extend(args.into_iter().map(Into::into));
+        self
+    }
+
+    /// 设置或覆盖一个环境变量。
+    pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.env.insert(key.into(), value.into());
+        self
+    }
+
+    /// 设置进程工作目录。
+    pub fn cwd(mut self, cwd: impl Into<PathBuf>) -> Self {
+        self.cwd = Some(cwd.into());
+        self
+    }
+
+    /// 返回程序名。
+    pub fn program(&self) -> &str {
+        &self.program
+    }
+
+    /// 返回附加参数，不包含 argv[0]。
+    pub fn args_slice(&self) -> &[String] {
+        &self.args
+    }
+
+    /// 返回额外环境变量。
+    pub fn env_map(&self) -> &BTreeMap<String, String> {
+        &self.env
+    }
+
+    /// 返回工作目录。
+    pub fn cwd_path(&self) -> Option<&Path> {
+        self.cwd.as_deref()
+    }
+
+    /// 返回完整 argv 视图，便于测试和日志记录。
+    pub fn argv(&self) -> Vec<&str> {
+        std::iter::once(self.program.as_str())
+            .chain(self.args.iter().map(String::as_str))
+            .collect()
+    }
+
+    /// 校验命令最小合法性。更复杂的路径解析交给具体后端或系统完成。
+    pub fn validate(&self) -> PtyResult<()> {
+        if self.program.trim().is_empty() {
+            return Err(PtyError::InvalidCommand(
+                "program must not be empty".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+/// 终端尺寸。
+///
+/// rows/cols 是字符网格尺寸；pixel_width/pixel_height 仅作为终端渲染提示，
+/// 有些平台会忽略它们。协议层和 UI 层可以传入这些值，但 PTY 模块不解释 UI 语义。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PtySize {
+    pub rows: u16,
+    pub cols: u16,
+    pub pixel_width: u16,
+    pub pixel_height: u16,
+}
+
+impl PtySize {
+    /// 常见终端默认行数。
+    pub const DEFAULT_ROWS: u16 = 24;
+    /// 常见终端默认列数。
+    pub const DEFAULT_COLS: u16 = 80;
+
+    /// 使用字符网格尺寸构造 PTY size，像素尺寸默认为 0。
+    pub const fn new(rows: u16, cols: u16) -> Self {
+        Self {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        }
+    }
+
+    /// 使用完整尺寸构造 PTY size。
+    pub const fn with_pixels(rows: u16, cols: u16, pixel_width: u16, pixel_height: u16) -> Self {
+        Self {
+            rows,
+            cols,
+            pixel_width,
+            pixel_height,
+        }
+    }
+}
+
+impl Default for PtySize {
+    fn default() -> Self {
+        Self::new(Self::DEFAULT_ROWS, Self::DEFAULT_COLS)
+    }
+}
+
+/// 子进程退出状态的后端无关表示。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PtyExitStatus {
+    pub exit_code: u32,
+    pub signal: Option<String>,
+}
+
+impl PtyExitStatus {
+    /// 构造正常退出状态。
+    pub fn exited(exit_code: u32) -> Self {
+        Self {
+            exit_code,
+            signal: None,
+        }
+    }
+
+    /// 构造被信号终止的状态。
+    pub fn signaled(signal: impl Into<String>) -> Self {
+        Self {
+            exit_code: 1,
+            signal: Some(signal.into()),
+        }
+    }
+
+    /// 判断进程是否成功退出。
+    pub fn success(&self) -> bool {
+        self.signal.is_none() && self.exit_code == 0
+    }
+}
+
+/// PTY 后端接口。
+///
+/// session manager 只依赖这个 trait，就可以在测试里替换成 fake backend，
+/// 并把真实 `portable-pty` 的平台差异限制在适配层。
+pub trait PtyBackend: Send + Sync {
+    /// 启动一个 PTY session。
+    fn spawn(&self, command: &CommandSpec, size: PtySize) -> PtyResult<Box<dyn PtySession>>;
+}
+
+/// 运行中的 PTY session。
+///
+/// 这里暴露 daemon 内核需要的最小操作：读输出、写输入、resize、终止和等待退出。
+/// 控制权判断必须由 session/control 层在调用写入前完成，PTY 层不识别 controller/viewer。
+pub trait PtySession: Send {
+    /// 从 PTY 输出流读取数据；调用方负责选择阻塞线程或异步桥接方式。
+    fn read(&mut self, buffer: &mut [u8]) -> PtyResult<usize>;
+
+    /// 写入用户输入或控制序列。调用前应由 session 层确认当前设备具备控制权。
+    fn write_all(&mut self, bytes: &[u8]) -> PtyResult<()>;
+
+    /// 调整 PTY 尺寸。
+    fn resize(&mut self, size: PtySize) -> PtyResult<()>;
+
+    /// 请求终止 PTY 子进程。
+    fn terminate(&mut self) -> PtyResult<()>;
+
+    /// 非阻塞检查子进程是否退出。
+    fn try_wait(&mut self) -> PtyResult<Option<PtyExitStatus>>;
+
+    /// 阻塞等待子进程退出。
+    fn wait(&mut self) -> PtyResult<PtyExitStatus>;
+
+    /// 返回本地子进程 id；不适用的平台可以返回 None。
+    fn process_id(&self) -> Option<u32>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn command_spec_builds_program_args_env_and_cwd() {
+        let command = CommandSpec::new("ssh")
+            .args(["-tt", "example.com"])
+            .arg("tmux")
+            .env("TERM", "xterm-256color")
+            .env("LANG", "C.UTF-8")
+            .cwd("/tmp");
+
+        assert_eq!(command.program(), "ssh");
+        assert_eq!(command.args_slice(), ["-tt", "example.com", "tmux"]);
+        assert_eq!(command.argv(), ["ssh", "-tt", "example.com", "tmux"]);
+        assert_eq!(
+            command.env_map().get("TERM").map(String::as_str),
+            Some("xterm-256color")
+        );
+        assert_eq!(
+            command.env_map().get("LANG").map(String::as_str),
+            Some("C.UTF-8")
+        );
+        assert_eq!(command.cwd_path(), Some(Path::new("/tmp")));
+        assert!(command.validate().is_ok());
+    }
+
+    #[test]
+    fn command_spec_rejects_empty_program() {
+        let command = CommandSpec::new("   ");
+
+        assert!(matches!(
+            command.validate(),
+            Err(PtyError::InvalidCommand(_))
+        ));
+    }
+
+    #[test]
+    fn pty_size_uses_reasonable_defaults() {
+        let size = PtySize::default();
+
+        assert_eq!(size.rows, 24);
+        assert_eq!(size.cols, 80);
+        assert_eq!(size.pixel_width, 0);
+        assert_eq!(size.pixel_height, 0);
+    }
+
+    #[test]
+    fn pty_size_can_include_pixels_without_ui_coupling() {
+        let size = PtySize::with_pixels(40, 120, 960, 640);
+
+        assert_eq!(
+            size,
+            PtySize {
+                rows: 40,
+                cols: 120,
+                pixel_width: 960,
+                pixel_height: 640,
+            }
+        );
+    }
+}

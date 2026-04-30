@@ -1,0 +1,24 @@
+[package]
+name = "termrelay"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+axum = { version = "0.7", features = ["ws", "json"] }
+base64 = "0.22"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+serde.workspace = true
+serde_json.workspace = true
+termd-proto = { path = "../proto" }
+thiserror.workspace = true
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+termd = { path = "../termd" }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect"] }
