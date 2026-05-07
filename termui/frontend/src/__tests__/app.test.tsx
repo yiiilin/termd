@@ -47,6 +47,29 @@ describe("termui web 工作台", () => {
     expect(daemon.outerWireText()).not.toContain("secret-token");
   });
 
+  it("粘贴 QR payload 后会切换到 payload 内的 ws_url 和 token", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    const payload = JSON.stringify({
+      type: "termd_pairing_qr",
+      version: 1,
+      ws_url: daemon.url,
+      token: "secret-token",
+      server_id: daemon.serverId,
+      expires_at_ms: Date.now() + 60_000,
+    });
+
+    await user.clear(await screen.findByLabelText("WS URL"));
+    fireEvent.change(screen.getByLabelText("Pairing token"), { target: { value: payload } });
+    await user.click(screen.getByRole("button", { name: "Pair" }));
+
+    await waitFor(() => expect(screen.getByLabelText("Pairing token")).toHaveValue(""));
+    expect(await screen.findByLabelText("WS URL")).toHaveValue(daemon.url);
+    await screen.findByText(daemon.serverId);
+    expect(daemon.outerWireText()).not.toContain("secret-token");
+  });
+
   it("pairing 失败后清空 token，错误 UI 和 outer wire 都不泄漏敏感字段", async () => {
     const user = userEvent.setup();
     await daemon.stop();

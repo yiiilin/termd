@@ -17,6 +17,10 @@ pub enum TermctlError {
     MissingPairing,
     #[error("device is not paired with this daemon")]
     NotPaired,
+    #[error("pairing payload is invalid")]
+    InvalidPairingPayload,
+    #[error("pairing payload server_id does not match daemon")]
+    PairingPayloadServerMismatch,
     #[error("failed to read local state")]
     StateRead,
     #[error("failed to write local state")]
@@ -52,6 +56,8 @@ impl TermctlError {
             Self::InvalidSize => "invalid_size",
             Self::MissingPairing => "missing_pairing",
             Self::NotPaired => "not_paired",
+            Self::InvalidPairingPayload => "invalid_pairing_payload",
+            Self::PairingPayloadServerMismatch => "pairing_payload_server_mismatch",
             Self::StateRead => "state_read_failed",
             Self::StateWrite => "state_write_failed",
             Self::InvalidDeviceKey => "invalid_device_key",
@@ -74,6 +80,10 @@ impl TermctlError {
             Self::InvalidSize => "rows and cols must be positive",
             Self::MissingPairing => "run termctl pair before session commands",
             Self::NotPaired => "this daemon is not in local paired state",
+            Self::InvalidPairingPayload => "pairing payload JSON is invalid",
+            Self::PairingPayloadServerMismatch => {
+                "pairing payload does not match the connected daemon"
+            }
             Self::StateRead => "failed to read local state",
             Self::StateWrite => "failed to write local state",
             Self::InvalidDeviceKey => "local device signing key is invalid",
@@ -98,6 +108,7 @@ impl TermctlError {
         match self {
             Self::InvalidSessionId | Self::InvalidSize => 2,
             Self::MissingPairing | Self::NotPaired | Self::InvalidDeviceKey => 3,
+            Self::InvalidPairingPayload | Self::PairingPayloadServerMismatch => 2,
             Self::Protocol { code, .. } if code == "auth_failed" => 4,
             Self::Protocol { .. }
             | Self::InvalidEnvelope

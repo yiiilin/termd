@@ -16,8 +16,8 @@ use crate::crypto;
 use crate::error::{Result, TermctlError};
 use crate::state::{TermctlState, resolve_state_path};
 use termd_proto::{
-    AttachRole, ErrorPayload, MessageType, SessionDataPayload, SessionId, SessionState,
-    TerminalSize,
+    AttachRole, ErrorPayload, MessageType, PairingQrPayload, ServerId, SessionDataPayload,
+    SessionId, SessionState, TerminalSize,
 };
 
 pub const DEFAULT_URL: &str = "ws://127.0.0.1:8765/ws";
@@ -53,8 +53,10 @@ pub enum Command {
 
 #[derive(Debug, Args)]
 pub struct PairArgs {
+    #[arg(long, required_unless_present = "payload", conflicts_with = "payload")]
+    pub token: Option<String>,
     #[arg(long)]
-    pub token: String,
+    pub payload: Option<String>,
     #[arg(long, default_value = DEFAULT_URL)]
     pub url: String,
 }
@@ -105,20 +107,73 @@ pub async fn run(cli: Cli) -> Result<()> {
 }
 
 async fn pair(args: PairArgs, state_path: PathBuf) -> Result<()> {
+    let input = PairingInput::from_args(args)?;
     let mut state = TermctlState::load(&state_path)?;
     let device = state.ensure_device();
-    let mut client = DirectClient::connect(&args.url, device.device_id).await?;
+    let mut client = DirectClient::connect(&input.url, device.device_id).await?;
+    if let Some(expected_server_id) = input.server_id {
+        if client.server_id() != expected_server_id {
+            drop(client);
+            return Err(TermctlError::PairingPayloadServerMismatch);
+        }
+    }
     let accepted = client
-        .pair(device.device_public_key.clone(), args.token)
+        .pair(device.device_public_key.clone(), input.token)
         .await?;
 
-    state.record_pairing(accepted.clone(), args.url);
+    state.record_pairing(accepted.clone(), input.url);
     state.save(&state_path)?;
     println!(
         "paired server={} device={}",
         accepted.server_id.0, accepted.device_id.0
     );
     Ok(())
+}
+
+struct PairingInput {
+    token: String,
+    url: String,
+    server_id: Option<ServerId>,
+}
+
+impl PairingInput {
+    fn from_args(args: PairArgs) -> Result<Self> {
+        if let Some(raw_payload) = args.payload {
+            let payload = parse_pairing_payload(&raw_payload)?;
+            return Ok(Self {
+                token: payload.token.0,
+                url: payload.ws_url,
+                server_id: Some(payload.server_id),
+            });
+        }
+
+        let token = args.token.ok_or(TermctlError::InvalidPairingPayload)?;
+        Ok(Self {
+            token,
+            url: args.url,
+            server_id: None,
+        })
+    }
+}
+
+fn parse_pairing_payload(raw_payload: &str) -> Result<PairingQrPayload> {
+    let payload: PairingQrPayload = serde_json::from_str(raw_payload.trim())
+        .map_err(|_| TermctlError::InvalidPairingPayload)?;
+
+    if !payload.is_supported_version()
+        || payload.token.0.is_empty()
+        || !is_supported_ws_url(&payload.ws_url)
+    {
+        return Err(TermctlError::InvalidPairingPayload);
+    }
+
+    Ok(payload)
+}
+
+fn is_supported_ws_url(value: &str) -> bool {
+    (value.starts_with("ws://") || value.starts_with("wss://"))
+        && !value.chars().any(char::is_whitespace)
+        && !value.contains('#')
 }
 
 async fn new_session(args: NewArgs, state_path: PathBuf) -> Result<()> {
@@ -346,8 +401,28 @@ mod tests {
 
         match cli.command {
             Command::Pair(args) => {
-                assert_eq!(args.token, "termd-pair-redacted");
+                assert_eq!(args.token.as_deref(), Some("termd-pair-redacted"));
+                assert_eq!(args.payload, None);
                 assert_eq!(args.url, DEFAULT_URL);
+            }
+            _ => panic!("expected pair command"),
+        }
+    }
+
+    #[test]
+    fn parses_pair_command_with_payload() {
+        let cli = Cli::try_parse_from([
+            "termctl",
+            "pair",
+            "--payload",
+            "{\"type\":\"termd_pairing_qr\",\"version\":1,\"ws_url\":\"wss://relay.example/ws/00000000-0000-0000-0000-000000000001/client\",\"token\":\"pair-token\",\"server_id\":\"00000000-0000-0000-0000-000000000001\",\"expires_at_ms\":1710000060000}",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Command::Pair(args) => {
+                assert_eq!(args.token, None);
+                assert!(args.payload.is_some());
             }
             _ => panic!("expected pair command"),
         }

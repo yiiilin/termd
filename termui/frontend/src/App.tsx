@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Cable, Link, RefreshCcw, ShieldCheck, Unplug } from "lucide-react";
 import { DirectClient, ProtocolClientError } from "./protocol/direct-client";
 import { toSafeError } from "./protocol/errors";
+import { parsePairingQrPayload } from "./protocol/pairing-payload";
 import type {
   AttachRole,
   BrowserState,
@@ -61,15 +62,24 @@ export default function App() {
   const handlePair = useCallback(async () => {
     setError(undefined);
     setStatus("pairing");
-    const token = pairingToken.trim();
     try {
       const device = await ensureDevice();
-      const client = await DirectClient.connect(url.trim(), device.device_id);
+      const payload = parsePairingQrPayload(pairingToken);
+      const effectiveUrl = payload?.ws_url ?? url.trim();
+      const token = payload?.token ?? pairingToken.trim();
+      const client = await DirectClient.connect(effectiveUrl, device.device_id);
+      if (payload && client.serverId !== payload.server_id) {
+        client.close();
+        throw new ProtocolClientError("pairing_payload_server_mismatch", "pairing payload does not match the connected daemon");
+      }
       const accepted = await client.pair(token, device.device_public_key);
       client.close();
-      const nextState = await recordPairing(accepted, url.trim());
+      const nextState = await recordPairing(accepted, effectiveUrl);
       setState(nextState);
       setPairingToken("");
+      if (payload) {
+        setUrl(effectiveUrl);
+      }
       setStatus("paired");
     } catch (caught) {
       setPairingToken("");

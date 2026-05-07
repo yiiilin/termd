@@ -3,9 +3,11 @@ import {
   ALL_MESSAGE_TYPES,
   type AttachRole,
   type Envelope,
+  type PairingQrPayload,
   type MessageType,
   type SessionState,
 } from "../protocol/types";
+import { parsePairingQrPayload } from "../protocol/pairing-payload";
 import { envelope } from "../protocol/wire";
 
 describe("协议类型", () => {
@@ -62,5 +64,27 @@ describe("协议类型", () => {
     const raw = JSON.stringify(message);
 
     expect(raw).toBe('{"type":"session_list","payload":{}}');
+  });
+
+  it("QR pairing payload 只在有效 JSON 且带 ws_url/token/server_id 时被识别", () => {
+    const payload: PairingQrPayload = {
+      type: "termd_pairing_qr",
+      version: 1,
+      ws_url: "wss://relay.example/ws/00000000-0000-0000-0000-000000000001/client",
+      token: "pair-token",
+      server_id: "00000000-0000-0000-0000-000000000001",
+      expires_at_ms: 1710000060000,
+    };
+
+    expect(parsePairingQrPayload(JSON.stringify(payload))).toEqual(payload);
+    expect(parsePairingQrPayload("plain-token")).toBeUndefined();
+    expect(
+      parsePairingQrPayload(
+        JSON.stringify({
+          ...payload,
+          ws_url: "http://not-supported",
+        }),
+      ),
+    ).toBeUndefined();
   });
 });

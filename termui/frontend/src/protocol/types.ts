@@ -72,6 +72,15 @@ export interface PairAcceptPayload {
   expires_at_ms: UnixTimestampMillis;
 }
 
+export interface PairingQrPayload {
+  type: "termd_pairing_qr";
+  version: 1;
+  ws_url: string;
+  token: string;
+  server_id: UUID;
+  expires_at_ms: UnixTimestampMillis;
+}
+
 export interface AuthChallengePayload {
   device_id: UUID;
   challenge: Challenge;

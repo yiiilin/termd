@@ -4,6 +4,7 @@
 //! 规则都由协议核心执行，避免网络框架层夹带业务判断。
 
 use std::net::{AddrParseError, SocketAddr};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -13,6 +14,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::{SinkExt, StreamExt};
+use rustls::pki_types::pem::PemObject;
 use serde::Serialize;
 use termd_proto::{
     ErrorPayload, MessageType, PairingToken, ProtocolVersion, ServerId, UnixTimestampMillis,
@@ -42,6 +44,40 @@ pub enum ServerError {
     Bind(#[source] std::io::Error),
     #[error("daemon HTTP server failed")]
     Serve(#[source] std::io::Error),
+    #[error("failed to load TLS certificate chain")]
+    TlsCertificate(#[source] std::io::Error),
+    #[error("failed to load TLS private key")]
+    TlsPrivateKey(#[source] std::io::Error),
+    #[error("TLS private key is missing")]
+    MissingTlsPrivateKey,
+    #[error("TLS configuration is invalid")]
+    TlsConfig,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct TlsPaths {
+    pub cert_path: PathBuf,
+    pub key_path: PathBuf,
+}
+
+impl TlsPaths {
+    pub fn new(cert_path: impl Into<PathBuf>, key_path: impl Into<PathBuf>) -> Self {
+        Self {
+            cert_path: cert_path.into(),
+            key_path: key_path.into(),
+        }
+    }
+}
+
+impl std::fmt::Debug for TlsPaths {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // 证书路径可用于排障；私钥路径按敏感启动材料处理，不进入 Debug 输出。
+        formatter
+            .debug_struct("TlsPaths")
+            .field("cert_path", &self.cert_path)
+            .field("key_path_configured", &true)
+            .finish()
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -86,6 +122,17 @@ pub async fn serve(
     serve_listener(listener, protocol).await
 }
 
+pub async fn serve_tls(
+    config: DaemonConfig,
+    protocol: SharedDaemonProtocol,
+    tls_paths: TlsPaths,
+) -> Result<(), ServerError> {
+    let addr: SocketAddr = format!("{}:{}", config.listen_host, config.listen_port).parse()?;
+    let listener = TcpListener::bind(addr).await.map_err(ServerError::Bind)?;
+
+    serve_tls_listener(listener, protocol, tls_paths).await
+}
+
 /// 使用调用方已经绑定好的 listener 启动 daemon HTTP 服务。
 ///
 /// 该函数只服务网络启动边界，方便集成测试使用随机端口；auth、session 和 E2EE 语义仍全部
@@ -100,6 +147,98 @@ pub async fn serve_listener(
     )
     .await
     .map_err(ServerError::Serve)
+}
+
+pub async fn serve_tls_listener(
+    listener: TcpListener,
+    protocol: SharedDaemonProtocol,
+    tls_paths: TlsPaths,
+) -> Result<(), ServerError> {
+    let tls_config = load_rustls_server_config(&tls_paths)?;
+
+    // TLS 只替换 transport accept 层；router 和协议状态机保持同一套路径与 E2EE 规则。
+    serve_rustls_listener(listener, router(protocol), tls_config).await
+}
+
+fn load_rustls_server_config(tls_paths: &TlsPaths) -> Result<rustls::ServerConfig, ServerError> {
+    let certs = rustls::pki_types::CertificateDer::pem_file_iter(&tls_paths.cert_path)
+        .map_err(io_error_for_tls_cert)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(io_error_for_tls_cert)?;
+    let key = rustls::pki_types::PrivateKeyDer::from_pem_file(&tls_paths.key_path)
+        .map_err(io_error_for_tls_key)?;
+
+    rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|_| ServerError::TlsConfig)
+}
+
+fn io_error_for_tls_cert(error: rustls::pki_types::pem::Error) -> ServerError {
+    ServerError::TlsCertificate(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
+fn io_error_for_tls_key(error: rustls::pki_types::pem::Error) -> ServerError {
+    match error {
+        rustls::pki_types::pem::Error::NoItemsFound => ServerError::MissingTlsPrivateKey,
+        other => {
+            ServerError::TlsPrivateKey(std::io::Error::new(std::io::ErrorKind::InvalidData, other))
+        }
+    }
+}
+
+async fn serve_rustls_listener(
+    listener: TcpListener,
+    router: Router,
+    tls_config: rustls::ServerConfig,
+) -> Result<(), ServerError> {
+    use axum::extract::connect_info::IntoMakeServiceWithConnectInfo;
+    use axum_core::{body::Body, extract::Request};
+    use hyper::body::Incoming;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use hyper_util::{server::conn::auto::Builder, service::TowerToHyperService};
+    use std::convert::Infallible;
+    use std::future::poll_fn;
+    use std::sync::Arc;
+    use tokio_rustls::TlsAcceptor;
+    use tower::ServiceExt as _;
+    use tower_service::Service;
+
+    let acceptor = TlsAcceptor::from(Arc::new(tls_config));
+    let mut make_service: IntoMakeServiceWithConnectInfo<_, SocketAddr> =
+        router.into_make_service_with_connect_info::<SocketAddr>();
+
+    loop {
+        let (tcp_stream, remote_addr) = listener.accept().await.map_err(ServerError::Serve)?;
+        let acceptor = acceptor.clone();
+
+        poll_fn(|cx| Service::<SocketAddr>::poll_ready(&mut make_service, cx))
+            .await
+            .unwrap_or_else(|error: Infallible| match error {});
+        let service = make_service
+            .call(remote_addr)
+            .await
+            .unwrap_or_else(|error: Infallible| match error {})
+            .map_request(|req: Request<Incoming>| req.map(Body::new));
+
+        tokio::spawn(async move {
+            let tls_stream = match acceptor.accept(tcp_stream).await {
+                Ok(stream) => stream,
+                Err(error) => {
+                    warn!(%error, "TLS handshake failed");
+                    return;
+                }
+            };
+            let io = TokioIo::new(tls_stream);
+            let hyper_service = TowerToHyperService::new(service);
+            if let Err(error) = Builder::new(TokioExecutor::new())
+                .serve_connection_with_upgrades(io, hyper_service)
+                .await
+            {
+                warn!(%error, "TLS HTTP/WebSocket connection failed");
+            }
+        });
+    }
 }
 
 async fn healthz(State(protocol): State<SharedDaemonProtocol>) -> Json<HealthzPayload> {
@@ -292,11 +431,14 @@ async fn send_envelope(
 mod tests {
     use super::*;
     use serde::Deserialize;
+    use std::fs;
     use std::io::{Read, Write};
+    use std::path::PathBuf;
     use termd_proto::{
         DeviceId, E2eeKeyExchangePayload, PairAcceptPayload, PairRequestPayload, PublicKey,
         UnixTimestampMillis,
     };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use crate::auth::current_unix_timestamp_millis;
     use crate::net::protocol::{
@@ -370,6 +512,54 @@ mod tests {
         ))));
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tls_listener_serves_healthz_without_touching_protocol_payloads() {
+        let (cert_path, key_path) = write_test_tls_files("healthz");
+        let tls_paths = TlsPaths::new(&cert_path, &key_path);
+        let protocol = default_protocol(DaemonConfig::default());
+        let server_id = {
+            protocol
+                .lock()
+                .expect("daemon protocol mutex poisoned")
+                .server_id()
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_protocol = protocol.clone();
+        let server = tokio::spawn(async move {
+            let _ = serve_tls_listener(listener, server_protocol, tls_paths).await;
+        });
+
+        let response = tls_healthz_request(addr, &cert_path).await;
+        server.abort();
+        fs::remove_file(cert_path).ok();
+        fs::remove_file(key_path).ok();
+
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.contains("\"status\":\"ok\""));
+        assert!(response.contains(&server_id.0.to_string()));
+    }
+
+    #[test]
+    fn tls_paths_debug_and_invalid_key_errors_do_not_leak_key_material() {
+        let (cert_path, key_path) = write_test_tls_files("invalid-key");
+        fs::write(&key_path, "not a private key\n").unwrap();
+        let tls_paths = TlsPaths::new(&cert_path, &key_path);
+
+        let error = load_rustls_server_config(&tls_paths).unwrap_err();
+        let rendered_error = error.to_string();
+        let rendered_paths = format!("{tls_paths:?}");
+
+        assert!(matches!(
+            error,
+            ServerError::MissingTlsPrivateKey | ServerError::TlsPrivateKey(_)
+        ));
+        assert!(!rendered_paths.contains("termd-test-tls-invalid-key-key"));
+        assert!(!rendered_error.contains("not a private key"));
+        fs::remove_file(cert_path).ok();
+        fs::remove_file(key_path).ok();
+    }
+
     fn post_pairing_token(addr: SocketAddr) -> RawHttpResponse {
         let mut stream = std::net::TcpStream::connect(addr).unwrap();
         let request = format!(
@@ -395,6 +585,100 @@ mod tests {
             body: body.to_owned(),
         }
     }
+
+    async fn tls_healthz_request(addr: SocketAddr, cert_path: &PathBuf) -> String {
+        let mut root_store = rustls::RootCertStore::empty();
+        let certs = rustls::pki_types::CertificateDer::pem_file_iter(cert_path)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        for cert in certs {
+            root_store.add(cert).unwrap();
+        }
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config));
+        let server_name = rustls::pki_types::ServerName::try_from("localhost")
+            .unwrap()
+            .to_owned();
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut stream = connector.connect(server_name, tcp).await.unwrap();
+        let request = format!(
+            "GET /healthz HTTP/1.1\r\nHost: localhost:{port}\r\nConnection: close\r\n\r\n",
+            port = addr.port()
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        String::from_utf8(response).unwrap()
+    }
+
+    fn write_test_tls_files(name: &str) -> (PathBuf, PathBuf) {
+        let cert_path = std::env::temp_dir().join(format!(
+            "termd-test-tls-{name}-cert-{}-{}.pem",
+            std::process::id(),
+            current_unix_timestamp_millis().0
+        ));
+        let key_path = std::env::temp_dir().join(format!(
+            "termd-test-tls-{name}-key-{}-{}.pem",
+            std::process::id(),
+            current_unix_timestamp_millis().0
+        ));
+        fs::write(&cert_path, TEST_TLS_CERT_PEM).unwrap();
+        fs::write(&key_path, TEST_TLS_KEY_PEM).unwrap();
+        (cert_path, key_path)
+    }
+
+    const TEST_TLS_CERT_PEM: &str = r#"-----BEGIN CERTIFICATE-----
+MIIDHzCCAgegAwIBAgIUFT0JPphPVviedOwVfBgtvRlWaBswDQYJKoZIhvcNAQEL
+BQAwFDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MDUwNzAzNDYxM1oXDTM2MDUw
+NDAzNDYxM1owFDESMBAGA1UEAwwJbG9jYWxob3N0MIIBIjANBgkqhkiG9w0BAQEF
+AAOCAQ8AMIIBCgKCAQEAp1LIkvOYe7VEamUgwSGpS3K9bH7DTl7sZXZLK4H4S3Ik
+/68PSKWs8k+J079wrdq7Pft2u+NMACqwWK4uO30NetgQPGLB+awxqgLXyxyouTNp
+XSX30gkxG1WhRWLq0JTtHZM86cFH3wZkrNIM6vzCGh5F/azICCkMyfoUJOkNezk2
+T3nagv4/BeT/IDVNMEjRstwDGuuyOcKnvzUGtgwvvYbXuHmn956vAc7As3jAQNm1
+eTFcg4FHzwDT5ZCYbeXeHGVtF+t+MXpbU9fbYncwLQNznni3Ngvg39XsEpsh17/I
+shjHxjyJPs8Wx/TerRJ/frLcxvdFse044YcMZIQ9zQIDAQABo2kwZzAdBgNVHQ4E
+FgQUVgawzOdJe6rn6Qc8o7sGNCOSJZcwHwYDVR0jBBgwFoAUVgawzOdJe6rn6Qc8
+o7sGNCOSJZcwGgYDVR0RBBMwEYIJbG9jYWxob3N0hwR/AAABMAkGA1UdEwQCMAAw
+DQYJKoZIhvcNAQELBQADggEBAEm25sfAoFRwcXTGJOfhEo9GM6JDESMxulolgR+4
+IiwniOYUXvK5e51mszNzxu4AsG9OO4+myqEE0AXrhgG7kjFvUWwOVQ4wgwCUUfbj
+qRpnH5SRYaKqQMJviz7adU0biGyRBN7+6YChZW8XEEE7+lGpDw979URChb/shtX7
+Yb9UYaOsqvLRh+MHXMfZMPTawI1o5x6oar1a6D3SswB9omWPQABuFXeJeZcK4B/0
+PEx176/dWuU6shATtBw9s3r4pJTJ5H+9awx7xyS9WYiVyt9SRxppJiwAPU9mS1Sa
+T+luYJ3JUrIbrKq4qET6e3ut8nJZcnJbryvWVpegnuNiH6k=
+-----END CERTIFICATE-----"#;
+
+    const TEST_TLS_KEY_PEM: &str = r#"-----BEGIN PRIVATE KEY-----
+MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQCnUsiS85h7tURq
+ZSDBIalLcr1sfsNOXuxldksrgfhLciT/rw9IpazyT4nTv3Ct2rs9+3a740wAKrBY
+ri47fQ162BA8YsH5rDGqAtfLHKi5M2ldJffSCTEbVaFFYurQlO0dkzzpwUffBmSs
+0gzq/MIaHkX9rMgIKQzJ+hQk6Q17OTZPedqC/j8F5P8gNU0wSNGy3AMa67I5wqe/
+NQa2DC+9hte4eaf3nq8BzsCzeMBA2bV5MVyDgUfPANPlkJht5d4cZW0X634xeltT
+19tidzAtA3OeeLc2C+Df1ewSmyHXv8iyGMfGPIk+zxbH9N6tEn9+stzG90Wx7Tjh
+hwxkhD3NAgMBAAECggEABMD/Xd156Zne1b8FzTbtnm0mIJ0BY4qi4McZn6TTryER
+GAqbPo8meMP1wIRh6S6bv0kTuIbes+qClCJuwdXtuh3FaFHN/Q/9YT0vcF/iE1D4
+n2LixZ7pPEOUj2oeDcsNaZezVVjed+GwnpBhOZPw19kgV/K+xCyWZm6qf9n3Phb4
+Pg9ODsq3+45cjk10Qvk+VWva1xcw8qHOpHbTLguZ3e13rL9HXbaZAfFvKGpDhzpX
+m7dZ7jOqnpZt9oll8Ean2SIOfhQdACcsuz+FDIYVj1PufA3WlOeGq4gAfoBKGUNb
+OFp49W0MHhSH/kmwhz9lF83okXqYJtZtxXGMiQOhKQKBgQDf4E2/BbcePEhdnMkq
+wTygBN+eEyZcN5nPnNZZ8wefaLSoO3BMbkjyjr0kPQnN/FCFMWr2Rs0ga3kCN/rr
+985D+DwObOSXtYBa16+w0bHoKOrxs27tX1Vnaj2djeTZggK/2k5l5YTcxrL+dSQI
+LnYowViOacuaxcqy0nzRxQamowKBgQC/VRyxVh/5tB3aV2zhwZuM4RrhdpSpExql
+Ohc7FAcM9X8ywjLc6ZSbGnd5j894P+EQpoJBLVxTExgasCWxuwdck4nv1dboGPZO
+PodEIcz4FGOZ177oiJsJH/xkuNlliyh7i/Cyu97IXIXzFupMVEaAGIGTd2h8zhU9
+wiQUUwaAzwKBgG8P14HsU+ur/Dp0jVeohWrdABJrbZxR+PwF0lDNP/rU9sp+sjc4
+fvfV1/8iSLrncQqieW2zsg9jQaTYIKLvTGRrwV9mpgCdChAG8CHH5XpG0kcVvPIF
+WVj0W5zNx7ofxT1oD3x9YGwmJqYVdsqYQgX15PjBg0BE30nXIhTuqV4BAoGAcWdF
+BmcBtMLpHszKoFRcmfeiMxhRrJTCKkRwGHgaZbfsmG06MG3RwszBG6/9TEywXWoT
+sgXsvuCGXOsirGEqT9iy3RBlvFNvSZkOG3fdQPz0u+6AHNs66QGoWxqk3+bHK9MZ
+6xYnSaJtUlO2s18QGkRsKLeRmsebF2vGbrV3GUkCgYAT5lgVHUx435Zy9mOgWCEl
+4OLdzEEZm8OmMiRDzgxHs0Nx4zCUYZRf5HaHUhz936R8Ez0DVCj1GAdQjkV1kCEI
+joi6qSEnJBpLL35fFZfHkF1jBOfv8otRgWJuJwyit3B7LR89GAw2VgZWu03QugPN
+zZZR5LzKVu9X7paftR7K8Q==
+-----END PRIVATE KEY-----"#;
 
     fn pair_device_with_http_token(
         protocol: SharedDaemonProtocol,

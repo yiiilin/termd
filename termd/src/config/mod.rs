@@ -1,15 +1,19 @@
 //! termd daemon 的本地配置文件存储。
 //!
-//! 本模块只保存单机 daemon 的本地启动配置：监听地址、状态文件路径、默认 shell/command
-//! 和 pairing token 默认 TTL。它不是用户配置中心，也不表达 RBAC、多用户 profile 或企业策略。
+//! 本模块只保存单机 daemon 的本地启动配置：监听地址、状态文件路径、默认 shell/command、
+//! pairing token 默认 TTL，以及 relay 连接所需的生产基线参数。它不是用户配置中心，
+//! 也不表达 RBAC、多用户 profile 或企业策略。
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use std::collections::HashSet;
 use std::error::Error;
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use crate::net::relay::RelayBaseUrl;
 
 /// 当前配置 JSON 的 schema 版本。
 ///
@@ -28,7 +32,108 @@ pub const DEFAULT_LISTEN_PORT: u16 = 8765;
 /// pairing token 的默认有效期：5 分钟。
 pub const DEFAULT_PAIRING_TOKEN_TTL_MS: u64 = 5 * 60 * 1000;
 
+/// daemon 主动连接 relay 的默认初始退避。
+pub const DEFAULT_RELAY_RECONNECT_INITIAL_DELAY_MS: u64 = 250;
+
+/// daemon 主动连接 relay 的默认最大退避。
+pub const DEFAULT_RELAY_RECONNECT_MAX_DELAY_MS: u64 = 5_000;
+
+/// relay mux socket 的默认心跳间隔。
+pub const DEFAULT_RELAY_HEARTBEAT_INTERVAL_MS: u64 = 15_000;
+
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// 本地配置中的敏感字符串。
+///
+/// 配置文件仍需要能保存 relay 凭证，但 Debug 输出必须脱敏，避免未来日志中误打印明文。
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SecretString(String);
+
+impl SecretString {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn expose_secret(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for SecretString {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SecretString(\"<redacted>\")")
+    }
+}
+
+/// daemon 主动连接 relay 时使用的重连与心跳策略。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayReconnectConfig {
+    pub initial_delay_ms: u64,
+    pub max_delay_ms: u64,
+    pub heartbeat_interval_ms: u64,
+}
+
+impl Default for RelayReconnectConfig {
+    fn default() -> Self {
+        Self {
+            initial_delay_ms: DEFAULT_RELAY_RECONNECT_INITIAL_DELAY_MS,
+            max_delay_ms: DEFAULT_RELAY_RECONNECT_MAX_DELAY_MS,
+            heartbeat_interval_ms: DEFAULT_RELAY_HEARTBEAT_INTERVAL_MS,
+        }
+    }
+}
+
+/// relay endpoint 规范化后的错误。
+///
+/// 这个错误只用于把本地配置和 CLI 中的 relay endpoint 列表收敛成稳定的 canonical 形式。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RelayEndpointError {
+    Empty,
+    Invalid { endpoint: String },
+}
+
+impl fmt::Display for RelayEndpointError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => write!(f, "relay endpoint cannot be empty"),
+            Self::Invalid { endpoint } => write!(
+                f,
+                "invalid relay endpoint `{endpoint}`; expected ws://host:port or wss://host:port"
+            ),
+        }
+    }
+}
+
+impl Error for RelayEndpointError {}
+
+/// 把 relay endpoint 列表收敛成 canonical、去重后的顺序列表。
+///
+/// 这个 helper 只保留 `ws://host:port` / `wss://host:port` 级别的公开 endpoint，不会把
+/// query、fragment 或空值混进最终 supervisor 列表。
+pub fn normalize_relay_endpoints(
+    endpoints: impl IntoIterator<Item = String>,
+) -> Result<Vec<String>, RelayEndpointError> {
+    let mut normalized = Vec::new();
+    let mut seen = HashSet::new();
+
+    for endpoint in endpoints {
+        let trimmed = endpoint.trim();
+        if trimmed.is_empty() {
+            return Err(RelayEndpointError::Empty);
+        }
+
+        let base = RelayBaseUrl::parse(trimmed).map_err(|_| RelayEndpointError::Invalid {
+            endpoint: trimmed.to_owned(),
+        })?;
+        let canonical = base.canonical_url();
+        if seen.insert(canonical.clone()) {
+            normalized.push(canonical);
+        }
+    }
+
+    Ok(normalized)
+}
 
 /// daemon 本地配置。
 ///
@@ -50,6 +155,18 @@ pub struct DaemonConfig {
     pub default_command: Vec<String>,
     /// 新 pairing token 的默认 TTL，单位为毫秒。
     pub pairing_token_ttl_ms: u64,
+    /// daemon 主动连接的 relay endpoint 列表；为空时不自动连接 relay。
+    #[serde(default)]
+    pub relay_endpoints: Vec<String>,
+    /// relay 访问凭证；它只认证 relay transport，不表达 session 权限。
+    #[serde(default)]
+    pub relay_auth_token: Option<SecretString>,
+    /// relay 自动重连和心跳策略。
+    #[serde(default)]
+    pub relay_reconnect: RelayReconnectConfig,
+    /// `termd pair --qr` 生成 pairing URI 时默认写入的 WebSocket URL。
+    #[serde(default = "default_pairing_ws_url")]
+    pub default_pairing_ws_url: String,
 }
 
 impl DaemonConfig {
@@ -67,6 +184,10 @@ impl DaemonConfig {
             default_shell: default_shell.clone(),
             default_command: vec![default_shell],
             pairing_token_ttl_ms: DEFAULT_PAIRING_TOKEN_TTL_MS,
+            relay_endpoints: Vec::new(),
+            relay_auth_token: None,
+            relay_reconnect: RelayReconnectConfig::default(),
+            default_pairing_ws_url: default_pairing_ws_url(),
         }
     }
 }
@@ -307,6 +428,10 @@ fn platform_default_shell() -> String {
     }
 }
 
+fn default_pairing_ws_url() -> String {
+    format!("ws://{DEFAULT_LISTEN_HOST}:{DEFAULT_LISTEN_PORT}/ws")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -339,6 +464,44 @@ mod tests {
         assert!(!config.default_shell.is_empty());
         assert_eq!(config.default_command, vec![config.default_shell.clone()]);
         assert!(config.pairing_token_ttl_ms > 0);
+        assert!(config.relay_endpoints.is_empty());
+        assert!(config.relay_auth_token.is_none());
+        assert_eq!(config.default_pairing_ws_url, "ws://127.0.0.1:8765/ws");
+        assert!(config.relay_reconnect.initial_delay_ms > 0);
+        assert!(config.relay_reconnect.max_delay_ms >= config.relay_reconnect.initial_delay_ms);
+        assert!(config.relay_reconnect.heartbeat_interval_ms > 0);
+    }
+
+    #[test]
+    fn normalize_relay_endpoints_deduplicates_and_canonicalizes() {
+        let normalized = normalize_relay_endpoints(vec![
+            " ws://127.0.0.1:8080/ ".to_owned(),
+            "ws://127.0.0.1:8080".to_owned(),
+            "wss://relay.example:443".to_owned(),
+            "wss://relay.example:443/".to_owned(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            normalized,
+            vec![
+                "ws://127.0.0.1:8080".to_owned(),
+                "wss://relay.example:443".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn normalize_relay_endpoints_rejects_empty_and_invalid() {
+        assert!(matches!(
+            normalize_relay_endpoints(vec!["   ".to_owned()]).unwrap_err(),
+            RelayEndpointError::Empty
+        ));
+
+        assert!(matches!(
+            normalize_relay_endpoints(vec!["http://127.0.0.1:8080".to_owned()]).unwrap_err(),
+            RelayEndpointError::Invalid { endpoint } if endpoint == "http://127.0.0.1:8080"
+        ));
     }
 
     #[test]
@@ -351,11 +514,22 @@ mod tests {
         config.default_shell = "/bin/zsh".to_owned();
         config.default_command = vec!["/bin/zsh".to_owned(), "-l".to_owned()];
         config.pairing_token_ttl_ms = 42_000;
+        config.relay_endpoints = vec!["ws://127.0.0.1:8080".to_owned()];
+        config.relay_auth_token = Some(SecretString::new("relay-secret-1"));
+        config.relay_reconnect = RelayReconnectConfig {
+            initial_delay_ms: 250,
+            max_delay_ms: 10_000,
+            heartbeat_interval_ms: 15_000,
+        };
+        config.default_pairing_ws_url = "ws://relay.example/ws/server/client".to_owned();
 
         ConfigStore::save(&config_path, &config).unwrap();
 
         let loaded = ConfigStore::load(&config_path).unwrap();
         assert_eq!(loaded, config);
+        let raw = fs::read_to_string(&config_path).unwrap();
+        assert!(raw.contains("relay-secret-1"));
+        assert!(!format!("{config:?}").contains("relay-secret-1"));
         fs::remove_file(config_path).ok();
     }
 

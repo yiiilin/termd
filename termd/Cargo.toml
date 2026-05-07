@@ -7,20 +7,29 @@ repository.workspace = true
 
 [dependencies]
 axum = { version = "0.7", features = ["ws", "json"] }
+axum-core = "0.4"
 base64 = "0.22"
 chacha20poly1305 = "0.10"
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 hkdf = "0.12"
+hyper = "1"
+hyper-util = { version = "0.1", features = ["server-auto", "service", "tokio"] }
 portable-pty = "0.9"
+qrcode = { version = "0.14", default-features = false }
 rand_core = { version = "0.6", features = ["getrandom"] }
+rustls = "0.23"
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.10"
 termd-proto = { path = "../proto" }
 thiserror.workspace = true
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync"] }
-tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect"] }
+tokio-rustls = "0.26"
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+tower = "0.5"
+tower-service = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+webpki-roots = "1"
 x25519-dalek = { version = "2.0", features = ["static_secrets"] }

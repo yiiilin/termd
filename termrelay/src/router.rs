@@ -1,10 +1,10 @@
 use axum::extract::ws::WebSocketUpgrade;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use termd_proto::ServerId;
 use uuid::Uuid;
 
@@ -35,33 +35,64 @@ async fn healthz(State(state): State<RelayState>) -> Json<HealthzPayload> {
 async fn daemon_ws(
     Path(raw_server_id): Path<String>,
     State(state): State<RelayState>,
+    Query(auth): Query<RelayAuthQuery>,
     websocket: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    ws_response(raw_server_id, state, websocket, ConnectionRole::Daemon)
+    ws_response(
+        raw_server_id,
+        state,
+        auth,
+        websocket,
+        ConnectionRole::Daemon,
+    )
 }
 
 async fn daemon_mux_ws(
     Path(raw_server_id): Path<String>,
     State(state): State<RelayState>,
+    Query(auth): Query<RelayAuthQuery>,
     websocket: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    ws_response(raw_server_id, state, websocket, ConnectionRole::DaemonMux)
+    ws_response(
+        raw_server_id,
+        state,
+        auth,
+        websocket,
+        ConnectionRole::DaemonMux,
+    )
 }
 
 async fn client_ws(
     Path(raw_server_id): Path<String>,
     State(state): State<RelayState>,
+    Query(auth): Query<RelayAuthQuery>,
     websocket: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    ws_response(raw_server_id, state, websocket, ConnectionRole::Client)
+    ws_response(
+        raw_server_id,
+        state,
+        auth,
+        websocket,
+        ConnectionRole::Client,
+    )
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RelayAuthQuery {
+    relay_token: Option<String>,
 }
 
 fn ws_response(
     raw_server_id: String,
     state: RelayState,
+    auth: RelayAuthQuery,
     websocket: WebSocketUpgrade,
     role: ConnectionRole,
 ) -> axum::response::Response {
+    if !state.authorizes(auth.relay_token.as_deref()) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
     match parse_server_id(&raw_server_id) {
         Ok(server_id) => websocket
             .on_upgrade(move |socket| handle_socket(socket, state, server_id, role))
@@ -99,6 +130,15 @@ mod tests {
     #[test]
     fn router_can_be_constructed() {
         let _router = router(RelayState::default());
+    }
+
+    #[test]
+    fn auth_state_accepts_only_matching_relay_token_when_configured() {
+        let state = RelayState::new(Some("relay-secret-1".to_owned()));
+
+        assert!(state.authorizes(Some("relay-secret-1")));
+        assert!(!state.authorizes(None));
+        assert!(!state.authorizes(Some("wrong-secret")));
     }
 
     #[tokio::test]

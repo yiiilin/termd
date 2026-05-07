@@ -231,6 +231,45 @@ pub struct PairAcceptPayload {
     pub expires_at_ms: UnixTimestampMillis,
 }
 
+/// 二维码 pairing 载荷只携带建立设备信任所需的短期公开路由与 token。
+///
+/// token 仍然是敏感短期凭证；payload 不表达 controller/viewer，也不包含任何私钥。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairingQrPayload {
+    #[serde(rename = "type")]
+    pub payload_type: String,
+    pub version: u16,
+    pub ws_url: String,
+    pub token: PairingToken,
+    pub server_id: ServerId,
+    pub expires_at_ms: UnixTimestampMillis,
+}
+
+impl PairingQrPayload {
+    pub const PAYLOAD_TYPE: &'static str = "termd_pairing_qr";
+    pub const VERSION: u16 = 1;
+
+    pub fn new(
+        ws_url: impl Into<String>,
+        token: PairingToken,
+        server_id: ServerId,
+        expires_at_ms: UnixTimestampMillis,
+    ) -> Self {
+        Self {
+            payload_type: Self::PAYLOAD_TYPE.to_owned(),
+            version: Self::VERSION,
+            ws_url: ws_url.into(),
+            token,
+            server_id,
+            expires_at_ms,
+        }
+    }
+
+    pub fn is_supported_version(&self) -> bool {
+        self.payload_type == Self::PAYLOAD_TYPE && self.version == Self::VERSION
+    }
+}
+
 /// E2EE key exchange 只携带公开材料和防重放字段，不包含任何私钥。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct E2eeKeyExchangePayload {
@@ -542,12 +581,39 @@ mod tests {
             device_id,
             expires_at_ms: UnixTimestampMillis(1_710_000_060_000),
         };
+        let qr_payload = PairingQrPayload::new(
+            "ws://127.0.0.1:8765/ws",
+            PairingToken("pair-token".to_owned()),
+            server_id,
+            UnixTimestampMillis(1_710_000_060_000),
+        );
 
         assert_roundtrip(hello);
         assert_roundtrip(auth);
         assert_roundtrip(auth_challenge);
         assert_roundtrip(pair_request);
         assert_roundtrip(pair_accept);
+        assert_roundtrip(qr_payload);
+    }
+
+    #[test]
+    fn pairing_qr_payload_contains_only_pairing_route_and_token_material() {
+        let payload = PairingQrPayload::new(
+            "wss://relay.example/ws/00000000-0000-0000-0000-000000000001/client",
+            PairingToken("pair-token".to_owned()),
+            ServerId(Uuid::nil()),
+            UnixTimestampMillis(1_710_000_060_000),
+        );
+        let json = serde_json::to_value(&payload).unwrap();
+        let raw = json.to_string();
+
+        assert_eq!(json["type"], PairingQrPayload::PAYLOAD_TYPE);
+        assert_eq!(json["version"], PairingQrPayload::VERSION);
+        assert_eq!(json["token"], "pair-token");
+        assert!(payload.is_supported_version());
+        for forbidden in ["private", "session_data", "controller", "viewer", "rbac"] {
+            assert!(!raw.contains(forbidden));
+        }
     }
 
     #[test]

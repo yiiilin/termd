@@ -2,7 +2,7 @@
 
 **termd** 是一个面向开发者的端到端加密持久终端系统。当前 MVP 重点是：daemon 持有 PTY session，受信任设备可以重新 attach，同一个 session 不会因为某个 client 断开而终止。
 
-当前仓库仍处于 MVP 阶段。下面的“已验证”只表示当前代码和本地 QA 覆盖的能力；扫码配对、relay TLS/auth/自动重连和完整 Native client 还没有交付。
+当前仓库仍处于 MVP 阶段。下面的“已验证”只表示当前代码和本地 QA 覆盖的能力；完整 Native client、RBAC、多用户和企业功能还没有交付。
 
 ---
 
@@ -21,8 +21,8 @@
 | `termui/frontend` Web MVP | 已验证 | 支持 pairing token consumer、session list、terminal attach、controller/viewer 状态、control request 和 IndexedDB 状态边界；QA 覆盖浏览器通过真实 relay client URL 完成 pairing/list。 |
 | `termui/native` Flutter 骨架 | 架构骨架 | 只有 Native app/service/storage/protocol 分层和安全边界测试；还不是完整 Native client。 |
 | SSH 会话复用 | 目标场景 | 当前没有专门 SSH 管理层；可以把 `ssh` 当作普通 PTY 命令运行。 |
-| daemon 主动连接 relay | 已验证 | `termd --relay ws://host:port` 会连接 relay 的 daemon mux 路径；Web/termctl 可使用 `ws://relay/ws/{server_id}/client`。暂不支持 TLS、relay auth、自动重连或多 relay。 |
-| 扫码 / 二维码 pairing | 未实现 | 当前没有 `termd pair --qr`。 |
+| daemon 主动连接 relay | 已验证 | `termd --relay ws://host:port` 会连接 relay 的 daemon mux 路径；可重复传入多个 `--relay` / `--relay-url` 端点。Web/termctl 可使用 `ws://relay/ws/{server_id}/client`；公网部署方案见 [docs/deployment.md](docs/deployment.md)。 |
+| 扫码 / 二维码 pairing | 已验证 | `termd pair --qr` 可输出二维码 payload，并支持 payload 消费。 |
 
 非目标或未实现：RBAC、多用户、组织/企业权限、审计、文件传输、session 录像、SSO、Kubernetes 集成。
 
@@ -177,7 +177,7 @@ cargo run -p termctl -- pair --token "$PAIRING_TOKEN" --url "ws://127.0.0.1:8080
 cargo run -p termctl -- list --url "ws://127.0.0.1:8080/ws/${SERVER_ID}/client"
 ```
 
-当前 relay 支持的是本地 MVP：没有 TLS、relay auth、自动重连、多 relay 配置或公网部署策略。
+当前 relay 支持本地 MVP 和多 relay endpoint；公网部署、反向代理、health check 与日志边界见 [docs/deployment.md](docs/deployment.md)。
 
 ---
 

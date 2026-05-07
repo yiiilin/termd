@@ -26,9 +26,21 @@ struct RelayProcess {
 
 impl RelayProcess {
     async fn spawn() -> Self {
+        Self::spawn_with_auth_token(None).await
+    }
+
+    async fn spawn_auth_required(token: &str) -> Self {
+        Self::spawn_with_auth_token(Some(token)).await
+    }
+
+    async fn spawn_with_auth_token(auth_token: Option<&str>) -> Self {
         let addr = unused_listen_addr();
-        let child = Command::new(env!("CARGO_BIN_EXE_termrelay"))
-            .args(["--listen", &addr.to_string()])
+        let mut command = Command::new(env!("CARGO_BIN_EXE_termrelay"));
+        command.args(["--listen", &addr.to_string()]);
+        if let Some(auth_token) = auth_token {
+            command.args(["--auth-token", auth_token]);
+        }
+        let child = command
             // relay 日志不参与不变量断言，避免测试依赖日志格式或落盘行为。
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -37,16 +49,16 @@ impl RelayProcess {
             .expect("termrelay binary should spawn");
         let relay = Self { addr, child };
 
-        relay.wait_until_accepting_websockets().await;
+        relay.wait_until_accepting_websockets(auth_token).await;
         relay
     }
 
-    async fn wait_until_accepting_websockets(&self) {
+    async fn wait_until_accepting_websockets(&self, auth_token: Option<&str>) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
 
         loop {
             let probe_server_id = ServerId::new();
-            let probe_url = self.daemon_url(probe_server_id);
+            let probe_url = self.authenticated_url(self.daemon_url(probe_server_id), auth_token);
             if let Ok(Ok((mut socket, _))) =
                 timeout(Duration::from_millis(200), connect_async(probe_url)).await
             {
@@ -72,6 +84,13 @@ impl RelayProcess {
 
     fn client_url(&self, server_id: ServerId) -> String {
         format!("ws://{}/ws/{}/client", self.addr, server_id.0)
+    }
+
+    fn authenticated_url(&self, url: String, auth_token: Option<&str>) -> String {
+        match auth_token {
+            Some(auth_token) => format!("{url}?relay_token={auth_token}"),
+            None => url,
+        }
     }
 }
 
@@ -289,6 +308,52 @@ async fn relay_mux_routes_client_frames_and_targeted_daemon_responses() {
     )
     .await;
     assert_eq!(next_binary(&mut client_b).await, vec![1, 2, 3]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relay_auth_rejects_missing_and_wrong_transport_token() {
+    let relay = RelayProcess::spawn_auth_required("relay-secret-1").await;
+    let server_id = ServerId::new();
+
+    assert!(
+        connect_async(relay.daemon_mux_url(server_id))
+            .await
+            .is_err()
+    );
+    assert!(
+        connect_async(format!(
+            "{}?relay_token=wrong-secret",
+            relay.client_url(server_id)
+        ))
+        .await
+        .is_err()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relay_auth_allows_dumb_pipe_forwarding_with_correct_token() {
+    let relay = RelayProcess::spawn_auth_required("relay-secret-1").await;
+    let server_id = ServerId::new();
+    let (mut daemon, _) = connect_async(format!(
+        "{}?relay_token=relay-secret-1",
+        relay.daemon_url(server_id)
+    ))
+    .await
+    .expect("authenticated daemon should connect");
+    let mut client = connect_registered_client(format!(
+        "{}?relay_token=relay-secret-1",
+        relay.client_url(server_id)
+    ))
+    .await;
+    let business_shaped_text =
+        "{\"type\":\"pair_request\",\"payload\":{\"token\":\"relay-secret-plaintext\"}}";
+
+    client
+        .send(Message::Text(business_shaped_text.to_owned()))
+        .await
+        .expect("authenticated client should send opaque text");
+
+    assert_eq!(next_text(&mut daemon).await, business_shaped_text);
 }
 
 fn encrypted_pair_request_wire(server_id: ServerId, token: &str) -> (String, E2eeSession) {

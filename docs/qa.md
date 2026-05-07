@@ -15,6 +15,14 @@
 | termui Web | `npm run typecheck`、`npm run test -- --run`、`npm run build`、`npm run test:e2e`、`npm audit --audit-level=high`；Playwright 覆盖 mock daemon 和真实 relay daemon |
 | termui Native | 有 Flutter/Dart 时运行 `flutter pub get`、`flutter analyze`、`flutter test`；缺失时运行结构和敏感字符串 fallback 检查。 |
 
+## 公网部署 smoke QA
+
+- 确认 `wss://relay.example/ws/{server_id}/client?relay_token=...` 可以完成 pair / new / list。
+- 确认反向代理保留 WebSocket upgrade，并且 `relay_token` 不出现在 access log 或 error log。
+- 确认 `termrelay /healthz` 可从公网 health check 入口访问，而 `termd /healthz` 仍留在私网或 loopback。
+- 确认 `termd /local/pairing-token` 不能从公网入口访问。
+- 确认 `termctl` 与 Web 仍然只把 relay 当作 transport，不把 relay 当成可信业务层。
+
 ## 已知非阻断项
 
 - `termctl` 测试构建可能输出 test helper `dead_code` warning；测试通过时不阻断交付。

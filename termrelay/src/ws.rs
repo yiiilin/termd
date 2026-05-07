@@ -88,20 +88,44 @@ fn opaque_frame_from_mux(frame: RelayOpaqueFrame) -> Result<OpaqueFrame, RelayMu
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RelayState {
     inner: Arc<RelayRegistry>,
+    auth_token: Option<String>,
+}
+
+impl fmt::Debug for RelayState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // relay auth token 是 transport 凭证，Debug 输出只能显示是否配置，不能泄漏明文。
+        formatter
+            .debug_struct("RelayState")
+            .field("auth_token_configured", &self.auth_token.is_some())
+            .field("rooms", &self.room_count())
+            .finish()
+    }
 }
 
 impl Default for RelayState {
     fn default() -> Self {
-        Self {
-            inner: Arc::new(RelayRegistry::default()),
-        }
+        Self::new(None)
     }
 }
 
 impl RelayState {
+    pub fn new(auth_token: Option<String>) -> Self {
+        Self {
+            inner: Arc::new(RelayRegistry::default()),
+            auth_token,
+        }
+    }
+
+    pub fn authorizes(&self, token: Option<&str>) -> bool {
+        match self.auth_token.as_deref() {
+            Some(expected) => token == Some(expected),
+            None => true,
+        }
+    }
+
     pub fn room_count(&self) -> usize {
         self.inner.room_count()
     }
@@ -897,6 +921,15 @@ mod tests {
         assert!(!format!("{text:?}").contains("terminal plaintext"));
         assert!(!format!("{binary:?}").contains("pairing_token"));
         assert!(!format!("{binary:?}").contains("ciphertext"));
+    }
+
+    #[test]
+    fn relay_state_debug_redacts_auth_token() {
+        let state = RelayState::new(Some("relay-secret-1".to_owned()));
+        let rendered = format!("{state:?}");
+
+        assert!(rendered.contains("auth_token_configured"));
+        assert!(!rendered.contains("relay-secret-1"));
     }
 
     fn decode_mux(frame: OpaqueFrame) -> RelayMuxEnvelope {

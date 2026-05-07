@@ -100,12 +100,17 @@ wait_for_port() {
   local port="$1"
   local label="$2"
 
-  for _ in $(seq 1 100); do
+  # 预留更长窗口，避免 `cargo run` 的冷启动、链接或首次初始化把刚启动的监听服务误判为失败。
+  for _ in $(seq 1 200); do
     if port_is_open "$port"; then
       return 0
     fi
     sleep 0.05
   done
+
+  if port_is_open "$port"; then
+    return 0
+  fi
 
   printf '[qa] 等待 %s 监听 127.0.0.1:%s 超时。\n' "$label" "$port" >&2
   return 1
@@ -145,7 +150,7 @@ run_pairing_cli_e2e() (
   cargo run -q -p termd >"$temp_dir/termd.log" 2>&1 &
   daemon_pid="$!"
 
-  for _ in $(seq 1 100); do
+  for _ in $(seq 1 200); do
     if ! kill -0 "$daemon_pid" 2>/dev/null; then
       printf '[termctl] 本地 termd 未能启动，daemon 日志如下：\n' >&2
       cat "$temp_dir/termd.log" >&2
@@ -237,7 +242,7 @@ run_relay_runtime_e2e() (
   cargo run -q -p termd -- --relay "ws://${relay_addr}" >"$temp_dir/termd-relay.log" 2>&1 &
   daemon_pid="$!"
 
-  for _ in $(seq 1 100); do
+  for _ in $(seq 1 200); do
     if ! kill -0 "$daemon_pid" 2>/dev/null; then
       printf '[termrelay] termd --relay 过早退出，daemon 日志如下：\n' >&2
       cat "$temp_dir/termd-relay.log" >&2
