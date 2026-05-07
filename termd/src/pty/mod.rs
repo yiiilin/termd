@@ -1,7 +1,7 @@
 //! termd 的 PTY 抽象层。
 //!
 //! 这个模块只负责“如何启动并驱动一个伪终端进程”。认证、控制权、relay 路由、
-//! WebSocket 协议和 E2EE 都在更外层处理，避免 PTY 后端意外承担业务权限逻辑。
+//! WebSocket 协议和 E2EE 都在更外层处理，避免 PTY 后端意外承担控制权逻辑。
 
 pub mod portable;
 

@@ -1,7 +1,7 @@
 //! `portable-pty` 后端适配。
 //!
 //! 本文件是唯一直接接触 `portable-pty` crate 的地方。上层 session/control 代码应该只依赖
-//! `PtyBackend` 和 `PtySession`，这样认证、权限、relay 和协议逻辑不会和平台 PTY 细节耦合。
+//! `PtyBackend` 和 `PtySession`，这样认证、控制权、relay 和协议逻辑不会和平台 PTY 细节耦合。
 
 use std::io::{Read, Write};
 
@@ -34,7 +34,7 @@ impl From<portable_pty::ExitStatus> for PtyExitStatus {
 impl CommandSpec {
     /// 转换为 `portable-pty` 的命令构造器。
     ///
-    /// 该转换只搬运 program/args/env/cwd，不补默认 shell，也不做鉴权或权限判断。
+    /// 该转换只搬运 program/args/env/cwd，不补默认 shell，也不做鉴权或控制权判断。
     pub(crate) fn to_portable_command(&self) -> PtyResult<CommandBuilder> {
         self.validate()?;
 

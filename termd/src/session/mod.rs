@@ -113,7 +113,7 @@ impl SessionRecord {
 /// 单进程内存版 session 管理器。
 ///
 /// 本类型假定调用方已经完成配对和 device key 验证；这里接收到的 device id 都被视为可信。
-/// 这样可以保持 auth 与 session 两个边界清晰，后续接入网络层时也不会把权限系统混入 relay。
+/// 这样可以保持 auth 与 session 两个边界清晰，后续接入网络层时也不会把控制权逻辑混入 relay。
 #[derive(Debug, Default)]
 pub struct SessionManager {
     sessions: HashMap<String, SessionRecord>,
@@ -194,7 +194,7 @@ impl SessionManager {
     /// 设备 detach 只断开连接状态，不关闭 session。
     ///
     /// 如果 detach 的设备正持有控制权，控制权回到 `None`；不会自动提升 viewer，
-    /// 避免在用户未显式请求时发生隐藏的输入权限转移。
+    /// 避免在用户未显式请求时发生隐藏的输入控制权转移。
     pub fn detach(&mut self, session_id: &str, device_id: &str) -> Result<(), SessionError> {
         let session = self.session_mut(session_id)?;
         session.ensure_open()?;

@@ -1,7 +1,7 @@
 //! termrelay 的 HTTP/WebSocket 入口。
 //!
 //! relay 只负责按 URL 中公开的 `server_id` 转发 WebSocket frame。它不解密、不解析
-//! 内层业务 envelope，也不参与 pairing/auth/session/control 权限判断。
+//! 内层业务 envelope，也不参与 pairing/auth/session/control 控制权判断。
 
 mod args;
 mod router;

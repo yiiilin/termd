@@ -2,7 +2,7 @@
 //!
 //! runtime 只把 `SessionManager` 的控制权状态和 `PtyBackend` 的进程句柄接起来，
 //! 负责 daemon 本地的持久会话生命周期与 I/O 桥接。认证、配对、E2EE、WebSocket
-//! 和 relay 路由都必须留在更外层，避免这里变成协议层或权限系统。
+//! 和 relay 路由都必须留在更外层，避免这里变成协议层或控制权系统。
 
 use std::collections::HashMap;
 use std::error::Error;

@@ -16,7 +16,7 @@ pub struct Envelope<P = serde_json::Value> {
 }
 
 impl<P> Envelope<P> {
-    /// 构造函数保持极薄，只负责协议外壳，不在这里做权限判断。
+    /// 构造函数保持极薄，只负责协议外壳，不在这里做控制权判断。
     pub fn new(kind: MessageType, payload: P) -> Self {
         Self { kind, payload }
     }
@@ -65,7 +65,7 @@ impl Default for ServerId {
     }
 }
 
-/// session 标识只表示一个持久终端实例，不等同于权限主体。
+/// session 标识只表示一个持久终端实例，不等同于设备身份。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SessionId(pub Uuid);
@@ -126,7 +126,7 @@ pub enum AttachRole {
     Viewer,
 }
 
-/// 控制权状态只记录当前 holder，不引入 RBAC 或复杂权限。
+/// 控制权状态只记录当前 holder，不引入平台级策略。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum ControlState {
@@ -194,7 +194,7 @@ pub struct HelloPayload {
     pub device_id: Option<DeviceId>,
 }
 
-/// auth payload 支持设备级 challenge-response，不引入用户/RBAC。
+/// auth payload 支持设备级 challenge-response，不引入账号体系。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthPayload {
     pub device_id: DeviceId,
@@ -410,7 +410,7 @@ pub struct PongPayload {
 
 /// relay 分配的短期 client 连接 id。
 ///
-/// 这个 id 只在 relay 与 daemon outbound connector 之间使用，不是设备身份，也不表达权限。
+/// 这个 id 只在 relay 与 daemon outbound connector 之间使用，不是设备身份，也不表达控制权。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct RelayClientId(pub u64);

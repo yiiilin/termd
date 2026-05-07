@@ -1,7 +1,7 @@
 //! termctl 的本地状态文件。
 //!
 //! 状态只保存设备身份、设备签名私钥 secret 和已配对 daemon 的公开身份。pairing token、
-//! daemon/server private key、终端明文输出和 session 录像都不属于客户端持久化范围。
+//! daemon/server private key 和终端明文输出都不属于客户端持久化范围。
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -169,7 +169,7 @@ fn set_owner_only_file_permissions(path: &Path) -> Result<()> {
 
 #[cfg(not(unix))]
 fn set_owner_only_file_permissions(_path: &Path) -> Result<()> {
-    // 非 Unix 平台不强行模拟 chmod，避免错误地给出不可靠的权限语义。
+    // 非 Unix 平台不强行模拟 chmod，避免错误地给出不可靠的访问语义。
     Ok(())
 }
 

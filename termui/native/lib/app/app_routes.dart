@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
 
-/// Native 骨架只提供三类工作区入口；协议流程和权限判断必须留在 service/daemon 边界。
+/// Native 骨架只提供三类工作区入口；协议流程和控制权判断必须留在 service/daemon 边界。
 enum AppRoute {
   pairing('/pairing', '配对', Icons.key_rounded),
   sessions('/sessions', '会话', Icons.list_alt_rounded),

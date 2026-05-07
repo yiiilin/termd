@@ -55,7 +55,7 @@ export function TerminalPane(props: TerminalPaneProps) {
     }
     writtenChunksRef.current = props.chunks.length;
 
-    // xterm 的 cols/rows 是 terminal attach 的协议边界，UI 只上报尺寸，不决定业务权限。
+    // xterm 的 cols/rows 是 terminal attach 的协议边界，UI 只上报尺寸，不决定业务控制权。
     const resize = () => {
       fit.fit();
       const proposed = fit.proposeDimensions();

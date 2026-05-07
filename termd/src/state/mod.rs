@@ -1,8 +1,8 @@
 //! termd daemon 的本地持久状态快照。
 //!
 //! 本模块保存 daemon 需要跨进程重启保留的最小事实：daemon 公共身份快照、可信设备清单和
-//! session 元数据。这里刻意不保存 PTY 明文输出、terminal 历史、录像或文件传输内容，也不引入
-//! 多用户/RBAC 权限模型。
+//! session 元数据。这里刻意不保存 PTY 明文输出、terminal 历史或文件传输内容，也不引入
+//! 账号体系。
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::error::Error;
@@ -32,7 +32,7 @@ pub struct DaemonIdentitySnapshot {
 
 /// 已配对设备的持久状态记录。
 ///
-/// 该结构只表达设备级信任事实；它不是用户、角色或权限策略。controller/viewer 仍由 session
+/// 该结构只表达设备级信任事实；它不是账号或平台策略。controller/viewer 仍由 session
 /// attach 规则在运行时决定。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrustedDeviceState {

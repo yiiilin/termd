@@ -49,10 +49,10 @@ describe("协议类型", () => {
     expect(message.payload.size.rows).toBe(40);
   });
 
-  it("状态枚举不引入用户或 RBAC 语义", () => {
+  it("状态枚举只表达个人设备控制权语义", () => {
     const states: SessionState[] = ["created", "running", "closed"];
     const roles: AttachRole[] = ["controller", "viewer"];
-    const forbidden = ["admin", "owner", "member", "rbac"];
+    const forbidden = ["admin", "owner", "member", "tenant"];
 
     expect(states).toEqual(["created", "running", "closed"]);
     expect(roles).toEqual(["controller", "viewer"]);

@@ -2,7 +2,7 @@
 //!
 //! 本模块只保存单机 daemon 的本地启动配置：监听地址、状态文件路径、默认 shell/command、
 //! pairing token 默认 TTL，以及 relay 连接所需的生产基线参数。它不是用户配置中心，
-//! 也不表达 RBAC、多用户 profile 或企业策略。
+//! 也不表达平台级策略。
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::HashSet;
@@ -138,7 +138,7 @@ pub fn normalize_relay_endpoints(
 /// daemon 本地配置。
 ///
 /// `DaemonConfig` 只描述 daemon 自己如何启动和在哪里保存本地状态；它不会把设备信任、
-/// controller/viewer 或 session 生命周期编码成权限系统。
+/// controller/viewer 或 session 生命周期编码成平台策略。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonConfig {
     /// 配置文件 schema 版本，便于后续做迁移。
@@ -158,7 +158,7 @@ pub struct DaemonConfig {
     /// daemon 主动连接的 relay endpoint 列表；为空时不自动连接 relay。
     #[serde(default)]
     pub relay_endpoints: Vec<String>,
-    /// relay 访问凭证；它只认证 relay transport，不表达 session 权限。
+    /// relay 访问凭证；它只认证 relay transport，不表达 session 控制权。
     #[serde(default)]
     pub relay_auth_token: Option<SecretString>,
     /// relay 自动重连和心跳策略。

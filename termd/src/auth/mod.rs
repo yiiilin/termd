@@ -1,7 +1,7 @@
 //! termd 的设备级认证与信任基础模型。
 //!
-//! 本模块只维护 daemon identity、device identity 和可信设备清单。它刻意不引入用户、
-//! RBAC、组织、多角色权限或 relay 业务判断；上层只需要先确认设备已配对并可信，再把
+//! 本模块只维护 daemon identity、device identity 和可信设备清单。它刻意不引入账号体系、
+//! 平台级策略或 relay 业务判断；上层只需要先确认设备已配对并可信，再把
 //! device id 交给 session/control 模块处理 controller/viewer 规则。
 //!
 //! 当前实现是 MVP 内存模型：pairing token、challenge-response 与 replay protection 都只在
@@ -50,7 +50,7 @@ impl Error for AuthError {}
 /// pairing 生命周期的拒绝原因。
 ///
 /// pairing 只是设备级 trust establishment：通过一次性 token 把 device id 与 device public
-/// key 登记为可信设备。这里不表达账号、用户、RBAC、controller/viewer 或复杂权限。
+/// key 登记为可信设备。这里不表达账号、controller/viewer 或平台级策略。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PairingError {
     /// token 不存在，可能是拼写错误、已被清理，或来自未授权来源。
@@ -88,7 +88,7 @@ pub type ChallengeResult<T> = Result<T, ChallengeError>;
 /// challenge 生命周期的拒绝原因。
 ///
 /// challenge 只证明后续 auth 请求必须回应 daemon 最近签发的一次性材料；它不代表
-/// controller/viewer，也不包含用户或权限语义。
+/// controller/viewer，也不包含账号或控制权语义。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChallengeError {
     /// challenge 不存在，可能来自其他 daemon、其他连接，或已被清理。
@@ -379,7 +379,7 @@ impl fmt::Debug for PairingTokenRecord {
 /// pairing token 的内存生命周期管理器。
 ///
 /// 该类型只负责签发、查询、一次性消费、撤销和清理过期 token；不实现扫码、CLI、WebSocket、
-/// E2EE 或持久化。后续持久化层可以围绕同一状态语义扩展，不应把用户/RBAC 混入这里。
+/// E2EE 或持久化。后续持久化层可以围绕同一状态语义扩展，不应把账号体系混入这里。
 #[derive(Default)]
 pub struct PairingTokenManager {
     tokens: HashMap<String, PairingTokenRecord>,
@@ -505,7 +505,7 @@ impl fmt::Debug for PairingTokenManager {
 /// pair_request / pair_accept 的 daemon 内核服务。
 ///
 /// 该服务只完成“token -> trusted device”的设备级信任建立，不给设备分配 controller/viewer，
-/// 也不创建账号或权限。controller/viewer 仍由 session/control 状态机在 attach 时决定。
+/// 也不创建账号。controller/viewer 仍由 session/control 状态机在 attach 时决定。
 #[derive(Debug, Default)]
 pub struct PairingService {
     token_manager: PairingTokenManager,
@@ -963,7 +963,7 @@ impl AuthSigningInput {
 /// challenge-response auth 成功后的最小结果。
 ///
 /// 这里仍只返回设备级事实：哪个可信设备在何时通过认证。它不包含 session role，也不代表
-/// controller/viewer 权限。
+/// controller/viewer 控制权。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthenticatedDevice {
     pub device_id: DeviceId,
@@ -1195,7 +1195,7 @@ impl DeviceIdentity {
         Self::new(DeviceId::new(), public_key)
     }
 
-    /// 返回设备 id。device id 是设备身份的索引，不等同于用户或权限角色。
+    /// 返回设备 id。device id 是设备身份的索引，不等同于账号或控制权角色。
     pub fn device_id(&self) -> DeviceId {
         self.device_id
     }
@@ -1209,7 +1209,7 @@ impl DeviceIdentity {
 /// 已建立信任的设备记录。
 ///
 /// 记录只保存设备级元数据：设备身份、建立信任时间、最近一次可信访问时间和可读标签。
-/// 不在这里保存 session 角色，也不保存 controller/viewer 权限。
+/// 不在这里保存 session 角色，也不保存 controller/viewer 控制权。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrustedDevice {
     identity: DeviceIdentity,
@@ -1257,7 +1257,7 @@ impl TrustedDevice {
         self.last_seen_at_ms
     }
 
-    /// 返回用于本地展示的设备标签；标签不参与权限判断。
+    /// 返回用于本地展示的设备标签；标签不参与控制权判断。
     pub fn label(&self) -> Option<&str> {
         self.label.as_deref()
     }
@@ -1448,7 +1448,7 @@ fn generate_pairing_token() -> PairingToken {
     let token_id = ServerId::new();
 
     // token 明文只作为短期 pairing 凭据使用；这里借用 UUID 生成不透明字符串，
-    // 不把其中任何内容解释为用户、权限或 session 信息。
+    // 不把其中任何内容解释为账号、控制权或 session 信息。
     PairingToken(format!("termd-pair-{}", token_id.0))
 }
 
@@ -1460,7 +1460,7 @@ fn generate_auth_challenge() -> Challenge {
     let challenge_id = ServerId::new();
 
     // challenge 是短期、一次性的 auth 材料；它只证明客户端回应了 daemon 最近签发的随机值，
-    // 不携带用户、权限或 session role。
+    // 不携带账号、控制权或 session role。
     Challenge(format!("termd-auth-challenge-{}", challenge_id.0))
 }
 

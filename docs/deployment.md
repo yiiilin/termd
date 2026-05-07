@@ -39,7 +39,7 @@ daemon outbound connector 形态如下：
 wss://relay.example/ws/{server_id}/daemon-mux?relay_token=...
 ```
 
-`relay_token` 是 transport 凭证，不是设备身份，也不是 controller/viewer 权限。
+`relay_token` 是 transport 凭证，不是设备身份，也不是 controller/viewer 控制权。
 
 ## TLS 与反向代理
 
