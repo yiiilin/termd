@@ -115,8 +115,8 @@ jobs:
               pathlib.Path("scripts/install-termrelay.sh"),
           ]
           replacements = {
-              'REPO="${TERMD_GITHUB_REPO:-${GITHUB_REPOSITORY:-}}"': f'REPO="${{TERMD_GITHUB_REPO:-{repo}}}"',
-              'VERSION="${TERMD_VERSION:-}"': f'VERSION="${{TERMD_VERSION:-{tag}}}"',
+              'REPO="${TERMD_GITHUB_REPO:-${GITHUB_REPOSITORY:-}}"': 'REPO="${TERMD_GITHUB_REPO:-' + repo + '}"',
+              'VERSION="${TERMD_VERSION:-}"': 'VERSION="${TERMD_VERSION:-' + tag + '}"',
           }
 
           for src in scripts:
