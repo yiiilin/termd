@@ -281,7 +281,8 @@ main() {
   write_unit
 
   systemctl daemon-reload
-  systemctl enable --now "$SERVICE_NAME"
+  systemctl enable "$SERVICE_NAME"
+  systemctl restart "$SERVICE_NAME"
 
   log "installed ${BIN_NAME} ${VERSION} and started ${SERVICE_NAME}.service"
 }

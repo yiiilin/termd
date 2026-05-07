@@ -266,6 +266,102 @@ WantedBy=multi-user.target
 EOF
 }
 
+local_pairing_base_url() {
+  local listen="$1"
+  local scheme="$2"
+
+  python3 - "$listen" "$scheme" <<'PY'
+import ipaddress
+import sys
+
+listen = sys.argv[1]
+scheme = sys.argv[2]
+
+try:
+    if listen.startswith("["):
+        host, port = listen[1:].rsplit("]:", 1)
+    else:
+        host, port = listen.rsplit(":", 1)
+    port_number = int(port)
+    if port_number <= 0 or port_number > 65535:
+        raise ValueError("invalid port")
+except ValueError:
+    raise SystemExit(1)
+
+try:
+    ip = ipaddress.ip_address(host)
+    if ip.is_unspecified:
+        host = "::1" if ip.version == 6 else "127.0.0.1"
+except ValueError:
+    pass
+
+if ":" in host and not (host.startswith("[") and host.endswith("]")):
+    host = f"[{host}]"
+
+print(f"{scheme}://{host}:{port_number}")
+PY
+}
+
+post_local_pairing_token() {
+  local endpoint="$1"
+
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSk -X POST "$endpoint"
+  elif command -v wget >/dev/null 2>&1; then
+    wget --no-check-certificate -qO- --method=POST "$endpoint"
+  else
+    return 1
+  fi
+}
+
+print_initial_pairing_token() {
+  local listen scheme base_url endpoint response summary
+
+  listen="${TERMD_LISTEN:-127.0.0.1:8765}"
+  scheme="http"
+  if [[ -n "${TERMD_TLS_CERT:-}" || -n "${TERMD_TLS_KEY:-}" ]]; then
+    scheme="https"
+  fi
+
+  if ! base_url="$(local_pairing_base_url "$listen" "$scheme")"; then
+    log "cannot derive local pairing URL from TERMD_LISTEN=${listen}; run '${INSTALL_PREFIX}/bin/${BIN_NAME} pair' manually"
+    return 0
+  fi
+
+  endpoint="${base_url}/local/pairing-token"
+  for _ in {1..40}; do
+    if response="$(post_local_pairing_token "$endpoint" 2>/dev/null)"; then
+      if summary="$(printf '%s' "$response" | PAIRING_BASE_URL="$base_url" python3 -c '
+import json
+import os
+import sys
+
+payload = json.load(sys.stdin)
+base_url = os.environ["PAIRING_BASE_URL"]
+token = payload["token"]
+ttl_ms = int(payload.get("ttl_ms", 0))
+server_id = payload.get("server_id", "")
+ws_url = base_url.replace("https://", "wss://", 1).replace("http://", "ws://", 1) + "/ws"
+
+print(f"[termd-install] initial pairing token, expires in {ttl_ms // 1000}s:")
+print(token)
+print("[termd-install] pair with:")
+print(f"termctl pair --token {token!r} --url {ws_url}")
+if server_id:
+    print(f"[termd-install] server_id: {server_id}")
+print("[termd-install] remote clients should replace 127.0.0.1 with the daemon address they can reach.")
+')"; then
+        printf '%s\n' "$summary"
+        return 0
+      fi
+    fi
+    sleep 0.25
+  done
+
+  log "service started, but initial pairing token could not be issued from ${endpoint}"
+  log "run '${INSTALL_PREFIX}/bin/${BIN_NAME} pair --url ${base_url}' on this host to issue a new token"
+}
+
 ensure_system_user() {
   if ! id -u termd >/dev/null 2>&1; then
     useradd --system --home-dir "$STATE_DIR" --shell /usr/sbin/nologin --user-group termd
@@ -296,9 +392,11 @@ main() {
   write_unit
 
   systemctl daemon-reload
-  systemctl enable --now "$SERVICE_NAME"
+  systemctl enable "$SERVICE_NAME"
+  systemctl restart "$SERVICE_NAME"
 
   log "installed ${BIN_NAME} ${VERSION} and started ${SERVICE_NAME}.service"
+  print_initial_pairing_token
 }
 
 main "$@"

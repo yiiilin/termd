@@ -134,11 +134,11 @@ release 资产和 GHCR 镜像都由同一个 tag 驱动。发布流水线会把 
 ### `termctl`
 
 ```bash
-curl -fsSL https://github.com/OWNER/REPO/releases/download/0.1.1/install-termctl.sh | sudo bash
+curl -fsSL https://github.com/OWNER/REPO/releases/latest/download/install-termctl.sh | sudo bash
 ```
 
 ```bash
-wget -qO- https://github.com/OWNER/REPO/releases/download/0.1.1/install-termctl.sh | sudo bash
+wget -qO- https://github.com/OWNER/REPO/releases/latest/download/install-termctl.sh | sudo bash
 ```
 
 `termctl` 的脚本只安装二进制到 `/usr/local/bin/termctl`，不注册 systemd 服务。
@@ -146,25 +146,25 @@ wget -qO- https://github.com/OWNER/REPO/releases/download/0.1.1/install-termctl.
 ### `termd`
 
 ```bash
-curl -fsSL https://github.com/OWNER/REPO/releases/download/0.1.1/install-termd.sh | sudo bash
+curl -fsSL https://github.com/OWNER/REPO/releases/latest/download/install-termd.sh | sudo bash
 ```
 
 ```bash
-wget -qO- https://github.com/OWNER/REPO/releases/download/0.1.1/install-termd.sh | sudo bash
+wget -qO- https://github.com/OWNER/REPO/releases/latest/download/install-termd.sh | sudo bash
 ```
 
-`termd` 脚本会安装二进制、创建 `termd.service`、写入 `/etc/termd/termd.env`（如不存在）并启用服务。默认只监听 `127.0.0.1:8765`，relay 和 TLS 通过 env 文件可选配置。
+`termd` 脚本会安装二进制、创建 `termd.service`、写入 `/etc/termd/termd.env`（如不存在）并启用服务。默认只监听 `127.0.0.1:8765`，relay 和 TLS 通过 env 文件可选配置。服务启动后，脚本会在当前终端打印一个短期一次性 pairing token 和 `termctl pair` 示例；token 不会写入配置文件。
 
 如果要把内嵌 Web 也一起打开，把 `/etc/termd/termd.env` 里的 `TERMD_WEB_ENABLED=1` 打开即可；脚本会自动追加 `--web`。
 
 ### `termrelay`
 
 ```bash
-curl -fsSL https://github.com/OWNER/REPO/releases/download/0.1.1/install-termrelay.sh | sudo bash
+curl -fsSL https://github.com/OWNER/REPO/releases/latest/download/install-termrelay.sh | sudo bash
 ```
 
 ```bash
-wget -qO- https://github.com/OWNER/REPO/releases/download/0.1.1/install-termrelay.sh | sudo bash
+wget -qO- https://github.com/OWNER/REPO/releases/latest/download/install-termrelay.sh | sudo bash
 ```
 
 `termrelay` 脚本会安装二进制、创建 `termrelay.service`、写入 `/etc/termd/termrelay.env`（如不存在）并启用服务。默认只监听 `127.0.0.1:8080`，公开入口仍建议走反向代理。
@@ -173,7 +173,7 @@ wget -qO- https://github.com/OWNER/REPO/releases/download/0.1.1/install-termrela
 
 ## GitHub Release 与 GHCR
 
-- tag 采用纯版本号，例如 `0.1.1`。
+- tag 采用纯版本号，例如 `0.1.2`。
 - tag 推送后，GitHub Actions 会：
   - 运行 workspace 测试，确认 release tag 与 `Cargo.toml` 版本一致。
   - 构建 `termd`、`termrelay`、`termctl` 的 Linux amd64 release tarball。二进制使用 `x86_64-unknown-linux-musl` 静态链接，并在打包前先构建 `termui/frontend` 的静态资源，确保 `termd` 和 `termrelay` 的内嵌 Web 可用。

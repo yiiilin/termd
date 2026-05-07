@@ -40,10 +40,21 @@ jobs:
               "termrelay/Cargo.toml",
               "termweb/Cargo.toml",
           ]
+          root = tomllib.loads(pathlib.Path("Cargo.toml").read_text())
+          workspace_version = root["workspace"]["package"]["version"]
+
+          def manifest_version(data):
+              version = data["package"]["version"]
+              if isinstance(version, str):
+                  return version
+              if isinstance(version, dict) and version.get("workspace") is True:
+                  return workspace_version
+              raise SystemExit(f"unsupported package.version shape: {version!r}")
+
           mismatches = []
           for manifest in manifests:
               data = tomllib.loads(pathlib.Path(manifest).read_text())
-              version = data["package"]["version"]
+              version = manifest_version(data)
               if version != tag:
                   mismatches.append(f"{manifest}: {version}")
 
