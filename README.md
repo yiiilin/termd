@@ -23,6 +23,7 @@
 | SSH 会话复用 | 目标场景 | 当前没有专门 SSH 管理层；可以把 `ssh` 当作普通 PTY 命令运行。 |
 | daemon 主动连接 relay | 已验证 | `termd --relay ws://host:port` 会连接 relay 的 daemon mux 路径；可重复传入多个 `--relay` / `--relay-url` 端点。Web/termctl 可使用 `ws://relay/ws/{server_id}/client`；公网部署方案见 [docs/deployment.md](docs/deployment.md)。 |
 | 扫码 / 二维码 pairing | 已验证 | `termd pair --qr` 可输出二维码 payload，并支持 payload 消费。 |
+| 安装脚本 / GHCR 发布 | 已提供 | `scripts/install-termctl.sh`、`scripts/install-termd.sh`、`scripts/install-termrelay.sh` 支持 curl/wget 安装；tag 触发的 GitHub Actions 会同时发布 release 资产和 GHCR 镜像，`termrelay` 另有 docker-compose 方案。 |
 
 非目标或未实现：RBAC、多用户、组织/企业权限、审计、文件传输、session 录像、SSO、Kubernetes 集成。
 
@@ -252,4 +253,4 @@ termrelay:    ws://<relay>/ws/{server_id}/client
 
 ## License
 
-TBD
+MIT. See [LICENSE](LICENSE).

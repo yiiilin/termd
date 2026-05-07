@@ -53,10 +53,11 @@ cargo run -p termd
 
 ```bash
 cargo run -p termd -- pair
+cargo run -p termd -- --listen 127.0.0.1:8765
 cargo run -p termd -- --relay ws://127.0.0.1:8080
 ```
 
-默认配置监听 `127.0.0.1:8765`。配置和 state 模块已经存在，生产级配置入口仍保持 MVP 范围。
+默认配置监听 `127.0.0.1:8765`，systemd/docker 部署可以通过 `--listen host:port` 覆盖监听地址。配置和 state 模块已经存在，完整配置文件入口仍保持 MVP 范围。
 
 ### `termctl`
 
@@ -115,6 +116,13 @@ WebSocket 路径：
 
 relay 只按 URL 中公开的 `server_id` 路由 frame。`/daemon-mux` 只解析 relay transport wrapper，用于 `client_id` 定向转发；它不解密、不解析内层业务 envelope，也不参与 pairing/auth/session/control 判断。
 公网部署方案、反向代理示例和 health check 细节见 [docs/deployment.md](docs/deployment.md)。
+
+### 发布与安装
+
+* workspace package 版本与 Git tag 保持一致，release 资产和 GHCR 镜像都使用同一个 tag。
+* `termctl` 和 `termd` 提供 curl/wget 安装脚本；`termd` 安装脚本默认注册 systemd 服务。
+* `termrelay` 提供 systemd 安装脚本，另外还有 `deploy/termrelay/docker-compose.yml` 的容器化部署方式。
+* GitHub Actions 在 tag push 时会同时构建 release tarball、发布 GitHub Release 资产，并推送 `ghcr.io/<owner>/<component>:<tag>` 镜像。
 
 ### `termui/frontend`
 

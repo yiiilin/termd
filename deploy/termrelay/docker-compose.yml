@@ -1,0 +1,32 @@
+services:
+  termrelay:
+    image: ${TERMRELAY_IMAGE}
+    restart: unless-stopped
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        if [ -n "${TERMRELAY_AUTH_TOKEN:-}" ]; then
+          exec termrelay --listen 0.0.0.0:8080 --auth-token "$TERMRELAY_AUTH_TOKEN"
+        fi
+        exec termrelay --listen 0.0.0.0:8080
+    expose:
+      - "8080"
+
+  caddy:
+    image: caddy:2.8
+    restart: unless-stopped
+    depends_on:
+      - termrelay
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:
+

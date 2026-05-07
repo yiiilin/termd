@@ -125,3 +125,57 @@ Web MVP 也使用同样的 relay client URL。
 4. 确认 `/local/pairing-token` 不能从公网访问。
 5. 确认 `wss://relay.example/ws/{server_id}/client` 可以完成 pair / new / list。
 
+## 一键安装脚本
+
+release 资产和 GHCR 镜像都由同一个 tag 驱动。发布流水线会把 `scripts/install-*.sh` 渲染成带默认仓库和默认版本的 release 资产，所以常规安装命令不需要再传 `TERMD_GITHUB_REPO` 或 `TERMD_VERSION`。
+
+直接运行仓库里的源码脚本时，它仍然是通用模板，需要通过 `TERMD_GITHUB_REPO=owner/repo` 指定仓库；`TERMD_VERSION` 只保留为高级覆盖项，不作为一键安装的默认入口。
+
+### `termctl`
+
+```bash
+curl -fsSL https://github.com/OWNER/REPO/releases/download/0.1.0/install-termctl.sh | sudo bash
+```
+
+```bash
+wget -qO- https://github.com/OWNER/REPO/releases/download/0.1.0/install-termctl.sh | sudo bash
+```
+
+`termctl` 的脚本只安装二进制到 `/usr/local/bin/termctl`，不注册 systemd 服务。
+
+### `termd`
+
+```bash
+curl -fsSL https://github.com/OWNER/REPO/releases/download/0.1.0/install-termd.sh | sudo bash
+```
+
+`termd` 脚本会安装二进制、创建 `termd.service`、写入 `/etc/termd/termd.env`（如不存在）并启用服务。默认只监听 `127.0.0.1:8765`，relay 和 TLS 通过 env 文件可选配置。
+
+### `termrelay`
+
+```bash
+curl -fsSL https://github.com/OWNER/REPO/releases/download/0.1.0/install-termrelay.sh | sudo bash
+```
+
+`termrelay` 脚本会安装二进制、创建 `termrelay.service`、写入 `/etc/termd/termrelay.env`（如不存在）并启用服务。默认只监听 `127.0.0.1:8080`，公开入口仍建议走反向代理。
+
+## GitHub Release 与 GHCR
+
+- tag 采用纯版本号，例如 `0.1.0`。
+- tag 推送后，GitHub Actions 会：
+  - 运行 workspace 测试，确认 release tag 与 `Cargo.toml` 版本一致。
+  - 构建 `termd`、`termrelay`、`termctl` 的 release tarball。
+  - 生成 `checksums.txt` 和带默认仓库/版本的安装脚本，并上传到 GitHub Release。
+  - 推送 `ghcr.io/<owner>/termd:<tag>`、`ghcr.io/<owner>/termrelay:<tag>`、`ghcr.io/<owner>/termctl:<tag>` 镜像。
+
+## `termrelay` docker-compose
+
+`termrelay` 还提供一个容器化部署方式，文件在 [deploy/termrelay/docker-compose.yml](../deploy/termrelay/docker-compose.yml)。使用步骤：
+
+```bash
+cd deploy/termrelay
+cp .env.example .env
+docker compose up -d
+```
+
+`.env` 里至少要填写 `TERMRELAY_IMAGE`、`TERMRELAY_DOMAIN`，可选填写 `TERMRELAY_AUTH_TOKEN`。compose 通过 Caddy 终止 TLS，再反向代理到 `termrelay:8080`。

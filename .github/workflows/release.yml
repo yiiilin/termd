@@ -1,0 +1,189 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "*"
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  validate:
+    name: validate tag and test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate tag matches workspace versions
+        run: |
+          set -euo pipefail
+          python3 - "${GITHUB_REF_NAME}" <<'PY'
+          import pathlib
+          import re
+          import sys
+          import tomllib
+
+          tag = sys.argv[1]
+          if not re.fullmatch(r"\d+\.\d+\.\d+", tag):
+              raise SystemExit(f"tag {tag!r} must be a plain semver version such as 0.1.0")
+
+          manifests = [
+              "proto/Cargo.toml",
+              "termd/Cargo.toml",
+              "termctl/Cargo.toml",
+              "termrelay/Cargo.toml",
+          ]
+          mismatches = []
+          for manifest in manifests:
+              data = tomllib.loads(pathlib.Path(manifest).read_text())
+              version = data["package"]["version"]
+              if version != tag:
+                  mismatches.append(f"{manifest}: {version}")
+
+          if mismatches:
+              raise SystemExit(
+                  "tag/version mismatch:\n" + "\n".join(f"- {line}" for line in mismatches)
+              )
+
+          print(f"validated release tag {tag}")
+          PY
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run workspace tests
+        run: cargo test --workspace --locked
+
+  package:
+    name: build release assets
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release archives
+        run: |
+          set -euo pipefail
+
+          tag="${GITHUB_REF_NAME}"
+          out_dir="dist/release"
+          mkdir -p "$out_dir"
+
+          build_archive() {
+            local package="$1"
+            local binary="$2"
+            cargo build --release --locked -p "$package" --bin "$binary"
+            local archive="$out_dir/${binary}-${tag}-linux-amd64.tar.gz"
+            tar -C target/release -czf "$archive" "$binary"
+          }
+
+          build_archive termd termd
+          build_archive termrelay termrelay
+          build_archive termctl termctl
+
+          (
+            cd "$out_dir"
+            sha256sum *.tar.gz > checksums.txt
+          )
+
+          ls -lah "$out_dir"
+
+      - name: Render installer assets
+        run: |
+          set -euo pipefail
+
+          tag="${GITHUB_REF_NAME}"
+          repo="${GITHUB_REPOSITORY}"
+          python3 - "$tag" "$repo" <<'PY'
+          import pathlib
+          import stat
+          import sys
+
+          tag = sys.argv[1]
+          repo = sys.argv[2]
+          out_dir = pathlib.Path("dist/release")
+          scripts = [
+              pathlib.Path("scripts/install-termctl.sh"),
+              pathlib.Path("scripts/install-termd.sh"),
+              pathlib.Path("scripts/install-termrelay.sh"),
+          ]
+          replacements = {
+              'REPO="${TERMD_GITHUB_REPO:-${GITHUB_REPOSITORY:-}}"': f'REPO="${{TERMD_GITHUB_REPO:-{repo}}}"',
+              'VERSION="${TERMD_VERSION:-}"': f'VERSION="${{TERMD_VERSION:-{tag}}}"',
+          }
+
+          for src in scripts:
+              text = src.read_text()
+              for old, new in replacements.items():
+                  if old not in text:
+                      raise SystemExit(f"{src} did not contain expected assignment: {old}")
+                  text = text.replace(old, new, 1)
+              dest = out_dir / src.name
+              dest.write_text(text)
+              dest.chmod(dest.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+          PY
+
+      - name: Publish GitHub release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          tag="${GITHUB_REF_NAME}"
+          cd dist/release
+
+          files=(*.tar.gz checksums.txt install-*.sh)
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "${files[@]}" --clobber
+          else
+            gh release create "$tag" "${files[@]}" --title "$tag" --notes "Automated release for termd workspace version $tag."
+          fi
+
+  images:
+    name: build and push images
+    needs: validate
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - component: termd
+            dockerfile: docker/termd.Dockerfile
+          - component: termrelay
+            dockerfile: docker/termrelay.Dockerfile
+          - component: termctl
+            dockerfile: docker/termctl.Dockerfile
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Normalize image owner
+        id: image_owner
+        run: echo "value=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Build and push ${{ matrix.component }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: ghcr.io/${{ steps.image_owner.outputs.value }}/${{ matrix.component }}:${{ github.ref_name }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

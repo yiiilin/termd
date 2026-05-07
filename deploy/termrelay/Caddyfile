@@ -1,0 +1,5 @@
+{$TERMRELAY_DOMAIN} {
+  encode zstd gzip
+  reverse_proxy termrelay:8080
+}
+

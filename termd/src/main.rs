@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::fmt;
 use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,10 +29,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     match CliCommand::parse(std::env::args().skip(1))? {
         CliCommand::Serve {
+            listen,
             relay_urls,
             relay_auth_token,
             tls,
-        } => serve_daemon(relay_urls, relay_auth_token, tls).await?,
+        } => serve_daemon(listen, relay_urls, relay_auth_token, tls).await?,
         CliCommand::Pair { url, qr, ws_url } => {
             let token = request_pairing_token_response(&url)?;
             if qr {
@@ -49,12 +50,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
 }
 
 async fn serve_daemon(
+    listen: Option<ListenAddress>,
     relay_urls: Vec<String>,
     relay_auth_token: Option<String>,
     tls: Option<TlsPaths>,
 ) -> Result<(), Box<dyn Error>> {
     // MVP 默认只监听 127.0.0.1:8765；更复杂的配置文件/后台守护留给后续任务。
-    let config = DaemonConfig::default();
+    let mut config = DaemonConfig::default();
+    if let Some(listen) = listen {
+        config.listen_host = listen.host;
+        config.listen_port = listen.port;
+    }
     let protocol = default_protocol(config.clone());
     let relay_endpoints = normalize_relay_endpoints(
         config
@@ -126,6 +132,7 @@ async fn serve_with_optional_tls(
 #[derive(Clone, PartialEq, Eq)]
 enum CliCommand {
     Serve {
+        listen: Option<ListenAddress>,
         relay_urls: Vec<String>,
         relay_auth_token: Option<String>,
         tls: Option<TlsPaths>,
@@ -141,6 +148,7 @@ impl fmt::Debug for CliCommand {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Serve {
+                listen,
                 relay_urls,
                 relay_auth_token,
                 tls,
@@ -149,6 +157,7 @@ impl fmt::Debug for CliCommand {
                 // 但 Debug 输出只能暴露是否配置，避免后续错误日志中误带明文 token。
                 formatter
                     .debug_struct("Serve")
+                    .field("listen", listen)
                     .field("relay_urls", relay_urls)
                     .field("relay_auth_token_configured", &relay_auth_token.is_some())
                     .field("tls", tls)
@@ -169,6 +178,7 @@ impl CliCommand {
         let mut args = args.into_iter().peekable();
         let Some(command) = args.next() else {
             return Ok(Self::Serve {
+                listen: None,
                 relay_urls: Vec::new(),
                 relay_auth_token: None,
                 tls: None,
@@ -177,15 +187,15 @@ impl CliCommand {
 
         match command.as_str() {
             "pair" => parse_pair_args(args),
-            "--relay" | "--relay-url" | "--relay-auth-token" | "--tls-cert" | "--tls-key" => {
-                parse_serve_args(std::iter::once(command).chain(args))
-            }
+            "--listen" | "--relay" | "--relay-url" | "--relay-auth-token" | "--tls-cert"
+            | "--tls-key" => parse_serve_args(std::iter::once(command).chain(args)),
             other => Err(CliError::UnknownCommand(other.to_owned())),
         }
     }
 }
 
 fn parse_serve_args(args: impl IntoIterator<Item = String>) -> Result<CliCommand, CliError> {
+    let mut listen = None;
     let mut relay_urls = Vec::new();
     let mut relay_auth_token = None;
     let mut tls_cert = None;
@@ -194,6 +204,10 @@ fn parse_serve_args(args: impl IntoIterator<Item = String>) -> Result<CliCommand
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--listen" => {
+                let value = args.next().ok_or(CliError::MissingListenValue)?;
+                listen = Some(parse_listen_address(&value)?);
+            }
             "--relay" | "--relay-url" => {
                 let value = args.next().ok_or(CliError::MissingRelayUrlValue)?;
                 let _ = RelayBaseUrl::parse(&value)
@@ -232,6 +246,7 @@ fn parse_serve_args(args: impl IntoIterator<Item = String>) -> Result<CliCommand
     };
 
     Ok(CliCommand::Serve {
+        listen,
         relay_urls,
         relay_auth_token,
         tls,
@@ -268,6 +283,27 @@ fn parse_pair_args(mut args: impl Iterator<Item = String>) -> Result<CliCommand,
     // 解析阶段先拒绝不支持的 URL，避免用户等到网络请求时才看到模糊错误。
     let _ = parse_pairing_base_url(&url)?;
     Ok(CliCommand::Pair { url, qr, ws_url })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ListenAddress {
+    host: String,
+    port: u16,
+}
+
+fn parse_listen_address(value: &str) -> Result<ListenAddress, CliError> {
+    if value.trim() != value || value.is_empty() {
+        return Err(CliError::InvalidListenAddress(value.to_owned()));
+    }
+
+    let addr = value
+        .parse::<SocketAddr>()
+        .map_err(|_| CliError::InvalidListenAddress(value.to_owned()))?;
+
+    Ok(ListenAddress {
+        host: addr.ip().to_string(),
+        port: addr.port(),
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -505,6 +541,7 @@ fn parse_http_status(head: &str) -> Result<u16, CliError> {
 enum CliError {
     UnknownCommand(String),
     UnexpectedArgument(String),
+    MissingListenValue,
     MissingUrlValue,
     MissingRelayUrlValue,
     MissingRelayAuthTokenValue,
@@ -519,6 +556,7 @@ enum CliError {
     WsUrlRequiresQr,
     UnsupportedUrl(String),
     UnsupportedRelayUrl(String),
+    InvalidListenAddress(String),
     InvalidUrl(String),
     InvalidWsUrl(String),
     ConnectFailed,
@@ -534,7 +572,7 @@ enum CliError {
 
 impl CliError {
     fn usage() -> &'static str {
-        "usage: termd [--relay ws://host:port]... [--relay-auth-token <token>] [--tls-cert <cert.pem> --tls-key <key.pem>] [pair [--url http://127.0.0.1:8765|https://127.0.0.1:8765] [--qr [--ws-url ws://127.0.0.1:8765/ws]]]"
+        "usage: termd [--listen 127.0.0.1:8765] [--relay ws://host:port]... [--relay-auth-token <token>] [--tls-cert <cert.pem> --tls-key <key.pem>] [pair [--url http://127.0.0.1:8765|https://127.0.0.1:8765] [--qr [--ws-url ws://127.0.0.1:8765/ws]]]"
     }
 }
 
@@ -547,6 +585,7 @@ impl fmt::Display for CliError {
             Self::UnexpectedArgument(argument) => {
                 write!(f, "unexpected argument `{argument}`\n{}", Self::usage())
             }
+            Self::MissingListenValue => write!(f, "`--listen` requires a value\n{}", Self::usage()),
             Self::MissingUrlValue => write!(f, "`--url` requires a value\n{}", Self::usage()),
             Self::MissingRelayUrlValue => {
                 write!(f, "`--relay` requires a value\n{}", Self::usage())
@@ -617,6 +656,12 @@ impl fmt::Display for CliError {
                     "unsupported relay URL `{url}`; expected ws://host:port or wss://host:port"
                 )
             }
+            Self::InvalidListenAddress(address) => {
+                write!(
+                    f,
+                    "invalid listen address `{address}`; expected host:port such as 127.0.0.1:8765"
+                )
+            }
             Self::InvalidUrl(url) => {
                 write!(
                     f,
@@ -658,6 +703,39 @@ mod tests {
         assert_eq!(
             CliCommand::parse(std::iter::empty::<String>()).unwrap(),
             CliCommand::Serve {
+                listen: None,
+                relay_urls: Vec::new(),
+                relay_auth_token: None,
+                tls: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_listen_address_for_serve() {
+        assert_eq!(
+            CliCommand::parse(["--listen".to_owned(), "0.0.0.0:8765".to_owned()]).unwrap(),
+            CliCommand::Serve {
+                listen: Some(ListenAddress {
+                    host: "0.0.0.0".to_owned(),
+                    port: 8765,
+                }),
+                relay_urls: Vec::new(),
+                relay_auth_token: None,
+                tls: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_ipv6_listen_address_for_serve() {
+        assert_eq!(
+            CliCommand::parse(["--listen".to_owned(), "[::1]:8765".to_owned()]).unwrap(),
+            CliCommand::Serve {
+                listen: Some(ListenAddress {
+                    host: "::1".to_owned(),
+                    port: 8765,
+                }),
                 relay_urls: Vec::new(),
                 relay_auth_token: None,
                 tls: None,
@@ -670,6 +748,7 @@ mod tests {
         assert_eq!(
             CliCommand::parse(["--relay".to_owned(), "ws://127.0.0.1:8080/".to_owned()]).unwrap(),
             CliCommand::Serve {
+                listen: None,
                 relay_urls: vec!["ws://127.0.0.1:8080/".to_owned()],
                 relay_auth_token: None,
                 tls: None,
@@ -679,6 +758,7 @@ mod tests {
             CliCommand::parse(["--relay-url".to_owned(), "ws://127.0.0.1:8080".to_owned()])
                 .unwrap(),
             CliCommand::Serve {
+                listen: None,
                 relay_urls: vec!["ws://127.0.0.1:8080".to_owned()],
                 relay_auth_token: None,
                 tls: None,
@@ -692,6 +772,7 @@ mod tests {
             CliCommand::parse(["--relay".to_owned(), "wss://relay.example:443".to_owned()])
                 .unwrap(),
             CliCommand::Serve {
+                listen: None,
                 relay_urls: vec!["wss://relay.example:443".to_owned()],
                 relay_auth_token: None,
                 tls: None,
@@ -829,6 +910,7 @@ mod tests {
         assert_eq!(
             command,
             CliCommand::Serve {
+                listen: None,
                 relay_urls: Vec::new(),
                 relay_auth_token: None,
                 tls: Some(TlsPaths::new(
@@ -853,6 +935,7 @@ mod tests {
         assert_eq!(
             command,
             CliCommand::Serve {
+                listen: None,
                 relay_urls: vec!["ws://127.0.0.1:8080".to_owned()],
                 relay_auth_token: Some("relay-secret-1".to_owned()),
                 tls: None,
@@ -872,6 +955,18 @@ mod tests {
             ])
             .unwrap_err(),
             CliError::EmptyRelayAuthTokenValue
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_listen_address_for_serve() {
+        assert!(matches!(
+            CliCommand::parse(["--listen".to_owned(), "127.0.0.1".to_owned()]).unwrap_err(),
+            CliError::InvalidListenAddress(_)
+        ));
+        assert!(matches!(
+            CliCommand::parse(["--listen".to_owned()]).unwrap_err(),
+            CliError::MissingListenValue
         ));
     }
 

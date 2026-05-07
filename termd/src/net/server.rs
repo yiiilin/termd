@@ -3,7 +3,7 @@
 //! 这里只把 socket 字节流接到 `protocol` 状态机；pairing、auth、session 和 E2EE
 //! 规则都由协议核心执行，避免网络框架层夹带业务判断。
 
-use std::net::{AddrParseError, SocketAddr};
+use std::net::{AddrParseError, IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -116,7 +116,7 @@ pub async fn serve(
     config: DaemonConfig,
     protocol: SharedDaemonProtocol,
 ) -> Result<(), ServerError> {
-    let addr: SocketAddr = format!("{}:{}", config.listen_host, config.listen_port).parse()?;
+    let addr = listen_addr_from_config(&config)?;
     let listener = TcpListener::bind(addr).await.map_err(ServerError::Bind)?;
 
     serve_listener(listener, protocol).await
@@ -127,10 +127,16 @@ pub async fn serve_tls(
     protocol: SharedDaemonProtocol,
     tls_paths: TlsPaths,
 ) -> Result<(), ServerError> {
-    let addr: SocketAddr = format!("{}:{}", config.listen_host, config.listen_port).parse()?;
+    let addr = listen_addr_from_config(&config)?;
     let listener = TcpListener::bind(addr).await.map_err(ServerError::Bind)?;
 
     serve_tls_listener(listener, protocol, tls_paths).await
+}
+
+fn listen_addr_from_config(config: &DaemonConfig) -> Result<SocketAddr, ServerError> {
+    // 分开解析 IP 和端口，避免 IPv6 监听地址被普通字符串拼接破坏。
+    let ip: IpAddr = config.listen_host.parse()?;
+    Ok(SocketAddr::new(ip, config.listen_port))
 }
 
 /// 使用调用方已经绑定好的 listener 启动 daemon HTTP 服务。
