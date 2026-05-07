@@ -11,18 +11,22 @@ FROM rust:1-bookworm AS builder
 WORKDIR /workspace
 COPY . .
 COPY --from=web-builder /workspace/termui/frontend/dist /workspace/termui/frontend/dist
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends musl-tools \
+    && rm -rf /var/lib/apt/lists/* \
+    && rustup target add x86_64-unknown-linux-musl \
+    && mkdir -p /scratch-root/data
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    cargo build --release --locked -p termrelay --bin termrelay
+    cargo build --release --locked --target x86_64-unknown-linux-musl -p termrelay --bin termrelay \
+    && strip /workspace/target/x86_64-unknown-linux-musl/release/termrelay
 
-FROM debian:bookworm-slim
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/* \
-    && adduser --system --uid 10001 --group --no-create-home termrelay
-COPY --from=builder /workspace/target/release/termrelay /usr/local/bin/termrelay
-RUN chmod 0755 /usr/local/bin/termrelay
-USER termrelay
+FROM scratch
+COPY --from=builder /workspace/target/x86_64-unknown-linux-musl/release/termrelay /termrelay
+COPY --from=builder --chown=10001:10001 /scratch-root/data /data
+ENV HOME=/data
+WORKDIR /data
+USER 10001:10001
 EXPOSE 8080
-ENTRYPOINT ["/usr/local/bin/termrelay"]
+ENTRYPOINT ["/termrelay"]
 CMD ["--listen", "0.0.0.0:8080"]

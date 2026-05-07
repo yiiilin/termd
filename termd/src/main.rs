@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use qrcode::{QrCode, render::unicode};
 use serde::Deserialize;
-use termd::config::{DaemonConfig, RelayReconnectConfig, normalize_relay_endpoints};
+use termd::config::{DaemonConfig, normalize_relay_endpoints};
 use termd::net::relay::{RelayBaseUrl, RelayReconnectPolicy, run_relay_mux_with_reconnect};
 use termd::net::server::{TlsPaths, default_protocol, serve, serve_tls};
 use termd_proto::{PairingQrPayload, PairingToken, ServerId, UnixTimestampMillis};
@@ -838,6 +838,7 @@ mod tests {
             Arc,
             atomic::{AtomicUsize, Ordering},
         };
+        use termd::config::RelayReconnectConfig;
 
         #[derive(Clone, Default)]
         struct MockMuxState {

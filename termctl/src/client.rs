@@ -378,7 +378,8 @@ fn protocol_error(payload: Value) -> TermctlError {
     }
 }
 
-pub fn ping_envelope_for_test() -> JsonEnvelope {
+#[cfg(test)]
+fn ping_envelope_for_test() -> JsonEnvelope {
     envelope_value(
         MessageType::Ping,
         PingPayload {
@@ -389,7 +390,8 @@ pub fn ping_envelope_for_test() -> JsonEnvelope {
     .expect("ping payload should serialize")
 }
 
-pub fn encrypted_envelope_for_test(
+#[cfg(test)]
+fn encrypted_envelope_for_test(
     e2ee: &mut E2eeSession,
     inner: JsonEnvelope,
 ) -> Result<JsonEnvelope> {

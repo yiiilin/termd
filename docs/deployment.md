@@ -176,10 +176,10 @@ wget -qO- https://github.com/OWNER/REPO/releases/download/0.1.1/install-termrela
 - tag 采用纯版本号，例如 `0.1.1`。
 - tag 推送后，GitHub Actions 会：
   - 运行 workspace 测试，确认 release tag 与 `Cargo.toml` 版本一致。
-  - 构建 `termd`、`termrelay`、`termctl` 的 release tarball，并在打包前先构建 `termui/frontend` 的静态资源，确保 `termd` 和 `termrelay` 的内嵌 Web 可用。
+  - 构建 `termd`、`termrelay`、`termctl` 的 Linux amd64 release tarball。二进制使用 `x86_64-unknown-linux-musl` 静态链接，并在打包前先构建 `termui/frontend` 的静态资源，确保 `termd` 和 `termrelay` 的内嵌 Web 可用。
   - 生成 `checksums.txt` 和带默认仓库/版本的安装脚本，并上传到 GitHub Release。
   - 推送 `ghcr.io/<owner>/termd:<tag>`、`ghcr.io/<owner>/termrelay:<tag>`、`ghcr.io/<owner>/termctl:<tag>` 镜像。
-  - 这些镜像里的 `termd` 和 `termrelay` 同样会内嵌 Web 静态资源。
+  - 这些镜像使用 `scratch` 运行层；`termd` 和 `termrelay` 同样会内嵌 Web 静态资源。
 
 ## `termrelay` docker-compose
 

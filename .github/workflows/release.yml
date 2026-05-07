@@ -9,6 +9,9 @@ permissions:
   contents: write
   packages: write
 
+env:
+  STATIC_TARGET: x86_64-unknown-linux-musl
+
 jobs:
   validate:
     name: validate tag and test
@@ -68,6 +71,14 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.STATIC_TARGET }}
+
+      - name: Install static linker tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
 
       - name: Install Node.js
         uses: actions/setup-node@v4
@@ -91,12 +102,30 @@ jobs:
           out_dir="dist/release"
           mkdir -p "$out_dir"
 
+          assert_static_binary() {
+            local binary_path="$1"
+            local file_output
+            file_output="$(file "$binary_path")"
+            printf '%s\n' "$file_output"
+            if ! printf '%s\n' "$file_output" | grep -Eq 'static-pie linked|statically linked'; then
+              printf 'release binary is not statically linked: %s\n' "$binary_path" >&2
+              exit 1
+            fi
+            if ldd "$binary_path" 2>&1 | grep -Eq '=>|ld-linux|libc\.so'; then
+              printf 'release binary unexpectedly has dynamic dependencies: %s\n' "$binary_path" >&2
+              exit 1
+            fi
+          }
+
           build_archive() {
             local package="$1"
             local binary="$2"
-            cargo build --release --locked -p "$package" --bin "$binary"
+            cargo build --release --locked --target "$STATIC_TARGET" -p "$package" --bin "$binary"
+            local binary_path="target/${STATIC_TARGET}/release/${binary}"
+            strip "$binary_path"
+            assert_static_binary "$binary_path"
             local archive="$out_dir/${binary}-${tag}-linux-amd64.tar.gz"
-            tar -C target/release -czf "$archive" "$binary"
+            tar -C "target/${STATIC_TARGET}/release" -czf "$archive" "$binary"
           }
 
           build_archive termd termd
