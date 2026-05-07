@@ -144,12 +144,16 @@ install_from_source() {
 }
 
 write_env_file() {
+  # systemd 服务会以 termd 用户运行 wrapper；env 文件需要允许 termd 组读取。
+  install -d -m 0755 "$ENV_DIR"
+
   if [[ -e "$ENV_FILE" ]]; then
     log "keeping existing env file at ${ENV_FILE}"
+    chown root:"$SERVICE_NAME" "$ENV_FILE"
+    chmod 0640 "$ENV_FILE"
     return 0
   fi
 
-  install -d -m 0750 "$ENV_DIR"
   {
     printf '# 这个文件由安装脚本创建，systemd wrapper 会读取它。\n'
     printf '# 需要 relay、TLS、Web 或自定义监听时，取消注释并修改对应变量。\n'
@@ -176,7 +180,8 @@ write_env_file() {
       printf '# TERMD_TLS_KEY=/etc/termd/privkey.pem\n'
     fi
   } >"$ENV_FILE"
-  chmod 0600 "$ENV_FILE"
+  chown root:"$SERVICE_NAME" "$ENV_FILE"
+  chmod 0640 "$ENV_FILE"
 }
 
 write_wrapper() {
