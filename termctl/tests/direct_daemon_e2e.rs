@@ -39,7 +39,7 @@ impl TestDaemon {
         let protocol = termd::net::server::default_protocol(config);
         let server_protocol = Arc::clone(&protocol);
         let task = tokio::spawn(async move {
-            serve_listener(listener, server_protocol)
+            serve_listener(listener, server_protocol, false)
                 .await
                 .expect("in-process daemon should keep serving");
         });

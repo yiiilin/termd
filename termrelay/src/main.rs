@@ -71,10 +71,11 @@ async fn main() -> Result<(), MainError> {
     info!(
         listen = %args.listen,
         tls = tls.is_some(),
+        web = args.web,
         "starting termrelay dumb pipe"
     );
 
-    serve_listener(listener, RelayState::new(args.auth_token), tls).await
+    serve_listener(listener, RelayState::new(args.auth_token), tls, args.web).await
 }
 
 fn init_tracing() {
@@ -98,10 +99,11 @@ async fn serve_listener(
     listener: TcpListener,
     state: RelayState,
     tls: Option<TlsPaths>,
+    web_enabled: bool,
 ) -> Result<(), MainError> {
     match tls {
-        Some(paths) => serve_tls_listener(listener, state, paths).await,
-        None => axum::serve(listener, router(state))
+        Some(paths) => serve_tls_listener(listener, state, paths, web_enabled).await,
+        None => axum::serve(listener, router(state, web_enabled))
             .with_graceful_shutdown(shutdown_signal())
             .await
             .map_err(MainError::Serve),
@@ -112,9 +114,10 @@ async fn serve_tls_listener(
     listener: TcpListener,
     state: RelayState,
     tls_paths: TlsPaths,
+    web_enabled: bool,
 ) -> Result<(), MainError> {
     let tls_config = load_rustls_server_config(&tls_paths)?;
-    serve_rustls_listener(listener, router(state), tls_config).await
+    serve_rustls_listener(listener, router(state, web_enabled), tls_config).await
 }
 
 fn load_rustls_server_config(tls_paths: &TlsPaths) -> Result<rustls::ServerConfig, MainError> {
@@ -210,7 +213,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            let _ = serve_tls_listener(listener, RelayState::default(), tls_paths).await;
+            let _ = serve_tls_listener(listener, RelayState::default(), tls_paths, false).await;
         });
 
         let response = tls_healthz_request(addr, &cert_path).await;

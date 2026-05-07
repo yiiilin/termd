@@ -33,7 +33,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
             relay_urls,
             relay_auth_token,
             tls,
-        } => serve_daemon(listen, relay_urls, relay_auth_token, tls).await?,
+            web,
+        } => serve_daemon(listen, relay_urls, relay_auth_token, tls, web).await?,
         CliCommand::Pair { url, qr, ws_url } => {
             let token = request_pairing_token_response(&url)?;
             if qr {
@@ -54,6 +55,7 @@ async fn serve_daemon(
     relay_urls: Vec<String>,
     relay_auth_token: Option<String>,
     tls: Option<TlsPaths>,
+    web_enabled: bool,
 ) -> Result<(), Box<dyn Error>> {
     // MVP 默认只监听 127.0.0.1:8765；更复杂的配置文件/后台守护留给后续任务。
     let mut config = DaemonConfig::default();
@@ -86,7 +88,7 @@ async fn serve_daemon(
             relay_protocol,
         );
     }
-    serve_with_optional_tls(config, protocol, tls).await?;
+    serve_with_optional_tls(config, protocol, tls, web_enabled).await?;
     Ok(())
 }
 
@@ -122,10 +124,11 @@ async fn serve_with_optional_tls(
     config: DaemonConfig,
     protocol: termd::net::server::SharedDaemonProtocol,
     tls: Option<TlsPaths>,
+    web_enabled: bool,
 ) -> Result<(), termd::net::server::ServerError> {
     match tls {
-        Some(tls) => serve_tls(config, protocol, tls).await,
-        None => serve(config, protocol).await,
+        Some(tls) => serve_tls(config, protocol, tls, web_enabled).await,
+        None => serve(config, protocol, web_enabled).await,
     }
 }
 
@@ -136,6 +139,7 @@ enum CliCommand {
         relay_urls: Vec<String>,
         relay_auth_token: Option<String>,
         tls: Option<TlsPaths>,
+        web: bool,
     },
     Pair {
         url: String,
@@ -152,6 +156,7 @@ impl fmt::Debug for CliCommand {
                 relay_urls,
                 relay_auth_token,
                 tls,
+                web,
             } => {
                 // relay auth token 是 transport 凭证，命令解析测试需要保留真实值用于行为断言，
                 // 但 Debug 输出只能暴露是否配置，避免后续错误日志中误带明文 token。
@@ -161,6 +166,7 @@ impl fmt::Debug for CliCommand {
                     .field("relay_urls", relay_urls)
                     .field("relay_auth_token_configured", &relay_auth_token.is_some())
                     .field("tls", tls)
+                    .field("web", web)
                     .finish()
             }
             Self::Pair { url, qr, ws_url } => formatter
@@ -182,13 +188,14 @@ impl CliCommand {
                 relay_urls: Vec::new(),
                 relay_auth_token: None,
                 tls: None,
+                web: false,
             });
         };
 
         match command.as_str() {
             "pair" => parse_pair_args(args),
             "--listen" | "--relay" | "--relay-url" | "--relay-auth-token" | "--tls-cert"
-            | "--tls-key" => parse_serve_args(std::iter::once(command).chain(args)),
+            | "--tls-key" | "--web" => parse_serve_args(std::iter::once(command).chain(args)),
             other => Err(CliError::UnknownCommand(other.to_owned())),
         }
     }
@@ -200,6 +207,7 @@ fn parse_serve_args(args: impl IntoIterator<Item = String>) -> Result<CliCommand
     let mut relay_auth_token = None;
     let mut tls_cert = None;
     let mut tls_key = None;
+    let mut web = false;
     let mut args = args.into_iter();
 
     while let Some(arg) = args.next() {
@@ -235,6 +243,9 @@ fn parse_serve_args(args: impl IntoIterator<Item = String>) -> Result<CliCommand
                 }
                 tls_key = Some(PathBuf::from(value));
             }
+            "--web" => {
+                web = true;
+            }
             other => return Err(CliError::UnexpectedArgument(other.to_owned())),
         }
     }
@@ -250,6 +261,7 @@ fn parse_serve_args(args: impl IntoIterator<Item = String>) -> Result<CliCommand
         relay_urls,
         relay_auth_token,
         tls,
+        web,
     })
 }
 
@@ -572,7 +584,7 @@ enum CliError {
 
 impl CliError {
     fn usage() -> &'static str {
-        "usage: termd [--listen 127.0.0.1:8765] [--relay ws://host:port]... [--relay-auth-token <token>] [--tls-cert <cert.pem> --tls-key <key.pem>] [pair [--url http://127.0.0.1:8765|https://127.0.0.1:8765] [--qr [--ws-url ws://127.0.0.1:8765/ws]]]"
+        "usage: termd [--listen 127.0.0.1:8765] [--relay ws://host:port]... [--relay-auth-token <token>] [--tls-cert <cert.pem> --tls-key <key.pem>] [--web] [pair [--url http://127.0.0.1:8765|https://127.0.0.1:8765] [--qr [--ws-url ws://127.0.0.1:8765/ws]]]"
     }
 }
 
@@ -707,6 +719,7 @@ mod tests {
                 relay_urls: Vec::new(),
                 relay_auth_token: None,
                 tls: None,
+                web: false,
             }
         );
     }
@@ -723,6 +736,7 @@ mod tests {
                 relay_urls: Vec::new(),
                 relay_auth_token: None,
                 tls: None,
+                web: false,
             }
         );
     }
@@ -739,6 +753,7 @@ mod tests {
                 relay_urls: Vec::new(),
                 relay_auth_token: None,
                 tls: None,
+                web: false,
             }
         );
     }
@@ -752,6 +767,7 @@ mod tests {
                 relay_urls: vec!["ws://127.0.0.1:8080/".to_owned()],
                 relay_auth_token: None,
                 tls: None,
+                web: false,
             }
         );
         assert_eq!(
@@ -762,6 +778,7 @@ mod tests {
                 relay_urls: vec!["ws://127.0.0.1:8080".to_owned()],
                 relay_auth_token: None,
                 tls: None,
+                web: false,
             }
         );
     }
@@ -776,6 +793,7 @@ mod tests {
                 relay_urls: vec!["wss://relay.example:443".to_owned()],
                 relay_auth_token: None,
                 tls: None,
+                web: false,
             }
         );
     }
@@ -793,6 +811,20 @@ mod tests {
         let rendered = format!("{command:?}");
         assert!(rendered.contains("ws://127.0.0.1:8080"));
         assert!(rendered.contains("wss://relay.example:443"));
+    }
+
+    #[test]
+    fn parses_web_flag_for_serve() {
+        assert_eq!(
+            CliCommand::parse(["--web".to_owned()]).unwrap(),
+            CliCommand::Serve {
+                listen: None,
+                relay_urls: Vec::new(),
+                relay_auth_token: None,
+                tls: None,
+                web: true,
+            }
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -917,6 +949,7 @@ mod tests {
                     "/etc/termd/fullchain.pem",
                     "/etc/termd/secret-key.pem"
                 )),
+                web: false,
             }
         );
         assert!(!format!("{command:?}").contains("secret-key.pem"));
@@ -939,6 +972,7 @@ mod tests {
                 relay_urls: vec!["ws://127.0.0.1:8080".to_owned()],
                 relay_auth_token: Some("relay-secret-1".to_owned()),
                 tls: None,
+                web: false,
             }
         );
         assert!(!format!("{command:?}").contains("relay-secret-1"));

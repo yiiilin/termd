@@ -149,7 +149,13 @@ wget -qO- https://github.com/OWNER/REPO/releases/download/0.1.0/install-termctl.
 curl -fsSL https://github.com/OWNER/REPO/releases/download/0.1.0/install-termd.sh | sudo bash
 ```
 
+```bash
+wget -qO- https://github.com/OWNER/REPO/releases/download/0.1.0/install-termd.sh | sudo bash
+```
+
 `termd` 脚本会安装二进制、创建 `termd.service`、写入 `/etc/termd/termd.env`（如不存在）并启用服务。默认只监听 `127.0.0.1:8765`，relay 和 TLS 通过 env 文件可选配置。
+
+如果要把内嵌 Web 也一起打开，把 `/etc/termd/termd.env` 里的 `TERMD_WEB_ENABLED=1` 打开即可；脚本会自动追加 `--web`。
 
 ### `termrelay`
 
@@ -157,16 +163,23 @@ curl -fsSL https://github.com/OWNER/REPO/releases/download/0.1.0/install-termd.s
 curl -fsSL https://github.com/OWNER/REPO/releases/download/0.1.0/install-termrelay.sh | sudo bash
 ```
 
+```bash
+wget -qO- https://github.com/OWNER/REPO/releases/download/0.1.0/install-termrelay.sh | sudo bash
+```
+
 `termrelay` 脚本会安装二进制、创建 `termrelay.service`、写入 `/etc/termd/termrelay.env`（如不存在）并启用服务。默认只监听 `127.0.0.1:8080`，公开入口仍建议走反向代理。
+
+如果需要嵌入 Web UI，把 `/etc/termd/termrelay.env` 里的 `TERMRELAY_WEB_ENABLED=1` 打开即可；脚本会自动追加 `--web`。
 
 ## GitHub Release 与 GHCR
 
 - tag 采用纯版本号，例如 `0.1.0`。
 - tag 推送后，GitHub Actions 会：
   - 运行 workspace 测试，确认 release tag 与 `Cargo.toml` 版本一致。
-  - 构建 `termd`、`termrelay`、`termctl` 的 release tarball。
+  - 构建 `termd`、`termrelay`、`termctl` 的 release tarball，并在打包前先构建 `termui/frontend` 的静态资源，确保 `termd` 和 `termrelay` 的内嵌 Web 可用。
   - 生成 `checksums.txt` 和带默认仓库/版本的安装脚本，并上传到 GitHub Release。
   - 推送 `ghcr.io/<owner>/termd:<tag>`、`ghcr.io/<owner>/termrelay:<tag>`、`ghcr.io/<owner>/termctl:<tag>` 镜像。
+  - 这些镜像里的 `termd` 和 `termrelay` 同样会内嵌 Web 静态资源。
 
 ## `termrelay` docker-compose
 

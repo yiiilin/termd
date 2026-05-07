@@ -152,8 +152,9 @@ write_env_file() {
   install -d -m 0750 "$ENV_DIR"
   {
     printf '# 这个文件由安装脚本创建，systemd wrapper 会读取它。\n'
-    printf '# 需要自定义监听、TLS 或 relay auth 时，取消注释并修改对应变量。\n'
+    printf '# 需要自定义监听、TLS、Web 或 relay auth 时，取消注释并修改对应变量。\n'
     printf 'TERMRELAY_LISTEN=%q\n' "${TERMRELAY_LISTEN:-127.0.0.1:8080}"
+    printf 'TERMRELAY_WEB_ENABLED=%q\n' "${TERMRELAY_WEB_ENABLED:-0}"
     if [[ -n "${TERMRELAY_AUTH_TOKEN:-}" ]]; then
       printf 'TERMRELAY_AUTH_TOKEN=%q\n' "$TERMRELAY_AUTH_TOKEN"
     else
@@ -201,6 +202,17 @@ if [[ -n "${TERMRELAY_TLS_CERT:-}" || -n "${TERMRELAY_TLS_KEY:-}" ]]; then
     exit 1
   fi
   args+=(--tls-cert "$TERMRELAY_TLS_CERT" --tls-key "$TERMRELAY_TLS_KEY")
+fi
+
+is_enabled() {
+  case "${1:-}" in
+    1|true|TRUE|yes|YES|on|ON) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+if is_enabled "${TERMRELAY_WEB_ENABLED:-0}"; then
+  args+=(--web)
 fi
 
 exec /usr/local/bin/termrelay "${args[@]}"

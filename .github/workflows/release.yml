@@ -35,6 +35,7 @@ jobs:
               "termd/Cargo.toml",
               "termctl/Cargo.toml",
               "termrelay/Cargo.toml",
+              "termweb/Cargo.toml",
           ]
           mismatches = []
           for manifest in manifests:
@@ -67,6 +68,20 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: termui/frontend/package-lock.json
+
+      - name: Build embedded Web assets
+        run: |
+          set -euo pipefail
+          cd termui/frontend
+          npm ci
+          npm run build
 
       - name: Build release archives
         run: |

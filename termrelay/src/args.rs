@@ -17,6 +17,8 @@ pub struct Args {
     pub auth_token: Option<String>,
     pub tls_cert: Option<PathBuf>,
     pub tls_key: Option<PathBuf>,
+    /// 是否挂载内嵌 Web 静态资源；默认关闭，避免 relay 默认暴露 UI 面。
+    pub web: bool,
 }
 
 impl fmt::Debug for Args {
@@ -28,6 +30,7 @@ impl fmt::Debug for Args {
             .field("auth_token_configured", &self.auth_token.is_some())
             .field("tls_cert", &self.tls_cert)
             .field("tls_key_configured", &self.tls_key.is_some())
+            .field("web", &self.web)
             .finish()
     }
 }
@@ -60,6 +63,7 @@ impl Args {
         let mut auth_token = None;
         let mut tls_cert = None;
         let mut tls_key = None;
+        let mut web = false;
         let mut args = args.into_iter().map(Into::into);
 
         // 第一个参数是程序名；不要求存在，方便单元测试直接传空迭代器。
@@ -96,6 +100,9 @@ impl Args {
                     }
                     tls_key = Some(PathBuf::from(value));
                 }
+                "--web" => {
+                    web = true;
+                }
                 other => return Err(ArgsError::UnknownArgument(other.to_owned())),
             }
         }
@@ -109,6 +116,7 @@ impl Args {
             auth_token,
             tls_cert,
             tls_key,
+            web,
         })
     }
 }
@@ -125,6 +133,7 @@ mod tests {
         assert_eq!(args.auth_token, None);
         assert_eq!(args.tls_cert, None);
         assert_eq!(args.tls_key, None);
+        assert!(!args.web);
     }
 
     #[test]
@@ -162,6 +171,13 @@ mod tests {
             Some(PathBuf::from("/etc/termd/secret-key.pem"))
         );
         assert!(!format!("{args:?}").contains("secret-key.pem"));
+    }
+
+    #[test]
+    fn parses_web_flag() {
+        let args = Args::parse_from(["termrelay", "--web"]).unwrap();
+
+        assert!(args.web);
     }
 
     #[test]

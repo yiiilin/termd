@@ -16,6 +16,7 @@ rustls = "0.23"
 serde.workspace = true
 serde_json.workspace = true
 termd-proto = { path = "../proto" }
+termweb = { path = "../termweb" }
 thiserror.workspace = true
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync"] }
 tokio-rustls = "0.26"

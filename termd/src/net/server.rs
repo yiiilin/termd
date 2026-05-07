@@ -104,33 +104,41 @@ pub fn default_protocol(config: DaemonConfig) -> SharedDaemonProtocol {
     )))
 }
 
-pub fn router(protocol: SharedDaemonProtocol) -> Router {
-    Router::new()
+pub fn router(protocol: SharedDaemonProtocol, web_enabled: bool) -> Router {
+    let router = Router::new()
         .route("/healthz", get(healthz))
         .route("/local/pairing-token", post(local_pairing_token))
         .route("/ws", get(ws_handler))
-        .with_state(protocol)
+        .with_state(protocol);
+
+    if web_enabled {
+        router.fallback(termweb::embedded_web_handler)
+    } else {
+        router
+    }
 }
 
 pub async fn serve(
     config: DaemonConfig,
     protocol: SharedDaemonProtocol,
+    web_enabled: bool,
 ) -> Result<(), ServerError> {
     let addr = listen_addr_from_config(&config)?;
     let listener = TcpListener::bind(addr).await.map_err(ServerError::Bind)?;
 
-    serve_listener(listener, protocol).await
+    serve_listener(listener, protocol, web_enabled).await
 }
 
 pub async fn serve_tls(
     config: DaemonConfig,
     protocol: SharedDaemonProtocol,
     tls_paths: TlsPaths,
+    web_enabled: bool,
 ) -> Result<(), ServerError> {
     let addr = listen_addr_from_config(&config)?;
     let listener = TcpListener::bind(addr).await.map_err(ServerError::Bind)?;
 
-    serve_tls_listener(listener, protocol, tls_paths).await
+    serve_tls_listener(listener, protocol, tls_paths, web_enabled).await
 }
 
 fn listen_addr_from_config(config: &DaemonConfig) -> Result<SocketAddr, ServerError> {
@@ -146,10 +154,11 @@ fn listen_addr_from_config(config: &DaemonConfig) -> Result<SocketAddr, ServerEr
 pub async fn serve_listener(
     listener: TcpListener,
     protocol: SharedDaemonProtocol,
+    web_enabled: bool,
 ) -> Result<(), ServerError> {
     axum::serve(
         listener,
-        router(protocol).into_make_service_with_connect_info::<SocketAddr>(),
+        router(protocol, web_enabled).into_make_service_with_connect_info::<SocketAddr>(),
     )
     .await
     .map_err(ServerError::Serve)
@@ -159,11 +168,12 @@ pub async fn serve_tls_listener(
     listener: TcpListener,
     protocol: SharedDaemonProtocol,
     tls_paths: TlsPaths,
+    web_enabled: bool,
 ) -> Result<(), ServerError> {
     let tls_config = load_rustls_server_config(&tls_paths)?;
 
     // TLS 只替换 transport accept 层；router 和协议状态机保持同一套路径与 E2EE 规则。
-    serve_rustls_listener(listener, router(protocol), tls_config).await
+    serve_rustls_listener(listener, router(protocol, web_enabled), tls_config).await
 }
 
 fn load_rustls_server_config(tls_paths: &TlsPaths) -> Result<rustls::ServerConfig, ServerError> {
@@ -451,6 +461,9 @@ mod tests {
         ProtocolConnection, decode_payload, encrypted_frame_from_envelope, envelope_value,
     };
     use crate::net::{E2eeKeyPair, E2eeSession, E2eeSessionContext, E2eeSessionRole};
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt as _;
 
     #[derive(Debug, Deserialize)]
     struct PairingTokenResponse {
@@ -463,7 +476,33 @@ mod tests {
     #[test]
     fn router_exposes_healthz_and_ws_routes() {
         let protocol = default_protocol(DaemonConfig::default());
-        let _router = router(protocol);
+        let _router = router(protocol, false);
+    }
+
+    #[tokio::test]
+    async fn web_fallback_is_opt_in() {
+        let protocol = default_protocol(DaemonConfig::default());
+        let disabled_response = router(protocol.clone(), false)
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .body(Body::empty())
+                    .expect("test request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(disabled_response.status(), StatusCode::NOT_FOUND);
+
+        let enabled_response = router(protocol, true)
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .body(Body::empty())
+                    .expect("test request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(enabled_response.status(), StatusCode::OK);
     }
 
     struct RawHttpResponse {
@@ -484,7 +523,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let server_protocol = protocol.clone();
         let server = tokio::spawn(async move {
-            let _ = serve_listener(listener, server_protocol).await;
+            let _ = serve_listener(listener, server_protocol, false).await;
         });
         let response = tokio::task::spawn_blocking(move || post_pairing_token(addr))
             .await
@@ -533,7 +572,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let server_protocol = protocol.clone();
         let server = tokio::spawn(async move {
-            let _ = serve_tls_listener(listener, server_protocol, tls_paths).await;
+            let _ = serve_tls_listener(listener, server_protocol, tls_paths, false).await;
         });
 
         let response = tls_healthz_request(addr, &cert_path).await;

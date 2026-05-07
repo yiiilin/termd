@@ -152,8 +152,9 @@ write_env_file() {
   install -d -m 0750 "$ENV_DIR"
   {
     printf '# 这个文件由安装脚本创建，systemd wrapper 会读取它。\n'
-    printf '# 需要 relay、TLS 或自定义监听时，取消注释并修改对应变量。\n'
+    printf '# 需要 relay、TLS、Web 或自定义监听时，取消注释并修改对应变量。\n'
     printf 'TERMD_LISTEN=%q\n' "${TERMD_LISTEN:-127.0.0.1:8765}"
+    printf 'TERMD_WEB_ENABLED=%q\n' "${TERMD_WEB_ENABLED:-0}"
     if [[ -n "${TERMD_RELAY_URLS:-}" ]]; then
       printf 'TERMD_RELAY_URLS=%q\n' "$TERMD_RELAY_URLS"
     else
@@ -215,6 +216,17 @@ if [[ -n "${TERMD_RELAY_URLS:-}" ]]; then
     [[ -n "$relay_url" ]] || continue
     args+=(--relay "$relay_url")
   done
+fi
+
+is_enabled() {
+  case "${1:-}" in
+    1|true|TRUE|yes|YES|on|ON) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+if is_enabled "${TERMD_WEB_ENABLED:-0}"; then
+  args+=(--web)
 fi
 
 exec /usr/local/bin/termd "${args[@]}"

@@ -23,6 +23,7 @@ serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.10"
 termd-proto = { path = "../proto" }
+termweb = { path = "../termweb" }
 thiserror.workspace = true
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync"] }
 tokio-rustls = "0.26"
