@@ -4,6 +4,30 @@
 
 当前仓库仍处于 MVP 阶段。下面的“已验证”只表示当前代码和本地 QA 覆盖的能力；完整 Native client、RBAC、多用户和企业功能还没有交付。
 
+## 安装方式
+
+release 资产和 GHCR 镜像由 tag 驱动。下面是一键安装入口；如果你要固定版本，把 `latest` 换成对应 tag。
+
+### termctl
+
+```bash
+curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termctl.sh | sudo bash
+```
+
+### termd
+
+```bash
+curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termd.sh | sudo bash
+```
+
+### termrelay
+
+```bash
+curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termrelay.sh | sudo bash
+```
+
+`termrelay` 也提供 [docker-compose 部署方式](docs/deployment.md#termrelay-docker-compose)。
+
 ---
 
 ## 当前状态
