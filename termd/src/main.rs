@@ -17,6 +17,33 @@ use tokio::task::JoinHandle;
 const DEFAULT_PAIRING_URL: &str = "http://127.0.0.1:8765";
 const LOCAL_PAIRING_TOKEN_PATH: &str = "/local/pairing-token";
 const LOCAL_PAIRING_HTTP_TIMEOUT: Duration = Duration::from_secs(5);
+const HELP_TEXT: &str = concat!(
+    "termd ",
+    env!("CARGO_PKG_VERSION"),
+    "\n\n",
+    "USAGE:\n",
+    "  termd [OPTIONS]\n",
+    "  termd pair [OPTIONS]\n\n",
+    "OPTIONS:\n",
+    "  --listen <HOST:PORT>           Listen address, default 127.0.0.1:8765\n",
+    "  --relay <WS_URL>               Connect to a relay; repeatable\n",
+    "  --relay-url <WS_URL>           Alias for --relay\n",
+    "  --relay-auth-token <TOKEN>     Transport auth token for relay connections\n",
+    "  --tls-cert <CERT_PEM>          TLS certificate path\n",
+    "  --tls-key <KEY_PEM>            TLS private key path; must be paired with --tls-cert\n",
+    "  --web                          Serve embedded Web UI\n",
+    "  -h, --help                     Print help\n",
+    "  -V, --version                  Print version\n\n",
+    "PAIR OPTIONS:\n",
+    "  --url <HTTP_URL>               Local daemon URL, default http://127.0.0.1:8765\n",
+    "  --qr                           Print a QR payload for Web/mobile pairing\n",
+    "  --ws-url <WS_URL>              WebSocket URL embedded in QR; requires --qr\n\n",
+    "EXAMPLES:\n",
+    "  termd --listen 0.0.0.0:8765 --web\n",
+    "  termd --relay wss://relay.example:443 --relay-auth-token env-token\n",
+    "  termd pair --url http://127.0.0.1:8765\n",
+    "  termd pair --qr --ws-url ws://192.168.1.20:8765/ws\n",
+);
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -28,6 +55,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .init();
 
     match CliCommand::parse(std::env::args().skip(1))? {
+        CliCommand::Help => {
+            println!("{HELP_TEXT}");
+        }
+        CliCommand::Version => {
+            println!("termd {}", env!("CARGO_PKG_VERSION"));
+        }
         CliCommand::Serve {
             listen,
             relay_urls,
@@ -134,6 +167,8 @@ async fn serve_with_optional_tls(
 
 #[derive(Clone, PartialEq, Eq)]
 enum CliCommand {
+    Help,
+    Version,
     Serve {
         listen: Option<ListenAddress>,
         relay_urls: Vec<String>,
@@ -151,6 +186,8 @@ enum CliCommand {
 impl fmt::Debug for CliCommand {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Help => formatter.write_str("Help"),
+            Self::Version => formatter.write_str("Version"),
             Self::Serve {
                 listen,
                 relay_urls,
@@ -193,6 +230,8 @@ impl CliCommand {
         };
 
         match command.as_str() {
+            "-h" | "--help" | "help" => Ok(Self::Help),
+            "-V" | "--version" | "version" => Ok(Self::Version),
             "pair" => parse_pair_args(args),
             "--listen" | "--relay" | "--relay-url" | "--relay-auth-token" | "--tls-cert"
             | "--tls-key" | "--web" => parse_serve_args(std::iter::once(command).chain(args)),
@@ -212,6 +251,8 @@ fn parse_serve_args(args: impl IntoIterator<Item = String>) -> Result<CliCommand
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "-h" | "--help" => return Ok(CliCommand::Help),
+            "-V" | "--version" => return Ok(CliCommand::Version),
             "--listen" => {
                 let value = args.next().ok_or(CliError::MissingListenValue)?;
                 listen = Some(parse_listen_address(&value)?);
@@ -272,6 +313,8 @@ fn parse_pair_args(mut args: impl Iterator<Item = String>) -> Result<CliCommand,
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "-h" | "--help" => return Ok(CliCommand::Help),
+            "-V" | "--version" => return Ok(CliCommand::Version),
             "--url" => {
                 url = args.next().ok_or(CliError::MissingUrlValue)?;
             }
@@ -584,7 +627,7 @@ enum CliError {
 
 impl CliError {
     fn usage() -> &'static str {
-        "usage: termd [--listen 127.0.0.1:8765] [--relay ws://host:port]... [--relay-auth-token <token>] [--tls-cert <cert.pem> --tls-key <key.pem>] [--web] [pair [--url http://127.0.0.1:8765|https://127.0.0.1:8765] [--qr [--ws-url ws://127.0.0.1:8765/ws]]]"
+        "usage: termd [--listen 127.0.0.1:8765] [--relay ws://host:port]... [--relay-auth-token <token>] [--tls-cert <cert.pem> --tls-key <key.pem>] [--web] [pair [--url http://127.0.0.1:8765|https://127.0.0.1:8765] [--qr [--ws-url ws://127.0.0.1:8765/ws]]]\ntry `termd --help` for full help"
     }
 }
 
@@ -721,6 +764,26 @@ mod tests {
                 tls: None,
                 web: false,
             }
+        );
+    }
+
+    #[test]
+    fn parses_help_and_version_without_starting_server() {
+        assert_eq!(
+            CliCommand::parse(["--help".to_owned()]).unwrap(),
+            CliCommand::Help
+        );
+        assert_eq!(
+            CliCommand::parse(["-h".to_owned()]).unwrap(),
+            CliCommand::Help
+        );
+        assert_eq!(
+            CliCommand::parse(["--version".to_owned()]).unwrap(),
+            CliCommand::Version
+        );
+        assert_eq!(
+            CliCommand::parse(["pair".to_owned(), "--help".to_owned()]).unwrap(),
+            CliCommand::Help
         );
     }
 

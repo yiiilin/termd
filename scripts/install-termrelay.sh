@@ -17,6 +17,11 @@ WRAPPER_DIR="/usr/local/lib/termrelay"
 WRAPPER_FILE="${WRAPPER_DIR}/termrelay-run"
 UNIT_FILE="/etc/systemd/system/termrelay.service"
 STATE_DIR="/var/lib/termrelay"
+INSTALL_SET_LISTEN=0
+INSTALL_SET_WEB=0
+INSTALL_SET_AUTH_TOKEN=0
+INSTALL_SET_TLS_CERT=0
+INSTALL_SET_TLS_KEY=0
 
 log() {
   printf '[%s-install] %s\n' "$COMPONENT" "$*"
@@ -35,6 +40,81 @@ require_root() {
   if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
     die "please run this installer with sudo/root so it can write system files"
   fi
+}
+
+print_usage() {
+  cat <<'EOF'
+usage: install-termrelay.sh [OPTIONS]
+
+Install termrelay and register termrelay.service.
+
+Options:
+  --web                       Enable embedded Web UI in systemd.
+  --no-web                    Disable embedded Web UI in systemd.
+  --listen <HOST:PORT>        Set TERMRELAY_LISTEN, for example 0.0.0.0:8080.
+  --public                    Alias for --listen 0.0.0.0:8080.
+  --auth-token <TOKEN>        Set relay transport auth token.
+  --tls-cert <PATH>           Set TLS certificate path.
+  --tls-key <PATH>            Set TLS private key path.
+  -h, --help                  Print this help.
+
+Examples:
+  curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termrelay.sh | sudo bash -- --web
+  curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termrelay.sh | sudo bash -- --listen 0.0.0.0:8080 --auth-token replace-me
+EOF
+}
+
+parse_args() {
+  while (($#)); do
+    case "$1" in
+      -h|--help)
+        print_usage
+        exit 0
+        ;;
+      --web)
+        TERMRELAY_WEB_ENABLED=1
+        INSTALL_SET_WEB=1
+        shift
+        ;;
+      --no-web)
+        TERMRELAY_WEB_ENABLED=0
+        INSTALL_SET_WEB=1
+        shift
+        ;;
+      --listen)
+        [[ $# -ge 2 && -n "$2" ]] || die "--listen requires a value"
+        TERMRELAY_LISTEN="$2"
+        INSTALL_SET_LISTEN=1
+        shift 2
+        ;;
+      --public)
+        TERMRELAY_LISTEN="0.0.0.0:8080"
+        INSTALL_SET_LISTEN=1
+        shift
+        ;;
+      --auth-token)
+        [[ $# -ge 2 && -n "$2" ]] || die "--auth-token requires a non-empty value"
+        TERMRELAY_AUTH_TOKEN="$2"
+        INSTALL_SET_AUTH_TOKEN=1
+        shift 2
+        ;;
+      --tls-cert)
+        [[ $# -ge 2 && -n "$2" ]] || die "--tls-cert requires a non-empty value"
+        TERMRELAY_TLS_CERT="$2"
+        INSTALL_SET_TLS_CERT=1
+        shift 2
+        ;;
+      --tls-key)
+        [[ $# -ge 2 && -n "$2" ]] || die "--tls-key requires a non-empty value"
+        TERMRELAY_TLS_KEY="$2"
+        INSTALL_SET_TLS_KEY=1
+        shift 2
+        ;;
+      *)
+        die "unknown installer argument: $1"
+        ;;
+    esac
+  done
 }
 
 detect_arch() {
@@ -143,12 +223,58 @@ install_from_source() {
   rm -rf "$src_dir"
 }
 
+upsert_env_var() {
+  local key="$1"
+  local value="$2"
+  local quoted tmp
+
+  printf -v quoted '%q' "$value"
+  tmp="$(mktemp)"
+  awk -v key="$key" -v line="${key}=${quoted}" '
+    $0 ~ "^[[:space:]]*#?[[:space:]]*" key "=" {
+      if (!done) {
+        print line
+        done = 1
+      }
+      next
+    }
+    { print }
+    END {
+      if (!done) {
+        print line
+      }
+    }
+  ' "$ENV_FILE" >"$tmp"
+  cat "$tmp" >"$ENV_FILE"
+  rm -f "$tmp"
+}
+
+apply_env_overrides() {
+  # 命令行参数只覆盖用户显式传入的项，避免重装时意外抹掉已有 systemd 配置。
+  if [[ "$INSTALL_SET_LISTEN" -eq 1 ]]; then
+    upsert_env_var "TERMRELAY_LISTEN" "$TERMRELAY_LISTEN"
+  fi
+  if [[ "$INSTALL_SET_WEB" -eq 1 ]]; then
+    upsert_env_var "TERMRELAY_WEB_ENABLED" "$TERMRELAY_WEB_ENABLED"
+  fi
+  if [[ "$INSTALL_SET_AUTH_TOKEN" -eq 1 ]]; then
+    upsert_env_var "TERMRELAY_AUTH_TOKEN" "$TERMRELAY_AUTH_TOKEN"
+  fi
+  if [[ "$INSTALL_SET_TLS_CERT" -eq 1 ]]; then
+    upsert_env_var "TERMRELAY_TLS_CERT" "$TERMRELAY_TLS_CERT"
+  fi
+  if [[ "$INSTALL_SET_TLS_KEY" -eq 1 ]]; then
+    upsert_env_var "TERMRELAY_TLS_KEY" "$TERMRELAY_TLS_KEY"
+  fi
+}
+
 write_env_file() {
   # systemd 服务会以 termrelay 用户运行 wrapper；env 文件需要允许 termrelay 组读取。
   install -d -m 0755 "$ENV_DIR"
 
   if [[ -e "$ENV_FILE" ]]; then
     log "keeping existing env file at ${ENV_FILE}"
+    apply_env_overrides
     chown root:"$SERVICE_NAME" "$ENV_FILE"
     chmod 0640 "$ENV_FILE"
     return 0
@@ -259,6 +385,7 @@ ensure_system_user() {
 }
 
 main() {
+  parse_args "$@"
   require_root
   require_cmd install
   require_cmd tar
@@ -277,6 +404,9 @@ main() {
 
   ensure_system_user
   write_env_file
+  # 重新读取最终 env，保证 wrapper 和 systemd 重启使用同一组配置。
+  # shellcheck source=/dev/null
+  source "$ENV_FILE"
   write_wrapper
   write_unit
 

@@ -106,7 +106,12 @@ mod tests {
                 .starts_with("text/html")
         );
         assert_eq!(
-            response.headers().get(CACHE_CONTROL).unwrap().to_str().unwrap(),
+            response
+                .headers()
+                .get(CACHE_CONTROL)
+                .unwrap()
+                .to_str()
+                .unwrap(),
             "no-store"
         );
     }
