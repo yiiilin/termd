@@ -23,6 +23,7 @@ import {
   nonce,
   nowMs,
   parseEnvelope,
+  randomUuid,
   sessionDataFromBase64,
   sessionDataToBase64,
 } from "../protocol/wire";
@@ -60,7 +61,7 @@ export class MockDaemon {
     private readonly server: WebSocketServer,
     private readonly options: MockDaemonOptions,
   ) {
-    this.serverId = globalThis.crypto.randomUUID();
+    this.serverId = randomUuid();
     this.e2eeKeypair = generateE2eeKeyPair();
   }
 
@@ -104,7 +105,7 @@ export class MockDaemon {
       socket,
       envelope("e2ee_key_exchange", {
         server_id: this.serverId,
-        device_id: globalThis.crypto.randomUUID(),
+        device_id: randomUuid(),
         public_key: this.e2eeKeypair.publicKeyWire,
         nonce: nonce(),
         timestamp_ms: nowMs(),
