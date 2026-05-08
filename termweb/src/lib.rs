@@ -66,11 +66,7 @@ fn asset_response(asset: &'static [u8], path: &str, head_only: bool) -> Response
     let content_type = mime_guess::from_path(path)
         .first_or_octet_stream()
         .to_string();
-    let cache_control = if path == "index.html" {
-        "no-store"
-    } else {
-        "public, max-age=31536000, immutable"
-    };
+    let cache_control = cache_control_for(path);
 
     Response::builder()
         .status(StatusCode::OK)
@@ -83,6 +79,12 @@ fn asset_response(asset: &'static [u8], path: &str, head_only: bool) -> Response
             Body::from(asset)
         })
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+fn cache_control_for(_path: &str) -> &'static str {
+    // Web 资源随 termd/termrelay 二进制一起发布，MVP 阶段优先避免浏览器长期持有旧 bundle。
+    // 旧 JS 一旦被 immutable 缓存，会让已经修复的前端逻辑继续在用户浏览器里报错。
+    "no-store"
 }
 
 #[cfg(test)]
@@ -103,6 +105,17 @@ mod tests {
                 .unwrap()
                 .starts_with("text/html")
         );
+        assert_eq!(
+            response.headers().get(CACHE_CONTROL).unwrap().to_str().unwrap(),
+            "no-store"
+        );
+    }
+
+    #[test]
+    fn embedded_assets_do_not_use_long_lived_cache() {
+        assert_eq!(cache_control_for("index.html"), "no-store");
+        assert_eq!(cache_control_for("assets/index.js"), "no-store");
+        assert_eq!(cache_control_for("assets/index.css"), "no-store");
     }
 
     #[test]
