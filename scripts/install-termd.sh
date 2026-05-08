@@ -61,8 +61,8 @@ Options:
   -h, --help                    Print this help.
 
 Examples:
-  curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termd.sh | sudo bash -- --web
-  curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termd.sh | sudo bash -- --web --listen 0.0.0.0:8765
+  curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termd.sh | sudo bash -s -- --web
+  curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termd.sh | sudo bash -s -- --web --listen 0.0.0.0:8765
 EOF
 }
 

@@ -59,8 +59,8 @@ Options:
   -h, --help                  Print this help.
 
 Examples:
-  curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termrelay.sh | sudo bash -- --web
-  curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termrelay.sh | sudo bash -- --listen 0.0.0.0:8080 --auth-token replace-me
+  curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termrelay.sh | sudo bash -s -- --web
+  curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termrelay.sh | sudo bash -s -- --listen 0.0.0.0:8080 --auth-token replace-me
 EOF
 }
 
