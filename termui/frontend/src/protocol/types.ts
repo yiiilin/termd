@@ -10,8 +10,14 @@ export const ALL_MESSAGE_TYPES = [
   "session_attached",
   "session_data",
   "session_resize",
+  "session_rename",
+  "session_renamed",
+  "session_close",
+  "session_closed",
   "session_list",
   "session_list_result",
+  "daemon_clients",
+  "daemon_clients_result",
   "control_request",
   "control_grant",
   "e2ee_key_exchange",
@@ -104,9 +110,11 @@ export interface TerminalSize {
 
 export type SessionState = "created" | "running" | "closed";
 export type AttachRole = "controller" | "viewer";
+export type SessionAttachIntent = "auto" | "viewer";
 
 export interface SessionSummaryPayload {
   session_id: UUID;
+  name?: string | null;
   state: SessionState;
   size: TerminalSize;
 }
@@ -115,11 +123,62 @@ export interface SessionListResultPayload {
   sessions: SessionSummaryPayload[];
 }
 
+export interface DaemonClientsPayload {}
+
+export interface DaemonClientSummaryPayload {
+  client_id: UUID;
+  device_id: UUID;
+  peer_ip: string | null;
+  online: boolean;
+  connected_at_ms: UnixTimestampMillis;
+  last_seen_at_ms: UnixTimestampMillis;
+  attached_session_ids: UUID[];
+}
+
+export interface DaemonClientsResultPayload {
+  clients: DaemonClientSummaryPayload[];
+}
+
+export interface SessionCreatePayload {
+  command: string[];
+  size: TerminalSize;
+}
+
+export interface SessionCreatedPayload {
+  session_id: UUID;
+  role: AttachRole;
+  state: SessionState;
+  size: TerminalSize;
+}
+
+export interface SessionAttachPayload {
+  session_id: UUID;
+  intent?: SessionAttachIntent;
+}
+
 export interface SessionAttachedPayload {
   session_id: UUID;
   role: AttachRole;
   state: SessionState;
   size: TerminalSize;
+}
+
+export interface SessionRenamePayload {
+  session_id: UUID;
+  name: string;
+}
+
+export interface SessionRenamedPayload {
+  session_id: UUID;
+  name: string;
+}
+
+export interface SessionClosePayload {
+  session_id: UUID;
+}
+
+export interface SessionClosedPayload {
+  session_id: UUID;
 }
 
 export interface SessionDataPayload {

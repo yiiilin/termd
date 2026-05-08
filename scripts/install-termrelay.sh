@@ -22,6 +22,8 @@ INSTALL_SET_WEB=0
 INSTALL_SET_AUTH_TOKEN=0
 INSTALL_SET_TLS_CERT=0
 INSTALL_SET_TLS_KEY=0
+ACTION="install"
+PURGE_STATE=0
 
 log() {
   printf '[%s-install] %s\n' "$COMPONENT" "$*"
@@ -56,11 +58,14 @@ Options:
   --auth-token <TOKEN>        Set relay transport auth token.
   --tls-cert <PATH>           Set TLS certificate path.
   --tls-key <PATH>            Set TLS private key path.
+  --uninstall                 Stop service and remove termrelay program files.
+  --purge                     Implies --uninstall; also remove /var/lib/termrelay and system user.
   -h, --help                  Print this help.
 
 Examples:
   curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termrelay.sh | sudo bash -s -- --web
   curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termrelay.sh | sudo bash -s -- --listen 0.0.0.0:8080 --auth-token replace-me
+  curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termrelay.sh | sudo bash -s -- --uninstall
 EOF
 }
 
@@ -109,6 +114,15 @@ parse_args() {
         TERMRELAY_TLS_KEY="$2"
         INSTALL_SET_TLS_KEY=1
         shift 2
+        ;;
+      --uninstall)
+        ACTION="uninstall"
+        shift
+        ;;
+      --purge)
+        ACTION="uninstall"
+        PURGE_STATE=1
+        shift
         ;;
       *)
         die "unknown installer argument: $1"
@@ -384,9 +398,48 @@ ensure_system_user() {
   install -d -o termrelay -g termrelay -m 0750 "$STATE_DIR"
 }
 
+uninstall_component() {
+  require_cmd systemctl
+
+  log "stopping and disabling ${SERVICE_NAME}.service if present"
+  systemctl stop "$SERVICE_NAME" 2>/dev/null || true
+  systemctl disable "$SERVICE_NAME" 2>/dev/null || true
+
+  # 默认保留 relay 本地状态目录；只有 --purge 才删除数据和 system user。
+  rm -f "$UNIT_FILE"
+  rm -f "$WRAPPER_FILE"
+  rmdir "$WRAPPER_DIR" 2>/dev/null || true
+  rm -f "${INSTALL_PREFIX}/bin/${BIN_NAME}"
+  rm -f "$ENV_FILE"
+  rmdir "$ENV_DIR" 2>/dev/null || true
+
+  systemctl daemon-reload
+  systemctl reset-failed "$SERVICE_NAME" 2>/dev/null || true
+
+  if [[ "$PURGE_STATE" -eq 1 ]]; then
+    log "purging ${STATE_DIR} and system user ${SERVICE_NAME}"
+    rm -rf "$STATE_DIR"
+    if id -u "$SERVICE_NAME" >/dev/null 2>&1; then
+      userdel "$SERVICE_NAME" 2>/dev/null || true
+    fi
+    if getent group "$SERVICE_NAME" >/dev/null 2>&1; then
+      groupdel "$SERVICE_NAME" 2>/dev/null || true
+    fi
+  else
+    log "preserved ${STATE_DIR}; rerun with --uninstall --purge to remove local relay state"
+  fi
+
+  log "uninstalled ${BIN_NAME}"
+}
+
 main() {
   parse_args "$@"
   require_root
+  if [[ "$ACTION" == "uninstall" ]]; then
+    uninstall_component
+    return 0
+  fi
+
   require_cmd install
   require_cmd tar
   require_cmd sha256sum

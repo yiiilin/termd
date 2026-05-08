@@ -37,8 +37,14 @@ pub enum MessageType {
     SessionAttached,
     SessionData,
     SessionResize,
+    SessionRename,
+    SessionRenamed,
+    SessionClose,
+    SessionClosed,
     SessionList,
     SessionListResult,
+    DaemonClients,
+    DaemonClientsResult,
     ControlRequest,
     ControlGrant,
     E2eeKeyExchange,
@@ -99,6 +105,26 @@ impl Default for DeviceId {
     }
 }
 
+/// Web/CLI 侧展示用的客户端标识。
+///
+/// 对个人使用场景而言，客户端通常对应一个已配对设备/浏览器，而不是每次 attach 新建的
+/// WebSocket 实例；它不代表 controller/viewer 权限。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ClientId(pub Uuid);
+
+impl ClientId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Default for ClientId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// session 状态机必须保持单向推进，不能从 CLOSED 恢复。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -123,6 +149,18 @@ pub enum ConnectionState {
 #[serde(rename_all = "snake_case")]
 pub enum AttachRole {
     Controller,
+    Viewer,
+}
+
+/// attach 请求的意图。
+///
+/// `Auto` 保留旧协议语义：没有 controller 时可成为 controller；`Viewer` 只订阅输出，
+/// 即使当前没有 controller，也不会隐式拿走控制权。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionAttachIntent {
+    #[default]
+    Auto,
     Viewer,
 }
 
@@ -349,6 +387,8 @@ pub struct SessionListPayload {}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionSummaryPayload {
     pub session_id: SessionId,
+    #[serde(default)]
+    pub name: Option<String>,
     pub state: SessionState,
     pub size: TerminalSize,
 }
@@ -356,6 +396,29 @@ pub struct SessionSummaryPayload {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionListResultPayload {
     pub sessions: Vec<SessionSummaryPayload>,
+}
+
+/// 查询当前 daemon 曾经见过或正在连接的客户端。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonClientsPayload {}
+
+/// daemon 下单个客户端的展示摘要。
+///
+/// 该结构只用于个人视图里的连接可见性，不表达审计、账号或企业权限模型。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonClientSummaryPayload {
+    pub client_id: ClientId,
+    pub device_id: DeviceId,
+    pub peer_ip: Option<String>,
+    pub online: bool,
+    pub connected_at_ms: UnixTimestampMillis,
+    pub last_seen_at_ms: UnixTimestampMillis,
+    pub attached_session_ids: Vec<SessionId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonClientsResultPayload {
+    pub clients: Vec<DaemonClientSummaryPayload>,
 }
 
 /// `session_data` 在 JSON 通道中使用 base64；二进制 WebSocket 帧可绕过这个结构。
@@ -368,12 +431,36 @@ pub struct SessionDataPayload {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionAttachPayload {
     pub session_id: SessionId,
+    #[serde(default)]
+    pub intent: SessionAttachIntent,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionResizePayload {
     pub session_id: SessionId,
     pub size: TerminalSize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRenamePayload {
+    pub session_id: SessionId,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRenamedPayload {
+    pub session_id: SessionId,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionClosePayload {
+    pub session_id: SessionId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionClosedPayload {
+    pub session_id: SessionId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -467,8 +554,14 @@ mod tests {
             (MessageType::SessionAttached, "session_attached"),
             (MessageType::SessionData, "session_data"),
             (MessageType::SessionResize, "session_resize"),
+            (MessageType::SessionRename, "session_rename"),
+            (MessageType::SessionRenamed, "session_renamed"),
+            (MessageType::SessionClose, "session_close"),
+            (MessageType::SessionClosed, "session_closed"),
             (MessageType::SessionList, "session_list"),
             (MessageType::SessionListResult, "session_list_result"),
+            (MessageType::DaemonClients, "daemon_clients"),
+            (MessageType::DaemonClientsResult, "daemon_clients_result"),
             (MessageType::ControlRequest, "control_request"),
             (MessageType::ControlGrant, "control_grant"),
             (MessageType::E2eeKeyExchange, "e2ee_key_exchange"),
@@ -632,7 +725,10 @@ mod tests {
             state: SessionState::Running,
             size,
         });
-        assert_roundtrip(SessionAttachPayload { session_id });
+        assert_roundtrip(SessionAttachPayload {
+            session_id,
+            intent: SessionAttachIntent::Auto,
+        });
         assert_roundtrip(SessionAttachedPayload {
             session_id,
             role: AttachRole::Viewer,
@@ -644,10 +740,21 @@ mod tests {
             data_base64: "aGVsbG8=".to_owned(),
         });
         assert_roundtrip(SessionResizePayload { session_id, size });
+        assert_roundtrip(SessionRenamePayload {
+            session_id,
+            name: "work shell".to_owned(),
+        });
+        assert_roundtrip(SessionRenamedPayload {
+            session_id,
+            name: "work shell".to_owned(),
+        });
+        assert_roundtrip(SessionClosePayload { session_id });
+        assert_roundtrip(SessionClosedPayload { session_id });
         assert_roundtrip(SessionListPayload {});
         assert_roundtrip(SessionListResultPayload {
             sessions: vec![SessionSummaryPayload {
                 session_id,
+                name: Some("work shell".to_owned()),
                 state: SessionState::Running,
                 size,
             }],
@@ -663,11 +770,40 @@ mod tests {
     }
 
     #[test]
+    fn daemon_client_payloads_roundtrip_with_online_state() {
+        let session_id = SessionId::new();
+        let device_id = DeviceId::new();
+        let client_id = ClientId::new();
+
+        assert_eq!(
+            serde_json::to_value(MessageType::DaemonClients).unwrap(),
+            "daemon_clients"
+        );
+        assert_eq!(
+            serde_json::to_value(MessageType::DaemonClientsResult).unwrap(),
+            "daemon_clients_result"
+        );
+        assert_roundtrip(DaemonClientsPayload {});
+        assert_roundtrip(DaemonClientsResultPayload {
+            clients: vec![DaemonClientSummaryPayload {
+                client_id,
+                device_id,
+                peer_ip: Some("192.0.2.10".to_owned()),
+                online: false,
+                connected_at_ms: UnixTimestampMillis(1_710_000_000_000),
+                last_seen_at_ms: UnixTimestampMillis(1_710_000_030_000),
+                attached_session_ids: vec![session_id],
+            }],
+        });
+    }
+
+    #[test]
     fn envelope_roundtrips_with_session_payload() {
         let envelope = Envelope::new(
             MessageType::SessionAttach,
             SessionAttachPayload {
                 session_id: SessionId::new(),
+                intent: SessionAttachIntent::Auto,
             },
         );
 

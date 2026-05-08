@@ -10,7 +10,7 @@ use qrcode::{QrCode, render::unicode};
 use serde::Deserialize;
 use termd::config::{DaemonConfig, normalize_relay_endpoints};
 use termd::net::relay::{RelayBaseUrl, RelayReconnectPolicy, run_relay_mux_with_reconnect};
-use termd::net::server::{TlsPaths, default_protocol, serve, serve_tls};
+use termd::net::server::{TlsPaths, serve, serve_tls, try_default_protocol};
 use termd_proto::{PairingQrPayload, PairingToken, ServerId, UnixTimestampMillis};
 use tokio::task::JoinHandle;
 
@@ -96,7 +96,7 @@ async fn serve_daemon(
         config.listen_host = listen.host;
         config.listen_port = listen.port;
     }
-    let protocol = default_protocol(config.clone());
+    let protocol = try_default_protocol(config.clone())?;
     let relay_endpoints = normalize_relay_endpoints(
         config
             .relay_endpoints
@@ -965,7 +965,12 @@ mod tests {
             max_delay_ms: 20,
             heartbeat_interval_ms: 10,
         });
-        let protocol = default_protocol(DaemonConfig::default());
+        let protocol = termd::net::server::default_protocol(DaemonConfig::default_for_state_path(
+            std::env::temp_dir().join(format!(
+                "termd-main-test-{}-relay-state.json",
+                std::process::id()
+            )),
+        ));
         let relay_tasks = spawn_relay_reconnect_supervisors(
             vec![format!("ws://{flaky_addr}"), format!("ws://{healthy_addr}")],
             None,

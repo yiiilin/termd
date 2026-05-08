@@ -1122,6 +1122,27 @@ impl DaemonIdentity {
         }
     }
 
+    /// 从持久化的公开身份恢复 daemon identity。
+    ///
+    /// 当前 MVP 的 daemon 私钥还是本地占位材料，尚不参与签名或密钥交换；真正需要跨重启稳定的
+    /// 是 client 签名输入中的 server id 与 daemon public key。后续接入真实 server 私钥时，
+    /// 这里应改为从受保护的本地密钥文件恢复完整身份。
+    pub fn from_persisted_public_identity(server_id: ServerId, public_key: PublicKey) -> Self {
+        let private_nonce = ServerId::new();
+        let private_key = DaemonPrivateKey {
+            _material: format!(
+                "termd-daemon-private-restored-{}-{}",
+                server_id.0, private_nonce.0
+            ),
+        };
+
+        Self {
+            server_id,
+            public_key,
+            _private_key: private_key,
+        }
+    }
+
     /// 返回 daemon 的稳定公开 id。
     pub fn server_id(&self) -> ServerId {
         self.server_id
@@ -1228,6 +1249,23 @@ impl TrustedDevice {
             identity,
             trusted_at_ms,
             last_seen_at_ms: None,
+            label: normalize_label(label),
+        }
+    }
+
+    /// 从本地状态文件恢复可信设备记录。
+    ///
+    /// 这只恢复设备级 trust fact；controller/viewer 仍由运行时 attach 状态机重新计算。
+    pub fn restore(
+        identity: DeviceIdentity,
+        trusted_at_ms: UnixTimestampMillis,
+        last_seen_at_ms: Option<UnixTimestampMillis>,
+        label: Option<String>,
+    ) -> Self {
+        Self {
+            identity,
+            trusted_at_ms,
+            last_seen_at_ms,
             label: normalize_label(label),
         }
     }
@@ -1362,6 +1400,20 @@ impl InMemoryTrustedDeviceStore {
     /// 创建空的可信设备清单。
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// 从持久化快照恢复内存 trust store。
+    pub fn from_trusted_devices(devices: impl IntoIterator<Item = TrustedDevice>) -> Self {
+        let devices = devices
+            .into_iter()
+            .map(|device| (device.device_id(), device))
+            .collect();
+        Self { devices }
+    }
+
+    /// 返回当前可信设备记录，供状态快照持久化。
+    pub fn trusted_devices(&self) -> impl Iterator<Item = &TrustedDevice> {
+        self.devices.values()
     }
 
     /// 使用当前系统时间 trust 设备，便于 daemon 运行时代码调用。

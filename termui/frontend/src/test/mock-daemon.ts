@@ -8,11 +8,14 @@ import {
 import { E2eeSession, generateE2eeKeyPair, type E2eeKeyPair } from "../protocol/e2ee";
 import type {
   AttachRole,
+  DaemonClientSummaryPayload,
   E2eeKeyExchangePayload,
   EncryptedFramePayload,
   Envelope,
   ErrorPayload,
   PairRequestPayload,
+  SessionCreatePayload,
+  SessionCreatedPayload,
   SessionDataPayload,
   SessionSummaryPayload,
   UUID,
@@ -30,10 +33,11 @@ import {
 
 interface MockDaemonOptions {
   token: string;
-  sessions: SessionSummaryPayload[];
+  sessions: Array<SessionSummaryPayload & { name?: string | null }>;
   attachOutput?: string;
   pairFailure?: ErrorPayload;
   sessionDataError?: ErrorPayload;
+  daemonClients?: DaemonClientSummaryPayload[];
 }
 
 interface TrustedDevice {
@@ -51,14 +55,21 @@ export class MockDaemon {
   public readonly serverId: UUID;
   public readonly daemonPublicKey = "ed25519-v1:daemon-public";
   public readonly outerWireLog: string[] = [];
+  public readonly createdCommands: string[][] = [];
   public readonly sessionDataMessages: string[] = [];
+  public readonly attachIntents: Array<"auto" | "viewer" | undefined> = [];
+  public readonly sessionRenames: Array<{ session_id: UUID; name: string }> = [];
+  public readonly closedSessions: UUID[] = [];
+  public pingMessages = 0;
   public readonly decryptedInputs: string[] = [];
   public nextAttachRole: AttachRole = "controller";
+  private createdSessionCounter = 0;
   private readonly e2eeKeypair: E2eeKeyPair;
   private readonly trustedDevices = new Map<UUID, TrustedDevice>();
 
   private constructor(
     private readonly server: WebSocketServer,
+    private readonly urlValue: string,
     private readonly options: MockDaemonOptions,
   ) {
     this.serverId = randomUuid();
@@ -68,14 +79,14 @@ export class MockDaemon {
   static async start(options: MockDaemonOptions): Promise<MockDaemon> {
     const server = new WebSocketServer({ port: 0, host: "127.0.0.1" });
     await new Promise<void>((resolve) => server.once("listening", resolve));
-    const daemon = new MockDaemon(server, options);
+    const address = server.address() as AddressInfo;
+    const daemon = new MockDaemon(server, `ws://127.0.0.1:${address.port}/ws`, options);
     server.on("connection", (socket) => daemon.accept(socket));
     return daemon;
   }
 
   get url(): string {
-    const address = this.server.address() as AddressInfo;
-    return `ws://127.0.0.1:${address.port}/ws`;
+    return this.urlValue;
   }
 
   outerWireText(): string {
@@ -164,14 +175,29 @@ export class MockDaemon {
       case "session_list":
         this.sendInner(connection, envelope("session_list_result", { sessions: this.options.sessions }));
         return;
+      case "daemon_clients": {
+        this.sendInner(
+          connection,
+          envelope("daemon_clients_result", {
+            clients: this.options.daemonClients ?? [],
+          }),
+        );
+        return;
+      }
+      case "session_create":
+        this.handleSessionCreate(connection, inner.payload as SessionCreatePayload);
+        return;
       case "session_attach": {
-        const payload = inner.payload as { session_id: UUID };
+        const payload = inner.payload as { session_id: UUID; intent?: "auto" | "viewer" };
         const session = this.options.sessions.find((candidate) => candidate.session_id === payload.session_id);
+        this.attachIntents.push(payload.intent);
+        // 测试 daemon 模拟真实协议：viewer intent 只建立输出订阅，不隐式抢 controller。
+        const role = payload.intent === "viewer" ? "viewer" : this.nextAttachRole;
         this.sendInner(
           connection,
           envelope("session_attached", {
             session_id: payload.session_id,
-            role: this.nextAttachRole,
+            role,
             state: session?.state ?? "running",
             size: session?.size ?? { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
           }),
@@ -201,6 +227,23 @@ export class MockDaemon {
       }
       case "session_resize":
         return;
+      case "session_rename": {
+        const payload = inner.payload as { session_id: UUID; name: string };
+        this.sessionRenames.push(payload);
+        const session = this.options.sessions.find((candidate) => candidate.session_id === payload.session_id);
+        if (session) {
+          session.name = payload.name;
+        }
+        this.sendInner(connection, envelope("session_renamed", payload));
+        return;
+      }
+      case "session_close": {
+        const payload = inner.payload as { session_id: UUID };
+        this.closedSessions.push(payload.session_id);
+        this.options.sessions = this.options.sessions.filter((session) => session.session_id !== payload.session_id);
+        this.sendInner(connection, envelope("session_closed", payload));
+        return;
+      }
       case "control_request": {
         const payload = inner.payload as { session_id: UUID; device_id: UUID };
         this.nextAttachRole = "controller";
@@ -209,11 +252,41 @@ export class MockDaemon {
       }
       case "ping": {
         const payload = inner.payload as { nonce: string };
+        this.pingMessages += 1;
         this.sendInner(connection, envelope("pong", { nonce: payload.nonce, timestamp_ms: nowMs() }));
         return;
       }
       default:
         this.sendError(connection, "invalid_state", "invalid protocol state");
+    }
+  }
+
+  private handleSessionCreate(connection: MockConnection, payload: SessionCreatePayload): void {
+    this.createdCommands.push(payload.command);
+    this.createdSessionCounter += 1;
+    const sessionId = `00000000-0000-0000-0000-${String(500 + this.createdSessionCounter).padStart(12, "0")}`;
+    const created = {
+      session_id: sessionId,
+      role: this.nextAttachRole,
+      state: "running",
+      size: payload.size,
+    } satisfies SessionCreatedPayload;
+
+    // mock daemon 模拟真实 daemon：session_create 会立刻 attach 当前连接。
+    this.options.sessions.unshift({
+      session_id: created.session_id,
+      state: created.state,
+      size: created.size,
+    });
+    this.sendInner(connection, envelope("session_created", created));
+    if (this.options.attachOutput) {
+      this.sendInner(
+        connection,
+        envelope("session_data", {
+          session_id: created.session_id,
+          data_base64: sessionDataToBase64(new TextEncoder().encode(this.options.attachOutput)),
+        }),
+      );
     }
   }
 

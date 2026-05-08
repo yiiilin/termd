@@ -10,6 +10,7 @@ use std::error::Error;
 use std::fmt::{self, Display};
 use std::io;
 use std::path::{Path, PathBuf};
+use tokio::sync::watch;
 
 /// PTY 模块统一使用的 Result 类型。
 pub type PtyResult<T> = Result<T, PtyError>;
@@ -240,6 +241,11 @@ pub trait PtyBackend: Send + Sync {
 pub trait PtySession: Send {
     /// 从 PTY 输出流读取数据；调用方负责选择阻塞线程或异步桥接方式。
     fn read(&mut self, buffer: &mut [u8]) -> PtyResult<usize>;
+
+    /// 返回输出就绪信号。真实 WebSocket daemon 用该信号主动推送终端输出，避免客户端轮询。
+    fn output_signal(&self) -> Option<watch::Receiver<u64>> {
+        None
+    }
 
     /// 写入用户输入或控制序列。调用前应由 session 层确认当前设备具备控制权。
     fn write_all(&mut self, bytes: &[u8]) -> PtyResult<()>;

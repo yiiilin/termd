@@ -8,6 +8,8 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 
+use tokio::sync::watch;
+
 use crate::pty::{CommandSpec, PtyBackend, PtyError, PtySession, PtySize};
 use crate::session::{AttachRole, SessionError, SessionManager, SessionState, TerminalSize};
 
@@ -154,6 +156,19 @@ impl<B: PtyBackend> SessionRuntime<B> {
         Ok(self.sessions.attach(session_id, device_id)?)
     }
 
+    /// 将已认证设备以 viewer 身份 attach 到 runtime session。
+    ///
+    /// Web 侧点击 session 只是在看这个会话；即使当前没有 controller，也不能因为“观看”
+    /// 动作隐式获得输入控制权。
+    pub fn attach_viewer(
+        &mut self,
+        session_id: &str,
+        device_id: impl Into<String>,
+    ) -> RuntimeResult<AttachRole> {
+        self.ensure_open_session(session_id)?;
+        Ok(self.sessions.attach_viewer(session_id, device_id)?)
+    }
+
     /// 已 attach 设备主动夺取控制权。
     ///
     /// 该方法只转移 session manager 中的 controller/viewer 角色，不触碰 PTY 进程。
@@ -190,6 +205,12 @@ impl<B: PtyBackend> SessionRuntime<B> {
     pub fn read_output(&mut self, session_id: &str, buffer: &mut [u8]) -> RuntimeResult<usize> {
         self.ensure_open_session(session_id)?;
         Ok(self.runtime_session_mut(session_id)?.pty.read(buffer)?)
+    }
+
+    /// 返回 PTY 输出就绪信号。网络层监听该信号后主动推送输出，不需要客户端轮询。
+    pub fn output_signal(&self, session_id: &str) -> RuntimeResult<Option<watch::Receiver<u64>>> {
+        self.ensure_open_session(session_id)?;
+        Ok(self.runtime_session(session_id)?.pty.output_signal())
     }
 
     /// 同步更新 SessionManager 元数据与底层 PTY 尺寸。

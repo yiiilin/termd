@@ -3,6 +3,7 @@
 //! 这里只把 socket 字节流接到 `protocol` 状态机；pairing、auth、session 和 E2EE
 //! 规则都由协议核心执行，避免网络框架层夹带业务判断。
 
+use std::collections::HashSet;
 use std::net::{AddrParseError, IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -17,16 +18,22 @@ use futures_util::{SinkExt, StreamExt};
 use rustls::pki_types::pem::PemObject;
 use serde::Serialize;
 use termd_proto::{
-    ErrorPayload, MessageType, PairingToken, ProtocolVersion, ServerId, UnixTimestampMillis,
+    ErrorPayload, MessageType, PairingToken, ProtocolVersion, ServerId, SessionId,
+    UnixTimestampMillis,
 };
 use thiserror::Error;
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
 use crate::auth::current_unix_timestamp_millis;
 use crate::config::DaemonConfig;
+use crate::state::{StateError, StateStore};
 
-use super::protocol::{DaemonProtocol, JsonEnvelope, ProtocolError, envelope_value};
+use super::protocol::{
+    DaemonProtocol, JsonEnvelope, ProtocolConnection, ProtocolError, envelope_value,
+};
 use super::pty_bridge::NonBlockingPortablePtyBackend;
 use super::signature::Ed25519SignatureVerifier;
 
@@ -52,6 +59,8 @@ pub enum ServerError {
     MissingTlsPrivateKey,
     #[error("TLS configuration is invalid")]
     TlsConfig,
+    #[error("daemon state persistence failed")]
+    State(#[from] StateError),
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -95,13 +104,23 @@ struct LocalPairingTokenPayload {
     server_id: ServerId,
 }
 
-/// 构造生产默认协议状态。pairing token 入口仍留给后续本地 CLI 接入。
-pub fn default_protocol(config: DaemonConfig) -> SharedDaemonProtocol {
-    Arc::new(Mutex::new(DaemonProtocol::new(
+/// 构造生产默认协议状态，并接入本地状态文件。
+pub fn try_default_protocol(config: DaemonConfig) -> Result<SharedDaemonProtocol, ServerError> {
+    let state = StateStore::load(&config.state_path)?;
+    let protocol = DaemonProtocol::from_state(
         config,
         NonBlockingPortablePtyBackend::new(),
         Ed25519SignatureVerifier,
-    )))
+        state,
+    )?;
+    // 首次启动时立即写入 daemon identity，避免已展示的 server id 只停留在内存里。
+    protocol.persist_state()?;
+    Ok(Arc::new(Mutex::new(protocol)))
+}
+
+/// 测试与旧调用点使用的便捷构造器；生产启动路径使用 `try_default_protocol` 返回结构化错误。
+pub fn default_protocol(config: DaemonConfig) -> SharedDaemonProtocol {
+    try_default_protocol(config).expect("default daemon protocol should initialize")
 }
 
 pub fn router(protocol: SharedDaemonProtocol, web_enabled: bool) -> Router {
@@ -321,90 +340,146 @@ fn is_loopback_peer(peer_addr: SocketAddr) -> bool {
 
 async fn ws_handler(
     websocket: WebSocketUpgrade,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     State(protocol): State<SharedDaemonProtocol>,
 ) -> impl IntoResponse {
-    websocket.on_upgrade(move |socket| handle_socket(socket, protocol))
+    websocket.on_upgrade(move |socket| handle_socket(socket, protocol, peer_addr))
 }
 
-async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol) {
+async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_addr: SocketAddr) {
     let (mut sender, mut receiver) = socket.split();
+    let (output_event_tx, mut output_event_rx) = mpsc::unbounded_channel::<SessionId>();
+    let mut watched_sessions = HashSet::new();
+    let mut watcher_tasks: Vec<JoinHandle<()>> = Vec::new();
     let (mut connection, initial_messages) = {
         let protocol = protocol.lock().expect("daemon protocol mutex poisoned");
-        protocol.start_connection()
+        protocol.start_connection_for_peer(Some(peer_addr.ip().to_string()))
     };
 
-    for envelope in initial_messages {
-        if send_envelope(&mut sender, envelope).await.is_err() {
-            return;
+    if send_envelopes(&mut sender, initial_messages).await.is_err() {
+        return;
+    }
+
+    loop {
+        tokio::select! {
+            maybe_message = receiver.next() => {
+                let Some(message) = maybe_message else {
+                    break;
+                };
+                let message = match message {
+                    Ok(message) => message,
+                    Err(error) => {
+                        warn!(%error, "websocket receive failed");
+                        break;
+                    }
+                };
+
+                match message {
+                    Message::Ping(payload) => {
+                        let _ = sender.send(Message::Pong(payload)).await;
+                        continue;
+                    }
+                    Message::Pong(_) => continue,
+                    Message::Close(_) => break,
+                    other => {
+                        let Some(envelope) = (match message_to_envelope(other) {
+                            Ok(envelope) => envelope,
+                            Err(error) => {
+                                let _ = send_envelope(&mut sender, plaintext_error(error)).await;
+                                continue;
+                            }
+                        }) else {
+                            break;
+                        };
+
+                        let responses = {
+                            let mut protocol = protocol.lock().expect("daemon protocol mutex poisoned");
+                            connection.handle_wire_envelope(&mut protocol, envelope)
+                        };
+
+                        if send_envelopes(&mut sender, responses).await.is_err() {
+                            break;
+                        }
+
+                        register_output_watchers(
+                            &connection,
+                            &protocol,
+                            &mut watched_sessions,
+                            &output_event_tx,
+                            &mut watcher_tasks,
+                        );
+
+                        let output_responses = {
+                            let mut protocol = protocol.lock().expect("daemon protocol mutex poisoned");
+                            connection.read_attached_outputs(
+                                &mut protocol,
+                                OUTPUT_FLUSH_MAX_BYTES_PER_SESSION,
+                            )
+                        };
+
+                        if send_envelopes(&mut sender, output_responses).await.is_err() {
+                            break;
+                        }
+                    }
+                };
+            }
+            maybe_session_id = output_event_rx.recv() => {
+                let Some(session_id) = maybe_session_id else {
+                    break;
+                };
+                let output_responses = {
+                    let mut protocol = protocol.lock().expect("daemon protocol mutex poisoned");
+                    connection.read_session_output(
+                        &mut protocol,
+                        session_id,
+                        OUTPUT_FLUSH_MAX_BYTES_PER_SESSION,
+                    )
+                };
+                if send_envelopes(&mut sender, output_responses).await.is_err() {
+                    break;
+                }
+            }
         }
     }
 
-    while let Some(message) = receiver.next().await {
-        let message = match message {
-            Ok(message) => message,
-            Err(error) => {
-                warn!(%error, "websocket receive failed");
-                break;
-            }
-        };
-
-        match message {
-            Message::Ping(payload) => {
-                let _ = sender.send(Message::Pong(payload)).await;
-                continue;
-            }
-            Message::Pong(_) => continue,
-            Message::Close(_) => break,
-            other => {
-                let Some(envelope) = (match message_to_envelope(other) {
-                    Ok(envelope) => envelope,
-                    Err(error) => {
-                        let _ = send_envelope(&mut sender, plaintext_error(error)).await;
-                        continue;
-                    }
-                }) else {
-                    break;
-                };
-
-                let responses = {
-                    let mut protocol = protocol.lock().expect("daemon protocol mutex poisoned");
-                    connection.handle_wire_envelope(&mut protocol, envelope)
-                };
-
-                let mut send_failed = false;
-                for response in responses {
-                    if send_envelope(&mut sender, response).await.is_err() {
-                        send_failed = true;
-                        break;
-                    }
-                }
-                if send_failed {
-                    break;
-                }
-
-                let output_responses = {
-                    let mut protocol = protocol.lock().expect("daemon protocol mutex poisoned");
-                    connection
-                        .read_attached_outputs(&mut protocol, OUTPUT_FLUSH_MAX_BYTES_PER_SESSION)
-                };
-
-                // 入站帧处理后做一次最小输出 flush；持续后台推送留在后续优化中接入。
-                for response in output_responses {
-                    if send_envelope(&mut sender, response).await.is_err() {
-                        send_failed = true;
-                        break;
-                    }
-                }
-                if send_failed {
-                    break;
-                }
-            }
-        }
+    for task in watcher_tasks {
+        task.abort();
     }
 
     let mut protocol = protocol.lock().expect("daemon protocol mutex poisoned");
     connection.close(&mut protocol);
     debug!("websocket connection closed and detached");
+}
+
+fn register_output_watchers(
+    connection: &ProtocolConnection,
+    protocol: &SharedDaemonProtocol,
+    watched_sessions: &mut HashSet<SessionId>,
+    output_event_tx: &mpsc::UnboundedSender<SessionId>,
+    watcher_tasks: &mut Vec<JoinHandle<()>>,
+) {
+    let signals = {
+        let protocol = protocol.lock().expect("daemon protocol mutex poisoned");
+        connection.attached_output_signals(&protocol)
+    };
+
+    for (session_id, mut signal) in signals {
+        if !watched_sessions.insert(session_id) {
+            continue;
+        }
+
+        let output_event_tx = output_event_tx.clone();
+        watcher_tasks.push(tokio::spawn(async move {
+            loop {
+                if signal.changed().await.is_err() {
+                    break;
+                }
+                if output_event_tx.send(session_id).is_err() {
+                    break;
+                }
+            }
+        }));
+    }
 }
 
 fn message_to_envelope(message: Message) -> Result<Option<JsonEnvelope>, ProtocolError> {
@@ -443,24 +518,40 @@ async fn send_envelope(
     })
 }
 
+async fn send_envelopes(
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    envelopes: Vec<JsonEnvelope>,
+) -> Result<(), ()> {
+    for envelope in envelopes {
+        send_envelope(sender, envelope).await?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
     use serde::Deserialize;
     use std::fs;
     use std::io::{Read, Write};
     use std::path::PathBuf;
     use termd_proto::{
         DeviceId, E2eeKeyExchangePayload, PairAcceptPayload, PairRequestPayload, PublicKey,
+        SessionCreatePayload, SessionCreatedPayload, SessionDataPayload, TerminalSize,
         UnixTimestampMillis,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::time::{Duration, timeout};
+    use tokio_tungstenite::tungstenite::Message as ClientWsMessage;
 
     use crate::auth::current_unix_timestamp_millis;
     use crate::net::protocol::{
         ProtocolConnection, decode_payload, encrypted_frame_from_envelope, envelope_value,
     };
-    use crate::net::{E2eeKeyPair, E2eeSession, E2eeSessionContext, E2eeSessionRole};
+    use crate::net::{
+        E2eeKeyPair, E2eePeerPublicKey, E2eeSession, E2eeSessionContext, E2eeSessionRole,
+    };
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt as _;
@@ -473,15 +564,31 @@ mod tests {
         server_id: ServerId,
     }
 
+    type TestWs = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    fn test_config(name: &str) -> DaemonConfig {
+        DaemonConfig::default_for_state_path(std::env::temp_dir().join(format!(
+            "termd-server-test-{}-{}-{name}.json",
+            std::process::id(),
+            current_unix_timestamp_millis().0
+        )))
+    }
+
+    fn test_protocol(name: &str) -> SharedDaemonProtocol {
+        default_protocol(test_config(name))
+    }
+
     #[test]
     fn router_exposes_healthz_and_ws_routes() {
-        let protocol = default_protocol(DaemonConfig::default());
+        let protocol = test_protocol("router");
         let _router = router(protocol, false);
     }
 
     #[tokio::test]
     async fn web_fallback_is_opt_in() {
-        let protocol = default_protocol(DaemonConfig::default());
+        let protocol = test_protocol("web-fallback");
         let disabled_response = router(protocol.clone(), false)
             .oneshot(
                 Request::builder()
@@ -512,7 +619,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn local_pairing_token_endpoint_issues_runtime_token() {
-        let protocol = default_protocol(DaemonConfig::default());
+        let protocol = test_protocol("local-pairing-token");
         let server_id = {
             protocol
                 .lock()
@@ -544,6 +651,94 @@ mod tests {
         assert_eq!(pair_accept.server_id, server_id);
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn websocket_pushes_session_output_without_client_poll_frame() {
+        let protocol = test_protocol("websocket-push");
+        let pairing_token = {
+            protocol
+                .lock()
+                .expect("daemon protocol mutex poisoned")
+                .issue_pairing_token(current_unix_timestamp_millis())
+                .unwrap()
+                .token()
+                .clone()
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_protocol = protocol.clone();
+        let server = tokio::spawn(async move {
+            let _ = serve_listener(listener, server_protocol, false).await;
+        });
+
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .unwrap();
+        let hello = read_ws_envelope(&mut socket).await;
+        assert_eq!(hello.kind, MessageType::Hello);
+        let key_exchange = read_ws_envelope(&mut socket).await;
+        assert_eq!(key_exchange.kind, MessageType::E2eeKeyExchange);
+        let daemon_exchange: E2eeKeyExchangePayload = decode_payload(key_exchange.payload).unwrap();
+        let device_id = DeviceId::new();
+        let mut device_session = open_client_e2ee(&mut socket, daemon_exchange, device_id).await;
+
+        send_encrypted_ws(
+            &mut socket,
+            &mut device_session,
+            envelope_value(
+                MessageType::PairRequest,
+                PairRequestPayload {
+                    device_id,
+                    device_public_key: PublicKey("ed25519-v1:test-device-key".to_owned()),
+                    token: pairing_token,
+                    nonce: termd_proto::Nonce("push-test-pairing-nonce".to_owned()),
+                    timestamp_ms: current_unix_timestamp_millis(),
+                },
+            )
+            .unwrap(),
+        )
+        .await;
+        let pair_accept = read_encrypted_ws(&mut socket, &mut device_session).await;
+        assert_eq!(pair_accept.kind, MessageType::PairAccept);
+
+        send_encrypted_ws(
+            &mut socket,
+            &mut device_session,
+            envelope_value(
+                MessageType::SessionCreate,
+                SessionCreatePayload {
+                    command: vec![
+                        "sh".to_owned(),
+                        "-lc".to_owned(),
+                        "sleep 0.15; printf pushed-output".to_owned(),
+                    ],
+                    size: TerminalSize::default(),
+                },
+            )
+            .unwrap(),
+        )
+        .await;
+        let created = read_encrypted_ws(&mut socket, &mut device_session).await;
+        assert_eq!(created.kind, MessageType::SessionCreated);
+        let created_payload: SessionCreatedPayload = decode_payload(created.payload).unwrap();
+
+        // 这里不再向 WebSocket 发送 ping 或任意业务帧；PTY 后续输出必须由 daemon 主动推送。
+        let pushed = timeout(
+            Duration::from_secs(2),
+            read_encrypted_ws(&mut socket, &mut device_session),
+        )
+        .await
+        .expect("daemon should push PTY output without client polling");
+        assert_eq!(pushed.kind, MessageType::SessionData);
+        let payload: SessionDataPayload = decode_payload(pushed.payload).unwrap();
+        assert_eq!(payload.session_id, created_payload.session_id);
+        let output = base64::engine::general_purpose::STANDARD
+            .decode(payload.data_base64)
+            .unwrap();
+        assert_eq!(output, b"pushed-output");
+
+        server.abort();
+    }
+
     #[test]
     fn local_pairing_token_peer_check_rejects_non_loopback_peer() {
         assert!(is_loopback_peer(SocketAddr::from(([127, 0, 0, 1], 34_567))));
@@ -561,7 +756,7 @@ mod tests {
     async fn tls_listener_serves_healthz_without_touching_protocol_payloads() {
         let (cert_path, key_path) = write_test_tls_files("healthz");
         let tls_paths = TlsPaths::new(&cert_path, &key_path);
-        let protocol = default_protocol(DaemonConfig::default());
+        let protocol = test_protocol("tls-healthz");
         let server_id = {
             protocol
                 .lock()
@@ -629,6 +824,87 @@ mod tests {
             status,
             body: body.to_owned(),
         }
+    }
+
+    async fn read_ws_envelope(socket: &mut TestWs) -> JsonEnvelope {
+        loop {
+            let message = socket.next().await.unwrap().unwrap();
+            match message {
+                ClientWsMessage::Text(raw) => return serde_json::from_str(&raw).unwrap(),
+                ClientWsMessage::Binary(raw) => return serde_json::from_slice(&raw).unwrap(),
+                ClientWsMessage::Ping(payload) => {
+                    socket.send(ClientWsMessage::Pong(payload)).await.unwrap();
+                }
+                ClientWsMessage::Pong(_) => continue,
+                ClientWsMessage::Close(frame) => panic!("websocket closed unexpectedly: {frame:?}"),
+                ClientWsMessage::Frame(_) => continue,
+            }
+        }
+    }
+
+    async fn send_ws_envelope(socket: &mut TestWs, envelope: JsonEnvelope) {
+        let raw = serde_json::to_string(&envelope).unwrap();
+        socket.send(ClientWsMessage::Text(raw)).await.unwrap();
+    }
+
+    async fn open_client_e2ee(
+        socket: &mut TestWs,
+        daemon_exchange: E2eeKeyExchangePayload,
+        device_id: DeviceId,
+    ) -> E2eeSession {
+        let daemon_public_key = E2eePeerPublicKey::try_from(&daemon_exchange.public_key).unwrap();
+        let device_keypair = E2eeKeyPair::generate();
+        let context = E2eeSessionContext::new(
+            daemon_exchange.server_id,
+            device_id,
+            daemon_public_key,
+            device_keypair.public_key(),
+        );
+        let device_session = E2eeSession::new(
+            E2eeSessionRole::Device,
+            &device_keypair,
+            daemon_public_key,
+            context,
+        )
+        .unwrap();
+        send_ws_envelope(
+            socket,
+            envelope_value(
+                MessageType::E2eeKeyExchange,
+                E2eeKeyExchangePayload {
+                    server_id: daemon_exchange.server_id,
+                    device_id,
+                    public_key: device_keypair.public_key_wire(),
+                    nonce: termd_proto::Nonce("push-test-e2ee-nonce".to_owned()),
+                    timestamp_ms: UnixTimestampMillis(1_000),
+                },
+            )
+            .unwrap(),
+        )
+        .await;
+        device_session
+    }
+
+    async fn send_encrypted_ws(
+        socket: &mut TestWs,
+        device_session: &mut E2eeSession,
+        inner: JsonEnvelope,
+    ) {
+        let frame = device_session.encrypt_json_payload(&inner).unwrap();
+        send_ws_envelope(
+            socket,
+            envelope_value(MessageType::EncryptedFrame, frame).unwrap(),
+        )
+        .await;
+    }
+
+    async fn read_encrypted_ws(
+        socket: &mut TestWs,
+        device_session: &mut E2eeSession,
+    ) -> JsonEnvelope {
+        let outer = read_ws_envelope(socket).await;
+        let frame = encrypted_frame_from_envelope(outer).unwrap();
+        device_session.decrypt_json_payload(&frame).unwrap()
     }
 
     async fn tls_healthz_request(addr: SocketAddr, cert_path: &PathBuf) -> String {

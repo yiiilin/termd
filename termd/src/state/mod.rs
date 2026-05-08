@@ -1,8 +1,8 @@
 //! termd daemon 的本地持久状态快照。
 //!
-//! 本模块保存 daemon 需要跨进程重启保留的最小事实：daemon 公共身份快照、可信设备清单和
-//! session 元数据。这里刻意不保存 PTY 明文输出、terminal 历史或文件传输内容，也不引入
-//! 账号体系。
+//! 本模块保存 daemon 需要跨进程重启保留的最小事实：daemon 公共身份快照、可信设备清单、
+//! session 元数据，以及独立的 SQLite client history 存储入口。这里刻意不保存 PTY 明文
+//! 输出、terminal 历史或文件传输内容，也不引入账号体系。
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::error::Error;
@@ -14,6 +14,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use termd_proto::{
     DeviceId, PublicKey, ServerId, SessionId, SessionState, TerminalSize, UnixTimestampMillis,
 };
+
+pub mod client_history;
 
 /// 当前 daemon 状态文件的 schema 版本。
 pub const STATE_SCHEMA_VERSION: u32 = 1;
@@ -137,6 +139,10 @@ pub enum StateError {
         to: PathBuf,
         source: io::Error,
     },
+    Sqlite {
+        path: PathBuf,
+        source: rusqlite::Error,
+    },
 }
 
 impl fmt::Display for StateError {
@@ -167,6 +173,9 @@ impl fmt::Display for StateError {
                 to.display(),
                 from.display()
             ),
+            Self::Sqlite { path, .. } => {
+                write!(f, "failed to access sqlite store at {}", path.display())
+            }
         }
     }
 }
@@ -179,6 +188,7 @@ impl Error for StateError {
             | Self::CreateDirectory { source, .. }
             | Self::WriteTemp { source, .. }
             | Self::Rename { source, .. } => Some(source),
+            Self::Sqlite { source, .. } => Some(source),
         }
     }
 }

@@ -13,9 +13,17 @@ import type {
   PairAcceptPayload,
   PairedServerState,
   PublicKeyWire,
+  SessionClosePayload,
+  SessionClosedPayload,
+  SessionAttachIntent,
   SessionAttachedPayload,
+  DaemonClientsResultPayload,
+  SessionCreatePayload,
+  SessionCreatedPayload,
   SessionDataPayload,
   SessionListResultPayload,
+  SessionRenamedPayload,
+  SessionRenamePayload,
   TerminalSize,
   UUID,
 } from "./types";
@@ -141,8 +149,28 @@ export class DirectClient {
     return this.expectPayload<SessionListResultPayload>("session_list_result");
   }
 
-  async attachSession(sessionId: UUID): Promise<SessionAttachedPayload> {
-    await this.sendInner(envelope("session_attach", { session_id: sessionId }));
+  async listDaemonClients(): Promise<DaemonClientsResultPayload> {
+    await this.sendInner(envelope("daemon_clients", {}));
+    return this.expectPayload<DaemonClientsResultPayload>("daemon_clients_result");
+  }
+
+  async createSession(command: string[], size: TerminalSize): Promise<SessionCreatedPayload> {
+    await this.sendInner(
+      envelope("session_create", {
+        command,
+        size,
+      } satisfies SessionCreatePayload),
+    );
+    return this.expectPayload<SessionCreatedPayload>("session_created");
+  }
+
+  async attachSession(sessionId: UUID, intent?: SessionAttachIntent): Promise<SessionAttachedPayload> {
+    await this.sendInner(
+      envelope("session_attach", {
+        session_id: sessionId,
+        ...(intent ? { intent } : {}),
+      }),
+    );
     return this.expectPayload<SessionAttachedPayload>("session_attached");
   }
 
@@ -157,6 +185,21 @@ export class DirectClient {
 
   async resizeSession(sessionId: UUID, size: TerminalSize): Promise<void> {
     await this.sendInner(envelope("session_resize", { session_id: sessionId, size }));
+  }
+
+  async renameSession(sessionId: UUID, name: string): Promise<SessionRenamedPayload> {
+    await this.sendInner(
+      envelope("session_rename", {
+        session_id: sessionId,
+        name,
+      } satisfies SessionRenamePayload),
+    );
+    return this.expectPayload<SessionRenamedPayload>("session_renamed");
+  }
+
+  async closeSession(sessionId: UUID): Promise<SessionClosedPayload> {
+    await this.sendInner(envelope("session_close", { session_id: sessionId } satisfies SessionClosePayload));
+    return this.expectPayload<SessionClosedPayload>("session_closed");
   }
 
   async requestControl(sessionId: UUID): Promise<ControlGrantPayload> {

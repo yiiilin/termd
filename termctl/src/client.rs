@@ -17,9 +17,10 @@ use termd::net::{
 use termd_proto::{
     AuthChallengePayload, AuthPayload, ControlGrantPayload, ControlRequestPayload, DeviceId,
     E2eeKeyExchangePayload, EncryptedFramePayload, ErrorPayload, MessageType, PairAcceptPayload,
-    PairRequestPayload, PairingToken, PingPayload, PublicKey, ServerId, SessionAttachPayload,
-    SessionAttachedPayload, SessionCreatePayload, SessionCreatedPayload, SessionDataPayload,
-    SessionId, SessionListPayload, SessionListResultPayload, SessionResizePayload, TerminalSize,
+    PairRequestPayload, PairingToken, PingPayload, PublicKey, ServerId, SessionAttachIntent,
+    SessionAttachPayload, SessionAttachedPayload, SessionCreatePayload, SessionCreatedPayload,
+    SessionDataPayload, SessionId, SessionListPayload, SessionListResultPayload,
+    SessionResizePayload, TerminalSize,
 };
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -193,7 +194,10 @@ impl DirectClient {
     ) -> Result<SessionAttachedPayload> {
         self.send_inner(envelope_value(
             MessageType::SessionAttach,
-            SessionAttachPayload { session_id },
+            SessionAttachPayload {
+                session_id,
+                intent: SessionAttachIntent::Auto,
+            },
         )?)
         .await?;
         self.expect_payload(MessageType::SessionAttached).await

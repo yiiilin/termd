@@ -50,6 +50,36 @@ wget -qO- https://github.com/yiiilin/termd/releases/latest/download/install-term
 
 `termd` 和 `termrelay` 的 systemd 安装脚本都可以通过 `bash -s -- ...` 追加安装参数。常用参数包括 `--web`、`--no-web`、`--listen <HOST:PORT>`、`--public`；也可以在对应的 `/etc/termd/*.env` 里设置 `TERMD_WEB_ENABLED=1`、`TERMRELAY_WEB_ENABLED=1` 或监听地址，脚本会自动组装启动参数。
 
+`termd` 默认创建并使用受限的 `termd` system user。个人机器上如果希望 Web 新建的终端直接以某个系统用户运行，可以安装时指定 `--user <USER>`；该用户必须已存在，session 默认工作目录和默认 shell 会使用该用户的 home/login shell：
+
+```bash
+curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termd.sh | sudo bash -s -- --web --user alice
+```
+
+### 卸载
+
+```bash
+curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termctl.sh | sudo bash -s -- --uninstall
+wget -qO- https://github.com/yiiilin/termd/releases/latest/download/install-termctl.sh | sudo bash -s -- --uninstall
+```
+
+```bash
+curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termd.sh | sudo bash -s -- --uninstall
+wget -qO- https://github.com/yiiilin/termd/releases/latest/download/install-termd.sh | sudo bash -s -- --uninstall
+```
+
+```bash
+curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termrelay.sh | sudo bash -s -- --uninstall
+wget -qO- https://github.com/yiiilin/termd/releases/latest/download/install-termrelay.sh | sudo bash -s -- --uninstall
+```
+
+`termd` 和 `termrelay` 默认卸载只删除二进制、wrapper、systemd unit 和 `/etc/termd/*.env`，会保留 `/var/lib/termd` / `/var/lib/termrelay`。如需连本地状态目录和 system user 一并删除，追加 `--purge`：
+
+```bash
+curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termd.sh | sudo bash -s -- --uninstall --purge
+curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termrelay.sh | sudo bash -s -- --uninstall --purge
+```
+
 ---
 
 ## 当前状态
@@ -69,7 +99,7 @@ wget -qO- https://github.com/yiiilin/termd/releases/latest/download/install-term
 | SSH 会话复用 | 目标场景 | 当前没有专门 SSH 管理层；可以把 `ssh` 当作普通 PTY 命令运行。 |
 | daemon 主动连接 relay | 已验证 | `termd --relay ws://host:port` 会连接 relay 的 daemon mux 路径；可重复传入多个 `--relay` / `--relay-url` 端点。Web/termctl 可使用 `ws://relay/ws/{server_id}/client`；公网部署方案见 [docs/deployment.md](docs/deployment.md)。 |
 | 扫码 / 二维码 pairing | 已验证 | `termd pair --qr` 可输出二维码 payload，并支持 payload 消费。 |
-| 安装脚本 / GHCR 发布 | 已提供 | `scripts/install-termctl.sh`、`scripts/install-termd.sh`、`scripts/install-termrelay.sh` 支持 curl/wget 安装；`termd` 安装后会打印一个短期一次性 pairing token；Linux amd64 release tarball 使用 musl 静态链接二进制；`termd` 和 `termrelay` 的 systemd 安装脚本支持通过 `bash -s -- --web --listen ...` 写入配置；tag 触发的 GitHub Actions 会同时发布 release 资产和 GHCR 镜像，`termrelay` 另有 docker-compose 方案。 |
+| 安装脚本 / GHCR 发布 | 已提供 | `scripts/install-termctl.sh`、`scripts/install-termd.sh`、`scripts/install-termrelay.sh` 支持 curl/wget 安装和 `--uninstall`；`termd` / `termrelay` 额外支持 `--purge` 删除本地状态；`termd` 安装后会打印一个短期一次性 pairing token；Linux amd64 release tarball 使用 musl 静态链接二进制；`termd` 和 `termrelay` 的 systemd 安装脚本支持通过 `bash -s -- --web --listen ...` 写入配置；tag 触发的 GitHub Actions 会同时发布 release 资产和 GHCR 镜像，`termrelay` 另有 docker-compose 方案。 |
 
 非目标：把 termd 做成多人平台。当前设计只面向个人使用和设备级信任。
 

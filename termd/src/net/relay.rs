@@ -537,6 +537,16 @@ mod tests {
     use std::time::Duration;
     use termd_proto::{Envelope, MessageType, PingPayload};
 
+    fn test_protocol(name: &str) -> SharedDaemonProtocol {
+        default_protocol(DaemonConfig::default_for_state_path(
+            std::env::temp_dir().join(format!(
+                "termd-relay-test-{}-{}-{name}.json",
+                std::process::id(),
+                current_unix_timestamp_millis().0
+            )),
+        ))
+    }
+
     #[test]
     fn parses_relay_base_url_and_builds_daemon_mux_url() {
         let server_id = ServerId::new();
@@ -644,7 +654,7 @@ mod tests {
             max_delay_ms: 20,
             heartbeat_interval_ms: 10,
         });
-        let protocol = default_protocol(DaemonConfig::default());
+        let protocol = test_protocol("reconnect-supervisor");
         let connector = tokio::spawn(run_relay_mux_with_reconnect_base(
             base, None, policy, protocol,
         ));
@@ -721,7 +731,7 @@ mod tests {
 
     #[test]
     fn mux_client_connection_can_complete_pairing_on_independent_protocol_connection() {
-        let protocol = default_protocol(DaemonConfig::default());
+        let protocol = test_protocol("mux-pairing");
         let client_id = RelayClientId(42);
         let mut connections = HashMap::new();
 
@@ -824,7 +834,7 @@ mod tests {
 
     #[test]
     fn invalid_mux_client_frame_closes_only_that_client_connection() {
-        let protocol = default_protocol(DaemonConfig::default());
+        let protocol = test_protocol("invalid-mux-frame");
         let bad_client_id = RelayClientId(1);
         let good_client_id = RelayClientId(2);
         let mut connections = HashMap::new();

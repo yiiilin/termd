@@ -10,6 +10,7 @@ BIN_NAME="termctl"
 INSTALL_PREFIX="${TERMD_INSTALL_PREFIX:-/usr/local}"
 REPO="${TERMD_GITHUB_REPO:-${GITHUB_REPOSITORY:-}}"
 VERSION="${TERMD_VERSION:-}"
+ACTION="install"
 
 log() {
   printf '[%s-install] %s\n' "$COMPONENT" "$*"
@@ -28,6 +29,40 @@ require_root() {
   if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
     die "please run this installer with sudo/root so it can write to ${INSTALL_PREFIX}/bin"
   fi
+}
+
+print_usage() {
+  cat <<'EOF'
+usage: install-termctl.sh [OPTIONS]
+
+Install termctl CLI.
+
+Options:
+  --uninstall                 Remove the termctl binary.
+  -h, --help                  Print this help.
+
+Examples:
+  curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termctl.sh | sudo bash
+  curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termctl.sh | sudo bash -s -- --uninstall
+EOF
+}
+
+parse_args() {
+  while (($#)); do
+    case "$1" in
+      -h|--help)
+        print_usage
+        exit 0
+        ;;
+      --uninstall)
+        ACTION="uninstall"
+        shift
+        ;;
+      *)
+        die "unknown installer argument: $1"
+        ;;
+    esac
+  done
 }
 
 detect_arch() {
@@ -136,8 +171,19 @@ install_from_source() {
   rm -rf "$src_dir"
 }
 
+uninstall_component() {
+  rm -f "${INSTALL_PREFIX}/bin/${BIN_NAME}"
+  log "uninstalled ${BIN_NAME}; user pairing state files were not removed"
+}
+
 main() {
+  parse_args "$@"
   require_root
+  if [[ "$ACTION" == "uninstall" ]]; then
+    uninstall_component
+    return 0
+  fi
+
   require_cmd install
   require_cmd tar
   require_cmd sha256sum
@@ -156,4 +202,3 @@ main() {
 }
 
 main "$@"
-

@@ -10,6 +10,7 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread::{self, JoinHandle};
 
 use portable_pty::{Child, MasterPty, native_pty_system};
+use tokio::sync::watch;
 
 use crate::pty::{
     CommandSpec, PtyBackend, PtyError, PtyExitStatus, PtyResult, PtySession, PtySize,
@@ -46,11 +47,12 @@ impl PtyBackend for NonBlockingPortablePtyBackend {
         let reader = master.try_clone_reader().map_err(PtyError::backend)?;
         let writer = master.take_writer().map_err(PtyError::backend)?;
         let (output_tx, output_rx) = mpsc::channel();
+        let (output_signal_tx, output_signal_rx) = watch::channel(0_u64);
 
         // 真实 PTY read 会阻塞，所以只能在专门线程中执行。WebSocket 线程只读 channel 缓存。
         let reader_thread = thread::Builder::new()
             .name("termd-pty-output-reader".to_owned())
-            .spawn(move || read_pty_output(reader, output_tx))
+            .spawn(move || read_pty_output(reader, output_tx, output_signal_tx))
             .map_err(PtyError::backend)?;
 
         Ok(Box::new(NonBlockingPortablePtySession {
@@ -58,6 +60,7 @@ impl PtyBackend for NonBlockingPortablePtyBackend {
             child,
             writer,
             output_rx,
+            output_signal_rx,
             pending_output: VecDeque::new(),
             _reader_thread: reader_thread,
         }))
@@ -66,8 +69,13 @@ impl PtyBackend for NonBlockingPortablePtyBackend {
 
 type OutputMessage = PtyResult<Vec<u8>>;
 
-fn read_pty_output(mut reader: Box<dyn Read + Send>, output_tx: mpsc::Sender<OutputMessage>) {
+fn read_pty_output(
+    mut reader: Box<dyn Read + Send>,
+    output_tx: mpsc::Sender<OutputMessage>,
+    output_signal_tx: watch::Sender<u64>,
+) {
     let mut buffer = vec![0_u8; READER_CHUNK_BYTES];
+    let mut sequence = 0_u64;
 
     loop {
         match reader.read(&mut buffer) {
@@ -76,9 +84,14 @@ fn read_pty_output(mut reader: Box<dyn Read + Send>, output_tx: mpsc::Sender<Out
                 if output_tx.send(Ok(buffer[..read].to_vec())).is_err() {
                     break;
                 }
+                sequence = sequence.wrapping_add(1);
+                // 信号只表示“有输出可读”，不携带终端明文；明文仍只经 E2EE session_data 发送。
+                let _ = output_signal_tx.send(sequence);
             }
             Err(error) => {
                 let _ = output_tx.send(Err(PtyError::from(error)));
+                sequence = sequence.wrapping_add(1);
+                let _ = output_signal_tx.send(sequence);
                 break;
             }
         }
@@ -91,6 +104,7 @@ struct NonBlockingPortablePtySession {
     child: Box<dyn Child + Send + Sync>,
     writer: Box<dyn Write + Send>,
     output_rx: Receiver<OutputMessage>,
+    output_signal_rx: watch::Receiver<u64>,
     pending_output: VecDeque<Vec<u8>>,
     _reader_thread: JoinHandle<()>,
 }
@@ -128,6 +142,10 @@ impl PtySession for NonBlockingPortablePtySession {
         }
 
         Ok(read)
+    }
+
+    fn output_signal(&self) -> Option<watch::Receiver<u64>> {
+        Some(self.output_signal_rx.clone())
     }
 
     fn write_all(&mut self, bytes: &[u8]) -> PtyResult<()> {

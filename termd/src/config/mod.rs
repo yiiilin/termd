@@ -153,6 +153,9 @@ pub struct DaemonConfig {
     pub default_shell: String,
     /// 新建 PTY session 时的默认命令；MVP 中默认等于 `[default_shell]`。
     pub default_command: Vec<String>,
+    /// 新建 PTY session 的默认工作目录；默认来自 daemon 运行用户的 `$HOME`。
+    #[serde(default = "default_working_directory")]
+    pub default_working_directory: Option<PathBuf>,
     /// 新 pairing token 的默认 TTL，单位为毫秒。
     pub pairing_token_ttl_ms: u64,
     /// daemon 主动连接的 relay endpoint 列表；为空时不自动连接 relay。
@@ -183,6 +186,7 @@ impl DaemonConfig {
             state_path: path.into(),
             default_shell: default_shell.clone(),
             default_command: vec![default_shell],
+            default_working_directory: default_working_directory(),
             pairing_token_ttl_ms: DEFAULT_PAIRING_TOKEN_TTL_MS,
             relay_endpoints: Vec::new(),
             relay_auth_token: None,
@@ -428,6 +432,13 @@ fn platform_default_shell() -> String {
     }
 }
 
+fn default_working_directory() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+}
+
 fn default_pairing_ws_url() -> String {
     format!("ws://{DEFAULT_LISTEN_HOST}:{DEFAULT_LISTEN_PORT}/ws")
 }
@@ -463,6 +474,10 @@ mod tests {
         assert_eq!(config.state_path, state_path);
         assert!(!config.default_shell.is_empty());
         assert_eq!(config.default_command, vec![config.default_shell.clone()]);
+        assert_eq!(
+            config.default_working_directory,
+            default_working_directory()
+        );
         assert!(config.pairing_token_ttl_ms > 0);
         assert!(config.relay_endpoints.is_empty());
         assert!(config.relay_auth_token.is_none());
@@ -513,6 +528,7 @@ mod tests {
         config.listen_port = 9001;
         config.default_shell = "/bin/zsh".to_owned();
         config.default_command = vec!["/bin/zsh".to_owned(), "-l".to_owned()];
+        config.default_working_directory = Some(PathBuf::from("/home/termd"));
         config.pairing_token_ttl_ms = 42_000;
         config.relay_endpoints = vec!["ws://127.0.0.1:8080".to_owned()];
         config.relay_auth_token = Some(SecretString::new("relay-secret-1"));

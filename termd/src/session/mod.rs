@@ -166,6 +166,39 @@ impl SessionManager {
         Ok(role)
     }
 
+    /// 将可信设备以 viewer 身份 attach 到 session。
+    ///
+    /// 这条路径用于“先观看再决定是否接管”的 UI 语义：它会启动 Created session，
+    /// 但不会因为 controller 为空而自动授予输入控制权。
+    pub fn attach_viewer(
+        &mut self,
+        session_id: &str,
+        device_id: impl Into<String>,
+    ) -> Result<AttachRole, SessionError> {
+        let device_id = device_id.into();
+        let session = self.session_mut(session_id)?;
+        session.ensure_open()?;
+
+        if session.state == SessionState::Created {
+            session.state = SessionState::Running;
+        }
+
+        if let Some(role) = session.attached_devices.get_mut(&device_id) {
+            if *role == AttachRole::Controller {
+                // viewer intent 来自“点击卡片查看”这种显式观看动作；即使同一设备之前持有
+                // controller，也要降级，避免普通选择操作隐式保留输入控制权。
+                session.controller = None;
+                *role = AttachRole::Viewer;
+            }
+            return Ok(AttachRole::Viewer);
+        }
+
+        session
+            .attached_devices
+            .insert(device_id, AttachRole::Viewer);
+        Ok(AttachRole::Viewer)
+    }
+
     /// 已 attach 的可信设备主动夺取控制权。
     ///
     /// 夺权时只做一次原子状态替换：旧 controller 降为 viewer，新设备升为 controller。
@@ -321,6 +354,22 @@ mod tests {
         assert_eq!(
             manager.role("s1", "dev-b").unwrap(),
             Some(AttachRole::Controller)
+        );
+    }
+
+    #[test]
+    fn viewer_attach_intent_downgrades_existing_controller_role() {
+        let mut manager = SessionManager::default();
+        manager.create_session("s1").unwrap();
+        manager.attach("s1", "dev-a").unwrap();
+
+        let role = manager.attach_viewer("s1", "dev-a").unwrap();
+
+        assert_eq!(role, AttachRole::Viewer);
+        assert_eq!(manager.controller("s1").unwrap(), None);
+        assert_eq!(
+            manager.role("s1", "dev-a").unwrap(),
+            Some(AttachRole::Viewer)
         );
     }
 

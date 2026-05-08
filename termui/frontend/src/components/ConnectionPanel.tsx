@@ -1,4 +1,4 @@
-import { KeyRound } from "lucide-react";
+import { KeyRound, Wifi } from "lucide-react";
 
 interface ConnectionPanelProps {
   url: string;
@@ -37,4 +37,30 @@ export function ConnectionPanel(props: ConnectionPanelProps) {
       </button>
     </section>
   );
+}
+
+interface ConnectionStatusPanelProps {
+  serverId: string;
+  url: string;
+  status: string;
+}
+
+export function ConnectionStatusPanel(props: ConnectionStatusPanelProps) {
+  return (
+    <section className="panel connection-status" aria-label="connection status">
+      <div className="connection-status-main">
+        <Wifi size={16} aria-hidden="true" />
+        <strong>{connectionLabel(props.status)}</strong>
+      </div>
+      <div className="server-identity">{props.serverId}</div>
+      <div className="server-url">{props.url}</div>
+    </section>
+  );
+}
+
+function connectionLabel(status: string): string {
+  if (status === "idle" || status === "connecting" || status === "listing") {
+    return "Checking connection";
+  }
+  return "Connected";
 }

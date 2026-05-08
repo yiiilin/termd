@@ -16,13 +16,19 @@ ENV_FILE="${ENV_DIR}/termd.env"
 WRAPPER_DIR="/usr/local/lib/termd"
 WRAPPER_FILE="${WRAPPER_DIR}/termd-run"
 UNIT_FILE="/etc/systemd/system/termd.service"
-STATE_DIR="/var/lib/termd"
+SERVICE_USER="termd"
+SERVICE_GROUP="termd"
+SERVICE_HOME=""
+SERVICE_SHELL=""
+STATE_DIR=""
 INSTALL_SET_LISTEN=0
 INSTALL_SET_WEB=0
 INSTALL_SET_RELAY_URLS=0
 INSTALL_SET_RELAY_AUTH_TOKEN=0
 INSTALL_SET_TLS_CERT=0
 INSTALL_SET_TLS_KEY=0
+ACTION="install"
+PURGE_STATE=0
 
 log() {
   printf '[%s-install] %s\n' "$COMPONENT" "$*"
@@ -58,11 +64,16 @@ Options:
   --relay-auth-token <TOKEN>    Set relay transport auth token.
   --tls-cert <PATH>             Set TLS certificate path.
   --tls-key <PATH>              Set TLS private key path.
+  --user <USER>                 Run termd.service as this Linux user; default: termd.
+  --uninstall                   Stop service and remove termd program files.
+  --purge                       Implies --uninstall; also remove /var/lib/termd and system user.
   -h, --help                    Print this help.
 
 Examples:
   curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termd.sh | sudo bash -s -- --web
+  curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termd.sh | sudo bash -s -- --web --user alice
   curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termd.sh | sudo bash -s -- --web --listen 0.0.0.0:8765
+  curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termd.sh | sudo bash -s -- --uninstall
 EOF
 }
 
@@ -128,6 +139,21 @@ parse_args() {
         TERMD_TLS_KEY="$2"
         INSTALL_SET_TLS_KEY=1
         shift 2
+        ;;
+      --user)
+        [[ $# -ge 2 && -n "$2" ]] || die "--user requires a non-empty value"
+        SERVICE_USER="$2"
+        SERVICE_GROUP="$2"
+        shift 2
+        ;;
+      --uninstall)
+        ACTION="uninstall"
+        shift
+        ;;
+      --purge)
+        ACTION="uninstall"
+        PURGE_STATE=1
+        shift
         ;;
       *)
         die "unknown installer argument: $1"
@@ -290,14 +316,41 @@ apply_env_overrides() {
   fi
 }
 
+resolve_service_identity() {
+  [[ "$SERVICE_USER" =~ ^[A-Za-z_][A-Za-z0-9_.-]*[$]?$ ]] || die "invalid --user value: ${SERVICE_USER}"
+
+  if id -u "$SERVICE_USER" >/dev/null 2>&1; then
+    local passwd_entry primary_group
+    primary_group="$(id -gn "$SERVICE_USER")"
+    passwd_entry="$(getent passwd "$SERVICE_USER")"
+    SERVICE_GROUP="$primary_group"
+    SERVICE_HOME="$(printf '%s' "$passwd_entry" | cut -d: -f6)"
+    SERVICE_SHELL="$(printf '%s' "$passwd_entry" | cut -d: -f7)"
+  else
+    if [[ "$SERVICE_USER" != "termd" ]]; then
+      die "system user ${SERVICE_USER} does not exist; create it first or omit --user to use the managed termd user"
+    fi
+    SERVICE_GROUP="termd"
+    SERVICE_HOME="/var/lib/termd"
+    SERVICE_SHELL="/bin/sh"
+  fi
+
+  [[ -n "$SERVICE_HOME" ]] || SERVICE_HOME="/var/lib/${SERVICE_USER}"
+  [[ -n "$SERVICE_SHELL" && "$SERVICE_SHELL" != "/usr/sbin/nologin" && "$SERVICE_SHELL" != "/sbin/nologin" ]] || SERVICE_SHELL="/bin/sh"
+  STATE_DIR="$SERVICE_HOME/.local/share/termd"
+  if [[ "$SERVICE_USER" == "termd" ]]; then
+    STATE_DIR="/var/lib/termd"
+  fi
+}
+
 write_env_file() {
-  # systemd 服务会以 termd 用户运行 wrapper；env 文件需要允许 termd 组读取。
+  # systemd 服务会以目标用户运行 wrapper；env 文件需要允许该用户的主组读取。
   install -d -m 0755 "$ENV_DIR"
 
   if [[ -e "$ENV_FILE" ]]; then
     log "keeping existing env file at ${ENV_FILE}"
     apply_env_overrides
-    chown root:"$SERVICE_NAME" "$ENV_FILE"
+    chown root:"$SERVICE_GROUP" "$ENV_FILE"
     chmod 0640 "$ENV_FILE"
     return 0
   fi
@@ -328,7 +381,7 @@ write_env_file() {
       printf '# TERMD_TLS_KEY=/etc/termd/privkey.pem\n'
     fi
   } >"$ENV_FILE"
-  chown root:"$SERVICE_NAME" "$ENV_FILE"
+  chown root:"$SERVICE_GROUP" "$ENV_FILE"
   chmod 0640 "$ENV_FILE"
 }
 
@@ -396,18 +449,35 @@ After=network-online.target
 
 [Service]
 Type=simple
-User=termd
-Group=termd
-StateDirectory=termd
+User=${SERVICE_USER}
+Group=${SERVICE_GROUP}
 WorkingDirectory=${STATE_DIR}
-Environment=HOME=${STATE_DIR}
+Environment=HOME=${SERVICE_HOME}
+Environment=SHELL=${SERVICE_SHELL}
 ExecStart=${WRAPPER_FILE}
 Restart=always
 RestartSec=2
+EOF
+
+  if [[ "$SERVICE_USER" == "termd" ]]; then
+    cat >>"$UNIT_FILE" <<EOF
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectHome=yes
 ProtectSystem=strict
+StateDirectory=termd
+EOF
+  else
+    cat >>"$UNIT_FILE" <<'EOF'
+# 自定义用户用于提供接近 SSH 的个人 shell 体验；这里不额外隐藏 home 或只读化文件系统。
+NoNewPrivileges=no
+PrivateTmp=no
+ProtectHome=no
+ProtectSystem=no
+EOF
+  fi
+
+  cat >>"$UNIT_FILE" <<EOF
 
 [Install]
 WantedBy=multi-user.target
@@ -511,15 +581,56 @@ print("[termd-install] remote clients should replace 127.0.0.1 with the daemon a
 }
 
 ensure_system_user() {
-  if ! id -u termd >/dev/null 2>&1; then
-    useradd --system --home-dir "$STATE_DIR" --shell /usr/sbin/nologin --user-group termd
+  if ! id -u "$SERVICE_USER" >/dev/null 2>&1; then
+    useradd --system --home-dir "$STATE_DIR" --shell /usr/sbin/nologin --user-group "$SERVICE_USER"
+    SERVICE_GROUP="$SERVICE_USER"
   fi
-  install -d -o termd -g termd -m 0750 "$STATE_DIR"
+  install -d -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 0750 "$STATE_DIR"
+}
+
+uninstall_component() {
+  require_cmd systemctl
+
+  log "stopping and disabling ${SERVICE_NAME}.service if present"
+  systemctl stop "$SERVICE_NAME" 2>/dev/null || true
+  systemctl disable "$SERVICE_NAME" 2>/dev/null || true
+
+  # 默认只删除程序与 systemd 配置，不删除 daemon identity、可信设备和 session 状态。
+  rm -f "$UNIT_FILE"
+  rm -f "$WRAPPER_FILE"
+  rmdir "$WRAPPER_DIR" 2>/dev/null || true
+  rm -f "${INSTALL_PREFIX}/bin/${BIN_NAME}"
+  rm -f "$ENV_FILE"
+  rmdir "$ENV_DIR" 2>/dev/null || true
+
+  systemctl daemon-reload
+  systemctl reset-failed "$SERVICE_NAME" 2>/dev/null || true
+
+  if [[ "$PURGE_STATE" -eq 1 ]]; then
+    log "purging ${STATE_DIR} and managed system user ${SERVICE_NAME}"
+    rm -rf "$STATE_DIR"
+    if [[ "$SERVICE_USER" == "$SERVICE_NAME" ]] && id -u "$SERVICE_NAME" >/dev/null 2>&1; then
+      userdel "$SERVICE_NAME" 2>/dev/null || true
+    fi
+    if [[ "$SERVICE_USER" == "$SERVICE_NAME" ]] && getent group "$SERVICE_NAME" >/dev/null 2>&1; then
+      groupdel "$SERVICE_NAME" 2>/dev/null || true
+    fi
+  else
+    log "preserved ${STATE_DIR}; rerun with --uninstall --purge to remove local daemon state"
+  fi
+
+  log "uninstalled ${BIN_NAME}"
 }
 
 main() {
   parse_args "$@"
   require_root
+  if [[ "$ACTION" == "uninstall" ]]; then
+    resolve_service_identity
+    uninstall_component
+    return 0
+  fi
+
   require_cmd install
   require_cmd tar
   require_cmd sha256sum
@@ -529,6 +640,7 @@ main() {
   [[ -n "$REPO" ]] || die "set TERMD_GITHUB_REPO=owner/repo before running the installer"
 
   resolve_version
+  resolve_service_identity
   log "installing ${BIN_NAME} ${VERSION}"
 
   if ! install_from_release; then
