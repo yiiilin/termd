@@ -40,6 +40,7 @@ import { SessionList } from "./components/SessionList";
 import { SessionFilesPanel } from "./components/SessionFilesPanel";
 import { StatusBar } from "./components/StatusBar";
 import { TerminalPane } from "./components/TerminalPane";
+import { PairingQrScanner } from "./components/PairingQrScanner";
 
 const FALLBACK_WS_URL = "ws://127.0.0.1:8765/ws";
 const DEFAULT_SESSION_SIZE: TerminalSize = { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 };
@@ -62,6 +63,7 @@ export default function App() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [filesPanelOpen, setFilesPanelOpen] = useState(true);
   const [connectionEditorOpen, setConnectionEditorOpen] = useState(false);
+  const [qrScannerOpen, setQrScannerOpen] = useState(false);
   const [status, setStatus] = useState("idle");
   const [error, setError] = useState<SafeError | undefined>();
   const attachClientRef = useRef<DirectClient | undefined>(undefined);
@@ -126,18 +128,22 @@ export default function App() {
     clearSessionFiles();
   }, [clearSessionFiles]);
 
-  const handlePair = useCallback(async () => {
+  const handlePair = useCallback(async (rawPairingInput?: string) => {
     setError(undefined);
     setStatus("pairing");
+    const pairingInput = typeof rawPairingInput === "string" ? rawPairingInput : pairingToken;
     try {
       const device = await ensureDevice();
-      const payload = parsePairingQrPayload(pairingToken);
+      const payload = parsePairingQrPayload(pairingInput);
       const effectiveUrl = payload?.ws_url ?? url.trim();
-      const token = payload?.token ?? pairingToken.trim();
+      const token = payload?.token ?? pairingInput.trim();
       const client = await DirectClient.connect(effectiveUrl, device.device_id);
       if (payload && client.serverId !== payload.server_id) {
         client.close();
-        throw new ProtocolClientError("pairing_payload_server_mismatch", "pairing payload does not match the connected daemon");
+        throw new ProtocolClientError(
+          "pairing_payload_server_mismatch",
+          "pairing payload does not match the connected daemon",
+        );
       }
       const accepted = await client.pair(token, device.device_public_key);
       client.close();
@@ -161,6 +167,20 @@ export default function App() {
       setSafeError(caught);
     }
   }, [disconnectAttach, pairingToken, setSafeError, url]);
+
+  const handleQrDetected = useCallback(
+    (value: string) => {
+      setQrScannerOpen(false);
+      if (!parsePairingQrPayload(value)) {
+        setPairingToken(value);
+        return;
+      }
+
+      // 有效邀请码直接进入配对流程，避免把一次性 token 暴露在输入框里。
+      void handlePair(value);
+    },
+    [handlePair],
+  );
 
   const handleUrlChange = useCallback((nextUrl: string) => {
     urlTouchedRef.current = true;
@@ -695,8 +715,15 @@ export default function App() {
                 canSaveUrl={hasPairedServer}
                 onUrlChange={handleUrlChange}
                 onTokenChange={setPairingToken}
-                onPair={handlePair}
+                onPair={() => void handlePair()}
+                onScanQr={() => setQrScannerOpen(true)}
                 onSaveUrl={handleSaveConnectionUrl}
+              />
+            ) : null}
+            {qrScannerOpen ? (
+              <PairingQrScanner
+                onDetected={handleQrDetected}
+                onClose={() => setQrScannerOpen(false)}
               />
             ) : null}
             {showConnectionStatus && activeServer ? (

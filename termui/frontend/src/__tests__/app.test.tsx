@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import App, { browserReachableWsUrl, defaultWsUrlFromPage } from "../App";
@@ -6,11 +6,43 @@ import type { SessionFilesResultPayload } from "../protocol/types";
 import { clearBrowserState } from "../state/browser-state";
 import { MockDaemon } from "../test/mock-daemon";
 
+const qrScannerMock = vi.hoisted(() => ({
+  destroy: vi.fn(),
+  hasCamera: vi.fn<() => Promise<boolean>>(() => Promise.resolve(true)),
+  onDecode: undefined as ((result: { data: string }) => void) | undefined,
+  start: vi.fn<() => Promise<void>>(() => Promise.resolve()),
+  stop: vi.fn(),
+}));
+
+vi.mock("qr-scanner", () => {
+  class MockQrScanner {
+    static NO_QR_CODE_FOUND = "No QR code found";
+    static hasCamera = qrScannerMock.hasCamera;
+
+    constructor(_video: HTMLVideoElement, onDecode: (result: { data: string }) => void) {
+      qrScannerMock.onDecode = onDecode;
+    }
+
+    start = qrScannerMock.start;
+    stop = qrScannerMock.stop;
+    destroy = qrScannerMock.destroy;
+  }
+
+  return { default: MockQrScanner };
+});
+
 describe("termui web 工作台", () => {
   let daemon: MockDaemon;
 
   beforeEach(async () => {
     await clearBrowserState();
+    qrScannerMock.destroy.mockClear();
+    qrScannerMock.hasCamera.mockReset();
+    qrScannerMock.hasCamera.mockResolvedValue(true);
+    qrScannerMock.onDecode = undefined;
+    qrScannerMock.start.mockReset();
+    qrScannerMock.start.mockResolvedValue();
+    qrScannerMock.stop.mockClear();
     daemon = await MockDaemon.start({
       token: "secret-token",
       sessions: [
@@ -727,6 +759,7 @@ describe("termui web 工作台", () => {
 
     await screen.findByLabelText("WS URL");
     expect(screen.getByLabelText("Pairing token")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Scan QR" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "New session" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Refresh" })).toBeNull();
     expect(defaultWsUrlFromPage({ protocol: "http:", host: "192.168.55.155:8765" })).toBe(
@@ -740,5 +773,138 @@ describe("termui web 工作台", () => {
         hostname: "192.168.55.155",
       }),
     ).toBe("ws://192.168.55.155:8765/ws");
+  });
+
+  it("点击 Scan QR 后打开扫码 pairing 界面入口", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "Scan QR" }));
+
+    expect(await screen.findByRole("dialog", { name: "Scan pairing QR" })).toBeInTheDocument();
+    await waitFor(() => expect(qrScannerMock.start).toHaveBeenCalledTimes(1));
+    await screen.findByText("Scanning");
+  });
+
+  it("扫码界面关闭时释放摄像头 scanner", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "Scan QR" }));
+    await screen.findByRole("dialog", { name: "Scan pairing QR" });
+    await user.click(screen.getByRole("button", { name: "Close scanner" }));
+
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Scan pairing QR" })).toBeNull());
+    expect(qrScannerMock.destroy).toHaveBeenCalledTimes(1);
+  });
+
+  it("启动中关闭扫码界面后不会继续启动摄像头 scanner", async () => {
+    const user = userEvent.setup();
+    let resolveHasCamera: (value: boolean) => void = () => undefined;
+    qrScannerMock.hasCamera.mockReturnValue(
+      new Promise<boolean>((resolve) => {
+        resolveHasCamera = resolve;
+      }),
+    );
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "Scan QR" }));
+    await screen.findByRole("dialog", { name: "Scan pairing QR" });
+    await waitFor(() => expect(qrScannerMock.hasCamera).toHaveBeenCalledTimes(1));
+    await user.click(screen.getByRole("button", { name: "Close scanner" }));
+
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Scan pairing QR" })).toBeNull());
+    resolveHasCamera(true);
+
+    await new Promise((resolve) => window.setTimeout(resolve, 0));
+    expect(qrScannerMock.destroy).not.toHaveBeenCalled();
+    expect(qrScannerMock.start).not.toHaveBeenCalled();
+  });
+
+  it("scanner start 等待期间关闭扫码界面会销毁 scanner 且不重复释放", async () => {
+    const user = userEvent.setup();
+    let resolveStart: () => void = () => undefined;
+    qrScannerMock.start.mockReturnValue(
+      new Promise<void>((resolve) => {
+        resolveStart = resolve;
+      }),
+    );
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "Scan QR" }));
+    await screen.findByRole("dialog", { name: "Scan pairing QR" });
+    await waitFor(() => expect(qrScannerMock.start).toHaveBeenCalledTimes(1));
+    await user.click(screen.getByRole("button", { name: "Close scanner" }));
+
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Scan pairing QR" })).toBeNull());
+    expect(qrScannerMock.destroy).toHaveBeenCalledTimes(1);
+    resolveStart();
+
+    await new Promise((resolve) => window.setTimeout(resolve, 0));
+    expect(qrScannerMock.destroy).toHaveBeenCalledTimes(1);
+  });
+
+  it("扫描到 QR 内容后关闭扫码界面并填入 Pairing token", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "Scan QR" }));
+    await screen.findByRole("dialog", { name: "Scan pairing QR" });
+
+    qrScannerMock.onDecode?.({ data: "scanned-token" });
+
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Scan pairing QR" })).toBeNull());
+    expect(screen.getByLabelText("Pairing token")).toHaveValue("scanned-token");
+    expect(qrScannerMock.stop).toHaveBeenCalledTimes(1);
+  });
+
+  it("扫描 termd-pair 邀请码后自动配对且不显示 token", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    const payload = JSON.stringify({
+      type: "termd_pairing_qr",
+      version: 1,
+      ws_url: daemon.url,
+      token: "secret-token",
+      server_id: daemon.serverId,
+      expires_at_ms: Date.now() + 60_000,
+    });
+    const inviteCode = `termd-pair:v1:${Buffer.from(payload, "utf8").toString("base64url")}`;
+
+    await user.click(await screen.findByRole("button", { name: "Scan QR" }));
+    await waitFor(() => expect(qrScannerMock.start).toHaveBeenCalledTimes(1));
+
+    qrScannerMock.onDecode?.({ data: inviteCode });
+
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Scan pairing QR" })).toBeNull());
+    await waitFor(() => expect(screen.queryByLabelText("Pairing token")).toBeNull());
+    await screen.findAllByText(daemon.serverId);
+    await screen.findByText(daemon.url);
+    expect(qrScannerMock.stop).toHaveBeenCalledTimes(1);
+    expect(daemon.outerWireText()).not.toContain("secret-token");
+  });
+
+  it("扫描 server_id 不匹配的邀请码时拒绝配对且不显示 token", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    const payload = JSON.stringify({
+      type: "termd_pairing_qr",
+      version: 1,
+      ws_url: daemon.url,
+      token: "secret-token",
+      server_id: "00000000-0000-0000-0000-000000000999",
+      expires_at_ms: Date.now() + 60_000,
+    });
+    const inviteCode = `termd-pair:v1:${Buffer.from(payload, "utf8").toString("base64url")}`;
+
+    await user.click(await screen.findByRole("button", { name: "Scan QR" }));
+    await waitFor(() => expect(qrScannerMock.start).toHaveBeenCalledTimes(1));
+
+    qrScannerMock.onDecode?.({ data: inviteCode });
+
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Scan pairing QR" })).toBeNull());
+    await screen.findByText(/pairing_payload_server_mismatch/);
+    expect(screen.getByLabelText("Pairing token")).toHaveValue("");
+    expect(daemon.outerWireText()).not.toContain("secret-token");
   });
 });

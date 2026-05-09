@@ -8,8 +8,7 @@ import { connect, createServer } from "node:net";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, "../../..");
-const TERMD_HTTP = "http://127.0.0.1:8765";
-const TERMD_PORT = 8765;
+const CARGO_MANIFEST = path.join(REPO_ROOT, "Cargo.toml");
 
 interface StartedProcess {
   child: ChildProcessWithoutNullStreams;
@@ -24,19 +23,36 @@ export interface RealRelayFixture {
 }
 
 export async function startRealRelayFixture(): Promise<RealRelayFixture> {
-  await assertPortFree(TERMD_PORT, "termd");
+  const termdPort = await pickFreePort();
+  const termdHttp = `http://127.0.0.1:${termdPort}`;
   const relayPort = await pickFreePort();
   const relayAddr = `127.0.0.1:${relayPort}`;
   const tempDir = path.join(tmpdir(), `termd-web-relay-${Date.now()}-${Math.random().toString(16).slice(2)}`);
   await mkdir(tempDir, { recursive: true });
 
-  const relay = spawnCargo(["run", "-q", "-p", "termrelay", "--", "--listen", relayAddr], "termrelay");
+  const relay = spawnCargo(["run", "-q", "--manifest-path", CARGO_MANIFEST, "-p", "termrelay", "--", "--listen", relayAddr], "termrelay", tempDir);
   await waitForPort(relayPort, relay, "termrelay");
-  const daemon = spawnCargo(["run", "-q", "-p", "termd", "--", "--relay", `ws://${relayAddr}`], "termd");
-  await waitForPort(TERMD_PORT, daemon, "termd");
+  const daemon = spawnCargo(
+    [
+      "run",
+      "-q",
+      "--manifest-path",
+      CARGO_MANIFEST,
+      "-p",
+      "termd",
+      "--",
+      "--listen",
+      `127.0.0.1:${termdPort}`,
+      "--relay",
+      `ws://${relayAddr}`,
+    ],
+    "termd",
+    tempDir,
+  );
+  await waitForPort(termdPort, daemon, "termd");
 
-  const token = await issueToken();
-  const serverId = await serverIdFromHealthz();
+  const token = await issueToken(termdHttp);
+  const serverId = await serverIdFromHealthz(termdHttp);
   const relayClientUrl = `ws://${relayAddr}/ws/${serverId}/client`;
 
   return {
@@ -51,8 +67,8 @@ export async function startRealRelayFixture(): Promise<RealRelayFixture> {
   };
 }
 
-async function issueToken(): Promise<string> {
-  const body = await httpRequest(`${TERMD_HTTP}/local/pairing-token`, { method: "POST" });
+async function issueToken(termdHttp: string): Promise<string> {
+  const body = await httpRequest(`${termdHttp}/local/pairing-token`, { method: "POST" });
   const parsed = JSON.parse(body) as { token: string };
   if (!parsed.token.startsWith("termd-pair-")) {
     throw new Error("termd pair token had unexpected shape");
@@ -60,8 +76,8 @@ async function issueToken(): Promise<string> {
   return parsed.token;
 }
 
-async function serverIdFromHealthz(): Promise<string> {
-  const body = await httpRequest(`${TERMD_HTTP}/healthz`, { method: "GET" });
+async function serverIdFromHealthz(termdHttp: string): Promise<string> {
+  const body = await httpRequest(`${termdHttp}/healthz`, { method: "GET" });
   const parsed = JSON.parse(body) as { server_id: string };
   return parsed.server_id;
 }
@@ -87,10 +103,10 @@ function httpRequest(url: string, options: { method: "GET" | "POST" }): Promise<
   });
 }
 
-function spawnCargo(args: string[], label: string): StartedProcess {
+function spawnCargo(args: string[], label: string, cwd: string): StartedProcess {
   const log: string[] = [];
   const child = spawn("cargo", args, {
-    cwd: REPO_ROOT,
+    cwd,
     env: { ...process.env, RUST_LOG: "termd=info,termrelay=info" },
   });
 
@@ -130,12 +146,6 @@ async function canOpenTcpPort(port: number): Promise<boolean> {
       resolve(false);
     });
   });
-}
-
-async function assertPortFree(port: number, label: string): Promise<void> {
-  if (await canOpenTcpPort(port)) {
-    throw new Error(`127.0.0.1:${port} is already in use; stop existing ${label} before running this test`);
-  }
 }
 
 async function pickFreePort(): Promise<number> {

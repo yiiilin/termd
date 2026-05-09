@@ -1,4 +1,4 @@
-import { KeyRound, Save, Settings, Wifi } from "lucide-react";
+import { KeyRound, Save, ScanQrCode, Settings, Wifi } from "lucide-react";
 
 interface ConnectionPanelProps {
   url: string;
@@ -8,6 +8,7 @@ interface ConnectionPanelProps {
   onUrlChange: (url: string) => void;
   onTokenChange: (token: string) => void;
   onPair: () => void;
+  onScanQr?: () => void;
   onSaveUrl?: () => void;
 }
 
@@ -38,6 +39,12 @@ export function ConnectionPanel(props: ConnectionPanelProps) {
           <KeyRound size={16} aria-hidden="true" />
           Pair
         </button>
+        {props.onScanQr ? (
+          <button type="button" onClick={props.onScanQr} disabled={props.status === "pairing"}>
+            <ScanQrCode size={16} aria-hidden="true" />
+            Scan QR
+          </button>
+        ) : null}
         {props.canSaveUrl ? (
           <button
             type="button"

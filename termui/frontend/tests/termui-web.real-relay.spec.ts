@@ -10,9 +10,10 @@ test("浏览器通过真实 relay 连接 daemon 完成 pairing 和 session list"
     await page.getByLabel("Pairing token").fill(fixture.token);
     await page.getByRole("button", { name: "Pair" }).click();
 
-    await expect(page.getByText(fixture.serverId)).toBeVisible();
-    await expect(page.getByLabel("Pairing token")).toHaveValue("");
+    await expect(page.getByLabel("connection status").getByText(fixture.serverId, { exact: true })).toBeVisible();
+    await expect(page.getByLabel("Pairing token")).toBeHidden();
 
+    await expect(page.getByRole("button", { name: "Refresh" })).toBeVisible();
     await page.getByRole("button", { name: "Refresh" }).click();
     await expect(page.getByLabel("sessions").getByText("No sessions")).toBeVisible();
 

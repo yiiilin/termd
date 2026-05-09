@@ -110,6 +110,7 @@ pub enum RelayConnectorError {
 pub struct RelayBaseUrl {
     scheme: RelayUrlScheme,
     authority: String,
+    base_path: RelayBasePath,
 }
 
 impl RelayBaseUrl {
@@ -125,28 +126,35 @@ impl RelayBaseUrl {
             return Err(RelayConnectorError::UnsupportedUrl);
         }
 
-        let authority = match rest.split_once('/') {
-            Some((authority, "")) => authority,
-            Some(_) => return Err(RelayConnectorError::UnsupportedUrl),
-            None => rest,
+        let (authority, raw_path) = match rest.split_once('/') {
+            Some((authority, path)) => (authority, Some(path)),
+            None => (rest, None),
         };
         validate_authority(authority)?;
+        let base_path = RelayBasePath::parse(raw_path)?;
         Ok(Self {
             scheme,
             authority: authority.to_owned(),
+            base_path,
         })
     }
 
     /// 返回去掉尾随斜杠后的 canonical endpoint 形式，便于配置层做去重。
     pub fn canonical_url(&self) -> String {
-        format!("{}://{}", self.scheme.as_str(), self.authority)
+        format!(
+            "{}://{}{}",
+            self.scheme.as_str(),
+            self.authority,
+            self.base_path.canonical_suffix()
+        )
     }
 
     pub fn daemon_mux_url(&self, server_id: ServerId) -> String {
         format!(
-            "{}://{}/ws/{}/daemon-mux",
+            "{}://{}{}{}/daemon-mux",
             self.scheme.as_str(),
             self.authority,
+            self.base_path.daemon_mux_prefix(),
             server_id.0
         )
     }
@@ -178,6 +186,36 @@ impl RelayUrlScheme {
         match self {
             Self::Ws => "ws",
             Self::Wss => "wss",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelayBasePath {
+    DefaultWs,
+    ExplicitWs,
+}
+
+impl RelayBasePath {
+    fn parse(raw_path: Option<&str>) -> Result<Self, RelayConnectorError> {
+        match raw_path {
+            None | Some("") => Ok(Self::DefaultWs),
+            Some("ws") | Some("ws/") => Ok(Self::ExplicitWs),
+            // relay base URL 只接受公开入口 path，避免误把完整 client/daemon 业务 path 当作 base。
+            Some(_) => Err(RelayConnectorError::UnsupportedUrl),
+        }
+    }
+
+    fn canonical_suffix(self) -> &'static str {
+        match self {
+            Self::DefaultWs => "",
+            Self::ExplicitWs => "/ws",
+        }
+    }
+
+    fn daemon_mux_prefix(self) -> &'static str {
+        match self {
+            Self::DefaultWs | Self::ExplicitWs => "/ws/",
         }
     }
 }
@@ -643,21 +681,27 @@ fn validate_authority(authority: &str) -> Result<(), RelayConnectorError> {
         return Err(RelayConnectorError::UnsupportedUrl);
     }
     if let Some(after_bracket) = authority.strip_prefix('[') {
-        let Some((host, port)) = after_bracket.split_once("]:") else {
+        let Some((host, suffix)) = after_bracket.split_once(']') else {
             return Err(RelayConnectorError::UnsupportedUrl);
         };
-        if host.is_empty() || port.parse::<u16>().is_err() {
+        if host.is_empty() {
+            return Err(RelayConnectorError::UnsupportedUrl);
+        }
+        return match suffix.strip_prefix(':') {
+            Some(port) if port.parse::<u16>().is_ok() => Ok(()),
+            None if suffix.is_empty() => Ok(()),
+            _ => Err(RelayConnectorError::UnsupportedUrl),
+        };
+    }
+
+    if let Some((host, port)) = authority.rsplit_once(':') {
+        // 未加方括号的 IPv6 不属于合法 authority；这里避免把最后一段误判成端口。
+        if host.is_empty() || host.contains(':') || port.parse::<u16>().is_err() {
             return Err(RelayConnectorError::UnsupportedUrl);
         }
         return Ok(());
-    }
-
-    let Some((host, port)) = authority.rsplit_once(':') else {
-        return Err(RelayConnectorError::UnsupportedUrl);
     };
-    if host.is_empty() || port.parse::<u16>().is_err() {
-        return Err(RelayConnectorError::UnsupportedUrl);
-    }
+
     Ok(())
 }
 
@@ -759,6 +803,18 @@ mod tests {
     }
 
     #[test]
+    fn parses_wss_relay_base_path_and_builds_single_layer_daemon_mux_url() {
+        let server_id = ServerId::new();
+        let base = RelayBaseUrl::parse("wss://termd.yiln.de/ws").unwrap();
+
+        assert_eq!(base.canonical_url(), "wss://termd.yiln.de/ws");
+        assert_eq!(
+            base.daemon_mux_url(server_id),
+            format!("wss://termd.yiln.de/ws/{}/daemon-mux", server_id.0)
+        );
+    }
+
+    #[test]
     fn relay_base_url_canonical_url_drops_trailing_slash_variants() {
         let base = RelayBaseUrl::parse("ws://127.0.0.1:8080/").unwrap();
 
@@ -785,7 +841,10 @@ mod tests {
     fn rejects_unsupported_relay_urls() {
         assert!(RelayBaseUrl::parse("http://127.0.0.1:8080").is_err());
         assert!(RelayBaseUrl::parse("ws://127.0.0.1:8080/path").is_err());
-        assert!(RelayBaseUrl::parse("ws://127.0.0.1").is_err());
+        assert!(RelayBaseUrl::parse("wss://termd.yiln.de/ws/server/client").is_err());
+        assert!(RelayBaseUrl::parse("wss://termd.yiln.de/ws/server/daemon-mux").is_err());
+        assert!(RelayBaseUrl::parse("wss://termd.yiln.de/ws?relay_token=secret").is_err());
+        assert!(RelayBaseUrl::parse("wss://termd.yiln.de/ws#fragment").is_err());
     }
 
     #[test]

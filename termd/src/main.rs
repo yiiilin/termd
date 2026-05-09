@@ -849,11 +849,10 @@ mod tests {
     #[test]
     fn parses_wss_relay_url_for_serve() {
         assert_eq!(
-            CliCommand::parse(["--relay".to_owned(), "wss://relay.example:443".to_owned()])
-                .unwrap(),
+            CliCommand::parse(["--relay".to_owned(), "wss://termd.yiln.de/ws".to_owned()]).unwrap(),
             CliCommand::Serve {
                 listen: None,
-                relay_urls: vec!["wss://relay.example:443".to_owned()],
+                relay_urls: vec!["wss://termd.yiln.de/ws".to_owned()],
                 relay_auth_token: None,
                 tls: None,
                 web: false,

@@ -109,8 +109,8 @@ impl Error for RelayEndpointError {}
 
 /// 把 relay endpoint 列表收敛成 canonical、去重后的顺序列表。
 ///
-/// 这个 helper 只保留 `ws://host:port` / `wss://host:port` 级别的公开 endpoint，不会把
-/// query、fragment 或空值混进最终 supervisor 列表。
+/// 这个 helper 只保留 `ws://host[:port]` / `wss://host[:port]` 级别的公开 endpoint，
+/// 可带 relay base path `/ws`；不会把 query、fragment 或空值混进最终 supervisor 列表。
 pub fn normalize_relay_endpoints(
     endpoints: impl IntoIterator<Item = String>,
 ) -> Result<Vec<String>, RelayEndpointError> {
@@ -492,6 +492,8 @@ mod tests {
         let normalized = normalize_relay_endpoints(vec![
             " ws://127.0.0.1:8080/ ".to_owned(),
             "ws://127.0.0.1:8080".to_owned(),
+            "wss://termd.yiln.de/ws/".to_owned(),
+            "wss://termd.yiln.de/ws".to_owned(),
             "wss://relay.example:443".to_owned(),
             "wss://relay.example:443/".to_owned(),
         ])
@@ -501,6 +503,7 @@ mod tests {
             normalized,
             vec![
                 "ws://127.0.0.1:8080".to_owned(),
+                "wss://termd.yiln.de/ws".to_owned(),
                 "wss://relay.example:443".to_owned(),
             ]
         );

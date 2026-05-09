@@ -1,4 +1,4 @@
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test, type Page, type TestInfo } from "@playwright/test";
 import { MockDaemon } from "../src/test/mock-daemon";
 
 async function activateButton(page: Page, name: string): Promise<void> {
@@ -10,7 +10,7 @@ async function activateButton(page: Page, name: string): Promise<void> {
   await page.keyboard.press("Enter");
 }
 
-test("pair、list、attach、control 的浏览器 smoke", async ({ page }) => {
+test("pair、list、attach 的浏览器 smoke", async ({ page }, testInfo: TestInfo) => {
   const daemon = await MockDaemon.start({
     token: "secret-token",
     sessions: [
@@ -25,21 +25,34 @@ test("pair、list、attach、control 的浏览器 smoke", async ({ page }) => {
 
   try {
     await page.goto("/");
+    await expect(page.getByRole("button", { name: "Scan QR" })).toBeVisible();
+    await page.getByRole("button", { name: "Scan QR" }).click();
+    await expect(page.getByRole("dialog", { name: "Scan pairing QR" })).toBeVisible();
+    await page.getByRole("button", { name: "Close scanner" }).click();
+    await expect(page.getByRole("dialog", { name: "Scan pairing QR" })).toBeHidden();
+
     await page.getByLabel("WS URL").fill(daemon.url);
     await page.getByLabel("Pairing token").fill("secret-token");
     await expect(page.getByLabel("Pairing token")).toHaveValue("secret-token");
     await activateButton(page, "Pair");
 
-    await expect(page.getByLabel("Pairing token")).toHaveValue("");
-    await expect(page.getByText(daemon.serverId)).toBeVisible();
+    await expect(page.getByLabel("Pairing token")).toBeHidden();
+    const connectionStatus = page.getByLabel("connection status");
+    await expect(connectionStatus.getByText(daemon.serverId)).toBeVisible();
+    await expect(connectionStatus.getByText(daemon.url)).toBeVisible();
 
     await activateButton(page, "Refresh");
-    await expect(page.getByLabel("sessions").getByText("00000000-0000-0000-0000-000000000501")).toBeVisible();
+    const sessionRow = page.getByLabel("sessions").getByText("00000000-0000-0000-0000-000000000501");
+    await expect(sessionRow).toBeVisible();
 
-    await activateButton(page, "Attach");
+    await sessionRow.click();
     const terminalPane = page.getByTestId("terminal-pane");
-    await expect(terminalPane.getByText("controller")).toBeVisible();
     await expect(terminalPane).toHaveAttribute("data-output-chunks", "1");
+    await expect(terminalPane.getByText("termd-e2e-ready")).toBeVisible();
+
+    if (testInfo.project.name === "mobile-chrome") {
+      await page.screenshot({ path: "test-results/mobile-termui-smoke.png", fullPage: true });
+    }
 
     await page.getByRole("textbox", { name: "Terminal input" }).focus();
     await page.keyboard.type("terminal-secret");
@@ -50,11 +63,8 @@ test("pair、list、attach、control 的浏览器 smoke", async ({ page }) => {
     expect(daemon.outerWireText()).not.toContain("terminal-secret");
     expect(daemon.outerWireText()).not.toContain("secret-token");
 
-    await activateButton(page, "Steal control");
-    await expect(page.getByTestId("terminal-pane").getByText("controller")).toBeVisible();
-
     await page.reload();
-    await expect(page.getByText(daemon.serverId)).toBeVisible();
+    await expect(page.getByLabel("connection status").getByText(daemon.serverId)).toBeVisible();
     const localStorageText = await page.evaluate(() => JSON.stringify(window.localStorage));
     expect(localStorageText).not.toContain("secret-token");
   } finally {
