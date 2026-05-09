@@ -127,6 +127,13 @@ async fn direct_termctl_binary_covers_session_flow_and_invariants() {
     assert!(!state_after_pair.contains("pairing_token"));
     assert!(!state_after_pair.contains("server_private_key"));
 
+    let second_token = daemon.issue_pairing_token();
+    let second_pair = run_termctl_success(
+        &paired_state,
+        &["pair", "--token", &second_token, "--url", &daemon.url],
+    );
+    assert!(stdout_string(&second_pair).contains("paired server="));
+
     let unpaired_new = run_termctl_failure(
         &unpaired_state,
         &["new", "--url", &daemon.url, "--", "/bin/sh", "-lc", "true"],

@@ -37,6 +37,20 @@ describe("DirectClient", () => {
     expect(daemon.outerWireText()).not.toContain("pair_request");
   });
 
+  it("已信任的同一浏览器 device 可以重新 pairing", async () => {
+    const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000305");
+    const firstClient = await DirectClient.connect(daemon.url, device.device_id, { timeoutMs: 3000 });
+    const firstAccepted = await firstClient.pair("secret-token", device.device_public_key);
+    firstClient.close();
+
+    const secondClient = await DirectClient.connect(daemon.url, device.device_id, { timeoutMs: 3000 });
+    const secondAccepted = await secondClient.pair("secret-token", device.device_public_key);
+    secondClient.close();
+
+    expect(secondAccepted.server_id).toBe(firstAccepted.server_id);
+    expect(secondAccepted.device_id).toBe(device.device_id);
+  });
+
   it("已配对设备可 auth、list、attach、shared-control noop，并隐藏终端输入明文", async () => {
     const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000303");
     const pairClient = await DirectClient.connect(daemon.url, device.device_id, { timeoutMs: 3000 });

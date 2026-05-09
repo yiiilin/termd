@@ -141,7 +141,9 @@ export class DirectClient {
         timestamp_ms: nowMs(),
       }),
     );
-    return this.expectPayload<PairAcceptPayload>("pair_accept");
+    // 已配对过的浏览器 device 重新 Pair 时，daemon 会在 E2EE 握手后主动发 auth_challenge。
+    // Pairing token 仍会被后续 pair_request 校验，这里只跳过这个与本次 Pair 无关的预发挑战。
+    return this.expectPayload<PairAcceptPayload>("pair_accept", { ignoredTypes: ["auth_challenge"] });
   }
 
   async authenticate(device: DeviceState, server: PairedServerState): Promise<void> {
@@ -300,11 +302,14 @@ export class DirectClient {
 
   private async expectPayload<T>(
     expectedType: Envelope["type"],
-    options: { bufferTerminalEvents?: boolean } = {},
+    options: { bufferTerminalEvents?: boolean; ignoredTypes?: Envelope["type"][] } = {},
   ): Promise<T> {
     while (true) {
       const inner = await withTimeout(this.receiveInnerFromSocket(), this.timeoutMs, "response_timeout");
       if (inner.type === "pong") {
+        continue;
+      }
+      if (options.ignoredTypes?.includes(inner.type)) {
         continue;
       }
       if (

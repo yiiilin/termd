@@ -137,7 +137,10 @@ impl DirectClient {
         )?)
         .await?;
 
-        self.expect_payload(MessageType::PairAccept).await
+        // 已信任 device 再次执行 pair 时，daemon 会先按认证路径预发 auth_challenge。
+        // pairing token 仍由 pair_request 校验；CLI 只需要忽略这个与重新配对无关的挑战。
+        self.expect_payload_ignoring(MessageType::PairAccept, &[MessageType::AuthChallenge])
+            .await
     }
 
     pub async fn authenticate(
@@ -309,9 +312,23 @@ impl DirectClient {
     where
         T: DeserializeOwned,
     {
+        self.expect_payload_ignoring(expected, &[]).await
+    }
+
+    async fn expect_payload_ignoring<T>(
+        &mut self,
+        expected: MessageType,
+        ignored: &[MessageType],
+    ) -> Result<T>
+    where
+        T: DeserializeOwned,
+    {
         loop {
             let envelope = self.receive_inner_timeout().await?;
             if envelope.kind == MessageType::Pong {
+                continue;
+            }
+            if ignored.contains(&envelope.kind) {
                 continue;
             }
             if envelope.kind != expected {
