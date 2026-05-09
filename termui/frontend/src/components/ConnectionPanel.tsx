@@ -1,12 +1,14 @@
-import { KeyRound, Wifi } from "lucide-react";
+import { KeyRound, Save, Settings, Wifi } from "lucide-react";
 
 interface ConnectionPanelProps {
   url: string;
   token: string;
   status: string;
+  canSaveUrl?: boolean;
   onUrlChange: (url: string) => void;
   onTokenChange: (token: string) => void;
   onPair: () => void;
+  onSaveUrl?: () => void;
 }
 
 export function ConnectionPanel(props: ConnectionPanelProps) {
@@ -31,10 +33,22 @@ export function ConnectionPanel(props: ConnectionPanelProps) {
           autoComplete="off"
         />
       </label>
-      <button type="button" onClick={props.onPair} disabled={props.status === "pairing" || !props.token.trim()}>
-        <KeyRound size={16} aria-hidden="true" />
-        Pair
-      </button>
+      <div className="connection-actions">
+        <button type="button" onClick={props.onPair} disabled={props.status === "pairing" || !props.token.trim()}>
+          <KeyRound size={16} aria-hidden="true" />
+          Pair
+        </button>
+        {props.canSaveUrl ? (
+          <button
+            type="button"
+            onClick={props.onSaveUrl}
+            disabled={props.status === "saving_url" || !props.url.trim()}
+          >
+            <Save size={16} aria-hidden="true" />
+            Save URL
+          </button>
+        ) : null}
+      </div>
     </section>
   );
 }
@@ -43,6 +57,7 @@ interface ConnectionStatusPanelProps {
   serverId: string;
   url: string;
   status: string;
+  onEdit?: () => void;
 }
 
 export function ConnectionStatusPanel(props: ConnectionStatusPanelProps) {
@@ -51,6 +66,11 @@ export function ConnectionStatusPanel(props: ConnectionStatusPanelProps) {
       <div className="connection-status-main">
         <Wifi size={16} aria-hidden="true" />
         <strong>{connectionLabel(props.status)}</strong>
+        {props.onEdit ? (
+          <button type="button" className="icon-button" aria-label="Edit connection" onClick={props.onEdit}>
+            <Settings size={15} aria-hidden="true" />
+          </button>
+        ) : null}
       </div>
       <div className="server-identity">{props.serverId}</div>
       <div className="server-url">{props.url}</div>

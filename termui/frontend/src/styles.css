@@ -246,6 +246,12 @@ label {
   gap: 8px;
 }
 
+.connection-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
 .connection-status {
   gap: 8px;
 }
@@ -260,6 +266,7 @@ label {
 .connection-status-main strong {
   font-size: 13px;
   letter-spacing: 0;
+  flex: 1;
 }
 
 .panel-title {

@@ -549,22 +549,59 @@ print_initial_pairing_token() {
   endpoint="${base_url}/local/pairing-token"
   for _ in {1..40}; do
     if response="$(post_local_pairing_token "$endpoint" 2>/dev/null)"; then
-      if summary="$(printf '%s' "$response" | PAIRING_BASE_URL="$base_url" python3 -c '
+      if summary="$(printf '%s' "$response" | PAIRING_BASE_URL="$base_url" PAIRING_RELAY_URLS="${TERMD_RELAY_URLS:-}" PAIRING_RELAY_AUTH_TOKEN="${TERMD_RELAY_AUTH_TOKEN:-}" python3 -c '
+import base64
 import json
 import os
+import shlex
 import sys
+import urllib.parse
 
 payload = json.load(sys.stdin)
 base_url = os.environ["PAIRING_BASE_URL"]
+relay_urls = [item for item in os.environ.get("PAIRING_RELAY_URLS", "").split() if item]
+relay_auth_token = os.environ.get("PAIRING_RELAY_AUTH_TOKEN", "")
 token = payload["token"]
 ttl_ms = int(payload.get("ttl_ms", 0))
 server_id = payload.get("server_id", "")
+expires_at_ms = int(payload.get("expires_at_ms", 0))
 ws_url = base_url.replace("https://", "wss://", 1).replace("http://", "ws://", 1) + "/ws"
+
+def invite_code(target_ws_url):
+    # 邀请码只是单行 URL-safe 包装，不是长期密钥；真正认证仍由 daemon 的 pairing/auth 完成。
+    invite_payload = {
+        "type": "termd_pairing_qr",
+        "version": 1,
+        "ws_url": target_ws_url,
+        "token": token,
+        "server_id": server_id,
+        "expires_at_ms": expires_at_ms,
+    }
+    raw = json.dumps(invite_payload, separators=(",", ":")).encode("utf-8")
+    return "termd-pair:v1:" + base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+def relay_client_ws_url():
+    if not relay_urls or not server_id:
+        return None
+    target = relay_urls[0].rstrip("/") + f"/ws/{server_id}/client"
+    if relay_auth_token:
+        target += "?relay_token=" + urllib.parse.quote(relay_auth_token, safe="")
+    return target
 
 print(f"[termd-install] initial pairing token, expires in {ttl_ms // 1000}s:")
 print(token)
 print("[termd-install] pair with:")
 print(f"termctl pair --token {token!r} --url {ws_url}")
+direct_invite = invite_code(ws_url)
+print("[termd-install] direct web invite code:")
+print(direct_invite)
+print(f"termctl pair --payload {shlex.quote(direct_invite)}")
+relay_ws_url = relay_client_ws_url()
+if relay_ws_url:
+    relay_invite = invite_code(relay_ws_url)
+    print("[termd-install] relay web invite code:")
+    print(relay_invite)
+    print(f"termctl pair --payload {shlex.quote(relay_invite)}")
 if server_id:
     print(f"[termd-install] server_id: {server_id}")
 print("[termd-install] remote clients should replace 127.0.0.1 with the daemon address they can reach.")

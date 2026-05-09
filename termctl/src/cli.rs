@@ -55,7 +55,7 @@ pub enum Command {
 pub struct PairArgs {
     #[arg(long, required_unless_present = "payload", conflicts_with = "payload")]
     pub token: Option<String>,
-    #[arg(long)]
+    #[arg(long, help = "Pairing invite code or legacy JSON payload")]
     pub payload: Option<String>,
     #[arg(long, default_value = DEFAULT_URL)]
     pub url: String,
@@ -157,8 +157,8 @@ impl PairingInput {
 }
 
 fn parse_pairing_payload(raw_payload: &str) -> Result<PairingQrPayload> {
-    let payload: PairingQrPayload = serde_json::from_str(raw_payload.trim())
-        .map_err(|_| TermctlError::InvalidPairingPayload)?;
+    let payload = PairingQrPayload::parse_invite_code(raw_payload)
+        .ok_or(TermctlError::InvalidPairingPayload)?;
 
     if !payload.is_supported_version()
         || payload.token.0.is_empty()
@@ -372,6 +372,7 @@ fn state_name(state: SessionState) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use base64::Engine as _;
     use clap::Parser;
 
     use super::*;
@@ -400,13 +401,12 @@ mod tests {
 
     #[test]
     fn parses_pair_command_with_payload() {
-        let cli = Cli::try_parse_from([
-            "termctl",
-            "pair",
-            "--payload",
-            "{\"type\":\"termd_pairing_qr\",\"version\":1,\"ws_url\":\"wss://relay.example/ws/00000000-0000-0000-0000-000000000001/client\",\"token\":\"pair-token\",\"server_id\":\"00000000-0000-0000-0000-000000000001\",\"expires_at_ms\":1710000060000}",
-        ])
-        .unwrap();
+        let payload = "{\"type\":\"termd_pairing_qr\",\"version\":1,\"ws_url\":\"wss://relay.example/ws/00000000-0000-0000-0000-000000000001/client\",\"token\":\"pair-token\",\"server_id\":\"00000000-0000-0000-0000-000000000001\",\"expires_at_ms\":1710000060000}";
+        let payload = format!(
+            "termd-pair:v1:{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload)
+        );
+        let cli = Cli::try_parse_from(["termctl", "pair", "--payload", &payload]).unwrap();
 
         match cli.command {
             Command::Pair(args) => {

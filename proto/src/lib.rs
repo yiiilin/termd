@@ -3,6 +3,7 @@
 //! 这个 crate 只描述客户端、daemon 与 relay 都需要知道的稳定外壳。
 //! 具体业务规则仍由 daemon 执行，relay 只能基于外层路由字段转发密文。
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -284,6 +285,7 @@ pub struct PairingQrPayload {
 impl PairingQrPayload {
     pub const PAYLOAD_TYPE: &'static str = "termd_pairing_qr";
     pub const VERSION: u16 = 1;
+    const INVITE_PREFIX: &'static str = "termd-pair:v1:";
 
     pub fn new(
         ws_url: impl Into<String>,
@@ -303,6 +305,29 @@ impl PairingQrPayload {
 
     pub fn is_supported_version(&self) -> bool {
         self.payload_type == Self::PAYLOAD_TYPE && self.version == Self::VERSION
+    }
+
+    /// 把 pairing payload 压成单行邀请码，便于复制粘贴和 QR 承载。
+    ///
+    /// 这不是安全加密，只是把结构化 JSON 包一层 URL-safe base64。
+    pub fn to_invite_code(&self) -> String {
+        let raw = serde_json::to_vec(self).expect("PairingQrPayload should serialize");
+        format!("{}{}", Self::INVITE_PREFIX, URL_SAFE_NO_PAD.encode(raw))
+    }
+
+    /// 解析单行邀请码。
+    ///
+    /// 这里同时保留对旧 JSON 文本的兼容，便于平滑迁移已有复制流程。
+    pub fn parse_invite_code(raw: &str) -> Option<Self> {
+        let trimmed = raw.trim();
+        if let Some(encoded) = trimmed.strip_prefix(Self::INVITE_PREFIX) {
+            let bytes = URL_SAFE_NO_PAD.decode(encoded).ok()?;
+            let payload: Self = serde_json::from_slice(&bytes).ok()?;
+            return payload.is_supported_version().then_some(payload);
+        }
+
+        let payload: Self = serde_json::from_str(trimmed).ok()?;
+        payload.is_supported_version().then_some(payload)
     }
 }
 
@@ -822,6 +847,20 @@ mod tests {
         for forbidden in ["private", "session_data", "controller", "viewer", "rbac"] {
             assert!(!raw.contains(forbidden));
         }
+    }
+
+    #[test]
+    fn pairing_qr_payload_invite_code_roundtrips() {
+        let payload = PairingQrPayload::new(
+            "wss://relay.example/ws/00000000-0000-0000-0000-000000000001/client",
+            PairingToken("pair-token".to_owned()),
+            ServerId(Uuid::nil()),
+            UnixTimestampMillis(1_710_000_060_000),
+        );
+        let invite = payload.to_invite_code();
+
+        assert!(invite.starts_with("termd-pair:v1:"));
+        assert_eq!(PairingQrPayload::parse_invite_code(&invite), Some(payload));
     }
 
     #[test]

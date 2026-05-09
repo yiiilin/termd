@@ -109,13 +109,19 @@ cargo run -p termrelay -- --listen 127.0.0.1:8080 --auth-token "$RELAY_TOKEN"
 cargo run -p termd -- --relay wss://relay.example:443 --relay-auth-token "$RELAY_TOKEN"
 ```
 
+生成一个指向 relay 的单行邀请码：
+
+```bash
+PAIR_INVITE="$(cargo run -q -p termd -- pair --qr --ws-url "wss://relay.example:443/ws/{server_id}/client?relay_token=${RELAY_TOKEN}" | tail -n1)"
+```
+
 客户端通过同一个 relay 入口访问：
 
 ```bash
-cargo run -p termctl -- pair --token "$PAIRING_TOKEN" --url "wss://relay.example:443/ws/${SERVER_ID}/client?relay_token=${RELAY_TOKEN}"
+cargo run -p termctl -- pair --payload "$PAIR_INVITE"
 ```
 
-Web MVP 也使用同样的 relay client URL。
+Web MVP 打开 relay 页面后也粘贴同一段 `termd-pair:v1:...` 邀请码。
 
 ## 运维检查
 

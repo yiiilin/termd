@@ -5,6 +5,7 @@ import {
   ensureDevice,
   loadBrowserState,
   recordPairing,
+  recordServerUrl,
   saveBrowserState,
 } from "../state/browser-state";
 import type { BrowserState } from "../protocol/types";
@@ -79,6 +80,31 @@ describe("浏览器本地状态", () => {
     expect(second).toEqual(first);
   });
 
+  it("允许把已配对 daemon 的连接地址切换到 relay URL", async () => {
+    const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000026");
+    const serverId = "00000000-0000-0000-0000-000000000027";
+    const directUrl = "ws://127.0.0.1:8765/ws";
+    const relayUrl = `wss://relay.example/ws/${serverId}/client?relay_token=relay-secret`;
+
+    await saveBrowserState({ device, pairedServers: [] });
+    await recordPairing(
+      {
+        server_id: serverId,
+        daemon_public_key: "ed25519-v1:daemon-public",
+        device_id: device.device_id,
+        expires_at_ms: 1710000060000,
+      },
+      directUrl,
+    );
+
+    const next = await recordServerUrl(serverId, relayUrl);
+    const loaded = await loadBrowserState();
+
+    expect(next.defaultUrl).toBe(relayUrl);
+    expect(defaultServerUrl(next)).toBe(relayUrl);
+    expect(defaultServerUrl(loaded)).toBe(relayUrl);
+  });
+
   it("不再把 session 文件树位置写入浏览器本地状态", async () => {
     await saveBrowserState({
       pairedServers: [],
@@ -100,3 +126,7 @@ describe("浏览器本地状态", () => {
     expect(raw).not.toContain("terminal-secret");
   });
 });
+
+function defaultServerUrl(state: BrowserState): string | undefined {
+  return state.pairedServers.find((server) => server.server_id === state.defaultServerId)?.url;
+}

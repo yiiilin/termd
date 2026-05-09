@@ -36,8 +36,8 @@ const HELP_TEXT: &str = concat!(
     "  -V, --version                  Print version\n\n",
     "PAIR OPTIONS:\n",
     "  --url <HTTP_URL>               Local daemon URL, default http://127.0.0.1:8765\n",
-    "  --qr                           Print a QR payload for Web/mobile pairing\n",
-    "  --ws-url <WS_URL>              WebSocket URL embedded in QR; requires --qr\n\n",
+    "  --qr                           Print a QR invite code for Web/mobile pairing\n",
+    "  --ws-url <WS_URL>              WebSocket URL embedded in invite code; requires --qr\n\n",
     "EXAMPLES:\n",
     "  termd --listen 0.0.0.0:8765 --web\n",
     "  termd --relay wss://relay.example:443 --relay-auth-token env-token\n",
@@ -72,8 +72,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let token = request_pairing_token_response(&url)?;
             if qr {
                 let payload = build_pairing_qr_payload(&token, ws_url.as_deref())?;
-                println!("{}", render_pairing_qr(&payload)?);
-                println!("{}", serde_json::to_string(&payload)?);
+                let invite_code = payload.to_invite_code();
+                println!("{}", render_pairing_qr(&invite_code)?);
+                println!("{invite_code}");
             } else {
                 println!("{}", token.token.0);
             }
@@ -573,11 +574,10 @@ fn is_supported_ws_url(value: &str) -> bool {
         && !value.contains('#')
 }
 
-fn render_pairing_qr(payload: &PairingQrPayload) -> Result<String, CliError> {
-    let raw = serde_json::to_string(payload).map_err(|_| CliError::InvalidJson)?;
-    let code = QrCode::new(raw.as_bytes()).map_err(|_| CliError::QrRenderFailed)?;
+fn render_pairing_qr(invite_code: &str) -> Result<String, CliError> {
+    let code = QrCode::new(invite_code.as_bytes()).map_err(|_| CliError::QrRenderFailed)?;
 
-    // 终端输出用 Unicode 二维码；payload JSON 会在下一行单独打印，便于复制。
+    // 终端输出用 Unicode 二维码；邀请码会在下一行单独打印，便于复制粘贴。
     Ok(code.render::<unicode::Dense1x2>().build())
 }
 

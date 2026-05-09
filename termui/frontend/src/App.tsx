@@ -32,6 +32,7 @@ import {
   ensureDevice,
   loadBrowserState,
   recordPairing,
+  recordServerUrl,
 } from "./state/browser-state";
 import { ConnectionPanel, ConnectionStatusPanel } from "./components/ConnectionPanel";
 import { DaemonClientsPanel } from "./components/DaemonClientsPanel";
@@ -60,6 +61,7 @@ export default function App() {
   const [sessionFilesError, setSessionFilesError] = useState<SafeError | undefined>();
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [filesPanelOpen, setFilesPanelOpen] = useState(true);
+  const [connectionEditorOpen, setConnectionEditorOpen] = useState(false);
   const [status, setStatus] = useState("idle");
   const [error, setError] = useState<SafeError | undefined>();
   const attachClientRef = useRef<DirectClient | undefined>(undefined);
@@ -85,7 +87,7 @@ export default function App() {
   const showConnectionStatus = hasPairedServer && !error && status !== "pairing";
   const connectionReady =
     showConnectionStatus && status !== "idle" && status !== "connecting" && status !== "listing";
-  const showPairingForm = !showConnectionStatus;
+  const showPairingForm = !showConnectionStatus || connectionEditorOpen;
   const sessionOperators = useMemo(() => {
     if (!attachedSessionId) {
       return [];
@@ -142,6 +144,7 @@ export default function App() {
       const nextState = await recordPairing(accepted, effectiveUrl);
       setState(nextState);
       setPairingToken("");
+      setConnectionEditorOpen(false);
       setSessions([]);
       setDaemonClients([]);
       setSelectedSessionId(undefined);
@@ -163,6 +166,42 @@ export default function App() {
     urlTouchedRef.current = true;
     setUrl(nextUrl);
   }, []);
+
+  const handleSaveConnectionUrl = useCallback(async () => {
+    const server = activeServer;
+    const device = state.device;
+    const effectiveUrl = url.trim();
+    if (!server || !device || !effectiveUrl) {
+      setSafeError(new ProtocolClientError("missing_pairing", "device is not paired"));
+      return;
+    }
+
+    setError(undefined);
+    setStatus("saving_url");
+    let client: DirectClient | undefined;
+    try {
+      client = await DirectClient.connect(effectiveUrl, device.device_id);
+      await client.authenticate(device, { ...server, url: effectiveUrl });
+      client.close();
+      client = undefined;
+      disconnectAttach();
+      const nextState = await recordServerUrl(server.server_id, effectiveUrl);
+      setState(nextState);
+      setSessions([]);
+      setDaemonClients([]);
+      setSelectedSessionId(undefined);
+      setRenamingSessionId(undefined);
+      setRenameDraft("");
+      setTerminalChunks([]);
+      setConnectionEditorOpen(false);
+      autoCheckedServerRef.current = undefined;
+      setStatus("ready");
+    } catch (caught) {
+      setSafeError(caught);
+    } finally {
+      client?.close();
+    }
+  }, [activeServer, disconnectAttach, setSafeError, state.device, url]);
 
   const authenticatedClient = useCallback(async () => {
     const server = activeServer;
@@ -653,13 +692,23 @@ export default function App() {
                 url={url}
                 token={pairingToken}
                 status={status}
+                canSaveUrl={hasPairedServer}
                 onUrlChange={handleUrlChange}
                 onTokenChange={setPairingToken}
                 onPair={handlePair}
+                onSaveUrl={handleSaveConnectionUrl}
               />
             ) : null}
             {showConnectionStatus && activeServer ? (
-              <ConnectionStatusPanel serverId={activeServer.server_id} url={connectionStatusUrl} status={status} />
+              <ConnectionStatusPanel
+                serverId={activeServer.server_id}
+                url={connectionStatusUrl}
+                status={status}
+                onEdit={() => {
+                  setUrl(connectionStatusUrl);
+                  setConnectionEditorOpen((open) => !open);
+                }}
+              />
             ) : null}
             {connectionReady ? (
               <>

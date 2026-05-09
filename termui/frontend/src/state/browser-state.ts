@@ -56,6 +56,21 @@ export async function recordPairing(accepted: PairAcceptPayload, url: string): P
   return next;
 }
 
+export async function recordServerUrl(serverId: string, url: string): Promise<BrowserState> {
+  const cleanUrl = url.trim();
+  const state = await loadBrowserState();
+  const next = normalizeState({
+    ...state,
+    pairedServers: state.pairedServers.map((server) =>
+      server.server_id === serverId ? { ...server, url: cleanUrl } : server,
+    ),
+    defaultServerId: serverId,
+    defaultUrl: cleanUrl,
+  });
+  await saveBrowserState(next);
+  return next;
+}
+
 export async function clearBrowserState(): Promise<void> {
   const db = await openStateDb();
   await requestToPromise(db.transaction(STORE_NAME, "readwrite").objectStore(STORE_NAME).clear());

@@ -51,6 +51,27 @@ describe("termui web 工作台", () => {
     expect(daemon.outerWireText()).not.toContain("secret-token");
   });
 
+  it("已配对后可以把连接地址改成 relay client URL", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.clear(await screen.findByLabelText("WS URL"));
+    await user.type(screen.getByLabelText("WS URL"), daemon.url);
+    await user.type(screen.getByLabelText("Pairing token"), "secret-token");
+    await user.click(screen.getByRole("button", { name: "Pair" }));
+    await screen.findAllByText(daemon.serverId);
+
+    const relayUrl = `${daemon.url.replace("/ws", `/ws/${daemon.serverId}/client`)}?relay_token=relay-secret`;
+    await user.click(screen.getByRole("button", { name: "Edit connection" }));
+    await user.clear(screen.getByLabelText("WS URL"));
+    await user.type(screen.getByLabelText("WS URL"), relayUrl);
+    await user.click(screen.getByRole("button", { name: "Save URL" }));
+
+    await screen.findByText(relayUrl);
+    await user.click(screen.getByRole("button", { name: "Refresh" }));
+    await screen.findAllByText("00000000-0000-0000-0000-000000000401");
+  });
+
   it("点击 session 卡片直接进入 shared-control operator", async () => {
     const user = userEvent.setup();
     render(<App />);
@@ -493,9 +514,10 @@ describe("termui web 工作台", () => {
       server_id: daemon.serverId,
       expires_at_ms: Date.now() + 60_000,
     });
+    const inviteCode = `termd-pair:v1:${Buffer.from(payload, "utf8").toString("base64url")}`;
 
     await user.clear(await screen.findByLabelText("WS URL"));
-    fireEvent.change(screen.getByLabelText("Pairing token"), { target: { value: payload } });
+    fireEvent.change(screen.getByLabelText("Pairing token"), { target: { value: inviteCode } });
     await user.click(screen.getByRole("button", { name: "Pair" }));
 
     await waitFor(() => expect(screen.queryByLabelText("Pairing token")).toBeNull());

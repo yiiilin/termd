@@ -133,4 +133,25 @@ describe("协议类型", () => {
       ),
     ).toBeUndefined();
   });
+
+  it("QR pairing payload 也应接受单行邀请码", () => {
+    const payload: PairingQrPayload = {
+      type: "termd_pairing_qr",
+      version: 1,
+      ws_url: "wss://relay.example/ws/00000000-0000-0000-0000-000000000001/client",
+      token: "pair-token",
+      server_id: "00000000-0000-0000-0000-000000000001",
+      expires_at_ms: 1710000060000,
+    };
+    const inviteCode = pairingInviteCode(payload);
+
+    expect(inviteCode).toMatch(/^termd-pair:v1:/);
+    expect(parsePairingQrPayload(inviteCode)).toEqual(payload);
+  });
 });
+
+function pairingInviteCode(payload: PairingQrPayload): string {
+  const json = JSON.stringify(payload);
+  const encoded = Buffer.from(json, "utf8").toString("base64url");
+  return `termd-pair:v1:${encoded}`;
+}
