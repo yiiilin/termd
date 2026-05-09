@@ -27,7 +27,12 @@ import type {
   UUID,
 } from "./protocol/types";
 import { decodeUtf8, sessionDataFromBase64 } from "./protocol/wire";
-import { defaultServer, ensureDevice, loadBrowserState, recordPairing } from "./state/browser-state";
+import {
+  defaultServer,
+  ensureDevice,
+  loadBrowserState,
+  recordPairing,
+} from "./state/browser-state";
 import { ConnectionPanel, ConnectionStatusPanel } from "./components/ConnectionPanel";
 import { DaemonClientsPanel } from "./components/DaemonClientsPanel";
 import { SessionList } from "./components/SessionList";
@@ -178,6 +183,7 @@ export default function App() {
       let client: DirectClient | undefined;
       try {
         client = await authenticatedClient();
+        // 文件树当前位置是 daemon 端 session 共享状态；不传 path 时由 daemon 返回当前共享目录。
         const files = await client.listSessionFiles(sessionId, path);
         setSessionFiles(files);
       } catch (caught) {
@@ -250,6 +256,14 @@ export default function App() {
           if (inner.type === "session_data") {
             const payload = inner.payload as { data_base64: string };
             setTerminalChunks((chunks) => [...chunks, decodeUtf8(sessionDataFromBase64(payload.data_base64))]);
+          } else if (inner.type === "session_files_result") {
+            const payload = inner.payload as SessionFilesResultPayload;
+            // daemon 主动推送的文件树状态和当前 attach 的 session 对齐后才更新右侧 panel。
+            if (payload.session_id === attachedSessionRef.current) {
+              setSessionFiles(payload);
+              setSessionFilesError(undefined);
+              setSessionFilesLoading(false);
+            }
           }
         } catch (caught) {
           if (receiveLoopActiveRef.current) {

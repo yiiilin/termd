@@ -125,6 +125,7 @@ export interface SessionSummaryPayload {
   name?: string | null;
   state: SessionState;
   size: TerminalSize;
+  files_path?: string | null;
 }
 
 export interface SessionListResultPayload {

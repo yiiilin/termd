@@ -307,9 +307,13 @@ export class DirectClient {
       if (inner.type === "pong") {
         continue;
       }
-      if (options.bufferTerminalEvents && (inner.type === "session_data" || inner.type === "control_grant")) {
-        // 文件列表请求复用已 attach 的终端连接；daemon 可能先推送 PTY 输出。
-        // 这里把终端事件放回队列，交给后续 receive loop 处理，避免文件 panel 吃掉回显。
+      if (
+        options.bufferTerminalEvents &&
+        inner.type !== expectedType &&
+        (inner.type === "session_data" || inner.type === "control_grant" || inner.type === "session_files_result")
+      ) {
+        // 文件操作复用已 attach 的终端连接；daemon 可能先推送 PTY 输出或文件树同步事件。
+        // 这里把旁路事件放回队列，交给后续 receive loop 处理，避免文件 panel 吃掉回显。
         this.pendingInner.push(inner);
         continue;
       }

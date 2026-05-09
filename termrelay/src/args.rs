@@ -21,6 +21,13 @@ pub struct Args {
     pub web: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RelayCommand {
+    Serve(Args),
+    Help,
+    Version,
+}
+
 impl fmt::Debug for Args {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         // relay auth token 是 transport 凭证，Debug 输出只能显示是否配置，不能泄漏值。
@@ -32,6 +39,37 @@ impl fmt::Debug for Args {
             .field("tls_key_configured", &self.tls_key.is_some())
             .field("web", &self.web)
             .finish()
+    }
+}
+
+impl RelayCommand {
+    pub fn from_env() -> Result<Self, ArgsError> {
+        Self::parse_from(env::args_os())
+    }
+
+    pub fn parse_from<I, S>(args: I) -> Result<Self, ArgsError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<OsString>,
+    {
+        let args: Vec<OsString> = args.into_iter().map(Into::into).collect();
+        if args
+            .iter()
+            .skip(1)
+            .any(|arg| matches!(arg.to_string_lossy().as_ref(), "-h" | "--help" | "help"))
+        {
+            return Ok(Self::Help);
+        }
+        if args.iter().skip(1).any(|arg| {
+            matches!(
+                arg.to_string_lossy().as_ref(),
+                "-V" | "--version" | "version"
+            )
+        }) {
+            return Ok(Self::Version);
+        }
+
+        Args::parse_from(args).map(Self::Serve)
     }
 }
 
@@ -50,10 +88,6 @@ pub enum ArgsError {
 }
 
 impl Args {
-    pub fn from_env() -> Result<Self, ArgsError> {
-        Self::parse_from(env::args_os())
-    }
-
     pub fn parse_from<I, S>(args: I) -> Result<Self, ArgsError>
     where
         I: IntoIterator<Item = S>,
@@ -178,6 +212,26 @@ mod tests {
         let args = Args::parse_from(["termrelay", "--web"]).unwrap();
 
         assert!(args.web);
+    }
+
+    #[test]
+    fn parses_help_and_version_without_requiring_server_start() {
+        assert_eq!(
+            RelayCommand::parse_from(["termrelay", "--help"]).unwrap(),
+            RelayCommand::Help
+        );
+        assert_eq!(
+            RelayCommand::parse_from(["termrelay", "-h"]).unwrap(),
+            RelayCommand::Help
+        );
+        assert_eq!(
+            RelayCommand::parse_from(["termrelay", "--version"]).unwrap(),
+            RelayCommand::Version
+        );
+        assert_eq!(
+            RelayCommand::parse_from(["termrelay", "-V"]).unwrap(),
+            RelayCommand::Version
+        );
     }
 
     #[test]

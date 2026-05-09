@@ -69,7 +69,8 @@ export function defaultServer(state: BrowserState): PairedServerState | undefine
 }
 
 function normalizeState(state: BrowserState): BrowserState {
-  // IndexedDB 只保存设备身份和 daemon 公开身份；pairing token、server 私钥和终端明文不进入 schema。
+  // IndexedDB 只保存设备身份和 daemon 公开身份；
+  // session 文件树位置属于 daemon 共享状态，不能在单个浏览器里各存一份。
   // 这里显式按字段白名单重建对象，避免旧 schema 或污染对象把敏感字段重新写回。
   return {
     device: state.device

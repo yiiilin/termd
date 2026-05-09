@@ -78,4 +78,25 @@ describe("浏览器本地状态", () => {
 
     expect(second).toEqual(first);
   });
+
+  it("不再把 session 文件树位置写入浏览器本地状态", async () => {
+    await saveBrowserState({
+      pairedServers: [],
+      sessionUiState: {
+        "00000000-0000-0000-0000-000000000024": {
+          "00000000-0000-0000-0000-000000000025": {
+            filesPath: "/home/me/project/src",
+            updated_at_ms: 1710000000000,
+          },
+        },
+      },
+    } as BrowserState);
+    const loaded = await loadBrowserState();
+    const raw = JSON.stringify(loaded);
+
+    expect(loaded).not.toHaveProperty("sessionUiState");
+    expect(raw).not.toContain("/home/me/project/src");
+    expect(raw).not.toContain("pairing_token");
+    expect(raw).not.toContain("terminal-secret");
+  });
 });

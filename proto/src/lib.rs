@@ -389,6 +389,9 @@ pub struct SessionSummaryPayload {
     pub name: Option<String>,
     pub state: SessionState,
     pub size: TerminalSize,
+    /// session 级共享文件树位置；为空时客户端应向 daemon 请求默认目录。
+    #[serde(default)]
+    pub files_path: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -926,6 +929,7 @@ mod tests {
                 name: Some("work shell".to_owned()),
                 state: SessionState::Running,
                 size,
+                files_path: Some("/home/me/project".to_owned()),
             }],
         });
         assert_roundtrip(ControlRequestPayload {

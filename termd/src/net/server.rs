@@ -39,6 +39,12 @@ use super::signature::Ed25519SignatureVerifier;
 
 const OUTPUT_FLUSH_MAX_BYTES_PER_SESSION: usize = 16 * 1024;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionPushEvent {
+    Output(SessionId),
+    FileTree(SessionId),
+}
+
 pub type DefaultDaemonProtocol =
     DaemonProtocol<NonBlockingPortablePtyBackend, Ed25519SignatureVerifier>;
 pub type SharedDaemonProtocol = Arc<Mutex<DefaultDaemonProtocol>>;
@@ -348,8 +354,9 @@ async fn ws_handler(
 
 async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_addr: SocketAddr) {
     let (mut sender, mut receiver) = socket.split();
-    let (output_event_tx, mut output_event_rx) = mpsc::unbounded_channel::<SessionId>();
-    let mut watched_sessions = HashSet::new();
+    let (push_event_tx, mut push_event_rx) = mpsc::unbounded_channel::<SessionPushEvent>();
+    let mut watched_output_sessions = HashSet::new();
+    let mut watched_file_tree_sessions = HashSet::new();
     let mut watcher_tasks: Vec<JoinHandle<()>> = Vec::new();
     let (mut connection, initial_messages) = {
         let protocol = protocol.lock().expect("daemon protocol mutex poisoned");
@@ -401,11 +408,12 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
                             break;
                         }
 
-                        register_output_watchers(
+                        register_session_watchers(
                             &connection,
                             &protocol,
-                            &mut watched_sessions,
-                            &output_event_tx,
+                            &mut watched_output_sessions,
+                            &mut watched_file_tree_sessions,
+                            &push_event_tx,
                             &mut watcher_tasks,
                         );
 
@@ -423,19 +431,26 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
                     }
                 };
             }
-            maybe_session_id = output_event_rx.recv() => {
-                let Some(session_id) = maybe_session_id else {
+            maybe_event = push_event_rx.recv() => {
+                let Some(event) = maybe_event else {
                     break;
                 };
-                let output_responses = {
+                let responses = {
                     let mut protocol = protocol.lock().expect("daemon protocol mutex poisoned");
-                    connection.read_session_output(
-                        &mut protocol,
-                        session_id,
-                        OUTPUT_FLUSH_MAX_BYTES_PER_SESSION,
-                    )
+                    match event {
+                        SessionPushEvent::Output(session_id) => {
+                            connection.read_session_output(
+                                &mut protocol,
+                                session_id,
+                                OUTPUT_FLUSH_MAX_BYTES_PER_SESSION,
+                            )
+                        }
+                        SessionPushEvent::FileTree(session_id) => {
+                            connection.read_session_file_tree_update(&mut protocol, session_id)
+                        }
+                    }
                 };
-                if send_envelopes(&mut sender, output_responses).await.is_err() {
+                if send_envelopes(&mut sender, responses).await.is_err() {
                     break;
                 }
             }
@@ -451,30 +466,58 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
     debug!("websocket connection closed and detached");
 }
 
-fn register_output_watchers(
+fn register_session_watchers(
     connection: &ProtocolConnection,
     protocol: &SharedDaemonProtocol,
-    watched_sessions: &mut HashSet<SessionId>,
-    output_event_tx: &mpsc::UnboundedSender<SessionId>,
+    watched_output_sessions: &mut HashSet<SessionId>,
+    watched_file_tree_sessions: &mut HashSet<SessionId>,
+    push_event_tx: &mpsc::UnboundedSender<SessionPushEvent>,
     watcher_tasks: &mut Vec<JoinHandle<()>>,
 ) {
-    let signals = {
+    let (output_signals, file_tree_signals) = {
         let protocol = protocol.lock().expect("daemon protocol mutex poisoned");
-        connection.attached_output_signals(&protocol)
+        (
+            connection.attached_output_signals(&protocol),
+            connection.attached_file_tree_signals(&protocol),
+        )
     };
 
-    for (session_id, mut signal) in signals {
-        if !watched_sessions.insert(session_id) {
+    for (session_id, mut signal) in output_signals {
+        if !watched_output_sessions.insert(session_id) {
             continue;
         }
 
-        let output_event_tx = output_event_tx.clone();
+        let push_event_tx = push_event_tx.clone();
         watcher_tasks.push(tokio::spawn(async move {
             loop {
                 if signal.changed().await.is_err() {
                     break;
                 }
-                if output_event_tx.send(session_id).is_err() {
+                if push_event_tx
+                    .send(SessionPushEvent::Output(session_id))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }));
+    }
+
+    for (session_id, mut signal) in file_tree_signals {
+        if !watched_file_tree_sessions.insert(session_id) {
+            continue;
+        }
+
+        let push_event_tx = push_event_tx.clone();
+        watcher_tasks.push(tokio::spawn(async move {
+            loop {
+                if signal.changed().await.is_err() {
+                    break;
+                }
+                if push_event_tx
+                    .send(SessionPushEvent::FileTree(session_id))
+                    .is_err()
+                {
                     break;
                 }
             }

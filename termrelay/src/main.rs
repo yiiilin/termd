@@ -16,7 +16,7 @@ use tokio::net::TcpListener;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-use crate::args::{Args, ArgsError};
+use crate::args::{ArgsError, RelayCommand};
 use crate::router::router;
 use crate::ws::RelayState;
 
@@ -52,7 +52,17 @@ struct TlsPaths {
 async fn main() -> Result<(), MainError> {
     init_tracing();
 
-    let args = Args::from_env()?;
+    let args = match RelayCommand::from_env()? {
+        RelayCommand::Help => {
+            println!("{}", help_text());
+            return Ok(());
+        }
+        RelayCommand::Version => {
+            println!("termrelay {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        RelayCommand::Serve(args) => args,
+    };
     let listener = TcpListener::bind(args.listen)
         .await
         .map_err(|source| MainError::Bind {
@@ -76,6 +86,28 @@ async fn main() -> Result<(), MainError> {
     );
 
     serve_listener(listener, RelayState::new(args.auth_token), tls, args.web).await
+}
+
+fn help_text() -> String {
+    format!(
+        concat!(
+            "termrelay {}\n\n",
+            "USAGE:\n",
+            "  termrelay [OPTIONS]\n\n",
+            "OPTIONS:\n",
+            "  --listen, -l <HOST:PORT>      Listen address, default 127.0.0.1:8080\n",
+            "  --auth-token <TOKEN>          Transport auth token required from daemon/client relay sockets\n",
+            "  --tls-cert <CERT_PEM>         TLS certificate path\n",
+            "  --tls-key <KEY_PEM>           TLS private key path; must be paired with --tls-cert\n",
+            "  --web                         Serve embedded Web UI\n",
+            "  -h, --help                    Print help\n",
+            "  -V, --version                 Print version\n\n",
+            "EXAMPLES:\n",
+            "  termrelay --listen 0.0.0.0:8080\n",
+            "  termrelay --listen 127.0.0.1:8080 --auth-token env-token\n"
+        ),
+        env!("CARGO_PKG_VERSION")
+    )
 }
 
 fn init_tracing() {

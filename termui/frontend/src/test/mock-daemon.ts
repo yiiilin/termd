@@ -78,6 +78,8 @@ export class MockDaemon {
   private createdSessionCounter = 0;
   private readonly e2eeKeypair: E2eeKeyPair;
   private readonly trustedDevices = new Map<UUID, TrustedDevice>();
+  private readonly connections = new Set<MockConnection>();
+  private readonly sessionFilePositions = new Map<UUID, string>();
 
   private constructor(
     private readonly server: WebSocketServer,
@@ -105,6 +107,15 @@ export class MockDaemon {
     return this.outerWireLog.join("\n");
   }
 
+  pushSessionFiles(files: SessionFilesResultPayload): void {
+    this.sessionFilePositions.set(files.session_id, files.path);
+    for (const connection of this.connections) {
+      if (connection.e2ee) {
+        this.sendInner(connection, envelope("session_files_result", files));
+      }
+    }
+  }
+
   async stop(): Promise<void> {
     this.server.clients.forEach((client) => client.close());
     await new Promise<void>((resolve, reject) => {
@@ -114,6 +125,8 @@ export class MockDaemon {
 
   private accept(socket: WebSocket): void {
     const connection: MockConnection = { socket };
+    this.connections.add(connection);
+    socket.on("close", () => this.connections.delete(connection));
     this.sendOuter(
       socket,
       envelope("hello", {
@@ -264,17 +277,21 @@ export class MockDaemon {
         const payload = inner.payload as { session_id: UUID; path?: string | null };
         this.sessionFileRequests.push(payload);
         // 指定 path 时必须按该目录返回，避免测试里把“任意切换目录”误回退成 session 根目录。
-        const files =
+        const lookupPath =
           payload.path && payload.path.trim()
-            ? this.options.sessionFiles?.[payload.path]
-            : this.options.sessionFiles?.[payload.session_id];
+            ? payload.path
+            : this.sessionFilePositions.get(payload.session_id) ?? payload.session_id;
+        const files = this.options.sessionFiles?.[lookupPath];
+        if (files) {
+          this.sessionFilePositions.set(payload.session_id, files.path);
+        }
         this.sendInner(
           connection,
           envelope(
             "session_files_result",
             files ?? {
               session_id: payload.session_id,
-              path: payload.path ?? "",
+              path: payload.path ?? this.sessionFilePositions.get(payload.session_id) ?? "",
               entries: [],
             },
           ),

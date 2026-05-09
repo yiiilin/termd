@@ -206,7 +206,10 @@ describe("termui web 工作台", () => {
         path: "/home/me/project/alpha.txt",
       });
     });
-    await waitFor(() => expect(within(panel).getByLabelText("Current directory")).toHaveValue(rootPath));
+    await waitFor(() => {
+      expect(within(panel).getByLabelText("Current directory")).toHaveValue(rootPath);
+      expect(within(panel).getByLabelText("Current directory")).toBeEnabled();
+    });
 
     await user.clear(within(panel).getByLabelText("Current directory"));
     await user.type(within(panel).getByLabelText("Current directory"), "/tmp");
@@ -239,6 +242,124 @@ describe("termui web 工作台", () => {
         text: "uploaded web file\n",
       });
     });
+  });
+
+  it("重新 attach session 时恢复该 session 的文件树目录", async () => {
+    const user = userEvent.setup();
+    const sessionId = "00000000-0000-0000-0000-000000000412";
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [
+        {
+          session_id: sessionId,
+          state: "running",
+          size: { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 },
+        },
+      ],
+      sessionFiles: {
+        [sessionId]: {
+          session_id: sessionId,
+          path: "/home/me",
+          entries: [],
+        },
+        "/tmp/work": {
+          session_id: sessionId,
+          path: "/tmp/work",
+          entries: [
+            {
+              name: "beta.log",
+              path: "/tmp/work/beta.log",
+              kind: "file",
+              size_bytes: 4,
+              modified_at_ms: null,
+            },
+          ],
+        },
+      },
+    });
+    render(<App />);
+
+    await user.clear(await screen.findByLabelText("WS URL"));
+    await user.type(screen.getByLabelText("WS URL"), daemon.url);
+    await user.type(screen.getByLabelText("Pairing token"), "secret-token");
+    await user.click(screen.getByRole("button", { name: "Pair" }));
+    await screen.findAllByText(daemon.serverId);
+    await user.click(screen.getByRole("button", { name: "Refresh" }));
+    await user.click((await screen.findAllByText(sessionId))[0]);
+
+    const panel = await screen.findByLabelText("session files");
+    await waitFor(() => expect(within(panel).getByLabelText("Current directory")).toHaveValue("/home/me"));
+
+    await user.clear(within(panel).getByLabelText("Current directory"));
+    await user.type(within(panel).getByLabelText("Current directory"), "/tmp/work");
+    await user.click(within(panel).getByRole("button", { name: "Go" }));
+    await within(panel).findByText("beta.log");
+
+    await user.click(screen.getByRole("button", { name: "Disconnect" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Disconnect" })).toBeDisabled());
+
+    const requestCountBeforeReattach = daemon.sessionFileRequests.length;
+    await user.click(screen.getAllByText(sessionId)[0]);
+
+    await waitFor(() =>
+      expect(daemon.sessionFileRequests.slice(requestCountBeforeReattach)).toContainEqual({
+        session_id: sessionId,
+      }),
+    );
+    await within(panel).findByText("beta.log");
+  });
+
+  it("接收 daemon 推送后同步当前 session 的文件树位置", async () => {
+    const user = userEvent.setup();
+    const sessionId = "00000000-0000-0000-0000-000000000413";
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [
+        {
+          session_id: sessionId,
+          state: "running",
+          size: { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 },
+        },
+      ],
+      sessionFiles: {
+        [sessionId]: {
+          session_id: sessionId,
+          path: "/home/me",
+          entries: [],
+        },
+      },
+    });
+    render(<App />);
+
+    await user.clear(await screen.findByLabelText("WS URL"));
+    await user.type(screen.getByLabelText("WS URL"), daemon.url);
+    await user.type(screen.getByLabelText("Pairing token"), "secret-token");
+    await user.click(screen.getByRole("button", { name: "Pair" }));
+    await screen.findAllByText(daemon.serverId);
+    await user.click(screen.getByRole("button", { name: "Refresh" }));
+    await user.click((await screen.findAllByText(sessionId))[0]);
+
+    const panel = await screen.findByLabelText("session files");
+    await waitFor(() => expect(within(panel).getByLabelText("Current directory")).toHaveValue("/home/me"));
+
+    daemon.pushSessionFiles({
+      session_id: sessionId,
+      path: "/tmp/work",
+      entries: [
+        {
+          name: "beta.log",
+          path: "/tmp/work/beta.log",
+          kind: "file",
+          size_bytes: 4,
+          modified_at_ms: null,
+        },
+      ],
+    });
+
+    await waitFor(() => expect(within(panel).getByLabelText("Current directory")).toHaveValue("/tmp/work"));
+    await within(panel).findByText("beta.log");
   });
 
   it("显示 daemon 级客户端在线、离线和 attach 状态", async () => {
