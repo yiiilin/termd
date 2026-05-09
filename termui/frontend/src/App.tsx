@@ -20,6 +20,7 @@ import type {
   PairedServerState,
   SafeError,
   SessionCreatedPayload,
+  SessionCursorPresence,
   SessionFilesResultPayload,
   SessionSummaryPayload,
   TerminalSize,
@@ -394,18 +395,18 @@ export default function App() {
   );
 
   const handleCursorChange = useCallback(
-    (position: { row: number; col: number }) => {
+    (presence: SessionCursorPresence) => {
       const client = attachClientRef.current;
       const sessionId = attachedSessionRef.current;
       if (!client || !sessionId) {
         return;
       }
-      const nextCursor = `${sessionId}:${position.row}:${position.col}`;
+      const nextCursor = `${sessionId}:${presence.row}:${presence.col}:${presence.focused}`;
       if (lastCursorReportRef.current === nextCursor) {
         return;
       }
       lastCursorReportRef.current = nextCursor;
-      void client.sendSessionCursor(sessionId, position.row, position.col).catch(setSafeError);
+      void client.sendSessionCursor(sessionId, presence).catch(setSafeError);
       if (cursorRefreshTimerRef.current === undefined) {
         cursorRefreshTimerRef.current = window.setTimeout(() => {
           cursorRefreshTimerRef.current = undefined;
@@ -749,12 +750,19 @@ function SessionOperatorsBar(props: {
             client.cursor_session_id === props.sessionId && client.cursor_row && client.cursor_col
               ? `${client.cursor_row}:${client.cursor_col}`
               : "cursor ?";
+          const focus =
+            client.cursor_session_id === props.sessionId && client.cursor_focused !== undefined && client.cursor_focused !== null
+              ? client.cursor_focused
+                ? "focused"
+                : "blurred"
+              : undefined;
           return (
             <span className="session-operator" key={client.client_id} title={client.device_id}>
               <span className="status-dot online" aria-hidden="true" />
               <span>{client.peer_ip ?? shortSessionId(client.client_id)}</span>
               {isCurrentDevice ? <span>you</span> : null}
-              <span>{cursor}</span>
+              <span className="session-operator-cursor">{cursor}</span>
+              {focus ? <span className={client.cursor_focused ? "focus-chip focused" : "focus-chip"}>{focus}</span> : null}
             </span>
           );
         })

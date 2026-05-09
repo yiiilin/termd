@@ -71,6 +71,7 @@ struct DaemonClientRecord {
     cursor_session_id: Option<SessionId>,
     cursor_row: Option<u16>,
     cursor_col: Option<u16>,
+    cursor_focused: Option<bool>,
 }
 
 /// session 级输出缓冲。
@@ -660,10 +661,12 @@ where
                 cursor_session_id: None,
                 cursor_row: None,
                 cursor_col: None,
+                cursor_focused: None,
             });
         record.cursor_session_id = Some(payload.session_id);
         record.cursor_row = Some(payload.row);
         record.cursor_col = Some(payload.col);
+        record.cursor_focused = Some(payload.focused);
         record.last_seen_at_ms = now_ms;
         record.online = true;
 
@@ -980,14 +983,15 @@ where
             let Some(record) = self.daemon_clients.get(&client.device_id) else {
                 continue;
             };
-            let cursor_is_for_active_session = record
+            let cursor_is_for_attached_session = record
                 .cursor_session_id
                 .map(|session_id| client.attached_session_ids.contains(&session_id))
                 .unwrap_or(false);
-            if record.online && cursor_is_for_active_session {
+            if record.online && cursor_is_for_attached_session {
                 client.cursor_session_id = record.cursor_session_id;
                 client.cursor_row = record.cursor_row;
                 client.cursor_col = record.cursor_col;
+                client.cursor_focused = record.cursor_focused;
             }
         }
         clients.sort_by_key(|client| client.connected_at_ms);
@@ -1039,6 +1043,7 @@ where
                 cursor_session_id: None,
                 cursor_row: None,
                 cursor_col: None,
+                cursor_focused: None,
             },
         );
     }
@@ -1082,6 +1087,7 @@ where
                 cursor_session_id: None,
                 cursor_row: None,
                 cursor_col: None,
+                cursor_focused: None,
             },
         );
     }
@@ -1115,6 +1121,7 @@ where
                 record.cursor_session_id = None;
                 record.cursor_row = None;
                 record.cursor_col = None;
+                record.cursor_focused = None;
             }
             persisted && !record.online
         };
@@ -1657,7 +1664,10 @@ fn command_spec_from_payload(
         return Err(ProtocolError::InvalidEnvelope);
     }
 
-    let mut command = CommandSpec::new(program).args(argv);
+    // Web 终端和 CLI attach 都按 xterm-256color 能力集启动 shell，保证颜色和补全体验一致。
+    let mut command = CommandSpec::new(program)
+        .args(argv)
+        .env("TERM", "xterm-256color");
     if let Some(cwd) = &config.default_working_directory {
         command = command.cwd(cwd.clone());
     }
@@ -1869,6 +1879,7 @@ fn daemon_client_to_payload_from_history(
         cursor_session_id: None,
         cursor_row: None,
         cursor_col: None,
+        cursor_focused: None,
     }
 }
 
@@ -2605,7 +2616,7 @@ mod tests {
     }
 
     #[test]
-    fn daemon_client_list_includes_attached_operator_cursor() {
+    fn daemon_client_list_includes_attached_operator_cursor_and_focus() {
         let (mut protocol, _) = protocol();
         let (mut connection, _) = protocol.start_connection_for_peer(Some("192.0.2.44".to_owned()));
         let device_id = DeviceId::new();
@@ -2646,6 +2657,7 @@ mod tests {
                     session_id: created_payload.session_id,
                     row: 12,
                     col: 8,
+                    focused: true,
                 },
             )
             .unwrap(),
@@ -2663,11 +2675,16 @@ mod tests {
 
         assert_eq!(payload.clients.len(), 1);
         assert_eq!(
+            payload.clients[0].attached_session_ids,
+            vec![created_payload.session_id]
+        );
+        assert_eq!(
             payload.clients[0].cursor_session_id,
             Some(created_payload.session_id)
         );
         assert_eq!(payload.clients[0].cursor_row, Some(12));
         assert_eq!(payload.clients[0].cursor_col, Some(8));
+        assert_eq!(payload.clients[0].cursor_focused, Some(true));
     }
 
     #[test]
@@ -3803,7 +3820,7 @@ mod tests {
     }
 
     #[test]
-    fn command_spec_uses_configured_default_working_directory() {
+    fn command_spec_uses_configured_default_working_directory_and_term_env() {
         let mut config = DaemonConfig::default_for_state_path(temp_state_path("cwd.json"));
         config.default_command = vec!["/bin/bash".to_owned()];
         config.default_working_directory = Some(std::path::PathBuf::from("/home/termd-user"));
@@ -3814,8 +3831,16 @@ mod tests {
 
         assert_eq!(default_command.program(), "/bin/bash");
         assert_eq!(
+            default_command.env_map().get("TERM").map(String::as_str),
+            Some("xterm-256color")
+        );
+        assert_eq!(
             default_command.cwd_path(),
             Some(std::path::Path::new("/home/termd-user"))
+        );
+        assert_eq!(
+            requested_command.env_map().get("TERM").map(String::as_str),
+            Some("xterm-256color")
         );
         assert_eq!(
             requested_command.cwd_path(),

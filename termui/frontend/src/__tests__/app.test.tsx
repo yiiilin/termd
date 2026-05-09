@@ -265,6 +265,7 @@ describe("termui web 工作台", () => {
           cursor_session_id: "00000000-0000-0000-0000-000000000410",
           cursor_row: 12,
           cursor_col: 8,
+          cursor_focused: true,
         },
         {
           client_id: "00000000-0000-0000-0000-000000000702",
@@ -290,6 +291,8 @@ describe("termui web 工作台", () => {
     const operators = await screen.findByLabelText("session operators");
     await within(operators).findByText("192.0.2.41");
     await within(operators).findByText("12:8");
+    await within(operators).findByText("focused");
+    expect(within(operators).queryByText(/selecting/)).toBeNull();
 
     expect(screen.queryByLabelText("daemon clients")).toBeNull();
     await user.click(screen.getByRole("button", { name: "Clients" }));
@@ -478,7 +481,7 @@ describe("termui web 工作台", () => {
     expect(daemon.closedSessions).toEqual(["00000000-0000-0000-0000-000000000401"]);
   });
 
-  it("shared-control attach 后持续发送终端输入和光标位置", async () => {
+  it("shared-control attach 后持续发送终端输入、光标位置和聚焦状态", async () => {
     const user = userEvent.setup();
     await daemon.stop();
     daemon = await MockDaemon.start({
@@ -506,8 +509,24 @@ describe("termui web 工作台", () => {
       terminalInput = document.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
       expect(terminalInput).not.toBeNull();
     });
-    await waitFor(() => expect(daemon.sessionCursorUpdates.length).toBeGreaterThan(0));
+    await waitFor(() =>
+      expect(daemon.sessionCursorUpdates).toContainEqual({
+        session_id: "00000000-0000-0000-0000-000000000402",
+        row: expect.any(Number),
+        col: expect.any(Number),
+        focused: false,
+      }),
+    );
 
+    terminalInput!.focus();
+    await waitFor(() =>
+      expect(daemon.sessionCursorUpdates).toContainEqual({
+        session_id: "00000000-0000-0000-0000-000000000402",
+        row: expect.any(Number),
+        col: expect.any(Number),
+        focused: true,
+      }),
+    );
     terminalInput!.value = "first-terminal-secret";
     fireEvent.input(terminalInput!);
 
@@ -517,6 +536,7 @@ describe("termui web 工作台", () => {
     fireEvent.input(terminalInput!);
 
     await waitFor(() => expect(daemon.sessionDataMessages).toEqual(["first-terminal-secret", "second-terminal-secret"]));
+    expect(daemon.sessionCursorUpdates.length).toBeGreaterThan(0);
     expect(daemon.outerWireText()).not.toContain("first-terminal-secret");
     expect(daemon.outerWireText()).not.toContain("second-terminal-secret");
   });

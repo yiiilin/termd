@@ -421,6 +421,9 @@ pub struct DaemonClientSummaryPayload {
     /// xterm 侧上报的 1-based 列号，用于 Web 顶部 operator 列表展示。
     #[serde(default)]
     pub cursor_col: Option<u16>,
+    /// xterm 是否处于聚焦状态；true 表示闪烁方块，false 表示非聚焦轮廓。
+    #[serde(default)]
+    pub cursor_focused: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -448,6 +451,9 @@ pub struct SessionCursorPayload {
     pub session_id: SessionId,
     pub row: u16,
     pub col: u16,
+    /// 兼容旧客户端：缺省时按未聚焦处理。
+    #[serde(default)]
+    pub focused: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -846,6 +852,7 @@ mod tests {
             session_id,
             row: 12,
             col: 8,
+            focused: true,
         });
         assert_roundtrip(SessionResizePayload { session_id, size });
         assert_roundtrip(SessionRenamePayload {
@@ -958,6 +965,7 @@ mod tests {
                 cursor_session_id: Some(session_id),
                 cursor_row: Some(12),
                 cursor_col: Some(8),
+                cursor_focused: Some(true),
             }],
         });
     }

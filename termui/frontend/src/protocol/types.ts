@@ -144,6 +144,7 @@ export interface DaemonClientSummaryPayload {
   cursor_session_id?: UUID | null;
   cursor_row?: number | null;
   cursor_col?: number | null;
+  cursor_focused?: boolean | null;
 }
 
 export interface DaemonClientsResultPayload {
@@ -257,7 +258,10 @@ export interface SessionCursorPayload {
   session_id: UUID;
   row: number;
   col: number;
+  focused: boolean;
 }
+
+export type SessionCursorPresence = Pick<SessionCursorPayload, "row" | "col" | "focused">;
 
 export interface ControlGrantPayload {
   session_id: UUID;

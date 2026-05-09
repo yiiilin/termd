@@ -20,6 +20,7 @@ import type {
   SessionCreatePayload,
   SessionCreatedPayload,
   SessionCursorPayload,
+  SessionCursorPresence,
   SessionDataPayload,
   SessionFileDeletePayload,
   SessionFileDeletedPayload,
@@ -222,12 +223,13 @@ export class DirectClient {
     );
   }
 
-  async sendSessionCursor(sessionId: UUID, row: number, col: number): Promise<void> {
+  async sendSessionCursor(sessionId: UUID, presence: SessionCursorPresence): Promise<void> {
     await this.sendInner(
       envelope("session_cursor", {
         session_id: sessionId,
-        row,
-        col,
+        row: presence.row,
+        col: presence.col,
+        focused: presence.focused,
       } satisfies SessionCursorPayload),
     );
   }

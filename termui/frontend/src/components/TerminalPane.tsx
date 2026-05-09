@@ -1,14 +1,14 @@
 import { useEffect, useRef } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
-import type { TerminalSize } from "../protocol/types";
+import type { SessionCursorPresence, TerminalSize } from "../protocol/types";
 
 interface TerminalPaneProps {
   chunks: string[];
   attached: boolean;
   onInput: (data: string) => void;
   onResize: (size: TerminalSize) => void;
-  onCursorChange?: (position: { row: number; col: number }) => void;
+  onCursorChange?: (presence: SessionCursorPresence) => void;
 }
 
 export function TerminalPane(props: TerminalPaneProps) {
@@ -20,6 +20,7 @@ export function TerminalPane(props: TerminalPaneProps) {
   const onResizeRef = useRef(props.onResize);
   const onCursorChangeRef = useRef(props.onCursorChange);
   const cursorFrameRef = useRef<number | undefined>(undefined);
+  const focusedRef = useRef(false);
 
   useEffect(() => {
     onInputRef.current = props.onInput;
@@ -38,12 +39,13 @@ export function TerminalPane(props: TerminalPaneProps) {
         return;
       }
 
-      // xterm 内部 cursorX/cursorY 是 0-based；协议用 1-based，便于 UI 直接展示。
+      // xterm 内部 cursorX/cursorY 是 0-based；协议用 1-based，便于顶部状态条直接展示。
       // jsdom 测试环境不会完整实现 xterm buffer，缺失时用 1:1 兜底，不影响浏览器真实值。
       const activeBuffer = terminal.buffer?.active;
       onCursorChangeRef.current({
         row: activeBuffer ? activeBuffer.cursorY + 1 : 1,
         col: activeBuffer ? activeBuffer.cursorX + 1 : 1,
+        focused: focusedRef.current,
       });
     });
   };
@@ -55,6 +57,8 @@ export function TerminalPane(props: TerminalPaneProps) {
 
     const terminal = new Terminal({
       cursorBlink: true,
+      cursorStyle: "block",
+      cursorInactiveStyle: "outline",
       screenReaderMode: true,
       fontFamily: '"IBM Plex Mono", "SFMono-Regular", Consolas, monospace',
       fontSize: 13,
@@ -69,16 +73,26 @@ export function TerminalPane(props: TerminalPaneProps) {
     const fit = new FitAddon();
     terminal.loadAddon(fit);
     terminal.open(hostRef.current);
+    const host = hostRef.current;
     const dataSubscription = terminal.onData((data) => {
       onInputRef.current(data);
-      queueCursorReport();
     });
+    const cursorMoveSubscription = terminal.onCursorMove(queueCursorReport);
+    const writeParsedSubscription = terminal.onWriteParsed(queueCursorReport);
+    const reportFocus = (focused: boolean) => {
+      focusedRef.current = focused;
+      queueCursorReport();
+    };
+    const handleFocusIn = () => reportFocus(true);
+    const handleFocusOut = () => reportFocus(false);
+    host.addEventListener("focusin", handleFocusIn);
+    host.addEventListener("focusout", handleFocusOut);
     terminalRef.current = terminal;
     fitRef.current = fit;
     writtenChunksRef.current = 0;
     // attach 输出可能早于 xterm 初始化到达；创建实例时补写已有 chunks，避免首屏输出丢失。
     for (const chunk of props.chunks) {
-      terminal.write(chunk);
+      terminal.write(chunk, queueCursorReport);
     }
     writtenChunksRef.current = props.chunks.length;
     queueCursorReport();
@@ -107,10 +121,15 @@ export function TerminalPane(props: TerminalPaneProps) {
         cursorFrameRef.current = undefined;
       }
       window.removeEventListener("resize", resize);
+      host.removeEventListener("focusin", handleFocusIn);
+      host.removeEventListener("focusout", handleFocusOut);
       dataSubscription.dispose();
+      cursorMoveSubscription.dispose();
+      writeParsedSubscription.dispose();
       terminal.dispose();
       terminalRef.current = null;
       fitRef.current = null;
+      focusedRef.current = false;
     };
   }, [props.attached]);
 

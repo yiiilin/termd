@@ -15,6 +15,7 @@ import type {
   PairRequestPayload,
   SessionCreatePayload,
   SessionCreatedPayload,
+  SessionCursorPayload,
   SessionDataPayload,
   SessionFileReadResultPayload,
   SessionFileWrittenPayload,
@@ -62,7 +63,7 @@ export class MockDaemon {
   public readonly createdCommands: string[][] = [];
   public readonly sessionDataMessages: string[] = [];
   public readonly attachedSessions: UUID[] = [];
-  public readonly sessionCursorUpdates: Array<{ session_id: UUID; row: number; col: number }> = [];
+  public readonly sessionCursorUpdates: SessionCursorPayload[] = [];
   public readonly sessionRenames: Array<{ session_id: UUID; name: string }> = [];
   public readonly closedSessions: UUID[] = [];
   public readonly sessionFileRequests: Array<{ session_id: UUID; path?: string | null }> = [];
@@ -233,7 +234,7 @@ export class MockDaemon {
         return;
       }
       case "session_cursor": {
-        this.sessionCursorUpdates.push(inner.payload as { session_id: UUID; row: number; col: number });
+        this.sessionCursorUpdates.push(inner.payload as SessionCursorPayload);
         return;
       }
       case "session_resize":

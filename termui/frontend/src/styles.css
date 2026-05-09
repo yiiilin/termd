@@ -488,7 +488,7 @@ label {
 }
 
 .session-operator {
-  max-width: 190px;
+  max-width: min(360px, 45vw);
   color: #c8d8d0;
   font-size: 12px;
 }
@@ -500,7 +500,16 @@ label {
   white-space: nowrap;
 }
 
-.session-operator span:last-child {
+.session-operator-cursor {
+  color: #d6ff5f;
+}
+
+.focus-chip {
+  flex: 0 0 auto;
+  color: #8fb8ff;
+}
+
+.focus-chip.focused {
   color: #d6ff5f;
 }
 

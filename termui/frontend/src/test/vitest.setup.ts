@@ -14,7 +14,10 @@ afterEach(() => {
 
 vi.mock("@xterm/xterm", () => {
   class Terminal {
-    private listeners: Array<(data: string) => void> = [];
+    private dataListeners: Array<(data: string) => void> = [];
+    private cursorMoveListeners: Array<() => void> = [];
+    private writeParsedListeners: Array<() => void> = [];
+    public buffer = { active: { cursorY: 0, cursorX: 0 } };
     public element: HTMLDivElement | undefined;
 
     open(element: HTMLElement) {
@@ -25,7 +28,9 @@ vi.mock("@xterm/xterm", () => {
       textarea.addEventListener("input", () => {
         const value = textarea.value;
         textarea.value = "";
-        this.listeners.forEach((listener) => listener(value));
+        this.buffer.active.cursorX += value.length;
+        this.dataListeners.forEach((listener) => listener(value));
+        this.cursorMoveListeners.forEach((listener) => listener());
       });
       this.element.append(textarea);
       element.append(this.element);
@@ -33,19 +38,42 @@ vi.mock("@xterm/xterm", () => {
 
     loadAddon() {}
 
-    write(data: string) {
+    write(data: string, callback?: () => void) {
       if (this.element) {
         this.element.dataset.buffer = `${this.element.dataset.buffer ?? ""}${data}`;
         this.element.append(document.createTextNode(data));
       }
+      const lines = data.split("\n");
+      const lastLine = lines[lines.length - 1] ?? "";
+      if (data.includes("\n")) {
+        this.buffer.active.cursorY += lines.length - 1;
+        this.buffer.active.cursorX = lastLine.length;
+      } else {
+        this.buffer.active.cursorX += data.length;
+      }
+      this.writeParsedListeners.forEach((listener) => listener());
+      this.cursorMoveListeners.forEach((listener) => listener());
+      callback?.();
     }
 
     onData(listener: (data: string) => void) {
-      this.listeners.push(listener);
+      this.dataListeners.push(listener);
       return { dispose: () => undefined };
     }
 
-    focus() {}
+    onCursorMove(listener: () => void) {
+      this.cursorMoveListeners.push(listener);
+      return { dispose: () => undefined };
+    }
+
+    onWriteParsed(listener: () => void) {
+      this.writeParsedListeners.push(listener);
+      return { dispose: () => undefined };
+    }
+
+    focus() {
+      this.element?.querySelector("textarea")?.focus();
+    }
 
     dispose() {}
   }

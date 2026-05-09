@@ -54,6 +54,7 @@ describe("DirectClient", () => {
     const list = await client.listSessions();
     const attached = await client.attachSession(list.sessions[0].session_id);
     await client.sendSessionData(attached.session_id, new TextEncoder().encode("terminal-secret"));
+    await client.sendSessionCursor(attached.session_id, { row: 12, col: 8, focused: true });
     const output = await client.receiveInner();
     const grant = await client.requestControl(attached.session_id);
     client.close();
@@ -63,8 +64,10 @@ describe("DirectClient", () => {
     expect(output.type).toBe("session_data");
     expect(grant.device_id).toBe(device.device_id);
     expect(daemon.decryptedInputs).toContain("terminal-secret");
+    expect(daemon.sessionCursorUpdates).toContainEqual({ session_id: attached.session_id, row: 12, col: 8, focused: true });
     expect(daemon.outerWireText()).not.toContain("terminal-secret");
     expect(daemon.outerWireText()).not.toContain("session_data");
+    expect(daemon.outerWireText()).not.toContain("session_cursor");
   });
 
   it("协议错误只暴露稳定 code 和安全 message", async () => {

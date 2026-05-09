@@ -2,9 +2,11 @@ import { describe, expect, it } from "vitest";
 import {
   ALL_MESSAGE_TYPES,
   type AttachRole,
+  type DaemonClientSummaryPayload,
   type Envelope,
   type PairingQrPayload,
   type MessageType,
+  type SessionCursorPayload,
   type SessionState,
 } from "../protocol/types";
 import { parsePairingQrPayload } from "../protocol/pairing-payload";
@@ -79,6 +81,35 @@ describe("协议类型", () => {
     const raw = JSON.stringify(message);
 
     expect(raw).toBe('{"type":"session_list","payload":{}}');
+  });
+
+  it("光标状态只同步位置和 xterm 聚焦状态", () => {
+    const cursor: SessionCursorPayload = {
+      session_id: "00000000-0000-0000-0000-000000000001",
+      row: 12,
+      col: 8,
+      focused: true,
+    };
+    const client: DaemonClientSummaryPayload = {
+      client_id: "00000000-0000-0000-0000-000000000002",
+      device_id: "00000000-0000-0000-0000-000000000003",
+      peer_ip: "192.0.2.10",
+      online: true,
+      connected_at_ms: 1,
+      last_seen_at_ms: 2,
+      attached_session_ids: [cursor.session_id],
+      cursor_session_id: cursor.session_id,
+      cursor_row: cursor.row,
+      cursor_col: cursor.col,
+      cursor_focused: cursor.focused,
+    };
+
+    expect(client).toMatchObject({
+      cursor_row: 12,
+      cursor_col: 8,
+      cursor_focused: true,
+    });
+    expect("selection_start_row" in client).toBe(false);
   });
 
   it("QR pairing payload 只在有效 JSON 且带 ws_url/token/server_id 时被识别", () => {
