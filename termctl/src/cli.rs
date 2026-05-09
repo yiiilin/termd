@@ -43,7 +43,7 @@ pub enum Command {
     New(NewArgs),
     /// attach 到已有 session，并桥接 stdin/stdout。
     Attach(SessionUrlArgs),
-    /// 抢占指定 session 的 controller。
+    /// 确认当前设备已作为 shared-control operator attach 到指定 session。
     Control(SessionUrlArgs),
     /// 调整指定 session 的终端尺寸。
     Resize(ResizeArgs),
@@ -285,7 +285,7 @@ async fn attach_for_session_operation(
     session_id: SessionId,
 ) -> Result<()> {
     // daemon 现在把 session 作用域能力绑定到“当前 WebSocket 连接”。
-    // control/resize 先 attach，避免同一设备的新连接借用旧连接的 controller/viewer 角色。
+    // control/resize 先 attach，避免同一设备的新连接借用旧连接在 runtime 中的 operator 状态。
     client.attach_session(session_id).await?;
     Ok(())
 }
@@ -296,11 +296,10 @@ async fn attach_loop(mut client: DirectClient, session_id: SessionId) -> Result<
     let mut ticker = interval(ATTACH_PING_INTERVAL);
     let mut buffer = vec![0_u8; STDIN_BUFFER_SIZE];
     let mut stdin_open = true;
-    let mut input_enabled = true;
 
     loop {
         tokio::select! {
-            read = stdin.read(&mut buffer), if stdin_open && input_enabled => {
+            read = stdin.read(&mut buffer), if stdin_open => {
                 let read = read.map_err(|_| TermctlError::LocalIo)?;
                 if read == 0 {
                     stdin_open = false;
@@ -314,15 +313,6 @@ async fn attach_loop(mut client: DirectClient, session_id: SessionId) -> Result<
             message = client.receive_inner() => {
                 match message {
                     Ok(envelope) => handle_attach_envelope(envelope, &mut stdout).await?,
-                    Err(TermctlError::Protocol { code, message }) if code == "controller_required" => {
-                        // viewer 写入被 daemon 拒绝后继续保持可读输出；禁用 stdin 可避免同一输入流
-                        // 反复触发 controller_required 噪音。
-                        input_enabled = false;
-                        eprintln!(
-                            "{}",
-                            TermctlError::Protocol { code, message }.user_message()
-                        );
-                    }
                     Err(error) => return Err(error),
                 }
             }
@@ -368,8 +358,7 @@ fn parse_session_id(value: &str) -> Result<SessionId> {
 
 fn role_name(role: AttachRole) -> &'static str {
     match role {
-        AttachRole::Controller => "controller",
-        AttachRole::Viewer => "viewer",
+        AttachRole::Operator => "operator",
     }
 }
 

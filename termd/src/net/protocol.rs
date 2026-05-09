@@ -4,6 +4,9 @@
 //! 操作。Axum 只负责把网络帧转成这里的统一 envelope。
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
 use base64::{Engine as _, engine::general_purpose};
 use serde::{Serialize, de::DeserializeOwned};
@@ -13,9 +16,12 @@ use termd_proto::{
     ControlRequestPayload, DaemonClientSummaryPayload, DaemonClientsPayload,
     DaemonClientsResultPayload, DeviceId, E2eeKeyExchangePayload, EncryptedFramePayload, Envelope,
     ErrorPayload, HelloPayload, MessageType, Nonce, PairRequestPayload, PingPayload, PongPayload,
-    ProtocolVersion, ServerId, SessionAttachIntent, SessionAttachPayload, SessionAttachedPayload,
-    SessionClosePayload, SessionClosedPayload, SessionCreatePayload, SessionCreatedPayload,
-    SessionDataPayload, SessionId, SessionListPayload, SessionListResultPayload,
+    ProtocolVersion, ServerId, SessionAttachPayload, SessionAttachedPayload, SessionClosePayload,
+    SessionClosedPayload, SessionCreatePayload, SessionCreatedPayload, SessionCursorPayload,
+    SessionDataPayload, SessionFileDeletePayload, SessionFileDeletedPayload,
+    SessionFileEntryPayload, SessionFileKind, SessionFileReadPayload, SessionFileReadResultPayload,
+    SessionFileWritePayload, SessionFileWrittenPayload, SessionFilesPayload,
+    SessionFilesResultPayload, SessionId, SessionListPayload, SessionListResultPayload,
     SessionRenamePayload, SessionRenamedPayload, SessionResizePayload, SessionState,
     SessionSummaryPayload, TerminalSize, UnixTimestampMillis,
 };
@@ -62,6 +68,9 @@ struct DaemonClientRecord {
     connected_at_ms: UnixTimestampMillis,
     last_seen_at_ms: UnixTimestampMillis,
     active_connections: HashMap<ClientId, HashSet<SessionId>>,
+    cursor_session_id: Option<SessionId>,
+    cursor_row: Option<u16>,
+    cursor_col: Option<u16>,
 }
 
 /// session 级输出缓冲。
@@ -150,8 +159,6 @@ pub enum ProtocolError {
     PairingFailed,
     #[error("session was not found")]
     SessionNotFound,
-    #[error("session input requires controller")]
-    ControllerRequired,
     #[error("runtime operation failed")]
     RuntimeFailed,
     #[error("daemon state persistence failed")]
@@ -168,7 +175,6 @@ impl ProtocolError {
             Self::AuthFailed => "auth_failed",
             Self::PairingFailed => "pairing_failed",
             Self::SessionNotFound => "session_not_found",
-            Self::ControllerRequired => "controller_required",
             Self::RuntimeFailed => "runtime_failed",
             Self::StateFailed => "state_failed",
         }
@@ -183,7 +189,6 @@ impl ProtocolError {
             Self::AuthFailed => "device authentication failed",
             Self::PairingFailed => "pairing failed",
             Self::SessionNotFound => "session was not found",
-            Self::ControllerRequired => "session input requires controller",
             Self::RuntimeFailed => "runtime operation failed",
             Self::StateFailed => "daemon state persistence failed",
         }
@@ -214,6 +219,7 @@ pub struct DaemonProtocol<B: PtyBackend, V> {
     verifier: V,
     session_index: HashMap<SessionId, String>,
     session_names: HashMap<SessionId, String>,
+    session_roots: HashMap<SessionId, PathBuf>,
     daemon_clients: HashMap<DeviceId, DaemonClientRecord>,
     client_history: ClientHistoryStore,
     session_output_history: HashMap<SessionId, SessionOutputHistory>,
@@ -288,6 +294,7 @@ where
             verifier,
             session_index: HashMap::new(),
             session_names: HashMap::new(),
+            session_roots: HashMap::new(),
             daemon_clients: HashMap::new(),
             client_history,
             session_output_history: HashMap::new(),
@@ -510,6 +517,7 @@ where
     ) -> Result<Vec<JsonEnvelope>, ProtocolError> {
         let device_id = connection.authenticated_device_id()?;
         let command = command_spec_from_payload(&payload.command, &self.config)?;
+        let session_root = session_root_from_command(&command)?;
         let runtime_size = proto_size_to_runtime(payload.size);
         let internal_session_id = self
             .runtime
@@ -519,6 +527,7 @@ where
 
         self.session_index
             .insert(wire_session_id, internal_session_id.clone());
+        self.session_roots.insert(wire_session_id, session_root);
         self.session_output_history
             .entry(wire_session_id)
             .or_default();
@@ -557,7 +566,8 @@ where
             .cloned()
             .ok_or(ProtocolError::SessionNotFound)?;
         let role = self
-            .attach_with_intent(&internal_session_id, device_key(device_id), payload.intent)
+            .runtime
+            .attach(&internal_session_id, device_key(device_id))
             .map_err(map_runtime_error)?;
         let wire_role = runtime_role_to_proto(role);
         connection.attach(
@@ -578,20 +588,6 @@ where
             MessageType::SessionAttached,
             response,
         )?])
-    }
-
-    fn attach_with_intent(
-        &mut self,
-        internal_session_id: &str,
-        device_key: String,
-        intent: SessionAttachIntent,
-    ) -> Result<RuntimeAttachRole, RuntimeError> {
-        // 旧客户端不带 intent 时继续使用 auto attach；Web 点击 session 时会显式传 viewer，
-        // 只建立输出订阅，不在空 controller 槽位上隐式拿控制权。
-        match intent {
-            SessionAttachIntent::Auto => self.runtime.attach(internal_session_id, device_key),
-            SessionAttachIntent::Viewer => self.runtime.attach_viewer(internal_session_id, device_key),
-        }
     }
 
     fn write_session_data(
@@ -635,6 +631,45 @@ where
         Ok(Vec::new())
     }
 
+    fn record_session_cursor(
+        &mut self,
+        connection: &ProtocolConnection,
+        payload: SessionCursorPayload,
+    ) -> Result<Vec<JsonEnvelope>, ProtocolError> {
+        let device_id = connection.authenticated_device_id()?;
+        if payload.row == 0 || payload.col == 0 {
+            return Err(ProtocolError::InvalidEnvelope);
+        }
+        if !self.session_index.contains_key(&payload.session_id) {
+            return Err(ProtocolError::SessionNotFound);
+        }
+        connection.ensure_attached_to(payload.session_id)?;
+
+        let now_ms = current_unix_timestamp_millis();
+        let record = self
+            .daemon_clients
+            .entry(device_id)
+            .or_insert_with(|| DaemonClientRecord {
+                client_id: stable_client_id_for_device(device_id),
+                device_id,
+                peer_ip: connection.peer_ip.clone(),
+                online: true,
+                connected_at_ms: now_ms,
+                last_seen_at_ms: now_ms,
+                active_connections: HashMap::new(),
+                cursor_session_id: None,
+                cursor_row: None,
+                cursor_col: None,
+            });
+        record.cursor_session_id = Some(payload.session_id);
+        record.cursor_row = Some(payload.row);
+        record.cursor_col = Some(payload.col);
+        record.last_seen_at_ms = now_ms;
+        record.online = true;
+
+        Ok(Vec::new())
+    }
+
     fn rename_session(
         &mut self,
         connection: &ProtocolConnection,
@@ -673,13 +708,17 @@ where
             .map_err(map_runtime_error)?;
         self.session_index.remove(&payload.session_id);
         self.session_names.remove(&payload.session_id);
+        self.session_roots.remove(&payload.session_id);
         self.session_output_history.remove(&payload.session_id);
         for record in self.daemon_clients.values_mut() {
             for sessions in record.active_connections.values_mut() {
                 sessions.remove(&payload.session_id);
             }
         }
-        if let Err(error) = self.client_history.remove_session_attachments(payload.session_id) {
+        if let Err(error) = self
+            .client_history
+            .remove_session_attachments(payload.session_id)
+        {
             tracing::warn!(%error, "failed to remove closed session attachments from sqlite history");
         }
 
@@ -687,6 +726,132 @@ where
             MessageType::SessionClosed,
             SessionClosedPayload {
                 session_id: payload.session_id,
+            },
+        )?])
+    }
+
+    fn list_session_files(
+        &mut self,
+        connection: &ProtocolConnection,
+        payload: SessionFilesPayload,
+    ) -> Result<Vec<JsonEnvelope>, ProtocolError> {
+        connection.authenticated_device_id()?;
+        if !self.session_index.contains_key(&payload.session_id) {
+            return Err(ProtocolError::SessionNotFound);
+        }
+
+        let root = self
+            .session_roots
+            .get(&payload.session_id)
+            .ok_or(ProtocolError::SessionNotFound)?;
+        let (target, normalized_path) = resolve_session_file_target(root, payload.path)?;
+        let entries = read_session_file_entries(root, &target)?;
+
+        Ok(vec![envelope_value(
+            MessageType::SessionFilesResult,
+            SessionFilesResultPayload {
+                session_id: payload.session_id,
+                path: normalized_path,
+                entries,
+            },
+        )?])
+    }
+
+    fn read_session_file(
+        &mut self,
+        connection: &ProtocolConnection,
+        payload: SessionFileReadPayload,
+    ) -> Result<Vec<JsonEnvelope>, ProtocolError> {
+        connection.authenticated_device_id()?;
+        if !self.session_index.contains_key(&payload.session_id) {
+            return Err(ProtocolError::SessionNotFound);
+        }
+        let root = self
+            .session_roots
+            .get(&payload.session_id)
+            .ok_or(ProtocolError::SessionNotFound)?;
+        let target = resolve_existing_session_file_target(root, &payload.path)?;
+        let metadata = fs::metadata(&target).map_err(map_file_path_error)?;
+        if metadata.is_dir() {
+            return Err(ProtocolError::InvalidEnvelope);
+        }
+        let bytes = fs::read(&target).map_err(map_file_path_error)?;
+
+        Ok(vec![envelope_value(
+            MessageType::SessionFileReadResult,
+            SessionFileReadResultPayload {
+                session_id: payload.session_id,
+                path: absolute_path_string(&target),
+                data_base64: general_purpose::STANDARD.encode(bytes),
+                size_bytes: metadata.len(),
+                modified_at_ms: metadata_modified_at_ms(&metadata),
+            },
+        )?])
+    }
+
+    fn write_session_file(
+        &mut self,
+        connection: &ProtocolConnection,
+        payload: SessionFileWritePayload,
+    ) -> Result<Vec<JsonEnvelope>, ProtocolError> {
+        connection.authenticated_device_id()?;
+        if !self.session_index.contains_key(&payload.session_id) {
+            return Err(ProtocolError::SessionNotFound);
+        }
+        let root = self
+            .session_roots
+            .get(&payload.session_id)
+            .ok_or(ProtocolError::SessionNotFound)?;
+        let target = resolve_writable_session_file_target(root, &payload.path)?;
+        let bytes = general_purpose::STANDARD
+            .decode(payload.data_base64)
+            .map_err(|_| ProtocolError::InvalidEnvelope)?;
+
+        if target.is_dir() {
+            return Err(ProtocolError::InvalidEnvelope);
+        }
+        fs::write(&target, &bytes).map_err(map_file_path_error)?;
+        let metadata = fs::metadata(&target).map_err(map_file_path_error)?;
+
+        Ok(vec![envelope_value(
+            MessageType::SessionFileWritten,
+            SessionFileWrittenPayload {
+                session_id: payload.session_id,
+                path: absolute_path_string(&target),
+                size_bytes: metadata.len(),
+                modified_at_ms: metadata_modified_at_ms(&metadata),
+            },
+        )?])
+    }
+
+    fn delete_session_file(
+        &mut self,
+        connection: &ProtocolConnection,
+        payload: SessionFileDeletePayload,
+    ) -> Result<Vec<JsonEnvelope>, ProtocolError> {
+        connection.authenticated_device_id()?;
+        if !self.session_index.contains_key(&payload.session_id) {
+            return Err(ProtocolError::SessionNotFound);
+        }
+        let root = self
+            .session_roots
+            .get(&payload.session_id)
+            .ok_or(ProtocolError::SessionNotFound)?;
+        let target = resolve_writable_session_file_target(root, &payload.path)?;
+        let metadata = fs::symlink_metadata(&target).map_err(map_file_path_error)?;
+
+        // 删除目录只删除空目录；递归删除风险过高，后续需要单独交互确认再扩展。
+        if metadata.file_type().is_dir() {
+            fs::remove_dir(&target).map_err(map_file_path_error)?;
+        } else {
+            fs::remove_file(&target).map_err(map_file_path_error)?;
+        }
+
+        Ok(vec![envelope_value(
+            MessageType::SessionFileDeleted,
+            SessionFileDeletedPayload {
+                session_id: payload.session_id,
+                path: absolute_path_string(&target),
             },
         )?])
     }
@@ -811,6 +976,20 @@ where
             .into_values()
             .map(|record| daemon_client_to_payload_from_history(record))
             .collect();
+        for client in &mut clients {
+            let Some(record) = self.daemon_clients.get(&client.device_id) else {
+                continue;
+            };
+            let cursor_is_for_active_session = record
+                .cursor_session_id
+                .map(|session_id| client.attached_session_ids.contains(&session_id))
+                .unwrap_or(false);
+            if record.online && cursor_is_for_active_session {
+                client.cursor_session_id = record.cursor_session_id;
+                client.cursor_row = record.cursor_row;
+                client.cursor_col = record.cursor_col;
+            }
+        }
         clients.sort_by_key(|client| client.connected_at_ms);
 
         Ok(vec![envelope_value(
@@ -857,6 +1036,9 @@ where
                 connected_at_ms: now_ms,
                 last_seen_at_ms: now_ms,
                 active_connections,
+                cursor_session_id: None,
+                cursor_row: None,
+                cursor_col: None,
             },
         );
     }
@@ -897,6 +1079,9 @@ where
                 connected_at_ms: now_ms,
                 last_seen_at_ms: now_ms,
                 active_connections,
+                cursor_session_id: None,
+                cursor_row: None,
+                cursor_col: None,
             },
         );
     }
@@ -926,6 +1111,11 @@ where
             record.active_connections.remove(&client_id);
             record.last_seen_at_ms = now_ms;
             record.online = !record.active_connections.is_empty();
+            if !record.online {
+                record.cursor_session_id = None;
+                record.cursor_row = None;
+                record.cursor_col = None;
+            }
             persisted && !record.online
         };
 
@@ -1019,7 +1209,7 @@ where
         self.mark_daemon_client_connection_offline(device_id, connection.client_id, now_ms);
 
         // 断开 WebSocket 只 detach 当前连接关联的 session，不 close/terminate PTY。
-        // 同一浏览器/设备如果还有另一条 attach 连接在线，不能撤掉设备级 controller/viewer 角色。
+        // 同一浏览器/设备如果还有另一条 attach 连接在线，不能撤掉设备级 operator 角色。
         for wire_session_id in attached_sessions {
             if remaining_sessions.contains(&wire_session_id) {
                 continue;
@@ -1307,6 +1497,10 @@ impl ProtocolConnection {
                 let payload = decode_payload(envelope.payload)?;
                 protocol.write_session_data(self, payload)
             }
+            MessageType::SessionCursor => {
+                let payload = decode_payload(envelope.payload)?;
+                protocol.record_session_cursor(self, payload)
+            }
             MessageType::SessionResize => {
                 let payload = decode_payload(envelope.payload)?;
                 protocol.resize_session(self, payload)
@@ -1318,6 +1512,22 @@ impl ProtocolConnection {
             MessageType::SessionClose => {
                 let payload = decode_payload(envelope.payload)?;
                 protocol.close_session(self, payload)
+            }
+            MessageType::SessionFiles => {
+                let payload = decode_payload(envelope.payload)?;
+                protocol.list_session_files(self, payload)
+            }
+            MessageType::SessionFileRead => {
+                let payload = decode_payload(envelope.payload)?;
+                protocol.read_session_file(self, payload)
+            }
+            MessageType::SessionFileWrite => {
+                let payload = decode_payload(envelope.payload)?;
+                protocol.write_session_file(self, payload)
+            }
+            MessageType::SessionFileDelete => {
+                let payload = decode_payload(envelope.payload)?;
+                protocol.delete_session_file(self, payload)
             }
             MessageType::ControlRequest => {
                 let payload = decode_payload(envelope.payload)?;
@@ -1351,7 +1561,7 @@ impl ProtocolConnection {
 
     fn ensure_attached_to(&self, session_id: SessionId) -> Result<(), ProtocolError> {
         // 认证只证明 device key，有 session 作用域的操作还必须来自当前已 attach 的连接。
-        // 这样同一设备新开的第二条连接不能借用旧连接在 runtime 中留下的 controller/viewer 角色。
+        // 这样同一设备新开的第二条连接不能借用旧连接在 runtime 中留下的 operator 角色。
         if self.attached_sessions.contains(&session_id) {
             return Ok(());
         }
@@ -1455,6 +1665,152 @@ fn command_spec_from_payload(
     Ok(command)
 }
 
+fn session_root_from_command(command: &CommandSpec) -> Result<PathBuf, ProtocolError> {
+    let root = match command.cwd_path() {
+        Some(path) => path.to_path_buf(),
+        None => std::env::current_dir().map_err(|_| ProtocolError::RuntimeFailed)?,
+    };
+
+    root.canonicalize()
+        .map_err(|_| ProtocolError::RuntimeFailed)
+}
+
+fn resolve_session_file_target(
+    root: &Path,
+    requested_path: Option<String>,
+) -> Result<(PathBuf, String), ProtocolError> {
+    let target = match requested_path {
+        Some(path) if !path.trim().is_empty() => resolve_existing_session_file_target(root, &path)?,
+        _ => root.to_path_buf(),
+    };
+    let normalized_path = absolute_path_string(&target);
+    Ok((target, normalized_path))
+}
+
+fn resolve_existing_session_file_target(
+    root: &Path,
+    requested_path: &str,
+) -> Result<PathBuf, ProtocolError> {
+    let raw = requested_path.trim();
+    if raw.is_empty() {
+        return Ok(root.to_path_buf());
+    }
+
+    let requested = Path::new(raw);
+    let candidate = if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        root.join(requested)
+    };
+
+    candidate.canonicalize().map_err(map_file_path_error)
+}
+
+fn resolve_writable_session_file_target(
+    root: &Path,
+    requested_path: &str,
+) -> Result<PathBuf, ProtocolError> {
+    let raw = requested_path.trim();
+    if raw.is_empty() {
+        return Err(ProtocolError::InvalidEnvelope);
+    }
+
+    let requested = Path::new(raw);
+    let candidate = if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        root.join(requested)
+    };
+    let Some(file_name) = candidate.file_name() else {
+        return Err(ProtocolError::InvalidEnvelope);
+    };
+    let Some(parent) = candidate.parent() else {
+        return Err(ProtocolError::InvalidEnvelope);
+    };
+    let parent = parent.canonicalize().map_err(map_file_path_error)?;
+
+    Ok(parent.join(file_name))
+}
+
+fn read_session_file_entries(
+    _root: &Path,
+    target: &Path,
+) -> Result<Vec<SessionFileEntryPayload>, ProtocolError> {
+    let metadata = fs::metadata(target).map_err(map_file_path_error)?;
+    if !metadata.is_dir() {
+        return Err(ProtocolError::InvalidEnvelope);
+    }
+
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(target).map_err(map_file_path_error)? {
+        let entry = entry.map_err(|_| ProtocolError::RuntimeFailed)?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path).map_err(|_| ProtocolError::RuntimeFailed)?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.is_empty() {
+            continue;
+        }
+
+        entries.push(SessionFileEntryPayload {
+            name,
+            path: absolute_path_string(&path),
+            kind: session_file_kind(&metadata),
+            size_bytes: metadata.len(),
+            modified_at_ms: metadata_modified_at_ms(&metadata),
+        });
+    }
+
+    // 文件 panel 面向人工浏览：目录优先，其余按名称稳定排序，避免每次刷新跳动。
+    entries.sort_by(|left, right| {
+        session_file_kind_rank(left.kind)
+            .cmp(&session_file_kind_rank(right.kind))
+            .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+
+    Ok(entries)
+}
+
+fn map_file_path_error(error: std::io::Error) -> ProtocolError {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        return ProtocolError::InvalidEnvelope;
+    }
+
+    ProtocolError::RuntimeFailed
+}
+
+fn session_file_kind(metadata: &fs::Metadata) -> SessionFileKind {
+    let file_type = metadata.file_type();
+    if file_type.is_dir() {
+        SessionFileKind::Directory
+    } else if file_type.is_file() {
+        SessionFileKind::File
+    } else if file_type.is_symlink() {
+        SessionFileKind::Symlink
+    } else {
+        SessionFileKind::Other
+    }
+}
+
+fn session_file_kind_rank(kind: SessionFileKind) -> u8 {
+    match kind {
+        SessionFileKind::Directory => 0,
+        SessionFileKind::File => 1,
+        SessionFileKind::Symlink => 2,
+        SessionFileKind::Other => 3,
+    }
+}
+
+fn metadata_modified_at_ms(metadata: &fs::Metadata) -> Option<UnixTimestampMillis> {
+    let duration = metadata.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
+    let millis = duration.as_millis().min(u128::from(u64::MAX)) as u64;
+    Some(UnixTimestampMillis(millis))
+}
+
+fn absolute_path_string(path: &Path) -> String {
+    path.to_string_lossy().to_string()
+}
+
 fn sanitize_session_name(raw_name: String) -> Result<String, ProtocolError> {
     let name = raw_name.trim();
     if name.is_empty() || name.len() > 80 || name.chars().any(char::is_control) {
@@ -1491,8 +1847,7 @@ fn runtime_state_to_proto(state: RuntimeSessionState) -> SessionState {
 
 fn runtime_role_to_proto(role: RuntimeAttachRole) -> AttachRole {
     match role {
-        RuntimeAttachRole::Controller => AttachRole::Controller,
-        RuntimeAttachRole::Viewer => AttachRole::Viewer,
+        RuntimeAttachRole::Operator => AttachRole::Operator,
     }
 }
 
@@ -1511,6 +1866,9 @@ fn daemon_client_to_payload_from_history(
         connected_at_ms: record.connected_at_ms,
         last_seen_at_ms: record.last_seen_at_ms,
         attached_session_ids,
+        cursor_session_id: None,
+        cursor_row: None,
+        cursor_col: None,
     }
 }
 
@@ -1536,7 +1894,6 @@ fn trusted_device_to_state(device: &TrustedDevice) -> TrustedDeviceState {
 fn map_runtime_error(error: RuntimeError) -> ProtocolError {
     match error {
         RuntimeError::SessionNotFound => ProtocolError::SessionNotFound,
-        RuntimeError::InputRequiresController => ProtocolError::ControllerRequired,
         RuntimeError::SessionAlreadyExists
         | RuntimeError::SessionClosed
         | RuntimeError::DeviceNotAttached
@@ -1556,12 +1913,18 @@ fn nonce() -> Nonce {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
 
     use ed25519_dalek::{Signer, SigningKey};
     use rand_core::OsRng;
-    use termd_proto::{PairAcceptPayload, PairingToken, PublicKey, Signature};
+    use termd_proto::{
+        PairAcceptPayload, PairingToken, PublicKey, SessionFileDeletePayload,
+        SessionFileDeletedPayload, SessionFileKind, SessionFileReadPayload,
+        SessionFileReadResultPayload, SessionFileWritePayload, SessionFileWrittenPayload,
+        SessionFilesPayload, SessionFilesResultPayload, Signature,
+    };
 
     use super::*;
     use crate::auth::AuthSigningInput;
@@ -1900,7 +2263,6 @@ mod tests {
                 MessageType::SessionAttach,
                 SessionAttachPayload {
                     session_id: unknown_session_id,
-                    intent: SessionAttachIntent::Auto,
                 },
             )
             .unwrap(),
@@ -2215,7 +2577,6 @@ mod tests {
                 MessageType::SessionAttach,
                 SessionAttachPayload {
                     session_id: created_payload.session_id,
-                    intent: SessionAttachIntent::Auto,
                 },
             )
             .unwrap(),
@@ -2241,6 +2602,72 @@ mod tests {
             second_payload.clients[0].attached_session_ids,
             vec![created_payload.session_id]
         );
+    }
+
+    #[test]
+    fn daemon_client_list_includes_attached_operator_cursor() {
+        let (mut protocol, _) = protocol();
+        let (mut connection, _) = protocol.start_connection_for_peer(Some("192.0.2.44".to_owned()));
+        let device_id = DeviceId::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = PublicKey(wire(signing_key.verifying_key().as_bytes()));
+        let (_, mut device_session) = open_e2ee(&mut protocol, &mut connection, device_id);
+        pair_device(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            device_id,
+            public_key,
+        );
+
+        let created_responses = send_encrypted(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            envelope_value(
+                MessageType::SessionCreate,
+                SessionCreatePayload {
+                    command: vec!["sh".to_owned()],
+                    size: TerminalSize::new(24, 80),
+                },
+            )
+            .unwrap(),
+        );
+        let created = decrypt_first(&mut device_session, created_responses);
+        let created_payload: SessionCreatedPayload = decode_payload(created.payload).unwrap();
+
+        let cursor_responses = send_encrypted(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            envelope_value(
+                MessageType::SessionCursor,
+                SessionCursorPayload {
+                    session_id: created_payload.session_id,
+                    row: 12,
+                    col: 8,
+                },
+            )
+            .unwrap(),
+        );
+        assert!(cursor_responses.is_empty());
+
+        let list_responses = send_encrypted(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            envelope_value(MessageType::DaemonClients, DaemonClientsPayload {}).unwrap(),
+        );
+        let list = decrypt_first(&mut device_session, list_responses);
+        let payload: DaemonClientsResultPayload = decode_payload(list.payload).unwrap();
+
+        assert_eq!(payload.clients.len(), 1);
+        assert_eq!(
+            payload.clients[0].cursor_session_id,
+            Some(created_payload.session_id)
+        );
+        assert_eq!(payload.clients[0].cursor_row, Some(12));
+        assert_eq!(payload.clients[0].cursor_col, Some(8));
     }
 
     #[test]
@@ -2397,7 +2824,6 @@ mod tests {
                 MessageType::SessionAttach,
                 SessionAttachPayload {
                     session_id: created_payload.session_id,
-                    intent: SessionAttachIntent::Auto,
                 },
             )
             .unwrap(),
@@ -2421,7 +2847,7 @@ mod tests {
     }
 
     #[test]
-    fn authenticated_controller_can_create_session_and_write_input() {
+    fn authenticated_operator_can_create_session_and_write_input() {
         let (mut protocol, backend) = protocol();
         let (mut connection, _) = protocol.start_connection();
         let device_id = DeviceId::new();
@@ -2447,7 +2873,7 @@ mod tests {
         let responses = send_encrypted(&mut protocol, &mut connection, &mut device_session, create);
         let created = decrypt_first(&mut device_session, responses);
         let created_payload: SessionCreatedPayload = decode_payload(created.payload).unwrap();
-        assert_eq!(created_payload.role, AttachRole::Controller);
+        assert_eq!(created_payload.role, AttachRole::Operator);
 
         let data = envelope_value(
             MessageType::SessionData,
@@ -2464,7 +2890,244 @@ mod tests {
     }
 
     #[test]
-    fn viewer_intent_reselect_downgrades_same_device_controller() {
+    fn attached_session_can_list_files_from_session_root() {
+        let root = temp_state_path("files-root");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("alpha.txt"), b"hello world!").unwrap();
+        fs::write(root.join("src").join("main.rs"), b"fn main() {}\n").unwrap();
+        let backend = FakePtyBackend::default();
+        let mut config = DaemonConfig::default_for_state_path(temp_state_path("files-state.json"));
+        config.default_command = vec!["sh".to_owned()];
+        config.default_working_directory = Some(root.clone());
+        let mut protocol =
+            DaemonProtocol::new(config, backend.clone(), Ed25519SignatureVerifier).unwrap();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = PublicKey(wire(signing_key.verifying_key().as_bytes()));
+        let (_, mut device_session) = open_e2ee(&mut protocol, &mut connection, device_id);
+        pair_device(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            device_id,
+            public_key,
+        );
+        let create_responses = send_encrypted(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            envelope_value(
+                MessageType::SessionCreate,
+                SessionCreatePayload {
+                    command: Vec::new(),
+                    size: TerminalSize::new(24, 80),
+                },
+            )
+            .unwrap(),
+        );
+        let created = decrypt_first(&mut device_session, create_responses);
+        let created_payload: SessionCreatedPayload = decode_payload(created.payload).unwrap();
+        let (mut file_connection, _) = protocol.start_connection();
+        let mut file_crypto = authenticate_paired_connection(
+            &mut protocol,
+            &mut file_connection,
+            device_id,
+            &signing_key,
+        );
+
+        let list_responses = send_encrypted(
+            &mut protocol,
+            &mut file_connection,
+            &mut file_crypto,
+            envelope_value(
+                MessageType::SessionFiles,
+                SessionFilesPayload {
+                    session_id: created_payload.session_id,
+                    path: None,
+                },
+            )
+            .unwrap(),
+        );
+        let listed = decrypt_first(&mut file_crypto, list_responses);
+        let payload: SessionFilesResultPayload = decode_payload(listed.payload).unwrap();
+        let entries: Vec<_> = payload
+            .entries
+            .iter()
+            .map(|entry| (entry.name.as_str(), entry.path.clone(), entry.kind))
+            .collect();
+
+        assert_eq!(listed.kind, MessageType::SessionFilesResult);
+        assert_eq!(payload.session_id, created_payload.session_id);
+        assert_eq!(payload.path, root.to_string_lossy());
+        assert_eq!(
+            entries,
+            vec![
+                (
+                    "src",
+                    root.join("src").to_string_lossy().to_string(),
+                    SessionFileKind::Directory,
+                ),
+                (
+                    "alpha.txt",
+                    root.join("alpha.txt").to_string_lossy().to_string(),
+                    SessionFileKind::File,
+                ),
+            ]
+        );
+        assert_eq!(
+            payload
+                .entries
+                .iter()
+                .find(|entry| entry.name == "alpha.txt")
+                .unwrap()
+                .size_bytes,
+            12
+        );
+        assert!(backend.writes().is_empty());
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn session_file_transfer_can_navigate_parent_read_write_and_delete() {
+        let base = temp_state_path("files-base");
+        let root = base.join("project");
+        let outside = base.join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("readme.txt"), b"outside file\n").unwrap();
+        let backend = FakePtyBackend::default();
+        let mut config = DaemonConfig::default_for_state_path(temp_state_path("files-state.json"));
+        config.default_command = vec!["sh".to_owned()];
+        config.default_working_directory = Some(root.clone());
+        let mut protocol =
+            DaemonProtocol::new(config, backend.clone(), Ed25519SignatureVerifier).unwrap();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = PublicKey(wire(signing_key.verifying_key().as_bytes()));
+        let (_, mut device_session) = open_e2ee(&mut protocol, &mut connection, device_id);
+        pair_device(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            device_id,
+            public_key,
+        );
+        let create_responses = send_encrypted(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            envelope_value(
+                MessageType::SessionCreate,
+                SessionCreatePayload {
+                    command: Vec::new(),
+                    size: TerminalSize::new(24, 80),
+                },
+            )
+            .unwrap(),
+        );
+        let created = decrypt_first(&mut device_session, create_responses);
+        let created_payload: SessionCreatedPayload = decode_payload(created.payload).unwrap();
+        let (mut file_connection, _) = protocol.start_connection();
+        let mut file_crypto = authenticate_paired_connection(
+            &mut protocol,
+            &mut file_connection,
+            device_id,
+            &signing_key,
+        );
+
+        let list_responses = send_encrypted(
+            &mut protocol,
+            &mut file_connection,
+            &mut file_crypto,
+            envelope_value(
+                MessageType::SessionFiles,
+                SessionFilesPayload {
+                    session_id: created_payload.session_id,
+                    path: Some("../outside".to_owned()),
+                },
+            )
+            .unwrap(),
+        );
+        let listed = decrypt_first(&mut file_crypto, list_responses);
+        let listed_payload: SessionFilesResultPayload = decode_payload(listed.payload).unwrap();
+
+        assert_eq!(listed.kind, MessageType::SessionFilesResult);
+        assert_eq!(listed_payload.path, outside.to_string_lossy());
+        assert_eq!(listed_payload.entries[0].name, "readme.txt");
+
+        let read_responses = send_encrypted(
+            &mut protocol,
+            &mut file_connection,
+            &mut file_crypto,
+            envelope_value(
+                MessageType::SessionFileRead,
+                SessionFileReadPayload {
+                    session_id: created_payload.session_id,
+                    path: outside.join("readme.txt").to_string_lossy().to_string(),
+                },
+            )
+            .unwrap(),
+        );
+        let read = decrypt_first(&mut file_crypto, read_responses);
+        let read_payload: SessionFileReadResultPayload = decode_payload(read.payload).unwrap();
+        assert_eq!(read.kind, MessageType::SessionFileReadResult);
+        assert_eq!(
+            general_purpose::STANDARD
+                .decode(read_payload.data_base64)
+                .unwrap(),
+            b"outside file\n"
+        );
+
+        let upload_path = root.join("upload.txt");
+        let write_responses = send_encrypted(
+            &mut protocol,
+            &mut file_connection,
+            &mut file_crypto,
+            envelope_value(
+                MessageType::SessionFileWrite,
+                SessionFileWritePayload {
+                    session_id: created_payload.session_id,
+                    path: upload_path.to_string_lossy().to_string(),
+                    data_base64: general_purpose::STANDARD.encode(b"uploaded\n"),
+                },
+            )
+            .unwrap(),
+        );
+        let written = decrypt_first(&mut file_crypto, write_responses);
+        let written_payload: SessionFileWrittenPayload = decode_payload(written.payload).unwrap();
+        assert_eq!(written.kind, MessageType::SessionFileWritten);
+        assert_eq!(written_payload.size_bytes, 9);
+        assert_eq!(fs::read(&upload_path).unwrap(), b"uploaded\n");
+
+        let delete_responses = send_encrypted(
+            &mut protocol,
+            &mut file_connection,
+            &mut file_crypto,
+            envelope_value(
+                MessageType::SessionFileDelete,
+                SessionFileDeletePayload {
+                    session_id: created_payload.session_id,
+                    path: upload_path.to_string_lossy().to_string(),
+                },
+            )
+            .unwrap(),
+        );
+        let deleted = decrypt_first(&mut file_crypto, delete_responses);
+        let deleted_payload: SessionFileDeletedPayload = decode_payload(deleted.payload).unwrap();
+
+        assert_eq!(deleted.kind, MessageType::SessionFileDeleted);
+        assert_eq!(deleted_payload.path, upload_path.to_string_lossy());
+        assert!(!upload_path.exists());
+        assert!(backend.writes().is_empty());
+
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn reselecting_session_keeps_operator_input_enabled() {
         let (mut protocol, backend) = protocol();
         let (mut connection, _) = protocol.start_connection();
         let device_id = DeviceId::new();
@@ -2487,44 +3150,42 @@ mod tests {
             },
         )
         .unwrap();
-        let create_responses = send_encrypted(&mut protocol, &mut connection, &mut device_session, create);
+        let create_responses =
+            send_encrypted(&mut protocol, &mut connection, &mut device_session, create);
         let created = decrypt_first(&mut device_session, create_responses);
         let created_payload: SessionCreatedPayload = decode_payload(created.payload).unwrap();
-        assert_eq!(created_payload.role, AttachRole::Controller);
+        assert_eq!(created_payload.role, AttachRole::Operator);
 
         let attach = envelope_value(
             MessageType::SessionAttach,
             SessionAttachPayload {
                 session_id: created_payload.session_id,
-                intent: SessionAttachIntent::Viewer,
             },
         )
         .unwrap();
-        let attach_responses = send_encrypted(&mut protocol, &mut connection, &mut device_session, attach);
+        let attach_responses =
+            send_encrypted(&mut protocol, &mut connection, &mut device_session, attach);
         let attached = decrypt_first(&mut device_session, attach_responses);
         let attached_payload: SessionAttachedPayload = decode_payload(attached.payload).unwrap();
         assert_eq!(attached.kind, MessageType::SessionAttached);
-        assert_eq!(attached_payload.role, AttachRole::Viewer);
+        assert_eq!(attached_payload.role, AttachRole::Operator);
 
-        let blocked_input = envelope_value(
+        let shared_input = envelope_value(
             MessageType::SessionData,
             SessionDataPayload {
                 session_id: created_payload.session_id,
-                data_base64: general_purpose::STANDARD.encode(b"must-stay-viewer\n"),
+                data_base64: general_purpose::STANDARD.encode(b"shared-reselect\n"),
             },
         )
         .unwrap();
-        let blocked_responses = send_encrypted(
+        let input_responses = send_encrypted(
             &mut protocol,
             &mut connection,
             &mut device_session,
-            blocked_input,
+            shared_input,
         );
-        let blocked = decrypt_first(&mut device_session, blocked_responses);
-        let error_payload: ErrorPayload = decode_payload(blocked.payload).unwrap();
-        assert_eq!(blocked.kind, MessageType::Error);
-        assert_eq!(error_payload.code, "controller_required");
-        assert!(backend.writes().is_empty());
+        assert!(input_responses.is_empty());
+        assert_eq!(backend.writes(), vec![b"shared-reselect\n".to_vec()]);
     }
 
     #[test]
@@ -2717,7 +3378,7 @@ mod tests {
     }
 
     #[test]
-    fn viewer_input_is_rejected_and_close_only_detaches() {
+    fn additional_operator_input_is_accepted_and_close_only_detaches() {
         let (mut protocol, backend) = protocol();
         let signing_a = SigningKey::generate(&mut OsRng);
         let signing_b = SigningKey::generate(&mut OsRng);
@@ -2766,14 +3427,13 @@ mod tests {
                 MessageType::SessionAttach,
                 SessionAttachPayload {
                     session_id: created_payload.session_id,
-                    intent: SessionAttachIntent::Auto,
                 },
             )
             .unwrap(),
         );
         let attached = decrypt_first(&mut viewer_crypto, responses);
         let attached_payload: SessionAttachedPayload = decode_payload(attached.payload).unwrap();
-        assert_eq!(attached_payload.role, AttachRole::Viewer);
+        assert_eq!(attached_payload.role, AttachRole::Operator);
 
         let responses = send_encrypted(
             &mut protocol,
@@ -2788,17 +3448,15 @@ mod tests {
             )
             .unwrap(),
         );
-        let error = decrypt_first(&mut viewer_crypto, responses);
-        let error_payload: ErrorPayload = decode_payload(error.payload).unwrap();
-        assert_eq!(error.kind, MessageType::Error);
-        assert_eq!(error_payload.code, "controller_required");
+        assert!(responses.is_empty());
+        assert_eq!(backend.writes(), vec![b"blocked\n".to_vec()]);
 
         viewer.close(&mut protocol);
         assert_eq!(backend.terminate_count(), 0);
     }
 
     #[test]
-    fn viewer_attach_intent_never_claims_empty_controller_slot() {
+    fn reattached_operator_can_write_and_control_request_is_noop() {
         let (mut protocol, backend) = protocol();
         let signing_a = SigningKey::generate(&mut OsRng);
         let signing_b = SigningKey::generate(&mut OsRng);
@@ -2845,19 +3503,19 @@ mod tests {
             &mut protocol,
             &mut viewer,
             &mut viewer_crypto,
-            JsonEnvelope {
-                kind: MessageType::SessionAttach,
-                payload: serde_json::json!({
-                    "session_id": created_payload.session_id,
-                    "intent": "viewer"
-                }),
-            },
+            envelope_value(
+                MessageType::SessionAttach,
+                SessionAttachPayload {
+                    session_id: created_payload.session_id,
+                },
+            )
+            .unwrap(),
         );
         let attached = decrypt_first(&mut viewer_crypto, attach_responses);
         let attached_payload: SessionAttachedPayload = decode_payload(attached.payload).unwrap();
-        assert_eq!(attached_payload.role, AttachRole::Viewer);
+        assert_eq!(attached_payload.role, AttachRole::Operator);
 
-        let blocked_input = send_encrypted(
+        let input_responses = send_encrypted(
             &mut protocol,
             &mut viewer,
             &mut viewer_crypto,
@@ -2870,11 +3528,8 @@ mod tests {
             )
             .unwrap(),
         );
-        let blocked_error = decrypt_first(&mut viewer_crypto, blocked_input);
-        let error_payload: ErrorPayload = decode_payload(blocked_error.payload).unwrap();
-        assert_eq!(blocked_error.kind, MessageType::Error);
-        assert_eq!(error_payload.code, "controller_required");
-        assert!(backend.writes().is_empty());
+        assert!(input_responses.is_empty());
+        assert_eq!(backend.writes(), vec![b"should-not-write\n".to_vec()]);
 
         let grant_responses = send_encrypted(
             &mut protocol,

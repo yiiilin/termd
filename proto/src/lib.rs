@@ -36,11 +36,20 @@ pub enum MessageType {
     SessionAttach,
     SessionAttached,
     SessionData,
+    SessionCursor,
     SessionResize,
     SessionRename,
     SessionRenamed,
     SessionClose,
     SessionClosed,
+    SessionFiles,
+    SessionFilesResult,
+    SessionFileRead,
+    SessionFileReadResult,
+    SessionFileWrite,
+    SessionFileWritten,
+    SessionFileDelete,
+    SessionFileDeleted,
     SessionList,
     SessionListResult,
     DaemonClients,
@@ -108,7 +117,7 @@ impl Default for DeviceId {
 /// Web/CLI 侧展示用的客户端标识。
 ///
 /// 对个人使用场景而言，客户端通常对应一个已配对设备/浏览器，而不是每次 attach 新建的
-/// WebSocket 实例；它不代表 controller/viewer 权限。
+/// WebSocket 实例；它不代表账号权限或企业策略。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ClientId(pub Uuid);
@@ -144,24 +153,13 @@ pub enum ConnectionState {
     Closed,
 }
 
-/// attach 后的运行角色；controller 唯一，viewer 可多个。
+/// attach 后的运行角色。
+///
+/// shared-control 模式下所有已 attach 设备都是 operator，都可以向同一个 PTY 输入。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AttachRole {
-    Controller,
-    Viewer,
-}
-
-/// attach 请求的意图。
-///
-/// `Auto` 保留旧协议语义：没有 controller 时可成为 controller；`Viewer` 只订阅输出，
-/// 即使当前没有 controller，也不会隐式拿走控制权。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum SessionAttachIntent {
-    #[default]
-    Auto,
-    Viewer,
+    Operator,
 }
 
 /// 控制权状态只记录当前 holder，不引入平台级策略。
@@ -271,7 +269,7 @@ pub struct PairAcceptPayload {
 
 /// 二维码 pairing 载荷只携带建立设备信任所需的短期公开路由与 token。
 ///
-/// token 仍然是敏感短期凭证；payload 不表达 controller/viewer，也不包含任何私钥。
+/// token 仍然是敏感短期凭证；payload 不表达 operator 状态，也不包含任何私钥。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PairingQrPayload {
     #[serde(rename = "type")]
@@ -371,7 +369,7 @@ pub struct SessionCreatedPayload {
     pub size: TerminalSize,
 }
 
-/// attach 成功后的响应，明确当前连接获得 controller 还是 viewer。
+/// attach 成功后的响应；shared-control 模式下 role 固定为 operator。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionAttachedPayload {
     pub session_id: SessionId,
@@ -414,6 +412,15 @@ pub struct DaemonClientSummaryPayload {
     pub connected_at_ms: UnixTimestampMillis,
     pub last_seen_at_ms: UnixTimestampMillis,
     pub attached_session_ids: Vec<SessionId>,
+    /// 当前客户端最后上报光标所在的 session；离线或未 attach 时为空。
+    #[serde(default)]
+    pub cursor_session_id: Option<SessionId>,
+    /// xterm 侧上报的 1-based 行号，用于 Web 顶部 operator 列表展示。
+    #[serde(default)]
+    pub cursor_row: Option<u16>,
+    /// xterm 侧上报的 1-based 列号，用于 Web 顶部 operator 列表展示。
+    #[serde(default)]
+    pub cursor_col: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -431,8 +438,16 @@ pub struct SessionDataPayload {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionAttachPayload {
     pub session_id: SessionId,
-    #[serde(default)]
-    pub intent: SessionAttachIntent,
+}
+
+/// Web 客户端在 shared-control 顶部状态条中展示的光标位置。
+///
+/// 该 payload 只表达客户端本地可见的终端光标，不授予权限，也不参与 PTY 写入判断。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionCursorPayload {
+    pub session_id: SessionId,
+    pub row: u16,
+    pub col: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -461,6 +476,86 @@ pub struct SessionClosePayload {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionClosedPayload {
     pub session_id: SessionId,
+}
+
+/// 文件列表条目的类型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionFileKind {
+    File,
+    Directory,
+    Symlink,
+    Other,
+}
+
+/// 查询某个 session 关联的文件目录。
+///
+/// `path` 为空时使用 session 启动目录；传入绝对路径或相对路径时，daemon 只依赖本机 OS
+/// 权限判断可访问性，不在协议里引入账号/RBAC。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionFilesPayload {
+    pub session_id: SessionId,
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+/// 单个文件或目录的只读展示信息。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionFileEntryPayload {
+    pub name: String,
+    pub path: String,
+    pub kind: SessionFileKind,
+    pub size_bytes: u64,
+    pub modified_at_ms: Option<UnixTimestampMillis>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionFilesResultPayload {
+    pub session_id: SessionId,
+    pub path: String,
+    pub entries: Vec<SessionFileEntryPayload>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionFileReadPayload {
+    pub session_id: SessionId,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionFileReadResultPayload {
+    pub session_id: SessionId,
+    pub path: String,
+    pub data_base64: String,
+    pub size_bytes: u64,
+    pub modified_at_ms: Option<UnixTimestampMillis>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionFileWritePayload {
+    pub session_id: SessionId,
+    pub path: String,
+    pub data_base64: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionFileWrittenPayload {
+    pub session_id: SessionId,
+    pub path: String,
+    pub size_bytes: u64,
+    pub modified_at_ms: Option<UnixTimestampMillis>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionFileDeletePayload {
+    pub session_id: SessionId,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionFileDeletedPayload {
+    pub session_id: SessionId,
+    pub path: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -516,7 +611,7 @@ pub enum RelayOpaqueFrame {
 /// relay 与 daemon outbound connector 之间的多路复用 transport envelope。
 ///
 /// 该 envelope 只解决“一条 daemon relay socket 服务多个 relay client socket”的寻址问题。
-/// 它不包含鉴权、session、controller/viewer 或任何业务判断。
+/// 它不包含鉴权、session、operator 状态或任何业务判断。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RelayMuxEnvelope {
@@ -553,11 +648,23 @@ mod tests {
             (MessageType::SessionAttach, "session_attach"),
             (MessageType::SessionAttached, "session_attached"),
             (MessageType::SessionData, "session_data"),
+            (MessageType::SessionCursor, "session_cursor"),
             (MessageType::SessionResize, "session_resize"),
             (MessageType::SessionRename, "session_rename"),
             (MessageType::SessionRenamed, "session_renamed"),
             (MessageType::SessionClose, "session_close"),
             (MessageType::SessionClosed, "session_closed"),
+            (MessageType::SessionFiles, "session_files"),
+            (MessageType::SessionFilesResult, "session_files_result"),
+            (MessageType::SessionFileRead, "session_file_read"),
+            (
+                MessageType::SessionFileReadResult,
+                "session_file_read_result",
+            ),
+            (MessageType::SessionFileWrite, "session_file_write"),
+            (MessageType::SessionFileWritten, "session_file_written"),
+            (MessageType::SessionFileDelete, "session_file_delete"),
+            (MessageType::SessionFileDeleted, "session_file_deleted"),
             (MessageType::SessionList, "session_list"),
             (MessageType::SessionListResult, "session_list_result"),
             (MessageType::DaemonClients, "daemon_clients"),
@@ -602,10 +709,9 @@ mod tests {
             "closed"
         );
         assert_eq!(
-            serde_json::to_value(AttachRole::Controller).unwrap(),
-            "controller"
+            serde_json::to_value(AttachRole::Operator).unwrap(),
+            "operator"
         );
-        assert_eq!(serde_json::to_value(AttachRole::Viewer).unwrap(), "viewer");
     }
 
     #[test]
@@ -721,23 +827,25 @@ mod tests {
         });
         assert_roundtrip(SessionCreatedPayload {
             session_id,
-            role: AttachRole::Controller,
+            role: AttachRole::Operator,
             state: SessionState::Running,
             size,
         });
-        assert_roundtrip(SessionAttachPayload {
-            session_id,
-            intent: SessionAttachIntent::Auto,
-        });
+        assert_roundtrip(SessionAttachPayload { session_id });
         assert_roundtrip(SessionAttachedPayload {
             session_id,
-            role: AttachRole::Viewer,
+            role: AttachRole::Operator,
             state: SessionState::Running,
             size,
         });
         assert_roundtrip(SessionDataPayload {
             session_id,
             data_base64: "aGVsbG8=".to_owned(),
+        });
+        assert_roundtrip(SessionCursorPayload {
+            session_id,
+            row: 12,
+            col: 8,
         });
         assert_roundtrip(SessionResizePayload { session_id, size });
         assert_roundtrip(SessionRenamePayload {
@@ -750,6 +858,60 @@ mod tests {
         });
         assert_roundtrip(SessionClosePayload { session_id });
         assert_roundtrip(SessionClosedPayload { session_id });
+        assert_roundtrip(SessionFilesPayload {
+            session_id,
+            path: Some("src".to_owned()),
+        });
+        assert_roundtrip(SessionFilesResultPayload {
+            session_id,
+            path: "src".to_owned(),
+            entries: vec![
+                SessionFileEntryPayload {
+                    name: "bin".to_owned(),
+                    path: "src/bin".to_owned(),
+                    kind: SessionFileKind::Directory,
+                    size_bytes: 0,
+                    modified_at_ms: Some(UnixTimestampMillis(1_710_000_000_000)),
+                },
+                SessionFileEntryPayload {
+                    name: "main.rs".to_owned(),
+                    path: "src/main.rs".to_owned(),
+                    kind: SessionFileKind::File,
+                    size_bytes: 128,
+                    modified_at_ms: None,
+                },
+            ],
+        });
+        assert_roundtrip(SessionFileReadPayload {
+            session_id,
+            path: "src/main.rs".to_owned(),
+        });
+        assert_roundtrip(SessionFileReadResultPayload {
+            session_id,
+            path: "src/main.rs".to_owned(),
+            data_base64: "Zm4gbWFpbigpIHt9Cg==".to_owned(),
+            size_bytes: 13,
+            modified_at_ms: None,
+        });
+        assert_roundtrip(SessionFileWritePayload {
+            session_id,
+            path: "upload.txt".to_owned(),
+            data_base64: "dXBsb2FkCg==".to_owned(),
+        });
+        assert_roundtrip(SessionFileWrittenPayload {
+            session_id,
+            path: "upload.txt".to_owned(),
+            size_bytes: 7,
+            modified_at_ms: Some(UnixTimestampMillis(1_710_000_000_000)),
+        });
+        assert_roundtrip(SessionFileDeletePayload {
+            session_id,
+            path: "upload.txt".to_owned(),
+        });
+        assert_roundtrip(SessionFileDeletedPayload {
+            session_id,
+            path: "upload.txt".to_owned(),
+        });
         assert_roundtrip(SessionListPayload {});
         assert_roundtrip(SessionListResultPayload {
             sessions: vec![SessionSummaryPayload {
@@ -793,6 +955,9 @@ mod tests {
                 connected_at_ms: UnixTimestampMillis(1_710_000_000_000),
                 last_seen_at_ms: UnixTimestampMillis(1_710_000_030_000),
                 attached_session_ids: vec![session_id],
+                cursor_session_id: Some(session_id),
+                cursor_row: Some(12),
+                cursor_col: Some(8),
             }],
         });
     }
@@ -803,7 +968,6 @@ mod tests {
             MessageType::SessionAttach,
             SessionAttachPayload {
                 session_id: SessionId::new(),
-                intent: SessionAttachIntent::Auto,
             },
         );
 

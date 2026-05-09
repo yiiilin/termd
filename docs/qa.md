@@ -1,6 +1,6 @@
 # QA 矩阵
 
-`bash scripts/qa.sh` 是当前 MVP 的统一本地 QA 入口。脚本不依赖强审 controller，不安装系统依赖，也不写 checklist。
+`bash scripts/qa.sh` 是当前 MVP 的统一本地 QA 入口。脚本不依赖旧 controller/viewer 模式，不安装系统依赖，也不写 checklist。
 
 ## 覆盖范围
 

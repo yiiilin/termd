@@ -51,15 +51,14 @@ relay = untrusted
 无账号/平台策略系统
 仅：
 
-- controller（唯一）
-- viewer（其他设备）
+- operator（所有已 attach 设备）
 ```
 
 规则：
 
-* 第一个 attach = controller
-* 其他设备 = viewer
-* 任意设备可 steal control
+* 任意已配对设备 attach 后都是 operator
+* 多个 operator 默认 shared-control，可同时向同一个 PTY 输入
+* `control_request` 仅作为旧命令的 noop 确认路径，不表达夺权
 
 ---
 
@@ -200,7 +199,7 @@ NONE → HELD(dev_x) → HELD(dev_y)
 必须始终成立：
 
 ```text
-1. 一个 session 只能有一个 controller
+1. 只有已 attach 的连接可以操作 session
 2. 未配对设备不能连接
 3. relay 不可访问明文
 4. session 不因 client 断开而终止

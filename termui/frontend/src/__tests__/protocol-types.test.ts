@@ -23,11 +23,20 @@ describe("协议类型", () => {
       "session_attach",
       "session_attached",
       "session_data",
+      "session_cursor",
       "session_resize",
       "session_rename",
       "session_renamed",
       "session_close",
       "session_closed",
+      "session_files",
+      "session_files_result",
+      "session_file_read",
+      "session_file_read_result",
+      "session_file_write",
+      "session_file_written",
+      "session_file_delete",
+      "session_file_deleted",
       "session_list",
       "session_list_result",
       "daemon_clients",
@@ -55,13 +64,13 @@ describe("协议类型", () => {
     expect(message.payload.size.rows).toBe(40);
   });
 
-  it("状态枚举只表达个人设备控制权语义", () => {
+  it("状态枚举只表达个人 shared-control 语义", () => {
     const states: SessionState[] = ["created", "running", "closed"];
-    const roles: AttachRole[] = ["controller", "viewer"];
+    const roles: AttachRole[] = ["operator"];
     const forbidden = ["admin", "owner", "member", "tenant"];
 
     expect(states).toEqual(["created", "running", "closed"]);
-    expect(roles).toEqual(["controller", "viewer"]);
+    expect(roles).toEqual(["operator"]);
     expect(JSON.stringify({ states, roles }).toLowerCase()).not.toContain(forbidden.join("|"));
   });
 

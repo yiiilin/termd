@@ -1,14 +1,14 @@
 import { useEffect, useRef } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
-import type { AttachRole, TerminalSize } from "../protocol/types";
+import type { TerminalSize } from "../protocol/types";
 
 interface TerminalPaneProps {
   chunks: string[];
   attached: boolean;
-  role?: AttachRole;
   onInput: (data: string) => void;
   onResize: (size: TerminalSize) => void;
+  onCursorChange?: (position: { row: number; col: number }) => void;
 }
 
 export function TerminalPane(props: TerminalPaneProps) {
@@ -18,11 +18,35 @@ export function TerminalPane(props: TerminalPaneProps) {
   const writtenChunksRef = useRef(0);
   const onInputRef = useRef(props.onInput);
   const onResizeRef = useRef(props.onResize);
+  const onCursorChangeRef = useRef(props.onCursorChange);
+  const cursorFrameRef = useRef<number | undefined>(undefined);
 
   useEffect(() => {
     onInputRef.current = props.onInput;
     onResizeRef.current = props.onResize;
-  }, [props.onInput, props.onResize]);
+    onCursorChangeRef.current = props.onCursorChange;
+  }, [props.onCursorChange, props.onInput, props.onResize]);
+
+  const queueCursorReport = () => {
+    if (cursorFrameRef.current !== undefined) {
+      return;
+    }
+    cursorFrameRef.current = window.requestAnimationFrame(() => {
+      cursorFrameRef.current = undefined;
+      const terminal = terminalRef.current;
+      if (!terminal || !onCursorChangeRef.current) {
+        return;
+      }
+
+      // xterm 内部 cursorX/cursorY 是 0-based；协议用 1-based，便于 UI 直接展示。
+      // jsdom 测试环境不会完整实现 xterm buffer，缺失时用 1:1 兜底，不影响浏览器真实值。
+      const activeBuffer = terminal.buffer?.active;
+      onCursorChangeRef.current({
+        row: activeBuffer ? activeBuffer.cursorY + 1 : 1,
+        col: activeBuffer ? activeBuffer.cursorX + 1 : 1,
+      });
+    });
+  };
 
   useEffect(() => {
     if (!props.attached || !hostRef.current || terminalRef.current) {
@@ -45,7 +69,10 @@ export function TerminalPane(props: TerminalPaneProps) {
     const fit = new FitAddon();
     terminal.loadAddon(fit);
     terminal.open(hostRef.current);
-    terminal.onData((data) => onInputRef.current(data));
+    const dataSubscription = terminal.onData((data) => {
+      onInputRef.current(data);
+      queueCursorReport();
+    });
     terminalRef.current = terminal;
     fitRef.current = fit;
     writtenChunksRef.current = 0;
@@ -54,6 +81,7 @@ export function TerminalPane(props: TerminalPaneProps) {
       terminal.write(chunk);
     }
     writtenChunksRef.current = props.chunks.length;
+    queueCursorReport();
 
     // xterm 的 cols/rows 是 terminal attach 的协议边界，UI 只上报尺寸，不决定业务控制权。
     const resize = () => {
@@ -66,6 +94,7 @@ export function TerminalPane(props: TerminalPaneProps) {
           pixel_width: hostRef.current?.clientWidth ?? 0,
           pixel_height: hostRef.current?.clientHeight ?? 0,
         });
+        queueCursorReport();
       }
     };
     const frame = window.requestAnimationFrame(resize);
@@ -73,7 +102,12 @@ export function TerminalPane(props: TerminalPaneProps) {
 
     return () => {
       window.cancelAnimationFrame(frame);
+      if (cursorFrameRef.current !== undefined) {
+        window.cancelAnimationFrame(cursorFrameRef.current);
+        cursorFrameRef.current = undefined;
+      }
       window.removeEventListener("resize", resize);
+      dataSubscription.dispose();
       terminal.dispose();
       terminalRef.current = null;
       fitRef.current = null;
@@ -92,7 +126,7 @@ export function TerminalPane(props: TerminalPaneProps) {
       writtenChunksRef.current = 0;
     }
     for (let index = writtenChunksRef.current; index < props.chunks.length; index += 1) {
-      terminal.write(props.chunks[index]);
+      terminal.write(props.chunks[index], queueCursorReport);
     }
     writtenChunksRef.current = props.chunks.length;
   }, [props.chunks]);
@@ -106,9 +140,6 @@ export function TerminalPane(props: TerminalPaneProps) {
     >
       <div className="terminal-host" ref={hostRef} />
       {!props.attached ? <div className="terminal-placeholder">detached</div> : null}
-      <div className="terminal-role" aria-live="polite">
-        {props.role ?? "detached"}
-      </div>
     </section>
   );
 }

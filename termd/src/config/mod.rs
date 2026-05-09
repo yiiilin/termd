@@ -138,7 +138,7 @@ pub fn normalize_relay_endpoints(
 /// daemon 本地配置。
 ///
 /// `DaemonConfig` 只描述 daemon 自己如何启动和在哪里保存本地状态；它不会把设备信任、
-/// controller/viewer 或 session 生命周期编码成平台策略。
+/// operator 状态或 session 生命周期编码成平台策略。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonConfig {
     /// 配置文件 schema 版本，便于后续做迁移。

@@ -34,7 +34,7 @@ pub struct DaemonIdentitySnapshot {
 
 /// 已配对设备的持久状态记录。
 ///
-/// 该结构只表达设备级信任事实；它不是账号或平台策略。controller/viewer 仍由 session
+/// 该结构只表达设备级信任事实；它不是账号或平台策略。operator 状态仍由 session
 /// attach 规则在运行时决定。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrustedDeviceState {
@@ -56,7 +56,6 @@ pub struct SessionStateRecord {
     pub size: TerminalSize,
     pub created_at_ms: UnixTimestampMillis,
     pub updated_at_ms: UnixTimestampMillis,
-    pub controller_device_id: Option<DeviceId>,
 }
 
 /// daemon 本地持久状态。
@@ -395,7 +394,6 @@ mod tests {
                 size: TerminalSize::new(40, 120),
                 created_at_ms: UnixTimestampMillis(3000),
                 updated_at_ms: UnixTimestampMillis(4000),
-                controller_device_id: Some(device_id),
             }],
         }
     }

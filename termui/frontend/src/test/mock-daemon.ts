@@ -7,7 +7,6 @@ import {
 } from "../protocol/auth";
 import { E2eeSession, generateE2eeKeyPair, type E2eeKeyPair } from "../protocol/e2ee";
 import type {
-  AttachRole,
   DaemonClientSummaryPayload,
   E2eeKeyExchangePayload,
   EncryptedFramePayload,
@@ -17,6 +16,9 @@ import type {
   SessionCreatePayload,
   SessionCreatedPayload,
   SessionDataPayload,
+  SessionFileReadResultPayload,
+  SessionFileWrittenPayload,
+  SessionFilesResultPayload,
   SessionSummaryPayload,
   UUID,
 } from "../protocol/types";
@@ -38,6 +40,8 @@ interface MockDaemonOptions {
   pairFailure?: ErrorPayload;
   sessionDataError?: ErrorPayload;
   daemonClients?: DaemonClientSummaryPayload[];
+  sessionFiles?: Record<UUID, SessionFilesResultPayload>;
+  sessionFileReads?: Record<string, SessionFileReadResultPayload>;
 }
 
 interface TrustedDevice {
@@ -57,12 +61,17 @@ export class MockDaemon {
   public readonly outerWireLog: string[] = [];
   public readonly createdCommands: string[][] = [];
   public readonly sessionDataMessages: string[] = [];
-  public readonly attachIntents: Array<"auto" | "viewer" | undefined> = [];
+  public readonly attachedSessions: UUID[] = [];
+  public readonly sessionCursorUpdates: Array<{ session_id: UUID; row: number; col: number }> = [];
   public readonly sessionRenames: Array<{ session_id: UUID; name: string }> = [];
   public readonly closedSessions: UUID[] = [];
+  public readonly sessionFileRequests: Array<{ session_id: UUID; path?: string | null }> = [];
+  public readonly sessionFileReadRequests: Array<{ session_id: UUID; path: string }> = [];
+  public readonly sessionFileWrites: Array<{ session_id: UUID; path: string; text: string }> = [];
+  public readonly sessionFileDeletes: Array<{ session_id: UUID; path: string }> = [];
   public pingMessages = 0;
   public readonly decryptedInputs: string[] = [];
-  public nextAttachRole: AttachRole = "controller";
+  public nextAttachRole = "operator" as const;
   private createdSessionCounter = 0;
   private readonly e2eeKeypair: E2eeKeyPair;
   private readonly trustedDevices = new Map<UUID, TrustedDevice>();
@@ -188,16 +197,14 @@ export class MockDaemon {
         this.handleSessionCreate(connection, inner.payload as SessionCreatePayload);
         return;
       case "session_attach": {
-        const payload = inner.payload as { session_id: UUID; intent?: "auto" | "viewer" };
+        const payload = inner.payload as { session_id: UUID };
         const session = this.options.sessions.find((candidate) => candidate.session_id === payload.session_id);
-        this.attachIntents.push(payload.intent);
-        // 测试 daemon 模拟真实协议：viewer intent 只建立输出订阅，不隐式抢 controller。
-        const role = payload.intent === "viewer" ? "viewer" : this.nextAttachRole;
+        this.attachedSessions.push(payload.session_id);
         this.sendInner(
           connection,
           envelope("session_attached", {
             session_id: payload.session_id,
-            role,
+            role: this.nextAttachRole,
             state: session?.state ?? "running",
             size: session?.size ?? { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
           }),
@@ -218,11 +225,15 @@ export class MockDaemon {
         const input = decodeUtf8(sessionDataFromBase64(payload.data_base64));
         this.sessionDataMessages.push(input);
         if (this.options.sessionDataError) {
-          // controller_required 等拒绝路径只记录收到的加密业务帧，不模拟写入 PTY。
+          // 拒绝路径只记录收到的加密业务帧，不模拟写入 PTY。
           this.sendError(connection, this.options.sessionDataError.code, this.options.sessionDataError.message);
           return;
         }
         this.decryptedInputs.push(input);
+        return;
+      }
+      case "session_cursor": {
+        this.sessionCursorUpdates.push(inner.payload as { session_id: UUID; row: number; col: number });
         return;
       }
       case "session_resize":
@@ -244,9 +255,69 @@ export class MockDaemon {
         this.sendInner(connection, envelope("session_closed", payload));
         return;
       }
+      case "session_files": {
+        const payload = inner.payload as { session_id: UUID; path?: string | null };
+        this.sessionFileRequests.push(payload);
+        // 指定 path 时必须按该目录返回，避免测试里把“任意切换目录”误回退成 session 根目录。
+        const files =
+          payload.path && payload.path.trim()
+            ? this.options.sessionFiles?.[payload.path]
+            : this.options.sessionFiles?.[payload.session_id];
+        this.sendInner(
+          connection,
+          envelope(
+            "session_files_result",
+            files ?? {
+              session_id: payload.session_id,
+              path: payload.path ?? "",
+              entries: [],
+            },
+          ),
+        );
+        return;
+      }
+      case "session_file_read": {
+        const payload = inner.payload as { session_id: UUID; path: string };
+        this.sessionFileReadRequests.push(payload);
+        const result =
+          this.options.sessionFileReads?.[payload.path] ??
+          ({
+            session_id: payload.session_id,
+            path: payload.path,
+            data_base64: sessionDataToBase64(new TextEncoder().encode("downloaded mock file\n")),
+            size_bytes: 21,
+            modified_at_ms: null,
+          } satisfies SessionFileReadResultPayload);
+        this.sendInner(connection, envelope("session_file_read_result", result));
+        return;
+      }
+      case "session_file_write": {
+        const payload = inner.payload as { session_id: UUID; path: string; data_base64: string };
+        const bytes = sessionDataFromBase64(payload.data_base64);
+        this.sessionFileWrites.push({
+          session_id: payload.session_id,
+          path: payload.path,
+          text: decodeUtf8(bytes),
+        });
+        this.sendInner(
+          connection,
+          envelope("session_file_written", {
+            session_id: payload.session_id,
+            path: payload.path,
+            size_bytes: bytes.byteLength,
+            modified_at_ms: null,
+          } satisfies SessionFileWrittenPayload),
+        );
+        return;
+      }
+      case "session_file_delete": {
+        const payload = inner.payload as { session_id: UUID; path: string };
+        this.sessionFileDeletes.push(payload);
+        this.sendInner(connection, envelope("session_file_deleted", payload));
+        return;
+      }
       case "control_request": {
         const payload = inner.payload as { session_id: UUID; device_id: UUID };
-        this.nextAttachRole = "controller";
         this.sendInner(connection, envelope("control_grant", payload));
         return;
       }

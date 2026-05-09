@@ -17,10 +17,9 @@ use termd::net::{
 use termd_proto::{
     AuthChallengePayload, AuthPayload, ControlGrantPayload, ControlRequestPayload, DeviceId,
     E2eeKeyExchangePayload, EncryptedFramePayload, ErrorPayload, MessageType, PairAcceptPayload,
-    PairRequestPayload, PairingToken, PingPayload, PublicKey, ServerId, SessionAttachIntent,
-    SessionAttachPayload, SessionAttachedPayload, SessionCreatePayload, SessionCreatedPayload,
-    SessionDataPayload, SessionId, SessionListPayload, SessionListResultPayload,
-    SessionResizePayload, TerminalSize,
+    PairRequestPayload, PairingToken, PingPayload, PublicKey, ServerId, SessionAttachPayload,
+    SessionAttachedPayload, SessionCreatePayload, SessionCreatedPayload, SessionDataPayload,
+    SessionId, SessionListPayload, SessionListResultPayload, SessionResizePayload, TerminalSize,
 };
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -194,10 +193,7 @@ impl DirectClient {
     ) -> Result<SessionAttachedPayload> {
         self.send_inner(envelope_value(
             MessageType::SessionAttach,
-            SessionAttachPayload {
-                session_id,
-                intent: SessionAttachIntent::Auto,
-            },
+            SessionAttachPayload { session_id },
         )?)
         .await?;
         self.expect_payload(MessageType::SessionAttached).await
@@ -213,8 +209,7 @@ impl DirectClient {
         )?)
         .await?;
 
-        // control 前的 attach 可能触发 daemon flush 已缓存的 session_data。
-        // control 命令只关心授权结果，因此跳过终端输出帧，等待当前请求的 control_grant。
+        // control 在 shared-control 模式下是 noop 确认命令；仍跳过 attach 后可能先到的输出帧。
         loop {
             let envelope = self.receive_inner_timeout().await?;
             match envelope.kind {

@@ -100,6 +100,10 @@ label {
   grid-template-columns: minmax(280px, 340px) 1fr;
 }
 
+.app-shell.sidebar-is-collapsed {
+  grid-template-columns: 58px 1fr;
+}
+
 .sidebar {
   border-right: 1px solid #25312d;
   background: rgba(11, 18, 16, 0.96);
@@ -108,6 +112,15 @@ label {
   align-content: start;
   gap: 12px;
   overflow: auto;
+}
+
+.collapsed-sidebar {
+  position: relative;
+  padding: 10px 8px;
+  gap: 10px;
+  justify-items: center;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  overflow: visible;
 }
 
 .brand-row,
@@ -134,9 +147,17 @@ label {
   gap: 8px;
 }
 
+.sidebar-collapse-toggle {
+  margin-left: auto;
+}
+
 .clients-toggle {
   flex: 0 0 auto;
   margin-left: auto;
+}
+
+.sidebar-collapse-toggle + .clients-toggle {
+  margin-left: 0;
 }
 
 .clients-popover {
@@ -152,6 +173,52 @@ label {
 .clients-popover .daemon-clients {
   max-height: min(420px, calc(100vh - 120px));
   overflow: auto;
+}
+
+.rail-brand,
+.rail-actions,
+.collapsed-session-list {
+  width: 100%;
+  display: grid;
+  justify-items: center;
+  gap: 8px;
+}
+
+.rail-brand {
+  position: relative;
+  padding-bottom: 10px;
+  border-bottom: 1px solid #25312d;
+  color: #d6ff5f;
+}
+
+.rail-actions {
+  padding-bottom: 10px;
+  border-bottom: 1px solid #25312d;
+}
+
+.collapsed-session-list {
+  align-content: start;
+  min-height: 0;
+  overflow: auto;
+}
+
+.collapsed-session-list .icon-button,
+.rail-actions .icon-button,
+.rail-brand .icon-button {
+  width: 38px;
+  min-height: 38px;
+}
+
+.selected-session-dot {
+  border-color: #d6ff5f;
+  color: #d6ff5f;
+  background: #1d2a24;
+}
+
+.rail-popover {
+  top: 56px;
+  left: calc(100% + 8px);
+  right: auto;
 }
 
 .panel {
@@ -235,8 +302,7 @@ label {
 .session-main,
 .session-row strong,
 .status-bar,
-.toolbar,
-.terminal-role {
+.toolbar {
   font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
 }
 
@@ -281,11 +347,6 @@ label {
 
 .session-actions-spacer {
   flex: 1 1 auto;
-}
-
-.icon-action {
-  justify-self: start;
-  min-height: 30px;
 }
 
 .session-rename-form {
@@ -361,6 +422,17 @@ label {
   grid-template-rows: 46px minmax(420px, 1fr) 30px;
 }
 
+.workspace-body {
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 286px;
+}
+
+.workspace-body.files-panel-hidden {
+  grid-template-columns: minmax(0, 1fr) 42px;
+}
+
 .toolbar {
   border-bottom: 1px solid #25312d;
   background: #111a17;
@@ -387,8 +459,58 @@ label {
   margin-left: auto;
 }
 
+.session-operators {
+  min-width: 0;
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  overflow: hidden;
+}
+
+.session-operators-title,
+.session-operator {
+  min-width: 0;
+  min-height: 26px;
+  border: 1px solid #30423b;
+  border-radius: 6px;
+  background: #0d1714;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 8px;
+}
+
+.session-operators-title {
+  flex: 0 0 auto;
+  color: #d6ff5f;
+}
+
+.session-operator {
+  max-width: 190px;
+  color: #c8d8d0;
+  font-size: 12px;
+}
+
+.session-operator span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-operator span:last-child {
+  color: #d6ff5f;
+}
+
+.session-operator.muted {
+  color: #697d73;
+}
+
 .terminal-pane {
   position: relative;
+  min-width: 0;
   min-height: 0;
   background: #08110f;
   overflow: hidden;
@@ -409,16 +531,171 @@ label {
   font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
 }
 
-.terminal-role {
-  position: absolute;
-  right: 10px;
-  top: 10px;
-  border: 1px solid #34413c;
-  border-radius: 6px;
-  padding: 4px 7px;
-  background: rgba(8, 17, 15, 0.88);
+.files-panel {
+  min-width: 0;
+  min-height: 0;
+  border-left: 1px solid #25312d;
+  background: #0d1512;
+  display: grid;
+  grid-template-rows: 46px auto minmax(0, 1fr);
+}
+
+.files-panel-header {
+  min-width: 0;
+  border-bottom: 1px solid #25312d;
+  padding: 0 8px 0 12px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.files-title {
+  display: flex;
+  align-items: center;
+  gap: 7px;
   color: #d6ff5f;
   font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
+.files-path {
+  min-width: 0;
+  margin-left: auto;
+  color: #8fa59a;
+  font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.files-hide-button {
+  flex: 0 0 auto;
+}
+
+.files-rail {
+  min-width: 0;
+  min-height: 0;
+  border-left: 1px solid #25312d;
+  background: #0d1512;
+  display: grid;
+  align-content: start;
+  justify-items: center;
+  padding-top: 8px;
+}
+
+.files-rail .icon-button {
+  width: 32px;
+  min-height: 34px;
+}
+
+.files-toolbar {
+  min-width: 0;
+  border-bottom: 1px solid #25312d;
+  padding: 8px;
+  display: grid;
+  grid-template-columns: 32px minmax(0, 1fr) auto 32px;
+  gap: 6px;
+  align-items: center;
+}
+
+.files-path-field {
+  min-width: 0;
+}
+
+.files-path-field input {
+  min-height: 30px;
+  font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+  font-size: 12px;
+}
+
+.files-upload-input {
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+  position: absolute;
+}
+
+.files-list {
+  min-height: 0;
+  overflow: auto;
+  padding: 8px;
+  display: grid;
+  align-content: start;
+  gap: 4px;
+}
+
+.file-row {
+  min-width: 0;
+  min-height: 32px;
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 7px;
+  border-radius: 6px;
+  padding: 0 6px;
+  color: #dbe8e2;
+}
+
+.file-row:hover {
+  background: #14201c;
+}
+
+.file-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: #90a59b;
+}
+
+.file-icon.directory {
+  color: #d6ff5f;
+}
+
+.file-icon.symlink {
+  color: #89d8ff;
+}
+
+.file-name,
+.file-size,
+.files-empty {
+  font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+  font-size: 12px;
+}
+
+.file-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-size {
+  color: #8fa59a;
+  white-space: nowrap;
+}
+
+.file-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.file-actions .icon-button {
+  width: 28px;
+  min-height: 28px;
+}
+
+.files-empty {
+  min-height: 80px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  color: #536760;
 }
 
 .status-bar {
@@ -456,6 +733,16 @@ label {
 
   .workspace {
     grid-template-rows: 44px minmax(360px, calc(100vh - 360px)) 30px;
+  }
+
+  .workspace-body {
+    grid-template-columns: 1fr;
+    grid-template-rows: minmax(280px, 1fr) minmax(170px, 32vh);
+  }
+
+  .files-panel {
+    border-left: 0;
+    border-top: 1px solid #25312d;
   }
 
   .toolbar-group {

@@ -1,7 +1,7 @@
 //! termd 的端到端加密传输边界。
 //!
 //! 本模块只负责已认证 daemon 与设备之间的会话密钥派生、帧加密、帧解密和序号防重放。
-//! 它不做 pairing、challenge-response、controller/viewer 决策，也不让 relay 接触明文业务内容。
+//! 它不做 pairing、challenge-response、operator 决策，也不让 relay 接触明文业务内容。
 
 pub mod protocol;
 pub mod pty_bridge;

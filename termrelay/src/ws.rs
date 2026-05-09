@@ -16,7 +16,7 @@ const CHANNEL_CAPACITY: usize = 256;
 type ConnectionId = u64;
 type FrameSender = mpsc::Sender<OpaqueFrame>;
 
-/// relay 只区分连接方向，不表达 controller/viewer 或任何控制权角色。
+/// relay 只区分连接方向，不表达 operator 或任何终端业务状态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionRole {
     Daemon,

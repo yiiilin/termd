@@ -237,7 +237,7 @@ pub trait PtyBackend: Send + Sync {
 /// 运行中的 PTY session。
 ///
 /// 这里暴露 daemon 内核需要的最小操作：读输出、写输入、resize、终止和等待退出。
-/// 控制权判断必须由 session/control 层在调用写入前完成，PTY 层不识别 controller/viewer。
+/// attach/operator 判断必须由 session/control 层在调用写入前完成，PTY 层不识别业务角色。
 pub trait PtySession: Send {
     /// 从 PTY 输出流读取数据；调用方负责选择阻塞线程或异步桥接方式。
     fn read(&mut self, buffer: &mut [u8]) -> PtyResult<usize>;

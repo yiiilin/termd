@@ -2,7 +2,7 @@
 //!
 //! 本模块只维护 daemon identity、device identity 和可信设备清单。它刻意不引入账号体系、
 //! 平台级策略或 relay 业务判断；上层只需要先确认设备已配对并可信，再把
-//! device id 交给 session/control 模块处理 controller/viewer 规则。
+//! device id 交给 session/control 模块处理 shared-control operator 规则。
 //!
 //! 当前实现是 MVP 内存模型：pairing token、challenge-response 与 replay protection 都只在
 //! daemon 内核中做生命周期管理；Noise/X25519 或 E2EE 会在后续协议层接入。后续持久化
@@ -50,7 +50,7 @@ impl Error for AuthError {}
 /// pairing 生命周期的拒绝原因。
 ///
 /// pairing 只是设备级 trust establishment：通过一次性 token 把 device id 与 device public
-/// key 登记为可信设备。这里不表达账号、controller/viewer 或平台级策略。
+/// key 登记为可信设备。这里不表达账号、operator 状态或平台级策略。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PairingError {
     /// token 不存在，可能是拼写错误、已被清理，或来自未授权来源。
@@ -88,7 +88,7 @@ pub type ChallengeResult<T> = Result<T, ChallengeError>;
 /// challenge 生命周期的拒绝原因。
 ///
 /// challenge 只证明后续 auth 请求必须回应 daemon 最近签发的一次性材料；它不代表
-/// controller/viewer，也不包含账号或控制权语义。
+/// operator 状态，也不包含账号或控制权语义。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChallengeError {
     /// challenge 不存在，可能来自其他 daemon、其他连接，或已被清理。
@@ -177,8 +177,8 @@ impl Error for SignatureError {}
 
 /// challenge-response auth 的统一拒绝原因。
 ///
-/// auth 只证明“已配对设备持有对应私钥”。它不代表用户身份，也不授予 controller/viewer；
-/// controller/viewer 仍由 session/control attach 状态机决定。
+/// auth 只证明“已配对设备持有对应私钥”。它不代表用户身份，也不授予 operator 状态；
+/// operator 状态仍由 session/control attach 状态机决定。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChallengeAuthError {
     UntrustedDevice {
@@ -504,8 +504,8 @@ impl fmt::Debug for PairingTokenManager {
 
 /// pair_request / pair_accept 的 daemon 内核服务。
 ///
-/// 该服务只完成“token -> trusted device”的设备级信任建立，不给设备分配 controller/viewer，
-/// 也不创建账号。controller/viewer 仍由 session/control 状态机在 attach 时决定。
+/// 该服务只完成“token -> trusted device”的设备级信任建立，不给设备分配 operator 状态，
+/// 也不创建账号。operator 状态仍由 session/control 状态机在 attach 时决定。
 #[derive(Debug, Default)]
 pub struct PairingService {
     token_manager: PairingTokenManager,
@@ -666,7 +666,7 @@ impl fmt::Debug for AuthChallengeRecord {
 /// auth challenge 的内存生命周期管理器。
 ///
 /// 管理器只签发、查询、一次性消费、撤销和清理 challenge；不做 WebSocket 握手、不做
-/// E2EE，也不决定 controller/viewer。auth 成功后才由上层继续 attach session。
+/// E2EE，也不决定 operator 状态。auth 成功后才由上层继续 attach session。
 #[derive(Default)]
 pub struct AuthChallengeManager {
     challenges: HashMap<String, AuthChallengeRecord>,
@@ -963,7 +963,7 @@ impl AuthSigningInput {
 /// challenge-response auth 成功后的最小结果。
 ///
 /// 这里仍只返回设备级事实：哪个可信设备在何时通过认证。它不包含 session role，也不代表
-/// controller/viewer 控制权。
+/// operator 控制状态。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthenticatedDevice {
     pub device_id: DeviceId,
@@ -1230,7 +1230,7 @@ impl DeviceIdentity {
 /// 已建立信任的设备记录。
 ///
 /// 记录只保存设备级元数据：设备身份、建立信任时间、最近一次可信访问时间和可读标签。
-/// 不在这里保存 session 角色，也不保存 controller/viewer 控制权。
+/// 不在这里保存 session 角色，也不保存 operator 控制状态。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrustedDevice {
     identity: DeviceIdentity,
@@ -1255,7 +1255,7 @@ impl TrustedDevice {
 
     /// 从本地状态文件恢复可信设备记录。
     ///
-    /// 这只恢复设备级 trust fact；controller/viewer 仍由运行时 attach 状态机重新计算。
+    /// 这只恢复设备级 trust fact；operator 状态仍由运行时 attach 状态机重新计算。
     pub fn restore(
         identity: DeviceIdentity,
         trusted_at_ms: UnixTimestampMillis,

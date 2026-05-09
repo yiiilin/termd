@@ -1,6 +1,6 @@
 //! termd 的内存版 session/control 状态核心。
 //!
-//! 这个模块只维护 daemon 内部的 session 生命周期、attach 角色和控制权状态。
+//! 这个模块只维护 daemon 内部的 session 生命周期和 attach 状态。
 //! 认证、配对、PTY I/O、网络协议和持久化都不在这里实现，避免把 MVP 过早做成复杂平台。
 
 use std::collections::HashMap;
@@ -19,11 +19,10 @@ pub enum SessionState {
 
 /// attach 后设备在 session 中获得的角色。
 ///
-/// 不变量：同一个 session 任意时刻最多只能有一个 `Controller`。
+/// shared-control 模式下，所有已 attach 设备都是 operator，都可以向同一个 PTY 输入。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttachRole {
-    Controller,
-    Viewer,
+    Operator,
 }
 
 /// 终端窗口尺寸。
@@ -86,7 +85,6 @@ impl std::error::Error for SessionError {}
 #[derive(Debug)]
 struct SessionRecord {
     state: SessionState,
-    controller: Option<String>,
     attached_devices: HashMap<String, AttachRole>,
     size: TerminalSize,
 }
@@ -95,7 +93,6 @@ impl SessionRecord {
     fn new() -> Self {
         Self {
             state: SessionState::Created,
-            controller: None,
             attached_devices: HashMap::new(),
             size: TerminalSize::default(),
         }
@@ -134,10 +131,9 @@ impl SessionManager {
 
     /// 将可信设备 attach 到 session。
     ///
-    /// 控制权规则：
+    /// shared-control 规则：
     /// - session 首次从 `Created` attach 时转为 `Running`。
-    /// - 当前没有 controller 时，本次 attach 成为 controller。
-    /// - 已有 controller 时，新设备只能成为 viewer，避免输入冲突。
+    /// - 所有已 attach 设备都是 operator，可以共同向 PTY 输入。
     pub fn attach(
         &mut self,
         session_id: &str,
@@ -155,54 +151,13 @@ impl SessionManager {
             return Ok(role);
         }
 
-        let role = if session.controller.is_none() {
-            session.controller = Some(device_id.clone());
-            AttachRole::Controller
-        } else {
-            AttachRole::Viewer
-        };
+        let role = AttachRole::Operator;
 
         session.attached_devices.insert(device_id, role);
         Ok(role)
     }
 
-    /// 将可信设备以 viewer 身份 attach 到 session。
-    ///
-    /// 这条路径用于“先观看再决定是否接管”的 UI 语义：它会启动 Created session，
-    /// 但不会因为 controller 为空而自动授予输入控制权。
-    pub fn attach_viewer(
-        &mut self,
-        session_id: &str,
-        device_id: impl Into<String>,
-    ) -> Result<AttachRole, SessionError> {
-        let device_id = device_id.into();
-        let session = self.session_mut(session_id)?;
-        session.ensure_open()?;
-
-        if session.state == SessionState::Created {
-            session.state = SessionState::Running;
-        }
-
-        if let Some(role) = session.attached_devices.get_mut(&device_id) {
-            if *role == AttachRole::Controller {
-                // viewer intent 来自“点击卡片查看”这种显式观看动作；即使同一设备之前持有
-                // controller，也要降级，避免普通选择操作隐式保留输入控制权。
-                session.controller = None;
-                *role = AttachRole::Viewer;
-            }
-            return Ok(AttachRole::Viewer);
-        }
-
-        session
-            .attached_devices
-            .insert(device_id, AttachRole::Viewer);
-        Ok(AttachRole::Viewer)
-    }
-
-    /// 已 attach 的可信设备主动夺取控制权。
-    ///
-    /// 夺权时只做一次原子状态替换：旧 controller 降为 viewer，新设备升为 controller。
-    /// 这保证了“最多一个 controller”的核心不变量。
+    /// shared-control 模式没有夺权概念；该方法只保留为旧 CLI 命令的无害确认路径。
     pub fn steal_control(&mut self, session_id: &str, device_id: &str) -> Result<(), SessionError> {
         let session = self.session_mut(session_id)?;
         session.ensure_open()?;
@@ -211,34 +166,18 @@ impl SessionManager {
             return Err(SessionError::DeviceNotAttached);
         }
 
-        if let Some(old_controller) = session.controller.take() {
-            if let Some(old_role) = session.attached_devices.get_mut(&old_controller) {
-                *old_role = AttachRole::Viewer;
-            }
-        }
-
-        session.controller = Some(device_id.to_owned());
-        session
-            .attached_devices
-            .insert(device_id.to_owned(), AttachRole::Controller);
         Ok(())
     }
 
     /// 设备 detach 只断开连接状态，不关闭 session。
-    ///
-    /// 如果 detach 的设备正持有控制权，控制权回到 `None`；不会自动提升 viewer，
-    /// 避免在用户未显式请求时发生隐藏的输入控制权转移。
     pub fn detach(&mut self, session_id: &str, device_id: &str) -> Result<(), SessionError> {
         let session = self.session_mut(session_id)?;
         session.ensure_open()?;
 
-        match session.attached_devices.remove(device_id) {
-            Some(AttachRole::Controller) => {
-                session.controller = None;
-                Ok(())
-            }
-            Some(AttachRole::Viewer) => Ok(()),
-            None => Err(SessionError::DeviceNotAttached),
+        if session.attached_devices.remove(device_id).is_some() {
+            Ok(())
+        } else {
+            Err(SessionError::DeviceNotAttached)
         }
     }
 
@@ -249,7 +188,6 @@ impl SessionManager {
         let session = self.session_mut(session_id)?;
 
         session.state = SessionState::Closed;
-        session.controller = None;
         session.attached_devices.clear();
         Ok(())
     }
@@ -270,10 +208,6 @@ impl SessionManager {
 
     pub fn state(&self, session_id: &str) -> Result<SessionState, SessionError> {
         Ok(self.session(session_id)?.state)
-    }
-
-    pub fn controller(&self, session_id: &str) -> Result<Option<&str>, SessionError> {
-        Ok(self.session(session_id)?.controller.as_deref())
     }
 
     pub fn role(
@@ -310,35 +244,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn first_attach_becomes_controller() {
+    fn first_attach_becomes_operator() {
         let mut manager = SessionManager::default();
         manager.create_session("s1").unwrap();
 
         let role = manager.attach("s1", "dev-a").unwrap();
 
-        assert_eq!(role, AttachRole::Controller);
-        assert_eq!(manager.controller("s1").unwrap(), Some("dev-a"));
+        assert_eq!(role, AttachRole::Operator);
         assert_eq!(manager.state("s1").unwrap(), SessionState::Running);
     }
 
     #[test]
-    fn second_attach_becomes_viewer() {
+    fn second_attach_is_also_operator() {
         let mut manager = SessionManager::default();
         manager.create_session("s1").unwrap();
         manager.attach("s1", "dev-a").unwrap();
 
         let role = manager.attach("s1", "dev-b").unwrap();
 
-        assert_eq!(role, AttachRole::Viewer);
-        assert_eq!(manager.controller("s1").unwrap(), Some("dev-a"));
+        assert_eq!(role, AttachRole::Operator);
         assert_eq!(
             manager.role("s1", "dev-b").unwrap(),
-            Some(AttachRole::Viewer)
+            Some(AttachRole::Operator)
         );
     }
 
     #[test]
-    fn trusted_device_can_steal_control() {
+    fn control_request_is_noop_for_attached_operator() {
         let mut manager = SessionManager::default();
         manager.create_session("s1").unwrap();
         manager.attach("s1", "dev-a").unwrap();
@@ -346,30 +278,13 @@ mod tests {
 
         manager.steal_control("s1", "dev-b").unwrap();
 
-        assert_eq!(manager.controller("s1").unwrap(), Some("dev-b"));
         assert_eq!(
             manager.role("s1", "dev-a").unwrap(),
-            Some(AttachRole::Viewer)
+            Some(AttachRole::Operator)
         );
         assert_eq!(
             manager.role("s1", "dev-b").unwrap(),
-            Some(AttachRole::Controller)
-        );
-    }
-
-    #[test]
-    fn viewer_attach_intent_downgrades_existing_controller_role() {
-        let mut manager = SessionManager::default();
-        manager.create_session("s1").unwrap();
-        manager.attach("s1", "dev-a").unwrap();
-
-        let role = manager.attach_viewer("s1", "dev-a").unwrap();
-
-        assert_eq!(role, AttachRole::Viewer);
-        assert_eq!(manager.controller("s1").unwrap(), None);
-        assert_eq!(
-            manager.role("s1", "dev-a").unwrap(),
-            Some(AttachRole::Viewer)
+            Some(AttachRole::Operator)
         );
     }
 
@@ -382,7 +297,7 @@ mod tests {
         manager.detach("s1", "dev-a").unwrap();
 
         assert_eq!(manager.state("s1").unwrap(), SessionState::Running);
-        assert_eq!(manager.controller("s1").unwrap(), None);
+        assert_eq!(manager.role("s1", "dev-a").unwrap(), None);
     }
 
     #[test]

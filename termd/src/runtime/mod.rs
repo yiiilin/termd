@@ -1,6 +1,6 @@
 //! termd daemon 内核 runtime glue。
 //!
-//! runtime 只把 `SessionManager` 的控制权状态和 `PtyBackend` 的进程句柄接起来，
+//! runtime 只把 `SessionManager` 的 attach 状态和 `PtyBackend` 的进程句柄接起来，
 //! 负责 daemon 本地的持久会话生命周期与 I/O 桥接。认证、配对、E2EE、WebSocket
 //! 和 relay 路由都必须留在更外层，避免这里变成协议层或控制权系统。
 
@@ -27,7 +27,6 @@ pub enum RuntimeError {
     SessionClosed,
     DeviceNotAttached,
     InvalidSize,
-    InputRequiresController,
     Pty(PtyError),
 }
 
@@ -38,8 +37,7 @@ impl PartialEq for RuntimeError {
             | (Self::SessionNotFound, Self::SessionNotFound)
             | (Self::SessionClosed, Self::SessionClosed)
             | (Self::DeviceNotAttached, Self::DeviceNotAttached)
-            | (Self::InvalidSize, Self::InvalidSize)
-            | (Self::InputRequiresController, Self::InputRequiresController) => true,
+            | (Self::InvalidSize, Self::InvalidSize) => true,
             (Self::Pty(_), Self::Pty(_)) => true,
             _ => false,
         }
@@ -56,7 +54,6 @@ impl fmt::Display for RuntimeError {
             Self::SessionClosed => write!(f, "session is closed"),
             Self::DeviceNotAttached => write!(f, "device is not attached"),
             Self::InvalidSize => write!(f, "terminal size must have non-zero rows and cols"),
-            Self::InputRequiresController => write!(f, "input requires controller role"),
             Self::Pty(error) => write!(f, "{error}"),
         }
     }
@@ -70,8 +67,7 @@ impl Error for RuntimeError {
             | Self::SessionNotFound
             | Self::SessionClosed
             | Self::DeviceNotAttached
-            | Self::InvalidSize
-            | Self::InputRequiresController => None,
+            | Self::InvalidSize => None,
         }
     }
 }
@@ -101,7 +97,7 @@ struct RuntimeSession {
 /// daemon 内核 runtime。
 ///
 /// `SessionRuntime` 接收的 device id 默认已经由 auth 层验证；本类型只执行
-/// controller/viewer 角色对应的本地 I/O 规则，不判断设备是否配对，也不解析网络消息。
+/// shared-control 对应的本地 I/O 规则，不判断设备是否配对，也不解析网络消息。
 pub struct SessionRuntime<B: PtyBackend> {
     backend: B,
     sessions: SessionManager,
@@ -124,8 +120,7 @@ impl<B: PtyBackend> SessionRuntime<B> {
 
     /// 创建一个持久 runtime session，并启动对应 PTY 进程。
     ///
-    /// 这里不会自动 attach 任何设备；第一个后续 attach 的设备会由
-    /// `SessionManager` 赋予 controller 角色。
+    /// 这里不会自动 attach 任何设备；后续 attach 的设备都以 operator 身份共享输入。
     pub fn create_session(
         &mut self,
         command: CommandSpec,
@@ -156,28 +151,13 @@ impl<B: PtyBackend> SessionRuntime<B> {
         Ok(self.sessions.attach(session_id, device_id)?)
     }
 
-    /// 将已认证设备以 viewer 身份 attach 到 runtime session。
-    ///
-    /// Web 侧点击 session 只是在看这个会话；即使当前没有 controller，也不能因为“观看”
-    /// 动作隐式获得输入控制权。
-    pub fn attach_viewer(
-        &mut self,
-        session_id: &str,
-        device_id: impl Into<String>,
-    ) -> RuntimeResult<AttachRole> {
-        self.ensure_open_session(session_id)?;
-        Ok(self.sessions.attach_viewer(session_id, device_id)?)
-    }
-
-    /// 已 attach 设备主动夺取控制权。
-    ///
-    /// 该方法只转移 session manager 中的 controller/viewer 角色，不触碰 PTY 进程。
+    /// shared-control 模式没有夺权概念；旧 control 命令只确认设备已经 attach。
     pub fn steal_control(&mut self, session_id: &str, device_id: &str) -> RuntimeResult<()> {
         self.ensure_open_session(session_id)?;
         Ok(self.sessions.steal_control(session_id, device_id)?)
     }
 
-    /// controller 输入写入 PTY；viewer 或未 attach 设备会被拒绝。
+    /// 任意已 attach 设备的输入都会写入 PTY；未 attach 设备会被拒绝。
     ///
     /// 这是 runtime 的核心 I/O 桥接点。网络层应在 E2EE 解包后调用本方法，
     /// 但这里不识别 WebSocket frame、设备密钥或 relay 信息。
@@ -190,18 +170,17 @@ impl<B: PtyBackend> SessionRuntime<B> {
         self.ensure_open_session(session_id)?;
 
         match self.sessions.role(session_id, device_id)? {
-            Some(AttachRole::Controller) => {
+            Some(AttachRole::Operator) => {
                 self.runtime_session_mut(session_id)?.pty.write_all(bytes)?;
                 Ok(())
             }
-            Some(AttachRole::Viewer) => Err(RuntimeError::InputRequiresController),
             None => Err(RuntimeError::DeviceNotAttached),
         }
     }
 
     /// 从 PTY 输出读取数据，供后续 WebSocket/terminal fanout 层广播。
     ///
-    /// 输出读取不绑定具体 device；controller 和 viewer 的输出分发策略属于网络层。
+    /// 输出读取不绑定具体 device；多客户端输出分发策略属于网络层。
     pub fn read_output(&mut self, session_id: &str, buffer: &mut [u8]) -> RuntimeResult<usize> {
         self.ensure_open_session(session_id)?;
         Ok(self.runtime_session_mut(session_id)?.pty.read(buffer)?)
@@ -419,7 +398,7 @@ mod tests {
     }
 
     #[test]
-    fn first_attach_after_create_becomes_controller() {
+    fn first_attach_after_create_becomes_operator() {
         let backend = FakePtyBackend::default();
         let mut runtime = SessionRuntime::new(backend);
 
@@ -429,11 +408,11 @@ mod tests {
 
         let role = runtime.attach(&session_id, "dev-a").unwrap();
 
-        assert_eq!(role, AttachRole::Controller);
+        assert_eq!(role, AttachRole::Operator);
     }
 
     #[test]
-    fn controller_input_is_written_to_pty() {
+    fn operator_input_is_written_to_pty() {
         let backend = FakePtyBackend::default();
         let mut runtime = SessionRuntime::new(backend.clone());
         let session_id = runtime
@@ -449,7 +428,7 @@ mod tests {
     }
 
     #[test]
-    fn viewer_input_is_rejected() {
+    fn additional_attached_device_input_is_written_to_shared_pty() {
         let backend = FakePtyBackend::default();
         let mut runtime = SessionRuntime::new(backend.clone());
         let session_id = runtime
@@ -458,12 +437,11 @@ mod tests {
         runtime.attach(&session_id, "dev-a").unwrap();
         runtime.attach(&session_id, "dev-b").unwrap();
 
-        let error = runtime
+        runtime
             .write_input(&session_id, "dev-b", b"whoami\n")
-            .unwrap_err();
+            .unwrap();
 
-        assert_eq!(error, RuntimeError::InputRequiresController);
-        assert!(backend.writes().is_empty());
+        assert_eq!(backend.writes(), vec![b"whoami\n".to_vec()]);
     }
 
     #[test]
@@ -478,7 +456,7 @@ mod tests {
         runtime.detach(&session_id, "dev-a").unwrap();
         let role = runtime.attach(&session_id, "dev-b").unwrap();
 
-        assert_eq!(role, AttachRole::Controller);
+        assert_eq!(role, AttachRole::Operator);
         assert_eq!(backend.terminate_count(), 0);
     }
 

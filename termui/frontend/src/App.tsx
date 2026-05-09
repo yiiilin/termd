@@ -1,15 +1,26 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Cable, Link, Plus, RefreshCcw, Unplug, UsersRound } from "lucide-react";
+import {
+  Cable,
+  Link,
+  MonitorUp,
+  PanelLeftClose,
+  PanelLeftOpen,
+  PanelRightOpen,
+  Plus,
+  RefreshCcw,
+  Unplug,
+  UsersRound,
+} from "lucide-react";
 import { DirectClient, ProtocolClientError } from "./protocol/direct-client";
 import { toSafeError } from "./protocol/errors";
 import { parsePairingQrPayload } from "./protocol/pairing-payload";
 import type {
-  AttachRole,
   BrowserState,
   DaemonClientSummaryPayload,
   PairedServerState,
   SafeError,
   SessionCreatedPayload,
+  SessionFilesResultPayload,
   SessionSummaryPayload,
   TerminalSize,
   UUID,
@@ -19,6 +30,7 @@ import { defaultServer, ensureDevice, loadBrowserState, recordPairing } from "./
 import { ConnectionPanel, ConnectionStatusPanel } from "./components/ConnectionPanel";
 import { DaemonClientsPanel } from "./components/DaemonClientsPanel";
 import { SessionList } from "./components/SessionList";
+import { SessionFilesPanel } from "./components/SessionFilesPanel";
 import { StatusBar } from "./components/StatusBar";
 import { TerminalPane } from "./components/TerminalPane";
 
@@ -33,10 +45,15 @@ export default function App() {
   const [daemonClients, setDaemonClients] = useState<DaemonClientSummaryPayload[]>([]);
   const [clientsOpen, setClientsOpen] = useState(false);
   const [selectedSessionId, setSelectedSessionId] = useState<UUID | undefined>();
-  const [role, setRole] = useState<AttachRole | undefined>();
+  const [attachedSessionId, setAttachedSessionId] = useState<UUID | undefined>();
   const [renamingSessionId, setRenamingSessionId] = useState<UUID | undefined>();
   const [renameDraft, setRenameDraft] = useState("");
   const [terminalChunks, setTerminalChunks] = useState<string[]>([]);
+  const [sessionFiles, setSessionFiles] = useState<SessionFilesResultPayload | undefined>();
+  const [sessionFilesLoading, setSessionFilesLoading] = useState(false);
+  const [sessionFilesError, setSessionFilesError] = useState<SafeError | undefined>();
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [filesPanelOpen, setFilesPanelOpen] = useState(true);
   const [status, setStatus] = useState("idle");
   const [error, setError] = useState<SafeError | undefined>();
   const attachClientRef = useRef<DirectClient | undefined>(undefined);
@@ -44,6 +61,8 @@ export default function App() {
   const receiveLoopActiveRef = useRef(false);
   const urlTouchedRef = useRef(false);
   const autoCheckedServerRef = useRef<UUID | undefined>(undefined);
+  const lastCursorReportRef = useRef("");
+  const cursorRefreshTimerRef = useRef<number | undefined>(undefined);
 
   useEffect(() => {
     void loadBrowserState().then((loaded) => {
@@ -61,10 +80,24 @@ export default function App() {
   const connectionReady =
     showConnectionStatus && status !== "idle" && status !== "connecting" && status !== "listing";
   const showPairingForm = !showConnectionStatus;
+  const sessionOperators = useMemo(() => {
+    if (!attachedSessionId) {
+      return [];
+    }
+    return daemonClients.filter(
+      (client) => client.online && client.attached_session_ids.includes(attachedSessionId),
+    );
+  }, [attachedSessionId, daemonClients]);
 
   const setSafeError = useCallback((caught: unknown) => {
     setError(toSafeError(caught));
     setStatus("error");
+  }, []);
+
+  const clearSessionFiles = useCallback(() => {
+    setSessionFiles(undefined);
+    setSessionFilesError(undefined);
+    setSessionFilesLoading(false);
   }, []);
 
   const disconnectAttach = useCallback(() => {
@@ -72,8 +105,14 @@ export default function App() {
     attachClientRef.current?.close();
     attachClientRef.current = undefined;
     attachedSessionRef.current = undefined;
-    setRole(undefined);
-  }, []);
+    setAttachedSessionId(undefined);
+    lastCursorReportRef.current = "";
+    if (cursorRefreshTimerRef.current !== undefined) {
+      window.clearTimeout(cursorRefreshTimerRef.current);
+      cursorRefreshTimerRef.current = undefined;
+    }
+    clearSessionFiles();
+  }, [clearSessionFiles]);
 
   const handlePair = useCallback(async () => {
     setError(undefined);
@@ -127,6 +166,27 @@ export default function App() {
     return client;
   }, [activeServer, state.device]);
 
+  const loadSessionFiles = useCallback(
+    async (sessionId: UUID, path?: string) => {
+      setSessionFilesLoading(true);
+      setSessionFilesError(undefined);
+      let client: DirectClient | undefined;
+      try {
+        client = await authenticatedClient();
+        const files = await client.listSessionFiles(sessionId, path);
+        setSessionFiles(files);
+      } catch (caught) {
+        // 文件列表是终端旁路信息；失败时只收敛到右侧 panel，不打断已 attach 的终端会话。
+        setSessionFiles(undefined);
+        setSessionFilesError(toSafeError(caught));
+      } finally {
+        client?.close();
+        setSessionFilesLoading(false);
+      }
+    },
+    [authenticatedClient],
+  );
+
   const handleRefresh = useCallback(async () => {
     setError(undefined);
     setStatus("listing");
@@ -141,11 +201,12 @@ export default function App() {
       setSelectedSessionId(firstSessionId);
       setRenamingSessionId(undefined);
       setRenameDraft("");
+      clearSessionFiles();
       setStatus("ready");
     } catch (caught) {
       setSafeError(caught);
     }
-  }, [authenticatedClient, setSafeError]);
+  }, [authenticatedClient, clearSessionFiles, setSafeError]);
 
   const refreshDaemonClients = useCallback(
     async () => {
@@ -183,14 +244,7 @@ export default function App() {
             const payload = inner.payload as { data_base64: string };
             setTerminalChunks((chunks) => [...chunks, decodeUtf8(sessionDataFromBase64(payload.data_base64))]);
           }
-          if (inner.type === "control_grant") {
-            setRole("controller");
-          }
         } catch (caught) {
-          if (caught instanceof ProtocolClientError && caught.code === "controller_required") {
-            setRole("viewer");
-            continue;
-          }
           if (receiveLoopActiveRef.current) {
             setSafeError(caught);
           }
@@ -201,59 +255,33 @@ export default function App() {
     void read();
   }, [setSafeError]);
 
-  const handleSelectSession = useCallback(
-    async (sessionId: UUID) => {
-      if (attachedSessionRef.current === sessionId && role === "viewer") {
-        setSelectedSessionId(sessionId);
-        return;
-      }
-      setError(undefined);
-      disconnectAttach();
-      setTerminalChunks([]);
-      setStatus("viewing");
-      try {
-        const client = await authenticatedClient();
-        const attached = await client.attachSession(sessionId, "viewer");
-        attachClientRef.current = client;
-        attachedSessionRef.current = sessionId;
-        setSelectedSessionId(sessionId);
-        setRole(attached.role);
-        setStatus("attached");
-        void refreshDaemonClients();
-        startReceiveLoop(client);
-      } catch (caught) {
-        setSafeError(caught);
-      }
-    },
-    [authenticatedClient, disconnectAttach, refreshDaemonClients, role, setSafeError, startReceiveLoop],
-  );
-
   const handleAttach = useCallback(
     async (sessionId: UUID) => {
       setError(undefined);
       setStatus("attaching");
       try {
-        if (attachedSessionRef.current === sessionId && attachClientRef.current && role === "viewer") {
-          await attachClientRef.current.sendControlRequest(sessionId);
+        if (attachedSessionRef.current === sessionId && attachClientRef.current) {
+          setSelectedSessionId(sessionId);
           setStatus("attached");
           return;
         }
         disconnectAttach();
         setTerminalChunks([]);
         const client = await authenticatedClient();
-        const attached = await client.attachSession(sessionId);
+        await client.attachSession(sessionId);
         attachClientRef.current = client;
         attachedSessionRef.current = sessionId;
         setSelectedSessionId(sessionId);
-        setRole(attached.role);
+        setAttachedSessionId(sessionId);
         setStatus("attached");
+        await loadSessionFiles(sessionId);
         void refreshDaemonClients();
         startReceiveLoop(client);
       } catch (caught) {
         setSafeError(caught);
       }
     },
-    [authenticatedClient, disconnectAttach, refreshDaemonClients, role, setSafeError, startReceiveLoop],
+    [authenticatedClient, disconnectAttach, loadSessionFiles, refreshDaemonClients, setSafeError, startReceiveLoop],
   );
 
   const handleCreateSession = useCallback(async () => {
@@ -268,15 +296,16 @@ export default function App() {
       attachClientRef.current = client;
       attachedSessionRef.current = created.session_id;
       setSelectedSessionId(created.session_id);
-      setRole(created.role);
+      setAttachedSessionId(created.session_id);
       setSessions((current) => upsertSession(current, created));
       setStatus("attached");
+      await loadSessionFiles(created.session_id);
       void refreshDaemonClients();
       startReceiveLoop(client);
     } catch (caught) {
       setSafeError(caught);
     }
-  }, [authenticatedClient, disconnectAttach, refreshDaemonClients, setSafeError, startReceiveLoop]);
+  }, [authenticatedClient, disconnectAttach, loadSessionFiles, refreshDaemonClients, setSafeError, startReceiveLoop]);
 
   const handleStartRename = useCallback((sessionId: UUID, currentName: string) => {
     setRenamingSessionId(sessionId);
@@ -322,6 +351,7 @@ export default function App() {
         setSessions((current) => current.filter((session) => session.session_id !== sessionId));
         if (selectedSessionId === sessionId) {
           setSelectedSessionId(undefined);
+          clearSessionFiles();
         }
         if (attachedSessionRef.current === sessionId) {
           disconnectAttach();
@@ -332,27 +362,23 @@ export default function App() {
         setSafeError(caught);
       }
     },
-    [authenticatedClient, disconnectAttach, refreshDaemonClients, selectedSessionId, setSafeError],
+    [authenticatedClient, clearSessionFiles, disconnectAttach, refreshDaemonClients, selectedSessionId, setSafeError],
   );
 
   const handleTerminalInput = useCallback(
     async (data: string) => {
       const client = attachClientRef.current;
       const sessionId = attachedSessionRef.current;
-      if (!client || !sessionId || role !== "controller") {
+      if (!client || !sessionId) {
         return;
       }
       try {
         await client.sendSessionData(sessionId, new TextEncoder().encode(data));
       } catch (caught) {
-        if (caught instanceof ProtocolClientError && caught.code === "controller_required") {
-          setRole("viewer");
-          return;
-        }
         setSafeError(caught);
       }
     },
-    [role, setSafeError],
+    [setSafeError],
   );
 
   const handleResize = useCallback(
@@ -367,93 +393,284 @@ export default function App() {
     [setSafeError],
   );
 
-  const handleControl = useCallback(async () => {
-    const client = attachClientRef.current;
-    const sessionId = attachedSessionRef.current;
-    if (!client || !sessionId) {
-      return;
+  const handleCursorChange = useCallback(
+    (position: { row: number; col: number }) => {
+      const client = attachClientRef.current;
+      const sessionId = attachedSessionRef.current;
+      if (!client || !sessionId) {
+        return;
+      }
+      const nextCursor = `${sessionId}:${position.row}:${position.col}`;
+      if (lastCursorReportRef.current === nextCursor) {
+        return;
+      }
+      lastCursorReportRef.current = nextCursor;
+      void client.sendSessionCursor(sessionId, position.row, position.col).catch(setSafeError);
+      if (cursorRefreshTimerRef.current === undefined) {
+        cursorRefreshTimerRef.current = window.setTimeout(() => {
+          cursorRefreshTimerRef.current = undefined;
+          void refreshDaemonClients();
+        }, 500);
+      }
+    },
+    [refreshDaemonClients, setSafeError],
+  );
+
+  useEffect(() => {
+    if (!attachedSessionId || !connectionReady) {
+      return undefined;
     }
-    try {
-      await client.sendControlRequest(sessionId);
-    } catch (caught) {
-      setSafeError(caught);
-    }
-  }, [setSafeError]);
+    const refreshTimer = window.setInterval(() => {
+      void refreshDaemonClients();
+    }, 2000);
+    return () => window.clearInterval(refreshTimer);
+  }, [attachedSessionId, connectionReady, refreshDaemonClients]);
+
+  const handleOpenDirectory = useCallback(
+    (path: string) => {
+      const sessionId = attachedSessionRef.current;
+      if (!sessionId) {
+        return;
+      }
+      void loadSessionFiles(sessionId, path);
+    },
+    [loadSessionFiles],
+  );
+
+  const handleGoToFilePath = useCallback(
+    (path: string) => {
+      const sessionId = attachedSessionRef.current;
+      if (!sessionId) {
+        return;
+      }
+      void loadSessionFiles(sessionId, resolveRemoteDirectoryPath(sessionFiles?.path ?? "", path));
+    },
+    [loadSessionFiles, sessionFiles?.path],
+  );
+
+  const handleUploadFile = useCallback(
+    async (file: File) => {
+      const sessionId = attachedSessionRef.current;
+      if (!sessionId) {
+        return;
+      }
+      setSessionFilesLoading(true);
+      setSessionFilesError(undefined);
+      let client: DirectClient | undefined;
+      try {
+        client = await authenticatedClient();
+        await client.writeSessionFile(sessionId, joinRemotePath(sessionFiles?.path ?? "", file.name), await fileToBytes(file));
+        client.close();
+        client = undefined;
+        await loadSessionFiles(sessionId, sessionFiles?.path);
+      } catch (caught) {
+        setSessionFilesError(toSafeError(caught));
+      } finally {
+        client?.close();
+        setSessionFilesLoading(false);
+      }
+    },
+    [authenticatedClient, loadSessionFiles, sessionFiles?.path],
+  );
+
+  const handleDownloadFile = useCallback(
+    async (entry: { name: string; path: string }) => {
+      const sessionId = attachedSessionRef.current;
+      if (!sessionId) {
+        return;
+      }
+      setSessionFilesError(undefined);
+      let client: DirectClient | undefined;
+      try {
+        client = await authenticatedClient();
+        const payload = await client.readSessionFile(sessionId, entry.path);
+        triggerBrowserDownload(entry.name, payload.data_base64);
+      } catch (caught) {
+        setSessionFilesError(toSafeError(caught));
+      } finally {
+        client?.close();
+      }
+    },
+    [authenticatedClient],
+  );
+
+  const handleDeleteFile = useCallback(
+    async (entry: { path: string }) => {
+      const sessionId = attachedSessionRef.current;
+      if (!sessionId) {
+        return;
+      }
+      setSessionFilesLoading(true);
+      setSessionFilesError(undefined);
+      let client: DirectClient | undefined;
+      try {
+        client = await authenticatedClient();
+        await client.deleteSessionFile(sessionId, entry.path);
+        client.close();
+        client = undefined;
+        await loadSessionFiles(sessionId, sessionFiles?.path);
+      } catch (caught) {
+        setSessionFilesError(toSafeError(caught));
+      } finally {
+        client?.close();
+        setSessionFilesLoading(false);
+      }
+    },
+    [authenticatedClient, loadSessionFiles, sessionFiles?.path],
+  );
 
   return (
-    <div className="app-shell">
-      <aside className="sidebar">
-        <div className="brand-row">
-          <div className="brand-title">
-            <Cable size={18} aria-hidden="true" />
-            <span>termd</span>
-          </div>
-          {connectionReady ? (
-            <button
-              type="button"
-              className="icon-button clients-toggle"
-              aria-label="Clients"
-              aria-controls="daemon-clients-popover"
-              aria-expanded={clientsOpen}
-              onClick={() => setClientsOpen((open) => !open)}
-            >
-              <UsersRound size={15} aria-hidden="true" />
-            </button>
-          ) : null}
-          {connectionReady && clientsOpen ? (
-            <div className="clients-popover" id="daemon-clients-popover">
-              <DaemonClientsPanel clients={daemonClients} />
-            </div>
-          ) : null}
-        </div>
-        {showPairingForm ? (
-          <ConnectionPanel
-            url={url}
-            token={pairingToken}
-            status={status}
-            onUrlChange={handleUrlChange}
-            onTokenChange={setPairingToken}
-            onPair={handlePair}
-          />
-        ) : null}
-        {showConnectionStatus && activeServer ? (
-          <ConnectionStatusPanel serverId={activeServer.server_id} url={connectionStatusUrl} status={status} />
-        ) : null}
-        {connectionReady ? (
+    <div className={`app-shell${sidebarCollapsed ? " sidebar-is-collapsed" : ""}`}>
+      <aside className={sidebarCollapsed ? "sidebar collapsed-sidebar" : "sidebar"}>
+        {sidebarCollapsed ? (
           <>
-            <div className="panel session-create" aria-label="new session">
-              <button type="button" onClick={handleCreateSession} disabled={status === "creating"}>
-                <Plus size={16} aria-hidden="true" />
-                New session
+            <div className="rail-brand">
+              <Cable size={18} aria-hidden="true" />
+              <button
+                type="button"
+                className="icon-button"
+                aria-label="Expand sidebar"
+                onClick={() => setSidebarCollapsed(false)}
+              >
+                <PanelLeftOpen size={16} aria-hidden="true" />
               </button>
             </div>
-            <div className="panel-actions">
-              <button type="button" onClick={handleRefresh} disabled={status === "listing"}>
-                <RefreshCcw size={16} aria-hidden="true" />
-                Refresh
-              </button>
-              <button type="button" onClick={disconnectAttach} disabled={!role}>
-                <Unplug size={16} aria-hidden="true" />
-                Disconnect
-              </button>
-            </div>
-            <SessionList
-              sessions={sessions}
-              selectedSessionId={selectedSessionId}
-              attachedSessionId={attachedSessionRef.current}
-              attachedRole={role}
-              renamingSessionId={renamingSessionId}
-              renameDraft={renameDraft}
-              onSelect={handleSelectSession}
-              onAttach={handleAttach}
-              onStartRename={handleStartRename}
-              onRenameDraftChange={setRenameDraft}
-              onSaveRename={handleSaveRename}
-              onCancelRename={handleCancelRename}
-              onClose={handleCloseSession}
-            />
+            {connectionReady ? (
+              <>
+                <div className="rail-actions">
+                  <button
+                    type="button"
+                    className="icon-button"
+                    aria-label="Clients"
+                    aria-controls="daemon-clients-popover"
+                    aria-expanded={clientsOpen}
+                    onClick={() => setClientsOpen((open) => !open)}
+                  >
+                    <UsersRound size={15} aria-hidden="true" />
+                  </button>
+                  <button
+                    type="button"
+                    className="icon-button"
+                    aria-label="New session"
+                    onClick={handleCreateSession}
+                    disabled={status === "creating"}
+                  >
+                    <Plus size={16} aria-hidden="true" />
+                  </button>
+                  <button
+                    type="button"
+                    className="icon-button"
+                    aria-label="Refresh"
+                    onClick={handleRefresh}
+                    disabled={status === "listing"}
+                  >
+                    <RefreshCcw size={16} aria-hidden="true" />
+                  </button>
+                  <button type="button" className="icon-button" aria-label="Disconnect" onClick={disconnectAttach} disabled={!attachedSessionId}>
+                    <Unplug size={16} aria-hidden="true" />
+                  </button>
+                </div>
+                {clientsOpen ? (
+                  <div className="clients-popover rail-popover" id="daemon-clients-popover">
+                    <DaemonClientsPanel clients={daemonClients} />
+                  </div>
+                ) : null}
+                <section className="collapsed-session-list" aria-label="collapsed sessions">
+                  {sessions.map((session) => (
+                    <button
+                      type="button"
+                      key={session.session_id}
+                      className={session.session_id === selectedSessionId ? "icon-button selected-session-dot" : "icon-button"}
+                      aria-label={`Select session ${session.name?.trim() || shortSessionId(session.session_id)}`}
+                      onClick={() => void handleAttach(session.session_id)}
+                    >
+                      <MonitorUp size={15} aria-hidden="true" />
+                    </button>
+                  ))}
+                </section>
+              </>
+            ) : null}
           </>
-        ) : null}
+        ) : (
+          <>
+            <div className="brand-row">
+              <div className="brand-title">
+                <Cable size={18} aria-hidden="true" />
+                <span>termd</span>
+              </div>
+              <button
+                type="button"
+                className="icon-button sidebar-collapse-toggle"
+                aria-label="Collapse sidebar"
+                onClick={() => setSidebarCollapsed(true)}
+              >
+                <PanelLeftClose size={16} aria-hidden="true" />
+              </button>
+              {connectionReady ? (
+                <button
+                  type="button"
+                  className="icon-button clients-toggle"
+                  aria-label="Clients"
+                  aria-controls="daemon-clients-popover"
+                  aria-expanded={clientsOpen}
+                  onClick={() => setClientsOpen((open) => !open)}
+                >
+                  <UsersRound size={15} aria-hidden="true" />
+                </button>
+              ) : null}
+              {connectionReady && clientsOpen ? (
+                <div className="clients-popover" id="daemon-clients-popover">
+                  <DaemonClientsPanel clients={daemonClients} />
+                </div>
+              ) : null}
+            </div>
+            {showPairingForm ? (
+              <ConnectionPanel
+                url={url}
+                token={pairingToken}
+                status={status}
+                onUrlChange={handleUrlChange}
+                onTokenChange={setPairingToken}
+                onPair={handlePair}
+              />
+            ) : null}
+            {showConnectionStatus && activeServer ? (
+              <ConnectionStatusPanel serverId={activeServer.server_id} url={connectionStatusUrl} status={status} />
+            ) : null}
+            {connectionReady ? (
+              <>
+                <div className="panel session-create" aria-label="new session">
+                  <button type="button" onClick={handleCreateSession} disabled={status === "creating"}>
+                    <Plus size={16} aria-hidden="true" />
+                    New session
+                  </button>
+                </div>
+                <div className="panel-actions">
+                  <button type="button" onClick={handleRefresh} disabled={status === "listing"}>
+                    <RefreshCcw size={16} aria-hidden="true" />
+                    Refresh
+                  </button>
+                  <button type="button" onClick={disconnectAttach} disabled={!attachedSessionId}>
+                    <Unplug size={16} aria-hidden="true" />
+                    Disconnect
+                  </button>
+                </div>
+                <SessionList
+                  sessions={sessions}
+                  selectedSessionId={selectedSessionId}
+                  renamingSessionId={renamingSessionId}
+                  renameDraft={renameDraft}
+                  onAttach={handleAttach}
+                  onStartRename={handleStartRename}
+                  onRenameDraftChange={setRenameDraft}
+                  onSaveRename={handleSaveRename}
+                  onCancelRename={handleCancelRename}
+                  onClose={handleCloseSession}
+                />
+              </>
+            ) : null}
+          </>
+        )}
       </aside>
       <main className="workspace">
         <div className="toolbar">
@@ -461,27 +678,87 @@ export default function App() {
             <Link size={16} aria-hidden="true" />
             <span>{activeServer?.server_id ?? "unpaired"}</span>
           </div>
-          {connectionReady && role === "viewer" ? (
-            <button type="button" onClick={handleControl}>
-              Take control
-            </button>
+          {connectionReady && attachedSessionId ? (
+            <SessionOperatorsBar
+              operators={sessionOperators}
+              currentDeviceId={state.device?.device_id}
+              sessionId={attachedSessionId}
+            />
           ) : null}
         </div>
-        {connectionReady ? (
-          <TerminalPane
-            chunks={terminalChunks}
-            role={role}
-            attached={Boolean(attachedSessionRef.current)}
-            onInput={handleTerminalInput}
-            onResize={handleResize}
-          />
-        ) : (
-          <div className="terminal-pane" aria-label="terminal unavailable">
-            <div className="terminal-placeholder">disconnected</div>
-          </div>
-        )}
-        <StatusBar status={status} error={error} sessionId={attachedSessionRef.current ?? selectedSessionId} />
+        <div className={filesPanelOpen ? "workspace-body" : "workspace-body files-panel-hidden"}>
+          {connectionReady ? (
+            <>
+              <TerminalPane
+                chunks={terminalChunks}
+                attached={Boolean(attachedSessionId)}
+                onInput={handleTerminalInput}
+                onResize={handleResize}
+                onCursorChange={handleCursorChange}
+              />
+              {filesPanelOpen ? (
+                <SessionFilesPanel
+                  attachedSessionId={attachedSessionId}
+                  files={sessionFiles}
+                  loading={sessionFilesLoading}
+                  error={sessionFilesError}
+                  onOpenDirectory={handleOpenDirectory}
+                  onGoToPath={handleGoToFilePath}
+                  onUpload={handleUploadFile}
+                  onDownload={handleDownloadFile}
+                  onDelete={handleDeleteFile}
+                  onHide={() => setFilesPanelOpen(false)}
+                />
+              ) : (
+                <aside className="files-rail" aria-label="files panel collapsed">
+                  <button type="button" className="icon-button" aria-label="Show files panel" onClick={() => setFilesPanelOpen(true)}>
+                    <PanelRightOpen size={16} aria-hidden="true" />
+                  </button>
+                </aside>
+              )}
+            </>
+          ) : (
+            <div className="terminal-pane" aria-label="terminal unavailable">
+              <div className="terminal-placeholder">disconnected</div>
+            </div>
+          )}
+        </div>
+        <StatusBar status={status} error={error} sessionId={attachedSessionId ?? selectedSessionId} />
       </main>
+    </div>
+  );
+}
+
+function SessionOperatorsBar(props: {
+  operators: DaemonClientSummaryPayload[];
+  currentDeviceId?: UUID;
+  sessionId: UUID;
+}) {
+  return (
+    <div className="session-operators" aria-label="session operators">
+      <div className="session-operators-title">
+        <UsersRound size={15} aria-hidden="true" />
+        <span>{props.operators.length}</span>
+      </div>
+      {props.operators.length === 0 ? (
+        <span className="session-operator muted">no operators</span>
+      ) : (
+        props.operators.map((client) => {
+          const isCurrentDevice = client.device_id === props.currentDeviceId;
+          const cursor =
+            client.cursor_session_id === props.sessionId && client.cursor_row && client.cursor_col
+              ? `${client.cursor_row}:${client.cursor_col}`
+              : "cursor ?";
+          return (
+            <span className="session-operator" key={client.client_id} title={client.device_id}>
+              <span className="status-dot online" aria-hidden="true" />
+              <span>{client.peer_ip ?? shortSessionId(client.client_id)}</span>
+              {isCurrentDevice ? <span>you</span> : null}
+              <span>{cursor}</span>
+            </span>
+          );
+        })
+      )}
     </div>
   );
 }
@@ -512,6 +789,91 @@ export function browserReachableWsUrl(
 
 function isLoopbackHost(hostname: string): boolean {
   return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1" || hostname === "[::1]";
+}
+
+function shortSessionId(sessionId: UUID): string {
+  return sessionId.slice(0, 8);
+}
+
+function joinRemotePath(directory: string, name: string): string {
+  const cleanName = name.replace(/^\/+/, "");
+  if (!directory || directory === "/") {
+    return `/${cleanName}`;
+  }
+  return `${directory.replace(/\/+$/, "")}/${cleanName}`;
+}
+
+function resolveRemoteDirectoryPath(currentDirectory: string, input: string): string {
+  const requested = input.trim();
+  if (!requested) {
+    return normalizeRemotePath(currentDirectory || "/");
+  }
+
+  // Web 文件面板里的相对路径按当前浏览目录解析，避免用户在 /tmp 输入 work 时回到 session 启动目录。
+  if (requested.startsWith("/")) {
+    return normalizeRemotePath(requested);
+  }
+  return normalizeRemotePath(joinRemotePath(currentDirectory || "/", requested));
+}
+
+function normalizeRemotePath(path: string): string {
+  const absolute = path.startsWith("/");
+  const parts: string[] = [];
+
+  for (const part of path.split("/")) {
+    if (!part || part === ".") {
+      continue;
+    }
+    if (part === "..") {
+      parts.pop();
+      continue;
+    }
+    parts.push(part);
+  }
+
+  if (absolute) {
+    return `/${parts.join("/")}`.replace(/\/+$/, "") || "/";
+  }
+  return parts.join("/") || ".";
+}
+
+function fileToBytes(file: File): Promise<Uint8Array> {
+  if (typeof file.arrayBuffer === "function") {
+    return file.arrayBuffer().then((buffer) => new Uint8Array(buffer));
+  }
+
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.addEventListener("load", () => {
+      if (reader.result instanceof ArrayBuffer) {
+        resolve(new Uint8Array(reader.result));
+        return;
+      }
+      reject(new Error("invalid_file_data"));
+    });
+    reader.addEventListener("error", () => reject(reader.error ?? new Error("file_read_failed")));
+    reader.readAsArrayBuffer(file);
+  });
+}
+
+function triggerBrowserDownload(name: string, dataBase64: string): void {
+  if (typeof navigator !== "undefined" && navigator.userAgent.toLowerCase().includes("jsdom")) {
+    return;
+  }
+  if (typeof URL.createObjectURL !== "function") {
+    return;
+  }
+  const bytes = Uint8Array.from(sessionDataFromBase64(dataBase64));
+  const blob = new Blob([bytes.buffer], { type: "application/octet-stream" });
+  const href = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = href;
+  link.download = name || "download";
+  link.style.display = "none";
+  document.body.append(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(href);
 }
 
 function upsertSession(current: SessionSummaryPayload[], session: SessionCreatedPayload): SessionSummaryPayload[] {

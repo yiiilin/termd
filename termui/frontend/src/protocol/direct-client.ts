@@ -15,12 +15,20 @@ import type {
   PublicKeyWire,
   SessionClosePayload,
   SessionClosedPayload,
-  SessionAttachIntent,
   SessionAttachedPayload,
   DaemonClientsResultPayload,
   SessionCreatePayload,
   SessionCreatedPayload,
+  SessionCursorPayload,
   SessionDataPayload,
+  SessionFileDeletePayload,
+  SessionFileDeletedPayload,
+  SessionFileReadPayload,
+  SessionFileReadResultPayload,
+  SessionFileWritePayload,
+  SessionFileWrittenPayload,
+  SessionFilesPayload,
+  SessionFilesResultPayload,
   SessionListResultPayload,
   SessionRenamedPayload,
   SessionRenamePayload,
@@ -53,6 +61,7 @@ export class DirectClient {
   private readonly timeoutMs: number;
   private e2ee: E2eeSession;
   private closed = false;
+  private readonly pendingInner: Envelope[] = [];
 
   private constructor(
     private readonly socket: WebSocket,
@@ -154,6 +163,37 @@ export class DirectClient {
     return this.expectPayload<DaemonClientsResultPayload>("daemon_clients_result");
   }
 
+  async listSessionFiles(sessionId: UUID, path?: string): Promise<SessionFilesResultPayload> {
+    await this.sendInner(
+      envelope("session_files", {
+        session_id: sessionId,
+        ...(path ? { path } : {}),
+      } satisfies SessionFilesPayload),
+    );
+    return this.expectPayload<SessionFilesResultPayload>("session_files_result", { bufferTerminalEvents: true });
+  }
+
+  async readSessionFile(sessionId: UUID, path: string): Promise<SessionFileReadResultPayload> {
+    await this.sendInner(envelope("session_file_read", { session_id: sessionId, path } satisfies SessionFileReadPayload));
+    return this.expectPayload<SessionFileReadResultPayload>("session_file_read_result", { bufferTerminalEvents: true });
+  }
+
+  async writeSessionFile(sessionId: UUID, path: string, bytes: Uint8Array): Promise<SessionFileWrittenPayload> {
+    await this.sendInner(
+      envelope("session_file_write", {
+        session_id: sessionId,
+        path,
+        data_base64: sessionDataToBase64(bytes),
+      } satisfies SessionFileWritePayload),
+    );
+    return this.expectPayload<SessionFileWrittenPayload>("session_file_written", { bufferTerminalEvents: true });
+  }
+
+  async deleteSessionFile(sessionId: UUID, path: string): Promise<SessionFileDeletedPayload> {
+    await this.sendInner(envelope("session_file_delete", { session_id: sessionId, path } satisfies SessionFileDeletePayload));
+    return this.expectPayload<SessionFileDeletedPayload>("session_file_deleted", { bufferTerminalEvents: true });
+  }
+
   async createSession(command: string[], size: TerminalSize): Promise<SessionCreatedPayload> {
     await this.sendInner(
       envelope("session_create", {
@@ -164,11 +204,10 @@ export class DirectClient {
     return this.expectPayload<SessionCreatedPayload>("session_created");
   }
 
-  async attachSession(sessionId: UUID, intent?: SessionAttachIntent): Promise<SessionAttachedPayload> {
+  async attachSession(sessionId: UUID): Promise<SessionAttachedPayload> {
     await this.sendInner(
       envelope("session_attach", {
         session_id: sessionId,
-        ...(intent ? { intent } : {}),
       }),
     );
     return this.expectPayload<SessionAttachedPayload>("session_attached");
@@ -180,6 +219,16 @@ export class DirectClient {
         session_id: sessionId,
         data_base64: sessionDataToBase64(bytes),
       } satisfies SessionDataPayload),
+    );
+  }
+
+  async sendSessionCursor(sessionId: UUID, row: number, col: number): Promise<void> {
+    await this.sendInner(
+      envelope("session_cursor", {
+        session_id: sessionId,
+        row,
+        col,
+      } satisfies SessionCursorPayload),
     );
   }
 
@@ -216,6 +265,15 @@ export class DirectClient {
   }
 
   async receiveInner(): Promise<Envelope> {
+    const pending = this.pendingInner.shift();
+    if (pending) {
+      return pending;
+    }
+
+    return this.receiveInnerFromSocket();
+  }
+
+  private async receiveInnerFromSocket(): Promise<Envelope> {
     while (true) {
       const outer = await this.readOuter();
       if (outer.type === "encrypted_frame") {
@@ -238,10 +296,19 @@ export class DirectClient {
     this.inbox.rejectPending(new ProtocolClientError("connection_closed", "connection closed"));
   }
 
-  private async expectPayload<T>(expectedType: Envelope["type"]): Promise<T> {
+  private async expectPayload<T>(
+    expectedType: Envelope["type"],
+    options: { bufferTerminalEvents?: boolean } = {},
+  ): Promise<T> {
     while (true) {
-      const inner = await withTimeout(this.receiveInner(), this.timeoutMs, "response_timeout");
+      const inner = await withTimeout(this.receiveInnerFromSocket(), this.timeoutMs, "response_timeout");
       if (inner.type === "pong") {
+        continue;
+      }
+      if (options.bufferTerminalEvents && (inner.type === "session_data" || inner.type === "control_grant")) {
+        // 文件列表请求复用已 attach 的终端连接；daemon 可能先推送 PTY 输出。
+        // 这里把终端事件放回队列，交给后续 receive loop 处理，避免文件 panel 吃掉回显。
+        this.pendingInner.push(inner);
         continue;
       }
       if (inner.type !== expectedType) {

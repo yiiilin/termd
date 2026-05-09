@@ -37,7 +37,7 @@ describe("DirectClient", () => {
     expect(daemon.outerWireText()).not.toContain("pair_request");
   });
 
-  it("已配对设备可 auth、list、attach、control，并隐藏终端输入明文", async () => {
+  it("已配对设备可 auth、list、attach、shared-control noop，并隐藏终端输入明文", async () => {
     const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000303");
     const pairClient = await DirectClient.connect(daemon.url, device.device_id, { timeoutMs: 3000 });
     const accepted = await pairClient.pair("secret-token", device.device_public_key);
@@ -59,7 +59,7 @@ describe("DirectClient", () => {
     client.close();
 
     expect(list.sessions).toHaveLength(1);
-    expect(attached.role).toBe("controller");
+    expect(attached.role).toBe("operator");
     expect(output.type).toBe("session_data");
     expect(grant.device_id).toBe(device.device_id);
     expect(daemon.decryptedInputs).toContain("terminal-secret");

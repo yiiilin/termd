@@ -9,11 +9,20 @@ export const ALL_MESSAGE_TYPES = [
   "session_attach",
   "session_attached",
   "session_data",
+  "session_cursor",
   "session_resize",
   "session_rename",
   "session_renamed",
   "session_close",
   "session_closed",
+  "session_files",
+  "session_files_result",
+  "session_file_read",
+  "session_file_read_result",
+  "session_file_write",
+  "session_file_written",
+  "session_file_delete",
+  "session_file_deleted",
   "session_list",
   "session_list_result",
   "daemon_clients",
@@ -109,8 +118,7 @@ export interface TerminalSize {
 }
 
 export type SessionState = "created" | "running" | "closed";
-export type AttachRole = "controller" | "viewer";
-export type SessionAttachIntent = "auto" | "viewer";
+export type AttachRole = "operator";
 
 export interface SessionSummaryPayload {
   session_id: UUID;
@@ -133,6 +141,9 @@ export interface DaemonClientSummaryPayload {
   connected_at_ms: UnixTimestampMillis;
   last_seen_at_ms: UnixTimestampMillis;
   attached_session_ids: UUID[];
+  cursor_session_id?: UUID | null;
+  cursor_row?: number | null;
+  cursor_col?: number | null;
 }
 
 export interface DaemonClientsResultPayload {
@@ -153,7 +164,6 @@ export interface SessionCreatedPayload {
 
 export interface SessionAttachPayload {
   session_id: UUID;
-  intent?: SessionAttachIntent;
 }
 
 export interface SessionAttachedPayload {
@@ -181,9 +191,72 @@ export interface SessionClosedPayload {
   session_id: UUID;
 }
 
+export type SessionFileKind = "file" | "directory" | "symlink" | "other";
+
+export interface SessionFilesPayload {
+  session_id: UUID;
+  path?: string | null;
+}
+
+export interface SessionFileEntryPayload {
+  name: string;
+  path: string;
+  kind: SessionFileKind;
+  size_bytes: number;
+  modified_at_ms?: UnixTimestampMillis | null;
+}
+
+export interface SessionFilesResultPayload {
+  session_id: UUID;
+  path: string;
+  entries: SessionFileEntryPayload[];
+}
+
+export interface SessionFileReadPayload {
+  session_id: UUID;
+  path: string;
+}
+
+export interface SessionFileReadResultPayload {
+  session_id: UUID;
+  path: string;
+  data_base64: string;
+  size_bytes: number;
+  modified_at_ms?: UnixTimestampMillis | null;
+}
+
+export interface SessionFileWritePayload {
+  session_id: UUID;
+  path: string;
+  data_base64: string;
+}
+
+export interface SessionFileWrittenPayload {
+  session_id: UUID;
+  path: string;
+  size_bytes: number;
+  modified_at_ms?: UnixTimestampMillis | null;
+}
+
+export interface SessionFileDeletePayload {
+  session_id: UUID;
+  path: string;
+}
+
+export interface SessionFileDeletedPayload {
+  session_id: UUID;
+  path: string;
+}
+
 export interface SessionDataPayload {
   session_id: UUID;
   data_base64: string;
+}
+
+export interface SessionCursorPayload {
+  session_id: UUID;
+  row: number;
+  col: number;
 }
 
 export interface ControlGrantPayload {

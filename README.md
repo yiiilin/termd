@@ -2,7 +2,7 @@
 
 **termd** 是一个面向个人开发者的端到端加密持久终端系统。当前 MVP 重点是：daemon 持有 PTY session，受信任设备可以重新 attach，同一个 session 不会因为某个 client 断开而终止。
 
-项目定位是个人使用：单个 daemon、设备级信任、一个当前 controller，加上其他 viewer 设备。当前仓库仍处于 MVP 阶段，下面的“已验证”只表示当前代码和本地 QA 覆盖的能力；完整 Native client 还没有交付。
+项目定位是个人使用：单个 daemon、设备级信任、默认 shared-control。多个已配对设备 attach 到同一个 session 后都是 operator，可以同时操作同一个终端。当前仓库仍处于 MVP 阶段，下面的“已验证”只表示当前代码和本地 QA 覆盖的能力；完整 Native client 还没有交付。
 
 ## 安装方式
 
@@ -87,14 +87,14 @@ curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-ter
 | 能力 | 当前状态 | 说明 |
 | --- | --- | --- |
 | PTY/session runtime | 已验证 | `termd` 可以创建 PTY session，session 生命周期独立于单个 client 连接。 |
-| 多客户端 attach | 已验证 | 第一个 attach 获得 controller，其他设备是 viewer。 |
-| 控制权抢占 | 已验证 | 已配对设备可以发送 `control_request` 抢占唯一 controller。 |
+| 多客户端 shared-control attach | 已验证 | 所有已配对设备 attach 后都是 operator，可同时向同一个 PTY 输入。 |
+| 旧 control 命令 | 已验证 | `control_request` 仅保留为 noop 确认路径，不再表达旧夺权语义。 |
 | direct WebSocket daemon | 已验证 | `termd` 默认监听 `127.0.0.1:8765`，WebSocket 路径是 `/ws`，健康检查是 `/healthz`。 |
 | 设备级 pairing/auth | 已验证 | `termd pair` 可向运行中的本机 daemon 签发短期 pairing token；pairing token 过期、device key 验证、challenge-response 和 timestamp/nonce replay protection 已实现。 |
 | E2EE frame 边界 | 已验证 | 当前实现是 X25519 + HKDF + ChaCha20Poly1305 `encrypted_frame`，不是 Noise protocol。 |
 | `termctl` CLI | 已验证 | 当前子命令是 `pair/new/attach/control/resize/list`；QA 覆盖真实 `termd pair` 到 `termctl pair --token` 闭环、direct daemon E2E 和 relay runtime E2E。 |
-| `termrelay` dumb pipe | 已验证 | relay 按公开 `server_id` 路由 WebSocket frame；mux 路径只包装 `client_id` 和不透明 frame，不解密、不解析业务 envelope、不判断 controller/viewer 控制权。 |
-| `termui/frontend` Web MVP | 已验证 | 支持 pairing token consumer、session list、terminal attach、controller/viewer 状态、control request 和 IndexedDB 状态边界；QA 覆盖浏览器通过真实 relay client URL 完成 pairing/list。 |
+| `termrelay` dumb pipe | 已验证 | relay 按公开 `server_id` 路由 WebSocket frame；mux 路径只包装 `client_id` 和不透明 frame，不解密、不解析业务 envelope、不判断 operator 业务状态。 |
+| `termui/frontend` Web MVP | 已验证 | 支持 pairing token consumer、session list、shared-control terminal attach、session operator/光标状态、文件面板和 IndexedDB 状态边界；QA 覆盖浏览器通过真实 relay client URL 完成 pairing/list。 |
 | `termui/native` Flutter 骨架 | 架构骨架 | 只有 Native app/service/storage/protocol 分层和安全边界测试；还不是完整 Native client。 |
 | SSH 会话复用 | 目标场景 | 当前没有专门 SSH 管理层；可以把 `ssh` 当作普通 PTY 命令运行。 |
 | daemon 主动连接 relay | 已验证 | `termd --relay ws://host:port` 会连接 relay 的 daemon mux 路径；可重复传入多个 `--relay` / `--relay-url` 端点。Web/termctl 可使用 `ws://relay/ws/{server_id}/client`；公网部署方案见 [docs/deployment.md](docs/deployment.md)。 |
