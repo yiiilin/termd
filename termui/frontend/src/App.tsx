@@ -89,6 +89,10 @@ export default function App() {
       (client) => client.online && client.attached_session_ids.includes(attachedSessionId),
     );
   }, [attachedSessionId, daemonClients]);
+  const attachedSession = useMemo(
+    () => sessions.find((session) => session.session_id === attachedSessionId),
+    [attachedSessionId, sessions],
+  );
 
   const setSafeError = useCallback((caught: unknown) => {
     setError(toSafeError(caught));
@@ -214,7 +218,9 @@ export default function App() {
       try {
         const client = await authenticatedClient();
         try {
+          const sessionList = await client.listSessions();
           const clientList = await client.listDaemonClients();
+          setSessions(sessionList.sessions);
           setDaemonClients(clientList.clients);
         } finally {
           client.close();
@@ -389,6 +395,9 @@ export default function App() {
       if (!client || !sessionId) {
         return;
       }
+      setSessions((current) =>
+        current.map((session) => (session.session_id === sessionId ? { ...session, size } : session)),
+      );
       void client.resizeSession(sessionId, size).catch(setSafeError);
     },
     [setSafeError],
@@ -693,6 +702,7 @@ export default function App() {
               <TerminalPane
                 chunks={terminalChunks}
                 attached={Boolean(attachedSessionId)}
+                sessionSize={attachedSession?.size}
                 onInput={handleTerminalInput}
                 onResize={handleResize}
                 onCursorChange={handleCursorChange}

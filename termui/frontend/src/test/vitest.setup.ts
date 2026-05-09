@@ -17,8 +17,27 @@ vi.mock("@xterm/xterm", () => {
     private dataListeners: Array<(data: string) => void> = [];
     private cursorMoveListeners: Array<() => void> = [];
     private writeParsedListeners: Array<() => void> = [];
+    private terminalOptions: Record<string, unknown>;
     public buffer = { active: { cursorY: 0, cursorX: 0 } };
+    public cols = 80;
+    public rows = 24;
     public element: HTMLDivElement | undefined;
+
+    constructor(options: Record<string, unknown> = {}) {
+      this.terminalOptions = options;
+    }
+
+    get options() {
+      return { ...this.terminalOptions, cols: this.cols, rows: this.rows };
+    }
+
+    set options(nextOptions: Record<string, unknown>) {
+      // 真实 xterm 不允许在运行期重新设置 cols/rows；测试里保留这个约束，避免缩放时误写只读配置。
+      if ("cols" in nextOptions || "rows" in nextOptions) {
+        throw new Error('Option "cols" can only be set in the constructor');
+      }
+      this.terminalOptions = { ...this.terminalOptions, ...nextOptions };
+    }
 
     open(element: HTMLElement) {
       this.element = document.createElement("div");
@@ -69,6 +88,11 @@ vi.mock("@xterm/xterm", () => {
     onWriteParsed(listener: () => void) {
       this.writeParsedListeners.push(listener);
       return { dispose: () => undefined };
+    }
+
+    resize(cols: number, rows: number) {
+      this.cols = cols;
+      this.rows = rows;
     }
 
     focus() {

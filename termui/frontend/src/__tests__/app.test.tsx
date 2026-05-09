@@ -509,6 +509,12 @@ describe("termui web 工作台", () => {
       terminalInput = document.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
       expect(terminalInput).not.toBeNull();
     });
+    expect(screen.getByTestId("terminal-pane")).toHaveAttribute("data-viewer-mode", "true");
+    await within(screen.getByLabelText("viewer controls")).findByText("100x30");
+    const viewerFrame = document.querySelector<HTMLElement>(".terminal-pane-viewer .terminal-viewer-frame");
+    expect(viewerFrame).not.toBeNull();
+    expect(viewerFrame?.style.width).toBe("calc(100ch + 26px)");
+    expect(viewerFrame?.style.height).toBe("592px");
     await waitFor(() =>
       expect(daemon.sessionCursorUpdates).toContainEqual({
         session_id: "00000000-0000-0000-0000-000000000402",
@@ -517,14 +523,22 @@ describe("termui web 工作台", () => {
         focused: false,
       }),
     );
+    expect(daemon.sessionResizes).toEqual([]);
 
     terminalInput!.focus();
+    await waitFor(() => expect(screen.getByTestId("terminal-pane")).toHaveAttribute("data-viewer-mode", "false"));
     await waitFor(() =>
       expect(daemon.sessionCursorUpdates).toContainEqual({
         session_id: "00000000-0000-0000-0000-000000000402",
         row: expect.any(Number),
         col: expect.any(Number),
         focused: true,
+      }),
+    );
+    await waitFor(() =>
+      expect(daemon.sessionResizes).toContainEqual({
+        session_id: "00000000-0000-0000-0000-000000000402",
+        size: { rows: 24, cols: 80, pixel_width: expect.any(Number), pixel_height: expect.any(Number) },
       }),
     );
     terminalInput!.value = "first-terminal-secret";
@@ -537,6 +551,30 @@ describe("termui web 工作台", () => {
 
     await waitFor(() => expect(daemon.sessionDataMessages).toEqual(["first-terminal-secret", "second-terminal-secret"]));
     expect(daemon.sessionCursorUpdates.length).toBeGreaterThan(0);
+    terminalInput!.blur();
+    await waitFor(() =>
+      expect(daemon.sessionCursorUpdates).toContainEqual({
+        session_id: "00000000-0000-0000-0000-000000000402",
+        row: expect.any(Number),
+        col: expect.any(Number),
+        focused: false,
+      }),
+    );
+    const resizeCountAfterBlur = daemon.sessionResizes.length;
+    const viewerCanvas = document.querySelector<HTMLElement>(".terminal-viewer-canvas");
+    expect(viewerCanvas).not.toBeNull();
+    await user.click(viewerCanvas!);
+    expect(screen.getByTestId("terminal-pane")).toHaveAttribute("data-viewer-mode", "true");
+    expect(daemon.sessionResizes).toHaveLength(resizeCountAfterBlur);
+    await screen.findByRole("button", { name: "Zoom out" });
+    await user.click(screen.getByRole("button", { name: "Zoom out" }));
+    await screen.findByText("90%");
+    expect(screen.getByTestId("terminal-pane")).toHaveAttribute("data-viewer-mode", "true");
+    await user.click(screen.getByRole("button", { name: "Fit" }));
+    await screen.findByText("100%");
+    expect(screen.getByTestId("terminal-pane")).toHaveAttribute("data-viewer-mode", "true");
+    fireEvent(window, new Event("resize"));
+    expect(daemon.sessionResizes).toHaveLength(resizeCountAfterBlur);
     expect(daemon.outerWireText()).not.toContain("first-terminal-secret");
     expect(daemon.outerWireText()).not.toContain("second-terminal-secret");
   });

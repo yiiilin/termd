@@ -21,6 +21,7 @@ import type {
   SessionFileWrittenPayload,
   SessionFilesResultPayload,
   SessionSummaryPayload,
+  TerminalSize,
   UUID,
 } from "../protocol/types";
 import {
@@ -64,6 +65,7 @@ export class MockDaemon {
   public readonly sessionDataMessages: string[] = [];
   public readonly attachedSessions: UUID[] = [];
   public readonly sessionCursorUpdates: SessionCursorPayload[] = [];
+  public readonly sessionResizes: Array<{ session_id: UUID; size: TerminalSize }> = [];
   public readonly sessionRenames: Array<{ session_id: UUID; name: string }> = [];
   public readonly closedSessions: UUID[] = [];
   public readonly sessionFileRequests: Array<{ session_id: UUID; path?: string | null }> = [];
@@ -237,8 +239,10 @@ export class MockDaemon {
         this.sessionCursorUpdates.push(inner.payload as SessionCursorPayload);
         return;
       }
-      case "session_resize":
+      case "session_resize": {
+        this.sessionResizes.push(inner.payload as { session_id: UUID; size: TerminalSize });
         return;
+      }
       case "session_rename": {
         const payload = inner.payload as { session_id: UUID; name: string };
         this.sessionRenames.push(payload);
