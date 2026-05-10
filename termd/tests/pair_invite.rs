@@ -41,8 +41,6 @@ fn pair_qr_prints_single_line_invite_code() {
             "--qr",
             "--url",
             &format!("http://127.0.0.1:{}", addr.port()),
-            "--ws-url",
-            "wss://relay.example/ws/{server_id}/client",
         ])
         .output()
         .unwrap();
@@ -70,7 +68,7 @@ fn pair_qr_prints_single_line_invite_code() {
 
 #[test]
 fn invite_code_roundtrips_with_url_safe_base64() {
-    let json = r#"{"type":"termd_pairing_qr","version":1,"ws_url":"wss://relay.example/ws/00000000-0000-0000-0000-000000000001/client","token":"pair-token","server_id":"00000000-0000-0000-0000-000000000001","expires_at_ms":1710000060000}"#;
+    let json = r#"{"type":"termd_pairing_qr","version":1,"token":"pair-token","server_id":"00000000-0000-0000-0000-000000000001","expires_at_ms":1710000060000}"#;
     let invite = format!("termd-pair:v1:{}", URL_SAFE_NO_PAD.encode(json));
 
     let decoded = URL_SAFE_NO_PAD

@@ -109,10 +109,10 @@ cargo run -p termrelay -- --listen 127.0.0.1:8080 --auth-token "$RELAY_TOKEN"
 cargo run -p termd -- --relay wss://relay.example:443 --relay-auth-token "$RELAY_TOKEN"
 ```
 
-生成一个指向 relay 的单行邀请码：
+生成一份可在 daemon Web 和 relay Web 里直接使用的单行邀请码。邀请码只包含 daemon 标识和短期 token；Web 默认使用当前页面的连接地址，普通使用者不需要查看或拼接 `server_id`：
 
 ```bash
-PAIR_INVITE="$(cargo run -q -p termd -- pair --qr --ws-url "wss://relay.example:443/ws/{server_id}/client?relay_token=${RELAY_TOKEN}" | tail -n1)"
+PAIR_INVITE="$(cargo run -q -p termd -- pair --qr | tail -n1)"
 ```
 
 客户端通过同一个 relay 入口访问：
@@ -121,7 +121,7 @@ PAIR_INVITE="$(cargo run -q -p termd -- pair --qr --ws-url "wss://relay.example:
 cargo run -p termctl -- pair --payload "$PAIR_INVITE"
 ```
 
-Web MVP 打开 relay 页面后也粘贴同一段 `termd-pair:v1:...` 邀请码。
+Web MVP 打开 daemon 页面或 relay 页面后都粘贴同一段 `termd-pair:v1:...` 邀请码。页面默认使用当前地址；需要其他地址时，使用 Web 的高级地址设置手动覆盖。relay 只按 daemon 路由标识转发密文，不读取 pairing token；token 仍由 daemon 验证。
 
 ## 运维检查
 

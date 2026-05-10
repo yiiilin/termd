@@ -71,6 +71,22 @@ export async function recordServerUrl(serverId: string, url: string): Promise<Br
   return next;
 }
 
+export async function selectDefaultServer(serverId: string): Promise<BrowserState> {
+  const state = await loadBrowserState();
+  const server = state.pairedServers.find((candidate) => candidate.server_id === serverId);
+  if (!server) {
+    return state;
+  }
+
+  const next = normalizeState({
+    ...state,
+    defaultServerId: server.server_id,
+    defaultUrl: server.url,
+  });
+  await saveBrowserState(next);
+  return next;
+}
+
 export async function clearBrowserState(): Promise<void> {
   const db = await openStateDb();
   await requestToPromise(db.transaction(STORE_NAME, "readwrite").objectStore(STORE_NAME).clear());

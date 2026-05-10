@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use qrcode::{QrCode, render::unicode};
 use serde::Deserialize;
-use termd::config::{DaemonConfig, normalize_relay_endpoints};
+use termd::config::{DaemonConfig, SecretString, normalize_relay_endpoints};
 use termd::net::relay::{RelayBaseUrl, RelayReconnectPolicy, run_relay_mux_with_reconnect};
 use termd::net::server::{TlsPaths, serve, serve_tls, try_default_protocol};
 use termd_proto::{PairingQrPayload, PairingToken, ServerId, UnixTimestampMillis};
@@ -26,7 +26,7 @@ const HELP_TEXT: &str = concat!(
     "  termd pair [OPTIONS]\n\n",
     "OPTIONS:\n",
     "  --listen <HOST:PORT>           Listen address, default 127.0.0.1:8765\n",
-    "  --relay <WS_URL>               Connect to a relay; repeatable\n",
+    "  --relay <WS_URL>               Connect to one relay\n",
     "  --relay-url <WS_URL>           Alias for --relay\n",
     "  --relay-auth-token <TOKEN>     Transport auth token for relay connections\n",
     "  --tls-cert <CERT_PEM>          TLS certificate path\n",
@@ -36,13 +36,12 @@ const HELP_TEXT: &str = concat!(
     "  -V, --version                  Print version\n\n",
     "PAIR OPTIONS:\n",
     "  --url <HTTP_URL>               Local daemon URL, default http://127.0.0.1:8765\n",
-    "  --qr                           Print a QR invite code for Web/mobile pairing\n",
-    "  --ws-url <WS_URL>              WebSocket URL embedded in invite code; requires --qr\n\n",
+    "  --qr                           Print a QR invite code for Web/mobile pairing\n\n",
     "EXAMPLES:\n",
     "  termd --listen 0.0.0.0:8765 --web\n",
     "  termd --relay wss://relay.example:443 --relay-auth-token env-token\n",
     "  termd pair --url http://127.0.0.1:8765\n",
-    "  termd pair --qr --ws-url ws://192.168.1.20:8765/ws\n",
+    "  termd pair --qr\n",
 );
 
 #[tokio::main]
@@ -68,10 +67,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
             tls,
             web,
         } => serve_daemon(listen, relay_urls, relay_auth_token, tls, web).await?,
-        CliCommand::Pair { url, qr, ws_url } => {
+        CliCommand::Pair { url, qr } => {
             let token = request_pairing_token_response(&url)?;
             if qr {
-                let payload = build_pairing_qr_payload(&token, ws_url.as_deref())?;
+                let payload = build_pairing_qr_payload(&token)?;
                 let invite_code = payload.to_invite_code();
                 println!("{}", render_pairing_qr(&invite_code)?);
                 println!("{invite_code}");
@@ -97,7 +96,6 @@ async fn serve_daemon(
         config.listen_host = listen.host;
         config.listen_port = listen.port;
     }
-    let protocol = try_default_protocol(config.clone())?;
     let relay_endpoints = normalize_relay_endpoints(
         config
             .relay_endpoints
@@ -105,6 +103,13 @@ async fn serve_daemon(
             .into_iter()
             .chain(relay_urls.into_iter()),
     )?;
+    if let Some(first_relay_endpoint) = relay_endpoints.first() {
+        config.default_pairing_ws_url = RelayBaseUrl::parse(first_relay_endpoint)?
+            .client_url_template_with_auth(relay_auth_token.as_deref());
+    }
+    config.relay_auth_token = relay_auth_token.clone().map(SecretString::new);
+    config.relay_endpoints = relay_endpoints.clone();
+    let protocol = try_default_protocol(config.clone())?;
 
     tracing::info!(
         host = %config.listen_host,
@@ -138,7 +143,7 @@ fn spawn_relay_reconnect_supervisors(
             let relay_protocol = protocol.clone();
             let relay_auth_token = relay_auth_token.clone();
             tokio::spawn(async move {
-                // 每个 relay endpoint 都有自己独立的 supervisor，避免一个端点的失败拖住其他端点。
+                // 目前 daemon 只允许配置一个 relay；保留 supervisor 边界，便于独立处理重连和心跳。
                 if let Err(error) = run_relay_mux_with_reconnect(
                     &relay_url,
                     relay_auth_token.as_deref(),
@@ -180,7 +185,6 @@ enum CliCommand {
     Pair {
         url: String,
         qr: bool,
-        ws_url: Option<String>,
     },
 }
 
@@ -207,11 +211,10 @@ impl fmt::Debug for CliCommand {
                     .field("web", web)
                     .finish()
             }
-            Self::Pair { url, qr, ws_url } => formatter
+            Self::Pair { url, qr } => formatter
                 .debug_struct("Pair")
                 .field("url", url)
                 .field("qr", qr)
-                .field("ws_url", ws_url)
                 .finish(),
         }
     }
@@ -262,6 +265,9 @@ fn parse_serve_args(args: impl IntoIterator<Item = String>) -> Result<CliCommand
                 let value = args.next().ok_or(CliError::MissingRelayUrlValue)?;
                 let _ = RelayBaseUrl::parse(&value)
                     .map_err(|_| CliError::UnsupportedRelayUrl(value.clone()))?;
+                if !relay_urls.is_empty() {
+                    return Err(CliError::TooManyRelayUrls);
+                }
                 relay_urls.push(value);
             }
             "--relay-auth-token" => {
@@ -310,7 +316,6 @@ fn parse_serve_args(args: impl IntoIterator<Item = String>) -> Result<CliCommand
 fn parse_pair_args(mut args: impl Iterator<Item = String>) -> Result<CliCommand, CliError> {
     let mut url = DEFAULT_PAIRING_URL.to_owned();
     let mut qr = false;
-    let mut ws_url = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -322,23 +327,13 @@ fn parse_pair_args(mut args: impl Iterator<Item = String>) -> Result<CliCommand,
             "--qr" => {
                 qr = true;
             }
-            "--ws-url" => {
-                if !qr {
-                    return Err(CliError::WsUrlRequiresQr);
-                }
-                let value = args.next().ok_or(CliError::MissingWsUrlValue)?;
-                if value.trim().is_empty() {
-                    return Err(CliError::EmptyWsUrlValue);
-                }
-                ws_url = Some(value);
-            }
             other => return Err(CliError::UnexpectedArgument(other.to_owned())),
         }
     }
 
     // 解析阶段先拒绝不支持的 URL，避免用户等到网络请求时才看到模糊错误。
     let _ = parse_pairing_base_url(&url)?;
-    Ok(CliCommand::Pair { url, qr, ws_url })
+    Ok(CliCommand::Pair { url, qr })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -539,39 +534,13 @@ fn parse_pairing_token_http_response(response: &[u8]) -> Result<PairingTokenResp
     Ok(payload)
 }
 
-fn build_pairing_qr_payload(
-    token: &PairingTokenResponse,
-    ws_url: Option<&str>,
-) -> Result<PairingQrPayload, CliError> {
-    let default_config = DaemonConfig::default();
-    let ws_url_template = ws_url.unwrap_or(&default_config.default_pairing_ws_url);
-    let ws_url = resolve_pairing_ws_url(ws_url_template, token.server_id)?;
-
+/// 生成 QR invite 时只保留短期信任材料；连接地址由 Web 当前页面决定。
+fn build_pairing_qr_payload(token: &PairingTokenResponse) -> Result<PairingQrPayload, CliError> {
     Ok(PairingQrPayload::new(
-        ws_url,
         token.token.clone(),
         token.server_id,
         token.expires_at_ms,
     ))
-}
-
-fn resolve_pairing_ws_url(template: &str, server_id: ServerId) -> Result<String, CliError> {
-    let rendered = template
-        .trim()
-        .replace("{server_id}", &server_id.0.to_string());
-    if rendered.is_empty() {
-        return Err(CliError::EmptyWsUrlValue);
-    }
-    if !is_supported_ws_url(&rendered) {
-        return Err(CliError::InvalidWsUrl(rendered));
-    }
-    Ok(rendered)
-}
-
-fn is_supported_ws_url(value: &str) -> bool {
-    (value.starts_with("ws://") || value.starts_with("wss://"))
-        && !value.chars().any(char::is_whitespace)
-        && !value.contains('#')
 }
 
 fn render_pairing_qr(invite_code: &str) -> Result<String, CliError> {
@@ -602,18 +571,15 @@ enum CliError {
     MissingRelayAuthTokenValue,
     MissingTlsCertValue,
     MissingTlsKeyValue,
-    MissingWsUrlValue,
     EmptyRelayAuthTokenValue,
     EmptyTlsCertValue,
     EmptyTlsKeyValue,
-    EmptyWsUrlValue,
+    TooManyRelayUrls,
     IncompleteTlsConfig,
-    WsUrlRequiresQr,
     UnsupportedUrl(String),
     UnsupportedRelayUrl(String),
     InvalidListenAddress(String),
     InvalidUrl(String),
-    InvalidWsUrl(String),
     ConnectFailed,
     SendFailed,
     ReceiveFailed,
@@ -627,7 +593,7 @@ enum CliError {
 
 impl CliError {
     fn usage() -> &'static str {
-        "usage: termd [--listen 127.0.0.1:8765] [--relay ws://host:port]... [--relay-auth-token <token>] [--tls-cert <cert.pem> --tls-key <key.pem>] [--web] [pair [--url http://127.0.0.1:8765|https://127.0.0.1:8765] [--qr [--ws-url ws://127.0.0.1:8765/ws]]]\ntry `termd --help` for full help"
+        "usage: termd [--listen 127.0.0.1:8765] [--relay ws://host:port] [--relay-auth-token <token>] [--tls-cert <cert.pem> --tls-key <key.pem>] [--web] [pair [--url http://127.0.0.1:8765|https://127.0.0.1:8765] [--qr]]\ntry `termd --help` for full help"
     }
 }
 
@@ -658,7 +624,6 @@ impl fmt::Display for CliError {
             Self::MissingTlsKeyValue => {
                 write!(f, "`--tls-key` requires a value\n{}", Self::usage())
             }
-            Self::MissingWsUrlValue => write!(f, "`--ws-url` requires a value\n{}", Self::usage()),
             Self::EmptyRelayAuthTokenValue => {
                 write!(
                     f,
@@ -680,10 +645,10 @@ impl fmt::Display for CliError {
                     Self::usage()
                 )
             }
-            Self::EmptyWsUrlValue => {
+            Self::TooManyRelayUrls => {
                 write!(
                     f,
-                    "`--ws-url` requires a non-empty value\n{}",
+                    "a daemon can connect to only one relay; configure a single `--relay`\n{}",
                     Self::usage()
                 )
             }
@@ -691,13 +656,6 @@ impl fmt::Display for CliError {
                 write!(
                     f,
                     "`--tls-cert` and `--tls-key` must be configured together\n{}",
-                    Self::usage()
-                )
-            }
-            Self::WsUrlRequiresQr => {
-                write!(
-                    f,
-                    "`--ws-url` can only be used with `--qr`\n{}",
                     Self::usage()
                 )
             }
@@ -721,12 +679,6 @@ impl fmt::Display for CliError {
                 write!(
                     f,
                     "invalid daemon URL `{url}`; expected http://host:port or https://host:port"
-                )
-            }
-            Self::InvalidWsUrl(url) => {
-                write!(
-                    f,
-                    "invalid pairing WebSocket URL `{url}`; expected ws://... or wss://..."
                 )
             }
             Self::ConnectFailed => write!(f, "failed to connect to the running termd daemon"),
@@ -861,18 +813,32 @@ mod tests {
     }
 
     #[test]
-    fn parses_multiple_relay_urls_for_serve() {
+    fn rejects_multiple_relay_urls_for_serve() {
+        assert!(matches!(
+            CliCommand::parse([
+                "--relay".to_owned(),
+                "ws://127.0.0.1:8080".to_owned(),
+                "--relay-url".to_owned(),
+                "wss://relay.example:443".to_owned(),
+            ])
+            .unwrap_err(),
+            CliError::TooManyRelayUrls
+        ));
+    }
+
+    #[test]
+    fn debug_output_does_not_leak_relay_auth_token() {
         let command = CliCommand::parse([
             "--relay".to_owned(),
             "ws://127.0.0.1:8080".to_owned(),
-            "--relay-url".to_owned(),
-            "wss://relay.example:443".to_owned(),
+            "--relay-auth-token".to_owned(),
+            "relay-secret-1".to_owned(),
         ])
         .unwrap();
 
         let rendered = format!("{command:?}");
         assert!(rendered.contains("ws://127.0.0.1:8080"));
-        assert!(rendered.contains("wss://relay.example:443"));
+        assert!(!rendered.contains("relay-secret-1"));
     }
 
     #[test]
@@ -1091,7 +1057,6 @@ mod tests {
             CliCommand::Pair {
                 url: DEFAULT_PAIRING_URL.to_owned(),
                 qr: false,
-                ws_url: None,
             }
         );
     }
@@ -1108,7 +1073,6 @@ mod tests {
             CliCommand::Pair {
                 url: "http://127.0.0.1:9999".to_owned(),
                 qr: false,
-                ws_url: None,
             }
         );
     }
@@ -1125,40 +1089,19 @@ mod tests {
             CliCommand::Pair {
                 url: "https://127.0.0.1:8765".to_owned(),
                 qr: false,
-                ws_url: None,
             }
         );
     }
 
     #[test]
-    fn parses_pair_with_qr_and_custom_ws_url() {
+    fn parses_pair_with_qr() {
         assert_eq!(
-            CliCommand::parse([
-                "pair".to_owned(),
-                "--qr".to_owned(),
-                "--ws-url".to_owned(),
-                "wss://relay.example/ws/{server_id}/client".to_owned(),
-            ])
-            .unwrap(),
+            CliCommand::parse(["pair".to_owned(), "--qr".to_owned(),]).unwrap(),
             CliCommand::Pair {
                 url: DEFAULT_PAIRING_URL.to_owned(),
                 qr: true,
-                ws_url: Some("wss://relay.example/ws/{server_id}/client".to_owned()),
             }
         );
-    }
-
-    #[test]
-    fn rejects_ws_url_without_qr() {
-        assert!(matches!(
-            CliCommand::parse([
-                "pair".to_owned(),
-                "--ws-url".to_owned(),
-                "ws://127.0.0.1:8765/ws".to_owned(),
-            ])
-            .unwrap_err(),
-            CliError::WsUrlRequiresQr
-        ));
     }
 
     #[test]
@@ -1168,14 +1111,12 @@ mod tests {
             expires_at_ms: UnixTimestampMillis(1_710_000_060_000),
             server_id: ServerId::new(),
         };
-        let payload =
-            build_pairing_qr_payload(&response, Some("wss://relay.example/ws/{server_id}/client"))
-                .unwrap();
+        let payload = build_pairing_qr_payload(&response).unwrap();
 
         assert_eq!(payload.payload_type, PairingQrPayload::PAYLOAD_TYPE);
         assert_eq!(payload.version, PairingQrPayload::VERSION);
         assert_eq!(payload.token.0, "pair-token");
-        assert!(payload.ws_url.contains(&response.server_id.0.to_string()));
+        assert!(payload.ws_url.is_none());
         assert!(payload.is_supported_version());
     }
 

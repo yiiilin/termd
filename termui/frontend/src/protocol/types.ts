@@ -90,7 +90,7 @@ export interface PairAcceptPayload {
 export interface PairingQrPayload {
   type: "termd_pairing_qr";
   version: 1;
-  ws_url: string;
+  ws_url?: string;
   token: string;
   server_id: UUID;
   expires_at_ms: UnixTimestampMillis;

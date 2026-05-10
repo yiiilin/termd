@@ -27,6 +27,12 @@ pub fn embedded_web_response(method: &Method, path: &str) -> Response<Body> {
         return asset_response(asset, &normalized, method == Method::HEAD);
     }
 
+    if let Some(asset_path) = strip_static_asset_prefix(&normalized) {
+        if let Some(asset) = embedded_asset(asset_path) {
+            return asset_response(asset, asset_path, method == Method::HEAD);
+        }
+    }
+
     if should_fallback_to_index(&normalized) {
         if let Some(index) = embedded_asset("index.html") {
             return asset_response(index, "index.html", method == Method::HEAD);
@@ -34,6 +40,21 @@ pub fn embedded_web_response(method: &Method, path: &str) -> Response<Body> {
     }
 
     StatusCode::NOT_FOUND.into_response()
+}
+
+fn strip_static_asset_prefix(path: &str) -> Option<&str> {
+    if path.ends_with("/index.html") {
+        return Some("index.html");
+    }
+    if path.ends_with("/manifest.webmanifest") {
+        return Some("manifest.webmanifest");
+    }
+    for marker in ["assets/", "icons/"] {
+        if let Some(index) = path.find(marker) {
+            return Some(&path[index..]);
+        }
+    }
+    None
 }
 
 fn normalize_path(path: &str) -> String {
@@ -140,6 +161,26 @@ mod tests {
         assert_eq!(
             embedded_web_response(&Method::GET, "/terminal").status(),
             StatusCode::OK
+        );
+    }
+
+    #[test]
+    fn prefixed_static_assets_are_served() {
+        assert_eq!(
+            embedded_web_response(&Method::GET, "/termd/index.html").status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            strip_static_asset_prefix("termd/assets/index.js"),
+            Some("assets/index.js")
+        );
+        assert_eq!(
+            strip_static_asset_prefix("termd/icons/termd.svg"),
+            Some("icons/termd.svg")
+        );
+        assert_eq!(
+            strip_static_asset_prefix("termd/manifest.webmanifest"),
+            Some("manifest.webmanifest")
         );
     }
 }

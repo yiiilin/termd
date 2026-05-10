@@ -108,6 +108,8 @@ struct LocalPairingTokenPayload {
     expires_at_ms: UnixTimestampMillis,
     ttl_ms: u64,
     server_id: ServerId,
+    /// Web 端默认优先使用当前页面地址；这里提供兼容回退地址。
+    ws_url: String,
 }
 
 /// 构造生产默认协议状态，并接入本地状态文件。
@@ -312,6 +314,7 @@ async fn local_pairing_token(
     let mut protocol = protocol.lock().expect("daemon protocol mutex poisoned");
     let ttl_ms = protocol.config().pairing_token_ttl_ms;
     let server_id = protocol.server_id();
+    let ws_url = pairing_ws_url_from_config(protocol.config(), server_id);
     let record = match protocol.issue_pairing_token(now_ms) {
         Ok(record) => record,
         Err(error) => {
@@ -335,9 +338,18 @@ async fn local_pairing_token(
             expires_at_ms: record.expires_at_ms(),
             ttl_ms,
             server_id,
+            ws_url,
         }),
     )
         .into_response()
+}
+
+fn pairing_ws_url_from_config(config: &DaemonConfig, server_id: ServerId) -> String {
+    // 配置里保存的是模板；本地 token 接口返回实际可用的 URL，CLI 生成二维码时无需用户拼 server_id。
+    config
+        .default_pairing_ws_url
+        .trim()
+        .replace("{server_id}", &server_id.0.to_string())
 }
 
 fn is_loopback_peer(peer_addr: SocketAddr) -> bool {
@@ -605,6 +617,7 @@ mod tests {
         expires_at_ms: UnixTimestampMillis,
         ttl_ms: u64,
         server_id: ServerId,
+        ws_url: String,
     }
 
     type TestWs = tokio_tungstenite::WebSocketStream<
@@ -687,11 +700,43 @@ mod tests {
         assert_eq!(payload.ttl_ms, DaemonConfig::default().pairing_token_ttl_ms);
         assert!(payload.expires_at_ms.0 > current_unix_timestamp_millis().0);
         assert_eq!(payload.server_id, server_id);
+        assert_eq!(payload.ws_url, "ws://127.0.0.1:8765/ws");
         assert!(!response.body.contains("server_private_key"));
         assert!(!response.body.contains("terminal sentinel"));
 
         let pair_accept = pair_device_with_http_token(protocol, payload.token);
         assert_eq!(pair_accept.server_id, server_id);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn local_pairing_token_endpoint_returns_configured_relay_client_url() {
+        let mut config = test_config("local-pairing-token-relay-url");
+        config.relay_endpoints = vec!["wss://relay.example/ws".to_owned()];
+        config.default_pairing_ws_url = "wss://relay.example/ws/{server_id}/client".to_owned();
+        let protocol = default_protocol(config);
+        let server_id = {
+            protocol
+                .lock()
+                .expect("daemon protocol mutex poisoned")
+                .server_id()
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_protocol = protocol.clone();
+        let server = tokio::spawn(async move {
+            let _ = serve_listener(listener, server_protocol, false).await;
+        });
+        let response = tokio::task::spawn_blocking(move || post_pairing_token(addr))
+            .await
+            .unwrap();
+        server.abort();
+
+        assert_eq!(response.status, 200);
+        let payload: PairingTokenResponse = serde_json::from_str(&response.body).unwrap();
+        assert_eq!(
+            payload.ws_url,
+            format!("wss://relay.example/ws/{}/client", server_id.0)
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

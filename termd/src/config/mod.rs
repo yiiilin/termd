@@ -86,10 +86,11 @@ impl Default for RelayReconnectConfig {
 
 /// relay endpoint 规范化后的错误。
 ///
-/// 这个错误只用于把本地配置和 CLI 中的 relay endpoint 列表收敛成稳定的 canonical 形式。
+/// 这个错误只用于把本地配置和 CLI 中的 relay endpoint 收敛成稳定的 canonical 形式。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RelayEndpointError {
     Empty,
+    TooMany,
     Invalid { endpoint: String },
 }
 
@@ -97,6 +98,7 @@ impl fmt::Display for RelayEndpointError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Empty => write!(f, "relay endpoint cannot be empty"),
+            Self::TooMany => write!(f, "daemon can connect to only one relay endpoint"),
             Self::Invalid { endpoint } => write!(
                 f,
                 "invalid relay endpoint `{endpoint}`; expected ws://host:port or wss://host:port"
@@ -107,7 +109,7 @@ impl fmt::Display for RelayEndpointError {
 
 impl Error for RelayEndpointError {}
 
-/// 把 relay endpoint 列表收敛成 canonical、去重后的顺序列表。
+/// 把 relay endpoint 收敛成 canonical、去重后的单 relay 列表。
 ///
 /// 这个 helper 只保留 `ws://host[:port]` / `wss://host[:port]` 级别的公开 endpoint，
 /// 可带 relay base path `/ws`；不会把 query、fragment 或空值混进最终 supervisor 列表。
@@ -128,6 +130,9 @@ pub fn normalize_relay_endpoints(
         })?;
         let canonical = base.canonical_url();
         if seen.insert(canonical.clone()) {
+            if !normalized.is_empty() {
+                return Err(RelayEndpointError::TooMany);
+            }
             normalized.push(canonical);
         }
     }
@@ -158,7 +163,7 @@ pub struct DaemonConfig {
     pub default_working_directory: Option<PathBuf>,
     /// 新 pairing token 的默认 TTL，单位为毫秒。
     pub pairing_token_ttl_ms: u64,
-    /// daemon 主动连接的 relay endpoint 列表；为空时不自动连接 relay。
+    /// daemon 主动连接的 relay endpoint；为空时不自动连接 relay。
     #[serde(default)]
     pub relay_endpoints: Vec<String>,
     /// relay 访问凭证；它只认证 relay transport，不表达 session 控制权。
@@ -492,21 +497,10 @@ mod tests {
         let normalized = normalize_relay_endpoints(vec![
             " ws://127.0.0.1:8080/ ".to_owned(),
             "ws://127.0.0.1:8080".to_owned(),
-            "wss://termd.yiln.de/ws/".to_owned(),
-            "wss://termd.yiln.de/ws".to_owned(),
-            "wss://relay.example:443".to_owned(),
-            "wss://relay.example:443/".to_owned(),
         ])
         .unwrap();
 
-        assert_eq!(
-            normalized,
-            vec![
-                "ws://127.0.0.1:8080".to_owned(),
-                "wss://termd.yiln.de/ws".to_owned(),
-                "wss://relay.example:443".to_owned(),
-            ]
-        );
+        assert_eq!(normalized, vec!["ws://127.0.0.1:8080".to_owned()]);
     }
 
     #[test]
@@ -519,6 +513,15 @@ mod tests {
         assert!(matches!(
             normalize_relay_endpoints(vec!["http://127.0.0.1:8080".to_owned()]).unwrap_err(),
             RelayEndpointError::Invalid { endpoint } if endpoint == "http://127.0.0.1:8080"
+        ));
+
+        assert!(matches!(
+            normalize_relay_endpoints(vec![
+                "ws://127.0.0.1:8080".to_owned(),
+                "wss://termd.yiln.de/ws".to_owned(),
+            ])
+            .unwrap_err(),
+            RelayEndpointError::TooMany
         ));
     }
 

@@ -268,7 +268,7 @@ pub struct PairAcceptPayload {
     pub expires_at_ms: UnixTimestampMillis,
 }
 
-/// 二维码 pairing 载荷只携带建立设备信任所需的短期公开路由与 token。
+/// 二维码 pairing 载荷只携带建立设备信任所需的 daemon 标识与短期 token。
 ///
 /// token 仍然是敏感短期凭证；payload 不表达 operator 状态，也不包含任何私钥。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -276,7 +276,9 @@ pub struct PairingQrPayload {
     #[serde(rename = "type")]
     pub payload_type: String,
     pub version: u16,
-    pub ws_url: String,
+    /// 新邀请码默认不携带地址；Web 端使用当前页面地址，这里只保留旧邀请码兼容字段。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ws_url: Option<String>,
     pub token: PairingToken,
     pub server_id: ServerId,
     pub expires_at_ms: UnixTimestampMillis,
@@ -288,7 +290,6 @@ impl PairingQrPayload {
     const INVITE_PREFIX: &'static str = "termd-pair:v1:";
 
     pub fn new(
-        ws_url: impl Into<String>,
         token: PairingToken,
         server_id: ServerId,
         expires_at_ms: UnixTimestampMillis,
@@ -296,7 +297,7 @@ impl PairingQrPayload {
         Self {
             payload_type: Self::PAYLOAD_TYPE.to_owned(),
             version: Self::VERSION,
-            ws_url: ws_url.into(),
+            ws_url: None,
             token,
             server_id,
             expires_at_ms,
@@ -815,7 +816,6 @@ mod tests {
             expires_at_ms: UnixTimestampMillis(1_710_000_060_000),
         };
         let qr_payload = PairingQrPayload::new(
-            "ws://127.0.0.1:8765/ws",
             PairingToken("pair-token".to_owned()),
             server_id,
             UnixTimestampMillis(1_710_000_060_000),
@@ -832,7 +832,6 @@ mod tests {
     #[test]
     fn pairing_qr_payload_contains_only_pairing_route_and_token_material() {
         let payload = PairingQrPayload::new(
-            "wss://relay.example/ws/00000000-0000-0000-0000-000000000001/client",
             PairingToken("pair-token".to_owned()),
             ServerId(Uuid::nil()),
             UnixTimestampMillis(1_710_000_060_000),
@@ -843,6 +842,7 @@ mod tests {
         assert_eq!(json["type"], PairingQrPayload::PAYLOAD_TYPE);
         assert_eq!(json["version"], PairingQrPayload::VERSION);
         assert_eq!(json["token"], "pair-token");
+        assert!(json.get("ws_url").is_none());
         assert!(payload.is_supported_version());
         for forbidden in ["private", "session_data", "controller", "viewer", "rbac"] {
             assert!(!raw.contains(forbidden));
@@ -852,7 +852,6 @@ mod tests {
     #[test]
     fn pairing_qr_payload_invite_code_roundtrips() {
         let payload = PairingQrPayload::new(
-            "wss://relay.example/ws/00000000-0000-0000-0000-000000000001/client",
             PairingToken("pair-token".to_owned()),
             ServerId(Uuid::nil()),
             UnixTimestampMillis(1_710_000_060_000),

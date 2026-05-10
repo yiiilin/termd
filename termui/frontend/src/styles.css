@@ -29,7 +29,9 @@ body {
 }
 
 button,
-input {
+input,
+select,
+textarea {
   font: inherit;
 }
 
@@ -68,7 +70,9 @@ button:disabled {
   opacity: 0.45;
 }
 
-input {
+input,
+select,
+textarea {
   width: 100%;
   border: 1px solid #34413c;
   border-radius: 6px;
@@ -76,6 +80,15 @@ input {
   padding: 7px 9px;
   background: #09110f;
   color: #e9fff5;
+}
+
+textarea {
+  min-height: 70px;
+  resize: vertical;
+}
+
+select {
+  cursor: pointer;
 }
 
 label {
@@ -231,7 +244,6 @@ label {
   background: #101815;
 }
 
-.server-identity,
 .server-url,
 .empty-list {
   color: #90a59b;
@@ -250,6 +262,43 @@ label {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(104px, 1fr));
   gap: 8px;
+}
+
+.connection-address-summary {
+  min-width: 0;
+  border: 1px solid #2d3b35;
+  border-radius: 6px;
+  background: #0b1411;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 8px;
+}
+
+.connection-address-summary div {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.connection-address-summary span {
+  color: #95aaa0;
+  font-size: 12px;
+}
+
+.connection-address-summary code {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #e9fff5;
+  font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+  font-size: 12px;
+}
+
+.daemon-switcher {
+  gap: 6px;
 }
 
 .modal-backdrop {
@@ -324,6 +373,26 @@ label {
 
 .qr-scanner-status.error {
   color: #ffafa9;
+}
+
+.qr-scanner-fallbacks {
+  display: grid;
+  gap: 8px;
+}
+
+.qr-scanner-fallbacks textarea {
+  font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+  font-size: 12px;
+}
+
+.qr-scanner-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.qr-scanner-actions button {
+  flex: 1 1 0;
+  min-width: 0;
 }
 
 .connection-status {
@@ -866,6 +935,12 @@ label {
   color: #536760;
 }
 
+.mobile-backdrop,
+.mobile-actionbar,
+.mobile-drawer-close {
+  display: none;
+}
+
 .status-bar {
   border-top: 1px solid #25312d;
   display: flex;
@@ -890,8 +965,13 @@ label {
 
 @media (max-width: 760px) {
   .app-shell {
+    height: 100dvh;
     grid-template-columns: 1fr;
-    grid-template-rows: auto 1fr;
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+
+  .app-shell.connection-ready {
+    grid-template-rows: minmax(0, 1fr);
   }
 
   .sidebar {
@@ -899,21 +979,174 @@ label {
     border-bottom: 1px solid #25312d;
   }
 
+  .app-shell.connection-ready .sidebar {
+    position: fixed;
+    z-index: 70;
+    inset: 0 auto 0 0;
+    width: min(88vw, 340px);
+    max-width: 340px;
+    border-right: 1px solid #31433b;
+    border-bottom: 0;
+    box-shadow: 22px 0 50px rgba(0, 0, 0, 0.45);
+    transform: translateX(-104%);
+    visibility: hidden;
+    pointer-events: none;
+    transition:
+      transform 160ms ease,
+      visibility 160ms ease;
+  }
+
+  .app-shell.connection-ready.mobile-sessions-open .sidebar {
+    transform: translateX(0);
+    visibility: visible;
+    pointer-events: auto;
+  }
+
+  .app-shell.connection-ready .sidebar.collapsed-sidebar {
+    padding: 14px;
+    justify-items: stretch;
+    grid-template-rows: auto;
+  }
+
+  .app-shell.connection-ready .rail-brand,
+  .app-shell.connection-ready .rail-actions,
+  .app-shell.connection-ready .collapsed-session-list {
+    justify-items: stretch;
+  }
+
+  .app-shell.connection-ready .rail-brand .icon-button,
+  .app-shell.connection-ready .rail-actions .icon-button,
+  .app-shell.connection-ready .collapsed-session-list .icon-button {
+    width: 100%;
+  }
+
+  .mobile-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 60;
+    display: block;
+    min-height: 0;
+    padding: 0;
+    border: 0;
+    border-radius: 0;
+    background: rgba(4, 8, 7, 0.58);
+  }
+
+  .mobile-drawer-close {
+    display: inline-flex;
+  }
+
+  .sidebar-collapse-toggle {
+    display: none;
+  }
+
   .workspace {
-    grid-template-rows: 44px minmax(360px, calc(100vh - 360px)) 30px;
+    min-height: 0;
+    height: 100%;
+    grid-template-rows: 42px minmax(0, 1fr) 30px;
+  }
+
+  .app-shell.connection-ready .workspace {
+    min-height: 0;
+    height: 100%;
+    grid-template-rows: 42px minmax(0, 1fr) 58px 28px;
   }
 
   .workspace-body {
     grid-template-columns: 1fr;
-    grid-template-rows: minmax(280px, 1fr) minmax(170px, 32vh);
+    grid-template-rows: minmax(0, 1fr);
   }
 
-  .files-panel {
+  .app-shell.connection-ready .workspace-body {
+    position: relative;
+    overflow: hidden;
+  }
+
+  .app-shell.connection-ready .files-panel {
+    position: fixed;
+    z-index: 75;
+    inset: auto 0 0 0;
+    height: min(72dvh, 560px);
     border-left: 0;
+    border-top: 1px solid #3a5147;
+    border-radius: 8px 8px 0 0;
+    box-shadow: 0 -22px 56px rgba(0, 0, 0, 0.46);
+    transform: translateY(104%);
+    visibility: hidden;
+    pointer-events: none;
+    transition:
+      transform 160ms ease,
+      visibility 160ms ease;
+  }
+
+  .app-shell.connection-ready.mobile-files-open .files-panel {
+    transform: translateY(0);
+    visibility: visible;
+    pointer-events: auto;
+  }
+
+  .app-shell.connection-ready .files-rail {
+    display: none;
+  }
+
+  .mobile-actionbar {
     border-top: 1px solid #25312d;
+    background: #101815;
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 5px;
+    padding: 6px;
+  }
+
+  .mobile-actionbar button {
+    min-width: 0;
+    min-height: 44px;
+    padding: 0 4px;
+    display: grid;
+    justify-items: center;
+    align-content: center;
+    gap: 3px;
+    font-size: 11px;
+  }
+
+  .toolbar {
+    padding: 0 10px;
+    gap: 8px;
   }
 
   .toolbar-group {
-    max-width: 36vw;
+    max-width: 34vw;
+  }
+
+  .session-operators {
+    gap: 4px;
+  }
+
+  .session-operator {
+    max-width: 38vw;
+    padding: 0 6px;
+  }
+
+  .terminal-pane {
+    min-height: 0;
+  }
+
+  .terminal-pane-viewer {
+    grid-template-rows: 36px minmax(0, 1fr);
+  }
+
+  .terminal-viewer-toolbar {
+    overflow-x: auto;
+  }
+
+  .status-bar {
+    min-width: 0;
+    gap: 8px;
+    padding: 0 8px;
+    font-size: 11px;
+  }
+
+  .files-panel-header {
+    min-height: 46px;
   }
 }

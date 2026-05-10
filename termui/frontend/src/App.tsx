@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Cable,
+  Folder,
   Link,
   MonitorUp,
   PanelLeftClose,
@@ -10,6 +11,7 @@ import {
   RefreshCcw,
   Unplug,
   UsersRound,
+  X,
 } from "lucide-react";
 import { DirectClient, ProtocolClientError } from "./protocol/direct-client";
 import { toSafeError } from "./protocol/errors";
@@ -33,6 +35,7 @@ import {
   loadBrowserState,
   recordPairing,
   recordServerUrl,
+  selectDefaultServer,
 } from "./state/browser-state";
 import { ConnectionPanel, ConnectionStatusPanel } from "./components/ConnectionPanel";
 import { DaemonClientsPanel } from "./components/DaemonClientsPanel";
@@ -62,6 +65,8 @@ export default function App() {
   const [sessionFilesError, setSessionFilesError] = useState<SafeError | undefined>();
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [filesPanelOpen, setFilesPanelOpen] = useState(true);
+  const [mobileSessionsOpen, setMobileSessionsOpen] = useState(false);
+  const [mobileFilesOpen, setMobileFilesOpen] = useState(false);
   const [connectionEditorOpen, setConnectionEditorOpen] = useState(false);
   const [qrScannerOpen, setQrScannerOpen] = useState(false);
   const [status, setStatus] = useState("idle");
@@ -102,6 +107,15 @@ export default function App() {
     () => sessions.find((session) => session.session_id === attachedSessionId),
     [attachedSessionId, sessions],
   );
+  const pairedServerOptions = useMemo(
+    () =>
+      state.pairedServers.map((server, index) => ({
+        server,
+        label: daemonDisplayLabel(server, index),
+      })),
+    [state.pairedServers],
+  );
+  const mobilePanelOpen = mobileSessionsOpen || mobileFilesOpen;
 
   const setSafeError = useCallback((caught: unknown) => {
     setError(toSafeError(caught));
@@ -126,6 +140,7 @@ export default function App() {
       cursorRefreshTimerRef.current = undefined;
     }
     clearSessionFiles();
+    setMobileFilesOpen(false);
   }, [clearSessionFiles]);
 
   const handlePair = useCallback(async (rawPairingInput?: string) => {
@@ -135,16 +150,11 @@ export default function App() {
     try {
       const device = await ensureDevice();
       const payload = parsePairingQrPayload(pairingInput);
-      const effectiveUrl = payload?.ws_url ?? url.trim();
+      const candidateUrls = payload?.ws_url
+        ? pairingWsUrlCandidates(payload.ws_url, payload.server_id)
+        : [url.trim()];
       const token = payload?.token ?? pairingInput.trim();
-      const client = await DirectClient.connect(effectiveUrl, device.device_id);
-      if (payload && client.serverId !== payload.server_id) {
-        client.close();
-        throw new ProtocolClientError(
-          "pairing_payload_server_mismatch",
-          "pairing payload does not match the connected daemon",
-        );
-      }
+      const { client, effectiveUrl } = await connectPairingClient(candidateUrls, device.device_id, payload?.server_id);
       const accepted = await client.pair(token, device.device_public_key);
       client.close();
       const nextState = await recordPairing(accepted, effectiveUrl);
@@ -222,6 +232,33 @@ export default function App() {
       client?.close();
     }
   }, [activeServer, disconnectAttach, setSafeError, state.device, url]);
+
+  const handleSelectServer = useCallback(
+    async (serverId: UUID) => {
+      const target = state.pairedServers.find((server) => server.server_id === serverId);
+      if (!target || target.server_id === activeServer?.server_id) {
+        return;
+      }
+
+      setError(undefined);
+      disconnectAttach();
+      setSessions([]);
+      setDaemonClients([]);
+      setSelectedSessionId(undefined);
+      setRenamingSessionId(undefined);
+      setRenameDraft("");
+      setTerminalChunks([]);
+      autoCheckedServerRef.current = undefined;
+      const nextState = await selectDefaultServer(target.server_id);
+      setState(nextState);
+      setUrl(browserReachableWsUrl(target.url));
+      setConnectionEditorOpen(false);
+      setMobileSessionsOpen(false);
+      setMobileFilesOpen(false);
+      setStatus("idle");
+    },
+    [activeServer?.server_id, disconnectAttach, state.pairedServers],
+  );
 
   const authenticatedClient = useCallback(async () => {
     const server = activeServer;
@@ -343,6 +380,7 @@ export default function App() {
         if (attachedSessionRef.current === sessionId && attachClientRef.current) {
           setSelectedSessionId(sessionId);
           setStatus("attached");
+          setMobileSessionsOpen(false);
           return;
         }
         disconnectAttach();
@@ -353,6 +391,7 @@ export default function App() {
         attachedSessionRef.current = sessionId;
         setSelectedSessionId(sessionId);
         setAttachedSessionId(sessionId);
+        setMobileSessionsOpen(false);
         setStatus("attached");
         await loadSessionFiles(sessionId);
         void refreshDaemonClients();
@@ -377,6 +416,7 @@ export default function App() {
       attachedSessionRef.current = created.session_id;
       setSelectedSessionId(created.session_id);
       setAttachedSessionId(created.session_id);
+      setMobileSessionsOpen(false);
       setSessions((current) => upsertSession(current, created));
       setStatus("attached");
       await loadSessionFiles(created.session_id);
@@ -437,6 +477,7 @@ export default function App() {
           disconnectAttach();
           setTerminalChunks([]);
         }
+        setMobileFilesOpen(false);
         void refreshDaemonClients();
       } catch (caught) {
         setSafeError(caught);
@@ -602,8 +643,39 @@ export default function App() {
     [authenticatedClient, loadSessionFiles, sessionFiles?.path],
   );
 
+  const handleShowMobileFiles = useCallback(() => {
+    setFilesPanelOpen(true);
+    setMobileFilesOpen(true);
+  }, []);
+
+  const handleHideFiles = useCallback(() => {
+    setFilesPanelOpen(false);
+    setMobileFilesOpen(false);
+  }, []);
+
   return (
-    <div className={`app-shell${sidebarCollapsed ? " sidebar-is-collapsed" : ""}`}>
+    <div
+      className={[
+        "app-shell",
+        sidebarCollapsed ? "sidebar-is-collapsed" : "",
+        connectionReady ? "connection-ready" : "",
+        mobileSessionsOpen ? "mobile-sessions-open" : "",
+        mobileFilesOpen ? "mobile-files-open" : "",
+      ]
+        .filter(Boolean)
+        .join(" ")}
+    >
+      {mobilePanelOpen ? (
+        <button
+          type="button"
+          className="mobile-backdrop"
+          aria-label="Close mobile panel"
+          onClick={() => {
+            setMobileSessionsOpen(false);
+            setMobileFilesOpen(false);
+          }}
+        />
+      ) : null}
       <aside className={sidebarCollapsed ? "sidebar collapsed-sidebar" : "sidebar"}>
         {sidebarCollapsed ? (
           <>
@@ -701,6 +773,16 @@ export default function App() {
                   <UsersRound size={15} aria-hidden="true" />
                 </button>
               ) : null}
+              {connectionReady ? (
+                <button
+                  type="button"
+                  className="icon-button mobile-drawer-close"
+                  aria-label="Close sessions panel"
+                  onClick={() => setMobileSessionsOpen(false)}
+                >
+                  <X size={15} aria-hidden="true" />
+                </button>
+              ) : null}
               {connectionReady && clientsOpen ? (
                 <div className="clients-popover" id="daemon-clients-popover">
                   <DaemonClientsPanel clients={daemonClients} />
@@ -718,6 +800,7 @@ export default function App() {
                 onPair={() => void handlePair()}
                 onScanQr={() => setQrScannerOpen(true)}
                 onSaveUrl={handleSaveConnectionUrl}
+                showUrlEditor={connectionEditorOpen}
               />
             ) : null}
             {qrScannerOpen ? (
@@ -728,9 +811,11 @@ export default function App() {
             ) : null}
             {showConnectionStatus && activeServer ? (
               <ConnectionStatusPanel
-                serverId={activeServer.server_id}
                 url={connectionStatusUrl}
                 status={status}
+                servers={pairedServerOptions}
+                activeServerId={activeServer.server_id}
+                onServerChange={(serverId) => void handleSelectServer(serverId)}
                 onEdit={() => {
                   setUrl(connectionStatusUrl);
                   setConnectionEditorOpen((open) => !open);
@@ -776,7 +861,7 @@ export default function App() {
         <div className="toolbar">
           <div className="toolbar-group">
             <Link size={16} aria-hidden="true" />
-            <span>{activeServer?.server_id ?? "unpaired"}</span>
+            <span>{activeServer ? "paired daemon" : "unpaired"}</span>
           </div>
           {connectionReady && attachedSessionId ? (
             <SessionOperatorsBar
@@ -808,7 +893,7 @@ export default function App() {
                   onUpload={handleUploadFile}
                   onDownload={handleDownloadFile}
                   onDelete={handleDeleteFile}
-                  onHide={() => setFilesPanelOpen(false)}
+                  onHide={handleHideFiles}
                 />
               ) : (
                 <aside className="files-rail" aria-label="files panel collapsed">
@@ -824,6 +909,33 @@ export default function App() {
             </div>
           )}
         </div>
+        {connectionReady && !mobilePanelOpen ? (
+          <nav className="mobile-actionbar" aria-label="mobile workspace actions">
+            <button
+              type="button"
+              aria-label="Open sessions"
+              onClick={() => {
+                setSidebarCollapsed(false);
+                setMobileSessionsOpen(true);
+              }}
+            >
+              <MonitorUp size={16} aria-hidden="true" />
+              Sessions
+            </button>
+            <button type="button" aria-label="Open files" onClick={handleShowMobileFiles} disabled={!attachedSessionId}>
+              <Folder size={16} aria-hidden="true" />
+              Files
+            </button>
+            <button type="button" aria-label="Mobile new session" onClick={handleCreateSession} disabled={status === "creating"}>
+              <Plus size={16} aria-hidden="true" />
+              New
+            </button>
+            <button type="button" aria-label="Mobile refresh" onClick={handleRefresh} disabled={status === "listing"}>
+              <RefreshCcw size={16} aria-hidden="true" />
+              Refresh
+            </button>
+          </nav>
+        ) : null}
         <StatusBar status={status} error={error} sessionId={attachedSessionId ?? selectedSessionId} />
       </main>
     </div>
@@ -871,17 +983,21 @@ function SessionOperatorsBar(props: {
   );
 }
 
-export function defaultWsUrlFromPage(location: Pick<Location, "protocol" | "host"> | undefined = globalThis.location): string {
+export function defaultWsUrlFromPage(
+  location: (Pick<Location, "protocol" | "host"> & Partial<Pick<Location, "pathname">>) | undefined = globalThis.location,
+): string {
   if (!location || !location.host || (location.protocol !== "http:" && location.protocol !== "https:")) {
     return FALLBACK_WS_URL;
   }
   const scheme = location.protocol === "https:" ? "wss" : "ws";
-  return `${scheme}://${location.host}/ws`;
+  return `${scheme}://${location.host}${websocketPathForPage(location.pathname)}`;
 }
 
 export function browserReachableWsUrl(
   rawUrl: string,
-  page: Pick<Location, "protocol" | "host" | "hostname"> | undefined = globalThis.location,
+  page:
+    | (Pick<Location, "protocol" | "host" | "hostname"> & Partial<Pick<Location, "pathname">>)
+    | undefined = globalThis.location,
 ): string {
   try {
     const parsed = new URL(rawUrl);
@@ -895,8 +1011,133 @@ export function browserReachableWsUrl(
   }
 }
 
+export function pairingWsUrlCandidates(
+  rawUrl: string,
+  serverId: UUID,
+  page:
+    | (Pick<Location, "protocol" | "host" | "hostname"> & Partial<Pick<Location, "pathname">>)
+    | undefined = globalThis.location,
+): string[] {
+  const candidates: string[] = [];
+  const inviteUrl = rawUrl.trim();
+  const pageUrl = defaultWsUrlFromPage(page);
+  const relayToken = relayTokenFromUrl(inviteUrl);
+
+  if (page?.hostname && !isLoopbackHost(page.hostname)) {
+    addCandidate(candidates, pageUrl);
+    addCandidate(candidates, relayClientUrlFromBase(withRelayToken(pageUrl, relayToken), serverId));
+  }
+
+  const browserUrl = browserReachableWsUrl(inviteUrl, page);
+  addCandidate(candidates, browserUrl);
+  addCandidate(candidates, relayClientUrlFromBase(browserUrl, serverId));
+
+  if (candidates.length === 0) {
+    return [inviteUrl];
+  }
+  return candidates;
+}
+
+export async function connectPairingClient(
+  candidateUrls: string[],
+  deviceId: UUID,
+  expectedServerId?: UUID,
+): Promise<{ client: DirectClient; effectiveUrl: string }> {
+  let lastError: unknown;
+  for (const candidateUrl of candidateUrls) {
+    try {
+      const client = await DirectClient.connect(candidateUrl, deviceId);
+      if (expectedServerId && client.serverId !== expectedServerId) {
+        client.close();
+        lastError = new ProtocolClientError(
+          "pairing_payload_server_mismatch",
+          "pairing payload does not match the connected daemon",
+        );
+        continue;
+      }
+      return { client, effectiveUrl: candidateUrl };
+    } catch (caught) {
+      lastError = caught;
+    }
+  }
+
+  throw lastError ?? new ProtocolClientError("empty_pairing_candidates", "no pairing URL candidates");
+}
+
+function relayClientUrlFromBase(rawUrl: string, serverId: UUID): string | undefined {
+  try {
+    const parsed = new URL(rawUrl);
+    if (parsed.protocol !== "ws:" && parsed.protocol !== "wss:") {
+      return undefined;
+    }
+
+    const normalizedPath = parsed.pathname.replace(/\/+$/, "");
+    if (!normalizedPath.endsWith("/ws")) {
+      return undefined;
+    }
+
+    parsed.pathname = `${normalizedPath}/${serverId}/client`;
+    return parsed.toString();
+  } catch {
+    return undefined;
+  }
+}
+
+function websocketPathForPage(pathname: string | undefined): string {
+  const rawPath = pathname?.trim() || "/";
+  const path = rawPath.startsWith("/") ? rawPath : `/${rawPath}`;
+  const basePath = path.endsWith("/")
+    ? path.replace(/\/+$/, "")
+    : path
+        .split("/")
+        .slice(0, -1)
+        .join("/");
+  // Web 被反向代理到 `/prefix/` 时，WS 也应使用同一个公开前缀：`/prefix/ws`。
+  return `${basePath || ""}/ws`;
+}
+
+function relayTokenFromUrl(rawUrl: string): string | undefined {
+  try {
+    const token = new URL(rawUrl).searchParams.get("relay_token")?.trim();
+    return token || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function withRelayToken(rawUrl: string, relayToken: string | undefined): string {
+  if (!relayToken) {
+    return rawUrl;
+  }
+  try {
+    const parsed = new URL(rawUrl);
+    if (!parsed.searchParams.has("relay_token")) {
+      parsed.searchParams.set("relay_token", relayToken);
+    }
+    return parsed.toString();
+  } catch {
+    return rawUrl;
+  }
+}
+
+function addCandidate(candidates: string[], candidate: string | undefined): void {
+  const clean = candidate?.trim();
+  if (clean && !candidates.includes(clean)) {
+    candidates.push(clean);
+  }
+}
+
 function isLoopbackHost(hostname: string): boolean {
   return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1" || hostname === "[::1]";
+}
+
+function daemonDisplayLabel(server: PairedServerState, index: number): string {
+  try {
+    const parsed = new URL(server.url);
+    return `Daemon ${index + 1} ${parsed.host}`;
+  } catch {
+    return `Daemon ${index + 1}`;
+  }
 }
 
 function shortSessionId(sessionId: UUID): string {

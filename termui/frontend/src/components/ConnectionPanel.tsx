@@ -1,4 +1,6 @@
+import { useEffect, useState } from "react";
 import { KeyRound, Save, ScanQrCode, Settings, Wifi } from "lucide-react";
+import type { PairedServerState, UUID } from "../protocol/types";
 
 interface ConnectionPanelProps {
   url: string;
@@ -10,20 +12,41 @@ interface ConnectionPanelProps {
   onPair: () => void;
   onScanQr?: () => void;
   onSaveUrl?: () => void;
+  showUrlEditor?: boolean;
 }
 
 export function ConnectionPanel(props: ConnectionPanelProps) {
+  const [urlEditorOpen, setUrlEditorOpen] = useState(Boolean(props.showUrlEditor));
+
+  useEffect(() => {
+    if (props.showUrlEditor) {
+      setUrlEditorOpen(true);
+    }
+  }, [props.showUrlEditor]);
+
   return (
     <section className="panel" aria-label="connection">
-      <label>
-        <span>WS URL</span>
-        <input
-          aria-label="WS URL"
-          value={props.url}
-          onChange={(event) => props.onUrlChange(event.target.value)}
-          spellCheck={false}
-        />
-      </label>
+      {urlEditorOpen ? (
+        <label>
+          <span>WS URL</span>
+          <input
+            aria-label="WS URL"
+            value={props.url}
+            onChange={(event) => props.onUrlChange(event.target.value)}
+            spellCheck={false}
+          />
+        </label>
+      ) : (
+        <div className="connection-address-summary">
+          <div>
+            <span>Address</span>
+            <code>{props.url}</code>
+          </div>
+          <button type="button" className="icon-button" aria-label="Edit address" onClick={() => setUrlEditorOpen(true)}>
+            <Settings size={15} aria-hidden="true" />
+          </button>
+        </div>
+      )}
       <label>
         <span>Pairing token</span>
         <input
@@ -49,7 +72,7 @@ export function ConnectionPanel(props: ConnectionPanelProps) {
           <button
             type="button"
             onClick={props.onSaveUrl}
-            disabled={props.status === "saving_url" || !props.url.trim()}
+            disabled={props.status === "saving_url" || !props.url.trim() || !urlEditorOpen}
           >
             <Save size={16} aria-hidden="true" />
             Save URL
@@ -61,9 +84,11 @@ export function ConnectionPanel(props: ConnectionPanelProps) {
 }
 
 interface ConnectionStatusPanelProps {
-  serverId: string;
   url: string;
   status: string;
+  servers?: { server: PairedServerState; label: string }[];
+  activeServerId?: UUID;
+  onServerChange?: (serverId: UUID) => void;
   onEdit?: () => void;
 }
 
@@ -79,7 +104,22 @@ export function ConnectionStatusPanel(props: ConnectionStatusPanelProps) {
           </button>
         ) : null}
       </div>
-      <div className="server-identity">{props.serverId}</div>
+      {props.servers && props.servers.length > 1 ? (
+        <label className="daemon-switcher">
+          <span>Daemon</span>
+          <select
+            aria-label="Daemon"
+            value={props.activeServerId ?? ""}
+            onChange={(event) => props.onServerChange?.(event.target.value)}
+          >
+            {props.servers.map((item) => (
+              <option key={item.server.server_id} value={item.server.server_id}>
+                {item.label}
+              </option>
+            ))}
+          </select>
+        </label>
+      ) : null}
       <div className="server-url">{props.url}</div>
     </section>
   );

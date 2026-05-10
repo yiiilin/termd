@@ -1,7 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import App, { browserReachableWsUrl, defaultWsUrlFromPage } from "../App";
+import App, {
+  browserReachableWsUrl,
+  connectPairingClient,
+  defaultWsUrlFromPage,
+  pairingWsUrlCandidates,
+} from "../App";
 import type { SessionFilesResultPayload } from "../protocol/types";
 import { clearBrowserState } from "../state/browser-state";
 import { MockDaemon } from "../test/mock-daemon";
@@ -10,6 +15,7 @@ const qrScannerMock = vi.hoisted(() => ({
   destroy: vi.fn(),
   hasCamera: vi.fn<() => Promise<boolean>>(() => Promise.resolve(true)),
   onDecode: undefined as ((result: { data: string }) => void) | undefined,
+  scanImage: vi.fn<() => Promise<{ data: string; cornerPoints: [] }>>(),
   start: vi.fn<() => Promise<void>>(() => Promise.resolve()),
   stop: vi.fn(),
 }));
@@ -18,6 +24,7 @@ vi.mock("qr-scanner", () => {
   class MockQrScanner {
     static NO_QR_CODE_FOUND = "No QR code found";
     static hasCamera = qrScannerMock.hasCamera;
+    static scanImage = qrScannerMock.scanImage;
 
     constructor(_video: HTMLVideoElement, onDecode: (result: { data: string }) => void) {
       qrScannerMock.onDecode = onDecode;
@@ -31,6 +38,15 @@ vi.mock("qr-scanner", () => {
   return { default: MockQrScanner };
 });
 
+async function setConnectionUrl(user: ReturnType<typeof userEvent.setup>, url: string): Promise<void> {
+  if (!screen.queryByLabelText("WS URL")) {
+    await user.click(await screen.findByRole("button", { name: "Edit address" }));
+  }
+  const input = await screen.findByLabelText("WS URL");
+  await user.clear(input);
+  await user.type(input, url);
+}
+
 describe("termui web 工作台", () => {
   let daemon: MockDaemon;
 
@@ -40,6 +56,7 @@ describe("termui web 工作台", () => {
     qrScannerMock.hasCamera.mockReset();
     qrScannerMock.hasCamera.mockResolvedValue(true);
     qrScannerMock.onDecode = undefined;
+    qrScannerMock.scanImage.mockReset();
     qrScannerMock.start.mockReset();
     qrScannerMock.start.mockResolvedValue();
     qrScannerMock.stop.mockClear();
@@ -64,13 +81,12 @@ describe("termui web 工作台", () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await user.clear(await screen.findByLabelText("WS URL"));
-    await user.type(screen.getByLabelText("WS URL"), daemon.url);
+    await setConnectionUrl(user, daemon.url);
     await user.type(screen.getByLabelText("Pairing token"), "secret-token");
     await user.click(screen.getByRole("button", { name: "Pair" }));
 
     await waitFor(() => expect(screen.queryByLabelText("Pairing token")).toBeNull());
-    await screen.findAllByText(daemon.serverId);
+    await screen.findByText("Connected");
     await user.click(screen.getByRole("button", { name: "Refresh" }));
     await screen.findAllByText("00000000-0000-0000-0000-000000000401");
     expect(screen.queryByRole("button", { name: "Open" })).toBeNull();
@@ -87,16 +103,14 @@ describe("termui web 工作台", () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await user.clear(await screen.findByLabelText("WS URL"));
-    await user.type(screen.getByLabelText("WS URL"), daemon.url);
+    await setConnectionUrl(user, daemon.url);
     await user.type(screen.getByLabelText("Pairing token"), "secret-token");
     await user.click(screen.getByRole("button", { name: "Pair" }));
-    await screen.findAllByText(daemon.serverId);
+    await screen.findByText("Connected");
 
     const relayUrl = `${daemon.url.replace("/ws", `/ws/${daemon.serverId}/client`)}?relay_token=relay-secret`;
     await user.click(screen.getByRole("button", { name: "Edit connection" }));
-    await user.clear(screen.getByLabelText("WS URL"));
-    await user.type(screen.getByLabelText("WS URL"), relayUrl);
+    await setConnectionUrl(user, relayUrl);
     await user.click(screen.getByRole("button", { name: "Save URL" }));
 
     await screen.findByText(relayUrl);
@@ -104,15 +118,77 @@ describe("termui web 工作台", () => {
     await screen.findAllByText("00000000-0000-0000-0000-000000000401");
   });
 
+  it("一个 Web 可以保存并切换多个 daemon", async () => {
+    const user = userEvent.setup();
+    const secondDaemon = await MockDaemon.start({
+      token: "second-token",
+      sessions: [
+        {
+          session_id: "00000000-0000-0000-0000-000000000421",
+          state: "running",
+          size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+        },
+      ],
+    });
+    render(<App />);
+
+    try {
+      await setConnectionUrl(user, daemon.url);
+      await user.type(screen.getByLabelText("Pairing token"), "secret-token");
+      await user.click(screen.getByRole("button", { name: "Pair" }));
+      await screen.findByText("Connected");
+
+      await user.click(screen.getByRole("button", { name: "Edit connection" }));
+      await setConnectionUrl(user, secondDaemon.url);
+      await user.clear(screen.getByLabelText("Pairing token"));
+      await user.type(screen.getByLabelText("Pairing token"), "second-token");
+      await user.click(screen.getByRole("button", { name: "Pair" }));
+      await screen.findByText(secondDaemon.url);
+
+      const selector = await screen.findByLabelText("Daemon");
+      expect(within(selector).getByRole("option", { name: new RegExp(new URL(daemon.url).host) })).toBeInTheDocument();
+      expect(within(selector).getByRole("option", { name: new RegExp(new URL(secondDaemon.url).host) })).toBeInTheDocument();
+
+      await user.click(screen.getByRole("button", { name: "Refresh" }));
+      await screen.findAllByText("00000000-0000-0000-0000-000000000421");
+
+      await user.selectOptions(selector, daemon.serverId);
+      await waitFor(() => expect(screen.getByLabelText("Daemon")).toHaveValue(daemon.serverId));
+      await screen.findAllByText("00000000-0000-0000-0000-000000000401");
+    } finally {
+      await secondDaemon.stop();
+    }
+  });
+
+  it("配对候选 URL 会跳过 server_id 不匹配的 daemon", async () => {
+    const secondDaemon = await MockDaemon.start({
+      token: "second-token",
+      sessions: [],
+    });
+
+    try {
+      const { client, effectiveUrl } = await connectPairingClient(
+        [daemon.url, secondDaemon.url],
+        "00000000-0000-0000-0000-000000000999",
+        secondDaemon.serverId,
+      );
+
+      expect(effectiveUrl).toBe(secondDaemon.url);
+      expect(client.serverId).toBe(secondDaemon.serverId);
+      client.close();
+    } finally {
+      await secondDaemon.stop();
+    }
+  });
+
   it("点击 session 卡片直接进入 shared-control operator", async () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await user.clear(await screen.findByLabelText("WS URL"));
-    await user.type(screen.getByLabelText("WS URL"), daemon.url);
+    await setConnectionUrl(user, daemon.url);
     await user.type(screen.getByLabelText("Pairing token"), "secret-token");
     await user.click(screen.getByRole("button", { name: "Pair" }));
-    await screen.findAllByText(daemon.serverId);
+    await screen.findByText("Connected");
     await user.click(screen.getByRole("button", { name: "Refresh" }));
 
     await screen.findAllByText("00000000-0000-0000-0000-000000000401");
@@ -134,11 +210,10 @@ describe("termui web 工作台", () => {
     });
     render(<App />);
 
-    await user.clear(await screen.findByLabelText("WS URL"));
-    await user.type(screen.getByLabelText("WS URL"), daemon.url);
+    await setConnectionUrl(user, daemon.url);
     await user.type(screen.getByLabelText("Pairing token"), "secret-token");
     await user.click(screen.getByRole("button", { name: "Pair" }));
-    await screen.findAllByText(daemon.serverId);
+    await screen.findByText("Connected");
 
     expect(screen.queryByLabelText("Command")).toBeNull();
     await user.click(screen.getByRole("button", { name: "New session" }));
@@ -222,11 +297,10 @@ describe("termui web 工作台", () => {
     });
     render(<App />);
 
-    await user.clear(await screen.findByLabelText("WS URL"));
-    await user.type(screen.getByLabelText("WS URL"), daemon.url);
+    await setConnectionUrl(user, daemon.url);
     await user.type(screen.getByLabelText("Pairing token"), "secret-token");
     await user.click(screen.getByRole("button", { name: "Pair" }));
-    await screen.findAllByText(daemon.serverId);
+    await screen.findByText("Connected");
     await user.click(screen.getByRole("button", { name: "Refresh" }));
     await user.click((await screen.findAllByText(sessionId))[0]);
 
@@ -333,11 +407,10 @@ describe("termui web 工作台", () => {
     });
     render(<App />);
 
-    await user.clear(await screen.findByLabelText("WS URL"));
-    await user.type(screen.getByLabelText("WS URL"), daemon.url);
+    await setConnectionUrl(user, daemon.url);
     await user.type(screen.getByLabelText("Pairing token"), "secret-token");
     await user.click(screen.getByRole("button", { name: "Pair" }));
-    await screen.findAllByText(daemon.serverId);
+    await screen.findByText("Connected");
     await user.click(screen.getByRole("button", { name: "Refresh" }));
     await user.click((await screen.findAllByText(sessionId))[0]);
 
@@ -386,11 +459,10 @@ describe("termui web 工作台", () => {
     });
     render(<App />);
 
-    await user.clear(await screen.findByLabelText("WS URL"));
-    await user.type(screen.getByLabelText("WS URL"), daemon.url);
+    await setConnectionUrl(user, daemon.url);
     await user.type(screen.getByLabelText("Pairing token"), "secret-token");
     await user.click(screen.getByRole("button", { name: "Pair" }));
-    await screen.findAllByText(daemon.serverId);
+    await screen.findByText("Connected");
     await user.click(screen.getByRole("button", { name: "Refresh" }));
     await user.click((await screen.findAllByText(sessionId))[0]);
 
@@ -454,11 +526,10 @@ describe("termui web 工作台", () => {
     });
     render(<App />);
 
-    await user.clear(await screen.findByLabelText("WS URL"));
-    await user.type(screen.getByLabelText("WS URL"), daemon.url);
+    await setConnectionUrl(user, daemon.url);
     await user.type(screen.getByLabelText("Pairing token"), "secret-token");
     await user.click(screen.getByRole("button", { name: "Pair" }));
-    await screen.findAllByText(daemon.serverId);
+    await screen.findByText("Connected");
     await user.click(screen.getByRole("button", { name: "Refresh" }));
     await user.click((await screen.findAllByText("00000000-0000-0000-0000-000000000410"))[0]);
 
@@ -485,11 +556,10 @@ describe("termui web 工作台", () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await user.clear(await screen.findByLabelText("WS URL"));
-    await user.type(screen.getByLabelText("WS URL"), daemon.url);
+    await setConnectionUrl(user, daemon.url);
     await user.type(screen.getByLabelText("Pairing token"), "secret-token");
     await user.click(screen.getByRole("button", { name: "Pair" }));
-    await screen.findAllByText(daemon.serverId);
+    await screen.findByText("Connected");
     await user.click(screen.getByRole("button", { name: "Refresh" }));
 
     const actions = await screen.findByLabelText("Session actions");
@@ -503,11 +573,10 @@ describe("termui web 工作台", () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await user.clear(await screen.findByLabelText("WS URL"));
-    await user.type(screen.getByLabelText("WS URL"), daemon.url);
+    await setConnectionUrl(user, daemon.url);
     await user.type(screen.getByLabelText("Pairing token"), "secret-token");
     await user.click(screen.getByRole("button", { name: "Pair" }));
-    await screen.findAllByText(daemon.serverId);
+    await screen.findByText("Connected");
     await user.click(screen.getByRole("button", { name: "Refresh" }));
     await user.click((await screen.findAllByText("00000000-0000-0000-0000-000000000401"))[0]);
 
@@ -534,10 +603,41 @@ describe("termui web 工作台", () => {
     expect(screen.getByRole("button", { name: "Hide files panel" })).toBeInTheDocument();
   });
 
-  it("粘贴 QR payload 后会切换到 payload 内的 ws_url 和 token", async () => {
+  it("粘贴 QR payload 后会使用当前连接地址和 token", async () => {
     const user = userEvent.setup();
     render(<App />);
+    await setConnectionUrl(user, daemon.url);
 
+    const payload = JSON.stringify({
+      type: "termd_pairing_qr",
+      version: 1,
+      token: "secret-token",
+      server_id: daemon.serverId,
+      expires_at_ms: Date.now() + 60_000,
+    });
+    const inviteCode = `termd-pair:v1:${Buffer.from(payload, "utf8").toString("base64url")}`;
+
+    fireEvent.change(screen.getByLabelText("Pairing token"), { target: { value: inviteCode } });
+    await user.click(screen.getByRole("button", { name: "Pair" }));
+
+    await waitFor(() => expect(screen.queryByLabelText("Pairing token")).toBeNull());
+    expect(screen.queryByLabelText("WS URL")).toBeNull();
+    await screen.findByText(daemon.url);
+    await screen.findByText("Connected");
+    expect(daemon.outerWireText()).not.toContain("secret-token");
+  });
+
+  it("粘贴 relay base URL 邀请码时会 fallback 到 client URL", async () => {
+    const user = userEvent.setup();
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [],
+      relayClientPathOnly: true,
+    });
+    render(<App />);
+
+    const relayClientUrl = `${daemon.url}/${daemon.serverId}/client`;
     const payload = JSON.stringify({
       type: "termd_pairing_qr",
       version: 1,
@@ -548,14 +648,12 @@ describe("termui web 工作台", () => {
     });
     const inviteCode = `termd-pair:v1:${Buffer.from(payload, "utf8").toString("base64url")}`;
 
-    await user.clear(await screen.findByLabelText("WS URL"));
     fireEvent.change(screen.getByLabelText("Pairing token"), { target: { value: inviteCode } });
     await user.click(screen.getByRole("button", { name: "Pair" }));
 
     await waitFor(() => expect(screen.queryByLabelText("Pairing token")).toBeNull());
-    expect(screen.queryByLabelText("WS URL")).toBeNull();
-    await screen.findByText(daemon.url);
-    await screen.findAllByText(daemon.serverId);
+    await screen.findByText(relayClientUrl);
+    await screen.findByText("Connected");
     expect(daemon.outerWireText()).not.toContain("secret-token");
   });
 
@@ -573,8 +671,7 @@ describe("termui web 工作台", () => {
     });
     render(<App />);
 
-    await user.clear(await screen.findByLabelText("WS URL"));
-    await user.type(screen.getByLabelText("WS URL"), daemon.url);
+    await setConnectionUrl(user, daemon.url);
     await user.type(screen.getByLabelText("Pairing token"), "wrong-token");
     await user.click(screen.getByRole("button", { name: "Pair" }));
 
@@ -611,11 +708,10 @@ describe("termui web 工作台", () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await user.clear(await screen.findByLabelText("WS URL"));
-    await user.type(screen.getByLabelText("WS URL"), daemon.url);
+    await setConnectionUrl(user, daemon.url);
     await user.type(screen.getByLabelText("Pairing token"), "secret-token");
     await user.click(screen.getByRole("button", { name: "Pair" }));
-    await screen.findAllByText(daemon.serverId);
+    await screen.findByText("Connected");
     await user.click(await screen.findByRole("button", { name: "Refresh" }));
     await user.click((await screen.findAllByText("00000000-0000-0000-0000-000000000401"))[0]);
 
@@ -628,11 +724,10 @@ describe("termui web 工作台", () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await user.clear(await screen.findByLabelText("WS URL"));
-    await user.type(screen.getByLabelText("WS URL"), daemon.url);
+    await setConnectionUrl(user, daemon.url);
     await user.type(screen.getByLabelText("Pairing token"), "secret-token");
     await user.click(screen.getByRole("button", { name: "Pair" }));
-    await screen.findAllByText(daemon.serverId);
+    await screen.findByText("Connected");
     await user.click(screen.getByRole("button", { name: "Refresh" }));
 
     await user.click(await screen.findByRole("button", { name: "Rename session" }));
@@ -671,11 +766,10 @@ describe("termui web 工作台", () => {
     });
     render(<App />);
 
-    await user.clear(await screen.findByLabelText("WS URL"));
-    await user.type(screen.getByLabelText("WS URL"), daemon.url);
+    await setConnectionUrl(user, daemon.url);
     await user.type(screen.getByLabelText("Pairing token"), "secret-token");
     await user.click(screen.getByRole("button", { name: "Pair" }));
-    await screen.findAllByText(daemon.serverId);
+    await screen.findByText("Connected");
     await user.click(screen.getByRole("button", { name: "Refresh" }));
     await user.click((await screen.findAllByText("00000000-0000-0000-0000-000000000402"))[0]);
 
@@ -754,10 +848,14 @@ describe("termui web 工作台", () => {
     expect(daemon.outerWireText()).not.toContain("second-terminal-secret");
   });
 
-  it("未配对时只显示连接表单，并按当前页面来源推导 WebSocket 地址", async () => {
+  it("未配对时只显示连接表单，并按当前页面来源和前缀推导 WebSocket 地址", async () => {
+    const user = userEvent.setup();
     render(<App />);
 
-    await screen.findByLabelText("WS URL");
+    await screen.findByText(defaultWsUrlFromPage());
+    expect(screen.queryByLabelText("WS URL")).toBeNull();
+    await user.click(screen.getByRole("button", { name: "Edit address" }));
+    expect(await screen.findByLabelText("WS URL")).toHaveValue(defaultWsUrlFromPage());
     expect(screen.getByLabelText("Pairing token")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Scan QR" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "New session" })).toBeNull();
@@ -766,13 +864,84 @@ describe("termui web 工作台", () => {
       "ws://192.168.55.155:8765/ws",
     );
     expect(defaultWsUrlFromPage({ protocol: "https:", host: "example.test" })).toBe("wss://example.test/ws");
+    expect(defaultWsUrlFromPage({ protocol: "https:", host: "example.test", pathname: "/termd/" })).toBe(
+      "wss://example.test/termd/ws",
+    );
+    expect(defaultWsUrlFromPage({ protocol: "https:", host: "example.test", pathname: "/termd/index.html" })).toBe(
+      "wss://example.test/termd/ws",
+    );
     expect(
       browserReachableWsUrl("ws://127.0.0.1:8765/ws", {
         protocol: "http:",
         host: "192.168.55.155:8765",
         hostname: "192.168.55.155",
+        pathname: "/termd/",
       }),
-    ).toBe("ws://192.168.55.155:8765/ws");
+    ).toBe("ws://192.168.55.155:8765/termd/ws");
+  });
+
+  it("pairingWsUrlCandidates 会优先当前 Web 页面并补出 relay client URL", () => {
+    const serverId = "00000000-0000-0000-0000-000000000123";
+    const relayPage = {
+      protocol: "https:",
+      host: "relay.example",
+      hostname: "relay.example",
+      pathname: "/termd/",
+    };
+
+    expect(pairingWsUrlCandidates("wss://relay.example/termd/ws", serverId, relayPage)).toEqual([
+      "wss://relay.example/termd/ws",
+      "wss://relay.example/termd/ws/00000000-0000-0000-0000-000000000123/client",
+    ]);
+    expect(pairingWsUrlCandidates("wss://relay.example/termd/ws?relay_token=abc", serverId, relayPage)).toEqual([
+      "wss://relay.example/termd/ws",
+      "wss://relay.example/termd/ws/00000000-0000-0000-0000-000000000123/client?relay_token=abc",
+      "wss://relay.example/termd/ws?relay_token=abc",
+    ]);
+    expect(pairingWsUrlCandidates("wss://relay.example/termd/ws/00000000-0000-0000-0000-000000000123/client", serverId, relayPage)).toEqual([
+      "wss://relay.example/termd/ws",
+      "wss://relay.example/termd/ws/00000000-0000-0000-0000-000000000123/client",
+    ]);
+  });
+
+  it("移动端从 relay 页面扫描默认 localhost 邀请码时会生成 relay client 候选 URL", () => {
+    const serverId = "00000000-0000-0000-0000-000000000123";
+    const reachable = browserReachableWsUrl("ws://127.0.0.1:8765/ws", {
+      protocol: "https:",
+      host: "relay.example",
+      hostname: "relay.example",
+      pathname: "/relay/",
+    });
+
+    expect(reachable).toBe("wss://relay.example/relay/ws");
+    expect(pairingWsUrlCandidates("ws://127.0.0.1:8765/ws", serverId, {
+      protocol: "https:",
+      host: "relay.example",
+      hostname: "relay.example",
+      pathname: "/relay/",
+    })).toEqual([
+      "wss://relay.example/relay/ws",
+      "wss://relay.example/relay/ws/00000000-0000-0000-0000-000000000123/client",
+    ]);
+  });
+
+  it("同一个 invite 在 daemon Web 页面会优先尝试当前 daemon 直连地址", () => {
+    const serverId = "00000000-0000-0000-0000-000000000123";
+
+    expect(pairingWsUrlCandidates(
+      "wss://relay.example/ws/00000000-0000-0000-0000-000000000123/client?relay_token=abc",
+      serverId,
+      {
+        protocol: "http:",
+        host: "192.168.55.155:8765",
+        hostname: "192.168.55.155",
+        pathname: "/termd/",
+      },
+    )).toEqual([
+      "ws://192.168.55.155:8765/termd/ws",
+      "ws://192.168.55.155:8765/termd/ws/00000000-0000-0000-0000-000000000123/client?relay_token=abc",
+      "wss://relay.example/ws/00000000-0000-0000-0000-000000000123/client?relay_token=abc",
+    ]);
   });
 
   it("点击 Scan QR 后打开扫码 pairing 界面入口", async () => {
@@ -878,7 +1047,63 @@ describe("termui web 工作台", () => {
 
     await waitFor(() => expect(screen.queryByRole("dialog", { name: "Scan pairing QR" })).toBeNull());
     await waitFor(() => expect(screen.queryByLabelText("Pairing token")).toBeNull());
-    await screen.findAllByText(daemon.serverId);
+    await screen.findByText("Connected");
+    await screen.findByText(daemon.url);
+    expect(qrScannerMock.stop).toHaveBeenCalledTimes(1);
+    expect(daemon.outerWireText()).not.toContain("secret-token");
+  });
+
+  it("扫码无法识别时可在扫码弹窗粘贴 invite 完成配对", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    const payload = JSON.stringify({
+      type: "termd_pairing_qr",
+      version: 1,
+      ws_url: daemon.url,
+      token: "secret-token",
+      server_id: daemon.serverId,
+      expires_at_ms: Date.now() + 60_000,
+    });
+    const inviteCode = `termd-pair:v1:${Buffer.from(payload, "utf8").toString("base64url")}`;
+
+    await user.click(await screen.findByRole("button", { name: "Scan QR" }));
+    await screen.findByRole("dialog", { name: "Scan pairing QR" });
+
+    fireEvent.change(screen.getByLabelText("Invite code"), { target: { value: inviteCode } });
+    await user.click(screen.getByRole("button", { name: "Use invite" }));
+
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Scan pairing QR" })).toBeNull());
+    await waitFor(() => expect(screen.queryByLabelText("Pairing token")).toBeNull());
+    await screen.findByText("Connected");
+    await screen.findByText(daemon.url);
+    expect(qrScannerMock.stop).toHaveBeenCalledTimes(1);
+    expect(daemon.outerWireText()).not.toContain("secret-token");
+  });
+
+  it("扫码无法识别时可上传二维码图片解析 invite", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    const payload = JSON.stringify({
+      type: "termd_pairing_qr",
+      version: 1,
+      ws_url: daemon.url,
+      token: "secret-token",
+      server_id: daemon.serverId,
+      expires_at_ms: Date.now() + 60_000,
+    });
+    const inviteCode = `termd-pair:v1:${Buffer.from(payload, "utf8").toString("base64url")}`;
+    qrScannerMock.scanImage.mockResolvedValue({ data: inviteCode, cornerPoints: [] });
+
+    await user.click(await screen.findByRole("button", { name: "Scan QR" }));
+    await screen.findByRole("dialog", { name: "Scan pairing QR" });
+
+    const file = new File(["qr"], "pairing.png", { type: "image/png" });
+    fireEvent.change(screen.getByLabelText("Upload QR image"), { target: { files: [file] } });
+
+    await waitFor(() => expect(qrScannerMock.scanImage).toHaveBeenCalledWith(file, expect.objectContaining({ returnDetailedScanResult: true })));
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Scan pairing QR" })).toBeNull());
+    await waitFor(() => expect(screen.queryByLabelText("Pairing token")).toBeNull());
+    await screen.findByText("Connected");
     await screen.findByText(daemon.url);
     expect(qrScannerMock.stop).toHaveBeenCalledTimes(1);
     expect(daemon.outerWireText()).not.toContain("secret-token");

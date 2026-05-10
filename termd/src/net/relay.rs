@@ -173,6 +173,26 @@ impl RelayBaseUrl {
             None => base,
         }
     }
+
+    pub fn client_url_template(&self) -> String {
+        self.client_url_template_with_auth(None)
+    }
+
+    pub fn client_url_template_with_auth(&self, auth_token: Option<&str>) -> String {
+        let base = format!(
+            "{}://{}{}{{server_id}}/client",
+            self.scheme.as_str(),
+            self.authority,
+            self.base_path.daemon_mux_prefix()
+        );
+        match auth_token {
+            Some(auth_token) => format!(
+                "{base}?relay_token={}",
+                percent_encode_query_value(auth_token)
+            ),
+            None => base,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,33 +210,56 @@ impl RelayUrlScheme {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RelayBasePath {
-    DefaultWs,
-    ExplicitWs,
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RelayBasePath {
+    canonical_suffix: String,
+    route_prefix: String,
 }
 
 impl RelayBasePath {
     fn parse(raw_path: Option<&str>) -> Result<Self, RelayConnectorError> {
-        match raw_path {
-            None | Some("") => Ok(Self::DefaultWs),
-            Some("ws") | Some("ws/") => Ok(Self::ExplicitWs),
-            // relay base URL 只接受公开入口 path，避免误把完整 client/daemon 业务 path 当作 base。
-            Some(_) => Err(RelayConnectorError::UnsupportedUrl),
+        let Some(raw_path) = raw_path else {
+            return Ok(Self {
+                canonical_suffix: String::new(),
+                route_prefix: "/ws/".to_owned(),
+            });
+        };
+        let trimmed = raw_path.trim_matches('/');
+        if trimmed.is_empty() {
+            return Ok(Self {
+                canonical_suffix: String::new(),
+                route_prefix: "/ws/".to_owned(),
+            });
         }
+        if trimmed.contains("//")
+            || trimmed
+                .split('/')
+                .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+            || trimmed.ends_with("/client")
+            || trimmed.ends_with("/daemon")
+            || trimmed.ends_with("/daemon-mux")
+        {
+            return Err(RelayConnectorError::UnsupportedUrl);
+        }
+
+        // 允许 relay 被反向代理到公开前缀，例如 `/termd/ws`。
+        // 公开 base path 必须以 `ws` 结尾，避免把完整业务 path 误当成 relay base。
+        if trimmed != "ws" && !trimmed.ends_with("/ws") {
+            return Err(RelayConnectorError::UnsupportedUrl);
+        }
+
+        Ok(Self {
+            canonical_suffix: format!("/{trimmed}"),
+            route_prefix: format!("/{trimmed}/"),
+        })
     }
 
-    fn canonical_suffix(self) -> &'static str {
-        match self {
-            Self::DefaultWs => "",
-            Self::ExplicitWs => "/ws",
-        }
+    fn canonical_suffix(&self) -> &str {
+        &self.canonical_suffix
     }
 
-    fn daemon_mux_prefix(self) -> &'static str {
-        match self {
-            Self::DefaultWs | Self::ExplicitWs => "/ws/",
-        }
+    fn daemon_mux_prefix(&self) -> &str {
+        &self.route_prefix
     }
 }
 
@@ -762,20 +805,28 @@ mod tests {
     use axum::response::IntoResponse;
     use axum::routing::get;
     use futures_util::StreamExt;
+    use std::fs;
+    use std::path::PathBuf;
     use std::sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     };
     use std::time::Duration;
     use termd_proto::{Envelope, MessageType, PingPayload};
 
+    static TEST_STATE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
     fn test_protocol(name: &str) -> SharedDaemonProtocol {
-        default_protocol(DaemonConfig::default_for_state_path(
-            std::env::temp_dir().join(format!(
-                "termd-relay-test-{}-{}-{name}.json",
-                std::process::id(),
-                current_unix_timestamp_millis().0
-            )),
+        default_protocol(DaemonConfig::default_for_state_path(temp_state_path(name)))
+    }
+
+    fn temp_state_path(name: &str) -> PathBuf {
+        let counter = TEST_STATE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "termd-relay-test-{}-{}-{}-{name}.json",
+            std::process::id(),
+            current_unix_timestamp_millis().0,
+            counter
         ))
     }
 
@@ -811,6 +862,36 @@ mod tests {
         assert_eq!(
             base.daemon_mux_url(server_id),
             format!("wss://termd.yiln.de/ws/{}/daemon-mux", server_id.0)
+        );
+    }
+
+    #[test]
+    fn relay_base_url_builds_client_url_template() {
+        let base = RelayBaseUrl::parse("wss://termd.yiln.de/ws").unwrap();
+
+        assert_eq!(
+            base.client_url_template(),
+            "wss://termd.yiln.de/ws/{server_id}/client"
+        );
+        assert_eq!(
+            base.client_url_template_with_auth(Some("relay secret")),
+            "wss://termd.yiln.de/ws/{server_id}/client?relay_token=relay%20secret"
+        );
+    }
+
+    #[test]
+    fn relay_base_url_preserves_public_path_prefix() {
+        let server_id = ServerId::new();
+        let base = RelayBaseUrl::parse("wss://relay.example/termd/ws/").unwrap();
+
+        assert_eq!(base.canonical_url(), "wss://relay.example/termd/ws");
+        assert_eq!(
+            base.daemon_mux_url(server_id),
+            format!("wss://relay.example/termd/ws/{}/daemon-mux", server_id.0)
+        );
+        assert_eq!(
+            base.client_url_template(),
+            "wss://relay.example/termd/ws/{server_id}/client"
         );
     }
 
@@ -1281,7 +1362,19 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn relay_mux_pushes_file_tree_updates_without_client_poll_frame() {
-        let protocol = test_protocol("mux-file-tree-push");
+        let file_root = std::env::temp_dir().join(format!(
+            "termd-relay-file-tree-root-{}-{}",
+            std::process::id(),
+            TEST_STATE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&file_root).unwrap();
+        fs::write(file_root.join("alpha.txt"), b"alpha\n").unwrap();
+
+        let mut config =
+            DaemonConfig::default_for_state_path(temp_state_path("mux-file-tree-push-state"));
+        // 文件树推送测试不能读取共享 `/tmp`，否则会和并行测试清理临时文件产生竞态。
+        config.default_working_directory = Some(file_root.clone());
+        let protocol = default_protocol(config);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let base = RelayBaseUrl::parse(&format!("ws://{addr}")).unwrap();
@@ -1457,7 +1550,7 @@ mod tests {
                     MessageType::SessionFiles,
                     termd_proto::SessionFilesPayload {
                         session_id: created_payload.session_id,
-                        path: Some("/tmp".to_owned()),
+                        path: Some(file_root.to_string_lossy().to_string()),
                     },
                 )
                 .unwrap(),
@@ -1476,12 +1569,14 @@ mod tests {
                 &mut relay_socket,
                 client_id,
                 &mut device_e2ee,
-                "/tmp",
+                &file_root.to_string_lossy(),
             ),
         )
         .await
         .expect("relay mux should push file tree updates without client polling");
         assert_eq!(pushed.session_id, created_payload.session_id);
+
+        fs::remove_dir_all(file_root).ok();
 
         connector.abort();
     }

@@ -18,25 +18,30 @@ export function parsePairingQrPayload(raw: string): PairingQrPayload | undefined
     if (
       parsed.type !== PAIRING_QR_TYPE ||
       parsed.version !== 1 ||
-      typeof parsed.ws_url !== "string" ||
-      !isSupportedWsUrl(parsed.ws_url) ||
       typeof parsed.token !== "string" ||
       parsed.token.trim().length === 0 ||
       typeof parsed.server_id !== "string" ||
       !UUID_PATTERN.test(parsed.server_id) ||
-      typeof parsed.expires_at_ms !== "number"
+      typeof parsed.expires_at_ms !== "number" ||
+      (parsed.ws_url !== undefined &&
+        (typeof parsed.ws_url !== "string" || !isSupportedWsUrl(parsed.ws_url)))
     ) {
       return undefined;
     }
 
-    return {
+    const payload: PairingQrPayload = {
       type: PAIRING_QR_TYPE,
       version: 1,
-      ws_url: parsed.ws_url,
       token: parsed.token,
       server_id: parsed.server_id,
       expires_at_ms: parsed.expires_at_ms,
     };
+
+    if (parsed.ws_url) {
+      payload.ws_url = parsed.ws_url;
+    }
+
+    return payload;
   } catch {
     return undefined;
   }

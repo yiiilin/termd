@@ -9,6 +9,8 @@ const TERMINAL_PADDING_PX = 12;
 const TERMINAL_FRAME_BORDER_PX = 1;
 const TERMINAL_FRAME_CHROME_PX = TERMINAL_PADDING_PX * 2 + TERMINAL_FRAME_BORDER_PX * 2;
 const TERMINAL_LINE_HEIGHT = 1.45;
+const MIN_FOCUSED_RESIZE_ROWS = 6;
+const MIN_FOCUSED_RESIZE_COLS = 20;
 const VIEWER_ZOOM_STEP = 0.1;
 const VIEWER_MIN_ZOOM = 0.5;
 const VIEWER_MAX_ZOOM = 1.4;
@@ -175,14 +177,18 @@ export function TerminalPane(props: TerminalPaneProps) {
         }
       }
       applyFontSize(terminal, TERMINAL_FONT_SIZE);
-      fit.fit();
+      const hostWidth = terminalHost.clientWidth;
+      const hostHeight = terminalHost.clientHeight;
+      // 移动端软键盘或外层 grid 短暂重排时可能把 xterm 容器压到 0 高。
+      // 这种尺寸不能写回 shared PTY，否则其他客户端会被同步成一行终端。
       const proposed = fit.proposeDimensions();
-      if (proposed) {
+      if (proposed && proposed.rows >= MIN_FOCUSED_RESIZE_ROWS && proposed.cols >= MIN_FOCUSED_RESIZE_COLS) {
+        fit.fit();
         onResizeRef.current({
           rows: proposed.rows,
           cols: proposed.cols,
-          pixel_width: hostRef.current?.clientWidth ?? 0,
-          pixel_height: hostRef.current?.clientHeight ?? 0,
+          pixel_width: hostWidth,
+          pixel_height: hostHeight,
         });
         queueCursorReport();
       }

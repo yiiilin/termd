@@ -112,17 +112,27 @@ describe("协议类型", () => {
     expect("selection_start_row" in client).toBe(false);
   });
 
-  it("QR pairing payload 只在有效 JSON 且带 ws_url/token/server_id 时被识别", () => {
+  it("QR pairing payload 只在有效 JSON 且带 token/server_id 时被识别，ws_url 仅作旧版兼容", () => {
     const payload: PairingQrPayload = {
       type: "termd_pairing_qr",
       version: 1,
-      ws_url: "wss://relay.example/ws/00000000-0000-0000-0000-000000000001/client",
       token: "pair-token",
       server_id: "00000000-0000-0000-0000-000000000001",
       expires_at_ms: 1710000060000,
     };
 
     expect(parsePairingQrPayload(JSON.stringify(payload))).toEqual(payload);
+    expect(
+      parsePairingQrPayload(
+        JSON.stringify({
+          ...payload,
+          ws_url: "wss://relay.example/ws/00000000-0000-0000-0000-000000000001/client",
+        }),
+      ),
+    ).toMatchObject({
+      ...payload,
+      ws_url: "wss://relay.example/ws/00000000-0000-0000-0000-000000000001/client",
+    });
     expect(parsePairingQrPayload("plain-token")).toBeUndefined();
     expect(
       parsePairingQrPayload(
@@ -138,7 +148,6 @@ describe("协议类型", () => {
     const payload: PairingQrPayload = {
       type: "termd_pairing_qr",
       version: 1,
-      ws_url: "wss://relay.example/ws/00000000-0000-0000-0000-000000000001/client",
       token: "pair-token",
       server_id: "00000000-0000-0000-0000-000000000001",
       expires_at_ms: 1710000060000,

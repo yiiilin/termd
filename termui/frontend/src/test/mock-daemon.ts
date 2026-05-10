@@ -44,6 +44,7 @@ interface MockDaemonOptions {
   daemonClients?: DaemonClientSummaryPayload[];
   sessionFiles?: Record<UUID, SessionFilesResultPayload>;
   sessionFileReads?: Record<string, SessionFileReadResultPayload>;
+  relayClientPathOnly?: boolean;
 }
 
 interface TrustedDevice {
@@ -95,7 +96,7 @@ export class MockDaemon {
     await new Promise<void>((resolve) => server.once("listening", resolve));
     const address = server.address() as AddressInfo;
     const daemon = new MockDaemon(server, `ws://127.0.0.1:${address.port}/ws`, options);
-    server.on("connection", (socket) => daemon.accept(socket));
+    server.on("connection", (socket, request) => daemon.accept(socket, request.url ?? ""));
     return daemon;
   }
 
@@ -123,7 +124,13 @@ export class MockDaemon {
     });
   }
 
-  private accept(socket: WebSocket): void {
+  private accept(socket: WebSocket, requestPath: string): void {
+    if (this.options.relayClientPathOnly && requestPath !== `/ws/${this.serverId}/client`) {
+      // 测试 relay base URL 误用场景：/ws 不是 client socket，必须 fallback 到 /ws/<server_id>/client。
+      socket.close();
+      return;
+    }
+
     const connection: MockConnection = { socket };
     this.connections.add(connection);
     socket.on("close", () => this.connections.delete(connection));

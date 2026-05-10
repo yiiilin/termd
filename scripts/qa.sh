@@ -203,7 +203,8 @@ run_pairing_cli_e2e() (
 run_relay_runtime_e2e() (
   set -euo pipefail
 
-  local relay_port relay_addr temp_dir relay_pid daemon_pid token server_id relay_client_url state_path new_stdout list_stdout
+  local relay_port relay_addr temp_dir relay_pid daemon_pid token relay_client_url state_path new_stdout list_stdout
+  local pairing_payload
   relay_port="$(pick_free_port)"
   relay_addr="127.0.0.1:${relay_port}"
   temp_dir="$(mktemp -d)"
@@ -259,23 +260,34 @@ run_relay_runtime_e2e() (
     exit 1
   fi
 
-  token="$(cargo run -q -p termd -- pair --url http://127.0.0.1:8765 2>"$temp_dir/termd-pair.err")"
+  mapfile -t pairing_payload < <(python3 - <<'PY'
+import json
+import urllib.request
+
+# relay E2E 直接使用 daemon 本地 token 接口返回的 ws_url，验证使用者不需要手工拼 server_id。
+request = urllib.request.Request("http://127.0.0.1:8765/local/pairing-token", method="POST")
+with urllib.request.urlopen(request, timeout=2) as response:
+    payload = json.load(response)
+print(payload["token"])
+print(payload["ws_url"])
+PY
+)
+  token="${pairing_payload[0]:-}"
+  relay_client_url="${pairing_payload[1]:-}"
   case "$token" in
     termd-pair-*) ;;
     *)
-      printf '[termrelay] termd pair 输出不是预期 token 格式。\n' >&2
+      printf '[termrelay] daemon 本地 pairing 响应不是预期 token 格式。\n' >&2
       exit 1
       ;;
   esac
-
-  server_id="$(python3 - <<'PY'
-import json
-import urllib.request
-with urllib.request.urlopen("http://127.0.0.1:8765/healthz", timeout=2) as response:
-    print(json.load(response)["server_id"])
-PY
-)"
-  relay_client_url="ws://${relay_addr}/ws/${server_id}/client"
+  case "$relay_client_url" in
+    "ws://${relay_addr}/ws/"*"/client") ;;
+    *)
+      printf '[termrelay] daemon 本地 pairing 响应未返回 relay client URL: %s\n' "$relay_client_url" >&2
+      exit 1
+      ;;
+  esac
   state_path="$temp_dir/termctl-state.json"
 
   TERMD_CTL_STATE="$state_path" cargo run -q -p termctl -- pair --token "$token" --url "$relay_client_url" >"$temp_dir/termctl-pair.out" 2>"$temp_dir/termctl-pair.err"
