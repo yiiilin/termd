@@ -6,7 +6,10 @@ use std::sync::{Arc, Mutex};
 use axum::extract::ws::{Message, WebSocket};
 use base64::{Engine as _, engine::general_purpose};
 use futures_util::{SinkExt, StreamExt};
-use termd_proto::{RelayClientId, RelayMuxEnvelope, RelayOpaqueFrame, ServerId};
+use termd_proto::{
+    Envelope, MessageType, RelayClientId, RelayMuxEnvelope, RelayOpaqueFrame, RouteHelloPayload,
+    RouteReadyPayload, RouteRole, ServerId,
+};
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
@@ -19,9 +22,17 @@ type FrameSender = mpsc::Sender<OpaqueFrame>;
 /// relay 只区分连接方向，不表达 operator 或任何终端业务状态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionRole {
-    Daemon,
     DaemonMux,
     Client,
+}
+
+impl ConnectionRole {
+    fn from_route_role(role: RouteRole) -> Self {
+        match role {
+            RouteRole::Client => Self::Client,
+            RouteRole::DaemonMux => Self::DaemonMux,
+        }
+    }
 }
 
 /// 被转发的业务 frame。这里刻意只保留 text/binary 两类可原样转发的数据。
@@ -160,7 +171,6 @@ struct RelayRegistry {
 
 #[derive(Debug, Default)]
 struct RelayRoom {
-    daemon: Option<ConnectionEndpoint>,
     daemon_mux: Option<ConnectionEndpoint>,
     clients: HashMap<ConnectionId, ConnectionEndpoint>,
 }
@@ -187,12 +197,10 @@ pub struct ForwardReport {
 
 #[derive(Debug, Error, PartialEq, Eq)]
 enum RelayError {
-    #[error("daemon already connected for server_id")]
-    DuplicateDaemon,
     #[error("daemon mux already connected for server_id")]
     DuplicateDaemonMux,
-    #[error("daemon is not connected for server_id")]
-    DaemonOffline,
+    #[error("daemon mux is not connected for server_id")]
+    DaemonMuxOffline,
     #[error("relay state mutex poisoned")]
     Poisoned,
 }
@@ -201,6 +209,27 @@ enum RelayError {
 enum RelayMuxFrameError {
     #[error("relay mux frame binary payload is not valid base64")]
     InvalidBase64(#[source] base64::DecodeError),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RoutePrelude {
+    server_id: ServerId,
+    route_role: RouteRole,
+    connection_role: ConnectionRole,
+}
+
+#[derive(Debug, Error)]
+enum RoutePreludeError {
+    #[error("relay websocket closed before route_hello")]
+    Closed,
+    #[error("relay websocket receive failed during route prelude: {0}")]
+    Receive(#[source] axum::Error),
+    #[error("relay websocket send failed during route prelude: {0}")]
+    Send(#[source] axum::Error),
+    #[error("route prelude JSON is invalid: {0}")]
+    InvalidJson(#[from] serde_json::Error),
+    #[error("expected route_hello as first envelope, got {0:?}")]
+    UnexpectedType(MessageType),
 }
 
 impl RelayRegistry {
@@ -221,13 +250,6 @@ impl RelayRegistry {
         let mut rooms = self.rooms.lock().map_err(|_| RelayError::Poisoned)?;
 
         match role {
-            ConnectionRole::Daemon => {
-                let room = rooms.entry(server_id).or_default();
-                if room.daemon.is_some() {
-                    return Err(RelayError::DuplicateDaemon);
-                }
-                room.daemon = Some(ConnectionEndpoint { id, sender });
-            }
             ConnectionRole::DaemonMux => {
                 let room = rooms.entry(server_id).or_default();
                 if room.daemon_mux.is_some() {
@@ -236,9 +258,11 @@ impl RelayRegistry {
                 room.daemon_mux = Some(ConnectionEndpoint { id, sender });
             }
             ConnectionRole::Client => {
-                let room = rooms.get_mut(&server_id).ok_or(RelayError::DaemonOffline)?;
-                if room.daemon.is_none() && room.daemon_mux.is_none() {
-                    return Err(RelayError::DaemonOffline);
+                let room = rooms
+                    .get_mut(&server_id)
+                    .ok_or(RelayError::DaemonMuxOffline)?;
+                if room.daemon_mux.is_none() {
+                    return Err(RelayError::DaemonMuxOffline);
                 }
                 room.clients.insert(id, ConnectionEndpoint { id, sender });
             }
@@ -262,15 +286,6 @@ impl RelayRegistry {
         };
 
         match registration.role {
-            ConnectionRole::Daemon => {
-                if room
-                    .daemon
-                    .as_ref()
-                    .is_some_and(|daemon| daemon.id == registration.id)
-                {
-                    room.daemon = None;
-                }
-            }
             ConnectionRole::DaemonMux => {
                 if room
                     .daemon_mux
@@ -291,7 +306,7 @@ impl RelayRegistry {
             }
         }
 
-        if room.daemon.is_none() && room.daemon_mux.is_none() && room.clients.is_empty() {
+        if room.daemon_mux.is_none() && room.clients.is_empty() {
             rooms.remove(&registration.server_id);
         }
     }
@@ -302,63 +317,8 @@ impl RelayRegistry {
         frame: OpaqueFrame,
     ) -> ForwardReport {
         match registration.role {
-            ConnectionRole::Daemon => self.forward_to_clients(registration.server_id, frame),
             ConnectionRole::DaemonMux => self.forward_mux_to_client(registration.server_id, frame),
             ConnectionRole::Client => self.forward_client_to_mux_daemon(registration, frame),
-        }
-    }
-
-    fn forward_to_clients(&self, server_id: ServerId, frame: OpaqueFrame) -> ForwardReport {
-        let Ok(mut rooms) = self.rooms.lock() else {
-            warn!("relay registry mutex poisoned during daemon fanout");
-            return ForwardReport {
-                attempted: 0,
-                delivered: 0,
-                dropped: 0,
-            };
-        };
-
-        let Some(room) = rooms.get_mut(&server_id) else {
-            return ForwardReport {
-                attempted: 0,
-                delivered: 0,
-                dropped: 0,
-            };
-        };
-
-        let attempted = room.clients.len();
-        let mut delivered = 0;
-        let mut dropped_ids = Vec::new();
-
-        for (client_id, client) in &room.clients {
-            match client.sender.try_send(frame.clone()) {
-                Ok(()) => delivered += 1,
-                Err(error) => {
-                    warn!(
-                        server_id = %server_id.0,
-                        connection_id = *client_id,
-                        frame_kind = frame.kind(),
-                        frame_len = frame.len(),
-                        %error,
-                        "dropping slow relay client"
-                    );
-                    dropped_ids.push(*client_id);
-                }
-            }
-        }
-
-        for client_id in &dropped_ids {
-            room.clients.remove(client_id);
-        }
-
-        if room.daemon.is_none() && room.daemon_mux.is_none() && room.clients.is_empty() {
-            rooms.remove(&server_id);
-        }
-
-        ForwardReport {
-            attempted,
-            delivered,
-            dropped: dropped_ids.len(),
         }
     }
 
@@ -385,7 +345,11 @@ impl RelayRegistry {
         };
 
         let Some(daemon_mux) = room.daemon_mux.as_ref() else {
-            return self.forward_to_daemon_locked(room, registration.server_id, frame);
+            return ForwardReport {
+                attempted: 0,
+                delivered: 0,
+                dropped: 0,
+            };
         };
 
         let envelope = RelayMuxEnvelope::ClientFrame {
@@ -406,45 +370,6 @@ impl RelayRegistry {
                     "dropping offline relay daemon mux"
                 );
                 room.daemon_mux = None;
-                ForwardReport {
-                    attempted: 1,
-                    delivered: 0,
-                    dropped: 1,
-                }
-            }
-        }
-    }
-
-    fn forward_to_daemon_locked(
-        &self,
-        room: &mut RelayRoom,
-        server_id: ServerId,
-        frame: OpaqueFrame,
-    ) -> ForwardReport {
-        let Some(daemon) = room.daemon.as_ref() else {
-            return ForwardReport {
-                attempted: 0,
-                delivered: 0,
-                dropped: 0,
-            };
-        };
-
-        match daemon.sender.try_send(frame.clone()) {
-            Ok(()) => ForwardReport {
-                attempted: 1,
-                delivered: 1,
-                dropped: 0,
-            },
-            Err(error) => {
-                warn!(
-                    server_id = %server_id.0,
-                    connection_id = daemon.id,
-                    frame_kind = frame.kind(),
-                    frame_len = frame.len(),
-                    %error,
-                    "dropping offline relay daemon"
-                );
-                room.daemon = None;
                 ForwardReport {
                     attempted: 1,
                     delivered: 0,
@@ -538,12 +463,17 @@ impl RelayRegistry {
     }
 }
 
-pub async fn handle_socket(
-    socket: WebSocket,
-    state: RelayState,
-    server_id: ServerId,
-    role: ConnectionRole,
-) {
+pub async fn handle_socket(mut socket: WebSocket, state: RelayState) {
+    // Only the first frame is public routing metadata; payload frames after this stay opaque.
+    let prelude = match read_route_prelude(&mut socket).await {
+        Ok(prelude) => prelude,
+        Err(error) => {
+            warn!(%error, "rejecting relay websocket before route registration");
+            return;
+        }
+    };
+    let server_id = prelude.server_id;
+    let role = prelude.connection_role;
     let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
     let registration = match state.register(server_id, role, tx) {
         Ok(registration) => registration,
@@ -552,6 +482,12 @@ pub async fn handle_socket(
             return;
         }
     };
+
+    if let Err(error) = send_route_ready(&mut socket, &prelude).await {
+        warn!(server_id = %server_id.0, ?role, %error, "relay websocket route_ready failed");
+        state.unregister(&registration);
+        return;
+    }
 
     if role == ConnectionRole::Client {
         notify_mux_client_connected(&state, &registration);
@@ -613,6 +549,71 @@ pub async fn handle_socket(
         connection_id = registration.id,
         "relay websocket unregistered"
     );
+}
+
+async fn read_route_prelude(socket: &mut WebSocket) -> Result<RoutePrelude, RoutePreludeError> {
+    loop {
+        let Some(message) = socket.next().await else {
+            return Err(RoutePreludeError::Closed);
+        };
+        let message = message.map_err(RoutePreludeError::Receive)?;
+
+        match message {
+            Message::Text(raw) => return decode_route_prelude_from_str(&raw),
+            Message::Binary(raw) => return decode_route_prelude_from_slice(&raw),
+            Message::Ping(payload) => socket
+                .send(Message::Pong(payload))
+                .await
+                .map_err(RoutePreludeError::Send)?,
+            Message::Pong(_) => {}
+            Message::Close(_) => return Err(RoutePreludeError::Closed),
+        }
+    }
+}
+
+fn decode_route_prelude_from_str(raw: &str) -> Result<RoutePrelude, RoutePreludeError> {
+    let envelope = serde_json::from_str::<Envelope<RouteHelloPayload>>(raw)?;
+    decode_route_prelude(envelope)
+}
+
+fn decode_route_prelude_from_slice(raw: &[u8]) -> Result<RoutePrelude, RoutePreludeError> {
+    let envelope = serde_json::from_slice::<Envelope<RouteHelloPayload>>(raw)?;
+    decode_route_prelude(envelope)
+}
+
+fn decode_route_prelude(
+    envelope: Envelope<RouteHelloPayload>,
+) -> Result<RoutePrelude, RoutePreludeError> {
+    if envelope.kind != MessageType::RouteHello {
+        return Err(RoutePreludeError::UnexpectedType(envelope.kind));
+    }
+
+    // protocol_version, nonce, and timestamp_ms are carried for the protocol edge;
+    // relay only uses server_id and role to place this socket into a route room.
+    let route_role = envelope.payload.role;
+    Ok(RoutePrelude {
+        server_id: envelope.payload.server_id,
+        route_role,
+        connection_role: ConnectionRole::from_route_role(route_role),
+    })
+}
+
+async fn send_route_ready(
+    socket: &mut WebSocket,
+    prelude: &RoutePrelude,
+) -> Result<(), RoutePreludeError> {
+    let ready = Envelope::new(
+        MessageType::RouteReady,
+        RouteReadyPayload {
+            server_id: prelude.server_id,
+            role: prelude.route_role,
+        },
+    );
+    let raw = serde_json::to_string(&ready)?;
+    socket
+        .send(Message::Text(raw))
+        .await
+        .map_err(RoutePreludeError::Send)
 }
 
 async fn handle_inbound_message(
@@ -690,15 +691,15 @@ mod tests {
     }
 
     #[test]
-    fn room_registers_one_daemon_and_many_clients() {
+    fn room_registers_one_daemon_mux_and_many_clients() {
         let state = RelayState::default();
         let server_id = server_id(1);
-        let (daemon_tx, _daemon_rx) = channel();
+        let (mux_tx, _mux_rx) = channel();
         let (client_a_tx, _client_a_rx) = channel();
         let (client_b_tx, _client_b_rx) = channel();
 
         state
-            .register(server_id, ConnectionRole::Daemon, daemon_tx)
+            .register(server_id, ConnectionRole::DaemonMux, mux_tx)
             .unwrap();
         state
             .register(server_id, ConnectionRole::Client, client_a_tx)
@@ -711,24 +712,24 @@ mod tests {
     }
 
     #[test]
-    fn room_rejects_duplicate_daemon() {
+    fn room_rejects_duplicate_daemon_mux() {
         let state = RelayState::default();
         let server_id = server_id(1);
         let (first_tx, _first_rx) = channel();
         let (second_tx, _second_rx) = channel();
 
         state
-            .register(server_id, ConnectionRole::Daemon, first_tx)
+            .register(server_id, ConnectionRole::DaemonMux, first_tx)
             .unwrap();
         let error = state
-            .register(server_id, ConnectionRole::Daemon, second_tx)
+            .register(server_id, ConnectionRole::DaemonMux, second_tx)
             .unwrap_err();
 
-        assert_eq!(error, RelayError::DuplicateDaemon);
+        assert_eq!(error, RelayError::DuplicateDaemonMux);
     }
 
     #[test]
-    fn room_rejects_client_when_daemon_is_offline() {
+    fn room_rejects_client_when_daemon_mux_is_offline() {
         let state = RelayState::default();
         let (client_tx, _client_rx) = channel();
 
@@ -736,64 +737,62 @@ mod tests {
             .register(server_id(1), ConnectionRole::Client, client_tx)
             .unwrap_err();
 
-        assert_eq!(error, RelayError::DaemonOffline);
+        assert_eq!(error, RelayError::DaemonMuxOffline);
     }
 
     #[test]
-    fn daemon_fanout_sends_text_and_binary_to_all_clients() {
+    fn client_frames_are_wrapped_for_daemon_mux() {
         let state = RelayState::default();
         let server_id = server_id(1);
-        let (daemon_tx, _daemon_rx) = channel();
-        let (client_a_tx, mut client_a_rx) = channel();
-        let (client_b_tx, mut client_b_rx) = channel();
+        let (mux_tx, mut mux_rx) = channel();
+        let (client_tx, _client_rx) = channel();
 
-        let daemon = state
-            .register(server_id, ConnectionRole::Daemon, daemon_tx)
-            .unwrap();
         state
-            .register(server_id, ConnectionRole::Client, client_a_tx)
+            .register(server_id, ConnectionRole::DaemonMux, mux_tx)
             .unwrap();
-        state
-            .register(server_id, ConnectionRole::Client, client_b_tx)
+        let client = state
+            .register(server_id, ConnectionRole::Client, client_tx)
             .unwrap();
 
-        let text_report = state.forward_from(&daemon, OpaqueFrame::Text("{not-json".to_owned()));
-        let binary_report = state.forward_from(&daemon, OpaqueFrame::Binary(vec![1, 2, 3]));
+        let text_report = state.forward_from(&client, OpaqueFrame::Text("{not-json".to_owned()));
+        let binary_report = state.forward_from(&client, OpaqueFrame::Binary(vec![1, 2, 3]));
 
-        assert_eq!(text_report.delivered, 2);
-        assert_eq!(binary_report.delivered, 2);
+        assert_eq!(text_report.delivered, 1);
+        assert_eq!(binary_report.delivered, 1);
         assert_eq!(
-            client_a_rx.try_recv().unwrap(),
-            OpaqueFrame::Text("{not-json".to_owned())
+            decode_mux(mux_rx.try_recv().unwrap()),
+            RelayMuxEnvelope::ClientFrame {
+                client_id: RelayClientId(client.id),
+                frame: RelayOpaqueFrame::Text {
+                    data: "{not-json".to_owned(),
+                },
+            }
         );
         assert_eq!(
-            client_a_rx.try_recv().unwrap(),
-            OpaqueFrame::Binary(vec![1, 2, 3])
-        );
-        assert_eq!(
-            client_b_rx.try_recv().unwrap(),
-            OpaqueFrame::Text("{not-json".to_owned())
-        );
-        assert_eq!(
-            client_b_rx.try_recv().unwrap(),
-            OpaqueFrame::Binary(vec![1, 2, 3])
+            decode_mux(mux_rx.try_recv().unwrap()),
+            RelayMuxEnvelope::ClientFrame {
+                client_id: RelayClientId(client.id),
+                frame: RelayOpaqueFrame::Binary {
+                    data_base64: "AQID".to_owned(),
+                },
+            }
         );
     }
 
     #[test]
-    fn client_frame_goes_only_to_matching_daemon() {
+    fn client_frame_goes_only_to_matching_daemon_mux() {
         let state = RelayState::default();
         let server_a = server_id(1);
         let server_b = server_id(2);
-        let (daemon_a_tx, mut daemon_a_rx) = channel();
-        let (daemon_b_tx, mut daemon_b_rx) = channel();
+        let (mux_a_tx, mut mux_a_rx) = channel();
+        let (mux_b_tx, mut mux_b_rx) = channel();
         let (client_a_tx, _client_a_rx) = channel();
 
         state
-            .register(server_a, ConnectionRole::Daemon, daemon_a_tx)
+            .register(server_a, ConnectionRole::DaemonMux, mux_a_tx)
             .unwrap();
         state
-            .register(server_b, ConnectionRole::Daemon, daemon_b_tx)
+            .register(server_b, ConnectionRole::DaemonMux, mux_b_tx)
             .unwrap();
         let client_a = state
             .register(server_a, ConnectionRole::Client, client_a_tx)
@@ -803,10 +802,15 @@ mod tests {
 
         assert_eq!(report.delivered, 1);
         assert_eq!(
-            daemon_a_rx.try_recv().unwrap(),
-            OpaqueFrame::Text("opaque".to_owned())
+            decode_mux(mux_a_rx.try_recv().unwrap()),
+            RelayMuxEnvelope::ClientFrame {
+                client_id: RelayClientId(client_a.id),
+                frame: RelayOpaqueFrame::Text {
+                    data: "opaque".to_owned(),
+                },
+            }
         );
-        assert_eq!(daemon_b_rx.try_recv().unwrap_err(), TryRecvError::Empty);
+        assert_eq!(mux_b_rx.try_recv().unwrap_err(), TryRecvError::Empty);
     }
 
     #[test]
@@ -895,17 +899,17 @@ mod tests {
         let state = RelayState::default();
         let server_a = server_id(1);
         let server_b = server_id(2);
-        let (daemon_a_tx, _daemon_a_rx) = channel();
-        let (daemon_b_tx, _daemon_b_rx) = channel();
+        let (mux_a_tx, _mux_a_rx) = channel();
+        let (mux_b_tx, _mux_b_rx) = channel();
 
-        let daemon_a = state
-            .register(server_a, ConnectionRole::Daemon, daemon_a_tx)
+        let daemon_mux_a = state
+            .register(server_a, ConnectionRole::DaemonMux, mux_a_tx)
             .unwrap();
         state
-            .register(server_b, ConnectionRole::Daemon, daemon_b_tx)
+            .register(server_b, ConnectionRole::DaemonMux, mux_b_tx)
             .unwrap();
 
-        state.unregister(&daemon_a);
+        state.unregister(&daemon_mux_a);
 
         assert_eq!(state.room_count(), 1);
     }

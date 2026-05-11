@@ -47,11 +47,54 @@ async function setConnectionUrl(user: ReturnType<typeof userEvent.setup>, url: s
   await user.type(input, url);
 }
 
+function setViewportWidth(width: number): void {
+  Object.defineProperty(window, "innerWidth", {
+    configurable: true,
+    value: width,
+    writable: true,
+  });
+  Object.defineProperty(window, "matchMedia", {
+    configurable: true,
+    value: undefined,
+    writable: true,
+  });
+  window.dispatchEvent(new Event("resize"));
+}
+
+function pairingInviteCode(
+  daemon: MockDaemon,
+  token = "secret-token",
+  options: { serverId?: string; wsUrl?: string } = {},
+): string {
+  const payload = JSON.stringify({
+    type: "termd_pairing_qr",
+    version: 1,
+    ...(options.wsUrl === undefined ? {} : { ws_url: options.wsUrl }),
+    token,
+    server_id: options.serverId ?? daemon.serverId,
+    expires_at_ms: Date.now() + 60_000,
+  });
+  return `termd-pair:v1:${Buffer.from(payload, "utf8").toString("base64url")}`;
+}
+
+async function pairWithInvite(
+  user: ReturnType<typeof userEvent.setup>,
+  daemon: MockDaemon,
+  token = "secret-token",
+): Promise<void> {
+  await setConnectionUrl(user, daemon.url);
+  fireEvent.change(screen.getByLabelText("Pairing token"), {
+    target: { value: pairingInviteCode(daemon, token) },
+  });
+  await user.click(screen.getByRole("button", { name: "Pair" }));
+}
+
 describe("termui web 工作台", () => {
   let daemon: MockDaemon;
 
   beforeEach(async () => {
     await clearBrowserState();
+    setViewportWidth(1366);
     qrScannerMock.destroy.mockClear();
     qrScannerMock.hasCamera.mockReset();
     qrScannerMock.hasCamera.mockResolvedValue(true);
@@ -81,9 +124,7 @@ describe("termui web 工作台", () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await setConnectionUrl(user, daemon.url);
-    await user.type(screen.getByLabelText("Pairing token"), "secret-token");
-    await user.click(screen.getByRole("button", { name: "Pair" }));
+    await pairWithInvite(user, daemon);
 
     await waitFor(() => expect(screen.queryByLabelText("Pairing token")).toBeNull());
     await screen.findByText("Connected");
@@ -99,16 +140,75 @@ describe("termui web 工作台", () => {
     expect(daemon.outerWireText()).not.toContain("secret-token");
   });
 
-  it("已配对后可以把连接地址改成 relay client URL", async () => {
+  it("移动端顶部菜单会打开 connection、sessions 和 files 全屏面板", async () => {
+    setViewportWidth(390);
+    const user = userEvent.setup();
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await screen.findByText("paired daemon");
+    expect(screen.queryByRole("navigation", { name: "mobile workspace menu" })).toBeNull();
+    expect(screen.queryByRole("navigation", { name: "mobile workspace actions" })).toBeNull();
+
+    await user.click(screen.getByRole("button", { name: "Open mobile workspace menu" }));
+    const menu = await screen.findByRole("navigation", { name: "mobile workspace menu" });
+    expect(within(menu).getByRole("button", { name: "Connection" })).toBeEnabled();
+    expect(within(menu).getByRole("button", { name: "Sessions" })).toBeEnabled();
+    expect(within(menu).getByRole("button", { name: "Files" })).toBeDisabled();
+    expect(within(menu).getByRole("button", { name: "New" })).toBeEnabled();
+    expect(within(menu).queryByRole("button", { name: "Refresh sessions" })).toBeNull();
+
+    await within(menu).getByRole("button", { name: "Connection" }).click();
+    const connectionPanel = await screen.findByLabelText("connection panel");
+    expect(within(connectionPanel).getByLabelText("connection status")).toBeVisible();
+    await user.click(within(connectionPanel).getByRole("button", { name: "Manage daemons" }));
+    expect(within(connectionPanel).getByLabelText("daemon manager")).toBeVisible();
+    await user.click(within(connectionPanel).getByRole("button", { name: "Close connection panel" }));
+
+    await user.click(screen.getByRole("button", { name: "Open mobile workspace menu" }));
+    const sessionsMenu = await screen.findByRole("navigation", { name: "mobile workspace menu" });
+    await within(sessionsMenu).getByRole("button", { name: "Sessions" }).click();
+    const sessionsPanel = await screen.findByLabelText("sessions panel");
+    const refreshSessions = within(sessionsPanel).getByRole("button", { name: "Refresh sessions" });
+    await expect(refreshSessions).toBeEnabled();
+    await user.click(refreshSessions);
+    const sessionRows = await screen.findAllByText("00000000-0000-0000-0000-000000000401");
+    const sessionRow = sessionRows.find((node) => node.closest('[aria-label="sessions panel"]'));
+    expect(sessionRow).toBeTruthy();
+    await user.click(sessionRow as HTMLElement);
+
+    await screen.findByText(/termd-e2e-ready/);
+    await user.click(screen.getByRole("button", { name: "Open mobile workspace menu" }));
+    const secondMenu = await screen.findByRole("navigation", { name: "mobile workspace menu" });
+    expect(within(secondMenu).getByRole("button", { name: "Files" })).toBeEnabled();
+
+    await within(secondMenu).getByRole("button", { name: "Files" }).click();
+    const filesPanel = screen.getByLabelText("session files");
+    await expect(filesPanel).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Hide files panel" }));
+    await expect(screen.queryByLabelText("session files")).toBeNull();
+  });
+
+  it("未保存 daemon 时手动 token 不会猜测 server_id", async () => {
     const user = userEvent.setup();
     render(<App />);
 
     await setConnectionUrl(user, daemon.url);
     await user.type(screen.getByLabelText("Pairing token"), "secret-token");
     await user.click(screen.getByRole("button", { name: "Pair" }));
+
+    await screen.findByText("pairing_server_unknown: pairing requires a known daemon server id");
+    expect(daemon.outerWireLog).toEqual([]);
+  });
+
+  it("已配对后可以把连接地址改成 relay /ws URL", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
     await screen.findByText("Connected");
 
-    const relayUrl = `${daemon.url.replace("/ws", `/ws/${daemon.serverId}/client`)}?relay_token=relay-secret`;
+    const relayUrl = `${daemon.url}?relay_token=relay-secret`;
     await user.click(screen.getByRole("button", { name: "Edit connection" }));
     await setConnectionUrl(user, relayUrl);
     await user.click(screen.getByRole("button", { name: "Save URL" }));
@@ -134,14 +234,18 @@ describe("termui web 工作台", () => {
 
     try {
       await setConnectionUrl(user, daemon.url);
-      await user.type(screen.getByLabelText("Pairing token"), "secret-token");
+      fireEvent.change(screen.getByLabelText("Pairing token"), {
+        target: { value: pairingInviteCode(daemon) },
+      });
       await user.click(screen.getByRole("button", { name: "Pair" }));
       await screen.findByText("Connected");
 
       await user.click(screen.getByRole("button", { name: "Edit connection" }));
       await setConnectionUrl(user, secondDaemon.url);
       await user.clear(screen.getByLabelText("Pairing token"));
-      await user.type(screen.getByLabelText("Pairing token"), "second-token");
+      fireEvent.change(screen.getByLabelText("Pairing token"), {
+        target: { value: pairingInviteCode(secondDaemon, "second-token") },
+      });
       await user.click(screen.getByRole("button", { name: "Pair" }));
       await screen.findByText(secondDaemon.url);
 
@@ -160,6 +264,56 @@ describe("termui web 工作台", () => {
     }
   });
 
+  it("daemon 管理面支持重命名和删除 daemon", async () => {
+    const user = userEvent.setup();
+    const secondDaemon = await MockDaemon.start({
+      token: "second-token",
+      sessions: [],
+    });
+    render(<App />);
+
+    try {
+      await pairWithInvite(user, daemon);
+      await screen.findByText("Connected");
+
+      await user.click(screen.getByRole("button", { name: "Edit connection" }));
+      await setConnectionUrl(user, secondDaemon.url);
+      fireEvent.change(screen.getByLabelText("Pairing token"), {
+        target: { value: pairingInviteCode(secondDaemon, "second-token") },
+      });
+      await user.click(screen.getByRole("button", { name: "Pair" }));
+      await screen.findByText(secondDaemon.url);
+
+      await user.click(screen.getByRole("button", { name: "Manage daemons" }));
+      const manager = await screen.findByLabelText("daemon manager");
+      expect(within(manager).getByText(daemon.url)).toBeInTheDocument();
+      expect(within(manager).getByText(secondDaemon.url)).toBeInTheDocument();
+
+      await user.click(within(manager).getAllByRole("button", { name: /Rename daemon/ })[1]);
+      const nameInput = within(manager).getByLabelText("Daemon name");
+      await user.clear(nameInput);
+      await user.type(nameInput, "Laptop relay");
+      await user.click(within(manager).getByRole("button", { name: "Save daemon name" }));
+
+      await within(manager).findByText("Laptop relay");
+      expect(screen.getByLabelText("Daemon")).toHaveValue(secondDaemon.serverId);
+
+      await user.click(within(manager).getByRole("button", { name: /Delete daemon Laptop relay/ }));
+      const afterDeleteManager = await screen.findByLabelText("daemon manager");
+      expect(within(afterDeleteManager).getByText(daemon.url)).toBeInTheDocument();
+      await waitFor(() => expect(screen.queryByText("Laptop relay")).toBeNull());
+
+      const remainingManager = afterDeleteManager;
+      await user.click(within(remainingManager).getByRole("button", { name: /Delete daemon/ }));
+
+      await waitFor(() => expect(screen.queryByLabelText("daemon manager")).toBeNull());
+      expect(await screen.findByLabelText("Pairing token")).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "New session" })).toBeNull();
+    } finally {
+      await secondDaemon.stop();
+    }
+  });
+
   it("配对候选 URL 会跳过 server_id 不匹配的 daemon", async () => {
     const secondDaemon = await MockDaemon.start({
       token: "second-token",
@@ -169,8 +323,8 @@ describe("termui web 工作台", () => {
     try {
       const { client, effectiveUrl } = await connectPairingClient(
         [daemon.url, secondDaemon.url],
-        "00000000-0000-0000-0000-000000000999",
         secondDaemon.serverId,
+        "00000000-0000-0000-0000-000000000999",
       );
 
       expect(effectiveUrl).toBe(secondDaemon.url);
@@ -185,9 +339,7 @@ describe("termui web 工作台", () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await setConnectionUrl(user, daemon.url);
-    await user.type(screen.getByLabelText("Pairing token"), "secret-token");
-    await user.click(screen.getByRole("button", { name: "Pair" }));
+    await pairWithInvite(user, daemon);
     await screen.findByText("Connected");
     await user.click(screen.getByRole("button", { name: "Refresh" }));
 
@@ -210,9 +362,7 @@ describe("termui web 工作台", () => {
     });
     render(<App />);
 
-    await setConnectionUrl(user, daemon.url);
-    await user.type(screen.getByLabelText("Pairing token"), "secret-token");
-    await user.click(screen.getByRole("button", { name: "Pair" }));
+    await pairWithInvite(user, daemon);
     await screen.findByText("Connected");
 
     expect(screen.queryByLabelText("Command")).toBeNull();
@@ -297,9 +447,7 @@ describe("termui web 工作台", () => {
     });
     render(<App />);
 
-    await setConnectionUrl(user, daemon.url);
-    await user.type(screen.getByLabelText("Pairing token"), "secret-token");
-    await user.click(screen.getByRole("button", { name: "Pair" }));
+    await pairWithInvite(user, daemon);
     await screen.findByText("Connected");
     await user.click(screen.getByRole("button", { name: "Refresh" }));
     await user.click((await screen.findAllByText(sessionId))[0]);
@@ -407,9 +555,7 @@ describe("termui web 工作台", () => {
     });
     render(<App />);
 
-    await setConnectionUrl(user, daemon.url);
-    await user.type(screen.getByLabelText("Pairing token"), "secret-token");
-    await user.click(screen.getByRole("button", { name: "Pair" }));
+    await pairWithInvite(user, daemon);
     await screen.findByText("Connected");
     await user.click(screen.getByRole("button", { name: "Refresh" }));
     await user.click((await screen.findAllByText(sessionId))[0]);
@@ -459,9 +605,7 @@ describe("termui web 工作台", () => {
     });
     render(<App />);
 
-    await setConnectionUrl(user, daemon.url);
-    await user.type(screen.getByLabelText("Pairing token"), "secret-token");
-    await user.click(screen.getByRole("button", { name: "Pair" }));
+    await pairWithInvite(user, daemon);
     await screen.findByText("Connected");
     await user.click(screen.getByRole("button", { name: "Refresh" }));
     await user.click((await screen.findAllByText(sessionId))[0]);
@@ -526,9 +670,7 @@ describe("termui web 工作台", () => {
     });
     render(<App />);
 
-    await setConnectionUrl(user, daemon.url);
-    await user.type(screen.getByLabelText("Pairing token"), "secret-token");
-    await user.click(screen.getByRole("button", { name: "Pair" }));
+    await pairWithInvite(user, daemon);
     await screen.findByText("Connected");
     await user.click(screen.getByRole("button", { name: "Refresh" }));
     await user.click((await screen.findAllByText("00000000-0000-0000-0000-000000000410"))[0]);
@@ -556,9 +698,7 @@ describe("termui web 工作台", () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await setConnectionUrl(user, daemon.url);
-    await user.type(screen.getByLabelText("Pairing token"), "secret-token");
-    await user.click(screen.getByRole("button", { name: "Pair" }));
+    await pairWithInvite(user, daemon);
     await screen.findByText("Connected");
     await user.click(screen.getByRole("button", { name: "Refresh" }));
 
@@ -573,9 +713,7 @@ describe("termui web 工作台", () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await setConnectionUrl(user, daemon.url);
-    await user.type(screen.getByLabelText("Pairing token"), "secret-token");
-    await user.click(screen.getByRole("button", { name: "Pair" }));
+    await pairWithInvite(user, daemon);
     await screen.findByText("Connected");
     await user.click(screen.getByRole("button", { name: "Refresh" }));
     await user.click((await screen.findAllByText("00000000-0000-0000-0000-000000000401"))[0]);
@@ -627,7 +765,7 @@ describe("termui web 工作台", () => {
     expect(daemon.outerWireText()).not.toContain("secret-token");
   });
 
-  it("粘贴 relay base URL 邀请码时会 fallback 到 client URL", async () => {
+  it("粘贴 relay base URL 邀请码时使用统一 /ws URL", async () => {
     const user = userEvent.setup();
     await daemon.stop();
     daemon = await MockDaemon.start({
@@ -637,7 +775,7 @@ describe("termui web 工作台", () => {
     });
     render(<App />);
 
-    const relayClientUrl = `${daemon.url}/${daemon.serverId}/client`;
+    const relayUrl = daemon.url;
     const payload = JSON.stringify({
       type: "termd_pairing_qr",
       version: 1,
@@ -652,7 +790,7 @@ describe("termui web 工作台", () => {
     await user.click(screen.getByRole("button", { name: "Pair" }));
 
     await waitFor(() => expect(screen.queryByLabelText("Pairing token")).toBeNull());
-    await screen.findByText(relayClientUrl);
+    await screen.findByText(relayUrl);
     await screen.findByText("Connected");
     expect(daemon.outerWireText()).not.toContain("secret-token");
   });
@@ -672,7 +810,9 @@ describe("termui web 工作台", () => {
     render(<App />);
 
     await setConnectionUrl(user, daemon.url);
-    await user.type(screen.getByLabelText("Pairing token"), "wrong-token");
+    fireEvent.change(screen.getByLabelText("Pairing token"), {
+      target: { value: pairingInviteCode(daemon, "wrong-token") },
+    });
     await user.click(screen.getByRole("button", { name: "Pair" }));
 
     await waitFor(() => expect(screen.getByLabelText("Pairing token")).toHaveValue(""));
@@ -708,9 +848,7 @@ describe("termui web 工作台", () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await setConnectionUrl(user, daemon.url);
-    await user.type(screen.getByLabelText("Pairing token"), "secret-token");
-    await user.click(screen.getByRole("button", { name: "Pair" }));
+    await pairWithInvite(user, daemon);
     await screen.findByText("Connected");
     await user.click(await screen.findByRole("button", { name: "Refresh" }));
     await user.click((await screen.findAllByText("00000000-0000-0000-0000-000000000401"))[0]);
@@ -724,9 +862,7 @@ describe("termui web 工作台", () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await setConnectionUrl(user, daemon.url);
-    await user.type(screen.getByLabelText("Pairing token"), "secret-token");
-    await user.click(screen.getByRole("button", { name: "Pair" }));
+    await pairWithInvite(user, daemon);
     await screen.findByText("Connected");
     await user.click(screen.getByRole("button", { name: "Refresh" }));
 
@@ -766,9 +902,7 @@ describe("termui web 工作台", () => {
     });
     render(<App />);
 
-    await setConnectionUrl(user, daemon.url);
-    await user.type(screen.getByLabelText("Pairing token"), "secret-token");
-    await user.click(screen.getByRole("button", { name: "Pair" }));
+    await pairWithInvite(user, daemon);
     await screen.findByText("Connected");
     await user.click(screen.getByRole("button", { name: "Refresh" }));
     await user.click((await screen.findAllByText("00000000-0000-0000-0000-000000000402"))[0]);
@@ -778,7 +912,7 @@ describe("termui web 工作台", () => {
       terminalInput = document.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
       expect(terminalInput).not.toBeNull();
     });
-    expect(screen.getByTestId("terminal-pane")).toHaveAttribute("data-viewer-mode", "true");
+    await waitFor(() => expect(screen.getByTestId("terminal-pane")).toHaveAttribute("data-viewer-mode", "true"));
     await within(screen.getByLabelText("viewer controls")).findByText("100x30");
     const viewerFrame = document.querySelector<HTMLElement>(".terminal-pane-viewer .terminal-viewer-frame");
     expect(viewerFrame).not.toBeNull();
@@ -793,6 +927,12 @@ describe("termui web 工作台", () => {
       }),
     );
     expect(daemon.sessionResizes).toEqual([]);
+    await user.click(screen.getByRole("button", { name: "Zoom out" }));
+    await screen.findByText("90%");
+    expect(screen.getByTestId("terminal-pane")).toHaveAttribute("data-viewer-mode", "true");
+    await user.click(screen.getByRole("button", { name: "Fit" }));
+    await screen.findByText("100%");
+    expect(screen.getByTestId("terminal-pane")).toHaveAttribute("data-viewer-mode", "true");
 
     terminalInput!.focus();
     await waitFor(() => expect(screen.getByTestId("terminal-pane")).toHaveAttribute("data-viewer-mode", "false"));
@@ -833,19 +973,44 @@ describe("termui web 工作台", () => {
     const viewerCanvas = document.querySelector<HTMLElement>(".terminal-viewer-canvas");
     expect(viewerCanvas).not.toBeNull();
     await user.click(viewerCanvas!);
-    expect(screen.getByTestId("terminal-pane")).toHaveAttribute("data-viewer-mode", "true");
+    expect(screen.getByTestId("terminal-pane")).toHaveAttribute("data-viewer-mode", "false");
     expect(daemon.sessionResizes).toHaveLength(resizeCountAfterBlur);
-    await screen.findByRole("button", { name: "Zoom out" });
-    await user.click(screen.getByRole("button", { name: "Zoom out" }));
-    await screen.findByText("90%");
-    expect(screen.getByTestId("terminal-pane")).toHaveAttribute("data-viewer-mode", "true");
-    await user.click(screen.getByRole("button", { name: "Fit" }));
-    await screen.findByText("100%");
-    expect(screen.getByTestId("terminal-pane")).toHaveAttribute("data-viewer-mode", "true");
+    expect(screen.queryByLabelText("viewer controls")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Zoom out" })).toBeNull();
     fireEvent(window, new Event("resize"));
     expect(daemon.sessionResizes).toHaveLength(resizeCountAfterBlur);
     expect(daemon.outerWireText()).not.toContain("first-terminal-secret");
     expect(daemon.outerWireText()).not.toContain("second-terminal-secret");
+  });
+
+  it("session 分辨率与当前客户端一致时不显示虚线框和缩放按钮", async () => {
+    const user = userEvent.setup();
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [
+        {
+          session_id: "00000000-0000-0000-0000-000000000403",
+          state: "running",
+          size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+        },
+      ],
+    });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await screen.findByText("Connected");
+    await user.click(screen.getByRole("button", { name: "Refresh" }));
+    await user.click((await screen.findAllByText("00000000-0000-0000-0000-000000000403"))[0]);
+
+    await waitFor(() => {
+      expect(document.querySelector(".xterm-helper-textarea")).not.toBeNull();
+    });
+    await new Promise((resolve) => window.setTimeout(resolve, 80));
+
+    expect(screen.getByTestId("terminal-pane")).toHaveAttribute("data-viewer-mode", "false");
+    expect(screen.queryByLabelText("viewer controls")).toBeNull();
+    expect(document.querySelector(".terminal-pane-viewer .terminal-viewer-frame")).toBeNull();
   });
 
   it("未配对时只显示连接表单，并按当前页面来源和前缀推导 WebSocket 地址", async () => {
@@ -880,7 +1045,7 @@ describe("termui web 工作台", () => {
     ).toBe("ws://192.168.55.155:8765/termd/ws");
   });
 
-  it("pairingWsUrlCandidates 会优先当前 Web 页面并补出 relay client URL", () => {
+  it("pairingWsUrlCandidates 会优先当前 Web 页面并统一到 /ws", () => {
     const serverId = "00000000-0000-0000-0000-000000000123";
     const relayPage = {
       protocol: "https:",
@@ -891,20 +1056,16 @@ describe("termui web 工作台", () => {
 
     expect(pairingWsUrlCandidates("wss://relay.example/termd/ws", serverId, relayPage)).toEqual([
       "wss://relay.example/termd/ws",
-      "wss://relay.example/termd/ws/00000000-0000-0000-0000-000000000123/client",
     ]);
     expect(pairingWsUrlCandidates("wss://relay.example/termd/ws?relay_token=abc", serverId, relayPage)).toEqual([
-      "wss://relay.example/termd/ws",
-      "wss://relay.example/termd/ws/00000000-0000-0000-0000-000000000123/client?relay_token=abc",
       "wss://relay.example/termd/ws?relay_token=abc",
     ]);
     expect(pairingWsUrlCandidates("wss://relay.example/termd/ws/00000000-0000-0000-0000-000000000123/client", serverId, relayPage)).toEqual([
       "wss://relay.example/termd/ws",
-      "wss://relay.example/termd/ws/00000000-0000-0000-0000-000000000123/client",
     ]);
   });
 
-  it("移动端从 relay 页面扫描默认 localhost 邀请码时会生成 relay client 候选 URL", () => {
+  it("移动端从 relay 页面扫描默认 localhost 邀请码时会生成统一 /ws 候选 URL", () => {
     const serverId = "00000000-0000-0000-0000-000000000123";
     const reachable = browserReachableWsUrl("ws://127.0.0.1:8765/ws", {
       protocol: "https:",
@@ -921,7 +1082,6 @@ describe("termui web 工作台", () => {
       pathname: "/relay/",
     })).toEqual([
       "wss://relay.example/relay/ws",
-      "wss://relay.example/relay/ws/00000000-0000-0000-0000-000000000123/client",
     ]);
   });
 
@@ -938,9 +1098,8 @@ describe("termui web 工作台", () => {
         pathname: "/termd/",
       },
     )).toEqual([
-      "ws://192.168.55.155:8765/termd/ws",
-      "ws://192.168.55.155:8765/termd/ws/00000000-0000-0000-0000-000000000123/client?relay_token=abc",
-      "wss://relay.example/ws/00000000-0000-0000-0000-000000000123/client?relay_token=abc",
+      "ws://192.168.55.155:8765/termd/ws?relay_token=abc",
+      "wss://relay.example/ws?relay_token=abc",
     ]);
   });
 

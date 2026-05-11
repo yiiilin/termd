@@ -13,6 +13,7 @@ import type {
   Envelope,
   ErrorPayload,
   PairRequestPayload,
+  RouteHelloPayload,
   SessionCreatePayload,
   SessionCreatedPayload,
   SessionCursorPayload,
@@ -54,6 +55,7 @@ interface TrustedDevice {
 
 interface MockConnection {
   socket: WebSocket;
+  routed: boolean;
   deviceId?: UUID;
   e2ee?: E2eeSession;
 }
@@ -125,35 +127,16 @@ export class MockDaemon {
   }
 
   private accept(socket: WebSocket, requestPath: string): void {
-    if (this.options.relayClientPathOnly && requestPath !== `/ws/${this.serverId}/client`) {
-      // 测试 relay base URL 误用场景：/ws 不是 client socket，必须 fallback 到 /ws/<server_id>/client。
+    const pathname = requestPath.split("?")[0] || requestPath;
+    if (this.options.relayClientPathOnly && pathname !== "/ws") {
+      // 旧版 path-based client URL 已移除；mock 用这个开关确保前端只连接统一 /ws 入口。
       socket.close();
       return;
     }
 
-    const connection: MockConnection = { socket };
+    const connection: MockConnection = { socket, routed: false };
     this.connections.add(connection);
     socket.on("close", () => this.connections.delete(connection));
-    this.sendOuter(
-      socket,
-      envelope("hello", {
-        protocol_version: 1,
-        nonce: nonce(),
-        timestamp_ms: nowMs(),
-        server_id: this.serverId,
-        device_id: null,
-      }),
-    );
-    this.sendOuter(
-      socket,
-      envelope("e2ee_key_exchange", {
-        server_id: this.serverId,
-        device_id: randomUuid(),
-        public_key: this.e2eeKeypair.publicKeyWire,
-        nonce: nonce(),
-        timestamp_ms: nowMs(),
-      }),
-    );
 
     socket.on("message", (raw) => {
       void this.handleOuter(connection, raw.toString());
@@ -163,6 +146,11 @@ export class MockDaemon {
   private async handleOuter(connection: MockConnection, raw: string): Promise<void> {
     this.outerWireLog.push(raw);
     const outer = parseEnvelope(raw);
+
+    if (!connection.routed) {
+      this.handleRoutePrelude(connection, outer);
+      return;
+    }
 
     if (outer.type === "e2ee_key_exchange") {
       const payload = outer.payload as E2eeKeyExchangePayload;
@@ -194,6 +182,48 @@ export class MockDaemon {
 
     const inner = connection.e2ee.decryptJson(outer.payload as EncryptedFramePayload);
     await this.handleInner(connection, inner);
+  }
+
+  private handleRoutePrelude(connection: MockConnection, outer: Envelope): void {
+    if (outer.type !== "route_hello") {
+      this.sendError(connection, "invalid_route_prelude", "invalid route prelude");
+      return;
+    }
+
+    const payload = outer.payload as RouteHelloPayload;
+    if (payload.server_id !== this.serverId || payload.role !== "client" || payload.protocol_version !== 1) {
+      this.sendError(connection, "invalid_route_prelude", "invalid route prelude");
+      return;
+    }
+
+    connection.routed = true;
+    this.sendOuter(
+      connection.socket,
+      envelope("route_ready", {
+        server_id: this.serverId,
+        role: "client",
+      }),
+    );
+    this.sendOuter(
+      connection.socket,
+      envelope("hello", {
+        protocol_version: 1,
+        nonce: nonce(),
+        timestamp_ms: nowMs(),
+        server_id: this.serverId,
+        device_id: null,
+      }),
+    );
+    this.sendOuter(
+      connection.socket,
+      envelope("e2ee_key_exchange", {
+        server_id: this.serverId,
+        device_id: randomUuid(),
+        public_key: this.e2eeKeypair.publicKeyWire,
+        nonce: nonce(),
+        timestamp_ms: nowMs(),
+      }),
+    );
   }
 
   private async handleInner(connection: MockConnection, inner: Envelope): Promise<void> {

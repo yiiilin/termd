@@ -27,6 +27,8 @@ impl<P> Envelope<P> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageType {
+    RouteHello,
+    RouteReady,
     Hello,
     Auth,
     AuthChallenge,
@@ -220,6 +222,36 @@ pub struct PairingToken(pub String);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct UnixTimestampMillis(pub u64);
+
+/// WebSocket 建立后的明文路由角色。
+///
+/// 这里只表达连接方向：relay 据此把连接放进对应 server_id 的房间；daemon 直连只接受
+/// `client`。它不是终端 operator / viewer 权限模型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteRole {
+    Client,
+    DaemonMux,
+}
+
+/// WebSocket 第一帧路由前置握手。
+///
+/// 该消息只携带公开的 server_id 和连接方向，不携带 pairing token、session 数据或认证签名。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouteHelloPayload {
+    pub server_id: ServerId,
+    pub role: RouteRole,
+    pub protocol_version: ProtocolVersion,
+    pub nonce: Nonce,
+    pub timestamp_ms: UnixTimestampMillis,
+}
+
+/// routing prelude 通过后返回的确认消息。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouteReadyPayload {
+    pub server_id: ServerId,
+    pub role: RouteRole,
+}
 
 /// hello 交换只表达身份、版本和防重放材料，不做认证决策。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -673,6 +705,8 @@ mod tests {
     #[test]
     fn all_message_types_use_snake_case_wire_names() {
         let cases = [
+            (MessageType::RouteHello, "route_hello"),
+            (MessageType::RouteReady, "route_ready"),
             (MessageType::Hello, "hello"),
             (MessageType::Auth, "auth"),
             (MessageType::AuthChallenge, "auth_challenge"),
@@ -747,6 +781,11 @@ mod tests {
             serde_json::to_value(AttachRole::Operator).unwrap(),
             "operator"
         );
+        assert_eq!(serde_json::to_value(RouteRole::Client).unwrap(), "client");
+        assert_eq!(
+            serde_json::to_value(RouteRole::DaemonMux).unwrap(),
+            "daemon_mux"
+        );
     }
 
     #[test]
@@ -777,6 +816,37 @@ mod tests {
         assert_eq!(json["type"], "session_resize");
         assert_eq!(json["payload"]["size"]["rows"], 40);
         assert_eq!(json["payload"]["size"]["cols"], 120);
+    }
+
+    #[test]
+    fn route_prelude_payloads_roundtrip_without_secrets() {
+        let server_id = ServerId::new();
+        let route_hello = Envelope::new(
+            MessageType::RouteHello,
+            RouteHelloPayload {
+                server_id,
+                role: RouteRole::Client,
+                protocol_version: ProtocolVersion::default(),
+                nonce: Nonce("route-nonce".to_owned()),
+                timestamp_ms: UnixTimestampMillis(1_710_000_000_000),
+            },
+        );
+        let route_ready = Envelope::new(
+            MessageType::RouteReady,
+            RouteReadyPayload {
+                server_id,
+                role: RouteRole::Client,
+            },
+        );
+        let json = serde_json::to_value(&route_hello).unwrap();
+        let raw = json.to_string();
+
+        assert_eq!(json["type"], "route_hello");
+        assert_eq!(json["payload"]["role"], "client");
+        assert!(json["payload"].get("token").is_none());
+        assert!(!raw.contains("pair"));
+        assert_roundtrip(route_hello);
+        assert_roundtrip(route_ready);
     }
 
     #[test]

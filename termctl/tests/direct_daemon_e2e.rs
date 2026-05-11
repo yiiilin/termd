@@ -9,6 +9,7 @@ use tempfile::TempDir;
 use termd::auth::current_unix_timestamp_millis;
 use termd::config::DaemonConfig;
 use termd::net::server::{DefaultDaemonProtocol, serve_listener};
+use termd_proto::{PairingQrPayload, ServerId};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
@@ -50,6 +51,33 @@ impl TestDaemon {
             _state_dir: state_dir,
             task,
         }
+    }
+
+    fn issue_pairing_invite(&self) -> String {
+        let mut protocol = self
+            .protocol
+            .lock()
+            .expect("daemon protocol mutex should not be poisoned");
+        let server_id = protocol.server_id();
+        let record = protocol
+            .issue_pairing_token(current_unix_timestamp_millis())
+            .expect("pairing token should be issued");
+
+        PairingQrPayload::new(record.token().clone(), server_id, record.expires_at_ms())
+            .to_invite_code()
+    }
+
+    fn issue_pairing_invite_for_server(&self, server_id: ServerId) -> String {
+        let mut protocol = self
+            .protocol
+            .lock()
+            .expect("daemon protocol mutex should not be poisoned");
+        let record = protocol
+            .issue_pairing_token(current_unix_timestamp_millis())
+            .expect("pairing token should be issued");
+
+        PairingQrPayload::new(record.token().clone(), server_id, record.expires_at_ms())
+            .to_invite_code()
     }
 
     fn issue_pairing_token(&self) -> String {
@@ -106,26 +134,49 @@ async fn direct_termctl_binary_covers_session_flow_and_invariants() {
     let paired_state = temp.path().join("paired-state.json");
     let unpaired_state = temp.path().join("unpaired-state.json");
 
-    let bad_pair = run_termctl_failure(
+    let bad_token_only_pair = run_termctl_failure(
         &paired_state,
         &["pair", "--token", "wrong-token", "--url", &daemon.url],
     );
-    let bad_pair_stderr = stderr_string(&bad_pair);
-    assert!(bad_pair_stderr.contains("pairing_failed"));
-    assert!(!bad_pair_stderr.contains("wrong-token"));
+    let bad_token_only_stderr = stderr_string(&bad_token_only_pair);
+    assert!(bad_token_only_stderr.contains("missing_route_server_id"));
+    assert!(!bad_token_only_stderr.contains("wrong-token"));
 
-    let token = daemon.issue_pairing_token();
+    let wrong_route_invite = daemon.issue_pairing_invite_for_server(ServerId::new());
+    let wrong_route_pair = run_termctl_failure(
+        &paired_state,
+        &[
+            "pair",
+            "--payload",
+            &wrong_route_invite,
+            "--url",
+            &daemon.url,
+        ],
+    );
+    let wrong_route_stderr = stderr_string(&wrong_route_pair);
+    assert!(wrong_route_stderr.contains("invalid_envelope"));
+    assert!(!wrong_route_stderr.contains("termd-pair"));
+
+    let invite = daemon.issue_pairing_invite();
     let pair = run_termctl_success(
         &paired_state,
-        &["pair", "--token", &token, "--url", &daemon.url],
+        &["pair", "--payload", &invite, "--url", &daemon.url],
     );
     assert!(stdout_string(&pair).contains("paired server="));
 
     let state_after_pair =
         fs::read_to_string(&paired_state).expect("paired state should be readable");
-    assert!(!state_after_pair.contains(&token));
+    assert!(!state_after_pair.contains("termd-pair"));
     assert!(!state_after_pair.contains("pairing_token"));
     assert!(!state_after_pair.contains("server_private_key"));
+
+    let bad_known_pair = run_termctl_failure(
+        &paired_state,
+        &["pair", "--token", "wrong-token", "--url", &daemon.url],
+    );
+    let bad_known_pair_stderr = stderr_string(&bad_known_pair);
+    assert!(bad_known_pair_stderr.contains("pairing_failed"));
+    assert!(!bad_known_pair_stderr.contains("wrong-token"));
 
     let second_token = daemon.issue_pairing_token();
     let second_pair = run_termctl_success(
@@ -140,7 +191,7 @@ async fn direct_termctl_binary_covers_session_flow_and_invariants() {
     );
     let unpaired_stderr = stderr_string(&unpaired_new);
     assert!(unpaired_stderr.contains("missing_pairing"));
-    assert!(!unpaired_stderr.contains(&token));
+    assert!(!unpaired_stderr.contains("termd-pair"));
     assert!(!unpaired_stderr.contains(TERMD_READY_SENTINEL));
 
     let command = format!("printf {TERMD_READY_SENTINEL}; sleep 5");
@@ -193,7 +244,7 @@ async fn direct_termctl_binary_covers_session_flow_and_invariants() {
 
     let state_after_session =
         fs::read_to_string(&paired_state).expect("paired state should remain readable");
-    assert!(!state_after_session.contains(&token));
+    assert!(!state_after_session.contains("termd-pair"));
     assert!(!state_after_session.contains("server_private_key"));
     assert!(!state_after_session.contains(TERMD_READY_SENTINEL));
 }

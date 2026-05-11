@@ -14,7 +14,7 @@ use uuid::Uuid;
 use crate::client::DirectClient;
 use crate::crypto;
 use crate::error::{Result, TermctlError};
-use crate::state::{TermctlState, resolve_state_path};
+use crate::state::{TermctlState, normalize_ws_url, resolve_state_path};
 use termd_proto::{
     AttachRole, ErrorPayload, MessageType, PairingQrPayload, ServerId, SessionDataPayload,
     SessionId, SessionState, TerminalSize,
@@ -57,8 +57,8 @@ pub struct PairArgs {
     pub token: Option<String>,
     #[arg(long, help = "Pairing invite code or legacy JSON payload")]
     pub payload: Option<String>,
-    #[arg(long, default_value = DEFAULT_URL)]
-    pub url: String,
+    #[arg(long)]
+    pub url: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -107,19 +107,18 @@ pub async fn run(cli: Cli) -> Result<()> {
 }
 
 async fn pair(args: PairArgs, state_path: PathBuf) -> Result<()> {
-    let input = PairingInput::from_args(args)?;
     let mut state = TermctlState::load(&state_path)?;
+    let input = PairingInput::from_args(args, &state)?;
     let device = state.ensure_device();
-    let mut client = DirectClient::connect(&input.url, device.device_id).await?;
-    if let Some(expected_server_id) = input.server_id {
-        if client.server_id() != expected_server_id {
-            drop(client);
-            return Err(TermctlError::PairingPayloadServerMismatch);
-        }
-    }
+    let mut client =
+        DirectClient::connect(&input.url, input.route_server_id, device.device_id).await?;
     let accepted = client
         .pair(device.device_public_key.clone(), input.token)
         .await?;
+    if accepted.server_id != input.route_server_id {
+        drop(client);
+        return Err(TermctlError::PairingPayloadServerMismatch);
+    }
 
     state.record_pairing(accepted.clone(), input.url);
     state.save(&state_path)?;
@@ -130,30 +129,34 @@ async fn pair(args: PairArgs, state_path: PathBuf) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug)]
 struct PairingInput {
     token: String,
     url: String,
-    server_id: Option<ServerId>,
+    route_server_id: ServerId,
 }
 
 impl PairingInput {
-    fn from_args(args: PairArgs) -> Result<Self> {
+    fn from_args(args: PairArgs, state: &TermctlState) -> Result<Self> {
         if let Some(raw_payload) = args.payload {
             let payload = parse_pairing_payload(&raw_payload)?;
-            // 新版 invite 不再内嵌地址；有地址时沿用 invite，没有时回退到 CLI/default URL。
-            let url = payload.ws_url.unwrap_or(args.url);
+            let url = pairing_payload_url(payload.ws_url.as_deref(), args.url.as_deref())?;
             return Ok(Self {
                 token: payload.token.0,
                 url,
-                server_id: Some(payload.server_id),
+                route_server_id: payload.server_id,
             });
         }
 
         let token = args.token.ok_or(TermctlError::InvalidPairingPayload)?;
+        let route_server_id = state
+            .selected_route_server_id()
+            .ok_or(TermctlError::MissingRouteServerId)?;
+        let url = state.selected_url_for_server(route_server_id, args.url.as_deref())?;
         Ok(Self {
             token,
-            url: args.url,
-            server_id: None,
+            url,
+            route_server_id,
         })
     }
 }
@@ -167,7 +170,7 @@ fn parse_pairing_payload(raw_payload: &str) -> Result<PairingQrPayload> {
         || payload
             .ws_url
             .as_deref()
-            .is_some_and(|ws_url| !is_supported_ws_url(ws_url))
+            .is_some_and(|ws_url| normalize_ws_url(ws_url).is_none())
     {
         return Err(TermctlError::InvalidPairingPayload);
     }
@@ -175,10 +178,14 @@ fn parse_pairing_payload(raw_payload: &str) -> Result<PairingQrPayload> {
     Ok(payload)
 }
 
-fn is_supported_ws_url(value: &str) -> bool {
-    (value.starts_with("ws://") || value.starts_with("wss://"))
-        && !value.chars().any(char::is_whitespace)
-        && !value.contains('#')
+fn pairing_payload_url(
+    payload_ws_url: Option<&str>,
+    requested_url: Option<&str>,
+) -> Result<String> {
+    // 新 invite 主要由 server_id 定位 daemon；URL 只描述传输入口。旧 invite 的 ws_url
+    // 仍可作为兼容回退，但会先收敛到统一 `/ws`，避免继续连接旧 `/client` 路径。
+    let url = requested_url.or(payload_ws_url).unwrap_or(DEFAULT_URL);
+    normalize_ws_url(url).ok_or(TermctlError::InvalidPairingPayload)
 }
 
 async fn new_session(args: NewArgs, state_path: PathBuf) -> Result<()> {
@@ -274,14 +281,12 @@ async fn connect_authenticated(
 ) -> Result<DirectClient> {
     let state = TermctlState::load(state_path)?;
     let device = state.require_device()?;
-    let url = state.selected_url(requested_url);
-    let mut client = DirectClient::connect(&url, device.device_id).await?;
-    let paired_server = state
-        .paired_server(client.server_id())
-        .ok_or(TermctlError::NotPaired)?;
+    let target = state.selected_paired_target(requested_url)?;
     let signing_key = crypto::decode_signing_key(&device.device_signing_key_secret)?;
+    let mut client =
+        DirectClient::connect(&target.url, target.server.server_id, device.device_id).await?;
 
-    client.authenticate(&signing_key, &paired_server).await?;
+    client.authenticate(&signing_key, &target.server).await?;
     Ok(client)
 }
 
@@ -398,7 +403,7 @@ mod tests {
             Command::Pair(args) => {
                 assert_eq!(args.token.as_deref(), Some("termd-pair-redacted"));
                 assert_eq!(args.payload, None);
-                assert_eq!(args.url, DEFAULT_URL);
+                assert_eq!(args.url.as_deref(), Some("ws://127.0.0.1:8765/ws"));
             }
             _ => panic!("expected pair command"),
         }
@@ -424,6 +429,8 @@ mod tests {
 
     #[test]
     fn parses_pair_command_with_payload_and_falls_back_to_default_url_when_missing_ws_url() {
+        let server_id =
+            ServerId(uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap());
         let payload = "{\"type\":\"termd_pairing_qr\",\"version\":1,\"token\":\"pair-token\",\"server_id\":\"00000000-0000-0000-0000-000000000001\",\"expires_at_ms\":1710000060000}";
         let payload = format!(
             "termd-pair:v1:{}",
@@ -432,12 +439,89 @@ mod tests {
         let args = PairArgs {
             token: None,
             payload: Some(payload),
-            url: DEFAULT_URL.to_owned(),
+            url: None,
+        };
+        let state = TermctlState::default();
+
+        let input = PairingInput::from_args(args, &state).unwrap();
+        assert_eq!(input.url, DEFAULT_URL);
+        assert_eq!(input.route_server_id, server_id);
+    }
+
+    #[test]
+    fn pairing_payload_legacy_ws_url_is_normalized_to_unified_ws_endpoint() {
+        let payload = "{\"type\":\"termd_pairing_qr\",\"version\":1,\"token\":\"pair-token\",\"server_id\":\"00000000-0000-0000-0000-000000000001\",\"expires_at_ms\":1710000060000,\"ws_url\":\"wss://relay.example/termd/ws/00000000-0000-0000-0000-000000000001/client?relay_token=redacted\"}";
+        let payload = format!(
+            "termd-pair:v1:{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload)
+        );
+        let args = PairArgs {
+            token: None,
+            payload: Some(payload),
+            url: None,
+        };
+        let state = TermctlState::default();
+
+        let input = PairingInput::from_args(args, &state).unwrap();
+
+        assert_eq!(
+            input.url,
+            "wss://relay.example/termd/ws?relay_token=redacted"
+        );
+    }
+
+    #[test]
+    fn explicit_pair_url_overrides_legacy_payload_ws_url() {
+        let payload = "{\"type\":\"termd_pairing_qr\",\"version\":1,\"token\":\"pair-token\",\"server_id\":\"00000000-0000-0000-0000-000000000001\",\"expires_at_ms\":1710000060000,\"ws_url\":\"wss://legacy.example/ws/00000000-0000-0000-0000-000000000001/client\"}";
+        let payload = format!(
+            "termd-pair:v1:{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload)
+        );
+        let args = PairArgs {
+            token: None,
+            payload: Some(payload),
+            url: Some("wss://relay.example/ws".to_owned()),
+        };
+        let state = TermctlState::default();
+
+        let input = PairingInput::from_args(args, &state).unwrap();
+
+        assert_eq!(input.url, "wss://relay.example/ws");
+    }
+
+    #[test]
+    fn token_only_pairing_requires_known_route_server_id() {
+        let args = PairArgs {
+            token: Some("pair-token".to_owned()),
+            payload: None,
+            url: None,
+        };
+        let state = TermctlState::default();
+
+        assert!(matches!(
+            PairingInput::from_args(args, &state).unwrap_err(),
+            TermctlError::MissingRouteServerId
+        ));
+    }
+
+    #[test]
+    fn token_only_pairing_uses_known_daemon_route_and_url() {
+        let server_id = ServerId::new();
+        let args = PairArgs {
+            token: Some("pair-token".to_owned()),
+            payload: None,
+            url: None,
+        };
+        let state = TermctlState {
+            default_server_id: Some(server_id),
+            default_url: Some(format!("ws://127.0.0.1:8765/ws/{}/client", server_id.0)),
+            ..TermctlState::default()
         };
 
-        let input = PairingInput::from_args(args).unwrap();
-        assert_eq!(input.url, DEFAULT_URL);
-        assert!(input.server_id.is_some());
+        let input = PairingInput::from_args(args, &state).unwrap();
+
+        assert_eq!(input.route_server_id, server_id);
+        assert_eq!(input.url, "ws://127.0.0.1:8765/ws");
     }
 
     #[test]

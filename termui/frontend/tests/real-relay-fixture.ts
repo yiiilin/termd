@@ -53,7 +53,7 @@ export async function startRealRelayFixture(): Promise<RealRelayFixture> {
 
   const token = await issueToken(termdHttp);
   const serverId = await serverIdFromHealthz(termdHttp);
-  const relayClientUrl = `ws://${relayAddr}/ws/${serverId}/client`;
+  const relayClientUrl = `ws://${relayAddr}/ws`;
 
   return {
     token,

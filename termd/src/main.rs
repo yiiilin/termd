@@ -862,11 +862,13 @@ mod tests {
         use axum::response::IntoResponse;
         use axum::routing::get;
         use futures_util::StreamExt;
+        use serde_json::Value;
         use std::sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
         };
         use termd::config::RelayReconnectConfig;
+        use termd_proto::{Envelope, MessageType, RouteHelloPayload, RouteReadyPayload, RouteRole};
 
         #[derive(Clone, Default)]
         struct MockMuxState {
@@ -885,6 +887,23 @@ mod tests {
                     // 故意让这个 relay 首连失败，验证另一个 endpoint 仍然可以独立存活。
                     return;
                 }
+                let Some(route_hello) = read_route_hello(&mut socket).await else {
+                    return;
+                };
+                if route_hello.role != RouteRole::DaemonMux {
+                    return;
+                }
+                let route_ready = Envelope::new(
+                    MessageType::RouteReady,
+                    RouteReadyPayload {
+                        server_id: route_hello.server_id,
+                        role: RouteRole::DaemonMux,
+                    },
+                );
+                let raw = serde_json::to_string(&route_ready).unwrap();
+                if socket.send(AxumMessage::Text(raw.into())).await.is_err() {
+                    return;
+                }
 
                 while let Some(message) = socket.next().await {
                     match message {
@@ -900,6 +919,35 @@ mod tests {
             })
         }
 
+        async fn read_route_hello(
+            socket: &mut axum::extract::ws::WebSocket,
+        ) -> Option<RouteHelloPayload> {
+            loop {
+                let message = socket.next().await?.ok()?;
+                match message {
+                    AxumMessage::Text(raw) => {
+                        let envelope: Envelope<Value> = serde_json::from_str(raw.as_str()).ok()?;
+                        if envelope.kind != MessageType::RouteHello {
+                            return None;
+                        }
+                        return serde_json::from_value(envelope.payload).ok();
+                    }
+                    AxumMessage::Binary(raw) => {
+                        let envelope: Envelope<Value> = serde_json::from_slice(&raw).ok()?;
+                        if envelope.kind != MessageType::RouteHello {
+                            return None;
+                        }
+                        return serde_json::from_value(envelope.payload).ok();
+                    }
+                    AxumMessage::Ping(payload) => {
+                        let _ = socket.send(AxumMessage::Pong(payload)).await;
+                    }
+                    AxumMessage::Pong(_) => {}
+                    AxumMessage::Close(_) => return None,
+                }
+            }
+        }
+
         let flaky_state = MockMuxState {
             close_first_attempt: true,
             ..MockMuxState::default()
@@ -907,10 +955,10 @@ mod tests {
         let healthy_state = MockMuxState::default();
 
         let flaky_app = axum::Router::new()
-            .route("/ws/:server_id/daemon-mux", get(mock_daemon_mux_ws))
+            .route("/ws", get(mock_daemon_mux_ws))
             .with_state(flaky_state.clone());
         let healthy_app = axum::Router::new()
-            .route("/ws/:server_id/daemon-mux", get(mock_daemon_mux_ws))
+            .route("/ws", get(mock_daemon_mux_ws))
             .with_state(healthy_state.clone());
 
         let flaky_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

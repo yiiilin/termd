@@ -6,6 +6,9 @@ import {
   type Envelope,
   type PairingQrPayload,
   type MessageType,
+  type RouteHelloPayload,
+  type RouteReadyPayload,
+  type RouteRole,
   type SessionCursorPayload,
   type SessionState,
 } from "../protocol/types";
@@ -15,6 +18,8 @@ import { envelope } from "../protocol/wire";
 describe("协议类型", () => {
   it("消息类型使用 Rust proto 的 snake_case wire 名称", () => {
     const expected: MessageType[] = [
+      "route_hello",
+      "route_ready",
       "hello",
       "auth",
       "auth_challenge",
@@ -69,11 +74,37 @@ describe("协议类型", () => {
   it("状态枚举只表达个人 shared-control 语义", () => {
     const states: SessionState[] = ["created", "running", "closed"];
     const roles: AttachRole[] = ["operator"];
+    const routeRoles: RouteRole[] = ["client", "daemon_mux"];
     const forbidden = ["admin", "owner", "member", "tenant"];
 
     expect(states).toEqual(["created", "running", "closed"]);
     expect(roles).toEqual(["operator"]);
+    expect(routeRoles).toEqual(["client", "daemon_mux"]);
     expect(JSON.stringify({ states, roles }).toLowerCase()).not.toContain(forbidden.join("|"));
+  });
+
+  it("route prelude payload 只携带公开路由字段", () => {
+    const routeHello: RouteHelloPayload = {
+      server_id: "00000000-0000-0000-0000-000000000001",
+      role: "client",
+      protocol_version: 1,
+      nonce: "route-nonce",
+      timestamp_ms: 1_710_000_000_000,
+    };
+    const routeReady: RouteReadyPayload = {
+      server_id: routeHello.server_id,
+      role: "client",
+    };
+
+    expect(envelope("route_hello", routeHello)).toEqual({
+      type: "route_hello",
+      payload: routeHello,
+    });
+    expect(envelope("route_ready", routeReady)).toEqual({
+      type: "route_ready",
+      payload: routeReady,
+    });
+    expect(JSON.stringify(routeHello)).not.toContain("token");
   });
 
   it("TypeScript wire shape 和 JSON envelope 可序列化", () => {

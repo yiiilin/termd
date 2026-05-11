@@ -1,7 +1,8 @@
 //! direct WebSocket termd 客户端。
 //!
-//! 外层只发送 `hello`/`e2ee_key_exchange`/`encrypted_frame`，pair/auth/session/control
-//! 业务 envelope 都放进 E2EE 密文。relay 因而只能看到 server_id、sequence 和密文。
+//! WebSocket 打开后先发送明文 `route_hello` 并等待 `route_ready`，随后才进入
+//! `hello`/`e2ee_key_exchange`/`encrypted_frame`。pair/auth/session/control 业务
+//! envelope 都放进 E2EE 密文。relay 因而只能看到 server_id、sequence 和密文。
 
 use std::time::Duration;
 
@@ -17,9 +18,10 @@ use termd::net::{
 use termd_proto::{
     AuthChallengePayload, AuthPayload, ControlGrantPayload, ControlRequestPayload, DeviceId,
     E2eeKeyExchangePayload, EncryptedFramePayload, ErrorPayload, MessageType, PairAcceptPayload,
-    PairRequestPayload, PairingToken, PingPayload, PublicKey, ServerId, SessionAttachPayload,
-    SessionAttachedPayload, SessionCreatePayload, SessionCreatedPayload, SessionDataPayload,
-    SessionId, SessionListPayload, SessionListResultPayload, SessionResizePayload, TerminalSize,
+    PairRequestPayload, PairingToken, PingPayload, ProtocolVersion, PublicKey, RouteHelloPayload,
+    RouteReadyPayload, RouteRole, ServerId, SessionAttachPayload, SessionAttachedPayload,
+    SessionCreatePayload, SessionCreatedPayload, SessionDataPayload, SessionId, SessionListPayload,
+    SessionListResultPayload, SessionResizePayload, TerminalSize,
 };
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -38,16 +40,39 @@ type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 pub struct DirectClient {
     socket: WsStream,
     e2ee: E2eeSession,
-    server_id: ServerId,
     device_id: DeviceId,
 }
 
 impl DirectClient {
-    pub async fn connect(url: &str, device_id: DeviceId) -> Result<Self> {
+    pub async fn connect(
+        url: &str,
+        route_server_id: ServerId,
+        device_id: DeviceId,
+    ) -> Result<Self> {
         let (mut socket, _) = connect_async(url)
             .await
             .map_err(|_| TermctlError::ConnectFailed)?;
-        let mut server_id = None;
+
+        send_outer_on_socket(
+            &mut socket,
+            envelope_value(
+                MessageType::RouteHello,
+                RouteHelloPayload {
+                    server_id: route_server_id,
+                    role: RouteRole::Client,
+                    protocol_version: ProtocolVersion::default(),
+                    nonce: crypto::nonce(),
+                    timestamp_ms: crypto::now_ms(),
+                },
+            )?,
+        )
+        .await?;
+        let route_ready: RouteReadyPayload =
+            expect_outer_payload(&mut socket, MessageType::RouteReady).await?;
+        if route_ready.server_id != route_server_id || route_ready.role != RouteRole::Client {
+            return Err(TermctlError::RouteServerMismatch);
+        }
+
         let mut server_e2ee_key = None;
 
         // daemon 在连接建立后立即发送 hello 和 E2EE 公钥；顺序固定，但这里仍按类型收敛，
@@ -61,12 +86,19 @@ impl DirectClient {
                 MessageType::Hello => {
                     let payload: termd_proto::HelloPayload = decode_payload(envelope.payload)
                         .map_err(|_| TermctlError::InvalidEnvelope)?;
-                    server_id = payload.server_id.or(server_id);
+                    if payload
+                        .server_id
+                        .is_some_and(|server_id| server_id != route_server_id)
+                    {
+                        return Err(TermctlError::RouteServerMismatch);
+                    }
                 }
                 MessageType::E2eeKeyExchange => {
                     let payload: E2eeKeyExchangePayload = decode_payload(envelope.payload)
                         .map_err(|_| TermctlError::InvalidEnvelope)?;
-                    server_id = Some(payload.server_id);
+                    if payload.server_id != route_server_id {
+                        return Err(TermctlError::RouteServerMismatch);
+                    }
                     server_e2ee_key = Some(
                         E2eePeerPublicKey::try_from(&payload.public_key)
                             .map_err(|_| TermctlError::E2eeFailed)?,
@@ -77,11 +109,10 @@ impl DirectClient {
             }
         }
 
-        let server_id = server_id.ok_or(TermctlError::InvalidEnvelope)?;
         let server_e2ee_key = server_e2ee_key.ok_or(TermctlError::InvalidEnvelope)?;
         let device_e2ee_keypair = E2eeKeyPair::generate();
         let context = E2eeSessionContext::new(
-            server_id,
+            route_server_id,
             device_id,
             server_e2ee_key,
             device_e2ee_keypair.public_key(),
@@ -96,7 +127,6 @@ impl DirectClient {
         let mut client = Self {
             socket,
             e2ee,
-            server_id,
             device_id,
         };
 
@@ -104,7 +134,7 @@ impl DirectClient {
             .send_outer(envelope_value(
                 MessageType::E2eeKeyExchange,
                 E2eeKeyExchangePayload {
-                    server_id,
+                    server_id: route_server_id,
                     device_id,
                     public_key: device_e2ee_keypair.public_key_wire(),
                     nonce: crypto::nonce(),
@@ -114,10 +144,6 @@ impl DirectClient {
             .await?;
 
         Ok(client)
-    }
-
-    pub fn server_id(&self) -> ServerId {
-        self.server_id
     }
 
     pub async fn pair(
@@ -355,6 +381,31 @@ impl DirectClient {
             .await
             .map_err(|_| TermctlError::SendFailed)
     }
+}
+
+async fn expect_outer_payload<T>(socket: &mut WsStream, expected: MessageType) -> Result<T>
+where
+    T: DeserializeOwned,
+{
+    let envelope = timeout(HANDSHAKE_TIMEOUT, read_outer(socket))
+        .await
+        .map_err(|_| TermctlError::ConnectionClosed)??;
+    if envelope.kind == MessageType::Error {
+        return Err(protocol_error(envelope.payload));
+    }
+    if envelope.kind != expected {
+        return Err(TermctlError::UnexpectedMessage);
+    }
+
+    decode_payload(envelope.payload).map_err(|_| TermctlError::InvalidEnvelope)
+}
+
+async fn send_outer_on_socket(socket: &mut WsStream, envelope: JsonEnvelope) -> Result<()> {
+    let raw = serde_json::to_string(&envelope).map_err(|_| TermctlError::InvalidEnvelope)?;
+    socket
+        .send(Message::Text(raw.into()))
+        .await
+        .map_err(|_| TermctlError::SendFailed)
 }
 
 async fn read_outer(socket: &mut WsStream) -> Result<JsonEnvelope> {

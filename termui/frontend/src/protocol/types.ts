@@ -1,4 +1,6 @@
 export const ALL_MESSAGE_TYPES = [
+  "route_hello",
+  "route_ready",
   "hello",
   "auth",
   "auth_challenge",
@@ -48,6 +50,21 @@ export type UnixTimestampMillis = number;
 export interface Envelope<P = unknown> {
   type: MessageType;
   payload: P;
+}
+
+export type RouteRole = "client" | "daemon_mux";
+
+export interface RouteHelloPayload {
+  server_id: UUID;
+  role: RouteRole;
+  protocol_version: number;
+  nonce: Nonce;
+  timestamp_ms: UnixTimestampMillis;
+}
+
+export interface RouteReadyPayload {
+  server_id: UUID;
+  role: RouteRole;
 }
 
 export interface HelloPayload {
@@ -295,6 +312,7 @@ export interface PairedServerState {
   daemon_public_key: PublicKeyWire;
   url: string;
   paired_at_ms: UnixTimestampMillis;
+  name?: string | null;
 }
 
 export interface BrowserState {

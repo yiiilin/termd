@@ -1,20 +1,65 @@
-import { expect, test } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
 import { startRealRelayFixture } from "./real-relay-fixture";
 
-test("浏览器通过真实 relay 连接 daemon 完成 pairing 和 session list", async ({ page }) => {
+async function activateButton(page: Page, name: string): Promise<void> {
+  const button = page.getByRole("button", { name });
+  await expect(button).toBeVisible();
+  await expect(button).toBeEnabled();
+  await button.focus();
+  await expect(button).toBeFocused();
+  await page.keyboard.press("Enter");
+}
+
+async function openMobileMenu(page: Page) {
+  await activateButton(page, "Open mobile workspace menu");
+  const menu = page.getByRole("navigation", { name: "mobile workspace menu" });
+  await expect(menu).toBeVisible();
+  return menu;
+}
+
+test("浏览器通过真实 relay 连接 daemon 完成 pairing 和 session list", async ({ page }, testInfo) => {
   const fixture = await startRealRelayFixture();
 
   try {
     await page.goto("/");
+    await page.getByRole("button", { name: "Edit address" }).click();
     await page.getByLabel("WS URL").fill(fixture.relayClientUrl);
-    await page.getByLabel("Pairing token").fill(fixture.token);
+    await page.getByLabel("Pairing token").fill(pairingInviteCode(fixture));
     await page.getByRole("button", { name: "Pair" }).click();
 
-    await expect(page.getByLabel("connection status").getByText(fixture.serverId, { exact: true })).toBeVisible();
     await expect(page.getByLabel("Pairing token")).toBeHidden();
 
-    await expect(page.getByRole("button", { name: "Refresh" })).toBeVisible();
-    await page.getByRole("button", { name: "Refresh" }).click();
+    if (testInfo.project.name === "mobile-chrome") {
+      await expect(page.getByRole("navigation", { name: "mobile workspace actions" })).toHaveCount(0);
+      const menu = await openMobileMenu(page);
+      await expect(menu.getByRole("button", { name: "Connection" })).toBeVisible();
+      await expect(menu.getByRole("button", { name: "Sessions" })).toBeVisible();
+      await expect(menu.getByRole("button", { name: "Files" })).toBeVisible();
+      await expect(menu.getByRole("button", { name: "New" })).toBeVisible();
+      await menu.getByRole("button", { name: "Connection" }).click();
+      const connectionPanel = page.getByRole("region", { name: "connection panel" });
+      await expect(connectionPanel.getByLabel("connection status")).toBeVisible();
+      await activateButton(page, "Manage daemons");
+      await expect(page.getByLabel("daemon manager")).toBeVisible();
+      await activateButton(page, "Close connection panel");
+
+      const reopenedMenu = await openMobileMenu(page);
+      await reopenedMenu.getByRole("button", { name: "Sessions" }).click();
+      await expect(page.getByRole("region", { name: "sessions panel" })).toBeVisible();
+      await activateButton(page, "Refresh sessions");
+
+      // 移动端刷新后，顶部入口仍然必须保持在左侧，不允许被布局规则顶到右边。
+      const mobileMenuButton = page.getByRole("button", { name: "Open mobile workspace menu" });
+      const menuBox = await mobileMenuButton.boundingBox();
+      expect(menuBox?.x ?? 0).toBeLessThan(48);
+
+      const daemonStatus = page.getByText("paired daemon");
+      const daemonBox = await daemonStatus.boundingBox();
+      expect(daemonBox?.x ?? 0).toBeLessThan(180);
+    } else {
+      await page.getByRole("button", { name: "Refresh" }).click();
+    }
+
     await expect(page.getByLabel("sessions").getByText("No sessions")).toBeVisible();
 
     const localStorageText = await page.evaluate(() => JSON.stringify(window.localStorage));
@@ -23,3 +68,15 @@ test("浏览器通过真实 relay 连接 daemon 完成 pairing 和 session list"
     await fixture.stop();
   }
 });
+
+function pairingInviteCode(fixture: { relayClientUrl: string; serverId: string; token: string }): string {
+  const payload = JSON.stringify({
+    type: "termd_pairing_qr",
+    version: 1,
+    ws_url: fixture.relayClientUrl,
+    token: fixture.token,
+    server_id: fixture.serverId,
+    expires_at_ms: Date.now() + 60_000,
+  });
+  return `termd-pair:v1:${Buffer.from(payload, "utf8").toString("base64url")}`;
+}

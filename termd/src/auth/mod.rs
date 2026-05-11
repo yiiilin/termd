@@ -8,6 +8,9 @@
 //! daemon 内核中做生命周期管理；Noise/X25519 或 E2EE 会在后续协议层接入。后续持久化
 //! 可以实现 `TrustedDeviceStore`，并复用同一组查询边界来拒绝未配对设备。
 
+use base64::{Engine as _, engine::general_purpose};
+use ed25519_dalek::SigningKey;
+use rand_core::OsRng;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
@@ -23,6 +26,9 @@ pub type AuthResult<T> = Result<T, AuthError>;
 
 /// pairing token 生命周期使用的 Result 类型。
 pub type PairingResult<T> = Result<T, PairingError>;
+
+const ED25519_WIRE_PREFIX: &str = "ed25519-v1:";
+const ED25519_PRIVATE_KEY_LEN: usize = 32;
 
 /// 设备信任查询的错误。
 ///
@@ -174,6 +180,32 @@ impl fmt::Display for SignatureError {
 }
 
 impl Error for SignatureError {}
+
+/// daemon static keypair 恢复失败的原因。
+///
+/// 这些错误只针对 daemon 本地状态；pair/auth wire payload 里不能携带 daemon private key。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DaemonIdentityError {
+    UnsupportedPrivateKeyPrefix,
+    InvalidPrivateKeyEncoding,
+    InvalidPrivateKeyLength { actual: usize },
+    PublicKeyMismatch,
+}
+
+impl fmt::Display for DaemonIdentityError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedPrivateKeyPrefix => write!(f, "daemon private key prefix is invalid"),
+            Self::InvalidPrivateKeyEncoding => write!(f, "daemon private key encoding is invalid"),
+            Self::InvalidPrivateKeyLength { .. } => {
+                write!(f, "daemon private key length is invalid")
+            }
+            Self::PublicKeyMismatch => write!(f, "daemon private key does not match public key"),
+        }
+    }
+}
+
+impl Error for DaemonIdentityError {}
 
 /// challenge-response auth 的统一拒绝原因。
 ///
@@ -1092,54 +1124,68 @@ pub struct DaemonPublicIdentity {
 
 /// daemon 本地身份。
 ///
-/// `DaemonIdentity` 是 daemon public key 这条信任根的宿主。私钥材料被保留在私有字段中，
-/// 目前只建立所有权边界，不在本 item 中实现真实签名或密钥交换。
+/// `DaemonIdentity` 是 daemon static keypair 这条信任根的宿主。私钥材料只保存在 daemon
+/// 本地持久状态里，不能进入 client、relay、pair payload 或日志。
 #[derive(Clone, PartialEq, Eq)]
 pub struct DaemonIdentity {
     server_id: ServerId,
     public_key: PublicKey,
-    _private_key: DaemonPrivateKey,
+    private_key: DaemonPrivateKey,
 }
 
 impl DaemonIdentity {
     /// 生成一个新的 daemon identity。
     ///
-    /// 这里使用不透明字符串作为 MVP key material，目的是先固定“daemon 拥有私钥、client
-    /// 只能看到 public identity”的边界。后续接入 X25519/Noise 时可以替换内部生成逻辑，
-    /// 而不改变外层 trust store API。
+    /// `server_id` 仍然只是 relay 路由 UUID；真正的 daemon 身份由 Ed25519 static keypair
+    /// 表达。
     pub fn generate() -> Self {
-        let server_id = ServerId::new();
-        let public_key = PublicKey(format!("termd-daemon-public-{}", server_id.0));
-        let private_nonce = ServerId::new();
-        let private_key = DaemonPrivateKey {
-            _material: format!("termd-daemon-private-{}-{}", server_id.0, private_nonce.0),
-        };
-
-        Self {
-            server_id,
-            public_key,
-            _private_key: private_key,
-        }
+        Self::generate_for_server_id(ServerId::new())
     }
 
-    /// 从持久化的公开身份恢复 daemon identity。
+    /// 保留已有 `server_id`，重新生成真实 daemon static keypair。
     ///
-    /// 当前 MVP 的 daemon 私钥还是本地占位材料，尚不参与签名或密钥交换；真正需要跨重启稳定的
-    /// 是 client 签名输入中的 server id 与 daemon public key。后续接入真实 server 私钥时，
-    /// 这里应改为从受保护的本地密钥文件恢复完整身份。
-    pub fn from_persisted_public_identity(server_id: ServerId, public_key: PublicKey) -> Self {
-        let private_nonce = ServerId::new();
+    /// 旧 fake public key 没有可恢复的私钥，只能在升级时走这个路径；这样不会改变 relay 路由
+    /// 使用的 UUID。
+    pub fn generate_for_server_id(server_id: ServerId) -> Self {
+        let signing_key = SigningKey::generate(&mut OsRng);
+        Self::from_signing_key(server_id, signing_key)
+    }
+
+    /// 从 daemon 本地持久化的 static keypair 恢复身份。
+    ///
+    /// 恢复时会用 private key 重新派生 public key，并与 SQLite 中保存的 public key 比对，避免
+    /// silent key rotation 破坏已配对设备的 trust anchor。
+    pub fn from_persisted_identity(
+        server_id: ServerId,
+        public_key: PublicKey,
+        private_key: String,
+    ) -> Result<Self, DaemonIdentityError> {
+        let signing_key = decode_daemon_signing_key(&private_key)?;
+        let derived_public_key =
+            PublicKey(daemon_wire_prefixed(signing_key.verifying_key().as_bytes()));
+        if derived_public_key != public_key {
+            return Err(DaemonIdentityError::PublicKeyMismatch);
+        }
+
+        Ok(Self {
+            server_id,
+            public_key,
+            private_key: DaemonPrivateKey {
+                material: private_key,
+            },
+        })
+    }
+
+    fn from_signing_key(server_id: ServerId, signing_key: SigningKey) -> Self {
+        let public_key = PublicKey(daemon_wire_prefixed(signing_key.verifying_key().as_bytes()));
         let private_key = DaemonPrivateKey {
-            _material: format!(
-                "termd-daemon-private-restored-{}-{}",
-                server_id.0, private_nonce.0
-            ),
+            material: daemon_wire_prefixed(&signing_key.to_bytes()),
         };
 
         Self {
             server_id,
             public_key,
-            _private_key: private_key,
+            private_key,
         }
     }
 
@@ -1151,6 +1197,11 @@ impl DaemonIdentity {
     /// 返回 daemon public key；调用方不得从这里推导或保存 server private key。
     pub fn public_key(&self) -> &PublicKey {
         &self.public_key
+    }
+
+    /// 返回仅供 daemon 本地持久化使用的 private key wire 文本。
+    pub(crate) fn private_key_for_persistence(&self) -> String {
+        self.private_key.material.clone()
     }
 
     /// 构造只含公开字段的 daemon identity，供 hello/pair_accept 等协议层使用。
@@ -1173,17 +1224,17 @@ impl fmt::Debug for DaemonIdentity {
         f.debug_struct("DaemonIdentity")
             .field("server_id", &self.server_id)
             .field("public_key", &self.public_key)
-            .field("private_key", &"<redacted>")
+            .field("private_key", &self.private_key)
             .finish()
     }
 }
 
-/// daemon 私钥材料的本地占位类型。
+/// daemon 私钥材料的本地类型。
 ///
-/// 类型不导出，Debug 也只输出脱敏文本，防止日志或测试失败输出中泄漏私钥占位内容。
+/// 类型不导出，Debug 也只输出脱敏文本，防止日志或测试失败输出中泄漏真实私钥。
 #[derive(Clone, PartialEq, Eq)]
 struct DaemonPrivateKey {
-    _material: String,
+    material: String,
 }
 
 impl fmt::Debug for DaemonPrivateKey {
@@ -1524,6 +1575,28 @@ fn nonce_key(nonce: &Nonce) -> &str {
     nonce.0.as_str()
 }
 
+fn daemon_wire_prefixed(bytes: &[u8]) -> String {
+    format!(
+        "{ED25519_WIRE_PREFIX}{}",
+        general_purpose::STANDARD.encode(bytes)
+    )
+}
+
+fn decode_daemon_signing_key(private_key: &str) -> Result<SigningKey, DaemonIdentityError> {
+    let encoded = private_key
+        .strip_prefix(ED25519_WIRE_PREFIX)
+        .ok_or(DaemonIdentityError::UnsupportedPrivateKeyPrefix)?;
+    let bytes = general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|_| DaemonIdentityError::InvalidPrivateKeyEncoding)?;
+    let actual = bytes.len();
+    let bytes: [u8; ED25519_PRIVATE_KEY_LEN] = bytes
+        .try_into()
+        .map_err(|_| DaemonIdentityError::InvalidPrivateKeyLength { actual })?;
+
+    Ok(SigningKey::from_bytes(&bytes))
+}
+
 fn append_canonical_field(bytes: &mut Vec<u8>, name: &str, value: &str) {
     bytes.extend_from_slice(name.as_bytes());
     bytes.extend_from_slice(b":");
@@ -1554,13 +1627,58 @@ mod tests {
     }
 
     #[test]
-    fn daemon_identity_can_be_generated_and_public_key_is_readable() {
+    fn daemon_identity_generates_real_static_ed25519_keypair() {
         let identity = DaemonIdentity::generate();
         let public_identity = identity.public_identity();
+        let private_key = identity.private_key_for_persistence();
+        let restored = DaemonIdentity::from_persisted_identity(
+            identity.server_id(),
+            identity.public_key().clone(),
+            private_key.clone(),
+        )
+        .unwrap();
 
         assert_eq!(public_identity.server_id, identity.server_id());
         assert_eq!(&public_identity.public_key, identity.public_key());
-        assert!(!identity.public_key().0.is_empty());
+        assert!(identity.public_key().0.starts_with(ED25519_WIRE_PREFIX));
+        assert!(private_key.starts_with(ED25519_WIRE_PREFIX));
+        assert!(
+            !identity
+                .public_key()
+                .0
+                .contains(&identity.server_id().0.to_string())
+        );
+        assert_eq!(restored.public_key(), identity.public_key());
+        assert_eq!(
+            restored.private_key_for_persistence(),
+            identity.private_key_for_persistence()
+        );
+    }
+
+    #[test]
+    fn daemon_identity_rejects_mismatched_persisted_keypair_and_redacts_debug() {
+        let identity = DaemonIdentity::generate();
+        let other = DaemonIdentity::generate();
+        let error = DaemonIdentity::from_persisted_identity(
+            identity.server_id(),
+            identity.public_key().clone(),
+            other.private_key_for_persistence(),
+        )
+        .unwrap_err();
+        let debug = format!("{identity:?}");
+
+        assert_eq!(error, DaemonIdentityError::PublicKeyMismatch);
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains(&identity.private_key_for_persistence()));
+    }
+
+    #[test]
+    fn daemon_identity_can_generate_real_keypair_for_existing_server_id() {
+        let server_id = ServerId::new();
+        let identity = DaemonIdentity::generate_for_server_id(server_id);
+
+        assert_eq!(identity.server_id(), server_id);
+        assert!(identity.public_key().0.starts_with(ED25519_WIRE_PREFIX));
     }
 
     #[test]

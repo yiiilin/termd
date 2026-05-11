@@ -1,35 +1,41 @@
 //! termd daemon 的本地持久状态快照。
 //!
 //! 本模块保存 daemon 需要跨进程重启保留的最小事实：daemon 公共身份快照、可信设备清单、
-//! session 元数据，以及独立的 SQLite client history 存储入口。这里刻意不保存 PTY 明文
-//! 输出、terminal 历史或文件传输内容，也不引入账号体系。
+//! session 元数据，以及 SQLite client history 存储入口。这里刻意不保存 PTY 明文输出、
+//! terminal 历史或文件传输内容，也不引入账号体系。
 
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, types::Type};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::error::Error;
 use std::fmt;
-use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 use termd_proto::{
     DeviceId, PublicKey, ServerId, SessionId, SessionState, TerminalSize, UnixTimestampMillis,
 };
+use uuid::Uuid;
 
 pub mod client_history;
 
 /// 当前 daemon 状态文件的 schema 版本。
 pub const STATE_SCHEMA_VERSION: u32 = 1;
 
-static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+const META_SERVER_ID: &str = "server_id";
+const META_DAEMON_PUBLIC_KEY: &str = "daemon_public_key";
+const META_DAEMON_PRIVATE_KEY: &str = "daemon_private_key";
 
-/// daemon 可公开身份的持久快照。
+/// daemon 身份的本地持久快照。
 ///
-/// 这里只保存 server id 和 daemon public key。server private key 不属于该快照，也不得写入
-/// client 或 relay 可读的位置。
+/// private key 只允许写入 daemon 本地 SQLite；pair payload、termctl state 和 relay 都不能保存
+/// 这个字段。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonIdentitySnapshot {
     pub server_id: ServerId,
     pub public_key: PublicKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_key: Option<String>,
 }
 
 /// 已配对设备的持久状态记录。
@@ -86,37 +92,38 @@ impl Default for DaemonState {
 pub struct StateStore;
 
 impl StateStore {
-    /// 从 JSON 状态文件读取 `DaemonState`。
+    /// 从 SQLite 状态库读取 `DaemonState`。
     ///
-    /// 缺失状态文件表示 daemon 第一次启动或还未保存任何本地状态，因此返回空的默认状态。
+    /// 旧版本的 `daemon-state.json` 只作为迁移来源读取；SQLite 一旦有 daemon 状态，
+    /// 后续启动都以 SQLite 为准，避免 stale JSON 覆盖新信任数据。
     pub fn load(path: impl AsRef<Path>) -> Result<DaemonState, StateError> {
         let path = path.as_ref();
+        let sqlite_path = sqlite_state_path_for_state_path(path);
+        let conn = open_state_connection(&sqlite_path)?;
+        initialize_daemon_state_schema(&conn, &sqlite_path)?;
+        let state = load_sqlite_state(&conn, &sqlite_path)?;
 
-        match fs::read_to_string(path) {
-            Ok(raw) => parse_json(path, &raw),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(DaemonState::default()),
-            Err(source) => Err(StateError::Read {
-                path: path.to_path_buf(),
-                source,
-            }),
+        if state.daemon_identity.is_some() || !state.trusted_devices.is_empty() {
+            return Ok(state);
         }
+
+        load_legacy_json_state(path, &sqlite_path).map(|legacy| legacy.unwrap_or(state))
     }
 
-    /// 将 daemon 状态以 JSON 保存到本地文件。
+    /// 将 daemon 状态保存到 SQLite 状态库。
     ///
-    /// 写入使用“临时文件 + rename”模式，保证目标文件要么保留旧内容，要么替换为完整新 JSON。
+    /// 这里不再写 `daemon-state.json`；旧 JSON 文件即使存在，也只作为迁移来源。
     pub fn save(path: impl AsRef<Path>, state: &DaemonState) -> Result<(), StateError> {
-        write_json_atomically(path.as_ref(), state)
+        let sqlite_path = sqlite_state_path_for_state_path(path.as_ref());
+        let mut conn = open_state_connection(&sqlite_path)?;
+        initialize_daemon_state_schema(&conn, &sqlite_path)?;
+        save_sqlite_state(&mut conn, &sqlite_path, state)
     }
 }
 
 /// 状态存储的结构化错误。
 #[derive(Debug)]
 pub enum StateError {
-    Serialize {
-        path: PathBuf,
-        source: serde_json::Error,
-    },
     Read {
         path: PathBuf,
         source: io::Error,
@@ -129,27 +136,18 @@ pub enum StateError {
         path: PathBuf,
         source: io::Error,
     },
-    WriteTemp {
-        path: PathBuf,
-        source: io::Error,
-    },
-    Rename {
-        from: PathBuf,
-        to: PathBuf,
-        source: io::Error,
-    },
     Sqlite {
         path: PathBuf,
         source: rusqlite::Error,
+    },
+    InvalidDaemonIdentity {
+        source: String,
     },
 }
 
 impl fmt::Display for StateError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Serialize { path, .. } => {
-                write!(f, "failed to serialize daemon state for {}", path.display())
-            }
             Self::Read { path, .. } => {
                 write!(f, "failed to read daemon state from {}", path.display())
             }
@@ -163,18 +161,10 @@ impl fmt::Display for StateError {
             Self::CreateDirectory { path, .. } => {
                 write!(f, "failed to create state directory {}", path.display())
             }
-            Self::WriteTemp { path, .. } => {
-                write!(f, "failed to write temporary state file {}", path.display())
-            }
-            Self::Rename { from, to, .. } => write!(
-                f,
-                "failed to atomically replace state file {} with {}",
-                to.display(),
-                from.display()
-            ),
             Self::Sqlite { path, .. } => {
                 write!(f, "failed to access sqlite store at {}", path.display())
             }
+            Self::InvalidDaemonIdentity { .. } => write!(f, "failed to restore daemon identity"),
         }
     }
 }
@@ -182,12 +172,10 @@ impl fmt::Display for StateError {
 impl Error for StateError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Serialize { source, .. } | Self::Parse { source, .. } => Some(source),
-            Self::Read { source, .. }
-            | Self::CreateDirectory { source, .. }
-            | Self::WriteTemp { source, .. }
-            | Self::Rename { source, .. } => Some(source),
+            Self::Parse { source, .. } => Some(source),
+            Self::Read { source, .. } | Self::CreateDirectory { source, .. } => Some(source),
             Self::Sqlite { source, .. } => Some(source),
+            Self::InvalidDaemonIdentity { .. } => None,
         }
     }
 }
@@ -202,27 +190,229 @@ where
     })
 }
 
-fn write_json_atomically<T>(path: &Path, value: &T) -> Result<(), StateError>
-where
-    T: Serialize,
-{
-    let mut bytes = serde_json::to_vec_pretty(value).map_err(|source| StateError::Serialize {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    bytes.push(b'\n');
+/// 从历史 `state_path` 派生当前唯一 SQLite 状态库路径。
+///
+/// 保留 `.json -> .sqlite` 的派生规则是为了让旧配置无需改路径也能平滑迁移。
+pub(crate) fn sqlite_state_path_for_state_path(state_path: &Path) -> PathBuf {
+    state_path.with_extension("sqlite")
+}
 
-    ensure_parent_directory(path)?;
-
-    let temp_path = temp_path_for(path);
-    let result = write_temp_then_rename(path, &temp_path, &bytes);
-
-    if result.is_err() {
-        // 清理失败的临时文件不影响主错误返回；目标文件由 rename 原子性保护。
-        fs::remove_file(&temp_path).ok();
+fn load_legacy_json_state(
+    path: &Path,
+    sqlite_path: &Path,
+) -> Result<Option<DaemonState>, StateError> {
+    if path == sqlite_path {
+        return Ok(None);
     }
 
-    result
+    match fs::read_to_string(path) {
+        Ok(raw) => parse_json(path, &raw).map(Some),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(StateError::Read {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+fn open_state_connection(sqlite_path: &Path) -> Result<Connection, StateError> {
+    ensure_parent_directory(sqlite_path)?;
+    Connection::open(sqlite_path).map_err(|source| sqlite_error(sqlite_path, source))
+}
+
+fn initialize_daemon_state_schema(conn: &Connection, path: &Path) -> Result<(), StateError> {
+    conn.execute_batch(
+        r#"
+        PRAGMA foreign_keys = ON;
+        PRAGMA journal_mode = WAL;
+        PRAGMA synchronous = NORMAL;
+
+        CREATE TABLE IF NOT EXISTS daemon_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at_ms INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS trusted_devices (
+            device_id TEXT PRIMARY KEY,
+            public_key TEXT NOT NULL,
+            trusted_at_ms INTEGER NOT NULL,
+            last_seen_at_ms INTEGER,
+            label TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_trusted_devices_seen
+            ON trusted_devices(last_seen_at_ms, device_id);
+        "#,
+    )
+    .map_err(|source| sqlite_error(path, source))
+}
+
+fn load_sqlite_state(conn: &Connection, path: &Path) -> Result<DaemonState, StateError> {
+    let server_id = read_meta_value(conn, path, META_SERVER_ID)?;
+    let public_key = read_meta_value(conn, path, META_DAEMON_PUBLIC_KEY)?;
+    let private_key = read_meta_value(conn, path, META_DAEMON_PRIVATE_KEY)?;
+    let daemon_identity = match (server_id, public_key) {
+        (Some(server_id), Some(public_key)) => Some(DaemonIdentitySnapshot {
+            server_id: parse_server_id(path, server_id)?,
+            public_key: PublicKey(public_key),
+            private_key,
+        }),
+        _ => None,
+    };
+
+    let mut trusted_devices = Vec::new();
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT device_id, public_key, trusted_at_ms, last_seen_at_ms, label
+            FROM trusted_devices
+            ORDER BY device_id
+            "#,
+        )
+        .map_err(|source| sqlite_error(path, source))?;
+    let rows = stmt
+        .query_map([], |row| {
+            let device_id = parse_device_id(row.get::<_, String>(0)?)?;
+            let public_key = PublicKey(row.get::<_, String>(1)?);
+            let trusted_at_ms = UnixTimestampMillis(row.get::<_, i64>(2)? as u64);
+            let last_seen_at_ms = row
+                .get::<_, Option<i64>>(3)?
+                .map(|value| UnixTimestampMillis(value as u64));
+            let label = row.get::<_, Option<String>>(4)?;
+
+            Ok(TrustedDeviceState {
+                device_id,
+                public_key,
+                trusted_at_ms,
+                last_seen_at_ms,
+                label,
+            })
+        })
+        .map_err(|source| sqlite_error(path, source))?;
+
+    for row in rows {
+        trusted_devices.push(row.map_err(|source| sqlite_error(path, source))?);
+    }
+
+    Ok(DaemonState {
+        version: STATE_SCHEMA_VERSION,
+        daemon_identity,
+        trusted_devices,
+        sessions: Vec::new(),
+    })
+}
+
+fn read_meta_value(
+    conn: &Connection,
+    path: &Path,
+    key: &'static str,
+) -> Result<Option<String>, StateError> {
+    conn.query_row(
+        "SELECT value FROM daemon_meta WHERE key = ?1",
+        params![key],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(|source| sqlite_error(path, source))
+}
+
+fn save_sqlite_state(
+    conn: &mut Connection,
+    path: &Path,
+    state: &DaemonState,
+) -> Result<(), StateError> {
+    let now_ms = current_unix_timestamp_millis().0 as i64;
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|source| sqlite_error(path, source))?;
+
+    match &state.daemon_identity {
+        Some(identity) => {
+            upsert_meta_value(
+                &tx,
+                path,
+                META_SERVER_ID,
+                &identity.server_id.0.to_string(),
+                now_ms,
+            )?;
+            upsert_meta_value(
+                &tx,
+                path,
+                META_DAEMON_PUBLIC_KEY,
+                &identity.public_key.0,
+                now_ms,
+            )?;
+            if let Some(private_key) = identity.private_key.as_deref() {
+                upsert_meta_value(&tx, path, META_DAEMON_PRIVATE_KEY, private_key, now_ms)?;
+            } else {
+                tx.execute(
+                    "DELETE FROM daemon_meta WHERE key = ?1",
+                    params![META_DAEMON_PRIVATE_KEY],
+                )
+                .map_err(|source| sqlite_error(path, source))?;
+            }
+        }
+        None => {
+            tx.execute(
+                "DELETE FROM daemon_meta WHERE key IN (?1, ?2, ?3)",
+                params![
+                    META_SERVER_ID,
+                    META_DAEMON_PUBLIC_KEY,
+                    META_DAEMON_PRIVATE_KEY
+                ],
+            )
+            .map_err(|source| sqlite_error(path, source))?;
+        }
+    }
+
+    tx.execute("DELETE FROM trusted_devices", [])
+        .map_err(|source| sqlite_error(path, source))?;
+    for device in &state.trusted_devices {
+        tx.execute(
+            r#"
+            INSERT INTO trusted_devices (
+                device_id,
+                public_key,
+                trusted_at_ms,
+                last_seen_at_ms,
+                label
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            "#,
+            params![
+                device.device_id.0.to_string(),
+                device.public_key.0.as_str(),
+                device.trusted_at_ms.0 as i64,
+                device.last_seen_at_ms.map(|timestamp| timestamp.0 as i64),
+                device.label.as_deref(),
+            ],
+        )
+        .map_err(|source| sqlite_error(path, source))?;
+    }
+
+    tx.commit().map_err(|source| sqlite_error(path, source))
+}
+
+fn upsert_meta_value(
+    conn: &Connection,
+    path: &Path,
+    key: &'static str,
+    value: &str,
+    now_ms: i64,
+) -> Result<(), StateError> {
+    conn.execute(
+        r#"
+        INSERT INTO daemon_meta (key, value, updated_at_ms)
+        VALUES (?1, ?2, ?3)
+        ON CONFLICT(key) DO UPDATE SET
+            value = excluded.value,
+            updated_at_ms = excluded.updated_at_ms
+        "#,
+        params![key, value, now_ms],
+    )
+    .map_err(|source| sqlite_error(path, source))?;
+    Ok(())
 }
 
 fn ensure_parent_directory(path: &Path) -> Result<(), StateError> {
@@ -239,50 +429,45 @@ fn ensure_parent_directory(path: &Path) -> Result<(), StateError> {
     })
 }
 
-fn write_temp_then_rename(path: &Path, temp_path: &Path, bytes: &[u8]) -> Result<(), StateError> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(temp_path)
-        .map_err(|source| StateError::WriteTemp {
-            path: temp_path.to_path_buf(),
-            source,
-        })?;
-
-    file.write_all(bytes)
-        .and_then(|_| file.sync_all())
-        .map_err(|source| StateError::WriteTemp {
-            path: temp_path.to_path_buf(),
-            source,
-        })?;
-    drop(file);
-
-    fs::rename(temp_path, path).map_err(|source| StateError::Rename {
-        from: temp_path.to_path_buf(),
-        to: path.to_path_buf(),
+fn sqlite_error(path: &Path, source: rusqlite::Error) -> StateError {
+    StateError::Sqlite {
+        path: path.to_path_buf(),
         source,
+    }
+}
+
+fn parse_server_id(path: &Path, raw: String) -> Result<ServerId, StateError> {
+    Uuid::parse_str(&raw)
+        .map(ServerId)
+        .map_err(|source| sqlite_error_from_conversion(path, source))
+}
+
+fn parse_device_id(raw: String) -> rusqlite::Result<DeviceId> {
+    Uuid::parse_str(&raw).map(DeviceId).map_err(|source| {
+        rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(source))
     })
 }
 
-fn temp_path_for(path: &Path) -> PathBuf {
-    let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let file_name = path
-        .file_name()
-        .map(|value| value.to_string_lossy())
-        .unwrap_or_else(|| "state".into());
+fn sqlite_error_from_conversion(path: &Path, source: uuid::Error) -> StateError {
+    StateError::Sqlite {
+        path: path.to_path_buf(),
+        source: rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(source)),
+    }
+}
 
-    path.with_file_name(format!(
-        ".{file_name}.tmp.{}.{}",
-        std::process::id(),
-        counter
-    ))
+fn current_unix_timestamp_millis() -> UnixTimestampMillis {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default();
+    UnixTimestampMillis(millis)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
     use termd_proto::{
         DeviceId, PublicKey, ServerId, SessionId, SessionState, TerminalSize, UnixTimestampMillis,
@@ -327,15 +512,20 @@ mod tests {
     }
 
     #[test]
-    fn state_store_saves_and_loads_full_state() {
+    fn state_store_saves_and_loads_sqlite_daemon_state_without_runtime_sessions() {
         let state_path = temp_path("daemon-state.json");
         let state = sample_state();
 
         StateStore::save(&state_path, &state).unwrap();
 
         let loaded = StateStore::load(&state_path).unwrap();
-        assert_eq!(loaded, state);
-        fs::remove_file(state_path).ok();
+        assert_eq!(loaded.version, STATE_SCHEMA_VERSION);
+        assert_eq!(loaded.daemon_identity, state.daemon_identity);
+        assert_eq!(loaded.trusted_devices, state.trusted_devices);
+        assert!(loaded.sessions.is_empty());
+        assert!(!state_path.exists());
+        assert!(sqlite_state_path_for_state_path(&state_path).exists());
+        cleanup_state_paths(&state_path);
     }
 
     #[test]
@@ -355,21 +545,51 @@ mod tests {
         let error = StateStore::load(&state_path).unwrap_err();
 
         assert!(matches!(error, StateError::Parse { .. }));
-        fs::remove_file(state_path).ok();
+        cleanup_state_paths(&state_path);
     }
 
     #[test]
-    fn state_save_uses_complete_json_target_after_atomic_write() {
-        let state_path = temp_path("atomic-state.json");
+    fn state_save_does_not_rewrite_legacy_json_target() {
+        let state_path = temp_path("sqlite-state.json");
         let state = sample_state();
 
         StateStore::save(&state_path, &state).unwrap();
 
-        let raw = fs::read_to_string(&state_path).unwrap();
-        let decoded: DaemonState = serde_json::from_str(&raw).unwrap();
-        assert_eq!(decoded, state);
-        assert!(raw.contains("\"version\""));
-        fs::remove_file(state_path).ok();
+        assert!(!state_path.exists());
+        assert!(sqlite_state_path_for_state_path(&state_path).exists());
+        cleanup_state_paths(&state_path);
+    }
+
+    #[test]
+    fn legacy_json_state_is_read_once_and_then_sqlite_wins() {
+        let state_path = temp_path("legacy-state.json");
+        let legacy_state = sample_state();
+        let mut sqlite_state = legacy_state.clone();
+        sqlite_state.trusted_devices[0].label = Some("sqlite-wins".to_owned());
+
+        fs::write(
+            &state_path,
+            serde_json::to_string_pretty(&legacy_state).unwrap(),
+        )
+        .unwrap();
+
+        let loaded_from_legacy = StateStore::load(&state_path).unwrap();
+        assert_eq!(loaded_from_legacy, legacy_state);
+
+        StateStore::save(&state_path, &sqlite_state).unwrap();
+        fs::write(&state_path, "{not-json").unwrap();
+
+        let loaded_from_sqlite = StateStore::load(&state_path).unwrap();
+        assert_eq!(
+            loaded_from_sqlite.daemon_identity,
+            sqlite_state.daemon_identity
+        );
+        assert_eq!(
+            loaded_from_sqlite.trusted_devices,
+            sqlite_state.trusted_devices
+        );
+        assert!(loaded_from_sqlite.sessions.is_empty());
+        cleanup_state_paths(&state_path);
     }
 
     fn sample_state() -> DaemonState {
@@ -380,6 +600,7 @@ mod tests {
             daemon_identity: Some(DaemonIdentitySnapshot {
                 server_id: ServerId::new(),
                 public_key: PublicKey("daemon-public".to_owned()),
+                private_key: Some("ed25519-v1:daemon-private".to_owned()),
             }),
             trusted_devices: vec![TrustedDeviceState {
                 device_id,
@@ -396,5 +617,13 @@ mod tests {
                 updated_at_ms: UnixTimestampMillis(4000),
             }],
         }
+    }
+
+    fn cleanup_state_paths(state_path: &Path) {
+        let sqlite_path = sqlite_state_path_for_state_path(state_path);
+        let _ = fs::remove_file(state_path);
+        let _ = fs::remove_file(&sqlite_path);
+        let _ = fs::remove_file(sqlite_path.with_extension("sqlite-wal"));
+        let _ = fs::remove_file(sqlite_path.with_extension("sqlite-shm"));
     }
 }

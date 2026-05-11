@@ -10,8 +10,8 @@
 - 多客户端 shared-control：多个已配对设备可以同时进入同一个 session 并操作终端。
 - 设备级 pairing/auth：短期 pairing token、device key 验证、challenge-response 和 timestamp/nonce replay protection。
 - E2EE 通信：使用 X25519 + HKDF + ChaCha20Poly1305 封装业务 frame，relay 不解密、不解析业务内容。
-- Web UI 和 CLI：内嵌 Web 终端支持 session、文件面板和 relay Web 配对；`termctl` 支持 `pair/new/attach/control/resize/list`。
-- relay 网络：`termrelay` 是 dumb pipe，按 daemon 内部路由标识转发 WebSocket；每个 `termd` 只主动连接一个 relay，一个 `termrelay` 可以转发多个 daemon，Web 默认使用当前页面地址连接。
+- Web UI 和 CLI：内嵌 Web 终端支持 session、文件面板和 daemon 管理；`termctl` 支持 `pair/new/attach/control/resize/list`。
+- relay 网络：`termrelay` 是 dumb pipe，按 daemon 的公开 `server_id` 路由转发 WebSocket；每个 `termd` 只主动连接一个 relay，一个 `termrelay` 可以转发多个 daemon，Web 默认使用当前页面地址连接。
 - 一键安装与发布：`termctl`、`termd`、`termrelay` 支持 curl/wget 安装；`termd` 和 `termrelay` 支持 systemd，`termrelay` 另有 docker-compose 部署方式。
 
 非目标：把 termd 做成多人平台或企业权限系统。当前设计只面向个人使用和设备级信任。
@@ -78,7 +78,7 @@ wget -qO- https://github.com/yiiilin/termd/releases/latest/download/install-term
 
 `termd pair --qr` 现在输出的是单行邀请码，形如 `termd-pair:v1:<base64url>`。它是对 pairing JSON 的 URL-safe 包装，便于复制粘贴；它不是长期密钥，仍会随 pairing token 过期。
 
-同一份邀请码不携带 direct/relay 地址，只携带 daemon 标识和短期 pairing token。打开 daemon Web 时默认连当前 daemon 页面地址；打开 relay Web 时默认连当前 relay 页面地址；需要切换到其他地址时，在 Web 的高级地址设置里手动填写。relay 本身不读取 pairing token，也不做身份判断，只按 URL 中的 daemon 路由标识转发密文，pairing token 仍由 daemon 验证。
+同一份邀请码不携带 direct/relay 地址，只携带 daemon 标识和短期 pairing token。打开 daemon Web 时默认连当前 daemon 页面地址；打开 relay Web 时默认连当前 relay 页面地址；需要切换到其他地址时，在 Web 的高级地址设置里手动填写。relay 本身不读取 pairing token，也不做身份判断，只在 `/ws` 上按 `route_hello` 里的 `server_id` 转发密文，pairing token 仍由 daemon 验证。
 
 新安装 `termd` 时直接加入 relay：
 
@@ -122,7 +122,7 @@ curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-ter
 
 ## 安全模型
 
-`daemon public key` 是信任根，`device key` 是设备身份，pairing 是建立信任的过程。relay 始终按不可信 dumb pipe 处理，只转发密文 frame，不接触终端明文、文件内容或 session 权限判断。开发验证矩阵见 [docs/qa.md](docs/qa.md)，公网部署细节见 [docs/deployment.md](docs/deployment.md)。
+`daemon public key` 是信任根，`device key` 是设备身份，pairing 是建立信任的过程。`server_id` 只用于 relay 路由。relay 始终按不可信 dumb pipe 处理，只转发密文 frame，不接触终端明文、文件内容或 session 权限判断。开发验证矩阵见 [docs/qa.md](docs/qa.md)，公网部署细节见 [docs/deployment.md](docs/deployment.md)。
 
 ## License
 

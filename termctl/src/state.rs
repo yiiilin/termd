@@ -28,6 +28,12 @@ pub struct PairedServerState {
     pub paired_at_ms: UnixTimestampMillis,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectedServerTarget {
+    pub server: PairedServerState,
+    pub url: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TermctlState {
     #[serde(default)]
@@ -91,6 +97,7 @@ impl TermctlState {
     }
 
     pub fn record_pairing(&mut self, accepted: PairAcceptPayload, url: String) {
+        let url = normalize_ws_url(&url).unwrap_or(url);
         let server = PairedServerState {
             server_id: accepted.server_id,
             daemon_public_key: accepted.daemon_public_key,
@@ -119,12 +126,154 @@ impl TermctlState {
             .cloned()
     }
 
-    pub fn selected_url(&self, requested_url: Option<&str>) -> String {
-        requested_url
-            .map(ToOwned::to_owned)
-            .or_else(|| self.default_url.clone())
-            .unwrap_or_else(|| crate::cli::DEFAULT_URL.to_owned())
+    pub fn selected_route_server_id(&self) -> Option<ServerId> {
+        if let Some(server_id) = self.default_server_id {
+            return Some(server_id);
+        }
+
+        // 旧状态可能没有 default_server_id；只有唯一 daemon 时才自动选择，避免多 daemon
+        // 场景中用 URL 猜路由身份。
+        let mut server_ids = self.paired_servers.iter().map(|server| server.server_id);
+        let first = server_ids.next()?;
+        server_ids
+            .all(|server_id| server_id == first)
+            .then_some(first)
     }
+
+    pub fn selected_url_for_server(
+        &self,
+        server_id: ServerId,
+        requested_url: Option<&str>,
+    ) -> Result<String> {
+        if let Some(url) = requested_url {
+            return normalize_ws_url(url).ok_or(TermctlError::InvalidWsUrl);
+        }
+
+        self.paired_server(server_id)
+            .and_then(|server| normalize_ws_url(&server.url))
+            .or_else(|| {
+                self.default_url
+                    .as_deref()
+                    .and_then(normalize_ws_url)
+                    .filter(|_| self.default_server_id == Some(server_id))
+            })
+            .or_else(|| normalize_ws_url(crate::cli::DEFAULT_URL))
+            .ok_or(TermctlError::InvalidWsUrl)
+    }
+
+    pub fn selected_paired_target(
+        &self,
+        requested_url: Option<&str>,
+    ) -> Result<SelectedServerTarget> {
+        let requested_url = requested_url
+            .map(|url| normalize_ws_url(url).ok_or(TermctlError::InvalidWsUrl))
+            .transpose()?;
+
+        // 如果 URL 与已保存 daemon 完全匹配，就用对应 server_id；这是读取本地状态，
+        // 不是从 URL 结构中反推 server_id。
+        if let Some(url) = requested_url.as_deref() {
+            if let Some(default_server_id) = self.default_server_id {
+                if let Some(server) = self.paired_server(default_server_id) {
+                    if normalize_ws_url(&server.url)
+                        .as_deref()
+                        .is_some_and(|saved_url| saved_url == url)
+                    {
+                        return Ok(SelectedServerTarget {
+                            server,
+                            url: url.to_owned(),
+                        });
+                    }
+                }
+            }
+
+            if let Some(server) = self.paired_servers.iter().find(|server| {
+                normalize_ws_url(&server.url)
+                    .as_deref()
+                    .is_some_and(|saved_url| saved_url == url)
+            }) {
+                return Ok(SelectedServerTarget {
+                    server: server.clone(),
+                    url: url.to_owned(),
+                });
+            }
+        }
+
+        let server_id = self
+            .selected_route_server_id()
+            .ok_or(TermctlError::MissingPairing)?;
+        let server = self
+            .paired_server(server_id)
+            .ok_or(TermctlError::MissingPairing)?;
+        let url = match requested_url {
+            Some(url) => url,
+            None => self.selected_url_for_server(server_id, None)?,
+        };
+
+        Ok(SelectedServerTarget { server, url })
+    }
+}
+
+pub fn normalize_ws_url(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty()
+        || trimmed != value
+        || trimmed.chars().any(char::is_whitespace)
+        || trimmed.contains('#')
+    {
+        return None;
+    }
+
+    let (scheme, rest) = if let Some(rest) = trimmed.strip_prefix("ws://") {
+        ("ws", rest)
+    } else if let Some(rest) = trimmed.strip_prefix("wss://") {
+        ("wss", rest)
+    } else {
+        return None;
+    };
+
+    let (without_query, query) = match rest.split_once('?') {
+        Some((without_query, query)) => (without_query, Some(query)),
+        None => (rest, None),
+    };
+    let (authority, raw_path) = match without_query.split_once('/') {
+        Some((authority, raw_path)) => (authority, raw_path),
+        None => (without_query, ""),
+    };
+    if authority.is_empty() {
+        return None;
+    }
+
+    let mut segments: Vec<&str> = raw_path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    if segments.is_empty() {
+        segments.push("ws");
+    }
+
+    // 兼容旧 relay client URL：`/ws/<server_id>/client` 或 `/prefix/ws/<server_id>/client`。
+    // 这里只把传输入口收敛回 `/ws`，不会把路径里的 server_id 当成路由身份使用。
+    if segments.len() >= 3
+        && segments.last() == Some(&"client")
+        && segments.get(segments.len().saturating_sub(3)) == Some(&"ws")
+    {
+        segments.truncate(segments.len() - 2);
+    }
+
+    if segments.last() != Some(&"ws")
+        || segments
+            .iter()
+            .any(|segment| *segment == "." || *segment == "..")
+    {
+        return None;
+    }
+
+    let mut normalized = format!("{scheme}://{authority}/{}", segments.join("/"));
+    if let Some(query) = query {
+        normalized.push('?');
+        normalized.push_str(query);
+    }
+    Some(normalized)
 }
 
 pub fn resolve_state_path(override_path: Option<PathBuf>) -> PathBuf {
@@ -213,5 +362,82 @@ mod tests {
         let path = dir.path().join("missing.json");
 
         assert_eq!(TermctlState::load(&path).unwrap(), TermctlState::default());
+    }
+
+    #[test]
+    fn normalizes_legacy_relay_client_urls_to_unified_ws_endpoint() {
+        assert_eq!(
+            normalize_ws_url(
+                "wss://relay.example/termd/ws/00000000-0000-0000-0000-000000000001/client?relay_token=redacted"
+            )
+            .unwrap(),
+            "wss://relay.example/termd/ws?relay_token=redacted"
+        );
+        assert_eq!(
+            normalize_ws_url("ws://127.0.0.1:8765").unwrap(),
+            "ws://127.0.0.1:8765/ws"
+        );
+        assert!(normalize_ws_url("https://relay.example/ws").is_none());
+        assert!(normalize_ws_url("wss://relay.example/ws#fragment").is_none());
+    }
+
+    #[test]
+    fn selects_paired_target_from_saved_state_without_url_route_inference() {
+        let first_server_id = ServerId::new();
+        let second_server_id = ServerId::new();
+        let first = PairedServerState {
+            server_id: first_server_id,
+            daemon_public_key: PublicKey("daemon-public-1".to_owned()),
+            url: "wss://relay.example/first/ws".to_owned(),
+            paired_at_ms: UnixTimestampMillis(1),
+        };
+        let second = PairedServerState {
+            server_id: second_server_id,
+            daemon_public_key: PublicKey("daemon-public-2".to_owned()),
+            url: "wss://relay.example/second/ws".to_owned(),
+            paired_at_ms: UnixTimestampMillis(2),
+        };
+        let state = TermctlState {
+            paired_servers: vec![first.clone(), second],
+            default_server_id: Some(second_server_id),
+            ..TermctlState::default()
+        };
+
+        let target = state
+            .selected_paired_target(Some("wss://relay.example/first/ws"))
+            .unwrap();
+
+        assert_eq!(target.server.server_id, first_server_id);
+        assert_eq!(target.url, first.url);
+    }
+
+    #[test]
+    fn selects_default_paired_target_when_multiple_servers_share_the_same_url() {
+        let first_server_id = ServerId::new();
+        let second_server_id = ServerId::new();
+        let shared_url = "wss://relay.example/shared/ws?relay_token=abc".to_owned();
+        let first = PairedServerState {
+            server_id: first_server_id,
+            daemon_public_key: PublicKey("daemon-public-1".to_owned()),
+            url: shared_url.clone(),
+            paired_at_ms: UnixTimestampMillis(1),
+        };
+        let second = PairedServerState {
+            server_id: second_server_id,
+            daemon_public_key: PublicKey("daemon-public-2".to_owned()),
+            url: shared_url.clone(),
+            paired_at_ms: UnixTimestampMillis(2),
+        };
+        let state = TermctlState {
+            paired_servers: vec![first, second.clone()],
+            default_server_id: Some(second_server_id),
+            default_url: Some(shared_url.clone()),
+            ..TermctlState::default()
+        };
+
+        let target = state.selected_paired_target(Some(&shared_url)).unwrap();
+
+        assert_eq!(target.server.server_id, second_server_id);
+        assert_eq!(target.url, shared_url);
     }
 }

@@ -12,7 +12,7 @@ export async function loadBrowserState(): Promise<BrowserState> {
     db.transaction(STORE_NAME, "readonly").objectStore(STORE_NAME).get(STATE_KEY),
   );
   db.close();
-  return state ?? { pairedServers: [] };
+  return normalizeState(state ?? { pairedServers: [] });
 }
 
 export async function saveBrowserState(state: BrowserState): Promise<void> {
@@ -36,11 +36,14 @@ export async function ensureDevice(): Promise<DeviceState> {
 
 export async function recordPairing(accepted: PairAcceptPayload, url: string): Promise<BrowserState> {
   const state = await loadBrowserState();
+  const normalizedUrl = normalizeRouteWsUrl(url, accepted.server_id);
+  const existing = state.pairedServers.find((server) => server.server_id === accepted.server_id);
   const server: PairedServerState = {
     server_id: accepted.server_id,
     daemon_public_key: accepted.daemon_public_key,
-    url,
+    url: normalizedUrl,
     paired_at_ms: Date.now(),
+    ...(existing?.name ? { name: existing.name } : {}),
   };
   const pairedServers = [
     ...state.pairedServers.filter((existing) => existing.server_id !== server.server_id),
@@ -50,14 +53,47 @@ export async function recordPairing(accepted: PairAcceptPayload, url: string): P
     ...state,
     pairedServers,
     defaultServerId: accepted.server_id,
-    defaultUrl: url,
+    defaultUrl: normalizedUrl,
+  });
+  await saveBrowserState(next);
+  return next;
+}
+
+export async function renameDaemon(serverId: string, name: string): Promise<BrowserState> {
+  const cleanName = normalizeDaemonName(name);
+  const state = await loadBrowserState();
+  const next = normalizeState({
+    ...state,
+    pairedServers: state.pairedServers.map((server) =>
+      server.server_id === serverId
+        ? {
+            ...server,
+            name: cleanName,
+          }
+        : server,
+    ),
+  });
+  await saveBrowserState(next);
+  return next;
+}
+
+export async function forgetDaemon(serverId: string): Promise<BrowserState> {
+  const state = await loadBrowserState();
+  const pairedServers = state.pairedServers.filter((server) => server.server_id !== serverId);
+  const defaultServer =
+    pairedServers.find((server) => server.server_id === state.defaultServerId) ?? pairedServers.at(0);
+  const next = normalizeState({
+    ...state,
+    pairedServers,
+    defaultServerId: defaultServer?.server_id,
+    defaultUrl: defaultServer?.url,
   });
   await saveBrowserState(next);
   return next;
 }
 
 export async function recordServerUrl(serverId: string, url: string): Promise<BrowserState> {
-  const cleanUrl = url.trim();
+  const cleanUrl = normalizeRouteWsUrl(url, serverId);
   const state = await loadBrowserState();
   const next = normalizeState({
     ...state,
@@ -103,6 +139,21 @@ function normalizeState(state: BrowserState): BrowserState {
   // IndexedDB 只保存设备身份和 daemon 公开身份；
   // session 文件树位置属于 daemon 共享状态，不能在单个浏览器里各存一份。
   // 这里显式按字段白名单重建对象，避免旧 schema 或污染对象把敏感字段重新写回。
+  const pairedServers = (state.pairedServers ?? []).map((server) => {
+    const name = normalizeDaemonName(server.name);
+    return {
+      server_id: server.server_id,
+      daemon_public_key: server.daemon_public_key,
+      url: normalizeRouteWsUrl(server.url, server.server_id),
+      paired_at_ms: server.paired_at_ms,
+      ...(name ? { name } : {}),
+    };
+  });
+  const defaultUrlServerId = state.defaultServerId ?? pairedServers.at(0)?.server_id;
+  const defaultUrl = state.defaultUrl
+    ? normalizeRouteWsUrl(state.defaultUrl, defaultUrlServerId)
+    : state.defaultUrl;
+
   return {
     device: state.device
       ? {
@@ -111,15 +162,53 @@ function normalizeState(state: BrowserState): BrowserState {
           device_signing_key_secret: state.device.device_signing_key_secret,
         }
       : undefined,
-    pairedServers: (state.pairedServers ?? []).map((server) => ({
-      server_id: server.server_id,
-      daemon_public_key: server.daemon_public_key,
-      url: server.url,
-      paired_at_ms: server.paired_at_ms,
-    })),
+    pairedServers,
     defaultServerId: state.defaultServerId,
-    defaultUrl: state.defaultUrl,
+    defaultUrl,
   };
+}
+
+export function normalizeRouteWsUrl(rawUrl: string, serverId?: string): string {
+  const cleanUrl = rawUrl.trim();
+  try {
+    const parsed = new URL(cleanUrl);
+    if (parsed.protocol !== "ws:" && parsed.protocol !== "wss:") {
+      return cleanUrl;
+    }
+
+    const normalizedPath = parsed.pathname.replace(/\/+$/, "") || "/";
+    if (serverId) {
+      const legacySuffix = `/${serverId}/client`;
+      const legacyBase = normalizedPath.endsWith(legacySuffix)
+        ? normalizedPath.slice(0, -legacySuffix.length)
+        : undefined;
+      if (legacyBase?.endsWith("/ws")) {
+        parsed.pathname = legacyBase;
+        return parsed.toString();
+      }
+    }
+
+    if (normalizedPath === "/") {
+      parsed.pathname = "/ws";
+      return parsed.toString();
+    }
+
+    if (normalizedPath.endsWith("/ws")) {
+      parsed.pathname = normalizedPath;
+      return parsed.toString();
+    }
+    return cleanUrl;
+  } catch {
+    return cleanUrl;
+  }
+}
+
+function normalizeDaemonName(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  return trimmed || undefined;
 }
 
 function openStateDb(): Promise<IDBDatabase> {

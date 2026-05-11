@@ -543,7 +543,7 @@ mod tests {
             max_delay_ms: 10_000,
             heartbeat_interval_ms: 15_000,
         };
-        config.default_pairing_ws_url = "ws://relay.example/ws/server/client".to_owned();
+        config.default_pairing_ws_url = "ws://relay.example/ws".to_owned();
 
         ConfigStore::save(&config_path, &config).unwrap();
 

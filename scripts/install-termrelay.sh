@@ -24,8 +24,13 @@ INSTALL_SET_TLS_CERT=0
 INSTALL_SET_TLS_KEY=0
 ACTION="install"
 PURGE_STATE=0
+LOG_EMITTED=0
 
 log() {
+  if [[ "$LOG_EMITTED" -eq 1 ]]; then
+    printf '\n'
+  fi
+  LOG_EMITTED=1
   printf '[%s-install] %s\n' "$COMPONENT" "$*"
 }
 

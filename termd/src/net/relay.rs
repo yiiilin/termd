@@ -8,7 +8,12 @@ use std::time::Duration;
 
 use base64::{Engine as _, engine::general_purpose};
 use futures_util::{SinkExt, StreamExt};
-use termd_proto::{RelayClientId, RelayMuxEnvelope, RelayOpaqueFrame, ServerId, SessionId};
+use termd_proto::{
+    Envelope as ProtoEnvelope, MessageType as ProtoMessageType, Nonce as ProtoNonce,
+    ProtocolVersion as ProtoProtocolVersion, RelayClientId, RelayMuxEnvelope, RelayOpaqueFrame,
+    RouteHelloPayload as ProtoRouteHelloPayload, RouteReadyPayload as ProtoRouteReadyPayload,
+    RouteRole as ProtoRouteRole, ServerId, SessionId,
+};
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -16,6 +21,7 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, warn};
 
+use crate::auth::current_unix_timestamp_millis;
 use crate::config::RelayReconnectConfig;
 
 use super::protocol::{JsonEnvelope, ProtocolConnection, ProtocolError};
@@ -24,6 +30,11 @@ use super::server::SharedDaemonProtocol;
 const OUTPUT_FLUSH_MAX_BYTES_PER_SESSION: usize = 16 * 1024;
 const MIN_RELAY_RETRY_DELAY_MS: u64 = 1;
 const MIN_RELAY_HEARTBEAT_INTERVAL_MS: u64 = 1;
+
+type RelayWs =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+type RelaySender = futures_util::stream::SplitSink<RelayWs, Message>;
+type RelayReceiver = futures_util::stream::SplitStream<RelayWs>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RelayPushEvent {
@@ -149,29 +160,16 @@ impl RelayBaseUrl {
         )
     }
 
-    pub fn daemon_mux_url(&self, server_id: ServerId) -> String {
-        format!(
-            "{}://{}{}{}/daemon-mux",
-            self.scheme.as_str(),
-            self.authority,
-            self.base_path.daemon_mux_prefix(),
-            server_id.0
-        )
+    pub fn daemon_mux_url(&self, _server_id: ServerId) -> String {
+        self.unified_ws_url()
     }
 
     pub fn daemon_mux_url_with_auth(
         &self,
-        server_id: ServerId,
+        _server_id: ServerId,
         auth_token: Option<&str>,
     ) -> String {
-        let base = self.daemon_mux_url(server_id);
-        match auth_token {
-            Some(auth_token) => format!(
-                "{base}?relay_token={}",
-                percent_encode_query_value(auth_token)
-            ),
-            None => base,
-        }
+        self.unified_ws_url_with_auth(auth_token)
     }
 
     pub fn client_url_template(&self) -> String {
@@ -179,12 +177,20 @@ impl RelayBaseUrl {
     }
 
     pub fn client_url_template_with_auth(&self, auth_token: Option<&str>) -> String {
-        let base = format!(
-            "{}://{}{}{{server_id}}/client",
+        self.unified_ws_url_with_auth(auth_token)
+    }
+
+    fn unified_ws_url(&self) -> String {
+        format!(
+            "{}://{}{}",
             self.scheme.as_str(),
             self.authority,
-            self.base_path.daemon_mux_prefix()
-        );
+            self.base_path.endpoint_suffix()
+        )
+    }
+
+    fn unified_ws_url_with_auth(&self, auth_token: Option<&str>) -> String {
+        let base = self.unified_ws_url();
         match auth_token {
             Some(auth_token) => format!(
                 "{base}?relay_token={}",
@@ -213,7 +219,7 @@ impl RelayUrlScheme {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RelayBasePath {
     canonical_suffix: String,
-    route_prefix: String,
+    endpoint_suffix: String,
 }
 
 impl RelayBasePath {
@@ -221,14 +227,14 @@ impl RelayBasePath {
         let Some(raw_path) = raw_path else {
             return Ok(Self {
                 canonical_suffix: String::new(),
-                route_prefix: "/ws/".to_owned(),
+                endpoint_suffix: "/ws".to_owned(),
             });
         };
         let trimmed = raw_path.trim_matches('/');
         if trimmed.is_empty() {
             return Ok(Self {
                 canonical_suffix: String::new(),
-                route_prefix: "/ws/".to_owned(),
+                endpoint_suffix: "/ws".to_owned(),
             });
         }
         if trimmed.contains("//")
@@ -250,7 +256,7 @@ impl RelayBasePath {
 
         Ok(Self {
             canonical_suffix: format!("/{trimmed}"),
-            route_prefix: format!("/{trimmed}/"),
+            endpoint_suffix: format!("/{trimmed}"),
         })
     }
 
@@ -258,8 +264,8 @@ impl RelayBasePath {
         &self.canonical_suffix
     }
 
-    fn daemon_mux_prefix(&self) -> &str {
-        &self.route_prefix
+    fn endpoint_suffix(&self) -> &str {
+        &self.endpoint_suffix
     }
 }
 
@@ -354,6 +360,9 @@ async fn connect_relay_mux_base_with_heartbeat(
         .await
         .map_err(|_| RelayConnectorError::ConnectFailed)?;
     let (mut sender, mut receiver) = socket.split();
+    send_route_hello(&mut sender, server_id).await?;
+    read_route_ready(&mut sender, &mut receiver, server_id).await?;
+
     let mut connections = HashMap::<RelayClientId, ProtocolConnection>::new();
     let (push_event_tx, mut push_event_rx) = mpsc::unbounded_channel::<RelayPushEvent>();
     let mut watched_output_sessions = HashMap::<RelayClientId, HashSet<SessionId>>::new();
@@ -475,6 +484,81 @@ async fn connect_relay_mux_base_with_heartbeat(
     abort_relay_watcher_tasks(watcher_tasks);
     close_relay_connections(protocol, connections);
     result
+}
+
+async fn send_route_hello(
+    sender: &mut RelaySender,
+    server_id: ServerId,
+) -> Result<(), RelayConnectorError> {
+    let envelope = ProtoEnvelope::new(
+        ProtoMessageType::RouteHello,
+        ProtoRouteHelloPayload {
+            server_id,
+            role: ProtoRouteRole::DaemonMux,
+            protocol_version: ProtoProtocolVersion::default(),
+            nonce: relay_route_nonce(),
+            timestamp_ms: current_unix_timestamp_millis(),
+        },
+    );
+    let raw = serde_json::to_string(&envelope).map_err(|_| RelayConnectorError::InvalidEnvelope)?;
+    sender
+        .send(Message::Text(raw.into()))
+        .await
+        .map_err(|_| RelayConnectorError::SendFailed)
+}
+
+async fn read_route_ready(
+    sender: &mut RelaySender,
+    receiver: &mut RelayReceiver,
+    expected_server_id: ServerId,
+) -> Result<(), RelayConnectorError> {
+    loop {
+        let Some(message) = receiver.next().await else {
+            return Err(RelayConnectorError::ReceiveFailed);
+        };
+        let message = message.map_err(|_| RelayConnectorError::ReceiveFailed)?;
+
+        match message {
+            Message::Text(raw) => {
+                let envelope: JsonEnvelope = serde_json::from_str(raw.as_str())
+                    .map_err(|_| RelayConnectorError::InvalidEnvelope)?;
+                validate_route_ready(envelope, expected_server_id)?;
+                return Ok(());
+            }
+            Message::Binary(raw) => {
+                let envelope: JsonEnvelope = serde_json::from_slice(&raw)
+                    .map_err(|_| RelayConnectorError::InvalidEnvelope)?;
+                validate_route_ready(envelope, expected_server_id)?;
+                return Ok(());
+            }
+            Message::Ping(payload) => {
+                if sender.send(Message::Pong(payload)).await.is_err() {
+                    return Err(RelayConnectorError::SendFailed);
+                }
+            }
+            Message::Pong(_) | Message::Frame(_) => {}
+            Message::Close(_) => return Err(RelayConnectorError::ReceiveFailed),
+        }
+    }
+}
+
+fn validate_route_ready(
+    envelope: JsonEnvelope,
+    expected_server_id: ServerId,
+) -> Result<(), RelayConnectorError> {
+    if envelope.kind != ProtoMessageType::RouteReady {
+        return Err(RelayConnectorError::InvalidEnvelope);
+    }
+    let payload: ProtoRouteReadyPayload = serde_json::from_value(envelope.payload)
+        .map_err(|_| RelayConnectorError::InvalidEnvelope)?;
+    if payload.server_id != expected_server_id || payload.role != ProtoRouteRole::DaemonMux {
+        return Err(RelayConnectorError::InvalidEnvelope);
+    }
+    Ok(())
+}
+
+fn relay_route_nonce() -> ProtoNonce {
+    ProtoNonce(format!("relay-route-{}", ServerId::new().0))
 }
 
 fn handle_mux_envelope(
@@ -684,12 +768,7 @@ fn client_envelopes(
 }
 
 async fn send_mux_envelopes(
-    sender: &mut futures_util::stream::SplitSink<
-        tokio_tungstenite::WebSocketStream<
-            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-        >,
-        Message,
-    >,
+    sender: &mut RelaySender,
     envelopes: Vec<RelayMuxEnvelope>,
 ) -> Result<(), RelayConnectorError> {
     for envelope in envelopes {
@@ -812,7 +891,10 @@ mod tests {
         atomic::{AtomicU64, AtomicUsize, Ordering},
     };
     use std::time::Duration;
-    use termd_proto::{Envelope, MessageType, PingPayload};
+    use termd_proto::{
+        Envelope, MessageType, PingPayload, ProtocolVersion, RouteHelloPayload, RouteReadyPayload,
+        RouteRole,
+    };
 
     static TEST_STATE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -831,51 +913,43 @@ mod tests {
     }
 
     #[test]
-    fn parses_relay_base_url_and_builds_daemon_mux_url() {
+    fn parses_relay_base_url_and_builds_unified_ws_url() {
         let server_id = ServerId::new();
         let base = RelayBaseUrl::parse("ws://127.0.0.1:8080/").unwrap();
         let url = base.daemon_mux_url(server_id);
 
-        assert_eq!(
-            url,
-            format!("ws://127.0.0.1:8080/ws/{}/daemon-mux", server_id.0)
-        );
+        assert_eq!(url, "ws://127.0.0.1:8080/ws");
     }
 
     #[test]
     fn parses_wss_relay_base_url_and_preserves_secure_scheme() {
-        let server_id = ServerId::new();
         let base = RelayBaseUrl::parse("wss://relay.example:443").unwrap();
 
         assert_eq!(
-            base.daemon_mux_url(server_id),
-            format!("wss://relay.example:443/ws/{}/daemon-mux", server_id.0)
+            base.daemon_mux_url(ServerId::new()),
+            "wss://relay.example:443/ws"
         );
     }
 
     #[test]
-    fn parses_wss_relay_base_path_and_builds_single_layer_daemon_mux_url() {
-        let server_id = ServerId::new();
+    fn parses_wss_relay_base_path_and_builds_single_layer_ws_url() {
         let base = RelayBaseUrl::parse("wss://termd.yiln.de/ws").unwrap();
 
         assert_eq!(base.canonical_url(), "wss://termd.yiln.de/ws");
         assert_eq!(
-            base.daemon_mux_url(server_id),
-            format!("wss://termd.yiln.de/ws/{}/daemon-mux", server_id.0)
+            base.daemon_mux_url(ServerId::new()),
+            "wss://termd.yiln.de/ws"
         );
     }
 
     #[test]
-    fn relay_base_url_builds_client_url_template() {
+    fn relay_base_url_builds_unified_pairing_ws_url() {
         let base = RelayBaseUrl::parse("wss://termd.yiln.de/ws").unwrap();
 
-        assert_eq!(
-            base.client_url_template(),
-            "wss://termd.yiln.de/ws/{server_id}/client"
-        );
+        assert_eq!(base.client_url_template(), "wss://termd.yiln.de/ws");
         assert_eq!(
             base.client_url_template_with_auth(Some("relay secret")),
-            "wss://termd.yiln.de/ws/{server_id}/client?relay_token=relay%20secret"
+            "wss://termd.yiln.de/ws?relay_token=relay%20secret"
         );
     }
 
@@ -887,12 +961,9 @@ mod tests {
         assert_eq!(base.canonical_url(), "wss://relay.example/termd/ws");
         assert_eq!(
             base.daemon_mux_url(server_id),
-            format!("wss://relay.example/termd/ws/{}/daemon-mux", server_id.0)
+            "wss://relay.example/termd/ws"
         );
-        assert_eq!(
-            base.client_url_template(),
-            "wss://relay.example/termd/ws/{server_id}/client"
-        );
+        assert_eq!(base.client_url_template(), "wss://relay.example/termd/ws");
     }
 
     #[test]
@@ -903,18 +974,12 @@ mod tests {
     }
 
     #[test]
-    fn daemon_mux_url_can_carry_relay_auth_token_without_debug_leakage() {
+    fn unified_ws_url_can_carry_relay_auth_token_without_debug_leakage() {
         let server_id = ServerId::new();
         let base = RelayBaseUrl::parse("ws://127.0.0.1:8080/").unwrap();
         let url = base.daemon_mux_url_with_auth(server_id, Some("relay-secret-1"));
 
-        assert_eq!(
-            url,
-            format!(
-                "ws://127.0.0.1:8080/ws/{}/daemon-mux?relay_token=relay-secret-1",
-                server_id.0
-            )
-        );
+        assert_eq!(url, "ws://127.0.0.1:8080/ws?relay_token=relay-secret-1");
         assert!(!format!("{base:?}").contains("relay-secret-1"));
     }
 
@@ -968,7 +1033,7 @@ mod tests {
     async fn reconnect_supervisor_retries_after_close_and_sends_heartbeat() {
         let state = MockMuxState::default();
         let app = axum::Router::new()
-            .route("/ws/:server_id/daemon-mux", get(mock_daemon_mux_ws))
+            .route("/ws", get(mock_daemon_mux_ws))
             .with_state(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1020,6 +1085,23 @@ mod tests {
                 // 首次连接立即关闭，用来证明 supervisor 会按退避重新拨号。
                 return;
             }
+            let Some(route_hello) = read_axum_route_hello(&mut socket).await else {
+                return;
+            };
+            if route_hello.role != RouteRole::DaemonMux {
+                return;
+            }
+            let route_ready = Envelope::new(
+                MessageType::RouteReady,
+                RouteReadyPayload {
+                    server_id: route_hello.server_id,
+                    role: RouteRole::DaemonMux,
+                },
+            );
+            let raw = serde_json::to_string(&route_ready).unwrap();
+            if socket.send(AxumMessage::Text(raw.into())).await.is_err() {
+                return;
+            }
 
             while let Some(message) = socket.next().await {
                 match message {
@@ -1033,6 +1115,31 @@ mod tests {
                 }
             }
         })
+    }
+
+    async fn read_axum_route_hello(
+        socket: &mut axum::extract::ws::WebSocket,
+    ) -> Option<RouteHelloPayload> {
+        loop {
+            let message = socket.next().await?.ok()?;
+            match message {
+                AxumMessage::Text(raw) => {
+                    let envelope: JsonEnvelope = serde_json::from_str(raw.as_str()).ok()?;
+                    assert_eq!(envelope.kind, MessageType::RouteHello);
+                    return decode_payload(envelope.payload).ok();
+                }
+                AxumMessage::Binary(raw) => {
+                    let envelope: JsonEnvelope = serde_json::from_slice(&raw).ok()?;
+                    assert_eq!(envelope.kind, MessageType::RouteHello);
+                    return decode_payload(envelope.payload).ok();
+                }
+                AxumMessage::Ping(payload) => {
+                    let _ = socket.send(AxumMessage::Pong(payload)).await;
+                }
+                AxumMessage::Pong(_) => {}
+                AxumMessage::Close(_) => return None,
+            }
+        }
     }
 
     #[test]
@@ -1240,6 +1347,11 @@ mod tests {
         let (tcp, _) = listener.accept().await.unwrap();
         let mut relay_socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
         let client_id = RelayClientId(77);
+        let expected_server_id = protocol
+            .lock()
+            .expect("daemon protocol mutex poisoned")
+            .server_id();
+        complete_relay_route_prelude(&mut relay_socket, expected_server_id).await;
 
         send_mux_to_connector(
             &mut relay_socket,
@@ -1387,6 +1499,11 @@ mod tests {
         let (tcp, _) = listener.accept().await.unwrap();
         let mut relay_socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
         let client_id = RelayClientId(78);
+        let expected_server_id = protocol
+            .lock()
+            .expect("daemon protocol mutex poisoned")
+            .server_id();
+        complete_relay_route_prelude(&mut relay_socket, expected_server_id).await;
 
         send_mux_to_connector(
             &mut relay_socket,
@@ -1670,6 +1787,60 @@ mod tests {
     ) {
         let raw = serde_json::to_string(&envelope).unwrap();
         socket.send(Message::Text(raw.into())).await.unwrap();
+    }
+
+    async fn complete_relay_route_prelude(
+        socket: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+        expected_server_id: ServerId,
+    ) {
+        let route_hello = tokio::time::timeout(
+            Duration::from_secs(1),
+            read_route_hello_from_connector(socket),
+        )
+        .await
+        .expect("connector should send route_hello before relay mux envelopes");
+        assert_eq!(route_hello.server_id, expected_server_id);
+        assert_eq!(route_hello.role, RouteRole::DaemonMux);
+        assert_eq!(route_hello.protocol_version, ProtocolVersion::default());
+
+        let route_ready = Envelope::new(
+            MessageType::RouteReady,
+            RouteReadyPayload {
+                server_id: expected_server_id,
+                role: RouteRole::DaemonMux,
+            },
+        );
+        socket
+            .send(Message::Text(
+                serde_json::to_string(&route_ready).unwrap().into(),
+            ))
+            .await
+            .unwrap();
+    }
+
+    async fn read_route_hello_from_connector(
+        socket: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    ) -> RouteHelloPayload {
+        loop {
+            let message = socket.next().await.unwrap().unwrap();
+            match message {
+                Message::Text(raw) => {
+                    let envelope: JsonEnvelope = serde_json::from_str(raw.as_str()).unwrap();
+                    assert_eq!(envelope.kind, MessageType::RouteHello);
+                    return decode_payload(envelope.payload).unwrap();
+                }
+                Message::Binary(raw) => {
+                    let envelope: JsonEnvelope = serde_json::from_slice(&raw).unwrap();
+                    assert_eq!(envelope.kind, MessageType::RouteHello);
+                    return decode_payload(envelope.payload).unwrap();
+                }
+                Message::Ping(payload) => {
+                    socket.send(Message::Pong(payload)).await.unwrap();
+                }
+                Message::Pong(_) | Message::Frame(_) => continue,
+                Message::Close(frame) => panic!("relay mux closed unexpectedly: {frame:?}"),
+            }
+        }
     }
 
     async fn send_mux_client_json(

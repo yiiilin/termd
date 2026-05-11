@@ -11,8 +11,13 @@ INSTALL_PREFIX="${TERMD_INSTALL_PREFIX:-/usr/local}"
 REPO="${TERMD_GITHUB_REPO:-${GITHUB_REPOSITORY:-}}"
 VERSION="${TERMD_VERSION:-}"
 ACTION="install"
+LOG_EMITTED=0
 
 log() {
+  if [[ "$LOG_EMITTED" -eq 1 ]]; then
+    printf '\n'
+  fi
+  LOG_EMITTED=1
   printf '[%s-install] %s\n' "$COMPONENT" "$*"
 }
 

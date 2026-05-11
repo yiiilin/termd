@@ -24,9 +24,29 @@ describe("DirectClient", () => {
     await daemon.stop();
   });
 
+  it("连接后第一帧发送 route_hello，然后才进入 hello/E2EE 握手", async () => {
+    const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000306");
+    const client = await DirectClient.connect(daemon.url, daemon.serverId, device.device_id, { timeoutMs: 3000 });
+    client.close();
+
+    const firstOuter = JSON.parse(daemon.outerWireLog[0]) as {
+      type: string;
+      payload: { server_id: string; role: string; protocol_version: number; nonce?: string };
+    };
+    expect(firstOuter).toMatchObject({
+      type: "route_hello",
+      payload: {
+        server_id: daemon.serverId,
+        role: "client",
+        protocol_version: 1,
+      },
+    });
+    expect(firstOuter.payload.nonce).toMatch(/^nonce-/);
+  });
+
   it("完成 E2EE 内层 pairing，并且 outer wire 不包含 token", async () => {
     const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000302");
-    const client = await DirectClient.connect(daemon.url, device.device_id, { timeoutMs: 3000 });
+    const client = await DirectClient.connect(daemon.url, daemon.serverId, device.device_id, { timeoutMs: 3000 });
 
     const accepted = await client.pair("secret-token", device.device_public_key);
     client.close();
@@ -39,11 +59,11 @@ describe("DirectClient", () => {
 
   it("已信任的同一浏览器 device 可以重新 pairing", async () => {
     const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000305");
-    const firstClient = await DirectClient.connect(daemon.url, device.device_id, { timeoutMs: 3000 });
+    const firstClient = await DirectClient.connect(daemon.url, daemon.serverId, device.device_id, { timeoutMs: 3000 });
     const firstAccepted = await firstClient.pair("secret-token", device.device_public_key);
     firstClient.close();
 
-    const secondClient = await DirectClient.connect(daemon.url, device.device_id, { timeoutMs: 3000 });
+    const secondClient = await DirectClient.connect(daemon.url, daemon.serverId, device.device_id, { timeoutMs: 3000 });
     const secondAccepted = await secondClient.pair("secret-token", device.device_public_key);
     secondClient.close();
 
@@ -53,11 +73,11 @@ describe("DirectClient", () => {
 
   it("已配对设备可 auth、list、attach、shared-control noop，并隐藏终端输入明文", async () => {
     const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000303");
-    const pairClient = await DirectClient.connect(daemon.url, device.device_id, { timeoutMs: 3000 });
+    const pairClient = await DirectClient.connect(daemon.url, daemon.serverId, device.device_id, { timeoutMs: 3000 });
     const accepted = await pairClient.pair("secret-token", device.device_public_key);
     pairClient.close();
 
-    const client = await DirectClient.connect(daemon.url, device.device_id, { timeoutMs: 3000 });
+    const client = await DirectClient.connect(daemon.url, daemon.serverId, device.device_id, { timeoutMs: 3000 });
     await client.authenticate(device, {
       server_id: accepted.server_id,
       daemon_public_key: accepted.daemon_public_key,
@@ -86,7 +106,7 @@ describe("DirectClient", () => {
 
   it("协议错误只暴露稳定 code 和安全 message", async () => {
     const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000304");
-    const client = await DirectClient.connect(daemon.url, device.device_id, { timeoutMs: 3000 });
+    const client = await DirectClient.connect(daemon.url, daemon.serverId, device.device_id, { timeoutMs: 3000 });
 
     await expect(client.pair("wrong-token", device.device_public_key)).rejects.toMatchObject({
       code: "pairing_failed",

@@ -254,15 +254,20 @@ where
         verifier: V,
         state: DaemonState,
     ) -> Result<Self, StateError> {
-        let daemon_identity = state
-            .daemon_identity
-            .map(|identity| {
-                DaemonIdentity::from_persisted_public_identity(
+        let daemon_identity = match state.daemon_identity {
+            Some(identity) => match identity.private_key {
+                Some(private_key) => DaemonIdentity::from_persisted_identity(
                     identity.server_id,
                     identity.public_key,
+                    private_key,
                 )
-            })
-            .unwrap_or_else(DaemonIdentity::generate);
+                .map_err(|source| StateError::InvalidDaemonIdentity {
+                    source: source.to_string(),
+                })?,
+                None => DaemonIdentity::generate_for_server_id(identity.server_id),
+            },
+            None => DaemonIdentity::generate(),
+        };
         let trusted_store = InMemoryTrustedDeviceStore::from_trusted_devices(
             state
                 .trusted_devices
@@ -304,7 +309,7 @@ where
         })
     }
 
-    /// 生成可写入本地 JSON 的最小状态快照。
+    /// 生成可写入本地 SQLite 的最小状态快照。
     ///
     /// 不保存 pairing token、auth challenge、E2EE 临时密钥、PTY 输出或终端输入。
     pub fn snapshot_state(&self) -> DaemonState {
@@ -320,9 +325,10 @@ where
             daemon_identity: Some(DaemonIdentitySnapshot {
                 server_id: self.daemon_identity.server_id(),
                 public_key: self.daemon_identity.public_key().clone(),
+                private_key: Some(self.daemon_identity.private_key_for_persistence()),
             }),
             trusted_devices,
-            // 运行中 PTY 进程无法通过 JSON 安全恢复；这里保持空列表，避免制造假 session。
+            // 运行中 PTY 进程无法通过持久状态安全恢复；这里保持空列表，避免制造假 session。
             sessions: Vec::new(),
         }
     }
@@ -2606,6 +2612,47 @@ mod tests {
         );
 
         std::fs::remove_file(state_path).ok();
+    }
+
+    #[test]
+    fn legacy_fake_daemon_public_key_migration_keeps_server_id_and_generates_static_keypair() {
+        let server_id = ServerId::new();
+        let state = DaemonState {
+            version: crate::state::STATE_SCHEMA_VERSION,
+            daemon_identity: Some(DaemonIdentitySnapshot {
+                server_id,
+                public_key: PublicKey(format!("termd-daemon-public-{}", server_id.0)),
+                private_key: None,
+            }),
+            trusted_devices: Vec::new(),
+            sessions: Vec::new(),
+        };
+        let backend = FakePtyBackend::default();
+        let config = DaemonConfig::default_for_state_path(temp_state_path("legacy-identity.json"));
+
+        let protocol =
+            DaemonProtocol::from_state(config, backend, Ed25519SignatureVerifier, state).unwrap();
+
+        assert_eq!(protocol.server_id(), server_id);
+        assert!(
+            protocol
+                .daemon_public_identity()
+                .public_key
+                .0
+                .starts_with("ed25519-v1:")
+        );
+        assert_ne!(
+            protocol.daemon_public_identity().public_key.0,
+            format!("termd-daemon-public-{}", server_id.0)
+        );
+        assert!(
+            protocol
+                .snapshot_state()
+                .daemon_identity
+                .unwrap()
+                .private_key
+                .is_some()
+        );
     }
 
     #[test]

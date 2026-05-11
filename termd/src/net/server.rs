@@ -18,8 +18,8 @@ use futures_util::{SinkExt, StreamExt};
 use rustls::pki_types::pem::PemObject;
 use serde::Serialize;
 use termd_proto::{
-    ErrorPayload, MessageType, PairingToken, ProtocolVersion, ServerId, SessionId,
-    UnixTimestampMillis,
+    ErrorPayload, MessageType, PairingToken, ProtocolVersion, RouteHelloPayload, RouteReadyPayload,
+    RouteRole, ServerId, SessionId, UnixTimestampMillis,
 };
 use thiserror::Error;
 use tokio::net::TcpListener;
@@ -32,7 +32,7 @@ use crate::config::DaemonConfig;
 use crate::state::{StateError, StateStore};
 
 use super::protocol::{
-    DaemonProtocol, JsonEnvelope, ProtocolConnection, ProtocolError, envelope_value,
+    DaemonProtocol, JsonEnvelope, ProtocolConnection, ProtocolError, decode_payload, envelope_value,
 };
 use super::pty_bridge::NonBlockingPortablePtyBackend;
 use super::signature::Ed25519SignatureVerifier;
@@ -364,12 +364,87 @@ async fn ws_handler(
     websocket.on_upgrade(move |socket| handle_socket(socket, protocol, peer_addr))
 }
 
+async fn read_route_hello(
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    receiver: &mut futures_util::stream::SplitStream<WebSocket>,
+    expected_server_id: ServerId,
+) -> Result<RouteHelloPayload, ProtocolError> {
+    loop {
+        let Some(message) = receiver.next().await else {
+            return Err(ProtocolError::InvalidEnvelope);
+        };
+        let message = message.map_err(|error| {
+            warn!(%error, "websocket receive failed while waiting for route prelude");
+            ProtocolError::InvalidEnvelope
+        })?;
+
+        match message {
+            Message::Ping(payload) => {
+                let _ = sender.send(Message::Pong(payload)).await;
+            }
+            Message::Pong(_) => continue,
+            Message::Close(_) => return Err(ProtocolError::InvalidEnvelope),
+            other => {
+                let Some(envelope) = message_to_envelope(other)? else {
+                    return Err(ProtocolError::InvalidEnvelope);
+                };
+                if envelope.kind != MessageType::RouteHello {
+                    return Err(ProtocolError::InvalidEnvelope);
+                }
+
+                let payload: RouteHelloPayload = decode_payload(envelope.payload)?;
+                if payload.protocol_version != ProtocolVersion::default() {
+                    return Err(ProtocolError::InvalidEnvelope);
+                }
+                if payload.server_id != expected_server_id {
+                    return Err(ProtocolError::InvalidEnvelope);
+                }
+                if payload.role != RouteRole::Client {
+                    return Err(ProtocolError::InvalidEnvelope);
+                }
+
+                return Ok(payload);
+            }
+        }
+    }
+}
+
+fn route_ready_envelope(server_id: ServerId, role: RouteRole) -> JsonEnvelope {
+    envelope_value(
+        MessageType::RouteReady,
+        RouteReadyPayload { server_id, role },
+    )
+    .expect("route_ready payload should serialize")
+}
+
 async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_addr: SocketAddr) {
     let (mut sender, mut receiver) = socket.split();
     let (push_event_tx, mut push_event_rx) = mpsc::unbounded_channel::<SessionPushEvent>();
     let mut watched_output_sessions = HashSet::new();
     let mut watched_file_tree_sessions = HashSet::new();
     let mut watcher_tasks: Vec<JoinHandle<()>> = Vec::new();
+    let server_id = {
+        let protocol = protocol.lock().expect("daemon protocol mutex poisoned");
+        protocol.server_id()
+    };
+
+    let route_hello = match read_route_hello(&mut sender, &mut receiver, server_id).await {
+        Ok(route_hello) => route_hello,
+        Err(error) => {
+            let _ = send_envelope(&mut sender, plaintext_error(error)).await;
+            return;
+        }
+    };
+    if send_envelope(
+        &mut sender,
+        route_ready_envelope(route_hello.server_id, route_hello.role),
+    )
+    .await
+    .is_err()
+    {
+        return;
+    }
+
     let (mut connection, initial_messages) = {
         let protocol = protocol.lock().expect("daemon protocol mutex poisoned");
         protocol.start_connection_for_peer(Some(peer_addr.ip().to_string()))
@@ -592,8 +667,8 @@ mod tests {
     use std::io::{Read, Write};
     use std::path::PathBuf;
     use termd_proto::{
-        DeviceId, E2eeKeyExchangePayload, PairAcceptPayload, PairRequestPayload, PublicKey,
-        SessionCreatePayload, SessionCreatedPayload, SessionDataPayload, TerminalSize,
+        DeviceId, E2eeKeyExchangePayload, Envelope, PairAcceptPayload, PairRequestPayload,
+        PublicKey, SessionCreatePayload, SessionCreatedPayload, SessionDataPayload, TerminalSize,
         UnixTimestampMillis,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -712,14 +787,8 @@ mod tests {
     async fn local_pairing_token_endpoint_returns_configured_relay_client_url() {
         let mut config = test_config("local-pairing-token-relay-url");
         config.relay_endpoints = vec!["wss://relay.example/ws".to_owned()];
-        config.default_pairing_ws_url = "wss://relay.example/ws/{server_id}/client".to_owned();
+        config.default_pairing_ws_url = "wss://relay.example/ws".to_owned();
         let protocol = default_protocol(config);
-        let server_id = {
-            protocol
-                .lock()
-                .expect("daemon protocol mutex poisoned")
-                .server_id()
-        };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server_protocol = protocol.clone();
@@ -733,15 +802,18 @@ mod tests {
 
         assert_eq!(response.status, 200);
         let payload: PairingTokenResponse = serde_json::from_str(&response.body).unwrap();
-        assert_eq!(
-            payload.ws_url,
-            format!("wss://relay.example/ws/{}/client", server_id.0)
-        );
+        assert_eq!(payload.ws_url, "wss://relay.example/ws");
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn websocket_pushes_session_output_without_client_poll_frame() {
         let protocol = test_protocol("websocket-push");
+        let server_id = {
+            protocol
+                .lock()
+                .expect("daemon protocol mutex poisoned")
+                .server_id()
+        };
         let pairing_token = {
             protocol
                 .lock()
@@ -761,6 +833,7 @@ mod tests {
         let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
             .await
             .unwrap();
+        send_ws_route_hello(&mut socket, server_id).await;
         let hello = read_ws_envelope(&mut socket).await;
         assert_eq!(hello.kind, MessageType::Hello);
         let key_exchange = read_ws_envelope(&mut socket).await;
@@ -928,6 +1001,27 @@ mod tests {
                 ClientWsMessage::Frame(_) => continue,
             }
         }
+    }
+
+    async fn send_ws_route_hello(socket: &mut TestWs, server_id: ServerId) {
+        let envelope = Envelope::new(
+            MessageType::RouteHello,
+            RouteHelloPayload {
+                server_id,
+                role: RouteRole::Client,
+                protocol_version: ProtocolVersion::default(),
+                nonce: termd_proto::Nonce("route-test-nonce".to_owned()),
+                timestamp_ms: current_unix_timestamp_millis(),
+            },
+        );
+        let raw = serde_json::to_string(&envelope).unwrap();
+        socket.send(ClientWsMessage::Text(raw)).await.unwrap();
+
+        let ready = read_ws_envelope(socket).await;
+        assert_eq!(ready.kind, MessageType::RouteReady);
+        let payload: RouteReadyPayload = decode_payload(ready.payload).unwrap();
+        assert_eq!(payload.server_id, server_id);
+        assert_eq!(payload.role, RouteRole::Client);
     }
 
     async fn send_ws_envelope(socket: &mut TestWs, envelope: JsonEnvelope) {

@@ -3,9 +3,11 @@ import { generateDeviceIdentity } from "../protocol/auth";
 import {
   clearBrowserState,
   ensureDevice,
+  forgetDaemon,
   loadBrowserState,
   recordPairing,
   recordServerUrl,
+  renameDaemon,
   saveBrowserState,
 } from "../state/browser-state";
 import type { BrowserState } from "../protocol/types";
@@ -84,7 +86,8 @@ describe("浏览器本地状态", () => {
     const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000026");
     const serverId = "00000000-0000-0000-0000-000000000027";
     const directUrl = "ws://127.0.0.1:8765/ws";
-    const relayUrl = `wss://relay.example/ws/${serverId}/client?relay_token=relay-secret`;
+    const legacyRelayUrl = `wss://relay.example/ws/${serverId}/client?relay_token=relay-secret`;
+    const relayUrl = "wss://relay.example/ws?relay_token=relay-secret";
 
     await saveBrowserState({ device, pairedServers: [] });
     await recordPairing(
@@ -97,12 +100,76 @@ describe("浏览器本地状态", () => {
       directUrl,
     );
 
-    const next = await recordServerUrl(serverId, relayUrl);
+    const next = await recordServerUrl(serverId, legacyRelayUrl);
     const loaded = await loadBrowserState();
 
     expect(next.defaultUrl).toBe(relayUrl);
     expect(defaultServerUrl(next)).toBe(relayUrl);
     expect(defaultServerUrl(loaded)).toBe(relayUrl);
+  });
+
+  it("会把旧的裸 websocket 主机地址归一到 /ws", async () => {
+    const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000028");
+
+    await saveBrowserState({
+      device,
+      pairedServers: [
+        {
+          server_id: "00000000-0000-0000-0000-000000000029",
+          daemon_public_key: "ed25519-v1:daemon-public",
+          url: "ws://127.0.0.1:8765",
+          paired_at_ms: 1710000000000,
+        },
+      ],
+      defaultServerId: "00000000-0000-0000-0000-000000000029",
+      defaultUrl: "ws://127.0.0.1:8765",
+    });
+
+    const loaded = await loadBrowserState();
+
+    expect(loaded.defaultUrl).toBe("ws://127.0.0.1:8765/ws");
+    expect(defaultServerUrl(loaded)).toBe("ws://127.0.0.1:8765/ws");
+  });
+
+  it("支持重命名和删除已配对 daemon，并维护默认 daemon", async () => {
+    const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000030");
+    const firstServerId = "00000000-0000-0000-0000-000000000031";
+    const secondServerId = "00000000-0000-0000-0000-000000000032";
+
+    await saveBrowserState({ device, pairedServers: [] });
+    await recordPairing(
+      {
+        server_id: firstServerId,
+        daemon_public_key: "ed25519-v1:first",
+        device_id: device.device_id,
+        expires_at_ms: 1710000060000,
+      },
+      "ws://127.0.0.1:8765/ws",
+    );
+    await recordPairing(
+      {
+        server_id: secondServerId,
+        daemon_public_key: "ed25519-v1:second",
+        device_id: device.device_id,
+        expires_at_ms: 1710000060000,
+      },
+      "wss://relay.example/ws",
+    );
+
+    const renamed = await renameDaemon(secondServerId, "  Laptop relay  ");
+    expect(renamed.defaultServerId).toBe(secondServerId);
+    expect(renamed.pairedServers.find((server) => server.server_id === secondServerId)?.name).toBe("Laptop relay");
+
+    const fallback = await forgetDaemon(secondServerId);
+    expect(fallback.pairedServers.map((server) => server.server_id)).toEqual([firstServerId]);
+    expect(fallback.defaultServerId).toBe(firstServerId);
+    expect(fallback.defaultUrl).toBe("ws://127.0.0.1:8765/ws");
+
+    const empty = await forgetDaemon(firstServerId);
+    expect(empty.device).toEqual(device);
+    expect(empty.pairedServers).toEqual([]);
+    expect(empty.defaultServerId).toBeUndefined();
+    expect(empty.defaultUrl).toBeUndefined();
   });
 
   it("不再把 session 文件树位置写入浏览器本地状态", async () => {

@@ -17,29 +17,23 @@ Reverse Proxy (TLS termination + access log control)
 
 - `termrelay` 可以是公网边缘服务，但它本身仍然只做转发和路由。
 - `termd` 仍建议只监听 loopback 或私网管理网段，`/local/pairing-token` 不应直接暴露到公网。
-- 浏览器和 `termctl` 连接 relay 时，使用同一条 client URL。
+- 浏览器和 `termctl` 连接 relay 时，使用同一条 `/ws` URL；daemon 路由由连接后的 `route_hello.server_id` 决定。
 
 ## 端口与路径
 
 | 组件 | 推荐绑定 | 对外暴露 | 说明 |
 | --- | --- | --- | --- |
 | `termd` | `127.0.0.1:8765` | 不直接暴露 | 提供 `/healthz`、`/ws`、`/local/pairing-token` |
-| `termrelay` | `127.0.0.1:8080` | 通过反向代理暴露到 443 | 提供 `/healthz`、`/ws/{server_id}/daemon`、`/ws/{server_id}/daemon-mux`、`/ws/{server_id}/client` |
+| `termrelay` | `127.0.0.1:8080` | 通过反向代理暴露到 443 | 提供 `/healthz`、`/ws`；首个 WebSocket frame 必须是 `route_hello` |
 | 反向代理 | `0.0.0.0:443` | 是 | 负责 TLS 终止、WebSocket upgrade、日志脱敏 |
 
-公网 client URL 形态如下：
+公网 client 和 daemon outbound connector 使用同一个 WebSocket 入口：
 
 ```text
-wss://relay.example/ws/{server_id}/client?relay_token=...
+wss://relay.example/ws?relay_token=...
 ```
 
-daemon outbound connector 形态如下：
-
-```text
-wss://relay.example/ws/{server_id}/daemon-mux?relay_token=...
-```
-
-`relay_token` 是 transport 凭证，不是设备身份，也不是 shared-control operator 状态。
+`server_id` 不再出现在 URL path 中，而是在连接建立后的 `route_hello` 明文前置握手里声明；`relay_token` 是 transport 凭证，不是设备身份，也不是 shared-control operator 状态。
 
 ## TLS 与反向代理
 
@@ -71,7 +65,7 @@ server {
         proxy_set_header Host $host;
     }
 
-    location /ws/ {
+    location = /ws {
         proxy_pass http://127.0.0.1:8080;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
@@ -87,7 +81,7 @@ server {
 
 - access log 里不要记录 `$request_uri`，否则 `relay_token` 会出现在日志里。
 - WebSocket upgrade 必须保留 `Upgrade` / `Connection` 头。
-- 如果反向代理做了额外的 rewrite，不要改写 `/ws/{server_id}/...` 结构。
+- 如果反向代理做了额外的 rewrite，最终仍必须把公开入口收敛到 relay 的 `/ws`，并保留 query string 中的 `relay_token`。
 
 ## pairing 边界
 
@@ -118,7 +112,7 @@ PAIR_INVITE="$(cargo run -q -p termd -- pair --qr | tail -n1)"
 客户端通过同一个 relay 入口访问：
 
 ```bash
-cargo run -p termctl -- pair --payload "$PAIR_INVITE"
+cargo run -p termctl -- pair --payload "$PAIR_INVITE" --url "wss://relay.example/ws?relay_token=$RELAY_TOKEN"
 ```
 
 Web MVP 打开 daemon 页面或 relay 页面后都粘贴同一段 `termd-pair:v1:...` 邀请码。页面默认使用当前地址；需要其他地址时，使用 Web 的高级地址设置手动覆盖。relay 只按 daemon 路由标识转发密文，不读取 pairing token；token 仍由 daemon 验证。
@@ -129,7 +123,7 @@ Web MVP 打开 daemon 页面或 relay 页面后都粘贴同一段 `termd-pair:v1
 2. 确认 `termd` 只在内网/loopback 暴露 `8765`。
 3. 确认 `relay_token` 不出现在 access log、proxy error log 或监控事件里。
 4. 确认 `/local/pairing-token` 不能从公网访问。
-5. 确认 `wss://relay.example/ws/{server_id}/client` 可以完成 pair / new / list。
+5. 确认 `wss://relay.example/ws` 可以完成 pair / new / list，relay 只通过 `route_hello.server_id` 选择 daemon。
 
 ## 一键安装脚本
 

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { KeyRound, Save, ScanQrCode, Settings, Wifi } from "lucide-react";
+import { KeyRound, Save, ScanQrCode, Server, Settings, Wifi } from "lucide-react";
 import type { PairedServerState, UUID } from "../protocol/types";
 
 interface ConnectionPanelProps {
@@ -90,6 +90,7 @@ interface ConnectionStatusPanelProps {
   activeServerId?: UUID;
   onServerChange?: (serverId: UUID) => void;
   onEdit?: () => void;
+  onManage?: () => void;
 }
 
 export function ConnectionStatusPanel(props: ConnectionStatusPanelProps) {
@@ -101,6 +102,11 @@ export function ConnectionStatusPanel(props: ConnectionStatusPanelProps) {
         {props.onEdit ? (
           <button type="button" className="icon-button" aria-label="Edit connection" onClick={props.onEdit}>
             <Settings size={15} aria-hidden="true" />
+          </button>
+        ) : null}
+        {props.onManage ? (
+          <button type="button" className="icon-button" aria-label="Manage daemons" onClick={props.onManage}>
+            <Server size={15} aria-hidden="true" />
           </button>
         ) : null}
       </div>

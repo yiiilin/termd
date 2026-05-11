@@ -29,8 +29,13 @@ INSTALL_SET_TLS_CERT=0
 INSTALL_SET_TLS_KEY=0
 ACTION="install"
 PURGE_STATE=0
+LOG_EMITTED=0
 
 log() {
+  if [[ "$LOG_EMITTED" -eq 1 ]]; then
+    printf '\n'
+  fi
+  LOG_EMITTED=1
   printf '[%s-install] %s\n' "$COMPONENT" "$*"
 }
 
@@ -591,7 +596,7 @@ print(web_invite)
 print(f"termctl pair --payload {shlex.quote(web_invite)}")
 print("[termd-install] open the Web page you plan to use and paste or scan this invite code.")
 ')"; then
-        printf '%s\n' "$summary"
+        printf '\n%s\n' "$summary"
         return 0
       fi
     fi

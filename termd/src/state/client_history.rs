@@ -11,7 +11,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, types
 use termd_proto::{ClientId, DeviceId, SessionId, SessionState, TerminalSize, UnixTimestampMillis};
 use uuid::Uuid;
 
-use super::StateError;
+use super::{StateError, sqlite_state_path_for_state_path};
 
 /// 客户端列表返回给协议层的持久化摘要。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,7 +53,7 @@ pub struct ClientHistoryStore {
 impl ClientHistoryStore {
     /// 打开或创建 SQLite store，并把运行态字段重置为离线。
     pub fn open(state_path: impl AsRef<Path>) -> Result<Self, StateError> {
-        let path = client_history_path_for_state_path(state_path.as_ref());
+        let path = sqlite_state_path_for_state_path(state_path.as_ref());
         ensure_parent_directory(&path)?;
 
         let conn = Connection::open(&path).map_err(|source| sqlite_error(&path, source))?;
@@ -607,10 +607,6 @@ fn session_history_record_from_row(
     })
 }
 
-fn client_history_path_for_state_path(state_path: &Path) -> PathBuf {
-    state_path.with_extension("sqlite")
-}
-
 fn ensure_parent_directory(path: &Path) -> Result<(), StateError> {
     let Some(parent) = path
         .parent()
@@ -691,7 +687,7 @@ mod tests {
     fn store_tracks_current_connections_and_resets_runtime_state_on_open() {
         let state_path =
             std::env::temp_dir().join(format!("termd-client-history-{}.json", std::process::id()));
-        let _ = fs::remove_file(client_history_path_for_state_path(&state_path));
+        let _ = fs::remove_file(sqlite_state_path_for_state_path(&state_path));
 
         let device_id = DeviceId::new();
         let session_id = SessionId::new();
@@ -721,7 +717,7 @@ mod tests {
             assert!(clients[0].attached_session_ids.is_empty());
         }
 
-        let _ = fs::remove_file(client_history_path_for_state_path(&state_path));
+        let _ = fs::remove_file(sqlite_state_path_for_state_path(&state_path));
         let _ = fs::remove_file(state_path);
     }
 
@@ -729,7 +725,7 @@ mod tests {
     fn store_persists_session_metadata_and_file_tree_path() {
         let state_path =
             std::env::temp_dir().join(format!("termd-session-store-{}.json", std::process::id()));
-        let _ = fs::remove_file(client_history_path_for_state_path(&state_path));
+        let _ = fs::remove_file(sqlite_state_path_for_state_path(&state_path));
 
         let session_id = SessionId::new();
         let now_ms = UnixTimestampMillis(1_710_000_000_000);
@@ -776,7 +772,7 @@ mod tests {
             );
         }
 
-        let _ = fs::remove_file(client_history_path_for_state_path(&state_path));
+        let _ = fs::remove_file(sqlite_state_path_for_state_path(&state_path));
         let _ = fs::remove_file(state_path);
     }
 }

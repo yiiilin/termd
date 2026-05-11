@@ -13,6 +13,7 @@ import type {
   PairAcceptPayload,
   PairedServerState,
   PublicKeyWire,
+  RouteReadyPayload,
   SessionClosePayload,
   SessionClosedPayload,
   SessionAttachedPayload,
@@ -76,25 +77,58 @@ export class DirectClient {
     this.timeoutMs = options.timeoutMs;
   }
 
-  static async connect(url: string, deviceId: UUID, options: DirectClientOptions = {}): Promise<DirectClient> {
+  static async connect(
+    url: string,
+    routeServerId: UUID,
+    deviceId: UUID,
+    options: DirectClientOptions = {},
+  ): Promise<DirectClient> {
     const socket = options.webSocketFactory?.(url) ?? new WebSocket(url);
     const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     const inbox = new SocketInbox(socket);
     await waitForOpen(socket, timeoutMs);
 
+    // route_hello 是统一 /ws 入口的第一帧；relay/daemon 先确认路由，再进入原有业务握手。
+    sendOuterMessage(
+      socket,
+      envelope("route_hello", {
+        server_id: routeServerId,
+        role: "client",
+        protocol_version: 1,
+        nonce: nonce(),
+        timestamp_ms: nowMs(),
+      }),
+    );
+    const routeReady = (
+      await withTimeout(inbox.read(), timeoutMs, "route_prelude_timeout")
+    ).envelope;
+    if (routeReady.type === "error") {
+      throw protocolError(routeReady.payload as ErrorPayload);
+    }
+    if (routeReady.type !== "route_ready") {
+      throw new ProtocolClientError("unexpected_message", "unexpected route prelude message");
+    }
+    const routeReadyPayload = routeReady.payload as RouteReadyPayload;
+    if (routeReadyPayload.server_id !== routeServerId || routeReadyPayload.role !== "client") {
+      throw new ProtocolClientError("route_server_mismatch", "route prelude does not match requested daemon");
+    }
+
     const initial = (
       await withTimeout(Promise.all([inbox.read(), inbox.read()]), timeoutMs, "handshake_timeout")
     ).map((message) => message.envelope);
 
-    let serverId: UUID | undefined;
     let daemonPublicKeyWire: PublicKeyWire | undefined;
     for (const message of initial) {
       if (message.type === "hello") {
         const payload = message.payload as HelloPayload;
-        serverId = payload.server_id ?? serverId;
+        if (payload.server_id && payload.server_id !== routeServerId) {
+          throw new ProtocolClientError("route_server_mismatch", "daemon hello does not match requested route");
+        }
       } else if (message.type === "e2ee_key_exchange") {
         const payload = message.payload as E2eeKeyExchangePayload;
-        serverId = payload.server_id;
+        if (payload.server_id !== routeServerId) {
+          throw new ProtocolClientError("route_server_mismatch", "daemon key exchange does not match requested route");
+        }
         daemonPublicKeyWire = payload.public_key;
       } else if (message.type === "error") {
         throw protocolError(message.payload as ErrorPayload);
@@ -103,21 +137,21 @@ export class DirectClient {
       }
     }
 
-    if (!serverId || !daemonPublicKeyWire) {
+    if (!daemonPublicKeyWire) {
       throw new ProtocolClientError("invalid_handshake", "daemon handshake was incomplete");
     }
 
     const keypair = generateE2eeKeyPair();
     const e2ee = E2eeSession.device({
-      serverId,
+      serverId: routeServerId,
       deviceId,
       localKeypair: keypair,
       daemonPublicKeyWire,
     });
-    const client = new DirectClient(socket, inbox, serverId, deviceId, e2ee, { timeoutMs });
+    const client = new DirectClient(socket, inbox, routeServerId, deviceId, e2ee, { timeoutMs });
     client.sendOuter(
       envelope("e2ee_key_exchange", {
-        server_id: serverId,
+        server_id: routeServerId,
         device_id: deviceId,
         public_key: keypair.publicKeyWire,
         nonce: nonce(),
@@ -338,7 +372,7 @@ export class DirectClient {
     if (this.closed || this.socket.readyState !== WebSocket.OPEN) {
       throw new ProtocolClientError("connection_closed", "connection closed");
     }
-    this.socket.send(JSON.stringify(message));
+    sendOuterMessage(this.socket, message);
   }
 
   private readOuter(): Promise<Envelope> {
@@ -352,7 +386,7 @@ class SocketInbox {
   private readonly errors: Array<(error: Error) => void> = [];
 
   constructor(private readonly socket: WebSocket) {
-    // 监听器必须在等待 open 前注册；daemon 会在连接建立后立即发送 hello/E2EE 公钥。
+    // 监听器必须在等待 open 前注册；route_ready 和后续 hello/E2EE 可能会连续到达。
     this.socket.addEventListener("message", (event) => {
       void this.enqueueMessage(event.data);
     });
@@ -393,6 +427,10 @@ class SocketInbox {
       this.rejectPending(error instanceof Error ? error : new Error("invalid_envelope"));
     }
   }
+}
+
+function sendOuterMessage(socket: WebSocket, message: Envelope): void {
+  socket.send(JSON.stringify(message));
 }
 
 function waitForOpen(socket: WebSocket, timeoutMs: number): Promise<void> {

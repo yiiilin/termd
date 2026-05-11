@@ -41,26 +41,35 @@ export function TerminalPane(props: TerminalPaneProps) {
   const cursorFrameRef = useRef<number | undefined>(undefined);
   const focusedRef = useRef(false);
   const currentFontSizeRef = useRef(TERMINAL_FONT_SIZE);
+  const [clientSize, setClientSize] = useState<TerminalSize | undefined>(undefined);
   const [focused, setFocused] = useState(false);
   const [viewerScale, setViewerScale] = useState(1);
   const fitViewerToScrollport = () => setViewerScale(fitScaleForViewer(scrollportRef.current, frameRef.current, viewerScaleRef.current));
-  const viewerMode = props.attached && !focused;
+  const remoteRenderMode = props.attached && !focused;
   const viewerCols = props.sessionSize?.cols ?? 0;
   const viewerRows = props.sessionSize?.rows ?? 0;
   const viewerPixelWidth = props.sessionSize?.pixel_width ?? 0;
   const viewerPixelHeight = props.sessionSize?.pixel_height ?? 0;
-  const viewerFontSize = fontSizeForScale(viewerScale);
+  // 只有 PTY 尺寸和当前客户端可容纳尺寸不一致时，才展示 viewer 的虚线框和缩放工具。
+  const resolutionMismatch =
+    remoteRenderMode &&
+    viewerCols > 0 &&
+    viewerRows > 0 &&
+    clientSize !== undefined &&
+    (clientSize.cols !== viewerCols || clientSize.rows !== viewerRows);
+  const effectiveViewerScale = resolutionMismatch ? viewerScale : 1;
+  const viewerFontSize = fontSizeForScale(effectiveViewerScale);
   const viewerFrameStyle =
-    viewerMode && viewerCols > 0 && viewerRows > 0
+    resolutionMismatch && viewerCols > 0 && viewerRows > 0
       ? {
           // 优先使用聚焦端上报的像素尺寸；缺失时才按 rows/cols 估算 PTY 画布。
           width:
             viewerPixelWidth > 0
-              ? `${Math.ceil(viewerPixelWidth * viewerScale) + TERMINAL_FRAME_CHROME_PX}px`
+              ? `${Math.ceil(viewerPixelWidth * effectiveViewerScale) + TERMINAL_FRAME_CHROME_PX}px`
               : `calc(${viewerCols}ch + ${TERMINAL_FRAME_CHROME_PX}px)`,
           height:
             viewerPixelHeight > 0
-              ? `${Math.ceil(viewerPixelHeight * viewerScale) + TERMINAL_FRAME_CHROME_PX}px`
+              ? `${Math.ceil(viewerPixelHeight * effectiveViewerScale) + TERMINAL_FRAME_CHROME_PX}px`
               : `${Math.ceil(viewerRows * viewerFontSize * TERMINAL_LINE_HEIGHT) + TERMINAL_FRAME_CHROME_PX}px`,
           fontSize: `${viewerFontSize}px`,
           fontFamily: '"IBM Plex Mono", "SFMono-Regular", Consolas, monospace',
@@ -90,7 +99,7 @@ export function TerminalPane(props: TerminalPaneProps) {
     if (!focusedRef.current) {
       resizeRef.current?.();
     }
-  }, [props.sessionSize?.cols, props.sessionSize?.rows]);
+  }, [props.sessionSize?.cols, props.sessionSize?.pixel_height, props.sessionSize?.pixel_width, props.sessionSize?.rows]);
 
   const queueCursorReport = () => {
     if (cursorFrameRef.current !== undefined) {
@@ -167,9 +176,34 @@ export function TerminalPane(props: TerminalPaneProps) {
       if (!terminalHost) {
         return;
       }
+      const proposed = fit.proposeDimensions();
+      const hostWidth = terminalHost.clientWidth;
+      const hostHeight = terminalHost.clientHeight;
+      if (proposed) {
+        setClientSize((current) =>
+          current &&
+          current.cols === proposed.cols &&
+          current.rows === proposed.rows &&
+          current.pixel_width === hostWidth &&
+          current.pixel_height === hostHeight
+            ? current
+            : {
+                rows: proposed.rows,
+                cols: proposed.cols,
+                pixel_width: hostWidth,
+                pixel_height: hostHeight,
+              },
+        );
+      }
       if (!focusedRef.current) {
         const remoteSize = sessionSizeRef.current;
-        applyFontSize(terminal, fontSizeForScale(viewerScaleRef.current));
+        const mismatch =
+          Boolean(
+            remoteSize &&
+              proposed &&
+              (remoteSize.rows !== proposed.rows || remoteSize.cols !== proposed.cols),
+          );
+        applyFontSize(terminal, mismatch ? fontSizeForScale(viewerScaleRef.current) : TERMINAL_FONT_SIZE);
         if (remoteSize) {
           terminal.resize(remoteSize.cols, remoteSize.rows);
           queueCursorReport();
@@ -177,11 +211,8 @@ export function TerminalPane(props: TerminalPaneProps) {
         }
       }
       applyFontSize(terminal, TERMINAL_FONT_SIZE);
-      const hostWidth = terminalHost.clientWidth;
-      const hostHeight = terminalHost.clientHeight;
       // 移动端软键盘或外层 grid 短暂重排时可能把 xterm 容器压到 0 高。
       // 这种尺寸不能写回 shared PTY，否则其他客户端会被同步成一行终端。
-      const proposed = fit.proposeDimensions();
       if (proposed && proposed.rows >= MIN_FOCUSED_RESIZE_ROWS && proposed.cols >= MIN_FOCUSED_RESIZE_COLS) {
         fit.fit();
         onResizeRef.current({
@@ -257,12 +288,12 @@ export function TerminalPane(props: TerminalPaneProps) {
 
   return (
     <section
-      className={viewerMode ? "terminal-pane terminal-pane-viewer" : "terminal-pane"}
+      className={resolutionMismatch ? "terminal-pane terminal-pane-viewer" : "terminal-pane"}
       data-output-chunks={props.chunks.length}
-      data-viewer-mode={viewerMode ? "true" : "false"}
+      data-viewer-mode={resolutionMismatch ? "true" : "false"}
       data-testid="terminal-pane"
     >
-      {viewerMode ? (
+      {resolutionMismatch ? (
         <div
           className="terminal-viewer-toolbar"
           aria-label="viewer controls"

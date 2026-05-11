@@ -38,6 +38,7 @@ export function parsePairingQrPayload(raw: string): PairingQrPayload | undefined
     };
 
     if (parsed.ws_url) {
+      // ws_url 仅兼容旧邀请码；真正连接入口由调用方结合 server_id 规范化到统一 /ws。
       payload.ws_url = parsed.ws_url;
     }
 
