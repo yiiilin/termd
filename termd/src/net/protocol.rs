@@ -35,15 +35,16 @@ use crate::auth::{
     current_unix_timestamp_millis,
 };
 use crate::config::DaemonConfig;
-use crate::pty::{CommandSpec, PtyBackend};
+use crate::pty::{CommandSpec, PtyBackend, PtyRestoreInfo, PtySupervisorStatus};
 use crate::runtime::{RuntimeError, SessionRuntime};
 use crate::session::{
     AttachRole as RuntimeAttachRole, SessionState as RuntimeSessionState,
     TerminalSize as RuntimeTerminalSize,
 };
 use crate::state::{
-    DaemonIdentitySnapshot, DaemonState, StateError, StateStore, TrustedDeviceState,
-    client_history::{ClientHistoryRecord, ClientHistoryStore},
+    DaemonIdentitySnapshot, DaemonState, SessionStateRecord, StateError, StateStore,
+    TrustedDeviceState,
+    client_history::{ClientHistoryRecord, ClientHistoryStore, SessionHistoryRecord},
 };
 
 use super::{
@@ -254,6 +255,7 @@ where
         verifier: V,
         state: DaemonState,
     ) -> Result<Self, StateError> {
+        let persisted_sessions = state.sessions.clone();
         let daemon_identity = match state.daemon_identity {
             Some(identity) => match identity.private_key {
                 Some(private_key) => DaemonIdentity::from_persisted_identity(
@@ -274,7 +276,15 @@ where
                 .into_iter()
                 .map(trusted_device_from_state),
         );
-        Self::from_identity_and_store(config, backend, verifier, daemon_identity, trusted_store)
+        let mut protocol = Self::from_identity_and_store(
+            config,
+            backend,
+            verifier,
+            daemon_identity,
+            trusted_store,
+        )?;
+        protocol.restore_runtime_sessions(persisted_sessions);
+        Ok(protocol)
     }
 
     fn from_identity_and_store(
@@ -320,6 +330,30 @@ where
             .collect();
         trusted_devices.sort_by_key(|device| device.device_id.0);
 
+        let mut sessions = Vec::new();
+        for (wire_session_id, internal_session_id) in &self.session_index {
+            let Ok(state) = self.runtime.state(internal_session_id) else {
+                continue;
+            };
+            let Ok(size) = self.runtime.size(internal_session_id) else {
+                continue;
+            };
+            let Ok(Some(restore_info)) = self.runtime.restore_info(internal_session_id) else {
+                continue;
+            };
+            let Some(history) = self.client_history_session_record(*wire_session_id) else {
+                continue;
+            };
+            sessions.push(SessionStateRecord {
+                session_id: *wire_session_id,
+                state: runtime_state_to_proto(state),
+                size: runtime_size_to_proto(size),
+                created_at_ms: history.created_at_ms,
+                updated_at_ms: history.updated_at_ms,
+                restore_info: Some(restore_info),
+            });
+        }
+
         DaemonState {
             version: crate::state::STATE_SCHEMA_VERSION,
             daemon_identity: Some(DaemonIdentitySnapshot {
@@ -328,8 +362,7 @@ where
                 private_key: Some(self.daemon_identity.private_key_for_persistence()),
             }),
             trusted_devices,
-            // 运行中 PTY 进程无法通过持久状态安全恢复；这里保持空列表，避免制造假 session。
-            sessions: Vec::new(),
+            sessions,
         }
     }
 
@@ -528,11 +561,11 @@ where
         let command = command_spec_from_payload(&payload.command, &self.config)?;
         let session_root = session_root_from_command(&command)?;
         let runtime_size = proto_size_to_runtime(payload.size);
-        let internal_session_id = self
-            .runtime
-            .create_session(command, runtime_size)
-            .map_err(map_runtime_error)?;
         let wire_session_id = SessionId::new();
+        self.runtime
+            .create_session_with_id(&wire_session_id.0.to_string(), command, runtime_size)
+            .map_err(map_runtime_error)?;
+        let internal_session_id = wire_session_id.0.to_string();
 
         self.session_index
             .insert(wire_session_id, internal_session_id.clone());
@@ -570,6 +603,7 @@ where
             size: self.runtime_size_proto(&internal_session_id)?,
         };
 
+        self.persist_state()?;
         connection.state = ProtocolConnectionState::Attached;
         Ok(vec![envelope_value(MessageType::SessionCreated, response)?])
     }
@@ -652,6 +686,7 @@ where
             payload.size,
             current_unix_timestamp_millis(),
         )?;
+        self.persist_state()?;
 
         Ok(Vec::new())
     }
@@ -735,19 +770,16 @@ where
             .cloned()
             .ok_or(ProtocolError::SessionNotFound)?;
 
-        self.runtime
-            .close(&internal_session_id)
-            .map_err(map_runtime_error)?;
-        self.session_index.remove(&payload.session_id);
-        self.session_names.remove(&payload.session_id);
-        self.session_roots.remove(&payload.session_id);
-        self.session_output_history.remove(&payload.session_id);
-        self.session_file_tree_signals.remove(&payload.session_id);
-        for record in self.daemon_clients.values_mut() {
-            for sessions in record.active_connections.values_mut() {
-                sessions.remove(&payload.session_id);
-            }
+        let close_result = self.runtime.close(&internal_session_id);
+        if let Err(error) = &close_result {
+            tracing::warn!(
+                %error,
+                session_id = %payload.session_id.0,
+                "failed to terminate runtime session during explicit close"
+            );
+            let _ = self.runtime.discard(&internal_session_id);
         }
+        self.close_visible_session_state(payload.session_id);
         if let Err(error) = self
             .client_history
             .record_session_closed(payload.session_id, current_unix_timestamp_millis())
@@ -760,6 +792,7 @@ where
         {
             tracing::warn!(%error, "failed to remove closed session attachments from sqlite history");
         }
+        self.persist_state()?;
 
         Ok(vec![envelope_value(
             MessageType::SessionClosed,
@@ -767,6 +800,19 @@ where
                 session_id: payload.session_id,
             },
         )?])
+    }
+
+    fn close_visible_session_state(&mut self, session_id: SessionId) {
+        self.session_index.remove(&session_id);
+        self.session_names.remove(&session_id);
+        self.session_roots.remove(&session_id);
+        self.session_output_history.remove(&session_id);
+        self.session_file_tree_signals.remove(&session_id);
+        for record in self.daemon_clients.values_mut() {
+            for sessions in record.active_connections.values_mut() {
+                sessions.remove(&session_id);
+            }
+        }
     }
 
     fn list_session_files(
@@ -1383,6 +1429,81 @@ where
             .session_file_tree_signals
             .get(&session_id)
             .map(watch::Sender::subscribe))
+    }
+
+    fn restore_runtime_sessions(&mut self, sessions: Vec<SessionStateRecord>) {
+        let persisted_by_id: HashMap<SessionId, _> = match self.client_history.list_sessions() {
+            Ok(records) => records
+                .into_iter()
+                .map(|record| (record.session_id, record))
+                .collect(),
+            Err(error) => {
+                tracing::warn!(%error, "failed to load session metadata while restoring supervisors");
+                HashMap::new()
+            }
+        };
+
+        for session in sessions {
+            let wire_session_id = session.session_id;
+            if session.state != SessionState::Running
+                || session.restore_info.is_none()
+                || !restore_info_is_reconnectable(session.restore_info.as_ref())
+                || !persisted_by_id.contains_key(&wire_session_id)
+            {
+                self.mark_persisted_session_closed(wire_session_id);
+                continue;
+            }
+
+            match self.runtime.reconnect_session(&session) {
+                Ok(()) => {
+                    let internal_session_id = wire_session_id.0.to_string();
+                    self.session_index
+                        .insert(wire_session_id, internal_session_id);
+                    self.session_output_history
+                        .entry(wire_session_id)
+                        .or_default();
+                    let (file_tree_signal, _) = watch::channel(0);
+                    self.session_file_tree_signals
+                        .insert(wire_session_id, file_tree_signal);
+                    if let Some(record) = persisted_by_id.get(&wire_session_id) {
+                        self.session_roots
+                            .insert(wire_session_id, PathBuf::from(&record.root_path));
+                        if let Some(name) = record.name.clone() {
+                            self.session_names.insert(wire_session_id, name);
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, session_id = %wire_session_id.0, "failed to reconnect persisted session supervisor");
+                    self.mark_persisted_session_closed(wire_session_id);
+                }
+            }
+        }
+        if let Err(error) = self.persist_state() {
+            tracing::warn!(%error, "failed to persist recovered session supervisor state");
+        }
+    }
+
+    fn mark_persisted_session_closed(&mut self, session_id: SessionId) {
+        self.close_visible_session_state(session_id);
+        let now_ms = current_unix_timestamp_millis();
+        if let Err(error) = self
+            .client_history
+            .record_session_closed(session_id, now_ms)
+        {
+            tracing::warn!(%error, session_id = %session_id.0, "failed to mark restored session closed in sqlite history");
+        }
+        if let Err(error) = self.client_history.remove_session_attachments(session_id) {
+            tracing::warn!(%error, session_id = %session_id.0, "failed to clear restored session attachments from sqlite history");
+        }
+    }
+
+    fn client_history_session_record(&self, session_id: SessionId) -> Option<SessionHistoryRecord> {
+        self.client_history
+            .list_sessions()
+            .ok()?
+            .into_iter()
+            .find(|record| record.session_id == session_id)
     }
 }
 
@@ -2036,6 +2157,16 @@ fn runtime_state_to_proto(state: RuntimeSessionState) -> SessionState {
     }
 }
 
+fn restore_info_is_reconnectable(restore_info: Option<&PtyRestoreInfo>) -> bool {
+    matches!(
+        restore_info,
+        Some(PtyRestoreInfo::UnixSocket {
+            supervisor_status: PtySupervisorStatus::Running,
+            ..
+        })
+    )
+}
+
 fn runtime_role_to_proto(role: RuntimeAttachRole) -> AttachRole {
     match role {
         RuntimeAttachRole::Operator => AttachRole::Operator,
@@ -2089,6 +2220,7 @@ fn map_runtime_error(error: RuntimeError) -> ProtocolError {
         RuntimeError::SessionAlreadyExists
         | RuntimeError::SessionClosed
         | RuntimeError::DeviceNotAttached
+        | RuntimeError::NotReconnectable
         | RuntimeError::InvalidSize
         | RuntimeError::Pty(_) => ProtocolError::RuntimeFailed,
     }
@@ -2121,7 +2253,10 @@ mod tests {
     use super::*;
     use crate::auth::AuthSigningInput;
     use crate::net::signature::Ed25519SignatureVerifier;
-    use crate::pty::{PtyBackend, PtyError, PtyExitStatus, PtyResult, PtySession, PtySize};
+    use crate::pty::{
+        PtyBackend, PtyError, PtyExitStatus, PtyRestoreInfo, PtyResult, PtySession, PtySize,
+        PtySnapshot, PtySupervisorStatus,
+    };
     use crate::session::TerminalSize as RuntimeTerminalSize;
     use crate::state::StateStore;
 
@@ -2136,6 +2271,9 @@ mod tests {
     struct FakePtyState {
         outputs: VecDeque<Vec<u8>>,
         writes: Vec<Vec<u8>>,
+        reconnects: Vec<String>,
+        reconnect_error: Option<String>,
+        terminate_error: Option<String>,
         terminate_count: usize,
     }
 
@@ -2151,18 +2289,65 @@ mod tests {
         fn terminate_count(&self) -> usize {
             self.state.lock().unwrap().terminate_count
         }
+
+        fn reconnects(&self) -> Vec<String> {
+            self.state.lock().unwrap().reconnects.clone()
+        }
+
+        fn fail_reconnects(&self, message: impl Into<String>) {
+            self.state.lock().unwrap().reconnect_error = Some(message.into());
+        }
+
+        fn fail_terminate(&self, message: impl Into<String>) {
+            self.state.lock().unwrap().terminate_error = Some(message.into());
+        }
     }
 
     impl PtyBackend for FakePtyBackend {
         fn spawn(&self, _command: &CommandSpec, _size: PtySize) -> PtyResult<Box<dyn PtySession>> {
             Ok(Box::new(FakePtySession {
                 state: Arc::clone(&self.state),
+                restore_info: None,
+            }))
+        }
+
+        fn spawn_named(
+            &self,
+            session_id: &str,
+            _command: &CommandSpec,
+            _size: PtySize,
+        ) -> PtyResult<Box<dyn PtySession>> {
+            let wire_session_id = SessionId(
+                uuid::Uuid::parse_str(session_id)
+                    .map_err(|source| PtyError::Backend(source.to_string()))?,
+            );
+            Ok(Box::new(FakePtySession {
+                state: Arc::clone(&self.state),
+                restore_info: Some(socket_restore_info(wire_session_id)),
+            }))
+        }
+
+        fn reconnect(
+            &self,
+            session_id: &str,
+            restore_info: &PtyRestoreInfo,
+        ) -> PtyResult<Box<dyn PtySession>> {
+            let mut state = self.state.lock().unwrap();
+            state.reconnects.push(session_id.to_owned());
+            if let Some(message) = state.reconnect_error.clone() {
+                return Err(PtyError::Backend(message));
+            }
+
+            Ok(Box::new(FakePtySession {
+                state: Arc::clone(&self.state),
+                restore_info: Some(restore_info.clone()),
             }))
         }
     }
 
     struct FakePtySession {
         state: Arc<Mutex<FakePtyState>>,
+        restore_info: Option<PtyRestoreInfo>,
     }
 
     impl PtySession for FakePtySession {
@@ -2191,8 +2376,24 @@ mod tests {
             Ok(())
         }
 
+        fn snapshot(&mut self) -> PtyResult<PtySnapshot> {
+            Ok(PtySnapshot {
+                size: PtySize::new(24, 80),
+                process_id: Some(7),
+                retained_output: Vec::new(),
+            })
+        }
+
+        fn restore_info(&self) -> Option<PtyRestoreInfo> {
+            self.restore_info.clone()
+        }
+
         fn terminate(&mut self) -> PtyResult<()> {
-            self.state.lock().unwrap().terminate_count += 1;
+            let mut state = self.state.lock().unwrap();
+            state.terminate_count += 1;
+            if let Some(message) = state.terminate_error.clone() {
+                return Err(PtyError::Backend(message));
+            }
             Ok(())
         }
 
@@ -2229,6 +2430,14 @@ mod tests {
             current_unix_timestamp_millis().0,
             counter
         ))
+    }
+
+    fn socket_restore_info(session_id: SessionId) -> PtyRestoreInfo {
+        PtyRestoreInfo::UnixSocket {
+            socket_path: std::env::temp_dir().join(format!("termd-test-{}.sock", session_id.0)),
+            supervisor_pid: 42,
+            supervisor_status: PtySupervisorStatus::Running,
+        }
     }
 
     fn wire(bytes: &[u8]) -> String {
@@ -2653,6 +2862,230 @@ mod tests {
                 .private_key
                 .is_some()
         );
+    }
+
+    #[test]
+    fn startup_restores_live_session_supervisor_metadata_from_sqlite() {
+        let backend = FakePtyBackend::default();
+        let state_path = temp_state_path("restore-live-session.json");
+        let config = DaemonConfig::default_for_state_path(&state_path);
+        let session_id = SessionId::new();
+        let root_path = std::env::temp_dir();
+        let files_path = root_path.join("project");
+
+        {
+            let mut history = ClientHistoryStore::open(&state_path).unwrap();
+            history
+                .record_session_created(
+                    session_id,
+                    SessionState::Running,
+                    TerminalSize::new(40, 120),
+                    &root_path,
+                    UnixTimestampMillis(1_000),
+                )
+                .unwrap();
+            history
+                .record_session_renamed(session_id, Some("work shell"), UnixTimestampMillis(1_001))
+                .unwrap();
+            history
+                .record_session_files_path(session_id, &files_path, UnixTimestampMillis(1_002))
+                .unwrap();
+        }
+
+        let state = DaemonState {
+            version: crate::state::STATE_SCHEMA_VERSION,
+            daemon_identity: None,
+            trusted_devices: Vec::new(),
+            sessions: vec![SessionStateRecord {
+                session_id,
+                state: SessionState::Running,
+                size: TerminalSize::new(40, 120),
+                created_at_ms: UnixTimestampMillis(1_000),
+                updated_at_ms: UnixTimestampMillis(1_002),
+                restore_info: Some(socket_restore_info(session_id)),
+            }],
+        };
+        StateStore::save(&state_path, &state).unwrap();
+        let state = StateStore::load(&state_path).unwrap();
+        let protocol =
+            DaemonProtocol::from_state(config, backend.clone(), Ed25519SignatureVerifier, state)
+                .unwrap();
+
+        assert_eq!(backend.reconnects(), vec![session_id.0.to_string()]);
+        assert!(protocol.session_index.contains_key(&session_id));
+        assert_eq!(
+            protocol.session_names.get(&session_id).map(String::as_str),
+            Some("work shell")
+        );
+        assert_eq!(protocol.session_roots.get(&session_id), Some(&root_path));
+        assert_eq!(
+            protocol
+                .client_history
+                .session_files_path(session_id)
+                .unwrap(),
+            Some(files_path.to_string_lossy().to_string())
+        );
+        assert_eq!(
+            protocol
+                .snapshot_state()
+                .sessions
+                .iter()
+                .map(|session| session.session_id)
+                .collect::<Vec<_>>(),
+            vec![session_id]
+        );
+    }
+
+    #[test]
+    fn startup_marks_stale_or_non_running_restore_records_closed() {
+        let backend = FakePtyBackend::default();
+        backend.fail_reconnects("stale supervisor socket");
+        let state_path = temp_state_path("restore-stale-session.json");
+        let config = DaemonConfig::default_for_state_path(&state_path);
+        let stale_session_id = SessionId::new();
+        let closing_session_id = SessionId::new();
+        let missing_metadata_session_id = SessionId::new();
+        let root_path = std::env::temp_dir();
+
+        {
+            let mut history = ClientHistoryStore::open(&state_path).unwrap();
+            for session_id in [stale_session_id, closing_session_id] {
+                history
+                    .record_session_created(
+                        session_id,
+                        SessionState::Running,
+                        TerminalSize::new(24, 80),
+                        &root_path,
+                        UnixTimestampMillis(1_000),
+                    )
+                    .unwrap();
+            }
+        }
+
+        let state = DaemonState {
+            version: crate::state::STATE_SCHEMA_VERSION,
+            daemon_identity: None,
+            trusted_devices: Vec::new(),
+            sessions: vec![
+                SessionStateRecord {
+                    session_id: stale_session_id,
+                    state: SessionState::Running,
+                    size: TerminalSize::new(24, 80),
+                    created_at_ms: UnixTimestampMillis(1_000),
+                    updated_at_ms: UnixTimestampMillis(1_001),
+                    restore_info: Some(socket_restore_info(stale_session_id)),
+                },
+                SessionStateRecord {
+                    session_id: closing_session_id,
+                    state: SessionState::Running,
+                    size: TerminalSize::new(24, 80),
+                    created_at_ms: UnixTimestampMillis(1_000),
+                    updated_at_ms: UnixTimestampMillis(1_001),
+                    restore_info: Some(PtyRestoreInfo::UnixSocket {
+                        socket_path: std::env::temp_dir().join("termd-test-closing.sock"),
+                        supervisor_pid: 43,
+                        supervisor_status: PtySupervisorStatus::Closing,
+                    }),
+                },
+                SessionStateRecord {
+                    session_id: missing_metadata_session_id,
+                    state: SessionState::Running,
+                    size: TerminalSize::new(24, 80),
+                    created_at_ms: UnixTimestampMillis(1_000),
+                    updated_at_ms: UnixTimestampMillis(1_001),
+                    restore_info: Some(socket_restore_info(missing_metadata_session_id)),
+                },
+            ],
+        };
+        StateStore::save(&state_path, &state).unwrap();
+        let state = StateStore::load(&state_path).unwrap();
+
+        let protocol = DaemonProtocol::from_state(
+            config.clone(),
+            backend.clone(),
+            Ed25519SignatureVerifier,
+            state,
+        )
+        .unwrap();
+
+        assert!(protocol.session_index.is_empty());
+        assert!(protocol.client_history.list_sessions().unwrap().is_empty());
+
+        let reloaded_state = StateStore::load(&config.state_path).unwrap();
+        let closed_by_id: HashMap<_, _> = reloaded_state
+            .sessions
+            .into_iter()
+            .map(|session| (session.session_id, session))
+            .collect();
+        for session_id in [
+            stale_session_id,
+            closing_session_id,
+            missing_metadata_session_id,
+        ] {
+            let session = closed_by_id
+                .get(&session_id)
+                .expect("stale restore record should remain as closed fact");
+            assert_eq!(session.state, SessionState::Closed);
+            assert!(session.restore_info.is_none());
+        }
+    }
+
+    #[test]
+    fn startup_does_not_restore_created_sessions_even_with_restore_info() {
+        let backend = FakePtyBackend::default();
+        let state_path = temp_state_path("restore-created-session.json");
+        let config = DaemonConfig::default_for_state_path(&state_path);
+        let created_session_id = SessionId::new();
+        let root_path = std::env::temp_dir();
+
+        {
+            let mut history = ClientHistoryStore::open(&state_path).unwrap();
+            history
+                .record_session_created(
+                    created_session_id,
+                    SessionState::Created,
+                    TerminalSize::new(24, 80),
+                    &root_path,
+                    UnixTimestampMillis(1_000),
+                )
+                .unwrap();
+        }
+
+        let state = DaemonState {
+            version: crate::state::STATE_SCHEMA_VERSION,
+            daemon_identity: None,
+            trusted_devices: Vec::new(),
+            sessions: vec![SessionStateRecord {
+                session_id: created_session_id,
+                state: SessionState::Created,
+                size: TerminalSize::new(24, 80),
+                created_at_ms: UnixTimestampMillis(1_000),
+                updated_at_ms: UnixTimestampMillis(1_001),
+                restore_info: Some(socket_restore_info(created_session_id)),
+            }],
+        };
+        StateStore::save(&state_path, &state).unwrap();
+        let state = StateStore::load(&state_path).unwrap();
+
+        let protocol = DaemonProtocol::from_state(
+            config.clone(),
+            backend.clone(),
+            Ed25519SignatureVerifier,
+            state,
+        )
+        .unwrap();
+
+        assert!(protocol.session_index.is_empty());
+        assert!(protocol.client_history.list_sessions().unwrap().is_empty());
+        assert!(protocol.session_names.is_empty());
+        assert!(protocol.session_roots.is_empty());
+        assert!(protocol.snapshot_state().sessions.is_empty());
+
+        let reloaded_state = StateStore::load(&config.state_path).unwrap();
+        assert_eq!(reloaded_state.sessions.len(), 1);
+        assert_eq!(reloaded_state.sessions[0].state, SessionState::Closed);
+        assert!(reloaded_state.sessions[0].restore_info.is_none());
+        assert!(backend.reconnects().is_empty());
     }
 
     #[test]
@@ -4202,6 +4635,139 @@ mod tests {
         let list = decrypt_first(&mut device_session, list_responses);
         let list_payload: SessionListResultPayload = decode_payload(list.payload).unwrap();
         assert!(list_payload.sessions.is_empty());
+    }
+
+    #[test]
+    fn explicit_close_persists_closed_runtime_fact_and_skips_future_recovery() {
+        let backend = FakePtyBackend::default();
+        let state_path = temp_state_path("explicit-close-no-recovery.json");
+        let config = DaemonConfig::default_for_state_path(&state_path);
+        let mut protocol =
+            DaemonProtocol::new(config.clone(), backend.clone(), Ed25519SignatureVerifier).unwrap();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let (_, mut device_session) = open_e2ee(&mut protocol, &mut connection, device_id);
+        pair_device(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            device_id,
+            PublicKey(wire(signing_key.verifying_key().as_bytes())),
+        );
+        let created_responses = send_encrypted(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            envelope_value(
+                MessageType::SessionCreate,
+                SessionCreatePayload {
+                    command: vec!["sh".to_owned()],
+                    size: TerminalSize::new(24, 80),
+                },
+            )
+            .unwrap(),
+        );
+        let created = decrypt_first(&mut device_session, created_responses);
+        let created_payload: SessionCreatedPayload = decode_payload(created.payload).unwrap();
+
+        let running_state = StateStore::load(&state_path).unwrap();
+        assert_eq!(running_state.sessions.len(), 1);
+        assert_eq!(running_state.sessions[0].state, SessionState::Running);
+        assert!(running_state.sessions[0].restore_info.is_some());
+
+        let close_responses = send_encrypted(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            envelope_value(
+                MessageType::SessionClose,
+                SessionClosePayload {
+                    session_id: created_payload.session_id,
+                },
+            )
+            .unwrap(),
+        );
+        let closed = decrypt_first(&mut device_session, close_responses);
+        assert_eq!(closed.kind, MessageType::SessionClosed);
+
+        let closed_state = StateStore::load(&state_path).unwrap();
+        assert_eq!(closed_state.sessions.len(), 1);
+        assert_eq!(
+            closed_state.sessions[0].session_id,
+            created_payload.session_id
+        );
+        assert_eq!(closed_state.sessions[0].state, SessionState::Closed);
+        assert!(closed_state.sessions[0].restore_info.is_none());
+
+        let restarted = DaemonProtocol::from_state(
+            config,
+            backend.clone(),
+            Ed25519SignatureVerifier,
+            closed_state,
+        )
+        .unwrap();
+
+        assert!(restarted.session_index.is_empty());
+        assert!(backend.reconnects().is_empty());
+    }
+
+    #[test]
+    fn explicit_close_recovers_state_even_when_pty_terminate_fails() {
+        let backend = FakePtyBackend::default();
+        backend.fail_terminate("stale supervisor socket");
+        let state_path = temp_state_path("explicit-close-terminate-failure.json");
+        let config = DaemonConfig::default_for_state_path(&state_path);
+        let mut protocol =
+            DaemonProtocol::new(config.clone(), backend.clone(), Ed25519SignatureVerifier).unwrap();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let (_, mut device_session) = open_e2ee(&mut protocol, &mut connection, device_id);
+        pair_device(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            device_id,
+            PublicKey(wire(signing_key.verifying_key().as_bytes())),
+        );
+        let created_responses = send_encrypted(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            envelope_value(
+                MessageType::SessionCreate,
+                SessionCreatePayload {
+                    command: vec!["sh".to_owned()],
+                    size: TerminalSize::new(24, 80),
+                },
+            )
+            .unwrap(),
+        );
+        let created = decrypt_first(&mut device_session, created_responses);
+        let created_payload: SessionCreatedPayload = decode_payload(created.payload).unwrap();
+
+        let close_responses = send_encrypted(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            envelope_value(
+                MessageType::SessionClose,
+                SessionClosePayload {
+                    session_id: created_payload.session_id,
+                },
+            )
+            .unwrap(),
+        );
+        let closed = decrypt_first(&mut device_session, close_responses);
+        assert_eq!(closed.kind, MessageType::SessionClosed);
+        assert_eq!(backend.terminate_count(), 1);
+        assert!(protocol.session_index.is_empty());
+
+        let closed_state = StateStore::load(&state_path).unwrap();
+        assert_eq!(closed_state.sessions.len(), 1);
+        assert_eq!(closed_state.sessions[0].state, SessionState::Closed);
+        assert!(closed_state.sessions[0].restore_info.is_none());
     }
 
     #[test]

@@ -89,6 +89,14 @@ async function pairWithInvite(
   await user.click(screen.getByRole("button", { name: "Pair" }));
 }
 
+async function expectDaemonUrlInAdmin(user: ReturnType<typeof userEvent.setup>, url: string): Promise<void> {
+  if (!screen.queryByLabelText("daemon admin")) {
+    await user.click(screen.getByRole("button", { name: "Daemons" }));
+  }
+  const admin = await screen.findByLabelText("daemon admin");
+  await waitFor(() => expect(within(admin).getAllByText(url).length).toBeGreaterThan(0));
+}
+
 describe("termui web 工作台", () => {
   let daemon: MockDaemon;
 
@@ -128,6 +136,10 @@ describe("termui web 工作台", () => {
 
     await waitFor(() => expect(screen.queryByLabelText("Pairing token")).toBeNull());
     await screen.findByText("Connected");
+    expect(screen.getByRole("button", { name: "Daemons" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Edit connection" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Manage daemons" })).toBeNull();
+    expect(screen.queryByLabelText("Daemon")).toBeNull();
     await user.click(screen.getByRole("button", { name: "Refresh" }));
     await screen.findAllByText("00000000-0000-0000-0000-000000000401");
     expect(screen.queryByRole("button", { name: "Open" })).toBeNull();
@@ -140,7 +152,7 @@ describe("termui web 工作台", () => {
     expect(daemon.outerWireText()).not.toContain("secret-token");
   });
 
-  it("移动端顶部菜单会打开 connection、sessions 和 files 全屏面板", async () => {
+  it("移动端顶部菜单保持 terminal-first，并把 daemon 管理放到独立后台页", async () => {
     setViewportWidth(390);
     const user = userEvent.setup();
     render(<App />);
@@ -152,18 +164,17 @@ describe("termui web 工作台", () => {
 
     await user.click(screen.getByRole("button", { name: "Open mobile workspace menu" }));
     const menu = await screen.findByRole("navigation", { name: "mobile workspace menu" });
-    expect(within(menu).getByRole("button", { name: "Connection" })).toBeEnabled();
+    expect(within(menu).getByRole("button", { name: "Daemons" })).toBeEnabled();
     expect(within(menu).getByRole("button", { name: "Sessions" })).toBeEnabled();
     expect(within(menu).getByRole("button", { name: "Files" })).toBeDisabled();
     expect(within(menu).getByRole("button", { name: "New" })).toBeEnabled();
     expect(within(menu).queryByRole("button", { name: "Refresh sessions" })).toBeNull();
 
-    await within(menu).getByRole("button", { name: "Connection" }).click();
-    const connectionPanel = await screen.findByLabelText("connection panel");
-    expect(within(connectionPanel).getByLabelText("connection status")).toBeVisible();
-    await user.click(within(connectionPanel).getByRole("button", { name: "Manage daemons" }));
-    expect(within(connectionPanel).getByLabelText("daemon manager")).toBeVisible();
-    await user.click(within(connectionPanel).getByRole("button", { name: "Close connection panel" }));
+    await within(menu).getByRole("button", { name: "Daemons" }).click();
+    const admin = await screen.findByLabelText("daemon admin");
+    expect(within(admin).getByLabelText("daemon manager")).toBeVisible();
+    await user.click(within(admin).getByRole("button", { name: "Open workspace" }));
+    await screen.findByText("paired daemon");
 
     await user.click(screen.getByRole("button", { name: "Open mobile workspace menu" }));
     const sessionsMenu = await screen.findByRole("navigation", { name: "mobile workspace menu" });
@@ -209,11 +220,13 @@ describe("termui web 工作台", () => {
     await screen.findByText("Connected");
 
     const relayUrl = `${daemon.url}?relay_token=relay-secret`;
-    await user.click(screen.getByRole("button", { name: "Edit connection" }));
+    await user.click(screen.getByRole("button", { name: "Daemons" }));
     await setConnectionUrl(user, relayUrl);
     await user.click(screen.getByRole("button", { name: "Save URL" }));
 
-    await screen.findByText(relayUrl);
+    await screen.findByText("Connected");
+    await expectDaemonUrlInAdmin(user, relayUrl);
+    await user.click(screen.getByRole("button", { name: "Open workspace" }));
     await user.click(screen.getByRole("button", { name: "Refresh" }));
     await screen.findAllByText("00000000-0000-0000-0000-000000000401");
   });
@@ -240,24 +253,31 @@ describe("termui web 工作台", () => {
       await user.click(screen.getByRole("button", { name: "Pair" }));
       await screen.findByText("Connected");
 
-      await user.click(screen.getByRole("button", { name: "Edit connection" }));
+      await user.click(screen.getByRole("button", { name: "Daemons" }));
       await setConnectionUrl(user, secondDaemon.url);
       await user.clear(screen.getByLabelText("Pairing token"));
       fireEvent.change(screen.getByLabelText("Pairing token"), {
         target: { value: pairingInviteCode(secondDaemon, "second-token") },
       });
       await user.click(screen.getByRole("button", { name: "Pair" }));
-      await screen.findByText(secondDaemon.url);
+      await screen.findByText("Connected");
 
-      const selector = await screen.findByLabelText("Daemon");
-      expect(within(selector).getByRole("option", { name: new RegExp(new URL(daemon.url).host) })).toBeInTheDocument();
-      expect(within(selector).getByRole("option", { name: new RegExp(new URL(secondDaemon.url).host) })).toBeInTheDocument();
+      await user.click(screen.getByRole("button", { name: "Daemons" }));
+      const manager = await screen.findByLabelText("daemon manager");
+      expect(within(manager).getByText(daemon.url)).toBeInTheDocument();
+      expect(within(manager).getByText(secondDaemon.url)).toBeInTheDocument();
+      expect(screen.queryByLabelText("Daemon")).toBeNull();
 
+      await user.click(screen.getByRole("button", { name: "Open workspace" }));
       await user.click(screen.getByRole("button", { name: "Refresh" }));
       await screen.findAllByText("00000000-0000-0000-0000-000000000421");
 
-      await user.selectOptions(selector, daemon.serverId);
-      await waitFor(() => expect(screen.getByLabelText("Daemon")).toHaveValue(daemon.serverId));
+      await user.click(screen.getByRole("button", { name: "Daemons" }));
+      const refreshedManager = await screen.findByLabelText("daemon manager");
+      await user.click(within(refreshedManager).getByRole("button", { name: /Use daemon Daemon 1/ }));
+      await waitFor(() => expect(screen.getByLabelText("selected daemon")).toHaveTextContent(daemon.url));
+      await user.click(screen.getByRole("button", { name: "Open workspace" }));
+      await screen.findByText("Connected");
       await screen.findAllByText("00000000-0000-0000-0000-000000000401");
     } finally {
       await secondDaemon.stop();
@@ -276,15 +296,15 @@ describe("termui web 工作台", () => {
       await pairWithInvite(user, daemon);
       await screen.findByText("Connected");
 
-      await user.click(screen.getByRole("button", { name: "Edit connection" }));
+      await user.click(screen.getByRole("button", { name: "Daemons" }));
       await setConnectionUrl(user, secondDaemon.url);
       fireEvent.change(screen.getByLabelText("Pairing token"), {
         target: { value: pairingInviteCode(secondDaemon, "second-token") },
       });
       await user.click(screen.getByRole("button", { name: "Pair" }));
-      await screen.findByText(secondDaemon.url);
+      await screen.findByText("Connected");
 
-      await user.click(screen.getByRole("button", { name: "Manage daemons" }));
+      await user.click(screen.getByRole("button", { name: "Daemons" }));
       const manager = await screen.findByLabelText("daemon manager");
       expect(within(manager).getByText(daemon.url)).toBeInTheDocument();
       expect(within(manager).getByText(secondDaemon.url)).toBeInTheDocument();
@@ -296,7 +316,7 @@ describe("termui web 工作台", () => {
       await user.click(within(manager).getByRole("button", { name: "Save daemon name" }));
 
       await within(manager).findByText("Laptop relay");
-      expect(screen.getByLabelText("Daemon")).toHaveValue(secondDaemon.serverId);
+      expect(screen.getByLabelText("selected daemon")).toHaveTextContent("Laptop relay");
 
       await user.click(within(manager).getByRole("button", { name: /Delete daemon Laptop relay/ }));
       const afterDeleteManager = await screen.findByLabelText("daemon manager");
@@ -306,11 +326,64 @@ describe("termui web 工作台", () => {
       const remainingManager = afterDeleteManager;
       await user.click(within(remainingManager).getByRole("button", { name: /Delete daemon/ }));
 
-      await waitFor(() => expect(screen.queryByLabelText("daemon manager")).toBeNull());
+      await waitFor(() => expect(within(screen.getByLabelText("daemon manager")).getByText("No daemons")).toBeVisible());
       expect(await screen.findByLabelText("Pairing token")).toBeInTheDocument();
       expect(screen.queryByRole("button", { name: "New session" })).toBeNull();
     } finally {
       await secondDaemon.stop();
+    }
+  });
+
+  it("选到不可用 daemon 后会回到后台管理页，并可切回可用 daemon", async () => {
+    const user = userEvent.setup();
+    const secondDaemon = await MockDaemon.start({
+      token: "second-token",
+      sessions: [],
+    });
+    let secondStopped = false;
+    render(<App />);
+
+    try {
+      await pairWithInvite(user, daemon);
+      await screen.findByText("Connected");
+
+      await user.click(screen.getByRole("button", { name: "Daemons" }));
+      await setConnectionUrl(user, secondDaemon.url);
+      fireEvent.change(screen.getByLabelText("Pairing token"), {
+        target: { value: pairingInviteCode(secondDaemon, "second-token") },
+      });
+      await user.click(screen.getByRole("button", { name: "Pair" }));
+      await screen.findByText("Connected");
+
+      await user.click(screen.getByRole("button", { name: "Daemons" }));
+      const initialManager = await screen.findByLabelText("daemon manager");
+      await user.click(within(initialManager).getByRole("button", { name: /Use daemon Daemon 1/ }));
+      await waitFor(() => expect(screen.getByLabelText("selected daemon")).toHaveTextContent(daemon.url));
+      await user.click(screen.getByRole("button", { name: "Open workspace" }));
+      await screen.findByText("Connected");
+      await screen.findAllByText("00000000-0000-0000-0000-000000000401");
+
+      await secondDaemon.stop();
+      secondStopped = true;
+
+      await user.click(screen.getByRole("button", { name: "Daemons" }));
+      const manager = await screen.findByLabelText("daemon manager");
+      await user.click(within(manager).getByRole("button", { name: /Use daemon Daemon 2/ }));
+
+      await waitFor(() => expect(screen.getByText("error")).toBeInTheDocument(), { timeout: 12_000 });
+      const recoveredAdmin = await screen.findByLabelText("daemon admin");
+      const recoveredManager = within(recoveredAdmin).getByLabelText("daemon manager");
+      expect(recoveredManager).toBeVisible();
+
+      await user.click(within(recoveredManager).getByRole("button", { name: /Use daemon Daemon 1/ }));
+      await waitFor(() => expect(screen.getByLabelText("selected daemon")).toHaveTextContent(daemon.url));
+      await user.click(screen.getByRole("button", { name: "Open workspace" }));
+      await screen.findByText("Connected");
+      await screen.findAllByText("00000000-0000-0000-0000-000000000401");
+    } finally {
+      if (!secondStopped) {
+        await secondDaemon.stop();
+      }
     }
   });
 
@@ -760,8 +833,8 @@ describe("termui web 工作台", () => {
 
     await waitFor(() => expect(screen.queryByLabelText("Pairing token")).toBeNull());
     expect(screen.queryByLabelText("WS URL")).toBeNull();
-    await screen.findByText(daemon.url);
     await screen.findByText("Connected");
+    await expectDaemonUrlInAdmin(user, daemon.url);
     expect(daemon.outerWireText()).not.toContain("secret-token");
   });
 
@@ -790,8 +863,8 @@ describe("termui web 工作台", () => {
     await user.click(screen.getByRole("button", { name: "Pair" }));
 
     await waitFor(() => expect(screen.queryByLabelText("Pairing token")).toBeNull());
-    await screen.findByText(relayUrl);
     await screen.findByText("Connected");
+    await expectDaemonUrlInAdmin(user, relayUrl);
     expect(daemon.outerWireText()).not.toContain("secret-token");
   });
 
@@ -1014,13 +1087,12 @@ describe("termui web 工作台", () => {
   });
 
   it("未配对时只显示连接表单，并按当前页面来源和前缀推导 WebSocket 地址", async () => {
-    const user = userEvent.setup();
     render(<App />);
 
-    await screen.findByText(defaultWsUrlFromPage());
-    expect(screen.queryByLabelText("WS URL")).toBeNull();
-    await user.click(screen.getByRole("button", { name: "Edit address" }));
+    expect(await screen.findByLabelText("daemon admin")).toBeVisible();
     expect(await screen.findByLabelText("WS URL")).toHaveValue(defaultWsUrlFromPage());
+    expect(screen.getByRole("button", { name: "Workspace" })).toBeDisabled();
+    expect(within(screen.getByLabelText("daemon manager")).getByText("No daemons")).toBeVisible();
     expect(screen.getByLabelText("Pairing token")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Scan QR" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "New session" })).toBeNull();
@@ -1207,7 +1279,7 @@ describe("termui web 工作台", () => {
     await waitFor(() => expect(screen.queryByRole("dialog", { name: "Scan pairing QR" })).toBeNull());
     await waitFor(() => expect(screen.queryByLabelText("Pairing token")).toBeNull());
     await screen.findByText("Connected");
-    await screen.findByText(daemon.url);
+    await expectDaemonUrlInAdmin(user, daemon.url);
     expect(qrScannerMock.stop).toHaveBeenCalledTimes(1);
     expect(daemon.outerWireText()).not.toContain("secret-token");
   });
@@ -1234,7 +1306,7 @@ describe("termui web 工作台", () => {
     await waitFor(() => expect(screen.queryByRole("dialog", { name: "Scan pairing QR" })).toBeNull());
     await waitFor(() => expect(screen.queryByLabelText("Pairing token")).toBeNull());
     await screen.findByText("Connected");
-    await screen.findByText(daemon.url);
+    await expectDaemonUrlInAdmin(user, daemon.url);
     expect(qrScannerMock.stop).toHaveBeenCalledTimes(1);
     expect(daemon.outerWireText()).not.toContain("secret-token");
   });
@@ -1263,7 +1335,7 @@ describe("termui web 工作台", () => {
     await waitFor(() => expect(screen.queryByRole("dialog", { name: "Scan pairing QR" })).toBeNull());
     await waitFor(() => expect(screen.queryByLabelText("Pairing token")).toBeNull());
     await screen.findByText("Connected");
-    await screen.findByText(daemon.url);
+    await expectDaemonUrlInAdmin(user, daemon.url);
     expect(qrScannerMock.stop).toHaveBeenCalledTimes(1);
     expect(daemon.outerWireText()).not.toContain("secret-token");
   });

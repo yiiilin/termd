@@ -36,7 +36,7 @@ wget -qO- https://github.com/yiiilin/termd/releases/latest/download/install-term
 curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termd.sh | sudo bash -s -- --web --listen 0.0.0.0:8765
 ```
 
-安装脚本会注册并启动 `termd.service`，随后在当前终端打印一个短期一次性 pairing token、Web 邀请码和 `termctl pair` 示例。token 不会写入配置文件；过期或用过后可在 daemon 主机上运行 `termd pair` 重新签发。
+安装脚本会注册并启动 `termd.service`，随后在当前终端打印一份短期一次性 `termd-pair:v1` 邀请码和 `termctl pair --payload` 示例。邀请材料不会写入配置文件；过期或用过后可在 daemon 主机上运行 `termd pair --qr` 重新签发。
 
 #### 运行用户、默认 shell 和工作目录
 

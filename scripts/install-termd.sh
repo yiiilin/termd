@@ -467,6 +467,7 @@ Environment=SHELL=${SERVICE_SHELL}
 ExecStart=${WRAPPER_FILE}
 Restart=always
 RestartSec=2
+KillMode=process
 EOF
 
   if [[ "$SERVICE_USER" == "termd" ]]; then
@@ -586,14 +587,14 @@ def invite_code():
     raw = json.dumps(invite_payload, separators=(",", ":")).encode("utf-8")
     return "termd-pair:v1:" + base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
-print(f"[termd-install] initial pairing token, expires in {ttl_ms // 1000}s:")
+web_invite = invite_code()
+print(f"[termd-install] initial pairing invite, expires in {ttl_ms // 1000}s:")
+print("[termd-install] raw token:")
 print(token)
 print("[termd-install] pair with:")
-print(f"termctl pair --token {token!r} --url {direct_ws_url}")
-web_invite = invite_code()
+print(f"termctl pair --payload {shlex.quote(web_invite)} --url {shlex.quote(direct_ws_url)}")
 print("[termd-install] web invite code:")
 print(web_invite)
-print(f"termctl pair --payload {shlex.quote(web_invite)}")
 print("[termd-install] open the Web page you plan to use and paste or scan this invite code.")
 ')"; then
         printf '\n%s\n' "$summary"
@@ -603,7 +604,7 @@ print("[termd-install] open the Web page you plan to use and paste or scan this 
     sleep 0.25
   done
 
-  log "service started, but initial pairing token could not be issued from ${endpoint}"
+  log "service started, but initial pairing invite could not be issued from ${endpoint}"
   log "run '${INSTALL_PREFIX}/bin/${BIN_NAME} pair --url ${base_url}' on this host to issue a new token"
 }
 

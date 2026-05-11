@@ -72,6 +72,7 @@ export function DaemonManagerPanel(props: DaemonManagerPanelProps) {
                 <>
                   <button
                     type="button"
+                    // 当前 daemon 只表达选择状态；进入工作台统一走页面级 Open workspace，避免管理动作隐式跳转。
                     onClick={() => props.onSelect(item.server.server_id)}
                     disabled={active}
                     aria-label={`Use daemon ${label}`}

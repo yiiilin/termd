@@ -10,6 +10,7 @@ import {
   PanelRightOpen,
   Plus,
   RefreshCcw,
+  Server,
   Unplug,
   UsersRound,
   X,
@@ -41,7 +42,7 @@ import {
   renameDaemon,
   selectDefaultServer,
 } from "./state/browser-state";
-import { ConnectionPanel, ConnectionStatusPanel } from "./components/ConnectionPanel";
+import { ConnectionPanel } from "./components/ConnectionPanel";
 import { DaemonClientsPanel } from "./components/DaemonClientsPanel";
 import { DaemonManagerPanel } from "./components/DaemonManagerPanel";
 import { SessionList } from "./components/SessionList";
@@ -54,6 +55,7 @@ const FALLBACK_WS_URL = "ws://127.0.0.1:8765/ws";
 const DEFAULT_SESSION_SIZE: TerminalSize = { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 };
 const MOBILE_LAYOUT_QUERY = "(max-width: 760px)";
 const MOBILE_LAYOUT_BREAKPOINT = 760;
+type AppSurface = "admin" | "workspace";
 
 export default function App() {
   const [state, setState] = useState<BrowserState>({ pairedServers: [] });
@@ -73,12 +75,12 @@ export default function App() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [filesPanelOpen, setFilesPanelOpen] = useState(true);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
-  const [mobilePanel, setMobilePanel] = useState<"connection" | "sessions" | "files" | undefined>();
+  const [mobilePanel, setMobilePanel] = useState<"sessions" | "files" | undefined>();
   const [connectionEditorOpen, setConnectionEditorOpen] = useState(false);
-  const [daemonManagerOpen, setDaemonManagerOpen] = useState(false);
   const [qrScannerOpen, setQrScannerOpen] = useState(false);
   const [renamingDaemonId, setRenamingDaemonId] = useState<UUID | undefined>();
   const [daemonRenameDraft, setDaemonRenameDraft] = useState("");
+  const [activeSurface, setActiveSurface] = useState<AppSurface>("admin");
   const [status, setStatus] = useState("idle");
   const [error, setError] = useState<SafeError | undefined>();
   const attachClientRef = useRef<DirectClient | undefined>(undefined);
@@ -96,16 +98,16 @@ export default function App() {
       if (!urlTouchedRef.current) {
         setUrl(browserReachableWsUrl(loaded.defaultUrl ?? defaultServer(loaded)?.url ?? defaultWsUrlFromPage()));
       }
+      // 已配对的浏览器默认进入工作台；连接失败时再回落到后台管理页重新选择 daemon。
+      setActiveSurface(defaultServer(loaded) && loaded.device ? "workspace" : "admin");
     });
   }, []);
 
   const activeServer = useMemo<PairedServerState | undefined>(() => defaultServer(state), [state]);
-  const connectionStatusUrl = activeServer ? browserReachableWsUrl(activeServer.url) : url;
   const hasPairedServer = Boolean(activeServer && state.device);
   const showConnectionStatus = hasPairedServer && !error && status !== "pairing";
   const connectionReady =
     showConnectionStatus && status !== "idle" && status !== "connecting" && status !== "listing";
-  const showPairingForm = !showConnectionStatus || connectionEditorOpen;
   const sessionOperators = useMemo(() => {
     if (!attachedSessionId) {
       return [];
@@ -127,10 +129,36 @@ export default function App() {
     [state.pairedServers],
   );
   const showMobileWorkspaceMenu = isMobileLayout && connectionReady;
-  const showMobileConnectionPanel = showMobileWorkspaceMenu && mobilePanel === "connection";
   const showMobileSessionsPanel = showMobileWorkspaceMenu && mobilePanel === "sessions";
   const showMobileFilesPanel = showMobileWorkspaceMenu && mobilePanel === "files";
   const showDesktopFilesPanel = !isMobileLayout && filesPanelOpen;
+  const canOpenWorkspace = Boolean(activeServer && state.device);
+  const activeDaemonLabel =
+    pairedServerOptions.find((item) => item.server.server_id === activeServer?.server_id)?.label ?? "No daemon";
+
+  const handleOpenAdmin = useCallback((options: { editConnection?: boolean } = {}) => {
+    setActiveSurface("admin");
+    setMobilePanel(undefined);
+    setMobileMenuOpen(false);
+    // 只有显式进入连接编辑时才保留编辑器，普通返回管理页时收起它。
+    setConnectionEditorOpen(Boolean(options.editConnection));
+  }, []);
+
+  const handleOpenWorkspace = useCallback(() => {
+    if (!activeServer || !state.device) {
+      return;
+    }
+    setError(undefined);
+    setActiveSurface("workspace");
+    setConnectionEditorOpen(false);
+    setMobilePanel(undefined);
+    setMobileMenuOpen(false);
+    if (status === "error" || status === "idle") {
+      // 从后台重新进入工作台时允许对当前 daemon 再做一次连通性探测。
+      autoCheckedServerRef.current = undefined;
+      setStatus("idle");
+    }
+  }, [activeServer, state.device, status]);
 
   const setSafeError = useCallback((caught: unknown) => {
     setError(toSafeError(caught));
@@ -178,7 +206,6 @@ export default function App() {
       }
       setRenamingDaemonId(serverId);
       setDaemonRenameDraft(target.server.name?.trim() ?? target.label);
-      setDaemonManagerOpen(true);
     },
     [pairedServerOptions],
   );
@@ -216,13 +243,14 @@ export default function App() {
         setState(nextState);
         setRenamingDaemonId(undefined);
         setDaemonRenameDraft("");
-        setDaemonManagerOpen(Boolean(nextState.pairedServers.length));
+        setConnectionEditorOpen(false);
         setMobilePanel(undefined);
         setMobileMenuOpen(false);
 
         const nextServer = defaultServer(nextState);
         const nextUrl = nextState.defaultUrl ?? nextServer?.url ?? defaultWsUrlFromPage();
         setUrl(browserReachableWsUrl(nextUrl));
+        setActiveSurface("admin");
 
         if (!nextState.pairedServers.length) {
           setConnectionEditorOpen(false);
@@ -273,6 +301,7 @@ export default function App() {
       if (payload) {
         setUrl(effectiveUrl);
       }
+      setActiveSurface("workspace");
       setStatus("paired");
     } catch (caught) {
       setPairingToken("");
@@ -327,6 +356,7 @@ export default function App() {
       setTerminalChunks([]);
       setConnectionEditorOpen(false);
       autoCheckedServerRef.current = undefined;
+      setActiveSurface("workspace");
       setStatus("ready");
     } catch (caught) {
       setSafeError(caught);
@@ -357,6 +387,7 @@ export default function App() {
       setState(nextState);
       setUrl(browserReachableWsUrl(target.url));
       setConnectionEditorOpen(false);
+      setActiveSurface("admin");
       setStatus("idle");
     },
     [activeServer?.server_id, disconnectAttach, state.pairedServers],
@@ -414,6 +445,7 @@ export default function App() {
       clearSessionFiles();
       setStatus("ready");
     } catch (caught) {
+      setActiveSurface("admin");
       setSafeError(caught);
     }
   }, [authenticatedClient, clearSessionFiles, setSafeError]);
@@ -768,41 +800,97 @@ export default function App() {
   }, [connectionReady, isMobileLayout]);
 
   const handleOpenMobileSessions = useCallback(() => {
-    setDaemonManagerOpen(false);
     setMobileMenuOpen(false);
     setMobilePanel("sessions");
-  }, []);
-
-  const handleOpenMobileConnection = useCallback(() => {
-    setDaemonManagerOpen(false);
-    setMobileMenuOpen(false);
-    setMobilePanel("connection");
   }, []);
 
   const handleOpenMobileFiles = useCallback(() => {
     if (!attachedSessionId) {
       return;
     }
-    setDaemonManagerOpen(false);
     setMobileMenuOpen(false);
     setMobilePanel("files");
   }, [attachedSessionId]);
 
   const handleOpenMobileNewSession = useCallback(() => {
-    setDaemonManagerOpen(false);
     setMobileMenuOpen(false);
     void handleCreateSession();
   }, [handleCreateSession]);
 
   const handleCloseMobilePanel = useCallback(() => {
     setMobilePanel(undefined);
-    setDaemonManagerOpen(false);
   }, []);
+
+  if (activeSurface === "admin") {
+    return (
+      <div className="admin-shell">
+        <header className="admin-topbar">
+          <div className="admin-brand">
+            <Cable size={18} aria-hidden="true" />
+            <span>termd admin</span>
+          </div>
+          <div className="admin-topbar-actions">
+            <button type="button" onClick={handleOpenWorkspace} disabled={!canOpenWorkspace}>
+              <MonitorUp size={16} aria-hidden="true" />
+              Workspace
+            </button>
+          </div>
+        </header>
+        <main className="admin-main" aria-label="daemon admin">
+          <section className="admin-summary-band" aria-label="selected daemon">
+            <div className="admin-summary-main">
+              <span>Selected daemon</span>
+              <strong>{activeDaemonLabel}</strong>
+              <code>{activeServer?.url ?? "unpaired"}</code>
+            </div>
+            <button type="button" onClick={handleOpenWorkspace} disabled={!canOpenWorkspace}>
+              <MonitorUp size={16} aria-hidden="true" />
+              Open workspace
+            </button>
+          </section>
+          <div className="admin-grid">
+            <ConnectionPanel
+              url={url}
+              token={pairingToken}
+              status={status}
+              canSaveUrl={hasPairedServer}
+              onUrlChange={handleUrlChange}
+              onTokenChange={setPairingToken}
+              onPair={() => void handlePair()}
+              onScanQr={() => setQrScannerOpen(true)}
+              onSaveUrl={handleSaveConnectionUrl}
+              showUrlEditor={connectionEditorOpen || !activeServer}
+            />
+            <DaemonManagerPanel
+              servers={pairedServerOptions}
+              activeServerId={activeServer?.server_id}
+              renamingServerId={renamingDaemonId}
+              renameDraft={daemonRenameDraft}
+              onSelect={(serverId) => void handleSelectServer(serverId)}
+              onStartRename={handleStartDaemonRename}
+              onRenameDraftChange={setDaemonRenameDraft}
+              onSaveRename={(serverId) => void handleSaveDaemonRename(serverId)}
+              onCancelRename={handleCancelDaemonRename}
+              onForget={(serverId) => void handleForgetDaemon(serverId)}
+            />
+          </div>
+          {qrScannerOpen ? (
+            <PairingQrScanner
+              onDetected={handleQrDetected}
+              onClose={() => setQrScannerOpen(false)}
+            />
+          ) : null}
+        </main>
+        <StatusBar status={status} error={error} sessionId={attachedSessionId ?? selectedSessionId} />
+      </div>
+    );
+  }
 
   return (
     <div
       className={[
         "app-shell",
+        "workspace-surface",
         sidebarCollapsed ? "sidebar-is-collapsed" : "",
         connectionReady ? "connection-ready" : "",
         mobileMenuOpen ? "mobile-menu-open" : "",
@@ -922,54 +1010,6 @@ export default function App() {
                 </div>
               ) : null}
             </div>
-            {showPairingForm ? (
-              <ConnectionPanel
-                url={url}
-                token={pairingToken}
-                status={status}
-                canSaveUrl={hasPairedServer}
-                onUrlChange={handleUrlChange}
-                onTokenChange={setPairingToken}
-                onPair={() => void handlePair()}
-                onScanQr={() => setQrScannerOpen(true)}
-                onSaveUrl={handleSaveConnectionUrl}
-                showUrlEditor={connectionEditorOpen}
-              />
-            ) : null}
-            {qrScannerOpen ? (
-              <PairingQrScanner
-                onDetected={handleQrDetected}
-                onClose={() => setQrScannerOpen(false)}
-              />
-            ) : null}
-            {!isMobileLayout && showConnectionStatus && activeServer ? (
-              <ConnectionStatusPanel
-                url={connectionStatusUrl}
-                status={status}
-                servers={pairedServerOptions}
-                activeServerId={activeServer.server_id}
-                onServerChange={(serverId) => void handleSelectServer(serverId)}
-                onEdit={() => {
-                  setUrl(connectionStatusUrl);
-                  setConnectionEditorOpen((open) => !open);
-                }}
-                onManage={() => setDaemonManagerOpen((open) => !open)}
-              />
-            ) : null}
-            {!isMobileLayout && showConnectionStatus && daemonManagerOpen ? (
-              <DaemonManagerPanel
-                servers={pairedServerOptions}
-                activeServerId={activeServer?.server_id}
-                renamingServerId={renamingDaemonId}
-                renameDraft={daemonRenameDraft}
-                onSelect={(serverId) => void handleSelectServer(serverId)}
-                onStartRename={handleStartDaemonRename}
-                onRenameDraftChange={setDaemonRenameDraft}
-                onSaveRename={(serverId) => void handleSaveDaemonRename(serverId)}
-                onCancelRename={handleCancelDaemonRename}
-                onForget={(serverId) => void handleForgetDaemon(serverId)}
-              />
-            ) : null}
             {!isMobileLayout && connectionReady ? (
               <>
                 <div className="panel session-create" aria-label="new session">
@@ -1020,8 +1060,13 @@ export default function App() {
           ) : null}
           <div className="toolbar-group">
             <Link size={16} aria-hidden="true" />
-            <span>{activeServer ? "paired daemon" : "unpaired"}</span>
+            <span>{connectionReady ? "Connected" : activeServer ? "paired daemon" : "unpaired"}</span>
+            {activeServer && connectionReady ? <small>paired daemon</small> : null}
           </div>
+          <button type="button" className="toolbar-admin-button" onClick={() => handleOpenAdmin()}>
+            <Server size={16} aria-hidden="true" />
+            Daemons
+          </button>
           {connectionReady && attachedSessionId ? (
             <SessionOperatorsBar
               operators={sessionOperators}
@@ -1078,9 +1123,9 @@ export default function App() {
         </div>
         {showMobileWorkspaceMenu && mobileMenuOpen ? (
           <nav className="mobile-menu-popover" aria-label="mobile workspace menu">
-            <button type="button" onClick={handleOpenMobileConnection}>
-              <Link size={16} aria-hidden="true" />
-              Connection
+            <button type="button" onClick={() => handleOpenAdmin()}>
+              <Server size={16} aria-hidden="true" />
+              Daemons
             </button>
             <button type="button" onClick={handleOpenMobileSessions}>
               <MonitorUp size={16} aria-hidden="true" />
@@ -1095,47 +1140,6 @@ export default function App() {
               New
             </button>
           </nav>
-        ) : null}
-        {showMobileConnectionPanel ? (
-          <section className="mobile-panel mobile-connection-panel" aria-label="connection panel">
-            <header className="mobile-panel-header">
-              <div className="mobile-panel-title">
-                <Link size={15} aria-hidden="true" />
-                <span>Connection</span>
-              </div>
-              <div className="mobile-panel-actions">
-                <button type="button" className="icon-button" aria-label="Close connection panel" onClick={handleCloseMobilePanel}>
-                  <X size={15} aria-hidden="true" />
-                </button>
-              </div>
-            </header>
-            <div className="mobile-panel-body mobile-connection-panel-body">
-              {showConnectionStatus && activeServer ? (
-                <ConnectionStatusPanel
-                  url={connectionStatusUrl}
-                  status={status}
-                  servers={pairedServerOptions}
-                  activeServerId={activeServer.server_id}
-                  onServerChange={(serverId) => void handleSelectServer(serverId)}
-                  onManage={() => setDaemonManagerOpen((open) => !open)}
-                />
-              ) : null}
-              {showConnectionStatus && daemonManagerOpen ? (
-                <DaemonManagerPanel
-                  servers={pairedServerOptions}
-                  activeServerId={activeServer?.server_id}
-                  renamingServerId={renamingDaemonId}
-                  renameDraft={daemonRenameDraft}
-                  onSelect={(serverId) => void handleSelectServer(serverId)}
-                  onStartRename={handleStartDaemonRename}
-                  onRenameDraftChange={setDaemonRenameDraft}
-                  onSaveRename={(serverId) => void handleSaveDaemonRename(serverId)}
-                  onCancelRename={handleCancelDaemonRename}
-                  onForget={(serverId) => void handleForgetDaemon(serverId)}
-                />
-              ) : null}
-            </div>
-          </section>
         ) : null}
         {showMobileSessionsPanel ? (
           <section className="mobile-panel mobile-sessions-panel" aria-label="sessions panel">

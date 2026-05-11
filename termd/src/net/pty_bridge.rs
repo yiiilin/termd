@@ -13,7 +13,7 @@ use portable_pty::{Child, MasterPty, native_pty_system};
 use tokio::sync::watch;
 
 use crate::pty::{
-    CommandSpec, PtyBackend, PtyError, PtyExitStatus, PtyResult, PtySession, PtySize,
+    CommandSpec, PtyBackend, PtyError, PtyExitStatus, PtyResult, PtySession, PtySize, PtySnapshot,
 };
 
 const READER_CHUNK_BYTES: usize = 16 * 1024;
@@ -63,6 +63,7 @@ impl PtyBackend for NonBlockingPortablePtyBackend {
             output_signal_rx,
             pending_output: VecDeque::new(),
             _reader_thread: reader_thread,
+            size,
         }))
     }
 }
@@ -107,6 +108,7 @@ struct NonBlockingPortablePtySession {
     output_signal_rx: watch::Receiver<u64>,
     pending_output: VecDeque<Vec<u8>>,
     _reader_thread: JoinHandle<()>,
+    size: PtySize,
 }
 
 impl NonBlockingPortablePtySession {
@@ -155,7 +157,20 @@ impl PtySession for NonBlockingPortablePtySession {
     }
 
     fn resize(&mut self, size: PtySize) -> PtyResult<()> {
-        self.master.resize(size.into()).map_err(PtyError::backend)
+        self.master.resize(size.into()).map_err(PtyError::backend)?;
+        self.size = size;
+        Ok(())
+    }
+
+    fn snapshot(&mut self) -> PtyResult<PtySnapshot> {
+        self.drain_ready_output()?;
+        let retained_output = self.pending_output.iter().flatten().copied().collect();
+
+        Ok(PtySnapshot {
+            size: self.size,
+            process_id: self.process_id(),
+            retained_output,
+        })
     }
 
     fn terminate(&mut self) -> PtyResult<()> {

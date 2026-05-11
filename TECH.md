@@ -121,7 +121,7 @@ relay 只按 URL 中公开的 `server_id` 路由 frame。`/daemon-mux` 只解析
 
 * workspace package 版本与 Git tag 保持一致，release 资产和 GHCR 镜像都使用同一个 tag。
 * `termctl` 和 `termd` 提供 curl/wget 安装脚本；`termd` 安装脚本默认注册 systemd 服务。
-* `termrelay` 提供 systemd 安装脚本，另外还有 `deploy/termrelay/docker-compose.yml` 的容器化部署方式。
+* `termd.service` 使用 `KillMode=process`，以便 daemon 重启时保留 per-session supervisor；`termrelay` 也提供 systemd 安装脚本，另外还有 `deploy/termrelay/docker-compose.yml` 的容器化部署方式。
 * GitHub Actions 在 tag push 时会同时构建 release tarball、发布 GitHub Release 资产，并推送 `ghcr.io/<owner>/<component>:<tag>` 镜像。
 
 ### `termui/frontend`

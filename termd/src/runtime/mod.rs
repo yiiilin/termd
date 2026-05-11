@@ -7,11 +7,20 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::sync::watch;
 
-use crate::pty::{CommandSpec, PtyBackend, PtyError, PtySession, PtySize};
+use crate::pty::{
+    CommandSpec, PtyBackend, PtyError, PtyRestoreInfo, PtySession, PtySize, PtySnapshot,
+};
 use crate::session::{AttachRole, SessionError, SessionManager, SessionState, TerminalSize};
+use crate::state::SessionStateRecord;
+use termd_proto::{
+    SessionId, SessionState as ProtoSessionState, TerminalSize as ProtoTerminalSize,
+    UnixTimestampMillis,
+};
+use uuid::Uuid;
 
 /// runtime 层统一 Result 类型。
 pub type RuntimeResult<T> = Result<T, RuntimeError>;
@@ -27,6 +36,7 @@ pub enum RuntimeError {
     SessionClosed,
     DeviceNotAttached,
     InvalidSize,
+    NotReconnectable,
     Pty(PtyError),
 }
 
@@ -37,7 +47,8 @@ impl PartialEq for RuntimeError {
             | (Self::SessionNotFound, Self::SessionNotFound)
             | (Self::SessionClosed, Self::SessionClosed)
             | (Self::DeviceNotAttached, Self::DeviceNotAttached)
-            | (Self::InvalidSize, Self::InvalidSize) => true,
+            | (Self::InvalidSize, Self::InvalidSize)
+            | (Self::NotReconnectable, Self::NotReconnectable) => true,
             (Self::Pty(_), Self::Pty(_)) => true,
             _ => false,
         }
@@ -54,6 +65,7 @@ impl fmt::Display for RuntimeError {
             Self::SessionClosed => write!(f, "session is closed"),
             Self::DeviceNotAttached => write!(f, "device is not attached"),
             Self::InvalidSize => write!(f, "terminal size must have non-zero rows and cols"),
+            Self::NotReconnectable => write!(f, "session does not contain reconnect metadata"),
             Self::Pty(error) => write!(f, "{error}"),
         }
     }
@@ -67,6 +79,7 @@ impl Error for RuntimeError {
             | Self::SessionNotFound
             | Self::SessionClosed
             | Self::DeviceNotAttached
+            | Self::NotReconnectable
             | Self::InvalidSize => None,
         }
     }
@@ -92,6 +105,8 @@ impl From<PtyError> for RuntimeError {
 
 struct RuntimeSession {
     pty: Box<dyn PtySession>,
+    created_at_ms: UnixTimestampMillis,
+    updated_at_ms: UnixTimestampMillis,
 }
 
 /// daemon 内核 runtime。
@@ -126,17 +141,79 @@ impl<B: PtyBackend> SessionRuntime<B> {
         command: CommandSpec,
         size: TerminalSize,
     ) -> RuntimeResult<String> {
-        let pty_size = terminal_size_to_pty_size(size)?;
         let session_id = self.allocate_session_id();
+        self.create_session_with_id(&session_id, command, size)?;
+        Ok(session_id)
+    }
+
+    /// 用调用方提供的稳定 session id 创建 runtime session。
+    ///
+    /// protocol 层用它把 wire session id 直接映射到 supervisor socket 路径，便于 daemon
+    /// 重启后按持久状态重连。
+    pub fn create_session_with_id(
+        &mut self,
+        session_id: &str,
+        command: CommandSpec,
+        size: TerminalSize,
+    ) -> RuntimeResult<()> {
+        let pty_size = terminal_size_to_pty_size(size)?;
+        if self.runtime_sessions.contains_key(session_id) {
+            return Err(RuntimeError::SessionAlreadyExists);
+        }
 
         // 先启动 PTY，只有成功后才写入 SessionManager，避免留下没有进程句柄的半成品 session。
-        let pty = self.backend.spawn(&command, pty_size)?;
+        let pty = self.backend.spawn_named(session_id, &command, pty_size)?;
+        self.sessions.create_session(session_id.to_owned())?;
+        self.sessions.resize(session_id, size)?;
+        let now_ms = current_unix_timestamp_millis();
+        self.runtime_sessions.insert(
+            session_id.to_owned(),
+            RuntimeSession {
+                pty,
+                created_at_ms: now_ms,
+                updated_at_ms: now_ms,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// 用持久化的 supervisor IPC 元数据重新接回存活的 session。
+    pub fn reconnect_session(&mut self, record: &SessionStateRecord) -> RuntimeResult<()> {
+        if self
+            .runtime_sessions
+            .contains_key(&record.session_id.0.to_string())
+        {
+            return Err(RuntimeError::SessionAlreadyExists);
+        }
+        if record.state == ProtoSessionState::Closed {
+            return Err(RuntimeError::SessionClosed);
+        }
+        let restore_info = record
+            .restore_info
+            .as_ref()
+            .ok_or(RuntimeError::NotReconnectable)?;
+        let session_id = record.session_id.0.to_string();
+        let pty = self.backend.reconnect(&session_id, restore_info)?;
+        let size = proto_size_to_runtime(record.size);
+
         self.sessions.create_session(session_id.clone())?;
         self.sessions.resize(&session_id, size)?;
-        self.runtime_sessions
-            .insert(session_id.clone(), RuntimeSession { pty });
-
-        Ok(session_id)
+        if record.state == ProtoSessionState::Running {
+            // SessionManager 没有“直接恢复 Running”接口；用内部恢复 attach/detach 把状态推到 Running。
+            let recovery_device = format!("__runtime-recovery-{session_id}");
+            let _ = self.sessions.attach(&session_id, recovery_device.clone())?;
+            let _ = self.sessions.detach(&session_id, &recovery_device);
+        }
+        self.runtime_sessions.insert(
+            session_id,
+            RuntimeSession {
+                pty,
+                created_at_ms: record.created_at_ms,
+                updated_at_ms: record.updated_at_ms,
+            },
+        );
+        Ok(())
     }
 
     /// 将已认证设备 attach 到 runtime session。
@@ -200,6 +277,7 @@ impl<B: PtyBackend> SessionRuntime<B> {
         // 先调整真实 PTY，成功后再更新 session 元数据，避免状态显示已 resize 但进程未更新。
         self.runtime_session_mut(session_id)?.pty.resize(pty_size)?;
         self.sessions.resize(session_id, size)?;
+        self.runtime_session_mut(session_id)?.updated_at_ms = current_unix_timestamp_millis();
         Ok(())
     }
 
@@ -222,6 +300,19 @@ impl<B: PtyBackend> SessionRuntime<B> {
         Ok(())
     }
 
+    /// 丢弃 runtime session 的本地句柄，但不再尝试终止 PTY。
+    ///
+    /// 这个兜底路径只在显式 close 的终止步骤失败时使用，用来确保 daemon 不再保留
+    /// 不可见的 runtime 句柄；真正的 PTY 终止仍然优先走 `close`。
+    pub fn discard(&mut self, session_id: &str) -> RuntimeResult<()> {
+        if self.runtime_sessions.remove(session_id).is_none() {
+            return Err(RuntimeError::SessionNotFound);
+        }
+
+        self.sessions.close(session_id)?;
+        Ok(())
+    }
+
     /// 查询 session 当前状态，便于上层做只读展示或测试断言。
     pub fn state(&self, session_id: &str) -> RuntimeResult<SessionState> {
         Ok(self.sessions.state(session_id)?)
@@ -240,6 +331,40 @@ impl<B: PtyBackend> SessionRuntime<B> {
     /// 查询底层进程 id；fake backend 或不支持的平台可以返回 None。
     pub fn process_id(&self, session_id: &str) -> RuntimeResult<Option<u32>> {
         Ok(self.runtime_session(session_id)?.pty.process_id())
+    }
+
+    /// 读取 supervisor 的最近快照。
+    pub fn snapshot(&mut self, session_id: &str) -> RuntimeResult<PtySnapshot> {
+        self.ensure_open_session(session_id)?;
+        Ok(self.runtime_session_mut(session_id)?.pty.snapshot()?)
+    }
+
+    /// 查询 session 对应的 supervisor 恢复信息。
+    pub fn restore_info(&self, session_id: &str) -> RuntimeResult<Option<PtyRestoreInfo>> {
+        self.ensure_open_session(session_id)?;
+        Ok(self.runtime_session(session_id)?.pty.restore_info())
+    }
+
+    /// 导出当前 runtime 中可重连的 session 持久记录。
+    pub fn persisted_sessions(&self) -> Vec<SessionStateRecord> {
+        self.runtime_sessions
+            .iter()
+            .filter_map(|(session_id, runtime_session)| {
+                let restore_info = runtime_session.pty.restore_info()?;
+                let wire_session_id = SessionId(Uuid::parse_str(session_id).ok()?);
+                let state = self.sessions.state(session_id).ok()?;
+                let size = self.sessions.size(session_id).ok()?;
+
+                Some(SessionStateRecord {
+                    session_id: wire_session_id,
+                    state: runtime_state_to_proto(state),
+                    size: runtime_size_to_proto(size),
+                    created_at_ms: runtime_session.created_at_ms,
+                    updated_at_ms: runtime_session.updated_at_ms,
+                    restore_info: Some(restore_info),
+                })
+            })
+            .collect()
     }
 
     fn allocate_session_id(&mut self) -> String {
@@ -308,11 +433,46 @@ fn terminal_size_to_pty_size(size: TerminalSize) -> RuntimeResult<PtySize> {
     ))
 }
 
+fn proto_size_to_runtime(size: ProtoTerminalSize) -> TerminalSize {
+    TerminalSize {
+        rows: size.rows,
+        cols: size.cols,
+        pixel_width: size.pixel_width,
+        pixel_height: size.pixel_height,
+    }
+}
+
+fn runtime_state_to_proto(state: SessionState) -> ProtoSessionState {
+    match state {
+        SessionState::Created => ProtoSessionState::Created,
+        SessionState::Running => ProtoSessionState::Running,
+        SessionState::Closed => ProtoSessionState::Closed,
+    }
+}
+
+fn runtime_size_to_proto(size: TerminalSize) -> ProtoTerminalSize {
+    ProtoTerminalSize {
+        rows: size.rows,
+        cols: size.cols,
+        pixel_width: size.pixel_width,
+        pixel_height: size.pixel_height,
+    }
+}
+
+fn current_unix_timestamp_millis() -> UnixTimestampMillis {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default();
+    UnixTimestampMillis(millis)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::pty::{
         CommandSpec, PtyBackend, PtyError, PtyExitStatus, PtyResult, PtySession, PtySize,
+        PtySnapshot,
     };
     use crate::session::{AttachRole, TerminalSize};
     use std::sync::{Arc, Mutex};
@@ -375,6 +535,21 @@ mod tests {
         fn resize(&mut self, size: PtySize) -> PtyResult<()> {
             self.state.lock().unwrap().resizes.push(size);
             Ok(())
+        }
+
+        fn snapshot(&mut self) -> PtyResult<PtySnapshot> {
+            Ok(PtySnapshot {
+                size: self
+                    .state
+                    .lock()
+                    .unwrap()
+                    .resizes
+                    .last()
+                    .copied()
+                    .unwrap_or_else(|| PtySize::new(24, 80)),
+                process_id: Some(42),
+                retained_output: Vec::new(),
+            })
         }
 
         fn terminate(&mut self) -> PtyResult<()> {

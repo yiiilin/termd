@@ -386,6 +386,7 @@ WorkingDirectory=${STATE_DIR}
 ExecStart=${WRAPPER_FILE}
 Restart=always
 RestartSec=2
+KillMode=process
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectHome=yes

@@ -38,7 +38,6 @@ test("pair、list、attach 的浏览器 smoke", async ({ page }, testInfo: TestI
     await page.getByRole("button", { name: "Close scanner" }).click();
     await expect(page.getByRole("dialog", { name: "Scan pairing QR" })).toBeHidden();
 
-    await activateButton(page, "Edit address");
     await page.getByLabel("WS URL").fill(daemon.url);
     await page.getByLabel("Pairing token").fill(pairingInviteCode(daemon));
     await expect(page.getByLabel("Pairing token")).toHaveValue(/termd-pair:v1:/);
@@ -48,17 +47,16 @@ test("pair、list、attach 的浏览器 smoke", async ({ page }, testInfo: TestI
     if (testInfo.project.name === "mobile-chrome") {
       await expect(page.getByRole("navigation", { name: "mobile workspace actions" })).toHaveCount(0);
       const menu = await openMobileMenu(page);
-      await expect(menu.getByRole("button", { name: "Connection" })).toBeVisible();
+      await expect(menu.getByRole("button", { name: "Daemons" })).toBeVisible();
       await expect(menu.getByRole("button", { name: "Sessions" })).toBeVisible();
       await expect(menu.getByRole("button", { name: "Files" })).toBeVisible();
       await expect(menu.getByRole("button", { name: "New" })).toBeVisible();
       await expect(menu.getByRole("button", { name: /Refresh/ })).toHaveCount(0);
-      await menu.getByRole("button", { name: "Connection" }).click();
-      const connectionPanel = await page.getByRole("region", { name: "connection panel" });
-      await expect(connectionPanel.getByLabel("connection status")).toBeVisible();
-      await activateButton(page, "Manage daemons");
+      await menu.getByRole("button", { name: "Daemons" }).click();
+      await expect(page.getByRole("main", { name: "daemon admin" })).toBeVisible();
+      await expect(page.getByRole("region", { name: "connection" })).toBeVisible();
       await expect(page.getByLabel("daemon manager")).toBeVisible();
-      await activateButton(page, "Close connection panel");
+      await activateButton(page, "Open workspace");
 
       const reopenedMenu = await openMobileMenu(page);
       await reopenedMenu.getByRole("button", { name: "Sessions" }).click();
@@ -74,8 +72,8 @@ test("pair、list、attach 的浏览器 smoke", async ({ page }, testInfo: TestI
       const daemonBox = await daemonStatus.boundingBox();
       expect(daemonBox?.x ?? 0).toBeLessThan(180);
     } else {
-      const connectionStatus = page.getByLabel("connection status");
-      await expect(connectionStatus.getByText(daemon.url)).toBeVisible();
+      await expect(page.getByText("Connected")).toBeVisible();
+      await expect(page.getByText("paired daemon")).toBeVisible();
       await activateButton(page, "Refresh");
     }
     const sessionsPanel = page.getByRole("region", { name: "sessions" });
@@ -137,11 +135,11 @@ test("pair、list、attach 的浏览器 smoke", async ({ page }, testInfo: TestI
       await activateButton(page, "Open mobile workspace menu");
       const menu = page.getByRole("navigation", { name: "mobile workspace menu" });
       await expect(menu).toBeVisible();
-      await menu.getByRole("button", { name: "Connection" }).click();
-      const connectionPanel = page.getByRole("region", { name: "connection panel" });
-      await expect(connectionPanel.getByLabel("connection status").getByText(daemon.url)).toBeVisible();
+      await menu.getByRole("button", { name: "Daemons" }).click();
+      await expect(page.getByRole("main", { name: "daemon admin" })).toBeVisible();
+      await expect(page.getByRole("button", { name: "Open workspace" })).toBeEnabled();
     } else {
-      await expect(page.getByLabel("connection status").getByText(daemon.url)).toBeVisible();
+      await expect(page.getByText("Connected")).toBeVisible();
     }
     const localStorageText = await page.evaluate(() => JSON.stringify(window.localStorage));
     expect(localStorageText).not.toContain("secret-token");

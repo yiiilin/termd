@@ -6,6 +6,7 @@
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, types::Type};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use std::collections::HashSet;
 use std::error::Error;
 use std::fmt;
 use std::fs;
@@ -16,6 +17,8 @@ use termd_proto::{
     DeviceId, PublicKey, ServerId, SessionId, SessionState, TerminalSize, UnixTimestampMillis,
 };
 use uuid::Uuid;
+
+use crate::pty::{PtyRestoreInfo, PtySupervisorStatus};
 
 pub mod client_history;
 
@@ -62,6 +65,8 @@ pub struct SessionStateRecord {
     pub size: TerminalSize,
     pub created_at_ms: UnixTimestampMillis,
     pub updated_at_ms: UnixTimestampMillis,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_info: Option<PtyRestoreInfo>,
 }
 
 /// daemon 本地持久状态。
@@ -103,7 +108,10 @@ impl StateStore {
         initialize_daemon_state_schema(&conn, &sqlite_path)?;
         let state = load_sqlite_state(&conn, &sqlite_path)?;
 
-        if state.daemon_identity.is_some() || !state.trusted_devices.is_empty() {
+        if state.daemon_identity.is_some()
+            || !state.trusted_devices.is_empty()
+            || !state.sessions.is_empty()
+        {
             return Ok(state);
         }
 
@@ -243,6 +251,19 @@ fn initialize_daemon_state_schema(conn: &Connection, path: &Path) -> Result<(), 
 
         CREATE INDEX IF NOT EXISTS idx_trusted_devices_seen
             ON trusted_devices(last_seen_at_ms, device_id);
+
+        CREATE TABLE IF NOT EXISTS runtime_sessions (
+            session_id TEXT PRIMARY KEY,
+            state TEXT NOT NULL,
+            rows INTEGER NOT NULL,
+            cols INTEGER NOT NULL,
+            pixel_width INTEGER NOT NULL,
+            pixel_height INTEGER NOT NULL,
+            created_at_ms INTEGER NOT NULL,
+            updated_at_ms INTEGER NOT NULL,
+            restore_kind TEXT,
+            restore_value TEXT
+        );
         "#,
     )
     .map_err(|source| sqlite_error(path, source))
@@ -295,11 +316,65 @@ fn load_sqlite_state(conn: &Connection, path: &Path) -> Result<DaemonState, Stat
         trusted_devices.push(row.map_err(|source| sqlite_error(path, source))?);
     }
 
+    let mut sessions = Vec::new();
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT
+                session_id,
+                state,
+                rows,
+                cols,
+                pixel_width,
+                pixel_height,
+                created_at_ms,
+                updated_at_ms,
+                restore_kind,
+                restore_value
+            FROM runtime_sessions
+            ORDER BY created_at_ms, session_id
+            "#,
+        )
+        .map_err(|source| sqlite_error(path, source))?;
+    let rows = stmt
+        .query_map([], |row| {
+            let raw_session_id = row.get::<_, String>(0)?;
+            let session_id = Uuid::parse_str(&raw_session_id)
+                .map(SessionId)
+                .map_err(|source| {
+                    rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(source))
+                })?;
+            let state = parse_session_state(row.get::<_, String>(1)?)?;
+            let size = TerminalSize {
+                rows: row.get::<_, i64>(2)? as u16,
+                cols: row.get::<_, i64>(3)? as u16,
+                pixel_width: row.get::<_, i64>(4)? as u16,
+                pixel_height: row.get::<_, i64>(5)? as u16,
+            };
+            let restore_kind = row.get::<_, Option<String>>(8)?;
+            let restore_value = row.get::<_, Option<String>>(9)?;
+            let restore_info = parse_restore_info(restore_kind, restore_value)?;
+
+            Ok(SessionStateRecord {
+                session_id,
+                state,
+                size,
+                created_at_ms: UnixTimestampMillis(row.get::<_, i64>(6)? as u64),
+                updated_at_ms: UnixTimestampMillis(row.get::<_, i64>(7)? as u64),
+                restore_info,
+            })
+        })
+        .map_err(|source| sqlite_error(path, source))?;
+
+    for row in rows {
+        sessions.push(row.map_err(|source| sqlite_error(path, source))?);
+    }
+
     Ok(DaemonState {
         version: STATE_SCHEMA_VERSION,
         daemon_identity,
         trusted_devices,
-        sessions: Vec::new(),
+        sessions,
     })
 }
 
@@ -391,6 +466,89 @@ fn save_sqlite_state(
         .map_err(|source| sqlite_error(path, source))?;
     }
 
+    let incoming_session_ids: HashSet<String> = state
+        .sessions
+        .iter()
+        .map(|session| session.session_id.0.to_string())
+        .collect();
+    {
+        let mut stmt = tx
+            .prepare("SELECT session_id FROM runtime_sessions")
+            .map_err(|source| sqlite_error(path, source))?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|source| sqlite_error(path, source))?;
+        let mut stale_session_ids = Vec::new();
+        for row in rows {
+            let session_id = row.map_err(|source| sqlite_error(path, source))?;
+            if !incoming_session_ids.contains(&session_id) {
+                stale_session_ids.push(session_id);
+            }
+        }
+        drop(stmt);
+
+        // 运行态快照里缺失的旧 session 不能被删除；closed 事实要留在 SQLite，
+        // 这样显式 close 或恢复失败后的下一次启动不会再次尝试连接旧 supervisor。
+        for session_id in stale_session_ids {
+            tx.execute(
+                r#"
+                UPDATE runtime_sessions
+                SET state = ?1,
+                    updated_at_ms = ?2,
+                    restore_kind = NULL,
+                    restore_value = NULL
+                WHERE session_id = ?3
+                "#,
+                params![session_state_text(SessionState::Closed), now_ms, session_id,],
+            )
+            .map_err(|source| sqlite_error(path, source))?;
+        }
+    }
+
+    for session in &state.sessions {
+        let (restore_kind, restore_value) = serialize_restore_info(session.restore_info.as_ref());
+        tx.execute(
+            r#"
+            INSERT INTO runtime_sessions (
+                session_id,
+                state,
+                rows,
+                cols,
+                pixel_width,
+                pixel_height,
+                created_at_ms,
+                updated_at_ms,
+                restore_kind,
+                restore_value
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            ON CONFLICT(session_id) DO UPDATE SET
+                state = excluded.state,
+                rows = excluded.rows,
+                cols = excluded.cols,
+                pixel_width = excluded.pixel_width,
+                pixel_height = excluded.pixel_height,
+                created_at_ms = excluded.created_at_ms,
+                updated_at_ms = excluded.updated_at_ms,
+                restore_kind = excluded.restore_kind,
+                restore_value = excluded.restore_value
+            "#,
+            params![
+                session.session_id.0.to_string(),
+                session_state_text(session.state),
+                i64::from(session.size.rows),
+                i64::from(session.size.cols),
+                i64::from(session.size.pixel_width),
+                i64::from(session.size.pixel_height),
+                session.created_at_ms.0 as i64,
+                session.updated_at_ms.0 as i64,
+                restore_kind,
+                restore_value,
+            ],
+        )
+        .map_err(|source| sqlite_error(path, source))?;
+    }
+
     tx.commit().map_err(|source| sqlite_error(path, source))
 }
 
@@ -446,6 +604,91 @@ fn parse_device_id(raw: String) -> rusqlite::Result<DeviceId> {
     Uuid::parse_str(&raw).map(DeviceId).map_err(|source| {
         rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(source))
     })
+}
+
+fn parse_session_state(raw: String) -> rusqlite::Result<SessionState> {
+    match raw.as_str() {
+        "created" => Ok(SessionState::Created),
+        "running" => Ok(SessionState::Running),
+        "closed" => Ok(SessionState::Closed),
+        other => Err(rusqlite::Error::FromSqlConversionFailure(
+            1,
+            Type::Text,
+            Box::new(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid runtime session state `{other}`"),
+            )),
+        )),
+    }
+}
+
+fn session_state_text(state: SessionState) -> &'static str {
+    match state {
+        SessionState::Created => "created",
+        SessionState::Running => "running",
+        SessionState::Closed => "closed",
+    }
+}
+
+fn serialize_restore_info(
+    restore_info: Option<&PtyRestoreInfo>,
+) -> (Option<&'static str>, Option<String>) {
+    match restore_info {
+        Some(PtyRestoreInfo::UnixSocket {
+            socket_path,
+            supervisor_pid,
+            supervisor_status,
+        }) => {
+            let value = SerializedUnixSocketRestoreInfo {
+                socket_path: socket_path.clone(),
+                supervisor_pid: *supervisor_pid,
+                supervisor_status: *supervisor_status,
+            };
+            (
+                Some("unix_socket"),
+                Some(
+                    serde_json::to_string(&value)
+                        .expect("supervisor restore info should always serialize"),
+                ),
+            )
+        }
+        None => (None, None),
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SerializedUnixSocketRestoreInfo {
+    socket_path: PathBuf,
+    supervisor_pid: u32,
+    supervisor_status: PtySupervisorStatus,
+}
+
+fn parse_restore_info(
+    restore_kind: Option<String>,
+    restore_value: Option<String>,
+) -> rusqlite::Result<Option<PtyRestoreInfo>> {
+    match (restore_kind.as_deref(), restore_value) {
+        (None, None) => Ok(None),
+        (Some("unix_socket"), Some(raw_value)) => {
+            let value: SerializedUnixSocketRestoreInfo =
+                serde_json::from_str(&raw_value).map_err(|source| {
+                    rusqlite::Error::FromSqlConversionFailure(9, Type::Text, Box::new(source))
+                })?;
+            Ok(Some(PtyRestoreInfo::UnixSocket {
+                socket_path: value.socket_path,
+                supervisor_pid: value.supervisor_pid,
+                supervisor_status: value.supervisor_status,
+            }))
+        }
+        (kind, value) => Err(rusqlite::Error::FromSqlConversionFailure(
+            8,
+            Type::Text,
+            Box::new(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid runtime session restore info kind={kind:?} value={value:?}"),
+            )),
+        )),
+    }
 }
 
 fn sqlite_error_from_conversion(path: &Path, source: uuid::Error) -> StateError {
@@ -522,7 +765,7 @@ mod tests {
         assert_eq!(loaded.version, STATE_SCHEMA_VERSION);
         assert_eq!(loaded.daemon_identity, state.daemon_identity);
         assert_eq!(loaded.trusted_devices, state.trusted_devices);
-        assert!(loaded.sessions.is_empty());
+        assert_eq!(loaded.sessions, state.sessions);
         assert!(!state_path.exists());
         assert!(sqlite_state_path_for_state_path(&state_path).exists());
         cleanup_state_paths(&state_path);
@@ -561,6 +804,25 @@ mod tests {
     }
 
     #[test]
+    fn state_save_marks_missing_runtime_sessions_closed() {
+        let state_path = temp_path("closed-runtime-session.json");
+        let running_state = sample_state();
+        let session_id = running_state.sessions[0].session_id;
+        let mut empty_live_snapshot = running_state.clone();
+        empty_live_snapshot.sessions.clear();
+
+        StateStore::save(&state_path, &running_state).unwrap();
+        StateStore::save(&state_path, &empty_live_snapshot).unwrap();
+
+        let loaded = StateStore::load(&state_path).unwrap();
+        assert_eq!(loaded.sessions.len(), 1);
+        assert_eq!(loaded.sessions[0].session_id, session_id);
+        assert_eq!(loaded.sessions[0].state, SessionState::Closed);
+        assert!(loaded.sessions[0].restore_info.is_none());
+        cleanup_state_paths(&state_path);
+    }
+
+    #[test]
     fn legacy_json_state_is_read_once_and_then_sqlite_wins() {
         let state_path = temp_path("legacy-state.json");
         let legacy_state = sample_state();
@@ -588,7 +850,28 @@ mod tests {
             loaded_from_sqlite.trusted_devices,
             sqlite_state.trusted_devices
         );
-        assert!(loaded_from_sqlite.sessions.is_empty());
+        assert_eq!(loaded_from_sqlite.sessions, sqlite_state.sessions);
+        cleanup_state_paths(&state_path);
+    }
+
+    #[test]
+    fn sqlite_runtime_sessions_prevent_legacy_json_fallback() {
+        let state_path = temp_path("sqlite-runtime-wins.json");
+        let mut sqlite_state = sample_state();
+        sqlite_state.daemon_identity = None;
+        sqlite_state.trusted_devices.clear();
+        let legacy_state = DaemonState::default();
+
+        StateStore::save(&state_path, &sqlite_state).unwrap();
+        fs::write(
+            &state_path,
+            serde_json::to_string_pretty(&legacy_state).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = StateStore::load(&state_path).unwrap();
+
+        assert_eq!(loaded.sessions, sqlite_state.sessions);
         cleanup_state_paths(&state_path);
     }
 
@@ -615,6 +898,11 @@ mod tests {
                 size: TerminalSize::new(40, 120),
                 created_at_ms: UnixTimestampMillis(3000),
                 updated_at_ms: UnixTimestampMillis(4000),
+                restore_info: Some(PtyRestoreInfo::UnixSocket {
+                    socket_path: PathBuf::from("/tmp/termd-test.sock"),
+                    supervisor_pid: 42,
+                    supervisor_status: PtySupervisorStatus::Running,
+                }),
             }],
         }
     }

@@ -9,7 +9,9 @@ use portable_pty::{
     Child, CommandBuilder, MasterPty, PtySize as PortablePtySize, native_pty_system,
 };
 
-use super::{CommandSpec, PtyBackend, PtyError, PtyExitStatus, PtyResult, PtySession, PtySize};
+use super::{
+    CommandSpec, PtyBackend, PtyError, PtyExitStatus, PtyResult, PtySession, PtySize, PtySnapshot,
+};
 
 impl From<PtySize> for PortablePtySize {
     fn from(size: PtySize) -> Self {
@@ -85,6 +87,8 @@ impl PtyBackend for PortablePtyBackend {
             child,
             reader,
             writer,
+            size,
+            history: Vec::new(),
         }))
     }
 }
@@ -97,11 +101,17 @@ pub struct PortablePtySession {
     child: Box<dyn Child + Send + Sync>,
     reader: Box<dyn Read + Send>,
     writer: Box<dyn Write + Send>,
+    size: PtySize,
+    history: Vec<u8>,
 }
 
 impl PtySession for PortablePtySession {
     fn read(&mut self, buffer: &mut [u8]) -> PtyResult<usize> {
-        self.reader.read(buffer).map_err(Into::into)
+        let read = self.reader.read(buffer).map_err(PtyError::from)?;
+        if read > 0 {
+            self.history.extend_from_slice(&buffer[..read]);
+        }
+        Ok(read)
     }
 
     fn write_all(&mut self, bytes: &[u8]) -> PtyResult<()> {
@@ -111,7 +121,17 @@ impl PtySession for PortablePtySession {
     }
 
     fn resize(&mut self, size: PtySize) -> PtyResult<()> {
-        self.master.resize(size.into()).map_err(PtyError::backend)
+        self.master.resize(size.into()).map_err(PtyError::backend)?;
+        self.size = size;
+        Ok(())
+    }
+
+    fn snapshot(&mut self) -> PtyResult<PtySnapshot> {
+        Ok(PtySnapshot {
+            size: self.size,
+            process_id: self.process_id(),
+            retained_output: self.history.clone(),
+        })
     }
 
     fn terminate(&mut self) -> PtyResult<()> {

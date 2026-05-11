@@ -6,11 +6,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use base64::{Engine as _, engine::general_purpose};
 use qrcode::{QrCode, render::unicode};
 use serde::Deserialize;
 use termd::config::{DaemonConfig, SecretString, normalize_relay_endpoints};
 use termd::net::relay::{RelayBaseUrl, RelayReconnectPolicy, run_relay_mux_with_reconnect};
 use termd::net::server::{TlsPaths, serve, serve_tls, try_default_protocol};
+use termd::pty::supervisor::{SessionSupervisorArgs, run_session_supervisor};
+use termd::pty::{CommandSpec, PtySize};
 use termd_proto::{PairingQrPayload, PairingToken, ServerId, UnixTimestampMillis};
 use tokio::task::JoinHandle;
 
@@ -78,6 +81,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 println!("{}", token.token.0);
             }
         }
+        CliCommand::SessionSupervisor(args) => run_session_supervisor(args).await?,
     }
 
     Ok(())
@@ -186,6 +190,7 @@ enum CliCommand {
         url: String,
         qr: bool,
     },
+    SessionSupervisor(SessionSupervisorArgs),
 }
 
 impl fmt::Debug for CliCommand {
@@ -216,6 +221,10 @@ impl fmt::Debug for CliCommand {
                 .field("url", url)
                 .field("qr", qr)
                 .finish(),
+            Self::SessionSupervisor(args) => formatter
+                .debug_tuple("SessionSupervisor")
+                .field(args)
+                .finish(),
         }
     }
 }
@@ -237,6 +246,7 @@ impl CliCommand {
             "-h" | "--help" | "help" => Ok(Self::Help),
             "-V" | "--version" | "version" => Ok(Self::Version),
             "pair" => parse_pair_args(args),
+            "__session-supervisor" => parse_session_supervisor_args(args),
             "--listen" | "--relay" | "--relay-url" | "--relay-auth-token" | "--tls-cert"
             | "--tls-key" | "--web" => parse_serve_args(std::iter::once(command).chain(args)),
             other => Err(CliError::UnknownCommand(other.to_owned())),
@@ -334,6 +344,55 @@ fn parse_pair_args(mut args: impl Iterator<Item = String>) -> Result<CliCommand,
     // 解析阶段先拒绝不支持的 URL，避免用户等到网络请求时才看到模糊错误。
     let _ = parse_pairing_base_url(&url)?;
     Ok(CliCommand::Pair { url, qr })
+}
+
+fn parse_session_supervisor_args(
+    mut args: impl Iterator<Item = String>,
+) -> Result<CliCommand, CliError> {
+    let mut session_id = None;
+    let mut socket_path = None;
+    let mut command = None;
+    let mut size = None;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--session-id" => {
+                session_id = Some(args.next().ok_or(CliError::MissingSupervisorSessionId)?);
+            }
+            "--socket-path" => {
+                let value = args.next().ok_or(CliError::MissingSupervisorSocketPath)?;
+                socket_path = Some(PathBuf::from(value));
+            }
+            "--command-base64" => {
+                let value = args.next().ok_or(CliError::MissingSupervisorCommand)?;
+                let decoded = general_purpose::STANDARD
+                    .decode(value)
+                    .map_err(|_| CliError::InvalidSupervisorPayload)?;
+                command = Some(
+                    serde_json::from_slice::<CommandSpec>(&decoded)
+                        .map_err(|_| CliError::InvalidSupervisorPayload)?,
+                );
+            }
+            "--size-base64" => {
+                let value = args.next().ok_or(CliError::MissingSupervisorSize)?;
+                let decoded = general_purpose::STANDARD
+                    .decode(value)
+                    .map_err(|_| CliError::InvalidSupervisorPayload)?;
+                size = Some(
+                    serde_json::from_slice::<PtySize>(&decoded)
+                        .map_err(|_| CliError::InvalidSupervisorPayload)?,
+                );
+            }
+            other => return Err(CliError::UnexpectedArgument(other.to_owned())),
+        }
+    }
+
+    Ok(CliCommand::SessionSupervisor(SessionSupervisorArgs {
+        session_id: session_id.ok_or(CliError::MissingSupervisorSessionId)?,
+        socket_path: socket_path.ok_or(CliError::MissingSupervisorSocketPath)?,
+        command: command.ok_or(CliError::MissingSupervisorCommand)?,
+        size: size.ok_or(CliError::MissingSupervisorSize)?,
+    }))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -589,6 +648,11 @@ enum CliError {
     InvalidJson,
     QrRenderFailed,
     Tls,
+    MissingSupervisorSessionId,
+    MissingSupervisorSocketPath,
+    MissingSupervisorCommand,
+    MissingSupervisorSize,
+    InvalidSupervisorPayload,
 }
 
 impl CliError {
@@ -695,6 +759,13 @@ impl fmt::Display for CliError {
             Self::InvalidJson => write!(f, "daemon returned an invalid pairing token response"),
             Self::QrRenderFailed => write!(f, "failed to render pairing QR code"),
             Self::Tls => write!(f, "failed to establish TLS for pairing token request"),
+            Self::MissingSupervisorSessionId => write!(f, "`--session-id` requires a value"),
+            Self::MissingSupervisorSocketPath => write!(f, "`--socket-path` requires a value"),
+            Self::MissingSupervisorCommand => write!(f, "`--command-base64` requires a value"),
+            Self::MissingSupervisorSize => write!(f, "`--size-base64` requires a value"),
+            Self::InvalidSupervisorPayload => {
+                write!(f, "session supervisor payload is invalid")
+            }
         }
     }
 }

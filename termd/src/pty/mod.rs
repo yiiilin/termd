@@ -4,7 +4,9 @@
 //! WebSocket 协议和 E2EE 都在更外层处理，避免 PTY 后端意外承担控制权逻辑。
 
 pub mod portable;
+pub mod supervisor;
 
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{self, Display};
@@ -64,7 +66,7 @@ impl From<io::Error> for PtyError {
 ///
 /// `CommandSpec` 只描述进程启动参数，不决定默认 shell；默认 shell 应由 CLI 或集成层显式选择。
 /// 这样可以避免 PTY 模块暗中读取用户环境并影响 session 状态机的可测试性。
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CommandSpec {
     program: String,
     args: Vec<String>,
@@ -154,7 +156,7 @@ impl CommandSpec {
 ///
 /// rows/cols 是字符网格尺寸；pixel_width/pixel_height 仅作为终端渲染提示，
 /// 有些平台会忽略它们。协议层和 UI 层可以传入这些值，但 PTY 模块不解释 UI 语义。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PtySize {
     pub rows: u16,
     pub cols: u16,
@@ -195,6 +197,42 @@ impl Default for PtySize {
     }
 }
 
+/// session supervisor 的可持久化生命周期状态。
+///
+/// 该状态用于 daemon 重启后判断恢复记录是否仍指向一个预期存活的 supervisor，
+/// 不是控制权状态，也不会进入 relay 或 UI 层做业务判断。
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PtySupervisorStatus {
+    Running,
+    Closing,
+    Closed,
+}
+
+/// daemon 可持久化的 PTY 恢复信息。
+///
+/// 这个结构只保存“如何重新连回 session supervisor”的最小 IPC 路径和 supervisor
+/// 进程事实，不保存任何终端明文、输入历史或密钥材料。
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum PtyRestoreInfo {
+    UnixSocket {
+        socket_path: PathBuf,
+        supervisor_pid: u32,
+        supervisor_status: PtySupervisorStatus,
+    },
+}
+
+/// supervisor 快照。
+///
+/// `retained_output` 只用于 daemon 重启后补回最近仍保留的终端输出，
+/// 不会被写入本地持久状态。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PtySnapshot {
+    pub size: PtySize,
+    pub process_id: Option<u32>,
+    pub retained_output: Vec<u8>,
+}
+
 /// 子进程退出状态的后端无关表示。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PtyExitStatus {
@@ -232,6 +270,31 @@ impl PtyExitStatus {
 pub trait PtyBackend: Send + Sync {
     /// 启动一个 PTY session。
     fn spawn(&self, command: &CommandSpec, size: PtySize) -> PtyResult<Box<dyn PtySession>>;
+
+    /// 使用调用方指定的 session id 启动一个 PTY session。
+    ///
+    /// 本地直接 PTY backend 可以忽略这个提示；supervisor backend 需要它来派生稳定 socket 路径。
+    fn spawn_named(
+        &self,
+        _session_id: &str,
+        command: &CommandSpec,
+        size: PtySize,
+    ) -> PtyResult<Box<dyn PtySession>> {
+        self.spawn(command, size)
+    }
+
+    /// 基于持久化的恢复信息重新连回一个仍存活的 session supervisor。
+    ///
+    /// 默认 backend 不支持重连；生产 supervisor backend 会覆盖实现。
+    fn reconnect(
+        &self,
+        _session_id: &str,
+        _restore_info: &PtyRestoreInfo,
+    ) -> PtyResult<Box<dyn PtySession>> {
+        Err(PtyError::Backend(
+            "PTY backend does not support reconnect".to_owned(),
+        ))
+    }
 }
 
 /// 运行中的 PTY session。
@@ -252,6 +315,21 @@ pub trait PtySession: Send {
 
     /// 调整 PTY 尺寸。
     fn resize(&mut self, size: PtySize) -> PtyResult<()>;
+
+    /// 获取最近一次 supervisor 快照。
+    ///
+    /// 本地 backend 默认只返回当前尺寸和 pid，不提供 retained output。
+    fn snapshot(&mut self) -> PtyResult<PtySnapshot>;
+
+    /// 心跳探测，供 daemon 重连或后台健康检查使用。
+    fn ping(&mut self) -> PtyResult<()> {
+        Ok(())
+    }
+
+    /// 返回本 session 的可持久恢复信息；不支持重连的 backend 返回 `None`。
+    fn restore_info(&self) -> Option<PtyRestoreInfo> {
+        None
+    }
 
     /// 请求终止 PTY 子进程。
     fn terminate(&mut self) -> PtyResult<()>;

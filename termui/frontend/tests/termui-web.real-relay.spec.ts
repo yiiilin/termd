@@ -22,7 +22,6 @@ test("浏览器通过真实 relay 连接 daemon 完成 pairing 和 session list"
 
   try {
     await page.goto("/");
-    await page.getByRole("button", { name: "Edit address" }).click();
     await page.getByLabel("WS URL").fill(fixture.relayClientUrl);
     await page.getByLabel("Pairing token").fill(pairingInviteCode(fixture));
     await page.getByRole("button", { name: "Pair" }).click();
@@ -32,16 +31,15 @@ test("浏览器通过真实 relay 连接 daemon 完成 pairing 和 session list"
     if (testInfo.project.name === "mobile-chrome") {
       await expect(page.getByRole("navigation", { name: "mobile workspace actions" })).toHaveCount(0);
       const menu = await openMobileMenu(page);
-      await expect(menu.getByRole("button", { name: "Connection" })).toBeVisible();
+      await expect(menu.getByRole("button", { name: "Daemons" })).toBeVisible();
       await expect(menu.getByRole("button", { name: "Sessions" })).toBeVisible();
       await expect(menu.getByRole("button", { name: "Files" })).toBeVisible();
       await expect(menu.getByRole("button", { name: "New" })).toBeVisible();
-      await menu.getByRole("button", { name: "Connection" }).click();
-      const connectionPanel = page.getByRole("region", { name: "connection panel" });
-      await expect(connectionPanel.getByLabel("connection status")).toBeVisible();
-      await activateButton(page, "Manage daemons");
+      await menu.getByRole("button", { name: "Daemons" }).click();
+      await expect(page.getByRole("main", { name: "daemon admin" })).toBeVisible();
+      await expect(page.getByRole("region", { name: "connection" })).toBeVisible();
       await expect(page.getByLabel("daemon manager")).toBeVisible();
-      await activateButton(page, "Close connection panel");
+      await activateButton(page, "Open workspace");
 
       const reopenedMenu = await openMobileMenu(page);
       await reopenedMenu.getByRole("button", { name: "Sessions" }).click();

@@ -153,7 +153,9 @@ curl -fsSL https://github.com/OWNER/REPO/releases/latest/download/install-termd.
 wget -qO- https://github.com/OWNER/REPO/releases/latest/download/install-termd.sh | sudo bash
 ```
 
-`termd` 脚本会安装二进制、创建 `termd.service`、写入 `/etc/termd/termd.env`（如不存在）并启用服务。默认只监听 `127.0.0.1:8765`，relay 和 TLS 通过 env 文件可选配置。服务启动后，脚本会在当前终端打印一个短期一次性 pairing token 和 `termctl pair` 示例；token 不会写入配置文件。
+`termd` 脚本会安装二进制、创建 `termd.service`、写入 `/etc/termd/termd.env`（如不存在）并启用服务。默认只监听 `127.0.0.1:8765`，relay 和 TLS 通过 env 文件可选配置。服务启动后，脚本会在当前终端打印一份短期一次性 `termd-pair:v1` 邀请码和 `termctl pair --payload` 示例；邀请材料不会写入配置文件，过期或用过后可在 daemon 主机上运行 `termd pair --qr` 重新签发。
+
+`termd.service` 使用 `KillMode=process`，这样 `systemctl restart termd` 只会重启 daemon 主进程，不会把每个 session 的 supervisor 子进程一起清掉；显式 close 仍然由 daemon 协议路径负责。
 
 如果要把内嵌 Web 也一起打开，把 `/etc/termd/termd.env` 里的 `TERMD_WEB_ENABLED=1` 打开即可；脚本会自动追加 `--web`。
 
@@ -168,6 +170,8 @@ wget -qO- https://github.com/OWNER/REPO/releases/latest/download/install-termrel
 ```
 
 `termrelay` 脚本会安装二进制、创建 `termrelay.service`、写入 `/etc/termd/termrelay.env`（如不存在）并启用服务。默认只监听 `127.0.0.1:8080`，公开入口仍建议走反向代理。
+
+`termrelay.service` 也保留了 `KillMode=process`，只是为了让 systemd 停止动作保持和 daemon 一致；它本身不承担 session supervisor 生命周期。
 
 如果需要嵌入 Web UI，把 `/etc/termd/termrelay.env` 里的 `TERMRELAY_WEB_ENABLED=1` 打开即可；脚本会自动追加 `--web`。
 

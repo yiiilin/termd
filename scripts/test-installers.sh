@@ -28,8 +28,19 @@ do
   assert_help_contains "$script" "--uninstall"
 done
 
-assert_help_contains scripts/install-termd.sh "--purge"
+assert_help_contains scripts/install-termd.sh "--web"
+assert_help_contains scripts/install-termd.sh "--listen <HOST:PORT>"
 assert_help_contains scripts/install-termd.sh "--user <USER>"
+assert_help_contains scripts/install-termd.sh "--purge"
+
+assert_help_contains scripts/install-termrelay.sh "--web"
+assert_help_contains scripts/install-termrelay.sh "--listen <HOST:PORT>"
+assert_help_contains scripts/install-termrelay.sh "--auth-token <TOKEN>"
 assert_help_contains scripts/install-termrelay.sh "--purge"
+
+grep -q "KillMode=process" "${ROOT_DIR}/scripts/install-termd.sh"
+grep -q "KillMode=process" "${ROOT_DIR}/scripts/install-termrelay.sh"
+grep -q "termctl pair --payload" "${ROOT_DIR}/scripts/install-termd.sh"
+! grep -q "termctl pair --token" "${ROOT_DIR}/scripts/install-termd.sh"
 
 printf 'installer tests passed\n'

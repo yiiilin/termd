@@ -29,12 +29,12 @@ use tracing::{debug, warn};
 
 use crate::auth::current_unix_timestamp_millis;
 use crate::config::DaemonConfig;
+use crate::pty::supervisor::SupervisorPtyBackend;
 use crate::state::{StateError, StateStore};
 
 use super::protocol::{
     DaemonProtocol, JsonEnvelope, ProtocolConnection, ProtocolError, decode_payload, envelope_value,
 };
-use super::pty_bridge::NonBlockingPortablePtyBackend;
 use super::signature::Ed25519SignatureVerifier;
 
 const OUTPUT_FLUSH_MAX_BYTES_PER_SESSION: usize = 16 * 1024;
@@ -45,8 +45,7 @@ enum SessionPushEvent {
     FileTree(SessionId),
 }
 
-pub type DefaultDaemonProtocol =
-    DaemonProtocol<NonBlockingPortablePtyBackend, Ed25519SignatureVerifier>;
+pub type DefaultDaemonProtocol = DaemonProtocol<SupervisorPtyBackend, Ed25519SignatureVerifier>;
 pub type SharedDaemonProtocol = Arc<Mutex<DefaultDaemonProtocol>>;
 
 #[derive(Debug, Error)]
@@ -116,8 +115,8 @@ struct LocalPairingTokenPayload {
 pub fn try_default_protocol(config: DaemonConfig) -> Result<SharedDaemonProtocol, ServerError> {
     let state = StateStore::load(&config.state_path)?;
     let protocol = DaemonProtocol::from_state(
-        config,
-        NonBlockingPortablePtyBackend::new(),
+        config.clone(),
+        SupervisorPtyBackend::for_state_path(&config.state_path),
         Ed25519SignatureVerifier,
         state,
     )?;

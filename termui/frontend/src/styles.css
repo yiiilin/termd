@@ -107,6 +107,99 @@ label {
   white-space: nowrap;
 }
 
+.admin-shell {
+  height: 100%;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: 52px minmax(0, 1fr) 30px;
+  background:
+    linear-gradient(180deg, rgba(137, 216, 255, 0.06), transparent 240px),
+    rgba(7, 13, 12, 0.96);
+}
+
+.admin-topbar {
+  min-width: 0;
+  border-bottom: 1px solid #25312d;
+  background: #101815;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 0 16px;
+}
+
+.admin-brand {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #d6ff5f;
+  font-weight: 700;
+}
+
+.admin-topbar-actions {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.admin-main {
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  padding: 18px;
+  display: grid;
+  align-content: start;
+  gap: 14px;
+}
+
+.admin-summary-band {
+  min-width: 0;
+  border: 1px solid #2b3934;
+  border-radius: 8px;
+  background: #0f1815;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  padding: 12px;
+}
+
+.admin-summary-main {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.admin-summary-main span {
+  color: #95aaa0;
+  font-size: 12px;
+}
+
+.admin-summary-main strong {
+  min-width: 0;
+  color: #e4f4ed;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.admin-summary-main code {
+  min-width: 0;
+  color: #89d8ff;
+  font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.admin-grid {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(280px, 400px) minmax(0, 1fr);
+  align-items: start;
+  gap: 14px;
+}
+
 .app-shell {
   height: 100%;
   min-height: 0;
@@ -670,6 +763,15 @@ label {
   white-space: nowrap;
 }
 
+.toolbar-admin-button {
+  flex: 0 0 auto;
+  margin-left: auto;
+}
+
+.toolbar-admin-button + .session-operators {
+  margin-left: 0;
+}
+
 .session-operators {
   min-width: 0;
   margin-left: auto;
@@ -1025,6 +1127,36 @@ label {
 }
 
 @media (max-width: 760px) {
+  .admin-shell {
+    height: 100dvh;
+    grid-template-rows: 48px minmax(0, 1fr) 30px;
+  }
+
+  .admin-topbar {
+    padding: 0 10px;
+  }
+
+  .admin-brand span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .admin-main {
+    padding: 10px;
+    gap: 10px;
+  }
+
+  .admin-summary-band {
+    grid-template-columns: 1fr;
+    align-items: stretch;
+  }
+
+  .admin-grid {
+    grid-template-columns: 1fr;
+    gap: 10px;
+  }
+
   .app-shell {
     height: 100dvh;
     grid-template-columns: 1fr;
@@ -1094,6 +1226,10 @@ label {
 
   .toolbar-group {
     max-width: 34vw;
+  }
+
+  .toolbar-admin-button {
+    display: none;
   }
 
   .mobile-menu-popover {

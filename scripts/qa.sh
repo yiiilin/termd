@@ -87,10 +87,6 @@ require_cmd cargo
 require_cmd npm
 require_cmd rg
 
-port_8765_is_open() {
-  (exec 9<>/dev/tcp/127.0.0.1/8765) >/dev/null 2>&1
-}
-
 port_is_open() {
   local port="$1"
   (exec 9<>"/dev/tcp/127.0.0.1/${port}") >/dev/null 2>&1
@@ -128,9 +124,12 @@ PY
 run_pairing_cli_e2e() (
   set -euo pipefail
 
-  local temp_dir daemon_pid token pair_stdout
+  local temp_dir daemon_pid daemon_port invite_code pair_stdout daemon_url daemon_ws_url
   temp_dir="$(mktemp -d)"
   daemon_pid=""
+  daemon_port="$(pick_free_port)"
+  daemon_url="http://127.0.0.1:${daemon_port}"
+  daemon_ws_url="ws://127.0.0.1:${daemon_port}/ws"
 
   cleanup() {
     if [[ -n "$daemon_pid" ]]; then
@@ -141,13 +140,7 @@ run_pairing_cli_e2e() (
   }
   trap cleanup EXIT
 
-  if port_8765_is_open; then
-    printf '[termctl] 127.0.0.1:8765 已被占用，无法安全启动本地 termd pairing CLI E2E。\n' >&2
-    printf '[termctl] 请停止已有 daemon 后重试，避免把 token 发给非本次测试进程。\n' >&2
-    exit 1
-  fi
-
-  cargo run -q -p termd >"$temp_dir/termd.log" 2>&1 &
+  cargo run -q -p termd -- --listen "127.0.0.1:${daemon_port}" >"$temp_dir/termd.log" 2>&1 &
   daemon_pid="$!"
 
   for _ in $(seq 1 200); do
@@ -156,38 +149,44 @@ run_pairing_cli_e2e() (
       cat "$temp_dir/termd.log" >&2
       exit 1
     fi
-    if port_8765_is_open; then
+    if port_is_open "$daemon_port"; then
       break
     fi
     sleep 0.05
   done
 
-  if ! port_8765_is_open; then
-    printf '[termctl] 等待本地 termd 监听 127.0.0.1:8765 超时。\n' >&2
+  if ! port_is_open "$daemon_port"; then
+    printf '[termctl] 等待本地 termd 监听 %s 超时。\n' "$daemon_url" >&2
     cat "$temp_dir/termd.log" >&2
     exit 1
   fi
 
-  if ! token="$(cargo run -q -p termd -- pair --url http://127.0.0.1:8765 2>"$temp_dir/termd-pair.err")"; then
-    printf '[termctl] termd pair 签发 token 失败：\n' >&2
+  if ! pair_stdout="$(
+    cargo run -q -p termd -- pair --qr --url "$daemon_url" 2>"$temp_dir/termd-pair.err"
+  )"; then
+    printf '[termctl] termd pair 签发 invite 失败：\n' >&2
     cat "$temp_dir/termd-pair.err" >&2
     exit 1
   fi
 
-  case "$token" in
-    termd-pair-*) ;;
+  invite_code="$(
+    printf '%s\n' "$pair_stdout" | rg -o '^termd-pair:v1:[^[:space:]]+' | tail -n1
+  )"
+
+  case "$invite_code" in
+    termd-pair:v1:*) ;;
     *)
-      printf '[termctl] termd pair 输出不是预期 token 格式。\n' >&2
+      printf '[termctl] termd pair 输出不是预期 invite 格式。\n' >&2
       exit 1
       ;;
   esac
 
   if ! pair_stdout="$(
     TERMD_CTL_STATE="$temp_dir/termctl-state.json" \
-      cargo run -q -p termctl -- pair --token "$token" --url ws://127.0.0.1:8765/ws \
+      cargo run -q -p termctl -- pair --payload "$invite_code" --url "$daemon_ws_url" \
         2>"$temp_dir/termctl-pair.err"
   )"; then
-    printf '[termctl] termctl pair 消费 token 失败：\n' >&2
+    printf '[termctl] termctl pair 消费 invite 失败：\n' >&2
     cat "$temp_dir/termctl-pair.err" >&2
     exit 1
   fi
@@ -203,10 +202,11 @@ run_pairing_cli_e2e() (
 run_relay_runtime_e2e() (
   set -euo pipefail
 
-  local relay_port relay_addr temp_dir relay_pid daemon_pid token relay_client_url state_path new_stdout list_stdout
-  local pairing_payload
+  local relay_port relay_addr daemon_port temp_dir relay_pid daemon_pid relay_client_url state_path new_stdout list_stdout
+  local pairing_payload pairing_json
   relay_port="$(pick_free_port)"
   relay_addr="127.0.0.1:${relay_port}"
+  daemon_port="$(pick_free_port)"
   temp_dir="$(mktemp -d)"
   relay_pid=""
   daemon_pid=""
@@ -224,12 +224,12 @@ run_relay_runtime_e2e() (
   }
   trap cleanup EXIT
 
-  if port_8765_is_open; then
-    printf '[termrelay] 127.0.0.1:8765 已被占用，无法安全启动本地 termd relay E2E。\n' >&2
-    exit 1
-  fi
   if port_is_open "$relay_port"; then
     printf '[termrelay] 127.0.0.1:%s 已被占用，无法安全启动本地 termrelay E2E。\n' "$relay_port" >&2
+    exit 1
+  fi
+  if port_is_open "$daemon_port"; then
+    printf '[termrelay] 127.0.0.1:%s 已被占用，无法安全启动本地 termd relay E2E。\n' "$daemon_port" >&2
     exit 1
   fi
 
@@ -240,7 +240,7 @@ run_relay_runtime_e2e() (
     exit 1
   fi
 
-  cargo run -q -p termd -- --relay "ws://${relay_addr}" >"$temp_dir/termd-relay.log" 2>&1 &
+  cargo run -q -p termd -- --listen "127.0.0.1:${daemon_port}" --relay "ws://${relay_addr}" >"$temp_dir/termd-relay.log" 2>&1 &
   daemon_pid="$!"
 
   for _ in $(seq 1 200); do
@@ -249,40 +249,46 @@ run_relay_runtime_e2e() (
       cat "$temp_dir/termd-relay.log" >&2
       exit 1
     fi
-    if port_8765_is_open; then
+    if port_is_open "$daemon_port"; then
       break
     fi
     sleep 0.05
   done
-  if ! port_8765_is_open; then
-    printf '[termrelay] 等待 termd --relay 监听 127.0.0.1:8765 超时。\n' >&2
+  if ! port_is_open "$daemon_port"; then
+    printf '[termrelay] 等待 termd --relay 监听 127.0.0.1:%s 超时。\n' "$daemon_port" >&2
     cat "$temp_dir/termd-relay.log" >&2
     exit 1
   fi
 
-  mapfile -t pairing_payload < <(python3 - <<'PY'
+  mapfile -t pairing_payload < <(TERMD_QA_DAEMON_PORT="$daemon_port" python3 - <<'PY'
 import json
+import os
 import urllib.request
 
 # relay E2E 直接使用 daemon 本地 token 接口返回的 ws_url，验证使用者不需要手工拼 server_id。
-request = urllib.request.Request("http://127.0.0.1:8765/local/pairing-token", method="POST")
+daemon_port = os.environ["TERMD_QA_DAEMON_PORT"]
+request = urllib.request.Request(f"http://127.0.0.1:{daemon_port}/local/pairing-token", method="POST")
 with urllib.request.urlopen(request, timeout=2) as response:
     payload = json.load(response)
-print(payload["token"])
+print(json.dumps({
+    "type": "termd_pairing_qr",
+    "version": 1,
+    "token": payload["token"],
+    "server_id": payload["server_id"],
+    "expires_at_ms": payload["expires_at_ms"],
+    "ws_url": payload["ws_url"],
+}, separators=(",", ":")))
 print(payload["ws_url"])
 PY
 )
-  token="${pairing_payload[0]:-}"
+  pairing_json="${pairing_payload[0]:-}"
   relay_client_url="${pairing_payload[1]:-}"
-  case "$token" in
-    termd-pair-*) ;;
-    *)
-      printf '[termrelay] daemon 本地 pairing 响应不是预期 token 格式。\n' >&2
-      exit 1
-      ;;
-  esac
+  if [[ "$pairing_json" != *'"type":"termd_pairing_qr"'* || "$pairing_json" != *'"server_id":'* ]]; then
+    printf '[termrelay] daemon 本地 pairing 响应未构造出预期 invite payload。\n' >&2
+    exit 1
+  fi
   case "$relay_client_url" in
-    "ws://${relay_addr}/ws/"*"/client") ;;
+    "ws://${relay_addr}/ws") ;;
     *)
       printf '[termrelay] daemon 本地 pairing 响应未返回 relay client URL: %s\n' "$relay_client_url" >&2
       exit 1
@@ -290,7 +296,7 @@ PY
   esac
   state_path="$temp_dir/termctl-state.json"
 
-  TERMD_CTL_STATE="$state_path" cargo run -q -p termctl -- pair --token "$token" --url "$relay_client_url" >"$temp_dir/termctl-pair.out" 2>"$temp_dir/termctl-pair.err"
+  TERMD_CTL_STATE="$state_path" cargo run -q -p termctl -- pair --payload "$pairing_json" >"$temp_dir/termctl-pair.out" 2>"$temp_dir/termctl-pair.err"
   new_stdout="$(TERMD_CTL_STATE="$state_path" cargo run -q -p termctl -- new --url "$relay_client_url" -- /bin/sh -lc 'printf relay-e2e-ready; sleep 1' 2>"$temp_dir/termctl-new.err")"
   list_stdout="$(TERMD_CTL_STATE="$state_path" cargo run -q -p termctl -- list --url "$relay_client_url" 2>"$temp_dir/termctl-list.err")"
 
@@ -311,6 +317,9 @@ cargo fmt --all -- --check
 
 section "rust" "cargo test --workspace"
 cargo test --workspace
+
+section "installers" "scripts/test-installers.sh"
+bash scripts/test-installers.sh
 
 section "termctl" "pairing CLI E2E"
 run_pairing_cli_e2e

@@ -9,6 +9,7 @@
 .termctl-state.json
 termd-state.json
 termd-config.json
+daemon-state.sqlite*
 
 # 前端依赖、构建产物和浏览器测试报告。
 node_modules/

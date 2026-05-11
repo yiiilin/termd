@@ -8,10 +8,11 @@
 | --- | --- |
 | Rust 格式 | `cargo fmt --all -- --check` |
 | Rust workspace | `cargo test --workspace` |
-| pairing CLI E2E | 启动本地 `termd`，运行 `termd pair` 获取 token，再运行 `termctl pair --token` 完成设备配对 |
+| pairing CLI E2E | 启动本地 `termd`，运行 `termd pair --qr` 获取 `termd-pair:v1` 邀请码，再运行 `termctl pair --payload` 完成设备配对 |
 | termctl direct E2E | `cargo test -p termctl --test direct_daemon_e2e` |
 | termrelay E2E | `cargo test -p termrelay --test relay_e2e` |
 | relay runtime E2E | 启动本地 `termrelay` 和 `termd --relay`，通过统一 `/ws` relay URL 运行 `termctl pair/new/list` |
+| 安装脚本 smoke | `bash scripts/test-installers.sh`，检查三个安装脚本的帮助和 systemd 语义 |
 | termui Web | `npm run typecheck`、`npm run test -- --run`、`npm run build`、`npm run test:e2e`、`npm audit --audit-level=high`；Playwright 覆盖 mock daemon 和真实 relay daemon |
 | termui Native | 有 Flutter/Dart 时运行 `flutter pub get`、`flutter analyze`、`flutter test`；缺失时运行结构和敏感字符串 fallback 检查。 |
 

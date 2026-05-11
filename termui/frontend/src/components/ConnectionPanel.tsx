@@ -7,6 +7,7 @@ interface ConnectionPanelProps {
   token: string;
   status: string;
   canSaveUrl?: boolean;
+  onManage?: () => void;
   onUrlChange: (url: string) => void;
   onTokenChange: (token: string) => void;
   onPair: () => void;
@@ -76,6 +77,12 @@ export function ConnectionPanel(props: ConnectionPanelProps) {
           >
             <Save size={16} aria-hidden="true" />
             Save URL
+          </button>
+        ) : null}
+        {props.onManage ? (
+          <button type="button" onClick={props.onManage}>
+            <Server size={16} aria-hidden="true" />
+            Manage daemons
           </button>
         ) : null}
       </div>
