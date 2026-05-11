@@ -140,9 +140,11 @@ impl PairingInput {
     fn from_args(args: PairArgs) -> Result<Self> {
         if let Some(raw_payload) = args.payload {
             let payload = parse_pairing_payload(&raw_payload)?;
+            // 新版 invite 不再内嵌地址；有地址时沿用 invite，没有时回退到 CLI/default URL。
+            let url = payload.ws_url.unwrap_or(args.url);
             return Ok(Self {
                 token: payload.token.0,
-                url: payload.ws_url,
+                url,
                 server_id: Some(payload.server_id),
             });
         }
@@ -162,7 +164,10 @@ fn parse_pairing_payload(raw_payload: &str) -> Result<PairingQrPayload> {
 
     if !payload.is_supported_version()
         || payload.token.0.is_empty()
-        || !is_supported_ws_url(&payload.ws_url)
+        || payload
+            .ws_url
+            .as_deref()
+            .is_some_and(|ws_url| !is_supported_ws_url(ws_url))
     {
         return Err(TermctlError::InvalidPairingPayload);
     }
@@ -401,7 +406,7 @@ mod tests {
 
     #[test]
     fn parses_pair_command_with_payload() {
-        let payload = "{\"type\":\"termd_pairing_qr\",\"version\":1,\"ws_url\":\"wss://relay.example/ws/00000000-0000-0000-0000-000000000001/client\",\"token\":\"pair-token\",\"server_id\":\"00000000-0000-0000-0000-000000000001\",\"expires_at_ms\":1710000060000}";
+        let payload = "{\"type\":\"termd_pairing_qr\",\"version\":1,\"token\":\"pair-token\",\"server_id\":\"00000000-0000-0000-0000-000000000001\",\"expires_at_ms\":1710000060000}";
         let payload = format!(
             "termd-pair:v1:{}",
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload)
@@ -415,6 +420,24 @@ mod tests {
             }
             _ => panic!("expected pair command"),
         }
+    }
+
+    #[test]
+    fn parses_pair_command_with_payload_and_falls_back_to_default_url_when_missing_ws_url() {
+        let payload = "{\"type\":\"termd_pairing_qr\",\"version\":1,\"token\":\"pair-token\",\"server_id\":\"00000000-0000-0000-0000-000000000001\",\"expires_at_ms\":1710000060000}";
+        let payload = format!(
+            "termd-pair:v1:{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload)
+        );
+        let args = PairArgs {
+            token: None,
+            payload: Some(payload),
+            url: DEFAULT_URL.to_owned(),
+        };
+
+        let input = PairingInput::from_args(args).unwrap();
+        assert_eq!(input.url, DEFAULT_URL);
+        assert!(input.server_id.is_some());
     }
 
     #[test]
