@@ -27,6 +27,7 @@ interface TerminalPaneProps {
   attached: boolean;
   sessionSize?: TerminalSize;
   focusRequest?: number;
+  mobileInputMode?: boolean;
   outputVersion: number;
   outputResetVersion: number;
   takeOutput: () => string[];
@@ -48,6 +49,7 @@ export function TerminalPane(props: TerminalPaneProps) {
   const onCursorChangeRef = useRef(props.onCursorChange);
   const takeOutputRef = useRef(props.takeOutput);
   const sessionSizeRef = useRef(props.sessionSize);
+  const mobileInputModeRef = useRef(Boolean(props.mobileInputMode));
   const viewerScaleRef = useRef(1);
   const resizeRef = useRef<((source?: ResizeSource) => void) | undefined>(undefined);
   const stabilizeRef = useRef<((source?: ResizeSource) => void) | undefined>(undefined);
@@ -100,7 +102,8 @@ export function TerminalPane(props: TerminalPaneProps) {
     onCursorChangeRef.current = props.onCursorChange;
     takeOutputRef.current = props.takeOutput;
     sessionSizeRef.current = props.sessionSize;
-  }, [props.onCursorChange, props.onInput, props.onResize, props.sessionSize, props.takeOutput]);
+    mobileInputModeRef.current = Boolean(props.mobileInputMode);
+  }, [props.mobileInputMode, props.onCursorChange, props.onInput, props.onResize, props.sessionSize, props.takeOutput]);
 
   useEffect(() => {
     viewerScaleRef.current = viewerScale;
@@ -208,6 +211,25 @@ export function TerminalPane(props: TerminalPaneProps) {
     const dataSubscription = terminal.onData((data) => {
       onInputRef.current(data);
     });
+    const helperTextarea = host.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
+    const handleMobileBeforeInput = (event: InputEvent) => {
+      if (
+        !mobileInputModeRef.current ||
+        event.defaultPrevented ||
+        event.inputType !== "insertText" ||
+        (event.data !== " " && event.data !== ",")
+      ) {
+        return;
+      }
+
+      // iOS/Safari 软键盘有时只给 beforeinput，不走 xterm 的 keydown/keypress。
+      // 对空格和逗号做最小兜底，并阻止后续 input，避免同一个字符被发送两次。
+      event.preventDefault();
+      event.stopPropagation();
+      onInputRef.current(event.data);
+      queueCursorReport();
+    };
+    helperTextarea?.addEventListener("beforeinput", handleMobileBeforeInput);
     const cursorMoveSubscription = terminal.onCursorMove(queueCursorReport);
     const writeParsedSubscription = terminal.onWriteParsed(queueCursorReport);
     // 本地 xterm 始终适配当前容器；只有聚焦客户端才把尺寸写回 shared PTY。
@@ -391,6 +413,7 @@ export function TerminalPane(props: TerminalPaneProps) {
       resizeObserver?.disconnect();
       host.removeEventListener("focusin", handleFocusIn);
       host.removeEventListener("focusout", handleFocusOut);
+      helperTextarea?.removeEventListener("beforeinput", handleMobileBeforeInput);
       dataSubscription.dispose();
       cursorMoveSubscription.dispose();
       writeParsedSubscription.dispose();

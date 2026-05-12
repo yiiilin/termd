@@ -78,6 +78,17 @@ function setViewportWidth(width: number): void {
   window.dispatchEvent(new Event("resize"));
 }
 
+function dispatchMobileTextInput(target: HTMLTextAreaElement, data: string): InputEvent {
+  const event = new InputEvent("beforeinput", {
+    bubbles: true,
+    cancelable: true,
+    data,
+    inputType: "insertText",
+  });
+  target.dispatchEvent(event);
+  return event;
+}
+
 function pairingInviteCode(
   daemon: MockDaemon,
   token = "secret-token",
@@ -582,6 +593,60 @@ describe("termui web 工作台", () => {
     await screen.findByText(/termd-e2e-ready/);
     await waitFor(() => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID, DEFAULT_SESSION_ID]));
     expect(screen.getByTestId("terminal-pane")).toBeInTheDocument();
+  });
+
+  it("connection error 后会自动按一秒间隔重试当前 session", async () => {
+    setViewportWidth(390);
+    const user = userEvent.setup();
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await user.click(screen.getByRole("button", { name: "Open mobile workspace menu" }));
+    const menu = await screen.findByRole("navigation", { name: "mobile workspace menu" });
+    await within(menu).getByRole("button", { name: "Sessions" }).click();
+    const sessionsPanel = await screen.findByLabelText("sessions panel");
+    await clickSessionCard(user, DEFAULT_SESSION_NAME, sessionsPanel);
+    await screen.findByText(/termd-e2e-ready/);
+    await waitFor(() => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID]));
+
+    daemon.dropConnections();
+
+    await screen.findByRole("alert", { name: "Connection error" });
+    await waitFor(
+      () => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID, DEFAULT_SESSION_ID]),
+      { timeout: 2200 },
+    );
+    await waitFor(() => expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull());
+    expect(screen.getByTestId("terminal-pane")).toBeInTheDocument();
+  });
+
+  it("移动端软键盘可以通过 beforeinput 输入空格和逗号", async () => {
+    setViewportWidth(390);
+    const user = userEvent.setup();
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await user.click(screen.getByRole("button", { name: "Open mobile workspace menu" }));
+    const menu = await screen.findByRole("navigation", { name: "mobile workspace menu" });
+    await within(menu).getByRole("button", { name: "Sessions" }).click();
+    const sessionsPanel = await screen.findByLabelText("sessions panel");
+    await clickSessionCard(user, DEFAULT_SESSION_NAME, sessionsPanel);
+
+    let terminalInput: HTMLTextAreaElement | null = null;
+    await waitFor(() => {
+      terminalInput = document.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
+      expect(terminalInput).not.toBeNull();
+    });
+    terminalInput!.focus();
+
+    const spaceEvent = dispatchMobileTextInput(terminalInput!, " ");
+    const commaEvent = dispatchMobileTextInput(terminalInput!, ",");
+
+    expect(spaceEvent.defaultPrevented).toBe(true);
+    expect(commaEvent.defaultPrevented).toBe(true);
+    await waitFor(() => expect(daemon.sessionDataMessages).toEqual([" ", ","]));
   });
 
   it("可以创建 session 并自动 attach 到 terminal", async () => {

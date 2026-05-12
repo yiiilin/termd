@@ -1557,6 +1557,26 @@ label {
     max-width: 100%;
   }
 
+  .terminal-host .xterm .xterm-helper-textarea {
+    position: fixed !important;
+    left: 0 !important;
+    top: 0 !important;
+    right: auto !important;
+    bottom: auto !important;
+    width: 1px !important;
+    min-width: 0 !important;
+    height: 1px !important;
+    min-height: 0 !important;
+    padding: 0 !important;
+    border: 0 !important;
+    border-radius: 0 !important;
+    opacity: 0;
+    overflow: hidden;
+    resize: none;
+    font-size: 16px;
+    transform: translate3d(0, 0, 0);
+  }
+
   .terminal-pane-viewer {
     grid-template-rows: 36px minmax(0, 1fr);
   }

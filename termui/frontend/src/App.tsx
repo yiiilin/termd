@@ -58,6 +58,8 @@ const DEFAULT_FILES_PANEL_WIDTH = 286;
 const MIN_FILES_PANEL_WIDTH = 240;
 const MAX_FILES_PANEL_WIDTH = 640;
 const FILES_PANEL_RESIZER_WIDTH = 10;
+const CONNECTION_AUTO_RETRY_DELAY_MS = 1000;
+const CONNECTION_AUTO_RETRY_LIMIT = 3;
 const MOBILE_LAYOUT_QUERY = "(max-width: 760px)";
 const MOBILE_LAYOUT_BREAKPOINT = 760;
 type AppSurface = "admin" | "workspace";
@@ -113,6 +115,9 @@ export default function App() {
   const terminalOutputQueueRef = useRef<string[]>([]);
   const terminalOutputResetVersionRef = useRef(0);
   const terminalOutputFlushFrameRef = useRef<number | undefined>(undefined);
+  const connectionAutoRetryTimerRef = useRef<number | undefined>(undefined);
+  const connectionAutoRetryKeyRef = useRef<string | undefined>(undefined);
+  const connectionAutoRetryAttemptsRef = useRef(0);
   const isMobileLayout = useMobileLayout();
 
   useEffect(() => {
@@ -131,6 +136,10 @@ export default function App() {
       if (terminalOutputFlushFrameRef.current !== undefined) {
         window.cancelAnimationFrame(terminalOutputFlushFrameRef.current);
         terminalOutputFlushFrameRef.current = undefined;
+      }
+      if (connectionAutoRetryTimerRef.current !== undefined) {
+        window.clearTimeout(connectionAutoRetryTimerRef.current);
+        connectionAutoRetryTimerRef.current = undefined;
       }
     };
   }, []);
@@ -760,6 +769,51 @@ export default function App() {
     autoCheckedServerRef.current = undefined;
     await handleRefresh();
   }, [attachedSessionId, disconnectAttach, handleAttach, handleRefresh, selectedSessionId]);
+
+  useEffect(() => {
+    if (!error && (status === "ready" || status === "attached")) {
+      connectionAutoRetryKeyRef.current = undefined;
+      connectionAutoRetryAttemptsRef.current = 0;
+    }
+  }, [error, status]);
+
+  useEffect(() => {
+    if (connectionAutoRetryTimerRef.current !== undefined) {
+      window.clearTimeout(connectionAutoRetryTimerRef.current);
+      connectionAutoRetryTimerRef.current = undefined;
+    }
+
+    if (!error || !hasPairedServer) {
+      return undefined;
+    }
+
+    const retryKey = [
+      activeServer?.server_id ?? "unknown",
+      attachedSessionRef.current ?? attachedSessionId ?? selectedSessionId ?? "no-session",
+    ].join(":");
+    if (connectionAutoRetryKeyRef.current !== retryKey) {
+      connectionAutoRetryKeyRef.current = retryKey;
+      connectionAutoRetryAttemptsRef.current = 0;
+    }
+    if (connectionAutoRetryAttemptsRef.current >= CONNECTION_AUTO_RETRY_LIMIT) {
+      return undefined;
+    }
+
+    connectionAutoRetryTimerRef.current = window.setTimeout(() => {
+      connectionAutoRetryTimerRef.current = undefined;
+      connectionAutoRetryAttemptsRef.current += 1;
+      // 错误态自动恢复只复用手动 Refresh 的路径：有当前 session 就重新 attach，
+      // 否则重新刷新 daemon 列表；失败后由新的 error 继续驱动剩余重试次数。
+      void handleRetryConnection();
+    }, CONNECTION_AUTO_RETRY_DELAY_MS);
+
+    return () => {
+      if (connectionAutoRetryTimerRef.current !== undefined) {
+        window.clearTimeout(connectionAutoRetryTimerRef.current);
+        connectionAutoRetryTimerRef.current = undefined;
+      }
+    };
+  }, [activeServer?.server_id, attachedSessionId, error, handleRetryConnection, hasPairedServer, selectedSessionId]);
 
   const handleStartRename = useCallback((sessionId: UUID, currentName: string) => {
     renamingSessionIdRef.current = sessionId;
@@ -1431,6 +1485,7 @@ export default function App() {
                 attached={Boolean(attachedSessionId)}
                 sessionSize={attachedSession?.size}
                 focusRequest={terminalFocusRequest}
+                mobileInputMode={isMobileLayout}
                 outputVersion={terminalOutputVersion}
                 outputResetVersion={terminalOutputResetVersion}
                 takeOutput={takeTerminalOutput}

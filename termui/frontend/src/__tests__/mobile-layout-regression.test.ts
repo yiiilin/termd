@@ -10,5 +10,8 @@ describe("mobile layout regressions", () => {
     expect(css).toContain(".terminal-scrollport {\n    overflow: hidden;");
     expect(css).toContain(".terminal-host {\n    min-width: 0;\n    max-width: 100%;");
     expect(css).toContain(".terminal-host .xterm");
+    expect(css).toContain(".terminal-host .xterm .xterm-helper-textarea");
+    expect(css).toContain("position: fixed !important;");
+    expect(css).toContain("min-height: 0 !important;");
   });
 });
