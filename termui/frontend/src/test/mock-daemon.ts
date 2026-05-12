@@ -143,6 +143,11 @@ export class MockDaemon {
     });
   }
 
+  dropConnections(): void {
+    // 移动端 PWA 切后台时系统可能只杀掉 WebSocket，而 daemon 本身仍然在线。
+    this.server.clients.forEach((client) => client.close());
+  }
+
   private accept(socket: WebSocket, requestPath: string): void {
     const pathname = requestPath.split("?")[0] || requestPath;
     if (this.options.relayClientPathOnly && pathname !== "/ws") {

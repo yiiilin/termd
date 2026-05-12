@@ -234,6 +234,12 @@ describe("termui web 工作台", () => {
     await user.click(within(admin).getByRole("button", { name: "Open workspace" }));
     await waitForWorkspaceSession();
 
+    await user.click(screen.getByRole("button", { name: "Open session list from title" }));
+    const titleSessionsPanel = await screen.findByLabelText("sessions panel");
+    await expect(titleSessionsPanel).toBeVisible();
+    await user.click(within(titleSessionsPanel).getByRole("button", { name: "Close sessions panel" }));
+    expect(screen.queryByLabelText("sessions panel")).toBeNull();
+
     await user.click(screen.getByRole("button", { name: "Open mobile workspace menu" }));
     const sessionsMenu = await screen.findByRole("navigation", { name: "mobile workspace menu" });
     await within(sessionsMenu).getByRole("button", { name: "Sessions" }).click();
@@ -549,6 +555,33 @@ describe("termui web 工作台", () => {
     for (const sensitive of ["invalid_envelope_token", "private_key", "private-value", "signature", "ciphertext_base64"]) {
       expect(renderedText).not.toContain(sensitive);
     }
+  });
+
+  it("移动端 PWA 恢复后可以从连接错误界面刷新并重新 attach 当前 session", async () => {
+    setViewportWidth(390);
+    const user = userEvent.setup();
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await user.click(screen.getByRole("button", { name: "Open mobile workspace menu" }));
+    const menu = await screen.findByRole("navigation", { name: "mobile workspace menu" });
+    await within(menu).getByRole("button", { name: "Sessions" }).click();
+    const sessionsPanel = await screen.findByLabelText("sessions panel");
+    await clickSessionCard(user, DEFAULT_SESSION_NAME, sessionsPanel);
+    await screen.findByText(/termd-e2e-ready/);
+    await waitFor(() => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID]));
+
+    daemon.dropConnections();
+
+    const alert = await screen.findByRole("alert", { name: "Connection error" });
+    const refreshButton = within(alert).getByRole("button", { name: "Refresh" });
+    await user.click(refreshButton);
+
+    await waitFor(() => expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull());
+    await screen.findByText(/termd-e2e-ready/);
+    await waitFor(() => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID, DEFAULT_SESSION_ID]));
+    expect(screen.getByTestId("terminal-pane")).toBeInTheDocument();
   });
 
   it("可以创建 session 并自动 attach 到 terminal", async () => {

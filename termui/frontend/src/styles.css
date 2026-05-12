@@ -213,6 +213,11 @@ label {
   font-weight: 700;
 }
 
+.protocol-error-refresh {
+  margin-left: auto;
+  min-height: 30px;
+}
+
 .protocol-error-alert-detail {
   min-width: 0;
   display: flex;
@@ -810,6 +815,25 @@ label {
   display: flex;
   align-items: center;
   gap: 8px;
+}
+
+.toolbar-title-button {
+  border: 0;
+  min-height: 0;
+  padding: 0;
+  background: transparent;
+  color: inherit;
+  justify-content: flex-start;
+}
+
+.toolbar-title-button:hover:not(:disabled) {
+  border-color: transparent;
+  color: inherit;
+}
+
+.toolbar-title-button:focus-visible {
+  outline: 1px solid #d6ff5f;
+  outline-offset: 4px;
 }
 
 .toolbar-title span {

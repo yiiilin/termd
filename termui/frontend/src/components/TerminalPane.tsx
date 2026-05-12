@@ -16,6 +16,13 @@ const VIEWER_MIN_ZOOM = 0.5;
 const VIEWER_MAX_ZOOM = 1.4;
 type ResizeSource = "layout" | "focus" | "viewer";
 
+function sameTerminalDimensions(
+  a: { rows: number; cols: number } | undefined,
+  b: { rows: number; cols: number } | undefined,
+): boolean {
+  return Boolean(a) && Boolean(b) && a!.rows === b!.rows && a!.cols === b!.cols;
+}
+
 interface TerminalPaneProps {
   attached: boolean;
   sessionSize?: TerminalSize;
@@ -172,7 +179,9 @@ export function TerminalPane(props: TerminalPaneProps) {
       cursorBlink: true,
       cursorStyle: "block",
       cursorInactiveStyle: "outline",
-      screenReaderMode: true,
+      // MVP 只需要普通终端渲染；屏幕阅读模式会额外维持可访问性树，增加高输出场景的内存和 CPU 压力。
+      screenReaderMode: false,
+      scrollback: 2000,
       fontFamily: '"IBM Plex Mono", "SFMono-Regular", Consolas, monospace',
       fontSize: TERMINAL_FONT_SIZE,
       convertEol: true,
@@ -247,12 +256,11 @@ export function TerminalPane(props: TerminalPaneProps) {
             : nextClientSize,
         );
       }
-      const mismatch =
-        Boolean(
-          remoteSize &&
-            proposed &&
-            (remoteSize.rows !== proposed.rows || remoteSize.cols !== proposed.cols),
-        );
+      const mismatch = Boolean(
+        remoteSize &&
+          proposed &&
+          (remoteSize.rows !== proposed.rows || remoteSize.cols !== proposed.cols),
+      );
       if (focusedRef.current && source !== "focus" && mismatch) {
         // 浏览器窗口 resize 或外层布局变化不是用户主动接管终端；一旦本地可容纳尺寸
         // 和当前 PTY 尺寸不一致，就退回 viewer，避免 focus/blur 与 session_resize 来回振荡。
@@ -270,6 +278,10 @@ export function TerminalPane(props: TerminalPaneProps) {
       if (!focusedRef.current) {
         applyFontSize(terminal, mismatch ? fontSizeForScale(viewerScaleRef.current) : TERMINAL_FONT_SIZE);
         if (remoteSize) {
+          if (sameTerminalDimensions(terminal, remoteSize)) {
+            queueCursorReport();
+            return;
+          }
           terminal.resize(remoteSize.cols, remoteSize.rows);
           queueCursorReport();
           return;
@@ -280,6 +292,13 @@ export function TerminalPane(props: TerminalPaneProps) {
       // 这种尺寸不能写回 shared PTY，否则其他客户端会被同步成一行终端。
       if (proposed && proposed.rows >= MIN_FOCUSED_RESIZE_ROWS && proposed.cols >= MIN_FOCUSED_RESIZE_COLS) {
         viewerModeRef.current = false;
+        if (
+          sessionSizeRef.current?.rows === proposed.rows &&
+          sessionSizeRef.current?.cols === proposed.cols
+        ) {
+          queueCursorReport();
+          return;
+        }
         fit.fit();
         onResizeRef.current({
           rows: proposed.rows,
@@ -336,8 +355,8 @@ export function TerminalPane(props: TerminalPaneProps) {
     setWrittenChunkCount(0);
     // attach 输出可能早于 xterm 初始化到达；创建实例时先取走待写队列，避免首屏输出丢失。
     const initialChunks = takeOutputRef.current();
-    for (const chunk of initialChunks) {
-      terminal.write(chunk, queueCursorReport);
+    if (initialChunks.length > 0) {
+      terminal.write(initialChunks.join(""), queueCursorReport);
     }
     if (initialChunks.length > 0) {
       setWrittenChunkCount(initialChunks.length);
@@ -409,9 +428,7 @@ export function TerminalPane(props: TerminalPaneProps) {
       return;
     }
 
-    for (const chunk of chunks) {
-      terminal.write(chunk, queueCursorReport);
-    }
+    terminal.write(chunks.join(""), queueCursorReport);
     setWrittenChunkCount((count) => count + chunks.length);
     stabilizeRef.current?.();
   }, [props.outputResetVersion, props.outputVersion]);

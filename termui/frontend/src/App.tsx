@@ -112,6 +112,7 @@ export default function App() {
   const cursorRefreshTimerRef = useRef<number | undefined>(undefined);
   const terminalOutputQueueRef = useRef<string[]>([]);
   const terminalOutputResetVersionRef = useRef(0);
+  const terminalOutputFlushFrameRef = useRef<number | undefined>(undefined);
   const isMobileLayout = useMobileLayout();
 
   useEffect(() => {
@@ -123,6 +124,15 @@ export default function App() {
       // 已配对的浏览器默认进入工作台；连接失败时再回落到后台管理页重新选择 daemon。
       setActiveSurface(defaultServer(loaded) && loaded.device ? "workspace" : "admin");
     });
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (terminalOutputFlushFrameRef.current !== undefined) {
+        window.cancelAnimationFrame(terminalOutputFlushFrameRef.current);
+        terminalOutputFlushFrameRef.current = undefined;
+      }
+    };
   }, []);
 
   useEffect(() => {
@@ -282,13 +292,32 @@ export default function App() {
     // 终端输出由 xterm 自己维护 scrollback；React 只保留尚未写入 xterm 的短队列。
     terminalOutputQueueRef.current = [];
     terminalOutputResetVersionRef.current += 1;
+    if (terminalOutputFlushFrameRef.current !== undefined) {
+      window.cancelAnimationFrame(terminalOutputFlushFrameRef.current);
+      terminalOutputFlushFrameRef.current = undefined;
+    }
     setTerminalOutputResetVersion(terminalOutputResetVersionRef.current);
   }, []);
 
-  const enqueueTerminalOutput = useCallback((chunk: string) => {
-    terminalOutputQueueRef.current.push(chunk);
+  const flushTerminalOutput = useCallback(() => {
+    terminalOutputFlushFrameRef.current = undefined;
+    // 这一帧里累积的 session_data 会在 xterm 里一次性写入，避免每个 chunk 都触发一次 React 更新。
     setTerminalOutputVersion((version) => version + 1);
   }, []);
+
+  const scheduleTerminalOutputFlush = useCallback(() => {
+    if (terminalOutputFlushFrameRef.current !== undefined) {
+      return;
+    }
+    terminalOutputFlushFrameRef.current = window.requestAnimationFrame(() => {
+      flushTerminalOutput();
+    });
+  }, [flushTerminalOutput]);
+
+  const enqueueTerminalOutput = useCallback((chunk: string) => {
+    terminalOutputQueueRef.current.push(chunk);
+    scheduleTerminalOutputFlush();
+  }, [scheduleTerminalOutputFlush]);
 
   const takeTerminalOutput = useCallback(() => {
     const chunks = terminalOutputQueueRef.current;
@@ -716,6 +745,22 @@ export default function App() {
     }
   }, [authenticatedClient, clearTerminalOutput, disconnectAttach, loadSessionFiles, refreshDaemonClients, setSafeError, startReceiveLoop]);
 
+  const handleRetryConnection = useCallback(async () => {
+    const sessionId = attachedSessionRef.current ?? attachedSessionId ?? selectedSessionId;
+    if (sessionId) {
+      // PWA 从后台恢复时旧 WebSocket 可能已经被系统关闭；先断开旧 attach，
+      // 否则 handleAttach 会误以为当前 session 已连接而直接短路返回。
+      disconnectAttach();
+      await handleAttach(sessionId);
+      return;
+    }
+
+    setError(undefined);
+    setActiveSurface("workspace");
+    autoCheckedServerRef.current = undefined;
+    await handleRefresh();
+  }, [attachedSessionId, disconnectAttach, handleAttach, handleRefresh, selectedSessionId]);
+
   const handleStartRename = useCallback((sessionId: UUID, currentName: string) => {
     renamingSessionIdRef.current = sessionId;
     setRenamingSessionId(sessionId);
@@ -863,9 +908,27 @@ export default function App() {
       if (!client || !sessionId) {
         return;
       }
-      setSessions((current) =>
-        current.map((session) => (session.session_id === sessionId ? { ...session, size } : session)),
-      );
+      let shouldSendResize = false;
+      setSessions((current) => {
+        const next = current.map((session) =>
+          session.session_id === sessionId ? { ...session, size } : session,
+        );
+        const currentSession = current.find((session) => session.session_id === sessionId);
+        if (
+          currentSession &&
+          currentSession.size.rows === size.rows &&
+          currentSession.size.cols === size.cols &&
+          currentSession.size.pixel_width === size.pixel_width &&
+          currentSession.size.pixel_height === size.pixel_height
+        ) {
+          return current;
+        }
+        shouldSendResize = true;
+        return next;
+      });
+      if (!shouldSendResize) {
+        return;
+      }
       void client.resizeSession(sessionId, size).catch((caught) => {
         if (!isIgnoredClosingSessionNotFound(sessionId, caught)) {
           setSafeError(caught);
@@ -1097,7 +1160,13 @@ export default function App() {
               Open workspace
             </button>
           </section>
-          {error ? <ProtocolErrorAlert error={error} /> : null}
+          {error ? (
+            <ProtocolErrorAlert
+              error={error}
+              onRefresh={hasPairedServer ? handleRetryConnection : undefined}
+              refreshing={status === "attaching" || status === "connecting" || status === "listing"}
+            />
+          ) : null}
           <div className="admin-grid">
             <ConnectionPanel
               url={url}
@@ -1278,11 +1347,25 @@ export default function App() {
               <Menu size={16} aria-hidden="true" />
             </button>
           ) : null}
-          <div className="toolbar-title">
-            <MonitorUp size={16} aria-hidden="true" />
-            <span>{toolbarSessionName}</span>
-            {toolbarSessionSize ? <small>{toolbarSessionSize}</small> : null}
-          </div>
+          {showMobileWorkspaceMenu ? (
+            <button
+              type="button"
+              className="toolbar-title toolbar-title-button"
+              aria-label="Open session list from title"
+              aria-expanded={showMobileSessionsPanel}
+              onClick={handleOpenMobileSessions}
+            >
+              <MonitorUp size={16} aria-hidden="true" />
+              <span>{toolbarSessionName}</span>
+              {toolbarSessionSize ? <small>{toolbarSessionSize}</small> : null}
+            </button>
+          ) : (
+            <div className="toolbar-title">
+              <MonitorUp size={16} aria-hidden="true" />
+              <span>{toolbarSessionName}</span>
+              {toolbarSessionSize ? <small>{toolbarSessionSize}</small> : null}
+            </div>
+          )}
           {connectionReady && attachedSessionId && !isMobileLayout ? (
             <SessionOperatorsBar
               operators={sessionOperators}
@@ -1335,7 +1418,13 @@ export default function App() {
           }
           style={desktopWorkspaceStyle}
         >
-          {error ? <ProtocolErrorAlert error={error} /> : null}
+          {error ? (
+            <ProtocolErrorAlert
+              error={error}
+              onRefresh={hasPairedServer ? handleRetryConnection : undefined}
+              refreshing={status === "attaching" || status === "connecting" || status === "listing"}
+            />
+          ) : null}
           {connectionReady ? (
             <>
               <TerminalPane
@@ -1468,17 +1557,32 @@ export default function App() {
   );
 }
 
-function ProtocolErrorAlert({ error }: { error: SafeError }) {
+function ProtocolErrorAlert(props: {
+  error: SafeError;
+  onRefresh?: () => void;
+  refreshing?: boolean;
+}) {
   return (
     <section className="protocol-error-alert" role="alert" aria-label="Connection error">
       <div className="protocol-error-alert-title">
         <CircleAlert size={17} aria-hidden="true" />
         <span>Connection error</span>
+        {props.onRefresh ? (
+          <button
+            type="button"
+            className="protocol-error-refresh"
+            onClick={props.onRefresh}
+            disabled={props.refreshing}
+          >
+            <RefreshCcw size={15} aria-hidden="true" />
+            Refresh
+          </button>
+        ) : null}
       </div>
       <div className="protocol-error-alert-detail">
-        <code>{error.code}</code>
+        <code>{props.error.code}</code>
         {/* 主体提示只展示 SafeError 字段，避免把 token、签名或密文等原始 payload 泄漏到 UI。 */}
-        <span>{error.message}</span>
+        <span>{props.error.message}</span>
       </div>
     </section>
   );
