@@ -1,5 +1,6 @@
 use std::error::Error;
 use std::fmt;
+use std::fmt::Write as FmtWrite;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
@@ -7,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use base64::{Engine as _, engine::general_purpose};
-use qrcode::{QrCode, render::unicode};
+use qrcode::{Color as QrColor, QrCode, render::unicode};
 use serde::Deserialize;
 use termd::config::{DaemonConfig, SecretString, normalize_relay_endpoints};
 use termd::net::relay::{RelayBaseUrl, RelayReconnectPolicy, run_relay_mux_with_reconnect};
@@ -39,7 +40,8 @@ const HELP_TEXT: &str = concat!(
     "  -V, --version                  Print version\n\n",
     "PAIR OPTIONS:\n",
     "  --url <HTTP_URL>               Local daemon URL, default http://127.0.0.1:8765\n",
-    "  --qr                           Print a QR invite code for Web/mobile pairing\n\n",
+    "  --qr                           Print a QR invite code for Web/mobile pairing\n",
+    "  --qr-svg <PATH>                 Write a real SVG QR invite code to PATH\n\n",
     "EXAMPLES:\n",
     "  termd --listen 0.0.0.0:8765 --web\n",
     "  termd --relay wss://relay.example:443 --relay-auth-token env-token\n",
@@ -70,12 +72,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
             tls,
             web,
         } => serve_daemon(listen, relay_urls, relay_auth_token, tls, web).await?,
-        CliCommand::Pair { url, qr } => {
+        CliCommand::Pair { url, qr, qr_svg } => {
             let token = request_pairing_token_response(&url)?;
-            if qr {
+            if qr || qr_svg.is_some() {
                 let payload = build_pairing_qr_payload(&token)?;
                 let invite_code = payload.to_invite_code();
-                println!("{}", render_pairing_qr(&invite_code)?);
+                if qr {
+                    println!("{}", render_pairing_qr(&invite_code)?);
+                }
+                if let Some(path) = qr_svg.as_deref() {
+                    write_pairing_qr_svg(path, &invite_code)?;
+                }
                 println!("{invite_code}");
             } else {
                 println!("{}", token.token.0);
@@ -189,6 +196,7 @@ enum CliCommand {
     Pair {
         url: String,
         qr: bool,
+        qr_svg: Option<PathBuf>,
     },
     SessionSupervisor(SessionSupervisorArgs),
 }
@@ -216,10 +224,11 @@ impl fmt::Debug for CliCommand {
                     .field("web", web)
                     .finish()
             }
-            Self::Pair { url, qr } => formatter
+            Self::Pair { url, qr, qr_svg } => formatter
                 .debug_struct("Pair")
                 .field("url", url)
                 .field("qr", qr)
+                .field("qr_svg", qr_svg)
                 .finish(),
             Self::SessionSupervisor(args) => formatter
                 .debug_tuple("SessionSupervisor")
@@ -326,6 +335,7 @@ fn parse_serve_args(args: impl IntoIterator<Item = String>) -> Result<CliCommand
 fn parse_pair_args(mut args: impl Iterator<Item = String>) -> Result<CliCommand, CliError> {
     let mut url = DEFAULT_PAIRING_URL.to_owned();
     let mut qr = false;
+    let mut qr_svg = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -337,13 +347,18 @@ fn parse_pair_args(mut args: impl Iterator<Item = String>) -> Result<CliCommand,
             "--qr" => {
                 qr = true;
             }
+            "--qr-svg" => {
+                qr_svg = Some(PathBuf::from(
+                    args.next().ok_or(CliError::MissingQrSvgPath)?,
+                ));
+            }
             other => return Err(CliError::UnexpectedArgument(other.to_owned())),
         }
     }
 
     // 解析阶段先拒绝不支持的 URL，避免用户等到网络请求时才看到模糊错误。
     let _ = parse_pairing_base_url(&url)?;
-    Ok(CliCommand::Pair { url, qr })
+    Ok(CliCommand::Pair { url, qr, qr_svg })
 }
 
 fn parse_session_supervisor_args(
@@ -609,6 +624,33 @@ fn render_pairing_qr(invite_code: &str) -> Result<String, CliError> {
     Ok(code.render::<unicode::Dense1x2>().build())
 }
 
+fn write_pairing_qr_svg(path: &std::path::Path, invite_code: &str) -> Result<(), CliError> {
+    let svg = render_pairing_qr_svg(invite_code)?;
+    std::fs::write(path, svg).map_err(|_| CliError::QrSvgWriteFailed)
+}
+
+fn render_pairing_qr_svg(invite_code: &str) -> Result<String, CliError> {
+    let code = QrCode::new(invite_code.as_bytes()).map_err(|_| CliError::QrRenderFailed)?;
+    let modules = code.width();
+    let quiet_zone = 4_usize;
+    let side = modules + quiet_zone * 2;
+    let mut path = String::new();
+
+    for (index, color) in code.to_colors().iter().enumerate() {
+        if *color != QrColor::Dark {
+            continue;
+        }
+        let x = index % modules + quiet_zone;
+        let y = index / modules + quiet_zone;
+        // SVG 用 path 合并黑色模块，文件体积比逐个 rect 更小，扫码器也更容易识别。
+        write!(&mut path, "M{x} {y}h1v1H{x}V{y}").map_err(|_| CliError::QrRenderFailed)?;
+    }
+
+    Ok(format!(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" version="1.1" width="{side}" height="{side}" viewBox="0 0 {side} {side}" shape-rendering="crispEdges"><rect x="0" y="0" width="{side}" height="{side}" fill="#ffffff"/><path d="{path}" fill="#000000"/></svg>"##
+    ))
+}
+
 fn parse_http_status(head: &str) -> Result<u16, CliError> {
     let status = head
         .lines()
@@ -626,6 +668,7 @@ enum CliError {
     UnexpectedArgument(String),
     MissingListenValue,
     MissingUrlValue,
+    MissingQrSvgPath,
     MissingRelayUrlValue,
     MissingRelayAuthTokenValue,
     MissingTlsCertValue,
@@ -647,6 +690,7 @@ enum CliError {
     HttpStatus { status: u16 },
     InvalidJson,
     QrRenderFailed,
+    QrSvgWriteFailed,
     Tls,
     MissingSupervisorSessionId,
     MissingSupervisorSocketPath,
@@ -657,7 +701,7 @@ enum CliError {
 
 impl CliError {
     fn usage() -> &'static str {
-        "usage: termd [--listen 127.0.0.1:8765] [--relay ws://host:port] [--relay-auth-token <token>] [--tls-cert <cert.pem> --tls-key <key.pem>] [--web] [pair [--url http://127.0.0.1:8765|https://127.0.0.1:8765] [--qr]]\ntry `termd --help` for full help"
+        "usage: termd [--listen 127.0.0.1:8765] [--relay ws://host:port] [--relay-auth-token <token>] [--tls-cert <cert.pem> --tls-key <key.pem>] [--web] [pair [--url http://127.0.0.1:8765|https://127.0.0.1:8765] [--qr] [--qr-svg <path>]]\ntry `termd --help` for full help"
     }
 }
 
@@ -672,6 +716,7 @@ impl fmt::Display for CliError {
             }
             Self::MissingListenValue => write!(f, "`--listen` requires a value\n{}", Self::usage()),
             Self::MissingUrlValue => write!(f, "`--url` requires a value\n{}", Self::usage()),
+            Self::MissingQrSvgPath => write!(f, "`--qr-svg` requires a path\n{}", Self::usage()),
             Self::MissingRelayUrlValue => {
                 write!(f, "`--relay` requires a value\n{}", Self::usage())
             }
@@ -758,6 +803,7 @@ impl fmt::Display for CliError {
             }
             Self::InvalidJson => write!(f, "daemon returned an invalid pairing token response"),
             Self::QrRenderFailed => write!(f, "failed to render pairing QR code"),
+            Self::QrSvgWriteFailed => write!(f, "failed to write pairing QR SVG"),
             Self::Tls => write!(f, "failed to establish TLS for pairing token request"),
             Self::MissingSupervisorSessionId => write!(f, "`--session-id` requires a value"),
             Self::MissingSupervisorSocketPath => write!(f, "`--socket-path` requires a value"),
@@ -1176,6 +1222,7 @@ mod tests {
             CliCommand::Pair {
                 url: DEFAULT_PAIRING_URL.to_owned(),
                 qr: false,
+                qr_svg: None,
             }
         );
     }
@@ -1192,6 +1239,7 @@ mod tests {
             CliCommand::Pair {
                 url: "http://127.0.0.1:9999".to_owned(),
                 qr: false,
+                qr_svg: None,
             }
         );
     }
@@ -1208,6 +1256,7 @@ mod tests {
             CliCommand::Pair {
                 url: "https://127.0.0.1:8765".to_owned(),
                 qr: false,
+                qr_svg: None,
             }
         );
     }
@@ -1219,6 +1268,24 @@ mod tests {
             CliCommand::Pair {
                 url: DEFAULT_PAIRING_URL.to_owned(),
                 qr: true,
+                qr_svg: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_pair_with_qr_svg_path() {
+        assert_eq!(
+            CliCommand::parse([
+                "pair".to_owned(),
+                "--qr-svg".to_owned(),
+                "/tmp/termd-pair.svg".to_owned(),
+            ])
+            .unwrap(),
+            CliCommand::Pair {
+                url: DEFAULT_PAIRING_URL.to_owned(),
+                qr: false,
+                qr_svg: Some(PathBuf::from("/tmp/termd-pair.svg")),
             }
         );
     }

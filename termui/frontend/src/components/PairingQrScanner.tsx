@@ -65,6 +65,20 @@ export function PairingQrScanner({ onDetected, onClose }: PairingQrScannerProps)
             stopAndDetect(result.data);
           },
           {
+            calculateScanRegion: (video) => {
+              const width = video.videoWidth || video.clientWidth || 1;
+              const height = video.videoHeight || video.clientHeight || 1;
+              return {
+                x: 0,
+                y: 0,
+                width,
+                height,
+                // iPhone Safari 对终端里生成的高密度二维码比较挑剔；保留全画面取样，
+                // 同时降采样到一半尺寸，减少小画面中心框漏扫的问题。
+                downScaledWidth: Math.max(1, Math.round(width / 2)),
+                downScaledHeight: Math.max(1, Math.round(height / 2)),
+              };
+            },
             highlightCodeOutline: true,
             highlightScanRegion: true,
             maxScansPerSecond: 8,
@@ -88,7 +102,7 @@ export function PairingQrScanner({ onDetected, onClose }: PairingQrScannerProps)
           return;
         }
 
-        setStatus("Scanning");
+        setStatus("Scanning. Fill the frame with the QR code.");
       } catch {
         if (!cancelled) {
           setError("Camera access failed");

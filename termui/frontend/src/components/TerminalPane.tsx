@@ -17,10 +17,12 @@ const VIEWER_MAX_ZOOM = 1.4;
 type ResizeSource = "layout" | "focus" | "viewer";
 
 interface TerminalPaneProps {
-  chunks: string[];
   attached: boolean;
   sessionSize?: TerminalSize;
   focusRequest?: number;
+  outputVersion: number;
+  outputResetVersion: number;
+  takeOutput: () => string[];
   onInput: (data: string) => void;
   onResize: (size: TerminalSize) => void;
   onCursorChange?: (presence: SessionCursorPresence) => void;
@@ -33,10 +35,11 @@ export function TerminalPane(props: TerminalPaneProps) {
   const frameRef = useRef<HTMLDivElement | null>(null);
   const terminalRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
-  const writtenChunksRef = useRef(0);
+  const outputResetVersionRef = useRef(props.outputResetVersion);
   const onInputRef = useRef(props.onInput);
   const onResizeRef = useRef(props.onResize);
   const onCursorChangeRef = useRef(props.onCursorChange);
+  const takeOutputRef = useRef(props.takeOutput);
   const sessionSizeRef = useRef(props.sessionSize);
   const viewerScaleRef = useRef(1);
   const resizeRef = useRef<((source?: ResizeSource) => void) | undefined>(undefined);
@@ -51,6 +54,7 @@ export function TerminalPane(props: TerminalPaneProps) {
   const [clientSize, setClientSize] = useState<TerminalSize | undefined>(undefined);
   const [focused, setFocused] = useState(false);
   const [viewerScale, setViewerScale] = useState(1);
+  const [writtenChunkCount, setWrittenChunkCount] = useState(0);
   const fitViewerToScrollport = () => setViewerScale(fitScaleForViewer(scrollportRef.current, frameRef.current, viewerScaleRef.current));
   const remoteRenderMode = props.attached && !focused;
   const viewerCols = props.sessionSize?.cols ?? 0;
@@ -87,8 +91,9 @@ export function TerminalPane(props: TerminalPaneProps) {
     onInputRef.current = props.onInput;
     onResizeRef.current = props.onResize;
     onCursorChangeRef.current = props.onCursorChange;
+    takeOutputRef.current = props.takeOutput;
     sessionSizeRef.current = props.sessionSize;
-  }, [props.onCursorChange, props.onInput, props.onResize, props.sessionSize]);
+  }, [props.onCursorChange, props.onInput, props.onResize, props.sessionSize, props.takeOutput]);
 
   useEffect(() => {
     viewerScaleRef.current = viewerScale;
@@ -327,12 +332,16 @@ export function TerminalPane(props: TerminalPaneProps) {
     host.addEventListener("focusout", handleFocusOut);
     terminalRef.current = terminal;
     fitRef.current = fit;
-    writtenChunksRef.current = 0;
-    // attach 输出可能早于 xterm 初始化到达；创建实例时补写已有 chunks，避免首屏输出丢失。
-    for (const chunk of props.chunks) {
+    outputResetVersionRef.current = props.outputResetVersion;
+    setWrittenChunkCount(0);
+    // attach 输出可能早于 xterm 初始化到达；创建实例时先取走待写队列，避免首屏输出丢失。
+    const initialChunks = takeOutputRef.current();
+    for (const chunk of initialChunks) {
       terminal.write(chunk, queueCursorReport);
     }
-    writtenChunksRef.current = props.chunks.length;
+    if (initialChunks.length > 0) {
+      setWrittenChunkCount(initialChunks.length);
+    }
     queueCursorReport();
 
     // 初次 attach 只做本地 fit；用户聚焦该终端时才接管 shared PTY 的远端尺寸。
@@ -367,6 +376,8 @@ export function TerminalPane(props: TerminalPaneProps) {
       cursorMoveSubscription.dispose();
       writeParsedSubscription.dispose();
       terminal.dispose();
+      // 清理 host 里的旧 xterm DOM，避免切换 session 后旧终端明文或隐藏 textarea 残留。
+      host.replaceChildren();
       terminalRef.current = null;
       fitRef.current = null;
       resizeRef.current = undefined;
@@ -377,30 +388,33 @@ export function TerminalPane(props: TerminalPaneProps) {
       focusActivationArmedRef.current = false;
       suppressPassiveFocusRef.current = false;
       setFocused(false);
+      setWrittenChunkCount(0);
     };
   }, [props.attached]);
 
   useEffect(() => {
     const terminal = terminalRef.current;
     if (!terminal) {
-      writtenChunksRef.current = props.chunks.length;
       return;
     }
-    if (props.chunks.length < writtenChunksRef.current) {
-      // session 切换时 UI 会清空 chunks；同步清屏，避免旧 session 明文留在终端实例中。
+    if (outputResetVersionRef.current !== props.outputResetVersion) {
+      outputResetVersionRef.current = props.outputResetVersion;
+      // session 切换时 UI 会重置输出队列；同步清屏，避免旧 session 明文留在终端实例中。
       terminal.clear();
-      writtenChunksRef.current = 0;
+      setWrittenChunkCount(0);
     }
-    let wroteChunk = false;
-    for (let index = writtenChunksRef.current; index < props.chunks.length; index += 1) {
-      terminal.write(props.chunks[index], queueCursorReport);
-      wroteChunk = true;
+
+    const chunks = takeOutputRef.current();
+    if (chunks.length === 0) {
+      return;
     }
-    writtenChunksRef.current = props.chunks.length;
-    if (wroteChunk) {
-      stabilizeRef.current?.();
+
+    for (const chunk of chunks) {
+      terminal.write(chunk, queueCursorReport);
     }
-  }, [props.chunks]);
+    setWrittenChunkCount((count) => count + chunks.length);
+    stabilizeRef.current?.();
+  }, [props.outputResetVersion, props.outputVersion]);
 
   useEffect(() => {
     if (!props.attached || !props.focusRequest || !terminalRef.current) {
@@ -421,7 +435,7 @@ export function TerminalPane(props: TerminalPaneProps) {
   return (
     <section
       className={resolutionMismatch ? "terminal-pane terminal-pane-viewer" : "terminal-pane"}
-      data-output-chunks={props.chunks.length}
+      data-output-chunks={writtenChunkCount}
       data-viewer-mode={resolutionMismatch ? "true" : "false"}
       data-testid="terminal-pane"
     >

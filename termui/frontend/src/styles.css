@@ -1350,6 +1350,10 @@ label {
     max-width: 34vw;
   }
 
+  .toolbar-actions {
+    display: none;
+  }
+
   .toolbar-admin-button {
     display: none;
   }
@@ -1510,6 +1514,23 @@ label {
 
   .terminal-pane {
     min-height: 0;
+  }
+
+  .terminal-scrollport {
+    overflow: hidden;
+  }
+
+  .terminal-host {
+    min-width: 0;
+    max-width: 100%;
+    overflow: hidden;
+  }
+
+  .terminal-host .xterm,
+  .terminal-host .xterm-screen,
+  .terminal-host .xterm-viewport,
+  .terminal-host .xterm-rows {
+    max-width: 100%;
   }
 
   .terminal-pane-viewer {

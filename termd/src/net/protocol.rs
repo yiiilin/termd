@@ -53,7 +53,8 @@ use super::{
 };
 
 const AUTH_CHALLENGE_TTL_MS: u64 = 60_000;
-const SESSION_OUTPUT_HISTORY_MAX_BYTES: usize = 1024 * 1024;
+// 只保留最近固定行数的 PTY 输出，避免长时间输出导致重新 attach 时回放过长。
+const SESSION_OUTPUT_HISTORY_MAX_LINES: usize = 2000;
 
 /// 协议层统一使用的 JSON envelope。
 pub type JsonEnvelope = Envelope<Value>;
@@ -83,14 +84,17 @@ struct RestoredSessionMetadata {
     root_path: PathBuf,
 }
 
-/// session 级输出缓冲。
+/// session 级输出回放窗口。
 ///
 /// PTY 输出只能被读取一次；这里先按 session 保留，再按每条连接自己的 offset 加密发送，
 /// 避免重新 attach 或多个客户端同时 attach 时丢失已经读过的终端内容。
+///
+/// 这里只保留最近固定行数，防止输出过多时把 replay 窗口拖成一大段历史回放。
 #[derive(Debug, Clone)]
 struct SessionOutputHistory {
     base_offset: u64,
     bytes: VecDeque<u8>,
+    newline_count: usize,
 }
 
 impl SessionOutputHistory {
@@ -104,10 +108,32 @@ impl SessionOutputHistory {
 
     fn append(&mut self, bytes: &[u8]) {
         self.bytes.extend(bytes.iter().copied());
+        self.newline_count += bytes.iter().filter(|byte| **byte == b'\n').count();
+        self.trim_to_line_limit();
+    }
 
-        while self.bytes.len() > SESSION_OUTPUT_HISTORY_MAX_BYTES {
-            self.bytes.pop_front();
+    fn visible_line_count(&self) -> usize {
+        if self.bytes.is_empty() {
+            return 0;
+        }
+
+        if self.bytes.back() == Some(&b'\n') {
+            self.newline_count
+        } else {
+            self.newline_count + 1
+        }
+    }
+
+    fn trim_to_line_limit(&mut self) {
+        // 只回收完整的老行，保留当前最新的半行，避免打断正在增长的输出。
+        while self.visible_line_count() > SESSION_OUTPUT_HISTORY_MAX_LINES {
+            let Some(byte) = self.bytes.pop_front() else {
+                break;
+            };
             self.base_offset = self.base_offset.saturating_add(1);
+            if byte == b'\n' {
+                self.newline_count = self.newline_count.saturating_sub(1);
+            }
         }
     }
 
@@ -138,6 +164,7 @@ impl Default for SessionOutputHistory {
         Self {
             base_offset: 0,
             bytes: VecDeque::new(),
+            newline_count: 0,
         }
     }
 }
@@ -4640,6 +4667,23 @@ mod tests {
         assert_eq!(inner.kind, MessageType::SessionData);
         assert_eq!(payload.session_id, created_payload.session_id);
         assert_eq!(output, b"terminal secret\n");
+    }
+
+    #[test]
+    fn session_output_history_keeps_only_recent_lines() {
+        let mut history = SessionOutputHistory::default();
+        for index in 0..=SESSION_OUTPUT_HISTORY_MAX_LINES {
+            history.append(format!("line-{index}\n").as_bytes());
+        }
+
+        let (bytes, cursor) = history.read_from(0, usize::MAX);
+        let output = String::from_utf8(bytes).unwrap();
+        let expected = (1..=SESSION_OUTPUT_HISTORY_MAX_LINES)
+            .map(|index| format!("line-{index}\n"))
+            .collect::<String>();
+
+        assert_eq!(output, expected);
+        assert!(history.read_from(cursor, 4096).0.is_empty());
     }
 
     #[test]

@@ -19,6 +19,18 @@ const qrScannerMock = vi.hoisted(() => ({
   destroy: vi.fn(),
   hasCamera: vi.fn<() => Promise<boolean>>(() => Promise.resolve(true)),
   onDecode: undefined as ((result: { data: string }) => void) | undefined,
+  options: undefined as
+    | {
+        calculateScanRegion?: (video: HTMLVideoElement) => {
+          x: number;
+          y: number;
+          width: number;
+          height: number;
+          downScaledWidth: number;
+          downScaledHeight: number;
+        };
+      }
+    | undefined,
   scanImage: vi.fn<() => Promise<{ data: string; cornerPoints: [] }>>(),
   start: vi.fn<() => Promise<void>>(() => Promise.resolve()),
   stop: vi.fn(),
@@ -30,8 +42,9 @@ vi.mock("qr-scanner", () => {
     static hasCamera = qrScannerMock.hasCamera;
     static scanImage = qrScannerMock.scanImage;
 
-    constructor(_video: HTMLVideoElement, onDecode: (result: { data: string }) => void) {
+    constructor(_video: HTMLVideoElement, onDecode: (result: { data: string }) => void, options?: typeof qrScannerMock.options) {
       qrScannerMock.onDecode = onDecode;
+      qrScannerMock.options = options;
     }
 
     start = qrScannerMock.start;
@@ -115,7 +128,7 @@ async function waitForWorkspaceSession(name?: string): Promise<void> {
 }
 
 async function waitForWorkspaceReady(): Promise<void> {
-  await screen.findByRole("button", { name: "Daemons" });
+  await screen.findByTestId("terminal-pane");
 }
 
 async function clickSessionCard(
@@ -148,6 +161,7 @@ describe("termui web 工作台", () => {
     qrScannerMock.hasCamera.mockReset();
     qrScannerMock.hasCamera.mockResolvedValue(true);
     qrScannerMock.onDecode = undefined;
+    qrScannerMock.options = undefined;
     qrScannerMock.scanImage.mockReset();
     qrScannerMock.start.mockReset();
     qrScannerMock.start.mockResolvedValue();
@@ -203,6 +217,8 @@ describe("termui web 工作台", () => {
     await waitForWorkspaceSession();
     expect(screen.queryByRole("navigation", { name: "mobile workspace menu" })).toBeNull();
     expect(screen.queryByRole("navigation", { name: "mobile workspace actions" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Clients" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Daemons" })).toBeNull();
 
     await user.click(screen.getByRole("button", { name: "Open mobile workspace menu" }));
     const menu = await screen.findByRole("navigation", { name: "mobile workspace menu" });
@@ -228,6 +244,7 @@ describe("termui web 工作台", () => {
     await clickSessionCard(user, DEFAULT_SESSION_NAME, sessionsPanel);
 
     await screen.findByText(/termd-e2e-ready/);
+    expect(screen.queryByLabelText("session operators")).toBeNull();
     await user.click(screen.getByRole("button", { name: "Open mobile workspace menu" }));
     const secondMenu = await screen.findByRole("navigation", { name: "mobile workspace menu" });
     expect(within(secondMenu).getByRole("button", { name: "Files" })).toBeEnabled();
@@ -1439,7 +1456,29 @@ describe("termui web 工作台", () => {
 
     expect(await screen.findByRole("dialog", { name: "Scan pairing QR" })).toBeInTheDocument();
     await waitFor(() => expect(qrScannerMock.start).toHaveBeenCalledTimes(1));
-    await screen.findByText("Scanning");
+    await screen.findByText(/Scanning/);
+  });
+
+  it("扫码器在 iPhone Safari 上使用全画面扫描区域提高终端二维码识别率", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "Scan QR" }));
+    await waitFor(() => expect(qrScannerMock.start).toHaveBeenCalledTimes(1));
+
+    const video = document.createElement("video");
+    Object.defineProperty(video, "videoWidth", { configurable: true, value: 1920 });
+    Object.defineProperty(video, "videoHeight", { configurable: true, value: 1080 });
+
+    expect(qrScannerMock.options?.calculateScanRegion?.(video)).toEqual({
+      x: 0,
+      y: 0,
+      width: 1920,
+      height: 1080,
+      downScaledWidth: 960,
+      downScaledHeight: 540,
+    });
+    expect(await screen.findByText(/Fill the frame/)).toBeInTheDocument();
   });
 
   it("扫码界面关闭时释放摄像头 scanner", async () => {

@@ -75,7 +75,8 @@ export default function App() {
   const [renamingSessionId, setRenamingSessionId] = useState<UUID | undefined>();
   const [renameDraft, setRenameDraft] = useState("");
   const [renameOriginalName, setRenameOriginalName] = useState("");
-  const [terminalChunks, setTerminalChunks] = useState<string[]>([]);
+  const [terminalOutputVersion, setTerminalOutputVersion] = useState(0);
+  const [terminalOutputResetVersion, setTerminalOutputResetVersion] = useState(0);
   const [terminalFocusRequest, setTerminalFocusRequest] = useState(0);
   const [sessionFiles, setSessionFiles] = useState<SessionFilesResultPayload | undefined>();
   const [sessionFilesLoading, setSessionFilesLoading] = useState(false);
@@ -109,6 +110,8 @@ export default function App() {
   const autoCheckedServerRef = useRef<UUID | undefined>(undefined);
   const lastCursorReportRef = useRef("");
   const cursorRefreshTimerRef = useRef<number | undefined>(undefined);
+  const terminalOutputQueueRef = useRef<string[]>([]);
+  const terminalOutputResetVersionRef = useRef(0);
   const isMobileLayout = useMobileLayout();
 
   useEffect(() => {
@@ -275,6 +278,24 @@ export default function App() {
     setSessionFilesLoading(false);
   }, []);
 
+  const clearTerminalOutput = useCallback(() => {
+    // 终端输出由 xterm 自己维护 scrollback；React 只保留尚未写入 xterm 的短队列。
+    terminalOutputQueueRef.current = [];
+    terminalOutputResetVersionRef.current += 1;
+    setTerminalOutputResetVersion(terminalOutputResetVersionRef.current);
+  }, []);
+
+  const enqueueTerminalOutput = useCallback((chunk: string) => {
+    terminalOutputQueueRef.current.push(chunk);
+    setTerminalOutputVersion((version) => version + 1);
+  }, []);
+
+  const takeTerminalOutput = useCallback(() => {
+    const chunks = terminalOutputQueueRef.current;
+    terminalOutputQueueRef.current = [];
+    return chunks;
+  }, []);
+
   const disconnectAttach = useCallback(() => {
     receiveLoopActiveRef.current = false;
     attachClientRef.current?.close();
@@ -286,10 +307,11 @@ export default function App() {
       window.clearTimeout(cursorRefreshTimerRef.current);
       cursorRefreshTimerRef.current = undefined;
     }
+    clearTerminalOutput();
     clearSessionFiles();
     setMobilePanel(undefined);
     setMobileMenuOpen(false);
-  }, [clearSessionFiles]);
+  }, [clearSessionFiles, clearTerminalOutput]);
 
   const resetWorkspaceState = useCallback(() => {
     setSessions([]);
@@ -299,10 +321,10 @@ export default function App() {
     setRenamingSessionId(undefined);
     setRenameDraft("");
     setRenameOriginalName("");
-    setTerminalChunks([]);
+    clearTerminalOutput();
     clearSessionFiles();
     autoCheckedServerRef.current = undefined;
-  }, [clearSessionFiles]);
+  }, [clearSessionFiles, clearTerminalOutput]);
 
   const handleStartDaemonRename = useCallback(
     (serverId: UUID) => {
@@ -402,7 +424,7 @@ export default function App() {
       setRenamingSessionId(undefined);
       setRenameDraft("");
       setRenameOriginalName("");
-      setTerminalChunks([]);
+      clearTerminalOutput();
       setMobilePanel(undefined);
       setMobileMenuOpen(false);
       disconnectAttach();
@@ -416,7 +438,7 @@ export default function App() {
       setPairingToken("");
       setSafeError(caught);
     }
-  }, [activeServer, disconnectAttach, pairingToken, setSafeError, url]);
+  }, [activeServer, clearTerminalOutput, disconnectAttach, pairingToken, setSafeError, url]);
 
   const handleQrDetected = useCallback(
     (value: string) => {
@@ -464,7 +486,7 @@ export default function App() {
       setRenamingSessionId(undefined);
       setRenameDraft("");
       setRenameOriginalName("");
-      setTerminalChunks([]);
+      clearTerminalOutput();
       setConnectionEditorOpen(false);
       autoCheckedServerRef.current = undefined;
       setActiveSurface("workspace");
@@ -475,7 +497,7 @@ export default function App() {
     } finally {
       client?.close();
     }
-  }, [activeServer, disconnectAttach, setSafeError, state.device, url]);
+  }, [activeServer, clearTerminalOutput, disconnectAttach, setSafeError, state.device, url]);
 
   const handleSelectServer = useCallback(
     async (serverId: UUID) => {
@@ -493,7 +515,7 @@ export default function App() {
       setRenamingSessionId(undefined);
       setRenameDraft("");
       setRenameOriginalName("");
-      setTerminalChunks([]);
+      clearTerminalOutput();
       setMobilePanel(undefined);
       setMobileMenuOpen(false);
       autoCheckedServerRef.current = undefined;
@@ -504,7 +526,7 @@ export default function App() {
       setActiveSurface("admin");
       setStatus("idle");
     },
-    [activeServer?.server_id, disconnectAttach, state.pairedServers],
+    [activeServer?.server_id, clearTerminalOutput, disconnectAttach, state.pairedServers],
   );
 
   const authenticatedClient = useCallback(async () => {
@@ -612,7 +634,7 @@ export default function App() {
           const inner = await client.receiveInner();
           if (inner.type === "session_data") {
             const payload = inner.payload as { data_base64: string };
-            setTerminalChunks((chunks) => [...chunks, decodeUtf8(sessionDataFromBase64(payload.data_base64))]);
+            enqueueTerminalOutput(decodeUtf8(sessionDataFromBase64(payload.data_base64)));
           } else if (inner.type === "session_files_result") {
             const payload = inner.payload as SessionFilesResultPayload;
             // daemon 主动推送的文件树状态和当前 attach 的 session 对齐后才更新右侧 panel。
@@ -631,7 +653,7 @@ export default function App() {
       }
     };
     void read();
-  }, [setSafeError]);
+  }, [enqueueTerminalOutput, setSafeError]);
 
   const handleAttach = useCallback(
     async (sessionId: UUID) => {
@@ -646,7 +668,7 @@ export default function App() {
           return;
         }
         disconnectAttach();
-        setTerminalChunks([]);
+        clearTerminalOutput();
         const client = await authenticatedClient();
         await client.attachSession(sessionId);
         attachClientRef.current = client;
@@ -663,13 +685,13 @@ export default function App() {
         setSafeError(caught);
       }
     },
-    [authenticatedClient, disconnectAttach, loadSessionFiles, refreshDaemonClients, setSafeError, startReceiveLoop],
+    [authenticatedClient, clearTerminalOutput, disconnectAttach, loadSessionFiles, refreshDaemonClients, setSafeError, startReceiveLoop],
   );
 
   const handleCreateSession = useCallback(async () => {
     setError(undefined);
     disconnectAttach();
-    setTerminalChunks([]);
+    clearTerminalOutput();
     setStatus("creating");
     try {
       const client = await authenticatedClient();
@@ -692,7 +714,7 @@ export default function App() {
     } catch (caught) {
       setSafeError(caught);
     }
-  }, [authenticatedClient, disconnectAttach, loadSessionFiles, refreshDaemonClients, setSafeError, startReceiveLoop]);
+  }, [authenticatedClient, clearTerminalOutput, disconnectAttach, loadSessionFiles, refreshDaemonClients, setSafeError, startReceiveLoop]);
 
   const handleStartRename = useCallback((sessionId: UUID, currentName: string) => {
     renamingSessionIdRef.current = sessionId;
@@ -742,7 +764,7 @@ export default function App() {
         // 先断开本地 xterm attach 连接，再发关闭请求；否则 xterm 清理阶段的 cursor/resize
         // 可能在 daemon 已删除 session 后继续发送，导致页面错误地显示 session_not_found。
         disconnectAttach();
-        setTerminalChunks([]);
+        clearTerminalOutput();
       }
       let client: DirectClient | undefined;
       try {
@@ -779,6 +801,7 @@ export default function App() {
     [
       authenticatedClient,
       clearSessionFiles,
+      clearTerminalOutput,
       disconnectAttach,
       isIgnoredClosingSessionNotFound,
       refreshDaemonClients,
@@ -1260,14 +1283,14 @@ export default function App() {
             <span>{toolbarSessionName}</span>
             {toolbarSessionSize ? <small>{toolbarSessionSize}</small> : null}
           </div>
-          {connectionReady && attachedSessionId ? (
+          {connectionReady && attachedSessionId && !isMobileLayout ? (
             <SessionOperatorsBar
               operators={sessionOperators}
               currentDeviceId={state.device?.device_id}
               sessionId={attachedSessionId}
             />
           ) : null}
-          {connectionReady ? (
+          {connectionReady && !isMobileLayout ? (
             <div className="toolbar-actions">
               <button
                 type="button"
@@ -1316,10 +1339,12 @@ export default function App() {
           {connectionReady ? (
             <>
               <TerminalPane
-                chunks={terminalChunks}
                 attached={Boolean(attachedSessionId)}
                 sessionSize={attachedSession?.size}
                 focusRequest={terminalFocusRequest}
+                outputVersion={terminalOutputVersion}
+                outputResetVersion={terminalOutputResetVersion}
+                takeOutput={takeTerminalOutput}
                 onInput={handleTerminalInput}
                 onResize={handleResize}
                 onCursorChange={handleCursorChange}
