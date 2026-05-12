@@ -6,6 +6,7 @@ import {
   verifyEd25519Signature,
 } from "../protocol/auth";
 import { E2eeSession, generateE2eeKeyPair, type E2eeKeyPair } from "../protocol/e2ee";
+import { fallbackSessionDisplayName } from "../session-names";
 import type {
   DaemonClientSummaryPayload,
   E2eeKeyExchangePayload,
@@ -40,12 +41,18 @@ interface MockDaemonOptions {
   token: string;
   sessions: Array<SessionSummaryPayload & { name?: string | null }>;
   attachOutput?: string;
+  routePreludeError?: ErrorPayload;
   pairFailure?: ErrorPayload;
   sessionDataError?: ErrorPayload;
   daemonClients?: DaemonClientSummaryPayload[];
   sessionFiles?: Record<UUID, SessionFilesResultPayload>;
   sessionFileReads?: Record<string, SessionFileReadResultPayload>;
   relayClientPathOnly?: boolean;
+}
+
+interface QueuedSessionListResponse {
+  sessions: SessionSummaryPayload[];
+  delayMs: number;
 }
 
 interface TrustedDevice {
@@ -79,6 +86,7 @@ export class MockDaemon {
   public readonly decryptedInputs: string[] = [];
   public nextAttachRole = "operator" as const;
   private createdSessionCounter = 0;
+  private readonly queuedSessionListResponses: QueuedSessionListResponse[] = [];
   private readonly e2eeKeypair: E2eeKeyPair;
   private readonly trustedDevices = new Map<UUID, TrustedDevice>();
   private readonly connections = new Set<MockConnection>();
@@ -108,6 +116,15 @@ export class MockDaemon {
 
   outerWireText(): string {
     return this.outerWireLog.join("\n");
+  }
+
+  forgetSession(sessionId: UUID): void {
+    this.options.sessions = this.options.sessions.filter((session) => session.session_id !== sessionId);
+  }
+
+  queueSessionListResponse(sessions: SessionSummaryPayload[], delayMs = 0): void {
+    // 用一次性响应模拟“旧请求稍后返回”的真实浏览器竞态。
+    this.queuedSessionListResponses.push({ sessions, delayMs });
   }
 
   pushSessionFiles(files: SessionFilesResultPayload): void {
@@ -196,6 +213,12 @@ export class MockDaemon {
       return;
     }
 
+    if (this.options.routePreludeError) {
+      // 模拟 daemon/relay 在 E2EE 建立前直接返回外层 error envelope 的失败路径。
+      this.sendError(connection, this.options.routePreludeError.code, this.options.routePreludeError.message);
+      return;
+    }
+
     connection.routed = true;
     this.sendOuter(
       connection.socket,
@@ -234,9 +257,20 @@ export class MockDaemon {
       case "auth":
         await this.handleAuth(connection, inner.payload as Record<string, unknown>);
         return;
-      case "session_list":
-        this.sendInner(connection, envelope("session_list_result", { sessions: this.options.sessions }));
+      case "client_hello":
+        this.handleClientHello(connection, inner.payload as { name: string });
         return;
+      case "session_list": {
+        const queued = this.queuedSessionListResponses.shift();
+        if (queued?.delayMs) {
+          await new Promise((resolve) => setTimeout(resolve, queued.delayMs));
+        }
+        this.sendInner(
+          connection,
+          envelope("session_list_result", { sessions: queued?.sessions ?? this.options.sessions }),
+        );
+        return;
+      }
       case "daemon_clients": {
         this.sendInner(
           connection,
@@ -244,6 +278,20 @@ export class MockDaemon {
             clients: this.options.daemonClients ?? [],
           }),
         );
+        return;
+      }
+      case "daemon_client_forget": {
+        const payload = inner.payload as { device_id: UUID };
+        const client = this.options.daemonClients?.find((candidate) => candidate.device_id === payload.device_id);
+        if (client?.online) {
+          this.sendError(connection, "invalid_state", "invalid protocol state");
+          return;
+        }
+        // daemon 端删除离线客户端是幂等操作；测试桩也保持一致，覆盖连点删除的竞态。
+        this.options.daemonClients = this.options.daemonClients?.filter(
+          (candidate) => candidate.device_id !== payload.device_id,
+        );
+        this.sendInner(connection, envelope("daemon_client_forgot", payload));
         return;
       }
       case "session_create":
@@ -305,6 +353,11 @@ export class MockDaemon {
       }
       case "session_close": {
         const payload = inner.payload as { session_id: UUID };
+        const sessionExists = this.options.sessions.some((session) => session.session_id === payload.session_id);
+        if (!sessionExists) {
+          this.sendError(connection, "session_not_found", "session was not found");
+          return;
+        }
         this.closedSessions.push(payload.session_id);
         this.options.sessions = this.options.sessions.filter((session) => session.session_id !== payload.session_id);
         this.sendInner(connection, envelope("session_closed", payload));
@@ -395,8 +448,10 @@ export class MockDaemon {
     this.createdCommands.push(payload.command);
     this.createdSessionCounter += 1;
     const sessionId = `00000000-0000-0000-0000-${String(500 + this.createdSessionCounter).padStart(12, "0")}`;
+    const name = fallbackSessionDisplayName(sessionId);
     const created = {
       session_id: sessionId,
+      name,
       role: this.nextAttachRole,
       state: "running",
       size: payload.size,
@@ -405,8 +460,10 @@ export class MockDaemon {
     // mock daemon 模拟真实 daemon：session_create 会立刻 attach 当前连接。
     this.options.sessions.unshift({
       session_id: created.session_id,
+      name,
       state: created.state,
       size: created.size,
+      created_at_ms: nowMs(),
     });
     this.sendInner(connection, envelope("session_created", created));
     if (this.options.attachOutput) {
@@ -417,6 +474,16 @@ export class MockDaemon {
           data_base64: sessionDataToBase64(new TextEncoder().encode(this.options.attachOutput)),
         }),
       );
+    }
+  }
+
+  private handleClientHello(connection: MockConnection, payload: { name: string }): void {
+    if (!connection.deviceId) {
+      return;
+    }
+    const client = this.options.daemonClients?.find((candidate) => candidate.device_id === connection.deviceId);
+    if (client) {
+      client.name = payload.name;
     }
   }
 

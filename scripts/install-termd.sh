@@ -18,15 +18,18 @@ WRAPPER_FILE="${WRAPPER_DIR}/termd-run"
 UNIT_FILE="/etc/systemd/system/termd.service"
 SERVICE_USER="termd"
 SERVICE_GROUP="termd"
+SERVICE_GROUP_FROM_UNIT=0
 SERVICE_HOME=""
 SERVICE_SHELL=""
-STATE_DIR=""
+STATE_DIR="/var/lib/termd"
+PREVIOUS_STATE_DIR=""
 INSTALL_SET_LISTEN=0
 INSTALL_SET_WEB=0
 INSTALL_SET_RELAY_URLS=0
 INSTALL_SET_RELAY_AUTH_TOKEN=0
 INSTALL_SET_TLS_CERT=0
 INSTALL_SET_TLS_KEY=0
+INSTALL_SET_USER=0
 ACTION="install"
 PURGE_STATE=0
 LOG_EMITTED=0
@@ -69,7 +72,7 @@ Options:
   --relay-auth-token <TOKEN>    Set relay transport auth token.
   --tls-cert <PATH>             Set TLS certificate path.
   --tls-key <PATH>              Set TLS private key path.
-  --user <USER>                 Run termd.service as this Linux user; default: termd.
+  --user <USER>                 Run termd.service as this Linux user; default: existing service user, then termd.
   --uninstall                   Stop service and remove termd program files.
   --purge                       Implies --uninstall; also remove /var/lib/termd and system user.
   -h, --help                    Print this help.
@@ -150,6 +153,8 @@ parse_args() {
         [[ $# -ge 2 && -n "$2" ]] || die "--user requires a non-empty value"
         SERVICE_USER="$2"
         SERVICE_GROUP="$2"
+        SERVICE_GROUP_FROM_UNIT=0
+        INSTALL_SET_USER=1
         shift 2
         ;;
       --uninstall)
@@ -166,6 +171,49 @@ parse_args() {
         ;;
     esac
   done
+}
+
+read_systemd_unit_assignment() {
+  local key="$1"
+  local file="$2"
+
+  [[ -r "$file" ]] || return 0
+  awk -F= -v key="$key" '
+    $1 == key {
+      value = substr($0, length(key) + 2)
+      gsub(/^[ \t]+|[ \t]+$/, "", value)
+      print value
+      exit
+    }
+  ' "$file"
+}
+
+inherit_existing_service_identity() {
+  if [[ "$INSTALL_SET_USER" -eq 1 || ! -e "$UNIT_FILE" ]]; then
+    return 0
+  fi
+
+  local existing_user existing_group existing_working_directory
+  existing_user="$(read_systemd_unit_assignment "User" "$UNIT_FILE")"
+  existing_group="$(read_systemd_unit_assignment "Group" "$UNIT_FILE")"
+  existing_working_directory="$(read_systemd_unit_assignment "WorkingDirectory" "$UNIT_FILE")"
+
+  if [[ -n "$existing_user" ]]; then
+    # 重装/升级时不带 --user 应保留既有 systemd User，避免把个人账号服务重写成 termd。
+    SERVICE_USER="$existing_user"
+    if [[ -n "$existing_group" ]]; then
+      # 既有 unit 显式写了 Group 时要一起继承，后续账号解析不能再改成用户主组。
+      SERVICE_GROUP="$existing_group"
+      SERVICE_GROUP_FROM_UNIT=1
+    else
+      SERVICE_GROUP="$existing_user"
+      SERVICE_GROUP_FROM_UNIT=0
+    fi
+  fi
+
+  if [[ -n "$existing_working_directory" ]]; then
+    PREVIOUS_STATE_DIR="$existing_working_directory"
+  fi
 }
 
 detect_arch() {
@@ -322,6 +370,12 @@ apply_env_overrides() {
   fi
 }
 
+apply_service_env_defaults() {
+  # HOME/SHELL 由 daemon 的 systemd 运行身份决定，始终写进 env 文件，避免 unit 和 env 文件各自维护。
+  upsert_env_var "HOME" "$SERVICE_HOME"
+  upsert_env_var "SHELL" "$SERVICE_SHELL"
+}
+
 resolve_service_identity() {
   [[ "$SERVICE_USER" =~ ^[A-Za-z_][A-Za-z0-9_.-]*[$]?$ ]] || die "invalid --user value: ${SERVICE_USER}"
 
@@ -329,7 +383,12 @@ resolve_service_identity() {
     local passwd_entry primary_group
     primary_group="$(id -gn "$SERVICE_USER")"
     passwd_entry="$(getent passwd "$SERVICE_USER")"
-    SERVICE_GROUP="$primary_group"
+    if [[ "$SERVICE_GROUP_FROM_UNIT" -eq 1 ]]; then
+      [[ "$SERVICE_GROUP" =~ ^[A-Za-z_][A-Za-z0-9_.-]*[$]?$ ]] || die "invalid Group value in existing service: ${SERVICE_GROUP}"
+      getent group "$SERVICE_GROUP" >/dev/null 2>&1 || die "system group ${SERVICE_GROUP} from existing service does not exist"
+    else
+      SERVICE_GROUP="$primary_group"
+    fi
     SERVICE_HOME="$(printf '%s' "$passwd_entry" | cut -d: -f6)"
     SERVICE_SHELL="$(printf '%s' "$passwd_entry" | cut -d: -f7)"
   else
@@ -343,10 +402,9 @@ resolve_service_identity() {
 
   [[ -n "$SERVICE_HOME" ]] || SERVICE_HOME="/var/lib/${SERVICE_USER}"
   [[ -n "$SERVICE_SHELL" && "$SERVICE_SHELL" != "/usr/sbin/nologin" && "$SERVICE_SHELL" != "/sbin/nologin" ]] || SERVICE_SHELL="/bin/sh"
-  STATE_DIR="$SERVICE_HOME/.local/share/termd"
-  if [[ "$SERVICE_USER" == "termd" ]]; then
-    STATE_DIR="/var/lib/termd"
-  fi
+  # daemon state、SQLite 和 supervisor socket 路径必须稳定；--user 只影响 shell 的 HOME/SHELL，
+  # 不再改变持久化根目录，避免升级或切换用户后丢失/错连会话状态。
+  STATE_DIR="/var/lib/termd"
 }
 
 write_env_file() {
@@ -355,6 +413,7 @@ write_env_file() {
 
   if [[ -e "$ENV_FILE" ]]; then
     log "keeping existing env file at ${ENV_FILE}"
+    apply_service_env_defaults
     apply_env_overrides
     chown root:"$SERVICE_GROUP" "$ENV_FILE"
     chmod 0640 "$ENV_FILE"
@@ -364,6 +423,8 @@ write_env_file() {
   {
     printf '# 这个文件由安装脚本创建，systemd wrapper 会读取它。\n'
     printf '# 需要 relay、TLS、Web 或自定义监听时，取消注释并修改对应变量。\n'
+    printf 'HOME=%q\n' "$SERVICE_HOME"
+    printf 'SHELL=%q\n' "$SERVICE_SHELL"
     printf 'TERMD_LISTEN=%q\n' "${TERMD_LISTEN:-127.0.0.1:8765}"
     printf 'TERMD_WEB_ENABLED=%q\n' "${TERMD_WEB_ENABLED:-0}"
     if [[ -n "${TERMD_RELAY_URLS:-}" ]]; then
@@ -387,6 +448,7 @@ write_env_file() {
       printf '# TERMD_TLS_KEY=/etc/termd/privkey.pem\n'
     fi
   } >"$ENV_FILE"
+  apply_env_overrides
   chown root:"$SERVICE_GROUP" "$ENV_FILE"
   chmod 0640 "$ENV_FILE"
 }
@@ -462,8 +524,7 @@ Type=simple
 User=${SERVICE_USER}
 Group=${SERVICE_GROUP}
 WorkingDirectory=${STATE_DIR}
-Environment=HOME=${SERVICE_HOME}
-Environment=SHELL=${SERVICE_SHELL}
+EnvironmentFile=-${ENV_FILE}
 ExecStart=${WRAPPER_FILE}
 Restart=always
 RestartSec=2
@@ -614,6 +675,57 @@ ensure_system_user() {
     SERVICE_GROUP="$SERVICE_USER"
   fi
   install -d -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 0750 "$STATE_DIR"
+  chown_state_dir
+}
+
+chown_state_dir() {
+  # 切换 --user 时服务进程也必须能读写同一套 daemon identity、SQLite 和 supervisor socket 目录。
+  chown -R "$SERVICE_USER:$SERVICE_GROUP" "$STATE_DIR"
+  chmod 0750 "$STATE_DIR"
+}
+
+clear_session_state_after_state_dir_change() {
+  if [[ -z "$PREVIOUS_STATE_DIR" || "$PREVIOUS_STATE_DIR" == "$STATE_DIR" ]]; then
+    return 0
+  fi
+
+  log "using fixed state directory ${STATE_DIR}; previous WorkingDirectory was ${PREVIOUS_STATE_DIR}"
+  log "clearing stale session metadata in ${STATE_DIR}; pairing identity and trusted devices are preserved"
+
+  local sqlite_path supervisor_dir
+  sqlite_path="${STATE_DIR}/daemon-state.sqlite"
+  supervisor_dir="${STATE_DIR}/termd-supervisors"
+
+  if [[ -f "$sqlite_path" ]]; then
+    python3 - "$sqlite_path" <<'PY'
+import sqlite3
+import sys
+
+path = sys.argv[1]
+conn = sqlite3.connect(path)
+try:
+    tables = {
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )
+    }
+    for table in (
+        "daemon_client_attached_sessions",
+        "daemon_sessions",
+        "runtime_sessions",
+    ):
+        if table in tables:
+            conn.execute(f"DELETE FROM {table}")
+    conn.commit()
+finally:
+    conn.close()
+PY
+  fi
+
+  if [[ -d "$supervisor_dir" ]]; then
+    find "$supervisor_dir" -maxdepth 1 -type s -delete
+  fi
 }
 
 uninstall_component() {
@@ -653,6 +765,7 @@ uninstall_component() {
 main() {
   parse_args "$@"
   require_root
+  inherit_existing_service_identity
   if [[ "$ACTION" == "uninstall" ]]; then
     resolve_service_identity
     uninstall_component
@@ -676,6 +789,8 @@ main() {
   fi
 
   ensure_system_user
+  clear_session_state_after_state_dir_change
+  chown_state_dir
   write_env_file
   # 重新读取最终 env，保证后续 wrapper 和初始 pairing token 都使用同一组监听/TLS 配置。
   # shellcheck source=/dev/null

@@ -14,11 +14,13 @@ const MIN_FOCUSED_RESIZE_COLS = 20;
 const VIEWER_ZOOM_STEP = 0.1;
 const VIEWER_MIN_ZOOM = 0.5;
 const VIEWER_MAX_ZOOM = 1.4;
+type ResizeSource = "layout" | "focus" | "viewer";
 
 interface TerminalPaneProps {
   chunks: string[];
   attached: boolean;
   sessionSize?: TerminalSize;
+  focusRequest?: number;
   onInput: (data: string) => void;
   onResize: (size: TerminalSize) => void;
   onCursorChange?: (presence: SessionCursorPresence) => void;
@@ -37,9 +39,14 @@ export function TerminalPane(props: TerminalPaneProps) {
   const onCursorChangeRef = useRef(props.onCursorChange);
   const sessionSizeRef = useRef(props.sessionSize);
   const viewerScaleRef = useRef(1);
-  const resizeRef = useRef<(() => void) | undefined>(undefined);
+  const resizeRef = useRef<((source?: ResizeSource) => void) | undefined>(undefined);
+  const stabilizeRef = useRef<((source?: ResizeSource) => void) | undefined>(undefined);
   const cursorFrameRef = useRef<number | undefined>(undefined);
   const focusedRef = useRef(false);
+  const clientSizeRef = useRef<TerminalSize | undefined>(undefined);
+  const viewerModeRef = useRef(false);
+  const focusActivationArmedRef = useRef(false);
+  const suppressPassiveFocusRef = useRef(false);
   const currentFontSizeRef = useRef(TERMINAL_FONT_SIZE);
   const [clientSize, setClientSize] = useState<TerminalSize | undefined>(undefined);
   const [focused, setFocused] = useState(false);
@@ -86,18 +93,18 @@ export function TerminalPane(props: TerminalPaneProps) {
   useEffect(() => {
     viewerScaleRef.current = viewerScale;
     if (!focusedRef.current) {
-      resizeRef.current?.();
+      resizeRef.current?.("viewer");
     }
   }, [viewerScale]);
 
   useEffect(() => {
-    resizeRef.current?.();
+    resizeRef.current?.(focused ? "focus" : "layout");
   }, [focused]);
 
   useEffect(() => {
     sessionSizeRef.current = props.sessionSize;
     if (!focusedRef.current) {
-      resizeRef.current?.();
+      resizeRef.current?.("viewer");
     }
   }, [props.sessionSize?.cols, props.sessionSize?.pixel_height, props.sessionSize?.pixel_width, props.sessionSize?.rows]);
 
@@ -132,12 +139,23 @@ export function TerminalPane(props: TerminalPaneProps) {
     terminal.options = { fontSize };
   };
 
+  const armFocusFromXtermPointer = (event: MouseEvent<HTMLDivElement>) => {
+    const target = event.target instanceof Element ? event.target : null;
+    if (!target?.closest(".xterm")) {
+      return;
+    }
+    // 只有用户明确点到真实 xterm 区域时，才允许从 viewer 状态重新接管 PTY 尺寸。
+    focusActivationArmedRef.current = true;
+    suppressPassiveFocusRef.current = false;
+  };
+
   const focusTerminalFromXtermClick = (event: MouseEvent<HTMLDivElement>) => {
     const target = event.target instanceof Element ? event.target : null;
     if (!target?.closest(".xterm")) {
       return;
     }
     terminalRef.current?.focus();
+    resizeRef.current?.("focus");
   };
 
   useEffect(() => {
@@ -164,6 +182,15 @@ export function TerminalPane(props: TerminalPaneProps) {
     terminal.loadAddon(fit);
     terminal.open(hostRef.current);
     const host = hostRef.current;
+    const scheduledFrames = new Set<number>();
+    const requestTrackedFrame = (callback: () => void) => {
+      const frame = window.requestAnimationFrame(() => {
+        scheduledFrames.delete(frame);
+        callback();
+      });
+      scheduledFrames.add(frame);
+      return frame;
+    };
     const dataSubscription = terminal.onData((data) => {
       onInputRef.current(data);
     });
@@ -171,38 +198,71 @@ export function TerminalPane(props: TerminalPaneProps) {
     const writeParsedSubscription = terminal.onWriteParsed(queueCursorReport);
     // 本地 xterm 始终适配当前容器；只有聚焦客户端才把尺寸写回 shared PTY。
     // 未聚焦客户端按 session 的远端 rows/cols 渲染，外层 viewer panel 负责缩放与滚动。
-    const resize = () => {
+    const resize = (source: ResizeSource = "layout") => {
       const terminalHost = hostRef.current;
       if (!terminalHost) {
         return;
       }
-      const proposed = fit.proposeDimensions();
-      const hostWidth = terminalHost.clientWidth;
-      const hostHeight = terminalHost.clientHeight;
+      let proposed = fit.proposeDimensions();
+      let hostWidth = terminalHost.clientWidth;
+      let hostHeight = terminalHost.clientHeight;
+      const remoteSize = sessionSizeRef.current;
+      const hostIsRemoteViewerFrame =
+        !focusedRef.current &&
+        viewerModeRef.current &&
+        Boolean(
+          remoteSize &&
+            proposed &&
+            remoteSize.rows === proposed.rows &&
+            remoteSize.cols === proposed.cols,
+        );
+      if (hostIsRemoteViewerFrame && clientSizeRef.current) {
+        // viewer 模式下真实 xterm host 会被远端 PTY frame 框住；这时 FitAddon 测到的是
+        // 远端画布尺寸，不是浏览器当前可容纳尺寸。继续使用上一轮本地测量值，避免
+        // “测到远端尺寸 -> 关闭 viewer -> 又测到本地尺寸 -> 打开 viewer” 的振荡。
+        proposed = { rows: clientSizeRef.current.rows, cols: clientSizeRef.current.cols };
+        hostWidth = clientSizeRef.current.pixel_width;
+        hostHeight = clientSizeRef.current.pixel_height;
+      }
       if (proposed) {
+        const nextClientSize = {
+          rows: proposed.rows,
+          cols: proposed.cols,
+          pixel_width: hostWidth,
+          pixel_height: hostHeight,
+        };
+        clientSizeRef.current = nextClientSize;
         setClientSize((current) =>
           current &&
-          current.cols === proposed.cols &&
-          current.rows === proposed.rows &&
-          current.pixel_width === hostWidth &&
-          current.pixel_height === hostHeight
+          current.cols === nextClientSize.cols &&
+          current.rows === nextClientSize.rows &&
+          current.pixel_width === nextClientSize.pixel_width &&
+          current.pixel_height === nextClientSize.pixel_height
             ? current
-            : {
-                rows: proposed.rows,
-                cols: proposed.cols,
-                pixel_width: hostWidth,
-                pixel_height: hostHeight,
-              },
+            : nextClientSize,
         );
       }
+      const mismatch =
+        Boolean(
+          remoteSize &&
+            proposed &&
+            (remoteSize.rows !== proposed.rows || remoteSize.cols !== proposed.cols),
+        );
+      if (focusedRef.current && source !== "focus" && mismatch) {
+        // 浏览器窗口 resize 或外层布局变化不是用户主动接管终端；一旦本地可容纳尺寸
+        // 和当前 PTY 尺寸不一致，就退回 viewer，避免 focus/blur 与 session_resize 来回振荡。
+        focusActivationArmedRef.current = false;
+        suppressPassiveFocusRef.current = true;
+        focusedRef.current = false;
+        setFocused(false);
+        const activeElement = document.activeElement;
+        if (activeElement instanceof HTMLElement && terminalHost.contains(activeElement)) {
+          activeElement.blur();
+        }
+        queueCursorReport();
+      }
+      viewerModeRef.current = !focusedRef.current && mismatch;
       if (!focusedRef.current) {
-        const remoteSize = sessionSizeRef.current;
-        const mismatch =
-          Boolean(
-            remoteSize &&
-              proposed &&
-              (remoteSize.rows !== proposed.rows || remoteSize.cols !== proposed.cols),
-          );
         applyFontSize(terminal, mismatch ? fontSizeForScale(viewerScaleRef.current) : TERMINAL_FONT_SIZE);
         if (remoteSize) {
           terminal.resize(remoteSize.cols, remoteSize.rows);
@@ -214,6 +274,7 @@ export function TerminalPane(props: TerminalPaneProps) {
       // 移动端软键盘或外层 grid 短暂重排时可能把 xterm 容器压到 0 高。
       // 这种尺寸不能写回 shared PTY，否则其他客户端会被同步成一行终端。
       if (proposed && proposed.rows >= MIN_FOCUSED_RESIZE_ROWS && proposed.cols >= MIN_FOCUSED_RESIZE_COLS) {
+        viewerModeRef.current = false;
         fit.fit();
         onResizeRef.current({
           rows: proposed.rows,
@@ -225,13 +286,43 @@ export function TerminalPane(props: TerminalPaneProps) {
       }
     };
     resizeRef.current = resize;
+    const refreshTerminal = (source: ResizeSource = "layout") => {
+      resize(source);
+      terminal.refresh(0, Math.max(0, terminal.rows - 1));
+    };
+    const stabilizeTerminal = (source: ResizeSource = "layout") => {
+      // xterm 在 CSS grid / 右侧文件 panel 同步变化时可能先按旧尺寸完成 open/write。
+      // 连续两帧刷新可以等浏览器完成布局后再重算 viewport，避免用户必须额外点击才正常显示。
+      requestTrackedFrame(() => {
+        refreshTerminal(source);
+        requestTrackedFrame(() => refreshTerminal(source));
+      });
+    };
+    stabilizeRef.current = stabilizeTerminal;
     const reportFocus = (focused: boolean) => {
       focusedRef.current = focused;
       setFocused(focused);
       queueCursorReport();
     };
-    const handleFocusIn = () => reportFocus(true);
-    const handleFocusOut = () => reportFocus(false);
+    const handleFocusIn = () => {
+      if (suppressPassiveFocusRef.current && !focusActivationArmedRef.current) {
+        focusedRef.current = false;
+        setFocused(false);
+        const activeElement = document.activeElement;
+        if (activeElement instanceof HTMLElement && host.contains(activeElement)) {
+          activeElement.blur();
+        }
+        queueCursorReport();
+        return;
+      }
+      focusActivationArmedRef.current = false;
+      suppressPassiveFocusRef.current = false;
+      reportFocus(true);
+    };
+    const handleFocusOut = () => {
+      focusActivationArmedRef.current = false;
+      reportFocus(false);
+    };
     host.addEventListener("focusin", handleFocusIn);
     host.addEventListener("focusout", handleFocusOut);
     terminalRef.current = terminal;
@@ -245,16 +336,31 @@ export function TerminalPane(props: TerminalPaneProps) {
     queueCursorReport();
 
     // 初次 attach 只做本地 fit；用户聚焦该终端时才接管 shared PTY 的远端尺寸。
-    const frame = window.requestAnimationFrame(resize);
-    window.addEventListener("resize", resize);
+    stabilizeTerminal();
+    const handleWindowResize = () => resize("layout");
+    window.addEventListener("resize", handleWindowResize);
+    const resizeObserver =
+      typeof ResizeObserver === "undefined"
+        ? undefined
+        : new ResizeObserver(() => {
+            stabilizeTerminal("layout");
+          });
+    resizeObserver?.observe(host);
+    if (scrollportRef.current) {
+      resizeObserver?.observe(scrollportRef.current);
+    }
 
     return () => {
-      window.cancelAnimationFrame(frame);
+      for (const frame of scheduledFrames) {
+        window.cancelAnimationFrame(frame);
+      }
+      scheduledFrames.clear();
       if (cursorFrameRef.current !== undefined) {
         window.cancelAnimationFrame(cursorFrameRef.current);
         cursorFrameRef.current = undefined;
       }
-      window.removeEventListener("resize", resize);
+      window.removeEventListener("resize", handleWindowResize);
+      resizeObserver?.disconnect();
       host.removeEventListener("focusin", handleFocusIn);
       host.removeEventListener("focusout", handleFocusOut);
       dataSubscription.dispose();
@@ -264,7 +370,12 @@ export function TerminalPane(props: TerminalPaneProps) {
       terminalRef.current = null;
       fitRef.current = null;
       resizeRef.current = undefined;
+      stabilizeRef.current = undefined;
       focusedRef.current = false;
+      clientSizeRef.current = undefined;
+      viewerModeRef.current = false;
+      focusActivationArmedRef.current = false;
+      suppressPassiveFocusRef.current = false;
       setFocused(false);
     };
   }, [props.attached]);
@@ -280,11 +391,32 @@ export function TerminalPane(props: TerminalPaneProps) {
       terminal.clear();
       writtenChunksRef.current = 0;
     }
+    let wroteChunk = false;
     for (let index = writtenChunksRef.current; index < props.chunks.length; index += 1) {
       terminal.write(props.chunks[index], queueCursorReport);
+      wroteChunk = true;
     }
     writtenChunksRef.current = props.chunks.length;
+    if (wroteChunk) {
+      stabilizeRef.current?.();
+    }
   }, [props.chunks]);
+
+  useEffect(() => {
+    if (!props.attached || !props.focusRequest || !terminalRef.current) {
+      return undefined;
+    }
+
+    // 新建 session 后要直接进入可输入状态；等一帧可以确保 xterm 已完成 open/fit，
+    // focusin 事件随后会关闭 viewer 虚线框，并由聚焦客户端上报真实 PTY 尺寸。
+    const frame = window.requestAnimationFrame(() => {
+      focusActivationArmedRef.current = true;
+      suppressPassiveFocusRef.current = false;
+      terminalRef.current?.focus();
+      stabilizeRef.current?.("focus");
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [props.attached, props.focusRequest]);
 
   return (
     <section
@@ -343,7 +475,12 @@ export function TerminalPane(props: TerminalPaneProps) {
       <div className="terminal-scrollport" ref={scrollportRef}>
         <div className="terminal-viewer-canvas" ref={canvasRef}>
           <div className="terminal-viewer-frame" ref={frameRef} style={viewerFrameStyle}>
-            <div className="terminal-host" ref={hostRef} onClick={focusTerminalFromXtermClick} />
+            <div
+              className="terminal-host"
+              ref={hostRef}
+              onMouseDown={armFocusFromXtermPointer}
+              onClick={focusTerminalFromXtermClick}
+            />
           </div>
         </div>
       </div>

@@ -192,6 +192,48 @@ label {
   overflow-wrap: anywhere;
 }
 
+.protocol-error-alert {
+  min-width: 0;
+  border: 1px solid #8f3d35;
+  border-radius: 8px;
+  background: #241412;
+  color: #ffd8d2;
+  display: grid;
+  gap: 8px;
+  padding: 10px 12px;
+}
+
+.protocol-error-alert-title {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #ffb3a7;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.protocol-error-alert-detail {
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  color: #f0c4bc;
+  font-size: 12px;
+}
+
+.protocol-error-alert-detail code {
+  flex: 0 0 auto;
+  color: #ffcc66;
+  font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+  font-size: 12px;
+}
+
+.protocol-error-alert-detail span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 .admin-grid {
   min-width: 0;
   display: grid;
@@ -231,7 +273,7 @@ label {
 }
 
 .brand-row,
-.toolbar-group {
+.toolbar-title {
   display: flex;
   align-items: center;
   gap: 8px;
@@ -256,15 +298,6 @@ label {
 
 .sidebar-collapse-toggle {
   margin-left: auto;
-}
-
-.clients-toggle {
-  flex: 0 0 auto;
-  margin-left: auto;
-}
-
-.sidebar-collapse-toggle + .clients-toggle {
-  margin-left: 0;
 }
 
 .clients-popover {
@@ -588,14 +621,10 @@ label {
 
 .session-row {
   width: 100%;
-  min-height: 118px;
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  grid-template-rows: minmax(0, 1fr) auto;
-  align-items: start;
+  min-height: 52px;
+  display: block;
   text-align: left;
-  gap: 6px 8px;
-  padding: 10px;
+  padding: 8px;
   border: 1px solid #405049;
   border-radius: 6px;
   background: #18231f;
@@ -612,6 +641,14 @@ label {
 .status-bar,
 .toolbar {
   font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+}
+
+.session-row-heading {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
 }
 
 .session-row strong {
@@ -636,25 +673,11 @@ label {
   overflow-wrap: anywhere;
 }
 
-.session-size {
-  justify-self: end;
-  white-space: nowrap;
-  font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
-}
-
 .session-actions {
-  grid-column: 1 / -1;
-  width: 100%;
-  align-self: end;
+  flex: 0 0 auto;
   display: flex;
   align-items: center;
   gap: 6px;
-  padding-top: 8px;
-  border-top: 1px solid #2b3934;
-}
-
-.session-actions-spacer {
-  flex: 1 1 auto;
 }
 
 .session-rename-form {
@@ -666,6 +689,7 @@ label {
 }
 
 .client-row {
+  grid-template-columns: minmax(0, 1fr) auto;
   border-top: 1px solid #27342f;
   padding-top: 8px;
   display: grid;
@@ -705,7 +729,14 @@ label {
 }
 
 .client-row-meta {
+  grid-column: 1;
   flex-wrap: wrap;
+}
+
+.client-forget-button {
+  grid-column: 2;
+  grid-row: 1 / span 2;
+  align-self: center;
 }
 
 .status-dot {
@@ -741,6 +772,27 @@ label {
   grid-template-columns: minmax(0, 1fr) 42px;
 }
 
+.workspace-body.has-error {
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
+.workspace-body.has-error > .protocol-error-alert {
+  grid-column: 1 / -1;
+  grid-row: 1;
+  margin: 10px;
+}
+
+.workspace-body.has-error > .terminal-pane,
+.workspace-body.has-error > .files-panel,
+.workspace-body.has-error > .files-resizer,
+.workspace-body.has-error > .files-rail {
+  grid-row: 2;
+}
+
+.workspace-body.has-error > .terminal-pane[aria-label="terminal unavailable"] {
+  grid-column: 1 / -1;
+}
+
 .toolbar {
   border-bottom: 1px solid #25312d;
   background: #111a17;
@@ -752,29 +804,56 @@ label {
   font-size: 12px;
 }
 
-.toolbar-group {
+.toolbar-title {
   min-width: 0;
-  max-width: 42vw;
+  max-width: 48vw;
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
-.toolbar-group span {
+.toolbar-title span {
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  color: #e4f4ed;
+  font-weight: 700;
 }
 
-.toolbar-admin-button {
+.toolbar-title small {
+  flex: 0 0 auto;
+  border: 1px solid #3b4b45;
+  border-radius: 999px;
+  padding: 2px 7px;
+  color: #9eb3aa;
+  background: #17211e;
+  font-size: 11px;
+  line-height: 1.2;
+}
+
+.toolbar-actions {
   flex: 0 0 auto;
   margin-left: auto;
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
-.toolbar-admin-button + .session-operators {
-  margin-left: 0;
+.toolbar-admin-button,
+.toolbar-clients-button {
+  flex: 0 0 auto;
+}
+
+.toolbar-clients-popover {
+  top: calc(100% + 8px);
+  right: 0;
 }
 
 .session-operators {
   min-width: 0;
-  margin-left: auto;
+  margin-left: 0;
   display: flex;
   align-items: center;
   justify-content: flex-end;
@@ -933,10 +1012,48 @@ label {
 .files-panel {
   min-width: 0;
   min-height: 0;
+  width: 100%;
   border-left: 1px solid #25312d;
   background: #0d1512;
   display: grid;
   grid-template-rows: 46px auto minmax(0, 1fr);
+}
+
+.files-resizer {
+  position: relative;
+  width: 10px;
+  min-width: 10px;
+  align-self: stretch;
+  cursor: col-resize;
+  touch-action: none;
+  user-select: none;
+}
+
+.files-resizer::before {
+  content: "";
+  position: absolute;
+  top: 10px;
+  bottom: 10px;
+  left: 50%;
+  width: 1px;
+  transform: translateX(-50%);
+  background: #2f4039;
+}
+
+.files-resizer:hover::before,
+.files-panel-resizing .files-resizer::before {
+  background: #d6ff5f;
+}
+
+.files-resizer:focus-visible {
+  outline: none;
+  box-shadow: inset 0 0 0 1px #d6ff5f;
+}
+
+.files-panel-resizing .terminal-pane,
+.files-panel-resizing .files-panel,
+.files-panel-resizing .files-resizer {
+  cursor: col-resize;
 }
 
 .files-panel-header {
@@ -1152,6 +1269,11 @@ label {
     align-items: stretch;
   }
 
+  .protocol-error-alert-detail {
+    display: grid;
+    gap: 5px;
+  }
+
   .admin-grid {
     grid-template-columns: 1fr;
     gap: 10px;
@@ -1224,7 +1346,7 @@ label {
     margin-left: 0;
   }
 
-  .toolbar-group {
+  .toolbar-title {
     max-width: 34vw;
   }
 
@@ -1349,7 +1471,7 @@ label {
   }
 
   .mobile-sessions-panel .session-row {
-    min-height: 110px;
+    min-height: 52px;
   }
 
   .mobile-files-panel .files-panel {

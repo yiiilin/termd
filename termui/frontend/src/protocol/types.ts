@@ -27,8 +27,11 @@ export const ALL_MESSAGE_TYPES = [
   "session_file_deleted",
   "session_list",
   "session_list_result",
+  "client_hello",
   "daemon_clients",
   "daemon_clients_result",
+  "daemon_client_forget",
+  "daemon_client_forgot",
   "control_request",
   "control_grant",
   "e2ee_key_exchange",
@@ -143,6 +146,7 @@ export interface SessionSummaryPayload {
   state: SessionState;
   size: TerminalSize;
   files_path?: string | null;
+  created_at_ms?: UnixTimestampMillis | null;
 }
 
 export interface SessionListResultPayload {
@@ -151,9 +155,14 @@ export interface SessionListResultPayload {
 
 export interface DaemonClientsPayload {}
 
+export interface ClientHelloPayload {
+  name: string;
+}
+
 export interface DaemonClientSummaryPayload {
   client_id: UUID;
   device_id: UUID;
+  name?: string | null;
   peer_ip: string | null;
   online: boolean;
   connected_at_ms: UnixTimestampMillis;
@@ -169,6 +178,14 @@ export interface DaemonClientsResultPayload {
   clients: DaemonClientSummaryPayload[];
 }
 
+export interface DaemonClientForgetPayload {
+  device_id: UUID;
+}
+
+export interface DaemonClientForgotPayload {
+  device_id: UUID;
+}
+
 export interface SessionCreatePayload {
   command: string[];
   size: TerminalSize;
@@ -176,6 +193,7 @@ export interface SessionCreatePayload {
 
 export interface SessionCreatedPayload {
   session_id: UUID;
+  name?: string | null;
   role: AttachRole;
   state: SessionState;
   size: TerminalSize;
@@ -305,6 +323,7 @@ export interface DeviceState {
   device_id: UUID;
   device_public_key: PublicKeyWire;
   device_signing_key_secret: string;
+  name?: string | null;
 }
 
 export interface PairedServerState {

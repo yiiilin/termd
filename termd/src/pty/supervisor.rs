@@ -17,7 +17,6 @@ use std::time::{Duration, Instant};
 
 use base64::{Engine as _, engine::general_purpose};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, mpsc as tokio_mpsc, watch};
@@ -538,16 +537,12 @@ fn fail_all_pending_requests(
 }
 
 fn supervisor_runtime_dir(state_path: &Path) -> PathBuf {
-    let mut hasher = Sha256::new();
-    hasher.update(state_path.to_string_lossy().as_bytes());
-    let digest = hasher.finalize();
-    let mut suffix = String::new();
-    for byte in digest.iter().take(8) {
-        suffix.push_str(&format!("{byte:02x}"));
-    }
-
     // 不能放在 /tmp：systemd 的 PrivateTmp 会让 daemon 重启后进入新的 /tmp 视图，
     // 老 session supervisor 还活着，但新 daemon 看不到它的 socket 文件。
+    //
+    // 目录也不能带 state_path 哈希后缀：安装后的 systemd 服务升级时如果工作目录曾发生过漂移，
+    // 同一台机器会留下多套 supervisor 目录，排查时容易出现 “systemctl 看得到进程，Web 看不到
+    // session” 的错觉。固定目录名让安装目录下的 supervisor 文件位置稳定、可预期。
     let base_dir = state_path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -555,7 +550,7 @@ fn supervisor_runtime_dir(state_path: &Path) -> PathBuf {
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(std::env::temp_dir);
 
-    base_dir.join(format!("termd-supervisors-{suffix}"))
+    base_dir.join("termd-supervisors")
 }
 
 fn discover_termd_binary_path() -> PathBuf {
@@ -989,6 +984,7 @@ fn invalid_data(error: impl std::fmt::Display) -> io::Error {
 mod tests {
     use super::*;
     use std::env;
+    use std::ffi::OsStr;
 
     #[test]
     fn supervisor_runtime_dir_uses_shared_base_directory_for_relative_state_paths() {
@@ -997,6 +993,10 @@ mod tests {
         let runtime_dir = supervisor_runtime_dir(Path::new("daemon-state.json"));
 
         assert_eq!(runtime_dir.parent(), Some(current_dir.as_path()));
+        assert_eq!(
+            runtime_dir.file_name(),
+            Some(OsStr::new("termd-supervisors"))
+        );
     }
 
     #[test]
@@ -1004,6 +1004,7 @@ mod tests {
         let runtime_dir = supervisor_runtime_dir(Path::new("/var/lib/termd/daemon-state.json"));
 
         assert_eq!(runtime_dir.parent(), Some(Path::new("/var/lib/termd")));
+        assert_eq!(runtime_dir, Path::new("/var/lib/termd/termd-supervisors"));
     }
 }
 

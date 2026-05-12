@@ -10,6 +10,10 @@ import App, {
 import type { SessionFilesResultPayload } from "../protocol/types";
 import { clearBrowserState } from "../state/browser-state";
 import { MockDaemon } from "../test/mock-daemon";
+import { fallbackSessionDisplayName } from "../session-names";
+
+const DEFAULT_SESSION_ID = "00000000-0000-0000-0000-000000000401";
+const DEFAULT_SESSION_NAME = fallbackSessionDisplayName(DEFAULT_SESSION_ID);
 
 const qrScannerMock = vi.hoisted(() => ({
   destroy: vi.fn(),
@@ -97,6 +101,43 @@ async function expectDaemonUrlInAdmin(user: ReturnType<typeof userEvent.setup>, 
   await waitFor(() => expect(within(admin).getAllByText(url).length).toBeGreaterThan(0));
 }
 
+async function waitForWorkspaceSession(name?: string): Promise<void> {
+  await waitForWorkspaceReady();
+  if (name) {
+    await waitFor(() => expect(screen.queryAllByText(name).length).toBeGreaterThan(0));
+    return;
+  }
+  await waitFor(() => {
+    const sessionRows = document.querySelectorAll(".session-row").length;
+    const toolbarName = document.querySelector<HTMLElement>(".toolbar-title span")?.textContent?.trim();
+    expect(sessionRows > 0 || Boolean(toolbarName && toolbarName !== "No session")).toBe(true);
+  });
+}
+
+async function waitForWorkspaceReady(): Promise<void> {
+  await screen.findByRole("button", { name: "Daemons" });
+}
+
+async function clickSessionCard(
+  user: ReturnType<typeof userEvent.setup>,
+  name?: string,
+  container: HTMLElement | Document = document.body,
+): Promise<void> {
+  const scope = container instanceof HTMLElement && !container.isConnected ? document.body : container;
+  if (name) {
+    await user.click(await within(scope as HTMLElement).findByRole("button", { name: `Open ${name}` }));
+    return;
+  }
+  const sessionButtons = await within(scope as HTMLElement).findAllByRole("button", { name: /^Open / });
+  await user.click(sessionButtons[0]);
+}
+
+function visibleSessionNames(): string[] {
+  return Array.from(document.querySelectorAll<HTMLElement>(".session-row strong"))
+    .map((element) => element.textContent?.trim() ?? "")
+    .filter(Boolean);
+}
+
 describe("termui web 工作台", () => {
   let daemon: MockDaemon;
 
@@ -135,15 +176,16 @@ describe("termui web 工作台", () => {
     await pairWithInvite(user, daemon);
 
     await waitFor(() => expect(screen.queryByLabelText("Pairing token")).toBeNull());
-    await screen.findByText("Connected");
+    await waitForWorkspaceSession();
     expect(screen.getByRole("button", { name: "Daemons" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Edit connection" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Manage daemons" })).toBeNull();
     expect(screen.queryByLabelText("Daemon")).toBeNull();
     await user.click(screen.getByRole("button", { name: "Refresh" }));
-    await screen.findAllByText("00000000-0000-0000-0000-000000000401");
+    await waitForWorkspaceSession();
+    expect(document.body.textContent).not.toContain("00000000-0000-0000-0000-000000000401");
     expect(screen.queryByRole("button", { name: "Open" })).toBeNull();
-    await user.click(screen.getAllByText("00000000-0000-0000-0000-000000000401")[0]);
+    await clickSessionCard(user);
 
     await screen.findByText(/termd-e2e-ready/);
     await waitFor(() => expect(daemon.attachedSessions).toEqual(["00000000-0000-0000-0000-000000000401"]));
@@ -158,7 +200,7 @@ describe("termui web 工作台", () => {
     render(<App />);
 
     await pairWithInvite(user, daemon);
-    await screen.findByText("paired daemon");
+    await waitForWorkspaceSession();
     expect(screen.queryByRole("navigation", { name: "mobile workspace menu" })).toBeNull();
     expect(screen.queryByRole("navigation", { name: "mobile workspace actions" })).toBeNull();
 
@@ -174,7 +216,7 @@ describe("termui web 工作台", () => {
     const admin = await screen.findByLabelText("daemon admin");
     expect(within(admin).getByLabelText("daemon manager")).toBeVisible();
     await user.click(within(admin).getByRole("button", { name: "Open workspace" }));
-    await screen.findByText("paired daemon");
+    await waitForWorkspaceSession();
 
     await user.click(screen.getByRole("button", { name: "Open mobile workspace menu" }));
     const sessionsMenu = await screen.findByRole("navigation", { name: "mobile workspace menu" });
@@ -183,10 +225,7 @@ describe("termui web 工作台", () => {
     const refreshSessions = within(sessionsPanel).getByRole("button", { name: "Refresh sessions" });
     await expect(refreshSessions).toBeEnabled();
     await user.click(refreshSessions);
-    const sessionRows = await screen.findAllByText("00000000-0000-0000-0000-000000000401");
-    const sessionRow = sessionRows.find((node) => node.closest('[aria-label="sessions panel"]'));
-    expect(sessionRow).toBeTruthy();
-    await user.click(sessionRow as HTMLElement);
+    await clickSessionCard(user, DEFAULT_SESSION_NAME, sessionsPanel);
 
     await screen.findByText(/termd-e2e-ready/);
     await user.click(screen.getByRole("button", { name: "Open mobile workspace menu" }));
@@ -212,23 +251,50 @@ describe("termui web 工作台", () => {
     expect(daemon.outerWireLog).toEqual([]);
   });
 
+  it("WebSocket 外层 error envelope 会在 admin 主体显示 alert", async () => {
+    const user = userEvent.setup();
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [],
+      routePreludeError: {
+        code: "invalid_envelope",
+        message: "message envelope is invalid",
+      },
+    });
+    render(<App />);
+
+    await setConnectionUrl(user, daemon.url);
+    fireEvent.change(screen.getByLabelText("Pairing token"), {
+      target: { value: pairingInviteCode(daemon) },
+    });
+    await user.click(screen.getByRole("button", { name: "Pair" }));
+
+    const admin = await screen.findByLabelText("daemon admin");
+    const alert = await within(admin).findByRole("alert", { name: "Connection error" });
+    expect(alert).toHaveTextContent("invalid_envelope");
+    expect(alert).toHaveTextContent("message envelope is invalid");
+    expect(await screen.findByText("invalid_envelope: message envelope is invalid")).toBeInTheDocument();
+    expect(screen.getByLabelText("Pairing token")).toHaveValue("");
+  });
+
   it("已配对后可以把连接地址改成 relay /ws URL", async () => {
     const user = userEvent.setup();
     render(<App />);
 
     await pairWithInvite(user, daemon);
-    await screen.findByText("Connected");
+    await waitForWorkspaceSession();
 
     const relayUrl = `${daemon.url}?relay_token=relay-secret`;
     await user.click(screen.getByRole("button", { name: "Daemons" }));
     await setConnectionUrl(user, relayUrl);
     await user.click(screen.getByRole("button", { name: "Save URL" }));
 
-    await screen.findByText("Connected");
+    await waitForWorkspaceSession();
     await expectDaemonUrlInAdmin(user, relayUrl);
     await user.click(screen.getByRole("button", { name: "Open workspace" }));
     await user.click(screen.getByRole("button", { name: "Refresh" }));
-    await screen.findAllByText("00000000-0000-0000-0000-000000000401");
+    await waitForWorkspaceSession();
   });
 
   it("一个 Web 可以保存并切换多个 daemon", async () => {
@@ -251,7 +317,7 @@ describe("termui web 工作台", () => {
         target: { value: pairingInviteCode(daemon) },
       });
       await user.click(screen.getByRole("button", { name: "Pair" }));
-      await screen.findByText("Connected");
+      await waitForWorkspaceSession();
 
       await user.click(screen.getByRole("button", { name: "Daemons" }));
       await setConnectionUrl(user, secondDaemon.url);
@@ -260,7 +326,7 @@ describe("termui web 工作台", () => {
         target: { value: pairingInviteCode(secondDaemon, "second-token") },
       });
       await user.click(screen.getByRole("button", { name: "Pair" }));
-      await screen.findByText("Connected");
+      await waitForWorkspaceSession();
 
       await user.click(screen.getByRole("button", { name: "Daemons" }));
       const manager = await screen.findByLabelText("daemon manager");
@@ -270,15 +336,14 @@ describe("termui web 工作台", () => {
 
       await user.click(screen.getByRole("button", { name: "Open workspace" }));
       await user.click(screen.getByRole("button", { name: "Refresh" }));
-      await screen.findAllByText("00000000-0000-0000-0000-000000000421");
+      await waitForWorkspaceSession();
 
       await user.click(screen.getByRole("button", { name: "Daemons" }));
       const refreshedManager = await screen.findByLabelText("daemon manager");
       await user.click(within(refreshedManager).getByRole("button", { name: /Use daemon Daemon 1/ }));
       await waitFor(() => expect(screen.getByLabelText("selected daemon")).toHaveTextContent(daemon.url));
       await user.click(screen.getByRole("button", { name: "Open workspace" }));
-      await screen.findByText("Connected");
-      await screen.findAllByText("00000000-0000-0000-0000-000000000401");
+      await waitForWorkspaceSession();
     } finally {
       await secondDaemon.stop();
     }
@@ -294,7 +359,7 @@ describe("termui web 工作台", () => {
 
     try {
       await pairWithInvite(user, daemon);
-      await screen.findByText("Connected");
+      await waitForWorkspaceSession();
 
       await user.click(screen.getByRole("button", { name: "Daemons" }));
       await setConnectionUrl(user, secondDaemon.url);
@@ -302,7 +367,7 @@ describe("termui web 工作台", () => {
         target: { value: pairingInviteCode(secondDaemon, "second-token") },
       });
       await user.click(screen.getByRole("button", { name: "Pair" }));
-      await screen.findByText("Connected");
+      await waitForWorkspaceSession("No session");
 
       await user.click(screen.getByRole("button", { name: "Daemons" }));
       const manager = await screen.findByLabelText("daemon manager");
@@ -345,7 +410,7 @@ describe("termui web 工作台", () => {
 
     try {
       await pairWithInvite(user, daemon);
-      await screen.findByText("Connected");
+      await waitForWorkspaceSession();
 
       await user.click(screen.getByRole("button", { name: "Daemons" }));
       await setConnectionUrl(user, secondDaemon.url);
@@ -353,15 +418,14 @@ describe("termui web 工作台", () => {
         target: { value: pairingInviteCode(secondDaemon, "second-token") },
       });
       await user.click(screen.getByRole("button", { name: "Pair" }));
-      await screen.findByText("Connected");
+      await waitForWorkspaceSession("No session");
 
       await user.click(screen.getByRole("button", { name: "Daemons" }));
       const initialManager = await screen.findByLabelText("daemon manager");
       await user.click(within(initialManager).getByRole("button", { name: /Use daemon Daemon 1/ }));
       await waitFor(() => expect(screen.getByLabelText("selected daemon")).toHaveTextContent(daemon.url));
       await user.click(screen.getByRole("button", { name: "Open workspace" }));
-      await screen.findByText("Connected");
-      await screen.findAllByText("00000000-0000-0000-0000-000000000401");
+      await waitForWorkspaceSession();
 
       await secondDaemon.stop();
       secondStopped = true;
@@ -378,8 +442,8 @@ describe("termui web 工作台", () => {
       await user.click(within(recoveredManager).getByRole("button", { name: /Use daemon Daemon 1/ }));
       await waitFor(() => expect(screen.getByLabelText("selected daemon")).toHaveTextContent(daemon.url));
       await user.click(screen.getByRole("button", { name: "Open workspace" }));
-      await screen.findByText("Connected");
-      await screen.findAllByText("00000000-0000-0000-0000-000000000401");
+      await waitForWorkspaceSession();
+      await waitForWorkspaceSession();
     } finally {
       if (!secondStopped) {
         await secondDaemon.stop();
@@ -413,16 +477,61 @@ describe("termui web 工作台", () => {
     render(<App />);
 
     await pairWithInvite(user, daemon);
-    await screen.findByText("Connected");
+    await waitForWorkspaceSession();
     await user.click(screen.getByRole("button", { name: "Refresh" }));
 
-    await screen.findAllByText("00000000-0000-0000-0000-000000000401");
-    await user.click(screen.getAllByText("00000000-0000-0000-0000-000000000401")[0]);
+    await waitForWorkspaceSession();
+    await clickSessionCard(user);
 
     await screen.findByText(/termd-e2e-ready/);
     expect(screen.queryByRole("button", { name: "Open" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Attached" })).toBeNull();
     expect(daemon.attachedSessions).toEqual(["00000000-0000-0000-0000-000000000401"]);
+  });
+
+  it("WebSocket error envelope 会在 workspace 主体显示 alert 且不泄漏敏感字段", async () => {
+    const user = userEvent.setup();
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [
+        {
+          session_id: "00000000-0000-0000-0000-000000000402",
+          state: "running",
+          size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+        },
+      ],
+      sessionDataError: {
+        code: "invalid_envelope_token",
+        message: "message envelope is invalid private_key=private-value signature=sig ciphertext_base64=abc",
+      },
+    });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await user.click(screen.getByRole("button", { name: "Refresh" }));
+    await clickSessionCard(user);
+
+    let terminalInput: HTMLTextAreaElement | null = null;
+    await waitFor(() => {
+      terminalInput = document.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
+      expect(terminalInput).not.toBeNull();
+    });
+    terminalInput!.value = "workspace-input";
+    fireEvent.input(terminalInput!);
+
+    const workspaceBody = document.querySelector<HTMLElement>(".workspace-body");
+    expect(workspaceBody).not.toBeNull();
+    const alert = await within(workspaceBody!).findByRole("alert", { name: "Connection error" });
+    expect(alert).toHaveTextContent("protocol_error");
+    expect(alert).toHaveTextContent("protocol operation failed");
+    expect(await screen.findByText("protocol_error: protocol operation failed")).toBeInTheDocument();
+
+    const renderedText = document.body.textContent ?? "";
+    for (const sensitive of ["invalid_envelope_token", "private_key", "private-value", "signature", "ciphertext_base64"]) {
+      expect(renderedText).not.toContain(sensitive);
+    }
   });
 
   it("可以创建 session 并自动 attach 到 terminal", async () => {
@@ -436,15 +545,45 @@ describe("termui web 工作台", () => {
     render(<App />);
 
     await pairWithInvite(user, daemon);
-    await screen.findByText("Connected");
+    await waitForWorkspaceSession("No session");
 
     expect(screen.queryByLabelText("Command")).toBeNull();
     await user.click(screen.getByRole("button", { name: "New session" }));
 
-    await screen.findAllByText("00000000-0000-0000-0000-000000000501");
+    await waitForWorkspaceSession();
     expect(screen.queryByRole("button", { name: "Attached" })).toBeNull();
     await screen.findByText(/web-session-ready/);
+    const terminalInput = document.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
+    expect(terminalInput).not.toBeNull();
+    await waitFor(() => expect(document.activeElement).toBe(terminalInput));
     expect(daemon.createdCommands).toEqual([[]]);
+  });
+
+  it("新建多个 session 时已有 session 名称保持稳定", async () => {
+    const user = userEvent.setup();
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [],
+      attachOutput: "web-session-ready\n",
+    });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession("No session");
+
+    await user.click(screen.getByRole("button", { name: "New session" }));
+    await waitFor(() => expect(visibleSessionNames()).toHaveLength(1));
+    const firstName = visibleSessionNames()[0];
+    expect(firstName).not.toMatch(/^Shell \d+$/);
+
+    await user.click(screen.getByRole("button", { name: "New session" }));
+    await waitFor(() => expect(visibleSessionNames()).toHaveLength(2));
+    const namesAfterSecondCreate = visibleSessionNames();
+
+    expect(namesAfterSecondCreate[1]).toBe(firstName);
+    expect(namesAfterSecondCreate[0]).not.toBe(firstName);
+    expect(namesAfterSecondCreate.every((name) => !/^Shell \d+$/.test(name))).toBe(true);
   });
 
   it("文件 panel 支持切换目录、上传、下载和删除", async () => {
@@ -521,9 +660,9 @@ describe("termui web 工作台", () => {
     render(<App />);
 
     await pairWithInvite(user, daemon);
-    await screen.findByText("Connected");
+    await waitForWorkspaceSession();
     await user.click(screen.getByRole("button", { name: "Refresh" }));
-    await user.click((await screen.findAllByText(sessionId))[0]);
+    await clickSessionCard(user);
 
     const panel = await screen.findByLabelText("session files");
 
@@ -629,9 +768,9 @@ describe("termui web 工作台", () => {
     render(<App />);
 
     await pairWithInvite(user, daemon);
-    await screen.findByText("Connected");
+    await waitForWorkspaceSession();
     await user.click(screen.getByRole("button", { name: "Refresh" }));
-    await user.click((await screen.findAllByText(sessionId))[0]);
+    await clickSessionCard(user);
 
     const panel = await screen.findByLabelText("session files");
     await waitFor(() => expect(within(panel).getByLabelText("Current directory")).toHaveValue("/home/me"));
@@ -645,7 +784,7 @@ describe("termui web 工作台", () => {
     await waitFor(() => expect(screen.getByRole("button", { name: "Disconnect" })).toBeDisabled());
 
     const requestCountBeforeReattach = daemon.sessionFileRequests.length;
-    await user.click(screen.getAllByText(sessionId)[0]);
+    await clickSessionCard(user);
 
     await waitFor(() =>
       expect(daemon.sessionFileRequests.slice(requestCountBeforeReattach)).toContainEqual({
@@ -679,9 +818,9 @@ describe("termui web 工作台", () => {
     render(<App />);
 
     await pairWithInvite(user, daemon);
-    await screen.findByText("Connected");
+    await waitForWorkspaceSession();
     await user.click(screen.getByRole("button", { name: "Refresh" }));
-    await user.click((await screen.findAllByText(sessionId))[0]);
+    await clickSessionCard(user);
 
     const panel = await screen.findByLabelText("session files");
     await waitFor(() => expect(within(panel).getByLabelText("Current directory")).toHaveValue("/home/me"));
@@ -744,9 +883,9 @@ describe("termui web 工作台", () => {
     render(<App />);
 
     await pairWithInvite(user, daemon);
-    await screen.findByText("Connected");
+    await waitForWorkspaceSession();
     await user.click(screen.getByRole("button", { name: "Refresh" }));
-    await user.click((await screen.findAllByText("00000000-0000-0000-0000-000000000410"))[0]);
+    await clickSessionCard(user);
 
     const operators = await screen.findByLabelText("session operators");
     await within(operators).findByText("192.0.2.41");
@@ -763,16 +902,21 @@ describe("termui web 工作台", () => {
     await within(clientPanel).findByText("198.51.100.9");
     await within(clientPanel).findByText("online");
     await within(clientPanel).findByText("offline");
-    await within(clientPanel).findByText("attached 00000000");
+    await within(clientPanel).findByText("attached");
     await within(clientPanel).findByText("detached");
+
+    const deleteOfflineClient = within(clientPanel).getByRole("button", { name: /Delete offline client/ });
+    await user.dblClick(deleteOfflineClient);
+    await waitFor(() => expect(within(clientPanel).queryByText("198.51.100.9")).toBeNull());
+    expect(screen.queryByText("invalid_envelope")).toBeNull();
   });
 
-  it("Session 卡片点击即打开，底部只保留管理按钮", async () => {
+  it("Session 卡片点击即打开，标题行保留管理按钮", async () => {
     const user = userEvent.setup();
     render(<App />);
 
     await pairWithInvite(user, daemon);
-    await screen.findByText("Connected");
+    await waitForWorkspaceSession();
     await user.click(screen.getByRole("button", { name: "Refresh" }));
 
     const actions = await screen.findByLabelText("Session actions");
@@ -787,9 +931,9 @@ describe("termui web 工作台", () => {
     render(<App />);
 
     await pairWithInvite(user, daemon);
-    await screen.findByText("Connected");
+    await waitForWorkspaceSession();
     await user.click(screen.getByRole("button", { name: "Refresh" }));
-    await user.click((await screen.findAllByText("00000000-0000-0000-0000-000000000401"))[0]);
+    await clickSessionCard(user);
 
     expect(await screen.findByLabelText("session files")).toBeInTheDocument();
 
@@ -814,6 +958,28 @@ describe("termui web 工作台", () => {
     expect(screen.getByRole("button", { name: "Hide files panel" })).toBeInTheDocument();
   });
 
+  it("桌面文件 panel 可以通过拖拽分隔条调整宽度", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await user.click(screen.getByRole("button", { name: "Refresh" }));
+    await clickSessionCard(user);
+
+    const workspaceBody = document.querySelector<HTMLElement>(".workspace-body");
+    expect(workspaceBody).not.toBeNull();
+    const initialColumns = workspaceBody!.style.gridTemplateColumns;
+    const resizer = screen.getByRole("separator", { name: "Resize files panel" });
+
+    fireEvent.pointerDown(resizer, { clientX: 1180, pointerId: 1 });
+    fireEvent.pointerMove(window, { clientX: 1080, pointerId: 1 });
+    fireEvent.pointerUp(window, { pointerId: 1 });
+
+    await waitFor(() => expect(workspaceBody!.style.gridTemplateColumns).not.toBe(initialColumns));
+    expect(workspaceBody!.style.gridTemplateColumns).toContain("px");
+  });
+
   it("粘贴 QR payload 后会使用当前连接地址和 token", async () => {
     const user = userEvent.setup();
     render(<App />);
@@ -833,7 +999,7 @@ describe("termui web 工作台", () => {
 
     await waitFor(() => expect(screen.queryByLabelText("Pairing token")).toBeNull());
     expect(screen.queryByLabelText("WS URL")).toBeNull();
-    await screen.findByText("Connected");
+    await waitForWorkspaceSession();
     await expectDaemonUrlInAdmin(user, daemon.url);
     expect(daemon.outerWireText()).not.toContain("secret-token");
   });
@@ -863,7 +1029,7 @@ describe("termui web 工作台", () => {
     await user.click(screen.getByRole("button", { name: "Pair" }));
 
     await waitFor(() => expect(screen.queryByLabelText("Pairing token")).toBeNull());
-    await screen.findByText("Connected");
+    await waitForWorkspaceSession("No session");
     await expectDaemonUrlInAdmin(user, relayUrl);
     expect(daemon.outerWireText()).not.toContain("secret-token");
   });
@@ -922,9 +1088,9 @@ describe("termui web 工作台", () => {
     render(<App />);
 
     await pairWithInvite(user, daemon);
-    await screen.findByText("Connected");
+    await waitForWorkspaceSession();
     await user.click(await screen.findByRole("button", { name: "Refresh" }));
-    await user.click((await screen.findAllByText("00000000-0000-0000-0000-000000000401"))[0]);
+    await clickSessionCard(user);
 
     expect(screen.queryByRole("button", { name: "Take control" })).toBeNull();
     expect(document.body.textContent).not.toContain("viewer");
@@ -936,15 +1102,20 @@ describe("termui web 工作台", () => {
     render(<App />);
 
     await pairWithInvite(user, daemon);
-    await screen.findByText("Connected");
+    await waitForWorkspaceSession();
     await user.click(screen.getByRole("button", { name: "Refresh" }));
 
     await user.click(await screen.findByRole("button", { name: "Rename session" }));
+    expect(screen.getByRole("button", { name: "Save session name" })).toBeDisabled();
+    expect(daemon.sessionRenames).toEqual([]);
+    daemon.queueSessionListResponse([], 30);
+    await user.click(screen.getByRole("button", { name: "Refresh" }));
+    await waitFor(() => expect(screen.getByLabelText("Session name")).toHaveValue(DEFAULT_SESSION_NAME));
     await user.clear(screen.getByLabelText("Session name"));
     await user.type(screen.getByLabelText("Session name"), "work shell");
     await user.click(screen.getByRole("button", { name: "Save session name" }));
 
-    await screen.findByText("work shell");
+    await waitFor(() => expect(screen.queryAllByText("work shell").length).toBeGreaterThan(0));
     expect(daemon.sessionRenames).toEqual([
       {
         session_id: "00000000-0000-0000-0000-000000000401",
@@ -958,6 +1129,27 @@ describe("termui web 工作台", () => {
       expect(screen.queryByText("work shell")).toBeNull();
     });
     expect(daemon.closedSessions).toEqual(["00000000-0000-0000-0000-000000000401"]);
+  });
+
+  it("关闭已被 daemon 移除的 session 时按幂等删除处理", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await user.click(screen.getByRole("button", { name: "Refresh" }));
+
+    const sessionId = "00000000-0000-0000-0000-000000000401";
+    await waitForWorkspaceSession();
+    daemon.forgetSession(sessionId);
+
+    await user.click(screen.getByRole("button", { name: "Close session" }));
+
+    await waitFor(() => {
+      expect(screen.queryByText(sessionId)).toBeNull();
+    });
+    expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
+    expect(daemon.closedSessions).toEqual([]);
   });
 
   it("shared-control attach 后持续发送终端输入、光标位置和聚焦状态", async () => {
@@ -976,9 +1168,9 @@ describe("termui web 工作台", () => {
     render(<App />);
 
     await pairWithInvite(user, daemon);
-    await screen.findByText("Connected");
+    await waitForWorkspaceSession();
     await user.click(screen.getByRole("button", { name: "Refresh" }));
-    await user.click((await screen.findAllByText("00000000-0000-0000-0000-000000000402"))[0]);
+    await clickSessionCard(user);
 
     let terminalInput: HTMLTextAreaElement | null = null;
     await waitFor(() => {
@@ -1072,9 +1264,9 @@ describe("termui web 工作台", () => {
     render(<App />);
 
     await pairWithInvite(user, daemon);
-    await screen.findByText("Connected");
+    await waitForWorkspaceSession();
     await user.click(screen.getByRole("button", { name: "Refresh" }));
-    await user.click((await screen.findAllByText("00000000-0000-0000-0000-000000000403"))[0]);
+    await clickSessionCard(user);
 
     await waitFor(() => {
       expect(document.querySelector(".xterm-helper-textarea")).not.toBeNull();
@@ -1084,6 +1276,70 @@ describe("termui web 工作台", () => {
     expect(screen.getByTestId("terminal-pane")).toHaveAttribute("data-viewer-mode", "false");
     expect(screen.queryByLabelText("viewer controls")).toBeNull();
     expect(document.querySelector(".terminal-pane-viewer .terminal-viewer-frame")).toBeNull();
+  });
+
+  it("聚焦终端遇到浏览器窗口 resize 后退回非聚焦 viewer 状态", async () => {
+    const user = userEvent.setup();
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [
+        {
+          session_id: "00000000-0000-0000-0000-000000000404",
+          state: "running",
+          size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+        },
+      ],
+    });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await user.click(screen.getByRole("button", { name: "Refresh" }));
+    await clickSessionCard(user);
+
+    let terminalInput: HTMLTextAreaElement | null = null;
+    await waitFor(() => {
+      terminalInput = document.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
+      expect(terminalInput).not.toBeNull();
+    });
+    terminalInput!.focus();
+    await waitFor(() => expect(screen.getByTestId("terminal-pane")).toHaveAttribute("data-viewer-mode", "false"));
+    await waitFor(() =>
+      expect(daemon.sessionCursorUpdates).toContainEqual({
+        session_id: "00000000-0000-0000-0000-000000000404",
+        row: expect.any(Number),
+        col: expect.any(Number),
+        focused: true,
+      }),
+    );
+
+    const resizeCountBeforeWindowResize = daemon.sessionResizes.length;
+    (globalThis as { __TERMD_TEST_FIT_DIMENSIONS__?: { rows: number; cols: number } }).__TERMD_TEST_FIT_DIMENSIONS__ = {
+      rows: 30,
+      cols: 100,
+    };
+    fireEvent(window, new Event("resize"));
+
+    await waitFor(() => expect(screen.getByTestId("terminal-pane")).toHaveAttribute("data-viewer-mode", "true"));
+    // 进入 viewer 后，xterm host 会被远端 PTY frame 框住；如果这时把该 host 再拿来测
+    // 本地可容纳尺寸，就会误判为“分辨率一致”，导致 viewer true/false 来回振荡。
+    (globalThis as { __TERMD_TEST_FIT_DIMENSIONS__?: { rows: number; cols: number } }).__TERMD_TEST_FIT_DIMENSIONS__ = {
+      rows: 24,
+      cols: 80,
+    };
+    fireEvent(window, new Event("resize"));
+    await new Promise((resolve) => window.setTimeout(resolve, 80));
+    expect(screen.getByTestId("terminal-pane")).toHaveAttribute("data-viewer-mode", "true");
+    expect(daemon.sessionResizes).toHaveLength(resizeCountBeforeWindowResize);
+    await waitFor(() =>
+      expect(daemon.sessionCursorUpdates).toContainEqual({
+        session_id: "00000000-0000-0000-0000-000000000404",
+        row: expect.any(Number),
+        col: expect.any(Number),
+        focused: false,
+      }),
+    );
   });
 
   it("未配对时只显示连接表单，并按当前页面来源和前缀推导 WebSocket 地址", async () => {
@@ -1278,7 +1534,7 @@ describe("termui web 工作台", () => {
 
     await waitFor(() => expect(screen.queryByRole("dialog", { name: "Scan pairing QR" })).toBeNull());
     await waitFor(() => expect(screen.queryByLabelText("Pairing token")).toBeNull());
-    await screen.findByText("Connected");
+    await waitForWorkspaceSession();
     await expectDaemonUrlInAdmin(user, daemon.url);
     expect(qrScannerMock.stop).toHaveBeenCalledTimes(1);
     expect(daemon.outerWireText()).not.toContain("secret-token");
@@ -1305,7 +1561,7 @@ describe("termui web 工作台", () => {
 
     await waitFor(() => expect(screen.queryByRole("dialog", { name: "Scan pairing QR" })).toBeNull());
     await waitFor(() => expect(screen.queryByLabelText("Pairing token")).toBeNull());
-    await screen.findByText("Connected");
+    await waitForWorkspaceSession();
     await expectDaemonUrlInAdmin(user, daemon.url);
     expect(qrScannerMock.stop).toHaveBeenCalledTimes(1);
     expect(daemon.outerWireText()).not.toContain("secret-token");
@@ -1334,7 +1590,7 @@ describe("termui web 工作台", () => {
     await waitFor(() => expect(qrScannerMock.scanImage).toHaveBeenCalledWith(file, expect.objectContaining({ returnDetailedScanResult: true })));
     await waitFor(() => expect(screen.queryByRole("dialog", { name: "Scan pairing QR" })).toBeNull());
     await waitFor(() => expect(screen.queryByLabelText("Pairing token")).toBeNull());
-    await screen.findByText("Connected");
+    await waitForWorkspaceSession();
     await expectDaemonUrlInAdmin(user, daemon.url);
     expect(qrScannerMock.stop).toHaveBeenCalledTimes(1);
     expect(daemon.outerWireText()).not.toContain("secret-token");
@@ -1359,7 +1615,9 @@ describe("termui web 工作台", () => {
     qrScannerMock.onDecode?.({ data: inviteCode });
 
     await waitFor(() => expect(screen.queryByRole("dialog", { name: "Scan pairing QR" })).toBeNull());
-    await screen.findByText(/pairing_payload_server_mismatch/);
+    const alert = await screen.findByRole("alert", { name: "Connection error" });
+    expect(alert).toHaveTextContent("pairing_payload_server_mismatch");
+    expect(alert).toHaveTextContent("pairing payload does not match the connected daemon");
     expect(screen.getByLabelText("Pairing token")).toHaveValue("");
     expect(daemon.outerWireText()).not.toContain("secret-token");
   });

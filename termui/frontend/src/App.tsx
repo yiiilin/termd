@@ -1,8 +1,8 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import {
   Cable,
+  CircleAlert,
   Folder,
-  Link,
   MonitorUp,
   Menu,
   PanelLeftClose,
@@ -50,9 +50,14 @@ import { SessionFilesPanel } from "./components/SessionFilesPanel";
 import { StatusBar } from "./components/StatusBar";
 import { TerminalPane } from "./components/TerminalPane";
 import { PairingQrScanner } from "./components/PairingQrScanner";
+import { sessionDisplayName } from "./session-names";
 
 const FALLBACK_WS_URL = "ws://127.0.0.1:8765/ws";
 const DEFAULT_SESSION_SIZE: TerminalSize = { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 };
+const DEFAULT_FILES_PANEL_WIDTH = 286;
+const MIN_FILES_PANEL_WIDTH = 240;
+const MAX_FILES_PANEL_WIDTH = 640;
+const FILES_PANEL_RESIZER_WIDTH = 10;
 const MOBILE_LAYOUT_QUERY = "(max-width: 760px)";
 const MOBILE_LAYOUT_BREAKPOINT = 760;
 type AppSurface = "admin" | "workspace";
@@ -63,17 +68,22 @@ export default function App() {
   const [pairingToken, setPairingToken] = useState("");
   const [sessions, setSessions] = useState<SessionSummaryPayload[]>([]);
   const [daemonClients, setDaemonClients] = useState<DaemonClientSummaryPayload[]>([]);
+  const [forgettingClientIds, setForgettingClientIds] = useState<Set<UUID>>(() => new Set());
   const [clientsOpen, setClientsOpen] = useState(false);
   const [selectedSessionId, setSelectedSessionId] = useState<UUID | undefined>();
   const [attachedSessionId, setAttachedSessionId] = useState<UUID | undefined>();
   const [renamingSessionId, setRenamingSessionId] = useState<UUID | undefined>();
   const [renameDraft, setRenameDraft] = useState("");
+  const [renameOriginalName, setRenameOriginalName] = useState("");
   const [terminalChunks, setTerminalChunks] = useState<string[]>([]);
+  const [terminalFocusRequest, setTerminalFocusRequest] = useState(0);
   const [sessionFiles, setSessionFiles] = useState<SessionFilesResultPayload | undefined>();
   const [sessionFilesLoading, setSessionFilesLoading] = useState(false);
   const [sessionFilesError, setSessionFilesError] = useState<SafeError | undefined>();
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [filesPanelOpen, setFilesPanelOpen] = useState(true);
+  const [filesPanelWidth, setFilesPanelWidth] = useState(DEFAULT_FILES_PANEL_WIDTH);
+  const [isFilesPanelResizing, setIsFilesPanelResizing] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [mobilePanel, setMobilePanel] = useState<"sessions" | "files" | undefined>();
   const [connectionEditorOpen, setConnectionEditorOpen] = useState(false);
@@ -86,6 +96,15 @@ export default function App() {
   const attachClientRef = useRef<DirectClient | undefined>(undefined);
   const attachedSessionRef = useRef<UUID | undefined>(undefined);
   const receiveLoopActiveRef = useRef(false);
+  const closingSessionIdsRef = useRef<Set<UUID>>(new Set());
+  const forgettingClientIdsRef = useRef<Set<UUID>>(new Set());
+  const renamingSessionIdRef = useRef<UUID | undefined>(undefined);
+  const filesPanelWidthRef = useRef(DEFAULT_FILES_PANEL_WIDTH);
+  const filesPanelResizeRef = useRef<{
+    pointerId: number;
+    startX: number;
+    startWidth: number;
+  } | null>(null);
   const urlTouchedRef = useRef(false);
   const autoCheckedServerRef = useRef<UUID | undefined>(undefined);
   const lastCursorReportRef = useRef("");
@@ -101,6 +120,67 @@ export default function App() {
       // 已配对的浏览器默认进入工作台；连接失败时再回落到后台管理页重新选择 daemon。
       setActiveSurface(defaultServer(loaded) && loaded.device ? "workspace" : "admin");
     });
+  }, []);
+
+  useEffect(() => {
+    renamingSessionIdRef.current = renamingSessionId;
+  }, [renamingSessionId]);
+
+  useEffect(() => {
+    filesPanelWidthRef.current = filesPanelWidth;
+  }, [filesPanelWidth]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return undefined;
+    }
+
+    const clampToViewport = () => {
+      const nextWidth = clampFilesPanelWidth(filesPanelWidthRef.current, window.innerWidth);
+      if (nextWidth !== filesPanelWidthRef.current) {
+        setFilesPanelWidth(nextWidth);
+      }
+    };
+
+    clampToViewport();
+    window.addEventListener("resize", clampToViewport);
+    return () => window.removeEventListener("resize", clampToViewport);
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return undefined;
+    }
+
+    const finishResize = (pointerId?: number) => {
+      const drag = filesPanelResizeRef.current;
+      if (!drag || (pointerId !== undefined && drag.pointerId !== pointerId)) {
+        return;
+      }
+      filesPanelResizeRef.current = null;
+      setIsFilesPanelResizing(false);
+    };
+
+    const handlePointerMove = (event: PointerEvent) => {
+      const drag = filesPanelResizeRef.current;
+      if (!drag || event.pointerId !== drag.pointerId) {
+        return;
+      }
+      const nextWidth = clampFilesPanelWidth(drag.startWidth + drag.startX - event.clientX, window.innerWidth);
+      setFilesPanelWidth(nextWidth);
+    };
+
+    const handlePointerUp = (event: PointerEvent) => finishResize(event.pointerId);
+    const handlePointerCancel = (event: PointerEvent) => finishResize(event.pointerId);
+
+    window.addEventListener("pointermove", handlePointerMove);
+    window.addEventListener("pointerup", handlePointerUp);
+    window.addEventListener("pointercancel", handlePointerCancel);
+    return () => {
+      window.removeEventListener("pointermove", handlePointerMove);
+      window.removeEventListener("pointerup", handlePointerUp);
+      window.removeEventListener("pointercancel", handlePointerCancel);
+    };
   }, []);
 
   const activeServer = useMemo<PairedServerState | undefined>(() => defaultServer(state), [state]);
@@ -120,6 +200,18 @@ export default function App() {
     () => sessions.find((session) => session.session_id === attachedSessionId),
     [attachedSessionId, sessions],
   );
+  const toolbarSession = useMemo(
+    () =>
+      attachedSession ?? sessions.find((session) => session.session_id === selectedSessionId),
+    [attachedSession, selectedSessionId, sessions],
+  );
+  const toolbarSessionName = useMemo(() => {
+    if (!toolbarSession) {
+      return "No session";
+    }
+    return sessionDisplayName(toolbarSession);
+  }, [sessions, toolbarSession]);
+  const toolbarSessionSize = toolbarSession ? terminalSizeDisplay(toolbarSession.size) : undefined;
   const pairedServerOptions = useMemo(
     () =>
       state.pairedServers.map((server, index) => ({
@@ -132,7 +224,12 @@ export default function App() {
   const showMobileSessionsPanel = showMobileWorkspaceMenu && mobilePanel === "sessions";
   const showMobileFilesPanel = showMobileWorkspaceMenu && mobilePanel === "files";
   const showDesktopFilesPanel = !isMobileLayout && filesPanelOpen;
+  const desktopWorkspaceStyle =
+    !isMobileLayout && showDesktopFilesPanel
+      ? { gridTemplateColumns: `minmax(0, 1fr) ${FILES_PANEL_RESIZER_WIDTH}px ${filesPanelWidth}px` }
+      : undefined;
   const canOpenWorkspace = Boolean(activeServer && state.device);
+  const canSaveRename = Boolean(renameDraft.trim()) && renameDraft.trim() !== renameOriginalName.trim();
   const activeDaemonLabel =
     pairedServerOptions.find((item) => item.server.server_id === activeServer?.server_id)?.label ?? "No daemon";
 
@@ -165,6 +262,13 @@ export default function App() {
     setStatus("error");
   }, []);
 
+  const isIgnoredClosingSessionNotFound = useCallback((sessionId: UUID, caught: unknown) => {
+    if (!closingSessionIdsRef.current.has(sessionId)) {
+      return false;
+    }
+    return toSafeError(caught).code === "session_not_found";
+  }, []);
+
   const clearSessionFiles = useCallback(() => {
     setSessionFiles(undefined);
     setSessionFilesError(undefined);
@@ -191,8 +295,10 @@ export default function App() {
     setSessions([]);
     setDaemonClients([]);
     setSelectedSessionId(undefined);
+    renamingSessionIdRef.current = undefined;
     setRenamingSessionId(undefined);
     setRenameDraft("");
+    setRenameOriginalName("");
     setTerminalChunks([]);
     clearSessionFiles();
     autoCheckedServerRef.current = undefined;
@@ -292,8 +398,10 @@ export default function App() {
       setSessions([]);
       setDaemonClients([]);
       setSelectedSessionId(undefined);
+      renamingSessionIdRef.current = undefined;
       setRenamingSessionId(undefined);
       setRenameDraft("");
+      setRenameOriginalName("");
       setTerminalChunks([]);
       setMobilePanel(undefined);
       setMobileMenuOpen(false);
@@ -302,7 +410,8 @@ export default function App() {
         setUrl(effectiveUrl);
       }
       setActiveSurface("workspace");
-      setStatus("paired");
+      // 配对成功只建立信任关系，后续 session/client 列表仍交给统一的自动刷新流程加载。
+      setStatus("idle");
     } catch (caught) {
       setPairingToken("");
       setSafeError(caught);
@@ -351,13 +460,16 @@ export default function App() {
       setSessions([]);
       setDaemonClients([]);
       setSelectedSessionId(undefined);
+      renamingSessionIdRef.current = undefined;
       setRenamingSessionId(undefined);
       setRenameDraft("");
+      setRenameOriginalName("");
       setTerminalChunks([]);
       setConnectionEditorOpen(false);
       autoCheckedServerRef.current = undefined;
       setActiveSurface("workspace");
-      setStatus("ready");
+      // 保存新地址后复用自动刷新流程重新探测 daemon，避免工作台停留在空列表。
+      setStatus("idle");
     } catch (caught) {
       setSafeError(caught);
     } finally {
@@ -377,8 +489,10 @@ export default function App() {
       setSessions([]);
       setDaemonClients([]);
       setSelectedSessionId(undefined);
+      renamingSessionIdRef.current = undefined;
       setRenamingSessionId(undefined);
       setRenameDraft("");
+      setRenameOriginalName("");
       setTerminalChunks([]);
       setMobilePanel(undefined);
       setMobileMenuOpen(false);
@@ -436,12 +550,19 @@ export default function App() {
       const list = await client.listSessions();
       const clients = await client.listDaemonClients();
       client.close();
-      const firstSessionId = list.sessions.at(0)?.session_id;
-      setSessions(list.sessions);
+      const firstSessionId =
+        sortSessionsNewestFirst(list.sessions).at(0)?.session_id ??
+        renamingSessionIdRef.current ??
+        attachedSessionRef.current;
+      setSessions((current) =>
+        mergeSessionRefresh(list.sessions, current, [
+          renamingSessionIdRef.current,
+          attachedSessionRef.current,
+        ]),
+      );
       setDaemonClients(clients.clients);
       setSelectedSessionId(firstSessionId);
-      setRenamingSessionId(undefined);
-      setRenameDraft("");
+      // session 列表刷新可能来自后台轮询或 cursor 同步，不能打断用户正在编辑的标题。
       clearSessionFiles();
       setStatus("ready");
     } catch (caught) {
@@ -457,7 +578,12 @@ export default function App() {
         try {
           const sessionList = await client.listSessions();
           const clientList = await client.listDaemonClients();
-          setSessions(sessionList.sessions);
+          setSessions((current) =>
+            mergeSessionRefresh(sessionList.sessions, current, [
+              renamingSessionIdRef.current,
+              attachedSessionRef.current,
+            ]),
+          );
           setDaemonClients(clientList.clients);
         } finally {
           client.close();
@@ -556,6 +682,9 @@ export default function App() {
       setMobilePanel(undefined);
       setMobileMenuOpen(false);
       setSessions((current) => upsertSession(current, created));
+      // 新建 session 等价于打开一个新的 SSH shell，应立即把输入焦点交给 xterm。
+      // 普通打开历史 session 仍保持 viewer 逻辑，避免意外接管其他客户端的 PTY 尺寸。
+      setTerminalFocusRequest((request) => request + 1);
       setStatus("attached");
       await loadSessionFiles(created.session_id);
       void refreshDaemonClients();
@@ -566,19 +695,23 @@ export default function App() {
   }, [authenticatedClient, disconnectAttach, loadSessionFiles, refreshDaemonClients, setSafeError, startReceiveLoop]);
 
   const handleStartRename = useCallback((sessionId: UUID, currentName: string) => {
+    renamingSessionIdRef.current = sessionId;
     setRenamingSessionId(sessionId);
     setRenameDraft(currentName);
+    setRenameOriginalName(currentName);
   }, []);
 
   const handleCancelRename = useCallback(() => {
+    renamingSessionIdRef.current = undefined;
     setRenamingSessionId(undefined);
     setRenameDraft("");
+    setRenameOriginalName("");
   }, []);
 
   const handleSaveRename = useCallback(
     async (sessionId: UUID) => {
       const nextName = renameDraft.trim();
-      if (!nextName) {
+      if (!nextName || nextName === renameOriginalName.trim()) {
         return;
       }
       setError(undefined);
@@ -596,33 +729,90 @@ export default function App() {
         setSafeError(caught);
       }
     },
-    [authenticatedClient, handleCancelRename, renameDraft, setSafeError],
+    [authenticatedClient, handleCancelRename, renameDraft, renameOriginalName, setSafeError],
   );
 
   const handleCloseSession = useCallback(
     async (sessionId: UUID) => {
       setError(undefined);
-      try {
-        const client = await authenticatedClient();
-        await client.closeSession(sessionId);
-        client.close();
-      setSessions((current) => current.filter((session) => session.session_id !== sessionId));
-      if (selectedSessionId === sessionId) {
-        setSelectedSessionId(undefined);
-        clearSessionFiles();
-      }
-      if (attachedSessionRef.current === sessionId) {
+      closingSessionIdsRef.current.add(sessionId);
+      const wasAttached = attachedSessionRef.current === sessionId;
+      const wasSelected = selectedSessionId === sessionId;
+      if (wasAttached) {
+        // 先断开本地 xterm attach 连接，再发关闭请求；否则 xterm 清理阶段的 cursor/resize
+        // 可能在 daemon 已删除 session 后继续发送，导致页面错误地显示 session_not_found。
         disconnectAttach();
         setTerminalChunks([]);
       }
-      setMobilePanel(undefined);
-      setMobileMenuOpen(false);
-      void refreshDaemonClients();
+      let client: DirectClient | undefined;
+      try {
+        client = await authenticatedClient();
+        try {
+          await client.closeSession(sessionId);
+        } catch (caught) {
+          if (!isIgnoredClosingSessionNotFound(sessionId, caught)) {
+            throw caught;
+          }
+        }
+        setSessions((current) => current.filter((session) => session.session_id !== sessionId));
+        if (wasSelected) {
+          setSelectedSessionId(undefined);
+          clearSessionFiles();
+        }
+        if (wasAttached || wasSelected) {
+          setStatus("ready");
+        }
+        setMobilePanel(undefined);
+        setMobileMenuOpen(false);
+        void refreshDaemonClients();
       } catch (caught) {
         setSafeError(caught);
+      } finally {
+        client?.close();
+        // 关闭当前会话时，旧 attach 连接上已经发出的 cursor/resize promise 可能稍后才失败；
+        // 短暂保留 closing 标记，避免这些迟到的 session_not_found 覆盖掉成功删除后的 UI。
+        window.setTimeout(() => {
+          closingSessionIdsRef.current.delete(sessionId);
+        }, 1000);
       }
     },
-    [authenticatedClient, clearSessionFiles, disconnectAttach, refreshDaemonClients, selectedSessionId, setSafeError],
+    [
+      authenticatedClient,
+      clearSessionFiles,
+      disconnectAttach,
+      isIgnoredClosingSessionNotFound,
+      refreshDaemonClients,
+      selectedSessionId,
+      setSafeError,
+    ],
+  );
+
+  const handleForgetOfflineClient = useCallback(
+    async (deviceId: UUID) => {
+      if (forgettingClientIdsRef.current.has(deviceId)) {
+        return;
+      }
+      setError(undefined);
+      forgettingClientIdsRef.current.add(deviceId);
+      setForgettingClientIds((current) => new Set(current).add(deviceId));
+      let client: DirectClient | undefined;
+      try {
+        client = await authenticatedClient();
+        await client.forgetDaemonClient(deviceId);
+        setDaemonClients((current) => current.filter((candidate) => candidate.device_id !== deviceId));
+      } catch (caught) {
+        setSafeError(caught);
+      } finally {
+        client?.close();
+        forgettingClientIdsRef.current.delete(deviceId);
+        setForgettingClientIds((current) => {
+          const next = new Set(current);
+          next.delete(deviceId);
+          return next;
+        });
+      }
+    },
+    [authenticatedClient, setSafeError],
   );
 
   const handleTerminalInput = useCallback(
@@ -635,10 +825,12 @@ export default function App() {
       try {
         await client.sendSessionData(sessionId, new TextEncoder().encode(data));
       } catch (caught) {
-        setSafeError(caught);
+        if (!isIgnoredClosingSessionNotFound(sessionId, caught)) {
+          setSafeError(caught);
+        }
       }
     },
-    [setSafeError],
+    [isIgnoredClosingSessionNotFound, setSafeError],
   );
 
   const handleResize = useCallback(
@@ -651,9 +843,13 @@ export default function App() {
       setSessions((current) =>
         current.map((session) => (session.session_id === sessionId ? { ...session, size } : session)),
       );
-      void client.resizeSession(sessionId, size).catch(setSafeError);
+      void client.resizeSession(sessionId, size).catch((caught) => {
+        if (!isIgnoredClosingSessionNotFound(sessionId, caught)) {
+          setSafeError(caught);
+        }
+      });
     },
-    [setSafeError],
+    [isIgnoredClosingSessionNotFound, setSafeError],
   );
 
   const handleCursorChange = useCallback(
@@ -668,7 +864,11 @@ export default function App() {
         return;
       }
       lastCursorReportRef.current = nextCursor;
-      void client.sendSessionCursor(sessionId, presence).catch(setSafeError);
+      void client.sendSessionCursor(sessionId, presence).catch((caught) => {
+        if (!isIgnoredClosingSessionNotFound(sessionId, caught)) {
+          setSafeError(caught);
+        }
+      });
       if (cursorRefreshTimerRef.current === undefined) {
         cursorRefreshTimerRef.current = window.setTimeout(() => {
           cursorRefreshTimerRef.current = undefined;
@@ -676,7 +876,7 @@ export default function App() {
         }, 500);
       }
     },
-    [refreshDaemonClients, setSafeError],
+    [isIgnoredClosingSessionNotFound, refreshDaemonClients, setSafeError],
   );
 
   useEffect(() => {
@@ -821,6 +1021,32 @@ export default function App() {
     setMobilePanel(undefined);
   }, []);
 
+  const handleFilesPanelResizePointerDown = useCallback(
+    (event: ReactPointerEvent<HTMLDivElement>) => {
+      if (isMobileLayout || !showDesktopFilesPanel) {
+        return;
+      }
+      event.preventDefault();
+      filesPanelResizeRef.current = {
+        pointerId: event.pointerId,
+        startX: event.clientX,
+        startWidth: filesPanelWidthRef.current,
+      };
+      setIsFilesPanelResizing(true);
+    },
+    [isMobileLayout, showDesktopFilesPanel],
+  );
+
+  const handleFilesPanelResizeKeyDown = useCallback((event: React.KeyboardEvent<HTMLDivElement>) => {
+    const step = event.shiftKey ? 48 : 16;
+    if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") {
+      return;
+    }
+    event.preventDefault();
+    const delta = event.key === "ArrowLeft" ? step : -step;
+    setFilesPanelWidth((current) => clampFilesPanelWidth(current + delta, window.innerWidth));
+  }, []);
+
   if (activeSurface === "admin") {
     return (
       <div className="admin-shell">
@@ -848,6 +1074,7 @@ export default function App() {
               Open workspace
             </button>
           </section>
+          {error ? <ProtocolErrorAlert error={error} /> : null}
           <div className="admin-grid">
             <ConnectionPanel
               url={url}
@@ -893,6 +1120,7 @@ export default function App() {
         "workspace-surface",
         sidebarCollapsed ? "sidebar-is-collapsed" : "",
         connectionReady ? "connection-ready" : "",
+        isFilesPanelResizing ? "files-panel-resizing" : "",
         mobileMenuOpen ? "mobile-menu-open" : "",
         mobilePanel ? `mobile-panel-${mobilePanel}` : "",
       ]
@@ -927,16 +1155,6 @@ export default function App() {
                   <button
                     type="button"
                     className="icon-button"
-                    aria-label="Clients"
-                    aria-controls="daemon-clients-popover"
-                    aria-expanded={clientsOpen}
-                    onClick={() => setClientsOpen((open) => !open)}
-                  >
-                    <UsersRound size={15} aria-hidden="true" />
-                  </button>
-                  <button
-                    type="button"
-                    className="icon-button"
                     aria-label="New session"
                     onClick={handleCreateSession}
                     disabled={status === "creating"}
@@ -956,18 +1174,13 @@ export default function App() {
                     <Unplug size={16} aria-hidden="true" />
                   </button>
                 </div>
-                {clientsOpen ? (
-                  <div className="clients-popover rail-popover" id="daemon-clients-popover">
-                    <DaemonClientsPanel clients={daemonClients} />
-                  </div>
-                ) : null}
                 <section className="collapsed-session-list" aria-label="collapsed sessions">
                   {sessions.map((session) => (
                     <button
                       type="button"
                       key={session.session_id}
                       className={session.session_id === selectedSessionId ? "icon-button selected-session-dot" : "icon-button"}
-                      aria-label={`Select session ${session.name?.trim() || shortSessionId(session.session_id)}`}
+                      aria-label={`Select ${sessionDisplayName(session)}`}
                       onClick={() => void handleAttach(session.session_id)}
                     >
                       <MonitorUp size={15} aria-hidden="true" />
@@ -992,23 +1205,6 @@ export default function App() {
               >
                 <PanelLeftClose size={16} aria-hidden="true" />
               </button>
-              {connectionReady ? (
-                <button
-                  type="button"
-                  className="icon-button clients-toggle"
-                  aria-label="Clients"
-                  aria-controls="daemon-clients-popover"
-                  aria-expanded={clientsOpen}
-                  onClick={() => setClientsOpen((open) => !open)}
-                >
-                  <UsersRound size={15} aria-hidden="true" />
-                </button>
-              ) : null}
-              {connectionReady && clientsOpen ? (
-                <div className="clients-popover" id="daemon-clients-popover">
-                  <DaemonClientsPanel clients={daemonClients} />
-                </div>
-              ) : null}
             </div>
             {!isMobileLayout && connectionReady ? (
               <>
@@ -1033,6 +1229,7 @@ export default function App() {
                   selectedSessionId={selectedSessionId}
                   renamingSessionId={renamingSessionId}
                   renameDraft={renameDraft}
+                  canSaveRename={canSaveRename}
                   onAttach={handleAttach}
                   onStartRename={handleStartRename}
                   onRenameDraftChange={setRenameDraft}
@@ -1058,15 +1255,11 @@ export default function App() {
               <Menu size={16} aria-hidden="true" />
             </button>
           ) : null}
-          <div className="toolbar-group">
-            <Link size={16} aria-hidden="true" />
-            <span>{connectionReady ? "Connected" : activeServer ? "paired daemon" : "unpaired"}</span>
-            {activeServer && connectionReady ? <small>paired daemon</small> : null}
+          <div className="toolbar-title">
+            <MonitorUp size={16} aria-hidden="true" />
+            <span>{toolbarSessionName}</span>
+            {toolbarSessionSize ? <small>{toolbarSessionSize}</small> : null}
           </div>
-          <button type="button" className="toolbar-admin-button" onClick={() => handleOpenAdmin()}>
-            <Server size={16} aria-hidden="true" />
-            Daemons
-          </button>
           {connectionReady && attachedSessionId ? (
             <SessionOperatorsBar
               operators={sessionOperators}
@@ -1074,39 +1267,87 @@ export default function App() {
               sessionId={attachedSessionId}
             />
           ) : null}
+          {connectionReady ? (
+            <div className="toolbar-actions">
+              <button
+                type="button"
+                className="toolbar-clients-button"
+                aria-label="Clients"
+                aria-controls="daemon-clients-popover"
+                aria-expanded={clientsOpen}
+                onClick={() => setClientsOpen((open) => !open)}
+              >
+                <UsersRound size={16} aria-hidden="true" />
+                Clients
+              </button>
+              {clientsOpen ? (
+                <div className="clients-popover toolbar-clients-popover" id="daemon-clients-popover">
+                  <DaemonClientsPanel
+                    clients={daemonClients}
+                    currentDeviceId={state.device?.device_id}
+                    forgettingClientIds={forgettingClientIds}
+                    onForgetOfflineClient={handleForgetOfflineClient}
+                  />
+                </div>
+              ) : null}
+              <button type="button" className="toolbar-admin-button" onClick={() => handleOpenAdmin()}>
+                <Server size={16} aria-hidden="true" />
+                Daemons
+              </button>
+            </div>
+          ) : null}
         </div>
         <div
           className={
-            isMobileLayout
-              ? "workspace-body workspace-body-mobile"
-              : filesPanelOpen
-                ? "workspace-body"
-                : "workspace-body files-panel-hidden"
+            [
+              isMobileLayout
+                ? "workspace-body workspace-body-mobile"
+                : filesPanelOpen
+                  ? "workspace-body"
+                  : "workspace-body files-panel-hidden",
+              error ? "has-error" : "",
+            ]
+              .filter(Boolean)
+              .join(" ")
           }
+          style={desktopWorkspaceStyle}
         >
+          {error ? <ProtocolErrorAlert error={error} /> : null}
           {connectionReady ? (
             <>
               <TerminalPane
                 chunks={terminalChunks}
                 attached={Boolean(attachedSessionId)}
                 sessionSize={attachedSession?.size}
+                focusRequest={terminalFocusRequest}
                 onInput={handleTerminalInput}
                 onResize={handleResize}
                 onCursorChange={handleCursorChange}
               />
               {showDesktopFilesPanel ? (
-                <SessionFilesPanel
-                  attachedSessionId={attachedSessionId}
-                  files={sessionFiles}
-                  loading={sessionFilesLoading}
-                  error={sessionFilesError}
-                  onOpenDirectory={handleOpenDirectory}
-                  onGoToPath={handleGoToFilePath}
-                  onUpload={handleUploadFile}
-                  onDownload={handleDownloadFile}
-                  onDelete={handleDeleteFile}
-                  onHide={handleHideFiles}
-                />
+                <>
+                  <div
+                    className="files-resizer"
+                    role="separator"
+                    aria-label="Resize files panel"
+                    aria-orientation="vertical"
+                    tabIndex={0}
+                    onPointerDown={handleFilesPanelResizePointerDown}
+                    onKeyDown={handleFilesPanelResizeKeyDown}
+                  />
+                  <SessionFilesPanel
+                    attachedSessionId={attachedSessionId}
+                    files={sessionFiles}
+                    loading={sessionFilesLoading}
+                    error={sessionFilesError}
+                    onOpenDirectory={handleOpenDirectory}
+                    onGoToPath={handleGoToFilePath}
+                    onUpload={handleUploadFile}
+                    onDownload={handleDownloadFile}
+                    onDelete={handleDeleteFile}
+                    onHide={handleHideFiles}
+                  />
+                </>
               ) : !isMobileLayout ? (
                 <aside className="files-rail" aria-label="files panel collapsed">
                   <button type="button" className="icon-button" aria-label="Show files panel" onClick={() => setFilesPanelOpen(true)}>
@@ -1169,6 +1410,7 @@ export default function App() {
                 selectedSessionId={selectedSessionId}
                 renamingSessionId={renamingSessionId}
                 renameDraft={renameDraft}
+                canSaveRename={canSaveRename}
                 onAttach={handleAttach}
                 onStartRename={handleStartRename}
                 onRenameDraftChange={setRenameDraft}
@@ -1201,6 +1443,22 @@ export default function App() {
   );
 }
 
+function ProtocolErrorAlert({ error }: { error: SafeError }) {
+  return (
+    <section className="protocol-error-alert" role="alert" aria-label="Connection error">
+      <div className="protocol-error-alert-title">
+        <CircleAlert size={17} aria-hidden="true" />
+        <span>Connection error</span>
+      </div>
+      <div className="protocol-error-alert-detail">
+        <code>{error.code}</code>
+        {/* 主体提示只展示 SafeError 字段，避免把 token、签名或密文等原始 payload 泄漏到 UI。 */}
+        <span>{error.message}</span>
+      </div>
+    </section>
+  );
+}
+
 function SessionOperatorsBar(props: {
   operators: DaemonClientSummaryPayload[];
   currentDeviceId?: UUID;
@@ -1217,6 +1475,7 @@ function SessionOperatorsBar(props: {
       ) : (
         props.operators.map((client) => {
           const isCurrentDevice = client.device_id === props.currentDeviceId;
+          const label = client.name?.trim() || client.peer_ip || "Client";
           const cursor =
             client.cursor_session_id === props.sessionId && client.cursor_row && client.cursor_col
               ? `${client.cursor_row}:${client.cursor_col}`
@@ -1228,9 +1487,9 @@ function SessionOperatorsBar(props: {
                 : "blurred"
               : undefined;
           return (
-            <span className="session-operator" key={client.client_id} title={client.device_id}>
+            <span className="session-operator" key={client.client_id} title={label}>
               <span className="status-dot online" aria-hidden="true" />
-              <span>{client.peer_ip ?? shortSessionId(client.client_id)}</span>
+              <span>{label}</span>
               {isCurrentDevice ? <span>you</span> : null}
               <span className="session-operator-cursor">{cursor}</span>
               {focus ? <span className={client.cursor_focused ? "focus-chip focused" : "focus-chip"}>{focus}</span> : null}
@@ -1281,6 +1540,11 @@ function useMobileLayout(): boolean {
   }, []);
 
   return isMobileLayout;
+}
+
+function clampFilesPanelWidth(width: number, viewportWidth: number): number {
+  const viewportCap = Math.max(MIN_FILES_PANEL_WIDTH, Math.min(MAX_FILES_PANEL_WIDTH, viewportWidth - 420));
+  return Math.max(MIN_FILES_PANEL_WIDTH, Math.min(width, viewportCap));
 }
 
 export function defaultWsUrlFromPage(
@@ -1456,8 +1720,49 @@ function daemonDisplayLabel(server: PairedServerState, index: number): string {
   }
 }
 
-function shortSessionId(sessionId: UUID): string {
-  return sessionId.slice(0, 8);
+function terminalSizeDisplay(size: TerminalSize): string {
+  return `${size.cols}x${size.rows}`;
+}
+
+function sortSessionsNewestFirst(sessions: SessionSummaryPayload[]): SessionSummaryPayload[] {
+  return [...sessions].sort((left, right) => sessionCreatedAt(right) - sessionCreatedAt(left));
+}
+
+function mergeSessionRefresh(
+  remoteSessions: SessionSummaryPayload[],
+  currentSessions: SessionSummaryPayload[],
+  preserveSessionIds: Array<UUID | undefined>,
+): SessionSummaryPayload[] {
+  const currentById = new Map(currentSessions.map((session) => [session.session_id, session]));
+  const remoteIds = new Set(remoteSessions.map((session) => session.session_id));
+  const next: SessionSummaryPayload[] = remoteSessions.map((remote) => {
+    const current = currentById.get(remote.session_id);
+    return {
+      ...remote,
+      // 旧的异步刷新可能带回缺字段的列表；本地已有的展示元数据不能因此抖动。
+      name: remote.name ?? current?.name ?? null,
+      files_path: remote.files_path ?? current?.files_path ?? null,
+      created_at_ms: remote.created_at_ms ?? current?.created_at_ms ?? null,
+    };
+  });
+
+  for (const sessionId of preserveSessionIds) {
+    if (!sessionId || remoteIds.has(sessionId)) {
+      continue;
+    }
+    const current = currentById.get(sessionId);
+    if (current) {
+      // 正在编辑或 attach 的 session 可能被更早发出的旧 session_list 暂时漏掉；
+      // 先保留本地行，下一次权威刷新或保存/关闭结果会再收敛。
+      next.push(current);
+    }
+  }
+
+  return sortSessionsNewestFirst(next);
+}
+
+function sessionCreatedAt(session: SessionSummaryPayload): number {
+  return session.created_at_ms ?? 0;
 }
 
 function joinRemotePath(directory: string, name: string): string {
@@ -1544,9 +1849,10 @@ function triggerBrowserDownload(name: string, dataBase64: string): void {
 function upsertSession(current: SessionSummaryPayload[], session: SessionCreatedPayload): SessionSummaryPayload[] {
   const next = {
     session_id: session.session_id,
-    name: null,
+    name: session.name ?? null,
     state: session.state,
     size: session.size,
+    created_at_ms: Date.now(),
   };
-  return [next, ...current.filter((candidate) => candidate.session_id !== session.session_id)];
+  return sortSessionsNewestFirst([next, ...current.filter((candidate) => candidate.session_id !== session.session_id)]);
 }

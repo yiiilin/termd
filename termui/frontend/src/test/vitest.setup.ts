@@ -9,6 +9,8 @@ import WebSocket from "ws";
 Object.assign(globalThis, { WebSocket });
 
 afterEach(() => {
+  delete (globalThis as { __TERMD_TEST_FIT_DIMENSIONS__?: { rows: number; cols: number } })
+    .__TERMD_TEST_FIT_DIMENSIONS__;
   cleanup();
 });
 
@@ -99,6 +101,8 @@ vi.mock("@xterm/xterm", () => {
       this.element?.querySelector("textarea")?.focus();
     }
 
+    refresh() {}
+
     dispose() {}
   }
 
@@ -110,7 +114,11 @@ vi.mock("@xterm/addon-fit", () => {
     fit() {}
 
     proposeDimensions() {
-      return { rows: 24, cols: 80 };
+      // 测试用例可显式覆盖 xterm 当前容器能容纳的尺寸，用来模拟浏览器窗口 resize。
+      return (
+        (globalThis as { __TERMD_TEST_FIT_DIMENSIONS__?: { rows: number; cols: number } })
+          .__TERMD_TEST_FIT_DIMENSIONS__ ?? { rows: 24, cols: 80 }
+      );
     }
   }
 

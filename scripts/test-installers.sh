@@ -43,4 +43,251 @@ grep -q "KillMode=process" "${ROOT_DIR}/scripts/install-termrelay.sh"
 grep -q "termctl pair --payload" "${ROOT_DIR}/scripts/install-termd.sh"
 ! grep -q "termctl pair --token" "${ROOT_DIR}/scripts/install-termd.sh"
 
+load_termd_installer_functions() {
+  # 测试只加载函数和默认变量，跳过脚本末尾的 main 调用，避免触发真实安装。
+  # shellcheck source=/dev/null
+  source <(sed '/^main "\$@"/,$d' "${ROOT_DIR}/scripts/install-termd.sh")
+}
+
+assert_file_contains() {
+  local file="$1"
+  local expected="$2"
+
+  if ! grep -Fq "$expected" "$file"; then
+    printf 'expected %s to contain %q\n' "$file" "$expected" >&2
+    printf 'actual file:\n' >&2
+    sed -n '1,160p' "$file" >&2
+    exit 1
+  fi
+}
+
+install_fake_termd_system_commands() {
+  # 用假的系统账号数据库覆盖 id/getent，测试即可稳定覆盖 alice/bob/termd 三种路径。
+  id() {
+    case "${1:-}" in
+      -u)
+        case "${2:-}" in
+          alice) printf '1001\n' ;;
+          bob) printf '1002\n' ;;
+          *) return 1 ;;
+        esac
+        ;;
+      -gn)
+        case "${2:-}" in
+          alice) printf 'alice-primary\n' ;;
+          bob) printf 'bob-primary\n' ;;
+          *) return 1 ;;
+        esac
+        ;;
+      *)
+        command id "$@"
+        ;;
+    esac
+  }
+
+  getent() {
+    case "${1:-}:${2:-}" in
+      passwd:alice) printf 'alice:x:1001:1001:Alice:/home/alice:/bin/zsh\n' ;;
+      passwd:bob) printf 'bob:x:1002:1002:Bob:/srv/bob:/usr/sbin/nologin\n' ;;
+      group:deploy) printf 'deploy:x:2001:\n' ;;
+      group:alice-primary) printf 'alice-primary:x:1001:\n' ;;
+      group:bob-primary) printf 'bob-primary:x:1002:\n' ;;
+      *) return 2 ;;
+    esac
+  }
+
+  require_root() { :; }
+  require_cmd() { :; }
+  resolve_version() { VERSION="v-test"; }
+  install_from_release() { return 0; }
+  install_from_source() { return 1; }
+  ensure_system_user() { :; }
+  chown() { :; }
+  chmod() { :; }
+  systemctl() { :; }
+  print_initial_pairing_token() { :; }
+}
+
+run_fake_termd_install() {
+  local unit_file="$1"
+  shift
+
+  REPO="example/termd"
+  VERSION=""
+  UNIT_FILE="$unit_file"
+  ENV_FILE="${unit_file%.service}.env"
+  ENV_DIR="$(dirname "$ENV_FILE")"
+  WRAPPER_FILE="${unit_file%.service}-run"
+  main "$@" >/dev/null
+}
+
+test_termd_default_install_uses_managed_user() (
+  load_termd_installer_functions
+  install_fake_termd_system_commands
+
+  local tmp_dir unit_file
+  tmp_dir="$(mktemp -d)"
+  trap 'rm -rf "$tmp_dir"' EXIT
+  unit_file="${tmp_dir}/termd.service"
+
+  run_fake_termd_install "$unit_file"
+
+  assert_file_contains "$unit_file" "User=termd"
+  assert_file_contains "$unit_file" "Group=termd"
+  assert_file_contains "$unit_file" "WorkingDirectory=/var/lib/termd"
+  assert_file_contains "$unit_file" "EnvironmentFile=-${tmp_dir}/termd.env"
+  assert_file_contains "$unit_file" "StateDirectory=termd"
+
+  assert_file_contains "${tmp_dir}/termd.env" "HOME=/var/lib/termd"
+  assert_file_contains "${tmp_dir}/termd.env" "SHELL=/bin/sh"
+)
+
+test_termd_upgrade_inherits_existing_user_without_user_arg() (
+  load_termd_installer_functions
+  install_fake_termd_system_commands
+
+  local tmp_dir unit_file
+  tmp_dir="$(mktemp -d)"
+  trap 'rm -rf "$tmp_dir"' EXIT
+  unit_file="${tmp_dir}/termd.service"
+  cat >"$unit_file" <<'EOF'
+[Unit]
+Description=existing termd
+
+[Service]
+User=alice
+Group=deploy
+WorkingDirectory=/old/state
+EOF
+
+  run_fake_termd_install "$unit_file"
+
+  assert_file_contains "$unit_file" "User=alice"
+  assert_file_contains "$unit_file" "Group=deploy"
+  assert_file_contains "$unit_file" "WorkingDirectory=/var/lib/termd"
+  assert_file_contains "$unit_file" "EnvironmentFile=-${tmp_dir}/termd.env"
+  assert_file_contains "${tmp_dir}/termd.env" "HOME=/home/alice"
+  assert_file_contains "${tmp_dir}/termd.env" "SHELL=/bin/zsh"
+)
+
+test_termd_upgrade_uses_fixed_state_dir_when_existing_unit_has_no_working_directory() (
+  load_termd_installer_functions
+  install_fake_termd_system_commands
+
+  local tmp_dir unit_file
+  tmp_dir="$(mktemp -d)"
+  trap 'rm -rf "$tmp_dir"' EXIT
+  unit_file="${tmp_dir}/termd.service"
+  cat >"$unit_file" <<'EOF'
+[Unit]
+Description=existing termd
+
+[Service]
+User=alice
+Group=deploy
+EOF
+
+  run_fake_termd_install "$unit_file"
+
+  assert_file_contains "$unit_file" "User=alice"
+  assert_file_contains "$unit_file" "Group=deploy"
+  assert_file_contains "$unit_file" "WorkingDirectory=/var/lib/termd"
+  assert_file_contains "$unit_file" "EnvironmentFile=-${tmp_dir}/termd.env"
+  assert_file_contains "${tmp_dir}/termd.env" "HOME=/home/alice"
+  assert_file_contains "${tmp_dir}/termd.env" "SHELL=/bin/zsh"
+)
+
+test_termd_explicit_user_overrides_existing_service_user() (
+  load_termd_installer_functions
+  install_fake_termd_system_commands
+
+  local tmp_dir unit_file
+  tmp_dir="$(mktemp -d)"
+  trap 'rm -rf "$tmp_dir"' EXIT
+  unit_file="${tmp_dir}/termd.service"
+  cat >"$unit_file" <<'EOF'
+[Service]
+User=alice
+Group=deploy
+EOF
+
+  run_fake_termd_install "$unit_file" --user bob
+
+  assert_file_contains "$unit_file" "User=bob"
+  assert_file_contains "$unit_file" "Group=bob-primary"
+  assert_file_contains "$unit_file" "WorkingDirectory=/var/lib/termd"
+  assert_file_contains "$unit_file" "EnvironmentFile=-${tmp_dir}/termd.env"
+  assert_file_contains "${tmp_dir}/termd.env" "HOME=/srv/bob"
+  assert_file_contains "${tmp_dir}/termd.env" "SHELL=/bin/sh"
+)
+
+test_termd_state_dir_change_clears_only_session_state() (
+  load_termd_installer_functions
+
+  local tmp_dir sqlite_file socket_file
+  tmp_dir="$(mktemp -d)"
+  trap 'rm -rf "$tmp_dir"' EXIT
+  STATE_DIR="${tmp_dir}/termd"
+  PREVIOUS_STATE_DIR="/old/state"
+  mkdir -p "${STATE_DIR}/termd-supervisors"
+  sqlite_file="${STATE_DIR}/daemon-state.sqlite"
+  socket_file="${STATE_DIR}/termd-supervisors/stale.sock"
+
+  python3 - "$sqlite_file" <<'PY'
+import sqlite3
+import sys
+
+conn = sqlite3.connect(sys.argv[1])
+conn.executescript("""
+CREATE TABLE daemon_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at_ms INTEGER NOT NULL);
+CREATE TABLE trusted_devices (device_id TEXT PRIMARY KEY, public_key TEXT NOT NULL, trusted_at_ms INTEGER NOT NULL);
+CREATE TABLE daemon_clients (device_id TEXT PRIMARY KEY);
+CREATE TABLE daemon_client_attached_sessions (device_id TEXT NOT NULL, connection_id TEXT NOT NULL, session_id TEXT NOT NULL);
+CREATE TABLE daemon_sessions (session_id TEXT PRIMARY KEY);
+CREATE TABLE runtime_sessions (session_id TEXT PRIMARY KEY);
+INSERT INTO daemon_meta VALUES ('server_id', 'server', 1);
+INSERT INTO trusted_devices VALUES ('device', 'public', 1);
+INSERT INTO daemon_clients VALUES ('device');
+INSERT INTO daemon_client_attached_sessions VALUES ('device', 'connection', 'session');
+INSERT INTO daemon_sessions VALUES ('session');
+INSERT INTO runtime_sessions VALUES ('session');
+""")
+conn.close()
+PY
+  python3 - "$socket_file" <<'PY'
+import socket
+import sys
+
+sock = socket.socket(socket.AF_UNIX)
+sock.bind(sys.argv[1])
+sock.close()
+PY
+
+  clear_session_state_after_state_dir_change >/dev/null
+
+  python3 - "$sqlite_file" "$socket_file" <<'PY'
+import pathlib
+import sqlite3
+import sys
+
+conn = sqlite3.connect(sys.argv[1])
+try:
+    for table in ("daemon_client_attached_sessions", "daemon_sessions", "runtime_sessions"):
+        count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        assert count == 0, (table, count)
+    assert conn.execute("SELECT COUNT(*) FROM daemon_meta").fetchone()[0] == 1
+    assert conn.execute("SELECT COUNT(*) FROM trusted_devices").fetchone()[0] == 1
+    assert conn.execute("SELECT COUNT(*) FROM daemon_clients").fetchone()[0] == 1
+finally:
+    conn.close()
+assert not pathlib.Path(sys.argv[2]).exists()
+PY
+)
+
+test_termd_default_install_uses_managed_user
+test_termd_upgrade_inherits_existing_user_without_user_arg
+test_termd_upgrade_uses_fixed_state_dir_when_existing_unit_has_no_working_directory
+test_termd_explicit_user_overrides_existing_service_user
+test_termd_state_dir_change_clears_only_session_state
+
 printf 'installer tests passed\n'

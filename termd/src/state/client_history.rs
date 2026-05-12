@@ -17,6 +17,7 @@ use super::{StateError, sqlite_state_path_for_state_path};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientHistoryRecord {
     pub device_id: DeviceId,
+    pub name: Option<String>,
     pub peer_ip: Option<String>,
     pub online: bool,
     pub connected_at_ms: UnixTimestampMillis,
@@ -72,6 +73,7 @@ impl ClientHistoryStore {
 
                 CREATE TABLE IF NOT EXISTS daemon_clients (
                     device_id TEXT PRIMARY KEY,
+                    name TEXT,
                     peer_ip TEXT,
                     connected_at_ms INTEGER NOT NULL,
                     last_seen_at_ms INTEGER NOT NULL,
@@ -109,8 +111,38 @@ impl ClientHistoryStore {
             )
             .map_err(|source| sqlite_error(&self.path, source))?;
 
+        self.ensure_daemon_clients_name_column()?;
         self.reset_runtime_state()?;
         Ok(())
+    }
+
+    fn ensure_daemon_clients_name_column(&self) -> Result<(), StateError> {
+        if self.column_exists("daemon_clients", "name")? {
+            return Ok(());
+        }
+
+        // 旧版 SQLite 没有客户端展示名列；在线历史保留，后续连接会自动补充 name。
+        self.conn
+            .execute("ALTER TABLE daemon_clients ADD COLUMN name TEXT", [])
+            .map_err(|source| sqlite_error(&self.path, source))?;
+        Ok(())
+    }
+
+    fn column_exists(&self, table: &str, column: &str) -> Result<bool, StateError> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .map_err(|source| sqlite_error(&self.path, source))?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|source| sqlite_error(&self.path, source))?;
+
+        for row in rows {
+            if row.map_err(|source| sqlite_error(&self.path, source))? == column {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// 启动时把活跃连接状态清成空，这样重启后不会把旧进程残留的在线状态误认为真实在线。
@@ -134,6 +166,7 @@ impl ClientHistoryStore {
         session_id: SessionId,
         state: SessionState,
         size: TerminalSize,
+        name: Option<&str>,
         root_path: impl AsRef<Path>,
         now_ms: UnixTimestampMillis,
     ) -> Result<(), StateError> {
@@ -155,8 +188,9 @@ impl ClientHistoryStore {
                     created_at_ms,
                     updated_at_ms
                 )
-                VALUES (?1, NULL, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?8)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?9)
                 ON CONFLICT(session_id) DO UPDATE SET
+                    name = COALESCE(daemon_sessions.name, excluded.name),
                     state = excluded.state,
                     rows = excluded.rows,
                     cols = excluded.cols,
@@ -167,6 +201,7 @@ impl ClientHistoryStore {
                 "#,
                 params![
                     session_id_text(session_id),
+                    name,
                     session_state_text(state),
                     i64::from(size.rows),
                     i64::from(size.cols),
@@ -279,6 +314,73 @@ impl ClientHistoryStore {
         Ok(())
     }
 
+    /// daemon 重启后修复可重连 session 的展示元数据。
+    ///
+    /// runtime_sessions 是 supervisor 是否可恢复的事实来源；如果 daemon_sessions 行缺失或仍是
+    /// closed，这里用保守默认值补齐 Web/CLI 列表需要的 root、name 和 files_path。已有用户命名
+    /// 和文件树位置不会被默认值覆盖。
+    pub fn record_session_restored(
+        &mut self,
+        session_id: SessionId,
+        state: SessionState,
+        size: TerminalSize,
+        root_path: impl AsRef<Path>,
+        default_name: &str,
+        files_path: impl AsRef<Path>,
+        created_at_ms: UnixTimestampMillis,
+        updated_at_ms: UnixTimestampMillis,
+    ) -> Result<SessionHistoryRecord, StateError> {
+        let root_path = root_path.as_ref().to_string_lossy().to_string();
+        let files_path = files_path.as_ref().to_string_lossy().to_string();
+
+        self.conn
+            .execute(
+                r#"
+                INSERT INTO daemon_sessions (
+                    session_id,
+                    name,
+                    state,
+                    rows,
+                    cols,
+                    pixel_width,
+                    pixel_height,
+                    root_path,
+                    files_path,
+                    created_at_ms,
+                    updated_at_ms
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    name = COALESCE(daemon_sessions.name, excluded.name),
+                    state = excluded.state,
+                    rows = excluded.rows,
+                    cols = excluded.cols,
+                    pixel_width = excluded.pixel_width,
+                    pixel_height = excluded.pixel_height,
+                    root_path = daemon_sessions.root_path,
+                    files_path = COALESCE(daemon_sessions.files_path, excluded.files_path),
+                    updated_at_ms = excluded.updated_at_ms
+                "#,
+                params![
+                    session_id_text(session_id),
+                    default_name,
+                    session_state_text(state),
+                    i64::from(size.rows),
+                    i64::from(size.cols),
+                    i64::from(size.pixel_width),
+                    i64::from(size.pixel_height),
+                    root_path,
+                    files_path,
+                    created_at_ms.0 as i64,
+                    updated_at_ms.0 as i64,
+                ],
+            )
+            .map_err(|source| sqlite_error(&self.path, source))?;
+
+        self.session_record(session_id)?
+            .ok_or_else(|| sqlite_error(&self.path, rusqlite::Error::QueryReturnedNoRows))
+    }
+
     /// 读取 session 级文件树当前位置。
     pub fn session_files_path(&self, session_id: SessionId) -> Result<Option<String>, StateError> {
         let path = self
@@ -293,6 +395,36 @@ impl ClientHistoryStore {
             .flatten();
 
         Ok(path)
+    }
+
+    /// 按 id 读取单条 session 元数据；包含 closed 行，供重启恢复路径修复可见性。
+    fn session_record(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<SessionHistoryRecord>, StateError> {
+        self.conn
+            .query_row(
+                r#"
+                SELECT
+                    session_id,
+                    name,
+                    state,
+                    rows,
+                    cols,
+                    pixel_width,
+                    pixel_height,
+                    root_path,
+                    files_path,
+                    created_at_ms,
+                    updated_at_ms
+                FROM daemon_sessions
+                WHERE session_id = ?1
+                "#,
+                params![session_id_text(session_id)],
+                session_history_record_from_row,
+            )
+            .optional()
+            .map_err(|source| sqlite_error(&self.path, source))
     }
 
     /// 返回仍处于可见状态的 session 元数据。
@@ -337,6 +469,7 @@ impl ClientHistoryStore {
     pub fn record_connection(
         &mut self,
         device_id: DeviceId,
+        name: Option<&str>,
         peer_ip: Option<&str>,
         now_ms: UnixTimestampMillis,
     ) -> Result<(), StateError> {
@@ -349,18 +482,20 @@ impl ClientHistoryStore {
             r#"
             INSERT INTO daemon_clients (
                 device_id,
+                name,
                 peer_ip,
                 connected_at_ms,
                 last_seen_at_ms,
                 active_connection_count
             )
-            VALUES (?1, ?2, ?3, ?3, 1)
+            VALUES (?1, ?2, ?3, ?4, ?4, 1)
             ON CONFLICT(device_id) DO UPDATE SET
+                name = COALESCE(excluded.name, daemon_clients.name),
                 peer_ip = excluded.peer_ip,
                 last_seen_at_ms = excluded.last_seen_at_ms,
                 active_connection_count = daemon_clients.active_connection_count + 1
             "#,
-            params![device_id_text(device_id), peer_ip, now_ms.0 as i64],
+            params![device_id_text(device_id), name, peer_ip, now_ms.0 as i64],
         )
         .map_err(|source| sqlite_error(&self.path, source))?;
 
@@ -445,6 +580,27 @@ impl ClientHistoryStore {
         Ok(())
     }
 
+    /// 更新客户端展示名；只影响 UI 区分，不改变设备信任关系。
+    pub fn record_client_name(
+        &mut self,
+        device_id: DeviceId,
+        name: &str,
+        now_ms: UnixTimestampMillis,
+    ) -> Result<(), StateError> {
+        self.conn
+            .execute(
+                r#"
+                UPDATE daemon_clients
+                SET name = ?1,
+                    last_seen_at_ms = ?2
+                WHERE device_id = ?3
+                "#,
+                params![name, now_ms.0 as i64, device_id_text(device_id)],
+            )
+            .map_err(|source| sqlite_error(&self.path, source))?;
+        Ok(())
+    }
+
     /// 判断某个设备当前是否还有活跃 session。
     pub fn device_has_active_session(
         &self,
@@ -480,6 +636,44 @@ impl ClientHistoryStore {
             )
             .map_err(|source| sqlite_error(&self.path, source))?;
         Ok(())
+    }
+
+    /// 删除离线客户端历史记录；在线客户端仍由当前连接负责维护，不能在这里清掉。
+    pub fn forget_offline_client(&mut self, device_id: DeviceId) -> Result<bool, StateError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&self.path, source))?;
+        let active_connection_count = tx
+            .query_row(
+                "SELECT active_connection_count FROM daemon_clients WHERE device_id = ?1",
+                params![device_id_text(device_id)],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|source| sqlite_error(&self.path, source))?;
+
+        if active_connection_count.unwrap_or_default() > 0 {
+            tx.commit()
+                .map_err(|source| sqlite_error(&self.path, source))?;
+            return Ok(false);
+        }
+
+        tx.execute(
+            "DELETE FROM daemon_client_attached_sessions WHERE device_id = ?1",
+            params![device_id_text(device_id)],
+        )
+        .map_err(|source| sqlite_error(&self.path, source))?;
+        let deleted = tx
+            .execute(
+                "DELETE FROM daemon_clients WHERE device_id = ?1",
+                params![device_id_text(device_id)],
+            )
+            .map_err(|source| sqlite_error(&self.path, source))?
+            > 0;
+        tx.commit()
+            .map_err(|source| sqlite_error(&self.path, source))?;
+        Ok(deleted)
     }
 
     /// 返回当前 daemon 看到过的所有客户端摘要。
@@ -520,7 +714,7 @@ impl ClientHistoryStore {
             .conn
             .prepare(
                 r#"
-                SELECT device_id, peer_ip, connected_at_ms, last_seen_at_ms, active_connection_count
+                SELECT device_id, name, peer_ip, connected_at_ms, last_seen_at_ms, active_connection_count
                 FROM daemon_clients
                 ORDER BY connected_at_ms, device_id
                 "#,
@@ -529,13 +723,15 @@ impl ClientHistoryStore {
         let rows = stmt
             .query_map([], |row| {
                 let device_id = parse_device_id(row.get::<_, String>(0)?)?;
-                let peer_ip = row.get::<_, Option<String>>(1)?;
-                let connected_at_ms = UnixTimestampMillis(row.get::<_, i64>(2)? as u64);
-                let last_seen_at_ms = UnixTimestampMillis(row.get::<_, i64>(3)? as u64);
-                let active_connection_count = row.get::<_, i64>(4)?;
+                let name = row.get::<_, Option<String>>(1)?;
+                let peer_ip = row.get::<_, Option<String>>(2)?;
+                let connected_at_ms = UnixTimestampMillis(row.get::<_, i64>(3)? as u64);
+                let last_seen_at_ms = UnixTimestampMillis(row.get::<_, i64>(4)? as u64);
+                let active_connection_count = row.get::<_, i64>(5)?;
 
                 Ok(ClientHistoryRow {
                     device_id,
+                    name,
                     peer_ip,
                     connected_at_ms,
                     last_seen_at_ms,
@@ -554,6 +750,7 @@ impl ClientHistoryStore {
 
             clients.push(ClientHistoryRecord {
                 device_id: row.device_id,
+                name: row.name,
                 peer_ip: row.peer_ip,
                 online: row.active_connection_count > 0,
                 connected_at_ms: row.connected_at_ms,
@@ -569,6 +766,7 @@ impl ClientHistoryStore {
 #[derive(Debug)]
 struct ClientHistoryRow {
     device_id: DeviceId,
+    name: Option<String>,
     peer_ip: Option<String>,
     connected_at_ms: UnixTimestampMillis,
     last_seen_at_ms: UnixTimestampMillis,
@@ -697,7 +895,12 @@ mod tests {
         {
             let mut store = ClientHistoryStore::open(&state_path).unwrap();
             store
-                .record_connection(device_id, Some("192.0.2.10"), now_ms)
+                .record_connection(
+                    device_id,
+                    Some("Browser on Linux"),
+                    Some("192.0.2.10"),
+                    now_ms,
+                )
                 .unwrap();
             store
                 .record_attach(device_id, connection_id, session_id, now_ms)
@@ -706,6 +909,7 @@ mod tests {
             let clients = store.list_clients().unwrap();
             assert_eq!(clients.len(), 1);
             assert!(clients[0].online);
+            assert_eq!(clients[0].name.as_deref(), Some("Browser on Linux"));
             assert_eq!(clients[0].attached_session_ids, vec![session_id]);
         }
 
@@ -737,6 +941,7 @@ mod tests {
                     session_id,
                     SessionState::Running,
                     TerminalSize::new(24, 80),
+                    Some("initial shell"),
                     "/home/me",
                     now_ms,
                 )
@@ -770,6 +975,83 @@ mod tests {
                 store.session_files_path(session_id).unwrap().as_deref(),
                 Some("/home/me/project")
             );
+        }
+
+        let _ = fs::remove_file(sqlite_state_path_for_state_path(&state_path));
+        let _ = fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn store_repairs_restored_session_metadata_without_overwriting_user_values() {
+        let state_path = std::env::temp_dir().join(format!(
+            "termd-session-restore-store-{}.json",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(sqlite_state_path_for_state_path(&state_path));
+        let missing_session_id = SessionId::new();
+        let existing_session_id = SessionId::new();
+
+        {
+            let mut store = ClientHistoryStore::open(&state_path).unwrap();
+            let repaired = store
+                .record_session_restored(
+                    missing_session_id,
+                    SessionState::Running,
+                    TerminalSize::new(32, 100),
+                    "/tmp/restored-root",
+                    "restored-shell",
+                    "/tmp/restored-root",
+                    UnixTimestampMillis(1_000),
+                    UnixTimestampMillis(1_001),
+                )
+                .unwrap();
+
+            assert_eq!(repaired.name.as_deref(), Some("restored-shell"));
+            assert_eq!(repaired.root_path, "/tmp/restored-root");
+            assert_eq!(repaired.files_path.as_deref(), Some("/tmp/restored-root"));
+
+            store
+                .record_session_created(
+                    existing_session_id,
+                    SessionState::Running,
+                    TerminalSize::new(24, 80),
+                    Some("initial shell"),
+                    "/home/me",
+                    UnixTimestampMillis(2_000),
+                )
+                .unwrap();
+            store
+                .record_session_renamed(
+                    existing_session_id,
+                    Some("kept name"),
+                    UnixTimestampMillis(2_001),
+                )
+                .unwrap();
+            store
+                .record_session_files_path(
+                    existing_session_id,
+                    "/home/me/project",
+                    UnixTimestampMillis(2_002),
+                )
+                .unwrap();
+
+            let existing = store
+                .record_session_restored(
+                    existing_session_id,
+                    SessionState::Running,
+                    TerminalSize::new(40, 120),
+                    "/tmp/default-root",
+                    "default-name",
+                    "/tmp/default-root",
+                    UnixTimestampMillis(2_000),
+                    UnixTimestampMillis(2_003),
+                )
+                .unwrap();
+
+            assert_eq!(existing.name.as_deref(), Some("kept name"));
+            assert_eq!(existing.root_path, "/home/me");
+            assert_eq!(existing.files_path.as_deref(), Some("/home/me/project"));
+            assert_eq!(existing.size, TerminalSize::new(40, 120));
         }
 
         let _ = fs::remove_file(sqlite_state_path_for_state_path(&state_path));

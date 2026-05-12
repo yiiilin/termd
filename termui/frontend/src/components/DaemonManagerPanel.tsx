@@ -44,7 +44,6 @@ export function DaemonManagerPanel(props: DaemonManagerPanelProps) {
             ) : (
               <div className="daemon-manager-main">
                 <strong>{label}</strong>
-                <span>{shortId(item.server.server_id)}</span>
                 <span>{item.server.url}</span>
               </div>
             )}
@@ -107,8 +106,4 @@ export function DaemonManagerPanel(props: DaemonManagerPanelProps) {
 
 function daemonLabel(server: PairedServerState, fallback: string): string {
   return server.name?.trim() || fallback;
-}
-
-function shortId(value: string): string {
-  return value.slice(0, 8);
 }

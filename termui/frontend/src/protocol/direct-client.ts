@@ -3,7 +3,10 @@ import { E2eeSession, generateE2eeKeyPair } from "./e2ee";
 import { ProtocolClientError, protocolError } from "./errors";
 import type {
   AuthChallengePayload,
+  ClientHelloPayload,
   ControlGrantPayload,
+  DaemonClientForgetPayload,
+  DaemonClientForgotPayload,
   DeviceState,
   E2eeKeyExchangePayload,
   EncryptedFramePayload,
@@ -188,6 +191,7 @@ export class DirectClient {
       device.device_signing_key_secret,
     );
     await this.sendInner(envelope("auth", auth));
+    await this.sendInner(envelope("client_hello", { name: device.name?.trim() || "Web client" } satisfies ClientHelloPayload));
   }
 
   async listSessions(): Promise<SessionListResultPayload> {
@@ -198,6 +202,11 @@ export class DirectClient {
   async listDaemonClients(): Promise<DaemonClientsResultPayload> {
     await this.sendInner(envelope("daemon_clients", {}));
     return this.expectPayload<DaemonClientsResultPayload>("daemon_clients_result");
+  }
+
+  async forgetDaemonClient(deviceId: UUID): Promise<DaemonClientForgotPayload> {
+    await this.sendInner(envelope("daemon_client_forget", { device_id: deviceId } satisfies DaemonClientForgetPayload));
+    return this.expectPayload<DaemonClientForgotPayload>("daemon_client_forgot");
   }
 
   async listSessionFiles(sessionId: UUID, path?: string): Promise<SessionFilesResultPayload> {

@@ -26,10 +26,15 @@ export async function saveBrowserState(state: BrowserState): Promise<void> {
 export async function ensureDevice(): Promise<DeviceState> {
   const state = await loadBrowserState();
   if (state.device) {
+    if (!normalizeDeviceName(state.device.name)) {
+      const device = { ...state.device, name: defaultDeviceName() };
+      await saveBrowserState({ ...state, device });
+      return device;
+    }
     return state.device;
   }
 
-  const device = await generateDeviceIdentity();
+  const device = { ...(await generateDeviceIdentity()), name: defaultDeviceName() };
   await saveBrowserState({ ...state, device });
   return device;
 }
@@ -160,6 +165,7 @@ function normalizeState(state: BrowserState): BrowserState {
           device_id: state.device.device_id,
           device_public_key: state.device.device_public_key,
           device_signing_key_secret: state.device.device_signing_key_secret,
+          ...(normalizeDeviceName(state.device.name) ? { name: normalizeDeviceName(state.device.name) } : {}),
         }
       : undefined,
     pairedServers,
@@ -209,6 +215,26 @@ function normalizeDaemonName(value: unknown): string | undefined {
   }
   const trimmed = value.trim();
   return trimmed || undefined;
+}
+
+function normalizeDeviceName(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  return trimmed || undefined;
+}
+
+function defaultDeviceName(): string {
+  const platform =
+    typeof navigator === "undefined"
+      ? undefined
+      : // userAgentData 在部分浏览器存在；没有时回退到 platform，避免引入额外依赖。
+        ((navigator as Navigator & { userAgentData?: { platform?: string } }).userAgentData?.platform ||
+          navigator.platform);
+  const cleanPlatform = platform?.trim();
+  const suffix = Math.floor(1000 + Math.random() * 9000);
+  return cleanPlatform ? `Web client ${suffix} on ${cleanPlatform}` : `Web client ${suffix}`;
 }
 
 function openStateDb(): Promise<IDBDatabase> {

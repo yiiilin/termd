@@ -55,8 +55,11 @@ pub enum MessageType {
     SessionFileDeleted,
     SessionList,
     SessionListResult,
+    ClientHello,
     DaemonClients,
     DaemonClientsResult,
+    DaemonClientForget,
+    DaemonClientForgot,
     ControlRequest,
     ControlGrant,
     E2eeKeyExchange,
@@ -422,6 +425,9 @@ pub struct SessionCreatePayload {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionCreatedPayload {
     pub session_id: SessionId,
+    /// daemon 分配的稳定展示名；旧客户端/旧 daemon 可能缺失，前端需保留兜底显示。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub role: AttachRole,
     pub state: SessionState,
     pub size: TerminalSize,
@@ -450,6 +456,9 @@ pub struct SessionSummaryPayload {
     /// session 级共享文件树位置；为空时客户端应向 daemon 请求默认目录。
     #[serde(default)]
     pub files_path: Option<String>,
+    /// 创建时间只用于客户端排序和人类可读展示，不参与权限或路由判断。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at_ms: Option<UnixTimestampMillis>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -461,6 +470,14 @@ pub struct SessionListResultPayload {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonClientsPayload {}
 
+/// 已认证客户端上报的人类可读展示信息。
+///
+/// 这不是认证材料；device id 和签名仍然是唯一可信身份。name 只用于 UI 区分多个浏览器。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientHelloPayload {
+    pub name: String,
+}
+
 /// daemon 下单个客户端的展示摘要。
 ///
 /// 该结构只用于个人视图里的连接可见性，不表达审计、账号或企业权限模型。
@@ -468,6 +485,8 @@ pub struct DaemonClientsPayload {}
 pub struct DaemonClientSummaryPayload {
     pub client_id: ClientId,
     pub device_id: DeviceId,
+    #[serde(default)]
+    pub name: Option<String>,
     pub peer_ip: Option<String>,
     pub online: bool,
     pub connected_at_ms: UnixTimestampMillis,
@@ -490,6 +509,17 @@ pub struct DaemonClientSummaryPayload {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonClientsResultPayload {
     pub clients: Vec<DaemonClientSummaryPayload>,
+}
+
+/// 删除 daemon 里的离线客户端历史记录。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonClientForgetPayload {
+    pub device_id: DeviceId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonClientForgotPayload {
+    pub device_id: DeviceId,
 }
 
 /// `session_data` 在 JSON 通道中使用 base64；二进制 WebSocket 帧可绕过这个结构。
@@ -736,8 +766,11 @@ mod tests {
             (MessageType::SessionFileDeleted, "session_file_deleted"),
             (MessageType::SessionList, "session_list"),
             (MessageType::SessionListResult, "session_list_result"),
+            (MessageType::ClientHello, "client_hello"),
             (MessageType::DaemonClients, "daemon_clients"),
             (MessageType::DaemonClientsResult, "daemon_clients_result"),
+            (MessageType::DaemonClientForget, "daemon_client_forget"),
+            (MessageType::DaemonClientForgot, "daemon_client_forgot"),
             (MessageType::ControlRequest, "control_request"),
             (MessageType::ControlGrant, "control_grant"),
             (MessageType::E2eeKeyExchange, "e2ee_key_exchange"),
@@ -944,6 +977,7 @@ mod tests {
         });
         assert_roundtrip(SessionCreatedPayload {
             session_id,
+            name: Some("Ada".to_owned()),
             role: AttachRole::Operator,
             state: SessionState::Running,
             size,
@@ -1038,6 +1072,7 @@ mod tests {
                 state: SessionState::Running,
                 size,
                 files_path: Some("/home/me/project".to_owned()),
+                created_at_ms: Some(UnixTimestampMillis(1_710_000_000_000)),
             }],
         });
         assert_roundtrip(ControlRequestPayload {
@@ -1064,11 +1099,15 @@ mod tests {
             serde_json::to_value(MessageType::DaemonClientsResult).unwrap(),
             "daemon_clients_result"
         );
+        assert_roundtrip(ClientHelloPayload {
+            name: "Browser on Linux".to_owned(),
+        });
         assert_roundtrip(DaemonClientsPayload {});
         assert_roundtrip(DaemonClientsResultPayload {
             clients: vec![DaemonClientSummaryPayload {
                 client_id,
                 device_id,
+                name: Some("Browser on Linux".to_owned()),
                 peer_ip: Some("192.0.2.10".to_owned()),
                 online: false,
                 connected_at_ms: UnixTimestampMillis(1_710_000_000_000),
@@ -1080,6 +1119,8 @@ mod tests {
                 cursor_focused: Some(true),
             }],
         });
+        assert_roundtrip(DaemonClientForgetPayload { device_id });
+        assert_roundtrip(DaemonClientForgotPayload { device_id });
     }
 
     #[test]

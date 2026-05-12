@@ -4,6 +4,16 @@ use std::process::Command as ProcessCommand;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::{Engine as _, engine::general_purpose};
+use ed25519_dalek::SigningKey;
+use rand_core::OsRng;
+use termd::auth::current_unix_timestamp_millis;
+use termd::config::DaemonConfig;
+use termd::net::protocol::{
+    DaemonProtocol, JsonEnvelope, ProtocolConnection, decode_payload,
+    encrypted_frame_from_envelope, envelope_value,
+};
+use termd::net::signature::Ed25519SignatureVerifier;
+use termd::net::{E2eeKeyPair, E2eeSession, E2eeSessionContext, E2eeSessionRole};
 use termd::pty::supervisor::SupervisorPtyBackend;
 use termd::pty::{
     CommandSpec, PtyBackend, PtyRestoreInfo, PtySession, PtySize, PtySupervisorStatus,
@@ -11,7 +21,11 @@ use termd::pty::{
 use termd::runtime::SessionRuntime;
 use termd::session::TerminalSize;
 use termd::state::{DaemonIdentitySnapshot, DaemonState, SessionStateRecord, StateStore};
-use termd_proto::{PublicKey, ServerId, SessionId, SessionState, UnixTimestampMillis};
+use termd_proto::{
+    DeviceId, E2eeKeyExchangePayload, MessageType, Nonce, PairAcceptPayload, PairRequestPayload,
+    PublicKey, ServerId, SessionClosePayload, SessionClosedPayload, SessionId, SessionListPayload,
+    SessionListResultPayload, SessionState, UnixTimestampMillis,
+};
 
 fn temp_state_path(name: &str) -> PathBuf {
     let nanos = SystemTime::now()
@@ -70,6 +84,102 @@ fn restore_supervisor_pid(restore_info: &PtyRestoreInfo) -> u32 {
     match restore_info {
         PtyRestoreInfo::UnixSocket { supervisor_pid, .. } => *supervisor_pid,
     }
+}
+
+fn nonce() -> Nonce {
+    Nonce(uuid::Uuid::new_v4().to_string())
+}
+
+fn ed25519_wire(bytes: &[u8]) -> String {
+    format!("ed25519-v1:{}", general_purpose::STANDARD.encode(bytes))
+}
+
+fn open_e2ee(
+    protocol: &mut DaemonProtocol<SupervisorPtyBackend, Ed25519SignatureVerifier>,
+    connection: &mut ProtocolConnection,
+    device_id: DeviceId,
+) -> E2eeSession {
+    let device_keypair = E2eeKeyPair::generate();
+    let context = E2eeSessionContext::new(
+        protocol.server_id(),
+        device_id,
+        protocol.e2ee_public_key(),
+        device_keypair.public_key(),
+    );
+    let device_session = E2eeSession::new(
+        E2eeSessionRole::Device,
+        &device_keypair,
+        protocol.e2ee_public_key(),
+        context,
+    )
+    .unwrap();
+    let handshake = envelope_value(
+        MessageType::E2eeKeyExchange,
+        E2eeKeyExchangePayload {
+            server_id: protocol.server_id(),
+            device_id,
+            public_key: device_keypair.public_key_wire(),
+            nonce: nonce(),
+            timestamp_ms: current_unix_timestamp_millis(),
+        },
+    )
+    .unwrap();
+
+    // 首次配对设备还不受信任，key exchange 只建立 E2EE，不会返回 auth challenge。
+    let responses = connection.handle_wire_envelope(protocol, handshake);
+    assert!(responses.is_empty());
+
+    device_session
+}
+
+fn send_encrypted(
+    protocol: &mut DaemonProtocol<SupervisorPtyBackend, Ed25519SignatureVerifier>,
+    connection: &mut ProtocolConnection,
+    device_session: &mut E2eeSession,
+    inner: JsonEnvelope,
+) -> Vec<JsonEnvelope> {
+    let frame = device_session.encrypt_json_payload(&inner).unwrap();
+    let outer = envelope_value(MessageType::EncryptedFrame, frame).unwrap();
+
+    connection.handle_wire_envelope(protocol, outer)
+}
+
+fn decrypt_first(device_session: &mut E2eeSession, messages: Vec<JsonEnvelope>) -> JsonEnvelope {
+    let frame = encrypted_frame_from_envelope(messages.into_iter().next().unwrap()).unwrap();
+    device_session.decrypt_json_payload(&frame).unwrap()
+}
+
+fn pair_connection(
+    protocol: &mut DaemonProtocol<SupervisorPtyBackend, Ed25519SignatureVerifier>,
+    connection: &mut ProtocolConnection,
+    device_session: &mut E2eeSession,
+    device_id: DeviceId,
+) {
+    let signing_key = SigningKey::generate(&mut OsRng);
+    let token = protocol
+        .issue_pairing_token(current_unix_timestamp_millis())
+        .unwrap()
+        .token()
+        .clone();
+    let pair_request = envelope_value(
+        MessageType::PairRequest,
+        PairRequestPayload {
+            device_id,
+            device_public_key: PublicKey(ed25519_wire(signing_key.verifying_key().as_bytes())),
+            token,
+            nonce: nonce(),
+            timestamp_ms: current_unix_timestamp_millis(),
+        },
+    )
+    .unwrap();
+
+    let responses = send_encrypted(protocol, connection, device_session, pair_request);
+    let response = decrypt_first(device_session, responses);
+    let accepted: PairAcceptPayload = decode_payload(response.payload).unwrap();
+
+    assert_eq!(response.kind, MessageType::PairAccept);
+    assert_eq!(accepted.device_id, device_id);
+    assert!(connection.is_authenticated());
 }
 
 #[cfg(target_os = "linux")]
@@ -215,6 +325,96 @@ fn runtime_reconnects_to_live_supervisor_and_replays_snapshot_output() {
     );
 
     restarted.close(session_id).unwrap();
+}
+
+#[test]
+fn daemon_session_list_shows_restored_supervisor_without_client_history_metadata() {
+    let state_path = temp_state_path("protocol-restore-list.json");
+    let binary_path = PathBuf::from(env!("CARGO_BIN_EXE_termd"));
+    let session_id = SessionId::new();
+    let session_id_text = session_id.0.to_string();
+    let default_root = std::env::temp_dir().canonicalize().unwrap();
+    let default_name = format!("restored-{}", &session_id_text[..8]);
+
+    let mut runtime = SessionRuntime::new(SupervisorPtyBackend::with_binary_and_state_path(
+        &binary_path,
+        &state_path,
+    ));
+    runtime
+        .create_session_with_id(
+            &session_id_text,
+            CommandSpec::new("sh").args(["-lc", "printf listed-after-restore && cat"]),
+            TerminalSize::cells(24, 80),
+        )
+        .unwrap();
+    runtime.attach(&session_id_text, "test-device").unwrap();
+    read_until_contains(&mut runtime, &session_id_text, b"listed-after-restore");
+
+    let persisted_sessions = runtime.persisted_sessions();
+    assert_eq!(persisted_sessions.len(), 1);
+    StateStore::save(
+        &state_path,
+        &DaemonState {
+            version: termd::state::STATE_SCHEMA_VERSION,
+            daemon_identity: None,
+            trusted_devices: Vec::new(),
+            sessions: persisted_sessions,
+        },
+    )
+    .unwrap();
+    drop(runtime);
+
+    let mut config = DaemonConfig::default_for_state_path(&state_path);
+    config.default_working_directory = Some(default_root.clone());
+    let backend = SupervisorPtyBackend::with_binary_and_state_path(&binary_path, &state_path);
+    let state = StateStore::load(&state_path).unwrap();
+    let mut protocol =
+        DaemonProtocol::from_state(config, backend, Ed25519SignatureVerifier, state).unwrap();
+    let (mut connection, _) = protocol.start_connection();
+    let device_id = DeviceId::new();
+    let mut device_session = open_e2ee(&mut protocol, &mut connection, device_id);
+    pair_connection(
+        &mut protocol,
+        &mut connection,
+        &mut device_session,
+        device_id,
+    );
+
+    let list_responses = send_encrypted(
+        &mut protocol,
+        &mut connection,
+        &mut device_session,
+        envelope_value(MessageType::SessionList, SessionListPayload {}).unwrap(),
+    );
+    let list = decrypt_first(&mut device_session, list_responses);
+    let list_payload: SessionListResultPayload = decode_payload(list.payload).unwrap();
+
+    assert_eq!(list.kind, MessageType::SessionListResult);
+    assert_eq!(list_payload.sessions.len(), 1);
+    assert_eq!(list_payload.sessions[0].session_id, session_id);
+    assert_eq!(
+        list_payload.sessions[0].name.as_deref(),
+        Some(default_name.as_str())
+    );
+    assert_eq!(
+        list_payload.sessions[0].files_path.as_deref(),
+        Some(default_root.to_string_lossy().as_ref())
+    );
+
+    let close_responses = send_encrypted(
+        &mut protocol,
+        &mut connection,
+        &mut device_session,
+        envelope_value(
+            MessageType::SessionClose,
+            SessionClosePayload { session_id },
+        )
+        .unwrap(),
+    );
+    let closed = decrypt_first(&mut device_session, close_responses);
+    let closed_payload: SessionClosedPayload = decode_payload(closed.payload).unwrap();
+    assert_eq!(closed.kind, MessageType::SessionClosed);
+    assert_eq!(closed_payload.session_id, session_id);
 }
 
 #[test]
