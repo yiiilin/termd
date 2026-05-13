@@ -56,6 +56,7 @@ use super::{
 const AUTH_CHALLENGE_TTL_MS: u64 = 60_000;
 const LIVE_OUTPUT_MIN_BYTES: usize = 16 * 1024;
 const LIVE_OUTPUT_BYTES_PER_CELL: usize = 8;
+const LIVE_OUTPUT_DRAIN_MAX_CHUNKS: usize = 64;
 
 /// 协议层统一使用的 JSON envelope。
 pub type JsonEnvelope = Envelope<Value>;
@@ -2073,14 +2074,65 @@ impl ProtocolConnection {
             return Ok(Vec::new());
         }
 
-        protocol.drain_runtime_output_to_history(session_id, &internal_session_id, max_bytes)?;
-
         let mut chunks = Vec::new();
         if let Some(pending) = self.pending_outputs.get_mut(&session_id) {
             while let Some(chunk) = pending.pop_front() {
                 chunks.push(chunk);
             }
         }
+
+        let mut drained_chunks = 0;
+        loop {
+            self.collect_retained_output_chunks(
+                protocol,
+                session_id,
+                &internal_session_id,
+                max_bytes,
+                &mut chunks,
+            );
+            if drained_chunks >= LIVE_OUTPUT_DRAIN_MAX_CHUNKS {
+                break;
+            }
+
+            // watch::Receiver 会合并多次 PTY 输出信号；如果一次事件只读一个 chunk，
+            // 剩余积压可能要等下一次用户输入才被推送。这里在单次唤醒内继续读空
+            // 当前已经就绪的非阻塞 PTY 缓存，同时每轮先 collect 再继续 drain，避免
+            // raw history 的保留窗口裁掉已连接客户端还没有收到的片段。
+            if !protocol.drain_runtime_output_to_history(
+                session_id,
+                &internal_session_id,
+                max_bytes,
+            )? {
+                break;
+            }
+            drained_chunks += 1;
+        }
+
+        let mut messages = Vec::with_capacity(chunks.len());
+        for chunk in chunks {
+            messages.push(envelope_value(
+                MessageType::SessionData,
+                SessionDataPayload {
+                    session_id,
+                    data_base64: general_purpose::STANDARD.encode(chunk),
+                },
+            )?);
+        }
+
+        self.encrypt_inner_messages(messages)
+    }
+
+    fn collect_retained_output_chunks<B, V>(
+        &mut self,
+        protocol: &mut DaemonProtocol<B, V>,
+        session_id: SessionId,
+        internal_session_id: &str,
+        max_bytes: usize,
+        chunks: &mut Vec<Vec<u8>>,
+    ) where
+        B: PtyBackend,
+        V: SignatureVerifier,
+    {
         loop {
             let cursor = self
                 .output_offsets
@@ -2088,7 +2140,7 @@ impl ProtocolConnection {
                 .copied()
                 .unwrap_or_else(|| {
                     let size = protocol
-                        .runtime_size_proto(&internal_session_id)
+                        .runtime_size_proto(internal_session_id)
                         .unwrap_or_else(|_| {
                             TerminalSize::new(
                                 TerminalSize::DEFAULT_ROWS,
@@ -2105,19 +2157,6 @@ impl ProtocolConnection {
             }
             chunks.push(bytes);
         }
-
-        let mut messages = Vec::with_capacity(chunks.len());
-        for chunk in chunks {
-            messages.push(envelope_value(
-                MessageType::SessionData,
-                SessionDataPayload {
-                    session_id,
-                    data_base64: general_purpose::STANDARD.encode(chunk),
-                },
-            )?);
-        }
-
-        self.encrypt_inner_messages(messages)
     }
 
     fn try_read_session_file_tree_update<B, V>(
@@ -2658,6 +2697,7 @@ mod tests {
     #[derive(Debug, Default)]
     struct FakePtyState {
         outputs: VecDeque<Vec<u8>>,
+        outputs_by_session: HashMap<String, VecDeque<Vec<u8>>>,
         writes: Vec<Vec<u8>>,
         reconnects: Vec<String>,
         reconnect_error: Option<String>,
@@ -2668,6 +2708,16 @@ mod tests {
     impl FakePtyBackend {
         fn push_output(&self, bytes: impl Into<Vec<u8>>) {
             self.state.lock().unwrap().outputs.push_back(bytes.into());
+        }
+
+        fn push_output_for_session(&self, session_id: SessionId, bytes: impl Into<Vec<u8>>) {
+            self.state
+                .lock()
+                .unwrap()
+                .outputs_by_session
+                .entry(session_id.0.to_string())
+                .or_default()
+                .push_back(bytes.into());
         }
 
         fn writes(&self) -> Vec<Vec<u8>> {
@@ -2695,6 +2745,7 @@ mod tests {
         fn spawn(&self, _command: &CommandSpec, _size: PtySize) -> PtyResult<Box<dyn PtySession>> {
             Ok(Box::new(FakePtySession {
                 state: Arc::clone(&self.state),
+                session_id: None,
                 restore_info: None,
             }))
         }
@@ -2711,6 +2762,7 @@ mod tests {
             );
             Ok(Box::new(FakePtySession {
                 state: Arc::clone(&self.state),
+                session_id: Some(session_id.to_owned()),
                 restore_info: Some(socket_restore_info(wire_session_id)),
             }))
         }
@@ -2728,6 +2780,7 @@ mod tests {
 
             Ok(Box::new(FakePtySession {
                 state: Arc::clone(&self.state),
+                session_id: Some(session_id.to_owned()),
                 restore_info: Some(restore_info.clone()),
             }))
         }
@@ -2735,24 +2788,24 @@ mod tests {
 
     struct FakePtySession {
         state: Arc<Mutex<FakePtyState>>,
+        session_id: Option<String>,
         restore_info: Option<PtyRestoreInfo>,
     }
 
     impl PtySession for FakePtySession {
         fn read(&mut self, buffer: &mut [u8]) -> PtyResult<usize> {
             let mut state = self.state.lock().unwrap();
-            let Some(output) = state.outputs.pop_front() else {
-                return Ok(0);
-            };
-            let read = output.len().min(buffer.len());
-            buffer[..read].copy_from_slice(&output[..read]);
-
-            if read < output.len() {
-                // fake PTY 也保留短读后的剩余输出，便于测试协议层按 buffer 大小读取。
-                state.outputs.push_front(output[read..].to_vec());
+            if let Some(session_id) = &self.session_id {
+                if let Some(outputs) = state.outputs_by_session.get_mut(session_id) {
+                    if let Some(read) = read_fake_output_queue(outputs, buffer) {
+                        return Ok(read);
+                    }
+                }
             }
 
-            Ok(read)
+            // 没有关联到具体 session 的旧测试仍走全局输出队列。
+            // 新的多 session 测试应优先使用 push_output_for_session，避免假 PTY 串流。
+            Ok(read_fake_output_queue(&mut state.outputs, buffer).unwrap_or(0))
         }
 
         fn write_all(&mut self, bytes: &[u8]) -> PtyResult<()> {
@@ -2796,6 +2849,21 @@ mod tests {
         fn process_id(&self) -> Option<u32> {
             Some(7)
         }
+    }
+
+    fn read_fake_output_queue(outputs: &mut VecDeque<Vec<u8>>, buffer: &mut [u8]) -> Option<usize> {
+        let Some(output) = outputs.pop_front() else {
+            return None;
+        };
+        let read = output.len().min(buffer.len());
+        buffer[..read].copy_from_slice(&output[..read]);
+
+        if read < output.len() {
+            // fake PTY 也保留短读后的剩余输出，便于测试协议层按 buffer 大小读取。
+            outputs.push_front(output[read..].to_vec());
+        }
+
+        Some(read)
     }
 
     fn protocol() -> (
@@ -4734,6 +4802,60 @@ mod tests {
     }
 
     #[test]
+    fn attached_connection_drains_coalesced_live_output_without_waiting_for_another_signal() {
+        let (mut protocol, backend) = protocol();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = PublicKey(wire(signing_key.verifying_key().as_bytes()));
+        let (_, mut device_session) = open_e2ee(&mut protocol, &mut connection, device_id);
+        pair_device(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            device_id,
+            public_key,
+        );
+        let responses = send_encrypted(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            envelope_value(
+                MessageType::SessionCreate,
+                SessionCreatePayload {
+                    command: vec!["sh".to_owned()],
+                    size: TerminalSize::new(24, 80),
+                },
+            )
+            .unwrap(),
+        );
+        let created = decrypt_first(&mut device_session, responses);
+        let created_payload: SessionCreatedPayload = decode_payload(created.payload).unwrap();
+
+        // PTY 后台线程可能在 WebSocket watcher 醒来前已经累积多段输出；
+        // watch 信号会合并这些变化，所以一次推送必须主动读空当前积压。
+        backend.push_output(b"chunk-1\n".to_vec());
+        backend.push_output(b"chunk-2\n".to_vec());
+        backend.push_output(b"chunk-3\n".to_vec());
+
+        let responses =
+            connection.read_session_output(&mut protocol, created_payload.session_id, 8);
+        let mut output = Vec::new();
+        for response in responses {
+            let inner = decrypt_first(&mut device_session, vec![response]);
+            assert_eq!(inner.kind, MessageType::SessionData);
+            let payload: SessionDataPayload = decode_payload(inner.payload).unwrap();
+            output.extend(
+                general_purpose::STANDARD
+                    .decode(payload.data_base64)
+                    .unwrap(),
+            );
+        }
+
+        assert_eq!(output, b"chunk-1\nchunk-2\nchunk-3\n");
+    }
+
+    #[test]
     fn session_output_history_snapshot_tracks_visible_line_refreshes() {
         let mut history = SessionOutputHistory::new(TerminalSize::new(3, 20));
 
@@ -4972,8 +5094,8 @@ mod tests {
         let second_created = decrypt_first(&mut device_session, second_responses);
         let second_payload: SessionCreatedPayload = decode_payload(second_created.payload).unwrap();
 
-        backend.push_output(b"first output\n".to_vec());
-        backend.push_output(b"second output\n".to_vec());
+        backend.push_output_for_session(first_payload.session_id, b"first output\n".to_vec());
+        backend.push_output_for_session(second_payload.session_id, b"second output\n".to_vec());
         let responses = connection.read_attached_outputs(&mut protocol, 4096);
 
         assert_eq!(responses.len(), 2);

@@ -350,6 +350,13 @@ impl SupervisorPtySession {
             let _ = self.output_signal_tx.send(next);
         }
     }
+
+    fn signal_pending_output(&self) {
+        let next = self.output_signal_tx.borrow().wrapping_add(1);
+        // daemon 侧的 supervisor 客户端也使用 watch 做输出通知；如果本地缓存
+        // 还没读空，需要再次唤醒协议推送层，避免大输出停在缓存里。
+        let _ = self.output_signal_tx.send(next);
+    }
 }
 
 impl Drop for SupervisorPtySession {
@@ -395,6 +402,14 @@ impl PtySession for SupervisorPtySession {
                 .lock()
                 .expect("pending output mutex poisoned")
                 .push_front(remaining);
+        }
+        if !self
+            .pending_output
+            .lock()
+            .expect("pending output mutex poisoned")
+            .is_empty()
+        {
+            self.signal_pending_output();
         }
         Ok(read)
     }
@@ -1207,6 +1222,46 @@ mod tests {
         assert!(
             snapshot.contains("current status"),
             "supervisor snapshot should be screen-derived, got {snapshot:?}"
+        );
+    }
+
+    #[test]
+    fn supervisor_client_read_rearms_signal_when_pending_output_remains() {
+        let socket_path = PathBuf::from("/tmp/termd-supervisor-test.sock");
+        let restore_info = PtyRestoreInfo::UnixSocket {
+            socket_path,
+            supervisor_pid: 42,
+            supervisor_status: PtySupervisorStatus::Running,
+        };
+        let (writer, _peer) = StdUnixStream::pair().expect("test unix stream pair should open");
+        let (output_signal_tx, output_signal_rx) = watch::channel(OUTPUT_SIGNAL_INIT);
+        let mut session = SupervisorPtySession {
+            restore_info,
+            supervisor_child: StdMutex::new(None),
+            writer: StdMutex::new(writer),
+            pending_requests: Arc::new(StdMutex::new(HashMap::new())),
+            pending_output: Arc::new(StdMutex::new(VecDeque::from([
+                b"first".to_vec(),
+                b"second".to_vec(),
+            ]))),
+            output_signal_tx,
+            output_signal_rx,
+            next_request_id: AtomicU64::new(1),
+            cached_size: StdMutex::new(PtySize::new(24, 80)),
+            cached_process_id: StdMutex::new(Some(42)),
+        };
+        let mut signal = session
+            .output_signal()
+            .expect("supervisor client should expose output signal");
+        signal.borrow_and_update();
+        let mut buffer = vec![0_u8; 16];
+
+        let read = session.read(&mut buffer).expect("read should not fail");
+
+        assert_eq!(&buffer[..read], b"first");
+        assert!(
+            signal.has_changed().unwrap_or(false),
+            "remaining supervisor output should rearm daemon watcher"
         );
     }
 

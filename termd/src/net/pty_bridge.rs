@@ -50,9 +50,10 @@ impl PtyBackend for NonBlockingPortablePtyBackend {
         let (output_signal_tx, output_signal_rx) = watch::channel(0_u64);
 
         // 真实 PTY read 会阻塞，所以只能在专门线程中执行。WebSocket 线程只读 channel 缓存。
+        let reader_signal_tx = output_signal_tx.clone();
         let reader_thread = thread::Builder::new()
             .name("termd-pty-output-reader".to_owned())
-            .spawn(move || read_pty_output(reader, output_tx, output_signal_tx))
+            .spawn(move || read_pty_output(reader, output_tx, reader_signal_tx))
             .map_err(PtyError::backend)?;
 
         Ok(Box::new(NonBlockingPortablePtySession {
@@ -60,6 +61,7 @@ impl PtyBackend for NonBlockingPortablePtyBackend {
             child,
             writer,
             output_rx,
+            output_signal_tx: output_signal_tx.clone(),
             output_signal_rx,
             pending_output: VecDeque::new(),
             _reader_thread: reader_thread,
@@ -105,6 +107,7 @@ struct NonBlockingPortablePtySession {
     child: Box<dyn Child + Send + Sync>,
     writer: Box<dyn Write + Send>,
     output_rx: Receiver<OutputMessage>,
+    output_signal_tx: watch::Sender<u64>,
     output_signal_rx: watch::Receiver<u64>,
     pending_output: VecDeque<Vec<u8>>,
     _reader_thread: JoinHandle<()>,
@@ -121,6 +124,13 @@ impl NonBlockingPortablePtySession {
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => return Ok(()),
             }
         }
+    }
+
+    fn signal_pending_output(&self) {
+        let next_sequence = self.output_signal_tx.borrow().wrapping_add(1);
+        // 这个信号只表示“本地缓存里还有输出没被 WebSocket 层取走”。
+        // watcher 使用 watch，会自动合并过密通知；这里允许忽略没有接收者的情况。
+        let _ = self.output_signal_tx.send(next_sequence);
     }
 }
 
@@ -141,6 +151,12 @@ impl PtySession for NonBlockingPortablePtySession {
         if read < chunk.len() {
             let remaining = chunk.split_off(read);
             self.pending_output.push_front(remaining);
+        }
+
+        if !self.pending_output.is_empty() {
+            // watch 信号可能把多个 PTY read 合并成一次唤醒；如果本次 read 后仍有缓存，
+            // 主动再唤醒一次 WebSocket 推送路径，避免画面停住直到下一次用户输入。
+            self.signal_pending_output();
         }
 
         Ok(read)
@@ -245,6 +261,46 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+
+        let _ = session.terminate();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn read_rearms_output_signal_when_cached_output_remains() {
+        let backend = NonBlockingPortablePtyBackend::new();
+        let mut session = backend
+            .spawn(
+                &CommandSpec::new("sh").args(["-c", "head -c 40000 /dev/zero | tr '\\000' x"]),
+                PtySize::new(24, 80),
+            )
+            .expect("test PTY should spawn");
+        let mut signal = session
+            .output_signal()
+            .expect("nonblocking PTY should expose output signal");
+        let deadline = Instant::now() + Duration::from_secs(2);
+
+        loop {
+            let snapshot = session.snapshot().expect("snapshot should not fail");
+            if snapshot.retained_output.len() > READER_CHUNK_BYTES {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for cached PTY output"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        signal.borrow_and_update();
+        let mut buffer = vec![0_u8; READER_CHUNK_BYTES];
+        let read = session.read(&mut buffer).expect("read should not fail");
+
+        assert!(read > 0);
+        assert!(
+            signal.has_changed().unwrap_or(false),
+            "remaining cached output should rearm the watcher"
+        );
 
         let _ = session.terminate();
     }
