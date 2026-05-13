@@ -36,6 +36,14 @@ ACTION="install"
 PURGE_STATE=0
 LOG_EMITTED=0
 SUPERVISOR_VERSION_NEEDS_RUNTIME_CLEAR=0
+SUPERVISOR_VERSION_EXPLICIT=0
+
+# 只有用户显式传入 TERMD_SUPERVISOR_VERSION 或 --supervisor-version 时，
+# supervisor 版本才表示兼容性切换请求；release 脚本中的默认值不能触发清 session。
+if [[ -n "${TERMD_SUPERVISOR_VERSION:-}" ]]; then
+  SUPERVISOR_VERSION_EXPLICIT=1
+  INSTALL_SET_SUPERVISOR_VERSION=1
+fi
 
 log() {
   if [[ "$LOG_EMITTED" -eq 1 ]]; then
@@ -157,6 +165,7 @@ parse_args() {
       --supervisor-version)
         [[ $# -ge 2 && -n "$2" ]] || die "--supervisor-version requires a non-empty value"
         SUPERVISOR_VERSION="$2"
+        SUPERVISOR_VERSION_EXPLICIT=1
         INSTALL_SET_SUPERVISOR_VERSION=1
         shift 2
         ;;
@@ -577,26 +586,31 @@ resolve_supervisor_version() {
     has_runtime_sessions=1
   fi
 
-  if [[ -n "$SUPERVISOR_VERSION" ]]; then
+  if [[ "$SUPERVISOR_VERSION_EXPLICIT" -eq 1 ]]; then
     desired_supervisor_version="$SUPERVISOR_VERSION"
   elif [[ -n "$current_supervisor_version" ]]; then
     desired_supervisor_version="$current_supervisor_version"
   else
-    desired_supervisor_version="$VERSION"
+    desired_supervisor_version="${SUPERVISOR_VERSION:-$VERSION}"
   fi
+  [[ -n "$desired_supervisor_version" ]] || die "unable to determine supervisor version"
 
-  if [[ -n "$current_supervisor_version" && "$current_supervisor_version" != "$desired_supervisor_version" ]]; then
+  if [[ "$SUPERVISOR_VERSION_EXPLICIT" -eq 1 && -n "$current_supervisor_version" && "$current_supervisor_version" != "$desired_supervisor_version" ]]; then
     log "supervisor version change detected: ${current_supervisor_version} -> ${desired_supervisor_version}"
     if ! prompt_confirmation "updating the supervisor version will lose existing sessions; confirm you are prepared for session loss and continue"; then
       die "supervisor version upgrade cancelled"
     fi
     SUPERVISOR_VERSION_NEEDS_RUNTIME_CLEAR=1
-  elif [[ -z "$current_supervisor_version" && "$has_runtime_sessions" -eq 1 ]]; then
+  elif [[ "$SUPERVISOR_VERSION_EXPLICIT" -eq 1 && -z "$current_supervisor_version" && "$has_runtime_sessions" -eq 1 ]]; then
     log "supervisor version baseline will be set to ${desired_supervisor_version} for this daemon"
     if ! prompt_confirmation "setting the initial supervisor version will lose existing sessions; confirm you are prepared for session loss and continue"; then
       die "supervisor version initialization cancelled"
     fi
     SUPERVISOR_VERSION_NEEDS_RUNTIME_CLEAR=1
+  elif [[ -z "$current_supervisor_version" && "$has_runtime_sessions" -eq 1 ]]; then
+    # 旧安装可能已有 session 但还没有 supervisor_version 元数据；默认更新只补 baseline，
+    # 避免普通二进制升级把用户的持久 session 当作不兼容 runtime 删除。
+    log "supervisor version baseline will be set to ${desired_supervisor_version} without clearing existing sessions"
   fi
 
   SUPERVISOR_VERSION="$desired_supervisor_version"
