@@ -48,6 +48,7 @@ test -s "${ROOT_DIR}/SUPERVISOR_VERSION"
 
 load_termd_installer_functions() {
   # 测试只加载函数和默认变量，跳过脚本末尾的 main 调用，避免触发真实安装。
+  unset SUPERVISOR_VERSION TERMD_SUPERVISOR_VERSION TERMD_INSTALL_CONFIRM_FD
   # shellcheck source=/dev/null
   source <(sed '/^main "\$@"/,$d' "${ROOT_DIR}/scripts/install-termd.sh")
 }
@@ -350,10 +351,10 @@ test_termd_supervisor_version_match_keeps_runtime_state() (
   seed_termd_runtime_sqlite "$sqlite_file" "v-test"
   create_stale_supervisor_socket "$socket_file"
 
-  export TERMD_SUPERVISOR_VERSION="v-test"
+  SUPERVISOR_VERSION="v-test"
   unit_file="${tmp_dir}/termd.service"
   run_fake_termd_install "$unit_file" >/dev/null
-  unset TERMD_SUPERVISOR_VERSION
+  unset SUPERVISOR_VERSION
 
   python3 - "$sqlite_file" "$socket_file" <<'PY'
 import pathlib
@@ -395,7 +396,7 @@ test_termd_supervisor_version_mismatch_prompts_and_clears_runtime_state() (
   export TERMD_INSTALL_CONFIRM_FD=0
   unit_file="${tmp_dir}/termd.service"
   printf 'y\n' | run_fake_termd_install "$unit_file" >/dev/null
-  unset TERMD_INSTALL_CONFIRM_FD
+  unset SUPERVISOR_VERSION TERMD_INSTALL_CONFIRM_FD
 
   python3 - "$sqlite_file" "$socket_file" <<'PY'
 import pathlib
@@ -443,7 +444,7 @@ test_termd_supervisor_version_mismatch_decline_preserves_runtime_state() (
   printf 'n\n' | run_fake_termd_install "$unit_file" >/dev/null 2>/dev/null
   status=$?
   set -e
-  unset TERMD_INSTALL_CONFIRM_FD
+  unset SUPERVISOR_VERSION TERMD_INSTALL_CONFIRM_FD
 
   [[ "$status" -ne 0 ]]
 
