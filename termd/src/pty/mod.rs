@@ -224,8 +224,8 @@ pub enum PtyRestoreInfo {
 
 /// supervisor 快照。
 ///
-/// `retained_output` 只用于 daemon 重启后补回最近仍保留的终端输出，
-/// 不会被写入本地持久状态。
+/// `retained_output` 是 daemon 重启后用于恢复终端显示的内存快照，不会被写入本地持久状态。
+/// supervisor backend 会返回屏幕模型生成的快照；普通 backend 可以返回最近仍保留的原始输出。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PtySnapshot {
     pub size: PtySize,

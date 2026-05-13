@@ -48,13 +48,14 @@ use crate::state::{
     client_history::{ClientHistoryRecord, ClientHistoryStore, SessionHistoryRecord},
 };
 
+use super::screen::TerminalScreen;
 use super::{
     E2eeError, E2eeKeyPair, E2eePeerPublicKey, E2eeSession, E2eeSessionContext, E2eeSessionRole,
 };
 
 const AUTH_CHALLENGE_TTL_MS: u64 = 60_000;
-// 只保留最近固定行数的 PTY 输出，避免长时间输出导致重新 attach 时回放过长。
-const SESSION_OUTPUT_HISTORY_MAX_LINES: usize = 2000;
+const LIVE_OUTPUT_MIN_BYTES: usize = 16 * 1024;
+const LIVE_OUTPUT_BYTES_PER_CELL: usize = 8;
 
 /// 协议层统一使用的 JSON envelope。
 pub type JsonEnvelope = Envelope<Value>;
@@ -89,15 +90,23 @@ struct RestoredSessionMetadata {
 /// PTY 输出只能被读取一次；这里先按 session 保留，再按每条连接自己的 offset 加密发送，
 /// 避免重新 attach 或多个客户端同时 attach 时丢失已经读过的终端内容。
 ///
-/// 这里只保留最近固定行数，防止输出过多时把 replay 窗口拖成一大段历史回放。
+/// 新 attach 使用按逻辑行维护的 terminal snapshot，最多回放最近 1000 行实际行内容和样式。
 #[derive(Debug, Clone)]
 struct SessionOutputHistory {
     base_offset: u64,
     bytes: VecDeque<u8>,
-    newline_count: usize,
+    screen: TerminalScreen,
 }
 
 impl SessionOutputHistory {
+    fn new(size: TerminalSize) -> Self {
+        Self {
+            base_offset: 0,
+            bytes: VecDeque::new(),
+            screen: TerminalScreen::new(size.rows, size.cols),
+        }
+    }
+
     fn base_offset(&self) -> u64 {
         self.base_offset
     }
@@ -108,32 +117,26 @@ impl SessionOutputHistory {
 
     fn append(&mut self, bytes: &[u8]) {
         self.bytes.extend(bytes.iter().copied());
-        self.newline_count += bytes.iter().filter(|byte| **byte == b'\n').count();
-        self.trim_to_line_limit();
+        self.screen.apply(bytes);
+        self.trim_to_live_output_limit();
     }
 
-    fn visible_line_count(&self) -> usize {
-        if self.bytes.is_empty() {
-            return 0;
-        }
-
-        if self.bytes.back() == Some(&b'\n') {
-            self.newline_count
-        } else {
-            self.newline_count + 1
-        }
+    fn resize(&mut self, size: TerminalSize) {
+        self.screen.resize(size.rows, size.cols);
+        self.trim_to_live_output_limit();
     }
 
-    fn trim_to_line_limit(&mut self) {
-        // 只回收完整的老行，保留当前最新的半行，避免打断正在增长的输出。
-        while self.visible_line_count() > SESSION_OUTPUT_HISTORY_MAX_LINES {
-            let Some(byte) = self.bytes.pop_front() else {
-                break;
-            };
+    fn snapshot_bytes(&self) -> Vec<u8> {
+        self.screen.snapshot_bytes()
+    }
+
+    fn trim_to_live_output_limit(&mut self) {
+        // raw bytes 只是给已连接客户端做增量 fanout；新 attach 使用 screen snapshot，不再缓存长 scrollback。
+        let max_bytes =
+            LIVE_OUTPUT_MIN_BYTES.max(self.screen.cell_count() * LIVE_OUTPUT_BYTES_PER_CELL);
+        while self.bytes.len() > max_bytes {
+            self.bytes.pop_front();
             self.base_offset = self.base_offset.saturating_add(1);
-            if byte == b'\n' {
-                self.newline_count = self.newline_count.saturating_sub(1);
-            }
         }
     }
 
@@ -156,16 +159,6 @@ impl SessionOutputHistory {
             .collect();
 
         (bytes, start_offset + take as u64)
-    }
-}
-
-impl Default for SessionOutputHistory {
-    fn default() -> Self {
-        Self {
-            base_offset: 0,
-            bytes: VecDeque::new(),
-            newline_count: 0,
-        }
     }
 }
 
@@ -631,9 +624,7 @@ where
             .insert(wire_session_id, session_name.clone());
         self.session_roots
             .insert(wire_session_id, session_root.clone());
-        self.session_output_history
-            .entry(wire_session_id)
-            .or_default();
+        self.session_output_history_mut(wire_session_id, payload.size);
         let (file_tree_signal, _) = watch::channel(0);
         self.session_file_tree_signals
             .insert(wire_session_id, file_tree_signal);
@@ -651,10 +642,15 @@ where
             .attach(&internal_session_id, device_key(device_id))
             .map_err(map_runtime_error)?;
         let wire_role = runtime_role_to_proto(role);
-        connection.attach(
+        self.drain_runtime_output_to_history_until_empty(
             wire_session_id,
-            self.output_history_base_offset(wire_session_id),
-        );
+            &internal_session_id,
+            16 * 1024,
+        )?;
+        let response_size = self.runtime_size_proto(&internal_session_id)?;
+        let (output_offset, initial_output) =
+            self.output_history_attach_snapshot(wire_session_id, response_size);
+        connection.attach(wire_session_id, output_offset, initial_output);
         self.record_daemon_client_attach(wire_session_id, connection, device_id);
 
         let response = SessionCreatedPayload {
@@ -662,7 +658,7 @@ where
             name: Some(session_name),
             role: wire_role,
             state: self.runtime_state_proto(&internal_session_id)?,
-            size: self.runtime_size_proto(&internal_session_id)?,
+            size: response_size,
         };
 
         self.persist_state()?;
@@ -686,10 +682,15 @@ where
             .attach(&internal_session_id, device_key(device_id))
             .map_err(map_runtime_error)?;
         let wire_role = runtime_role_to_proto(role);
-        connection.attach(
+        self.drain_runtime_output_to_history_until_empty(
             payload.session_id,
-            self.output_history_base_offset(payload.session_id),
-        );
+            &internal_session_id,
+            16 * 1024,
+        )?;
+        let response_size = self.runtime_size_proto(&internal_session_id)?;
+        let (output_offset, initial_output) =
+            self.output_history_attach_snapshot(payload.session_id, response_size);
+        connection.attach(payload.session_id, output_offset, initial_output);
         self.record_daemon_client_attach(payload.session_id, connection, device_id);
         connection.state = ProtocolConnectionState::Attached;
 
@@ -697,7 +698,7 @@ where
             session_id: payload.session_id,
             role: wire_role,
             state: self.runtime_state_proto(&internal_session_id)?,
-            size: self.runtime_size_proto(&internal_session_id)?,
+            size: response_size,
         };
 
         Ok(vec![envelope_value(
@@ -743,6 +744,9 @@ where
         self.runtime
             .resize(internal_session_id, proto_size_to_runtime(payload.size))
             .map_err(map_runtime_error)?;
+        if let Some(history) = self.session_output_history.get_mut(&payload.session_id) {
+            history.resize(payload.size);
+        }
         self.client_history.record_session_resized(
             payload.session_id,
             payload.size,
@@ -1382,11 +1386,29 @@ where
             .unwrap_or(false)
     }
 
-    fn output_history_base_offset(&mut self, session_id: SessionId) -> u64 {
+    fn session_output_history_mut(
+        &mut self,
+        session_id: SessionId,
+        size: TerminalSize,
+    ) -> &mut SessionOutputHistory {
         self.session_output_history
             .entry(session_id)
-            .or_default()
+            .or_insert_with(|| SessionOutputHistory::new(size))
+    }
+
+    fn output_history_base_offset(&mut self, session_id: SessionId, size: TerminalSize) -> u64 {
+        self.session_output_history_mut(session_id, size)
             .base_offset()
+    }
+
+    fn output_history_attach_snapshot(
+        &mut self,
+        session_id: SessionId,
+        size: TerminalSize,
+    ) -> (u64, Vec<u8>) {
+        let history = self.session_output_history_mut(session_id, size);
+        history.resize(size);
+        (history.end_offset(), history.snapshot_bytes())
     }
 
     fn drain_runtime_output_to_history(
@@ -1394,9 +1416,9 @@ where
         session_id: SessionId,
         internal_session_id: &str,
         max_chunk_bytes: usize,
-    ) -> Result<(), ProtocolError> {
+    ) -> Result<bool, ProtocolError> {
         if max_chunk_bytes == 0 {
-            return Ok(());
+            return Ok(false);
         }
 
         // 每个 session 每轮只拉一个 chunk，避免批量 flush 多个已 attach session 时，
@@ -1407,14 +1429,32 @@ where
             .read_output(internal_session_id, &mut buffer)
             .map_err(map_runtime_error)?;
         if read == 0 {
-            return Ok(());
+            return Ok(false);
         }
 
         buffer.truncate(read);
-        self.session_output_history
-            .entry(session_id)
-            .or_default()
+        let size = self.runtime_size_proto(internal_session_id)?;
+        self.session_output_history_mut(session_id, size)
             .append(&buffer);
+        Ok(true)
+    }
+
+    fn drain_runtime_output_to_history_until_empty(
+        &mut self,
+        session_id: SessionId,
+        internal_session_id: &str,
+        max_chunk_bytes: usize,
+    ) -> Result<(), ProtocolError> {
+        // attach 前尽量把 PTY 已有输出折叠进 screen snapshot；设置上限避免持续刷屏进程拖住握手。
+        for _ in 0..256 {
+            if !self.drain_runtime_output_to_history(
+                session_id,
+                internal_session_id,
+                max_chunk_bytes,
+            )? {
+                break;
+            }
+        }
         Ok(())
     }
 
@@ -1500,6 +1540,7 @@ where
             })
             .collect();
         connection.output_offsets.clear();
+        connection.pending_outputs.clear();
         self.mark_daemon_client_connection_offline(device_id, connection.client_id, now_ms);
 
         // 断开 WebSocket 只 detach 当前连接关联的 session，不 close/terminate PTY。
@@ -1579,9 +1620,7 @@ where
                     let internal_session_id = wire_session_id.0.to_string();
                     self.session_index
                         .insert(wire_session_id, internal_session_id);
-                    self.session_output_history
-                        .entry(wire_session_id)
-                        .or_default();
+                    self.session_output_history_mut(wire_session_id, session.size);
                     let (file_tree_signal, _) = watch::channel(0);
                     self.session_file_tree_signals
                         .insert(wire_session_id, file_tree_signal);
@@ -1828,6 +1867,7 @@ pub struct ProtocolConnection {
     e2ee: Option<E2eeSession>,
     attached_sessions: Vec<SessionId>,
     output_offsets: HashMap<SessionId, u64>,
+    pending_outputs: HashMap<SessionId, VecDeque<Vec<u8>>>,
 }
 
 impl ProtocolConnection {
@@ -1841,6 +1881,7 @@ impl ProtocolConnection {
             e2ee: None,
             attached_sessions: Vec::new(),
             output_offsets: HashMap::new(),
+            pending_outputs: HashMap::new(),
         }
     }
 
@@ -2035,12 +2076,27 @@ impl ProtocolConnection {
         protocol.drain_runtime_output_to_history(session_id, &internal_session_id, max_bytes)?;
 
         let mut chunks = Vec::new();
+        if let Some(pending) = self.pending_outputs.get_mut(&session_id) {
+            while let Some(chunk) = pending.pop_front() {
+                chunks.push(chunk);
+            }
+        }
         loop {
             let cursor = self
                 .output_offsets
                 .get(&session_id)
                 .copied()
-                .unwrap_or_else(|| protocol.output_history_base_offset(session_id));
+                .unwrap_or_else(|| {
+                    let size = protocol
+                        .runtime_size_proto(&internal_session_id)
+                        .unwrap_or_else(|_| {
+                            TerminalSize::new(
+                                TerminalSize::DEFAULT_ROWS,
+                                TerminalSize::DEFAULT_COLS,
+                            )
+                        });
+                    protocol.output_history_base_offset(session_id, size)
+                });
             let (bytes, next_cursor) =
                 protocol.retained_output_chunk(session_id, cursor, max_bytes);
             self.output_offsets.insert(session_id, next_cursor);
@@ -2226,10 +2282,16 @@ impl ProtocolConnection {
         error_envelope
     }
 
-    fn attach(&mut self, session_id: SessionId, output_base_offset: u64) {
+    fn attach(&mut self, session_id: SessionId, output_base_offset: u64, initial_output: Vec<u8>) {
         if !self.attached_sessions.contains(&session_id) {
             self.attached_sessions.push(session_id);
             self.output_offsets.insert(session_id, output_base_offset);
+            if !initial_output.is_empty() {
+                self.pending_outputs
+                    .entry(session_id)
+                    .or_default()
+                    .push_back(initial_output);
+            }
         }
     }
 }
@@ -4014,7 +4076,7 @@ mod tests {
     }
 
     #[test]
-    fn reattached_connection_replays_retained_session_output() {
+    fn reattached_connection_receives_plain_text_history_without_clearing_scrollback() {
         let (mut protocol, backend) = protocol();
         let device_id = DeviceId::new();
         let signing_key = SigningKey::generate(&mut OsRng);
@@ -4088,12 +4150,14 @@ mod tests {
 
         assert_eq!(replayed_output.kind, MessageType::SessionData);
         assert_eq!(replayed_data.session_id, created_payload.session_id);
-        assert_eq!(
+        let replayed_snapshot = String::from_utf8(
             general_purpose::STANDARD
                 .decode(replayed_data.data_base64)
                 .unwrap(),
-            b"original screen\n"
-        );
+        )
+        .unwrap();
+        assert!(replayed_snapshot.contains("original screen"));
+        assert!(!replayed_snapshot.contains("\x1b[2J\x1b[H"));
     }
 
     #[test]
@@ -4670,20 +4734,194 @@ mod tests {
     }
 
     #[test]
-    fn session_output_history_keeps_only_recent_lines() {
-        let mut history = SessionOutputHistory::default();
-        for index in 0..=SESSION_OUTPUT_HISTORY_MAX_LINES {
-            history.append(format!("line-{index}\n").as_bytes());
-        }
+    fn session_output_history_snapshot_tracks_visible_line_refreshes() {
+        let mut history = SessionOutputHistory::new(TerminalSize::new(3, 20));
 
-        let (bytes, cursor) = history.read_from(0, usize::MAX);
-        let output = String::from_utf8(bytes).unwrap();
-        let expected = (1..=SESSION_OUTPUT_HISTORY_MAX_LINES)
-            .map(|index| format!("line-{index}\n"))
-            .collect::<String>();
+        history.append(b"alpha\nbeta\ngamma\x1b[2;1Hbravo\x1b[K");
 
-        assert_eq!(output, expected);
-        assert!(history.read_from(cursor, 4096).0.is_empty());
+        let snapshot = String::from_utf8(history.snapshot_bytes()).unwrap();
+        assert!(snapshot.contains("alpha\r\nbravo\r\ngamma"));
+        assert!(!snapshot.contains("beta"));
+    }
+
+    #[test]
+    fn session_output_history_keeps_pre_clear_text_and_visible_background_rows() {
+        let mut history = SessionOutputHistory::new(TerminalSize::new(3, 8));
+
+        // 普通屏清屏会开启新的空白 viewport，但旧可见内容应保留为 scrollback；
+        // 否则 Codex/CLI 的普通屏重绘会让刚输出的状态块在重新 attach 时少行。
+        history.append(b"alpha\nbeta\n\x1b[48;5;22m\x1b[2J");
+
+        let snapshot = String::from_utf8(history.snapshot_bytes()).unwrap();
+
+        assert!(snapshot.contains("alpha"));
+        assert!(snapshot.contains("beta"));
+        assert!(
+            snapshot.contains("\x1b[48;5;22m        \x1b[0m"),
+            "snapshot should preserve styled blank rows: {snapshot:?}"
+        );
+    }
+
+    #[test]
+    fn session_output_history_keeps_crlf_lines_in_text_scrollback() {
+        let mut history = SessionOutputHistory::new(TerminalSize::new(3, 20));
+
+        // 真实 PTY 常见输出是 CRLF。单独 CR 会回到行首，后续 K 清掉旧行尾。
+        history.append(b"one\r\ntwo\r\nstate: pending\rstate: done\x1b[K\r\n");
+
+        let snapshot = String::from_utf8(history.snapshot_bytes()).unwrap();
+
+        assert!(snapshot.contains("one\r\ntwo\r\nstate: done"));
+        assert!(!snapshot.contains("state: pending"));
+        assert!(!snapshot.contains("\x1b[2J\x1b[H"));
+    }
+
+    #[test]
+    fn session_output_history_snapshot_keeps_tail_after_wide_text_wraps() {
+        let mut history = SessionOutputHistory::new(TerminalSize::new(5, 20));
+
+        // 中文宽字符如果按 1 列算，会比真实终端少换行，attach 清屏重绘后尾部几行会消失。
+        history.append(
+            "前缀：这是一段很长的中文输出，会在真实终端里自动换行\r\n\
+             验证过了：\r\n\r\n\
+             go test ./internal/app/shelves/pkg/deploy\r\n\r\n\
+             另外，这里还有最后一行\r\n"
+                .as_bytes(),
+        );
+
+        let snapshot = String::from_utf8(history.snapshot_bytes()).unwrap();
+        assert!(snapshot.contains("验证过了："));
+        assert!(snapshot.contains("go test"));
+        assert!(snapshot.contains("shelves"));
+        // 20 列终端里这句中文会按双宽字符自然换行，不能要求整句在快照中连续出现。
+        assert!(snapshot.contains("另外，这里还有最后一"));
+        assert!(snapshot.contains("行"));
+        assert!(!snapshot.contains("\x1b[2J\x1b[H"));
+    }
+
+    #[test]
+    fn session_output_history_keeps_status_block_before_screen_redraw() {
+        let mut history = SessionOutputHistory::new(TerminalSize::new(6, 80));
+
+        history.append(
+            "• 当前状态：\r\n\
+             \r\n\
+             - 工作区干净：git status --short --branch 显示 dev...origin/dev，无未提交改动。\r\n\
+             - 当前 HEAD：4b70e91a 【谢一林】【fix: 修复部署方案wildcard判断异常问题】\r\n\
+             \r\n\
+             验证已通过：\r\n\
+             \r\n\
+             go test ./internal/app/shelves/pkg/deploy\r\n"
+                .as_bytes(),
+        );
+        // 全屏 UI 随后滚动并清屏重绘时，已经滚入 scrollback 的状态块不能丢。
+        history.append(b"\n\n\n\n\n\n\x1b[2J\x1b[1;1Hvisible after redraw");
+
+        let snapshot = String::from_utf8(history.snapshot_bytes()).unwrap();
+
+        assert!(snapshot.contains("当前状态"));
+        assert!(snapshot.contains("工作区干净"));
+        assert!(snapshot.contains("4b70e91a"));
+        assert!(snapshot.contains("go test"));
+        assert!(snapshot.contains("visible after redraw"));
+    }
+
+    #[test]
+    fn session_output_history_keeps_visible_status_block_when_plain_screen_clears() {
+        let mut history = SessionOutputHistory::new(TerminalSize::new(8, 100));
+
+        // 这个形态贴近 `软件货架` session 的真实尾部：状态块还在普通屏 viewport 内，
+        // 随后 Codex/CLI 用 ESC[2J 做整屏重绘。回放缓存必须把清屏前的可见行保留下来。
+        history.append(
+            "验证过了：\r\n\
+             \r\n\
+             • 当前状态：\r\n\
+             \r\n\
+             - 工作区干净：git status --short --branch 显示 dev...origin/dev，无未提交改动。\r\n\
+             - 当前 HEAD：4b70e91a 【谢一林】【fix: 修复部署方案wildcard判断异常问题】\r\n\
+             \r\n\
+             go test ./internal/app/shelves/pkg/deploy\r\n"
+                .as_bytes(),
+        );
+        history.append(b"\x1b[2J\x1b[H\x1b[48;5;236mSummarize recent commits");
+
+        let snapshot = String::from_utf8(history.snapshot_bytes()).unwrap();
+
+        assert!(snapshot.contains("当前状态"));
+        assert!(snapshot.contains("工作区干净"));
+        assert!(snapshot.contains("4b70e91a"));
+        assert!(snapshot.contains("go test"));
+        assert!(snapshot.contains("Summarize recent commits"));
+    }
+
+    #[test]
+    fn new_attach_receives_current_screen_snapshot_instead_of_raw_scrollback() {
+        let (mut protocol, backend) = protocol();
+        let (mut first_connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = PublicKey(wire(signing_key.verifying_key().as_bytes()));
+        let (_, mut first_device_session) =
+            open_e2ee(&mut protocol, &mut first_connection, device_id);
+        pair_device(
+            &mut protocol,
+            &mut first_connection,
+            &mut first_device_session,
+            device_id,
+            public_key,
+        );
+        let created_responses = send_encrypted(
+            &mut protocol,
+            &mut first_connection,
+            &mut first_device_session,
+            envelope_value(
+                MessageType::SessionCreate,
+                SessionCreatePayload {
+                    command: vec!["sh".to_owned()],
+                    size: TerminalSize::new(3, 20),
+                },
+            )
+            .unwrap(),
+        );
+        let created = decrypt_first(&mut first_device_session, created_responses);
+        let created_payload: SessionCreatedPayload = decode_payload(created.payload).unwrap();
+
+        backend.push_output(b"alpha\nbeta\ngamma\x1b[2;1Hbravo\x1b[K".to_vec());
+
+        let (mut second_connection, _) = protocol.start_connection();
+        let mut second_device_session = authenticate_paired_connection(
+            &mut protocol,
+            &mut second_connection,
+            device_id,
+            &signing_key,
+        );
+        let attached = send_encrypted(
+            &mut protocol,
+            &mut second_connection,
+            &mut second_device_session,
+            envelope_value(
+                MessageType::SessionAttach,
+                SessionAttachPayload {
+                    session_id: created_payload.session_id,
+                },
+            )
+            .unwrap(),
+        );
+        let attached_inner = decrypt_first(&mut second_device_session, attached);
+        assert_eq!(attached_inner.kind, MessageType::SessionAttached);
+
+        let outputs = second_connection.read_attached_outputs(&mut protocol, 4096);
+        let output_inner = decrypt_first(&mut second_device_session, outputs);
+        let payload: SessionDataPayload = decode_payload(output_inner.payload).unwrap();
+        let snapshot = String::from_utf8(
+            general_purpose::STANDARD
+                .decode(payload.data_base64)
+                .unwrap(),
+        )
+        .unwrap();
+
+        assert!(snapshot.contains("alpha\r\nbravo\r\ngamma"));
+        assert!(!snapshot.contains("beta"));
     }
 
     #[test]

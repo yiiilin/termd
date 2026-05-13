@@ -65,6 +65,7 @@ interface MockConnection {
   routed: boolean;
   deviceId?: UUID;
   e2ee?: E2eeSession;
+  attachedSessionIds: Set<UUID>;
 }
 
 export class MockDaemon {
@@ -136,6 +137,20 @@ export class MockDaemon {
     }
   }
 
+  pushSessionData(sessionId: UUID, text: string): void {
+    for (const connection of this.connections) {
+      if (connection.e2ee && connection.attachedSessionIds.has(sessionId)) {
+        this.sendInner(
+          connection,
+          envelope("session_data", {
+            session_id: sessionId,
+            data_base64: sessionDataToBase64(new TextEncoder().encode(text)),
+          }),
+        );
+      }
+    }
+  }
+
   async stop(): Promise<void> {
     this.server.clients.forEach((client) => client.close());
     await new Promise<void>((resolve, reject) => {
@@ -156,7 +171,7 @@ export class MockDaemon {
       return;
     }
 
-    const connection: MockConnection = { socket, routed: false };
+    const connection: MockConnection = { socket, routed: false, attachedSessionIds: new Set() };
     this.connections.add(connection);
     socket.on("close", () => this.connections.delete(connection));
 
@@ -306,6 +321,7 @@ export class MockDaemon {
         const payload = inner.payload as { session_id: UUID };
         const session = this.options.sessions.find((candidate) => candidate.session_id === payload.session_id);
         this.attachedSessions.push(payload.session_id);
+        connection.attachedSessionIds.add(payload.session_id);
         this.sendInner(
           connection,
           envelope("session_attached", {
@@ -470,6 +486,7 @@ export class MockDaemon {
       size: created.size,
       created_at_ms: nowMs(),
     });
+    connection.attachedSessionIds.add(created.session_id);
     this.sendInner(connection, envelope("session_created", created));
     if (this.options.attachOutput) {
       this.sendInner(

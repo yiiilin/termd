@@ -11,16 +11,31 @@ Object.assign(globalThis, { WebSocket });
 afterEach(() => {
   delete (globalThis as { __TERMD_TEST_FIT_DIMENSIONS__?: { rows: number; cols: number } })
     .__TERMD_TEST_FIT_DIMENSIONS__;
+  delete (globalThis as { __TERMD_TEST_DEFER_XTERM_RENDER_UNTIL_WRITE_CALLBACK__?: boolean })
+    .__TERMD_TEST_DEFER_XTERM_RENDER_UNTIL_WRITE_CALLBACK__;
+  delete (globalThis as { __TERMD_TEST_XTERM_STATS__?: { writes: number; refreshes: number; writtenBytes: number } })
+    .__TERMD_TEST_XTERM_STATS__;
   cleanup();
 });
 
 vi.mock("@xterm/xterm", () => {
+  const textDecoder = new TextDecoder();
+
+  function xtermStats() {
+    const scope = globalThis as { __TERMD_TEST_XTERM_STATS__?: { writes: number; refreshes: number; writtenBytes: number } };
+    scope.__TERMD_TEST_XTERM_STATS__ ??= { writes: 0, refreshes: 0, writtenBytes: 0 };
+    return scope.__TERMD_TEST_XTERM_STATS__;
+  }
+
   class Terminal {
     private dataListeners: Array<(data: string) => void> = [];
     private cursorMoveListeners: Array<() => void> = [];
     private writeParsedListeners: Array<() => void> = [];
+    private scrollListeners: Array<(viewportY: number) => void> = [];
     private terminalOptions: Record<string, unknown>;
-    public buffer = { active: { cursorY: 0, cursorX: 0 } };
+    private pendingRender = "";
+    private pendingRenderReady = false;
+    public buffer = { active: { cursorY: 0, cursorX: 0, viewportY: 0, baseY: 0 } };
     public cols = 80;
     public rows = 24;
     public element: HTMLDivElement | undefined;
@@ -59,22 +74,49 @@ vi.mock("@xterm/xterm", () => {
 
     loadAddon() {}
 
-    write(data: string, callback?: () => void) {
-      if (this.element) {
-        this.element.dataset.buffer = `${this.element.dataset.buffer ?? ""}${data}`;
-        this.element.append(document.createTextNode(data));
+    write(data: string | Uint8Array, callback?: () => void) {
+      const text = typeof data === "string" ? data : textDecoder.decode(data);
+      const stats = xtermStats();
+      stats.writes += 1;
+      stats.writtenBytes += typeof data === "string" ? data.length : data.byteLength;
+      const deferRender = Boolean(
+        (globalThis as { __TERMD_TEST_DEFER_XTERM_RENDER_UNTIL_WRITE_CALLBACK__?: boolean })
+          .__TERMD_TEST_DEFER_XTERM_RENDER_UNTIL_WRITE_CALLBACK__,
+      );
+      if (deferRender) {
+        this.pendingRender += text;
+        this.pendingRenderReady = false;
+      } else {
+        this.renderData(text);
       }
-      const lines = data.split("\n");
+      const lines = text.split("\n");
       const lastLine = lines[lines.length - 1] ?? "";
-      if (data.includes("\n")) {
+      if (text.includes("\n")) {
         this.buffer.active.cursorY += lines.length - 1;
         this.buffer.active.cursorX = lastLine.length;
       } else {
-        this.buffer.active.cursorX += data.length;
+        this.buffer.active.cursorX += text.length;
       }
+      this.buffer.active.baseY = Math.max(0, this.buffer.active.cursorY - this.rows + 1);
+      this.buffer.active.viewportY = this.buffer.active.baseY;
       this.writeParsedListeners.forEach((listener) => listener());
       this.cursorMoveListeners.forEach((listener) => listener());
-      callback?.();
+      this.scrollListeners.forEach((listener) => listener(this.buffer.active.viewportY));
+      if (!deferRender) {
+        callback?.();
+        return;
+      }
+
+      // 真实 xterm 会异步完成 write 解析和绘制；这里延后三帧，让测试能覆盖
+      // “write 后立即 refresh 但内容尚不可绘制”的浏览器时序。
+      window.requestAnimationFrame(() => {
+        window.requestAnimationFrame(() => {
+          window.requestAnimationFrame(() => {
+            this.pendingRenderReady = true;
+            callback?.();
+          });
+        });
+      });
     }
 
     onData(listener: (data: string) => void) {
@@ -92,6 +134,16 @@ vi.mock("@xterm/xterm", () => {
       return { dispose: () => undefined };
     }
 
+    onScroll(listener: (viewportY: number) => void) {
+      this.scrollListeners.push(listener);
+      return { dispose: () => undefined };
+    }
+
+    scrollToLine(line: number) {
+      this.buffer.active.viewportY = Math.min(this.buffer.active.baseY, Math.max(0, line));
+      this.scrollListeners.forEach((listener) => listener(this.buffer.active.viewportY));
+    }
+
     resize(cols: number, rows: number) {
       this.cols = cols;
       this.rows = rows;
@@ -101,9 +153,26 @@ vi.mock("@xterm/xterm", () => {
       this.element?.querySelector("textarea")?.focus();
     }
 
-    refresh() {}
+    refresh() {
+      xtermStats().refreshes += 1;
+      if (!this.pendingRenderReady || !this.pendingRender) {
+        return;
+      }
+      const data = this.pendingRender;
+      this.pendingRender = "";
+      this.pendingRenderReady = false;
+      this.renderData(data);
+    }
 
     dispose() {}
+
+    private renderData(data: string) {
+      if (!this.element) {
+        return;
+      }
+      this.element.dataset.buffer = `${this.element.dataset.buffer ?? ""}${data}`;
+      this.element.append(document.createTextNode(data));
+    }
   }
 
   return { Terminal };

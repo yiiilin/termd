@@ -162,6 +162,34 @@ function visibleSessionNames(): string[] {
     .filter(Boolean);
 }
 
+function resetXtermStats(): { writes: number; refreshes: number; writtenBytes: number } {
+  const scope = globalThis as { __TERMD_TEST_XTERM_STATS__?: { writes: number; refreshes: number; writtenBytes: number } };
+  scope.__TERMD_TEST_XTERM_STATS__ = { writes: 0, refreshes: 0, writtenBytes: 0 };
+  return scope.__TERMD_TEST_XTERM_STATS__;
+}
+
+function mockViewerLayout(input: { viewportWidth: number; viewportHeight: number; frameWidth: number; frameHeight: number }) {
+  const clientWidthSpy = vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockImplementation(function (this: HTMLElement) {
+    return this.classList.contains("terminal-scrollport") ? input.viewportWidth : 0;
+  });
+  const clientHeightSpy = vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockImplementation(function (this: HTMLElement) {
+    return this.classList.contains("terminal-scrollport") ? input.viewportHeight : 0;
+  });
+  const offsetWidthSpy = vi.spyOn(HTMLElement.prototype, "offsetWidth", "get").mockImplementation(function (this: HTMLElement) {
+    return this.classList.contains("terminal-viewer-frame") ? input.frameWidth : 0;
+  });
+  const offsetHeightSpy = vi.spyOn(HTMLElement.prototype, "offsetHeight", "get").mockImplementation(function (this: HTMLElement) {
+    return this.classList.contains("terminal-viewer-frame") ? input.frameHeight : 0;
+  });
+
+  return () => {
+    clientWidthSpy.mockRestore();
+    clientHeightSpy.mockRestore();
+    offsetWidthSpy.mockRestore();
+    offsetHeightSpy.mockRestore();
+  };
+}
+
 describe("termui web 工作台", () => {
   let daemon: MockDaemon;
 
@@ -217,6 +245,32 @@ describe("termui web 工作台", () => {
     await new Promise((resolve) => window.setTimeout(resolve, 250));
     expect(daemon.pingMessages).toBe(0);
     expect(daemon.outerWireText()).not.toContain("secret-token");
+  });
+
+  it("持续输出时合并写入 xterm，并且不为每个输出刷新布局", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await clickSessionCard(user);
+    await screen.findByText(/termd-e2e-ready/);
+    await new Promise((resolve) => window.setTimeout(resolve, 80));
+    daemon.sessionCursorUpdates.length = 0;
+    const stats = resetXtermStats();
+
+    for (let index = 0; index < 80; index += 1) {
+      daemon.pushSessionData(DEFAULT_SESSION_ID, `burst-output-${index}\n`);
+    }
+
+    await waitFor(() =>
+      expect(document.querySelector<HTMLElement>(".xterm")?.textContent).toContain("burst-output-79"),
+    );
+    await new Promise((resolve) => window.setTimeout(resolve, 160));
+
+    expect(stats.writes).toBeLessThan(80);
+    expect(stats.refreshes).toBeLessThanOrEqual(1);
+    expect(daemon.sessionCursorUpdates.length).toBeLessThan(20);
   });
 
   it("移动端顶部菜单保持 terminal-first，并把 daemon 管理放到独立后台页", async () => {
@@ -672,6 +726,35 @@ describe("termui web 工作台", () => {
     expect(terminalInput).not.toBeNull();
     await waitFor(() => expect(document.activeElement).toBe(terminalInput));
     expect(daemon.createdCommands).toEqual([[]]);
+  });
+
+  it("新建 session 后不输入内容也会刷新初始回显", async () => {
+    const user = userEvent.setup();
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [],
+      attachOutput: "idle-shell-prompt$ ",
+    });
+    (globalThis as { __TERMD_TEST_DEFER_XTERM_RENDER_UNTIL_WRITE_CALLBACK__?: boolean })
+      .__TERMD_TEST_DEFER_XTERM_RENDER_UNTIL_WRITE_CALLBACK__ = true;
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession("No session");
+
+    await user.click(screen.getByRole("button", { name: "New session" }));
+
+    const terminalInput = await waitFor(() => {
+      const input = document.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
+      expect(input).not.toBeNull();
+      return input!;
+    });
+    await waitFor(() => expect(document.activeElement).toBe(terminalInput));
+    await waitFor(() =>
+      expect(document.querySelector<HTMLElement>(".xterm")?.textContent).toContain("idle-shell-prompt$ "),
+    );
+    expect(daemon.decryptedInputs).toEqual([]);
   });
 
   it("新建多个 session 时已有 session 名称保持稳定", async () => {
@@ -1269,98 +1352,113 @@ describe("termui web 工作台", () => {
 
   it("shared-control attach 后持续发送终端输入、光标位置和聚焦状态", async () => {
     const user = userEvent.setup();
-    await daemon.stop();
-    daemon = await MockDaemon.start({
-      token: "secret-token",
-      sessions: [
-        {
+    const restoreViewerLayout = mockViewerLayout({
+      viewportWidth: 600,
+      viewportHeight: 420,
+      frameWidth: 1200,
+      frameHeight: 592,
+    });
+    try {
+      await daemon.stop();
+      daemon = await MockDaemon.start({
+        token: "secret-token",
+        sessions: [
+          {
+            session_id: "00000000-0000-0000-0000-000000000402",
+            state: "running",
+            size: { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 },
+          },
+        ],
+      });
+      render(<App />);
+
+      await pairWithInvite(user, daemon);
+      await waitForWorkspaceSession();
+      await user.click(screen.getByRole("button", { name: "Refresh" }));
+      await clickSessionCard(user);
+
+      let terminalInput: HTMLTextAreaElement | null = null;
+      await waitFor(() => {
+        terminalInput = document.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
+        expect(terminalInput).not.toBeNull();
+      });
+      await waitFor(() => expect(screen.getByTestId("terminal-pane")).toHaveAttribute("data-viewer-mode", "true"));
+      await within(screen.getByLabelText("viewer controls")).findByText("100x30");
+      await waitFor(() => within(screen.getByLabelText("viewer controls")).getByText("50%"));
+      const viewerFrame = document.querySelector<HTMLElement>(".terminal-pane-viewer .terminal-viewer-frame");
+      expect(viewerFrame).not.toBeNull();
+      expect(viewerFrame?.style.width).toBe("446px");
+      expect(viewerFrame?.style.height).toBe("309px");
+      const terminalHost = document.querySelector<HTMLElement>(".terminal-pane-viewer .terminal-host");
+      expect(terminalHost?.style.width).toBe("840px");
+      expect(terminalHost?.style.height).toBe("566px");
+      expect(terminalHost?.style.transform).toBe("scale(0.5)");
+      await waitFor(() =>
+        expect(daemon.sessionCursorUpdates).toContainEqual({
           session_id: "00000000-0000-0000-0000-000000000402",
-          state: "running",
-          size: { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 },
-        },
-      ],
-    });
-    render(<App />);
+          row: expect.any(Number),
+          col: expect.any(Number),
+          focused: false,
+        }),
+      );
+      expect(daemon.sessionResizes).toEqual([]);
+      await user.click(screen.getByRole("button", { name: "Zoom out" }));
+      await screen.findByText("50%");
+      expect(screen.getByTestId("terminal-pane")).toHaveAttribute("data-viewer-mode", "true");
+      await user.click(screen.getByRole("button", { name: "Fit" }));
+      await screen.findByText("50%");
+      expect(screen.getByTestId("terminal-pane")).toHaveAttribute("data-viewer-mode", "true");
 
-    await pairWithInvite(user, daemon);
-    await waitForWorkspaceSession();
-    await user.click(screen.getByRole("button", { name: "Refresh" }));
-    await clickSessionCard(user);
+      terminalInput!.focus();
+      await waitFor(() => expect(screen.getByTestId("terminal-pane")).toHaveAttribute("data-viewer-mode", "false"));
+      await waitFor(() =>
+        expect(daemon.sessionCursorUpdates).toContainEqual({
+          session_id: "00000000-0000-0000-0000-000000000402",
+          row: expect.any(Number),
+          col: expect.any(Number),
+          focused: true,
+        }),
+      );
+      await waitFor(() =>
+        expect(daemon.sessionResizes).toContainEqual({
+          session_id: "00000000-0000-0000-0000-000000000402",
+          size: { rows: 24, cols: 80, pixel_width: expect.any(Number), pixel_height: expect.any(Number) },
+        }),
+      );
+      terminalInput!.value = "first-terminal-secret";
+      fireEvent.input(terminalInput!);
 
-    let terminalInput: HTMLTextAreaElement | null = null;
-    await waitFor(() => {
-      terminalInput = document.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
-      expect(terminalInput).not.toBeNull();
-    });
-    await waitFor(() => expect(screen.getByTestId("terminal-pane")).toHaveAttribute("data-viewer-mode", "true"));
-    await within(screen.getByLabelText("viewer controls")).findByText("100x30");
-    const viewerFrame = document.querySelector<HTMLElement>(".terminal-pane-viewer .terminal-viewer-frame");
-    expect(viewerFrame).not.toBeNull();
-    expect(viewerFrame?.style.width).toBe("calc(100ch + 26px)");
-    expect(viewerFrame?.style.height).toBe("592px");
-    await waitFor(() =>
-      expect(daemon.sessionCursorUpdates).toContainEqual({
-        session_id: "00000000-0000-0000-0000-000000000402",
-        row: expect.any(Number),
-        col: expect.any(Number),
-        focused: false,
-      }),
-    );
-    expect(daemon.sessionResizes).toEqual([]);
-    await user.click(screen.getByRole("button", { name: "Zoom out" }));
-    await screen.findByText("90%");
-    expect(screen.getByTestId("terminal-pane")).toHaveAttribute("data-viewer-mode", "true");
-    await user.click(screen.getByRole("button", { name: "Fit" }));
-    await screen.findByText("100%");
-    expect(screen.getByTestId("terminal-pane")).toHaveAttribute("data-viewer-mode", "true");
+      await waitFor(() => expect(daemon.sessionDataMessages).toEqual(["first-terminal-secret"]));
 
-    terminalInput!.focus();
-    await waitFor(() => expect(screen.getByTestId("terminal-pane")).toHaveAttribute("data-viewer-mode", "false"));
-    await waitFor(() =>
-      expect(daemon.sessionCursorUpdates).toContainEqual({
-        session_id: "00000000-0000-0000-0000-000000000402",
-        row: expect.any(Number),
-        col: expect.any(Number),
-        focused: true,
-      }),
-    );
-    await waitFor(() =>
-      expect(daemon.sessionResizes).toContainEqual({
-        session_id: "00000000-0000-0000-0000-000000000402",
-        size: { rows: 24, cols: 80, pixel_width: expect.any(Number), pixel_height: expect.any(Number) },
-      }),
-    );
-    terminalInput!.value = "first-terminal-secret";
-    fireEvent.input(terminalInput!);
+      terminalInput!.value = "second-terminal-secret";
+      fireEvent.input(terminalInput!);
 
-    await waitFor(() => expect(daemon.sessionDataMessages).toEqual(["first-terminal-secret"]));
-
-    terminalInput!.value = "second-terminal-secret";
-    fireEvent.input(terminalInput!);
-
-    await waitFor(() => expect(daemon.sessionDataMessages).toEqual(["first-terminal-secret", "second-terminal-secret"]));
-    expect(daemon.sessionCursorUpdates.length).toBeGreaterThan(0);
-    terminalInput!.blur();
-    await waitFor(() =>
-      expect(daemon.sessionCursorUpdates).toContainEqual({
-        session_id: "00000000-0000-0000-0000-000000000402",
-        row: expect.any(Number),
-        col: expect.any(Number),
-        focused: false,
-      }),
-    );
-    const resizeCountAfterBlur = daemon.sessionResizes.length;
-    const viewerCanvas = document.querySelector<HTMLElement>(".terminal-viewer-canvas");
-    expect(viewerCanvas).not.toBeNull();
-    await user.click(viewerCanvas!);
-    expect(screen.getByTestId("terminal-pane")).toHaveAttribute("data-viewer-mode", "false");
-    expect(daemon.sessionResizes).toHaveLength(resizeCountAfterBlur);
-    expect(screen.queryByLabelText("viewer controls")).toBeNull();
-    expect(screen.queryByRole("button", { name: "Zoom out" })).toBeNull();
-    fireEvent(window, new Event("resize"));
-    expect(daemon.sessionResizes).toHaveLength(resizeCountAfterBlur);
-    expect(daemon.outerWireText()).not.toContain("first-terminal-secret");
-    expect(daemon.outerWireText()).not.toContain("second-terminal-secret");
+      await waitFor(() => expect(daemon.sessionDataMessages).toEqual(["first-terminal-secret", "second-terminal-secret"]));
+      expect(daemon.sessionCursorUpdates.length).toBeGreaterThan(0);
+      terminalInput!.blur();
+      await waitFor(() =>
+        expect(daemon.sessionCursorUpdates).toContainEqual({
+          session_id: "00000000-0000-0000-0000-000000000402",
+          row: expect.any(Number),
+          col: expect.any(Number),
+          focused: false,
+        }),
+      );
+      const resizeCountAfterBlur = daemon.sessionResizes.length;
+      const viewerCanvas = document.querySelector<HTMLElement>(".terminal-viewer-canvas");
+      expect(viewerCanvas).not.toBeNull();
+      await user.click(viewerCanvas!);
+      expect(screen.getByTestId("terminal-pane")).toHaveAttribute("data-viewer-mode", "false");
+      expect(daemon.sessionResizes).toHaveLength(resizeCountAfterBlur);
+      expect(screen.queryByLabelText("viewer controls")).toBeNull();
+      expect(screen.queryByRole("button", { name: "Zoom out" })).toBeNull();
+      fireEvent(window, new Event("resize"));
+      expect(daemon.sessionResizes).toHaveLength(resizeCountAfterBlur);
+      expect(daemon.outerWireText()).not.toContain("first-terminal-secret");
+      expect(daemon.outerWireText()).not.toContain("second-terminal-secret");
+    } finally {
+      restoreViewerLayout();
+    }
   });
 
   it("session 分辨率与当前客户端一致时不显示虚线框和缩放按钮", async () => {
@@ -1455,6 +1553,60 @@ describe("termui web 工作台", () => {
         focused: false,
       }),
     );
+  });
+
+  it("窗口 resize 进入 viewer 后点击缩放再点终端面板仍可重新聚焦", async () => {
+    const user = userEvent.setup();
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [
+        {
+          session_id: "00000000-0000-0000-0000-000000000406",
+          state: "running",
+          size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+        },
+      ],
+    });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await user.click(screen.getByRole("button", { name: "Refresh" }));
+    await clickSessionCard(user);
+
+    let terminalInput: HTMLTextAreaElement | null = null;
+    await waitFor(() => {
+      terminalInput = document.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
+      expect(terminalInput).not.toBeNull();
+    });
+    terminalInput!.focus();
+    await waitFor(() => expect(screen.getByTestId("terminal-pane")).toHaveAttribute("data-viewer-mode", "false"));
+
+    const resizeCountBeforeWindowResize = daemon.sessionResizes.length;
+    (globalThis as { __TERMD_TEST_FIT_DIMENSIONS__?: { rows: number; cols: number } }).__TERMD_TEST_FIT_DIMENSIONS__ = {
+      rows: 30,
+      cols: 100,
+    };
+    fireEvent(window, new Event("resize"));
+    await waitFor(() => expect(screen.getByTestId("terminal-pane")).toHaveAttribute("data-viewer-mode", "true"));
+
+    await user.click(screen.getByRole("button", { name: "Zoom in" }));
+    await screen.findByText("110%");
+    const viewerFrame = document.querySelector<HTMLElement>(".terminal-pane-viewer .terminal-viewer-frame");
+    expect(viewerFrame).not.toBeNull();
+    await user.click(viewerFrame!);
+
+    await waitFor(() => expect(screen.getByTestId("terminal-pane")).toHaveAttribute("data-viewer-mode", "false"));
+    await waitFor(() =>
+      expect(daemon.sessionCursorUpdates).toContainEqual({
+        session_id: "00000000-0000-0000-0000-000000000406",
+        row: expect.any(Number),
+        col: expect.any(Number),
+        focused: true,
+      }),
+    );
+    expect(daemon.sessionResizes.length).toBeGreaterThan(resizeCountBeforeWindowResize);
   });
 
   it("未配对时只显示连接表单，并按当前页面来源和前缀推导 WebSocket 地址", async () => {

@@ -1,8 +1,9 @@
-const CACHE_NAME = "termd-web-shell-v1";
+const CACHE_NAME = "termd-web-shell-v2";
 const SHELL_URLS = ["/", "/manifest.webmanifest", "/icons/termd.svg"];
 const NEVER_CACHE_PATHS = new Set(["/ws", "/healthz", "/local/pairing-token"]);
 
-// 只缓存 Web UI 外壳；终端协议、pairing/auth 和健康检查必须始终走网络。
+// 只把 Web UI 外壳作为离线兜底；正常在线访问必须优先走网络，
+// 避免 PWA 或 Safari 长期使用旧 JS 导致终端交互行为和 daemon 不一致。
 self.addEventListener("install", (event) => {
   event.waitUntil(
     caches
@@ -35,32 +36,19 @@ self.addEventListener("fetch", (event) => {
   }
 
   if (url.pathname.startsWith("/assets/") || SHELL_URLS.includes(url.pathname)) {
-    event.respondWith(cacheFirst(request));
+    event.respondWith(networkFirst(request, request));
   }
 });
 
-async function cacheFirst(request) {
-  const cached = await caches.match(request);
-  if (cached) {
-    return cached;
-  }
-  const response = await fetch(request);
-  if (response.ok) {
-    const cache = await caches.open(CACHE_NAME);
-    await cache.put(request, response.clone());
-  }
-  return response;
-}
-
-async function networkFirst(request, fallbackPath) {
+async function networkFirst(request, cacheKey) {
   try {
     const response = await fetch(request);
     if (response.ok) {
       const cache = await caches.open(CACHE_NAME);
-      await cache.put(fallbackPath, response.clone());
+      await cache.put(cacheKey, response.clone());
     }
     return response;
   } catch {
-    return (await caches.match(fallbackPath)) || Response.error();
+    return (await caches.match(cacheKey)) || Response.error();
   }
 }

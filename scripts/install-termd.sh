@@ -11,6 +11,7 @@ SERVICE_NAME="termd"
 INSTALL_PREFIX="${TERMD_INSTALL_PREFIX:-/usr/local}"
 REPO="${TERMD_GITHUB_REPO:-${GITHUB_REPOSITORY:-}}"
 VERSION="${TERMD_VERSION:-}"
+SUPERVISOR_VERSION="${TERMD_SUPERVISOR_VERSION:-}"
 ENV_DIR="/etc/termd"
 ENV_FILE="${ENV_DIR}/termd.env"
 WRAPPER_DIR="/usr/local/lib/termd"
@@ -29,10 +30,12 @@ INSTALL_SET_RELAY_URLS=0
 INSTALL_SET_RELAY_AUTH_TOKEN=0
 INSTALL_SET_TLS_CERT=0
 INSTALL_SET_TLS_KEY=0
+INSTALL_SET_SUPERVISOR_VERSION=0
 INSTALL_SET_USER=0
 ACTION="install"
 PURGE_STATE=0
 LOG_EMITTED=0
+SUPERVISOR_VERSION_NEEDS_RUNTIME_CLEAR=0
 
 log() {
   if [[ "$LOG_EMITTED" -eq 1 ]]; then
@@ -72,6 +75,7 @@ Options:
   --relay-auth-token <TOKEN>    Set relay transport auth token.
   --tls-cert <PATH>             Set TLS certificate path.
   --tls-key <PATH>              Set TLS private key path.
+  --supervisor-version <VER>    Set the target supervisor compatibility version.
   --user <USER>                 Run termd.service as this Linux user; default: existing service user, then termd.
   --uninstall                   Stop service and remove termd program files.
   --purge                       Implies --uninstall; also remove /var/lib/termd and system user.
@@ -81,6 +85,7 @@ Examples:
   curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termd.sh | sudo bash -s -- --web
   curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termd.sh | sudo bash -s -- --web --user alice
   curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termd.sh | sudo bash -s -- --web --listen 0.0.0.0:8765
+  curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termd.sh | sudo bash -s -- --web --supervisor-version 0.1.0
   curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termd.sh | sudo bash -s -- --uninstall
 EOF
 }
@@ -149,6 +154,12 @@ parse_args() {
         INSTALL_SET_TLS_KEY=1
         shift 2
         ;;
+      --supervisor-version)
+        [[ $# -ge 2 && -n "$2" ]] || die "--supervisor-version requires a non-empty value"
+        SUPERVISOR_VERSION="$2"
+        INSTALL_SET_SUPERVISOR_VERSION=1
+        shift 2
+        ;;
       --user)
         [[ $# -ge 2 && -n "$2" ]] || die "--user requires a non-empty value"
         SERVICE_USER="$2"
@@ -214,6 +225,115 @@ inherit_existing_service_identity() {
   if [[ -n "$existing_working_directory" ]]; then
     PREVIOUS_STATE_DIR="$existing_working_directory"
   fi
+}
+
+read_sqlite_meta_value() {
+  local sqlite_path="$1"
+  local key="$2"
+
+  [[ -f "$sqlite_path" ]] || return 0
+
+  python3 - "$sqlite_path" "$key" <<'PY'
+import sqlite3
+import sys
+
+path = sys.argv[1]
+key = sys.argv[2]
+
+try:
+    conn = sqlite3.connect(path)
+    try:
+        row = conn.execute(
+            "SELECT value FROM daemon_meta WHERE key = ?",
+            (key,),
+        ).fetchone()
+        if row and row[0] is not None:
+            print(row[0])
+    finally:
+        conn.close()
+except sqlite3.Error:
+    pass
+PY
+}
+
+upsert_sqlite_meta_value() {
+  local sqlite_path="$1"
+  local key="$2"
+  local value="$3"
+
+  python3 - "$sqlite_path" "$key" "$value" <<'PY'
+import sqlite3
+import sys
+import time
+
+path = sys.argv[1]
+key = sys.argv[2]
+value = sys.argv[3]
+
+conn = sqlite3.connect(path)
+try:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS daemon_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at_ms INTEGER NOT NULL
+        )
+        """
+    )
+    now_ms = int(time.time() * 1000)
+    conn.execute(
+        """
+        INSERT INTO daemon_meta (key, value, updated_at_ms)
+        VALUES (?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET
+            value = excluded.value,
+            updated_at_ms = excluded.updated_at_ms
+        """,
+        (key, value, now_ms),
+    )
+    conn.commit()
+finally:
+    conn.close()
+PY
+}
+
+sqlite_has_runtime_sessions() {
+  local sqlite_path="$1"
+
+  [[ -f "$sqlite_path" ]] || return 1
+
+  python3 - "$sqlite_path" <<'PY'
+import sqlite3
+import sys
+
+path = sys.argv[1]
+
+try:
+    conn = sqlite3.connect(path)
+    try:
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        for table in (
+            "daemon_client_attached_sessions",
+            "daemon_sessions",
+            "runtime_sessions",
+        ):
+            if table in tables:
+                row = conn.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone()
+                if row is not None:
+                    raise SystemExit(0)
+    finally:
+        conn.close()
+except sqlite3.Error:
+    pass
+
+raise SystemExit(1)
+PY
 }
 
 detect_arch() {
@@ -368,12 +488,132 @@ apply_env_overrides() {
   if [[ "$INSTALL_SET_TLS_KEY" -eq 1 ]]; then
     upsert_env_var "TERMD_TLS_KEY" "$TERMD_TLS_KEY"
   fi
+  if [[ "$INSTALL_SET_SUPERVISOR_VERSION" -eq 1 ]]; then
+    upsert_env_var "TERMD_SUPERVISOR_VERSION" "$SUPERVISOR_VERSION"
+  fi
 }
 
 apply_service_env_defaults() {
   # HOME/SHELL 由 daemon 的 systemd 运行身份决定，始终写进 env 文件，避免 unit 和 env 文件各自维护。
   upsert_env_var "HOME" "$SERVICE_HOME"
   upsert_env_var "SHELL" "$SERVICE_SHELL"
+}
+
+prompt_confirmation() {
+  local message="$1"
+  local answer confirm_fd
+
+  if [[ -n "${TERMD_INSTALL_CONFIRM_FD:-}" ]]; then
+    confirm_fd="$TERMD_INSTALL_CONFIRM_FD"
+    [[ "$confirm_fd" =~ ^[0-9]+$ ]] || die "TERMD_INSTALL_CONFIRM_FD must be a numeric file descriptor"
+  else
+    confirm_fd=9
+    exec 9</dev/tty || return 1
+  fi
+
+  printf '%s [y/N] ' "$message" >&2
+  if ! read -r -u "$confirm_fd" answer; then
+    if [[ -z "${TERMD_INSTALL_CONFIRM_FD:-}" ]]; then
+      exec 9<&-
+    fi
+    return 1
+  fi
+  if [[ -z "${TERMD_INSTALL_CONFIRM_FD:-}" ]]; then
+    exec 9<&-
+  fi
+
+  case "${answer,,}" in
+    y|yes)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+clear_runtime_session_state() {
+  local sqlite_path="$1"
+  local supervisor_dir="$2"
+
+  if [[ -f "$sqlite_path" ]]; then
+    python3 - "$sqlite_path" <<'PY'
+import sqlite3
+import sys
+
+path = sys.argv[1]
+conn = sqlite3.connect(path)
+try:
+    tables = {
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )
+    }
+    for table in (
+        "daemon_client_attached_sessions",
+        "daemon_sessions",
+        "runtime_sessions",
+    ):
+        if table in tables:
+            conn.execute(f"DELETE FROM {table}")
+    conn.commit()
+finally:
+    conn.close()
+PY
+  fi
+
+  if [[ -d "$supervisor_dir" ]]; then
+    find "$supervisor_dir" -maxdepth 1 -type s -delete
+  fi
+}
+
+resolve_supervisor_version() {
+  local sqlite_path current_supervisor_version desired_supervisor_version
+  sqlite_path="${STATE_DIR}/daemon-state.sqlite"
+  current_supervisor_version="$(read_sqlite_meta_value "$sqlite_path" "supervisor_version")"
+  local has_runtime_sessions=0
+  if sqlite_has_runtime_sessions "$sqlite_path"; then
+    has_runtime_sessions=1
+  fi
+
+  if [[ -n "$SUPERVISOR_VERSION" ]]; then
+    desired_supervisor_version="$SUPERVISOR_VERSION"
+  elif [[ -n "$current_supervisor_version" ]]; then
+    desired_supervisor_version="$current_supervisor_version"
+  else
+    desired_supervisor_version="$VERSION"
+  fi
+
+  if [[ -n "$current_supervisor_version" && "$current_supervisor_version" != "$desired_supervisor_version" ]]; then
+    log "supervisor version change detected: ${current_supervisor_version} -> ${desired_supervisor_version}"
+    if ! prompt_confirmation "updating the supervisor version will lose existing sessions; confirm you are prepared for session loss and continue"; then
+      die "supervisor version upgrade cancelled"
+    fi
+    SUPERVISOR_VERSION_NEEDS_RUNTIME_CLEAR=1
+  elif [[ -z "$current_supervisor_version" && "$has_runtime_sessions" -eq 1 ]]; then
+    log "supervisor version baseline will be set to ${desired_supervisor_version} for this daemon"
+    if ! prompt_confirmation "setting the initial supervisor version will lose existing sessions; confirm you are prepared for session loss and continue"; then
+      die "supervisor version initialization cancelled"
+    fi
+    SUPERVISOR_VERSION_NEEDS_RUNTIME_CLEAR=1
+  fi
+
+  SUPERVISOR_VERSION="$desired_supervisor_version"
+  INSTALL_SET_SUPERVISOR_VERSION=1
+}
+
+persist_supervisor_version() {
+  local sqlite_path
+  sqlite_path="${STATE_DIR}/daemon-state.sqlite"
+
+  if [[ "$SUPERVISOR_VERSION_NEEDS_RUNTIME_CLEAR" -eq 1 ]]; then
+    clear_runtime_session_state "$sqlite_path" "${STATE_DIR}/termd-supervisors"
+  fi
+
+  if [[ "$INSTALL_SET_SUPERVISOR_VERSION" -eq 1 ]]; then
+    upsert_sqlite_meta_value "$sqlite_path" "supervisor_version" "$SUPERVISOR_VERSION"
+  fi
 }
 
 resolve_service_identity() {
@@ -404,7 +644,7 @@ resolve_service_identity() {
   [[ -n "$SERVICE_SHELL" && "$SERVICE_SHELL" != "/usr/sbin/nologin" && "$SERVICE_SHELL" != "/sbin/nologin" ]] || SERVICE_SHELL="/bin/sh"
   # daemon state、SQLite 和 supervisor socket 路径必须稳定；--user 只影响 shell 的 HOME/SHELL，
   # 不再改变持久化根目录，避免升级或切换用户后丢失/错连会话状态。
-  STATE_DIR="/var/lib/termd"
+  STATE_DIR="${TERMD_STATE_DIR:-/var/lib/termd}"
 }
 
 write_env_file() {
@@ -427,6 +667,7 @@ write_env_file() {
     printf 'SHELL=%q\n' "$SERVICE_SHELL"
     printf 'TERMD_LISTEN=%q\n' "${TERMD_LISTEN:-127.0.0.1:8765}"
     printf 'TERMD_WEB_ENABLED=%q\n' "${TERMD_WEB_ENABLED:-0}"
+    printf 'TERMD_SUPERVISOR_VERSION=%q\n' "${SUPERVISOR_VERSION:-$VERSION}"
     if [[ -n "${TERMD_RELAY_URLS:-}" ]]; then
       printf 'TERMD_RELAY_URLS=%q\n' "$TERMD_RELAY_URLS"
     else
@@ -691,41 +932,7 @@ clear_session_state_after_state_dir_change() {
 
   log "using fixed state directory ${STATE_DIR}; previous WorkingDirectory was ${PREVIOUS_STATE_DIR}"
   log "clearing stale session metadata in ${STATE_DIR}; pairing identity and trusted devices are preserved"
-
-  local sqlite_path supervisor_dir
-  sqlite_path="${STATE_DIR}/daemon-state.sqlite"
-  supervisor_dir="${STATE_DIR}/termd-supervisors"
-
-  if [[ -f "$sqlite_path" ]]; then
-    python3 - "$sqlite_path" <<'PY'
-import sqlite3
-import sys
-
-path = sys.argv[1]
-conn = sqlite3.connect(path)
-try:
-    tables = {
-        row[0]
-        for row in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'table'"
-        )
-    }
-    for table in (
-        "daemon_client_attached_sessions",
-        "daemon_sessions",
-        "runtime_sessions",
-    ):
-        if table in tables:
-            conn.execute(f"DELETE FROM {table}")
-    conn.commit()
-finally:
-    conn.close()
-PY
-  fi
-
-  if [[ -d "$supervisor_dir" ]]; then
-    find "$supervisor_dir" -maxdepth 1 -type s -delete
-  fi
+  clear_runtime_session_state "${STATE_DIR}/daemon-state.sqlite" "${STATE_DIR}/termd-supervisors"
 }
 
 uninstall_component() {
@@ -782,6 +989,7 @@ main() {
 
   resolve_version
   resolve_service_identity
+  resolve_supervisor_version
   log "installing ${BIN_NAME} ${VERSION}"
 
   if ! install_from_release; then
@@ -790,6 +998,9 @@ main() {
 
   ensure_system_user
   clear_session_state_after_state_dir_change
+  chown_state_dir
+  persist_supervisor_version
+  # installer 可能首次创建 SQLite 元数据文件；写入 supervisor_version 后要重新归属给服务用户。
   chown_state_dir
   write_env_file
   # 重新读取最终 env，保证后续 wrapper 和初始 pairing token 都使用同一组监听/TLS 配置。

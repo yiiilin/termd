@@ -4,7 +4,7 @@
 //! supervisor 进程继续使用 termd 当前二进制启动，并在自己的进程空间里托管 PTY、
 //! 保留最近输出快照，以及在 daemon 重启后接受新的 attach。
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream as StdUnixStream;
@@ -22,6 +22,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, mpsc as tokio_mpsc, watch};
 
 use crate::net::pty_bridge::NonBlockingPortablePtyBackend;
+use crate::net::screen::TerminalScreen;
 
 use super::{
     CommandSpec, PtyBackend, PtyError, PtyRestoreInfo, PtyResult, PtySession, PtySize, PtySnapshot,
@@ -32,6 +33,13 @@ const SOCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const OUTPUT_SIGNAL_INIT: u64 = 0;
 const RETAINED_OUTPUT_MAX_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SupervisorProcess {
+    pid: u32,
+    session_id: String,
+    socket_path: PathBuf,
+}
 
 /// 生产 daemon 使用的 supervisor PTY backend。
 #[derive(Debug, Clone)]
@@ -62,6 +70,29 @@ impl SupervisorPtyBackend {
 
     fn socket_path_for_session(&self, session_id: &str) -> PathBuf {
         self.runtime_dir.join(format!("{session_id}.sock"))
+    }
+
+    /// 清理当前 supervisor 目录中已经不属于有效 runtime session 的孤儿进程。
+    ///
+    /// 这里按 `--socket-path` 限定目录，再按 `--session-id` 对比有效集合，避免误杀其他 termd 实例。
+    pub fn cleanup_orphaned_supervisors<I, S>(&self, valid_session_ids: I) -> PtyResult<usize>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let valid_session_ids = valid_session_ids
+            .into_iter()
+            .map(|session_id| session_id.as_ref().to_owned())
+            .collect::<HashSet<_>>();
+        let supervisors = supervisor_processes_from_proc()?;
+        let orphan_pids =
+            orphaned_supervisor_pids(&self.runtime_dir, &valid_session_ids, &supervisors);
+
+        for pid in &orphan_pids {
+            terminate_process(*pid)?;
+        }
+
+        Ok(orphan_pids.len())
     }
 
     fn launch_supervisor(
@@ -553,6 +584,102 @@ fn supervisor_runtime_dir(state_path: &Path) -> PathBuf {
     base_dir.join("termd-supervisors")
 }
 
+fn supervisor_processes_from_proc() -> PtyResult<Vec<SupervisorProcess>> {
+    let mut supervisors = Vec::new();
+    let proc_entries = match fs::read_dir("/proc") {
+        Ok(entries) => entries,
+        // 非 Linux 或受限测试环境没有 /proc 时，不应阻断 daemon 启动。
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(supervisors),
+        Err(error) => return Err(PtyError::from(error)),
+    };
+
+    for entry in proc_entries.flatten() {
+        let raw_pid = entry.file_name().to_string_lossy().into_owned();
+        if !raw_pid.bytes().all(|byte| byte.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(pid) = raw_pid.parse::<u32>() else {
+            continue;
+        };
+        let Ok(raw_cmdline) = fs::read(entry.path().join("cmdline")) else {
+            continue;
+        };
+        let args = raw_cmdline
+            .split(|byte| *byte == 0)
+            .filter(|arg| !arg.is_empty())
+            .map(|arg| String::from_utf8_lossy(arg).to_string())
+            .collect::<Vec<_>>();
+
+        if let Some(supervisor) = parse_supervisor_cmdline(pid, &args) {
+            supervisors.push(supervisor);
+        }
+    }
+
+    Ok(supervisors)
+}
+
+fn parse_supervisor_cmdline(pid: u32, args: &[String]) -> Option<SupervisorProcess> {
+    if !args.iter().any(|arg| arg == "__session-supervisor") {
+        return None;
+    }
+
+    let mut session_id = None;
+    let mut socket_path = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--session-id" => {
+                session_id = args.get(index + 1).cloned();
+                index += 2;
+            }
+            "--socket-path" => {
+                socket_path = args.get(index + 1).map(PathBuf::from);
+                index += 2;
+            }
+            _ => index += 1,
+        }
+    }
+
+    Some(SupervisorProcess {
+        pid,
+        session_id: session_id?,
+        socket_path: socket_path?,
+    })
+}
+
+fn orphaned_supervisor_pids(
+    runtime_dir: &Path,
+    valid_session_ids: &HashSet<String>,
+    supervisors: &[SupervisorProcess],
+) -> Vec<u32> {
+    supervisors
+        .iter()
+        .filter(|supervisor| supervisor.socket_path.parent() == Some(runtime_dir))
+        .filter(|supervisor| !valid_session_ids.contains(&supervisor.session_id))
+        .map(|supervisor| supervisor.pid)
+        .collect()
+}
+
+fn terminate_process(pid: u32) -> PtyResult<()> {
+    if pid == std::process::id() {
+        return Ok(());
+    }
+
+    let pid = i32::try_from(pid)
+        .map_err(|_| PtyError::Backend(format!("invalid supervisor pid {pid}")))?;
+    // 直接调用 kill(2)，避免静态二进制部署时额外依赖系统里的 /bin/kill。
+    let result = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    if result == 0 {
+        return Ok(());
+    }
+
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(());
+    }
+    Err(PtyError::from(error))
+}
+
 fn discover_termd_binary_path() -> PathBuf {
     if let Some(path) = std::env::var_os("CARGO_BIN_EXE_termd").map(PathBuf::from) {
         if path.exists() {
@@ -592,12 +719,39 @@ struct SupervisorShared {
     shutdown_tx: watch::Sender<bool>,
 }
 
-#[derive(Default)]
 struct SupervisorState {
     next_controller_id: u64,
     controller: Option<ControllerHandle>,
     retained_output: VecDeque<u8>,
+    screen: TerminalScreen,
     size: PtySize,
+}
+
+impl SupervisorState {
+    fn new(size: PtySize) -> Self {
+        Self {
+            next_controller_id: 1,
+            controller: None,
+            retained_output: VecDeque::new(),
+            screen: TerminalScreen::new(size.rows, size.cols),
+            size,
+        }
+    }
+
+    fn record_output(&mut self, bytes: &[u8]) {
+        // supervisor 是 PTY 真正存活的一侧；屏幕快照必须在这里维护，不能只放在 daemon 内存中。
+        self.screen.apply(bytes);
+        append_retained_output(&mut self.retained_output, bytes);
+    }
+
+    fn resize(&mut self, size: PtySize) {
+        self.size = size;
+        self.screen.resize(size.rows, size.cols);
+    }
+
+    fn snapshot_output(&self) -> Vec<u8> {
+        self.screen.snapshot_bytes()
+    }
 }
 
 #[derive(Clone)]
@@ -619,12 +773,7 @@ pub async fn run_session_supervisor(args: SessionSupervisorArgs) -> PtyResult<()
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     let shared = SupervisorShared {
         session: Arc::clone(&session),
-        state: Arc::new(Mutex::new(SupervisorState {
-            next_controller_id: 1,
-            controller: None,
-            retained_output: VecDeque::new(),
-            size: args.size,
-        })),
+        state: Arc::new(Mutex::new(SupervisorState::new(args.size))),
         shutdown_tx,
     };
     let listener = UnixListener::bind(&args.socket_path).map_err(PtyError::from)?;
@@ -702,7 +851,7 @@ async fn handle_supervisor_connection(
                                 SupervisorSnapshotPayload {
                                     size: state.size,
                                     process_id,
-                                    retained_output: state.retained_output.iter().copied().collect(),
+                                    retained_output: state.snapshot_output(),
                                 }
                             };
                             SupervisorResponse::ok(SupervisorResponsePayload::Snapshot(snapshot))
@@ -719,7 +868,7 @@ async fn handle_supervisor_connection(
                     SupervisorRequest::Resize { size } => {
                         ensure_current_controller(&shared, controller_id).await?;
                         shared.session.lock().await.resize(size)?;
-                        shared.state.lock().await.size = size;
+                        shared.state.lock().await.resize(size);
                         SupervisorResponse::ok(SupervisorResponsePayload::Empty)
                     }
                     SupervisorRequest::Snapshot => {
@@ -729,7 +878,7 @@ async fn handle_supervisor_connection(
                         let payload = SupervisorSnapshotPayload {
                             size: state.size,
                             process_id,
-                            retained_output: state.retained_output.iter().copied().collect(),
+                            retained_output: state.snapshot_output(),
                         };
                         SupervisorResponse::ok(SupervisorResponsePayload::Snapshot(payload))
                     }
@@ -811,7 +960,7 @@ async fn drain_supervisor_output(shared: &SupervisorShared) {
         buffer.truncate(read);
         let encoded = general_purpose::STANDARD.encode(&buffer);
         let mut state = shared.state.lock().await;
-        append_retained_output(&mut state.retained_output, &buffer);
+        state.record_output(&buffer);
         if let Some(controller) = state.controller.clone() {
             if controller
                 .tx
@@ -983,6 +1132,7 @@ fn invalid_data(error: impl std::fmt::Display) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
     use std::env;
     use std::ffi::OsStr;
 
@@ -1005,6 +1155,80 @@ mod tests {
 
         assert_eq!(runtime_dir.parent(), Some(Path::new("/var/lib/termd")));
         assert_eq!(runtime_dir, Path::new("/var/lib/termd/termd-supervisors"));
+    }
+
+    #[test]
+    fn orphan_cleanup_selects_only_current_runtime_dir_unrecorded_supervisors() {
+        let runtime_dir = Path::new("/var/lib/termd/termd-supervisors");
+        let valid_session_ids = HashSet::from(["kept-session".to_owned()]);
+        let supervisors = vec![
+            SupervisorProcess {
+                pid: 11,
+                session_id: "kept-session".to_owned(),
+                socket_path: runtime_dir.join("kept-session.sock"),
+            },
+            SupervisorProcess {
+                pid: 12,
+                session_id: "orphan-session".to_owned(),
+                socket_path: runtime_dir.join("orphan-session.sock"),
+            },
+            SupervisorProcess {
+                pid: 13,
+                session_id: "orphan-session".to_owned(),
+                socket_path: PathBuf::from("/tmp/other-termd-supervisors/orphan-session.sock"),
+            },
+        ];
+
+        let orphan_pids = orphaned_supervisor_pids(runtime_dir, &valid_session_ids, &supervisors);
+
+        assert_eq!(orphan_pids, vec![12]);
+    }
+
+    #[test]
+    fn supervisor_snapshot_preserves_screen_after_raw_retained_output_trim() {
+        let mut state = SupervisorState::new(PtySize::new(8, 80));
+        state.record_output(b"\x1b[4;1Hcurrent status");
+
+        let mut osc_noise = Vec::with_capacity(RETAINED_OUTPUT_MAX_BYTES + 4096);
+        while osc_noise.len() <= RETAINED_OUTPUT_MAX_BYTES + 1024 {
+            // OSC 标题更新不会改变终端屏幕，但会冲掉有限的原始输出环形缓存。
+            osc_noise.extend_from_slice(b"\x1b]0;ignored-title\x07");
+        }
+        state.record_output(&osc_noise);
+
+        let raw_retained = state.retained_output.iter().copied().collect::<Vec<_>>();
+        assert!(
+            !raw_retained
+                .windows(b"current status".len())
+                .any(|window| window == b"current status"),
+            "raw retained output should have been trimmed"
+        );
+        let snapshot = String::from_utf8_lossy(&state.snapshot_output()).to_string();
+        assert!(
+            snapshot.contains("current status"),
+            "supervisor snapshot should be screen-derived, got {snapshot:?}"
+        );
+    }
+
+    #[test]
+    fn parses_session_supervisor_cmdline() {
+        let args = vec![
+            "/usr/local/bin/termd".to_owned(),
+            "__session-supervisor".to_owned(),
+            "--session-id".to_owned(),
+            "session-a".to_owned(),
+            "--socket-path".to_owned(),
+            "/var/lib/termd/termd-supervisors/session-a.sock".to_owned(),
+        ];
+
+        let supervisor = parse_supervisor_cmdline(42, &args).expect("supervisor should parse");
+
+        assert_eq!(supervisor.pid, 42);
+        assert_eq!(supervisor.session_id, "session-a");
+        assert_eq!(
+            supervisor.socket_path,
+            PathBuf::from("/var/lib/termd/termd-supervisors/session-a.sock")
+        );
     }
 }
 

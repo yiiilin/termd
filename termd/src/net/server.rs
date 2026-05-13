@@ -19,7 +19,7 @@ use rustls::pki_types::pem::PemObject;
 use serde::Serialize;
 use termd_proto::{
     ErrorPayload, MessageType, PairingToken, ProtocolVersion, RouteHelloPayload, RouteReadyPayload,
-    RouteRole, ServerId, SessionId, UnixTimestampMillis,
+    RouteRole, ServerId, SessionId, SessionState, UnixTimestampMillis,
 };
 use thiserror::Error;
 use tokio::net::TcpListener;
@@ -114,9 +114,23 @@ struct LocalPairingTokenPayload {
 /// 构造生产默认协议状态，并接入本地状态文件。
 pub fn try_default_protocol(config: DaemonConfig) -> Result<SharedDaemonProtocol, ServerError> {
     let state = StateStore::load(&config.state_path)?;
+    let supervisor_backend = SupervisorPtyBackend::for_state_path(&config.state_path);
+    let valid_supervisor_session_ids = state
+        .sessions
+        .iter()
+        .filter(|session| session.state == SessionState::Running && session.restore_info.is_some())
+        .map(|session| session.session_id.0.to_string());
+    match supervisor_backend.cleanup_orphaned_supervisors(valid_supervisor_session_ids) {
+        Ok(cleaned_count) if cleaned_count > 0 => {
+            warn!(cleaned_count, "cleaned orphaned session supervisors")
+        }
+        Ok(_) => {}
+        // 清理失败只影响异常进程回收，不应阻断已有 session 恢复和 daemon 启动。
+        Err(error) => warn!(%error, "failed to clean orphaned session supervisors"),
+    }
     let protocol = DaemonProtocol::from_state(
         config.clone(),
-        SupervisorPtyBackend::for_state_path(&config.state_path),
+        supervisor_backend,
         Ed25519SignatureVerifier,
         state,
     )?;

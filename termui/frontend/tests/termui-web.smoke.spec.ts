@@ -63,21 +63,17 @@ test("pair、list、attach 的浏览器 smoke", async ({ page }, testInfo: TestI
       await expect(page.getByRole("region", { name: "sessions panel" })).toBeVisible();
       await activateButton(page, "Refresh sessions");
 
-      // 回归断言：移动端顶部菜单按钮和连接状态必须留在左侧，避免刷新后被挤到右上角。
+      // 回归断言：移动端顶部入口必须留在左侧，避免刷新后被布局规则顶到右边。
       const mobileMenuButton = page.getByRole("button", { name: "Open mobile workspace menu" });
       const menuBox = await mobileMenuButton.boundingBox();
       expect(menuBox?.x ?? 0).toBeLessThan(48);
-
-      const daemonStatus = page.getByText("paired daemon");
-      const daemonBox = await daemonStatus.boundingBox();
-      expect(daemonBox?.x ?? 0).toBeLessThan(180);
     } else {
-      await expect(page.getByText("Connected")).toBeVisible();
-      await expect(page.getByText("paired daemon")).toBeVisible();
+      await expect(page.getByText("ready")).toBeVisible();
       await activateButton(page, "Refresh");
     }
     const sessionsPanel = page.getByRole("region", { name: "sessions" });
-    const sessionRow = sessionsPanel.getByText("00000000-0000-0000-0000-000000000501");
+    // session UUID 已从 UI 隐藏；测试按用户实际看到的可访问名称打开会话。
+    const sessionRow = sessionsPanel.getByRole("button", { name: "Open Lagrange" });
     await expect(sessionRow).toBeVisible();
 
     await sessionRow.click();
@@ -139,7 +135,7 @@ test("pair、list、attach 的浏览器 smoke", async ({ page }, testInfo: TestI
       await expect(page.getByRole("main", { name: "daemon admin" })).toBeVisible();
       await expect(page.getByRole("button", { name: "Open workspace" })).toBeEnabled();
     } else {
-      await expect(page.getByText("Connected")).toBeVisible();
+      await expect(page.getByText("ready")).toBeVisible();
     }
     const localStorageText = await page.evaluate(() => JSON.stringify(window.localStorage));
     expect(localStorageText).not.toContain("secret-token");

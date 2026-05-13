@@ -6,6 +6,7 @@
 pub mod protocol;
 pub mod pty_bridge;
 pub mod relay;
+pub(crate) mod screen;
 pub mod server;
 pub mod signature;
 

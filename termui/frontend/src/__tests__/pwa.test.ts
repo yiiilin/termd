@@ -8,15 +8,18 @@ describe("PWA 外壳", () => {
     vi.unstubAllGlobals();
   });
 
-  it("注册 service worker 时使用静态根路径，便于 embedded Web UI 缓存资源", () => {
-    const register = vi.fn(() => Promise.resolve({}));
+  it("注册 service worker 时使用静态根路径，便于 embedded Web UI 缓存资源", async () => {
+    const update = vi.fn(() => Promise.resolve());
+    const register = vi.fn(() => Promise.resolve({ update }));
     vi.stubGlobal("navigator", {
       serviceWorker: { register },
     });
 
     registerTermdServiceWorker();
+    await Promise.resolve();
 
     expect(register).toHaveBeenCalledWith("/service-worker.js");
+    expect(update).toHaveBeenCalledTimes(1);
   });
 
   it("manifest 声明可安装的 termd Web 应用", async () => {
@@ -32,5 +35,13 @@ describe("PWA 外壳", () => {
     expect(manifest.start_url).toBe("/");
     expect(manifest.display).toBe("standalone");
     expect(manifest.icons?.some((icon) => icon.src === "/icons/termd.svg" && icon.purpose?.includes("maskable"))).toBe(true);
+  });
+
+  it("service worker 对前端资源使用网络优先，避免 PWA 长期运行旧 JS", async () => {
+    const source = await readFile(resolve(process.cwd(), "public/service-worker.js"), "utf8");
+
+    expect(source).toContain('const CACHE_NAME = "termd-web-shell-v2"');
+    expect(source).toContain('event.respondWith(networkFirst(request, request))');
+    expect(source).not.toContain("event.respondWith(cacheFirst(request))");
   });
 });

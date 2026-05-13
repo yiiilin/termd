@@ -30,6 +30,7 @@ done
 
 assert_help_contains scripts/install-termd.sh "--web"
 assert_help_contains scripts/install-termd.sh "--listen <HOST:PORT>"
+assert_help_contains scripts/install-termd.sh "--supervisor-version <VER>"
 assert_help_contains scripts/install-termd.sh "--user <USER>"
 assert_help_contains scripts/install-termd.sh "--purge"
 
@@ -42,6 +43,8 @@ grep -q "KillMode=process" "${ROOT_DIR}/scripts/install-termd.sh"
 grep -q "KillMode=process" "${ROOT_DIR}/scripts/install-termrelay.sh"
 grep -q "termctl pair --payload" "${ROOT_DIR}/scripts/install-termd.sh"
 ! grep -q "termctl pair --token" "${ROOT_DIR}/scripts/install-termd.sh"
+grep -q 'SUPERVISOR_VERSION="${TERMD_SUPERVISOR_VERSION:-' "${ROOT_DIR}/.github/workflows/release.yml"
+test -s "${ROOT_DIR}/SUPERVISOR_VERSION"
 
 load_termd_installer_functions() {
   # 测试只加载函数和默认变量，跳过脚本末尾的 main 调用，避免触发真实安装。
@@ -106,6 +109,51 @@ install_fake_termd_system_commands() {
   chmod() { :; }
   systemctl() { :; }
   print_initial_pairing_token() { :; }
+}
+
+seed_termd_runtime_sqlite() {
+  local sqlite_file="$1"
+  local supervisor_version="$2"
+
+  python3 - "$sqlite_file" "$supervisor_version" <<'PY'
+import sqlite3
+import sys
+
+sqlite_path = sys.argv[1]
+supervisor_version = sys.argv[2]
+
+conn = sqlite3.connect(sqlite_path)
+conn.executescript("""
+CREATE TABLE daemon_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at_ms INTEGER NOT NULL);
+CREATE TABLE trusted_devices (device_id TEXT PRIMARY KEY, public_key TEXT NOT NULL, trusted_at_ms INTEGER NOT NULL);
+CREATE TABLE daemon_clients (device_id TEXT PRIMARY KEY);
+CREATE TABLE daemon_client_attached_sessions (device_id TEXT NOT NULL, connection_id TEXT NOT NULL, session_id TEXT NOT NULL);
+CREATE TABLE daemon_sessions (session_id TEXT PRIMARY KEY);
+CREATE TABLE runtime_sessions (session_id TEXT PRIMARY KEY);
+""")
+conn.execute("INSERT INTO daemon_meta VALUES ('server_id', 'server', 1)")
+conn.execute("INSERT INTO daemon_meta VALUES ('supervisor_version', ?, 1)", (supervisor_version,))
+conn.execute("INSERT INTO trusted_devices VALUES ('device', 'public', 1)")
+conn.execute("INSERT INTO daemon_clients VALUES ('device')")
+conn.execute("INSERT INTO daemon_client_attached_sessions VALUES ('device', 'connection', 'session')")
+conn.execute("INSERT INTO daemon_sessions VALUES ('session')")
+conn.execute("INSERT INTO runtime_sessions VALUES ('session')")
+conn.commit()
+conn.close()
+PY
+}
+
+create_stale_supervisor_socket() {
+  local socket_file="$1"
+
+  python3 - "$socket_file" <<'PY'
+import socket
+import sys
+
+sock = socket.socket(socket.AF_UNIX)
+sock.bind(sys.argv[1])
+sock.close()
+PY
 }
 
 run_fake_termd_install() {
@@ -227,7 +275,9 @@ test_termd_state_dir_change_clears_only_session_state() (
   local tmp_dir sqlite_file socket_file
   tmp_dir="$(mktemp -d)"
   trap 'rm -rf "$tmp_dir"' EXIT
-  STATE_DIR="${tmp_dir}/termd"
+  TERMD_STATE_DIR="${tmp_dir}/termd"
+  export TERMD_STATE_DIR
+  STATE_DIR="${TERMD_STATE_DIR}"
   PREVIOUS_STATE_DIR="/old/state"
   mkdir -p "${STATE_DIR}/termd-supervisors"
   sqlite_file="${STATE_DIR}/daemon-state.sqlite"
@@ -284,10 +334,146 @@ assert not pathlib.Path(sys.argv[2]).exists()
 PY
 )
 
+test_termd_supervisor_version_match_keeps_runtime_state() (
+  load_termd_installer_functions
+  install_fake_termd_system_commands
+
+  local tmp_dir unit_file sqlite_file socket_file
+  tmp_dir="$(mktemp -d)"
+  trap 'rm -rf "$tmp_dir"' EXIT
+  TERMD_STATE_DIR="${tmp_dir}/termd"
+  export TERMD_STATE_DIR
+  STATE_DIR="${TERMD_STATE_DIR}"
+  mkdir -p "${STATE_DIR}/termd-supervisors"
+  sqlite_file="${STATE_DIR}/daemon-state.sqlite"
+  socket_file="${STATE_DIR}/termd-supervisors/stale.sock"
+  seed_termd_runtime_sqlite "$sqlite_file" "v-test"
+  create_stale_supervisor_socket "$socket_file"
+
+  export TERMD_SUPERVISOR_VERSION="v-test"
+  unit_file="${tmp_dir}/termd.service"
+  run_fake_termd_install "$unit_file" >/dev/null
+  unset TERMD_SUPERVISOR_VERSION
+
+  python3 - "$sqlite_file" "$socket_file" <<'PY'
+import pathlib
+import sqlite3
+import sys
+
+conn = sqlite3.connect(sys.argv[1])
+try:
+    for table in ("daemon_client_attached_sessions", "daemon_sessions", "runtime_sessions"):
+        count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        assert count == 1, (table, count)
+    version = conn.execute(
+        "SELECT value FROM daemon_meta WHERE key = 'supervisor_version'"
+    ).fetchone()[0]
+    assert version == "v-test", version
+finally:
+    conn.close()
+assert pathlib.Path(sys.argv[2]).exists()
+PY
+)
+
+test_termd_supervisor_version_mismatch_prompts_and_clears_runtime_state() (
+  load_termd_installer_functions
+  install_fake_termd_system_commands
+
+  local tmp_dir unit_file sqlite_file socket_file
+  tmp_dir="$(mktemp -d)"
+  trap 'rm -rf "$tmp_dir"' EXIT
+  TERMD_STATE_DIR="${tmp_dir}/termd"
+  export TERMD_STATE_DIR
+  STATE_DIR="${TERMD_STATE_DIR}"
+  mkdir -p "${STATE_DIR}/termd-supervisors"
+  sqlite_file="${STATE_DIR}/daemon-state.sqlite"
+  socket_file="${STATE_DIR}/termd-supervisors/stale.sock"
+  seed_termd_runtime_sqlite "$sqlite_file" "v-old"
+  create_stale_supervisor_socket "$socket_file"
+
+  SUPERVISOR_VERSION="v-new"
+  export TERMD_INSTALL_CONFIRM_FD=0
+  unit_file="${tmp_dir}/termd.service"
+  printf 'y\n' | run_fake_termd_install "$unit_file" >/dev/null
+  unset TERMD_INSTALL_CONFIRM_FD
+
+  python3 - "$sqlite_file" "$socket_file" <<'PY'
+import pathlib
+import sqlite3
+import sys
+
+conn = sqlite3.connect(sys.argv[1])
+try:
+    for table in ("daemon_client_attached_sessions", "daemon_sessions", "runtime_sessions"):
+        count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        assert count == 0, (table, count)
+    version = conn.execute(
+        "SELECT value FROM daemon_meta WHERE key = 'supervisor_version'"
+    ).fetchone()[0]
+    assert version == "v-new", version
+    assert conn.execute("SELECT COUNT(*) FROM daemon_meta").fetchone()[0] == 2
+    assert conn.execute("SELECT COUNT(*) FROM trusted_devices").fetchone()[0] == 1
+    assert conn.execute("SELECT COUNT(*) FROM daemon_clients").fetchone()[0] == 1
+finally:
+    conn.close()
+assert not pathlib.Path(sys.argv[2]).exists()
+PY
+)
+
+test_termd_supervisor_version_mismatch_decline_preserves_runtime_state() (
+  load_termd_installer_functions
+  install_fake_termd_system_commands
+
+  local tmp_dir unit_file sqlite_file socket_file status
+  tmp_dir="$(mktemp -d)"
+  trap 'rm -rf "$tmp_dir"' EXIT
+  TERMD_STATE_DIR="${tmp_dir}/termd"
+  export TERMD_STATE_DIR
+  STATE_DIR="${TERMD_STATE_DIR}"
+  mkdir -p "${STATE_DIR}/termd-supervisors"
+  sqlite_file="${STATE_DIR}/daemon-state.sqlite"
+  socket_file="${STATE_DIR}/termd-supervisors/stale.sock"
+  seed_termd_runtime_sqlite "$sqlite_file" "v-old"
+  create_stale_supervisor_socket "$socket_file"
+
+  SUPERVISOR_VERSION="v-new"
+  export TERMD_INSTALL_CONFIRM_FD=0
+  unit_file="${tmp_dir}/termd.service"
+  set +e
+  printf 'n\n' | run_fake_termd_install "$unit_file" >/dev/null 2>/dev/null
+  status=$?
+  set -e
+  unset TERMD_INSTALL_CONFIRM_FD
+
+  [[ "$status" -ne 0 ]]
+
+  python3 - "$sqlite_file" "$socket_file" <<'PY'
+import pathlib
+import sqlite3
+import sys
+
+conn = sqlite3.connect(sys.argv[1])
+try:
+    for table in ("daemon_client_attached_sessions", "daemon_sessions", "runtime_sessions"):
+        count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        assert count == 1, (table, count)
+    version = conn.execute(
+        "SELECT value FROM daemon_meta WHERE key = 'supervisor_version'"
+    ).fetchone()[0]
+    assert version == "v-old", version
+finally:
+    conn.close()
+assert pathlib.Path(sys.argv[2]).exists()
+PY
+)
+
 test_termd_default_install_uses_managed_user
 test_termd_upgrade_inherits_existing_user_without_user_arg
 test_termd_upgrade_uses_fixed_state_dir_when_existing_unit_has_no_working_directory
 test_termd_explicit_user_overrides_existing_service_user
 test_termd_state_dir_change_clears_only_session_state
+test_termd_supervisor_version_match_keeps_runtime_state
+test_termd_supervisor_version_mismatch_prompts_and_clears_runtime_state
+test_termd_supervisor_version_mismatch_decline_preserves_runtime_state
 
 printf 'installer tests passed\n'

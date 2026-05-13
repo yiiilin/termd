@@ -1024,6 +1024,10 @@ label {
   overflow: hidden;
 }
 
+.terminal-mobile-scroll-track {
+  display: none;
+}
+
 .terminal-placeholder {
   position: absolute;
   inset: 0;
@@ -1542,6 +1546,48 @@ label {
 
   .terminal-scrollport {
     overflow: hidden;
+  }
+
+  .terminal-mobile-scroll-track {
+    position: absolute;
+    top: 56px;
+    right: 6px;
+    bottom: 56px;
+    z-index: 6;
+    display: block;
+    width: 36px;
+    min-height: 96px;
+    pointer-events: none;
+  }
+
+  .terminal-pane-viewer .terminal-mobile-scroll-track {
+    top: 52px;
+  }
+
+  .terminal-mobile-scroll-thumb {
+    position: absolute;
+    right: 0;
+    width: 34px;
+    min-height: 52px;
+    padding: 0;
+    border-color: #4d6259;
+    border-radius: 8px;
+    background: rgba(16, 26, 22, 0.86);
+    color: #d6ff5f;
+    box-shadow:
+      0 12px 26px rgba(0, 0, 0, 0.34),
+      inset 0 0 0 1px rgba(214, 255, 95, 0.08);
+    pointer-events: auto;
+    touch-action: none;
+    user-select: none;
+    backdrop-filter: blur(8px);
+  }
+
+  .terminal-mobile-scroll-track.dragging .terminal-mobile-scroll-thumb,
+  .terminal-mobile-scroll-thumb:active {
+    border-color: #d6ff5f;
+    background: rgba(26, 39, 34, 0.94);
+    color: #f5ffe0;
   }
 
   .terminal-host {

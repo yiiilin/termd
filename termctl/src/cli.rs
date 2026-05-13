@@ -348,6 +348,16 @@ async fn handle_attach_envelope(
             Ok(())
         }
         MessageType::Pong => Ok(()),
+        MessageType::ControlGrant
+        | MessageType::DaemonClientsResult
+        | MessageType::SessionAttached
+        | MessageType::SessionCursor
+        | MessageType::SessionFilesResult => {
+            // attach 模式的 stdout 只能写入 PTY 明文字节。daemon 可能在同一条已 attach
+            // 连接上推送文件树、客户端列表或 shared-control 状态，这些旁路消息对 CLI
+            // 交互没有可展示价值，必须忽略而不是中断终端流。
+            Ok(())
+        }
         MessageType::Error => {
             let payload: ErrorPayload = termd::net::protocol::decode_payload(envelope.payload)
                 .map_err(|_| TermctlError::InvalidEnvelope)?;

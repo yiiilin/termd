@@ -30,7 +30,7 @@ import type {
   TerminalSize,
   UUID,
 } from "./protocol/types";
-import { decodeUtf8, sessionDataFromBase64 } from "./protocol/wire";
+import { sessionDataFromBase64 } from "./protocol/wire";
 import {
   defaultServer,
   ensureDevice,
@@ -77,7 +77,6 @@ export default function App() {
   const [renamingSessionId, setRenamingSessionId] = useState<UUID | undefined>();
   const [renameDraft, setRenameDraft] = useState("");
   const [renameOriginalName, setRenameOriginalName] = useState("");
-  const [terminalOutputVersion, setTerminalOutputVersion] = useState(0);
   const [terminalOutputResetVersion, setTerminalOutputResetVersion] = useState(0);
   const [terminalFocusRequest, setTerminalFocusRequest] = useState(0);
   const [sessionFiles, setSessionFiles] = useState<SessionFilesResultPayload | undefined>();
@@ -111,10 +110,12 @@ export default function App() {
   const urlTouchedRef = useRef(false);
   const autoCheckedServerRef = useRef<UUID | undefined>(undefined);
   const lastCursorReportRef = useRef("");
+  const lastCursorFocusedRef = useRef<boolean | undefined>(undefined);
   const cursorRefreshTimerRef = useRef<number | undefined>(undefined);
-  const terminalOutputQueueRef = useRef<string[]>([]);
+  const terminalOutputQueueRef = useRef<Uint8Array[]>([]);
   const terminalOutputResetVersionRef = useRef(0);
   const terminalOutputFlushFrameRef = useRef<number | undefined>(undefined);
+  const terminalOutputDrainRef = useRef<(() => void) | undefined>(undefined);
   const connectionAutoRetryTimerRef = useRef<number | undefined>(undefined);
   const connectionAutoRetryKeyRef = useRef<string | undefined>(undefined);
   const connectionAutoRetryAttemptsRef = useRef(0);
@@ -310,8 +311,8 @@ export default function App() {
 
   const flushTerminalOutput = useCallback(() => {
     terminalOutputFlushFrameRef.current = undefined;
-    // 这一帧里累积的 session_data 会在 xterm 里一次性写入，避免每个 chunk 都触发一次 React 更新。
-    setTerminalOutputVersion((version) => version + 1);
+    // 这一帧里累积的 session_data 直接交给 xterm drain，避免每帧输出都触发 React 重渲染。
+    terminalOutputDrainRef.current?.();
   }, []);
 
   const scheduleTerminalOutputFlush = useCallback(() => {
@@ -323,7 +324,7 @@ export default function App() {
     });
   }, [flushTerminalOutput]);
 
-  const enqueueTerminalOutput = useCallback((chunk: string) => {
+  const enqueueTerminalOutput = useCallback((chunk: Uint8Array) => {
     terminalOutputQueueRef.current.push(chunk);
     scheduleTerminalOutputFlush();
   }, [scheduleTerminalOutputFlush]);
@@ -334,6 +335,17 @@ export default function App() {
     return chunks;
   }, []);
 
+  const registerTerminalOutputDrain = useCallback((drain: () => void) => {
+    terminalOutputDrainRef.current = drain;
+    // TerminalPane 可能在已有 attach 输出之后才挂载；注册完成后立刻尝试消费积压输出。
+    drain();
+    return () => {
+      if (terminalOutputDrainRef.current === drain) {
+        terminalOutputDrainRef.current = undefined;
+      }
+    };
+  }, []);
+
   const disconnectAttach = useCallback(() => {
     receiveLoopActiveRef.current = false;
     attachClientRef.current?.close();
@@ -341,6 +353,7 @@ export default function App() {
     attachedSessionRef.current = undefined;
     setAttachedSessionId(undefined);
     lastCursorReportRef.current = "";
+    lastCursorFocusedRef.current = undefined;
     if (cursorRefreshTimerRef.current !== undefined) {
       window.clearTimeout(cursorRefreshTimerRef.current);
       cursorRefreshTimerRef.current = undefined;
@@ -672,7 +685,7 @@ export default function App() {
           const inner = await client.receiveInner();
           if (inner.type === "session_data") {
             const payload = inner.payload as { data_base64: string };
-            enqueueTerminalOutput(decodeUtf8(sessionDataFromBase64(payload.data_base64)));
+            enqueueTerminalOutput(sessionDataFromBase64(payload.data_base64));
           } else if (inner.type === "session_files_result") {
             const payload = inner.payload as SessionFilesResultPayload;
             // daemon 主动推送的文件树状态和当前 attach 的 session 对齐后才更新右侧 panel。
@@ -1004,12 +1017,14 @@ export default function App() {
         return;
       }
       lastCursorReportRef.current = nextCursor;
+      const focusChanged = lastCursorFocusedRef.current !== presence.focused;
+      lastCursorFocusedRef.current = presence.focused;
       void client.sendSessionCursor(sessionId, presence).catch((caught) => {
         if (!isIgnoredClosingSessionNotFound(sessionId, caught)) {
           setSafeError(caught);
         }
       });
-      if (cursorRefreshTimerRef.current === undefined) {
+      if (focusChanged && cursorRefreshTimerRef.current === undefined) {
         cursorRefreshTimerRef.current = window.setTimeout(() => {
           cursorRefreshTimerRef.current = undefined;
           void refreshDaemonClients();
@@ -1486,9 +1501,9 @@ export default function App() {
                 sessionSize={attachedSession?.size}
                 focusRequest={terminalFocusRequest}
                 mobileInputMode={isMobileLayout}
-                outputVersion={terminalOutputVersion}
                 outputResetVersion={terminalOutputResetVersion}
                 takeOutput={takeTerminalOutput}
+                registerOutputDrain={registerTerminalOutputDrain}
                 onInput={handleTerminalInput}
                 onResize={handleResize}
                 onCursorChange={handleCursorChange}

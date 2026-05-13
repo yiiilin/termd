@@ -50,10 +50,6 @@ test("浏览器通过真实 relay 连接 daemon 完成 pairing 和 session list"
       const mobileMenuButton = page.getByRole("button", { name: "Open mobile workspace menu" });
       const menuBox = await mobileMenuButton.boundingBox();
       expect(menuBox?.x ?? 0).toBeLessThan(48);
-
-      const daemonStatus = page.getByText("paired daemon");
-      const daemonBox = await daemonStatus.boundingBox();
-      expect(daemonBox?.x ?? 0).toBeLessThan(180);
     } else {
       await page.getByRole("button", { name: "Refresh" }).click();
     }
