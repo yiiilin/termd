@@ -23,7 +23,7 @@ use termd_proto::{
 };
 use thiserror::Error;
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
@@ -43,6 +43,7 @@ const OUTPUT_FLUSH_MAX_BYTES_PER_SESSION: usize = 16 * 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SessionPushEvent {
     Output(SessionId),
+    Activity(SessionId),
     FileTree(SessionId),
 }
 
@@ -513,6 +514,7 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
     let (mut sender, mut receiver) = socket.split();
     let (push_event_tx, mut push_event_rx) = mpsc::unbounded_channel::<SessionPushEvent>();
     let mut watched_output_sessions = HashSet::new();
+    let mut watched_activity_sessions = HashSet::new();
     let mut watched_file_tree_sessions = HashSet::new();
     let mut watcher_tasks: Vec<JoinHandle<()>> = Vec::new();
     let server_id = {
@@ -591,6 +593,7 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
                             &connection,
                             &protocol,
                             &mut watched_output_sessions,
+                            &mut watched_activity_sessions,
                             &mut watched_file_tree_sessions,
                             &push_event_tx,
                             &mut watcher_tasks,
@@ -624,6 +627,9 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
                                 OUTPUT_FLUSH_MAX_BYTES_PER_SESSION,
                             )
                         }
+                        SessionPushEvent::Activity(session_id) => {
+                            connection.read_session_activity(&mut protocol, session_id)
+                        }
                         SessionPushEvent::FileTree(session_id) => {
                             connection.read_session_file_tree_update(&mut protocol, session_id)
                         }
@@ -649,59 +655,93 @@ fn register_session_watchers(
     connection: &ProtocolConnection,
     protocol: &SharedDaemonProtocol,
     watched_output_sessions: &mut HashSet<SessionId>,
+    watched_activity_sessions: &mut HashSet<SessionId>,
     watched_file_tree_sessions: &mut HashSet<SessionId>,
     push_event_tx: &mpsc::UnboundedSender<SessionPushEvent>,
     watcher_tasks: &mut Vec<JoinHandle<()>>,
 ) {
-    let (output_signals, file_tree_signals) = {
+    let (output_signals, activity_signals, file_tree_signals) = {
         let protocol = protocol.lock().expect("daemon protocol mutex poisoned");
         (
             connection.attached_output_signals(&protocol),
+            connection.session_activity_signals(&protocol),
             connection.attached_file_tree_signals(&protocol),
         )
     };
 
-    for (session_id, mut signal) in output_signals {
+    for (session_id, signal) in output_signals {
         if !watched_output_sessions.insert(session_id) {
             continue;
         }
 
-        let push_event_tx = push_event_tx.clone();
-        watcher_tasks.push(tokio::spawn(async move {
-            loop {
-                if signal.changed().await.is_err() {
-                    break;
-                }
-                if push_event_tx
-                    .send(SessionPushEvent::Output(session_id))
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        }));
+        spawn_session_push_watcher(
+            session_id,
+            signal,
+            SessionPushEvent::Output(session_id),
+            push_event_tx,
+            watcher_tasks,
+        );
     }
 
-    for (session_id, mut signal) in file_tree_signals {
+    for (session_id, signal) in activity_signals {
+        if !watched_activity_sessions.insert(session_id) {
+            continue;
+        }
+        if watched_output_sessions.contains(&session_id) {
+            continue;
+        }
+
+        spawn_session_push_watcher(
+            session_id,
+            signal,
+            SessionPushEvent::Activity(session_id),
+            push_event_tx,
+            watcher_tasks,
+        );
+    }
+
+    for (session_id, signal) in file_tree_signals {
         if !watched_file_tree_sessions.insert(session_id) {
             continue;
         }
 
-        let push_event_tx = push_event_tx.clone();
-        watcher_tasks.push(tokio::spawn(async move {
-            loop {
-                if signal.changed().await.is_err() {
-                    break;
-                }
-                if push_event_tx
-                    .send(SessionPushEvent::FileTree(session_id))
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        }));
+        spawn_session_push_watcher(
+            session_id,
+            signal,
+            SessionPushEvent::FileTree(session_id),
+            push_event_tx,
+            watcher_tasks,
+        );
     }
+}
+
+fn spawn_session_push_watcher(
+    session_id: SessionId,
+    mut signal: watch::Receiver<u64>,
+    event: SessionPushEvent,
+    push_event_tx: &mpsc::UnboundedSender<SessionPushEvent>,
+    watcher_tasks: &mut Vec<JoinHandle<()>>,
+) {
+    // watch 新订阅者可能把当前版本视为“未读”；先标记已读，避免 attach 时把历史输出
+    // 误推成 session_activity，导致前端一直显示 new output。
+    signal.borrow_and_update();
+
+    let push_event_tx = push_event_tx.clone();
+    watcher_tasks.push(tokio::spawn(async move {
+        loop {
+            if signal.changed().await.is_err() {
+                break;
+            }
+            let next_event = match event {
+                SessionPushEvent::Output(_) => SessionPushEvent::Output(session_id),
+                SessionPushEvent::Activity(_) => SessionPushEvent::Activity(session_id),
+                SessionPushEvent::FileTree(_) => SessionPushEvent::FileTree(session_id),
+            };
+            if push_event_tx.send(next_event).is_err() {
+                break;
+            }
+        }
+    }));
 }
 
 fn message_to_envelope(message: Message) -> Result<Option<JsonEnvelope>, ProtocolError> {
@@ -1026,6 +1066,40 @@ mod tests {
         assert_eq!(output, b"pushed-output");
 
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn session_push_watcher_ignores_initial_watch_value() {
+        let session_id = SessionId::new();
+        let (signal_tx, signal_rx) = watch::channel(41_u64);
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let mut watcher_tasks = Vec::new();
+
+        spawn_session_push_watcher(
+            session_id,
+            signal_rx,
+            SessionPushEvent::Activity(session_id),
+            &event_tx,
+            &mut watcher_tasks,
+        );
+
+        // 新建 watcher 时的当前值只是历史状态，不应立刻变成前端的 new output。
+        assert!(
+            timeout(Duration::from_millis(80), event_rx.recv())
+                .await
+                .is_err()
+        );
+
+        signal_tx.send(42).unwrap();
+        let pushed = timeout(Duration::from_secs(1), event_rx.recv())
+            .await
+            .expect("watcher should push after a real signal change")
+            .expect("push channel should remain open");
+        assert_eq!(pushed, SessionPushEvent::Activity(session_id));
+
+        for task in watcher_tasks {
+            task.abort();
+        }
     }
 
     #[test]

@@ -11,8 +11,10 @@ export const ALL_MESSAGE_TYPES = [
   "session_attach",
   "session_attached",
   "session_data",
+  "session_activity",
   "session_cursor",
   "session_resize",
+  "session_resized",
   "session_rename",
   "session_renamed",
   "session_close",
@@ -25,6 +27,10 @@ export const ALL_MESSAGE_TYPES = [
   "session_file_written",
   "session_file_delete",
   "session_file_deleted",
+  "session_file_download_prepare",
+  "session_file_download_ready",
+  "session_file_download_chunk",
+  "session_file_download_chunk_result",
   "session_list",
   "session_list_result",
   "client_hello",
@@ -32,6 +38,8 @@ export const ALL_MESSAGE_TYPES = [
   "daemon_clients_result",
   "daemon_client_forget",
   "daemon_client_forgot",
+  "daemon_status",
+  "daemon_status_result",
   "control_request",
   "control_grant",
   "e2ee_key_exchange",
@@ -186,6 +194,21 @@ export interface DaemonClientForgotPayload {
   device_id: UUID;
 }
 
+export interface DaemonStatusPayload {}
+
+export interface DaemonStatusResultPayload {
+  host_name?: string | null;
+  load_avg: [number, number, number];
+  uptime_seconds: number;
+  cpu_percent: number;
+  memory_total_bytes: number;
+  memory_available_bytes: number;
+  disk_total_bytes: number;
+  disk_available_bytes: number;
+  process_count: number;
+  atop_available: boolean;
+}
+
 export interface SessionCreatePayload {
   command: string[];
   size: TerminalSize;
@@ -285,9 +308,46 @@ export interface SessionFileDeletedPayload {
   path: string;
 }
 
+export interface SessionFileDownloadPreparePayload {
+  session_id: UUID;
+  path: string;
+}
+
+export interface SessionFileDownloadReadyPayload {
+  session_id: UUID;
+  path: string;
+  token: string;
+  size_bytes: number;
+  modified_at_ms?: UnixTimestampMillis | null;
+  expires_at_ms: UnixTimestampMillis;
+}
+
+export interface SessionFileDownloadChunkPayload {
+  session_id: UUID;
+  path: string;
+  offset_bytes: number;
+  max_bytes: number;
+}
+
+export interface SessionFileDownloadChunkResultPayload {
+  session_id: UUID;
+  path: string;
+  offset_bytes: number;
+  data_base64: string;
+  next_offset_bytes: number;
+  size_bytes: number;
+  eof: boolean;
+  modified_at_ms?: UnixTimestampMillis | null;
+}
+
 export interface SessionDataPayload {
   session_id: UUID;
   data_base64: string;
+}
+
+export interface SessionActivityPayload {
+  session_id: UUID;
+  timestamp_ms: UnixTimestampMillis;
 }
 
 export interface SessionCursorPayload {
@@ -298,6 +358,16 @@ export interface SessionCursorPayload {
 }
 
 export type SessionCursorPresence = Pick<SessionCursorPayload, "row" | "col" | "focused">;
+
+export interface SessionResizePayload {
+  session_id: UUID;
+  size: TerminalSize;
+}
+
+export interface SessionResizedPayload {
+  session_id: UUID;
+  size: TerminalSize;
+}
 
 export interface ControlGrantPayload {
   session_id: UUID;

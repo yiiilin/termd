@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { ArrowUp, Download, File, Folder, Link2, PanelRightClose, RefreshCw, Trash2, Upload } from "lucide-react";
+import { ArrowUp, Download, File, FilePenLine, Folder, Link2, PanelRightClose, RefreshCw, Trash2, Upload } from "lucide-react";
 import type { SafeError, SessionFileEntryPayload, SessionFilesResultPayload, UUID } from "../protocol/types";
 
 interface SessionFilesPanelProps {
@@ -8,7 +8,9 @@ interface SessionFilesPanelProps {
   loading: boolean;
   error?: SafeError;
   onOpenDirectory: (path: string) => void;
+  onOpenFile: (entry: SessionFileEntryPayload) => void;
   onGoToPath: (path: string) => void;
+  onRefresh: () => void;
   onUpload: (file: globalThis.File) => void;
   onDownload: (entry: SessionFileEntryPayload) => void;
   onDelete: (entry: SessionFileEntryPayload) => void;
@@ -21,7 +23,9 @@ export function SessionFilesPanel({
   loading,
   error,
   onOpenDirectory,
+  onOpenFile,
   onGoToPath,
+  onRefresh,
   onUpload,
   onDownload,
   onDelete,
@@ -29,6 +33,7 @@ export function SessionFilesPanel({
 }: SessionFilesPanelProps) {
   const entries = files?.entries ?? [];
   const currentPath = files?.path ?? "";
+  const hasCachedEntries = entries.length > 0;
   const [pathDraft, setPathDraft] = useState(currentPath);
   const uploadRef = useRef<HTMLInputElement | null>(null);
 
@@ -72,8 +77,22 @@ export function SessionFilesPanel({
             }}
           />
         </label>
-        <button type="button" disabled={!attachedSessionId || loading} onClick={() => onGoToPath(pathDraft)}>
+        <button
+          type="button"
+          className="files-go-button"
+          disabled={!attachedSessionId || loading}
+          onClick={() => onGoToPath(pathDraft)}
+        >
           Go
+        </button>
+        <button
+          type="button"
+          className="icon-button"
+          aria-label="Refresh files"
+          disabled={!attachedSessionId || loading}
+          onClick={onRefresh}
+        >
+          <RefreshCw size={15} aria-hidden="true" />
         </button>
         <button
           type="button"
@@ -100,7 +119,7 @@ export function SessionFilesPanel({
       </div>
       <div className="files-list">
         {!attachedSessionId ? <div className="files-empty">detached</div> : null}
-        {attachedSessionId && loading ? (
+        {attachedSessionId && loading && !hasCachedEntries ? (
           <div className="files-empty">
             <RefreshCw size={14} aria-hidden="true" />
             loading
@@ -110,12 +129,17 @@ export function SessionFilesPanel({
         {attachedSessionId && !loading && !error && entries.length === 0 ? (
           <div className="files-empty">empty directory</div>
         ) : null}
-        {attachedSessionId && !loading && !error
+        {/*
+          刷新目录或保存文件时保留旧列表，避免按钮在短暂 loading 期间消失；
+          daemon 返回新目录后会用新的 session_files_result 覆盖这里的缓存。
+        */}
+        {attachedSessionId && !error && hasCachedEntries
           ? entries.map((entry) => (
               <SessionFileRow
                 key={entry.path}
                 entry={entry}
                 onOpenDirectory={onOpenDirectory}
+                onOpenFile={onOpenFile}
                 onDownload={onDownload}
                 onDelete={onDelete}
               />
@@ -129,11 +153,13 @@ export function SessionFilesPanel({
 function SessionFileRow({
   entry,
   onOpenDirectory,
+  onOpenFile,
   onDownload,
   onDelete,
 }: {
   entry: SessionFileEntryPayload;
   onOpenDirectory: (path: string) => void;
+  onOpenFile: (entry: SessionFileEntryPayload) => void;
   onDownload: (entry: SessionFileEntryPayload) => void;
   onDelete: (entry: SessionFileEntryPayload) => void;
 }) {
@@ -156,9 +182,14 @@ function SessionFileRow({
             <Folder size={14} aria-hidden="true" />
           </button>
         ) : (
-          <button type="button" className="icon-button" aria-label={`Download ${entry.name}`} onClick={() => onDownload(entry)}>
-            <Download size={14} aria-hidden="true" />
-          </button>
+          <>
+            <button type="button" className="icon-button" aria-label={`Edit ${entry.name}`} onClick={() => onOpenFile(entry)}>
+              <FilePenLine size={14} aria-hidden="true" />
+            </button>
+            <button type="button" className="icon-button" aria-label={`Download ${entry.name}`} onClick={() => onDownload(entry)}>
+              <Download size={14} aria-hidden="true" />
+            </button>
+          </>
         )}
         <button
           type="button"

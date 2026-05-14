@@ -231,7 +231,17 @@ NONE → HELD(dev_x) → HELD(dev_y)
 
 ---
 
-# 10. 个人使用边界
+# 10. 发版要求
+
+每次发版必须携带清晰的改动内容：
+
+* tag 或 GitHub Release 说明必须列出本次用户可感知的功能、修复和兼容性变化
+* 如果只有 git tag 而没有 GitHub Release，也必须在 tag message 中写明改动摘要
+* 改动说明应面向使用者描述行为变化，不只写内部文件名或提交号
+
+---
+
+# 11. 个人使用边界
 
 ```text
 保持单用户、设备级信任和轻量 relay。
@@ -240,7 +250,7 @@ NONE → HELD(dev_x) → HELD(dev_y)
 
 ---
 
-# 11. 一句话原则
+# 12. 一句话原则
 
 ```text
 保持 termd 像 sshd + tmux 的组合，

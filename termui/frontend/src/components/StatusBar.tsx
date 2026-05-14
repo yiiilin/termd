@@ -10,7 +10,7 @@ export function StatusBar({ status, sessionId, error }: StatusBarProps) {
   return (
     <footer className="status-bar">
       <span>{status}</span>
-      <span>{sessionId ? "session active" : "no session"}</span>
+      <span>{sessionId ? "attached" : "detached"}</span>
       {error ? (
         <span className="status-error">
           {error.code}: {error.message}

@@ -26,12 +26,14 @@ describe("PWA 外壳", () => {
     const raw = await readFile(resolve(process.cwd(), "public/manifest.webmanifest"), "utf8");
     const manifest = JSON.parse(raw) as {
       name?: string;
+      short_name?: string;
       start_url?: string;
       display?: string;
       icons?: Array<{ src: string; purpose?: string }>;
     };
 
-    expect(manifest.name).toBe("termd");
+    expect(manifest.name).toBe("Termd");
+    expect(manifest.short_name).toBe("Termd");
     expect(manifest.start_url).toBe("/");
     expect(manifest.display).toBe("standalone");
     expect(manifest.icons?.some((icon) => icon.src === "/icons/termd.svg" && icon.purpose?.includes("maskable"))).toBe(true);

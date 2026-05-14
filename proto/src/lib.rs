@@ -39,8 +39,10 @@ pub enum MessageType {
     SessionAttach,
     SessionAttached,
     SessionData,
+    SessionActivity,
     SessionCursor,
     SessionResize,
+    SessionResized,
     SessionRename,
     SessionRenamed,
     SessionClose,
@@ -53,6 +55,10 @@ pub enum MessageType {
     SessionFileWritten,
     SessionFileDelete,
     SessionFileDeleted,
+    SessionFileDownloadPrepare,
+    SessionFileDownloadReady,
+    SessionFileDownloadChunk,
+    SessionFileDownloadChunkResult,
     SessionList,
     SessionListResult,
     ClientHello,
@@ -60,6 +66,8 @@ pub enum MessageType {
     DaemonClientsResult,
     DaemonClientForget,
     DaemonClientForgot,
+    DaemonStatus,
+    DaemonStatusResult,
     ControlRequest,
     ControlGrant,
     E2eeKeyExchange,
@@ -192,7 +200,7 @@ pub struct ProtocolVersion(pub u16);
 
 impl Default for ProtocolVersion {
     fn default() -> Self {
-        Self(1)
+        Self(2)
     }
 }
 
@@ -522,11 +530,45 @@ pub struct DaemonClientForgotPayload {
     pub device_id: DeviceId,
 }
 
+/// 查询 daemon 所在服务器的轻量运行状态。
+///
+/// 该请求必须作为 E2EE 内层业务消息发送；relay 只能看到外层 encrypted_frame。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonStatusPayload {}
+
+/// daemon 所在服务器的只读状态快照。
+///
+/// Linux 上优先来自 /proc 和根目录 statvfs；采集失败或非 Linux 平台使用 0/null 降级，
+/// 避免状态面板影响终端主链路。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DaemonStatusResultPayload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_name: Option<String>,
+    pub load_avg: [f64; 3],
+    pub uptime_seconds: u64,
+    pub cpu_percent: f32,
+    pub memory_total_bytes: u64,
+    pub memory_available_bytes: u64,
+    pub disk_total_bytes: u64,
+    pub disk_available_bytes: u64,
+    pub process_count: u64,
+    pub atop_available: bool,
+}
+
 /// `session_data` 在 JSON 通道中使用 base64；二进制 WebSocket 帧可绕过这个结构。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionDataPayload {
     pub session_id: SessionId,
     pub data_base64: String,
+}
+
+/// session 有新输出的轻量通知。
+///
+/// 该消息只用于 UI 标记后台 session，不携带终端明文，避免为了列表变色额外推送大块输出。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionActivityPayload {
+    pub session_id: SessionId,
+    pub timestamp_ms: UnixTimestampMillis,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -549,6 +591,12 @@ pub struct SessionCursorPayload {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionResizePayload {
+    pub session_id: SessionId,
+    pub size: TerminalSize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionResizedPayload {
     pub session_id: SessionId,
     pub size: TerminalSize,
 }
@@ -656,6 +704,42 @@ pub struct SessionFileDeletedPayload {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionFileDownloadPreparePayload {
+    pub session_id: SessionId,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionFileDownloadReadyPayload {
+    pub session_id: SessionId,
+    pub path: String,
+    pub token: String,
+    pub size_bytes: u64,
+    pub modified_at_ms: Option<UnixTimestampMillis>,
+    pub expires_at_ms: UnixTimestampMillis,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionFileDownloadChunkPayload {
+    pub session_id: SessionId,
+    pub path: String,
+    pub offset_bytes: u64,
+    pub max_bytes: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionFileDownloadChunkResultPayload {
+    pub session_id: SessionId,
+    pub path: String,
+    pub offset_bytes: u64,
+    pub data_base64: String,
+    pub next_offset_bytes: u64,
+    pub size_bytes: u64,
+    pub eof: bool,
+    pub modified_at_ms: Option<UnixTimestampMillis>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControlRequestPayload {
     pub session_id: SessionId,
     pub device_id: DeviceId,
@@ -747,8 +831,10 @@ mod tests {
             (MessageType::SessionAttach, "session_attach"),
             (MessageType::SessionAttached, "session_attached"),
             (MessageType::SessionData, "session_data"),
+            (MessageType::SessionActivity, "session_activity"),
             (MessageType::SessionCursor, "session_cursor"),
             (MessageType::SessionResize, "session_resize"),
+            (MessageType::SessionResized, "session_resized"),
             (MessageType::SessionRename, "session_rename"),
             (MessageType::SessionRenamed, "session_renamed"),
             (MessageType::SessionClose, "session_close"),
@@ -764,6 +850,22 @@ mod tests {
             (MessageType::SessionFileWritten, "session_file_written"),
             (MessageType::SessionFileDelete, "session_file_delete"),
             (MessageType::SessionFileDeleted, "session_file_deleted"),
+            (
+                MessageType::SessionFileDownloadPrepare,
+                "session_file_download_prepare",
+            ),
+            (
+                MessageType::SessionFileDownloadReady,
+                "session_file_download_ready",
+            ),
+            (
+                MessageType::SessionFileDownloadChunk,
+                "session_file_download_chunk",
+            ),
+            (
+                MessageType::SessionFileDownloadChunkResult,
+                "session_file_download_chunk_result",
+            ),
             (MessageType::SessionList, "session_list"),
             (MessageType::SessionListResult, "session_list_result"),
             (MessageType::ClientHello, "client_hello"),
@@ -771,6 +873,8 @@ mod tests {
             (MessageType::DaemonClientsResult, "daemon_clients_result"),
             (MessageType::DaemonClientForget, "daemon_client_forget"),
             (MessageType::DaemonClientForgot, "daemon_client_forgot"),
+            (MessageType::DaemonStatus, "daemon_status"),
+            (MessageType::DaemonStatusResult, "daemon_status_result"),
             (MessageType::ControlRequest, "control_request"),
             (MessageType::ControlGrant, "control_grant"),
             (MessageType::E2eeKeyExchange, "e2ee_key_exchange"),
@@ -993,6 +1097,10 @@ mod tests {
             session_id,
             data_base64: "aGVsbG8=".to_owned(),
         });
+        assert_roundtrip(SessionActivityPayload {
+            session_id,
+            timestamp_ms: UnixTimestampMillis(1_710_000_000_000),
+        });
         assert_roundtrip(SessionCursorPayload {
             session_id,
             row: 12,
@@ -1000,6 +1108,7 @@ mod tests {
             focused: true,
         });
         assert_roundtrip(SessionResizePayload { session_id, size });
+        assert_roundtrip(SessionResizedPayload { session_id, size });
         assert_roundtrip(SessionRenamePayload {
             session_id,
             name: "work shell".to_owned(),
@@ -1064,6 +1173,34 @@ mod tests {
             session_id,
             path: "upload.txt".to_owned(),
         });
+        assert_roundtrip(SessionFileDownloadPreparePayload {
+            session_id,
+            path: "large.bin".to_owned(),
+        });
+        assert_roundtrip(SessionFileDownloadReadyPayload {
+            session_id,
+            path: "large.bin".to_owned(),
+            token: "download-token".to_owned(),
+            size_bytes: 4096,
+            modified_at_ms: Some(UnixTimestampMillis(1_710_000_000_000)),
+            expires_at_ms: UnixTimestampMillis(1_710_000_060_000),
+        });
+        assert_roundtrip(SessionFileDownloadChunkPayload {
+            session_id,
+            path: "large.bin".to_owned(),
+            offset_bytes: 1024,
+            max_bytes: 65_536,
+        });
+        assert_roundtrip(SessionFileDownloadChunkResultPayload {
+            session_id,
+            path: "large.bin".to_owned(),
+            offset_bytes: 1024,
+            data_base64: "Y2h1bms=".to_owned(),
+            next_offset_bytes: 1029,
+            size_bytes: 4096,
+            eof: false,
+            modified_at_ms: Some(UnixTimestampMillis(1_710_000_000_000)),
+        });
         assert_roundtrip(SessionListPayload {});
         assert_roundtrip(SessionListResultPayload {
             sessions: vec![SessionSummaryPayload {
@@ -1099,6 +1236,14 @@ mod tests {
             serde_json::to_value(MessageType::DaemonClientsResult).unwrap(),
             "daemon_clients_result"
         );
+        assert_eq!(
+            serde_json::to_value(MessageType::DaemonStatus).unwrap(),
+            "daemon_status"
+        );
+        assert_eq!(
+            serde_json::to_value(MessageType::DaemonStatusResult).unwrap(),
+            "daemon_status_result"
+        );
         assert_roundtrip(ClientHelloPayload {
             name: "Browser on Linux".to_owned(),
         });
@@ -1121,6 +1266,19 @@ mod tests {
         });
         assert_roundtrip(DaemonClientForgetPayload { device_id });
         assert_roundtrip(DaemonClientForgotPayload { device_id });
+        assert_roundtrip(DaemonStatusPayload {});
+        assert_roundtrip(DaemonStatusResultPayload {
+            host_name: Some("devbox".to_owned()),
+            load_avg: [0.1, 0.2, 0.3],
+            uptime_seconds: 123,
+            cpu_percent: 12.5,
+            memory_total_bytes: 8 * 1024 * 1024,
+            memory_available_bytes: 4 * 1024 * 1024,
+            disk_total_bytes: 100 * 1024 * 1024,
+            disk_available_bytes: 40 * 1024 * 1024,
+            process_count: 42,
+            atop_available: false,
+        });
     }
 
     #[test]

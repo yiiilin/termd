@@ -9,6 +9,7 @@ import { E2eeSession, generateE2eeKeyPair, type E2eeKeyPair } from "../protocol/
 import { fallbackSessionDisplayName } from "../session-names";
 import type {
   DaemonClientSummaryPayload,
+  DaemonStatusResultPayload,
   E2eeKeyExchangePayload,
   EncryptedFramePayload,
   Envelope,
@@ -44,7 +45,9 @@ interface MockDaemonOptions {
   routePreludeError?: ErrorPayload;
   pairFailure?: ErrorPayload;
   sessionDataError?: ErrorPayload;
+  resizeAckDelayMs?: number;
   daemonClients?: DaemonClientSummaryPayload[];
+  daemonStatus?: DaemonStatusResultPayload;
   sessionFiles?: Record<UUID, SessionFilesResultPayload>;
   sessionFileReads?: Record<string, SessionFileReadResultPayload>;
   relayClientPathOnly?: boolean;
@@ -81,8 +84,11 @@ export class MockDaemon {
   public readonly closedSessions: UUID[] = [];
   public readonly sessionFileRequests: Array<{ session_id: UUID; path?: string | null }> = [];
   public readonly sessionFileReadRequests: Array<{ session_id: UUID; path: string }> = [];
+  public readonly sessionFileDownloadPrepareRequests: Array<{ session_id: UUID; path: string }> = [];
+  public readonly sessionFileDownloadChunkRequests: Array<{ session_id: UUID; path: string; offset_bytes: number; max_bytes: number }> = [];
   public readonly sessionFileWrites: Array<{ session_id: UUID; path: string; text: string }> = [];
   public readonly sessionFileDeletes: Array<{ session_id: UUID; path: string }> = [];
+  public daemonStatusRequests = 0;
   public pingMessages = 0;
   public readonly decryptedInputs: string[] = [];
   public nextAttachRole = "operator" as const;
@@ -131,7 +137,7 @@ export class MockDaemon {
   pushSessionFiles(files: SessionFilesResultPayload): void {
     this.sessionFilePositions.set(files.session_id, files.path);
     for (const connection of this.connections) {
-      if (connection.e2ee) {
+      if (connection.e2ee && connection.attachedSessionIds.has(files.session_id)) {
         this.sendInner(connection, envelope("session_files_result", files));
       }
     }
@@ -147,6 +153,16 @@ export class MockDaemon {
             data_base64: sessionDataToBase64(new TextEncoder().encode(text)),
           }),
         );
+      }
+    }
+  }
+
+  pushSessionDataToAll(sessionId: UUID, text: string): void {
+    // 后台 session 只发 activity 标记，不把未打开 session 的输出内容灌进当前 xterm。
+    for (const connection of this.connections) {
+      if (connection.e2ee && connection.attachedSessionIds.size > 0) {
+        void text;
+        this.sendInner(connection, envelope("session_activity", { session_id: sessionId, timestamp_ms: nowMs() }));
       }
     }
   }
@@ -228,7 +244,7 @@ export class MockDaemon {
     }
 
     const payload = outer.payload as RouteHelloPayload;
-    if (payload.server_id !== this.serverId || payload.role !== "client" || payload.protocol_version !== 1) {
+    if (payload.server_id !== this.serverId || payload.role !== "client" || payload.protocol_version !== 2) {
       this.sendError(connection, "invalid_route_prelude", "invalid route prelude");
       return;
     }
@@ -250,7 +266,7 @@ export class MockDaemon {
     this.sendOuter(
       connection.socket,
       envelope("hello", {
-        protocol_version: 1,
+        protocol_version: 2,
         nonce: nonce(),
         timestamp_ms: nowMs(),
         server_id: this.serverId,
@@ -314,6 +330,11 @@ export class MockDaemon {
         this.sendInner(connection, envelope("daemon_client_forgot", payload));
         return;
       }
+      case "daemon_status": {
+        this.daemonStatusRequests += 1;
+        this.sendInner(connection, envelope("daemon_status_result", this.options.daemonStatus ?? mockDaemonStatus()));
+        return;
+      }
       case "session_create":
         this.handleSessionCreate(connection, inner.payload as SessionCreatePayload);
         return;
@@ -359,11 +380,23 @@ export class MockDaemon {
         return;
       }
       case "session_resize": {
-        this.sessionResizes.push(inner.payload as { session_id: UUID; size: TerminalSize });
+        const payload = inner.payload as { session_id: UUID; size: TerminalSize };
+        this.sessionResizes.push(payload);
+        if (this.options.resizeAckDelayMs) {
+          await new Promise((resolve) => setTimeout(resolve, this.options.resizeAckDelayMs));
+        }
+        const session = this.options.sessions.find((candidate) => candidate.session_id === payload.session_id);
+        if (session) {
+          session.size = payload.size;
+        }
+        this.sendInner(connection, envelope("session_resized", payload));
         return;
       }
       case "session_rename": {
         const payload = inner.payload as { session_id: UUID; name: string };
+        if (!this.ensureAttached(connection, payload.session_id)) {
+          return;
+        }
         this.sessionRenames.push(payload);
         const session = this.options.sessions.find((candidate) => candidate.session_id === payload.session_id);
         if (session) {
@@ -386,6 +419,9 @@ export class MockDaemon {
       }
       case "session_files": {
         const payload = inner.payload as { session_id: UUID; path?: string | null };
+        if (!this.ensureAttached(connection, payload.session_id)) {
+          return;
+        }
         this.sessionFileRequests.push(payload);
         // 指定 path 时必须按该目录返回，避免测试里把“任意切换目录”误回退成 session 根目录。
         const lookupPath =
@@ -411,6 +447,9 @@ export class MockDaemon {
       }
       case "session_file_read": {
         const payload = inner.payload as { session_id: UUID; path: string };
+        if (!this.ensureAttached(connection, payload.session_id)) {
+          return;
+        }
         this.sessionFileReadRequests.push(payload);
         const result =
           this.options.sessionFileReads?.[payload.path] ??
@@ -424,8 +463,58 @@ export class MockDaemon {
         this.sendInner(connection, envelope("session_file_read_result", result));
         return;
       }
+      case "session_file_download_prepare": {
+        const payload = inner.payload as { session_id: UUID; path: string };
+        if (!this.ensureAttached(connection, payload.session_id)) {
+          return;
+        }
+        this.sessionFileDownloadPrepareRequests.push(payload);
+        this.sendInner(
+          connection,
+          envelope("session_file_download_ready", {
+            session_id: payload.session_id,
+            path: payload.path,
+            token: `mock-download-${this.sessionFileDownloadPrepareRequests.length}`,
+            size_bytes: this.options.sessionFileReads?.[payload.path]?.size_bytes ?? 21,
+            modified_at_ms: this.options.sessionFileReads?.[payload.path]?.modified_at_ms ?? null,
+            expires_at_ms: nowMs() + 60_000,
+          }),
+        );
+        return;
+      }
+      case "session_file_download_chunk": {
+        const payload = inner.payload as { session_id: UUID; path: string; offset_bytes: number; max_bytes: number };
+        if (!this.ensureAttached(connection, payload.session_id)) {
+          return;
+        }
+        this.sessionFileDownloadChunkRequests.push(payload);
+        const source =
+          this.options.sessionFileReads?.[payload.path]?.data_base64 ??
+          sessionDataToBase64(new TextEncoder().encode("downloaded mock file\n"));
+        const allBytes = sessionDataFromBase64(source);
+        const start = Math.max(0, payload.offset_bytes);
+        const end = Math.min(allBytes.byteLength, start + Math.max(0, payload.max_bytes));
+        const bytes = allBytes.slice(start, end);
+        this.sendInner(
+          connection,
+          envelope("session_file_download_chunk_result", {
+            session_id: payload.session_id,
+            path: payload.path,
+            offset_bytes: start,
+            data_base64: sessionDataToBase64(bytes),
+            next_offset_bytes: end,
+            size_bytes: allBytes.byteLength,
+            eof: end >= allBytes.byteLength,
+            modified_at_ms: this.options.sessionFileReads?.[payload.path]?.modified_at_ms ?? null,
+          }),
+        );
+        return;
+      }
       case "session_file_write": {
         const payload = inner.payload as { session_id: UUID; path: string; data_base64: string };
+        if (!this.ensureAttached(connection, payload.session_id)) {
+          return;
+        }
         const bytes = sessionDataFromBase64(payload.data_base64);
         this.sessionFileWrites.push({
           session_id: payload.session_id,
@@ -445,6 +534,9 @@ export class MockDaemon {
       }
       case "session_file_delete": {
         const payload = inner.payload as { session_id: UUID; path: string };
+        if (!this.ensureAttached(connection, payload.session_id)) {
+          return;
+        }
         this.sessionFileDeletes.push(payload);
         this.sendInner(connection, envelope("session_file_deleted", payload));
         return;
@@ -507,6 +599,15 @@ export class MockDaemon {
     if (client) {
       client.name = payload.name;
     }
+  }
+
+  private ensureAttached(connection: MockConnection, sessionId: UUID): boolean {
+    if (connection.attachedSessionIds.has(sessionId)) {
+      return true;
+    }
+    // 测试桩和真实 daemon 保持一致：session 级操作必须来自已 attach 的连接。
+    this.sendError(connection, "invalid_state", "invalid protocol state");
+    return false;
   }
 
   private handlePairRequest(connection: MockConnection, payload: PairRequestPayload): void {
@@ -572,4 +673,20 @@ export class MockDaemon {
   private sendOuter(socket: WebSocket, outer: Envelope): void {
     socket.send(JSON.stringify(outer));
   }
+}
+
+function mockDaemonStatus(): DaemonStatusResultPayload {
+  // mock 只表达协议形状；真实采集由 daemon 端 /proc/statvfs 实现。
+  return {
+    host_name: "mock-daemon",
+    load_avg: [0.12, 0.08, 0.03],
+    uptime_seconds: 3600,
+    cpu_percent: 7.5,
+    memory_total_bytes: 8 * 1024 * 1024 * 1024,
+    memory_available_bytes: 5 * 1024 * 1024 * 1024,
+    disk_total_bytes: 128 * 1024 * 1024 * 1024,
+    disk_available_bytes: 64 * 1024 * 1024 * 1024,
+    process_count: 123,
+    atop_available: false,
+  };
 }

@@ -3,13 +3,17 @@ import {
   ALL_MESSAGE_TYPES,
   type AttachRole,
   type DaemonClientSummaryPayload,
+  type DaemonStatusResultPayload,
   type Envelope,
   type PairingQrPayload,
   type MessageType,
   type RouteHelloPayload,
   type RouteReadyPayload,
   type RouteRole,
+  type SessionActivityPayload,
   type SessionCursorPayload,
+  type SessionFileDownloadChunkPayload,
+  type SessionFileDownloadChunkResultPayload,
   type SessionState,
 } from "../protocol/types";
 import { parsePairingQrPayload } from "../protocol/pairing-payload";
@@ -30,8 +34,10 @@ describe("协议类型", () => {
       "session_attach",
       "session_attached",
       "session_data",
+      "session_activity",
       "session_cursor",
       "session_resize",
+      "session_resized",
       "session_rename",
       "session_renamed",
       "session_close",
@@ -44,6 +50,10 @@ describe("协议类型", () => {
       "session_file_written",
       "session_file_delete",
       "session_file_deleted",
+      "session_file_download_prepare",
+      "session_file_download_ready",
+      "session_file_download_chunk",
+      "session_file_download_chunk_result",
       "session_list",
       "session_list_result",
       "client_hello",
@@ -51,6 +61,8 @@ describe("协议类型", () => {
       "daemon_clients_result",
       "daemon_client_forget",
       "daemon_client_forgot",
+      "daemon_status",
+      "daemon_status_result",
       "control_request",
       "control_grant",
       "e2ee_key_exchange",
@@ -90,7 +102,7 @@ describe("协议类型", () => {
     const routeHello: RouteHelloPayload = {
       server_id: "00000000-0000-0000-0000-000000000001",
       role: "client",
-      protocol_version: 1,
+      protocol_version: 2,
       nonce: "route-nonce",
       timestamp_ms: 1_710_000_000_000,
     };
@@ -144,6 +156,66 @@ describe("协议类型", () => {
       cursor_focused: true,
     });
     expect("selection_start_row" in client).toBe(false);
+  });
+
+  it("后台活动和分块下载 payload 不携带明文路径外的权限材料", () => {
+    const sessionId = "00000000-0000-0000-0000-000000000001";
+    const activity: SessionActivityPayload = {
+      session_id: sessionId,
+      timestamp_ms: 1_710_000_000_000,
+    };
+    const chunkRequest: SessionFileDownloadChunkPayload = {
+      session_id: sessionId,
+      path: "/home/me/large.log",
+      offset_bytes: 262_144,
+      max_bytes: 262_144,
+    };
+    const chunkResult: SessionFileDownloadChunkResultPayload = {
+      session_id: sessionId,
+      path: "/home/me/large.log",
+      offset_bytes: 262_144,
+      data_base64: "Y2h1bms=",
+      next_offset_bytes: 262_149,
+      size_bytes: 1_000_000,
+      eof: false,
+      modified_at_ms: null,
+    };
+
+    expect(envelope("session_activity", activity)).toEqual({
+      type: "session_activity",
+      payload: activity,
+    });
+    expect(envelope("session_file_download_chunk", chunkRequest).payload.max_bytes).toBe(262_144);
+    expect(envelope("session_file_download_chunk_result", chunkResult).payload).toMatchObject({
+      data_base64: "Y2h1bms=",
+      eof: false,
+    });
+  });
+
+  it("daemon 状态 payload 只包含轻量只读服务器指标", () => {
+    const status: DaemonStatusResultPayload = {
+      host_name: "devbox",
+      load_avg: [0.1, 0.2, 0.3],
+      uptime_seconds: 3600,
+      cpu_percent: 12.5,
+      memory_total_bytes: 8 * 1024 * 1024,
+      memory_available_bytes: 4 * 1024 * 1024,
+      disk_total_bytes: 100 * 1024 * 1024,
+      disk_available_bytes: 40 * 1024 * 1024,
+      process_count: 42,
+      atop_available: false,
+    };
+
+    expect(envelope("daemon_status", {})).toEqual({
+      type: "daemon_status",
+      payload: {},
+    });
+    expect(envelope("daemon_status_result", status).payload).toMatchObject({
+      host_name: "devbox",
+      load_avg: [0.1, 0.2, 0.3],
+      atop_available: false,
+    });
+    expect(JSON.stringify(status)).not.toContain("session_data");
   });
 
   it("QR pairing payload 只在有效 JSON 且带 token/server_id 时被识别，ws_url 仅作旧版兼容", () => {

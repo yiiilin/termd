@@ -360,6 +360,31 @@ label {
   background: #1d2a24;
 }
 
+.collapsed-session-list .icon-button.has-new-output {
+  position: relative;
+  border-color: #405049;
+  color: #e4f7ff;
+  background: #18231f;
+}
+
+.collapsed-session-list .icon-button.has-new-output::after {
+  content: "";
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  background: #89d8ff;
+  box-shadow: 0 0 0 3px rgba(137, 216, 255, 0.18);
+}
+
+.collapsed-session-list .icon-button.selected-session-dot.has-new-output {
+  border-color: #d6ff5f;
+  color: #f5ffe0;
+  background: #1d2a24;
+}
+
 .rail-popover {
   top: 56px;
   left: calc(100% + 8px);
@@ -636,9 +661,38 @@ label {
   cursor: pointer;
 }
 
+.session-row:focus-visible {
+  outline: 2px solid #89d8ff;
+  outline-offset: 2px;
+}
+
 .session-row.selected {
   border-color: #d6ff5f;
   background: #1d2a24;
+}
+
+.session-row.has-new-output {
+  border-color: #405049;
+  background: #18231f;
+}
+
+.session-row.selected.has-new-output {
+  border-color: #d6ff5f;
+  background: #1d2a24;
+}
+
+.session-row.dragging {
+  border-color: #89d8ff;
+  opacity: 0.72;
+  cursor: grabbing;
+  transform: translateY(1px);
+}
+
+.session-row.drag-target {
+  border-color: #89d8ff;
+  box-shadow:
+    inset 0 2px 0 #89d8ff,
+    0 0 0 1px rgba(137, 216, 255, 0.16);
 }
 
 .session-main,
@@ -651,9 +705,25 @@ label {
 .session-row-heading {
   min-width: 0;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: 30px minmax(0, 1fr) auto;
   align-items: center;
   gap: 8px;
+}
+
+.session-drag-handle {
+  cursor: grab;
+  color: #8fa59a;
+  touch-action: none;
+}
+
+.session-drag-handle:hover:not(:disabled),
+.session-drag-handle:focus-visible {
+  border-color: #89d8ff;
+  color: #d8f3ff;
+}
+
+.session-drag-handle:active {
+  cursor: grabbing;
 }
 
 .session-row strong {
@@ -661,6 +731,10 @@ label {
   overflow-wrap: anywhere;
   font-size: 12px;
   line-height: 1.35;
+}
+
+.session-row.has-new-output strong {
+  color: #89d8ff;
 }
 
 .session-main {
@@ -875,6 +949,144 @@ label {
   right: 0;
 }
 
+.daemon-status-panel {
+  border: 1px solid #31433b;
+  border-radius: 8px;
+  background: #0d1714;
+  display: grid;
+  gap: 10px;
+  padding: 10px;
+}
+
+.daemon-status-strip {
+  min-width: 0;
+  min-height: 30px;
+  border: 0;
+  border-top: 1px solid #25312d;
+  border-radius: 0;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 0 10px;
+}
+
+.daemon-status-header,
+.daemon-status-title {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.daemon-status-header {
+  justify-content: space-between;
+}
+
+.daemon-status-strip .daemon-status-header {
+  min-height: 30px;
+  justify-content: flex-start;
+}
+
+.daemon-status-title {
+  color: #d6ff5f;
+  font-weight: 700;
+}
+
+.daemon-status-title span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.daemon-status-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.daemon-status-strip .daemon-status-grid {
+  min-width: 0;
+  grid-template-columns: minmax(118px, 1.35fr) repeat(5, minmax(0, 1fr));
+  gap: 0;
+  align-items: center;
+}
+
+.daemon-status-metric {
+  min-width: 0;
+  border: 1px solid #273831;
+  border-radius: 6px;
+  background: #09110f;
+  display: grid;
+  gap: 4px;
+  padding: 8px;
+}
+
+.daemon-status-strip .daemon-status-metric {
+  min-height: 30px;
+  border: 0;
+  border-left: 1px solid #25312d;
+  border-radius: 0;
+  background: transparent;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 10px;
+}
+
+.daemon-status-metric span,
+.daemon-status-error {
+  color: #8fa59a;
+  font-size: 12px;
+}
+
+.daemon-status-metric strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: #e4f4ed;
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.daemon-status-strip .daemon-status-metric strong {
+  font-size: 12px;
+}
+
+.daemon-status-cpu {
+  min-width: 118px;
+}
+
+.daemon-status-strip .daemon-status-cpu {
+  gap: 7px;
+}
+
+.daemon-cpu-sparkline {
+  flex: 1 1 72px;
+  width: 72px;
+  height: 18px;
+  min-width: 56px;
+  color: #89d8ff;
+}
+
+.daemon-cpu-sparkline-fill {
+  fill: rgba(137, 216, 255, 0.16);
+}
+
+.daemon-cpu-sparkline-line {
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.7;
+}
+
+.daemon-status-error {
+  display: grid;
+  gap: 4px;
+  color: #ffb3a7;
+}
+
 .session-operators {
   min-width: 0;
   margin-left: 0;
@@ -1037,6 +1249,20 @@ label {
   font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
 }
 
+.terminal-copy-toast {
+  position: absolute;
+  right: 18px;
+  bottom: 18px;
+  z-index: 4;
+  border: 1px solid rgba(214, 255, 95, 0.35);
+  border-radius: 6px;
+  background: rgba(8, 17, 15, 0.92);
+  color: #d7f7e8;
+  padding: 6px 10px;
+  font-size: 12px;
+  pointer-events: none;
+}
+
 .files-panel {
   min-width: 0;
   min-height: 0;
@@ -1140,7 +1366,7 @@ label {
   border-bottom: 1px solid #25312d;
   padding: 8px;
   display: grid;
-  grid-template-columns: 32px minmax(0, 1fr) auto 32px;
+  grid-template-columns: 32px minmax(0, 1fr) 32px 32px 32px;
   gap: 6px;
   align-items: center;
 }
@@ -1153,6 +1379,14 @@ label {
   min-height: 30px;
   font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
   font-size: 12px;
+}
+
+.files-go-button {
+  width: 32px;
+  min-height: 30px;
+  padding: 0;
+  font-size: 11px;
+  font-weight: 700;
 }
 
 .files-upload-input {
@@ -1240,6 +1474,227 @@ label {
   justify-content: center;
   gap: 7px;
   color: #536760;
+}
+
+.file-editor-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  display: grid;
+  place-items: center;
+  padding: 18px;
+  background: rgba(5, 9, 8, 0.72);
+}
+
+.file-editor-dialog {
+  width: min(960px, calc(100vw - 32px));
+  height: min(720px, calc(100vh - 32px));
+  min-height: 0;
+  overflow: hidden;
+  border: 1px solid #31433b;
+  border-radius: 8px;
+  background: #0d1714;
+  color: #dbe8e2;
+  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.48);
+  display: grid;
+  grid-template-areas:
+    "header"
+    "error"
+    "editor"
+    "footer";
+  grid-template-rows: auto auto minmax(260px, 1fr) 46px;
+}
+
+.file-editor-header,
+.file-editor-title-group,
+.file-editor-actions,
+.file-editor-footer {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+}
+
+.file-editor-header {
+  grid-area: header;
+  justify-content: space-between;
+  gap: 12px;
+  border-bottom: 1px solid #25312d;
+  padding: 10px 12px;
+}
+
+.file-editor-title-group {
+  gap: 9px;
+  color: #d6ff5f;
+}
+
+.file-editor-title-text {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.file-editor-title-text h2 {
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  color: #e4f4ed;
+  font-size: 14px;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-editor-title-text span,
+.file-editor-status {
+  min-width: 0;
+  overflow: hidden;
+  color: #8fa59a;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-editor-actions {
+  flex: 0 0 auto;
+  gap: 8px;
+}
+
+.file-editor-error {
+  grid-area: error;
+  border-bottom: 1px solid #5f2d29;
+  background: #231512;
+  color: #ffb3a7;
+  padding: 8px 12px;
+  font-size: 12px;
+}
+
+.file-editor-shell {
+  grid-area: editor;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background: #08110f;
+}
+
+.file-editor-monaco,
+.file-editor-monaco-host,
+.file-editor-shell > section,
+.file-editor-shell > div {
+  min-width: 0;
+  min-height: 0;
+  width: 100%;
+  height: 100%;
+}
+
+.file-editor-monaco {
+  display: block;
+  overflow: hidden;
+  background: #1e1e1e;
+}
+
+.file-editor-monaco-host {
+  position: relative;
+  overflow: hidden;
+}
+
+.file-editor-fallback {
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  display: grid;
+  grid-template-columns: 48px minmax(0, 1fr) 78px;
+  background: #08110f;
+}
+
+.file-editor-line-numbers {
+  min-height: 0;
+  overflow: hidden;
+  border-right: 1px solid #17231f;
+  background: #07100e;
+  color: #536760;
+  display: grid;
+  align-content: start;
+  padding: 8px 7px 8px 0;
+  font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+  font-size: 13px;
+  line-height: 1.55;
+  text-align: right;
+  user-select: none;
+}
+
+.file-editor-line-numbers span {
+  height: 20px;
+}
+
+.file-editor-shell textarea {
+  width: 100%;
+  height: 100%;
+  min-height: 260px;
+  border: 0;
+  border-radius: 0;
+  outline: none;
+  resize: none;
+  background: #08110f;
+  color: #d7f7e8;
+  font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.file-editor-fallback textarea {
+  min-height: 0;
+}
+
+.file-editor-minimap {
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  border-left: 1px solid #17231f;
+  background: #06100e;
+  display: grid;
+  align-content: start;
+  gap: 2px;
+  padding: 8px 7px;
+}
+
+.file-editor-minimap span {
+  height: 3px;
+  border-radius: 999px;
+  background: #2d5148;
+}
+
+.file-editor-loading {
+  height: 100%;
+  min-height: 260px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  color: #8fa59a;
+  font-size: 12px;
+}
+
+.file-editor-footer {
+  grid-area: footer;
+  justify-content: flex-end;
+  gap: 8px;
+  border-top: 1px solid #25312d;
+  min-height: 46px;
+  padding: 6px 12px;
+}
+
+.file-editor-footer.single-row {
+  height: 46px;
+}
+
+.file-editor-footer button {
+  min-height: 32px;
+}
+
+.file-editor-save {
+  border-color: #d6ff5f;
+  background: #1d2a24;
+  color: #f5ffe0;
 }
 
 .mobile-backdrop,
@@ -1542,6 +1997,34 @@ label {
 
   .terminal-pane {
     min-height: 0;
+  }
+
+  .daemon-status-strip {
+    min-height: 30px;
+    padding: 0;
+  }
+
+  .daemon-status-strip .daemon-status-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .daemon-status-strip .daemon-status-metric {
+    min-height: 30px;
+    justify-content: center;
+    padding: 0 6px;
+  }
+
+  .daemon-status-cpu {
+    min-width: 0;
+  }
+
+  .daemon-cpu-sparkline {
+    display: none;
+  }
+
+  .daemon-status-strip .daemon-status-metric span,
+  .daemon-status-strip .daemon-status-metric strong {
+    font-size: 11px;
   }
 
   .terminal-scrollport {

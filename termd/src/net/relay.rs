@@ -904,12 +904,11 @@ mod tests {
 
     fn temp_state_path(name: &str) -> PathBuf {
         let counter = TEST_STATE_COUNTER.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!(
-            "termd-relay-test-{}-{}-{}-{name}.json",
-            std::process::id(),
-            current_unix_timestamp_millis().0,
-            counter
-        ))
+        let state_dir = std::env::temp_dir().join(format!("tr-{}-{counter}", std::process::id()));
+        // supervisor runtime 目录由 state parent 推导；并行测试必须隔离 parent，避免互相清理 orphan。
+        // Unix socket 有较短路径长度限制，因此测试目录名必须保持紧凑。
+        fs::create_dir_all(&state_dir).unwrap();
+        state_dir.join(format!("{name}.json"))
     }
 
     #[test]
@@ -1658,6 +1657,23 @@ mod tests {
         assert_eq!(
             decrypt_protocol_response(&mut direct_e2ee, pair_responses[0].clone()).kind,
             MessageType::PairAccept
+        );
+        let attach_responses = direct_connection.handle_wire_envelope(
+            &mut direct_protocol,
+            encrypted_outer(
+                &mut direct_e2ee,
+                envelope_value(
+                    MessageType::SessionAttach,
+                    termd_proto::SessionAttachPayload {
+                        session_id: created_payload.session_id,
+                    },
+                )
+                .unwrap(),
+            ),
+        );
+        assert_eq!(
+            decrypt_protocol_response(&mut direct_e2ee, attach_responses[0].clone()).kind,
+            MessageType::SessionAttached
         );
         let files_responses = direct_connection.handle_wire_envelope(
             &mut direct_protocol,

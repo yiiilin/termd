@@ -27,7 +27,7 @@ sha2 = "0.10"
 termd-proto = { path = "../proto" }
 termweb = { path = "../termweb" }
 thiserror.workspace = true
-tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync"] }
 tokio-rustls = "0.26"
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 tower = "0.5"

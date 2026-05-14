@@ -21,11 +21,17 @@ import { parsePairingQrPayload } from "./protocol/pairing-payload";
 import type {
   BrowserState,
   DaemonClientSummaryPayload,
+  DaemonStatusResultPayload,
   PairedServerState,
   SafeError,
   SessionCreatedPayload,
   SessionCursorPresence,
+  SessionActivityPayload,
+  SessionAttachedPayload,
+  SessionDataPayload,
+  SessionFileEntryPayload,
   SessionFilesResultPayload,
+  SessionResizedPayload,
   SessionSummaryPayload,
   TerminalSize,
   UUID,
@@ -47,6 +53,7 @@ import { DaemonClientsPanel } from "./components/DaemonClientsPanel";
 import { DaemonManagerPanel } from "./components/DaemonManagerPanel";
 import { SessionList } from "./components/SessionList";
 import { SessionFilesPanel } from "./components/SessionFilesPanel";
+import { FileEditorDialog } from "./components/FileEditorDialog";
 import { StatusBar } from "./components/StatusBar";
 import { TerminalPane } from "./components/TerminalPane";
 import { PairingQrScanner } from "./components/PairingQrScanner";
@@ -60,8 +67,14 @@ const MAX_FILES_PANEL_WIDTH = 640;
 const FILES_PANEL_RESIZER_WIDTH = 10;
 const CONNECTION_AUTO_RETRY_DELAY_MS = 1000;
 const CONNECTION_AUTO_RETRY_LIMIT = 3;
+const TEXT_FILE_EDITOR_MAX_BYTES = 1024 * 1024;
+const FILE_TRANSFER_MEMORY_FALLBACK_MAX_BYTES = 16 * 1024 * 1024;
+const FILE_DOWNLOAD_CHUNK_BYTES = 256 * 1024;
+const FILE_UPLOAD_MAX_BYTES = 16 * 1024 * 1024;
 const MOBILE_LAYOUT_QUERY = "(max-width: 760px)";
 const MOBILE_LAYOUT_BREAKPOINT = 760;
+const CPU_HISTORY_LIMIT = 48;
+const DAEMON_STATUS_POLL_INTERVAL_MS = 5000;
 type AppSurface = "admin" | "workspace";
 
 export default function App() {
@@ -69,9 +82,16 @@ export default function App() {
   const [url, setUrl] = useState(() => defaultWsUrlFromPage());
   const [pairingToken, setPairingToken] = useState("");
   const [sessions, setSessions] = useState<SessionSummaryPayload[]>([]);
+  const [sessionOrder, setSessionOrder] = useState<UUID[]>([]);
+  const sessionOrderRef = useRef<UUID[]>([]);
+  const [newOutputSessionIds, setNewOutputSessionIds] = useState<Set<UUID>>(() => new Set());
   const [daemonClients, setDaemonClients] = useState<DaemonClientSummaryPayload[]>([]);
   const [forgettingClientIds, setForgettingClientIds] = useState<Set<UUID>>(() => new Set());
   const [clientsOpen, setClientsOpen] = useState(false);
+  const [daemonStatus, setDaemonStatus] = useState<DaemonStatusResultPayload | undefined>();
+  const [daemonCpuHistory, setDaemonCpuHistory] = useState<number[]>([]);
+  const [daemonStatusLoading, setDaemonStatusLoading] = useState(false);
+  const [daemonStatusError, setDaemonStatusError] = useState<SafeError | undefined>();
   const [selectedSessionId, setSelectedSessionId] = useState<UUID | undefined>();
   const [attachedSessionId, setAttachedSessionId] = useState<UUID | undefined>();
   const [renamingSessionId, setRenamingSessionId] = useState<UUID | undefined>();
@@ -82,6 +102,14 @@ export default function App() {
   const [sessionFiles, setSessionFiles] = useState<SessionFilesResultPayload | undefined>();
   const [sessionFilesLoading, setSessionFilesLoading] = useState(false);
   const [sessionFilesError, setSessionFilesError] = useState<SafeError | undefined>();
+  const [fileEditor, setFileEditor] = useState<{
+    path: string;
+    name: string;
+    text: string;
+    loading: boolean;
+    saving: boolean;
+    error?: string;
+  } | undefined>();
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [filesPanelOpen, setFilesPanelOpen] = useState(true);
   const [filesPanelWidth, setFilesPanelWidth] = useState(DEFAULT_FILES_PANEL_WIDTH);
@@ -97,6 +125,10 @@ export default function App() {
   const [error, setError] = useState<SafeError | undefined>();
   const attachClientRef = useRef<DirectClient | undefined>(undefined);
   const attachedSessionRef = useRef<UUID | undefined>(undefined);
+  const autoAttachAttemptedSessionRef = useRef<UUID | undefined>(undefined);
+  const reattachCurrentSessionOnOpenRef = useRef(false);
+  const userDetachedRef = useRef(false);
+  const pendingResizeKeyRef = useRef<string | undefined>(undefined);
   const receiveLoopActiveRef = useRef(false);
   const closingSessionIdsRef = useRef<Set<UUID>>(new Set());
   const forgettingClientIdsRef = useRef<Set<UUID>>(new Set());
@@ -154,6 +186,10 @@ export default function App() {
   }, [filesPanelWidth]);
 
   useEffect(() => {
+    sessionOrderRef.current = sessionOrder;
+  }, [sessionOrder]);
+
+  useEffect(() => {
     if (typeof window === "undefined") {
       return undefined;
     }
@@ -209,8 +245,8 @@ export default function App() {
   const activeServer = useMemo<PairedServerState | undefined>(() => defaultServer(state), [state]);
   const hasPairedServer = Boolean(activeServer && state.device);
   const showConnectionStatus = hasPairedServer && !error && status !== "pairing";
-  const connectionReady =
-    showConnectionStatus && status !== "idle" && status !== "connecting" && status !== "listing";
+  // session 列表刷新只是旁路请求，不能把正在显示的 xterm 卸载成 disconnected。
+  const connectionReady = showConnectionStatus && status !== "idle" && status !== "connecting";
   const sessionOperators = useMemo(() => {
     if (!attachedSessionId) {
       return [];
@@ -235,6 +271,22 @@ export default function App() {
     return sessionDisplayName(toolbarSession);
   }, [sessions, toolbarSession]);
   const toolbarSessionSize = toolbarSession ? terminalSizeDisplay(toolbarSession.size) : undefined;
+
+  useEffect(() => {
+    if (!activeServer?.url || !toolbarSession) {
+      document.title = "Termd";
+      return;
+    }
+
+    // 浏览器标题只使用 daemon 地址和当前 session 名称；URL query/fragment 可能包含 relay token，
+    // 不能放进窗口标题或系统任务切换器。
+    document.title = `Termd - ${daemonAddressForTitle(activeServer.url)} - ${sessionDisplayName(toolbarSession)}`;
+  }, [activeServer?.url, toolbarSession]);
+
+  const orderedSessions = useMemo(
+    () => applyLocalSessionOrder(sessions, sessionOrder),
+    [sessionOrder, sessions],
+  );
   const pairedServerOptions = useMemo(
     () =>
       state.pairedServers.map((server, index) => ({
@@ -255,7 +307,6 @@ export default function App() {
   const canSaveRename = Boolean(renameDraft.trim()) && renameDraft.trim() !== renameOriginalName.trim();
   const activeDaemonLabel =
     pairedServerOptions.find((item) => item.server.server_id === activeServer?.server_id)?.label ?? "No daemon";
-
   const handleOpenAdmin = useCallback((options: { editConnection?: boolean } = {}) => {
     setActiveSurface("admin");
     setMobilePanel(undefined);
@@ -263,22 +314,6 @@ export default function App() {
     // 只有显式进入连接编辑时才保留编辑器，普通返回管理页时收起它。
     setConnectionEditorOpen(Boolean(options.editConnection));
   }, []);
-
-  const handleOpenWorkspace = useCallback(() => {
-    if (!activeServer || !state.device) {
-      return;
-    }
-    setError(undefined);
-    setActiveSurface("workspace");
-    setConnectionEditorOpen(false);
-    setMobilePanel(undefined);
-    setMobileMenuOpen(false);
-    if (status === "error" || status === "idle") {
-      // 从后台重新进入工作台时允许对当前 daemon 再做一次连通性探测。
-      autoCheckedServerRef.current = undefined;
-      setStatus("idle");
-    }
-  }, [activeServer, state.device, status]);
 
   const setSafeError = useCallback((caught: unknown) => {
     setError(toSafeError(caught));
@@ -296,6 +331,7 @@ export default function App() {
     setSessionFiles(undefined);
     setSessionFilesError(undefined);
     setSessionFilesLoading(false);
+    setFileEditor(undefined);
   }, []);
 
   const clearTerminalOutput = useCallback(() => {
@@ -351,6 +387,7 @@ export default function App() {
     attachClientRef.current?.close();
     attachClientRef.current = undefined;
     attachedSessionRef.current = undefined;
+    pendingResizeKeyRef.current = undefined;
     setAttachedSessionId(undefined);
     lastCursorReportRef.current = "";
     lastCursorFocusedRef.current = undefined;
@@ -364,9 +401,41 @@ export default function App() {
     setMobileMenuOpen(false);
   }, [clearSessionFiles, clearTerminalOutput]);
 
+  const handleDisconnectAttach = useCallback(() => {
+    // 用户主动断开时不要被“默认打开第一个 session”的自动流程立即重新 attach。
+    userDetachedRef.current = true;
+    autoAttachAttemptedSessionRef.current = undefined;
+    disconnectAttach();
+    setSelectedSessionId(undefined);
+    setStatus("ready");
+  }, [disconnectAttach]);
+
+  useEffect(() => {
+    if (activeSurface !== "admin" || !attachClientRef.current) {
+      return;
+    }
+
+    // 管理页会卸载 TerminalPane；继续保留旧 attach 会让返回工作台时 xterm 为空。
+    // 这里仅断开本地 attach，daemon 端 session 仍保持运行，回到工作台后会自动重新 attach。
+    userDetachedRef.current = false;
+    autoAttachAttemptedSessionRef.current = undefined;
+    reattachCurrentSessionOnOpenRef.current = true;
+    disconnectAttach();
+    setStatus("ready");
+  }, [activeSurface, disconnectAttach]);
+
   const resetWorkspaceState = useCallback(() => {
     setSessions([]);
+    setSessionOrder([]);
+    sessionOrderRef.current = [];
+    autoAttachAttemptedSessionRef.current = undefined;
+    reattachCurrentSessionOnOpenRef.current = false;
+    userDetachedRef.current = false;
+    setNewOutputSessionIds(new Set());
     setDaemonClients([]);
+    setDaemonStatus(undefined);
+    setDaemonCpuHistory([]);
+    setDaemonStatusError(undefined);
     setSelectedSessionId(undefined);
     renamingSessionIdRef.current = undefined;
     setRenamingSessionId(undefined);
@@ -469,7 +538,16 @@ export default function App() {
       setPairingToken("");
       setConnectionEditorOpen(false);
       setSessions([]);
+      setSessionOrder([]);
+      sessionOrderRef.current = [];
+      autoAttachAttemptedSessionRef.current = undefined;
+      reattachCurrentSessionOnOpenRef.current = false;
+      userDetachedRef.current = false;
+      setNewOutputSessionIds(new Set());
       setDaemonClients([]);
+      setDaemonStatus(undefined);
+      setDaemonCpuHistory([]);
+      setDaemonStatusError(undefined);
       setSelectedSessionId(undefined);
       renamingSessionIdRef.current = undefined;
       setRenamingSessionId(undefined);
@@ -531,7 +609,16 @@ export default function App() {
       const nextState = await recordServerUrl(server.server_id, effectiveUrl);
       setState(nextState);
       setSessions([]);
+      setSessionOrder([]);
+      sessionOrderRef.current = [];
+      autoAttachAttemptedSessionRef.current = undefined;
+      reattachCurrentSessionOnOpenRef.current = false;
+      userDetachedRef.current = false;
+      setNewOutputSessionIds(new Set());
       setDaemonClients([]);
+      setDaemonStatus(undefined);
+      setDaemonCpuHistory([]);
+      setDaemonStatusError(undefined);
       setSelectedSessionId(undefined);
       renamingSessionIdRef.current = undefined;
       setRenamingSessionId(undefined);
@@ -560,7 +647,16 @@ export default function App() {
       setError(undefined);
       disconnectAttach();
       setSessions([]);
+      setSessionOrder([]);
+      sessionOrderRef.current = [];
+      autoAttachAttemptedSessionRef.current = undefined;
+      reattachCurrentSessionOnOpenRef.current = false;
+      userDetachedRef.current = false;
+      setNewOutputSessionIds(new Set());
       setDaemonClients([]);
+      setDaemonStatus(undefined);
+      setDaemonCpuHistory([]);
+      setDaemonStatusError(undefined);
       setSelectedSessionId(undefined);
       renamingSessionIdRef.current = undefined;
       setRenamingSessionId(undefined);
@@ -593,13 +689,43 @@ export default function App() {
     return client;
   }, [activeServer, state.device]);
 
+  const authenticatedSessionClient = useCallback(
+    async (sessionId: UUID) => {
+      const client = await authenticatedClient();
+      try {
+        // daemon 对文件、重命名等 session 级操作要求当前连接已 attach。
+        // 这些旁路连接只短暂 attach，避免和 xterm 主连接的 receive loop 抢同一个 socket。
+        await client.attachSession(sessionId);
+        return client;
+      } catch (caught) {
+        client.close();
+        throw caught;
+      }
+    },
+    [authenticatedClient],
+  );
+
   const loadSessionFiles = useCallback(
     async (sessionId: UUID, path?: string) => {
       setSessionFilesLoading(true);
       setSessionFilesError(undefined);
+      const attachedClient = attachClientRef.current;
+      if (attachedSessionRef.current === sessionId && attachedClient) {
+        try {
+          // 当前 xterm 主连接已经 attach，文件列表请求只需要发送；返回的
+          // session_files_result 仍由 receive loop 统一接收，避免并发读同一个 socket。
+          await attachedClient.requestSessionFiles(sessionId, path);
+          return;
+        } catch (caught) {
+          setSessionFiles(undefined);
+          setSessionFilesError(toSafeError(caught));
+          setSessionFilesLoading(false);
+          return;
+        }
+      }
       let client: DirectClient | undefined;
       try {
-        client = await authenticatedClient();
+        client = await authenticatedSessionClient(sessionId);
         // 文件树当前位置是 daemon 端 session 共享状态；不传 path 时由 daemon 返回当前共享目录。
         const files = await client.listSessionFiles(sessionId, path);
         setSessionFiles(files);
@@ -612,7 +738,7 @@ export default function App() {
         setSessionFilesLoading(false);
       }
     },
-    [authenticatedClient],
+    [authenticatedSessionClient],
   );
 
   const handleRefresh = useCallback(async () => {
@@ -623,20 +749,26 @@ export default function App() {
       const list = await client.listSessions();
       const clients = await client.listDaemonClients();
       client.close();
-      const firstSessionId =
-        sortSessionsNewestFirst(list.sessions).at(0)?.session_id ??
-        renamingSessionIdRef.current ??
-        attachedSessionRef.current;
+      const nextOrder = mergeSessionOrder(sessionOrderRef.current, list.sessions);
+      sessionOrderRef.current = nextOrder;
+      setSessionOrder(nextOrder);
+      const orderedSessions = orderSessions(sortSessionsNewestFirst(list.sessions), nextOrder);
+      const firstSessionId = userDetachedRef.current
+        ? undefined
+        : orderedSessions.at(0)?.session_id ?? renamingSessionIdRef.current ?? attachedSessionRef.current;
       setSessions((current) =>
         mergeSessionRefresh(list.sessions, current, [
           renamingSessionIdRef.current,
           attachedSessionRef.current,
-        ]),
+        ], nextOrder),
       );
       setDaemonClients(clients.clients);
       setSelectedSessionId(firstSessionId);
-      // session 列表刷新可能来自后台轮询或 cursor 同步，不能打断用户正在编辑的标题。
-      clearSessionFiles();
+      // session 列表刷新可能来自后台轮询或 cursor 同步；已有 attach 时保留右侧文件树，
+      // 避免用户刷新 session 列表后文件 panel 被短暂清空。
+      if (!attachedSessionRef.current) {
+        clearSessionFiles();
+      }
       setStatus("ready");
     } catch (caught) {
       setActiveSurface("admin");
@@ -651,11 +783,14 @@ export default function App() {
         try {
           const sessionList = await client.listSessions();
           const clientList = await client.listDaemonClients();
+          const nextOrder = mergeSessionOrder(sessionOrderRef.current, sessionList.sessions);
+          sessionOrderRef.current = nextOrder;
+          setSessionOrder(nextOrder);
           setSessions((current) =>
             mergeSessionRefresh(sessionList.sessions, current, [
               renamingSessionIdRef.current,
               attachedSessionRef.current,
-            ]),
+            ], nextOrder),
           );
           setDaemonClients(clientList.clients);
         } finally {
@@ -667,6 +802,49 @@ export default function App() {
     },
     [authenticatedClient, setSafeError],
   );
+
+  const loadDaemonStatus = useCallback(async () => {
+    setDaemonStatusLoading(true);
+    setDaemonStatusError(undefined);
+    let client: DirectClient | undefined;
+    try {
+      client = await authenticatedClient();
+      const status = await client.getDaemonStatus();
+      setDaemonStatus(status);
+      // CPU 曲线只做当前页面内缓存，避免把瞬时监控数据写入浏览器持久状态。
+      setDaemonCpuHistory((current) => appendCpuSample(current, status.cpu_percent));
+    } catch (caught) {
+      setDaemonStatusError(toSafeError(caught));
+    } finally {
+      client?.close();
+      setDaemonStatusLoading(false);
+    }
+  }, [authenticatedClient]);
+
+  const clearNewOutputMark = useCallback((sessionId: UUID) => {
+    // 新输出提示只属于本地 UI；用户打开该 session 后立即清除，不回写 daemon。
+    setNewOutputSessionIds((current) => {
+      if (!current.has(sessionId)) {
+        return current;
+      }
+      const next = new Set(current);
+      next.delete(sessionId);
+      return next;
+    });
+  }, []);
+
+  const markNewOutputIfBackground = useCallback((sessionId: UUID) => {
+    // 当前 attach 的 session 输出会直接进入 xterm，不需要再用列表颜色提示。
+    if (sessionId === attachedSessionRef.current) {
+      return;
+    }
+    setNewOutputSessionIds((current) => {
+      if (current.has(sessionId)) {
+        return current;
+      }
+      return new Set(current).add(sessionId);
+    });
+  }, []);
 
   useEffect(() => {
     if (!activeServer || !state.device || status !== "idle" || autoCheckedServerRef.current === activeServer.server_id) {
@@ -684,8 +862,15 @@ export default function App() {
         try {
           const inner = await client.receiveInner();
           if (inner.type === "session_data") {
-            const payload = inner.payload as { data_base64: string };
+            const payload = inner.payload as SessionDataPayload;
+            if (payload.session_id !== attachedSessionRef.current) {
+              markNewOutputIfBackground(payload.session_id);
+              continue;
+            }
             enqueueTerminalOutput(sessionDataFromBase64(payload.data_base64));
+          } else if (inner.type === "session_activity") {
+            const payload = inner.payload as SessionActivityPayload;
+            markNewOutputIfBackground(payload.session_id);
           } else if (inner.type === "session_files_result") {
             const payload = inner.payload as SessionFilesResultPayload;
             // daemon 主动推送的文件树状态和当前 attach 的 session 对齐后才更新右侧 panel。
@@ -694,9 +879,25 @@ export default function App() {
               setSessionFilesError(undefined);
               setSessionFilesLoading(false);
             }
+          } else if (inner.type === "session_resized") {
+            const payload = inner.payload as SessionResizedPayload;
+            // session_resize 是请求，session_resized 才是 daemon 确认；前端只在这里更新
+            // session size，TerminalPane 随后按这份确认尺寸执行本地 xterm resize。
+            setSessions((current) =>
+              current.map((session) =>
+                session.session_id === payload.session_id ? { ...session, size: payload.size } : session,
+              ),
+            );
+            if (payload.session_id === attachedSessionRef.current) {
+              const confirmedResizeKey = terminalSizeKey(payload.session_id, payload.size);
+              if (pendingResizeKeyRef.current === confirmedResizeKey) {
+                pendingResizeKeyRef.current = undefined;
+              }
+            }
           }
         } catch (caught) {
-          if (receiveLoopActiveRef.current) {
+          // 旧 attach 关闭可能晚于新 attach 启动；只有当前 client 的错误才能切到错误态。
+          if (receiveLoopActiveRef.current && attachClientRef.current === client) {
             setSafeError(caught);
           }
           return;
@@ -704,42 +905,90 @@ export default function App() {
       }
     };
     void read();
-  }, [enqueueTerminalOutput, setSafeError]);
+  }, [enqueueTerminalOutput, markNewOutputIfBackground, setSafeError]);
 
   const handleAttach = useCallback(
     async (sessionId: UUID) => {
+      userDetachedRef.current = false;
       setError(undefined);
       setStatus("attaching");
       try {
-        if (attachedSessionRef.current === sessionId && attachClientRef.current) {
+        const shouldRefreshCurrentAttach =
+          reattachCurrentSessionOnOpenRef.current &&
+          attachedSessionRef.current === sessionId &&
+          Boolean(attachClientRef.current);
+        if (attachedSessionRef.current === sessionId && attachClientRef.current && !shouldRefreshCurrentAttach) {
           setSelectedSessionId(sessionId);
+          clearNewOutputMark(sessionId);
           setStatus("attached");
           setMobilePanel(undefined);
           setMobileMenuOpen(false);
           return;
         }
+        reattachCurrentSessionOnOpenRef.current = false;
         disconnectAttach();
         clearTerminalOutput();
         const client = await authenticatedClient();
-        await client.attachSession(sessionId);
+        const attached = await client.attachSession(sessionId);
         attachClientRef.current = client;
         attachedSessionRef.current = sessionId;
         setSelectedSessionId(sessionId);
         setAttachedSessionId(sessionId);
+        setSessions((current) => upsertAttachedSession(current, attached, sessionOrderRef.current));
+        clearNewOutputMark(sessionId);
         setMobilePanel(undefined);
         setMobileMenuOpen(false);
         setStatus("attached");
-        await loadSessionFiles(sessionId);
-        void refreshDaemonClients();
         startReceiveLoop(client);
+        void loadSessionFiles(sessionId);
+        void refreshDaemonClients();
       } catch (caught) {
         setSafeError(caught);
       }
     },
-    [authenticatedClient, clearTerminalOutput, disconnectAttach, loadSessionFiles, refreshDaemonClients, setSafeError, startReceiveLoop],
+    [authenticatedClient, clearNewOutputMark, clearTerminalOutput, disconnectAttach, loadSessionFiles, refreshDaemonClients, setSafeError, startReceiveLoop],
   );
 
+  const handleOpenWorkspace = useCallback(() => {
+    if (!activeServer || !state.device) {
+      return;
+    }
+    setError(undefined);
+    setActiveSurface("workspace");
+    setConnectionEditorOpen(false);
+    setMobilePanel(undefined);
+    setMobileMenuOpen(false);
+    if (status === "error" || status === "idle") {
+      // 从后台重新进入工作台时允许对当前 daemon 再做一次连通性探测。
+      autoCheckedServerRef.current = undefined;
+      setStatus("idle");
+    }
+  }, [activeServer, state.device, status]);
+
+  useEffect(() => {
+    const sessionId = selectedSessionId;
+    const shouldReattachCurrentSession =
+      activeSurface === "workspace" && reattachCurrentSessionOnOpenRef.current;
+    if (
+      activeSurface !== "workspace" ||
+      !connectionReady ||
+      status !== "ready" ||
+      !sessionId ||
+      attachClientRef.current ||
+      attachedSessionRef.current ||
+      userDetachedRef.current ||
+      (autoAttachAttemptedSessionRef.current === sessionId && !shouldReattachCurrentSession)
+    ) {
+      return;
+    }
+
+    // 首次打开或浏览器刷新后，session_list 只选中了第一行；这里补上真正的 attach。
+    autoAttachAttemptedSessionRef.current = sessionId;
+    void handleAttach(sessionId);
+  }, [activeSurface, connectionReady, handleAttach, selectedSessionId, status]);
+
   const handleCreateSession = useCallback(async () => {
+    userDetachedRef.current = false;
     setError(undefined);
     disconnectAttach();
     clearTerminalOutput();
@@ -752,20 +1001,24 @@ export default function App() {
       attachedSessionRef.current = created.session_id;
       setSelectedSessionId(created.session_id);
       setAttachedSessionId(created.session_id);
+      clearNewOutputMark(created.session_id);
       setMobilePanel(undefined);
       setMobileMenuOpen(false);
-      setSessions((current) => upsertSession(current, created));
+      const nextOrder = [created.session_id, ...sessionOrderRef.current.filter((sessionId) => sessionId !== created.session_id)];
+      sessionOrderRef.current = nextOrder;
+      setSessionOrder(nextOrder);
+      setSessions((current) => upsertSession(current, created, nextOrder));
       // 新建 session 等价于打开一个新的 SSH shell，应立即把输入焦点交给 xterm。
       // 普通打开历史 session 仍保持 viewer 逻辑，避免意外接管其他客户端的 PTY 尺寸。
       setTerminalFocusRequest((request) => request + 1);
       setStatus("attached");
-      await loadSessionFiles(created.session_id);
-      void refreshDaemonClients();
       startReceiveLoop(client);
+      void loadSessionFiles(created.session_id);
+      void refreshDaemonClients();
     } catch (caught) {
       setSafeError(caught);
     }
-  }, [authenticatedClient, clearTerminalOutput, disconnectAttach, loadSessionFiles, refreshDaemonClients, setSafeError, startReceiveLoop]);
+  }, [authenticatedClient, clearNewOutputMark, clearTerminalOutput, disconnectAttach, loadSessionFiles, refreshDaemonClients, setSafeError, startReceiveLoop]);
 
   const handleRetryConnection = useCallback(async () => {
     const sessionId = attachedSessionRef.current ?? attachedSessionId ?? selectedSessionId;
@@ -849,10 +1102,10 @@ export default function App() {
         return;
       }
       setError(undefined);
+      let client: DirectClient | undefined;
       try {
-        const client = await authenticatedClient();
+        client = await authenticatedSessionClient(sessionId);
         const renamed = await client.renameSession(sessionId, nextName);
-        client.close();
         setSessions((current) =>
           current.map((session) =>
             session.session_id === renamed.session_id ? { ...session, name: renamed.name } : session,
@@ -861,9 +1114,11 @@ export default function App() {
         handleCancelRename();
       } catch (caught) {
         setSafeError(caught);
+      } finally {
+        client?.close();
       }
     },
-    [authenticatedClient, handleCancelRename, renameDraft, renameOriginalName, setSafeError],
+    [authenticatedSessionClient, handleCancelRename, renameDraft, renameOriginalName, setSafeError],
   );
 
   const handleCloseSession = useCallback(
@@ -889,6 +1144,9 @@ export default function App() {
           }
         }
         setSessions((current) => current.filter((session) => session.session_id !== sessionId));
+        sessionOrderRef.current = sessionOrderRef.current.filter((candidate) => candidate !== sessionId);
+        setSessionOrder(sessionOrderRef.current);
+        clearNewOutputMark(sessionId);
         if (wasSelected) {
           setSelectedSessionId(undefined);
           clearSessionFiles();
@@ -915,12 +1173,20 @@ export default function App() {
       clearSessionFiles,
       clearTerminalOutput,
       disconnectAttach,
+      clearNewOutputMark,
       isIgnoredClosingSessionNotFound,
       refreshDaemonClients,
       selectedSessionId,
       setSafeError,
     ],
   );
+
+  const handleReorderSessions = useCallback((sessionIds: UUID[]) => {
+    // 排序是当前浏览器的工作台偏好，不写入 daemon，避免把个人 UI 状态扩展成协议状态。
+    sessionOrderRef.current = sessionIds;
+    setSessionOrder(sessionIds);
+    setSessions((current) => orderSessions(current, sessionIds));
+  }, []);
 
   const handleForgetOfflineClient = useCallback(
     async (deviceId: UUID) => {
@@ -975,34 +1241,27 @@ export default function App() {
       if (!client || !sessionId) {
         return;
       }
-      let shouldSendResize = false;
-      setSessions((current) => {
-        const next = current.map((session) =>
-          session.session_id === sessionId ? { ...session, size } : session,
-        );
-        const currentSession = current.find((session) => session.session_id === sessionId);
-        if (
-          currentSession &&
-          currentSession.size.rows === size.rows &&
-          currentSession.size.cols === size.cols &&
-          currentSession.size.pixel_width === size.pixel_width &&
-          currentSession.size.pixel_height === size.pixel_height
-        ) {
-          return current;
-        }
-        shouldSendResize = true;
-        return next;
-      });
-      if (!shouldSendResize) {
+      const currentSize = sessions.find((session) => session.session_id === sessionId)?.size;
+      const nextResizeKey = terminalSizeKey(sessionId, size);
+      if (
+        (currentSize && sameTerminalSize(currentSize, size)) ||
+        pendingResizeKeyRef.current === nextResizeKey
+      ) {
         return;
       }
-      void client.resizeSession(sessionId, size).catch((caught) => {
+      pendingResizeKeyRef.current = nextResizeKey;
+      // 这里仅向 daemon 请求 resize，不乐观改本地 session size，也不等待这个调用读取回执。
+      // attach receive loop 收到 session_resized 后才会更新 state，避免和终端输出读取循环抢 socket。
+      void client.requestSessionResize(sessionId, size).catch((caught) => {
+        if (pendingResizeKeyRef.current === nextResizeKey) {
+          pendingResizeKeyRef.current = undefined;
+        }
         if (!isIgnoredClosingSessionNotFound(sessionId, caught)) {
           setSafeError(caught);
         }
       });
     },
-    [isIgnoredClosingSessionNotFound, setSafeError],
+    [isIgnoredClosingSessionNotFound, sessions, setSafeError],
   );
 
   const handleCursorChange = useCallback(
@@ -1044,6 +1303,17 @@ export default function App() {
     return () => window.clearInterval(refreshTimer);
   }, [attachedSessionId, connectionReady, refreshDaemonClients]);
 
+  useEffect(() => {
+    if (!connectionReady) {
+      return undefined;
+    }
+    void loadDaemonStatus();
+    const timer = window.setInterval(() => {
+      void loadDaemonStatus();
+    }, DAEMON_STATUS_POLL_INTERVAL_MS);
+    return () => window.clearInterval(timer);
+  }, [connectionReady, loadDaemonStatus]);
+
   const handleOpenDirectory = useCallback(
     (path: string) => {
       const sessionId = attachedSessionRef.current;
@@ -1066,17 +1336,32 @@ export default function App() {
     [loadSessionFiles, sessionFiles?.path],
   );
 
+  const handleRefreshSessionFiles = useCallback(() => {
+    const sessionId = attachedSessionRef.current;
+    if (!sessionId) {
+      return;
+    }
+    void loadSessionFiles(sessionId, sessionFiles?.path);
+  }, [loadSessionFiles, sessionFiles?.path]);
+
   const handleUploadFile = useCallback(
     async (file: File) => {
       const sessionId = attachedSessionRef.current;
       if (!sessionId) {
         return;
       }
+      if (file.size > FILE_UPLOAD_MAX_BYTES) {
+        setSessionFilesError({
+          code: "file_too_large",
+          message: "file is too large to upload in browser",
+        });
+        return;
+      }
       setSessionFilesLoading(true);
       setSessionFilesError(undefined);
       let client: DirectClient | undefined;
       try {
-        client = await authenticatedClient();
+        client = await authenticatedSessionClient(sessionId);
         await client.writeSessionFile(sessionId, joinRemotePath(sessionFiles?.path ?? "", file.name), await fileToBytes(file));
         client.close();
         client = undefined;
@@ -1088,7 +1373,91 @@ export default function App() {
         setSessionFilesLoading(false);
       }
     },
-    [authenticatedClient, loadSessionFiles, sessionFiles?.path],
+    [authenticatedSessionClient, loadSessionFiles, sessionFiles?.path],
+  );
+
+  const handleOpenFile = useCallback(
+    async (entry: SessionFileEntryPayload) => {
+      const sessionId = attachedSessionRef.current;
+      if (!sessionId || entry.kind !== "file") {
+        return;
+      }
+      if (entry.size_bytes > TEXT_FILE_EDITOR_MAX_BYTES) {
+        setFileEditor({
+          path: entry.path,
+          name: entry.name,
+          text: "",
+          loading: false,
+          saving: false,
+          error: "file is too large to edit in browser",
+        });
+        return;
+      }
+
+      setSessionFilesError(undefined);
+      setFileEditor({
+        path: entry.path,
+        name: entry.name,
+        text: "",
+        loading: true,
+        saving: false,
+      });
+      let client: DirectClient | undefined;
+      try {
+        client = await authenticatedSessionClient(sessionId);
+        const payload = await readEditableSessionFile(client, sessionId, entry.path);
+        setFileEditor({
+          path: payload.path,
+          name: entry.name,
+          text: new TextDecoder().decode(payload.bytes),
+          loading: false,
+          saving: false,
+        });
+      } catch (caught) {
+        setFileEditor((current) => ({
+          path: current?.path ?? entry.path,
+          name: current?.name ?? entry.name,
+          text: current?.text ?? "",
+          loading: false,
+          saving: false,
+          error: toSafeError(caught).message,
+        }));
+      } finally {
+        client?.close();
+      }
+    },
+    [authenticatedSessionClient],
+  );
+
+  const handleSaveOpenFile = useCallback(
+    async (text: string) => {
+      const sessionId = attachedSessionRef.current;
+      const editor = fileEditor;
+      if (!sessionId || !editor) {
+        return;
+      }
+      setFileEditor({ ...editor, text, saving: true, error: undefined });
+      let client: DirectClient | undefined;
+      try {
+        client = await authenticatedSessionClient(sessionId);
+        const written = await client.writeSessionFile(sessionId, editor.path, new TextEncoder().encode(text));
+        client.close();
+        client = undefined;
+        setFileEditor({
+          path: written.path,
+          name: editor.name,
+          text,
+          loading: false,
+          saving: false,
+        });
+        await loadSessionFiles(sessionId, sessionFiles?.path);
+      } catch (caught) {
+        setFileEditor({ ...editor, text, loading: false, saving: false, error: toSafeError(caught).message });
+      } finally {
+        client?.close();
+      }
+    },
+    [authenticatedSessionClient, fileEditor, loadSessionFiles, sessionFiles?.path],
   );
 
   const handleDownloadFile = useCallback(
@@ -1100,16 +1469,15 @@ export default function App() {
       setSessionFilesError(undefined);
       let client: DirectClient | undefined;
       try {
-        client = await authenticatedClient();
-        const payload = await client.readSessionFile(sessionId, entry.path);
-        triggerBrowserDownload(entry.name, payload.data_base64);
+        client = await authenticatedSessionClient(sessionId);
+        await downloadSessionFile(client, sessionId, entry.name, entry.path);
       } catch (caught) {
         setSessionFilesError(toSafeError(caught));
       } finally {
         client?.close();
       }
     },
-    [authenticatedClient],
+    [authenticatedSessionClient],
   );
 
   const handleDeleteFile = useCallback(
@@ -1122,7 +1490,7 @@ export default function App() {
       setSessionFilesError(undefined);
       let client: DirectClient | undefined;
       try {
-        client = await authenticatedClient();
+        client = await authenticatedSessionClient(sessionId);
         await client.deleteSessionFile(sessionId, entry.path);
         client.close();
         client = undefined;
@@ -1134,7 +1502,7 @@ export default function App() {
         setSessionFilesLoading(false);
       }
     },
-    [authenticatedClient, loadSessionFiles, sessionFiles?.path],
+    [authenticatedSessionClient, loadSessionFiles, sessionFiles?.path],
   );
 
   const handleHideFiles = useCallback(() => {
@@ -1208,7 +1576,7 @@ export default function App() {
         <header className="admin-topbar">
           <div className="admin-brand">
             <Cable size={18} aria-hidden="true" />
-            <span>termd admin</span>
+            <span>Termd admin</span>
           </div>
           <div className="admin-topbar-actions">
             <button type="button" onClick={handleOpenWorkspace} disabled={!canOpenWorkspace}>
@@ -1331,17 +1699,27 @@ export default function App() {
                   >
                     <RefreshCcw size={16} aria-hidden="true" />
                   </button>
-                  <button type="button" className="icon-button" aria-label="Disconnect" onClick={disconnectAttach} disabled={!attachedSessionId}>
+                  <button type="button" className="icon-button" aria-label="Disconnect" onClick={handleDisconnectAttach} disabled={!attachedSessionId}>
                     <Unplug size={16} aria-hidden="true" />
                   </button>
                 </div>
                 <section className="collapsed-session-list" aria-label="collapsed sessions">
-                  {sessions.map((session) => (
+                  {orderedSessions.map((session) => (
                     <button
                       type="button"
                       key={session.session_id}
-                      className={session.session_id === selectedSessionId ? "icon-button selected-session-dot" : "icon-button"}
-                      aria-label={`Select ${sessionDisplayName(session)}`}
+                      className={[
+                        "icon-button",
+                        session.session_id === selectedSessionId ? "selected-session-dot" : "",
+                        newOutputSessionIds.has(session.session_id) ? "has-new-output" : "",
+                      ]
+                        .filter(Boolean)
+                        .join(" ")}
+                      aria-label={
+                        newOutputSessionIds.has(session.session_id)
+                          ? `Select ${sessionDisplayName(session)}, new output`
+                          : `Select ${sessionDisplayName(session)}`
+                      }
                       onClick={() => void handleAttach(session.session_id)}
                     >
                       <MonitorUp size={15} aria-hidden="true" />
@@ -1354,9 +1732,9 @@ export default function App() {
         ) : (
           <>
             <div className="brand-row">
-              <div className="brand-title">
-                <Cable size={18} aria-hidden="true" />
-                <span>termd</span>
+            <div className="brand-title">
+              <Cable size={18} aria-hidden="true" />
+                <span>Termd</span>
               </div>
               <button
                 type="button"
@@ -1380,14 +1758,15 @@ export default function App() {
                     <RefreshCcw size={16} aria-hidden="true" />
                     Refresh
                   </button>
-                  <button type="button" onClick={disconnectAttach} disabled={!attachedSessionId}>
+                  <button type="button" onClick={handleDisconnectAttach} disabled={!attachedSessionId}>
                     <Unplug size={16} aria-hidden="true" />
                     Disconnect
                   </button>
                 </div>
                 <SessionList
-                  sessions={sessions}
+                  sessions={orderedSessions}
                   selectedSessionId={selectedSessionId}
+                  newOutputSessionIds={newOutputSessionIds}
                   renamingSessionId={renamingSessionId}
                   renameDraft={renameDraft}
                   canSaveRename={canSaveRename}
@@ -1397,6 +1776,7 @@ export default function App() {
                   onSaveRename={handleSaveRename}
                   onCancelRename={handleCancelRename}
                   onClose={handleCloseSession}
+                  onReorder={handleReorderSessions}
                 />
               </>
             ) : null}
@@ -1525,7 +1905,9 @@ export default function App() {
                     loading={sessionFilesLoading}
                     error={sessionFilesError}
                     onOpenDirectory={handleOpenDirectory}
+                    onOpenFile={handleOpenFile}
                     onGoToPath={handleGoToFilePath}
+                    onRefresh={handleRefreshSessionFiles}
                     onUpload={handleUploadFile}
                     onDownload={handleDownloadFile}
                     onDelete={handleDeleteFile}
@@ -1590,8 +1972,9 @@ export default function App() {
             </header>
             <div className="mobile-panel-body">
               <SessionList
-                sessions={sessions}
+                sessions={orderedSessions}
                 selectedSessionId={selectedSessionId}
+                newOutputSessionIds={newOutputSessionIds}
                 renamingSessionId={renamingSessionId}
                 renameDraft={renameDraft}
                 canSaveRename={canSaveRename}
@@ -1601,6 +1984,7 @@ export default function App() {
                 onSaveRename={handleSaveRename}
                 onCancelRename={handleCancelRename}
                 onClose={handleCloseSession}
+                onReorder={handleReorderSessions}
               />
             </div>
           </section>
@@ -1613,7 +1997,9 @@ export default function App() {
               loading={sessionFilesLoading}
               error={sessionFilesError}
               onOpenDirectory={handleOpenDirectory}
+              onOpenFile={handleOpenFile}
               onGoToPath={handleGoToFilePath}
+              onRefresh={handleRefreshSessionFiles}
               onUpload={handleUploadFile}
               onDownload={handleDownloadFile}
               onDelete={handleDeleteFile}
@@ -1621,7 +2007,25 @@ export default function App() {
             />
           </div>
         ) : null}
-        <StatusBar status={status} error={error} sessionId={attachedSessionId ?? selectedSessionId} />
+        <FileEditorDialog
+          open={Boolean(fileEditor)}
+          path={fileEditor?.path ?? ""}
+          name={fileEditor?.name}
+          initialText={fileEditor?.text ?? ""}
+          loading={fileEditor?.loading}
+          saving={fileEditor?.saving}
+          error={fileEditor?.error}
+          language={languageForPath(fileEditor?.path ?? "")}
+          onSave={handleSaveOpenFile}
+          onClose={() => setFileEditor(undefined)}
+        />
+        <DaemonStatusPanel
+          status={daemonStatus}
+          cpuHistory={daemonCpuHistory}
+          loading={daemonStatusLoading}
+          error={daemonStatusError}
+          compact={isMobileLayout}
+        />
       </main>
     </div>
   );
@@ -1696,6 +2100,82 @@ function SessionOperatorsBar(props: {
           );
         })
       )}
+    </div>
+  );
+}
+
+function DaemonStatusPanel(props: {
+  status?: DaemonStatusResultPayload;
+  cpuHistory: number[];
+  loading: boolean;
+  error?: SafeError;
+  compact?: boolean;
+}) {
+  const memoryValue = props.status
+    ? `${formatBytesCompact(usedBytes(props.status.memory_total_bytes, props.status.memory_available_bytes))} / ${formatBytesCompact(props.status.memory_total_bytes)}`
+    : "-";
+  const diskValue = props.status
+    ? `${formatBytesCompact(usedBytes(props.status.disk_total_bytes, props.status.disk_available_bytes))} / ${formatBytesCompact(props.status.disk_total_bytes)}`
+    : "-";
+  const cpuValue = props.status ? `${props.status.cpu_percent.toFixed(1)}%` : props.loading ? "..." : "-";
+
+  return (
+    <footer
+      className={props.compact ? "daemon-status-panel daemon-status-strip compact" : "daemon-status-panel daemon-status-strip"}
+      aria-label="daemon server status"
+      role="contentinfo"
+    >
+      {props.compact ? null : (
+        <header className="daemon-status-header">
+          <div className="daemon-status-title">
+            <Server size={15} aria-hidden="true" />
+            <span>{props.status?.host_name ?? "daemon"}</span>
+          </div>
+        </header>
+      )}
+      {!props.compact && props.error ? (
+        <div className="daemon-status-error">
+          <code>{props.error.code}</code>
+          <span>{props.error.message}</span>
+        </div>
+      ) : null}
+      <div className="daemon-status-grid">
+        <CpuMetric value={cpuValue} history={props.cpuHistory} />
+        {props.compact ? null : <Metric label="Load" value={props.status ? props.status.load_avg.map((value) => value.toFixed(2)).join(" ") : "-"} />}
+        <Metric label="Mem" value={memoryValue} />
+        <Metric label="Disk" value={diskValue} />
+        {props.compact ? null : <Metric label="Uptime" value={props.status ? formatDuration(props.status.uptime_seconds) : "-"} />}
+        {props.compact ? null : <Metric label="Procs" value={props.status ? String(props.status.process_count) : "-"} />}
+      </div>
+    </footer>
+  );
+}
+
+function CpuMetric(props: { value: string; history: number[] }) {
+  return (
+    <div className="daemon-status-metric daemon-status-cpu">
+      <span>CPU</span>
+      <strong>{props.value}</strong>
+      <CpuSparkline samples={props.history} />
+    </div>
+  );
+}
+
+function CpuSparkline(props: { samples: number[] }) {
+  const points = cpuSparklinePoints(props.samples, 72, 18);
+  return (
+    <svg className="daemon-cpu-sparkline" viewBox="0 0 72 18" role="img" aria-label="CPU usage trend">
+      <path className="daemon-cpu-sparkline-fill" d={cpuSparklineAreaPath(points, 72, 18)} />
+      <polyline className="daemon-cpu-sparkline-line" points={points} />
+    </svg>
+  );
+}
+
+function Metric(props: { label: string; value: string }) {
+  return (
+    <div className="daemon-status-metric">
+      <span>{props.label}</span>
+      <strong>{props.value}</strong>
     </div>
   );
 }
@@ -1919,8 +2399,80 @@ function daemonDisplayLabel(server: PairedServerState, index: number): string {
   }
 }
 
+function daemonAddressForTitle(rawUrl: string): string {
+  try {
+    const parsed = new URL(rawUrl);
+    parsed.search = "";
+    parsed.hash = "";
+    return parsed.toString();
+  } catch {
+    return rawUrl.split("?")[0]?.split("#")[0] ?? rawUrl;
+  }
+}
+
 function terminalSizeDisplay(size: TerminalSize): string {
   return `${size.cols}x${size.rows}`;
+}
+
+function formatBytesCompact(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) {
+    return "0 B";
+  }
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let value = bytes;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  return `${value >= 10 || unitIndex === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[unitIndex]}`;
+}
+
+function usedBytes(totalBytes: number, availableBytes: number): number {
+  if (!Number.isFinite(totalBytes) || !Number.isFinite(availableBytes)) {
+    return 0;
+  }
+  return Math.max(0, totalBytes - Math.max(0, availableBytes));
+}
+
+function formatDuration(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds < 0) {
+    return "-";
+  }
+  const days = Math.floor(seconds / 86_400);
+  const hours = Math.floor((seconds % 86_400) / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  if (days > 0) {
+    return `${days}d ${hours}h`;
+  }
+  if (hours > 0) {
+    return `${hours}h ${minutes}m`;
+  }
+  return `${minutes}m`;
+}
+
+function appendCpuSample(samples: number[], sample: number): number[] {
+  const boundedSample = Number.isFinite(sample) ? Math.max(0, Math.min(100, sample)) : 0;
+  return [...samples, boundedSample].slice(-CPU_HISTORY_LIMIT);
+}
+
+function cpuSparklinePoints(samples: number[], width: number, height: number): string {
+  const normalizedSamples = samples.length > 0 ? samples : [0];
+  const lastIndex = normalizedSamples.length - 1;
+  return normalizedSamples
+    .map((sample, index) => {
+      const x = lastIndex === 0 ? width : (index / lastIndex) * width;
+      const y = height - (Math.max(0, Math.min(100, sample)) / 100) * height;
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    })
+    .join(" ");
+}
+
+function cpuSparklineAreaPath(points: string, width: number, height: number): string {
+  if (!points) {
+    return "";
+  }
+  return `M0 ${height} L ${points} L ${width} ${height} Z`;
 }
 
 function sortSessionsNewestFirst(sessions: SessionSummaryPayload[]): SessionSummaryPayload[] {
@@ -1931,6 +2483,7 @@ function mergeSessionRefresh(
   remoteSessions: SessionSummaryPayload[],
   currentSessions: SessionSummaryPayload[],
   preserveSessionIds: Array<UUID | undefined>,
+  sessionOrder: UUID[] = [],
 ): SessionSummaryPayload[] {
   const currentById = new Map(currentSessions.map((session) => [session.session_id, session]));
   const remoteIds = new Set(remoteSessions.map((session) => session.session_id));
@@ -1945,10 +2498,15 @@ function mergeSessionRefresh(
     };
   });
 
+  const preservedIds = new Set<UUID>();
   for (const sessionId of preserveSessionIds) {
     if (!sessionId || remoteIds.has(sessionId)) {
       continue;
     }
+    if (preservedIds.has(sessionId)) {
+      continue;
+    }
+    preservedIds.add(sessionId);
     const current = currentById.get(sessionId);
     if (current) {
       // 正在编辑或 attach 的 session 可能被更早发出的旧 session_list 暂时漏掉；
@@ -1957,7 +2515,40 @@ function mergeSessionRefresh(
     }
   }
 
-  return sortSessionsNewestFirst(next);
+  return orderSessions(sortSessionsNewestFirst(next), sessionOrder);
+}
+
+function orderSessions(
+  sessions: SessionSummaryPayload[],
+  sessionOrder: UUID[],
+): SessionSummaryPayload[] {
+  if (sessionOrder.length === 0) {
+    return sessions;
+  }
+  const sessionById = new Map(sessions.map((session) => [session.session_id, session]));
+  const ordered = sessionOrder
+    .map((sessionId) => sessionById.get(sessionId))
+    .filter((session): session is SessionSummaryPayload => Boolean(session));
+  const orderedIds = new Set(ordered.map((session) => session.session_id));
+  // 新 session 还没有用户排序偏好，保留 daemon 刷新后的稳定顺序并放在已排序区前面。
+  const unordered = sessions.filter((session) => !orderedIds.has(session.session_id));
+  return [...unordered, ...ordered];
+}
+
+function applyLocalSessionOrder(
+  sessions: SessionSummaryPayload[],
+  sessionOrder: UUID[],
+): SessionSummaryPayload[] {
+  return orderSessions(sessions, sessionOrder);
+}
+
+function mergeSessionOrder(currentOrder: UUID[], sessions: SessionSummaryPayload[]): UUID[] {
+  const remoteIds = sessions.map((session) => session.session_id);
+  const remoteIdSet = new Set(remoteIds);
+  const keptOrder = currentOrder;
+  const keptOrderSet = new Set(keptOrder);
+  // 不因为一次旧 session_list 临时漏项而丢掉用户排序；关闭 session 时会显式删除该 id。
+  return [...keptOrder, ...remoteIds.filter((sessionId) => !keptOrderSet.has(sessionId))];
 }
 
 function sessionCreatedAt(session: SessionSummaryPayload): number {
@@ -2025,15 +2616,136 @@ function fileToBytes(file: File): Promise<Uint8Array> {
   });
 }
 
-function triggerBrowserDownload(name: string, dataBase64: string): void {
+async function readEditableSessionFile(
+  client: DirectClient,
+  sessionId: UUID,
+  path: string,
+): Promise<{ path: string; bytes: Uint8Array }> {
+  let offset = 0;
+  let resolvedPath = path;
+  let totalBytes = 0;
+  const chunks: Uint8Array[] = [];
+
+  while (true) {
+    const chunk = await client.readSessionFileDownloadChunk(sessionId, path, offset, FILE_DOWNLOAD_CHUNK_BYTES);
+    if (chunk.size_bytes > TEXT_FILE_EDITOR_MAX_BYTES) {
+      throw new ProtocolClientError("file_too_large", "file is too large to edit in browser");
+    }
+    const bytes = sessionDataFromBase64(chunk.data_base64);
+    if (bytes.includes(0)) {
+      throw new ProtocolClientError("binary_file", "binary files cannot be edited in browser");
+    }
+    totalBytes += bytes.byteLength;
+    if (totalBytes > TEXT_FILE_EDITOR_MAX_BYTES) {
+      throw new ProtocolClientError("file_too_large", "file is too large to edit in browser");
+    }
+    chunks.push(bytes);
+    resolvedPath = chunk.path;
+    if (chunk.eof) {
+      break;
+    }
+    if (chunk.next_offset_bytes <= offset) {
+      // daemon 必须单调推进 offset，否则前端会无限循环等待同一个 chunk。
+      throw new ProtocolClientError("invalid_file_chunk", "file chunk did not advance");
+    }
+    offset = chunk.next_offset_bytes;
+  }
+
+  return { path: resolvedPath, bytes: concatByteChunks(chunks) };
+}
+
+async function downloadSessionFile(
+  client: DirectClient,
+  sessionId: UUID,
+  name: string,
+  path: string,
+): Promise<void> {
+  const writer = await createDownloadWriter(name);
+  if (writer) {
+    let offset = 0;
+    try {
+      while (true) {
+        const chunk = await client.readSessionFileDownloadChunk(sessionId, path, offset, FILE_DOWNLOAD_CHUNK_BYTES);
+        const bytes = sessionDataFromBase64(chunk.data_base64);
+        await writer.write(bytes);
+        offset = chunk.next_offset_bytes;
+        if (chunk.eof) {
+          break;
+        }
+      }
+    } finally {
+      await writer.close();
+    }
+    return;
+  }
+
+  let offset = 0;
+  let sizeBytes: number | undefined;
+  const chunks: Uint8Array[] = [];
+  while (true) {
+    const chunk = await client.readSessionFileDownloadChunk(sessionId, path, offset, FILE_DOWNLOAD_CHUNK_BYTES);
+    sizeBytes = chunk.size_bytes;
+    if (sizeBytes > FILE_TRANSFER_MEMORY_FALLBACK_MAX_BYTES) {
+      throw new ProtocolClientError("file_too_large", "browser streaming download is unavailable for this file");
+    }
+    const bytes = sessionDataFromBase64(chunk.data_base64);
+    chunks.push(bytes);
+    offset = chunk.next_offset_bytes;
+    if (chunk.eof) {
+      break;
+    }
+  }
+  triggerBrowserDownload(name, concatByteChunks(chunks));
+}
+
+async function createDownloadWriter(name: string): Promise<{ write: (bytes: Uint8Array) => Promise<void>; close: () => Promise<void> } | undefined> {
+  const picker = (globalThis as {
+    showSaveFilePicker?: (options?: { suggestedName?: string }) => Promise<{
+      createWritable: () => Promise<{
+        write: (data: Uint8Array) => Promise<void>;
+        close: () => Promise<void>;
+      }>;
+    }>;
+  }).showSaveFilePicker;
+  if (!picker) {
+    return undefined;
+  }
+  try {
+    const handle = await picker({ suggestedName: name || "download" });
+    const writable = await handle.createWritable();
+    return {
+      write: (bytes) => writable.write(bytes),
+      close: () => writable.close(),
+    };
+  } catch (caught) {
+    if (caught instanceof DOMException && caught.name === "AbortError") {
+      throw new ProtocolClientError("download_cancelled", "download was cancelled");
+    }
+    return undefined;
+  }
+}
+
+function concatByteChunks(chunks: Uint8Array[]): Uint8Array {
+  const length = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
+  const out = new Uint8Array(length);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
+}
+
+function triggerBrowserDownload(name: string, bytes: Uint8Array): void {
   if (typeof navigator !== "undefined" && navigator.userAgent.toLowerCase().includes("jsdom")) {
     return;
   }
   if (typeof URL.createObjectURL !== "function") {
     return;
   }
-  const bytes = Uint8Array.from(sessionDataFromBase64(dataBase64));
-  const blob = new Blob([bytes.buffer], { type: "application/octet-stream" });
+  const buffer = new ArrayBuffer(bytes.byteLength);
+  new Uint8Array(buffer).set(bytes);
+  const blob = new Blob([buffer], { type: "application/octet-stream" });
   const href = URL.createObjectURL(blob);
   const link = document.createElement("a");
   link.href = href;
@@ -2045,7 +2757,43 @@ function triggerBrowserDownload(name: string, dataBase64: string): void {
   URL.revokeObjectURL(href);
 }
 
-function upsertSession(current: SessionSummaryPayload[], session: SessionCreatedPayload): SessionSummaryPayload[] {
+function languageForPath(path: string): string | undefined {
+  const extension = path.split(".").pop()?.toLowerCase();
+  switch (extension) {
+    case "js":
+    case "jsx":
+      return "javascript";
+    case "ts":
+    case "tsx":
+      return "typescript";
+    case "json":
+      return "json";
+    case "rs":
+      return "rust";
+    case "md":
+      return "markdown";
+    case "py":
+      return "python";
+    case "sh":
+    case "bash":
+      return "shell";
+    case "css":
+      return "css";
+    case "html":
+      return "html";
+    case "yml":
+    case "yaml":
+      return "yaml";
+    default:
+      return undefined;
+  }
+}
+
+function upsertSession(
+  current: SessionSummaryPayload[],
+  session: SessionCreatedPayload,
+  sessionOrder: UUID[] = [],
+): SessionSummaryPayload[] {
   const next = {
     session_id: session.session_id,
     name: session.name ?? null,
@@ -2053,5 +2801,41 @@ function upsertSession(current: SessionSummaryPayload[], session: SessionCreated
     size: session.size,
     created_at_ms: Date.now(),
   };
-  return sortSessionsNewestFirst([next, ...current.filter((candidate) => candidate.session_id !== session.session_id)]);
+  return orderSessions(
+    sortSessionsNewestFirst([next, ...current.filter((candidate) => candidate.session_id !== session.session_id)]),
+    sessionOrder,
+  );
+}
+
+function upsertAttachedSession(
+  current: SessionSummaryPayload[],
+  attached: SessionAttachedPayload,
+  sessionOrder: UUID[] = [],
+): SessionSummaryPayload[] {
+  const existing = current.find((candidate) => candidate.session_id === attached.session_id);
+  const next: SessionSummaryPayload = {
+    session_id: attached.session_id,
+    name: existing?.name ?? null,
+    state: attached.state,
+    size: attached.size,
+    files_path: existing?.files_path ?? null,
+    created_at_ms: existing?.created_at_ms ?? null,
+  };
+  return orderSessions(
+    [next, ...current.filter((candidate) => candidate.session_id !== attached.session_id)],
+    sessionOrder,
+  );
+}
+
+function sameTerminalSize(a: TerminalSize, b: TerminalSize): boolean {
+  return (
+    a.rows === b.rows &&
+    a.cols === b.cols &&
+    a.pixel_width === b.pixel_width &&
+    a.pixel_height === b.pixel_height
+  );
+}
+
+function terminalSizeKey(sessionId: UUID, size: TerminalSize): string {
+  return `${sessionId}:${size.rows}:${size.cols}:${size.pixel_width}:${size.pixel_height}`;
 }

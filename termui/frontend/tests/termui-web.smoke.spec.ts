@@ -44,6 +44,9 @@ test("pair、list、attach 的浏览器 smoke", async ({ page }, testInfo: TestI
     await activateButton(page, "Pair");
 
     await expect(page.getByLabel("Pairing token")).toBeHidden();
+    const terminalPane = page.getByTestId("terminal-pane");
+    await expect(terminalPane.getByText("termd-e2e-ready")).toBeVisible();
+
     if (testInfo.project.name === "mobile-chrome") {
       await expect(page.getByRole("navigation", { name: "mobile workspace actions" })).toHaveCount(0);
       const menu = await openMobileMenu(page);
@@ -68,8 +71,10 @@ test("pair、list、attach 的浏览器 smoke", async ({ page }, testInfo: TestI
       const menuBox = await mobileMenuButton.boundingBox();
       expect(menuBox?.x ?? 0).toBeLessThan(48);
     } else {
-      await expect(page.getByText("ready")).toBeVisible();
-      await activateButton(page, "Refresh");
+      const daemonStatus = page.getByRole("contentinfo", { name: "daemon server status" });
+      await expect(daemonStatus).toBeVisible();
+      await expect(daemonStatus.getByRole("img", { name: "CPU usage trend" })).toBeVisible();
+      await expect(daemonStatus.getByRole("button", { name: "Refresh server status" })).toHaveCount(0);
     }
     const sessionsPanel = page.getByRole("region", { name: "sessions" });
     // session UUID 已从 UI 隐藏；测试按用户实际看到的可访问名称打开会话。
@@ -77,9 +82,32 @@ test("pair、list、attach 的浏览器 smoke", async ({ page }, testInfo: TestI
     await expect(sessionRow).toBeVisible();
 
     await sessionRow.click();
-    const terminalPane = page.getByTestId("terminal-pane");
-    await expect(terminalPane).toHaveAttribute("data-output-chunks", "1");
     await expect(terminalPane.getByText("termd-e2e-ready")).toBeVisible();
+
+    if (testInfo.project.name !== "mobile-chrome") {
+      daemon.pushSessionData(
+        "00000000-0000-0000-0000-000000000501",
+        Array.from({ length: 96 }, (_, index) => `resize-scroll-bottom-${index}\n`).join(""),
+      );
+      await expect(terminalPane.getByText("resize-scroll-bottom-95")).toBeVisible();
+      const resizer = page.getByRole("separator", { name: "Resize files panel" });
+      const box = await resizer.boundingBox();
+      expect(box).not.toBeNull();
+      await page.mouse.move((box?.x ?? 0) + (box?.width ?? 1) / 2, (box?.y ?? 0) + 20);
+      await page.mouse.down();
+      await page.mouse.move((box?.x ?? 0) - 120, (box?.y ?? 0) + 20);
+      await page.mouse.up();
+      await terminalPane.click();
+      await expect(terminalPane.getByText("resize-scroll-bottom-95")).toBeVisible();
+      await expect
+        .poll(async () =>
+          page.locator(".terminal-scrollport").evaluate((element) => {
+            const maxScrollTop = Math.max(0, element.scrollHeight - element.clientHeight);
+            return element.scrollTop >= maxScrollTop - 2;
+          }),
+        )
+        .toBe(true);
+    }
 
     if (testInfo.project.name === "mobile-chrome") {
       await expect
@@ -115,18 +143,19 @@ test("pair、list、attach 的浏览器 smoke", async ({ page }, testInfo: TestI
 
     if (testInfo.project.name === "mobile-chrome") {
       await page.evaluate(() => {
-        // 移动端失焦后会回到 viewer 面板；高度不能被刚才的输入态同步成一行。
+        // 移动端软键盘收起或输入框 blur 后，终端不能被同步成一行或丢失可视高度。
         if (document.activeElement instanceof HTMLElement) {
           document.activeElement.blur();
         }
       });
-      await expect(terminalPane).toHaveAttribute("data-viewer-mode", "true");
+      await expect(terminalPane).toHaveAttribute("data-viewer-mode", "false");
       await expect
         .poll(async () => (await terminalPane.boundingBox())?.height ?? 0)
         .toBeGreaterThan(280);
     }
 
     await page.reload();
+    await expect(page.getByTestId("terminal-pane").getByText("termd-e2e-ready")).toBeVisible();
     if (testInfo.project.name === "mobile-chrome") {
       await activateButton(page, "Open mobile workspace menu");
       const menu = page.getByRole("navigation", { name: "mobile workspace menu" });
@@ -134,8 +163,6 @@ test("pair、list、attach 的浏览器 smoke", async ({ page }, testInfo: TestI
       await menu.getByRole("button", { name: "Daemons" }).click();
       await expect(page.getByRole("main", { name: "daemon admin" })).toBeVisible();
       await expect(page.getByRole("button", { name: "Open workspace" })).toBeEnabled();
-    } else {
-      await expect(page.getByText("ready")).toBeVisible();
     }
     const localStorageText = await page.evaluate(() => JSON.stringify(window.localStorage));
     expect(localStorageText).not.toContain("secret-token");

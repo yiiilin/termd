@@ -17,7 +17,8 @@ const VIEWER_MIN_ZOOM = 0.5;
 const VIEWER_MAX_ZOOM = 1.4;
 const CURSOR_REPORT_INTERVAL_MS = 120;
 const MOBILE_SCROLL_REPORT_INTERVAL_MS = 120;
-type ResizeSource = "layout" | "focus" | "viewer";
+const FOCUS_OUT_SETTLE_MS = 120;
+type ResizeSource = "layout" | "focus" | "session" | "viewer";
 
 function sameTerminalDimensions(
   a: { rows: number; cols: number } | undefined,
@@ -59,6 +60,9 @@ export function TerminalPane(props: TerminalPaneProps) {
   const drainOutputRef = useRef<() => void>(() => undefined);
   const cursorFrameRef = useRef<number | undefined>(undefined);
   const cursorReportTimerRef = useRef<number | undefined>(undefined);
+  const focusOutTimerRef = useRef<number | undefined>(undefined);
+  const bottomScrollFrameRef = useRef<number | undefined>(undefined);
+  const copyToastTimerRef = useRef<number | undefined>(undefined);
   const lastCursorReportAtRef = useRef(0);
   const mobileScrollFrameRef = useRef<number | undefined>(undefined);
   const mobileScrollTimerRef = useRef<number | undefined>(undefined);
@@ -84,14 +88,53 @@ export function TerminalPane(props: TerminalPaneProps) {
   const [clientSize, setClientSize] = useState<TerminalSize | undefined>(undefined);
   const [focused, setFocused] = useState(false);
   const [viewerScale, setViewerScale] = useState(1);
+  const [copyToastVisible, setCopyToastVisible] = useState(false);
   const [mobileScrollRatio, setMobileScrollRatio] = useState(1);
   const [mobileScrollAvailable, setMobileScrollAvailable] = useState(false);
   const [mobileScrollDragging, setMobileScrollDragging] = useState(false);
   const [viewerViewportSize, setViewerViewportSize] = useState<{ width: number; height: number } | undefined>(undefined);
   const [viewerContentSize, setViewerContentSize] = useState<{ width: number; height: number } | undefined>(undefined);
+  const scrollToBottom = () => {
+    const terminal = terminalRef.current;
+    const activeBuffer = terminal?.buffer?.active;
+    if (terminal && activeBuffer) {
+      terminal.scrollToLine(Math.max(0, activeBuffer.baseY));
+    }
+    const scrollport = scrollportRef.current;
+    if (!scrollport) {
+      return;
+    }
+    scrollport.scrollTop = Math.max(0, scrollport.scrollHeight - scrollport.clientHeight);
+  };
+  const scheduleScrollToBottom = () => {
+    if (bottomScrollFrameRef.current !== undefined) {
+      return;
+    }
+    bottomScrollFrameRef.current = window.requestAnimationFrame(() => {
+      bottomScrollFrameRef.current = undefined;
+      scrollToBottom();
+      // resize 后浏览器会在下一帧才稳定 scrollHeight；再贴底一次避免停在顶部。
+      bottomScrollFrameRef.current = window.requestAnimationFrame(() => {
+        bottomScrollFrameRef.current = undefined;
+        scrollToBottom();
+      });
+    });
+  };
+  const showCopyToast = () => {
+    setCopyToastVisible(true);
+    if (copyToastTimerRef.current !== undefined) {
+      window.clearTimeout(copyToastTimerRef.current);
+    }
+    // 自动复制是瞬时反馈，短暂保留提示即可，避免长期遮挡终端内容。
+    copyToastTimerRef.current = window.setTimeout(() => {
+      copyToastTimerRef.current = undefined;
+      setCopyToastVisible(false);
+    }, 1400);
+  };
   const fitViewerToScrollport = () => {
     viewerAutoFitRef.current = true;
     setViewerScale((current) => fitScaleForViewer(scrollportRef.current, frameRef.current, current));
+    scheduleScrollToBottom();
   };
   const setManualViewerScale = (updater: (scale: number) => number) => {
     viewerAutoFitRef.current = false;
@@ -226,15 +269,20 @@ export function TerminalPane(props: TerminalPaneProps) {
     viewerRows,
   ]);
 
+  useLayoutEffect(() => {
+    if (!resolutionMismatch) {
+      return;
+    }
+    scheduleScrollToBottom();
+  }, [effectiveViewerScale, resolutionMismatch, viewerContentHeight, viewerRows]);
+
   useEffect(() => {
     resizeRef.current?.(focused ? "focus" : "layout");
   }, [focused]);
 
   useEffect(() => {
     sessionSizeRef.current = props.sessionSize;
-    if (!focusedRef.current) {
-      resizeRef.current?.("viewer");
-    }
+    resizeRef.current?.(focusedRef.current ? "session" : "viewer");
   }, [props.sessionSize?.cols, props.sessionSize?.pixel_height, props.sessionSize?.pixel_width, props.sessionSize?.rows]);
 
   const requestCursorReportFrame = () => {
@@ -411,6 +459,9 @@ export function TerminalPane(props: TerminalPaneProps) {
     }
     terminalRef.current?.focus();
     resizeRef.current?.("focus");
+    // 从 viewer 回到 operator 时，xterm 和外层 scrollport 会连续重排；点击后立即贴底，
+    // 避免浏览器把滚动位置恢复到顶部。
+    scheduleScrollToBottom();
   };
 
   useEffect(() => {
@@ -474,6 +525,17 @@ export function TerminalPane(props: TerminalPaneProps) {
     const cursorMoveSubscription = terminal.onCursorMove(() => queueCursorReport());
     const writeParsedSubscription = terminal.onWriteParsed(() => queueCursorReport());
     const scrollSubscription = terminal.onScroll(() => scheduleMobileScrollPosition());
+    const selectionSubscription = terminal.onSelectionChange(() => {
+      if (!terminal.hasSelection()) {
+        return;
+      }
+      const selection = terminal.getSelection();
+      if (!selection) {
+        return;
+      }
+      // xterm 原生选择完成后同步复制到系统剪贴板；复制失败时不打断终端交互。
+      void navigator.clipboard?.writeText(selection).then(showCopyToast).catch(() => undefined);
+    });
     // 本地 xterm 始终适配当前容器；只有聚焦客户端才把尺寸写回 shared PTY。
     // 未聚焦客户端按 session 的远端 rows/cols 渲染，外层 viewer panel 负责缩放与滚动。
     const resize = (source: ResizeSource = "layout") => {
@@ -525,30 +587,19 @@ export function TerminalPane(props: TerminalPaneProps) {
           proposed &&
           (remoteSize.rows !== proposed.rows || remoteSize.cols !== proposed.cols),
       );
-      if (focusedRef.current && source !== "focus" && mismatch) {
-        // 浏览器窗口 resize 或外层布局变化不是用户主动接管终端；一旦本地可容纳尺寸
-        // 和当前 PTY 尺寸不一致，就退回 viewer，避免 focus/blur 与 session_resize 来回振荡。
-        focusActivationArmedRef.current = false;
-        suppressPassiveFocusRef.current = true;
-        focusedRef.current = false;
-        setFocused(false);
-        const activeElement = document.activeElement;
-        if (activeElement instanceof HTMLElement && terminalHost.contains(activeElement)) {
-          activeElement.blur();
-        }
-        queueCursorReport({ immediate: true });
-      }
       viewerModeRef.current = !focusedRef.current && mismatch;
       if (!focusedRef.current) {
         applyFontSize(terminal, TERMINAL_FONT_SIZE);
         if (remoteSize) {
           if (sameTerminalDimensions(terminal, remoteSize)) {
             updateViewerContentSize();
+            scheduleScrollToBottom();
             queueCursorReport({ immediate: true });
             return;
           }
           terminal.resize(remoteSize.cols, remoteSize.rows);
           updateViewerContentSize();
+          scheduleScrollToBottom();
           queueCursorReport({ immediate: true });
           return;
         }
@@ -558,14 +609,19 @@ export function TerminalPane(props: TerminalPaneProps) {
       // 这种尺寸不能写回 shared PTY，否则其他客户端会被同步成一行终端。
       if (proposed && proposed.rows >= MIN_FOCUSED_RESIZE_ROWS && proposed.cols >= MIN_FOCUSED_RESIZE_COLS) {
         viewerModeRef.current = false;
-        if (
-          sessionSizeRef.current?.rows === proposed.rows &&
-          sessionSizeRef.current?.cols === proposed.cols
-        ) {
+        const approvedBySession =
+          remoteSize?.rows === proposed.rows &&
+          remoteSize?.cols === proposed.cols;
+        if (approvedBySession) {
+          if (source === "session" || !sameTerminalDimensions(terminal, proposed)) {
+            fit.fit();
+          }
+          scheduleScrollToBottom();
           queueCursorReport({ immediate: true });
           return;
         }
-        fit.fit();
+        // 聚焦状态下只向 daemon 请求新尺寸；在收到 session_resized 并更新
+        // sessionSize 之前，不主动调整本地 xterm，避免前端和 daemon 状态分叉。
         onResizeRef.current({
           rows: proposed.rows,
           cols: proposed.cols,
@@ -653,12 +709,26 @@ export function TerminalPane(props: TerminalPaneProps) {
       schedulePendingWrite();
     };
     stabilizeRef.current = stabilizeTerminal;
+    const clearPendingFocusOut = () => {
+      if (focusOutTimerRef.current === undefined) {
+        return;
+      }
+      window.clearTimeout(focusOutTimerRef.current);
+      focusOutTimerRef.current = undefined;
+    };
     const reportFocus = (focused: boolean) => {
+      if (focusedRef.current === focused) {
+        return;
+      }
       focusedRef.current = focused;
       setFocused(focused);
+      if (!focused) {
+        suppressPassiveFocusRef.current = true;
+      }
       queueCursorReport({ immediate: true });
     };
     const handleFocusIn = () => {
+      clearPendingFocusOut();
       if (suppressPassiveFocusRef.current && !focusActivationArmedRef.current) {
         focusedRef.current = false;
         setFocused(false);
@@ -672,10 +742,21 @@ export function TerminalPane(props: TerminalPaneProps) {
       focusActivationArmedRef.current = false;
       suppressPassiveFocusRef.current = false;
       reportFocus(true);
+      // 主动点击或程序 focus 回到终端时默认看最新输出，尤其覆盖 viewer resize 后的回聚焦路径。
+      scheduleScrollToBottom();
     };
     const handleFocusOut = () => {
       focusActivationArmedRef.current = false;
-      reportFocus(false);
+      if (!focusedRef.current || focusOutTimerRef.current !== undefined) {
+        return;
+      }
+      // 浏览器窗口 resize、移动端视觉视口变化和 xterm 内部重排都可能短暂触发
+      // focusout -> focusin。延迟确认失焦，避免把这种瞬时 DOM 抖动上报成
+      // operator 在 focused/blurred 之间来回切换。
+      focusOutTimerRef.current = window.setTimeout(() => {
+        focusOutTimerRef.current = undefined;
+        reportFocus(false);
+      }, FOCUS_OUT_SETTLE_MS);
     };
     host.addEventListener("focusin", handleFocusIn);
     host.addEventListener("focusout", handleFocusOut);
@@ -722,6 +803,18 @@ export function TerminalPane(props: TerminalPaneProps) {
         window.clearTimeout(cursorReportTimerRef.current);
         cursorReportTimerRef.current = undefined;
       }
+      if (focusOutTimerRef.current !== undefined) {
+        window.clearTimeout(focusOutTimerRef.current);
+        focusOutTimerRef.current = undefined;
+      }
+      if (copyToastTimerRef.current !== undefined) {
+        window.clearTimeout(copyToastTimerRef.current);
+        copyToastTimerRef.current = undefined;
+      }
+      if (bottomScrollFrameRef.current !== undefined) {
+        window.cancelAnimationFrame(bottomScrollFrameRef.current);
+        bottomScrollFrameRef.current = undefined;
+      }
       lastCursorReportAtRef.current = 0;
       if (mobileScrollFrameRef.current !== undefined) {
         window.cancelAnimationFrame(mobileScrollFrameRef.current);
@@ -741,6 +834,7 @@ export function TerminalPane(props: TerminalPaneProps) {
       cursorMoveSubscription.dispose();
       writeParsedSubscription.dispose();
       scrollSubscription.dispose();
+      selectionSubscription.dispose();
       terminal.dispose();
       // 清理 host 里的旧 xterm DOM，避免切换 session 后旧终端明文或隐藏 textarea 残留。
       host.replaceChildren();
@@ -758,8 +852,9 @@ export function TerminalPane(props: TerminalPaneProps) {
       clientSizeRef.current = undefined;
       viewerModeRef.current = false;
       focusActivationArmedRef.current = false;
-      suppressPassiveFocusRef.current = false;
+      suppressPassiveFocusRef.current = true;
       setFocused(false);
+      setCopyToastVisible(false);
       setMobileScrollRatio(1);
       setMobileScrollAvailable(false);
       setMobileScrollDragging(false);
@@ -874,6 +969,11 @@ export function TerminalPane(props: TerminalPaneProps) {
           </div>
         </div>
       </div>
+      {copyToastVisible ? (
+        <div className="terminal-copy-toast" role="status" aria-live="polite">
+          复制成功
+        </div>
+      ) : null}
       {props.attached && mobileScrollAvailable ? (
         <div className={mobileScrollDragging ? "terminal-mobile-scroll-track dragging" : "terminal-mobile-scroll-track"}>
           <button

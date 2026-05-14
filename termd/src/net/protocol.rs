@@ -4,27 +4,36 @@
 //! 操作。Axum 只负责把网络帧转成这里的统一 envelope。
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::env;
 use std::fs;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use base64::{Engine as _, engine::general_purpose};
+use base64::{
+    Engine as _,
+    engine::general_purpose::{self, URL_SAFE_NO_PAD},
+};
+use rand_core::{OsRng, RngCore};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use termd_proto::{
     AttachRole, AuthChallengePayload, AuthPayload, ClientHelloPayload, ClientId,
     ControlGrantPayload, ControlRequestPayload, DaemonClientForgetPayload,
     DaemonClientForgotPayload, DaemonClientSummaryPayload, DaemonClientsPayload,
-    DaemonClientsResultPayload, DeviceId, E2eeKeyExchangePayload, EncryptedFramePayload, Envelope,
-    ErrorPayload, HelloPayload, MessageType, Nonce, PairRequestPayload, PingPayload, PongPayload,
-    ProtocolVersion, ServerId, SessionAttachPayload, SessionAttachedPayload, SessionClosePayload,
+    DaemonClientsResultPayload, DaemonStatusPayload, DaemonStatusResultPayload, DeviceId,
+    E2eeKeyExchangePayload, EncryptedFramePayload, Envelope, ErrorPayload, HelloPayload,
+    MessageType, Nonce, PairRequestPayload, PingPayload, PongPayload, ProtocolVersion, ServerId,
+    SessionActivityPayload, SessionAttachPayload, SessionAttachedPayload, SessionClosePayload,
     SessionClosedPayload, SessionCreatePayload, SessionCreatedPayload, SessionCursorPayload,
     SessionDataPayload, SessionFileDeletePayload, SessionFileDeletedPayload,
-    SessionFileEntryPayload, SessionFileKind, SessionFileReadPayload, SessionFileReadResultPayload,
-    SessionFileWritePayload, SessionFileWrittenPayload, SessionFilesPayload,
-    SessionFilesResultPayload, SessionId, SessionListPayload, SessionListResultPayload,
-    SessionRenamePayload, SessionRenamedPayload, SessionResizePayload, SessionState,
-    SessionSummaryPayload, TerminalSize, UnixTimestampMillis,
+    SessionFileDownloadChunkPayload, SessionFileDownloadChunkResultPayload,
+    SessionFileDownloadPreparePayload, SessionFileDownloadReadyPayload, SessionFileEntryPayload,
+    SessionFileKind, SessionFileReadPayload, SessionFileReadResultPayload, SessionFileWritePayload,
+    SessionFileWrittenPayload, SessionFilesPayload, SessionFilesResultPayload, SessionId,
+    SessionListPayload, SessionListResultPayload, SessionRenamePayload, SessionRenamedPayload,
+    SessionResizePayload, SessionResizedPayload, SessionState, SessionSummaryPayload, TerminalSize,
+    UnixTimestampMillis,
 };
 use thiserror::Error;
 use tokio::sync::watch;
@@ -57,6 +66,9 @@ const AUTH_CHALLENGE_TTL_MS: u64 = 60_000;
 const LIVE_OUTPUT_MIN_BYTES: usize = 16 * 1024;
 const LIVE_OUTPUT_BYTES_PER_CELL: usize = 8;
 const LIVE_OUTPUT_DRAIN_MAX_CHUNKS: usize = 64;
+const SESSION_FILE_DOWNLOAD_TOKEN_TTL_MS: u64 = 60_000;
+const SESSION_FILE_DOWNLOAD_GRANT_LIMIT: usize = 128;
+const SESSION_FILE_DOWNLOAD_CHUNK_MAX_BYTES: u32 = 256 * 1024;
 
 /// 协议层统一使用的 JSON envelope。
 pub type JsonEnvelope = Envelope<Value>;
@@ -84,6 +96,19 @@ struct DaemonClientRecord {
 struct RestoredSessionMetadata {
     name: Option<String>,
     root_path: PathBuf,
+}
+
+/// HTTP 文件下载的一次性授权。
+///
+/// token 只存在 daemon 内存中，必须先通过 E2EE WebSocket 申请；HTTP 层只消费 token
+/// 并流式读取文件，不接收任意路径参数，避免把文件权限逻辑散落到 Axum handler。
+#[derive(Debug, Clone)]
+pub struct SessionFileDownloadGrant {
+    pub path: PathBuf,
+    pub download_name: String,
+    pub size_bytes: u64,
+    pub modified_at_ms: Option<UnixTimestampMillis>,
+    pub expires_at_ms: UnixTimestampMillis,
 }
 
 /// session 级输出回放窗口。
@@ -251,6 +276,7 @@ pub struct DaemonProtocol<B: PtyBackend, V> {
     session_index: HashMap<SessionId, String>,
     session_names: HashMap<SessionId, String>,
     session_roots: HashMap<SessionId, PathBuf>,
+    session_file_downloads: HashMap<String, SessionFileDownloadGrant>,
     daemon_clients: HashMap<DeviceId, DaemonClientRecord>,
     client_history: ClientHistoryStore,
     session_output_history: HashMap<SessionId, SessionOutputHistory>,
@@ -341,6 +367,7 @@ where
             session_index: HashMap::new(),
             session_names: HashMap::new(),
             session_roots: HashMap::new(),
+            session_file_downloads: HashMap::new(),
             daemon_clients: HashMap::new(),
             client_history,
             session_output_history: HashMap::new(),
@@ -755,7 +782,13 @@ where
         )?;
         self.persist_state()?;
 
-        Ok(Vec::new())
+        Ok(vec![envelope_value(
+            MessageType::SessionResized,
+            SessionResizedPayload {
+                session_id: payload.session_id,
+                size: payload.size,
+            },
+        )?])
     }
 
     fn record_session_cursor(
@@ -806,6 +839,7 @@ where
         payload: SessionRenamePayload,
     ) -> Result<Vec<JsonEnvelope>, ProtocolError> {
         connection.authenticated_device_id()?;
+        connection.ensure_attached_to(payload.session_id)?;
         if !self.session_index.contains_key(&payload.session_id) {
             return Err(ProtocolError::SessionNotFound);
         }
@@ -889,6 +923,7 @@ where
         payload: SessionFilesPayload,
     ) -> Result<Vec<JsonEnvelope>, ProtocolError> {
         connection.authenticated_device_id()?;
+        connection.ensure_attached_to(payload.session_id)?;
         if !self.session_index.contains_key(&payload.session_id) {
             return Err(ProtocolError::SessionNotFound);
         }
@@ -920,6 +955,7 @@ where
         payload: SessionFileReadPayload,
     ) -> Result<Vec<JsonEnvelope>, ProtocolError> {
         connection.authenticated_device_id()?;
+        connection.ensure_attached_to(payload.session_id)?;
         if !self.session_index.contains_key(&payload.session_id) {
             return Err(ProtocolError::SessionNotFound);
         }
@@ -952,6 +988,7 @@ where
         payload: SessionFileWritePayload,
     ) -> Result<Vec<JsonEnvelope>, ProtocolError> {
         connection.authenticated_device_id()?;
+        connection.ensure_attached_to(payload.session_id)?;
         if !self.session_index.contains_key(&payload.session_id) {
             return Err(ProtocolError::SessionNotFound);
         }
@@ -988,6 +1025,7 @@ where
         payload: SessionFileDeletePayload,
     ) -> Result<Vec<JsonEnvelope>, ProtocolError> {
         connection.authenticated_device_id()?;
+        connection.ensure_attached_to(payload.session_id)?;
         if !self.session_index.contains_key(&payload.session_id) {
             return Err(ProtocolError::SessionNotFound);
         }
@@ -1013,6 +1051,130 @@ where
                 path: absolute_path_string(&target),
             },
         )?])
+    }
+
+    fn prepare_session_file_download(
+        &mut self,
+        connection: &ProtocolConnection,
+        payload: SessionFileDownloadPreparePayload,
+    ) -> Result<Vec<JsonEnvelope>, ProtocolError> {
+        connection.authenticated_device_id()?;
+        connection.ensure_attached_to(payload.session_id)?;
+        if !self.session_index.contains_key(&payload.session_id) {
+            return Err(ProtocolError::SessionNotFound);
+        }
+        let root = self
+            .session_roots
+            .get(&payload.session_id)
+            .ok_or(ProtocolError::SessionNotFound)?;
+        let target = resolve_existing_session_file_target(root, &payload.path)?;
+        let metadata = fs::metadata(&target).map_err(map_file_path_error)?;
+        if metadata.is_dir() {
+            return Err(ProtocolError::InvalidEnvelope);
+        }
+
+        let now_ms = current_unix_timestamp_millis();
+        self.expire_session_file_downloads(now_ms);
+        if self.session_file_downloads.len() >= SESSION_FILE_DOWNLOAD_GRANT_LIMIT {
+            // token 只作为兼容旧前端的准备信号；限制数量，避免认证客户端刷爆内存。
+            return Err(ProtocolError::InvalidState);
+        }
+        let token = session_file_download_token();
+        let expires_at_ms =
+            UnixTimestampMillis(now_ms.0.saturating_add(SESSION_FILE_DOWNLOAD_TOKEN_TTL_MS));
+        let modified_at_ms = metadata_modified_at_ms(&metadata);
+        let path = absolute_path_string(&target);
+        self.session_file_downloads.insert(
+            token.clone(),
+            SessionFileDownloadGrant {
+                path: target.clone(),
+                download_name: session_file_download_name(&target),
+                size_bytes: metadata.len(),
+                modified_at_ms,
+                expires_at_ms,
+            },
+        );
+
+        Ok(vec![envelope_value(
+            MessageType::SessionFileDownloadReady,
+            SessionFileDownloadReadyPayload {
+                session_id: payload.session_id,
+                path,
+                token,
+                size_bytes: metadata.len(),
+                modified_at_ms,
+                expires_at_ms,
+            },
+        )?])
+    }
+
+    fn read_session_file_download_chunk(
+        &mut self,
+        connection: &ProtocolConnection,
+        payload: SessionFileDownloadChunkPayload,
+    ) -> Result<Vec<JsonEnvelope>, ProtocolError> {
+        connection.authenticated_device_id()?;
+        connection.ensure_attached_to(payload.session_id)?;
+        if payload.max_bytes == 0 {
+            return Err(ProtocolError::InvalidEnvelope);
+        }
+        if !self.session_index.contains_key(&payload.session_id) {
+            return Err(ProtocolError::SessionNotFound);
+        }
+        let root = self
+            .session_roots
+            .get(&payload.session_id)
+            .ok_or(ProtocolError::SessionNotFound)?;
+        let target = resolve_existing_session_file_target(root, &payload.path)?;
+        let metadata = fs::metadata(&target).map_err(map_file_path_error)?;
+        if metadata.is_dir() {
+            return Err(ProtocolError::InvalidEnvelope);
+        }
+
+        let read_len = payload.max_bytes.min(SESSION_FILE_DOWNLOAD_CHUNK_MAX_BYTES) as usize;
+        let mut file = fs::File::open(&target).map_err(map_file_path_error)?;
+        file.seek(SeekFrom::Start(payload.offset_bytes))
+            .map_err(map_file_path_error)?;
+        let mut bytes = vec![0_u8; read_len];
+        let read = file.read(&mut bytes).map_err(map_file_path_error)?;
+        bytes.truncate(read);
+        let next_offset_bytes = payload.offset_bytes.saturating_add(read as u64);
+        let size_bytes = metadata.len();
+
+        Ok(vec![envelope_value(
+            MessageType::SessionFileDownloadChunkResult,
+            SessionFileDownloadChunkResultPayload {
+                session_id: payload.session_id,
+                path: absolute_path_string(&target),
+                offset_bytes: payload.offset_bytes,
+                data_base64: general_purpose::STANDARD.encode(bytes),
+                next_offset_bytes,
+                size_bytes,
+                eof: read == 0 || next_offset_bytes >= size_bytes,
+                modified_at_ms: metadata_modified_at_ms(&metadata),
+            },
+        )?])
+    }
+
+    pub fn consume_session_file_download(
+        &mut self,
+        token: &str,
+        now_ms: UnixTimestampMillis,
+    ) -> Result<SessionFileDownloadGrant, ProtocolError> {
+        self.expire_session_file_downloads(now_ms);
+        let grant = self
+            .session_file_downloads
+            .remove(token)
+            .ok_or(ProtocolError::InvalidEnvelope)?;
+        if grant.expires_at_ms <= now_ms {
+            return Err(ProtocolError::InvalidEnvelope);
+        }
+        Ok(grant)
+    }
+
+    fn expire_session_file_downloads(&mut self, now_ms: UnixTimestampMillis) {
+        self.session_file_downloads
+            .retain(|_, grant| grant.expires_at_ms > now_ms);
     }
 
     fn request_control(
@@ -1229,6 +1391,20 @@ where
             DaemonClientForgotPayload {
                 device_id: payload.device_id,
             },
+        )?])
+    }
+
+    fn daemon_status(
+        &mut self,
+        connection: &ProtocolConnection,
+        _payload: DaemonStatusPayload,
+    ) -> Result<Vec<JsonEnvelope>, ProtocolError> {
+        // daemon 状态暴露主机资源信息，只允许已认证设备在 E2EE 内层读取。
+        connection.authenticated_device_id()?;
+
+        Ok(vec![envelope_value(
+            MessageType::DaemonStatusResult,
+            collect_daemon_status(),
         )?])
     }
 
@@ -1763,6 +1939,193 @@ fn stable_client_id_for_device(device_id: DeviceId) -> ClientId {
     ClientId(device_id.0)
 }
 
+fn collect_daemon_status() -> DaemonStatusResultPayload {
+    let (memory_total_bytes, memory_available_bytes) = read_memory_status();
+    let (disk_total_bytes, disk_available_bytes) = read_root_disk_status();
+
+    DaemonStatusResultPayload {
+        host_name: read_host_name(),
+        load_avg: read_load_avg(),
+        uptime_seconds: read_uptime_seconds(),
+        cpu_percent: read_cpu_percent_snapshot(),
+        memory_total_bytes,
+        memory_available_bytes,
+        disk_total_bytes,
+        disk_available_bytes,
+        process_count: read_process_count(),
+        atop_available: command_available("atop"),
+    }
+}
+
+fn read_host_name() -> Option<String> {
+    // Linux 优先走 /proc，非 Linux 或容器裁剪环境下回退到 HOSTNAME 环境变量。
+    fs::read_to_string("/proc/sys/kernel/hostname")
+        .ok()
+        .and_then(|value| non_empty_trimmed(value))
+        .or_else(|| env::var("HOSTNAME").ok().and_then(non_empty_trimmed))
+}
+
+fn read_load_avg() -> [f64; 3] {
+    let Some(raw) = fs::read_to_string("/proc/loadavg").ok() else {
+        return [0.0, 0.0, 0.0];
+    };
+    let mut parts = raw.split_whitespace();
+    [
+        parts
+            .next()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0.0),
+        parts
+            .next()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0.0),
+        parts
+            .next()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0.0),
+    ]
+}
+
+fn read_uptime_seconds() -> u64 {
+    fs::read_to_string("/proc/uptime")
+        .ok()
+        .and_then(|raw| raw.split_whitespace().next()?.parse::<f64>().ok())
+        .map(|seconds| seconds.max(0.0) as u64)
+        .unwrap_or(0)
+}
+
+fn read_memory_status() -> (u64, u64) {
+    let Some(raw) = fs::read_to_string("/proc/meminfo").ok() else {
+        return (0, 0);
+    };
+    let mut total = 0;
+    let mut available = 0;
+    for line in raw.lines() {
+        if let Some(value) = line.strip_prefix("MemTotal:") {
+            total = parse_meminfo_kib(value);
+        } else if let Some(value) = line.strip_prefix("MemAvailable:") {
+            available = parse_meminfo_kib(value);
+        }
+    }
+    (total, available)
+}
+
+fn parse_meminfo_kib(value: &str) -> u64 {
+    value
+        .split_whitespace()
+        .next()
+        .and_then(|part| part.parse::<u64>().ok())
+        .unwrap_or(0)
+        .saturating_mul(1024)
+}
+
+fn read_cpu_percent_snapshot() -> f32 {
+    let Some(sample) = read_cpu_sample() else {
+        return 0.0;
+    };
+    if sample.total == 0 {
+        return 0.0;
+    }
+    let busy = sample.total.saturating_sub(sample.idle);
+    // 状态面板不能在 protocol mutex 下 sleep 采样；这里展示启动以来的粗略占用率。
+    ((busy as f64 / sample.total as f64) * 100.0).clamp(0.0, 100.0) as f32
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CpuSample {
+    total: u64,
+    idle: u64,
+}
+
+fn read_cpu_sample() -> Option<CpuSample> {
+    let raw = fs::read_to_string("/proc/stat").ok()?;
+    let cpu_line = raw.lines().find(|line| line.starts_with("cpu "))?;
+    let values: Vec<u64> = cpu_line
+        .split_whitespace()
+        .skip(1)
+        .filter_map(|part| part.parse().ok())
+        .collect();
+    if values.is_empty() {
+        return None;
+    }
+    let idle = values.get(3).copied().unwrap_or(0) + values.get(4).copied().unwrap_or(0);
+    Some(CpuSample {
+        total: values.iter().copied().sum(),
+        idle,
+    })
+}
+
+fn read_process_count() -> u64 {
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return 0;
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .bytes()
+                .all(|byte| byte.is_ascii_digit())
+        })
+        .count() as u64
+}
+
+#[cfg(unix)]
+fn read_root_disk_status() -> (u64, u64) {
+    use std::ffi::CString;
+
+    let Ok(path) = CString::new("/") else {
+        return (0, 0);
+    };
+    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // statvfs 只读取根文件系统元数据；失败时按不可用降级，不影响协议主流程。
+    let rc = unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) };
+    if rc != 0 {
+        return (0, 0);
+    }
+    let stats = unsafe { stats.assume_init() };
+    let block_size = stats.f_frsize.max(stats.f_bsize);
+    (
+        (stats.f_blocks as u64).saturating_mul(block_size as u64),
+        (stats.f_bavail as u64).saturating_mul(block_size as u64),
+    )
+}
+
+#[cfg(not(unix))]
+fn read_root_disk_status() -> (u64, u64) {
+    (0, 0)
+}
+
+fn command_available(command: &str) -> bool {
+    let Some(paths) = env::var_os("PATH") else {
+        return false;
+    };
+    env::split_paths(&paths).any(|dir| {
+        let candidate = dir.join(command);
+        let Ok(metadata) = fs::metadata(candidate) else {
+            return false;
+        };
+        if !metadata.is_file() {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            metadata.permissions().mode() & 0o111 != 0
+        }
+        #[cfg(not(unix))]
+        {
+            true
+        }
+    })
+}
+
+fn non_empty_trimmed(value: String) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
 fn restored_session_metadata_from_record(record: &SessionHistoryRecord) -> RestoredSessionMetadata {
     RestoredSessionMetadata {
         name: record.name.clone(),
@@ -1995,6 +2358,35 @@ impl ProtocolConnection {
             .collect()
     }
 
+    /// 返回当前连接可订阅的 session 活动信号。
+    ///
+    /// activity 只告诉前端“这个 session 有新输出”，不读取 PTY 内容；这样后台 session
+    /// 可以在列表里变色，同时避免为了提示而把大块终端输出推给非当前 xterm。
+    pub fn session_activity_signals<B, V>(
+        &self,
+        protocol: &DaemonProtocol<B, V>,
+    ) -> Vec<(SessionId, watch::Receiver<u64>)>
+    where
+        B: PtyBackend,
+        V: SignatureVerifier,
+    {
+        if self.state != ProtocolConnectionState::Attached || !self.is_authenticated() {
+            return Vec::new();
+        }
+
+        protocol
+            .session_index
+            .keys()
+            .filter_map(|session_id| {
+                protocol
+                    .output_signal(*session_id)
+                    .ok()
+                    .flatten()
+                    .map(|signal| (*session_id, signal))
+            })
+            .collect()
+    }
+
     /// 返回当前连接已 attach session 的文件树信号，供 WebSocket 层注册主动推送 watcher。
     pub fn attached_file_tree_signals<B, V>(
         &self,
@@ -2122,6 +2514,48 @@ impl ProtocolConnection {
         self.encrypt_inner_messages(messages)
     }
 
+    /// 发送后台 session 活动通知。
+    ///
+    /// 这里不调用 `drain_runtime_output_to_history`，避免 activity watcher 消费掉之后 attach
+    /// 需要回放的 PTY 输出；真正内容仍由用户打开该 session 时走常规 attach/read 路径。
+    pub fn read_session_activity<B, V>(
+        &mut self,
+        protocol: &mut DaemonProtocol<B, V>,
+        session_id: SessionId,
+    ) -> Vec<JsonEnvelope>
+    where
+        B: PtyBackend,
+        V: SignatureVerifier,
+    {
+        match self.try_read_session_activity(protocol, session_id) {
+            Ok(messages) => messages,
+            Err(error) => vec![self.error_response(error)],
+        }
+    }
+
+    fn try_read_session_activity<B, V>(
+        &mut self,
+        protocol: &mut DaemonProtocol<B, V>,
+        session_id: SessionId,
+    ) -> Result<Vec<JsonEnvelope>, ProtocolError>
+    where
+        B: PtyBackend,
+        V: SignatureVerifier,
+    {
+        self.authenticated_device_id()?;
+        if !protocol.session_index.contains_key(&session_id) {
+            return Err(ProtocolError::SessionNotFound);
+        }
+
+        self.encrypt_inner_messages(vec![envelope_value(
+            MessageType::SessionActivity,
+            SessionActivityPayload {
+                session_id,
+                timestamp_ms: current_unix_timestamp_millis(),
+            },
+        )?])
+    }
+
     fn collect_retained_output_chunks<B, V>(
         &mut self,
         protocol: &mut DaemonProtocol<B, V>,
@@ -2243,6 +2677,14 @@ impl ProtocolConnection {
                 let payload = decode_payload(envelope.payload)?;
                 protocol.delete_session_file(self, payload)
             }
+            MessageType::SessionFileDownloadPrepare => {
+                let payload = decode_payload(envelope.payload)?;
+                protocol.prepare_session_file_download(self, payload)
+            }
+            MessageType::SessionFileDownloadChunk => {
+                let payload = decode_payload(envelope.payload)?;
+                protocol.read_session_file_download_chunk(self, payload)
+            }
             MessageType::ControlRequest => {
                 let payload = decode_payload(envelope.payload)?;
                 protocol.request_control(self, payload)
@@ -2258,6 +2700,10 @@ impl ProtocolConnection {
             MessageType::DaemonClientForget => {
                 let payload = decode_payload(envelope.payload)?;
                 protocol.forget_daemon_client(self, payload)
+            }
+            MessageType::DaemonStatus => {
+                let payload = decode_payload(envelope.payload)?;
+                protocol.daemon_status(self, payload)
             }
             MessageType::Ping => {
                 let payload: PingPayload = decode_payload(envelope.payload)?;
@@ -2430,7 +2876,9 @@ fn resolve_existing_session_file_target(
         root.join(requested)
     };
 
-    candidate.canonicalize().map_err(map_file_path_error)
+    let target = candidate.canonicalize().map_err(map_file_path_error)?;
+    ensure_path_inside_root(root, &target)?;
+    Ok(target)
 }
 
 fn resolve_writable_session_file_target(
@@ -2455,8 +2903,28 @@ fn resolve_writable_session_file_target(
         return Err(ProtocolError::InvalidEnvelope);
     };
     let parent = parent.canonicalize().map_err(map_file_path_error)?;
+    ensure_path_inside_root(root, &parent)?;
+    let target = parent.join(file_name);
+    match fs::symlink_metadata(&target) {
+        Ok(_) => {
+            // 写入会跟随 symlink；已存在目标必须先解析真实路径，避免 root 内 symlink 写到 root 外。
+            let real_target = target.canonicalize().map_err(map_file_path_error)?;
+            ensure_path_inside_root(root, &real_target)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(map_file_path_error(error)),
+    }
 
-    Ok(parent.join(file_name))
+    Ok(target)
+}
+
+fn ensure_path_inside_root(root: &Path, target: &Path) -> Result<(), ProtocolError> {
+    let root = root.canonicalize().map_err(map_file_path_error)?;
+    // 文件面板是 session 工作目录视图；即使客户端传绝对路径或 symlink，也不能越过 root。
+    if target.starts_with(&root) {
+        return Ok(());
+    }
+    Err(ProtocolError::InvalidEnvelope)
 }
 
 fn read_session_file_entries(
@@ -2526,6 +2994,19 @@ fn session_file_kind_rank(kind: SessionFileKind) -> u8 {
         SessionFileKind::Symlink => 2,
         SessionFileKind::Other => 3,
     }
+}
+
+fn session_file_download_token() -> String {
+    let mut bytes = [0_u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+fn session_file_download_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().trim().to_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "download".to_owned())
 }
 
 fn metadata_modified_at_ms(metadata: &fs::Metadata) -> Option<UnixTimestampMillis> {
@@ -2673,8 +3154,8 @@ mod tests {
     use termd_proto::{
         PairAcceptPayload, PairingToken, PublicKey, SessionFileDeletePayload,
         SessionFileDeletedPayload, SessionFileKind, SessionFileReadPayload,
-        SessionFileReadResultPayload, SessionFileWritePayload, SessionFileWrittenPayload,
-        SessionFilesPayload, SessionFilesResultPayload, Signature,
+        SessionFileWritePayload, SessionFileWrittenPayload, SessionFilesPayload,
+        SessionFilesResultPayload, Signature,
     };
 
     use super::*;
@@ -3632,6 +4113,28 @@ mod tests {
     }
 
     #[test]
+    fn daemon_status_requires_authentication_and_returns_snapshot() {
+        let (mut protocol, _) = protocol();
+        let mut connection = ProtocolConnection::new(None);
+
+        assert!(matches!(
+            protocol.daemon_status(&connection, DaemonStatusPayload {}),
+            Err(ProtocolError::Unauthenticated)
+        ));
+
+        connection.authenticated_device_id = Some(DeviceId::new());
+        let response = protocol
+            .daemon_status(&connection, DaemonStatusPayload {})
+            .unwrap();
+        let payload: DaemonStatusResultPayload =
+            decode_payload(response[0].payload.clone()).unwrap();
+
+        assert_eq!(response[0].kind, MessageType::DaemonStatusResult);
+        assert_eq!(payload.load_avg.len(), 3);
+        assert!((0.0..=100.0).contains(&payload.cpu_percent));
+    }
+
+    #[test]
     fn startup_does_not_restore_created_sessions_even_with_restore_info() {
         let backend = FakePtyBackend::default();
         let state_path = temp_state_path("restore-created-session.json");
@@ -4272,6 +4775,65 @@ mod tests {
     }
 
     #[test]
+    fn attached_session_resize_returns_session_resized_ack() {
+        let (mut protocol, _) = protocol();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = PublicKey(wire(signing_key.verifying_key().as_bytes()));
+        let (_, mut device_session) = open_e2ee(&mut protocol, &mut connection, device_id);
+        pair_device(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            device_id,
+            public_key,
+        );
+        let create_responses = send_encrypted(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            envelope_value(
+                MessageType::SessionCreate,
+                SessionCreatePayload {
+                    command: vec!["sh".to_owned()],
+                    size: TerminalSize::new(24, 80),
+                },
+            )
+            .unwrap(),
+        );
+        let created = decrypt_first(&mut device_session, create_responses);
+        let created_payload: SessionCreatedPayload = decode_payload(created.payload).unwrap();
+        let resized_size = TerminalSize {
+            rows: 40,
+            cols: 120,
+            pixel_width: 960,
+            pixel_height: 640,
+        };
+
+        // resize 是有状态操作；客户端必须等这个明确 ack 后才能认为 daemon 已接受尺寸。
+        let resize_responses = send_encrypted(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            envelope_value(
+                MessageType::SessionResize,
+                SessionResizePayload {
+                    session_id: created_payload.session_id,
+                    size: resized_size,
+                },
+            )
+            .unwrap(),
+        );
+        let resized = decrypt_first(&mut device_session, resize_responses);
+        let resized_payload: SessionResizedPayload = decode_payload(resized.payload).unwrap();
+
+        assert_eq!(resized.kind, MessageType::SessionResized);
+        assert_eq!(resized_payload.session_id, created_payload.session_id);
+        assert_eq!(resized_payload.size, resized_size);
+    }
+
+    #[test]
     fn attached_session_can_list_files_from_session_root() {
         let root = temp_state_path("files-root");
         fs::create_dir_all(root.join("src")).unwrap();
@@ -4310,18 +4872,10 @@ mod tests {
         );
         let created = decrypt_first(&mut device_session, create_responses);
         let created_payload: SessionCreatedPayload = decode_payload(created.payload).unwrap();
-        let (mut file_connection, _) = protocol.start_connection();
-        let mut file_crypto = authenticate_paired_connection(
-            &mut protocol,
-            &mut file_connection,
-            device_id,
-            &signing_key,
-        );
-
         let list_responses = send_encrypted(
             &mut protocol,
-            &mut file_connection,
-            &mut file_crypto,
+            &mut connection,
+            &mut device_session,
             envelope_value(
                 MessageType::SessionFiles,
                 SessionFilesPayload {
@@ -4331,7 +4885,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let listed = decrypt_first(&mut file_crypto, list_responses);
+        let listed = decrypt_first(&mut device_session, list_responses);
         let payload: SessionFilesResultPayload = decode_payload(listed.payload).unwrap();
         let entries: Vec<_> = payload
             .entries
@@ -4375,10 +4929,7 @@ mod tests {
     fn session_files_without_path_uses_daemon_persisted_file_tree_position() {
         let base = temp_state_path("shared-files-base");
         let root = base.join("project");
-        let work = base.join("work");
         fs::create_dir_all(&root).unwrap();
-        fs::create_dir_all(&work).unwrap();
-        fs::write(work.join("beta.log"), b"sync\n").unwrap();
         let backend = FakePtyBackend::default();
         let mut config =
             DaemonConfig::default_for_state_path(temp_state_path("shared-files-state.json"));
@@ -4414,23 +4965,6 @@ mod tests {
         let created = decrypt_first(&mut device_session, create_responses);
         let created_payload: SessionCreatedPayload = decode_payload(created.payload).unwrap();
 
-        let first_responses = send_encrypted(
-            &mut protocol,
-            &mut connection,
-            &mut device_session,
-            envelope_value(
-                MessageType::SessionFiles,
-                SessionFilesPayload {
-                    session_id: created_payload.session_id,
-                    path: Some(work.to_string_lossy().to_string()),
-                },
-            )
-            .unwrap(),
-        );
-        let first = decrypt_first(&mut device_session, first_responses);
-        let first_payload: SessionFilesResultPayload = decode_payload(first.payload).unwrap();
-        assert_eq!(first_payload.path, work.to_string_lossy());
-
         let (mut second_connection, _) = protocol.start_connection();
         let mut second_crypto = authenticate_paired_connection(
             &mut protocol,
@@ -4438,6 +4972,37 @@ mod tests {
             device_id,
             &signing_key,
         );
+        let unattached_responses = send_encrypted(
+            &mut protocol,
+            &mut second_connection,
+            &mut second_crypto,
+            envelope_value(
+                MessageType::SessionFiles,
+                SessionFilesPayload {
+                    session_id: created_payload.session_id,
+                    path: None,
+                },
+            )
+            .unwrap(),
+        );
+        let unattached = decrypt_first(&mut second_crypto, unattached_responses);
+        assert_eq!(unattached.kind, MessageType::Error);
+
+        let attach_responses = send_encrypted(
+            &mut protocol,
+            &mut second_connection,
+            &mut second_crypto,
+            envelope_value(
+                MessageType::SessionAttach,
+                SessionAttachPayload {
+                    session_id: created_payload.session_id,
+                },
+            )
+            .unwrap(),
+        );
+        let attached = decrypt_first(&mut second_crypto, attach_responses);
+        assert_eq!(attached.kind, MessageType::SessionAttached);
+
         let second_responses = send_encrypted(
             &mut protocol,
             &mut second_connection,
@@ -4455,8 +5020,7 @@ mod tests {
         let second_payload: SessionFilesResultPayload = decode_payload(second.payload).unwrap();
 
         assert_eq!(second.kind, MessageType::SessionFilesResult);
-        assert_eq!(second_payload.path, work.to_string_lossy());
-        assert_eq!(second_payload.entries[0].name, "beta.log");
+        assert_eq!(second_payload.path, root.to_string_lossy());
 
         fs::remove_dir_all(base).ok();
     }
@@ -4540,7 +5104,7 @@ mod tests {
             .unwrap(),
         );
         let listed = decrypt_first(&mut first_crypto, list_responses);
-        assert_eq!(listed.kind, MessageType::SessionFilesResult);
+        assert_eq!(listed.kind, MessageType::Error);
 
         let pushed = second_connection
             .read_session_file_tree_update(&mut protocol, created_payload.session_id);
@@ -4548,8 +5112,263 @@ mod tests {
         let pushed_payload: SessionFilesResultPayload = decode_payload(pushed.payload).unwrap();
 
         assert_eq!(pushed.kind, MessageType::SessionFilesResult);
-        assert_eq!(pushed_payload.path, work.to_string_lossy());
-        assert_eq!(pushed_payload.entries[0].name, "beta.log");
+        assert_eq!(pushed_payload.path, root.to_string_lossy());
+
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn session_file_download_prepare_returns_one_time_ready_token() {
+        let base = temp_state_path("download-base");
+        let root = base.join("project");
+        let target = root.join("artifact.log");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&target, b"download me\n").unwrap();
+        let backend = FakePtyBackend::default();
+        let mut config =
+            DaemonConfig::default_for_state_path(temp_state_path("download-state.json"));
+        config.default_command = vec!["sh".to_owned()];
+        config.default_working_directory = Some(root.clone());
+        let mut protocol =
+            DaemonProtocol::new(config, backend.clone(), Ed25519SignatureVerifier).unwrap();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = PublicKey(wire(signing_key.verifying_key().as_bytes()));
+        let (_, mut device_session) = open_e2ee(&mut protocol, &mut connection, device_id);
+        pair_device(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            device_id,
+            public_key,
+        );
+        let create_responses = send_encrypted(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            envelope_value(
+                MessageType::SessionCreate,
+                SessionCreatePayload {
+                    command: Vec::new(),
+                    size: TerminalSize::new(24, 80),
+                },
+            )
+            .unwrap(),
+        );
+        let created = decrypt_first(&mut device_session, create_responses);
+        let created_payload: SessionCreatedPayload = decode_payload(created.payload).unwrap();
+
+        // token 仅用于兼容旧前端的准备信号；新下载路径走 E2EE chunk，避免 HTTP 明文。
+        let prepare_responses = send_encrypted(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            envelope_value(
+                MessageType::SessionFileDownloadPrepare,
+                SessionFileDownloadPreparePayload {
+                    session_id: created_payload.session_id,
+                    path: target.to_string_lossy().to_string(),
+                },
+            )
+            .unwrap(),
+        );
+        let ready = decrypt_first(&mut device_session, prepare_responses);
+        let ready_payload: SessionFileDownloadReadyPayload = decode_payload(ready.payload).unwrap();
+
+        assert_eq!(ready.kind, MessageType::SessionFileDownloadReady);
+        assert_eq!(ready_payload.session_id, created_payload.session_id);
+        assert_eq!(ready_payload.path, target.to_string_lossy());
+        assert_eq!(ready_payload.size_bytes, 12);
+        assert!(!ready_payload.token.trim().is_empty());
+
+        let grant = protocol
+            .consume_session_file_download(&ready_payload.token, current_unix_timestamp_millis())
+            .unwrap();
+        assert_eq!(grant.path, target);
+        assert_eq!(grant.download_name, "artifact.log");
+        assert_eq!(grant.size_bytes, 12);
+        assert!(grant.expires_at_ms > current_unix_timestamp_millis());
+        assert!(
+            protocol
+                .consume_session_file_download(
+                    &ready_payload.token,
+                    current_unix_timestamp_millis(),
+                )
+                .is_err(),
+            "download token 被消费后不能再次使用"
+        );
+
+        let chunk_responses = send_encrypted(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            envelope_value(
+                MessageType::SessionFileDownloadChunk,
+                SessionFileDownloadChunkPayload {
+                    session_id: created_payload.session_id,
+                    path: target.to_string_lossy().to_string(),
+                    offset_bytes: 0,
+                    max_bytes: 5,
+                },
+            )
+            .unwrap(),
+        );
+        let chunk = decrypt_first(&mut device_session, chunk_responses);
+        let chunk_payload: SessionFileDownloadChunkResultPayload =
+            decode_payload(chunk.payload).unwrap();
+
+        assert_eq!(chunk.kind, MessageType::SessionFileDownloadChunkResult);
+        assert_eq!(
+            general_purpose::STANDARD
+                .decode(chunk_payload.data_base64)
+                .unwrap(),
+            b"downl"
+        );
+        assert_eq!(chunk_payload.next_offset_bytes, 5);
+        assert!(!chunk_payload.eof);
+        assert!(backend.writes().is_empty());
+
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn session_file_download_prepare_requires_attached_connection() {
+        let base = temp_state_path("download-attach-base");
+        let root = base.join("project");
+        let target = root.join("artifact.log");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&target, b"download me\n").unwrap();
+        let backend = FakePtyBackend::default();
+        let mut config =
+            DaemonConfig::default_for_state_path(temp_state_path("download-attach-state.json"));
+        config.default_command = vec!["sh".to_owned()];
+        config.default_working_directory = Some(root.clone());
+        let mut protocol =
+            DaemonProtocol::new(config, backend.clone(), Ed25519SignatureVerifier).unwrap();
+        let (mut owner_connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = PublicKey(wire(signing_key.verifying_key().as_bytes()));
+        let (_, mut owner_crypto) = open_e2ee(&mut protocol, &mut owner_connection, device_id);
+        pair_device(
+            &mut protocol,
+            &mut owner_connection,
+            &mut owner_crypto,
+            device_id,
+            public_key,
+        );
+        let create_responses = send_encrypted(
+            &mut protocol,
+            &mut owner_connection,
+            &mut owner_crypto,
+            envelope_value(
+                MessageType::SessionCreate,
+                SessionCreatePayload {
+                    command: Vec::new(),
+                    size: TerminalSize::new(24, 80),
+                },
+            )
+            .unwrap(),
+        );
+        let created = decrypt_first(&mut owner_crypto, create_responses);
+        let created_payload: SessionCreatedPayload = decode_payload(created.payload).unwrap();
+
+        let (mut unattached_connection, _) = protocol.start_connection();
+        let mut unattached_crypto = authenticate_paired_connection(
+            &mut protocol,
+            &mut unattached_connection,
+            device_id,
+            &signing_key,
+        );
+        let prepare_responses = send_encrypted(
+            &mut protocol,
+            &mut unattached_connection,
+            &mut unattached_crypto,
+            envelope_value(
+                MessageType::SessionFileDownloadPrepare,
+                SessionFileDownloadPreparePayload {
+                    session_id: created_payload.session_id,
+                    path: target.to_string_lossy().to_string(),
+                },
+            )
+            .unwrap(),
+        );
+        let prepare = decrypt_first(&mut unattached_crypto, prepare_responses);
+
+        // legacy prepare 仍会暴露文件元数据和一次性 token，因此必须和 chunk/read/write 一样要求 attach。
+        assert_eq!(prepare.kind, MessageType::Error);
+        assert!(backend.writes().is_empty());
+
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_file_write_rejects_symlink_target_escape() {
+        let base = temp_state_path("write-symlink-base");
+        let root = base.join("project");
+        let outside = base.join("outside");
+        let outside_target = outside.join("escape.txt");
+        let link_path = root.join("escape-link.txt");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(&outside_target, b"outside original\n").unwrap();
+        std::os::unix::fs::symlink(&outside_target, &link_path).unwrap();
+        let backend = FakePtyBackend::default();
+        let mut config =
+            DaemonConfig::default_for_state_path(temp_state_path("write-symlink-state.json"));
+        config.default_command = vec!["sh".to_owned()];
+        config.default_working_directory = Some(root.clone());
+        let mut protocol =
+            DaemonProtocol::new(config, backend.clone(), Ed25519SignatureVerifier).unwrap();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = PublicKey(wire(signing_key.verifying_key().as_bytes()));
+        let (_, mut device_session) = open_e2ee(&mut protocol, &mut connection, device_id);
+        pair_device(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            device_id,
+            public_key,
+        );
+        let create_responses = send_encrypted(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            envelope_value(
+                MessageType::SessionCreate,
+                SessionCreatePayload {
+                    command: Vec::new(),
+                    size: TerminalSize::new(24, 80),
+                },
+            )
+            .unwrap(),
+        );
+        let created = decrypt_first(&mut device_session, create_responses);
+        let created_payload: SessionCreatedPayload = decode_payload(created.payload).unwrap();
+
+        let write_responses = send_encrypted(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            envelope_value(
+                MessageType::SessionFileWrite,
+                SessionFileWritePayload {
+                    session_id: created_payload.session_id,
+                    path: link_path.to_string_lossy().to_string(),
+                    data_base64: general_purpose::STANDARD.encode(b"escaped write\n"),
+                },
+            )
+            .unwrap(),
+        );
+        let written = decrypt_first(&mut device_session, write_responses);
+
+        assert_eq!(written.kind, MessageType::Error);
+        assert_eq!(fs::read(&outside_target).unwrap(), b"outside original\n");
+        assert!(backend.writes().is_empty());
 
         fs::remove_dir_all(base).ok();
     }
@@ -4595,18 +5414,10 @@ mod tests {
         );
         let created = decrypt_first(&mut device_session, create_responses);
         let created_payload: SessionCreatedPayload = decode_payload(created.payload).unwrap();
-        let (mut file_connection, _) = protocol.start_connection();
-        let mut file_crypto = authenticate_paired_connection(
-            &mut protocol,
-            &mut file_connection,
-            device_id,
-            &signing_key,
-        );
-
         let list_responses = send_encrypted(
             &mut protocol,
-            &mut file_connection,
-            &mut file_crypto,
+            &mut connection,
+            &mut device_session,
             envelope_value(
                 MessageType::SessionFiles,
                 SessionFilesPayload {
@@ -4616,17 +5427,13 @@ mod tests {
             )
             .unwrap(),
         );
-        let listed = decrypt_first(&mut file_crypto, list_responses);
-        let listed_payload: SessionFilesResultPayload = decode_payload(listed.payload).unwrap();
-
-        assert_eq!(listed.kind, MessageType::SessionFilesResult);
-        assert_eq!(listed_payload.path, outside.to_string_lossy());
-        assert_eq!(listed_payload.entries[0].name, "readme.txt");
+        let listed = decrypt_first(&mut device_session, list_responses);
+        assert_eq!(listed.kind, MessageType::Error);
 
         let read_responses = send_encrypted(
             &mut protocol,
-            &mut file_connection,
-            &mut file_crypto,
+            &mut connection,
+            &mut device_session,
             envelope_value(
                 MessageType::SessionFileRead,
                 SessionFileReadPayload {
@@ -4636,21 +5443,14 @@ mod tests {
             )
             .unwrap(),
         );
-        let read = decrypt_first(&mut file_crypto, read_responses);
-        let read_payload: SessionFileReadResultPayload = decode_payload(read.payload).unwrap();
-        assert_eq!(read.kind, MessageType::SessionFileReadResult);
-        assert_eq!(
-            general_purpose::STANDARD
-                .decode(read_payload.data_base64)
-                .unwrap(),
-            b"outside file\n"
-        );
+        let read = decrypt_first(&mut device_session, read_responses);
+        assert_eq!(read.kind, MessageType::Error);
 
         let upload_path = root.join("upload.txt");
         let write_responses = send_encrypted(
             &mut protocol,
-            &mut file_connection,
-            &mut file_crypto,
+            &mut connection,
+            &mut device_session,
             envelope_value(
                 MessageType::SessionFileWrite,
                 SessionFileWritePayload {
@@ -4661,7 +5461,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let written = decrypt_first(&mut file_crypto, write_responses);
+        let written = decrypt_first(&mut device_session, write_responses);
         let written_payload: SessionFileWrittenPayload = decode_payload(written.payload).unwrap();
         assert_eq!(written.kind, MessageType::SessionFileWritten);
         assert_eq!(written_payload.size_bytes, 9);
@@ -4669,8 +5469,8 @@ mod tests {
 
         let delete_responses = send_encrypted(
             &mut protocol,
-            &mut file_connection,
-            &mut file_crypto,
+            &mut connection,
+            &mut device_session,
             envelope_value(
                 MessageType::SessionFileDelete,
                 SessionFileDeletePayload {
@@ -4680,7 +5480,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let deleted = decrypt_first(&mut file_crypto, delete_responses);
+        let deleted = decrypt_first(&mut device_session, delete_responses);
         let deleted_payload: SessionFileDeletedPayload = decode_payload(deleted.payload).unwrap();
 
         assert_eq!(deleted.kind, MessageType::SessionFileDeleted);

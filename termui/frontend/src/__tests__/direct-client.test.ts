@@ -38,7 +38,7 @@ describe("DirectClient", () => {
       payload: {
         server_id: daemon.serverId,
         role: "client",
-        protocol_version: 1,
+        protocol_version: 2,
       },
     });
     expect(firstOuter.payload.nonce).toMatch(/^nonce-/);

@@ -262,14 +262,12 @@ impl DirectClient {
             SessionResizePayload { session_id, size },
         )?)
         .await?;
-        self.send_ping().await?;
 
-        // resize 成功没有业务 ack；随后发送一个加密 ping，用 pong 证明 daemon 已处理到
-        // resize 后的帧。若 resize 失败，error 会排在 pong 前返回。
+        // resize 必须等 daemon 返回明确确认后才算完成，避免客户端先行调整本地状态。
         loop {
             let envelope = self.receive_inner_timeout().await?;
             match envelope.kind {
-                MessageType::Pong => return Ok(()),
+                MessageType::SessionResized => return Ok(()),
                 MessageType::SessionData => continue,
                 _ => return Err(TermctlError::UnexpectedMessage),
             }

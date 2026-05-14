@@ -7,6 +7,11 @@ import WebSocket from "ws";
 // 单元测试在 Node/jsdom 中运行，使用 ws 提供真实 WebSocket，确保 DirectClient
 // 测试仍经过完整 E2EE wire 流程，而不是绕过协议状态机。
 Object.assign(globalThis, { WebSocket });
+const clipboardWriteTextMock = vi.fn(() => Promise.resolve());
+Object.defineProperty(globalThis.navigator, "clipboard", {
+  configurable: true,
+  get: () => ({ writeText: clipboardWriteTextMock }),
+});
 
 afterEach(() => {
   delete (globalThis as { __TERMD_TEST_FIT_DIMENSIONS__?: { rows: number; cols: number } })
@@ -15,6 +20,8 @@ afterEach(() => {
     .__TERMD_TEST_DEFER_XTERM_RENDER_UNTIL_WRITE_CALLBACK__;
   delete (globalThis as { __TERMD_TEST_XTERM_STATS__?: { writes: number; refreshes: number; writtenBytes: number } })
     .__TERMD_TEST_XTERM_STATS__;
+  delete (globalThis as { __TERMD_TEST_XTERM__?: { select: (text: string) => void } }).__TERMD_TEST_XTERM__;
+  clipboardWriteTextMock.mockClear();
   cleanup();
 });
 
@@ -32,9 +39,11 @@ vi.mock("@xterm/xterm", () => {
     private cursorMoveListeners: Array<() => void> = [];
     private writeParsedListeners: Array<() => void> = [];
     private scrollListeners: Array<(viewportY: number) => void> = [];
+    private selectionChangeListeners: Array<() => void> = [];
     private terminalOptions: Record<string, unknown>;
     private pendingRender = "";
     private pendingRenderReady = false;
+    private selection = "";
     public buffer = { active: { cursorY: 0, cursorX: 0, viewportY: 0, baseY: 0 } };
     public cols = 80;
     public rows = 24;
@@ -70,9 +79,17 @@ vi.mock("@xterm/xterm", () => {
       });
       this.element.append(textarea);
       element.append(this.element);
+      (globalThis as { __TERMD_TEST_XTERM__?: { select: (text: string) => void } }).__TERMD_TEST_XTERM__ = {
+        select: (text: string) => {
+          this.selection = text;
+          this.selectionChangeListeners.forEach((listener) => listener());
+        },
+      };
     }
 
-    loadAddon() {}
+    loadAddon(addon?: { activate?: (terminal: Terminal) => void }) {
+      addon?.activate?.(this);
+    }
 
     write(data: string | Uint8Array, callback?: () => void) {
       const text = typeof data === "string" ? data : textDecoder.decode(data);
@@ -139,14 +156,33 @@ vi.mock("@xterm/xterm", () => {
       return { dispose: () => undefined };
     }
 
+    onSelectionChange(listener: () => void) {
+      this.selectionChangeListeners.push(listener);
+      return { dispose: () => undefined };
+    }
+
+    hasSelection() {
+      return this.selection.length > 0;
+    }
+
+    getSelection() {
+      return this.selection;
+    }
+
     scrollToLine(line: number) {
       this.buffer.active.viewportY = Math.min(this.buffer.active.baseY, Math.max(0, line));
       this.scrollListeners.forEach((listener) => listener(this.buffer.active.viewportY));
     }
 
     resize(cols: number, rows: number) {
+      const previousBaseY = this.buffer.active.baseY;
+      const wasAtBottom = this.buffer.active.viewportY >= previousBaseY;
       this.cols = cols;
       this.rows = rows;
+      this.buffer.active.baseY = Math.max(0, this.buffer.active.cursorY - this.rows + 1);
+      this.buffer.active.viewportY = wasAtBottom
+        ? this.buffer.active.baseY
+        : Math.min(this.buffer.active.viewportY, this.buffer.active.baseY);
     }
 
     focus() {
@@ -162,6 +198,11 @@ vi.mock("@xterm/xterm", () => {
       this.pendingRender = "";
       this.pendingRenderReady = false;
       this.renderData(data);
+    }
+
+    clear() {
+      // 输出清空由 App 的待写队列和重新 attach 流程覆盖；mock 这里保持 no-op，
+      // 避免 React effect 时序把刚写入的 attach 输出误清掉。
     }
 
     dispose() {}
@@ -180,7 +221,18 @@ vi.mock("@xterm/xterm", () => {
 
 vi.mock("@xterm/addon-fit", () => {
   class FitAddon {
-    fit() {}
+    private terminal?: { resize: (cols: number, rows: number) => void };
+
+    activate(terminal: { resize: (cols: number, rows: number) => void }) {
+      this.terminal = terminal;
+    }
+
+    fit() {
+      const proposed = this.proposeDimensions();
+      // xterm 的 FitAddon.fit 会把终端尺寸同步成 proposeDimensions 的结果；
+      // mock 也要这样做，才能覆盖 resize ack 后回聚焦的滚动保持逻辑。
+      this.terminal?.resize(proposed.cols, proposed.rows);
+    }
 
     proposeDimensions() {
       // 测试用例可显式覆盖 xterm 当前容器能容纳的尺寸，用来模拟浏览器窗口 resize。

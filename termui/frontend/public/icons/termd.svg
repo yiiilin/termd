@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="termd">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Termd">
   <rect width="512" height="512" rx="96" fill="#0c1210"/>
   <rect x="70" y="102" width="372" height="308" rx="38" fill="#08110f" stroke="#d6ff5f" stroke-width="18"/>
   <path d="M128 188l66 66-66 66" fill="none" stroke="#d7f7e8" stroke-width="32" stroke-linecap="round" stroke-linejoin="round"/>

@@ -7,6 +7,8 @@ import type {
   ControlGrantPayload,
   DaemonClientForgetPayload,
   DaemonClientForgotPayload,
+  DaemonStatusPayload,
+  DaemonStatusResultPayload,
   DeviceState,
   E2eeKeyExchangePayload,
   EncryptedFramePayload,
@@ -28,6 +30,10 @@ import type {
   SessionDataPayload,
   SessionFileDeletePayload,
   SessionFileDeletedPayload,
+  SessionFileDownloadChunkPayload,
+  SessionFileDownloadChunkResultPayload,
+  SessionFileDownloadPreparePayload,
+  SessionFileDownloadReadyPayload,
   SessionFileReadPayload,
   SessionFileReadResultPayload,
   SessionFileWritePayload,
@@ -37,6 +43,8 @@ import type {
   SessionListResultPayload,
   SessionRenamedPayload,
   SessionRenamePayload,
+  SessionResizePayload,
+  SessionResizedPayload,
   TerminalSize,
   UUID,
 } from "./types";
@@ -97,7 +105,7 @@ export class DirectClient {
       envelope("route_hello", {
         server_id: routeServerId,
         role: "client",
-        protocol_version: 1,
+        protocol_version: 2,
         nonce: nonce(),
         timestamp_ms: nowMs(),
       }),
@@ -209,14 +217,23 @@ export class DirectClient {
     return this.expectPayload<DaemonClientForgotPayload>("daemon_client_forgot");
   }
 
+  async getDaemonStatus(): Promise<DaemonStatusResultPayload> {
+    await this.sendInner(envelope("daemon_status", {} satisfies DaemonStatusPayload));
+    return this.expectPayload<DaemonStatusResultPayload>("daemon_status_result", { bufferTerminalEvents: true });
+  }
+
   async listSessionFiles(sessionId: UUID, path?: string): Promise<SessionFilesResultPayload> {
+    await this.requestSessionFiles(sessionId, path);
+    return this.expectPayload<SessionFilesResultPayload>("session_files_result", { bufferTerminalEvents: true });
+  }
+
+  async requestSessionFiles(sessionId: UUID, path?: string): Promise<void> {
     await this.sendInner(
       envelope("session_files", {
         session_id: sessionId,
         ...(path ? { path } : {}),
       } satisfies SessionFilesPayload),
     );
-    return this.expectPayload<SessionFilesResultPayload>("session_files_result", { bufferTerminalEvents: true });
   }
 
   async readSessionFile(sessionId: UUID, path: string): Promise<SessionFileReadResultPayload> {
@@ -238,6 +255,33 @@ export class DirectClient {
   async deleteSessionFile(sessionId: UUID, path: string): Promise<SessionFileDeletedPayload> {
     await this.sendInner(envelope("session_file_delete", { session_id: sessionId, path } satisfies SessionFileDeletePayload));
     return this.expectPayload<SessionFileDeletedPayload>("session_file_deleted", { bufferTerminalEvents: true });
+  }
+
+  async prepareSessionFileDownload(sessionId: UUID, path: string): Promise<SessionFileDownloadReadyPayload> {
+    await this.sendInner(
+      envelope("session_file_download_prepare", {
+        session_id: sessionId,
+        path,
+      } satisfies SessionFileDownloadPreparePayload),
+    );
+    return this.expectPayload<SessionFileDownloadReadyPayload>("session_file_download_ready", { bufferTerminalEvents: true });
+  }
+
+  async readSessionFileDownloadChunk(
+    sessionId: UUID,
+    path: string,
+    offsetBytes: number,
+    maxBytes: number,
+  ): Promise<SessionFileDownloadChunkResultPayload> {
+    await this.sendInner(
+      envelope("session_file_download_chunk", {
+        session_id: sessionId,
+        path,
+        offset_bytes: offsetBytes,
+        max_bytes: maxBytes,
+      } satisfies SessionFileDownloadChunkPayload),
+    );
+    return this.expectPayload<SessionFileDownloadChunkResultPayload>("session_file_download_chunk_result", { bufferTerminalEvents: true });
   }
 
   async createSession(command: string[], size: TerminalSize): Promise<SessionCreatedPayload> {
@@ -279,8 +323,13 @@ export class DirectClient {
     );
   }
 
-  async resizeSession(sessionId: UUID, size: TerminalSize): Promise<void> {
-    await this.sendInner(envelope("session_resize", { session_id: sessionId, size }));
+  async resizeSession(sessionId: UUID, size: TerminalSize): Promise<SessionResizedPayload> {
+    await this.requestSessionResize(sessionId, size);
+    return this.expectPayload<SessionResizedPayload>("session_resized", { bufferTerminalEvents: true });
+  }
+
+  async requestSessionResize(sessionId: UUID, size: TerminalSize): Promise<void> {
+    await this.sendInner(envelope("session_resize", { session_id: sessionId, size } satisfies SessionResizePayload));
   }
 
   async renameSession(sessionId: UUID, name: string): Promise<SessionRenamedPayload> {
@@ -290,7 +339,7 @@ export class DirectClient {
         name,
       } satisfies SessionRenamePayload),
     );
-    return this.expectPayload<SessionRenamedPayload>("session_renamed");
+    return this.expectPayload<SessionRenamedPayload>("session_renamed", { bufferTerminalEvents: true });
   }
 
   async closeSession(sessionId: UUID): Promise<SessionClosedPayload> {
@@ -358,7 +407,11 @@ export class DirectClient {
       if (
         options.bufferTerminalEvents &&
         inner.type !== expectedType &&
-        (inner.type === "session_data" || inner.type === "control_grant" || inner.type === "session_files_result")
+        (inner.type === "session_data" ||
+          inner.type === "session_activity" ||
+          inner.type === "session_resized" ||
+          inner.type === "control_grant" ||
+          inner.type === "session_files_result")
       ) {
         // 文件操作复用已 attach 的终端连接；daemon 可能先推送 PTY 输出或文件树同步事件。
         // 这里把旁路事件放回队列，交给后续 receive loop 处理，避免文件 panel 吃掉回显。

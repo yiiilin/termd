@@ -11,6 +11,7 @@ import type { SessionFilesResultPayload } from "../protocol/types";
 import { clearBrowserState } from "../state/browser-state";
 import { MockDaemon } from "../test/mock-daemon";
 import { fallbackSessionDisplayName } from "../session-names";
+import { resetFileEditorDialogMonacoCacheForTests } from "../components/FileEditorDialog";
 
 const DEFAULT_SESSION_ID = "00000000-0000-0000-0000-000000000401";
 const DEFAULT_SESSION_NAME = fallbackSessionDisplayName(DEFAULT_SESSION_ID);
@@ -149,7 +150,12 @@ async function clickSessionCard(
 ): Promise<void> {
   const scope = container instanceof HTMLElement && !container.isConnected ? document.body : container;
   if (name) {
-    await user.click(await within(scope as HTMLElement).findByRole("button", { name: `Open ${name}` }));
+    const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    await user.click(
+      await within(scope as HTMLElement).findByRole("button", {
+        name: new RegExp(`^Open ${escapedName}(?:, new output)?$`),
+      }),
+    );
     return;
   }
   const sessionButtons = await within(scope as HTMLElement).findAllByRole("button", { name: /^Open / });
@@ -168,7 +174,20 @@ function resetXtermStats(): { writes: number; refreshes: number; writtenBytes: n
   return scope.__TERMD_TEST_XTERM_STATS__;
 }
 
-function mockViewerLayout(input: { viewportWidth: number; viewportHeight: number; frameWidth: number; frameHeight: number }) {
+function triggerXtermSelection(text: string): void {
+  const scope = globalThis as { __TERMD_TEST_XTERM__?: { select: (text: string) => void } };
+  expect(scope.__TERMD_TEST_XTERM__).toBeDefined();
+  // 测试 mock 只暴露选择完成事件，避免测试直接依赖 xterm 内部 DOM 结构。
+  scope.__TERMD_TEST_XTERM__!.select(text);
+}
+
+function mockViewerLayout(input: {
+  viewportWidth: number;
+  viewportHeight: number;
+  frameWidth: number;
+  frameHeight: number;
+  scrollHeight?: number;
+}) {
   const clientWidthSpy = vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockImplementation(function (this: HTMLElement) {
     return this.classList.contains("terminal-scrollport") ? input.viewportWidth : 0;
   });
@@ -181,12 +200,16 @@ function mockViewerLayout(input: { viewportWidth: number; viewportHeight: number
   const offsetHeightSpy = vi.spyOn(HTMLElement.prototype, "offsetHeight", "get").mockImplementation(function (this: HTMLElement) {
     return this.classList.contains("terminal-viewer-frame") ? input.frameHeight : 0;
   });
+  const scrollHeightSpy = vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockImplementation(function (this: HTMLElement) {
+    return this.classList.contains("terminal-scrollport") ? (input.scrollHeight ?? input.frameHeight) : 0;
+  });
 
   return () => {
     clientWidthSpy.mockRestore();
     clientHeightSpy.mockRestore();
     offsetWidthSpy.mockRestore();
     offsetHeightSpy.mockRestore();
+    scrollHeightSpy.mockRestore();
   };
 }
 
@@ -194,6 +217,9 @@ describe("termui web 工作台", () => {
   let daemon: MockDaemon;
 
   beforeEach(async () => {
+    // app 集成测试运行在 jsdom 中；这里固定使用 fallback 编辑器，Monaco 的生产加载由构建验证覆盖。
+    (globalThis as { __TERMD_TEST_DISABLE_MONACO__?: boolean }).__TERMD_TEST_DISABLE_MONACO__ = true;
+    resetFileEditorDialogMonacoCacheForTests();
     await clearBrowserState();
     setViewportWidth(1366);
     qrScannerMock.destroy.mockClear();
@@ -219,10 +245,12 @@ describe("termui web 工作台", () => {
   });
 
   afterEach(async () => {
+    resetFileEditorDialogMonacoCacheForTests();
+    delete (globalThis as { __TERMD_TEST_DISABLE_MONACO__?: boolean }).__TERMD_TEST_DISABLE_MONACO__;
     await daemon.stop();
   });
 
-  it("pairing 后清空 token，刷新 session list，并 attach 到 terminal", async () => {
+  it("pairing 后清空 token，刷新 session list，并默认 attach 第一个 session", async () => {
     const user = userEvent.setup();
     render(<App />);
 
@@ -238,13 +266,151 @@ describe("termui web 工作台", () => {
     await waitForWorkspaceSession();
     expect(document.body.textContent).not.toContain("00000000-0000-0000-0000-000000000401");
     expect(screen.queryByRole("button", { name: "Open" })).toBeNull();
-    await clickSessionCard(user);
 
     await screen.findByText(/termd-e2e-ready/);
     await waitFor(() => expect(daemon.attachedSessions).toEqual(["00000000-0000-0000-0000-000000000401"]));
     await new Promise((resolve) => window.setTimeout(resolve, 250));
     expect(daemon.pingMessages).toBe(0);
     expect(daemon.outerWireText()).not.toContain("secret-token");
+  });
+
+  it("已配对 web 初次打开和刷新后自动 attach 第一个 session 并显示输出", async () => {
+    const user = userEvent.setup();
+    const firstRender = render(<App />);
+
+    await waitFor(() => expect(document.title).toBe("Termd"));
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+
+    await screen.findByText(/termd-e2e-ready/);
+    await waitFor(() => expect(document.title).toBe(`Termd - ${daemon.url} - ${DEFAULT_SESSION_NAME}`));
+    await waitFor(() => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID]));
+
+    firstRender.unmount();
+    render(<App />);
+
+    await waitForWorkspaceSession();
+    await screen.findByText(/termd-e2e-ready/);
+    await waitFor(() => expect(document.title).toBe(`Termd - ${daemon.url} - ${DEFAULT_SESSION_NAME}`));
+    await waitFor(() => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID, DEFAULT_SESSION_ID]));
+  });
+
+  it("在底部状态栏显示 daemon 状态，移动端只保留核心指标", async () => {
+    const user = userEvent.setup();
+    const desktopRender = render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+
+    const desktopStatus = await screen.findByRole("contentinfo", { name: "daemon server status" });
+    await within(desktopStatus).findByText("CPU");
+    expect(within(desktopStatus).getByText("7.5%")).toBeInTheDocument();
+    expect(within(desktopStatus).getByRole("img", { name: "CPU usage trend" })).toBeInTheDocument();
+    expect(within(desktopStatus).getByText("Mem")).toBeInTheDocument();
+    expect(within(desktopStatus).getByText("3.0 GB / 8.0 GB")).toBeInTheDocument();
+    expect(within(desktopStatus).getByText("Disk")).toBeInTheDocument();
+    expect(within(desktopStatus).getByText("64 GB / 128 GB")).toBeInTheDocument();
+    expect(within(desktopStatus).getByText("Load")).toBeInTheDocument();
+    expect(within(desktopStatus).getByText("Uptime")).toBeInTheDocument();
+    expect(within(desktopStatus).getByText("Procs")).toBeInTheDocument();
+    expect(within(desktopStatus).queryByText(/atop/)).toBeNull();
+    expect(within(desktopStatus).queryByRole("button", { name: "Refresh server status" })).toBeNull();
+    expect(screen.queryByText("session active")).toBeNull();
+
+    desktopRender.unmount();
+    await daemon.stop();
+    await clearBrowserState();
+    setViewportWidth(390);
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [
+        {
+          session_id: DEFAULT_SESSION_ID,
+          state: "running",
+          size: { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 },
+        },
+      ],
+    });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+
+    const mobileStatus = await screen.findByRole("contentinfo", { name: "daemon server status" });
+    await within(mobileStatus).findByText("CPU");
+    expect(within(mobileStatus).getByText("Mem")).toBeInTheDocument();
+    expect(within(mobileStatus).getByText("Disk")).toBeInTheDocument();
+    expect(within(mobileStatus).queryByRole("button", { name: "Refresh server status" })).toBeNull();
+    expect(within(mobileStatus).queryByText("Load")).toBeNull();
+    expect(within(mobileStatus).queryByText("Uptime")).toBeNull();
+    expect(within(mobileStatus).queryByText("Procs")).toBeNull();
+    expect(within(mobileStatus).queryByText(/atop/)).toBeNull();
+  });
+
+  it("daemon 状态栏注册 5 秒自动轮询", async () => {
+    const intervalSpy = vi.spyOn(window, "setInterval");
+    const user = userEvent.setup();
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    expect(intervalSpy).toHaveBeenCalledWith(expect.any(Function), 5000);
+    intervalSpy.mockRestore();
+  });
+
+  it("可以通过拖动手柄调整 session 顺序，并在刷新后保留", async () => {
+    const user = userEvent.setup();
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [
+        {
+          session_id: "00000000-0000-0000-0000-000000000402",
+          name: "work",
+          state: "running",
+          size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+          created_at_ms: 2000,
+        },
+        {
+          session_id: "00000000-0000-0000-0000-000000000401",
+          name: "shell",
+          state: "running",
+          size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+          created_at_ms: 1000,
+        },
+      ],
+    });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession("work");
+    expect(visibleSessionNames()).toEqual(["work", "shell"]);
+
+    const rows = document.querySelectorAll<HTMLElement>(".session-row");
+    rows.forEach((row, index) => {
+      row.getBoundingClientRect = vi.fn(() => ({
+        x: 0,
+        y: index * 60,
+        width: 260,
+        height: 52,
+        top: index * 60,
+        right: 260,
+        bottom: index * 60 + 52,
+        left: 0,
+        toJSON: () => ({}),
+      }));
+    });
+
+    const shellHandle = screen.getByRole("button", { name: "Drag shell" });
+    fireEvent.mouseDown(shellHandle, { button: 0, clientY: 90 });
+    fireEvent.mouseMove(shellHandle, { clientY: 10 });
+    fireEvent.mouseUp(shellHandle, { clientY: 10 });
+
+    await waitFor(() => expect(visibleSessionNames()).toEqual(["shell", "work"]));
+
+    await user.click(screen.getByRole("button", { name: "Refresh" }));
+    await waitFor(() => expect(visibleSessionNames()).toEqual(["shell", "work"]));
   });
 
   it("持续输出时合并写入 xterm，并且不为每个输出刷新布局", async () => {
@@ -273,6 +439,67 @@ describe("termui web 工作台", () => {
     expect(daemon.sessionCursorUpdates.length).toBeLessThan(20);
   });
 
+  it("后台 session 收到输出时标记新输出，打开后清除", async () => {
+    const user = userEvent.setup();
+    const shellSessionId = "00000000-0000-0000-0000-000000000401";
+    const workSessionId = "00000000-0000-0000-0000-000000000402";
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [
+        {
+          session_id: shellSessionId,
+          name: "shell",
+          state: "running",
+          size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+          created_at_ms: 1000,
+        },
+        {
+          session_id: workSessionId,
+          name: "work",
+          state: "running",
+          size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+          created_at_ms: 2000,
+        },
+      ],
+      attachOutput: "attached-ready\n",
+    });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession("shell");
+    await clickSessionCard(user, "shell");
+    await screen.findByText(/attached-ready/);
+
+    daemon.pushSessionDataToAll(workSessionId, "background-work-output\n");
+
+    await waitFor(() => expect(screen.getByRole("button", { name: /Open work/ })).toHaveClass("has-new-output"));
+    // 新输出提示只通过标题颜色表达，避免整行高亮或额外徽标长期占用列表空间。
+    expect(screen.queryByText("New output")).toBeNull();
+    expect(screen.getByRole("button", { name: "Open shell" })).not.toHaveClass("has-new-output");
+    expect(document.querySelector<HTMLElement>(".xterm")?.textContent).not.toContain("background-work-output");
+
+    await clickSessionCard(user, "work");
+
+    await waitFor(() => expect(screen.getByRole("button", { name: "Open work" })).not.toHaveClass("has-new-output"));
+  });
+
+  it("xterm 鼠标选中后自动复制并提示复制成功", async () => {
+    const user = userEvent.setup();
+    const writeTextSpy = vi.spyOn(navigator.clipboard, "writeText").mockResolvedValue();
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await clickSessionCard(user);
+    await screen.findByText(/termd-e2e-ready/);
+
+    triggerXtermSelection("termd-e2e-ready");
+
+    await waitFor(() => expect(writeTextSpy).toHaveBeenCalledWith("termd-e2e-ready"));
+    expect(await screen.findByRole("status")).toHaveTextContent("复制成功");
+  });
+
   it("移动端顶部菜单保持 terminal-first，并把 daemon 管理放到独立后台页", async () => {
     setViewportWidth(390);
     const user = userEvent.setup();
@@ -280,6 +507,7 @@ describe("termui web 工作台", () => {
 
     await pairWithInvite(user, daemon);
     await waitForWorkspaceSession();
+    await screen.findByText(/termd-e2e-ready/);
     expect(screen.queryByRole("navigation", { name: "mobile workspace menu" })).toBeNull();
     expect(screen.queryByRole("navigation", { name: "mobile workspace actions" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Clients" })).toBeNull();
@@ -289,15 +517,17 @@ describe("termui web 工作台", () => {
     const menu = await screen.findByRole("navigation", { name: "mobile workspace menu" });
     expect(within(menu).getByRole("button", { name: "Daemons" })).toBeEnabled();
     expect(within(menu).getByRole("button", { name: "Sessions" })).toBeEnabled();
-    expect(within(menu).getByRole("button", { name: "Files" })).toBeDisabled();
+    expect(within(menu).getByRole("button", { name: "Files" })).toBeEnabled();
     expect(within(menu).getByRole("button", { name: "New" })).toBeEnabled();
     expect(within(menu).queryByRole("button", { name: "Refresh sessions" })).toBeNull();
 
-    await within(menu).getByRole("button", { name: "Daemons" }).click();
+    await user.click(within(menu).getByRole("button", { name: "Daemons" }));
     const admin = await screen.findByLabelText("daemon admin");
     expect(within(admin).getByLabelText("daemon manager")).toBeVisible();
     await user.click(within(admin).getByRole("button", { name: "Open workspace" }));
     await waitForWorkspaceSession();
+    await screen.findByText(/termd-e2e-ready/);
+    await waitFor(() => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID, DEFAULT_SESSION_ID]));
 
     await user.click(screen.getByRole("button", { name: "Open session list from title" }));
     const titleSessionsPanel = await screen.findByLabelText("sessions panel");
@@ -314,7 +544,10 @@ describe("termui web 工作台", () => {
     await user.click(refreshSessions);
     await clickSessionCard(user, DEFAULT_SESSION_NAME, sessionsPanel);
 
+    await waitFor(() => expect(screen.queryByLabelText("sessions panel")).toBeNull());
     await screen.findByText(/termd-e2e-ready/);
+    expect(await screen.findByRole("contentinfo", { name: "daemon server status" })).toBeInTheDocument();
+    expect(screen.queryByText("session active")).toBeNull();
     expect(screen.queryByLabelText("session operators")).toBeNull();
     await user.click(screen.getByRole("button", { name: "Open mobile workspace menu" }));
     const secondMenu = await screen.findByRole("navigation", { name: "mobile workspace menu" });
@@ -614,7 +847,7 @@ describe("termui web 工作台", () => {
     const alert = await within(workspaceBody!).findByRole("alert", { name: "Connection error" });
     expect(alert).toHaveTextContent("protocol_error");
     expect(alert).toHaveTextContent("protocol operation failed");
-    expect(await screen.findByText("protocol_error: protocol operation failed")).toBeInTheDocument();
+    expect(screen.queryByText("session active")).toBeNull();
 
     const renderedText = document.body.textContent ?? "";
     for (const sensitive of ["invalid_envelope_token", "private_key", "private-value", "signature", "ciphertext_base64"]) {
@@ -629,11 +862,6 @@ describe("termui web 工作台", () => {
 
     await pairWithInvite(user, daemon);
     await waitForWorkspaceSession();
-    await user.click(screen.getByRole("button", { name: "Open mobile workspace menu" }));
-    const menu = await screen.findByRole("navigation", { name: "mobile workspace menu" });
-    await within(menu).getByRole("button", { name: "Sessions" }).click();
-    const sessionsPanel = await screen.findByLabelText("sessions panel");
-    await clickSessionCard(user, DEFAULT_SESSION_NAME, sessionsPanel);
     await screen.findByText(/termd-e2e-ready/);
     await waitFor(() => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID]));
 
@@ -656,11 +884,6 @@ describe("termui web 工作台", () => {
 
     await pairWithInvite(user, daemon);
     await waitForWorkspaceSession();
-    await user.click(screen.getByRole("button", { name: "Open mobile workspace menu" }));
-    const menu = await screen.findByRole("navigation", { name: "mobile workspace menu" });
-    await within(menu).getByRole("button", { name: "Sessions" }).click();
-    const sessionsPanel = await screen.findByLabelText("sessions panel");
-    await clickSessionCard(user, DEFAULT_SESSION_NAME, sessionsPanel);
     await screen.findByText(/termd-e2e-ready/);
     await waitFor(() => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID]));
 
@@ -682,11 +905,6 @@ describe("termui web 工作台", () => {
 
     await pairWithInvite(user, daemon);
     await waitForWorkspaceSession();
-    await user.click(screen.getByRole("button", { name: "Open mobile workspace menu" }));
-    const menu = await screen.findByRole("navigation", { name: "mobile workspace menu" });
-    await within(menu).getByRole("button", { name: "Sessions" }).click();
-    const sessionsPanel = await screen.findByLabelText("sessions panel");
-    await clickSessionCard(user, DEFAULT_SESSION_NAME, sessionsPanel);
 
     let terminalInput: HTMLTextAreaElement | null = null;
     await waitFor(() => {
@@ -869,6 +1087,11 @@ describe("termui web 工作台", () => {
     expect(within(panel).getByText("12 B")).toBeInTheDocument();
     expect(daemon.sessionFileRequests).toEqual([{ session_id: sessionId }]);
 
+    const fileRequestCountBeforeRefresh = daemon.sessionFileRequests.length;
+    await user.click(within(panel).getByRole("button", { name: "Refresh files" }));
+    await waitFor(() => expect(daemon.sessionFileRequests.length).toBeGreaterThan(fileRequestCountBeforeRefresh));
+    expect(daemon.sessionFileRequests).toContainEqual({ session_id: sessionId, path: "/home/me/project" });
+
     await user.click(within(panel).getByRole("button", { name: "Open src" }));
     await within(panel).findByText("main.rs");
     expect(daemon.sessionFileRequests).toContainEqual({ session_id: sessionId, path: srcPath });
@@ -876,13 +1099,40 @@ describe("termui web 工作台", () => {
     await user.click(within(panel).getByRole("button", { name: "Parent directory" }));
     await within(panel).findByText("alpha.txt");
 
-    await user.click(within(panel).getByRole("button", { name: "Download alpha.txt" }));
+    await user.click(within(panel).getByRole("button", { name: "Edit alpha.txt" }));
+    const editor = await screen.findByRole("dialog", { name: "alpha.txt" });
     await waitFor(() => {
-      expect(daemon.sessionFileReadRequests).toContainEqual({
+      expect(daemon.sessionFileDownloadChunkRequests).toContainEqual({
         session_id: sessionId,
         path: "/home/me/project/alpha.txt",
+        offset_bytes: 0,
+        max_bytes: 262144,
       });
     });
+    expect(daemon.sessionFileReadRequests).toEqual([]);
+    const fileText = within(editor).getByLabelText("File text") as HTMLTextAreaElement;
+    fireEvent.change(fileText, { target: { value: "edited from browser" } });
+    await user.click(within(editor).getByRole("button", { name: "Save" }));
+    await waitFor(() => {
+      expect(daemon.sessionFileWrites).toContainEqual({
+        session_id: sessionId,
+        path: "/home/me/project/alpha.txt",
+        text: "edited from browser",
+      });
+    });
+    await user.click(within(editor).getByRole("button", { name: "Close editor" }));
+
+    await user.click(within(panel).getByRole("button", { name: "Download alpha.txt" }));
+    await waitFor(() => {
+      expect(daemon.sessionFileDownloadChunkRequests.filter((request) => request.path === "/home/me/project/alpha.txt")).toHaveLength(2);
+      expect(daemon.sessionFileDownloadChunkRequests).toContainEqual({
+        session_id: sessionId,
+        path: "/home/me/project/alpha.txt",
+        offset_bytes: 0,
+        max_bytes: 262144,
+      });
+    });
+    expect(daemon.sessionFileReadRequests).toEqual([]);
 
     await user.click(within(panel).getByRole("button", { name: "Delete alpha.txt" }));
     await waitFor(() => {
@@ -980,6 +1230,8 @@ describe("termui web 工作台", () => {
 
     await user.click(screen.getByRole("button", { name: "Disconnect" }));
     await waitFor(() => expect(screen.getByRole("button", { name: "Disconnect" })).toBeDisabled());
+    await waitFor(() => expect(screen.getByText("No session")).toBeInTheDocument());
+    expect(document.querySelector(".session-row.selected")).toBeNull();
 
     const requestCountBeforeReattach = daemon.sessionFileRequests.length;
     await clickSessionCard(user);
@@ -1491,7 +1743,7 @@ describe("termui web 工作台", () => {
     expect(document.querySelector(".terminal-pane-viewer .terminal-viewer-frame")).toBeNull();
   });
 
-  it("聚焦终端遇到浏览器窗口 resize 后退回非聚焦 viewer 状态", async () => {
+  it("聚焦终端遇到浏览器窗口 resize 后保持聚焦并同步 PTY 尺寸", async () => {
     const user = userEvent.setup();
     await daemon.stop();
     daemon = await MockDaemon.start({
@@ -1527,42 +1779,32 @@ describe("termui web 工作台", () => {
       }),
     );
 
-    const resizeCountBeforeWindowResize = daemon.sessionResizes.length;
+    daemon.sessionCursorUpdates.length = 0;
     (globalThis as { __TERMD_TEST_FIT_DIMENSIONS__?: { rows: number; cols: number } }).__TERMD_TEST_FIT_DIMENSIONS__ = {
       rows: 30,
       cols: 100,
     };
     fireEvent(window, new Event("resize"));
 
-    await waitFor(() => expect(screen.getByTestId("terminal-pane")).toHaveAttribute("data-viewer-mode", "true"));
-    // 进入 viewer 后，xterm host 会被远端 PTY frame 框住；如果这时把该 host 再拿来测
-    // 本地可容纳尺寸，就会误判为“分辨率一致”，导致 viewer true/false 来回振荡。
-    (globalThis as { __TERMD_TEST_FIT_DIMENSIONS__?: { rows: number; cols: number } }).__TERMD_TEST_FIT_DIMENSIONS__ = {
-      rows: 24,
-      cols: 80,
-    };
-    fireEvent(window, new Event("resize"));
-    await new Promise((resolve) => window.setTimeout(resolve, 80));
-    expect(screen.getByTestId("terminal-pane")).toHaveAttribute("data-viewer-mode", "true");
-    expect(daemon.sessionResizes).toHaveLength(resizeCountBeforeWindowResize);
+    await waitFor(() => expect(screen.getByTestId("terminal-pane")).toHaveAttribute("data-viewer-mode", "false"));
     await waitFor(() =>
-      expect(daemon.sessionCursorUpdates).toContainEqual({
+      expect(daemon.sessionResizes).toContainEqual({
         session_id: "00000000-0000-0000-0000-000000000404",
-        row: expect.any(Number),
-        col: expect.any(Number),
-        focused: false,
+        size: { rows: 30, cols: 100, pixel_width: expect.any(Number), pixel_height: expect.any(Number) },
       }),
     );
+    expect(daemon.sessionCursorUpdates.map((update) => update.focused)).not.toContain(false);
   });
 
-  it("窗口 resize 进入 viewer 后点击缩放再点终端面板仍可重新聚焦", async () => {
+  it("前端发出 resize 请求后等 daemon 确认才更新 session 尺寸", async () => {
     const user = userEvent.setup();
     await daemon.stop();
     daemon = await MockDaemon.start({
       token: "secret-token",
+      resizeAckDelayMs: 240,
       sessions: [
         {
-          session_id: "00000000-0000-0000-0000-000000000406",
+          session_id: "00000000-0000-0000-0000-000000000407",
           state: "running",
           size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
         },
@@ -1581,32 +1823,146 @@ describe("termui web 工作台", () => {
       expect(terminalInput).not.toBeNull();
     });
     terminalInput!.focus();
-    await waitFor(() => expect(screen.getByTestId("terminal-pane")).toHaveAttribute("data-viewer-mode", "false"));
+    await waitFor(() => expect(screen.getAllByText("80x24").length).toBeGreaterThan(0));
 
-    const resizeCountBeforeWindowResize = daemon.sessionResizes.length;
     (globalThis as { __TERMD_TEST_FIT_DIMENSIONS__?: { rows: number; cols: number } }).__TERMD_TEST_FIT_DIMENSIONS__ = {
       rows: 30,
       cols: 100,
     };
     fireEvent(window, new Event("resize"));
-    await waitFor(() => expect(screen.getByTestId("terminal-pane")).toHaveAttribute("data-viewer-mode", "true"));
 
-    await user.click(screen.getByRole("button", { name: "Zoom in" }));
-    await screen.findByText("110%");
-    const viewerFrame = document.querySelector<HTMLElement>(".terminal-pane-viewer .terminal-viewer-frame");
-    expect(viewerFrame).not.toBeNull();
-    await user.click(viewerFrame!);
+    await waitFor(() =>
+      expect(daemon.sessionResizes).toContainEqual({
+        session_id: "00000000-0000-0000-0000-000000000407",
+        size: { rows: 30, cols: 100, pixel_width: expect.any(Number), pixel_height: expect.any(Number) },
+      }),
+    );
+    // resize 请求已经发出，但 mock daemon 还没返回 session_resized；UI 仍展示旧 session 尺寸。
+    expect(screen.getAllByText("80x24").length).toBeGreaterThan(0);
+    expect(screen.queryByText("100x30")).toBeNull();
 
-    await waitFor(() => expect(screen.getByTestId("terminal-pane")).toHaveAttribute("data-viewer-mode", "false"));
+    await screen.findByText("100x30");
+    expect(screen.queryByText("80x24")).toBeNull();
+  });
+
+  it("浏览器窗口 resize 引发的短暂 focusout/focusin 不会上报聚焦抖动", async () => {
+    const user = userEvent.setup();
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [
+        {
+          session_id: "00000000-0000-0000-0000-000000000405",
+          state: "running",
+          size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+        },
+      ],
+    });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await user.click(screen.getByRole("button", { name: "Refresh" }));
+    await clickSessionCard(user);
+
+    let terminalInput: HTMLTextAreaElement | null = null;
+    await waitFor(() => {
+      terminalInput = document.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
+      expect(terminalInput).not.toBeNull();
+    });
+    terminalInput!.focus();
     await waitFor(() =>
       expect(daemon.sessionCursorUpdates).toContainEqual({
-        session_id: "00000000-0000-0000-0000-000000000406",
+        session_id: "00000000-0000-0000-0000-000000000405",
         row: expect.any(Number),
         col: expect.any(Number),
         focused: true,
       }),
     );
-    expect(daemon.sessionResizes.length).toBeGreaterThan(resizeCountBeforeWindowResize);
+
+    daemon.sessionCursorUpdates.length = 0;
+    fireEvent(window, new Event("resize"));
+    // 真实浏览器在拖动窗口边界时可能短暂让 xterm textarea 失焦，随后又恢复焦点；
+    // 这类 resize 伴随的瞬时 DOM focus 抖动不应变成 operator 的 focused/blurred 抖动。
+    terminalInput!.blur();
+    await new Promise((resolve) => window.setTimeout(resolve, 40));
+    terminalInput!.focus();
+    await new Promise((resolve) => window.setTimeout(resolve, 180));
+
+    const focusUpdates = daemon.sessionCursorUpdates
+      .filter((update) => update.session_id === "00000000-0000-0000-0000-000000000405")
+      .map((update) => update.focused);
+    expect(focusUpdates).not.toContain(false);
+    expect(screen.getByTestId("terminal-pane")).toHaveAttribute("data-viewer-mode", "false");
+  });
+
+  it("非聚焦窗口 resize 进入 viewer，点击终端面板仍可重新聚焦", async () => {
+    const user = userEvent.setup();
+    const restoreViewerLayout = mockViewerLayout({
+      viewportWidth: 600,
+      viewportHeight: 420,
+      frameWidth: 1200,
+      frameHeight: 900,
+      scrollHeight: 900,
+    });
+    await daemon.stop();
+    try {
+      daemon = await MockDaemon.start({
+        token: "secret-token",
+        sessions: [
+          {
+            session_id: "00000000-0000-0000-0000-000000000406",
+            state: "running",
+            size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+          },
+        ],
+      });
+      render(<App />);
+
+      await pairWithInvite(user, daemon);
+      await waitForWorkspaceSession();
+      await user.click(screen.getByRole("button", { name: "Refresh" }));
+      await clickSessionCard(user);
+
+      let terminalInput: HTMLTextAreaElement | null = null;
+      await waitFor(() => {
+        terminalInput = document.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
+        expect(terminalInput).not.toBeNull();
+      });
+      (globalThis as { __TERMD_TEST_FIT_DIMENSIONS__?: { rows: number; cols: number } }).__TERMD_TEST_FIT_DIMENSIONS__ = {
+        rows: 30,
+        cols: 100,
+      };
+      const resizeCountBeforeWindowResize = daemon.sessionResizes.length;
+      fireEvent(window, new Event("resize"));
+      await waitFor(() => expect(screen.getByTestId("terminal-pane")).toHaveAttribute("data-viewer-mode", "true"));
+      const scrollport = document.querySelector<HTMLElement>(".terminal-scrollport");
+      expect(scrollport).not.toBeNull();
+      await waitFor(() => expect(scrollport!.scrollTop).toBe(480));
+
+      scrollport!.scrollTop = 0;
+      await user.click(screen.getByRole("button", { name: "Zoom in" }));
+      await screen.findByText("60%");
+      await waitFor(() => expect(scrollport!.scrollTop).toBe(480));
+      const viewerFrame = document.querySelector<HTMLElement>(".terminal-pane-viewer .terminal-viewer-frame");
+      expect(viewerFrame).not.toBeNull();
+      scrollport!.scrollTop = 0;
+      await user.click(viewerFrame!);
+
+      await waitFor(() => expect(screen.getByTestId("terminal-pane")).toHaveAttribute("data-viewer-mode", "false"));
+      await waitFor(() => expect(scrollport!.scrollTop).toBe(480));
+      await waitFor(() =>
+        expect(daemon.sessionCursorUpdates).toContainEqual({
+          session_id: "00000000-0000-0000-0000-000000000406",
+          row: expect.any(Number),
+          col: expect.any(Number),
+          focused: true,
+        }),
+      );
+      expect(daemon.sessionResizes.length).toBeGreaterThan(resizeCountBeforeWindowResize);
+    } finally {
+      restoreViewerLayout();
+    }
   });
 
   it("未配对时只显示连接表单，并按当前页面来源和前缀推导 WebSocket 地址", async () => {

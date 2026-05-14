@@ -1,6 +1,6 @@
 {
-  "name": "termd",
-  "short_name": "termd",
+  "name": "Termd",
+  "short_name": "Termd",
   "description": "Personal persistent terminal workspace",
   "start_url": "/",
   "scope": "/",
