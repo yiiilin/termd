@@ -78,6 +78,7 @@ export function TerminalPane(props: TerminalPaneProps) {
   const viewerModeRef = useRef(false);
   const focusActivationArmedRef = useRef(false);
   const suppressPassiveFocusRef = useRef(false);
+  const windowActiveRef = useRef(true);
   const viewerAutoFitRef = useRef(true);
   const currentFontSizeRef = useRef(TERMINAL_FONT_SIZE);
   const pendingWriteChunksRef = useRef<Uint8Array[]>([]);
@@ -223,7 +224,7 @@ export function TerminalPane(props: TerminalPaneProps) {
 
   useEffect(() => {
     viewerScaleRef.current = viewerScale;
-    if (!focusedRef.current) {
+    if (!hasActiveTerminalFocus()) {
       resizeRef.current?.("viewer");
     }
   }, [viewerScale]);
@@ -282,7 +283,7 @@ export function TerminalPane(props: TerminalPaneProps) {
 
   useEffect(() => {
     sessionSizeRef.current = props.sessionSize;
-    resizeRef.current?.(focusedRef.current ? "session" : "viewer");
+    resizeRef.current?.(hasActiveTerminalFocus() ? "session" : "viewer");
   }, [props.sessionSize?.cols, props.sessionSize?.pixel_height, props.sessionSize?.pixel_width, props.sessionSize?.rows]);
 
   const requestCursorReportFrame = () => {
@@ -441,6 +442,8 @@ export function TerminalPane(props: TerminalPaneProps) {
     return Boolean(element?.closest(".xterm") || element?.closest(".terminal-viewer-frame"));
   };
 
+  const hasActiveTerminalFocus = () => focusedRef.current && windowActiveRef.current;
+
   const armFocusFromTerminalPointer = (event: MouseEvent<HTMLDivElement>) => {
     const target = event.target instanceof Element ? event.target : null;
     if (!isTerminalActivationTarget(target)) {
@@ -448,6 +451,7 @@ export function TerminalPane(props: TerminalPaneProps) {
     }
     // 只有用户明确点到终端渲染区域时，才允许从 viewer 状态重新接管 PTY 尺寸。
     // 缩放后命中目标可能是外层 PTY frame，而不是 xterm 内部节点。
+    windowActiveRef.current = true;
     focusActivationArmedRef.current = true;
     suppressPassiveFocusRef.current = false;
   };
@@ -457,6 +461,7 @@ export function TerminalPane(props: TerminalPaneProps) {
     if (!isTerminalActivationTarget(target)) {
       return;
     }
+    windowActiveRef.current = true;
     terminalRef.current?.focus();
     resizeRef.current?.("focus");
     // 从 viewer 回到 operator 时，xterm 和外层 scrollport 会连续重排；点击后立即贴底，
@@ -547,8 +552,9 @@ export function TerminalPane(props: TerminalPaneProps) {
       let hostWidth = terminalHost.clientWidth;
       let hostHeight = terminalHost.clientHeight;
       const remoteSize = sessionSizeRef.current;
+      const terminalHasActiveFocus = hasActiveTerminalFocus();
       const hostIsRemoteViewerFrame =
-        !focusedRef.current &&
+        !terminalHasActiveFocus &&
         viewerModeRef.current &&
         Boolean(
           remoteSize &&
@@ -587,8 +593,8 @@ export function TerminalPane(props: TerminalPaneProps) {
           proposed &&
           (remoteSize.rows !== proposed.rows || remoteSize.cols !== proposed.cols),
       );
-      viewerModeRef.current = !focusedRef.current && mismatch;
-      if (!focusedRef.current) {
+      viewerModeRef.current = !terminalHasActiveFocus && mismatch;
+      if (!terminalHasActiveFocus) {
         applyFontSize(terminal, TERMINAL_FONT_SIZE);
         if (remoteSize) {
           if (sameTerminalDimensions(terminal, remoteSize)) {
@@ -727,15 +733,25 @@ export function TerminalPane(props: TerminalPaneProps) {
       }
       queueCursorReport({ immediate: true });
     };
+    const blurActiveTerminalElement = () => {
+      const activeElement = document.activeElement;
+      if (activeElement instanceof HTMLElement && host.contains(activeElement)) {
+        activeElement.blur();
+      }
+    };
     const handleFocusIn = () => {
       clearPendingFocusOut();
+      if (!windowActiveRef.current) {
+        focusedRef.current = false;
+        setFocused(false);
+        blurActiveTerminalElement();
+        queueCursorReport({ immediate: true });
+        return;
+      }
       if (suppressPassiveFocusRef.current && !focusActivationArmedRef.current) {
         focusedRef.current = false;
         setFocused(false);
-        const activeElement = document.activeElement;
-        if (activeElement instanceof HTMLElement && host.contains(activeElement)) {
-          activeElement.blur();
-        }
+        blurActiveTerminalElement();
         queueCursorReport({ immediate: true });
         return;
       }
@@ -758,8 +774,35 @@ export function TerminalPane(props: TerminalPaneProps) {
         reportFocus(false);
       }, FOCUS_OUT_SETTLE_MS);
     };
+    const handleWindowBlur = () => {
+      windowActiveRef.current = false;
+      focusActivationArmedRef.current = false;
+      suppressPassiveFocusRef.current = true;
+      clearPendingFocusOut();
+      // 真实浏览器切到另一个窗口后，旧窗口的 textarea 可能仍留着 DOM focus。
+      // 这里立即撤销 operator 聚焦态，避免旧窗口继续按自己的布局上报 PTY resize。
+      reportFocus(false);
+      blurActiveTerminalElement();
+      resize("viewer");
+    };
+    const handleWindowFocus = () => {
+      windowActiveRef.current = true;
+      focusActivationArmedRef.current = false;
+      // 回到浏览器窗口不等于用户要接管 PTY；仍需点击终端区域重新激活。
+      suppressPassiveFocusRef.current = true;
+    };
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "hidden") {
+        handleWindowBlur();
+        return;
+      }
+      handleWindowFocus();
+    };
     host.addEventListener("focusin", handleFocusIn);
     host.addEventListener("focusout", handleFocusOut);
+    window.addEventListener("blur", handleWindowBlur);
+    window.addEventListener("focus", handleWindowFocus);
+    document.addEventListener("visibilitychange", handleVisibilityChange);
     terminalRef.current = terminal;
     fitRef.current = fit;
     outputResetVersionRef.current = props.outputResetVersion;
@@ -826,6 +869,9 @@ export function TerminalPane(props: TerminalPaneProps) {
       }
       lastMobileScrollReportAtRef.current = 0;
       window.removeEventListener("resize", handleWindowResize);
+      window.removeEventListener("blur", handleWindowBlur);
+      window.removeEventListener("focus", handleWindowFocus);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
       resizeObserver?.disconnect();
       host.removeEventListener("focusin", handleFocusIn);
       host.removeEventListener("focusout", handleFocusOut);
@@ -853,6 +899,7 @@ export function TerminalPane(props: TerminalPaneProps) {
       viewerModeRef.current = false;
       focusActivationArmedRef.current = false;
       suppressPassiveFocusRef.current = true;
+      windowActiveRef.current = true;
       setFocused(false);
       setCopyToastVisible(false);
       setMobileScrollRatio(1);
@@ -958,8 +1005,9 @@ export function TerminalPane(props: TerminalPaneProps) {
             className="terminal-viewer-frame"
             ref={frameRef}
             style={viewerFrameStyle}
+            onMouseDownCapture={armFocusFromTerminalPointer}
             onMouseDown={armFocusFromTerminalPointer}
-            onClick={focusTerminalFromTerminalClick}
+            onClickCapture={focusTerminalFromTerminalClick}
           >
             <div
               className="terminal-host"

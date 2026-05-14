@@ -391,7 +391,7 @@ export class MockDaemon {
         if (session) {
           session.size = payload.size;
         }
-        this.sendInner(connection, envelope("session_resized", payload));
+        this.broadcastSessionResized(payload.session_id, payload.size);
         return;
       }
       case "session_rename": {
@@ -610,6 +610,14 @@ export class MockDaemon {
     // 测试桩和真实 daemon 保持一致：session 级操作必须来自已 attach 的连接。
     this.sendError(connection, "invalid_state", "invalid protocol state");
     return false;
+  }
+
+  private broadcastSessionResized(sessionId: UUID, size: TerminalSize): void {
+    for (const connection of this.connections) {
+      if (connection.e2ee && connection.attachedSessionIds.has(sessionId)) {
+        this.sendInner(connection, envelope("session_resized", { session_id: sessionId, size }));
+      }
+    }
   }
 
   private handlePairRequest(connection: MockConnection, payload: PairRequestPayload): void {

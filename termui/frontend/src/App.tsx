@@ -144,6 +144,7 @@ export default function App() {
   const reattachCurrentSessionOnOpenRef = useRef(false);
   const userDetachedRef = useRef(false);
   const pendingResizeKeyRef = useRef<string | undefined>(undefined);
+  const confirmedSessionSizesRef = useRef<Map<UUID, TerminalSize>>(new Map());
   const receiveLoopActiveRef = useRef(false);
   const closingSessionIdsRef = useRef<Set<UUID>>(new Set());
   const forgettingClientIdsRef = useRef<Set<UUID>>(new Set());
@@ -404,6 +405,7 @@ export default function App() {
     attachClientRef.current = undefined;
     attachedSessionRef.current = undefined;
     pendingResizeKeyRef.current = undefined;
+    confirmedSessionSizesRef.current.clear();
     setAttachedSessionId(undefined);
     lastCursorReportRef.current = "";
     lastCursorFocusedRef.current = undefined;
@@ -442,6 +444,7 @@ export default function App() {
 
   const resetWorkspaceState = useCallback(() => {
     setSessions([]);
+    confirmedSessionSizesRef.current.clear();
     setSessionOrder([]);
     sessionOrderRef.current = [];
     autoAttachAttemptedSessionRef.current = undefined;
@@ -556,6 +559,7 @@ export default function App() {
       setPairingToken("");
       setConnectionEditorOpen(false);
       setSessions([]);
+      confirmedSessionSizesRef.current.clear();
       setSessionOrder([]);
       sessionOrderRef.current = [];
       autoAttachAttemptedSessionRef.current = undefined;
@@ -629,6 +633,7 @@ export default function App() {
       const nextState = await recordServerUrl(server.server_id, effectiveUrl);
       setState(nextState);
       setSessions([]);
+      confirmedSessionSizesRef.current.clear();
       setSessionOrder([]);
       sessionOrderRef.current = [];
       autoAttachAttemptedSessionRef.current = undefined;
@@ -669,6 +674,7 @@ export default function App() {
       setError(undefined);
       disconnectAttach();
       setSessions([]);
+      confirmedSessionSizesRef.current.clear();
       setSessionOrder([]);
       sessionOrderRef.current = [];
       autoAttachAttemptedSessionRef.current = undefined;
@@ -777,6 +783,7 @@ export default function App() {
       sessionOrderRef.current = nextOrder;
       setSessionOrder(nextOrder);
       const orderedSessions = orderSessions(sortSessionsNewestFirst(list.sessions), nextOrder);
+      confirmedSessionSizesRef.current = new Map(list.sessions.map((session) => [session.session_id, session.size]));
       const firstSessionId = userDetachedRef.current
         ? undefined
         : orderedSessions.at(0)?.session_id ?? renamingSessionIdRef.current ?? attachedSessionRef.current;
@@ -810,6 +817,7 @@ export default function App() {
           const nextOrder = mergeSessionOrder(sessionOrderRef.current, sessionList.sessions);
           sessionOrderRef.current = nextOrder;
           setSessionOrder(nextOrder);
+          confirmedSessionSizesRef.current = new Map(sessionList.sessions.map((session) => [session.session_id, session.size]));
           setSessions((current) =>
             mergeSessionRefresh(sessionList.sessions, current, [
               renamingSessionIdRef.current,
@@ -910,6 +918,7 @@ export default function App() {
             const payload = inner.payload as SessionResizedPayload;
             // session_resize 是请求，session_resized 才是 daemon 确认；前端只在这里更新
             // session size，TerminalPane 随后按这份确认尺寸执行本地 xterm resize。
+            confirmedSessionSizesRef.current.set(payload.session_id, payload.size);
             setSessions((current) =>
               current.map((session) =>
                 session.session_id === payload.session_id ? { ...session, size: payload.size } : session,
@@ -959,6 +968,7 @@ export default function App() {
         const attached = await client.attachSession(sessionId);
         attachClientRef.current = client;
         attachedSessionRef.current = sessionId;
+        confirmedSessionSizesRef.current.set(attached.session_id, attached.size);
         setSelectedSessionId(sessionId);
         setAttachedSessionId(sessionId);
         setSessions((current) => upsertAttachedSession(current, attached, sessionOrderRef.current));
@@ -1026,6 +1036,7 @@ export default function App() {
       const created = await client.createSession([], DEFAULT_SESSION_SIZE);
       attachClientRef.current = client;
       attachedSessionRef.current = created.session_id;
+      confirmedSessionSizesRef.current.set(created.session_id, created.size);
       setSelectedSessionId(created.session_id);
       setAttachedSessionId(created.session_id);
       clearNewOutputMark(created.session_id);
@@ -1171,6 +1182,7 @@ export default function App() {
           }
         }
         setSessions((current) => current.filter((session) => session.session_id !== sessionId));
+        confirmedSessionSizesRef.current.delete(sessionId);
         sessionOrderRef.current = sessionOrderRef.current.filter((candidate) => candidate !== sessionId);
         setSessionOrder(sessionOrderRef.current);
         clearNewOutputMark(sessionId);
@@ -1268,7 +1280,9 @@ export default function App() {
       if (!client || !sessionId) {
         return;
       }
-      const currentSize = sessions.find((session) => session.session_id === sessionId)?.size;
+      const currentSize =
+        confirmedSessionSizesRef.current.get(sessionId) ??
+        sessions.find((session) => session.session_id === sessionId)?.size;
       const nextResizeKey = terminalSizeKey(sessionId, size);
       if (
         (currentSize && sameTerminalSize(currentSize, size)) ||

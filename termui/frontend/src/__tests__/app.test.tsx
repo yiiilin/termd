@@ -523,6 +523,43 @@ describe("termui web 工作台", () => {
     expect(await screen.findByRole("status")).toHaveTextContent("复制成功");
   });
 
+  it("点击 xterm 已渲染文字也能聚焦终端", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await clickSessionCard(user);
+    await screen.findByText(/termd-e2e-ready/);
+
+    const terminalInput = document.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
+    const xterm = document.querySelector<HTMLElement>(".xterm");
+    expect(terminalInput).not.toBeNull();
+    expect(xterm).not.toBeNull();
+    terminalInput!.blur();
+
+    const renderedText = document.createElement("span");
+    renderedText.textContent = "rendered-terminal-text";
+    // xterm 的文字层会处理鼠标选择，真实浏览器里可能阻断冒泡阶段事件。
+    // 测试这里显式阻断冒泡，确保外层捕获阶段仍能完成聚焦。
+    renderedText.addEventListener("mousedown", (event) => event.stopPropagation());
+    renderedText.addEventListener("click", (event) => event.stopPropagation());
+    xterm!.append(renderedText);
+
+    fireEvent.mouseDown(renderedText);
+    fireEvent.click(renderedText);
+
+    await waitFor(() => expect(document.activeElement).toBe(terminalInput));
+    await waitFor(() =>
+      expect(daemon.sessionCursorUpdates).toContainEqual({
+        session_id: DEFAULT_SESSION_ID,
+        row: expect.any(Number),
+        col: expect.any(Number),
+        focused: true,
+      }),
+    );
+  });
+
   it("移动端顶部菜单保持 terminal-first，并把 daemon 管理放到独立后台页", async () => {
     setViewportWidth(390);
     const user = userEvent.setup();
@@ -1917,6 +1954,145 @@ describe("termui web 工作台", () => {
       .map((update) => update.focused);
     expect(focusUpdates).not.toContain(false);
     expect(screen.getByTestId("terminal-pane")).toHaveAttribute("data-viewer-mode", "false");
+  });
+
+  it("浏览器窗口失活后不再继续上报 PTY resize", async () => {
+    const user = userEvent.setup();
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [
+        {
+          session_id: "00000000-0000-0000-0000-000000000408",
+          state: "running",
+          size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+        },
+      ],
+    });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await user.click(screen.getByRole("button", { name: "Refresh" }));
+    await clickSessionCard(user);
+
+    let terminalInput: HTMLTextAreaElement | null = null;
+    await waitFor(() => {
+      terminalInput = document.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
+      expect(terminalInput).not.toBeNull();
+    });
+    terminalInput!.focus();
+    await waitFor(() =>
+      expect(daemon.sessionCursorUpdates).toContainEqual({
+        session_id: "00000000-0000-0000-0000-000000000408",
+        row: expect.any(Number),
+        col: expect.any(Number),
+        focused: true,
+      }),
+    );
+
+    daemon.sessionCursorUpdates.length = 0;
+    const resizeCountAfterFocus = daemon.sessionResizes.length;
+    fireEvent(window, new Event("blur"));
+    await waitFor(() =>
+      expect(daemon.sessionCursorUpdates).toContainEqual({
+        session_id: "00000000-0000-0000-0000-000000000408",
+        row: expect.any(Number),
+        col: expect.any(Number),
+        focused: false,
+      }),
+    );
+
+    (globalThis as { __TERMD_TEST_FIT_DIMENSIONS__?: { rows: number; cols: number } }).__TERMD_TEST_FIT_DIMENSIONS__ = {
+      rows: 30,
+      cols: 100,
+    };
+    fireEvent(window, new Event("resize"));
+    await new Promise((resolve) => window.setTimeout(resolve, 160));
+
+    expect(daemon.sessionResizes).toHaveLength(resizeCountAfterFocus);
+    expect(screen.getByTestId("terminal-pane")).toHaveAttribute("data-viewer-mode", "true");
+  });
+
+  it("收到其他窗口的 session_resized 后不反向抢回本地尺寸", async () => {
+    const user = userEvent.setup();
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [
+        {
+          session_id: "00000000-0000-0000-0000-000000000409",
+          state: "running",
+          size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+        },
+      ],
+    });
+    const firstRender = render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await user.click(screen.getByRole("button", { name: "Refresh" }));
+    await clickSessionCard(user);
+
+    let firstTerminalInput: HTMLTextAreaElement | null = null;
+    await waitFor(() => {
+      firstTerminalInput = document.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
+      expect(firstTerminalInput).not.toBeNull();
+    });
+    firstTerminalInput!.focus();
+    await waitFor(() =>
+      expect(daemon.sessionCursorUpdates).toContainEqual({
+        session_id: "00000000-0000-0000-0000-000000000409",
+        row: expect.any(Number),
+        col: expect.any(Number),
+        focused: true,
+      }),
+    );
+    fireEvent(window, new Event("blur"));
+    await waitFor(() =>
+      expect(daemon.sessionCursorUpdates).toContainEqual({
+        session_id: "00000000-0000-0000-0000-000000000409",
+        row: expect.any(Number),
+        col: expect.any(Number),
+        focused: false,
+      }),
+    );
+
+    const resizeCountAfterBlur = daemon.sessionResizes.length;
+    const secondRender = render(<App />);
+    await waitForWorkspaceSession();
+    await user.click(screen.getAllByRole("button", { name: "Refresh" }).at(-1)!);
+    await clickSessionCard(user, undefined, secondRender.container);
+
+    await waitFor(() => {
+      expect(secondRender.container.querySelector(".xterm-helper-textarea")).not.toBeNull();
+    });
+    (globalThis as { __TERMD_TEST_FIT_DIMENSIONS__?: { rows: number; cols: number } }).__TERMD_TEST_FIT_DIMENSIONS__ = {
+      rows: 30,
+      cols: 100,
+    };
+    const secondTerminalFrame = secondRender.container.querySelector<HTMLElement>(".terminal-viewer-frame");
+    expect(secondTerminalFrame).not.toBeNull();
+    await user.click(secondTerminalFrame!);
+
+    await waitFor(() =>
+      expect(daemon.sessionResizes).toContainEqual({
+        session_id: "00000000-0000-0000-0000-000000000409",
+        size: { rows: 30, cols: 100, pixel_width: expect.any(Number), pixel_height: expect.any(Number) },
+      }),
+    );
+    await new Promise((resolve) => window.setTimeout(resolve, 160));
+
+    const laterResizes = daemon.sessionResizes.slice(resizeCountAfterBlur);
+    expect(laterResizes).toEqual([
+      {
+        session_id: "00000000-0000-0000-0000-000000000409",
+        size: { rows: 30, cols: 100, pixel_width: expect.any(Number), pixel_height: expect.any(Number) },
+      },
+    ]);
+
+    secondRender.unmount();
+    firstRender.unmount();
   });
 
   it("非聚焦窗口 resize 进入 viewer，点击终端面板仍可重新聚焦", async () => {

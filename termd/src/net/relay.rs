@@ -46,6 +46,10 @@ enum RelayPushEvent {
         client_id: RelayClientId,
         session_id: SessionId,
     },
+    Resize {
+        client_id: RelayClientId,
+        session_id: SessionId,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -367,6 +371,7 @@ async fn connect_relay_mux_base_with_heartbeat(
     let (push_event_tx, mut push_event_rx) = mpsc::unbounded_channel::<RelayPushEvent>();
     let mut watched_output_sessions = HashMap::<RelayClientId, HashSet<SessionId>>::new();
     let mut watched_file_tree_sessions = HashMap::<RelayClientId, HashSet<SessionId>>::new();
+    let mut watched_resize_sessions = HashMap::<RelayClientId, HashSet<SessionId>>::new();
     let mut watcher_tasks = HashMap::<RelayClientId, Vec<JoinHandle<()>>>::new();
     let mut heartbeat = tokio::time::interval_at(
         tokio::time::Instant::now() + heartbeat_interval,
@@ -405,6 +410,7 @@ async fn connect_relay_mux_base_with_heartbeat(
                             &protocol,
                             &mut watched_output_sessions,
                             &mut watched_file_tree_sessions,
+                            &mut watched_resize_sessions,
                             &push_event_tx,
                             &mut watcher_tasks,
                         );
@@ -428,6 +434,7 @@ async fn connect_relay_mux_base_with_heartbeat(
                             &protocol,
                             &mut watched_output_sessions,
                             &mut watched_file_tree_sessions,
+                            &mut watched_resize_sessions,
                             &push_event_tx,
                             &mut watcher_tasks,
                         );
@@ -456,6 +463,7 @@ async fn connect_relay_mux_base_with_heartbeat(
                     let (client_id, session_id) = match event {
                         RelayPushEvent::Output { client_id, session_id } => (client_id, session_id),
                         RelayPushEvent::FileTree { client_id, session_id } => (client_id, session_id),
+                        RelayPushEvent::Resize { client_id, session_id } => (client_id, session_id),
                     };
                     let Some(connection) = connections.get_mut(&client_id) else {
                         continue;
@@ -469,6 +477,9 @@ async fn connect_relay_mux_base_with_heartbeat(
                         ),
                         RelayPushEvent::FileTree { .. } => {
                             connection.read_session_file_tree_update(&mut protocol, session_id)
+                        }
+                        RelayPushEvent::Resize { .. } => {
+                            connection.read_session_resize_update(&mut protocol, session_id)
                         }
                     };
                     (client_id, responses)
@@ -646,6 +657,7 @@ fn sync_relay_watchers_for_client(
     protocol: &SharedDaemonProtocol,
     watched_output_sessions: &mut HashMap<RelayClientId, HashSet<SessionId>>,
     watched_file_tree_sessions: &mut HashMap<RelayClientId, HashSet<SessionId>>,
+    watched_resize_sessions: &mut HashMap<RelayClientId, HashSet<SessionId>>,
     push_event_tx: &mpsc::UnboundedSender<RelayPushEvent>,
     watcher_tasks: &mut HashMap<RelayClientId, Vec<JoinHandle<()>>>,
 ) {
@@ -657,16 +669,18 @@ fn sync_relay_watchers_for_client(
             client_id,
             watched_output_sessions,
             watched_file_tree_sessions,
+            watched_resize_sessions,
             watcher_tasks,
         );
         return;
     };
 
-    let (output_signals, file_tree_signals) = {
+    let (output_signals, file_tree_signals, resize_signals) = {
         let protocol = protocol.lock().expect("daemon protocol mutex poisoned");
         (
             connection.attached_output_signals(&protocol),
             connection.attached_file_tree_signals(&protocol),
+            connection.attached_resize_signals(&protocol),
         )
     };
 
@@ -725,16 +739,47 @@ fn sync_relay_watchers_for_client(
                 }
             }));
     }
+
+    for (session_id, mut signal) in resize_signals {
+        let watched = watched_resize_sessions.entry(client_id).or_default();
+        if !watched.insert(session_id) {
+            continue;
+        }
+        signal.borrow_and_update();
+
+        let push_event_tx = push_event_tx.clone();
+        watcher_tasks
+            .entry(client_id)
+            .or_default()
+            .push(tokio::spawn(async move {
+                loop {
+                    if signal.changed().await.is_err() {
+                        break;
+                    }
+                    if push_event_tx
+                        .send(RelayPushEvent::Resize {
+                            client_id,
+                            session_id,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }));
+    }
 }
 
 fn remove_relay_watchers_for_client(
     client_id: RelayClientId,
     watched_output_sessions: &mut HashMap<RelayClientId, HashSet<SessionId>>,
     watched_file_tree_sessions: &mut HashMap<RelayClientId, HashSet<SessionId>>,
+    watched_resize_sessions: &mut HashMap<RelayClientId, HashSet<SessionId>>,
     watcher_tasks: &mut HashMap<RelayClientId, Vec<JoinHandle<()>>>,
 ) {
     watched_output_sessions.remove(&client_id);
     watched_file_tree_sessions.remove(&client_id);
+    watched_resize_sessions.remove(&client_id);
     if let Some(tasks) = watcher_tasks.remove(&client_id) {
         for task in tasks {
             task.abort();

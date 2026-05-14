@@ -45,6 +45,7 @@ enum SessionPushEvent {
     Output(SessionId),
     Activity(SessionId),
     FileTree(SessionId),
+    Resize(SessionId),
 }
 
 pub type DefaultDaemonProtocol = DaemonProtocol<SupervisorPtyBackend, Ed25519SignatureVerifier>;
@@ -516,6 +517,7 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
     let mut watched_output_sessions = HashSet::new();
     let mut watched_activity_sessions = HashSet::new();
     let mut watched_file_tree_sessions = HashSet::new();
+    let mut watched_resize_sessions = HashSet::new();
     let mut watcher_tasks: Vec<JoinHandle<()>> = Vec::new();
     let server_id = {
         let protocol = protocol.lock().expect("daemon protocol mutex poisoned");
@@ -595,6 +597,7 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
                             &mut watched_output_sessions,
                             &mut watched_activity_sessions,
                             &mut watched_file_tree_sessions,
+                            &mut watched_resize_sessions,
                             &push_event_tx,
                             &mut watcher_tasks,
                         );
@@ -633,6 +636,9 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
                         SessionPushEvent::FileTree(session_id) => {
                             connection.read_session_file_tree_update(&mut protocol, session_id)
                         }
+                        SessionPushEvent::Resize(session_id) => {
+                            connection.read_session_resize_update(&mut protocol, session_id)
+                        }
                     }
                 };
                 if send_envelopes(&mut sender, responses).await.is_err() {
@@ -657,15 +663,17 @@ fn register_session_watchers(
     watched_output_sessions: &mut HashSet<SessionId>,
     watched_activity_sessions: &mut HashSet<SessionId>,
     watched_file_tree_sessions: &mut HashSet<SessionId>,
+    watched_resize_sessions: &mut HashSet<SessionId>,
     push_event_tx: &mpsc::UnboundedSender<SessionPushEvent>,
     watcher_tasks: &mut Vec<JoinHandle<()>>,
 ) {
-    let (output_signals, activity_signals, file_tree_signals) = {
+    let (output_signals, activity_signals, file_tree_signals, resize_signals) = {
         let protocol = protocol.lock().expect("daemon protocol mutex poisoned");
         (
             connection.attached_output_signals(&protocol),
             connection.session_activity_signals(&protocol),
             connection.attached_file_tree_signals(&protocol),
+            connection.attached_resize_signals(&protocol),
         )
     };
 
@@ -713,15 +721,31 @@ fn register_session_watchers(
             watcher_tasks,
         );
     }
+
+    for (session_id, signal) in resize_signals {
+        if !watched_resize_sessions.insert(session_id) {
+            continue;
+        }
+
+        spawn_session_push_watcher(
+            session_id,
+            signal,
+            SessionPushEvent::Resize(session_id),
+            push_event_tx,
+            watcher_tasks,
+        );
+    }
 }
 
-fn spawn_session_push_watcher(
+fn spawn_session_push_watcher<T>(
     session_id: SessionId,
-    mut signal: watch::Receiver<u64>,
+    mut signal: watch::Receiver<T>,
     event: SessionPushEvent,
     push_event_tx: &mpsc::UnboundedSender<SessionPushEvent>,
     watcher_tasks: &mut Vec<JoinHandle<()>>,
-) {
+) where
+    T: Clone + Send + Sync + 'static,
+{
     // watch 新订阅者可能把当前版本视为“未读”；先标记已读，避免 attach 时把历史输出
     // 误推成 session_activity，导致前端一直显示 new output。
     signal.borrow_and_update();
@@ -736,6 +760,7 @@ fn spawn_session_push_watcher(
                 SessionPushEvent::Output(_) => SessionPushEvent::Output(session_id),
                 SessionPushEvent::Activity(_) => SessionPushEvent::Activity(session_id),
                 SessionPushEvent::FileTree(_) => SessionPushEvent::FileTree(session_id),
+                SessionPushEvent::Resize(_) => SessionPushEvent::Resize(session_id),
             };
             if push_event_tx.send(next_event).is_err() {
                 break;

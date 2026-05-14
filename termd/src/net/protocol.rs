@@ -281,6 +281,7 @@ pub struct DaemonProtocol<B: PtyBackend, V> {
     client_history: ClientHistoryStore,
     session_output_history: HashMap<SessionId, SessionOutputHistory>,
     session_file_tree_signals: HashMap<SessionId, watch::Sender<u64>>,
+    session_resize_signals: HashMap<SessionId, watch::Sender<TerminalSize>>,
 }
 
 impl<B, V> DaemonProtocol<B, V>
@@ -372,6 +373,7 @@ where
             client_history,
             session_output_history: HashMap::new(),
             session_file_tree_signals: HashMap::new(),
+            session_resize_signals: HashMap::new(),
         })
     }
 
@@ -656,6 +658,9 @@ where
         let (file_tree_signal, _) = watch::channel(0);
         self.session_file_tree_signals
             .insert(wire_session_id, file_tree_signal);
+        let (resize_signal, _) = watch::channel(payload.size);
+        self.session_resize_signals
+            .insert(wire_session_id, resize_signal);
         self.client_history.record_session_created(
             wire_session_id,
             self.runtime_state_proto(&internal_session_id)?,
@@ -775,6 +780,7 @@ where
         if let Some(history) = self.session_output_history.get_mut(&payload.session_id) {
             history.resize(payload.size);
         }
+        self.notify_session_resized(payload.session_id, payload.size);
         self.client_history.record_session_resized(
             payload.session_id,
             payload.size,
@@ -910,6 +916,7 @@ where
         self.session_roots.remove(&session_id);
         self.session_output_history.remove(&session_id);
         self.session_file_tree_signals.remove(&session_id);
+        self.session_resize_signals.remove(&session_id);
         for record in self.daemon_clients.values_mut() {
             for sessions in record.active_connections.values_mut() {
                 sessions.remove(&session_id);
@@ -1701,6 +1708,14 @@ where
         let _ = signal.send(next_version);
     }
 
+    fn notify_session_resized(&self, session_id: SessionId, size: TerminalSize) {
+        let Some(signal) = self.session_resize_signals.get(&session_id) else {
+            return;
+        };
+        // resize 是 session 元数据，不含终端明文；推送给已 attach 连接可避免多窗口尺寸认知分叉。
+        let _ = signal.send(size);
+    }
+
     fn detach_connection(&mut self, connection: &mut ProtocolConnection) {
         let Some(device_id) = connection.authenticated_device_id else {
             connection.state = ProtocolConnectionState::Closed;
@@ -1777,6 +1792,19 @@ where
             .map(watch::Sender::subscribe))
     }
 
+    fn resize_signal(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<watch::Receiver<TerminalSize>>, ProtocolError> {
+        if !self.session_index.contains_key(&session_id) {
+            return Err(ProtocolError::SessionNotFound);
+        }
+        Ok(self
+            .session_resize_signals
+            .get(&session_id)
+            .map(watch::Sender::subscribe))
+    }
+
     fn restore_runtime_sessions(&mut self, sessions: Vec<SessionStateRecord>) {
         let persisted_by_id = self.visible_session_metadata_by_id();
 
@@ -1801,6 +1829,9 @@ where
                     let (file_tree_signal, _) = watch::channel(0);
                     self.session_file_tree_signals
                         .insert(wire_session_id, file_tree_signal);
+                    let (resize_signal, _) = watch::channel(session.size);
+                    self.session_resize_signals
+                        .insert(wire_session_id, resize_signal);
                     let metadata = self
                         .restored_session_metadata(&session, persisted_by_id.get(&wire_session_id));
                     self.session_roots
@@ -2363,6 +2394,22 @@ impl ProtocolConnection {
         }
     }
 
+    /// 读取并加密当前 session 的 resize 状态，用于多窗口同步 PTY 尺寸元数据。
+    pub fn read_session_resize_update<B, V>(
+        &mut self,
+        protocol: &mut DaemonProtocol<B, V>,
+        session_id: SessionId,
+    ) -> Vec<JsonEnvelope>
+    where
+        B: PtyBackend,
+        V: SignatureVerifier,
+    {
+        match self.try_read_session_resize_update(protocol, session_id) {
+            Ok(messages) => messages,
+            Err(error) => vec![self.error_response(error)],
+        }
+    }
+
     /// 批量 flush 当前连接已 attach 的所有 session 输出。
     ///
     /// server 层在 attach/create 后调用本方法，把 watcher 注册前已经缓存的 PTY 输出立即发走；
@@ -2450,6 +2497,27 @@ impl ProtocolConnection {
             .filter_map(|session_id| {
                 protocol
                     .file_tree_signal(*session_id)
+                    .ok()
+                    .flatten()
+                    .map(|signal| (*session_id, signal))
+            })
+            .collect()
+    }
+
+    /// 返回当前连接已 attach session 的 resize 信号，供 WebSocket 层向其他窗口同步尺寸。
+    pub fn attached_resize_signals<B, V>(
+        &self,
+        protocol: &DaemonProtocol<B, V>,
+    ) -> Vec<(SessionId, watch::Receiver<TerminalSize>)>
+    where
+        B: PtyBackend,
+        V: SignatureVerifier,
+    {
+        self.attached_sessions
+            .iter()
+            .filter_map(|session_id| {
+                protocol
+                    .resize_signal(*session_id)
                     .ok()
                     .flatten()
                     .map(|signal| (*session_id, signal))
@@ -2658,6 +2726,31 @@ impl ProtocolConnection {
 
         let update = protocol.session_file_tree_update(session_id)?;
         self.encrypt_inner_messages(vec![update])
+    }
+
+    fn try_read_session_resize_update<B, V>(
+        &mut self,
+        protocol: &mut DaemonProtocol<B, V>,
+        session_id: SessionId,
+    ) -> Result<Vec<JsonEnvelope>, ProtocolError>
+    where
+        B: PtyBackend,
+        V: SignatureVerifier,
+    {
+        self.authenticated_device_id()?;
+        if !self.attached_sessions.contains(&session_id) {
+            return Err(ProtocolError::InvalidState);
+        }
+        let internal_session_id = protocol
+            .session_index
+            .get(&session_id)
+            .ok_or(ProtocolError::SessionNotFound)?;
+        let size = protocol.runtime_size_proto(internal_session_id)?;
+
+        self.encrypt_inner_messages(vec![envelope_value(
+            MessageType::SessionResized,
+            SessionResizedPayload { session_id, size },
+        )?])
     }
 
     fn handle_inner_envelope<B, V>(
@@ -4950,6 +5043,99 @@ mod tests {
         assert_eq!(resized.kind, MessageType::SessionResized);
         assert_eq!(resized_payload.session_id, created_payload.session_id);
         assert_eq!(resized_payload.size, resized_size);
+    }
+
+    #[test]
+    fn attached_resize_signal_pushes_session_resized_to_other_connection() {
+        let (mut protocol, _) = protocol();
+        let (mut first_connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = PublicKey(wire(signing_key.verifying_key().as_bytes()));
+        let (_, mut first_crypto) = open_e2ee(&mut protocol, &mut first_connection, device_id);
+        pair_device(
+            &mut protocol,
+            &mut first_connection,
+            &mut first_crypto,
+            device_id,
+            public_key,
+        );
+        let create_responses = send_encrypted(
+            &mut protocol,
+            &mut first_connection,
+            &mut first_crypto,
+            envelope_value(
+                MessageType::SessionCreate,
+                SessionCreatePayload {
+                    command: vec!["sh".to_owned()],
+                    size: TerminalSize::new(24, 80),
+                },
+            )
+            .unwrap(),
+        );
+        let created = decrypt_first(&mut first_crypto, create_responses);
+        let created_payload: SessionCreatedPayload = decode_payload(created.payload).unwrap();
+
+        let (mut second_connection, _) = protocol.start_connection();
+        let mut second_crypto = authenticate_paired_connection(
+            &mut protocol,
+            &mut second_connection,
+            device_id,
+            &signing_key,
+        );
+        let attach_responses = send_encrypted(
+            &mut protocol,
+            &mut second_connection,
+            &mut second_crypto,
+            envelope_value(
+                MessageType::SessionAttach,
+                SessionAttachPayload {
+                    session_id: created_payload.session_id,
+                },
+            )
+            .unwrap(),
+        );
+        let attached = decrypt_first(&mut second_crypto, attach_responses);
+        assert_eq!(attached.kind, MessageType::SessionAttached);
+
+        let mut resize_signal = second_connection
+            .attached_resize_signals(&protocol)
+            .into_iter()
+            .find(|(session_id, _)| *session_id == created_payload.session_id)
+            .map(|(_, signal)| signal)
+            .expect("attached connection should subscribe to resize changes");
+        resize_signal.borrow_and_update();
+
+        let resized_size = TerminalSize {
+            rows: 32,
+            cols: 120,
+            pixel_width: 1000,
+            pixel_height: 700,
+        };
+        let first_ack = send_encrypted(
+            &mut protocol,
+            &mut first_connection,
+            &mut first_crypto,
+            envelope_value(
+                MessageType::SessionResize,
+                SessionResizePayload {
+                    session_id: created_payload.session_id,
+                    size: resized_size,
+                },
+            )
+            .unwrap(),
+        );
+        let first_ack = decrypt_first(&mut first_crypto, first_ack);
+        assert_eq!(first_ack.kind, MessageType::SessionResized);
+        assert!(resize_signal.has_changed().unwrap());
+
+        let push =
+            second_connection.read_session_resize_update(&mut protocol, created_payload.session_id);
+        let push = decrypt_first(&mut second_crypto, push);
+        let push_payload: SessionResizedPayload = decode_payload(push.payload).unwrap();
+        assert_eq!(push.kind, MessageType::SessionResized);
+        assert_eq!(push_payload.session_id, created_payload.session_id);
+        assert_eq!(push_payload.size, resized_size);
     }
 
     #[test]
