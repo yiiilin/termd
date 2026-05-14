@@ -1,6 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command as ProcessCommand;
+use std::process::{Command as ProcessCommand, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::{Engine as _, engine::general_purpose};
@@ -12,6 +12,7 @@ use termd::net::protocol::{
     DaemonProtocol, JsonEnvelope, ProtocolConnection, decode_payload,
     encrypted_frame_from_envelope, envelope_value,
 };
+use termd::net::server::try_default_protocol;
 use termd::net::signature::Ed25519SignatureVerifier;
 use termd::net::{E2eeKeyPair, E2eeSession, E2eeSessionContext, E2eeSessionRole};
 use termd::pty::supervisor::SupervisorPtyBackend;
@@ -415,6 +416,91 @@ fn daemon_session_list_shows_restored_supervisor_without_client_history_metadata
     let closed_payload: SessionClosedPayload = decode_payload(closed.payload).unwrap();
     assert_eq!(closed.kind, MessageType::SessionClosed);
     assert_eq!(closed_payload.session_id, session_id);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn daemon_startup_adopts_live_supervisor_when_runtime_row_is_missing() {
+    let state_dir = std::env::temp_dir().join(format!(
+        "td-a-{}-{}",
+        std::process::id(),
+        current_unix_timestamp_millis().0
+    ));
+    fs::create_dir_all(&state_dir).unwrap();
+    let state_path = state_dir.join("daemon-state.json");
+    let socket_dir = state_dir.join("termd-supervisors");
+    fs::create_dir_all(&socket_dir).unwrap();
+    let binary_path = PathBuf::from(env!("CARGO_BIN_EXE_termd"));
+    let session_id = "00000000-0000-0000-0000-000000000777";
+    let socket_path = socket_dir.join(format!("{session_id}.sock"));
+    let pid_file = state_dir.join("session-supervisor.pid");
+    let log_file = state_dir.join("session-supervisor.log");
+    let command = CommandSpec::new("sh").args(["-lc", "printf adopted-live; sleep 60"]);
+    let size = PtySize::with_pixels(28, 90, 1440, 900);
+
+    let command_base64 =
+        general_purpose::STANDARD.encode(serde_json::to_vec(&command).expect("command serializes"));
+    let size_base64 =
+        general_purpose::STANDARD.encode(serde_json::to_vec(&size).expect("size serializes"));
+    let stdout_log = fs::File::create(&log_file).unwrap();
+    let stderr_log = stdout_log.try_clone().unwrap();
+    let mut supervisor = ProcessCommand::new(&binary_path)
+        .args([
+            "__session-supervisor",
+            "--session-id",
+            session_id,
+            "--socket-path",
+            socket_path.to_string_lossy().as_ref(),
+            "--command-base64",
+            &command_base64,
+            "--size-base64",
+            &size_base64,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout_log))
+        .stderr(Stdio::from(stderr_log))
+        .spawn()
+        .expect("test supervisor should spawn");
+    let supervisor_pid = supervisor.id();
+    assert!(
+        linux_process_state(supervisor_pid).is_some(),
+        "test supervisor should be alive before daemon startup"
+    );
+    let candidates = SupervisorPtyBackend::with_binary_and_state_path(&binary_path, &state_path)
+        .live_supervisor_restore_candidates()
+        .unwrap();
+    let debug_cmdline = fs::read(format!("/proc/{supervisor_pid}/cmdline"))
+        .map(|bytes| String::from_utf8_lossy(&bytes).replace('\0', " "))
+        .unwrap_or_else(|error| format!("cmdline read failed: {error}"));
+    let supervisor_status = supervisor.try_wait().unwrap();
+    let supervisor_log = fs::read_to_string(&log_file).unwrap_or_default();
+    assert!(
+        candidates
+            .iter()
+            .any(|candidate| candidate.session_id == session_id),
+        "live supervisor should be discoverable before daemon startup: candidates={candidates:?} state={:?} status={supervisor_status:?} cmdline={debug_cmdline} log={supervisor_log}",
+        linux_process_state(supervisor_pid),
+    );
+
+    let config = DaemonConfig::default_for_state_path(&state_path);
+    let protocol = try_default_protocol(config).unwrap();
+
+    let reloaded = StateStore::load(&state_path).unwrap();
+    assert_eq!(reloaded.sessions.len(), 1);
+    assert_eq!(reloaded.sessions[0].session_id.0.to_string(), session_id);
+    assert_eq!(reloaded.sessions[0].state, SessionState::Running);
+    assert!(reloaded.sessions[0].restore_info.is_some());
+    assert!(
+        linux_process_state(supervisor_pid).is_some(),
+        "startup must adopt the live supervisor instead of cleaning it as orphan"
+    );
+
+    drop(protocol);
+    let _ = supervisor.kill();
+    let _ = supervisor.wait();
+    let _ = fs::remove_file(socket_path);
+    let _ = fs::remove_file(pid_file);
+    let _ = fs::remove_file(log_file);
 }
 
 #[test]

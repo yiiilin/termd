@@ -19,7 +19,7 @@ use rustls::pki_types::pem::PemObject;
 use serde::Serialize;
 use termd_proto::{
     ErrorPayload, MessageType, PairingToken, ProtocolVersion, RouteHelloPayload, RouteReadyPayload,
-    RouteRole, ServerId, SessionId, SessionState, UnixTimestampMillis,
+    RouteRole, ServerId, SessionId, SessionState, TerminalSize, UnixTimestampMillis,
 };
 use thiserror::Error;
 use tokio::net::TcpListener;
@@ -29,8 +29,9 @@ use tracing::{debug, warn};
 
 use crate::auth::current_unix_timestamp_millis;
 use crate::config::DaemonConfig;
-use crate::pty::supervisor::SupervisorPtyBackend;
-use crate::state::{StateError, StateStore};
+use crate::pty::supervisor::{SupervisorPtyBackend, SupervisorRestoreCandidate};
+use crate::pty::{PtyRestoreInfo, PtySupervisorStatus};
+use crate::state::{DaemonState, SessionStateRecord, StateError, StateStore};
 
 use super::protocol::{
     DaemonProtocol, JsonEnvelope, ProtocolConnection, ProtocolError, decode_payload, envelope_value,
@@ -113,8 +114,26 @@ struct LocalPairingTokenPayload {
 
 /// 构造生产默认协议状态，并接入本地状态文件。
 pub fn try_default_protocol(config: DaemonConfig) -> Result<SharedDaemonProtocol, ServerError> {
-    let state = StateStore::load(&config.state_path)?;
+    let mut state = StateStore::load(&config.state_path)?;
     let supervisor_backend = SupervisorPtyBackend::for_state_path(&config.state_path);
+    let adopted_count = match supervisor_backend.live_supervisor_restore_candidates() {
+        Ok(supervisors) => adopt_missing_runtime_sessions_from_supervisors(
+            &mut state,
+            supervisors,
+            current_unix_timestamp_millis(),
+        ),
+        // /proc 不可读只会影响异常升级恢复，不能阻断 daemon 正常启动。
+        Err(error) => {
+            warn!(%error, "failed to inspect live session supervisors");
+            0
+        }
+    };
+    if adopted_count > 0 {
+        warn!(
+            adopted_count,
+            "adopted live session supervisors missing from runtime state"
+        );
+    }
     let valid_supervisor_session_ids = state
         .sessions
         .iter()
@@ -134,9 +153,69 @@ pub fn try_default_protocol(config: DaemonConfig) -> Result<SharedDaemonProtocol
         Ed25519SignatureVerifier,
         state,
     )?;
+    let restored_supervisor_session_ids = protocol
+        .snapshot_state()
+        .sessions
+        .into_iter()
+        .filter(|session| session.state == SessionState::Running && session.restore_info.is_some())
+        .map(|session| session.session_id.0.to_string())
+        .collect::<Vec<_>>();
+    match SupervisorPtyBackend::for_state_path(&config.state_path)
+        .cleanup_orphaned_supervisors(restored_supervisor_session_ids)
+    {
+        Ok(cleaned_count) if cleaned_count > 0 => {
+            warn!(cleaned_count, "cleaned orphaned session supervisors")
+        }
+        Ok(_) => {}
+        Err(error) => warn!(%error, "failed to clean orphaned session supervisors"),
+    }
     // 首次启动时立即写入 daemon identity，避免已展示的 server id 只停留在内存里。
     protocol.persist_state()?;
     Ok(Arc::new(Mutex::new(protocol)))
+}
+
+fn adopt_missing_runtime_sessions_from_supervisors(
+    state: &mut DaemonState,
+    supervisors: impl IntoIterator<Item = SupervisorRestoreCandidate>,
+    now_ms: UnixTimestampMillis,
+) -> usize {
+    let mut known_session_ids = state
+        .sessions
+        .iter()
+        .map(|session| session.session_id)
+        .collect::<HashSet<_>>();
+    let mut adopted_count = 0;
+
+    for supervisor in supervisors {
+        let Ok(raw_session_id) = uuid::Uuid::parse_str(&supervisor.session_id) else {
+            continue;
+        };
+        let session_id = SessionId(raw_session_id);
+        if !known_session_ids.insert(session_id) {
+            continue;
+        }
+
+        state.sessions.push(SessionStateRecord {
+            session_id,
+            state: SessionState::Running,
+            size: TerminalSize {
+                rows: supervisor.size.rows,
+                cols: supervisor.size.cols,
+                pixel_width: supervisor.size.pixel_width,
+                pixel_height: supervisor.size.pixel_height,
+            },
+            created_at_ms: now_ms,
+            updated_at_ms: now_ms,
+            restore_info: Some(PtyRestoreInfo::UnixSocket {
+                socket_path: supervisor.socket_path,
+                supervisor_pid: supervisor.supervisor_pid,
+                supervisor_status: PtySupervisorStatus::Running,
+            }),
+        });
+        adopted_count += 1;
+    }
+
+    adopted_count
 }
 
 /// 测试与旧调用点使用的便捷构造器；生产启动路径使用 `try_default_protocol` 返回结构化错误。
@@ -695,6 +774,8 @@ mod tests {
     use crate::net::{
         E2eeKeyPair, E2eePeerPublicKey, E2eeSession, E2eeSessionContext, E2eeSessionRole,
     };
+    use crate::pty::PtySize;
+    use crate::pty::supervisor::SupervisorRestoreCandidate;
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt as _;
@@ -722,6 +803,40 @@ mod tests {
 
     fn test_protocol(name: &str) -> SharedDaemonProtocol {
         default_protocol(test_config(name))
+    }
+
+    #[test]
+    fn missing_runtime_rows_are_adopted_from_live_supervisors_before_cleanup() {
+        let session_id = SessionId::new();
+        let socket_path = PathBuf::from(format!(
+            "/var/lib/termd/termd-supervisors/{}.sock",
+            session_id.0
+        ));
+        let mut state = crate::state::DaemonState::default();
+        let candidates = vec![SupervisorRestoreCandidate {
+            session_id: session_id.0.to_string(),
+            socket_path: socket_path.clone(),
+            supervisor_pid: 4242,
+            size: PtySize::with_pixels(35, 120, 1600, 1000),
+        }];
+
+        let adopted = adopt_missing_runtime_sessions_from_supervisors(
+            &mut state,
+            candidates,
+            UnixTimestampMillis(12_345),
+        );
+
+        assert_eq!(adopted, 1);
+        assert_eq!(state.sessions.len(), 1);
+        let adopted_session = &state.sessions[0];
+        assert_eq!(adopted_session.session_id, session_id);
+        assert_eq!(adopted_session.state, SessionState::Running);
+        assert_eq!(adopted_session.size.rows, 35);
+        assert_eq!(adopted_session.size.cols, 120);
+        assert_eq!(adopted_session.size.pixel_width, 1600);
+        assert_eq!(adopted_session.size.pixel_height, 1000);
+        assert_eq!(adopted_session.created_at_ms, UnixTimestampMillis(12_345));
+        assert!(adopted_session.restore_info.is_some());
     }
 
     #[test]

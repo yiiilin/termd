@@ -39,6 +39,16 @@ struct SupervisorProcess {
     pid: u32,
     session_id: String,
     socket_path: PathBuf,
+    size: Option<PtySize>,
+}
+
+/// 从仍存活的 session supervisor 进程中提取出的可恢复记录。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SupervisorRestoreCandidate {
+    pub session_id: String,
+    pub socket_path: PathBuf,
+    pub supervisor_pid: u32,
+    pub size: PtySize,
 }
 
 /// 生产 daemon 使用的 supervisor PTY backend。
@@ -93,6 +103,26 @@ impl SupervisorPtyBackend {
         }
 
         Ok(orphan_pids.len())
+    }
+
+    /// 列出当前 state 目录下仍存活、且命令行足够完整的 session supervisor。
+    pub fn live_supervisor_restore_candidates(&self) -> PtyResult<Vec<SupervisorRestoreCandidate>> {
+        let supervisors = supervisor_processes_from_proc()?;
+        Ok(supervisors
+            .into_iter()
+            .filter(|supervisor| {
+                supervisor.socket_path.parent() == Some(self.runtime_dir.as_path())
+            })
+            .filter_map(|supervisor| {
+                let size = supervisor.size?;
+                Some(SupervisorRestoreCandidate {
+                    session_id: supervisor.session_id,
+                    socket_path: supervisor.socket_path,
+                    supervisor_pid: supervisor.pid,
+                    size,
+                })
+            })
+            .collect())
     }
 
     fn launch_supervisor(
@@ -640,6 +670,7 @@ fn parse_supervisor_cmdline(pid: u32, args: &[String]) -> Option<SupervisorProce
 
     let mut session_id = None;
     let mut socket_path = None;
+    let mut size = None;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -651,6 +682,13 @@ fn parse_supervisor_cmdline(pid: u32, args: &[String]) -> Option<SupervisorProce
                 socket_path = args.get(index + 1).map(PathBuf::from);
                 index += 2;
             }
+            "--size-base64" => {
+                size = args
+                    .get(index + 1)
+                    .and_then(|raw| general_purpose::STANDARD.decode(raw).ok())
+                    .and_then(|bytes| serde_json::from_slice::<PtySize>(&bytes).ok());
+                index += 2;
+            }
             _ => index += 1,
         }
     }
@@ -659,6 +697,7 @@ fn parse_supervisor_cmdline(pid: u32, args: &[String]) -> Option<SupervisorProce
         pid,
         session_id: session_id?,
         socket_path: socket_path?,
+        size,
     })
 }
 
@@ -1181,16 +1220,19 @@ mod tests {
                 pid: 11,
                 session_id: "kept-session".to_owned(),
                 socket_path: runtime_dir.join("kept-session.sock"),
+                size: Some(PtySize::default()),
             },
             SupervisorProcess {
                 pid: 12,
                 session_id: "orphan-session".to_owned(),
                 socket_path: runtime_dir.join("orphan-session.sock"),
+                size: Some(PtySize::default()),
             },
             SupervisorProcess {
                 pid: 13,
                 session_id: "orphan-session".to_owned(),
                 socket_path: PathBuf::from("/tmp/other-termd-supervisors/orphan-session.sock"),
+                size: Some(PtySize::default()),
             },
         ];
 
@@ -1267,6 +1309,9 @@ mod tests {
 
     #[test]
     fn parses_session_supervisor_cmdline() {
+        let size = PtySize::with_pixels(33, 101, 1200, 900);
+        let size_base64 = general_purpose::STANDARD
+            .encode(serde_json::to_vec(&size).expect("test size should serialize"));
         let args = vec![
             "/usr/local/bin/termd".to_owned(),
             "__session-supervisor".to_owned(),
@@ -1274,6 +1319,8 @@ mod tests {
             "session-a".to_owned(),
             "--socket-path".to_owned(),
             "/var/lib/termd/termd-supervisors/session-a.sock".to_owned(),
+            "--size-base64".to_owned(),
+            size_base64,
         ];
 
         let supervisor = parse_supervisor_cmdline(42, &args).expect("supervisor should parse");
@@ -1284,6 +1331,7 @@ mod tests {
             supervisor.socket_path,
             PathBuf::from("/var/lib/termd/termd-supervisors/session-a.sock")
         );
+        assert_eq!(supervisor.size, Some(size));
     }
 }
 
