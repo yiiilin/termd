@@ -439,6 +439,9 @@ pub struct SessionCreatedPayload {
     pub role: AttachRole,
     pub state: SessionState,
     pub size: TerminalSize,
+    /// 当前连接是否持有该 session 的 PTY resize 权限；shared-control 输入权限不受影响。
+    #[serde(default)]
+    pub resize_owner: bool,
 }
 
 /// attach 成功后的响应；shared-control 模式下 role 固定为 operator。
@@ -448,6 +451,9 @@ pub struct SessionAttachedPayload {
     pub role: AttachRole,
     pub state: SessionState,
     pub size: TerminalSize,
+    /// 当前连接是否持有该 session 的 PTY resize 权限；后续 attach 连接默认只能 viewer/zoom。
+    #[serde(default)]
+    pub resize_owner: bool,
 }
 
 /// 列出 daemon 当前已知 session；MVP 暂不携带筛选条件。
@@ -607,6 +613,9 @@ pub struct SessionResizePayload {
 pub struct SessionResizedPayload {
     pub session_id: SessionId,
     pub size: TerminalSize,
+    /// 接收该消息的连接是否仍是 resize owner；用于 owner 断开后的接管通知。
+    #[serde(default)]
+    pub resize_owner: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1093,6 +1102,7 @@ mod tests {
             role: AttachRole::Operator,
             state: SessionState::Running,
             size,
+            resize_owner: true,
         });
         assert_roundtrip(SessionAttachPayload { session_id });
         assert_roundtrip(SessionAttachedPayload {
@@ -1100,6 +1110,7 @@ mod tests {
             role: AttachRole::Operator,
             state: SessionState::Running,
             size,
+            resize_owner: false,
         });
         assert_roundtrip(SessionDataPayload {
             session_id,
@@ -1116,7 +1127,11 @@ mod tests {
             focused: true,
         });
         assert_roundtrip(SessionResizePayload { session_id, size });
-        assert_roundtrip(SessionResizedPayload { session_id, size });
+        assert_roundtrip(SessionResizedPayload {
+            session_id,
+            size,
+            resize_owner: true,
+        });
         assert_roundtrip(SessionRenamePayload {
             session_id,
             name: "work shell".to_owned(),
@@ -1228,6 +1243,36 @@ mod tests {
             session_id,
             device_id,
         });
+    }
+
+    #[test]
+    fn session_resize_owner_fields_default_for_older_payloads() {
+        let session_id = SessionId::new();
+        let size = TerminalSize::new(24, 80);
+        let created: SessionCreatedPayload = serde_json::from_value(serde_json::json!({
+            "session_id": session_id,
+            "name": "Ada",
+            "role": "operator",
+            "state": "running",
+            "size": size,
+        }))
+        .unwrap();
+        let attached: SessionAttachedPayload = serde_json::from_value(serde_json::json!({
+            "session_id": session_id,
+            "role": "operator",
+            "state": "running",
+            "size": size,
+        }))
+        .unwrap();
+        let resized: SessionResizedPayload = serde_json::from_value(serde_json::json!({
+            "session_id": session_id,
+            "size": size,
+        }))
+        .unwrap();
+
+        assert!(!created.resize_owner);
+        assert!(!attached.resize_owner);
+        assert!(!resized.resize_owner);
     }
 
     #[test]

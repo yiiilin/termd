@@ -282,6 +282,7 @@ pub struct DaemonProtocol<B: PtyBackend, V> {
     session_output_history: HashMap<SessionId, SessionOutputHistory>,
     session_file_tree_signals: HashMap<SessionId, watch::Sender<u64>>,
     session_resize_signals: HashMap<SessionId, watch::Sender<TerminalSize>>,
+    session_resize_owners: HashMap<SessionId, ClientId>,
 }
 
 impl<B, V> DaemonProtocol<B, V>
@@ -374,6 +375,7 @@ where
             session_output_history: HashMap::new(),
             session_file_tree_signals: HashMap::new(),
             session_resize_signals: HashMap::new(),
+            session_resize_owners: HashMap::new(),
         })
     }
 
@@ -685,6 +687,7 @@ where
             self.output_history_attach_snapshot(wire_session_id, response_size);
         connection.attach(wire_session_id, output_offset, initial_output);
         self.record_daemon_client_attach(wire_session_id, connection, device_id);
+        let resize_owner = self.assign_resize_owner_if_missing(wire_session_id, connection);
 
         let response = SessionCreatedPayload {
             session_id: wire_session_id,
@@ -692,6 +695,7 @@ where
             role: wire_role,
             state: self.runtime_state_proto(&internal_session_id)?,
             size: response_size,
+            resize_owner,
         };
 
         self.persist_state()?;
@@ -725,6 +729,7 @@ where
             self.output_history_attach_snapshot(payload.session_id, response_size);
         connection.attach(payload.session_id, output_offset, initial_output);
         self.record_daemon_client_attach(payload.session_id, connection, device_id);
+        let resize_owner = self.assign_resize_owner_if_missing(payload.session_id, connection);
         connection.state = ProtocolConnectionState::Attached;
 
         let response = SessionAttachedPayload {
@@ -732,6 +737,7 @@ where
             role: wire_role,
             state: self.runtime_state_proto(&internal_session_id)?,
             size: response_size,
+            resize_owner,
         };
 
         Ok(vec![envelope_value(
@@ -773,6 +779,9 @@ where
             .get(&payload.session_id)
             .ok_or(ProtocolError::SessionNotFound)?;
         connection.ensure_attached_to(payload.session_id)?;
+        if !self.connection_is_resize_owner(payload.session_id, connection) {
+            return Err(ProtocolError::InvalidState);
+        }
 
         self.runtime
             .resize(internal_session_id, proto_size_to_runtime(payload.size))
@@ -793,6 +802,7 @@ where
             SessionResizedPayload {
                 session_id: payload.session_id,
                 size: payload.size,
+                resize_owner: true,
             },
         )?])
     }
@@ -917,6 +927,7 @@ where
         self.session_output_history.remove(&session_id);
         self.session_file_tree_signals.remove(&session_id);
         self.session_resize_signals.remove(&session_id);
+        self.session_resize_owners.remove(&session_id);
         for record in self.daemon_clients.values_mut() {
             for sessions in record.active_connections.values_mut() {
                 sessions.remove(&session_id);
@@ -1513,6 +1524,62 @@ where
         );
     }
 
+    fn assign_resize_owner_if_missing(
+        &mut self,
+        session_id: SessionId,
+        connection: &ProtocolConnection,
+    ) -> bool {
+        // resize owner 是连接级状态，同一设备的两个浏览器标签页也不能同时改 PTY 尺寸。
+        let owner = self
+            .session_resize_owners
+            .entry(session_id)
+            .or_insert(connection.client_id);
+        *owner == connection.client_id
+    }
+
+    fn connection_is_resize_owner(
+        &self,
+        session_id: SessionId,
+        connection: &ProtocolConnection,
+    ) -> bool {
+        self.session_resize_owners
+            .get(&session_id)
+            .map(|owner| *owner == connection.client_id)
+            .unwrap_or(false)
+    }
+
+    fn first_attached_connection_for_session(&self, session_id: SessionId) -> Option<ClientId> {
+        let mut candidates: Vec<_> = self
+            .daemon_clients
+            .values()
+            .filter(|record| record.online)
+            .flat_map(|record| {
+                record
+                    .active_connections
+                    .iter()
+                    .filter(move |(_, sessions)| sessions.contains(&session_id))
+                    .map(move |(client_id, _)| (*client_id, record.connected_at_ms))
+            })
+            .collect();
+        candidates.sort_by_key(|(client_id, connected_at_ms)| (connected_at_ms.0, client_id.0));
+        candidates.first().map(|(client_id, _)| *client_id)
+    }
+
+    fn refresh_resize_owner_after_detach(&mut self, session_id: SessionId, old_owner: ClientId) {
+        if self.session_resize_owners.get(&session_id) != Some(&old_owner) {
+            return;
+        }
+        match self.first_attached_connection_for_session(session_id) {
+            Some(next_owner) => {
+                self.session_resize_owners.insert(session_id, next_owner);
+                self.notify_session_resized_with_current_size(session_id);
+            }
+            None => {
+                self.session_resize_owners.remove(&session_id);
+            }
+        }
+    }
+
     fn mark_daemon_client_connection_offline(
         &mut self,
         device_id: DeviceId,
@@ -1716,6 +1783,16 @@ where
         let _ = signal.send(size);
     }
 
+    fn notify_session_resized_with_current_size(&self, session_id: SessionId) {
+        let Some(internal_session_id) = self.session_index.get(&session_id) else {
+            return;
+        };
+        let Ok(size) = self.runtime_size_proto(internal_session_id) else {
+            return;
+        };
+        self.notify_session_resized(session_id, size);
+    }
+
     fn detach_connection(&mut self, connection: &mut ProtocolConnection) {
         let Some(device_id) = connection.authenticated_device_id else {
             connection.state = ProtocolConnectionState::Closed;
@@ -1738,6 +1815,7 @@ where
         // 断开 WebSocket 只 detach 当前连接关联的 session，不 close/terminate PTY。
         // 同一浏览器/设备如果还有另一条 attach 连接在线，不能撤掉设备级 operator 角色。
         for wire_session_id in attached_sessions {
+            self.refresh_resize_owner_after_detach(wire_session_id, connection.client_id);
             if remaining_sessions.contains(&wire_session_id) {
                 continue;
             }
@@ -2749,7 +2827,11 @@ impl ProtocolConnection {
 
         self.encrypt_inner_messages(vec![envelope_value(
             MessageType::SessionResized,
-            SessionResizedPayload { session_id, size },
+            SessionResizedPayload {
+                session_id,
+                size,
+                resize_owner: protocol.connection_is_resize_owner(session_id, self),
+            },
         )?])
     }
 
@@ -5016,6 +5098,7 @@ mod tests {
         );
         let created = decrypt_first(&mut device_session, create_responses);
         let created_payload: SessionCreatedPayload = decode_payload(created.payload).unwrap();
+        assert!(created_payload.resize_owner);
         let resized_size = TerminalSize {
             rows: 40,
             cols: 120,
@@ -5043,6 +5126,187 @@ mod tests {
         assert_eq!(resized.kind, MessageType::SessionResized);
         assert_eq!(resized_payload.session_id, created_payload.session_id);
         assert_eq!(resized_payload.size, resized_size);
+        assert!(resized_payload.resize_owner);
+    }
+
+    #[test]
+    fn non_owner_attached_connection_cannot_resize_session() {
+        let (mut protocol, _) = protocol();
+        let (mut first_connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = PublicKey(wire(signing_key.verifying_key().as_bytes()));
+        let (_, mut first_crypto) = open_e2ee(&mut protocol, &mut first_connection, device_id);
+        pair_device(
+            &mut protocol,
+            &mut first_connection,
+            &mut first_crypto,
+            device_id,
+            public_key,
+        );
+        let create_responses = send_encrypted(
+            &mut protocol,
+            &mut first_connection,
+            &mut first_crypto,
+            envelope_value(
+                MessageType::SessionCreate,
+                SessionCreatePayload {
+                    command: vec!["sh".to_owned()],
+                    size: TerminalSize::new(24, 80),
+                },
+            )
+            .unwrap(),
+        );
+        let created = decrypt_first(&mut first_crypto, create_responses);
+        let created_payload: SessionCreatedPayload = decode_payload(created.payload).unwrap();
+        assert!(created_payload.resize_owner);
+
+        let (mut second_connection, _) = protocol.start_connection();
+        let mut second_crypto = authenticate_paired_connection(
+            &mut protocol,
+            &mut second_connection,
+            device_id,
+            &signing_key,
+        );
+        let attach_responses = send_encrypted(
+            &mut protocol,
+            &mut second_connection,
+            &mut second_crypto,
+            envelope_value(
+                MessageType::SessionAttach,
+                SessionAttachPayload {
+                    session_id: created_payload.session_id,
+                },
+            )
+            .unwrap(),
+        );
+        let attached = decrypt_first(&mut second_crypto, attach_responses);
+        let attached_payload: SessionAttachedPayload = decode_payload(attached.payload).unwrap();
+        assert_eq!(attached.kind, MessageType::SessionAttached);
+        assert!(!attached_payload.resize_owner);
+
+        let resize_responses = send_encrypted(
+            &mut protocol,
+            &mut second_connection,
+            &mut second_crypto,
+            envelope_value(
+                MessageType::SessionResize,
+                SessionResizePayload {
+                    session_id: created_payload.session_id,
+                    size: TerminalSize {
+                        rows: 40,
+                        cols: 120,
+                        pixel_width: 960,
+                        pixel_height: 640,
+                    },
+                },
+            )
+            .unwrap(),
+        );
+        let resize_error = decrypt_first(&mut second_crypto, resize_responses);
+        let resize_error_payload: ErrorPayload = decode_payload(resize_error.payload).unwrap();
+
+        // 非 owner 可以继续作为 operator 输入，但不能覆盖 shared PTY 的尺寸。
+        assert_eq!(resize_error.kind, MessageType::Error);
+        assert_eq!(resize_error_payload.code, "invalid_state");
+    }
+
+    #[test]
+    fn resize_owner_moves_to_attached_connection_after_owner_disconnect() {
+        let (mut protocol, _) = protocol();
+        let (mut first_connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = PublicKey(wire(signing_key.verifying_key().as_bytes()));
+        let (_, mut first_crypto) = open_e2ee(&mut protocol, &mut first_connection, device_id);
+        pair_device(
+            &mut protocol,
+            &mut first_connection,
+            &mut first_crypto,
+            device_id,
+            public_key,
+        );
+        let create_responses = send_encrypted(
+            &mut protocol,
+            &mut first_connection,
+            &mut first_crypto,
+            envelope_value(
+                MessageType::SessionCreate,
+                SessionCreatePayload {
+                    command: vec!["sh".to_owned()],
+                    size: TerminalSize::new(24, 80),
+                },
+            )
+            .unwrap(),
+        );
+        let created = decrypt_first(&mut first_crypto, create_responses);
+        let created_payload: SessionCreatedPayload = decode_payload(created.payload).unwrap();
+
+        let (mut second_connection, _) = protocol.start_connection();
+        let mut second_crypto = authenticate_paired_connection(
+            &mut protocol,
+            &mut second_connection,
+            device_id,
+            &signing_key,
+        );
+        let attach_responses = send_encrypted(
+            &mut protocol,
+            &mut second_connection,
+            &mut second_crypto,
+            envelope_value(
+                MessageType::SessionAttach,
+                SessionAttachPayload {
+                    session_id: created_payload.session_id,
+                },
+            )
+            .unwrap(),
+        );
+        let attached = decrypt_first(&mut second_crypto, attach_responses);
+        let attached_payload: SessionAttachedPayload = decode_payload(attached.payload).unwrap();
+        assert!(!attached_payload.resize_owner);
+
+        let mut resize_signal = second_connection
+            .attached_resize_signals(&protocol)
+            .into_iter()
+            .find(|(session_id, _)| *session_id == created_payload.session_id)
+            .map(|(_, signal)| signal)
+            .expect("attached connection should subscribe to resize owner changes");
+        resize_signal.borrow_and_update();
+
+        first_connection.close(&mut protocol);
+        assert!(resize_signal.has_changed().unwrap());
+        let owner_update =
+            second_connection.read_session_resize_update(&mut protocol, created_payload.session_id);
+        let owner_update = decrypt_first(&mut second_crypto, owner_update);
+        let owner_update_payload: SessionResizedPayload =
+            decode_payload(owner_update.payload).unwrap();
+        assert_eq!(owner_update.kind, MessageType::SessionResized);
+        assert!(owner_update_payload.resize_owner);
+
+        let resized_size = TerminalSize {
+            rows: 32,
+            cols: 100,
+            pixel_width: 840,
+            pixel_height: 600,
+        };
+        let resize_responses = send_encrypted(
+            &mut protocol,
+            &mut second_connection,
+            &mut second_crypto,
+            envelope_value(
+                MessageType::SessionResize,
+                SessionResizePayload {
+                    session_id: created_payload.session_id,
+                    size: resized_size,
+                },
+            )
+            .unwrap(),
+        );
+        let resized = decrypt_first(&mut second_crypto, resize_responses);
+        let resized_payload: SessionResizedPayload = decode_payload(resized.payload).unwrap();
+        assert_eq!(resized.kind, MessageType::SessionResized);
+        assert_eq!(resized_payload.size, resized_size);
+        assert!(resized_payload.resize_owner);
     }
 
     #[test]

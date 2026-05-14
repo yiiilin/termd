@@ -225,6 +225,7 @@ export interface SessionCreatedPayload {
   role: AttachRole;
   state: SessionState;
   size: TerminalSize;
+  resize_owner?: boolean;
 }
 
 export interface SessionAttachPayload {
@@ -236,6 +237,7 @@ export interface SessionAttachedPayload {
   role: AttachRole;
   state: SessionState;
   size: TerminalSize;
+  resize_owner?: boolean;
 }
 
 export interface SessionRenamePayload {
@@ -372,6 +374,7 @@ export interface SessionResizePayload {
 export interface SessionResizedPayload {
   session_id: UUID;
   size: TerminalSize;
+  resize_owner?: boolean;
 }
 
 export interface ControlGrantPayload {

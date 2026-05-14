@@ -13,7 +13,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::net::relay::RelayBaseUrl;
+use crate::net::relay::{RelayBaseUrl, RelayProxyUrl};
 
 /// 当前配置 JSON 的 schema 版本。
 ///
@@ -109,6 +109,27 @@ impl fmt::Display for RelayEndpointError {
 
 impl Error for RelayEndpointError {}
 
+/// relay outbound 代理配置规范化后的错误。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RelayProxyError {
+    Empty,
+    Invalid { proxy_url: String },
+}
+
+impl fmt::Display for RelayProxyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => write!(f, "relay proxy URL cannot be empty"),
+            Self::Invalid { proxy_url } => write!(
+                f,
+                "invalid relay proxy URL `{proxy_url}`; expected http://host:port or socks5://host:port"
+            ),
+        }
+    }
+}
+
+impl Error for RelayProxyError {}
+
 /// 把 relay endpoint 收敛成 canonical、去重后的单 relay 列表。
 ///
 /// 这个 helper 只保留 `ws://host[:port]` / `wss://host[:port]` 级别的公开 endpoint，
@@ -138,6 +159,19 @@ pub fn normalize_relay_endpoints(
     }
 
     Ok(normalized)
+}
+
+/// 把 CLI / 环境变量传入的 relay outbound 代理收敛成 canonical URL。
+pub fn normalize_relay_proxy_url(proxy_url: impl AsRef<str>) -> Result<String, RelayProxyError> {
+    let trimmed = proxy_url.as_ref().trim();
+    if trimmed.is_empty() {
+        return Err(RelayProxyError::Empty);
+    }
+    RelayProxyUrl::parse(trimmed)
+        .map(|proxy| proxy.canonical_url())
+        .map_err(|_| RelayProxyError::Invalid {
+            proxy_url: trimmed.to_owned(),
+        })
 }
 
 /// daemon 本地配置。
@@ -172,6 +206,9 @@ pub struct DaemonConfig {
     /// relay 自动重连和心跳策略。
     #[serde(default)]
     pub relay_reconnect: RelayReconnectConfig,
+    /// daemon 连接 relay 时使用的 outbound 代理；只影响 daemon 到 relay 的 TCP/WebSocket 拨号。
+    #[serde(default)]
+    pub relay_proxy_url: Option<String>,
     /// `termd pair --qr` 生成 pairing URI 时默认写入的 WebSocket URL。
     #[serde(default = "default_pairing_ws_url")]
     pub default_pairing_ws_url: String,
@@ -196,6 +233,7 @@ impl DaemonConfig {
             relay_endpoints: Vec::new(),
             relay_auth_token: None,
             relay_reconnect: RelayReconnectConfig::default(),
+            relay_proxy_url: None,
             default_pairing_ws_url: default_pairing_ws_url(),
         }
     }
@@ -486,6 +524,7 @@ mod tests {
         assert!(config.pairing_token_ttl_ms > 0);
         assert!(config.relay_endpoints.is_empty());
         assert!(config.relay_auth_token.is_none());
+        assert!(config.relay_proxy_url.is_none());
         assert_eq!(config.default_pairing_ws_url, "ws://127.0.0.1:8765/ws");
         assert!(config.relay_reconnect.initial_delay_ms > 0);
         assert!(config.relay_reconnect.max_delay_ms >= config.relay_reconnect.initial_delay_ms);
@@ -526,6 +565,30 @@ mod tests {
     }
 
     #[test]
+    fn normalize_relay_proxy_url_accepts_http_and_socks5() {
+        assert_eq!(
+            normalize_relay_proxy_url(" http://127.0.0.1:3128/ ").unwrap(),
+            "http://127.0.0.1:3128"
+        );
+        assert_eq!(
+            normalize_relay_proxy_url("socks5://proxy.example:1080").unwrap(),
+            "socks5://proxy.example:1080"
+        );
+    }
+
+    #[test]
+    fn normalize_relay_proxy_url_rejects_empty_and_invalid() {
+        assert!(matches!(
+            normalize_relay_proxy_url("  ").unwrap_err(),
+            RelayProxyError::Empty
+        ));
+        assert!(matches!(
+            normalize_relay_proxy_url("https://proxy.example:443").unwrap_err(),
+            RelayProxyError::Invalid { proxy_url } if proxy_url == "https://proxy.example:443"
+        ));
+    }
+
+    #[test]
     fn config_store_saves_and_loads_full_config() {
         let config_path = temp_path("config.json");
         let state_path = temp_path("state.json");
@@ -543,6 +606,7 @@ mod tests {
             max_delay_ms: 10_000,
             heartbeat_interval_ms: 15_000,
         };
+        config.relay_proxy_url = Some("socks5://127.0.0.1:1080".to_owned());
         config.default_pairing_ws_url = "ws://relay.example/ws".to_owned();
 
         ConfigStore::save(&config_path, &config).unwrap();

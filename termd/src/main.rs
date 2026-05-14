@@ -10,8 +10,12 @@ use std::time::Duration;
 use base64::{Engine as _, engine::general_purpose};
 use qrcode::{Color as QrColor, QrCode, render::unicode};
 use serde::Deserialize;
-use termd::config::{DaemonConfig, SecretString, normalize_relay_endpoints};
-use termd::net::relay::{RelayBaseUrl, RelayReconnectPolicy, run_relay_mux_with_reconnect};
+use termd::config::{
+    DaemonConfig, SecretString, normalize_relay_endpoints, normalize_relay_proxy_url,
+};
+use termd::net::relay::{
+    RelayBaseUrl, RelayProxyUrl, RelayReconnectPolicy, run_relay_mux_with_reconnect,
+};
 use termd::net::server::{TlsPaths, serve, serve_tls, try_default_protocol};
 use termd::pty::supervisor::{SessionSupervisorArgs, run_session_supervisor};
 use termd::pty::{CommandSpec, PtySize};
@@ -21,6 +25,17 @@ use tokio::task::JoinHandle;
 const DEFAULT_PAIRING_URL: &str = "http://127.0.0.1:8765";
 const LOCAL_PAIRING_TOKEN_PATH: &str = "/local/pairing-token";
 const LOCAL_PAIRING_HTTP_TIMEOUT: Duration = Duration::from_secs(5);
+const DEDICATED_RELAY_PROXY_ENV_VARS: [&str; 2] = ["TERMD_RELAY_PROXY_URL", "TERMD_RELAY_PROXY"];
+const COMMON_WS_PROXY_ENV_VARS: [&str; 4] = ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"];
+const COMMON_WSS_PROXY_ENV_VARS: [&str; 6] = [
+    "HTTPS_PROXY",
+    "https_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+];
+const NO_PROXY_ENV_VARS: [&str; 2] = ["NO_PROXY", "no_proxy"];
 const HELP_TEXT: &str = concat!(
     "termd ",
     env!("CARGO_PKG_VERSION"),
@@ -33,6 +48,7 @@ const HELP_TEXT: &str = concat!(
     "  --relay <WS_URL>               Connect to one relay\n",
     "  --relay-url <WS_URL>           Alias for --relay\n",
     "  --relay-auth-token <TOKEN>     Transport auth token for relay connections\n",
+    "  --relay-proxy <PROXY_URL>      Relay outbound proxy, http://host:port or socks5://host:port\n",
     "  --tls-cert <CERT_PEM>          TLS certificate path\n",
     "  --tls-key <KEY_PEM>            TLS private key path; must be paired with --tls-cert\n",
     "  --web                          Serve embedded Web UI\n",
@@ -42,9 +58,15 @@ const HELP_TEXT: &str = concat!(
     "  --url <HTTP_URL>               Local daemon URL, default http://127.0.0.1:8765\n",
     "  --qr                           Print a QR invite code for Web/mobile pairing\n",
     "  --qr-svg <PATH>                 Write a real SVG QR invite code to PATH\n\n",
+    "ENVIRONMENT:\n",
+    "  TERMD_RELAY_PROXY_URL, TERMD_RELAY_PROXY\n",
+    "  HTTPS_PROXY, HTTP_PROXY, ALL_PROXY and lowercase variants for relay outbound proxy\n",
+    "  NO_PROXY and no_proxy bypass common proxy variables for matching relay hosts\n\n",
     "EXAMPLES:\n",
     "  termd --listen 0.0.0.0:8765 --web\n",
     "  termd --relay wss://relay.example:443 --relay-auth-token env-token\n",
+    "  HTTP_PROXY=http://127.0.0.1:3128 termd --relay wss://relay.example/ws\n",
+    "  ALL_PROXY=socks5://127.0.0.1:1080 termd --relay wss://relay.example/ws\n",
     "  termd pair --url http://127.0.0.1:8765\n",
     "  termd pair --qr\n",
 );
@@ -69,9 +91,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
             listen,
             relay_urls,
             relay_auth_token,
+            relay_proxy_url,
             tls,
             web,
-        } => serve_daemon(listen, relay_urls, relay_auth_token, tls, web).await?,
+        } => {
+            serve_daemon(
+                listen,
+                relay_urls,
+                relay_auth_token,
+                relay_proxy_url,
+                tls,
+                web,
+            )
+            .await?
+        }
         CliCommand::Pair { url, qr, qr_svg } => {
             let token = request_pairing_token_response(&url)?;
             if qr || qr_svg.is_some() {
@@ -98,6 +131,7 @@ async fn serve_daemon(
     listen: Option<ListenAddress>,
     relay_urls: Vec<String>,
     relay_auth_token: Option<String>,
+    relay_proxy_url: Option<String>,
     tls: Option<TlsPaths>,
     web_enabled: bool,
 ) -> Result<(), Box<dyn Error>> {
@@ -118,8 +152,12 @@ async fn serve_daemon(
         config.default_pairing_ws_url = RelayBaseUrl::parse(first_relay_endpoint)?
             .client_url_template_with_auth(relay_auth_token.as_deref());
     }
+    let relay_proxy_url = resolve_relay_proxy_url(relay_proxy_url, &relay_endpoints, |name| {
+        std::env::var(name).ok()
+    })?;
     config.relay_auth_token = relay_auth_token.clone().map(SecretString::new);
     config.relay_endpoints = relay_endpoints.clone();
+    config.relay_proxy_url = relay_proxy_url.clone();
     let protocol = try_default_protocol(config.clone())?;
 
     tracing::info!(
@@ -134,6 +172,7 @@ async fn serve_daemon(
         let _relay_tasks = spawn_relay_reconnect_supervisors(
             relay_endpoints,
             relay_auth_token,
+            relay_proxy_url,
             reconnect_policy,
             relay_protocol,
         );
@@ -142,22 +181,197 @@ async fn serve_daemon(
     Ok(())
 }
 
+fn resolve_relay_proxy_url(
+    cli_proxy_url: Option<String>,
+    relay_endpoints: &[String],
+    env_lookup: impl Fn(&str) -> Option<String>,
+) -> Result<Option<String>, CliError> {
+    if let Some(cli_proxy_url) = cli_proxy_url {
+        return normalize_relay_proxy_url(&cli_proxy_url)
+            .map(Some)
+            .map_err(|_| CliError::UnsupportedRelayProxy(cli_proxy_url));
+    }
+
+    for env_name in DEDICATED_RELAY_PROXY_ENV_VARS {
+        let Some(value) = env_lookup(env_name) else {
+            continue;
+        };
+        if value.trim().is_empty() {
+            continue;
+        }
+        return normalize_relay_proxy_url(&value)
+            .map(Some)
+            .map_err(|_| CliError::UnsupportedRelayProxy(value));
+    }
+
+    // 通用代理变量只在实际配置 relay 时生效，避免用户系统里全局 HTTP_PROXY
+    // 影响只跑本地 Web/PTY 的 daemon。
+    let Some(relay_endpoint) = relay_endpoints.first() else {
+        return Ok(None);
+    };
+    if relay_proxy_bypassed_by_no_proxy(relay_endpoint, &env_lookup) {
+        return Ok(None);
+    }
+
+    for env_name in common_proxy_env_vars_for_relay(relay_endpoint) {
+        let Some(value) = env_lookup(env_name) else {
+            continue;
+        };
+        if value.trim().is_empty() {
+            continue;
+        }
+        return normalize_relay_proxy_url(&value)
+            .map(Some)
+            .map_err(|_| CliError::UnsupportedRelayProxy(value));
+    }
+
+    Ok(None)
+}
+
+fn common_proxy_env_vars_for_relay(relay_endpoint: &str) -> &'static [&'static str] {
+    if relay_endpoint.starts_with("wss://") {
+        &COMMON_WSS_PROXY_ENV_VARS
+    } else {
+        &COMMON_WS_PROXY_ENV_VARS
+    }
+}
+
+fn relay_proxy_bypassed_by_no_proxy(
+    relay_endpoint: &str,
+    env_lookup: &impl Fn(&str) -> Option<String>,
+) -> bool {
+    let Some((relay_host, relay_port)) = relay_host_port_for_proxy_env(relay_endpoint) else {
+        return false;
+    };
+
+    for env_name in NO_PROXY_ENV_VARS {
+        let Some(value) = env_lookup(env_name) else {
+            continue;
+        };
+        if no_proxy_matches(&value, &relay_host, relay_port) {
+            return true;
+        }
+    }
+    false
+}
+
+fn relay_host_port_for_proxy_env(relay_endpoint: &str) -> Option<(String, u16)> {
+    let (default_port, rest) = if let Some(rest) = relay_endpoint.strip_prefix("ws://") {
+        (80, rest)
+    } else if let Some(rest) = relay_endpoint.strip_prefix("wss://") {
+        (443, rest)
+    } else {
+        return None;
+    };
+    let authority = rest
+        .split_once('/')
+        .map_or(rest, |(authority, _)| authority);
+    parse_proxy_env_authority(authority, default_port)
+}
+
+fn parse_proxy_env_authority(authority: &str, default_port: u16) -> Option<(String, u16)> {
+    if let Some(after_bracket) = authority.strip_prefix('[') {
+        let (host, suffix) = after_bracket.split_once(']')?;
+        if host.is_empty() {
+            return None;
+        }
+        let port = match suffix.strip_prefix(':') {
+            Some(port) => port.parse::<u16>().ok()?,
+            None if suffix.is_empty() => default_port,
+            _ => return None,
+        };
+        return Some((host.to_owned(), port));
+    }
+
+    if let Some((host, port)) = authority.rsplit_once(':') {
+        if host.is_empty() || host.contains(':') {
+            return None;
+        }
+        return Some((host.to_owned(), port.parse::<u16>().ok()?));
+    }
+
+    if authority.is_empty() || authority.contains(':') {
+        return None;
+    }
+    Some((authority.to_owned(), default_port))
+}
+
+fn no_proxy_matches(no_proxy: &str, relay_host: &str, relay_port: u16) -> bool {
+    no_proxy
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .any(|entry| no_proxy_entry_matches(entry, relay_host, relay_port))
+}
+
+fn no_proxy_entry_matches(entry: &str, relay_host: &str, relay_port: u16) -> bool {
+    if entry == "*" {
+        return true;
+    }
+
+    let (entry_host, entry_port) = split_no_proxy_entry(entry);
+    if entry_port.is_some_and(|entry_port| entry_port != relay_port) {
+        return false;
+    }
+
+    let entry_host = normalize_no_proxy_host(entry_host);
+    let relay_host = normalize_no_proxy_host(relay_host);
+    if entry_host.is_empty() || relay_host.is_empty() {
+        return false;
+    }
+    if entry_host == relay_host {
+        return true;
+    }
+
+    // 常见 NO_PROXY 语义中 `example.com` 和 `.example.com` 都匹配子域名。
+    let suffix = entry_host.trim_start_matches('.');
+    relay_host
+        .strip_suffix(suffix)
+        .is_some_and(|prefix| prefix.ends_with('.'))
+}
+
+fn split_no_proxy_entry(entry: &str) -> (&str, Option<u16>) {
+    if let Some(after_bracket) = entry.strip_prefix('[') {
+        if let Some((host, suffix)) = after_bracket.split_once(']') {
+            return match suffix.strip_prefix(':') {
+                Some(port) => (host, port.parse::<u16>().ok()),
+                None => (host, None),
+            };
+        }
+    }
+
+    match entry.rsplit_once(':') {
+        Some((host, port)) if !host.contains(':') => (host, port.parse::<u16>().ok()),
+        _ => (entry, None),
+    }
+}
+
+fn normalize_no_proxy_host(host: &str) -> String {
+    host.trim().trim_matches('.').to_ascii_lowercase()
+}
+
 fn spawn_relay_reconnect_supervisors(
     relay_endpoints: Vec<String>,
     relay_auth_token: Option<String>,
+    relay_proxy_url: Option<String>,
     reconnect_policy: RelayReconnectPolicy,
     protocol: termd::net::server::SharedDaemonProtocol,
 ) -> Vec<JoinHandle<()>> {
+    let relay_proxy = relay_proxy_url
+        .as_deref()
+        .and_then(|value| RelayProxyUrl::parse(value).ok());
     relay_endpoints
         .into_iter()
         .map(|relay_url| {
             let relay_protocol = protocol.clone();
             let relay_auth_token = relay_auth_token.clone();
+            let relay_proxy = relay_proxy.clone();
             tokio::spawn(async move {
                 // 目前 daemon 只允许配置一个 relay；保留 supervisor 边界，便于独立处理重连和心跳。
                 if let Err(error) = run_relay_mux_with_reconnect(
                     &relay_url,
                     relay_auth_token.as_deref(),
+                    relay_proxy,
                     reconnect_policy,
                     relay_protocol,
                 )
@@ -190,6 +404,7 @@ enum CliCommand {
         listen: Option<ListenAddress>,
         relay_urls: Vec<String>,
         relay_auth_token: Option<String>,
+        relay_proxy_url: Option<String>,
         tls: Option<TlsPaths>,
         web: bool,
     },
@@ -210,6 +425,7 @@ impl fmt::Debug for CliCommand {
                 listen,
                 relay_urls,
                 relay_auth_token,
+                relay_proxy_url,
                 tls,
                 web,
             } => {
@@ -220,6 +436,7 @@ impl fmt::Debug for CliCommand {
                     .field("listen", listen)
                     .field("relay_urls", relay_urls)
                     .field("relay_auth_token_configured", &relay_auth_token.is_some())
+                    .field("relay_proxy_url", relay_proxy_url)
                     .field("tls", tls)
                     .field("web", web)
                     .finish()
@@ -246,6 +463,7 @@ impl CliCommand {
                 listen: None,
                 relay_urls: Vec::new(),
                 relay_auth_token: None,
+                relay_proxy_url: None,
                 tls: None,
                 web: false,
             });
@@ -256,8 +474,10 @@ impl CliCommand {
             "-V" | "--version" | "version" => Ok(Self::Version),
             "pair" => parse_pair_args(args),
             "__session-supervisor" => parse_session_supervisor_args(args),
-            "--listen" | "--relay" | "--relay-url" | "--relay-auth-token" | "--tls-cert"
-            | "--tls-key" | "--web" => parse_serve_args(std::iter::once(command).chain(args)),
+            "--listen" | "--relay" | "--relay-url" | "--relay-auth-token" | "--relay-proxy"
+            | "--tls-cert" | "--tls-key" | "--web" => {
+                parse_serve_args(std::iter::once(command).chain(args))
+            }
             other => Err(CliError::UnknownCommand(other.to_owned())),
         }
     }
@@ -267,6 +487,7 @@ fn parse_serve_args(args: impl IntoIterator<Item = String>) -> Result<CliCommand
     let mut listen = None;
     let mut relay_urls = Vec::new();
     let mut relay_auth_token = None;
+    let mut relay_proxy_url = None;
     let mut tls_cert = None;
     let mut tls_key = None;
     let mut web = false;
@@ -295,6 +516,12 @@ fn parse_serve_args(args: impl IntoIterator<Item = String>) -> Result<CliCommand
                     return Err(CliError::EmptyRelayAuthTokenValue);
                 }
                 relay_auth_token = Some(value);
+            }
+            "--relay-proxy" => {
+                let value = args.next().ok_or(CliError::MissingRelayProxyValue)?;
+                let proxy = normalize_relay_proxy_url(&value)
+                    .map_err(|_| CliError::UnsupportedRelayProxy(value.clone()))?;
+                relay_proxy_url = Some(proxy);
             }
             "--tls-cert" => {
                 let value = args.next().ok_or(CliError::MissingTlsCertValue)?;
@@ -327,6 +554,7 @@ fn parse_serve_args(args: impl IntoIterator<Item = String>) -> Result<CliCommand
         listen,
         relay_urls,
         relay_auth_token,
+        relay_proxy_url,
         tls,
         web,
     })
@@ -671,6 +899,7 @@ enum CliError {
     MissingQrSvgPath,
     MissingRelayUrlValue,
     MissingRelayAuthTokenValue,
+    MissingRelayProxyValue,
     MissingTlsCertValue,
     MissingTlsKeyValue,
     EmptyRelayAuthTokenValue,
@@ -680,6 +909,7 @@ enum CliError {
     IncompleteTlsConfig,
     UnsupportedUrl(String),
     UnsupportedRelayUrl(String),
+    UnsupportedRelayProxy(String),
     InvalidListenAddress(String),
     InvalidUrl(String),
     ConnectFailed,
@@ -701,7 +931,7 @@ enum CliError {
 
 impl CliError {
     fn usage() -> &'static str {
-        "usage: termd [--listen 127.0.0.1:8765] [--relay ws://host:port] [--relay-auth-token <token>] [--tls-cert <cert.pem> --tls-key <key.pem>] [--web] [pair [--url http://127.0.0.1:8765|https://127.0.0.1:8765] [--qr] [--qr-svg <path>]]\ntry `termd --help` for full help"
+        "usage: termd [--listen 127.0.0.1:8765] [--relay ws://host:port] [--relay-auth-token <token>] [--relay-proxy http://host:port|socks5://host:port] [--tls-cert <cert.pem> --tls-key <key.pem>] [--web] [pair [--url http://127.0.0.1:8765|https://127.0.0.1:8765] [--qr] [--qr-svg <path>]]\ntry `termd --help` for full help"
     }
 }
 
@@ -726,6 +956,9 @@ impl fmt::Display for CliError {
                     "`--relay-auth-token` requires a value\n{}",
                     Self::usage()
                 )
+            }
+            Self::MissingRelayProxyValue => {
+                write!(f, "`--relay-proxy` requires a value\n{}", Self::usage())
             }
             Self::MissingTlsCertValue => {
                 write!(f, "`--tls-cert` requires a value\n{}", Self::usage())
@@ -776,6 +1009,12 @@ impl fmt::Display for CliError {
                 write!(
                     f,
                     "unsupported relay URL `{url}`; expected ws://host:port or wss://host:port"
+                )
+            }
+            Self::UnsupportedRelayProxy(url) => {
+                write!(
+                    f,
+                    "unsupported relay proxy `{url}`; expected http://host:port or socks5://host:port"
                 )
             }
             Self::InvalidListenAddress(address) => {
@@ -830,6 +1069,7 @@ mod tests {
                 listen: None,
                 relay_urls: Vec::new(),
                 relay_auth_token: None,
+                relay_proxy_url: None,
                 tls: None,
                 web: false,
             }
@@ -867,6 +1107,7 @@ mod tests {
                 }),
                 relay_urls: Vec::new(),
                 relay_auth_token: None,
+                relay_proxy_url: None,
                 tls: None,
                 web: false,
             }
@@ -884,6 +1125,7 @@ mod tests {
                 }),
                 relay_urls: Vec::new(),
                 relay_auth_token: None,
+                relay_proxy_url: None,
                 tls: None,
                 web: false,
             }
@@ -898,6 +1140,7 @@ mod tests {
                 listen: None,
                 relay_urls: vec!["ws://127.0.0.1:8080/".to_owned()],
                 relay_auth_token: None,
+                relay_proxy_url: None,
                 tls: None,
                 web: false,
             }
@@ -909,6 +1152,7 @@ mod tests {
                 listen: None,
                 relay_urls: vec!["ws://127.0.0.1:8080".to_owned()],
                 relay_auth_token: None,
+                relay_proxy_url: None,
                 tls: None,
                 web: false,
             }
@@ -923,6 +1167,7 @@ mod tests {
                 listen: None,
                 relay_urls: vec!["wss://termd.yiln.de/ws".to_owned()],
                 relay_auth_token: None,
+                relay_proxy_url: None,
                 tls: None,
                 web: false,
             }
@@ -966,6 +1211,7 @@ mod tests {
                 listen: None,
                 relay_urls: Vec::new(),
                 relay_auth_token: None,
+                relay_proxy_url: None,
                 tls: None,
                 web: true,
             }
@@ -1104,6 +1350,7 @@ mod tests {
         let relay_tasks = spawn_relay_reconnect_supervisors(
             vec![format!("ws://{flaky_addr}"), format!("ws://{healthy_addr}")],
             None,
+            None,
             reconnect_policy,
             protocol,
         );
@@ -1144,6 +1391,7 @@ mod tests {
                 listen: None,
                 relay_urls: Vec::new(),
                 relay_auth_token: None,
+                relay_proxy_url: None,
                 tls: Some(TlsPaths::new(
                     "/etc/termd/fullchain.pem",
                     "/etc/termd/secret-key.pem"
@@ -1170,11 +1418,181 @@ mod tests {
                 listen: None,
                 relay_urls: vec!["ws://127.0.0.1:8080".to_owned()],
                 relay_auth_token: Some("relay-secret-1".to_owned()),
+                relay_proxy_url: None,
                 tls: None,
                 web: false,
             }
         );
         assert!(!format!("{command:?}").contains("relay-secret-1"));
+    }
+
+    #[test]
+    fn parses_relay_proxy_for_serve() {
+        assert_eq!(
+            CliCommand::parse([
+                "--relay".to_owned(),
+                "wss://relay.example/ws".to_owned(),
+                "--relay-proxy".to_owned(),
+                " http://127.0.0.1:3128/ ".to_owned(),
+            ])
+            .unwrap(),
+            CliCommand::Serve {
+                listen: None,
+                relay_urls: vec!["wss://relay.example/ws".to_owned()],
+                relay_auth_token: None,
+                relay_proxy_url: Some("http://127.0.0.1:3128".to_owned()),
+                tls: None,
+                web: false,
+            }
+        );
+
+        assert_eq!(
+            CliCommand::parse([
+                "--relay".to_owned(),
+                "ws://127.0.0.1:8080".to_owned(),
+                "--relay-proxy".to_owned(),
+                "socks5://127.0.0.1:1080".to_owned(),
+            ])
+            .unwrap(),
+            CliCommand::Serve {
+                listen: None,
+                relay_urls: vec!["ws://127.0.0.1:8080".to_owned()],
+                relay_auth_token: None,
+                relay_proxy_url: Some("socks5://127.0.0.1:1080".to_owned()),
+                tls: None,
+                web: false,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_relay_proxy_for_serve() {
+        assert!(matches!(
+            CliCommand::parse([
+                "--relay".to_owned(),
+                "ws://127.0.0.1:8080".to_owned(),
+                "--relay-proxy".to_owned(),
+                "https://proxy.example:443".to_owned(),
+            ])
+            .unwrap_err(),
+            CliError::UnsupportedRelayProxy(url) if url == "https://proxy.example:443"
+        ));
+    }
+
+    #[test]
+    fn resolves_relay_proxy_from_env_when_cli_is_absent() {
+        let resolved = resolve_relay_proxy_url(None, &[], |name| match name {
+            "TERMD_RELAY_PROXY_URL" => Some(" socks5://127.0.0.1:1080/ ".to_owned()),
+            _ => None,
+        })
+        .unwrap();
+
+        assert_eq!(resolved, Some("socks5://127.0.0.1:1080".to_owned()));
+    }
+
+    #[test]
+    fn resolves_relay_proxy_from_common_http_proxy_env() {
+        let resolved = resolve_relay_proxy_url(
+            None,
+            &["wss://relay.example/ws".to_owned()],
+            |name| match name {
+                "HTTP_PROXY" => Some(" http://127.0.0.1:3128/ ".to_owned()),
+                _ => None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(resolved, Some("http://127.0.0.1:3128".to_owned()));
+    }
+
+    #[test]
+    fn resolves_relay_proxy_from_all_proxy_env() {
+        let resolved = resolve_relay_proxy_url(
+            None,
+            &["ws://relay.example/ws".to_owned()],
+            |name| match name {
+                "ALL_PROXY" => Some("socks5://127.0.0.1:1080".to_owned()),
+                _ => None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(resolved, Some("socks5://127.0.0.1:1080".to_owned()));
+    }
+
+    #[test]
+    fn dedicated_relay_proxy_env_overrides_common_proxy_env() {
+        let resolved = resolve_relay_proxy_url(
+            None,
+            &["wss://relay.example/ws".to_owned()],
+            |name| match name {
+                "TERMD_RELAY_PROXY" => Some("socks5://127.0.0.1:1080".to_owned()),
+                "HTTP_PROXY" => Some("http://127.0.0.1:3128".to_owned()),
+                _ => None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(resolved, Some("socks5://127.0.0.1:1080".to_owned()));
+    }
+
+    #[test]
+    fn secure_relay_prefers_https_proxy_before_http_proxy() {
+        let resolved = resolve_relay_proxy_url(
+            None,
+            &["wss://relay.example/ws".to_owned()],
+            |name| match name {
+                "HTTPS_PROXY" => Some("http://127.0.0.1:9443".to_owned()),
+                "HTTP_PROXY" => Some("http://127.0.0.1:3128".to_owned()),
+                _ => None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(resolved, Some("http://127.0.0.1:9443".to_owned()));
+    }
+
+    #[test]
+    fn no_proxy_bypasses_common_proxy_env_for_matching_relay_host() {
+        let resolved = resolve_relay_proxy_url(
+            None,
+            &["wss://relay.example/ws".to_owned()],
+            |name| match name {
+                "NO_PROXY" => Some("localhost,.example".to_owned()),
+                "HTTPS_PROXY" => Some("http://127.0.0.1:9443".to_owned()),
+                _ => None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(resolved, None);
+    }
+
+    #[test]
+    fn relay_proxy_cli_value_overrides_env() {
+        let resolved =
+            resolve_relay_proxy_url(Some("http://127.0.0.1:3128".to_owned()), &[], |_| {
+                Some("socks5://127.0.0.1:1080".to_owned())
+            })
+            .unwrap();
+
+        assert_eq!(resolved, Some("http://127.0.0.1:3128".to_owned()));
+    }
+
+    #[test]
+    fn invalid_relay_proxy_env_is_rejected() {
+        assert!(matches!(
+            resolve_relay_proxy_url(
+                None,
+                &[],
+                |name| match name {
+                    "TERMD_RELAY_PROXY_URL" => Some("https://proxy.example:443".to_owned()),
+                    _ => None,
+                }
+            )
+            .unwrap_err(),
+            CliError::UnsupportedRelayProxy(url) if url == "https://proxy.example:443"
+        ));
     }
 
     #[test]

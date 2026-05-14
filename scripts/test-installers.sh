@@ -30,6 +30,7 @@ done
 
 assert_help_contains scripts/install-termd.sh "--web"
 assert_help_contains scripts/install-termd.sh "--listen <HOST:PORT>"
+assert_help_contains scripts/install-termd.sh "--proxy <URL>"
 assert_help_contains scripts/install-termd.sh "--supervisor-version <VER>"
 assert_help_contains scripts/install-termd.sh "--user <USER>"
 assert_help_contains scripts/install-termd.sh "--purge"
@@ -297,6 +298,22 @@ EOF
   assert_file_contains "$unit_file" "EnvironmentFile=-${tmp_dir}/termd.env"
   assert_file_contains "${tmp_dir}/termd.env" "HOME=/srv/bob"
   assert_file_contains "${tmp_dir}/termd.env" "SHELL=/bin/sh"
+)
+
+test_termd_proxy_arg_writes_common_proxy_env_vars() (
+  load_termd_installer_functions
+  install_fake_termd_system_commands
+
+  local tmp_dir unit_file
+  tmp_dir="$(mktemp -d)"
+  trap 'rm -rf "$tmp_dir"' EXIT
+  unit_file="${tmp_dir}/termd.service"
+
+  run_fake_termd_install "$unit_file" --proxy http://127.0.0.1:3128
+
+  assert_file_contains "${tmp_dir}/termd.env" "HTTP_PROXY=http://127.0.0.1:3128"
+  assert_file_contains "${tmp_dir}/termd.env" "HTTPS_PROXY=http://127.0.0.1:3128"
+  assert_file_contains "${unit_file%.service}-run" "set -a"
 )
 
 test_termd_state_dir_change_clears_only_session_state() (
@@ -586,6 +603,7 @@ test_termd_default_install_uses_managed_user
 test_termd_upgrade_inherits_existing_user_without_user_arg
 test_termd_upgrade_uses_fixed_state_dir_when_existing_unit_has_no_working_directory
 test_termd_explicit_user_overrides_existing_service_user
+test_termd_proxy_arg_writes_common_proxy_env_vars
 test_termd_state_dir_change_clears_only_session_state
 test_termd_supervisor_version_match_keeps_runtime_state
 test_termd_baked_supervisor_default_keeps_runtime_state

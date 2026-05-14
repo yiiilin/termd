@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
 import {
   Cable,
   CircleAlert,
@@ -114,6 +114,7 @@ export default function App() {
   const [renameOriginalName, setRenameOriginalName] = useState("");
   const [terminalOutputResetVersion, setTerminalOutputResetVersion] = useState(0);
   const [terminalFocusRequest, setTerminalFocusRequest] = useState(0);
+  const [terminalResizeOwner, setTerminalResizeOwner] = useState(false);
   const [sessionFiles, setSessionFiles] = useState<SessionFilesResultPayload | undefined>();
   const [sessionFilesLoading, setSessionFilesLoading] = useState(false);
   const [sessionFilesError, setSessionFilesError] = useState<SafeError | undefined>();
@@ -140,7 +141,10 @@ export default function App() {
   const [error, setError] = useState<SafeError | undefined>();
   const attachClientRef = useRef<DirectClient | undefined>(undefined);
   const attachedSessionRef = useRef<UUID | undefined>(undefined);
+  const terminalResizeOwnerRef = useRef(false);
   const autoAttachAttemptedSessionRef = useRef<UUID | undefined>(undefined);
+  const attachingSessionIdRef = useRef<UUID | undefined>(undefined);
+  const attachRequestIdRef = useRef(0);
   const reattachCurrentSessionOnOpenRef = useRef(false);
   const userDetachedRef = useRef(false);
   const pendingResizeKeyRef = useRef<string | undefined>(undefined);
@@ -169,6 +173,7 @@ export default function App() {
   const connectionAutoRetryAttemptsRef = useRef(0);
   const daemonNetworkSampleRef = useRef<DaemonNetworkCounterSample | undefined>(undefined);
   const isMobileLayout = useMobileLayout();
+  const visualViewportHeight = useVisualViewportHeight(isMobileLayout && activeSurface === "workspace");
 
   useEffect(() => {
     void loadBrowserState().then((loaded) => {
@@ -320,6 +325,11 @@ export default function App() {
     !isMobileLayout && showDesktopFilesPanel
       ? { gridTemplateColumns: `minmax(0, 1fr) ${FILES_PANEL_RESIZER_WIDTH}px ${filesPanelWidth}px` }
       : undefined;
+  const appShellStyle = isMobileLayout
+    ? ({
+        "--termd-visual-viewport-height": `${visualViewportHeight}px`,
+      } as CSSProperties)
+    : undefined;
   const canOpenWorkspace = Boolean(activeServer && state.device);
   const canSaveRename = Boolean(renameDraft.trim()) && renameDraft.trim() !== renameOriginalName.trim();
   const activeDaemonLabel =
@@ -349,6 +359,11 @@ export default function App() {
     setSessionFilesError(undefined);
     setSessionFilesLoading(false);
     setFileEditor(undefined);
+  }, []);
+
+  const updateTerminalResizeOwner = useCallback((owned: boolean) => {
+    terminalResizeOwnerRef.current = owned;
+    setTerminalResizeOwner(owned);
   }, []);
 
   const clearTerminalOutput = useCallback(() => {
@@ -406,6 +421,7 @@ export default function App() {
     attachedSessionRef.current = undefined;
     pendingResizeKeyRef.current = undefined;
     confirmedSessionSizesRef.current.clear();
+    updateTerminalResizeOwner(false);
     setAttachedSessionId(undefined);
     lastCursorReportRef.current = "";
     lastCursorFocusedRef.current = undefined;
@@ -417,7 +433,7 @@ export default function App() {
     clearSessionFiles();
     setMobilePanel(undefined);
     setMobileMenuOpen(false);
-  }, [clearSessionFiles, clearTerminalOutput]);
+  }, [clearSessionFiles, clearTerminalOutput, updateTerminalResizeOwner]);
 
   const handleDisconnectAttach = useCallback(() => {
     // 用户主动断开时不要被“默认打开第一个 session”的自动流程立即重新 attach。
@@ -448,6 +464,8 @@ export default function App() {
     setSessionOrder([]);
     sessionOrderRef.current = [];
     autoAttachAttemptedSessionRef.current = undefined;
+    attachingSessionIdRef.current = undefined;
+    attachRequestIdRef.current += 1;
     reattachCurrentSessionOnOpenRef.current = false;
     userDetachedRef.current = false;
     setNewOutputSessionIds(new Set());
@@ -925,6 +943,7 @@ export default function App() {
               ),
             );
             if (payload.session_id === attachedSessionRef.current) {
+              updateTerminalResizeOwner(Boolean(payload.resize_owner));
               const confirmedResizeKey = terminalSizeKey(payload.session_id, payload.size);
               if (pendingResizeKeyRef.current === confirmedResizeKey) {
                 pendingResizeKeyRef.current = undefined;
@@ -941,13 +960,24 @@ export default function App() {
       }
     };
     void read();
-  }, [enqueueTerminalOutput, markNewOutputIfBackground, setSafeError]);
+  }, [enqueueTerminalOutput, markNewOutputIfBackground, setSafeError, updateTerminalResizeOwner]);
 
   const handleAttach = useCallback(
     async (sessionId: UUID) => {
+      if (attachingSessionIdRef.current === sessionId) {
+        setSelectedSessionId(sessionId);
+        clearNewOutputMark(sessionId);
+        setMobilePanel(undefined);
+        setMobileMenuOpen(false);
+        return;
+      }
       userDetachedRef.current = false;
       setError(undefined);
       setStatus("attaching");
+      const attachRequestId = attachRequestIdRef.current + 1;
+      attachRequestIdRef.current = attachRequestId;
+      attachingSessionIdRef.current = sessionId;
+      let client: DirectClient | undefined;
       try {
         const shouldRefreshCurrentAttach =
           reattachCurrentSessionOnOpenRef.current &&
@@ -964,9 +994,19 @@ export default function App() {
         reattachCurrentSessionOnOpenRef.current = false;
         disconnectAttach();
         clearTerminalOutput();
-        const client = await authenticatedClient();
+        client = await authenticatedClient();
         const attached = await client.attachSession(sessionId);
-        attachClientRef.current = client;
+        if (
+          attachRequestIdRef.current !== attachRequestId ||
+          attachingSessionIdRef.current !== sessionId
+        ) {
+          client.close();
+          client = undefined;
+          return;
+        }
+        const attachedClient = client;
+        client = undefined;
+        attachClientRef.current = attachedClient;
         attachedSessionRef.current = sessionId;
         confirmedSessionSizesRef.current.set(attached.session_id, attached.size);
         setSelectedSessionId(sessionId);
@@ -976,14 +1016,44 @@ export default function App() {
         setMobilePanel(undefined);
         setMobileMenuOpen(false);
         setStatus("attached");
-        startReceiveLoop(client);
+        if (isMobileLayout) {
+          // 移动端打开历史 session 后主动请求 xterm focus，让软键盘保持在终端下方。
+          // 真实 resize 权限仍由 daemon 下发的 resize_owner 控制。
+          setTerminalFocusRequest((request) => request + 1);
+        }
+        startReceiveLoop(attachedClient);
+        updateTerminalResizeOwner(Boolean(attached.resize_owner));
         void loadSessionFiles(sessionId);
         void refreshDaemonClients();
       } catch (caught) {
-        setSafeError(caught);
+        if (
+          attachRequestIdRef.current === attachRequestId &&
+          attachingSessionIdRef.current === sessionId
+        ) {
+          setSafeError(caught);
+        }
+      } finally {
+        client?.close();
+        if (
+          attachRequestIdRef.current === attachRequestId &&
+          attachingSessionIdRef.current === sessionId
+        ) {
+          attachingSessionIdRef.current = undefined;
+        }
       }
     },
-    [authenticatedClient, clearNewOutputMark, clearTerminalOutput, disconnectAttach, loadSessionFiles, refreshDaemonClients, setSafeError, startReceiveLoop],
+    [
+      authenticatedClient,
+      clearNewOutputMark,
+      clearTerminalOutput,
+      disconnectAttach,
+      loadSessionFiles,
+      refreshDaemonClients,
+      setSafeError,
+      isMobileLayout,
+      startReceiveLoop,
+      updateTerminalResizeOwner,
+    ],
   );
 
   const handleOpenWorkspace = useCallback(() => {
@@ -1037,6 +1107,7 @@ export default function App() {
       attachClientRef.current = client;
       attachedSessionRef.current = created.session_id;
       confirmedSessionSizesRef.current.set(created.session_id, created.size);
+      updateTerminalResizeOwner(Boolean(created.resize_owner));
       setSelectedSessionId(created.session_id);
       setAttachedSessionId(created.session_id);
       clearNewOutputMark(created.session_id);
@@ -1056,7 +1127,17 @@ export default function App() {
     } catch (caught) {
       setSafeError(caught);
     }
-  }, [authenticatedClient, clearNewOutputMark, clearTerminalOutput, disconnectAttach, loadSessionFiles, refreshDaemonClients, setSafeError, startReceiveLoop]);
+  }, [
+    authenticatedClient,
+    clearNewOutputMark,
+    clearTerminalOutput,
+    disconnectAttach,
+    loadSessionFiles,
+    refreshDaemonClients,
+    setSafeError,
+    startReceiveLoop,
+    updateTerminalResizeOwner,
+  ]);
 
   const handleRetryConnection = useCallback(async () => {
     const sessionId = attachedSessionRef.current ?? attachedSessionId ?? selectedSessionId;
@@ -1278,6 +1359,9 @@ export default function App() {
       const client = attachClientRef.current;
       const sessionId = attachedSessionRef.current;
       if (!client || !sessionId) {
+        return;
+      }
+      if (!terminalResizeOwnerRef.current) {
         return;
       }
       const currentSize =
@@ -1696,6 +1780,7 @@ export default function App() {
       ]
         .filter(Boolean)
         .join(" ")}
+      style={appShellStyle}
     >
       {mobileMenuOpen ? (
         <button
@@ -1922,6 +2007,7 @@ export default function App() {
                 sessionSize={attachedSession?.size}
                 focusRequest={terminalFocusRequest}
                 mobileInputMode={isMobileLayout}
+                resizeEnabled={terminalResizeOwner}
                 outputResetVersion={terminalOutputResetVersion}
                 takeOutput={takeTerminalOutput}
                 registerOutputDrain={registerTerminalOutputDrain}
@@ -2290,6 +2376,35 @@ function useMobileLayout(): boolean {
   }, []);
 
   return isMobileLayout;
+}
+
+function useVisualViewportHeight(enabled: boolean): number {
+  const heightFromWindow = () => {
+    if (typeof window === "undefined") {
+      return 0;
+    }
+    return Math.round(window.visualViewport?.height ?? window.innerHeight);
+  };
+  const [height, setHeight] = useState(heightFromWindow);
+
+  useEffect(() => {
+    if (!enabled || typeof window === "undefined") {
+      return undefined;
+    }
+    const viewport = window.visualViewport;
+    const updateHeight = () => setHeight(heightFromWindow());
+    updateHeight();
+    window.addEventListener("resize", updateHeight);
+    viewport?.addEventListener("resize", updateHeight);
+    viewport?.addEventListener("scroll", updateHeight);
+    return () => {
+      window.removeEventListener("resize", updateHeight);
+      viewport?.removeEventListener("resize", updateHeight);
+      viewport?.removeEventListener("scroll", updateHeight);
+    };
+  }, [enabled]);
+
+  return height || (typeof window === "undefined" ? 0 : window.innerHeight);
 }
 
 function clampFilesPanelWidth(width: number, viewportWidth: number): number {

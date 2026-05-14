@@ -15,9 +15,10 @@ use termd_proto::{
     RouteRole as ProtoRouteRole, ServerId, SessionId,
 };
 use thiserror::Error;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, warn};
 
@@ -31,8 +32,7 @@ const OUTPUT_FLUSH_MAX_BYTES_PER_SESSION: usize = 16 * 1024;
 const MIN_RELAY_RETRY_DELAY_MS: u64 = 1;
 const MIN_RELAY_HEARTBEAT_INTERVAL_MS: u64 = 1;
 
-type RelayWs =
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+type RelayWs = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>;
 type RelaySender = futures_util::stream::SplitSink<RelayWs, Message>;
 type RelayReceiver = futures_util::stream::SplitStream<RelayWs>;
 
@@ -273,6 +273,66 @@ impl RelayBasePath {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayProxyUrl {
+    scheme: RelayProxyScheme,
+    authority: String,
+}
+
+impl RelayProxyUrl {
+    pub fn parse(value: &str) -> Result<Self, RelayConnectorError> {
+        let trimmed = value.trim();
+        let (scheme, rest) = if let Some(rest) = trimmed.strip_prefix("http://") {
+            (RelayProxyScheme::Http, rest)
+        } else if let Some(rest) = trimmed.strip_prefix("socks5://") {
+            (RelayProxyScheme::Socks5, rest)
+        } else {
+            return Err(RelayConnectorError::UnsupportedUrl);
+        };
+
+        if rest.is_empty() || rest.contains('?') || rest.contains('#') {
+            return Err(RelayConnectorError::UnsupportedUrl);
+        }
+        let authority = rest.trim_end_matches('/');
+        if authority.contains('/') || authority_contains_credentials(authority) {
+            return Err(RelayConnectorError::UnsupportedUrl);
+        }
+        validate_proxy_authority(authority)?;
+
+        Ok(Self {
+            scheme,
+            authority: authority.to_owned(),
+        })
+    }
+
+    pub fn canonical_url(&self) -> String {
+        format!("{}://{}", self.scheme.as_str(), self.authority)
+    }
+
+    pub fn scheme(&self) -> RelayProxyScheme {
+        self.scheme
+    }
+
+    pub fn authority(&self) -> &str {
+        &self.authority
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayProxyScheme {
+    Http,
+    Socks5,
+}
+
+impl RelayProxyScheme {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Http => "http",
+            Self::Socks5 => "socks5",
+        }
+    }
+}
+
 pub async fn connect_relay_mux(
     relay_url: &str,
     protocol: SharedDaemonProtocol,
@@ -297,6 +357,7 @@ pub async fn connect_relay_mux_base(
     connect_relay_mux_base_with_heartbeat(
         base,
         auth_token,
+        None,
         RelayReconnectPolicy::default().heartbeat_interval(),
         protocol,
     )
@@ -306,16 +367,18 @@ pub async fn connect_relay_mux_base(
 pub async fn run_relay_mux_with_reconnect(
     relay_url: &str,
     auth_token: Option<&str>,
+    proxy: Option<RelayProxyUrl>,
     policy: RelayReconnectPolicy,
     protocol: SharedDaemonProtocol,
 ) -> Result<(), RelayConnectorError> {
     let base = RelayBaseUrl::parse(relay_url)?;
-    run_relay_mux_with_reconnect_base(base, auth_token, policy, protocol).await
+    run_relay_mux_with_reconnect_base(base, auth_token, proxy, policy, protocol).await
 }
 
 pub async fn run_relay_mux_with_reconnect_base(
     base: RelayBaseUrl,
     auth_token: Option<&str>,
+    proxy: Option<RelayProxyUrl>,
     policy: RelayReconnectPolicy,
     protocol: SharedDaemonProtocol,
 ) -> Result<(), RelayConnectorError> {
@@ -325,6 +388,7 @@ pub async fn run_relay_mux_with_reconnect_base(
         let result = connect_relay_mux_base_with_heartbeat(
             base.clone(),
             auth_token,
+            proxy.clone(),
             policy.heartbeat_interval(),
             protocol.clone(),
         )
@@ -350,6 +414,7 @@ pub async fn run_relay_mux_with_reconnect_base(
 async fn connect_relay_mux_base_with_heartbeat(
     base: RelayBaseUrl,
     auth_token: Option<&str>,
+    proxy: Option<RelayProxyUrl>,
     heartbeat_interval: Duration,
     protocol: SharedDaemonProtocol,
 ) -> Result<(), RelayConnectorError> {
@@ -360,7 +425,7 @@ async fn connect_relay_mux_base_with_heartbeat(
             .server_id()
     };
     let url = base.daemon_mux_url_with_auth(server_id, auth_token);
-    let (socket, _) = connect_async(url)
+    let (socket, _) = connect_relay_websocket(&url, proxy.as_ref())
         .await
         .map_err(|_| RelayConnectorError::ConnectFailed)?;
     let (mut sender, mut receiver) = socket.split();
@@ -843,6 +908,215 @@ fn json_envelope_from_mux_frame(
     }
 }
 
+async fn connect_relay_websocket(
+    url: &str,
+    proxy: Option<&RelayProxyUrl>,
+) -> Result<
+    (
+        RelayWs,
+        tokio_tungstenite::tungstenite::handshake::client::Response,
+    ),
+    tokio_tungstenite::tungstenite::Error,
+> {
+    let Some(proxy) = proxy else {
+        return tokio_tungstenite::connect_async(url).await;
+    };
+
+    let target = relay_target_from_ws_url(url).ok_or_else(|| {
+        tokio_tungstenite::tungstenite::Error::Url(
+            tokio_tungstenite::tungstenite::error::UrlError::UnsupportedUrlScheme,
+        )
+    })?;
+    let stream = connect_proxy_tunnel(proxy, &target)
+        .await
+        .map_err(tokio_tungstenite::tungstenite::Error::Io)?;
+
+    tokio_tungstenite::client_async_tls_with_config(url, stream, None, None).await
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RelayConnectTarget {
+    host: String,
+    port: u16,
+    authority: String,
+}
+
+fn relay_target_from_ws_url(url: &str) -> Option<RelayConnectTarget> {
+    let (scheme, rest) = if let Some(rest) = url.strip_prefix("ws://") {
+        ("ws", rest)
+    } else if let Some(rest) = url.strip_prefix("wss://") {
+        ("wss", rest)
+    } else {
+        return None;
+    };
+    let authority = rest
+        .split_once('/')
+        .map_or(rest, |(authority, _)| authority);
+    let authority = authority
+        .split_once('?')
+        .map_or(authority, |(authority, _)| authority);
+    let (host, port) = parse_target_authority(authority, scheme)?;
+    let authority = if authority_has_explicit_port(authority) {
+        authority.to_owned()
+    } else {
+        format_authority(&host, port)
+    };
+    Some(RelayConnectTarget {
+        host,
+        port,
+        authority,
+    })
+}
+
+async fn connect_proxy_tunnel(
+    proxy: &RelayProxyUrl,
+    target: &RelayConnectTarget,
+) -> std::io::Result<TcpStream> {
+    let mut stream = TcpStream::connect(proxy.authority()).await?;
+    match proxy.scheme() {
+        RelayProxyScheme::Http => {
+            write_http_connect(&mut stream, target).await?;
+        }
+        RelayProxyScheme::Socks5 => {
+            write_socks5_connect(&mut stream, target).await?;
+        }
+    }
+    Ok(stream)
+}
+
+async fn write_http_connect(
+    stream: &mut TcpStream,
+    target: &RelayConnectTarget,
+) -> std::io::Result<()> {
+    // 代理只看目标 host:port，relay auth token 仍留在后续 WebSocket 请求内。
+    let request = http_connect_request(&target.authority, "");
+    stream.write_all(request.as_bytes()).await?;
+    stream.flush().await?;
+
+    let mut response = Vec::new();
+    let mut buf = [0_u8; 256];
+    loop {
+        let read = stream.read(&mut buf).await?;
+        if read == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "http proxy closed before CONNECT response",
+            ));
+        }
+        response.extend_from_slice(&buf[..read]);
+        if response.windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
+        }
+        if response.len() > 8192 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "http proxy CONNECT response is too large",
+            ));
+        }
+    }
+
+    let response = std::str::from_utf8(&response).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "http proxy CONNECT response is not utf-8",
+        )
+    })?;
+    let status = response
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|status| status.parse::<u16>().ok())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "http proxy CONNECT response has no status",
+            )
+        })?;
+    if (200..300).contains(&status) {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            format!("http proxy CONNECT returned {status}"),
+        ))
+    }
+}
+
+async fn write_socks5_connect(
+    stream: &mut TcpStream,
+    target: &RelayConnectTarget,
+) -> std::io::Result<()> {
+    let request = socks5_connect_request(&target.host, target.port)?;
+    stream.write_all(&request[..3]).await?;
+    stream.flush().await?;
+    let mut greeting = [0_u8; 2];
+    stream.read_exact(&mut greeting).await?;
+    if greeting != [0x05, 0x00] {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "socks5 proxy rejected no-auth method",
+        ));
+    }
+
+    stream.write_all(&request[3..]).await?;
+    stream.flush().await?;
+    let mut head = [0_u8; 4];
+    stream.read_exact(&mut head).await?;
+    if head[0] != 0x05 || head[1] != 0x00 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "socks5 proxy failed CONNECT",
+        ));
+    }
+
+    let remaining = match head[3] {
+        0x01 => 4 + 2,
+        0x03 => {
+            let mut len = [0_u8; 1];
+            stream.read_exact(&mut len).await?;
+            len[0] as usize + 2
+        }
+        0x04 => 16 + 2,
+        _ => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "socks5 proxy returned unknown address type",
+            ));
+        }
+    };
+    let mut discard = vec![0_u8; remaining];
+    stream.read_exact(&mut discard).await?;
+    Ok(())
+}
+
+fn http_connect_request(target_authority: &str, _proxy_authority: &str) -> String {
+    format!(
+        "CONNECT {target_authority} HTTP/1.1\r\nHost: {target_authority}\r\nProxy-Connection: Keep-Alive\r\n\r\n"
+    )
+}
+
+fn socks5_connect_request(host: &str, port: u16) -> std::io::Result<Vec<u8>> {
+    if host.is_empty() || host.len() > u8::MAX as usize {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "socks5 target host length is invalid",
+        ));
+    }
+    let mut request = vec![
+        0x05,
+        0x01,
+        0x00, // greeting: version 5, one method, no-auth
+        0x05,
+        0x01,
+        0x00,
+        0x03,
+        host.len() as u8,
+    ];
+    request.extend_from_slice(host.as_bytes());
+    request.extend_from_slice(&port.to_be_bytes());
+    Ok(request)
+}
+
 fn validate_authority(authority: &str) -> Result<(), RelayConnectorError> {
     if authority.is_empty() || authority.contains('@') {
         return Err(RelayConnectorError::UnsupportedUrl);
@@ -870,6 +1144,70 @@ fn validate_authority(authority: &str) -> Result<(), RelayConnectorError> {
     };
 
     Ok(())
+}
+
+fn validate_proxy_authority(authority: &str) -> Result<(), RelayConnectorError> {
+    parse_target_authority(authority, "proxy")
+        .map(|_| ())
+        .ok_or(RelayConnectorError::UnsupportedUrl)
+}
+
+fn parse_target_authority(authority: &str, scheme: &str) -> Option<(String, u16)> {
+    if let Some(after_bracket) = authority.strip_prefix('[') {
+        let (host, suffix) = after_bracket.split_once(']')?;
+        if host.is_empty() {
+            return None;
+        }
+        let port = suffix
+            .strip_prefix(':')
+            .and_then(|port| port.parse::<u16>().ok())
+            .or_else(|| default_port_for_scheme(scheme))?;
+        return Some((host.to_owned(), port));
+    }
+
+    if let Some((host, port)) = authority.rsplit_once(':') {
+        if host.is_empty() || host.contains(':') {
+            return None;
+        }
+        return Some((host.to_owned(), port.parse::<u16>().ok()?));
+    }
+
+    let port = default_port_for_scheme(scheme)?;
+    if authority.is_empty() || authority.contains(':') {
+        return None;
+    }
+    Some((authority.to_owned(), port))
+}
+
+fn default_port_for_scheme(scheme: &str) -> Option<u16> {
+    match scheme {
+        "ws" => Some(80),
+        "wss" => Some(443),
+        _ => None,
+    }
+}
+
+fn authority_has_explicit_port(authority: &str) -> bool {
+    if let Some(after_bracket) = authority.strip_prefix('[') {
+        return after_bracket
+            .split_once(']')
+            .is_some_and(|(_, suffix)| suffix.starts_with(':'));
+    }
+    authority.rsplit_once(':').is_some_and(|(host, port)| {
+        !host.is_empty() && !host.contains(':') && port.parse::<u16>().is_ok()
+    })
+}
+
+fn format_authority(host: &str, port: u16) -> String {
+    if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+fn authority_contains_credentials(authority: &str) -> bool {
+    authority.contains('@')
 }
 
 fn percent_encode_query_value(value: &str) -> String {
@@ -1028,6 +1366,52 @@ mod tests {
     }
 
     #[test]
+    fn parses_http_and_socks5_relay_proxy_urls() {
+        let http = RelayProxyUrl::parse("http://127.0.0.1:3128").unwrap();
+        assert_eq!(http.scheme(), RelayProxyScheme::Http);
+        assert_eq!(http.authority(), "127.0.0.1:3128");
+
+        let socks5 = RelayProxyUrl::parse("socks5://proxy.example:1080").unwrap();
+        assert_eq!(socks5.scheme(), RelayProxyScheme::Socks5);
+        assert_eq!(socks5.authority(), "proxy.example:1080");
+    }
+
+    #[test]
+    fn relay_proxy_url_rejects_unsupported_or_ambiguous_values() {
+        assert!(RelayProxyUrl::parse("https://proxy.example:443").is_err());
+        assert!(RelayProxyUrl::parse("http://proxy.example").is_err());
+        assert!(RelayProxyUrl::parse("socks5://user:pass@proxy.example:1080").is_err());
+        assert!(RelayProxyUrl::parse("socks5h://proxy.example:1080").is_err());
+        assert!(RelayProxyUrl::parse("http://proxy.example:3128/path").is_err());
+    }
+
+    #[test]
+    fn http_connect_request_uses_target_authority_without_secret_url() {
+        let request = http_connect_request("relay.example:443", "proxy.local:3128");
+
+        assert_eq!(
+            request,
+            "CONNECT relay.example:443 HTTP/1.1\r\nHost: relay.example:443\r\nProxy-Connection: Keep-Alive\r\n\r\n"
+        );
+        assert!(!request.contains("relay_token"));
+        assert!(!request.contains("proxy.local"));
+    }
+
+    #[test]
+    fn socks5_connect_request_encodes_domain_target() {
+        let request = socks5_connect_request("relay.example", 443).unwrap();
+
+        assert_eq!(
+            request,
+            vec![
+                0x05, 0x01, 0x00, // no-auth greeting
+                0x05, 0x01, 0x00, 0x03, 13, b'r', b'e', b'l', b'a', b'y', b'.', b'e', b'x', b'a',
+                b'm', b'p', b'l', b'e', 0x01, 0xbb,
+            ]
+        );
+    }
+
+    #[test]
     fn rejects_unsupported_relay_urls() {
         assert!(RelayBaseUrl::parse("http://127.0.0.1:8080").is_err());
         assert!(RelayBaseUrl::parse("ws://127.0.0.1:8080/path").is_err());
@@ -1093,7 +1477,7 @@ mod tests {
         });
         let protocol = test_protocol("reconnect-supervisor");
         let connector = tokio::spawn(run_relay_mux_with_reconnect_base(
-            base, None, policy, protocol,
+            base, None, None, policy, protocol,
         ));
 
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -1385,6 +1769,7 @@ mod tests {
         let connector = tokio::spawn(connect_relay_mux_base_with_heartbeat(
             base,
             None,
+            None,
             Duration::from_secs(60),
             protocol.clone(),
         ));
@@ -1536,6 +1921,7 @@ mod tests {
         let base = RelayBaseUrl::parse(&format!("ws://{addr}")).unwrap();
         let connector = tokio::spawn(connect_relay_mux_base_with_heartbeat(
             base,
+            None,
             None,
             Duration::from_secs(60),
             protocol.clone(),

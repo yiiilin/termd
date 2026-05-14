@@ -32,6 +32,7 @@ INSTALL_SET_TLS_CERT=0
 INSTALL_SET_TLS_KEY=0
 INSTALL_SET_SUPERVISOR_VERSION=0
 INSTALL_SET_USER=0
+INSTALL_SET_PROXY=0
 ACTION="install"
 PURGE_STATE=0
 LOG_EMITTED=0
@@ -81,6 +82,8 @@ Options:
   --public                      Alias for --listen 0.0.0.0:8765.
   --relay <WS_URL>              Set the relay URL.
   --relay-auth-token <TOKEN>    Set relay transport auth token.
+  --proxy <URL>                 Set relay outbound proxy; http://host:port or socks5://host:port.
+                                Also supports HTTP_PROXY, HTTPS_PROXY, ALL_PROXY and NO_PROXY in /etc/termd/termd.env.
   --tls-cert <PATH>             Set TLS certificate path.
   --tls-key <PATH>              Set TLS private key path.
   --supervisor-version <VER>    Set the target supervisor compatibility version.
@@ -148,6 +151,13 @@ parse_args() {
         [[ $# -ge 2 && -n "$2" ]] || die "--relay-auth-token requires a non-empty value"
         TERMD_RELAY_AUTH_TOKEN="$2"
         INSTALL_SET_RELAY_AUTH_TOKEN=1
+        shift 2
+        ;;
+      --proxy|--relay-proxy)
+        [[ $# -ge 2 && -n "$2" ]] || die "$1 requires a non-empty value"
+        HTTP_PROXY="$2"
+        HTTPS_PROXY="$2"
+        INSTALL_SET_PROXY=1
         shift 2
         ;;
       --tls-cert)
@@ -491,6 +501,10 @@ apply_env_overrides() {
   if [[ "$INSTALL_SET_RELAY_AUTH_TOKEN" -eq 1 ]]; then
     upsert_env_var "TERMD_RELAY_AUTH_TOKEN" "$TERMD_RELAY_AUTH_TOKEN"
   fi
+  if [[ "$INSTALL_SET_PROXY" -eq 1 ]]; then
+    upsert_env_var "HTTP_PROXY" "$HTTP_PROXY"
+    upsert_env_var "HTTPS_PROXY" "$HTTPS_PROXY"
+  fi
   if [[ "$INSTALL_SET_TLS_CERT" -eq 1 ]]; then
     upsert_env_var "TERMD_TLS_CERT" "$TERMD_TLS_CERT"
   fi
@@ -692,6 +706,26 @@ write_env_file() {
     else
       printf '# TERMD_RELAY_AUTH_TOKEN=replace-me\n'
     fi
+    if [[ -n "${HTTP_PROXY:-}" ]]; then
+      printf 'HTTP_PROXY=%q\n' "$HTTP_PROXY"
+    else
+      printf '# HTTP_PROXY=http://127.0.0.1:3128\n'
+    fi
+    if [[ -n "${HTTPS_PROXY:-}" ]]; then
+      printf 'HTTPS_PROXY=%q\n' "$HTTPS_PROXY"
+    else
+      printf '# HTTPS_PROXY=http://127.0.0.1:3128\n'
+    fi
+    if [[ -n "${ALL_PROXY:-}" ]]; then
+      printf 'ALL_PROXY=%q\n' "$ALL_PROXY"
+    else
+      printf '# ALL_PROXY=socks5://127.0.0.1:1080\n'
+    fi
+    if [[ -n "${NO_PROXY:-}" ]]; then
+      printf 'NO_PROXY=%q\n' "$NO_PROXY"
+    else
+      printf '# NO_PROXY=localhost,127.0.0.1\n'
+    fi
     if [[ -n "${TERMD_TLS_CERT:-}" ]]; then
       printf 'TERMD_TLS_CERT=%q\n' "$TERMD_TLS_CERT"
     else
@@ -721,7 +755,9 @@ ENV_FILE="/etc/termd/termd.env"
 
 if [[ -r "$ENV_FILE" ]]; then
   # shellcheck source=/dev/null
+  set -a
   source "$ENV_FILE"
+  set +a
 fi
 
 args=()

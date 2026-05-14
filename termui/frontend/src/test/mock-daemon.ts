@@ -70,6 +70,7 @@ interface MockConnection {
   deviceId?: UUID;
   e2ee?: E2eeSession;
   attachedSessionIds: Set<UUID>;
+  resizeOwnerSessionIds: Set<UUID>;
 }
 
 export class MockDaemon {
@@ -188,9 +189,14 @@ export class MockDaemon {
       return;
     }
 
-    const connection: MockConnection = { socket, routed: false, attachedSessionIds: new Set() };
+    const connection: MockConnection = { socket, routed: false, attachedSessionIds: new Set(), resizeOwnerSessionIds: new Set() };
     this.connections.add(connection);
-    socket.on("close", () => this.connections.delete(connection));
+    socket.on("close", () => {
+      this.connections.delete(connection);
+      for (const sessionId of connection.resizeOwnerSessionIds) {
+        this.promoteResizeOwner(sessionId);
+      }
+    });
 
     socket.on("message", (raw) => {
       void this.handleOuter(connection, raw.toString());
@@ -352,6 +358,7 @@ export class MockDaemon {
             role: this.nextAttachRole,
             state: session?.state ?? "running",
             size: session?.size ?? { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+            resize_owner: this.assignResizeOwner(connection, payload.session_id),
           }),
         );
         if (this.options.attachOutput) {
@@ -383,6 +390,10 @@ export class MockDaemon {
       }
       case "session_resize": {
         const payload = inner.payload as { session_id: UUID; size: TerminalSize };
+        if (!connection.resizeOwnerSessionIds.has(payload.session_id)) {
+          this.sendError(connection, "invalid_state", "invalid protocol state");
+          return;
+        }
         this.sessionResizes.push(payload);
         if (this.options.resizeAckDelayMs) {
           await new Promise((resolve) => setTimeout(resolve, this.options.resizeAckDelayMs));
@@ -570,6 +581,7 @@ export class MockDaemon {
       role: this.nextAttachRole,
       state: "running",
       size: payload.size,
+      resize_owner: this.assignResizeOwner(connection, sessionId),
     } satisfies SessionCreatedPayload;
 
     // mock daemon 模拟真实 daemon：session_create 会立刻 attach 当前连接。
@@ -612,10 +624,45 @@ export class MockDaemon {
     return false;
   }
 
+  private assignResizeOwner(connection: MockConnection, sessionId: UUID): boolean {
+    for (const candidate of this.connections) {
+      if (candidate !== connection && candidate.e2ee && candidate.resizeOwnerSessionIds.has(sessionId)) {
+        return false;
+      }
+    }
+    connection.resizeOwnerSessionIds.add(sessionId);
+    return true;
+  }
+
+  private promoteResizeOwner(sessionId: UUID): void {
+    for (const connection of this.connections) {
+      if (connection.e2ee && connection.attachedSessionIds.has(sessionId)) {
+        connection.resizeOwnerSessionIds.add(sessionId);
+        const session = this.options.sessions.find((candidate) => candidate.session_id === sessionId);
+        this.sendInner(
+          connection,
+          envelope("session_resized", {
+            session_id: sessionId,
+            size: session?.size ?? { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+            resize_owner: true,
+          }),
+        );
+        return;
+      }
+    }
+  }
+
   private broadcastSessionResized(sessionId: UUID, size: TerminalSize): void {
     for (const connection of this.connections) {
       if (connection.e2ee && connection.attachedSessionIds.has(sessionId)) {
-        this.sendInner(connection, envelope("session_resized", { session_id: sessionId, size }));
+        this.sendInner(
+          connection,
+          envelope("session_resized", {
+            session_id: sessionId,
+            size,
+            resize_owner: connection.resizeOwnerSessionIds.has(sessionId),
+          }),
+        );
       }
     }
   }

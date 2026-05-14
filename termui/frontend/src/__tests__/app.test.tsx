@@ -1,5 +1,7 @@
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import App, {
   browserReachableWsUrl,
@@ -360,6 +362,19 @@ describe("termui web 工作台", () => {
     await waitForWorkspaceSession();
     expect(intervalSpy).toHaveBeenCalledWith(expect.any(Function), 1000);
     intervalSpy.mockRestore();
+  });
+
+  it("底部状态栏使用固定列宽，避免指标内容变化时横向抖动", () => {
+    const css = readFileSync(resolve(process.cwd(), "src/styles.css"), "utf8");
+
+    expect(css).toContain("--daemon-status-cpu-width: 132px;");
+    expect(css).toContain("--daemon-status-memory-width: 132px;");
+    expect(css).toContain("--daemon-status-network-width: 150px;");
+    expect(css).toContain("--daemon-status-disk-width: 150px;");
+    expect(css).toContain("--daemon-status-load-width: 122px;");
+    expect(css).toContain("--daemon-status-uptime-width: 132px;");
+    expect(css).toContain("grid-template-columns:\n    var(--daemon-status-cpu-width)");
+    expect(css).toContain("flex: 0 0 var(--daemon-status-network-width);");
   });
 
   it("基于相邻 daemon 状态快照计算网卡上下行速度", () => {
@@ -1773,6 +1788,72 @@ describe("termui web 工作台", () => {
     }
   });
 
+  it("移动端键盘上方快捷按钮会发送常用控制字符", async () => {
+    const user = userEvent.setup();
+    setViewportWidth(390);
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await waitFor(() => {
+      expect(document.querySelector(".xterm-helper-textarea")).not.toBeNull();
+    });
+
+    await user.click(screen.getByRole("button", { name: "Send Tab" }));
+    await user.click(screen.getByRole("button", { name: "Send Ctrl-C" }));
+    await user.click(screen.getByRole("button", { name: "Send Ctrl-Z" }));
+
+    await waitFor(() => expect(daemon.sessionDataMessages).toEqual(["\t", "\x03", "\x1a"]));
+  });
+
+  it("移动端长按终端一秒后拖动会发送方向键序列", async () => {
+    const user = userEvent.setup();
+    setViewportWidth(390);
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await waitFor(() => {
+      expect(document.querySelector(".xterm-helper-textarea")).not.toBeNull();
+    });
+    const viewerFrame = await waitFor(() => {
+      const frame = document.querySelector<HTMLElement>(".terminal-viewer-frame");
+      expect(frame).not.toBeNull();
+      return frame!;
+    });
+
+    vi.useFakeTimers();
+    try {
+      fireEvent.pointerDown(viewerFrame, {
+        pointerId: 11,
+        pointerType: "touch",
+        clientX: 160,
+        clientY: 240,
+      });
+      act(() => {
+        vi.advanceTimersByTime(1000);
+      });
+
+      expect(screen.getByLabelText("mobile direction gesture")).toBeInTheDocument();
+      fireEvent.pointerMove(viewerFrame, {
+        pointerId: 11,
+        pointerType: "touch",
+        clientX: 160,
+        clientY: 190,
+      });
+      fireEvent.pointerUp(viewerFrame, {
+        pointerId: 11,
+        pointerType: "touch",
+        clientX: 160,
+        clientY: 190,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+
+    await waitFor(() => expect(daemon.sessionDataMessages).toContain("\x1b[A"));
+  });
+
   it("session 分辨率与当前客户端一致时不显示虚线框和缩放按钮", async () => {
     const user = userEvent.setup();
     await daemon.stop();
@@ -2014,7 +2095,7 @@ describe("termui web 工作台", () => {
     expect(screen.getByTestId("terminal-pane")).toHaveAttribute("data-viewer-mode", "true");
   });
 
-  it("收到其他窗口的 session_resized 后不反向抢回本地尺寸", async () => {
+  it("已有在线客户端时第二个客户端只显示 viewer zoom 且不发送 resize", async () => {
     const user = userEvent.setup();
     await daemon.stop();
     daemon = await MockDaemon.start({
@@ -2076,20 +2157,17 @@ describe("termui web 工作台", () => {
     await user.click(secondTerminalFrame!);
 
     await waitFor(() =>
-      expect(daemon.sessionResizes).toContainEqual({
-        session_id: "00000000-0000-0000-0000-000000000409",
-        size: { rows: 30, cols: 100, pixel_width: expect.any(Number), pixel_height: expect.any(Number) },
-      }),
+      expect(secondRender.container.querySelector("[data-testid='terminal-pane']")).toHaveAttribute(
+        "data-viewer-mode",
+        "true",
+      ),
     );
     await new Promise((resolve) => window.setTimeout(resolve, 160));
 
     const laterResizes = daemon.sessionResizes.slice(resizeCountAfterBlur);
-    expect(laterResizes).toEqual([
-      {
-        session_id: "00000000-0000-0000-0000-000000000409",
-        size: { rows: 30, cols: 100, pixel_width: expect.any(Number), pixel_height: expect.any(Number) },
-      },
-    ]);
+    expect(laterResizes).toEqual([]);
+    expect(within(secondRender.container).getByLabelText("viewer controls")).toBeVisible();
+    expect(within(secondRender.container).getByRole("button", { name: "Zoom in" })).toBeVisible();
 
     secondRender.unmount();
     firstRender.unmount();

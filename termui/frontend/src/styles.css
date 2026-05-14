@@ -4,6 +4,12 @@
   background: #0c1210;
   color: #dbe8e2;
   --terminal-frame-padding: 12px;
+  --daemon-status-cpu-width: 132px;
+  --daemon-status-memory-width: 132px;
+  --daemon-status-network-width: 150px;
+  --daemon-status-disk-width: 150px;
+  --daemon-status-load-width: 122px;
+  --daemon-status-uptime-width: 132px;
 }
 
 * {
@@ -1009,14 +1015,16 @@ label {
 .daemon-status-strip .daemon-status-grid {
   min-width: 0;
   grid-template-columns:
-    minmax(106px, 1.1fr)
-    minmax(0, 0.92fr)
-    minmax(0, 1fr)
-    minmax(118px, 1.35fr)
-    minmax(0, 1.1fr)
-    minmax(0, 0.9fr);
+    var(--daemon-status-cpu-width)
+    var(--daemon-status-memory-width)
+    var(--daemon-status-network-width)
+    var(--daemon-status-disk-width)
+    var(--daemon-status-load-width)
+    var(--daemon-status-uptime-width);
   gap: 0;
   align-items: center;
+  justify-content: end;
+  overflow: hidden;
 }
 
 .daemon-status-metric {
@@ -1030,6 +1038,8 @@ label {
 }
 
 .daemon-status-strip .daemon-status-metric {
+  width: 100%;
+  flex: 0 0 auto;
   min-height: 30px;
   border: 0;
   border-left: 1px solid #25312d;
@@ -1042,7 +1052,11 @@ label {
 }
 
 .daemon-status-network {
-  min-width: 118px;
+  min-width: 0;
+}
+
+.daemon-status-strip .daemon-status-network {
+  flex: 0 0 var(--daemon-status-network-width);
 }
 
 .daemon-status-metric span,
@@ -1065,7 +1079,7 @@ label {
 }
 
 .daemon-status-cpu {
-  min-width: 106px;
+  min-width: 0;
 }
 
 .daemon-status-strip .daemon-status-cpu {
@@ -1248,6 +1262,11 @@ label {
 }
 
 .terminal-mobile-scroll-track {
+  display: none;
+}
+
+.terminal-mobile-shortcuts,
+.terminal-direction-pad {
   display: none;
 }
 
@@ -1774,7 +1793,7 @@ label {
   }
 
   .app-shell {
-    height: 100dvh;
+    height: var(--termd-visual-viewport-height, 100dvh);
     grid-template-columns: 1fr;
     grid-template-rows: auto minmax(0, 1fr);
   }
@@ -1877,7 +1896,7 @@ label {
 
   .workspace {
     min-height: 0;
-    height: 100%;
+    height: var(--termd-visual-viewport-height, 100%);
     grid-template-rows: 42px minmax(0, 1fr) 30px;
   }
 
@@ -2008,6 +2027,11 @@ label {
 
   .terminal-pane {
     min-height: 0;
+    grid-template-rows: minmax(0, 1fr) 42px;
+  }
+
+  .terminal-pane-viewer {
+    grid-template-rows: 36px minmax(0, 1fr) 42px;
   }
 
   .daemon-status-strip {
@@ -2017,10 +2041,12 @@ label {
 
   .daemon-status-strip .daemon-status-grid {
     grid-template-columns: repeat(4, minmax(0, 1fr));
+    justify-content: stretch;
   }
 
   .daemon-status-strip .daemon-status-metric {
     min-height: 30px;
+    width: auto;
     justify-content: center;
     gap: 4px;
     padding: 0 4px;
@@ -2045,6 +2071,96 @@ label {
 
   .terminal-scrollport {
     overflow: hidden;
+  }
+
+  .terminal-mobile-shortcuts {
+    position: relative;
+    z-index: 7;
+    min-width: 0;
+    border-top: 1px solid #25312d;
+    background: #0d1714;
+    display: grid;
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+    gap: 6px;
+    padding: 5px 8px 6px;
+  }
+
+  .terminal-mobile-shortcut-button {
+    min-width: 0;
+    min-height: 30px;
+    padding: 0;
+    border-color: #33443d;
+    border-radius: 6px;
+    background: #121d19;
+    color: #d7f7e8;
+    font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+    font-size: 12px;
+    touch-action: manipulation;
+    user-select: none;
+  }
+
+  .terminal-mobile-shortcut-button:active {
+    border-color: #d6ff5f;
+    background: #1d2a24;
+    color: #f5ffe0;
+  }
+
+  .terminal-direction-pad {
+    position: absolute;
+    top: 48px;
+    right: 10px;
+    z-index: 8;
+    width: 74px;
+    height: 74px;
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    grid-template-rows: repeat(3, 1fr);
+    place-items: center;
+    border: 1px solid rgba(214, 255, 95, 0.38);
+    border-radius: 8px;
+    background: rgba(8, 17, 15, 0.88);
+    box-shadow: 0 18px 34px rgba(0, 0, 0, 0.36);
+    pointer-events: none;
+    backdrop-filter: blur(8px);
+  }
+
+  .terminal-direction-pad span {
+    width: 22px;
+    height: 22px;
+    border: 1px solid #3d5048;
+    border-radius: 6px;
+    display: grid;
+    place-items: center;
+    color: #9eb3aa;
+    font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+    font-size: 14px;
+    line-height: 1;
+  }
+
+  .terminal-direction-pad span:nth-child(1) {
+    grid-column: 2;
+    grid-row: 1;
+  }
+
+  .terminal-direction-pad span:nth-child(2) {
+    grid-column: 1;
+    grid-row: 2;
+  }
+
+  .terminal-direction-pad span:nth-child(3) {
+    grid-column: 2;
+    grid-row: 3;
+  }
+
+  .terminal-direction-pad span:nth-child(4) {
+    grid-column: 3;
+    grid-row: 2;
+  }
+
+  .terminal-direction-pad span.active {
+    border-color: #d6ff5f;
+    background: #1d2a24;
+    color: #f5ffe0;
   }
 
   .terminal-mobile-scroll-track {
@@ -2120,10 +2236,6 @@ label {
     resize: none;
     font-size: 16px;
     transform: translate3d(0, 0, 0);
-  }
-
-  .terminal-pane-viewer {
-    grid-template-rows: 36px minmax(0, 1fr);
   }
 
   .terminal-viewer-toolbar {
