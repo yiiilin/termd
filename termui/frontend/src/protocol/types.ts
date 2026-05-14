@@ -205,7 +205,12 @@ export interface DaemonStatusResultPayload {
   memory_available_bytes: number;
   disk_total_bytes: number;
   disk_available_bytes: number;
-  process_count: number;
+  network_rx_bytes?: number;
+  network_tx_bytes?: number;
+  /**
+   * 兼容旧 daemon/status payload 的保留字段；当前状态栏不再显示进程数量。
+   */
+  process_count?: number;
   atop_available: boolean;
 }
 

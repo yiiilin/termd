@@ -11,7 +11,7 @@ describe("mobile layout regressions", () => {
     expect(css).toContain(".terminal-host {\n    min-width: 0;\n    max-width: 100%;");
     expect(css).toContain(".terminal-host .xterm");
     expect(css).toContain(".terminal-host .xterm .xterm-helper-textarea");
-    expect(css).toContain(".daemon-cpu-sparkline {\n    display: none;");
+    expect(css).toContain(".daemon-cpu-bar-chart {\n    display: none;");
     expect(css).toContain("position: fixed !important;");
     expect(css).toContain("min-height: 0 !important;");
   });

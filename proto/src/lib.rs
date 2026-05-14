@@ -551,6 +551,14 @@ pub struct DaemonStatusResultPayload {
     pub memory_available_bytes: u64,
     pub disk_total_bytes: u64,
     pub disk_available_bytes: u64,
+    /// 所有物理网卡累计接收字节数；旧 daemon 没有该字段时客户端按 0 降级。
+    #[serde(default)]
+    pub network_rx_bytes: u64,
+    /// 所有物理网卡累计发送字节数；前端用相邻两次快照计算上下行速度。
+    #[serde(default)]
+    pub network_tx_bytes: u64,
+    /// 兼容旧前端的保留字段；新状态栏不再展示进程数量。
+    #[serde(default)]
     pub process_count: u64,
     pub atop_available: bool,
 }
@@ -1276,6 +1284,8 @@ mod tests {
             memory_available_bytes: 4 * 1024 * 1024,
             disk_total_bytes: 100 * 1024 * 1024,
             disk_available_bytes: 40 * 1024 * 1024,
+            network_rx_bytes: 12 * 1024 * 1024,
+            network_tx_bytes: 3 * 1024 * 1024,
             process_count: 42,
             atop_available: false,
         });

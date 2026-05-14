@@ -202,6 +202,8 @@ describe("协议类型", () => {
       memory_available_bytes: 4 * 1024 * 1024,
       disk_total_bytes: 100 * 1024 * 1024,
       disk_available_bytes: 40 * 1024 * 1024,
+      network_rx_bytes: 12 * 1024 * 1024,
+      network_tx_bytes: 3 * 1024 * 1024,
       process_count: 42,
       atop_available: false,
     };
@@ -213,6 +215,8 @@ describe("协议类型", () => {
     expect(envelope("daemon_status_result", status).payload).toMatchObject({
       host_name: "devbox",
       load_avg: [0.1, 0.2, 0.3],
+      network_rx_bytes: 12 * 1024 * 1024,
+      network_tx_bytes: 3 * 1024 * 1024,
       atop_available: false,
     });
     expect(JSON.stringify(status)).not.toContain("session_data");

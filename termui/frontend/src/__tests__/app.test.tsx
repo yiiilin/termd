@@ -5,6 +5,7 @@ import App, {
   browserReachableWsUrl,
   connectPairingClient,
   defaultWsUrlFromPage,
+  networkRateFromSamples,
   pairingWsUrlCandidates,
 } from "../App";
 import type { SessionFilesResultPayload } from "../protocol/types";
@@ -306,14 +307,15 @@ describe("termui web 工作台", () => {
     const desktopStatus = await screen.findByRole("contentinfo", { name: "daemon server status" });
     await within(desktopStatus).findByText("CPU");
     expect(within(desktopStatus).getByText("7.5%")).toBeInTheDocument();
-    expect(within(desktopStatus).getByRole("img", { name: "CPU usage trend" })).toBeInTheDocument();
+    expect(within(desktopStatus).getByRole("img", { name: "CPU usage bars" })).toBeInTheDocument();
     expect(within(desktopStatus).getByText("Mem")).toBeInTheDocument();
     expect(within(desktopStatus).getByText("3.0 GB / 8.0 GB")).toBeInTheDocument();
+    expect(within(desktopStatus).getByText("Net")).toBeInTheDocument();
     expect(within(desktopStatus).getByText("Disk")).toBeInTheDocument();
     expect(within(desktopStatus).getByText("64 GB / 128 GB")).toBeInTheDocument();
     expect(within(desktopStatus).getByText("Load")).toBeInTheDocument();
     expect(within(desktopStatus).getByText("Uptime")).toBeInTheDocument();
-    expect(within(desktopStatus).getByText("Procs")).toBeInTheDocument();
+    expect(within(desktopStatus).queryByText("Procs")).toBeNull();
     expect(within(desktopStatus).queryByText(/atop/)).toBeNull();
     expect(within(desktopStatus).queryByRole("button", { name: "Refresh server status" })).toBeNull();
     expect(screen.queryByText("session active")).toBeNull();
@@ -340,6 +342,7 @@ describe("termui web 工作台", () => {
     const mobileStatus = await screen.findByRole("contentinfo", { name: "daemon server status" });
     await within(mobileStatus).findByText("CPU");
     expect(within(mobileStatus).getByText("Mem")).toBeInTheDocument();
+    expect(within(mobileStatus).getByText("Net")).toBeInTheDocument();
     expect(within(mobileStatus).getByText("Disk")).toBeInTheDocument();
     expect(within(mobileStatus).queryByRole("button", { name: "Refresh server status" })).toBeNull();
     expect(within(mobileStatus).queryByText("Load")).toBeNull();
@@ -348,15 +351,35 @@ describe("termui web 工作台", () => {
     expect(within(mobileStatus).queryByText(/atop/)).toBeNull();
   });
 
-  it("daemon 状态栏注册 5 秒自动轮询", async () => {
+  it("daemon 状态栏注册 1 秒自动轮询", async () => {
     const intervalSpy = vi.spyOn(window, "setInterval");
     const user = userEvent.setup();
     render(<App />);
 
     await pairWithInvite(user, daemon);
     await waitForWorkspaceSession();
-    expect(intervalSpy).toHaveBeenCalledWith(expect.any(Function), 5000);
+    expect(intervalSpy).toHaveBeenCalledWith(expect.any(Function), 1000);
     intervalSpy.mockRestore();
+  });
+
+  it("基于相邻 daemon 状态快照计算网卡上下行速度", () => {
+    expect(networkRateFromSamples(undefined, { rxBytes: 1000, txBytes: 2000, sampledAtMs: 5000 })).toBeUndefined();
+    expect(
+      networkRateFromSamples(
+        { rxBytes: 1000, txBytes: 2000, sampledAtMs: 5000 },
+        { rxBytes: 2000, txBytes: 3500, sampledAtMs: 10_000 },
+      ),
+    ).toEqual({
+      rxBytesPerSecond: 200,
+      txBytesPerSecond: 300,
+    });
+    // daemon 重启或网卡计数器回退时，不展示错误的负速度。
+    expect(
+      networkRateFromSamples(
+        { rxBytes: 2000, txBytes: 3500, sampledAtMs: 10_000 },
+        { rxBytes: 1000, txBytes: 3600, sampledAtMs: 15_000 },
+      ),
+    ).toBeUndefined();
   });
 
   it("可以通过拖动手柄调整 session 顺序，并在刷新后保留", async () => {

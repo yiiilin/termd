@@ -74,8 +74,22 @@ const FILE_UPLOAD_MAX_BYTES = 16 * 1024 * 1024;
 const MOBILE_LAYOUT_QUERY = "(max-width: 760px)";
 const MOBILE_LAYOUT_BREAKPOINT = 760;
 const CPU_HISTORY_LIMIT = 48;
-const DAEMON_STATUS_POLL_INTERVAL_MS = 5000;
+const CPU_BAR_CHART_WIDTH = 56;
+const CPU_BAR_CHART_HEIGHT = 18;
+const CPU_BAR_CHART_COUNT = 18;
+const DAEMON_STATUS_POLL_INTERVAL_MS = 1000;
 type AppSurface = "admin" | "workspace";
+
+export interface DaemonNetworkCounterSample {
+  rxBytes: number;
+  txBytes: number;
+  sampledAtMs: number;
+}
+
+export interface DaemonNetworkRate {
+  rxBytesPerSecond: number;
+  txBytesPerSecond: number;
+}
 
 export default function App() {
   const [state, setState] = useState<BrowserState>({ pairedServers: [] });
@@ -90,6 +104,7 @@ export default function App() {
   const [clientsOpen, setClientsOpen] = useState(false);
   const [daemonStatus, setDaemonStatus] = useState<DaemonStatusResultPayload | undefined>();
   const [daemonCpuHistory, setDaemonCpuHistory] = useState<number[]>([]);
+  const [daemonNetworkRate, setDaemonNetworkRate] = useState<DaemonNetworkRate | undefined>();
   const [daemonStatusLoading, setDaemonStatusLoading] = useState(false);
   const [daemonStatusError, setDaemonStatusError] = useState<SafeError | undefined>();
   const [selectedSessionId, setSelectedSessionId] = useState<UUID | undefined>();
@@ -151,6 +166,7 @@ export default function App() {
   const connectionAutoRetryTimerRef = useRef<number | undefined>(undefined);
   const connectionAutoRetryKeyRef = useRef<string | undefined>(undefined);
   const connectionAutoRetryAttemptsRef = useRef(0);
+  const daemonNetworkSampleRef = useRef<DaemonNetworkCounterSample | undefined>(undefined);
   const isMobileLayout = useMobileLayout();
 
   useEffect(() => {
@@ -435,6 +451,8 @@ export default function App() {
     setDaemonClients([]);
     setDaemonStatus(undefined);
     setDaemonCpuHistory([]);
+    setDaemonNetworkRate(undefined);
+    daemonNetworkSampleRef.current = undefined;
     setDaemonStatusError(undefined);
     setSelectedSessionId(undefined);
     renamingSessionIdRef.current = undefined;
@@ -547,6 +565,8 @@ export default function App() {
       setDaemonClients([]);
       setDaemonStatus(undefined);
       setDaemonCpuHistory([]);
+      setDaemonNetworkRate(undefined);
+      daemonNetworkSampleRef.current = undefined;
       setDaemonStatusError(undefined);
       setSelectedSessionId(undefined);
       renamingSessionIdRef.current = undefined;
@@ -618,6 +638,8 @@ export default function App() {
       setDaemonClients([]);
       setDaemonStatus(undefined);
       setDaemonCpuHistory([]);
+      setDaemonNetworkRate(undefined);
+      daemonNetworkSampleRef.current = undefined;
       setDaemonStatusError(undefined);
       setSelectedSessionId(undefined);
       renamingSessionIdRef.current = undefined;
@@ -656,6 +678,8 @@ export default function App() {
       setDaemonClients([]);
       setDaemonStatus(undefined);
       setDaemonCpuHistory([]);
+      setDaemonNetworkRate(undefined);
+      daemonNetworkSampleRef.current = undefined;
       setDaemonStatusError(undefined);
       setSelectedSessionId(undefined);
       renamingSessionIdRef.current = undefined;
@@ -810,8 +834,11 @@ export default function App() {
     try {
       client = await authenticatedClient();
       const status = await client.getDaemonStatus();
+      const nextNetworkSample = networkCounterSampleFromStatus(status, Date.now());
+      setDaemonNetworkRate(networkRateFromSamples(daemonNetworkSampleRef.current, nextNetworkSample));
+      daemonNetworkSampleRef.current = nextNetworkSample;
       setDaemonStatus(status);
-      // CPU 曲线只做当前页面内缓存，避免把瞬时监控数据写入浏览器持久状态。
+      // CPU 柱状图只做当前页面内缓存，避免把瞬时监控数据写入浏览器持久状态。
       setDaemonCpuHistory((current) => appendCpuSample(current, status.cpu_percent));
     } catch (caught) {
       setDaemonStatusError(toSafeError(caught));
@@ -2022,6 +2049,7 @@ export default function App() {
         <DaemonStatusPanel
           status={daemonStatus}
           cpuHistory={daemonCpuHistory}
+          networkRate={daemonNetworkRate}
           loading={daemonStatusLoading}
           error={daemonStatusError}
           compact={isMobileLayout}
@@ -2107,17 +2135,23 @@ function SessionOperatorsBar(props: {
 function DaemonStatusPanel(props: {
   status?: DaemonStatusResultPayload;
   cpuHistory: number[];
+  networkRate?: DaemonNetworkRate;
   loading: boolean;
   error?: SafeError;
   compact?: boolean;
 }) {
   const memoryValue = props.status
-    ? `${formatBytesCompact(usedBytes(props.status.memory_total_bytes, props.status.memory_available_bytes))} / ${formatBytesCompact(props.status.memory_total_bytes)}`
+    ? props.compact
+      ? `${formatBytesTiny(usedBytes(props.status.memory_total_bytes, props.status.memory_available_bytes))}/${formatBytesTiny(props.status.memory_total_bytes)}`
+      : `${formatBytesCompact(usedBytes(props.status.memory_total_bytes, props.status.memory_available_bytes))} / ${formatBytesCompact(props.status.memory_total_bytes)}`
     : "-";
   const diskValue = props.status
-    ? `${formatBytesCompact(usedBytes(props.status.disk_total_bytes, props.status.disk_available_bytes))} / ${formatBytesCompact(props.status.disk_total_bytes)}`
+    ? props.compact
+      ? `${formatBytesTiny(usedBytes(props.status.disk_total_bytes, props.status.disk_available_bytes))}/${formatBytesTiny(props.status.disk_total_bytes)}`
+      : `${formatBytesCompact(usedBytes(props.status.disk_total_bytes, props.status.disk_available_bytes))} / ${formatBytesCompact(props.status.disk_total_bytes)}`
     : "-";
   const cpuValue = props.status ? `${props.status.cpu_percent.toFixed(1)}%` : props.loading ? "..." : "-";
+  const networkValue = props.networkRate ? formatNetworkRate(props.networkRate, Boolean(props.compact)) : "-";
 
   return (
     <footer
@@ -2128,7 +2162,7 @@ function DaemonStatusPanel(props: {
       {props.compact ? null : (
         <header className="daemon-status-header">
           <div className="daemon-status-title">
-            <Server size={15} aria-hidden="true" />
+            <Server size={13} aria-hidden="true" />
             <span>{props.status?.host_name ?? "daemon"}</span>
           </div>
         </header>
@@ -2143,9 +2177,9 @@ function DaemonStatusPanel(props: {
         <CpuMetric value={cpuValue} history={props.cpuHistory} />
         {props.compact ? null : <Metric label="Load" value={props.status ? props.status.load_avg.map((value) => value.toFixed(2)).join(" ") : "-"} />}
         <Metric label="Mem" value={memoryValue} />
+        <Metric label="Net" value={networkValue} className="daemon-status-network" />
         <Metric label="Disk" value={diskValue} />
         {props.compact ? null : <Metric label="Uptime" value={props.status ? formatDuration(props.status.uptime_seconds) : "-"} />}
-        {props.compact ? null : <Metric label="Procs" value={props.status ? String(props.status.process_count) : "-"} />}
       </div>
     </footer>
   );
@@ -2156,24 +2190,47 @@ function CpuMetric(props: { value: string; history: number[] }) {
     <div className="daemon-status-metric daemon-status-cpu">
       <span>CPU</span>
       <strong>{props.value}</strong>
-      <CpuSparkline samples={props.history} />
+      <CpuBarChart samples={props.history} />
     </div>
   );
 }
 
-function CpuSparkline(props: { samples: number[] }) {
-  const points = cpuSparklinePoints(props.samples, 72, 18);
+function CpuBarChart(props: { samples: number[] }) {
+  const bars = cpuBarChartRects(props.samples, CPU_BAR_CHART_WIDTH, CPU_BAR_CHART_HEIGHT, CPU_BAR_CHART_COUNT);
   return (
-    <svg className="daemon-cpu-sparkline" viewBox="0 0 72 18" role="img" aria-label="CPU usage trend">
-      <path className="daemon-cpu-sparkline-fill" d={cpuSparklineAreaPath(points, 72, 18)} />
-      <polyline className="daemon-cpu-sparkline-line" points={points} />
+    <svg
+      className="daemon-cpu-bar-chart"
+      viewBox={`0 0 ${CPU_BAR_CHART_WIDTH} ${CPU_BAR_CHART_HEIGHT}`}
+      role="img"
+      aria-label="CPU usage bars"
+    >
+      <rect
+        className="daemon-cpu-bar-frame"
+        x="0.5"
+        y="0.5"
+        width={CPU_BAR_CHART_WIDTH - 1}
+        height={CPU_BAR_CHART_HEIGHT - 1}
+        rx="2"
+      />
+      {bars.map((bar) => (
+        <rect
+          className="daemon-cpu-bar"
+          key={bar.index}
+          x={bar.x}
+          y={bar.y}
+          width={bar.width}
+          height={bar.height}
+          rx="0.6"
+        />
+      ))}
     </svg>
   );
 }
 
-function Metric(props: { label: string; value: string }) {
+function Metric(props: { label: string; value: string; className?: string }) {
+  const className = props.className ? `daemon-status-metric ${props.className}` : "daemon-status-metric";
   return (
-    <div className="daemon-status-metric">
+    <div className={className}>
       <span>{props.label}</span>
       <strong>{props.value}</strong>
     </div>
@@ -2428,11 +2485,81 @@ function formatBytesCompact(bytes: number): string {
   return `${value >= 10 || unitIndex === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[unitIndex]}`;
 }
 
+function formatBytesTiny(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) {
+    return "0B";
+  }
+  const units = ["B", "K", "M", "G", "T"];
+  let value = bytes;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  return `${value >= 10 || unitIndex === 0 ? value.toFixed(0) : value.toFixed(1)}${units[unitIndex]}`;
+}
+
 function usedBytes(totalBytes: number, availableBytes: number): number {
   if (!Number.isFinite(totalBytes) || !Number.isFinite(availableBytes)) {
     return 0;
   }
   return Math.max(0, totalBytes - Math.max(0, availableBytes));
+}
+
+function formatNetworkRate(rate: DaemonNetworkRate, compact = false): string {
+  if (compact) {
+    return `↓${formatBytesTiny(rate.rxBytesPerSecond)} ↑${formatBytesTiny(rate.txBytesPerSecond)}`;
+  }
+  return `↓${formatBytesPerSecond(rate.rxBytesPerSecond)} ↑${formatBytesPerSecond(rate.txBytesPerSecond)}`;
+}
+
+function formatBytesPerSecond(bytesPerSecond: number): string {
+  if (!Number.isFinite(bytesPerSecond) || bytesPerSecond < 0) {
+    return "-";
+  }
+  return `${formatBytesTiny(bytesPerSecond)}/s`;
+}
+
+function networkCounterSampleFromStatus(
+  status: DaemonStatusResultPayload,
+  sampledAtMs: number,
+): DaemonNetworkCounterSample | undefined {
+  const rxBytes = normalizedNetworkCounter(status.network_rx_bytes);
+  const txBytes = normalizedNetworkCounter(status.network_tx_bytes);
+  if (rxBytes === undefined || txBytes === undefined) {
+    return undefined;
+  }
+  return { rxBytes, txBytes, sampledAtMs };
+}
+
+function normalizedNetworkCounter(value: number | undefined): number | undefined {
+  if (value === undefined || !Number.isFinite(value) || value < 0) {
+    return undefined;
+  }
+  return value;
+}
+
+export function networkRateFromSamples(
+  previous: DaemonNetworkCounterSample | undefined,
+  next: DaemonNetworkCounterSample | undefined,
+): DaemonNetworkRate | undefined {
+  if (!previous || !next) {
+    return undefined;
+  }
+  const elapsedSeconds = (next.sampledAtMs - previous.sampledAtMs) / 1000;
+  if (!Number.isFinite(elapsedSeconds) || elapsedSeconds <= 0) {
+    return undefined;
+  }
+  const rxDelta = next.rxBytes - previous.rxBytes;
+  const txDelta = next.txBytes - previous.txBytes;
+  // 网卡计数器会在 daemon 重启、网卡重置或溢出时回退；这种采样直接丢弃。
+  if (rxDelta < 0 || txDelta < 0) {
+    return undefined;
+  }
+  return {
+    rxBytesPerSecond: rxDelta / elapsedSeconds,
+    txBytesPerSecond: txDelta / elapsedSeconds,
+  };
 }
 
 function formatDuration(seconds: number): string {
@@ -2456,23 +2583,24 @@ function appendCpuSample(samples: number[], sample: number): number[] {
   return [...samples, boundedSample].slice(-CPU_HISTORY_LIMIT);
 }
 
-function cpuSparklinePoints(samples: number[], width: number, height: number): string {
-  const normalizedSamples = samples.length > 0 ? samples : [0];
-  const lastIndex = normalizedSamples.length - 1;
-  return normalizedSamples
-    .map((sample, index) => {
-      const x = lastIndex === 0 ? width : (index / lastIndex) * width;
-      const y = height - (Math.max(0, Math.min(100, sample)) / 100) * height;
-      return `${x.toFixed(1)},${y.toFixed(1)}`;
-    })
-    .join(" ");
-}
-
-function cpuSparklineAreaPath(points: string, width: number, height: number): string {
-  if (!points) {
-    return "";
-  }
-  return `M0 ${height} L ${points} L ${width} ${height} Z`;
+function cpuBarChartRects(samples: number[], width: number, height: number, count: number) {
+  const padding = 2;
+  const gap = 1;
+  const innerHeight = height - padding * 2;
+  const barWidth = Math.max(1, (width - padding * 2 - gap * (count - 1)) / count);
+  const recentSamples = samples.slice(-count);
+  const paddedSamples = [...Array(Math.max(0, count - recentSamples.length)).fill(0), ...recentSamples];
+  return paddedSamples.map((sample, index) => {
+    const boundedSample = Number.isFinite(sample) ? Math.max(0, Math.min(100, sample)) : 0;
+    const barHeight = boundedSample <= 0 ? 0 : Math.max(1, (boundedSample / 100) * innerHeight);
+    return {
+      index,
+      x: Number((padding + index * (barWidth + gap)).toFixed(2)),
+      y: Number((height - padding - barHeight).toFixed(2)),
+      width: Number(barWidth.toFixed(2)),
+      height: Number(barHeight.toFixed(2)),
+    };
+  });
 }
 
 function sortSessionsNewestFirst(sessions: SessionSummaryPayload[]): SessionSummaryPayload[] {

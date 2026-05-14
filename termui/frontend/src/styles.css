@@ -988,8 +988,9 @@ label {
 }
 
 .daemon-status-title {
-  color: #d6ff5f;
-  font-weight: 700;
+  color: #e4f4ed;
+  font-size: 12px;
+  font-weight: 500;
 }
 
 .daemon-status-title span {
@@ -1007,7 +1008,13 @@ label {
 
 .daemon-status-strip .daemon-status-grid {
   min-width: 0;
-  grid-template-columns: minmax(118px, 1.35fr) repeat(5, minmax(0, 1fr));
+  grid-template-columns:
+    minmax(106px, 1.1fr)
+    minmax(0, 0.92fr)
+    minmax(0, 1fr)
+    minmax(118px, 1.35fr)
+    minmax(0, 1.1fr)
+    minmax(0, 0.9fr);
   gap: 0;
   align-items: center;
 }
@@ -1034,6 +1041,10 @@ label {
   padding: 0 10px;
 }
 
+.daemon-status-network {
+  min-width: 118px;
+}
+
 .daemon-status-metric span,
 .daemon-status-error {
   color: #8fa59a;
@@ -1054,31 +1065,31 @@ label {
 }
 
 .daemon-status-cpu {
-  min-width: 118px;
+  min-width: 106px;
 }
 
 .daemon-status-strip .daemon-status-cpu {
-  gap: 7px;
+  gap: 5px;
 }
 
-.daemon-cpu-sparkline {
-  flex: 1 1 72px;
-  width: 72px;
+.daemon-cpu-bar-chart {
+  flex: 0 0 56px;
+  width: 56px;
   height: 18px;
-  min-width: 56px;
+  min-width: 48px;
   color: #89d8ff;
 }
 
-.daemon-cpu-sparkline-fill {
-  fill: rgba(137, 216, 255, 0.16);
+.daemon-cpu-bar-frame {
+  fill: rgba(137, 216, 255, 0.06);
+  stroke: rgba(137, 216, 255, 0.34);
+  stroke-width: 1;
 }
 
-.daemon-cpu-sparkline-line {
-  fill: none;
-  stroke: currentColor;
-  stroke-linecap: round;
-  stroke-linejoin: round;
-  stroke-width: 1.7;
+.daemon-cpu-bar {
+  fill: rgba(137, 216, 255, 0.72);
+  stroke: rgba(199, 239, 255, 0.68);
+  stroke-width: 0.45;
 }
 
 .daemon-status-error {
@@ -2005,20 +2016,25 @@ label {
   }
 
   .daemon-status-strip .daemon-status-grid {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-template-columns: repeat(4, minmax(0, 1fr));
   }
 
   .daemon-status-strip .daemon-status-metric {
     min-height: 30px;
     justify-content: center;
-    padding: 0 6px;
+    gap: 4px;
+    padding: 0 4px;
+  }
+
+  .daemon-status-network {
+    min-width: 0;
   }
 
   .daemon-status-cpu {
     min-width: 0;
   }
 
-  .daemon-cpu-sparkline {
+  .daemon-cpu-bar-chart {
     display: none;
   }
 

@@ -48,6 +48,7 @@ interface MockDaemonOptions {
   resizeAckDelayMs?: number;
   daemonClients?: DaemonClientSummaryPayload[];
   daemonStatus?: DaemonStatusResultPayload;
+  daemonStatusResponses?: DaemonStatusResultPayload[];
   sessionFiles?: Record<UUID, SessionFilesResultPayload>;
   sessionFileReads?: Record<string, SessionFileReadResultPayload>;
   relayClientPathOnly?: boolean;
@@ -332,7 +333,8 @@ export class MockDaemon {
       }
       case "daemon_status": {
         this.daemonStatusRequests += 1;
-        this.sendInner(connection, envelope("daemon_status_result", this.options.daemonStatus ?? mockDaemonStatus()));
+        const queuedStatus = this.options.daemonStatusResponses?.shift();
+        this.sendInner(connection, envelope("daemon_status_result", queuedStatus ?? this.options.daemonStatus ?? mockDaemonStatus()));
         return;
       }
       case "session_create":
@@ -686,6 +688,8 @@ function mockDaemonStatus(): DaemonStatusResultPayload {
     memory_available_bytes: 5 * 1024 * 1024 * 1024,
     disk_total_bytes: 128 * 1024 * 1024 * 1024,
     disk_available_bytes: 64 * 1024 * 1024 * 1024,
+    network_rx_bytes: 24 * 1024 * 1024,
+    network_tx_bytes: 6 * 1024 * 1024,
     process_count: 123,
     atop_available: false,
   };

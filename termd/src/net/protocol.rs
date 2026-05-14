@@ -1942,6 +1942,7 @@ fn stable_client_id_for_device(device_id: DeviceId) -> ClientId {
 fn collect_daemon_status() -> DaemonStatusResultPayload {
     let (memory_total_bytes, memory_available_bytes) = read_memory_status();
     let (disk_total_bytes, disk_available_bytes) = read_root_disk_status();
+    let (network_rx_bytes, network_tx_bytes) = read_physical_network_bytes();
 
     DaemonStatusResultPayload {
         host_name: read_host_name(),
@@ -1952,7 +1953,10 @@ fn collect_daemon_status() -> DaemonStatusResultPayload {
         memory_available_bytes,
         disk_total_bytes,
         disk_available_bytes,
-        process_count: read_process_count(),
+        network_rx_bytes,
+        network_tx_bytes,
+        // 兼容 0.1.25 及更早前端的字段；新 UI 不再展示或采集进程数量。
+        process_count: 0,
         atop_available: command_available("atop"),
     }
 }
@@ -2055,20 +2059,65 @@ fn read_cpu_sample() -> Option<CpuSample> {
     })
 }
 
-fn read_process_count() -> u64 {
-    let Ok(entries) = fs::read_dir("/proc") else {
-        return 0;
+#[cfg(target_os = "linux")]
+fn read_physical_network_bytes() -> (u64, u64) {
+    read_physical_network_bytes_from_sys_class_net(Path::new("/sys/class/net"))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_physical_network_bytes() -> (u64, u64) {
+    (0, 0)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn read_physical_network_bytes_from_sys_class_net(root: &Path) -> (u64, u64) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return (0, 0);
     };
-    entries
-        .filter_map(Result::ok)
-        .filter(|entry| {
-            entry
-                .file_name()
-                .to_string_lossy()
-                .bytes()
-                .all(|byte| byte.is_ascii_digit())
-        })
-        .count() as u64
+    let mut total_rx = 0u64;
+    let mut total_tx = 0u64;
+    for entry in entries.filter_map(Result::ok) {
+        let iface_dir = entry.path();
+        let iface_name = entry.file_name().to_string_lossy().to_string();
+        if !is_physical_network_interface(&iface_name, &iface_dir) {
+            continue;
+        }
+        let stats_dir = iface_dir.join("statistics");
+        let Some(rx_bytes) = read_u64_file(&stats_dir.join("rx_bytes")) else {
+            continue;
+        };
+        let Some(tx_bytes) = read_u64_file(&stats_dir.join("tx_bytes")) else {
+            continue;
+        };
+        total_rx = total_rx.saturating_add(rx_bytes);
+        total_tx = total_tx.saturating_add(tx_bytes);
+    }
+    (total_rx, total_tx)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn is_physical_network_interface(iface_name: &str, iface_dir: &Path) -> bool {
+    if iface_name == "lo" {
+        return false;
+    }
+    if let Ok(canonical) = fs::canonicalize(iface_dir) {
+        // Linux virtual interfaces normally resolve below /sys/devices/virtual/net.
+        if canonical
+            .to_string_lossy()
+            .contains("/devices/virtual/net/")
+        {
+            return false;
+        }
+    }
+    // 物理 PCI/USB/Wi-Fi 网卡通常带 device 链接；veth/docker/tun/bridge 没有。
+    iface_dir.join("device").exists()
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn read_u64_file(path: &Path) -> Option<u64> {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
 }
 
 #[cfg(unix)]
@@ -4132,6 +4181,76 @@ mod tests {
         assert_eq!(response[0].kind, MessageType::DaemonStatusResult);
         assert_eq!(payload.load_avg.len(), 3);
         assert!((0.0..=100.0).contains(&payload.cpu_percent));
+        assert_eq!(payload.process_count, 0);
+        let _network_bytes = (payload.network_rx_bytes, payload.network_tx_bytes);
+    }
+
+    #[test]
+    fn daemon_status_network_bytes_sum_physical_interfaces_only() {
+        let root = temp_state_path("sys-class-net");
+        fs::create_dir_all(root.join("eth0").join("statistics")).unwrap();
+        fs::write(root.join("eth0").join("device"), b"physical").unwrap();
+        fs::write(
+            root.join("eth0").join("statistics").join("rx_bytes"),
+            b"1024\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("eth0").join("statistics").join("tx_bytes"),
+            b"2048\n",
+        )
+        .unwrap();
+
+        fs::create_dir_all(root.join("wlan0").join("statistics")).unwrap();
+        fs::write(root.join("wlan0").join("device"), b"physical").unwrap();
+        fs::write(
+            root.join("wlan0").join("statistics").join("rx_bytes"),
+            b"4096\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("wlan0").join("statistics").join("tx_bytes"),
+            b"8192\n",
+        )
+        .unwrap();
+
+        fs::create_dir_all(root.join("lo").join("statistics")).unwrap();
+        fs::write(root.join("lo").join("device"), b"loopback").unwrap();
+        fs::write(
+            root.join("lo").join("statistics").join("rx_bytes"),
+            b"100000\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("lo").join("statistics").join("tx_bytes"),
+            b"100000\n",
+        )
+        .unwrap();
+
+        fs::create_dir_all(root.join("docker0").join("statistics")).unwrap();
+        fs::write(
+            root.join("docker0").join("statistics").join("rx_bytes"),
+            b"500000\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("docker0").join("statistics").join("tx_bytes"),
+            b"500000\n",
+        )
+        .unwrap();
+
+        fs::create_dir_all(root.join("broken0").join("statistics")).unwrap();
+        fs::write(root.join("broken0").join("device"), b"physical").unwrap();
+        fs::write(
+            root.join("broken0").join("statistics").join("rx_bytes"),
+            b"700000\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            read_physical_network_bytes_from_sys_class_net(&root),
+            (5 * 1024, 10 * 1024)
+        );
     }
 
     #[test]
