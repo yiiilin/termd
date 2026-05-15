@@ -112,6 +112,22 @@ function dispatchMobileTextInput(target: HTMLTextAreaElement, data: string): Inp
   return event;
 }
 
+function fireTouchPointer(
+  target: HTMLElement,
+  type: "pointerdown" | "pointermove" | "pointerup" | "pointercancel",
+  options: { pointerId: number; clientX: number; clientY: number },
+): void {
+  const event = new Event(type, { bubbles: true, cancelable: true });
+  Object.defineProperties(event, {
+    pointerId: { value: options.pointerId },
+    pointerType: { value: "touch" },
+    button: { value: 0 },
+    clientX: { value: options.clientX },
+    clientY: { value: options.clientY },
+  });
+  fireEvent(target, event);
+}
+
 function pairingInviteCode(
   daemon: MockDaemon,
   token = "secret-token",
@@ -402,8 +418,20 @@ describe("termui web 工作台", () => {
     expect(css).toContain("--daemon-status-disk-width: 150px;");
     expect(css).toContain("--daemon-status-load-width: 122px;");
     expect(css).toContain("--daemon-status-uptime-width: 132px;");
+    expect(css).toContain("grid-template-columns: auto auto minmax(0, 1fr);");
     expect(css).toContain("grid-template-columns:\n    var(--daemon-status-cpu-width)");
     expect(css).toContain("flex: 0 0 var(--daemon-status-network-width);");
+    expect(css).toContain("justify-content: start;");
+  });
+
+  it("移动端状态栏和快捷输入栏固定占满父容器，避免内容变化带动宽度", () => {
+    const css = readFileSync(resolve(process.cwd(), "src/styles.css"), "utf8");
+
+    expect(css).toContain("width: min(100vw, 100dvw);");
+    expect(css).toContain("max-width: min(100vw, 100dvw);");
+    expect(css).toContain(".daemon-status-strip {\n    width: 100%;");
+    expect(css).toContain(".daemon-status-strip .daemon-status-grid {\n    width: 100%;");
+    expect(css).toContain(".terminal-mobile-shortcuts {\n    width: 100%;");
   });
 
   it("基于相邻 daemon 状态快照计算网卡上下行速度", () => {
@@ -520,6 +548,73 @@ describe("termui web 工作台", () => {
 
     await waitFor(() => expect(visibleSessionNames()).toEqual(["shell", "work"]));
     expect(daemon.sessionReorders).toEqual([]);
+  });
+
+  it("迟到的旧 session list 响应不能覆盖刚完成的拖拽排序", async () => {
+    const user = userEvent.setup();
+    const workSession = {
+      session_id: "00000000-0000-0000-0000-000000000402",
+      name: "work",
+      state: "running",
+      size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+      created_at_ms: 2000,
+    } as const;
+    const shellSession = {
+      session_id: "00000000-0000-0000-0000-000000000401",
+      name: "shell",
+      state: "running",
+      size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+      created_at_ms: 1000,
+    } as const;
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [workSession, shellSession],
+    });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession("work");
+    expect(visibleSessionNames()).toEqual(["work", "shell"]);
+
+    daemon.queueSessionListResponse([workSession, shellSession], 30);
+    void user.click(screen.getByRole("button", { name: "Refresh" }));
+
+    await waitFor(() => {
+      const rows = Array.from(document.querySelectorAll<HTMLElement>(".session-row"));
+      expect(rows).toHaveLength(2);
+      rows.forEach((row, index) => {
+        vi.spyOn(row, "getBoundingClientRect").mockReturnValue({
+          x: 0,
+          y: index * 60,
+          width: 260,
+          height: 52,
+          top: index * 60,
+          right: 260,
+          bottom: index * 60 + 52,
+          left: 0,
+          toJSON: () => ({}),
+        });
+      });
+    });
+
+    const shellHandle = screen.getByRole("button", { name: "Drag shell" });
+    fireEvent.mouseDown(shellHandle, { button: 0, clientY: 90 });
+    fireEvent.mouseMove(shellHandle, { clientY: 10 });
+    fireEvent.mouseUp(shellHandle, { clientY: 10 });
+
+    await waitFor(() => expect(visibleSessionNames()).toEqual(["shell", "work"]));
+    await waitFor(() =>
+      expect(daemon.sessionReorders).toEqual([
+        [
+          "00000000-0000-0000-0000-000000000401",
+          "00000000-0000-0000-0000-000000000402",
+        ],
+      ]),
+    );
+    await new Promise((resolve) => window.setTimeout(resolve, 60));
+
+    expect(visibleSessionNames()).toEqual(["shell", "work"]);
   });
 
   it("持续输出时合并写入 xterm，并且不为每个输出刷新布局", async () => {
@@ -1896,9 +1991,8 @@ describe("termui web 工作台", () => {
 
     vi.useFakeTimers();
     try {
-      fireEvent.pointerDown(viewerFrame, {
+      fireTouchPointer(viewerFrame, "pointerdown", {
         pointerId: 11,
-        pointerType: "touch",
         clientX: 160,
         clientY: 240,
       });
@@ -1907,17 +2001,15 @@ describe("termui web 工作台", () => {
       });
 
       expect(screen.getByLabelText("mobile direction gesture")).toBeInTheDocument();
-      fireEvent.pointerMove(viewerFrame, {
+      fireTouchPointer(viewerFrame, "pointermove", {
         pointerId: 11,
-        pointerType: "touch",
         clientX: 160,
-        clientY: 190,
+        clientY: 150,
       });
-      fireEvent.pointerUp(viewerFrame, {
+      fireTouchPointer(viewerFrame, "pointerup", {
         pointerId: 11,
-        pointerType: "touch",
         clientX: 160,
-        clientY: 190,
+        clientY: 150,
       });
     } finally {
       vi.useRealTimers();

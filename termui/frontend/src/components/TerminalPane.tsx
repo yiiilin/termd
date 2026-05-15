@@ -22,9 +22,13 @@ const FOCUS_OUT_SETTLE_MS = 120;
 const MOBILE_DIRECTION_HOLD_MS = 1000;
 const MOBILE_DIRECTION_DEAD_ZONE_PX = 24;
 const MOBILE_DIRECTION_STEP_PX = 38;
+const MOBILE_DIRECTION_REPEAT_MS = 500;
+const MOBILE_DIRECTION_TIER_TWO_PX = 56;
+const MOBILE_DIRECTION_TIER_THREE_PX = 84;
 const MOBILE_DIRECTION_CANCEL_PX = 10;
 type ResizeSource = "layout" | "focus" | "session" | "viewer";
 type MobileDirection = "up" | "down" | "left" | "right";
+type MobileDirectionTier = 1 | 2 | 3;
 
 const MOBILE_SHORTCUT_KEYS = [
   { label: "Tab", ariaLabel: "Send Tab", data: "\t" },
@@ -97,6 +101,9 @@ export function TerminalPane(props: TerminalPaneProps) {
     lastStepY: number;
     active: boolean;
     timer: number;
+    repeatTimer?: number;
+    repeatDirection?: MobileDirection;
+    repeatCount: number;
   } | undefined>(undefined);
   const focusedRef = useRef(false);
   const clientSizeRef = useRef<TerminalSize | undefined>(undefined);
@@ -501,12 +508,62 @@ export function TerminalPane(props: TerminalPaneProps) {
     return deltaY > 0 ? "down" : "up";
   };
 
+  const directionTierFromDelta = (deltaX: number, deltaY: number): MobileDirectionTier | undefined => {
+    const distance = Math.max(Math.abs(deltaX), Math.abs(deltaY));
+    if (distance < MOBILE_DIRECTION_DEAD_ZONE_PX) {
+      return undefined;
+    }
+    if (distance >= MOBILE_DIRECTION_TIER_THREE_PX) {
+      return 3;
+    }
+    if (distance >= MOBILE_DIRECTION_TIER_TWO_PX) {
+      return 2;
+    }
+    return 1;
+  };
+
+  const stopMobileDirectionRepeat = (
+    gesture: NonNullable<typeof mobileDirectionGestureRef.current>,
+  ) => {
+    if (gesture.repeatTimer !== undefined) {
+      window.clearInterval(gesture.repeatTimer);
+      gesture.repeatTimer = undefined;
+    }
+    gesture.repeatDirection = undefined;
+    gesture.repeatCount = 0;
+  };
+
+  const startMobileDirectionRepeat = (
+    gesture: NonNullable<typeof mobileDirectionGestureRef.current>,
+    direction: MobileDirection,
+    repeatCount: 1 | 2,
+  ) => {
+    setMobileDirection(direction);
+    if (gesture.repeatDirection === direction && gesture.repeatCount === repeatCount && gesture.repeatTimer !== undefined) {
+      return;
+    }
+    stopMobileDirectionRepeat(gesture);
+    gesture.repeatDirection = direction;
+    gesture.repeatCount = repeatCount;
+    gesture.repeatTimer = window.setInterval(() => {
+      const current = mobileDirectionGestureRef.current;
+      if (!current?.active || current.repeatDirection !== direction) {
+        return;
+      }
+      // 一档/二档按固定节奏发送，避免 pointermove 频率直接决定终端光标移动速度。
+      for (let index = 0; index < repeatCount; index += 1) {
+        sendMobileDirection(direction);
+      }
+    }, MOBILE_DIRECTION_REPEAT_MS);
+  };
+
   const clearMobileDirectionGesture = () => {
     const gesture = mobileDirectionGestureRef.current;
     if (!gesture) {
       return;
     }
     window.clearTimeout(gesture.timer);
+    stopMobileDirectionRepeat(gesture);
     mobileDirectionGestureRef.current = undefined;
     setMobileDirectionActive(false);
     setMobileDirection(undefined);
@@ -540,6 +597,7 @@ export function TerminalPane(props: TerminalPaneProps) {
       lastStepY: startY,
       active: false,
       timer,
+      repeatCount: 0,
     };
   };
 
@@ -558,17 +616,28 @@ export function TerminalPane(props: TerminalPaneProps) {
     }
     event.preventDefault();
     event.stopPropagation();
-    const stepDeltaX = event.clientX - gesture.lastStepX;
-    const stepDeltaY = event.clientY - gesture.lastStepY;
-    const basisX = Math.abs(stepDeltaX) >= MOBILE_DIRECTION_STEP_PX ? stepDeltaX : deltaX;
-    const basisY = Math.abs(stepDeltaY) >= MOBILE_DIRECTION_STEP_PX ? stepDeltaY : deltaY;
-    const direction = directionFromDelta(basisX, basisY);
-    if (!direction) {
+    const direction = directionFromDelta(deltaX, deltaY);
+    const tier = directionTierFromDelta(deltaX, deltaY);
+    if (!direction || !tier) {
+      stopMobileDirectionRepeat(gesture);
       return;
     }
+    if (tier === 1 || tier === 2) {
+      startMobileDirectionRepeat(gesture, direction, tier);
+      return;
+    }
+    stopMobileDirectionRepeat(gesture);
+    const stepDeltaX = event.clientX - gesture.lastStepX;
+    const stepDeltaY = event.clientY - gesture.lastStepY;
     if (direction === "left" || direction === "right") {
+      if (Math.abs(stepDeltaX) < MOBILE_DIRECTION_STEP_PX) {
+        return;
+      }
       gesture.lastStepX = event.clientX;
       sendMobileDirection(direction);
+      return;
+    }
+    if (Math.abs(stepDeltaY) < MOBILE_DIRECTION_STEP_PX) {
       return;
     }
     gesture.lastStepY = event.clientY;
@@ -584,7 +653,8 @@ export function TerminalPane(props: TerminalPaneProps) {
       event.preventDefault();
       event.stopPropagation();
       const direction = directionFromDelta(event.clientX - gesture.startX, event.clientY - gesture.startY);
-      if (direction && !mobileDirection) {
+      const tier = directionTierFromDelta(event.clientX - gesture.startX, event.clientY - gesture.startY);
+      if (direction && tier === 3 && !mobileDirection) {
         sendMobileDirection(direction);
       }
     }

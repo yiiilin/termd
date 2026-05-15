@@ -68,6 +68,10 @@ assert_file_contains() {
 }
 
 install_fake_termd_system_commands() {
+  SYSTEMCTL_CALLS=()
+  INSTALL_EVENTS=()
+  TERMD_FAKE_SERVICE_ACTIVE=1
+
   # 用假的系统账号数据库覆盖 id/getent，测试即可稳定覆盖 alice/bob/termd 三种路径。
   id() {
     case "${1:-}" in
@@ -110,8 +114,34 @@ install_fake_termd_system_commands() {
   ensure_system_user() { :; }
   chown() { :; }
   chmod() { :; }
-  systemctl() { :; }
+  systemctl() {
+    SYSTEMCTL_CALLS+=("$*")
+    INSTALL_EVENTS+=("systemctl:$*")
+    case "${1:-}" in
+      is-active)
+        [[ "${TERMD_FAKE_SERVICE_ACTIVE}" -eq 1 ]]
+        ;;
+      stop)
+        TERMD_FAKE_SERVICE_ACTIVE=0
+        ;;
+      start|restart)
+        TERMD_FAKE_SERVICE_ACTIVE=1
+        ;;
+      *)
+        :
+        ;;
+    esac
+  }
   print_initial_pairing_token() { :; }
+}
+
+install_fake_supervisor_termination_tracker() {
+  TERMINATED_SUPERVISOR_DIRS=()
+
+  terminate_session_supervisors() {
+    TERMINATED_SUPERVISOR_DIRS+=("$1")
+    INSTALL_EVENTS+=("terminate-supervisors:$1")
+  }
 }
 
 seed_termd_runtime_sqlite() {
@@ -483,7 +513,7 @@ test_termd_baked_supervisor_default_keeps_runtime_state() (
   SUPERVISOR_VERSION="v-new"
   export TERMD_INSTALL_CONFIRM_FD=0
   unit_file="${tmp_dir}/termd.service"
-  printf 'y\n' | run_fake_termd_install "$unit_file" >/dev/null
+  run_fake_termd_install "$unit_file" <<<"y" >/dev/null
   unset SUPERVISOR_VERSION TERMD_INSTALL_CONFIRM_FD
 
   python3 - "$sqlite_file" "$socket_file" <<'PY'
@@ -526,7 +556,7 @@ test_termd_missing_supervisor_meta_keeps_runtime_state_on_default_update() (
   # 不能把已有 session 当成需要清理的旧 runtime。
   export TERMD_INSTALL_CONFIRM_FD=0
   unit_file="${tmp_dir}/termd.service"
-  printf 'y\n' | run_fake_termd_install "$unit_file" >/dev/null
+  run_fake_termd_install "$unit_file" <<<"y" >/dev/null
   unset TERMD_INSTALL_CONFIRM_FD
 
   python3 - "$sqlite_file" "$socket_file" <<'PY'
@@ -552,6 +582,7 @@ PY
 test_termd_supervisor_version_mismatch_prompts_and_clears_runtime_state() (
   load_termd_installer_functions
   install_fake_termd_system_commands
+  install_fake_supervisor_termination_tracker
 
   local tmp_dir unit_file sqlite_file socket_file
   tmp_dir="$(mktemp -d)"
@@ -567,7 +598,7 @@ test_termd_supervisor_version_mismatch_prompts_and_clears_runtime_state() (
 
   export TERMD_INSTALL_CONFIRM_FD=0
   unit_file="${tmp_dir}/termd.service"
-  printf 'y\n' | run_fake_termd_install "$unit_file" --supervisor-version v-new >/dev/null
+  run_fake_termd_install "$unit_file" --supervisor-version v-new <<<"y" >/dev/null
   unset TERMD_INSTALL_CONFIRM_FD
 
   python3 - "$sqlite_file" "$socket_file" <<'PY'
@@ -579,14 +610,10 @@ conn = sqlite3.connect(sys.argv[1])
 try:
     attached = conn.execute("SELECT COUNT(*) FROM daemon_client_attached_sessions").fetchone()[0]
     assert attached == 0, attached
-    daemon_session = conn.execute(
-        "SELECT name, state FROM daemon_sessions WHERE session_id = 'session'"
-    ).fetchone()
-    assert daemon_session == ("work shell", "closed"), daemon_session
-    runtime_session = conn.execute(
-        "SELECT state, restore_kind, restore_value FROM runtime_sessions WHERE session_id = 'session'"
-    ).fetchone()
-    assert runtime_session == ("closed", None, None), runtime_session
+    daemon_sessions = conn.execute("SELECT COUNT(*) FROM daemon_sessions").fetchone()[0]
+    assert daemon_sessions == 0, daemon_sessions
+    runtime_sessions = conn.execute("SELECT COUNT(*) FROM runtime_sessions").fetchone()[0]
+    assert runtime_sessions == 0, runtime_sessions
     version = conn.execute(
         "SELECT value FROM daemon_meta WHERE key = 'supervisor_version'"
     ).fetchone()[0]
@@ -596,7 +623,22 @@ try:
     assert conn.execute("SELECT COUNT(*) FROM daemon_clients").fetchone()[0] == 1
 finally:
     conn.close()
-assert pathlib.Path(sys.argv[2]).exists()
+assert not pathlib.Path(sys.argv[2]).exists()
+PY
+  [[ "${#TERMINATED_SUPERVISOR_DIRS[@]}" -eq 1 ]]
+  [[ "${TERMINATED_SUPERVISOR_DIRS[0]}" == "${STATE_DIR}/termd-supervisors" ]]
+  [[ "${INSTALL_EVENTS[*]}" == *"systemctl:stop termd"* ]]
+  [[ "${INSTALL_EVENTS[*]}" == *"systemctl:restart termd"* ]]
+  python3 - "${INSTALL_EVENTS[@]}" <<'PY'
+import sys
+
+events = sys.argv[1:]
+stop_index = events.index("systemctl:stop termd")
+terminate_index = next(
+    index for index, event in enumerate(events) if event.startswith("terminate-supervisors:")
+)
+restart_index = events.index("systemctl:restart termd")
+assert stop_index < terminate_index < restart_index, events
 PY
 )
 
@@ -619,7 +661,7 @@ test_termd_supervisor_version_mismatch_decline_preserves_runtime_state() (
   export TERMD_INSTALL_CONFIRM_FD=0
   unit_file="${tmp_dir}/termd.service"
   set +e
-  printf 'n\n' | run_fake_termd_install "$unit_file" --supervisor-version v-new >/dev/null 2>/dev/null
+  (run_fake_termd_install "$unit_file" --supervisor-version v-new <<<"n" >/dev/null 2>/dev/null)
   status=$?
   set -e
   unset TERMD_INSTALL_CONFIRM_FD

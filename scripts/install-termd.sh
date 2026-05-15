@@ -557,7 +557,7 @@ prompt_confirmation() {
 
 clear_runtime_session_state() {
   local sqlite_path="$1"
-  local supervisor_dir="$2"
+  local _supervisor_dir="$2"
 
   if [[ -f "$sqlite_path" ]]; then
     python3 - "$sqlite_path" <<'PY'
@@ -575,8 +575,7 @@ try:
     }
     if "daemon_client_attached_sessions" in tables:
         conn.execute("DELETE FROM daemon_client_attached_sessions")
-    # daemon_sessions 保存用户可见名称、root 和文件树位置。清理不兼容 runtime 时不能删除它，
-    # 否则仍存活的 supervisor 被重新领养后只能显示 restored-* 默认名。
+    # state 目录迁移只清运行态，保留展示行名称，方便人工排查旧 session 来源。
     if "daemon_sessions" in tables:
         columns = {
             row[1]
@@ -611,8 +610,149 @@ finally:
 PY
   fi
 
-  # 不删除 supervisor socket：即使本次选择清理 runtime 元数据，仍存活的 supervisor
-  # 里面可能有用户正在跑的 shell。保留 socket 让人工或后续恢复逻辑仍有接回机会。
+  # 这个函数只用于非 supervisor 兼容版本切换的清理路径，不终止 supervisor。
+  # supervisor 版本升级必须走 clear_runtime_session_state_for_supervisor_upgrade。
+}
+
+terminate_session_supervisors() {
+  local supervisor_dir="$1"
+
+  [[ -d "$supervisor_dir" ]] || return 0
+
+  python3 - "$supervisor_dir" <<'PY'
+import os
+import signal
+import sys
+import time
+from pathlib import Path
+
+target_dir = Path(sys.argv[1]).resolve()
+proc_dir = Path("/proc")
+if not proc_dir.exists():
+    raise SystemExit("cannot inspect /proc to terminate old session supervisors")
+
+
+def process_is_alive(pid: int) -> bool:
+    status_path = proc_dir / str(pid) / "status"
+    try:
+        for line in status_path.read_text(errors="replace").splitlines():
+            if line.startswith("State:"):
+                # 僵尸进程已经不能继续托管 PTY，可视为已退出。
+                return not line.split(None, 2)[1].startswith("Z")
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def session_supervisor_pids() -> list[int]:
+    matched: list[int] = []
+    for entry in proc_dir.iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid == os.getpid():
+            continue
+        try:
+            raw_cmdline = (entry / "cmdline").read_bytes()
+        except (FileNotFoundError, PermissionError, OSError):
+            continue
+        args = [
+            part.decode("utf-8", errors="surrogateescape")
+            for part in raw_cmdline.split(b"\0")
+            if part
+        ]
+        if "__session-supervisor" not in args:
+            continue
+        try:
+            socket_path = Path(args[args.index("--socket-path") + 1])
+        except (ValueError, IndexError):
+            continue
+        try:
+            socket_parent = socket_path.parent.resolve()
+        except OSError:
+            socket_parent = socket_path.parent.absolute()
+        if socket_parent == target_dir:
+            matched.append(pid)
+    return matched
+
+
+pids = session_supervisor_pids()
+for pid in pids:
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    except PermissionError as error:
+        raise SystemExit(f"failed to terminate session supervisor {pid}: {error}")
+
+deadline = time.monotonic() + 5
+remaining = {pid for pid in pids if process_is_alive(pid)}
+while remaining and time.monotonic() < deadline:
+    time.sleep(0.1)
+    remaining = {pid for pid in remaining if process_is_alive(pid)}
+
+for pid in sorted(remaining):
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except PermissionError as error:
+        raise SystemExit(f"failed to kill session supervisor {pid}: {error}")
+
+deadline = time.monotonic() + 5
+remaining = {pid for pid in remaining if process_is_alive(pid)}
+while remaining and time.monotonic() < deadline:
+    time.sleep(0.1)
+    remaining = {pid for pid in remaining if process_is_alive(pid)}
+
+if remaining:
+    raise SystemExit(
+        "session supervisors did not exit after supervisor version upgrade: "
+        + ", ".join(str(pid) for pid in sorted(remaining))
+    )
+PY
+}
+
+clear_runtime_session_state_for_supervisor_upgrade() {
+  local sqlite_path="$1"
+  local supervisor_dir="$2"
+
+  # supervisor 兼容版本切换不能让旧 supervisor 被新 daemon 重新领养；
+  # 用户确认后必须先终止旧 supervisor，再清空所有 session 运行态和展示态数据。
+  terminate_session_supervisors "$supervisor_dir"
+
+  if [[ -f "$sqlite_path" ]]; then
+    python3 - "$sqlite_path" <<'PY'
+import sqlite3
+import sys
+
+path = sys.argv[1]
+conn = sqlite3.connect(path)
+try:
+    tables = {
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )
+    }
+    for table in (
+        "daemon_client_attached_sessions",
+        "daemon_sessions",
+        "runtime_sessions",
+    ):
+        if table in tables:
+            conn.execute(f"DELETE FROM {table}")
+    conn.commit()
+finally:
+    conn.close()
+PY
+  fi
+
+  if [[ -d "$supervisor_dir" ]]; then
+    find "$supervisor_dir" -maxdepth 1 -type s -name '*.sock' -delete
+  fi
 }
 
 resolve_supervisor_version() {
@@ -660,11 +800,24 @@ persist_supervisor_version() {
   sqlite_path="${STATE_DIR}/daemon-state.sqlite"
 
   if [[ "$SUPERVISOR_VERSION_NEEDS_RUNTIME_CLEAR" -eq 1 ]]; then
-    clear_runtime_session_state "$sqlite_path" "${STATE_DIR}/termd-supervisors"
+    clear_runtime_session_state_for_supervisor_upgrade "$sqlite_path" "${STATE_DIR}/termd-supervisors"
   fi
 
   if [[ "$INSTALL_SET_SUPERVISOR_VERSION" -eq 1 ]]; then
     upsert_sqlite_meta_value "$sqlite_path" "supervisor_version" "$SUPERVISOR_VERSION"
+  fi
+}
+
+stop_service_before_supervisor_runtime_clear() {
+  if [[ "$SUPERVISOR_VERSION_NEEDS_RUNTIME_CLEAR" -ne 1 ]]; then
+    return 0
+  fi
+
+  # supervisor 兼容版本升级已经由用户确认会丢 session；清 SQLite 之前必须先停旧 daemon，
+  # 否则旧 daemon 可能在 systemctl restart 前把内存里的 session 再写回数据库。
+  if systemctl is-active --quiet "$SERVICE_NAME"; then
+    log "stopping ${SERVICE_NAME}.service before clearing supervisor runtime state"
+    systemctl stop "$SERVICE_NAME" || die "failed to stop ${SERVICE_NAME}.service before supervisor upgrade"
   fi
 }
 
@@ -1071,6 +1224,7 @@ main() {
   fi
 
   ensure_system_user
+  stop_service_before_supervisor_runtime_clear
   clear_session_state_after_state_dir_change
   chown_state_dir
   persist_supervisor_version

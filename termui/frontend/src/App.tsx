@@ -98,6 +98,8 @@ export default function App() {
   const [sessions, setSessions] = useState<SessionSummaryPayload[]>([]);
   const [sessionOrder, setSessionOrder] = useState<UUID[]>([]);
   const sessionOrderRef = useRef<UUID[]>([]);
+  const sessionOrderGenerationRef = useRef(0);
+  const pendingSessionReorderRef = useRef(false);
   const [newOutputSessionIds, setNewOutputSessionIds] = useState<Set<UUID>>(() => new Set());
   const [daemonClients, setDaemonClients] = useState<DaemonClientSummaryPayload[]>([]);
   const [forgettingClientIds, setForgettingClientIds] = useState<Set<UUID>>(() => new Set());
@@ -794,14 +796,22 @@ export default function App() {
   const handleRefresh = useCallback(async () => {
     setError(undefined);
     setStatus("listing");
+    const requestOrderGeneration = sessionOrderGenerationRef.current;
     try {
       const client = await authenticatedClient();
       const list = await client.listSessions();
       const clients = await client.listDaemonClients();
       client.close();
-      const nextOrder = sessionOrderFromDaemonList(list.sessions);
-      sessionOrderRef.current = nextOrder;
-      setSessionOrder(nextOrder);
+      const canApplyDaemonOrder =
+        !pendingSessionReorderRef.current &&
+        requestOrderGeneration === sessionOrderGenerationRef.current;
+      const nextOrder = canApplyDaemonOrder
+        ? sessionOrderFromDaemonList(list.sessions)
+        : sessionOrderRef.current;
+      if (canApplyDaemonOrder) {
+        sessionOrderRef.current = nextOrder;
+        setSessionOrder(nextOrder);
+      }
       const orderedSessions = orderSessions(sortSessionsNewestFirst(list.sessions), nextOrder);
       confirmedSessionSizesRef.current = new Map(list.sessions.map((session) => [session.session_id, session.size]));
       const firstSessionId = userDetachedRef.current
@@ -829,14 +839,22 @@ export default function App() {
 
   const refreshDaemonClients = useCallback(
     async () => {
+      const requestOrderGeneration = sessionOrderGenerationRef.current;
       try {
         const client = await authenticatedClient();
         try {
           const sessionList = await client.listSessions();
           const clientList = await client.listDaemonClients();
-          const nextOrder = sessionOrderFromDaemonList(sessionList.sessions);
-          sessionOrderRef.current = nextOrder;
-          setSessionOrder(nextOrder);
+          const canApplyDaemonOrder =
+            !pendingSessionReorderRef.current &&
+            requestOrderGeneration === sessionOrderGenerationRef.current;
+          const nextOrder = canApplyDaemonOrder
+            ? sessionOrderFromDaemonList(sessionList.sessions)
+            : sessionOrderRef.current;
+          if (canApplyDaemonOrder) {
+            sessionOrderRef.current = nextOrder;
+            setSessionOrder(nextOrder);
+          }
           confirmedSessionSizesRef.current = new Map(sessionList.sessions.map((session) => [session.session_id, session.size]));
           setSessions((current) =>
             mergeSessionRefresh(sessionList.sessions, current, [
@@ -1305,6 +1323,8 @@ export default function App() {
 
   const handleReorderSessions = useCallback(
     (sessionIds: UUID[]) => {
+      sessionOrderGenerationRef.current += 1;
+      pendingSessionReorderRef.current = true;
       sessionOrderRef.current = sessionIds;
       setSessionOrder(sessionIds);
       setSessions((current) => orderSessions(current, sessionIds));
@@ -1314,10 +1334,14 @@ export default function App() {
           const client = await authenticatedClient();
           const reordered = await client.reorderSessions(sessionIds);
           client.close();
+          sessionOrderGenerationRef.current += 1;
+          pendingSessionReorderRef.current = false;
           sessionOrderRef.current = reordered.session_ids;
           setSessionOrder(reordered.session_ids);
           setSessions((current) => orderSessions(current, reordered.session_ids));
         } catch (caught) {
+          sessionOrderGenerationRef.current += 1;
+          pendingSessionReorderRef.current = false;
           setSafeError(caught);
           void handleRefresh();
         }

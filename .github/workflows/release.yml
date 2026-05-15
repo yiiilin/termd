@@ -193,13 +193,16 @@ jobs:
           set -euo pipefail
 
           tag="${GITHUB_REF_NAME}"
+          notes_file="$(mktemp)"
+          ./scripts/release-notes.sh "$tag" > "$notes_file"
           cd dist/release
 
           files=(*.tar.gz checksums.txt install-*.sh)
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release upload "$tag" "${files[@]}" --clobber
+            gh release edit "$tag" --title "$tag" --notes-file "$notes_file"
           else
-            gh release create "$tag" "${files[@]}" --title "$tag" --notes "Automated release for termd workspace version $tag."
+            gh release create "$tag" "${files[@]}" --title "$tag" --notes-file "$notes_file"
           fi
 
   images:

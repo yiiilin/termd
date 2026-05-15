@@ -912,6 +912,7 @@ where
         payload: SessionReorderPayload,
     ) -> Result<Vec<JsonEnvelope>, ProtocolError> {
         connection.authenticated_device_id()?;
+        self.repair_visible_session_metadata();
         let visible_session_ids = self.visible_session_ids();
         if visible_session_ids.is_empty() {
             return Ok(vec![envelope_value(
@@ -1296,6 +1297,7 @@ where
     ) -> Result<Vec<JsonEnvelope>, ProtocolError> {
         connection.authenticated_device_id()?;
         self.retry_pending_restore_sessions();
+        self.repair_visible_session_metadata();
 
         let sessions_by_id: HashMap<SessionId, _> = match self.client_history.list_sessions() {
             Ok(sessions) => sessions
@@ -1977,6 +1979,107 @@ where
             .copied()
             .chain(self.pending_restore_sessions.keys().copied())
             .collect()
+    }
+
+    fn repair_visible_session_metadata(&mut self) {
+        let session_ids = self.visible_session_ids().into_iter().collect::<Vec<_>>();
+        for session_id in session_ids {
+            if let Err(error) = self.repair_visible_session_metadata_for(session_id) {
+                tracing::warn!(%error, session_id = %session_id.0, "failed to repair visible session metadata");
+            }
+        }
+    }
+
+    fn repair_visible_session_metadata_for(
+        &mut self,
+        session_id: SessionId,
+    ) -> Result<(), ProtocolError> {
+        let current_record = self
+            .client_history
+            .session_record_including_closed(session_id)?;
+        if matches!(
+            current_record.as_ref().map(|record| record.state),
+            Some(SessionState::Running | SessionState::Created)
+        ) {
+            return Ok(());
+        }
+
+        if let Some(internal_id) = self.session_index.get(&session_id).cloned() {
+            let state = self.runtime_state_proto(&internal_id)?;
+            let size = self.runtime_size_proto(&internal_id)?;
+            let root_path = self
+                .session_roots
+                .get(&session_id)
+                .cloned()
+                .or_else(|| {
+                    current_record
+                        .as_ref()
+                        .map(|record| PathBuf::from(&record.root_path))
+                })
+                .unwrap_or_else(|| self.default_restored_session_root());
+            let files_path = current_record
+                .as_ref()
+                .and_then(|record| record.files_path.as_ref().map(PathBuf::from))
+                .unwrap_or_else(|| root_path.clone());
+            let default_name = self
+                .session_names
+                .get(&session_id)
+                .cloned()
+                .or_else(|| {
+                    current_record
+                        .as_ref()
+                        .and_then(|record| record.name.clone())
+                })
+                .unwrap_or_else(|| default_restored_session_name(session_id));
+            let created_at_ms = current_record
+                .as_ref()
+                .map(|record| record.created_at_ms)
+                .unwrap_or_else(current_unix_timestamp_millis);
+            self.client_history.record_session_restored(
+                session_id,
+                state,
+                size,
+                &root_path,
+                &default_name,
+                &files_path,
+                created_at_ms,
+                current_unix_timestamp_millis(),
+            )?;
+            return Ok(());
+        }
+
+        if let Some(pending) = self.pending_restore_sessions.get(&session_id).cloned() {
+            let root_path = pending.metadata.root_path;
+            let files_path = current_record
+                .as_ref()
+                .and_then(|record| record.files_path.as_ref().map(PathBuf::from))
+                .unwrap_or_else(|| root_path.clone());
+            let default_name = pending
+                .metadata
+                .name
+                .or_else(|| {
+                    current_record
+                        .as_ref()
+                        .and_then(|record| record.name.clone())
+                })
+                .unwrap_or_else(|| default_restored_session_name(session_id));
+            let created_at_ms = current_record
+                .as_ref()
+                .map(|record| record.created_at_ms)
+                .unwrap_or(pending.record.created_at_ms);
+            self.client_history.record_session_restored(
+                session_id,
+                pending.record.state,
+                pending.record.size,
+                &root_path,
+                &default_name,
+                &files_path,
+                created_at_ms,
+                current_unix_timestamp_millis(),
+            )?;
+        }
+
+        Ok(())
     }
 
     fn restore_runtime_sessions(&mut self, sessions: Vec<SessionStateRecord>) {
@@ -4587,6 +4690,118 @@ mod tests {
     }
 
     #[test]
+    fn startup_repairs_closed_runtime_rows_without_losing_names_or_order() {
+        let backend = FakePtyBackend::default();
+        let state_path = temp_state_path("repair-closed-runtime-row.json");
+        let config = DaemonConfig::default_for_state_path(&state_path);
+        let first = SessionId::new();
+        let second = SessionId::new();
+        let root_path = std::env::temp_dir();
+
+        {
+            let mut history = ClientHistoryStore::open(&state_path).unwrap();
+            for (index, (session_id, name)) in [(first, "first shell"), (second, "second shell")]
+                .into_iter()
+                .enumerate()
+            {
+                history
+                    .record_session_created(
+                        session_id,
+                        SessionState::Running,
+                        TerminalSize::new(24, 80),
+                        Some(name),
+                        &root_path,
+                        UnixTimestampMillis(1_000 + index as u64),
+                    )
+                    .unwrap();
+            }
+            history
+                .record_session_order(&[second, first], UnixTimestampMillis(2_000))
+                .unwrap();
+            // 旧安装/恢复路径可能把展示行也误标 closed；live supervisor 补回时必须保留名称和顺序。
+            history
+                .record_session_closed(first, UnixTimestampMillis(3_000))
+                .unwrap();
+            history
+                .record_session_closed(second, UnixTimestampMillis(3_000))
+                .unwrap();
+        }
+
+        let mut state = DaemonState {
+            version: crate::state::STATE_SCHEMA_VERSION,
+            daemon_identity: None,
+            trusted_devices: Vec::new(),
+            sessions: vec![
+                SessionStateRecord {
+                    session_id: first,
+                    state: SessionState::Closed,
+                    size: TerminalSize::new(24, 80),
+                    created_at_ms: UnixTimestampMillis(1_000),
+                    updated_at_ms: UnixTimestampMillis(3_000),
+                    restore_info: None,
+                },
+                SessionStateRecord {
+                    session_id: second,
+                    state: SessionState::Closed,
+                    size: TerminalSize::new(24, 80),
+                    created_at_ms: UnixTimestampMillis(1_001),
+                    updated_at_ms: UnixTimestampMillis(3_000),
+                    restore_info: None,
+                },
+            ],
+        };
+        let supervisors = vec![
+            crate::pty::supervisor::SupervisorRestoreCandidate {
+                session_id: first.0.to_string(),
+                socket_path: std::path::PathBuf::from(format!("/tmp/{}.sock", first.0)),
+                supervisor_pid: 11,
+                size: PtySize::new(24, 80),
+            },
+            crate::pty::supervisor::SupervisorRestoreCandidate {
+                session_id: second.0.to_string(),
+                socket_path: std::path::PathBuf::from(format!("/tmp/{}.sock", second.0)),
+                supervisor_pid: 12,
+                size: PtySize::new(24, 80),
+            },
+        ];
+        crate::net::server::adopt_or_repair_runtime_sessions_from_supervisors(
+            &mut state,
+            supervisors,
+            UnixTimestampMillis(4_000),
+        );
+        StateStore::save(&state_path, &state).unwrap();
+        let state = StateStore::load(&state_path).unwrap();
+
+        let mut protocol =
+            DaemonProtocol::from_state(config, backend.clone(), Ed25519SignatureVerifier, state)
+                .unwrap();
+        let mut connection = ProtocolConnection::new(None);
+        connection.authenticated_device_id = Some(DeviceId::new());
+        let response = protocol
+            .list_sessions(&connection, SessionListPayload {})
+            .unwrap();
+        let payload: SessionListResultPayload =
+            decode_payload(response[0].payload.clone()).unwrap();
+
+        assert_eq!(
+            payload
+                .sessions
+                .iter()
+                .map(|session| (session.session_id, session.name.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![(second, Some("second shell")), (first, Some("first shell"))]
+        );
+        assert_eq!(backend.reconnects().len(), 2);
+        assert!(
+            StateStore::load(&state_path)
+                .unwrap()
+                .sessions
+                .iter()
+                .all(|session| session.state == SessionState::Running)
+        );
+    }
+
+    #[test]
     fn snapshot_keeps_live_runtime_session_when_history_row_was_deleted() {
         let backend = FakePtyBackend::default();
         let state_path = temp_state_path("snapshot-without-history.json");
@@ -4677,6 +4892,82 @@ mod tests {
             .map(|record| record.session_id)
             .collect::<Vec<_>>();
         assert_eq!(persisted_ids, wanted_order);
+    }
+
+    #[test]
+    fn session_reorder_repairs_live_sessions_whose_history_rows_were_closed() {
+        let (mut protocol, _) = protocol();
+        let device_id = DeviceId::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = PublicKey(wire(signing_key.verifying_key().as_bytes()));
+        let (mut connection, _) = protocol.start_connection();
+        let (_, mut device_session) = open_e2ee(&mut protocol, &mut connection, device_id);
+        pair_device(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            device_id,
+            public_key,
+        );
+
+        let first = create_test_session(&mut protocol, &mut connection, &mut device_session);
+        let second = create_test_session(&mut protocol, &mut connection, &mut device_session);
+        let third = create_test_session(&mut protocol, &mut connection, &mut device_session);
+
+        // 旧安装/重启路径曾把仍由 supervisor 持有的 session 展示行标成 closed。
+        // 这些 session 在内存和 runtime_sessions 中仍是 live，重排必须修复展示行后再写顺序。
+        for session_id in [first, second, third] {
+            protocol
+                .client_history
+                .record_session_closed(session_id, UnixTimestampMillis(2_000))
+                .unwrap();
+        }
+
+        let wanted_order = vec![third, first, second];
+        let reorder_responses = send_encrypted(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            envelope_value(
+                MessageType::SessionReorder,
+                SessionReorderPayload {
+                    session_ids: wanted_order.clone(),
+                },
+            )
+            .unwrap(),
+        );
+        let reordered = decrypt_first(&mut device_session, reorder_responses);
+        let reordered_payload: SessionReorderedPayload = decode_payload(reordered.payload).unwrap();
+        assert_eq!(reordered_payload.session_ids, wanted_order);
+
+        let list_responses = send_encrypted(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            envelope_value(MessageType::SessionList, SessionListPayload {}).unwrap(),
+        );
+        let list = decrypt_first(&mut device_session, list_responses);
+        let list_payload: SessionListResultPayload = decode_payload(list.payload).unwrap();
+        let listed_ids = list_payload
+            .sessions
+            .into_iter()
+            .map(|session| session.session_id)
+            .collect::<Vec<_>>();
+        assert_eq!(listed_ids, wanted_order);
+
+        let persisted_records = protocol.client_history.list_sessions().unwrap();
+        assert_eq!(
+            persisted_records
+                .iter()
+                .map(|record| record.session_id)
+                .collect::<Vec<_>>(),
+            wanted_order
+        );
+        assert!(
+            persisted_records
+                .iter()
+                .all(|record| record.state == SessionState::Running)
+        );
     }
 
     #[test]

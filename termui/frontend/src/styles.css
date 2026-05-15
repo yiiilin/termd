@@ -965,12 +965,13 @@ label {
 }
 
 .daemon-status-strip {
+  width: 100%;
   min-width: 0;
   min-height: 30px;
   border: 0;
   border-top: 1px solid #25312d;
   border-radius: 0;
-  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-columns: auto auto minmax(0, 1fr);
   align-items: center;
   gap: 10px;
   padding: 0 10px;
@@ -1023,7 +1024,7 @@ label {
     var(--daemon-status-uptime-width);
   gap: 0;
   align-items: center;
-  justify-content: end;
+  justify-content: start;
   overflow: hidden;
 }
 
@@ -1795,9 +1796,12 @@ label {
   .app-shell {
     position: relative;
     top: var(--termd-visual-viewport-offset-top, 0px);
+    width: min(100vw, 100dvw);
+    max-width: min(100vw, 100dvw);
     height: var(--termd-visual-viewport-height, 100dvh);
     grid-template-columns: 1fr;
     grid-template-rows: auto minmax(0, 1fr);
+    overflow: hidden;
   }
 
   .app-shell.connection-ready {
@@ -1897,6 +1901,8 @@ label {
   }
 
   .workspace {
+    width: 100%;
+    max-width: 100%;
     min-height: 0;
     height: var(--termd-visual-viewport-height, 100%);
     grid-template-rows: 42px minmax(0, 1fr) 30px;
@@ -1911,6 +1917,8 @@ label {
   }
 
   .workspace-body {
+    width: 100%;
+    max-width: 100%;
     grid-template-columns: 1fr;
     grid-template-rows: minmax(0, 1fr);
   }
@@ -2036,6 +2044,8 @@ label {
   }
 
   .terminal-pane {
+    width: 100%;
+    max-width: 100%;
     min-height: 0;
     grid-template-rows: minmax(0, 1fr) 42px;
   }
@@ -2045,11 +2055,16 @@ label {
   }
 
   .daemon-status-strip {
+    width: 100%;
+    max-width: 100%;
     min-height: 30px;
+    grid-template-columns: minmax(0, 1fr);
     padding: 0;
   }
 
   .daemon-status-strip .daemon-status-grid {
+    width: 100%;
+    max-width: 100%;
     grid-template-columns: repeat(4, minmax(0, 1fr));
     justify-content: stretch;
   }
@@ -2084,6 +2099,8 @@ label {
   }
 
   .terminal-mobile-shortcuts {
+    width: 100%;
+    max-width: 100%;
     position: relative;
     z-index: 7;
     min-width: 0;
