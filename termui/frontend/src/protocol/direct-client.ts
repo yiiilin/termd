@@ -43,6 +43,8 @@ import type {
   SessionListResultPayload,
   SessionRenamedPayload,
   SessionRenamePayload,
+  SessionReorderedPayload,
+  SessionReorderPayload,
   SessionResizePayload,
   SessionResizedPayload,
   TerminalSize,
@@ -340,6 +342,11 @@ export class DirectClient {
       } satisfies SessionRenamePayload),
     );
     return this.expectPayload<SessionRenamedPayload>("session_renamed", { bufferTerminalEvents: true });
+  }
+
+  async reorderSessions(sessionIds: UUID[]): Promise<SessionReorderedPayload> {
+    await this.sendInner(envelope("session_reorder", { session_ids: sessionIds } satisfies SessionReorderPayload));
+    return this.expectPayload<SessionReorderedPayload>("session_reordered", { bufferTerminalEvents: true });
   }
 
   async closeSession(sessionId: UUID): Promise<SessionClosedPayload> {

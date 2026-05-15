@@ -1793,6 +1793,8 @@ label {
   }
 
   .app-shell {
+    position: relative;
+    top: var(--termd-visual-viewport-offset-top, 0px);
     height: var(--termd-visual-viewport-height, 100dvh);
     grid-template-columns: 1fr;
     grid-template-rows: auto minmax(0, 1fr);
@@ -1898,6 +1900,14 @@ label {
     min-height: 0;
     height: var(--termd-visual-viewport-height, 100%);
     grid-template-rows: 42px minmax(0, 1fr) 30px;
+  }
+
+  .app-shell.mobile-keyboard-open .workspace {
+    grid-template-rows: 42px minmax(0, 1fr);
+  }
+
+  .app-shell.mobile-keyboard-open .daemon-status-strip {
+    display: none;
   }
 
   .workspace-body {
@@ -2207,14 +2217,17 @@ label {
 
   .terminal-host {
     min-width: 0;
-    max-width: 100%;
     overflow: hidden;
   }
 
-  .terminal-host .xterm,
-  .terminal-host .xterm-screen,
-  .terminal-host .xterm-viewport,
-  .terminal-host .xterm-rows {
+  .terminal-pane:not(.terminal-pane-viewer) .terminal-host {
+    max-width: 100%;
+  }
+
+  .terminal-pane:not(.terminal-pane-viewer) .terminal-host .xterm,
+  .terminal-pane:not(.terminal-pane-viewer) .terminal-host .xterm-screen,
+  .terminal-pane:not(.terminal-pane-viewer) .terminal-host .xterm-viewport,
+  .terminal-pane:not(.terminal-pane-viewer) .terminal-host .xterm-rows {
     max-width: 100%;
   }
 

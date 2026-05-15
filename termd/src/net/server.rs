@@ -141,14 +141,7 @@ pub fn try_default_protocol(config: DaemonConfig) -> Result<SharedDaemonProtocol
         .iter()
         .filter(|session| session.state == SessionState::Running && session.restore_info.is_some())
         .map(|session| session.session_id.0.to_string());
-    match supervisor_backend.cleanup_orphaned_supervisors(valid_supervisor_session_ids) {
-        Ok(cleaned_count) if cleaned_count > 0 => {
-            warn!(cleaned_count, "cleaned orphaned session supervisors")
-        }
-        Ok(_) => {}
-        // 清理失败只影响异常进程回收，不应阻断已有 session 恢复和 daemon 启动。
-        Err(error) => warn!(%error, "failed to clean orphaned session supervisors"),
-    }
+    warn_about_orphaned_supervisors(&supervisor_backend, valid_supervisor_session_ids);
     let protocol = DaemonProtocol::from_state(
         config.clone(),
         supervisor_backend,
@@ -162,18 +155,32 @@ pub fn try_default_protocol(config: DaemonConfig) -> Result<SharedDaemonProtocol
         .filter(|session| session.state == SessionState::Running && session.restore_info.is_some())
         .map(|session| session.session_id.0.to_string())
         .collect::<Vec<_>>();
-    match SupervisorPtyBackend::for_state_path(&config.state_path)
-        .cleanup_orphaned_supervisors(restored_supervisor_session_ids)
-    {
-        Ok(cleaned_count) if cleaned_count > 0 => {
-            warn!(cleaned_count, "cleaned orphaned session supervisors")
-        }
-        Ok(_) => {}
-        Err(error) => warn!(%error, "failed to clean orphaned session supervisors"),
-    }
+    warn_about_orphaned_supervisors(
+        &SupervisorPtyBackend::for_state_path(&config.state_path),
+        restored_supervisor_session_ids,
+    );
     // 首次启动时立即写入 daemon identity，避免已展示的 server id 只停留在内存里。
     protocol.persist_state()?;
     Ok(Arc::new(Mutex::new(protocol)))
+}
+
+fn warn_about_orphaned_supervisors<I, S>(backend: &SupervisorPtyBackend, valid_session_ids: I)
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    match backend.orphaned_supervisor_count(valid_session_ids) {
+        Ok(orphaned_count) if orphaned_count > 0 => {
+            // 启动/升级恢复路径绝不能因为判断为孤儿就主动 SIGTERM supervisor。
+            // 如果 socket 文件临时缺失或状态迁移失败，里面仍可能是用户正在跑的 shell。
+            warn!(
+                orphaned_count,
+                "left orphaned session supervisors running during startup"
+            );
+        }
+        Ok(_) => {}
+        Err(error) => warn!(%error, "failed to inspect orphaned session supervisors"),
+    }
 }
 
 fn adopt_missing_runtime_sessions_from_supervisors(

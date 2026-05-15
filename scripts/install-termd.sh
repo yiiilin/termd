@@ -573,22 +573,46 @@ try:
             "SELECT name FROM sqlite_master WHERE type = 'table'"
         )
     }
-    for table in (
-        "daemon_client_attached_sessions",
-        "daemon_sessions",
-        "runtime_sessions",
-    ):
-        if table in tables:
-            conn.execute(f"DELETE FROM {table}")
+    if "daemon_client_attached_sessions" in tables:
+        conn.execute("DELETE FROM daemon_client_attached_sessions")
+    # daemon_sessions 保存用户可见名称、root 和文件树位置。清理不兼容 runtime 时不能删除它，
+    # 否则仍存活的 supervisor 被重新领养后只能显示 restored-* 默认名。
+    if "daemon_sessions" in tables:
+        columns = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(daemon_sessions)")
+        }
+        if {"state", "updated_at_ms"}.issubset(columns):
+            conn.execute(
+                "UPDATE daemon_sessions SET state = 'closed', updated_at_ms = ?",
+                (int(__import__("time").time() * 1000),),
+            )
+    if "runtime_sessions" in tables:
+        columns = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(runtime_sessions)")
+        }
+        if {"state", "updated_at_ms", "restore_kind", "restore_value"}.issubset(columns):
+            conn.execute(
+                """
+                UPDATE runtime_sessions
+                SET state = 'closed',
+                    updated_at_ms = ?,
+                    restore_kind = NULL,
+                    restore_value = NULL
+                """,
+                (int(__import__("time").time() * 1000),),
+            )
+        else:
+            conn.execute("DELETE FROM runtime_sessions")
     conn.commit()
 finally:
     conn.close()
 PY
   fi
 
-  if [[ -d "$supervisor_dir" ]]; then
-    find "$supervisor_dir" -maxdepth 1 -type s -delete
-  fi
+  # 不删除 supervisor socket：即使本次选择清理 runtime 元数据，仍存活的 supervisor
+  # 里面可能有用户正在跑的 shell。保留 socket 让人工或后续恢复逻辑仍有接回机会。
 }
 
 resolve_supervisor_version() {

@@ -196,7 +196,7 @@ export function TerminalPane(props: TerminalPaneProps) {
       current && current.width === next.width && current.height === next.height ? current : next,
     );
   };
-  const remoteRenderMode = props.attached && (!focused || !props.resizeEnabled);
+  const remoteRenderMode = props.attached && !props.resizeEnabled;
   const viewerCols = props.sessionSize?.cols ?? 0;
   const viewerRows = props.sessionSize?.rows ?? 0;
   const viewerPixelWidth = props.sessionSize?.pixel_width ?? 0;
@@ -209,7 +209,8 @@ export function TerminalPane(props: TerminalPaneProps) {
     (viewerPixelHeight > 0
       ? Math.ceil(viewerPixelHeight)
       : Math.ceil(viewerRows * (props.mobileInputMode ? MOBILE_TERMINAL_FONT_SIZE : TERMINAL_FONT_SIZE) * TERMINAL_LINE_HEIGHT));
-  // 只有 PTY 尺寸和当前客户端可容纳尺寸不一致时，才展示 viewer 的虚线框和缩放工具。
+  // 只有当前客户端不是 resize owner 且 PTY 尺寸不匹配时，才展示 viewer 虚线框和缩放工具。
+  // 独占 session 的客户端即使短暂失焦，也仍按 operator 视图展示，避免移动端出现多余虚线框。
   const resolutionMismatch =
     remoteRenderMode &&
     viewerCols > 0 &&
@@ -734,8 +735,9 @@ export function TerminalPane(props: TerminalPaneProps) {
       let hostHeight = terminalHost.clientHeight;
       const remoteSize = sessionSizeRef.current;
       const terminalHasActiveFocus = hasActiveTerminalFocus();
+      const terminalOwnsResize = resizeEnabledRef.current;
       const hostIsRemoteViewerFrame =
-        !terminalHasActiveFocus &&
+        !terminalOwnsResize &&
         viewerModeRef.current &&
         Boolean(
           remoteSize &&
@@ -774,8 +776,9 @@ export function TerminalPane(props: TerminalPaneProps) {
           proposed &&
           (remoteSize.rows !== proposed.rows || remoteSize.cols !== proposed.cols),
       );
-      viewerModeRef.current = !terminalHasActiveFocus && mismatch;
-      if (!terminalHasActiveFocus) {
+      viewerModeRef.current = !terminalOwnsResize && mismatch;
+      // 非 resize owner 始终按 daemon 确认的远端尺寸渲染；它可以输入，但不能因为聚焦而接管 PTY 尺寸。
+      if (!terminalOwnsResize || !terminalHasActiveFocus) {
         applyFontSize(terminal, currentTerminalFontSize());
         if (remoteSize) {
           if (sameTerminalDimensions(terminal, remoteSize)) {
@@ -788,6 +791,9 @@ export function TerminalPane(props: TerminalPaneProps) {
           updateViewerContentSize();
           scheduleScrollToBottom();
           queueCursorReport({ immediate: true });
+          return;
+        }
+        if (!terminalOwnsResize) {
           return;
         }
       }
@@ -1111,6 +1117,18 @@ export function TerminalPane(props: TerminalPaneProps) {
     // 新建 session 后要直接进入可输入状态；等一帧可以确保 xterm 已完成 open/fit，
     // focusin 事件随后会关闭 viewer 虚线框，并由聚焦客户端上报真实 PTY 尺寸。
     const frame = window.requestAnimationFrame(() => {
+      const activeElement = document.activeElement;
+      const terminalHost = hostRef.current;
+      if (
+        activeElement instanceof HTMLElement &&
+        terminalHost &&
+        !terminalHost.contains(activeElement) &&
+        Boolean(activeElement.closest(".toolbar, .mobile-menu-popover, .mobile-panel, .files-panel"))
+      ) {
+        // 延迟 focusRequest 不能抢走用户刚聚焦的工作台工具栏、菜单、文件面板等控件；
+        // 否则移动端键盘常驻会破坏顶部工具按钮的键盘/辅助技术操作。
+        return;
+      }
       focusActivationArmedRef.current = true;
       suppressPassiveFocusRef.current = false;
       terminalRef.current?.focus();

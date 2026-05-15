@@ -17,6 +17,8 @@ export const ALL_MESSAGE_TYPES = [
   "session_resized",
   "session_rename",
   "session_renamed",
+  "session_reorder",
+  "session_reordered",
   "session_close",
   "session_closed",
   "session_files",
@@ -248,6 +250,14 @@ export interface SessionRenamePayload {
 export interface SessionRenamedPayload {
   session_id: UUID;
   name: string;
+}
+
+export interface SessionReorderPayload {
+  session_ids: UUID[];
+}
+
+export interface SessionReorderedPayload {
+  session_ids: UUID[];
 }
 
 export interface SessionClosePayload {

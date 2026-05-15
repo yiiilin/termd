@@ -131,16 +131,27 @@ CREATE TABLE daemon_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at_
 CREATE TABLE trusted_devices (device_id TEXT PRIMARY KEY, public_key TEXT NOT NULL, trusted_at_ms INTEGER NOT NULL);
 CREATE TABLE daemon_clients (device_id TEXT PRIMARY KEY);
 CREATE TABLE daemon_client_attached_sessions (device_id TEXT NOT NULL, connection_id TEXT NOT NULL, session_id TEXT NOT NULL);
-CREATE TABLE daemon_sessions (session_id TEXT PRIMARY KEY);
-CREATE TABLE runtime_sessions (session_id TEXT PRIMARY KEY);
+CREATE TABLE daemon_sessions (
+  session_id TEXT PRIMARY KEY,
+  name TEXT,
+  state TEXT NOT NULL,
+  updated_at_ms INTEGER NOT NULL
+);
+CREATE TABLE runtime_sessions (
+  session_id TEXT PRIMARY KEY,
+  state TEXT NOT NULL,
+  updated_at_ms INTEGER NOT NULL,
+  restore_kind TEXT,
+  restore_value TEXT
+);
 """)
 conn.execute("INSERT INTO daemon_meta VALUES ('server_id', 'server', 1)")
 conn.execute("INSERT INTO daemon_meta VALUES ('supervisor_version', ?, 1)", (supervisor_version,))
 conn.execute("INSERT INTO trusted_devices VALUES ('device', 'public', 1)")
 conn.execute("INSERT INTO daemon_clients VALUES ('device')")
 conn.execute("INSERT INTO daemon_client_attached_sessions VALUES ('device', 'connection', 'session')")
-conn.execute("INSERT INTO daemon_sessions VALUES ('session')")
-conn.execute("INSERT INTO runtime_sessions VALUES ('session')")
+conn.execute("INSERT INTO daemon_sessions VALUES ('session', 'work shell', 'running', 1)")
+conn.execute("INSERT INTO runtime_sessions VALUES ('session', 'running', 1, 'unix_socket', '/tmp/session.sock')")
 conn.commit()
 conn.close()
 PY
@@ -161,14 +172,25 @@ CREATE TABLE daemon_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at_
 CREATE TABLE trusted_devices (device_id TEXT PRIMARY KEY, public_key TEXT NOT NULL, trusted_at_ms INTEGER NOT NULL);
 CREATE TABLE daemon_clients (device_id TEXT PRIMARY KEY);
 CREATE TABLE daemon_client_attached_sessions (device_id TEXT NOT NULL, connection_id TEXT NOT NULL, session_id TEXT NOT NULL);
-CREATE TABLE daemon_sessions (session_id TEXT PRIMARY KEY);
-CREATE TABLE runtime_sessions (session_id TEXT PRIMARY KEY);
+CREATE TABLE daemon_sessions (
+  session_id TEXT PRIMARY KEY,
+  name TEXT,
+  state TEXT NOT NULL,
+  updated_at_ms INTEGER NOT NULL
+);
+CREATE TABLE runtime_sessions (
+  session_id TEXT PRIMARY KEY,
+  state TEXT NOT NULL,
+  updated_at_ms INTEGER NOT NULL,
+  restore_kind TEXT,
+  restore_value TEXT
+);
 INSERT INTO daemon_meta VALUES ('server_id', 'server', 1);
 INSERT INTO trusted_devices VALUES ('device', 'public', 1);
 INSERT INTO daemon_clients VALUES ('device');
 INSERT INTO daemon_client_attached_sessions VALUES ('device', 'connection', 'session');
-INSERT INTO daemon_sessions VALUES ('session');
-INSERT INTO runtime_sessions VALUES ('session');
+INSERT INTO daemon_sessions VALUES ('session', 'work shell', 'running', 1);
+INSERT INTO runtime_sessions VALUES ('session', 'running', 1, 'unix_socket', '/tmp/session.sock');
 """)
 conn.close()
 PY
@@ -340,14 +362,25 @@ CREATE TABLE daemon_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at_
 CREATE TABLE trusted_devices (device_id TEXT PRIMARY KEY, public_key TEXT NOT NULL, trusted_at_ms INTEGER NOT NULL);
 CREATE TABLE daemon_clients (device_id TEXT PRIMARY KEY);
 CREATE TABLE daemon_client_attached_sessions (device_id TEXT NOT NULL, connection_id TEXT NOT NULL, session_id TEXT NOT NULL);
-CREATE TABLE daemon_sessions (session_id TEXT PRIMARY KEY);
-CREATE TABLE runtime_sessions (session_id TEXT PRIMARY KEY);
+CREATE TABLE daemon_sessions (
+  session_id TEXT PRIMARY KEY,
+  name TEXT,
+  state TEXT NOT NULL,
+  updated_at_ms INTEGER NOT NULL
+);
+CREATE TABLE runtime_sessions (
+  session_id TEXT PRIMARY KEY,
+  state TEXT NOT NULL,
+  updated_at_ms INTEGER NOT NULL,
+  restore_kind TEXT,
+  restore_value TEXT
+);
 INSERT INTO daemon_meta VALUES ('server_id', 'server', 1);
 INSERT INTO trusted_devices VALUES ('device', 'public', 1);
 INSERT INTO daemon_clients VALUES ('device');
 INSERT INTO daemon_client_attached_sessions VALUES ('device', 'connection', 'session');
-INSERT INTO daemon_sessions VALUES ('session');
-INSERT INTO runtime_sessions VALUES ('session');
+INSERT INTO daemon_sessions VALUES ('session', 'work shell', 'running', 1);
+INSERT INTO runtime_sessions VALUES ('session', 'running', 1, 'unix_socket', '/tmp/session.sock');
 """)
 conn.close()
 PY
@@ -369,15 +402,22 @@ import sys
 
 conn = sqlite3.connect(sys.argv[1])
 try:
-    for table in ("daemon_client_attached_sessions", "daemon_sessions", "runtime_sessions"):
-        count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-        assert count == 0, (table, count)
+    attached = conn.execute("SELECT COUNT(*) FROM daemon_client_attached_sessions").fetchone()[0]
+    assert attached == 0, attached
+    daemon_session = conn.execute(
+        "SELECT name, state FROM daemon_sessions WHERE session_id = 'session'"
+    ).fetchone()
+    assert daemon_session == ("work shell", "closed"), daemon_session
+    runtime_session = conn.execute(
+        "SELECT state, restore_kind, restore_value FROM runtime_sessions WHERE session_id = 'session'"
+    ).fetchone()
+    assert runtime_session == ("closed", None, None), runtime_session
     assert conn.execute("SELECT COUNT(*) FROM daemon_meta").fetchone()[0] == 1
     assert conn.execute("SELECT COUNT(*) FROM trusted_devices").fetchone()[0] == 1
     assert conn.execute("SELECT COUNT(*) FROM daemon_clients").fetchone()[0] == 1
 finally:
     conn.close()
-assert not pathlib.Path(sys.argv[2]).exists()
+assert pathlib.Path(sys.argv[2]).exists()
 PY
 )
 
@@ -537,9 +577,16 @@ import sys
 
 conn = sqlite3.connect(sys.argv[1])
 try:
-    for table in ("daemon_client_attached_sessions", "daemon_sessions", "runtime_sessions"):
-        count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-        assert count == 0, (table, count)
+    attached = conn.execute("SELECT COUNT(*) FROM daemon_client_attached_sessions").fetchone()[0]
+    assert attached == 0, attached
+    daemon_session = conn.execute(
+        "SELECT name, state FROM daemon_sessions WHERE session_id = 'session'"
+    ).fetchone()
+    assert daemon_session == ("work shell", "closed"), daemon_session
+    runtime_session = conn.execute(
+        "SELECT state, restore_kind, restore_value FROM runtime_sessions WHERE session_id = 'session'"
+    ).fetchone()
+    assert runtime_session == ("closed", None, None), runtime_session
     version = conn.execute(
         "SELECT value FROM daemon_meta WHERE key = 'supervisor_version'"
     ).fetchone()[0]
@@ -549,7 +596,7 @@ try:
     assert conn.execute("SELECT COUNT(*) FROM daemon_clients").fetchone()[0] == 1
 finally:
     conn.close()
-assert not pathlib.Path(sys.argv[2]).exists()
+assert pathlib.Path(sys.argv[2]).exists()
 PY
 )
 

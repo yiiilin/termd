@@ -37,6 +37,7 @@ pub struct SessionHistoryRecord {
     pub size: TerminalSize,
     pub root_path: String,
     pub files_path: Option<String>,
+    pub display_order: i64,
     pub created_at_ms: UnixTimestampMillis,
     pub updated_at_ms: UnixTimestampMillis,
 }
@@ -97,6 +98,7 @@ impl ClientHistoryStore {
                     pixel_height INTEGER NOT NULL,
                     root_path TEXT NOT NULL,
                     files_path TEXT,
+                    display_order INTEGER NOT NULL DEFAULT 0,
                     created_at_ms INTEGER NOT NULL,
                     updated_at_ms INTEGER NOT NULL
                 );
@@ -105,13 +107,13 @@ impl ClientHistoryStore {
                     ON daemon_clients(active_connection_count, connected_at_ms, device_id);
                 CREATE INDEX IF NOT EXISTS idx_daemon_client_sessions_lookup
                     ON daemon_client_attached_sessions(device_id, session_id);
-                CREATE INDEX IF NOT EXISTS idx_daemon_sessions_state
-                    ON daemon_sessions(state, created_at_ms, session_id);
                 "#,
             )
             .map_err(|source| sqlite_error(&self.path, source))?;
 
         self.ensure_daemon_clients_name_column()?;
+        self.ensure_daemon_sessions_display_order_column()?;
+        self.ensure_daemon_sessions_display_order_index()?;
         self.reset_runtime_state()?;
         Ok(())
     }
@@ -124,6 +126,62 @@ impl ClientHistoryStore {
         // 旧版 SQLite 没有客户端展示名列；在线历史保留，后续连接会自动补充 name。
         self.conn
             .execute("ALTER TABLE daemon_clients ADD COLUMN name TEXT", [])
+            .map_err(|source| sqlite_error(&self.path, source))?;
+        Ok(())
+    }
+
+    fn ensure_daemon_sessions_display_order_column(&self) -> Result<(), StateError> {
+        if self.column_exists("daemon_sessions", "display_order")? {
+            return Ok(());
+        }
+
+        // 旧版只按 created_at 排序；迁移时把现有行固化成 display_order，
+        // 后续拖拽排序就有 daemon 端权威状态，不再依赖某个浏览器的内存数组。
+        self.conn
+            .execute(
+                "ALTER TABLE daemon_sessions ADD COLUMN display_order INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|source| sqlite_error(&self.path, source))?;
+        let mut stmt = self
+            .conn
+            .prepare(
+                r#"
+                SELECT session_id
+                FROM daemon_sessions
+                ORDER BY created_at_ms DESC, session_id DESC
+                "#,
+            )
+            .map_err(|source| sqlite_error(&self.path, source))?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|source| sqlite_error(&self.path, source))?;
+        let mut session_ids = Vec::new();
+        for row in rows {
+            session_ids.push(row.map_err(|source| sqlite_error(&self.path, source))?);
+        }
+        drop(stmt);
+        for (index, session_id) in session_ids.into_iter().enumerate() {
+            self.conn
+                .execute(
+                    "UPDATE daemon_sessions SET display_order = ?1 WHERE session_id = ?2",
+                    params![index as i64, session_id],
+                )
+                .map_err(|source| sqlite_error(&self.path, source))?;
+        }
+        Ok(())
+    }
+
+    fn ensure_daemon_sessions_display_order_index(&self) -> Result<(), StateError> {
+        // display_order 是后加列；旧库初始化时必须先完成列迁移，再重建依赖该列的索引。
+        self.conn
+            .execute_batch(
+                r#"
+                DROP INDEX IF EXISTS idx_daemon_sessions_state;
+                CREATE INDEX idx_daemon_sessions_state
+                    ON daemon_sessions(state, display_order, created_at_ms, session_id);
+                "#,
+            )
             .map_err(|source| sqlite_error(&self.path, source))?;
         Ok(())
     }
@@ -185,10 +243,15 @@ impl ClientHistoryStore {
                     pixel_height,
                     root_path,
                     files_path,
+                    display_order,
                     created_at_ms,
                     updated_at_ms
                 )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?9)
+                VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL,
+                    COALESCE((SELECT MIN(display_order) - 1 FROM daemon_sessions), 0),
+                    ?9, ?9
+                )
                 ON CONFLICT(session_id) DO UPDATE SET
                     name = COALESCE(daemon_sessions.name, excluded.name),
                     state = excluded.state,
@@ -314,6 +377,64 @@ impl ClientHistoryStore {
         Ok(())
     }
 
+    /// 持久化 daemon 端的 session 列表顺序。
+    ///
+    /// 前端拖拽排序属于跨客户端共享状态：重启后必须由 daemon 返回同一顺序，而不是由某个浏览器
+    /// 的本地数组临时决定。
+    pub fn record_session_order(
+        &mut self,
+        session_ids: &[SessionId],
+        now_ms: UnixTimestampMillis,
+    ) -> Result<Vec<SessionId>, StateError> {
+        let known_sessions = self.list_sessions()?;
+        let known_by_id = known_sessions
+            .iter()
+            .map(|record| (record.session_id, record.display_order))
+            .collect::<HashMap<_, _>>();
+        let mut seen = HashSet::new();
+        let mut ordered = Vec::new();
+        for session_id in session_ids {
+            if !known_by_id.contains_key(session_id) || !seen.insert(*session_id) {
+                continue;
+            }
+            ordered.push(*session_id);
+        }
+
+        let requested = ordered.iter().copied().collect::<HashSet<_>>();
+        let mut remaining = known_sessions
+            .into_iter()
+            .filter(|record| !requested.contains(&record.session_id))
+            .collect::<Vec<_>>();
+        remaining.sort_by(|left, right| {
+            left.display_order
+                .cmp(&right.display_order)
+                .then_with(|| left.created_at_ms.cmp(&right.created_at_ms))
+                .then_with(|| left.session_id.0.cmp(&right.session_id.0))
+        });
+        ordered.extend(remaining.into_iter().map(|record| record.session_id));
+
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&self.path, source))?;
+        for (index, session_id) in ordered.iter().enumerate() {
+            tx.execute(
+                r#"
+                UPDATE daemon_sessions
+                SET display_order = ?1,
+                    updated_at_ms = ?2
+                WHERE session_id = ?3
+                "#,
+                params![index as i64, now_ms.0 as i64, session_id_text(*session_id),],
+            )
+            .map_err(|source| sqlite_error(&self.path, source))?;
+        }
+        tx.commit()
+            .map_err(|source| sqlite_error(&self.path, source))?;
+
+        Ok(ordered)
+    }
+
     /// daemon 重启后修复可重连 session 的展示元数据。
     ///
     /// runtime_sessions 是 supervisor 是否可恢复的事实来源；如果 daemon_sessions 行缺失或仍是
@@ -346,10 +467,15 @@ impl ClientHistoryStore {
                     pixel_height,
                     root_path,
                     files_path,
+                    display_order,
                     created_at_ms,
                     updated_at_ms
                 )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
+                    COALESCE((SELECT MAX(display_order) + 1 FROM daemon_sessions), 0),
+                    ?10, ?11
+                )
                 ON CONFLICT(session_id) DO UPDATE SET
                     name = COALESCE(daemon_sessions.name, excluded.name),
                     state = excluded.state,
@@ -397,8 +523,11 @@ impl ClientHistoryStore {
         Ok(path)
     }
 
-    /// 按 id 读取单条 session 元数据；包含 closed 行，供重启恢复路径修复可见性。
-    fn session_record(
+    /// 按 id 读取单条 session 元数据；包含 closed 行。
+    ///
+    /// session 名称、root 和文件树路径是展示元数据，即使 runtime 状态曾被错误清理或标记
+    /// closed，也要允许恢复路径拿回来，避免存活 supervisor 只能退回 `restored-*` 默认名。
+    pub fn session_record_including_closed(
         &self,
         session_id: SessionId,
     ) -> Result<Option<SessionHistoryRecord>, StateError> {
@@ -415,6 +544,7 @@ impl ClientHistoryStore {
                     pixel_height,
                     root_path,
                     files_path,
+                    display_order,
                     created_at_ms,
                     updated_at_ms
                 FROM daemon_sessions
@@ -425,6 +555,13 @@ impl ClientHistoryStore {
             )
             .optional()
             .map_err(|source| sqlite_error(&self.path, source))
+    }
+
+    fn session_record(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<SessionHistoryRecord>, StateError> {
+        self.session_record_including_closed(session_id)
     }
 
     /// 返回仍处于可见状态的 session 元数据。
@@ -443,11 +580,12 @@ impl ClientHistoryStore {
                     pixel_height,
                     root_path,
                     files_path,
+                    display_order,
                     created_at_ms,
                     updated_at_ms
                 FROM daemon_sessions
                 WHERE state != ?1
-                ORDER BY created_at_ms, session_id
+                ORDER BY display_order, created_at_ms, session_id
                 "#,
             )
             .map_err(|source| sqlite_error(&self.path, source))?;
@@ -785,8 +923,9 @@ fn session_history_record_from_row(
     let pixel_height = integer_to_u16(row.get::<_, i64>(6)?, 6)?;
     let root_path = row.get::<_, String>(7)?;
     let files_path = row.get::<_, Option<String>>(8)?;
-    let created_at_ms = UnixTimestampMillis(row.get::<_, i64>(9)? as u64);
-    let updated_at_ms = UnixTimestampMillis(row.get::<_, i64>(10)? as u64);
+    let display_order = row.get::<_, i64>(9)?;
+    let created_at_ms = UnixTimestampMillis(row.get::<_, i64>(10)? as u64);
+    let updated_at_ms = UnixTimestampMillis(row.get::<_, i64>(11)? as u64);
 
     Ok(SessionHistoryRecord {
         session_id,
@@ -800,6 +939,7 @@ fn session_history_record_from_row(
         },
         root_path,
         files_path,
+        display_order,
         created_at_ms,
         updated_at_ms,
     })
@@ -976,6 +1116,146 @@ mod tests {
                 Some("/home/me/project")
             );
         }
+
+        let _ = fs::remove_file(sqlite_state_path_for_state_path(&state_path));
+        let _ = fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn store_persists_session_display_order_across_reopen() {
+        let state_path = std::env::temp_dir().join(format!(
+            "termd-session-order-store-{}.json",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(sqlite_state_path_for_state_path(&state_path));
+        let first_session_id = SessionId::new();
+        let second_session_id = SessionId::new();
+        let third_session_id = SessionId::new();
+
+        {
+            let mut store = ClientHistoryStore::open(&state_path).unwrap();
+            for (index, session_id) in [first_session_id, second_session_id, third_session_id]
+                .into_iter()
+                .enumerate()
+            {
+                store
+                    .record_session_created(
+                        session_id,
+                        SessionState::Running,
+                        TerminalSize::new(24, 80),
+                        Some(&format!("session-{index}")),
+                        "/home/me",
+                        UnixTimestampMillis(1_000 + index as u64),
+                    )
+                    .unwrap();
+            }
+
+            // 新建 session 默认排在列表最前面，避免用户开新 shell 后还要滚动寻找。
+            assert_eq!(
+                store
+                    .list_sessions()
+                    .unwrap()
+                    .into_iter()
+                    .map(|record| record.session_id)
+                    .collect::<Vec<_>>(),
+                vec![third_session_id, second_session_id, first_session_id]
+            );
+
+            let persisted_order = store
+                .record_session_order(
+                    &[first_session_id, third_session_id, second_session_id],
+                    UnixTimestampMillis(2_000),
+                )
+                .unwrap();
+            assert_eq!(
+                persisted_order,
+                vec![first_session_id, third_session_id, second_session_id]
+            );
+        }
+
+        {
+            let store = ClientHistoryStore::open(&state_path).unwrap();
+            assert_eq!(
+                store
+                    .list_sessions()
+                    .unwrap()
+                    .into_iter()
+                    .map(|record| record.session_id)
+                    .collect::<Vec<_>>(),
+                vec![first_session_id, third_session_id, second_session_id]
+            );
+        }
+
+        let _ = fs::remove_file(sqlite_state_path_for_state_path(&state_path));
+        let _ = fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn store_migrates_legacy_session_rows_into_stable_display_order() {
+        let state_path = std::env::temp_dir().join(format!(
+            "termd-session-order-migration-{}.json",
+            std::process::id()
+        ));
+        let sqlite_path = sqlite_state_path_for_state_path(&state_path);
+        let _ = fs::remove_file(&sqlite_path);
+        let old_session_id = SessionId::new();
+        let new_session_id = SessionId::new();
+
+        {
+            let conn = Connection::open(&sqlite_path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE daemon_sessions (
+                    session_id TEXT PRIMARY KEY,
+                    name TEXT,
+                    state TEXT NOT NULL,
+                    rows INTEGER NOT NULL,
+                    cols INTEGER NOT NULL,
+                    pixel_width INTEGER NOT NULL,
+                    pixel_height INTEGER NOT NULL,
+                    root_path TEXT NOT NULL,
+                    files_path TEXT,
+                    created_at_ms INTEGER NOT NULL,
+                    updated_at_ms INTEGER NOT NULL
+                );
+                "#,
+            )
+            .unwrap();
+            conn.execute(
+                r#"
+                INSERT INTO daemon_sessions (
+                    session_id, name, state, rows, cols, pixel_width, pixel_height,
+                    root_path, files_path, created_at_ms, updated_at_ms
+                )
+                VALUES (?1, 'old', 'running', 24, 80, 0, 0, '/home/me', NULL, 1000, 1000)
+                "#,
+                params![session_id_text(old_session_id)],
+            )
+            .unwrap();
+            conn.execute(
+                r#"
+                INSERT INTO daemon_sessions (
+                    session_id, name, state, rows, cols, pixel_width, pixel_height,
+                    root_path, files_path, created_at_ms, updated_at_ms
+                )
+                VALUES (?1, 'new', 'running', 24, 80, 0, 0, '/home/me', NULL, 2000, 2000)
+                "#,
+                params![session_id_text(new_session_id)],
+            )
+            .unwrap();
+        }
+
+        let store = ClientHistoryStore::open(&state_path).unwrap();
+
+        assert_eq!(
+            store
+                .list_sessions()
+                .unwrap()
+                .into_iter()
+                .map(|record| (record.session_id, record.display_order))
+                .collect::<Vec<_>>(),
+            vec![(new_session_id, 0), (old_session_id, 1)]
+        );
 
         let _ = fs::remove_file(sqlite_state_path_for_state_path(&state_path));
         let _ = fs::remove_file(state_path);

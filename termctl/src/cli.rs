@@ -265,8 +265,13 @@ async fn list(args: UrlArgs, state_path: PathBuf) -> Result<()> {
 
     for session in result.sessions {
         println!(
-            "session={} state={} size={}x{}",
+            "session={} name={} state={} size={}x{}",
             session.session_id.0,
+            session
+                .name
+                .as_deref()
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or("-"),
             state_name(session.state),
             session.size.rows,
             session.size.cols

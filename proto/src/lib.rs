@@ -45,6 +45,8 @@ pub enum MessageType {
     SessionResized,
     SessionRename,
     SessionRenamed,
+    SessionReorder,
+    SessionReordered,
     SessionClose,
     SessionClosed,
     SessionFiles,
@@ -631,6 +633,16 @@ pub struct SessionRenamedPayload {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionReorderPayload {
+    pub session_ids: Vec<SessionId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionReorderedPayload {
+    pub session_ids: Vec<SessionId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionClosePayload {
     pub session_id: SessionId,
 }
@@ -854,6 +866,8 @@ mod tests {
             (MessageType::SessionResized, "session_resized"),
             (MessageType::SessionRename, "session_rename"),
             (MessageType::SessionRenamed, "session_renamed"),
+            (MessageType::SessionReorder, "session_reorder"),
+            (MessageType::SessionReordered, "session_reordered"),
             (MessageType::SessionClose, "session_close"),
             (MessageType::SessionClosed, "session_closed"),
             (MessageType::SessionFiles, "session_files"),
@@ -1139,6 +1153,12 @@ mod tests {
         assert_roundtrip(SessionRenamedPayload {
             session_id,
             name: "work shell".to_owned(),
+        });
+        assert_roundtrip(SessionReorderPayload {
+            session_ids: vec![session_id],
+        });
+        assert_roundtrip(SessionReorderedPayload {
+            session_ids: vec![session_id],
         });
         assert_roundtrip(SessionClosePayload { session_id });
         assert_roundtrip(SessionClosedPayload { session_id });

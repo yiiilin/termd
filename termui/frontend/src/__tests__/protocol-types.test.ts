@@ -40,6 +40,8 @@ describe("协议类型", () => {
       "session_resized",
       "session_rename",
       "session_renamed",
+      "session_reorder",
+      "session_reordered",
       "session_close",
       "session_closed",
       "session_files",

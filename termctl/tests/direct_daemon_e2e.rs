@@ -219,6 +219,9 @@ async fn direct_termctl_binary_covers_session_flow_and_invariants() {
     assert!(control_stdout.contains("control_granted"));
     assert!(control_stdout.contains(&session_id));
 
+    // resize owner 只属于当前持有尺寸权的 attach 连接；短连接 CLI resize 需要等旧 attach 释放。
+    drop(attach);
+
     let resize = run_termctl_success(
         &paired_state,
         &[
@@ -233,8 +236,6 @@ async fn direct_termctl_binary_covers_session_flow_and_invariants() {
         ],
     );
     assert!(stdout_string(&resize).contains("size=40x120"));
-
-    drop(attach);
 
     let list_after_detach = run_termctl_success(&paired_state, &["list", "--url", &daemon.url]);
     let list_after_detach_stdout = stdout_string(&list_after_detach);

@@ -7,6 +7,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{self, Read, Write};
+use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as ProcessCommand, Stdio};
@@ -31,6 +32,7 @@ use super::{
 
 const SOCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const SUPERVISOR_SOCKET_REPAIR_INTERVAL: Duration = Duration::from_secs(1);
 const OUTPUT_SIGNAL_INIT: u64 = 0;
 const RETAINED_OUTPUT_MAX_BYTES: usize = 1024 * 1024;
 
@@ -82,10 +84,11 @@ impl SupervisorPtyBackend {
         self.runtime_dir.join(format!("{session_id}.sock"))
     }
 
-    /// 清理当前 supervisor 目录中已经不属于有效 runtime session 的孤儿进程。
+    /// 统计当前 supervisor 目录中已经不属于有效 runtime session 的孤儿进程。
     ///
-    /// 这里按 `--socket-path` 限定目录，再按 `--session-id` 对比有效集合，避免误杀其他 termd 实例。
-    pub fn cleanup_orphaned_supervisors<I, S>(&self, valid_session_ids: I) -> PtyResult<usize>
+    /// 启动恢复阶段只能告警，不能主动杀进程；否则 socket 文件短暂缺失或状态迁移异常时，
+    /// 会把仍在运行的用户 shell 当成垃圾回收掉。
+    pub fn orphaned_supervisor_count<I, S>(&self, valid_session_ids: I) -> PtyResult<usize>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
@@ -97,10 +100,6 @@ impl SupervisorPtyBackend {
         let supervisors = supervisor_processes_from_proc()?;
         let orphan_pids =
             orphaned_supervisor_pids(&self.runtime_dir, &valid_session_ids, &supervisors);
-
-        for pid in &orphan_pids {
-            terminate_process(*pid)?;
-        }
 
         Ok(orphan_pids.len())
     }
@@ -714,26 +713,6 @@ fn orphaned_supervisor_pids(
         .collect()
 }
 
-fn terminate_process(pid: u32) -> PtyResult<()> {
-    if pid == std::process::id() {
-        return Ok(());
-    }
-
-    let pid = i32::try_from(pid)
-        .map_err(|_| PtyError::Backend(format!("invalid supervisor pid {pid}")))?;
-    // 直接调用 kill(2)，避免静态二进制部署时额外依赖系统里的 /bin/kill。
-    let result = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
-    if result == 0 {
-        return Ok(());
-    }
-
-    let error = io::Error::last_os_error();
-    if error.raw_os_error() == Some(libc::ESRCH) {
-        return Ok(());
-    }
-    Err(PtyError::from(error))
-}
-
 fn discover_termd_binary_path() -> PathBuf {
     if let Some(path) = std::env::var_os("CARGO_BIN_EXE_termd").map(PathBuf::from) {
         if path.exists() {
@@ -816,11 +795,6 @@ struct ControllerHandle {
 
 /// supervisor 入口，由主二进制的隐藏子命令调用。
 pub async fn run_session_supervisor(args: SessionSupervisorArgs) -> PtyResult<()> {
-    if let Some(parent) = args.socket_path.parent() {
-        fs::create_dir_all(parent).map_err(PtyError::from)?;
-    }
-    let _ = fs::remove_file(&args.socket_path);
-
     let backend = NonBlockingPortablePtyBackend::new();
     let session = backend.spawn(&args.command, args.size)?;
     let session = Arc::new(Mutex::new(session));
@@ -830,7 +804,7 @@ pub async fn run_session_supervisor(args: SessionSupervisorArgs) -> PtyResult<()
         state: Arc::new(Mutex::new(SupervisorState::new(args.size))),
         shutdown_tx,
     };
-    let listener = UnixListener::bind(&args.socket_path).map_err(PtyError::from)?;
+    let mut listener = bind_supervisor_listener(&args.socket_path, true)?;
 
     if let Some(signal) = {
         let session = shared.session.lock().await;
@@ -840,6 +814,12 @@ pub async fn run_session_supervisor(args: SessionSupervisorArgs) -> PtyResult<()
     }
 
     loop {
+        if let Err(error) = ensure_supervisor_socket_bound(&args.socket_path, &mut listener) {
+            // supervisor 的首要职责是保住 PTY；socket 修复失败只能降级为告警，
+            // 不能让用户正在跑的 shell 因为一个控制面入口文件异常而退出。
+            tracing::warn!(%error, socket_path = %args.socket_path.display(), "failed to repair session supervisor socket");
+        }
+
         tokio::select! {
             biased;
             changed = shutdown_rx.changed() => {
@@ -847,20 +827,61 @@ pub async fn run_session_supervisor(args: SessionSupervisorArgs) -> PtyResult<()
                     break;
                 }
             }
-            accepted = listener.accept() => {
-                let (stream, _) = accepted.map_err(PtyError::from)?;
-                let shared = shared.clone();
-                let expected_session_id = args.session_id.clone();
-                tokio::spawn(async move {
-                    if let Err(error) = handle_supervisor_connection(shared, expected_session_id, stream).await {
-                        tracing::warn!(%error, "session supervisor connection failed");
+            accepted = tokio::time::timeout(SUPERVISOR_SOCKET_REPAIR_INTERVAL, listener.accept()) => {
+                match accepted {
+                    Ok(Ok((stream, _))) => {
+                        let shared = shared.clone();
+                        let expected_session_id = args.session_id.clone();
+                        tokio::spawn(async move {
+                            if let Err(error) = handle_supervisor_connection(shared, expected_session_id, stream).await {
+                                tracing::warn!(%error, "session supervisor connection failed");
+                            }
+                        });
                     }
-                });
+                    Ok(Err(error)) => return Err(PtyError::from(error)),
+                    Err(_) => {}
+                }
             }
         }
     }
 
     let _ = fs::remove_file(&args.socket_path);
+    Ok(())
+}
+
+fn bind_supervisor_listener(socket_path: &Path, remove_existing: bool) -> PtyResult<UnixListener> {
+    if let Some(parent) = socket_path.parent() {
+        fs::create_dir_all(parent).map_err(PtyError::from)?;
+    }
+    if remove_existing {
+        let _ = fs::remove_file(socket_path);
+    }
+    UnixListener::bind(socket_path).map_err(PtyError::from)
+}
+
+fn ensure_supervisor_socket_bound(
+    socket_path: &Path,
+    listener: &mut UnixListener,
+) -> PtyResult<()> {
+    match fs::metadata(socket_path) {
+        Ok(metadata) if metadata.file_type().is_socket() => return Ok(()),
+        Ok(_) => {
+            return Err(PtyError::Backend(format!(
+                "session supervisor socket path exists but is not a socket: {}",
+                socket_path.display()
+            )));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(PtyError::from(error)),
+    }
+
+    // Unix socket 的路径名被外部 unlink 后，已 accept 的连接仍然可用，但新的 daemon
+    // 无法再按路径 attach。重新 bind 同一路径可以保留原 PTY，并恢复后续重连入口。
+    *listener = bind_supervisor_listener(socket_path, false)?;
+    tracing::warn!(
+        socket_path = %socket_path.display(),
+        "session supervisor socket path was missing; rebound listener"
+    );
     Ok(())
 }
 
@@ -1212,7 +1233,7 @@ mod tests {
     }
 
     #[test]
-    fn orphan_cleanup_selects_only_current_runtime_dir_unrecorded_supervisors() {
+    fn orphan_detection_selects_only_current_runtime_dir_unrecorded_supervisors() {
         let runtime_dir = Path::new("/var/lib/termd/termd-supervisors");
         let valid_session_ids = HashSet::from(["kept-session".to_owned()]);
         let supervisors = vec![
@@ -1239,6 +1260,35 @@ mod tests {
         let orphan_pids = orphaned_supervisor_pids(runtime_dir, &valid_session_ids, &supervisors);
 
         assert_eq!(orphan_pids, vec![12]);
+    }
+
+    #[tokio::test]
+    async fn supervisor_listener_rebinds_when_socket_path_is_unlinked() {
+        let socket_path = env::temp_dir().join(format!(
+            "termd-supervisor-rebind-{}-{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        ));
+        let mut listener =
+            bind_supervisor_listener(&socket_path, true).expect("listener should bind");
+        assert!(
+            socket_path.exists(),
+            "initial bind should create the socket path"
+        );
+
+        fs::remove_file(&socket_path).expect("test should unlink socket path");
+        ensure_supervisor_socket_bound(&socket_path, &mut listener)
+            .expect("missing socket path should be rebound");
+
+        let metadata = fs::metadata(&socket_path).expect("socket path should exist after repair");
+        assert!(
+            metadata.file_type().is_socket(),
+            "repair should recreate a unix socket"
+        );
+        let _ = fs::remove_file(socket_path);
     }
 
     #[test]

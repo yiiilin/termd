@@ -83,6 +83,7 @@ export class MockDaemon {
   public readonly sessionCursorUpdates: SessionCursorPayload[] = [];
   public readonly sessionResizes: Array<{ session_id: UUID; size: TerminalSize }> = [];
   public readonly sessionRenames: Array<{ session_id: UUID; name: string }> = [];
+  public readonly sessionReorders: UUID[][] = [];
   public readonly closedSessions: UUID[] = [];
   public readonly sessionFileRequests: Array<{ session_id: UUID; path?: string | null }> = [];
   public readonly sessionFileReadRequests: Array<{ session_id: UUID; path: string }> = [];
@@ -129,6 +130,11 @@ export class MockDaemon {
 
   forgetSession(sessionId: UUID): void {
     this.options.sessions = this.options.sessions.filter((session) => session.session_id !== sessionId);
+  }
+
+  setSessions(sessions: SessionSummaryPayload[]): void {
+    // 测试另一个客户端已经改变 daemon 端权威列表时，当前浏览器下一次刷新必须服从 daemon 顺序。
+    this.options.sessions = sessions;
   }
 
   queueSessionListResponse(sessions: SessionSummaryPayload[], delayMs = 0): void {
@@ -416,6 +422,21 @@ export class MockDaemon {
           session.name = payload.name;
         }
         this.sendInner(connection, envelope("session_renamed", payload));
+        return;
+      }
+      case "session_reorder": {
+        const payload = inner.payload as { session_ids: UUID[] };
+        this.sessionReorders.push(payload.session_ids);
+        const byId = new Map(this.options.sessions.map((session) => [session.session_id, session]));
+        const ordered = payload.session_ids
+          .map((sessionId) => byId.get(sessionId))
+          .filter((session): session is SessionSummaryPayload => Boolean(session));
+        const orderedIds = new Set(ordered.map((session) => session.session_id));
+        this.options.sessions = [
+          ...ordered,
+          ...this.options.sessions.filter((session) => !orderedIds.has(session.session_id)),
+        ];
+        this.sendInner(connection, envelope("session_reordered", { session_ids: this.options.sessions.map((session) => session.session_id) }));
         return;
       }
       case "session_close": {

@@ -173,7 +173,7 @@ export default function App() {
   const connectionAutoRetryAttemptsRef = useRef(0);
   const daemonNetworkSampleRef = useRef<DaemonNetworkCounterSample | undefined>(undefined);
   const isMobileLayout = useMobileLayout();
-  const visualViewportHeight = useVisualViewportHeight(isMobileLayout && activeSurface === "workspace");
+  const visualViewportMetrics = useVisualViewportMetrics(isMobileLayout && activeSurface === "workspace");
 
   useEffect(() => {
     void loadBrowserState().then((loaded) => {
@@ -327,9 +327,11 @@ export default function App() {
       : undefined;
   const appShellStyle = isMobileLayout
     ? ({
-        "--termd-visual-viewport-height": `${visualViewportHeight}px`,
+        "--termd-visual-viewport-height": `${visualViewportMetrics.height}px`,
+        "--termd-visual-viewport-offset-top": `${visualViewportMetrics.offsetTop}px`,
       } as CSSProperties)
     : undefined;
+  const mobileKeyboardOpen = isMobileLayout && activeSurface === "workspace" && visualViewportMetrics.keyboardOpen;
   const canOpenWorkspace = Boolean(activeServer && state.device);
   const canSaveRename = Boolean(renameDraft.trim()) && renameDraft.trim() !== renameOriginalName.trim();
   const activeDaemonLabel =
@@ -797,7 +799,7 @@ export default function App() {
       const list = await client.listSessions();
       const clients = await client.listDaemonClients();
       client.close();
-      const nextOrder = mergeSessionOrder(sessionOrderRef.current, list.sessions);
+      const nextOrder = sessionOrderFromDaemonList(list.sessions);
       sessionOrderRef.current = nextOrder;
       setSessionOrder(nextOrder);
       const orderedSessions = orderSessions(sortSessionsNewestFirst(list.sessions), nextOrder);
@@ -832,7 +834,7 @@ export default function App() {
         try {
           const sessionList = await client.listSessions();
           const clientList = await client.listDaemonClients();
-          const nextOrder = mergeSessionOrder(sessionOrderRef.current, sessionList.sessions);
+          const nextOrder = sessionOrderFromDaemonList(sessionList.sessions);
           sessionOrderRef.current = nextOrder;
           setSessionOrder(nextOrder);
           confirmedSessionSizesRef.current = new Map(sessionList.sessions.map((session) => [session.session_id, session.size]));
@@ -1301,12 +1303,28 @@ export default function App() {
     ],
   );
 
-  const handleReorderSessions = useCallback((sessionIds: UUID[]) => {
-    // 排序是当前浏览器的工作台偏好，不写入 daemon，避免把个人 UI 状态扩展成协议状态。
-    sessionOrderRef.current = sessionIds;
-    setSessionOrder(sessionIds);
-    setSessions((current) => orderSessions(current, sessionIds));
-  }, []);
+  const handleReorderSessions = useCallback(
+    (sessionIds: UUID[]) => {
+      sessionOrderRef.current = sessionIds;
+      setSessionOrder(sessionIds);
+      setSessions((current) => orderSessions(current, sessionIds));
+
+      void (async () => {
+        try {
+          const client = await authenticatedClient();
+          const reordered = await client.reorderSessions(sessionIds);
+          client.close();
+          sessionOrderRef.current = reordered.session_ids;
+          setSessionOrder(reordered.session_ids);
+          setSessions((current) => orderSessions(current, reordered.session_ids));
+        } catch (caught) {
+          setSafeError(caught);
+          void handleRefresh();
+        }
+      })();
+    },
+    [authenticatedClient, handleRefresh, setSafeError],
+  );
 
   const handleForgetOfflineClient = useCallback(
     async (deviceId: UUID) => {
@@ -1630,14 +1648,22 @@ export default function App() {
     [authenticatedSessionClient, loadSessionFiles, sessionFiles?.path],
   );
 
+  const requestMobileTerminalFocus = useCallback(() => {
+    if (isMobileLayout && attachedSessionId) {
+      // 移动端关闭覆盖面板后回到终端输入场景，主动恢复 xterm focus 以保持键盘常驻。
+      setTerminalFocusRequest((request) => request + 1);
+    }
+  }, [attachedSessionId, isMobileLayout]);
+
   const handleHideFiles = useCallback(() => {
     if (isMobileLayout) {
       setMobilePanel(undefined);
       setMobileMenuOpen(false);
+      requestMobileTerminalFocus();
       return;
     }
     setFilesPanelOpen(false);
-  }, [isMobileLayout]);
+  }, [isMobileLayout, requestMobileTerminalFocus]);
 
   const handleToggleMobileMenu = useCallback(() => {
     if (!isMobileLayout || !connectionReady) {
@@ -1667,7 +1693,8 @@ export default function App() {
 
   const handleCloseMobilePanel = useCallback(() => {
     setMobilePanel(undefined);
-  }, []);
+    requestMobileTerminalFocus();
+  }, [requestMobileTerminalFocus]);
 
   const handleFilesPanelResizePointerDown = useCallback(
     (event: ReactPointerEvent<HTMLDivElement>) => {
@@ -1775,6 +1802,7 @@ export default function App() {
         sidebarCollapsed ? "sidebar-is-collapsed" : "",
         connectionReady ? "connection-ready" : "",
         isFilesPanelResizing ? "files-panel-resizing" : "",
+        mobileKeyboardOpen ? "mobile-keyboard-open" : "",
         mobileMenuOpen ? "mobile-menu-open" : "",
         mobilePanel ? `mobile-panel-${mobilePanel}` : "",
       ]
@@ -2378,33 +2406,48 @@ function useMobileLayout(): boolean {
   return isMobileLayout;
 }
 
-function useVisualViewportHeight(enabled: boolean): number {
-  const heightFromWindow = () => {
+function useVisualViewportMetrics(enabled: boolean): { height: number; offsetTop: number; keyboardOpen: boolean } {
+  const metricsFromWindow = () => {
     if (typeof window === "undefined") {
-      return 0;
+      return { height: 0, offsetTop: 0, keyboardOpen: false };
     }
-    return Math.round(window.visualViewport?.height ?? window.innerHeight);
+    const viewport = window.visualViewport;
+    const height = Math.round(viewport?.height ?? window.innerHeight);
+    const offsetTop = Math.round(viewport?.offsetTop ?? 0);
+    const keyboardInset = Math.max(0, Math.round(window.innerHeight - height - offsetTop));
+    // 地址栏收缩也会改变 visualViewport，高度差超过常见工具栏后才按软键盘处理。
+    return { height, offsetTop, keyboardOpen: keyboardInset >= 80 };
   };
-  const [height, setHeight] = useState(heightFromWindow);
+  const [metrics, setMetrics] = useState(metricsFromWindow);
 
   useEffect(() => {
     if (!enabled || typeof window === "undefined") {
       return undefined;
     }
     const viewport = window.visualViewport;
-    const updateHeight = () => setHeight(heightFromWindow());
-    updateHeight();
-    window.addEventListener("resize", updateHeight);
-    viewport?.addEventListener("resize", updateHeight);
-    viewport?.addEventListener("scroll", updateHeight);
+    const updateMetrics = () =>
+      setMetrics((current) => {
+        const next = metricsFromWindow();
+        return current.height === next.height &&
+          current.offsetTop === next.offsetTop &&
+          current.keyboardOpen === next.keyboardOpen
+          ? current
+          : next;
+      });
+    updateMetrics();
+    window.addEventListener("resize", updateMetrics);
+    viewport?.addEventListener("resize", updateMetrics);
+    viewport?.addEventListener("scroll", updateMetrics);
     return () => {
-      window.removeEventListener("resize", updateHeight);
-      viewport?.removeEventListener("resize", updateHeight);
-      viewport?.removeEventListener("scroll", updateHeight);
+      window.removeEventListener("resize", updateMetrics);
+      viewport?.removeEventListener("resize", updateMetrics);
+      viewport?.removeEventListener("scroll", updateMetrics);
     };
   }, [enabled]);
 
-  return height || (typeof window === "undefined" ? 0 : window.innerHeight);
+  return metrics.height
+    ? metrics
+    : { height: typeof window === "undefined" ? 0 : window.innerHeight, offsetTop: 0, keyboardOpen: false };
 }
 
 function clampFilesPanelWidth(width: number, viewportWidth: number): number {
@@ -2799,13 +2842,10 @@ function applyLocalSessionOrder(
   return orderSessions(sessions, sessionOrder);
 }
 
-function mergeSessionOrder(currentOrder: UUID[], sessions: SessionSummaryPayload[]): UUID[] {
-  const remoteIds = sessions.map((session) => session.session_id);
-  const remoteIdSet = new Set(remoteIds);
-  const keptOrder = currentOrder;
-  const keptOrderSet = new Set(keptOrder);
-  // 不因为一次旧 session_list 临时漏项而丢掉用户排序；关闭 session 时会显式删除该 id。
-  return [...keptOrder, ...remoteIds.filter((sessionId) => !keptOrderSet.has(sessionId))];
+function sessionOrderFromDaemonList(sessions: SessionSummaryPayload[]): UUID[] {
+  // session_list 现在由 daemon 按持久化 display_order 返回；刷新时必须把它当权威顺序。
+  // 否则另一个客户端或重启后的新顺序会被当前浏览器里的旧数组覆盖。
+  return sessions.map((session) => session.session_id);
 }
 
 function sessionCreatedAt(session: SessionSummaryPayload): number {
