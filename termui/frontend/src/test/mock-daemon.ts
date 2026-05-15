@@ -151,6 +151,11 @@ export class MockDaemon {
     }
   }
 
+  setSessionFilePosition(sessionId: UUID, path: string): void {
+    // 测试轮询时只改变 daemon 端共享目录，不主动 push，才能确认前端真的发起了下一次 session_files。
+    this.sessionFilePositions.set(sessionId, path);
+  }
+
   pushSessionData(sessionId: UUID, text: string): void {
     for (const connection of this.connections) {
       if (connection.e2ee && connection.attachedSessionIds.has(sessionId)) {

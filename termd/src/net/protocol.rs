@@ -287,6 +287,7 @@ pub struct DaemonProtocol<B: PtyBackend, V> {
     session_index: HashMap<SessionId, String>,
     session_names: HashMap<SessionId, String>,
     session_roots: HashMap<SessionId, PathBuf>,
+    session_terminal_cwds: HashMap<SessionId, PathBuf>,
     session_file_downloads: HashMap<String, SessionFileDownloadGrant>,
     daemon_clients: HashMap<DeviceId, DaemonClientRecord>,
     client_history: ClientHistoryStore,
@@ -381,6 +382,7 @@ where
             session_index: HashMap::new(),
             session_names: HashMap::new(),
             session_roots: HashMap::new(),
+            session_terminal_cwds: HashMap::new(),
             session_file_downloads: HashMap::new(),
             daemon_clients: HashMap::new(),
             client_history,
@@ -991,6 +993,7 @@ where
         self.session_index.remove(&session_id);
         self.session_names.remove(&session_id);
         self.session_roots.remove(&session_id);
+        self.session_terminal_cwds.remove(&session_id);
         self.session_output_history.remove(&session_id);
         self.session_file_tree_signals.remove(&session_id);
         self.session_resize_signals.remove(&session_id);
@@ -1023,7 +1026,7 @@ where
         let requested_path = if has_explicit_path {
             payload.path.clone()
         } else {
-            self.client_history.session_files_path(payload.session_id)?
+            self.default_session_files_path(payload.session_id)?
         };
         let result =
             self.session_files_result(payload.session_id, requested_path, !has_explicit_path)?;
@@ -1777,6 +1780,9 @@ where
         let size = self.runtime_size_proto(internal_session_id)?;
         self.session_output_history_mut(session_id, size)
             .append(&buffer);
+        if self.sync_session_terminal_cwd(session_id)? {
+            self.notify_session_file_tree_changed(session_id);
+        }
         Ok(true)
     }
 
@@ -1809,6 +1815,66 @@ where
             .get(&session_id)
             .map(|history| history.read_from(cursor, max_chunk_bytes))
             .unwrap_or_else(|| (Vec::new(), cursor))
+    }
+
+    fn default_session_files_path(
+        &mut self,
+        session_id: SessionId,
+    ) -> Result<Option<String>, ProtocolError> {
+        self.sync_session_terminal_cwd(session_id)?;
+        if let Some(cwd) = self.session_terminal_cwds.get(&session_id) {
+            return Ok(Some(absolute_path_string(cwd)));
+        }
+
+        self.client_history
+            .session_files_path(session_id)
+            .map_err(ProtocolError::from)
+    }
+
+    fn sync_session_terminal_cwd(&mut self, session_id: SessionId) -> Result<bool, ProtocolError> {
+        let Some(cwd) = self.read_session_terminal_cwd(session_id)? else {
+            return Ok(false);
+        };
+        if self
+            .session_terminal_cwds
+            .get(&session_id)
+            .is_some_and(|cached| cached == &cwd)
+        {
+            return Ok(false);
+        }
+
+        self.session_terminal_cwds.insert(session_id, cwd.clone());
+        self.client_history.record_session_files_path(
+            session_id,
+            &cwd,
+            current_unix_timestamp_millis(),
+        )?;
+        Ok(true)
+    }
+
+    fn read_session_terminal_cwd(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<PathBuf>, ProtocolError> {
+        let Some(internal_session_id) = self.session_index.get(&session_id) else {
+            return Ok(None);
+        };
+        let Some(cwd) = self
+            .runtime
+            .current_working_directory(internal_session_id)
+            .map_err(map_runtime_error)?
+        else {
+            return Ok(None);
+        };
+        let cwd = match cwd.canonicalize() {
+            Ok(cwd) => cwd,
+            Err(error) => {
+                tracing::debug!(%error, session_id = %session_id.0, path = %cwd.display(), "terminal cwd is not readable; keeping previous file tree path");
+                return Ok(None);
+            }
+        };
+
+        Ok(Some(cwd))
     }
 
     fn session_files_result(
@@ -1851,7 +1917,7 @@ where
         if !self.session_index.contains_key(&session_id) {
             return Err(ProtocolError::SessionNotFound);
         }
-        let requested_path = self.client_history.session_files_path(session_id)?;
+        let requested_path = self.default_session_files_path(session_id)?;
         let payload = self.session_files_result(session_id, requested_path, true)?;
         envelope_value(MessageType::SessionFilesResult, payload)
     }
@@ -3427,9 +3493,13 @@ fn resolve_existing_session_file_target(
     } else {
         root.join(requested)
     };
+    let root_scoped =
+        session_file_request_is_root_scoped(root, &candidate, requested.is_absolute())?;
 
     let target = candidate.canonicalize().map_err(map_file_path_error)?;
-    ensure_path_inside_root(root, &target)?;
+    if root_scoped {
+        ensure_path_inside_root(root, &target)?;
+    }
     Ok(target)
 }
 
@@ -3448,6 +3518,8 @@ fn resolve_writable_session_file_target(
     } else {
         root.join(requested)
     };
+    let root_scoped =
+        session_file_request_is_root_scoped(root, &candidate, requested.is_absolute())?;
     let Some(file_name) = candidate.file_name() else {
         return Err(ProtocolError::InvalidEnvelope);
     };
@@ -3455,13 +3527,17 @@ fn resolve_writable_session_file_target(
         return Err(ProtocolError::InvalidEnvelope);
     };
     let parent = parent.canonicalize().map_err(map_file_path_error)?;
-    ensure_path_inside_root(root, &parent)?;
+    if root_scoped {
+        ensure_path_inside_root(root, &parent)?;
+    }
     let target = parent.join(file_name);
     match fs::symlink_metadata(&target) {
         Ok(_) => {
             // 写入会跟随 symlink；已存在目标必须先解析真实路径，避免 root 内 symlink 写到 root 外。
             let real_target = target.canonicalize().map_err(map_file_path_error)?;
-            ensure_path_inside_root(root, &real_target)?;
+            if root_scoped {
+                ensure_path_inside_root(root, &real_target)?;
+            }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(map_file_path_error(error)),
@@ -3470,9 +3546,23 @@ fn resolve_writable_session_file_target(
     Ok(target)
 }
 
+fn session_file_request_is_root_scoped(
+    root: &Path,
+    candidate: &Path,
+    requested_absolute: bool,
+) -> Result<bool, ProtocolError> {
+    if !requested_absolute {
+        return Ok(true);
+    }
+    let root = root.canonicalize().map_err(map_file_path_error)?;
+    // 绝对路径如果本来就在 session root 内，仍按 root 沙箱处理；终端 cwd 跑到 root 外时，
+    // daemon 会传入 root 外绝对路径，这类路径由已 attach 的可信设备显式访问。
+    Ok(candidate.starts_with(&root))
+}
+
 fn ensure_path_inside_root(root: &Path, target: &Path) -> Result<(), ProtocolError> {
     let root = root.canonicalize().map_err(map_file_path_error)?;
-    // 文件面板是 session 工作目录视图；即使客户端传绝对路径或 symlink，也不能越过 root。
+    // root 作用于相对路径和 root 内绝对路径，避免 `..` 或 root 内 symlink 意外逃逸。
     if target.starts_with(&root) {
         return Ok(());
     }
@@ -3706,8 +3796,8 @@ mod tests {
     use termd_proto::{
         PairAcceptPayload, PairingToken, PublicKey, SessionFileDeletePayload,
         SessionFileDeletedPayload, SessionFileKind, SessionFileReadPayload,
-        SessionFileWritePayload, SessionFileWrittenPayload, SessionFilesPayload,
-        SessionFilesResultPayload, Signature,
+        SessionFileReadResultPayload, SessionFileWritePayload, SessionFileWrittenPayload,
+        SessionFilesPayload, SessionFilesResultPayload, Signature,
     };
 
     use super::*;
@@ -3731,6 +3821,7 @@ mod tests {
     struct FakePtyState {
         outputs: VecDeque<Vec<u8>>,
         outputs_by_session: HashMap<String, VecDeque<Vec<u8>>>,
+        cwd_by_session: HashMap<String, PathBuf>,
         writes: Vec<Vec<u8>>,
         reconnects: Vec<String>,
         reconnect_error: Option<String>,
@@ -3751,6 +3842,14 @@ mod tests {
                 .entry(session_id.0.to_string())
                 .or_default()
                 .push_back(bytes.into());
+        }
+
+        fn set_cwd_for_session(&self, session_id: SessionId, cwd: impl Into<PathBuf>) {
+            self.state
+                .lock()
+                .unwrap()
+                .cwd_by_session
+                .insert(session_id.0.to_string(), cwd.into());
         }
 
         fn writes(&self) -> Vec<Vec<u8>> {
@@ -3885,6 +3984,16 @@ mod tests {
 
         fn process_id(&self) -> Option<u32> {
             Some(7)
+        }
+
+        fn current_working_directory(&self) -> Option<PathBuf> {
+            let session_id = self.session_id.as_ref()?;
+            self.state
+                .lock()
+                .unwrap()
+                .cwd_by_session
+                .get(session_id)
+                .cloned()
         }
     }
 
@@ -6482,6 +6591,175 @@ mod tests {
     }
 
     #[test]
+    fn session_files_without_path_prefers_terminal_cwd_over_persisted_file_tree_position() {
+        let base = temp_state_path("shared-files-cwd-base");
+        let root = base.join("project");
+        let manual = root.join("manual");
+        let terminal_cwd = root.join("terminal-cwd");
+        fs::create_dir_all(&manual).unwrap();
+        fs::create_dir_all(&terminal_cwd).unwrap();
+        fs::write(manual.join("manual.txt"), b"manual\n").unwrap();
+        fs::write(terminal_cwd.join("cwd.txt"), b"cwd\n").unwrap();
+        let backend = FakePtyBackend::default();
+        let mut config =
+            DaemonConfig::default_for_state_path(temp_state_path("shared-files-cwd-state.json"));
+        config.default_command = vec!["sh".to_owned()];
+        config.default_working_directory = Some(root.clone());
+        let mut protocol =
+            DaemonProtocol::new(config, backend.clone(), Ed25519SignatureVerifier).unwrap();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = PublicKey(wire(signing_key.verifying_key().as_bytes()));
+        let (_, mut device_session) = open_e2ee(&mut protocol, &mut connection, device_id);
+        pair_device(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            device_id,
+            public_key,
+        );
+        let create_responses = send_encrypted(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            envelope_value(
+                MessageType::SessionCreate,
+                SessionCreatePayload {
+                    command: Vec::new(),
+                    size: TerminalSize::new(24, 80),
+                },
+            )
+            .unwrap(),
+        );
+        let created = decrypt_first(&mut device_session, create_responses);
+        let created_payload: SessionCreatedPayload = decode_payload(created.payload).unwrap();
+
+        let manual_responses = send_encrypted(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            envelope_value(
+                MessageType::SessionFiles,
+                SessionFilesPayload {
+                    session_id: created_payload.session_id,
+                    path: Some(manual.to_string_lossy().to_string()),
+                },
+            )
+            .unwrap(),
+        );
+        let manual_listed = decrypt_first(&mut device_session, manual_responses);
+        assert_eq!(manual_listed.kind, MessageType::SessionFilesResult);
+
+        backend.set_cwd_for_session(created_payload.session_id, terminal_cwd.clone());
+        let cwd_responses = send_encrypted(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            envelope_value(
+                MessageType::SessionFiles,
+                SessionFilesPayload {
+                    session_id: created_payload.session_id,
+                    path: None,
+                },
+            )
+            .unwrap(),
+        );
+        let cwd_listed = decrypt_first(&mut device_session, cwd_responses);
+        let cwd_payload: SessionFilesResultPayload = decode_payload(cwd_listed.payload).unwrap();
+
+        assert_eq!(cwd_listed.kind, MessageType::SessionFilesResult);
+        assert_eq!(cwd_payload.path, terminal_cwd.to_string_lossy());
+        assert!(
+            cwd_payload
+                .entries
+                .iter()
+                .any(|entry| entry.name == "cwd.txt")
+        );
+        assert!(
+            !cwd_payload
+                .entries
+                .iter()
+                .any(|entry| entry.name == "manual.txt")
+        );
+
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn session_files_without_path_follows_terminal_cwd_outside_initial_root() {
+        let base = temp_state_path("shared-files-cwd-outside-base");
+        let root = base.join("project");
+        let terminal_cwd = base.join("outside-cwd");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&terminal_cwd).unwrap();
+        fs::write(terminal_cwd.join("outside.txt"), b"cwd outside root\n").unwrap();
+        let backend = FakePtyBackend::default();
+        let mut config = DaemonConfig::default_for_state_path(temp_state_path(
+            "shared-files-cwd-outside-state.json",
+        ));
+        config.default_command = vec!["sh".to_owned()];
+        config.default_working_directory = Some(root.clone());
+        let mut protocol =
+            DaemonProtocol::new(config, backend.clone(), Ed25519SignatureVerifier).unwrap();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = PublicKey(wire(signing_key.verifying_key().as_bytes()));
+        let (_, mut device_session) = open_e2ee(&mut protocol, &mut connection, device_id);
+        pair_device(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            device_id,
+            public_key,
+        );
+        let create_responses = send_encrypted(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            envelope_value(
+                MessageType::SessionCreate,
+                SessionCreatePayload {
+                    command: Vec::new(),
+                    size: TerminalSize::new(24, 80),
+                },
+            )
+            .unwrap(),
+        );
+        let created = decrypt_first(&mut device_session, create_responses);
+        let created_payload: SessionCreatedPayload = decode_payload(created.payload).unwrap();
+
+        backend.set_cwd_for_session(created_payload.session_id, terminal_cwd.clone());
+        let cwd_responses = send_encrypted(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            envelope_value(
+                MessageType::SessionFiles,
+                SessionFilesPayload {
+                    session_id: created_payload.session_id,
+                    path: None,
+                },
+            )
+            .unwrap(),
+        );
+        let cwd_listed = decrypt_first(&mut device_session, cwd_responses);
+        let cwd_payload: SessionFilesResultPayload = decode_payload(cwd_listed.payload).unwrap();
+
+        assert_eq!(cwd_listed.kind, MessageType::SessionFilesResult);
+        assert_eq!(cwd_payload.path, terminal_cwd.to_string_lossy());
+        assert!(
+            cwd_payload
+                .entries
+                .iter()
+                .any(|entry| entry.name == "outside.txt")
+        );
+
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
     fn attached_connection_receives_file_tree_update_when_another_client_changes_directory() {
         let base = temp_state_path("shared-files-push-base");
         let root = base.join("project");
@@ -6560,7 +6838,7 @@ mod tests {
             .unwrap(),
         );
         let listed = decrypt_first(&mut first_crypto, list_responses);
-        assert_eq!(listed.kind, MessageType::Error);
+        assert_eq!(listed.kind, MessageType::SessionFilesResult);
 
         let pushed = second_connection
             .read_session_file_tree_update(&mut protocol, created_payload.session_id);
@@ -6568,7 +6846,102 @@ mod tests {
         let pushed_payload: SessionFilesResultPayload = decode_payload(pushed.payload).unwrap();
 
         assert_eq!(pushed.kind, MessageType::SessionFilesResult);
-        assert_eq!(pushed_payload.path, root.to_string_lossy());
+        assert_eq!(pushed_payload.path, work.to_string_lossy());
+
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn terminal_output_pushes_file_tree_update_when_terminal_cwd_changes() {
+        let base = temp_state_path("terminal-cwd-push-base");
+        let root = base.join("project");
+        let work = root.join("work");
+        fs::create_dir_all(&work).unwrap();
+        fs::write(work.join("from-cwd.txt"), b"cwd\n").unwrap();
+        let backend = FakePtyBackend::default();
+        let mut config =
+            DaemonConfig::default_for_state_path(temp_state_path("terminal-cwd-push-state.json"));
+        config.default_command = vec!["sh".to_owned()];
+        config.default_working_directory = Some(root.clone());
+        let mut protocol =
+            DaemonProtocol::new(config, backend.clone(), Ed25519SignatureVerifier).unwrap();
+        let (mut first_connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = PublicKey(wire(signing_key.verifying_key().as_bytes()));
+        let (_, mut first_crypto) = open_e2ee(&mut protocol, &mut first_connection, device_id);
+        pair_device(
+            &mut protocol,
+            &mut first_connection,
+            &mut first_crypto,
+            device_id,
+            public_key,
+        );
+        let create_responses = send_encrypted(
+            &mut protocol,
+            &mut first_connection,
+            &mut first_crypto,
+            envelope_value(
+                MessageType::SessionCreate,
+                SessionCreatePayload {
+                    command: Vec::new(),
+                    size: TerminalSize::new(24, 80),
+                },
+            )
+            .unwrap(),
+        );
+        let created = decrypt_first(&mut first_crypto, create_responses);
+        let created_payload: SessionCreatedPayload = decode_payload(created.payload).unwrap();
+
+        let (mut second_connection, _) = protocol.start_connection();
+        let mut second_crypto = authenticate_paired_connection(
+            &mut protocol,
+            &mut second_connection,
+            device_id,
+            &signing_key,
+        );
+        let attach_responses = send_encrypted(
+            &mut protocol,
+            &mut second_connection,
+            &mut second_crypto,
+            envelope_value(
+                MessageType::SessionAttach,
+                SessionAttachPayload {
+                    session_id: created_payload.session_id,
+                },
+            )
+            .unwrap(),
+        );
+        let attached = decrypt_first(&mut second_crypto, attach_responses);
+        assert_eq!(attached.kind, MessageType::SessionAttached);
+        let mut file_tree_signal = second_connection
+            .attached_file_tree_signals(&protocol)
+            .into_iter()
+            .find(|(session_id, _)| *session_id == created_payload.session_id)
+            .map(|(_, signal)| signal)
+            .expect("attached connection should subscribe to file tree changes");
+        file_tree_signal.borrow_and_update();
+
+        backend.set_cwd_for_session(created_payload.session_id, work.clone());
+        backend.push_output_for_session(created_payload.session_id, b"$ ");
+        let output_responses =
+            first_connection.read_session_output(&mut protocol, created_payload.session_id, 4096);
+        assert!(!output_responses.is_empty());
+        assert!(file_tree_signal.has_changed().unwrap());
+
+        let pushed = second_connection
+            .read_session_file_tree_update(&mut protocol, created_payload.session_id);
+        let pushed = decrypt_first(&mut second_crypto, pushed);
+        let pushed_payload: SessionFilesResultPayload = decode_payload(pushed.payload).unwrap();
+
+        assert_eq!(pushed.kind, MessageType::SessionFilesResult);
+        assert_eq!(pushed_payload.path, work.to_string_lossy());
+        assert!(
+            pushed_payload
+                .entries
+                .iter()
+                .any(|entry| entry.name == "from-cwd.txt")
+        );
 
         fs::remove_dir_all(base).ok();
     }
@@ -6900,7 +7273,16 @@ mod tests {
             .unwrap(),
         );
         let read = decrypt_first(&mut device_session, read_responses);
-        assert_eq!(read.kind, MessageType::Error);
+        let read_payload: SessionFileReadResultPayload = decode_payload(read.payload).unwrap();
+        assert_eq!(read.kind, MessageType::SessionFileReadResult);
+        assert_eq!(
+            read_payload.path,
+            outside.join("readme.txt").to_string_lossy()
+        );
+        assert_eq!(
+            read_payload.data_base64,
+            general_purpose::STANDARD.encode(b"outside file\n")
+        );
 
         let upload_path = root.join("upload.txt");
         let write_responses = send_encrypted(

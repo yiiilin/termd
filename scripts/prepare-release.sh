@@ -81,8 +81,9 @@ for package_json in (pathlib.Path("termui/frontend/package.json"), pathlib.Path(
     package_json.write_text(json.dumps(data, indent=2) + "\n")
 PY
 
-# workspace.package.version 变化后必须同步 Cargo.lock，否则 --locked 验证会正确失败。
-cargo metadata --locked --no-deps >/dev/null 2>&1 || cargo generate-lockfile
+# workspace.package.version 变化后必须同步 Cargo.lock；`cargo metadata --locked`
+# 不总能捕捉这个差异，后续 `cargo test --locked` 会正确失败，所以这里直接重生成。
+cargo generate-lockfile
 
 notes_file="$(mktemp)"
 trap 'rm -f "$notes_file"' EXIT
@@ -108,6 +109,7 @@ fi
 
 git diff --check
 git add \
+  .gitignore \
   .github/workflows/release.yml \
   Cargo.lock \
   Cargo.toml \
@@ -116,14 +118,22 @@ git add \
   scripts/install-termd.sh \
   scripts/test-installers.sh \
   termd/src/net/protocol.rs \
+  termd/src/net/pty_bridge.rs \
   termd/src/net/server.rs \
+  termd/src/pty/mod.rs \
+  termd/src/pty/portable.rs \
+  termd/src/pty/supervisor.rs \
+  termd/src/runtime/mod.rs \
+  termd/tests/session_supervisor.rs \
   termui/frontend/package.json \
   termui/frontend/package-lock.json \
   termui/frontend/src/App.tsx \
   termui/frontend/src/__tests__/app.test.tsx \
   termui/frontend/src/__tests__/terminal-pane.test.tsx \
+  termui/frontend/src/components/SessionFilesPanel.tsx \
   termui/frontend/src/components/TerminalPane.tsx \
-  termui/frontend/src/styles.css
+  termui/frontend/src/styles.css \
+  termui/frontend/src/test/mock-daemon.ts
 
 git diff --cached --quiet && die "no staged release changes"
 git commit -m "Release ${version}"

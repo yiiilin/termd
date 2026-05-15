@@ -342,6 +342,29 @@ pub trait PtySession: Send {
 
     /// 返回本地子进程 id；不适用的平台可以返回 None。
     fn process_id(&self) -> Option<u32>;
+
+    /// 返回 PTY 主进程当前工作目录。
+    ///
+    /// 这个能力用于让文件面板跟随交互 shell 的 `cd`；不支持的平台或权限受限时返回 `None`，
+    /// 上层会回退到已保存的文件面板路径。
+    fn current_working_directory(&self) -> Option<PathBuf> {
+        None
+    }
+}
+
+/// Linux 上通过 `/proc/<pid>/cwd` 读取 shell 当前目录；其他平台先降级为不可用。
+pub(crate) fn current_working_directory_for_pid(pid: u32) -> Option<PathBuf> {
+    platform_current_working_directory_for_pid(pid)
+}
+
+#[cfg(target_os = "linux")]
+fn platform_current_working_directory_for_pid(pid: u32) -> Option<PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn platform_current_working_directory_for_pid(_pid: u32) -> Option<PathBuf> {
+    None
 }
 
 #[cfg(test)]

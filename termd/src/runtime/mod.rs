@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::sync::watch;
@@ -331,6 +332,15 @@ impl<B: PtyBackend> SessionRuntime<B> {
     /// 查询底层进程 id；fake backend 或不支持的平台可以返回 None。
     pub fn process_id(&self, session_id: &str) -> RuntimeResult<Option<u32>> {
         Ok(self.runtime_session(session_id)?.pty.process_id())
+    }
+
+    /// 查询底层交互进程当前工作目录；平台不支持时返回 `None`。
+    pub fn current_working_directory(&self, session_id: &str) -> RuntimeResult<Option<PathBuf>> {
+        self.ensure_open_session(session_id)?;
+        Ok(self
+            .runtime_session(session_id)?
+            .pty
+            .current_working_directory())
     }
 
     /// 读取 supervisor 的最近快照。

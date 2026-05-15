@@ -207,6 +207,11 @@ impl PtySession for NonBlockingPortablePtySession {
     fn process_id(&self) -> Option<u32> {
         self.child.process_id()
     }
+
+    fn current_working_directory(&self) -> Option<std::path::PathBuf> {
+        self.process_id()
+            .and_then(crate::pty::current_working_directory_for_pid)
+    }
 }
 
 #[cfg(test)]

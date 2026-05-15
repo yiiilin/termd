@@ -50,6 +50,7 @@ interface TerminalPaneProps {
   sessionSize?: TerminalSize;
   focusRequest?: number;
   mobileInputMode?: boolean;
+  mobileKeyboardOpen?: boolean;
   resizeEnabled?: boolean;
   outputResetVersion: number;
   takeOutput: () => Uint8Array[];
@@ -1291,7 +1292,7 @@ export function TerminalPane(props: TerminalPaneProps) {
           </div>
         </div>
       </div>
-      {props.attached && props.mobileInputMode ? (
+      {props.attached && props.mobileInputMode && props.mobileKeyboardOpen ? (
         <div
           className="terminal-mobile-shortcuts"
           aria-label="mobile terminal shortcuts"

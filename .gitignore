@@ -36,3 +36,4 @@ coverage/
 # 系统 / 编辑器噪声。
 .DS_Store
 Thumbs.db
+.gstack/

@@ -7,10 +7,12 @@ interface SessionFilesPanelProps {
   files?: SessionFilesResultPayload;
   loading: boolean;
   error?: SafeError;
+  followTerminalCwd: boolean;
   onOpenDirectory: (path: string) => void;
   onOpenFile: (entry: SessionFileEntryPayload) => void;
   onGoToPath: (path: string) => void;
   onRefresh: () => void;
+  onFollowTerminalCwdChange: (follow: boolean) => void;
   onUpload: (file: globalThis.File) => void;
   onDownload: (entry: SessionFileEntryPayload) => void;
   onDelete: (entry: SessionFileEntryPayload) => void;
@@ -22,10 +24,12 @@ export function SessionFilesPanel({
   files,
   loading,
   error,
+  followTerminalCwd,
   onOpenDirectory,
   onOpenFile,
   onGoToPath,
   onRefresh,
+  onFollowTerminalCwdChange,
   onUpload,
   onDownload,
   onDelete,
@@ -146,6 +150,17 @@ export function SessionFilesPanel({
             ))
           : null}
       </div>
+      <footer className="files-follow-footer">
+        <label className="files-follow-toggle">
+          <input
+            type="checkbox"
+            checked={followTerminalCwd}
+            disabled={!attachedSessionId}
+            onChange={(event) => onFollowTerminalCwdChange(event.currentTarget.checked)}
+          />
+          <span>Follow terminal cwd</span>
+        </label>
+      </footer>
     </aside>
   );
 }

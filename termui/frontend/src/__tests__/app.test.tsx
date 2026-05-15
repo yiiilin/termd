@@ -416,11 +416,13 @@ describe("termui web 工作台", () => {
     expect(css).toContain("--daemon-status-memory-width: 132px;");
     expect(css).toContain("--daemon-status-network-width: 150px;");
     expect(css).toContain("--daemon-status-disk-width: 150px;");
-    expect(css).toContain("--daemon-status-load-width: 122px;");
-    expect(css).toContain("--daemon-status-uptime-width: 132px;");
-    expect(css).toContain("grid-template-columns: auto auto minmax(0, 1fr);");
-    expect(css).toContain("grid-template-columns:\n    var(--daemon-status-cpu-width)");
-    expect(css).toContain("flex: 0 0 var(--daemon-status-network-width);");
+    expect(css).toContain("--daemon-status-load-width: 132px;");
+    expect(css).toContain("--daemon-status-uptime-width: 122px;");
+    expect(css).toContain("grid-template-columns: max-content minmax(0, 1fr);");
+    expect(css).toContain("flex: 0 0 var(--daemon-status-memory-width);");
+    expect(css).toContain("flex-basis: var(--daemon-status-cpu-width);");
+    expect(css).toContain("flex-basis: var(--daemon-status-disk-width);");
+    expect(css).toContain(".daemon-status-strip .daemon-status-load {\n    display: none;");
     expect(css).toContain("justify-content: start;");
   });
 
@@ -431,6 +433,7 @@ describe("termui web 工作台", () => {
     expect(css).toContain("max-width: min(100vw, 100dvw);");
     expect(css).toContain(".daemon-status-strip {\n    width: 100%;");
     expect(css).toContain(".daemon-status-strip .daemon-status-grid {\n    width: 100%;");
+    expect(css).toContain("display: grid;\n    grid-template-columns:\n      minmax(56px, 0.75fr)");
     expect(css).toContain(".terminal-mobile-shortcuts {\n    width: 100%;");
   });
 
@@ -823,6 +826,20 @@ describe("termui web 工作台", () => {
       "daemon-status-strip",
     );
     expect(screen.getByLabelText("mobile terminal shortcuts")).toBeInTheDocument();
+  });
+
+  it("移动端软键盘未打开时隐藏快捷键栏", async () => {
+    setViewportWidth(390);
+    const user = userEvent.setup();
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await screen.findByText(/termd-e2e-ready/);
+
+    const shell = document.querySelector<HTMLElement>(".app-shell");
+    expect(shell).not.toHaveClass("mobile-keyboard-open");
+    expect(screen.queryByLabelText("mobile terminal shortcuts")).toBeNull();
   });
 
   it("未保存 daemon 时手动 token 不会猜测 server_id", async () => {
@@ -1350,12 +1367,18 @@ describe("termui web 工作台", () => {
     await within(panel).findByText("src");
     await within(panel).findByText("alpha.txt");
     expect(within(panel).getByText("12 B")).toBeInTheDocument();
-    expect(daemon.sessionFileRequests).toEqual([{ session_id: sessionId }]);
+    expect(daemon.sessionFileRequests[0]).toEqual({ session_id: sessionId });
+
+    const followToggle = within(panel).getByLabelText("Follow terminal cwd") as HTMLInputElement;
+    expect(followToggle).toBeChecked();
 
     const fileRequestCountBeforeRefresh = daemon.sessionFileRequests.length;
     await user.click(within(panel).getByRole("button", { name: "Refresh files" }));
     await waitFor(() => expect(daemon.sessionFileRequests.length).toBeGreaterThan(fileRequestCountBeforeRefresh));
-    expect(daemon.sessionFileRequests).toContainEqual({ session_id: sessionId, path: "/home/me/project" });
+    expect(daemon.sessionFileRequests.slice(fileRequestCountBeforeRefresh)).toContainEqual({ session_id: sessionId });
+
+    await user.click(followToggle);
+    expect(followToggle).not.toBeChecked();
 
     await user.click(within(panel).getByRole("button", { name: "Open src" }));
     await within(panel).findByText("main.rs");
@@ -1442,6 +1465,74 @@ describe("termui web 工作台", () => {
         text: "uploaded web file\n",
       });
     });
+  });
+
+  it("文件 panel 默认每秒跟随终端 cwd，并可关闭跟随", async () => {
+    const user = userEvent.setup();
+    const sessionId = "00000000-0000-0000-0000-000000000414";
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [
+        {
+          session_id: sessionId,
+          state: "running",
+          size: { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 },
+        },
+      ],
+      sessionFiles: {
+        [sessionId]: {
+          session_id: sessionId,
+          path: "/home/me",
+          entries: [],
+        },
+        "/tmp/work": {
+          session_id: sessionId,
+          path: "/tmp/work",
+          entries: [
+            {
+              name: "beta.log",
+              path: "/tmp/work/beta.log",
+              kind: "file",
+              size_bytes: 4,
+              modified_at_ms: null,
+            },
+          ],
+        },
+      },
+    });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await user.click(screen.getByRole("button", { name: "Refresh" }));
+    await clickSessionCard(user);
+
+    const panel = await screen.findByLabelText("session files");
+    await waitFor(() => expect(within(panel).getByLabelText("Current directory")).toHaveValue("/home/me"));
+    const followToggle = within(panel).getByLabelText("Follow terminal cwd") as HTMLInputElement;
+    expect(followToggle).toBeChecked();
+
+    const requestCountBeforeCwdChange = daemon.sessionFileRequests.length;
+    daemon.setSessionFilePosition(sessionId, "/tmp/work");
+    await waitFor(
+      () => {
+        expect(daemon.sessionFileRequests.slice(requestCountBeforeCwdChange)).toContainEqual({
+          session_id: sessionId,
+        });
+      },
+      { timeout: 2500 },
+    );
+    await within(panel).findByText("beta.log");
+    expect(within(panel).getByLabelText("Current directory")).toHaveValue("/tmp/work");
+
+    await user.click(followToggle);
+    expect(followToggle).not.toBeChecked();
+    const requestCountAfterDisable = daemon.sessionFileRequests.length;
+    daemon.setSessionFilePosition(sessionId, "/home/me");
+    await new Promise((resolve) => window.setTimeout(resolve, 1200));
+    expect(daemon.sessionFileRequests).toHaveLength(requestCountAfterDisable);
+    expect(within(panel).getByLabelText("Current directory")).toHaveValue("/tmp/work");
   });
 
   it("重新 attach session 时恢复该 session 的文件树目录", async () => {
@@ -1958,6 +2049,7 @@ describe("termui web 工作台", () => {
   it("移动端键盘上方快捷按钮会发送常用控制字符", async () => {
     const user = userEvent.setup();
     setViewportWidth(390);
+    setMobileVisualViewport(820, 460, 20);
     render(<App />);
 
     await pairWithInvite(user, daemon);

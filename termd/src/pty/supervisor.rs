@@ -524,6 +524,11 @@ impl PtySession for SupervisorPtySession {
             .lock()
             .expect("cached pid mutex poisoned")
     }
+
+    fn current_working_directory(&self) -> Option<PathBuf> {
+        self.process_id()
+            .and_then(super::current_working_directory_for_pid)
+    }
 }
 
 fn restore_info_with_status(

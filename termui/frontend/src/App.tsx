@@ -67,6 +67,7 @@ const MAX_FILES_PANEL_WIDTH = 640;
 const FILES_PANEL_RESIZER_WIDTH = 10;
 const CONNECTION_AUTO_RETRY_DELAY_MS = 1000;
 const CONNECTION_AUTO_RETRY_LIMIT = 3;
+const FILES_CWD_FOLLOW_POLL_INTERVAL_MS = 1000;
 const TEXT_FILE_EDITOR_MAX_BYTES = 1024 * 1024;
 const FILE_TRANSFER_MEMORY_FALLBACK_MAX_BYTES = 16 * 1024 * 1024;
 const FILE_DOWNLOAD_CHUNK_BYTES = 256 * 1024;
@@ -120,6 +121,7 @@ export default function App() {
   const [sessionFiles, setSessionFiles] = useState<SessionFilesResultPayload | undefined>();
   const [sessionFilesLoading, setSessionFilesLoading] = useState(false);
   const [sessionFilesError, setSessionFilesError] = useState<SafeError | undefined>();
+  const [sessionFilesFollowTerminalCwd, setSessionFilesFollowTerminalCwd] = useState(true);
   const [fileEditor, setFileEditor] = useState<{
     path: string;
     name: string;
@@ -758,9 +760,12 @@ export default function App() {
   );
 
   const loadSessionFiles = useCallback(
-    async (sessionId: UUID, path?: string) => {
-      setSessionFilesLoading(true);
-      setSessionFilesError(undefined);
+    async (sessionId: UUID, path?: string, options: { silent?: boolean } = {}) => {
+      const silent = Boolean(options.silent);
+      if (!silent) {
+        setSessionFilesLoading(true);
+        setSessionFilesError(undefined);
+      }
       const attachedClient = attachClientRef.current;
       if (attachedSessionRef.current === sessionId && attachedClient) {
         try {
@@ -769,9 +774,11 @@ export default function App() {
           await attachedClient.requestSessionFiles(sessionId, path);
           return;
         } catch (caught) {
-          setSessionFiles(undefined);
-          setSessionFilesError(toSafeError(caught));
-          setSessionFilesLoading(false);
+          if (!silent) {
+            setSessionFiles(undefined);
+            setSessionFilesError(toSafeError(caught));
+            setSessionFilesLoading(false);
+          }
           return;
         }
       }
@@ -781,13 +788,18 @@ export default function App() {
         // 文件树当前位置是 daemon 端 session 共享状态；不传 path 时由 daemon 返回当前共享目录。
         const files = await client.listSessionFiles(sessionId, path);
         setSessionFiles(files);
+        setSessionFilesError(undefined);
       } catch (caught) {
-        // 文件列表是终端旁路信息；失败时只收敛到右侧 panel，不打断已 attach 的终端会话。
-        setSessionFiles(undefined);
-        setSessionFilesError(toSafeError(caught));
+        if (!silent) {
+          // 文件列表是终端旁路信息；失败时只收敛到右侧 panel，不打断已 attach 的终端会话。
+          setSessionFiles(undefined);
+          setSessionFilesError(toSafeError(caught));
+        }
       } finally {
         client?.close();
-        setSessionFilesLoading(false);
+        if (!silent) {
+          setSessionFilesLoading(false);
+        }
       }
     },
     [authenticatedSessionClient],
@@ -1481,6 +1493,24 @@ export default function App() {
     return () => window.clearInterval(timer);
   }, [connectionReady, loadDaemonStatus]);
 
+  useEffect(() => {
+    if (!attachedSessionId || !connectionReady || !sessionFilesFollowTerminalCwd || sessionFilesLoading) {
+      return undefined;
+    }
+
+    const refreshFromTerminalCwd = () => {
+      const sessionId = attachedSessionRef.current;
+      if (!sessionId) {
+        return;
+      }
+      // 跟随模式必须不传 path；daemon 会按当前 PTY cwd 返回文件树位置。
+      void loadSessionFiles(sessionId, undefined, { silent: true });
+    };
+
+    const timer = window.setInterval(refreshFromTerminalCwd, FILES_CWD_FOLLOW_POLL_INTERVAL_MS);
+    return () => window.clearInterval(timer);
+  }, [attachedSessionId, connectionReady, loadSessionFiles, sessionFilesFollowTerminalCwd, sessionFilesLoading]);
+
   const handleOpenDirectory = useCallback(
     (path: string) => {
       const sessionId = attachedSessionRef.current;
@@ -1508,8 +1538,8 @@ export default function App() {
     if (!sessionId) {
       return;
     }
-    void loadSessionFiles(sessionId, sessionFiles?.path);
-  }, [loadSessionFiles, sessionFiles?.path]);
+    void loadSessionFiles(sessionId, sessionFilesFollowTerminalCwd ? undefined : sessionFiles?.path);
+  }, [loadSessionFiles, sessionFiles?.path, sessionFilesFollowTerminalCwd]);
 
   const handleUploadFile = useCallback(
     async (file: File) => {
@@ -2059,6 +2089,7 @@ export default function App() {
                 sessionSize={attachedSession?.size}
                 focusRequest={terminalFocusRequest}
                 mobileInputMode={isMobileLayout}
+                mobileKeyboardOpen={mobileKeyboardOpen}
                 resizeEnabled={terminalResizeOwner}
                 outputResetVersion={terminalOutputResetVersion}
                 takeOutput={takeTerminalOutput}
@@ -2083,10 +2114,12 @@ export default function App() {
                     files={sessionFiles}
                     loading={sessionFilesLoading}
                     error={sessionFilesError}
+                    followTerminalCwd={sessionFilesFollowTerminalCwd}
                     onOpenDirectory={handleOpenDirectory}
                     onOpenFile={handleOpenFile}
                     onGoToPath={handleGoToFilePath}
                     onRefresh={handleRefreshSessionFiles}
+                    onFollowTerminalCwdChange={setSessionFilesFollowTerminalCwd}
                     onUpload={handleUploadFile}
                     onDownload={handleDownloadFile}
                     onDelete={handleDeleteFile}
@@ -2175,10 +2208,12 @@ export default function App() {
               files={sessionFiles}
               loading={sessionFilesLoading}
               error={sessionFilesError}
+              followTerminalCwd={sessionFilesFollowTerminalCwd}
               onOpenDirectory={handleOpenDirectory}
               onOpenFile={handleOpenFile}
               onGoToPath={handleGoToFilePath}
               onRefresh={handleRefreshSessionFiles}
+              onFollowTerminalCwdChange={setSessionFilesFollowTerminalCwd}
               onUpload={handleUploadFile}
               onDownload={handleDownloadFile}
               onDelete={handleDeleteFile}
@@ -2327,11 +2362,19 @@ function DaemonStatusPanel(props: {
       ) : null}
       <div className="daemon-status-grid">
         <CpuMetric value={cpuValue} history={props.cpuHistory} />
-        {props.compact ? null : <Metric label="Load" value={props.status ? props.status.load_avg.map((value) => value.toFixed(2)).join(" ") : "-"} />}
-        <Metric label="Mem" value={memoryValue} />
+        <Metric label="Mem" value={memoryValue} className="daemon-status-memory" />
+        <Metric label="Disk" value={diskValue} className="daemon-status-disk" />
         <Metric label="Net" value={networkValue} className="daemon-status-network" />
-        <Metric label="Disk" value={diskValue} />
-        {props.compact ? null : <Metric label="Uptime" value={props.status ? formatDuration(props.status.uptime_seconds) : "-"} />}
+        {props.compact ? null : (
+          <Metric
+            label="Load"
+            value={props.status ? props.status.load_avg.map((value) => value.toFixed(2)).join(" ") : "-"}
+            className="daemon-status-load"
+          />
+        )}
+        {props.compact ? null : (
+          <Metric label="Uptime" value={props.status ? formatDuration(props.status.uptime_seconds) : "-"} className="daemon-status-uptime" />
+        )}
       </div>
     </footer>
   );

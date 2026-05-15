@@ -329,6 +329,60 @@ fn runtime_reconnects_to_live_supervisor_and_replays_snapshot_output() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
+fn runtime_reports_supervisor_shell_current_working_directory() {
+    let state_path = temp_state_path("runtime-cwd.json");
+    let root = temp_state_path("runtime-cwd-root");
+    let work = root.join("work");
+    fs::create_dir_all(&work).unwrap();
+    let binary_path = PathBuf::from(env!("CARGO_BIN_EXE_termd"));
+    let session_id = "00000000-0000-0000-0000-000000000112";
+
+    let mut runtime = SessionRuntime::new(SupervisorPtyBackend::with_binary_and_state_path(
+        &binary_path,
+        &state_path,
+    ));
+    runtime
+        .create_session_with_id(
+            session_id,
+            CommandSpec::new("sh").cwd(&root),
+            TerminalSize::cells(24, 80),
+        )
+        .unwrap();
+    runtime.attach(session_id, "dev-a").unwrap();
+    runtime
+        .write_input(
+            session_id,
+            "dev-a",
+            format!("cd {}\nprintf cwd-ready\\n", work.display()).as_bytes(),
+        )
+        .unwrap();
+    read_until_contains(&mut runtime, session_id, b"cwd-ready");
+
+    let expected = work.canonicalize().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if runtime
+            .current_working_directory(session_id)
+            .unwrap()
+            .as_ref()
+            == Some(&expected)
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "supervisor shell cwd did not update to {}",
+            expected.display()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    runtime.close(session_id).unwrap();
+    fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn daemon_session_list_shows_restored_supervisor_without_client_history_metadata() {
     let state_path = temp_state_path("protocol-restore-list.json");
     let binary_path = PathBuf::from(env!("CARGO_BIN_EXE_termd"));
@@ -466,9 +520,20 @@ fn daemon_startup_adopts_live_supervisor_when_runtime_row_is_missing() {
         linux_process_state(supervisor_pid).is_some(),
         "test supervisor should be alive before daemon startup"
     );
-    let candidates = SupervisorPtyBackend::with_binary_and_state_path(&binary_path, &state_path)
-        .live_supervisor_restore_candidates()
-        .unwrap();
+    let backend = SupervisorPtyBackend::with_binary_and_state_path(&binary_path, &state_path);
+    let mut candidates = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        // 子进程刚 exec 时 `/proc` 扫描可能短暂看不到完整 argv，测试侧等待到可发现为止。
+        candidates = backend.live_supervisor_restore_candidates().unwrap();
+        if candidates
+            .iter()
+            .any(|candidate| candidate.session_id == session_id)
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
     let debug_cmdline = fs::read(format!("/proc/{supervisor_pid}/cmdline"))
         .map(|bytes| String::from_utf8_lossy(&bytes).replace('\0', " "))
         .unwrap_or_else(|error| format!("cmdline read failed: {error}"));

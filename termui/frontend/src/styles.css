@@ -8,8 +8,8 @@
   --daemon-status-memory-width: 132px;
   --daemon-status-network-width: 150px;
   --daemon-status-disk-width: 150px;
-  --daemon-status-load-width: 122px;
-  --daemon-status-uptime-width: 132px;
+  --daemon-status-load-width: 132px;
+  --daemon-status-uptime-width: 122px;
 }
 
 * {
@@ -257,11 +257,11 @@ label {
   height: 100%;
   min-height: 0;
   display: grid;
-  grid-template-columns: minmax(280px, 340px) 1fr;
+  grid-template-columns: minmax(280px, 340px) minmax(0, 1fr);
 }
 
 .app-shell.sidebar-is-collapsed {
-  grid-template-columns: 58px 1fr;
+  grid-template-columns: 58px minmax(0, 1fr);
 }
 
 .sidebar {
@@ -879,6 +879,7 @@ label {
 }
 
 .toolbar {
+  min-width: 0;
   border-bottom: 1px solid #25312d;
   background: #111a17;
   display: flex;
@@ -887,6 +888,7 @@ label {
   padding: 0 14px;
   color: #bdd0c8;
   font-size: 12px;
+  overflow: hidden;
 }
 
 .toolbar-title {
@@ -971,7 +973,7 @@ label {
   border: 0;
   border-top: 1px solid #25312d;
   border-radius: 0;
-  grid-template-columns: auto auto minmax(0, 1fr);
+  grid-template-columns: max-content minmax(0, 1fr);
   align-items: center;
   gap: 10px;
   padding: 0 10px;
@@ -1014,14 +1016,10 @@ label {
 }
 
 .daemon-status-strip .daemon-status-grid {
+  width: 100%;
   min-width: 0;
-  grid-template-columns:
-    var(--daemon-status-cpu-width)
-    var(--daemon-status-memory-width)
-    var(--daemon-status-network-width)
-    var(--daemon-status-disk-width)
-    var(--daemon-status-load-width)
-    var(--daemon-status-uptime-width);
+  display: flex;
+  flex-wrap: nowrap;
   gap: 0;
   align-items: center;
   justify-content: start;
@@ -1039,8 +1037,8 @@ label {
 }
 
 .daemon-status-strip .daemon-status-metric {
-  width: 100%;
-  flex: 0 0 auto;
+  width: auto;
+  flex: 0 0 var(--daemon-status-memory-width);
   min-height: 30px;
   border: 0;
   border-left: 1px solid #25312d;
@@ -1057,7 +1055,7 @@ label {
 }
 
 .daemon-status-strip .daemon-status-network {
-  flex: 0 0 var(--daemon-status-network-width);
+  flex-basis: var(--daemon-status-network-width);
 }
 
 .daemon-status-metric span,
@@ -1084,14 +1082,27 @@ label {
 }
 
 .daemon-status-strip .daemon-status-cpu {
+  flex-basis: var(--daemon-status-cpu-width);
   gap: 5px;
 }
 
+.daemon-status-strip .daemon-status-disk {
+  flex-basis: var(--daemon-status-disk-width);
+}
+
+.daemon-status-strip .daemon-status-load {
+  flex-basis: var(--daemon-status-load-width);
+}
+
+.daemon-status-strip .daemon-status-uptime {
+  flex-basis: var(--daemon-status-uptime-width);
+}
+
 .daemon-cpu-bar-chart {
-  flex: 0 0 56px;
-  width: 56px;
+  flex: 0 0 42px;
+  width: 42px;
   height: 18px;
-  min-width: 48px;
+  min-width: 38px;
   color: #89d8ff;
 }
 
@@ -1301,7 +1312,7 @@ label {
   border-left: 1px solid #25312d;
   background: #0d1512;
   display: grid;
-  grid-template-rows: 46px auto minmax(0, 1fr);
+  grid-template-rows: 46px auto minmax(0, 1fr) auto;
 }
 
 .files-resizer {
@@ -1505,6 +1516,31 @@ label {
   justify-content: center;
   gap: 7px;
   color: #536760;
+}
+
+.files-follow-footer {
+  min-width: 0;
+  border-top: 1px solid #25312d;
+  padding: 8px 10px;
+  background: #0b1310;
+}
+
+.files-follow-toggle {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #bdd0c7;
+  font-size: 12px;
+  user-select: none;
+}
+
+.files-follow-toggle input {
+  width: 14px;
+  height: 14px;
+  min-height: 14px;
+  margin: 0;
+  accent-color: #d6ff5f;
 }
 
 .file-editor-backdrop {
@@ -1755,6 +1791,44 @@ label {
 
 .status-error {
   color: #ffb3a7;
+}
+
+@media (min-width: 761px) and (max-width: 1100px) {
+  .app-shell {
+    grid-template-columns: 280px minmax(0, 1fr);
+  }
+}
+
+@media (min-width: 761px) and (max-width: 1180px) {
+  .daemon-status-strip {
+    --daemon-status-cpu-width: 86px;
+    --daemon-status-memory-width: 130px;
+    --daemon-status-network-width: 140px;
+    --daemon-status-disk-width: 150px;
+    --daemon-status-load-width: 130px;
+  }
+
+  .daemon-status-strip .daemon-status-metric {
+    gap: 5px;
+    padding: 0 8px;
+  }
+
+  .daemon-status-strip .daemon-cpu-bar-chart,
+  .daemon-status-strip .daemon-status-uptime {
+    display: none;
+  }
+}
+
+@media (min-width: 761px) and (max-width: 1040px) {
+  .daemon-status-strip .daemon-status-load {
+    display: none;
+  }
+}
+
+@media (min-width: 761px) and (max-width: 900px) {
+  .daemon-status-strip .daemon-status-network {
+    display: none;
+  }
 }
 
 @media (max-width: 760px) {
@@ -2065,7 +2139,12 @@ label {
   .daemon-status-strip .daemon-status-grid {
     width: 100%;
     max-width: 100%;
-    grid-template-columns: repeat(4, minmax(0, 1fr));
+    display: grid;
+    grid-template-columns:
+      minmax(56px, 0.75fr)
+      minmax(82px, 1.1fr)
+      minmax(82px, 1.1fr)
+      minmax(70px, 1fr);
     justify-content: stretch;
   }
 
