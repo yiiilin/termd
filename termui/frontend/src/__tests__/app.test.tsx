@@ -11,7 +11,7 @@ import App, {
   pairingWsUrlCandidates,
 } from "../App";
 import type { SessionFilesResultPayload } from "../protocol/types";
-import { clearBrowserState } from "../state/browser-state";
+import { clearBrowserState, loadBrowserState } from "../state/browser-state";
 import { MockDaemon } from "../test/mock-daemon";
 import { fallbackSessionDisplayName } from "../session-names";
 import { resetFileEditorDialogMonacoCacheForTests } from "../components/FileEditorDialog";
@@ -107,6 +107,32 @@ function dispatchMobileTextInput(target: HTMLTextAreaElement, data: string): Inp
     cancelable: true,
     data,
     inputType: "insertText",
+  });
+  target.dispatchEvent(event);
+  return event;
+}
+
+function dispatchMobilePasteInput(target: HTMLTextAreaElement, data: string): InputEvent {
+  const event = new InputEvent("beforeinput", {
+    bubbles: true,
+    cancelable: true,
+    data,
+    inputType: "insertFromPaste",
+  });
+  target.dispatchEvent(event);
+  return event;
+}
+
+function dispatchMobileClipboardPaste(target: HTMLTextAreaElement, data: string): Event {
+  const event = new Event("paste", {
+    bubbles: true,
+    cancelable: true,
+  });
+  Object.defineProperty(event, "clipboardData", {
+    configurable: true,
+    value: {
+      getData: (format: string) => (format === "text" || format === "text/plain" ? data : ""),
+    },
   });
   target.dispatchEvent(event);
   return event;
@@ -322,6 +348,26 @@ describe("termui web 工作台", () => {
     expect(daemon.outerWireText()).not.toContain("secret-token");
   });
 
+  it("设置面板支持切换语言和浅色主题，并持久化到浏览器本地状态", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "Settings" }));
+    await user.click(screen.getByLabelText("Light"));
+    await user.click(screen.getByLabelText("中文"));
+
+    await waitFor(() => expect(document.documentElement).toHaveAttribute("data-theme", "light"));
+    expect(document.documentElement).toHaveAttribute("lang", "zh-CN");
+    expect(screen.getByRole("dialog", { name: "设置" })).toBeVisible();
+    expect(screen.getByLabelText("守护进程管理器")).toBeInTheDocument();
+    expect(screen.queryByLabelText("daemon manager")).toBeNull();
+    await waitFor(async () => {
+      await expect(loadBrowserState()).resolves.toMatchObject({
+        preferences: { language: "zh-CN", theme: "light" },
+      });
+    });
+  });
+
   it("已配对 web 初次打开和刷新后自动 attach 第一个 session 并显示输出", async () => {
     const user = userEvent.setup();
     const firstRender = render(<App />);
@@ -412,18 +458,42 @@ describe("termui web 工作台", () => {
   it("底部状态栏使用固定列宽，避免指标内容变化时横向抖动", () => {
     const css = readFileSync(resolve(process.cwd(), "src/styles.css"), "utf8");
 
-    expect(css).toContain("--daemon-status-cpu-width: 132px;");
-    expect(css).toContain("--daemon-status-memory-width: 132px;");
-    expect(css).toContain("--daemon-status-network-width: 150px;");
-    expect(css).toContain("--daemon-status-disk-width: 150px;");
-    expect(css).toContain("--daemon-status-load-width: 132px;");
-    expect(css).toContain("--daemon-status-uptime-width: 122px;");
+    expect(css).toContain("--daemon-status-cpu-width: 148px;");
+    expect(css).toContain("--daemon-status-memory-width: 176px;");
+    expect(css).toContain("--daemon-status-network-width: 168px;");
+    expect(css).toContain("--daemon-status-disk-width: 176px;");
+    expect(css).toContain("--daemon-status-load-width: 142px;");
+    expect(css).toContain("--daemon-status-uptime-width: 132px;");
     expect(css).toContain("grid-template-columns: max-content minmax(0, 1fr);");
     expect(css).toContain("flex: 0 0 var(--daemon-status-memory-width);");
     expect(css).toContain("flex-basis: var(--daemon-status-cpu-width);");
     expect(css).toContain("flex-basis: var(--daemon-status-disk-width);");
     expect(css).toContain(".daemon-status-strip .daemon-status-load {\n    display: none;");
     expect(css).toContain("justify-content: start;");
+  });
+
+  it("浅色主题使用 Everforest soft light 底色，避免面板和终端大面积纯白", () => {
+    const css = readFileSync(resolve(process.cwd(), "src/styles.css"), "utf8");
+
+    expect(css).toContain("--color-bg-page: #e5dfc5;");
+    expect(css).toContain("--color-surface: #f3ead3;");
+    expect(css).toContain("--color-terminal-bg: #eae4ca;");
+    expect(css).toContain("--color-text: #5c6a72;");
+    expect(css).not.toContain("--color-surface: #ffffff;");
+    expect(css).not.toContain("--color-toast-bg: rgba(255, 255, 255");
+  });
+
+  it("暗色主题使用 Everforest soft dark 底色，避免霓虹高对比黑绿", () => {
+    const css = readFileSync(resolve(process.cwd(), "src/styles.css"), "utf8");
+    const html = readFileSync(resolve(process.cwd(), "index.html"), "utf8");
+
+    expect(css).toContain("--color-bg-page: #293136;");
+    expect(css).toContain("--color-surface: #333c43;");
+    expect(css).toContain("--color-terminal-bg: #293136;");
+    expect(css).toContain("--color-text: #d3c6aa;");
+    expect(css).toContain("--color-accent: #a7c080;");
+    expect(html).toContain('<meta name="theme-color" content="#293136" />');
+    expect(css).not.toContain("--color-accent: #d6ff5f;");
   });
 
   it("移动端状态栏和快捷输入栏固定占满父容器，避免内容变化带动宽度", () => {
@@ -435,6 +505,10 @@ describe("termui web 工作台", () => {
     expect(css).toContain(".daemon-status-strip .daemon-status-grid {\n    width: 100%;");
     expect(css).toContain("display: grid;\n    grid-template-columns:\n      minmax(56px, 0.75fr)");
     expect(css).toContain(".terminal-mobile-shortcuts {\n    width: 100%;");
+    expect(css).toContain("overflow-x: auto;");
+    expect(css).toContain("scrollbar-width: none;");
+    expect(css).toContain("flex: 0 0 64px;");
+    expect(css).toContain(".terminal-mobile-paste-button {\n    flex-basis: 82px;");
   });
 
   it("基于相邻 daemon 状态快照计算网卡上下行速度", () => {
@@ -704,7 +778,7 @@ describe("termui web 工作台", () => {
     triggerXtermSelection("termd-e2e-ready");
 
     await waitFor(() => expect(writeTextSpy).toHaveBeenCalledWith("termd-e2e-ready"));
-    expect(await screen.findByRole("status")).toHaveTextContent("复制成功");
+    expect(await screen.findByRole("status")).toHaveTextContent("Copied");
   });
 
   it("点击 xterm 已渲染文字也能聚焦终端", async () => {
@@ -1201,6 +1275,44 @@ describe("termui web 工作台", () => {
     expect(spaceEvent.defaultPrevented).toBe(true);
     expect(commaEvent.defaultPrevented).toBe(true);
     await waitFor(() => expect(daemon.sessionDataMessages).toEqual([" ", ","]));
+  });
+
+  it("移动端可以通过快捷栏按钮和原生粘贴事件输入剪贴板文本", async () => {
+    setViewportWidth(390);
+    setMobileVisualViewport(844, 520);
+    const user = userEvent.setup();
+    const readTextSpy = vi.fn<() => Promise<string>>(() => Promise.resolve("shortcut-paste"));
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: {
+        ...navigator.clipboard,
+        readText: readTextSpy,
+      },
+    });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+
+    const terminalInput = await waitFor(() => {
+      const input = document.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
+      expect(input).not.toBeNull();
+      return input!;
+    });
+    terminalInput.focus();
+
+    await user.click(await screen.findByRole("button", { name: "Paste" }));
+    await waitFor(() => expect(daemon.sessionDataMessages).toEqual(["shortcut-paste"]));
+
+    const pasteEvent = dispatchMobilePasteInput(terminalInput, "native-paste");
+    expect(pasteEvent.defaultPrevented).toBe(true);
+    await waitFor(() => expect(daemon.sessionDataMessages).toEqual(["shortcut-paste", "native-paste"]));
+
+    const clipboardPasteEvent = dispatchMobileClipboardPaste(terminalInput, "clipboard-event-paste");
+    expect(clipboardPasteEvent.defaultPrevented).toBe(true);
+    await waitFor(() =>
+      expect(daemon.sessionDataMessages).toEqual(["shortcut-paste", "native-paste", "clipboard-event-paste"]),
+    );
   });
 
   it("可以创建 session 并自动 attach 到 terminal", async () => {

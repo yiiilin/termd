@@ -32,6 +32,7 @@ import type {
   SessionGitWorktreePayload,
   UUID,
 } from "../protocol/types";
+import { useI18n, type Translate } from "../i18n";
 
 const GIT_SPLIT_MIN_PANE_HEIGHT = 24;
 const GIT_SPLIT_FALLBACK_PANEL_HEIGHT = 360;
@@ -93,6 +94,7 @@ export function SessionFilesPanel({
   onResizePointerDown,
   onResizeKeyDown,
 }: SessionFilesPanelProps) {
+  const { t } = useI18n();
   const entries = files?.entries ?? [];
   const currentPath = files?.path ?? "";
   const hasCachedEntries = entries.length > 0;
@@ -104,12 +106,12 @@ export function SessionFilesPanel({
   }, [currentPath]);
 
   return (
-    <aside className="files-panel" aria-label="session files">
+    <aside className="files-panel" aria-label={t("files.panelAria")}>
       {onResizePointerDown ? (
         <div
           className="files-panel-edge-resizer"
           role="separator"
-          aria-label="Resize files panel"
+          aria-label={t("files.resizePanel")}
           aria-orientation="vertical"
           tabIndex={0}
           onPointerDown={onResizePointerDown}
@@ -117,7 +119,7 @@ export function SessionFilesPanel({
         />
       ) : null}
       <header className="files-panel-header">
-        <div className="files-tabs" role="tablist" aria-label="Files panel view">
+        <div className="files-tabs" role="tablist" aria-label={t("files.panelView")}>
           <button
             type="button"
             className="files-tab"
@@ -126,7 +128,7 @@ export function SessionFilesPanel({
             onClick={() => onTabChange("files")}
           >
             <Folder size={14} aria-hidden="true" />
-            <span>Files</span>
+            <span>{t("app.files")}</span>
           </button>
           <button
             type="button"
@@ -136,29 +138,29 @@ export function SessionFilesPanel({
             onClick={() => onTabChange("git")}
           >
             <GitBranch size={14} aria-hidden="true" />
-            <span>Git</span>
+            <span>{t("app.git")}</span>
           </button>
         </div>
-        <button type="button" className="icon-button files-hide-button" aria-label="Hide files panel" onClick={onHide}>
+        <button type="button" className="icon-button files-hide-button" aria-label={t("files.hidePanel")} onClick={onHide}>
           <PanelRightClose size={16} aria-hidden="true" />
         </button>
       </header>
       {activeTab === "files" ? (
-        <div className="files-tab-body" role="tabpanel" aria-label="Files">
+        <div className="files-tab-body" role="tabpanel" aria-label={t("app.files")}>
           <div className="files-toolbar">
             <button
               type="button"
               className="icon-button"
-              aria-label="Parent directory"
+              aria-label={t("files.parentDirectory")}
               disabled={!attachedSessionId || loading || !currentPath}
               onClick={() => onGoToPath(parentPath(currentPath))}
             >
               <ArrowUp size={15} aria-hidden="true" />
             </button>
             <label className="files-path-field">
-              <span className="sr-only">Current directory</span>
+              <span className="sr-only">{t("files.currentDirectory")}</span>
               <input
-                aria-label="Current directory"
+                aria-label={t("files.currentDirectory")}
                 value={pathDraft}
                 disabled={!attachedSessionId || loading}
                 onChange={(event) => setPathDraft(event.target.value)}
@@ -175,12 +177,12 @@ export function SessionFilesPanel({
               disabled={!attachedSessionId || loading}
               onClick={() => onGoToPath(pathDraft)}
             >
-              Go
+              {t("files.go")}
             </button>
             <button
               type="button"
               className="icon-button"
-              aria-label="Refresh files"
+              aria-label={t("files.refresh")}
               disabled={!attachedSessionId || loading}
               onClick={onRefresh}
             >
@@ -189,7 +191,7 @@ export function SessionFilesPanel({
             <button
               type="button"
               className="icon-button"
-              aria-label="Upload"
+              aria-label={t("files.upload")}
               disabled={!attachedSessionId || loading}
               onClick={() => uploadRef.current?.click()}
             >
@@ -198,7 +200,7 @@ export function SessionFilesPanel({
             <input
               ref={uploadRef}
               className="files-upload-input"
-              aria-label="Upload file"
+              aria-label={t("files.uploadFile")}
               type="file"
               onChange={(event) => {
                 const file = event.target.files?.[0];
@@ -210,16 +212,16 @@ export function SessionFilesPanel({
             />
           </div>
           <div className="files-list">
-            {!attachedSessionId ? <div className="files-empty">detached</div> : null}
+            {!attachedSessionId ? <div className="files-empty">{t("files.detached")}</div> : null}
             {attachedSessionId && loading && !hasCachedEntries ? (
               <div className="files-empty">
                 <RefreshCw size={14} aria-hidden="true" />
-                loading
+                {t("files.loading")}
               </div>
             ) : null}
-            {attachedSessionId && !loading && error ? <div className="files-empty">unavailable</div> : null}
+            {attachedSessionId && !loading && error ? <div className="files-empty">{t("files.unavailable")}</div> : null}
             {attachedSessionId && !loading && !error && entries.length === 0 ? (
-              <div className="files-empty">empty directory</div>
+              <div className="files-empty">{t("files.emptyDirectory")}</div>
             ) : null}
             {/*
               刷新目录或保存文件时保留旧列表，避免按钮在短暂 loading 期间消失；
@@ -234,6 +236,7 @@ export function SessionFilesPanel({
                     onOpenFile={onOpenFile}
                     onDownload={onDownload}
                     onDelete={onDelete}
+                    t={t}
                   />
                 ))
               : null}
@@ -246,7 +249,7 @@ export function SessionFilesPanel({
                 disabled={!attachedSessionId}
                 onChange={(event) => onFollowTerminalCwdChange(event.currentTarget.checked)}
               />
-              <span>Follow terminal cwd</span>
+              <span>{t("files.followCwd")}</span>
             </label>
           </footer>
         </div>
@@ -286,6 +289,7 @@ function GitPanel({
     action: SessionGitActionKind,
   ) => void;
 }) {
+  const { t } = useI18n();
   const worktrees = git?.worktrees ?? [];
   const graph = git?.graph ?? [];
   const [filesCollapsed, setFilesCollapsed] = useState(false);
@@ -358,28 +362,28 @@ function GitPanel({
       ref={panelRef}
       className={`git-panel git-panel-compact${splitActive ? " git-panel-split-overridden" : ""}${graphResizing ? " git-graph-resizing" : ""}${filesCollapsed ? " git-files-collapsed" : ""}${graphCollapsed ? " git-graph-collapsed" : ""}`}
       role="tabpanel"
-      aria-label="Git"
+      aria-label={t("app.git")}
       style={splitActive ? ({ "--git-changes-pane-height": `${changesPaneHeight}px` } as CSSProperties) : undefined}
     >
-      <section ref={statusPaneRef} className="git-status-pane" aria-label="Git status">
+      <section ref={statusPaneRef} className="git-status-pane" aria-label={t("git.status")}>
         <header className="git-section-header">
           <button
             type="button"
             className="git-section-toggle"
             aria-expanded={!filesCollapsed}
-            aria-label={`${filesCollapsed ? "Expand" : "Collapse"} Git changes`}
+            aria-label={filesCollapsed ? t("git.expandChanges") : t("git.collapseChanges")}
             onClick={() => setFilesCollapsed((collapsed) => !collapsed)}
           >
             {filesCollapsed ? <ChevronRight size={14} aria-hidden="true" /> : <ChevronDown size={14} aria-hidden="true" />}
-            <span>Changes</span>
+            <span>{t("git.changes")}</span>
           </button>
           <span className="git-repo-label" title={git?.repository_root ?? git?.cwd ?? ""}>
-            {git?.repository_root ? lastPathSegment(git.repository_root) : "Repository"}
+            {git?.repository_root ? lastPathSegment(git.repository_root) : t("git.repository")}
           </span>
           <button
             type="button"
             className="icon-button"
-            aria-label="Refresh Git"
+            aria-label={t("git.refresh")}
             disabled={!attachedSessionId || loading}
             onClick={onRefresh}
           >
@@ -387,18 +391,18 @@ function GitPanel({
           </button>
         </header>
         {!filesCollapsed ? (
-          <div className="git-section-body git-status-body" role="tree" aria-label="Git changes tree">
-            {!attachedSessionId ? <div className="files-empty">detached</div> : null}
+          <div className="git-section-body git-status-body" role="tree" aria-label={t("git.changesTree")}>
+            {!attachedSessionId ? <div className="files-empty">{t("files.detached")}</div> : null}
             {attachedSessionId && loading && !git ? (
               <div className="files-empty">
                 <RefreshCw size={14} aria-hidden="true" />
-                loading
+                {t("files.loading")}
               </div>
             ) : null}
-            {attachedSessionId && !loading && error ? <div className="files-empty">unavailable</div> : null}
+            {attachedSessionId && !loading && error ? <div className="files-empty">{t("files.unavailable")}</div> : null}
             {attachedSessionId && !error && git?.error ? <div className="files-empty">{git.error}</div> : null}
             {attachedSessionId && !error && git && !git.error && worktrees.length === 0 ? (
-              <div className="files-empty">clean repository</div>
+              <div className="files-empty">{t("git.cleanRepository")}</div>
             ) : null}
             {attachedSessionId && !error && !git?.error
               ? worktrees.map((worktree) => (
@@ -417,7 +421,7 @@ function GitPanel({
         <div
           className="git-graph-resizer"
           role="separator"
-          aria-label="Resize Git graph"
+          aria-label={t("git.resizeGraph")}
           aria-orientation="horizontal"
           tabIndex={0}
           onPointerDown={handleGraphResizePointerDown}
@@ -427,21 +431,21 @@ function GitPanel({
           onKeyDown={handleGraphResizeKeyDown}
         />
       ) : null}
-      <section className="git-graph-pane" aria-label="Git graph">
+      <section className="git-graph-pane" aria-label={t("git.graph")}>
         <header className="git-section-header">
           <button
             type="button"
             className="git-section-toggle"
             aria-expanded={!graphCollapsed}
-            aria-label={`${graphCollapsed ? "Expand" : "Collapse"} Git graph`}
+            aria-label={graphCollapsed ? t("git.expandGraph") : t("git.collapseGraph")}
             onClick={() => setGraphCollapsed((collapsed) => !collapsed)}
           >
             {graphCollapsed ? <ChevronRight size={14} aria-hidden="true" /> : <ChevronDown size={14} aria-hidden="true" />}
-            <span>Graph</span>
+            <span>{t("git.graph")}</span>
           </button>
         </header>
         {!graphCollapsed ? (
-          graph.length > 0 ? <GitGraph lines={graph} /> : <div className="files-empty">no commits</div>
+          graph.length > 0 ? <GitGraph lines={graph} /> : <div className="files-empty">{t("git.noCommits")}</div>
         ) : null}
       </section>
     </div>
@@ -461,17 +465,18 @@ function GitWorktree({
     action: SessionGitActionKind,
   ) => void;
 }) {
-  const label = worktree.branch ?? worktree.head ?? "detached";
+  const { t } = useI18n();
+  const label = worktree.branch ?? worktree.head ?? t("git.detached");
   const [collapsed, setCollapsed] = useState(false);
 
   return (
-    <article className="git-worktree" role="treeitem" aria-label={`${label} changes`} aria-expanded={!collapsed}>
+    <article className="git-worktree" role="treeitem" aria-label={t("git.worktreeChanges", { label })} aria-expanded={!collapsed}>
       <header className="git-worktree-header">
         <button
           type="button"
           className="git-worktree-toggle"
           aria-expanded={!collapsed}
-          aria-label={`${collapsed ? "Expand" : "Collapse"} ${label} worktree`}
+          aria-label={collapsed ? t("git.expandWorktree", { label }) : t("git.collapseWorktree", { label })}
           onClick={() => setCollapsed((current) => !current)}
           title={label}
         >
@@ -482,7 +487,7 @@ function GitWorktree({
         </button>
         <span className="git-worktree-floating-meta" aria-hidden="true">
           {worktree.head ? <span className="git-worktree-head">{worktree.head}</span> : null}
-          {worktree.is_current ? <span className="git-worktree-current">cwd</span> : null}
+          {worktree.is_current ? <span className="git-worktree-current">{t("git.cwd")}</span> : null}
         </span>
       </header>
       {!collapsed ? (
@@ -491,22 +496,20 @@ function GitWorktree({
             {worktree.path}
           </div>
           <GitChangeSection
-            title="Staged"
+            title={t("git.staged")}
             worktree={worktree}
             changes={worktree.staged}
-            emptyText="no staged changes"
+            emptyText={t("git.noStaged")}
             action="unstage"
-            actionLabel="Unstage"
             onOpenGitFile={onOpenGitFile}
             onGitAction={onGitAction}
           />
           <GitChangeSection
-            title="Unstaged"
+            title={t("git.unstaged")}
             worktree={worktree}
             changes={worktree.unstaged}
-            emptyText="no unstaged changes"
+            emptyText={t("git.noUnstaged")}
             action="stage"
-            actionLabel="Stage"
             onOpenGitFile={onOpenGitFile}
             onGitAction={onGitAction}
           />
@@ -522,7 +525,6 @@ function GitChangeSection({
   changes,
   emptyText,
   action,
-  actionLabel,
   onOpenGitFile,
   onGitAction,
 }: {
@@ -531,7 +533,6 @@ function GitChangeSection({
   changes: SessionGitFileChangePayload[];
   emptyText: string;
   action: SessionGitActionKind;
-  actionLabel: string;
   onOpenGitFile: (worktree: SessionGitWorktreePayload, change: SessionGitFileChangePayload) => void;
   onGitAction: (
     worktree: SessionGitWorktreePayload,
@@ -539,6 +540,7 @@ function GitChangeSection({
     action: SessionGitActionKind,
   ) => void;
 }) {
+  const { t } = useI18n();
   return (
     <section className="git-change-section">
       <h3>{title}</h3>
@@ -559,8 +561,8 @@ function GitChangeSection({
                 <button
                   type="button"
                   className="icon-button"
-                  aria-label={`Open ${change.path}`}
-                  title={`Open ${change.path}`}
+                  aria-label={t("git.openFile", { path: change.path })}
+                  title={t("git.openFile", { path: change.path })}
                   onClick={() => onOpenGitFile(worktree, change)}
                 >
                   <FilePenLine size={13} aria-hidden="true" />
@@ -568,8 +570,16 @@ function GitChangeSection({
                 <button
                   type="button"
                   className="icon-button"
-                  aria-label={`${actionLabel} ${change.path}`}
-                  title={`${actionLabel} ${change.path}`}
+                  aria-label={
+                    action === "stage"
+                      ? t("git.stageFile", { path: change.path })
+                      : t("git.unstageFile", { path: change.path })
+                  }
+                  title={
+                    action === "stage"
+                      ? t("git.stageFile", { path: change.path })
+                      : t("git.unstageFile", { path: change.path })
+                  }
                   onClick={() => onGitAction(worktree, change, action)}
                 >
                   {action === "stage" ? <Plus size={13} aria-hidden="true" /> : <Minus size={13} aria-hidden="true" />}
@@ -577,8 +587,8 @@ function GitChangeSection({
                 <button
                   type="button"
                   className="icon-button danger"
-                  aria-label={`Discard ${change.path}`}
-                  title={`Discard ${change.path}`}
+                  aria-label={t("git.discardFile", { path: change.path })}
+                  title={t("git.discardFile", { path: change.path })}
                   onClick={() => onGitAction(worktree, change, "discard")}
                 >
                   <Undo2 size={13} aria-hidden="true" />
@@ -595,8 +605,9 @@ function GitChangeSection({
 }
 
 function GitGraph({ lines }: { lines: string[] }) {
+  const { t } = useI18n();
   return (
-    <div className="git-graph-lines" aria-label="Git graph commits">
+    <div className="git-graph-lines" aria-label={t("git.commits")}>
       {lines.map((line, index) => {
         const parsed = parseGitGraphLine(line);
         return (
@@ -636,12 +647,14 @@ function SessionFileRow({
   onOpenFile,
   onDownload,
   onDelete,
+  t,
 }: {
   entry: SessionFileEntryPayload;
   onOpenDirectory: (path: string) => void;
   onOpenFile: (entry: SessionFileEntryPayload) => void;
   onDownload: (entry: SessionFileEntryPayload) => void;
   onDelete: (entry: SessionFileEntryPayload) => void;
+  t: Translate;
 }) {
   const isDirectory = entry.kind === "directory";
 
@@ -658,15 +671,15 @@ function SessionFileRow({
       <span className="file-size">{formatBytes(entry.size_bytes)}</span>
       <span className="file-actions">
         {isDirectory ? (
-          <button type="button" className="icon-button" aria-label={`Open ${entry.name}`} onClick={() => onOpenDirectory(entry.path)}>
+          <button type="button" className="icon-button" aria-label={t("files.open", { name: entry.name })} onClick={() => onOpenDirectory(entry.path)}>
             <Folder size={14} aria-hidden="true" />
           </button>
         ) : (
           <>
-            <button type="button" className="icon-button" aria-label={`Edit ${entry.name}`} onClick={() => onOpenFile(entry)}>
+            <button type="button" className="icon-button" aria-label={t("files.edit", { name: entry.name })} onClick={() => onOpenFile(entry)}>
               <FilePenLine size={14} aria-hidden="true" />
             </button>
-            <button type="button" className="icon-button" aria-label={`Download ${entry.name}`} onClick={() => onDownload(entry)}>
+            <button type="button" className="icon-button" aria-label={t("files.download", { name: entry.name })} onClick={() => onDownload(entry)}>
               <Download size={14} aria-hidden="true" />
             </button>
           </>
@@ -674,7 +687,7 @@ function SessionFileRow({
         <button
           type="button"
           className="icon-button danger"
-          aria-label={`Delete ${entry.name}`}
+          aria-label={t("files.delete", { name: entry.name })}
           onClick={() => onDelete(entry)}
         >
           <Trash2 size={14} aria-hidden="true" />

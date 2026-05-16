@@ -2,6 +2,9 @@ import { useEffect, useMemo, useState } from "react";
 import type { ReactNode } from "react";
 import { Check, FileText, Loader2, X } from "lucide-react";
 import type { MonacoCodeEditor } from "./MonacoCodeEditor";
+import { useI18n } from "../i18n";
+import type { EffectiveTheme } from "../protocol/types";
+import { monacoTheme } from "../theme";
 
 export interface FileEditorDialogProps {
   open: boolean;
@@ -12,6 +15,7 @@ export interface FileEditorDialogProps {
   saving?: boolean;
   error?: string;
   language?: string;
+  theme?: EffectiveTheme;
   readOnly?: boolean;
   onSave: (text: string) => void | Promise<void>;
   onClose: () => void;
@@ -53,6 +57,7 @@ export function FileEditorDialog({
   saving = false,
   error,
   language,
+  theme = "dark",
   readOnly = false,
   onSave,
   onClose,
@@ -60,6 +65,7 @@ export function FileEditorDialog({
   const [text, setText] = useState(initialText);
   const [MonacoEditor, setMonacoEditor] = useState<MonacoCodeEditor | null>(null);
   const [monacoChecked, setMonacoChecked] = useState(false);
+  const { t } = useI18n();
 
   useEffect(() => {
     if (open) {
@@ -88,23 +94,23 @@ export function FileEditorDialog({
     };
   }, [open]);
 
-  const title = name?.trim() || basename(path) || "Untitled";
+  const title = name?.trim() || basename(path) || t("editor.untitled");
   const disabled = loading || saving;
   const canEdit = !disabled && !readOnly;
   const isDirty = text !== initialText;
-  const saveLabel = saving ? "Saving" : "Save";
+  const saveLabel = saving ? t("editor.savingButton") : t("editor.save");
   const statusText = useMemo(() => {
     if (loading) {
-      return "loading";
+      return t("editor.loading");
     }
     if (saving) {
-      return "saving";
+      return t("editor.saving");
     }
     if (readOnly) {
-      return "read only";
+      return t("editor.readOnly");
     }
-    return isDirty ? "modified" : "saved";
-  }, [isDirty, loading, readOnly, saving]);
+    return isDirty ? t("editor.modified") : t("editor.saved");
+  }, [isDirty, loading, readOnly, saving, t]);
 
   if (!open) {
     return null;
@@ -135,7 +141,7 @@ export function FileEditorDialog({
             <span className="file-editor-status" aria-live="polite">
               {statusText}
             </span>
-            <button type="button" className="icon-button" aria-label="Close editor" disabled={saving} onClick={onClose}>
+            <button type="button" className="icon-button" aria-label={t("editor.close")} disabled={saving} onClick={onClose}>
               <X size={16} aria-hidden="true" />
             </button>
           </div>
@@ -151,7 +157,7 @@ export function FileEditorDialog({
           {loading ? (
             <div className="file-editor-loading">
               <Loader2 size={16} aria-hidden="true" />
-              loading
+              {t("editor.loading")}
             </div>
           ) : MonacoEditor ? (
             <MonacoEditor
@@ -159,8 +165,8 @@ export function FileEditorDialog({
               height="100%"
               value={text}
               language={language}
-              theme="vs-dark"
-              loading={<div className="file-editor-loading">loading editor</div>}
+              theme={monacoTheme(theme)}
+              loading={<div className="file-editor-loading">{t("editor.loadingEditor")}</div>}
               options={{
                 readOnly: !canEdit,
                 lineNumbers: "on",
@@ -181,15 +187,18 @@ export function FileEditorDialog({
             <FallbackCodeEditor
               text={text}
               readOnly={!canEdit}
-              placeholder={monacoChecked ? "" : "loading editor"}
+              placeholder={monacoChecked ? "" : t("editor.loadingEditor")}
               onChange={setText}
+              lineNumbersLabel={t("editor.lineNumbers")}
+              fileTextLabel={t("editor.fileText")}
+              minimapLabel={t("editor.minimap")}
             />
           )}
         </div>
 
         <footer className="file-editor-footer single-row">
           <button type="button" disabled={saving} onClick={onClose}>
-            Cancel
+            {t("editor.cancel")}
           </button>
           <button
             type="button"
@@ -210,6 +219,9 @@ function FallbackCodeEditor(props: {
   text: string;
   readOnly: boolean;
   placeholder: string;
+  lineNumbersLabel: string;
+  fileTextLabel: string;
+  minimapLabel: string;
   onChange: (text: string) => void;
 }) {
   const lines = props.text.split("\n");
@@ -217,20 +229,20 @@ function FallbackCodeEditor(props: {
 
   return (
     <div className="file-editor-fallback">
-      <div className="file-editor-line-numbers" aria-label="Line numbers">
+      <div className="file-editor-line-numbers" aria-label={props.lineNumbersLabel}>
         {lineNumbers.map((line) => (
           <span key={line}>{line}</span>
         ))}
       </div>
       <textarea
-        aria-label="File text"
+        aria-label={props.fileTextLabel}
         value={props.text}
         readOnly={props.readOnly}
         spellCheck={false}
         placeholder={props.placeholder}
         onChange={(event) => props.onChange(event.currentTarget.value)}
       />
-      <div className="file-editor-minimap" aria-label="Editor minimap">
+      <div className="file-editor-minimap" aria-label={props.minimapLabel}>
         {lines.map((line, index) => (
           <span key={`${index}:${line.slice(0, 12)}`} style={{ width: `${minimapLineWidth(line)}%` }} />
         ))}

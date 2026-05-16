@@ -11,6 +11,7 @@ import {
   Plus,
   RefreshCcw,
   Server,
+  Settings,
   Unplug,
   UsersRound,
   X,
@@ -43,6 +44,7 @@ import type {
 import { sessionDataFromBase64 } from "./protocol/wire";
 import {
   defaultServer,
+  DEFAULT_BROWSER_PREFERENCES,
   ensureDevice,
   loadBrowserState,
   normalizeRouteWsUrl,
@@ -50,6 +52,7 @@ import {
   recordPairing,
   recordServerUrl,
   renameDaemon,
+  saveBrowserPreferences,
   selectDefaultServer,
 } from "./state/browser-state";
 import { ConnectionPanel } from "./components/ConnectionPanel";
@@ -61,7 +64,11 @@ import { FileEditorDialog } from "./components/FileEditorDialog";
 import { StatusBar } from "./components/StatusBar";
 import { TerminalPane } from "./components/TerminalPane";
 import { PairingQrScanner } from "./components/PairingQrScanner";
+import { SettingsDialog } from "./components/SettingsDialog";
 import { sessionDisplayName } from "./session-names";
+import { createTranslator, I18nProvider, resolveLocale, translateSafeErrorMessage, useI18n, type Translate } from "./i18n";
+import { resolveTheme } from "./theme";
+import type { BrowserPreferences } from "./protocol/types";
 
 const FALLBACK_WS_URL = "ws://127.0.0.1:8765/ws";
 const DEFAULT_SESSION_SIZE: TerminalSize = { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 };
@@ -144,6 +151,7 @@ export default function App() {
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [mobilePanel, setMobilePanel] = useState<"sessions" | "files" | undefined>();
   const [connectionEditorOpen, setConnectionEditorOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [qrScannerOpen, setQrScannerOpen] = useState(false);
   const [renamingDaemonId, setRenamingDaemonId] = useState<UUID | undefined>();
   const [daemonRenameDraft, setDaemonRenameDraft] = useState("");
@@ -185,6 +193,11 @@ export default function App() {
   const daemonNetworkSampleRef = useRef<DaemonNetworkCounterSample | undefined>(undefined);
   const isMobileLayout = useMobileLayout();
   const visualViewportMetrics = useVisualViewportMetrics(isMobileLayout && activeSurface === "workspace");
+  const systemTheme = useSystemTheme();
+  const preferences = state.preferences ?? DEFAULT_BROWSER_PREFERENCES;
+  const effectiveTheme = resolveTheme(preferences.theme, systemTheme);
+  const effectiveLocale = resolveLocale(preferences.language);
+  const t = useMemo(() => createTranslator(effectiveLocale), [effectiveLocale]);
 
   useEffect(() => {
     void loadBrowserState().then((loaded) => {
@@ -196,6 +209,16 @@ export default function App() {
       setActiveSurface(defaultServer(loaded) && loaded.device ? "workspace" : "admin");
     });
   }, []);
+
+  useEffect(() => {
+    document.documentElement.lang = effectiveLocale;
+    document.documentElement.dataset.theme = effectiveTheme;
+    document.documentElement.style.colorScheme = effectiveTheme;
+    document.querySelector('meta[name="theme-color"]')?.setAttribute(
+      "content",
+      effectiveTheme === "light" ? "#e5dfc5" : "#293136",
+    );
+  }, [effectiveLocale, effectiveTheme]);
 
   useEffect(() => {
     return () => {
@@ -299,10 +322,10 @@ export default function App() {
   );
   const toolbarSessionName = useMemo(() => {
     if (!toolbarSession) {
-      return "No session";
+      return t("app.noSession");
     }
     return sessionDisplayName(toolbarSession);
-  }, [sessions, toolbarSession]);
+  }, [sessions, t, toolbarSession]);
   const toolbarSessionSize = toolbarSession ? terminalSizeDisplay(toolbarSession.size) : undefined;
 
   useEffect(() => {
@@ -324,9 +347,9 @@ export default function App() {
     () =>
       state.pairedServers.map((server, index) => ({
         server,
-        label: daemonDisplayLabel(server, index),
+        label: daemonDisplayLabel(server, index, t),
       })),
-    [state.pairedServers],
+    [state.pairedServers, t],
   );
   const showMobileWorkspaceMenu = isMobileLayout && connectionReady;
   const showMobileSessionsPanel = showMobileWorkspaceMenu && mobilePanel === "sessions";
@@ -346,7 +369,7 @@ export default function App() {
   const canOpenWorkspace = Boolean(activeServer && state.device);
   const canSaveRename = Boolean(renameDraft.trim()) && renameDraft.trim() !== renameOriginalName.trim();
   const activeDaemonLabel =
-    pairedServerOptions.find((item) => item.server.server_id === activeServer?.server_id)?.label ?? "No daemon";
+    pairedServerOptions.find((item) => item.server.server_id === activeServer?.server_id)?.label ?? t("app.noDaemon");
   const handleOpenAdmin = useCallback((options: { editConnection?: boolean } = {}) => {
     setActiveSurface("admin");
     setMobilePanel(undefined);
@@ -359,6 +382,17 @@ export default function App() {
     setError(toSafeError(caught));
     setStatus("error");
   }, []);
+
+  const handlePreferencesChange = useCallback(
+    (nextPreferences: BrowserPreferences) => {
+      // 偏好是当前浏览器的纯 UI 状态；先乐观更新，保存失败再显示错误。
+      setState((current) => ({ ...current, preferences: nextPreferences }));
+      void saveBrowserPreferences(nextPreferences)
+        .then((nextState) => setState(nextState))
+        .catch(setSafeError);
+    },
+    [setSafeError],
+  );
 
   const isIgnoredClosingSessionNotFound = useCallback((sessionId: UUID, caught: unknown) => {
     if (!closingSessionIdsRef.current.has(sessionId)) {
@@ -1697,7 +1731,7 @@ export default function App() {
           text: "",
           loading: false,
           saving: false,
-          error: "file is too large to edit in browser",
+          error: t("error.fileEditTooLarge"),
         });
         return;
       }
@@ -1728,13 +1762,13 @@ export default function App() {
           text: current?.text ?? "",
           loading: false,
           saving: false,
-          error: toSafeError(caught).message,
+          error: translateSafeErrorMessage(toSafeError(caught), t),
         }));
       } finally {
         client?.close();
       }
     },
-    [authenticatedSessionClient],
+    [authenticatedSessionClient, t],
   );
 
   const handleOpenGitFile = useCallback(
@@ -1774,12 +1808,12 @@ export default function App() {
         });
         await loadSessionFiles(sessionId, sessionFiles?.path);
       } catch (caught) {
-        setFileEditor({ ...editor, text, loading: false, saving: false, error: toSafeError(caught).message });
+        setFileEditor({ ...editor, text, loading: false, saving: false, error: translateSafeErrorMessage(toSafeError(caught), t) });
       } finally {
         client?.close();
       }
     },
-    [authenticatedSessionClient, fileEditor, loadSessionFiles, sessionFiles?.path],
+    [authenticatedSessionClient, fileEditor, loadSessionFiles, sessionFiles?.path, t],
   );
 
   const handleDownloadFile = useCallback(
@@ -1903,29 +1937,33 @@ export default function App() {
 
   if (activeSurface === "admin") {
     return (
+      <I18nProvider locale={effectiveLocale}>
       <div className="admin-shell">
         <header className="admin-topbar">
           <div className="admin-brand">
             <Cable size={18} aria-hidden="true" />
-            <span>Termd admin</span>
+            <span>{t("app.adminTitle")}</span>
           </div>
           <div className="admin-topbar-actions">
+            <button type="button" className="icon-button" aria-label={t("app.settings")} onClick={() => setSettingsOpen(true)}>
+              <Settings size={16} aria-hidden="true" />
+            </button>
             <button type="button" onClick={handleOpenWorkspace} disabled={!canOpenWorkspace}>
               <MonitorUp size={16} aria-hidden="true" />
-              Workspace
+              {t("app.workspace")}
             </button>
           </div>
         </header>
-        <main className="admin-main" aria-label="daemon admin">
-          <section className="admin-summary-band" aria-label="selected daemon">
+        <main className="admin-main" aria-label={t("app.adminAria")}>
+          <section className="admin-summary-band" aria-label={t("app.selectedDaemonAria")}>
             <div className="admin-summary-main">
-              <span>Selected daemon</span>
+              <span>{t("app.selectedDaemon")}</span>
               <strong>{activeDaemonLabel}</strong>
-              <code>{activeServer?.url ?? "unpaired"}</code>
+              <code>{activeServer?.url ?? t("app.unpaired")}</code>
             </div>
             <button type="button" onClick={handleOpenWorkspace} disabled={!canOpenWorkspace}>
               <MonitorUp size={16} aria-hidden="true" />
-              Open workspace
+              {t("app.openWorkspace")}
             </button>
           </section>
           {error ? (
@@ -1967,13 +2005,23 @@ export default function App() {
               onClose={() => setQrScannerOpen(false)}
             />
           ) : null}
+          <SettingsDialog
+            open={settingsOpen}
+            preferences={preferences}
+            effectiveLocale={effectiveLocale}
+            effectiveTheme={effectiveTheme}
+            onPreferencesChange={handlePreferencesChange}
+            onClose={() => setSettingsOpen(false)}
+          />
         </main>
         <StatusBar status={status} error={error} sessionId={attachedSessionId ?? selectedSessionId} />
       </div>
+      </I18nProvider>
     );
   }
 
   return (
+    <I18nProvider locale={effectiveLocale}>
     <div
       className={[
         "app-shell",
@@ -1993,7 +2041,7 @@ export default function App() {
         <button
           type="button"
           className="mobile-backdrop mobile-menu-backdrop"
-          aria-label="Close mobile workspace menu"
+          aria-label={t("app.closeMobileMenu")}
           onClick={() => setMobileMenuOpen(false)}
         />
       ) : null}
@@ -2005,7 +2053,7 @@ export default function App() {
               <button
                 type="button"
                 className="icon-button"
-                aria-label="Expand sidebar"
+                aria-label={t("app.expandSidebar")}
                 onClick={() => setSidebarCollapsed(false)}
               >
                 <PanelLeftOpen size={16} aria-hidden="true" />
@@ -2017,7 +2065,7 @@ export default function App() {
                   <button
                     type="button"
                     className="icon-button"
-                    aria-label="New session"
+                    aria-label={t("app.newSession")}
                     onClick={handleCreateSession}
                     disabled={status === "creating"}
                   >
@@ -2026,17 +2074,17 @@ export default function App() {
                   <button
                     type="button"
                     className="icon-button"
-                    aria-label="Refresh"
+                    aria-label={t("app.refresh")}
                     onClick={handleRefresh}
                     disabled={status === "listing"}
                   >
                     <RefreshCcw size={16} aria-hidden="true" />
                   </button>
-                  <button type="button" className="icon-button" aria-label="Disconnect" onClick={handleDisconnectAttach} disabled={!attachedSessionId}>
+                  <button type="button" className="icon-button" aria-label={t("app.disconnect")} onClick={handleDisconnectAttach} disabled={!attachedSessionId}>
                     <Unplug size={16} aria-hidden="true" />
                   </button>
                 </div>
-                <section className="collapsed-session-list" aria-label="collapsed sessions">
+                <section className="collapsed-session-list" aria-label={t("app.collapsedSessions")}>
                   {orderedSessions.map((session) => (
                     <button
                       type="button"
@@ -2050,8 +2098,8 @@ export default function App() {
                         .join(" ")}
                       aria-label={
                         newOutputSessionIds.has(session.session_id)
-                          ? `Select ${sessionDisplayName(session)}, new output`
-                          : `Select ${sessionDisplayName(session)}`
+                          ? t("sessions.selectNewOutput", { name: sessionDisplayName(session) })
+                          : t("sessions.select", { name: sessionDisplayName(session) })
                       }
                       onClick={() => void handleAttach(session.session_id)}
                     >
@@ -2067,12 +2115,12 @@ export default function App() {
             <div className="brand-row">
             <div className="brand-title">
               <Cable size={18} aria-hidden="true" />
-                <span>Termd</span>
+                <span>{t("app.termd")}</span>
               </div>
               <button
                 type="button"
                 className="icon-button sidebar-collapse-toggle"
-                aria-label="Collapse sidebar"
+                aria-label={t("app.collapseSidebar")}
                 onClick={() => setSidebarCollapsed(true)}
               >
                 <PanelLeftClose size={16} aria-hidden="true" />
@@ -2080,20 +2128,20 @@ export default function App() {
             </div>
             {!isMobileLayout && connectionReady ? (
               <>
-                <div className="panel session-create" aria-label="new session">
+                <div className="panel session-create" aria-label={t("app.newSession")}>
                   <button type="button" onClick={handleCreateSession} disabled={status === "creating"}>
                     <Plus size={16} aria-hidden="true" />
-                    New session
+                    {t("app.newSession")}
                   </button>
                 </div>
                 <div className="panel-actions">
                   <button type="button" onClick={handleRefresh} disabled={status === "listing"}>
                     <RefreshCcw size={16} aria-hidden="true" />
-                    Refresh
+                    {t("app.refresh")}
                   </button>
                   <button type="button" onClick={handleDisconnectAttach} disabled={!attachedSessionId}>
                     <Unplug size={16} aria-hidden="true" />
-                    Disconnect
+                    {t("app.disconnect")}
                   </button>
                 </div>
                 <SessionList
@@ -2122,7 +2170,7 @@ export default function App() {
             <button
               type="button"
               className="icon-button mobile-menu-toggle"
-              aria-label="Open mobile workspace menu"
+              aria-label={t("app.openMobileMenu")}
               aria-expanded={mobileMenuOpen}
               onClick={handleToggleMobileMenu}
             >
@@ -2133,7 +2181,7 @@ export default function App() {
             <button
               type="button"
               className="toolbar-title toolbar-title-button"
-              aria-label="Open session list from title"
+              aria-label={t("app.openSessionListFromTitle")}
               aria-expanded={showMobileSessionsPanel}
               onClick={handleOpenMobileSessions}
             >
@@ -2160,13 +2208,13 @@ export default function App() {
               <button
                 type="button"
                 className="toolbar-clients-button"
-                aria-label="Clients"
+                aria-label={t("app.clients")}
                 aria-controls="daemon-clients-popover"
                 aria-expanded={clientsOpen}
                 onClick={() => setClientsOpen((open) => !open)}
               >
                 <UsersRound size={16} aria-hidden="true" />
-                Clients
+                {t("app.clients")}
               </button>
               {clientsOpen ? (
                 <div className="clients-popover toolbar-clients-popover" id="daemon-clients-popover">
@@ -2180,7 +2228,10 @@ export default function App() {
               ) : null}
               <button type="button" className="toolbar-admin-button" onClick={() => handleOpenAdmin()}>
                 <Server size={16} aria-hidden="true" />
-                Daemons
+                {t("app.daemons")}
+              </button>
+              <button type="button" className="icon-button toolbar-settings-button" aria-label={t("app.settings")} onClick={() => setSettingsOpen(true)}>
+                <Settings size={16} aria-hidden="true" />
               </button>
             </div>
           ) : null}
@@ -2215,6 +2266,7 @@ export default function App() {
                 focusRequest={terminalFocusRequest}
                 mobileInputMode={isMobileLayout}
                 mobileKeyboardOpen={mobileKeyboardOpen}
+                theme={effectiveTheme}
                 resizeEnabled={terminalResizeOwner}
                 outputResetVersion={terminalOutputResetVersion}
                 takeOutput={takeTerminalOutput}
@@ -2253,57 +2305,61 @@ export default function App() {
                   />
                 </>
               ) : !isMobileLayout ? (
-                <aside className="files-rail" aria-label="files panel collapsed">
-                  <button type="button" className="icon-button" aria-label="Show files panel" onClick={() => setFilesPanelOpen(true)}>
+                <aside className="files-rail" aria-label={t("app.filesPanelCollapsed")}>
+                  <button type="button" className="icon-button" aria-label={t("app.showFilesPanel")} onClick={() => setFilesPanelOpen(true)}>
                     <PanelRightOpen size={16} aria-hidden="true" />
                   </button>
                 </aside>
               ) : null}
             </>
           ) : (
-            <div className="terminal-pane" aria-label="terminal unavailable">
-              <div className="terminal-placeholder">disconnected</div>
+            <div className="terminal-pane" aria-label={t("app.terminalUnavailable")}>
+              <div className="terminal-placeholder">{t("app.disconnected")}</div>
             </div>
           )}
         </div>
         {showMobileWorkspaceMenu && mobileMenuOpen ? (
-          <nav className="mobile-menu-popover" aria-label="mobile workspace menu">
+          <nav className="mobile-menu-popover" aria-label={t("app.mobileWorkspaceMenu")}>
             <button type="button" onClick={() => handleOpenAdmin()}>
               <Server size={16} aria-hidden="true" />
-              Daemons
+              {t("app.daemons")}
             </button>
             <button type="button" onClick={handleOpenMobileSessions}>
               <MonitorUp size={16} aria-hidden="true" />
-              Sessions
+              {t("app.sessions")}
             </button>
             <button type="button" onClick={handleOpenMobileFiles} disabled={!attachedSessionId}>
               <Folder size={16} aria-hidden="true" />
-              Files
+              {t("app.files")}
             </button>
             <button type="button" onClick={handleOpenMobileNewSession} disabled={status === "creating"}>
               <Plus size={16} aria-hidden="true" />
-              New
+              {t("app.new")}
+            </button>
+            <button type="button" onClick={() => setSettingsOpen(true)}>
+              <Settings size={16} aria-hidden="true" />
+              {t("app.settings")}
             </button>
           </nav>
         ) : null}
         {showMobileSessionsPanel ? (
-          <section className="mobile-panel mobile-sessions-panel" aria-label="sessions panel">
+          <section className="mobile-panel mobile-sessions-panel" aria-label={t("app.sessionsPanel")}>
             <header className="mobile-panel-header">
               <div className="mobile-panel-title">
                 <MonitorUp size={15} aria-hidden="true" />
-                <span>Sessions</span>
+                <span>{t("app.sessions")}</span>
               </div>
               <div className="mobile-panel-actions">
                 <button
                   type="button"
                   className="icon-button"
-                  aria-label="Refresh sessions"
+                  aria-label={t("sessions.refresh")}
                   onClick={handleRefresh}
                   disabled={status === "listing"}
                 >
                   <RefreshCcw size={15} aria-hidden="true" />
                 </button>
-                <button type="button" className="icon-button" aria-label="Close sessions panel" onClick={handleCloseMobilePanel}>
+                <button type="button" className="icon-button" aria-label={t("sessions.closePanel")} onClick={handleCloseMobilePanel}>
                   <X size={15} aria-hidden="true" />
                 </button>
               </div>
@@ -2364,8 +2420,17 @@ export default function App() {
           saving={fileEditor?.saving}
           error={fileEditor?.error}
           language={languageForPath(fileEditor?.path ?? "")}
+          theme={effectiveTheme}
           onSave={handleSaveOpenFile}
           onClose={() => setFileEditor(undefined)}
+        />
+        <SettingsDialog
+          open={settingsOpen}
+          preferences={preferences}
+          effectiveLocale={effectiveLocale}
+          effectiveTheme={effectiveTheme}
+          onPreferencesChange={handlePreferencesChange}
+          onClose={() => setSettingsOpen(false)}
         />
         <DaemonStatusPanel
           status={daemonStatus}
@@ -2377,6 +2442,7 @@ export default function App() {
         />
       </main>
     </div>
+    </I18nProvider>
   );
 }
 
@@ -2385,11 +2451,12 @@ function ProtocolErrorAlert(props: {
   onRefresh?: () => void;
   refreshing?: boolean;
 }) {
+  const { t } = useI18n();
   return (
-    <section className="protocol-error-alert" role="alert" aria-label="Connection error">
+    <section className="protocol-error-alert" role="alert" aria-label={t("protocolError.title")}>
       <div className="protocol-error-alert-title">
         <CircleAlert size={17} aria-hidden="true" />
-        <span>Connection error</span>
+        <span>{t("protocolError.title")}</span>
         {props.onRefresh ? (
           <button
             type="button"
@@ -2398,14 +2465,14 @@ function ProtocolErrorAlert(props: {
             disabled={props.refreshing}
           >
             <RefreshCcw size={15} aria-hidden="true" />
-            Refresh
+            {t("protocolError.retry")}
           </button>
         ) : null}
       </div>
       <div className="protocol-error-alert-detail">
         <code>{props.error.code}</code>
         {/* 主体提示只展示 SafeError 字段，避免把 token、签名或密文等原始 payload 泄漏到 UI。 */}
-        <span>{props.error.message}</span>
+        <span>{translateSafeErrorMessage(props.error, t)}</span>
       </div>
     </section>
   );
@@ -2416,33 +2483,34 @@ function SessionOperatorsBar(props: {
   currentDeviceId?: UUID;
   sessionId: UUID;
 }) {
+  const { t } = useI18n();
   return (
-    <div className="session-operators" aria-label="session operators">
+    <div className="session-operators" aria-label={t("operators.aria")}>
       <div className="session-operators-title">
         <UsersRound size={15} aria-hidden="true" />
         <span>{props.operators.length}</span>
       </div>
       {props.operators.length === 0 ? (
-        <span className="session-operator muted">no operators</span>
+        <span className="session-operator muted">{t("operators.empty")}</span>
       ) : (
         props.operators.map((client) => {
           const isCurrentDevice = client.device_id === props.currentDeviceId;
-          const label = client.name?.trim() || client.peer_ip || "Client";
+          const label = client.name?.trim() || client.peer_ip || t("operators.client");
           const cursor =
             client.cursor_session_id === props.sessionId && client.cursor_row && client.cursor_col
               ? `${client.cursor_row}:${client.cursor_col}`
-              : "cursor ?";
+              : t("operators.cursorUnknown");
           const focus =
             client.cursor_session_id === props.sessionId && client.cursor_focused !== undefined && client.cursor_focused !== null
               ? client.cursor_focused
-                ? "focused"
-                : "blurred"
+                ? t("operators.focused")
+                : t("operators.blurred")
               : undefined;
           return (
             <span className="session-operator" key={client.client_id} title={label}>
               <span className="status-dot online" aria-hidden="true" />
               <span>{label}</span>
-              {isCurrentDevice ? <span>you</span> : null}
+              {isCurrentDevice ? <span>{t("operators.you")}</span> : null}
               <span className="session-operator-cursor">{cursor}</span>
               {focus ? <span className={client.cursor_focused ? "focus-chip focused" : "focus-chip"}>{focus}</span> : null}
             </span>
@@ -2461,6 +2529,7 @@ function DaemonStatusPanel(props: {
   error?: SafeError;
   compact?: boolean;
 }) {
+  const { t } = useI18n();
   const memoryValue = props.status
     ? props.compact
       ? `${formatBytesTiny(usedBytes(props.status.memory_total_bytes, props.status.memory_available_bytes))}/${formatBytesTiny(props.status.memory_total_bytes)}`
@@ -2477,37 +2546,37 @@ function DaemonStatusPanel(props: {
   return (
     <footer
       className={props.compact ? "daemon-status-panel daemon-status-strip compact" : "daemon-status-panel daemon-status-strip"}
-      aria-label="daemon server status"
+      aria-label={t("daemonStatus.aria")}
       role="contentinfo"
     >
       {props.compact ? null : (
         <header className="daemon-status-header">
           <div className="daemon-status-title">
             <Server size={13} aria-hidden="true" />
-            <span>{props.status?.host_name ?? "daemon"}</span>
+            <span>{props.status?.host_name ?? t("daemonStatus.fallbackHost")}</span>
           </div>
         </header>
       )}
       {!props.compact && props.error ? (
         <div className="daemon-status-error">
           <code>{props.error.code}</code>
-          <span>{props.error.message}</span>
+          <span>{translateSafeErrorMessage(props.error, t)}</span>
         </div>
       ) : null}
       <div className="daemon-status-grid">
         <CpuMetric value={cpuValue} history={props.cpuHistory} />
-        <Metric label="Mem" value={memoryValue} className="daemon-status-memory" />
-        <Metric label="Disk" value={diskValue} className="daemon-status-disk" />
-        <Metric label="Net" value={networkValue} className="daemon-status-network" />
+        <Metric label={t("daemonStatus.memory")} value={memoryValue} className="daemon-status-memory" />
+        <Metric label={t("daemonStatus.disk")} value={diskValue} className="daemon-status-disk" />
+        <Metric label={t("daemonStatus.network")} value={networkValue} className="daemon-status-network" />
         {props.compact ? null : (
           <Metric
-            label="Load"
+            label={t("daemonStatus.load")}
             value={props.status ? props.status.load_avg.map((value) => value.toFixed(2)).join(" ") : "-"}
             className="daemon-status-load"
           />
         )}
         {props.compact ? null : (
-          <Metric label="Uptime" value={props.status ? formatDuration(props.status.uptime_seconds) : "-"} className="daemon-status-uptime" />
+          <Metric label={t("daemonStatus.uptime")} value={props.status ? formatDuration(props.status.uptime_seconds) : "-"} className="daemon-status-uptime" />
         )}
       </div>
     </footer>
@@ -2515,9 +2584,10 @@ function DaemonStatusPanel(props: {
 }
 
 function CpuMetric(props: { value: string; history: number[] }) {
+  const { t } = useI18n();
   return (
     <div className="daemon-status-metric daemon-status-cpu">
-      <span>CPU</span>
+      <span>{t("daemonStatus.cpu")}</span>
       <strong>{props.value}</strong>
       <CpuBarChart samples={props.history} />
     </div>
@@ -2525,13 +2595,14 @@ function CpuMetric(props: { value: string; history: number[] }) {
 }
 
 function CpuBarChart(props: { samples: number[] }) {
+  const { t } = useI18n();
   const bars = cpuBarChartRects(props.samples, CPU_BAR_CHART_WIDTH, CPU_BAR_CHART_HEIGHT, CPU_BAR_CHART_COUNT);
   return (
     <svg
       className="daemon-cpu-bar-chart"
       viewBox={`0 0 ${CPU_BAR_CHART_WIDTH} ${CPU_BAR_CHART_HEIGHT}`}
       role="img"
-      aria-label="CPU usage bars"
+      aria-label={t("daemonStatus.cpuBars")}
     >
       <rect
         className="daemon-cpu-bar-frame"
@@ -2605,6 +2676,34 @@ function useMobileLayout(): boolean {
   }, []);
 
   return isMobileLayout;
+}
+
+function useSystemTheme(): "dark" | "light" {
+  const getSnapshot = () => {
+    if (typeof window === "undefined" || typeof window.matchMedia !== "function") {
+      return "dark" as const;
+    }
+    return window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+  };
+
+  const [systemTheme, setSystemTheme] = useState<"dark" | "light">(getSnapshot);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || typeof window.matchMedia !== "function") {
+      return undefined;
+    }
+    const mediaQuery = window.matchMedia("(prefers-color-scheme: light)");
+    const handleChange = () => setSystemTheme(mediaQuery.matches ? "light" : "dark");
+    handleChange();
+    if (typeof mediaQuery.addEventListener === "function") {
+      mediaQuery.addEventListener("change", handleChange);
+      return () => mediaQuery.removeEventListener("change", handleChange);
+    }
+    mediaQuery.addListener(handleChange);
+    return () => mediaQuery.removeListener(handleChange);
+  }, []);
+
+  return systemTheme;
 }
 
 function useVisualViewportMetrics(enabled: boolean): { height: number; offsetTop: number; keyboardOpen: boolean } {
@@ -2816,16 +2915,16 @@ function isLoopbackHost(hostname: string): boolean {
   return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1" || hostname === "[::1]";
 }
 
-function daemonDisplayLabel(server: PairedServerState, index: number): string {
+function daemonDisplayLabel(server: PairedServerState, index: number, t: Translate): string {
   const name = server.name?.trim();
   if (name) {
     return name;
   }
   try {
     const parsed = new URL(server.url);
-    return `Daemon ${index + 1} ${parsed.host}`;
+    return t("daemons.fallbackHostName", { index: index + 1, host: parsed.host });
   } catch {
-    return `Daemon ${index + 1}`;
+    return t("daemons.fallbackName", { index: index + 1 });
   }
 }
 

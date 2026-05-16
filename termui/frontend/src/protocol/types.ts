@@ -469,11 +469,21 @@ export interface PairedServerState {
   name?: string | null;
 }
 
+export type BrowserLanguagePreference = "auto" | "zh-CN" | "en-US";
+export type BrowserThemePreference = "system" | "dark" | "light";
+export type EffectiveTheme = "dark" | "light";
+
+export interface BrowserPreferences {
+  language: BrowserLanguagePreference;
+  theme: BrowserThemePreference;
+}
+
 export interface BrowserState {
   device?: DeviceState;
   pairedServers: PairedServerState[];
   defaultServerId?: UUID;
   defaultUrl?: string;
+  preferences?: BrowserPreferences;
 }
 
 export interface SafeError {

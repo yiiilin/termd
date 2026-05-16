@@ -1,5 +1,6 @@
 import { Check, Pencil, Trash2, X } from "lucide-react";
 import type { PairedServerState, UUID } from "../protocol/types";
+import { useI18n } from "../i18n";
 
 export interface DaemonManagerOption {
   server: PairedServerState;
@@ -20,10 +21,11 @@ interface DaemonManagerPanelProps {
 }
 
 export function DaemonManagerPanel(props: DaemonManagerPanelProps) {
+  const { t } = useI18n();
   return (
-    <section className="panel daemon-manager" aria-label="daemon manager">
-      <div className="panel-title">Daemons</div>
-      {props.servers.length === 0 ? <div className="empty-list">No daemons</div> : null}
+    <section className="panel daemon-manager" aria-label={t("daemons.managerAria")}>
+      <div className="panel-title">{t("daemons.title")}</div>
+      {props.servers.length === 0 ? <div className="empty-list">{t("daemons.empty")}</div> : null}
       {props.servers.map((item) => {
         const label = daemonLabel(item.server, item.label);
         const active = item.server.server_id === props.activeServerId;
@@ -33,9 +35,9 @@ export function DaemonManagerPanel(props: DaemonManagerPanelProps) {
           <div className={active ? "daemon-manager-row active" : "daemon-manager-row"} key={item.server.server_id}>
             {renaming ? (
               <label className="daemon-rename-form">
-                <span>Daemon name</span>
+                <span>{t("daemons.name")}</span>
                 <input
-                  aria-label="Daemon name"
+                  aria-label={t("daemons.name")}
                   value={props.renameDraft}
                   onChange={(event) => props.onRenameDraftChange(event.target.value)}
                   autoFocus
@@ -53,7 +55,7 @@ export function DaemonManagerPanel(props: DaemonManagerPanelProps) {
                   <button
                     type="button"
                     className="icon-button"
-                    aria-label="Save daemon name"
+                    aria-label={t("daemons.saveName")}
                     onClick={() => props.onSaveRename(item.server.server_id)}
                   >
                     <Check size={15} aria-hidden="true" />
@@ -61,7 +63,7 @@ export function DaemonManagerPanel(props: DaemonManagerPanelProps) {
                   <button
                     type="button"
                     className="icon-button"
-                    aria-label="Cancel daemon rename"
+                    aria-label={t("daemons.cancelRename")}
                     onClick={props.onCancelRename}
                   >
                     <X size={15} aria-hidden="true" />
@@ -74,14 +76,14 @@ export function DaemonManagerPanel(props: DaemonManagerPanelProps) {
                     // 当前 daemon 只表达选择状态；进入工作台统一走页面级 Open workspace，避免管理动作隐式跳转。
                     onClick={() => props.onSelect(item.server.server_id)}
                     disabled={active}
-                    aria-label={`Use daemon ${label}`}
+                    aria-label={t("daemons.useDaemon", { label })}
                   >
-                    {active ? "Active" : "Use"}
+                    {active ? t("daemons.active") : t("daemons.use")}
                   </button>
                   <button
                     type="button"
                     className="icon-button"
-                    aria-label={`Rename daemon ${label}`}
+                    aria-label={t("daemons.renameDaemon", { label })}
                     onClick={() => props.onStartRename(item.server.server_id, label)}
                   >
                     <Pencil size={15} aria-hidden="true" />
@@ -89,7 +91,7 @@ export function DaemonManagerPanel(props: DaemonManagerPanelProps) {
                   <button
                     type="button"
                     className="icon-button danger"
-                    aria-label={`Delete daemon ${label}`}
+                    aria-label={t("daemons.deleteDaemon", { label })}
                     onClick={() => props.onForget(item.server.server_id)}
                   >
                     <Trash2 size={15} aria-hidden="true" />

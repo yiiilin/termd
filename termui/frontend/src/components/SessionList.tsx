@@ -8,6 +8,7 @@ import {
 } from "react";
 import type { SessionSummaryPayload, UUID } from "../protocol/types";
 import { sessionDisplayName } from "../session-names";
+import { useI18n } from "../i18n";
 
 interface SessionListProps {
   sessions: SessionSummaryPayload[];
@@ -28,6 +29,7 @@ interface SessionListProps {
 export function SessionList(props: SessionListProps) {
   const [draggingSessionId, setDraggingSessionId] = useState<UUID | undefined>();
   const [dragTargetSessionId, setDragTargetSessionId] = useState<UUID | undefined>();
+  const { t } = useI18n();
   const rowRefs = useRef(new Map<UUID, HTMLDivElement>());
   const pointerDragRef = useRef<{
     pointerId: number;
@@ -147,8 +149,8 @@ export function SessionList(props: SessionListProps) {
   });
 
   return (
-    <section className="session-list" aria-label="sessions">
-      {props.sessions.length === 0 ? <div className="empty-list">No sessions</div> : null}
+    <section className="session-list" aria-label={t("sessions.aria")}>
+      {props.sessions.length === 0 ? <div className="empty-list">{t("sessions.empty")}</div> : null}
       {props.sessions.map((session) => {
         const displayName = sessionDisplayName(session);
         const isRenaming = props.renamingSessionId === session.session_id;
@@ -178,7 +180,7 @@ export function SessionList(props: SessionListProps) {
             }}
             role="button"
             tabIndex={0}
-            aria-label={hasNewOutput ? `Open ${displayName}, new output` : `Open ${displayName}`}
+            aria-label={hasNewOutput ? t("sessions.openNewOutput", { name: displayName }) : t("sessions.open", { name: displayName })}
             onDragOver={(event) => {
               if (!draggingSessionId || draggingSessionId === session.session_id) {
                 return;
@@ -207,7 +209,7 @@ export function SessionList(props: SessionListProps) {
               <button
                 type="button"
                 className="icon-button session-drag-handle"
-                aria-label={`Drag ${displayName}`}
+                aria-label={t("sessions.drag", { name: displayName })}
                 draggable={Boolean(props.onReorder)}
                 onClick={(event) => event.stopPropagation()}
                 onPointerDown={(event: ReactPointerEvent<HTMLButtonElement>) => {
@@ -286,11 +288,11 @@ export function SessionList(props: SessionListProps) {
                     }}
                   >
                     <label className="sr-only" htmlFor={`session-name-${session.session_id}`}>
-                      Session name
+                      {t("sessions.name")}
                     </label>
                     <input
                       id={`session-name-${session.session_id}`}
-                      aria-label="Session name"
+                      aria-label={t("sessions.name")}
                       value={props.renameDraft}
                       onChange={(event) => props.onRenameDraftChange(event.target.value)}
                       autoFocus
@@ -300,19 +302,19 @@ export function SessionList(props: SessionListProps) {
                   <strong>{displayName}</strong>
                 )}
               </div>
-              <div className="session-actions" aria-label="Session actions" onClick={(event) => event.stopPropagation()}>
+              <div className="session-actions" aria-label={t("sessions.actions")} onClick={(event) => event.stopPropagation()}>
                 {isRenaming ? (
                   <>
                     <button
                       type="submit"
                       className="icon-button"
                       form={`session-rename-${session.session_id}`}
-                      aria-label="Save session name"
+                      aria-label={t("sessions.saveName")}
                       disabled={!props.canSaveRename}
                     >
                       <Check size={15} aria-hidden="true" />
                     </button>
-                    <button type="button" className="icon-button" aria-label="Cancel rename" onClick={props.onCancelRename}>
+                    <button type="button" className="icon-button" aria-label={t("sessions.cancelRename")} onClick={props.onCancelRename}>
                       <X size={15} aria-hidden="true" />
                     </button>
                   </>
@@ -321,7 +323,7 @@ export function SessionList(props: SessionListProps) {
                     <button
                       type="button"
                       className="icon-button"
-                      aria-label="Rename session"
+                      aria-label={t("sessions.rename")}
                       onClick={() => props.onStartRename(session.session_id, displayName)}
                     >
                       <Pencil size={15} aria-hidden="true" />
@@ -329,7 +331,7 @@ export function SessionList(props: SessionListProps) {
                     <button
                       type="button"
                       className="icon-button danger"
-                      aria-label="Close session"
+                      aria-label={t("sessions.close")}
                       onClick={() => props.onClose(session.session_id)}
                     >
                       <Trash2 size={15} aria-hidden="true" />

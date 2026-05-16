@@ -1,10 +1,23 @@
 import { generateDeviceIdentity } from "../protocol/auth";
-import type { BrowserState, DeviceState, PairAcceptPayload, PairedServerState } from "../protocol/types";
+import type {
+  BrowserLanguagePreference,
+  BrowserPreferences,
+  BrowserState,
+  BrowserThemePreference,
+  DeviceState,
+  PairAcceptPayload,
+  PairedServerState,
+} from "../protocol/types";
 
 const DB_NAME = "termd-termui-web";
 const DB_VERSION = 1;
 const STORE_NAME = "state";
 const STATE_KEY = "current";
+
+export const DEFAULT_BROWSER_PREFERENCES: BrowserPreferences = {
+  language: "auto",
+  theme: "system",
+};
 
 export async function loadBrowserState(): Promise<BrowserState> {
   const db = await openStateDb();
@@ -112,6 +125,16 @@ export async function recordServerUrl(serverId: string, url: string): Promise<Br
   return next;
 }
 
+export async function saveBrowserPreferences(preferences: BrowserPreferences): Promise<BrowserState> {
+  const state = await loadBrowserState();
+  const next = normalizeState({
+    ...state,
+    preferences,
+  });
+  await saveBrowserState(next);
+  return next;
+}
+
 export async function selectDefaultServer(serverId: string): Promise<BrowserState> {
   const state = await loadBrowserState();
   const server = state.pairedServers.find((candidate) => candidate.server_id === serverId);
@@ -171,7 +194,36 @@ function normalizeState(state: BrowserState): BrowserState {
     pairedServers,
     defaultServerId: state.defaultServerId,
     defaultUrl,
+    preferences: normalizePreferences(state.preferences),
   };
+}
+
+function normalizePreferences(value: unknown): BrowserPreferences {
+  const source = isObjectRecord(value) ? value : {};
+  const language = normalizeLanguagePreference(source.language);
+  const theme = normalizeThemePreference(source.theme);
+  return {
+    language,
+    theme,
+  };
+}
+
+function normalizeLanguagePreference(value: unknown): BrowserLanguagePreference {
+  if (value === "zh-CN" || value === "en-US" || value === "auto") {
+    return value;
+  }
+  return DEFAULT_BROWSER_PREFERENCES.language;
+}
+
+function normalizeThemePreference(value: unknown): BrowserThemePreference {
+  if (value === "dark" || value === "light" || value === "system") {
+    return value;
+  }
+  return DEFAULT_BROWSER_PREFERENCES.theme;
+}
+
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
 }
 
 export function normalizeRouteWsUrl(rawUrl: string, serverId?: string): string {

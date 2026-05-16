@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Camera, ImageUp, X } from "lucide-react";
 import QrScanner from "qr-scanner";
+import { useI18n } from "../i18n";
 
 interface PairingQrScannerProps {
   onDetected: (value: string) => void;
@@ -8,10 +9,11 @@ interface PairingQrScannerProps {
 }
 
 export function PairingQrScanner({ onDetected, onClose }: PairingQrScannerProps) {
+  const { t } = useI18n();
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const scannerRef = useRef<QrScanner | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
-  const [status, setStatus] = useState("Starting camera");
+  const [status, setStatus] = useState(t("qr.startingCamera"));
   const [error, setError] = useState<string | undefined>();
   const [manualInvite, setManualInvite] = useState("");
 
@@ -52,7 +54,7 @@ export function PairingQrScanner({ onDetected, onClose }: PairingQrScannerProps)
 
       try {
         if (!(await QrScanner.hasCamera())) {
-          throw new Error("Camera not available");
+          throw new Error(t("qr.cameraNotAvailable"));
         }
 
         if (cancelled) {
@@ -87,7 +89,7 @@ export function PairingQrScanner({ onDetected, onClose }: PairingQrScannerProps)
               if (caught === QrScanner.NO_QR_CODE_FOUND) {
                 return;
               }
-              setError("Unable to read QR code");
+              setError(t("qr.unableToRead"));
             },
             preferredCamera: "environment",
             returnDetailedScanResult: true,
@@ -102,11 +104,11 @@ export function PairingQrScanner({ onDetected, onClose }: PairingQrScannerProps)
           return;
         }
 
-        setStatus("Scanning. Fill the frame with the QR code.");
+        setStatus(t("qr.scanningHelp"));
       } catch {
         if (!cancelled) {
-          setError("Camera access failed");
-          setStatus("Scanner unavailable");
+          setError(t("qr.cameraAccessFailed"));
+          setStatus(t("qr.scannerUnavailable"));
         }
       }
     }
@@ -117,7 +119,7 @@ export function PairingQrScanner({ onDetected, onClose }: PairingQrScannerProps)
       cancelled = true;
       destroyScanner(scanner);
     };
-  }, [stopAndDetect]);
+  }, [stopAndDetect, t]);
 
   const handleManualSubmit = () => {
     stopAndDetect(manualInvite);
@@ -129,7 +131,7 @@ export function PairingQrScanner({ onDetected, onClose }: PairingQrScannerProps)
     }
 
     setError(undefined);
-    setStatus("Reading image");
+    setStatus(t("qr.readingImage"));
     try {
       const result = await QrScanner.scanImage(file, {
         alsoTryWithoutScanRegion: true,
@@ -137,8 +139,8 @@ export function PairingQrScanner({ onDetected, onClose }: PairingQrScannerProps)
       });
       stopAndDetect(result.data);
     } catch {
-      setError("No QR code found in image");
-      setStatus("Scanning");
+      setError(t("qr.noQrInImage"));
+      setStatus(t("qr.scanning"));
     } finally {
       if (fileInputRef.current) {
         fileInputRef.current.value = "";
@@ -146,15 +148,19 @@ export function PairingQrScanner({ onDetected, onClose }: PairingQrScannerProps)
     }
   };
 
+  useEffect(() => {
+    setStatus((current) => (current ? current : t("qr.startingCamera")));
+  }, [t]);
+
   return (
     <div className="modal-backdrop" role="presentation">
-      <section className="qr-scanner-dialog" role="dialog" aria-modal="true" aria-label="Scan pairing QR">
+      <section className="qr-scanner-dialog" role="dialog" aria-modal="true" aria-label={t("qr.scanPairing")}>
         <header className="qr-scanner-header">
           <div className="qr-scanner-title">
             <Camera size={16} aria-hidden="true" />
-            <span>Scan pairing QR</span>
+            <span>{t("qr.scanPairing")}</span>
           </div>
-          <button type="button" className="icon-button" aria-label="Close scanner" onClick={onClose}>
+          <button type="button" className="icon-button" aria-label={t("qr.closeScanner")} onClick={onClose}>
             <X size={16} aria-hidden="true" />
           </button>
         </header>
@@ -165,7 +171,7 @@ export function PairingQrScanner({ onDetected, onClose }: PairingQrScannerProps)
         <div className={error ? "qr-scanner-status error" : "qr-scanner-status"}>{error ?? status}</div>
         <div className="qr-scanner-fallbacks">
           <textarea
-            aria-label="Invite code"
+            aria-label={t("qr.inviteCode")}
             value={manualInvite}
             placeholder="termd-pair:v1:..."
             spellCheck={false}
@@ -173,18 +179,18 @@ export function PairingQrScanner({ onDetected, onClose }: PairingQrScannerProps)
           />
           <div className="qr-scanner-actions">
             <button type="button" onClick={handleManualSubmit} disabled={!manualInvite.trim()}>
-              Use invite
+              {t("qr.useInvite")}
             </button>
             <button type="button" onClick={() => fileInputRef.current?.click()}>
               <ImageUp size={15} aria-hidden="true" />
-              Upload image
+              {t("qr.uploadImage")}
             </button>
             <input
               ref={fileInputRef}
               className="sr-only"
               type="file"
               accept="image/*"
-              aria-label="Upload QR image"
+              aria-label={t("qr.uploadQrImage")}
               onChange={(event) => void handleImageUpload(event.currentTarget.files?.[0])}
             />
           </div>

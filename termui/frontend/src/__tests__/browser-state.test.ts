@@ -8,6 +8,7 @@ import {
   recordPairing,
   recordServerUrl,
   renameDaemon,
+  saveBrowserPreferences,
   saveBrowserState,
 } from "../state/browser-state";
 import type { BrowserState } from "../protocol/types";
@@ -191,6 +192,22 @@ describe("浏览器本地状态", () => {
     expect(raw).not.toContain("/home/me/project/src");
     expect(raw).not.toContain("pairing_token");
     expect(raw).not.toContain("terminal-secret");
+  });
+
+  it("持久化客户端偏好，并对旧数据或异常值做安全归一化", async () => {
+    const next = await saveBrowserPreferences({ language: "zh-CN", theme: "light" });
+    expect(next.preferences).toEqual({ language: "zh-CN", theme: "light" });
+    expect((await loadBrowserState()).preferences).toEqual({ language: "zh-CN", theme: "light" });
+
+    await saveBrowserState({
+      pairedServers: [],
+      preferences: {
+        language: "pirate",
+        theme: "neon",
+      },
+    } as unknown as BrowserState);
+
+    expect((await loadBrowserState()).preferences).toEqual({ language: "auto", theme: "system" });
   });
 });
 

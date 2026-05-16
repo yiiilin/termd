@@ -1,8 +1,10 @@
 import { useEffect, useLayoutEffect, useRef, useState, type MouseEvent, type PointerEvent as ReactPointerEvent } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
-import { GripVertical, Maximize2, RotateCcw, ZoomIn, ZoomOut } from "lucide-react";
-import type { SessionCursorPresence, TerminalSize } from "../protocol/types";
+import { ClipboardPaste, GripVertical, Maximize2, RotateCcw, ZoomIn, ZoomOut } from "lucide-react";
+import type { EffectiveTheme, SessionCursorPresence, TerminalSize } from "../protocol/types";
+import { useI18n } from "../i18n";
+import { terminalTheme } from "../theme";
 
 const TERMINAL_FONT_SIZE = 13;
 const MOBILE_TERMINAL_FONT_SIZE = 12;
@@ -31,11 +33,11 @@ type MobileDirection = "up" | "down" | "left" | "right";
 type MobileDirectionTier = 1 | 2 | 3;
 
 const MOBILE_SHORTCUT_KEYS = [
-  { label: "Tab", ariaLabel: "Send Tab", data: "\t" },
-  { label: "Esc", ariaLabel: "Send Escape", data: "\x1b" },
-  { label: "^C", ariaLabel: "Send Ctrl-C", data: "\x03" },
-  { label: "^Z", ariaLabel: "Send Ctrl-Z", data: "\x1a" },
-  { label: "^D", ariaLabel: "Send Ctrl-D", data: "\x04" },
+  { label: "Tab", ariaKey: "terminal.sendTab", data: "\t" },
+  { label: "Esc", ariaKey: "terminal.sendEscape", data: "\x1b" },
+  { label: "^C", ariaKey: "terminal.sendCtrlC", data: "\x03" },
+  { label: "^Z", ariaKey: "terminal.sendCtrlZ", data: "\x1a" },
+  { label: "^D", ariaKey: "terminal.sendCtrlD", data: "\x04" },
 ] as const;
 
 function sameTerminalDimensions(
@@ -51,6 +53,7 @@ interface TerminalPaneProps {
   focusRequest?: number;
   mobileInputMode?: boolean;
   mobileKeyboardOpen?: boolean;
+  theme?: EffectiveTheme;
   resizeEnabled?: boolean;
   outputResetVersion: number;
   takeOutput: () => Uint8Array[];
@@ -61,6 +64,7 @@ interface TerminalPaneProps {
 }
 
 export function TerminalPane(props: TerminalPaneProps) {
+  const { t } = useI18n();
   const hostRef = useRef<HTMLDivElement | null>(null);
   const scrollportRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLDivElement | null>(null);
@@ -106,6 +110,7 @@ export function TerminalPane(props: TerminalPaneProps) {
     repeatDirection?: MobileDirection;
     repeatCount: number;
   } | undefined>(undefined);
+  const lastNativePasteRef = useRef<{ text: string; atMs: number } | undefined>(undefined);
   const focusedRef = useRef(false);
   const clientSizeRef = useRef<TerminalSize | undefined>(undefined);
   const viewerModeRef = useRef(false);
@@ -486,6 +491,35 @@ export function TerminalPane(props: TerminalPaneProps) {
     terminalRef.current?.focus();
   };
 
+  const sendNativePasteText = (text: string) => {
+    if (!text) {
+      return;
+    }
+    const now = Date.now();
+    const lastPaste = lastNativePasteRef.current;
+    if (lastPaste?.text === text && now - lastPaste.atMs < 120) {
+      return;
+    }
+    // 移动端有些浏览器会连续触发 paste 和 beforeinput(insertFromPaste)；
+    // 这里去重只覆盖同一次系统粘贴，不影响快捷栏按钮反复粘贴。
+    lastNativePasteRef.current = { text, atMs: now };
+    sendTerminalControl(text);
+  };
+
+  const handlePasteShortcut = async () => {
+    try {
+      const text = await navigator.clipboard?.readText?.();
+      if (text) {
+        sendTerminalControl(text);
+      } else {
+        terminalRef.current?.focus();
+      }
+    } catch {
+      // 剪贴板读取可能被浏览器权限或非安全上下文拒绝；失败时只保持终端焦点。
+      terminalRef.current?.focus();
+    }
+  };
+
   const sendMobileDirection = (direction: MobileDirection) => {
     const sequences: Record<MobileDirection, string> = {
       up: "\x1b[A",
@@ -737,12 +771,7 @@ export function TerminalPane(props: TerminalPaneProps) {
       fontFamily: '"IBM Plex Mono", "SFMono-Regular", Consolas, monospace',
       fontSize: props.mobileInputMode ? MOBILE_TERMINAL_FONT_SIZE : TERMINAL_FONT_SIZE,
       convertEol: true,
-      theme: {
-        background: "#08110f",
-        foreground: "#d7f7e8",
-        cursor: "#d6ff5f",
-        selectionBackground: "#285f52",
-      },
+      theme: terminalTheme(props.theme ?? "dark"),
     });
     const fit = new FitAddon();
     terminal.loadAddon(fit);
@@ -763,23 +792,44 @@ export function TerminalPane(props: TerminalPaneProps) {
     });
     const helperTextarea = host.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
     const handleMobileBeforeInput = (event: InputEvent) => {
-      if (
-        !mobileInputModeRef.current ||
-        event.defaultPrevented ||
-        event.inputType !== "insertText" ||
-        (event.data !== " " && event.data !== ",")
-      ) {
+      if (!mobileInputModeRef.current || event.defaultPrevented) {
+        return;
+      }
+
+      const text =
+        event.inputType === "insertFromPaste" && event.data
+          ? event.data
+          : event.inputType === "insertText" && (event.data === " " || event.data === ",")
+            ? event.data
+            : undefined;
+      if (!text) {
         return;
       }
 
       // iOS/Safari 软键盘有时只给 beforeinput，不走 xterm 的 keydown/keypress。
-      // 对空格和逗号做最小兜底，并阻止后续 input，避免同一个字符被发送两次。
+      // 对空格、逗号和粘贴文本做兜底，并阻止后续 input，避免同一份内容发送两次。
       event.preventDefault();
       event.stopPropagation();
-      onInputRef.current(event.data);
-      queueCursorReport({ immediate: true });
+      if (event.inputType === "insertFromPaste") {
+        sendNativePasteText(text);
+        return;
+      }
+      sendTerminalControl(text);
+    };
+    const handleMobilePaste = (event: ClipboardEvent) => {
+      if (!mobileInputModeRef.current || event.defaultPrevented) {
+        return;
+      }
+      const text = event.clipboardData?.getData("text");
+      if (!text) {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      sendNativePasteText(text);
     };
     helperTextarea?.addEventListener("beforeinput", handleMobileBeforeInput);
+    helperTextarea?.addEventListener("paste", handleMobilePaste);
     const cursorMoveSubscription = terminal.onCursorMove(() => queueCursorReport());
     const writeParsedSubscription = terminal.onWriteParsed(() => queueCursorReport());
     const scrollSubscription = terminal.onScroll(() => scheduleMobileScrollPosition());
@@ -1124,6 +1174,7 @@ export function TerminalPane(props: TerminalPaneProps) {
       host.removeEventListener("focusin", handleFocusIn);
       host.removeEventListener("focusout", handleFocusOut);
       helperTextarea?.removeEventListener("beforeinput", handleMobileBeforeInput);
+      helperTextarea?.removeEventListener("paste", handleMobilePaste);
       dataSubscription.dispose();
       cursorMoveSubscription.dispose();
       writeParsedSubscription.dispose();
@@ -1159,6 +1210,15 @@ export function TerminalPane(props: TerminalPaneProps) {
       setViewerContentSize(undefined);
     };
   }, [props.attached]);
+
+  useEffect(() => {
+    const terminal = terminalRef.current;
+    if (!terminal) {
+      return;
+    }
+    terminal.options = { theme: terminalTheme(props.theme ?? "dark") };
+    terminal.refresh(0, Math.max(0, terminal.rows - 1));
+  }, [props.theme]);
 
   useEffect(() => {
     const terminal = terminalRef.current;
@@ -1226,16 +1286,16 @@ export function TerminalPane(props: TerminalPaneProps) {
       {resolutionMismatch ? (
         <div
           className="terminal-viewer-toolbar"
-          aria-label="viewer controls"
+          aria-label={t("terminal.viewerControls")}
           onClick={(event) => event.stopPropagation()}
           onMouseDown={(event) => event.preventDefault()}
         >
-          <span className="terminal-viewer-size">{viewerCols && viewerRows ? `${viewerCols}x${viewerRows}` : "viewer"}</span>
+          <span className="terminal-viewer-size">{viewerCols && viewerRows ? `${viewerCols}x${viewerRows}` : t("terminal.viewer")}</span>
           <button
             type="button"
             className="icon-button"
-            aria-label="Zoom out"
-            title="Zoom out"
+            aria-label={t("terminal.zoomOut")}
+            title={t("terminal.zoomOut")}
             onClick={() => setManualViewerScale((scale) => clampViewerScale(scale - VIEWER_ZOOM_STEP))}
           >
             <ZoomOut size={15} aria-hidden="true" />
@@ -1244,8 +1304,8 @@ export function TerminalPane(props: TerminalPaneProps) {
           <button
             type="button"
             className="icon-button"
-            aria-label="Zoom in"
-            title="Zoom in"
+            aria-label={t("terminal.zoomIn")}
+            title={t("terminal.zoomIn")}
             onClick={() => setManualViewerScale((scale) => clampViewerScale(scale + VIEWER_ZOOM_STEP))}
           >
             <ZoomIn size={15} aria-hidden="true" />
@@ -1253,8 +1313,8 @@ export function TerminalPane(props: TerminalPaneProps) {
           <button
             type="button"
             className="icon-button"
-            aria-label="Fit"
-            title="Fit"
+            aria-label={t("terminal.fit")}
+            title={t("terminal.fit")}
             onClick={fitViewerToScrollport}
           >
             <Maximize2 size={14} aria-hidden="true" />
@@ -1262,8 +1322,8 @@ export function TerminalPane(props: TerminalPaneProps) {
           <button
             type="button"
             className="icon-button"
-            aria-label="Reset zoom"
-            title="Reset zoom"
+            aria-label={t("terminal.resetZoom")}
+            title={t("terminal.resetZoom")}
             onClick={() => setManualViewerScale(() => 1)}
           >
             <RotateCcw size={14} aria-hidden="true" />
@@ -1295,7 +1355,7 @@ export function TerminalPane(props: TerminalPaneProps) {
       {props.attached && props.mobileInputMode && props.mobileKeyboardOpen ? (
         <div
           className="terminal-mobile-shortcuts"
-          aria-label="mobile terminal shortcuts"
+          aria-label={t("terminal.mobileShortcuts")}
           onClick={(event) => event.stopPropagation()}
         >
           {MOBILE_SHORTCUT_KEYS.map((shortcut) => (
@@ -1303,8 +1363,8 @@ export function TerminalPane(props: TerminalPaneProps) {
               type="button"
               key={shortcut.label}
               className="terminal-mobile-shortcut-button"
-              aria-label={shortcut.ariaLabel}
-              title={shortcut.ariaLabel}
+              aria-label={t(shortcut.ariaKey)}
+              title={t(shortcut.ariaKey)}
               onPointerDown={keepMobileKeyboardFocused}
               onClick={(event) => {
                 event.preventDefault();
@@ -1315,10 +1375,25 @@ export function TerminalPane(props: TerminalPaneProps) {
               {shortcut.label}
             </button>
           ))}
+          <button
+            type="button"
+            className="terminal-mobile-shortcut-button terminal-mobile-paste-button"
+            aria-label={t("terminal.paste")}
+            title={t("terminal.paste")}
+            onPointerDown={keepMobileKeyboardFocused}
+            onClick={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              void handlePasteShortcut();
+            }}
+          >
+            <ClipboardPaste size={13} aria-hidden="true" />
+            <span>{t("terminal.paste")}</span>
+          </button>
         </div>
       ) : null}
       {mobileDirectionActive ? (
-        <div className="terminal-direction-pad" aria-label="mobile direction gesture">
+        <div className="terminal-direction-pad" aria-label={t("terminal.mobileDirection")}>
           <span className={mobileDirection === "up" ? "active" : undefined}>↑</span>
           <span className={mobileDirection === "left" ? "active" : undefined}>←</span>
           <span className={mobileDirection === "down" ? "active" : undefined}>↓</span>
@@ -1327,7 +1402,7 @@ export function TerminalPane(props: TerminalPaneProps) {
       ) : null}
       {copyToastVisible ? (
         <div className="terminal-copy-toast" role="status" aria-live="polite">
-          复制成功
+          {t("terminal.copied")}
         </div>
       ) : null}
       {props.attached && mobileScrollAvailable ? (
@@ -1335,8 +1410,8 @@ export function TerminalPane(props: TerminalPaneProps) {
           <button
             type="button"
             className="terminal-mobile-scroll-thumb"
-            aria-label="Terminal scroll"
-            title="Terminal scroll"
+            aria-label={t("terminal.scroll")}
+            title={t("terminal.scroll")}
             style={{
               top: `${mobileScrollRatio * 100}%`,
               transform: `translateY(-${mobileScrollRatio * 100}%)`,
@@ -1350,7 +1425,7 @@ export function TerminalPane(props: TerminalPaneProps) {
           </button>
         </div>
       ) : null}
-      {!props.attached ? <div className="terminal-placeholder">detached</div> : null}
+      {!props.attached ? <div className="terminal-placeholder">{t("status.detached")}</div> : null}
     </section>
   );
 }

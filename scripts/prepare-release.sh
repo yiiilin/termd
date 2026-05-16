@@ -108,36 +108,9 @@ if [[ "$SKIP_VERIFY" -eq 0 ]]; then
 fi
 
 git diff --check
-git add \
-  .gitignore \
-  .github/workflows/release.yml \
-  Cargo.lock \
-  Cargo.toml \
-  proto/src/lib.rs \
-  scripts/prepare-release.sh \
-  scripts/release-notes.sh \
-  scripts/install-termd.sh \
-  scripts/test-installers.sh \
-  termd/src/net/protocol.rs \
-  termd/src/net/pty_bridge.rs \
-  termd/src/net/server.rs \
-  termd/src/pty/mod.rs \
-  termd/src/pty/portable.rs \
-  termd/src/pty/supervisor.rs \
-  termd/src/runtime/mod.rs \
-  termd/tests/session_supervisor.rs \
-  termui/frontend/package.json \
-  termui/frontend/package-lock.json \
-  termui/frontend/src/App.tsx \
-  termui/frontend/src/__tests__/app.test.tsx \
-  termui/frontend/src/__tests__/protocol-types.test.ts \
-  termui/frontend/src/__tests__/terminal-pane.test.tsx \
-  termui/frontend/src/components/SessionFilesPanel.tsx \
-  termui/frontend/src/components/TerminalPane.tsx \
-  termui/frontend/src/protocol/direct-client.ts \
-  termui/frontend/src/protocol/types.ts \
-  termui/frontend/src/styles.css \
-  termui/frontend/src/test/mock-daemon.ts
+# 发版改动经常会新增前端组件、测试或文档，硬编码文件列表容易漏提交。
+# 依赖 .gitignore 排除构建产物和本地状态，统一暂存当前工作区的全部源码改动。
+git add -A
 
 git diff --cached --quiet && die "no staged release changes"
 git commit -m "Release ${version}"

@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { KeyRound, Save, ScanQrCode, Server, Settings, Wifi } from "lucide-react";
 import type { PairedServerState, UUID } from "../protocol/types";
+import { useI18n, type Translate } from "../i18n";
 
 interface ConnectionPanelProps {
   url: string;
@@ -18,6 +19,7 @@ interface ConnectionPanelProps {
 
 export function ConnectionPanel(props: ConnectionPanelProps) {
   const [urlEditorOpen, setUrlEditorOpen] = useState(Boolean(props.showUrlEditor));
+  const { t } = useI18n();
 
   useEffect(() => {
     if (props.showUrlEditor) {
@@ -26,12 +28,12 @@ export function ConnectionPanel(props: ConnectionPanelProps) {
   }, [props.showUrlEditor]);
 
   return (
-    <section className="panel" aria-label="connection">
+    <section className="panel" aria-label={t("connection.panelAria")}>
       {urlEditorOpen ? (
         <label>
-          <span>WS URL</span>
+          <span>{t("connection.wsUrl")}</span>
           <input
-            aria-label="WS URL"
+            aria-label={t("connection.wsUrl")}
             value={props.url}
             onChange={(event) => props.onUrlChange(event.target.value)}
             spellCheck={false}
@@ -40,18 +42,18 @@ export function ConnectionPanel(props: ConnectionPanelProps) {
       ) : (
         <div className="connection-address-summary">
           <div>
-            <span>Address</span>
+            <span>{t("connection.address")}</span>
             <code>{props.url}</code>
           </div>
-          <button type="button" className="icon-button" aria-label="Edit address" onClick={() => setUrlEditorOpen(true)}>
+          <button type="button" className="icon-button" aria-label={t("connection.editAddress")} onClick={() => setUrlEditorOpen(true)}>
             <Settings size={15} aria-hidden="true" />
           </button>
         </div>
       )}
       <label>
-        <span>Pairing token</span>
+        <span>{t("connection.pairingToken")}</span>
         <input
-          aria-label="Pairing token"
+          aria-label={t("connection.pairingToken")}
           value={props.token}
           onChange={(event) => props.onTokenChange(event.target.value)}
           spellCheck={false}
@@ -61,12 +63,12 @@ export function ConnectionPanel(props: ConnectionPanelProps) {
       <div className="connection-actions">
         <button type="button" onClick={props.onPair} disabled={props.status === "pairing" || !props.token.trim()}>
           <KeyRound size={16} aria-hidden="true" />
-          Pair
+          {t("connection.pair")}
         </button>
         {props.onScanQr ? (
           <button type="button" onClick={props.onScanQr} disabled={props.status === "pairing"}>
             <ScanQrCode size={16} aria-hidden="true" />
-            Scan QR
+            {t("connection.scanQr")}
           </button>
         ) : null}
         {props.canSaveUrl ? (
@@ -76,13 +78,13 @@ export function ConnectionPanel(props: ConnectionPanelProps) {
             disabled={props.status === "saving_url" || !props.url.trim() || !urlEditorOpen}
           >
             <Save size={16} aria-hidden="true" />
-            Save URL
+            {t("connection.saveUrl")}
           </button>
         ) : null}
         {props.onManage ? (
           <button type="button" onClick={props.onManage}>
             <Server size={16} aria-hidden="true" />
-            Manage daemons
+            {t("connection.manageDaemons")}
           </button>
         ) : null}
       </div>
@@ -101,27 +103,28 @@ interface ConnectionStatusPanelProps {
 }
 
 export function ConnectionStatusPanel(props: ConnectionStatusPanelProps) {
+  const { t } = useI18n();
   return (
-    <section className="panel connection-status" aria-label="connection status">
+    <section className="panel connection-status" aria-label={t("connection.statusAria")}>
       <div className="connection-status-main">
         <Wifi size={16} aria-hidden="true" />
-        <strong>{connectionLabel(props.status)}</strong>
+        <strong>{connectionLabel(props.status, t)}</strong>
         {props.onEdit ? (
-          <button type="button" className="icon-button" aria-label="Edit connection" onClick={props.onEdit}>
+          <button type="button" className="icon-button" aria-label={t("connection.editConnection")} onClick={props.onEdit}>
             <Settings size={15} aria-hidden="true" />
           </button>
         ) : null}
         {props.onManage ? (
-          <button type="button" className="icon-button" aria-label="Manage daemons" onClick={props.onManage}>
+          <button type="button" className="icon-button" aria-label={t("connection.manageDaemons")} onClick={props.onManage}>
             <Server size={15} aria-hidden="true" />
           </button>
         ) : null}
       </div>
       {props.servers && props.servers.length > 1 ? (
         <label className="daemon-switcher">
-          <span>Daemon</span>
+          <span>{t("connection.daemon")}</span>
           <select
-            aria-label="Daemon"
+            aria-label={t("connection.daemon")}
             value={props.activeServerId ?? ""}
             onChange={(event) => props.onServerChange?.(event.target.value)}
           >
@@ -138,9 +141,9 @@ export function ConnectionStatusPanel(props: ConnectionStatusPanelProps) {
   );
 }
 
-function connectionLabel(status: string): string {
+function connectionLabel(status: string, t: Translate): string {
   if (status === "idle" || status === "connecting" || status === "listing") {
-    return "Checking connection";
+    return t("app.connectionChecking");
   }
-  return "Connected";
+  return t("app.connectionReady");
 }
