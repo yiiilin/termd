@@ -22,7 +22,9 @@ import type {
   SessionDataPayload,
   SessionFileReadResultPayload,
   SessionFileWrittenPayload,
+  SessionGitActionPayload,
   SessionFilesResultPayload,
+  SessionGitResultPayload,
   SessionSummaryPayload,
   TerminalSize,
   UUID,
@@ -50,6 +52,7 @@ interface MockDaemonOptions {
   daemonStatus?: DaemonStatusResultPayload;
   daemonStatusResponses?: DaemonStatusResultPayload[];
   sessionFiles?: Record<UUID, SessionFilesResultPayload>;
+  sessionGit?: Record<UUID, SessionGitResultPayload>;
   sessionFileReads?: Record<string, SessionFileReadResultPayload>;
   relayClientPathOnly?: boolean;
 }
@@ -91,6 +94,8 @@ export class MockDaemon {
   public readonly sessionFileDownloadChunkRequests: Array<{ session_id: UUID; path: string; offset_bytes: number; max_bytes: number }> = [];
   public readonly sessionFileWrites: Array<{ session_id: UUID; path: string; text: string }> = [];
   public readonly sessionFileDeletes: Array<{ session_id: UUID; path: string }> = [];
+  public readonly sessionGitRequests: Array<{ session_id: UUID }> = [];
+  public readonly sessionGitActions: SessionGitActionPayload[] = [];
   public daemonStatusRequests = 0;
   public pingMessages = 0;
   public readonly decryptedInputs: string[] = [];
@@ -484,6 +489,27 @@ export class MockDaemon {
         );
         return;
       }
+      case "session_git": {
+        const payload = inner.payload as { session_id: UUID };
+        if (!this.ensureAttached(connection, payload.session_id)) {
+          return;
+        }
+        this.sessionGitRequests.push(payload);
+        this.sendInner(
+          connection,
+          envelope("session_git_result", this.options.sessionGit?.[payload.session_id] ?? defaultSessionGit(payload.session_id)),
+        );
+        return;
+      }
+      case "session_git_action": {
+        const payload = inner.payload as SessionGitActionPayload;
+        if (!this.ensureAttached(connection, payload.session_id)) {
+          return;
+        }
+        this.sessionGitActions.push(payload);
+        this.sendInner(connection, envelope("session_git_action_result", payload));
+        return;
+      }
       case "session_file_read": {
         const payload = inner.payload as { session_id: UUID; path: string };
         if (!this.ensureAttached(connection, payload.session_id)) {
@@ -773,5 +799,26 @@ function mockDaemonStatus(): DaemonStatusResultPayload {
     network_tx_bytes: 6 * 1024 * 1024,
     process_count: 123,
     atop_available: false,
+  };
+}
+
+function defaultSessionGit(sessionId: UUID): SessionGitResultPayload {
+  // 默认 Git 快照保持可读的最小样例，便于 UI 测试只关心 tab 渲染和消息流。
+  return {
+    session_id: sessionId,
+    cwd: "/home/me/project",
+    repository_root: "/home/me/project",
+    worktrees: [
+      {
+        path: "/home/me/project",
+        branch: "main",
+        head: "a1b2c3d",
+        is_current: true,
+        staged: [{ path: "src/lib.rs", status: "M " }],
+        unstaged: [{ path: "README.md", status: " M" }],
+      },
+    ],
+    graph: ["* a1b2c3d main commit"],
+    error: null,
   };
 }

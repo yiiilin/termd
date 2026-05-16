@@ -23,6 +23,10 @@ export const ALL_MESSAGE_TYPES = [
   "session_closed",
   "session_files",
   "session_files_result",
+  "session_git",
+  "session_git_result",
+  "session_git_action",
+  "session_git_action_result",
   "session_file_read",
   "session_file_read_result",
   "session_file_write",
@@ -287,6 +291,49 @@ export interface SessionFilesResultPayload {
   session_id: UUID;
   path: string;
   entries: SessionFileEntryPayload[];
+}
+
+export interface SessionGitPayload {
+  session_id: UUID;
+}
+
+export interface SessionGitFileChangePayload {
+  path: string;
+  status: string;
+}
+
+export interface SessionGitWorktreePayload {
+  path: string;
+  branch?: string | null;
+  head?: string | null;
+  is_current: boolean;
+  staged: SessionGitFileChangePayload[];
+  unstaged: SessionGitFileChangePayload[];
+}
+
+export interface SessionGitResultPayload {
+  session_id: UUID;
+  cwd: string;
+  repository_root?: string | null;
+  worktrees: SessionGitWorktreePayload[];
+  graph: string[];
+  error?: string | null;
+}
+
+export type SessionGitActionKind = "stage" | "unstage" | "discard";
+
+export interface SessionGitActionPayload {
+  session_id: UUID;
+  worktree_path: string;
+  file_path: string;
+  action: SessionGitActionKind;
+}
+
+export interface SessionGitActionResultPayload {
+  session_id: UUID;
+  worktree_path: string;
+  file_path: string;
+  action: SessionGitActionKind;
 }
 
 export interface SessionFileReadPayload {

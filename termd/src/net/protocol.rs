@@ -7,7 +7,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+use std::process::Command;
 use std::time::UNIX_EPOCH;
 
 use base64::{
@@ -30,10 +31,13 @@ use termd_proto::{
     SessionFileDownloadChunkPayload, SessionFileDownloadChunkResultPayload,
     SessionFileDownloadPreparePayload, SessionFileDownloadReadyPayload, SessionFileEntryPayload,
     SessionFileKind, SessionFileReadPayload, SessionFileReadResultPayload, SessionFileWritePayload,
-    SessionFileWrittenPayload, SessionFilesPayload, SessionFilesResultPayload, SessionId,
-    SessionListPayload, SessionListResultPayload, SessionRenamePayload, SessionRenamedPayload,
-    SessionReorderPayload, SessionReorderedPayload, SessionResizePayload, SessionResizedPayload,
-    SessionState, SessionSummaryPayload, TerminalSize, UnixTimestampMillis,
+    SessionFileWrittenPayload, SessionFilesPayload, SessionFilesResultPayload,
+    SessionGitActionKind, SessionGitActionPayload, SessionGitActionResultPayload,
+    SessionGitFileChangePayload, SessionGitPayload, SessionGitResultPayload,
+    SessionGitWorktreePayload, SessionId, SessionListPayload, SessionListResultPayload,
+    SessionRenamePayload, SessionRenamedPayload, SessionReorderPayload, SessionReorderedPayload,
+    SessionResizePayload, SessionResizedPayload, SessionState, SessionSummaryPayload, TerminalSize,
+    UnixTimestampMillis,
 };
 use thiserror::Error;
 use tokio::sync::watch;
@@ -1038,6 +1042,48 @@ where
         )?])
     }
 
+    fn list_session_git(
+        &mut self,
+        connection: &ProtocolConnection,
+        payload: SessionGitPayload,
+    ) -> Result<Vec<JsonEnvelope>, ProtocolError> {
+        connection.authenticated_device_id()?;
+        connection.ensure_attached_to(payload.session_id)?;
+        if !self.session_index.contains_key(&payload.session_id) {
+            return Err(ProtocolError::SessionNotFound);
+        }
+
+        let result = self.session_git_result(payload.session_id)?;
+        Ok(vec![envelope_value(MessageType::SessionGitResult, result)?])
+    }
+
+    fn apply_session_git_action(
+        &mut self,
+        connection: &ProtocolConnection,
+        payload: SessionGitActionPayload,
+    ) -> Result<Vec<JsonEnvelope>, ProtocolError> {
+        connection.authenticated_device_id()?;
+        connection.ensure_attached_to(payload.session_id)?;
+        if !self.session_index.contains_key(&payload.session_id) {
+            return Err(ProtocolError::SessionNotFound);
+        }
+
+        validate_git_relative_file_path(&payload.file_path)?;
+        let worktree =
+            self.session_git_worktree_path(payload.session_id, &payload.worktree_path)?;
+        apply_git_file_action(&worktree, &payload.file_path, payload.action)?;
+
+        Ok(vec![envelope_value(
+            MessageType::SessionGitActionResult,
+            SessionGitActionResultPayload {
+                session_id: payload.session_id,
+                worktree_path: absolute_path_string(&worktree),
+                file_path: payload.file_path,
+                action: payload.action,
+            },
+        )?])
+    }
+
     fn read_session_file(
         &mut self,
         connection: &ProtocolConnection,
@@ -1908,6 +1954,55 @@ where
             path: normalized_path,
             entries,
         })
+    }
+
+    fn session_git_result(
+        &mut self,
+        session_id: SessionId,
+    ) -> Result<SessionGitResultPayload, ProtocolError> {
+        let root = self
+            .session_roots
+            .get(&session_id)
+            .cloned()
+            .ok_or(ProtocolError::SessionNotFound)?;
+        let requested_path = self.default_session_files_path(session_id)?;
+        let (cwd, normalized_cwd) = match resolve_session_file_target(&root, requested_path) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                tracing::warn!(%error, session_id = %session_id.0, "session git cwd is not readable; falling back to root");
+                resolve_session_file_target(&root, None)?
+            }
+        };
+
+        Ok(read_session_git_snapshot(session_id, &cwd, normalized_cwd))
+    }
+
+    fn session_git_worktree_path(
+        &mut self,
+        session_id: SessionId,
+        requested_worktree: &str,
+    ) -> Result<PathBuf, ProtocolError> {
+        let root = self
+            .session_roots
+            .get(&session_id)
+            .cloned()
+            .ok_or(ProtocolError::SessionNotFound)?;
+        let requested_path = self.default_session_files_path(session_id)?;
+        let (cwd, _) = match resolve_session_file_target(&root, requested_path) {
+            Ok(resolved) => resolved,
+            Err(_) => resolve_session_file_target(&root, None)?,
+        };
+        let repo_root = current_git_repository_root(&cwd).ok_or(ProtocolError::InvalidEnvelope)?;
+        let current_root = current_git_repository_root(&cwd).unwrap_or_else(|| repo_root.clone());
+        let requested = Path::new(requested_worktree)
+            .canonicalize()
+            .map_err(map_file_path_error)?;
+
+        read_git_worktrees(&repo_root, &current_root)
+            .into_iter()
+            .map(|worktree| worktree.path)
+            .find(|worktree| same_path(worktree, &requested))
+            .ok_or(ProtocolError::InvalidEnvelope)
     }
 
     fn session_file_tree_update(
@@ -3283,6 +3378,14 @@ impl ProtocolConnection {
                 let payload = decode_payload(envelope.payload)?;
                 protocol.list_session_files(self, payload)
             }
+            MessageType::SessionGit => {
+                let payload = decode_payload(envelope.payload)?;
+                protocol.list_session_git(self, payload)
+            }
+            MessageType::SessionGitAction => {
+                let payload = decode_payload(envelope.payload)?;
+                protocol.apply_session_git_action(self, payload)
+            }
             MessageType::SessionFileRead => {
                 let payload = decode_payload(envelope.payload)?;
                 protocol.read_session_file(self, payload)
@@ -3569,6 +3672,20 @@ fn ensure_path_inside_root(root: &Path, target: &Path) -> Result<(), ProtocolErr
     Err(ProtocolError::InvalidEnvelope)
 }
 
+fn validate_git_relative_file_path(path: &str) -> Result<(), ProtocolError> {
+    let path = Path::new(path.trim());
+    if path.as_os_str().is_empty() || path.is_absolute() {
+        return Err(ProtocolError::InvalidEnvelope);
+    }
+    if path
+        .components()
+        .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(ProtocolError::InvalidEnvelope);
+    }
+    Ok(())
+}
+
 fn read_session_file_entries(
     _root: &Path,
     target: &Path,
@@ -3606,6 +3723,367 @@ fn read_session_file_entries(
     });
 
     Ok(entries)
+}
+
+#[derive(Debug, Clone)]
+struct GitCommandResult {
+    success: bool,
+    stdout: String,
+    stderr: String,
+}
+
+#[derive(Debug, Clone)]
+struct GitWorktreeInfo {
+    path: PathBuf,
+    branch: Option<String>,
+    head: Option<String>,
+}
+
+fn read_session_git_snapshot(
+    session_id: SessionId,
+    cwd: &Path,
+    cwd_text: String,
+) -> SessionGitResultPayload {
+    let repo_output = match run_git_command(cwd, &["rev-parse", "--show-toplevel"]) {
+        Ok(output) => output,
+        Err(error) => {
+            return session_git_error(session_id, cwd_text, format!("git unavailable: {error}"));
+        }
+    };
+    if !repo_output.success {
+        return session_git_error(
+            session_id,
+            cwd_text,
+            git_error_message(&repo_output, "not a git repository"),
+        );
+    }
+    let Some(repo_root_text) = first_non_empty_line(&repo_output.stdout) else {
+        return session_git_error(session_id, cwd_text, "git repository root is unavailable");
+    };
+    let repo_root = PathBuf::from(repo_root_text);
+    let canonical_repo_root = repo_root.canonicalize().unwrap_or(repo_root);
+    let repository_root_text = absolute_path_string(&canonical_repo_root);
+
+    let current_root_output =
+        run_git_command(cwd, &["rev-parse", "--show-toplevel"]).unwrap_or(repo_output);
+    let current_root = first_non_empty_line(&current_root_output.stdout)
+        .map(PathBuf::from)
+        .and_then(|path| path.canonicalize().ok())
+        .unwrap_or_else(|| canonical_repo_root.clone());
+    let worktree_infos = read_git_worktrees(&canonical_repo_root, &current_root);
+    let worktrees = worktree_infos
+        .into_iter()
+        .map(|worktree| {
+            let (staged, unstaged) = read_git_worktree_changes(&worktree.path);
+            let is_current = same_path(&worktree.path, &current_root);
+            SessionGitWorktreePayload {
+                path: absolute_path_string(&worktree.path),
+                branch: worktree.branch,
+                head: worktree.head,
+                is_current,
+                staged,
+                unstaged,
+            }
+        })
+        .collect();
+
+    SessionGitResultPayload {
+        session_id,
+        cwd: cwd_text,
+        repository_root: Some(repository_root_text),
+        worktrees,
+        graph: read_git_graph(&canonical_repo_root),
+        error: None,
+    }
+}
+
+fn session_git_error(
+    session_id: SessionId,
+    cwd: String,
+    error: impl Into<String>,
+) -> SessionGitResultPayload {
+    SessionGitResultPayload {
+        session_id,
+        cwd,
+        repository_root: None,
+        worktrees: Vec::new(),
+        graph: Vec::new(),
+        error: Some(error.into()),
+    }
+}
+
+fn run_git_command(cwd: &Path, args: &[&str]) -> Result<GitCommandResult, std::io::Error> {
+    // Git 信息只通过本机 git CLI 读取，避免 daemon 为侧栏展示引入额外持久状态。
+    let output = Command::new("git").arg("-C").arg(cwd).args(args).output()?;
+    Ok(GitCommandResult {
+        success: output.status.success(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    })
+}
+
+fn current_git_repository_root(cwd: &Path) -> Option<PathBuf> {
+    let output = run_git_command(cwd, &["rev-parse", "--show-toplevel"]).ok()?;
+    if !output.success {
+        return None;
+    }
+    first_non_empty_line(&output.stdout)
+        .map(PathBuf::from)
+        .and_then(|path| path.canonicalize().ok())
+}
+
+fn apply_git_file_action(
+    worktree: &Path,
+    file_path: &str,
+    action: SessionGitActionKind,
+) -> Result<(), ProtocolError> {
+    match action {
+        SessionGitActionKind::Stage => run_git_checked(worktree, &["add", "--", file_path]),
+        SessionGitActionKind::Unstage => {
+            run_git_checked(worktree, &["restore", "--staged", "--", file_path])
+        }
+        SessionGitActionKind::Discard => discard_git_file_change(worktree, file_path),
+    }
+}
+
+fn discard_git_file_change(worktree: &Path, file_path: &str) -> Result<(), ProtocolError> {
+    let status = run_git_command(
+        worktree,
+        &[
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--",
+            file_path,
+        ],
+    )
+    .map_err(|_| ProtocolError::RuntimeFailed)?;
+    if !status.success {
+        tracing::warn!(stderr = %status.stderr, "git status for discard failed");
+        return Err(ProtocolError::RuntimeFailed);
+    }
+    let has_untracked = status.stdout.lines().any(|line| line.starts_with("??"));
+    let has_staged_add = status.stdout.lines().any(|line| {
+        let mut chars = line.chars();
+        matches!(chars.next(), Some('A'))
+    });
+    if has_untracked {
+        return run_git_checked(worktree, &["clean", "-fd", "--", file_path]);
+    }
+    if has_staged_add {
+        return run_git_checked(worktree, &["rm", "-f", "--", file_path]);
+    }
+
+    run_git_checked(
+        worktree,
+        &["restore", "--staged", "--worktree", "--", file_path],
+    )
+}
+
+fn run_git_checked(cwd: &Path, args: &[&str]) -> Result<(), ProtocolError> {
+    let output = run_git_command(cwd, args).map_err(|_| ProtocolError::RuntimeFailed)?;
+    if output.success {
+        return Ok(());
+    }
+
+    tracing::warn!(stderr = %output.stderr, "git action failed");
+    Err(ProtocolError::RuntimeFailed)
+}
+
+fn read_git_worktrees(repo_root: &Path, current_root: &Path) -> Vec<GitWorktreeInfo> {
+    let mut worktrees = run_git_command(repo_root, &["worktree", "list", "--porcelain"])
+        .ok()
+        .filter(|output| output.success)
+        .map(|output| parse_git_worktrees(&output.stdout))
+        .unwrap_or_default();
+    if worktrees.is_empty() {
+        worktrees.push(GitWorktreeInfo {
+            path: current_root.to_path_buf(),
+            branch: read_git_branch(current_root),
+            head: read_git_head(current_root),
+        });
+    }
+
+    worktrees
+}
+
+fn parse_git_worktrees(output: &str) -> Vec<GitWorktreeInfo> {
+    let mut worktrees = Vec::new();
+    let mut current: Option<GitWorktreeInfo> = None;
+    for line in output.lines() {
+        if line.trim().is_empty() {
+            if let Some(worktree) = current.take() {
+                worktrees.push(normalize_git_worktree(worktree));
+            }
+            continue;
+        }
+        if let Some(path) = line.strip_prefix("worktree ") {
+            if let Some(worktree) = current.replace(GitWorktreeInfo {
+                path: PathBuf::from(path),
+                branch: None,
+                head: None,
+            }) {
+                worktrees.push(normalize_git_worktree(worktree));
+            }
+        } else if let Some(head) = line.strip_prefix("HEAD ") {
+            if let Some(worktree) = current.as_mut() {
+                worktree.head = Some(short_git_hash(head));
+            }
+        } else if let Some(branch) = line.strip_prefix("branch ") {
+            if let Some(worktree) = current.as_mut() {
+                worktree.branch = Some(short_branch_name(branch));
+            }
+        }
+    }
+    if let Some(worktree) = current {
+        worktrees.push(normalize_git_worktree(worktree));
+    }
+
+    worktrees
+}
+
+fn normalize_git_worktree(mut worktree: GitWorktreeInfo) -> GitWorktreeInfo {
+    if let Ok(path) = worktree.path.canonicalize() {
+        worktree.path = path;
+    }
+    worktree
+}
+
+fn read_git_branch(worktree: &Path) -> Option<String> {
+    let output = run_git_command(worktree, &["rev-parse", "--abbrev-ref", "HEAD"]).ok()?;
+    if !output.success {
+        return None;
+    }
+    let branch = first_non_empty_line(&output.stdout)?;
+    if branch == "HEAD" {
+        None
+    } else {
+        Some(branch.to_owned())
+    }
+}
+
+fn read_git_head(worktree: &Path) -> Option<String> {
+    let output = run_git_command(worktree, &["rev-parse", "--short", "HEAD"]).ok()?;
+    if output.success {
+        first_non_empty_line(&output.stdout).map(ToOwned::to_owned)
+    } else {
+        None
+    }
+}
+
+fn read_git_worktree_changes(
+    worktree: &Path,
+) -> (
+    Vec<SessionGitFileChangePayload>,
+    Vec<SessionGitFileChangePayload>,
+) {
+    let Some(output) = run_git_command(
+        worktree,
+        &["status", "--porcelain=v1", "--untracked-files=all"],
+    )
+    .ok()
+    .filter(|output| output.success) else {
+        return (Vec::new(), Vec::new());
+    };
+    let mut staged = Vec::new();
+    let mut unstaged = Vec::new();
+    for line in output.stdout.lines() {
+        if let Some(change) = parse_git_status_line(line) {
+            if change.staged {
+                staged.push(SessionGitFileChangePayload {
+                    path: change.path.clone(),
+                    status: change.status.clone(),
+                });
+            }
+            if change.unstaged {
+                unstaged.push(SessionGitFileChangePayload {
+                    path: change.path,
+                    status: change.status,
+                });
+            }
+        }
+    }
+
+    (staged, unstaged)
+}
+
+struct GitStatusLine {
+    path: String,
+    status: String,
+    staged: bool,
+    unstaged: bool,
+}
+
+fn parse_git_status_line(line: &str) -> Option<GitStatusLine> {
+    let mut chars = line.chars();
+    let index = chars.next()?;
+    let worktree = chars.next()?;
+    let path = line.get(3..)?.trim();
+    if path.is_empty() {
+        return None;
+    }
+    let staged = index != ' ' && index != '?';
+    let unstaged = worktree != ' ' || (index == '?' && worktree == '?');
+    Some(GitStatusLine {
+        path: path.to_owned(),
+        status: format!("{index}{worktree}"),
+        staged,
+        unstaged,
+    })
+}
+
+fn read_git_graph(repo_root: &Path) -> Vec<String> {
+    run_git_command(
+        repo_root,
+        &[
+            "log",
+            "--graph",
+            "--decorate",
+            "--oneline",
+            "--max-count=24",
+            "--all",
+        ],
+    )
+    .ok()
+    .filter(|output| output.success)
+    .map(|output| {
+        output
+            .stdout
+            .lines()
+            .map(str::trim_end)
+            .filter(|line| !line.is_empty())
+            .map(ToOwned::to_owned)
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+fn git_error_message(output: &GitCommandResult, fallback: &'static str) -> String {
+    first_non_empty_line(&output.stderr)
+        .or_else(|| first_non_empty_line(&output.stdout))
+        .unwrap_or(fallback)
+        .to_owned()
+}
+
+fn first_non_empty_line(text: &str) -> Option<&str> {
+    text.lines().map(str::trim).find(|line| !line.is_empty())
+}
+
+fn short_branch_name(branch: &str) -> String {
+    branch
+        .strip_prefix("refs/heads/")
+        .unwrap_or(branch)
+        .to_owned()
+}
+
+fn short_git_hash(head: &str) -> String {
+    head.chars().take(7).collect()
+}
+
+fn same_path(left: &Path, right: &Path) -> bool {
+    let left = left.canonicalize().unwrap_or_else(|_| left.to_path_buf());
+    let right = right.canonicalize().unwrap_or_else(|_| right.to_path_buf());
+    left == right
 }
 
 fn map_file_path_error(error: std::io::Error) -> ProtocolError {
@@ -3797,7 +4275,9 @@ mod tests {
         PairAcceptPayload, PairingToken, PublicKey, SessionFileDeletePayload,
         SessionFileDeletedPayload, SessionFileKind, SessionFileReadPayload,
         SessionFileReadResultPayload, SessionFileWritePayload, SessionFileWrittenPayload,
-        SessionFilesPayload, SessionFilesResultPayload, Signature,
+        SessionFilesPayload, SessionFilesResultPayload, SessionGitActionKind,
+        SessionGitActionPayload, SessionGitActionResultPayload, SessionGitPayload,
+        SessionGitResultPayload, Signature,
     };
 
     use super::*;
@@ -4032,6 +4512,37 @@ mod tests {
             current_unix_timestamp_millis().0,
             counter
         ))
+    }
+
+    fn run_test_git(cwd: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(args)
+            .output()
+            .unwrap_or_else(|error| panic!("failed to run git {args:?}: {error}"));
+        assert!(
+            output.status.success(),
+            "git {args:?} failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn run_test_git_stdout(cwd: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(args)
+            .output()
+            .unwrap_or_else(|error| panic!("failed to run git {args:?}: {error}"));
+        assert!(
+            output.status.success(),
+            "git {args:?} failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
     }
 
     fn socket_restore_info(session_id: SessionId) -> PtyRestoreInfo {
@@ -6488,6 +6999,179 @@ mod tests {
         assert!(backend.writes().is_empty());
 
         fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn attached_session_can_list_git_status_and_graph_from_session_cwd() {
+        let base = temp_state_path("git-base");
+        let root = base.join("project");
+        fs::create_dir_all(root.join("src")).unwrap();
+        run_test_git(&root, &["init", "-b", "main"]);
+        run_test_git(&root, &["config", "user.email", "test@example.com"]);
+        run_test_git(&root, &["config", "user.name", "Termd Test"]);
+        fs::write(root.join("README.md"), b"initial\n").unwrap();
+        fs::write(root.join("src").join("lib.rs"), b"pub fn initial() {}\n").unwrap();
+        run_test_git(&root, &["add", "README.md", "src/lib.rs"]);
+        run_test_git(&root, &["commit", "-m", "main commit"]);
+        fs::write(root.join("src").join("lib.rs"), b"pub fn staged() {}\n").unwrap();
+        run_test_git(&root, &["add", "src/lib.rs"]);
+        fs::write(root.join("README.md"), b"initial\nunstaged\n").unwrap();
+
+        let backend = FakePtyBackend::default();
+        let mut config = DaemonConfig::default_for_state_path(temp_state_path("git-state.json"));
+        config.default_command = vec!["sh".to_owned()];
+        config.default_working_directory = Some(root.clone());
+        let mut protocol =
+            DaemonProtocol::new(config, backend.clone(), Ed25519SignatureVerifier).unwrap();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = PublicKey(wire(signing_key.verifying_key().as_bytes()));
+        let (_, mut device_session) = open_e2ee(&mut protocol, &mut connection, device_id);
+        pair_device(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            device_id,
+            public_key,
+        );
+        let session_id = create_test_session(&mut protocol, &mut connection, &mut device_session);
+        backend.set_cwd_for_session(session_id, root.clone());
+
+        let responses = send_encrypted(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            envelope_value(MessageType::SessionGit, SessionGitPayload { session_id }).unwrap(),
+        );
+        let listed = decrypt_first(&mut device_session, responses);
+        let payload: SessionGitResultPayload = decode_payload(listed.payload).unwrap();
+        let current_worktree = payload
+            .worktrees
+            .iter()
+            .find(|worktree| worktree.is_current)
+            .expect("current worktree should be marked");
+
+        assert_eq!(listed.kind, MessageType::SessionGitResult);
+        assert_eq!(payload.session_id, session_id);
+        assert_eq!(
+            payload.repository_root,
+            Some(root.to_string_lossy().to_string())
+        );
+        assert_eq!(payload.error, None);
+        assert_eq!(current_worktree.branch.as_deref(), Some("main"));
+        assert!(
+            current_worktree
+                .staged
+                .iter()
+                .any(|file| file.path == "src/lib.rs")
+        );
+        assert!(
+            current_worktree
+                .unstaged
+                .iter()
+                .any(|file| file.path == "README.md")
+        );
+        assert!(
+            payload
+                .graph
+                .iter()
+                .any(|line| line.contains("main commit"))
+        );
+
+        let unstage_responses = send_encrypted(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            envelope_value(
+                MessageType::SessionGitAction,
+                SessionGitActionPayload {
+                    session_id,
+                    worktree_path: root.to_string_lossy().to_string(),
+                    file_path: "src/lib.rs".to_owned(),
+                    action: SessionGitActionKind::Unstage,
+                },
+            )
+            .unwrap(),
+        );
+        let unstage = decrypt_first(&mut device_session, unstage_responses);
+        let unstage_payload: SessionGitActionResultPayload =
+            decode_payload(unstage.payload).unwrap();
+        assert_eq!(unstage.kind, MessageType::SessionGitActionResult);
+        assert_eq!(unstage_payload.action, SessionGitActionKind::Unstage);
+
+        let stage_responses = send_encrypted(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            envelope_value(
+                MessageType::SessionGitAction,
+                SessionGitActionPayload {
+                    session_id,
+                    worktree_path: root.to_string_lossy().to_string(),
+                    file_path: "README.md".to_owned(),
+                    action: SessionGitActionKind::Stage,
+                },
+            )
+            .unwrap(),
+        );
+        let stage = decrypt_first(&mut device_session, stage_responses);
+        let stage_payload: SessionGitActionResultPayload = decode_payload(stage.payload).unwrap();
+        assert_eq!(stage.kind, MessageType::SessionGitActionResult);
+        assert_eq!(stage_payload.action, SessionGitActionKind::Stage);
+
+        let discard_responses = send_encrypted(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            envelope_value(
+                MessageType::SessionGitAction,
+                SessionGitActionPayload {
+                    session_id,
+                    worktree_path: root.to_string_lossy().to_string(),
+                    file_path: "README.md".to_owned(),
+                    action: SessionGitActionKind::Discard,
+                },
+            )
+            .unwrap(),
+        );
+        let discard = decrypt_first(&mut device_session, discard_responses);
+        let discard_payload: SessionGitActionResultPayload =
+            decode_payload(discard.payload).unwrap();
+        assert_eq!(discard.kind, MessageType::SessionGitActionResult);
+        assert_eq!(discard_payload.action, SessionGitActionKind::Discard);
+
+        fs::write(root.join("scratch.txt"), b"temporary\n").unwrap();
+        let untracked_discard_responses = send_encrypted(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            envelope_value(
+                MessageType::SessionGitAction,
+                SessionGitActionPayload {
+                    session_id,
+                    worktree_path: root.to_string_lossy().to_string(),
+                    file_path: "scratch.txt".to_owned(),
+                    action: SessionGitActionKind::Discard,
+                },
+            )
+            .unwrap(),
+        );
+        let untracked_discard = decrypt_first(&mut device_session, untracked_discard_responses);
+        let untracked_discard_payload: SessionGitActionResultPayload =
+            decode_payload(untracked_discard.payload).unwrap();
+        assert_eq!(untracked_discard.kind, MessageType::SessionGitActionResult);
+        assert_eq!(
+            untracked_discard_payload.action,
+            SessionGitActionKind::Discard
+        );
+
+        let status = run_test_git_stdout(&root, &["status", "--porcelain=v1"]);
+        assert!(status.contains(" M src/lib.rs"));
+        assert!(!status.contains("README.md"));
+        assert!(!status.contains("scratch.txt"));
+
+        fs::remove_dir_all(base).ok();
     }
 
     #[test]

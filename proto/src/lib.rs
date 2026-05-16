@@ -51,6 +51,10 @@ pub enum MessageType {
     SessionClosed,
     SessionFiles,
     SessionFilesResult,
+    SessionGit,
+    SessionGitResult,
+    SessionGitAction,
+    SessionGitActionResult,
     SessionFileRead,
     SessionFileReadResult,
     SessionFileWrite,
@@ -690,6 +694,66 @@ pub struct SessionFilesResultPayload {
     pub entries: Vec<SessionFileEntryPayload>,
 }
 
+/// 查询某个 session 当前终端目录关联的 Git 状态。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionGitPayload {
+    pub session_id: SessionId,
+}
+
+/// Git 文件变更展示条目；`status` 保留 porcelain 的两列状态码，便于客户端直接展示。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionGitFileChangePayload {
+    pub path: String,
+    pub status: String,
+}
+
+/// 一个 Git worktree 下的未提交文件分组。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionGitWorktreePayload {
+    pub path: String,
+    pub branch: Option<String>,
+    pub head: Option<String>,
+    pub is_current: bool,
+    pub staged: Vec<SessionGitFileChangePayload>,
+    pub unstaged: Vec<SessionGitFileChangePayload>,
+}
+
+/// Git tab 的只读快照。`repository_root` 为空表示当前 cwd 不在 Git 仓库中。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionGitResultPayload {
+    pub session_id: SessionId,
+    pub cwd: String,
+    pub repository_root: Option<String>,
+    pub worktrees: Vec<SessionGitWorktreePayload>,
+    pub graph: Vec<String>,
+    pub error: Option<String>,
+}
+
+/// Git 文件操作只允许作用于 Git tab 已展示的 worktree 和相对路径。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionGitActionKind {
+    Stage,
+    Unstage,
+    Discard,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionGitActionPayload {
+    pub session_id: SessionId,
+    pub worktree_path: String,
+    pub file_path: String,
+    pub action: SessionGitActionKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionGitActionResultPayload {
+    pub session_id: SessionId,
+    pub worktree_path: String,
+    pub file_path: String,
+    pub action: SessionGitActionKind,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionFileReadPayload {
     pub session_id: SessionId,
@@ -872,6 +936,13 @@ mod tests {
             (MessageType::SessionClosed, "session_closed"),
             (MessageType::SessionFiles, "session_files"),
             (MessageType::SessionFilesResult, "session_files_result"),
+            (MessageType::SessionGit, "session_git"),
+            (MessageType::SessionGitResult, "session_git_result"),
+            (MessageType::SessionGitAction, "session_git_action"),
+            (
+                MessageType::SessionGitActionResult,
+                "session_git_action_result",
+            ),
             (MessageType::SessionFileRead, "session_file_read"),
             (
                 MessageType::SessionFileReadResult,
@@ -1185,6 +1256,40 @@ mod tests {
                     modified_at_ms: None,
                 },
             ],
+        });
+        assert_roundtrip(SessionGitPayload { session_id });
+        assert_roundtrip(SessionGitResultPayload {
+            session_id,
+            cwd: "/repo".to_owned(),
+            repository_root: Some("/repo".to_owned()),
+            worktrees: vec![SessionGitWorktreePayload {
+                path: "/repo".to_owned(),
+                branch: Some("main".to_owned()),
+                head: Some("a1b2c3d".to_owned()),
+                is_current: true,
+                staged: vec![SessionGitFileChangePayload {
+                    path: "src/lib.rs".to_owned(),
+                    status: "M ".to_owned(),
+                }],
+                unstaged: vec![SessionGitFileChangePayload {
+                    path: "README.md".to_owned(),
+                    status: " M".to_owned(),
+                }],
+            }],
+            graph: vec!["* a1b2c3d main commit".to_owned()],
+            error: None,
+        });
+        assert_roundtrip(SessionGitActionPayload {
+            session_id,
+            worktree_path: "/repo".to_owned(),
+            file_path: "src/lib.rs".to_owned(),
+            action: SessionGitActionKind::Stage,
+        });
+        assert_roundtrip(SessionGitActionResultPayload {
+            session_id,
+            worktree_path: "/repo".to_owned(),
+            file_path: "src/lib.rs".to_owned(),
+            action: SessionGitActionKind::Unstage,
         });
         assert_roundtrip(SessionFileReadPayload {
             session_id,

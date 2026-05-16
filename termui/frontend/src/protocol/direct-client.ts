@@ -40,6 +40,11 @@ import type {
   SessionFileWrittenPayload,
   SessionFilesPayload,
   SessionFilesResultPayload,
+  SessionGitActionKind,
+  SessionGitActionPayload,
+  SessionGitActionResultPayload,
+  SessionGitPayload,
+  SessionGitResultPayload,
   SessionListResultPayload,
   SessionRenamedPayload,
   SessionRenamePayload,
@@ -238,6 +243,32 @@ export class DirectClient {
     );
   }
 
+  async getSessionGit(sessionId: UUID): Promise<SessionGitResultPayload> {
+    await this.requestSessionGit(sessionId);
+    return this.expectPayload<SessionGitResultPayload>("session_git_result", { bufferTerminalEvents: true });
+  }
+
+  async requestSessionGit(sessionId: UUID): Promise<void> {
+    await this.sendInner(envelope("session_git", { session_id: sessionId } satisfies SessionGitPayload));
+  }
+
+  async applySessionGitAction(
+    sessionId: UUID,
+    worktreePath: string,
+    filePath: string,
+    action: SessionGitActionKind,
+  ): Promise<SessionGitActionResultPayload> {
+    await this.sendInner(
+      envelope("session_git_action", {
+        session_id: sessionId,
+        worktree_path: worktreePath,
+        file_path: filePath,
+        action,
+      } satisfies SessionGitActionPayload),
+    );
+    return this.expectPayload<SessionGitActionResultPayload>("session_git_action_result", { bufferTerminalEvents: true });
+  }
+
   async readSessionFile(sessionId: UUID, path: string): Promise<SessionFileReadResultPayload> {
     await this.sendInner(envelope("session_file_read", { session_id: sessionId, path } satisfies SessionFileReadPayload));
     return this.expectPayload<SessionFileReadResultPayload>("session_file_read_result", { bufferTerminalEvents: true });
@@ -418,7 +449,9 @@ export class DirectClient {
           inner.type === "session_activity" ||
           inner.type === "session_resized" ||
           inner.type === "control_grant" ||
-          inner.type === "session_files_result")
+          inner.type === "session_files_result" ||
+          inner.type === "session_git_result" ||
+          inner.type === "session_git_action_result")
       ) {
         // 文件操作复用已 attach 的终端连接；daemon 可能先推送 PTY 输出或文件树同步事件。
         // 这里把旁路事件放回队列，交给后续 receive loop 处理，避免文件 panel 吃掉回显。

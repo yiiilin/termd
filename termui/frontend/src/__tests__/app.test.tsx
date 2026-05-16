@@ -1363,6 +1363,7 @@ describe("termui web 工作台", () => {
     await clickSessionCard(user);
 
     const panel = await screen.findByLabelText("session files");
+    expect(panel.querySelector(".files-panel-header .files-path")).toBeNull();
 
     await within(panel).findByText("src");
     await within(panel).findByText("alpha.txt");
@@ -1465,6 +1466,142 @@ describe("termui web 工作台", () => {
         text: "uploaded web file\n",
       });
     });
+  });
+
+  it("文件 panel 可以切到 Git tab 查看未提交文件和提交图", async () => {
+    const user = userEvent.setup();
+    const sessionId = "00000000-0000-0000-0000-000000000415";
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [
+        {
+          session_id: sessionId,
+          state: "running",
+          size: { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 },
+        },
+      ],
+      sessionFiles: {
+        [sessionId]: {
+          session_id: sessionId,
+          path: "/home/me/project",
+          entries: [],
+        },
+      },
+      sessionGit: {
+        [sessionId]: {
+          session_id: sessionId,
+          cwd: "/home/me/project",
+          repository_root: "/home/me/project",
+          worktrees: [
+            {
+              path: "/home/me/project",
+              branch: "main",
+              head: "a1b2c3d",
+              is_current: true,
+              staged: [{ path: "src/lib.rs", status: "M " }],
+              unstaged: [{ path: "README.md", status: " M" }],
+            },
+            {
+              path: "/home/me/project-feature",
+              branch: "feature/files",
+              head: "d4e5f6a",
+              is_current: false,
+              staged: [{ path: "src/git-panel.tsx", status: "A " }],
+              unstaged: [],
+            },
+          ],
+          graph: ["* a1b2c3d main commit", "| * d4e5f6a feature commit", "|/"],
+          error: null,
+        },
+      },
+    });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await user.click(screen.getByRole("button", { name: "Refresh" }));
+    await clickSessionCard(user);
+
+    const panel = await screen.findByLabelText("session files");
+    await user.click(within(panel).getByRole("tab", { name: "Git" }));
+
+    await within(panel).findByText("main");
+    await within(panel).findAllByText("Staged");
+    await within(panel).findByText("src/lib.rs");
+    await within(panel).findAllByText("Unstaged");
+    await within(panel).findByText("README.md");
+    await within(panel).findByText("feature/files");
+    await within(panel).findByText("Changes");
+    const gitStatusPane = within(panel).getByLabelText("Git status");
+    expect(within(gitStatusPane).queryByText("Files")).toBeNull();
+    const changesTree = within(gitStatusPane).getByRole("tree", { name: "Git changes tree" });
+    expect(changesTree.classList.contains("git-status-body")).toBe(true);
+    expect(panel.querySelector(".git-panel-compact")).not.toBeNull();
+    const mainTreeItem = within(changesTree).getByRole("treeitem", { name: "main changes" });
+    expect(mainTreeItem.querySelector(".git-worktree-floating-meta .git-worktree-head")?.textContent).toBe("a1b2c3d");
+    const readmeTreeItem = within(changesTree).getByRole("treeitem", { name: "M README.md" });
+    expect(readmeTreeItem.querySelector(".git-change-floating-actions button[aria-label='Stage README.md']")).not.toBeNull();
+    expect(within(panel).getByRole("button", { name: "Discard README.md" }).querySelector(".lucide-undo2")).not.toBeNull();
+    const graphResizer = within(panel).getByRole("separator", { name: "Resize Git graph" });
+    fireEvent.keyDown(graphResizer, { key: "ArrowDown" });
+    expect(panel.querySelector<HTMLElement>(".git-panel")?.style.getPropertyValue("--git-changes-pane-height")).toContain("px");
+    await waitFor(() =>
+      expect(panel.querySelector(".git-graph-commit")?.getAttribute("title")).toBe("a1b2c3d main commit"),
+    );
+    expect(panel.querySelector(".git-graph-row")?.textContent).not.toContain("* a1b2c3d main commit");
+    expect(panel.querySelector(".git-graph-node")).not.toBeNull();
+
+    await user.click(within(panel).getByRole("button", { name: "Open README.md" }));
+    await waitFor(() =>
+      expect(daemon.sessionFileDownloadChunkRequests).toContainEqual({
+        session_id: sessionId,
+        path: "/home/me/project/README.md",
+        offset_bytes: 0,
+        max_bytes: expect.any(Number),
+      }),
+    );
+
+    await user.click(within(panel).getByRole("button", { name: "Stage README.md" }));
+    await user.click(within(panel).getByRole("button", { name: "Unstage src/lib.rs" }));
+    await user.click(within(panel).getByRole("button", { name: "Discard README.md" }));
+    await waitFor(() =>
+      expect(daemon.sessionGitActions).toEqual(
+        expect.arrayContaining([
+          {
+            session_id: sessionId,
+            worktree_path: "/home/me/project",
+            file_path: "README.md",
+            action: "stage",
+          },
+          {
+            session_id: sessionId,
+            worktree_path: "/home/me/project",
+            file_path: "src/lib.rs",
+            action: "unstage",
+          },
+          {
+            session_id: sessionId,
+            worktree_path: "/home/me/project",
+            file_path: "README.md",
+            action: "discard",
+          },
+        ]),
+      ),
+    );
+
+    await user.click(within(panel).getByRole("button", { name: "Collapse main worktree" }));
+    expect(within(panel).queryByText("src/lib.rs")).toBeNull();
+    await user.click(within(panel).getByRole("button", { name: "Expand main worktree" }));
+    await within(panel).findByText("src/lib.rs");
+
+    await user.click(within(panel).getByRole("button", { name: "Collapse Git changes" }));
+    expect(within(panel).queryByText("README.md")).toBeNull();
+    await user.click(within(panel).getByRole("button", { name: "Expand Git changes" }));
+    await within(panel).findByText("README.md");
+
+    await user.click(within(panel).getByRole("button", { name: "Collapse Git graph" }));
+    expect(panel.querySelector(".git-graph-commit")).toBeNull();
   });
 
   it("文件 panel 默认每秒跟随终端 cwd，并可关闭跟随", async () => {
@@ -1777,6 +1914,8 @@ describe("termui web 工作台", () => {
     expect(workspaceBody).not.toBeNull();
     const initialColumns = workspaceBody!.style.gridTemplateColumns;
     const resizer = screen.getByRole("separator", { name: "Resize files panel" });
+    expect(document.querySelector(".files-resizer")).toBeNull();
+    expect(resizer.classList.contains("files-panel-edge-resizer")).toBe(true);
 
     fireEvent.pointerDown(resizer, { clientX: 1180, pointerId: 1 });
     fireEvent.pointerMove(window, { clientX: 1080, pointerId: 1 });

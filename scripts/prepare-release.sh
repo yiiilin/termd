@@ -113,6 +113,7 @@ git add \
   .github/workflows/release.yml \
   Cargo.lock \
   Cargo.toml \
+  proto/src/lib.rs \
   scripts/prepare-release.sh \
   scripts/release-notes.sh \
   scripts/install-termd.sh \
@@ -129,9 +130,12 @@ git add \
   termui/frontend/package-lock.json \
   termui/frontend/src/App.tsx \
   termui/frontend/src/__tests__/app.test.tsx \
+  termui/frontend/src/__tests__/protocol-types.test.ts \
   termui/frontend/src/__tests__/terminal-pane.test.tsx \
   termui/frontend/src/components/SessionFilesPanel.tsx \
   termui/frontend/src/components/TerminalPane.tsx \
+  termui/frontend/src/protocol/direct-client.ts \
+  termui/frontend/src/protocol/types.ts \
   termui/frontend/src/styles.css \
   termui/frontend/src/test/mock-daemon.ts
 

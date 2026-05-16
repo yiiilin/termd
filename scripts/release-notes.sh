@@ -12,6 +12,22 @@ version="${1:-}"
 }
 
 case "$version" in
+  0.1.32)
+    cat <<'EOF'
+termd 0.1.32
+
+用户可见变化:
+- Web 文件侧栏新增 Git 视图，Files/Git 可在同一 panel 内切换；Git 视图展示当前 session cwd 所在仓库的未提交变更和提交图。
+- Git Changes 支持多 worktree/分支折叠展示，分支和文件采用文件树层级缩进；溢出文本可 hover 查看完整路径或名称。
+- Git 变更文件支持打开文件、Stage、Unstage 和 Discard 操作；Discard 使用撤回图标，操作按钮以 hover 浮层显示，不挤占文件名空间。
+- Git Graph 改为更接近 Source Control Graph 的彩色 lane 视图，并支持通过 Changes 与 Graph 之间的横向分隔条上下拖动调整区域高度。
+- 文件侧栏与终端之间的宽度调整改为直接拖动 panel 左边框，不再额外显示一条独立拖动线。
+
+兼容性:
+- 这是 daemon/Web UI/协议扩展更新，不要求 supervisor 兼容版本升级；默认安装更新不应终止或清空现有 session。
+- Git 视图依赖 session 当前 cwd 可被 daemon 读取，并依赖本机 `git` CLI；非 Git 目录会在 Git panel 内显示不可用或空仓库状态。
+EOF
+    ;;
   0.1.31)
     cat <<'EOF'
 termd 0.1.31

@@ -31,6 +31,10 @@ import type {
   SessionDataPayload,
   SessionFileEntryPayload,
   SessionFilesResultPayload,
+  SessionGitActionKind,
+  SessionGitFileChangePayload,
+  SessionGitResultPayload,
+  SessionGitWorktreePayload,
   SessionResizedPayload,
   SessionSummaryPayload,
   TerminalSize,
@@ -64,7 +68,6 @@ const DEFAULT_SESSION_SIZE: TerminalSize = { rows: 24, cols: 80, pixel_width: 0,
 const DEFAULT_FILES_PANEL_WIDTH = 286;
 const MIN_FILES_PANEL_WIDTH = 240;
 const MAX_FILES_PANEL_WIDTH = 640;
-const FILES_PANEL_RESIZER_WIDTH = 10;
 const CONNECTION_AUTO_RETRY_DELAY_MS = 1000;
 const CONNECTION_AUTO_RETRY_LIMIT = 3;
 const FILES_CWD_FOLLOW_POLL_INTERVAL_MS = 1000;
@@ -122,6 +125,10 @@ export default function App() {
   const [sessionFilesLoading, setSessionFilesLoading] = useState(false);
   const [sessionFilesError, setSessionFilesError] = useState<SafeError | undefined>();
   const [sessionFilesFollowTerminalCwd, setSessionFilesFollowTerminalCwd] = useState(true);
+  const [sessionFilesPanelTab, setSessionFilesPanelTab] = useState<"files" | "git">("files");
+  const [sessionGit, setSessionGit] = useState<SessionGitResultPayload | undefined>();
+  const [sessionGitLoading, setSessionGitLoading] = useState(false);
+  const [sessionGitError, setSessionGitError] = useState<SafeError | undefined>();
   const [fileEditor, setFileEditor] = useState<{
     path: string;
     name: string;
@@ -327,7 +334,7 @@ export default function App() {
   const showDesktopFilesPanel = !isMobileLayout && filesPanelOpen;
   const desktopWorkspaceStyle =
     !isMobileLayout && showDesktopFilesPanel
-      ? { gridTemplateColumns: `minmax(0, 1fr) ${FILES_PANEL_RESIZER_WIDTH}px ${filesPanelWidth}px` }
+      ? { gridTemplateColumns: `minmax(0, 1fr) ${filesPanelWidth}px` }
       : undefined;
   const appShellStyle = isMobileLayout
     ? ({
@@ -364,6 +371,9 @@ export default function App() {
     setSessionFiles(undefined);
     setSessionFilesError(undefined);
     setSessionFilesLoading(false);
+    setSessionGit(undefined);
+    setSessionGitError(undefined);
+    setSessionGitLoading(false);
     setFileEditor(undefined);
   }, []);
 
@@ -805,6 +815,50 @@ export default function App() {
     [authenticatedSessionClient],
   );
 
+  const loadSessionGit = useCallback(
+    async (sessionId: UUID, options: { silent?: boolean } = {}) => {
+      const silent = Boolean(options.silent);
+      if (!silent) {
+        setSessionGitLoading(true);
+        setSessionGitError(undefined);
+      }
+      const attachedClient = attachClientRef.current;
+      if (attachedSessionRef.current === sessionId && attachedClient) {
+        try {
+          // Git tab 和文件树一样复用当前 attach 连接，响应仍交给 receive loop，
+          // 避免多个 reader 同时消费同一个 WebSocket。
+          await attachedClient.requestSessionGit(sessionId);
+          return;
+        } catch (caught) {
+          if (!silent) {
+            setSessionGit(undefined);
+            setSessionGitError(toSafeError(caught));
+            setSessionGitLoading(false);
+          }
+          return;
+        }
+      }
+      let client: DirectClient | undefined;
+      try {
+        client = await authenticatedSessionClient(sessionId);
+        const git = await client.getSessionGit(sessionId);
+        setSessionGit(git);
+        setSessionGitError(undefined);
+      } catch (caught) {
+        if (!silent) {
+          setSessionGit(undefined);
+          setSessionGitError(toSafeError(caught));
+        }
+      } finally {
+        client?.close();
+        if (!silent) {
+          setSessionGitLoading(false);
+        }
+      }
+    },
+    [authenticatedSessionClient],
+  );
+
   const handleRefresh = useCallback(async () => {
     setError(undefined);
     setStatus("listing");
@@ -964,6 +1018,13 @@ export default function App() {
               setSessionFilesError(undefined);
               setSessionFilesLoading(false);
             }
+          } else if (inner.type === "session_git_result") {
+            const payload = inner.payload as SessionGitResultPayload;
+            if (payload.session_id === attachedSessionRef.current) {
+              setSessionGit(payload);
+              setSessionGitError(undefined);
+              setSessionGitLoading(false);
+            }
           } else if (inner.type === "session_resized") {
             const payload = inner.payload as SessionResizedPayload;
             // session_resize 是请求，session_resized 才是 daemon 确认；前端只在这里更新
@@ -1056,6 +1117,7 @@ export default function App() {
         startReceiveLoop(attachedClient);
         updateTerminalResizeOwner(Boolean(attached.resize_owner));
         void loadSessionFiles(sessionId);
+        void loadSessionGit(sessionId);
         void refreshDaemonClients();
       } catch (caught) {
         if (
@@ -1080,6 +1142,7 @@ export default function App() {
       clearTerminalOutput,
       disconnectAttach,
       loadSessionFiles,
+      loadSessionGit,
       refreshDaemonClients,
       setSafeError,
       isMobileLayout,
@@ -1541,6 +1604,54 @@ export default function App() {
     void loadSessionFiles(sessionId, sessionFilesFollowTerminalCwd ? undefined : sessionFiles?.path);
   }, [loadSessionFiles, sessionFiles?.path, sessionFilesFollowTerminalCwd]);
 
+  const handleRefreshSessionGit = useCallback(() => {
+    const sessionId = attachedSessionRef.current;
+    if (!sessionId) {
+      return;
+    }
+    void loadSessionGit(sessionId);
+  }, [loadSessionGit]);
+
+  const handleSessionGitAction = useCallback(
+    async (
+      worktree: SessionGitWorktreePayload,
+      change: SessionGitFileChangePayload,
+      action: SessionGitActionKind,
+    ) => {
+      const sessionId = attachedSessionRef.current;
+      if (!sessionId) {
+        return;
+      }
+      setSessionGitLoading(true);
+      setSessionGitError(undefined);
+      let client: DirectClient | undefined;
+      try {
+        client = await authenticatedSessionClient(sessionId);
+        await client.applySessionGitAction(sessionId, worktree.path, change.path, action);
+        client.close();
+        client = undefined;
+        await loadSessionGit(sessionId);
+      } catch (caught) {
+        setSessionGitError(toSafeError(caught));
+        setSessionGitLoading(false);
+      } finally {
+        client?.close();
+      }
+    },
+    [authenticatedSessionClient, loadSessionGit],
+  );
+
+  const handleSessionFilesPanelTabChange = useCallback(
+    (tab: "files" | "git") => {
+      setSessionFilesPanelTab(tab);
+      const sessionId = attachedSessionRef.current;
+      if (tab === "git" && sessionId) {
+        void loadSessionGit(sessionId);
+      }
+    },
+    [loadSessionGit],
+  );
+
   const handleUploadFile = useCallback(
     async (file: File) => {
       const sessionId = attachedSessionRef.current;
@@ -1624,6 +1735,20 @@ export default function App() {
       }
     },
     [authenticatedSessionClient],
+  );
+
+  const handleOpenGitFile = useCallback(
+    (worktree: SessionGitWorktreePayload, change: SessionGitFileChangePayload) => {
+      const path = joinRemotePath(worktree.path, change.path);
+      void handleOpenFile({
+        name: basenameRemotePath(change.path),
+        path,
+        kind: "file",
+        size_bytes: 0,
+        modified_at_ms: null,
+      });
+    },
+    [handleOpenFile],
   );
 
   const handleSaveOpenFile = useCallback(
@@ -2100,30 +2225,31 @@ export default function App() {
               />
               {showDesktopFilesPanel ? (
                 <>
-                  <div
-                    className="files-resizer"
-                    role="separator"
-                    aria-label="Resize files panel"
-                    aria-orientation="vertical"
-                    tabIndex={0}
-                    onPointerDown={handleFilesPanelResizePointerDown}
-                    onKeyDown={handleFilesPanelResizeKeyDown}
-                  />
                   <SessionFilesPanel
                     attachedSessionId={attachedSessionId}
+                    activeTab={sessionFilesPanelTab}
                     files={sessionFiles}
                     loading={sessionFilesLoading}
                     error={sessionFilesError}
+                    git={sessionGit}
+                    gitLoading={sessionGitLoading}
+                    gitError={sessionGitError}
                     followTerminalCwd={sessionFilesFollowTerminalCwd}
+                    onTabChange={handleSessionFilesPanelTabChange}
                     onOpenDirectory={handleOpenDirectory}
                     onOpenFile={handleOpenFile}
+                    onOpenGitFile={handleOpenGitFile}
+                    onGitAction={handleSessionGitAction}
                     onGoToPath={handleGoToFilePath}
                     onRefresh={handleRefreshSessionFiles}
+                    onRefreshGit={handleRefreshSessionGit}
                     onFollowTerminalCwdChange={setSessionFilesFollowTerminalCwd}
                     onUpload={handleUploadFile}
                     onDownload={handleDownloadFile}
                     onDelete={handleDeleteFile}
                     onHide={handleHideFiles}
+                    onResizePointerDown={handleFilesPanelResizePointerDown}
+                    onResizeKeyDown={handleFilesPanelResizeKeyDown}
                   />
                 </>
               ) : !isMobileLayout ? (
@@ -2205,14 +2331,22 @@ export default function App() {
           <div className="mobile-panel mobile-files-panel">
             <SessionFilesPanel
               attachedSessionId={attachedSessionId}
+              activeTab={sessionFilesPanelTab}
               files={sessionFiles}
               loading={sessionFilesLoading}
               error={sessionFilesError}
+              git={sessionGit}
+              gitLoading={sessionGitLoading}
+              gitError={sessionGitError}
               followTerminalCwd={sessionFilesFollowTerminalCwd}
+              onTabChange={handleSessionFilesPanelTabChange}
               onOpenDirectory={handleOpenDirectory}
               onOpenFile={handleOpenFile}
+              onOpenGitFile={handleOpenGitFile}
+              onGitAction={handleSessionGitAction}
               onGoToPath={handleGoToFilePath}
               onRefresh={handleRefreshSessionFiles}
+              onRefreshGit={handleRefreshSessionGit}
               onFollowTerminalCwdChange={setSessionFilesFollowTerminalCwd}
               onUpload={handleUploadFile}
               onDownload={handleDownloadFile}
@@ -2925,6 +3059,12 @@ function joinRemotePath(directory: string, name: string): string {
     return `/${cleanName}`;
   }
   return `${directory.replace(/\/+$/, "")}/${cleanName}`;
+}
+
+function basenameRemotePath(path: string): string {
+  const trimmed = path.replace(/\/+$/, "");
+  const index = trimmed.lastIndexOf("/");
+  return index >= 0 ? trimmed.slice(index + 1) || trimmed : trimmed;
 }
 
 function resolveRemoteDirectoryPath(currentDirectory: string, input: string): string {
