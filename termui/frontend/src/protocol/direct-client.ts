@@ -1,6 +1,14 @@
-import { authPayloadForChallenge, signAuthPayload } from "./auth";
+import {
+  authPayloadForChallenge,
+  daemonE2eeSigningInputBytes,
+  decodeEd25519PublicKey,
+  e2eeAuthTranscriptDigestWire,
+  signAuthPayload,
+  verifyEd25519Signature,
+} from "./auth";
 import { E2eeSession, generateE2eeKeyPair } from "./e2ee";
 import { ProtocolClientError, protocolError } from "./errors";
+import { PROTOCOL_PACKET_VERSION } from "./types";
 import type {
   AuthChallengePayload,
   ClientHelloPayload,
@@ -16,9 +24,15 @@ import type {
   ErrorPayload,
   HelloPayload,
   PairAcceptPayload,
+  PairRequestPayload,
   PairedServerState,
+  PacketErrorPayload,
+  PacketStreamId,
+  PongPayload,
+  ProtocolPacket,
   PublicKeyWire,
   RouteReadyPayload,
+  SessionAttachPayload,
   SessionClosePayload,
   SessionClosedPayload,
   SessionAttachedPayload,
@@ -65,11 +79,13 @@ import {
   nonce,
   nowMs,
   parseEnvelope,
+  randomUuid,
   sessionDataToBase64,
 } from "./wire";
 
 interface DirectClientOptions {
   timeoutMs?: number;
+  expectedDaemonPublicKey?: PublicKeyWire;
   webSocketFactory?: (url: string) => WebSocket;
 }
 
@@ -77,7 +93,28 @@ interface QueuedMessage {
   envelope: Envelope;
 }
 
-const DEFAULT_TIMEOUT_MS = 10000;
+interface PendingRequest {
+  method: string;
+  resolve: (payload: unknown) => void;
+  reject: (error: Error) => void;
+  timer: ReturnType<typeof setTimeout>;
+}
+
+interface QueuedInnerWaiter {
+  resolve: (envelope: Envelope) => void;
+  reject: (error: Error) => void;
+}
+
+interface TerminalStreamState {
+  sessionId: UUID;
+  streamId: PacketStreamId;
+  nextInputSeq: number;
+  lastOutputSeq: number;
+}
+
+const DEFAULT_TIMEOUT_MS = 30000;
+const INITIAL_TERMINAL_STREAM_CREDIT = 64;
+const TERMINAL_STREAM_CREDIT_INCREMENT = 1;
 
 export { ProtocolClientError };
 
@@ -85,7 +122,13 @@ export class DirectClient {
   private readonly timeoutMs: number;
   private e2ee: E2eeSession;
   private closed = false;
+  private receivePumpStarted = false;
+  private e2eeTranscriptSha256?: string;
+  private readonly pendingRequests = new Map<UUID, PendingRequest>();
   private readonly pendingInner: Envelope[] = [];
+  private readonly innerWaiters: QueuedInnerWaiter[] = [];
+  private readonly terminalStreamsBySession = new Map<UUID, TerminalStreamState>();
+  private readonly terminalStreamsById = new Map<PacketStreamId, TerminalStreamState>();
 
   private constructor(
     private readonly socket: WebSocket,
@@ -108,79 +151,120 @@ export class DirectClient {
     const socket = options.webSocketFactory?.(url) ?? new WebSocket(url);
     const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     const inbox = new SocketInbox(socket);
-    await waitForOpen(socket, timeoutMs);
 
-    // route_hello 是统一 /ws 入口的第一帧；relay/daemon 先确认路由，再进入原有业务握手。
-    sendOuterMessage(
-      socket,
-      envelope("route_hello", {
-        server_id: routeServerId,
-        role: "client",
-        protocol_version: 2,
-        nonce: nonce(),
-        timestamp_ms: nowMs(),
-      }),
-    );
-    const routeReady = (
-      await withTimeout(inbox.read(), timeoutMs, "route_prelude_timeout")
-    ).envelope;
-    if (routeReady.type === "error") {
-      throw protocolError(routeReady.payload as ErrorPayload);
-    }
-    if (routeReady.type !== "route_ready") {
-      throw new ProtocolClientError("unexpected_message", "unexpected route prelude message");
-    }
-    const routeReadyPayload = routeReady.payload as RouteReadyPayload;
-    if (routeReadyPayload.server_id !== routeServerId || routeReadyPayload.role !== "client") {
-      throw new ProtocolClientError("route_server_mismatch", "route prelude does not match requested daemon");
-    }
+    try {
+      await waitForOpen(socket, timeoutMs);
 
-    const initial = (
-      await withTimeout(Promise.all([inbox.read(), inbox.read()]), timeoutMs, "handshake_timeout")
-    ).map((message) => message.envelope);
-
-    let daemonPublicKeyWire: PublicKeyWire | undefined;
-    for (const message of initial) {
-      if (message.type === "hello") {
-        const payload = message.payload as HelloPayload;
-        if (payload.server_id && payload.server_id !== routeServerId) {
-          throw new ProtocolClientError("route_server_mismatch", "daemon hello does not match requested route");
-        }
-      } else if (message.type === "e2ee_key_exchange") {
-        const payload = message.payload as E2eeKeyExchangePayload;
-        if (payload.server_id !== routeServerId) {
-          throw new ProtocolClientError("route_server_mismatch", "daemon key exchange does not match requested route");
-        }
-        daemonPublicKeyWire = payload.public_key;
-      } else if (message.type === "error") {
-        throw protocolError(message.payload as ErrorPayload);
-      } else {
-        throw new ProtocolClientError("unexpected_message", "unexpected handshake message");
+      // route_hello 是统一 /ws 入口的第一帧；relay/daemon 先确认路由，再进入原有业务握手。
+      sendOuterMessage(
+        socket,
+        envelope("route_hello", {
+          server_id: routeServerId,
+          role: "client",
+          protocol_version: PROTOCOL_PACKET_VERSION,
+          nonce: nonce(),
+          timestamp_ms: nowMs(),
+        }),
+      );
+      const routeReady = (
+        await withTimeout(inbox.read(), timeoutMs, "route_prelude_timeout")
+      ).envelope;
+      if (routeReady.type === "error") {
+        throw protocolError(routeReady.payload as ErrorPayload);
       }
-    }
+      if (routeReady.type !== "route_ready") {
+        throw new ProtocolClientError("unexpected_message", "unexpected route prelude message");
+      }
+      const routeReadyPayload = routeReady.payload as RouteReadyPayload;
+      if (routeReadyPayload.server_id !== routeServerId || routeReadyPayload.role !== "client") {
+        throw new ProtocolClientError("route_server_mismatch", "route prelude does not match requested daemon");
+      }
 
-    if (!daemonPublicKeyWire) {
-      throw new ProtocolClientError("invalid_handshake", "daemon handshake was incomplete");
-    }
+      const initial = (
+        await withTimeout(Promise.all([inbox.read(), inbox.read()]), timeoutMs, "handshake_timeout")
+      ).map((message) => message.envelope);
 
-    const keypair = generateE2eeKeyPair();
-    const e2ee = E2eeSession.device({
-      serverId: routeServerId,
-      deviceId,
-      localKeypair: keypair,
-      daemonPublicKeyWire,
-    });
-    const client = new DirectClient(socket, inbox, routeServerId, deviceId, e2ee, { timeoutMs });
-    client.sendOuter(
-      envelope("e2ee_key_exchange", {
+      const expectedDaemonPublicKey = options.expectedDaemonPublicKey;
+      if (!expectedDaemonPublicKey) {
+        throw new ProtocolClientError("daemon_identity_required", "daemon public key is required");
+      }
+
+      let daemonKeyExchange: E2eeKeyExchangePayload | undefined;
+      for (const message of initial) {
+        if (message.type === "hello") {
+          const payload = message.payload as HelloPayload;
+          if (payload.server_id && payload.server_id !== routeServerId) {
+            throw new ProtocolClientError("route_server_mismatch", "daemon hello does not match requested route");
+          }
+        } else if (message.type === "e2ee_key_exchange") {
+          const payload = message.payload as E2eeKeyExchangePayload;
+          if (payload.server_id !== routeServerId) {
+            throw new ProtocolClientError("route_server_mismatch", "daemon key exchange does not match requested route");
+          }
+          if (payload.packet_version !== PROTOCOL_PACKET_VERSION) {
+            throw new ProtocolClientError("unsupported_protocol_version", "daemon key exchange does not support packet v3");
+          }
+          if (!payload.signature) {
+            throw new ProtocolClientError("invalid_handshake", "daemon key exchange is unsigned");
+          }
+          const verified = await verifyEd25519Signature(
+            decodeEd25519PublicKey(expectedDaemonPublicKey),
+            daemonE2eeSigningInputBytes(payload, {
+              server_id: routeServerId,
+              daemon_public_key: expectedDaemonPublicKey,
+            }),
+            payload.signature,
+          );
+          if (!verified) {
+            throw new ProtocolClientError("daemon_identity_mismatch", "daemon key exchange signature is invalid");
+          }
+          daemonKeyExchange = payload;
+        } else if (message.type === "error") {
+          throw protocolError(message.payload as ErrorPayload);
+        } else {
+          throw new ProtocolClientError("unexpected_message", "unexpected handshake message");
+        }
+      }
+
+      if (!daemonKeyExchange) {
+        throw new ProtocolClientError("invalid_handshake", "daemon handshake was incomplete");
+      }
+
+      const keypair = generateE2eeKeyPair();
+      const e2ee = E2eeSession.device({
+        serverId: routeServerId,
+        deviceId,
+        localKeypair: keypair,
+        daemonPublicKeyWire: daemonKeyExchange.public_key,
+      });
+      const client = new DirectClient(socket, inbox, routeServerId, deviceId, e2ee, { timeoutMs });
+      const deviceKeyExchange: E2eeKeyExchangePayload = {
         server_id: routeServerId,
         device_id: deviceId,
         public_key: keypair.publicKeyWire,
         nonce: nonce(),
         timestamp_ms: nowMs(),
-      } satisfies E2eeKeyExchangePayload),
-    );
-    return client;
+        packet_version: PROTOCOL_PACKET_VERSION,
+      };
+      client.sendOuter(
+        envelope("e2ee_key_exchange", deviceKeyExchange),
+      );
+      client.e2eeTranscriptSha256 = e2eeAuthTranscriptDigestWire(
+        daemonKeyExchange,
+        deviceKeyExchange,
+        {
+          server_id: routeServerId,
+          daemon_public_key: expectedDaemonPublicKey,
+        },
+      );
+      client.startReceivePump();
+      return client;
+    } catch (error) {
+      // 连接建立阶段一旦超时或握手失败，必须关闭半开 socket，避免 relay 侧残留旧 client。
+      socket.close();
+      inbox.rejectPending(new ProtocolClientError("connection_closed", "connection closed"));
+      throw error;
+    }
   }
 
   get serverId(): UUID {
@@ -188,72 +272,71 @@ export class DirectClient {
   }
 
   async pair(token: string, devicePublicKey: PublicKeyWire): Promise<PairAcceptPayload> {
-    await this.sendInner(
-      envelope("pair_request", {
-        device_id: this.deviceId,
-        device_public_key: devicePublicKey,
-        token,
-        nonce: nonce(),
-        timestamp_ms: nowMs(),
-      }),
-    );
-    // 已配对过的浏览器 device 重新 Pair 时，daemon 会在 E2EE 握手后主动发 auth_challenge。
-    // Pairing token 仍会被后续 pair_request 校验，这里只跳过这个与本次 Pair 无关的预发挑战。
-    return this.expectPayload<PairAcceptPayload>("pair_accept", { ignoredTypes: ["auth_challenge"] });
+    return this.request<PairAcceptPayload>("pair.request", {
+      device_id: this.deviceId,
+      device_public_key: devicePublicKey,
+      token,
+      nonce: nonce(),
+      timestamp_ms: nowMs(),
+    } satisfies PairRequestPayload);
   }
 
   async authenticate(device: DeviceState, server: PairedServerState): Promise<void> {
-    const challenge = await this.expectPayload<AuthChallengePayload>("auth_challenge");
+    const challenge = await this.expectQueuedPayload<AuthChallengePayload>("auth_challenge");
     const auth = await signAuthPayload(
       authPayloadForChallenge(device.device_id, challenge.challenge),
       server,
       device.device_signing_key_secret,
+      this.e2eeTranscriptSha256,
     );
-    await this.sendInner(envelope("auth", auth));
-    await this.sendInner(envelope("client_hello", { name: device.name?.trim() || "Web client" } satisfies ClientHelloPayload));
+    await this.request("auth.verify", auth);
+    await this.request("client.hello", { name: device.name?.trim() || "Web client" } satisfies ClientHelloPayload);
   }
 
   async listSessions(): Promise<SessionListResultPayload> {
-    await this.sendInner(envelope("session_list", {}));
-    return this.expectPayload<SessionListResultPayload>("session_list_result");
+    return this.request<SessionListResultPayload>("session.list", {});
   }
 
   async listDaemonClients(): Promise<DaemonClientsResultPayload> {
-    await this.sendInner(envelope("daemon_clients", {}));
-    return this.expectPayload<DaemonClientsResultPayload>("daemon_clients_result");
+    return this.request<DaemonClientsResultPayload>("daemon.clients", {});
   }
 
   async forgetDaemonClient(deviceId: UUID): Promise<DaemonClientForgotPayload> {
-    await this.sendInner(envelope("daemon_client_forget", { device_id: deviceId } satisfies DaemonClientForgetPayload));
-    return this.expectPayload<DaemonClientForgotPayload>("daemon_client_forgot");
+    return this.request<DaemonClientForgotPayload>("daemon.client_forget", { device_id: deviceId } satisfies DaemonClientForgetPayload);
   }
 
   async getDaemonStatus(): Promise<DaemonStatusResultPayload> {
-    await this.sendInner(envelope("daemon_status", {} satisfies DaemonStatusPayload));
-    return this.expectPayload<DaemonStatusResultPayload>("daemon_status_result", { bufferTerminalEvents: true });
+    return this.request<DaemonStatusResultPayload>("daemon.status", {} satisfies DaemonStatusPayload);
   }
 
   async listSessionFiles(sessionId: UUID, path?: string): Promise<SessionFilesResultPayload> {
-    await this.requestSessionFiles(sessionId, path);
-    return this.expectPayload<SessionFilesResultPayload>("session_files_result", { bufferTerminalEvents: true });
-  }
-
-  async requestSessionFiles(sessionId: UUID, path?: string): Promise<void> {
-    await this.sendInner(
-      envelope("session_files", {
+    return this.request<SessionFilesResultPayload>(
+      "session.files",
+      {
         session_id: sessionId,
         ...(path ? { path } : {}),
-      } satisfies SessionFilesPayload),
+      } satisfies SessionFilesPayload,
     );
   }
 
+  async requestSessionFiles(sessionId: UUID, path?: string): Promise<void> {
+    const payload = await this.request<SessionFilesResultPayload>(
+      "session.files",
+      {
+        session_id: sessionId,
+        ...(path ? { path } : {}),
+      } satisfies SessionFilesPayload,
+    );
+    this.enqueueInner(envelope("session_files_result", payload));
+  }
+
   async getSessionGit(sessionId: UUID): Promise<SessionGitResultPayload> {
-    await this.requestSessionGit(sessionId);
-    return this.expectPayload<SessionGitResultPayload>("session_git_result", { bufferTerminalEvents: true });
+    return this.request<SessionGitResultPayload>("session.git", { session_id: sessionId } satisfies SessionGitPayload);
   }
 
   async requestSessionGit(sessionId: UUID): Promise<void> {
-    await this.sendInner(envelope("session_git", { session_id: sessionId } satisfies SessionGitPayload));
+    const payload = await this.request<SessionGitResultPayload>("session.git", { session_id: sessionId } satisfies SessionGitPayload);
+    this.enqueueInner(envelope("session_git_result", payload));
   }
 
   async applySessionGitAction(
@@ -262,15 +345,15 @@ export class DirectClient {
     filePath: string,
     action: SessionGitActionKind,
   ): Promise<SessionGitActionResultPayload> {
-    await this.sendInner(
-      envelope("session_git_action", {
+    return this.request<SessionGitActionResultPayload>(
+      "session.git_action",
+      {
         session_id: sessionId,
         worktree_path: worktreePath,
         file_path: filePath,
         action,
-      } satisfies SessionGitActionPayload),
+      } satisfies SessionGitActionPayload,
     );
-    return this.expectPayload<SessionGitActionResultPayload>("session_git_action_result", { bufferTerminalEvents: true });
   }
 
   async searchSessionOutput(
@@ -278,15 +361,15 @@ export class DirectClient {
     query: string,
     options: { caseSensitive?: boolean; maxResults?: number } = {},
   ): Promise<SessionSearchResultPayload> {
-    await this.sendInner(
-      envelope("session_search", {
+    return this.request<SessionSearchResultPayload>(
+      "session.search",
+      {
         session_id: sessionId,
         query,
         case_sensitive: Boolean(options.caseSensitive),
         max_results: options.maxResults ?? 80,
-      } satisfies SessionSearchPayload),
+      } satisfies SessionSearchPayload,
     );
-    return this.expectPayload<SessionSearchResultPayload>("session_search_result", { bufferTerminalEvents: true });
   }
 
   async getSessionGitDiff(
@@ -295,46 +378,44 @@ export class DirectClient {
     filePath?: string | null,
     staged = false,
   ): Promise<SessionGitDiffResultPayload> {
-    await this.sendInner(
-      envelope("session_git_diff", {
+    return this.request<SessionGitDiffResultPayload>(
+      "session.git_diff",
+      {
         session_id: sessionId,
         worktree_path: worktreePath,
         file_path: filePath,
         staged,
-      } satisfies SessionGitDiffPayload),
+      } satisfies SessionGitDiffPayload,
     );
-    return this.expectPayload<SessionGitDiffResultPayload>("session_git_diff_result", { bufferTerminalEvents: true });
   }
 
   async readSessionFile(sessionId: UUID, path: string): Promise<SessionFileReadResultPayload> {
-    await this.sendInner(envelope("session_file_read", { session_id: sessionId, path } satisfies SessionFileReadPayload));
-    return this.expectPayload<SessionFileReadResultPayload>("session_file_read_result", { bufferTerminalEvents: true });
+    return this.request<SessionFileReadResultPayload>("session.file_read", { session_id: sessionId, path } satisfies SessionFileReadPayload);
   }
 
   async writeSessionFile(sessionId: UUID, path: string, bytes: Uint8Array): Promise<SessionFileWrittenPayload> {
-    await this.sendInner(
-      envelope("session_file_write", {
+    return this.request<SessionFileWrittenPayload>(
+      "session.file_write",
+      {
         session_id: sessionId,
         path,
         data_base64: sessionDataToBase64(bytes),
-      } satisfies SessionFileWritePayload),
+      } satisfies SessionFileWritePayload,
     );
-    return this.expectPayload<SessionFileWrittenPayload>("session_file_written", { bufferTerminalEvents: true });
   }
 
   async deleteSessionFile(sessionId: UUID, path: string): Promise<SessionFileDeletedPayload> {
-    await this.sendInner(envelope("session_file_delete", { session_id: sessionId, path } satisfies SessionFileDeletePayload));
-    return this.expectPayload<SessionFileDeletedPayload>("session_file_deleted", { bufferTerminalEvents: true });
+    return this.request<SessionFileDeletedPayload>("session.file_delete", { session_id: sessionId, path } satisfies SessionFileDeletePayload);
   }
 
   async prepareSessionFileDownload(sessionId: UUID, path: string): Promise<SessionFileDownloadReadyPayload> {
-    await this.sendInner(
-      envelope("session_file_download_prepare", {
+    return this.request<SessionFileDownloadReadyPayload>(
+      "session.file_download_prepare",
+      {
         session_id: sessionId,
         path,
-      } satisfies SessionFileDownloadPreparePayload),
+      } satisfies SessionFileDownloadPreparePayload,
     );
-    return this.expectPayload<SessionFileDownloadReadyPayload>("session_file_download_ready", { bufferTerminalEvents: true });
   }
 
   async readSessionFileDownloadChunk(
@@ -343,168 +424,466 @@ export class DirectClient {
     offsetBytes: number,
     maxBytes: number,
   ): Promise<SessionFileDownloadChunkResultPayload> {
-    await this.sendInner(
-      envelope("session_file_download_chunk", {
+    return this.request<SessionFileDownloadChunkResultPayload>(
+      "session.file_download_chunk",
+      {
         session_id: sessionId,
         path,
         offset_bytes: offsetBytes,
         max_bytes: maxBytes,
-      } satisfies SessionFileDownloadChunkPayload),
+      } satisfies SessionFileDownloadChunkPayload,
     );
-    return this.expectPayload<SessionFileDownloadChunkResultPayload>("session_file_download_chunk_result", { bufferTerminalEvents: true });
   }
 
   async createSession(command: string[], size: TerminalSize): Promise<SessionCreatedPayload> {
-    await this.sendInner(
-      envelope("session_create", {
+    return this.openTerminalStream<SessionCreatedPayload>(
+      "terminal.create",
+      {
         command,
         size,
-      } satisfies SessionCreatePayload),
+      } satisfies SessionCreatePayload,
     );
-    return this.expectPayload<SessionCreatedPayload>("session_created");
   }
 
-  async attachSession(sessionId: UUID): Promise<SessionAttachedPayload> {
-    await this.sendInner(
-      envelope("session_attach", {
+  async attachSession(sessionId: UUID, options: { watchUpdates?: boolean } = {}): Promise<SessionAttachedPayload> {
+    return this.openTerminalStream<SessionAttachedPayload>(
+      "terminal.attach",
+      {
         session_id: sessionId,
-      }),
+        watch_updates: options.watchUpdates ?? true,
+      } satisfies SessionAttachPayload,
+      sessionId,
     );
-    return this.expectPayload<SessionAttachedPayload>("session_attached");
   }
 
   async sendSessionData(sessionId: UUID, bytes: Uint8Array): Promise<void> {
-    await this.sendInner(
-      envelope("session_data", {
+    const stream = this.terminalStreamsBySession.get(sessionId);
+    if (!stream) {
+      throw new ProtocolClientError("invalid_state", "terminal stream is not attached");
+    }
+    const seq = stream.nextInputSeq;
+    stream.nextInputSeq += 1;
+    this.sendPacket({
+      version: PROTOCOL_PACKET_VERSION,
+      kind: "stream_chunk",
+      stream_id: stream.streamId,
+      seq,
+      payload: {
         session_id: sessionId,
         data_base64: sessionDataToBase64(bytes),
-      } satisfies SessionDataPayload),
-    );
+      } satisfies SessionDataPayload,
+    });
   }
 
   async sendSessionCursor(sessionId: UUID, presence: SessionCursorPresence): Promise<void> {
-    await this.sendInner(
-      envelope("session_cursor", {
+    await this.request(
+      "session.cursor",
+      {
         session_id: sessionId,
         row: presence.row,
         col: presence.col,
         focused: presence.focused,
-      } satisfies SessionCursorPayload),
+      } satisfies SessionCursorPayload,
     );
   }
 
   async resizeSession(sessionId: UUID, size: TerminalSize): Promise<SessionResizedPayload> {
-    await this.requestSessionResize(sessionId, size);
-    return this.expectPayload<SessionResizedPayload>("session_resized", { bufferTerminalEvents: true });
+    return this.request<SessionResizedPayload>("session.resize", { session_id: sessionId, size } satisfies SessionResizePayload);
   }
 
   async requestSessionResize(sessionId: UUID, size: TerminalSize): Promise<void> {
-    await this.sendInner(envelope("session_resize", { session_id: sessionId, size } satisfies SessionResizePayload));
+    const payload = await this.request<SessionResizedPayload>(
+      "session.resize",
+      { session_id: sessionId, size } satisfies SessionResizePayload,
+    );
+    this.enqueueInner(envelope("session_resized", payload));
   }
 
   async renameSession(sessionId: UUID, name: string): Promise<SessionRenamedPayload> {
-    await this.sendInner(
-      envelope("session_rename", {
+    return this.request<SessionRenamedPayload>(
+      "session.rename",
+      {
         session_id: sessionId,
         name,
-      } satisfies SessionRenamePayload),
+      } satisfies SessionRenamePayload,
     );
-    return this.expectPayload<SessionRenamedPayload>("session_renamed", { bufferTerminalEvents: true });
   }
 
   async reorderSessions(sessionIds: UUID[]): Promise<SessionReorderedPayload> {
-    await this.sendInner(envelope("session_reorder", { session_ids: sessionIds } satisfies SessionReorderPayload));
-    return this.expectPayload<SessionReorderedPayload>("session_reordered", { bufferTerminalEvents: true });
+    return this.request<SessionReorderedPayload>("session.reorder", { session_ids: sessionIds } satisfies SessionReorderPayload);
   }
 
   async closeSession(sessionId: UUID): Promise<SessionClosedPayload> {
-    await this.sendInner(envelope("session_close", { session_id: sessionId } satisfies SessionClosePayload));
-    return this.expectPayload<SessionClosedPayload>("session_closed");
+    return this.request<SessionClosedPayload>("session.close", { session_id: sessionId } satisfies SessionClosePayload);
   }
 
   async requestControl(sessionId: UUID): Promise<ControlGrantPayload> {
-    await this.sendControlRequest(sessionId);
-    return this.expectPayload<ControlGrantPayload>("control_grant");
+    return this.request<ControlGrantPayload>("control.request", { session_id: sessionId, device_id: this.deviceId });
   }
 
   async sendControlRequest(sessionId: UUID): Promise<void> {
-    await this.sendInner(envelope("control_request", { session_id: sessionId, device_id: this.deviceId }));
+    await this.requestControl(sessionId);
   }
 
   async sendPing(): Promise<void> {
-    await this.sendInner(envelope("ping", { nonce: nonce(), timestamp_ms: nowMs() }));
+    await this.request<PongPayload>("ping", { nonce: nonce(), timestamp_ms: nowMs() });
+  }
+
+  async measureLatency(): Promise<number> {
+    const pingNonce = nonce();
+    const startedAt = performance.now();
+    await this.request<PongPayload>("ping", { nonce: pingNonce, timestamp_ms: nowMs() });
+    return Math.max(0, performance.now() - startedAt);
+  }
+
+  async request<T = unknown>(method: string, payload: unknown): Promise<T> {
+    const id = randomUuid();
+    return this.sendTrackedPacket<T>(
+      {
+        version: PROTOCOL_PACKET_VERSION,
+        kind: "request",
+        id,
+        method,
+        payload,
+      },
+      id,
+      method,
+    );
   }
 
   async receiveInner(): Promise<Envelope> {
     const pending = this.pendingInner.shift();
     if (pending) {
+      if (pending.type === "error") {
+        throw protocolError(pending.payload as ErrorPayload);
+      }
       return pending;
     }
 
-    return this.receiveInnerFromSocket();
-  }
-
-  private async receiveInnerFromSocket(): Promise<Envelope> {
-    while (true) {
-      const outer = await this.readOuter();
-      if (outer.type === "encrypted_frame") {
-        const inner = this.e2ee.decryptJson(outer.payload as EncryptedFramePayload);
-        if (inner.type === "error") {
-          throw protocolError(inner.payload as ErrorPayload);
-        }
-        return inner;
-      }
-      if (outer.type === "error") {
-        throw protocolError(outer.payload as ErrorPayload);
-      }
-      throw new ProtocolClientError("unexpected_message", "unexpected outer message");
-    }
+    return new Promise((resolve, reject) => {
+      this.innerWaiters.push({
+        resolve: (inner) => {
+          if (inner.type === "error") {
+            reject(protocolError(inner.payload as ErrorPayload));
+            return;
+          }
+          resolve(inner);
+        },
+        reject,
+      });
+    });
   }
 
   close(): void {
+    const error = new ProtocolClientError("connection_closed", "connection closed");
+    for (const stream of this.terminalStreamsById.values()) {
+      this.sendPacketBestEffort({
+        version: PROTOCOL_PACKET_VERSION,
+        kind: "cancel",
+        stream_id: stream.streamId,
+        payload: { reason: "client_closed" },
+      });
+    }
+    this.terminalStreamsById.clear();
+    this.terminalStreamsBySession.clear();
     this.closed = true;
+    this.rejectPendingRequests(error);
+    this.rejectInnerWaiters(error);
     this.socket.close();
-    this.inbox.rejectPending(new ProtocolClientError("connection_closed", "connection closed"));
+    this.inbox.rejectPending(error);
   }
 
-  private async expectPayload<T>(
-    expectedType: Envelope["type"],
-    options: { bufferTerminalEvents?: boolean; ignoredTypes?: Envelope["type"][] } = {},
-  ): Promise<T> {
-    while (true) {
-      const inner = await withTimeout(this.receiveInnerFromSocket(), this.timeoutMs, "response_timeout");
-      if (inner.type === "pong") {
-        continue;
+  private startReceivePump(): void {
+    if (this.receivePumpStarted) {
+      return;
+    }
+    this.receivePumpStarted = true;
+    void this.runReceivePump();
+  }
+
+  private async runReceivePump(): Promise<void> {
+    while (!this.closed) {
+      try {
+        const outer = await this.readOuter();
+        if (outer.type === "encrypted_frame") {
+          const inner = this.e2ee.decryptJson(outer.payload as EncryptedFramePayload);
+          this.dispatchInner(inner);
+          continue;
+        }
+        if (outer.type === "error") {
+          throw protocolError(outer.payload as ErrorPayload);
+        }
+        throw new ProtocolClientError("unexpected_message", "unexpected outer message");
+      } catch (caught) {
+        if (!this.closed) {
+          const error = caught instanceof Error ? caught : new ProtocolClientError("protocol_error", "protocol operation failed");
+          this.rejectPendingRequests(error);
+          this.rejectInnerWaiters(error);
+        }
+        return;
       }
-      if (options.ignoredTypes?.includes(inner.type)) {
-        continue;
-      }
-      if (
-        options.bufferTerminalEvents &&
-        inner.type !== expectedType &&
-        (inner.type === "session_data" ||
-          inner.type === "session_activity" ||
-          inner.type === "session_resized" ||
-          inner.type === "control_grant" ||
-          inner.type === "session_files_result" ||
-          inner.type === "session_git_result" ||
-          inner.type === "session_git_action_result" ||
-          inner.type === "session_git_diff_result" ||
-          inner.type === "session_search_result")
-      ) {
-        // 文件操作复用已 attach 的终端连接；daemon 可能先推送 PTY 输出或文件树同步事件。
-        // 这里把旁路事件放回队列，交给后续 receive loop 处理，避免文件 panel 吃掉回显。
-        this.pendingInner.push(inner);
-        continue;
-      }
-      if (inner.type !== expectedType) {
-        throw new ProtocolClientError("unexpected_message", "unexpected protocol response");
-      }
-      return inner.payload as T;
     }
   }
 
-  private async sendInner(inner: Envelope): Promise<void> {
+  private dispatchInner(inner: Envelope): void {
+    if (inner.type === "packet") {
+      this.dispatchPacket(inner.payload as ProtocolPacket);
+      return;
+    }
+    if (inner.type === "error") {
+      throw protocolError(inner.payload as ErrorPayload);
+    }
+    throw new ProtocolClientError("unexpected_message", "expected protocol packet");
+  }
+
+  private dispatchPacket(packet: ProtocolPacket): void {
+    if (packet.version !== PROTOCOL_PACKET_VERSION) {
+      throw new ProtocolClientError("unsupported_protocol_version", "unsupported protocol packet version");
+    }
+
+    switch (packet.kind) {
+      case "response":
+        this.resolvePacketResponse(packet);
+        return;
+      case "error":
+        this.dispatchPacketError(packet as ProtocolPacket<PacketErrorPayload>);
+        return;
+      case "event":
+        this.enqueuePacketEvent(packet);
+        return;
+      case "stream_chunk":
+        this.handleStreamChunk(packet);
+        return;
+      case "stream_end":
+      case "cancel":
+        this.removeStream(packet.stream_id);
+        return;
+      case "flow":
+        return;
+      case "request":
+      case "stream_open":
+        throw new ProtocolClientError("unexpected_message", "unexpected protocol packet");
+      default:
+        throw new ProtocolClientError("unexpected_message", "unexpected protocol packet");
+    }
+  }
+
+  private resolvePacketResponse(packet: ProtocolPacket): void {
+    if (!packet.id) {
+      throw new ProtocolClientError("invalid_packet", "packet response is missing request id");
+    }
+    const pending = this.pendingRequests.get(packet.id);
+    if (!pending) {
+      return;
+    }
+    if (packet.method && packet.method !== pending.method) {
+      this.rejectTrackedRequest(packet.id, new ProtocolClientError("unexpected_message", "unexpected protocol response"));
+      return;
+    }
+    clearTimeout(pending.timer);
+    this.pendingRequests.delete(packet.id);
+    pending.resolve(packet.payload);
+  }
+
+  private dispatchPacketError(packet: ProtocolPacket<PacketErrorPayload>): void {
+    const error = new ProtocolClientError(packet.payload.code, packet.payload.message);
+    if (packet.id && this.pendingRequests.has(packet.id)) {
+      this.rejectTrackedRequest(packet.id, error);
+      return;
+    }
+    if (packet.stream_id) {
+      // stream 级错误只进入事件队列，不能误伤其他 pending unary request。
+      this.enqueueInner(envelope("error", { code: error.code, message: error.message } satisfies ErrorPayload));
+    }
+  }
+
+  private enqueuePacketEvent(packet: ProtocolPacket): void {
+    switch (packet.method) {
+      case "auth.challenge":
+        this.enqueueInner(envelope("auth_challenge", packet.payload as AuthChallengePayload));
+        return;
+      case "session.activity":
+        this.enqueueInner(envelope("session_activity", packet.payload));
+        return;
+      case "session.files":
+        this.enqueueInner(envelope("session_files_result", packet.payload));
+        return;
+      case "session.git":
+        this.enqueueInner(envelope("session_git_result", packet.payload));
+        return;
+      case "session.resized":
+        this.enqueueInner(envelope("session_resized", packet.payload));
+        return;
+      default:
+        return;
+    }
+  }
+
+  private handleStreamChunk(packet: ProtocolPacket): void {
+    if (!packet.stream_id) {
+      throw new ProtocolClientError("invalid_packet", "stream chunk is missing stream id");
+    }
+    const seq = packet.seq ?? 0;
+    const stream = this.terminalStreamsById.get(packet.stream_id);
+    if (stream) {
+      stream.lastOutputSeq = seq;
+    }
+    this.enqueueInner(envelope("session_data", packet.payload as SessionDataPayload));
+    if (seq > 0) {
+      this.sendPacketBestEffort({
+        version: PROTOCOL_PACKET_VERSION,
+        kind: "flow",
+        stream_id: packet.stream_id,
+        ack: seq,
+        credit: TERMINAL_STREAM_CREDIT_INCREMENT,
+        payload: {},
+      });
+    }
+  }
+
+  private async expectQueuedPayload<T>(expectedType: Envelope["type"]): Promise<T> {
+    const buffered: Envelope[] = [];
+    try {
+      while (true) {
+        const inner = await withTimeout(this.receiveInner(), this.timeoutMs, "response_timeout");
+        if (inner.type === expectedType) {
+          return inner.payload as T;
+        }
+        buffered.push(inner);
+      }
+    } finally {
+      for (const inner of buffered) {
+        this.enqueueInner(inner);
+      }
+    }
+  }
+
+  private openTerminalStream<T extends { session_id: UUID }>(
+    method: string,
+    payload: unknown,
+    sessionId?: UUID,
+  ): Promise<T> {
+    const id = randomUuid();
+    const streamId = randomUuid();
+    let provisionalStream: TerminalStreamState | undefined;
+    if (sessionId) {
+      provisionalStream = { sessionId, streamId, nextInputSeq: 1, lastOutputSeq: 0 };
+      this.terminalStreamsBySession.set(sessionId, provisionalStream);
+      this.terminalStreamsById.set(streamId, provisionalStream);
+    }
+
+    return this.sendTrackedPacket<T>(
+      {
+        version: PROTOCOL_PACKET_VERSION,
+        kind: "stream_open",
+        id,
+        stream_id: streamId,
+        method,
+        credit: INITIAL_TERMINAL_STREAM_CREDIT,
+        payload,
+      },
+      id,
+      method,
+    ).then(
+      (response) => {
+        const resolvedSessionId = response.session_id;
+        if (provisionalStream && provisionalStream.sessionId !== resolvedSessionId) {
+          this.terminalStreamsBySession.delete(provisionalStream.sessionId);
+        }
+        const stream = provisionalStream ?? { sessionId: resolvedSessionId, streamId, nextInputSeq: 1, lastOutputSeq: 0 };
+        stream.sessionId = resolvedSessionId;
+        this.terminalStreamsBySession.set(resolvedSessionId, stream);
+        this.terminalStreamsById.set(streamId, stream);
+        return response;
+      },
+      (error) => {
+        this.removeStream(streamId);
+        throw error;
+      },
+    );
+  }
+
+  private sendTrackedPacket<T>(packet: ProtocolPacket, id: UUID, method: string): Promise<T> {
+    if (this.closed) {
+      return Promise.reject(new ProtocolClientError("connection_closed", "connection closed"));
+    }
+    return new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pendingRequests.delete(id);
+        reject(new ProtocolClientError("response_timeout", "operation timed out"));
+      }, this.timeoutMs);
+      this.pendingRequests.set(id, {
+        method,
+        resolve: (payload) => resolve(payload as T),
+        reject,
+        timer,
+      });
+      try {
+        this.sendPacket(packet);
+      } catch (caught) {
+        this.rejectTrackedRequest(id, caught instanceof Error ? caught : new Error("send_failed"));
+      }
+    });
+  }
+
+  private rejectTrackedRequest(id: UUID, error: Error): void {
+    const pending = this.pendingRequests.get(id);
+    if (!pending) {
+      return;
+    }
+    clearTimeout(pending.timer);
+    this.pendingRequests.delete(id);
+    pending.reject(error);
+  }
+
+  private rejectPendingRequests(error: Error): void {
+    for (const [id] of this.pendingRequests) {
+      this.rejectTrackedRequest(id, error);
+    }
+  }
+
+  private enqueueInner(inner: Envelope): void {
+    const waiter = this.innerWaiters.shift();
+    if (waiter) {
+      waiter.resolve(inner);
+      return;
+    }
+    this.pendingInner.push(inner);
+  }
+
+  private rejectInnerWaiters(error: Error): void {
+    let waiter = this.innerWaiters.shift();
+    while (waiter) {
+      waiter.reject(error);
+      waiter = this.innerWaiters.shift();
+    }
+  }
+
+  private removeStream(streamId?: PacketStreamId): void {
+    if (!streamId) {
+      return;
+    }
+    const stream = this.terminalStreamsById.get(streamId);
+    if (!stream) {
+      return;
+    }
+    this.terminalStreamsById.delete(streamId);
+    this.terminalStreamsBySession.delete(stream.sessionId);
+  }
+
+  private sendPacket(packet: ProtocolPacket): void {
+    this.sendInner(envelope("packet", packet));
+  }
+
+  private sendPacketBestEffort(packet: ProtocolPacket): void {
+    try {
+      this.sendPacket(packet);
+    } catch {
+      // flow/cancel 是流控提示；socket 已关闭时不能影响其它请求归属。
+    }
+  }
+
+  private sendInner(inner: Envelope): void {
     const frame = this.e2ee.encryptJson(inner);
     this.sendOuter(envelope("encrypted_frame", frame));
   }
@@ -578,12 +957,23 @@ function waitForOpen(socket: WebSocket, timeoutMs: number): Promise<void> {
   if (socket.readyState === WebSocket.OPEN) {
     return Promise.resolve();
   }
+  if (socket.readyState === WebSocket.CLOSING || socket.readyState === WebSocket.CLOSED) {
+    return Promise.reject(new ProtocolClientError("connection_closed", "connection closed"));
+  }
   return withTimeout(
     new Promise((resolve, reject) => {
       socket.addEventListener("open", () => resolve(undefined), { once: true });
       socket.addEventListener("error", () => reject(new ProtocolClientError("connection_error", "connection error")), {
         once: true,
       });
+      // 连接拒绝可能在 error 监听器注册前已经推进到 CLOSED；监听 close 并在注册后再检查一次，
+      // 避免不可用 daemon 让前端一直等到完整握手超时。
+      socket.addEventListener("close", () => reject(new ProtocolClientError("connection_closed", "connection closed")), {
+        once: true,
+      });
+      if (socket.readyState === WebSocket.CLOSING || socket.readyState === WebSocket.CLOSED) {
+        reject(new ProtocolClientError("connection_closed", "connection closed"));
+      }
     }),
     timeoutMs,
     "connect_timeout",

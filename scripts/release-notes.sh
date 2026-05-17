@@ -12,6 +12,24 @@ version="${1:-}"
 }
 
 case "$version" in
+  0.2.0)
+    cat <<'EOF'
+termd 0.2.0
+
+用户可见变化:
+- 通信协议升级为 packet v3，所有主要操作统一走带 request id、stream id、错误包、取消包和流控 credit 的 E2EE 内层包；Web、termctl、direct daemon 和 relay 路径使用同一套协议形状。
+- 终端 attach/create 改为流式 packet，终端输出带序号和 credit，客户端关闭会发送 cancel，后续扩展一次性请求和流式请求不再需要新增外层消息格式。
+- E2EE 握手绑定 daemon 公开身份：daemon 会签名自己的 X25519 key exchange，Web 和 termctl 会校验 daemon public key；auth 签名同时绑定当前 E2EE transcript，降低 relay 转发挑战或跨连接复用的风险。
+- pairing invite/QR 现在携带 daemon public key；客户端不会再在新配对流程里猜测 daemon 身份。
+- relay 与 direct transport 增加路由前置握手超时、pong/idle 超时、发送截止时间和帧大小限制；relay 仍只做 dumb pipe，不解密也不解析业务 packet。
+- Web 端切换到不可用 daemon 时会更快回到后台管理页，修复 WebSocket 已关闭但连接等待直到完整超时的竞态。
+
+兼容性:
+- 0.2.0 是协议不兼容版本；0.1.x 的 Web、termctl 或 daemon 不能和 0.2.0 daemon 混用，需要 daemon、termctl 和 Web UI 同步更新。
+- supervisor 兼容版本未更新，仍为 `0.1.0`；按现有本地更新原则，普通 termd 更新不应终止或清空已有 session supervisor。
+- relay 继续保持不可信 dumb pipe，不引入业务权限判断；建议 relay 与 daemon 同步升级以获得新的 transport 超时和大小限制。
+EOF
+    ;;
   0.1.34)
     cat <<'EOF'
 termd 0.1.34

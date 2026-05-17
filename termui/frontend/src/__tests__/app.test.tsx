@@ -165,6 +165,7 @@ function pairingInviteCode(
     ...(options.wsUrl === undefined ? {} : { ws_url: options.wsUrl }),
     token,
     server_id: options.serverId ?? daemon.serverId,
+    daemon_public_key: daemon.daemonPublicKey,
     expires_at_ms: Date.now() + 60_000,
   });
   return `termd-pair:v1:${Buffer.from(payload, "utf8").toString("base64url")}`;
@@ -344,7 +345,7 @@ describe("termui web 工作台", () => {
     await screen.findByText(/termd-e2e-ready/);
     await waitFor(() => expect(daemon.attachedSessions).toEqual(["00000000-0000-0000-0000-000000000401"]));
     await new Promise((resolve) => window.setTimeout(resolve, 250));
-    expect(daemon.pingMessages).toBe(0);
+    expect(daemon.pingMessages).toBeGreaterThan(0);
     expect(daemon.outerWireText()).not.toContain("secret-token");
   });
 
@@ -459,9 +460,9 @@ describe("termui web 工作台", () => {
     const css = readFileSync(resolve(process.cwd(), "src/styles.css"), "utf8");
 
     expect(css).toContain("--daemon-status-cpu-width: 148px;");
-    expect(css).toContain("--daemon-status-memory-width: 176px;");
-    expect(css).toContain("--daemon-status-network-width: 168px;");
-    expect(css).toContain("--daemon-status-disk-width: 176px;");
+    expect(css).toContain("--daemon-status-memory-width: 188px;");
+    expect(css).toContain("--daemon-status-network-width: 236px;");
+    expect(css).toContain("--daemon-status-disk-width: 188px;");
     expect(css).toContain("--daemon-status-load-width: 142px;");
     expect(css).toContain("--daemon-status-uptime-width: 132px;");
     expect(css).toContain("grid-template-columns: max-content minmax(0, 1fr);");
@@ -503,7 +504,7 @@ describe("termui web 工作台", () => {
     expect(css).toContain("max-width: min(100vw, 100dvw);");
     expect(css).toContain(".daemon-status-strip {\n    width: 100%;");
     expect(css).toContain(".daemon-status-strip .daemon-status-grid {\n    width: 100%;");
-    expect(css).toContain("display: grid;\n    grid-template-columns:\n      minmax(56px, 0.75fr)");
+    expect(css).toContain("display: grid;\n    grid-template-columns:\n      68px");
     expect(css).toContain(".terminal-mobile-shortcuts {\n    width: 100%;");
     expect(css).toContain("overflow-x: auto;");
     expect(css).toContain("scrollbar-width: none;");
@@ -529,6 +530,17 @@ describe("termui web 工作台", () => {
         { rxBytes: 1000, txBytes: 3600, sampledAtMs: 15_000 },
       ),
     ).toBeUndefined();
+  });
+
+  it("daemon 状态栏显示网络延迟", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    const status = await screen.findByRole("contentinfo", { name: "daemon server status" });
+
+    expect(await within(status).findByText(/RTT \d+ms/)).toBeInTheDocument();
+    expect(daemon.pingMessages).toBeGreaterThan(0);
   });
 
   it("可以通过拖动手柄调整 session 顺序，并在刷新后保留", async () => {
@@ -1139,6 +1151,7 @@ describe("termui web 工作台", () => {
         [daemon.url, secondDaemon.url],
         secondDaemon.serverId,
         "00000000-0000-0000-0000-000000000999",
+        secondDaemon.daemonPublicKey,
       );
 
       expect(effectiveUrl).toBe(secondDaemon.url);
@@ -1211,7 +1224,7 @@ describe("termui web 工作台", () => {
     }
   });
 
-  it("移动端 PWA 恢复后可以从连接错误界面刷新并重新 attach 当前 session", async () => {
+  it("移动端 PWA 恢复后会静默重新 attach 当前 session", async () => {
     setViewportWidth(390);
     const user = userEvent.setup();
     render(<App />);
@@ -1223,18 +1236,13 @@ describe("termui web 工作台", () => {
 
     daemon.dropConnections();
 
-    const alert = await screen.findByRole("alert", { name: "Connection error" });
-    const refreshButton = within(alert).getByRole("button", { name: "Refresh" });
-    await user.click(refreshButton);
-
-    await waitFor(() => expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull());
-    await screen.findByText(/termd-e2e-ready/);
     await waitFor(() => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID, DEFAULT_SESSION_ID]));
+    expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
+    await screen.findByText(/termd-e2e-ready/);
     expect(screen.getByTestId("terminal-pane")).toBeInTheDocument();
   });
 
-  it("connection error 后会自动按一秒间隔重试当前 session", async () => {
-    setViewportWidth(390);
+  it("attach WebSocket 短断时保留终端并静默重连当前 session", async () => {
     const user = userEvent.setup();
     render(<App />);
 
@@ -1243,14 +1251,45 @@ describe("termui web 工作台", () => {
     await screen.findByText(/termd-e2e-ready/);
     await waitFor(() => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID]));
 
+    let sawConnectionAlert = false;
+    const observer = new MutationObserver(() => {
+      if (document.querySelector('[role="alert"][aria-label="Connection error"]')) {
+        sawConnectionAlert = true;
+      }
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
     daemon.dropConnections();
+    await waitFor(() => expect(daemon.activeConnectionCount()).toBe(0));
+    await new Promise((resolve) => setTimeout(resolve, 80));
 
-    await screen.findByRole("alert", { name: "Connection error" });
+    expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
+    expect(screen.getByTestId("terminal-pane")).toBeInTheDocument();
+    expect(screen.getByText(/termd-e2e-ready/)).toBeInTheDocument();
     await waitFor(
       () => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID, DEFAULT_SESSION_ID]),
       { timeout: 2200 },
     );
-    await waitFor(() => expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull());
+    observer.disconnect();
+    expect(sawConnectionAlert).toBe(false);
+  });
+
+  it("connection closed 后会静默按短延迟重试当前 session", async () => {
+    setViewportWidth(390);
+    const user = userEvent.setup();
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await screen.findByText(/termd-e2e-ready/);
+    await waitFor(() => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID]));
+
+    daemon.dropConnections();
+
+    await waitFor(
+      () => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID, DEFAULT_SESSION_ID]),
+      { timeout: 2200 },
+    );
+    expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
     expect(screen.getByTestId("terminal-pane")).toBeInTheDocument();
   });
 
@@ -2102,6 +2141,7 @@ describe("termui web 工作台", () => {
       version: 1,
       token: "secret-token",
       server_id: daemon.serverId,
+      daemon_public_key: daemon.daemonPublicKey,
       expires_at_ms: Date.now() + 60_000,
     });
     const inviteCode = `termd-pair:v1:${Buffer.from(payload, "utf8").toString("base64url")}`;
@@ -2133,6 +2173,7 @@ describe("termui web 工作台", () => {
       ws_url: daemon.url,
       token: "secret-token",
       server_id: daemon.serverId,
+      daemon_public_key: daemon.daemonPublicKey,
       expires_at_ms: Date.now() + 60_000,
     });
     const inviteCode = `termd-pair:v1:${Buffer.from(payload, "utf8").toString("base64url")}`;
@@ -3014,6 +3055,7 @@ describe("termui web 工作台", () => {
       ws_url: daemon.url,
       token: "secret-token",
       server_id: daemon.serverId,
+      daemon_public_key: daemon.daemonPublicKey,
       expires_at_ms: Date.now() + 60_000,
     });
     const inviteCode = `termd-pair:v1:${Buffer.from(payload, "utf8").toString("base64url")}`;
@@ -3040,6 +3082,7 @@ describe("termui web 工作台", () => {
       ws_url: daemon.url,
       token: "secret-token",
       server_id: daemon.serverId,
+      daemon_public_key: daemon.daemonPublicKey,
       expires_at_ms: Date.now() + 60_000,
     });
     const inviteCode = `termd-pair:v1:${Buffer.from(payload, "utf8").toString("base64url")}`;
@@ -3067,6 +3110,7 @@ describe("termui web 工作台", () => {
       ws_url: daemon.url,
       token: "secret-token",
       server_id: daemon.serverId,
+      daemon_public_key: daemon.daemonPublicKey,
       expires_at_ms: Date.now() + 60_000,
     });
     const inviteCode = `termd-pair:v1:${Buffer.from(payload, "utf8").toString("base64url")}`;
@@ -3096,6 +3140,7 @@ describe("termui web 工作台", () => {
       ws_url: daemon.url,
       token: "secret-token",
       server_id: "00000000-0000-0000-0000-000000000999",
+      daemon_public_key: daemon.daemonPublicKey,
       expires_at_ms: Date.now() + 60_000,
     });
     const inviteCode = `termd-pair:v1:${Buffer.from(payload, "utf8").toString("base64url")}`;

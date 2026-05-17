@@ -24,10 +24,11 @@ use termd_proto::{
     DaemonClientForgotPayload, DaemonClientSummaryPayload, DaemonClientsPayload,
     DaemonClientsResultPayload, DaemonStatusPayload, DaemonStatusResultPayload, DeviceId,
     E2eeKeyExchangePayload, EncryptedFramePayload, Envelope, ErrorPayload, HelloPayload,
-    MessageType, Nonce, PairRequestPayload, PingPayload, PongPayload, ProtocolVersion, ServerId,
-    SessionActivityPayload, SessionAttachPayload, SessionAttachedPayload, SessionClosePayload,
-    SessionClosedPayload, SessionCreatePayload, SessionCreatedPayload, SessionCursorPayload,
-    SessionDataPayload, SessionFileDeletePayload, SessionFileDeletedPayload,
+    MessageType, Nonce, PROTOCOL_PACKET_VERSION, PacketErrorPayload, PacketKind, PacketRequestId,
+    PacketStreamId, PairRequestPayload, PingPayload, PongPayload, ProtocolPacket, ProtocolVersion,
+    ServerId, SessionActivityPayload, SessionAttachPayload, SessionAttachedPayload,
+    SessionClosePayload, SessionClosedPayload, SessionCreatePayload, SessionCreatedPayload,
+    SessionCursorPayload, SessionDataPayload, SessionFileDeletePayload, SessionFileDeletedPayload,
     SessionFileDownloadChunkPayload, SessionFileDownloadChunkResultPayload,
     SessionFileDownloadPreparePayload, SessionFileDownloadReadyPayload, SessionFileEntryPayload,
     SessionFileKind, SessionFileReadPayload, SessionFileReadResultPayload, SessionFileWritePayload,
@@ -44,10 +45,10 @@ use thiserror::Error;
 use tokio::sync::watch;
 
 use crate::auth::{
-    AuthChallengeManager, ChallengeResponseService, DaemonIdentity, DaemonPublicIdentity,
-    DeviceIdentity, InMemoryTrustedDeviceStore, PairingService, PairingTokenManager,
-    ReplayProtector, SignatureVerifier, TrustedDevice, TrustedDeviceStore,
-    current_unix_timestamp_millis,
+    AuthChallengeManager, ChallengeResponseService, DaemonE2eeSigningInput, DaemonIdentity,
+    DaemonPublicIdentity, DeviceIdentity, E2eeAuthTranscript, InMemoryTrustedDeviceStore,
+    PairingService, PairingTokenManager, ReplayProtector, SignatureVerifier, TrustedDevice,
+    TrustedDeviceStore, current_unix_timestamp_millis,
 };
 use crate::config::DaemonConfig;
 use crate::pty::{CommandSpec, PtyBackend, PtyRestoreInfo, PtySupervisorStatus};
@@ -74,6 +75,39 @@ const LIVE_OUTPUT_DRAIN_MAX_CHUNKS: usize = 64;
 const SESSION_FILE_DOWNLOAD_TOKEN_TTL_MS: u64 = 60_000;
 const SESSION_FILE_DOWNLOAD_GRANT_LIMIT: usize = 128;
 const SESSION_FILE_DOWNLOAD_CHUNK_MAX_BYTES: u32 = 256 * 1024;
+const METHOD_PAIR_REQUEST: &str = "pair.request";
+const METHOD_AUTH: &str = "auth";
+const METHOD_AUTH_VERIFY: &str = "auth.verify";
+const METHOD_AUTH_CHALLENGE: &str = "auth.challenge";
+const METHOD_CLIENT_HELLO: &str = "client.hello";
+const METHOD_SESSION_CREATE: &str = "session.create";
+const METHOD_SESSION_ATTACH: &str = "session.attach";
+const METHOD_TERMINAL_CREATE: &str = "terminal.create";
+const METHOD_TERMINAL_ATTACH: &str = "terminal.attach";
+const METHOD_SESSION_DATA: &str = "session.data";
+const METHOD_SESSION_ACTIVITY: &str = "session.activity";
+const METHOD_SESSION_CURSOR: &str = "session.cursor";
+const METHOD_SESSION_RESIZE: &str = "session.resize";
+const METHOD_SESSION_RESIZED: &str = "session.resized";
+const METHOD_SESSION_RENAME: &str = "session.rename";
+const METHOD_SESSION_REORDER: &str = "session.reorder";
+const METHOD_SESSION_CLOSE: &str = "session.close";
+const METHOD_SESSION_SEARCH: &str = "session.search";
+const METHOD_SESSION_FILES: &str = "session.files";
+const METHOD_SESSION_GIT: &str = "session.git";
+const METHOD_SESSION_GIT_ACTION: &str = "session.git_action";
+const METHOD_SESSION_GIT_DIFF: &str = "session.git_diff";
+const METHOD_SESSION_FILE_READ: &str = "session.file_read";
+const METHOD_SESSION_FILE_WRITE: &str = "session.file_write";
+const METHOD_SESSION_FILE_DELETE: &str = "session.file_delete";
+const METHOD_SESSION_FILE_DOWNLOAD_PREPARE: &str = "session.file_download_prepare";
+const METHOD_SESSION_FILE_DOWNLOAD_CHUNK: &str = "session.file_download_chunk";
+const METHOD_SESSION_LIST: &str = "session.list";
+const METHOD_DAEMON_CLIENTS: &str = "daemon.clients";
+const METHOD_DAEMON_CLIENT_FORGET: &str = "daemon.client_forget";
+const METHOD_DAEMON_STATUS: &str = "daemon.status";
+const METHOD_CONTROL_REQUEST: &str = "control.request";
+const METHOD_PING: &str = "ping";
 
 /// 协议层统一使用的 JSON envelope。
 pub type JsonEnvelope = Envelope<Value>;
@@ -112,6 +146,29 @@ struct RestoredSessionMetadata {
 struct PendingRestoreSession {
     record: SessionStateRecord,
     metadata: RestoredSessionMetadata,
+}
+
+/// 0.2.0 packet terminal stream 的连接内状态。
+///
+/// stream id 只在单条 E2EE 连接内有效；它把 terminal attach 的 request/response、后续
+/// input/output chunk、flow credit 和 cancel 都绑定到同一个 session。
+#[derive(Debug, Clone)]
+struct PacketTerminalStream {
+    session_id: SessionId,
+    next_input_seq: u64,
+    next_output_seq: u64,
+    output_credit: u32,
+}
+
+impl PacketTerminalStream {
+    fn new(session_id: SessionId, output_credit: u32) -> Self {
+        Self {
+            session_id,
+            next_input_seq: 1,
+            next_output_seq: 1,
+            output_credit,
+        }
+    }
 }
 
 /// HTTP 文件下载的一次性授权。
@@ -558,13 +615,33 @@ where
         &self,
         peer_ip: Option<String>,
     ) -> (ProtocolConnection, Vec<JsonEnvelope>) {
-        let connection = ProtocolConnection::new(peer_ip);
         let now_ms = current_unix_timestamp_millis();
+        let daemon_public_identity = self.daemon_identity.public_identity();
+        let mut server_key_exchange = E2eeKeyExchangePayload::new(
+            self.server_id(),
+            // server 尚不知道真实 device id；该字段在客户端回应时才作为 E2EE context 使用。
+            DeviceId::default(),
+            self.e2ee_keypair.public_key_wire(),
+            nonce(),
+            now_ms,
+        );
+        server_key_exchange.packet_version = Some(ProtocolVersion(PROTOCOL_PACKET_VERSION));
+        let signing_input =
+            DaemonE2eeSigningInput::from_payload(&server_key_exchange, &daemon_public_identity)
+                .to_bytes();
+        let signature = self
+            .daemon_identity
+            .sign_to_wire(&signing_input)
+            .expect("persisted daemon identity should sign E2EE key exchange");
+        server_key_exchange = server_key_exchange.with_signature(signature);
+
+        let mut connection = ProtocolConnection::new(peer_ip);
+        connection.daemon_e2ee_exchange = Some(server_key_exchange.clone());
         let messages = vec![
             envelope_value(
                 MessageType::Hello,
                 HelloPayload {
-                    protocol_version: ProtocolVersion::default(),
+                    protocol_version: ProtocolVersion(PROTOCOL_PACKET_VERSION),
                     nonce: nonce(),
                     timestamp_ms: now_ms,
                     server_id: Some(self.server_id()),
@@ -572,18 +649,8 @@ where
                 },
             )
             .expect("hello payload should serialize"),
-            envelope_value(
-                MessageType::E2eeKeyExchange,
-                E2eeKeyExchangePayload {
-                    server_id: self.server_id(),
-                    // server 尚不知道真实 device id；该字段在客户端回应时才作为 E2EE context 使用。
-                    device_id: DeviceId::default(),
-                    public_key: self.e2ee_keypair.public_key_wire(),
-                    nonce: nonce(),
-                    timestamp_ms: now_ms,
-                },
-            )
-            .expect("key exchange payload should serialize"),
+            envelope_value(MessageType::E2eeKeyExchange, server_key_exchange)
+                .expect("key exchange payload should serialize"),
         ];
 
         (connection, messages)
@@ -601,6 +668,7 @@ where
             return Err(ProtocolError::InvalidEnvelope);
         }
 
+        let device_key_exchange = payload.clone();
         let peer_public_key = E2eePeerPublicKey::try_from(&payload.public_key)?;
         let context = E2eeSessionContext::new(
             self.server_id(),
@@ -617,6 +685,21 @@ where
 
         connection.device_id = Some(payload.device_id);
         connection.e2ee = Some(e2ee_session);
+        connection.packet_mode = payload
+            .packet_version
+            .is_some_and(|version| version.0 == PROTOCOL_PACKET_VERSION);
+        connection.device_e2ee_exchange = Some(device_key_exchange.clone());
+        connection.e2ee_auth_transcript =
+            connection
+                .daemon_e2ee_exchange
+                .as_ref()
+                .map(|daemon_key_exchange| {
+                    E2eeAuthTranscript::from_key_exchanges(
+                        daemon_key_exchange,
+                        &device_key_exchange,
+                        self.daemon_public_identity(),
+                    )
+                });
         connection.state = ProtocolConnectionState::Auth;
 
         if self.trusted_store.is_trusted(&payload.device_id) {
@@ -687,11 +770,15 @@ where
 
         let authenticated = self
             .auth_service
-            .authenticate(
+            .authenticate_with_transcript(
                 payload,
                 current_unix_timestamp_millis(),
                 &mut self.trusted_store,
                 &self.verifier,
+                connection
+                    .packet_mode
+                    .then_some(())
+                    .and_then(|_| connection.e2ee_auth_transcript.as_ref()),
             )
             .map_err(|_| ProtocolError::AuthFailed)?;
 
@@ -775,7 +862,7 @@ where
         let response_size = self.runtime_size_proto(&internal_session_id)?;
         let (output_offset, initial_output) =
             self.output_history_attach_snapshot(wire_session_id, response_size);
-        connection.attach(wire_session_id, output_offset, initial_output);
+        connection.attach(wire_session_id, output_offset, initial_output, true);
         self.record_daemon_client_attach(wire_session_id, connection, device_id);
         let resize_owner = self.assign_resize_owner_if_missing(wire_session_id, connection);
 
@@ -816,17 +903,29 @@ where
             .attach(&internal_session_id, device_key(device_id))
             .map_err(map_runtime_error)?;
         let wire_role = runtime_role_to_proto(role);
-        self.drain_runtime_output_to_history_until_empty(
-            payload.session_id,
-            &internal_session_id,
-            16 * 1024,
-        )?;
         let response_size = self.runtime_size_proto(&internal_session_id)?;
-        let (output_offset, initial_output) =
-            self.output_history_attach_snapshot(payload.session_id, response_size);
-        connection.attach(payload.session_id, output_offset, initial_output);
-        self.record_daemon_client_attach(payload.session_id, connection, device_id);
-        let resize_owner = self.assign_resize_owner_if_missing(payload.session_id, connection);
+        let (output_offset, initial_output) = if payload.watch_updates {
+            self.drain_runtime_output_to_history_until_empty(
+                payload.session_id,
+                &internal_session_id,
+                16 * 1024,
+            )?;
+            self.output_history_attach_snapshot(payload.session_id, response_size)
+        } else {
+            (0, Vec::new())
+        };
+        connection.attach(
+            payload.session_id,
+            output_offset,
+            initial_output,
+            payload.watch_updates,
+        );
+        let resize_owner = if payload.watch_updates {
+            self.record_daemon_client_attach(payload.session_id, connection, device_id);
+            self.assign_resize_owner_if_missing(payload.session_id, connection)
+        } else {
+            false
+        };
         connection.state = ProtocolConnectionState::Attached;
 
         let response = SessionAttachedPayload {
@@ -2209,6 +2308,7 @@ where
             .collect();
         connection.output_offsets.clear();
         connection.pending_outputs.clear();
+        connection.watched_sessions.clear();
         self.mark_daemon_client_connection_offline(device_id, connection.client_id, now_ms);
 
         // 断开 WebSocket 只 detach 当前连接关联的 session，不 close/terminate PTY。
@@ -3025,7 +3125,16 @@ pub struct ProtocolConnection {
     device_id: Option<DeviceId>,
     authenticated_device_id: Option<DeviceId>,
     e2ee: Option<E2eeSession>,
+    daemon_e2ee_exchange: Option<E2eeKeyExchangePayload>,
+    device_e2ee_exchange: Option<E2eeKeyExchangePayload>,
+    e2ee_auth_transcript: Option<E2eeAuthTranscript>,
+    packet_mode: bool,
+    packet_terminal_streams: HashMap<PacketStreamId, PacketTerminalStream>,
+    packet_terminal_streams_by_session: HashMap<SessionId, PacketStreamId>,
     attached_sessions: Vec<SessionId>,
+    // `attached_sessions` 表示权限范围；`watched_sessions` 才表示该连接要接收实时输出。
+    // 文件/Git/search 等短连接会只 attach 权限，避免大流量终端输出堵住 RPC 响应。
+    watched_sessions: HashSet<SessionId>,
     output_offsets: HashMap<SessionId, u64>,
     pending_outputs: HashMap<SessionId, VecDeque<Vec<u8>>>,
 }
@@ -3039,7 +3148,14 @@ impl ProtocolConnection {
             device_id: None,
             authenticated_device_id: None,
             e2ee: None,
+            daemon_e2ee_exchange: None,
+            device_e2ee_exchange: None,
+            e2ee_auth_transcript: None,
+            packet_mode: false,
+            packet_terminal_streams: HashMap::new(),
+            packet_terminal_streams_by_session: HashMap::new(),
             attached_sessions: Vec::new(),
+            watched_sessions: HashSet::new(),
             output_offsets: HashMap::new(),
             pending_outputs: HashMap::new(),
         }
@@ -3139,7 +3255,12 @@ impl ProtocolConnection {
         B: PtyBackend,
         V: SignatureVerifier,
     {
-        let session_ids = self.attached_sessions.clone();
+        let session_ids: Vec<_> = self
+            .attached_sessions
+            .iter()
+            .copied()
+            .filter(|session_id| self.watched_sessions.contains(session_id))
+            .collect();
         let mut outputs = Vec::new();
 
         for session_id in session_ids {
@@ -3160,6 +3281,7 @@ impl ProtocolConnection {
     {
         self.attached_sessions
             .iter()
+            .filter(|session_id| self.watched_sessions.contains(*session_id))
             .filter_map(|session_id| {
                 protocol
                     .output_signal(*session_id)
@@ -3182,7 +3304,10 @@ impl ProtocolConnection {
         B: PtyBackend,
         V: SignatureVerifier,
     {
-        if self.state != ProtocolConnectionState::Attached || !self.is_authenticated() {
+        if self.state != ProtocolConnectionState::Attached
+            || !self.is_authenticated()
+            || self.watched_sessions.is_empty()
+        {
             return Vec::new();
         }
 
@@ -3210,6 +3335,7 @@ impl ProtocolConnection {
     {
         self.attached_sessions
             .iter()
+            .filter(|session_id| self.watched_sessions.contains(*session_id))
             .filter_map(|session_id| {
                 protocol
                     .file_tree_signal(*session_id)
@@ -3231,6 +3357,7 @@ impl ProtocolConnection {
     {
         self.attached_sessions
             .iter()
+            .filter(|session_id| self.watched_sessions.contains(*session_id))
             .filter_map(|session_id| {
                 protocol
                     .resize_signal(*session_id)
@@ -3266,6 +3393,14 @@ impl ProtocolConnection {
             MessageType::EncryptedFrame => {
                 let frame = decode_payload(envelope.payload)?;
                 let inner: JsonEnvelope = self.e2ee_mut()?.decrypt_json_payload(&frame)?;
+                if inner.kind == MessageType::Packet {
+                    let packet: ProtocolPacket<Value> = decode_payload(inner.payload)?;
+                    let packet_responses = self.handle_inner_packet(protocol, packet)?;
+                    return self.encrypt_packets(packet_responses);
+                }
+                if self.packet_mode {
+                    return Err(ProtocolError::InvalidState);
+                }
                 let inner_responses = self.handle_inner_envelope(protocol, inner)?;
                 self.encrypt_inner_messages(inner_responses)
             }
@@ -3291,31 +3426,49 @@ impl ProtocolConnection {
             .cloned()
             .ok_or(ProtocolError::SessionNotFound)?;
 
-        if !self.attached_sessions.contains(&session_id) {
+        if !self.watched_sessions.contains(&session_id) {
             return Err(ProtocolError::InvalidState);
         }
 
         if max_bytes == 0 {
             return Ok(Vec::new());
         }
+        let max_packet_chunks = if self.packet_mode {
+            let credit = self.packet_stream_output_credit(session_id).unwrap_or(0) as usize;
+            if credit == 0 {
+                return Ok(Vec::new());
+            }
+            Some(credit)
+        } else {
+            None
+        };
 
         let mut chunks = Vec::new();
         if let Some(pending) = self.pending_outputs.get_mut(&session_id) {
-            while let Some(chunk) = pending.pop_front() {
+            while max_packet_chunks.is_none_or(|max_chunks| chunks.len() < max_chunks) {
+                let Some(chunk) = pending.pop_front() else {
+                    break;
+                };
                 chunks.push(chunk);
             }
         }
 
         let mut drained_chunks = 0;
         loop {
-            self.collect_retained_output_chunks(
-                protocol,
-                session_id,
-                &internal_session_id,
-                max_bytes,
-                &mut chunks,
-            );
+            if max_packet_chunks.is_none_or(|max_chunks| chunks.len() < max_chunks) {
+                self.collect_retained_output_chunks(
+                    protocol,
+                    session_id,
+                    &internal_session_id,
+                    max_bytes,
+                    max_packet_chunks,
+                    &mut chunks,
+                );
+            }
             if drained_chunks >= LIVE_OUTPUT_DRAIN_MAX_CHUNKS {
+                break;
+            }
+            if max_packet_chunks.is_some_and(|max_chunks| chunks.len() >= max_chunks) {
                 break;
             }
 
@@ -3376,6 +3529,9 @@ impl ProtocolConnection {
         V: SignatureVerifier,
     {
         self.authenticated_device_id()?;
+        if self.watched_sessions.is_empty() {
+            return Err(ProtocolError::InvalidState);
+        }
         if !protocol.session_index.contains_key(&session_id) {
             return Err(ProtocolError::SessionNotFound);
         }
@@ -3395,12 +3551,16 @@ impl ProtocolConnection {
         session_id: SessionId,
         internal_session_id: &str,
         max_bytes: usize,
+        max_chunks: Option<usize>,
         chunks: &mut Vec<Vec<u8>>,
     ) where
         B: PtyBackend,
         V: SignatureVerifier,
     {
         loop {
+            if max_chunks.is_some_and(|max_chunks| chunks.len() >= max_chunks) {
+                break;
+            }
             let cursor = self
                 .output_offsets
                 .get(&session_id)
@@ -3436,7 +3596,7 @@ impl ProtocolConnection {
         V: SignatureVerifier,
     {
         self.authenticated_device_id()?;
-        if !self.attached_sessions.contains(&session_id) {
+        if !self.watched_sessions.contains(&session_id) {
             return Err(ProtocolError::InvalidState);
         }
 
@@ -3454,7 +3614,7 @@ impl ProtocolConnection {
         V: SignatureVerifier,
     {
         self.authenticated_device_id()?;
-        if !self.attached_sessions.contains(&session_id) {
+        if !self.watched_sessions.contains(&session_id) {
             return Err(ProtocolError::InvalidState);
         }
         let internal_session_id = protocol
@@ -3601,6 +3761,303 @@ impl ProtocolConnection {
         }
     }
 
+    fn handle_inner_packet<B, V>(
+        &mut self,
+        protocol: &mut DaemonProtocol<B, V>,
+        packet: ProtocolPacket<Value>,
+    ) -> Result<Vec<ProtocolPacket<Value>>, ProtocolError>
+    where
+        B: PtyBackend,
+        V: SignatureVerifier,
+    {
+        if packet.version != PROTOCOL_PACKET_VERSION {
+            return Ok(packet_bound_error(packet, ProtocolError::InvalidEnvelope)
+                .into_iter()
+                .collect());
+        }
+
+        match packet.kind {
+            PacketKind::Request => self.handle_packet_request(protocol, packet),
+            PacketKind::StreamOpen => self.handle_packet_stream_open(protocol, packet),
+            PacketKind::StreamChunk => self.handle_packet_stream_chunk(protocol, packet),
+            PacketKind::StreamEnd => self.handle_packet_stream_end(packet),
+            PacketKind::Cancel => self.handle_packet_cancel(packet),
+            PacketKind::Flow => self.handle_packet_flow(packet),
+            PacketKind::Response | PacketKind::Event | PacketKind::Error => {
+                Err(ProtocolError::InvalidState)
+            }
+        }
+    }
+
+    fn handle_packet_request<B, V>(
+        &mut self,
+        protocol: &mut DaemonProtocol<B, V>,
+        packet: ProtocolPacket<Value>,
+    ) -> Result<Vec<ProtocolPacket<Value>>, ProtocolError>
+    where
+        B: PtyBackend,
+        V: SignatureVerifier,
+    {
+        let id = packet.id.ok_or(ProtocolError::InvalidEnvelope)?;
+        let method = packet
+            .method
+            .clone()
+            .ok_or(ProtocolError::InvalidEnvelope)?;
+        let responses = self.dispatch_packet_request(protocol, method.as_str(), packet.payload);
+
+        match responses {
+            Ok(envelopes) => packetize_handler_responses(id, method.as_str(), envelopes),
+            Err(error) => Ok(vec![packet_request_error(id, error)?]),
+        }
+    }
+
+    fn dispatch_packet_request<B, V>(
+        &mut self,
+        protocol: &mut DaemonProtocol<B, V>,
+        method: &str,
+        payload: Value,
+    ) -> Result<Vec<JsonEnvelope>, ProtocolError>
+    where
+        B: PtyBackend,
+        V: SignatureVerifier,
+    {
+        match method {
+            METHOD_PAIR_REQUEST => {
+                let payload = decode_payload(payload)?;
+                protocol.handle_pair_request(self, payload)
+            }
+            METHOD_AUTH | METHOD_AUTH_VERIFY => {
+                let payload = decode_payload(payload)?;
+                protocol.handle_auth(self, payload)
+            }
+            METHOD_CLIENT_HELLO => {
+                let payload = decode_payload(payload)?;
+                protocol.record_client_hello(self, payload)
+            }
+            METHOD_SESSION_CREATE => {
+                let payload = decode_payload(payload)?;
+                protocol.create_session(self, payload)
+            }
+            METHOD_SESSION_ATTACH => {
+                let payload = decode_payload(payload)?;
+                protocol.attach_session(self, payload)
+            }
+            METHOD_SESSION_DATA => {
+                let payload = decode_payload(payload)?;
+                protocol.write_session_data(self, payload)
+            }
+            METHOD_SESSION_CURSOR => {
+                let payload = decode_payload(payload)?;
+                protocol.record_session_cursor(self, payload)
+            }
+            METHOD_SESSION_RESIZE => {
+                let payload = decode_payload(payload)?;
+                protocol.resize_session(self, payload)
+            }
+            METHOD_SESSION_RENAME => {
+                let payload = decode_payload(payload)?;
+                protocol.rename_session(self, payload)
+            }
+            METHOD_SESSION_REORDER => {
+                let payload = decode_payload(payload)?;
+                protocol.reorder_sessions(self, payload)
+            }
+            METHOD_SESSION_CLOSE => {
+                let payload = decode_payload(payload)?;
+                protocol.close_session(self, payload)
+            }
+            METHOD_SESSION_SEARCH => {
+                let payload = decode_payload(payload)?;
+                protocol.search_session_output(self, payload)
+            }
+            METHOD_SESSION_FILES => {
+                let payload = decode_payload(payload)?;
+                protocol.list_session_files(self, payload)
+            }
+            METHOD_SESSION_GIT => {
+                let payload = decode_payload(payload)?;
+                protocol.list_session_git(self, payload)
+            }
+            METHOD_SESSION_GIT_ACTION => {
+                let payload = decode_payload(payload)?;
+                protocol.apply_session_git_action(self, payload)
+            }
+            METHOD_SESSION_GIT_DIFF => {
+                let payload = decode_payload(payload)?;
+                protocol.read_session_git_diff(self, payload)
+            }
+            METHOD_SESSION_FILE_READ => {
+                let payload = decode_payload(payload)?;
+                protocol.read_session_file(self, payload)
+            }
+            METHOD_SESSION_FILE_WRITE => {
+                let payload = decode_payload(payload)?;
+                protocol.write_session_file(self, payload)
+            }
+            METHOD_SESSION_FILE_DELETE => {
+                let payload = decode_payload(payload)?;
+                protocol.delete_session_file(self, payload)
+            }
+            METHOD_SESSION_FILE_DOWNLOAD_PREPARE => {
+                let payload = decode_payload(payload)?;
+                protocol.prepare_session_file_download(self, payload)
+            }
+            METHOD_SESSION_FILE_DOWNLOAD_CHUNK => {
+                let payload = decode_payload(payload)?;
+                protocol.read_session_file_download_chunk(self, payload)
+            }
+            METHOD_CONTROL_REQUEST => {
+                let payload = decode_payload(payload)?;
+                protocol.request_control(self, payload)
+            }
+            METHOD_SESSION_LIST => {
+                let payload = decode_payload(payload)?;
+                protocol.list_sessions(self, payload)
+            }
+            METHOD_DAEMON_CLIENTS => {
+                let payload = decode_payload(payload)?;
+                protocol.list_daemon_clients(self, payload)
+            }
+            METHOD_DAEMON_CLIENT_FORGET => {
+                let payload = decode_payload(payload)?;
+                protocol.forget_daemon_client(self, payload)
+            }
+            METHOD_DAEMON_STATUS => {
+                let payload = decode_payload(payload)?;
+                protocol.daemon_status(self, payload)
+            }
+            METHOD_PING => {
+                let payload: PingPayload = decode_payload(payload)?;
+                Ok(vec![envelope_value(
+                    MessageType::Pong,
+                    PongPayload {
+                        nonce: payload.nonce,
+                        timestamp_ms: current_unix_timestamp_millis(),
+                    },
+                )?])
+            }
+            _ => Err(ProtocolError::InvalidEnvelope),
+        }
+    }
+
+    fn handle_packet_stream_open<B, V>(
+        &mut self,
+        protocol: &mut DaemonProtocol<B, V>,
+        packet: ProtocolPacket<Value>,
+    ) -> Result<Vec<ProtocolPacket<Value>>, ProtocolError>
+    where
+        B: PtyBackend,
+        V: SignatureVerifier,
+    {
+        let id = packet.id.ok_or(ProtocolError::InvalidEnvelope)?;
+        let stream_id = packet.stream_id.ok_or(ProtocolError::InvalidEnvelope)?;
+        let method = packet
+            .method
+            .clone()
+            .ok_or(ProtocolError::InvalidEnvelope)?;
+        let credit = packet.credit.unwrap_or(0);
+        let responses = match method.as_str() {
+            METHOD_TERMINAL_CREATE => {
+                let payload = decode_payload(packet.payload)?;
+                protocol.create_session(self, payload)
+            }
+            METHOD_TERMINAL_ATTACH => {
+                let payload = decode_payload(packet.payload)?;
+                protocol.attach_session(self, payload)
+            }
+            _ => Err(ProtocolError::InvalidEnvelope),
+        };
+
+        let envelopes = match responses {
+            Ok(envelopes) => envelopes,
+            Err(error) => return Ok(vec![packet_request_error(id, error)?]),
+        };
+        let session_id = packet_stream_session_id(method.as_str(), &envelopes)?;
+        self.register_packet_terminal_stream(stream_id, session_id, credit);
+        packetize_handler_stream_open_response(id, stream_id, method.as_str(), credit, envelopes)
+    }
+
+    fn handle_packet_stream_chunk<B, V>(
+        &mut self,
+        protocol: &mut DaemonProtocol<B, V>,
+        packet: ProtocolPacket<Value>,
+    ) -> Result<Vec<ProtocolPacket<Value>>, ProtocolError>
+    where
+        B: PtyBackend,
+        V: SignatureVerifier,
+    {
+        let stream_id = packet.stream_id.ok_or(ProtocolError::InvalidEnvelope)?;
+        let Some(stream) = self.packet_terminal_streams.get(&stream_id).cloned() else {
+            return Ok(vec![packet_stream_error(
+                stream_id,
+                ProtocolError::InvalidState,
+            )?]);
+        };
+        if packet.seq != stream.next_input_seq {
+            return Ok(vec![packet_stream_error(
+                stream_id,
+                ProtocolError::InvalidEnvelope,
+            )?]);
+        }
+        let payload: SessionDataPayload = match decode_payload(packet.payload) {
+            Ok(payload) => payload,
+            Err(error) => return Ok(vec![packet_stream_error(stream_id, error)?]),
+        };
+        if payload.session_id != stream.session_id {
+            return Ok(vec![packet_stream_error(
+                stream_id,
+                ProtocolError::InvalidEnvelope,
+            )?]);
+        }
+
+        if let Err(error) = protocol.write_session_data(self, payload) {
+            return Ok(vec![packet_stream_error(stream_id, error)?]);
+        }
+        if let Some(stream) = self.packet_terminal_streams.get_mut(&stream_id) {
+            stream.next_input_seq = stream.next_input_seq.saturating_add(1);
+        }
+        Ok(Vec::new())
+    }
+
+    fn handle_packet_stream_end(
+        &mut self,
+        packet: ProtocolPacket<Value>,
+    ) -> Result<Vec<ProtocolPacket<Value>>, ProtocolError> {
+        let stream_id = packet.stream_id.ok_or(ProtocolError::InvalidEnvelope)?;
+        if let Some(stream) = self.packet_terminal_streams.get_mut(&stream_id) {
+            if packet.seq == stream.next_input_seq {
+                stream.next_input_seq = stream.next_input_seq.saturating_add(1);
+            }
+        }
+        Ok(Vec::new())
+    }
+
+    fn handle_packet_cancel(
+        &mut self,
+        packet: ProtocolPacket<Value>,
+    ) -> Result<Vec<ProtocolPacket<Value>>, ProtocolError> {
+        if let Some(stream_id) = packet.stream_id {
+            self.remove_packet_terminal_stream(stream_id);
+            return Ok(Vec::new());
+        }
+        if packet.id.is_some() {
+            return Ok(Vec::new());
+        }
+        Err(ProtocolError::InvalidEnvelope)
+    }
+
+    fn handle_packet_flow(
+        &mut self,
+        packet: ProtocolPacket<Value>,
+    ) -> Result<Vec<ProtocolPacket<Value>>, ProtocolError> {
+        let stream_id = packet.stream_id.ok_or(ProtocolError::InvalidEnvelope)?;
+        let credit = packet.credit.unwrap_or(0);
+        if let Some(stream) = self.packet_terminal_streams.get_mut(&stream_id) {
+            stream.output_credit = stream.output_credit.saturating_add(credit);
+        }
+        Ok(Vec::new())
+    }
+
     fn e2ee_mut(&mut self) -> Result<&mut E2eeSession, ProtocolError> {
         self.e2ee.as_mut().ok_or(ProtocolError::InvalidState)
     }
@@ -3619,6 +4076,14 @@ impl ProtocolConnection {
         &mut self,
         messages: Vec<JsonEnvelope>,
     ) -> Result<Vec<JsonEnvelope>, ProtocolError> {
+        if self.packet_mode {
+            let packets = messages
+                .into_iter()
+                .map(|message| packet_from_envelope(self, message))
+                .collect::<Result<Vec<_>, _>>()?;
+            return self.encrypt_packets(packets);
+        }
+
         messages
             .into_iter()
             .map(|message| {
@@ -3649,9 +4114,88 @@ impl ProtocolConnection {
         error_envelope
     }
 
-    fn attach(&mut self, session_id: SessionId, output_base_offset: u64, initial_output: Vec<u8>) {
+    fn encrypt_packets(
+        &mut self,
+        packets: Vec<ProtocolPacket<Value>>,
+    ) -> Result<Vec<JsonEnvelope>, ProtocolError> {
+        packets
+            .into_iter()
+            .map(|packet| {
+                let frame = self
+                    .e2ee_mut()?
+                    .encrypt_json_payload(&Envelope::new(MessageType::Packet, packet))?;
+                envelope_value(MessageType::EncryptedFrame, frame)
+            })
+            .collect()
+    }
+
+    fn register_packet_terminal_stream(
+        &mut self,
+        stream_id: PacketStreamId,
+        session_id: SessionId,
+        output_credit: u32,
+    ) {
+        if let Some(previous_stream_id) = self
+            .packet_terminal_streams_by_session
+            .insert(session_id, stream_id)
+        {
+            self.packet_terminal_streams.remove(&previous_stream_id);
+        }
+        self.packet_terminal_streams.insert(
+            stream_id,
+            PacketTerminalStream::new(session_id, output_credit),
+        );
+    }
+
+    fn remove_packet_terminal_stream(&mut self, stream_id: PacketStreamId) {
+        let Some(stream) = self.packet_terminal_streams.remove(&stream_id) else {
+            return;
+        };
+        self.packet_terminal_streams_by_session
+            .remove(&stream.session_id);
+    }
+
+    fn packet_stream_id_for_session(&self, session_id: SessionId) -> Option<PacketStreamId> {
+        self.packet_terminal_streams_by_session
+            .get(&session_id)
+            .copied()
+    }
+
+    fn packet_stream_output_credit(&self, session_id: SessionId) -> Option<u32> {
+        let stream_id = self.packet_stream_id_for_session(session_id)?;
+        self.packet_terminal_streams
+            .get(&stream_id)
+            .map(|stream| stream.output_credit)
+    }
+
+    fn next_packet_stream_output_seq(
+        &mut self,
+        session_id: SessionId,
+    ) -> Option<(PacketStreamId, u64)> {
+        let stream_id = self.packet_stream_id_for_session(session_id)?;
+        let stream = self.packet_terminal_streams.get_mut(&stream_id)?;
+        if stream.output_credit == 0 {
+            return None;
+        }
+
+        let seq = stream.next_output_seq;
+        stream.next_output_seq = stream.next_output_seq.saturating_add(1);
+        stream.output_credit = stream.output_credit.saturating_sub(1);
+        Some((stream_id, seq))
+    }
+
+    fn attach(
+        &mut self,
+        session_id: SessionId,
+        output_base_offset: u64,
+        initial_output: Vec<u8>,
+        watch_updates: bool,
+    ) {
         if !self.attached_sessions.contains(&session_id) {
             self.attached_sessions.push(session_id);
+        }
+        if watch_updates {
+            self.watched_sessions.insert(session_id);
             self.output_offsets.insert(session_id, output_base_offset);
             if !initial_output.is_empty() {
                 self.pending_outputs
@@ -3678,6 +4222,229 @@ where
     T: DeserializeOwned,
 {
     serde_json::from_value(payload).map_err(|_| ProtocolError::InvalidEnvelope)
+}
+
+fn packetize_handler_responses(
+    id: PacketRequestId,
+    method: &str,
+    envelopes: Vec<JsonEnvelope>,
+) -> Result<Vec<ProtocolPacket<Value>>, ProtocolError> {
+    if envelopes.is_empty() {
+        return Ok(vec![ProtocolPacket::response(
+            id,
+            method,
+            serde_json::json!({}),
+        )]);
+    }
+
+    let mut packets = Vec::with_capacity(envelopes.len());
+    for (index, envelope) in envelopes.into_iter().enumerate() {
+        if envelope.kind == MessageType::Error {
+            let error: ErrorPayload = decode_payload(envelope.payload)?;
+            packets.push(packet_request_error_from_payload(
+                id,
+                error.code,
+                error.message,
+                false,
+            )?);
+            continue;
+        }
+
+        if index == 0 {
+            packets.push(ProtocolPacket::response(id, method, envelope.payload));
+        } else {
+            let event_method = packet_event_method_for_message(envelope.kind)
+                .unwrap_or(method)
+                .to_owned();
+            packets.push(ProtocolPacket::event(event_method, envelope.payload));
+        }
+    }
+
+    Ok(packets)
+}
+
+fn packetize_handler_stream_open_response(
+    id: PacketRequestId,
+    stream_id: PacketStreamId,
+    method: &str,
+    credit: u32,
+    envelopes: Vec<JsonEnvelope>,
+) -> Result<Vec<ProtocolPacket<Value>>, ProtocolError> {
+    let mut packets = packetize_handler_responses(id, method, envelopes)?;
+    if let Some(first) = packets.first_mut() {
+        first.stream_id = Some(stream_id);
+        first.credit = Some(credit);
+    }
+    Ok(packets)
+}
+
+fn packet_stream_session_id(
+    method: &str,
+    envelopes: &[JsonEnvelope],
+) -> Result<SessionId, ProtocolError> {
+    let first = envelopes.first().ok_or(ProtocolError::InvalidEnvelope)?;
+    match method {
+        METHOD_TERMINAL_CREATE => {
+            let payload: SessionCreatedPayload = decode_payload(first.payload.clone())?;
+            Ok(payload.session_id)
+        }
+        METHOD_TERMINAL_ATTACH => {
+            let payload: SessionAttachedPayload = decode_payload(first.payload.clone())?;
+            Ok(payload.session_id)
+        }
+        _ => Err(ProtocolError::InvalidEnvelope),
+    }
+}
+
+fn packet_from_envelope(
+    connection: &mut ProtocolConnection,
+    envelope: JsonEnvelope,
+) -> Result<ProtocolPacket<Value>, ProtocolError> {
+    if envelope.kind == MessageType::Error {
+        let error: ErrorPayload = decode_payload(envelope.payload)?;
+        return packet_unbound_error_from_payload(error.code, error.message, false);
+    }
+
+    if envelope.kind == MessageType::SessionData {
+        let payload: SessionDataPayload = decode_payload(envelope.payload)?;
+        let (stream_id, seq) = connection
+            .next_packet_stream_output_seq(payload.session_id)
+            .ok_or(ProtocolError::InvalidState)?;
+        let payload = serde_json::to_value(payload).map_err(|_| ProtocolError::InvalidEnvelope)?;
+        return Ok(ProtocolPacket::stream_chunk(stream_id, seq, payload));
+    }
+
+    let method =
+        packet_event_method_for_message(envelope.kind).ok_or(ProtocolError::InvalidEnvelope)?;
+    Ok(ProtocolPacket::event(method, envelope.payload))
+}
+
+fn packet_event_method_for_message(kind: MessageType) -> Option<&'static str> {
+    match kind {
+        MessageType::AuthChallenge => Some(METHOD_AUTH_CHALLENGE),
+        MessageType::SessionActivity => Some(METHOD_SESSION_ACTIVITY),
+        MessageType::SessionFilesResult => Some(METHOD_SESSION_FILES),
+        MessageType::SessionGitResult => Some(METHOD_SESSION_GIT),
+        MessageType::SessionResized => Some(METHOD_SESSION_RESIZED),
+        _ => None,
+    }
+}
+
+fn packet_bound_error(
+    packet: ProtocolPacket<Value>,
+    error: ProtocolError,
+) -> Option<ProtocolPacket<Value>> {
+    if let Some(id) = packet.id {
+        return packet_request_error(id, error).ok();
+    }
+    if let Some(stream_id) = packet.stream_id {
+        return packet_stream_error(stream_id, error).ok();
+    }
+    packet_unbound_error(error).ok()
+}
+
+fn packet_request_error(
+    id: PacketRequestId,
+    error: ProtocolError,
+) -> Result<ProtocolPacket<Value>, ProtocolError> {
+    packet_request_error_from_payload(
+        id,
+        error.code().to_owned(),
+        error.safe_message().to_owned(),
+        false,
+    )
+}
+
+fn packet_stream_error(
+    stream_id: PacketStreamId,
+    error: ProtocolError,
+) -> Result<ProtocolPacket<Value>, ProtocolError> {
+    packet_stream_error_from_payload(
+        stream_id,
+        error.code().to_owned(),
+        error.safe_message().to_owned(),
+        false,
+    )
+}
+
+fn packet_unbound_error(error: ProtocolError) -> Result<ProtocolPacket<Value>, ProtocolError> {
+    packet_unbound_error_from_payload(
+        error.code().to_owned(),
+        error.safe_message().to_owned(),
+        false,
+    )
+}
+
+fn packet_request_error_from_payload(
+    id: PacketRequestId,
+    code: String,
+    message: String,
+    retryable: bool,
+) -> Result<ProtocolPacket<Value>, ProtocolError> {
+    let payload = packet_error_payload_value(code, message, retryable)?;
+    Ok(ProtocolPacket {
+        version: PROTOCOL_PACKET_VERSION,
+        kind: PacketKind::Error,
+        id: Some(id),
+        stream_id: None,
+        method: None,
+        seq: 0,
+        ack: None,
+        credit: None,
+        payload,
+    })
+}
+
+fn packet_stream_error_from_payload(
+    stream_id: PacketStreamId,
+    code: String,
+    message: String,
+    retryable: bool,
+) -> Result<ProtocolPacket<Value>, ProtocolError> {
+    let payload = packet_error_payload_value(code, message, retryable)?;
+    Ok(ProtocolPacket {
+        version: PROTOCOL_PACKET_VERSION,
+        kind: PacketKind::Error,
+        id: None,
+        stream_id: Some(stream_id),
+        method: None,
+        seq: 0,
+        ack: None,
+        credit: None,
+        payload,
+    })
+}
+
+fn packet_unbound_error_from_payload(
+    code: String,
+    message: String,
+    retryable: bool,
+) -> Result<ProtocolPacket<Value>, ProtocolError> {
+    let payload = packet_error_payload_value(code, message, retryable)?;
+    Ok(ProtocolPacket {
+        version: PROTOCOL_PACKET_VERSION,
+        kind: PacketKind::Error,
+        id: None,
+        stream_id: None,
+        method: None,
+        seq: 0,
+        ack: None,
+        credit: None,
+        payload,
+    })
+}
+
+fn packet_error_payload_value(
+    code: String,
+    message: String,
+    retryable: bool,
+) -> Result<Value, ProtocolError> {
+    serde_json::to_value(PacketErrorPayload {
+        code,
+        message,
+        retryable,
+    })
+    .map_err(|_| ProtocolError::InvalidEnvelope)
 }
 
 pub fn encrypted_frame_from_envelope(
@@ -4712,6 +5479,22 @@ mod tests {
         )
     }
 
+    fn protocol_from_state(
+        state: crate::state::DaemonState,
+    ) -> (
+        DaemonProtocol<FakePtyBackend, Ed25519SignatureVerifier>,
+        FakePtyBackend,
+    ) {
+        let backend = FakePtyBackend::default();
+        let config =
+            DaemonConfig::default_for_state_path(temp_state_path("protocol-restored.json"));
+        (
+            DaemonProtocol::from_state(config, backend.clone(), Ed25519SignatureVerifier, state)
+                .unwrap(),
+            backend,
+        )
+    }
+
     fn temp_state_path(name: &str) -> std::path::PathBuf {
         let counter = TEST_STATE_COUNTER.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!(
@@ -4809,13 +5592,13 @@ mod tests {
         .unwrap();
         let handshake = envelope_value(
             MessageType::E2eeKeyExchange,
-            E2eeKeyExchangePayload {
-                server_id: protocol.server_id(),
+            E2eeKeyExchangePayload::new(
+                protocol.server_id(),
                 device_id,
-                public_key: device_keypair.public_key_wire(),
-                nonce: nonce(),
-                timestamp_ms: UnixTimestampMillis(1_000),
-            },
+                device_keypair.public_key_wire(),
+                nonce(),
+                UnixTimestampMillis(1_000),
+            ),
         )
         .unwrap();
 
@@ -4823,6 +5606,44 @@ mod tests {
         assert!(responses.is_empty());
 
         (device_keypair, device_session)
+    }
+
+    fn open_packet_e2ee(
+        protocol: &mut DaemonProtocol<FakePtyBackend, Ed25519SignatureVerifier>,
+        connection: &mut ProtocolConnection,
+        device_id: DeviceId,
+    ) -> (E2eeKeyPair, E2eeSession, Vec<JsonEnvelope>) {
+        let device_keypair = E2eeKeyPair::generate();
+        let context = E2eeSessionContext::new(
+            protocol.server_id(),
+            device_id,
+            protocol.e2ee_public_key(),
+            device_keypair.public_key(),
+        );
+        let device_session = E2eeSession::new(
+            E2eeSessionRole::Device,
+            &device_keypair,
+            protocol.e2ee_public_key(),
+            context,
+        )
+        .unwrap();
+        let handshake = envelope_value(
+            MessageType::E2eeKeyExchange,
+            E2eeKeyExchangePayload::new(
+                protocol.server_id(),
+                device_id,
+                device_keypair.public_key_wire(),
+                nonce(),
+                UnixTimestampMillis(1_000),
+            )
+            .with_packet_version(ProtocolVersion(PROTOCOL_PACKET_VERSION)),
+        )
+        .unwrap();
+
+        let responses = connection.handle_wire_envelope(protocol, handshake);
+        assert!(connection.packet_mode);
+
+        (device_keypair, device_session, responses)
     }
 
     fn send_encrypted(
@@ -4837,12 +5658,38 @@ mod tests {
         connection.handle_wire_envelope(protocol, outer)
     }
 
+    fn send_encrypted_packet(
+        protocol: &mut DaemonProtocol<FakePtyBackend, Ed25519SignatureVerifier>,
+        connection: &mut ProtocolConnection,
+        device_session: &mut E2eeSession,
+        packet: ProtocolPacket<Value>,
+    ) -> Vec<JsonEnvelope> {
+        send_encrypted(
+            protocol,
+            connection,
+            device_session,
+            Envelope::new(
+                MessageType::Packet,
+                serde_json::to_value(packet).expect("packet should serialize"),
+            ),
+        )
+    }
+
     fn decrypt_first(
         device_session: &mut E2eeSession,
         messages: Vec<JsonEnvelope>,
     ) -> JsonEnvelope {
         let frame = encrypted_frame_from_envelope(messages.into_iter().next().unwrap()).unwrap();
         device_session.decrypt_json_payload(&frame).unwrap()
+    }
+
+    fn decrypt_first_packet(
+        device_session: &mut E2eeSession,
+        messages: Vec<JsonEnvelope>,
+    ) -> ProtocolPacket<Value> {
+        let envelope = decrypt_first(device_session, messages);
+        assert_eq!(envelope.kind, MessageType::Packet);
+        decode_payload(envelope.payload).unwrap()
     }
 
     fn pair_device(
@@ -4900,13 +5747,13 @@ mod tests {
         .unwrap();
         let handshake = envelope_value(
             MessageType::E2eeKeyExchange,
-            E2eeKeyExchangePayload {
-                server_id: protocol.server_id(),
+            E2eeKeyExchangePayload::new(
+                protocol.server_id(),
                 device_id,
-                public_key: device_e2ee_keypair.public_key_wire(),
-                nonce: nonce(),
-                timestamp_ms: current_unix_timestamp_millis(),
-            },
+                device_e2ee_keypair.public_key_wire(),
+                nonce(),
+                current_unix_timestamp_millis(),
+            ),
         )
         .unwrap();
         let challenge_response = connection.handle_wire_envelope(protocol, handshake);
@@ -5087,6 +5934,192 @@ mod tests {
     }
 
     #[test]
+    fn packet_pair_and_session_list_use_request_response_ids() {
+        let (mut protocol, _) = protocol();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let (_, mut device_session, _) =
+            open_packet_e2ee(&mut protocol, &mut connection, device_id);
+        let token = protocol
+            .issue_pairing_token(current_unix_timestamp_millis())
+            .unwrap()
+            .token()
+            .clone();
+        let pair_request_id = PacketRequestId::new();
+
+        let pair_responses = send_encrypted_packet(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            ProtocolPacket::request(
+                pair_request_id,
+                METHOD_PAIR_REQUEST,
+                serde_json::to_value(PairRequestPayload {
+                    device_id,
+                    device_public_key: PublicKey("device-public-key".to_owned()),
+                    token,
+                    nonce: nonce(),
+                    timestamp_ms: current_unix_timestamp_millis(),
+                })
+                .unwrap(),
+            ),
+        );
+        let pair_response = decrypt_first_packet(&mut device_session, pair_responses);
+        assert_eq!(pair_response.kind, PacketKind::Response);
+        assert_eq!(pair_response.id, Some(pair_request_id));
+        assert_eq!(pair_response.method.as_deref(), Some(METHOD_PAIR_REQUEST));
+        let accepted: PairAcceptPayload = decode_payload(pair_response.payload).unwrap();
+        assert_eq!(accepted.device_id, device_id);
+
+        let list_request_id = PacketRequestId::new();
+        let list_responses = send_encrypted_packet(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            ProtocolPacket::request(list_request_id, METHOD_SESSION_LIST, serde_json::json!({})),
+        );
+        let list_response = decrypt_first_packet(&mut device_session, list_responses);
+        assert_eq!(list_response.kind, PacketKind::Response);
+        assert_eq!(list_response.id, Some(list_request_id));
+        assert_eq!(list_response.method.as_deref(), Some(METHOD_SESSION_LIST));
+        let list: SessionListResultPayload = decode_payload(list_response.payload).unwrap();
+        assert!(list.sessions.is_empty());
+    }
+
+    #[test]
+    fn packet_terminal_stream_open_and_output_use_stream_sequence() {
+        let (mut protocol, backend) = protocol();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let (_, mut device_session, _) =
+            open_packet_e2ee(&mut protocol, &mut connection, device_id);
+        let token = protocol
+            .issue_pairing_token(current_unix_timestamp_millis())
+            .unwrap()
+            .token()
+            .clone();
+        let pair_responses = send_encrypted_packet(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            ProtocolPacket::request(
+                PacketRequestId::new(),
+                METHOD_PAIR_REQUEST,
+                serde_json::to_value(PairRequestPayload {
+                    device_id,
+                    device_public_key: PublicKey("device-public-key".to_owned()),
+                    token,
+                    nonce: nonce(),
+                    timestamp_ms: current_unix_timestamp_millis(),
+                })
+                .unwrap(),
+            ),
+        );
+        let _ = decrypt_first_packet(&mut device_session, pair_responses);
+        let stream_id = PacketStreamId::new();
+        let create_request_id = PacketRequestId::new();
+
+        let created_responses = send_encrypted_packet(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            ProtocolPacket::stream_open(
+                create_request_id,
+                stream_id,
+                METHOD_TERMINAL_CREATE,
+                2,
+                serde_json::to_value(SessionCreatePayload {
+                    command: vec!["sh".to_owned()],
+                    size: TerminalSize::new(24, 80),
+                })
+                .unwrap(),
+            ),
+        );
+        let created_packet = decrypt_first_packet(&mut device_session, created_responses);
+        assert_eq!(created_packet.kind, PacketKind::Response);
+        assert_eq!(created_packet.stream_id, Some(stream_id));
+        let created: SessionCreatedPayload = decode_payload(created_packet.payload).unwrap();
+
+        backend.push_output_for_session(created.session_id, b"hello");
+        let output_packet = decrypt_first_packet(
+            &mut device_session,
+            connection.read_session_output(&mut protocol, created.session_id, 1024),
+        );
+        assert_eq!(output_packet.kind, PacketKind::StreamChunk);
+        assert_eq!(output_packet.stream_id, Some(stream_id));
+        assert_eq!(output_packet.seq, 1);
+        let output: SessionDataPayload = decode_payload(output_packet.payload).unwrap();
+        assert_eq!(output.session_id, created.session_id);
+        assert_eq!(
+            general_purpose::STANDARD
+                .decode(output.data_base64)
+                .unwrap(),
+            b"hello"
+        );
+    }
+
+    #[test]
+    fn packet_auth_signature_is_bound_to_e2ee_transcript() {
+        let (mut bootstrap_protocol, _) = protocol();
+        let device_id = DeviceId::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = PublicKey(wire(signing_key.verifying_key().as_bytes()));
+        let (mut pair_connection, _) = bootstrap_protocol.start_connection();
+        let (_, mut pair_device_session) =
+            open_e2ee(&mut bootstrap_protocol, &mut pair_connection, device_id);
+        pair_device(
+            &mut bootstrap_protocol,
+            &mut pair_connection,
+            &mut pair_device_session,
+            device_id,
+            public_key,
+        );
+
+        let state = bootstrap_protocol.snapshot_state();
+        let (mut protocol, _) = protocol_from_state(state);
+        let (mut connection, _) = protocol.start_connection();
+        let (_, mut device_session, challenge_response) =
+            open_packet_e2ee(&mut protocol, &mut connection, device_id);
+        let challenge_packet = decrypt_first_packet(&mut device_session, challenge_response);
+        assert_eq!(challenge_packet.kind, PacketKind::Event);
+        assert_eq!(
+            challenge_packet.method.as_deref(),
+            Some(METHOD_AUTH_CHALLENGE)
+        );
+        let challenge: AuthChallengePayload = decode_payload(challenge_packet.payload).unwrap();
+        let mut auth_payload = AuthPayload {
+            device_id,
+            challenge: challenge.challenge,
+            nonce: nonce(),
+            timestamp_ms: current_unix_timestamp_millis(),
+            signature: Signature("ed25519-v1:placeholder".to_owned()),
+        };
+        let signing_input = AuthSigningInput::from_payload_with_e2ee_transcript(
+            &auth_payload,
+            protocol.daemon_public_identity(),
+            connection.e2ee_auth_transcript.as_ref(),
+        )
+        .to_bytes();
+        auth_payload.signature = Signature(wire(&signing_key.sign(&signing_input).to_bytes()));
+
+        let auth_request_id = PacketRequestId::new();
+        let auth_responses = send_encrypted_packet(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            ProtocolPacket::request(
+                auth_request_id,
+                METHOD_AUTH_VERIFY,
+                serde_json::to_value(auth_payload).unwrap(),
+            ),
+        );
+        let auth_response = decrypt_first_packet(&mut device_session, auth_responses);
+        assert_eq!(auth_response.kind, PacketKind::Response);
+        assert_eq!(auth_response.id, Some(auth_request_id));
+        assert!(connection.is_authenticated());
+    }
+
+    #[test]
     fn unpaired_e2ee_connection_cannot_use_session_or_control_messages() {
         let (mut protocol, backend) = protocol();
         let (mut connection, _) = protocol.start_connection();
@@ -5107,6 +6140,7 @@ mod tests {
                 MessageType::SessionAttach,
                 SessionAttachPayload {
                     session_id: unknown_session_id,
+                    watch_updates: true,
                 },
             )
             .unwrap(),
@@ -5186,13 +6220,13 @@ mod tests {
         .unwrap();
         let handshake = envelope_value(
             MessageType::E2eeKeyExchange,
-            E2eeKeyExchangePayload {
-                server_id: protocol.server_id(),
+            E2eeKeyExchangePayload::new(
+                protocol.server_id(),
                 device_id,
-                public_key: device_e2ee_keypair.public_key_wire(),
-                nonce: nonce(),
-                timestamp_ms: UnixTimestampMillis(2_000),
-            },
+                device_e2ee_keypair.public_key_wire(),
+                nonce(),
+                UnixTimestampMillis(2_000),
+            ),
         )
         .unwrap();
         let challenge_response = auth_connection.handle_wire_envelope(&mut protocol, handshake);
@@ -6032,7 +7066,13 @@ mod tests {
         connection.authenticated_device_id = Some(DeviceId::new());
 
         let response = protocol
-            .attach_session(&mut connection, SessionAttachPayload { session_id })
+            .attach_session(
+                &mut connection,
+                SessionAttachPayload {
+                    session_id,
+                    watch_updates: true,
+                },
+            )
             .unwrap();
         let attached: SessionAttachedPayload = decode_payload(response[0].payload.clone()).unwrap();
 
@@ -6357,6 +7397,7 @@ mod tests {
                 MessageType::SessionAttach,
                 SessionAttachPayload {
                     session_id: created_payload.session_id,
+                    watch_updates: true,
                 },
             )
             .unwrap(),
@@ -6716,6 +7757,7 @@ mod tests {
                 MessageType::SessionAttach,
                 SessionAttachPayload {
                     session_id: created_payload.session_id,
+                    watch_updates: true,
                 },
             )
             .unwrap(),
@@ -6891,6 +7933,7 @@ mod tests {
                 MessageType::SessionAttach,
                 SessionAttachPayload {
                     session_id: created_payload.session_id,
+                    watch_updates: true,
                 },
             )
             .unwrap(),
@@ -6972,6 +8015,7 @@ mod tests {
                 MessageType::SessionAttach,
                 SessionAttachPayload {
                     session_id: created_payload.session_id,
+                    watch_updates: true,
                 },
             )
             .unwrap(),
@@ -7070,6 +8114,7 @@ mod tests {
                 MessageType::SessionAttach,
                 SessionAttachPayload {
                     session_id: created_payload.session_id,
+                    watch_updates: true,
                 },
             )
             .unwrap(),
@@ -7512,6 +8557,7 @@ mod tests {
                 MessageType::SessionAttach,
                 SessionAttachPayload {
                     session_id: created_payload.session_id,
+                    watch_updates: true,
                 },
             )
             .unwrap(),
@@ -7768,6 +8814,7 @@ mod tests {
                 MessageType::SessionAttach,
                 SessionAttachPayload {
                     session_id: created_payload.session_id,
+                    watch_updates: true,
                 },
             )
             .unwrap(),
@@ -7859,6 +8906,7 @@ mod tests {
                 MessageType::SessionAttach,
                 SessionAttachPayload {
                     session_id: created_payload.session_id,
+                    watch_updates: true,
                 },
             )
             .unwrap(),
@@ -8314,6 +9362,7 @@ mod tests {
             MessageType::SessionAttach,
             SessionAttachPayload {
                 session_id: created_payload.session_id,
+                watch_updates: true,
             },
         )
         .unwrap();
@@ -8614,6 +9663,7 @@ mod tests {
                 MessageType::SessionAttach,
                 SessionAttachPayload {
                     session_id: created_payload.session_id,
+                    watch_updates: true,
                 },
             )
             .unwrap(),
@@ -8633,6 +9683,100 @@ mod tests {
 
         assert!(snapshot.contains("alpha\r\nbravo\r\ngamma"));
         assert!(!snapshot.contains("beta"));
+    }
+
+    #[test]
+    fn permission_only_attach_can_use_session_rpc_without_subscribing_to_output() {
+        let (mut protocol, backend) = protocol();
+        let (mut first_connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = PublicKey(wire(signing_key.verifying_key().as_bytes()));
+        let (_, mut first_device_session) =
+            open_e2ee(&mut protocol, &mut first_connection, device_id);
+        pair_device(
+            &mut protocol,
+            &mut first_connection,
+            &mut first_device_session,
+            device_id,
+            public_key,
+        );
+        let created_responses = send_encrypted(
+            &mut protocol,
+            &mut first_connection,
+            &mut first_device_session,
+            envelope_value(
+                MessageType::SessionCreate,
+                SessionCreatePayload {
+                    command: vec!["sh".to_owned()],
+                    size: TerminalSize::new(24, 80),
+                },
+            )
+            .unwrap(),
+        );
+        let created = decrypt_first(&mut first_device_session, created_responses);
+        let created_payload: SessionCreatedPayload = decode_payload(created.payload).unwrap();
+        backend.push_output_for_session(created_payload.session_id, b"busy output\n".to_vec());
+
+        let (mut rpc_connection, _) = protocol.start_connection();
+        let mut rpc_device_session = authenticate_paired_connection(
+            &mut protocol,
+            &mut rpc_connection,
+            device_id,
+            &signing_key,
+        );
+        let attached = send_encrypted(
+            &mut protocol,
+            &mut rpc_connection,
+            &mut rpc_device_session,
+            envelope_value(
+                MessageType::SessionAttach,
+                SessionAttachPayload {
+                    session_id: created_payload.session_id,
+                    watch_updates: false,
+                },
+            )
+            .unwrap(),
+        );
+        let attached = decrypt_first(&mut rpc_device_session, attached);
+        let attached_payload: SessionAttachedPayload = decode_payload(attached.payload).unwrap();
+
+        assert_eq!(attached.kind, MessageType::SessionAttached);
+        assert!(!attached_payload.resize_owner);
+        assert!(rpc_connection.attached_output_signals(&protocol).is_empty());
+        assert!(
+            rpc_connection
+                .attached_file_tree_signals(&protocol)
+                .is_empty()
+        );
+        assert!(rpc_connection.attached_resize_signals(&protocol).is_empty());
+        assert!(
+            rpc_connection
+                .session_activity_signals(&protocol)
+                .is_empty()
+        );
+        assert!(
+            rpc_connection
+                .read_attached_outputs(&mut protocol, 4096)
+                .is_empty()
+        );
+
+        // 短连接仍然拥有 session 级权限，可以查询文件；只是不会接收终端输出洪峰。
+        let files_responses = send_encrypted(
+            &mut protocol,
+            &mut rpc_connection,
+            &mut rpc_device_session,
+            envelope_value(
+                MessageType::SessionFiles,
+                SessionFilesPayload {
+                    session_id: created_payload.session_id,
+                    path: None,
+                },
+            )
+            .unwrap(),
+        );
+        let files = decrypt_first(&mut rpc_device_session, files_responses);
+        assert_eq!(files.kind, MessageType::SessionFilesResult);
     }
 
     #[test]
@@ -8826,6 +9970,7 @@ mod tests {
                 MessageType::SessionAttach,
                 SessionAttachPayload {
                     session_id: created_payload.session_id,
+                    watch_updates: true,
                 },
             )
             .unwrap(),
@@ -8906,6 +10051,7 @@ mod tests {
                 MessageType::SessionAttach,
                 SessionAttachPayload {
                     session_id: created_payload.session_id,
+                    watch_updates: true,
                 },
             )
             .unwrap(),

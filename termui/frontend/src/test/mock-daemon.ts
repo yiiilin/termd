@@ -1,12 +1,17 @@
 import type { AddressInfo } from "node:net";
+import { ed25519 } from "@noble/curves/ed25519";
 import { WebSocketServer, type WebSocket } from "ws";
 import {
   authSigningInputBytes,
+  daemonE2eeSigningInputBytes,
   decodeEd25519PublicKey,
+  e2eeAuthTranscriptDigestWire,
+  encodeEd25519Wire,
   verifyEd25519Signature,
 } from "../protocol/auth";
 import { E2eeSession, generateE2eeKeyPair, type E2eeKeyPair } from "../protocol/e2ee";
 import { fallbackSessionDisplayName } from "../session-names";
+import { PROTOCOL_PACKET_VERSION } from "../protocol/types";
 import type {
   DaemonClientSummaryPayload,
   DaemonStatusResultPayload,
@@ -14,7 +19,10 @@ import type {
   EncryptedFramePayload,
   Envelope,
   ErrorPayload,
+  PacketErrorPayload,
+  PacketStreamId,
   PairRequestPayload,
+  ProtocolPacket,
   RouteHelloPayload,
   SessionCreatePayload,
   SessionCreatedPayload,
@@ -50,6 +58,8 @@ interface MockDaemonOptions {
   sessions: Array<SessionSummaryPayload & { name?: string | null }>;
   attachOutput?: string;
   routePreludeError?: ErrorPayload;
+  routeReadyDelayMs?: number;
+  daemonPacketVersion?: number;
   pairFailure?: ErrorPayload;
   sessionDataError?: ErrorPayload;
   resizeAckDelayMs?: number;
@@ -72,22 +82,41 @@ interface TrustedDevice {
   devicePublicKey: string;
 }
 
+interface MockTerminalStream {
+  sessionId: UUID;
+  streamId: PacketStreamId;
+  nextOutputSeq: number;
+  watchUpdates: boolean;
+}
+
 interface MockConnection {
   socket: WebSocket;
   routed: boolean;
   deviceId?: UUID;
   e2ee?: E2eeSession;
   attachedSessionIds: Set<UUID>;
+  watchedSessionIds: Set<UUID>;
   resizeOwnerSessionIds: Set<UUID>;
+  terminalStreamsById: Map<PacketStreamId, MockTerminalStream>;
+  terminalStreamsBySession: Map<UUID, MockTerminalStream>;
+  daemonE2eeExchange?: E2eeKeyExchangePayload;
+  e2eeAuthTranscriptSha256?: string;
+  activeRequest?: ProtocolPacket;
+  activeStreamId?: PacketStreamId;
+  respondedToActiveRequest?: boolean;
 }
 
 export class MockDaemon {
   public readonly serverId: UUID;
-  public readonly daemonPublicKey = "ed25519-v1:daemon-public";
+  private readonly daemonSigningSecretKey = ed25519.utils.randomSecretKey();
+  public readonly daemonPublicKey = encodeEd25519Wire(ed25519.getPublicKey(this.daemonSigningSecretKey));
   public readonly outerWireLog: string[] = [];
+  public readonly receivedPackets: ProtocolPacket[] = [];
+  public readonly sentPackets: ProtocolPacket[] = [];
   public readonly createdCommands: string[][] = [];
   public readonly sessionDataMessages: string[] = [];
   public readonly attachedSessions: UUID[] = [];
+  public readonly attachRequests: Array<{ session_id: UUID; watch_updates?: boolean }> = [];
   public readonly sessionCursorUpdates: SessionCursorPayload[] = [];
   public readonly sessionResizes: Array<{ session_id: UUID; size: TerminalSize }> = [];
   public readonly sessionRenames: Array<{ session_id: UUID; name: string }> = [];
@@ -137,6 +166,10 @@ export class MockDaemon {
     return this.urlValue;
   }
 
+  activeConnectionCount(): number {
+    return this.connections.size;
+  }
+
   outerWireText(): string {
     return this.outerWireLog.join("\n");
   }
@@ -158,7 +191,7 @@ export class MockDaemon {
   pushSessionFiles(files: SessionFilesResultPayload): void {
     this.sessionFilePositions.set(files.session_id, files.path);
     for (const connection of this.connections) {
-      if (connection.e2ee && connection.attachedSessionIds.has(files.session_id)) {
+      if (connection.e2ee && connection.watchedSessionIds.has(files.session_id)) {
         this.sendInner(connection, envelope("session_files_result", files));
       }
     }
@@ -172,7 +205,7 @@ export class MockDaemon {
   pushSessionData(sessionId: UUID, text: string): void {
     this.appendSessionOutput(sessionId, text);
     for (const connection of this.connections) {
-      if (connection.e2ee && connection.attachedSessionIds.has(sessionId)) {
+      if (connection.e2ee && connection.watchedSessionIds.has(sessionId)) {
         this.sendInner(
           connection,
           envelope("session_data", {
@@ -187,7 +220,7 @@ export class MockDaemon {
   pushSessionDataToAll(sessionId: UUID, text: string): void {
     // 后台 session 只发 activity 标记，不把未打开 session 的输出内容灌进当前 xterm。
     for (const connection of this.connections) {
-      if (connection.e2ee && connection.attachedSessionIds.size > 0) {
+      if (connection.e2ee && connection.watchedSessionIds.size > 0) {
         void text;
         this.sendInner(connection, envelope("session_activity", { session_id: sessionId, timestamp_ms: nowMs() }));
       }
@@ -214,7 +247,15 @@ export class MockDaemon {
       return;
     }
 
-    const connection: MockConnection = { socket, routed: false, attachedSessionIds: new Set(), resizeOwnerSessionIds: new Set() };
+    const connection: MockConnection = {
+      socket,
+      routed: false,
+      attachedSessionIds: new Set(),
+      watchedSessionIds: new Set(),
+      resizeOwnerSessionIds: new Set(),
+      terminalStreamsById: new Map(),
+      terminalStreamsBySession: new Map(),
+    };
     this.connections.add(connection);
     socket.on("close", () => {
       this.connections.delete(connection);
@@ -228,6 +269,25 @@ export class MockDaemon {
     });
   }
 
+  private signedDaemonE2eeExchange(): E2eeKeyExchangePayload {
+    const payload: E2eeKeyExchangePayload = {
+      server_id: this.serverId,
+      device_id: "00000000-0000-0000-0000-000000000000",
+      public_key: this.e2eeKeypair.publicKeyWire,
+      nonce: nonce(),
+      timestamp_ms: nowMs(),
+      packet_version: this.options.daemonPacketVersion ?? PROTOCOL_PACKET_VERSION,
+    };
+    const signature = ed25519.sign(
+      daemonE2eeSigningInputBytes(payload, {
+        server_id: this.serverId,
+        daemon_public_key: this.daemonPublicKey,
+      }),
+      this.daemonSigningSecretKey,
+    );
+    return { ...payload, signature: encodeEd25519Wire(signature) };
+  }
+
   private async handleOuter(connection: MockConnection, raw: string): Promise<void> {
     this.outerWireLog.push(raw);
     const outer = parseEnvelope(raw);
@@ -239,6 +299,10 @@ export class MockDaemon {
 
     if (outer.type === "e2ee_key_exchange") {
       const payload = outer.payload as E2eeKeyExchangePayload;
+      if (payload.packet_version !== PROTOCOL_PACKET_VERSION || !connection.daemonE2eeExchange) {
+        this.sendError(connection, "unsupported_protocol_version", "unsupported protocol version");
+        return;
+      }
       connection.deviceId = payload.device_id;
       connection.e2ee = E2eeSession.daemon({
         serverId: this.serverId,
@@ -246,15 +310,28 @@ export class MockDaemon {
         localKeypair: this.e2eeKeypair,
         devicePublicKeyWire: payload.public_key,
       });
+      connection.e2eeAuthTranscriptSha256 = e2eeAuthTranscriptDigestWire(
+        connection.daemonE2eeExchange,
+        payload,
+        {
+          server_id: this.serverId,
+          daemon_public_key: this.daemonPublicKey,
+        },
+      );
 
       if (this.trustedDevices.has(payload.device_id)) {
-        this.sendInner(
+        this.sendPacket(
           connection,
-          envelope("auth_challenge", {
-            device_id: payload.device_id,
-            challenge: `challenge-${payload.device_id}`,
-            expires_at_ms: nowMs() + 60_000,
-          }),
+          {
+            version: PROTOCOL_PACKET_VERSION,
+            kind: "event",
+            method: "auth.challenge",
+            payload: {
+              device_id: payload.device_id,
+              challenge: `challenge-${payload.device_id}`,
+              expires_at_ms: nowMs() + 60_000,
+            },
+          },
         );
       }
       return;
@@ -276,7 +353,7 @@ export class MockDaemon {
     }
 
     const payload = outer.payload as RouteHelloPayload;
-    if (payload.server_id !== this.serverId || payload.role !== "client" || payload.protocol_version !== 2) {
+    if (payload.server_id !== this.serverId || payload.role !== "client" || payload.protocol_version !== PROTOCOL_PACKET_VERSION) {
       this.sendError(connection, "invalid_route_prelude", "invalid route prelude");
       return;
     }
@@ -288,36 +365,197 @@ export class MockDaemon {
     }
 
     connection.routed = true;
-    this.sendOuter(
-      connection.socket,
-      envelope("route_ready", {
-        server_id: this.serverId,
-        role: "client",
-      }),
-    );
-    this.sendOuter(
-      connection.socket,
-      envelope("hello", {
-        protocol_version: 2,
-        nonce: nonce(),
-        timestamp_ms: nowMs(),
-        server_id: this.serverId,
-        device_id: null,
-      }),
-    );
-    this.sendOuter(
-      connection.socket,
-      envelope("e2ee_key_exchange", {
-        server_id: this.serverId,
-        device_id: randomUuid(),
-        public_key: this.e2eeKeypair.publicKeyWire,
-        nonce: nonce(),
-        timestamp_ms: nowMs(),
-      }),
-    );
+    const sendPrelude = () => {
+      const daemonE2eeExchange = this.signedDaemonE2eeExchange();
+      connection.daemonE2eeExchange = daemonE2eeExchange;
+      this.sendOuter(
+        connection.socket,
+        envelope("route_ready", {
+          server_id: this.serverId,
+          role: "client",
+        }),
+      );
+      this.sendOuter(
+        connection.socket,
+        envelope("hello", {
+          protocol_version: PROTOCOL_PACKET_VERSION,
+          nonce: nonce(),
+          timestamp_ms: nowMs(),
+          server_id: this.serverId,
+          device_id: null,
+        }),
+      );
+      this.sendOuter(
+        connection.socket,
+        envelope("e2ee_key_exchange", daemonE2eeExchange),
+      );
+    };
+    if (this.options.routeReadyDelayMs) {
+      setTimeout(sendPrelude, this.options.routeReadyDelayMs);
+      return;
+    }
+    sendPrelude();
   }
 
   private async handleInner(connection: MockConnection, inner: Envelope): Promise<void> {
+    if (inner.type !== "packet") {
+      this.sendError(connection, "invalid_packet", "expected protocol packet");
+      return;
+    }
+    await this.handlePacket(connection, inner.payload as ProtocolPacket);
+  }
+
+  private async handlePacket(connection: MockConnection, packet: ProtocolPacket): Promise<void> {
+    this.receivedPackets.push(packet);
+    if (packet.version !== PROTOCOL_PACKET_VERSION) {
+      this.sendPacketError(connection, packet, "unsupported_protocol_version", "unsupported protocol packet version");
+      return;
+    }
+
+    if (packet.kind === "flow") {
+      return;
+    }
+    if (packet.kind === "cancel") {
+      this.removeTerminalStream(connection, packet.stream_id);
+      return;
+    }
+    if (packet.kind === "stream_chunk") {
+      await this.handlePacketStreamChunk(connection, packet);
+      return;
+    }
+    if (packet.kind !== "request" && packet.kind !== "stream_open") {
+      this.sendPacketError(connection, packet, "invalid_packet", "invalid protocol packet");
+      return;
+    }
+    if (packet.kind === "request" && await this.handleDirectPacketRequest(connection, packet)) {
+      return;
+    }
+
+    const legacy = this.packetToLegacyEnvelope(packet);
+    if (!legacy) {
+      this.sendPacketError(connection, packet, "unknown_method", "unknown protocol method");
+      return;
+    }
+
+    connection.activeRequest = packet;
+    connection.respondedToActiveRequest = false;
+    try {
+      await this.handleLegacyInner(connection, legacy);
+      if (!connection.respondedToActiveRequest && this.packetMethodNeedsEmptyAck(packet.method)) {
+        this.sendPacketResponse(connection, packet, {});
+      }
+    } finally {
+      connection.activeRequest = undefined;
+      connection.respondedToActiveRequest = false;
+    }
+  }
+
+  private async handlePacketStreamChunk(connection: MockConnection, packet: ProtocolPacket): Promise<void> {
+    if (!packet.stream_id || !connection.terminalStreamsById.has(packet.stream_id)) {
+      this.sendPacketError(connection, packet, "invalid_state", "invalid protocol state");
+      return;
+    }
+    connection.activeStreamId = packet.stream_id;
+    try {
+      await this.handleLegacyInner(connection, envelope("session_data", packet.payload));
+    } finally {
+      connection.activeStreamId = undefined;
+    }
+  }
+
+  private async handleDirectPacketRequest(connection: MockConnection, packet: ProtocolPacket): Promise<boolean> {
+    switch (packet.method) {
+      case "session.list": {
+        const queued = this.queuedSessionListResponses.shift();
+        if (queued?.delayMs) {
+          await new Promise((resolve) => setTimeout(resolve, queued.delayMs));
+        }
+        this.sendPacketResponse(connection, packet, { sessions: queued?.sessions ?? this.options.sessions });
+        return true;
+      }
+      case "session.close": {
+        const payload = packet.payload as { session_id: UUID };
+        const sessionExists = this.options.sessions.some((session) => session.session_id === payload.session_id);
+        if (!sessionExists) {
+          this.sendPacketError(connection, packet, "session_not_found", "session was not found");
+          return true;
+        }
+        this.closedSessions.push(payload.session_id);
+        this.options.sessions = this.options.sessions.filter((session) => session.session_id !== payload.session_id);
+        this.sendPacketResponse(connection, packet, payload);
+        return true;
+      }
+      default:
+        return false;
+    }
+  }
+
+  private packetToLegacyEnvelope(packet: ProtocolPacket): Envelope | undefined {
+    const payload = packet.payload;
+    switch (packet.method) {
+      case "pair.request":
+        return envelope("pair_request", payload);
+      case "auth":
+      case "auth.verify":
+        return envelope("auth", payload);
+      case "client.hello":
+        return envelope("client_hello", payload);
+      case "session.list":
+        return envelope("session_list", payload);
+      case "daemon.clients":
+        return envelope("daemon_clients", payload);
+      case "daemon.client_forget":
+        return envelope("daemon_client_forget", payload);
+      case "daemon.status":
+        return envelope("daemon_status", payload);
+      case "terminal.create":
+        return envelope("session_create", payload);
+      case "terminal.attach":
+        return envelope("session_attach", payload);
+      case "session.cursor":
+        return envelope("session_cursor", payload);
+      case "session.resize":
+        return envelope("session_resize", payload);
+      case "session.rename":
+        return envelope("session_rename", payload);
+      case "session.reorder":
+        return envelope("session_reorder", payload);
+      case "session.close":
+        return envelope("session_close", payload);
+      case "session.files":
+        return envelope("session_files", payload);
+      case "session.search":
+        return envelope("session_search", payload);
+      case "session.git":
+        return envelope("session_git", payload);
+      case "session.git_diff":
+        return envelope("session_git_diff", payload);
+      case "session.git_action":
+        return envelope("session_git_action", payload);
+      case "session.file_read":
+        return envelope("session_file_read", payload);
+      case "session.file_download_prepare":
+        return envelope("session_file_download_prepare", payload);
+      case "session.file_download_chunk":
+        return envelope("session_file_download_chunk", payload);
+      case "session.file_write":
+        return envelope("session_file_write", payload);
+      case "session.file_delete":
+        return envelope("session_file_delete", payload);
+      case "control.request":
+        return envelope("control_request", payload);
+      case "ping":
+        return envelope("ping", payload);
+      default:
+        return undefined;
+    }
+  }
+
+  private packetMethodNeedsEmptyAck(method?: string): boolean {
+    return method === "auth" || method === "auth.verify" || method === "client.hello" || method === "session.cursor";
+  }
+
+  private async handleLegacyInner(connection: MockConnection, inner: Envelope): Promise<void> {
     switch (inner.type) {
       case "pair_request":
         this.handlePairRequest(connection, inner.payload as PairRequestPayload);
@@ -372,10 +610,15 @@ export class MockDaemon {
         this.handleSessionCreate(connection, inner.payload as SessionCreatePayload);
         return;
       case "session_attach": {
-        const payload = inner.payload as { session_id: UUID };
+        const payload = inner.payload as { session_id: UUID; watch_updates?: boolean };
+        const watchUpdates = payload.watch_updates ?? true;
         const session = this.options.sessions.find((candidate) => candidate.session_id === payload.session_id);
+        this.attachRequests.push(payload);
         this.attachedSessions.push(payload.session_id);
         connection.attachedSessionIds.add(payload.session_id);
+        if (watchUpdates) {
+          connection.watchedSessionIds.add(payload.session_id);
+        }
         this.sendInner(
           connection,
           envelope("session_attached", {
@@ -383,10 +626,10 @@ export class MockDaemon {
             role: this.nextAttachRole,
             state: session?.state ?? "running",
             size: session?.size ?? { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
-            resize_owner: this.assignResizeOwner(connection, payload.session_id),
+            resize_owner: watchUpdates ? this.assignResizeOwner(connection, payload.session_id) : false,
           }),
         );
-        if (this.options.attachOutput) {
+        if (watchUpdates && this.options.attachOutput) {
           if (!this.sessionOutputSnapshots.has(payload.session_id)) {
             this.appendSessionOutput(payload.session_id, this.options.attachOutput);
           }
@@ -678,6 +921,7 @@ export class MockDaemon {
       created_at_ms: nowMs(),
     });
     connection.attachedSessionIds.add(created.session_id);
+    connection.watchedSessionIds.add(created.session_id);
     this.sendInner(connection, envelope("session_created", created));
     if (this.options.attachOutput) {
       this.appendSessionOutput(created.session_id, this.options.attachOutput);
@@ -766,7 +1010,7 @@ export class MockDaemon {
 
   private promoteResizeOwner(sessionId: UUID): void {
     for (const connection of this.connections) {
-      if (connection.e2ee && connection.attachedSessionIds.has(sessionId)) {
+      if (connection.e2ee && connection.watchedSessionIds.has(sessionId)) {
         connection.resizeOwnerSessionIds.add(sessionId);
         const session = this.options.sessions.find((candidate) => candidate.session_id === sessionId);
         this.sendInner(
@@ -784,7 +1028,7 @@ export class MockDaemon {
 
   private broadcastSessionResized(sessionId: UUID, size: TerminalSize): void {
     for (const connection of this.connections) {
-      if (connection.e2ee && connection.attachedSessionIds.has(sessionId)) {
+      if (connection.e2ee && connection.watchedSessionIds.has(sessionId)) {
         this.sendInner(
           connection,
           envelope("session_resized", {
@@ -830,9 +1074,7 @@ export class MockDaemon {
       authSigningInputBytes(authPayload, {
         server_id: this.serverId,
         daemon_public_key: this.daemonPublicKey,
-        url: this.url,
-        paired_at_ms: nowMs(),
-      }),
+      }, connection.e2eeAuthTranscriptSha256),
       String(payload.signature),
     );
     if (!ok) {
@@ -845,16 +1087,148 @@ export class MockDaemon {
       this.sendError(connection, "invalid_state", "invalid protocol state");
       return;
     }
-    this.sendOuter(connection.socket, envelope("encrypted_frame", connection.e2ee.encryptJson(inner)));
+    if (inner.type === "session_data") {
+      this.sendTerminalStreamChunk(connection, inner.payload as SessionDataPayload);
+      return;
+    }
+
+    const activeRequest = connection.activeRequest;
+    if (activeRequest && !connection.respondedToActiveRequest) {
+      this.sendPacketResponse(connection, activeRequest, inner.payload);
+      return;
+    }
+
+    this.sendPacketEvent(connection, this.legacyEventMethod(inner.type), inner.payload);
   }
 
   private sendError(connection: MockConnection, code: string, message: string): void {
-    const error = envelope("error", { code, message } satisfies ErrorPayload);
     if (connection.e2ee) {
-      this.sendInner(connection, error);
+      this.sendPacketError(connection, connection.activeRequest, code, message);
       return;
     }
+    const error = envelope("error", { code, message } satisfies ErrorPayload);
     this.sendOuter(connection.socket, error);
+  }
+
+  private sendPacketResponse(connection: MockConnection, request: ProtocolPacket, payload: unknown): void {
+    if (!request.id || !request.method) {
+      this.sendPacketError(connection, request, "invalid_packet", "invalid protocol packet");
+      return;
+    }
+    this.registerTerminalStreamForResponse(connection, request, payload);
+    connection.respondedToActiveRequest = true;
+    this.sendPacket(connection, {
+      version: PROTOCOL_PACKET_VERSION,
+      kind: "response",
+      id: request.id,
+      ...(request.stream_id ? { stream_id: request.stream_id } : {}),
+      method: request.method,
+      payload,
+    });
+  }
+
+  private sendPacketEvent(connection: MockConnection, method: string, payload: unknown): void {
+    this.sendPacket(connection, {
+      version: PROTOCOL_PACKET_VERSION,
+      kind: "event",
+      method,
+      payload,
+    });
+  }
+
+  private sendPacketError(
+    connection: MockConnection,
+    request: ProtocolPacket | undefined,
+    code: string,
+    message: string,
+  ): void {
+    const packet: ProtocolPacket<PacketErrorPayload> = {
+      version: PROTOCOL_PACKET_VERSION,
+      kind: "error",
+      ...(request?.id ? { id: request.id } : {}),
+      ...(request?.stream_id ? { stream_id: request.stream_id } : connection.activeStreamId ? { stream_id: connection.activeStreamId } : {}),
+      payload: { code, message, retryable: false },
+    };
+    connection.respondedToActiveRequest = true;
+    this.sendPacket(connection, packet);
+  }
+
+  private sendPacket(connection: MockConnection, packet: ProtocolPacket): void {
+    if (!connection.e2ee) {
+      this.sendOuter(connection.socket, envelope("error", { code: "invalid_state", message: "invalid protocol state" } satisfies ErrorPayload));
+      return;
+    }
+    this.sentPackets.push(packet);
+    this.sendOuter(connection.socket, envelope("encrypted_frame", connection.e2ee.encryptJson(envelope("packet", packet))));
+  }
+
+  private sendTerminalStreamChunk(connection: MockConnection, payload: SessionDataPayload): void {
+    const stream = connection.terminalStreamsBySession.get(payload.session_id);
+    if (!stream || !stream.watchUpdates) {
+      return;
+    }
+    const seq = stream.nextOutputSeq;
+    stream.nextOutputSeq += 1;
+    this.sendPacket(connection, {
+      version: PROTOCOL_PACKET_VERSION,
+      kind: "stream_chunk",
+      stream_id: stream.streamId,
+      seq,
+      payload,
+    });
+  }
+
+  private registerTerminalStreamForResponse(connection: MockConnection, request: ProtocolPacket, payload: unknown): void {
+    if (request.kind !== "stream_open" || !request.stream_id || !String(request.method ?? "").startsWith("terminal.")) {
+      return;
+    }
+    const response = payload as { session_id?: UUID };
+    if (!response.session_id) {
+      return;
+    }
+    const requestPayload = request.payload as { watch_updates?: boolean };
+    const watchUpdates = request.method === "terminal.attach" ? requestPayload.watch_updates ?? true : true;
+    const stream: MockTerminalStream = {
+      sessionId: response.session_id,
+      streamId: request.stream_id,
+      nextOutputSeq: 1,
+      watchUpdates,
+    };
+    connection.terminalStreamsById.set(stream.streamId, stream);
+    connection.terminalStreamsBySession.set(stream.sessionId, stream);
+  }
+
+  private removeTerminalStream(connection: MockConnection, streamId?: PacketStreamId): void {
+    if (!streamId) {
+      return;
+    }
+    const stream = connection.terminalStreamsById.get(streamId);
+    if (!stream) {
+      return;
+    }
+    connection.terminalStreamsById.delete(streamId);
+    connection.terminalStreamsBySession.delete(stream.sessionId);
+    connection.watchedSessionIds.delete(stream.sessionId);
+    connection.resizeOwnerSessionIds.delete(stream.sessionId);
+  }
+
+  private legacyEventMethod(type: Envelope["type"]): string {
+    switch (type) {
+      case "auth_challenge":
+        return "auth.challenge";
+      case "session_activity":
+        return "session.activity";
+      case "session_files_result":
+        return "session.files";
+      case "session_git_result":
+        return "session.git";
+      case "session_resized":
+        return "session.resized";
+      case "session_data":
+        return "terminal.output";
+      default:
+        return type.replaceAll("_", ".");
+    }
   }
 
   private sendOuter(socket: WebSocket, outer: Envelope): void {

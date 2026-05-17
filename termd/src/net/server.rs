@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::{AddrParseError, IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, State};
@@ -18,13 +19,15 @@ use futures_util::{SinkExt, StreamExt};
 use rustls::pki_types::pem::PemObject;
 use serde::Serialize;
 use termd_proto::{
-    ErrorPayload, MessageType, PairingToken, ProtocolVersion, RouteHelloPayload, RouteReadyPayload,
-    RouteRole, ServerId, SessionId, SessionState, TerminalSize, UnixTimestampMillis,
+    ErrorPayload, MessageType, PROTOCOL_PACKET_VERSION, PairingToken, ProtocolVersion,
+    RouteHelloPayload, RouteReadyPayload, RouteRole, ServerId, SessionId, SessionState,
+    TerminalSize, UnixTimestampMillis,
 };
 use thiserror::Error;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
+use tokio::time::{Instant, timeout};
 use tracing::{debug, warn};
 
 use crate::auth::current_unix_timestamp_millis;
@@ -39,6 +42,13 @@ use super::protocol::{
 use super::signature::Ed25519SignatureVerifier;
 
 const OUTPUT_FLUSH_MAX_BYTES_PER_SESSION: usize = 16 * 1024;
+// transport 超时只关闭当前 WebSocket 连接；session/supervisor 仍由协议和 PTY 层保持持久。
+const ROUTE_PRELUDE_TIMEOUT: Duration = Duration::from_secs(2);
+const WEBSOCKET_SEND_DEADLINE: Duration = Duration::from_secs(2);
+const WEBSOCKET_PONG_DEADLINE: Duration = Duration::from_secs(2);
+const WEBSOCKET_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const WEBSOCKET_MAX_FRAME_SIZE: usize = 1024 * 1024;
+const WEBSOCKET_MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SessionPushEvent {
@@ -110,6 +120,7 @@ struct LocalPairingTokenPayload {
     expires_at_ms: UnixTimestampMillis,
     ttl_ms: u64,
     server_id: ServerId,
+    daemon_public_key: termd_proto::PublicKey,
     /// Web 端默认优先使用当前页面地址；这里提供兼容回退地址。
     ws_url: String,
 }
@@ -430,7 +441,7 @@ async fn healthz(State(protocol): State<SharedDaemonProtocol>) -> Json<HealthzPa
 
     Json(HealthzPayload {
         status: "ok",
-        protocol_version: ProtocolVersion::default(),
+        protocol_version: ProtocolVersion(PROTOCOL_PACKET_VERSION),
         server_id: protocol.server_id(),
     })
 }
@@ -455,6 +466,7 @@ async fn local_pairing_token(
     let mut protocol = protocol.lock().expect("daemon protocol mutex poisoned");
     let ttl_ms = protocol.config().pairing_token_ttl_ms;
     let server_id = protocol.server_id();
+    let daemon_public_key = protocol.daemon_public_identity().public_key.clone();
     let ws_url = pairing_ws_url_from_config(protocol.config(), server_id);
     let record = match protocol.issue_pairing_token(now_ms) {
         Ok(record) => record,
@@ -479,6 +491,7 @@ async fn local_pairing_token(
             expires_at_ms: record.expires_at_ms(),
             ttl_ms,
             server_id,
+            daemon_public_key,
             ws_url,
         }),
     )
@@ -502,7 +515,10 @@ async fn ws_handler(
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     State(protocol): State<SharedDaemonProtocol>,
 ) -> impl IntoResponse {
-    websocket.on_upgrade(move |socket| handle_socket(socket, protocol, peer_addr))
+    websocket
+        .max_frame_size(WEBSOCKET_MAX_FRAME_SIZE)
+        .max_message_size(WEBSOCKET_MAX_MESSAGE_SIZE)
+        .on_upgrade(move |socket| handle_socket(socket, protocol, peer_addr))
 }
 
 async fn read_route_hello(
@@ -521,7 +537,17 @@ async fn read_route_hello(
 
         match message {
             Message::Ping(payload) => {
-                let _ = sender.send(Message::Pong(payload)).await;
+                if send_message_with_deadline(
+                    sender,
+                    Message::Pong(payload),
+                    WEBSOCKET_PONG_DEADLINE,
+                    "websocket route prelude pong failed",
+                )
+                .await
+                .is_err()
+                {
+                    return Err(ProtocolError::InvalidEnvelope);
+                }
             }
             Message::Pong(_) => continue,
             Message::Close(_) => return Err(ProtocolError::InvalidEnvelope),
@@ -534,7 +560,7 @@ async fn read_route_hello(
                 }
 
                 let payload: RouteHelloPayload = decode_payload(envelope.payload)?;
-                if payload.protocol_version != ProtocolVersion::default() {
+                if payload.protocol_version != ProtocolVersion(PROTOCOL_PACKET_VERSION) {
                     return Err(ProtocolError::InvalidEnvelope);
                 }
                 if payload.server_id != expected_server_id {
@@ -571,10 +597,19 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
         protocol.server_id()
     };
 
-    let route_hello = match read_route_hello(&mut sender, &mut receiver, server_id).await {
-        Ok(route_hello) => route_hello,
-        Err(error) => {
+    let route_hello = match timeout(
+        ROUTE_PRELUDE_TIMEOUT,
+        read_route_hello(&mut sender, &mut receiver, server_id),
+    )
+    .await
+    {
+        Ok(Ok(route_hello)) => route_hello,
+        Ok(Err(error)) => {
             let _ = send_envelope(&mut sender, plaintext_error(error)).await;
+            return;
+        }
+        Err(_) => {
+            let _ = send_envelope(&mut sender, route_prelude_timeout_error()).await;
             return;
         }
     };
@@ -597,8 +632,13 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
         return;
     }
 
+    let mut idle_deadline = Instant::now() + WEBSOCKET_IDLE_TIMEOUT;
     loop {
         tokio::select! {
+            _ = tokio::time::sleep_until(idle_deadline) => {
+                warn!(peer_addr = %peer_addr, "websocket idle timeout");
+                break;
+            }
             maybe_message = receiver.next() => {
                 let Some(message) = maybe_message else {
                     break;
@@ -610,10 +650,21 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
                         break;
                     }
                 };
+                idle_deadline = Instant::now() + WEBSOCKET_IDLE_TIMEOUT;
 
                 match message {
                     Message::Ping(payload) => {
-                        let _ = sender.send(Message::Pong(payload)).await;
+                        if send_message_with_deadline(
+                            &mut sender,
+                            Message::Pong(payload),
+                            WEBSOCKET_PONG_DEADLINE,
+                            "websocket pong failed",
+                        )
+                        .await
+                        .is_err()
+                        {
+                            break;
+                        }
                         continue;
                     }
                     Message::Pong(_) => continue,
@@ -667,6 +718,7 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
                 let Some(event) = maybe_event else {
                     break;
                 };
+                idle_deadline = Instant::now() + WEBSOCKET_IDLE_TIMEOUT;
                 let responses = {
                     let mut protocol = protocol.lock().expect("daemon protocol mutex poisoned");
                     match event {
@@ -839,6 +891,36 @@ fn plaintext_error(error: ProtocolError) -> JsonEnvelope {
     .expect("error payload should serialize")
 }
 
+fn route_prelude_timeout_error() -> JsonEnvelope {
+    envelope_value(
+        MessageType::Error,
+        ErrorPayload {
+            code: "route_prelude_timeout".to_owned(),
+            message: "route prelude timed out".to_owned(),
+        },
+    )
+    .expect("route prelude timeout payload should serialize")
+}
+
+async fn send_message_with_deadline(
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    message: Message,
+    deadline: Duration,
+    context: &'static str,
+) -> Result<(), ()> {
+    match timeout(deadline, sender.send(message)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => {
+            warn!(%error, context = context, "websocket send failed");
+            Err(())
+        }
+        Err(_) => {
+            warn!(?deadline, context = context, "websocket send timed out");
+            Err(())
+        }
+    }
+}
+
 async fn send_envelope(
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
     envelope: JsonEnvelope,
@@ -847,9 +929,13 @@ async fn send_envelope(
         warn!(%error, "failed to serialize websocket envelope");
     })?;
 
-    sender.send(Message::Text(raw)).await.map_err(|error| {
-        warn!(%error, "failed to send websocket envelope");
-    })
+    send_message_with_deadline(
+        sender,
+        Message::Text(raw),
+        WEBSOCKET_SEND_DEADLINE,
+        "websocket envelope",
+    )
+    .await
 }
 
 async fn send_envelopes(
@@ -1159,6 +1245,35 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn websocket_route_prelude_times_out_before_first_message() {
+        let protocol = test_protocol("websocket-route-prelude-timeout");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_protocol = protocol.clone();
+        let server = tokio::spawn(async move {
+            let _ = serve_listener(listener, server_protocol, false).await;
+        });
+
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .unwrap();
+        let message = timeout(Duration::from_secs(4), socket.next())
+            .await
+            .expect("daemon should reject missing route_hello before the outer test timeout")
+            .expect("daemon should send a route prelude error")
+            .expect("route prelude error should be a websocket message");
+        let ClientWsMessage::Text(raw) = message else {
+            panic!("expected plaintext route prelude error, got {message:?}");
+        };
+        let envelope: JsonEnvelope = serde_json::from_str(&raw).unwrap();
+        assert_eq!(envelope.kind, MessageType::Error);
+        let error: ErrorPayload = decode_payload(envelope.payload).unwrap();
+        assert_eq!(error.code, "route_prelude_timeout");
+
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn websocket_pushes_session_output_without_client_poll_frame() {
         let protocol = test_protocol("websocket-push");
         let server_id = {
@@ -1300,6 +1415,13 @@ mod tests {
         ))));
     }
 
+    #[test]
+    fn websocket_transport_limits_keep_frames_smaller_than_messages() {
+        assert_eq!(WEBSOCKET_MAX_FRAME_SIZE, 1024 * 1024);
+        assert_eq!(WEBSOCKET_MAX_MESSAGE_SIZE, 4 * 1024 * 1024);
+        assert!(WEBSOCKET_MAX_FRAME_SIZE <= WEBSOCKET_MAX_MESSAGE_SIZE);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn tls_listener_serves_healthz_without_touching_protocol_payloads() {
         let (cert_path, key_path) = write_test_tls_files("healthz");
@@ -1396,7 +1518,7 @@ mod tests {
             RouteHelloPayload {
                 server_id,
                 role: RouteRole::Client,
-                protocol_version: ProtocolVersion::default(),
+                protocol_version: ProtocolVersion(PROTOCOL_PACKET_VERSION),
                 nonce: termd_proto::Nonce("route-test-nonce".to_owned()),
                 timestamp_ms: current_unix_timestamp_millis(),
             },
@@ -1440,13 +1562,13 @@ mod tests {
             socket,
             envelope_value(
                 MessageType::E2eeKeyExchange,
-                E2eeKeyExchangePayload {
-                    server_id: daemon_exchange.server_id,
+                E2eeKeyExchangePayload::new(
+                    daemon_exchange.server_id,
                     device_id,
-                    public_key: device_keypair.public_key_wire(),
-                    nonce: termd_proto::Nonce("push-test-e2ee-nonce".to_owned()),
-                    timestamp_ms: UnixTimestampMillis(1_000),
-                },
+                    device_keypair.public_key_wire(),
+                    termd_proto::Nonce("push-test-e2ee-nonce".to_owned()),
+                    UnixTimestampMillis(1_000),
+                ),
             )
             .unwrap(),
         )
@@ -1629,13 +1751,13 @@ zZZR5LzKVu9X7paftR7K8Q==
         .unwrap();
         let handshake = envelope_value(
             MessageType::E2eeKeyExchange,
-            E2eeKeyExchangePayload {
-                server_id: protocol.server_id(),
+            E2eeKeyExchangePayload::new(
+                protocol.server_id(),
                 device_id,
-                public_key: device_keypair.public_key_wire(),
-                nonce: termd_proto::Nonce("nonce-e2ee-test".to_owned()),
-                timestamp_ms: UnixTimestampMillis(1_000),
-            },
+                device_keypair.public_key_wire(),
+                termd_proto::Nonce("nonce-e2ee-test".to_owned()),
+                UnixTimestampMillis(1_000),
+            ),
         )
         .unwrap();
 

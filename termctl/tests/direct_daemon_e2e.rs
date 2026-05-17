@@ -59,11 +59,13 @@ impl TestDaemon {
             .lock()
             .expect("daemon protocol mutex should not be poisoned");
         let server_id = protocol.server_id();
+        let daemon_public_key = protocol.daemon_public_identity().public_key.clone();
         let record = protocol
             .issue_pairing_token(current_unix_timestamp_millis())
             .expect("pairing token should be issued");
 
         PairingQrPayload::new(record.token().clone(), server_id, record.expires_at_ms())
+            .with_daemon_public_key(daemon_public_key)
             .to_invite_code()
     }
 
@@ -72,11 +74,13 @@ impl TestDaemon {
             .protocol
             .lock()
             .expect("daemon protocol mutex should not be poisoned");
+        let daemon_public_key = protocol.daemon_public_identity().public_key.clone();
         let record = protocol
             .issue_pairing_token(current_unix_timestamp_millis())
             .expect("pairing token should be issued");
 
         PairingQrPayload::new(record.token().clone(), server_id, record.expires_at_ms())
+            .with_daemon_public_key(daemon_public_key)
             .to_invite_code()
     }
 
@@ -175,7 +179,10 @@ async fn direct_termctl_binary_covers_session_flow_and_invariants() {
         &["pair", "--token", "wrong-token", "--url", &daemon.url],
     );
     let bad_known_pair_stderr = stderr_string(&bad_known_pair);
-    assert!(bad_known_pair_stderr.contains("pairing_failed"));
+    assert!(
+        bad_known_pair_stderr.contains("pairing_failed"),
+        "stderr was: {bad_known_pair_stderr}"
+    );
     assert!(!bad_known_pair_stderr.contains("wrong-token"));
 
     let second_token = daemon.issue_pairing_token();

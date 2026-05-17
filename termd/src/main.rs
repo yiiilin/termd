@@ -19,7 +19,7 @@ use termd::net::relay::{
 use termd::net::server::{TlsPaths, serve, serve_tls, try_default_protocol};
 use termd::pty::supervisor::{SessionSupervisorArgs, run_session_supervisor};
 use termd::pty::{CommandSpec, PtySize};
-use termd_proto::{PairingQrPayload, PairingToken, ServerId, UnixTimestampMillis};
+use termd_proto::{PairingQrPayload, PairingToken, PublicKey, ServerId, UnixTimestampMillis};
 use tokio::task::JoinHandle;
 
 const DEFAULT_PAIRING_URL: &str = "http://127.0.0.1:8765";
@@ -672,6 +672,7 @@ struct PairingTokenResponse {
     token: PairingToken,
     expires_at_ms: UnixTimestampMillis,
     server_id: ServerId,
+    daemon_public_key: PublicKey,
 }
 
 fn parse_pairing_base_url(url: &str) -> Result<PairingBaseUrl, CliError> {
@@ -838,11 +839,10 @@ fn parse_pairing_token_http_response(response: &[u8]) -> Result<PairingTokenResp
 
 /// 生成 QR invite 时只保留短期信任材料；连接地址由 Web 当前页面决定。
 fn build_pairing_qr_payload(token: &PairingTokenResponse) -> Result<PairingQrPayload, CliError> {
-    Ok(PairingQrPayload::new(
-        token.token.clone(),
-        token.server_id,
-        token.expires_at_ms,
-    ))
+    Ok(
+        PairingQrPayload::new(token.token.clone(), token.server_id, token.expires_at_ms)
+            .with_daemon_public_key(token.daemon_public_key.clone()),
+    )
 }
 
 fn render_pairing_qr(invite_code: &str) -> Result<String, CliError> {
@@ -1714,12 +1714,17 @@ mod tests {
             token: PairingToken("pair-token".to_owned()),
             expires_at_ms: UnixTimestampMillis(1_710_000_060_000),
             server_id: ServerId::new(),
+            daemon_public_key: PublicKey("ed25519-v1:daemon-public".to_owned()),
         };
         let payload = build_pairing_qr_payload(&response).unwrap();
 
         assert_eq!(payload.payload_type, PairingQrPayload::PAYLOAD_TYPE);
         assert_eq!(payload.version, PairingQrPayload::VERSION);
         assert_eq!(payload.token.0, "pair-token");
+        assert_eq!(
+            payload.daemon_public_key.as_ref().map(|key| key.0.as_str()),
+            Some("ed25519-v1:daemon-public")
+        );
         assert!(payload.ws_url.is_none());
         assert!(payload.is_supported_version());
     }
@@ -1742,7 +1747,7 @@ mod tests {
 
     #[test]
     fn parses_pairing_token_http_response() {
-        let raw = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"token\":\"termd-pair-test\",\"expires_at_ms\":1710000060000,\"server_id\":\"00000000-0000-0000-0000-000000000001\"}";
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"token\":\"termd-pair-test\",\"expires_at_ms\":1710000060000,\"server_id\":\"00000000-0000-0000-0000-000000000001\",\"daemon_public_key\":\"ed25519-v1:daemon-public\"}";
         let parsed = parse_pairing_token_http_response(raw).unwrap();
 
         assert_eq!(parsed.token.0, "termd-pair-test");
@@ -1751,6 +1756,7 @@ mod tests {
             parsed.server_id.0.to_string(),
             "00000000-0000-0000-0000-000000000001"
         );
+        assert_eq!(parsed.daemon_public_key.0, "ed25519-v1:daemon-public");
     }
 
     #[test]

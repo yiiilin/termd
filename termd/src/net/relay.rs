@@ -10,16 +10,17 @@ use base64::{Engine as _, engine::general_purpose};
 use futures_util::{SinkExt, StreamExt};
 use termd_proto::{
     Envelope as ProtoEnvelope, MessageType as ProtoMessageType, Nonce as ProtoNonce,
-    ProtocolVersion as ProtoProtocolVersion, RelayClientId, RelayMuxEnvelope, RelayOpaqueFrame,
-    RouteHelloPayload as ProtoRouteHelloPayload, RouteReadyPayload as ProtoRouteReadyPayload,
-    RouteRole as ProtoRouteRole, ServerId, SessionId,
+    PROTOCOL_PACKET_VERSION, ProtocolVersion as ProtoProtocolVersion, RelayClientId,
+    RelayMuxEnvelope, RelayOpaqueFrame, RouteHelloPayload as ProtoRouteHelloPayload,
+    RouteReadyPayload as ProtoRouteReadyPayload, RouteRole as ProtoRouteRole, ServerId, SessionId,
 };
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tokio_tungstenite::tungstenite::Message;
+use tokio::time::{Instant, timeout};
+use tokio_tungstenite::tungstenite::{Message, protocol::WebSocketConfig};
 use tracing::{debug, warn};
 
 use crate::auth::current_unix_timestamp_millis;
@@ -31,6 +32,14 @@ use super::server::SharedDaemonProtocol;
 const OUTPUT_FLUSH_MAX_BYTES_PER_SESSION: usize = 16 * 1024;
 const MIN_RELAY_RETRY_DELAY_MS: u64 = 1;
 const MIN_RELAY_HEARTBEAT_INTERVAL_MS: u64 = 1;
+// relay mux transport 失败只会断开当前 relay 连接并触发重连，不关闭持久 session/supervisor。
+const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const RELAY_ROUTE_READY_TIMEOUT: Duration = Duration::from_secs(2);
+const RELAY_SEND_DEADLINE: Duration = Duration::from_secs(2);
+const RELAY_PONG_DEADLINE: Duration = Duration::from_secs(2);
+const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const RELAY_MAX_FRAME_SIZE: usize = 1024 * 1024;
+const RELAY_MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
 
 type RelayWs = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>;
 type RelaySender = futures_util::stream::SplitSink<RelayWs, Message>;
@@ -105,16 +114,34 @@ fn duration_from_millis_floor(value: u64, floor_ms: u64) -> Duration {
     Duration::from_millis(value.max(floor_ms))
 }
 
+fn relay_websocket_config() -> WebSocketConfig {
+    WebSocketConfig {
+        max_message_size: Some(RELAY_MAX_MESSAGE_SIZE),
+        max_frame_size: Some(RELAY_MAX_FRAME_SIZE),
+        ..WebSocketConfig::default()
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum RelayConnectorError {
     #[error("unsupported relay URL; expected ws://host:port or wss://host:port")]
     UnsupportedUrl,
+    #[error("relay daemon mux websocket connect timed out")]
+    ConnectTimeout,
     #[error("failed to connect relay daemon mux websocket")]
     ConnectFailed,
+    #[error("relay route_ready timed out")]
+    RouteReadyTimeout,
     #[error("relay websocket receive failed")]
     ReceiveFailed,
+    #[error("relay websocket send timed out")]
+    SendTimeout,
     #[error("relay websocket send failed")]
     SendFailed,
+    #[error("relay websocket pong timed out")]
+    PongTimeout,
+    #[error("relay websocket idle timeout")]
+    IdleTimeout,
     #[error("relay mux envelope is invalid")]
     InvalidEnvelope,
     #[error("relay mux frame is invalid")]
@@ -425,9 +452,7 @@ async fn connect_relay_mux_base_with_heartbeat(
             .server_id()
     };
     let url = base.daemon_mux_url_with_auth(server_id, auth_token);
-    let (socket, _) = connect_relay_websocket(&url, proxy.as_ref())
-        .await
-        .map_err(|_| RelayConnectorError::ConnectFailed)?;
+    let (socket, _) = connect_relay_websocket(&url, proxy.as_ref()).await?;
     let (mut sender, mut receiver) = socket.split();
     send_route_hello(&mut sender, server_id).await?;
     read_route_ready(&mut sender, &mut receiver, server_id).await?;
@@ -443,9 +468,24 @@ async fn connect_relay_mux_base_with_heartbeat(
         heartbeat_interval,
     );
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut idle_deadline = Instant::now() + RELAY_IDLE_TIMEOUT;
+    let mut pending_pong_deadline: Option<Instant> = None;
 
     let result = loop {
+        let pending_pong_deadline_snapshot = pending_pong_deadline;
         tokio::select! {
+            _ = tokio::time::sleep_until(idle_deadline) => {
+                break Err(RelayConnectorError::IdleTimeout);
+            }
+            _ = async move {
+                if let Some(deadline) = pending_pong_deadline_snapshot {
+                    tokio::time::sleep_until(deadline).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                break Err(RelayConnectorError::PongTimeout);
+            }
             inbound = receiver.next() => {
                 let Some(message) = inbound else {
                     break Ok(());
@@ -454,6 +494,7 @@ async fn connect_relay_mux_base_with_heartbeat(
                     Ok(message) => message,
                     Err(_) => break Err(RelayConnectorError::ReceiveFailed),
                 };
+                idle_deadline = Instant::now() + RELAY_IDLE_TIMEOUT;
 
                 match message {
                     Message::Text(raw) => {
@@ -505,25 +546,44 @@ async fn connect_relay_mux_base_with_heartbeat(
                         );
                     }
                     Message::Ping(payload) => {
-                        if sender.send(Message::Pong(payload)).await.is_err() {
-                            break Err(RelayConnectorError::SendFailed);
+                        if let Err(error) = send_relay_message_with_deadline(
+                            &mut sender,
+                            Message::Pong(payload),
+                            RELAY_PONG_DEADLINE,
+                        )
+                        .await
+                        {
+                            break Err(error);
                         }
                     }
-                    Message::Pong(_) => {}
+                    Message::Pong(_) => {
+                        pending_pong_deadline = None;
+                    }
                     Message::Close(_) => break Ok(()),
                     Message::Frame(_) => {}
                 }
             }
             _ = heartbeat.tick() => {
                 // 心跳只使用 WebSocket control frame，不进入 termd 的 JSON envelope / E2EE 状态机。
-                if sender.send(Message::Ping(Vec::new().into())).await.is_err() {
-                    break Err(RelayConnectorError::SendFailed);
+                if pending_pong_deadline.is_none() {
+                    if let Err(error) = send_relay_message_with_deadline(
+                        &mut sender,
+                        Message::Ping(Vec::new().into()),
+                        RELAY_SEND_DEADLINE,
+                    )
+                    .await
+                    {
+                        break Err(error);
+                    }
+                    idle_deadline = Instant::now() + RELAY_IDLE_TIMEOUT;
+                    pending_pong_deadline = Some(Instant::now() + RELAY_PONG_DEADLINE);
                 }
             }
             maybe_event = push_event_rx.recv() => {
                 let Some(event) = maybe_event else {
                     break Err(RelayConnectorError::SendFailed);
                 };
+                idle_deadline = Instant::now() + RELAY_IDLE_TIMEOUT;
                 let (client_id, responses) = {
                     let (client_id, session_id) = match event {
                         RelayPushEvent::Output { client_id, session_id } => (client_id, session_id),
@@ -571,16 +631,13 @@ async fn send_route_hello(
         ProtoRouteHelloPayload {
             server_id,
             role: ProtoRouteRole::DaemonMux,
-            protocol_version: ProtoProtocolVersion::default(),
+            protocol_version: ProtoProtocolVersion(PROTOCOL_PACKET_VERSION),
             nonce: relay_route_nonce(),
             timestamp_ms: current_unix_timestamp_millis(),
         },
     );
     let raw = serde_json::to_string(&envelope).map_err(|_| RelayConnectorError::InvalidEnvelope)?;
-    sender
-        .send(Message::Text(raw.into()))
-        .await
-        .map_err(|_| RelayConnectorError::SendFailed)
+    send_relay_message_with_deadline(sender, Message::Text(raw.into()), RELAY_SEND_DEADLINE).await
 }
 
 async fn read_route_ready(
@@ -588,8 +645,12 @@ async fn read_route_ready(
     receiver: &mut RelayReceiver,
     expected_server_id: ServerId,
 ) -> Result<(), RelayConnectorError> {
+    let route_deadline = Instant::now() + RELAY_ROUTE_READY_TIMEOUT;
     loop {
-        let Some(message) = receiver.next().await else {
+        let Some(message) = tokio::time::timeout_at(route_deadline, receiver.next())
+            .await
+            .map_err(|_| RelayConnectorError::RouteReadyTimeout)?
+        else {
             return Err(RelayConnectorError::ReceiveFailed);
         };
         let message = message.map_err(|_| RelayConnectorError::ReceiveFailed)?;
@@ -608,9 +669,12 @@ async fn read_route_ready(
                 return Ok(());
             }
             Message::Ping(payload) => {
-                if sender.send(Message::Pong(payload)).await.is_err() {
-                    return Err(RelayConnectorError::SendFailed);
-                }
+                send_relay_message_with_deadline(
+                    sender,
+                    Message::Pong(payload),
+                    RELAY_PONG_DEADLINE,
+                )
+                .await?;
             }
             Message::Pong(_) | Message::Frame(_) => {}
             Message::Close(_) => return Err(RelayConnectorError::ReceiveFailed),
@@ -884,12 +948,22 @@ async fn send_mux_envelopes(
     for envelope in envelopes {
         let raw =
             serde_json::to_string(&envelope).map_err(|_| RelayConnectorError::InvalidEnvelope)?;
-        sender
-            .send(Message::Text(raw.into()))
-            .await
-            .map_err(|_| RelayConnectorError::SendFailed)?;
+        send_relay_message_with_deadline(sender, Message::Text(raw.into()), RELAY_SEND_DEADLINE)
+            .await?;
     }
     Ok(())
+}
+
+async fn send_relay_message_with_deadline(
+    sender: &mut RelaySender,
+    message: Message,
+    deadline: Duration,
+) -> Result<(), RelayConnectorError> {
+    match timeout(deadline, sender.send(message)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => Err(RelayConnectorError::SendFailed),
+        Err(_) => Err(RelayConnectorError::SendTimeout),
+    }
 }
 
 fn json_envelope_from_mux_frame(
@@ -916,22 +990,41 @@ async fn connect_relay_websocket(
         RelayWs,
         tokio_tungstenite::tungstenite::handshake::client::Response,
     ),
-    tokio_tungstenite::tungstenite::Error,
+    RelayConnectorError,
 > {
     let Some(proxy) = proxy else {
-        return tokio_tungstenite::connect_async(url).await;
+        return timeout(
+            RELAY_CONNECT_TIMEOUT,
+            tokio_tungstenite::connect_async_with_config(
+                url,
+                Some(relay_websocket_config()),
+                false,
+            ),
+        )
+        .await
+        .map_err(|_| RelayConnectorError::ConnectTimeout)?
+        .map_err(|_| RelayConnectorError::ConnectFailed);
     };
 
-    let target = relay_target_from_ws_url(url).ok_or_else(|| {
-        tokio_tungstenite::tungstenite::Error::Url(
-            tokio_tungstenite::tungstenite::error::UrlError::UnsupportedUrlScheme,
-        )
-    })?;
-    let stream = connect_proxy_tunnel(proxy, &target)
+    let target =
+        relay_target_from_ws_url(url).ok_or_else(|| RelayConnectorError::UnsupportedUrl)?;
+    let stream = timeout(RELAY_CONNECT_TIMEOUT, connect_proxy_tunnel(proxy, &target))
         .await
-        .map_err(tokio_tungstenite::tungstenite::Error::Io)?;
+        .map_err(|_| RelayConnectorError::ConnectTimeout)?
+        .map_err(|_| RelayConnectorError::ConnectFailed)?;
 
-    tokio_tungstenite::client_async_tls_with_config(url, stream, None, None).await
+    timeout(
+        RELAY_CONNECT_TIMEOUT,
+        tokio_tungstenite::client_async_tls_with_config(
+            url,
+            stream,
+            Some(relay_websocket_config()),
+            None,
+        ),
+    )
+    .await
+    .map_err(|_| RelayConnectorError::ConnectTimeout)?
+    .map_err(|_| RelayConnectorError::ConnectFailed)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1278,6 +1371,8 @@ mod tests {
         Envelope, MessageType, PingPayload, ProtocolVersion, RouteHelloPayload, RouteReadyPayload,
         RouteRole,
     };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
 
     static TEST_STATE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -1457,6 +1552,15 @@ mod tests {
         );
     }
 
+    #[test]
+    fn relay_websocket_config_sets_transport_size_limits() {
+        let config = relay_websocket_config();
+
+        assert_eq!(config.max_frame_size, Some(RELAY_MAX_FRAME_SIZE));
+        assert_eq!(config.max_message_size, Some(RELAY_MAX_MESSAGE_SIZE));
+        assert!(RELAY_MAX_FRAME_SIZE <= RELAY_MAX_MESSAGE_SIZE);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn reconnect_supervisor_retries_after_close_and_sends_heartbeat() {
         let state = MockMuxState::default();
@@ -1497,10 +1601,138 @@ mod tests {
         server.abort();
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn relay_mux_route_ready_times_out_when_relay_never_acks() {
+        let app = axum::Router::new().route("/ws", get(mock_route_ready_timeout_ws));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let base = RelayBaseUrl::parse(&format!("ws://{addr}")).unwrap();
+        let protocol = test_protocol("relay-route-ready-timeout");
+        let result = tokio::time::timeout(
+            Duration::from_secs(4),
+            connect_relay_mux_base_with_heartbeat(
+                base,
+                None,
+                None,
+                Duration::from_millis(10),
+                protocol,
+            ),
+        )
+        .await
+        .expect("relay connector should return before the outer test timeout");
+
+        assert!(matches!(
+            result,
+            Err(RelayConnectorError::RouteReadyTimeout)
+        ));
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn relay_mux_heartbeat_pong_timeout_closes_stalled_relay() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let protocol = test_protocol("relay-pong-timeout");
+        let server_id = protocol
+            .lock()
+            .expect("test protocol mutex should not be poisoned")
+            .server_id();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_raw_websocket_handshake(&mut stream).await;
+            let accept_key = websocket_accept_key(&request);
+            let response = format!(
+                "HTTP/1.1 101 Switching Protocols\r\n\
+                 Upgrade: websocket\r\n\
+                 Connection: Upgrade\r\n\
+                 Sec-WebSocket-Accept: {accept_key}\r\n\r\n"
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            let route_ready = Envelope::new(
+                MessageType::RouteReady,
+                RouteReadyPayload {
+                    server_id,
+                    role: RouteRole::DaemonMux,
+                },
+            );
+            let raw = serde_json::to_string(&route_ready).unwrap();
+            write_raw_ws_text(&mut stream, &raw).await;
+            // 不读取后续 ping，也不发送 pong，用裸 TCP 避免 axum/tungstenite 自动 pong。
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let base = RelayBaseUrl::parse(&format!("ws://{addr}")).unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(4),
+            connect_relay_mux_base_with_heartbeat(
+                base,
+                None,
+                None,
+                Duration::from_millis(10),
+                protocol,
+            ),
+        )
+        .await
+        .expect("relay connector should enforce heartbeat pong deadline");
+
+        assert!(matches!(result, Err(RelayConnectorError::PongTimeout)));
+        server.abort();
+    }
+
+    async fn read_raw_websocket_handshake(stream: &mut tokio::net::TcpStream) -> String {
+        let mut request = Vec::new();
+        let mut byte = [0_u8; 1];
+        loop {
+            stream.read_exact(&mut byte).await.unwrap();
+            request.push(byte[0]);
+            if request.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        String::from_utf8(request).unwrap()
+    }
+
+    fn websocket_accept_key(request: &str) -> String {
+        let key = request
+            .lines()
+            .find_map(|line| line.strip_prefix("Sec-WebSocket-Key: "))
+            .expect("client handshake should include websocket key")
+            .trim();
+        derive_accept_key(key.as_bytes())
+    }
+
+    async fn write_raw_ws_text(stream: &mut tokio::net::TcpStream, text: &str) {
+        let bytes = text.as_bytes();
+        let mut frame = Vec::with_capacity(bytes.len() + 10);
+        frame.push(0x81);
+        if bytes.len() < 126 {
+            frame.push(bytes.len() as u8);
+        } else if bytes.len() <= u16::MAX as usize {
+            frame.push(126);
+            frame.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+        } else {
+            frame.push(127);
+            frame.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+        }
+        frame.extend_from_slice(bytes);
+        stream.write_all(&frame).await.unwrap();
+    }
+
     #[derive(Clone, Default)]
     struct MockMuxState {
         attempts: Arc<AtomicUsize>,
         heartbeat_pings: Arc<AtomicUsize>,
+    }
+
+    async fn mock_route_ready_timeout_ws(websocket: WebSocketUpgrade) -> impl IntoResponse {
+        websocket.on_upgrade(move |mut socket| async move {
+            let _ = read_axum_route_hello(&mut socket).await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        })
     }
 
     async fn mock_daemon_mux_ws(
@@ -1639,13 +1871,13 @@ mod tests {
 
         let device_key_exchange = envelope_value(
             MessageType::E2eeKeyExchange,
-            termd_proto::E2eeKeyExchangePayload {
-                server_id: server_key_exchange.server_id,
+            termd_proto::E2eeKeyExchangePayload::new(
+                server_key_exchange.server_id,
                 device_id,
-                public_key: device_keypair.public_key_wire(),
-                nonce: termd_proto::Nonce("relay-e2ee-nonce".to_owned()),
-                timestamp_ms: current_unix_timestamp_millis(),
-            },
+                device_keypair.public_key_wire(),
+                termd_proto::Nonce("relay-e2ee-nonce".to_owned()),
+                current_unix_timestamp_millis(),
+            ),
         )
         .unwrap();
         let handshake_responses = handle_mux_envelope(
@@ -1825,13 +2057,13 @@ mod tests {
             client_id,
             envelope_value(
                 MessageType::E2eeKeyExchange,
-                termd_proto::E2eeKeyExchangePayload {
-                    server_id: server_key_exchange.server_id,
+                termd_proto::E2eeKeyExchangePayload::new(
+                    server_key_exchange.server_id,
                     device_id,
-                    public_key: device_keypair.public_key_wire(),
-                    nonce: termd_proto::Nonce("relay-push-e2ee-nonce".to_owned()),
-                    timestamp_ms: current_unix_timestamp_millis(),
-                },
+                    device_keypair.public_key_wire(),
+                    termd_proto::Nonce("relay-push-e2ee-nonce".to_owned()),
+                    current_unix_timestamp_millis(),
+                ),
             )
             .unwrap(),
         )
@@ -2056,13 +2288,13 @@ mod tests {
             &mut direct_protocol,
             envelope_value(
                 MessageType::E2eeKeyExchange,
-                termd_proto::E2eeKeyExchangePayload {
-                    server_id: direct_server_key_exchange.server_id,
-                    device_id: direct_device_id,
-                    public_key: direct_keypair.public_key_wire(),
-                    nonce: termd_proto::Nonce("direct-file-tree-e2ee-nonce".to_owned()),
-                    timestamp_ms: current_unix_timestamp_millis(),
-                },
+                termd_proto::E2eeKeyExchangePayload::new(
+                    direct_server_key_exchange.server_id,
+                    direct_device_id,
+                    direct_keypair.public_key_wire(),
+                    termd_proto::Nonce("direct-file-tree-e2ee-nonce".to_owned()),
+                    current_unix_timestamp_millis(),
+                ),
             )
             .unwrap(),
         );
@@ -2097,6 +2329,7 @@ mod tests {
                     MessageType::SessionAttach,
                     termd_proto::SessionAttachPayload {
                         session_id: created_payload.session_id,
+                        watch_updates: true,
                     },
                 )
                 .unwrap(),
@@ -2171,13 +2404,13 @@ mod tests {
         .unwrap();
         let device_key_exchange = envelope_value(
             MessageType::E2eeKeyExchange,
-            termd_proto::E2eeKeyExchangePayload {
-                server_id: server_key_exchange.server_id,
+            termd_proto::E2eeKeyExchangePayload::new(
+                server_key_exchange.server_id,
                 device_id,
-                public_key: device_keypair.public_key_wire(),
-                nonce: termd_proto::Nonce("relay-e2ee-nonce".to_owned()),
-                timestamp_ms: current_unix_timestamp_millis(),
-            },
+                device_keypair.public_key_wire(),
+                termd_proto::Nonce("relay-e2ee-nonce".to_owned()),
+                current_unix_timestamp_millis(),
+            ),
         )
         .unwrap();
         let handshake_responses = handle_mux_envelope(
@@ -2248,7 +2481,10 @@ mod tests {
         .expect("connector should send route_hello before relay mux envelopes");
         assert_eq!(route_hello.server_id, expected_server_id);
         assert_eq!(route_hello.role, RouteRole::DaemonMux);
-        assert_eq!(route_hello.protocol_version, ProtocolVersion::default());
+        assert_eq!(
+            route_hello.protocol_version,
+            ProtocolVersion(PROTOCOL_PACKET_VERSION)
+        );
 
         let route_ready = Envelope::new(
             MessageType::RouteReady,
@@ -2364,13 +2600,13 @@ mod tests {
             client_id,
             envelope_value(
                 MessageType::E2eeKeyExchange,
-                termd_proto::E2eeKeyExchangePayload {
-                    server_id: daemon_exchange.server_id,
+                termd_proto::E2eeKeyExchangePayload::new(
+                    daemon_exchange.server_id,
                     device_id,
-                    public_key: device_keypair.public_key_wire(),
-                    nonce: termd_proto::Nonce(nonce.to_owned()),
-                    timestamp_ms: current_unix_timestamp_millis(),
-                },
+                    device_keypair.public_key_wire(),
+                    termd_proto::Nonce(nonce.to_owned()),
+                    current_unix_timestamp_millis(),
+                ),
             )
             .unwrap(),
         )

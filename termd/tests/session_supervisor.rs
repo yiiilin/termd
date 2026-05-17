@@ -116,13 +116,13 @@ fn open_e2ee(
     .unwrap();
     let handshake = envelope_value(
         MessageType::E2eeKeyExchange,
-        E2eeKeyExchangePayload {
-            server_id: protocol.server_id(),
+        E2eeKeyExchangePayload::new(
+            protocol.server_id(),
             device_id,
-            public_key: device_keypair.public_key_wire(),
-            nonce: nonce(),
-            timestamp_ms: current_unix_timestamp_millis(),
-        },
+            device_keypair.public_key_wire(),
+            nonce(),
+            current_unix_timestamp_millis(),
+        ),
     )
     .unwrap();
 

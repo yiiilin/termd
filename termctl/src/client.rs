@@ -2,26 +2,32 @@
 //!
 //! WebSocket 打开后先发送明文 `route_hello` 并等待 `route_ready`，随后才进入
 //! `hello`/`e2ee_key_exchange`/`encrypted_frame`。pair/auth/session/control 业务
-//! envelope 都放进 E2EE 密文。relay 因而只能看到 server_id、sequence 和密文。
+//! 统一封装为 E2EE 内的 `packet`。relay 因而只能看到 server_id、sequence 和密文。
 
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
 use futures_util::{SinkExt, StreamExt};
-use serde::de::DeserializeOwned;
+use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
-use termd::auth::{AuthSigningInput, DaemonPublicIdentity};
+use termd::auth::{
+    AuthSigningInput, DaemonE2eeSigningInput, DaemonPublicIdentity, E2eeAuthTranscript,
+    SignatureVerifier,
+};
 use termd::net::protocol::{JsonEnvelope, decode_payload, envelope_value};
+use termd::net::signature::Ed25519SignatureVerifier;
 use termd::net::{
     E2eeKeyPair, E2eePeerPublicKey, E2eeSession, E2eeSessionContext, E2eeSessionRole,
 };
 use termd_proto::{
     AuthChallengePayload, AuthPayload, ControlGrantPayload, ControlRequestPayload, DeviceId,
-    E2eeKeyExchangePayload, EncryptedFramePayload, ErrorPayload, MessageType, PairAcceptPayload,
-    PairRequestPayload, PairingToken, PingPayload, ProtocolVersion, PublicKey, RouteHelloPayload,
-    RouteReadyPayload, RouteRole, ServerId, SessionAttachPayload, SessionAttachedPayload,
-    SessionCreatePayload, SessionCreatedPayload, SessionDataPayload, SessionId, SessionListPayload,
-    SessionListResultPayload, SessionResizePayload, TerminalSize,
+    E2eeKeyExchangePayload, EncryptedFramePayload, ErrorPayload, MessageType,
+    PROTOCOL_PACKET_VERSION, PacketErrorPayload, PacketKind, PacketRequestId, PacketStreamId,
+    PairAcceptPayload, PairRequestPayload, PairingToken, PingPayload, PongPayload, ProtocolPacket,
+    ProtocolVersion, PublicKey, RouteHelloPayload, RouteReadyPayload, RouteRole, ServerId,
+    SessionAttachPayload, SessionAttachedPayload, SessionCreatePayload, SessionCreatedPayload,
+    SessionDataPayload, SessionId, SessionListPayload, SessionListResultPayload,
+    SessionResizePayload, SessionResizedPayload, TerminalSize,
 };
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -34,13 +40,78 @@ use crate::state::PairedServerState;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
+const METHOD_PAIR_REQUEST: &str = "pair.request";
+const METHOD_AUTH: &str = "auth";
+const METHOD_AUTH_CHALLENGE: &str = "auth.challenge";
+const METHOD_SESSION_CREATE: &str = "session.create";
+const METHOD_SESSION_LIST: &str = "session.list";
+const METHOD_SESSION_RESIZE: &str = "session.resize";
+const METHOD_CONTROL_REQUEST: &str = "control.request";
+const METHOD_TERMINAL_ATTACH: &str = "terminal.attach";
+const METHOD_PING: &str = "ping";
+const TERMINAL_STREAM_INITIAL_CREDIT: u32 = 64;
+const TERMINAL_STREAM_REPLENISH_CREDIT: u32 = 16;
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+#[derive(Debug, Clone)]
+pub struct TerminalStream {
+    id: PacketStreamId,
+    next_send_seq: u64,
+    last_recv_seq: u64,
+}
+
+impl TerminalStream {
+    fn new() -> Self {
+        Self::with_id(PacketStreamId::new())
+    }
+
+    fn with_id(id: PacketStreamId) -> Self {
+        Self {
+            id,
+            next_send_seq: 1,
+            last_recv_seq: 0,
+        }
+    }
+
+    fn data_chunk_packet(
+        &mut self,
+        session_id: SessionId,
+        bytes: &[u8],
+    ) -> Result<ProtocolPacket<Value>> {
+        let seq = self.next_send_seq;
+        self.next_send_seq = self.next_send_seq.saturating_add(1);
+        packet_stream_chunk(
+            self.id,
+            seq,
+            SessionDataPayload {
+                session_id,
+                data_base64: crypto::encode_session_data(bytes),
+            },
+        )
+    }
+
+    fn flow_packet(&self, ack: u64, credit: u32) -> ProtocolPacket<Value> {
+        ProtocolPacket::flow(self.id, ack, credit)
+    }
+
+    fn cancel_packet(&self) -> ProtocolPacket<Value> {
+        ProtocolPacket::cancel_stream(self.id, serde_json::json!({}))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminalStreamEvent {
+    Output(Vec<u8>),
+    End,
+}
 
 pub struct DirectClient {
     socket: WsStream,
     e2ee: E2eeSession,
     device_id: DeviceId,
+    daemon_identity: DaemonPublicIdentity,
+    e2ee_auth_transcript: E2eeAuthTranscript,
 }
 
 impl DirectClient {
@@ -48,6 +119,7 @@ impl DirectClient {
         url: &str,
         route_server_id: ServerId,
         device_id: DeviceId,
+        expected_daemon_public_key: PublicKey,
     ) -> Result<Self> {
         let (mut socket, _) = connect_async(url)
             .await
@@ -60,7 +132,7 @@ impl DirectClient {
                 RouteHelloPayload {
                     server_id: route_server_id,
                     role: RouteRole::Client,
-                    protocol_version: ProtocolVersion::default(),
+                    protocol_version: ProtocolVersion(PROTOCOL_PACKET_VERSION),
                     nonce: crypto::nonce(),
                     timestamp_ms: crypto::now_ms(),
                 },
@@ -73,7 +145,11 @@ impl DirectClient {
             return Err(TermctlError::RouteServerMismatch);
         }
 
-        let mut server_e2ee_key = None;
+        let daemon_identity = DaemonPublicIdentity {
+            server_id: route_server_id,
+            public_key: expected_daemon_public_key,
+        };
+        let mut server_e2ee_exchange = None;
 
         // daemon 在连接建立后立即发送 hello 和 E2EE 公钥；顺序固定，但这里仍按类型收敛，
         // 便于后续兼容额外的明文握手字段。
@@ -99,17 +175,17 @@ impl DirectClient {
                     if payload.server_id != route_server_id {
                         return Err(TermctlError::RouteServerMismatch);
                     }
-                    server_e2ee_key = Some(
-                        E2eePeerPublicKey::try_from(&payload.public_key)
-                            .map_err(|_| TermctlError::E2eeFailed)?,
-                    );
+                    verify_daemon_e2ee_key_exchange(&payload, &daemon_identity)?;
+                    server_e2ee_exchange = Some(payload);
                 }
                 MessageType::Error => return Err(protocol_error(envelope.payload)),
                 _ => return Err(TermctlError::UnexpectedMessage),
             }
         }
 
-        let server_e2ee_key = server_e2ee_key.ok_or(TermctlError::InvalidEnvelope)?;
+        let server_e2ee_exchange = server_e2ee_exchange.ok_or(TermctlError::InvalidEnvelope)?;
+        let server_e2ee_key = E2eePeerPublicKey::try_from(&server_e2ee_exchange.public_key)
+            .map_err(|_| TermctlError::E2eeFailed)?;
         let device_e2ee_keypair = E2eeKeyPair::generate();
         let context = E2eeSessionContext::new(
             route_server_id,
@@ -124,22 +200,31 @@ impl DirectClient {
             context,
         )
         .map_err(|_| TermctlError::E2eeFailed)?;
+        let device_e2ee_exchange = E2eeKeyExchangePayload::new(
+            route_server_id,
+            device_id,
+            device_e2ee_keypair.public_key_wire(),
+            crypto::nonce(),
+            crypto::now_ms(),
+        )
+        .with_packet_version(ProtocolVersion(PROTOCOL_PACKET_VERSION));
+        let e2ee_auth_transcript = E2eeAuthTranscript::from_key_exchanges(
+            &server_e2ee_exchange,
+            &device_e2ee_exchange,
+            &daemon_identity,
+        );
         let mut client = Self {
             socket,
             e2ee,
             device_id,
+            daemon_identity,
+            e2ee_auth_transcript,
         };
 
         client
             .send_outer(envelope_value(
                 MessageType::E2eeKeyExchange,
-                E2eeKeyExchangePayload {
-                    server_id: route_server_id,
-                    device_id,
-                    public_key: device_e2ee_keypair.public_key_wire(),
-                    nonce: crypto::nonce(),
-                    timestamp_ms: crypto::now_ms(),
-                },
+                device_e2ee_exchange,
             )?)
             .await?;
 
@@ -151,8 +236,8 @@ impl DirectClient {
         device_public_key: PublicKey,
         token: String,
     ) -> Result<PairAcceptPayload> {
-        self.send_inner(envelope_value(
-            MessageType::PairRequest,
+        self.request_packet(
+            METHOD_PAIR_REQUEST,
             PairRequestPayload {
                 device_id: self.device_id,
                 device_public_key,
@@ -160,13 +245,8 @@ impl DirectClient {
                 nonce: crypto::nonce(),
                 timestamp_ms: crypto::now_ms(),
             },
-        )?)
-        .await?;
-
-        // 已信任 device 再次执行 pair 时，daemon 会先按认证路径预发 auth_challenge。
-        // pairing token 仍由 pair_request 校验；CLI 只需要忽略这个与重新配对无关的挑战。
-        self.expect_payload_ignoring(MessageType::PairAccept, &[MessageType::AuthChallenge])
-            .await
+        )
+        .await
     }
 
     pub async fn authenticate(
@@ -174,16 +254,13 @@ impl DirectClient {
         signing_key: &SigningKey,
         paired_server: &PairedServerState,
     ) -> Result<()> {
-        let challenge: AuthChallengePayload = timeout(RESPONSE_TIMEOUT, async {
-            let envelope = self.receive_inner().await?;
-            if envelope.kind != MessageType::AuthChallenge {
-                return Err(TermctlError::UnexpectedMessage);
-            }
-
-            decode_payload(envelope.payload).map_err(|_| TermctlError::InvalidEnvelope)
-        })
-        .await
-        .map_err(|_| TermctlError::AuthChallengeTimeout)??;
+        let challenge: AuthChallengePayload = self
+            .expect_packet_event(METHOD_AUTH_CHALLENGE)
+            .await
+            .map_err(|error| match error {
+                TermctlError::ConnectionClosed => TermctlError::AuthChallengeTimeout,
+                other => other,
+            })?;
 
         let mut auth = AuthPayload {
             device_id: self.device_id,
@@ -192,15 +269,21 @@ impl DirectClient {
             timestamp_ms: crypto::now_ms(),
             signature: termd_proto::Signature("ed25519-v1:placeholder".to_owned()),
         };
-        let daemon_identity = DaemonPublicIdentity {
-            server_id: paired_server.server_id,
-            public_key: paired_server.daemon_public_key.clone(),
-        };
-        let signing_input = AuthSigningInput::from_payload(&auth, &daemon_identity).to_bytes();
+        if paired_server.server_id != self.daemon_identity.server_id
+            || paired_server.daemon_public_key != self.daemon_identity.public_key
+        {
+            return Err(TermctlError::RouteServerMismatch);
+        }
+        let signing_input = AuthSigningInput::from_payload_with_e2ee_transcript(
+            &auth,
+            &self.daemon_identity,
+            Some(&self.e2ee_auth_transcript),
+        )
+        .to_bytes();
         auth.signature = crypto::sign_to_wire(signing_key, &signing_input);
 
-        self.send_inner(envelope_value(MessageType::Auth, auth)?)
-            .await
+        let _: Value = self.request_packet(METHOD_AUTH, auth).await?;
+        Ok(())
     }
 
     pub async fn create_session(
@@ -208,48 +291,46 @@ impl DirectClient {
         command: Vec<String>,
         size: TerminalSize,
     ) -> Result<SessionCreatedPayload> {
-        self.send_inner(envelope_value(
-            MessageType::SessionCreate,
+        self.request_packet(
+            METHOD_SESSION_CREATE,
             SessionCreatePayload { command, size },
-        )?)
-        .await?;
-        self.expect_payload(MessageType::SessionCreated).await
+        )
+        .await
     }
 
-    pub async fn attach_session(
+    pub async fn attach_terminal_stream(
         &mut self,
         session_id: SessionId,
-    ) -> Result<SessionAttachedPayload> {
-        self.send_inner(envelope_value(
-            MessageType::SessionAttach,
-            SessionAttachPayload { session_id },
-        )?)
-        .await?;
-        self.expect_payload(MessageType::SessionAttached).await
+    ) -> Result<(SessionAttachedPayload, TerminalStream)> {
+        let request_id = PacketRequestId::new();
+        let stream = TerminalStream::new();
+        let packet = packet_stream_open(
+            request_id,
+            stream.id,
+            METHOD_TERMINAL_ATTACH,
+            TERMINAL_STREAM_INITIAL_CREDIT,
+            SessionAttachPayload {
+                session_id,
+                watch_updates: true,
+            },
+        )?;
+
+        self.send_packet(packet).await?;
+        let attached = self
+            .expect_packet_response(request_id, METHOD_TERMINAL_ATTACH)
+            .await?;
+        Ok((attached, stream))
     }
 
     pub async fn request_control(&mut self, session_id: SessionId) -> Result<ControlGrantPayload> {
-        self.send_inner(envelope_value(
-            MessageType::ControlRequest,
+        self.request_packet(
+            METHOD_CONTROL_REQUEST,
             ControlRequestPayload {
                 session_id,
                 device_id: self.device_id,
             },
-        )?)
-        .await?;
-
-        // control 在 shared-control 模式下是 noop 确认命令；仍跳过 attach 后可能先到的输出帧。
-        loop {
-            let envelope = self.receive_inner_timeout().await?;
-            match envelope.kind {
-                MessageType::ControlGrant => {
-                    return decode_payload(envelope.payload)
-                        .map_err(|_| TermctlError::InvalidEnvelope);
-                }
-                MessageType::Pong | MessageType::SessionData => continue,
-                _ => return Err(TermctlError::UnexpectedMessage),
-            }
-        }
+        )
+        .await
     }
 
     pub async fn resize_session(
@@ -257,52 +338,80 @@ impl DirectClient {
         session_id: SessionId,
         size: TerminalSize,
     ) -> Result<()> {
-        self.send_inner(envelope_value(
-            MessageType::SessionResize,
-            SessionResizePayload { session_id, size },
-        )?)
-        .await?;
-
         // resize 必须等 daemon 返回明确确认后才算完成，避免客户端先行调整本地状态。
+        let _: SessionResizedPayload = self
+            .request_packet(
+                METHOD_SESSION_RESIZE,
+                SessionResizePayload { session_id, size },
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn list_sessions(&mut self) -> Result<SessionListResultPayload> {
+        self.request_packet(METHOD_SESSION_LIST, SessionListPayload {})
+            .await
+    }
+
+    pub async fn send_terminal_data(
+        &mut self,
+        stream: &mut TerminalStream,
+        session_id: SessionId,
+        bytes: &[u8],
+    ) -> Result<()> {
+        let packet = stream.data_chunk_packet(session_id, bytes)?;
+        self.send_packet(packet).await
+    }
+
+    pub async fn cancel_terminal_stream(&mut self, stream: &TerminalStream) -> Result<()> {
+        self.send_packet(stream.cancel_packet()).await
+    }
+
+    pub async fn receive_terminal_event(
+        &mut self,
+        stream: &mut TerminalStream,
+    ) -> Result<TerminalStreamEvent> {
         loop {
-            let envelope = self.receive_inner_timeout().await?;
-            match envelope.kind {
-                MessageType::SessionResized => return Ok(()),
-                MessageType::SessionData => continue,
-                _ => return Err(TermctlError::UnexpectedMessage),
+            let packet = self.receive_packet().await?;
+            if packet.stream_id != Some(stream.id) {
+                continue;
+            }
+
+            match packet.kind {
+                PacketKind::StreamChunk => {
+                    let payload: SessionDataPayload = decode_payload(packet.payload)
+                        .map_err(|_| TermctlError::InvalidEnvelope)?;
+                    let bytes = crypto::decode_session_data(&payload.data_base64)?;
+                    stream.last_recv_seq = packet.seq;
+                    self.send_packet(
+                        stream.flow_packet(packet.seq, TERMINAL_STREAM_REPLENISH_CREDIT),
+                    )
+                    .await?;
+                    return Ok(TerminalStreamEvent::Output(bytes));
+                }
+                PacketKind::StreamEnd | PacketKind::Cancel => return Ok(TerminalStreamEvent::End),
+                PacketKind::Error => return Err(packet_error(packet.payload)),
+                PacketKind::Flow
+                | PacketKind::Event
+                | PacketKind::Response
+                | PacketKind::Request
+                | PacketKind::StreamOpen => continue,
             }
         }
     }
 
-    pub async fn list_sessions(&mut self) -> Result<SessionListResultPayload> {
-        self.send_inner(envelope_value(
-            MessageType::SessionList,
-            SessionListPayload {},
-        )?)
-        .await?;
-        self.expect_payload(MessageType::SessionListResult).await
-    }
-
-    pub async fn send_session_data(&mut self, session_id: SessionId, bytes: &[u8]) -> Result<()> {
-        self.send_inner(envelope_value(
-            MessageType::SessionData,
-            SessionDataPayload {
-                session_id,
-                data_base64: crypto::encode_session_data(bytes),
-            },
-        )?)
-        .await
-    }
-
+    #[allow(dead_code)]
     pub async fn send_ping(&mut self) -> Result<()> {
-        self.send_inner(envelope_value(
-            MessageType::Ping,
-            PingPayload {
-                nonce: crypto::nonce(),
-                timestamp_ms: crypto::now_ms(),
-            },
-        )?)
-        .await
+        let _: PongPayload = self
+            .request_packet(
+                METHOD_PING,
+                PingPayload {
+                    nonce: crypto::nonce(),
+                    timestamp_ms: crypto::now_ms(),
+                },
+            )
+            .await?;
+        Ok(())
     }
 
     pub async fn receive_inner(&mut self) -> Result<JsonEnvelope> {
@@ -326,41 +435,74 @@ impl DirectClient {
         }
     }
 
-    async fn receive_inner_timeout(&mut self) -> Result<JsonEnvelope> {
-        timeout(RESPONSE_TIMEOUT, self.receive_inner())
-            .await
-            .map_err(|_| TermctlError::ConnectionClosed)?
-    }
-
-    async fn expect_payload<T>(&mut self, expected: MessageType) -> Result<T>
+    async fn request_packet<P, T>(&mut self, method: &'static str, payload: P) -> Result<T>
     where
+        P: Serialize,
         T: DeserializeOwned,
     {
-        self.expect_payload_ignoring(expected, &[]).await
+        let request_id = PacketRequestId::new();
+        self.send_inner(packet_request_envelope(request_id, method, payload)?)
+            .await?;
+        self.expect_packet_response(request_id, method).await
     }
 
-    async fn expect_payload_ignoring<T>(
+    async fn expect_packet_response<T>(
         &mut self,
-        expected: MessageType,
-        ignored: &[MessageType],
+        request_id: PacketRequestId,
+        method: &'static str,
     ) -> Result<T>
     where
         T: DeserializeOwned,
     {
         loop {
-            let envelope = self.receive_inner_timeout().await?;
-            if envelope.kind == MessageType::Pong {
-                continue;
+            let packet = self.receive_packet_timeout().await?;
+            if let Some(payload) = decode_packet_response_for_request(packet, request_id, method)? {
+                return Ok(payload);
             }
-            if ignored.contains(&envelope.kind) {
-                continue;
-            }
-            if envelope.kind != expected {
-                return Err(TermctlError::UnexpectedMessage);
-            }
-
-            return decode_payload(envelope.payload).map_err(|_| TermctlError::InvalidEnvelope);
         }
+    }
+
+    async fn expect_packet_event<T>(&mut self, method: &'static str) -> Result<T>
+    where
+        T: DeserializeOwned,
+    {
+        loop {
+            let packet = self.receive_packet_timeout().await?;
+            validate_packet_version(&packet)?;
+
+            match packet.kind {
+                PacketKind::Event if packet.method.as_deref() == Some(method) => {
+                    return decode_payload(packet.payload)
+                        .map_err(|_| TermctlError::InvalidEnvelope);
+                }
+                PacketKind::Error if packet.id.is_none() => {
+                    return Err(packet_error(packet.payload));
+                }
+                _ => continue,
+            }
+        }
+    }
+
+    async fn send_packet(&mut self, packet: ProtocolPacket<Value>) -> Result<()> {
+        self.send_inner(packet_envelope(packet)?).await
+    }
+
+    async fn receive_packet(&mut self) -> Result<ProtocolPacket<Value>> {
+        let envelope = self.receive_inner().await?;
+        if envelope.kind != MessageType::Packet {
+            return Err(TermctlError::UnexpectedMessage);
+        }
+
+        let packet: ProtocolPacket<Value> =
+            decode_payload(envelope.payload).map_err(|_| TermctlError::InvalidEnvelope)?;
+        validate_packet_version(&packet)?;
+        Ok(packet)
+    }
+
+    async fn receive_packet_timeout(&mut self) -> Result<ProtocolPacket<Value>> {
+        timeout(RESPONSE_TIMEOUT, self.receive_packet())
+            .await
+            .map_err(|_| TermctlError::ConnectionClosed)?
     }
 
     async fn send_inner(&mut self, inner: JsonEnvelope) -> Result<()> {
@@ -443,16 +585,117 @@ fn protocol_error(payload: Value) -> TermctlError {
     }
 }
 
-#[cfg(test)]
-fn ping_envelope_for_test() -> JsonEnvelope {
-    envelope_value(
-        MessageType::Ping,
-        PingPayload {
-            nonce: crypto::nonce(),
-            timestamp_ms: crypto::now_ms(),
+fn verify_daemon_e2ee_key_exchange(
+    payload: &E2eeKeyExchangePayload,
+    daemon_identity: &DaemonPublicIdentity,
+) -> Result<()> {
+    if payload.packet_version != Some(ProtocolVersion(PROTOCOL_PACKET_VERSION)) {
+        return Err(TermctlError::InvalidEnvelope);
+    }
+    let signature = payload
+        .signature
+        .as_ref()
+        .ok_or(TermctlError::InvalidEnvelope)?;
+    let signing_input = DaemonE2eeSigningInput::from_payload(payload, daemon_identity).to_bytes();
+
+    Ed25519SignatureVerifier
+        .verify(&daemon_identity.public_key, &signing_input, signature)
+        .map_err(|_| TermctlError::E2eeFailed)
+}
+
+fn packet_request_envelope<P>(
+    request_id: PacketRequestId,
+    method: &'static str,
+    payload: P,
+) -> Result<JsonEnvelope>
+where
+    P: Serialize,
+{
+    let payload = serde_json::to_value(payload).map_err(|_| TermctlError::InvalidEnvelope)?;
+    packet_envelope(ProtocolPacket::request(request_id, method, payload))
+}
+
+fn packet_stream_open<P>(
+    request_id: PacketRequestId,
+    stream_id: PacketStreamId,
+    method: &'static str,
+    credit: u32,
+    payload: P,
+) -> Result<ProtocolPacket<Value>>
+where
+    P: Serialize,
+{
+    let payload = serde_json::to_value(payload).map_err(|_| TermctlError::InvalidEnvelope)?;
+    Ok(ProtocolPacket::stream_open(
+        request_id, stream_id, method, credit, payload,
+    ))
+}
+
+fn packet_stream_chunk<P>(
+    stream_id: PacketStreamId,
+    seq: u64,
+    payload: P,
+) -> Result<ProtocolPacket<Value>>
+where
+    P: Serialize,
+{
+    let payload = serde_json::to_value(payload).map_err(|_| TermctlError::InvalidEnvelope)?;
+    Ok(ProtocolPacket::stream_chunk(stream_id, seq, payload))
+}
+
+fn packet_envelope(packet: ProtocolPacket<Value>) -> Result<JsonEnvelope> {
+    envelope_value(MessageType::Packet, packet).map_err(Into::into)
+}
+
+fn decode_packet_response_for_request<T>(
+    packet: ProtocolPacket<Value>,
+    request_id: PacketRequestId,
+    method: &'static str,
+) -> Result<Option<T>>
+where
+    T: DeserializeOwned,
+{
+    validate_packet_version(&packet)?;
+
+    let Some(packet_request_id) = packet.id else {
+        return Ok(None);
+    };
+    if packet_request_id != request_id {
+        return Ok(None);
+    }
+    if packet
+        .method
+        .as_deref()
+        .is_some_and(|packet_method| packet_method != method)
+    {
+        return Err(TermctlError::UnexpectedMessage);
+    }
+
+    match packet.kind {
+        PacketKind::Response => decode_payload(packet.payload)
+            .map(Some)
+            .map_err(|_| TermctlError::InvalidEnvelope),
+        PacketKind::Error => Err(packet_error(packet.payload)),
+        _ => Ok(None),
+    }
+}
+
+fn validate_packet_version(packet: &ProtocolPacket<Value>) -> Result<()> {
+    if packet.version != PROTOCOL_PACKET_VERSION {
+        return Err(TermctlError::InvalidEnvelope);
+    }
+
+    Ok(())
+}
+
+fn packet_error(payload: Value) -> TermctlError {
+    match decode_payload::<PacketErrorPayload>(payload) {
+        Ok(error) => TermctlError::Protocol {
+            code: error.code,
+            message: error.message,
         },
-    )
-    .expect("ping payload should serialize")
+        Err(_) => TermctlError::InvalidEnvelope,
+    }
 }
 
 #[cfg(test)]
@@ -468,10 +711,134 @@ fn encrypted_envelope_for_test(
 
 #[cfg(test)]
 mod tests {
+    use termd::auth::DaemonIdentity;
     use termd::net::{E2eeKeyPair, E2eeSessionContext};
-    use termd_proto::{PairingToken, UnixTimestampMillis};
+    use termd_proto::{
+        PacketErrorPayload, PacketKind, PacketRequestId, PacketStreamId, PairingToken,
+        ProtocolPacket, UnixTimestampMillis,
+    };
 
     use super::*;
+
+    #[test]
+    fn daemon_e2ee_key_exchange_requires_packet_v3_and_valid_signature() {
+        let identity = DaemonIdentity::generate();
+        let daemon_identity = identity.public_identity();
+        let mut exchange = E2eeKeyExchangePayload::new(
+            daemon_identity.server_id,
+            DeviceId::default(),
+            PublicKey("x25519-v1:daemon-session-key".to_owned()),
+            crypto::nonce(),
+            UnixTimestampMillis(1_710_000_000_000),
+        )
+        .with_packet_version(ProtocolVersion(PROTOCOL_PACKET_VERSION));
+        let signing_input =
+            DaemonE2eeSigningInput::from_payload(&exchange, &daemon_identity).to_bytes();
+        exchange = exchange.with_signature(identity.sign_to_wire(&signing_input).unwrap());
+
+        verify_daemon_e2ee_key_exchange(&exchange, &daemon_identity).unwrap();
+
+        let mut missing_version = exchange.clone();
+        missing_version.packet_version = None;
+        assert!(matches!(
+            verify_daemon_e2ee_key_exchange(&missing_version, &daemon_identity).unwrap_err(),
+            TermctlError::InvalidEnvelope
+        ));
+
+        let mut tampered = exchange;
+        tampered.nonce = crypto::nonce();
+        assert!(matches!(
+            verify_daemon_e2ee_key_exchange(&tampered, &daemon_identity).unwrap_err(),
+            TermctlError::E2eeFailed
+        ));
+    }
+
+    #[test]
+    fn packet_request_envelope_uses_protocol_packet_request_id() {
+        let request_id = PacketRequestId::new();
+
+        let envelope =
+            packet_request_envelope(request_id, METHOD_SESSION_LIST, SessionListPayload {})
+                .expect("packet request should serialize");
+        let packet: ProtocolPacket<Value> =
+            decode_payload(envelope.payload).expect("packet payload should decode");
+
+        assert_eq!(envelope.kind, MessageType::Packet);
+        assert_eq!(packet.kind, PacketKind::Request);
+        assert_eq!(packet.id, Some(request_id));
+        assert_eq!(packet.method.as_deref(), Some(METHOD_SESSION_LIST));
+        assert_eq!(packet.stream_id, None);
+        assert_eq!(packet.payload, serde_json::json!({}));
+    }
+
+    #[test]
+    fn packet_response_matching_is_bound_to_request_id() {
+        let expected_id = PacketRequestId::new();
+        let other_id = PacketRequestId::new();
+
+        let other_response = ProtocolPacket::response(
+            other_id,
+            METHOD_SESSION_LIST,
+            serde_json::json!({"sessions": []}),
+        );
+        let matched: Option<SessionListResultPayload> =
+            decode_packet_response_for_request(other_response, expected_id, METHOD_SESSION_LIST)
+                .expect("unrelated response should be ignored");
+        assert!(matched.is_none());
+
+        let packet_error = ProtocolPacket::request_error(
+            expected_id,
+            PacketErrorPayload {
+                code: "session_not_found".to_owned(),
+                message: "session was not found".to_owned(),
+                retryable: false,
+            },
+        );
+        let packet_error: ProtocolPacket<Value> =
+            serde_json::from_value(serde_json::to_value(packet_error).unwrap()).unwrap();
+        let err = decode_packet_response_for_request::<SessionListResultPayload>(
+            packet_error,
+            expected_id,
+            METHOD_SESSION_LIST,
+        )
+        .expect_err("matching packet error should map to the request");
+
+        assert!(matches!(
+            err,
+            TermctlError::Protocol { ref code, .. } if code == "session_not_found"
+        ));
+    }
+
+    #[test]
+    fn terminal_stream_packets_carry_stream_id_sequence_flow_and_cancel() {
+        let stream_id = PacketStreamId::new();
+        let session_id = SessionId::new();
+        let mut stream = TerminalStream::with_id(stream_id);
+
+        let chunk = stream
+            .data_chunk_packet(session_id, b"abc")
+            .expect("terminal data chunk should serialize");
+        let chunk_payload: SessionDataPayload =
+            decode_payload(chunk.payload.clone()).expect("terminal data should decode");
+        assert_eq!(chunk.kind, PacketKind::StreamChunk);
+        assert_eq!(chunk.stream_id, Some(stream_id));
+        assert_eq!(chunk.seq, 1);
+        assert_eq!(chunk_payload.session_id, session_id);
+        assert_eq!(
+            crypto::decode_session_data(&chunk_payload.data_base64).unwrap(),
+            b"abc"
+        );
+
+        let flow = stream.flow_packet(7, 16);
+        assert_eq!(flow.kind, PacketKind::Flow);
+        assert_eq!(flow.stream_id, Some(stream_id));
+        assert_eq!(flow.ack, Some(7));
+        assert_eq!(flow.credit, Some(16));
+
+        let cancel = stream.cancel_packet();
+        assert_eq!(cancel.kind, PacketKind::Cancel);
+        assert_eq!(cancel.stream_id, Some(stream_id));
+    }
 
     #[test]
     fn encrypted_business_envelope_hides_pairing_and_session_plaintext() {
@@ -499,8 +866,9 @@ mod tests {
             context,
         )
         .unwrap();
-        let inner = envelope_value(
-            MessageType::PairRequest,
+        let inner = packet_request_envelope(
+            PacketRequestId::new(),
+            METHOD_PAIR_REQUEST,
             PairRequestPayload {
                 device_id,
                 device_public_key: PublicKey("ed25519-v1:public".to_owned()),
@@ -516,11 +884,15 @@ mod tests {
 
         assert_eq!(outer.kind, MessageType::EncryptedFrame);
         assert!(!wire.contains("pair_request"));
+        assert!(!wire.contains("pair.request"));
         assert!(!wire.contains("secret-token"));
 
         let frame: EncryptedFramePayload = decode_payload(outer.payload).unwrap();
         let decrypted: JsonEnvelope = daemon_e2ee.decrypt_json_payload(&frame).unwrap();
-        assert_eq!(decrypted.kind, MessageType::PairRequest);
+        assert_eq!(decrypted.kind, MessageType::Packet);
+        let packet: ProtocolPacket<Value> = decode_payload(decrypted.payload).unwrap();
+        assert_eq!(packet.kind, PacketKind::Request);
+        assert_eq!(packet.method.as_deref(), Some(METHOD_PAIR_REQUEST));
     }
 
     #[test]
@@ -542,28 +914,39 @@ mod tests {
             context,
         )
         .unwrap();
-        let inner = envelope_value(
-            MessageType::SessionData,
-            SessionDataPayload {
-                session_id: SessionId::new(),
-                data_base64: crypto::encode_session_data(b"terminal secret\n"),
-            },
-        )
-        .unwrap();
+        let mut stream = TerminalStream::new();
+        let packet = stream
+            .data_chunk_packet(SessionId::new(), b"terminal secret\n")
+            .unwrap();
+        let inner = packet_envelope(packet).unwrap();
 
         let outer = encrypted_envelope_for_test(&mut device_e2ee, inner).unwrap();
         let wire = serde_json::to_string(&outer).unwrap();
 
         assert!(!wire.contains("session_data"));
+        assert!(!wire.contains("stream_chunk"));
         assert!(!wire.contains("terminal secret"));
     }
 
     #[test]
-    fn ping_envelope_carries_only_nonce_and_timestamp() {
-        let ping = ping_envelope_for_test();
-        let payload: PingPayload = decode_payload(ping.payload).unwrap();
+    fn ping_packet_carries_nonce_and_timestamp_in_request_payload() {
+        let request_id = PacketRequestId::new();
+        let envelope = packet_request_envelope(
+            request_id,
+            METHOD_PING,
+            PingPayload {
+                nonce: crypto::nonce(),
+                timestamp_ms: crypto::now_ms(),
+            },
+        )
+        .expect("ping packet should serialize");
+        let packet: ProtocolPacket<Value> = decode_payload(envelope.payload).unwrap();
+        let payload: PingPayload = decode_payload(packet.payload).unwrap();
 
-        assert_eq!(ping.kind, MessageType::Ping);
+        assert_eq!(envelope.kind, MessageType::Packet);
+        assert_eq!(packet.kind, PacketKind::Request);
+        assert_eq!(packet.id, Some(request_id));
+        assert_eq!(packet.method.as_deref(), Some(METHOD_PING));
         assert!(payload.nonce.0.starts_with("nonce-"));
         assert!(payload.timestamp_ms.0 > 0);
     }

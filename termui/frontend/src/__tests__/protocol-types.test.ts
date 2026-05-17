@@ -7,6 +7,8 @@ import {
   type Envelope,
   type PairingQrPayload,
   type MessageType,
+  PROTOCOL_PACKET_VERSION,
+  type ProtocolPacket,
   type RouteHelloPayload,
   type RouteReadyPayload,
   type RouteRole,
@@ -77,6 +79,7 @@ describe("协议类型", () => {
       "control_grant",
       "e2ee_key_exchange",
       "encrypted_frame",
+      "packet",
       "error",
       "ping",
       "pong",
@@ -112,7 +115,7 @@ describe("协议类型", () => {
     const routeHello: RouteHelloPayload = {
       server_id: "00000000-0000-0000-0000-000000000001",
       role: "client",
-      protocol_version: 2,
+      protocol_version: PROTOCOL_PACKET_VERSION,
       nonce: "route-nonce",
       timestamp_ms: 1_710_000_000_000,
     };
@@ -137,6 +140,61 @@ describe("协议类型", () => {
     const raw = JSON.stringify(message);
 
     expect(raw).toBe('{"type":"session_list","payload":{}}');
+  });
+
+  it("0.2 packet 支持 request/response/stream/error 的稳定 JSON 形状", () => {
+    const requestId = "00000000-0000-0000-0000-000000000010";
+    const streamId = "00000000-0000-0000-0000-000000000020";
+    const request: ProtocolPacket = {
+      version: PROTOCOL_PACKET_VERSION,
+      kind: "request",
+      id: requestId,
+      method: "session.list",
+      payload: {},
+    };
+    const chunk: ProtocolPacket = {
+      version: PROTOCOL_PACKET_VERSION,
+      kind: "stream_chunk",
+      stream_id: streamId,
+      seq: 7,
+      payload: { data_base64: "YWJj" },
+    };
+    const flow: ProtocolPacket = {
+      version: PROTOCOL_PACKET_VERSION,
+      kind: "flow",
+      stream_id: streamId,
+      ack: 7,
+      credit: 64,
+      payload: {},
+    };
+    const error: ProtocolPacket = {
+      version: PROTOCOL_PACKET_VERSION,
+      kind: "error",
+      id: requestId,
+      payload: { code: "timeout", message: "operation timed out", retryable: true },
+    };
+
+    expect(JSON.parse(JSON.stringify(request))).toMatchObject({
+      version: 3,
+      kind: "request",
+      id: requestId,
+      method: "session.list",
+    });
+    expect(JSON.parse(JSON.stringify(chunk))).toMatchObject({
+      kind: "stream_chunk",
+      stream_id: streamId,
+      seq: 7,
+    });
+    expect(JSON.parse(JSON.stringify(flow))).toMatchObject({
+      kind: "flow",
+      ack: 7,
+      credit: 64,
+    });
+    expect(JSON.parse(JSON.stringify(error))).toMatchObject({
+      kind: "error",
+      id: requestId,
+      payload: { retryable: true },
+    });
   });
 
   it("光标状态只同步位置和 xterm 聚焦状态", () => {
@@ -232,12 +290,13 @@ describe("协议类型", () => {
     expect(JSON.stringify(status)).not.toContain("session_data");
   });
 
-  it("QR pairing payload 只在有效 JSON 且带 token/server_id 时被识别，ws_url 仅作旧版兼容", () => {
+  it("QR pairing payload 只在有效 JSON 且带 token/server_id/daemon public key 时被识别", () => {
     const payload: PairingQrPayload = {
       type: "termd_pairing_qr",
       version: 1,
       token: "pair-token",
       server_id: "00000000-0000-0000-0000-000000000001",
+      daemon_public_key: "ed25519-v1:daemon-public",
       expires_at_ms: 1710000060000,
     };
 
@@ -258,6 +317,14 @@ describe("协议类型", () => {
       parsePairingQrPayload(
         JSON.stringify({
           ...payload,
+          daemon_public_key: undefined,
+        }),
+      ),
+    ).toBeUndefined();
+    expect(
+      parsePairingQrPayload(
+        JSON.stringify({
+          ...payload,
           ws_url: "http://not-supported",
         }),
       ),
@@ -270,6 +337,7 @@ describe("协议类型", () => {
       version: 1,
       token: "pair-token",
       server_id: "00000000-0000-0000-0000-000000000001",
+      daemon_public_key: "ed25519-v1:daemon-public",
       expires_at_ms: 1710000060000,
     };
     const inviteCode = pairingInviteCode(payload);

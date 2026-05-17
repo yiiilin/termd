@@ -9,16 +9,17 @@
 //! 可以实现 `TrustedDeviceStore`，并复用同一组查询边界来拒绝未配对设备。
 
 use base64::{Engine as _, engine::general_purpose};
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{Signer, SigningKey};
 use rand_core::OsRng;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub use termd_proto::{
-    AuthPayload, Challenge, DeviceId, Nonce, PairAcceptPayload, PairRequestPayload, PairingToken,
-    PublicKey, ServerId, Signature, UnixTimestampMillis,
+    AuthPayload, Challenge, DeviceId, E2eeKeyExchangePayload, Nonce, PairAcceptPayload,
+    PairRequestPayload, PairingToken, PublicKey, ServerId, Signature, UnixTimestampMillis,
 };
 
 /// auth 模块统一使用的 Result 类型。
@@ -959,6 +960,7 @@ pub struct AuthSigningInput {
     challenge: Challenge,
     nonce: Nonce,
     timestamp_ms: UnixTimestampMillis,
+    e2ee_transcript_sha256: Option<String>,
 }
 
 impl AuthSigningInput {
@@ -971,7 +973,22 @@ impl AuthSigningInput {
             challenge: payload.challenge.clone(),
             nonce: payload.nonce.clone(),
             timestamp_ms: payload.timestamp_ms,
+            e2ee_transcript_sha256: None,
         }
+    }
+
+    /// 从 auth payload 构造绑定当前 E2EE transcript 的签名输入。
+    ///
+    /// 0.2.0 的客户端必须使用这个路径：设备签名不只证明 challenge，还证明自己看到的是
+    /// 当前 daemon 身份签过的 X25519 握手材料，避免 relay 把 challenge 跨连接转发。
+    pub fn from_payload_with_e2ee_transcript(
+        payload: &AuthPayload,
+        daemon_identity: &DaemonPublicIdentity,
+        transcript: Option<&E2eeAuthTranscript>,
+    ) -> Self {
+        let mut input = Self::from_payload(payload, daemon_identity);
+        input.e2ee_transcript_sha256 = transcript.map(E2eeAuthTranscript::digest_wire);
+        input
     }
 
     /// 输出稳定字节序列，供具体签名算法验签。
@@ -988,6 +1005,174 @@ impl AuthSigningInput {
         append_canonical_field(&mut bytes, "challenge", self.challenge.0.as_str());
         append_canonical_field(&mut bytes, "nonce", self.nonce.0.as_str());
         append_canonical_field(&mut bytes, "timestamp_ms", &self.timestamp_ms.0.to_string());
+        if let Some(transcript) = &self.e2ee_transcript_sha256 {
+            append_canonical_field(&mut bytes, "e2ee_transcript_sha256", transcript);
+        }
+        bytes
+    }
+}
+
+/// daemon 对自己发出的 E2EE server hello 做身份签名的规范化输入。
+///
+/// 这个签名把长期 Ed25519 trust anchor 绑定到短期 X25519 公钥。客户端在建立 E2EE session
+/// 前先验证它，relay 因而不能替换 X25519 公钥后继续冒充 daemon。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaemonE2eeSigningInput {
+    server_id: ServerId,
+    daemon_public_key: PublicKey,
+    device_id: DeviceId,
+    e2ee_public_key: PublicKey,
+    nonce: Nonce,
+    timestamp_ms: UnixTimestampMillis,
+    packet_version: u16,
+}
+
+impl DaemonE2eeSigningInput {
+    pub fn from_payload(
+        payload: &E2eeKeyExchangePayload,
+        daemon_identity: &DaemonPublicIdentity,
+    ) -> Self {
+        Self {
+            server_id: daemon_identity.server_id,
+            daemon_public_key: daemon_identity.public_key.clone(),
+            device_id: payload.device_id,
+            e2ee_public_key: payload.public_key.clone(),
+            nonce: payload.nonce.clone(),
+            timestamp_ms: payload.timestamp_ms,
+            packet_version: payload
+                .packet_version
+                .unwrap_or(termd_proto::ProtocolVersion(0))
+                .0,
+        }
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"termd-daemon-e2ee-key-exchange-v1\n");
+        append_canonical_field(&mut bytes, "server_id", &self.server_id.0.to_string());
+        append_canonical_field(
+            &mut bytes,
+            "daemon_public_key",
+            self.daemon_public_key.0.as_str(),
+        );
+        append_canonical_field(&mut bytes, "device_id", &self.device_id.0.to_string());
+        append_canonical_field(
+            &mut bytes,
+            "e2ee_public_key",
+            self.e2ee_public_key.0.as_str(),
+        );
+        append_canonical_field(&mut bytes, "nonce", self.nonce.0.as_str());
+        append_canonical_field(&mut bytes, "timestamp_ms", &self.timestamp_ms.0.to_string());
+        append_canonical_field(
+            &mut bytes,
+            "packet_version",
+            &self.packet_version.to_string(),
+        );
+        bytes
+    }
+}
+
+/// auth 签名需要绑定的 E2EE transcript 摘要。
+///
+/// 摘要覆盖 daemon 身份、daemon/server E2EE hello、device E2EE hello 和 packet 版本。
+/// wire payload 不额外携带这个摘要，客户端与 daemon 各自从握手材料计算同一个值。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct E2eeAuthTranscript {
+    server_id: ServerId,
+    daemon_public_key: PublicKey,
+    daemon_e2ee_public_key: PublicKey,
+    daemon_nonce: Nonce,
+    daemon_timestamp_ms: UnixTimestampMillis,
+    daemon_packet_version: u16,
+    daemon_signature: Option<Signature>,
+    device_id: DeviceId,
+    device_e2ee_public_key: PublicKey,
+    device_nonce: Nonce,
+    device_timestamp_ms: UnixTimestampMillis,
+    device_packet_version: u16,
+}
+
+impl E2eeAuthTranscript {
+    pub fn from_key_exchanges(
+        daemon_exchange: &E2eeKeyExchangePayload,
+        device_exchange: &E2eeKeyExchangePayload,
+        daemon_identity: &DaemonPublicIdentity,
+    ) -> Self {
+        Self {
+            server_id: daemon_identity.server_id,
+            daemon_public_key: daemon_identity.public_key.clone(),
+            daemon_e2ee_public_key: daemon_exchange.public_key.clone(),
+            daemon_nonce: daemon_exchange.nonce.clone(),
+            daemon_timestamp_ms: daemon_exchange.timestamp_ms,
+            daemon_packet_version: daemon_exchange
+                .packet_version
+                .unwrap_or(termd_proto::ProtocolVersion(0))
+                .0,
+            daemon_signature: daemon_exchange.signature.clone(),
+            device_id: device_exchange.device_id,
+            device_e2ee_public_key: device_exchange.public_key.clone(),
+            device_nonce: device_exchange.nonce.clone(),
+            device_timestamp_ms: device_exchange.timestamp_ms,
+            device_packet_version: device_exchange
+                .packet_version
+                .unwrap_or(termd_proto::ProtocolVersion(0))
+                .0,
+        }
+    }
+
+    pub fn digest_wire(&self) -> String {
+        let digest = Sha256::digest(self.to_bytes());
+        format!(
+            "sha256-v1:{}",
+            general_purpose::STANDARD.encode(digest.as_slice())
+        )
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"termd-e2ee-auth-transcript-v1\n");
+        append_canonical_field(&mut bytes, "server_id", &self.server_id.0.to_string());
+        append_canonical_field(
+            &mut bytes,
+            "daemon_public_key",
+            self.daemon_public_key.0.as_str(),
+        );
+        append_canonical_field(
+            &mut bytes,
+            "daemon_e2ee_public_key",
+            self.daemon_e2ee_public_key.0.as_str(),
+        );
+        append_canonical_field(&mut bytes, "daemon_nonce", self.daemon_nonce.0.as_str());
+        append_canonical_field(
+            &mut bytes,
+            "daemon_timestamp_ms",
+            &self.daemon_timestamp_ms.0.to_string(),
+        );
+        append_canonical_field(
+            &mut bytes,
+            "daemon_packet_version",
+            &self.daemon_packet_version.to_string(),
+        );
+        if let Some(signature) = &self.daemon_signature {
+            append_canonical_field(&mut bytes, "daemon_signature", signature.0.as_str());
+        }
+        append_canonical_field(&mut bytes, "device_id", &self.device_id.0.to_string());
+        append_canonical_field(
+            &mut bytes,
+            "device_e2ee_public_key",
+            self.device_e2ee_public_key.0.as_str(),
+        );
+        append_canonical_field(&mut bytes, "device_nonce", self.device_nonce.0.as_str());
+        append_canonical_field(
+            &mut bytes,
+            "device_timestamp_ms",
+            &self.device_timestamp_ms.0.to_string(),
+        );
+        append_canonical_field(
+            &mut bytes,
+            "device_packet_version",
+            &self.device_packet_version.to_string(),
+        );
         bytes
     }
 }
@@ -1075,6 +1260,25 @@ impl ChallengeResponseService {
         S: TrustedDeviceStore,
         V: SignatureVerifier,
     {
+        self.authenticate_with_transcript(payload, now_ms, trusted_store, verifier, None)
+    }
+
+    /// 校验 auth payload，并可选绑定当前 E2EE transcript。
+    ///
+    /// 这条路径是 0.2.0 新握手所用：relay 即使拿到 challenge，也不能把签名搬到另一条
+    /// E2EE 连接上，因为签名输入里会包含本次握手 transcript 的摘要。
+    pub fn authenticate_with_transcript<S, V>(
+        &mut self,
+        payload: AuthPayload,
+        now_ms: UnixTimestampMillis,
+        trusted_store: &mut S,
+        verifier: &V,
+        transcript: Option<&E2eeAuthTranscript>,
+    ) -> Result<AuthenticatedDevice, ChallengeAuthError>
+    where
+        S: TrustedDeviceStore,
+        V: SignatureVerifier,
+    {
         let device_public_key = trusted_store
             .require_trusted(&payload.device_id)
             .map_err(ChallengeAuthError::from)?
@@ -1094,8 +1298,12 @@ impl ChallengeResponseService {
             )
             .map_err(ChallengeAuthError::from)?;
 
-        let signing_input =
-            AuthSigningInput::from_payload(&payload, &self.daemon_identity).to_bytes();
+        let signing_input = AuthSigningInput::from_payload_with_e2ee_transcript(
+            &payload,
+            &self.daemon_identity,
+            transcript,
+        )
+        .to_bytes();
         verifier
             .verify(&device_public_key, &signing_input, &payload.signature)
             .map_err(ChallengeAuthError::from)?;
@@ -1202,6 +1410,15 @@ impl DaemonIdentity {
     /// 返回仅供 daemon 本地持久化使用的 private key wire 文本。
     pub(crate) fn private_key_for_persistence(&self) -> String {
         self.private_key.material.clone()
+    }
+
+    /// 使用 daemon static Ed25519 私钥签名规范化输入，并返回 wire signature。
+    ///
+    /// 该方法只用于 daemon 本地给公开握手材料背书；私钥仍不会进入任何协议 payload。
+    pub fn sign_to_wire(&self, signing_input: &[u8]) -> Result<Signature, DaemonIdentityError> {
+        let signing_key = decode_daemon_signing_key(&self.private_key.material)?;
+        let signature = signing_key.sign(signing_input);
+        Ok(Signature(daemon_wire_prefixed(&signature.to_bytes())))
     }
 
     /// 构造只含公开字段的 daemon identity，供 hello/pair_accept 等协议层使用。
@@ -1609,6 +1826,7 @@ fn append_canonical_field(bytes: &mut Vec<u8>, name: &str, value: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::{Signature as Ed25519Signature, Verifier, VerifyingKey};
 
     fn public_key(value: &str) -> PublicKey {
         PublicKey(value.to_owned())
@@ -1624,6 +1842,13 @@ mod tests {
 
     fn signature(value: &str) -> termd_proto::Signature {
         termd_proto::Signature(value.to_owned())
+    }
+
+    fn decode_test_wire_bytes(value: &str, expected_len: usize) -> Vec<u8> {
+        let encoded = value.strip_prefix(ED25519_WIRE_PREFIX).unwrap();
+        let bytes = general_purpose::STANDARD.decode(encoded).unwrap();
+        assert_eq!(bytes.len(), expected_len);
+        bytes
     }
 
     #[test]
@@ -2217,6 +2442,73 @@ mod tests {
         assert!(device_pos < challenge_pos);
         assert!(challenge_pos < nonce_pos);
         assert!(nonce_pos < timestamp_pos);
+    }
+
+    #[test]
+    fn daemon_identity_signs_e2ee_key_exchange_material() {
+        let identity = DaemonIdentity::generate();
+        let public_identity = identity.public_identity();
+        let payload = E2eeKeyExchangePayload::new(
+            public_identity.server_id,
+            DeviceId::default(),
+            public_key("x25519-v1:daemon-e2ee-public"),
+            nonce("daemon-e2ee-nonce"),
+            timestamp(1234),
+        );
+        let signing_input =
+            DaemonE2eeSigningInput::from_payload(&payload, &public_identity).to_bytes();
+        let signature = identity.sign_to_wire(&signing_input).unwrap();
+
+        let public_key_bytes = decode_test_wire_bytes(&public_identity.public_key.0, 32);
+        let signature_bytes = decode_test_wire_bytes(&signature.0, 64);
+        let verifying_key =
+            VerifyingKey::from_bytes(&public_key_bytes.try_into().unwrap()).unwrap();
+        let signature = Ed25519Signature::from_slice(&signature_bytes).unwrap();
+
+        verifying_key.verify(&signing_input, &signature).unwrap();
+    }
+
+    #[test]
+    fn auth_signing_input_can_bind_current_e2ee_transcript() {
+        let identity = DaemonIdentity::generate();
+        let daemon = identity.public_identity();
+        let server_exchange = E2eeKeyExchangePayload::new(
+            daemon.server_id,
+            DeviceId::default(),
+            public_key("x25519-v1:daemon-session-key"),
+            nonce("server-nonce"),
+            timestamp(1000),
+        )
+        .with_signature(signature("ed25519-v1:server-signature"));
+        let device_id = DeviceId::new();
+        let device_exchange = E2eeKeyExchangePayload::new(
+            daemon.server_id,
+            device_id,
+            public_key("x25519-v1:device-session-key"),
+            nonce("device-nonce"),
+            timestamp(1001),
+        );
+        let transcript =
+            E2eeAuthTranscript::from_key_exchanges(&server_exchange, &device_exchange, &daemon);
+        let payload = termd_proto::AuthPayload {
+            device_id,
+            challenge: termd_proto::Challenge("challenge-a".to_owned()),
+            nonce: nonce("auth-nonce"),
+            timestamp_ms: timestamp(1100),
+            signature: signature("sig"),
+        };
+
+        let unbound = AuthSigningInput::from_payload(&payload, &daemon).to_bytes();
+        let bound = AuthSigningInput::from_payload_with_e2ee_transcript(
+            &payload,
+            &daemon,
+            Some(&transcript),
+        )
+        .to_bytes();
+        let bound_text = String::from_utf8(bound.clone()).unwrap();
+
+        assert_ne!(unbound, bound);
+        assert!(bound_text.contains("e2ee_transcript_sha256:"));
     }
 
     #[test]

@@ -22,6 +22,8 @@ export function parsePairingQrPayload(raw: string): PairingQrPayload | undefined
       parsed.token.trim().length === 0 ||
       typeof parsed.server_id !== "string" ||
       !UUID_PATTERN.test(parsed.server_id) ||
+      typeof parsed.daemon_public_key !== "string" ||
+      !parsed.daemon_public_key.startsWith("ed25519-v1:") ||
       typeof parsed.expires_at_ms !== "number" ||
       (parsed.ws_url !== undefined &&
         (typeof parsed.ws_url !== "string" || !isSupportedWsUrl(parsed.ws_url)))
@@ -34,6 +36,7 @@ export function parsePairingQrPayload(raw: string): PairingQrPayload | undefined
       version: 1,
       token: parsed.token,
       server_id: parsed.server_id,
+      daemon_public_key: parsed.daemon_public_key,
       expires_at_ms: parsed.expires_at_ms,
     };
 

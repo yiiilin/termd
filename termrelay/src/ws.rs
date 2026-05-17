@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket};
 use base64::{Engine as _, engine::general_purpose};
@@ -12,12 +13,20 @@ use termd_proto::{
 };
 use thiserror::Error;
 use tokio::sync::mpsc;
+use tokio::time::{Instant, timeout};
 use tracing::{debug, warn};
 
-const CHANNEL_CAPACITY: usize = 256;
+const CHANNEL_CAPACITY: usize = 1024;
+// relay 只关闭当前 WebSocket transport；不会解释或终止 E2EE 内部的 daemon session。
+const ROUTE_PRELUDE_TIMEOUT: Duration = Duration::from_secs(2);
+const WEBSOCKET_SEND_DEADLINE: Duration = Duration::from_secs(2);
+const WEBSOCKET_PONG_DEADLINE: Duration = Duration::from_secs(2);
+const WEBSOCKET_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const WEBSOCKET_MAX_FRAME_SIZE: usize = 1024 * 1024;
+const WEBSOCKET_MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
 
 type ConnectionId = u64;
-type FrameSender = mpsc::Sender<OpaqueFrame>;
+type FrameSender = mpsc::Sender<RelayOutbound>;
 
 /// relay 只区分连接方向，不表达 operator 或任何终端业务状态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +49,12 @@ impl ConnectionRole {
 pub enum OpaqueFrame {
     Text(String),
     Binary(Vec<u8>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RelayOutbound {
+    Frame(OpaqueFrame),
+    Close,
 }
 
 impl fmt::Debug for OpaqueFrame {
@@ -175,6 +190,15 @@ struct RelayRoom {
     clients: HashMap<ConnectionId, ConnectionEndpoint>,
 }
 
+impl RelayRoom {
+    fn close_clients(&mut self) {
+        for (_, client) in self.clients.drain() {
+            // daemon mux 已不可用时，client 必须尽快收到 close，避免继续等待业务响应直到超时。
+            let _ = client.sender.try_send(RelayOutbound::Close);
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ConnectionEndpoint {
     id: ConnectionId,
@@ -226,6 +250,10 @@ enum RoutePreludeError {
     Receive(#[source] axum::Error),
     #[error("relay websocket send failed during route prelude: {0}")]
     Send(#[source] axum::Error),
+    #[error("relay route prelude pong timed out")]
+    PongTimeout,
+    #[error("route prelude frame exceeded transport limit: {0} bytes")]
+    TooLarge(usize),
     #[error("route prelude JSON is invalid: {0}")]
     InvalidJson(#[from] serde_json::Error),
     #[error("expected route_hello as first envelope, got {0:?}")]
@@ -293,15 +321,13 @@ impl RelayRegistry {
                     .is_some_and(|daemon| daemon.id == registration.id)
                 {
                     room.daemon_mux = None;
+                    room.close_clients();
                 }
             }
             ConnectionRole::Client => {
                 room.clients.remove(&registration.id);
                 if let Some(daemon_mux) = room.daemon_mux.as_ref() {
-                    let envelope = RelayMuxEnvelope::ClientDisconnected {
-                        client_id: RelayClientId(registration.id),
-                    };
-                    let _ = daemon_mux.sender.try_send(mux_envelope_frame(envelope));
+                    notify_daemon_mux_client_disconnected(daemon_mux, registration.id);
                 }
             }
         }
@@ -356,7 +382,10 @@ impl RelayRegistry {
             client_id: RelayClientId(registration.id),
             frame: frame.into(),
         };
-        match daemon_mux.sender.try_send(mux_envelope_frame(envelope)) {
+        match daemon_mux
+            .sender
+            .try_send(RelayOutbound::Frame(mux_envelope_frame(envelope)))
+        {
             Ok(()) => ForwardReport {
                 attempted: 1,
                 delivered: 1,
@@ -370,6 +399,7 @@ impl RelayRegistry {
                     "dropping offline relay daemon mux"
                 );
                 room.daemon_mux = None;
+                room.close_clients();
                 ForwardReport {
                     attempted: 1,
                     delivered: 0,
@@ -380,7 +410,7 @@ impl RelayRegistry {
     }
 
     fn forward_mux_to_client(&self, server_id: ServerId, frame: OpaqueFrame) -> ForwardReport {
-        let Ok(rooms) = self.rooms.lock() else {
+        let Ok(mut rooms) = self.rooms.lock() else {
             warn!("relay registry mutex poisoned during daemon mux forward");
             return ForwardReport {
                 attempted: 0,
@@ -389,7 +419,7 @@ impl RelayRegistry {
             };
         };
 
-        let Some(room) = rooms.get(&server_id) else {
+        let Some(room) = rooms.get_mut(&server_id) else {
             return ForwardReport {
                 attempted: 0,
                 delivered: 0,
@@ -428,6 +458,8 @@ impl RelayRegistry {
                 dropped: 1,
             };
         };
+        let target_client_id = client.id;
+        let target_sender = client.sender.clone();
         let frame = match opaque_frame_from_mux(frame) {
             Ok(frame) => frame,
             Err(error) => {
@@ -440,7 +472,7 @@ impl RelayRegistry {
             }
         };
 
-        match client.sender.try_send(frame) {
+        match target_sender.try_send(RelayOutbound::Frame(frame)) {
             Ok(()) => ForwardReport {
                 attempted: 1,
                 delivered: 1,
@@ -449,10 +481,14 @@ impl RelayRegistry {
             Err(error) => {
                 warn!(
                     server_id = %server_id.0,
-                    connection_id = client.id,
+                    connection_id = target_client_id,
                     %error,
                     "dropping slow relay mux client"
                 );
+                room.clients.remove(&client_id.0);
+                if let Some(daemon_mux) = room.daemon_mux.as_ref() {
+                    notify_daemon_mux_client_disconnected(daemon_mux, client_id.0);
+                }
                 ForwardReport {
                     attempted: 1,
                     delivered: 0,
@@ -463,12 +499,28 @@ impl RelayRegistry {
     }
 }
 
+fn notify_daemon_mux_client_disconnected(daemon_mux: &ConnectionEndpoint, client_id: ConnectionId) {
+    let envelope = RelayMuxEnvelope::ClientDisconnected {
+        client_id: RelayClientId(client_id),
+    };
+    let _ = daemon_mux
+        .sender
+        .try_send(RelayOutbound::Frame(mux_envelope_frame(envelope)));
+}
+
 pub async fn handle_socket(mut socket: WebSocket, state: RelayState) {
     // Only the first frame is public routing metadata; payload frames after this stay opaque.
-    let prelude = match read_route_prelude(&mut socket).await {
-        Ok(prelude) => prelude,
-        Err(error) => {
+    let prelude = match timeout(ROUTE_PRELUDE_TIMEOUT, read_route_prelude(&mut socket)).await {
+        Ok(Ok(prelude)) => prelude,
+        Ok(Err(error)) => {
             warn!(%error, "rejecting relay websocket before route registration");
+            return;
+        }
+        Err(_) => {
+            warn!(
+                timeout_ms = ROUTE_PRELUDE_TIMEOUT.as_millis(),
+                "relay route prelude timed out"
+            );
             return;
         }
     };
@@ -483,10 +535,28 @@ pub async fn handle_socket(mut socket: WebSocket, state: RelayState) {
         }
     };
 
-    if let Err(error) = send_route_ready(&mut socket, &prelude).await {
-        warn!(server_id = %server_id.0, ?role, %error, "relay websocket route_ready failed");
-        state.unregister(&registration);
-        return;
+    match timeout(
+        WEBSOCKET_SEND_DEADLINE,
+        send_route_ready(&mut socket, &prelude),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            warn!(server_id = %server_id.0, ?role, %error, "relay websocket route_ready failed");
+            state.unregister(&registration);
+            return;
+        }
+        Err(_) => {
+            warn!(
+                server_id = %server_id.0,
+                ?role,
+                timeout_ms = WEBSOCKET_SEND_DEADLINE.as_millis(),
+                "relay websocket route_ready timed out"
+            );
+            state.unregister(&registration);
+            return;
+        }
     }
 
     if role == ConnectionRole::Client {
@@ -501,9 +571,19 @@ pub async fn handle_socket(mut socket: WebSocket, state: RelayState) {
     );
 
     let (mut sender, mut receiver) = socket.split();
+    let mut idle_deadline = Instant::now() + WEBSOCKET_IDLE_TIMEOUT;
 
     loop {
         tokio::select! {
+            _ = tokio::time::sleep_until(idle_deadline) => {
+                warn!(
+                    server_id = %server_id.0,
+                    ?role,
+                    connection_id = registration.id,
+                    "relay websocket idle timeout"
+                );
+                break;
+            }
             inbound = receiver.next() => {
                 let Some(inbound) = inbound else {
                     break;
@@ -515,6 +595,7 @@ pub async fn handle_socket(mut socket: WebSocket, state: RelayState) {
                         break;
                     }
                 };
+                idle_deadline = Instant::now() + WEBSOCKET_IDLE_TIMEOUT;
 
                 if !handle_inbound_message(&state, &registration, &mut sender, inbound).await {
                     break;
@@ -525,18 +606,41 @@ pub async fn handle_socket(mut socket: WebSocket, state: RelayState) {
                     break;
                 };
 
-                let frame_kind = outbound.kind();
-                let frame_len = outbound.len();
-                if sender.send(outbound.into()).await.is_err() {
-                    warn!(
-                        server_id = %server_id.0,
-                        ?role,
-                        connection_id = registration.id,
-                        frame_kind,
-                        frame_len,
-                        "relay websocket send failed"
-                    );
-                    break;
+                match outbound {
+                    RelayOutbound::Frame(frame) => {
+                        let frame_kind = frame.kind();
+                        let frame_len = frame.len();
+                        if send_message_with_deadline(
+                            &mut sender,
+                            frame.into(),
+                            WEBSOCKET_SEND_DEADLINE,
+                            "relay websocket outbound frame",
+                        )
+                        .await
+                        .is_err()
+                        {
+                            warn!(
+                                server_id = %server_id.0,
+                                ?role,
+                                connection_id = registration.id,
+                                frame_kind,
+                                frame_len,
+                                "relay websocket send failed"
+                            );
+                            break;
+                        }
+                        idle_deadline = Instant::now() + WEBSOCKET_IDLE_TIMEOUT;
+                    }
+                    RelayOutbound::Close => {
+                        let _ = send_message_with_deadline(
+                            &mut sender,
+                            Message::Close(None),
+                            WEBSOCKET_SEND_DEADLINE,
+                            "relay websocket close",
+                        )
+                        .await;
+                        break;
+                    }
                 }
             }
         }
@@ -559,12 +663,20 @@ async fn read_route_prelude(socket: &mut WebSocket) -> Result<RoutePrelude, Rout
         let message = message.map_err(RoutePreludeError::Receive)?;
 
         match message {
-            Message::Text(raw) => return decode_route_prelude_from_str(&raw),
-            Message::Binary(raw) => return decode_route_prelude_from_slice(&raw),
-            Message::Ping(payload) => socket
-                .send(Message::Pong(payload))
-                .await
-                .map_err(RoutePreludeError::Send)?,
+            Message::Text(raw) => {
+                reject_oversized_frame(raw.len()).map_err(RoutePreludeError::TooLarge)?;
+                return decode_route_prelude_from_str(&raw);
+            }
+            Message::Binary(raw) => {
+                reject_oversized_frame(raw.len()).map_err(RoutePreludeError::TooLarge)?;
+                return decode_route_prelude_from_slice(&raw);
+            }
+            Message::Ping(payload) => {
+                timeout(WEBSOCKET_PONG_DEADLINE, socket.send(Message::Pong(payload)))
+                    .await
+                    .map_err(|_| RoutePreludeError::PongTimeout)?
+                    .map_err(RoutePreludeError::Send)?
+            }
             Message::Pong(_) => {}
             Message::Close(_) => return Err(RoutePreludeError::Closed),
         }
@@ -624,16 +736,72 @@ async fn handle_inbound_message(
 ) -> bool {
     match message {
         Message::Text(text) => {
+            if let Err(len) = reject_oversized_frame(text.len()) {
+                warn!(
+                    server_id = %registration.server_id.0,
+                    ?registration.role,
+                    connection_id = registration.id,
+                    frame_len = len,
+                    "dropping oversized relay text frame"
+                );
+                return false;
+            }
             forward_opaque(state, registration, OpaqueFrame::Text(text));
             true
         }
         Message::Binary(bytes) => {
+            if let Err(len) = reject_oversized_frame(bytes.len()) {
+                warn!(
+                    server_id = %registration.server_id.0,
+                    ?registration.role,
+                    connection_id = registration.id,
+                    frame_len = len,
+                    "dropping oversized relay binary frame"
+                );
+                return false;
+            }
             forward_opaque(state, registration, OpaqueFrame::Binary(bytes));
             true
         }
-        Message::Ping(payload) => sender.send(Message::Pong(payload)).await.is_ok(),
+        Message::Ping(payload) => send_message_with_deadline(
+            sender,
+            Message::Pong(payload),
+            WEBSOCKET_PONG_DEADLINE,
+            "relay websocket pong",
+        )
+        .await
+        .is_ok(),
         Message::Pong(_) => true,
         Message::Close(_) => false,
+    }
+}
+
+fn reject_oversized_frame(len: usize) -> Result<(), usize> {
+    // axum 的升级配置在 router 层；这里在 ws 层再做一次元数据大小闸门，避免继续转发超限 frame。
+    let max = WEBSOCKET_MAX_FRAME_SIZE.min(WEBSOCKET_MAX_MESSAGE_SIZE);
+    if len > max { Err(len) } else { Ok(()) }
+}
+
+async fn send_message_with_deadline(
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    message: Message,
+    deadline: Duration,
+    context: &'static str,
+) -> Result<(), ()> {
+    match timeout(deadline, sender.send(message)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => {
+            warn!(%error, context = context, "relay websocket send failed");
+            Err(())
+        }
+        Err(_) => {
+            warn!(
+                ?deadline,
+                context = context,
+                "relay websocket send timed out"
+            );
+            Err(())
+        }
     }
 }
 
@@ -669,7 +837,9 @@ fn notify_mux_client_connected(state: &RelayState, registration: &ConnectionRegi
     let envelope = RelayMuxEnvelope::ClientConnected {
         client_id: RelayClientId(registration.id),
     };
-    let _ = daemon_mux.sender.try_send(mux_envelope_frame(envelope));
+    let _ = daemon_mux
+        .sender
+        .try_send(RelayOutbound::Frame(mux_envelope_frame(envelope)));
 }
 
 fn mux_envelope_frame(envelope: RelayMuxEnvelope) -> OpaqueFrame {
@@ -680,14 +850,51 @@ fn mux_envelope_frame(envelope: RelayMuxEnvelope) -> OpaqueFrame {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::router::router;
     use tokio::sync::mpsc::error::TryRecvError;
+    use tokio::time::{Duration, timeout};
+    use tokio_tungstenite::connect_async;
+    use tokio_tungstenite::tungstenite::Message as ClientMessage;
 
     fn server_id(value: u128) -> ServerId {
         ServerId(uuid::Uuid::from_u128(value))
     }
 
-    fn channel() -> (FrameSender, mpsc::Receiver<OpaqueFrame>) {
+    fn channel() -> (FrameSender, mpsc::Receiver<RelayOutbound>) {
         mpsc::channel(CHANNEL_CAPACITY)
+    }
+
+    #[test]
+    fn relay_size_guard_rejects_oversized_frames() {
+        assert_eq!(WEBSOCKET_MAX_FRAME_SIZE, 1024 * 1024);
+        assert_eq!(WEBSOCKET_MAX_MESSAGE_SIZE, 4 * 1024 * 1024);
+        assert!(reject_oversized_frame(WEBSOCKET_MAX_FRAME_SIZE).is_ok());
+        assert_eq!(
+            reject_oversized_frame(WEBSOCKET_MAX_FRAME_SIZE + 1),
+            Err(WEBSOCKET_MAX_FRAME_SIZE + 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_route_prelude_times_out_before_registration() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router(RelayState::default(), false))
+                .await
+                .unwrap();
+        });
+
+        let (mut socket, _) = connect_async(format!("ws://{addr}/ws")).await.unwrap();
+        let next = timeout(Duration::from_secs(4), socket.next())
+            .await
+            .expect("relay should close a socket that never sends route_hello");
+        match next {
+            None | Some(Err(_)) | Some(Ok(ClientMessage::Close(_))) => {}
+            other => panic!("expected relay prelude timeout close, got {other:?}"),
+        }
+
+        server.abort();
     }
 
     #[test]
@@ -889,9 +1096,43 @@ mod tests {
         assert_eq!(report.delivered, 1);
         assert_eq!(
             client_a_rx.try_recv().unwrap(),
-            OpaqueFrame::Binary(vec![1, 2, 3, 4])
+            RelayOutbound::Frame(OpaqueFrame::Binary(vec![1, 2, 3, 4]))
         );
         assert_eq!(client_b_rx.try_recv().unwrap_err(), TryRecvError::Empty);
+    }
+
+    #[test]
+    fn slow_client_drop_notifies_daemon_mux() {
+        let state = RelayState::default();
+        let server_id = server_id(1);
+        let (mux_tx, mut mux_rx) = channel();
+        let (client_tx, _client_rx) = mpsc::channel(1);
+
+        client_tx
+            .try_send(RelayOutbound::Frame(OpaqueFrame::Text("queued".to_owned())))
+            .unwrap();
+        let mux = state
+            .register(server_id, ConnectionRole::DaemonMux, mux_tx)
+            .unwrap();
+        let client = state
+            .register(server_id, ConnectionRole::Client, client_tx)
+            .unwrap();
+
+        let response = mux_envelope_frame(RelayMuxEnvelope::DaemonFrame {
+            client_id: RelayClientId(client.id),
+            frame: RelayOpaqueFrame::Text {
+                data: "response".to_owned(),
+            },
+        });
+        let report = state.forward_from(&mux, response);
+
+        assert_eq!(report.dropped, 1);
+        assert_eq!(
+            decode_mux(mux_rx.try_recv().unwrap()),
+            RelayMuxEnvelope::ClientDisconnected {
+                client_id: RelayClientId(client.id)
+            }
+        );
     }
 
     #[test]
@@ -912,6 +1153,27 @@ mod tests {
         state.unregister(&daemon_mux_a);
 
         assert_eq!(state.room_count(), 1);
+    }
+
+    #[test]
+    fn daemon_mux_disconnect_closes_clients_for_same_server_id() {
+        let state = RelayState::default();
+        let server = server_id(1);
+        let (mux_tx, _mux_rx) = channel();
+        let (client_tx, mut client_rx) = channel();
+
+        let daemon_mux = state
+            .register(server, ConnectionRole::DaemonMux, mux_tx)
+            .unwrap();
+        state
+            .register(server, ConnectionRole::Client, client_tx)
+            .unwrap();
+
+        state.unregister(&daemon_mux);
+
+        assert_eq!(state.room_count(), 0);
+        // daemon mux 已经不可用时，client 不能继续挂在房间里等待一个永远不会来的响应。
+        assert_eq!(client_rx.try_recv().unwrap(), RelayOutbound::Close);
     }
 
     #[test]
@@ -936,8 +1198,8 @@ mod tests {
         assert!(!rendered.contains("relay-secret-1"));
     }
 
-    fn decode_mux(frame: OpaqueFrame) -> RelayMuxEnvelope {
-        let OpaqueFrame::Text(raw) = frame else {
+    fn decode_mux(outbound: RelayOutbound) -> RelayMuxEnvelope {
+        let RelayOutbound::Frame(OpaqueFrame::Text(raw)) = outbound else {
             panic!("expected mux text envelope");
         };
         serde_json::from_str(&raw).expect("mux envelope should decode")

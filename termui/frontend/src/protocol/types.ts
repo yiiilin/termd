@@ -54,6 +54,7 @@ export const ALL_MESSAGE_TYPES = [
   "control_grant",
   "e2ee_key_exchange",
   "encrypted_frame",
+  "packet",
   "error",
   "ping",
   "pong",
@@ -67,9 +68,42 @@ export type Nonce = string;
 export type Challenge = string;
 export type SignatureWire = string;
 export type UnixTimestampMillis = number;
+export type PacketRequestId = UUID;
+export type PacketStreamId = UUID;
 
 export interface Envelope<P = unknown> {
   type: MessageType;
+  payload: P;
+}
+
+export const PROTOCOL_PACKET_VERSION = 3;
+
+export type PacketKind =
+  | "request"
+  | "response"
+  | "event"
+  | "stream_open"
+  | "stream_chunk"
+  | "stream_end"
+  | "cancel"
+  | "flow"
+  | "error";
+
+export interface PacketErrorPayload {
+  code: string;
+  message: string;
+  retryable: boolean;
+}
+
+export interface ProtocolPacket<P = unknown> {
+  version: number;
+  kind: PacketKind;
+  id?: PacketRequestId;
+  stream_id?: PacketStreamId;
+  method?: string;
+  seq?: number;
+  ack?: number;
+  credit?: number;
   payload: P;
 }
 
@@ -102,6 +136,8 @@ export interface E2eeKeyExchangePayload {
   public_key: PublicKeyWire;
   nonce: Nonce;
   timestamp_ms: UnixTimestampMillis;
+  packet_version?: number | null;
+  signature?: SignatureWire | null;
 }
 
 export interface EncryptedFramePayload {
@@ -131,6 +167,7 @@ export interface PairingQrPayload {
   ws_url?: string;
   token: string;
   server_id: UUID;
+  daemon_public_key?: PublicKeyWire;
   expires_at_ms: UnixTimestampMillis;
 }
 
@@ -240,6 +277,7 @@ export interface SessionCreatedPayload {
 
 export interface SessionAttachPayload {
   session_id: UUID;
+  watch_updates?: boolean;
 }
 
 export interface SessionAttachedPayload {

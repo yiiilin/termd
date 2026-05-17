@@ -23,6 +23,10 @@ impl<P> Envelope<P> {
     }
 }
 
+fn default_true() -> bool {
+    true
+}
+
 /// 文档中列出的 MVP 必备消息类型。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -82,6 +86,7 @@ pub enum MessageType {
     ControlGrant,
     E2eeKeyExchange,
     EncryptedFrame,
+    Packet,
     Error,
     Ping,
     Pong,
@@ -244,6 +249,194 @@ pub struct PairingToken(pub String);
 #[serde(transparent)]
 pub struct UnixTimestampMillis(pub u64);
 
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
+}
+
+/// 0.2.0 的加密业务包版本；外层 WebSocket/relay 仍只承担 transport。
+pub const PROTOCOL_PACKET_VERSION: u16 = 3;
+
+/// 一次 request/response 交互的关联 id。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct PacketRequestId(pub Uuid);
+
+impl PacketRequestId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Default for PacketRequestId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// 流式交互的稳定 id；断线恢复和流控都围绕它表达。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct PacketStreamId(pub Uuid);
+
+impl PacketStreamId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Default for PacketStreamId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// 0.2.0 packet 的统一类型。请求、响应、事件、流和流控都用同一个外壳。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PacketKind {
+    Request,
+    Response,
+    Event,
+    StreamOpen,
+    StreamChunk,
+    StreamEnd,
+    Cancel,
+    Flow,
+    Error,
+}
+
+/// packet 级错误必须绑定 request id 或 stream id，避免客户端猜测错误归属。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PacketErrorPayload {
+    pub code: String,
+    pub message: String,
+    pub retryable: bool,
+}
+
+/// E2EE 内部承载的 0.2.0 业务 packet。
+///
+/// `id` 用于 unary request/response，`stream_id` 用于长流；`seq/ack/credit`
+/// 是流式顺序、确认和背压字段。relay 不应解密或解释这些字段。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProtocolPacket<P = serde_json::Value> {
+    pub version: u16,
+    pub kind: PacketKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<PacketRequestId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_id: Option<PacketStreamId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ack: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credit: Option<u32>,
+    pub payload: P,
+}
+
+impl<P> ProtocolPacket<P> {
+    fn new(kind: PacketKind, payload: P) -> Self {
+        Self {
+            version: PROTOCOL_PACKET_VERSION,
+            kind,
+            id: None,
+            stream_id: None,
+            method: None,
+            seq: 0,
+            ack: None,
+            credit: None,
+            payload,
+        }
+    }
+
+    pub fn request(id: PacketRequestId, method: impl Into<String>, payload: P) -> Self {
+        let mut packet = Self::new(PacketKind::Request, payload);
+        packet.id = Some(id);
+        packet.method = Some(method.into());
+        packet
+    }
+
+    pub fn response(id: PacketRequestId, method: impl Into<String>, payload: P) -> Self {
+        let mut packet = Self::new(PacketKind::Response, payload);
+        packet.id = Some(id);
+        packet.method = Some(method.into());
+        packet
+    }
+
+    pub fn event(method: impl Into<String>, payload: P) -> Self {
+        let mut packet = Self::new(PacketKind::Event, payload);
+        packet.method = Some(method.into());
+        packet
+    }
+
+    pub fn stream_open(
+        id: PacketRequestId,
+        stream_id: PacketStreamId,
+        method: impl Into<String>,
+        credit: u32,
+        payload: P,
+    ) -> Self {
+        let mut packet = Self::new(PacketKind::StreamOpen, payload);
+        packet.id = Some(id);
+        packet.stream_id = Some(stream_id);
+        packet.method = Some(method.into());
+        packet.credit = Some(credit);
+        packet
+    }
+
+    pub fn stream_chunk(stream_id: PacketStreamId, seq: u64, payload: P) -> Self {
+        let mut packet = Self::new(PacketKind::StreamChunk, payload);
+        packet.stream_id = Some(stream_id);
+        packet.seq = seq;
+        packet
+    }
+
+    pub fn stream_end(stream_id: PacketStreamId, seq: u64, payload: P) -> Self {
+        let mut packet = Self::new(PacketKind::StreamEnd, payload);
+        packet.stream_id = Some(stream_id);
+        packet.seq = seq;
+        packet
+    }
+
+    pub fn cancel_request(id: PacketRequestId, payload: P) -> Self {
+        let mut packet = Self::new(PacketKind::Cancel, payload);
+        packet.id = Some(id);
+        packet
+    }
+
+    pub fn cancel_stream(stream_id: PacketStreamId, payload: P) -> Self {
+        let mut packet = Self::new(PacketKind::Cancel, payload);
+        packet.stream_id = Some(stream_id);
+        packet
+    }
+}
+
+impl ProtocolPacket<PacketErrorPayload> {
+    pub fn request_error(id: PacketRequestId, payload: PacketErrorPayload) -> Self {
+        let mut packet = Self::new(PacketKind::Error, payload);
+        packet.id = Some(id);
+        packet
+    }
+
+    pub fn stream_error(stream_id: PacketStreamId, payload: PacketErrorPayload) -> Self {
+        let mut packet = Self::new(PacketKind::Error, payload);
+        packet.stream_id = Some(stream_id);
+        packet
+    }
+}
+
+impl ProtocolPacket<serde_json::Value> {
+    pub fn flow(stream_id: PacketStreamId, ack: u64, credit: u32) -> Self {
+        let mut packet = Self::new(PacketKind::Flow, serde_json::json!({}));
+        packet.stream_id = Some(stream_id);
+        packet.ack = Some(ack);
+        packet.credit = Some(credit);
+        packet
+    }
+}
+
 /// WebSocket 建立后的明文路由角色。
 ///
 /// 这里只表达连接方向：relay 据此把连接放进对应 server_id 的房间；daemon 直连只接受
@@ -334,6 +527,8 @@ pub struct PairingQrPayload {
     pub ws_url: Option<String>,
     pub token: PairingToken,
     pub server_id: ServerId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_public_key: Option<PublicKey>,
     pub expires_at_ms: UnixTimestampMillis,
 }
 
@@ -353,8 +548,14 @@ impl PairingQrPayload {
             ws_url: None,
             token,
             server_id,
+            daemon_public_key: None,
             expires_at_ms,
         }
+    }
+
+    pub fn with_daemon_public_key(mut self, daemon_public_key: PublicKey) -> Self {
+        self.daemon_public_key = Some(daemon_public_key);
+        self
     }
 
     pub fn is_supported_version(&self) -> bool {
@@ -385,6 +586,36 @@ impl PairingQrPayload {
     }
 }
 
+impl E2eeKeyExchangePayload {
+    pub fn new(
+        server_id: ServerId,
+        device_id: DeviceId,
+        public_key: PublicKey,
+        nonce: Nonce,
+        timestamp_ms: UnixTimestampMillis,
+    ) -> Self {
+        Self {
+            server_id,
+            device_id,
+            public_key,
+            nonce,
+            timestamp_ms,
+            packet_version: None,
+            signature: None,
+        }
+    }
+
+    pub fn with_signature(mut self, signature: Signature) -> Self {
+        self.signature = Some(signature);
+        self
+    }
+
+    pub fn with_packet_version(mut self, packet_version: ProtocolVersion) -> Self {
+        self.packet_version = Some(packet_version);
+        self
+    }
+}
+
 /// E2EE key exchange 只携带公开材料和防重放字段，不包含任何私钥。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct E2eeKeyExchangePayload {
@@ -393,6 +624,10 @@ pub struct E2eeKeyExchangePayload {
     pub public_key: PublicKey,
     pub nonce: Nonce,
     pub timestamp_ms: UnixTimestampMillis,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub packet_version: Option<ProtocolVersion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<Signature>,
 }
 
 /// 加密帧外层只暴露 relay 路由需要的信息，内部业务 envelope 必须整体放入密文。
@@ -598,6 +833,9 @@ pub struct SessionActivityPayload {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionAttachPayload {
     pub session_id: SessionId,
+    /// 是否订阅终端输出、文件树和 resize 推送；短连接 RPC 只需要权限时可以关闭。
+    #[serde(default = "default_true")]
+    pub watch_updates: bool,
 }
 
 /// Web 客户端在 shared-control 顶部状态条中展示的光标位置。
@@ -1041,6 +1279,7 @@ mod tests {
             (MessageType::ControlGrant, "control_grant"),
             (MessageType::E2eeKeyExchange, "e2ee_key_exchange"),
             (MessageType::EncryptedFrame, "encrypted_frame"),
+            (MessageType::Packet, "packet"),
             (MessageType::Error, "error"),
             (MessageType::Ping, "ping"),
             (MessageType::Pong, "pong"),
@@ -1249,7 +1488,10 @@ mod tests {
             size,
             resize_owner: true,
         });
-        assert_roundtrip(SessionAttachPayload { session_id });
+        assert_roundtrip(SessionAttachPayload {
+            session_id,
+            watch_updates: true,
+        });
         assert_roundtrip(SessionAttachedPayload {
             session_id,
             role: AttachRole::Operator,
@@ -1527,10 +1769,20 @@ mod tests {
             MessageType::SessionAttach,
             SessionAttachPayload {
                 session_id: SessionId::new(),
+                watch_updates: true,
             },
         );
 
         assert_roundtrip(envelope);
+    }
+
+    #[test]
+    fn session_attach_defaults_to_watching_updates_for_old_clients() {
+        let session_id = SessionId::new();
+        let payload: SessionAttachPayload =
+            serde_json::from_value(serde_json::json!({ "session_id": session_id })).unwrap();
+
+        assert!(payload.watch_updates);
     }
 
     #[test]
@@ -1581,15 +1833,13 @@ mod tests {
         let device_id = DeviceId::new();
         let key_exchange = Envelope::new(
             MessageType::E2eeKeyExchange,
-            E2eeKeyExchangePayload {
+            E2eeKeyExchangePayload::new(
                 server_id,
                 device_id,
-                public_key: PublicKey(
-                    "x25519-v1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
-                ),
-                nonce: Nonce("key-exchange-nonce".to_owned()),
-                timestamp_ms: UnixTimestampMillis(1_710_000_000_005),
-            },
+                PublicKey("x25519-v1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned()),
+                Nonce("key-exchange-nonce".to_owned()),
+                UnixTimestampMillis(1_710_000_000_005),
+            ),
         );
         let encrypted_frame = Envelope::new(
             MessageType::EncryptedFrame,
@@ -1656,6 +1906,90 @@ mod tests {
         assert!(json.get("device_id").is_none());
         assert!(json.get("session_id").is_none());
         assert!(json.get("controller").is_none());
+    }
+
+    #[test]
+    fn protocol_packet_request_response_and_stream_shapes_are_stable() {
+        let request_id = PacketRequestId::new();
+        let stream_id = PacketStreamId::new();
+
+        let request = ProtocolPacket::request(
+            request_id,
+            "session.list",
+            serde_json::json!({"include_closed": false}),
+        );
+        let request_json = serde_json::to_value(&request).unwrap();
+        assert_eq!(request_json.get("version"), Some(&serde_json::json!(3)));
+        assert_eq!(
+            request_json.get("kind"),
+            Some(&serde_json::json!("request"))
+        );
+        assert_eq!(request_json.get("id"), Some(&serde_json::json!(request_id)));
+        assert_eq!(
+            request_json.get("method"),
+            Some(&serde_json::json!("session.list"))
+        );
+        assert!(request_json.get("stream_id").is_none());
+
+        let response = ProtocolPacket::response(
+            request_id,
+            "session.list",
+            serde_json::json!({"sessions": []}),
+        );
+        let response_json = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            response_json.get("kind"),
+            Some(&serde_json::json!("response"))
+        );
+        assert_eq!(
+            response_json.get("id"),
+            Some(&serde_json::json!(request_id))
+        );
+
+        let chunk =
+            ProtocolPacket::stream_chunk(stream_id, 7, serde_json::json!({"data_base64": "YWJj"}));
+        let chunk_json = serde_json::to_value(&chunk).unwrap();
+        assert_eq!(
+            chunk_json.get("kind"),
+            Some(&serde_json::json!("stream_chunk"))
+        );
+        assert_eq!(
+            chunk_json.get("stream_id"),
+            Some(&serde_json::json!(stream_id))
+        );
+        assert_eq!(chunk_json.get("seq"), Some(&serde_json::json!(7)));
+        assert!(chunk_json.get("id").is_none());
+
+        let flow = ProtocolPacket::flow(stream_id, 7, 64);
+        let flow_json = serde_json::to_value(&flow).unwrap();
+        assert_eq!(flow_json.get("kind"), Some(&serde_json::json!("flow")));
+        assert_eq!(flow_json.get("ack"), Some(&serde_json::json!(7)));
+        assert_eq!(flow_json.get("credit"), Some(&serde_json::json!(64)));
+    }
+
+    #[test]
+    fn protocol_packet_error_is_bound_to_request_or_stream() {
+        let request_id = PacketRequestId::new();
+        let packet = ProtocolPacket::request_error(
+            request_id,
+            PacketErrorPayload {
+                code: "timeout".to_owned(),
+                message: "operation timed out".to_owned(),
+                retryable: true,
+            },
+        );
+
+        let json = serde_json::to_value(&packet).unwrap();
+        assert_eq!(json.get("version"), Some(&serde_json::json!(3)));
+        assert_eq!(json.get("kind"), Some(&serde_json::json!("error")));
+        assert_eq!(json.get("id"), Some(&serde_json::json!(request_id)));
+        assert!(json.get("stream_id").is_none());
+
+        let decoded: ProtocolPacket<PacketErrorPayload> = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded.kind, PacketKind::Error);
+        assert_eq!(decoded.id, Some(request_id));
+        assert_eq!(decoded.payload.code, "timeout");
+        assert!(decoded.payload.retryable);
     }
 
     fn assert_roundtrip<T>(value: T)

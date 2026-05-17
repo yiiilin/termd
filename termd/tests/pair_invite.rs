@@ -32,7 +32,7 @@ fn pair_qr_prints_single_line_invite_code() {
             String::from_utf8_lossy(&request).starts_with("POST /local/pairing-token HTTP/1.1")
         );
 
-        let body = "{\"token\":\"pair-token\",\"expires_at_ms\":1710000060000,\"server_id\":\"00000000-0000-0000-0000-000000000001\"}";
+        let body = "{\"token\":\"pair-token\",\"expires_at_ms\":1710000060000,\"server_id\":\"00000000-0000-0000-0000-000000000001\",\"daemon_public_key\":\"ed25519-v1:daemon-public\"}";
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}"
         );
@@ -96,7 +96,7 @@ fn pair_qr_svg_writes_real_svg_and_prints_invite_code() {
             String::from_utf8_lossy(&request).starts_with("POST /local/pairing-token HTTP/1.1")
         );
 
-        let body = "{\"token\":\"pair-token\",\"expires_at_ms\":1710000060000,\"server_id\":\"00000000-0000-0000-0000-000000000001\"}";
+        let body = "{\"token\":\"pair-token\",\"expires_at_ms\":1710000060000,\"server_id\":\"00000000-0000-0000-0000-000000000001\",\"daemon_public_key\":\"ed25519-v1:daemon-public\"}";
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}"
         );
@@ -143,7 +143,7 @@ fn pair_qr_svg_writes_real_svg_and_prints_invite_code() {
 
 #[test]
 fn invite_code_roundtrips_with_url_safe_base64() {
-    let json = r#"{"type":"termd_pairing_qr","version":1,"token":"pair-token","server_id":"00000000-0000-0000-0000-000000000001","expires_at_ms":1710000060000}"#;
+    let json = r#"{"type":"termd_pairing_qr","version":1,"token":"pair-token","server_id":"00000000-0000-0000-0000-000000000001","expires_at_ms":1710000060000,"daemon_public_key":"ed25519-v1:daemon-public"}"#;
     let invite = format!("termd-pair:v1:{}", URL_SAFE_NO_PAD.encode(json));
 
     let decoded = URL_SAFE_NO_PAD

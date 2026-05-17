@@ -79,6 +79,7 @@ const MIN_FILES_PANEL_WIDTH = 240;
 const MAX_FILES_PANEL_WIDTH = 640;
 const CONNECTION_AUTO_RETRY_DELAY_MS = 1000;
 const CONNECTION_AUTO_RETRY_LIMIT = 3;
+const ATTACH_RECONNECT_DELAYS_MS = [250, 1000, 2500, 5000];
 const FILES_CWD_FOLLOW_POLL_INTERVAL_MS = 1000;
 const TEXT_FILE_EDITOR_MAX_BYTES = 1024 * 1024;
 const FILE_TRANSFER_MEMORY_FALLBACK_MAX_BYTES = 16 * 1024 * 1024;
@@ -92,6 +93,19 @@ const CPU_BAR_CHART_HEIGHT = 18;
 const CPU_BAR_CHART_COUNT = 18;
 const DAEMON_STATUS_POLL_INTERVAL_MS = 1000;
 type AppSurface = "admin" | "workspace";
+
+const RETRYABLE_CONNECTION_ERROR_CODES = new Set([
+  "connection_closed",
+  "connection_error",
+  "connect_timeout",
+  "route_prelude_timeout",
+  "handshake_timeout",
+  "response_timeout",
+]);
+
+function isRetryableConnectionError(caught: unknown): boolean {
+  return RETRYABLE_CONNECTION_ERROR_CODES.has(toSafeError(caught).code);
+}
 
 export interface DaemonNetworkCounterSample {
   rxBytes: number;
@@ -120,6 +134,7 @@ export default function App() {
   const [daemonStatus, setDaemonStatus] = useState<DaemonStatusResultPayload | undefined>();
   const [daemonCpuHistory, setDaemonCpuHistory] = useState<number[]>([]);
   const [daemonNetworkRate, setDaemonNetworkRate] = useState<DaemonNetworkRate | undefined>();
+  const [daemonNetworkLatencyMs, setDaemonNetworkLatencyMs] = useState<number | undefined>();
   const [daemonStatusLoading, setDaemonStatusLoading] = useState(false);
   const [daemonStatusError, setDaemonStatusError] = useState<SafeError | undefined>();
   const [selectedSessionId, setSelectedSessionId] = useState<UUID | undefined>();
@@ -199,6 +214,11 @@ export default function App() {
   const connectionAutoRetryTimerRef = useRef<number | undefined>(undefined);
   const connectionAutoRetryKeyRef = useRef<string | undefined>(undefined);
   const connectionAutoRetryAttemptsRef = useRef(0);
+  const attachReconnectTimerRef = useRef<number | undefined>(undefined);
+  const attachReconnectKeyRef = useRef<string | undefined>(undefined);
+  const attachReconnectAttemptsRef = useRef(0);
+  const attachReconnectLastErrorRef = useRef<unknown>(undefined);
+  const attachReconnectHandlerRef = useRef<(client: DirectClient, caught: unknown) => boolean>(() => false);
   const daemonNetworkSampleRef = useRef<DaemonNetworkCounterSample | undefined>(undefined);
   const lastNotificationAtRef = useRef(0);
   const isMobileLayout = useMobileLayout();
@@ -239,6 +259,10 @@ export default function App() {
       if (connectionAutoRetryTimerRef.current !== undefined) {
         window.clearTimeout(connectionAutoRetryTimerRef.current);
         connectionAutoRetryTimerRef.current = undefined;
+      }
+      if (attachReconnectTimerRef.current !== undefined) {
+        window.clearTimeout(attachReconnectTimerRef.current);
+        attachReconnectTimerRef.current = undefined;
       }
     };
   }, []);
@@ -309,6 +333,10 @@ export default function App() {
   }, []);
 
   const activeServer = useMemo<PairedServerState | undefined>(() => defaultServer(state), [state]);
+  const activeServerIdRef = useRef<UUID | undefined>(activeServer?.server_id);
+  useEffect(() => {
+    activeServerIdRef.current = activeServer?.server_id;
+  }, [activeServer?.server_id]);
   const hasPairedServer = Boolean(activeServer && state.device);
   const showConnectionStatus = hasPairedServer && !error && status !== "pairing";
   // session 列表刷新只是旁路请求，不能把正在显示的 xterm 卸载成 disconnected。
@@ -440,6 +468,34 @@ export default function App() {
     setTerminalOutputResetVersion(terminalOutputResetVersionRef.current);
   }, []);
 
+  const resetAttachReconnectState = useCallback(() => {
+    if (attachReconnectTimerRef.current !== undefined) {
+      window.clearTimeout(attachReconnectTimerRef.current);
+      attachReconnectTimerRef.current = undefined;
+    }
+    attachReconnectKeyRef.current = undefined;
+    attachReconnectAttemptsRef.current = 0;
+    attachReconnectLastErrorRef.current = undefined;
+  }, []);
+
+  const closeAttachForReconnect = useCallback((client?: DirectClient) => {
+    receiveLoopActiveRef.current = false;
+    if (!client || attachClientRef.current === client) {
+      attachClientRef.current?.close();
+      attachClientRef.current = undefined;
+    } else {
+      client.close();
+    }
+    pendingResizeKeyRef.current = undefined;
+    updateTerminalResizeOwner(false);
+    lastCursorReportRef.current = "";
+    lastCursorFocusedRef.current = undefined;
+    if (cursorRefreshTimerRef.current !== undefined) {
+      window.clearTimeout(cursorRefreshTimerRef.current);
+      cursorRefreshTimerRef.current = undefined;
+    }
+  }, [updateTerminalResizeOwner]);
+
   const flushTerminalOutput = useCallback(() => {
     terminalOutputFlushFrameRef.current = undefined;
     // 这一帧里累积的 session_data 直接交给 xterm drain，避免每帧输出都触发 React 重渲染。
@@ -478,6 +534,7 @@ export default function App() {
   }, []);
 
   const disconnectAttach = useCallback(() => {
+    resetAttachReconnectState();
     receiveLoopActiveRef.current = false;
     attachClientRef.current?.close();
     attachClientRef.current = undefined;
@@ -496,7 +553,7 @@ export default function App() {
     clearSessionFiles();
     setMobilePanel(undefined);
     setMobileMenuOpen(false);
-  }, [clearSessionFiles, clearTerminalOutput, updateTerminalResizeOwner]);
+  }, [clearSessionFiles, clearTerminalOutput, resetAttachReconnectState, updateTerminalResizeOwner]);
 
   const handleDisconnectAttach = useCallback(() => {
     // 用户主动断开时不要被“默认打开第一个 session”的自动流程立即重新 attach。
@@ -536,6 +593,7 @@ export default function App() {
     setDaemonStatus(undefined);
     setDaemonCpuHistory([]);
     setDaemonNetworkRate(undefined);
+    setDaemonNetworkLatencyMs(undefined);
     daemonNetworkSampleRef.current = undefined;
     setDaemonStatusError(undefined);
     setSelectedSessionId(undefined);
@@ -629,10 +687,22 @@ export default function App() {
           "pairing requires a known daemon server id",
         );
       }
+      const daemonPublicKey = payload?.daemon_public_key ?? activeServer?.daemon_public_key;
+      if (!daemonPublicKey) {
+        throw new ProtocolClientError(
+          "pairing_server_unknown",
+          "pairing requires a known daemon public key",
+        );
+      }
       const rawCandidateUrl = payload?.ws_url ?? (url.trim() || activeServer?.url || defaultWsUrlFromPage());
       const candidateUrls = pairingWsUrlCandidates(rawCandidateUrl, routeServerId);
       const token = payload?.token ?? pairingInput.trim();
-      const { client, effectiveUrl } = await connectPairingClient(candidateUrls, routeServerId, device.device_id);
+      const { client, effectiveUrl } = await connectPairingClient(
+        candidateUrls,
+        routeServerId,
+        device.device_id,
+        daemonPublicKey,
+      );
       const accepted = await client.pair(token, device.device_public_key);
       client.close();
       const nextState = await recordPairing(accepted, effectiveUrl);
@@ -651,6 +721,7 @@ export default function App() {
       setDaemonStatus(undefined);
       setDaemonCpuHistory([]);
       setDaemonNetworkRate(undefined);
+      setDaemonNetworkLatencyMs(undefined);
       daemonNetworkSampleRef.current = undefined;
       setDaemonStatusError(undefined);
       setSelectedSessionId(undefined);
@@ -706,7 +777,9 @@ export default function App() {
     setStatus("saving_url");
     let client: DirectClient | undefined;
     try {
-      client = await DirectClient.connect(effectiveUrl, server.server_id, device.device_id);
+      client = await DirectClient.connect(effectiveUrl, server.server_id, device.device_id, {
+        expectedDaemonPublicKey: server.daemon_public_key,
+      });
       await client.authenticate(device, { ...server, url: effectiveUrl });
       client.close();
       client = undefined;
@@ -725,6 +798,7 @@ export default function App() {
       setDaemonStatus(undefined);
       setDaemonCpuHistory([]);
       setDaemonNetworkRate(undefined);
+      setDaemonNetworkLatencyMs(undefined);
       daemonNetworkSampleRef.current = undefined;
       setDaemonStatusError(undefined);
       setSelectedSessionId(undefined);
@@ -766,6 +840,7 @@ export default function App() {
       setDaemonStatus(undefined);
       setDaemonCpuHistory([]);
       setDaemonNetworkRate(undefined);
+      setDaemonNetworkLatencyMs(undefined);
       daemonNetworkSampleRef.current = undefined;
       setDaemonStatusError(undefined);
       setSelectedSessionId(undefined);
@@ -795,7 +870,9 @@ export default function App() {
     }
     const reachableUrl = browserReachableWsUrl(server.url);
     const routeUrl = routeWsUrlForKnownServer(reachableUrl, server.server_id) ?? reachableUrl;
-    const client = await DirectClient.connect(routeUrl, server.server_id, device.device_id);
+    const client = await DirectClient.connect(routeUrl, server.server_id, device.device_id, {
+      expectedDaemonPublicKey: server.daemon_public_key,
+    });
     await client.authenticate(device, { ...server, url: routeUrl });
     return client;
   }, [activeServer, state.device]);
@@ -806,7 +883,7 @@ export default function App() {
       try {
         // daemon 对文件、重命名等 session 级操作要求当前连接已 attach。
         // 这些旁路连接只短暂 attach，避免和 xterm 主连接的 receive loop 抢同一个 socket。
-        await client.attachSession(sessionId);
+        await client.attachSession(sessionId, { watchUpdates: false });
         return client;
       } catch (caught) {
         client.close();
@@ -907,6 +984,7 @@ export default function App() {
   );
 
   const handleRefresh = useCallback(async () => {
+    const requestServerId = activeServer?.server_id;
     setError(undefined);
     setStatus("listing");
     const requestOrderGeneration = sessionOrderGenerationRef.current;
@@ -915,6 +993,9 @@ export default function App() {
       const list = await client.listSessions();
       const clients = await client.listDaemonClients();
       client.close();
+      if (activeServerIdRef.current !== requestServerId) {
+        return;
+      }
       const canApplyDaemonOrder =
         !pendingSessionReorderRef.current &&
         requestOrderGeneration === sessionOrderGenerationRef.current;
@@ -945,19 +1026,26 @@ export default function App() {
       }
       setStatus("ready");
     } catch (caught) {
+      if (activeServerIdRef.current !== requestServerId) {
+        return;
+      }
       setActiveSurface("admin");
       setSafeError(caught);
     }
-  }, [authenticatedClient, clearSessionFiles, setSafeError]);
+  }, [activeServer?.server_id, authenticatedClient, clearSessionFiles, setSafeError]);
 
   const refreshDaemonClients = useCallback(
     async () => {
+      const requestServerId = activeServer?.server_id;
       const requestOrderGeneration = sessionOrderGenerationRef.current;
       try {
         const client = await authenticatedClient();
         try {
           const sessionList = await client.listSessions();
           const clientList = await client.listDaemonClients();
+          if (activeServerIdRef.current !== requestServerId) {
+            return;
+          }
           const canApplyDaemonOrder =
             !pendingSessionReorderRef.current &&
             requestOrderGeneration === sessionOrderGenerationRef.current;
@@ -980,10 +1068,12 @@ export default function App() {
           client.close();
         }
       } catch (caught) {
-        setSafeError(caught);
+        // 后台 client/session 刷新失败不能把正在使用的 xterm 切到错误态；
+        // 主 attach 连接有自己的重连路径，手动 Refresh 仍会显示错误。
+        void caught;
       }
     },
-    [authenticatedClient, setSafeError],
+    [activeServer?.server_id, authenticatedClient],
   );
 
   const loadDaemonStatus = useCallback(async () => {
@@ -993,14 +1083,17 @@ export default function App() {
     try {
       client = await authenticatedClient();
       const status = await client.getDaemonStatus();
+      const latencyMs = await client.measureLatency().catch(() => undefined);
       const nextNetworkSample = networkCounterSampleFromStatus(status, Date.now());
       setDaemonNetworkRate(networkRateFromSamples(daemonNetworkSampleRef.current, nextNetworkSample));
       daemonNetworkSampleRef.current = nextNetworkSample;
+      setDaemonNetworkLatencyMs(latencyMs);
       setDaemonStatus(status);
       // CPU 柱状图只做当前页面内缓存，避免把瞬时监控数据写入浏览器持久状态。
       setDaemonCpuHistory((current) => appendCpuSample(current, status.cpu_percent));
     } catch (caught) {
       setDaemonStatusError(toSafeError(caught));
+      setDaemonNetworkLatencyMs(undefined);
     } finally {
       client?.close();
       setDaemonStatusLoading(false);
@@ -1100,6 +1193,9 @@ export default function App() {
         } catch (caught) {
           // 旧 attach 关闭可能晚于新 attach 启动；只有当前 client 的错误才能切到错误态。
           if (receiveLoopActiveRef.current && attachClientRef.current === client) {
+            if (attachReconnectHandlerRef.current(client, caught)) {
+              return;
+            }
             setSafeError(caught);
           }
           return;
@@ -1108,6 +1204,101 @@ export default function App() {
     };
     void read();
   }, [enqueueTerminalOutput, markNewOutputIfBackground, setSafeError, updateTerminalResizeOwner]);
+
+  const scheduleAttachReconnect = useCallback((staleClient: DirectClient, caught: unknown) => {
+    const sessionId = attachedSessionRef.current ?? attachedSessionId ?? selectedSessionId;
+    if (!sessionId || userDetachedRef.current || !isRetryableConnectionError(caught)) {
+      return false;
+    }
+
+    const reconnectKey = `${activeServer?.server_id ?? "unknown"}:${sessionId}`;
+    if (attachReconnectKeyRef.current !== reconnectKey) {
+      attachReconnectKeyRef.current = reconnectKey;
+      attachReconnectAttemptsRef.current = 0;
+      attachReconnectLastErrorRef.current = caught;
+    } else {
+      attachReconnectLastErrorRef.current = caught;
+    }
+
+    closeAttachForReconnect(staleClient);
+    setError(undefined);
+
+    if (attachReconnectTimerRef.current !== undefined) {
+      return true;
+    }
+
+    if (attachReconnectAttemptsRef.current >= ATTACH_RECONNECT_DELAYS_MS.length) {
+      const finalError = attachReconnectLastErrorRef.current ?? caught;
+      resetAttachReconnectState();
+      setSafeError(finalError);
+      return true;
+    }
+
+    const delayMs = ATTACH_RECONNECT_DELAYS_MS[attachReconnectAttemptsRef.current] ?? ATTACH_RECONNECT_DELAYS_MS.at(-1)!;
+    attachReconnectAttemptsRef.current += 1;
+    setStatus("attaching");
+    attachReconnectTimerRef.current = window.setTimeout(() => {
+      attachReconnectTimerRef.current = undefined;
+      void (async () => {
+        let client: DirectClient | undefined;
+        try {
+          client = await authenticatedClient();
+          const attached = await client.attachSession(sessionId);
+          if (userDetachedRef.current) {
+            resetAttachReconnectState();
+            client.close();
+            return;
+          }
+          if (attachReconnectKeyRef.current !== reconnectKey) {
+            client.close();
+            return;
+          }
+
+          const attachedClient = client;
+          client = undefined;
+          resetAttachReconnectState();
+          attachClientRef.current = attachedClient;
+          attachedSessionRef.current = sessionId;
+          confirmedSessionSizesRef.current.set(attached.session_id, attached.size);
+          setSelectedSessionId(sessionId);
+          setAttachedSessionId(sessionId);
+          setSessions((current) => upsertAttachedSession(current, attached, sessionOrderRef.current));
+          clearNewOutputMark(sessionId);
+          setStatus("attached");
+          startReceiveLoop(attachedClient);
+          updateTerminalResizeOwner(Boolean(attached.resize_owner));
+          void loadSessionFiles(sessionId, undefined, { silent: true });
+          void loadSessionGit(sessionId, { silent: true });
+          void refreshDaemonClients();
+        } catch (retryError) {
+          client?.close();
+          attachReconnectLastErrorRef.current = retryError;
+          if (!attachReconnectHandlerRef.current(staleClient, retryError)) {
+            resetAttachReconnectState();
+            setSafeError(retryError);
+          }
+        }
+      })();
+    }, delayMs);
+
+    return true;
+  }, [
+    activeServer?.server_id,
+    attachedSessionId,
+    authenticatedClient,
+    clearNewOutputMark,
+    closeAttachForReconnect,
+    loadSessionFiles,
+    loadSessionGit,
+    refreshDaemonClients,
+    resetAttachReconnectState,
+    selectedSessionId,
+    setSafeError,
+    startReceiveLoop,
+    updateTerminalResizeOwner,
+  ]);
+
+  attachReconnectHandlerRef.current = scheduleAttachReconnect;
 
   const handleAttach = useCallback(
     async (sessionId: UUID) => {
@@ -1214,12 +1405,13 @@ export default function App() {
     setConnectionEditorOpen(false);
     setMobilePanel(undefined);
     setMobileMenuOpen(false);
-    if (status === "error" || status === "idle") {
-      // 从后台重新进入工作台时允许对当前 daemon 再做一次连通性探测。
+    if (status === "error" || status === "idle" || sessions.length === 0) {
+      // 从后台重新进入工作台时允许对当前 daemon 再做一次连通性探测；
+      // daemon 切换中的旧刷新结果可能把 session 列表临时置空，打开工作台时要重新确认。
       autoCheckedServerRef.current = undefined;
       setStatus("idle");
     }
-  }, [activeServer, state.device, status]);
+  }, [activeServer, sessions.length, state.device, status]);
 
   useEffect(() => {
     const sessionId = selectedSessionId;
@@ -1517,6 +1709,9 @@ export default function App() {
       try {
         await client.sendSessionData(sessionId, new TextEncoder().encode(data));
       } catch (caught) {
+        if (isRetryableConnectionError(caught) && attachReconnectHandlerRef.current(client, caught)) {
+          return;
+        }
         if (!isIgnoredClosingSessionNotFound(sessionId, caught)) {
           setSafeError(caught);
         }
@@ -1549,6 +1744,9 @@ export default function App() {
       // 这里仅向 daemon 请求 resize，不乐观改本地 session size，也不等待这个调用读取回执。
       // attach receive loop 收到 session_resized 后才会更新 state，避免和终端输出读取循环抢 socket。
       void client.requestSessionResize(sessionId, size).catch((caught) => {
+        if (isRetryableConnectionError(caught) && attachReconnectHandlerRef.current(client, caught)) {
+          return;
+        }
         if (pendingResizeKeyRef.current === nextResizeKey) {
           pendingResizeKeyRef.current = undefined;
         }
@@ -1575,6 +1773,9 @@ export default function App() {
       const focusChanged = lastCursorFocusedRef.current !== presence.focused;
       lastCursorFocusedRef.current = presence.focused;
       void client.sendSessionCursor(sessionId, presence).catch((caught) => {
+        if (isRetryableConnectionError(caught) && attachReconnectHandlerRef.current(client, caught)) {
+          return;
+        }
         if (!isIgnoredClosingSessionNotFound(sessionId, caught)) {
           setSafeError(caught);
         }
@@ -2528,6 +2729,7 @@ export default function App() {
           status={daemonStatus}
           cpuHistory={daemonCpuHistory}
           networkRate={daemonNetworkRate}
+          latencyMs={daemonNetworkLatencyMs}
           loading={daemonStatusLoading}
           error={daemonStatusError}
           compact={isMobileLayout}
@@ -2617,6 +2819,7 @@ function DaemonStatusPanel(props: {
   status?: DaemonStatusResultPayload;
   cpuHistory: number[];
   networkRate?: DaemonNetworkRate;
+  latencyMs?: number;
   loading: boolean;
   error?: SafeError;
   compact?: boolean;
@@ -2633,7 +2836,7 @@ function DaemonStatusPanel(props: {
       : `${formatBytesCompact(usedBytes(props.status.disk_total_bytes, props.status.disk_available_bytes))} / ${formatBytesCompact(props.status.disk_total_bytes)}`
     : "-";
   const cpuValue = props.status ? `${props.status.cpu_percent.toFixed(1)}%` : props.loading ? "..." : "-";
-  const networkValue = props.networkRate ? formatNetworkRate(props.networkRate, Boolean(props.compact)) : "-";
+  const networkValue = formatNetworkMetric(props.networkRate, props.latencyMs, Boolean(props.compact));
 
   return (
     <footer
@@ -2900,6 +3103,7 @@ export async function connectPairingClient(
   candidateUrls: string[],
   routeServerId: UUID,
   deviceId: UUID,
+  daemonPublicKey: string,
 ): Promise<{ client: DirectClient; effectiveUrl: string }> {
   if (!routeServerId) {
     throw new ProtocolClientError("pairing_server_unknown", "pairing requires a known daemon server id");
@@ -2907,7 +3111,9 @@ export async function connectPairingClient(
   let lastError: unknown;
   for (const candidateUrl of candidateUrls) {
     try {
-      const client = await DirectClient.connect(candidateUrl, routeServerId, deviceId);
+      const client = await DirectClient.connect(candidateUrl, routeServerId, deviceId, {
+        expectedDaemonPublicKey: daemonPublicKey,
+      });
       if (client.serverId !== routeServerId) {
         client.close();
         lastError = new ProtocolClientError(
@@ -3099,6 +3305,34 @@ function formatNetworkRate(rate: DaemonNetworkRate, compact = false): string {
     return `↓${formatBytesTiny(rate.rxBytesPerSecond)} ↑${formatBytesTiny(rate.txBytesPerSecond)}`;
   }
   return `↓${formatBytesPerSecond(rate.rxBytesPerSecond)} ↑${formatBytesPerSecond(rate.txBytesPerSecond)}`;
+}
+
+function formatNetworkMetric(rate?: DaemonNetworkRate, latencyMs?: number, compact = false): string {
+  const rateValue = rate ? formatNetworkRate(rate, compact) : undefined;
+  const latencyValue = formatLatency(latencyMs);
+  if (rateValue && latencyValue) {
+    return compact ? `${rateValue} ${latencyValue}` : `${rateValue} RTT ${latencyValue}`;
+  }
+  if (rateValue) {
+    return rateValue;
+  }
+  if (latencyValue) {
+    return compact ? latencyValue : `RTT ${latencyValue}`;
+  }
+  return "-";
+}
+
+function formatLatency(latencyMs?: number): string | undefined {
+  if (latencyMs === undefined || !Number.isFinite(latencyMs) || latencyMs < 0) {
+    return undefined;
+  }
+  if (latencyMs < 1000) {
+    return `${Math.max(1, Math.round(latencyMs))}ms`;
+  }
+  if (latencyMs < 10_000) {
+    return `${(latencyMs / 1000).toFixed(1)}s`;
+  }
+  return `${Math.round(latencyMs / 1000)}s`;
 }
 
 function formatBytesPerSecond(bytesPerSecond: number): string {
