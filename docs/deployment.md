@@ -178,6 +178,22 @@ wget -qO- https://github.com/OWNER/REPO/releases/latest/download/install-termrel
 ## GitHub Release 与 GHCR
 
 - tag 采用纯版本号，例如 `0.1.2`。
+- 本机从源码更新正在运行的 daemon 时，优先使用 `scripts/update-local-termd.sh`：
+
+  ```bash
+  sudo scripts/update-local-termd.sh --workspace-tests
+  ```
+
+  脚本会先运行格式检查、Rust 测试和 release 编译，再记录当前 `termd.service`
+  的 `KillMode`、主进程、session supervisor PID、SQLite session 计数和 health
+  状态。只有 `KillMode=process` 时才会替换 `/usr/local/bin/termd` 并重启
+  `termd.service`；重启后会校验 healthz、supervisor PID 集合不变、running
+  session 数没有下降。它不会手动删除 SQLite 数据，也不会终止
+  `__session-supervisor` 进程。
+- 常规发版仍使用 `scripts/prepare-release.sh <version>`。发版脚本会同步版本号、
+  生成 release notes、运行安装脚本回归、Rust/workspace 验证、Web typecheck/test/build
+  和 release 编译，然后创建带用户可见说明的 annotated tag；传 `--push` 才会推送并触发
+  GitHub Actions。
 - tag 推送后，GitHub Actions 会：
   - 运行 workspace 测试，确认 release tag 与 `Cargo.toml` 版本一致。
   - 构建 `termd`、`termrelay`、`termctl` 的 Linux amd64 release tarball。二进制使用 `x86_64-unknown-linux-musl` 静态链接，并在打包前先构建 `termui/frontend` 的静态资源，确保 `termd` 和 `termrelay` 的内嵌 Web 可用。

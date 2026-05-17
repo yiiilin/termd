@@ -118,12 +118,21 @@ struct LocalPairingTokenPayload {
 pub fn try_default_protocol(config: DaemonConfig) -> Result<SharedDaemonProtocol, ServerError> {
     let mut state = StateStore::load(&config.state_path)?;
     let supervisor_backend = SupervisorPtyBackend::for_state_path(&config.state_path);
+    let mut live_supervisor_session_ids: Option<HashSet<SessionId>> = None;
     let repaired_count = match supervisor_backend.live_supervisor_restore_candidates() {
-        Ok(supervisors) => adopt_or_repair_runtime_sessions_from_supervisors(
-            &mut state,
-            supervisors,
-            current_unix_timestamp_millis(),
-        ),
+        Ok(supervisors) => {
+            let session_ids = supervisors
+                .iter()
+                .filter_map(|supervisor| uuid::Uuid::parse_str(&supervisor.session_id).ok())
+                .map(SessionId)
+                .collect::<HashSet<_>>();
+            live_supervisor_session_ids = Some(session_ids);
+            adopt_or_repair_runtime_sessions_from_supervisors(
+                &mut state,
+                supervisors,
+                current_unix_timestamp_millis(),
+            )
+        }
         // /proc 不可读只会影响异常升级恢复，不能阻断 daemon 正常启动。
         Err(error) => {
             warn!(%error, "failed to inspect live session supervisors");
@@ -160,7 +169,13 @@ pub fn try_default_protocol(config: DaemonConfig) -> Result<SharedDaemonProtocol
         restored_supervisor_session_ids,
     );
     // 首次启动时立即写入 daemon identity，避免已展示的 server id 只停留在内存里。
+    let mut protocol = protocol;
     protocol.persist_state()?;
+    if let Some(protected_session_ids) = live_supervisor_session_ids.as_ref() {
+        if let Err(error) = protocol.prune_closed_sessions_except(protected_session_ids) {
+            warn!(%error, "failed to prune closed session records during startup");
+        }
+    }
     Ok(Arc::new(Mutex::new(protocol)))
 }
 
@@ -873,6 +888,9 @@ mod tests {
     };
     use crate::pty::PtySize;
     use crate::pty::supervisor::SupervisorRestoreCandidate;
+    use crate::state::{
+        DaemonState, SessionStateRecord, StateStore, client_history::ClientHistoryStore,
+    };
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt as _;
@@ -934,6 +952,71 @@ mod tests {
         assert_eq!(adopted_session.size.pixel_height, 1000);
         assert_eq!(adopted_session.created_at_ms, UnixTimestampMillis(12_345));
         assert!(adopted_session.restore_info.is_some());
+    }
+
+    #[test]
+    fn startup_prunes_closed_rows_without_live_supervisors() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "termd-server-startup-prune-{}-{}",
+            std::process::id(),
+            current_unix_timestamp_millis().0
+        ));
+        fs::create_dir_all(&state_dir).unwrap();
+        let state_path = state_dir.join("daemon-state.json");
+        let session_id = SessionId::new();
+        let running_state = DaemonState {
+            version: crate::state::STATE_SCHEMA_VERSION,
+            daemon_identity: None,
+            trusted_devices: Vec::new(),
+            sessions: vec![SessionStateRecord {
+                session_id,
+                state: SessionState::Running,
+                size: termd_proto::TerminalSize::new(24, 80),
+                created_at_ms: UnixTimestampMillis(1_000),
+                updated_at_ms: UnixTimestampMillis(1_000),
+                restore_info: Some(crate::pty::PtyRestoreInfo::UnixSocket {
+                    socket_path: PathBuf::from("/tmp/orphan.sock"),
+                    supervisor_pid: 123,
+                    supervisor_status: crate::pty::PtySupervisorStatus::Running,
+                }),
+            }],
+        };
+        StateStore::save(&state_path, &running_state).unwrap();
+        StateStore::record_runtime_session_closed(
+            &state_path,
+            session_id,
+            UnixTimestampMillis(2_000),
+        )
+        .unwrap();
+        let mut history = ClientHistoryStore::open(&state_path).unwrap();
+        history
+            .record_session_created(
+                session_id,
+                SessionState::Running,
+                termd_proto::TerminalSize::new(24, 80),
+                Some("closed shell"),
+                "/tmp",
+                UnixTimestampMillis(1_000),
+            )
+            .unwrap();
+        history
+            .record_session_closed(session_id, UnixTimestampMillis(2_000))
+            .unwrap();
+        drop(history);
+
+        let _protocol =
+            try_default_protocol(DaemonConfig::default_for_state_path(&state_path)).unwrap();
+
+        let loaded = StateStore::load(&state_path).unwrap();
+        assert!(loaded.sessions.is_empty(), "{:?}", loaded.sessions);
+        let history = ClientHistoryStore::open(&state_path).unwrap();
+        assert!(
+            history
+                .session_record_including_closed(session_id)
+                .unwrap()
+                .is_none()
+        );
+        let _ = fs::remove_dir_all(state_dir);
     }
 
     #[test]

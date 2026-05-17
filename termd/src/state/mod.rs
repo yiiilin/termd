@@ -127,6 +127,71 @@ impl StateStore {
         initialize_daemon_state_schema(&conn, &sqlite_path)?;
         save_sqlite_state(&mut conn, &sqlite_path, state)
     }
+
+    /// 删除单个已关闭 runtime tombstone。调用方必须先确认对应 supervisor 已经结束。
+    pub fn prune_closed_session(
+        path: impl AsRef<Path>,
+        session_id: SessionId,
+    ) -> Result<bool, StateError> {
+        let sqlite_path = sqlite_state_path_for_state_path(path.as_ref());
+        let conn = open_state_connection(&sqlite_path)?;
+        initialize_daemon_state_schema(&conn, &sqlite_path)?;
+        let deleted = conn
+            .execute(
+                "DELETE FROM runtime_sessions WHERE session_id = ?1 AND state = ?2",
+                params![
+                    session_id.0.to_string(),
+                    session_state_text(SessionState::Closed)
+                ],
+            )
+            .map_err(|source| sqlite_error(&sqlite_path, source))?
+            > 0;
+        Ok(deleted)
+    }
+
+    /// 显式记录 runtime session 已关闭，并清掉 supervisor 恢复信息。
+    ///
+    /// `save` 只保存当前快照，不再把“快照缺失”推断为关闭；调用方在确认 close 或恢复失败时
+    /// 必须走这个显式 tombstone 路径，避免临时快照漏项把仍存活的 supervisor 标成 closed。
+    pub fn record_runtime_session_closed(
+        path: impl AsRef<Path>,
+        session_id: SessionId,
+        now_ms: UnixTimestampMillis,
+    ) -> Result<bool, StateError> {
+        let sqlite_path = sqlite_state_path_for_state_path(path.as_ref());
+        let conn = open_state_connection(&sqlite_path)?;
+        initialize_daemon_state_schema(&conn, &sqlite_path)?;
+        let updated = conn
+            .execute(
+                r#"
+                UPDATE runtime_sessions
+                SET state = ?1,
+                    updated_at_ms = ?2,
+                    restore_kind = NULL,
+                    restore_value = NULL
+                WHERE session_id = ?3
+                "#,
+                params![
+                    session_state_text(SessionState::Closed),
+                    now_ms.0 as i64,
+                    session_id.0.to_string(),
+                ],
+            )
+            .map_err(|source| sqlite_error(&sqlite_path, source))?
+            > 0;
+        Ok(updated)
+    }
+
+    /// 清理已经不可恢复的 closed runtime 行；仍有 live supervisor 的 id 必须保留。
+    pub fn prune_closed_sessions_except(
+        path: impl AsRef<Path>,
+        protected_session_ids: &HashSet<SessionId>,
+    ) -> Result<usize, StateError> {
+        let sqlite_path = sqlite_state_path_for_state_path(path.as_ref());
+        let mut conn = open_state_connection(&sqlite_path)?;
+        initialize_daemon_state_schema(&conn, &sqlite_path)?;
+        prune_closed_runtime_sessions_except(&mut conn, &sqlite_path, protected_session_ids)
+    }
 }
 
 /// 状态存储的结构化错误。
@@ -466,44 +531,9 @@ fn save_sqlite_state(
         .map_err(|source| sqlite_error(path, source))?;
     }
 
-    let incoming_session_ids: HashSet<String> = state
-        .sessions
-        .iter()
-        .map(|session| session.session_id.0.to_string())
-        .collect();
-    {
-        let mut stmt = tx
-            .prepare("SELECT session_id FROM runtime_sessions")
-            .map_err(|source| sqlite_error(path, source))?;
-        let rows = stmt
-            .query_map([], |row| row.get::<_, String>(0))
-            .map_err(|source| sqlite_error(path, source))?;
-        let mut stale_session_ids = Vec::new();
-        for row in rows {
-            let session_id = row.map_err(|source| sqlite_error(path, source))?;
-            if !incoming_session_ids.contains(&session_id) {
-                stale_session_ids.push(session_id);
-            }
-        }
-        drop(stmt);
-
-        // 运行态快照里缺失的旧 session 不能被删除；closed 事实要留在 SQLite，
-        // 这样显式 close 或恢复失败后的下一次启动不会再次尝试连接旧 supervisor。
-        for session_id in stale_session_ids {
-            tx.execute(
-                r#"
-                UPDATE runtime_sessions
-                SET state = ?1,
-                    updated_at_ms = ?2,
-                    restore_kind = NULL,
-                    restore_value = NULL
-                WHERE session_id = ?3
-                "#,
-                params![session_state_text(SessionState::Closed), now_ms, session_id,],
-            )
-            .map_err(|source| sqlite_error(path, source))?;
-        }
-    }
+    // 这里不能把“本次快照里缺失”的旧 runtime 行自动标成 closed。快照生成依赖 runtime
+    // 状态、尺寸和 supervisor restore_info，任一临时读取失败都可能漏掉仍存活的 session。
+    // 显式关闭或恢复失败必须调用 `record_runtime_session_closed` 写 tombstone。
 
     for session in &state.sessions {
         let (restore_kind, restore_value) = serialize_restore_info(session.restore_info.as_ref());
@@ -550,6 +580,55 @@ fn save_sqlite_state(
     }
 
     tx.commit().map_err(|source| sqlite_error(path, source))
+}
+
+fn prune_closed_runtime_sessions_except(
+    conn: &mut Connection,
+    path: &Path,
+    protected_session_ids: &HashSet<SessionId>,
+) -> Result<usize, StateError> {
+    let protected = protected_session_ids
+        .iter()
+        .map(|session_id| session_id.0.to_string())
+        .collect::<HashSet<_>>();
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|source| sqlite_error(path, source))?;
+    let mut stmt = tx
+        .prepare(
+            r#"
+            SELECT session_id
+            FROM runtime_sessions
+            WHERE state = ?1
+            "#,
+        )
+        .map_err(|source| sqlite_error(path, source))?;
+    let rows = stmt
+        .query_map(params![session_state_text(SessionState::Closed)], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(|source| sqlite_error(path, source))?;
+    let mut deletable = Vec::new();
+    for row in rows {
+        let session_id = row.map_err(|source| sqlite_error(path, source))?;
+        if !protected.contains(&session_id) {
+            deletable.push(session_id);
+        }
+    }
+    drop(stmt);
+
+    let mut deleted = 0;
+    for session_id in deletable {
+        // closed 且没有 live supervisor 保护的 runtime 行已经不可恢复，保留只会污染统计。
+        deleted += tx
+            .execute(
+                "DELETE FROM runtime_sessions WHERE session_id = ?1 AND state = ?2",
+                params![session_id, session_state_text(SessionState::Closed)],
+            )
+            .map_err(|source| sqlite_error(path, source))?;
+    }
+    tx.commit().map_err(|source| sqlite_error(path, source))?;
+    Ok(deleted)
 }
 
 fn upsert_meta_value(
@@ -804,7 +883,7 @@ mod tests {
     }
 
     #[test]
-    fn state_save_marks_missing_runtime_sessions_closed() {
+    fn state_save_preserves_missing_runtime_sessions_until_explicit_close() {
         let state_path = temp_path("closed-runtime-session.json");
         let running_state = sample_state();
         let session_id = running_state.sessions[0].session_id;
@@ -817,8 +896,65 @@ mod tests {
         let loaded = StateStore::load(&state_path).unwrap();
         assert_eq!(loaded.sessions.len(), 1);
         assert_eq!(loaded.sessions[0].session_id, session_id);
-        assert_eq!(loaded.sessions[0].state, SessionState::Closed);
-        assert!(loaded.sessions[0].restore_info.is_none());
+        assert_eq!(loaded.sessions[0].state, SessionState::Running);
+        assert!(loaded.sessions[0].restore_info.is_some());
+
+        let updated = StateStore::record_runtime_session_closed(
+            &state_path,
+            session_id,
+            UnixTimestampMillis(3_000),
+        )
+        .unwrap();
+        assert!(updated);
+
+        let closed = StateStore::load(&state_path).unwrap();
+        assert_eq!(closed.sessions.len(), 1);
+        assert_eq!(closed.sessions[0].session_id, session_id);
+        assert_eq!(closed.sessions[0].state, SessionState::Closed);
+        assert!(closed.sessions[0].restore_info.is_none());
+        cleanup_state_paths(&state_path);
+    }
+
+    #[test]
+    fn state_prune_closed_sessions_removes_only_unprotected_rows() {
+        let state_path = temp_path("prune-closed-runtime-session.json");
+        let running_state = sample_state();
+        let protected_session_id = running_state.sessions[0].session_id;
+        let mut closed_state = running_state.clone();
+        closed_state.sessions.push(SessionStateRecord {
+            session_id: SessionId::new(),
+            state: SessionState::Running,
+            size: TerminalSize::new(30, 100),
+            created_at_ms: UnixTimestampMillis(1_500),
+            updated_at_ms: UnixTimestampMillis(1_500),
+            restore_info: Some(PtyRestoreInfo::UnixSocket {
+                socket_path: PathBuf::from("/tmp/protected.sock"),
+                supervisor_pid: 99,
+                supervisor_status: PtySupervisorStatus::Running,
+            }),
+        });
+        closed_state.sessions.push(SessionStateRecord {
+            session_id: SessionId::new(),
+            state: SessionState::Closed,
+            size: TerminalSize::new(24, 80),
+            created_at_ms: UnixTimestampMillis(2_000),
+            updated_at_ms: UnixTimestampMillis(2_000),
+            restore_info: None,
+        });
+
+        StateStore::save(&state_path, &closed_state).unwrap();
+        let protected = [protected_session_id].into_iter().collect::<HashSet<_>>();
+        let deleted = StateStore::prune_closed_sessions_except(&state_path, &protected).unwrap();
+        assert_eq!(deleted, 1);
+
+        let loaded = StateStore::load(&state_path).unwrap();
+        assert_eq!(loaded.sessions.len(), 2);
+        assert!(
+            loaded
+                .sessions
+                .iter()
+                .all(|session| session.state == SessionState::Running)
+        );
         cleanup_state_paths(&state_path);
     }
 

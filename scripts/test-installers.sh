@@ -22,11 +22,15 @@ assert_help_contains() {
 for script in \
   scripts/install-termd.sh \
   scripts/install-termctl.sh \
-  scripts/install-termrelay.sh
+  scripts/install-termrelay.sh \
+  scripts/update-local-termd.sh
 do
   bash -n "${ROOT_DIR}/${script}"
-  assert_help_contains "$script" "--uninstall"
 done
+
+assert_help_contains scripts/install-termd.sh "--uninstall"
+assert_help_contains scripts/install-termctl.sh "--uninstall"
+assert_help_contains scripts/install-termrelay.sh "--uninstall"
 
 assert_help_contains scripts/install-termd.sh "--web"
 assert_help_contains scripts/install-termd.sh "--listen <HOST:PORT>"
@@ -34,6 +38,8 @@ assert_help_contains scripts/install-termd.sh "--proxy <URL>"
 assert_help_contains scripts/install-termd.sh "--supervisor-version <VER>"
 assert_help_contains scripts/install-termd.sh "--user <USER>"
 assert_help_contains scripts/install-termd.sh "--purge"
+assert_help_contains scripts/update-local-termd.sh "--workspace-tests"
+assert_help_contains scripts/update-local-termd.sh "--health-url <URL>"
 
 assert_help_contains scripts/install-termrelay.sh "--web"
 assert_help_contains scripts/install-termrelay.sh "--listen <HOST:PORT>"
@@ -42,6 +48,10 @@ assert_help_contains scripts/install-termrelay.sh "--purge"
 
 grep -q "KillMode=process" "${ROOT_DIR}/scripts/install-termd.sh"
 grep -q "KillMode=process" "${ROOT_DIR}/scripts/install-termrelay.sh"
+grep -q "KillMode" "${ROOT_DIR}/scripts/update-local-termd.sh"
+grep -q "__session-supervisor" "${ROOT_DIR}/scripts/update-local-termd.sh"
+grep -q "cargo build --release -p termd --bin termd --locked" "${ROOT_DIR}/scripts/update-local-termd.sh"
+grep -q "systemctl restart" "${ROOT_DIR}/scripts/update-local-termd.sh"
 grep -q "termctl pair --payload" "${ROOT_DIR}/scripts/install-termd.sh"
 ! grep -q "termctl pair --token" "${ROOT_DIR}/scripts/install-termd.sh"
 grep -q 'SUPERVISOR_VERSION="${TERMD_SUPERVISOR_VERSION:-}"' "${ROOT_DIR}/scripts/install-termd.sh"

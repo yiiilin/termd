@@ -33,11 +33,12 @@ use termd_proto::{
     SessionFileKind, SessionFileReadPayload, SessionFileReadResultPayload, SessionFileWritePayload,
     SessionFileWrittenPayload, SessionFilesPayload, SessionFilesResultPayload,
     SessionGitActionKind, SessionGitActionPayload, SessionGitActionResultPayload,
-    SessionGitFileChangePayload, SessionGitPayload, SessionGitResultPayload,
-    SessionGitWorktreePayload, SessionId, SessionListPayload, SessionListResultPayload,
-    SessionRenamePayload, SessionRenamedPayload, SessionReorderPayload, SessionReorderedPayload,
-    SessionResizePayload, SessionResizedPayload, SessionState, SessionSummaryPayload, TerminalSize,
-    UnixTimestampMillis,
+    SessionGitDiffPayload, SessionGitDiffResultPayload, SessionGitFileChangePayload,
+    SessionGitPayload, SessionGitResultPayload, SessionGitWorktreePayload, SessionId,
+    SessionListPayload, SessionListResultPayload, SessionRenamePayload, SessionRenamedPayload,
+    SessionReorderPayload, SessionReorderedPayload, SessionResizePayload, SessionResizedPayload,
+    SessionSearchMatchPayload, SessionSearchPayload, SessionSearchResultPayload, SessionState,
+    SessionSummaryPayload, TerminalSize, UnixTimestampMillis,
 };
 use thiserror::Error;
 use tokio::sync::watch;
@@ -169,6 +170,44 @@ impl SessionOutputHistory {
 
     fn snapshot_bytes(&self) -> Vec<u8> {
         self.screen.snapshot_bytes()
+    }
+
+    fn search(
+        &self,
+        query: &str,
+        case_sensitive: bool,
+        max_results: u16,
+    ) -> (Vec<SessionSearchMatchPayload>, bool, u32) {
+        let needle = if case_sensitive {
+            query.to_owned()
+        } else {
+            query.to_lowercase()
+        };
+        let mut matches = Vec::new();
+        let mut truncated = false;
+        let lines = self.screen.snapshot_plain_lines();
+        let line_count = lines.len().min(u32::MAX as usize) as u32;
+
+        for (line_index, line_text) in lines.into_iter().enumerate() {
+            let haystack = if case_sensitive {
+                line_text.clone()
+            } else {
+                line_text.to_lowercase()
+            };
+            for column_index in match_indices(&haystack, &needle) {
+                if matches.len() >= usize::from(max_results) {
+                    truncated = true;
+                    return (matches, truncated, line_count);
+                }
+                matches.push(SessionSearchMatchPayload {
+                    line_index: line_index.min(u32::MAX as usize) as u32,
+                    column_index: column_index.min(u16::MAX as usize) as u16,
+                    line_text: line_text.clone(),
+                });
+            }
+        }
+
+        (matches, truncated, line_count)
     }
 
     fn trim_to_live_output_limit(&mut self) {
@@ -458,6 +497,28 @@ where
     /// 将当前最小持久状态保存到配置指定的位置。
     pub fn persist_state(&self) -> Result<(), StateError> {
         StateStore::save(&self.config.state_path, &self.snapshot_state())
+    }
+
+    /// 清理单个已确认关闭的 session 记录。只在 PTY terminate 成功后使用。
+    fn prune_closed_session(&mut self, session_id: SessionId) -> Result<(), StateError> {
+        self.client_history.prune_closed_session(session_id)?;
+        StateStore::prune_closed_session(&self.config.state_path, session_id)?;
+        Ok(())
+    }
+
+    /// 清理不可恢复的 closed session；仍有 live supervisor 的 session id 不允许删除。
+    pub(crate) fn prune_closed_sessions_except(
+        &mut self,
+        protected_session_ids: &HashSet<SessionId>,
+    ) -> Result<usize, StateError> {
+        let history_deleted = self
+            .client_history
+            .prune_closed_sessions_except(protected_session_ids)?;
+        let runtime_deleted = StateStore::prune_closed_sessions_except(
+            &self.config.state_path,
+            protected_session_ids,
+        )?;
+        Ok(history_deleted + runtime_deleted)
     }
 
     pub fn server_id(&self) -> ServerId {
@@ -984,6 +1045,18 @@ where
             tracing::warn!(%error, "failed to remove closed session attachments from sqlite history");
         }
         self.persist_state()?;
+        if let Err(error) = StateStore::record_runtime_session_closed(
+            &self.config.state_path,
+            payload.session_id,
+            current_unix_timestamp_millis(),
+        ) {
+            tracing::warn!(%error, "failed to mark closed runtime session tombstone");
+        }
+        if close_result.is_ok() {
+            if let Err(error) = self.prune_closed_session(payload.session_id) {
+                tracing::warn!(%error, "failed to prune closed session records after close");
+            }
+        }
 
         Ok(vec![envelope_value(
             MessageType::SessionClosed,
@@ -1008,6 +1081,47 @@ where
                 sessions.remove(&session_id);
             }
         }
+    }
+
+    fn search_session_output(
+        &mut self,
+        connection: &ProtocolConnection,
+        payload: SessionSearchPayload,
+    ) -> Result<Vec<JsonEnvelope>, ProtocolError> {
+        connection.authenticated_device_id()?;
+        connection.ensure_attached_to(payload.session_id)?;
+        let internal_session_id = self
+            .session_index
+            .get(&payload.session_id)
+            .cloned()
+            .ok_or(ProtocolError::SessionNotFound)?;
+        let query = payload.query.trim();
+        if query.is_empty() || query.chars().any(char::is_control) {
+            return Err(ProtocolError::InvalidEnvelope);
+        }
+
+        // 搜索前先尽量把 PTY 已输出内容读入内存 snapshot；不写入 SQLite/state。
+        self.drain_runtime_output_to_history_until_empty(
+            payload.session_id,
+            &internal_session_id,
+            16 * 1024,
+        )?;
+        let size = self.runtime_size_proto(&internal_session_id)?;
+        let history = self.session_output_history_mut(payload.session_id, size);
+        let max_results = payload.max_results.unwrap_or(80).clamp(1, 500);
+        let (matches, truncated, line_count) =
+            history.search(query, payload.case_sensitive, max_results);
+
+        Ok(vec![envelope_value(
+            MessageType::SessionSearchResult,
+            SessionSearchResultPayload {
+                session_id: payload.session_id,
+                query: query.to_owned(),
+                line_count,
+                matches,
+                truncated,
+            },
+        )?])
     }
 
     fn list_session_files(
@@ -1080,6 +1194,40 @@ where
                 worktree_path: absolute_path_string(&worktree),
                 file_path: payload.file_path,
                 action: payload.action,
+            },
+        )?])
+    }
+
+    fn read_session_git_diff(
+        &mut self,
+        connection: &ProtocolConnection,
+        payload: SessionGitDiffPayload,
+    ) -> Result<Vec<JsonEnvelope>, ProtocolError> {
+        connection.authenticated_device_id()?;
+        connection.ensure_attached_to(payload.session_id)?;
+        if !self.session_index.contains_key(&payload.session_id) {
+            return Err(ProtocolError::SessionNotFound);
+        }
+        let file_path = payload
+            .file_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|path| !path.is_empty());
+        if let Some(path) = file_path {
+            validate_git_relative_file_path(path)?;
+        }
+        let worktree =
+            self.session_git_worktree_path(payload.session_id, &payload.worktree_path)?;
+        let diff = read_git_diff(&worktree, file_path, payload.staged)?;
+
+        Ok(vec![envelope_value(
+            MessageType::SessionGitDiffResult,
+            SessionGitDiffResultPayload {
+                session_id: payload.session_id,
+                worktree_path: absolute_path_string(&worktree),
+                file_path: file_path.map(ToOwned::to_owned),
+                staged: payload.staged,
+                diff,
             },
         )?])
     }
@@ -2515,6 +2663,11 @@ where
         if let Err(error) = self.client_history.remove_session_attachments(session_id) {
             tracing::warn!(%error, session_id = %session_id.0, "failed to clear restored session attachments from sqlite history");
         }
+        if let Err(error) =
+            StateStore::record_runtime_session_closed(&self.config.state_path, session_id, now_ms)
+        {
+            tracing::warn!(%error, session_id = %session_id.0, "failed to mark restored runtime session closed in sqlite state");
+        }
     }
 
     fn client_history_session_record(&self, session_id: SessionId) -> Option<SessionHistoryRecord> {
@@ -3374,6 +3527,10 @@ impl ProtocolConnection {
                 let payload = decode_payload(envelope.payload)?;
                 protocol.close_session(self, payload)
             }
+            MessageType::SessionSearch => {
+                let payload = decode_payload(envelope.payload)?;
+                protocol.search_session_output(self, payload)
+            }
             MessageType::SessionFiles => {
                 let payload = decode_payload(envelope.payload)?;
                 protocol.list_session_files(self, payload)
@@ -3385,6 +3542,10 @@ impl ProtocolConnection {
             MessageType::SessionGitAction => {
                 let payload = decode_payload(envelope.payload)?;
                 protocol.apply_session_git_action(self, payload)
+            }
+            MessageType::SessionGitDiff => {
+                let payload = decode_payload(envelope.payload)?;
+                protocol.read_session_git_diff(self, payload)
             }
             MessageType::SessionFileRead => {
                 let payload = decode_payload(envelope.payload)?;
@@ -3686,6 +3847,20 @@ fn validate_git_relative_file_path(path: &str) -> Result<(), ProtocolError> {
     Ok(())
 }
 
+fn match_indices(haystack: &str, needle: &str) -> Vec<usize> {
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let mut indices = Vec::new();
+    let mut offset = 0;
+    while let Some(index) = haystack[offset..].find(needle) {
+        let absolute_index = offset + index;
+        indices.push(haystack[..absolute_index].chars().count());
+        offset = absolute_index + needle.len();
+    }
+    indices
+}
+
 fn read_session_file_entries(
     _root: &Path,
     target: &Path,
@@ -3844,6 +4019,39 @@ fn apply_git_file_action(
         }
         SessionGitActionKind::Discard => discard_git_file_change(worktree, file_path),
     }
+}
+
+fn read_git_diff(
+    worktree: &Path,
+    file_path: Option<&str>,
+    staged: bool,
+) -> Result<String, ProtocolError> {
+    let mut args = vec!["diff", "--no-ext-diff"];
+    if staged {
+        args.push("--cached");
+    }
+    args.push("--");
+    if let Some(file_path) = file_path {
+        args.push(file_path);
+    }
+    let output = run_git_command(worktree, &args).map_err(|_| ProtocolError::RuntimeFailed)?;
+    if !output.success {
+        tracing::warn!(stderr = %output.stderr, "git diff failed");
+        return Err(ProtocolError::RuntimeFailed);
+    }
+    Ok(limit_text_for_payload(output.stdout, 256 * 1024))
+}
+
+fn limit_text_for_payload(mut text: String, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    text.truncate(max_bytes);
+    while !text.is_char_boundary(text.len()) {
+        text.pop();
+    }
+    text.push_str("\n[termd: output truncated]");
+    text
 }
 
 fn discard_git_file_change(worktree: &Path, file_path: &str) -> Result<(), ProtocolError> {
@@ -4288,7 +4496,7 @@ mod tests {
         PtySnapshot, PtySupervisorStatus,
     };
     use crate::session::TerminalSize as RuntimeTerminalSize;
-    use crate::state::StateStore;
+    use crate::state::{StateStore, client_history::ClientHistoryStore};
 
     static TEST_STATE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -7175,6 +7383,65 @@ mod tests {
     }
 
     #[test]
+    fn attached_session_can_read_git_diff() {
+        let base = temp_state_path("git-workflow-base");
+        let root = base.join("project");
+        fs::create_dir_all(&root).unwrap();
+        run_test_git(&root, &["init", "-b", "main"]);
+        run_test_git(&root, &["config", "user.email", "test@example.com"]);
+        run_test_git(&root, &["config", "user.name", "Termd Test"]);
+        fs::write(root.join("README.md"), b"initial\n").unwrap();
+        run_test_git(&root, &["add", "README.md"]);
+        run_test_git(&root, &["commit", "-m", "initial"]);
+        fs::write(root.join("README.md"), b"initial\nstaged\n").unwrap();
+        run_test_git(&root, &["add", "README.md"]);
+
+        let backend = FakePtyBackend::default();
+        let mut config =
+            DaemonConfig::default_for_state_path(temp_state_path("git-workflow-state.json"));
+        config.default_command = vec!["sh".to_owned()];
+        config.default_working_directory = Some(root.clone());
+        let mut protocol =
+            DaemonProtocol::new(config, backend.clone(), Ed25519SignatureVerifier).unwrap();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = PublicKey(wire(signing_key.verifying_key().as_bytes()));
+        let (_, mut device_session) = open_e2ee(&mut protocol, &mut connection, device_id);
+        pair_device(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            device_id,
+            public_key,
+        );
+        let session_id = create_test_session(&mut protocol, &mut connection, &mut device_session);
+        backend.set_cwd_for_session(session_id, root.clone());
+
+        let diff_responses = send_encrypted(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            envelope_value(
+                MessageType::SessionGitDiff,
+                SessionGitDiffPayload {
+                    session_id,
+                    worktree_path: root.to_string_lossy().to_string(),
+                    file_path: Some("README.md".to_owned()),
+                    staged: true,
+                },
+            )
+            .unwrap(),
+        );
+        let diff = decrypt_first(&mut device_session, diff_responses);
+        let diff_payload: SessionGitDiffResultPayload = decode_payload(diff.payload).unwrap();
+        assert_eq!(diff.kind, MessageType::SessionGitDiffResult);
+        assert!(diff_payload.diff.contains("+staged"));
+
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
     fn session_files_without_path_uses_daemon_persisted_file_tree_position() {
         let base = temp_state_path("shared-files-base");
         let root = base.join("project");
@@ -8969,13 +9236,7 @@ mod tests {
         assert_eq!(closed.kind, MessageType::SessionClosed);
 
         let closed_state = StateStore::load(&state_path).unwrap();
-        assert_eq!(closed_state.sessions.len(), 1);
-        assert_eq!(
-            closed_state.sessions[0].session_id,
-            created_payload.session_id
-        );
-        assert_eq!(closed_state.sessions[0].state, SessionState::Closed);
-        assert!(closed_state.sessions[0].restore_info.is_none());
+        assert!(closed_state.sessions.is_empty());
 
         let restarted = DaemonProtocol::from_state(
             config,
@@ -8987,6 +9248,67 @@ mod tests {
 
         assert!(restarted.session_index.is_empty());
         assert!(backend.reconnects().is_empty());
+    }
+
+    #[test]
+    fn explicit_close_prunes_successfully_closed_session_rows() {
+        let backend = FakePtyBackend::default();
+        let state_path = temp_state_path("explicit-close-prunes-closed-rows.json");
+        let config = DaemonConfig::default_for_state_path(&state_path);
+        let mut protocol =
+            DaemonProtocol::new(config.clone(), backend.clone(), Ed25519SignatureVerifier).unwrap();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let (_, mut device_session) = open_e2ee(&mut protocol, &mut connection, device_id);
+        pair_device(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            device_id,
+            PublicKey(wire(signing_key.verifying_key().as_bytes())),
+        );
+        let created_responses = send_encrypted(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            envelope_value(
+                MessageType::SessionCreate,
+                SessionCreatePayload {
+                    command: vec!["sh".to_owned()],
+                    size: TerminalSize::new(24, 80),
+                },
+            )
+            .unwrap(),
+        );
+        let created = decrypt_first(&mut device_session, created_responses);
+        let created_payload: SessionCreatedPayload = decode_payload(created.payload).unwrap();
+
+        let close_responses = send_encrypted(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            envelope_value(
+                MessageType::SessionClose,
+                SessionClosePayload {
+                    session_id: created_payload.session_id,
+                },
+            )
+            .unwrap(),
+        );
+        let closed = decrypt_first(&mut device_session, close_responses);
+        assert_eq!(closed.kind, MessageType::SessionClosed);
+        assert_eq!(backend.terminate_count(), 1);
+
+        let state = StateStore::load(&state_path).unwrap();
+        assert!(state.sessions.is_empty());
+        let history = ClientHistoryStore::open(&state_path).unwrap();
+        assert!(
+            history
+                .session_record_including_closed(created_payload.session_id)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

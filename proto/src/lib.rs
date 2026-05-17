@@ -49,12 +49,16 @@ pub enum MessageType {
     SessionReordered,
     SessionClose,
     SessionClosed,
+    SessionSearch,
+    SessionSearchResult,
     SessionFiles,
     SessionFilesResult,
     SessionGit,
     SessionGitResult,
     SessionGitAction,
     SessionGitActionResult,
+    SessionGitDiff,
+    SessionGitDiffResult,
     SessionFileRead,
     SessionFileReadResult,
     SessionFileWrite,
@@ -656,6 +660,38 @@ pub struct SessionClosedPayload {
     pub session_id: SessionId,
 }
 
+/// 在 daemon 内存中的终端 screen snapshot 里搜索文本。
+///
+/// 这里刻意不要求 daemon 把 PTY 明文写入磁盘；搜索范围只覆盖当前进程保留的最近逻辑行。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSearchPayload {
+    pub session_id: SessionId,
+    pub query: String,
+    #[serde(default)]
+    pub case_sensitive: bool,
+    /// 客户端可传入较小上限，避免一次搜索把大量 scrollback 明文推回浏览器。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_results: Option<u16>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSearchMatchPayload {
+    /// 在本次 snapshot 文本中的 0-based 行号。
+    pub line_index: u32,
+    /// 匹配在该行中的 0-based 字符偏移。
+    pub column_index: u16,
+    pub line_text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSearchResultPayload {
+    pub session_id: SessionId,
+    pub query: String,
+    pub line_count: u32,
+    pub matches: Vec<SessionSearchMatchPayload>,
+    pub truncated: bool,
+}
+
 /// 文件列表条目的类型。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -752,6 +788,26 @@ pub struct SessionGitActionResultPayload {
     pub worktree_path: String,
     pub file_path: String,
     pub action: SessionGitActionKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionGitDiffPayload {
+    pub session_id: SessionId,
+    pub worktree_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_path: Option<String>,
+    #[serde(default)]
+    pub staged: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionGitDiffResultPayload {
+    pub session_id: SessionId,
+    pub worktree_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_path: Option<String>,
+    pub staged: bool,
+    pub diff: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -934,6 +990,8 @@ mod tests {
             (MessageType::SessionReordered, "session_reordered"),
             (MessageType::SessionClose, "session_close"),
             (MessageType::SessionClosed, "session_closed"),
+            (MessageType::SessionSearch, "session_search"),
+            (MessageType::SessionSearchResult, "session_search_result"),
             (MessageType::SessionFiles, "session_files"),
             (MessageType::SessionFilesResult, "session_files_result"),
             (MessageType::SessionGit, "session_git"),
@@ -943,6 +1001,8 @@ mod tests {
                 MessageType::SessionGitActionResult,
                 "session_git_action_result",
             ),
+            (MessageType::SessionGitDiff, "session_git_diff"),
+            (MessageType::SessionGitDiffResult, "session_git_diff_result"),
             (MessageType::SessionFileRead, "session_file_read"),
             (
                 MessageType::SessionFileReadResult,

@@ -51,6 +51,7 @@ interface SessionFilesPanelProps {
   onOpenDirectory: (path: string) => void;
   onOpenFile: (entry: SessionFileEntryPayload) => void;
   onOpenGitFile: (worktree: SessionGitWorktreePayload, change: SessionGitFileChangePayload) => void;
+  onOpenGitDiff: (worktree: SessionGitWorktreePayload, change?: SessionGitFileChangePayload, staged?: boolean) => void;
   onGitAction: (
     worktree: SessionGitWorktreePayload,
     change: SessionGitFileChangePayload,
@@ -82,6 +83,7 @@ export function SessionFilesPanel({
   onOpenDirectory,
   onOpenFile,
   onOpenGitFile,
+  onOpenGitDiff,
   onGitAction,
   onGoToPath,
   onRefresh,
@@ -261,6 +263,7 @@ export function SessionFilesPanel({
           error={gitError}
           onRefresh={onRefreshGit}
           onOpenGitFile={onOpenGitFile}
+          onOpenGitDiff={onOpenGitDiff}
           onGitAction={onGitAction}
         />
       )}
@@ -275,6 +278,7 @@ function GitPanel({
   error,
   onRefresh,
   onOpenGitFile,
+  onOpenGitDiff,
   onGitAction,
 }: {
   attachedSessionId?: UUID;
@@ -283,6 +287,7 @@ function GitPanel({
   error?: SafeError;
   onRefresh: () => void;
   onOpenGitFile: (worktree: SessionGitWorktreePayload, change: SessionGitFileChangePayload) => void;
+  onOpenGitDiff: (worktree: SessionGitWorktreePayload, change?: SessionGitFileChangePayload, staged?: boolean) => void;
   onGitAction: (
     worktree: SessionGitWorktreePayload,
     change: SessionGitFileChangePayload,
@@ -410,6 +415,7 @@ function GitPanel({
                     key={worktree.path}
                     worktree={worktree}
                     onOpenGitFile={onOpenGitFile}
+                    onOpenGitDiff={onOpenGitDiff}
                     onGitAction={onGitAction}
                   />
                 ))
@@ -455,10 +461,12 @@ function GitPanel({
 function GitWorktree({
   worktree,
   onOpenGitFile,
+  onOpenGitDiff,
   onGitAction,
 }: {
   worktree: SessionGitWorktreePayload;
   onOpenGitFile: (worktree: SessionGitWorktreePayload, change: SessionGitFileChangePayload) => void;
+  onOpenGitDiff: (worktree: SessionGitWorktreePayload, change?: SessionGitFileChangePayload, staged?: boolean) => void;
   onGitAction: (
     worktree: SessionGitWorktreePayload,
     change: SessionGitFileChangePayload,
@@ -501,7 +509,9 @@ function GitWorktree({
             changes={worktree.staged}
             emptyText={t("git.noStaged")}
             action="unstage"
+            staged
             onOpenGitFile={onOpenGitFile}
+            onOpenGitDiff={onOpenGitDiff}
             onGitAction={onGitAction}
           />
           <GitChangeSection
@@ -511,6 +521,7 @@ function GitWorktree({
             emptyText={t("git.noUnstaged")}
             action="stage"
             onOpenGitFile={onOpenGitFile}
+            onOpenGitDiff={onOpenGitDiff}
             onGitAction={onGitAction}
           />
         </div>
@@ -525,7 +536,9 @@ function GitChangeSection({
   changes,
   emptyText,
   action,
+  staged = false,
   onOpenGitFile,
+  onOpenGitDiff,
   onGitAction,
 }: {
   title: string;
@@ -533,7 +546,9 @@ function GitChangeSection({
   changes: SessionGitFileChangePayload[];
   emptyText: string;
   action: SessionGitActionKind;
+  staged?: boolean;
   onOpenGitFile: (worktree: SessionGitWorktreePayload, change: SessionGitFileChangePayload) => void;
+  onOpenGitDiff: (worktree: SessionGitWorktreePayload, change?: SessionGitFileChangePayload, staged?: boolean) => void;
   onGitAction: (
     worktree: SessionGitWorktreePayload,
     change: SessionGitFileChangePayload,
@@ -558,6 +573,15 @@ function GitChangeSection({
                 {change.path}
               </span>
               <span className="git-change-actions git-change-floating-actions">
+                <button
+                  type="button"
+                  className="icon-button"
+                  aria-label={t("git.diffFile", { path: change.path })}
+                  title={t("git.diffFile", { path: change.path })}
+                  onClick={() => onOpenGitDiff(worktree, change, staged)}
+                >
+                  <File size={13} aria-hidden="true" />
+                </button>
                 <button
                   type="button"
                   className="icon-button"

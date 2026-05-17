@@ -1315,6 +1315,41 @@ describe("termui web 工作台", () => {
     );
   });
 
+  it("终端搜索会查询 session snapshot，并支持切换命中结果", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await user.click(screen.getByRole("button", { name: "Refresh" }));
+    await clickSessionCard(user);
+
+    await screen.findByText(/termd-e2e-ready/);
+    daemon.pushSessionData(DEFAULT_SESSION_ID, "alpha beta\nbeta gamma\n");
+    await screen.findByText(/beta gamma/);
+
+    const terminalPane = screen.getByTestId("terminal-pane");
+    await user.click(within(terminalPane).getByRole("button", { name: "Search terminal" }));
+    const searchInput = await within(terminalPane).findByPlaceholderText("Search scrollback");
+    await user.type(searchInput, "beta");
+    await user.keyboard("{Enter}");
+
+    await waitFor(() =>
+      expect(daemon.sessionSearchRequests).toContainEqual({
+        session_id: DEFAULT_SESSION_ID,
+        query: "beta",
+        case_sensitive: false,
+        max_results: 80,
+      }),
+    );
+    await within(terminalPane).findByText("1/2");
+    await waitFor(() =>
+      expect(within(terminalPane).getByTestId("xterm-search-highlight")).toHaveTextContent("beta"),
+    );
+    await user.click(within(terminalPane).getByRole("button", { name: "Next match" }));
+    await within(terminalPane).findByText("2/2");
+  });
+
   it("可以创建 session 并自动 attach 到 terminal", async () => {
     const user = userEvent.setup();
     await daemon.stop();
@@ -1535,6 +1570,9 @@ describe("termui web 工作台", () => {
     });
     expect(daemon.sessionFileReadRequests).toEqual([]);
 
+    expect(within(panel).queryByRole("button", { name: "Copy alpha.txt" })).toBeNull();
+    expect(within(panel).queryByRole("button", { name: "Move alpha.txt" })).toBeNull();
+
     await user.click(within(panel).getByRole("button", { name: "Delete alpha.txt" }));
     await waitFor(() => {
       expect(daemon.sessionFileDeletes).toContainEqual({
@@ -1664,6 +1702,17 @@ describe("termui web 工作台", () => {
     expect(panel.querySelector(".git-graph-row")?.textContent).not.toContain("* a1b2c3d main commit");
     expect(panel.querySelector(".git-graph-node")).not.toBeNull();
 
+    await user.click(within(readmeTreeItem).getByRole("button", { name: "Diff README.md" }));
+    await waitFor(() =>
+      expect(daemon.sessionGitDiffRequests).toContainEqual({
+        session_id: sessionId,
+        worktree_path: "/home/me/project",
+        file_path: "README.md",
+        staged: false,
+      }),
+    );
+    await screen.findByText(/mock unstaged diff for README\.md/);
+
     await user.click(within(panel).getByRole("button", { name: "Open README.md" }));
     await waitFor(() =>
       expect(daemon.sessionFileDownloadChunkRequests).toContainEqual({
@@ -1701,6 +1750,12 @@ describe("termui web 工作台", () => {
         ]),
       ),
     );
+
+    const worktreeItem = within(panel).getByRole("treeitem", { name: "main changes" });
+    expect(within(worktreeItem).queryByLabelText("Commit message")).toBeNull();
+    expect(within(worktreeItem).queryByRole("button", { name: "Commit staged" })).toBeNull();
+    expect(within(worktreeItem).queryByLabelText("Stash message")).toBeNull();
+    expect(within(worktreeItem).queryByRole("button", { name: "Stash" })).toBeNull();
 
     await user.click(within(panel).getByRole("button", { name: "Collapse main worktree" }));
     expect(within(panel).queryByText("src/lib.rs")).toBeNull();

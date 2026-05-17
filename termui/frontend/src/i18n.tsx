@@ -68,6 +68,12 @@ const enUS = {
   "settings.theme.system": "System",
   "settings.theme.dark": "Dark",
   "settings.theme.light": "Light",
+  "settings.notifications": "Notifications",
+  "settings.notifications.off": "Off",
+  "settings.notifications.mentions": "Background output",
+  "settings.notifications.all": "Connection + output",
+  "settings.mobileShortcuts": "Mobile shortcuts",
+  "settings.mobileShortcutsHelp": "One button per line, format: label=escaped text",
   "settings.effective": "Current: {value}",
 
   "connection.wsUrl": "WS URL",
@@ -144,6 +150,7 @@ const enUS = {
   "files.edit": "Edit {name}",
   "files.download": "Download {name}",
   "files.delete": "Delete {name}",
+  "files.rename": "Rename {name}",
 
   "git.status": "Git status",
   "git.graph": "Git graph",
@@ -171,6 +178,7 @@ const enUS = {
   "git.stageFile": "Stage {path}",
   "git.unstageFile": "Unstage {path}",
   "git.discardFile": "Discard {path}",
+  "git.diffFile": "Diff {path}",
   "git.commits": "Git graph commits",
 
   "status.attached": "attached",
@@ -220,6 +228,12 @@ const enUS = {
   "terminal.sendCtrlZ": "Send Ctrl-Z",
   "terminal.sendCtrlD": "Send Ctrl-D",
   "terminal.paste": "Paste",
+  "terminal.search": "Search terminal",
+  "terminal.searchPlaceholder": "Search scrollback",
+  "terminal.previousMatch": "Previous match",
+  "terminal.nextMatch": "Next match",
+  "terminal.closeSearch": "Close search",
+  "terminal.searchFailed": "Search failed",
 
   "qr.startingCamera": "Starting camera",
   "qr.cameraNotAvailable": "Camera not available",
@@ -321,6 +335,12 @@ const zhCN: Record<TranslationKey, string> = {
   "settings.theme.system": "跟随系统",
   "settings.theme.dark": "深色",
   "settings.theme.light": "浅色",
+  "settings.notifications": "通知",
+  "settings.notifications.off": "关闭",
+  "settings.notifications.mentions": "后台输出",
+  "settings.notifications.all": "连接和输出",
+  "settings.mobileShortcuts": "移动端快捷键",
+  "settings.mobileShortcutsHelp": "每行一个按钮，格式：标签=转义文本",
   "settings.effective": "当前：{value}",
 
   "connection.wsUrl": "WS URL",
@@ -397,6 +417,7 @@ const zhCN: Record<TranslationKey, string> = {
   "files.edit": "编辑 {name}",
   "files.download": "下载 {name}",
   "files.delete": "删除 {name}",
+  "files.rename": "重命名 {name}",
 
   "git.status": "Git 状态",
   "git.graph": "Git 图",
@@ -424,6 +445,7 @@ const zhCN: Record<TranslationKey, string> = {
   "git.stageFile": "暂存 {path}",
   "git.unstageFile": "取消暂存 {path}",
   "git.discardFile": "撤销 {path}",
+  "git.diffFile": "查看差异 {path}",
   "git.commits": "Git 提交图",
 
   "status.attached": "已接入",
@@ -473,6 +495,12 @@ const zhCN: Record<TranslationKey, string> = {
   "terminal.sendCtrlZ": "发送 Ctrl-Z",
   "terminal.sendCtrlD": "发送 Ctrl-D",
   "terminal.paste": "粘贴",
+  "terminal.search": "搜索终端",
+  "terminal.searchPlaceholder": "搜索滚动历史",
+  "terminal.previousMatch": "上一个匹配",
+  "terminal.nextMatch": "下一个匹配",
+  "terminal.closeSearch": "关闭搜索",
+  "terminal.searchFailed": "搜索失败",
 
   "qr.startingCamera": "正在启动摄像头",
   "qr.cameraNotAvailable": "摄像头不可用",

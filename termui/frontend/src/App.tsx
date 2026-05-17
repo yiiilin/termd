@@ -34,9 +34,11 @@ import type {
   SessionFilesResultPayload,
   SessionGitActionKind,
   SessionGitFileChangePayload,
+  SessionGitDiffResultPayload,
   SessionGitResultPayload,
   SessionGitWorktreePayload,
   SessionResizedPayload,
+  SessionSearchResultPayload,
   SessionSummaryPayload,
   TerminalSize,
   UUID,
@@ -144,6 +146,13 @@ export default function App() {
     saving: boolean;
     error?: string;
   } | undefined>();
+  const [diffViewer, setDiffViewer] = useState<{
+    path: string;
+    name: string;
+    text: string;
+    loading: boolean;
+    error?: string;
+  } | undefined>();
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [filesPanelOpen, setFilesPanelOpen] = useState(true);
   const [filesPanelWidth, setFilesPanelWidth] = useState(DEFAULT_FILES_PANEL_WIDTH);
@@ -191,6 +200,7 @@ export default function App() {
   const connectionAutoRetryKeyRef = useRef<string | undefined>(undefined);
   const connectionAutoRetryAttemptsRef = useRef(0);
   const daemonNetworkSampleRef = useRef<DaemonNetworkCounterSample | undefined>(undefined);
+  const lastNotificationAtRef = useRef(0);
   const isMobileLayout = useMobileLayout();
   const visualViewportMetrics = useVisualViewportMetrics(isMobileLayout && activeSurface === "workspace");
   const systemTheme = useSystemTheme();
@@ -387,6 +397,9 @@ export default function App() {
     (nextPreferences: BrowserPreferences) => {
       // 偏好是当前浏览器的纯 UI 状态；先乐观更新，保存失败再显示错误。
       setState((current) => ({ ...current, preferences: nextPreferences }));
+      if (nextPreferences.notifications !== "off" && typeof Notification !== "undefined" && Notification.permission === "default") {
+        void Notification.requestPermission().catch(() => undefined);
+      }
       void saveBrowserPreferences(nextPreferences)
         .then((nextState) => setState(nextState))
         .catch(setSafeError);
@@ -1017,7 +1030,14 @@ export default function App() {
       }
       return new Set(current).add(sessionId);
     });
-  }, []);
+    maybeNotifyBrowser(
+      preferences,
+      t("sessions.openNewOutput", {
+        name: sessionDisplayName(sessions.find((session) => session.session_id === sessionId) ?? { session_id: sessionId }),
+      }),
+      lastNotificationAtRef,
+    );
+  }, [preferences, sessions, t]);
 
   useEffect(() => {
     if (!activeServer || !state.device || status !== "idle" || autoCheckedServerRef.current === activeServer.server_id) {
@@ -1675,6 +1695,61 @@ export default function App() {
     [authenticatedSessionClient, loadSessionGit],
   );
 
+  const handleTerminalSearch = useCallback(
+    async (query: string): Promise<SessionSearchResultPayload> => {
+      const sessionId = attachedSessionRef.current;
+      if (!sessionId) {
+        throw new ProtocolClientError("invalid_state", "no attached session");
+      }
+      let transientClient: DirectClient | undefined;
+      try {
+        transientClient = await authenticatedSessionClient(sessionId);
+        return await transientClient.searchSessionOutput(sessionId, query, { maxResults: 80 });
+      } finally {
+        transientClient?.close();
+      }
+    },
+    [authenticatedSessionClient],
+  );
+
+  const handleOpenGitDiff = useCallback(
+    async (worktree: SessionGitWorktreePayload, change?: SessionGitFileChangePayload, staged = false) => {
+      const sessionId = attachedSessionRef.current;
+      if (!sessionId) {
+        return;
+      }
+      const path = change?.path ?? worktree.path;
+      setDiffViewer({
+        path,
+        name: change ? basenameRemotePath(change.path) : t("git.graph"),
+        text: "",
+        loading: true,
+      });
+      let client: DirectClient | undefined;
+      try {
+        client = await authenticatedSessionClient(sessionId);
+        const diff: SessionGitDiffResultPayload = await client.getSessionGitDiff(sessionId, worktree.path, change?.path, staged);
+        setDiffViewer({
+          path: diff.file_path ?? diff.worktree_path,
+          name: diff.file_path ? basenameRemotePath(diff.file_path) : t("git.graph"),
+          text: diff.diff || "\n",
+          loading: false,
+        });
+      } catch (caught) {
+        setDiffViewer((current) => ({
+          path: current?.path ?? path,
+          name: current?.name ?? path,
+          text: current?.text ?? "",
+          loading: false,
+          error: translateSafeErrorMessage(toSafeError(caught), t),
+        }));
+      } finally {
+        client?.close();
+      }
+    },
+    [authenticatedSessionClient, t],
+  );
+
   const handleSessionFilesPanelTabChange = useCallback(
     (tab: "files" | "git") => {
       setSessionFilesPanelTab(tab);
@@ -2271,6 +2346,8 @@ export default function App() {
                 outputResetVersion={terminalOutputResetVersion}
                 takeOutput={takeTerminalOutput}
                 registerOutputDrain={registerTerminalOutputDrain}
+                mobileShortcuts={preferences.mobileShortcuts}
+                onSearch={handleTerminalSearch}
                 onInput={handleTerminalInput}
                 onResize={handleResize}
                 onCursorChange={handleCursorChange}
@@ -2291,6 +2368,7 @@ export default function App() {
                     onOpenDirectory={handleOpenDirectory}
                     onOpenFile={handleOpenFile}
                     onOpenGitFile={handleOpenGitFile}
+                    onOpenGitDiff={handleOpenGitDiff}
                     onGitAction={handleSessionGitAction}
                     onGoToPath={handleGoToFilePath}
                     onRefresh={handleRefreshSessionFiles}
@@ -2399,6 +2477,7 @@ export default function App() {
               onOpenDirectory={handleOpenDirectory}
               onOpenFile={handleOpenFile}
               onOpenGitFile={handleOpenGitFile}
+              onOpenGitDiff={handleOpenGitDiff}
               onGitAction={handleSessionGitAction}
               onGoToPath={handleGoToFilePath}
               onRefresh={handleRefreshSessionFiles}
@@ -2423,6 +2502,19 @@ export default function App() {
           theme={effectiveTheme}
           onSave={handleSaveOpenFile}
           onClose={() => setFileEditor(undefined)}
+        />
+        <FileEditorDialog
+          open={Boolean(diffViewer)}
+          path={diffViewer?.path ?? ""}
+          name={diffViewer?.name}
+          initialText={diffViewer?.text ?? ""}
+          loading={diffViewer?.loading}
+          error={diffViewer?.error}
+          language="diff"
+          theme={effectiveTheme}
+          readOnly
+          onSave={() => undefined}
+          onClose={() => setDiffViewer(undefined)}
         />
         <SettingsDialog
           open={settingsOpen}
@@ -2941,6 +3033,30 @@ function daemonAddressForTitle(rawUrl: string): string {
 
 function terminalSizeDisplay(size: TerminalSize): string {
   return `${size.cols}x${size.rows}`;
+}
+
+function maybeNotifyBrowser(
+  preferences: BrowserPreferences,
+  body: string,
+  lastNotificationAtRef: React.MutableRefObject<number>,
+): void {
+  if (preferences.notifications === "off" || typeof Notification === "undefined" || Notification.permission !== "granted") {
+    return;
+  }
+  const now = Date.now();
+  if (now - lastNotificationAtRef.current < 3000) {
+    return;
+  }
+  lastNotificationAtRef.current = now;
+  try {
+    new Notification("Termd", {
+      body,
+      tag: "termd-session-activity",
+      silent: true,
+    });
+  } catch {
+    // 浏览器通知失败不应影响终端主链路。
+  }
 }
 
 function formatBytesCompact(bytes: number): string {

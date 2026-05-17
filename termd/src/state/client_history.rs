@@ -354,6 +354,82 @@ impl ClientHistoryStore {
         Ok(())
     }
 
+    /// 删除单个已关闭 session 的展示历史。调用方必须先确认对应 supervisor 已经结束。
+    pub fn prune_closed_session(&mut self, session_id: SessionId) -> Result<bool, StateError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&self.path, source))?;
+        tx.execute(
+            "DELETE FROM daemon_client_attached_sessions WHERE session_id = ?1",
+            params![session_id_text(session_id)],
+        )
+        .map_err(|source| sqlite_error(&self.path, source))?;
+        let deleted = tx
+            .execute(
+                "DELETE FROM daemon_sessions WHERE session_id = ?1 AND state = ?2",
+                params![
+                    session_id_text(session_id),
+                    session_state_text(SessionState::Closed)
+                ],
+            )
+            .map_err(|source| sqlite_error(&self.path, source))?
+            > 0;
+        tx.commit()
+            .map_err(|source| sqlite_error(&self.path, source))?;
+        Ok(deleted)
+    }
+
+    /// 清理已经不可恢复的 closed 展示行；仍有 live supervisor 的 id 必须保留。
+    pub fn prune_closed_sessions_except(
+        &mut self,
+        protected_session_ids: &HashSet<SessionId>,
+    ) -> Result<usize, StateError> {
+        let protected = protected_session_ids
+            .iter()
+            .map(|session_id| session_id_text(*session_id))
+            .collect::<HashSet<_>>();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&self.path, source))?;
+        let mut stmt = tx
+            .prepare("SELECT session_id FROM daemon_sessions WHERE state = ?1")
+            .map_err(|source| sqlite_error(&self.path, source))?;
+        let rows = stmt
+            .query_map(params![session_state_text(SessionState::Closed)], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|source| sqlite_error(&self.path, source))?;
+        let mut deletable = Vec::new();
+        for row in rows {
+            let session_id = row.map_err(|source| sqlite_error(&self.path, source))?;
+            if !protected.contains(&session_id) {
+                deletable.push(session_id);
+            }
+        }
+        drop(stmt);
+
+        let mut deleted = 0;
+        for session_id in deletable {
+            tx.execute(
+                "DELETE FROM daemon_client_attached_sessions WHERE session_id = ?1",
+                params![session_id.as_str()],
+            )
+            .map_err(|source| sqlite_error(&self.path, source))?;
+            // closed 且没有 live supervisor 保护的展示行已经不可打开，保留只会污染统计。
+            deleted += tx
+                .execute(
+                    "DELETE FROM daemon_sessions WHERE session_id = ?1 AND state = ?2",
+                    params![session_id, session_state_text(SessionState::Closed)],
+                )
+                .map_err(|source| sqlite_error(&self.path, source))?;
+        }
+        tx.commit()
+            .map_err(|source| sqlite_error(&self.path, source))?;
+        Ok(deleted)
+    }
+
     /// 持久化 session 级文件树当前位置；多个 Web 客户端共享这一份状态。
     pub fn record_session_files_path(
         &mut self,

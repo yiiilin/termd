@@ -894,6 +894,26 @@ label {
   outline-offset: 2px;
 }
 
+.settings-shortcuts-textarea {
+  width: 100%;
+  min-height: 92px;
+  resize: vertical;
+  border: 1px solid var(--color-border-input);
+  border-radius: 6px;
+  background: var(--color-surface-sunken);
+  color: var(--color-text);
+  padding: 8px;
+  font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.settings-shortcuts-textarea:focus {
+  outline: none;
+  border-color: var(--color-focus);
+  box-shadow: 0 0 0 1px var(--color-focus);
+}
+
 .connection-status {
   gap: 8px;
 }
@@ -1553,6 +1573,59 @@ label {
 .terminal-mobile-shortcuts,
 .terminal-direction-pad {
   display: none;
+}
+
+.terminal-search-control {
+  position: absolute;
+  top: 8px;
+  right: 10px;
+  z-index: 8;
+  display: flex;
+  align-items: center;
+}
+
+.terminal-search-button {
+  background: var(--color-toast-bg);
+}
+
+.terminal-search-popover {
+  min-width: min(420px, calc(100vw - 28px));
+  border: 1px solid var(--color-border-panel);
+  border-radius: 8px;
+  background: var(--color-toast-bg);
+  box-shadow: 0 12px 30px var(--color-popover-shadow);
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) repeat(3, 28px) minmax(54px, max-content) 28px;
+  align-items: center;
+  gap: 5px;
+  padding: 6px;
+}
+
+.terminal-search-popover input {
+  width: 100%;
+  min-width: 0;
+  height: 28px;
+  border: 1px solid var(--color-border-input);
+  border-radius: 6px;
+  background: var(--color-surface-sunken);
+  color: var(--color-text);
+  padding: 0 8px;
+  font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+  font-size: 12px;
+}
+
+.terminal-search-popover .icon-button {
+  width: 28px;
+  min-height: 28px;
+}
+
+.terminal-search-count {
+  min-width: 54px;
+  color: var(--color-text-muted);
+  font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+  font-size: 11px;
+  text-align: right;
+  white-space: nowrap;
 }
 
 .terminal-placeholder {
@@ -2905,10 +2978,18 @@ label {
     width: 100%;
     max-width: 100%;
     min-height: 0;
-    grid-template-rows: minmax(0, 1fr) 42px;
+    grid-template-rows: minmax(0, 1fr);
   }
 
   .terminal-pane-viewer {
+    grid-template-rows: 36px minmax(0, 1fr);
+  }
+
+  .app-shell.mobile-keyboard-open .terminal-pane {
+    grid-template-rows: minmax(0, 1fr) 42px;
+  }
+
+  .app-shell.mobile-keyboard-open .terminal-pane-viewer {
     grid-template-rows: 36px minmax(0, 1fr) 42px;
   }
 

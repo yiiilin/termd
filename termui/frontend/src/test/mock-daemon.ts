@@ -23,8 +23,13 @@ import type {
   SessionFileReadResultPayload,
   SessionFileWrittenPayload,
   SessionGitActionPayload,
+  SessionGitDiffPayload,
+  SessionGitDiffResultPayload,
   SessionFilesResultPayload,
   SessionGitResultPayload,
+  SessionSearchMatchPayload,
+  SessionSearchPayload,
+  SessionSearchResultPayload,
   SessionSummaryPayload,
   TerminalSize,
   UUID,
@@ -96,6 +101,8 @@ export class MockDaemon {
   public readonly sessionFileDeletes: Array<{ session_id: UUID; path: string }> = [];
   public readonly sessionGitRequests: Array<{ session_id: UUID }> = [];
   public readonly sessionGitActions: SessionGitActionPayload[] = [];
+  public readonly sessionGitDiffRequests: SessionGitDiffPayload[] = [];
+  public readonly sessionSearchRequests: SessionSearchPayload[] = [];
   public daemonStatusRequests = 0;
   public pingMessages = 0;
   public readonly decryptedInputs: string[] = [];
@@ -106,6 +113,7 @@ export class MockDaemon {
   private readonly trustedDevices = new Map<UUID, TrustedDevice>();
   private readonly connections = new Set<MockConnection>();
   private readonly sessionFilePositions = new Map<UUID, string>();
+  private readonly sessionOutputSnapshots = new Map<UUID, string>();
 
   private constructor(
     private readonly server: WebSocketServer,
@@ -162,6 +170,7 @@ export class MockDaemon {
   }
 
   pushSessionData(sessionId: UUID, text: string): void {
+    this.appendSessionOutput(sessionId, text);
     for (const connection of this.connections) {
       if (connection.e2ee && connection.attachedSessionIds.has(sessionId)) {
         this.sendInner(
@@ -378,6 +387,9 @@ export class MockDaemon {
           }),
         );
         if (this.options.attachOutput) {
+          if (!this.sessionOutputSnapshots.has(payload.session_id)) {
+            this.appendSessionOutput(payload.session_id, this.options.attachOutput);
+          }
           this.sendInner(
             connection,
             envelope("session_data", {
@@ -489,6 +501,16 @@ export class MockDaemon {
         );
         return;
       }
+      case "session_search": {
+        const payload = inner.payload as SessionSearchPayload;
+        if (!this.ensureAttached(connection, payload.session_id)) {
+          return;
+        }
+        this.sessionSearchRequests.push(payload);
+        const result = mockSessionSearchResult(payload, this.sessionOutputSnapshots.get(payload.session_id) ?? "");
+        this.sendInner(connection, envelope("session_search_result", result));
+        return;
+      }
       case "session_git": {
         const payload = inner.payload as { session_id: UUID };
         if (!this.ensureAttached(connection, payload.session_id)) {
@@ -499,6 +521,15 @@ export class MockDaemon {
           connection,
           envelope("session_git_result", this.options.sessionGit?.[payload.session_id] ?? defaultSessionGit(payload.session_id)),
         );
+        return;
+      }
+      case "session_git_diff": {
+        const payload = inner.payload as SessionGitDiffPayload;
+        if (!this.ensureAttached(connection, payload.session_id)) {
+          return;
+        }
+        this.sessionGitDiffRequests.push(payload);
+        this.sendInner(connection, envelope("session_git_diff_result", mockSessionGitDiffResult(payload)));
         return;
       }
       case "session_git_action": {
@@ -586,6 +617,7 @@ export class MockDaemon {
           path: payload.path,
           text: decodeUtf8(bytes),
         });
+        this.applyMockFileWrite(payload.session_id, payload.path);
         this.sendInner(
           connection,
           envelope("session_file_written", {
@@ -603,6 +635,7 @@ export class MockDaemon {
           return;
         }
         this.sessionFileDeletes.push(payload);
+        this.applyMockFileDelete(payload.session_id, payload.path);
         this.sendInner(connection, envelope("session_file_deleted", payload));
         return;
       }
@@ -647,6 +680,7 @@ export class MockDaemon {
     connection.attachedSessionIds.add(created.session_id);
     this.sendInner(connection, envelope("session_created", created));
     if (this.options.attachOutput) {
+      this.appendSessionOutput(created.session_id, this.options.attachOutput);
       this.sendInner(
         connection,
         envelope("session_data", {
@@ -665,6 +699,50 @@ export class MockDaemon {
     if (client) {
       client.name = payload.name;
     }
+  }
+
+  private appendSessionOutput(sessionId: UUID, text: string): void {
+    const current = this.sessionOutputSnapshots.get(sessionId) ?? "";
+    this.sessionOutputSnapshots.set(sessionId, `${current}${text}`);
+  }
+
+  private applyMockFileWrite(sessionId: UUID, path: string): void {
+    const parent = parentDirectory(path);
+    const record = this.findSessionFilesRecord(sessionId, parent);
+    if (!record) {
+      return;
+    }
+
+    const index = record.entries.findIndex((entry) => entry.path === path);
+    const nextEntry = {
+      name: basenamePath(path),
+      path,
+      kind: "file" as const,
+      size_bytes: index >= 0 ? record.entries[index].size_bytes : 0,
+      modified_at_ms: null,
+    };
+
+    if (index >= 0) {
+      record.entries[index] = nextEntry;
+      return;
+    }
+    record.entries.push(nextEntry);
+  }
+
+  private applyMockFileDelete(sessionId: UUID, path: string): void {
+    const parent = parentDirectory(path);
+    const record = this.findSessionFilesRecord(sessionId, parent);
+    if (!record) {
+      return;
+    }
+
+    record.entries = record.entries.filter((entry) => entry.path !== path);
+  }
+
+  private findSessionFilesRecord(sessionId: UUID, path: string): SessionFilesResultPayload | undefined {
+    return Object.values(this.options.sessionFiles ?? {}).find(
+      (record) => record.session_id === sessionId && record.path === path,
+    );
   }
 
   private ensureAttached(connection: MockConnection, sessionId: UUID): boolean {
@@ -821,4 +899,82 @@ function defaultSessionGit(sessionId: UUID): SessionGitResultPayload {
     graph: ["* a1b2c3d main commit"],
     error: null,
   };
+}
+
+function mockSessionSearchResult(payload: SessionSearchPayload, source: string): SessionSearchResultPayload {
+  const query = payload.query.trim();
+  const caseSensitive = payload.case_sensitive;
+  const maxResults = Math.max(1, Math.min(payload.max_results ?? 80, 500));
+  const lines = source.split(/\r?\n/);
+  const needle = caseSensitive ? query : query.toLowerCase();
+  const matches: SessionSearchMatchPayload[] = [];
+
+  for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+    const line = lines[lineIndex] ?? "";
+    const haystack = caseSensitive ? line : line.toLowerCase();
+    let searchIndex = 0;
+    while (query && searchIndex <= haystack.length) {
+      const matchIndex = haystack.indexOf(needle, searchIndex);
+      if (matchIndex < 0) {
+        break;
+      }
+      if (matches.length >= maxResults) {
+        return {
+          session_id: payload.session_id,
+          query,
+          line_count: lines.length,
+          matches,
+          truncated: true,
+        };
+      }
+      matches.push({
+        line_index: lineIndex,
+        column_index: matchIndex,
+        line_text: line,
+      });
+      searchIndex = matchIndex + Math.max(1, needle.length);
+    }
+  }
+
+  return {
+    session_id: payload.session_id,
+    query,
+    line_count: lines.length,
+    matches,
+    truncated: false,
+  };
+}
+
+function mockSessionGitDiffResult(payload: SessionGitDiffPayload): SessionGitDiffResultPayload {
+  const fileLabel = payload.file_path?.trim() || payload.worktree_path;
+  const staged = Boolean(payload.staged);
+  const prefix = staged ? "staged" : "unstaged";
+  return {
+    session_id: payload.session_id,
+    worktree_path: payload.worktree_path,
+    file_path: payload.file_path?.trim() || undefined,
+    staged,
+    diff: [
+      `diff --git a/${fileLabel} b/${fileLabel}`,
+      `--- a/${fileLabel}`,
+      `+++ b/${fileLabel}`,
+      `@@ -1 +1 @@`,
+      `${staged ? "+" : "-"} mock ${prefix} diff for ${fileLabel}`,
+    ].join("\n") + "\n",
+  };
+}
+
+function parentDirectory(path: string): string {
+  const trimmed = path.replace(/\/+$/, "");
+  const index = trimmed.lastIndexOf("/");
+  if (index <= 0) {
+    return "/";
+  }
+  return trimmed.slice(0, index);
+}
+
+function basenamePath(path: string): string {
+  const trimmed = path.replace(/\/+$/, "");
+  const index = trimmed.lastIndexOf("/");
+  return index >= 0 ? trimmed.slice(index + 1) || trimmed : trimmed;
 }

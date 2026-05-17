@@ -196,8 +196,8 @@ describe("浏览器本地状态", () => {
 
   it("持久化客户端偏好，并对旧数据或异常值做安全归一化", async () => {
     const next = await saveBrowserPreferences({ language: "zh-CN", theme: "light" });
-    expect(next.preferences).toEqual({ language: "zh-CN", theme: "light" });
-    expect((await loadBrowserState()).preferences).toEqual({ language: "zh-CN", theme: "light" });
+    expect(next.preferences).toEqual({ language: "zh-CN", theme: "light", notifications: "off", mobileShortcuts: [] });
+    expect((await loadBrowserState()).preferences).toEqual({ language: "zh-CN", theme: "light", notifications: "off", mobileShortcuts: [] });
 
     await saveBrowserState({
       pairedServers: [],
@@ -207,7 +207,27 @@ describe("浏览器本地状态", () => {
       },
     } as unknown as BrowserState);
 
-    expect((await loadBrowserState()).preferences).toEqual({ language: "auto", theme: "system" });
+    expect((await loadBrowserState()).preferences).toEqual({ language: "auto", theme: "system", notifications: "off", mobileShortcuts: [] });
+  });
+
+  it("持久化移动端快捷键和通知偏好，并过滤异常快捷键", async () => {
+    const next = await saveBrowserPreferences({
+      language: "en-US",
+      theme: "dark",
+      notifications: "mentions",
+      mobileShortcuts: [
+        { label: "PgUp", data: "\x1b[5~" },
+        { label: "", data: "ignored" },
+        { label: "Bad", data: "\0" },
+      ],
+    });
+
+    expect(next.preferences).toEqual({
+      language: "en-US",
+      theme: "dark",
+      notifications: "mentions",
+      mobileShortcuts: [{ label: "PgUp", data: "\x1b[5~" }],
+    });
   });
 });
 

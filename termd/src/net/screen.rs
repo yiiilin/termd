@@ -111,7 +111,6 @@ impl TerminalLine {
         self.cells.iter().all(|cell| cell.is_blank_default())
     }
 
-    #[cfg(test)]
     fn plain_text(&self) -> String {
         self.cells
             .iter()
@@ -367,6 +366,13 @@ impl TerminalScreen {
         output
     }
 
+    pub(crate) fn snapshot_plain_lines(&self) -> Vec<String> {
+        self.snapshot_lines()
+            .into_iter()
+            .map(|line| line.plain_text())
+            .collect()
+    }
+
     pub(crate) fn cell_count(&self) -> usize {
         self.lines.len().saturating_mul(self.cols)
     }
@@ -402,7 +408,6 @@ impl TerminalScreen {
         self.lines.iter().skip(self.visible_start()).collect()
     }
 
-    #[cfg(test)]
     fn snapshot_lines(&self) -> Vec<&TerminalLine> {
         let Some((start, end)) = self.snapshot_line_bounds() else {
             return Vec::new();

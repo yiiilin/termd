@@ -12,6 +12,25 @@ version="${1:-}"
 }
 
 case "$version" in
+  0.1.34)
+    cat <<'EOF'
+termd 0.1.34
+
+用户可见变化:
+- 终端新增搜索入口，搜索结果会在 xterm 渲染层高亮，并支持上一个/下一个结果跳转；搜索计数区域重新布局，关闭按钮不再遮挡结果文字。
+- daemon 支持在当前内存中的终端 screen snapshot 内搜索文本；搜索不会把 PTY 明文写入 SQLite 或状态文件。
+- Git panel 支持查看 worktree 或单个文件的 diff，使用只读编辑器打开；仍保留 Stage、Unstage、Discard 和打开文件能力。
+- 文件 panel 去掉复制/移动入口，Git panel 去掉 commit/stash 入口；对应浏览器协议与测试桩也同步收口，避免留下未展示的写操作入口。
+- 设置里新增浏览器通知和移动端快捷键配置；移动端快捷栏可叠加自定义按钮，后台 session 有新输出时可按偏好触发浏览器通知。
+- 关闭 session 后会清理不可再次打开的 closed 展示记录；daemon 启动时也会清理无 live supervisor 保护的 closed 记录，避免列表里长期残留无法打开的 session。
+- 本地源码更新新增 `scripts/update-local-termd.sh`，会在重启主 daemon 前后校验 supervisor PID、running session 计数和 healthz，避免普通 termd 更新误杀现有 session。
+
+兼容性:
+- 这是 daemon/Web UI/协议更新，不要求 supervisor 兼容版本升级；默认本地更新不应终止或清空现有 session。
+- 终端搜索只覆盖 daemon 当前保留的内存 screen snapshot，不是跨历史日志的全量检索。
+- 浏览器通知需要当前浏览器授权；未授权或不支持 Notification API 时不会影响终端主链路。
+EOF
+    ;;
   0.1.33)
     cat <<'EOF'
 termd 0.1.33

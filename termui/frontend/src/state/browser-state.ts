@@ -17,6 +17,8 @@ const STATE_KEY = "current";
 export const DEFAULT_BROWSER_PREFERENCES: BrowserPreferences = {
   language: "auto",
   theme: "system",
+  notifications: "off",
+  mobileShortcuts: [],
 };
 
 export async function loadBrowserState(): Promise<BrowserState> {
@@ -202,9 +204,13 @@ function normalizePreferences(value: unknown): BrowserPreferences {
   const source = isObjectRecord(value) ? value : {};
   const language = normalizeLanguagePreference(source.language);
   const theme = normalizeThemePreference(source.theme);
+  const notifications = normalizeNotificationPreference(source.notifications);
+  const mobileShortcuts = normalizeMobileShortcuts(source.mobileShortcuts);
   return {
     language,
     theme,
+    notifications,
+    mobileShortcuts,
   };
 }
 
@@ -220,6 +226,35 @@ function normalizeThemePreference(value: unknown): BrowserThemePreference {
     return value;
   }
   return DEFAULT_BROWSER_PREFERENCES.theme;
+}
+
+function normalizeNotificationPreference(value: unknown): BrowserPreferences["notifications"] {
+  if (value === "off" || value === "mentions" || value === "all") {
+    return value;
+  }
+  return DEFAULT_BROWSER_PREFERENCES.notifications;
+}
+
+function normalizeMobileShortcuts(value: unknown): BrowserPreferences["mobileShortcuts"] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .map((shortcut) => {
+      if (!isObjectRecord(shortcut)) {
+        return undefined;
+      }
+      const label = typeof shortcut.label === "string" ? shortcut.label.trim() : "";
+      const data = typeof shortcut.data === "string" ? shortcut.data : "";
+      if (!label || !data || label.length > 12 || data.length > 64 || [...data].some((character) => character === "\0")) {
+        return undefined;
+      }
+      // 移动快捷键允许控制字符，但不允许空标签或过长数据，避免 IndexedDB 偏好被异常值污染。
+      return { label, data };
+    })
+    .filter((shortcut): shortcut is NonNullable<typeof shortcut> => Boolean(shortcut))
+    .slice(0, 12);
 }
 
 function isObjectRecord(value: unknown): value is Record<string, unknown> {

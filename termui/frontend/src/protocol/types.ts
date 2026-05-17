@@ -21,12 +21,16 @@ export const ALL_MESSAGE_TYPES = [
   "session_reordered",
   "session_close",
   "session_closed",
+  "session_search",
+  "session_search_result",
   "session_files",
   "session_files_result",
   "session_git",
   "session_git_result",
   "session_git_action",
   "session_git_action_result",
+  "session_git_diff",
+  "session_git_diff_result",
   "session_file_read",
   "session_file_read_result",
   "session_file_write",
@@ -272,6 +276,27 @@ export interface SessionClosedPayload {
   session_id: UUID;
 }
 
+export interface SessionSearchPayload {
+  session_id: UUID;
+  query: string;
+  case_sensitive?: boolean;
+  max_results?: number | null;
+}
+
+export interface SessionSearchMatchPayload {
+  line_index: number;
+  column_index: number;
+  line_text: string;
+}
+
+export interface SessionSearchResultPayload {
+  session_id: UUID;
+  query: string;
+  line_count: number;
+  matches: SessionSearchMatchPayload[];
+  truncated: boolean;
+}
+
 export type SessionFileKind = "file" | "directory" | "symlink" | "other";
 
 export interface SessionFilesPayload {
@@ -334,6 +359,21 @@ export interface SessionGitActionResultPayload {
   worktree_path: string;
   file_path: string;
   action: SessionGitActionKind;
+}
+
+export interface SessionGitDiffPayload {
+  session_id: UUID;
+  worktree_path: string;
+  file_path?: string | null;
+  staged?: boolean;
+}
+
+export interface SessionGitDiffResultPayload {
+  session_id: UUID;
+  worktree_path: string;
+  file_path?: string | null;
+  staged: boolean;
+  diff: string;
 }
 
 export interface SessionFileReadPayload {
@@ -472,10 +512,18 @@ export interface PairedServerState {
 export type BrowserLanguagePreference = "auto" | "zh-CN" | "en-US";
 export type BrowserThemePreference = "system" | "dark" | "light";
 export type EffectiveTheme = "dark" | "light";
+export type BrowserNotificationPreference = "off" | "mentions" | "all";
+
+export interface BrowserMobileShortcut {
+  label: string;
+  data: string;
+}
 
 export interface BrowserPreferences {
   language: BrowserLanguagePreference;
   theme: BrowserThemePreference;
+  notifications?: BrowserNotificationPreference;
+  mobileShortcuts?: BrowserMobileShortcut[];
 }
 
 export interface BrowserState {

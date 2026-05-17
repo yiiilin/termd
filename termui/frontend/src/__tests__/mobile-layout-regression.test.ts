@@ -19,4 +19,11 @@ describe("mobile layout regressions", () => {
     expect(css).toContain("position: fixed !important;");
     expect(css).toContain("min-height: 0 !important;");
   });
+
+  it("keeps terminal search result text in its own grid column before the close button", () => {
+    const css = readFileSync(resolve(process.cwd(), "src/styles.css"), "utf8");
+
+    expect(css).toContain("grid-template-columns: minmax(0, 1fr) repeat(3, 28px) minmax(54px, max-content) 28px;");
+    expect(css).toContain(".terminal-search-count {\n  min-width: 54px;");
+  });
 });

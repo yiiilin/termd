@@ -1,5 +1,5 @@
-import { MonitorCog, Palette, Languages, X } from "lucide-react";
-import type { BrowserPreferences, BrowserLanguagePreference, BrowserThemePreference, EffectiveTheme } from "../protocol/types";
+import { Bell, Keyboard, MonitorCog, Palette, Languages, X } from "lucide-react";
+import type { BrowserNotificationPreference, BrowserPreferences, BrowserLanguagePreference, BrowserThemePreference, EffectiveTheme } from "../protocol/types";
 import { useI18n, type Locale } from "../i18n";
 
 interface SettingsDialogProps {
@@ -27,6 +27,12 @@ export function SettingsDialog({
 
   const setLanguage = (language: BrowserLanguagePreference) => onPreferencesChange({ ...preferences, language });
   const setTheme = (theme: BrowserThemePreference) => onPreferencesChange({ ...preferences, theme });
+  const setNotifications = (notifications: BrowserNotificationPreference) => onPreferencesChange({ ...preferences, notifications });
+  const setMobileShortcutsText = (text: string) =>
+    onPreferencesChange({
+      ...preferences,
+      mobileShortcuts: parseMobileShortcutsText(text),
+    });
 
   return (
     <div className="modal-backdrop settings-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
@@ -93,6 +99,42 @@ export function SettingsDialog({
             </div>
             <p>{t("settings.effective", { value: t(themeLabelKey(effectiveTheme)) })}</p>
           </fieldset>
+
+          <fieldset className="settings-fieldset">
+            <legend>
+              <Bell size={15} aria-hidden="true" />
+              <span>{t("settings.notifications")}</span>
+            </legend>
+            <div className="settings-segmented" role="radiogroup" aria-label={t("settings.notifications")}>
+              {notificationOptions.map((option) => (
+                <label key={option.value}>
+                  <input
+                    type="radio"
+                    name="termd-notifications"
+                    value={option.value}
+                    checked={(preferences.notifications ?? "off") === option.value}
+                    onChange={() => setNotifications(option.value)}
+                  />
+                  <span>{t(option.labelKey)}</span>
+                </label>
+              ))}
+            </div>
+          </fieldset>
+
+          <fieldset className="settings-fieldset">
+            <legend>
+              <Keyboard size={15} aria-hidden="true" />
+              <span>{t("settings.mobileShortcuts")}</span>
+            </legend>
+            <textarea
+              className="settings-shortcuts-textarea"
+              value={mobileShortcutsText(preferences.mobileShortcuts ?? [])}
+              placeholder={"PgUp=\\u001b[5~\nPgDn=\\u001b[6~"}
+              spellCheck={false}
+              onChange={(event) => setMobileShortcutsText(event.currentTarget.value)}
+            />
+            <p>{t("settings.mobileShortcutsHelp")}</p>
+          </fieldset>
         </div>
       </section>
     </div>
@@ -111,10 +153,56 @@ const themeOptions: Array<{ value: BrowserThemePreference; labelKey: "settings.t
   { value: "light", labelKey: "settings.theme.light" },
 ];
 
+const notificationOptions: Array<{ value: BrowserNotificationPreference; labelKey: "settings.notifications.off" | "settings.notifications.mentions" | "settings.notifications.all" }> = [
+  { value: "off", labelKey: "settings.notifications.off" },
+  { value: "mentions", labelKey: "settings.notifications.mentions" },
+  { value: "all", labelKey: "settings.notifications.all" },
+];
+
 function localeLabelKey(locale: Locale): "settings.language.zhCN" | "settings.language.enUS" {
   return locale === "zh-CN" ? "settings.language.zhCN" : "settings.language.enUS";
 }
 
 function themeLabelKey(theme: EffectiveTheme): "settings.theme.dark" | "settings.theme.light" {
   return theme === "dark" ? "settings.theme.dark" : "settings.theme.light";
+}
+
+function mobileShortcutsText(shortcuts: NonNullable<BrowserPreferences["mobileShortcuts"]>): string {
+  return shortcuts.map((shortcut) => `${shortcut.label}=${escapeShortcutData(shortcut.data)}`).join("\n");
+}
+
+function parseMobileShortcutsText(text: string): NonNullable<BrowserPreferences["mobileShortcuts"]> {
+  return text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const separator = line.indexOf("=");
+      if (separator <= 0) {
+        return undefined;
+      }
+      const label = line.slice(0, separator).trim().slice(0, 12);
+      const data = unescapeShortcutData(line.slice(separator + 1).trim()).slice(0, 64);
+      return label && data ? { label, data } : undefined;
+    })
+    .filter((shortcut): shortcut is NonNullable<typeof shortcut> => Boolean(shortcut))
+    .slice(0, 12);
+}
+
+function escapeShortcutData(data: string): string {
+  return data
+    .replace(/\\/g, "\\\\")
+    .replace(/\x1b/g, "\\e")
+    .replace(/\t/g, "\\t")
+    .replace(/\r/g, "\\r")
+    .replace(/\n/g, "\\n");
+}
+
+function unescapeShortcutData(data: string): string {
+  return data
+    .replace(/\\e/g, "\x1b")
+    .replace(/\\t/g, "\t")
+    .replace(/\\r/g, "\r")
+    .replace(/\\n/g, "\n")
+    .replace(/\\\\/g, "\\");
 }

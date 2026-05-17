@@ -245,3 +245,48 @@ vi.mock("@xterm/addon-fit", () => {
 
   return { FitAddon };
 });
+
+vi.mock("@xterm/addon-search", () => {
+  class SearchAddon {
+    private terminal?: { element?: HTMLElement };
+
+    activate(terminal: { element?: HTMLElement }) {
+      this.terminal = terminal;
+    }
+
+    findNext(term: string, options?: { decorations?: unknown }) {
+      this.renderSearchMarker(term, Boolean(options?.decorations));
+      return Boolean(term);
+    }
+
+    findPrevious(term: string, options?: { decorations?: unknown }) {
+      this.renderSearchMarker(term, Boolean(options?.decorations));
+      return Boolean(term);
+    }
+
+    clearDecorations() {
+      this.terminal?.element?.querySelectorAll("[data-testid='xterm-search-highlight']").forEach((node) => node.remove());
+    }
+
+    clearActiveDecoration() {}
+
+    dispose() {
+      this.clearDecorations();
+    }
+
+    private renderSearchMarker(term: string, enabled: boolean) {
+      this.clearDecorations();
+      if (!term || !enabled || !this.terminal?.element) {
+        return;
+      }
+      // 测试 mock 不复刻 xterm 的真实 decoration DOM，只暴露一个稳定标记，
+      // 用来验证 TerminalPane 确实调用 search addon 开启高亮。
+      const marker = document.createElement("mark");
+      marker.dataset.testid = "xterm-search-highlight";
+      marker.textContent = term;
+      this.terminal.element.append(marker);
+    }
+  }
+
+  return { SearchAddon };
+});

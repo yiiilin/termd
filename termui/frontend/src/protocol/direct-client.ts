@@ -43,6 +43,8 @@ import type {
   SessionGitActionKind,
   SessionGitActionPayload,
   SessionGitActionResultPayload,
+  SessionGitDiffPayload,
+  SessionGitDiffResultPayload,
   SessionGitPayload,
   SessionGitResultPayload,
   SessionListResultPayload,
@@ -52,6 +54,8 @@ import type {
   SessionReorderPayload,
   SessionResizePayload,
   SessionResizedPayload,
+  SessionSearchPayload,
+  SessionSearchResultPayload,
   TerminalSize,
   UUID,
 } from "./types";
@@ -269,6 +273,39 @@ export class DirectClient {
     return this.expectPayload<SessionGitActionResultPayload>("session_git_action_result", { bufferTerminalEvents: true });
   }
 
+  async searchSessionOutput(
+    sessionId: UUID,
+    query: string,
+    options: { caseSensitive?: boolean; maxResults?: number } = {},
+  ): Promise<SessionSearchResultPayload> {
+    await this.sendInner(
+      envelope("session_search", {
+        session_id: sessionId,
+        query,
+        case_sensitive: Boolean(options.caseSensitive),
+        max_results: options.maxResults ?? 80,
+      } satisfies SessionSearchPayload),
+    );
+    return this.expectPayload<SessionSearchResultPayload>("session_search_result", { bufferTerminalEvents: true });
+  }
+
+  async getSessionGitDiff(
+    sessionId: UUID,
+    worktreePath: string,
+    filePath?: string | null,
+    staged = false,
+  ): Promise<SessionGitDiffResultPayload> {
+    await this.sendInner(
+      envelope("session_git_diff", {
+        session_id: sessionId,
+        worktree_path: worktreePath,
+        file_path: filePath,
+        staged,
+      } satisfies SessionGitDiffPayload),
+    );
+    return this.expectPayload<SessionGitDiffResultPayload>("session_git_diff_result", { bufferTerminalEvents: true });
+  }
+
   async readSessionFile(sessionId: UUID, path: string): Promise<SessionFileReadResultPayload> {
     await this.sendInner(envelope("session_file_read", { session_id: sessionId, path } satisfies SessionFileReadPayload));
     return this.expectPayload<SessionFileReadResultPayload>("session_file_read_result", { bufferTerminalEvents: true });
@@ -451,7 +488,9 @@ export class DirectClient {
           inner.type === "control_grant" ||
           inner.type === "session_files_result" ||
           inner.type === "session_git_result" ||
-          inner.type === "session_git_action_result")
+          inner.type === "session_git_action_result" ||
+          inner.type === "session_git_diff_result" ||
+          inner.type === "session_search_result")
       ) {
         // 文件操作复用已 attach 的终端连接；daemon 可能先推送 PTY 输出或文件树同步事件。
         // 这里把旁路事件放回队列，交给后续 receive loop 处理，避免文件 panel 吃掉回显。

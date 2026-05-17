@@ -1,8 +1,9 @@
-import { useEffect, useLayoutEffect, useRef, useState, type MouseEvent, type PointerEvent as ReactPointerEvent } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type FormEvent, type MouseEvent, type PointerEvent as ReactPointerEvent } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
-import { ClipboardPaste, GripVertical, Maximize2, RotateCcw, ZoomIn, ZoomOut } from "lucide-react";
-import type { EffectiveTheme, SessionCursorPresence, TerminalSize } from "../protocol/types";
+import { SearchAddon, type ISearchOptions } from "@xterm/addon-search";
+import { ChevronDown, ChevronUp, ClipboardPaste, GripVertical, Maximize2, RotateCcw, Search, X, ZoomIn, ZoomOut } from "lucide-react";
+import type { BrowserMobileShortcut, EffectiveTheme, SessionCursorPresence, SessionSearchResultPayload, TerminalSize } from "../protocol/types";
 import { useI18n } from "../i18n";
 import { terminalTheme } from "../theme";
 
@@ -28,6 +29,17 @@ const MOBILE_DIRECTION_REPEAT_MS = 500;
 const MOBILE_DIRECTION_TIER_TWO_PX = 56;
 const MOBILE_DIRECTION_TIER_THREE_PX = 84;
 const MOBILE_DIRECTION_CANCEL_PX = 10;
+const TERMINAL_SEARCH_OPTIONS: ISearchOptions = {
+  caseSensitive: false,
+  decorations: {
+    matchBackground: "#a7c080",
+    matchBorder: "#a7c080",
+    matchOverviewRuler: "#a7c080",
+    activeMatchBackground: "#e69875",
+    activeMatchBorder: "#e69875",
+    activeMatchColorOverviewRuler: "#e69875",
+  },
+};
 type ResizeSource = "layout" | "focus" | "session" | "viewer";
 type MobileDirection = "up" | "down" | "left" | "right";
 type MobileDirectionTier = 1 | 2 | 3;
@@ -58,6 +70,8 @@ interface TerminalPaneProps {
   outputResetVersion: number;
   takeOutput: () => Uint8Array[];
   registerOutputDrain: (drain: () => void) => () => void;
+  mobileShortcuts?: BrowserMobileShortcut[];
+  onSearch?: (query: string) => Promise<SessionSearchResultPayload>;
   onInput: (data: string) => void;
   onResize: (size: TerminalSize) => void;
   onCursorChange?: (presence: SessionCursorPresence) => void;
@@ -71,6 +85,7 @@ export function TerminalPane(props: TerminalPaneProps) {
   const frameRef = useRef<HTMLDivElement | null>(null);
   const terminalRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
+  const searchAddonRef = useRef<SearchAddon | null>(null);
   const outputResetVersionRef = useRef(props.outputResetVersion);
   const onInputRef = useRef(props.onInput);
   const onResizeRef = useRef(props.onResize);
@@ -135,6 +150,12 @@ export function TerminalPane(props: TerminalPaneProps) {
   const [viewerContentSize, setViewerContentSize] = useState<{ width: number; height: number } | undefined>(undefined);
   const [mobileDirectionActive, setMobileDirectionActive] = useState(false);
   const [mobileDirection, setMobileDirection] = useState<MobileDirection | undefined>();
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [searchDraft, setSearchDraft] = useState("");
+  const [searchLoading, setSearchLoading] = useState(false);
+  const [searchError, setSearchError] = useState<string | undefined>();
+  const [searchResult, setSearchResult] = useState<SessionSearchResultPayload | undefined>();
+  const [activeSearchIndex, setActiveSearchIndex] = useState(0);
   const scrollToBottom = () => {
     const terminal = terminalRef.current;
     const activeBuffer = terminal?.buffer?.active;
@@ -323,6 +344,18 @@ export function TerminalPane(props: TerminalPaneProps) {
     scheduleScrollToBottom();
   }, [effectiveViewerScale, resolutionMismatch, viewerContentHeight, viewerRows]);
 
+  useLayoutEffect(() => {
+    if (!props.mobileInputMode) {
+      return;
+    }
+    // 移动端软键盘会改变 visual viewport，但 viewer 模式不会向 daemon 发送 resize。
+    // 因此键盘开合时必须主动重测本地可视高度并重新 fit，否则远端 PTY 的底部输入行会停在键盘下方。
+    updateViewerViewportSize();
+    updateViewerContentSize();
+    stabilizeRef.current?.(hasActiveTerminalFocus() ? "focus" : "viewer");
+    scheduleScrollToBottom();
+  }, [props.mobileInputMode, props.mobileKeyboardOpen]);
+
   useEffect(() => {
     resizeRef.current?.(focused ? "focus" : "layout");
   }, [focused]);
@@ -480,6 +513,68 @@ export function TerminalPane(props: TerminalPaneProps) {
     if (mobileInputModeRef.current) {
       terminalRef.current?.focus();
     }
+  };
+
+  const runSearch = async (event?: FormEvent<HTMLFormElement>) => {
+    event?.preventDefault();
+    const query = searchDraft.trim();
+    if (!query || !props.onSearch) {
+      searchAddonRef.current?.clearDecorations();
+      return;
+    }
+    setSearchLoading(true);
+    setSearchError(undefined);
+    try {
+      const result = await props.onSearch(query);
+      setSearchResult(result);
+      setActiveSearchIndex(0);
+      scrollToSearchMatch(result, 0);
+      highlightSearchMatches(query, "next");
+    } catch {
+      setSearchResult(undefined);
+      searchAddonRef.current?.clearDecorations();
+      setSearchError(t("terminal.searchFailed"));
+    } finally {
+      setSearchLoading(false);
+    }
+  };
+
+  const scrollToSearchMatch = (result: SessionSearchResultPayload | undefined, index: number) => {
+    const terminal = terminalRef.current;
+    const activeBuffer = terminal?.buffer?.active;
+    const match = result?.matches[index];
+    if (!terminal || !activeBuffer || !match || !result?.line_count) {
+      return;
+    }
+    // daemon 返回的是本次 snapshot 内的行号；前端 xterm buffer 尾部与 snapshot 尾部对齐。
+    const firstSnapshotLine = Math.max(0, activeBuffer.length - result.line_count);
+    terminal.scrollToLine(clampNumber(firstSnapshotLine + match.line_index, 0, Math.max(0, activeBuffer.length - 1)));
+    terminal.focus();
+  };
+
+  const stepSearchResult = (direction: 1 | -1) => {
+    if (!searchResult || searchResult.matches.length === 0) {
+      return;
+    }
+    const nextIndex = (activeSearchIndex + direction + searchResult.matches.length) % searchResult.matches.length;
+    setActiveSearchIndex(nextIndex);
+    scrollToSearchMatch(searchResult, nextIndex);
+    highlightSearchMatches(searchResult.query, direction > 0 ? "next" : "previous");
+  };
+
+  const highlightSearchMatches = (query: string, direction: "next" | "previous") => {
+    const trimmed = query.trim();
+    if (!trimmed) {
+      searchAddonRef.current?.clearDecorations();
+      return;
+    }
+    // daemon 搜索负责跨 snapshot 的结果数量和目标行；xterm search addon 负责真实渲染层高亮。
+    // 两者分开可以避免前端手写 xterm DOM 高亮，从而不绑定具体 renderer 结构。
+    if (direction === "previous") {
+      searchAddonRef.current?.findPrevious(trimmed, TERMINAL_SEARCH_OPTIONS);
+      return;
+    }
+    searchAddonRef.current?.findNext(trimmed, TERMINAL_SEARCH_OPTIONS);
   };
 
   const keepMobileKeyboardFocused = (event: ReactPointerEvent<HTMLButtonElement>) => {
@@ -774,7 +869,9 @@ export function TerminalPane(props: TerminalPaneProps) {
       theme: terminalTheme(props.theme ?? "dark"),
     });
     const fit = new FitAddon();
+    const searchAddon = new SearchAddon({ highlightLimit: 1000 });
     terminal.loadAddon(fit);
+    terminal.loadAddon(searchAddon);
     terminal.open(hostRef.current);
     const host = hostRef.current;
     let disposed = false;
@@ -1102,6 +1199,7 @@ export function TerminalPane(props: TerminalPaneProps) {
     document.addEventListener("visibilitychange", handleVisibilityChange);
     terminalRef.current = terminal;
     fitRef.current = fit;
+    searchAddonRef.current = searchAddon;
     outputResetVersionRef.current = props.outputResetVersion;
     needsPostWriteRefreshRef.current = true;
     // attach 输出可能早于 xterm 初始化到达；创建实例时先取走待写队列，避免首屏输出丢失。
@@ -1185,6 +1283,7 @@ export function TerminalPane(props: TerminalPaneProps) {
       host.replaceChildren();
       terminalRef.current = null;
       fitRef.current = null;
+      searchAddonRef.current = null;
       resizeRef.current = undefined;
       stabilizeRef.current = undefined;
       drainOutputRef.current = () => undefined;
@@ -1352,19 +1451,63 @@ export function TerminalPane(props: TerminalPaneProps) {
           </div>
         </div>
       </div>
+      {props.attached && props.onSearch ? (
+        <div className="terminal-search-control" onClick={(event) => event.stopPropagation()}>
+          {searchOpen ? (
+            <form className="terminal-search-popover" onSubmit={runSearch}>
+              <label>
+                <span className="sr-only">{t("terminal.search")}</span>
+                <input
+                  value={searchDraft}
+                  autoFocus
+                  placeholder={t("terminal.searchPlaceholder")}
+                  onChange={(event) => setSearchDraft(event.currentTarget.value)}
+                />
+              </label>
+              <button type="submit" className="icon-button" aria-label={t("terminal.search")} disabled={searchLoading || !searchDraft.trim()}>
+                <Search size={14} aria-hidden="true" />
+              </button>
+              <button type="button" className="icon-button" aria-label={t("terminal.previousMatch")} disabled={!searchResult?.matches.length} onClick={() => stepSearchResult(-1)}>
+                <ChevronUp size={14} aria-hidden="true" />
+              </button>
+              <button type="button" className="icon-button" aria-label={t("terminal.nextMatch")} disabled={!searchResult?.matches.length} onClick={() => stepSearchResult(1)}>
+                <ChevronDown size={14} aria-hidden="true" />
+              </button>
+              <span className="terminal-search-count" aria-live="polite">
+                {searchError ?? (searchResult ? `${searchResult.matches.length ? activeSearchIndex + 1 : 0}/${searchResult.matches.length}${searchResult.truncated ? "+" : ""}` : "")}
+              </span>
+              <button
+                type="button"
+                className="icon-button"
+                aria-label={t("terminal.closeSearch")}
+                onClick={() => {
+                  searchAddonRef.current?.clearDecorations();
+                  setSearchOpen(false);
+                }}
+              >
+                <X size={14} aria-hidden="true" />
+              </button>
+            </form>
+          ) : (
+            <button type="button" className="icon-button terminal-search-button" aria-label={t("terminal.search")} onClick={() => setSearchOpen(true)}>
+              <Search size={15} aria-hidden="true" />
+            </button>
+          )}
+        </div>
+      ) : null}
       {props.attached && props.mobileInputMode && props.mobileKeyboardOpen ? (
         <div
           className="terminal-mobile-shortcuts"
           aria-label={t("terminal.mobileShortcuts")}
           onClick={(event) => event.stopPropagation()}
         >
-          {MOBILE_SHORTCUT_KEYS.map((shortcut) => (
+          {[...MOBILE_SHORTCUT_KEYS, ...(props.mobileShortcuts ?? [])].map((shortcut) => (
             <button
               type="button"
               key={shortcut.label}
               className="terminal-mobile-shortcut-button"
-              aria-label={t(shortcut.ariaKey)}
-              title={t(shortcut.ariaKey)}
+              aria-label={"ariaKey" in shortcut ? t(shortcut.ariaKey) : shortcut.label}
+              title={"ariaKey" in shortcut ? t(shortcut.ariaKey) : shortcut.label}
               onPointerDown={keepMobileKeyboardFocused}
               onClick={(event) => {
                 event.preventDefault();
