@@ -12,6 +12,23 @@ version="${1:-}"
 }
 
 case "$version" in
+  0.2.2)
+    cat <<'EOF'
+termd 0.2.2
+
+用户可见变化:
+- 修复 daemon 通过代理链路连接公网 relay 时反复 `websocket connect timed out` 的问题；daemon 到 relay 的 TLS 握手改用兼容性更好的传统 ECDHE key exchange，避开部分代理/TLS 入口吞掉过大的 hybrid ClientHello。
+- Web 工作台打开 session 后，状态栏、RTT、session/client 后台刷新会复用当前 attach 的主 WebSocket，不再每秒/每两秒创建短连接，relay Web 和浏览器网络面板不再表现成持续重连。
+- RTT 单次测量失败时会保留上一条有效延迟，不再因为一次 ping 抖动就让 session 标题右侧的延迟时有时无。
+- 新建或 attach session 后会同步修复 daemon 展示元数据里的 session 状态，避免 live supervisor 已经 running 但 session 列表/本地更新校验仍看到 created。
+- 本地更新脚本会在确认 live supervisor 与 runtime session 都仍 running 时，保守修复旧版本遗留的展示状态不一致；普通更新仍会校验 supervisor PID、session id 和 running session 数不下降。
+
+兼容性:
+- 这是 0.2.x 稳定性修复版本；协议 packet version 仍为 3，daemon、Web UI、termctl 和 relay 可按 0.2.x 路径同步升级。
+- supervisor 兼容版本未更新，仍为 `0.1.0`；普通 termd 更新不应终止或清空已有 session supervisor。
+- relay 仍保持不可信 dumb pipe，不解密也不解析 E2EE 内层业务 packet；本次 relay 稳定性修复主要在 daemon outbound 连接和 Web 客户端连接复用侧。
+EOF
+    ;;
   0.2.1)
     cat <<'EOF'
 termd 0.2.1

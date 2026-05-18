@@ -4,10 +4,12 @@
 //! 每个 relay client 映射成独立的 daemon `ProtocolConnection`。
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Duration;
 
 use base64::{Engine as _, engine::general_purpose};
 use futures_util::{SinkExt, StreamExt};
+use rustls::{ClientConfig, RootCertStore};
 use termd_proto::{
     Envelope as ProtoEnvelope, MessageType as ProtoMessageType, Nonce as ProtoNonce,
     PROTOCOL_PACKET_VERSION, ProtocolVersion as ProtoProtocolVersion, RelayClientId,
@@ -20,7 +22,10 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, timeout};
-use tokio_tungstenite::tungstenite::{Message, protocol::WebSocketConfig};
+use tokio_tungstenite::{
+    Connector,
+    tungstenite::{Message, protocol::WebSocketConfig},
+};
 use tracing::{debug, warn};
 
 use crate::auth::current_unix_timestamp_millis;
@@ -1001,13 +1006,15 @@ async fn connect_relay_websocket(
     ),
     RelayConnectorError,
 > {
+    let tls_connector = relay_tls_connector();
     let Some(proxy) = proxy else {
         return timeout(
             RELAY_CONNECT_TIMEOUT,
-            tokio_tungstenite::connect_async_with_config(
+            tokio_tungstenite::connect_async_tls_with_config(
                 url,
                 Some(relay_websocket_config()),
                 false,
+                Some(tls_connector),
             ),
         )
         .await
@@ -1028,12 +1035,40 @@ async fn connect_relay_websocket(
             url,
             stream,
             Some(relay_websocket_config()),
-            None,
+            Some(tls_connector),
         ),
     )
     .await
     .map_err(|_| RelayConnectorError::ConnectTimeout)?
     .map_err(|_| RelayConnectorError::ConnectFailed)
+}
+
+fn relay_tls_connector() -> Connector {
+    Connector::Rustls(Arc::new(relay_tls_client_config()))
+}
+
+fn relay_tls_client_config() -> ClientConfig {
+    let mut root_store = RootCertStore::empty();
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+    let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+    provider.kx_groups = relay_tls_kx_groups();
+
+    // 一些代理或 TLS 入口会吞掉 rustls 默认的 X25519MLKEM768 hybrid ClientHello。
+    // relay outbound 是兼容性优先的公网长连接，这里显式使用传统 ECDHE 组。
+    ClientConfig::builder_with_provider(Arc::new(provider))
+        .with_safe_default_protocol_versions()
+        .expect("relay TLS protocol versions should be valid")
+        .with_root_certificates(root_store)
+        .with_no_client_auth()
+}
+
+fn relay_tls_kx_groups() -> Vec<&'static dyn rustls::crypto::SupportedKxGroup> {
+    vec![
+        rustls::crypto::aws_lc_rs::kx_group::X25519,
+        rustls::crypto::aws_lc_rs::kx_group::SECP256R1,
+        rustls::crypto::aws_lc_rs::kx_group::SECP384R1,
+    ]
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1467,6 +1502,17 @@ mod tests {
 
         assert_eq!(url, "ws://127.0.0.1:8080/ws?relay_token=relay-secret-1");
         assert!(!format!("{base:?}").contains("relay-secret-1"));
+    }
+
+    #[test]
+    fn relay_tls_kx_groups_exclude_hybrid_post_quantum_groups() {
+        let names = relay_tls_kx_groups()
+            .into_iter()
+            .map(|group| format!("{:?}", group.name()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["X25519", "secp256r1", "secp384r1"]);
+        assert!(!names.iter().any(|name| name.contains("MLKEM")));
     }
 
     #[test]

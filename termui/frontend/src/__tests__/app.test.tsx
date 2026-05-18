@@ -6,6 +6,7 @@ import userEvent from "@testing-library/user-event";
 import App, {
   browserReachableWsUrl,
   connectPairingClient,
+  DAEMON_STATUS_POLL_INTERVAL_MS,
   defaultWsUrlFromPage,
   latencyLevelClass,
   networkRateFromSamples,
@@ -348,6 +349,24 @@ describe("termui web 工作台", () => {
     await new Promise((resolve) => window.setTimeout(resolve, 250));
     expect(daemon.pingMessages).toBeGreaterThan(0);
     expect(daemon.outerWireText()).not.toContain("secret-token");
+  });
+
+  it("已 attach 后状态和客户端轮询复用主 WebSocket", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await screen.findByText(/termd-e2e-ready/);
+    await waitFor(() => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID]));
+    const acceptedAfterAttach = daemon.acceptedConnections;
+
+    await waitFor(() => expect(daemon.daemonStatusRequests).toBeGreaterThan(0));
+    await new Promise((resolve) => window.setTimeout(resolve, DAEMON_STATUS_POLL_INTERVAL_MS + 250));
+
+    expect(daemon.acceptedConnections).toBe(acceptedAfterAttach);
+    expect(daemon.activeConnectionCount()).toBe(1);
+    expect(daemon.pingMessages).toBeGreaterThan(0);
   });
 
   it("设置面板支持切换语言和浅色主题，并持久化到浏览器本地状态", async () => {

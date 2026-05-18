@@ -278,6 +278,45 @@ impl ClientHistoryStore {
         Ok(())
     }
 
+    /// 同步 session 的运行态投影。
+    ///
+    /// PTY runtime 才是 `created -> running` 的事实来源；这里把 attach 后的状态写回
+    /// daemon 展示表，避免重启/升级前检查看到 live supervisor 但元数据仍停在 created。
+    pub fn record_session_runtime_state(
+        &mut self,
+        session_id: SessionId,
+        state: SessionState,
+        size: TerminalSize,
+        now_ms: UnixTimestampMillis,
+    ) -> Result<(), StateError> {
+        self.conn
+            .execute(
+                r#"
+                UPDATE daemon_sessions
+                SET state = ?1,
+                    rows = ?2,
+                    cols = ?3,
+                    pixel_width = ?4,
+                    pixel_height = ?5,
+                    updated_at_ms = ?6
+                WHERE session_id = ?7
+                  AND state != ?8
+                "#,
+                params![
+                    session_state_text(state),
+                    i64::from(size.rows),
+                    i64::from(size.cols),
+                    i64::from(size.pixel_width),
+                    i64::from(size.pixel_height),
+                    now_ms.0 as i64,
+                    session_id_text(session_id),
+                    session_state_text(SessionState::Closed),
+                ],
+            )
+            .map_err(|source| sqlite_error(&self.path, source))?;
+        Ok(())
+    }
+
     /// 持久化 session 尺寸，供列表和重连后的 UI 元数据使用。
     pub fn record_session_resized(
         &mut self,
@@ -1191,6 +1230,67 @@ mod tests {
                 store.session_files_path(session_id).unwrap().as_deref(),
                 Some("/home/me/project")
             );
+        }
+
+        let _ = fs::remove_file(sqlite_state_path_for_state_path(&state_path));
+        let _ = fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn record_session_runtime_state_promotes_created_metadata_without_reopening_closed_rows() {
+        let state_path = std::env::temp_dir().join(format!(
+            "termd-session-runtime-state-store-{}.json",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(sqlite_state_path_for_state_path(&state_path));
+        let session_id = SessionId::new();
+
+        {
+            let mut store = ClientHistoryStore::open(&state_path).unwrap();
+            store
+                .record_session_created(
+                    session_id,
+                    SessionState::Created,
+                    TerminalSize::new(24, 80),
+                    Some("booting shell"),
+                    "/home/me",
+                    UnixTimestampMillis(1_000),
+                )
+                .unwrap();
+            store
+                .record_session_runtime_state(
+                    session_id,
+                    SessionState::Running,
+                    TerminalSize::new(30, 100),
+                    UnixTimestampMillis(1_001),
+                )
+                .unwrap();
+
+            let record = store
+                .session_record_including_closed(session_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(record.state, SessionState::Running);
+            assert_eq!(record.size, TerminalSize::new(30, 100));
+
+            store
+                .record_session_closed(session_id, UnixTimestampMillis(1_002))
+                .unwrap();
+            store
+                .record_session_runtime_state(
+                    session_id,
+                    SessionState::Running,
+                    TerminalSize::new(40, 120),
+                    UnixTimestampMillis(1_003),
+                )
+                .unwrap();
+
+            let closed = store
+                .session_record_including_closed(session_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(closed.state, SessionState::Closed);
+            assert_eq!(closed.size, TerminalSize::new(30, 100));
         }
 
         let _ = fs::remove_file(sqlite_state_path_for_state_path(&state_path));

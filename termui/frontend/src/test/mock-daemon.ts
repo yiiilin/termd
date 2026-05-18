@@ -134,6 +134,7 @@ export class MockDaemon {
   public readonly sessionSearchRequests: SessionSearchPayload[] = [];
   public daemonStatusRequests = 0;
   public pingMessages = 0;
+  public acceptedConnections = 0;
   public readonly decryptedInputs: string[] = [];
   public nextAttachRole = "operator" as const;
   private createdSessionCounter = 0;
@@ -257,6 +258,7 @@ export class MockDaemon {
       terminalStreamsBySession: new Map(),
     };
     this.connections.add(connection);
+    this.acceptedConnections += 1;
     socket.on("close", () => {
       this.connections.delete(connection);
       for (const sessionId of connection.resizeOwnerSessionIds) {

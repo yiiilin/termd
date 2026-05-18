@@ -866,14 +866,21 @@ where
         self.record_daemon_client_attach(wire_session_id, connection, device_id);
         let resize_owner = self.assign_resize_owner_if_missing(wire_session_id, connection);
 
+        let response_state = self.runtime_state_proto(&internal_session_id)?;
         let response = SessionCreatedPayload {
             session_id: wire_session_id,
             name: Some(session_name),
             role: wire_role,
-            state: self.runtime_state_proto(&internal_session_id)?,
+            state: response_state,
             size: response_size,
             resize_owner,
         };
+        self.client_history.record_session_runtime_state(
+            wire_session_id,
+            response_state,
+            response_size,
+            current_unix_timestamp_millis(),
+        )?;
 
         self.persist_state()?;
         connection.state = ProtocolConnectionState::Attached;
@@ -898,6 +905,7 @@ where
             .get(&payload.session_id)
             .cloned()
             .ok_or(ProtocolError::SessionNotFound)?;
+        let state_before_attach = self.runtime_state_proto(&internal_session_id)?;
         let role = self
             .runtime
             .attach(&internal_session_id, device_key(device_id))
@@ -914,6 +922,16 @@ where
         } else {
             (0, Vec::new())
         };
+        let response_state = self.runtime_state_proto(&internal_session_id)?;
+        self.client_history.record_session_runtime_state(
+            payload.session_id,
+            response_state,
+            response_size,
+            current_unix_timestamp_millis(),
+        )?;
+        if state_before_attach != response_state {
+            self.persist_state()?;
+        }
         connection.attach(
             payload.session_id,
             output_offset,
@@ -931,7 +949,7 @@ where
         let response = SessionAttachedPayload {
             session_id: payload.session_id,
             role: wire_role,
-            state: self.runtime_state_proto(&internal_session_id)?,
+            state: response_state,
             size: response_size,
             resize_owner,
         };
@@ -6039,6 +6057,12 @@ mod tests {
         assert_eq!(created_packet.kind, PacketKind::Response);
         assert_eq!(created_packet.stream_id, Some(stream_id));
         let created: SessionCreatedPayload = decode_payload(created_packet.payload).unwrap();
+        let visible_record = protocol
+            .client_history
+            .session_record_including_closed(created.session_id)
+            .unwrap()
+            .expect("created session should be present in daemon history");
+        assert_eq!(visible_record.state, SessionState::Running);
 
         backend.push_output_for_session(created.session_id, b"hello");
         let output_packet = decrypt_first_packet(

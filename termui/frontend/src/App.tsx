@@ -91,7 +91,7 @@ const CPU_HISTORY_LIMIT = 48;
 const CPU_BAR_CHART_WIDTH = 56;
 const CPU_BAR_CHART_HEIGHT = 18;
 const CPU_BAR_CHART_COUNT = 18;
-const DAEMON_STATUS_POLL_INTERVAL_MS = 1000;
+export const DAEMON_STATUS_POLL_INTERVAL_MS = 1000;
 const APP_CONNECTION_TIMEOUT_MS = 2000;
 const PAIRING_CONNECTION_TIMEOUT_MS = 5000;
 const ATTACH_CONNECTION_TIMEOUT_MS = 15000;
@@ -227,6 +227,8 @@ export default function App() {
   const attachReconnectLastErrorRef = useRef<unknown>(undefined);
   const attachReconnectHandlerRef = useRef<(client: DirectClient, caught: unknown) => boolean>(() => false);
   const daemonNetworkSampleRef = useRef<DaemonNetworkCounterSample | undefined>(undefined);
+  const daemonStatusRefreshInFlightRef = useRef(false);
+  const daemonClientsRefreshInFlightRef = useRef(false);
   const lastNotificationAtRef = useRef(0);
   const isMobileLayout = useMobileLayout();
   const visualViewportMetrics = useVisualViewportMetrics(isMobileLayout && activeSurface === "workspace");
@@ -1077,13 +1079,23 @@ export default function App() {
 
   const refreshDaemonClients = useCallback(
     async () => {
+      if (daemonClientsRefreshInFlightRef.current) {
+        return;
+      }
+      daemonClientsRefreshInFlightRef.current = true;
       const requestServerId = activeServer?.server_id;
       const requestOrderGeneration = sessionOrderGenerationRef.current;
       try {
-        const client = await authenticatedClient();
+        const attachedClient = attachClientRef.current;
+        const ownsClient = !attachedClient;
+        const client = attachedClient ?? await authenticatedClient();
         try {
-          const sessionList = await client.listSessions();
-          const clientList = await client.listDaemonClients();
+          // 已 attach 时复用 xterm 主连接，避免状态轮询每 2 秒创建一次 relay client。
+          // receive pump 会按 packet id 分发 response，不会和终端输出读取互相抢 socket。
+          const [sessionList, clientList] = await Promise.all([
+            client.listSessions(),
+            client.listDaemonClients(),
+          ]);
           if (activeServerIdRef.current !== requestServerId) {
             return;
           }
@@ -1105,38 +1117,68 @@ export default function App() {
             ], nextOrder),
           );
           setDaemonClients(clientList.clients);
+        } catch (caught) {
+          if (attachedClient && isRetryableConnectionError(caught)) {
+            attachReconnectHandlerRef.current(attachedClient, caught);
+          }
+          throw caught;
         } finally {
-          client.close();
+          if (ownsClient) {
+            client.close();
+          }
         }
       } catch (caught) {
         // 后台 client/session 刷新失败不能把正在使用的 xterm 切到错误态；
         // 主 attach 连接有自己的重连路径，手动 Refresh 仍会显示错误。
         void caught;
+      } finally {
+        daemonClientsRefreshInFlightRef.current = false;
       }
     },
     [activeServer?.server_id, authenticatedClient],
   );
 
   const loadDaemonStatus = useCallback(async () => {
+    if (daemonStatusRefreshInFlightRef.current) {
+      return;
+    }
+    daemonStatusRefreshInFlightRef.current = true;
     setDaemonStatusLoading(true);
     setDaemonStatusError(undefined);
-    let client: DirectClient | undefined;
     try {
-      client = await authenticatedClient();
-      const status = await client.getDaemonStatus();
-      const latencyMs = await client.measureLatency().catch(() => undefined);
-      const nextNetworkSample = networkCounterSampleFromStatus(status, Date.now());
-      setDaemonNetworkRate(networkRateFromSamples(daemonNetworkSampleRef.current, nextNetworkSample));
-      daemonNetworkSampleRef.current = nextNetworkSample;
-      setDaemonNetworkLatencyMs(latencyMs);
-      setDaemonStatus(status);
-      // CPU 柱状图只做当前页面内缓存，避免把瞬时监控数据写入浏览器持久状态。
-      setDaemonCpuHistory((current) => appendCpuSample(current, status.cpu_percent));
+      const attachedClient = attachClientRef.current;
+      const ownsClient = !attachedClient;
+      const client = attachedClient ?? await authenticatedClient();
+      try {
+        // 状态栏和 RTT 都走同一条主连接；relay 页面不会再因为每秒状态刷新看到短连接风暴。
+        const status = await client.getDaemonStatus();
+        const latencyMs = await client.measureLatency().catch(() => undefined);
+        const nextNetworkSample = networkCounterSampleFromStatus(status, Date.now());
+        setDaemonNetworkRate(networkRateFromSamples(daemonNetworkSampleRef.current, nextNetworkSample));
+        daemonNetworkSampleRef.current = nextNetworkSample;
+        if (latencyMs !== undefined) {
+          setDaemonNetworkLatencyMs(latencyMs);
+        }
+        setDaemonStatus(status);
+        // CPU 柱状图只做当前页面内缓存，避免把瞬时监控数据写入浏览器持久状态。
+        setDaemonCpuHistory((current) => appendCpuSample(current, status.cpu_percent));
+      } catch (caught) {
+        if (attachedClient && isRetryableConnectionError(caught)) {
+          attachReconnectHandlerRef.current(attachedClient, caught);
+        }
+        throw caught;
+      } finally {
+        if (ownsClient) {
+          client.close();
+        }
+      }
     } catch (caught) {
       setDaemonStatusError(toSafeError(caught));
-      setDaemonNetworkLatencyMs(undefined);
+      if (!attachClientRef.current) {
+        setDaemonNetworkLatencyMs(undefined);
+      }
     } finally {
-      client?.close();
+      daemonStatusRefreshInFlightRef.current = false;
       setDaemonStatusLoading(false);
     }
   }, [authenticatedClient]);

@@ -312,6 +312,122 @@ finally:
 PY
 }
 
+live_supervisor_display_states_need_repair() {
+  local supervisor_ids_file="$1"
+
+  python3 - "$STATE_DB" "$supervisor_ids_file" <<'PY'
+import sqlite3
+import sys
+from pathlib import Path
+
+db_path = Path(sys.argv[1])
+supervisor_ids_path = Path(sys.argv[2])
+supervisor_ids = [
+    line.strip()
+    for line in supervisor_ids_path.read_text().splitlines()
+    if line.strip()
+]
+if not supervisor_ids or not db_path.exists():
+    print(0)
+    raise SystemExit(0)
+
+conn = sqlite3.connect(db_path)
+try:
+    tables = {
+        row[0]
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+    }
+    if "daemon_sessions" not in tables or "runtime_sessions" not in tables:
+        print(0)
+        raise SystemExit(0)
+
+    count = 0
+    for session_id in supervisor_ids:
+        row = conn.execute(
+            """
+            SELECT 1
+            FROM daemon_sessions
+            WHERE session_id = ?
+              AND state != 'running'
+              AND EXISTS (
+                  SELECT 1
+                  FROM runtime_sessions
+                  WHERE runtime_sessions.session_id = daemon_sessions.session_id
+                    AND runtime_sessions.state = 'running'
+                    AND runtime_sessions.restore_kind IS NOT NULL
+              )
+            """,
+            (session_id,),
+        ).fetchone()
+        if row:
+            count += 1
+    print(count)
+finally:
+    conn.close()
+PY
+}
+
+repair_live_supervisor_display_states() {
+  local supervisor_ids_file="$1"
+
+  # runtime_sessions 和 live supervisor 是能否恢复 shell 的事实来源；daemon_sessions 只保存
+  # Web/CLI 展示元数据。旧版本可能在 create 后 attach 前把展示行停在 created，这里只对
+  # “live supervisor + runtime running” 的行做 created/closed -> running 修复。
+  python3 - "$STATE_DB" "$supervisor_ids_file" <<'PY'
+import sqlite3
+import sys
+import time
+from pathlib import Path
+
+db_path = Path(sys.argv[1])
+supervisor_ids_path = Path(sys.argv[2])
+supervisor_ids = [
+    line.strip()
+    for line in supervisor_ids_path.read_text().splitlines()
+    if line.strip()
+]
+if not supervisor_ids or not db_path.exists():
+    print(0)
+    raise SystemExit(0)
+
+conn = sqlite3.connect(db_path)
+try:
+    tables = {
+        row[0]
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+    }
+    if "daemon_sessions" not in tables or "runtime_sessions" not in tables:
+        print(0)
+        raise SystemExit(0)
+
+    updated = 0
+    now_ms = int(time.time() * 1000)
+    for session_id in supervisor_ids:
+        cursor = conn.execute(
+            """
+            UPDATE daemon_sessions
+            SET state = 'running',
+                updated_at_ms = ?
+            WHERE session_id = ?
+              AND state != 'running'
+              AND EXISTS (
+                  SELECT 1
+                  FROM runtime_sessions
+                  WHERE runtime_sessions.session_id = daemon_sessions.session_id
+                    AND runtime_sessions.state = 'running'
+                    AND runtime_sessions.restore_kind IS NOT NULL
+              )
+            """,
+            (now_ms, session_id),
+        )
+        updated += cursor.rowcount
+    conn.commit()
+    print(updated)
+finally:
+    conn.close()
+PY
+}
+
 state_count() {
   local file="$1"
   local table="$2"
@@ -413,6 +529,16 @@ main() {
   before_count="$(wc -l <"$before_pids" | tr -d ' ')"
   [[ "$before_count" =~ ^[0-9]+$ ]] || die "cannot count supervisor pids"
   write_state_counts "$before_counts"
+  repairable_display_states="$(live_supervisor_display_states_need_repair "$before_session_ids")"
+  if [[ "${repairable_display_states}" != "0" ]]; then
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+      log "dry run: would repair ${repairable_display_states} live supervisor display session state row(s)"
+    else
+      repaired_display_states="$(repair_live_supervisor_display_states "$before_session_ids")"
+      log "repaired ${repaired_display_states} live supervisor display session state row(s)"
+      write_state_counts "$before_counts"
+    fi
+  fi
   assert_live_supervisors_are_running_in_state "$before_session_ids" "pre-update"
 
   log "pre-update supervisor count: ${before_count}"
