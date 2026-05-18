@@ -70,6 +70,7 @@ interface TerminalPaneProps {
   outputResetVersion: number;
   takeOutput: () => Uint8Array[];
   registerOutputDrain: (drain: () => void) => () => void;
+  onOutputResetApplied?: (version: number) => void;
   mobileShortcuts?: BrowserMobileShortcut[];
   onSearch?: (query: string) => Promise<SessionSearchResultPayload>;
   onInput: (data: string) => void;
@@ -1337,7 +1338,8 @@ export function TerminalPane(props: TerminalPaneProps) {
     needsPostWriteRefreshRef.current = true;
     // session 切换时 UI 会重置输出队列；同步清屏，避免旧 session 明文留在终端实例中。
     terminal.clear();
-  }, [props.outputResetVersion]);
+    props.onOutputResetApplied?.(props.outputResetVersion);
+  }, [props.outputResetVersion, props.onOutputResetApplied]);
 
   useEffect(() => {
     if (!props.attached || !props.focusRequest || !terminalRef.current) {

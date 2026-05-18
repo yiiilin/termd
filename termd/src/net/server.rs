@@ -44,9 +44,10 @@ use super::signature::Ed25519SignatureVerifier;
 const OUTPUT_FLUSH_MAX_BYTES_PER_SESSION: usize = 16 * 1024;
 // transport 超时只关闭当前 WebSocket 连接；session/supervisor 仍由协议和 PTY 层保持持久。
 const ROUTE_PRELUDE_TIMEOUT: Duration = Duration::from_secs(2);
-const WEBSOCKET_SEND_DEADLINE: Duration = Duration::from_secs(2);
-const WEBSOCKET_PONG_DEADLINE: Duration = Duration::from_secs(2);
-const WEBSOCKET_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const WEBSOCKET_SEND_DEADLINE: Duration = Duration::from_secs(10);
+const WEBSOCKET_PONG_DEADLINE: Duration = Duration::from_secs(10);
+const WEBSOCKET_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+const WEBSOCKET_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(25);
 const WEBSOCKET_MAX_FRAME_SIZE: usize = 1024 * 1024;
 const WEBSOCKET_MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
 
@@ -633,11 +634,44 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
     }
 
     let mut idle_deadline = Instant::now() + WEBSOCKET_IDLE_TIMEOUT;
+    let mut heartbeat = tokio::time::interval_at(
+        Instant::now() + WEBSOCKET_HEARTBEAT_INTERVAL,
+        WEBSOCKET_HEARTBEAT_INTERVAL,
+    );
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut pending_pong_deadline: Option<Instant> = None;
     loop {
+        let pending_pong_deadline_snapshot = pending_pong_deadline;
         tokio::select! {
             _ = tokio::time::sleep_until(idle_deadline) => {
                 warn!(peer_addr = %peer_addr, "websocket idle timeout");
                 break;
+            }
+            _ = async move {
+                if let Some(deadline) = pending_pong_deadline_snapshot {
+                    tokio::time::sleep_until(deadline).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                warn!(peer_addr = %peer_addr, "websocket pong timed out");
+                break;
+            }
+            _ = heartbeat.tick() => {
+                if pending_pong_deadline.is_none() {
+                    if send_message_with_deadline(
+                        &mut sender,
+                        Message::Ping(Vec::new()),
+                        WEBSOCKET_SEND_DEADLINE,
+                        "websocket ping failed",
+                    )
+                    .await
+                    .is_err()
+                    {
+                        break;
+                    }
+                    pending_pong_deadline = Some(Instant::now() + WEBSOCKET_PONG_DEADLINE);
+                }
             }
             maybe_message = receiver.next() => {
                 let Some(message) = maybe_message else {
@@ -667,7 +701,10 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
                         }
                         continue;
                     }
-                    Message::Pong(_) => continue,
+                    Message::Pong(_) => {
+                        pending_pong_deadline = None;
+                        continue;
+                    }
                     Message::Close(_) => break,
                     other => {
                         let Some(envelope) = (match message_to_envelope(other) {
@@ -1351,8 +1388,10 @@ mod tests {
         let created_payload: SessionCreatedPayload = decode_payload(created.payload).unwrap();
 
         // 这里不再向 WebSocket 发送 ping 或任意业务帧；PTY 后续输出必须由 daemon 主动推送。
+        // 等待窗口需要覆盖 CI 或本地 workspace 并发测试时的 PTY 进程启动抖动，
+        // 这个值不是产品 WebSocket 的超时语义。
         let pushed = timeout(
-            Duration::from_secs(2),
+            Duration::from_secs(8),
             read_encrypted_ws(&mut socket, &mut device_session),
         )
         .await

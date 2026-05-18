@@ -19,6 +19,7 @@ export interface RealRelayFixture {
   token: string;
   relayClientUrl: string;
   serverId: string;
+  daemonPublicKey: string;
   stop: () => Promise<void>;
 }
 
@@ -51,14 +52,15 @@ export async function startRealRelayFixture(): Promise<RealRelayFixture> {
   );
   await waitForPort(termdPort, daemon, "termd");
 
-  const token = await issueToken(termdHttp);
+  const pairing = await issuePairingToken(termdHttp);
   const serverId = await serverIdFromHealthz(termdHttp);
   const relayClientUrl = `ws://${relayAddr}/ws`;
 
   return {
-    token,
+    token: pairing.token,
     relayClientUrl,
     serverId,
+    daemonPublicKey: pairing.daemonPublicKey,
     stop: async () => {
       stopProcess(daemon);
       stopProcess(relay);
@@ -67,13 +69,16 @@ export async function startRealRelayFixture(): Promise<RealRelayFixture> {
   };
 }
 
-async function issueToken(termdHttp: string): Promise<string> {
+async function issuePairingToken(termdHttp: string): Promise<{ token: string; daemonPublicKey: string }> {
   const body = await httpRequest(`${termdHttp}/local/pairing-token`, { method: "POST" });
-  const parsed = JSON.parse(body) as { token: string };
+  const parsed = JSON.parse(body) as { token: string; daemon_public_key: string };
   if (!parsed.token.startsWith("termd-pair-")) {
     throw new Error("termd pair token had unexpected shape");
   }
-  return parsed.token;
+  if (!parsed.daemon_public_key.startsWith("ed25519-v1:")) {
+    throw new Error("termd daemon public key had unexpected shape");
+  }
+  return { token: parsed.token, daemonPublicKey: parsed.daemon_public_key };
 }
 
 async function serverIdFromHealthz(termdHttp: string): Promise<string> {

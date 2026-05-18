@@ -73,7 +73,7 @@ test("pair、list、attach 的浏览器 smoke", async ({ page }, testInfo: TestI
     } else {
       const daemonStatus = page.getByRole("contentinfo", { name: "daemon server status" });
       await expect(daemonStatus).toBeVisible();
-      await expect(daemonStatus.getByRole("img", { name: "CPU usage trend" })).toBeVisible();
+      await expect(daemonStatus.getByText("CPU")).toBeVisible();
       await expect(daemonStatus.getByRole("button", { name: "Refresh server status" })).toHaveCount(0);
     }
     const sessionsPanel = page.getByRole("region", { name: "sessions" });
@@ -177,6 +177,7 @@ function pairingInviteCode(daemon: MockDaemon): string {
     version: 1,
     token: "secret-token",
     server_id: daemon.serverId,
+    daemon_public_key: daemon.daemonPublicKey,
     expires_at_ms: Date.now() + 60_000,
   });
   return `termd-pair:v1:${Buffer.from(payload, "utf8").toString("base64url")}`;

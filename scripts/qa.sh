@@ -96,8 +96,9 @@ wait_for_port() {
   local port="$1"
   local label="$2"
 
-  # 预留更长窗口，避免 `cargo run` 的冷启动、链接或首次初始化把刚启动的监听服务误判为失败。
-  for _ in $(seq 1 200); do
+  # 预留更长窗口，避免完整 QA 下的 `cargo run` 冷启动、构建锁等待或首次初始化
+  # 把刚启动的监听服务误判为失败。
+  for _ in $(seq 1 600); do
     if port_is_open "$port"; then
       return 0
     fi
@@ -261,6 +262,7 @@ run_relay_runtime_e2e() (
   fi
 
   mapfile -t pairing_payload < <(TERMD_QA_DAEMON_PORT="$daemon_port" python3 - <<'PY'
+import base64
 import json
 import os
 import urllib.request
@@ -270,20 +272,23 @@ daemon_port = os.environ["TERMD_QA_DAEMON_PORT"]
 request = urllib.request.Request(f"http://127.0.0.1:{daemon_port}/local/pairing-token", method="POST")
 with urllib.request.urlopen(request, timeout=2) as response:
     payload = json.load(response)
-print(json.dumps({
+invite_payload = json.dumps({
     "type": "termd_pairing_qr",
     "version": 1,
     "token": payload["token"],
     "server_id": payload["server_id"],
+    "daemon_public_key": payload["daemon_public_key"],
     "expires_at_ms": payload["expires_at_ms"],
     "ws_url": payload["ws_url"],
-}, separators=(",", ":")))
+}, separators=(",", ":"))
+invite_code = "termd-pair:v1:" + base64.urlsafe_b64encode(invite_payload.encode()).decode().rstrip("=")
+print(invite_code)
 print(payload["ws_url"])
 PY
 )
   pairing_json="${pairing_payload[0]:-}"
   relay_client_url="${pairing_payload[1]:-}"
-  if [[ "$pairing_json" != *'"type":"termd_pairing_qr"'* || "$pairing_json" != *'"server_id":'* ]]; then
+  if [[ "$pairing_json" != termd-pair:v1:* ]]; then
     printf '[termrelay] daemon 本地 pairing 响应未构造出预期 invite payload。\n' >&2
     exit 1
   fi

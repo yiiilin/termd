@@ -12,6 +12,25 @@ version="${1:-}"
 }
 
 case "$version" in
+  0.2.1)
+    cat <<'EOF'
+termd 0.2.1
+
+用户可见变化:
+- relay 和 direct WebSocket 的发送、pong、idle 超时放宽，并增加服务端主动 heartbeat；公网 relay 或代理链路短暂抖动时不再轻易被误判为连接超时。
+- relay daemon mux 重新连接时会替换半断的旧 mux，并通知旧客户端走统一重连路径；daemon 长连接稳定运行一段时间后再次断开，会从快速重连退避重新开始。
+- relay 在 daemon 不在线或 relay 状态不可用时会返回可重试错误，Web 客户端会识别这些错误并自动重连，减少手动刷新页面的情况。
+- Web attach 静默重连时会先清空旧 xterm 再消费 daemon 重新发送的 screen snapshot，修复重连后终端已输出内容重复出现的问题。
+- 网络 RTT 从底部状态栏移到 session 名称右侧、分辨率右侧；50ms 以内显示绿色，50-150ms 显示黄色，超过 150ms 显示红色，移动端同样显示在该位置。
+- 底部状态栏移除 RTT 后重新收紧网络列宽，CPU、内存、磁盘等指标继续保持固定宽度布局。
+- Web UI 字体切换为 HarmonyOS Sans SC，终端内容仍使用等宽字体，避免破坏终端列宽对齐。
+
+兼容性:
+- 这是 0.2.x 协议内的稳定性和 Web UI 修复版本；daemon、termctl、Web UI 和 relay 建议同步升级到 0.2.1。
+- supervisor 兼容版本未更新，仍为 `0.1.0`；普通 termd 更新不应终止或清空已有 session supervisor。
+- relay 仍保持不可信 dumb pipe，只转发 WebSocket 数据并管理连接，不解密也不解析 E2EE 内层业务 packet。
+EOF
+    ;;
   0.2.0)
     cat <<'EOF'
 termd 0.2.0

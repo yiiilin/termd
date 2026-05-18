@@ -1,6 +1,28 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Termd">
-  <rect width="512" height="512" rx="96" fill="#0c1210"/>
-  <rect x="70" y="102" width="372" height="308" rx="38" fill="#08110f" stroke="#d6ff5f" stroke-width="18"/>
-  <path d="M128 188l66 66-66 66" fill="none" stroke="#d7f7e8" stroke-width="32" stroke-linecap="round" stroke-linejoin="round"/>
-  <path d="M230 326h126" fill="none" stroke="#d6ff5f" stroke-width="32" stroke-linecap="round"/>
+<svg width="300" height="260" viewBox="0 0 300 260" xmlns="http://www.w3.org/2000/svg">
+  <title>termd logo</title>
+  <defs>
+    <clipPath id="win-clip">
+      <rect x="20" y="46" width="230" height="170" rx="22"/>
+    </clipPath>
+  </defs>
+
+  <!-- Shadow layer -->
+  <rect x="46" y="66" width="230" height="170" rx="22" fill="#A7C080"/>
+
+  <!-- Terminal window body -->
+  <rect x="20" y="46" width="230" height="170" rx="22" fill="#1e1e22"/>
+
+  <!-- Title bar clipped to window shape -->
+  <rect x="20" y="46" width="230" height="34" fill="#2a2a30" clip-path="url(#win-clip)"/>
+
+  <!-- Traffic lights -->
+  <circle cx="48" cy="63" r="7" fill="#ff5f57"/>
+  <circle cx="69" cy="63" r="7" fill="#febc2e"/>
+  <circle cx="90" cy="63" r="7" fill="#28c840"/>
+
+  <!-- Prompt -->
+  <text x="36" y="148" font-family="'JetBrains Mono', Consolas, 'Courier New', monospace" font-size="48" font-weight="700" fill="white">&#62;_</text>
+
+  <!-- Bottom accent bar -->
+  <rect x="36" y="192" width="68" height="9" rx="4.5" fill="#A7C080"/>
 </svg>

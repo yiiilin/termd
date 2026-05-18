@@ -50,8 +50,6 @@ test("浏览器通过真实 relay 连接 daemon 完成 pairing 和 session list"
       const mobileMenuButton = page.getByRole("button", { name: "Open mobile workspace menu" });
       const menuBox = await mobileMenuButton.boundingBox();
       expect(menuBox?.x ?? 0).toBeLessThan(48);
-    } else {
-      await page.getByRole("button", { name: "Refresh" }).click();
     }
 
     await expect(page.getByLabel("sessions").getByText("No sessions")).toBeVisible();
@@ -63,13 +61,14 @@ test("浏览器通过真实 relay 连接 daemon 完成 pairing 和 session list"
   }
 });
 
-function pairingInviteCode(fixture: { relayClientUrl: string; serverId: string; token: string }): string {
+function pairingInviteCode(fixture: { relayClientUrl: string; serverId: string; token: string; daemonPublicKey: string }): string {
   const payload = JSON.stringify({
     type: "termd_pairing_qr",
     version: 1,
     ws_url: fixture.relayClientUrl,
     token: fixture.token,
     server_id: fixture.serverId,
+    daemon_public_key: fixture.daemonPublicKey,
     expires_at_ms: Date.now() + 60_000,
   });
   return `termd-pair:v1:${Buffer.from(payload, "utf8").toString("base64url")}`;

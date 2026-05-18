@@ -33,11 +33,13 @@ const OUTPUT_FLUSH_MAX_BYTES_PER_SESSION: usize = 16 * 1024;
 const MIN_RELAY_RETRY_DELAY_MS: u64 = 1;
 const MIN_RELAY_HEARTBEAT_INTERVAL_MS: u64 = 1;
 // relay mux transport 失败只会断开当前 relay 连接并触发重连，不关闭持久 session/supervisor。
-const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-const RELAY_ROUTE_READY_TIMEOUT: Duration = Duration::from_secs(2);
-const RELAY_SEND_DEADLINE: Duration = Duration::from_secs(2);
-const RELAY_PONG_DEADLINE: Duration = Duration::from_secs(2);
-const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+// 公网 relay 往往还隔着 TLS 和反向代理，2s 级 deadline 容易把短暂抖动误判成断线。
+const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+const RELAY_ROUTE_READY_TIMEOUT: Duration = Duration::from_secs(5);
+const RELAY_SEND_DEADLINE: Duration = Duration::from_secs(10);
+const RELAY_PONG_DEADLINE: Duration = Duration::from_secs(10);
+const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+const RELAY_RECONNECT_STABLE_RESET_AFTER: Duration = Duration::from_secs(60);
 const RELAY_MAX_FRAME_SIZE: usize = 1024 * 1024;
 const RELAY_MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
 
@@ -412,6 +414,7 @@ pub async fn run_relay_mux_with_reconnect_base(
     let mut retry_delay = policy.first_retry_delay();
 
     loop {
+        let attempt_started_at = Instant::now();
         let result = connect_relay_mux_base_with_heartbeat(
             base.clone(),
             auth_token,
@@ -434,7 +437,13 @@ pub async fn run_relay_mux_with_reconnect_base(
         }
 
         tokio::time::sleep(retry_delay).await;
-        retry_delay = policy.next_retry_delay(retry_delay);
+        retry_delay = if attempt_started_at.elapsed() >= RELAY_RECONNECT_STABLE_RESET_AFTER {
+            // mux 曾经稳定存活过，下一次应按快速重连处理，避免一次长连接后的偶发断线
+            // 还沿用之前的最大 backoff。
+            policy.first_retry_delay()
+        } else {
+            policy.next_retry_delay(retry_delay)
+        };
     }
 }
 
@@ -1613,7 +1622,7 @@ mod tests {
         let base = RelayBaseUrl::parse(&format!("ws://{addr}")).unwrap();
         let protocol = test_protocol("relay-route-ready-timeout");
         let result = tokio::time::timeout(
-            Duration::from_secs(4),
+            Duration::from_secs(8),
             connect_relay_mux_base_with_heartbeat(
                 base,
                 None,
@@ -1662,12 +1671,12 @@ mod tests {
             let raw = serde_json::to_string(&route_ready).unwrap();
             write_raw_ws_text(&mut stream, &raw).await;
             // 不读取后续 ping，也不发送 pong，用裸 TCP 避免 axum/tungstenite 自动 pong。
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            tokio::time::sleep(Duration::from_secs(15)).await;
         });
 
         let base = RelayBaseUrl::parse(&format!("ws://{addr}")).unwrap();
         let result = tokio::time::timeout(
-            Duration::from_secs(4),
+            Duration::from_secs(12),
             connect_relay_mux_base_with_heartbeat(
                 base,
                 None,
@@ -1731,7 +1740,7 @@ mod tests {
     async fn mock_route_ready_timeout_ws(websocket: WebSocketUpgrade) -> impl IntoResponse {
         websocket.on_upgrade(move |mut socket| async move {
             let _ = read_axum_route_hello(&mut socket).await;
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            tokio::time::sleep(Duration::from_secs(8)).await;
         })
     }
 

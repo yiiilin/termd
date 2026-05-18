@@ -201,8 +201,22 @@ vi.mock("@xterm/xterm", () => {
     }
 
     clear() {
-      // 输出清空由 App 的待写队列和重新 attach 流程覆盖；mock 这里保持 no-op，
-      // 避免 React effect 时序把刚写入的 attach 输出误清掉。
+      // mock 要真实清空 DOM buffer，才能覆盖 WebSocket 断线重连后的 snapshot 重放不会叠加旧内容。
+      this.pendingRender = "";
+      this.pendingRenderReady = false;
+      if (!this.element) {
+        return;
+      }
+      this.element.dataset.buffer = "";
+      for (const node of Array.from(this.element.childNodes)) {
+        if (node.nodeType === Node.TEXT_NODE) {
+          node.remove();
+        }
+      }
+      this.buffer.active.cursorY = 0;
+      this.buffer.active.cursorX = 0;
+      this.buffer.active.baseY = 0;
+      this.buffer.active.viewportY = 0;
     }
 
     dispose() {}

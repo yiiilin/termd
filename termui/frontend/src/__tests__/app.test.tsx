@@ -7,6 +7,7 @@ import App, {
   browserReachableWsUrl,
   connectPairingClient,
   defaultWsUrlFromPage,
+  latencyLevelClass,
   networkRateFromSamples,
   pairingWsUrlCandidates,
 } from "../App";
@@ -459,9 +460,11 @@ describe("termui web 工作台", () => {
   it("底部状态栏使用固定列宽，避免指标内容变化时横向抖动", () => {
     const css = readFileSync(resolve(process.cwd(), "src/styles.css"), "utf8");
 
+    expect(css).toContain('font-family: "HarmonyOS Sans SC";');
+    expect(css).toContain('--font-ui: "HarmonyOS Sans SC", "HarmonyOS Sans", "Aptos", "Segoe UI", sans-serif;');
     expect(css).toContain("--daemon-status-cpu-width: 148px;");
     expect(css).toContain("--daemon-status-memory-width: 188px;");
-    expect(css).toContain("--daemon-status-network-width: 236px;");
+    expect(css).toContain("--daemon-status-network-width: 184px;");
     expect(css).toContain("--daemon-status-disk-width: 188px;");
     expect(css).toContain("--daemon-status-load-width: 142px;");
     expect(css).toContain("--daemon-status-uptime-width: 132px;");
@@ -532,15 +535,29 @@ describe("termui web 工作台", () => {
     ).toBeUndefined();
   });
 
-  it("daemon 状态栏显示网络延迟", async () => {
+  it("标题栏显示网络延迟，daemon 状态栏不再显示 RTT", async () => {
     const user = userEvent.setup();
     render(<App />);
 
     await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
     const status = await screen.findByRole("contentinfo", { name: "daemon server status" });
 
-    expect(await within(status).findByText(/RTT \d+ms/)).toBeInTheDocument();
+    await waitFor(() => {
+      const latency = document.querySelector<HTMLElement>(".toolbar-title .toolbar-latency");
+      expect(latency).not.toBeNull();
+      expect(latency?.textContent).toMatch(/\d+ms/);
+    });
+    expect(within(status).queryByText(/RTT/)).toBeNull();
     expect(daemon.pingMessages).toBeGreaterThan(0);
+  });
+
+  it("标题栏 RTT 按延迟阈值返回颜色等级", () => {
+    expect(latencyLevelClass(undefined)).toBeUndefined();
+    expect(latencyLevelClass(50)).toBe("latency-good");
+    expect(latencyLevelClass(51)).toBe("latency-warning");
+    expect(latencyLevelClass(150)).toBe("latency-warning");
+    expect(latencyLevelClass(151)).toBe("latency-danger");
   });
 
   it("可以通过拖动手柄调整 session 顺序，并在刷新后保留", async () => {
@@ -1123,10 +1140,10 @@ describe("termui web 工作台", () => {
       const manager = await screen.findByLabelText("daemon manager");
       await user.click(within(manager).getByRole("button", { name: /Use daemon Daemon 2/ }));
 
-      await waitFor(() => expect(screen.getByText("error")).toBeInTheDocument(), { timeout: 12_000 });
       const recoveredAdmin = await screen.findByLabelText("daemon admin");
       const recoveredManager = within(recoveredAdmin).getByLabelText("daemon manager");
       expect(recoveredManager).toBeVisible();
+      await waitFor(() => expect(screen.getByLabelText("selected daemon")).toHaveTextContent(secondDaemon.url));
 
       await user.click(within(recoveredManager).getByRole("button", { name: /Use daemon Daemon 1/ }));
       await waitFor(() => expect(screen.getByLabelText("selected daemon")).toHaveTextContent(daemon.url));
@@ -1138,7 +1155,7 @@ describe("termui web 工作台", () => {
         await secondDaemon.stop();
       }
     }
-  });
+  }, 20_000);
 
   it("配对候选 URL 会跳过 server_id 不匹配的 daemon", async () => {
     const secondDaemon = await MockDaemon.start({
@@ -1269,6 +1286,12 @@ describe("termui web 工作台", () => {
       () => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID, DEFAULT_SESSION_ID]),
       { timeout: 2200 },
     );
+    await waitFor(() => {
+      const stats = (globalThis as { __TERMD_TEST_XTERM_STATS__?: { writes: number } }).__TERMD_TEST_XTERM_STATS__;
+      expect(stats?.writes ?? 0).toBeGreaterThanOrEqual(2);
+    });
+    const terminalText = screen.getByTestId("terminal-pane").textContent ?? "";
+    expect(terminalText.match(/termd-e2e-ready/g) ?? []).toHaveLength(1);
     observer.disconnect();
     expect(sawConnectionAlert).toBe(false);
   });

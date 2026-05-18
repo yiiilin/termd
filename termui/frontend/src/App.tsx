@@ -77,9 +77,9 @@ const DEFAULT_SESSION_SIZE: TerminalSize = { rows: 24, cols: 80, pixel_width: 0,
 const DEFAULT_FILES_PANEL_WIDTH = 286;
 const MIN_FILES_PANEL_WIDTH = 240;
 const MAX_FILES_PANEL_WIDTH = 640;
-const CONNECTION_AUTO_RETRY_DELAY_MS = 1000;
+const CONNECTION_AUTO_RETRY_DELAY_MS = 1500;
 const CONNECTION_AUTO_RETRY_LIMIT = 3;
-const ATTACH_RECONNECT_DELAYS_MS = [250, 1000, 2500, 5000];
+const ATTACH_RECONNECT_DELAYS_MS = [250, 1000, 2500, 5000, 10000, 20000];
 const FILES_CWD_FOLLOW_POLL_INTERVAL_MS = 1000;
 const TEXT_FILE_EDITOR_MAX_BYTES = 1024 * 1024;
 const FILE_TRANSFER_MEMORY_FALLBACK_MAX_BYTES = 16 * 1024 * 1024;
@@ -92,6 +92,9 @@ const CPU_BAR_CHART_WIDTH = 56;
 const CPU_BAR_CHART_HEIGHT = 18;
 const CPU_BAR_CHART_COUNT = 18;
 const DAEMON_STATUS_POLL_INTERVAL_MS = 1000;
+const APP_CONNECTION_TIMEOUT_MS = 2000;
+const PAIRING_CONNECTION_TIMEOUT_MS = 5000;
+const ATTACH_CONNECTION_TIMEOUT_MS = 15000;
 type AppSurface = "admin" | "workspace";
 
 const RETRYABLE_CONNECTION_ERROR_CODES = new Set([
@@ -99,6 +102,8 @@ const RETRYABLE_CONNECTION_ERROR_CODES = new Set([
   "connection_error",
   "connect_timeout",
   "route_prelude_timeout",
+  "relay_daemon_offline",
+  "relay_state_unavailable",
   "handshake_timeout",
   "response_timeout",
 ]);
@@ -209,6 +214,8 @@ export default function App() {
   const cursorRefreshTimerRef = useRef<number | undefined>(undefined);
   const terminalOutputQueueRef = useRef<Uint8Array[]>([]);
   const terminalOutputResetVersionRef = useRef(0);
+  const terminalOutputAppliedResetVersionRef = useRef(0);
+  const terminalOutputResetWaitersRef = useRef<Map<number, () => void>>(new Map());
   const terminalOutputFlushFrameRef = useRef<number | undefined>(undefined);
   const terminalOutputDrainRef = useRef<(() => void) | undefined>(undefined);
   const connectionAutoRetryTimerRef = useRef<number | undefined>(undefined);
@@ -365,6 +372,8 @@ export default function App() {
     return sessionDisplayName(toolbarSession);
   }, [sessions, t, toolbarSession]);
   const toolbarSessionSize = toolbarSession ? terminalSizeDisplay(toolbarSession.size) : undefined;
+  const toolbarLatency = toolbarSession ? formatLatency(daemonNetworkLatencyMs) : undefined;
+  const toolbarLatencyLevel = latencyLevelClass(daemonNetworkLatencyMs);
 
   useEffect(() => {
     if (!activeServer?.url || !toolbarSession) {
@@ -466,6 +475,36 @@ export default function App() {
       terminalOutputFlushFrameRef.current = undefined;
     }
     setTerminalOutputResetVersion(terminalOutputResetVersionRef.current);
+    return terminalOutputResetVersionRef.current;
+  }, []);
+
+  const handleTerminalOutputResetApplied = useCallback((version: number) => {
+    terminalOutputAppliedResetVersionRef.current = Math.max(
+      terminalOutputAppliedResetVersionRef.current,
+      version,
+    );
+    for (const [pendingVersion, resolve] of terminalOutputResetWaitersRef.current) {
+      if (pendingVersion <= terminalOutputAppliedResetVersionRef.current) {
+        terminalOutputResetWaitersRef.current.delete(pendingVersion);
+        resolve();
+      }
+    }
+  }, []);
+
+  const waitForTerminalOutputResetApplied = useCallback((version: number) => {
+    if (terminalOutputAppliedResetVersionRef.current >= version) {
+      return Promise.resolve();
+    }
+    return new Promise<void>((resolve) => {
+      const timer = window.setTimeout(() => {
+        terminalOutputResetWaitersRef.current.delete(version);
+        resolve();
+      }, 250);
+      terminalOutputResetWaitersRef.current.set(version, () => {
+        window.clearTimeout(timer);
+        resolve();
+      });
+    });
   }, []);
 
   const resetAttachReconnectState = useCallback(() => {
@@ -702,6 +741,7 @@ export default function App() {
         routeServerId,
         device.device_id,
         daemonPublicKey,
+        PAIRING_CONNECTION_TIMEOUT_MS,
       );
       const accepted = await client.pair(token, device.device_public_key);
       client.close();
@@ -862,7 +902,7 @@ export default function App() {
     [activeServer?.server_id, clearTerminalOutput, disconnectAttach, state.pairedServers],
   );
 
-  const authenticatedClient = useCallback(async () => {
+  const authenticatedClient = useCallback(async (timeoutMs = APP_CONNECTION_TIMEOUT_MS) => {
     const server = activeServer;
     const device = state.device;
     if (!server || !device) {
@@ -872,6 +912,7 @@ export default function App() {
     const routeUrl = routeWsUrlForKnownServer(reachableUrl, server.server_id) ?? reachableUrl;
     const client = await DirectClient.connect(routeUrl, server.server_id, device.device_id, {
       expectedDaemonPublicKey: server.daemon_public_key,
+      timeoutMs,
     });
     await client.authenticate(device, { ...server, url: routeUrl });
     return client;
@@ -1242,7 +1283,7 @@ export default function App() {
       void (async () => {
         let client: DirectClient | undefined;
         try {
-          client = await authenticatedClient();
+          client = await authenticatedClient(ATTACH_CONNECTION_TIMEOUT_MS);
           const attached = await client.attachSession(sessionId);
           if (userDetachedRef.current) {
             resetAttachReconnectState();
@@ -1265,6 +1306,13 @@ export default function App() {
           setSessions((current) => upsertAttachedSession(current, attached, sessionOrderRef.current));
           clearNewOutputMark(sessionId);
           setStatus("attached");
+          // 自动重连会拿到 daemon 重新发送的 screen snapshot；先等旧 xterm 清屏落地，
+          // 再消费新连接里的 snapshot，避免同一屏内容被追加成两份。
+          await waitForTerminalOutputResetApplied(clearTerminalOutput());
+          if (userDetachedRef.current || attachClientRef.current !== attachedClient) {
+            attachedClient.close();
+            return;
+          }
           startReceiveLoop(attachedClient);
           updateTerminalResizeOwner(Boolean(attached.resize_owner));
           void loadSessionFiles(sessionId, undefined, { silent: true });
@@ -1287,6 +1335,7 @@ export default function App() {
     attachedSessionId,
     authenticatedClient,
     clearNewOutputMark,
+    clearTerminalOutput,
     closeAttachForReconnect,
     loadSessionFiles,
     loadSessionGit,
@@ -1296,6 +1345,7 @@ export default function App() {
     setSafeError,
     startReceiveLoop,
     updateTerminalResizeOwner,
+    waitForTerminalOutputResetApplied,
   ]);
 
   attachReconnectHandlerRef.current = scheduleAttachReconnect;
@@ -1332,7 +1382,7 @@ export default function App() {
         reattachCurrentSessionOnOpenRef.current = false;
         disconnectAttach();
         clearTerminalOutput();
-        client = await authenticatedClient();
+        client = await authenticatedClient(ATTACH_CONNECTION_TIMEOUT_MS);
         const attached = await client.attachSession(sessionId);
         if (
           attachRequestIdRef.current !== attachRequestId ||
@@ -1509,7 +1559,7 @@ export default function App() {
       connectionAutoRetryTimerRef.current = undefined;
     }
 
-    if (!error || !hasPairedServer) {
+    if (!error || !hasPairedServer || activeSurface !== "workspace") {
       return undefined;
     }
 
@@ -1539,7 +1589,7 @@ export default function App() {
         connectionAutoRetryTimerRef.current = undefined;
       }
     };
-  }, [activeServer?.server_id, attachedSessionId, error, handleRetryConnection, hasPairedServer, selectedSessionId]);
+  }, [activeServer?.server_id, activeSurface, attachedSessionId, error, handleRetryConnection, hasPairedServer, selectedSessionId]);
 
   const handleStartRename = useCallback((sessionId: UUID, currentName: string) => {
     renamingSessionIdRef.current = sessionId;
@@ -2464,12 +2514,30 @@ export default function App() {
               <MonitorUp size={16} aria-hidden="true" />
               <span>{toolbarSessionName}</span>
               {toolbarSessionSize ? <small>{toolbarSessionSize}</small> : null}
+              {toolbarLatency && toolbarLatencyLevel ? (
+                <small
+                  className={`toolbar-latency ${toolbarLatencyLevel}`}
+                  aria-label={`RTT ${toolbarLatency}`}
+                  title={`RTT ${toolbarLatency}`}
+                >
+                  {toolbarLatency}
+                </small>
+              ) : null}
             </button>
           ) : (
             <div className="toolbar-title">
               <MonitorUp size={16} aria-hidden="true" />
               <span>{toolbarSessionName}</span>
               {toolbarSessionSize ? <small>{toolbarSessionSize}</small> : null}
+              {toolbarLatency && toolbarLatencyLevel ? (
+                <small
+                  className={`toolbar-latency ${toolbarLatencyLevel}`}
+                  aria-label={`RTT ${toolbarLatency}`}
+                  title={`RTT ${toolbarLatency}`}
+                >
+                  {toolbarLatency}
+                </small>
+              ) : null}
             </div>
           )}
           {connectionReady && attachedSessionId && !isMobileLayout ? (
@@ -2547,6 +2615,7 @@ export default function App() {
                 outputResetVersion={terminalOutputResetVersion}
                 takeOutput={takeTerminalOutput}
                 registerOutputDrain={registerTerminalOutputDrain}
+                onOutputResetApplied={handleTerminalOutputResetApplied}
                 mobileShortcuts={preferences.mobileShortcuts}
                 onSearch={handleTerminalSearch}
                 onInput={handleTerminalInput}
@@ -2729,7 +2798,6 @@ export default function App() {
           status={daemonStatus}
           cpuHistory={daemonCpuHistory}
           networkRate={daemonNetworkRate}
-          latencyMs={daemonNetworkLatencyMs}
           loading={daemonStatusLoading}
           error={daemonStatusError}
           compact={isMobileLayout}
@@ -2819,7 +2887,6 @@ function DaemonStatusPanel(props: {
   status?: DaemonStatusResultPayload;
   cpuHistory: number[];
   networkRate?: DaemonNetworkRate;
-  latencyMs?: number;
   loading: boolean;
   error?: SafeError;
   compact?: boolean;
@@ -2836,7 +2903,7 @@ function DaemonStatusPanel(props: {
       : `${formatBytesCompact(usedBytes(props.status.disk_total_bytes, props.status.disk_available_bytes))} / ${formatBytesCompact(props.status.disk_total_bytes)}`
     : "-";
   const cpuValue = props.status ? `${props.status.cpu_percent.toFixed(1)}%` : props.loading ? "..." : "-";
-  const networkValue = formatNetworkMetric(props.networkRate, props.latencyMs, Boolean(props.compact));
+  const networkValue = formatNetworkMetric(props.networkRate, Boolean(props.compact));
 
   return (
     <footer
@@ -3104,6 +3171,7 @@ export async function connectPairingClient(
   routeServerId: UUID,
   deviceId: UUID,
   daemonPublicKey: string,
+  timeoutMs = APP_CONNECTION_TIMEOUT_MS,
 ): Promise<{ client: DirectClient; effectiveUrl: string }> {
   if (!routeServerId) {
     throw new ProtocolClientError("pairing_server_unknown", "pairing requires a known daemon server id");
@@ -3113,6 +3181,7 @@ export async function connectPairingClient(
     try {
       const client = await DirectClient.connect(candidateUrl, routeServerId, deviceId, {
         expectedDaemonPublicKey: daemonPublicKey,
+        timeoutMs,
       });
       if (client.serverId !== routeServerId) {
         client.close();
@@ -3307,19 +3376,8 @@ function formatNetworkRate(rate: DaemonNetworkRate, compact = false): string {
   return `↓${formatBytesPerSecond(rate.rxBytesPerSecond)} ↑${formatBytesPerSecond(rate.txBytesPerSecond)}`;
 }
 
-function formatNetworkMetric(rate?: DaemonNetworkRate, latencyMs?: number, compact = false): string {
-  const rateValue = rate ? formatNetworkRate(rate, compact) : undefined;
-  const latencyValue = formatLatency(latencyMs);
-  if (rateValue && latencyValue) {
-    return compact ? `${rateValue} ${latencyValue}` : `${rateValue} RTT ${latencyValue}`;
-  }
-  if (rateValue) {
-    return rateValue;
-  }
-  if (latencyValue) {
-    return compact ? latencyValue : `RTT ${latencyValue}`;
-  }
-  return "-";
+function formatNetworkMetric(rate?: DaemonNetworkRate, compact = false): string {
+  return rate ? formatNetworkRate(rate, compact) : "-";
 }
 
 function formatLatency(latencyMs?: number): string | undefined {
@@ -3333,6 +3391,21 @@ function formatLatency(latencyMs?: number): string | undefined {
     return `${(latencyMs / 1000).toFixed(1)}s`;
   }
   return `${Math.round(latencyMs / 1000)}s`;
+}
+
+export function latencyLevelClass(latencyMs?: number): "latency-good" | "latency-warning" | "latency-danger" | undefined {
+  if (latencyMs === undefined || !Number.isFinite(latencyMs) || latencyMs < 0) {
+    return undefined;
+  }
+  // RTT 使用固定分档：50ms 内绿色，50-150ms 黄色，超过 150ms 红色，便于标题栏快速扫视。
+  const roundedMs = Math.round(latencyMs);
+  if (roundedMs <= 50) {
+    return "latency-good";
+  }
+  if (roundedMs <= 150) {
+    return "latency-warning";
+  }
+  return "latency-danger";
 }
 
 function formatBytesPerSecond(bytesPerSecond: number): string {

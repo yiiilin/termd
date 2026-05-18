@@ -1,6 +1,16 @@
+@font-face {
+  font-family: "HarmonyOS Sans SC";
+  src: url("/fonts/HarmonyOS_Sans_SC_Regular.ttf") format("truetype");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
 :root {
   color-scheme: var(--color-scheme);
-  font-family: "IBM Plex Sans", "Aptos", "Segoe UI", sans-serif;
+  --font-ui: "HarmonyOS Sans SC", "HarmonyOS Sans", "Aptos", "Segoe UI", sans-serif;
+  --font-mono: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+  font-family: var(--font-ui);
   background: var(--color-bg-page);
   color: var(--color-text);
   /* 默认暗色主题使用 Everforest soft dark，保持终端长时间使用时的低对比柔和观感。 */
@@ -79,7 +89,8 @@
   --terminal-frame-padding: 12px;
   --daemon-status-cpu-width: 148px;
   --daemon-status-memory-width: 188px;
-  --daemon-status-network-width: 236px;
+  /* RTT 已移到 session 标题栏，状态栏网络列只需要容纳上下行速率。 */
+  --daemon-status-network-width: 184px;
   --daemon-status-disk-width: 188px;
   --daemon-status-load-width: 142px;
   --daemon-status-uptime-width: 132px;
@@ -342,7 +353,7 @@ label {
 .admin-summary-main code {
   min-width: 0;
   color: var(--color-info);
-  font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 12px;
   overflow-wrap: anywhere;
 }
@@ -385,7 +396,7 @@ label {
 .protocol-error-alert-detail code {
   flex: 0 0 auto;
   color: var(--color-warning);
-  font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 12px;
 }
 
@@ -558,7 +569,7 @@ label {
 .server-url,
 .empty-list {
   color: var(--color-text-empty);
-  font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 12px;
   overflow-wrap: anywhere;
 }
@@ -604,7 +615,7 @@ label {
   text-overflow: ellipsis;
   white-space: nowrap;
   color: var(--color-text-bright);
-  font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 12px;
 }
 
@@ -655,7 +666,7 @@ label {
 .daemon-manager-main span {
   min-width: 0;
   color: var(--color-text-muted);
-  font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 12px;
   overflow-wrap: anywhere;
 }
@@ -756,7 +767,7 @@ label {
 }
 
 .qr-scanner-fallbacks textarea {
-  font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 12px;
 }
 
@@ -903,7 +914,7 @@ label {
   background: var(--color-surface-sunken);
   color: var(--color-text);
   padding: 8px;
-  font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 12px;
   line-height: 1.45;
 }
@@ -998,7 +1009,7 @@ label {
 .session-row strong,
 .status-bar,
 .toolbar {
-  font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+  font-family: var(--font-mono);
 }
 
 .session-row-heading {
@@ -1089,7 +1100,7 @@ label {
 
 .client-row-main strong,
 .client-row-meta {
-  font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+  font-family: var(--font-mono);
 }
 
 .client-row-main strong {
@@ -1192,6 +1203,10 @@ label {
   gap: 8px;
 }
 
+.toolbar-title svg {
+  flex: 0 0 auto;
+}
+
 .toolbar-title-button {
   border: 0;
   min-height: 0;
@@ -1229,6 +1244,28 @@ label {
   background: var(--color-surface-raised);
   font-size: 11px;
   line-height: 1.2;
+}
+
+.toolbar-title .toolbar-latency {
+  min-width: 42px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+}
+
+.toolbar-title .toolbar-latency.latency-good {
+  border-color: color-mix(in srgb, var(--color-accent) 55%, var(--color-border-chip));
+  color: var(--color-accent);
+}
+
+.toolbar-title .toolbar-latency.latency-warning {
+  border-color: color-mix(in srgb, var(--color-warning) 60%, var(--color-border-chip));
+  color: var(--color-warning);
+}
+
+.toolbar-title .toolbar-latency.latency-danger {
+  border-color: color-mix(in srgb, var(--color-danger-text) 58%, var(--color-border-chip));
+  color: var(--color-danger-text);
 }
 
 .toolbar-actions {
@@ -1503,7 +1540,7 @@ label {
 .terminal-viewer-scale {
   min-width: 0;
   color: var(--color-text-toolbar);
-  font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 12px;
   white-space: nowrap;
 }
@@ -1610,7 +1647,7 @@ label {
   background: var(--color-surface-sunken);
   color: var(--color-text);
   padding: 0 8px;
-  font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 12px;
 }
 
@@ -1622,7 +1659,7 @@ label {
 .terminal-search-count {
   min-width: 54px;
   color: var(--color-text-muted);
-  font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 11px;
   text-align: right;
   white-space: nowrap;
@@ -1634,7 +1671,7 @@ label {
   display: grid;
   place-items: center;
   color: var(--color-text-dim);
-  font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+  font-family: var(--font-mono);
 }
 
 .terminal-copy-toast {
@@ -1778,7 +1815,7 @@ label {
 
 .files-path-field input {
   min-height: 30px;
-  font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 12px;
 }
 
@@ -1841,7 +1878,7 @@ label {
 .file-name,
 .file-size,
 .files-empty {
-  font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 12px;
 }
 
@@ -2085,7 +2122,7 @@ label {
 .git-change-empty,
 .git-graph-title,
 .git-graph-commit {
-  font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+  font-family: var(--font-mono);
 }
 
 .git-worktree-branch {
@@ -2141,7 +2178,7 @@ label {
   display: flex;
   align-items: center;
   color: var(--color-text-muted);
-  font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 10px;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -2534,7 +2571,7 @@ label {
   display: grid;
   align-content: start;
   padding: 8px 7px 8px 0;
-  font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 13px;
   line-height: 1.55;
   text-align: right;
@@ -2555,7 +2592,7 @@ label {
   resize: none;
   background: var(--color-terminal-bg);
   color: var(--color-terminal-fg);
-  font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 13px;
   line-height: 1.55;
 }
@@ -2655,7 +2692,7 @@ label {
   .daemon-status-strip {
     --daemon-status-cpu-width: 96px;
     --daemon-status-memory-width: 178px;
-    --daemon-status-network-width: 206px;
+    --daemon-status-network-width: 164px;
     --daemon-status-disk-width: 178px;
     --daemon-status-load-width: 136px;
   }
@@ -3008,7 +3045,7 @@ label {
     grid-template-columns:
       68px
       96px
-      112px
+      96px
       88px;
     justify-content: stretch;
     overflow-x: auto;
@@ -3079,7 +3116,7 @@ label {
     border-radius: 6px;
     background: var(--color-surface-raised);
     color: var(--color-terminal-fg);
-    font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+    font-family: var(--font-mono);
     font-size: 12px;
     display: inline-flex;
     align-items: center;
@@ -3092,7 +3129,7 @@ label {
   .terminal-mobile-paste-button {
     flex-basis: 82px;
     min-width: 82px;
-    font-family: "IBM Plex Sans", "Aptos", "Segoe UI", sans-serif;
+    font-family: var(--font-ui);
     font-weight: 700;
   }
 
@@ -3129,7 +3166,7 @@ label {
     display: grid;
     place-items: center;
     color: var(--color-text-muted);
-    font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+    font-family: var(--font-mono);
     font-size: 14px;
     line-height: 1;
   }
