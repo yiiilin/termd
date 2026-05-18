@@ -31,6 +31,7 @@ import type {
   PongPayload,
   ProtocolPacket,
   PublicKeyWire,
+  RenderableTerminalFramePayload,
   RouteReadyPayload,
   SessionAttachPayload,
   SessionClosePayload,
@@ -113,8 +114,7 @@ interface TerminalStreamState {
 }
 
 const DEFAULT_TIMEOUT_MS = 30000;
-const INITIAL_TERMINAL_STREAM_CREDIT = 64;
-const TERMINAL_STREAM_CREDIT_INCREMENT = 1;
+const INITIAL_TERMINAL_STREAM_CREDIT = 8;
 
 export { ProtocolClientError };
 
@@ -445,12 +445,13 @@ export class DirectClient {
     );
   }
 
-  async attachSession(sessionId: UUID, options: { watchUpdates?: boolean } = {}): Promise<SessionAttachedPayload> {
+  async attachSession(sessionId: UUID, options: { watchUpdates?: boolean; lastTerminalSeq?: number } = {}): Promise<SessionAttachedPayload> {
     return this.openTerminalStream<SessionAttachedPayload>(
       "terminal.attach",
       {
         session_id: sessionId,
         watch_updates: options.watchUpdates ?? true,
+        ...(options.lastTerminalSeq !== undefined ? { last_terminal_seq: options.lastTerminalSeq } : {}),
       } satisfies SessionAttachPayload,
       sessionId,
     );
@@ -728,17 +729,32 @@ export class DirectClient {
     if (stream) {
       stream.lastOutputSeq = seq;
     }
-    this.enqueueInner(envelope("session_data", packet.payload as SessionDataPayload));
-    if (seq > 0) {
-      this.sendPacketBestEffort({
-        version: PROTOCOL_PACKET_VERSION,
-        kind: "flow",
+    const payload = packet.payload as { kind?: unknown; session_id?: unknown };
+    if (payload.kind === "snapshot" || payload.kind === "output" || payload.kind === "resize" || payload.kind === "exit") {
+      this.enqueueInner(envelope("terminal_frame", {
+        ...(packet.payload as object),
+        transport_seq: seq,
         stream_id: packet.stream_id,
-        ack: seq,
-        credit: TERMINAL_STREAM_CREDIT_INCREMENT,
-        payload: {},
-      });
+      } as RenderableTerminalFramePayload));
+      return;
     }
+
+    this.enqueueInner(envelope("session_data", packet.payload as SessionDataPayload));
+  }
+
+  ackTerminalRender(sessionId: UUID, transportSeq: number, credit: number): void {
+    const stream = this.terminalStreamsBySession.get(sessionId);
+    if (!stream || credit <= 0 || transportSeq <= 0) {
+      return;
+    }
+    this.sendPacketBestEffort({
+      version: PROTOCOL_PACKET_VERSION,
+      kind: "flow",
+      stream_id: stream.streamId,
+      ack: transportSeq,
+      credit,
+      payload: {},
+    });
   }
 
   private async expectQueuedPayload<T>(expectedType: Envelope["type"]): Promise<T> {

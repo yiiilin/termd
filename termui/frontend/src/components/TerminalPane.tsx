@@ -29,6 +29,7 @@ const MOBILE_DIRECTION_REPEAT_MS = 500;
 const MOBILE_DIRECTION_TIER_TWO_PX = 56;
 const MOBILE_DIRECTION_TIER_THREE_PX = 84;
 const MOBILE_DIRECTION_CANCEL_PX = 10;
+const MAX_WRITE_BYTES = 64 * 1024;
 const TERMINAL_SEARCH_OPTIONS: ISearchOptions = {
   caseSensitive: false,
   decorations: {
@@ -43,6 +44,19 @@ const TERMINAL_SEARCH_OPTIONS: ISearchOptions = {
 type ResizeSource = "layout" | "focus" | "session" | "viewer";
 type MobileDirection = "up" | "down" | "left" | "right";
 type MobileDirectionTier = 1 | 2 | 3;
+
+export type TerminalOutputItem =
+  | { kind: "data"; bytes: Uint8Array; onRendered?: () => void }
+  | { kind: "snapshot"; bytes: Uint8Array; baseSeq: number; onRendered?: () => void }
+  | { kind: "output"; bytes: Uint8Array; terminalSeq: number; onRendered?: () => void }
+  | { kind: "resize"; terminalSeq: number; onRendered?: () => void }
+  | { kind: "exit"; terminalSeq: number; onRendered?: () => void };
+
+interface ActiveTerminalWrite {
+  item: TerminalOutputItem;
+  offset: number;
+  sequenceChecked: boolean;
+}
 
 const MOBILE_SHORTCUT_KEYS = [
   { label: "Tab", ariaKey: "terminal.sendTab", data: "\t" },
@@ -68,9 +82,10 @@ interface TerminalPaneProps {
   theme?: EffectiveTheme;
   resizeEnabled?: boolean;
   outputResetVersion: number;
-  takeOutput: () => Uint8Array[];
+  takeOutput: () => TerminalOutputItem[];
   registerOutputDrain: (drain: () => void) => () => void;
   onOutputResetApplied?: (version: number) => void;
+  onTerminalResync?: () => void;
   mobileShortcuts?: BrowserMobileShortcut[];
   onSearch?: (query: string) => Promise<SessionSearchResultPayload>;
   onInput: (data: string) => void;
@@ -135,8 +150,10 @@ export function TerminalPane(props: TerminalPaneProps) {
   const windowActiveRef = useRef(true);
   const viewerAutoFitRef = useRef(true);
   const currentFontSizeRef = useRef(TERMINAL_FONT_SIZE);
-  const pendingWriteChunksRef = useRef<Uint8Array[]>([]);
+  const pendingWriteItemsRef = useRef<TerminalOutputItem[]>([]);
   const pendingWriteBytesRef = useRef(0);
+  const activeWriteRef = useRef<ActiveTerminalWrite | undefined>(undefined);
+  const lastTerminalSeqRef = useRef<number | undefined>(undefined);
   const writeInFlightRef = useRef(false);
   const writeFrameRef = useRef<number | undefined>(undefined);
   const needsPostWriteRefreshRef = useRef(false);
@@ -1056,14 +1073,80 @@ export function TerminalPane(props: TerminalPaneProps) {
         requestTrackedFrame(() => refreshTerminal(source));
       });
     };
+    const byteLengthForItem = (item: TerminalOutputItem) =>
+      item.kind === "data" || item.kind === "snapshot" || item.kind === "output" ? item.bytes.byteLength : 0;
+    const completeActiveWrite = () => {
+      const active = activeWriteRef.current;
+      if (!active) {
+        return;
+      }
+      const { item } = active;
+      activeWriteRef.current = undefined;
+      if (item.kind === "snapshot") {
+        lastTerminalSeqRef.current = item.baseSeq;
+      } else if (item.kind === "output" || item.kind === "resize" || item.kind === "exit") {
+        lastTerminalSeqRef.current = item.terminalSeq;
+      }
+      item.onRendered?.();
+    };
+    const ensureActiveWriteSequence = (active: ActiveTerminalWrite): boolean => {
+      if (active.sequenceChecked) {
+        return true;
+      }
+      active.sequenceChecked = true;
+      const { item } = active;
+      if (item.kind === "snapshot") {
+        terminal.reset();
+        needsPostWriteRefreshRef.current = true;
+        return true;
+      }
+      if (item.kind === "output" || item.kind === "resize" || item.kind === "exit") {
+        const expected = (lastTerminalSeqRef.current ?? -1) + 1;
+        if (lastTerminalSeqRef.current === undefined || item.terminalSeq !== expected) {
+          // 中文注释：terminal_seq 缺口说明 snapshot/tail 已经不连续，必须重新 attach 获取权威 snapshot。
+          props.onTerminalResync?.();
+          item.onRendered?.();
+          activeWriteRef.current = undefined;
+          return false;
+        }
+      }
+      return true;
+    };
+    const nextActiveWrite = () => {
+      while (!activeWriteRef.current) {
+        const item = pendingWriteItemsRef.current.shift();
+        if (!item) {
+          return undefined;
+        }
+        pendingWriteBytesRef.current = Math.max(0, pendingWriteBytesRef.current - byteLengthForItem(item));
+        activeWriteRef.current = { item, offset: 0, sequenceChecked: false };
+        if (!ensureActiveWriteSequence(activeWriteRef.current)) {
+          continue;
+        }
+        if (item.kind === "resize" || item.kind === "exit") {
+          completeActiveWrite();
+          continue;
+        }
+        if (byteLengthForItem(item) === 0) {
+          completeActiveWrite();
+          continue;
+        }
+      }
+      return activeWriteRef.current;
+    };
     const takePendingWrite = () => {
-      if (pendingWriteBytesRef.current <= 0) {
+      const active = nextActiveWrite();
+      if (!active) {
         return undefined;
       }
-      const chunks = pendingWriteChunksRef.current;
-      pendingWriteChunksRef.current = [];
-      pendingWriteBytesRef.current = 0;
-      return concatTerminalOutputChunks(chunks);
+      const { item } = active;
+      if (item.kind !== "data" && item.kind !== "snapshot" && item.kind !== "output") {
+        return undefined;
+      }
+      const end = Math.min(item.bytes.byteLength, active.offset + MAX_WRITE_BYTES);
+      const slice = item.bytes.subarray(active.offset, end);
+      active.offset = end;
+      return slice;
     };
     const afterTerminalWrite = () => {
       if (disposed) {
@@ -1093,8 +1176,11 @@ export function TerminalPane(props: TerminalPaneProps) {
           return;
         }
         writeInFlightRef.current = false;
+        if (activeWriteRef.current && activeWriteRef.current.offset >= byteLengthForItem(activeWriteRef.current.item)) {
+          completeActiveWrite();
+        }
         afterTerminalWrite();
-        if (pendingWriteBytesRef.current > 0) {
+        if (activeWriteRef.current || pendingWriteItemsRef.current.length > 0) {
           schedulePendingWrite();
         }
       });
@@ -1112,12 +1198,12 @@ export function TerminalPane(props: TerminalPaneProps) {
       });
     }
     const drainOutput = () => {
-      const chunks = takeOutputRef.current();
-      if (chunks.length === 0) {
+      const items = takeOutputRef.current();
+      if (items.length === 0) {
         return;
       }
-      pendingWriteChunksRef.current.push(...chunks);
-      pendingWriteBytesRef.current += chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
+      pendingWriteItemsRef.current.push(...items);
+      pendingWriteBytesRef.current += items.reduce((sum, item) => sum + byteLengthForItem(item), 0);
       schedulePendingWrite();
     };
     stabilizeRef.current = stabilizeTerminal;
@@ -1288,8 +1374,10 @@ export function TerminalPane(props: TerminalPaneProps) {
       resizeRef.current = undefined;
       stabilizeRef.current = undefined;
       drainOutputRef.current = () => undefined;
-      pendingWriteChunksRef.current = [];
+      pendingWriteItemsRef.current = [];
       pendingWriteBytesRef.current = 0;
+      activeWriteRef.current = undefined;
+      lastTerminalSeqRef.current = undefined;
       writeInFlightRef.current = false;
       writeFrameRef.current = undefined;
       needsPostWriteRefreshRef.current = false;
@@ -1329,15 +1417,17 @@ export function TerminalPane(props: TerminalPaneProps) {
       return;
     }
     outputResetVersionRef.current = props.outputResetVersion;
-    pendingWriteChunksRef.current = [];
+    pendingWriteItemsRef.current = [];
     pendingWriteBytesRef.current = 0;
+    activeWriteRef.current = undefined;
+    lastTerminalSeqRef.current = undefined;
     if (writeFrameRef.current !== undefined) {
       window.cancelAnimationFrame(writeFrameRef.current);
       writeFrameRef.current = undefined;
     }
     needsPostWriteRefreshRef.current = true;
     // session 切换时 UI 会重置输出队列；同步清屏，避免旧 session 明文留在终端实例中。
-    terminal.clear();
+    terminal.reset();
     props.onOutputResetApplied?.(props.outputResetVersion);
   }, [props.outputResetVersion, props.onOutputResetApplied]);
 
@@ -1590,20 +1680,6 @@ function fitScaleForViewer(scrollport: HTMLElement | null, canvas: HTMLElement |
   const widthScale = (scrollport.clientWidth / canvas.offsetWidth) * currentScale;
   const heightScale = (scrollport.clientHeight / canvas.offsetHeight) * currentScale;
   return clampViewerScale(Math.min(widthScale, heightScale));
-}
-
-function concatTerminalOutputChunks(chunks: Uint8Array[]): Uint8Array {
-  if (chunks.length === 1) {
-    return chunks[0];
-  }
-  const byteLength = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
-  const output = new Uint8Array(byteLength);
-  let offset = 0;
-  for (const chunk of chunks) {
-    output.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return output;
 }
 
 function nowForThrottle(): number {

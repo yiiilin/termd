@@ -163,6 +163,9 @@ jobs:
 
           tag = sys.argv[1]
           repo = sys.argv[2]
+          supervisor_version = pathlib.Path("SUPERVISOR_VERSION").read_text().strip()
+          if not supervisor_version:
+              raise SystemExit("SUPERVISOR_VERSION is empty")
           out_dir = pathlib.Path("dist/release")
           scripts = [
               pathlib.Path("scripts/install-termctl.sh"),
@@ -177,6 +180,12 @@ jobs:
           for src in scripts:
               text = src.read_text()
               replacements = dict(common_replacements)
+              if src.name == "install-termd.sh":
+                  replacements['REQUIRED_SUPERVISOR_VERSION="${TERMD_REQUIRED_SUPERVISOR_VERSION:-}"'] = (
+                      'REQUIRED_SUPERVISOR_VERSION="${TERMD_REQUIRED_SUPERVISOR_VERSION:-'
+                      + supervisor_version
+                      + '}"'
+                  )
               for old, new in replacements.items():
                   if old not in text:
                       raise SystemExit(f"{src} did not contain expected assignment: {old}")

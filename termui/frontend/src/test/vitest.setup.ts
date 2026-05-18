@@ -219,6 +219,11 @@ vi.mock("@xterm/xterm", () => {
       this.buffer.active.viewportY = 0;
     }
 
+    reset() {
+      // xterm.reset() 会清空终端状态；测试 mock 复用 clear 的 DOM/游标重置逻辑即可。
+      this.clear();
+    }
+
     dispose() {}
 
     private renderData(data: string) {

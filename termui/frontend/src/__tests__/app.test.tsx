@@ -1920,6 +1920,173 @@ describe("termui web 工作台", () => {
     expect(within(panel).getByLabelText("Current directory")).toHaveValue("/tmp/work");
   });
 
+  it("文件 panel 在跟随模式下手动切目录后会退出跟随，避免被轮询打回", async () => {
+    const user = userEvent.setup();
+    const sessionId = "00000000-0000-0000-0000-000000000416";
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [
+        {
+          session_id: sessionId,
+          state: "running",
+          size: { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 },
+        },
+      ],
+      sessionFiles: {
+        [sessionId]: {
+          session_id: sessionId,
+          path: "/home/me",
+          entries: [
+            {
+              name: "project",
+              path: "/home/me/project",
+              kind: "directory",
+              size_bytes: 0,
+              modified_at_ms: null,
+            },
+          ],
+        },
+        "/home/me/project": {
+          session_id: sessionId,
+          path: "/home/me/project",
+          entries: [
+            {
+              name: "src",
+              path: "/home/me/project/src",
+              kind: "directory",
+              size_bytes: 0,
+              modified_at_ms: null,
+            },
+          ],
+        },
+        "/tmp/work": {
+          session_id: sessionId,
+          path: "/tmp/work",
+          entries: [
+            {
+              name: "beta.log",
+              path: "/tmp/work/beta.log",
+              kind: "file",
+              size_bytes: 4,
+              modified_at_ms: null,
+            },
+          ],
+        },
+      },
+    });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await user.click(screen.getByRole("button", { name: "Refresh" }));
+    await clickSessionCard(user);
+
+    const panel = await screen.findByLabelText("session files");
+    const followToggle = within(panel).getByLabelText("Follow terminal cwd") as HTMLInputElement;
+    expect(followToggle).toBeChecked();
+    await within(panel).findByText("project");
+
+    daemon.setSessionFilePosition(sessionId, "/home/me/project");
+    await user.click(within(panel).getByRole("button", { name: "Open project" }));
+    await within(panel).findByText("src");
+    expect(followToggle).not.toBeChecked();
+    await waitFor(() => expect(within(panel).getByLabelText("Current directory")).toHaveValue("/home/me/project"));
+
+    const requestCountBeforeFollowTick = daemon.sessionFileRequests.length;
+    daemon.setSessionFilePosition(sessionId, "/tmp/work");
+    await new Promise((resolve) => window.setTimeout(resolve, 1200));
+    expect(daemon.sessionFileRequests.slice(requestCountBeforeFollowTick)).not.toContainEqual({
+      session_id: sessionId,
+    });
+    expect(within(panel).getByLabelText("Current directory")).toHaveValue("/home/me/project");
+    expect(within(panel).queryByText("beta.log")).toBeNull();
+  });
+
+  it("文件 panel 关闭跟随后忽略 daemon 后台 cwd 推送，仍可手动切目录", async () => {
+    const user = userEvent.setup();
+    const sessionId = "00000000-0000-0000-0000-000000000417";
+    const cwdPushFiles = {
+      session_id: sessionId,
+      path: "/tmp/work",
+      entries: [
+        {
+          name: "beta.log",
+          path: "/tmp/work/beta.log",
+          kind: "file",
+          size_bytes: 4,
+          modified_at_ms: null,
+        },
+      ],
+    } satisfies SessionFilesResultPayload;
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [
+        {
+          session_id: sessionId,
+          state: "running",
+          size: { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 },
+        },
+      ],
+      sessionFiles: {
+        [sessionId]: {
+          session_id: sessionId,
+          path: "/home/me",
+          entries: [
+            {
+              name: "project",
+              path: "/home/me/project",
+              kind: "directory",
+              size_bytes: 0,
+              modified_at_ms: null,
+            },
+          ],
+        },
+        "/home/me/project": {
+          session_id: sessionId,
+          path: "/home/me/project",
+          entries: [
+            {
+              name: "src",
+              path: "/home/me/project/src",
+              kind: "directory",
+              size_bytes: 0,
+              modified_at_ms: null,
+            },
+          ],
+        },
+        "/tmp/work": cwdPushFiles,
+      },
+    });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await user.click(screen.getByRole("button", { name: "Refresh" }));
+    await clickSessionCard(user);
+
+    const panel = await screen.findByLabelText("session files");
+    await within(panel).findByText("project");
+    const followToggle = within(panel).getByLabelText("Follow terminal cwd") as HTMLInputElement;
+    await user.click(followToggle);
+    expect(followToggle).not.toBeChecked();
+
+    daemon.pushSessionFiles(cwdPushFiles);
+    await new Promise((resolve) => window.setTimeout(resolve, 50));
+    expect(within(panel).getByLabelText("Current directory")).toHaveValue("/home/me");
+    expect(within(panel).queryByText("beta.log")).toBeNull();
+
+    await user.click(within(panel).getByRole("button", { name: "Open project" }));
+    await within(panel).findByText("src");
+    await waitFor(() => expect(within(panel).getByLabelText("Current directory")).toHaveValue("/home/me/project"));
+
+    daemon.pushSessionFiles(cwdPushFiles);
+    await new Promise((resolve) => window.setTimeout(resolve, 50));
+    expect(within(panel).getByLabelText("Current directory")).toHaveValue("/home/me/project");
+    expect(within(panel).queryByText("beta.log")).toBeNull();
+  });
+
   it("重新 attach session 时恢复该 session 的文件树目录", async () => {
     const user = userEvent.setup();
     const sessionId = "00000000-0000-0000-0000-000000000412";

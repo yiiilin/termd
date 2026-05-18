@@ -14,6 +14,7 @@ use tokio::sync::watch;
 
 use crate::pty::{
     CommandSpec, PtyBackend, PtyError, PtyRestoreInfo, PtySession, PtySize, PtySnapshot,
+    PtyTerminalFrame,
 };
 use crate::session::{AttachRole, SessionError, SessionManager, SessionState, TerminalSize};
 use crate::state::SessionStateRecord;
@@ -347,6 +348,34 @@ impl<B: PtyBackend> SessionRuntime<B> {
     pub fn snapshot(&mut self, session_id: &str) -> RuntimeResult<PtySnapshot> {
         self.ensure_open_session(session_id)?;
         Ok(self.runtime_session_mut(session_id)?.pty.snapshot()?)
+    }
+
+    /// 读取 supervisor 权威 terminal snapshot/tail。
+    ///
+    /// 中文注释：`last_terminal_seq` 是客户端已完成渲染的 session 级序号；
+    /// runtime 只透传给 PTY supervisor，不把它和 packet stream seq 混在一起。
+    pub fn terminal_snapshot(
+        &mut self,
+        session_id: &str,
+        last_terminal_seq: Option<u64>,
+    ) -> RuntimeResult<Vec<PtyTerminalFrame>> {
+        self.ensure_open_session(session_id)?;
+        Ok(self
+            .runtime_session_mut(session_id)?
+            .pty
+            .terminal_snapshot(last_terminal_seq)?)
+    }
+
+    /// 读取一个 supervisor 结构化 terminal live frame。
+    pub fn read_terminal_frame(
+        &mut self,
+        session_id: &str,
+    ) -> RuntimeResult<Option<PtyTerminalFrame>> {
+        self.ensure_open_session(session_id)?;
+        Ok(self
+            .runtime_session_mut(session_id)?
+            .pty
+            .read_terminal_frame()?)
     }
 
     /// 查询 session 对应的 supervisor 恢复信息。

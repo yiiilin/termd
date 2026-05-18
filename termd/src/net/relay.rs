@@ -2385,6 +2385,7 @@ mod tests {
                     termd_proto::SessionAttachPayload {
                         session_id: created_payload.session_id,
                         watch_updates: true,
+                        last_terminal_seq: None,
                     },
                 )
                 .unwrap(),

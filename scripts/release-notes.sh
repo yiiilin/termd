@@ -12,6 +12,24 @@ version="${1:-}"
 }
 
 case "$version" in
+  0.3.0)
+    cat <<'EOF'
+termd 0.3.0
+
+用户可见变化:
+- 重新打开或切换大型 session 时，终端输入通道会在 attach 后立即可用；10MB 级历史输出不再阻塞输入。
+- supervisor 现在是终端画面的权威来源，会维护最近 1000 行热历史、当前 viewport、样式、光标位置和 session 级 terminal_seq；浏览器收到 snapshot 后替换画面，再按 tail 追平。
+- Web xterm 输出改为 render-complete flow control：只有 xterm write callback 完成后才补 credit，慢浏览器不会被后端无限灌输出。
+- terminal stream 新增明确的 snapshot/output/resize/exit frame，不再把恢复内容伪装成普通 session_data；重连和切换 session 时会避免历史重复重放。
+- 重新 attach 的 snapshot 会恢复当前 SGR 样式状态，未 reset 的彩色输出在后续 tail 中会继续按原样式渲染。
+- direct 和 relay 路径都覆盖了新 terminal stream；relay 下创建、attach、输入、daemon 重启后恢复热历史都使用同一套协议语义。
+
+兼容性:
+- 0.3.0 是 supervisor IPC 不兼容版本；旧 live supervisor 不能被 0.3.0 daemon 安全复用。
+- 本次 release installer 会要求 supervisor 兼容版本升级到 `0.3.0`。如果检测到已有 runtime session，会提示“升级 supervisor 会丢失现有 session”；用户拒绝则退出升级流程，用户确认后才会停旧 daemon、终止旧 supervisor 并清空 session 运行态。
+- daemon、Web UI、termctl 和 relay 建议同步升级到 0.3.0；relay 仍保持不可信 dumb pipe，不解密也不解析业务内容。
+EOF
+    ;;
   0.2.2)
     cat <<'EOF'
 termd 0.2.2

@@ -11,6 +11,7 @@ export const ALL_MESSAGE_TYPES = [
   "session_attach",
   "session_attached",
   "session_data",
+  "terminal_frame",
   "session_activity",
   "session_cursor",
   "session_resize",
@@ -278,6 +279,7 @@ export interface SessionCreatedPayload {
 export interface SessionAttachPayload {
   session_id: UUID;
   watch_updates?: boolean;
+  last_terminal_seq?: number | null;
 }
 
 export interface SessionAttachedPayload {
@@ -486,6 +488,47 @@ export interface SessionDataPayload {
   session_id: UUID;
   data_base64: string;
 }
+
+export type TerminalFrameKind = "snapshot" | "output" | "resize" | "exit";
+
+export type TerminalFramePayload =
+  | {
+      kind: "snapshot";
+      session_id: UUID;
+      base_seq: number;
+      size: TerminalSize;
+      data_base64: string;
+    }
+  | {
+      kind: "output";
+      session_id: UUID;
+      terminal_seq: number;
+      data_base64: string;
+    }
+  | {
+      kind: "resize";
+      session_id: UUID;
+      terminal_seq: number;
+      size: TerminalSize;
+    }
+  | {
+      kind: "exit";
+      session_id: UUID;
+      terminal_seq: number;
+      code?: number | null;
+    };
+
+export type RenderableTerminalFramePayload = TerminalFramePayload & {
+  /**
+   * 前端内部字段：连接内 stream seq，用于 xterm 渲染完成后补 flow credit。
+   * 这个字段不属于 wire payload，不能由 daemon/relay 解释。
+   */
+  transport_seq: number;
+  /**
+   * 前端内部字段：当前 packet stream id，方便调试和测试流控归属。
+   */
+  stream_id: PacketStreamId;
+};
 
 export interface SessionActivityPayload {
   session_id: UUID;

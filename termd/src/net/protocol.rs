@@ -39,7 +39,7 @@ use termd_proto::{
     SessionListPayload, SessionListResultPayload, SessionRenamePayload, SessionRenamedPayload,
     SessionReorderPayload, SessionReorderedPayload, SessionResizePayload, SessionResizedPayload,
     SessionSearchMatchPayload, SessionSearchPayload, SessionSearchResultPayload, SessionState,
-    SessionSummaryPayload, TerminalSize, UnixTimestampMillis,
+    SessionSummaryPayload, TerminalFramePayload, TerminalSize, UnixTimestampMillis,
 };
 use thiserror::Error;
 use tokio::sync::watch;
@@ -51,7 +51,9 @@ use crate::auth::{
     TrustedDeviceStore, current_unix_timestamp_millis,
 };
 use crate::config::DaemonConfig;
-use crate::pty::{CommandSpec, PtyBackend, PtyRestoreInfo, PtySupervisorStatus};
+use crate::pty::{
+    CommandSpec, PtyBackend, PtyRestoreInfo, PtySize, PtySupervisorStatus, PtyTerminalFrame,
+};
 use crate::runtime::{RuntimeError, SessionRuntime};
 use crate::session::{
     AttachRole as RuntimeAttachRole, SessionState as RuntimeSessionState,
@@ -816,6 +818,23 @@ where
         connection: &mut ProtocolConnection,
         payload: SessionCreatePayload,
     ) -> Result<Vec<JsonEnvelope>, ProtocolError> {
+        self.create_session_inner(connection, payload, false)
+    }
+
+    fn create_terminal_stream_session(
+        &mut self,
+        connection: &mut ProtocolConnection,
+        payload: SessionCreatePayload,
+    ) -> Result<Vec<JsonEnvelope>, ProtocolError> {
+        self.create_session_inner(connection, payload, true)
+    }
+
+    fn create_session_inner(
+        &mut self,
+        connection: &mut ProtocolConnection,
+        payload: SessionCreatePayload,
+        enqueue_terminal_snapshot: bool,
+    ) -> Result<Vec<JsonEnvelope>, ProtocolError> {
         let device_id = connection.authenticated_device_id()?;
         let command = command_spec_from_payload(&payload.command, &self.config)?;
         let session_root = session_root_from_command(&command)?;
@@ -854,14 +873,24 @@ where
             .attach(&internal_session_id, device_key(device_id))
             .map_err(map_runtime_error)?;
         let wire_role = runtime_role_to_proto(role);
-        self.drain_runtime_output_to_history_until_empty(
-            wire_session_id,
-            &internal_session_id,
-            16 * 1024,
-        )?;
         let response_size = self.runtime_size_proto(&internal_session_id)?;
-        let (output_offset, initial_output) =
-            self.output_history_attach_snapshot(wire_session_id, response_size);
+        let (output_offset, initial_output) = if connection.packet_mode {
+            if enqueue_terminal_snapshot {
+                // 普通 packet `session.create` 只创建 session；只有 terminal stream
+                // create 才需要立即入队 snapshot，避免无 stream 的短命令触发终端恢复路径。
+                let frames =
+                    self.terminal_snapshot_frames(wire_session_id, &internal_session_id, None)?;
+                connection.enqueue_terminal_frames(wire_session_id, frames);
+            }
+            (0, Vec::new())
+        } else {
+            self.drain_runtime_output_to_history_until_empty(
+                wire_session_id,
+                &internal_session_id,
+                16 * 1024,
+            )?;
+            self.output_history_attach_snapshot(wire_session_id, response_size)
+        };
         connection.attach(wire_session_id, output_offset, initial_output, true);
         self.record_daemon_client_attach(wire_session_id, connection, device_id);
         let resize_owner = self.assign_resize_owner_if_missing(wire_session_id, connection);
@@ -913,12 +942,22 @@ where
         let wire_role = runtime_role_to_proto(role);
         let response_size = self.runtime_size_proto(&internal_session_id)?;
         let (output_offset, initial_output) = if payload.watch_updates {
-            self.drain_runtime_output_to_history_until_empty(
-                payload.session_id,
-                &internal_session_id,
-                16 * 1024,
-            )?;
-            self.output_history_attach_snapshot(payload.session_id, response_size)
+            if connection.packet_mode {
+                let frames = self.terminal_snapshot_frames(
+                    payload.session_id,
+                    &internal_session_id,
+                    payload.last_terminal_seq,
+                )?;
+                connection.enqueue_terminal_frames(payload.session_id, frames);
+                (0, Vec::new())
+            } else {
+                self.drain_runtime_output_to_history_until_empty(
+                    payload.session_id,
+                    &internal_session_id,
+                    16 * 1024,
+                )?;
+                self.output_history_attach_snapshot(payload.session_id, response_size)
+            }
         } else {
             (0, Vec::new())
         };
@@ -2066,6 +2105,32 @@ where
         (history.end_offset(), history.snapshot_bytes())
     }
 
+    fn terminal_snapshot_frames(
+        &mut self,
+        session_id: SessionId,
+        internal_session_id: &str,
+        last_terminal_seq: Option<u64>,
+    ) -> Result<Vec<TerminalFramePayload>, ProtocolError> {
+        self.runtime
+            .terminal_snapshot(internal_session_id, last_terminal_seq)
+            .map_err(map_runtime_error)?
+            .into_iter()
+            .map(|frame| terminal_frame_payload(session_id, frame))
+            .collect()
+    }
+
+    fn read_terminal_frame(
+        &mut self,
+        session_id: SessionId,
+        internal_session_id: &str,
+    ) -> Result<Option<TerminalFramePayload>, ProtocolError> {
+        self.runtime
+            .read_terminal_frame(internal_session_id)
+            .map_err(map_runtime_error)?
+            .map(|frame| terminal_frame_payload(session_id, frame))
+            .transpose()
+    }
+
     fn drain_runtime_output_to_history(
         &mut self,
         session_id: SessionId,
@@ -2326,6 +2391,7 @@ where
             .collect();
         connection.output_offsets.clear();
         connection.pending_outputs.clear();
+        connection.pending_terminal_frames.clear();
         connection.watched_sessions.clear();
         self.mark_daemon_client_connection_offline(device_id, connection.client_id, now_ms);
 
@@ -3155,6 +3221,7 @@ pub struct ProtocolConnection {
     watched_sessions: HashSet<SessionId>,
     output_offsets: HashMap<SessionId, u64>,
     pending_outputs: HashMap<SessionId, VecDeque<Vec<u8>>>,
+    pending_terminal_frames: HashMap<SessionId, VecDeque<TerminalFramePayload>>,
 }
 
 impl ProtocolConnection {
@@ -3176,6 +3243,7 @@ impl ProtocolConnection {
             watched_sessions: HashSet::new(),
             output_offsets: HashMap::new(),
             pending_outputs: HashMap::new(),
+            pending_terminal_frames: HashMap::new(),
         }
     }
 
@@ -3450,6 +3518,41 @@ impl ProtocolConnection {
 
         if max_bytes == 0 {
             return Ok(Vec::new());
+        }
+        if self.packet_mode {
+            let max_frames = self.packet_stream_output_credit(session_id).unwrap_or(0) as usize;
+            if max_frames == 0 {
+                return Ok(Vec::new());
+            }
+
+            let mut frames = Vec::new();
+            if let Some(pending) = self.pending_terminal_frames.get_mut(&session_id) {
+                while frames.len() < max_frames {
+                    let Some(frame) = pending.pop_front() else {
+                        break;
+                    };
+                    frames.push(frame);
+                }
+            }
+
+            while frames.len() < max_frames && frames.len() < LIVE_OUTPUT_DRAIN_MAX_CHUNKS {
+                let Some(frame) = protocol.read_terminal_frame(session_id, &internal_session_id)?
+                else {
+                    break;
+                };
+                if matches!(frame, TerminalFramePayload::Output { .. })
+                    && protocol.sync_session_terminal_cwd(session_id)?
+                {
+                    protocol.notify_session_file_tree_changed(session_id);
+                }
+                frames.push(frame);
+            }
+
+            let messages = frames
+                .into_iter()
+                .map(|frame| envelope_value(MessageType::TerminalFrame, frame))
+                .collect::<Result<Vec<_>, _>>()?;
+            return self.encrypt_inner_messages(messages);
         }
         let max_packet_chunks = if self.packet_mode {
             let credit = self.packet_stream_output_credit(session_id).unwrap_or(0) as usize;
@@ -3977,7 +4080,7 @@ impl ProtocolConnection {
         let responses = match method.as_str() {
             METHOD_TERMINAL_CREATE => {
                 let payload = decode_payload(packet.payload)?;
-                protocol.create_session(self, payload)
+                protocol.create_terminal_stream_session(self, payload)
             }
             METHOD_TERMINAL_ATTACH => {
                 let payload = decode_payload(packet.payload)?;
@@ -4223,6 +4326,15 @@ impl ProtocolConnection {
             }
         }
     }
+
+    fn enqueue_terminal_frames(
+        &mut self,
+        session_id: SessionId,
+        frames: impl IntoIterator<Item = TerminalFramePayload>,
+    ) {
+        let queue = self.pending_terminal_frames.entry(session_id).or_default();
+        queue.extend(frames);
+    }
 }
 
 pub fn envelope_value<T>(kind: MessageType, payload: T) -> Result<JsonEnvelope, ProtocolError>
@@ -4327,6 +4439,15 @@ fn packet_from_envelope(
         let payload: SessionDataPayload = decode_payload(envelope.payload)?;
         let (stream_id, seq) = connection
             .next_packet_stream_output_seq(payload.session_id)
+            .ok_or(ProtocolError::InvalidState)?;
+        let payload = serde_json::to_value(payload).map_err(|_| ProtocolError::InvalidEnvelope)?;
+        return Ok(ProtocolPacket::stream_chunk(stream_id, seq, payload));
+    }
+
+    if envelope.kind == MessageType::TerminalFrame {
+        let payload: TerminalFramePayload = decode_payload(envelope.payload)?;
+        let (stream_id, seq) = connection
+            .next_packet_stream_output_seq(payload.session_id())
             .ok_or(ProtocolError::InvalidState)?;
         let payload = serde_json::to_value(payload).map_err(|_| ProtocolError::InvalidEnvelope)?;
         return Ok(ProtocolPacket::stream_chunk(stream_id, seq, payload));
@@ -5166,6 +5287,48 @@ fn runtime_size_to_proto(size: RuntimeTerminalSize) -> TerminalSize {
     }
 }
 
+fn pty_size_to_proto(size: PtySize) -> TerminalSize {
+    TerminalSize {
+        rows: size.rows,
+        cols: size.cols,
+        pixel_width: size.pixel_width,
+        pixel_height: size.pixel_height,
+    }
+}
+
+fn terminal_frame_payload(
+    session_id: SessionId,
+    frame: PtyTerminalFrame,
+) -> Result<TerminalFramePayload, ProtocolError> {
+    Ok(match frame {
+        PtyTerminalFrame::Snapshot {
+            base_seq,
+            size,
+            data,
+        } => TerminalFramePayload::Snapshot {
+            session_id,
+            base_seq,
+            size: pty_size_to_proto(size),
+            data_base64: general_purpose::STANDARD.encode(data),
+        },
+        PtyTerminalFrame::Output { terminal_seq, data } => TerminalFramePayload::Output {
+            session_id,
+            terminal_seq,
+            data_base64: general_purpose::STANDARD.encode(data),
+        },
+        PtyTerminalFrame::Resize { terminal_seq, size } => TerminalFramePayload::Resize {
+            session_id,
+            terminal_seq,
+            size: pty_size_to_proto(size),
+        },
+        PtyTerminalFrame::Exit { terminal_seq, code } => TerminalFramePayload::Exit {
+            session_id,
+            terminal_seq,
+            code,
+        },
+    })
+}
+
 fn runtime_state_to_proto(state: RuntimeSessionState) -> SessionState {
     match state {
         RuntimeSessionState::Created => SessionState::Created,
@@ -5278,7 +5441,7 @@ mod tests {
     use crate::net::signature::Ed25519SignatureVerifier;
     use crate::pty::{
         PtyBackend, PtyError, PtyExitStatus, PtyRestoreInfo, PtyResult, PtySession, PtySize,
-        PtySnapshot, PtySupervisorStatus,
+        PtySnapshot, PtySupervisorStatus, PtyTerminalFrame,
     };
     use crate::session::TerminalSize as RuntimeTerminalSize;
     use crate::state::{StateStore, client_history::ClientHistoryStore};
@@ -5294,6 +5457,8 @@ mod tests {
     struct FakePtyState {
         outputs: VecDeque<Vec<u8>>,
         outputs_by_session: HashMap<String, VecDeque<Vec<u8>>>,
+        terminal_seq_by_session: HashMap<String, u64>,
+        terminal_frames_by_session: HashMap<String, VecDeque<PtyTerminalFrame>>,
         cwd_by_session: HashMap<String, PathBuf>,
         writes: Vec<Vec<u8>>,
         reconnects: Vec<String>,
@@ -5422,7 +5587,22 @@ mod tests {
             Ok(())
         }
 
-        fn resize(&mut self, _size: PtySize) -> PtyResult<()> {
+        fn resize(&mut self, size: PtySize) -> PtyResult<()> {
+            let Some(session_id) = &self.session_id else {
+                return Ok(());
+            };
+            let mut state = self.state.lock().unwrap();
+            let seq = next_fake_terminal_seq(&mut state, session_id);
+            // fake PTY 也把 resize 放进 terminal frame 队列，确保协议层测试能覆盖
+            // “resize 也是 session 级 terminal_seq 事件”这个不变量。
+            state
+                .terminal_frames_by_session
+                .entry(session_id.clone())
+                .or_default()
+                .push_back(PtyTerminalFrame::Resize {
+                    terminal_seq: seq,
+                    size,
+                });
             Ok(())
         }
 
@@ -5432,6 +5612,61 @@ mod tests {
                 process_id: Some(7),
                 retained_output: Vec::new(),
             })
+        }
+
+        fn terminal_snapshot(
+            &mut self,
+            _last_terminal_seq: Option<u64>,
+        ) -> PtyResult<Vec<PtyTerminalFrame>> {
+            let base_seq = self
+                .session_id
+                .as_ref()
+                .and_then(|session_id| {
+                    self.state
+                        .lock()
+                        .unwrap()
+                        .terminal_seq_by_session
+                        .get(session_id)
+                        .copied()
+                })
+                .unwrap_or(0);
+            Ok(vec![PtyTerminalFrame::Snapshot {
+                base_seq,
+                size: PtySize::new(24, 80),
+                data: Vec::new(),
+            }])
+        }
+
+        fn read_terminal_frame(&mut self) -> PtyResult<Option<PtyTerminalFrame>> {
+            let mut state = self.state.lock().unwrap();
+            if let Some(session_id) = &self.session_id {
+                if let Some(frames) = state.terminal_frames_by_session.get_mut(session_id) {
+                    if let Some(frame) = frames.pop_front() {
+                        return Ok(Some(frame));
+                    }
+                }
+
+                if let Some(outputs) = state.outputs_by_session.get_mut(session_id) {
+                    if let Some(data) = pop_fake_output_queue(outputs, 16 * 1024) {
+                        let seq = next_fake_terminal_seq(&mut state, session_id);
+                        return Ok(Some(PtyTerminalFrame::Output {
+                            terminal_seq: seq,
+                            data,
+                        }));
+                    }
+                }
+            }
+
+            // 没有关联到具体 session 的旧测试仍走全局输出队列；为了不伪造跨
+            // session 的顺序关系，这条兼容路径只使用 `terminal_seq=0`。
+            Ok(
+                pop_fake_output_queue(&mut state.outputs, 16 * 1024).map(|data| {
+                    PtyTerminalFrame::Output {
+                        terminal_seq: 0,
+                        data,
+                    }
+                }),
+            )
         }
 
         fn restore_info(&self) -> Option<PtyRestoreInfo> {
@@ -5483,6 +5718,26 @@ mod tests {
         }
 
         Some(read)
+    }
+
+    fn pop_fake_output_queue(outputs: &mut VecDeque<Vec<u8>>, max_bytes: usize) -> Option<Vec<u8>> {
+        let Some(output) = outputs.pop_front() else {
+            return None;
+        };
+        let read = output.len().min(max_bytes);
+        if read < output.len() {
+            outputs.push_front(output[read..].to_vec());
+        }
+        Some(output[..read].to_vec())
+    }
+
+    fn next_fake_terminal_seq(state: &mut FakePtyState, session_id: &str) -> u64 {
+        let next = state
+            .terminal_seq_by_session
+            .entry(session_id.to_owned())
+            .or_insert(0);
+        *next = next.saturating_add(1);
+        *next
     }
 
     fn protocol() -> (
@@ -5708,6 +5963,21 @@ mod tests {
         let envelope = decrypt_first(device_session, messages);
         assert_eq!(envelope.kind, MessageType::Packet);
         decode_payload(envelope.payload).unwrap()
+    }
+
+    fn decrypt_packets(
+        device_session: &mut E2eeSession,
+        messages: Vec<JsonEnvelope>,
+    ) -> Vec<ProtocolPacket<Value>> {
+        messages
+            .into_iter()
+            .map(|message| {
+                let frame = encrypted_frame_from_envelope(message).unwrap();
+                let envelope: JsonEnvelope = device_session.decrypt_json_payload(&frame).unwrap();
+                assert_eq!(envelope.kind, MessageType::Packet);
+                decode_payload(envelope.payload).unwrap()
+            })
+            .collect()
     }
 
     fn pair_device(
@@ -6065,21 +6335,51 @@ mod tests {
         assert_eq!(visible_record.state, SessionState::Running);
 
         backend.push_output_for_session(created.session_id, b"hello");
-        let output_packet = decrypt_first_packet(
+        let output_packets = decrypt_packets(
             &mut device_session,
             connection.read_session_output(&mut protocol, created.session_id, 1024),
         );
+        assert_eq!(output_packets.len(), 2);
+        let snapshot_packet = &output_packets[0];
+        assert_eq!(snapshot_packet.kind, PacketKind::StreamChunk);
+        assert_eq!(snapshot_packet.stream_id, Some(stream_id));
+        assert_eq!(snapshot_packet.seq, 1);
+        let snapshot: TerminalFramePayload =
+            decode_payload(snapshot_packet.payload.clone()).unwrap();
+        match snapshot {
+            TerminalFramePayload::Snapshot {
+                session_id,
+                base_seq,
+                data_base64,
+                ..
+            } => {
+                assert_eq!(session_id, created.session_id);
+                assert_eq!(base_seq, 0);
+                assert!(data_base64.is_empty());
+            }
+            other => panic!("expected snapshot terminal frame, got {other:?}"),
+        }
+
+        let output_packet = &output_packets[1];
         assert_eq!(output_packet.kind, PacketKind::StreamChunk);
         assert_eq!(output_packet.stream_id, Some(stream_id));
-        assert_eq!(output_packet.seq, 1);
-        let output: SessionDataPayload = decode_payload(output_packet.payload).unwrap();
-        assert_eq!(output.session_id, created.session_id);
-        assert_eq!(
-            general_purpose::STANDARD
-                .decode(output.data_base64)
-                .unwrap(),
-            b"hello"
-        );
+        assert_eq!(output_packet.seq, 2);
+        let output: TerminalFramePayload = decode_payload(output_packet.payload.clone()).unwrap();
+        match output {
+            TerminalFramePayload::Output {
+                session_id,
+                terminal_seq,
+                data_base64,
+            } => {
+                assert_eq!(session_id, created.session_id);
+                assert_eq!(terminal_seq, 1);
+                assert_eq!(
+                    general_purpose::STANDARD.decode(data_base64).unwrap(),
+                    b"hello"
+                );
+            }
+            other => panic!("expected output terminal frame, got {other:?}"),
+        }
     }
 
     #[test]
@@ -6165,6 +6465,7 @@ mod tests {
                 SessionAttachPayload {
                     session_id: unknown_session_id,
                     watch_updates: true,
+                    last_terminal_seq: None,
                 },
             )
             .unwrap(),
@@ -7095,6 +7396,7 @@ mod tests {
                 SessionAttachPayload {
                     session_id,
                     watch_updates: true,
+                    last_terminal_seq: None,
                 },
             )
             .unwrap();
@@ -7422,6 +7724,7 @@ mod tests {
                 SessionAttachPayload {
                     session_id: created_payload.session_id,
                     watch_updates: true,
+                    last_terminal_seq: None,
                 },
             )
             .unwrap(),
@@ -7782,6 +8085,7 @@ mod tests {
                 SessionAttachPayload {
                     session_id: created_payload.session_id,
                     watch_updates: true,
+                    last_terminal_seq: None,
                 },
             )
             .unwrap(),
@@ -7958,6 +8262,7 @@ mod tests {
                 SessionAttachPayload {
                     session_id: created_payload.session_id,
                     watch_updates: true,
+                    last_terminal_seq: None,
                 },
             )
             .unwrap(),
@@ -8040,6 +8345,7 @@ mod tests {
                 SessionAttachPayload {
                     session_id: created_payload.session_id,
                     watch_updates: true,
+                    last_terminal_seq: None,
                 },
             )
             .unwrap(),
@@ -8139,6 +8445,7 @@ mod tests {
                 SessionAttachPayload {
                     session_id: created_payload.session_id,
                     watch_updates: true,
+                    last_terminal_seq: None,
                 },
             )
             .unwrap(),
@@ -8582,6 +8889,7 @@ mod tests {
                 SessionAttachPayload {
                     session_id: created_payload.session_id,
                     watch_updates: true,
+                    last_terminal_seq: None,
                 },
             )
             .unwrap(),
@@ -8839,6 +9147,7 @@ mod tests {
                 SessionAttachPayload {
                     session_id: created_payload.session_id,
                     watch_updates: true,
+                    last_terminal_seq: None,
                 },
             )
             .unwrap(),
@@ -8931,6 +9240,7 @@ mod tests {
                 SessionAttachPayload {
                     session_id: created_payload.session_id,
                     watch_updates: true,
+                    last_terminal_seq: None,
                 },
             )
             .unwrap(),
@@ -9387,6 +9697,7 @@ mod tests {
             SessionAttachPayload {
                 session_id: created_payload.session_id,
                 watch_updates: true,
+                last_terminal_seq: None,
             },
         )
         .unwrap();
@@ -9688,6 +9999,7 @@ mod tests {
                 SessionAttachPayload {
                     session_id: created_payload.session_id,
                     watch_updates: true,
+                    last_terminal_seq: None,
                 },
             )
             .unwrap(),
@@ -9758,6 +10070,7 @@ mod tests {
                 SessionAttachPayload {
                     session_id: created_payload.session_id,
                     watch_updates: false,
+                    last_terminal_seq: None,
                 },
             )
             .unwrap(),
@@ -9995,6 +10308,7 @@ mod tests {
                 SessionAttachPayload {
                     session_id: created_payload.session_id,
                     watch_updates: true,
+                    last_terminal_seq: None,
                 },
             )
             .unwrap(),
@@ -10076,6 +10390,7 @@ mod tests {
                 SessionAttachPayload {
                     session_id: created_payload.session_id,
                     watch_updates: true,
+                    last_terminal_seq: None,
                 },
             )
             .unwrap(),

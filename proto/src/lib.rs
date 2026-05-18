@@ -43,6 +43,7 @@ pub enum MessageType {
     SessionAttach,
     SessionAttached,
     SessionData,
+    TerminalFrame,
     SessionActivity,
     SessionCursor,
     SessionResize,
@@ -821,6 +822,60 @@ pub struct SessionDataPayload {
     pub data_base64: String,
 }
 
+/// terminal stream 内的输出帧类型。
+///
+/// `ProtocolPacket.seq` 是连接内传输序号；这里的 `terminal_seq` / `base_seq`
+/// 是 session 级终端事件序号，用于 snapshot 和 tail 的一致性判断。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalFrameKind {
+    Snapshot,
+    Output,
+    Resize,
+    Exit,
+}
+
+/// packet terminal stream 的结构化帧。
+///
+/// snapshot 是替换语义，浏览器必须 reset xterm 后写入；output/resize/exit 是
+/// `base_seq` 之后的增量 tail。不要把 snapshot 伪装成普通 `session_data`。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TerminalFramePayload {
+    Snapshot {
+        session_id: SessionId,
+        base_seq: u64,
+        size: TerminalSize,
+        data_base64: String,
+    },
+    Output {
+        session_id: SessionId,
+        terminal_seq: u64,
+        data_base64: String,
+    },
+    Resize {
+        session_id: SessionId,
+        terminal_seq: u64,
+        size: TerminalSize,
+    },
+    Exit {
+        session_id: SessionId,
+        terminal_seq: u64,
+        code: Option<i32>,
+    },
+}
+
+impl TerminalFramePayload {
+    pub fn session_id(&self) -> SessionId {
+        match self {
+            Self::Snapshot { session_id, .. }
+            | Self::Output { session_id, .. }
+            | Self::Resize { session_id, .. }
+            | Self::Exit { session_id, .. } => *session_id,
+        }
+    }
+}
+
 /// session 有新输出的轻量通知。
 ///
 /// 该消息只用于 UI 标记后台 session，不携带终端明文，避免为了列表变色额外推送大块输出。
@@ -836,6 +891,9 @@ pub struct SessionAttachPayload {
     /// 是否订阅终端输出、文件树和 resize 推送；短连接 RPC 只需要权限时可以关闭。
     #[serde(default = "default_true")]
     pub watch_updates: bool,
+    /// 客户端最后完成渲染的 session 级 terminal_seq；daemon/supervisor 用它决定补 tail 还是发 snapshot。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_terminal_seq: Option<u64>,
 }
 
 /// Web 客户端在 shared-control 顶部状态条中展示的光标位置。
@@ -1218,6 +1276,7 @@ mod tests {
             (MessageType::SessionAttach, "session_attach"),
             (MessageType::SessionAttached, "session_attached"),
             (MessageType::SessionData, "session_data"),
+            (MessageType::TerminalFrame, "terminal_frame"),
             (MessageType::SessionActivity, "session_activity"),
             (MessageType::SessionCursor, "session_cursor"),
             (MessageType::SessionResize, "session_resize"),
@@ -1491,6 +1550,7 @@ mod tests {
         assert_roundtrip(SessionAttachPayload {
             session_id,
             watch_updates: true,
+            last_terminal_seq: Some(41),
         });
         assert_roundtrip(SessionAttachedPayload {
             session_id,
@@ -1502,6 +1562,27 @@ mod tests {
         assert_roundtrip(SessionDataPayload {
             session_id,
             data_base64: "aGVsbG8=".to_owned(),
+        });
+        assert_roundtrip(TerminalFramePayload::Snapshot {
+            session_id,
+            base_seq: 1024,
+            size,
+            data_base64: "c25hcHNob3Q=".to_owned(),
+        });
+        assert_roundtrip(TerminalFramePayload::Output {
+            session_id,
+            terminal_seq: 1025,
+            data_base64: "b3V0cHV0".to_owned(),
+        });
+        assert_roundtrip(TerminalFramePayload::Resize {
+            session_id,
+            terminal_seq: 1026,
+            size,
+        });
+        assert_roundtrip(TerminalFramePayload::Exit {
+            session_id,
+            terminal_seq: 1027,
+            code: Some(0),
         });
         assert_roundtrip(SessionActivityPayload {
             session_id,
@@ -1770,6 +1851,7 @@ mod tests {
             SessionAttachPayload {
                 session_id: SessionId::new(),
                 watch_updates: true,
+                last_terminal_seq: None,
             },
         );
 

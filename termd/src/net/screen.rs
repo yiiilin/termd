@@ -363,6 +363,11 @@ impl TerminalScreen {
             )
             .as_bytes(),
         );
+        // 中文注释：snapshot 写完内容后必须恢复当前 SGR 状态；否则后续 tail 如果依赖
+        // 终端里仍处于红色/背景色等状态，重新 attach 的 xterm 会按默认样式继续渲染。
+        if !self.current_style.is_default() {
+            output.extend_from_slice(&self.current_style.sgr_bytes(false));
+        }
         output
     }
 
@@ -1054,6 +1059,20 @@ mod tests {
         let snapshot = String::from_utf8(screen.snapshot_bytes()).unwrap();
         assert!(snapshot.contains("\x1b[31mred\x1b[0m"));
         assert!(snapshot.contains("normal"));
+    }
+
+    #[test]
+    fn snapshot_restores_current_sgr_style_for_following_tail() {
+        let mut screen = TerminalScreen::with_max_cached_lines(2, 20, 5);
+
+        // 真实 PTY 后续输出可能不重复发送 SGR；重新 attach 的 snapshot 必须把当前样式恢复回来。
+        screen.apply(b"\x1b[31mred-still-open");
+
+        let snapshot = String::from_utf8(screen.snapshot_bytes()).unwrap();
+        assert!(
+            snapshot.ends_with("\x1b[1;15H\x1b[31m"),
+            "snapshot should restore cursor and active SGR style for tail output: {snapshot:?}"
+        );
     }
 
     #[test]

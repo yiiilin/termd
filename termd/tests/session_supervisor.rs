@@ -18,6 +18,7 @@ use termd::net::{E2eeKeyPair, E2eeSession, E2eeSessionContext, E2eeSessionRole};
 use termd::pty::supervisor::SupervisorPtyBackend;
 use termd::pty::{
     CommandSpec, PtyBackend, PtyRestoreInfo, PtySession, PtySize, PtySupervisorStatus,
+    PtyTerminalFrame,
 };
 use termd::runtime::SessionRuntime;
 use termd::session::TerminalSize;
@@ -326,6 +327,85 @@ fn runtime_reconnects_to_live_supervisor_and_replays_snapshot_output() {
     );
 
     restarted.close(session_id).unwrap();
+}
+
+#[test]
+fn supervisor_terminal_snapshot_survives_last_client_detach() {
+    let state_path = temp_state_path("runtime-detach-snapshot.json");
+    let binary_path = PathBuf::from(env!("CARGO_BIN_EXE_termd"));
+    let session_id = "00000000-0000-0000-0000-000000000113";
+
+    let mut runtime = SessionRuntime::new(SupervisorPtyBackend::with_binary_and_state_path(
+        &binary_path,
+        &state_path,
+    ));
+    runtime
+        .create_session_with_id(
+            session_id,
+            CommandSpec::new("sh").args(["-lc", "printf booted && cat"]),
+            TerminalSize::cells(24, 80),
+        )
+        .unwrap();
+    runtime.attach(session_id, "dev-a").unwrap();
+    read_until_contains(&mut runtime, session_id, b"booted");
+    runtime.detach(session_id, "dev-a").unwrap();
+
+    runtime.attach(session_id, "dev-b").unwrap();
+    let frames = runtime.terminal_snapshot(session_id, None).unwrap();
+    assert!(
+        frames.iter().any(|frame| matches!(frame, PtyTerminalFrame::Snapshot { data, .. } if data.windows(b"booted".len()).any(|window| window == b"booted"))),
+        "snapshot after detach should still come from live supervisor"
+    );
+
+    runtime.close(session_id).unwrap();
+}
+
+#[test]
+fn supervisor_terminal_snapshot_preserves_active_sgr_style_after_reattach() {
+    let state_path = temp_state_path("runtime-style-snapshot.json");
+    let binary_path = PathBuf::from(env!("CARGO_BIN_EXE_termd"));
+    let session_id = "00000000-0000-0000-0000-000000000114";
+
+    let mut runtime = SessionRuntime::new(SupervisorPtyBackend::with_binary_and_state_path(
+        &binary_path,
+        &state_path,
+    ));
+    runtime
+        .create_session_with_id(
+            session_id,
+            CommandSpec::new("sh").args(["-lc", "printf '\\033[31mred-still-open'; cat"]),
+            TerminalSize::cells(24, 80),
+        )
+        .unwrap();
+    runtime.attach(session_id, "dev-a").unwrap();
+    read_until_contains(&mut runtime, session_id, b"red-still-open");
+    runtime.detach(session_id, "dev-a").unwrap();
+
+    runtime.attach(session_id, "dev-b").unwrap();
+    let frames = runtime.terminal_snapshot(session_id, None).unwrap();
+    let snapshot = frames
+        .iter()
+        .find_map(|frame| {
+            if let PtyTerminalFrame::Snapshot { data, .. } = frame {
+                Some(String::from_utf8_lossy(data).into_owned())
+            } else {
+                None
+            }
+        })
+        .expect("terminal snapshot should be returned after reattach");
+
+    // 中文注释：样式未 reset 的命令会依赖终端当前 SGR 状态；snapshot 末尾要恢复该状态，
+    // 后续 tail 才会继续按红色渲染，而不是回到默认颜色。
+    assert!(
+        snapshot.contains("\x1b[31mred-still-open\x1b[0m"),
+        "snapshot should preserve styled cells: {snapshot:?}"
+    );
+    assert!(
+        snapshot.ends_with("\x1b[1;15H\x1b[31m"),
+        "snapshot should restore cursor and active SGR style for subsequent tail: {snapshot:?}"
+    );
+
+    runtime.close(session_id).unwrap();
 }
 
 #[test]

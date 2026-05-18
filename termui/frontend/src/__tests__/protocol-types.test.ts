@@ -17,6 +17,7 @@ import {
   type SessionFileDownloadChunkPayload,
   type SessionFileDownloadChunkResultPayload,
   type SessionState,
+  type TerminalFramePayload,
 } from "../protocol/types";
 import { parsePairingQrPayload } from "../protocol/pairing-payload";
 import { envelope } from "../protocol/wire";
@@ -36,6 +37,7 @@ describe("协议类型", () => {
       "session_attach",
       "session_attached",
       "session_data",
+      "terminal_frame",
       "session_activity",
       "session_cursor",
       "session_resize",
@@ -194,6 +196,44 @@ describe("协议类型", () => {
       kind: "error",
       id: requestId,
       payload: { retryable: true },
+    });
+  });
+
+  it("terminal frame 区分 snapshot 和 session 级 tail 序号", () => {
+    const sessionId = "00000000-0000-0000-0000-000000000001";
+    const size = { rows: 32, cols: 120, pixel_width: 0, pixel_height: 0 };
+    const snapshot: TerminalFramePayload = {
+      kind: "snapshot",
+      session_id: sessionId,
+      base_seq: 1024,
+      size,
+      data_base64: "c25hcHNob3Q=",
+    };
+    const output: TerminalFramePayload = {
+      kind: "output",
+      session_id: sessionId,
+      terminal_seq: 1025,
+      data_base64: "b3V0cHV0",
+    };
+    const resize: TerminalFramePayload = {
+      kind: "resize",
+      session_id: sessionId,
+      terminal_seq: 1026,
+      size,
+    };
+
+    expect(envelope("terminal_frame", snapshot)).toEqual({
+      type: "terminal_frame",
+      payload: snapshot,
+    });
+    expect(JSON.parse(JSON.stringify(output))).toMatchObject({
+      kind: "output",
+      terminal_seq: 1025,
+    });
+    expect(JSON.parse(JSON.stringify(resize))).toMatchObject({
+      kind: "resize",
+      terminal_seq: 1026,
+      size,
     });
   });
 

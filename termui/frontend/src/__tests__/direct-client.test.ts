@@ -196,7 +196,7 @@ describe("DirectClient", () => {
     expect(errorPacket?.id).toBe(closePacket?.id);
   });
 
-  it("terminal attach 使用 stream packet，输出和输入带 seq，并发送 flow 与 cancel", async () => {
+  it("terminal attach 使用 stream packet，输出和输入带 seq，渲染完成后发送 flow 与 cancel", async () => {
     const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000311");
     const pairClient = await connectDevice(device.device_id);
     const accepted = await pairClient.pair("secret-token", device.device_public_key);
@@ -213,6 +213,7 @@ describe("DirectClient", () => {
     const list = await client.listSessions();
     const attached = await client.attachSession(list.sessions[0].session_id);
     const output = await client.receiveInner();
+    client.ackTerminalRender(attached.session_id, 1, 1);
     await client.sendSessionData(attached.session_id, new TextEncoder().encode("stream-input"));
     client.close();
     await new Promise((resolve) => setTimeout(resolve, 20));

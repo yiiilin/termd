@@ -233,6 +233,52 @@ pub struct PtySnapshot {
     pub retained_output: Vec<u8>,
 }
 
+/// supervisor 暴露给 daemon 的 session 级终端帧。
+///
+/// 中文注释：`terminal_seq` 是 session 级终端事件序号，用于 snapshot 后补 tail；
+/// 它和 `ProtocolPacket.seq` 的连接内传输序号不是同一个东西，不能混用。
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PtyTerminalFrame {
+    Snapshot {
+        base_seq: u64,
+        size: PtySize,
+        #[serde(with = "base64_bytes")]
+        data: Vec<u8>,
+    },
+    Output {
+        terminal_seq: u64,
+        #[serde(with = "base64_bytes")]
+        data: Vec<u8>,
+    },
+    Resize {
+        terminal_seq: u64,
+        size: PtySize,
+    },
+    Exit {
+        terminal_seq: u64,
+        code: Option<i32>,
+    },
+}
+
+impl PtyTerminalFrame {
+    pub fn terminal_seq(&self) -> Option<u64> {
+        match self {
+            Self::Snapshot { .. } => None,
+            Self::Output { terminal_seq, .. }
+            | Self::Resize { terminal_seq, .. }
+            | Self::Exit { terminal_seq, .. } => Some(*terminal_seq),
+        }
+    }
+
+    pub fn bytes_for_legacy_read(&self) -> Option<&[u8]> {
+        match self {
+            Self::Snapshot { data, .. } | Self::Output { data, .. } => Some(data),
+            Self::Resize { .. } | Self::Exit { .. } => None,
+        }
+    }
+}
+
 /// 子进程退出状态的后端无关表示。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PtyExitStatus {
@@ -321,6 +367,39 @@ pub trait PtySession: Send {
     /// 本地 backend 默认只返回当前尺寸和 pid，不提供 retained output。
     fn snapshot(&mut self) -> PtyResult<PtySnapshot>;
 
+    /// 获取结构化 terminal snapshot/tail。
+    ///
+    /// 中文注释：普通 backend 没有 session 级 terminal_seq，只能退化为一个 base_seq=0
+    /// 的 snapshot；supervisor backend 会覆盖为权威 1000 行热历史和 journal tail。
+    fn terminal_snapshot(
+        &mut self,
+        _last_terminal_seq: Option<u64>,
+    ) -> PtyResult<Vec<PtyTerminalFrame>> {
+        let snapshot = self.snapshot()?;
+        Ok(vec![PtyTerminalFrame::Snapshot {
+            base_seq: 0,
+            size: snapshot.size,
+            data: snapshot.retained_output,
+        }])
+    }
+
+    /// 读取一个结构化 terminal live frame。
+    ///
+    /// 中文注释：默认实现只能把裸 PTY 输出包装成 terminal_seq=0 的兼容输出帧；
+    /// production supervisor backend 会返回真实 session 级 terminal_seq。
+    fn read_terminal_frame(&mut self) -> PtyResult<Option<PtyTerminalFrame>> {
+        let mut buffer = vec![0_u8; 16 * 1024];
+        let read = self.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(None);
+        }
+        buffer.truncate(read);
+        Ok(Some(PtyTerminalFrame::Output {
+            terminal_seq: 0,
+            data: buffer,
+        }))
+    }
+
     /// 心跳探测，供 daemon 重连或后台健康检查使用。
     fn ping(&mut self) -> PtyResult<()> {
         Ok(())
@@ -349,6 +428,28 @@ pub trait PtySession: Send {
     /// 上层会回退到已保存的文件面板路径。
     fn current_working_directory(&self) -> Option<PathBuf> {
         None
+    }
+}
+
+mod base64_bytes {
+    use base64::{Engine as _, engine::general_purpose};
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&general_purpose::STANDARD.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        general_purpose::STANDARD
+            .decode(value)
+            .map_err(serde::de::Error::custom)
     }
 }
 

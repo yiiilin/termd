@@ -40,6 +40,7 @@ import type {
   SessionResizedPayload,
   SessionSearchResultPayload,
   SessionSummaryPayload,
+  RenderableTerminalFramePayload,
   TerminalSize,
   UUID,
 } from "./protocol/types";
@@ -64,7 +65,7 @@ import { SessionList } from "./components/SessionList";
 import { SessionFilesPanel } from "./components/SessionFilesPanel";
 import { FileEditorDialog } from "./components/FileEditorDialog";
 import { StatusBar } from "./components/StatusBar";
-import { TerminalPane } from "./components/TerminalPane";
+import { TerminalPane, type TerminalOutputItem } from "./components/TerminalPane";
 import { PairingQrScanner } from "./components/PairingQrScanner";
 import { SettingsDialog } from "./components/SettingsDialog";
 import { sessionDisplayName } from "./session-names";
@@ -106,6 +107,7 @@ const RETRYABLE_CONNECTION_ERROR_CODES = new Set([
   "relay_state_unavailable",
   "handshake_timeout",
   "response_timeout",
+  "terminal_resync",
 ]);
 
 function isRetryableConnectionError(caught: unknown): boolean {
@@ -202,6 +204,9 @@ export default function App() {
   const forgettingClientIdsRef = useRef<Set<UUID>>(new Set());
   const renamingSessionIdRef = useRef<UUID | undefined>(undefined);
   const filesPanelWidthRef = useRef(DEFAULT_FILES_PANEL_WIDTH);
+  const sessionFilesFollowTerminalCwdRef = useRef(sessionFilesFollowTerminalCwd);
+  const sessionFilesRequestSeqRef = useRef(0);
+  const sessionFilesFollowRefreshInFlightRef = useRef(false);
   const filesPanelResizeRef = useRef<{
     pointerId: number;
     startX: number;
@@ -212,7 +217,8 @@ export default function App() {
   const lastCursorReportRef = useRef("");
   const lastCursorFocusedRef = useRef<boolean | undefined>(undefined);
   const cursorRefreshTimerRef = useRef<number | undefined>(undefined);
-  const terminalOutputQueueRef = useRef<Uint8Array[]>([]);
+  const terminalOutputQueueRef = useRef<TerminalOutputItem[]>([]);
+  const terminalRenderAckRef = useRef<{ sessionId: UUID; lastTransportSeq: number; credit: number } | undefined>(undefined);
   const terminalOutputResetVersionRef = useRef(0);
   const terminalOutputAppliedResetVersionRef = useRef(0);
   const terminalOutputResetWaitersRef = useRef<Map<number, () => void>>(new Map());
@@ -237,6 +243,10 @@ export default function App() {
   const effectiveTheme = resolveTheme(preferences.theme, systemTheme);
   const effectiveLocale = resolveLocale(preferences.language);
   const t = useMemo(() => createTranslator(effectiveLocale), [effectiveLocale]);
+
+  useEffect(() => {
+    sessionFilesFollowTerminalCwdRef.current = sessionFilesFollowTerminalCwd;
+  }, [sessionFilesFollowTerminalCwd]);
 
   useEffect(() => {
     void loadBrowserState().then((loaded) => {
@@ -454,6 +464,8 @@ export default function App() {
   }, []);
 
   const clearSessionFiles = useCallback(() => {
+    sessionFilesRequestSeqRef.current += 1;
+    sessionFilesFollowRefreshInFlightRef.current = false;
     setSessionFiles(undefined);
     setSessionFilesError(undefined);
     setSessionFilesLoading(false);
@@ -471,6 +483,7 @@ export default function App() {
   const clearTerminalOutput = useCallback(() => {
     // 终端输出由 xterm 自己维护 scrollback；React 只保留尚未写入 xterm 的短队列。
     terminalOutputQueueRef.current = [];
+    terminalRenderAckRef.current = undefined;
     terminalOutputResetVersionRef.current += 1;
     if (terminalOutputFlushFrameRef.current !== undefined) {
       window.cancelAnimationFrame(terminalOutputFlushFrameRef.current);
@@ -552,8 +565,42 @@ export default function App() {
     });
   }, [flushTerminalOutput]);
 
-  const enqueueTerminalOutput = useCallback((chunk: Uint8Array) => {
-    terminalOutputQueueRef.current.push(chunk);
+  const flushRenderedTerminalAck = useCallback(() => {
+    const pending = terminalRenderAckRef.current;
+    const client = attachClientRef.current;
+    if (!pending || !client) {
+      return;
+    }
+    terminalRenderAckRef.current = undefined;
+    client.ackTerminalRender(pending.sessionId, pending.lastTransportSeq, pending.credit);
+  }, []);
+
+  const markTerminalFrameRendered = useCallback((sessionId: UUID, transportSeq: number) => {
+    const pending = terminalRenderAckRef.current;
+    if (!pending || pending.sessionId !== sessionId) {
+      if (pending && attachClientRef.current) {
+        attachClientRef.current.ackTerminalRender(pending.sessionId, pending.lastTransportSeq, pending.credit);
+      }
+      terminalRenderAckRef.current = { sessionId, lastTransportSeq: transportSeq, credit: 1 };
+    } else {
+      pending.lastTransportSeq = Math.max(pending.lastTransportSeq, transportSeq);
+      pending.credit += 1;
+    }
+    if ((terminalRenderAckRef.current?.credit ?? 0) >= 8) {
+      flushRenderedTerminalAck();
+    }
+  }, [flushRenderedTerminalAck]);
+
+  const enqueueTerminalOutput = useCallback((item: TerminalOutputItem) => {
+    const queue = terminalOutputQueueRef.current;
+    const previous = queue.at(-1);
+    if (item.kind === "data" && previous?.kind === "data") {
+      // legacy `session_data` 没有 terminal_seq/transport_seq 边界，可以安全合并成
+      // 一个 xterm write；新的 terminal_frame 仍逐帧保留，用于渲染完成后精确补 credit。
+      previous.bytes = concatByteChunks([previous.bytes, item.bytes]);
+    } else {
+      queue.push(item);
+    }
     scheduleTerminalOutputFlush();
   }, [scheduleTerminalOutputFlush]);
 
@@ -937,50 +984,59 @@ export default function App() {
   );
 
   const loadSessionFiles = useCallback(
-    async (sessionId: UUID, path?: string, options: { silent?: boolean } = {}) => {
+    async (
+      sessionId: UUID,
+      path?: string,
+      options: { silent?: boolean; source?: "initial" | "manual" | "follow" } = {},
+    ) => {
       const silent = Boolean(options.silent);
+      const source = options.source ?? (path === undefined ? "initial" : "manual");
+      const requestSeq = sessionFilesRequestSeqRef.current + 1;
+      sessionFilesRequestSeqRef.current = requestSeq;
       if (!silent) {
         setSessionFilesLoading(true);
         setSessionFilesError(undefined);
       }
       const attachedClient = attachClientRef.current;
-      if (attachedSessionRef.current === sessionId && attachedClient) {
-        try {
-          // 当前 xterm 主连接已经 attach，文件列表请求只需要发送；返回的
-          // session_files_result 仍由 receive loop 统一接收，避免并发读同一个 socket。
-          await attachedClient.requestSessionFiles(sessionId, path);
-          return;
-        } catch (caught) {
-          if (!silent) {
-            setSessionFiles(undefined);
-            setSessionFilesError(toSafeError(caught));
-            setSessionFilesLoading(false);
-          }
+      let client: DirectClient | undefined;
+      let request: Promise<SessionFilesResultPayload>;
+      try {
+        if (attachedSessionRef.current === sessionId && attachedClient) {
+          // 直接请求可以拿到一次性的响应，避免把文件树状态和后台推送混在同一条回写链路里。
+          request = attachedClient.listSessionFiles(sessionId, path);
+        } else {
+          client = await authenticatedSessionClient(sessionId);
+          // 文件树当前位置是 daemon 端 session 共享状态；不传 path 时由 daemon 返回当前共享目录。
+          request = client.listSessionFiles(sessionId, path);
+        }
+        const files = await request;
+        const isCurrentRequest = requestSeq === sessionFilesRequestSeqRef.current;
+        const allowsFollowResult = source !== "follow" || sessionFilesFollowTerminalCwdRef.current;
+        if (!isCurrentRequest || !allowsFollowResult) {
           return;
         }
-      }
-      let client: DirectClient | undefined;
-      try {
-        client = await authenticatedSessionClient(sessionId);
-        // 文件树当前位置是 daemon 端 session 共享状态；不传 path 时由 daemon 返回当前共享目录。
-        const files = await client.listSessionFiles(sessionId, path);
         setSessionFiles(files);
         setSessionFilesError(undefined);
       } catch (caught) {
-        if (!silent) {
+        if (!silent && requestSeq === sessionFilesRequestSeqRef.current) {
           // 文件列表是终端旁路信息；失败时只收敛到右侧 panel，不打断已 attach 的终端会话。
           setSessionFiles(undefined);
           setSessionFilesError(toSafeError(caught));
         }
       } finally {
         client?.close();
-        if (!silent) {
+        if (!silent && requestSeq === sessionFilesRequestSeqRef.current) {
           setSessionFilesLoading(false);
         }
       }
     },
     [authenticatedSessionClient],
   );
+
+  const handleSessionFilesFollowTerminalCwdChange = useCallback((follow: boolean) => {
+    sessionFilesFollowTerminalCwdRef.current = follow;
+    setSessionFilesFollowTerminalCwd(follow);
+  }, []);
 
   const loadSessionGit = useCallback(
     async (sessionId: UUID, options: { silent?: boolean } = {}) => {
@@ -1236,14 +1292,40 @@ export default function App() {
               markNewOutputIfBackground(payload.session_id);
               continue;
             }
-            enqueueTerminalOutput(sessionDataFromBase64(payload.data_base64));
+            enqueueTerminalOutput({ kind: "data", bytes: sessionDataFromBase64(payload.data_base64) });
+          } else if (inner.type === "terminal_frame") {
+            const payload = inner.payload as RenderableTerminalFramePayload;
+            if (payload.session_id !== attachedSessionRef.current) {
+              markNewOutputIfBackground(payload.session_id);
+              continue;
+            }
+            const onRendered = () => markTerminalFrameRendered(payload.session_id, payload.transport_seq);
+            if (payload.kind === "snapshot") {
+              enqueueTerminalOutput({
+                kind: "snapshot",
+                bytes: sessionDataFromBase64(payload.data_base64),
+                baseSeq: payload.base_seq,
+                onRendered,
+              });
+            } else if (payload.kind === "output") {
+              enqueueTerminalOutput({
+                kind: "output",
+                bytes: sessionDataFromBase64(payload.data_base64),
+                terminalSeq: payload.terminal_seq,
+                onRendered,
+              });
+            } else if (payload.kind === "resize") {
+              enqueueTerminalOutput({ kind: "resize", terminalSeq: payload.terminal_seq, onRendered });
+            } else if (payload.kind === "exit") {
+              enqueueTerminalOutput({ kind: "exit", terminalSeq: payload.terminal_seq, onRendered });
+            }
           } else if (inner.type === "session_activity") {
             const payload = inner.payload as SessionActivityPayload;
             markNewOutputIfBackground(payload.session_id);
           } else if (inner.type === "session_files_result") {
             const payload = inner.payload as SessionFilesResultPayload;
-            // daemon 主动推送的文件树状态和当前 attach 的 session 对齐后才更新右侧 panel。
-            if (payload.session_id === attachedSessionRef.current) {
+            // 非跟随模式下只接受当前请求的直接回写，不再让 daemon 的后台推送覆盖手动浏览目录。
+            if (payload.session_id === attachedSessionRef.current && sessionFilesFollowTerminalCwdRef.current) {
               setSessionFiles(payload);
               setSessionFilesError(undefined);
               setSessionFilesLoading(false);
@@ -1286,7 +1368,7 @@ export default function App() {
       }
     };
     void read();
-  }, [enqueueTerminalOutput, markNewOutputIfBackground, setSafeError, updateTerminalResizeOwner]);
+  }, [enqueueTerminalOutput, markNewOutputIfBackground, markTerminalFrameRendered, setSafeError, updateTerminalResizeOwner]);
 
   const scheduleAttachReconnect = useCallback((staleClient: DirectClient, caught: unknown) => {
     const sessionId = attachedSessionRef.current ?? attachedSessionId ?? selectedSessionId;
@@ -1357,7 +1439,7 @@ export default function App() {
           }
           startReceiveLoop(attachedClient);
           updateTerminalResizeOwner(Boolean(attached.resize_owner));
-          void loadSessionFiles(sessionId, undefined, { silent: true });
+          void loadSessionFiles(sessionId, undefined, { silent: true, source: "initial" });
           void loadSessionGit(sessionId, { silent: true });
           void refreshDaemonClients();
         } catch (retryError) {
@@ -1391,6 +1473,14 @@ export default function App() {
   ]);
 
   attachReconnectHandlerRef.current = scheduleAttachReconnect;
+
+  const handleTerminalResync = useCallback(() => {
+    const client = attachClientRef.current;
+    if (!client) {
+      return;
+    }
+    scheduleAttachReconnect(client, new ProtocolClientError("terminal_resync", "terminal stream out of sync"));
+  }, [scheduleAttachReconnect]);
 
   const handleAttach = useCallback(
     async (sessionId: UUID) => {
@@ -1453,7 +1543,7 @@ export default function App() {
         }
         startReceiveLoop(attachedClient);
         updateTerminalResizeOwner(Boolean(attached.resize_owner));
-        void loadSessionFiles(sessionId);
+        void loadSessionFiles(sessionId, undefined, { source: "initial" });
         void loadSessionGit(sessionId);
         void refreshDaemonClients();
       } catch (caught) {
@@ -1555,7 +1645,7 @@ export default function App() {
       setTerminalFocusRequest((request) => request + 1);
       setStatus("attached");
       startReceiveLoop(client);
-      void loadSessionFiles(created.session_id);
+      void loadSessionFiles(created.session_id, undefined, { source: "initial" });
       void refreshDaemonClients();
     } catch (caught) {
       setSafeError(caught);
@@ -1910,11 +2000,14 @@ export default function App() {
 
     const refreshFromTerminalCwd = () => {
       const sessionId = attachedSessionRef.current;
-      if (!sessionId) {
+      if (!sessionId || sessionFilesFollowRefreshInFlightRef.current) {
         return;
       }
+      sessionFilesFollowRefreshInFlightRef.current = true;
       // 跟随模式必须不传 path；daemon 会按当前 PTY cwd 返回文件树位置。
-      void loadSessionFiles(sessionId, undefined, { silent: true });
+      void loadSessionFiles(sessionId, undefined, { silent: true, source: "follow" }).finally(() => {
+        sessionFilesFollowRefreshInFlightRef.current = false;
+      });
     };
 
     const timer = window.setInterval(refreshFromTerminalCwd, FILES_CWD_FOLLOW_POLL_INTERVAL_MS);
@@ -1927,9 +2020,11 @@ export default function App() {
       if (!sessionId) {
         return;
       }
-      void loadSessionFiles(sessionId, path);
+      // 用户开始手动浏览目录时，立即退出自动跟随，避免下一次轮询把目录打回终端 cwd。
+      handleSessionFilesFollowTerminalCwdChange(false);
+      void loadSessionFiles(sessionId, path, { source: "manual" });
     },
-    [loadSessionFiles],
+    [handleSessionFilesFollowTerminalCwdChange, loadSessionFiles],
   );
 
   const handleGoToFilePath = useCallback(
@@ -1938,9 +2033,11 @@ export default function App() {
       if (!sessionId) {
         return;
       }
-      void loadSessionFiles(sessionId, resolveRemoteDirectoryPath(sessionFiles?.path ?? "", path));
+      // 手动输入目录路径时同样切到浏览模式，避免和“跟随终端 cwd”互相覆盖。
+      handleSessionFilesFollowTerminalCwdChange(false);
+      void loadSessionFiles(sessionId, resolveRemoteDirectoryPath(sessionFiles?.path ?? "", path), { source: "manual" });
     },
-    [loadSessionFiles, sessionFiles?.path],
+    [handleSessionFilesFollowTerminalCwdChange, loadSessionFiles, sessionFiles?.path],
   );
 
   const handleRefreshSessionFiles = useCallback(() => {
@@ -1948,7 +2045,7 @@ export default function App() {
     if (!sessionId) {
       return;
     }
-    void loadSessionFiles(sessionId, sessionFilesFollowTerminalCwd ? undefined : sessionFiles?.path);
+    void loadSessionFiles(sessionId, sessionFilesFollowTerminalCwd ? undefined : sessionFiles?.path, { source: "manual" });
   }, [loadSessionFiles, sessionFiles?.path, sessionFilesFollowTerminalCwd]);
 
   const handleRefreshSessionGit = useCallback(() => {
@@ -2075,7 +2172,7 @@ export default function App() {
         await client.writeSessionFile(sessionId, joinRemotePath(sessionFiles?.path ?? "", file.name), await fileToBytes(file));
         client.close();
         client = undefined;
-        await loadSessionFiles(sessionId, sessionFiles?.path);
+        await loadSessionFiles(sessionId, sessionFiles?.path, { source: "manual" });
       } catch (caught) {
         setSessionFilesError(toSafeError(caught));
       } finally {
@@ -2174,7 +2271,7 @@ export default function App() {
           loading: false,
           saving: false,
         });
-        await loadSessionFiles(sessionId, sessionFiles?.path);
+        await loadSessionFiles(sessionId, sessionFiles?.path, { source: "manual" });
       } catch (caught) {
         setFileEditor({ ...editor, text, loading: false, saving: false, error: translateSafeErrorMessage(toSafeError(caught), t) });
       } finally {
@@ -2218,7 +2315,7 @@ export default function App() {
         await client.deleteSessionFile(sessionId, entry.path);
         client.close();
         client = undefined;
-        await loadSessionFiles(sessionId, sessionFiles?.path);
+        await loadSessionFiles(sessionId, sessionFiles?.path, { source: "manual" });
       } catch (caught) {
         setSessionFilesError(toSafeError(caught));
       } finally {
@@ -2658,6 +2755,7 @@ export default function App() {
                 takeOutput={takeTerminalOutput}
                 registerOutputDrain={registerTerminalOutputDrain}
                 onOutputResetApplied={handleTerminalOutputResetApplied}
+                onTerminalResync={handleTerminalResync}
                 mobileShortcuts={preferences.mobileShortcuts}
                 onSearch={handleTerminalSearch}
                 onInput={handleTerminalInput}
@@ -2685,7 +2783,7 @@ export default function App() {
                     onGoToPath={handleGoToFilePath}
                     onRefresh={handleRefreshSessionFiles}
                     onRefreshGit={handleRefreshSessionGit}
-                    onFollowTerminalCwdChange={setSessionFilesFollowTerminalCwd}
+                    onFollowTerminalCwdChange={handleSessionFilesFollowTerminalCwdChange}
                     onUpload={handleUploadFile}
                     onDownload={handleDownloadFile}
                     onDelete={handleDeleteFile}
@@ -2794,7 +2892,7 @@ export default function App() {
               onGoToPath={handleGoToFilePath}
               onRefresh={handleRefreshSessionFiles}
               onRefreshGit={handleRefreshSessionGit}
-              onFollowTerminalCwdChange={setSessionFilesFollowTerminalCwd}
+              onFollowTerminalCwdChange={handleSessionFilesFollowTerminalCwdChange}
               onUpload={handleUploadFile}
               onDownload={handleDownloadFile}
               onDelete={handleDeleteFile}

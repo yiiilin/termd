@@ -27,7 +27,7 @@ use crate::net::screen::TerminalScreen;
 
 use super::{
     CommandSpec, PtyBackend, PtyError, PtyRestoreInfo, PtyResult, PtySession, PtySize, PtySnapshot,
-    PtySupervisorStatus,
+    PtySupervisorStatus, PtyTerminalFrame,
 };
 
 const SOCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -35,6 +35,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const SUPERVISOR_SOCKET_REPAIR_INTERVAL: Duration = Duration::from_secs(1);
 const OUTPUT_SIGNAL_INIT: u64 = 0;
 const RETAINED_OUTPUT_MAX_BYTES: usize = 1024 * 1024;
+const TERMINAL_JOURNAL_MAX_EVENTS: usize = 8192;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SupervisorProcess {
@@ -236,12 +237,14 @@ impl PtyBackend for SupervisorPtyBackend {
 
 /// daemon 侧持有的 supervisor IPC 客户端。
 struct SupervisorPtySession {
+    session_id: String,
     restore_info: PtyRestoreInfo,
     supervisor_child: StdMutex<Option<Child>>,
     writer: StdMutex<StdUnixStream>,
     pending_requests:
         Arc<StdMutex<HashMap<u64, mpsc::Sender<PtyResult<SupervisorResponsePayload>>>>>,
     pending_output: Arc<StdMutex<VecDeque<Vec<u8>>>>,
+    pending_terminal_frames: Arc<StdMutex<VecDeque<PtyTerminalFrame>>>,
     output_signal_tx: watch::Sender<u64>,
     output_signal_rx: watch::Receiver<u64>,
     next_request_id: AtomicU64,
@@ -256,44 +259,23 @@ impl SupervisorPtySession {
         supervisor_pid: u32,
         child: Option<Child>,
     ) -> PtyResult<Self> {
-        let deadline = Instant::now() + SOCKET_CONNECT_TIMEOUT;
-        let stream = loop {
-            match StdUnixStream::connect(&socket_path) {
-                Ok(stream) => break stream,
-                Err(error) if Instant::now() < deadline => {
-                    if error.kind() != io::ErrorKind::NotFound
-                        && error.kind() != io::ErrorKind::ConnectionRefused
-                    {
-                        return Err(PtyError::Io(error));
-                    }
-                    thread::sleep(Duration::from_millis(50));
-                }
-                Err(error) => return Err(PtyError::Io(error)),
-            }
-        };
-        stream.set_nonblocking(false).map_err(PtyError::from)?;
-        let reader = stream.try_clone().map_err(PtyError::from)?;
+        let stream = connect_supervisor_socket(&socket_path)?;
         let writer = stream.try_clone().map_err(PtyError::from)?;
         let pending_requests = Arc::new(StdMutex::new(HashMap::new()));
         let pending_output = Arc::new(StdMutex::new(VecDeque::new()));
+        let pending_terminal_frames = Arc::new(StdMutex::new(VecDeque::new()));
         let (output_signal_tx, output_signal_rx) = watch::channel(OUTPUT_SIGNAL_INIT);
-        let pending_requests_for_thread = Arc::clone(&pending_requests);
-        let pending_output_for_thread = Arc::clone(&pending_output);
-        let output_signal_tx_for_thread = output_signal_tx.clone();
-
-        thread::Builder::new()
-            .name(format!("termd-supervisor-ipc-{session_id}"))
-            .spawn(move || {
-                supervisor_reader_loop(
-                    reader,
-                    pending_requests_for_thread,
-                    pending_output_for_thread,
-                    output_signal_tx_for_thread,
-                );
-            })
-            .map_err(PtyError::backend)?;
+        spawn_supervisor_reader_thread(
+            session_id,
+            stream,
+            Arc::clone(&pending_requests),
+            Arc::clone(&pending_output),
+            Arc::clone(&pending_terminal_frames),
+            output_signal_tx.clone(),
+        )?;
 
         let session = Self {
+            session_id: session_id.to_owned(),
             restore_info: PtyRestoreInfo::UnixSocket {
                 socket_path,
                 supervisor_pid,
@@ -303,6 +285,7 @@ impl SupervisorPtySession {
             writer: StdMutex::new(writer),
             pending_requests,
             pending_output,
+            pending_terminal_frames,
             output_signal_tx,
             output_signal_rx,
             next_request_id: AtomicU64::new(1),
@@ -320,6 +303,29 @@ impl SupervisorPtySession {
     }
 
     fn request(&self, request: SupervisorRequest) -> PtyResult<SupervisorResponsePayload> {
+        let mut last_error = None;
+        for attempt in 0..3 {
+            match self.request_once(request.clone()) {
+                Ok(payload) => return Ok(payload),
+                Err(error) => {
+                    last_error = Some(error);
+                    if attempt < 2 {
+                        // supervisor 进程仍存活但 Unix IPC 连接可能因为 daemon 侧读写竞态、
+                        // 旧连接 EOF 或热升级残留而断开；运行中请求失败时重连同一个 socket
+                        // 再做有限重试，避免把活 session 误报为 runtime_failed。
+                        if self.reconnect_ipc().is_ok() {
+                            continue;
+                        }
+                    }
+                }
+            }
+            break;
+        }
+        Err(last_error
+            .unwrap_or_else(|| PtyError::Backend("session supervisor request failed".to_owned())))
+    }
+
+    fn request_once(&self, request: SupervisorRequest) -> PtyResult<SupervisorResponsePayload> {
         let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         let envelope = SupervisorRequestEnvelope {
             request_id,
@@ -363,6 +369,44 @@ impl SupervisorPtySession {
         }
     }
 
+    fn reconnect_ipc(&self) -> PtyResult<()> {
+        let (socket_path, supervisor_pid, supervisor_status) = match &self.restore_info {
+            PtyRestoreInfo::UnixSocket {
+                socket_path,
+                supervisor_pid,
+                supervisor_status,
+            } => (socket_path.clone(), *supervisor_pid, *supervisor_status),
+        };
+        if supervisor_status != PtySupervisorStatus::Running {
+            return Err(PtyError::Backend(format!(
+                "session supervisor is not reconnectable in {supervisor_status:?} state"
+            )));
+        }
+
+        let stream = connect_supervisor_socket(&socket_path)?;
+        let writer = stream.try_clone().map_err(PtyError::from)?;
+        *self
+            .writer
+            .lock()
+            .expect("supervisor writer mutex poisoned") = writer;
+        spawn_supervisor_reader_thread(
+            &self.session_id,
+            stream,
+            Arc::clone(&self.pending_requests),
+            Arc::clone(&self.pending_output),
+            Arc::clone(&self.pending_terminal_frames),
+            self.output_signal_tx.clone(),
+        )?;
+
+        let attach = self.request_once(SupervisorRequest::Attach {
+            session_id: self.session_id.clone(),
+        })?;
+        let snapshot = attach.into_snapshot()?;
+        self.seed_snapshot(snapshot);
+        let _ = supervisor_pid;
+        Ok(())
+    }
+
     fn seed_snapshot(&self, snapshot: SupervisorSnapshotPayload) {
         *self.cached_size.lock().expect("cached size mutex poisoned") = snapshot.size;
         *self
@@ -385,6 +429,19 @@ impl SupervisorPtySession {
         // daemon 侧的 supervisor 客户端也使用 watch 做输出通知；如果本地缓存
         // 还没读空，需要再次唤醒协议推送层，避免大输出停在缓存里。
         let _ = self.output_signal_tx.send(next);
+    }
+
+    fn has_pending_output_or_terminal_frames(&self) -> bool {
+        !self
+            .pending_output
+            .lock()
+            .expect("pending output mutex poisoned")
+            .is_empty()
+            || !self
+                .pending_terminal_frames
+                .lock()
+                .expect("pending terminal frames mutex poisoned")
+                .is_empty()
     }
 }
 
@@ -409,20 +466,81 @@ impl Drop for SupervisorPtySession {
     }
 }
 
+fn connect_supervisor_socket(socket_path: &Path) -> PtyResult<StdUnixStream> {
+    let deadline = Instant::now() + SOCKET_CONNECT_TIMEOUT;
+    let stream = loop {
+        match StdUnixStream::connect(socket_path) {
+            Ok(stream) => break stream,
+            Err(error) if Instant::now() < deadline => {
+                if error.kind() != io::ErrorKind::NotFound
+                    && error.kind() != io::ErrorKind::ConnectionRefused
+                {
+                    return Err(PtyError::Io(error));
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => return Err(PtyError::Io(error)),
+        }
+    };
+    stream.set_nonblocking(false).map_err(PtyError::from)?;
+    Ok(stream)
+}
+
+fn spawn_supervisor_reader_thread(
+    session_id: &str,
+    reader: StdUnixStream,
+    pending_requests: Arc<
+        StdMutex<HashMap<u64, mpsc::Sender<PtyResult<SupervisorResponsePayload>>>>,
+    >,
+    pending_output: Arc<StdMutex<VecDeque<Vec<u8>>>>,
+    pending_terminal_frames: Arc<StdMutex<VecDeque<PtyTerminalFrame>>>,
+    output_signal_tx: watch::Sender<u64>,
+) -> PtyResult<()> {
+    let thread_name = format!("termd-supervisor-ipc-{session_id}");
+    thread::Builder::new()
+        .name(thread_name)
+        .spawn(move || {
+            supervisor_reader_loop(
+                reader,
+                pending_requests,
+                pending_output,
+                pending_terminal_frames,
+                output_signal_tx,
+            );
+        })
+        .map(|_| ())
+        .map_err(PtyError::backend)
+}
+
 impl PtySession for SupervisorPtySession {
     fn read(&mut self, buffer: &mut [u8]) -> PtyResult<usize> {
         if buffer.is_empty() {
             return Ok(0);
         }
 
-        let Some(mut chunk) = self
+        let mut chunk = if let Some(chunk) = self
             .pending_output
             .lock()
             .expect("pending output mutex poisoned")
             .pop_front()
-        else {
-            return Ok(0);
+        {
+            chunk
+        } else {
+            loop {
+                let Some(frame) = self
+                    .pending_terminal_frames
+                    .lock()
+                    .expect("pending terminal frames mutex poisoned")
+                    .pop_front()
+                else {
+                    return Ok(0);
+                };
+                if let Some(bytes) = frame.bytes_for_legacy_read() {
+                    break bytes.to_vec();
+                }
+            }
         };
+
         let read = buffer.len().min(chunk.len());
         buffer[..read].copy_from_slice(&chunk[..read]);
         if read < chunk.len() {
@@ -432,12 +550,7 @@ impl PtySession for SupervisorPtySession {
                 .expect("pending output mutex poisoned")
                 .push_front(remaining);
         }
-        if !self
-            .pending_output
-            .lock()
-            .expect("pending output mutex poisoned")
-            .is_empty()
-        {
+        if self.has_pending_output_or_terminal_frames() {
             self.signal_pending_output();
         }
         Ok(read)
@@ -473,6 +586,29 @@ impl PtySession for SupervisorPtySession {
             process_id: snapshot.process_id,
             retained_output: snapshot.retained_output,
         })
+    }
+
+    fn terminal_snapshot(
+        &mut self,
+        last_terminal_seq: Option<u64>,
+    ) -> PtyResult<Vec<PtyTerminalFrame>> {
+        let (base_seq, frames) = self
+            .request(SupervisorRequest::TerminalSnapshot { last_terminal_seq })?
+            .into_terminal_frames()?;
+        self.drop_pending_terminal_frames_through(base_seq);
+        Ok(frames)
+    }
+
+    fn read_terminal_frame(&mut self) -> PtyResult<Option<PtyTerminalFrame>> {
+        let frame = self
+            .pending_terminal_frames
+            .lock()
+            .expect("pending terminal frames mutex poisoned")
+            .pop_front();
+        if self.has_pending_output_or_terminal_frames() {
+            self.signal_pending_output();
+        }
+        Ok(frame)
     }
 
     fn ping(&mut self) -> PtyResult<()> {
@@ -531,6 +667,18 @@ impl PtySession for SupervisorPtySession {
     }
 }
 
+impl SupervisorPtySession {
+    fn drop_pending_terminal_frames_through(&self, base_seq: u64) {
+        // 中文注释：daemon 和 supervisor 的 IPC reader 会持续接收 live frame。新 attach
+        // 已经用 snapshot/tail 同步到 base_seq 后，队列中不晚于该序号的旧 frame 必须丢弃；
+        // 否则 snapshot 后会再次重放 attach 前的大量历史输出。
+        self.pending_terminal_frames
+            .lock()
+            .expect("pending terminal frames mutex poisoned")
+            .retain(|frame| frame.terminal_seq().is_none_or(|seq| seq > base_seq));
+    }
+}
+
 fn restore_info_with_status(
     restore_info: &PtyRestoreInfo,
     supervisor_status: PtySupervisorStatus,
@@ -554,6 +702,7 @@ fn supervisor_reader_loop(
         StdMutex<HashMap<u64, mpsc::Sender<PtyResult<SupervisorResponsePayload>>>>,
     >,
     pending_output: Arc<StdMutex<VecDeque<Vec<u8>>>>,
+    pending_terminal_frames: Arc<StdMutex<VecDeque<PtyTerminalFrame>>>,
     output_signal_tx: watch::Sender<u64>,
 ) {
     loop {
@@ -595,6 +744,14 @@ fn supervisor_reader_loop(
                     let next = output_signal_tx.borrow().wrapping_add(1);
                     let _ = output_signal_tx.send(next);
                 }
+            }
+            SupervisorFrame::TerminalFrame { frame } => {
+                pending_terminal_frames
+                    .lock()
+                    .expect("pending terminal frames mutex poisoned")
+                    .push_back(frame);
+                let next = output_signal_tx.borrow().wrapping_add(1);
+                let _ = output_signal_tx.send(next);
             }
         }
     }
@@ -761,8 +918,151 @@ struct SupervisorState {
     next_controller_id: u64,
     controller: Option<ControllerHandle>,
     retained_output: VecDeque<u8>,
+    terminal: SupervisorTerminalCache,
+}
+
+/// supervisor 侧的权威终端缓存。
+///
+/// 中文注释：daemon 可以重启、浏览器可以断线，但这个结构跟真实 PTY 在同一个
+/// session supervisor 进程里，因此它是恢复 screen snapshot 和 tail 的权威来源。
+struct SupervisorTerminalCache {
+    // 中文注释：session 级终端事件序号，output/resize/exit 共用；从 1 开始递增。
+    next_terminal_seq: u64,
+    // 中文注释：当前 journal 窗口中第一条事件的 terminal_seq；用于判断客户端 tail 是否过旧。
+    journal_base_seq: u64,
+    // 中文注释：最近原始终端事件，用于 snapshot 之后补 tail；snapshot 本身不进入 journal。
+    journal: VecDeque<TerminalEvent>,
+    // 中文注释：权威终端模拟状态，内部保留最近 1000 行热历史。
     screen: TerminalScreen,
     size: PtySize,
+}
+
+/// supervisor journal 中的原始终端事件。
+///
+/// 中文注释：这里保存 session 级 `terminal_seq`，不是 WebSocket packet seq。
+/// snapshot 只是一张状态图，不进入 journal；tail 只由这些事件构成。
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum TerminalEvent {
+    Output { seq: u64, bytes: Vec<u8> },
+    Resize { seq: u64, size: PtySize },
+    Exit { seq: u64, code: Option<i32> },
+}
+
+impl TerminalEvent {
+    fn terminal_seq(&self) -> u64 {
+        match self {
+            Self::Output { seq, .. } | Self::Resize { seq, .. } | Self::Exit { seq, .. } => *seq,
+        }
+    }
+
+    fn to_terminal_frame(&self) -> PtyTerminalFrame {
+        match self {
+            Self::Output { seq, bytes } => PtyTerminalFrame::Output {
+                terminal_seq: *seq,
+                data: bytes.clone(),
+            },
+            Self::Resize { seq, size } => PtyTerminalFrame::Resize {
+                terminal_seq: *seq,
+                size: *size,
+            },
+            Self::Exit { seq, code } => PtyTerminalFrame::Exit {
+                terminal_seq: *seq,
+                code: *code,
+            },
+        }
+    }
+}
+
+impl SupervisorTerminalCache {
+    fn new(size: PtySize) -> Self {
+        Self {
+            next_terminal_seq: 1,
+            journal_base_seq: 1,
+            journal: VecDeque::new(),
+            screen: TerminalScreen::new(size.rows, size.cols),
+            size,
+        }
+    }
+
+    fn record_output(&mut self, bytes: &[u8]) -> PtyTerminalFrame {
+        // supervisor 是 PTY 真正存活的一侧；屏幕快照必须在这里维护，不能只放在 daemon 内存中。
+        self.screen.apply(bytes);
+        let event = TerminalEvent::Output {
+            seq: self.allocate_terminal_seq(),
+            bytes: bytes.to_vec(),
+        };
+        let frame = event.to_terminal_frame();
+        self.push_journal(event);
+        frame
+    }
+
+    fn resize(&mut self, size: PtySize) -> PtyTerminalFrame {
+        self.size = size;
+        self.screen.resize(size.rows, size.cols);
+        let event = TerminalEvent::Resize {
+            seq: self.allocate_terminal_seq(),
+            size,
+        };
+        let frame = event.to_terminal_frame();
+        self.push_journal(event);
+        frame
+    }
+
+    fn record_exit(&mut self, code: Option<i32>) -> PtyTerminalFrame {
+        let event = TerminalEvent::Exit {
+            seq: self.allocate_terminal_seq(),
+            code,
+        };
+        let frame = event.to_terminal_frame();
+        self.push_journal(event);
+        frame
+    }
+
+    fn snapshot_output(&self) -> Vec<u8> {
+        self.screen.snapshot_bytes()
+    }
+
+    fn terminal_snapshot_or_tail(
+        &self,
+        last_terminal_seq: Option<u64>,
+    ) -> (u64, Vec<PtyTerminalFrame>) {
+        let current_seq = self.current_terminal_seq();
+        if let Some(last_terminal_seq) = last_terminal_seq {
+            if last_terminal_seq == current_seq {
+                return (current_seq, Vec::new());
+            }
+            if last_terminal_seq < current_seq
+                && last_terminal_seq.saturating_add(1) >= self.journal_base_seq
+            {
+                let frames = self
+                    .journal
+                    .iter()
+                    .filter(|event| event.terminal_seq() > last_terminal_seq)
+                    .map(TerminalEvent::to_terminal_frame)
+                    .collect();
+                return (current_seq, frames);
+            }
+        }
+
+        (
+            current_seq,
+            vec![PtyTerminalFrame::Snapshot {
+                base_seq: current_seq,
+                size: self.size,
+                data: self.snapshot_output(),
+            }],
+        )
+    }
+
+    fn current_terminal_seq(&self) -> u64 {
+        self.next_terminal_seq.saturating_sub(1)
+    }
+
+    fn allocate_terminal_seq(&mut self) -> u64 {
+        let seq = self.next_terminal_seq;
+        self.next_terminal_seq = self.next_terminal_seq.saturating_add(1).max(seq + 1);
+        seq
+    }
 }
 
 impl SupervisorState {
@@ -771,24 +1071,50 @@ impl SupervisorState {
             next_controller_id: 1,
             controller: None,
             retained_output: VecDeque::new(),
-            screen: TerminalScreen::new(size.rows, size.cols),
-            size,
+            terminal: SupervisorTerminalCache::new(size),
         }
     }
 
-    fn record_output(&mut self, bytes: &[u8]) {
-        // supervisor 是 PTY 真正存活的一侧；屏幕快照必须在这里维护，不能只放在 daemon 内存中。
-        self.screen.apply(bytes);
+    fn record_output(&mut self, bytes: &[u8]) -> PtyTerminalFrame {
         append_retained_output(&mut self.retained_output, bytes);
+        self.terminal.record_output(bytes)
     }
 
-    fn resize(&mut self, size: PtySize) {
-        self.size = size;
-        self.screen.resize(size.rows, size.cols);
+    fn resize(&mut self, size: PtySize) -> PtyTerminalFrame {
+        self.terminal.resize(size)
+    }
+
+    fn record_exit(&mut self, code: Option<i32>) -> PtyTerminalFrame {
+        self.terminal.record_exit(code)
     }
 
     fn snapshot_output(&self) -> Vec<u8> {
-        self.screen.snapshot_bytes()
+        self.terminal.snapshot_output()
+    }
+
+    fn terminal_snapshot_or_tail_with_base(
+        &self,
+        last_terminal_seq: Option<u64>,
+    ) -> (u64, Vec<PtyTerminalFrame>) {
+        self.terminal.terminal_snapshot_or_tail(last_terminal_seq)
+    }
+
+    fn size(&self) -> PtySize {
+        self.terminal.size
+    }
+}
+
+impl SupervisorTerminalCache {
+    fn push_journal(&mut self, event: TerminalEvent) {
+        self.journal.push_back(event);
+        while self.journal.len() > TERMINAL_JOURNAL_MAX_EVENTS {
+            self.journal.pop_front();
+        }
+        self.journal_base_seq = self
+            .journal
+            .front()
+            .map(TerminalEvent::terminal_seq)
+            .unwrap_or(self.next_terminal_seq);
     }
 }
 
@@ -817,6 +1143,7 @@ pub async fn run_session_supervisor(args: SessionSupervisorArgs) -> PtyResult<()
     } {
         tokio::spawn(supervisor_output_pump(shared.clone(), signal));
     }
+    tokio::spawn(supervisor_exit_watcher(shared.clone()));
 
     loop {
         if let Err(error) = ensure_supervisor_socket_bound(&args.socket_path, &mut listener) {
@@ -897,6 +1224,9 @@ async fn handle_supervisor_connection(
 ) -> PtyResult<()> {
     let (mut reader, mut writer) = stream.into_split();
     let (controller_tx, mut controller_rx) = tokio_mpsc::unbounded_channel::<SupervisorFrame>();
+    // 保留一个显式 sender，避免 controller 还未写入 state 或被短暂替换时，
+    // outbound 分支把通道误判为关闭而结束 IPC 连接。
+    let _controller_tx_keepalive = controller_tx.clone();
     let mut controller_id = None;
 
     loop {
@@ -929,7 +1259,7 @@ async fn handle_supervisor_connection(
                                 });
                                 controller_id = Some(id);
                                 SupervisorSnapshotPayload {
-                                    size: state.size,
+                                    size: state.size(),
                                     process_id,
                                     retained_output: state.snapshot_output(),
                                 }
@@ -948,7 +1278,14 @@ async fn handle_supervisor_connection(
                     SupervisorRequest::Resize { size } => {
                         ensure_current_controller(&shared, controller_id).await?;
                         shared.session.lock().await.resize(size)?;
-                        shared.state.lock().await.resize(size);
+                        let (frame, controller) = {
+                            let mut state = shared.state.lock().await;
+                            let frame = state.resize(size);
+                            (frame, state.controller.clone())
+                        };
+                        if let Some(controller) = controller {
+                            let _ = controller.tx.send(SupervisorFrame::TerminalFrame { frame });
+                        }
                         SupervisorResponse::ok(SupervisorResponsePayload::Empty)
                     }
                     SupervisorRequest::Snapshot => {
@@ -956,11 +1293,23 @@ async fn handle_supervisor_connection(
                         let process_id = shared.session.lock().await.process_id();
                         let state = shared.state.lock().await;
                         let payload = SupervisorSnapshotPayload {
-                            size: state.size,
+                            size: state.size(),
                             process_id,
                             retained_output: state.snapshot_output(),
                         };
                         SupervisorResponse::ok(SupervisorResponsePayload::Snapshot(payload))
+                    }
+                    SupervisorRequest::TerminalSnapshot { last_terminal_seq } => {
+                        ensure_current_controller(&shared, controller_id).await?;
+                        let (base_seq, frames) = shared
+                            .state
+                            .lock()
+                            .await
+                            .terminal_snapshot_or_tail_with_base(last_terminal_seq);
+                        SupervisorResponse::ok(SupervisorResponsePayload::TerminalFrames {
+                            base_seq,
+                            frames,
+                        })
                     }
                     SupervisorRequest::Close => {
                         ensure_current_controller(&shared, controller_id).await?;
@@ -1038,20 +1387,42 @@ async fn drain_supervisor_output(shared: &SupervisorShared) {
         }
 
         buffer.truncate(read);
-        let encoded = general_purpose::STANDARD.encode(&buffer);
         let mut state = shared.state.lock().await;
-        state.record_output(&buffer);
+        let frame = state.record_output(&buffer);
         if let Some(controller) = state.controller.clone() {
             if controller
                 .tx
-                .send(SupervisorFrame::Output {
-                    data_base64: encoded,
-                })
+                .send(SupervisorFrame::TerminalFrame { frame })
                 .is_err()
             {
                 state.controller = None;
             }
         }
+    }
+}
+
+async fn supervisor_exit_watcher(shared: SupervisorShared) {
+    loop {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let exit_status = match shared.session.lock().await.try_wait() {
+            Ok(Some(status)) => status,
+            Ok(None) => continue,
+            Err(error) => {
+                tracing::warn!(%error, "session supervisor failed to poll PTY exit status");
+                return;
+            }
+        };
+        let code = if exit_status.signal.is_none() {
+            Some(exit_status.exit_code as i32)
+        } else {
+            None
+        };
+        let mut state = shared.state.lock().await;
+        let frame = state.record_exit(code);
+        if let Some(controller) = state.controller.clone() {
+            let _ = controller.tx.send(SupervisorFrame::TerminalFrame { frame });
+        }
+        return;
     }
 }
 
@@ -1068,13 +1439,14 @@ struct SupervisorRequestEnvelope {
     request: SupervisorRequest,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum SupervisorRequest {
     Attach { session_id: String },
     Input { data_base64: String },
     Resize { size: PtySize },
     Snapshot,
+    TerminalSnapshot { last_terminal_seq: Option<u64> },
     Close,
     Ping,
 }
@@ -1088,6 +1460,9 @@ enum SupervisorFrame {
     },
     Output {
         data_base64: String,
+    },
+    TerminalFrame {
+        frame: PtyTerminalFrame,
     },
 }
 
@@ -1122,13 +1497,17 @@ impl SupervisorResponse {
 enum SupervisorResponsePayload {
     Empty,
     Snapshot(SupervisorSnapshotPayload),
+    TerminalFrames {
+        base_seq: u64,
+        frames: Vec<PtyTerminalFrame>,
+    },
 }
 
 impl SupervisorResponsePayload {
     fn expect_empty(self) -> PtyResult<()> {
         match self {
             Self::Empty => Ok(()),
-            Self::Snapshot(_) => Err(PtyError::Backend(
+            Self::Snapshot(_) | Self::TerminalFrames { .. } => Err(PtyError::Backend(
                 "session supervisor returned unexpected snapshot payload".to_owned(),
             )),
         }
@@ -1137,8 +1516,17 @@ impl SupervisorResponsePayload {
     fn into_snapshot(self) -> PtyResult<SupervisorSnapshotPayload> {
         match self {
             Self::Snapshot(payload) => Ok(payload),
-            Self::Empty => Err(PtyError::Backend(
+            Self::Empty | Self::TerminalFrames { .. } => Err(PtyError::Backend(
                 "session supervisor returned empty payload".to_owned(),
+            )),
+        }
+    }
+
+    fn into_terminal_frames(self) -> PtyResult<(u64, Vec<PtyTerminalFrame>)> {
+        match self {
+            Self::TerminalFrames { base_seq, frames } => Ok((base_seq, frames)),
+            Self::Empty | Self::Snapshot(_) => Err(PtyError::Backend(
+                "session supervisor returned unexpected terminal frame payload".to_owned(),
             )),
         }
     }
@@ -1323,6 +1711,61 @@ mod tests {
     }
 
     #[test]
+    fn supervisor_terminal_snapshot_uses_session_seq_and_tail_window() {
+        let mut state = SupervisorState::new(PtySize::new(4, 40));
+        let first = state.record_output(b"alpha\n");
+        let second = state.record_output(b"beta\n");
+        assert_eq!(first.terminal_seq(), Some(1));
+        assert_eq!(second.terminal_seq(), Some(2));
+
+        let snapshot = state.terminal_snapshot_or_tail_with_base(None).1;
+        assert_eq!(snapshot.len(), 1);
+        assert!(matches!(
+            snapshot[0],
+            PtyTerminalFrame::Snapshot { base_seq: 2, .. }
+        ));
+
+        let tail = state.terminal_snapshot_or_tail_with_base(Some(1)).1;
+        assert_eq!(tail, vec![second]);
+
+        assert!(
+            state
+                .terminal_snapshot_or_tail_with_base(Some(2))
+                .1
+                .is_empty(),
+            "up-to-date clients do not need snapshot or tail"
+        );
+    }
+
+    #[test]
+    fn supervisor_terminal_resize_consumes_session_seq() {
+        let mut state = SupervisorState::new(PtySize::new(4, 40));
+        let output = state.record_output(b"before resize");
+        let resize = state.resize(PtySize::new(10, 100));
+
+        assert_eq!(output.terminal_seq(), Some(1));
+        assert_eq!(resize.terminal_seq(), Some(2));
+        assert_eq!(
+            state.terminal_snapshot_or_tail_with_base(Some(1)).1,
+            vec![resize]
+        );
+    }
+
+    #[test]
+    fn supervisor_terminal_exit_consumes_session_seq() {
+        let mut state = SupervisorState::new(PtySize::new(4, 40));
+        let output = state.record_output(b"before exit");
+        let exit = state.record_exit(Some(0));
+
+        assert_eq!(output.terminal_seq(), Some(1));
+        assert_eq!(exit.terminal_seq(), Some(2));
+        assert_eq!(
+            state.terminal_snapshot_or_tail_with_base(Some(1)).1,
+            vec![exit]
+        );
+    }
+
+    #[test]
     fn supervisor_client_read_rearms_signal_when_pending_output_remains() {
         let socket_path = PathBuf::from("/tmp/termd-supervisor-test.sock");
         let restore_info = PtyRestoreInfo::UnixSocket {
@@ -1333,6 +1776,7 @@ mod tests {
         let (writer, _peer) = StdUnixStream::pair().expect("test unix stream pair should open");
         let (output_signal_tx, output_signal_rx) = watch::channel(OUTPUT_SIGNAL_INIT);
         let mut session = SupervisorPtySession {
+            session_id: "test-session".to_owned(),
             restore_info,
             supervisor_child: StdMutex::new(None),
             writer: StdMutex::new(writer),
@@ -1341,6 +1785,7 @@ mod tests {
                 b"first".to_vec(),
                 b"second".to_vec(),
             ]))),
+            pending_terminal_frames: Arc::new(StdMutex::new(VecDeque::new())),
             output_signal_tx,
             output_signal_rx,
             next_request_id: AtomicU64::new(1),
@@ -1359,6 +1804,60 @@ mod tests {
         assert!(
             signal.has_changed().unwrap_or(false),
             "remaining supervisor output should rearm daemon watcher"
+        );
+    }
+
+    #[test]
+    fn supervisor_client_prunes_live_frames_covered_by_snapshot() {
+        let socket_path = PathBuf::from("/tmp/termd-supervisor-test.sock");
+        let restore_info = PtyRestoreInfo::UnixSocket {
+            socket_path,
+            supervisor_pid: 42,
+            supervisor_status: PtySupervisorStatus::Running,
+        };
+        let (writer, _peer) = StdUnixStream::pair().expect("test unix stream pair should open");
+        let (output_signal_tx, output_signal_rx) = watch::channel(OUTPUT_SIGNAL_INIT);
+        let pending_terminal_frames = Arc::new(StdMutex::new(VecDeque::from([
+            PtyTerminalFrame::Output {
+                terminal_seq: 1,
+                data: b"old-1".to_vec(),
+            },
+            PtyTerminalFrame::Resize {
+                terminal_seq: 2,
+                size: PtySize::new(30, 100),
+            },
+            PtyTerminalFrame::Output {
+                terminal_seq: 3,
+                data: b"new-3".to_vec(),
+            },
+        ])));
+        let session = SupervisorPtySession {
+            session_id: "test-session".to_owned(),
+            restore_info,
+            supervisor_child: StdMutex::new(None),
+            writer: StdMutex::new(writer),
+            pending_requests: Arc::new(StdMutex::new(HashMap::new())),
+            pending_output: Arc::new(StdMutex::new(VecDeque::new())),
+            pending_terminal_frames: Arc::clone(&pending_terminal_frames),
+            output_signal_tx,
+            output_signal_rx,
+            next_request_id: AtomicU64::new(1),
+            cached_size: StdMutex::new(PtySize::new(24, 80)),
+            cached_process_id: StdMutex::new(Some(42)),
+        };
+
+        // 中文注释：snapshot(base_seq=2) 已覆盖 seq<=2 的 live frame，后续只能保留真正的新 tail。
+        session.drop_pending_terminal_frames_through(2);
+
+        let pending = pending_terminal_frames
+            .lock()
+            .expect("pending terminal frame mutex should not be poisoned");
+        assert_eq!(
+            pending
+                .iter()
+                .map(PtyTerminalFrame::terminal_seq)
+                .collect::<Vec<_>>(),
+            vec![Some(3)]
         );
     }
 

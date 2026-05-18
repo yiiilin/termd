@@ -27,7 +27,7 @@ use termd_proto::{
     ProtocolVersion, PublicKey, RouteHelloPayload, RouteReadyPayload, RouteRole, ServerId,
     SessionAttachPayload, SessionAttachedPayload, SessionCreatePayload, SessionCreatedPayload,
     SessionDataPayload, SessionId, SessionListPayload, SessionListResultPayload,
-    SessionResizePayload, SessionResizedPayload, TerminalSize,
+    SessionResizePayload, SessionResizedPayload, TerminalFramePayload, TerminalSize,
 };
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -312,6 +312,7 @@ impl DirectClient {
             SessionAttachPayload {
                 session_id,
                 watch_updates: true,
+                last_terminal_seq: None,
             },
         )?;
 
@@ -379,14 +380,32 @@ impl DirectClient {
 
             match packet.kind {
                 PacketKind::StreamChunk => {
-                    let payload: SessionDataPayload = decode_payload(packet.payload)
-                        .map_err(|_| TermctlError::InvalidEnvelope)?;
-                    let bytes = crypto::decode_session_data(&payload.data_base64)?;
                     stream.last_recv_seq = packet.seq;
                     self.send_packet(
                         stream.flow_packet(packet.seq, TERMINAL_STREAM_REPLENISH_CREDIT),
                     )
                     .await?;
+                    if let Ok(frame) =
+                        decode_payload::<TerminalFramePayload>(packet.payload.clone())
+                    {
+                        // termctl 没有 xterm 渲染队列；它把 snapshot/output 都作为 stdout bytes 输出。
+                        // resize 只更新远端终端状态，不产生本地字节；exit 则结束流。
+                        match frame {
+                            TerminalFramePayload::Snapshot { data_base64, .. }
+                            | TerminalFramePayload::Output { data_base64, .. } => {
+                                let bytes = crypto::decode_session_data(&data_base64)?;
+                                return Ok(TerminalStreamEvent::Output(bytes));
+                            }
+                            TerminalFramePayload::Resize { .. } => continue,
+                            TerminalFramePayload::Exit { .. } => {
+                                return Ok(TerminalStreamEvent::End);
+                            }
+                        }
+                    }
+
+                    let payload: SessionDataPayload = decode_payload(packet.payload)
+                        .map_err(|_| TermctlError::InvalidEnvelope)?;
+                    let bytes = crypto::decode_session_data(&payload.data_base64)?;
                     return Ok(TerminalStreamEvent::Output(bytes));
                 }
                 PacketKind::StreamEnd | PacketKind::Cancel => return Ok(TerminalStreamEvent::End),
