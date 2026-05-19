@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
-import { TerminalPane } from "../components/TerminalPane";
+import { TerminalPane, type TerminalOutputItem } from "../components/TerminalPane";
 
 function fireTouchPointer(
   target: HTMLElement,
@@ -93,6 +93,69 @@ function activateMobileDirectionGesture(frame: HTMLElement, pointerId: number, s
   });
   expect(screen.getByLabelText("mobile direction gesture")).toBeInTheDocument();
 }
+
+function renderTerminalPaneWithOutput(items: TerminalOutputItem[], options: {
+  onTerminalResync?: (lastTerminalSeq?: number) => void;
+  onTerminalSeqRendered?: (terminalSeq: number) => void;
+} = {}) {
+  const queue = [...items];
+  const takeOutput = vi.fn(() => queue.splice(0));
+  const registerOutputDrain = vi.fn((drain: () => void) => {
+    drain();
+    return () => undefined;
+  });
+  render(
+    <TerminalPane
+      attached
+      sessionSize={{ rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 }}
+      resizeEnabled
+      outputResetVersion={0}
+      takeOutput={takeOutput}
+      registerOutputDrain={registerOutputDrain}
+      onTerminalResync={options.onTerminalResync}
+      onTerminalSeqRendered={options.onTerminalSeqRendered}
+      onInput={vi.fn()}
+      onResize={vi.fn()}
+      onCursorChange={vi.fn()}
+    />,
+  );
+}
+
+describe("TerminalPane terminal sequence rendering", () => {
+  it("snapshot 后推进 base seq，连续 output 正常写入并推进 terminal_seq", async () => {
+    const onTerminalSeqRendered = vi.fn();
+
+    renderTerminalPaneWithOutput(
+      [
+        { kind: "snapshot", bytes: new TextEncoder().encode("snapshot\n"), baseSeq: 10 },
+        { kind: "output", bytes: new TextEncoder().encode("tail\n"), terminalSeq: 11 },
+      ],
+      { onTerminalSeqRendered },
+    );
+
+    await screen.findByText("snapshot", { exact: false });
+    const xterm = screen.getByTestId("terminal-pane").querySelector<HTMLElement>(".xterm");
+    await waitFor(() => expect(xterm?.dataset.buffer).toContain("tail"));
+    expect(onTerminalSeqRendered.mock.calls).toEqual([[10], [11]]);
+  });
+
+  it("output terminal_seq 不连续时触发 resync，且不推进到跳号 frame", async () => {
+    const onTerminalResync = vi.fn();
+    const onTerminalSeqRendered = vi.fn();
+
+    renderTerminalPaneWithOutput(
+      [
+        { kind: "snapshot", bytes: new TextEncoder().encode("snapshot\n"), baseSeq: 10 },
+        { kind: "output", bytes: new TextEncoder().encode("gap\n"), terminalSeq: 13 },
+      ],
+      { onTerminalResync, onTerminalSeqRendered },
+    );
+
+    await screen.findByText("snapshot", { exact: false });
+    await waitFor(() => expect(onTerminalResync).toHaveBeenCalledWith(10));
+    expect(onTerminalSeqRendered.mock.calls).toEqual([[10]]);
+  });
+});
 
 describe("TerminalPane mobile direction gesture", () => {
   it("一档每半秒发送一个方向键，并在松手后停止", () => {

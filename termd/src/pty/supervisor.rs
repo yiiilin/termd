@@ -293,11 +293,9 @@ impl SupervisorPtySession {
             cached_process_id: StdMutex::new(None),
         };
 
-        let attach = session.request(SupervisorRequest::Attach {
-            session_id: session_id.to_owned(),
-        })?;
-        let snapshot = attach.into_snapshot()?;
-        session.seed_snapshot(snapshot);
+        let sync = session.attach_sync(None)?;
+        session.seed_snapshot(sync.snapshot);
+        session.drop_pending_terminal_frames_through(sync.base_seq);
 
         Ok(session)
     }
@@ -398,13 +396,33 @@ impl SupervisorPtySession {
             self.output_signal_tx.clone(),
         )?;
 
-        let attach = self.request_once(SupervisorRequest::Attach {
-            session_id: self.session_id.clone(),
-        })?;
-        let snapshot = attach.into_snapshot()?;
-        self.seed_snapshot(snapshot);
+        let sync = self.attach_sync_once(None)?;
+        self.seed_snapshot(sync.snapshot);
+        self.drop_pending_terminal_frames_through(sync.base_seq);
         let _ = supervisor_pid;
         Ok(())
+    }
+
+    fn attach_sync(
+        &self,
+        last_terminal_seq: Option<u64>,
+    ) -> PtyResult<SupervisorAttachSyncPayload> {
+        self.request(SupervisorRequest::AttachSync {
+            session_id: self.session_id.clone(),
+            last_terminal_seq,
+        })?
+        .into_attach_sync()
+    }
+
+    fn attach_sync_once(
+        &self,
+        last_terminal_seq: Option<u64>,
+    ) -> PtyResult<SupervisorAttachSyncPayload> {
+        self.request_once(SupervisorRequest::AttachSync {
+            session_id: self.session_id.clone(),
+            last_terminal_seq,
+        })?
+        .into_attach_sync()
     }
 
     fn seed_snapshot(&self, snapshot: SupervisorSnapshotPayload) {
@@ -592,11 +610,14 @@ impl PtySession for SupervisorPtySession {
         &mut self,
         last_terminal_seq: Option<u64>,
     ) -> PtyResult<Vec<PtyTerminalFrame>> {
-        let (base_seq, frames) = self
-            .request(SupervisorRequest::TerminalSnapshot { last_terminal_seq })?
-            .into_terminal_frames()?;
-        self.drop_pending_terminal_frames_through(base_seq);
-        Ok(frames)
+        let sync = self.attach_sync(last_terminal_seq)?;
+        *self.cached_size.lock().expect("cached size mutex poisoned") = sync.snapshot.size;
+        *self
+            .cached_process_id
+            .lock()
+            .expect("cached pid mutex poisoned") = sync.snapshot.process_id;
+        self.drop_pending_terminal_frames_through(sync.base_seq);
+        Ok(sync.frames)
     }
 
     fn read_terminal_frame(&mut self) -> PtyResult<Option<PtyTerminalFrame>> {
@@ -1102,6 +1123,34 @@ impl SupervisorState {
     fn size(&self) -> PtySize {
         self.terminal.size
     }
+
+    fn attach_sync(
+        &mut self,
+        controller_tx: tokio_mpsc::UnboundedSender<SupervisorFrame>,
+        process_id: Option<u32>,
+        last_terminal_seq: Option<u64>,
+    ) -> (u64, SupervisorAttachSyncPayload) {
+        let id = self.next_controller_id;
+        self.next_controller_id = self.next_controller_id.saturating_add(1);
+        self.controller = Some(ControllerHandle {
+            id,
+            tx: controller_tx,
+        });
+        let snapshot = SupervisorSnapshotPayload {
+            size: self.size(),
+            process_id,
+            retained_output: self.snapshot_output(),
+        };
+        let (base_seq, frames) = self.terminal_snapshot_or_tail_with_base(last_terminal_seq);
+        (
+            id,
+            SupervisorAttachSyncPayload {
+                snapshot,
+                base_seq,
+                frames,
+            },
+        )
+    }
 }
 
 impl SupervisorTerminalCache {
@@ -1235,6 +1284,9 @@ async fn handle_supervisor_connection(
                 let Some(frame) = outbound else {
                     break;
                 };
+                if !is_current_controller(&shared, controller_id).await {
+                    break;
+                }
                 write_frame_async(&mut writer, &frame).await.map_err(PtyError::from)?;
             }
             inbound = read_frame_async::<SupervisorRequestEnvelope>(&mut reader) => {
@@ -1243,28 +1295,46 @@ async fn handle_supervisor_connection(
                     Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
                     Err(error) => return Err(PtyError::from(error)),
                 };
+                let mut suppress_live_through_base_seq = None;
                 let response = match envelope.request {
                     SupervisorRequest::Attach { session_id } => {
                         if session_id != expected_session_id {
                             SupervisorResponse::err("session id mismatch")
                         } else {
                             let process_id = shared.session.lock().await.process_id();
-                            let snapshot = {
+                            let sync = {
                                 let mut state = shared.state.lock().await;
-                                let id = state.next_controller_id;
-                                state.next_controller_id = state.next_controller_id.saturating_add(1);
-                                state.controller = Some(ControllerHandle {
-                                    id,
-                                    tx: controller_tx.clone(),
-                                });
+                                let (id, sync) =
+                                    state.attach_sync(controller_tx.clone(), process_id, None);
                                 controller_id = Some(id);
-                                SupervisorSnapshotPayload {
-                                    size: state.size(),
-                                    process_id,
-                                    retained_output: state.snapshot_output(),
-                                }
+                                sync
                             };
-                            SupervisorResponse::ok(SupervisorResponsePayload::Snapshot(snapshot))
+                            suppress_live_through_base_seq = Some(sync.base_seq);
+                            SupervisorResponse::ok(SupervisorResponsePayload::Snapshot(
+                                sync.snapshot,
+                            ))
+                        }
+                    }
+                    SupervisorRequest::AttachSync {
+                        session_id,
+                        last_terminal_seq,
+                    } => {
+                        if session_id != expected_session_id {
+                            SupervisorResponse::err("session id mismatch")
+                        } else {
+                            let process_id = shared.session.lock().await.process_id();
+                            let sync = {
+                                let mut state = shared.state.lock().await;
+                                let (id, sync) = state.attach_sync(
+                                    controller_tx.clone(),
+                                    process_id,
+                                    last_terminal_seq,
+                                );
+                                controller_id = Some(id);
+                                sync
+                            };
+                            suppress_live_through_base_seq = Some(sync.base_seq);
+                            SupervisorResponse::ok(SupervisorResponsePayload::AttachSync(sync))
                         }
                     }
                     SupervisorRequest::Input { data_base64 } => {
@@ -1306,6 +1376,7 @@ async fn handle_supervisor_connection(
                             .lock()
                             .await
                             .terminal_snapshot_or_tail_with_base(last_terminal_seq);
+                        suppress_live_through_base_seq = Some(base_seq);
                         SupervisorResponse::ok(SupervisorResponsePayload::TerminalFrames {
                             base_seq,
                             frames,
@@ -1331,7 +1402,16 @@ async fn handle_supervisor_connection(
                     request_id: envelope.request_id,
                     response,
                 };
+                let delayed_live_frames = suppress_live_through_base_seq
+                    .map(|base_seq| drain_controller_frames_after_sync(&mut controller_rx, base_seq))
+                    .unwrap_or_default();
                 write_frame_async(&mut writer, &frame).await.map_err(PtyError::from)?;
+                for frame in delayed_live_frames {
+                    if !is_current_controller(&shared, controller_id).await {
+                        break;
+                    }
+                    write_frame_async(&mut writer, &frame).await.map_err(PtyError::from)?;
+                }
             }
         }
     }
@@ -1362,6 +1442,36 @@ async fn ensure_current_controller(
         ));
     }
     Ok(())
+}
+
+async fn is_current_controller(shared: &SupervisorShared, controller_id: Option<u64>) -> bool {
+    let Some(controller_id) = controller_id else {
+        return false;
+    };
+    let state = shared.state.lock().await;
+    state.controller.as_ref().map(|controller| controller.id) == Some(controller_id)
+}
+
+fn drain_controller_frames_after_sync(
+    controller_rx: &mut tokio_mpsc::UnboundedReceiver<SupervisorFrame>,
+    base_seq: u64,
+) -> Vec<SupervisorFrame> {
+    let mut delayed = Vec::new();
+    while let Ok(frame) = controller_rx.try_recv() {
+        match &frame {
+            SupervisorFrame::TerminalFrame {
+                frame: terminal_frame,
+            } if terminal_frame
+                .terminal_seq()
+                .is_some_and(|seq| seq <= base_seq) =>
+            {
+                // 中文注释：AttachSync/TerminalSnapshot 的响应已经覆盖到 base_seq；
+                // 仍停在 outbound 队列里的旧 live frame 必须丢弃，否则会在响应之后重放旧序号。
+            }
+            _ => delayed.push(frame),
+        }
+    }
+    delayed
 }
 
 async fn supervisor_output_pump(shared: SupervisorShared, mut output_signal: watch::Receiver<u64>) {
@@ -1442,11 +1552,23 @@ struct SupervisorRequestEnvelope {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum SupervisorRequest {
-    Attach { session_id: String },
-    Input { data_base64: String },
-    Resize { size: PtySize },
+    Attach {
+        session_id: String,
+    },
+    AttachSync {
+        session_id: String,
+        last_terminal_seq: Option<u64>,
+    },
+    Input {
+        data_base64: String,
+    },
+    Resize {
+        size: PtySize,
+    },
     Snapshot,
-    TerminalSnapshot { last_terminal_seq: Option<u64> },
+    TerminalSnapshot {
+        last_terminal_seq: Option<u64>,
+    },
     Close,
     Ping,
 }
@@ -1497,6 +1619,7 @@ impl SupervisorResponse {
 enum SupervisorResponsePayload {
     Empty,
     Snapshot(SupervisorSnapshotPayload),
+    AttachSync(SupervisorAttachSyncPayload),
     TerminalFrames {
         base_seq: u64,
         frames: Vec<PtyTerminalFrame>,
@@ -1507,27 +1630,31 @@ impl SupervisorResponsePayload {
     fn expect_empty(self) -> PtyResult<()> {
         match self {
             Self::Empty => Ok(()),
-            Self::Snapshot(_) | Self::TerminalFrames { .. } => Err(PtyError::Backend(
-                "session supervisor returned unexpected snapshot payload".to_owned(),
-            )),
+            Self::Snapshot(_) | Self::AttachSync(_) | Self::TerminalFrames { .. } => {
+                Err(PtyError::Backend(
+                    "session supervisor returned unexpected snapshot payload".to_owned(),
+                ))
+            }
         }
     }
 
     fn into_snapshot(self) -> PtyResult<SupervisorSnapshotPayload> {
         match self {
             Self::Snapshot(payload) => Ok(payload),
-            Self::Empty | Self::TerminalFrames { .. } => Err(PtyError::Backend(
-                "session supervisor returned empty payload".to_owned(),
-            )),
+            Self::Empty | Self::AttachSync(_) | Self::TerminalFrames { .. } => Err(
+                PtyError::Backend("session supervisor returned empty payload".to_owned()),
+            ),
         }
     }
 
-    fn into_terminal_frames(self) -> PtyResult<(u64, Vec<PtyTerminalFrame>)> {
+    fn into_attach_sync(self) -> PtyResult<SupervisorAttachSyncPayload> {
         match self {
-            Self::TerminalFrames { base_seq, frames } => Ok((base_seq, frames)),
-            Self::Empty | Self::Snapshot(_) => Err(PtyError::Backend(
-                "session supervisor returned unexpected terminal frame payload".to_owned(),
-            )),
+            Self::AttachSync(payload) => Ok(payload),
+            Self::Empty | Self::Snapshot(_) | Self::TerminalFrames { .. } => {
+                Err(PtyError::Backend(
+                    "session supervisor returned unexpected attach sync payload".to_owned(),
+                ))
+            }
         }
     }
 }
@@ -1538,6 +1665,13 @@ struct SupervisorSnapshotPayload {
     process_id: Option<u32>,
     #[serde(with = "base64_bytes")]
     retained_output: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SupervisorAttachSyncPayload {
+    snapshot: SupervisorSnapshotPayload,
+    base_seq: u64,
+    frames: Vec<PtyTerminalFrame>,
 }
 
 fn read_frame_sync<T>(reader: &mut StdUnixStream) -> io::Result<T>
@@ -1603,6 +1737,46 @@ mod tests {
     use std::collections::HashSet;
     use std::env;
     use std::ffi::OsStr;
+
+    struct NoopPtySession;
+
+    impl PtySession for NoopPtySession {
+        fn read(&mut self, _buffer: &mut [u8]) -> PtyResult<usize> {
+            Ok(0)
+        }
+
+        fn write_all(&mut self, _bytes: &[u8]) -> PtyResult<()> {
+            Ok(())
+        }
+
+        fn resize(&mut self, _size: PtySize) -> PtyResult<()> {
+            Ok(())
+        }
+
+        fn snapshot(&mut self) -> PtyResult<PtySnapshot> {
+            Ok(PtySnapshot {
+                size: PtySize::default(),
+                process_id: None,
+                retained_output: Vec::new(),
+            })
+        }
+
+        fn terminate(&mut self) -> PtyResult<()> {
+            Ok(())
+        }
+
+        fn try_wait(&mut self) -> PtyResult<Option<super::super::PtyExitStatus>> {
+            Ok(None)
+        }
+
+        fn wait(&mut self) -> PtyResult<super::super::PtyExitStatus> {
+            Ok(super::super::PtyExitStatus::exited(0))
+        }
+
+        fn process_id(&self) -> Option<u32> {
+            Some(42)
+        }
+    }
 
     #[test]
     fn supervisor_runtime_dir_uses_shared_base_directory_for_relative_state_paths() {
@@ -1734,6 +1908,171 @@ mod tests {
                 .1
                 .is_empty(),
             "up-to-date clients do not need snapshot or tail"
+        );
+    }
+
+    #[test]
+    fn attach_sync_returns_snapshot_and_live_boundary_for_new_controller() {
+        let mut state = SupervisorState::new(PtySize::new(4, 40));
+        state.record_output(b"before\n");
+        let (controller_tx, mut controller_rx) = tokio_mpsc::unbounded_channel();
+
+        let (_controller_id, sync) = state.attach_sync(controller_tx, Some(42), None);
+
+        assert_eq!(sync.base_seq, 1);
+        assert!(matches!(
+            sync.frames.as_slice(),
+            [PtyTerminalFrame::Snapshot { base_seq: 1, .. }]
+        ));
+
+        let frame = state.record_output(b"after\n");
+        if let Some(controller) = state.controller.clone() {
+            controller
+                .tx
+                .send(SupervisorFrame::TerminalFrame { frame })
+                .expect("new controller should receive live output");
+        }
+        assert!(matches!(
+            controller_rx
+                .try_recv()
+                .expect("live frame should be sent to the attached controller"),
+            SupervisorFrame::TerminalFrame {
+                frame: PtyTerminalFrame::Output {
+                    terminal_seq: 2,
+                    ..
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn attach_sync_returns_tail_when_last_seq_is_in_journal() {
+        let mut state = SupervisorState::new(PtySize::new(4, 40));
+        state.record_output(b"alpha\n");
+        state.record_output(b"beta\n");
+        let (controller_tx, _controller_rx) = tokio_mpsc::unbounded_channel();
+
+        let (_controller_id, sync) = state.attach_sync(controller_tx, Some(42), Some(1));
+
+        assert_eq!(sync.base_seq, 2);
+        assert_eq!(
+            sync.frames,
+            vec![PtyTerminalFrame::Output {
+                terminal_seq: 2,
+                data: b"beta\n".to_vec(),
+            }]
+        );
+    }
+
+    #[test]
+    fn attach_sync_replaces_old_controller_and_invalidates_old_controller_id() {
+        let mut state = SupervisorState::new(PtySize::new(4, 40));
+        let (old_tx, mut old_rx) = tokio_mpsc::unbounded_channel();
+        let (old_id, _old_sync) = state.attach_sync(old_tx, Some(42), None);
+        let (new_tx, mut new_rx) = tokio_mpsc::unbounded_channel();
+        let (new_id, _new_sync) = state.attach_sync(new_tx, Some(42), Some(0));
+
+        assert_ne!(old_id, new_id);
+        assert_eq!(
+            state.controller.as_ref().map(|controller| controller.id),
+            Some(new_id)
+        );
+
+        let frame = state.record_output(b"new-controller-only\n");
+        if let Some(controller) = state.controller.clone() {
+            controller
+                .tx
+                .send(SupervisorFrame::TerminalFrame { frame })
+                .expect("new controller should receive live output");
+        }
+
+        assert!(
+            old_rx.try_recv().is_err(),
+            "old controller must not receive live frames after replacement"
+        );
+        assert!(
+            new_rx.try_recv().is_ok(),
+            "new controller should receive live frames after replacement"
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_sync_rejects_requests_from_replaced_controller_id() {
+        let mut state = SupervisorState::new(PtySize::new(4, 40));
+        let (old_tx, _old_rx) = tokio_mpsc::unbounded_channel();
+        let (old_id, _old_sync) = state.attach_sync(old_tx, Some(42), None);
+        let (new_tx, _new_rx) = tokio_mpsc::unbounded_channel();
+        let (new_id, _new_sync) = state.attach_sync(new_tx, Some(42), Some(0));
+        let (shutdown_tx, _shutdown_rx) = watch::channel(false);
+        let shared = SupervisorShared {
+            session: Arc::new(Mutex::new(Box::new(NoopPtySession))),
+            state: Arc::new(Mutex::new(state)),
+            shutdown_tx,
+        };
+
+        assert!(
+            ensure_current_controller(&shared, Some(old_id))
+                .await
+                .is_err(),
+            "old controller id must not be allowed to input or resize after replacement"
+        );
+        ensure_current_controller(&shared, Some(new_id))
+            .await
+            .expect("new controller id should remain valid");
+    }
+
+    #[test]
+    fn attach_sync_falls_back_to_snapshot_when_requested_seq_is_outside_journal() {
+        let mut state = SupervisorState::new(PtySize::new(4, 40));
+        for index in 0..=TERMINAL_JOURNAL_MAX_EVENTS {
+            state.record_output(format!("line-{index}\n").as_bytes());
+        }
+        let (controller_tx, _controller_rx) = tokio_mpsc::unbounded_channel();
+
+        let (_controller_id, sync) = state.attach_sync(controller_tx, Some(42), Some(0));
+
+        assert_eq!(sync.base_seq, (TERMINAL_JOURNAL_MAX_EVENTS + 1) as u64);
+        assert!(matches!(
+            sync.frames.as_slice(),
+            [PtyTerminalFrame::Snapshot { base_seq, .. }]
+                if *base_seq == (TERMINAL_JOURNAL_MAX_EVENTS + 1) as u64
+        ));
+    }
+
+    #[test]
+    fn attach_sync_drops_queued_live_frames_already_covered_by_base_seq() {
+        let (controller_tx, mut controller_rx) = tokio_mpsc::unbounded_channel();
+        controller_tx
+            .send(SupervisorFrame::TerminalFrame {
+                frame: PtyTerminalFrame::Output {
+                    terminal_seq: 1,
+                    data: b"old".to_vec(),
+                },
+            })
+            .expect("test queue should accept old frame");
+        controller_tx
+            .send(SupervisorFrame::TerminalFrame {
+                frame: PtyTerminalFrame::Output {
+                    terminal_seq: 3,
+                    data: b"new".to_vec(),
+                },
+            })
+            .expect("test queue should accept new frame");
+
+        let delayed = drain_controller_frames_after_sync(&mut controller_rx, 2);
+
+        assert!(matches!(
+            delayed.as_slice(),
+            [SupervisorFrame::TerminalFrame {
+                frame: PtyTerminalFrame::Output {
+                    terminal_seq: 3,
+                    data,
+                },
+            }] if data == b"new"
+        ));
+        assert!(
+            controller_rx.try_recv().is_err(),
+            "drain should leave no covered frame in the controller queue"
         );
     }
 

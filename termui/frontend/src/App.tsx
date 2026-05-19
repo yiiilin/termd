@@ -219,6 +219,7 @@ export default function App() {
   const cursorRefreshTimerRef = useRef<number | undefined>(undefined);
   const terminalOutputQueueRef = useRef<TerminalOutputItem[]>([]);
   const terminalRenderAckRef = useRef<{ sessionId: UUID; lastTransportSeq: number; credit: number } | undefined>(undefined);
+  const lastRenderedTerminalSeqRef = useRef<Map<UUID, number>>(new Map());
   const terminalOutputResetVersionRef = useRef(0);
   const terminalOutputAppliedResetVersionRef = useRef(0);
   const terminalOutputResetWaitersRef = useRef<Map<number, () => void>>(new Map());
@@ -480,18 +481,26 @@ export default function App() {
     setTerminalResizeOwner(owned);
   }, []);
 
-  const clearTerminalOutput = useCallback(() => {
+  const discardPendingTerminalOutput = useCallback(() => {
     // 终端输出由 xterm 自己维护 scrollback；React 只保留尚未写入 xterm 的短队列。
     terminalOutputQueueRef.current = [];
     terminalRenderAckRef.current = undefined;
-    terminalOutputResetVersionRef.current += 1;
     if (terminalOutputFlushFrameRef.current !== undefined) {
       window.cancelAnimationFrame(terminalOutputFlushFrameRef.current);
       terminalOutputFlushFrameRef.current = undefined;
     }
+  }, []);
+
+  const clearTerminalOutput = useCallback(() => {
+    const currentSessionId = attachedSessionRef.current;
+    if (currentSessionId) {
+      lastRenderedTerminalSeqRef.current.delete(currentSessionId);
+    }
+    discardPendingTerminalOutput();
+    terminalOutputResetVersionRef.current += 1;
     setTerminalOutputResetVersion(terminalOutputResetVersionRef.current);
     return terminalOutputResetVersionRef.current;
-  }, []);
+  }, [discardPendingTerminalOutput]);
 
   const handleTerminalOutputResetApplied = useCallback((version: number) => {
     terminalOutputAppliedResetVersionRef.current = Math.max(
@@ -626,6 +635,9 @@ export default function App() {
     receiveLoopActiveRef.current = false;
     attachClientRef.current?.close();
     attachClientRef.current = undefined;
+    if (attachedSessionRef.current) {
+      lastRenderedTerminalSeqRef.current.delete(attachedSessionRef.current);
+    }
     attachedSessionRef.current = undefined;
     pendingResizeKeyRef.current = undefined;
     confirmedSessionSizesRef.current.clear();
@@ -677,6 +689,7 @@ export default function App() {
     reattachCurrentSessionOnOpenRef.current = false;
     userDetachedRef.current = false;
     setNewOutputSessionIds(new Set());
+    lastRenderedTerminalSeqRef.current.clear();
     setDaemonClients([]);
     setDaemonStatus(undefined);
     setDaemonCpuHistory([]);
@@ -1370,11 +1383,13 @@ export default function App() {
     void read();
   }, [enqueueTerminalOutput, markNewOutputIfBackground, markTerminalFrameRendered, setSafeError, updateTerminalResizeOwner]);
 
-  const scheduleAttachReconnect = useCallback((staleClient: DirectClient, caught: unknown) => {
+  const scheduleAttachReconnect = useCallback((staleClient: DirectClient, caught: unknown, options: { lastTerminalSeq?: number } = {}) => {
     const sessionId = attachedSessionRef.current ?? attachedSessionId ?? selectedSessionId;
     if (!sessionId || userDetachedRef.current || !isRetryableConnectionError(caught)) {
       return false;
     }
+    const lastTerminalSeq =
+      options.lastTerminalSeq ?? lastRenderedTerminalSeqRef.current.get(sessionId);
 
     const reconnectKey = `${activeServer?.server_id ?? "unknown"}:${sessionId}`;
     if (attachReconnectKeyRef.current !== reconnectKey) {
@@ -1386,6 +1401,7 @@ export default function App() {
     }
 
     closeAttachForReconnect(staleClient);
+    discardPendingTerminalOutput();
     setError(undefined);
 
     if (attachReconnectTimerRef.current !== undefined) {
@@ -1408,7 +1424,10 @@ export default function App() {
         let client: DirectClient | undefined;
         try {
           client = await authenticatedClient(ATTACH_CONNECTION_TIMEOUT_MS);
-          const attached = await client.attachSession(sessionId);
+          const attached = await client.attachSession(
+            sessionId,
+            lastTerminalSeq !== undefined ? { lastTerminalSeq } : {},
+          );
           if (userDetachedRef.current) {
             resetAttachReconnectState();
             client.close();
@@ -1430,12 +1449,12 @@ export default function App() {
           setSessions((current) => upsertAttachedSession(current, attached, sessionOrderRef.current));
           clearNewOutputMark(sessionId);
           setStatus("attached");
-          // 自动重连会拿到 daemon 重新发送的 screen snapshot；先等旧 xterm 清屏落地，
-          // 再消费新连接里的 snapshot，避免同一屏内容被追加成两份。
-          await waitForTerminalOutputResetApplied(clearTerminalOutput());
-          if (userDetachedRef.current || attachClientRef.current !== attachedClient) {
-            attachedClient.close();
-            return;
+          if (lastTerminalSeq === undefined) {
+            await waitForTerminalOutputResetApplied(clearTerminalOutput());
+            if (userDetachedRef.current || attachClientRef.current !== attachedClient) {
+              attachedClient.close();
+              return;
+            }
           }
           startReceiveLoop(attachedClient);
           updateTerminalResizeOwner(Boolean(attached.resize_owner));
@@ -1461,6 +1480,7 @@ export default function App() {
     clearNewOutputMark,
     clearTerminalOutput,
     closeAttachForReconnect,
+    discardPendingTerminalOutput,
     loadSessionFiles,
     loadSessionGit,
     refreshDaemonClients,
@@ -1474,13 +1494,29 @@ export default function App() {
 
   attachReconnectHandlerRef.current = scheduleAttachReconnect;
 
-  const handleTerminalResync = useCallback(() => {
+  const handleTerminalResync = useCallback((lastTerminalSeq?: number) => {
     const client = attachClientRef.current;
     if (!client) {
       return;
     }
-    scheduleAttachReconnect(client, new ProtocolClientError("terminal_resync", "terminal stream out of sync"));
+    const sessionId = attachedSessionRef.current;
+    if (sessionId && lastTerminalSeq !== undefined) {
+      lastRenderedTerminalSeqRef.current.set(sessionId, lastTerminalSeq);
+    }
+    scheduleAttachReconnect(
+      client,
+      new ProtocolClientError("terminal_resync", "terminal stream out of sync"),
+      { lastTerminalSeq },
+    );
   }, [scheduleAttachReconnect]);
+
+  const handleTerminalSeqRendered = useCallback((terminalSeq: number) => {
+    const sessionId = attachedSessionRef.current;
+    if (!sessionId) {
+      return;
+    }
+    lastRenderedTerminalSeqRef.current.set(sessionId, terminalSeq);
+  }, []);
 
   const handleAttach = useCallback(
     async (sessionId: UUID) => {
@@ -2756,6 +2792,7 @@ export default function App() {
                 registerOutputDrain={registerTerminalOutputDrain}
                 onOutputResetApplied={handleTerminalOutputResetApplied}
                 onTerminalResync={handleTerminalResync}
+                onTerminalSeqRendered={handleTerminalSeqRendered}
                 mobileShortcuts={preferences.mobileShortcuts}
                 onSearch={handleTerminalSearch}
                 onInput={handleTerminalInput}

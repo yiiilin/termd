@@ -53,6 +53,58 @@ fn read_session_until_contains(session: &mut dyn PtySession, needle: &[u8]) -> V
     read_with(needle, |buffer| session.read(buffer))
 }
 
+fn read_terminal_frame_until_contains(
+    runtime: &mut SessionRuntime<SupervisorPtyBackend>,
+    session_id: &str,
+    needle: &[u8],
+) -> PtyTerminalFrame {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut skipped = Vec::new();
+
+    while Instant::now() < deadline {
+        if let Some(frame) = runtime.read_terminal_frame(session_id).unwrap() {
+            if frame_contains(&frame, needle) {
+                return frame;
+            }
+            skipped.push(format!("{frame:?}"));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    panic!(
+        "timed out waiting for terminal frame containing {:?}; skipped frames: {skipped:?}",
+        String::from_utf8_lossy(needle)
+    );
+}
+
+fn frame_contains(frame: &PtyTerminalFrame, needle: &[u8]) -> bool {
+    match frame {
+        PtyTerminalFrame::Snapshot { data, .. } | PtyTerminalFrame::Output { data, .. } => {
+            data.windows(needle.len()).any(|window| window == needle)
+        }
+        PtyTerminalFrame::Resize { .. } | PtyTerminalFrame::Exit { .. } => false,
+    }
+}
+
+fn snapshot_base_seq_containing(frames: &[PtyTerminalFrame], needle: &[u8]) -> u64 {
+    frames
+        .iter()
+        .find_map(|frame| match frame {
+            PtyTerminalFrame::Snapshot { base_seq, data, .. }
+                if data.windows(needle.len()).any(|window| window == needle) =>
+            {
+                Some(*base_seq)
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "expected snapshot containing {:?}, got {frames:?}",
+                String::from_utf8_lossy(needle)
+            )
+        })
+}
+
 fn read_with<E>(needle: &[u8], mut read_once: impl FnMut(&mut [u8]) -> Result<usize, E>) -> Vec<u8>
 where
     E: std::fmt::Debug,
@@ -406,6 +458,106 @@ fn supervisor_terminal_snapshot_preserves_active_sgr_style_after_reattach() {
     );
 
     runtime.close(session_id).unwrap();
+}
+
+#[test]
+fn supervisor_attach_sync_returns_tail_from_journal_without_snapshot() {
+    let state_path = temp_state_path("runtime-tail-sync.json");
+    let binary_path = PathBuf::from(env!("CARGO_BIN_EXE_termd"));
+    let session_id = "00000000-0000-0000-0000-000000000115";
+
+    let mut runtime = SessionRuntime::new(SupervisorPtyBackend::with_binary_and_state_path(
+        &binary_path,
+        &state_path,
+    ));
+    runtime
+        .create_session_with_id(
+            session_id,
+            CommandSpec::new("sh").args(["-lc", "printf first-sync; cat"]),
+            TerminalSize::cells(24, 80),
+        )
+        .unwrap();
+    runtime.attach(session_id, "dev-a").unwrap();
+
+    let first_snapshot = runtime
+        .terminal_snapshot(session_id, None)
+        .expect("initial AttachSync should return snapshot");
+    let first_seq = snapshot_base_seq_containing(&first_snapshot, b"first-sync");
+    runtime
+        .write_input(session_id, "dev-a", b"second-sync\n")
+        .unwrap();
+    let second = read_terminal_frame_until_contains(&mut runtime, session_id, b"second-sync");
+    let second_seq = second
+        .terminal_seq()
+        .expect("tail output should have a session terminal seq");
+
+    let tail = runtime
+        .terminal_snapshot(session_id, Some(first_seq))
+        .expect("AttachSync should return terminal tail");
+
+    assert!(
+        tail.iter()
+            .all(|frame| !matches!(frame, PtyTerminalFrame::Snapshot { .. })),
+        "journal-covered AttachSync must return tail frames, not a snapshot: {tail:?}"
+    );
+    assert!(
+        tail.iter()
+            .all(|frame| frame.terminal_seq().is_none_or(|seq| seq > first_seq)),
+        "tail must not replay frames already covered by last_terminal_seq={first_seq}: {tail:?}"
+    );
+    assert!(
+        tail.iter()
+            .any(|frame| frame.terminal_seq() == Some(second_seq)
+                && frame_contains(frame, b"second-sync")),
+        "tail should include the output after the rendered seq: {tail:?}"
+    );
+
+    runtime.close(session_id).unwrap();
+}
+
+#[test]
+fn supervisor_reconnect_attach_sync_does_not_replay_rendered_terminal_frame() {
+    let state_path = temp_state_path("runtime-reconnect-terminal-sync.json");
+    let binary_path = PathBuf::from(env!("CARGO_BIN_EXE_termd"));
+    let session_id = "00000000-0000-0000-0000-000000000116";
+
+    let mut runtime = SessionRuntime::new(SupervisorPtyBackend::with_binary_and_state_path(
+        &binary_path,
+        &state_path,
+    ));
+    runtime
+        .create_session_with_id(
+            session_id,
+            CommandSpec::new("sh").args(["-lc", "printf rendered-before-reconnect; sleep 60"]),
+            TerminalSize::cells(24, 80),
+        )
+        .unwrap();
+    runtime.attach(session_id, "dev-a").unwrap();
+    let rendered_snapshot = runtime
+        .terminal_snapshot(session_id, None)
+        .expect("initial AttachSync should return snapshot");
+    let rendered_seq =
+        snapshot_base_seq_containing(&rendered_snapshot, b"rendered-before-reconnect");
+    let persisted = runtime.persisted_sessions();
+    assert_eq!(persisted.len(), 1);
+    drop(runtime);
+
+    let mut restarted = SessionRuntime::new(SupervisorPtyBackend::with_binary_and_state_path(
+        &binary_path,
+        &state_path,
+    ));
+    restarted.reconnect_session(&persisted[0]).unwrap();
+    restarted.attach(session_id, "dev-b").unwrap();
+
+    let sync = restarted
+        .terminal_snapshot(session_id, Some(rendered_seq))
+        .expect("reconnected daemon should AttachSync with last rendered seq");
+    assert!(
+        sync.is_empty(),
+        "reconnect AttachSync should not replay already rendered seq {rendered_seq}: {sync:?}"
+    );
+
+    restarted.close(session_id).unwrap();
 }
 
 #[test]

@@ -116,7 +116,7 @@ export class MockDaemon {
   public readonly createdCommands: string[][] = [];
   public readonly sessionDataMessages: string[] = [];
   public readonly attachedSessions: UUID[] = [];
-  public readonly attachRequests: Array<{ session_id: UUID; watch_updates?: boolean }> = [];
+  public readonly attachRequests: Array<{ session_id: UUID; watch_updates?: boolean; last_terminal_seq?: number | null }> = [];
   public readonly sessionCursorUpdates: SessionCursorPayload[] = [];
   public readonly sessionResizes: Array<{ session_id: UUID; size: TerminalSize }> = [];
   public readonly sessionRenames: Array<{ session_id: UUID; name: string }> = [];
@@ -612,7 +612,7 @@ export class MockDaemon {
         this.handleSessionCreate(connection, inner.payload as SessionCreatePayload);
         return;
       case "session_attach": {
-        const payload = inner.payload as { session_id: UUID; watch_updates?: boolean };
+        const payload = inner.payload as { session_id: UUID; watch_updates?: boolean; last_terminal_seq?: number | null };
         const watchUpdates = payload.watch_updates ?? true;
         const session = this.options.sessions.find((candidate) => candidate.session_id === payload.session_id);
         this.attachRequests.push(payload);

@@ -271,6 +271,31 @@ describe("DirectClient", () => {
     expect(daemon.attachRequests.at(-1)).toEqual({ session_id: attached.session_id, watch_updates: false });
   });
 
+  it("terminal attach 会把已渲染的 session terminal_seq 作为 last_terminal_seq 发送", async () => {
+    const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000314");
+    const pairClient = await connectDevice(device.device_id);
+    const accepted = await pairClient.pair("secret-token", device.device_public_key);
+    pairClient.close();
+
+    const client = await connectDevice(device.device_id);
+    await client.authenticate(device, {
+      server_id: accepted.server_id,
+      daemon_public_key: accepted.daemon_public_key,
+      url: daemon.url,
+      paired_at_ms: 1710000000000,
+    });
+
+    const list = await client.listSessions();
+    const attached = await client.attachSession(list.sessions[0].session_id, { lastTerminalSeq: 10 });
+    client.close();
+
+    expect(daemon.attachRequests.at(-1)).toEqual({
+      session_id: attached.session_id,
+      watch_updates: true,
+      last_terminal_seq: 10,
+    });
+  });
+
   it("可以通过 ping/pong 测量 daemon 网络延迟", async () => {
     const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000308");
     const pairClient = await connectDevice(device.device_id);

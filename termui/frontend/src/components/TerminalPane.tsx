@@ -85,7 +85,8 @@ interface TerminalPaneProps {
   takeOutput: () => TerminalOutputItem[];
   registerOutputDrain: (drain: () => void) => () => void;
   onOutputResetApplied?: (version: number) => void;
-  onTerminalResync?: () => void;
+  onTerminalResync?: (lastTerminalSeq?: number) => void;
+  onTerminalSeqRendered?: (terminalSeq: number) => void;
   mobileShortcuts?: BrowserMobileShortcut[];
   onSearch?: (query: string) => Promise<SessionSearchResultPayload>;
   onInput: (data: string) => void;
@@ -106,6 +107,8 @@ export function TerminalPane(props: TerminalPaneProps) {
   const onInputRef = useRef(props.onInput);
   const onResizeRef = useRef(props.onResize);
   const onCursorChangeRef = useRef(props.onCursorChange);
+  const onTerminalResyncRef = useRef(props.onTerminalResync);
+  const onTerminalSeqRenderedRef = useRef(props.onTerminalSeqRendered);
   const takeOutputRef = useRef(props.takeOutput);
   const sessionSizeRef = useRef(props.sessionSize);
   const mobileInputModeRef = useRef(Boolean(props.mobileInputMode));
@@ -295,11 +298,13 @@ export function TerminalPane(props: TerminalPaneProps) {
     onInputRef.current = props.onInput;
     onResizeRef.current = props.onResize;
     onCursorChangeRef.current = props.onCursorChange;
+    onTerminalResyncRef.current = props.onTerminalResync;
+    onTerminalSeqRenderedRef.current = props.onTerminalSeqRendered;
     takeOutputRef.current = props.takeOutput;
     sessionSizeRef.current = props.sessionSize;
     mobileInputModeRef.current = Boolean(props.mobileInputMode);
     resizeEnabledRef.current = Boolean(props.resizeEnabled);
-  }, [props.mobileInputMode, props.onCursorChange, props.onInput, props.onResize, props.resizeEnabled, props.sessionSize, props.takeOutput]);
+  }, [props.mobileInputMode, props.onCursorChange, props.onInput, props.onResize, props.onTerminalResync, props.onTerminalSeqRendered, props.resizeEnabled, props.sessionSize, props.takeOutput]);
 
   useEffect(() => props.registerOutputDrain(() => drainOutputRef.current()), [props.registerOutputDrain]);
 
@@ -1084,8 +1089,10 @@ export function TerminalPane(props: TerminalPaneProps) {
       activeWriteRef.current = undefined;
       if (item.kind === "snapshot") {
         lastTerminalSeqRef.current = item.baseSeq;
+        onTerminalSeqRenderedRef.current?.(item.baseSeq);
       } else if (item.kind === "output" || item.kind === "resize" || item.kind === "exit") {
         lastTerminalSeqRef.current = item.terminalSeq;
+        onTerminalSeqRenderedRef.current?.(item.terminalSeq);
       }
       item.onRendered?.();
     };
@@ -1104,7 +1111,7 @@ export function TerminalPane(props: TerminalPaneProps) {
         const expected = (lastTerminalSeqRef.current ?? -1) + 1;
         if (lastTerminalSeqRef.current === undefined || item.terminalSeq !== expected) {
           // 中文注释：terminal_seq 缺口说明 snapshot/tail 已经不连续，必须重新 attach 获取权威 snapshot。
-          props.onTerminalResync?.();
+          onTerminalResyncRef.current?.(lastTerminalSeqRef.current);
           item.onRendered?.();
           activeWriteRef.current = undefined;
           return false;

@@ -5458,6 +5458,7 @@ mod tests {
         outputs: VecDeque<Vec<u8>>,
         outputs_by_session: HashMap<String, VecDeque<Vec<u8>>>,
         terminal_seq_by_session: HashMap<String, u64>,
+        terminal_journal_by_session: HashMap<String, Vec<PtyTerminalFrame>>,
         terminal_frames_by_session: HashMap<String, VecDeque<PtyTerminalFrame>>,
         cwd_by_session: HashMap<String, PathBuf>,
         writes: Vec<Vec<u8>>,
@@ -5488,6 +5489,25 @@ mod tests {
                 .unwrap()
                 .cwd_by_session
                 .insert(session_id.0.to_string(), cwd.into());
+        }
+
+        fn push_terminal_journal_frame_for_session(
+            &self,
+            session_id: SessionId,
+            frame: PtyTerminalFrame,
+        ) {
+            let mut state = self.state.lock().unwrap();
+            let terminal_seq = frame.terminal_seq().unwrap_or(0);
+            state
+                .terminal_seq_by_session
+                .entry(session_id.0.to_string())
+                .and_modify(|current| *current = (*current).max(terminal_seq))
+                .or_insert(terminal_seq);
+            state
+                .terminal_journal_by_session
+                .entry(session_id.0.to_string())
+                .or_default()
+                .push(frame);
         }
 
         fn writes(&self) -> Vec<Vec<u8>> {
@@ -5593,6 +5613,14 @@ mod tests {
             };
             let mut state = self.state.lock().unwrap();
             let seq = next_fake_terminal_seq(&mut state, session_id);
+            push_fake_terminal_journal(
+                &mut state,
+                session_id,
+                PtyTerminalFrame::Resize {
+                    terminal_seq: seq,
+                    size,
+                },
+            );
             // fake PTY 也把 resize 放进 terminal frame 队列，确保协议层测试能覆盖
             // “resize 也是 session 级 terminal_seq 事件”这个不变量。
             state
@@ -5616,20 +5644,45 @@ mod tests {
 
         fn terminal_snapshot(
             &mut self,
-            _last_terminal_seq: Option<u64>,
+            last_terminal_seq: Option<u64>,
         ) -> PtyResult<Vec<PtyTerminalFrame>> {
-            let base_seq = self
-                .session_id
-                .as_ref()
-                .and_then(|session_id| {
-                    self.state
-                        .lock()
-                        .unwrap()
-                        .terminal_seq_by_session
-                        .get(session_id)
-                        .copied()
-                })
+            let Some(session_id) = &self.session_id else {
+                return Ok(vec![PtyTerminalFrame::Snapshot {
+                    base_seq: 0,
+                    size: PtySize::new(24, 80),
+                    data: Vec::new(),
+                }]);
+            };
+            let state = self.state.lock().unwrap();
+            let base_seq = state
+                .terminal_seq_by_session
+                .get(session_id)
+                .copied()
                 .unwrap_or(0);
+            if let Some(last_terminal_seq) = last_terminal_seq {
+                if last_terminal_seq == base_seq {
+                    return Ok(Vec::new());
+                }
+                if let Some(journal) = state.terminal_journal_by_session.get(session_id) {
+                    let journal_base_seq = journal
+                        .first()
+                        .and_then(PtyTerminalFrame::terminal_seq)
+                        .unwrap_or(base_seq.saturating_add(1));
+                    if last_terminal_seq < base_seq
+                        && last_terminal_seq.saturating_add(1) >= journal_base_seq
+                    {
+                        return Ok(journal
+                            .iter()
+                            .filter(|frame| {
+                                frame
+                                    .terminal_seq()
+                                    .is_some_and(|seq| seq > last_terminal_seq)
+                            })
+                            .cloned()
+                            .collect());
+                    }
+                }
+            }
             Ok(vec![PtyTerminalFrame::Snapshot {
                 base_seq,
                 size: PtySize::new(24, 80),
@@ -5649,10 +5702,12 @@ mod tests {
                 if let Some(outputs) = state.outputs_by_session.get_mut(session_id) {
                     if let Some(data) = pop_fake_output_queue(outputs, 16 * 1024) {
                         let seq = next_fake_terminal_seq(&mut state, session_id);
-                        return Ok(Some(PtyTerminalFrame::Output {
+                        let frame = PtyTerminalFrame::Output {
                             terminal_seq: seq,
                             data,
-                        }));
+                        };
+                        push_fake_terminal_journal(&mut state, session_id, frame.clone());
+                        return Ok(Some(frame));
                     }
                 }
             }
@@ -5738,6 +5793,20 @@ mod tests {
             .or_insert(0);
         *next = next.saturating_add(1);
         *next
+    }
+
+    fn push_fake_terminal_journal(
+        state: &mut FakePtyState,
+        session_id: &str,
+        frame: PtyTerminalFrame,
+    ) {
+        // 中文注释：fake backend 的 journal 模拟 supervisor 的 raw event log，
+        // 用于验证 protocol 层正确透传 last_terminal_seq，而不是总是拿 snapshot。
+        state
+            .terminal_journal_by_session
+            .entry(session_id.to_owned())
+            .or_default()
+            .push(frame);
     }
 
     fn protocol() -> (
@@ -6379,6 +6448,210 @@ mod tests {
                 );
             }
             other => panic!("expected output terminal frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn packet_terminal_attach_uses_last_terminal_seq_for_tail() {
+        let (mut protocol, backend) = protocol();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let (_, mut device_session, _) =
+            open_packet_e2ee(&mut protocol, &mut connection, device_id);
+        let token = protocol
+            .issue_pairing_token(current_unix_timestamp_millis())
+            .unwrap()
+            .token()
+            .clone();
+        let pair_responses = send_encrypted_packet(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            ProtocolPacket::request(
+                PacketRequestId::new(),
+                METHOD_PAIR_REQUEST,
+                serde_json::to_value(PairRequestPayload {
+                    device_id,
+                    device_public_key: PublicKey("device-public-key".to_owned()),
+                    token,
+                    nonce: nonce(),
+                    timestamp_ms: current_unix_timestamp_millis(),
+                })
+                .unwrap(),
+            ),
+        );
+        let _ = decrypt_first_packet(&mut device_session, pair_responses);
+
+        let create_responses = send_encrypted_packet(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            ProtocolPacket::request(
+                PacketRequestId::new(),
+                METHOD_SESSION_CREATE,
+                serde_json::to_value(SessionCreatePayload {
+                    command: vec!["sh".to_owned()],
+                    size: TerminalSize::new(24, 80),
+                })
+                .unwrap(),
+            ),
+        );
+        let created_packet = decrypt_first_packet(&mut device_session, create_responses);
+        let created: SessionCreatedPayload = decode_payload(created_packet.payload).unwrap();
+        backend.push_terminal_journal_frame_for_session(
+            created.session_id,
+            PtyTerminalFrame::Output {
+                terminal_seq: 1,
+                data: b"already-rendered".to_vec(),
+            },
+        );
+        backend.push_terminal_journal_frame_for_session(
+            created.session_id,
+            PtyTerminalFrame::Output {
+                terminal_seq: 2,
+                data: b"tail-only".to_vec(),
+            },
+        );
+
+        let stream_id = PacketStreamId::new();
+        let attach_responses = send_encrypted_packet(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            ProtocolPacket::stream_open(
+                PacketRequestId::new(),
+                stream_id,
+                METHOD_TERMINAL_ATTACH,
+                4,
+                serde_json::to_value(SessionAttachPayload {
+                    session_id: created.session_id,
+                    watch_updates: true,
+                    last_terminal_seq: Some(1),
+                })
+                .unwrap(),
+            ),
+        );
+        let attached_packet = decrypt_first_packet(&mut device_session, attach_responses);
+        assert_eq!(attached_packet.kind, PacketKind::Response);
+        assert_eq!(attached_packet.stream_id, Some(stream_id));
+
+        let output_packets = decrypt_packets(
+            &mut device_session,
+            connection.read_session_output(&mut protocol, created.session_id, 1024),
+        );
+        assert_eq!(output_packets.len(), 1);
+        let tail: TerminalFramePayload = decode_payload(output_packets[0].payload.clone()).unwrap();
+        match tail {
+            TerminalFramePayload::Output {
+                session_id,
+                terminal_seq,
+                data_base64,
+            } => {
+                assert_eq!(session_id, created.session_id);
+                assert_eq!(terminal_seq, 2);
+                assert_eq!(
+                    general_purpose::STANDARD.decode(data_base64).unwrap(),
+                    b"tail-only"
+                );
+            }
+            other => panic!("expected attach tail output, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn packet_terminal_attach_falls_back_to_snapshot_when_tail_window_is_missing() {
+        let (mut protocol, backend) = protocol();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let (_, mut device_session, _) =
+            open_packet_e2ee(&mut protocol, &mut connection, device_id);
+        let token = protocol
+            .issue_pairing_token(current_unix_timestamp_millis())
+            .unwrap()
+            .token()
+            .clone();
+        let pair_responses = send_encrypted_packet(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            ProtocolPacket::request(
+                PacketRequestId::new(),
+                METHOD_PAIR_REQUEST,
+                serde_json::to_value(PairRequestPayload {
+                    device_id,
+                    device_public_key: PublicKey("device-public-key".to_owned()),
+                    token,
+                    nonce: nonce(),
+                    timestamp_ms: current_unix_timestamp_millis(),
+                })
+                .unwrap(),
+            ),
+        );
+        let _ = decrypt_first_packet(&mut device_session, pair_responses);
+
+        let create_responses = send_encrypted_packet(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            ProtocolPacket::request(
+                PacketRequestId::new(),
+                METHOD_SESSION_CREATE,
+                serde_json::to_value(SessionCreatePayload {
+                    command: vec!["sh".to_owned()],
+                    size: TerminalSize::new(24, 80),
+                })
+                .unwrap(),
+            ),
+        );
+        let created_packet = decrypt_first_packet(&mut device_session, create_responses);
+        let created: SessionCreatedPayload = decode_payload(created_packet.payload).unwrap();
+        backend.push_terminal_journal_frame_for_session(
+            created.session_id,
+            PtyTerminalFrame::Output {
+                terminal_seq: 2,
+                data: b"journal-starts-after-gap".to_vec(),
+            },
+        );
+
+        let stream_id = PacketStreamId::new();
+        let attach_responses = send_encrypted_packet(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            ProtocolPacket::stream_open(
+                PacketRequestId::new(),
+                stream_id,
+                METHOD_TERMINAL_ATTACH,
+                4,
+                serde_json::to_value(SessionAttachPayload {
+                    session_id: created.session_id,
+                    watch_updates: true,
+                    last_terminal_seq: Some(0),
+                })
+                .unwrap(),
+            ),
+        );
+        let attached_packet = decrypt_first_packet(&mut device_session, attach_responses);
+        assert_eq!(attached_packet.kind, PacketKind::Response);
+        assert_eq!(attached_packet.stream_id, Some(stream_id));
+
+        let output_packets = decrypt_packets(
+            &mut device_session,
+            connection.read_session_output(&mut protocol, created.session_id, 1024),
+        );
+        assert_eq!(output_packets.len(), 1);
+        let snapshot: TerminalFramePayload =
+            decode_payload(output_packets[0].payload.clone()).unwrap();
+        match snapshot {
+            TerminalFramePayload::Snapshot {
+                session_id,
+                base_seq,
+                ..
+            } => {
+                assert_eq!(session_id, created.session_id);
+                assert_eq!(base_seq, 2);
+            }
+            other => panic!("expected fallback snapshot, got {other:?}"),
         }
     }
 
