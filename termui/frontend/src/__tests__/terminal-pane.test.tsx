@@ -2,6 +2,8 @@ import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { describe, expect, it, vi } from "vitest";
 import { TerminalPane, type TerminalOutputItem } from "../components/TerminalPane";
 
+const animationFrameMs = 16;
+
 function fireTouchPointer(
   target: HTMLElement,
   type: "pointerdown" | "pointermove" | "pointerup" | "pointercancel",
@@ -176,6 +178,95 @@ describe("TerminalPane terminal sequence rendering", () => {
     expect(stats?.writes ?? 0).toBeLessThan(10);
     expect(onTerminalSeqRendered.mock.calls.at(-1)).toEqual([32]);
     expect(onTerminalSeqRendered).toHaveBeenCalledTimes(33);
+  });
+
+  it("切换 session 时旧的异步 write 回调不能阻塞或确认新 session", async () => {
+    vi.useFakeTimers();
+    try {
+      (globalThis as { __TERMD_TEST_DEFER_XTERM_RENDER_UNTIL_WRITE_CALLBACK__?: boolean })
+        .__TERMD_TEST_DEFER_XTERM_RENDER_UNTIL_WRITE_CALLBACK__ = true;
+      (globalThis as { __TERMD_TEST_SERIALIZE_XTERM_WRITES__?: boolean })
+        .__TERMD_TEST_SERIALIZE_XTERM_WRITES__ = true;
+      const encoder = new TextEncoder();
+      let queue: TerminalOutputItem[] = [
+        { kind: "snapshot", bytes: encoder.encode("old-session\n"), baseSeq: 10 },
+      ];
+      let drainOutput: (() => void) | undefined;
+      const takeOutput = vi.fn(() => queue.splice(0));
+      const registerOutputDrain = vi.fn((drain: () => void) => {
+        drainOutput = drain;
+        drain();
+        return () => undefined;
+      });
+      const onTerminalSeqRendered = vi.fn();
+      const onOutputResetApplied = vi.fn();
+
+      const { rerender } = render(
+        <TerminalPane
+          attached
+          sessionSize={{ rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 }}
+          resizeEnabled
+          outputResetVersion={0}
+          takeOutput={takeOutput}
+          registerOutputDrain={registerOutputDrain}
+          onOutputResetApplied={onOutputResetApplied}
+          onTerminalSeqRendered={onTerminalSeqRendered}
+          onInput={vi.fn()}
+          onResize={vi.fn()}
+          onCursorChange={vi.fn()}
+        />,
+      );
+
+      act(() => {
+        vi.advanceTimersByTime(animationFrameMs);
+      });
+      expect((globalThis as { __TERMD_TEST_XTERM_STATS__?: { writes: number } }).__TERMD_TEST_XTERM_STATS__?.writes).toBe(1);
+      expect(onTerminalSeqRendered).not.toHaveBeenCalled();
+
+      queue = [
+        { kind: "snapshot", bytes: encoder.encode("new-session\n"), baseSeq: 30 },
+      ];
+      rerender(
+        <TerminalPane
+          attached
+          sessionSize={{ rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 }}
+          resizeEnabled
+          outputResetVersion={1}
+          takeOutput={takeOutput}
+          registerOutputDrain={registerOutputDrain}
+          onOutputResetApplied={onOutputResetApplied}
+          onTerminalSeqRendered={onTerminalSeqRendered}
+          onInput={vi.fn()}
+          onResize={vi.fn()}
+          onCursorChange={vi.fn()}
+        />,
+      );
+
+      expect(onOutputResetApplied).toHaveBeenCalledWith(1);
+      act(() => {
+        drainOutput?.();
+        vi.advanceTimersByTime(animationFrameMs);
+      });
+
+      // 中文注释：旧 session 的 write 回调尚未返回时，新 session 的 snapshot 也必须能开始写入；
+      // 否则用户快速切 session 会被旧的大量输出拖住，表现为整个 Web 延迟数秒。
+      expect((globalThis as { __TERMD_TEST_XTERM_STATS__?: { writes: number } }).__TERMD_TEST_XTERM_STATS__?.writes).toBe(2);
+
+      act(() => {
+        vi.advanceTimersByTime(animationFrameMs * 6);
+      });
+
+      expect(onTerminalSeqRendered.mock.calls).toEqual([[30]]);
+      const xterm = screen.getByTestId("terminal-pane").querySelector<HTMLElement>(".xterm");
+      act(() => {
+        // 中文注释：TerminalPane 在 write callback 之后再排一帧 refresh；这里单独推进，确认新实例完成绘制。
+        vi.advanceTimersByTime(animationFrameMs);
+      });
+      expect(xterm?.dataset.buffer).toContain("new-session");
+      expect(xterm?.dataset.buffer).not.toContain("old-session");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

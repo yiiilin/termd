@@ -235,6 +235,10 @@ function visibleSessionNames(): string[] {
     .filter(Boolean);
 }
 
+function selectedSessionName(): string | undefined {
+  return document.querySelector<HTMLElement>(".session-row.selected strong")?.textContent?.trim();
+}
+
 function resetXtermStats(): { writes: number; refreshes: number; writtenBytes: number } {
   const scope = globalThis as { __TERMD_TEST_XTERM_STATS__?: { writes: number; refreshes: number; writtenBytes: number } };
   scope.__TERMD_TEST_XTERM_STATS__ = { writes: 0, refreshes: 0, writtenBytes: 0 };
@@ -740,6 +744,50 @@ describe("termui web 工作台", () => {
     await new Promise((resolve) => window.setTimeout(resolve, 60));
 
     expect(visibleSessionNames()).toEqual(["shell", "work"]);
+  });
+
+  it("迟到的 session list 刷新不能把刚切换的 session 选中态改回第一行", async () => {
+    const user = userEvent.setup();
+    const alphaSession = {
+      session_id: "00000000-0000-0000-0000-000000000411",
+      name: "alpha",
+      state: "running",
+      size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+      created_at_ms: 3000,
+    } as const;
+    const betaSession = {
+      session_id: "00000000-0000-0000-0000-000000000412",
+      name: "beta",
+      state: "running",
+      size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+      created_at_ms: 2000,
+    } as const;
+    const gammaSession = {
+      session_id: "00000000-0000-0000-0000-000000000413",
+      name: "gamma",
+      state: "running",
+      size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+      created_at_ms: 1000,
+    } as const;
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [alphaSession, betaSession, gammaSession],
+      attachOutput: "attached-ready\n",
+    });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession("alpha");
+    expect(selectedSessionName()).toBe("alpha");
+
+    daemon.queueSessionListResponse([alphaSession, betaSession, gammaSession], 120);
+    await user.click(screen.getByRole("button", { name: "Refresh" }));
+    await clickSessionCard(user, "gamma");
+    await waitFor(() => expect(selectedSessionName()).toBe("gamma"));
+    await new Promise((resolve) => window.setTimeout(resolve, 180));
+
+    expect(selectedSessionName()).toBe("gamma");
   });
 
   it("持续输出时合并写入 xterm，并且不为每个输出刷新布局", async () => {

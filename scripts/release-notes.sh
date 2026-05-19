@@ -12,6 +12,22 @@ version="${1:-}"
 }
 
 case "$version" in
+  0.3.3)
+    cat <<'EOF'
+termd 0.3.3
+
+用户可见变化:
+- 修复 Web 工作台频繁快速切换多个 session 后，迟到的 session list 刷新把选中态改回第一行或旧 session，导致用户点击其他 session 后马上跳回原 session 的问题。
+- 点击 session 后会立即更新左侧列表选中态；真实 attach 完成后再切换 xterm 数据流，慢 attach、后台刷新或手动 Refresh 不再覆盖用户刚做出的选择。
+- 切换 session 时 Web xterm 会随输出 reset 版本重建实例，并忽略旧实例迟到的 write callback；旧 session 的大量输出不再阻塞新 session 首屏，也不会把旧输出确认到新 session。
+- 新增快速切 session / 迟到刷新回归测试，以及旧 xterm 异步 write callback 不能阻塞新 session 的回归测试。
+- direct daemon、真实 relay、桌面浏览器和移动端浏览器路径都经过 smoke 验证。
+
+兼容性:
+- supervisor 兼容版本未变化，仍为 `0.3.1`；从 0.3.2 更新到 0.3.3 不应终止或清空已有 live session supervisor。
+- packet protocol version 仍为 3；本次主要是 Web UI session 选择态与 xterm 切换稳定性修复。daemon、Web UI、termctl 和 relay 可同步升级到 0.3.3，relay 仍是 dumb pipe，不解密也不解析业务内容。
+EOF
+    ;;
   0.3.2)
     cat <<'EOF'
 termd 0.3.2

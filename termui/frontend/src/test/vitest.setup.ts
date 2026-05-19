@@ -18,6 +18,8 @@ afterEach(() => {
     .__TERMD_TEST_FIT_DIMENSIONS__;
   delete (globalThis as { __TERMD_TEST_DEFER_XTERM_RENDER_UNTIL_WRITE_CALLBACK__?: boolean })
     .__TERMD_TEST_DEFER_XTERM_RENDER_UNTIL_WRITE_CALLBACK__;
+  delete (globalThis as { __TERMD_TEST_SERIALIZE_XTERM_WRITES__?: boolean })
+    .__TERMD_TEST_SERIALIZE_XTERM_WRITES__;
   delete (globalThis as { __TERMD_TEST_XTERM_STATS__?: { writes: number; refreshes: number; writtenBytes: number } })
     .__TERMD_TEST_XTERM_STATS__;
   delete (globalThis as { __TERMD_TEST_XTERM__?: { select: (text: string) => void } }).__TERMD_TEST_XTERM__;
@@ -43,6 +45,8 @@ vi.mock("@xterm/xterm", () => {
     private terminalOptions: Record<string, unknown>;
     private pendingRender = "";
     private pendingRenderReady = false;
+    private serializedWriteInFlight = false;
+    private serializedWriteQueue: Array<{ data: string | Uint8Array; callback?: () => void }> = [];
     private selection = "";
     public buffer = { active: { cursorY: 0, cursorX: 0, viewportY: 0, baseY: 0 } };
     public cols = 80;
@@ -92,6 +96,31 @@ vi.mock("@xterm/xterm", () => {
     }
 
     write(data: string | Uint8Array, callback?: () => void) {
+      const serializeWrites = Boolean(
+        (globalThis as { __TERMD_TEST_SERIALIZE_XTERM_WRITES__?: boolean })
+          .__TERMD_TEST_SERIALIZE_XTERM_WRITES__,
+      );
+      if (serializeWrites && this.serializedWriteInFlight) {
+        this.serializedWriteQueue.push({ data, callback });
+        return;
+      }
+      if (serializeWrites) {
+        this.serializedWriteInFlight = true;
+      }
+      this.processWrite(data, () => {
+        callback?.();
+        if (!serializeWrites) {
+          return;
+        }
+        this.serializedWriteInFlight = false;
+        const next = this.serializedWriteQueue.shift();
+        if (next) {
+          this.write(next.data, next.callback);
+        }
+      });
+    }
+
+    private processWrite(data: string | Uint8Array, callback?: () => void) {
       const text = typeof data === "string" ? data : textDecoder.decode(data);
       const stats = xtermStats();
       stats.writes += 1;

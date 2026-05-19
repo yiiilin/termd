@@ -225,6 +225,7 @@ export default function App() {
   const terminalOutputResetWaitersRef = useRef<Map<number, () => void>>(new Map());
   const terminalOutputFlushFrameRef = useRef<number | undefined>(undefined);
   const terminalOutputDrainRef = useRef<(() => void) | undefined>(undefined);
+  const selectedSessionIdRef = useRef<UUID | undefined>(undefined);
   const connectionAutoRetryTimerRef = useRef<number | undefined>(undefined);
   const connectionAutoRetryKeyRef = useRef<string | undefined>(undefined);
   const connectionAutoRetryAttemptsRef = useRef(0);
@@ -244,6 +245,11 @@ export default function App() {
   const effectiveTheme = resolveTheme(preferences.theme, systemTheme);
   const effectiveLocale = resolveLocale(preferences.language);
   const t = useMemo(() => createTranslator(effectiveLocale), [effectiveLocale]);
+
+  const selectSession = useCallback((sessionId: UUID | undefined) => {
+    selectedSessionIdRef.current = sessionId;
+    setSelectedSessionId(sessionId);
+  }, []);
 
   useEffect(() => {
     sessionFilesFollowTerminalCwdRef.current = sessionFilesFollowTerminalCwd;
@@ -661,9 +667,9 @@ export default function App() {
     userDetachedRef.current = true;
     autoAttachAttemptedSessionRef.current = undefined;
     disconnectAttach();
-    setSelectedSessionId(undefined);
+    selectSession(undefined);
     setStatus("ready");
-  }, [disconnectAttach]);
+  }, [disconnectAttach, selectSession]);
 
   useEffect(() => {
     if (activeSurface !== "admin" || !attachClientRef.current) {
@@ -698,7 +704,7 @@ export default function App() {
     setDaemonNetworkLatencyMs(undefined);
     daemonNetworkSampleRef.current = undefined;
     setDaemonStatusError(undefined);
-    setSelectedSessionId(undefined);
+    selectSession(undefined);
     renamingSessionIdRef.current = undefined;
     setRenamingSessionId(undefined);
     setRenameDraft("");
@@ -706,7 +712,7 @@ export default function App() {
     clearTerminalOutput();
     clearSessionFiles();
     autoCheckedServerRef.current = undefined;
-  }, [clearSessionFiles, clearTerminalOutput]);
+  }, [clearSessionFiles, clearTerminalOutput, selectSession]);
 
   const handleStartDaemonRename = useCallback(
     (serverId: UUID) => {
@@ -827,7 +833,7 @@ export default function App() {
       setDaemonNetworkLatencyMs(undefined);
       daemonNetworkSampleRef.current = undefined;
       setDaemonStatusError(undefined);
-      setSelectedSessionId(undefined);
+      selectSession(undefined);
       renamingSessionIdRef.current = undefined;
       setRenamingSessionId(undefined);
       setRenameDraft("");
@@ -846,7 +852,7 @@ export default function App() {
       setPairingToken("");
       setSafeError(caught);
     }
-  }, [activeServer, clearTerminalOutput, disconnectAttach, pairingToken, setSafeError, url]);
+  }, [activeServer, clearTerminalOutput, disconnectAttach, pairingToken, selectSession, setSafeError, url]);
 
   const handleQrDetected = useCallback(
     (value: string) => {
@@ -904,7 +910,7 @@ export default function App() {
       setDaemonNetworkLatencyMs(undefined);
       daemonNetworkSampleRef.current = undefined;
       setDaemonStatusError(undefined);
-      setSelectedSessionId(undefined);
+      selectSession(undefined);
       renamingSessionIdRef.current = undefined;
       setRenamingSessionId(undefined);
       setRenameDraft("");
@@ -920,7 +926,7 @@ export default function App() {
     } finally {
       client?.close();
     }
-  }, [activeServer, clearTerminalOutput, disconnectAttach, setSafeError, state.device, url]);
+  }, [activeServer, clearTerminalOutput, disconnectAttach, selectSession, setSafeError, state.device, url]);
 
   const handleSelectServer = useCallback(
     async (serverId: UUID) => {
@@ -946,7 +952,7 @@ export default function App() {
       setDaemonNetworkLatencyMs(undefined);
       daemonNetworkSampleRef.current = undefined;
       setDaemonStatusError(undefined);
-      setSelectedSessionId(undefined);
+      selectSession(undefined);
       renamingSessionIdRef.current = undefined;
       setRenamingSessionId(undefined);
       setRenameDraft("");
@@ -962,7 +968,7 @@ export default function App() {
       setActiveSurface("admin");
       setStatus("idle");
     },
-    [activeServer?.server_id, clearTerminalOutput, disconnectAttach, state.pairedServers],
+    [activeServer?.server_id, clearTerminalOutput, disconnectAttach, selectSession, state.pairedServers],
   );
 
   const authenticatedClient = useCallback(async (timeoutMs = APP_CONNECTION_TIMEOUT_MS) => {
@@ -1121,9 +1127,14 @@ export default function App() {
       }
       const orderedSessions = orderSessions(sortSessionsNewestFirst(list.sessions), nextOrder);
       confirmedSessionSizesRef.current = new Map(list.sessions.map((session) => [session.session_id, session.size]));
-      const firstSessionId = userDetachedRef.current
+      const listedSessionIds = new Set(list.sessions.map((session) => session.session_id));
+      const stickySessionId =
+        attachingSessionIdRef.current ?? attachedSessionRef.current ?? selectedSessionIdRef.current;
+      const nextSelectedSessionId = userDetachedRef.current
         ? undefined
-        : orderedSessions.at(0)?.session_id ?? renamingSessionIdRef.current ?? attachedSessionRef.current;
+        : stickySessionId && listedSessionIds.has(stickySessionId)
+          ? stickySessionId
+          : orderedSessions.at(0)?.session_id ?? renamingSessionIdRef.current ?? attachedSessionRef.current;
       setSessions((current) =>
         mergeSessionRefresh(list.sessions, current, [
           renamingSessionIdRef.current,
@@ -1131,13 +1142,16 @@ export default function App() {
         ], nextOrder),
       );
       setDaemonClients(clients.clients);
-      setSelectedSessionId(firstSessionId);
+      // 列表刷新可能晚于用户点击 session 返回；不能用“第一行”覆盖用户刚选择/正在 attach 的目标。
+      selectSession(nextSelectedSessionId);
       // session 列表刷新可能来自后台轮询或 cursor 同步；已有 attach 时保留右侧文件树，
       // 避免用户刷新 session 列表后文件 panel 被短暂清空。
       if (!attachedSessionRef.current) {
         clearSessionFiles();
       }
-      setStatus("ready");
+      if (!attachingSessionIdRef.current) {
+        setStatus(attachedSessionRef.current ? "attached" : "ready");
+      }
     } catch (caught) {
       if (activeServerIdRef.current !== requestServerId) {
         return;
@@ -1145,7 +1159,7 @@ export default function App() {
       setActiveSurface("admin");
       setSafeError(caught);
     }
-  }, [activeServer?.server_id, authenticatedClient, clearSessionFiles, setSafeError]);
+  }, [activeServer?.server_id, authenticatedClient, clearSessionFiles, selectSession, setSafeError]);
 
   const refreshDaemonClients = useCallback(
     async () => {
@@ -1445,7 +1459,7 @@ export default function App() {
           attachClientRef.current = attachedClient;
           attachedSessionRef.current = sessionId;
           confirmedSessionSizesRef.current.set(attached.session_id, attached.size);
-          setSelectedSessionId(sessionId);
+          selectSession(sessionId);
           setAttachedSessionId(sessionId);
           setSessions((current) => upsertAttachedSession(current, attached, sessionOrderRef.current));
           clearNewOutputMark(sessionId);
@@ -1487,6 +1501,7 @@ export default function App() {
     refreshDaemonClients,
     resetAttachReconnectState,
     selectedSessionId,
+    selectSession,
     setSafeError,
     startReceiveLoop,
     updateTerminalResizeOwner,
@@ -1522,13 +1537,16 @@ export default function App() {
   const handleAttach = useCallback(
     async (sessionId: UUID) => {
       if (attachingSessionIdRef.current === sessionId) {
-        setSelectedSessionId(sessionId);
+        selectSession(sessionId);
         clearNewOutputMark(sessionId);
         setMobilePanel(undefined);
         setMobileMenuOpen(false);
         return;
       }
       userDetachedRef.current = false;
+      // 用户点击 session 后立即更新选中态；实际 attach 完成后再切换 xterm 数据流。
+      // 这样慢 attach 或迟到刷新不会让列表视觉上跳回旧 session。
+      selectSession(sessionId);
       setError(undefined);
       setStatus("attaching");
       const attachRequestId = attachRequestIdRef.current + 1;
@@ -1541,7 +1559,7 @@ export default function App() {
           attachedSessionRef.current === sessionId &&
           Boolean(attachClientRef.current);
         if (attachedSessionRef.current === sessionId && attachClientRef.current && !shouldRefreshCurrentAttach) {
-          setSelectedSessionId(sessionId);
+          selectSession(sessionId);
           clearNewOutputMark(sessionId);
           setStatus("attached");
           setMobilePanel(undefined);
@@ -1566,7 +1584,7 @@ export default function App() {
         attachClientRef.current = attachedClient;
         attachedSessionRef.current = sessionId;
         confirmedSessionSizesRef.current.set(attached.session_id, attached.size);
-        setSelectedSessionId(sessionId);
+        selectSession(sessionId);
         setAttachedSessionId(sessionId);
         setSessions((current) => upsertAttachedSession(current, attached, sessionOrderRef.current));
         clearNewOutputMark(sessionId);
@@ -1608,6 +1626,7 @@ export default function App() {
       loadSessionFiles,
       loadSessionGit,
       refreshDaemonClients,
+      selectSession,
       setSafeError,
       isMobileLayout,
       startReceiveLoop,
@@ -1668,7 +1687,7 @@ export default function App() {
       attachedSessionRef.current = created.session_id;
       confirmedSessionSizesRef.current.set(created.session_id, created.size);
       updateTerminalResizeOwner(Boolean(created.resize_owner));
-      setSelectedSessionId(created.session_id);
+      selectSession(created.session_id);
       setAttachedSessionId(created.session_id);
       clearNewOutputMark(created.session_id);
       setMobilePanel(undefined);
@@ -1694,6 +1713,7 @@ export default function App() {
     disconnectAttach,
     loadSessionFiles,
     refreshDaemonClients,
+    selectSession,
     setSafeError,
     startReceiveLoop,
     updateTerminalResizeOwner,
@@ -1828,7 +1848,7 @@ export default function App() {
         setSessionOrder(sessionOrderRef.current);
         clearNewOutputMark(sessionId);
         if (wasSelected) {
-          setSelectedSessionId(undefined);
+          selectSession(undefined);
           clearSessionFiles();
         }
         if (wasAttached || wasSelected) {
@@ -1857,6 +1877,7 @@ export default function App() {
       isIgnoredClosingSessionNotFound,
       refreshDaemonClients,
       selectedSessionId,
+      selectSession,
       setSafeError,
     ],
   );

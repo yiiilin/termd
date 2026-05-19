@@ -127,6 +127,7 @@ export function TerminalPane(props: TerminalPaneProps) {
   const onCursorChangeRef = useRef(props.onCursorChange);
   const onTerminalResyncRef = useRef(props.onTerminalResync);
   const onTerminalSeqRenderedRef = useRef(props.onTerminalSeqRendered);
+  const onOutputResetAppliedRef = useRef(props.onOutputResetApplied);
   const takeOutputRef = useRef(props.takeOutput);
   const sessionSizeRef = useRef(props.sessionSize);
   const mobileInputModeRef = useRef(Boolean(props.mobileInputMode));
@@ -176,6 +177,7 @@ export function TerminalPane(props: TerminalPaneProps) {
   const activeWriteRef = useRef<ActiveTerminalWrite | undefined>(undefined);
   const lastTerminalSeqRef = useRef<number | undefined>(undefined);
   const writeInFlightRef = useRef(false);
+  const writeGenerationRef = useRef(0);
   const writeFrameRef = useRef<number | undefined>(undefined);
   const needsPostWriteRefreshRef = useRef(false);
   const [clientSize, setClientSize] = useState<TerminalSize | undefined>(undefined);
@@ -318,11 +320,12 @@ export function TerminalPane(props: TerminalPaneProps) {
     onCursorChangeRef.current = props.onCursorChange;
     onTerminalResyncRef.current = props.onTerminalResync;
     onTerminalSeqRenderedRef.current = props.onTerminalSeqRendered;
+    onOutputResetAppliedRef.current = props.onOutputResetApplied;
     takeOutputRef.current = props.takeOutput;
     sessionSizeRef.current = props.sessionSize;
     mobileInputModeRef.current = Boolean(props.mobileInputMode);
     resizeEnabledRef.current = Boolean(props.resizeEnabled);
-  }, [props.mobileInputMode, props.onCursorChange, props.onInput, props.onResize, props.onTerminalResync, props.onTerminalSeqRendered, props.resizeEnabled, props.sessionSize, props.takeOutput]);
+  }, [props.mobileInputMode, props.onCursorChange, props.onInput, props.onOutputResetApplied, props.onResize, props.onTerminalResync, props.onTerminalSeqRendered, props.resizeEnabled, props.sessionSize, props.takeOutput]);
 
   useEffect(() => props.registerOutputDrain(() => drainOutputRef.current()), [props.registerOutputDrain]);
 
@@ -1236,8 +1239,9 @@ export function TerminalPane(props: TerminalPaneProps) {
         return;
       }
       writeInFlightRef.current = true;
+      const writeGeneration = writeGenerationRef.current;
       terminal.write(output.bytes, () => {
-        if (disposed) {
+        if (disposed || writeGeneration !== writeGenerationRef.current) {
           return;
         }
         writeInFlightRef.current = false;
@@ -1353,6 +1357,7 @@ export function TerminalPane(props: TerminalPaneProps) {
     fitRef.current = fit;
     searchAddonRef.current = searchAddon;
     outputResetVersionRef.current = props.outputResetVersion;
+    onOutputResetAppliedRef.current?.(props.outputResetVersion);
     needsPostWriteRefreshRef.current = true;
     // attach 输出可能早于 xterm 初始化到达；创建实例时先取走待写队列，避免首屏输出丢失。
     drainOutputRef.current = drainOutput;
@@ -1444,6 +1449,7 @@ export function TerminalPane(props: TerminalPaneProps) {
       activeWriteRef.current = undefined;
       lastTerminalSeqRef.current = undefined;
       writeInFlightRef.current = false;
+      writeGenerationRef.current += 1;
       writeFrameRef.current = undefined;
       needsPostWriteRefreshRef.current = false;
       focusedRef.current = false;
@@ -1462,7 +1468,7 @@ export function TerminalPane(props: TerminalPaneProps) {
       setViewerViewportSize(undefined);
       setViewerContentSize(undefined);
     };
-  }, [props.attached]);
+  }, [props.attached, props.outputResetVersion]);
 
   useEffect(() => {
     const terminal = terminalRef.current;
@@ -1481,20 +1487,10 @@ export function TerminalPane(props: TerminalPaneProps) {
     if (outputResetVersionRef.current === props.outputResetVersion) {
       return;
     }
-    outputResetVersionRef.current = props.outputResetVersion;
-    pendingWriteItemsRef.current = [];
-    pendingWriteBytesRef.current = 0;
-    activeWriteRef.current = undefined;
-    lastTerminalSeqRef.current = undefined;
-    if (writeFrameRef.current !== undefined) {
-      window.cancelAnimationFrame(writeFrameRef.current);
-      writeFrameRef.current = undefined;
-    }
-    needsPostWriteRefreshRef.current = true;
-    // session 切换时 UI 会重置输出队列；同步清屏，避免旧 session 明文留在终端实例中。
+    // session 切换时上面的 terminal effect 会按 outputResetVersion 重建 xterm 实例。
+    // 这里仅保留防御式同步清屏：如果未来 effect 条件调整导致实例未重建，也不能残留旧 session 明文。
     terminal.reset();
-    props.onOutputResetApplied?.(props.outputResetVersion);
-  }, [props.outputResetVersion, props.onOutputResetApplied]);
+  }, [props.outputResetVersion]);
 
   useEffect(() => {
     if (!props.attached || !props.focusRequest || !terminalRef.current) {
