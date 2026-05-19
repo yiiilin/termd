@@ -155,6 +155,28 @@ describe("TerminalPane terminal sequence rendering", () => {
     await waitFor(() => expect(onTerminalResync).toHaveBeenCalledWith(10));
     expect(onTerminalSeqRendered.mock.calls).toEqual([[10]]);
   });
+
+  it("连续 output frame 合并成批量 xterm write，但仍逐帧确认 terminal_seq", async () => {
+    const onTerminalSeqRendered = vi.fn();
+    const items: TerminalOutputItem[] = [
+      { kind: "snapshot", bytes: new TextEncoder().encode("snapshot\n"), baseSeq: 0 },
+      ...Array.from({ length: 32 }, (_, index) => ({
+        kind: "output" as const,
+        bytes: new TextEncoder().encode(`line-${index + 1}\n`),
+        terminalSeq: index + 1,
+      })),
+    ];
+
+    renderTerminalPaneWithOutput(items, { onTerminalSeqRendered });
+
+    const xterm = screen.getByTestId("terminal-pane").querySelector<HTMLElement>(".xterm");
+    await waitFor(() => expect(xterm?.dataset.buffer).toContain("line-32"));
+    const stats = (globalThis as { __TERMD_TEST_XTERM_STATS__?: { writes: number } })
+      .__TERMD_TEST_XTERM_STATS__;
+    expect(stats?.writes ?? 0).toBeLessThan(10);
+    expect(onTerminalSeqRendered.mock.calls.at(-1)).toEqual([32]);
+    expect(onTerminalSeqRendered).toHaveBeenCalledTimes(33);
+  });
 });
 
 describe("TerminalPane mobile direction gesture", () => {

@@ -67,6 +67,13 @@ load_termd_installer_functions() {
   source <(sed '/^main "\$@"/,$d' "${ROOT_DIR}/scripts/install-termd.sh")
 }
 
+load_update_local_functions() {
+  # 本地更新测试只加载函数，避免触发真实 build、systemctl restart 或清理本机 session。
+  unset SUPERVISOR_VERSION_TARGET SUPERVISOR_VERSION_NEEDS_RUNTIME_CLEAR TERMD_SUPERVISOR_VERSION_FILE
+  # shellcheck source=/dev/null
+  source <(sed '/^main "\$@"/,$d' "${ROOT_DIR}/scripts/update-local-termd.sh")
+}
+
 assert_file_contains() {
   local file="$1"
   local expected="$2"
@@ -797,6 +804,56 @@ assert pathlib.Path(sys.argv[2]).exists()
 PY
 )
 
+test_update_local_supervisor_version_mismatch_clears_runtime_state() (
+  load_update_local_functions
+  INSTALL_EVENTS=()
+  install_fake_supervisor_termination_tracker
+
+  local tmp_dir sqlite_file socket_file version_file
+  tmp_dir="$(mktemp -d)"
+  trap 'rm -rf "$tmp_dir"' EXIT
+  STATE_DIR="${tmp_dir}/termd"
+  STATE_DB="${STATE_DIR}/daemon-state.sqlite"
+  mkdir -p "${STATE_DIR}/termd-supervisors"
+  sqlite_file="$STATE_DB"
+  socket_file="${STATE_DIR}/termd-supervisors/stale.sock"
+  version_file="${tmp_dir}/SUPERVISOR_VERSION"
+  seed_termd_runtime_sqlite "$sqlite_file" "v-old"
+  create_stale_supervisor_socket "$socket_file"
+  printf 'v-new\n' >"$version_file"
+  TERMD_SUPERVISOR_VERSION_FILE="$version_file"
+
+  resolve_local_supervisor_version
+  [[ "$SUPERVISOR_VERSION_NEEDS_RUNTIME_CLEAR" -eq 1 ]]
+  [[ "$SUPERVISOR_VERSION_TARGET" == "v-new" ]]
+  clear_runtime_session_state_for_supervisor_upgrade "$STATE_DB" "${STATE_DIR}/termd-supervisors"
+  persist_local_supervisor_version
+
+  python3 - "$sqlite_file" "$socket_file" <<'PY'
+import pathlib
+import sqlite3
+import sys
+
+conn = sqlite3.connect(sys.argv[1])
+try:
+    attached = conn.execute("SELECT COUNT(*) FROM daemon_client_attached_sessions").fetchone()[0]
+    assert attached == 0, attached
+    daemon_sessions = conn.execute("SELECT COUNT(*) FROM daemon_sessions").fetchone()[0]
+    assert daemon_sessions == 0, daemon_sessions
+    runtime_sessions = conn.execute("SELECT COUNT(*) FROM runtime_sessions").fetchone()[0]
+    assert runtime_sessions == 0, runtime_sessions
+    version = conn.execute(
+        "SELECT value FROM daemon_meta WHERE key = 'supervisor_version'"
+    ).fetchone()[0]
+    assert version == "v-new", version
+finally:
+    conn.close()
+assert not pathlib.Path(sys.argv[2]).exists()
+PY
+  [[ "${#TERMINATED_SUPERVISOR_DIRS[@]}" -eq 1 ]]
+  [[ "${TERMINATED_SUPERVISOR_DIRS[0]}" == "${STATE_DIR}/termd-supervisors" ]]
+)
+
 test_termd_default_install_uses_managed_user
 test_termd_upgrade_inherits_existing_user_without_user_arg
 test_termd_upgrade_uses_fixed_state_dir_when_existing_unit_has_no_working_directory
@@ -810,5 +867,6 @@ test_termd_missing_supervisor_meta_keeps_runtime_state_on_default_update
 test_termd_supervisor_version_mismatch_prompts_and_clears_runtime_state
 test_termd_supervisor_version_mismatch_decline_preserves_runtime_state
 test_termd_required_supervisor_version_mismatch_decline_preserves_runtime_state
+test_update_local_supervisor_version_mismatch_clears_runtime_state
 
 printf 'installer tests passed\n'

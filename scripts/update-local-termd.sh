@@ -2,8 +2,9 @@
 
 set -euo pipefail
 
-# 从当前源码安全更新本机 systemd 管理的 termd 主进程。
-# 这个脚本只替换 /usr/local/bin/termd 并重启 termd.service；不会主动终止 session supervisor。
+# 从当前源码安全更新本机 systemd 管理的 termd。
+# supervisor 兼容版本一致时只替换主 daemon，并校验 live session supervisor 不变。
+# supervisor 兼容版本变化时，旧 session 必然不可兼容恢复；脚本会终止旧 supervisor 并清空 session 运行态。
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SERVICE_NAME="${TERMD_SERVICE_NAME:-termd.service}"
@@ -11,6 +12,9 @@ BIN_PATH="${TERMD_BIN_PATH:-/usr/local/bin/termd}"
 STATE_DIR="${TERMD_STATE_DIR:-/var/lib/termd}"
 STATE_DB="${TERMD_STATE_DB:-${STATE_DIR}/daemon-state.sqlite}"
 HEALTH_URL="${TERMD_HEALTH_URL:-http://127.0.0.1:8765/healthz}"
+SUPERVISOR_VERSION_FILE="${TERMD_SUPERVISOR_VERSION_FILE:-${ROOT_DIR}/SUPERVISOR_VERSION}"
+SUPERVISOR_VERSION_TARGET=""
+SUPERVISOR_VERSION_NEEDS_RUNTIME_CLEAR=0
 WORKSPACE_TESTS=0
 SKIP_TESTS=0
 SKIP_BUILD=0
@@ -30,11 +34,14 @@ Options:
   --bin <PATH>            Installed termd binary path; default: /usr/local/bin/termd.
   --state-db <PATH>       SQLite state DB; default: /var/lib/termd/daemon-state.sqlite.
   --health-url <URL>      Health check URL; default: http://127.0.0.1:8765/healthz.
+  --supervisor-version-file <PATH>
+                           Supervisor compatibility version file; default: ./SUPERVISOR_VERSION.
   --dry-run               Run checks and print the planned install/restart without changing service state.
   -h, --help              Print this help.
 
 Environment overrides:
-  TERMD_SERVICE_NAME, TERMD_BIN_PATH, TERMD_STATE_DIR, TERMD_STATE_DB, TERMD_HEALTH_URL
+  TERMD_SERVICE_NAME, TERMD_BIN_PATH, TERMD_STATE_DIR, TERMD_STATE_DB, TERMD_HEALTH_URL,
+  TERMD_SUPERVISOR_VERSION_FILE
 EOF
 }
 
@@ -86,6 +93,11 @@ parse_args() {
         HEALTH_URL="$2"
         shift 2
         ;;
+      --supervisor-version-file)
+        [[ $# -ge 2 && -n "$2" ]] || die "--supervisor-version-file requires a value"
+        SUPERVISOR_VERSION_FILE="$2"
+        shift 2
+        ;;
       --dry-run)
         DRY_RUN=1
         shift
@@ -104,6 +116,107 @@ parse_args() {
 service_property() {
   local property="$1"
   systemctl show "$SERVICE_NAME" -p "$property" --value
+}
+
+read_sqlite_meta_value() {
+  local sqlite_path="$1"
+  local key="$2"
+
+  python3 - "$sqlite_path" "$key" <<'PY'
+import sqlite3
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+key = sys.argv[2]
+if not path.exists():
+    raise SystemExit(0)
+
+conn = sqlite3.connect(path)
+try:
+    tables = {
+        row[0]
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+    }
+    if "daemon_meta" not in tables:
+        raise SystemExit(0)
+    row = conn.execute(
+        "SELECT value FROM daemon_meta WHERE key = ?",
+        (key,),
+    ).fetchone()
+    if row:
+        print(row[0])
+finally:
+    conn.close()
+PY
+}
+
+upsert_sqlite_meta_value() {
+  local sqlite_path="$1"
+  local key="$2"
+  local value="$3"
+
+  python3 - "$sqlite_path" "$key" "$value" <<'PY'
+import sqlite3
+import sys
+import time
+from pathlib import Path
+
+path = Path(sys.argv[1])
+key = sys.argv[2]
+value = sys.argv[3]
+path.parent.mkdir(parents=True, exist_ok=True)
+
+conn = sqlite3.connect(path)
+try:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS daemon_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at_ms INTEGER NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO daemon_meta (key, value, updated_at_ms)
+        VALUES (?1, ?2, ?3)
+        ON CONFLICT(key) DO UPDATE SET
+            value = excluded.value,
+            updated_at_ms = excluded.updated_at_ms
+        """,
+        (key, value, int(time.time() * 1000)),
+    )
+    conn.commit()
+finally:
+    conn.close()
+PY
+}
+
+resolve_local_supervisor_version() {
+  local version_file current_supervisor_version
+
+  version_file="${TERMD_SUPERVISOR_VERSION_FILE:-$SUPERVISOR_VERSION_FILE}"
+  [[ -s "$version_file" ]] || die "missing supervisor compatibility version file: ${version_file}"
+  IFS= read -r SUPERVISOR_VERSION_TARGET <"$version_file"
+  [[ -n "$SUPERVISOR_VERSION_TARGET" ]] || die "supervisor compatibility version file is empty: ${version_file}"
+
+  current_supervisor_version="$(read_sqlite_meta_value "$STATE_DB" "supervisor_version")"
+  SUPERVISOR_VERSION_NEEDS_RUNTIME_CLEAR=0
+  if [[ -n "$current_supervisor_version" && "$current_supervisor_version" != "$SUPERVISOR_VERSION_TARGET" ]]; then
+    SUPERVISOR_VERSION_NEEDS_RUNTIME_CLEAR=1
+    log "supervisor version change detected: ${current_supervisor_version} -> ${SUPERVISOR_VERSION_TARGET}; existing sessions will be cleared"
+  elif [[ -z "$current_supervisor_version" ]]; then
+    log "supervisor version baseline will be set to ${SUPERVISOR_VERSION_TARGET}"
+  else
+    log "supervisor version unchanged: ${SUPERVISOR_VERSION_TARGET}"
+  fi
+}
+
+persist_local_supervisor_version() {
+  [[ -n "$SUPERVISOR_VERSION_TARGET" ]] || die "supervisor compatibility version was not resolved"
+  upsert_sqlite_meta_value "$STATE_DB" "supervisor_version" "$SUPERVISOR_VERSION_TARGET"
 }
 
 assert_service_can_restart_without_killing_supervisors() {
@@ -452,6 +565,144 @@ assert_running_sessions_did_not_drop() {
   done
 }
 
+terminate_session_supervisors() {
+  local supervisor_dir="$1"
+
+  [[ -d "$supervisor_dir" ]] || return 0
+
+  python3 - "$supervisor_dir" <<'PY'
+import os
+import signal
+import sys
+import time
+from pathlib import Path
+
+target_dir = Path(sys.argv[1]).resolve()
+proc_dir = Path("/proc")
+if not proc_dir.exists():
+    raise SystemExit("cannot inspect /proc to terminate old session supervisors")
+
+
+def process_is_alive(pid: int) -> bool:
+    status_path = proc_dir / str(pid) / "status"
+    try:
+        for line in status_path.read_text(errors="replace").splitlines():
+            if line.startswith("State:"):
+                # 僵尸进程已经不能继续托管 PTY，可视为已退出。
+                return not line.split(None, 2)[1].startswith("Z")
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def session_supervisor_pids() -> list[int]:
+    matched: list[int] = []
+    for entry in proc_dir.iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid == os.getpid():
+            continue
+        try:
+            raw_cmdline = (entry / "cmdline").read_bytes()
+        except (FileNotFoundError, PermissionError, OSError):
+            continue
+        args = [
+            part.decode("utf-8", errors="surrogateescape")
+            for part in raw_cmdline.split(b"\0")
+            if part
+        ]
+        if "__session-supervisor" not in args:
+            continue
+        try:
+            socket_path = Path(args[args.index("--socket-path") + 1])
+        except (ValueError, IndexError):
+            continue
+        try:
+            socket_parent = socket_path.parent.resolve()
+        except OSError:
+            socket_parent = socket_path.parent.absolute()
+        if socket_parent == target_dir:
+            matched.append(pid)
+    return matched
+
+
+pids = session_supervisor_pids()
+for pid in pids:
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    except PermissionError as error:
+        raise SystemExit(f"failed to terminate session supervisor {pid}: {error}")
+
+deadline = time.monotonic() + 5
+remaining = {pid for pid in pids if process_is_alive(pid)}
+while remaining and time.monotonic() < deadline:
+    time.sleep(0.1)
+    remaining = {pid for pid in remaining if process_is_alive(pid)}
+
+for pid in sorted(remaining):
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except PermissionError as error:
+        raise SystemExit(f"failed to kill session supervisor {pid}: {error}")
+
+deadline = time.monotonic() + 5
+remaining = {pid for pid in remaining if process_is_alive(pid)}
+while remaining and time.monotonic() < deadline:
+    time.sleep(0.1)
+    remaining = {pid for pid in remaining if process_is_alive(pid)}
+
+if remaining:
+    raise SystemExit(
+        "session supervisors did not exit after supervisor version upgrade: "
+        + ", ".join(str(pid) for pid in sorted(remaining))
+    )
+PY
+}
+
+clear_runtime_session_state_for_supervisor_upgrade() {
+  local sqlite_path="$1"
+  local supervisor_dir="$2"
+
+  # supervisor 兼容版本变化代表 IPC 语义不兼容；旧 session 无法保真恢复，
+  # 必须先终止旧 supervisor，再清空 session 展示态和运行态，避免 Web 自动 attach 卡死。
+  terminate_session_supervisors "$supervisor_dir"
+
+  if [[ -f "$sqlite_path" ]]; then
+    python3 - "$sqlite_path" <<'PY'
+import sqlite3
+import sys
+
+conn = sqlite3.connect(sys.argv[1])
+try:
+    tables = {
+        row[0]
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+    }
+    for table in (
+        "daemon_client_attached_sessions",
+        "daemon_sessions",
+        "runtime_sessions",
+    ):
+        if table in tables:
+            conn.execute(f"DELETE FROM {table}")
+    conn.commit()
+finally:
+    conn.close()
+PY
+  fi
+
+  if [[ -d "$supervisor_dir" ]]; then
+    find "$supervisor_dir" -maxdepth 1 -type s -name '*.sock' -delete
+  fi
+}
+
 verify_health() {
   local response
 
@@ -500,6 +751,15 @@ install_and_restart() {
   systemctl restart "$SERVICE_NAME"
 }
 
+stop_service_before_supervisor_runtime_clear() {
+  if [[ "$SUPERVISOR_VERSION_NEEDS_RUNTIME_CLEAR" -ne 1 ]]; then
+    return 0
+  fi
+
+  log "stopping ${SERVICE_NAME} before clearing incompatible supervisor runtime state"
+  systemctl stop "$SERVICE_NAME"
+}
+
 main() {
   parse_args "$@"
   cd "$ROOT_DIR"
@@ -511,6 +771,7 @@ main() {
   require_cmd systemctl
 
   assert_service_can_restart_without_killing_supervisors
+  resolve_local_supervisor_version
   run_verification
   build_release_binary
 
@@ -529,6 +790,34 @@ main() {
   before_count="$(wc -l <"$before_pids" | tr -d ' ')"
   [[ "$before_count" =~ ^[0-9]+$ ]] || die "cannot count supervisor pids"
   write_state_counts "$before_counts"
+
+  if [[ "$SUPERVISOR_VERSION_NEEDS_RUNTIME_CLEAR" -eq 1 ]]; then
+    log "pre-update supervisor count: ${before_count}"
+    log "pre-update state:"
+    sed 's/^/[update-local-termd]   /' "$before_counts"
+
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+      log "dry run: would stop ${SERVICE_NAME}, terminate old session supervisors, clear sessions, set supervisor_version=${SUPERVISOR_VERSION_TARGET}, install ${BIN_PATH}, and restart"
+      return 0
+    fi
+
+    stop_service_before_supervisor_runtime_clear
+    clear_runtime_session_state_for_supervisor_upgrade "$STATE_DB" "${STATE_DIR}/termd-supervisors"
+    persist_local_supervisor_version
+    install_and_restart
+
+    sleep 1
+    verify_health
+    snapshot_supervisor_pids "$after_pids"
+    after_count="$(wc -l <"$after_pids" | tr -d ' ')"
+    [[ "$after_count" == "0" ]] || die "old session supervisors remain after supervisor version upgrade"
+    write_state_counts "$after_counts"
+    log "post-update state:"
+    sed 's/^/[update-local-termd]   /' "$after_counts"
+    log "updated ${BIN_PATH}, restarted ${SERVICE_NAME}, and cleared incompatible supervisor sessions"
+    return 0
+  fi
+
   repairable_display_states="$(live_supervisor_display_states_need_repair "$before_session_ids")"
   if [[ "${repairable_display_states}" != "0" ]]; then
     if [[ "$DRY_RUN" -eq 1 ]]; then
@@ -550,6 +839,7 @@ main() {
     return 0
   fi
 
+  persist_local_supervisor_version
   install_and_restart
 
   sleep 1

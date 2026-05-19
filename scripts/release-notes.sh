@@ -12,6 +12,25 @@ version="${1:-}"
 }
 
 case "$version" in
+  0.3.1)
+    cat <<'EOF'
+termd 0.3.1
+
+用户可见变化:
+- supervisor/daemon 的 attach 边界改成事务化 `AttachSync(last_terminal_seq)`；浏览器重新打开、切换或 daemon 重连到 live supervisor 时，会在同一个同步点拿到权威 snapshot 或 tail，减少大终端在重连附近丢输出、重放旧输出或重复清屏的问题。
+- terminal tail 恢复现在严格按 session 级 `terminal_seq` 连续推进；snapshot 只负责重绘当前屏幕，之后的 output/resize/exit 都按 `base_seq` 之后的事件补齐，direct 和 relay 路径都复用这套语义。
+- Web xterm 在连续收到大量 terminal frame 时会把多帧输出合并成更大的批量 `write`，但 render ack 仍按帧精确回补；大量输出不再明显“一行一行蹦出来”，大块终端刷新更快。
+- 本地源码更新脚本现在会读取 `SUPERVISOR_VERSION` / SQLite `supervisor_version` 元数据；如果 supervisor 兼容版本未变化，继续保守热更新并校验 live supervisor PID 不变。
+- 如果本地源码更新检测到 supervisor 兼容版本不匹配，会先停 daemon、终止旧 session supervisor、清空 runtime session 状态，再写入新的 `supervisor_version` 并重启，避免 Web 端继续 attach 到已不兼容的旧 session 而卡死。
+- installer/update 路径补了针对 supervisor 版本不兼容清理流程的回归测试，确保“兼容时不丢 session，不兼容时明确清空旧 session”的行为稳定。
+
+兼容性:
+- 0.3.1 是 supervisor IPC 不兼容版本；0.3.0 的 live supervisor 不能被 0.3.1 daemon 安全复用。
+- release installer 会要求 supervisor 兼容版本升级到 `0.3.1`。如果检测到已有 runtime session，会提示升级会丢失现有 session；用户确认后才会停旧 daemon、终止旧 supervisor 并清空 session 运行态。
+- `scripts/update-local-termd.sh` 现在也会执行同样的兼容性判断；版本匹配时保留 session，版本不匹配时清空旧 session 后再完成本地更新。
+- packet protocol version 仍保持现有 0.3.x 路径；daemon、Web UI、termctl 和 relay 仍建议同步升级到 0.3.1。
+EOF
+    ;;
   0.3.0)
     cat <<'EOF'
 termd 0.3.0

@@ -58,6 +58,11 @@ interface ActiveTerminalWrite {
   sequenceChecked: boolean;
 }
 
+interface TerminalWriteBatch {
+  bytes: Uint8Array;
+  renderedItems: TerminalOutputItem[];
+}
+
 const MOBILE_SHORTCUT_KEYS = [
   { label: "Tab", ariaKey: "terminal.sendTab", data: "\t" },
   { label: "Esc", ariaKey: "terminal.sendEscape", data: "\x1b" },
@@ -71,6 +76,19 @@ function sameTerminalDimensions(
   b: { rows: number; cols: number } | undefined,
 ): boolean {
   return Boolean(a) && Boolean(b) && a!.rows === b!.rows && a!.cols === b!.cols;
+}
+
+function concatWriteChunks(chunks: Uint8Array[], totalBytes: number): Uint8Array {
+  if (chunks.length === 1 && chunks[0].byteLength === totalBytes) {
+    return chunks[0];
+  }
+  const merged = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return merged;
 }
 
 interface TerminalPaneProps {
@@ -1080,13 +1098,7 @@ export function TerminalPane(props: TerminalPaneProps) {
     };
     const byteLengthForItem = (item: TerminalOutputItem) =>
       item.kind === "data" || item.kind === "snapshot" || item.kind === "output" ? item.bytes.byteLength : 0;
-    const completeActiveWrite = () => {
-      const active = activeWriteRef.current;
-      if (!active) {
-        return;
-      }
-      const { item } = active;
-      activeWriteRef.current = undefined;
+    const markItemRendered = (item: TerminalOutputItem) => {
       if (item.kind === "snapshot") {
         lastTerminalSeqRef.current = item.baseSeq;
         onTerminalSeqRenderedRef.current?.(item.baseSeq);
@@ -1096,7 +1108,24 @@ export function TerminalPane(props: TerminalPaneProps) {
       }
       item.onRendered?.();
     };
-    const ensureActiveWriteSequence = (active: ActiveTerminalWrite): boolean => {
+    const completeActiveWrite = () => {
+      const active = activeWriteRef.current;
+      if (!active) {
+        return;
+      }
+      activeWriteRef.current = undefined;
+      markItemRendered(active.item);
+    };
+    const advanceSequenceCursor = (item: TerminalOutputItem, current: number | undefined) => {
+      if (item.kind === "snapshot") {
+        return item.baseSeq;
+      }
+      if (item.kind === "output" || item.kind === "resize" || item.kind === "exit") {
+        return item.terminalSeq;
+      }
+      return current;
+    };
+    const ensureActiveWriteSequence = (active: ActiveTerminalWrite, sequenceCursor = lastTerminalSeqRef.current): boolean => {
       if (active.sequenceChecked) {
         return true;
       }
@@ -1108,10 +1137,10 @@ export function TerminalPane(props: TerminalPaneProps) {
         return true;
       }
       if (item.kind === "output" || item.kind === "resize" || item.kind === "exit") {
-        const expected = (lastTerminalSeqRef.current ?? -1) + 1;
-        if (lastTerminalSeqRef.current === undefined || item.terminalSeq !== expected) {
+        const expected = (sequenceCursor ?? -1) + 1;
+        if (sequenceCursor === undefined || item.terminalSeq !== expected) {
           // 中文注释：terminal_seq 缺口说明 snapshot/tail 已经不连续，必须重新 attach 获取权威 snapshot。
-          onTerminalResyncRef.current?.(lastTerminalSeqRef.current);
+          onTerminalResyncRef.current?.(sequenceCursor);
           item.onRendered?.();
           activeWriteRef.current = undefined;
           return false;
@@ -1119,41 +1148,67 @@ export function TerminalPane(props: TerminalPaneProps) {
       }
       return true;
     };
-    const nextActiveWrite = () => {
-      while (!activeWriteRef.current) {
-        const item = pendingWriteItemsRef.current.shift();
-        if (!item) {
-          return undefined;
+    const takePendingWrite = (): TerminalWriteBatch | undefined => {
+      const chunks: Uint8Array[] = [];
+      const renderedItems: TerminalOutputItem[] = [];
+      let byteCount = 0;
+      let sequenceCursor = lastTerminalSeqRef.current;
+
+      while (byteCount < MAX_WRITE_BYTES) {
+        let active = activeWriteRef.current;
+        if (!active) {
+          const item = pendingWriteItemsRef.current.shift();
+          if (!item) {
+            break;
+          }
+          pendingWriteBytesRef.current = Math.max(0, pendingWriteBytesRef.current - byteLengthForItem(item));
+          active = { item, offset: 0, sequenceChecked: false };
+          activeWriteRef.current = active;
+          if (!ensureActiveWriteSequence(active, sequenceCursor)) {
+            continue;
+          }
         }
-        pendingWriteBytesRef.current = Math.max(0, pendingWriteBytesRef.current - byteLengthForItem(item));
-        activeWriteRef.current = { item, offset: 0, sequenceChecked: false };
-        if (!ensureActiveWriteSequence(activeWriteRef.current)) {
+
+        const { item } = active;
+        if (item.kind === "resize" || item.kind === "exit" || byteLengthForItem(item) === 0) {
+          renderedItems.push(item);
+          sequenceCursor = advanceSequenceCursor(item, sequenceCursor);
+          activeWriteRef.current = undefined;
           continue;
         }
-        if (item.kind === "resize" || item.kind === "exit") {
-          completeActiveWrite();
+
+        if (item.kind !== "data" && item.kind !== "snapshot" && item.kind !== "output") {
+          break;
+        }
+
+        const remaining = MAX_WRITE_BYTES - byteCount;
+        const end = Math.min(item.bytes.byteLength, active.offset + remaining);
+        const slice = item.bytes.subarray(active.offset, end);
+        chunks.push(slice);
+        byteCount += slice.byteLength;
+        active.offset = end;
+
+        if (active.offset >= byteLengthForItem(item)) {
+          renderedItems.push(item);
+          sequenceCursor = advanceSequenceCursor(item, sequenceCursor);
+          activeWriteRef.current = undefined;
           continue;
         }
-        if (byteLengthForItem(item) === 0) {
-          completeActiveWrite();
-          continue;
-        }
+
+        break;
       }
-      return activeWriteRef.current;
-    };
-    const takePendingWrite = () => {
-      const active = nextActiveWrite();
-      if (!active) {
+
+      if (byteCount === 0) {
+        for (const item of renderedItems) {
+          markItemRendered(item);
+        }
         return undefined;
       }
-      const { item } = active;
-      if (item.kind !== "data" && item.kind !== "snapshot" && item.kind !== "output") {
-        return undefined;
-      }
-      const end = Math.min(item.bytes.byteLength, active.offset + MAX_WRITE_BYTES);
-      const slice = item.bytes.subarray(active.offset, end);
-      active.offset = end;
-      return slice;
+
+      return {
+        bytes: concatWriteChunks(chunks, byteCount),
+        renderedItems,
+      };
     };
     const afterTerminalWrite = () => {
       if (disposed) {
@@ -1174,17 +1229,20 @@ export function TerminalPane(props: TerminalPaneProps) {
         return;
       }
       const output = takePendingWrite();
-      if (!output || output.byteLength === 0) {
+      if (!output || output.bytes.byteLength === 0) {
+        if (activeWriteRef.current || pendingWriteItemsRef.current.length > 0) {
+          schedulePendingWrite();
+        }
         return;
       }
       writeInFlightRef.current = true;
-      terminal.write(output, () => {
+      terminal.write(output.bytes, () => {
         if (disposed) {
           return;
         }
         writeInFlightRef.current = false;
-        if (activeWriteRef.current && activeWriteRef.current.offset >= byteLengthForItem(activeWriteRef.current.item)) {
-          completeActiveWrite();
+        for (const item of output.renderedItems) {
+          markItemRendered(item);
         }
         afterTerminalWrite();
         if (activeWriteRef.current || pendingWriteItemsRef.current.length > 0) {
