@@ -221,6 +221,11 @@ describe("协议类型", () => {
       terminal_seq: 1026,
       size,
     };
+    const batch: TerminalFramePayload = {
+      kind: "batch",
+      session_id: sessionId,
+      frames: [output, resize],
+    };
 
     expect(envelope("terminal_frame", snapshot)).toEqual({
       type: "terminal_frame",
@@ -234,6 +239,13 @@ describe("协议类型", () => {
       kind: "resize",
       terminal_seq: 1026,
       size,
+    });
+    expect(JSON.parse(JSON.stringify(batch))).toMatchObject({
+      kind: "batch",
+      frames: [
+        { kind: "output", terminal_seq: 1025 },
+        { kind: "resize", terminal_seq: 1026 },
+      ],
     });
   });
 

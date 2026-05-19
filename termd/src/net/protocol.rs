@@ -74,6 +74,8 @@ const AUTH_CHALLENGE_TTL_MS: u64 = 60_000;
 const LIVE_OUTPUT_MIN_BYTES: usize = 16 * 1024;
 const LIVE_OUTPUT_BYTES_PER_CELL: usize = 8;
 const LIVE_OUTPUT_DRAIN_MAX_CHUNKS: usize = 64;
+const TERMINAL_STREAM_BATCH_MAX_BYTES: usize = 64 * 1024;
+const TERMINAL_STREAM_METADATA_CREDIT_BYTES: usize = 1;
 const SESSION_FILE_DOWNLOAD_TOKEN_TTL_MS: u64 = 60_000;
 const SESSION_FILE_DOWNLOAD_GRANT_LIMIT: usize = 128;
 const SESSION_FILE_DOWNLOAD_CHUNK_MAX_BYTES: u32 = 256 * 1024;
@@ -159,6 +161,8 @@ struct PacketTerminalStream {
     session_id: SessionId,
     next_input_seq: u64,
     next_output_seq: u64,
+    // 中文注释：terminal output credit 使用“已渲染字节数”作为单位，不再按 frame 计数。
+    // 这样大量小 frame 不会因为 frame 数过多而被 8 个 credit 人为限速。
     output_credit: u32,
 }
 
@@ -3520,38 +3524,62 @@ impl ProtocolConnection {
             return Ok(Vec::new());
         }
         if self.packet_mode {
-            let max_frames = self.packet_stream_output_credit(session_id).unwrap_or(0) as usize;
-            if max_frames == 0 {
+            let max_credit = self.packet_stream_output_credit(session_id).unwrap_or(0) as usize;
+            if max_credit == 0 {
                 return Ok(Vec::new());
             }
 
             let mut frames = Vec::new();
-            if let Some(pending) = self.pending_terminal_frames.get_mut(&session_id) {
-                while frames.len() < max_frames {
-                    let Some(frame) = pending.pop_front() else {
-                        break;
-                    };
-                    frames.push(frame);
+            let mut frame_bytes = 0_usize;
+            let mut drained_chunks = 0_usize;
+
+            loop {
+                let pending_frame = self
+                    .pending_terminal_frames
+                    .get_mut(&session_id)
+                    .and_then(VecDeque::pop_front);
+                let Some(frame) = pending_frame else {
+                    break;
+                };
+                let cost = terminal_frame_credit_cost(&frame);
+                if !terminal_frame_fits_credit_batch(frame_bytes, cost, max_credit) {
+                    self.pending_terminal_frames
+                        .entry(session_id)
+                        .or_default()
+                        .push_front(frame);
+                    break;
                 }
+                frame_bytes = frame_bytes.saturating_add(cost);
+                frames.push(frame);
             }
 
-            while frames.len() < max_frames && frames.len() < LIVE_OUTPUT_DRAIN_MAX_CHUNKS {
+            while drained_chunks < LIVE_OUTPUT_DRAIN_MAX_CHUNKS {
+                if frame_bytes >= TERMINAL_STREAM_BATCH_MAX_BYTES {
+                    break;
+                }
                 let Some(frame) = protocol.read_terminal_frame(session_id, &internal_session_id)?
                 else {
                     break;
                 };
+                let cost = terminal_frame_credit_cost(&frame);
+                if !terminal_frame_fits_credit_batch(frame_bytes, cost, max_credit) {
+                    self.pending_terminal_frames
+                        .entry(session_id)
+                        .or_default()
+                        .push_back(frame);
+                    break;
+                }
                 if matches!(frame, TerminalFramePayload::Output { .. })
                     && protocol.sync_session_terminal_cwd(session_id)?
                 {
                     protocol.notify_session_file_tree_changed(session_id);
                 }
+                frame_bytes = frame_bytes.saturating_add(cost);
                 frames.push(frame);
+                drained_chunks += 1;
             }
 
-            let messages = frames
-                .into_iter()
-                .map(|frame| envelope_value(MessageType::TerminalFrame, frame))
-                .collect::<Result<Vec<_>, _>>()?;
+            let messages = terminal_frame_batch_messages(session_id, frames)?;
             return self.encrypt_inner_messages(messages);
         }
         let max_packet_chunks = if self.packet_mode {
@@ -4292,6 +4320,7 @@ impl ProtocolConnection {
     fn next_packet_stream_output_seq(
         &mut self,
         session_id: SessionId,
+        credit_cost: u32,
     ) -> Option<(PacketStreamId, u64)> {
         let stream_id = self.packet_stream_id_for_session(session_id)?;
         let stream = self.packet_terminal_streams.get_mut(&stream_id)?;
@@ -4301,7 +4330,7 @@ impl ProtocolConnection {
 
         let seq = stream.next_output_seq;
         stream.next_output_seq = stream.next_output_seq.saturating_add(1);
-        stream.output_credit = stream.output_credit.saturating_sub(1);
+        stream.output_credit = stream.output_credit.saturating_sub(credit_cost.max(1));
         Some((stream_id, seq))
     }
 
@@ -4352,6 +4381,66 @@ where
     T: DeserializeOwned,
 {
     serde_json::from_value(payload).map_err(|_| ProtocolError::InvalidEnvelope)
+}
+
+fn base64_payload_credit_cost(data_base64: &str) -> u32 {
+    let trimmed = data_base64.trim_end_matches('=');
+    let decoded_len = trimmed.len().saturating_mul(3) / 4;
+    decoded_len
+        .max(TERMINAL_STREAM_METADATA_CREDIT_BYTES)
+        .min(u32::MAX as usize) as u32
+}
+
+fn terminal_frame_credit_cost(frame: &TerminalFramePayload) -> usize {
+    match frame {
+        TerminalFramePayload::Snapshot { data_base64, .. }
+        | TerminalFramePayload::Output { data_base64, .. } => {
+            base64_payload_credit_cost(data_base64) as usize
+        }
+        TerminalFramePayload::Resize { .. } | TerminalFramePayload::Exit { .. } => {
+            TERMINAL_STREAM_METADATA_CREDIT_BYTES
+        }
+        TerminalFramePayload::Batch { frames, .. } => frames
+            .iter()
+            .map(terminal_frame_credit_cost)
+            .sum::<usize>()
+            .max(TERMINAL_STREAM_METADATA_CREDIT_BYTES),
+    }
+}
+
+fn terminal_frame_fits_credit_batch(
+    current_bytes: usize,
+    frame_bytes: usize,
+    max_credit: usize,
+) -> bool {
+    let frame_bytes = frame_bytes.max(TERMINAL_STREAM_METADATA_CREDIT_BYTES);
+    if current_bytes == 0 {
+        // 中文注释：terminal frame 是不可拆的协议边界；单个 snapshot/output 可能大于当前
+        // credit 或 batch 上限，此时允许它独占一个 stream_chunk，并通过 saturating 扣减把
+        // credit 清零，等待客户端按实际渲染字节补回，避免大 snapshot 永久卡住。
+        return max_credit > 0;
+    }
+    current_bytes.saturating_add(frame_bytes) <= max_credit
+        && current_bytes.saturating_add(frame_bytes) <= TERMINAL_STREAM_BATCH_MAX_BYTES
+}
+
+fn terminal_frame_batch_messages(
+    session_id: SessionId,
+    frames: Vec<TerminalFramePayload>,
+) -> Result<Vec<JsonEnvelope>, ProtocolError> {
+    if frames.is_empty() {
+        return Ok(Vec::new());
+    }
+    if frames.len() == 1 {
+        return frames
+            .into_iter()
+            .map(|frame| envelope_value(MessageType::TerminalFrame, frame))
+            .collect();
+    }
+    Ok(vec![envelope_value(
+        MessageType::TerminalFrame,
+        TerminalFramePayload::Batch { session_id, frames },
+    )?])
 }
 
 fn packetize_handler_responses(
@@ -4437,8 +4526,9 @@ fn packet_from_envelope(
 
     if envelope.kind == MessageType::SessionData {
         let payload: SessionDataPayload = decode_payload(envelope.payload)?;
+        let credit_cost = base64_payload_credit_cost(&payload.data_base64);
         let (stream_id, seq) = connection
-            .next_packet_stream_output_seq(payload.session_id)
+            .next_packet_stream_output_seq(payload.session_id, credit_cost)
             .ok_or(ProtocolError::InvalidState)?;
         let payload = serde_json::to_value(payload).map_err(|_| ProtocolError::InvalidEnvelope)?;
         return Ok(ProtocolPacket::stream_chunk(stream_id, seq, payload));
@@ -4446,8 +4536,9 @@ fn packet_from_envelope(
 
     if envelope.kind == MessageType::TerminalFrame {
         let payload: TerminalFramePayload = decode_payload(envelope.payload)?;
+        let credit_cost = terminal_frame_credit_cost(&payload).min(u32::MAX as usize) as u32;
         let (stream_id, seq) = connection
-            .next_packet_stream_output_seq(payload.session_id())
+            .next_packet_stream_output_seq(payload.session_id(), credit_cost)
             .ok_or(ProtocolError::InvalidState)?;
         let payload = serde_json::to_value(payload).map_err(|_| ProtocolError::InvalidEnvelope)?;
         return Ok(ProtocolPacket::stream_chunk(stream_id, seq, payload));
@@ -6344,7 +6435,7 @@ mod tests {
     }
 
     #[test]
-    fn packet_terminal_stream_open_and_output_use_stream_sequence() {
+    fn packet_terminal_stream_open_batches_snapshot_and_output_with_stream_sequence() {
         let (mut protocol, backend) = protocol();
         let (mut connection, _) = protocol.start_connection();
         let device_id = DeviceId::new();
@@ -6384,7 +6475,7 @@ mod tests {
                 create_request_id,
                 stream_id,
                 METHOD_TERMINAL_CREATE,
-                2,
+                128 * 1024,
                 serde_json::to_value(SessionCreatePayload {
                     command: vec!["sh".to_owned()],
                     size: TerminalSize::new(24, 80),
@@ -6408,46 +6499,46 @@ mod tests {
             &mut device_session,
             connection.read_session_output(&mut protocol, created.session_id, 1024),
         );
-        assert_eq!(output_packets.len(), 2);
-        let snapshot_packet = &output_packets[0];
-        assert_eq!(snapshot_packet.kind, PacketKind::StreamChunk);
-        assert_eq!(snapshot_packet.stream_id, Some(stream_id));
-        assert_eq!(snapshot_packet.seq, 1);
-        let snapshot: TerminalFramePayload =
-            decode_payload(snapshot_packet.payload.clone()).unwrap();
-        match snapshot {
-            TerminalFramePayload::Snapshot {
-                session_id,
-                base_seq,
-                data_base64,
-                ..
-            } => {
+        assert_eq!(output_packets.len(), 1);
+        let batch_packet = &output_packets[0];
+        assert_eq!(batch_packet.kind, PacketKind::StreamChunk);
+        assert_eq!(batch_packet.stream_id, Some(stream_id));
+        assert_eq!(batch_packet.seq, 1);
+        let batch: TerminalFramePayload = decode_payload(batch_packet.payload.clone()).unwrap();
+        match batch {
+            TerminalFramePayload::Batch { session_id, frames } => {
                 assert_eq!(session_id, created.session_id);
-                assert_eq!(base_seq, 0);
-                assert!(data_base64.is_empty());
+                assert_eq!(frames.len(), 2);
+                match &frames[0] {
+                    TerminalFramePayload::Snapshot {
+                        session_id,
+                        base_seq,
+                        data_base64,
+                        ..
+                    } => {
+                        assert_eq!(*session_id, created.session_id);
+                        assert_eq!(*base_seq, 0);
+                        assert!(data_base64.is_empty());
+                    }
+                    other => panic!("expected snapshot as first batch frame, got {other:?}"),
+                }
+                match &frames[1] {
+                    TerminalFramePayload::Output {
+                        session_id,
+                        terminal_seq,
+                        data_base64,
+                    } => {
+                        assert_eq!(*session_id, created.session_id);
+                        assert_eq!(*terminal_seq, 1);
+                        assert_eq!(
+                            general_purpose::STANDARD.decode(data_base64).unwrap(),
+                            b"hello"
+                        );
+                    }
+                    other => panic!("expected output as second batch frame, got {other:?}"),
+                }
             }
-            other => panic!("expected snapshot terminal frame, got {other:?}"),
-        }
-
-        let output_packet = &output_packets[1];
-        assert_eq!(output_packet.kind, PacketKind::StreamChunk);
-        assert_eq!(output_packet.stream_id, Some(stream_id));
-        assert_eq!(output_packet.seq, 2);
-        let output: TerminalFramePayload = decode_payload(output_packet.payload.clone()).unwrap();
-        match output {
-            TerminalFramePayload::Output {
-                session_id,
-                terminal_seq,
-                data_base64,
-            } => {
-                assert_eq!(session_id, created.session_id);
-                assert_eq!(terminal_seq, 1);
-                assert_eq!(
-                    general_purpose::STANDARD.decode(data_base64).unwrap(),
-                    b"hello"
-                );
-            }
-            other => panic!("expected output terminal frame, got {other:?}"),
+            other => panic!("expected batched terminal frames, got {other:?}"),
         }
     }
 
@@ -6522,7 +6613,7 @@ mod tests {
                 PacketRequestId::new(),
                 stream_id,
                 METHOD_TERMINAL_ATTACH,
-                4,
+                128 * 1024,
                 serde_json::to_value(SessionAttachPayload {
                     session_id: created.session_id,
                     watch_updates: true,
@@ -6556,6 +6647,254 @@ mod tests {
             }
             other => panic!("expected attach tail output, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn packet_terminal_output_batches_frames_by_byte_credit() {
+        let (mut protocol, backend) = protocol();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let (_, mut device_session, _) =
+            open_packet_e2ee(&mut protocol, &mut connection, device_id);
+        let token = protocol
+            .issue_pairing_token(current_unix_timestamp_millis())
+            .unwrap()
+            .token()
+            .clone();
+        let pair_responses = send_encrypted_packet(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            ProtocolPacket::request(
+                PacketRequestId::new(),
+                METHOD_PAIR_REQUEST,
+                serde_json::to_value(PairRequestPayload {
+                    device_id,
+                    device_public_key: PublicKey("device-public-key".to_owned()),
+                    token,
+                    nonce: nonce(),
+                    timestamp_ms: current_unix_timestamp_millis(),
+                })
+                .unwrap(),
+            ),
+        );
+        let _ = decrypt_first_packet(&mut device_session, pair_responses);
+
+        let create_responses = send_encrypted_packet(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            ProtocolPacket::request(
+                PacketRequestId::new(),
+                METHOD_SESSION_CREATE,
+                serde_json::to_value(SessionCreatePayload {
+                    command: vec!["sh".to_owned()],
+                    size: TerminalSize::new(24, 80),
+                })
+                .unwrap(),
+            ),
+        );
+        let created_packet = decrypt_first_packet(&mut device_session, create_responses);
+        let created: SessionCreatedPayload = decode_payload(created_packet.payload).unwrap();
+        for (terminal_seq, data) in [
+            (1, b"abcdefghij".to_vec()),
+            (2, b"klmnopqrst".to_vec()),
+            (3, b"uvwxyz1234".to_vec()),
+        ] {
+            backend.push_terminal_journal_frame_for_session(
+                created.session_id,
+                PtyTerminalFrame::Output { terminal_seq, data },
+            );
+        }
+
+        let stream_id = PacketStreamId::new();
+        let attach_responses = send_encrypted_packet(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            ProtocolPacket::stream_open(
+                PacketRequestId::new(),
+                stream_id,
+                METHOD_TERMINAL_ATTACH,
+                20,
+                serde_json::to_value(SessionAttachPayload {
+                    session_id: created.session_id,
+                    watch_updates: true,
+                    last_terminal_seq: Some(0),
+                })
+                .unwrap(),
+            ),
+        );
+        let attached_packet = decrypt_first_packet(&mut device_session, attach_responses);
+        assert_eq!(attached_packet.kind, PacketKind::Response);
+
+        let first_packets = decrypt_packets(
+            &mut device_session,
+            connection.read_session_output(&mut protocol, created.session_id, 1024),
+        );
+        assert_eq!(first_packets.len(), 1);
+        assert_eq!(first_packets[0].kind, PacketKind::StreamChunk);
+        assert_eq!(first_packets[0].seq, 1);
+        let first_batch: TerminalFramePayload =
+            decode_payload(first_packets[0].payload.clone()).unwrap();
+        match first_batch {
+            TerminalFramePayload::Batch { session_id, frames } => {
+                assert_eq!(session_id, created.session_id);
+                assert_eq!(frames.len(), 2);
+                assert_eq!(frames[0].terminal_seq(), Some(1));
+                assert_eq!(frames[1].terminal_seq(), Some(2));
+            }
+            other => panic!("expected first byte-budgeted terminal batch, got {other:?}"),
+        }
+
+        let blocked = decrypt_packets(
+            &mut device_session,
+            connection.read_session_output(&mut protocol, created.session_id, 1024),
+        );
+        assert!(
+            blocked.is_empty(),
+            "no output should be sent after byte credit is exhausted: {blocked:?}"
+        );
+
+        let _ = send_encrypted_packet(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            ProtocolPacket::flow(stream_id, 1, 10),
+        );
+        let second_packets = decrypt_packets(
+            &mut device_session,
+            connection.read_session_output(&mut protocol, created.session_id, 1024),
+        );
+        assert_eq!(second_packets.len(), 1);
+        assert_eq!(second_packets[0].kind, PacketKind::StreamChunk);
+        assert_eq!(second_packets[0].seq, 2);
+        let second: TerminalFramePayload =
+            decode_payload(second_packets[0].payload.clone()).unwrap();
+        assert_eq!(second.terminal_seq(), Some(3));
+    }
+
+    #[test]
+    fn packet_terminal_output_allows_one_frame_larger_than_current_credit() {
+        let (mut protocol, backend) = protocol();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let (_, mut device_session, _) =
+            open_packet_e2ee(&mut protocol, &mut connection, device_id);
+        let token = protocol
+            .issue_pairing_token(current_unix_timestamp_millis())
+            .unwrap()
+            .token()
+            .clone();
+        let pair_responses = send_encrypted_packet(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            ProtocolPacket::request(
+                PacketRequestId::new(),
+                METHOD_PAIR_REQUEST,
+                serde_json::to_value(PairRequestPayload {
+                    device_id,
+                    device_public_key: PublicKey("device-public-key".to_owned()),
+                    token,
+                    nonce: nonce(),
+                    timestamp_ms: current_unix_timestamp_millis(),
+                })
+                .unwrap(),
+            ),
+        );
+        let _ = decrypt_first_packet(&mut device_session, pair_responses);
+
+        let create_responses = send_encrypted_packet(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            ProtocolPacket::request(
+                PacketRequestId::new(),
+                METHOD_SESSION_CREATE,
+                serde_json::to_value(SessionCreatePayload {
+                    command: vec!["sh".to_owned()],
+                    size: TerminalSize::new(24, 80),
+                })
+                .unwrap(),
+            ),
+        );
+        let created_packet = decrypt_first_packet(&mut device_session, create_responses);
+        let created: SessionCreatedPayload = decode_payload(created_packet.payload).unwrap();
+        backend.push_terminal_journal_frame_for_session(
+            created.session_id,
+            PtyTerminalFrame::Output {
+                terminal_seq: 1,
+                data: vec![b'x'; 30],
+            },
+        );
+        backend.push_terminal_journal_frame_for_session(
+            created.session_id,
+            PtyTerminalFrame::Output {
+                terminal_seq: 2,
+                data: b"next".to_vec(),
+            },
+        );
+
+        let stream_id = PacketStreamId::new();
+        let attach_responses = send_encrypted_packet(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            ProtocolPacket::stream_open(
+                PacketRequestId::new(),
+                stream_id,
+                METHOD_TERMINAL_ATTACH,
+                20,
+                serde_json::to_value(SessionAttachPayload {
+                    session_id: created.session_id,
+                    watch_updates: true,
+                    last_terminal_seq: Some(0),
+                })
+                .unwrap(),
+            ),
+        );
+        let attached_packet = decrypt_first_packet(&mut device_session, attach_responses);
+        assert_eq!(attached_packet.kind, PacketKind::Response);
+
+        let first_packets = decrypt_packets(
+            &mut device_session,
+            connection.read_session_output(&mut protocol, created.session_id, 1024),
+        );
+        assert_eq!(
+            first_packets.len(),
+            1,
+            "单个 terminal frame 大于 credit 时也必须向前推进，否则大 snapshot 会卡死"
+        );
+        assert_eq!(first_packets[0].kind, PacketKind::StreamChunk);
+        assert_eq!(first_packets[0].seq, 1);
+        let first: TerminalFramePayload = decode_payload(first_packets[0].payload.clone()).unwrap();
+        assert_eq!(first.terminal_seq(), Some(1));
+
+        let blocked = decrypt_packets(
+            &mut device_session,
+            connection.read_session_output(&mut protocol, created.session_id, 1024),
+        );
+        assert!(
+            blocked.is_empty(),
+            "超额发送后必须等客户端按实际字节数补 credit，不能继续透支"
+        );
+
+        let _ = send_encrypted_packet(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            ProtocolPacket::flow(stream_id, 1, 30),
+        );
+        let second_packets = decrypt_packets(
+            &mut device_session,
+            connection.read_session_output(&mut protocol, created.session_id, 1024),
+        );
+        assert_eq!(second_packets.len(), 1);
+        assert_eq!(second_packets[0].seq, 2);
+        let second: TerminalFramePayload =
+            decode_payload(second_packets[0].payload.clone()).unwrap();
+        assert_eq!(second.terminal_seq(), Some(2));
     }
 
     #[test]
@@ -6622,7 +6961,7 @@ mod tests {
                 PacketRequestId::new(),
                 stream_id,
                 METHOD_TERMINAL_ATTACH,
-                4,
+                128 * 1024,
                 serde_json::to_value(SessionAttachPayload {
                     session_id: created.session_id,
                     watch_updates: true,

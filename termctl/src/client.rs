@@ -4,6 +4,7 @@
 //! `hello`/`e2ee_key_exchange`/`encrypted_frame`。pair/auth/session/control 业务
 //! 统一封装为 E2EE 内的 `packet`。relay 因而只能看到 server_id、sequence 和密文。
 
+use std::collections::VecDeque;
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
@@ -49,8 +50,7 @@ const METHOD_SESSION_RESIZE: &str = "session.resize";
 const METHOD_CONTROL_REQUEST: &str = "control.request";
 const METHOD_TERMINAL_ATTACH: &str = "terminal.attach";
 const METHOD_PING: &str = "ping";
-const TERMINAL_STREAM_INITIAL_CREDIT: u32 = 64;
-const TERMINAL_STREAM_REPLENISH_CREDIT: u32 = 16;
+const TERMINAL_STREAM_INITIAL_CREDIT: u32 = 256 * 1024;
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -59,6 +59,9 @@ pub struct TerminalStream {
     id: PacketStreamId,
     next_send_seq: u64,
     last_recv_seq: u64,
+    // 中文注释：一个 terminal stream chunk 现在可能携带 batch；termctl 没有 xterm 队列，
+    // 所以需要把同一 packet 解出的 Output/End 事件按顺序暂存在本地。
+    pending_events: VecDeque<TerminalStreamEvent>,
 }
 
 impl TerminalStream {
@@ -71,6 +74,7 @@ impl TerminalStream {
             id,
             next_send_seq: 1,
             last_recv_seq: 0,
+            pending_events: VecDeque::new(),
         }
     }
 
@@ -372,6 +376,10 @@ impl DirectClient {
         &mut self,
         stream: &mut TerminalStream,
     ) -> Result<TerminalStreamEvent> {
+        if let Some(event) = stream.pending_events.pop_front() {
+            return Ok(event);
+        }
+
         loop {
             let packet = self.receive_packet().await?;
             if packet.stream_id != Some(stream.id) {
@@ -381,31 +389,27 @@ impl DirectClient {
             match packet.kind {
                 PacketKind::StreamChunk => {
                     stream.last_recv_seq = packet.seq;
-                    self.send_packet(
-                        stream.flow_packet(packet.seq, TERMINAL_STREAM_REPLENISH_CREDIT),
-                    )
-                    .await?;
                     if let Ok(frame) =
                         decode_payload::<TerminalFramePayload>(packet.payload.clone())
                     {
                         // termctl 没有 xterm 渲染队列；它把 snapshot/output 都作为 stdout bytes 输出。
                         // resize 只更新远端终端状态，不产生本地字节；exit 则结束流。
-                        match frame {
-                            TerminalFramePayload::Snapshot { data_base64, .. }
-                            | TerminalFramePayload::Output { data_base64, .. } => {
-                                let bytes = crypto::decode_session_data(&data_base64)?;
-                                return Ok(TerminalStreamEvent::Output(bytes));
-                            }
-                            TerminalFramePayload::Resize { .. } => continue,
-                            TerminalFramePayload::Exit { .. } => {
-                                return Ok(TerminalStreamEvent::End);
-                            }
+                        let (events, credit) = terminal_frame_events_and_credit(frame)?;
+                        self.send_packet(stream.flow_packet(packet.seq, credit))
+                            .await?;
+                        stream.pending_events.extend(events);
+                        if let Some(event) = stream.pending_events.pop_front() {
+                            return Ok(event);
                         }
+                        continue;
                     }
 
                     let payload: SessionDataPayload = decode_payload(packet.payload)
                         .map_err(|_| TermctlError::InvalidEnvelope)?;
                     let bytes = crypto::decode_session_data(&payload.data_base64)?;
+                    let credit = bytes.len().max(1).min(u32::MAX as usize) as u32;
+                    self.send_packet(stream.flow_packet(packet.seq, credit))
+                        .await?;
                     return Ok(TerminalStreamEvent::Output(bytes));
                 }
                 PacketKind::StreamEnd | PacketKind::Cancel => return Ok(TerminalStreamEvent::End),
@@ -662,6 +666,54 @@ where
     Ok(ProtocolPacket::stream_chunk(stream_id, seq, payload))
 }
 
+fn terminal_frame_events_and_credit(
+    frame: TerminalFramePayload,
+) -> Result<(Vec<TerminalStreamEvent>, u32)> {
+    match frame {
+        TerminalFramePayload::Snapshot { data_base64, .. }
+        | TerminalFramePayload::Output { data_base64, .. } => {
+            let bytes = crypto::decode_session_data(&data_base64)?;
+            let credit = bytes.len().max(1).min(u32::MAX as usize) as u32;
+            Ok((vec![TerminalStreamEvent::Output(bytes)], credit))
+        }
+        TerminalFramePayload::Resize { .. } => Ok((Vec::new(), 1)),
+        TerminalFramePayload::Exit { .. } => Ok((vec![TerminalStreamEvent::End], 1)),
+        TerminalFramePayload::Batch { frames, .. } => {
+            let mut events = Vec::new();
+            let mut credit = 0_u32;
+            for frame in frames {
+                let (frame_events, frame_credit) = terminal_frame_events_and_credit(frame)?;
+                credit = credit.saturating_add(frame_credit.max(1));
+                let saw_end = frame_events
+                    .iter()
+                    .any(|event| matches!(event, TerminalStreamEvent::End));
+                events.extend(frame_events);
+                if saw_end {
+                    break;
+                }
+            }
+            Ok((coalesce_terminal_output_events(events), credit.max(1)))
+        }
+    }
+}
+
+fn coalesce_terminal_output_events(events: Vec<TerminalStreamEvent>) -> Vec<TerminalStreamEvent> {
+    let mut coalesced = Vec::new();
+    for event in events {
+        match event {
+            TerminalStreamEvent::Output(bytes) => {
+                if let Some(TerminalStreamEvent::Output(previous)) = coalesced.last_mut() {
+                    previous.extend(bytes);
+                } else {
+                    coalesced.push(TerminalStreamEvent::Output(bytes));
+                }
+            }
+            TerminalStreamEvent::End => coalesced.push(TerminalStreamEvent::End),
+        }
+    }
+    coalesced
+}
+
 fn packet_envelope(packet: ProtocolPacket<Value>) -> Result<JsonEnvelope> {
     envelope_value(MessageType::Packet, packet).map_err(Into::into)
 }
@@ -857,6 +909,36 @@ mod tests {
         let cancel = stream.cancel_packet();
         assert_eq!(cancel.kind, PacketKind::Cancel);
         assert_eq!(cancel.stream_id, Some(stream_id));
+    }
+
+    #[test]
+    fn terminal_frame_batch_keeps_output_before_exit_for_termctl() {
+        let session_id = SessionId::new();
+        let (events, credit) = terminal_frame_events_and_credit(TerminalFramePayload::Batch {
+            session_id,
+            frames: vec![
+                TerminalFramePayload::Output {
+                    session_id,
+                    terminal_seq: 1,
+                    data_base64: crypto::encode_session_data(b"bye"),
+                },
+                TerminalFramePayload::Exit {
+                    session_id,
+                    terminal_seq: 2,
+                    code: Some(0),
+                },
+            ],
+        })
+        .expect("batch should decode");
+
+        assert_eq!(
+            events,
+            vec![
+                TerminalStreamEvent::Output(b"bye".to_vec()),
+                TerminalStreamEvent::End
+            ]
+        );
+        assert_eq!(credit, 4);
     }
 
     #[test]

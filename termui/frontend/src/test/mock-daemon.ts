@@ -218,6 +218,14 @@ export class MockDaemon {
     }
   }
 
+  pushTerminalFrameBatch(sessionId: UUID, frames: unknown[]): void {
+    for (const connection of this.connections) {
+      if (connection.e2ee && connection.watchedSessionIds.has(sessionId)) {
+        this.sendTerminalStreamBatch(connection, sessionId, frames);
+      }
+    }
+  }
+
   pushSessionDataToAll(sessionId: UUID, text: string): void {
     // 后台 session 只发 activity 标记，不把未打开 session 的输出内容灌进当前 xterm。
     for (const connection of this.connections) {
@@ -1177,6 +1185,26 @@ export class MockDaemon {
       stream_id: stream.streamId,
       seq,
       payload,
+    });
+  }
+
+  private sendTerminalStreamBatch(connection: MockConnection, sessionId: UUID, frames: unknown[]): void {
+    const stream = connection.terminalStreamsBySession.get(sessionId);
+    if (!stream || !stream.watchUpdates) {
+      return;
+    }
+    const seq = stream.nextOutputSeq;
+    stream.nextOutputSeq += 1;
+    this.sendPacket(connection, {
+      version: PROTOCOL_PACKET_VERSION,
+      kind: "stream_chunk",
+      stream_id: stream.streamId,
+      seq,
+      payload: {
+        kind: "batch",
+        session_id: sessionId,
+        frames,
+      },
     });
   }
 

@@ -833,6 +833,7 @@ pub enum TerminalFrameKind {
     Output,
     Resize,
     Exit,
+    Batch,
 }
 
 /// packet terminal stream 的结构化帧。
@@ -863,6 +864,10 @@ pub enum TerminalFramePayload {
         terminal_seq: u64,
         code: Option<i32>,
     },
+    Batch {
+        session_id: SessionId,
+        frames: Vec<TerminalFramePayload>,
+    },
 }
 
 impl TerminalFramePayload {
@@ -871,7 +876,18 @@ impl TerminalFramePayload {
             Self::Snapshot { session_id, .. }
             | Self::Output { session_id, .. }
             | Self::Resize { session_id, .. }
-            | Self::Exit { session_id, .. } => *session_id,
+            | Self::Exit { session_id, .. }
+            | Self::Batch { session_id, .. } => *session_id,
+        }
+    }
+
+    pub fn terminal_seq(&self) -> Option<u64> {
+        match self {
+            Self::Output { terminal_seq, .. }
+            | Self::Resize { terminal_seq, .. }
+            | Self::Exit { terminal_seq, .. } => Some(*terminal_seq),
+            Self::Batch { frames, .. } => frames.iter().filter_map(Self::terminal_seq).next_back(),
+            Self::Snapshot { .. } => None,
         }
     }
 }
@@ -1583,6 +1599,14 @@ mod tests {
             session_id,
             terminal_seq: 1027,
             code: Some(0),
+        });
+        assert_roundtrip(TerminalFramePayload::Batch {
+            session_id,
+            frames: vec![TerminalFramePayload::Output {
+                session_id,
+                terminal_seq: 1028,
+                data_base64: "YmF0Y2g=".to_owned(),
+            }],
         });
         assert_roundtrip(SessionActivityPayload {
             session_id,

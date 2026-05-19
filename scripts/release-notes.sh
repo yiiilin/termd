@@ -12,6 +12,23 @@ version="${1:-}"
 }
 
 case "$version" in
+  0.3.2)
+    cat <<'EOF'
+termd 0.3.2
+
+用户可见变化:
+- terminal stream 输出从“按 frame 数量限速”改为“按已渲染字节数补 credit”；大量小输出不再被少量 frame credit 人为卡住，突然输出大段内容时会更快成批出现在 Web 终端里。
+- daemon 会把多个 terminal frame 合成一个 `batch` stream chunk 发送，同时保留每个 frame 原本的 `terminal_seq` 边界；浏览器仍按 snapshot/output/resize/exit 的顺序渲染和确认，不牺牲重连一致性。
+- Web 端收到 batch 后会展开成独立 terminal frame，再按每帧实际字节数回补 credit；同一个传输 chunk 内的多帧输出会一起走 xterm 的批量写入路径，降低“一行一行蹦出来”的感觉。
+- termctl 同步支持 terminal batch；如果同一个 batch 里包含输出和 exit，会先把退出前的输出写到 stdout，再结束 attach 流。
+- 单个 snapshot/output 大于当前 credit 时，daemon 允许它独占一个 stream chunk 发送，并把 credit 饱和扣到 0，避免大 snapshot 因不可拆帧永久卡住。
+- 本地源码更新、direct daemon、relay 中转、桌面和移动端浏览器路径都经过回归验证。
+
+兼容性:
+- supervisor 兼容版本未变化，仍为 `0.3.1`；从 0.3.1 更新到 0.3.2 不应终止或清空已有 live session supervisor。
+- packet protocol version 仍为 3，但 terminal stream 新增 `terminal_frame.batch` payload；daemon、Web UI 和 termctl 建议同步升级到 0.3.2。relay 仍是 dumb pipe，不解密也不解析业务内容。
+EOF
+    ;;
   0.3.1)
     cat <<'EOF'
 termd 0.3.1

@@ -489,7 +489,7 @@ export interface SessionDataPayload {
   data_base64: string;
 }
 
-export type TerminalFrameKind = "snapshot" | "output" | "resize" | "exit";
+export type TerminalFrameKind = "snapshot" | "output" | "resize" | "exit" | "batch";
 
 export type TerminalFramePayload =
   | {
@@ -516,9 +516,16 @@ export type TerminalFramePayload =
       session_id: UUID;
       terminal_seq: number;
       code?: number | null;
+    }
+  | {
+      kind: "batch";
+      session_id: UUID;
+      frames: TerminalFramePayload[];
     };
 
-export type RenderableTerminalFramePayload = TerminalFramePayload & {
+export type SingleTerminalFramePayload = Exclude<TerminalFramePayload, { kind: "batch" }>;
+
+export type RenderableTerminalFramePayload = SingleTerminalFramePayload & {
   /**
    * 前端内部字段：连接内 stream seq，用于 xterm 渲染完成后补 flow credit。
    * 这个字段不属于 wire payload，不能由 daemon/relay 解释。
@@ -528,6 +535,10 @@ export type RenderableTerminalFramePayload = TerminalFramePayload & {
    * 前端内部字段：当前 packet stream id，方便调试和测试流控归属。
    */
   stream_id: PacketStreamId;
+  /**
+   * 前端内部字段：本 frame 渲染完成后应该补回 daemon 的字节 credit。
+   */
+  render_credit: number;
 };
 
 export interface SessionActivityPayload {

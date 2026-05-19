@@ -196,7 +196,7 @@ describe("DirectClient", () => {
     expect(errorPacket?.id).toBe(closePacket?.id);
   });
 
-  it("terminal attach 使用 stream packet，输出和输入带 seq，渲染完成后发送 flow 与 cancel", async () => {
+  it("terminal attach 使用 stream packet，输出和输入带 seq，渲染完成后按字节发送 flow 与 cancel", async () => {
     const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000311");
     const pairClient = await connectDevice(device.device_id);
     const accepted = await pairClient.pair("secret-token", device.device_public_key);
@@ -213,7 +213,7 @@ describe("DirectClient", () => {
     const list = await client.listSessions();
     const attached = await client.attachSession(list.sessions[0].session_id);
     const output = await client.receiveInner();
-    client.ackTerminalRender(attached.session_id, 1, 1);
+    client.ackTerminalRender(attached.session_id, 1, 64 * 1024);
     await client.sendSessionData(attached.session_id, new TextEncoder().encode("stream-input"));
     client.close();
     await new Promise((resolve) => setTimeout(resolve, 20));
@@ -242,9 +242,71 @@ describe("DirectClient", () => {
     });
     expect(receivedPackets.find((packet) => packet.kind === "flow" && packet.stream_id === streamId)).toMatchObject({
       ack: 1,
-      credit: 1,
+      credit: 64 * 1024,
     });
     expect(receivedPackets.find((packet) => packet.kind === "cancel" && packet.stream_id === streamId)).toBeTruthy();
+  });
+
+  it("terminal stream batch 会展开为多个 terminal_frame，并按每帧字节数补 credit", async () => {
+    const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000315");
+    const pairClient = await connectDevice(device.device_id);
+    const accepted = await pairClient.pair("secret-token", device.device_public_key);
+    pairClient.close();
+
+    const client = await connectDevice(device.device_id);
+    await client.authenticate(device, {
+      server_id: accepted.server_id,
+      daemon_public_key: accepted.daemon_public_key,
+      url: daemon.url,
+      paired_at_ms: 1710000000000,
+    });
+
+    const list = await client.listSessions();
+    const attached = await client.attachSession(list.sessions[0].session_id);
+    await client.receiveInner();
+    daemon.pushTerminalFrameBatch(attached.session_id, [
+      {
+        kind: "output",
+        session_id: attached.session_id,
+        terminal_seq: 1,
+        data_base64: "YWJjZA==",
+      },
+      {
+        kind: "output",
+        session_id: attached.session_id,
+        terminal_seq: 2,
+        data_base64: "ZWZnaGlq",
+      },
+    ]);
+
+    const first = await client.receiveInner();
+    const second = await client.receiveInner();
+    const batchTransportSeq = (first.payload as { transport_seq: number }).transport_seq;
+    client.ackTerminalRender(attached.session_id, batchTransportSeq, (first.payload as { render_credit: number }).render_credit);
+    client.ackTerminalRender(attached.session_id, batchTransportSeq, (second.payload as { render_credit: number }).render_credit);
+    client.close();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(first).toMatchObject({
+      type: "terminal_frame",
+      payload: { kind: "output", terminal_seq: 1, transport_seq: batchTransportSeq, render_credit: 4 },
+    });
+    expect(second).toMatchObject({
+      type: "terminal_frame",
+      payload: { kind: "output", terminal_seq: 2, transport_seq: batchTransportSeq, render_credit: 6 },
+    });
+
+    const streamId = (
+      daemon as unknown as {
+        receivedPackets?: Array<{ kind: string; method?: string; stream_id?: string }>;
+      }
+    ).receivedPackets?.find((packet) => packet.kind === "stream_open" && packet.method === "terminal.attach")?.stream_id;
+    const flows = (
+      daemon as unknown as {
+        receivedPackets?: Array<{ kind: string; stream_id?: string; ack?: number; credit?: number }>;
+      }
+    ).receivedPackets?.filter((packet) => packet.kind === "flow" && packet.stream_id === streamId && packet.ack === batchTransportSeq) ?? [];
+    expect(flows.reduce((total, packet) => total + (packet.credit ?? 0), 0)).toBe(10);
   });
 
   it("短连接 attach 可以只拿 session 权限，不订阅终端输出", async () => {

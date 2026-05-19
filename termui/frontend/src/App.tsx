@@ -584,18 +584,19 @@ export default function App() {
     client.ackTerminalRender(pending.sessionId, pending.lastTransportSeq, pending.credit);
   }, []);
 
-  const markTerminalFrameRendered = useCallback((sessionId: UUID, transportSeq: number) => {
+  const markTerminalFrameRendered = useCallback((sessionId: UUID, transportSeq: number, renderCredit: number) => {
+    const credit = Math.max(1, Math.floor(renderCredit));
     const pending = terminalRenderAckRef.current;
     if (!pending || pending.sessionId !== sessionId) {
       if (pending && attachClientRef.current) {
         attachClientRef.current.ackTerminalRender(pending.sessionId, pending.lastTransportSeq, pending.credit);
       }
-      terminalRenderAckRef.current = { sessionId, lastTransportSeq: transportSeq, credit: 1 };
+      terminalRenderAckRef.current = { sessionId, lastTransportSeq: transportSeq, credit };
     } else {
       pending.lastTransportSeq = Math.max(pending.lastTransportSeq, transportSeq);
-      pending.credit += 1;
+      pending.credit += credit;
     }
-    if ((terminalRenderAckRef.current?.credit ?? 0) >= 8) {
+    if ((terminalRenderAckRef.current?.credit ?? 0) >= 64 * 1024) {
       flushRenderedTerminalAck();
     }
   }, [flushRenderedTerminalAck]);
@@ -1312,7 +1313,7 @@ export default function App() {
               markNewOutputIfBackground(payload.session_id);
               continue;
             }
-            const onRendered = () => markTerminalFrameRendered(payload.session_id, payload.transport_seq);
+            const onRendered = () => markTerminalFrameRendered(payload.session_id, payload.transport_seq, payload.render_credit);
             if (payload.kind === "snapshot") {
               enqueueTerminalOutput({
                 kind: "snapshot",

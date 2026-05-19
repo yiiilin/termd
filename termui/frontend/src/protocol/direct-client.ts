@@ -71,6 +71,7 @@ import type {
   SessionResizedPayload,
   SessionSearchPayload,
   SessionSearchResultPayload,
+  SingleTerminalFramePayload,
   TerminalSize,
   UUID,
 } from "./types";
@@ -114,9 +115,14 @@ interface TerminalStreamState {
 }
 
 const DEFAULT_TIMEOUT_MS = 30000;
-const INITIAL_TERMINAL_STREAM_CREDIT = 8;
+const INITIAL_TERMINAL_STREAM_CREDIT = 256 * 1024;
 
 export { ProtocolClientError };
+
+function base64DecodedLength(dataBase64: string): number {
+  const trimmed = dataBase64.replace(/=+$/, "");
+  return Math.floor((trimmed.length * 3) / 4);
+}
 
 export class DirectClient {
   private readonly timeoutMs: number;
@@ -729,17 +735,49 @@ export class DirectClient {
     if (stream) {
       stream.lastOutputSeq = seq;
     }
-    const payload = packet.payload as { kind?: unknown; session_id?: unknown };
-    if (payload.kind === "snapshot" || payload.kind === "output" || payload.kind === "resize" || payload.kind === "exit") {
-      this.enqueueInner(envelope("terminal_frame", {
-        ...(packet.payload as object),
-        transport_seq: seq,
-        stream_id: packet.stream_id,
-      } as RenderableTerminalFramePayload));
+    const payload = packet.payload as { kind?: unknown; session_id?: unknown; frames?: unknown };
+    if (payload.kind === "batch" && Array.isArray(payload.frames)) {
+      for (const frame of payload.frames) {
+        if (this.isTerminalFramePayload(frame)) {
+          this.enqueueTerminalFrame(frame, packet.stream_id, seq);
+        }
+      }
+      return;
+    }
+    if (this.isTerminalFramePayload(payload)) {
+      this.enqueueTerminalFrame(payload, packet.stream_id, seq);
       return;
     }
 
     this.enqueueInner(envelope("session_data", packet.payload as SessionDataPayload));
+  }
+
+  private enqueueTerminalFrame(
+    payload: SingleTerminalFramePayload,
+    streamId: PacketStreamId,
+    transportSeq: number,
+  ): void {
+    this.enqueueInner(envelope("terminal_frame", {
+      ...(payload as object),
+      transport_seq: transportSeq,
+      stream_id: streamId,
+      render_credit: this.terminalFrameRenderCredit(payload),
+    } as RenderableTerminalFramePayload));
+  }
+
+  private isTerminalFramePayload(payload: unknown): payload is SingleTerminalFramePayload {
+    if (!payload || typeof payload !== "object") {
+      return false;
+    }
+    const kind = (payload as { kind?: unknown }).kind;
+    return kind === "snapshot" || kind === "output" || kind === "resize" || kind === "exit";
+  }
+
+  private terminalFrameRenderCredit(payload: SingleTerminalFramePayload): number {
+    if (payload.kind === "snapshot" || payload.kind === "output") {
+      return Math.max(1, base64DecodedLength(payload.data_base64));
+    }
+    return 1;
   }
 
   ackTerminalRender(sessionId: UUID, transportSeq: number, credit: number): void {
