@@ -28,7 +28,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, timeout};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::auth::current_unix_timestamp_millis;
 use crate::config::DaemonConfig;
@@ -37,7 +37,8 @@ use crate::pty::{PtyRestoreInfo, PtySupervisorStatus};
 use crate::state::{DaemonState, SessionStateRecord, StateError, StateStore};
 
 use super::protocol::{
-    DaemonProtocol, JsonEnvelope, ProtocolConnection, ProtocolError, decode_payload, envelope_value,
+    DaemonProtocol, JsonEnvelope, ProtocolConnection, ProtocolConnectionDebugSnapshot,
+    ProtocolConnectionDebugTraffic, ProtocolError, decode_payload, envelope_value,
 };
 use super::signature::Ed25519SignatureVerifier;
 
@@ -50,6 +51,14 @@ const WEBSOCKET_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const WEBSOCKET_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(25);
 const WEBSOCKET_MAX_FRAME_SIZE: usize = 1024 * 1024;
 const WEBSOCKET_MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
+const SESSION_ACTIVITY_PUSH_MIN_INTERVAL: Duration = Duration::from_millis(250);
+const WEBSOCKET_TRAFFIC_LOG_INTERVAL: Duration = Duration::from_secs(1);
+const WEBSOCKET_SEND_SLOW_LOG_THRESHOLD: Duration = Duration::from_millis(50);
+const WEBSOCKET_SEND_DEBUG_LOG_THRESHOLD: Duration = Duration::from_millis(10);
+const WEBSOCKET_SEND_DEBUG_BATCH_ENVELOPES: usize = 8;
+const WEBSOCKET_SEND_DEBUG_BATCH_BYTES: usize = 32 * 1024;
+const WEBSOCKET_SEND_INFO_BATCH_ENVELOPES: usize = 20;
+const WEBSOCKET_SEND_INFO_BATCH_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SessionPushEvent {
@@ -57,6 +66,156 @@ enum SessionPushEvent {
     Activity(SessionId),
     FileTree(SessionId),
     Resize(SessionId),
+}
+
+impl SessionPushEvent {
+    fn min_interval(self) -> Option<Duration> {
+        match self {
+            // Activity 只是前端列表里的“后台有新输出”提示；不需要按 PTY 输出频率逐包推送。
+            // 多窗口 attach 时，如果后台 session 高频输出，未限速的小加密包会按窗口数放大，
+            // 造成浏览器 WebSocket 队列和 daemon 事件循环都被固定长度小包拖慢。
+            SessionPushEvent::Activity(_) => Some(SESSION_ACTIVITY_PUSH_MIN_INTERVAL),
+            SessionPushEvent::Output(_)
+            | SessionPushEvent::FileTree(_)
+            | SessionPushEvent::Resize(_) => None,
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct WebSocketTrafficBucket {
+    calls: u64,
+    envelopes: u64,
+    bytes: u64,
+}
+
+impl WebSocketTrafficBucket {
+    fn record(&mut self, envelopes: usize, bytes: usize) {
+        self.calls = self.calls.saturating_add(1);
+        self.envelopes = self.envelopes.saturating_add(envelopes as u64);
+        self.bytes = self.bytes.saturating_add(bytes as u64);
+    }
+
+    fn is_empty(self) -> bool {
+        self.calls == 0 && self.envelopes == 0 && self.bytes == 0
+    }
+}
+
+#[derive(Debug, Default)]
+struct WebSocketTrafficCounters {
+    in_text: WebSocketTrafficBucket,
+    in_binary: WebSocketTrafficBucket,
+    in_ping: WebSocketTrafficBucket,
+    in_pong: WebSocketTrafficBucket,
+    in_close: WebSocketTrafficBucket,
+    out_route_ready: WebSocketTrafficBucket,
+    out_initial: WebSocketTrafficBucket,
+    out_response: WebSocketTrafficBucket,
+    out_push_output: WebSocketTrafficBucket,
+    out_push_activity: WebSocketTrafficBucket,
+    out_push_file_tree: WebSocketTrafficBucket,
+    out_push_resize: WebSocketTrafficBucket,
+    out_plain_error: WebSocketTrafficBucket,
+    out_ping: WebSocketTrafficBucket,
+    out_pong: WebSocketTrafficBucket,
+    send_errors: u64,
+}
+
+impl WebSocketTrafficCounters {
+    fn record_in(&mut self, message: &Message) {
+        match message {
+            Message::Text(raw) => self.in_text.record(1, raw.len()),
+            Message::Binary(raw) => self.in_binary.record(1, raw.len()),
+            Message::Ping(payload) => self.in_ping.record(0, payload.len()),
+            Message::Pong(payload) => self.in_pong.record(0, payload.len()),
+            Message::Close(_) => self.in_close.record(0, 0),
+        }
+    }
+
+    fn record_out(&mut self, kind: WebSocketOutKind, envelopes: usize, bytes: usize) {
+        if kind.is_payload_batch() && envelopes == 0 && bytes == 0 {
+            return;
+        }
+        match kind {
+            WebSocketOutKind::RouteReady => self.out_route_ready.record(envelopes, bytes),
+            WebSocketOutKind::Initial => self.out_initial.record(envelopes, bytes),
+            WebSocketOutKind::Response => self.out_response.record(envelopes, bytes),
+            WebSocketOutKind::PushOutput => self.out_push_output.record(envelopes, bytes),
+            WebSocketOutKind::PushActivity => self.out_push_activity.record(envelopes, bytes),
+            WebSocketOutKind::PushFileTree => self.out_push_file_tree.record(envelopes, bytes),
+            WebSocketOutKind::PushResize => self.out_push_resize.record(envelopes, bytes),
+            WebSocketOutKind::PlainError => self.out_plain_error.record(envelopes, bytes),
+            WebSocketOutKind::Ping => self.out_ping.record(envelopes, bytes),
+            WebSocketOutKind::Pong => self.out_pong.record(envelopes, bytes),
+        }
+    }
+
+    fn record_send_error(&mut self) {
+        self.send_errors = self.send_errors.saturating_add(1);
+    }
+
+    fn has_activity(&self) -> bool {
+        !self.in_text.is_empty()
+            || !self.in_binary.is_empty()
+            || !self.in_ping.is_empty()
+            || !self.in_pong.is_empty()
+            || !self.in_close.is_empty()
+            || !self.out_route_ready.is_empty()
+            || !self.out_initial.is_empty()
+            || !self.out_response.is_empty()
+            || !self.out_push_output.is_empty()
+            || !self.out_push_activity.is_empty()
+            || !self.out_push_file_tree.is_empty()
+            || !self.out_push_resize.is_empty()
+            || !self.out_plain_error.is_empty()
+            || !self.out_ping.is_empty()
+            || !self.out_pong.is_empty()
+            || self.send_errors > 0
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum WebSocketOutKind {
+    RouteReady,
+    Initial,
+    Response,
+    PushOutput,
+    PushActivity,
+    PushFileTree,
+    PushResize,
+    PlainError,
+    Ping,
+    Pong,
+}
+
+impl WebSocketOutKind {
+    fn is_payload_batch(self) -> bool {
+        // control frame 发送本身就是事件；业务 batch 如果没有 envelope，就不要污染空转诊断。
+        !matches!(self, Self::Ping | Self::Pong)
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::RouteReady => "route_ready",
+            Self::Initial => "initial",
+            Self::Response => "response",
+            Self::PushOutput => "push_output",
+            Self::PushActivity => "push_activity",
+            Self::PushFileTree => "push_file_tree",
+            Self::PushResize => "push_resize",
+            Self::PlainError => "plain_error",
+            Self::Ping => "ping",
+            Self::Pong => "pong",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WebSocketWatcherCounts {
+    output: usize,
+    activity: usize,
+    file_tree: usize,
+    resize: usize,
 }
 
 pub type DefaultDaemonProtocol = DaemonProtocol<SupervisorPtyBackend, Ed25519SignatureVerifier>;
@@ -585,6 +744,123 @@ fn route_ready_envelope(server_id: ServerId, role: RouteRole) -> JsonEnvelope {
     .expect("route_ready payload should serialize")
 }
 
+fn current_websocket_watcher_counts(
+    watched_output_sessions: &HashSet<SessionId>,
+    watched_activity_sessions: &HashSet<SessionId>,
+    watched_file_tree_sessions: &HashSet<SessionId>,
+    watched_resize_sessions: &HashSet<SessionId>,
+) -> WebSocketWatcherCounts {
+    WebSocketWatcherCounts {
+        output: watched_output_sessions.len(),
+        activity: watched_activity_sessions.len(),
+        file_tree: watched_file_tree_sessions.len(),
+        resize: watched_resize_sessions.len(),
+    }
+}
+
+fn maybe_log_websocket_traffic(
+    peer_addr: SocketAddr,
+    traffic: &mut WebSocketTrafficCounters,
+    last_logged_at: &mut Instant,
+    connection: &mut ProtocolConnection,
+    watchers: WebSocketWatcherCounts,
+    force: bool,
+) {
+    if !traffic.has_activity() {
+        return;
+    }
+    if !force && last_logged_at.elapsed() < WEBSOCKET_TRAFFIC_LOG_INTERVAL {
+        return;
+    }
+
+    let flow = connection.debug_snapshot();
+    let protocol_traffic = connection.take_debug_traffic();
+    if websocket_traffic_should_promote_to_info(
+        traffic,
+        &protocol_traffic,
+        flow.zero_credit_terminal_streams,
+    ) {
+        info_websocket_traffic(peer_addr, traffic, &protocol_traffic, watchers, flow);
+    } else {
+        debug_websocket_traffic(peer_addr, traffic, &protocol_traffic, watchers, flow);
+    }
+    *traffic = WebSocketTrafficCounters::default();
+    *last_logged_at = Instant::now();
+}
+
+fn websocket_traffic_should_promote_to_info(
+    traffic: &WebSocketTrafficCounters,
+    protocol_traffic: &ProtocolConnectionDebugTraffic,
+    zero_credit_terminal_streams: usize,
+) -> bool {
+    // 正常心跳、RPC 和 activity 计数只进 debug；只有疑似空转/背压/断连时提升到 info，
+    // 这样线上默认日志能抓到异常，又不会长期刷屏。
+    traffic.send_errors > 0
+        || traffic.out_push_output.calls > 1_000
+        || traffic.out_response.calls > 20
+        || traffic.out_response.envelopes > 20
+        || traffic.out_push_activity.calls > 100
+        || protocol_traffic.inbound_flow_packets > 200
+        || protocol_traffic.method_count_exceeds(20)
+        || protocol_traffic.inbound_stream_chunks > 100
+        || protocol_traffic.outbound_stream_chunks > 100
+        || (zero_credit_terminal_streams > 0 && traffic.out_push_output.calls > 0)
+}
+
+fn info_websocket_traffic(
+    peer_addr: SocketAddr,
+    traffic: &WebSocketTrafficCounters,
+    protocol_traffic: &ProtocolConnectionDebugTraffic,
+    watchers: WebSocketWatcherCounts,
+    flow: ProtocolConnectionDebugSnapshot,
+) {
+    info!(
+        peer_addr = %peer_addr,
+        ?traffic,
+        ?protocol_traffic,
+        watchers_output = watchers.output,
+        watchers_activity = watchers.activity,
+        watchers_file_tree = watchers.file_tree,
+        watchers_resize = watchers.resize,
+        flow_packet_mode = flow.packet_mode,
+        flow_attached_sessions = flow.attached_sessions,
+        flow_watched_sessions = flow.watched_sessions,
+        flow_terminal_streams = flow.terminal_streams,
+        flow_zero_credit_terminal_streams = flow.zero_credit_terminal_streams,
+        flow_total_output_credit = flow.total_output_credit,
+        flow_pending_raw_chunks = flow.pending_raw_chunks,
+        flow_pending_terminal_frames = flow.pending_terminal_frames,
+        "websocket traffic counters"
+    );
+}
+
+fn debug_websocket_traffic(
+    peer_addr: SocketAddr,
+    traffic: &WebSocketTrafficCounters,
+    protocol_traffic: &ProtocolConnectionDebugTraffic,
+    watchers: WebSocketWatcherCounts,
+    flow: ProtocolConnectionDebugSnapshot,
+) {
+    debug!(
+        peer_addr = %peer_addr,
+        ?traffic,
+        ?protocol_traffic,
+        watchers_output = watchers.output,
+        watchers_activity = watchers.activity,
+        watchers_file_tree = watchers.file_tree,
+        watchers_resize = watchers.resize,
+        flow_packet_mode = flow.packet_mode,
+        flow_attached_sessions = flow.attached_sessions,
+        flow_watched_sessions = flow.watched_sessions,
+        flow_terminal_streams = flow.terminal_streams,
+        flow_zero_credit_terminal_streams = flow.zero_credit_terminal_streams,
+        flow_total_output_credit = flow.total_output_credit,
+        flow_pending_raw_chunks = flow.pending_raw_chunks,
+        flow_pending_terminal_frames = flow.pending_terminal_frames,
+        "websocket traffic counters"
+    );
+}
+
 async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_addr: SocketAddr) {
     let (mut sender, mut receiver) = socket.split();
     let (push_event_tx, mut push_event_rx) = mpsc::unbounded_channel::<SessionPushEvent>();
@@ -593,6 +869,8 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
     let mut watched_file_tree_sessions = HashSet::new();
     let mut watched_resize_sessions = HashSet::new();
     let mut watcher_tasks: Vec<JoinHandle<()>> = Vec::new();
+    let mut traffic = WebSocketTrafficCounters::default();
+    let mut last_traffic_log = Instant::now();
     let server_id = {
         let protocol = protocol.lock().expect("daemon protocol mutex poisoned");
         protocol.server_id()
@@ -606,22 +884,38 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
     {
         Ok(Ok(route_hello)) => route_hello,
         Ok(Err(error)) => {
-            let _ = send_envelope(&mut sender, plaintext_error(error)).await;
+            if let Ok(bytes) = send_envelope_logged(
+                peer_addr,
+                &mut sender,
+                plaintext_error(error),
+                "plain_error",
+                true,
+            )
+            .await
+            {
+                traffic.record_out(WebSocketOutKind::PlainError, 1, bytes);
+            }
             return;
         }
         Err(_) => {
-            let _ = send_envelope(&mut sender, route_prelude_timeout_error()).await;
+            if let Ok(bytes) = send_envelope_logged(
+                peer_addr,
+                &mut sender,
+                route_prelude_timeout_error(),
+                "plain_error",
+                true,
+            )
+            .await
+            {
+                traffic.record_out(WebSocketOutKind::PlainError, 1, bytes);
+            }
             return;
         }
     };
-    if send_envelope(
-        &mut sender,
-        route_ready_envelope(route_hello.server_id, route_hello.role),
-    )
-    .await
-    .is_err()
-    {
-        return;
+    let route_ready = route_ready_envelope(route_hello.server_id, route_hello.role);
+    match send_envelope_logged(peer_addr, &mut sender, route_ready, "route_ready", true).await {
+        Ok(bytes) => traffic.record_out(WebSocketOutKind::RouteReady, 1, bytes),
+        Err(()) => return,
     }
 
     let (mut connection, initial_messages) = {
@@ -629,8 +923,10 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
         protocol.start_connection_for_peer(Some(peer_addr.ip().to_string()))
     };
 
-    if send_envelopes(&mut sender, initial_messages).await.is_err() {
-        return;
+    let initial_count = initial_messages.len();
+    match send_envelopes_logged(peer_addr, &mut sender, initial_messages, "initial").await {
+        Ok(bytes) => traffic.record_out(WebSocketOutKind::Initial, initial_count, bytes),
+        Err(()) => return,
     }
 
     let mut idle_deadline = Instant::now() + WEBSOCKET_IDLE_TIMEOUT;
@@ -642,7 +938,10 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
     let mut pending_pong_deadline: Option<Instant> = None;
     loop {
         let pending_pong_deadline_snapshot = pending_pong_deadline;
+        // 控制和 client close 必须先于输出队列处理；快速切换时旧 attach 才能及时取消。
         tokio::select! {
+            biased;
+
             _ = tokio::time::sleep_until(idle_deadline) => {
                 warn!(peer_addr = %peer_addr, "websocket idle timeout");
                 break;
@@ -657,22 +956,6 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
                 warn!(peer_addr = %peer_addr, "websocket pong timed out");
                 break;
             }
-            _ = heartbeat.tick() => {
-                if pending_pong_deadline.is_none() {
-                    if send_message_with_deadline(
-                        &mut sender,
-                        Message::Ping(Vec::new()),
-                        WEBSOCKET_SEND_DEADLINE,
-                        "websocket ping failed",
-                    )
-                    .await
-                    .is_err()
-                    {
-                        break;
-                    }
-                    pending_pong_deadline = Some(Instant::now() + WEBSOCKET_PONG_DEADLINE);
-                }
-            }
             maybe_message = receiver.next() => {
                 let Some(message) = maybe_message else {
                     break;
@@ -685,9 +968,11 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
                     }
                 };
                 idle_deadline = Instant::now() + WEBSOCKET_IDLE_TIMEOUT;
+                traffic.record_in(&message);
 
                 match message {
                     Message::Ping(payload) => {
+                        let pong_bytes = payload.len();
                         if send_message_with_deadline(
                             &mut sender,
                             Message::Pong(payload),
@@ -697,12 +982,40 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
                         .await
                         .is_err()
                         {
+                            traffic.record_send_error();
                             break;
                         }
+                        traffic.record_out(WebSocketOutKind::Pong, 0, pong_bytes);
+                        maybe_log_websocket_traffic(
+                            peer_addr,
+                            &mut traffic,
+                            &mut last_traffic_log,
+                            &mut connection,
+                            current_websocket_watcher_counts(
+                                &watched_output_sessions,
+                                &watched_activity_sessions,
+                                &watched_file_tree_sessions,
+                                &watched_resize_sessions,
+                            ),
+                            false,
+                        );
                         continue;
                     }
                     Message::Pong(_) => {
                         pending_pong_deadline = None;
+                        maybe_log_websocket_traffic(
+                            peer_addr,
+                            &mut traffic,
+                            &mut last_traffic_log,
+                            &mut connection,
+                            current_websocket_watcher_counts(
+                                &watched_output_sessions,
+                                &watched_activity_sessions,
+                                &watched_file_tree_sessions,
+                                &watched_resize_sessions,
+                            ),
+                            false,
+                        );
                         continue;
                     }
                     Message::Close(_) => break,
@@ -710,7 +1023,31 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
                         let Some(envelope) = (match message_to_envelope(other) {
                             Ok(envelope) => envelope,
                             Err(error) => {
-                                let _ = send_envelope(&mut sender, plaintext_error(error)).await;
+                                match send_envelope_logged(
+                                    peer_addr,
+                                    &mut sender,
+                                    plaintext_error(error),
+                                    "plain_error",
+                                    true,
+                                )
+                                .await
+                                {
+                                    Ok(bytes) => traffic.record_out(WebSocketOutKind::PlainError, 1, bytes),
+                                    Err(()) => traffic.record_send_error(),
+                                }
+                                maybe_log_websocket_traffic(
+                                    peer_addr,
+                                    &mut traffic,
+                                    &mut last_traffic_log,
+                                    &mut connection,
+                            current_websocket_watcher_counts(
+                                        &watched_output_sessions,
+                                        &watched_activity_sessions,
+                                        &watched_file_tree_sessions,
+                                        &watched_resize_sessions,
+                                    ),
+                                    false,
+                                );
                                 continue;
                             }
                         }) else {
@@ -722,11 +1059,16 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
                             connection.handle_wire_envelope(&mut protocol, envelope)
                         };
 
-                        if send_envelopes(&mut sender, responses).await.is_err() {
-                            break;
+                        let response_count = responses.len();
+                        match send_envelopes_logged(peer_addr, &mut sender, responses, "response").await {
+                            Ok(bytes) => traffic.record_out(WebSocketOutKind::Response, response_count, bytes),
+                            Err(()) => {
+                                traffic.record_send_error();
+                                break;
+                            }
                         }
 
-                        register_session_watchers(
+                        let initial_output_sessions = register_session_watchers(
                             &connection,
                             &protocol,
                             &mut watched_output_sessions,
@@ -736,53 +1078,131 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
                             &push_event_tx,
                             &mut watcher_tasks,
                         );
-
-                        let output_responses = {
-                            let mut protocol = protocol.lock().expect("daemon protocol mutex poisoned");
-                            connection.read_attached_outputs(
-                                &mut protocol,
-                                OUTPUT_FLUSH_MAX_BYTES_PER_SESSION,
-                            )
-                        };
-
-                        if send_envelopes(&mut sender, output_responses).await.is_err() {
-                            break;
-                        }
+                        queue_initial_output_events(&initial_output_sessions, &push_event_tx);
+                        maybe_log_websocket_traffic(
+                            peer_addr,
+                            &mut traffic,
+                            &mut last_traffic_log,
+                            &mut connection,
+                            current_websocket_watcher_counts(
+                                &watched_output_sessions,
+                                &watched_activity_sessions,
+                                &watched_file_tree_sessions,
+                                &watched_resize_sessions,
+                            ),
+                            false,
+                        );
                     }
                 };
+            }
+            _ = heartbeat.tick() => {
+                if pending_pong_deadline.is_none() {
+                    let ping_bytes = 0;
+                    if send_message_with_deadline(
+                        &mut sender,
+                        Message::Ping(Vec::new()),
+                        WEBSOCKET_SEND_DEADLINE,
+                        "websocket ping failed",
+                    )
+                    .await
+                    .is_err()
+                    {
+                        traffic.record_send_error();
+                        break;
+                    }
+                    traffic.record_out(WebSocketOutKind::Ping, 0, ping_bytes);
+                    maybe_log_websocket_traffic(
+                        peer_addr,
+                        &mut traffic,
+                        &mut last_traffic_log,
+                        &mut connection,
+                        current_websocket_watcher_counts(
+                            &watched_output_sessions,
+                            &watched_activity_sessions,
+                            &watched_file_tree_sessions,
+                            &watched_resize_sessions,
+                        ),
+                        false,
+                    );
+                    pending_pong_deadline = Some(Instant::now() + WEBSOCKET_PONG_DEADLINE);
+                }
             }
             maybe_event = push_event_rx.recv() => {
                 let Some(event) = maybe_event else {
                     break;
                 };
                 idle_deadline = Instant::now() + WEBSOCKET_IDLE_TIMEOUT;
-                let responses = {
+                let (kind, responses) = {
                     let mut protocol = protocol.lock().expect("daemon protocol mutex poisoned");
                     match event {
                         SessionPushEvent::Output(session_id) => {
-                            connection.read_session_output(
-                                &mut protocol,
-                                session_id,
-                                OUTPUT_FLUSH_MAX_BYTES_PER_SESSION,
+                            (
+                                WebSocketOutKind::PushOutput,
+                                connection.read_session_output(
+                                    &mut protocol,
+                                    session_id,
+                                    OUTPUT_FLUSH_MAX_BYTES_PER_SESSION,
+                                ),
                             )
                         }
                         SessionPushEvent::Activity(session_id) => {
-                            connection.read_session_activity(&mut protocol, session_id)
+                            (
+                                WebSocketOutKind::PushActivity,
+                                connection.read_session_activity(&mut protocol, session_id),
+                            )
                         }
                         SessionPushEvent::FileTree(session_id) => {
-                            connection.read_session_file_tree_update(&mut protocol, session_id)
+                            (
+                                WebSocketOutKind::PushFileTree,
+                                connection.read_session_file_tree_update(&mut protocol, session_id),
+                            )
                         }
                         SessionPushEvent::Resize(session_id) => {
-                            connection.read_session_resize_update(&mut protocol, session_id)
+                            (
+                                WebSocketOutKind::PushResize,
+                                connection.read_session_resize_update(&mut protocol, session_id),
+                            )
                         }
                     }
                 };
-                if send_envelopes(&mut sender, responses).await.is_err() {
-                    break;
+                let response_count = responses.len();
+                match send_envelopes_logged(peer_addr, &mut sender, responses, kind.label()).await {
+                    Ok(bytes) => traffic.record_out(kind, response_count, bytes),
+                    Err(()) => {
+                        traffic.record_send_error();
+                        break;
+                    }
                 }
+                maybe_log_websocket_traffic(
+                    peer_addr,
+                    &mut traffic,
+                    &mut last_traffic_log,
+                    &mut connection,
+                            current_websocket_watcher_counts(
+                        &watched_output_sessions,
+                        &watched_activity_sessions,
+                        &watched_file_tree_sessions,
+                        &watched_resize_sessions,
+                    ),
+                    false,
+                );
             }
         }
     }
+
+    maybe_log_websocket_traffic(
+        peer_addr,
+        &mut traffic,
+        &mut last_traffic_log,
+        &mut connection,
+        current_websocket_watcher_counts(
+            &watched_output_sessions,
+            &watched_activity_sessions,
+            &watched_file_tree_sessions,
+            &watched_resize_sessions,
+        ),
+        true,
+    );
 
     for task in watcher_tasks {
         task.abort();
@@ -802,7 +1222,8 @@ fn register_session_watchers(
     watched_resize_sessions: &mut HashSet<SessionId>,
     push_event_tx: &mpsc::UnboundedSender<SessionPushEvent>,
     watcher_tasks: &mut Vec<JoinHandle<()>>,
-) {
+) -> Vec<SessionId> {
+    let mut initial_output_sessions = Vec::new();
     let (output_signals, activity_signals, file_tree_signals, resize_signals) = {
         let protocol = protocol.lock().expect("daemon protocol mutex poisoned");
         (
@@ -817,6 +1238,7 @@ fn register_session_watchers(
         if !watched_output_sessions.insert(session_id) {
             continue;
         }
+        initial_output_sessions.push(session_id);
 
         spawn_session_push_watcher(
             session_id,
@@ -871,6 +1293,19 @@ fn register_session_watchers(
             watcher_tasks,
         );
     }
+
+    initial_output_sessions
+}
+
+fn queue_initial_output_events(
+    initial_output_sessions: &[SessionId],
+    push_event_tx: &mpsc::UnboundedSender<SessionPushEvent>,
+) {
+    for session_id in initial_output_sessions {
+        // attach/create 刚完成时 watcher 会忽略当前 watch 值；显式排一次输出读取，
+        // 但让它走 push 队列，给 close、cancel、pong 等控制事件抢先处理的机会。
+        let _ = push_event_tx.send(SessionPushEvent::Output(*session_id));
+    }
 }
 
 fn spawn_session_push_watcher<T>(
@@ -887,6 +1322,7 @@ fn spawn_session_push_watcher<T>(
     signal.borrow_and_update();
 
     let push_event_tx = push_event_tx.clone();
+    let min_interval = event.min_interval();
     watcher_tasks.push(tokio::spawn(async move {
         loop {
             if signal.changed().await.is_err() {
@@ -900,6 +1336,9 @@ fn spawn_session_push_watcher<T>(
             };
             if push_event_tx.send(next_event).is_err() {
                 break;
+            }
+            if let Some(interval) = min_interval {
+                tokio::time::sleep(interval).await;
             }
         }
     }));
@@ -958,13 +1397,18 @@ async fn send_message_with_deadline(
     }
 }
 
-async fn send_envelope(
+async fn send_envelope_logged(
+    peer_addr: SocketAddr,
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
     envelope: JsonEnvelope,
-) -> Result<(), ()> {
+    label: &'static str,
+    log_send: bool,
+) -> Result<usize, ()> {
     let raw = serde_json::to_string(&envelope).map_err(|error| {
         warn!(%error, "failed to serialize websocket envelope");
     })?;
+    let bytes = raw.len();
+    let started_at = Instant::now();
 
     send_message_with_deadline(
         sender,
@@ -972,17 +1416,79 @@ async fn send_envelope(
         WEBSOCKET_SEND_DEADLINE,
         "websocket envelope",
     )
-    .await
+    .await?;
+    if log_send {
+        log_websocket_send(
+            peer_addr,
+            label,
+            1,
+            bytes,
+            started_at.elapsed(),
+            "websocket send batch",
+        );
+    }
+    Ok(bytes)
 }
 
-async fn send_envelopes(
+async fn send_envelopes_logged(
+    peer_addr: SocketAddr,
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
     envelopes: Vec<JsonEnvelope>,
-) -> Result<(), ()> {
+    label: &'static str,
+) -> Result<usize, ()> {
+    let envelope_count = envelopes.len();
+    let mut bytes = 0_usize;
+    let started_at = Instant::now();
     for envelope in envelopes {
-        send_envelope(sender, envelope).await?;
+        bytes = bytes
+            .saturating_add(send_envelope_logged(peer_addr, sender, envelope, label, false).await?);
     }
-    Ok(())
+    log_websocket_send(
+        peer_addr,
+        label,
+        envelope_count,
+        bytes,
+        started_at.elapsed(),
+        "websocket send batch",
+    );
+    Ok(bytes)
+}
+
+fn log_websocket_send(
+    peer_addr: SocketAddr,
+    label: &str,
+    envelopes: usize,
+    bytes: usize,
+    elapsed: Duration,
+    event: &'static str,
+) {
+    let elapsed_ms = elapsed.as_millis();
+    let promote_to_info = elapsed >= WEBSOCKET_SEND_SLOW_LOG_THRESHOLD
+        || envelopes >= WEBSOCKET_SEND_INFO_BATCH_ENVELOPES
+        || bytes >= WEBSOCKET_SEND_INFO_BATCH_BYTES;
+    let emit_debug = elapsed >= WEBSOCKET_SEND_DEBUG_LOG_THRESHOLD
+        || envelopes >= WEBSOCKET_SEND_DEBUG_BATCH_ENVELOPES
+        || bytes >= WEBSOCKET_SEND_DEBUG_BATCH_BYTES;
+
+    if promote_to_info {
+        info!(
+            peer_addr = %peer_addr,
+            label,
+            envelopes,
+            bytes,
+            elapsed_ms,
+            "{event}"
+        );
+    } else if emit_debug {
+        debug!(
+            peer_addr = %peer_addr,
+            label,
+            envelopes,
+            bytes,
+            elapsed_ms,
+            "{event}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1030,6 +1536,15 @@ mod tests {
     type TestWs = tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >;
+
+    #[test]
+    fn websocket_traffic_ignores_empty_output_pushes() {
+        let mut traffic = WebSocketTrafficCounters::default();
+
+        traffic.record_out(WebSocketOutKind::PushOutput, 0, 0);
+
+        assert!(!traffic.has_activity());
+    }
 
     fn test_config(name: &str) -> DaemonConfig {
         DaemonConfig::default_for_state_path(std::env::temp_dir().join(format!(
@@ -1435,6 +1950,55 @@ mod tests {
             .expect("watcher should push after a real signal change")
             .expect("push channel should remain open");
         assert_eq!(pushed, SessionPushEvent::Activity(session_id));
+
+        for task in watcher_tasks {
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn session_activity_push_watcher_coalesces_frequent_output_signals() {
+        let session_id = SessionId::new();
+        let (signal_tx, signal_rx) = watch::channel(1_u64);
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let mut watcher_tasks = Vec::new();
+
+        spawn_session_push_watcher(
+            session_id,
+            signal_rx,
+            SessionPushEvent::Activity(session_id),
+            &event_tx,
+            &mut watcher_tasks,
+        );
+
+        signal_tx.send(2).unwrap();
+        let first = timeout(Duration::from_secs(1), event_rx.recv())
+            .await
+            .expect("first activity should be pushed immediately")
+            .expect("push channel should remain open");
+        assert_eq!(first, SessionPushEvent::Activity(session_id));
+
+        signal_tx.send(3).unwrap();
+        signal_tx.send(4).unwrap();
+        signal_tx.send(5).unwrap();
+
+        // 高频后台输出只需要一个“有新输出”提示；250ms 合并窗口内不能继续刷固定小包。
+        assert!(
+            timeout(SESSION_ACTIVITY_PUSH_MIN_INTERVAL / 2, event_rx.recv())
+                .await
+                .is_err()
+        );
+
+        let second = timeout(SESSION_ACTIVITY_PUSH_MIN_INTERVAL * 2, event_rx.recv())
+            .await
+            .expect("coalesced activity should be pushed after the throttle window")
+            .expect("push channel should remain open");
+        assert_eq!(second, SessionPushEvent::Activity(session_id));
+        assert!(
+            timeout(Duration::from_millis(80), event_rx.recv())
+                .await
+                .is_err()
+        );
 
         for task in watcher_tasks {
             task.abort();

@@ -277,7 +277,7 @@ async fn relay_mux_routes_client_frames_and_targeted_daemon_responses() {
 
     let first_connected = next_mux(&mut daemon_mux).await;
     let second_connected = next_mux(&mut daemon_mux).await;
-    let (client_a_id, client_b_id) = match (first_connected, second_connected) {
+    let connected_ids = match (first_connected, second_connected) {
         (
             RelayMuxEnvelope::ClientConnected {
                 client_id: first_id,
@@ -285,7 +285,7 @@ async fn relay_mux_routes_client_frames_and_targeted_daemon_responses() {
             RelayMuxEnvelope::ClientConnected {
                 client_id: second_id,
             },
-        ) => (first_id, second_id),
+        ) => [first_id, second_id],
         other => panic!("expected two client_connected envelopes, got {other:?}"),
     };
 
@@ -296,15 +296,22 @@ async fn relay_mux_routes_client_frames_and_targeted_daemon_responses() {
         .await
         .expect("client A should send opaque text");
 
-    assert_eq!(
-        next_mux(&mut daemon_mux).await,
-        RelayMuxEnvelope::ClientFrame {
-            client_id: client_a_id,
-            frame: RelayOpaqueFrame::Text {
-                data: business_shaped_text.to_owned(),
-            },
-        }
-    );
+    // connect 通知是生命周期控制消息；不同 socket task 的调度顺序不等于测试里的 A/B 变量顺序。
+    let RelayMuxEnvelope::ClientFrame {
+        client_id: client_a_id,
+        frame: RelayOpaqueFrame::Text {
+            data: client_a_text,
+        },
+    } = next_mux(&mut daemon_mux).await
+    else {
+        panic!("expected client A frame");
+    };
+    assert!(connected_ids.contains(&client_a_id));
+    assert_eq!(client_a_text, business_shaped_text);
+    let client_b_id = connected_ids
+        .into_iter()
+        .find(|client_id| *client_id != client_a_id)
+        .expect("client B id should be the other connected client");
 
     send_mux(
         &mut daemon_mux,

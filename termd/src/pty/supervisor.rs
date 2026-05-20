@@ -461,6 +461,14 @@ impl SupervisorPtySession {
                 .expect("pending terminal frames mutex poisoned")
                 .is_empty()
     }
+
+    fn has_pending_terminal_frames(&self) -> bool {
+        !self
+            .pending_terminal_frames
+            .lock()
+            .expect("pending terminal frames mutex poisoned")
+            .is_empty()
+    }
 }
 
 impl Drop for SupervisorPtySession {
@@ -626,7 +634,9 @@ impl PtySession for SupervisorPtySession {
             .lock()
             .expect("pending terminal frames mutex poisoned")
             .pop_front();
-        if self.has_pending_output_or_terminal_frames() {
+        // terminal_frame 新协议只消费结构化 frame；legacy raw output 缓存不能在这里 rearm，
+        // 否则 packet client 会在没有新 frame 时空转唤醒 output watcher。
+        if self.has_pending_terminal_frames() {
             self.signal_pending_output();
         }
         Ok(frame)
@@ -2143,6 +2153,95 @@ mod tests {
         assert!(
             signal.has_changed().unwrap_or(false),
             "remaining supervisor output should rearm daemon watcher"
+        );
+    }
+
+    #[test]
+    fn supervisor_client_terminal_frame_read_does_not_rearm_for_legacy_pending_output() {
+        let socket_path = PathBuf::from("/tmp/termd-supervisor-test.sock");
+        let restore_info = PtyRestoreInfo::UnixSocket {
+            socket_path,
+            supervisor_pid: 42,
+            supervisor_status: PtySupervisorStatus::Running,
+        };
+        let (writer, _peer) = StdUnixStream::pair().expect("test unix stream pair should open");
+        let (output_signal_tx, output_signal_rx) = watch::channel(OUTPUT_SIGNAL_INIT);
+        let mut session = SupervisorPtySession {
+            session_id: "test-session".to_owned(),
+            restore_info,
+            supervisor_child: StdMutex::new(None),
+            writer: StdMutex::new(writer),
+            pending_requests: Arc::new(StdMutex::new(HashMap::new())),
+            pending_output: Arc::new(StdMutex::new(VecDeque::from([b"legacy".to_vec()]))),
+            pending_terminal_frames: Arc::new(StdMutex::new(VecDeque::new())),
+            output_signal_tx,
+            output_signal_rx,
+            next_request_id: AtomicU64::new(1),
+            cached_size: StdMutex::new(PtySize::new(24, 80)),
+            cached_process_id: StdMutex::new(Some(42)),
+        };
+        let mut signal = session
+            .output_signal()
+            .expect("supervisor client should expose output signal");
+        signal.borrow_and_update();
+
+        let frame = session
+            .read_terminal_frame()
+            .expect("terminal frame read should not fail");
+
+        assert!(frame.is_none());
+        assert!(
+            !signal.has_changed().unwrap_or(false),
+            "legacy raw output must not spin terminal_frame watcher"
+        );
+    }
+
+    #[test]
+    fn supervisor_client_terminal_frame_read_rearms_when_frames_remain() {
+        let socket_path = PathBuf::from("/tmp/termd-supervisor-test.sock");
+        let restore_info = PtyRestoreInfo::UnixSocket {
+            socket_path,
+            supervisor_pid: 42,
+            supervisor_status: PtySupervisorStatus::Running,
+        };
+        let (writer, _peer) = StdUnixStream::pair().expect("test unix stream pair should open");
+        let (output_signal_tx, output_signal_rx) = watch::channel(OUTPUT_SIGNAL_INIT);
+        let mut session = SupervisorPtySession {
+            session_id: "test-session".to_owned(),
+            restore_info,
+            supervisor_child: StdMutex::new(None),
+            writer: StdMutex::new(writer),
+            pending_requests: Arc::new(StdMutex::new(HashMap::new())),
+            pending_output: Arc::new(StdMutex::new(VecDeque::new())),
+            pending_terminal_frames: Arc::new(StdMutex::new(VecDeque::from([
+                PtyTerminalFrame::Output {
+                    terminal_seq: 1,
+                    data: b"first".to_vec(),
+                },
+                PtyTerminalFrame::Output {
+                    terminal_seq: 2,
+                    data: b"second".to_vec(),
+                },
+            ]))),
+            output_signal_tx,
+            output_signal_rx,
+            next_request_id: AtomicU64::new(1),
+            cached_size: StdMutex::new(PtySize::new(24, 80)),
+            cached_process_id: StdMutex::new(Some(42)),
+        };
+        let mut signal = session
+            .output_signal()
+            .expect("supervisor client should expose output signal");
+        signal.borrow_and_update();
+
+        let frame = session
+            .read_terminal_frame()
+            .expect("terminal frame read should not fail");
+
+        assert_eq!(frame.and_then(|frame| frame.terminal_seq()), Some(1));
+        assert!(
+            signal.has_changed().unwrap_or(false),
+            "remaining terminal frames should rearm daemon watcher"
         );
     }
 

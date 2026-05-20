@@ -57,6 +57,7 @@ interface MockDaemonOptions {
   token: string;
   sessions: Array<SessionSummaryPayload & { name?: string | null }>;
   attachOutput?: string;
+  attachDelayMs?: number;
   routePreludeError?: ErrorPayload;
   routeReadyDelayMs?: number;
   daemonPacketVersion?: number;
@@ -628,6 +629,9 @@ export class MockDaemon {
         connection.attachedSessionIds.add(payload.session_id);
         if (watchUpdates) {
           connection.watchedSessionIds.add(payload.session_id);
+        }
+        if (this.options.attachDelayMs) {
+          await new Promise((resolve) => setTimeout(resolve, this.options.attachDelayMs));
         }
         this.sendInner(
           connection,

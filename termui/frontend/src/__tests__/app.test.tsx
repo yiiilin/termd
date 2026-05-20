@@ -790,6 +790,50 @@ describe("termui web 工作台", () => {
     expect(selectedSessionName()).toBe("gamma");
   });
 
+  it("快速切换 session 会关闭尚未完成的 attach 连接", async () => {
+    const user = userEvent.setup();
+    const alphaSession = {
+      session_id: "00000000-0000-0000-0000-000000000431",
+      name: "alpha",
+      state: "running",
+      size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+    } as const;
+    const betaSession = {
+      session_id: "00000000-0000-0000-0000-000000000432",
+      name: "beta",
+      state: "running",
+      size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+    } as const;
+    const gammaSession = {
+      session_id: "00000000-0000-0000-0000-000000000433",
+      name: "gamma",
+      state: "running",
+      size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+    } as const;
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [alphaSession, betaSession, gammaSession],
+      attachOutput: "attached-ready\n",
+      attachDelayMs: 180,
+    });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession("alpha");
+    const cancelCount = () => daemon.receivedPackets.filter((packet) => packet.kind === "cancel").length;
+    const beforeSwitch = cancelCount();
+
+    await clickSessionCard(user, "beta");
+    await waitFor(() => expect(cancelCount()).toBeGreaterThan(beforeSwitch));
+    const afterClosingCurrentAttach = cancelCount();
+
+    await clickSessionCard(user, "gamma");
+    await waitFor(() => expect(cancelCount()).toBeGreaterThan(afterClosingCurrentAttach));
+    await waitFor(() => expect(selectedSessionName()).toBe("gamma"));
+    await waitFor(() => expect(daemon.attachedSessions).toContain(gammaSession.session_id));
+  });
+
   it("持续输出时合并写入 xterm，并且不为每个输出刷新布局", async () => {
     const user = userEvent.setup();
     render(<App />);
@@ -2922,6 +2966,62 @@ describe("termui web 工作台", () => {
       .map((update) => update.focused);
     expect(focusUpdates).not.toContain(false);
     expect(screen.getByTestId("terminal-pane")).toHaveAttribute("data-viewer-mode", "false");
+  });
+
+  it("terminal frame 渲染后会很快回补 flow credit，而不是等到很大的累计阈值", async () => {
+    const user = userEvent.setup();
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [
+        {
+          session_id: "00000000-0000-0000-0000-000000000406",
+          state: "running",
+          size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+        },
+      ],
+      attachOutput: "ready\n",
+    });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await user.click(screen.getByRole("button", { name: "Refresh" }));
+    await clickSessionCard(user);
+
+    await waitFor(() => expect(screen.getByTestId("terminal-pane")).toBeInTheDocument());
+    await waitFor(() =>
+      expect(daemon.attachedSessions).toContain("00000000-0000-0000-0000-000000000406"),
+    );
+    await waitFor(() => expect(document.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea")).not.toBeNull());
+    await new Promise((resolve) => window.setTimeout(resolve, 120));
+
+    const receivedPackets = () =>
+      (
+        daemon as unknown as {
+          receivedPackets?: Array<{ kind: string; credit?: number }>;
+        }
+      ).receivedPackets ?? [];
+    const countFlowPackets = () => receivedPackets().filter((packet) => packet.kind === "flow").length;
+    const flowPacketsBefore = countFlowPackets();
+
+    daemon.pushTerminalFrameBatch("00000000-0000-0000-0000-000000000406", [
+      {
+        kind: "snapshot",
+        session_id: "00000000-0000-0000-0000-000000000406",
+        base_seq: 0,
+        size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+        data_base64: "",
+      },
+      {
+        kind: "output",
+        session_id: "00000000-0000-0000-0000-000000000406",
+        terminal_seq: 1,
+        data_base64: "YWJjZA==",
+      },
+    ]);
+
+    await waitFor(() => expect(countFlowPackets()).toBeGreaterThan(flowPacketsBefore));
   });
 
   it("浏览器窗口失活后不再继续上报 PTY resize，也不把 resize owner 切成 viewer", async () => {

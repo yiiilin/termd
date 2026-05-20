@@ -26,17 +26,18 @@ use tokio_tungstenite::{
     Connector,
     tungstenite::{Message, protocol::WebSocketConfig},
 };
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::auth::current_unix_timestamp_millis;
 use crate::config::RelayReconnectConfig;
 
-use super::protocol::{JsonEnvelope, ProtocolConnection, ProtocolError};
+use super::protocol::{
+    JsonEnvelope, ProtocolConnection, ProtocolConnectionDebugTraffic, ProtocolError,
+};
 use super::server::SharedDaemonProtocol;
 
 const OUTPUT_FLUSH_MAX_BYTES_PER_SESSION: usize = 16 * 1024;
 const MIN_RELAY_RETRY_DELAY_MS: u64 = 1;
-const MIN_RELAY_HEARTBEAT_INTERVAL_MS: u64 = 1;
 // relay mux transport 失败只会断开当前 relay 连接并触发重连，不关闭持久 session/supervisor。
 // 公网 relay 往往还隔着 TLS 和反向代理，2s 级 deadline 容易把短暂抖动误判成断线。
 const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
@@ -47,6 +48,13 @@ const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const RELAY_RECONNECT_STABLE_RESET_AFTER: Duration = Duration::from_secs(60);
 const RELAY_MAX_FRAME_SIZE: usize = 1024 * 1024;
 const RELAY_MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
+const RELAY_TRAFFIC_LOG_INTERVAL: Duration = Duration::from_secs(1);
+const RELAY_SEND_SLOW_LOG_THRESHOLD: Duration = Duration::from_millis(50);
+const RELAY_SEND_DEBUG_LOG_THRESHOLD: Duration = Duration::from_millis(10);
+const RELAY_SEND_DEBUG_BATCH_ENVELOPES: usize = 8;
+const RELAY_SEND_DEBUG_BATCH_BYTES: usize = 32 * 1024;
+const RELAY_SEND_INFO_BATCH_ENVELOPES: usize = 20;
+const RELAY_SEND_INFO_BATCH_BYTES: usize = 256 * 1024;
 
 type RelayWs = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>;
 type RelaySender = futures_util::stream::SplitSink<RelayWs, Message>;
@@ -68,11 +76,214 @@ enum RelayPushEvent {
     },
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+struct RelayTrafficBucket {
+    calls: u64,
+    envelopes: u64,
+    bytes: u64,
+}
+
+impl RelayTrafficBucket {
+    fn record(&mut self, envelopes: usize, bytes: usize) {
+        self.calls = self.calls.saturating_add(1);
+        self.envelopes = self.envelopes.saturating_add(envelopes as u64);
+        self.bytes = self.bytes.saturating_add(bytes as u64);
+    }
+
+    fn is_empty(self) -> bool {
+        self.calls == 0 && self.envelopes == 0 && self.bytes == 0
+    }
+}
+
+#[derive(Debug, Default)]
+struct RelayTrafficCounters {
+    in_text: RelayTrafficBucket,
+    in_binary: RelayTrafficBucket,
+    in_ping: RelayTrafficBucket,
+    in_pong: RelayTrafficBucket,
+    in_close: RelayTrafficBucket,
+    in_frame: RelayTrafficBucket,
+    out_response: RelayTrafficBucket,
+    out_push_output: RelayTrafficBucket,
+    out_push_file_tree: RelayTrafficBucket,
+    out_push_resize: RelayTrafficBucket,
+    out_pong: RelayTrafficBucket,
+    send_errors: u64,
+}
+
+impl RelayTrafficCounters {
+    fn record_in(&mut self, message: &Message) {
+        match message {
+            Message::Text(raw) => self.in_text.record(1, raw.len()),
+            Message::Binary(raw) => self.in_binary.record(1, raw.len()),
+            Message::Ping(payload) => self.in_ping.record(0, payload.len()),
+            Message::Pong(payload) => self.in_pong.record(0, payload.len()),
+            Message::Close(_) => self.in_close.record(0, 0),
+            Message::Frame(frame) => self.in_frame.record(0, frame.payload().len()),
+        }
+    }
+
+    fn record_out(&mut self, kind: RelayOutKind, envelopes: usize, bytes: usize) {
+        if kind.is_payload_batch() && envelopes == 0 && bytes == 0 {
+            return;
+        }
+        match kind {
+            RelayOutKind::Response => self.out_response.record(envelopes, bytes),
+            RelayOutKind::PushOutput => self.out_push_output.record(envelopes, bytes),
+            RelayOutKind::PushFileTree => self.out_push_file_tree.record(envelopes, bytes),
+            RelayOutKind::PushResize => self.out_push_resize.record(envelopes, bytes),
+            RelayOutKind::Pong => self.out_pong.record(envelopes, bytes),
+        }
+    }
+
+    fn record_send_error(&mut self) {
+        self.send_errors = self.send_errors.saturating_add(1);
+    }
+
+    fn has_activity(&self) -> bool {
+        !self.in_text.is_empty()
+            || !self.in_binary.is_empty()
+            || !self.in_ping.is_empty()
+            || !self.in_pong.is_empty()
+            || !self.in_close.is_empty()
+            || !self.in_frame.is_empty()
+            || !self.out_response.is_empty()
+            || !self.out_push_output.is_empty()
+            || !self.out_push_file_tree.is_empty()
+            || !self.out_push_resize.is_empty()
+            || !self.out_pong.is_empty()
+            || self.send_errors > 0
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy)]
+struct RelayTransportDebugSnapshot {
+    since_last_inbound_ms: u64,
+    since_last_outbound_ms: u64,
+    last_inbound_kind: &'static str,
+    last_outbound_kind: &'static str,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RelayHeartbeatDebug {
+    last_inbound_at: Instant,
+    last_outbound_at: Instant,
+    last_inbound_kind: &'static str,
+    last_outbound_kind: &'static str,
+}
+
+impl RelayHeartbeatDebug {
+    fn new(now: Instant) -> Self {
+        Self {
+            last_inbound_at: now,
+            last_outbound_at: now,
+            last_inbound_kind: "none",
+            last_outbound_kind: "none",
+        }
+    }
+
+    fn record_inbound(&mut self, kind: &'static str, _bytes: usize) {
+        let now = Instant::now();
+        self.last_inbound_at = now;
+        self.last_inbound_kind = kind;
+    }
+
+    fn record_outbound(&mut self, kind: &'static str, _bytes: usize) {
+        let now = Instant::now();
+        self.last_outbound_at = now;
+        self.last_outbound_kind = kind;
+    }
+
+    fn snapshot(&self) -> RelayTransportDebugSnapshot {
+        RelayTransportDebugSnapshot {
+            since_last_inbound_ms: self
+                .last_inbound_at
+                .elapsed()
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64,
+            since_last_outbound_ms: self
+                .last_outbound_at
+                .elapsed()
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64,
+            last_inbound_kind: self.last_inbound_kind,
+            last_outbound_kind: self.last_outbound_kind,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RelayOutKind {
+    Response,
+    PushOutput,
+    PushFileTree,
+    PushResize,
+    Pong,
+}
+
+impl RelayOutKind {
+    fn is_payload_batch(self) -> bool {
+        // 空业务 batch 不会写 WebSocket；忽略它，避免零 credit 时把 watcher 空转记成输出流量。
+        !matches!(self, Self::Pong)
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Response => "response",
+            Self::PushOutput => "push_output",
+            Self::PushFileTree => "push_file_tree",
+            Self::PushResize => "push_resize",
+            Self::Pong => "pong",
+        }
+    }
+}
+
+fn relay_message_kind(message: &Message) -> &'static str {
+    match message {
+        Message::Text(_) => "text",
+        Message::Binary(_) => "binary",
+        Message::Ping(_) => "ping",
+        Message::Pong(_) => "pong",
+        Message::Close(_) => "close",
+        Message::Frame(_) => "frame",
+    }
+}
+
+fn relay_message_bytes(message: &Message) -> usize {
+    match message {
+        Message::Text(raw) => raw.len(),
+        Message::Binary(raw) => raw.len(),
+        Message::Ping(payload) | Message::Pong(payload) => payload.len(),
+        Message::Close(_) => 0,
+        Message::Frame(frame) => frame.payload().len(),
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct RelayWatcherCounts {
+    output: usize,
+    file_tree: usize,
+    resize: usize,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct RelayMuxDebugSnapshot {
+    clients: usize,
+    packet_mode_clients: usize,
+    attached_sessions: usize,
+    watched_sessions: usize,
+    terminal_streams: usize,
+    zero_credit_terminal_streams: usize,
+    total_output_credit: u64,
+    pending_raw_chunks: usize,
+    pending_terminal_frames: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RelayReconnectPolicy {
     initial_delay: Duration,
     max_delay: Duration,
-    heartbeat_interval: Duration,
 }
 
 impl RelayReconnectPolicy {
@@ -82,24 +293,18 @@ impl RelayReconnectPolicy {
         let configured_max =
             duration_from_millis_floor(config.max_delay_ms, MIN_RELAY_RETRY_DELAY_MS);
         let max_delay = configured_max.max(initial_delay);
-        let heartbeat_interval = duration_from_millis_floor(
-            config.heartbeat_interval_ms,
-            MIN_RELAY_HEARTBEAT_INTERVAL_MS,
-        );
+        // daemon 作为 relay mux 的 WebSocket client 只回复 control Ping；主动 heartbeat
+        // 由接收连接的 relay 端负责。保留配置字段只为兼容旧配置文件。
+        let _ = config.heartbeat_interval_ms;
 
         Self {
             initial_delay,
             max_delay,
-            heartbeat_interval,
         }
     }
 
     pub fn first_retry_delay(self) -> Duration {
         self.initial_delay
-    }
-
-    pub fn heartbeat_interval(self) -> Duration {
-        self.heartbeat_interval
     }
 
     pub fn next_retry_delay(self, current: Duration) -> Duration {
@@ -145,8 +350,6 @@ pub enum RelayConnectorError {
     SendTimeout,
     #[error("relay websocket send failed")]
     SendFailed,
-    #[error("relay websocket pong timed out")]
-    PongTimeout,
     #[error("relay websocket idle timeout")]
     IdleTimeout,
     #[error("relay mux envelope is invalid")]
@@ -388,14 +591,7 @@ pub async fn connect_relay_mux_base(
     auth_token: Option<&str>,
     protocol: SharedDaemonProtocol,
 ) -> Result<(), RelayConnectorError> {
-    connect_relay_mux_base_with_heartbeat(
-        base,
-        auth_token,
-        None,
-        RelayReconnectPolicy::default().heartbeat_interval(),
-        protocol,
-    )
-    .await
+    connect_relay_mux_base_once(base, auth_token, None, protocol).await
 }
 
 pub async fn run_relay_mux_with_reconnect(
@@ -420,14 +616,9 @@ pub async fn run_relay_mux_with_reconnect_base(
 
     loop {
         let attempt_started_at = Instant::now();
-        let result = connect_relay_mux_base_with_heartbeat(
-            base.clone(),
-            auth_token,
-            proxy.clone(),
-            policy.heartbeat_interval(),
-            protocol.clone(),
-        )
-        .await;
+        let result =
+            connect_relay_mux_base_once(base.clone(), auth_token, proxy.clone(), protocol.clone())
+                .await;
 
         match &result {
             Ok(()) => warn!(
@@ -452,11 +643,10 @@ pub async fn run_relay_mux_with_reconnect_base(
     }
 }
 
-async fn connect_relay_mux_base_with_heartbeat(
+async fn connect_relay_mux_base_once(
     base: RelayBaseUrl,
     auth_token: Option<&str>,
     proxy: Option<RelayProxyUrl>,
-    heartbeat_interval: Duration,
     protocol: SharedDaemonProtocol,
 ) -> Result<(), RelayConnectorError> {
     let server_id = {
@@ -465,6 +655,7 @@ async fn connect_relay_mux_base_with_heartbeat(
             .expect("daemon protocol mutex poisoned")
             .server_id()
     };
+    let relay_endpoint = base.canonical_url();
     let url = base.daemon_mux_url_with_auth(server_id, auth_token);
     let (socket, _) = connect_relay_websocket(&url, proxy.as_ref()).await?;
     let (mut sender, mut receiver) = socket.split();
@@ -477,28 +668,18 @@ async fn connect_relay_mux_base_with_heartbeat(
     let mut watched_file_tree_sessions = HashMap::<RelayClientId, HashSet<SessionId>>::new();
     let mut watched_resize_sessions = HashMap::<RelayClientId, HashSet<SessionId>>::new();
     let mut watcher_tasks = HashMap::<RelayClientId, Vec<JoinHandle<()>>>::new();
-    let mut heartbeat = tokio::time::interval_at(
-        tokio::time::Instant::now() + heartbeat_interval,
-        heartbeat_interval,
-    );
-    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut idle_deadline = Instant::now() + RELAY_IDLE_TIMEOUT;
-    let mut pending_pong_deadline: Option<Instant> = None;
+    let mut traffic = RelayTrafficCounters::default();
+    let mut last_traffic_log = Instant::now();
+    let mut heartbeat_debug = RelayHeartbeatDebug::new(Instant::now());
 
     let result = loop {
-        let pending_pong_deadline_snapshot = pending_pong_deadline;
+        // relay control frame 必须先于业务输出处理，避免大量 PTY 输出让 Ping/Pong 被调度延迟。
         tokio::select! {
+            biased;
+
             _ = tokio::time::sleep_until(idle_deadline) => {
                 break Err(RelayConnectorError::IdleTimeout);
-            }
-            _ = async move {
-                if let Some(deadline) = pending_pong_deadline_snapshot {
-                    tokio::time::sleep_until(deadline).await;
-                } else {
-                    std::future::pending::<()>().await;
-                }
-            } => {
-                break Err(RelayConnectorError::PongTimeout);
             }
             inbound = receiver.next() => {
                 let Some(message) = inbound else {
@@ -506,9 +687,21 @@ async fn connect_relay_mux_base_with_heartbeat(
                 };
                 let message = match message {
                     Ok(message) => message,
-                    Err(_) => break Err(RelayConnectorError::ReceiveFailed),
+                    Err(error) => {
+                        warn!(
+                            relay = %relay_endpoint,
+                            ?server_id,
+                            %error,
+                            heartbeat_debug = ?heartbeat_debug.snapshot(),
+                            "relay daemon mux receive failed"
+                        );
+                        break Err(RelayConnectorError::ReceiveFailed);
+                    }
                 };
                 idle_deadline = Instant::now() + RELAY_IDLE_TIMEOUT;
+                traffic.record_in(&message);
+                heartbeat_debug
+                    .record_inbound(relay_message_kind(&message), relay_message_bytes(&message));
 
                 match message {
                     Message::Text(raw) => {
@@ -521,10 +714,25 @@ async fn connect_relay_mux_base_with_heartbeat(
                             Ok(responses) => responses,
                             Err(error) => break Err(error),
                         };
-                        if let Err(error) = send_mux_envelopes(&mut sender, responses).await {
-                            break Err(error);
+                        let response_count = responses.len();
+                        match send_mux_envelopes_logged(
+                            &relay_endpoint,
+                            &mut sender,
+                            responses,
+                            "response",
+                        )
+                        .await
+                        {
+                            Ok(bytes) => {
+                                traffic.record_out(RelayOutKind::Response, response_count, bytes);
+                                heartbeat_debug.record_outbound("response", bytes);
+                            }
+                            Err(error) => {
+                                traffic.record_send_error();
+                                break Err(error);
+                            }
                         }
-                        sync_relay_watchers_for_client(
+                        let initial_output_sessions = sync_relay_watchers_for_client(
                             client_id,
                             &connections,
                             &protocol,
@@ -533,6 +741,23 @@ async fn connect_relay_mux_base_with_heartbeat(
                             &mut watched_resize_sessions,
                             &push_event_tx,
                             &mut watcher_tasks,
+                        );
+                        queue_relay_initial_output_events(
+                            client_id,
+                            &initial_output_sessions,
+                            &push_event_tx,
+                        );
+                        maybe_log_relay_traffic(
+                            &relay_endpoint,
+                            &mut traffic,
+                            &mut last_traffic_log,
+                            &mut connections,
+                            relay_watcher_counts(
+                                &watched_output_sessions,
+                                &watched_file_tree_sessions,
+                                &watched_resize_sessions,
+                            ),
+                            false,
                         );
                     }
                     Message::Binary(raw) => {
@@ -545,10 +770,25 @@ async fn connect_relay_mux_base_with_heartbeat(
                             Ok(responses) => responses,
                             Err(error) => break Err(error),
                         };
-                        if let Err(error) = send_mux_envelopes(&mut sender, responses).await {
-                            break Err(error);
+                        let response_count = responses.len();
+                        match send_mux_envelopes_logged(
+                            &relay_endpoint,
+                            &mut sender,
+                            responses,
+                            "response",
+                        )
+                        .await
+                        {
+                            Ok(bytes) => {
+                                traffic.record_out(RelayOutKind::Response, response_count, bytes);
+                                heartbeat_debug.record_outbound("response", bytes);
+                            }
+                            Err(error) => {
+                                traffic.record_send_error();
+                                break Err(error);
+                            }
                         }
-                        sync_relay_watchers_for_client(
+                        let initial_output_sessions = sync_relay_watchers_for_client(
                             client_id,
                             &connections,
                             &protocol,
@@ -558,8 +798,26 @@ async fn connect_relay_mux_base_with_heartbeat(
                             &push_event_tx,
                             &mut watcher_tasks,
                         );
+                        queue_relay_initial_output_events(
+                            client_id,
+                            &initial_output_sessions,
+                            &push_event_tx,
+                        );
+                        maybe_log_relay_traffic(
+                            &relay_endpoint,
+                            &mut traffic,
+                            &mut last_traffic_log,
+                            &mut connections,
+                            relay_watcher_counts(
+                                &watched_output_sessions,
+                                &watched_file_tree_sessions,
+                                &watched_resize_sessions,
+                            ),
+                            false,
+                        );
                     }
                     Message::Ping(payload) => {
+                        let pong_bytes = payload.len();
                         if let Err(error) = send_relay_message_with_deadline(
                             &mut sender,
                             Message::Pong(payload),
@@ -567,30 +825,40 @@ async fn connect_relay_mux_base_with_heartbeat(
                         )
                         .await
                         {
+                            traffic.record_send_error();
                             break Err(error);
                         }
+                        traffic.record_out(RelayOutKind::Pong, 0, pong_bytes);
+                        heartbeat_debug.record_outbound("pong", pong_bytes);
+                        maybe_log_relay_traffic(
+                            &relay_endpoint,
+                            &mut traffic,
+                            &mut last_traffic_log,
+                            &mut connections,
+                            relay_watcher_counts(
+                                &watched_output_sessions,
+                                &watched_file_tree_sessions,
+                                &watched_resize_sessions,
+                            ),
+                            false,
+                        );
                     }
                     Message::Pong(_) => {
-                        pending_pong_deadline = None;
+                        maybe_log_relay_traffic(
+                            &relay_endpoint,
+                            &mut traffic,
+                            &mut last_traffic_log,
+                            &mut connections,
+                            relay_watcher_counts(
+                                &watched_output_sessions,
+                                &watched_file_tree_sessions,
+                                &watched_resize_sessions,
+                            ),
+                            false,
+                        );
                     }
                     Message::Close(_) => break Ok(()),
                     Message::Frame(_) => {}
-                }
-            }
-            _ = heartbeat.tick() => {
-                // 心跳只使用 WebSocket control frame，不进入 termd 的 JSON envelope / E2EE 状态机。
-                if pending_pong_deadline.is_none() {
-                    if let Err(error) = send_relay_message_with_deadline(
-                        &mut sender,
-                        Message::Ping(Vec::new().into()),
-                        RELAY_SEND_DEADLINE,
-                    )
-                    .await
-                    {
-                        break Err(error);
-                    }
-                    idle_deadline = Instant::now() + RELAY_IDLE_TIMEOUT;
-                    pending_pong_deadline = Some(Instant::now() + RELAY_PONG_DEADLINE);
                 }
             }
             maybe_event = push_event_rx.recv() => {
@@ -624,16 +892,226 @@ async fn connect_relay_mux_base_with_heartbeat(
                     (client_id, responses)
                 };
                 let responses = client_envelopes(client_id, responses)?;
-                if let Err(error) = send_mux_envelopes(&mut sender, responses).await {
-                    break Err(error);
+                let kind = match event {
+                    RelayPushEvent::Output { .. } => RelayOutKind::PushOutput,
+                    RelayPushEvent::FileTree { .. } => RelayOutKind::PushFileTree,
+                    RelayPushEvent::Resize { .. } => RelayOutKind::PushResize,
+                };
+                let response_count = responses.len();
+                if response_count == 0 {
+                    continue;
                 }
+                match send_mux_envelopes_logged(
+                    &relay_endpoint,
+                    &mut sender,
+                    responses,
+                    kind.label(),
+                )
+                .await
+                {
+                    Ok(bytes) => {
+                        traffic.record_out(kind, response_count, bytes);
+                        heartbeat_debug.record_outbound(kind.label(), bytes);
+                    }
+                    Err(error) => {
+                        traffic.record_send_error();
+                        break Err(error);
+                    }
+                }
+                maybe_log_relay_traffic(
+                    &relay_endpoint,
+                    &mut traffic,
+                    &mut last_traffic_log,
+                    &mut connections,
+                    relay_watcher_counts(
+                        &watched_output_sessions,
+                        &watched_file_tree_sessions,
+                        &watched_resize_sessions,
+                    ),
+                    false,
+                );
             }
         }
     };
 
+    maybe_log_relay_traffic(
+        &relay_endpoint,
+        &mut traffic,
+        &mut last_traffic_log,
+        &mut connections,
+        relay_watcher_counts(
+            &watched_output_sessions,
+            &watched_file_tree_sessions,
+            &watched_resize_sessions,
+        ),
+        true,
+    );
+
     abort_relay_watcher_tasks(watcher_tasks);
     close_relay_connections(protocol, connections);
     result
+}
+
+fn relay_watcher_counts(
+    watched_output_sessions: &HashMap<RelayClientId, HashSet<SessionId>>,
+    watched_file_tree_sessions: &HashMap<RelayClientId, HashSet<SessionId>>,
+    watched_resize_sessions: &HashMap<RelayClientId, HashSet<SessionId>>,
+) -> RelayWatcherCounts {
+    RelayWatcherCounts {
+        output: watched_output_sessions.values().map(HashSet::len).sum(),
+        file_tree: watched_file_tree_sessions.values().map(HashSet::len).sum(),
+        resize: watched_resize_sessions.values().map(HashSet::len).sum(),
+    }
+}
+
+fn relay_mux_debug_snapshot(
+    connections: &HashMap<RelayClientId, ProtocolConnection>,
+) -> RelayMuxDebugSnapshot {
+    let mut snapshot = RelayMuxDebugSnapshot {
+        clients: connections.len(),
+        ..RelayMuxDebugSnapshot::default()
+    };
+
+    for connection in connections.values() {
+        let connection_snapshot = connection.debug_snapshot();
+        if connection_snapshot.packet_mode {
+            snapshot.packet_mode_clients = snapshot.packet_mode_clients.saturating_add(1);
+        }
+        snapshot.attached_sessions = snapshot
+            .attached_sessions
+            .saturating_add(connection_snapshot.attached_sessions);
+        snapshot.watched_sessions = snapshot
+            .watched_sessions
+            .saturating_add(connection_snapshot.watched_sessions);
+        snapshot.terminal_streams = snapshot
+            .terminal_streams
+            .saturating_add(connection_snapshot.terminal_streams);
+        snapshot.zero_credit_terminal_streams = snapshot
+            .zero_credit_terminal_streams
+            .saturating_add(connection_snapshot.zero_credit_terminal_streams);
+        snapshot.total_output_credit = snapshot
+            .total_output_credit
+            .saturating_add(connection_snapshot.total_output_credit);
+        snapshot.pending_raw_chunks = snapshot
+            .pending_raw_chunks
+            .saturating_add(connection_snapshot.pending_raw_chunks);
+        snapshot.pending_terminal_frames = snapshot
+            .pending_terminal_frames
+            .saturating_add(connection_snapshot.pending_terminal_frames);
+    }
+
+    snapshot
+}
+
+fn relay_protocol_debug_traffic(
+    connections: &mut HashMap<RelayClientId, ProtocolConnection>,
+) -> ProtocolConnectionDebugTraffic {
+    let mut traffic = ProtocolConnectionDebugTraffic::default();
+    for connection in connections.values_mut() {
+        traffic.merge(connection.take_debug_traffic());
+    }
+    traffic
+}
+
+fn maybe_log_relay_traffic(
+    relay_endpoint: &str,
+    traffic: &mut RelayTrafficCounters,
+    last_logged_at: &mut Instant,
+    connections: &mut HashMap<RelayClientId, ProtocolConnection>,
+    watchers: RelayWatcherCounts,
+    force: bool,
+) {
+    if !traffic.has_activity() {
+        return;
+    }
+    if !force && last_logged_at.elapsed() < RELAY_TRAFFIC_LOG_INTERVAL {
+        return;
+    }
+
+    let flow = relay_mux_debug_snapshot(connections);
+    let protocol_traffic = relay_protocol_debug_traffic(connections);
+    if relay_traffic_should_promote_to_info(
+        traffic,
+        &protocol_traffic,
+        flow.zero_credit_terminal_streams,
+    ) {
+        info_relay_traffic(relay_endpoint, traffic, &protocol_traffic, watchers, flow);
+    } else {
+        debug_relay_traffic(relay_endpoint, traffic, &protocol_traffic, watchers, flow);
+    }
+    *traffic = RelayTrafficCounters::default();
+    *last_logged_at = Instant::now();
+}
+
+fn relay_traffic_should_promote_to_info(
+    traffic: &RelayTrafficCounters,
+    protocol_traffic: &ProtocolConnectionDebugTraffic,
+    zero_credit_terminal_streams: usize,
+) -> bool {
+    // relay 是所有公网 client 共享的单条 daemon mux；只把异常放大、背压或发送错误提升到 info。
+    traffic.send_errors > 0
+        || traffic.out_push_output.calls > 1_000
+        || traffic.out_response.calls > 1_000
+        || protocol_traffic.inbound_flow_packets > 200
+        || protocol_traffic.method_count_exceeds(20)
+        || protocol_traffic.inbound_stream_chunks > 100
+        || protocol_traffic.outbound_stream_chunks > 100
+        || (zero_credit_terminal_streams > 0
+            && (traffic.out_push_output.calls > 0 || traffic.out_response.calls > 0))
+}
+
+fn info_relay_traffic(
+    relay_endpoint: &str,
+    traffic: &RelayTrafficCounters,
+    protocol_traffic: &ProtocolConnectionDebugTraffic,
+    watchers: RelayWatcherCounts,
+    flow: RelayMuxDebugSnapshot,
+) {
+    info!(
+        relay = relay_endpoint,
+        ?traffic,
+        ?protocol_traffic,
+        watchers_output = watchers.output,
+        watchers_file_tree = watchers.file_tree,
+        watchers_resize = watchers.resize,
+        flow_clients = flow.clients,
+        flow_packet_mode_clients = flow.packet_mode_clients,
+        flow_attached_sessions = flow.attached_sessions,
+        flow_watched_sessions = flow.watched_sessions,
+        flow_terminal_streams = flow.terminal_streams,
+        flow_zero_credit_terminal_streams = flow.zero_credit_terminal_streams,
+        flow_total_output_credit = flow.total_output_credit,
+        flow_pending_raw_chunks = flow.pending_raw_chunks,
+        flow_pending_terminal_frames = flow.pending_terminal_frames,
+        "relay mux traffic counters"
+    );
+}
+
+fn debug_relay_traffic(
+    relay_endpoint: &str,
+    traffic: &RelayTrafficCounters,
+    protocol_traffic: &ProtocolConnectionDebugTraffic,
+    watchers: RelayWatcherCounts,
+    flow: RelayMuxDebugSnapshot,
+) {
+    debug!(
+        relay = relay_endpoint,
+        ?traffic,
+        ?protocol_traffic,
+        watchers_output = watchers.output,
+        watchers_file_tree = watchers.file_tree,
+        watchers_resize = watchers.resize,
+        flow_clients = flow.clients,
+        flow_packet_mode_clients = flow.packet_mode_clients,
+        flow_attached_sessions = flow.attached_sessions,
+        flow_watched_sessions = flow.watched_sessions,
+        flow_terminal_streams = flow.terminal_streams,
+        flow_zero_credit_terminal_streams = flow.zero_credit_terminal_streams,
+        flow_total_output_credit = flow.total_output_credit,
+        flow_pending_raw_chunks = flow.pending_raw_chunks,
+        flow_pending_terminal_frames = flow.pending_terminal_frames,
+        "relay mux traffic counters"
+    );
 }
 
 async fn send_route_hello(
@@ -772,12 +1250,7 @@ fn handle_mux_envelope(
                     .get_mut(&client_id)
                     .expect("connection existence checked before frame parsing");
                 let mut protocol = protocol.lock().expect("daemon protocol mutex poisoned");
-                let mut responses = connection.handle_wire_envelope(&mut protocol, frame);
-                responses.extend(
-                    connection
-                        .read_attached_outputs(&mut protocol, OUTPUT_FLUSH_MAX_BYTES_PER_SESSION),
-                );
-                responses
+                connection.handle_wire_envelope(&mut protocol, frame)
             };
             client_envelopes(client_id, responses)
         }
@@ -803,9 +1276,10 @@ fn sync_relay_watchers_for_client(
     watched_resize_sessions: &mut HashMap<RelayClientId, HashSet<SessionId>>,
     push_event_tx: &mpsc::UnboundedSender<RelayPushEvent>,
     watcher_tasks: &mut HashMap<RelayClientId, Vec<JoinHandle<()>>>,
-) {
+) -> Vec<SessionId> {
+    let mut initial_output_sessions = Vec::new();
     let Some(client_id) = client_id else {
-        return;
+        return initial_output_sessions;
     };
     let Some(connection) = connections.get(&client_id) else {
         remove_relay_watchers_for_client(
@@ -815,7 +1289,7 @@ fn sync_relay_watchers_for_client(
             watched_resize_sessions,
             watcher_tasks,
         );
-        return;
+        return initial_output_sessions;
     };
 
     let (output_signals, file_tree_signals, resize_signals) = {
@@ -832,6 +1306,8 @@ fn sync_relay_watchers_for_client(
         if !watched.insert(session_id) {
             continue;
         }
+        signal.borrow_and_update();
+        initial_output_sessions.push(session_id);
 
         let push_event_tx = push_event_tx.clone();
         watcher_tasks
@@ -911,6 +1387,26 @@ fn sync_relay_watchers_for_client(
                 }
             }));
     }
+
+    initial_output_sessions
+}
+
+fn queue_relay_initial_output_events(
+    client_id: Option<RelayClientId>,
+    initial_output_sessions: &[SessionId],
+    push_event_tx: &mpsc::UnboundedSender<RelayPushEvent>,
+) {
+    let Some(client_id) = client_id else {
+        return;
+    };
+    for session_id in initial_output_sessions {
+        // attach/create 后的大 snapshot 不在请求处理分支内同步发送；先回到 select，
+        // 让 relay 发来的 ClientDisconnected、Ping 或用户输入有机会抢在旧输出前面。
+        let _ = push_event_tx.send(RelayPushEvent::Output {
+            client_id,
+            session_id: *session_id,
+        });
+    }
 }
 
 fn remove_relay_watchers_for_client(
@@ -955,17 +1451,31 @@ fn client_envelopes(
         .collect()
 }
 
-async fn send_mux_envelopes(
+async fn send_mux_envelopes_logged(
+    relay_endpoint: &str,
     sender: &mut RelaySender,
     envelopes: Vec<RelayMuxEnvelope>,
-) -> Result<(), RelayConnectorError> {
+    label: &'static str,
+) -> Result<usize, RelayConnectorError> {
+    let envelope_count = envelopes.len();
+    let mut bytes = 0_usize;
+    let started_at = Instant::now();
     for envelope in envelopes {
         let raw =
             serde_json::to_string(&envelope).map_err(|_| RelayConnectorError::InvalidEnvelope)?;
+        bytes = bytes.saturating_add(raw.len());
         send_relay_message_with_deadline(sender, Message::Text(raw.into()), RELAY_SEND_DEADLINE)
             .await?;
     }
-    Ok(())
+    log_relay_send(
+        relay_endpoint,
+        label,
+        envelope_count,
+        bytes,
+        started_at.elapsed(),
+        "relay mux send batch",
+    );
+    Ok(bytes)
 }
 
 async fn send_relay_message_with_deadline(
@@ -977,6 +1487,35 @@ async fn send_relay_message_with_deadline(
         Ok(Ok(())) => Ok(()),
         Ok(Err(_)) => Err(RelayConnectorError::SendFailed),
         Err(_) => Err(RelayConnectorError::SendTimeout),
+    }
+}
+
+fn log_relay_send(
+    relay_endpoint: &str,
+    label: &str,
+    envelopes: usize,
+    bytes: usize,
+    elapsed: Duration,
+    event: &'static str,
+) {
+    let elapsed_ms = elapsed.as_millis();
+    let promote_to_info = elapsed >= RELAY_SEND_SLOW_LOG_THRESHOLD
+        || envelopes >= RELAY_SEND_INFO_BATCH_ENVELOPES
+        || bytes >= RELAY_SEND_INFO_BATCH_BYTES;
+    let emit_debug = elapsed >= RELAY_SEND_DEBUG_LOG_THRESHOLD
+        || envelopes >= RELAY_SEND_DEBUG_BATCH_ENVELOPES
+        || bytes >= RELAY_SEND_DEBUG_BATCH_BYTES;
+
+    if promote_to_info {
+        info!(
+            relay = relay_endpoint,
+            label, envelopes, bytes, elapsed_ms, "{event}"
+        );
+    } else if emit_debug {
+        debug!(
+            relay = relay_endpoint,
+            label, envelopes, bytes, elapsed_ms, "{event}"
+        );
     }
 }
 
@@ -1415,8 +1954,6 @@ mod tests {
         Envelope, MessageType, PingPayload, ProtocolVersion, RouteHelloPayload, RouteReadyPayload,
         RouteRole,
     };
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
 
     static TEST_STATE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -1580,7 +2117,6 @@ mod tests {
         });
 
         assert_eq!(policy.first_retry_delay(), Duration::from_millis(1));
-        assert_eq!(policy.heartbeat_interval(), Duration::from_millis(1));
         assert_eq!(
             policy.next_retry_delay(Duration::from_millis(1)),
             Duration::from_millis(2)
@@ -1616,8 +2152,17 @@ mod tests {
         assert!(RELAY_MAX_FRAME_SIZE <= RELAY_MAX_MESSAGE_SIZE);
     }
 
+    #[test]
+    fn relay_traffic_ignores_empty_output_pushes() {
+        let mut traffic = RelayTrafficCounters::default();
+
+        traffic.record_out(RelayOutKind::PushOutput, 0, 0);
+
+        assert!(!traffic.has_activity());
+    }
+
     #[tokio::test(flavor = "multi_thread")]
-    async fn reconnect_supervisor_retries_after_close_and_sends_heartbeat() {
+    async fn reconnect_supervisor_retries_after_close_and_does_not_send_client_heartbeat() {
         let state = MockMuxState::default();
         let app = axum::Router::new()
             .route("/ws", get(mock_daemon_mux_ws))
@@ -1641,9 +2186,7 @@ mod tests {
 
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                if state.attempts.load(Ordering::SeqCst) >= 2
-                    && state.heartbeat_pings.load(Ordering::SeqCst) >= 1
-                {
+                if state.attempts.load(Ordering::SeqCst) >= 2 {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1651,6 +2194,9 @@ mod tests {
         })
         .await
         .unwrap();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        assert_eq!(state.heartbeat_pings.load(Ordering::SeqCst), 0);
 
         connector.abort();
         server.abort();
@@ -1669,13 +2215,7 @@ mod tests {
         let protocol = test_protocol("relay-route-ready-timeout");
         let result = tokio::time::timeout(
             Duration::from_secs(8),
-            connect_relay_mux_base_with_heartbeat(
-                base,
-                None,
-                None,
-                Duration::from_millis(10),
-                protocol,
-            ),
+            connect_relay_mux_base_once(base, None, None, protocol),
         )
         .await
         .expect("relay connector should return before the outer test timeout");
@@ -1688,93 +2228,48 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn relay_mux_heartbeat_pong_timeout_closes_stalled_relay() {
+    async fn relay_mux_replies_to_relay_websocket_ping_without_business_traffic() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let protocol = test_protocol("relay-pong-timeout");
+        let protocol = test_protocol("relay-control-pong");
         let server_id = protocol
             .lock()
             .expect("test protocol mutex should not be poisoned")
             .server_id();
+
         let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let request = read_raw_websocket_handshake(&mut stream).await;
-            let accept_key = websocket_accept_key(&request);
-            let response = format!(
-                "HTTP/1.1 101 Switching Protocols\r\n\
-                 Upgrade: websocket\r\n\
-                 Connection: Upgrade\r\n\
-                 Sec-WebSocket-Accept: {accept_key}\r\n\r\n"
-            );
-            stream.write_all(response.as_bytes()).await.unwrap();
-            let route_ready = Envelope::new(
-                MessageType::RouteReady,
-                RouteReadyPayload {
-                    server_id,
-                    role: RouteRole::DaemonMux,
-                },
-            );
-            let raw = serde_json::to_string(&route_ready).unwrap();
-            write_raw_ws_text(&mut stream, &raw).await;
-            // 不读取后续 ping，也不发送 pong，用裸 TCP 避免 axum/tungstenite 自动 pong。
-            tokio::time::sleep(Duration::from_secs(15)).await;
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            complete_relay_route_prelude(&mut socket, server_id).await;
+
+            socket.send(Message::Ping(vec![1, 2, 3])).await.unwrap();
+            let pong = tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    match socket.next().await.unwrap().unwrap() {
+                        Message::Pong(payload) => break payload,
+                        Message::Ping(payload) => {
+                            socket.send(Message::Pong(payload)).await.unwrap();
+                        }
+                        Message::Text(raw) => panic!("unexpected relay mux text frame: {raw:?}"),
+                        Message::Binary(raw) => {
+                            panic!("unexpected relay mux binary frame: {raw:?}");
+                        }
+                        Message::Close(frame) => panic!("relay mux closed unexpectedly: {frame:?}"),
+                        Message::Frame(_) => {}
+                    }
+                }
+            })
+            .await
+            .expect("daemon mux should reply to relay control ping before heartbeat timeout");
+
+            assert_eq!(pong, vec![1, 2, 3]);
         });
 
         let base = RelayBaseUrl::parse(&format!("ws://{addr}")).unwrap();
-        let result = tokio::time::timeout(
-            Duration::from_secs(12),
-            connect_relay_mux_base_with_heartbeat(
-                base,
-                None,
-                None,
-                Duration::from_millis(10),
-                protocol,
-            ),
-        )
-        .await
-        .expect("relay connector should enforce heartbeat pong deadline");
+        let connector = tokio::spawn(connect_relay_mux_base_once(base, None, None, protocol));
 
-        assert!(matches!(result, Err(RelayConnectorError::PongTimeout)));
-        server.abort();
-    }
-
-    async fn read_raw_websocket_handshake(stream: &mut tokio::net::TcpStream) -> String {
-        let mut request = Vec::new();
-        let mut byte = [0_u8; 1];
-        loop {
-            stream.read_exact(&mut byte).await.unwrap();
-            request.push(byte[0]);
-            if request.ends_with(b"\r\n\r\n") {
-                break;
-            }
-        }
-        String::from_utf8(request).unwrap()
-    }
-
-    fn websocket_accept_key(request: &str) -> String {
-        let key = request
-            .lines()
-            .find_map(|line| line.strip_prefix("Sec-WebSocket-Key: "))
-            .expect("client handshake should include websocket key")
-            .trim();
-        derive_accept_key(key.as_bytes())
-    }
-
-    async fn write_raw_ws_text(stream: &mut tokio::net::TcpStream, text: &str) {
-        let bytes = text.as_bytes();
-        let mut frame = Vec::with_capacity(bytes.len() + 10);
-        frame.push(0x81);
-        if bytes.len() < 126 {
-            frame.push(bytes.len() as u8);
-        } else if bytes.len() <= u16::MAX as usize {
-            frame.push(126);
-            frame.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
-        } else {
-            frame.push(127);
-            frame.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
-        }
-        frame.extend_from_slice(bytes);
-        stream.write_all(&frame).await.unwrap();
+        server.await.unwrap();
+        connector.abort();
     }
 
     #[derive(Clone, Default)]
@@ -2053,11 +2548,10 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let base = RelayBaseUrl::parse(&format!("ws://{addr}")).unwrap();
-        let connector = tokio::spawn(connect_relay_mux_base_with_heartbeat(
+        let connector = tokio::spawn(connect_relay_mux_base_once(
             base,
             None,
             None,
-            Duration::from_secs(60),
             protocol.clone(),
         ));
         let (tcp, _) = listener.accept().await.unwrap();
@@ -2206,11 +2700,10 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let base = RelayBaseUrl::parse(&format!("ws://{addr}")).unwrap();
-        let connector = tokio::spawn(connect_relay_mux_base_with_heartbeat(
+        let connector = tokio::spawn(connect_relay_mux_base_once(
             base,
             None,
             None,
-            Duration::from_secs(60),
             protocol.clone(),
         ));
         let (tcp, _) = listener.accept().await.unwrap();

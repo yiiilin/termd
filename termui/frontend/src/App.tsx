@@ -81,6 +81,9 @@ const MAX_FILES_PANEL_WIDTH = 640;
 const CONNECTION_AUTO_RETRY_DELAY_MS = 1500;
 const CONNECTION_AUTO_RETRY_LIMIT = 3;
 const ATTACH_RECONNECT_DELAYS_MS = [250, 1000, 2500, 5000, 10000, 20000];
+// terminal frame 的 credit 回补不要拖太久，否则输出会先把额度耗光再卡住。
+const TERMINAL_RENDER_ACK_FLUSH_BYTES = 16 * 1024;
+const TERMINAL_RENDER_ACK_FLUSH_DELAY_MS = 10;
 const FILES_CWD_FOLLOW_POLL_INTERVAL_MS = 1000;
 const TEXT_FILE_EDITOR_MAX_BYTES = 1024 * 1024;
 const FILE_TRANSFER_MEMORY_FALLBACK_MAX_BYTES = 16 * 1024 * 1024;
@@ -190,6 +193,7 @@ export default function App() {
   const [status, setStatus] = useState("idle");
   const [error, setError] = useState<SafeError | undefined>();
   const attachClientRef = useRef<DirectClient | undefined>(undefined);
+  const pendingAttachClientRef = useRef<DirectClient | undefined>(undefined);
   const attachedSessionRef = useRef<UUID | undefined>(undefined);
   const terminalResizeOwnerRef = useRef(false);
   const autoAttachAttemptedSessionRef = useRef<UUID | undefined>(undefined);
@@ -219,6 +223,7 @@ export default function App() {
   const cursorRefreshTimerRef = useRef<number | undefined>(undefined);
   const terminalOutputQueueRef = useRef<TerminalOutputItem[]>([]);
   const terminalRenderAckRef = useRef<{ sessionId: UUID; lastTransportSeq: number; credit: number } | undefined>(undefined);
+  const terminalRenderAckTimerRef = useRef<number | undefined>(undefined);
   const lastRenderedTerminalSeqRef = useRef<Map<UUID, number>>(new Map());
   const terminalOutputResetVersionRef = useRef(0);
   const terminalOutputAppliedResetVersionRef = useRef(0);
@@ -491,6 +496,10 @@ export default function App() {
     // 终端输出由 xterm 自己维护 scrollback；React 只保留尚未写入 xterm 的短队列。
     terminalOutputQueueRef.current = [];
     terminalRenderAckRef.current = undefined;
+    if (terminalRenderAckTimerRef.current !== undefined) {
+      window.clearTimeout(terminalRenderAckTimerRef.current);
+      terminalRenderAckTimerRef.current = undefined;
+    }
     if (terminalOutputFlushFrameRef.current !== undefined) {
       window.cancelAnimationFrame(terminalOutputFlushFrameRef.current);
       terminalOutputFlushFrameRef.current = undefined;
@@ -549,6 +558,10 @@ export default function App() {
 
   const closeAttachForReconnect = useCallback((client?: DirectClient) => {
     receiveLoopActiveRef.current = false;
+    if (pendingAttachClientRef.current && (!client || pendingAttachClientRef.current === client)) {
+      pendingAttachClientRef.current.close();
+      pendingAttachClientRef.current = undefined;
+    }
     if (!client || attachClientRef.current === client) {
       attachClientRef.current?.close();
       attachClientRef.current = undefined;
@@ -581,6 +594,10 @@ export default function App() {
   }, [flushTerminalOutput]);
 
   const flushRenderedTerminalAck = useCallback(() => {
+    if (terminalRenderAckTimerRef.current !== undefined) {
+      window.clearTimeout(terminalRenderAckTimerRef.current);
+      terminalRenderAckTimerRef.current = undefined;
+    }
     const pending = terminalRenderAckRef.current;
     const client = attachClientRef.current;
     if (!pending || !client) {
@@ -589,6 +606,16 @@ export default function App() {
     terminalRenderAckRef.current = undefined;
     client.ackTerminalRender(pending.sessionId, pending.lastTransportSeq, pending.credit);
   }, []);
+
+  const scheduleRenderedTerminalAckFlush = useCallback(() => {
+    if (terminalRenderAckTimerRef.current !== undefined || !terminalRenderAckRef.current) {
+      return;
+    }
+    terminalRenderAckTimerRef.current = window.setTimeout(() => {
+      terminalRenderAckTimerRef.current = undefined;
+      flushRenderedTerminalAck();
+    }, TERMINAL_RENDER_ACK_FLUSH_DELAY_MS);
+  }, [flushRenderedTerminalAck]);
 
   const markTerminalFrameRendered = useCallback((sessionId: UUID, transportSeq: number, renderCredit: number) => {
     const credit = Math.max(1, Math.floor(renderCredit));
@@ -602,10 +629,12 @@ export default function App() {
       pending.lastTransportSeq = Math.max(pending.lastTransportSeq, transportSeq);
       pending.credit += credit;
     }
-    if ((terminalRenderAckRef.current?.credit ?? 0) >= 64 * 1024) {
+    if ((terminalRenderAckRef.current?.credit ?? 0) >= TERMINAL_RENDER_ACK_FLUSH_BYTES) {
       flushRenderedTerminalAck();
+      return;
     }
-  }, [flushRenderedTerminalAck]);
+    scheduleRenderedTerminalAckFlush();
+  }, [flushRenderedTerminalAck, scheduleRenderedTerminalAckFlush]);
 
   const enqueueTerminalOutput = useCallback((item: TerminalOutputItem) => {
     const queue = terminalOutputQueueRef.current;
@@ -640,6 +669,10 @@ export default function App() {
   const disconnectAttach = useCallback(() => {
     resetAttachReconnectState();
     receiveLoopActiveRef.current = false;
+    // 快速切换 session 时，新的 attach 可能还没完成且尚未进入 attachClientRef。
+    // 这里必须关闭 pending client，避免 daemon 继续为过时 attach 生成大 snapshot。
+    pendingAttachClientRef.current?.close();
+    pendingAttachClientRef.current = undefined;
     attachClientRef.current?.close();
     attachClientRef.current = undefined;
     if (attachedSessionRef.current) {
@@ -688,6 +721,8 @@ export default function App() {
   const resetWorkspaceState = useCallback(() => {
     setSessions([]);
     confirmedSessionSizesRef.current.clear();
+    pendingAttachClientRef.current?.close();
+    pendingAttachClientRef.current = undefined;
     setSessionOrder([]);
     sessionOrderRef.current = [];
     autoAttachAttemptedSessionRef.current = undefined;
@@ -1439,22 +1474,30 @@ export default function App() {
         let client: DirectClient | undefined;
         try {
           client = await authenticatedClient(ATTACH_CONNECTION_TIMEOUT_MS);
+          pendingAttachClientRef.current = client;
           const attached = await client.attachSession(
             sessionId,
             lastTerminalSeq !== undefined ? { lastTerminalSeq } : {},
           );
           if (userDetachedRef.current) {
             resetAttachReconnectState();
+            if (pendingAttachClientRef.current === client) {
+              pendingAttachClientRef.current = undefined;
+            }
             client.close();
             return;
           }
           if (attachReconnectKeyRef.current !== reconnectKey) {
+            if (pendingAttachClientRef.current === client) {
+              pendingAttachClientRef.current = undefined;
+            }
             client.close();
             return;
           }
 
           const attachedClient = client;
           client = undefined;
+          pendingAttachClientRef.current = undefined;
           resetAttachReconnectState();
           attachClientRef.current = attachedClient;
           attachedSessionRef.current = sessionId;
@@ -1477,6 +1520,9 @@ export default function App() {
           void loadSessionGit(sessionId, { silent: true });
           void refreshDaemonClients();
         } catch (retryError) {
+          if (client && pendingAttachClientRef.current === client) {
+            pendingAttachClientRef.current = undefined;
+          }
           client?.close();
           attachReconnectLastErrorRef.current = retryError;
           if (!attachReconnectHandlerRef.current(staleClient, retryError)) {
@@ -1570,17 +1616,22 @@ export default function App() {
         disconnectAttach();
         clearTerminalOutput();
         client = await authenticatedClient(ATTACH_CONNECTION_TIMEOUT_MS);
+        pendingAttachClientRef.current = client;
         const attached = await client.attachSession(sessionId);
         if (
           attachRequestIdRef.current !== attachRequestId ||
           attachingSessionIdRef.current !== sessionId
         ) {
+          if (pendingAttachClientRef.current === client) {
+            pendingAttachClientRef.current = undefined;
+          }
           client.close();
           client = undefined;
           return;
         }
         const attachedClient = client;
         client = undefined;
+        pendingAttachClientRef.current = undefined;
         attachClientRef.current = attachedClient;
         attachedSessionRef.current = sessionId;
         confirmedSessionSizesRef.current.set(attached.session_id, attached.size);
@@ -1609,6 +1660,9 @@ export default function App() {
           setSafeError(caught);
         }
       } finally {
+        if (client && pendingAttachClientRef.current === client) {
+          pendingAttachClientRef.current = undefined;
+        }
         client?.close();
         if (
           attachRequestIdRef.current === attachRequestId &&

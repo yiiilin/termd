@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 use tokio::time::{Instant, timeout};
 use tracing::{debug, warn};
 
-const CHANNEL_CAPACITY: usize = 1024;
+const DATA_CHANNEL_CAPACITY: usize = 1024;
 // relay 只关闭当前 WebSocket transport；不会解释或终止 E2EE 内部的 daemon session。
 const ROUTE_PRELUDE_TIMEOUT: Duration = Duration::from_secs(2);
 const WEBSOCKET_SEND_DEADLINE: Duration = Duration::from_secs(10);
@@ -27,7 +27,48 @@ const WEBSOCKET_MAX_FRAME_SIZE: usize = 1024 * 1024;
 const WEBSOCKET_MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
 
 type ConnectionId = u64;
-type FrameSender = mpsc::Sender<RelayOutbound>;
+
+#[derive(Debug, Clone)]
+struct FrameSender {
+    control: mpsc::UnboundedSender<RelayOutbound>,
+    data: mpsc::Sender<RelayOutbound>,
+}
+
+impl FrameSender {
+    fn channel(
+        data_capacity: usize,
+    ) -> (
+        Self,
+        mpsc::UnboundedReceiver<RelayOutbound>,
+        mpsc::Receiver<RelayOutbound>,
+    ) {
+        let (control_tx, control_rx) = mpsc::unbounded_channel();
+        let (data_tx, data_rx) = mpsc::channel(data_capacity);
+        (
+            Self {
+                control: control_tx,
+                data: data_tx,
+            },
+            control_rx,
+            data_rx,
+        )
+    }
+
+    fn try_send(
+        &self,
+        outbound: RelayOutbound,
+    ) -> Result<(), mpsc::error::TrySendError<RelayOutbound>> {
+        self.data.try_send(outbound)
+    }
+
+    fn try_send_control(
+        &self,
+        outbound: RelayOutbound,
+    ) -> Result<(), mpsc::error::SendError<RelayOutbound>> {
+        // 生命周期控制消息不能被普通业务队列挤掉；否则 daemon 会继续保留 stale client/watchers。
+        self.control.send(outbound)
+    }
+}
 
 /// relay 只区分连接方向，不表达 operator 或任何终端业务状态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,7 +96,125 @@ pub enum OpaqueFrame {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RelayOutbound {
     Frame(OpaqueFrame),
+    MuxClientFrame {
+        client_id: RelayClientId,
+        frame: OpaqueFrame,
+    },
     Close,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PreparedRelayOutbound {
+    Frame(OpaqueFrame),
+    Close,
+    Drop,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy)]
+struct WebSocketHeartbeatPendingSnapshot {
+    pending_for_ms: u64,
+    since_last_inbound_ms: u64,
+    since_last_outbound_ms: u64,
+    last_inbound_kind: &'static str,
+    last_outbound_kind: &'static str,
+    inbound_messages_since_ping: u64,
+    inbound_bytes_since_ping: u64,
+    outbound_messages_since_ping: u64,
+    outbound_bytes_since_ping: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WebSocketHeartbeatDebug {
+    last_inbound_at: Instant,
+    last_outbound_at: Instant,
+    last_inbound_kind: &'static str,
+    last_outbound_kind: &'static str,
+    pending_ping_sent_at: Option<Instant>,
+    inbound_messages_since_ping: u64,
+    inbound_bytes_since_ping: u64,
+    outbound_messages_since_ping: u64,
+    outbound_bytes_since_ping: u64,
+}
+
+impl WebSocketHeartbeatDebug {
+    fn new(now: Instant) -> Self {
+        Self {
+            last_inbound_at: now,
+            last_outbound_at: now,
+            last_inbound_kind: "none",
+            last_outbound_kind: "none",
+            pending_ping_sent_at: None,
+            inbound_messages_since_ping: 0,
+            inbound_bytes_since_ping: 0,
+            outbound_messages_since_ping: 0,
+            outbound_bytes_since_ping: 0,
+        }
+    }
+
+    fn record_inbound(&mut self, kind: &'static str, bytes: usize) {
+        let now = Instant::now();
+        self.last_inbound_at = now;
+        self.last_inbound_kind = kind;
+        if self.pending_ping_sent_at.is_some() {
+            self.inbound_messages_since_ping = self.inbound_messages_since_ping.saturating_add(1);
+            self.inbound_bytes_since_ping =
+                self.inbound_bytes_since_ping.saturating_add(bytes as u64);
+        }
+    }
+
+    fn record_outbound(&mut self, kind: &'static str, bytes: usize) {
+        let now = Instant::now();
+        self.last_outbound_at = now;
+        self.last_outbound_kind = kind;
+        if self.pending_ping_sent_at.is_some() {
+            self.outbound_messages_since_ping = self.outbound_messages_since_ping.saturating_add(1);
+            self.outbound_bytes_since_ping =
+                self.outbound_bytes_since_ping.saturating_add(bytes as u64);
+        }
+    }
+
+    fn note_ping_sent(&mut self) {
+        let now = Instant::now();
+        self.last_outbound_at = now;
+        self.last_outbound_kind = "ping";
+        self.pending_ping_sent_at = Some(now);
+        self.inbound_messages_since_ping = 0;
+        self.inbound_bytes_since_ping = 0;
+        self.outbound_messages_since_ping = 0;
+        self.outbound_bytes_since_ping = 0;
+    }
+
+    fn note_pong_received(&mut self) {
+        self.pending_ping_sent_at = None;
+        self.inbound_messages_since_ping = 0;
+        self.inbound_bytes_since_ping = 0;
+        self.outbound_messages_since_ping = 0;
+        self.outbound_bytes_since_ping = 0;
+    }
+
+    fn pending_snapshot(&self) -> Option<WebSocketHeartbeatPendingSnapshot> {
+        let ping_sent_at = self.pending_ping_sent_at?;
+        Some(WebSocketHeartbeatPendingSnapshot {
+            pending_for_ms: ping_sent_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+            since_last_inbound_ms: self
+                .last_inbound_at
+                .elapsed()
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64,
+            since_last_outbound_ms: self
+                .last_outbound_at
+                .elapsed()
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64,
+            last_inbound_kind: self.last_inbound_kind,
+            last_outbound_kind: self.last_outbound_kind,
+            inbound_messages_since_ping: self.inbound_messages_since_ping,
+            inbound_bytes_since_ping: self.inbound_bytes_since_ping,
+            outbound_messages_since_ping: self.outbound_messages_since_ping,
+            outbound_bytes_since_ping: self.outbound_bytes_since_ping,
+        })
+    }
 }
 
 impl fmt::Debug for OpaqueFrame {
@@ -83,6 +242,32 @@ impl OpaqueFrame {
             Self::Binary(value) => value.len(),
         }
     }
+}
+
+fn websocket_message_kind(message: &Message) -> &'static str {
+    match message {
+        Message::Text(_) => "text",
+        Message::Binary(_) => "binary",
+        Message::Ping(_) => "ping",
+        Message::Pong(_) => "pong",
+        Message::Close(_) => "close",
+    }
+}
+
+fn websocket_message_bytes(message: &Message) -> usize {
+    match message {
+        Message::Text(raw) => raw.len(),
+        Message::Binary(raw) => raw.len(),
+        Message::Ping(payload) | Message::Pong(payload) => payload.len(),
+        Message::Close(_) => 0,
+    }
+}
+
+fn websocket_heartbeat_enabled(role: ConnectionRole) -> bool {
+    // daemon mux 是所有 relay client 共享的主干连接；主动 Ping/Pong 和大输出、断连控制帧共用
+    // 同一条 WebSocket/TCP 流，10s deadline 会在高输出或批量断连时误杀主干，反而造成全局卡顿。
+    // 浏览器 client 仍用 heartbeat 快速清理断线；daemon mux 交给 idle timeout 和写失败检测。
+    role == ConnectionRole::Client
 }
 
 impl From<OpaqueFrame> for RelayOpaqueFrame {
@@ -170,6 +355,10 @@ impl RelayState {
         self.inner.unregister(registration);
     }
 
+    fn has_client(&self, server_id: ServerId, client_id: RelayClientId) -> bool {
+        self.inner.has_client(server_id, client_id)
+    }
+
     fn forward_from(
         &self,
         registration: &ConnectionRegistration,
@@ -195,7 +384,7 @@ impl RelayRoom {
     fn close_clients(&mut self) {
         for (_, client) in self.clients.drain() {
             // daemon mux 已不可用时，client 必须尽快收到 close，避免继续等待业务响应直到超时。
-            let _ = client.sender.try_send(RelayOutbound::Close);
+            let _ = client.sender.try_send_control(RelayOutbound::Close);
         }
     }
 }
@@ -309,7 +498,7 @@ impl RelayRegistry {
                     );
                     // 新 mux 已经到达时，旧 mux 多半是半断连接；关闭旧 mux 和旧 clients，
                     // 让浏览器按统一重连路径重新完成 E2EE 握手，避免复用旧 client_id。
-                    let _ = stale_mux.sender.try_send(RelayOutbound::Close);
+                    let _ = stale_mux.sender.try_send_control(RelayOutbound::Close);
                     room.close_clients();
                 }
             }
@@ -365,6 +554,16 @@ impl RelayRegistry {
         }
     }
 
+    fn has_client(&self, server_id: ServerId, client_id: RelayClientId) -> bool {
+        let Ok(rooms) = self.rooms.lock() else {
+            warn!("relay registry mutex poisoned during client presence check");
+            return false;
+        };
+        rooms
+            .get(&server_id)
+            .is_some_and(|room| room.clients.contains_key(&client_id.0))
+    }
+
     fn forward_from(
         &self,
         registration: &ConnectionRegistration,
@@ -406,14 +605,10 @@ impl RelayRegistry {
             };
         };
 
-        let envelope = RelayMuxEnvelope::ClientFrame {
+        match daemon_mux.sender.try_send(RelayOutbound::MuxClientFrame {
             client_id: RelayClientId(registration.id),
-            frame: frame.into(),
-        };
-        match daemon_mux
-            .sender
-            .try_send(RelayOutbound::Frame(mux_envelope_frame(envelope)))
-        {
+            frame,
+        }) {
             Ok(()) => ForwardReport {
                 attempted: 1,
                 delivered: 1,
@@ -533,7 +728,7 @@ fn notify_daemon_mux_client_disconnected(daemon_mux: &ConnectionEndpoint, client
     };
     let _ = daemon_mux
         .sender
-        .try_send(RelayOutbound::Frame(mux_envelope_frame(envelope)));
+        .try_send_control(RelayOutbound::Frame(mux_envelope_frame(envelope)));
 }
 
 pub async fn handle_socket(mut socket: WebSocket, state: RelayState) {
@@ -554,7 +749,7 @@ pub async fn handle_socket(mut socket: WebSocket, state: RelayState) {
     };
     let server_id = prelude.server_id;
     let role = prelude.connection_role;
-    let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
+    let (tx, mut control_rx, mut data_rx) = FrameSender::channel(DATA_CHANNEL_CAPACITY);
     let registration = match state.register(server_id, role, tx) {
         Ok(registration) => registration,
         Err(error) => {
@@ -611,11 +806,16 @@ pub async fn handle_socket(mut socket: WebSocket, state: RelayState) {
         WEBSOCKET_HEARTBEAT_INTERVAL,
     );
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let heartbeat_enabled = websocket_heartbeat_enabled(role);
     let mut pending_pong_deadline: Option<Instant> = None;
+    let mut heartbeat_debug = WebSocketHeartbeatDebug::new(Instant::now());
 
     loop {
         let pending_pong_deadline_snapshot = pending_pong_deadline;
+        // control frame 优先级高于业务转发，避免慢 client 或大输出把 Pong 消费延迟到超时之后。
         tokio::select! {
+            biased;
+
             _ = tokio::time::sleep_until(idle_deadline) => {
                 warn!(
                     server_id = %server_id.0,
@@ -631,16 +831,77 @@ pub async fn handle_socket(mut socket: WebSocket, state: RelayState) {
                 } else {
                     std::future::pending::<()>().await;
                 }
-            } => {
+            }, if heartbeat_enabled => {
                 warn!(
                     server_id = %server_id.0,
                     ?role,
                     connection_id = registration.id,
+                    heartbeat_debug = ?heartbeat_debug.pending_snapshot(),
                     "relay websocket pong timed out"
                 );
                 break;
             }
-            _ = heartbeat.tick() => {
+            control = control_rx.recv() => {
+                let Some(outbound) = control else {
+                    break;
+                };
+                if !send_relay_outbound(
+                    &state,
+                    &mut sender,
+                    server_id,
+                    role,
+                    registration.id,
+                    outbound,
+                    &mut heartbeat_debug,
+                    &mut idle_deadline,
+                )
+                .await
+                {
+                    break;
+                }
+            }
+            inbound = receiver.next() => {
+                let Some(inbound) = inbound else {
+                    break;
+                };
+                let inbound = match inbound {
+                    Ok(message) => message,
+                    Err(error) => {
+                        warn!(
+                            server_id = %server_id.0,
+                            ?role,
+                            connection_id = registration.id,
+                            %error,
+                            heartbeat_debug = ?heartbeat_debug.pending_snapshot(),
+                            "relay websocket receive failed"
+                        );
+                        break;
+                    }
+                };
+                idle_deadline = Instant::now() + WEBSOCKET_IDLE_TIMEOUT;
+                heartbeat_debug.record_inbound(
+                    websocket_message_kind(&inbound),
+                    websocket_message_bytes(&inbound),
+                );
+                let is_pong = matches!(inbound, Message::Pong(_));
+
+                if !handle_inbound_message(
+                    &state,
+                    &registration,
+                    &mut sender,
+                    &mut heartbeat_debug,
+                    inbound,
+                )
+                .await
+                {
+                    break;
+                }
+                if is_pong {
+                    pending_pong_deadline = None;
+                    heartbeat_debug.note_pong_received();
+                }
+            }
+            _ = heartbeat.tick(), if heartbeat_enabled => {
                 if pending_pong_deadline.is_none() {
                     if send_message_with_deadline(
                         &mut sender,
@@ -653,70 +914,28 @@ pub async fn handle_socket(mut socket: WebSocket, state: RelayState) {
                     {
                         break;
                     }
+                    heartbeat_debug.note_ping_sent();
                     pending_pong_deadline = Some(Instant::now() + WEBSOCKET_PONG_DEADLINE);
                 }
             }
-            inbound = receiver.next() => {
-                let Some(inbound) = inbound else {
-                    break;
-                };
-                let inbound = match inbound {
-                    Ok(message) => message,
-                    Err(error) => {
-                        warn!(server_id = %server_id.0, ?role, connection_id = registration.id, %error, "relay websocket receive failed");
-                        break;
-                    }
-                };
-                idle_deadline = Instant::now() + WEBSOCKET_IDLE_TIMEOUT;
-                let is_pong = matches!(inbound, Message::Pong(_));
-
-                if !handle_inbound_message(&state, &registration, &mut sender, inbound).await {
-                    break;
-                }
-                if is_pong {
-                    pending_pong_deadline = None;
-                }
-            }
-            outbound = rx.recv() => {
+            outbound = data_rx.recv() => {
                 let Some(outbound) = outbound else {
                     break;
                 };
 
-                match outbound {
-                    RelayOutbound::Frame(frame) => {
-                        let frame_kind = frame.kind();
-                        let frame_len = frame.len();
-                        if send_message_with_deadline(
-                            &mut sender,
-                            frame.into(),
-                            WEBSOCKET_SEND_DEADLINE,
-                            "relay websocket outbound frame",
-                        )
-                        .await
-                        .is_err()
-                        {
-                            warn!(
-                                server_id = %server_id.0,
-                                ?role,
-                                connection_id = registration.id,
-                                frame_kind,
-                                frame_len,
-                                "relay websocket send failed"
-                            );
-                            break;
-                        }
-                        idle_deadline = Instant::now() + WEBSOCKET_IDLE_TIMEOUT;
-                    }
-                    RelayOutbound::Close => {
-                        let _ = send_message_with_deadline(
-                            &mut sender,
-                            Message::Close(None),
-                            WEBSOCKET_SEND_DEADLINE,
-                            "relay websocket close",
-                        )
-                        .await;
-                        break;
-                    }
+                if !send_relay_outbound(
+                    &state,
+                    &mut sender,
+                    server_id,
+                    role,
+                    registration.id,
+                    outbound,
+                    &mut heartbeat_debug,
+                    &mut idle_deadline,
+                )
+                .await
+                {
+                    break;
                 }
             }
         }
@@ -729,6 +948,117 @@ pub async fn handle_socket(mut socket: WebSocket, state: RelayState) {
         connection_id = registration.id,
         "relay websocket unregistered"
     );
+}
+
+async fn send_relay_outbound(
+    state: &RelayState,
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    server_id: ServerId,
+    role: ConnectionRole,
+    connection_id: ConnectionId,
+    outbound: RelayOutbound,
+    heartbeat_debug: &mut WebSocketHeartbeatDebug,
+    idle_deadline: &mut Instant,
+) -> bool {
+    match prepare_relay_outbound(state, server_id, role, connection_id, outbound) {
+        PreparedRelayOutbound::Frame(frame) => {
+            send_relay_opaque_frame(
+                sender,
+                server_id,
+                role,
+                connection_id,
+                frame,
+                heartbeat_debug,
+                idle_deadline,
+            )
+            .await
+        }
+        PreparedRelayOutbound::Close => {
+            let _ = send_message_with_deadline(
+                sender,
+                Message::Close(None),
+                WEBSOCKET_SEND_DEADLINE,
+                "relay websocket close",
+            )
+            .await;
+            false
+        }
+        PreparedRelayOutbound::Drop => true,
+    }
+}
+
+fn prepare_relay_outbound(
+    state: &RelayState,
+    server_id: ServerId,
+    role: ConnectionRole,
+    connection_id: ConnectionId,
+    outbound: RelayOutbound,
+) -> PreparedRelayOutbound {
+    match outbound {
+        RelayOutbound::Frame(frame) => PreparedRelayOutbound::Frame(frame),
+        RelayOutbound::MuxClientFrame { client_id, frame } => {
+            if role != ConnectionRole::DaemonMux {
+                warn!(
+                    server_id = %server_id.0,
+                    ?role,
+                    connection_id,
+                    client_id = client_id.0,
+                    "dropping mux client frame queued for non-daemon connection"
+                );
+                return PreparedRelayOutbound::Drop;
+            }
+            if !state.has_client(server_id, client_id) {
+                debug!(
+                    server_id = %server_id.0,
+                    connection_id,
+                    client_id = client_id.0,
+                    "dropping queued relay client frame after client disconnect"
+                );
+                return PreparedRelayOutbound::Drop;
+            }
+            let frame = mux_envelope_frame(RelayMuxEnvelope::ClientFrame {
+                client_id,
+                frame: frame.into(),
+            });
+            PreparedRelayOutbound::Frame(frame)
+        }
+        RelayOutbound::Close => PreparedRelayOutbound::Close,
+    }
+}
+
+async fn send_relay_opaque_frame(
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    server_id: ServerId,
+    role: ConnectionRole,
+    connection_id: ConnectionId,
+    frame: OpaqueFrame,
+    heartbeat_debug: &mut WebSocketHeartbeatDebug,
+    idle_deadline: &mut Instant,
+) -> bool {
+    let frame_kind = frame.kind();
+    let frame_len = frame.len();
+    if send_message_with_deadline(
+        sender,
+        frame.into(),
+        WEBSOCKET_SEND_DEADLINE,
+        "relay websocket outbound frame",
+    )
+    .await
+    .is_err()
+    {
+        warn!(
+            server_id = %server_id.0,
+            ?role,
+            connection_id,
+            frame_kind,
+            frame_len,
+            "relay websocket send failed"
+        );
+        return false;
+    }
+    heartbeat_debug.record_outbound(frame_kind, frame_len);
+    *idle_deadline = Instant::now() + WEBSOCKET_IDLE_TIMEOUT;
+    true
 }
 
 async fn read_route_prelude(socket: &mut WebSocket) -> Result<RoutePrelude, RoutePreludeError> {
@@ -827,6 +1157,7 @@ async fn handle_inbound_message(
     state: &RelayState,
     registration: &ConnectionRegistration,
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    heartbeat_debug: &mut WebSocketHeartbeatDebug,
     message: Message,
 ) -> bool {
     match message {
@@ -858,14 +1189,20 @@ async fn handle_inbound_message(
             forward_opaque(state, registration, OpaqueFrame::Binary(bytes));
             true
         }
-        Message::Ping(payload) => send_message_with_deadline(
-            sender,
-            Message::Pong(payload),
-            WEBSOCKET_PONG_DEADLINE,
-            "relay websocket pong",
-        )
-        .await
-        .is_ok(),
+        Message::Ping(payload) => {
+            let pong_bytes = payload.len();
+            send_message_with_deadline(
+                sender,
+                Message::Pong(payload),
+                WEBSOCKET_PONG_DEADLINE,
+                "relay websocket pong",
+            )
+            .await
+            .map(|_| {
+                heartbeat_debug.record_outbound("pong", pong_bytes);
+            })
+            .is_ok()
+        }
         Message::Pong(_) => true,
         Message::Close(_) => false,
     }
@@ -934,7 +1271,7 @@ fn notify_mux_client_connected(state: &RelayState, registration: &ConnectionRegi
     };
     let _ = daemon_mux
         .sender
-        .try_send(RelayOutbound::Frame(mux_envelope_frame(envelope)));
+        .try_send_control(RelayOutbound::Frame(mux_envelope_frame(envelope)));
 }
 
 fn mux_envelope_frame(envelope: RelayMuxEnvelope) -> OpaqueFrame {
@@ -956,8 +1293,28 @@ mod tests {
         ServerId(uuid::Uuid::from_u128(value))
     }
 
-    fn channel() -> (FrameSender, mpsc::Receiver<RelayOutbound>) {
-        mpsc::channel(CHANNEL_CAPACITY)
+    struct TestReceiver {
+        control: mpsc::UnboundedReceiver<RelayOutbound>,
+        data: mpsc::Receiver<RelayOutbound>,
+    }
+
+    impl TestReceiver {
+        fn try_recv(&mut self) -> Result<RelayOutbound, TryRecvError> {
+            match self.control.try_recv() {
+                Ok(outbound) => Ok(outbound),
+                Err(TryRecvError::Empty) => self.data.try_recv(),
+                Err(error) => Err(error),
+            }
+        }
+    }
+
+    fn channel() -> (FrameSender, TestReceiver) {
+        channel_with_data_capacity(DATA_CHANNEL_CAPACITY)
+    }
+
+    fn channel_with_data_capacity(data_capacity: usize) -> (FrameSender, TestReceiver) {
+        let (sender, control, data) = FrameSender::channel(data_capacity);
+        (sender, TestReceiver { control, data })
     }
 
     fn client_route_hello(server_id: ServerId) -> Envelope<RouteHelloPayload> {
@@ -982,6 +1339,32 @@ mod tests {
             reject_oversized_frame(WEBSOCKET_MAX_FRAME_SIZE + 1),
             Err(WEBSOCKET_MAX_FRAME_SIZE + 1)
         );
+    }
+
+    #[test]
+    fn websocket_heartbeat_requires_pong_even_when_data_flows() {
+        let mut heartbeat = WebSocketHeartbeatDebug::new(Instant::now());
+        heartbeat.note_ping_sent();
+
+        heartbeat.record_outbound("text", 128);
+
+        assert!(heartbeat.pending_snapshot().is_some());
+    }
+
+    #[test]
+    fn websocket_heartbeat_pong_clears_pending_ping() {
+        let mut heartbeat = WebSocketHeartbeatDebug::new(Instant::now());
+        heartbeat.note_ping_sent();
+
+        heartbeat.note_pong_received();
+
+        assert!(heartbeat.pending_snapshot().is_none());
+    }
+
+    #[test]
+    fn websocket_heartbeat_is_not_active_for_daemon_mux_trunk() {
+        assert!(!websocket_heartbeat_enabled(ConnectionRole::DaemonMux));
+        assert!(websocket_heartbeat_enabled(ConnectionRole::Client));
     }
 
     #[tokio::test]
@@ -1250,7 +1633,7 @@ mod tests {
         let state = RelayState::default();
         let server_id = server_id(1);
         let (mux_tx, mut mux_rx) = channel();
-        let (client_tx, _client_rx) = mpsc::channel(1);
+        let (client_tx, _client_rx) = channel_with_data_capacity(1);
 
         client_tx
             .try_send(RelayOutbound::Frame(OpaqueFrame::Text("queued".to_owned())))
@@ -1277,6 +1660,74 @@ mod tests {
                 client_id: RelayClientId(client.id)
             }
         );
+    }
+
+    #[test]
+    fn client_disconnect_bypasses_full_daemon_mux_data_queue() {
+        let state = RelayState::default();
+        let server_id = server_id(1);
+        let (mux_tx, mut mux_rx) = channel_with_data_capacity(1);
+        let (client_tx, _client_rx) = channel();
+
+        mux_tx
+            .try_send(RelayOutbound::MuxClientFrame {
+                client_id: RelayClientId(999),
+                frame: OpaqueFrame::Text("queued-data".to_owned()),
+            })
+            .unwrap();
+        state
+            .register(server_id, ConnectionRole::DaemonMux, mux_tx)
+            .unwrap();
+        let client = state
+            .register(server_id, ConnectionRole::Client, client_tx)
+            .unwrap();
+
+        state.unregister(&client);
+
+        // 断开事件必须走控制队列并抢在普通业务帧前面，否则 daemon 会继续保留 stale watcher。
+        assert_eq!(
+            decode_mux(mux_rx.try_recv().unwrap()),
+            RelayMuxEnvelope::ClientDisconnected {
+                client_id: RelayClientId(client.id)
+            }
+        );
+        assert_eq!(
+            mux_rx.try_recv().unwrap(),
+            RelayOutbound::MuxClientFrame {
+                client_id: RelayClientId(999),
+                frame: OpaqueFrame::Text("queued-data".to_owned())
+            }
+        );
+    }
+
+    #[test]
+    fn queued_client_frame_is_dropped_after_client_disconnect() {
+        let state = RelayState::default();
+        let server_id = server_id(1);
+        let (mux_tx, _mux_rx) = channel();
+        let (client_tx, _client_rx) = channel();
+
+        let mux = state
+            .register(server_id, ConnectionRole::DaemonMux, mux_tx)
+            .unwrap();
+        let client = state
+            .register(server_id, ConnectionRole::Client, client_tx)
+            .unwrap();
+        state.unregister(&client);
+
+        let prepared = prepare_relay_outbound(
+            &state,
+            server_id,
+            ConnectionRole::DaemonMux,
+            mux.id,
+            RelayOutbound::MuxClientFrame {
+                client_id: RelayClientId(client.id),
+                frame: OpaqueFrame::Text("late-flow".to_owned()),
+            },
+        );
+
+        // disconnect 之后残留在普通队列里的 flow/data 不能再发给 daemon。
+        assert_eq!(prepared, PreparedRelayOutbound::Drop);
     }
 
     #[test]
@@ -1343,8 +1794,18 @@ mod tests {
     }
 
     fn decode_mux(outbound: RelayOutbound) -> RelayMuxEnvelope {
-        let RelayOutbound::Frame(OpaqueFrame::Text(raw)) = outbound else {
-            panic!("expected mux text envelope");
+        let raw = match outbound {
+            RelayOutbound::Frame(OpaqueFrame::Text(raw)) => raw,
+            RelayOutbound::MuxClientFrame { client_id, frame } => {
+                let envelope = RelayMuxEnvelope::ClientFrame {
+                    client_id,
+                    frame: frame.into(),
+                };
+                serde_json::to_string(&envelope).expect("mux envelope should encode")
+            }
+            other => {
+                panic!("expected mux text envelope, got {other:?}");
+            }
         };
         serde_json::from_str(&raw).expect("mux envelope should decode")
     }

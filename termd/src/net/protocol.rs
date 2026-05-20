@@ -3,7 +3,7 @@
 //! 本模块不依赖真实 socket，便于单元测试直接驱动 hello、E2EE、pair/auth 和 session
 //! 操作。Axum 只负责把网络帧转成这里的统一 envelope。
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
@@ -3226,6 +3226,223 @@ pub struct ProtocolConnection {
     output_offsets: HashMap<SessionId, u64>,
     pending_outputs: HashMap<SessionId, VecDeque<Vec<u8>>>,
     pending_terminal_frames: HashMap<SessionId, VecDeque<TerminalFramePayload>>,
+    debug_traffic: ProtocolConnectionDebugTraffic,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ProtocolConnectionDebugSnapshot {
+    pub packet_mode: bool,
+    pub attached_sessions: usize,
+    pub watched_sessions: usize,
+    pub terminal_streams: usize,
+    pub zero_credit_terminal_streams: usize,
+    pub total_output_credit: u64,
+    pub pending_raw_chunks: usize,
+    pub pending_terminal_frames: usize,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ProtocolConnectionDebugTraffic {
+    pub inbound_legacy_messages: BTreeMap<String, u64>,
+    pub inbound_requests: BTreeMap<String, u64>,
+    pub inbound_stream_opens: BTreeMap<String, u64>,
+    pub inbound_flow_packets: u64,
+    pub inbound_flow_credit: u64,
+    pub inbound_stream_chunks: u64,
+    pub inbound_stream_chunk_payload_bytes: u64,
+    pub inbound_stream_ends: u64,
+    pub inbound_cancels: u64,
+    pub outbound_legacy_messages: BTreeMap<String, u64>,
+    pub outbound_responses: BTreeMap<String, u64>,
+    pub outbound_events: BTreeMap<String, u64>,
+    pub outbound_errors: u64,
+    pub outbound_stream_chunks: u64,
+    pub outbound_session_data_chunks: u64,
+    pub outbound_session_data_bytes: u64,
+    pub outbound_terminal_frame_chunks: u64,
+    pub outbound_terminal_frame_count: u64,
+    pub outbound_terminal_frame_credit: u64,
+}
+
+impl ProtocolConnectionDebugTraffic {
+    fn increment_method(map: &mut BTreeMap<String, u64>, method: Option<&str>) {
+        let method = method.unwrap_or("<none>");
+        let counter = map.entry(method.to_owned()).or_default();
+        *counter = counter.saturating_add(1);
+    }
+
+    fn record_inbound_legacy_envelope(&mut self, kind: MessageType) {
+        // legacy envelope 没有 packet method/id，只记录消息类型，避免 daemon 日志出现明文 payload。
+        Self::increment_method(
+            &mut self.inbound_legacy_messages,
+            Some(&format!("{kind:?}")),
+        );
+    }
+
+    fn record_inbound_packet(&mut self, packet: &ProtocolPacket<Value>) {
+        match packet.kind {
+            PacketKind::Request => {
+                Self::increment_method(&mut self.inbound_requests, packet.method.as_deref());
+            }
+            PacketKind::StreamOpen => {
+                Self::increment_method(&mut self.inbound_stream_opens, packet.method.as_deref());
+            }
+            PacketKind::StreamChunk => {
+                self.inbound_stream_chunks = self.inbound_stream_chunks.saturating_add(1);
+            }
+            PacketKind::StreamEnd => {
+                self.inbound_stream_ends = self.inbound_stream_ends.saturating_add(1);
+            }
+            PacketKind::Cancel => {
+                self.inbound_cancels = self.inbound_cancels.saturating_add(1);
+            }
+            PacketKind::Flow => {
+                self.inbound_flow_packets = self.inbound_flow_packets.saturating_add(1);
+                self.inbound_flow_credit = self
+                    .inbound_flow_credit
+                    .saturating_add(u64::from(packet.credit.unwrap_or(0)));
+            }
+            PacketKind::Response | PacketKind::Event | PacketKind::Error => {}
+        }
+    }
+
+    fn record_inbound_stream_chunk_payload(&mut self, data_base64: &str) {
+        self.inbound_stream_chunk_payload_bytes = self
+            .inbound_stream_chunk_payload_bytes
+            .saturating_add(base64_payload_decoded_len(data_base64) as u64);
+    }
+
+    fn record_outbound_legacy_envelope(&mut self, kind: MessageType) {
+        // 只统计内层消息类型，足以定位是否是旧协议 activity/status/files 等路径在刷包。
+        Self::increment_method(
+            &mut self.outbound_legacy_messages,
+            Some(&format!("{kind:?}")),
+        );
+    }
+
+    fn record_outbound_packet(&mut self, packet: &ProtocolPacket<Value>) {
+        match packet.kind {
+            PacketKind::Response => {
+                Self::increment_method(&mut self.outbound_responses, packet.method.as_deref());
+            }
+            PacketKind::Event => {
+                Self::increment_method(&mut self.outbound_events, packet.method.as_deref());
+            }
+            PacketKind::Error => {
+                self.outbound_errors = self.outbound_errors.saturating_add(1);
+            }
+            PacketKind::StreamChunk => {
+                self.outbound_stream_chunks = self.outbound_stream_chunks.saturating_add(1);
+            }
+            PacketKind::Request
+            | PacketKind::StreamOpen
+            | PacketKind::StreamEnd
+            | PacketKind::Cancel
+            | PacketKind::Flow => {}
+        }
+    }
+
+    fn record_outbound_session_data(&mut self, data_base64: &str) {
+        self.outbound_session_data_chunks = self.outbound_session_data_chunks.saturating_add(1);
+        self.outbound_session_data_bytes = self
+            .outbound_session_data_bytes
+            .saturating_add(base64_payload_decoded_len(data_base64) as u64);
+    }
+
+    fn record_outbound_terminal_frame(&mut self, frame: &TerminalFramePayload, credit_cost: u32) {
+        self.outbound_terminal_frame_chunks = self.outbound_terminal_frame_chunks.saturating_add(1);
+        self.outbound_terminal_frame_count = self
+            .outbound_terminal_frame_count
+            .saturating_add(terminal_frame_payload_count(frame) as u64);
+        self.outbound_terminal_frame_credit = self
+            .outbound_terminal_frame_credit
+            .saturating_add(u64::from(credit_cost));
+    }
+
+    pub fn merge(&mut self, other: Self) {
+        merge_method_counts(
+            &mut self.inbound_legacy_messages,
+            other.inbound_legacy_messages,
+        );
+        merge_method_counts(&mut self.inbound_requests, other.inbound_requests);
+        merge_method_counts(&mut self.inbound_stream_opens, other.inbound_stream_opens);
+        self.inbound_flow_packets = self
+            .inbound_flow_packets
+            .saturating_add(other.inbound_flow_packets);
+        self.inbound_flow_credit = self
+            .inbound_flow_credit
+            .saturating_add(other.inbound_flow_credit);
+        self.inbound_stream_chunks = self
+            .inbound_stream_chunks
+            .saturating_add(other.inbound_stream_chunks);
+        self.inbound_stream_chunk_payload_bytes = self
+            .inbound_stream_chunk_payload_bytes
+            .saturating_add(other.inbound_stream_chunk_payload_bytes);
+        self.inbound_stream_ends = self
+            .inbound_stream_ends
+            .saturating_add(other.inbound_stream_ends);
+        self.inbound_cancels = self.inbound_cancels.saturating_add(other.inbound_cancels);
+        merge_method_counts(
+            &mut self.outbound_legacy_messages,
+            other.outbound_legacy_messages,
+        );
+        merge_method_counts(&mut self.outbound_responses, other.outbound_responses);
+        merge_method_counts(&mut self.outbound_events, other.outbound_events);
+        self.outbound_errors = self.outbound_errors.saturating_add(other.outbound_errors);
+        self.outbound_stream_chunks = self
+            .outbound_stream_chunks
+            .saturating_add(other.outbound_stream_chunks);
+        self.outbound_session_data_chunks = self
+            .outbound_session_data_chunks
+            .saturating_add(other.outbound_session_data_chunks);
+        self.outbound_session_data_bytes = self
+            .outbound_session_data_bytes
+            .saturating_add(other.outbound_session_data_bytes);
+        self.outbound_terminal_frame_chunks = self
+            .outbound_terminal_frame_chunks
+            .saturating_add(other.outbound_terminal_frame_chunks);
+        self.outbound_terminal_frame_count = self
+            .outbound_terminal_frame_count
+            .saturating_add(other.outbound_terminal_frame_count);
+        self.outbound_terminal_frame_credit = self
+            .outbound_terminal_frame_credit
+            .saturating_add(other.outbound_terminal_frame_credit);
+    }
+
+    pub fn packet_count(&self) -> u64 {
+        self.inbound_legacy_messages.values().sum::<u64>()
+            + self.inbound_requests.values().sum::<u64>()
+            + self.inbound_stream_opens.values().sum::<u64>()
+            + self.inbound_flow_packets
+            + self.inbound_stream_chunks
+            + self.inbound_stream_ends
+            + self.inbound_cancels
+            + self.outbound_legacy_messages.values().sum::<u64>()
+            + self.outbound_responses.values().sum::<u64>()
+            + self.outbound_events.values().sum::<u64>()
+            + self.outbound_errors
+            + self.outbound_stream_chunks
+    }
+
+    pub fn method_count_exceeds(&self, threshold: u64) -> bool {
+        [
+            &self.inbound_legacy_messages,
+            &self.inbound_requests,
+            &self.inbound_stream_opens,
+            &self.outbound_legacy_messages,
+            &self.outbound_responses,
+            &self.outbound_events,
+        ]
+        .into_iter()
+        .any(|counts| counts.values().any(|count| *count > threshold))
+    }
+}
+
+fn merge_method_counts(target: &mut BTreeMap<String, u64>, source: BTreeMap<String, u64>) {
+    for (method, count) in source {
+        let target_count = target.entry(method).or_default();
+        *target_count = target_count.saturating_add(count);
+    }
 }
 
 impl ProtocolConnection {
@@ -3248,6 +3465,7 @@ impl ProtocolConnection {
             output_offsets: HashMap::new(),
             pending_outputs: HashMap::new(),
             pending_terminal_frames: HashMap::new(),
+            debug_traffic: ProtocolConnectionDebugTraffic::default(),
         }
     }
 
@@ -3262,6 +3480,38 @@ impl ProtocolConnection {
 
     pub fn is_authenticated(&self) -> bool {
         self.authenticated_device_id.is_some()
+    }
+
+    pub fn debug_snapshot(&self) -> ProtocolConnectionDebugSnapshot {
+        // 该快照只暴露计数和 credit，不包含 PTY 明文或设备密钥，可安全写入 daemon 日志。
+        let pending_raw_chunks = self.pending_outputs.values().map(VecDeque::len).sum();
+        let pending_terminal_frames = self
+            .pending_terminal_frames
+            .values()
+            .map(VecDeque::len)
+            .sum();
+        ProtocolConnectionDebugSnapshot {
+            packet_mode: self.packet_mode,
+            attached_sessions: self.attached_sessions.len(),
+            watched_sessions: self.watched_sessions.len(),
+            terminal_streams: self.packet_terminal_streams.len(),
+            zero_credit_terminal_streams: self
+                .packet_terminal_streams
+                .values()
+                .filter(|stream| stream.output_credit == 0)
+                .count(),
+            total_output_credit: self
+                .packet_terminal_streams
+                .values()
+                .map(|stream| u64::from(stream.output_credit))
+                .sum(),
+            pending_raw_chunks,
+            pending_terminal_frames,
+        }
+    }
+
+    pub fn take_debug_traffic(&mut self) -> ProtocolConnectionDebugTraffic {
+        std::mem::take(&mut self.debug_traffic)
     }
 
     /// 处理来自 socket 的一条外层 envelope。错误会自动转换为可发送的 error envelope。
@@ -3491,6 +3741,8 @@ impl ProtocolConnection {
                 if self.packet_mode {
                     return Err(ProtocolError::InvalidState);
                 }
+                self.debug_traffic
+                    .record_inbound_legacy_envelope(inner.kind);
                 let inner_responses = self.handle_inner_envelope(protocol, inner)?;
                 self.encrypt_inner_messages(inner_responses)
             }
@@ -3498,7 +3750,7 @@ impl ProtocolConnection {
         }
     }
 
-    fn try_read_session_output<B, V>(
+    fn try_collect_session_output_messages<B, V>(
         &mut self,
         protocol: &mut DaemonProtocol<B, V>,
         session_id: SessionId,
@@ -3579,8 +3831,7 @@ impl ProtocolConnection {
                 drained_chunks += 1;
             }
 
-            let messages = terminal_frame_batch_messages(session_id, frames)?;
-            return self.encrypt_inner_messages(messages);
+            return terminal_frame_batch_messages(session_id, frames);
         }
         let max_packet_chunks = if self.packet_mode {
             let credit = self.packet_stream_output_credit(session_id).unwrap_or(0) as usize;
@@ -3646,6 +3897,20 @@ impl ProtocolConnection {
             )?);
         }
 
+        Ok(messages)
+    }
+
+    fn try_read_session_output<B, V>(
+        &mut self,
+        protocol: &mut DaemonProtocol<B, V>,
+        session_id: SessionId,
+        max_bytes: usize,
+    ) -> Result<Vec<JsonEnvelope>, ProtocolError>
+    where
+        B: PtyBackend,
+        V: SignatureVerifier,
+    {
+        let messages = self.try_collect_session_output_messages(protocol, session_id, max_bytes)?;
         self.encrypt_inner_messages(messages)
     }
 
@@ -3924,6 +4189,7 @@ impl ProtocolConnection {
                 .into_iter()
                 .collect());
         }
+        self.debug_traffic.record_inbound_packet(&packet);
 
         match packet.kind {
             PacketKind::Request => self.handle_packet_request(protocol, packet),
@@ -3931,7 +4197,7 @@ impl ProtocolConnection {
             PacketKind::StreamChunk => self.handle_packet_stream_chunk(protocol, packet),
             PacketKind::StreamEnd => self.handle_packet_stream_end(packet),
             PacketKind::Cancel => self.handle_packet_cancel(packet),
-            PacketKind::Flow => self.handle_packet_flow(packet),
+            PacketKind::Flow => self.handle_packet_flow(protocol, packet),
             PacketKind::Response | PacketKind::Event | PacketKind::Error => {
                 Err(ProtocolError::InvalidState)
             }
@@ -4152,6 +4418,8 @@ impl ProtocolConnection {
             Ok(payload) => payload,
             Err(error) => return Ok(vec![packet_stream_error(stream_id, error)?]),
         };
+        self.debug_traffic
+            .record_inbound_stream_chunk_payload(&payload.data_base64);
         if payload.session_id != stream.session_id {
             return Ok(vec![packet_stream_error(
                 stream_id,
@@ -4195,16 +4463,40 @@ impl ProtocolConnection {
         Err(ProtocolError::InvalidEnvelope)
     }
 
-    fn handle_packet_flow(
+    fn handle_packet_flow<B, V>(
         &mut self,
+        protocol: &mut DaemonProtocol<B, V>,
         packet: ProtocolPacket<Value>,
-    ) -> Result<Vec<ProtocolPacket<Value>>, ProtocolError> {
+    ) -> Result<Vec<ProtocolPacket<Value>>, ProtocolError>
+    where
+        B: PtyBackend,
+        V: SignatureVerifier,
+    {
         let stream_id = packet.stream_id.ok_or(ProtocolError::InvalidEnvelope)?;
         let credit = packet.credit.unwrap_or(0);
+        let Some(session_id) = self
+            .packet_terminal_streams
+            .get(&stream_id)
+            .map(|stream| stream.session_id)
+        else {
+            return Ok(Vec::new());
+        };
         if let Some(stream) = self.packet_terminal_streams.get_mut(&stream_id) {
             stream.output_credit = stream.output_credit.saturating_add(credit);
         }
-        Ok(Vec::new())
+        if credit == 0 {
+            return Ok(Vec::new());
+        }
+
+        // 中文注释：flow 是客户端确认“这些字节已经写入 xterm，可以继续发送”的信号。
+        // 如果上一次因为 credit 耗尽把 terminal frame 暂存在连接内 pending 队列，
+        // 这里必须立即续推；否则只能等下一次 PTY 输出信号，用户会看到几秒钟的断续卡顿。
+        let messages =
+            self.try_collect_session_output_messages(protocol, session_id, LIVE_OUTPUT_MIN_BYTES)?;
+        messages
+            .into_iter()
+            .map(|message| packet_from_envelope(self, message))
+            .collect()
     }
 
     fn e2ee_mut(&mut self) -> Result<&mut E2eeSession, ProtocolError> {
@@ -4236,6 +4528,8 @@ impl ProtocolConnection {
         messages
             .into_iter()
             .map(|message| {
+                self.debug_traffic
+                    .record_outbound_legacy_envelope(message.kind);
                 let frame = self.e2ee_mut()?.encrypt_json_payload(&message)?;
                 envelope_value(MessageType::EncryptedFrame, frame)
             })
@@ -4270,6 +4564,7 @@ impl ProtocolConnection {
         packets
             .into_iter()
             .map(|packet| {
+                self.debug_traffic.record_outbound_packet(&packet);
                 let frame = self
                     .e2ee_mut()?
                     .encrypt_json_payload(&Envelope::new(MessageType::Packet, packet))?;
@@ -4384,11 +4679,15 @@ where
 }
 
 fn base64_payload_credit_cost(data_base64: &str) -> u32 {
-    let trimmed = data_base64.trim_end_matches('=');
-    let decoded_len = trimmed.len().saturating_mul(3) / 4;
+    let decoded_len = base64_payload_decoded_len(data_base64);
     decoded_len
         .max(TERMINAL_STREAM_METADATA_CREDIT_BYTES)
         .min(u32::MAX as usize) as u32
+}
+
+fn base64_payload_decoded_len(data_base64: &str) -> usize {
+    let trimmed = data_base64.trim_end_matches('=');
+    trimmed.len().saturating_mul(3) / 4
 }
 
 fn terminal_frame_credit_cost(frame: &TerminalFramePayload) -> usize {
@@ -4405,6 +4704,20 @@ fn terminal_frame_credit_cost(frame: &TerminalFramePayload) -> usize {
             .map(terminal_frame_credit_cost)
             .sum::<usize>()
             .max(TERMINAL_STREAM_METADATA_CREDIT_BYTES),
+    }
+}
+
+fn terminal_frame_payload_count(frame: &TerminalFramePayload) -> usize {
+    match frame {
+        TerminalFramePayload::Batch { frames, .. } => frames
+            .iter()
+            .map(terminal_frame_payload_count)
+            .sum::<usize>()
+            .max(1),
+        TerminalFramePayload::Snapshot { .. }
+        | TerminalFramePayload::Output { .. }
+        | TerminalFramePayload::Resize { .. }
+        | TerminalFramePayload::Exit { .. } => 1,
     }
 }
 
@@ -4530,6 +4843,9 @@ fn packet_from_envelope(
         let (stream_id, seq) = connection
             .next_packet_stream_output_seq(payload.session_id, credit_cost)
             .ok_or(ProtocolError::InvalidState)?;
+        connection
+            .debug_traffic
+            .record_outbound_session_data(&payload.data_base64);
         let payload = serde_json::to_value(payload).map_err(|_| ProtocolError::InvalidEnvelope)?;
         return Ok(ProtocolPacket::stream_chunk(stream_id, seq, payload));
     }
@@ -4540,6 +4856,9 @@ fn packet_from_envelope(
         let (stream_id, seq) = connection
             .next_packet_stream_output_seq(payload.session_id(), credit_cost)
             .ok_or(ProtocolError::InvalidState)?;
+        connection
+            .debug_traffic
+            .record_outbound_terminal_frame(&payload, credit_cost);
         let payload = serde_json::to_value(payload).map_err(|_| ProtocolError::InvalidEnvelope)?;
         return Ok(ProtocolPacket::stream_chunk(stream_id, seq, payload));
     }
@@ -6435,6 +6754,143 @@ mod tests {
     }
 
     #[test]
+    fn debug_traffic_counts_legacy_inner_messages_without_payloads() {
+        let (mut protocol, _) = protocol();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let (_, mut device_session) = open_e2ee(&mut protocol, &mut connection, device_id);
+
+        pair_device(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            device_id,
+            PublicKey(wire(signing_key.verifying_key().as_bytes())),
+        );
+
+        let traffic = connection.take_debug_traffic();
+        assert_eq!(
+            traffic.inbound_legacy_messages.get("PairRequest").copied(),
+            Some(1)
+        );
+        assert_eq!(
+            traffic.outbound_legacy_messages.get("PairAccept").copied(),
+            Some(1)
+        );
+        assert_eq!(traffic.packet_count(), 2);
+        assert_eq!(
+            connection.take_debug_traffic(),
+            ProtocolConnectionDebugTraffic::default()
+        );
+    }
+
+    #[test]
+    fn debug_traffic_counts_packet_flow_and_terminal_output() {
+        let (mut protocol, backend) = protocol();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let (_, mut device_session, _) =
+            open_packet_e2ee(&mut protocol, &mut connection, device_id);
+        let token = protocol
+            .issue_pairing_token(current_unix_timestamp_millis())
+            .unwrap()
+            .token()
+            .clone();
+
+        let pair_responses = send_encrypted_packet(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            ProtocolPacket::request(
+                PacketRequestId::new(),
+                METHOD_PAIR_REQUEST,
+                serde_json::to_value(PairRequestPayload {
+                    device_id,
+                    device_public_key: PublicKey("device-public-key".to_owned()),
+                    token,
+                    nonce: nonce(),
+                    timestamp_ms: current_unix_timestamp_millis(),
+                })
+                .unwrap(),
+            ),
+        );
+        let _ = decrypt_first_packet(&mut device_session, pair_responses);
+        let pair_traffic = connection.take_debug_traffic();
+        assert_eq!(
+            pair_traffic
+                .inbound_requests
+                .get(METHOD_PAIR_REQUEST)
+                .copied(),
+            Some(1)
+        );
+        assert_eq!(
+            pair_traffic
+                .outbound_responses
+                .get(METHOD_PAIR_REQUEST)
+                .copied(),
+            Some(1)
+        );
+
+        let stream_id = PacketStreamId::new();
+        let create_responses = send_encrypted_packet(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            ProtocolPacket::stream_open(
+                PacketRequestId::new(),
+                stream_id,
+                METHOD_TERMINAL_CREATE,
+                128 * 1024,
+                serde_json::to_value(SessionCreatePayload {
+                    command: vec!["sh".to_owned()],
+                    size: TerminalSize::new(24, 80),
+                })
+                .unwrap(),
+            ),
+        );
+        let created_packet = decrypt_first_packet(&mut device_session, create_responses);
+        let created: SessionCreatedPayload = decode_payload(created_packet.payload).unwrap();
+        let create_traffic = connection.take_debug_traffic();
+        assert_eq!(
+            create_traffic
+                .inbound_stream_opens
+                .get(METHOD_TERMINAL_CREATE)
+                .copied(),
+            Some(1)
+        );
+        assert_eq!(
+            create_traffic
+                .outbound_responses
+                .get(METHOD_TERMINAL_CREATE)
+                .copied(),
+            Some(1)
+        );
+
+        backend.push_output_for_session(created.session_id, b"hello");
+        let output_packets = decrypt_packets(
+            &mut device_session,
+            connection.read_session_output(&mut protocol, created.session_id, 1024),
+        );
+        assert_eq!(output_packets.len(), 1);
+        let output_traffic = connection.take_debug_traffic();
+        assert_eq!(output_traffic.outbound_stream_chunks, 1);
+        assert_eq!(output_traffic.outbound_terminal_frame_chunks, 1);
+        assert!(output_traffic.outbound_terminal_frame_count >= 1);
+        assert!(output_traffic.outbound_terminal_frame_credit >= 5);
+
+        let _ = send_encrypted_packet(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            ProtocolPacket::flow(stream_id, 1, 1024),
+        );
+        let flow_traffic = connection.take_debug_traffic();
+        assert_eq!(flow_traffic.inbound_flow_packets, 1);
+        assert_eq!(flow_traffic.inbound_flow_credit, 1024);
+    }
+
+    #[test]
     fn packet_terminal_stream_open_batches_snapshot_and_output_with_stream_sequence() {
         let (mut protocol, backend) = protocol();
         let (mut connection, _) = protocol.start_connection();
@@ -6756,21 +7212,127 @@ mod tests {
             "no output should be sent after byte credit is exhausted: {blocked:?}"
         );
 
-        let _ = send_encrypted_packet(
+        let flow_responses = send_encrypted_packet(
             &mut protocol,
             &mut connection,
             &mut device_session,
             ProtocolPacket::flow(stream_id, 1, 10),
         );
-        let second_packets = decrypt_packets(
-            &mut device_session,
-            connection.read_session_output(&mut protocol, created.session_id, 1024),
-        );
+        let second_packets = decrypt_packets(&mut device_session, flow_responses);
         assert_eq!(second_packets.len(), 1);
         assert_eq!(second_packets[0].kind, PacketKind::StreamChunk);
         assert_eq!(second_packets[0].seq, 2);
         let second: TerminalFramePayload =
             decode_payload(second_packets[0].payload.clone()).unwrap();
+        assert_eq!(second.terminal_seq(), Some(3));
+    }
+
+    #[test]
+    fn packet_terminal_flow_credit_flushes_pending_terminal_frames_immediately() {
+        let (mut protocol, backend) = protocol();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let (_, mut device_session, _) =
+            open_packet_e2ee(&mut protocol, &mut connection, device_id);
+        let token = protocol
+            .issue_pairing_token(current_unix_timestamp_millis())
+            .unwrap()
+            .token()
+            .clone();
+        let pair_responses = send_encrypted_packet(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            ProtocolPacket::request(
+                PacketRequestId::new(),
+                METHOD_PAIR_REQUEST,
+                serde_json::to_value(PairRequestPayload {
+                    device_id,
+                    device_public_key: PublicKey("device-public-key".to_owned()),
+                    token,
+                    nonce: nonce(),
+                    timestamp_ms: current_unix_timestamp_millis(),
+                })
+                .unwrap(),
+            ),
+        );
+        let _ = decrypt_first_packet(&mut device_session, pair_responses);
+
+        let create_responses = send_encrypted_packet(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            ProtocolPacket::request(
+                PacketRequestId::new(),
+                METHOD_SESSION_CREATE,
+                serde_json::to_value(SessionCreatePayload {
+                    command: vec!["sh".to_owned()],
+                    size: TerminalSize::new(24, 80),
+                })
+                .unwrap(),
+            ),
+        );
+        let created_packet = decrypt_first_packet(&mut device_session, create_responses);
+        let created: SessionCreatedPayload = decode_payload(created_packet.payload).unwrap();
+        for (terminal_seq, data) in [
+            (1, b"abcdefghij".to_vec()),
+            (2, b"klmnopqrst".to_vec()),
+            (3, b"uvwxyz1234".to_vec()),
+        ] {
+            backend.push_terminal_journal_frame_for_session(
+                created.session_id,
+                PtyTerminalFrame::Output { terminal_seq, data },
+            );
+        }
+
+        let stream_id = PacketStreamId::new();
+        let attach_responses = send_encrypted_packet(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            ProtocolPacket::stream_open(
+                PacketRequestId::new(),
+                stream_id,
+                METHOD_TERMINAL_ATTACH,
+                20,
+                serde_json::to_value(SessionAttachPayload {
+                    session_id: created.session_id,
+                    watch_updates: true,
+                    last_terminal_seq: Some(0),
+                })
+                .unwrap(),
+            ),
+        );
+        let attached_packet = decrypt_first_packet(&mut device_session, attach_responses);
+        assert_eq!(attached_packet.kind, PacketKind::Response);
+
+        let first_packets = decrypt_packets(
+            &mut device_session,
+            connection.read_session_output(&mut protocol, created.session_id, 1024),
+        );
+        assert_eq!(first_packets.len(), 1);
+        assert_eq!(first_packets[0].seq, 1);
+        assert_eq!(
+            connection.debug_snapshot().pending_terminal_frames,
+            1,
+            "第三帧应因为 credit 不足暂存在连接内 pending 队列"
+        );
+
+        let flow_responses = send_encrypted_packet(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            ProtocolPacket::flow(stream_id, 1, 10),
+        );
+        let flow_packets = decrypt_packets(&mut device_session, flow_responses);
+        assert_eq!(
+            flow_packets.len(),
+            1,
+            "flow credit 回补必须立刻续推 pending terminal frame，不能等下一次 PTY 输出信号"
+        );
+        assert_eq!(flow_packets[0].kind, PacketKind::StreamChunk);
+        assert_eq!(flow_packets[0].seq, 2);
+        let second: TerminalFramePayload = decode_payload(flow_packets[0].payload.clone()).unwrap();
         assert_eq!(second.terminal_seq(), Some(3));
     }
 
@@ -6880,16 +7442,13 @@ mod tests {
             "超额发送后必须等客户端按实际字节数补 credit，不能继续透支"
         );
 
-        let _ = send_encrypted_packet(
+        let flow_responses = send_encrypted_packet(
             &mut protocol,
             &mut connection,
             &mut device_session,
             ProtocolPacket::flow(stream_id, 1, 30),
         );
-        let second_packets = decrypt_packets(
-            &mut device_session,
-            connection.read_session_output(&mut protocol, created.session_id, 1024),
-        );
+        let second_packets = decrypt_packets(&mut device_session, flow_responses);
         assert_eq!(second_packets.len(), 1);
         assert_eq!(second_packets[0].seq, 2);
         let second: TerminalFramePayload =

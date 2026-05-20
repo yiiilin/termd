@@ -1237,6 +1237,7 @@ mod tests {
         struct MockMuxState {
             attempts: Arc<AtomicUsize>,
             heartbeat_pings: Arc<AtomicUsize>,
+            route_ready_sent: Arc<AtomicUsize>,
             close_first_attempt: bool,
         }
 
@@ -1267,6 +1268,7 @@ mod tests {
                 if socket.send(AxumMessage::Text(raw.into())).await.is_err() {
                     return;
                 }
+                state.route_ready_sent.fetch_add(1, Ordering::SeqCst);
 
                 while let Some(message) = socket.next().await {
                     match message {
@@ -1358,7 +1360,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 if flaky_state.attempts.load(Ordering::SeqCst) >= 2
-                    && healthy_state.heartbeat_pings.load(Ordering::SeqCst) >= 1
+                    && healthy_state.route_ready_sent.load(Ordering::SeqCst) >= 1
                 {
                     break;
                 }
@@ -1367,6 +1369,9 @@ mod tests {
         })
         .await
         .unwrap();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        assert_eq!(healthy_state.heartbeat_pings.load(Ordering::SeqCst), 0);
 
         for handle in relay_tasks {
             handle.abort();
