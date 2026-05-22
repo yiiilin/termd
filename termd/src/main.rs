@@ -1236,7 +1236,7 @@ mod tests {
         #[derive(Clone, Default)]
         struct MockMuxState {
             attempts: Arc<AtomicUsize>,
-            heartbeat_pings: Arc<AtomicUsize>,
+            idle_pings: Arc<AtomicUsize>,
             route_ready_sent: Arc<AtomicUsize>,
             close_first_attempt: bool,
         }
@@ -1254,14 +1254,17 @@ mod tests {
                 let Some(route_hello) = read_route_hello(&mut socket).await else {
                     return;
                 };
-                if route_hello.role != RouteRole::DaemonMux {
+                if !matches!(
+                    route_hello.role,
+                    RouteRole::DaemonMux | RouteRole::DaemonMuxData
+                ) {
                     return;
                 }
                 let route_ready = Envelope::new(
                     MessageType::RouteReady,
                     RouteReadyPayload {
                         server_id: route_hello.server_id,
-                        role: RouteRole::DaemonMux,
+                        role: route_hello.role,
                     },
                 );
                 let raw = serde_json::to_string(&route_ready).unwrap();
@@ -1272,10 +1275,10 @@ mod tests {
 
                 while let Some(message) = socket.next().await {
                     match message {
+                        Ok(AxumMessage::Binary(_)) => {}
                         Ok(AxumMessage::Ping(payload)) => {
-                            state.heartbeat_pings.fetch_add(1, Ordering::SeqCst);
+                            state.idle_pings.fetch_add(1, Ordering::SeqCst);
                             let _ = socket.send(AxumMessage::Pong(payload)).await;
-                            break;
                         }
                         Ok(AxumMessage::Close(_)) | Err(_) => break,
                         Ok(_) => {}
@@ -1360,7 +1363,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 if flaky_state.attempts.load(Ordering::SeqCst) >= 2
-                    && healthy_state.route_ready_sent.load(Ordering::SeqCst) >= 1
+                    && healthy_state.route_ready_sent.load(Ordering::SeqCst) >= 2
                 {
                     break;
                 }
@@ -1371,7 +1374,15 @@ mod tests {
         .unwrap();
         tokio::time::sleep(Duration::from_millis(80)).await;
 
-        assert_eq!(healthy_state.heartbeat_pings.load(Ordering::SeqCst), 0);
+        assert!(
+            healthy_state.idle_pings.load(Ordering::SeqCst) >= 1,
+            "健康 relay supervisor 空闲时应发送 WebSocket Ping，避免公网代理清理静默主干"
+        );
+        assert_eq!(
+            healthy_state.attempts.load(Ordering::SeqCst),
+            2,
+            "健康 relay supervisor 应保持第一组 control/data mux 连接，不能因为 WebSocket Ping 重连"
+        );
 
         for handle in relay_tasks {
             handle.abort();

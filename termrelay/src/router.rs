@@ -6,7 +6,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
-use crate::ws::{RelayState, handle_socket};
+use crate::ws::{RelayState, WEBSOCKET_MAX_FRAME_SIZE, WEBSOCKET_MAX_MESSAGE_SIZE, handle_socket};
 
 pub fn router(state: RelayState, web_enabled: bool) -> Router {
     let router = Router::new()
@@ -57,6 +57,8 @@ fn ws_response(
     }
 
     websocket
+        .max_frame_size(WEBSOCKET_MAX_FRAME_SIZE)
+        .max_message_size(WEBSOCKET_MAX_MESSAGE_SIZE)
         .on_upgrade(move |socket| handle_socket(socket, state))
         .into_response()
 }
@@ -67,11 +69,14 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use futures_util::{SinkExt, StreamExt};
+    use std::time::Duration;
     use termd_proto::{
         Envelope, MessageType, Nonce, ProtocolVersion, RelayMuxEnvelope, RelayOpaqueFrame,
         RouteHelloPayload, RouteReadyPayload, RouteRole, ServerId,
+        decode_binary_relay_mux_envelope, encode_binary_relay_mux_envelope,
     };
     use tokio::net::TcpListener;
+    use tokio::time::timeout;
     use tokio_tungstenite::connect_async;
     use tokio_tungstenite::tungstenite::Message as ClientMessage;
     use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
@@ -193,6 +198,72 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn daemon_mux_reader_is_not_blocked_by_client_to_daemon_backpressure() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _server = tokio::spawn(async move {
+            axum::serve(listener, router(RelayState::default(), false))
+                .await
+                .unwrap();
+        });
+        let server_id = ServerId::new();
+        let url = format!("ws://{addr}/ws");
+        let (mut daemon_mux, _daemon_response) = connect_async(url.clone()).await.unwrap();
+        register_route(&mut daemon_mux, server_id, RouteRole::DaemonMux).await;
+        let (mut target_client, _target_response) = connect_async(url.clone()).await.unwrap();
+        register_route(&mut target_client, server_id, RouteRole::Client).await;
+        let target_client_id = match next_mux(&mut daemon_mux).await {
+            RelayMuxEnvelope::ClientConnected { client_id } => client_id,
+            other => panic!("expected target client_connected envelope, got {other:?}"),
+        };
+        let (mut flood_client, _flood_response) = connect_async(url).await.unwrap();
+        register_route(&mut flood_client, server_id, RouteRole::Client).await;
+        let _flood_client_id = match next_mux(&mut daemon_mux).await {
+            RelayMuxEnvelope::ClientConnected { client_id } => client_id,
+            other => panic!("expected flood client_connected envelope, got {other:?}"),
+        };
+
+        // 中文注释：这里刻意不再读取 daemon_mux。旧实现的 relay daemon-mux task 会在把
+        // flood client 的大帧写向 daemon 时卡住，因而无法继续读取 daemon 反向发来的响应。
+        let flood_payload = vec![b'x'; 900 * 1024];
+        for _ in 0..96 {
+            if tokio::time::timeout(
+                Duration::from_millis(20),
+                flood_client.send(ClientMessage::Binary(flood_payload.clone())),
+            )
+            .await
+            .is_err()
+            {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let response = RelayMuxEnvelope::DaemonFrame {
+            client_id: target_client_id,
+            frame: RelayOpaqueFrame::Text {
+                data: "daemon-response-while-backpressured".to_owned(),
+            },
+        };
+        daemon_mux
+            .send(ClientMessage::Binary(
+                encode_binary_relay_mux_envelope(&response).unwrap(),
+            ))
+            .await
+            .unwrap();
+
+        let received = timeout(Duration::from_millis(300), target_client.next())
+            .await
+            .expect("daemon mux reader must keep forwarding daemon frames while writer is backpressured")
+            .expect("target client websocket should stay open")
+            .expect("target client frame should be valid");
+        assert_eq!(
+            received,
+            ClientMessage::Text("daemon-response-while-backpressured".to_owned())
+        );
+    }
+
     type TestSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
     async fn register_route(socket: &mut TestSocket, server_id: ServerId, role: RouteRole) {
@@ -203,6 +274,7 @@ mod tests {
                 role,
                 protocol_version: ProtocolVersion::default(),
                 nonce: Nonce("route-test-nonce".to_owned()),
+                route_generation: None,
                 timestamp_ms: termd_proto::UnixTimestampMillis(1_710_000_000_000),
             },
         );
@@ -226,6 +298,10 @@ mod tests {
     }
 
     async fn next_mux(socket: &mut TestSocket) -> RelayMuxEnvelope {
-        serde_json::from_str(&next_text(socket).await).unwrap()
+        match socket.next().await.unwrap().unwrap() {
+            ClientMessage::Text(text) => serde_json::from_str(&text).unwrap(),
+            ClientMessage::Binary(bytes) => decode_binary_relay_mux_envelope(&bytes).unwrap(),
+            other => panic!("expected mux frame, got {other:?}"),
+        }
     }
 }

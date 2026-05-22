@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
   E2eeSession,
+  decodeBinaryEncryptedFrame,
   decodeX25519PublicKey,
+  encodeBinaryEncryptedFrame,
   generateE2eeKeyPair,
 } from "../protocol/e2ee";
 import { envelope } from "../protocol/wire";
@@ -72,5 +74,37 @@ describe("E2EE 加密帧", () => {
     expect(receiver.decryptJson(first)).toEqual(envelope("ping", { nonce: "n1", timestamp_ms: 1 }));
     expect(() => receiver.decryptJson(first)).toThrow(/sequence/i);
     expect(receiver.decryptJson(second)).toEqual(envelope("ping", { nonce: "n2", timestamp_ms: 2 }));
+  });
+
+  it("binary encrypted frame 直接承载密文字节，不再使用 ciphertext_base64 JSON 外壳", () => {
+    const serverId = "00000000-0000-0000-0000-000000000301";
+    const deviceId = "00000000-0000-0000-0000-000000000302";
+    const daemonKeypair = generateE2eeKeyPair();
+    const deviceKeypair = generateE2eeKeyPair();
+    const sender = E2eeSession.device({
+      serverId,
+      deviceId,
+      localKeypair: deviceKeypair,
+      daemonPublicKeyWire: daemonKeypair.publicKeyWire,
+    });
+    const receiver = E2eeSession.daemon({
+      serverId,
+      deviceId,
+      localKeypair: daemonKeypair,
+      devicePublicKeyWire: deviceKeypair.publicKeyWire,
+    });
+    const plaintext = new Uint8Array([0, 1, 2, 255, 65, 66, 67]);
+
+    const frame = sender.encryptBinary(plaintext);
+    const wire = encodeBinaryEncryptedFrame(frame);
+    const decoded = decodeBinaryEncryptedFrame(wire);
+    const decrypted = receiver.decryptBinary(decoded);
+    const wireText = new TextDecoder().decode(wire);
+
+    expect(decoded.server_id).toBe(serverId);
+    expect(decoded.sequence).toBe(0);
+    expect(decrypted).toEqual(plaintext);
+    expect(wireText).not.toContain("ciphertext_base64");
+    expect(wireText).not.toContain("encrypted_frame");
   });
 });

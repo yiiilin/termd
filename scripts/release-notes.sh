@@ -12,6 +12,22 @@ version="${1:-}"
 }
 
 case "$version" in
+  0.3.4)
+    cat <<'EOF'
+termd 0.3.4
+
+用户可见变化:
+- supervisor 现在会保留普通屏幕和替代屏幕的终端快照；daemon 或浏览器重新接入时，会先恢复权威屏幕状态，再继续追赶后续 tail，减少大输出 session 在重连后丢屏、跳屏或回到旧画面的情况。
+- daemon 也维护会话级终端镜像缓存；新客户端加入、daemon 和 supervisor 断开重连、或多个客户端轮番 attach 时，都会优先使用本地缓存恢复画面，再对接 live tail。
+- 终端流发送改成按字节累计的 chunk/credit 模式，并让 relay/direct 路径更偏向批量转发；大段输出不会再被过细的小片段打散，前端不再明显“一字一字蹦”。
+- relay 仍然只是 dumb pipe，但在高延迟、抖动、双客户端和断连恢复场景下更稳；多个 session 轮番切换、长时间大量输出和客户端掉线重连都经过回归测试。
+- Web、daemon、termctl 和 relay 都同步更新到 0.3.4，安装/更新时如果 supervisor 兼容版本不匹配，会升级 supervisor 并清空不兼容的 live session。
+
+兼容性:
+- 0.3.4 更新了 supervisor 兼容版本到 `0.3.4`；如果本地已有旧版 live supervisor，普通更新会触发重建并清空对应 session。
+- packet / terminal frame 语义继续沿用 0.3.x 路线；relay 仍只是转发连接和路由，不解密也不解析明文。
+EOF
+    ;;
   0.3.3)
     cat <<'EOF'
 termd 0.3.3

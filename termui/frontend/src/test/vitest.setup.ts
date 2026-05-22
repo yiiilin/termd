@@ -20,6 +20,8 @@ afterEach(() => {
     .__TERMD_TEST_DEFER_XTERM_RENDER_UNTIL_WRITE_CALLBACK__;
   delete (globalThis as { __TERMD_TEST_SERIALIZE_XTERM_WRITES__?: boolean })
     .__TERMD_TEST_SERIALIZE_XTERM_WRITES__;
+  delete (globalThis as { __TERMD_TEST_DEFER_OUTPUT_RESET_APPLIED__?: (confirm: () => void) => void })
+    .__TERMD_TEST_DEFER_OUTPUT_RESET_APPLIED__;
   delete (globalThis as { __TERMD_TEST_XTERM_STATS__?: { writes: number; refreshes: number; writtenBytes: number } })
     .__TERMD_TEST_XTERM_STATS__;
   delete (globalThis as { __TERMD_TEST_XTERM__?: { select: (text: string) => void } }).__TERMD_TEST_XTERM__;

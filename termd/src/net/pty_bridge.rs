@@ -17,6 +17,8 @@ use crate::pty::{
 };
 
 const READER_CHUNK_BYTES: usize = 16 * 1024;
+const READY_OUTPUT_DRAIN_MAX_CHUNKS: usize = 64;
+const READY_OUTPUT_DRAIN_MAX_BYTES: usize = 1024 * 1024;
 
 /// 生产 daemon 使用的 PTY backend。
 ///
@@ -116,9 +118,20 @@ struct NonBlockingPortablePtySession {
 
 impl NonBlockingPortablePtySession {
     fn drain_ready_output(&mut self) -> PtyResult<()> {
+        let mut chunks = 0_usize;
+        let mut bytes = 0_usize;
         loop {
+            if chunks >= READY_OUTPUT_DRAIN_MAX_CHUNKS || bytes >= READY_OUTPUT_DRAIN_MAX_BYTES {
+                // 中文注释：这里仍在 supervisor 的 session 锁内。持续刷屏时不能把
+                // mpsc backlog 一次搬空，否则 input/resize/snapshot 会等这个同步函数。
+                return Ok(());
+            }
             match self.output_rx.try_recv() {
-                Ok(Ok(chunk)) if !chunk.is_empty() => self.pending_output.push_back(chunk),
+                Ok(Ok(chunk)) if !chunk.is_empty() => {
+                    bytes = bytes.saturating_add(chunk.len());
+                    chunks = chunks.saturating_add(1);
+                    self.pending_output.push_back(chunk);
+                }
                 Ok(Ok(_)) => continue,
                 Ok(Err(error)) => return Err(error),
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => return Ok(()),

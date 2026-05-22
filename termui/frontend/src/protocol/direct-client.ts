@@ -6,9 +6,21 @@ import {
   signAuthPayload,
   verifyEd25519Signature,
 } from "./auth";
-import { E2eeSession, generateE2eeKeyPair } from "./e2ee";
+import {
+  E2eeSession,
+  decodeBinaryEncryptedFrame,
+  encodeBinaryEncryptedFrame,
+  generateE2eeKeyPair,
+} from "./e2ee";
+import {
+  type BinaryProtocolPacket,
+  decodeBinaryProtocolPacket,
+  encodeBinaryProtocolPacket,
+  terminalFrameBinaryToJson,
+  terminalFrameJsonToBinary,
+} from "./binary-packet";
 import { ProtocolClientError, protocolError } from "./errors";
-import { PROTOCOL_PACKET_VERSION } from "./types";
+import { BINARY_PROTOCOL_VERSION, PROTOCOL_PACKET_VERSION } from "./types";
 import type {
   AuthChallengePayload,
   ClientHelloPayload,
@@ -76,7 +88,11 @@ import type {
   UUID,
 } from "./types";
 import {
+  base64ToBytes,
+  bytesToBase64,
+  decodeUtf8,
   envelope,
+  encodeUtf8,
   messageDataToText,
   nonce,
   nowMs,
@@ -92,7 +108,8 @@ interface DirectClientOptions {
 }
 
 interface QueuedMessage {
-  envelope: Envelope;
+  envelope?: Envelope;
+  binary?: Uint8Array;
 }
 
 interface PendingRequest {
@@ -116,12 +133,25 @@ interface TerminalStreamState {
 
 const DEFAULT_TIMEOUT_MS = 30000;
 const INITIAL_TERMINAL_STREAM_CREDIT = 256 * 1024;
+const RECEIVE_PUMP_YIELD_MESSAGES = 64;
+const RECEIVE_PUMP_YIELD_BYTES = 256 * 1024;
 
 export { ProtocolClientError };
 
 function base64DecodedLength(dataBase64: string): number {
   const trimmed = dataBase64.replace(/=+$/, "");
   return Math.floor((trimmed.length * 3) / 4);
+}
+
+function queuedMessageBytes(message: QueuedMessage): number {
+  if (message.binary) {
+    return message.binary.byteLength;
+  }
+  return 0;
+}
+
+function yieldToEventLoop(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
 export class DirectClient {
@@ -143,6 +173,7 @@ export class DirectClient {
     private readonly deviceId: UUID,
     e2ee: E2eeSession,
     options: Required<Pick<DirectClientOptions, "timeoutMs">>,
+    private readonly binaryMode: boolean,
   ) {
     this.e2ee = e2ee;
     this.timeoutMs = options.timeoutMs;
@@ -155,6 +186,7 @@ export class DirectClient {
     options: DirectClientOptions = {},
   ): Promise<DirectClient> {
     const socket = options.webSocketFactory?.(url) ?? new WebSocket(url);
+    socket.binaryType = "arraybuffer";
     const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     const inbox = new SocketInbox(socket);
 
@@ -172,9 +204,9 @@ export class DirectClient {
           timestamp_ms: nowMs(),
         }),
       );
-      const routeReady = (
-        await withTimeout(inbox.read(), timeoutMs, "route_prelude_timeout")
-      ).envelope;
+      const routeReady = expectQueuedEnvelope(
+        await withTimeout(inbox.read(), timeoutMs, "route_prelude_timeout"),
+      );
       if (routeReady.type === "error") {
         throw protocolError(routeReady.payload as ErrorPayload);
       }
@@ -188,7 +220,7 @@ export class DirectClient {
 
       const initial = (
         await withTimeout(Promise.all([inbox.read(), inbox.read()]), timeoutMs, "handshake_timeout")
-      ).map((message) => message.envelope);
+      ).map(expectQueuedEnvelope);
 
       const expectedDaemonPublicKey = options.expectedDaemonPublicKey;
       if (!expectedDaemonPublicKey) {
@@ -243,7 +275,8 @@ export class DirectClient {
         localKeypair: keypair,
         daemonPublicKeyWire: daemonKeyExchange.public_key,
       });
-      const client = new DirectClient(socket, inbox, routeServerId, deviceId, e2ee, { timeoutMs });
+      const binaryMode = daemonKeyExchange.binary_version === BINARY_PROTOCOL_VERSION;
+      const client = new DirectClient(socket, inbox, routeServerId, deviceId, e2ee, { timeoutMs }, binaryMode);
       const deviceKeyExchange: E2eeKeyExchangePayload = {
         server_id: routeServerId,
         device_id: deviceId,
@@ -251,6 +284,7 @@ export class DirectClient {
         nonce: nonce(),
         timestamp_ms: nowMs(),
         packet_version: PROTOCOL_PACKET_VERSION,
+        ...(binaryMode ? { binary_version: BINARY_PROTOCOL_VERSION } : {}),
       };
       client.sendOuter(
         envelope("e2ee_key_exchange", deviceKeyExchange),
@@ -609,18 +643,37 @@ export class DirectClient {
   }
 
   private async runReceivePump(): Promise<void> {
+    let processedMessages = 0;
+    let processedBytes = 0;
     while (!this.closed) {
       try {
-        const outer = await this.readOuter();
-        if (outer.type === "encrypted_frame") {
-          const inner = this.e2ee.decryptJson(outer.payload as EncryptedFramePayload);
-          this.dispatchInner(inner);
-          continue;
+        const message = await this.inbox.read();
+        processedMessages += 1;
+        processedBytes += queuedMessageBytes(message);
+        if (message.binary) {
+          if (!this.binaryMode) {
+            throw new ProtocolClientError("unexpected_message", "unexpected binary outer message");
+          }
+          this.dispatchBinaryWire(message.binary);
+        } else {
+          const outer = expectQueuedEnvelope(message);
+          if (outer.type === "encrypted_frame") {
+            const inner = this.e2ee.decryptJson(outer.payload as EncryptedFramePayload);
+            this.dispatchInner(inner);
+          } else if (outer.type === "error") {
+            throw protocolError(outer.payload as ErrorPayload);
+          } else {
+            throw new ProtocolClientError("unexpected_message", "unexpected outer message");
+          }
         }
-        if (outer.type === "error") {
-          throw protocolError(outer.payload as ErrorPayload);
+        if (
+          processedMessages >= RECEIVE_PUMP_YIELD_MESSAGES ||
+          processedBytes >= RECEIVE_PUMP_YIELD_BYTES
+        ) {
+          processedMessages = 0;
+          processedBytes = 0;
+          await yieldToEventLoop();
         }
-        throw new ProtocolClientError("unexpected_message", "unexpected outer message");
       } catch (caught) {
         if (!this.closed) {
           const error = caught instanceof Error ? caught : new ProtocolClientError("protocol_error", "protocol operation failed");
@@ -749,7 +802,17 @@ export class DirectClient {
       return;
     }
 
-    this.enqueueInner(envelope("session_data", packet.payload as SessionDataPayload));
+    this.enqueueSessionData(packet.payload as SessionDataPayload, packet.stream_id, seq);
+  }
+
+  private enqueueSessionData(payload: SessionDataPayload, streamId: PacketStreamId, transportSeq: number): void {
+    this.enqueueInner(envelope("session_data", {
+      ...payload,
+      // 这三个字段只供前端内部流控使用：daemon/relay 仍只理解原始 session_data。
+      stream_id: streamId,
+      transport_seq: transportSeq,
+      render_credit: this.sessionDataRenderCredit(payload),
+    } satisfies SessionDataPayload));
   }
 
   private enqueueTerminalFrame(
@@ -775,9 +838,13 @@ export class DirectClient {
 
   private terminalFrameRenderCredit(payload: SingleTerminalFramePayload): number {
     if (payload.kind === "snapshot" || payload.kind === "output") {
-      return Math.max(1, base64DecodedLength(payload.data_base64));
+      return Math.max(1, payload.data_bytes?.byteLength ?? base64DecodedLength(payload.data_base64 ?? ""));
     }
     return 1;
+  }
+
+  private sessionDataRenderCredit(payload: SessionDataPayload): number {
+    return Math.max(1, payload.data_bytes?.byteLength ?? base64DecodedLength(payload.data_base64 ?? ""));
   }
 
   ackTerminalRender(sessionId: UUID, transportSeq: number, credit: number): void {
@@ -926,6 +993,10 @@ export class DirectClient {
   }
 
   private sendPacket(packet: ProtocolPacket): void {
+    if (this.binaryMode) {
+      this.sendBinaryPacket(packet);
+      return;
+    }
     this.sendInner(envelope("packet", packet));
   }
 
@@ -942,6 +1013,11 @@ export class DirectClient {
     this.sendOuter(envelope("encrypted_frame", frame));
   }
 
+  private sendBinaryPacket(packet: ProtocolPacket): void {
+    const frame = this.e2ee.encryptBinary(encodeBinaryProtocolPacket(protocolPacketToBinary(packet)));
+    this.sendBinaryOuter(encodeBinaryEncryptedFrame(frame));
+  }
+
   private sendOuter(message: Envelope): void {
     if (this.closed || this.socket.readyState !== WebSocket.OPEN) {
       throw new ProtocolClientError("connection_closed", "connection closed");
@@ -949,8 +1025,17 @@ export class DirectClient {
     sendOuterMessage(this.socket, message);
   }
 
-  private readOuter(): Promise<Envelope> {
-    return this.inbox.read().then((message) => message.envelope);
+  private sendBinaryOuter(bytes: Uint8Array): void {
+    if (this.closed || this.socket.readyState !== WebSocket.OPEN) {
+      throw new ProtocolClientError("connection_closed", "connection closed");
+    }
+    this.socket.send(bytes);
+  }
+
+  private dispatchBinaryWire(bytes: Uint8Array): void {
+    const frame = decodeBinaryEncryptedFrame(bytes);
+    const packet = binaryPacketToProtocol(decodeBinaryProtocolPacket(this.e2ee.decryptBinary(frame)));
+    this.dispatchPacket(packet);
   }
 }
 
@@ -989,7 +1074,9 @@ class SocketInbox {
 
   private async enqueueMessage(data: unknown): Promise<void> {
     try {
-      const message = { envelope: parseEnvelope(await messageDataToText(data)) };
+      const message = typeof data === "string"
+        ? { envelope: parseEnvelope(await messageDataToText(data)) }
+        : { binary: await messageDataToBytes(data) };
       const waiter = this.waiters.shift();
       this.errors.shift();
       if (waiter) {
@@ -1001,6 +1088,101 @@ class SocketInbox {
       this.rejectPending(error instanceof Error ? error : new Error("invalid_envelope"));
     }
   }
+}
+
+function expectQueuedEnvelope(message: QueuedMessage): Envelope {
+  if (!message.envelope) {
+    throw new ProtocolClientError("unexpected_message", "expected JSON outer message");
+  }
+  return message.envelope;
+}
+
+function protocolPacketToBinary(packet: ProtocolPacket): BinaryProtocolPacket {
+  const binary: BinaryProtocolPacket = {
+    version: packet.version,
+    kind: packet.kind,
+    id: packet.id,
+    stream_id: packet.stream_id,
+    method: packet.method,
+    seq: packet.seq,
+    ack: packet.ack,
+    credit: packet.credit,
+  };
+  if (packet.kind === "stream_chunk") {
+    const payload = packet.payload as { session_id?: UUID; data_base64?: string; data_bytes?: Uint8Array; kind?: string };
+    if (payload.kind) {
+      return {
+        ...binary,
+        payload: { type: "terminal_frame", frame: terminalFrameJsonToBinary(payload) },
+      };
+    }
+    if (payload.session_id && (typeof payload.data_base64 === "string" || payload.data_bytes instanceof Uint8Array)) {
+      const data = payload.data_bytes ?? base64ToBytes(payload.data_base64 ?? "");
+      return {
+        ...binary,
+        payload: { type: "session_data", session_id: payload.session_id, data },
+      };
+    }
+  }
+  if (packet.kind === "error") {
+    const payload = packet.payload as { code?: string; message?: string; retryable?: boolean };
+    if (payload.code && payload.message) {
+      return {
+        ...binary,
+        payload: { type: "error", code: payload.code, message: payload.message, retryable: Boolean(payload.retryable) },
+      };
+    }
+  }
+  return {
+    ...binary,
+    payload: { type: "json", data: encodeUtf8(JSON.stringify(packet.payload ?? {})) },
+  };
+}
+
+function binaryPacketToProtocol(packet: BinaryProtocolPacket): ProtocolPacket {
+  let payload: unknown = {};
+  if (packet.payload?.type === "json") {
+    payload = JSON.parse(decodeUtf8(packet.payload.data));
+  } else if (packet.payload?.type === "session_data") {
+    payload = {
+      session_id: packet.payload.session_id,
+      data_base64: bytesToBase64(packet.payload.data),
+      data_bytes: packet.payload.data,
+    } satisfies SessionDataPayload;
+  } else if (packet.payload?.type === "terminal_frame") {
+    payload = terminalFrameBinaryToJson(packet.payload.frame);
+  } else if (packet.payload?.type === "error") {
+    payload = {
+      code: packet.payload.code,
+      message: packet.payload.message,
+      retryable: packet.payload.retryable,
+    } satisfies PacketErrorPayload;
+  }
+  return {
+    version: packet.version,
+    kind: packet.kind,
+    ...(packet.id ? { id: packet.id } : {}),
+    ...(packet.stream_id ? { stream_id: packet.stream_id } : {}),
+    ...(packet.method ? { method: packet.method } : {}),
+    ...(packet.seq ? { seq: packet.seq } : {}),
+    ...(packet.ack ? { ack: packet.ack } : {}),
+    ...(packet.credit ? { credit: packet.credit } : {}),
+    payload,
+  };
+}
+
+async function messageDataToBytes(data: unknown): Promise<Uint8Array> {
+  if (data instanceof Blob) {
+    return new Uint8Array(await data.arrayBuffer());
+  }
+  if (data instanceof ArrayBuffer || Object.prototype.toString.call(data) === "[object ArrayBuffer]") {
+    return new Uint8Array(data as ArrayBuffer);
+  }
+  if (ArrayBuffer.isView(data)) {
+    const view = data as ArrayBufferView;
+    return new Uint8Array(new Uint8Array(view.buffer, view.byteOffset, view.byteLength));
+  }
+  return encodeUtf8(String(data));
 }
 
 function sendOuterMessage(socket: WebSocket, message: Envelope): void {

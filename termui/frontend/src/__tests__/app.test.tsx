@@ -12,7 +12,8 @@ import App, {
   networkRateFromSamples,
   pairingWsUrlCandidates,
 } from "../App";
-import type { SessionFilesResultPayload } from "../protocol/types";
+import type { SessionDataPayload, SessionFilesResultPayload } from "../protocol/types";
+import { sessionDataFromBase64 } from "../protocol/wire";
 import { clearBrowserState, loadBrowserState } from "../state/browser-state";
 import { MockDaemon } from "../test/mock-daemon";
 import { fallbackSessionDisplayName } from "../session-names";
@@ -349,11 +350,41 @@ describe("termui web 工作台", () => {
     expect(screen.queryByRole("button", { name: "Open" })).toBeNull();
 
     await screen.findByText(/termd-e2e-ready/);
-    await waitFor(() => expect(daemon.attachedSessions).toEqual(["00000000-0000-0000-0000-000000000401"]));
+    await waitFor(() =>
+      expect(daemon.attachedSessions).toEqual([
+        "00000000-0000-0000-0000-000000000401",
+        "00000000-0000-0000-0000-000000000401",
+      ]),
+    );
     await new Promise((resolve) => window.setTimeout(resolve, 250));
     expect(daemon.pingMessages).toBeGreaterThan(0);
     expect(daemon.outerWireText()).not.toContain("secret-token");
   });
+
+  it("daemon.clients 超时不阻断 session list", async () => {
+    const user = userEvent.setup();
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [
+        {
+          session_id: DEFAULT_SESSION_ID,
+          state: "running",
+          size: { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 },
+        },
+      ],
+      dropDaemonClients: true,
+    });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitFor(() => expect(screen.queryByLabelText("Pairing token")).toBeNull());
+    await waitFor(() => expect(visibleSessionNames()).toEqual([DEFAULT_SESSION_NAME]));
+    await new Promise((resolve) => window.setTimeout(resolve, 2300));
+
+    expect(screen.queryByLabelText("Connection error")).toBeNull();
+    expect(document.body.textContent).not.toContain("response_timeout");
+  }, 10_000);
 
   it("已 attach 后状态和客户端轮询复用主 WebSocket", async () => {
     const user = userEvent.setup();
@@ -362,15 +393,61 @@ describe("termui web 工作台", () => {
     await pairWithInvite(user, daemon);
     await waitForWorkspaceSession();
     await screen.findByText(/termd-e2e-ready/);
-    await waitFor(() => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID]));
+    await waitFor(() => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID, DEFAULT_SESSION_ID]));
     const acceptedAfterAttach = daemon.acceptedConnections;
 
     await waitFor(() => expect(daemon.daemonStatusRequests).toBeGreaterThan(0));
     await new Promise((resolve) => window.setTimeout(resolve, DAEMON_STATUS_POLL_INTERVAL_MS + 250));
 
     expect(daemon.acceptedConnections).toBe(acceptedAfterAttach);
-    expect(daemon.activeConnectionCount()).toBe(1);
+    expect(daemon.activeConnectionCount()).toBe(2);
     expect(daemon.pingMessages).toBeGreaterThan(0);
+  });
+
+  it("终端输入走独立控制 stream，不和大量输出共用输出 stream", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await screen.findByText(/termd-e2e-ready/);
+
+    await waitFor(() => {
+      const attachStreams = daemon.receivedPackets.filter(
+        (packet) => packet.kind === "stream_open" && packet.method === "terminal.attach",
+      );
+      expect(attachStreams).toHaveLength(2);
+    });
+
+    const attachStreams = daemon.receivedPackets.filter(
+      (packet) => packet.kind === "stream_open" && packet.method === "terminal.attach",
+    );
+    const controlStream = attachStreams.find((packet) => {
+      const payload = packet.payload as { watch_updates?: boolean };
+      return payload.watch_updates === false;
+    });
+    const outputStream = attachStreams.find((packet) => {
+      const payload = packet.payload as { watch_updates?: boolean };
+      return payload.watch_updates === true;
+    });
+    expect(controlStream?.stream_id).toBeDefined();
+    expect(outputStream?.stream_id).toBeDefined();
+    expect(controlStream?.stream_id).not.toBe(outputStream?.stream_id);
+
+    const terminalInput = await waitFor(() => {
+      const textarea = document.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
+      expect(textarea).not.toBeNull();
+      return textarea!;
+    });
+    terminalInput.value = "isolated-input";
+    fireEvent.input(terminalInput);
+
+    await waitFor(() => expect(daemon.sessionDataMessages).toContain("isolated-input"));
+    const inputChunks = daemon.receivedPackets.filter(
+      (packet) => packet.kind === "stream_chunk" && (packet.payload as { session_id?: string }).session_id === DEFAULT_SESSION_ID,
+    );
+    expect(inputChunks.at(-1)?.stream_id).toBe(controlStream!.stream_id);
+    expect(inputChunks.at(-1)?.stream_id).not.toBe(outputStream!.stream_id);
   });
 
   it("设置面板支持切换语言和浅色主题，并持久化到浏览器本地状态", async () => {
@@ -404,7 +481,7 @@ describe("termui web 工作台", () => {
 
     await screen.findByText(/termd-e2e-ready/);
     await waitFor(() => expect(document.title).toBe(`Termd - ${daemon.url} - ${DEFAULT_SESSION_NAME}`));
-    await waitFor(() => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID]));
+    await waitFor(() => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID, DEFAULT_SESSION_ID]));
 
     firstRender.unmount();
     render(<App />);
@@ -412,7 +489,14 @@ describe("termui web 工作台", () => {
     await waitForWorkspaceSession();
     await screen.findByText(/termd-e2e-ready/);
     await waitFor(() => expect(document.title).toBe(`Termd - ${daemon.url} - ${DEFAULT_SESSION_NAME}`));
-    await waitFor(() => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID, DEFAULT_SESSION_ID]));
+    await waitFor(() =>
+      expect(daemon.attachedSessions).toEqual([
+        DEFAULT_SESSION_ID,
+        DEFAULT_SESSION_ID,
+        DEFAULT_SESSION_ID,
+        DEFAULT_SESSION_ID,
+      ]),
+    );
   });
 
   it("在底部状态栏显示 daemon 状态，移动端只保留核心指标", async () => {
@@ -424,7 +508,7 @@ describe("termui web 工作台", () => {
 
     const desktopStatus = await screen.findByRole("contentinfo", { name: "daemon server status" });
     await within(desktopStatus).findByText("CPU");
-    expect(within(desktopStatus).getByText("7.5%")).toBeInTheDocument();
+    await within(desktopStatus).findByText("7.5%");
     expect(within(desktopStatus).getByRole("img", { name: "CPU usage bars" })).toBeInTheDocument();
     expect(within(desktopStatus).getByText("Mem")).toBeInTheDocument();
     expect(within(desktopStatus).getByText("3.0 GB / 8.0 GB")).toBeInTheDocument();
@@ -821,17 +905,279 @@ describe("termui web 工作台", () => {
 
     await pairWithInvite(user, daemon);
     await waitForWorkspaceSession("alpha");
+    await screen.findByText(/attached-ready/);
     const cancelCount = () => daemon.receivedPackets.filter((packet) => packet.kind === "cancel").length;
     const beforeSwitch = cancelCount();
 
     await clickSessionCard(user, "beta");
     await waitFor(() => expect(cancelCount()).toBeGreaterThan(beforeSwitch));
-    const afterClosingCurrentAttach = cancelCount();
 
     await clickSessionCard(user, "gamma");
-    await waitFor(() => expect(cancelCount()).toBeGreaterThan(afterClosingCurrentAttach));
     await waitFor(() => expect(selectedSessionName()).toBe("gamma"));
     await waitFor(() => expect(daemon.attachedSessions).toContain(gammaSession.session_id));
+    expect(cancelCount()).toBeGreaterThan(beforeSwitch);
+    expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
+  });
+
+  it("连续快速切换 session 只让最后一次 attach 生效", async () => {
+    const user = userEvent.setup();
+    const alphaSession = {
+      session_id: "00000000-0000-0000-0000-000000000441",
+      name: "alpha",
+      state: "running",
+      size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+    } as const;
+    const betaSession = {
+      session_id: "00000000-0000-0000-0000-000000000442",
+      name: "beta",
+      state: "running",
+      size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+    } as const;
+    const gammaSession = {
+      session_id: "00000000-0000-0000-0000-000000000443",
+      name: "gamma",
+      state: "running",
+      size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+    } as const;
+    const deltaSession = {
+      session_id: "00000000-0000-0000-0000-000000000444",
+      name: "delta",
+      state: "running",
+      size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+    } as const;
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [alphaSession, betaSession, gammaSession, deltaSession],
+      attachOutput: "attached-ready\n",
+      attachDelayMs: 160,
+    });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession("alpha");
+    await screen.findByText(/attached-ready/);
+    daemon.attachedSessions.splice(0);
+    daemon.attachRequests.splice(0);
+
+    const openSession = (name: string) => {
+      fireEvent.click(screen.getByRole("button", { name: `Open ${name}` }));
+    };
+    for (const name of ["beta", "gamma", "alpha", "beta", "gamma", "alpha", "beta", "delta"]) {
+      openSession(name);
+    }
+
+    await waitFor(() => expect(selectedSessionName()).toBe("delta"));
+    await waitFor(() => expect(daemon.attachedSessions).toEqual([deltaSession.session_id, deltaSession.session_id]));
+    const watchedAttachRequests = daemon.attachRequests.filter((request) => request.watch_updates !== false);
+    expect(watchedAttachRequests).toEqual([{ session_id: deltaSession.session_id, watch_updates: true }]);
+    expect(document.body.textContent).not.toContain("response_timeout");
+    expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
+  });
+
+  it("切换 session 时立即停止当前输出 stream，避免旧输出继续占用渲染通道", async () => {
+    const user = userEvent.setup();
+    const alphaSession = {
+      session_id: "00000000-0000-0000-0000-000000000451",
+      name: "alpha",
+      state: "running",
+      size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+    } as const;
+    const betaSession = {
+      session_id: "00000000-0000-0000-0000-000000000452",
+      name: "beta",
+      state: "running",
+      size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+    } as const;
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [alphaSession, betaSession],
+      attachOutput: "alpha-ready\n",
+    });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession("alpha");
+    await screen.findByText(/alpha-ready/);
+
+    const stats = resetXtermStats();
+    const cancelCount = () => daemon.receivedPackets.filter((packet) => packet.kind === "cancel").length;
+    const beforeSwitch = cancelCount();
+
+    fireEvent.click(screen.getByRole("button", { name: "Open beta" }));
+    daemon.pushSessionData(alphaSession.session_id, "late-alpha-output\n");
+
+    // 旧输出 stream 的关闭必须发生在 attach 合并窗口之前；否则旧 session 的大输出会继续占用
+    // xterm 渲染和 relay flow credit，把新 session 的恢复拖慢。
+    await new Promise((resolve) => window.setTimeout(resolve, 30));
+
+    expect(cancelCount()).toBeGreaterThan(beforeSwitch);
+    expect(stats.writes).toBe(0);
+    expect(document.querySelector<HTMLElement>(".xterm")?.textContent ?? "").not.toContain("late-alpha-output");
+  });
+
+  it("新 attach 的输出必须等 TerminalPane reset 确认后才写入 xterm", async () => {
+    const user = userEvent.setup();
+    const alphaSession = {
+      session_id: "00000000-0000-0000-0000-000000000461",
+      name: "alpha",
+      state: "running",
+      size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+    } as const;
+    const betaSession = {
+      session_id: "00000000-0000-0000-0000-000000000462",
+      name: "beta",
+      state: "running",
+      size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+    } as const;
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [alphaSession, betaSession],
+      attachOutput: "session-ready\n",
+    });
+    const deferredResetConfirmations: Array<() => void> = [];
+    (globalThis as { __TERMD_TEST_DEFER_OUTPUT_RESET_APPLIED__?: (confirm: () => void) => void })
+      .__TERMD_TEST_DEFER_OUTPUT_RESET_APPLIED__ = (confirm) => {
+        deferredResetConfirmations.push(confirm);
+      };
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession("alpha");
+    await waitFor(() => expect(deferredResetConfirmations.length).toBeGreaterThan(0));
+    while (deferredResetConfirmations.length > 0) {
+      deferredResetConfirmations.shift()?.();
+    }
+    await screen.findByText(/session-ready/);
+
+    const stats = resetXtermStats();
+    fireEvent.click(screen.getByRole("button", { name: "Open beta" }));
+    await waitFor(() => expect(deferredResetConfirmations.length).toBeGreaterThan(0));
+    await new Promise((resolve) => window.setTimeout(resolve, 300));
+
+    expect(stats.writes).toBe(0);
+    expect(document.querySelector<HTMLElement>(".xterm")?.textContent ?? "").not.toContain("session-ready");
+
+    while (deferredResetConfirmations.length > 0) {
+      deferredResetConfirmations.shift()?.();
+    }
+
+    await waitFor(() => expect(document.querySelector<HTMLElement>(".xterm")?.textContent).toContain("session-ready"));
+    expect(stats.writes).toBeGreaterThan(0);
+  });
+
+  it("session 切换等待 reset 时不能丢弃最后目标 session 的输入", async () => {
+    const user = userEvent.setup();
+    const alphaSession = {
+      session_id: "00000000-0000-0000-0000-000000000481",
+      name: "alpha",
+      state: "running",
+      size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+    } as const;
+    const betaSession = {
+      session_id: "00000000-0000-0000-0000-000000000482",
+      name: "beta",
+      state: "running",
+      size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+    } as const;
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [alphaSession, betaSession],
+      attachOutput: "session-ready\n",
+    });
+    const deferredResetConfirmations: Array<() => void> = [];
+    (globalThis as { __TERMD_TEST_DEFER_OUTPUT_RESET_APPLIED__?: (confirm: () => void) => void })
+      .__TERMD_TEST_DEFER_OUTPUT_RESET_APPLIED__ = (confirm) => {
+        deferredResetConfirmations.push(confirm);
+      };
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession("alpha");
+    await waitFor(() => expect(deferredResetConfirmations.length).toBeGreaterThan(0));
+    while (deferredResetConfirmations.length > 0) {
+      deferredResetConfirmations.shift()?.();
+    }
+    await screen.findByText(/session-ready/);
+    daemon.sessionDataMessages.length = 0;
+
+    fireEvent.click(screen.getByRole("button", { name: "Open beta" }));
+    await waitFor(() => expect(selectedSessionName()).toBe("beta"));
+    await waitFor(() => expect(deferredResetConfirmations.length).toBeGreaterThan(0));
+    const terminalInput = await waitFor(() => {
+      const input = document.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
+      expect(input).not.toBeNull();
+      return input!;
+    });
+    fireEvent.input(terminalInput, { target: { value: "input-during-reset" } });
+
+    await waitFor(() => expect(daemon.sessionDataMessages).toContain("input-during-reset"));
+    const inputPacket = daemon.receivedPackets.find((packet) => {
+      if (packet.kind !== "stream_chunk") {
+        return false;
+      }
+      const payload = packet.payload as SessionDataPayload;
+      const bytes = payload.data_bytes ?? sessionDataFromBase64(payload.data_base64 ?? "");
+      return new TextDecoder().decode(bytes) === "input-during-reset";
+    });
+    expect(inputPacket?.stream_id).toBeDefined();
+    const betaAttachPacket = daemon.receivedPackets.find((packet) =>
+      packet.kind === "stream_open" &&
+      packet.method === "terminal.attach" &&
+      JSON.stringify(packet.payload).includes(betaSession.session_id) &&
+      JSON.stringify(packet.payload).includes('"watch_updates":false')
+    );
+    expect(inputPacket?.stream_id).toBe(betaAttachPacket?.stream_id);
+
+    while (deferredResetConfirmations.length > 0) {
+      deferredResetConfirmations.shift()?.();
+    }
+  });
+
+  it("旧控制连接的迟到失败不能触发旧 session 重连", async () => {
+    const user = userEvent.setup();
+    const alphaSession = {
+      session_id: "00000000-0000-0000-0000-000000000491",
+      name: "alpha",
+      state: "running",
+      size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+    } as const;
+    const betaSession = {
+      session_id: "00000000-0000-0000-0000-000000000492",
+      name: "beta",
+      state: "running",
+      size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+    } as const;
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [alphaSession, betaSession],
+      attachOutput: "session-ready\n",
+      daemonStatusDelayMs: 250,
+    });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession("alpha");
+    await screen.findByText(/session-ready/);
+    await waitFor(() => expect(daemon.daemonStatusRequests).toBeGreaterThan(0));
+    daemon.attachRequests.length = 0;
+    const acceptedBeforeSwitch = daemon.acceptedConnections;
+
+    fireEvent.click(screen.getByRole("button", { name: "Open beta" }));
+    await waitFor(() => expect(selectedSessionName()).toBe("beta"));
+    await waitFor(() => expect(daemon.attachedSessions).toContain(betaSession.session_id));
+    // 中文注释：首个 attach reconnect 延迟是 250ms；这里多等一段，确认旧 control
+    // RPC 的 connection_closed 不会重新 attach 回 alpha。
+    await new Promise((resolve) => window.setTimeout(resolve, 450));
+
+    expect(selectedSessionName()).toBe("beta");
+    expect(daemon.attachRequests.every((request) => request.session_id === betaSession.session_id)).toBe(true);
+    expect(daemon.acceptedConnections).toBeLessThanOrEqual(acceptedBeforeSwitch + 2);
+    expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
   });
 
   it("持续输出时合并写入 xterm，并且不为每个输出刷新布局", async () => {
@@ -985,7 +1331,14 @@ describe("termui web 工作台", () => {
     await user.click(within(admin).getByRole("button", { name: "Open workspace" }));
     await waitForWorkspaceSession();
     await screen.findByText(/termd-e2e-ready/);
-    await waitFor(() => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID, DEFAULT_SESSION_ID]));
+    await waitFor(() =>
+      expect(daemon.attachedSessions).toEqual([
+        DEFAULT_SESSION_ID,
+        DEFAULT_SESSION_ID,
+        DEFAULT_SESSION_ID,
+        DEFAULT_SESSION_ID,
+      ]),
+    );
 
     await user.click(screen.getByRole("button", { name: "Open session list from title" }));
     const titleSessionsPanel = await screen.findByLabelText("sessions panel");
@@ -1304,7 +1657,10 @@ describe("termui web 工作台", () => {
     await screen.findByText(/termd-e2e-ready/);
     expect(screen.queryByRole("button", { name: "Open" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Attached" })).toBeNull();
-    expect(daemon.attachedSessions).toEqual(["00000000-0000-0000-0000-000000000401"]);
+    expect(daemon.attachedSessions).toEqual([
+      "00000000-0000-0000-0000-000000000401",
+      "00000000-0000-0000-0000-000000000401",
+    ]);
   });
 
   it("WebSocket error envelope 会在 workspace 主体显示 alert 且不泄漏敏感字段", async () => {
@@ -1360,11 +1716,18 @@ describe("termui web 工作台", () => {
     await pairWithInvite(user, daemon);
     await waitForWorkspaceSession();
     await screen.findByText(/termd-e2e-ready/);
-    await waitFor(() => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID]));
+    await waitFor(() => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID, DEFAULT_SESSION_ID]));
 
     daemon.dropConnections();
 
-    await waitFor(() => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID, DEFAULT_SESSION_ID]));
+    await waitFor(() =>
+      expect(daemon.attachedSessions).toEqual([
+        DEFAULT_SESSION_ID,
+        DEFAULT_SESSION_ID,
+        DEFAULT_SESSION_ID,
+        DEFAULT_SESSION_ID,
+      ]),
+    );
     expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
     await screen.findByText(/termd-e2e-ready/);
     expect(screen.getByTestId("terminal-pane")).toBeInTheDocument();
@@ -1377,7 +1740,7 @@ describe("termui web 工作台", () => {
     await pairWithInvite(user, daemon);
     await waitForWorkspaceSession();
     await screen.findByText(/termd-e2e-ready/);
-    await waitFor(() => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID]));
+    await waitFor(() => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID, DEFAULT_SESSION_ID]));
 
     let sawConnectionAlert = false;
     const observer = new MutationObserver(() => {
@@ -1394,7 +1757,13 @@ describe("termui web 工作台", () => {
     expect(screen.getByTestId("terminal-pane")).toBeInTheDocument();
     expect(screen.getByText(/termd-e2e-ready/)).toBeInTheDocument();
     await waitFor(
-      () => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID, DEFAULT_SESSION_ID]),
+      () =>
+        expect(daemon.attachedSessions).toEqual([
+          DEFAULT_SESSION_ID,
+          DEFAULT_SESSION_ID,
+          DEFAULT_SESSION_ID,
+          DEFAULT_SESSION_ID,
+        ]),
       { timeout: 2200 },
     );
     await waitFor(() => {
@@ -1415,14 +1784,48 @@ describe("termui web 工作台", () => {
     await pairWithInvite(user, daemon);
     await waitForWorkspaceSession();
     await screen.findByText(/termd-e2e-ready/);
-    await waitFor(() => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID]));
+    await waitFor(() => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID, DEFAULT_SESSION_ID]));
 
     daemon.dropConnections();
 
     await waitFor(
-      () => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID, DEFAULT_SESSION_ID]),
+      () =>
+        expect(daemon.attachedSessions).toEqual([
+          DEFAULT_SESSION_ID,
+          DEFAULT_SESSION_ID,
+          DEFAULT_SESSION_ID,
+          DEFAULT_SESSION_ID,
+        ]),
       { timeout: 2200 },
     );
+    expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
+    expect(screen.getByTestId("terminal-pane")).toBeInTheDocument();
+  });
+
+  it("terminal resync 的 attach 重连第一次失败后会继续排第二次并恢复当前 session", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await screen.findByText(/termd-e2e-ready/);
+    await waitFor(() => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID, DEFAULT_SESSION_ID]));
+
+    daemon.failNextWatchedTerminalAttaches(1);
+    daemon.pushTerminalFrame(DEFAULT_SESSION_ID, {
+      kind: "output",
+      session_id: DEFAULT_SESSION_ID,
+      terminal_seq: 5,
+      data_base64: "b3V0LW9mLXN5bmMK",
+    });
+
+    await waitFor(() => expect(daemon.failedTerminalAttachRequests).toBe(1), { timeout: 1200 });
+    await waitFor(
+      () => expect(daemon.attachedSessions.length).toBeGreaterThanOrEqual(5),
+      { timeout: 2800 },
+    );
+    expect(daemon.attachedSessions.slice(0, 3)).toEqual([DEFAULT_SESSION_ID, DEFAULT_SESSION_ID, DEFAULT_SESSION_ID]);
+    expect(daemon.attachedSessions.at(-1)).toBe(DEFAULT_SESSION_ID);
     expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
     expect(screen.getByTestId("terminal-pane")).toBeInTheDocument();
   });
@@ -3022,6 +3425,131 @@ describe("termui web 工作台", () => {
     ]);
 
     await waitFor(() => expect(countFlowPackets()).toBeGreaterThan(flowPacketsBefore));
+  });
+
+  it("legacy session_data 渲染完成后会按 stream seq 回补 flow credit", async () => {
+    const user = userEvent.setup();
+    const sessionId = "00000000-0000-0000-0000-000000000410";
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [
+        {
+          session_id: sessionId,
+          state: "running",
+          size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+        },
+      ],
+    });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await waitFor(() => expect(daemon.attachedSessions).toEqual([sessionId, sessionId]));
+
+    const outputStream = daemon.receivedPackets.find((packet) => {
+      if (packet.kind !== "stream_open" || packet.method !== "terminal.attach") {
+        return false;
+      }
+      const payload = packet.payload as { session_id?: string; watch_updates?: boolean };
+      return payload.session_id === sessionId && payload.watch_updates === true;
+    });
+    expect(outputStream?.stream_id).toBeDefined();
+    const flowPackets = () =>
+      daemon.receivedPackets.filter((packet) => packet.kind === "flow" && packet.stream_id === outputStream!.stream_id);
+    const flowPacketsBefore = flowPackets().length;
+    const text = "legacy-stream-output\n";
+
+    daemon.pushSessionData(sessionId, text);
+
+    await screen.findByText(/legacy-stream-output/);
+    await waitFor(() => {
+      const flows = flowPackets().slice(flowPacketsBefore);
+      expect(flows).toHaveLength(1);
+      expect(flows[0]).toMatchObject({
+        ack: 1,
+        credit: new TextEncoder().encode(text).byteLength,
+      });
+    });
+  });
+
+  it("同一批 terminal frame 渲染完成后会合并 flow credit，避免 ACK 风暴", async () => {
+    const user = userEvent.setup();
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [
+        {
+          session_id: "00000000-0000-0000-0000-000000000409",
+          state: "running",
+          size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+        },
+      ],
+      attachOutput: "ready\n",
+    });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await user.click(screen.getByRole("button", { name: "Refresh" }));
+    await clickSessionCard(user);
+
+    await waitFor(() => expect(screen.getByTestId("terminal-pane")).toBeInTheDocument());
+    await waitFor(() =>
+      expect(daemon.attachedSessions).toContain("00000000-0000-0000-0000-000000000409"),
+    );
+    await waitFor(() => expect(document.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea")).not.toBeNull());
+    await new Promise((resolve) => window.setTimeout(resolve, 120));
+
+    const receivedPackets = () =>
+      (
+        daemon as unknown as {
+          receivedPackets?: Array<{ kind: string; credit?: number }>;
+        }
+      ).receivedPackets ?? [];
+    const countFlowPackets = () => receivedPackets().filter((packet) => packet.kind === "flow").length;
+    const flowPacketsBefore = countFlowPackets();
+    const chunk = Buffer.alloc(8 * 1024, "x").toString("base64");
+
+    daemon.pushTerminalFrameBatch("00000000-0000-0000-0000-000000000409", [
+      {
+        kind: "snapshot",
+        session_id: "00000000-0000-0000-0000-000000000409",
+        base_seq: 0,
+        size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+        data_base64: "",
+      },
+      {
+        kind: "output",
+        session_id: "00000000-0000-0000-0000-000000000409",
+        terminal_seq: 1,
+        data_base64: chunk,
+      },
+      {
+        kind: "output",
+        session_id: "00000000-0000-0000-0000-000000000409",
+        terminal_seq: 2,
+        data_base64: chunk,
+      },
+      {
+        kind: "output",
+        session_id: "00000000-0000-0000-0000-000000000409",
+        terminal_seq: 3,
+        data_base64: chunk,
+      },
+      {
+        kind: "output",
+        session_id: "00000000-0000-0000-0000-000000000409",
+        terminal_seq: 4,
+        data_base64: chunk,
+      },
+    ]);
+
+    await waitFor(() => {
+      const flows = receivedPackets().filter((packet) => packet.kind === "flow").slice(flowPacketsBefore);
+      expect(flows).toHaveLength(1);
+      expect(flows[0].credit).toBe(32 * 1024 + 1);
+    });
   });
 
   it("浏览器窗口失活后不再继续上报 PTY resize，也不把 resize owner 切成 viewer", async () => {

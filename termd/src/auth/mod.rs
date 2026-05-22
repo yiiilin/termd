@@ -1025,6 +1025,7 @@ pub struct DaemonE2eeSigningInput {
     nonce: Nonce,
     timestamp_ms: UnixTimestampMillis,
     packet_version: u16,
+    binary_version: u16,
 }
 
 impl DaemonE2eeSigningInput {
@@ -1041,6 +1042,10 @@ impl DaemonE2eeSigningInput {
             timestamp_ms: payload.timestamp_ms,
             packet_version: payload
                 .packet_version
+                .unwrap_or(termd_proto::ProtocolVersion(0))
+                .0,
+            binary_version: payload
+                .binary_version
                 .unwrap_or(termd_proto::ProtocolVersion(0))
                 .0,
         }
@@ -1068,6 +1073,11 @@ impl DaemonE2eeSigningInput {
             "packet_version",
             &self.packet_version.to_string(),
         );
+        append_canonical_field(
+            &mut bytes,
+            "binary_version",
+            &self.binary_version.to_string(),
+        );
         bytes
     }
 }
@@ -1084,12 +1094,14 @@ pub struct E2eeAuthTranscript {
     daemon_nonce: Nonce,
     daemon_timestamp_ms: UnixTimestampMillis,
     daemon_packet_version: u16,
+    daemon_binary_version: u16,
     daemon_signature: Option<Signature>,
     device_id: DeviceId,
     device_e2ee_public_key: PublicKey,
     device_nonce: Nonce,
     device_timestamp_ms: UnixTimestampMillis,
     device_packet_version: u16,
+    device_binary_version: u16,
 }
 
 impl E2eeAuthTranscript {
@@ -1108,6 +1120,10 @@ impl E2eeAuthTranscript {
                 .packet_version
                 .unwrap_or(termd_proto::ProtocolVersion(0))
                 .0,
+            daemon_binary_version: daemon_exchange
+                .binary_version
+                .unwrap_or(termd_proto::ProtocolVersion(0))
+                .0,
             daemon_signature: daemon_exchange.signature.clone(),
             device_id: device_exchange.device_id,
             device_e2ee_public_key: device_exchange.public_key.clone(),
@@ -1115,6 +1131,10 @@ impl E2eeAuthTranscript {
             device_timestamp_ms: device_exchange.timestamp_ms,
             device_packet_version: device_exchange
                 .packet_version
+                .unwrap_or(termd_proto::ProtocolVersion(0))
+                .0,
+            device_binary_version: device_exchange
+                .binary_version
                 .unwrap_or(termd_proto::ProtocolVersion(0))
                 .0,
         }
@@ -1153,6 +1173,11 @@ impl E2eeAuthTranscript {
             "daemon_packet_version",
             &self.daemon_packet_version.to_string(),
         );
+        append_canonical_field(
+            &mut bytes,
+            "daemon_binary_version",
+            &self.daemon_binary_version.to_string(),
+        );
         if let Some(signature) = &self.daemon_signature {
             append_canonical_field(&mut bytes, "daemon_signature", signature.0.as_str());
         }
@@ -1172,6 +1197,11 @@ impl E2eeAuthTranscript {
             &mut bytes,
             "device_packet_version",
             &self.device_packet_version.to_string(),
+        );
+        append_canonical_field(
+            &mut bytes,
+            "device_binary_version",
+            &self.device_binary_version.to_string(),
         );
         bytes
     }

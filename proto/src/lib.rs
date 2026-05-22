@@ -256,6 +256,8 @@ fn is_zero_u64(value: &u64) -> bool {
 
 /// 0.2.0 的加密业务包版本；外层 WebSocket/relay 仍只承担 transport。
 pub const PROTOCOL_PACKET_VERSION: u16 = 3;
+/// 二进制数据面版本；双方都声明该版本时，E2EE 后的 packet 使用 WebSocket binary + Protobuf。
+pub const BINARY_PROTOCOL_VERSION: u16 = 1;
 
 /// 一次 request/response 交互的关联 id。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -438,6 +440,131 @@ impl ProtocolPacket<serde_json::Value> {
     }
 }
 
+/// 二进制数据面的 Protobuf packet kind。字段编号和 JSON `PacketKind` 解耦，避免字符串开销。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, prost::Enumeration)]
+#[repr(i32)]
+pub enum BinaryPacketKind {
+    Request = 1,
+    Response = 2,
+    Event = 3,
+    StreamOpen = 4,
+    StreamChunk = 5,
+    StreamEnd = 6,
+    Cancel = 7,
+    Flow = 8,
+    Error = 9,
+}
+
+/// Protobuf terminal frame kind。terminal bytes 放在 `data` 字段中，不再 base64。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, prost::Enumeration)]
+#[repr(i32)]
+pub enum BinaryTerminalFrameKind {
+    Unspecified = 0,
+    Snapshot = 1,
+    Output = 2,
+    Resize = 3,
+    Exit = 4,
+    Batch = 5,
+}
+
+/// 二进制 packet 外壳。低频控制 payload 可暂时使用 `json`，高频 terminal payload 使用 typed bytes。
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct BinaryProtocolPacket {
+    #[prost(uint32, tag = "1")]
+    pub version: u32,
+    #[prost(enumeration = "BinaryPacketKind", tag = "2")]
+    pub kind: i32,
+    #[prost(bytes = "vec", tag = "3")]
+    pub id: Vec<u8>,
+    #[prost(bytes = "vec", tag = "4")]
+    pub stream_id: Vec<u8>,
+    #[prost(string, tag = "5")]
+    pub method: String,
+    #[prost(uint64, tag = "6")]
+    pub seq: u64,
+    #[prost(uint64, tag = "7")]
+    pub ack: u64,
+    #[prost(uint32, tag = "8")]
+    pub credit: u32,
+    #[prost(oneof = "binary_protocol_packet::Payload", tags = "20, 21, 22, 23")]
+    pub payload: Option<binary_protocol_packet::Payload>,
+}
+
+pub mod binary_protocol_packet {
+    #[derive(Clone, PartialEq, prost::Oneof)]
+    pub enum Payload {
+        /// 兼容迁移期的低频控制面 payload。terminal 数据不得放在这里。
+        #[prost(bytes, tag = "20")]
+        Json(Vec<u8>),
+        #[prost(message, tag = "21")]
+        SessionData(super::BinarySessionDataPayload),
+        #[prost(message, tag = "22")]
+        TerminalFrame(super::BinaryTerminalFramePayload),
+        #[prost(message, tag = "23")]
+        Error(super::BinaryPacketErrorPayload),
+    }
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct BinarySessionDataPayload {
+    #[prost(bytes = "vec", tag = "1")]
+    pub session_id: Vec<u8>,
+    #[prost(bytes = "vec", tag = "2")]
+    pub data: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct BinaryTerminalSize {
+    #[prost(uint32, tag = "1")]
+    pub rows: u32,
+    #[prost(uint32, tag = "2")]
+    pub cols: u32,
+    #[prost(uint32, tag = "3")]
+    pub pixel_width: u32,
+    #[prost(uint32, tag = "4")]
+    pub pixel_height: u32,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct BinaryTerminalFramePayload {
+    #[prost(enumeration = "BinaryTerminalFrameKind", tag = "1")]
+    pub kind: i32,
+    #[prost(bytes = "vec", tag = "2")]
+    pub session_id: Vec<u8>,
+    #[prost(uint64, tag = "3")]
+    pub base_seq: u64,
+    #[prost(uint64, tag = "4")]
+    pub terminal_seq: u64,
+    #[prost(message, optional, tag = "5")]
+    pub size: Option<BinaryTerminalSize>,
+    #[prost(bytes = "vec", tag = "6")]
+    pub data: Vec<u8>,
+    #[prost(message, repeated, tag = "7")]
+    pub frames: Vec<BinaryTerminalFramePayload>,
+    #[prost(int32, optional, tag = "8")]
+    pub exit_code: Option<i32>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct BinaryPacketErrorPayload {
+    #[prost(string, tag = "1")]
+    pub code: String,
+    #[prost(string, tag = "2")]
+    pub message: String,
+    #[prost(bool, tag = "3")]
+    pub retryable: bool,
+}
+
+pub fn encode_binary_protocol_packet(packet: &BinaryProtocolPacket) -> Vec<u8> {
+    prost::Message::encode_to_vec(packet)
+}
+
+pub fn decode_binary_protocol_packet(
+    bytes: &[u8],
+) -> Result<BinaryProtocolPacket, prost::DecodeError> {
+    <BinaryProtocolPacket as prost::Message>::decode(bytes)
+}
+
 /// WebSocket 建立后的明文路由角色。
 ///
 /// 这里只表达连接方向：relay 据此把连接放进对应 server_id 的房间；daemon 直连只接受
@@ -447,6 +574,11 @@ impl ProtocolPacket<serde_json::Value> {
 pub enum RouteRole {
     Client,
     DaemonMux,
+    /// daemon 到 relay 的输出数据通道。
+    ///
+    /// 它只用于把高吞吐 terminal output 从控制通道中拆出去，不表达任何 session/operator
+    /// 权限。旧 relay 不认识该角色时会拒绝连接，避免把 data 通道误注册成新的控制 mux。
+    DaemonMuxData,
 }
 
 /// WebSocket 第一帧路由前置握手。
@@ -458,6 +590,11 @@ pub struct RouteHelloPayload {
     pub role: RouteRole,
     pub protocol_version: ProtocolVersion,
     pub nonce: Nonce,
+    /// daemon control/data mux 的公开连接代际。
+    ///
+    /// relay 只用它确认 `daemon_mux_data` 附属于当前 `daemon_mux`，不解析任何业务密文。
+    #[serde(default)]
+    pub route_generation: Option<Nonce>,
     pub timestamp_ms: UnixTimestampMillis,
 }
 
@@ -602,6 +739,7 @@ impl E2eeKeyExchangePayload {
             nonce,
             timestamp_ms,
             packet_version: None,
+            binary_version: None,
             signature: None,
         }
     }
@@ -613,6 +751,11 @@ impl E2eeKeyExchangePayload {
 
     pub fn with_packet_version(mut self, packet_version: ProtocolVersion) -> Self {
         self.packet_version = Some(packet_version);
+        self
+    }
+
+    pub fn with_binary_version(mut self, binary_version: ProtocolVersion) -> Self {
+        self.binary_version = Some(binary_version);
         self
     }
 }
@@ -627,6 +770,8 @@ pub struct E2eeKeyExchangePayload {
     pub timestamp_ms: UnixTimestampMillis,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub packet_version: Option<ProtocolVersion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary_version: Option<ProtocolVersion>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<Signature>,
 }
@@ -1257,6 +1402,12 @@ pub enum RelayOpaqueFrame {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RelayMuxEnvelope {
+    Keepalive {
+        nonce: u64,
+    },
+    KeepaliveAck {
+        nonce: u64,
+    },
     ClientConnected {
         client_id: RelayClientId,
     },
@@ -1271,6 +1422,162 @@ pub enum RelayMuxEnvelope {
         client_id: RelayClientId,
         frame: RelayOpaqueFrame,
     },
+}
+
+const BINARY_RELAY_MUX_MAGIC: &[u8; 4] = b"TD2M";
+const BINARY_RELAY_MUX_VERSION: u8 = 1;
+const BINARY_RELAY_MUX_HEADER_LEN: usize = 16;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BinaryRelayMuxKind {
+    ClientConnected = 1,
+    ClientDisconnected = 2,
+    ClientTextFrame = 3,
+    ClientBinaryFrame = 4,
+    DaemonTextFrame = 5,
+    DaemonBinaryFrame = 6,
+    Keepalive = 7,
+    KeepaliveAck = 8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BinaryRelayMuxFrameError {
+    InvalidFrame,
+    InvalidBase64,
+    InvalidUtf8,
+}
+
+pub fn encode_binary_relay_mux_envelope(
+    envelope: &RelayMuxEnvelope,
+) -> Result<Vec<u8>, BinaryRelayMuxFrameError> {
+    let (kind, client_id, payload) = match envelope {
+        RelayMuxEnvelope::Keepalive { nonce } => (
+            BinaryRelayMuxKind::Keepalive,
+            RelayClientId(*nonce),
+            Vec::new(),
+        ),
+        RelayMuxEnvelope::KeepaliveAck { nonce } => (
+            BinaryRelayMuxKind::KeepaliveAck,
+            RelayClientId(*nonce),
+            Vec::new(),
+        ),
+        RelayMuxEnvelope::ClientConnected { client_id } => {
+            (BinaryRelayMuxKind::ClientConnected, *client_id, Vec::new())
+        }
+        RelayMuxEnvelope::ClientDisconnected { client_id } => (
+            BinaryRelayMuxKind::ClientDisconnected,
+            *client_id,
+            Vec::new(),
+        ),
+        RelayMuxEnvelope::ClientFrame { client_id, frame } => {
+            let (kind, payload) = binary_relay_mux_payload(
+                frame,
+                BinaryRelayMuxKind::ClientTextFrame,
+                BinaryRelayMuxKind::ClientBinaryFrame,
+            )?;
+            (kind, *client_id, payload)
+        }
+        RelayMuxEnvelope::DaemonFrame { client_id, frame } => {
+            let (kind, payload) = binary_relay_mux_payload(
+                frame,
+                BinaryRelayMuxKind::DaemonTextFrame,
+                BinaryRelayMuxKind::DaemonBinaryFrame,
+            )?;
+            (kind, *client_id, payload)
+        }
+    };
+    let mut wire = Vec::with_capacity(BINARY_RELAY_MUX_HEADER_LEN + payload.len());
+    wire.extend_from_slice(BINARY_RELAY_MUX_MAGIC);
+    wire.push(BINARY_RELAY_MUX_VERSION);
+    wire.push(kind as u8);
+    wire.extend_from_slice(&[0, 0]);
+    wire.extend_from_slice(&client_id.0.to_be_bytes());
+    wire.extend_from_slice(&payload);
+    Ok(wire)
+}
+
+pub fn decode_binary_relay_mux_envelope(
+    wire: &[u8],
+) -> Result<RelayMuxEnvelope, BinaryRelayMuxFrameError> {
+    if wire.len() < BINARY_RELAY_MUX_HEADER_LEN
+        || &wire[..4] != BINARY_RELAY_MUX_MAGIC
+        || wire[4] != BINARY_RELAY_MUX_VERSION
+        || wire[6] != 0
+        || wire[7] != 0
+    {
+        return Err(BinaryRelayMuxFrameError::InvalidFrame);
+    }
+    let kind = binary_relay_mux_kind(wire[5])?;
+    let client_id = RelayClientId(u64::from_be_bytes(
+        wire[8..16]
+            .try_into()
+            .map_err(|_| BinaryRelayMuxFrameError::InvalidFrame)?,
+    ));
+    let payload = &wire[BINARY_RELAY_MUX_HEADER_LEN..];
+    match kind {
+        BinaryRelayMuxKind::Keepalive => Ok(RelayMuxEnvelope::Keepalive { nonce: client_id.0 }),
+        BinaryRelayMuxKind::KeepaliveAck => {
+            Ok(RelayMuxEnvelope::KeepaliveAck { nonce: client_id.0 })
+        }
+        BinaryRelayMuxKind::ClientConnected => Ok(RelayMuxEnvelope::ClientConnected { client_id }),
+        BinaryRelayMuxKind::ClientDisconnected => {
+            Ok(RelayMuxEnvelope::ClientDisconnected { client_id })
+        }
+        BinaryRelayMuxKind::ClientTextFrame => Ok(RelayMuxEnvelope::ClientFrame {
+            client_id,
+            frame: RelayOpaqueFrame::Text {
+                data: String::from_utf8(payload.to_vec())
+                    .map_err(|_| BinaryRelayMuxFrameError::InvalidUtf8)?,
+            },
+        }),
+        BinaryRelayMuxKind::ClientBinaryFrame => Ok(RelayMuxEnvelope::ClientFrame {
+            client_id,
+            frame: RelayOpaqueFrame::Binary {
+                data_base64: base64::engine::general_purpose::STANDARD.encode(payload),
+            },
+        }),
+        BinaryRelayMuxKind::DaemonTextFrame => Ok(RelayMuxEnvelope::DaemonFrame {
+            client_id,
+            frame: RelayOpaqueFrame::Text {
+                data: String::from_utf8(payload.to_vec())
+                    .map_err(|_| BinaryRelayMuxFrameError::InvalidUtf8)?,
+            },
+        }),
+        BinaryRelayMuxKind::DaemonBinaryFrame => Ok(RelayMuxEnvelope::DaemonFrame {
+            client_id,
+            frame: RelayOpaqueFrame::Binary {
+                data_base64: base64::engine::general_purpose::STANDARD.encode(payload),
+            },
+        }),
+    }
+}
+
+fn binary_relay_mux_payload(
+    frame: &RelayOpaqueFrame,
+    text_kind: BinaryRelayMuxKind,
+    binary_kind: BinaryRelayMuxKind,
+) -> Result<(BinaryRelayMuxKind, Vec<u8>), BinaryRelayMuxFrameError> {
+    match frame {
+        RelayOpaqueFrame::Text { data } => Ok((text_kind, data.as_bytes().to_vec())),
+        RelayOpaqueFrame::Binary { data_base64 } => base64::engine::general_purpose::STANDARD
+            .decode(data_base64)
+            .map(|payload| (binary_kind, payload))
+            .map_err(|_| BinaryRelayMuxFrameError::InvalidBase64),
+    }
+}
+
+fn binary_relay_mux_kind(kind: u8) -> Result<BinaryRelayMuxKind, BinaryRelayMuxFrameError> {
+    match kind {
+        1 => Ok(BinaryRelayMuxKind::ClientConnected),
+        2 => Ok(BinaryRelayMuxKind::ClientDisconnected),
+        3 => Ok(BinaryRelayMuxKind::ClientTextFrame),
+        4 => Ok(BinaryRelayMuxKind::ClientBinaryFrame),
+        5 => Ok(BinaryRelayMuxKind::DaemonTextFrame),
+        6 => Ok(BinaryRelayMuxKind::DaemonBinaryFrame),
+        7 => Ok(BinaryRelayMuxKind::Keepalive),
+        8 => Ok(BinaryRelayMuxKind::KeepaliveAck),
+        _ => Err(BinaryRelayMuxFrameError::InvalidFrame),
+    }
 }
 
 #[cfg(test)]
@@ -1441,6 +1748,7 @@ mod tests {
                 role: RouteRole::Client,
                 protocol_version: ProtocolVersion::default(),
                 nonce: Nonce("route-nonce".to_owned()),
+                route_generation: None,
                 timestamp_ms: UnixTimestampMillis(1_710_000_000_000),
             },
         );
@@ -1991,6 +2299,8 @@ mod tests {
     #[test]
     fn relay_mux_payloads_roundtrip_without_business_semantics() {
         let client_id = RelayClientId(7);
+        assert_roundtrip(RelayMuxEnvelope::Keepalive { nonce: 11 });
+        assert_roundtrip(RelayMuxEnvelope::KeepaliveAck { nonce: 11 });
         assert_roundtrip(RelayMuxEnvelope::ClientConnected { client_id });
         assert_roundtrip(RelayMuxEnvelope::ClientDisconnected { client_id });
         assert_roundtrip(RelayMuxEnvelope::ClientFrame {
@@ -2096,6 +2406,112 @@ mod tests {
         assert_eq!(decoded.id, Some(request_id));
         assert_eq!(decoded.payload.code, "timeout");
         assert!(decoded.payload.retryable);
+    }
+
+    #[test]
+    fn binary_protocol_packet_stream_chunk_carries_raw_terminal_bytes_without_base64() {
+        let session_id = SessionId::new();
+        let stream_id = PacketStreamId::new();
+        let terminal_bytes = b"\x00raw-terminal\xff".to_vec();
+        let packet = BinaryProtocolPacket {
+            version: PROTOCOL_PACKET_VERSION as u32,
+            kind: BinaryPacketKind::StreamChunk as i32,
+            id: Vec::new(),
+            stream_id: stream_id.0.as_bytes().to_vec(),
+            method: String::new(),
+            seq: 7,
+            ack: 0,
+            credit: 0,
+            payload: Some(binary_protocol_packet::Payload::SessionData(
+                BinarySessionDataPayload {
+                    session_id: session_id.0.as_bytes().to_vec(),
+                    data: terminal_bytes.clone(),
+                },
+            )),
+        };
+
+        let encoded = encode_binary_protocol_packet(&packet);
+        let decoded = decode_binary_protocol_packet(&encoded).expect("binary packet should decode");
+
+        assert_eq!(decoded.kind, BinaryPacketKind::StreamChunk as i32);
+        assert_eq!(decoded.seq, 7);
+        assert_eq!(decoded.stream_id, stream_id.0.as_bytes());
+        assert!(!String::from_utf8_lossy(&encoded).contains("data_base64"));
+        assert!(!String::from_utf8_lossy(&encoded).contains("AHJhdy10ZXJtaW5hbA=="));
+        assert_eq!(
+            decoded.payload,
+            Some(binary_protocol_packet::Payload::SessionData(
+                BinarySessionDataPayload {
+                    session_id: session_id.0.as_bytes().to_vec(),
+                    data: terminal_bytes,
+                },
+            )),
+        );
+    }
+
+    #[test]
+    fn binary_protocol_packet_flow_and_error_shapes_are_stable() {
+        let request_id = PacketRequestId::new();
+        let stream_id = PacketStreamId::new();
+        let flow = BinaryProtocolPacket {
+            version: PROTOCOL_PACKET_VERSION as u32,
+            kind: BinaryPacketKind::Flow as i32,
+            id: Vec::new(),
+            stream_id: stream_id.0.as_bytes().to_vec(),
+            method: String::new(),
+            seq: 0,
+            ack: 9,
+            credit: 4096,
+            payload: None,
+        };
+        let error = BinaryProtocolPacket {
+            version: PROTOCOL_PACKET_VERSION as u32,
+            kind: BinaryPacketKind::Error as i32,
+            id: request_id.0.as_bytes().to_vec(),
+            stream_id: Vec::new(),
+            method: String::new(),
+            seq: 0,
+            ack: 0,
+            credit: 0,
+            payload: Some(binary_protocol_packet::Payload::Error(
+                BinaryPacketErrorPayload {
+                    code: "session_not_found".to_owned(),
+                    message: "session was not found".to_owned(),
+                    retryable: false,
+                },
+            )),
+        };
+
+        let decoded_flow = decode_binary_protocol_packet(&encode_binary_protocol_packet(&flow))
+            .expect("flow packet should decode");
+        let decoded_error = decode_binary_protocol_packet(&encode_binary_protocol_packet(&error))
+            .expect("error packet should decode");
+
+        assert_eq!(decoded_flow.kind, BinaryPacketKind::Flow as i32);
+        assert_eq!(decoded_flow.ack, 9);
+        assert_eq!(decoded_flow.credit, 4096);
+        assert_eq!(decoded_error.kind, BinaryPacketKind::Error as i32);
+        assert_eq!(decoded_error.id, request_id.0.as_bytes());
+    }
+
+    #[test]
+    fn binary_relay_mux_frame_carries_opaque_binary_without_json_base64() {
+        let client_id = RelayClientId(42);
+        let envelope = RelayMuxEnvelope::ClientFrame {
+            client_id,
+            frame: RelayOpaqueFrame::Binary {
+                data_base64: base64::engine::general_purpose::STANDARD.encode([1, 2, 3, 4]),
+            },
+        };
+
+        let wire = encode_binary_relay_mux_envelope(&envelope).unwrap();
+        let decoded = decode_binary_relay_mux_envelope(&wire).unwrap();
+
+        assert_eq!(decoded, envelope);
+        assert_eq!(&wire[..4], b"TD2M");
+        assert_eq!(wire[5], 4);
+        assert!(!String::from_utf8_lossy(&wire).contains("data_base64"));
+        assert!(wire.ends_with(&[1, 2, 3, 4]));
     }
 
     fn assert_roundtrip<T>(value: T)

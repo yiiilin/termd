@@ -1,6 +1,6 @@
 import type { AddressInfo } from "node:net";
 import { ed25519 } from "@noble/curves/ed25519";
-import { WebSocketServer, type WebSocket } from "ws";
+import { WebSocketServer, type RawData, type WebSocket } from "ws";
 import {
   authSigningInputBytes,
   daemonE2eeSigningInputBytes,
@@ -9,9 +9,22 @@ import {
   encodeEd25519Wire,
   verifyEd25519Signature,
 } from "../protocol/auth";
-import { E2eeSession, generateE2eeKeyPair, type E2eeKeyPair } from "../protocol/e2ee";
+import {
+  E2eeSession,
+  decodeBinaryEncryptedFrame,
+  encodeBinaryEncryptedFrame,
+  generateE2eeKeyPair,
+  type E2eeKeyPair,
+} from "../protocol/e2ee";
+import {
+  type BinaryProtocolPacket,
+  decodeBinaryProtocolPacket,
+  encodeBinaryProtocolPacket,
+  terminalFrameBinaryToJson,
+  terminalFrameJsonToBinary,
+} from "../protocol/binary-packet";
 import { fallbackSessionDisplayName } from "../session-names";
-import { PROTOCOL_PACKET_VERSION } from "../protocol/types";
+import { BINARY_PROTOCOL_VERSION, PROTOCOL_PACKET_VERSION } from "../protocol/types";
 import type {
   DaemonClientSummaryPayload,
   DaemonStatusResultPayload,
@@ -43,7 +56,10 @@ import type {
   UUID,
 } from "../protocol/types";
 import {
+  base64ToBytes,
+  bytesToBase64,
   decodeUtf8,
+  encodeUtf8,
   envelope,
   nonce,
   nowMs,
@@ -58,6 +74,7 @@ interface MockDaemonOptions {
   sessions: Array<SessionSummaryPayload & { name?: string | null }>;
   attachOutput?: string;
   attachDelayMs?: number;
+  sessionCreateDelayMs?: number;
   routePreludeError?: ErrorPayload;
   routeReadyDelayMs?: number;
   daemonPacketVersion?: number;
@@ -65,8 +82,11 @@ interface MockDaemonOptions {
   sessionDataError?: ErrorPayload;
   resizeAckDelayMs?: number;
   daemonClients?: DaemonClientSummaryPayload[];
+  daemonClientsDelayMs?: number;
+  dropDaemonClients?: boolean;
   daemonStatus?: DaemonStatusResultPayload;
   daemonStatusResponses?: DaemonStatusResultPayload[];
+  daemonStatusDelayMs?: number;
   sessionFiles?: Record<UUID, SessionFilesResultPayload>;
   sessionGit?: Record<UUID, SessionGitResultPayload>;
   sessionFileReads?: Record<string, SessionFileReadResultPayload>;
@@ -105,6 +125,19 @@ interface MockConnection {
   activeRequest?: ProtocolPacket;
   activeStreamId?: PacketStreamId;
   respondedToActiveRequest?: boolean;
+  binaryMode?: boolean;
+}
+
+interface MockBinaryWireFrameLog {
+  direction: "in" | "out";
+  byteLength: number;
+}
+
+interface MockBinaryPacketLog {
+  direction: "in" | "out";
+  kind: string;
+  payload_type?: string;
+  data_text?: string;
 }
 
 export class MockDaemon {
@@ -112,6 +145,8 @@ export class MockDaemon {
   private readonly daemonSigningSecretKey = ed25519.utils.randomSecretKey();
   public readonly daemonPublicKey = encodeEd25519Wire(ed25519.getPublicKey(this.daemonSigningSecretKey));
   public readonly outerWireLog: string[] = [];
+  public readonly binaryWireFrames: MockBinaryWireFrameLog[] = [];
+  public readonly binaryPacketLog: MockBinaryPacketLog[] = [];
   public readonly receivedPackets: ProtocolPacket[] = [];
   public readonly sentPackets: ProtocolPacket[] = [];
   public readonly createdCommands: string[][] = [];
@@ -136,9 +171,12 @@ export class MockDaemon {
   public daemonStatusRequests = 0;
   public pingMessages = 0;
   public acceptedConnections = 0;
+  public failedTerminalAttachRequests = 0;
   public readonly decryptedInputs: string[] = [];
   public nextAttachRole = "operator" as const;
   private createdSessionCounter = 0;
+  private failTerminalAttachRequests = 0;
+  private failWatchedTerminalAttachRequests = 0;
   private readonly queuedSessionListResponses: QueuedSessionListResponse[] = [];
   private readonly e2eeKeypair: E2eeKeyPair;
   private readonly trustedDevices = new Map<UUID, TrustedDevice>();
@@ -185,6 +223,18 @@ export class MockDaemon {
     this.options.sessions = sessions;
   }
 
+  failNextTerminalAttaches(count = 1): void {
+    // 只让后续 terminal.attach 失败，用来稳定复现“重连尝试本身失败”的链路。
+    // 失败发生在记录 attach 之前，测试可以清楚地区分失败尝试和真正成功 attach。
+    this.failTerminalAttachRequests = Math.max(0, Math.floor(count));
+  }
+
+  failNextWatchedTerminalAttaches(count = 1): void {
+    // 输出连接 watch_updates=true；只让这条 attach 失败，可以覆盖“控制连接已恢复但输出连接失败”
+    // 之后还要继续排下一次重连的场景。
+    this.failWatchedTerminalAttachRequests = Math.max(0, Math.floor(count));
+  }
+
   queueSessionListResponse(sessions: SessionSummaryPayload[], delayMs = 0): void {
     // 用一次性响应模拟“旧请求稍后返回”的真实浏览器竞态。
     this.queuedSessionListResponses.push({ sessions, delayMs });
@@ -223,6 +273,14 @@ export class MockDaemon {
     for (const connection of this.connections) {
       if (connection.e2ee && connection.watchedSessionIds.has(sessionId)) {
         this.sendTerminalStreamBatch(connection, sessionId, frames);
+      }
+    }
+  }
+
+  pushTerminalFrame(sessionId: UUID, frame: unknown): void {
+    for (const connection of this.connections) {
+      if (connection.e2ee && connection.watchedSessionIds.has(sessionId)) {
+        this.sendTerminalStreamFrame(connection, sessionId, frame);
       }
     }
   }
@@ -275,7 +333,11 @@ export class MockDaemon {
       }
     });
 
-    socket.on("message", (raw) => {
+    socket.on("message", (raw, isBinary) => {
+      if (isBinary) {
+        void this.handleOuterBinary(connection, bytesFromWsMessage(raw));
+        return;
+      }
       void this.handleOuter(connection, raw.toString());
     });
   }
@@ -288,6 +350,7 @@ export class MockDaemon {
       nonce: nonce(),
       timestamp_ms: nowMs(),
       packet_version: this.options.daemonPacketVersion ?? PROTOCOL_PACKET_VERSION,
+      binary_version: BINARY_PROTOCOL_VERSION,
     };
     const signature = ed25519.sign(
       daemonE2eeSigningInputBytes(payload, {
@@ -329,6 +392,9 @@ export class MockDaemon {
           daemon_public_key: this.daemonPublicKey,
         },
       );
+      connection.binaryMode =
+        connection.daemonE2eeExchange.binary_version === BINARY_PROTOCOL_VERSION &&
+        payload.binary_version === BINARY_PROTOCOL_VERSION;
 
       if (this.trustedDevices.has(payload.device_id)) {
         this.sendPacket(
@@ -355,6 +421,18 @@ export class MockDaemon {
 
     const inner = connection.e2ee.decryptJson(outer.payload as EncryptedFramePayload);
     await this.handleInner(connection, inner);
+  }
+
+  private async handleOuterBinary(connection: MockConnection, raw: Uint8Array): Promise<void> {
+    this.binaryWireFrames.push({ direction: "in", byteLength: raw.byteLength });
+    if (!connection.e2ee || !connection.binaryMode) {
+      this.sendError(connection, "invalid_state", "invalid protocol state");
+      return;
+    }
+    const plaintext = connection.e2ee.decryptBinary(decodeBinaryEncryptedFrame(raw));
+    const binaryPacket = decodeBinaryProtocolPacket(plaintext);
+    this.recordBinaryPacket("in", binaryPacket);
+    await this.handlePacket(connection, binaryPacketToProtocol(binaryPacket));
   }
 
   private handleRoutePrelude(connection: MockConnection, outer: Envelope): void {
@@ -589,6 +667,12 @@ export class MockDaemon {
         return;
       }
       case "daemon_clients": {
+        if (this.options.daemonClientsDelayMs) {
+          await new Promise((resolve) => setTimeout(resolve, this.options.daemonClientsDelayMs));
+        }
+        if (this.options.dropDaemonClients) {
+          return;
+        }
         this.sendInner(
           connection,
           envelope("daemon_clients_result", {
@@ -613,16 +697,36 @@ export class MockDaemon {
       }
       case "daemon_status": {
         this.daemonStatusRequests += 1;
+        if (this.options.daemonStatusDelayMs) {
+          await new Promise((resolve) => setTimeout(resolve, this.options.daemonStatusDelayMs));
+        }
         const queuedStatus = this.options.daemonStatusResponses?.shift();
         this.sendInner(connection, envelope("daemon_status_result", queuedStatus ?? this.options.daemonStatus ?? mockDaemonStatus()));
         return;
       }
       case "session_create":
+        if (this.options.sessionCreateDelayMs) {
+          // 中文注释：真实 daemon 创建 shell 需要拉起 supervisor/PTY；测试用延迟覆盖
+          // “创建 session 不是普通短 RPC”这个超时语义。
+          await new Promise((resolve) => setTimeout(resolve, this.options.sessionCreateDelayMs));
+        }
         this.handleSessionCreate(connection, inner.payload as SessionCreatePayload);
         return;
       case "session_attach": {
         const payload = inner.payload as { session_id: UUID; watch_updates?: boolean; last_terminal_seq?: number | null };
         const watchUpdates = payload.watch_updates ?? true;
+        if (this.failTerminalAttachRequests > 0) {
+          this.failTerminalAttachRequests -= 1;
+          this.failedTerminalAttachRequests += 1;
+          this.sendError(connection, "connection_closed", "mock terminal attach closed");
+          return;
+        }
+        if (watchUpdates && this.failWatchedTerminalAttachRequests > 0) {
+          this.failWatchedTerminalAttachRequests -= 1;
+          this.failedTerminalAttachRequests += 1;
+          this.sendError(connection, "connection_closed", "mock watched terminal attach closed");
+          return;
+        }
         const session = this.options.sessions.find((candidate) => candidate.session_id === payload.session_id);
         this.attachRequests.push(payload);
         this.attachedSessions.push(payload.session_id);
@@ -659,7 +763,7 @@ export class MockDaemon {
       }
       case "session_data": {
         const payload = inner.payload as SessionDataPayload;
-        const input = decodeUtf8(sessionDataFromBase64(payload.data_base64));
+        const input = decodeUtf8(sessionDataFromBase64(payload.data_base64 ?? ""));
         this.sessionDataMessages.push(input);
         if (this.options.sessionDataError) {
           // 拒绝路径只记录收到的加密业务帧，不模拟写入 PTY。
@@ -1173,11 +1277,63 @@ export class MockDaemon {
       return;
     }
     this.sentPackets.push(packet);
+    if (connection.binaryMode) {
+      const binaryPacket = protocolPacketToBinary(packet);
+      this.recordBinaryPacket("out", binaryPacket);
+      const frame = connection.e2ee.encryptBinary(encodeBinaryProtocolPacket(binaryPacket));
+      const wire = encodeBinaryEncryptedFrame(frame);
+      this.binaryWireFrames.push({ direction: "out", byteLength: wire.byteLength });
+      connection.socket.send(wire);
+      return;
+    }
     this.sendOuter(connection.socket, envelope("encrypted_frame", connection.e2ee.encryptJson(envelope("packet", packet))));
+  }
+
+  private recordBinaryPacket(direction: "in" | "out", packet: BinaryProtocolPacket): void {
+    if (packet.payload?.type === "session_data") {
+      this.binaryPacketLog.push({
+        direction,
+        kind: packet.kind,
+        payload_type: packet.payload.type,
+        data_text: decodeUtf8(packet.payload.data),
+      });
+      return;
+    }
+    if (packet.payload?.type === "terminal_frame") {
+      const frame = packet.payload.frame;
+      this.binaryPacketLog.push({
+        direction,
+        kind: packet.kind,
+        payload_type: packet.payload.type,
+        data_text: frame.kind === "snapshot" || frame.kind === "output" ? decodeUtf8(frame.data) : undefined,
+      });
+      return;
+    }
+    this.binaryPacketLog.push({
+      direction,
+      kind: packet.kind,
+      payload_type: packet.payload?.type,
+    });
   }
 
   private sendTerminalStreamChunk(connection: MockConnection, payload: SessionDataPayload): void {
     const stream = connection.terminalStreamsBySession.get(payload.session_id);
+    if (!stream || !stream.watchUpdates) {
+      return;
+    }
+    const seq = stream.nextOutputSeq;
+    stream.nextOutputSeq += 1;
+    this.sendPacket(connection, {
+      version: PROTOCOL_PACKET_VERSION,
+      kind: "stream_chunk",
+      stream_id: stream.streamId,
+      seq,
+      payload,
+    });
+  }
+
+  private sendTerminalStreamFrame(connection: MockConnection, sessionId: UUID, payload: unknown): void {
+    const stream = connection.terminalStreamsBySession.get(sessionId);
     if (!stream || !stream.watchUpdates) {
       return;
     }
@@ -1286,6 +1442,101 @@ function mockDaemonStatus(): DaemonStatusResultPayload {
     process_count: 123,
     atop_available: false,
   };
+}
+
+function protocolPacketToBinary(packet: ProtocolPacket): BinaryProtocolPacket {
+  const binary: BinaryProtocolPacket = {
+    version: packet.version,
+    kind: packet.kind,
+    id: packet.id,
+    stream_id: packet.stream_id,
+    method: packet.method,
+    seq: packet.seq,
+    ack: packet.ack,
+    credit: packet.credit,
+  };
+  if (packet.kind === "stream_chunk") {
+    const payload = packet.payload as { session_id?: UUID; data_base64?: string; data_bytes?: Uint8Array; kind?: string };
+    if (payload.kind) {
+      return {
+        ...binary,
+        payload: { type: "terminal_frame", frame: terminalFrameJsonToBinary(payload) },
+      };
+    }
+    if (payload.session_id && (typeof payload.data_base64 === "string" || payload.data_bytes instanceof Uint8Array)) {
+      const data = payload.data_bytes ?? base64ToBytes(payload.data_base64 ?? "");
+      return {
+        ...binary,
+        payload: { type: "session_data", session_id: payload.session_id, data },
+      };
+    }
+  }
+  if (packet.kind === "error") {
+    const payload = packet.payload as { code?: string; message?: string; retryable?: boolean };
+    if (payload.code && payload.message) {
+      return {
+        ...binary,
+        payload: { type: "error", code: payload.code, message: payload.message, retryable: Boolean(payload.retryable) },
+      };
+    }
+  }
+  return {
+    ...binary,
+    payload: { type: "json", data: encodeUtf8(JSON.stringify(packet.payload ?? {})) },
+  };
+}
+
+function binaryPacketToProtocol(packet: BinaryProtocolPacket): ProtocolPacket {
+  let payload: unknown = {};
+  if (packet.payload?.type === "json") {
+    payload = JSON.parse(decodeUtf8(packet.payload.data));
+  } else if (packet.payload?.type === "session_data") {
+    payload = {
+      session_id: packet.payload.session_id,
+      data_base64: bytesToBase64(packet.payload.data),
+      data_bytes: packet.payload.data,
+    } satisfies SessionDataPayload;
+  } else if (packet.payload?.type === "terminal_frame") {
+    payload = terminalFrameBinaryToJson(packet.payload.frame);
+  } else if (packet.payload?.type === "error") {
+    payload = {
+      code: packet.payload.code,
+      message: packet.payload.message,
+      retryable: packet.payload.retryable,
+    } satisfies PacketErrorPayload;
+  }
+  return {
+    version: packet.version,
+    kind: packet.kind,
+    ...(packet.id ? { id: packet.id } : {}),
+    ...(packet.stream_id ? { stream_id: packet.stream_id } : {}),
+    ...(packet.method ? { method: packet.method } : {}),
+    ...(packet.seq ? { seq: packet.seq } : {}),
+    ...(packet.ack ? { ack: packet.ack } : {}),
+    ...(packet.credit ? { credit: packet.credit } : {}),
+    payload,
+  };
+}
+
+function bytesFromWsMessage(raw: RawData): Uint8Array {
+  if (raw instanceof ArrayBuffer) {
+    return new Uint8Array(raw);
+  }
+  if (ArrayBuffer.isView(raw)) {
+    return new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength);
+  }
+  if (Array.isArray(raw)) {
+    const chunks = raw.map(bytesFromWsMessage);
+    const totalLength = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
+    const out = new Uint8Array(totalLength);
+    let offset = 0;
+    for (const chunk of chunks) {
+      out.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return out;
+  }
+  return encodeUtf8(String(raw));
 }
 
 function defaultSessionGit(sessionId: UUID): SessionGitResultPayload {

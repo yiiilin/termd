@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -8,30 +8,114 @@ use axum::extract::ws::{Message, WebSocket};
 use base64::{Engine as _, engine::general_purpose};
 use futures_util::{SinkExt, StreamExt};
 use termd_proto::{
-    Envelope, ErrorPayload, MessageType, RelayClientId, RelayMuxEnvelope, RelayOpaqueFrame,
-    RouteHelloPayload, RouteReadyPayload, RouteRole, ServerId,
+    Envelope, ErrorPayload, MessageType, Nonce, RelayClientId, RelayMuxEnvelope, RelayOpaqueFrame,
+    RouteHelloPayload, RouteReadyPayload, RouteRole, ServerId, decode_binary_relay_mux_envelope,
+    encode_binary_relay_mux_envelope,
 };
 use thiserror::Error;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::time::{Instant, timeout};
 use tracing::{debug, warn};
 
 const DATA_CHANNEL_CAPACITY: usize = 1024;
+const DATA_CHANNEL_BYTE_BUDGET: usize = 8 * 1024 * 1024;
+const CONTROL_CHANNEL_CAPACITY: usize = 256;
 // relay 只关闭当前 WebSocket transport；不会解释或终止 E2EE 内部的 daemon session。
 const ROUTE_PRELUDE_TIMEOUT: Duration = Duration::from_secs(2);
 const WEBSOCKET_SEND_DEADLINE: Duration = Duration::from_secs(10);
 const WEBSOCKET_PONG_DEADLINE: Duration = Duration::from_secs(10);
 const WEBSOCKET_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const WEBSOCKET_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(25);
-const WEBSOCKET_MAX_FRAME_SIZE: usize = 1024 * 1024;
-const WEBSOCKET_MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
-
+pub(crate) const WEBSOCKET_MAX_FRAME_SIZE: usize = 1024 * 1024;
+pub(crate) const WEBSOCKET_MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
 type ConnectionId = u64;
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct RelayTrafficBucket {
+    calls: u64,
+    bytes: u64,
+}
+
+impl RelayTrafficBucket {
+    fn record(&mut self, bytes: usize) {
+        self.calls = self.calls.saturating_add(1);
+        self.bytes = self.bytes.saturating_add(bytes as u64);
+    }
+
+    fn is_empty(self) -> bool {
+        self.calls == 0 && self.bytes == 0
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct RelayConnectionTraffic {
+    in_text: RelayTrafficBucket,
+    in_binary: RelayTrafficBucket,
+    in_ping: RelayTrafficBucket,
+    in_pong: RelayTrafficBucket,
+    in_close: RelayTrafficBucket,
+    out_text: RelayTrafficBucket,
+    out_binary: RelayTrafficBucket,
+    out_ping: RelayTrafficBucket,
+    out_pong: RelayTrafficBucket,
+    forwarded_attempted: u64,
+    forwarded_delivered: u64,
+    forwarded_dropped: u64,
+}
+
+impl RelayConnectionTraffic {
+    fn record_inbound(&mut self, message: &Message) {
+        match message {
+            Message::Text(raw) => self.in_text.record(raw.len()),
+            Message::Binary(raw) => self.in_binary.record(raw.len()),
+            Message::Ping(payload) => self.in_ping.record(payload.len()),
+            Message::Pong(payload) => self.in_pong.record(payload.len()),
+            Message::Close(_) => self.in_close.record(0),
+        }
+    }
+
+    fn record_outbound(&mut self, frame_kind: &'static str, frame_len: usize) {
+        match frame_kind {
+            "text" => self.out_text.record(frame_len),
+            "binary" => self.out_binary.record(frame_len),
+            "ping" => self.out_ping.record(frame_len),
+            "pong" => self.out_pong.record(frame_len),
+            _ => {}
+        }
+    }
+
+    fn record_forward(&mut self, report: ForwardReport) {
+        self.forwarded_attempted = self
+            .forwarded_attempted
+            .saturating_add(report.attempted as u64);
+        self.forwarded_delivered = self
+            .forwarded_delivered
+            .saturating_add(report.delivered as u64);
+        self.forwarded_dropped = self.forwarded_dropped.saturating_add(report.dropped as u64);
+    }
+
+    fn has_activity(self) -> bool {
+        !self.in_text.is_empty()
+            || !self.in_binary.is_empty()
+            || !self.in_ping.is_empty()
+            || !self.in_pong.is_empty()
+            || !self.in_close.is_empty()
+            || !self.out_text.is_empty()
+            || !self.out_binary.is_empty()
+            || !self.out_ping.is_empty()
+            || !self.out_pong.is_empty()
+            || self.forwarded_attempted > 0
+            || self.forwarded_delivered > 0
+            || self.forwarded_dropped > 0
+    }
+}
 
 #[derive(Debug, Clone)]
 struct FrameSender {
-    control: mpsc::UnboundedSender<RelayOutbound>,
+    control: mpsc::Sender<RelayOutbound>,
     data: mpsc::Sender<RelayOutbound>,
+    data_budget: Arc<DataQueueByteBudget>,
+    close_signal: EndpointCloseSignal,
 }
 
 impl FrameSender {
@@ -39,15 +123,19 @@ impl FrameSender {
         data_capacity: usize,
     ) -> (
         Self,
-        mpsc::UnboundedReceiver<RelayOutbound>,
+        mpsc::Receiver<RelayOutbound>,
         mpsc::Receiver<RelayOutbound>,
     ) {
-        let (control_tx, control_rx) = mpsc::unbounded_channel();
+        let (control_tx, control_rx) = mpsc::channel(CONTROL_CHANNEL_CAPACITY);
         let (data_tx, data_rx) = mpsc::channel(data_capacity);
+        let data_budget = Arc::new(DataQueueByteBudget::new(DATA_CHANNEL_BYTE_BUDGET));
+        let close_signal = EndpointCloseSignal::new();
         (
             Self {
                 control: control_tx,
                 data: data_tx,
+                data_budget,
+                close_signal,
             },
             control_rx,
             data_rx,
@@ -58,15 +146,138 @@ impl FrameSender {
         &self,
         outbound: RelayOutbound,
     ) -> Result<(), mpsc::error::TrySendError<RelayOutbound>> {
-        self.data.try_send(outbound)
+        let queued_bytes = outbound.queued_data_bytes();
+        if !self.data_budget.try_reserve(queued_bytes) {
+            return Err(mpsc::error::TrySendError::Full(outbound));
+        }
+        match self.data.try_send(outbound) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(outbound)) => {
+                self.data_budget.release(queued_bytes);
+                Err(mpsc::error::TrySendError::Full(outbound))
+            }
+            Err(mpsc::error::TrySendError::Closed(outbound)) => {
+                self.data_budget.release(queued_bytes);
+                Err(mpsc::error::TrySendError::Closed(outbound))
+            }
+        }
     }
 
     fn try_send_control(
         &self,
         outbound: RelayOutbound,
-    ) -> Result<(), mpsc::error::SendError<RelayOutbound>> {
-        // 生命周期控制消息不能被普通业务队列挤掉；否则 daemon 会继续保留 stale client/watchers。
-        self.control.send(outbound)
+    ) -> Result<(), mpsc::error::TrySendError<RelayOutbound>> {
+        // 生命周期控制消息不能被普通业务队列挤掉；但它也必须有上限。
+        // 如果底层 WebSocket 慢写到 control 都堆满，继续无界缓存只会拖垮整个 relay。
+        self.control.try_send(outbound)
+    }
+
+    fn subscribe_close(&self) -> EndpointCloseReceiver {
+        self.close_signal.subscribe()
+    }
+
+    fn close_endpoint(&self) {
+        self.close_signal.close();
+    }
+
+    fn request_close(&self) {
+        // 中文注释：close 信号是可靠退出路径；队列里的 Close 只是尽力发送 WebSocket
+        // close frame。即使 control 队列已满，endpoint 也会通过信号退出。
+        self.close_endpoint();
+        let _ = self.try_send_control(RelayOutbound::Close);
+    }
+}
+
+#[derive(Debug)]
+struct DataQueueByteBudget {
+    limit: usize,
+    queued: AtomicUsize,
+}
+
+impl DataQueueByteBudget {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            queued: AtomicUsize::new(0),
+        }
+    }
+
+    fn try_reserve(&self, bytes: usize) -> bool {
+        if bytes == 0 {
+            return true;
+        }
+
+        let mut current = self.queued.load(Ordering::Acquire);
+        loop {
+            let Some(next) = current.checked_add(bytes) else {
+                return false;
+            };
+            if next > self.limit {
+                return false;
+            }
+            match self.queued.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    fn release(&self, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        // 中文注释：release 只在成功入队后的出队/发送失败回滚路径调用。
+        // 使用 saturating_sub 兜住测试或未来改动造成的重复释放，不让计数下溢成巨大值。
+        let _ = self
+            .queued
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                Some(current.saturating_sub(bytes))
+            });
+    }
+}
+
+#[derive(Debug, Clone)]
+struct EndpointCloseSignal {
+    sender: watch::Sender<bool>,
+}
+
+impl EndpointCloseSignal {
+    fn new() -> Self {
+        let (sender, _receiver) = watch::channel(false);
+        Self { sender }
+    }
+
+    fn subscribe(&self) -> EndpointCloseReceiver {
+        EndpointCloseReceiver {
+            receiver: self.sender.subscribe(),
+        }
+    }
+
+    fn close(&self) {
+        let _ = self.sender.send(true);
+    }
+}
+
+#[derive(Debug)]
+struct EndpointCloseReceiver {
+    receiver: watch::Receiver<bool>,
+}
+
+impl EndpointCloseReceiver {
+    async fn closed(&mut self) {
+        if *self.receiver.borrow() {
+            return;
+        }
+        while self.receiver.changed().await.is_ok() {
+            if *self.receiver.borrow() {
+                return;
+            }
+        }
     }
 }
 
@@ -74,6 +285,7 @@ impl FrameSender {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionRole {
     DaemonMux,
+    DaemonMuxData,
     Client,
 }
 
@@ -82,6 +294,7 @@ impl ConnectionRole {
         match role {
             RouteRole::Client => Self::Client,
             RouteRole::DaemonMux => Self::DaemonMux,
+            RouteRole::DaemonMuxData => Self::DaemonMuxData,
         }
     }
 }
@@ -100,14 +313,49 @@ enum RelayOutbound {
         client_id: RelayClientId,
         frame: OpaqueFrame,
     },
+    Ping(Vec<u8>),
+    Pong(Vec<u8>),
     Close,
+}
+
+impl RelayOutbound {
+    fn queued_data_bytes(&self) -> usize {
+        match self {
+            Self::Frame(frame) => frame.len(),
+            Self::MuxClientFrame { frame, .. } => frame.len(),
+            Self::Ping(_) | Self::Pong(_) | Self::Close => 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PreparedRelayOutbound {
     Frame(OpaqueFrame),
+    Ping(Vec<u8>),
+    Pong(Vec<u8>),
     Close,
     Drop,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SentRelayOutbound {
+    frame_kind: &'static str,
+    frame_len: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelayWriteResult {
+    Sent(SentRelayOutbound),
+    Dropped,
+    Closed,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelayWriterOutcome {
+    Sent(SentRelayOutbound),
+    Closed,
+    Failed,
 }
 
 #[allow(dead_code)]
@@ -266,7 +514,13 @@ fn websocket_message_bytes(message: &Message) -> usize {
 fn websocket_heartbeat_enabled(role: ConnectionRole) -> bool {
     // daemon mux 是所有 relay client 共享的主干连接；主动 Ping/Pong 和大输出、断连控制帧共用
     // 同一条 WebSocket/TCP 流，10s deadline 会在高输出或批量断连时误杀主干，反而造成全局卡顿。
-    // 浏览器 client 仍用 heartbeat 快速清理断线；daemon mux 交给 idle timeout 和写失败检测。
+    // 浏览器 client 仍用 heartbeat 快速清理断线；daemon mux 的保活由 daemon 主动发 WebSocket Ping。
+    role == ConnectionRole::Client
+}
+
+fn websocket_idle_timeout_enabled(role: ConnectionRole) -> bool {
+    // relay 不用 idle timeout 裁定 daemon 在线；daemon mux 连接断开/写失败时才标记离线。
+    // 浏览器 client 仍用 idle timeout 清理长期静默断线。
     role == ConnectionRole::Client
 }
 
@@ -342,13 +596,51 @@ impl RelayState {
         self.inner.room_count()
     }
 
+    fn register_route(
+        &self,
+        prelude: &RoutePrelude,
+        sender: FrameSender,
+    ) -> Result<ConnectionRegistration, RelayError> {
+        self.inner.register(prelude, sender)
+    }
+
+    #[cfg(test)]
+    fn register_with_generation(
+        &self,
+        server_id: ServerId,
+        role: ConnectionRole,
+        route_generation: Option<Nonce>,
+        sender: FrameSender,
+    ) -> Result<ConnectionRegistration, RelayError> {
+        let prelude = RoutePrelude {
+            server_id,
+            route_role: match role {
+                ConnectionRole::DaemonMux => RouteRole::DaemonMux,
+                ConnectionRole::DaemonMuxData => RouteRole::DaemonMuxData,
+                ConnectionRole::Client => RouteRole::Client,
+            },
+            connection_role: role,
+            route_generation,
+        };
+        self.register_route(&prelude, sender)
+    }
+
+    #[cfg(test)]
     fn register(
         &self,
         server_id: ServerId,
         role: ConnectionRole,
         sender: FrameSender,
     ) -> Result<ConnectionRegistration, RelayError> {
-        self.inner.register(server_id, role, sender)
+        let generation = if matches!(
+            role,
+            ConnectionRole::DaemonMux | ConnectionRole::DaemonMuxData
+        ) {
+            Some(Nonce("test-route-generation".to_owned()))
+        } else {
+            None
+        };
+        self.register_with_generation(server_id, role, generation, sender)
     }
 
     fn unregister(&self, registration: &ConnectionRegistration) {
@@ -377,6 +669,8 @@ struct RelayRegistry {
 #[derive(Debug, Default)]
 struct RelayRoom {
     daemon_mux: Option<ConnectionEndpoint>,
+    daemon_mux_data: Option<ConnectionEndpoint>,
+    daemon_mux_generation: Option<Nonce>,
     clients: HashMap<ConnectionId, ConnectionEndpoint>,
 }
 
@@ -384,8 +678,23 @@ impl RelayRoom {
     fn close_clients(&mut self) {
         for (_, client) in self.clients.drain() {
             // daemon mux 已不可用时，client 必须尽快收到 close，避免继续等待业务响应直到超时。
-            let _ = client.sender.try_send_control(RelayOutbound::Close);
+            client.sender.request_close();
         }
+    }
+
+    fn clear_daemon_mux_and_dependents(&mut self) {
+        if let Some(daemon_mux) = self.daemon_mux.take() {
+            // 中文注释：daemon mux 从 room 移除时必须同时终止它自己的 endpoint。
+            // 只把 room.daemon_mux 置空会留下假活 WebSocket，control 队列满时尤其明显。
+            daemon_mux.sender.request_close();
+        }
+        self.daemon_mux_generation = None;
+        if let Some(data) = self.daemon_mux_data.take() {
+            // 中文注释：data 通道附属于当前 control mux。主 mux 失效后，旧 data 即使
+            // TCP 还没感知断线，也不能继续向后续新 client 投递旧一代输出。
+            data.sender.request_close();
+        }
+        self.close_clients();
     }
 }
 
@@ -393,13 +702,15 @@ impl RelayRoom {
 struct ConnectionEndpoint {
     id: ConnectionId,
     sender: FrameSender,
+    route_generation: Option<Nonce>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ConnectionRegistration {
     server_id: ServerId,
     role: ConnectionRole,
     id: ConnectionId,
+    route_generation: Option<Nonce>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -409,10 +720,34 @@ pub struct ForwardReport {
     pub dropped: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RelayForwardOutcome {
+    report: ForwardReport,
+    should_continue: bool,
+}
+
+impl RelayForwardOutcome {
+    fn continue_with(report: ForwardReport) -> Self {
+        Self {
+            report,
+            should_continue: true,
+        }
+    }
+
+    fn close_with(report: ForwardReport) -> Self {
+        Self {
+            report,
+            should_continue: false,
+        }
+    }
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 enum RelayError {
     #[error("daemon mux is not connected for server_id")]
     DaemonMuxOffline,
+    #[error("daemon mux control channel is backpressured")]
+    DaemonMuxBusy,
     #[error("relay state mutex poisoned")]
     Poisoned,
 }
@@ -421,6 +756,7 @@ impl RelayError {
     fn route_error_code(&self) -> &'static str {
         match self {
             Self::DaemonMuxOffline => "relay_daemon_offline",
+            Self::DaemonMuxBusy => "relay_busy",
             Self::Poisoned => "relay_state_unavailable",
         }
     }
@@ -430,6 +766,7 @@ impl RelayError {
             Self::DaemonMuxOffline => {
                 "relay daemon mux is not connected; retry after daemon reconnects"
             }
+            Self::DaemonMuxBusy => "relay daemon mux is busy; retry shortly",
             Self::Poisoned => "relay state is temporarily unavailable",
         }
     }
@@ -437,15 +774,18 @@ impl RelayError {
 
 #[derive(Debug, Error)]
 enum RelayMuxFrameError {
+    #[error("relay mux envelope is invalid")]
+    InvalidEnvelope,
     #[error("relay mux frame binary payload is not valid base64")]
     InvalidBase64(#[source] base64::DecodeError),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct RoutePrelude {
     server_id: ServerId,
     route_role: RouteRole,
     connection_role: ConnectionRole,
+    route_generation: Option<Nonce>,
 }
 
 #[derive(Debug, Error)]
@@ -478,18 +818,24 @@ impl RelayRegistry {
 
     fn register(
         &self,
-        server_id: ServerId,
-        role: ConnectionRole,
+        prelude: &RoutePrelude,
         sender: FrameSender,
     ) -> Result<ConnectionRegistration, RelayError> {
+        let server_id = prelude.server_id;
+        let role = prelude.connection_role;
+        let route_generation = prelude.route_generation.clone();
         let id = self.next_connection_id.fetch_add(1, Ordering::Relaxed) + 1;
         let mut rooms = self.rooms.lock().map_err(|_| RelayError::Poisoned)?;
 
         match role {
             ConnectionRole::DaemonMux => {
                 let room = rooms.entry(server_id).or_default();
-                if let Some(stale_mux) = room.daemon_mux.replace(ConnectionEndpoint { id, sender })
-                {
+                let endpoint = ConnectionEndpoint {
+                    id,
+                    sender,
+                    route_generation: route_generation.clone(),
+                };
+                if let Some(stale_mux) = room.daemon_mux.replace(endpoint) {
                     warn!(
                         server_id = %server_id.0,
                         stale_connection_id = stale_mux.id,
@@ -498,8 +844,45 @@ impl RelayRegistry {
                     );
                     // 新 mux 已经到达时，旧 mux 多半是半断连接；关闭旧 mux 和旧 clients，
                     // 让浏览器按统一重连路径重新完成 E2EE 握手，避免复用旧 client_id。
-                    let _ = stale_mux.sender.try_send_control(RelayOutbound::Close);
+                    stale_mux.sender.request_close();
+                    if let Some(stale_data) = room.daemon_mux_data.take() {
+                        // 中文注释：data 通道和 control 通道必须同代。替换 control 时关闭旧 data，
+                        // 防止旧 daemon 的残留输出跨代写进新 control mux 下的 client。
+                        stale_data.sender.request_close();
+                    }
                     room.close_clients();
+                }
+                room.daemon_mux_generation = route_generation.clone();
+            }
+            ConnectionRole::DaemonMuxData => {
+                let room = rooms.entry(server_id).or_default();
+                if room.daemon_mux.is_none() {
+                    rooms.remove(&server_id);
+                    return Err(RelayError::DaemonMuxOffline);
+                }
+                if route_generation.as_ref() != room.daemon_mux_generation.as_ref() {
+                    warn!(
+                        server_id = %server_id.0,
+                        connection_id = id,
+                        "rejecting relay daemon mux data channel with stale generation"
+                    );
+                    return Err(RelayError::DaemonMuxOffline);
+                }
+                let endpoint = ConnectionEndpoint {
+                    id,
+                    sender,
+                    route_generation: route_generation.clone(),
+                };
+                if let Some(stale_mux) = room.daemon_mux_data.replace(endpoint) {
+                    warn!(
+                        server_id = %server_id.0,
+                        stale_connection_id = stale_mux.id,
+                        new_connection_id = id,
+                        "replacing stale relay daemon mux data channel"
+                    );
+                    // 中文注释：data 通道是 control mux 的附属连接。替换 data 只关闭旧 data，
+                    // 不触碰 clients；否则一次输出通道重拨会让所有 Web 会话重连。
+                    stale_mux.sender.request_close();
                 }
             }
             ConnectionRole::Client => {
@@ -509,7 +892,14 @@ impl RelayRegistry {
                 if room.daemon_mux.is_none() {
                     return Err(RelayError::DaemonMuxOffline);
                 }
-                room.clients.insert(id, ConnectionEndpoint { id, sender });
+                room.clients.insert(
+                    id,
+                    ConnectionEndpoint {
+                        id,
+                        sender,
+                        route_generation: None,
+                    },
+                );
             }
         }
 
@@ -517,6 +907,7 @@ impl RelayRegistry {
             server_id,
             role,
             id,
+            route_generation,
         })
     }
 
@@ -537,19 +928,32 @@ impl RelayRegistry {
                     .as_ref()
                     .is_some_and(|daemon| daemon.id == registration.id)
                 {
-                    room.daemon_mux = None;
-                    room.close_clients();
+                    room.clear_daemon_mux_and_dependents();
+                }
+            }
+            ConnectionRole::DaemonMuxData => {
+                if room
+                    .daemon_mux_data
+                    .as_ref()
+                    .is_some_and(|daemon| daemon.id == registration.id)
+                {
+                    room.daemon_mux_data = None;
                 }
             }
             ConnectionRole::Client => {
                 room.clients.remove(&registration.id);
                 if let Some(daemon_mux) = room.daemon_mux.as_ref() {
-                    notify_daemon_mux_client_disconnected(daemon_mux, registration.id);
+                    if notify_daemon_mux_client_disconnected(daemon_mux, registration.id).is_err() {
+                        // 中文注释：disconnect 是 lifecycle 必达消息。control 队列都满时，
+                        // 静默丢弃会让 daemon 永久保留 stale watcher；关闭 mux 让 daemon
+                        // 重连并清理本代 clients，比继续假活更安全。
+                        room.clear_daemon_mux_and_dependents();
+                    }
                 }
             }
         }
 
-        if room.daemon_mux.is_none() && room.clients.is_empty() {
+        if room.daemon_mux.is_none() && room.daemon_mux_data.is_none() && room.clients.is_empty() {
             rooms.remove(&registration.server_id);
         }
     }
@@ -570,7 +974,9 @@ impl RelayRegistry {
         frame: OpaqueFrame,
     ) -> ForwardReport {
         match registration.role {
-            ConnectionRole::DaemonMux => self.forward_mux_to_client(registration.server_id, frame),
+            ConnectionRole::DaemonMux | ConnectionRole::DaemonMuxData => {
+                self.forward_mux_to_client(registration, frame)
+            }
             ConnectionRole::Client => self.forward_client_to_mux_daemon(registration, frame),
         }
     }
@@ -597,6 +1003,19 @@ impl RelayRegistry {
             };
         };
 
+        if !room.clients.contains_key(&registration.id) {
+            debug!(
+                server_id = %registration.server_id.0,
+                connection_id = registration.id,
+                "dropping frame from relay client that is no longer registered"
+            );
+            return ForwardReport {
+                attempted: 1,
+                delivered: 0,
+                dropped: 1,
+            };
+        }
+
         let Some(daemon_mux) = room.daemon_mux.as_ref() else {
             return ForwardReport {
                 attempted: 0,
@@ -614,15 +1033,44 @@ impl RelayRegistry {
                 delivered: 1,
                 dropped: 0,
             },
-            Err(error) => {
+            Err(mpsc::error::TrySendError::Full(RelayOutbound::MuxClientFrame {
+                client_id,
+                ..
+            })) => {
+                warn!(
+                    server_id = %registration.server_id.0,
+                    connection_id = registration.id,
+                    daemon_connection_id = daemon_mux.id,
+                    "dropping relay client because daemon mux control queue is full"
+                );
+                if let Some(client) = room.clients.remove(&registration.id) {
+                    client.sender.request_close();
+                }
+                if let Some(daemon_mux) = room.daemon_mux.as_ref() {
+                    // data 队列满只是 daemon 暂时消费不过来，不能把主干判为离线；
+                    // 只通知 daemon 清理当前 client，其他 client 等 mux 恢复消费后继续工作。
+                    if notify_daemon_mux_client_disconnected(daemon_mux, client_id.0).is_err() {
+                        room.clear_daemon_mux_and_dependents();
+                    }
+                }
+                ForwardReport {
+                    attempted: 1,
+                    delivered: 0,
+                    dropped: 1,
+                }
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => ForwardReport {
+                attempted: 1,
+                delivered: 0,
+                dropped: 1,
+            },
+            Err(mpsc::error::TrySendError::Closed(_outbound)) => {
                 warn!(
                     server_id = %registration.server_id.0,
                     connection_id = daemon_mux.id,
-                    %error,
                     "dropping offline relay daemon mux"
                 );
-                room.daemon_mux = None;
-                room.close_clients();
+                room.clear_daemon_mux_and_dependents();
                 ForwardReport {
                     attempted: 1,
                     delivered: 0,
@@ -632,34 +1080,17 @@ impl RelayRegistry {
         }
     }
 
-    fn forward_mux_to_client(&self, server_id: ServerId, frame: OpaqueFrame) -> ForwardReport {
-        let Ok(mut rooms) = self.rooms.lock() else {
-            warn!("relay registry mutex poisoned during daemon mux forward");
-            return ForwardReport {
-                attempted: 0,
-                delivered: 0,
-                dropped: 0,
-            };
-        };
-
-        let Some(room) = rooms.get_mut(&server_id) else {
-            return ForwardReport {
-                attempted: 0,
-                delivered: 0,
-                dropped: 0,
-            };
-        };
-        let OpaqueFrame::Text(raw) = frame else {
-            return ForwardReport {
-                attempted: 0,
-                delivered: 0,
-                dropped: 1,
-            };
-        };
-        let envelope = match serde_json::from_str::<RelayMuxEnvelope>(&raw) {
+    fn forward_mux_to_client(
+        &self,
+        registration: &ConnectionRegistration,
+        frame: OpaqueFrame,
+    ) -> ForwardReport {
+        // 中文注释：mux envelope 和内部 binary payload 可能很大，必须在 registry 全局锁外解析。
+        // relay 锁只用于查当前 room/endpoint 和 clone sender，避免大输出阻塞其它 client 输入或注册。
+        let envelope = match mux_envelope_from_opaque_frame(frame) {
             Ok(envelope) => envelope,
             Err(error) => {
-                warn!(server_id = %server_id.0, %error, "rejecting invalid relay mux envelope");
+                warn!(server_id = %registration.server_id.0, %error, "rejecting invalid relay mux envelope");
                 return ForwardReport {
                     attempted: 0,
                     delivered: 0,
@@ -667,32 +1098,93 @@ impl RelayRegistry {
                 };
             }
         };
-        let RelayMuxEnvelope::DaemonFrame { client_id, frame } = envelope else {
-            return ForwardReport {
-                attempted: 0,
-                delivered: 0,
-                dropped: 1,
-            };
+        let (client_id, frame) = match envelope {
+            RelayMuxEnvelope::Keepalive { .. } | RelayMuxEnvelope::KeepaliveAck { .. } => {
+                // relay 不维护 daemon 心跳状态；标准 WebSocket Ping/Pong 由传输层处理。
+                // 旧 mux keepalive 帧到达时只丢弃，避免 relay 重新承担保活协议角色。
+                return ForwardReport {
+                    attempted: 1,
+                    delivered: 0,
+                    dropped: 0,
+                };
+            }
+            RelayMuxEnvelope::DaemonFrame { client_id, frame } => (client_id, frame),
+            RelayMuxEnvelope::ClientConnected { .. }
+            | RelayMuxEnvelope::ClientDisconnected { .. }
+            | RelayMuxEnvelope::ClientFrame { .. } => {
+                return ForwardReport {
+                    attempted: 0,
+                    delivered: 0,
+                    dropped: 1,
+                };
+            }
         };
-        let Some(client) = room.clients.get(&client_id.0) else {
-            return ForwardReport {
-                attempted: 1,
-                delivered: 0,
-                dropped: 1,
-            };
-        };
-        let target_client_id = client.id;
-        let target_sender = client.sender.clone();
         let frame = match opaque_frame_from_mux(frame) {
             Ok(frame) => frame,
             Err(error) => {
-                warn!(server_id = %server_id.0, %error, "rejecting invalid relay mux frame");
+                warn!(server_id = %registration.server_id.0, %error, "rejecting invalid relay mux frame");
                 return ForwardReport {
                     attempted: 1,
                     delivered: 0,
                     dropped: 1,
                 };
             }
+        };
+        let target_sender = {
+            let Ok(rooms) = self.rooms.lock() else {
+                warn!("relay registry mutex poisoned during daemon mux forward");
+                return ForwardReport {
+                    attempted: 0,
+                    delivered: 0,
+                    dropped: 0,
+                };
+            };
+
+            let Some(room) = rooms.get(&registration.server_id) else {
+                return ForwardReport {
+                    attempted: 0,
+                    delivered: 0,
+                    dropped: 0,
+                };
+            };
+            let active = match registration.role {
+                ConnectionRole::DaemonMux => room.daemon_mux.as_ref().is_some_and(|endpoint| {
+                    endpoint.id == registration.id
+                        && endpoint.route_generation.as_ref()
+                            == registration.route_generation.as_ref()
+                }),
+                ConnectionRole::DaemonMuxData => {
+                    room.daemon_mux_data.as_ref().is_some_and(|endpoint| {
+                        endpoint.id == registration.id
+                            && endpoint.route_generation.as_ref()
+                                == registration.route_generation.as_ref()
+                            && room.daemon_mux_generation.as_ref()
+                                == registration.route_generation.as_ref()
+                    })
+                }
+                ConnectionRole::Client => false,
+            };
+            if !active {
+                debug!(
+                    server_id = %registration.server_id.0,
+                    ?registration.role,
+                    connection_id = registration.id,
+                    "dropping frame from stale relay daemon mux connection"
+                );
+                return ForwardReport {
+                    attempted: 1,
+                    delivered: 0,
+                    dropped: 1,
+                };
+            }
+            let Some(client) = room.clients.get(&client_id.0) else {
+                return ForwardReport {
+                    attempted: 1,
+                    delivered: 0,
+                    dropped: 1,
+                };
+            };
+            client.sender.clone()
         };
 
         match target_sender.try_send(RelayOutbound::Frame(frame)) {
@@ -703,14 +1195,30 @@ impl RelayRegistry {
             },
             Err(error) => {
                 warn!(
-                    server_id = %server_id.0,
-                    connection_id = target_client_id,
+                    server_id = %registration.server_id.0,
+                    connection_id = client_id.0,
                     %error,
                     "dropping slow relay mux client"
                 );
-                room.clients.remove(&client_id.0);
-                if let Some(daemon_mux) = room.daemon_mux.as_ref() {
-                    notify_daemon_mux_client_disconnected(daemon_mux, client_id.0);
+                let Ok(mut rooms) = self.rooms.lock() else {
+                    warn!("relay registry mutex poisoned during slow client cleanup");
+                    return ForwardReport {
+                        attempted: 1,
+                        delivered: 0,
+                        dropped: 1,
+                    };
+                };
+                if let Some(room) = rooms.get_mut(&registration.server_id) {
+                    if let Some(client) = room.clients.remove(&client_id.0) {
+                        // 中文注释：慢 client 从 room 移除后必须主动关闭自己的 socket。
+                        // 否则它还能继续把输入帧塞向 daemon mux，形成“已下线 client 占用主干”的假活连接。
+                        client.sender.request_close();
+                    }
+                    if let Some(daemon_mux) = room.daemon_mux.as_ref() {
+                        if notify_daemon_mux_client_disconnected(daemon_mux, client_id.0).is_err() {
+                            room.clear_daemon_mux_and_dependents();
+                        }
+                    }
                 }
                 ForwardReport {
                     attempted: 1,
@@ -722,13 +1230,24 @@ impl RelayRegistry {
     }
 }
 
-fn notify_daemon_mux_client_disconnected(daemon_mux: &ConnectionEndpoint, client_id: ConnectionId) {
+fn notify_daemon_mux_client_disconnected(
+    daemon_mux: &ConnectionEndpoint,
+    client_id: ConnectionId,
+) -> Result<(), ()> {
     let envelope = RelayMuxEnvelope::ClientDisconnected {
         client_id: RelayClientId(client_id),
     };
-    let _ = daemon_mux
+    daemon_mux
         .sender
-        .try_send_control(RelayOutbound::Frame(mux_envelope_frame(envelope)));
+        .try_send_control(RelayOutbound::Frame(mux_envelope_frame(envelope)))
+        .map_err(|error| {
+            warn!(
+                daemon_connection_id = daemon_mux.id,
+                client_connection_id = client_id,
+                %error,
+                "failed to notify daemon mux about relay client disconnect"
+            );
+        })
 }
 
 pub async fn handle_socket(mut socket: WebSocket, state: RelayState) {
@@ -749,8 +1268,12 @@ pub async fn handle_socket(mut socket: WebSocket, state: RelayState) {
     };
     let server_id = prelude.server_id;
     let role = prelude.connection_role;
-    let (tx, mut control_rx, mut data_rx) = FrameSender::channel(DATA_CHANNEL_CAPACITY);
-    let registration = match state.register(server_id, role, tx) {
+    let (tx, control_rx, data_rx) = FrameSender::channel(DATA_CHANNEL_CAPACITY);
+    let self_sender = tx.clone();
+    let mut endpoint_close_rx = self_sender.subscribe_close();
+    let writer_close_rx = self_sender.subscribe_close();
+    let data_budget = self_sender.data_budget.clone();
+    let registration = match state.register_route(&prelude, tx) {
         Ok(registration) => registration,
         Err(error) => {
             warn!(server_id = %server_id.0, ?role, %error, "rejecting relay websocket");
@@ -763,6 +1286,26 @@ pub async fn handle_socket(mut socket: WebSocket, state: RelayState) {
             return;
         }
     };
+
+    if role == ConnectionRole::Client {
+        if let Err(error) = notify_mux_client_connected(&state, &registration) {
+            warn!(
+                server_id = %server_id.0,
+                ?role,
+                connection_id = registration.id,
+                %error,
+                "rejecting relay websocket after daemon mux notify failed"
+            );
+            state.unregister(&registration);
+            let _ = send_route_error(
+                &mut socket,
+                error.route_error_code(),
+                error.route_error_message(),
+            )
+            .await;
+            return;
+        }
+    }
 
     match timeout(
         WEBSOCKET_SEND_DEADLINE,
@@ -788,10 +1331,6 @@ pub async fn handle_socket(mut socket: WebSocket, state: RelayState) {
         }
     }
 
-    if role == ConnectionRole::Client {
-        notify_mux_client_connected(&state, &registration);
-    }
-
     debug!(
         server_id = %server_id.0,
         ?role,
@@ -799,7 +1338,7 @@ pub async fn handle_socket(mut socket: WebSocket, state: RelayState) {
         "relay websocket registered"
     );
 
-    let (mut sender, mut receiver) = socket.split();
+    let (sender, mut receiver) = socket.split();
     let mut idle_deadline = Instant::now() + WEBSOCKET_IDLE_TIMEOUT;
     let mut heartbeat = tokio::time::interval_at(
         Instant::now() + WEBSOCKET_HEARTBEAT_INTERVAL,
@@ -807,16 +1346,37 @@ pub async fn handle_socket(mut socket: WebSocket, state: RelayState) {
     );
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let heartbeat_enabled = websocket_heartbeat_enabled(role);
+    let idle_timeout_enabled = websocket_idle_timeout_enabled(role);
     let mut pending_pong_deadline: Option<Instant> = None;
+    let mut ping_enqueued = false;
     let mut heartbeat_debug = WebSocketHeartbeatDebug::new(Instant::now());
+    let mut traffic = RelayConnectionTraffic::default();
+    let (writer_outcome_tx, mut writer_outcome_rx) = mpsc::unbounded_channel();
+    // 中文注释：relay 必须是 dumb pipe，但 transport 读写不能互相拖住。
+    // 每条 WebSocket 的写侧单独跑，主循环只负责持续读取输入并转发到目标队列；
+    // 这样慢 daemon/client 写不会阻塞本连接继续读取反方向的控制帧或新 client hello。
+    let writer_task = tokio::spawn(run_relay_websocket_writer(
+        state.clone(),
+        sender,
+        server_id,
+        role,
+        registration.id,
+        control_rx,
+        data_rx,
+        data_budget,
+        writer_close_rx,
+        writer_outcome_tx,
+    ));
 
     loop {
         let pending_pong_deadline_snapshot = pending_pong_deadline;
-        // control frame 优先级高于业务转发，避免慢 client 或大输出把 Pong 消费延迟到超时之后。
+        // 写侧由 writer task 消费；这里持续读入站帧，避免慢写把反方向输入也卡住。
+        // 中文注释：writer outcome 在大输出期间可能持续就绪。它只能更新统计和心跳状态，
+        // 不能排在 inbound 前面，否则 relay client 的输入/close 会被输出完成通知饿住。
         tokio::select! {
             biased;
 
-            _ = tokio::time::sleep_until(idle_deadline) => {
+            _ = tokio::time::sleep_until(idle_deadline), if idle_timeout_enabled => {
                 warn!(
                     server_id = %server_id.0,
                     ?role,
@@ -841,24 +1401,14 @@ pub async fn handle_socket(mut socket: WebSocket, state: RelayState) {
                 );
                 break;
             }
-            control = control_rx.recv() => {
-                let Some(outbound) = control else {
-                    break;
-                };
-                if !send_relay_outbound(
-                    &state,
-                    &mut sender,
-                    server_id,
-                    role,
-                    registration.id,
-                    outbound,
-                    &mut heartbeat_debug,
-                    &mut idle_deadline,
-                )
-                .await
-                {
-                    break;
-                }
+            _ = endpoint_close_rx.closed() => {
+                debug!(
+                    server_id = %server_id.0,
+                    ?role,
+                    connection_id = registration.id,
+                    "relay websocket endpoint close signal received"
+                );
+                break;
             }
             inbound = receiver.next() => {
                 let Some(inbound) = inbound else {
@@ -867,33 +1417,31 @@ pub async fn handle_socket(mut socket: WebSocket, state: RelayState) {
                 let inbound = match inbound {
                     Ok(message) => message,
                     Err(error) => {
-                        warn!(
-                            server_id = %server_id.0,
-                            ?role,
-                            connection_id = registration.id,
-                            %error,
-                            heartbeat_debug = ?heartbeat_debug.pending_snapshot(),
-                            "relay websocket receive failed"
+                        log_websocket_receive_failed(
+                            server_id,
+                            role,
+                            registration.id,
+                            &error,
+                            &heartbeat_debug,
                         );
                         break;
                     }
                 };
                 idle_deadline = Instant::now() + WEBSOCKET_IDLE_TIMEOUT;
+                traffic.record_inbound(&inbound);
                 heartbeat_debug.record_inbound(
                     websocket_message_kind(&inbound),
                     websocket_message_bytes(&inbound),
                 );
                 let is_pong = matches!(inbound, Message::Pong(_));
 
-                if !handle_inbound_message(
+                let forward_report = handle_inbound_message(
                     &state,
                     &registration,
-                    &mut sender,
-                    &mut heartbeat_debug,
                     inbound,
-                )
-                .await
-                {
+                );
+                traffic.record_forward(forward_report.report);
+                if !forward_report.should_continue {
                     break;
                 }
                 if is_pong {
@@ -901,53 +1449,92 @@ pub async fn handle_socket(mut socket: WebSocket, state: RelayState) {
                     heartbeat_debug.note_pong_received();
                 }
             }
+            outcome = writer_outcome_rx.recv() => {
+                let Some(outcome) = outcome else {
+                    break;
+                };
+                match outcome {
+                    RelayWriterOutcome::Sent(sent) => {
+                        traffic.record_outbound(sent.frame_kind, sent.frame_len);
+                        heartbeat_debug.record_outbound(sent.frame_kind, sent.frame_len);
+                        if sent.frame_kind == "ping" {
+                            ping_enqueued = false;
+                            heartbeat_debug.note_ping_sent();
+                            pending_pong_deadline = Some(Instant::now() + WEBSOCKET_PONG_DEADLINE);
+                        }
+                        idle_deadline = Instant::now() + WEBSOCKET_IDLE_TIMEOUT;
+                    }
+                    RelayWriterOutcome::Closed | RelayWriterOutcome::Failed => break,
+                }
+            }
             _ = heartbeat.tick(), if heartbeat_enabled => {
-                if pending_pong_deadline.is_none() {
-                    if send_message_with_deadline(
-                        &mut sender,
-                        Message::Ping(Vec::new()),
-                        WEBSOCKET_SEND_DEADLINE,
-                        "relay websocket ping",
-                    )
-                    .await
-                    .is_err()
+                if pending_pong_deadline.is_none() && !ping_enqueued {
+                    if self_sender
+                        .try_send_control(RelayOutbound::Ping(Vec::new()))
+                        .is_err()
                     {
                         break;
                     }
-                    heartbeat_debug.note_ping_sent();
-                    pending_pong_deadline = Some(Instant::now() + WEBSOCKET_PONG_DEADLINE);
-                }
-            }
-            outbound = data_rx.recv() => {
-                let Some(outbound) = outbound else {
-                    break;
-                };
-
-                if !send_relay_outbound(
-                    &state,
-                    &mut sender,
-                    server_id,
-                    role,
-                    registration.id,
-                    outbound,
-                    &mut heartbeat_debug,
-                    &mut idle_deadline,
-                )
-                .await
-                {
-                    break;
+                    ping_enqueued = true;
                 }
             }
         }
     }
 
+    writer_task.abort();
     state.unregister(&registration);
+    if traffic.has_activity() {
+        debug!(
+            server_id = %server_id.0,
+            ?role,
+            connection_id = registration.id,
+            ?traffic,
+            "relay websocket traffic counters"
+        );
+    }
     debug!(
         server_id = %server_id.0,
         ?role,
         connection_id = registration.id,
         "relay websocket unregistered"
     );
+}
+
+fn log_websocket_receive_failed(
+    server_id: ServerId,
+    role: ConnectionRole,
+    connection_id: ConnectionId,
+    error: &axum::Error,
+    heartbeat_debug: &WebSocketHeartbeatDebug,
+) {
+    let error_text = error.to_string();
+    if websocket_receive_failed_is_noisy_client_disconnect(role, &error_text) {
+        debug!(
+            server_id = %server_id.0,
+            ?role,
+            connection_id,
+            %error,
+            heartbeat_debug = ?heartbeat_debug.pending_snapshot(),
+            "relay websocket receive failed"
+        );
+    } else {
+        warn!(
+            server_id = %server_id.0,
+            ?role,
+            connection_id,
+            %error,
+            heartbeat_debug = ?heartbeat_debug.pending_snapshot(),
+            "relay websocket receive failed"
+        );
+    }
+}
+
+fn websocket_receive_failed_is_noisy_client_disconnect(
+    role: ConnectionRole,
+    error_text: &str,
+) -> bool {
+    role == ConnectionRole::Client
+        && error_text.contains("Connection reset without closing handshake")
 }
 
 async fn send_relay_outbound(
@@ -957,21 +1544,45 @@ async fn send_relay_outbound(
     role: ConnectionRole,
     connection_id: ConnectionId,
     outbound: RelayOutbound,
-    heartbeat_debug: &mut WebSocketHeartbeatDebug,
-    idle_deadline: &mut Instant,
-) -> bool {
+    channel: &'static str,
+) -> RelayWriteResult {
     match prepare_relay_outbound(state, server_id, role, connection_id, outbound) {
         PreparedRelayOutbound::Frame(frame) => {
-            send_relay_opaque_frame(
+            send_relay_opaque_frame(sender, server_id, role, connection_id, frame, channel).await
+        }
+        PreparedRelayOutbound::Ping(payload) => {
+            let frame_len = payload.len();
+            match send_message_with_deadline(
                 sender,
-                server_id,
-                role,
-                connection_id,
-                frame,
-                heartbeat_debug,
-                idle_deadline,
+                Message::Ping(payload),
+                WEBSOCKET_SEND_DEADLINE,
+                "relay websocket ping",
             )
             .await
+            {
+                Ok(()) => RelayWriteResult::Sent(SentRelayOutbound {
+                    frame_kind: "ping",
+                    frame_len,
+                }),
+                Err(()) => RelayWriteResult::Failed,
+            }
+        }
+        PreparedRelayOutbound::Pong(payload) => {
+            let frame_len = payload.len();
+            match send_message_with_deadline(
+                sender,
+                Message::Pong(payload),
+                WEBSOCKET_PONG_DEADLINE,
+                "relay websocket pong",
+            )
+            .await
+            {
+                Ok(()) => RelayWriteResult::Sent(SentRelayOutbound {
+                    frame_kind: "pong",
+                    frame_len,
+                }),
+                Err(()) => RelayWriteResult::Failed,
+            }
         }
         PreparedRelayOutbound::Close => {
             let _ = send_message_with_deadline(
@@ -981,9 +1592,9 @@ async fn send_relay_outbound(
                 "relay websocket close",
             )
             .await;
-            false
+            RelayWriteResult::Closed
         }
-        PreparedRelayOutbound::Drop => true,
+        PreparedRelayOutbound::Drop => RelayWriteResult::Dropped,
     }
 }
 
@@ -1022,7 +1633,189 @@ fn prepare_relay_outbound(
             });
             PreparedRelayOutbound::Frame(frame)
         }
+        RelayOutbound::Ping(payload) => PreparedRelayOutbound::Ping(payload),
+        RelayOutbound::Pong(payload) => PreparedRelayOutbound::Pong(payload),
         RelayOutbound::Close => PreparedRelayOutbound::Close,
+    }
+}
+
+async fn run_relay_websocket_writer(
+    state: RelayState,
+    mut sender: futures_util::stream::SplitSink<WebSocket, Message>,
+    server_id: ServerId,
+    role: ConnectionRole,
+    connection_id: ConnectionId,
+    mut control_rx: mpsc::Receiver<RelayOutbound>,
+    mut data_rx: mpsc::Receiver<RelayOutbound>,
+    data_budget: Arc<DataQueueByteBudget>,
+    mut close_rx: EndpointCloseReceiver,
+    outcome_tx: mpsc::UnboundedSender<RelayWriterOutcome>,
+) {
+    let mut prefer_data_once = false;
+    loop {
+        if prefer_data_once {
+            tokio::select! {
+                biased;
+
+                _ = close_rx.closed() => {
+                    write_relay_close_and_report(
+                        &mut sender,
+                        &outcome_tx,
+                    )
+                    .await;
+                    break;
+                }
+                outbound = data_rx.recv() => {
+                    prefer_data_once = false;
+                    let Some(outbound) = outbound else {
+                        break;
+                    };
+                    data_budget.release(outbound.queued_data_bytes());
+                    if !write_relay_outbound_and_report(
+                        &state,
+                        &mut sender,
+                        server_id,
+                        role,
+                        connection_id,
+                        outbound,
+                        "data",
+                        &outcome_tx,
+                    )
+                    .await
+                    {
+                        break;
+                    }
+                }
+                outbound = control_rx.recv() => {
+                    let Some(outbound) = outbound else {
+                        break;
+                    };
+                    prefer_data_once = true;
+                    if !write_relay_outbound_and_report(
+                        &state,
+                        &mut sender,
+                        server_id,
+                        role,
+                        connection_id,
+                        outbound,
+                        "control",
+                        &outcome_tx,
+                    )
+                    .await
+                    {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+
+        tokio::select! {
+            biased;
+
+            _ = close_rx.closed() => {
+                write_relay_close_and_report(
+                    &mut sender,
+                    &outcome_tx,
+                )
+                .await;
+                break;
+            }
+            outbound = control_rx.recv() => {
+                let Some(outbound) = outbound else {
+                    break;
+                };
+                prefer_data_once = true;
+                if !write_relay_outbound_and_report(
+                    &state,
+                    &mut sender,
+                    server_id,
+                    role,
+                    connection_id,
+                    outbound,
+                    "control",
+                    &outcome_tx,
+                )
+                .await
+                {
+                    break;
+                }
+            }
+            outbound = data_rx.recv() => {
+                prefer_data_once = false;
+                let Some(outbound) = outbound else {
+                    break;
+                };
+                data_budget.release(outbound.queued_data_bytes());
+                if !write_relay_outbound_and_report(
+                    &state,
+                    &mut sender,
+                    server_id,
+                    role,
+                    connection_id,
+                    outbound,
+                    "data",
+                    &outcome_tx,
+                )
+                .await
+                {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+async fn write_relay_close_and_report(
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    outcome_tx: &mpsc::UnboundedSender<RelayWriterOutcome>,
+) {
+    // 中文注释：这是独立于 mpsc 队列的关闭路径；队列满时也能尽力发送 close frame，
+    // 并通知读侧退出。真正的 socket 回收由 handle_socket drop/abort 兜底。
+    let _ = send_message_with_deadline(
+        sender,
+        Message::Close(None),
+        WEBSOCKET_SEND_DEADLINE,
+        "relay websocket close signal",
+    )
+    .await;
+    let _ = outcome_tx.send(RelayWriterOutcome::Closed);
+}
+
+async fn write_relay_outbound_and_report(
+    state: &RelayState,
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    server_id: ServerId,
+    role: ConnectionRole,
+    connection_id: ConnectionId,
+    outbound: RelayOutbound,
+    channel: &'static str,
+    outcome_tx: &mpsc::UnboundedSender<RelayWriterOutcome>,
+) -> bool {
+    match send_relay_outbound(
+        state,
+        sender,
+        server_id,
+        role,
+        connection_id,
+        outbound,
+        channel,
+    )
+    .await
+    {
+        RelayWriteResult::Sent(sent) => {
+            let _ = outcome_tx.send(RelayWriterOutcome::Sent(sent));
+            true
+        }
+        RelayWriteResult::Dropped => true,
+        RelayWriteResult::Closed => {
+            let _ = outcome_tx.send(RelayWriterOutcome::Closed);
+            false
+        }
+        RelayWriteResult::Failed => {
+            let _ = outcome_tx.send(RelayWriterOutcome::Failed);
+            false
+        }
     }
 }
 
@@ -1032,9 +1825,8 @@ async fn send_relay_opaque_frame(
     role: ConnectionRole,
     connection_id: ConnectionId,
     frame: OpaqueFrame,
-    heartbeat_debug: &mut WebSocketHeartbeatDebug,
-    idle_deadline: &mut Instant,
-) -> bool {
+    channel: &'static str,
+) -> RelayWriteResult {
     let frame_kind = frame.kind();
     let frame_len = frame.len();
     if send_message_with_deadline(
@@ -1052,13 +1844,15 @@ async fn send_relay_opaque_frame(
             connection_id,
             frame_kind,
             frame_len,
+            channel,
             "relay websocket send failed"
         );
-        return false;
+        return RelayWriteResult::Failed;
     }
-    heartbeat_debug.record_outbound(frame_kind, frame_len);
-    *idle_deadline = Instant::now() + WEBSOCKET_IDLE_TIMEOUT;
-    true
+    RelayWriteResult::Sent(SentRelayOutbound {
+        frame_kind,
+        frame_len,
+    })
 }
 
 async fn read_route_prelude(socket: &mut WebSocket) -> Result<RoutePrelude, RoutePreludeError> {
@@ -1113,6 +1907,7 @@ fn decode_route_prelude(
         server_id: envelope.payload.server_id,
         route_role,
         connection_role: ConnectionRole::from_route_role(route_role),
+        route_generation: envelope.payload.route_generation,
     })
 }
 
@@ -1153,13 +1948,11 @@ async fn send_route_error(
         .map_err(RoutePreludeError::Send)
 }
 
-async fn handle_inbound_message(
+fn handle_inbound_message(
     state: &RelayState,
     registration: &ConnectionRegistration,
-    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
-    heartbeat_debug: &mut WebSocketHeartbeatDebug,
     message: Message,
-) -> bool {
+) -> RelayForwardOutcome {
     match message {
         Message::Text(text) => {
             if let Err(len) = reject_oversized_frame(text.len()) {
@@ -1170,10 +1963,13 @@ async fn handle_inbound_message(
                     frame_len = len,
                     "dropping oversized relay text frame"
                 );
-                return false;
+                return RelayForwardOutcome::close_with(ForwardReport {
+                    attempted: 1,
+                    delivered: 0,
+                    dropped: 1,
+                });
             }
-            forward_opaque(state, registration, OpaqueFrame::Text(text));
-            true
+            forward_opaque(state, registration, OpaqueFrame::Text(text))
         }
         Message::Binary(bytes) => {
             if let Err(len) = reject_oversized_frame(bytes.len()) {
@@ -1184,27 +1980,73 @@ async fn handle_inbound_message(
                     frame_len = len,
                     "dropping oversized relay binary frame"
                 );
-                return false;
+                return RelayForwardOutcome::close_with(ForwardReport {
+                    attempted: 1,
+                    delivered: 0,
+                    dropped: 1,
+                });
             }
-            forward_opaque(state, registration, OpaqueFrame::Binary(bytes));
-            true
+            forward_opaque(state, registration, OpaqueFrame::Binary(bytes))
         }
         Message::Ping(payload) => {
-            let pong_bytes = payload.len();
-            send_message_with_deadline(
-                sender,
-                Message::Pong(payload),
-                WEBSOCKET_PONG_DEADLINE,
-                "relay websocket pong",
-            )
-            .await
-            .map(|_| {
-                heartbeat_debug.record_outbound("pong", pong_bytes);
-            })
-            .is_ok()
+            let Ok(rooms) = state.inner.rooms.lock() else {
+                warn!("relay registry mutex poisoned during ping pong enqueue");
+                return RelayForwardOutcome::close_with(ForwardReport {
+                    attempted: 1,
+                    delivered: 0,
+                    dropped: 1,
+                });
+            };
+            let sender =
+                rooms
+                    .get(&registration.server_id)
+                    .and_then(|room| match registration.role {
+                        ConnectionRole::DaemonMux => {
+                            room.daemon_mux.as_ref().and_then(|endpoint| {
+                                (endpoint.id == registration.id).then_some(endpoint.sender.clone())
+                            })
+                        }
+                        ConnectionRole::Client => room
+                            .clients
+                            .get(&registration.id)
+                            .map(|endpoint| endpoint.sender.clone()),
+                        ConnectionRole::DaemonMuxData => {
+                            room.daemon_mux_data.as_ref().and_then(|endpoint| {
+                                (endpoint.id == registration.id).then_some(endpoint.sender.clone())
+                            })
+                        }
+                    });
+            drop(rooms);
+            let Some(sender) = sender else {
+                return RelayForwardOutcome::close_with(ForwardReport {
+                    attempted: 1,
+                    delivered: 0,
+                    dropped: 1,
+                });
+            };
+            match sender.try_send_control(RelayOutbound::Pong(payload)) {
+                Ok(()) => RelayForwardOutcome::continue_with(ForwardReport {
+                    attempted: 1,
+                    delivered: 1,
+                    dropped: 0,
+                }),
+                Err(_) => RelayForwardOutcome::close_with(ForwardReport {
+                    attempted: 1,
+                    delivered: 0,
+                    dropped: 1,
+                }),
+            }
         }
-        Message::Pong(_) => true,
-        Message::Close(_) => false,
+        Message::Pong(_) => RelayForwardOutcome::continue_with(ForwardReport {
+            attempted: 0,
+            delivered: 0,
+            dropped: 0,
+        }),
+        Message::Close(_) => RelayForwardOutcome::close_with(ForwardReport {
+            attempted: 0,
+            delivered: 0,
+            dropped: 0,
+        }),
     }
 }
 
@@ -1237,53 +2079,91 @@ async fn send_message_with_deadline(
     }
 }
 
-fn forward_opaque(state: &RelayState, registration: &ConnectionRegistration, frame: OpaqueFrame) {
-    let frame_kind = frame.kind();
-    let frame_len = frame.len();
+fn forward_opaque(
+    state: &RelayState,
+    registration: &ConnectionRegistration,
+    frame: OpaqueFrame,
+) -> RelayForwardOutcome {
     let report = state.forward_from(registration, frame);
-
-    debug!(
-        server_id = %registration.server_id.0,
-        ?registration.role,
-        connection_id = registration.id,
-        frame_kind,
-        frame_len,
-        attempted = report.attempted,
-        delivered = report.delivered,
-        dropped = report.dropped,
-        "relay forwarded opaque frame"
-    );
+    let should_continue = !(registration.role == ConnectionRole::Client
+        && report.dropped > 0
+        && !state.has_client(registration.server_id, RelayClientId(registration.id)));
+    // 中文注释：转发是 relay 的最高频路径，不能逐帧写日志；连接关闭时会输出聚合计数。
+    RelayForwardOutcome {
+        report,
+        should_continue,
+    }
 }
 
-fn notify_mux_client_connected(state: &RelayState, registration: &ConnectionRegistration) {
-    let Ok(rooms) = state.inner.rooms.lock() else {
+fn notify_mux_client_connected(
+    state: &RelayState,
+    registration: &ConnectionRegistration,
+) -> Result<(), RelayError> {
+    let Ok(mut rooms) = state.inner.rooms.lock() else {
         warn!("relay registry mutex poisoned during mux connect notify");
-        return;
+        return Err(RelayError::Poisoned);
     };
-    let Some(room) = rooms.get(&registration.server_id) else {
-        return;
+    let Some(room) = rooms.get_mut(&registration.server_id) else {
+        return Err(RelayError::DaemonMuxOffline);
     };
     let Some(daemon_mux) = room.daemon_mux.as_ref() else {
-        return;
+        return Err(RelayError::DaemonMuxOffline);
     };
     let envelope = RelayMuxEnvelope::ClientConnected {
         client_id: RelayClientId(registration.id),
     };
-    let _ = daemon_mux
+    let notify_result = daemon_mux
         .sender
         .try_send_control(RelayOutbound::Frame(mux_envelope_frame(envelope)));
+    match notify_result {
+        Ok(()) => Ok(()),
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            warn!(
+                server_id = %registration.server_id.0,
+                daemon_connection_id = daemon_mux.id,
+                client_connection_id = registration.id,
+                "rejecting relay client because daemon mux control queue is full"
+            );
+            Err(RelayError::DaemonMuxBusy)
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            warn!(
+                server_id = %registration.server_id.0,
+                stale_connection_id = daemon_mux.id,
+                "dropping offline relay daemon mux during client connect notify"
+            );
+            room.clear_daemon_mux_and_dependents();
+            Err(RelayError::DaemonMuxOffline)
+        }
+    }
 }
 
 fn mux_envelope_frame(envelope: RelayMuxEnvelope) -> OpaqueFrame {
-    let raw = serde_json::to_string(&envelope).expect("relay mux envelope should serialize");
-    OpaqueFrame::Text(raw)
+    OpaqueFrame::Binary(
+        encode_binary_relay_mux_envelope(&envelope)
+            .expect("relay mux envelope should encode as binary"),
+    )
+}
+
+fn mux_envelope_from_opaque_frame(
+    frame: OpaqueFrame,
+) -> Result<RelayMuxEnvelope, RelayMuxFrameError> {
+    match frame {
+        OpaqueFrame::Text(raw) => serde_json::from_str::<RelayMuxEnvelope>(&raw)
+            .map_err(|_| RelayMuxFrameError::InvalidEnvelope),
+        OpaqueFrame::Binary(raw) => {
+            decode_binary_relay_mux_envelope(&raw).map_err(|_| RelayMuxFrameError::InvalidEnvelope)
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::router::router;
-    use termd_proto::{Nonce, PROTOCOL_PACKET_VERSION, ProtocolVersion, UnixTimestampMillis};
+    use termd_proto::{
+        Nonce, PROTOCOL_PACKET_VERSION, ProtocolVersion, RouteReadyPayload, UnixTimestampMillis,
+    };
     use tokio::sync::mpsc::error::TryRecvError;
     use tokio::time::{Duration, timeout};
     use tokio_tungstenite::connect_async;
@@ -1294,15 +2174,22 @@ mod tests {
     }
 
     struct TestReceiver {
-        control: mpsc::UnboundedReceiver<RelayOutbound>,
+        control: mpsc::Receiver<RelayOutbound>,
         data: mpsc::Receiver<RelayOutbound>,
+        data_budget: Arc<DataQueueByteBudget>,
     }
 
     impl TestReceiver {
         fn try_recv(&mut self) -> Result<RelayOutbound, TryRecvError> {
             match self.control.try_recv() {
                 Ok(outbound) => Ok(outbound),
-                Err(TryRecvError::Empty) => self.data.try_recv(),
+                Err(TryRecvError::Empty) => match self.data.try_recv() {
+                    Ok(outbound) => {
+                        self.data_budget.release(outbound.queued_data_bytes());
+                        Ok(outbound)
+                    }
+                    Err(error) => Err(error),
+                },
                 Err(error) => Err(error),
             }
         }
@@ -1312,9 +2199,36 @@ mod tests {
         channel_with_data_capacity(DATA_CHANNEL_CAPACITY)
     }
 
+    fn channel_with_control_capacity(control_capacity: usize) -> (FrameSender, TestReceiver) {
+        let (control_tx, control_rx) = mpsc::channel(control_capacity);
+        let (data_tx, data_rx) = mpsc::channel(DATA_CHANNEL_CAPACITY);
+        let data_budget = Arc::new(DataQueueByteBudget::new(DATA_CHANNEL_BYTE_BUDGET));
+        (
+            FrameSender {
+                control: control_tx,
+                data: data_tx,
+                data_budget: data_budget.clone(),
+                close_signal: EndpointCloseSignal::new(),
+            },
+            TestReceiver {
+                control: control_rx,
+                data: data_rx,
+                data_budget,
+            },
+        )
+    }
+
     fn channel_with_data_capacity(data_capacity: usize) -> (FrameSender, TestReceiver) {
         let (sender, control, data) = FrameSender::channel(data_capacity);
-        (sender, TestReceiver { control, data })
+        let data_budget = sender.data_budget.clone();
+        (
+            sender,
+            TestReceiver {
+                control,
+                data,
+                data_budget,
+            },
+        )
     }
 
     fn client_route_hello(server_id: ServerId) -> Envelope<RouteHelloPayload> {
@@ -1325,9 +2239,52 @@ mod tests {
                 role: RouteRole::Client,
                 protocol_version: ProtocolVersion(PROTOCOL_PACKET_VERSION),
                 nonce: Nonce("test-route".to_owned()),
+                route_generation: None,
                 timestamp_ms: UnixTimestampMillis(1_000),
             },
         )
+    }
+
+    async fn register_test_route(
+        socket: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        server_id: ServerId,
+        role: RouteRole,
+    ) {
+        let hello = Envelope::new(
+            MessageType::RouteHello,
+            RouteHelloPayload {
+                server_id,
+                role,
+                protocol_version: ProtocolVersion(PROTOCOL_PACKET_VERSION),
+                nonce: Nonce("test-route".to_owned()),
+                route_generation: match role {
+                    RouteRole::DaemonMux | RouteRole::DaemonMuxData => {
+                        Some(Nonce("test-route-generation".to_owned()))
+                    }
+                    RouteRole::Client => None,
+                },
+                timestamp_ms: UnixTimestampMillis(1_000),
+            },
+        );
+        socket
+            .send(ClientMessage::Text(serde_json::to_string(&hello).unwrap()))
+            .await
+            .unwrap();
+
+        let next = timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("relay should answer route_ready")
+            .expect("relay websocket should stay open")
+            .expect("route_ready frame should be valid");
+        let ClientMessage::Text(raw) = next else {
+            panic!("expected route_ready text frame, got {next:?}");
+        };
+        let ready: Envelope<RouteReadyPayload> = serde_json::from_str(&raw).unwrap();
+        assert_eq!(ready.kind, MessageType::RouteReady);
+        assert_eq!(ready.payload.server_id, server_id);
+        assert_eq!(ready.payload.role, role);
     }
 
     #[test]
@@ -1365,6 +2322,26 @@ mod tests {
     fn websocket_heartbeat_is_not_active_for_daemon_mux_trunk() {
         assert!(!websocket_heartbeat_enabled(ConnectionRole::DaemonMux));
         assert!(websocket_heartbeat_enabled(ConnectionRole::Client));
+        assert!(!websocket_idle_timeout_enabled(ConnectionRole::DaemonMux));
+        assert!(websocket_idle_timeout_enabled(ConnectionRole::Client));
+    }
+
+    #[test]
+    fn client_reset_without_close_is_debug_noise_not_daemon_mux_warning() {
+        let reset = "WebSocket protocol error: Connection reset without closing handshake";
+
+        assert!(websocket_receive_failed_is_noisy_client_disconnect(
+            ConnectionRole::Client,
+            reset
+        ));
+        assert!(!websocket_receive_failed_is_noisy_client_disconnect(
+            ConnectionRole::DaemonMux,
+            reset
+        ));
+        assert!(!websocket_receive_failed_is_noisy_client_disconnect(
+            ConnectionRole::Client,
+            "WebSocket protocol error: protocol violation"
+        ));
     }
 
     #[tokio::test]
@@ -1417,6 +2394,65 @@ mod tests {
         server.abort();
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn daemon_mux_inbound_is_read_while_outbound_to_daemon_is_backpressured() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router(RelayState::default(), false))
+                .await
+                .unwrap();
+        });
+        let server_id = server_id(9001);
+        let url = format!("ws://{addr}/ws");
+        let (mut daemon_mux, _daemon_response) = connect_async(url.clone()).await.unwrap();
+        register_test_route(&mut daemon_mux, server_id, RouteRole::DaemonMux).await;
+        let (mut daemon_tx, _daemon_rx) = daemon_mux.split();
+
+        let (mut noisy_client, _noisy_response) = connect_async(url.clone()).await.unwrap();
+        register_test_route(&mut noisy_client, server_id, RouteRole::Client).await;
+        let (mut fresh_client, _fresh_response) = connect_async(url).await.unwrap();
+        register_test_route(&mut fresh_client, server_id, RouteRole::Client).await;
+
+        let noisy_payload = vec![b'x'; WEBSOCKET_MAX_FRAME_SIZE / 2];
+        for _ in 0..384 {
+            if noisy_client
+                .send(ClientMessage::Binary(noisy_payload.clone()))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // 连接 id 在这个独立 RelayState 内按注册顺序递增：
+        // daemon_mux=1、noisy_client=2、fresh_client=3。
+        let fresh_frame = RelayMuxEnvelope::DaemonFrame {
+            client_id: RelayClientId(3),
+            frame: RelayOpaqueFrame::Text {
+                data: "fresh-client-ready".to_owned(),
+            },
+        };
+        daemon_tx
+            .send(ClientMessage::Binary(
+                encode_binary_relay_mux_envelope(&fresh_frame).unwrap(),
+            ))
+            .await
+            .unwrap();
+
+        let received = timeout(Duration::from_millis(500), fresh_client.next())
+            .await
+            .expect("daemon->client frame must not wait behind client->daemon backpressure")
+            .expect("fresh client websocket should stay open")
+            .expect("fresh client frame should be valid");
+        assert_eq!(
+            received,
+            ClientMessage::Text("fresh-client-ready".to_owned())
+        );
+        server.abort();
+    }
+
     #[test]
     fn room_registers_one_daemon_mux_and_many_clients() {
         let state = RelayState::default();
@@ -1460,6 +2496,152 @@ mod tests {
         assert_eq!(second.role, ConnectionRole::DaemonMux);
         assert_eq!(first_rx.try_recv().unwrap(), RelayOutbound::Close);
         assert_eq!(client_rx.try_recv().unwrap(), RelayOutbound::Close);
+    }
+
+    #[test]
+    fn room_rejects_daemon_mux_data_before_control_mux() {
+        let state = RelayState::default();
+        let (data_tx, _data_rx) = channel();
+
+        let error = state
+            .register(server_id(1), ConnectionRole::DaemonMuxData, data_tx)
+            .unwrap_err();
+
+        assert_eq!(error, RelayError::DaemonMuxOffline);
+        assert_eq!(state.room_count(), 0);
+    }
+
+    #[test]
+    fn daemon_mux_data_disconnect_does_not_close_clients_or_control_mux() {
+        let state = RelayState::default();
+        let server_id = server_id(1);
+        let (mux_tx, mut mux_rx) = channel();
+        let (data_tx, _data_rx) = channel();
+        let (client_tx, mut client_rx) = channel();
+
+        state
+            .register(server_id, ConnectionRole::DaemonMux, mux_tx)
+            .unwrap();
+        let data = state
+            .register(server_id, ConnectionRole::DaemonMuxData, data_tx)
+            .unwrap();
+        let client = state
+            .register(server_id, ConnectionRole::Client, client_tx)
+            .unwrap();
+
+        state.unregister(&data);
+        let report = state.forward_from(&client, OpaqueFrame::Text("input".to_owned()));
+
+        assert_eq!(report.delivered, 1);
+        assert_eq!(
+            decode_mux(mux_rx.try_recv().unwrap()),
+            RelayMuxEnvelope::ClientFrame {
+                client_id: RelayClientId(client.id),
+                frame: RelayOpaqueFrame::Text {
+                    data: "input".to_owned()
+                },
+            }
+        );
+        assert_eq!(client_rx.try_recv().unwrap_err(), TryRecvError::Empty);
+    }
+
+    #[test]
+    fn daemon_mux_disconnect_closes_data_channel_and_clients() {
+        let state = RelayState::default();
+        let server = server_id(1);
+        let (mux_tx, _mux_rx) = channel();
+        let (data_tx, mut data_rx) = channel();
+        let (client_tx, mut client_rx) = channel();
+
+        let daemon_mux = state
+            .register(server, ConnectionRole::DaemonMux, mux_tx)
+            .unwrap();
+        state
+            .register(server, ConnectionRole::DaemonMuxData, data_tx)
+            .unwrap();
+        state
+            .register(server, ConnectionRole::Client, client_tx)
+            .unwrap();
+
+        state.unregister(&daemon_mux);
+
+        assert_eq!(data_rx.try_recv().unwrap(), RelayOutbound::Close);
+        assert_eq!(client_rx.try_recv().unwrap(), RelayOutbound::Close);
+        assert_eq!(state.room_count(), 0);
+    }
+
+    #[test]
+    fn replacing_control_mux_closes_stale_data_and_stale_data_cannot_forward() {
+        let state = RelayState::default();
+        let server = server_id(1);
+        let (first_mux_tx, mut first_mux_rx) = channel();
+        let (data_tx, mut data_rx) = channel();
+        let (second_mux_tx, _second_mux_rx) = channel();
+        let (client_tx, mut client_rx) = channel();
+
+        state
+            .register(server, ConnectionRole::DaemonMux, first_mux_tx)
+            .unwrap();
+        let stale_data = state
+            .register(server, ConnectionRole::DaemonMuxData, data_tx)
+            .unwrap();
+        state
+            .register(server, ConnectionRole::DaemonMux, second_mux_tx)
+            .unwrap();
+        let client = state
+            .register(server, ConnectionRole::Client, client_tx)
+            .unwrap();
+
+        let stale_frame = mux_envelope_frame(RelayMuxEnvelope::DaemonFrame {
+            client_id: RelayClientId(client.id),
+            frame: RelayOpaqueFrame::Text {
+                data: "stale-output".to_owned(),
+            },
+        });
+        let report = state.forward_from(&stale_data, stale_frame);
+
+        assert_eq!(first_mux_rx.try_recv().unwrap(), RelayOutbound::Close);
+        assert_eq!(data_rx.try_recv().unwrap(), RelayOutbound::Close);
+        assert_eq!(report.dropped, 1);
+        assert_eq!(client_rx.try_recv().unwrap_err(), TryRecvError::Empty);
+    }
+
+    #[test]
+    fn replacing_daemon_mux_data_closes_only_old_data() {
+        let state = RelayState::default();
+        let server = server_id(1);
+        let (mux_tx, _mux_rx) = channel();
+        let (old_data_tx, mut old_data_rx) = channel();
+        let (new_data_tx, _new_data_rx) = channel();
+        let (client_tx, mut client_rx) = channel();
+
+        state
+            .register(server, ConnectionRole::DaemonMux, mux_tx)
+            .unwrap();
+        state
+            .register(server, ConnectionRole::DaemonMuxData, old_data_tx)
+            .unwrap();
+        let new_data = state
+            .register(server, ConnectionRole::DaemonMuxData, new_data_tx)
+            .unwrap();
+        let client = state
+            .register(server, ConnectionRole::Client, client_tx)
+            .unwrap();
+
+        let response = mux_envelope_frame(RelayMuxEnvelope::DaemonFrame {
+            client_id: RelayClientId(client.id),
+            frame: RelayOpaqueFrame::Text {
+                data: "fresh-output".to_owned(),
+            },
+        });
+        let report = state.forward_from(&new_data, response);
+
+        assert_eq!(old_data_rx.try_recv().unwrap(), RelayOutbound::Close);
+        assert_eq!(report.delivered, 1);
+        assert_eq!(
+            client_rx.try_recv().unwrap(),
+            RelayOutbound::Frame(OpaqueFrame::Text("fresh-output".to_owned()))
+        );
     }
 
     #[test]
@@ -1560,7 +2742,7 @@ mod tests {
         let client = state
             .register(server_id, ConnectionRole::Client, client_tx)
             .unwrap();
-        notify_mux_client_connected(&state, &client);
+        notify_mux_client_connected(&state, &client).unwrap();
 
         assert_eq!(
             decode_mux(mux_rx.try_recv().unwrap()),
@@ -1629,6 +2811,87 @@ mod tests {
     }
 
     #[test]
+    fn mux_daemon_data_frame_goes_only_to_target_client() {
+        let state = RelayState::default();
+        let server_id = server_id(1);
+        let (mux_tx, _mux_rx) = channel();
+        let (data_tx, _data_rx) = channel();
+        let (client_a_tx, mut client_a_rx) = channel();
+        let (client_b_tx, mut client_b_rx) = channel();
+
+        state
+            .register(server_id, ConnectionRole::DaemonMux, mux_tx)
+            .unwrap();
+        let data = state
+            .register(server_id, ConnectionRole::DaemonMuxData, data_tx)
+            .unwrap();
+        let client_a = state
+            .register(server_id, ConnectionRole::Client, client_a_tx)
+            .unwrap();
+        state
+            .register(server_id, ConnectionRole::Client, client_b_tx)
+            .unwrap();
+
+        let response = mux_envelope_frame(RelayMuxEnvelope::DaemonFrame {
+            client_id: RelayClientId(client_a.id),
+            frame: RelayOpaqueFrame::Binary {
+                data_base64: "AQIDBA==".to_owned(),
+            },
+        });
+        let report = state.forward_from(&data, response);
+
+        assert_eq!(report.delivered, 1);
+        assert_eq!(
+            client_a_rx.try_recv().unwrap(),
+            RelayOutbound::Frame(OpaqueFrame::Binary(vec![1, 2, 3, 4]))
+        );
+        assert_eq!(client_b_rx.try_recv().unwrap_err(), TryRecvError::Empty);
+    }
+
+    #[test]
+    fn mux_daemon_keepalive_is_ignored_without_touching_clients() {
+        let state = RelayState::default();
+        let server_id = server_id(1);
+        let (mux_tx, mut mux_rx) = channel();
+        let (client_tx, mut client_rx) = channel();
+
+        let mux = state
+            .register(server_id, ConnectionRole::DaemonMux, mux_tx)
+            .unwrap();
+        state
+            .register(server_id, ConnectionRole::Client, client_tx)
+            .unwrap();
+
+        let report = state.forward_from(
+            &mux,
+            mux_envelope_frame(RelayMuxEnvelope::Keepalive { nonce: 42 }),
+        );
+
+        assert_eq!(report.delivered, 0);
+        assert_eq!(report.dropped, 0);
+        assert_eq!(mux_rx.try_recv().unwrap_err(), TryRecvError::Empty);
+        assert_eq!(client_rx.try_recv().unwrap_err(), TryRecvError::Empty);
+    }
+
+    #[test]
+    fn relay_mux_uses_binary_frame_for_opaque_binary_payload() {
+        let envelope = RelayMuxEnvelope::ClientFrame {
+            client_id: RelayClientId(7),
+            frame: RelayOpaqueFrame::Binary {
+                data_base64: "AQIDBA==".to_owned(),
+            },
+        };
+        let frame = mux_envelope_frame(envelope.clone());
+        let OpaqueFrame::Binary(raw) = &frame else {
+            panic!("expected binary mux frame");
+        };
+
+        assert!(!String::from_utf8_lossy(raw).contains("data_base64"));
+        assert!(raw.ends_with(&[1, 2, 3, 4]));
+        assert_eq!(mux_envelope_from_opaque_frame(frame).unwrap(), envelope);
+    }
+
+    #[test]
     fn slow_client_drop_notifies_daemon_mux() {
         let state = RelayState::default();
         let server_id = server_id(1);
@@ -1663,6 +2926,196 @@ mod tests {
     }
 
     #[test]
+    fn slow_client_disconnect_closes_daemon_mux_when_lifecycle_queue_is_full() {
+        let state = RelayState::default();
+        let server_id = server_id(1);
+        let (mux_tx, mut mux_rx) = channel_with_control_capacity(1);
+        let (client_tx, _client_rx) = channel_with_data_capacity(1);
+
+        mux_tx
+            .try_send_control(RelayOutbound::Ping(Vec::new()))
+            .unwrap();
+        client_tx
+            .try_send(RelayOutbound::Frame(OpaqueFrame::Text("queued".to_owned())))
+            .unwrap();
+        let mux = state
+            .register(server_id, ConnectionRole::DaemonMux, mux_tx)
+            .unwrap();
+        let client = state
+            .register(server_id, ConnectionRole::Client, client_tx)
+            .unwrap();
+
+        let response = mux_envelope_frame(RelayMuxEnvelope::DaemonFrame {
+            client_id: RelayClientId(client.id),
+            frame: RelayOpaqueFrame::Text {
+                data: "response".to_owned(),
+            },
+        });
+        let report = state.forward_from(&mux, response);
+
+        assert_eq!(report.dropped, 1);
+        assert!(!state.has_client(server_id, RelayClientId(client.id)));
+        assert_eq!(
+            state.forward_from(
+                &mux,
+                mux_envelope_frame(RelayMuxEnvelope::DaemonFrame {
+                    client_id: RelayClientId(client.id),
+                    frame: RelayOpaqueFrame::Text {
+                        data: "late".to_owned(),
+                    },
+                }),
+            ),
+            ForwardReport {
+                attempted: 1,
+                delivered: 0,
+                dropped: 1
+            }
+        );
+        assert_eq!(mux_rx.try_recv().unwrap(), RelayOutbound::Ping(Vec::new()));
+    }
+
+    #[test]
+    fn client_connect_reports_busy_when_daemon_mux_lifecycle_queue_is_full() {
+        let state = RelayState::default();
+        let server_id = server_id(1);
+        let (mux_tx, _mux_rx) = channel_with_control_capacity(1);
+        let (client_tx, _client_rx) = channel();
+
+        mux_tx
+            .try_send_control(RelayOutbound::Ping(Vec::new()))
+            .unwrap();
+        state
+            .register(server_id, ConnectionRole::DaemonMux, mux_tx)
+            .unwrap();
+        let client = state
+            .register(server_id, ConnectionRole::Client, client_tx)
+            .unwrap();
+
+        let error = notify_mux_client_connected(&state, &client).unwrap_err();
+
+        // 中文注释：daemon mux 在线但 lifecycle/control 队列满是 backpressure，
+        // 不能伪装成 offline，否则 Web 会进入错误的重连/离线提示路径。
+        assert_eq!(error, RelayError::DaemonMuxBusy);
+    }
+
+    #[tokio::test]
+    async fn endpoint_close_signal_terminates_even_when_control_queue_is_full() {
+        let (sender, mut receiver) = channel_with_control_capacity(1);
+        let mut close_rx = sender.subscribe_close();
+
+        sender
+            .try_send_control(RelayOutbound::Ping(Vec::new()))
+            .unwrap();
+        assert!(matches!(
+            sender.try_send_control(RelayOutbound::Close),
+            Err(mpsc::error::TrySendError::Full(RelayOutbound::Close))
+        ));
+
+        sender.close_endpoint();
+
+        timeout(Duration::from_millis(50), close_rx.closed())
+            .await
+            .expect("endpoint close signal should not wait for queue capacity");
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            RelayOutbound::Ping(Vec::new())
+        );
+        assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
+    }
+
+    #[tokio::test]
+    async fn daemon_mux_cleanup_signals_dependents_even_when_close_queues_are_full() {
+        let state = RelayState::default();
+        let server = server_id(1);
+        let (mux_tx, mut mux_rx) = channel_with_control_capacity(1);
+        let (data_tx, mut data_rx) = channel_with_control_capacity(1);
+        let (client_tx, mut client_rx) = channel_with_control_capacity(1);
+        let mut mux_close_rx = mux_tx.subscribe_close();
+        let mut data_close_rx = data_tx.subscribe_close();
+        let mut client_close_rx = client_tx.subscribe_close();
+
+        mux_tx
+            .try_send_control(RelayOutbound::Ping(Vec::new()))
+            .unwrap();
+        data_tx
+            .try_send_control(RelayOutbound::Ping(Vec::new()))
+            .unwrap();
+        client_tx
+            .try_send_control(RelayOutbound::Ping(Vec::new()))
+            .unwrap();
+        let daemon_mux = state
+            .register(server, ConnectionRole::DaemonMux, mux_tx)
+            .unwrap();
+        state
+            .register(server, ConnectionRole::DaemonMuxData, data_tx)
+            .unwrap();
+        state
+            .register(server, ConnectionRole::Client, client_tx)
+            .unwrap();
+
+        state.unregister(&daemon_mux);
+
+        timeout(Duration::from_millis(50), mux_close_rx.closed())
+            .await
+            .expect("daemon mux close signal should bypass its full control queue");
+        timeout(Duration::from_millis(50), data_close_rx.closed())
+            .await
+            .expect("daemon data close signal should bypass its full control queue");
+        timeout(Duration::from_millis(50), client_close_rx.closed())
+            .await
+            .expect("client close signal should bypass its full control queue");
+        assert_eq!(mux_rx.try_recv().unwrap(), RelayOutbound::Ping(Vec::new()));
+        assert_eq!(data_rx.try_recv().unwrap(), RelayOutbound::Ping(Vec::new()));
+        assert_eq!(
+            client_rx.try_recv().unwrap(),
+            RelayOutbound::Ping(Vec::new())
+        );
+        assert_no_queued_close(&mut mux_rx);
+        assert_no_queued_close(&mut data_rx);
+        assert_no_queued_close(&mut client_rx);
+        assert_eq!(state.room_count(), 0);
+    }
+
+    #[test]
+    fn data_queue_rejects_large_frames_by_byte_budget_before_frame_capacity() {
+        let (sender, mut receiver) = channel_with_data_capacity(DATA_CHANNEL_CAPACITY);
+        let frame = RelayOutbound::Frame(OpaqueFrame::Binary(vec![7; WEBSOCKET_MAX_FRAME_SIZE]));
+
+        for _ in 0..8 {
+            sender.try_send(frame.clone()).unwrap();
+        }
+
+        assert!(matches!(
+            sender.try_send(frame.clone()),
+            Err(mpsc::error::TrySendError::Full(_))
+        ));
+        assert_eq!(receiver.try_recv().unwrap(), frame);
+        sender.try_send(frame).unwrap();
+    }
+
+    #[test]
+    fn relay_traffic_counters_aggregate_forwarded_frames() {
+        let mut traffic = RelayConnectionTraffic::default();
+
+        traffic.record_inbound(&Message::Binary(vec![1, 2, 3]));
+        traffic.record_outbound("text", 5);
+        traffic.record_forward(ForwardReport {
+            attempted: 2,
+            delivered: 1,
+            dropped: 1,
+        });
+
+        assert!(traffic.has_activity());
+        assert_eq!(traffic.in_binary.calls, 1);
+        assert_eq!(traffic.in_binary.bytes, 3);
+        assert_eq!(traffic.out_text.calls, 1);
+        assert_eq!(traffic.out_text.bytes, 5);
+        assert_eq!(traffic.forwarded_attempted, 2);
+        assert_eq!(traffic.forwarded_delivered, 1);
+        assert_eq!(traffic.forwarded_dropped, 1);
+    }
+
+    #[test]
     fn client_disconnect_bypasses_full_daemon_mux_data_queue() {
         let state = RelayState::default();
         let server_id = server_id(1);
@@ -1685,6 +3138,56 @@ mod tests {
         state.unregister(&client);
 
         // 断开事件必须走控制队列并抢在普通业务帧前面，否则 daemon 会继续保留 stale watcher。
+        assert_eq!(
+            decode_mux(mux_rx.try_recv().unwrap()),
+            RelayMuxEnvelope::ClientDisconnected {
+                client_id: RelayClientId(client.id)
+            }
+        );
+        assert_eq!(
+            mux_rx.try_recv().unwrap(),
+            RelayOutbound::MuxClientFrame {
+                client_id: RelayClientId(999),
+                frame: OpaqueFrame::Text("queued-data".to_owned())
+            }
+        );
+    }
+
+    #[test]
+    fn full_daemon_mux_data_queue_drops_only_current_client() {
+        let state = RelayState::default();
+        let server_id = server_id(1);
+        let (mux_tx, mut mux_rx) = channel_with_data_capacity(1);
+        let (client_tx, mut client_rx) = channel();
+        let (other_client_tx, mut other_client_rx) = channel();
+
+        mux_tx
+            .try_send(RelayOutbound::MuxClientFrame {
+                client_id: RelayClientId(999),
+                frame: OpaqueFrame::Text("queued-data".to_owned()),
+            })
+            .unwrap();
+        state
+            .register(server_id, ConnectionRole::DaemonMux, mux_tx)
+            .unwrap();
+        let client = state
+            .register(server_id, ConnectionRole::Client, client_tx)
+            .unwrap();
+        let other_client = state
+            .register(server_id, ConnectionRole::Client, other_client_tx)
+            .unwrap();
+
+        let report = state.forward_from(&client, OpaqueFrame::Text("overflow".to_owned()));
+
+        assert_eq!(report.attempted, 1);
+        assert_eq!(report.delivered, 0);
+        assert_eq!(report.dropped, 1);
+        assert_eq!(client_rx.try_recv().unwrap(), RelayOutbound::Close);
+        assert_eq!(other_client_rx.try_recv().unwrap_err(), TryRecvError::Empty);
+
+        // daemon mux data 队列满只是背压，不是 daemon 离线；其他 client 仍应能留在 room 中。
+        assert!(state.has_client(server_id, RelayClientId(other_client.id)));
+        assert!(!state.has_client(server_id, RelayClientId(client.id)));
         assert_eq!(
             decode_mux(mux_rx.try_recv().unwrap()),
             RelayMuxEnvelope::ClientDisconnected {
@@ -1794,19 +3297,27 @@ mod tests {
     }
 
     fn decode_mux(outbound: RelayOutbound) -> RelayMuxEnvelope {
-        let raw = match outbound {
-            RelayOutbound::Frame(OpaqueFrame::Text(raw)) => raw,
+        match outbound {
+            RelayOutbound::Frame(frame) => return mux_envelope_from_opaque_frame(frame).unwrap(),
             RelayOutbound::MuxClientFrame { client_id, frame } => {
                 let envelope = RelayMuxEnvelope::ClientFrame {
                     client_id,
                     frame: frame.into(),
                 };
-                serde_json::to_string(&envelope).expect("mux envelope should encode")
+                return envelope;
             }
             other => {
-                panic!("expected mux text envelope, got {other:?}");
+                panic!("expected mux envelope, got {other:?}");
             }
-        };
-        serde_json::from_str(&raw).expect("mux envelope should decode")
+        }
+    }
+
+    fn assert_no_queued_close(receiver: &mut TestReceiver) {
+        // 中文注释：sender 被 room 清理后可能已经 drop；Empty 和 Disconnected 都说明
+        // 没有把 Close 硬塞进已满队列，endpoint 退出依赖的是独立 close 信号。
+        match receiver.try_recv() {
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => {}
+            other => panic!("expected no queued close frame, got {other:?}"),
+        }
     }
 }

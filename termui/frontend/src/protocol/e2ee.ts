@@ -17,11 +17,21 @@ const X25519_WIRE_PREFIX = "x25519-v1:";
 const PROTOCOL_LABEL = encodeUtf8("termd-e2ee-v1");
 const CLIENT_TO_SERVER_INFO = encodeUtf8("termd-e2ee-v1/client-to-server");
 const SERVER_TO_CLIENT_INFO = encodeUtf8("termd-e2ee-v1/server-to-client");
+const BINARY_E2EE_FRAME_MAGIC = new Uint8Array([0x54, 0x44, 0x32, 0x45]); // TD2E
+const BINARY_E2EE_FRAME_VERSION = 1;
+const BINARY_E2EE_FRAME_KIND_ENCRYPTED = 1;
+const BINARY_E2EE_FRAME_HEADER_LEN = 32;
 
 export interface E2eeKeyPair {
   secretKey: Uint8Array;
   publicKey: Uint8Array;
   publicKeyWire: PublicKeyWire;
+}
+
+export interface BinaryEncryptedFramePayload {
+  server_id: UUID;
+  sequence: number;
+  ciphertext: Uint8Array;
 }
 
 interface E2eeContext {
@@ -113,19 +123,21 @@ export class E2eeSession {
   }
 
   encryptJson(inner: Envelope): EncryptedFramePayload {
-    const sequence = this.nextSendSequence;
     const plaintext = encodeUtf8(JSON.stringify(inner));
-    const ciphertext = chacha20poly1305(
-      this.sendKey,
-      sequenceNonce(sequence),
-      associatedData(this.context, sequence),
-    ).encrypt(plaintext);
-
-    this.nextSendSequence += 1;
+    const { sequence, ciphertext } = this.encryptCiphertext(plaintext);
     return {
       server_id: this.context.serverId,
       sequence,
       ciphertext_base64: bytesToBase64(ciphertext),
+    };
+  }
+
+  encryptBinary(plaintext: Uint8Array): BinaryEncryptedFramePayload {
+    const { sequence, ciphertext } = this.encryptCiphertext(plaintext);
+    return {
+      server_id: this.context.serverId,
+      sequence,
+      ciphertext,
     };
   }
 
@@ -134,26 +146,46 @@ export class E2eeSession {
     return parseEnvelope(new TextDecoder().decode(plaintext));
   }
 
-  private decryptBytes(frame: EncryptedFramePayload): Uint8Array {
-    if (frame.server_id !== this.context.serverId) {
-      throw new Error("server_id mismatch");
-    }
-    if (frame.sequence !== this.nextReceiveSequence) {
-      throw new Error(`unexpected sequence: expected ${this.nextReceiveSequence}, received ${frame.sequence}`);
-    }
+  decryptBinary(frame: BinaryEncryptedFramePayload): Uint8Array {
+    return this.decryptCiphertext(frame.server_id, frame.sequence, frame.ciphertext);
+  }
 
+  private encryptCiphertext(plaintext: Uint8Array): { sequence: number; ciphertext: Uint8Array } {
+    const sequence = this.nextSendSequence;
+    const ciphertext = chacha20poly1305(
+      this.sendKey,
+      sequenceNonce(sequence),
+      associatedData(this.context, sequence),
+    ).encrypt(plaintext);
+
+    this.nextSendSequence += 1;
+    return { sequence, ciphertext };
+  }
+
+  private decryptBytes(frame: EncryptedFramePayload): Uint8Array {
     let ciphertext: Uint8Array;
     try {
       ciphertext = base64ToBytes(frame.ciphertext_base64);
     } catch (error) {
       throw new Error("decrypt failed", { cause: error });
     }
+    return this.decryptCiphertext(frame.server_id, frame.sequence, ciphertext);
+  }
+
+  private decryptCiphertext(serverId: UUID, sequence: number, ciphertext: Uint8Array): Uint8Array {
+    if (serverId !== this.context.serverId) {
+      throw new Error("server_id mismatch");
+    }
+    if (sequence !== this.nextReceiveSequence) {
+      throw new Error(`unexpected sequence: expected ${this.nextReceiveSequence}, received ${sequence}`);
+    }
+
     let plaintext: Uint8Array;
     try {
       plaintext = chacha20poly1305(
         this.receiveKey,
-        sequenceNonce(frame.sequence),
-        associatedData(this.context, frame.sequence),
+        sequenceNonce(sequence),
+        associatedData(this.context, sequence),
       ).decrypt(ciphertext);
     } catch (error) {
       // 解密失败不得推进 receive sequence，否则攻击者可用坏帧造成后续合法帧失序。
@@ -163,6 +195,43 @@ export class E2eeSession {
     this.nextReceiveSequence += 1;
     return plaintext;
   }
+}
+
+export function encodeBinaryEncryptedFrame(frame: BinaryEncryptedFramePayload): Uint8Array {
+  const wire = new Uint8Array(BINARY_E2EE_FRAME_HEADER_LEN + frame.ciphertext.length);
+  wire.set(BINARY_E2EE_FRAME_MAGIC, 0);
+  wire[4] = BINARY_E2EE_FRAME_VERSION;
+  wire[5] = BINARY_E2EE_FRAME_KIND_ENCRYPTED;
+  wire.set(uuidToBytes(frame.server_id), 8);
+  new DataView(wire.buffer, wire.byteOffset + 24, 8).setBigUint64(0, BigInt(frame.sequence), false);
+  wire.set(frame.ciphertext, BINARY_E2EE_FRAME_HEADER_LEN);
+  return wire;
+}
+
+export function decodeBinaryEncryptedFrame(wire: Uint8Array): BinaryEncryptedFramePayload {
+  if (
+    wire.length < BINARY_E2EE_FRAME_HEADER_LEN ||
+    !BINARY_E2EE_FRAME_MAGIC.every((byte, index) => wire[index] === byte) ||
+    wire[4] !== BINARY_E2EE_FRAME_VERSION ||
+    wire[5] !== BINARY_E2EE_FRAME_KIND_ENCRYPTED ||
+    wire[6] !== 0 ||
+    wire[7] !== 0
+  ) {
+    throw new Error("invalid_binary_e2ee_frame");
+  }
+  return {
+    server_id: bytesToUuid(wire.subarray(8, 24)),
+    sequence: Number(new DataView(wire.buffer, wire.byteOffset + 24, 8).getBigUint64(0, false)),
+    ciphertext: wire.slice(BINARY_E2EE_FRAME_HEADER_LEN),
+  };
+}
+
+function bytesToUuid(bytes: Uint8Array): UUID {
+  if (bytes.length !== 16) {
+    throw new Error("invalid_uuid");
+  }
+  const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
 function deriveDirectionKeys(

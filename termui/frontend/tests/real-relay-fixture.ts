@@ -1,10 +1,11 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { mkdir, rm } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { request } from "node:http";
-import { connect, createServer } from "node:net";
+import { connect, createServer, type Socket } from "node:net";
+import WebSocket from "ws";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, "../../..");
@@ -18,21 +19,96 @@ interface StartedProcess {
 export interface RealRelayFixture {
   token: string;
   relayClientUrl: string;
+  relayWebUrl: string;
   serverId: string;
   daemonPublicKey: string;
+  diagnostics: () => string;
+  issuePairingToken: () => Promise<string>;
+  interruptRelayMux: () => Promise<void>;
+  waitForRelayReady: () => Promise<void>;
   stop: () => Promise<void>;
 }
 
-export async function startRealRelayFixture(): Promise<RealRelayFixture> {
+interface RealRelayFixtureOptions {
+  daemonToRelayLatencyMs?: number;
+  relayToDaemonLatencyMs?: number;
+  daemonToRelayJitterMs?: number;
+  relayToDaemonJitterMs?: number;
+  daemonToRelayBytesPerSecond?: number;
+  relayToDaemonBytesPerSecond?: number;
+  blackoutAfterMs?: number;
+  blackoutDurationMs?: number;
+  enableRelayInterrupt?: boolean;
+}
+
+interface LatencyProxy {
+  listenPort: number;
+  diagnostics: () => string;
+  interruptConnections: () => Promise<void>;
+  stop: () => Promise<void>;
+}
+
+interface LinkRules {
+  latencyMs: number;
+  jitterMs: number;
+  bytesPerSecond?: number;
+  blackoutAfterMs?: number;
+  blackoutDurationMs?: number;
+}
+
+export async function startRealRelayFixture(options: RealRelayFixtureOptions = {}): Promise<RealRelayFixture> {
   const termdPort = await pickFreePort();
   const termdHttp = `http://127.0.0.1:${termdPort}`;
   const relayPort = await pickFreePort();
   const relayAddr = `127.0.0.1:${relayPort}`;
-  const tempDir = path.join(tmpdir(), `termd-web-relay-${Date.now()}-${Math.random().toString(16).slice(2)}`);
-  await mkdir(tempDir, { recursive: true });
+  let relayForDaemon = relayAddr;
+  let latencyProxy: LatencyProxy | undefined;
+  // Unix domain socket 路径有 SUN_LEN 限制；termd 会从 cwd 派生 supervisor socket 目录。
+  // 真实 relay 测试必须使用短 cwd，否则创建 PTY 时会因为 socket path 过长失败。
+  const tempDir = await mkdtemp(path.join(tmpdir(), "td-"));
 
-  const relay = spawnCargo(["run", "-q", "--manifest-path", CARGO_MANIFEST, "-p", "termrelay", "--", "--listen", relayAddr], "termrelay", tempDir);
+  const relay = spawnCargo(
+    ["run", "-q", "--manifest-path", CARGO_MANIFEST, "-p", "termrelay", "--", "--listen", relayAddr, "--web"],
+    "termrelay",
+    tempDir,
+  );
   await waitForPort(relayPort, relay, "termrelay");
+  const daemonToRelayLatencyMs = Math.max(0, options.daemonToRelayLatencyMs ?? 0);
+  const relayToDaemonLatencyMs = Math.max(0, options.relayToDaemonLatencyMs ?? 0);
+  const daemonToRelayJitterMs = Math.max(0, options.daemonToRelayJitterMs ?? 0);
+  const relayToDaemonJitterMs = Math.max(0, options.relayToDaemonJitterMs ?? 0);
+  const blackoutAfterMs = positiveNumberOrUndefined(options.blackoutAfterMs);
+  const blackoutDurationMs = positiveNumberOrUndefined(options.blackoutDurationMs);
+  const daemonToRelayBytesPerSecond = positiveNumberOrUndefined(options.daemonToRelayBytesPerSecond);
+  const relayToDaemonBytesPerSecond = positiveNumberOrUndefined(options.relayToDaemonBytesPerSecond);
+  if (
+    daemonToRelayLatencyMs > 0 ||
+    relayToDaemonLatencyMs > 0 ||
+    daemonToRelayJitterMs > 0 ||
+    relayToDaemonJitterMs > 0 ||
+    daemonToRelayBytesPerSecond ||
+    relayToDaemonBytesPerSecond ||
+    (blackoutAfterMs && blackoutDurationMs) ||
+    options.enableRelayInterrupt
+  ) {
+    latencyProxy = await startRelayLatencyProxy(relayPort, {
+      daemonToRelay: {
+        latencyMs: daemonToRelayLatencyMs,
+        jitterMs: daemonToRelayJitterMs,
+        bytesPerSecond: daemonToRelayBytesPerSecond,
+        blackoutAfterMs,
+        blackoutDurationMs,
+      },
+      relayToDaemon: {
+        latencyMs: relayToDaemonLatencyMs,
+        jitterMs: relayToDaemonJitterMs,
+        bytesPerSecond: relayToDaemonBytesPerSecond,
+        blackoutAfterMs,
+        blackoutDurationMs,
+      },
+    });
+    relayForDaemon = `127.0.0.1:${latencyProxy.listenPort}`;
+  }
   const daemon = spawnCargo(
     [
       "run",
@@ -45,28 +121,327 @@ export async function startRealRelayFixture(): Promise<RealRelayFixture> {
       "--listen",
       `127.0.0.1:${termdPort}`,
       "--relay",
-      `ws://${relayAddr}`,
+      `ws://${relayForDaemon}`,
     ],
     "termd",
     tempDir,
   );
   await waitForPort(termdPort, daemon, "termd");
 
-  const pairing = await issuePairingToken(termdHttp);
   const serverId = await serverIdFromHealthz(termdHttp);
   const relayClientUrl = `ws://${relayAddr}/ws`;
+  await waitForRelayDaemonMux(relayClientUrl, serverId, [relay, daemon]);
+  const pairing = await issuePairingToken(termdHttp);
 
   return {
     token: pairing.token,
     relayClientUrl,
+    relayWebUrl: `http://${relayAddr}/`,
     serverId,
     daemonPublicKey: pairing.daemonPublicKey,
+    diagnostics: () => [
+      `daemon_http=${termdHttp}`,
+      `relay_ws=${relayClientUrl}`,
+      `relay_web=http://${relayAddr}/`,
+      `daemon_relay_ws=ws://${relayForDaemon}`,
+      latencyProxy?.diagnostics() ?? "",
+      `server_id=${serverId}`,
+      relay.log.join(""),
+      daemon.log.join(""),
+    ].join("\n"),
+    issuePairingToken: async () => {
+      // 中文注释：多客户端测试需要不同设备身份，所以必须让 daemon 再签发一个独立的一次性 token。
+      const nextPairing = await issuePairingToken(termdHttp);
+      return nextPairing.token;
+    },
+    interruptRelayMux: async () => {
+      if (!latencyProxy) {
+        throw new Error("relay mux interrupt requires fixture network proxy");
+      }
+      await latencyProxy.interruptConnections();
+    },
+    waitForRelayReady: () => waitForRelayDaemonMux(relayClientUrl, serverId, [relay, daemon]),
     stop: async () => {
       stopProcess(daemon);
+      await latencyProxy?.stop();
       stopProcess(relay);
       await rm(tempDir, { recursive: true, force: true });
     },
   };
+}
+
+async function waitForRelayDaemonMux(
+  relayClientUrl: string,
+  serverId: string,
+  processes: StartedProcess[],
+): Promise<void> {
+  const deadline = Date.now() + 30_000;
+  let lastError = "not probed";
+  while (Date.now() < deadline) {
+    for (const process of processes) {
+      if (process.child.exitCode !== null) {
+        throw new Error(`process exited while waiting for relay daemon mux\n${process.log.join("")}`);
+      }
+    }
+    try {
+      await probeRelayDaemonMux(relayClientUrl, serverId, Math.min(3_000, Math.max(1, deadline - Date.now())));
+      return;
+    } catch (caught) {
+      lastError = caught instanceof Error ? caught.message : String(caught);
+      await sleep(150);
+    }
+  }
+  throw new Error(`relay daemon mux did not become ready: ${lastError}\n${processes.map((process) => process.log.join("")).join("\n")}`);
+}
+
+function probeRelayDaemonMux(relayClientUrl: string, serverId: string, timeoutMs: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const socket = new WebSocket(relayClientUrl);
+    let settled = false;
+    const finish = (error?: Error) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      socket.close();
+      if (error) {
+        reject(error);
+      } else {
+        resolve();
+      }
+    };
+    const timer = setTimeout(() => finish(new Error("relay daemon mux probe timed out")), timeoutMs);
+
+    socket.once("open", () => {
+      // 中文注释：这里不做业务握手，只用 relay 的公开 route prelude 探测 daemon mux 是否已注册。
+      // route_ready 表示 relay 已能把 client 路由到该 daemon，避免 pairing 抢在 mux 注册前误报 offline。
+      socket.send(JSON.stringify({
+        type: "route_hello",
+        payload: {
+          server_id: serverId,
+          role: "client",
+          protocol_version: 3,
+          nonce: `relay-mux-probe-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+          timestamp_ms: Date.now(),
+        },
+      }));
+    });
+    socket.once("message", (data) => {
+      let envelope: { type?: string; payload?: { code?: string; message?: string } };
+      try {
+        envelope = JSON.parse(data.toString()) as { type?: string; payload?: { code?: string; message?: string } };
+      } catch (error) {
+        finish(error instanceof Error ? error : new Error("invalid relay probe response"));
+        return;
+      }
+      if (envelope.type === "route_ready") {
+        finish();
+        return;
+      }
+      const code = envelope.payload?.code ?? envelope.type ?? "unexpected_response";
+      const message = envelope.payload?.message ?? "relay daemon mux probe returned non-ready response";
+      finish(new Error(`${code}: ${message}`));
+    });
+    socket.once("error", (error) => finish(error instanceof Error ? error : new Error("relay daemon mux probe failed")));
+    socket.once("close", () => finish(new Error("relay daemon mux probe closed before route_ready")));
+  });
+}
+
+async function startRelayLatencyProxy(
+  targetPort: number,
+  options: { daemonToRelay: LinkRules; relayToDaemon: LinkRules },
+): Promise<LatencyProxy> {
+  const listenPort = await pickFreePort();
+  const log: string[] = [];
+  const sockets = new Set<Socket>();
+  const timers = new Set<NodeJS.Timeout>();
+  const activeInterrupts = new Set<() => void>();
+  const server = createServer((daemonSocket) => {
+    const connectionStartedAt = Date.now();
+    const relaySocket = connect({ host: "127.0.0.1", port: targetPort });
+    sockets.add(daemonSocket);
+    sockets.add(relaySocket);
+    log.push(
+      `[latency-proxy] accepted daemon socket; daemon->relay=${formatLinkRules(options.daemonToRelay)} relay->daemon=${formatLinkRules(options.relayToDaemon)}\n`,
+    );
+
+    // 中文注释：网络代理必须保持 TCP 字节顺序，只改变两端之间的传输时间和吞吐。
+    // 这样测试到的是公网延迟/限速，而不是测试代理自己引入的乱序或协议损坏。
+    const cleanupPipes = [
+      pipeWithNetworkRules(daemonSocket, relaySocket, options.daemonToRelay, timers, connectionStartedAt),
+      pipeWithNetworkRules(relaySocket, daemonSocket, options.relayToDaemon, timers, connectionStartedAt),
+    ];
+
+    let closed = false;
+    const closeBoth = (error?: Error) => {
+      if (closed) {
+        return;
+      }
+      closed = true;
+      if (error) {
+        log.push(`[latency-proxy] socket error: ${error.message}\n`);
+      }
+      cleanupPipes.forEach((cleanup) => cleanup());
+      daemonSocket.destroy();
+      relaySocket.destroy();
+      sockets.delete(daemonSocket);
+      sockets.delete(relaySocket);
+      activeInterrupts.delete(interruptConnection);
+    };
+    const interruptConnection = () => {
+      log.push("[latency-proxy] injecting daemon relay mux disconnect\n");
+      closeBoth();
+    };
+    activeInterrupts.add(interruptConnection);
+    daemonSocket.on("error", closeBoth);
+    relaySocket.on("error", closeBoth);
+    daemonSocket.on("close", () => closeBoth());
+    relaySocket.on("close", () => closeBoth());
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(listenPort, "127.0.0.1", () => {
+      server.off("error", reject);
+      resolve();
+    });
+  });
+
+  return {
+    listenPort,
+    diagnostics: () => [`latency_proxy=127.0.0.1:${listenPort}->127.0.0.1:${targetPort}`, ...log].join("\n"),
+    interruptConnections: async () => {
+      const interrupts = [...activeInterrupts];
+      if (interrupts.length === 0) {
+        log.push("[latency-proxy] interrupt requested but no active daemon relay socket existed\n");
+      }
+      interrupts.forEach((interrupt) => interrupt());
+      await sleep(50);
+    },
+    stop: async () => {
+      for (const timer of timers) {
+        clearTimeout(timer);
+      }
+      timers.clear();
+      for (const socket of sockets) {
+        socket.destroy();
+      }
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    },
+  };
+}
+
+function pipeWithNetworkRules(
+  source: Socket,
+  target: Socket,
+  rules: LinkRules,
+  timers: Set<NodeJS.Timeout>,
+  connectionStartedAt: number,
+): () => void {
+  const delayedChunks: Array<{ dueAt: number; data: Buffer; offset: number }> = [];
+  let drainTimer: NodeJS.Timeout | undefined;
+  let nextSendAt = 0;
+
+  const scheduleDrain = () => {
+    if (drainTimer || delayedChunks.length === 0) {
+      return;
+    }
+    const now = Date.now();
+    const delay = Math.max(0, delayedChunks[0].dueAt - now, nextSendAt - now);
+    drainTimer = setTimeout(() => {
+      const timer = drainTimer;
+      drainTimer = undefined;
+      if (timer) {
+        timers.delete(timer);
+      }
+
+      const currentTime = Date.now();
+      while (
+        delayedChunks.length > 0 &&
+        delayedChunks[0].dueAt <= currentTime &&
+        nextSendAt <= currentTime
+      ) {
+        const chunk = delayedChunks[0];
+        if (target.destroyed) {
+          delayedChunks.length = 0;
+          break;
+        }
+        if (rules.bytesPerSecond) {
+          const bytesToWrite = Math.min(16 * 1024, chunk.data.length - chunk.offset);
+          target.write(chunk.data.subarray(chunk.offset, chunk.offset + bytesToWrite));
+          chunk.offset += bytesToWrite;
+          nextSendAt = Date.now() + Math.max(1, Math.ceil((bytesToWrite / rules.bytesPerSecond) * 1000));
+          if (chunk.offset >= chunk.data.length) {
+            delayedChunks.shift();
+          }
+        } else {
+          target.write(chunk.data);
+          delayedChunks.shift();
+        }
+      }
+      scheduleDrain();
+    }, delay);
+    timers.add(drainTimer);
+  };
+
+  source.on("data", (chunk) => {
+    if (rules.latencyMs <= 0 && !rules.bytesPerSecond) {
+      if (!target.destroyed) {
+        target.write(chunk);
+      }
+      return;
+    }
+    const rawDueAt = Date.now() + rules.latencyMs + randomJitterMs(rules.jitterMs);
+    delayedChunks.push({ dueAt: applyBlackout(rawDueAt, rules, connectionStartedAt), data: Buffer.from(chunk), offset: 0 });
+    scheduleDrain();
+  });
+
+  return () => {
+    delayedChunks.length = 0;
+    if (drainTimer) {
+      clearTimeout(drainTimer);
+      timers.delete(drainTimer);
+      drainTimer = undefined;
+    }
+  };
+}
+
+function positiveNumberOrUndefined(value: number | undefined): number | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+    return undefined;
+  }
+  return value;
+}
+
+function formatLinkRules(rules: LinkRules): string {
+  const jitter = rules.jitterMs > 0 ? `+jitter${rules.jitterMs}ms` : "";
+  const bandwidth = rules.bytesPerSecond ? `,${rules.bytesPerSecond}Bps` : "";
+  const blackout =
+    rules.blackoutAfterMs && rules.blackoutDurationMs
+      ? `,blackout@${rules.blackoutAfterMs}ms/${rules.blackoutDurationMs}ms`
+      : "";
+  return `${rules.latencyMs}ms${jitter}${bandwidth}${blackout}`;
+}
+
+function randomJitterMs(jitterMs: number): number {
+  if (jitterMs <= 0) {
+    return 0;
+  }
+  return Math.floor(Math.random() * (jitterMs + 1));
+}
+
+function applyBlackout(dueAt: number, rules: LinkRules, connectionStartedAt: number): number {
+  if (!rules.blackoutAfterMs || !rules.blackoutDurationMs) {
+    return dueAt;
+  }
+  const blackoutStart = connectionStartedAt + rules.blackoutAfterMs;
+  const blackoutEnd = blackoutStart + rules.blackoutDurationMs;
+  const now = Date.now();
+  if ((now >= blackoutStart && now < blackoutEnd) || (dueAt >= blackoutStart && dueAt < blackoutEnd)) {
+    return blackoutEnd;
+  }
+  return dueAt;
 }
 
 async function issuePairingToken(termdHttp: string): Promise<{ token: string; daemonPublicKey: string }> {

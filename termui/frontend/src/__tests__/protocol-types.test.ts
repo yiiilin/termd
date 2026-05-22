@@ -104,12 +104,12 @@ describe("协议类型", () => {
   it("状态枚举只表达个人 shared-control 语义", () => {
     const states: SessionState[] = ["created", "running", "closed"];
     const roles: AttachRole[] = ["operator"];
-    const routeRoles: RouteRole[] = ["client", "daemon_mux"];
+    const routeRoles: RouteRole[] = ["client", "daemon_mux", "daemon_mux_data"];
     const forbidden = ["admin", "owner", "member", "tenant"];
 
     expect(states).toEqual(["created", "running", "closed"]);
     expect(roles).toEqual(["operator"]);
-    expect(routeRoles).toEqual(["client", "daemon_mux"]);
+    expect(routeRoles).toEqual(["client", "daemon_mux", "daemon_mux_data"]);
     expect(JSON.stringify({ states, roles }).toLowerCase()).not.toContain(forbidden.join("|"));
   });
 

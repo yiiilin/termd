@@ -150,6 +150,44 @@ describe("DirectClient", () => {
     expect(daemon.outerWireText()).not.toContain("session_cursor");
   });
 
+  it("terminal.create 使用当前连接的请求超时", async () => {
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [],
+      sessionCreateDelayMs: 80,
+    });
+    const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000314");
+    const pairClient = await connectDevice(device.device_id, 300);
+    const accepted = await pairClient.pair("secret-token", device.device_public_key);
+    pairClient.close();
+
+    const shortClient = await connectDevice(device.device_id, 30);
+    await shortClient.authenticate(device, {
+      server_id: accepted.server_id,
+      daemon_public_key: accepted.daemon_public_key,
+      url: daemon.url,
+      paired_at_ms: 1710000000000,
+    });
+    await expect(shortClient.createSession([], { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })).rejects.toMatchObject({
+      code: "response_timeout",
+    });
+    shortClient.close();
+
+    const longClient = await connectDevice(device.device_id, 300);
+    await longClient.authenticate(device, {
+      server_id: accepted.server_id,
+      daemon_public_key: accepted.daemon_public_key,
+      url: daemon.url,
+      paired_at_ms: 1710000000000,
+    });
+    const created = await longClient.createSession([], { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 });
+    longClient.close();
+
+    expect(created.session_id).toMatch(/^00000000-0000-0000-0000-/);
+    expect(daemon.createdCommands).toEqual([[], []]);
+  });
+
   it("packet dispatcher 按 request id 归属响应和错误，错误不会污染并发请求", async () => {
     const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000310");
     const pairClient = await connectDevice(device.device_id);
@@ -245,6 +283,115 @@ describe("DirectClient", () => {
       credit: 64 * 1024,
     });
     expect(receivedPackets.find((packet) => packet.kind === "cancel" && packet.stream_id === streamId)).toBeTruthy();
+  });
+
+  it("二进制模式下 terminal stream packet 使用 WebSocket binary 和 raw bytes", async () => {
+    const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000316");
+    const pairClient = await connectDevice(device.device_id);
+    const accepted = await pairClient.pair("secret-token", device.device_public_key);
+    pairClient.close();
+
+    const client = await connectDevice(device.device_id);
+    await client.authenticate(device, {
+      server_id: accepted.server_id,
+      daemon_public_key: accepted.daemon_public_key,
+      url: daemon.url,
+      paired_at_ms: 1710000000000,
+    });
+
+    const list = await client.listSessions();
+    const attached = await client.attachSession(list.sessions[0].session_id);
+    const output = await client.receiveInner();
+    await client.sendSessionData(attached.session_id, new TextEncoder().encode("stream-input"));
+    client.close();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    const binaryWireFrames = (
+      daemon as unknown as {
+        binaryWireFrames?: Array<{ direction: "in" | "out"; byteLength: number }>;
+      }
+    ).binaryWireFrames ?? [];
+    const binaryPackets = (
+      daemon as unknown as {
+        binaryPacketLog?: Array<{
+          direction: "in" | "out";
+          kind: string;
+          payload_type?: string;
+          data_text?: string;
+        }>;
+      }
+    ).binaryPacketLog ?? [];
+
+    expect(output.type).toBe("session_data");
+    expect(binaryWireFrames.some((frame) => frame.direction === "in" && frame.byteLength > 0)).toBe(true);
+    expect(binaryWireFrames.some((frame) => frame.direction === "out" && frame.byteLength > 0)).toBe(true);
+    expect(
+      binaryPackets.some(
+        (packet) =>
+          packet.direction === "in" &&
+          packet.kind === "stream_chunk" &&
+          packet.payload_type === "session_data" &&
+          packet.data_text === "stream-input",
+      ),
+    ).toBe(true);
+    expect(
+      binaryPackets.some(
+        (packet) =>
+          packet.direction === "out" &&
+          packet.kind === "stream_chunk" &&
+          packet.payload_type === "session_data" &&
+          packet.data_text === "termd-e2e-ready\n",
+      ),
+    ).toBe(true);
+    expect(daemon.outerWireText()).not.toContain("data_base64");
+  });
+
+  it("二进制模式下单个 terminal_frame output 不会退化成 session_data", async () => {
+    const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000320");
+    const pairClient = await connectDevice(device.device_id);
+    const accepted = await pairClient.pair("secret-token", device.device_public_key);
+    pairClient.close();
+
+    const client = await connectDevice(device.device_id);
+    await client.authenticate(device, {
+      server_id: accepted.server_id,
+      daemon_public_key: accepted.daemon_public_key,
+      url: daemon.url,
+      paired_at_ms: 1710000000000,
+    });
+
+    const list = await client.listSessions();
+    const attached = await client.attachSession(list.sessions[0].session_id);
+    await client.receiveInner();
+    daemon.pushTerminalFrame(attached.session_id, {
+      kind: "output",
+      session_id: attached.session_id,
+      terminal_seq: 9,
+      data_base64: "c2luZ2xlLWZyYW1lCg==",
+    });
+
+    const frame = await client.receiveInner();
+    client.close();
+
+    expect(frame).toMatchObject({
+      type: "terminal_frame",
+      payload: {
+        kind: "output",
+        terminal_seq: 9,
+        data_bytes: expect.any(Uint8Array),
+      },
+    });
+    expect(new TextDecoder().decode((frame as { payload: { data_bytes?: Uint8Array } }).payload.data_bytes)).toBe(
+      "single-frame\n",
+    );
+    expect(
+      daemon.binaryPacketLog.some(
+        (packet) =>
+          packet.direction === "out" &&
+          packet.kind === "stream_chunk" &&
+          packet.payload_type === "terminal_frame",
+      ),
+    ).toBe(true);
   });
 
   it("terminal stream batch 会展开为多个 terminal_frame，并按每帧字节数补 credit", async () => {

@@ -1,4 +1,4 @@
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test, type Locator, type Page } from "@playwright/test";
 import { startRealRelayFixture } from "./real-relay-fixture";
 
 async function activateButton(page: Page, name: string): Promise<void> {
@@ -27,6 +27,7 @@ test("浏览器通过真实 relay 连接 daemon 完成 pairing 和 session list"
     await page.getByRole("button", { name: "Pair" }).click();
 
     await expect(page.getByLabel("Pairing token")).toBeHidden();
+    await expect(page.getByText("No sessions")).toBeVisible();
 
     if (testInfo.project.name === "mobile-chrome") {
       await expect(page.getByRole("navigation", { name: "mobile workspace actions" })).toHaveCount(0);
@@ -57,6 +58,475 @@ test("浏览器通过真实 relay 连接 daemon 完成 pairing 和 session list"
     const localStorageText = await page.evaluate(() => JSON.stringify(window.localStorage));
     expect(localStorageText).not.toContain(fixture.token);
   } finally {
+    await testInfo.attach("real-relay-fixture.log", {
+      body: fixture.diagnostics(),
+      contentType: "text/plain",
+    });
+    await fixture.stop();
+  }
+});
+
+test("真实 relay 下多个大输出 session 快速切换后仍能恢复和输入", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name === "mobile-chrome", "压力回归只需要桌面布局覆盖真实 relay 链路");
+  const fixture = await startRealRelayFixture();
+  const createdNames: string[] = [];
+
+  try {
+    await page.goto("/");
+    await page.getByLabel("WS URL").fill(fixture.relayClientUrl);
+    await page.getByLabel("Pairing token").fill(pairingInviteCode(fixture));
+    await page.getByRole("button", { name: "Pair" }).click();
+    await expect(page.getByLabel("Pairing token")).toBeHidden();
+    await expect(page.getByText("No sessions")).toBeVisible();
+
+    for (let index = 0; index < 3; index += 1) {
+      const name = await createShellSession(page, createdNames);
+      createdNames.push(name);
+      await runTerminalCommand(
+        page,
+        `for i in $(seq 1 900); do printf '${marker(name)}-bulk-%04d\\n' "$i"; done; printf '${marker(name)}-ready\\n'`,
+      );
+      await expectTerminalLine(page, `${marker(name)}-ready`, 10_000);
+    }
+
+    for (const name of [...createdNames, ...createdNames].reverse()) {
+      await openSession(page, name);
+    }
+    const targetName = createdNames[0];
+    await openSession(page, targetName);
+    await expectTerminalLine(page, `${marker(targetName)}-ready`, 3_000);
+
+    await runTerminalCommand(page, `printf '${marker(targetName)}-input-ok\\n'`);
+    await expectTerminalLine(page, `${marker(targetName)}-input-ok`, 3_000);
+    await expect(page.getByRole("alert", { name: "Connection error" })).toHaveCount(0);
+  } finally {
+    await testInfo.attach("real-relay-fixture.log", {
+      body: fixture.diagnostics(),
+      contentType: "text/plain",
+    });
+    await closeCreatedSessions(page, createdNames);
+    await fixture.stop();
+  }
+});
+
+test("relay Web 在 daemon 和 relay 双向 100ms 延迟下多 session 快速切换仍稳定", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name === "mobile-chrome", "延迟压力回归只需要桌面布局覆盖真实 relay 链路");
+  test.setTimeout(90_000);
+  const fixture = await startRealRelayFixture({ daemonToRelayLatencyMs: 100, relayToDaemonLatencyMs: 100 });
+  const createdNames: string[] = [];
+  const browserErrors: string[] = [];
+
+  page.on("console", (message) => {
+    if (message.type() === "error") {
+      browserErrors.push(message.text());
+    }
+  });
+  page.on("pageerror", (error) => {
+    browserErrors.push(error.message);
+  });
+
+  try {
+    await page.goto(fixture.relayWebUrl);
+    await page.getByLabel("WS URL").fill(fixture.relayClientUrl);
+    await page.getByLabel("Pairing token").fill(pairingInviteCode(fixture));
+    await page.getByRole("button", { name: "Pair" }).click();
+    await expect(page.getByLabel("Pairing token")).toBeHidden();
+    await expect(page.getByText("No sessions")).toBeVisible();
+
+    for (let index = 0; index < 3; index += 1) {
+      const name = await createShellSession(page, createdNames);
+      createdNames.push(name);
+      await runTerminalCommand(
+        page,
+        `for i in $(seq 1 1200); do printf '${marker(name)}-latency-bulk-%04d\\n' "$i"; done; printf '${marker(name)}-latency-ready\\n'`,
+      );
+      await expectTerminalLine(page, `${marker(name)}-latency-ready`, 15_000);
+    }
+
+    for (const name of [...createdNames, ...createdNames, ...createdNames].reverse()) {
+      await openSession(page, name);
+    }
+
+    const targetName = createdNames[1];
+    await openSession(page, targetName);
+    await expectTerminalLine(page, `${marker(targetName)}-latency-ready`, 5_000);
+
+    await runTerminalCommand(page, `printf '${marker(targetName)}-latency-input-ok\\n'`);
+    await expectTerminalLine(page, `${marker(targetName)}-latency-input-ok`, 5_000);
+    await expect(page.getByRole("alert", { name: "Connection error" })).toHaveCount(0);
+    expect(browserErrors).toEqual([]);
+  } finally {
+    await testInfo.attach("real-relay-fixture.log", {
+      body: fixture.diagnostics(),
+      contentType: "text/plain",
+    });
+    if (browserErrors.length > 0) {
+      await testInfo.attach("browser-errors.log", {
+        body: browserErrors.join("\n"),
+        contentType: "text/plain",
+      });
+    }
+    await closeCreatedSessions(page, createdNames);
+    await fixture.stop();
+  }
+});
+
+test("relay Web 在双客户端慢链路下快速切换仍稳定", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name === "mobile-chrome", "多客户端压力回归只需要桌面布局覆盖真实 relay 链路");
+  test.setTimeout(120_000);
+  const fixture = await startRealRelayFixture({
+    daemonToRelayLatencyMs: 100,
+    relayToDaemonLatencyMs: 100,
+    daemonToRelayBytesPerSecond: 96 * 1024,
+    relayToDaemonBytesPerSecond: 96 * 1024,
+  });
+  const secondPage = await page.context().newPage();
+  const createdNames: string[] = [];
+  const browserErrors: string[] = [];
+  collectBrowserErrors(page, "client-a", browserErrors);
+  collectBrowserErrors(secondPage, "client-b", browserErrors);
+
+  try {
+    await page.goto(fixture.relayWebUrl);
+    await page.getByLabel("WS URL").fill(fixture.relayClientUrl);
+    await page.getByLabel("Pairing token").fill(pairingInviteCode(fixture));
+    await page.getByRole("button", { name: "Pair" }).click();
+    await expect(page.getByLabel("Pairing token")).toBeHidden();
+    await expect(page.getByText("No sessions")).toBeVisible();
+
+    await secondPage.goto(fixture.relayWebUrl);
+    await expect(secondPage.getByRole("button", { name: "New session" })).toBeVisible();
+    await expect(secondPage.getByText("No sessions")).toBeVisible();
+
+    for (let index = 0; index < 3; index += 1) {
+      const name = await createShellSession(page, createdNames);
+      createdNames.push(name);
+      await runTerminalCommand(
+        page,
+        `for i in $(seq 1 1800); do printf '${marker(name)}-slow-bulk-%04d\\n' "$i"; done; printf '${marker(name)}-slow-ready\\n'`,
+      );
+      await expectTerminalLine(page, `${marker(name)}-slow-ready`, 20_000);
+    }
+    await secondPage.getByRole("button", { name: "Refresh", exact: true }).click();
+    await expect.poll(async () => sessionNames(secondPage), { timeout: 10_000 }).toHaveLength(createdNames.length);
+
+    for (let round = 0; round < 8; round += 1) {
+      const leftName = createdNames[round % createdNames.length];
+      const rightName = createdNames[(round + 1) % createdNames.length];
+      await Promise.all([openSession(page, leftName), openSession(secondPage, rightName)]);
+    }
+
+    const leftTarget = createdNames[0];
+    const rightTarget = createdNames[2];
+    await openSession(page, leftTarget);
+    await expectTerminalLine(page, `${marker(leftTarget)}-slow-ready`, 8_000);
+    await openSession(secondPage, rightTarget);
+    await expectTerminalLine(secondPage, `${marker(rightTarget)}-slow-ready`, 8_000);
+
+    await runTerminalCommand(page, `printf '${marker(leftTarget)}-slow-client-a-ok\\n'`);
+    await expectTerminalLine(page, `${marker(leftTarget)}-slow-client-a-ok`, 8_000);
+    await runTerminalCommand(secondPage, `printf '${marker(rightTarget)}-slow-client-b-ok\\n'`);
+    await expectTerminalLine(secondPage, `${marker(rightTarget)}-slow-client-b-ok`, 8_000);
+
+    await expect(page.getByRole("alert", { name: "Connection error" })).toHaveCount(0);
+    await expect(secondPage.getByRole("alert", { name: "Connection error" })).toHaveCount(0);
+    expect(browserErrors).toEqual([]);
+  } finally {
+    await testInfo.attach("real-relay-fixture.log", {
+      body: fixture.diagnostics(),
+      contentType: "text/plain",
+    });
+    if (browserErrors.length > 0) {
+      await testInfo.attach("browser-errors.log", {
+        body: browserErrors.join("\n"),
+        contentType: "text/plain",
+      });
+    }
+    await closeCreatedSessions(page, createdNames);
+    await secondPage.close();
+    await fixture.stop();
+  }
+});
+
+test("relay Web 在双客户端抖动低带宽链路下仍能恢复", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name === "mobile-chrome", "抖动压力回归只需要桌面布局覆盖真实 relay 链路");
+  test.setTimeout(120_000);
+  const fixture = await startRealRelayFixture({
+    daemonToRelayLatencyMs: 100,
+    relayToDaemonLatencyMs: 100,
+    daemonToRelayJitterMs: 150,
+    relayToDaemonJitterMs: 150,
+    daemonToRelayBytesPerSecond: 48 * 1024,
+    relayToDaemonBytesPerSecond: 48 * 1024,
+  });
+  const secondPage = await page.context().newPage();
+  const createdNames: string[] = [];
+  const browserErrors: string[] = [];
+  collectBrowserErrors(page, "client-a", browserErrors);
+  collectBrowserErrors(secondPage, "client-b", browserErrors);
+
+  try {
+    await page.goto(fixture.relayWebUrl);
+    await page.getByLabel("WS URL").fill(fixture.relayClientUrl);
+    await page.getByLabel("Pairing token").fill(pairingInviteCode(fixture));
+    await page.getByRole("button", { name: "Pair" }).click();
+    await expect(page.getByLabel("Pairing token")).toBeHidden();
+    await expect(page.getByText("No sessions")).toBeVisible();
+
+    await secondPage.goto(fixture.relayWebUrl);
+    await expect(secondPage.getByRole("button", { name: "New session" })).toBeVisible();
+    await expect(secondPage.getByText("No sessions")).toBeVisible();
+
+    for (let index = 0; index < 2; index += 1) {
+      const name = await createShellSession(page, createdNames);
+      createdNames.push(name);
+      await runTerminalCommand(
+        page,
+        `for i in $(seq 1 2400); do printf '${marker(name)}-jitter-bulk-%04d\\n' "$i"; done; printf '${marker(name)}-jitter-ready\\n'`,
+      );
+      await expectTerminalLine(page, `${marker(name)}-jitter-ready`, 30_000);
+    }
+
+    await secondPage.getByRole("button", { name: "Refresh", exact: true }).click();
+    await expect.poll(async () => sessionNames(secondPage), { timeout: 20_000 }).toHaveLength(createdNames.length);
+
+    for (let round = 0; round < 6; round += 1) {
+      await Promise.all([
+        openSession(page, createdNames[round % createdNames.length]),
+        openSession(secondPage, createdNames[(round + 1) % createdNames.length]),
+      ]);
+    }
+
+    await runTerminalCommand(page, `printf '${marker(createdNames[0])}-jitter-client-a-ok\\n'`);
+    await expectTerminalLine(page, `${marker(createdNames[0])}-jitter-client-a-ok`, 10_000);
+    await runTerminalCommand(secondPage, `printf '${marker(createdNames[1])}-jitter-client-b-ok\\n'`);
+    await expectTerminalLine(secondPage, `${marker(createdNames[1])}-jitter-client-b-ok`, 10_000);
+
+    await expect(page.getByRole("alert", { name: "Connection error" })).toHaveCount(0);
+    await expect(secondPage.getByRole("alert", { name: "Connection error" })).toHaveCount(0);
+    expect(browserErrors).toEqual([]);
+  } finally {
+    await testInfo.attach("real-relay-fixture.log", {
+      body: fixture.diagnostics(),
+      contentType: "text/plain",
+    });
+    if (browserErrors.length > 0) {
+      await testInfo.attach("browser-errors.log", {
+        body: browserErrors.join("\n"),
+        contentType: "text/plain",
+      });
+    }
+    await closeCreatedSessions(page, createdNames);
+    await secondPage.close();
+    await fixture.stop();
+  }
+});
+
+test("relay Web 在 daemon relay 短暂冻结恢复后仍能输入", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name === "mobile-chrome", "冻结恢复压力回归只需要桌面布局覆盖真实 relay 链路");
+  test.setTimeout(90_000);
+  const fixture = await startRealRelayFixture({
+    daemonToRelayLatencyMs: 100,
+    relayToDaemonLatencyMs: 100,
+    blackoutAfterMs: 4_000,
+    blackoutDurationMs: 3_000,
+  });
+  const createdNames: string[] = [];
+  const browserErrors: string[] = [];
+  collectBrowserErrors(page, "client", browserErrors);
+
+  try {
+    await page.goto(fixture.relayWebUrl);
+    await page.getByLabel("WS URL").fill(fixture.relayClientUrl);
+    await page.getByLabel("Pairing token").fill(pairingInviteCode(fixture));
+    await page.getByRole("button", { name: "Pair" }).click();
+    await expect(page.getByLabel("Pairing token")).toBeHidden();
+    await expect(page.getByText("No sessions")).toBeVisible();
+
+    for (let index = 0; index < 2; index += 1) {
+      const name = await createShellSession(page, createdNames);
+      createdNames.push(name);
+      await runTerminalCommand(
+        page,
+        `for i in $(seq 1 1600); do printf '${marker(name)}-freeze-bulk-%04d\\n' "$i"; sleep 0.001; done; printf '${marker(name)}-freeze-ready\\n'`,
+      );
+      await expectTerminalLine(page, `${marker(name)}-freeze-ready`, 25_000);
+    }
+
+    for (const name of [...createdNames, ...createdNames].reverse()) {
+      await openSession(page, name);
+    }
+    const targetName = createdNames[0];
+    await openSession(page, targetName);
+    await expectTerminalLine(page, `${marker(targetName)}-freeze-ready`, 8_000);
+    await runTerminalCommand(page, `printf '${marker(targetName)}-freeze-input-ok\\n'`);
+    await expectTerminalLine(page, `${marker(targetName)}-freeze-input-ok`, 8_000);
+
+    await expect(page.getByRole("alert", { name: "Connection error" })).toHaveCount(0);
+    expect(browserErrors).toEqual([]);
+  } finally {
+    await testInfo.attach("real-relay-fixture.log", {
+      body: fixture.diagnostics(),
+      contentType: "text/plain",
+    });
+    if (browserErrors.length > 0) {
+      await testInfo.attach("browser-errors.log", {
+        body: browserErrors.join("\n"),
+        contentType: "text/plain",
+      });
+    }
+    await closeCreatedSessions(page, createdNames);
+    await fixture.stop();
+  }
+});
+
+test("relay Web 在 daemon relay 主干断开重连后仍能恢复输入", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name === "mobile-chrome", "主干重连压力回归只需要桌面布局覆盖真实 relay 链路");
+  test.setTimeout(120_000);
+  const fixture = await startRealRelayFixture({
+    daemonToRelayLatencyMs: 100,
+    relayToDaemonLatencyMs: 100,
+    enableRelayInterrupt: true,
+  });
+  const createdNames: string[] = [];
+  const browserErrors: string[] = [];
+  collectBrowserErrors(page, "client", browserErrors);
+
+  try {
+    await page.goto(fixture.relayWebUrl);
+    await page.getByLabel("WS URL").fill(fixture.relayClientUrl);
+    await page.getByLabel("Pairing token").fill(pairingInviteCode(fixture));
+    await page.getByRole("button", { name: "Pair" }).click();
+    await expect(page.getByLabel("Pairing token")).toBeHidden();
+    await expect(page.getByText("No sessions")).toBeVisible();
+
+    const name = await createShellSession(page, createdNames);
+    createdNames.push(name);
+    await runTerminalCommand(
+      page,
+      `for i in $(seq 1 1000); do printf '${marker(name)}-reconnect-bulk-%04d\\n' "$i"; done; printf '${marker(name)}-reconnect-ready\\n'`,
+    );
+    await expectTerminalLine(page, `${marker(name)}-reconnect-ready`, 15_000);
+
+    await fixture.interruptRelayMux();
+    await fixture.waitForRelayReady();
+    await page.getByRole("button", { name: "Refresh", exact: true }).click();
+    await expect.poll(async () => sessionNames(page), { timeout: 20_000 }).toContain(name);
+
+    await openSession(page, name);
+    await expectTerminalLine(page, `${marker(name)}-reconnect-ready`, 20_000);
+    await runTerminalCommand(page, `printf '${marker(name)}-reconnect-input-ok\\n'`);
+    await expectTerminalLine(page, `${marker(name)}-reconnect-input-ok`, 20_000);
+
+    await expect(page.getByRole("alert", { name: "Connection error" })).toHaveCount(0);
+    expect(browserErrors).toEqual([]);
+  } finally {
+    await testInfo.attach("real-relay-fixture.log", {
+      body: fixture.diagnostics(),
+      contentType: "text/plain",
+    });
+    if (browserErrors.length > 0) {
+      await testInfo.attach("browser-errors.log", {
+        body: browserErrors.join("\n"),
+        contentType: "text/plain",
+      });
+    }
+    await closeCreatedSessions(page, createdNames);
+    await fixture.stop();
+  }
+});
+
+test("relay Web 双客户端同会话不同分辨率轮番离线上线后仍能恢复", async ({ page, browser }, testInfo) => {
+  test.skip(testInfo.project.name === "mobile-chrome", "多客户端断续回归只需要桌面布局覆盖真实 relay 链路");
+  test.setTimeout(150_000);
+
+  const fixture = await startRealRelayFixture({ daemonToRelayLatencyMs: 100, relayToDaemonLatencyMs: 100 });
+  const secondContext = await browser.newContext({ viewport: { width: 1024, height: 700 } });
+  const secondPage = await secondContext.newPage();
+  const createdNames: string[] = [];
+  const browserErrors: string[] = [];
+  collectBrowserErrors(page, "client-a", browserErrors);
+  collectBrowserErrors(secondPage, "client-b", browserErrors);
+
+  try {
+    await page.setViewportSize({ width: 1366, height: 768 });
+    await page.goto(fixture.relayWebUrl);
+    await page.getByLabel("WS URL").fill(fixture.relayClientUrl);
+    await page.getByLabel("Pairing token").fill(pairingInviteCode(fixture));
+    await page.getByRole("button", { name: "Pair" }).click();
+    await expect(page.getByLabel("Pairing token")).toBeHidden();
+    await expect(page.getByText("No sessions")).toBeVisible();
+
+    const secondToken = await fixture.issuePairingToken();
+    await secondPage.goto(fixture.relayWebUrl);
+    await secondPage.getByLabel("WS URL").fill(fixture.relayClientUrl);
+    await secondPage.getByLabel("Pairing token").fill(pairingInviteCode({ ...fixture, token: secondToken }));
+    await secondPage.getByRole("button", { name: "Pair" }).click();
+    await expect(secondPage.getByLabel("Pairing token")).toBeHidden();
+    await expect(secondPage.getByText("No sessions")).toBeVisible();
+
+    const name = await createShellSession(page, createdNames);
+    createdNames.push(name);
+    await secondPage.getByRole("button", { name: "Refresh", exact: true }).click();
+    await expect.poll(async () => sessionNames(secondPage), { timeout: 20_000 }).toContain(name);
+    await openSession(secondPage, name);
+
+    await runTerminalCommand(
+      page,
+      `for i in $(seq 1 3600); do printf '${marker(name)}-shared-bulk-%04d\\n' "$i"; sleep 0.002; done; printf '${marker(name)}-shared-ready\\n'`,
+    );
+    await expectTerminalLineMatching(page, new RegExp(`${escapeRegex(marker(name))}-shared-bulk-0[0-9]{3}`), 20_000);
+    await expectTerminalLineMatching(secondPage, new RegExp(`${escapeRegex(marker(name))}-shared-bulk-0[0-9]{3}`), 20_000);
+
+    // 中文注释：这里用浏览器上下文 offline 模拟两个客户端轮番掉线，daemon 与 relay 主干仍保持在线。
+    await page.context().setOffline(true);
+    await sleep(1_200);
+    await page.context().setOffline(false);
+    await expectTerminalLineMatching(secondPage, new RegExp(`${escapeRegex(marker(name))}-shared-bulk-[0-9]{4}`), 20_000);
+
+    await secondContext.setOffline(true);
+    await sleep(1_200);
+    await secondContext.setOffline(false);
+    await openSession(secondPage, name);
+    await expectTerminalLineMatching(page, new RegExp(`${escapeRegex(marker(name))}-shared-bulk-[0-9]{4}`), 20_000);
+
+    await page.context().setOffline(true);
+    await sleep(1_000);
+    await page.context().setOffline(false);
+    await secondContext.setOffline(true);
+    await sleep(1_000);
+    await secondContext.setOffline(false);
+
+    await openSession(page, name);
+    await openSession(secondPage, name);
+    await expectTerminalLine(page, `${marker(name)}-shared-ready`, 40_000);
+    await expectTerminalLine(secondPage, `${marker(name)}-shared-ready`, 40_000);
+
+    await runTerminalCommand(page, `printf '${marker(name)}-shared-client-a-ok\\n'`);
+    await expectTerminalLine(page, `${marker(name)}-shared-client-a-ok`, 20_000);
+    await expectTerminalLine(secondPage, `${marker(name)}-shared-client-a-ok`, 20_000);
+    await runTerminalCommand(secondPage, `printf '${marker(name)}-shared-client-b-ok\\n'`);
+    await expectTerminalLine(page, `${marker(name)}-shared-client-b-ok`, 20_000);
+    await expectTerminalLine(secondPage, `${marker(name)}-shared-client-b-ok`, 20_000);
+
+    await expect(page.getByRole("alert", { name: "Connection error" })).toHaveCount(0);
+    await expect(secondPage.getByRole("alert", { name: "Connection error" })).toHaveCount(0);
+    expect(browserErrors).toEqual([]);
+  } finally {
+    await testInfo.attach("real-relay-fixture.log", {
+      body: fixture.diagnostics(),
+      contentType: "text/plain",
+    });
+    if (browserErrors.length > 0) {
+      await testInfo.attach("browser-errors.log", {
+        body: browserErrors.join("\n"),
+        contentType: "text/plain",
+      });
+    }
+    await page.context().setOffline(false).catch(() => undefined);
+    await secondContext.setOffline(false).catch(() => undefined);
+    await closeCreatedSessions(page, createdNames);
+    await secondContext.close();
     await fixture.stop();
   }
 });
@@ -72,4 +542,86 @@ function pairingInviteCode(fixture: { relayClientUrl: string; serverId: string; 
     expires_at_ms: Date.now() + 60_000,
   });
   return `termd-pair:v1:${Buffer.from(payload, "utf8").toString("base64url")}`;
+}
+
+function terminalPane(page: Page): Locator {
+  return page.getByTestId("terminal-pane");
+}
+
+function collectBrowserErrors(page: Page, label: string, browserErrors: string[]): void {
+  page.on("console", (message) => {
+    if (message.type() === "error") {
+      browserErrors.push(`[${label}:console] ${message.text()}`);
+    }
+  });
+  page.on("pageerror", (error) => {
+    browserErrors.push(`[${label}:pageerror] ${error.message}`);
+  });
+}
+
+async function expectTerminalLine(page: Page, text: string, timeout: number): Promise<void> {
+  // xterm 会同时显示命令回显和命令输出；压力测试只关心最终输出行，
+  // 这里必须用精确文本，避免 strict locator 被命令回显里的子串干扰。
+  await expect(terminalPane(page).getByText(text, { exact: true })).toBeVisible({ timeout });
+}
+
+async function expectTerminalLineMatching(page: Page, pattern: RegExp, timeout: number): Promise<void> {
+  // 中文注释：持续输出期间具体行号会受网络和重连时机影响；正则只用于确认终端流仍在推进。
+  await expect(terminalPane(page).getByText(pattern).first()).toBeVisible({ timeout });
+}
+
+async function createShellSession(page: Page, existingNames: string[]): Promise<string> {
+  await page.getByRole("button", { name: "New session" }).click();
+  await expect(page.getByRole("textbox", { name: "Terminal input" })).toBeAttached({ timeout: 8_000 });
+  await expect
+    .poll(async () => sessionNames(page), { timeout: 8_000 })
+    .toHaveLength(existingNames.length + 1);
+  const names = await sessionNames(page);
+  const created = names.find((name) => !existingNames.includes(name));
+  if (!created) {
+    throw new Error(`failed to detect created session from ${names.join(", ")}`);
+  }
+  return created;
+}
+
+async function sessionNames(page: Page): Promise<string[]> {
+  return page
+    .getByRole("region", { name: "sessions" })
+    .locator(".session-row strong")
+    .allTextContents();
+}
+
+async function openSession(page: Page, name: string): Promise<void> {
+  await page.getByRole("button", { name: `Open ${name}` }).click();
+}
+
+async function runTerminalCommand(page: Page, command: string): Promise<void> {
+  await terminalPane(page).click();
+  const input = page.getByRole("textbox", { name: "Terminal input" });
+  await expect(input).toBeAttached({ timeout: 8_000 });
+  await input.focus();
+  await page.keyboard.insertText(command);
+  await page.keyboard.press("Enter");
+}
+
+async function closeCreatedSessions(page: Page, names: string[]): Promise<void> {
+  for (const name of [...names].reverse()) {
+    const row = page.getByRole("button", { name: new RegExp(`^Open ${escapeRegex(name)}(?:, new output)?$`) });
+    if (await row.count() === 0) {
+      continue;
+    }
+    await row.getByRole("button", { name: "Close session" }).click();
+  }
+}
+
+function marker(name: string): string {
+  return `relay-${name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`;
+}
+
+function escapeRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }

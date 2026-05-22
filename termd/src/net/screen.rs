@@ -3,11 +3,12 @@
 //! 这里不是完整终端模拟器，只维护 daemon 重新 attach 时需要的最近 1000 行逻辑内容。
 //! 样式变化会落到 cell 上，不单独消耗行数；实时连接仍接收原始 PTY 字节。
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 
 use unicode_width::UnicodeWidthChar;
 
 const DEFAULT_MAX_CACHED_LINES: usize = 1000;
+const MAX_PENDING_CONTROL_BYTES: usize = 4096;
 
 #[derive(Debug, Clone)]
 pub(crate) struct TerminalScreen {
@@ -20,8 +21,10 @@ pub(crate) struct TerminalScreen {
     cursor_col: usize,
     saved_cursor: Option<(usize, usize)>,
     current_style: CellStyle,
+    modes: TerminalModes,
     parser: ParserState,
     utf8_pending: Vec<u8>,
+    pending_control: Vec<u8>,
     normal_screen: Option<SavedScreen>,
     requires_snapshot_redraw: bool,
     scroll_top: usize,
@@ -44,6 +47,7 @@ struct SavedScreen {
     cursor_col: usize,
     saved_cursor: Option<(usize, usize)>,
     current_style: CellStyle,
+    modes: TerminalModes,
     scroll_top: usize,
     scroll_bottom: usize,
 }
@@ -67,6 +71,17 @@ struct CellStyle {
     strike: bool,
     foreground: Option<SgrColor>,
     background: Option<SgrColor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TerminalModes {
+    auto_wrap: bool,
+    origin: bool,
+    insert: bool,
+    application_cursor: bool,
+    application_keypad: bool,
+    bracketed_paste: bool,
+    mouse_modes: BTreeSet<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -263,6 +278,58 @@ impl CellStyle {
     }
 }
 
+impl Default for TerminalModes {
+    fn default() -> Self {
+        Self {
+            auto_wrap: true,
+            origin: false,
+            insert: false,
+            application_cursor: false,
+            application_keypad: false,
+            bracketed_paste: false,
+            mouse_modes: BTreeSet::new(),
+        }
+    }
+}
+
+impl TerminalModes {
+    fn restore_bytes(&self) -> Vec<u8> {
+        let mut output = Vec::new();
+
+        output.extend_from_slice(if self.auto_wrap {
+            b"\x1b[?7h"
+        } else {
+            b"\x1b[?7l"
+        });
+        output.extend_from_slice(if self.origin {
+            b"\x1b[?6h"
+        } else {
+            b"\x1b[?6l"
+        });
+        output.extend_from_slice(if self.insert { b"\x1b[4h" } else { b"\x1b[4l" });
+        if self.application_cursor {
+            output.extend_from_slice(b"\x1b[?1h");
+        } else {
+            output.extend_from_slice(b"\x1b[?1l");
+        }
+        if self.application_keypad {
+            output.extend_from_slice(b"\x1b=");
+        } else {
+            output.extend_from_slice(b"\x1b>");
+        }
+        if self.bracketed_paste {
+            output.extend_from_slice(b"\x1b[?2004h");
+        } else {
+            output.extend_from_slice(b"\x1b[?2004l");
+        }
+        for mode in &self.mouse_modes {
+            output.extend_from_slice(format!("\x1b[?{mode}h").as_bytes());
+        }
+
+        output
+    }
+}
+
 impl SgrColor {
     fn sgr_codes(&self, background: bool) -> Vec<String> {
         match self {
@@ -306,8 +373,10 @@ impl TerminalScreen {
             cursor_col: 0,
             saved_cursor: None,
             current_style: CellStyle::default(),
+            modes: TerminalModes::default(),
             parser: ParserState::Ground,
             utf8_pending: Vec::new(),
+            pending_control: Vec::new(),
             normal_screen: None,
             requires_snapshot_redraw: false,
             scroll_top: 0,
@@ -344,30 +413,53 @@ impl TerminalScreen {
     }
 
     pub(crate) fn snapshot_bytes(&self) -> Vec<u8> {
-        let Some((start, end)) = self.snapshot_line_bounds() else {
+        if self.normal_screen.is_none()
+            && self.pending_control.is_empty()
+            && self.utf8_pending.is_empty()
+            && !self.needs_state_restore()
+            && self.snapshot_line_bounds().is_none()
+        {
             return Vec::new();
-        };
+        }
 
         let mut output = Vec::new();
-        for (index, row) in self.lines.iter().enumerate().skip(start).take(end - start) {
-            output.extend_from_slice(&row_ansi_bytes(row));
-            if index + 1 < end {
-                output.extend_from_slice(b"\r\n");
-            }
+
+        if let Some(normal_screen) = &self.normal_screen {
+            // 中文注释：alternate screen attach 不能只恢复 TUI 当前页。先把普通屏写入
+            // xterm，再切到 alternate screen，后续 TUI 退出时浏览器终端才能恢复普通屏。
+            output.extend_from_slice(&snapshot_state_bytes(
+                &normal_screen.lines,
+                self.rows,
+                self.cols,
+                normal_screen.cursor_row,
+                normal_screen.cursor_col,
+                normal_screen.saved_cursor,
+                &normal_screen.current_style,
+                &normal_screen.modes,
+                normal_screen.scroll_top,
+                normal_screen.scroll_bottom,
+            ));
+            output.extend_from_slice(b"\x1b[?1049h");
         }
-        output.extend_from_slice(
-            format!(
-                "\x1b[{};{}H",
-                self.cursor_row + 1,
-                self.cursor_col.min(self.cols - 1) + 1
-            )
-            .as_bytes(),
-        );
-        // 中文注释：snapshot 写完内容后必须恢复当前 SGR 状态；否则后续 tail 如果依赖
-        // 终端里仍处于红色/背景色等状态，重新 attach 的 xterm 会按默认样式继续渲染。
-        if !self.current_style.is_default() {
-            output.extend_from_slice(&self.current_style.sgr_bytes(false));
-        }
+
+        output.extend_from_slice(&snapshot_state_bytes(
+            &self.lines,
+            self.rows,
+            self.cols,
+            self.cursor_row,
+            self.cursor_col,
+            self.saved_cursor,
+            &self.current_style,
+            &self.modes,
+            self.scroll_top,
+            self.scroll_bottom,
+        ));
+        // 中文注释：PTY 读取可能切在 ESC/CSI/OSC 中间；snapshot 末尾要保留这段
+        // 未完成控制序列，让紧随其后的 tail 继续解释同一个序列。
+        output.extend_from_slice(&self.pending_control);
+        // 中文注释：UTF-8 也可能切在多字节字符中间；把未完成字节附在 snapshot 尾部，
+        // 让后续 tail 继续补全字符，而不是先输出替换符。
+        output.extend_from_slice(&self.utf8_pending);
         output
     }
 
@@ -446,6 +538,16 @@ impl TerminalScreen {
         Some((start, last_visible + 1))
     }
 
+    fn needs_state_restore(&self) -> bool {
+        self.cursor_row != 0
+            || self.cursor_col != 0
+            || self.saved_cursor.is_some()
+            || !self.current_style.is_default()
+            || self.modes != TerminalModes::default()
+            || self.scroll_top != 0
+            || self.scroll_bottom != self.rows
+    }
+
     fn visible_line_mut(&mut self, row: usize) -> &mut TerminalLine {
         let index = self.visible_start() + row.min(self.rows - 1);
         self.lines
@@ -479,9 +581,14 @@ impl TerminalScreen {
         let state = std::mem::replace(&mut self.parser, ParserState::Ground);
         match state {
             ParserState::Ground => self.apply_ground_byte(byte),
-            ParserState::Escape => self.apply_escape_byte(byte),
+            ParserState::Escape => {
+                self.push_pending_control_byte(byte);
+                self.apply_escape_byte(byte);
+            }
             ParserState::Osc => {
+                self.push_pending_control_byte(byte);
                 if byte == 0x07 {
+                    self.clear_pending_control();
                     self.parser = ParserState::Ground;
                 } else if byte == 0x1b {
                     self.parser = ParserState::OscEscape;
@@ -490,7 +597,9 @@ impl TerminalScreen {
                 }
             }
             ParserState::OscEscape => {
+                self.push_pending_control_byte(byte);
                 self.parser = if byte == b'\\' {
+                    self.clear_pending_control();
                     ParserState::Ground
                 } else {
                     ParserState::Osc
@@ -501,6 +610,7 @@ impl TerminalScreen {
                 mut params,
                 mut current,
             } => {
+                self.push_pending_control_byte(byte);
                 if byte == b'?' {
                     private = true;
                     self.parser = ParserState::Csi {
@@ -531,6 +641,7 @@ impl TerminalScreen {
                 } else if (0x40..=0x7e).contains(&byte) {
                     params.push(current.take());
                     self.parser = ParserState::Ground;
+                    self.clear_pending_control();
                     self.dispatch_csi(private, &params, byte as char);
                 } else {
                     self.parser = ParserState::Csi {
@@ -547,6 +658,8 @@ impl TerminalScreen {
         match byte {
             0x1b => {
                 self.flush_invalid_utf8();
+                self.pending_control.clear();
+                self.push_pending_control_byte(byte);
                 self.parser = ParserState::Escape;
             }
             b'\r' => {
@@ -588,6 +701,7 @@ impl TerminalScreen {
             b']' => ParserState::Osc,
             b'7' => {
                 self.saved_cursor = Some((self.cursor_row, self.cursor_col));
+                self.clear_pending_control();
                 ParserState::Ground
             }
             b'8' => {
@@ -595,6 +709,17 @@ impl TerminalScreen {
                     self.cursor_row = row.min(self.rows - 1);
                     self.cursor_col = col.min(self.cols - 1);
                 }
+                self.clear_pending_control();
+                ParserState::Ground
+            }
+            b'=' => {
+                self.modes.application_keypad = true;
+                self.clear_pending_control();
+                ParserState::Ground
+            }
+            b'>' => {
+                self.modes.application_keypad = false;
+                self.clear_pending_control();
                 ParserState::Ground
             }
             b'c' => {
@@ -602,10 +727,27 @@ impl TerminalScreen {
                 self.clear_screen();
                 self.cursor_row = 0;
                 self.cursor_col = 0;
+                self.saved_cursor = None;
+                self.current_style = CellStyle::default();
+                self.modes = TerminalModes::default();
+                self.clear_pending_control();
                 ParserState::Ground
             }
-            _ => ParserState::Ground,
+            _ => {
+                self.clear_pending_control();
+                ParserState::Ground
+            }
         };
+    }
+
+    fn push_pending_control_byte(&mut self, byte: u8) {
+        if self.pending_control.len() < MAX_PENDING_CONTROL_BYTES {
+            self.pending_control.push(byte);
+        }
+    }
+
+    fn clear_pending_control(&mut self) {
+        self.pending_control.clear();
     }
 
     fn push_utf8_byte(&mut self, byte: u8) {
@@ -644,7 +786,7 @@ impl TerminalScreen {
             'D' => self.cursor_col = self.cursor_col.saturating_sub(param_or(params, 0, 1)),
             'G' => self.cursor_col = one_based_param(params, 0).min(self.cols - 1),
             'H' | 'f' => {
-                self.cursor_row = one_based_param(params, 0).min(self.rows - 1);
+                self.cursor_row = self.cursor_row_from_param(params, 0);
                 self.cursor_col = one_based_param(params, 1).min(self.cols - 1);
             }
             'J' => self.erase_display(param_or(params, 0, 0)),
@@ -653,9 +795,11 @@ impl TerminalScreen {
             'r' => self.set_scroll_region(params),
             'S' => self.scroll_up(param_or(params, 0, 1)),
             'T' => self.scroll_down(param_or(params, 0, 1)),
-            'd' => self.cursor_row = one_based_param(params, 0).min(self.rows - 1),
-            'h' if private && has_param(params, 1049) => self.enter_alternate_screen(),
-            'l' if private && has_param(params, 1049) => self.leave_alternate_screen(),
+            'd' => self.cursor_row = self.cursor_row_from_param(params, 0),
+            'h' if private => self.set_private_modes(params, true),
+            'l' if private => self.set_private_modes(params, false),
+            'h' => self.set_public_modes(params, true),
+            'l' => self.set_public_modes(params, false),
             _ => {}
         }
     }
@@ -666,12 +810,20 @@ impl TerminalScreen {
             return;
         }
         if self.cursor_col >= self.cols || (width > 1 && self.cursor_col + width > self.cols) {
-            self.cursor_col = 0;
-            self.line_feed();
+            if self.modes.auto_wrap {
+                self.cursor_col = 0;
+                self.line_feed();
+            } else {
+                self.cursor_col = self.cols.saturating_sub(width.min(self.cols));
+            }
         }
         let cursor_col = self.cursor_col;
         let current_style = self.current_style.clone();
+        let insert = self.modes.insert;
         let line = self.visible_line_mut(self.cursor_row);
+        if insert {
+            insert_blank_cells(line, cursor_col, width, &current_style);
+        }
         line.touched = true;
         line.cells[cursor_col] = TerminalCell {
             character,
@@ -684,7 +836,11 @@ impl TerminalScreen {
                     TerminalCell::wide_continuation(&line.cells[cursor_col].style);
             }
         }
-        self.cursor_col += width;
+        if self.modes.auto_wrap {
+            self.cursor_col += width;
+        } else {
+            self.cursor_col = (self.cursor_col + width).min(self.cols - 1);
+        }
     }
 
     fn line_feed(&mut self) {
@@ -782,11 +938,19 @@ impl TerminalScreen {
                 cursor_col: self.cursor_col,
                 saved_cursor: self.saved_cursor,
                 current_style: self.current_style.clone(),
+                modes: self.modes.clone(),
                 scroll_top: self.scroll_top,
                 scroll_bottom: self.scroll_bottom,
             });
         }
+        let current_style = self.current_style.clone();
+        let modes = self.modes.clone();
         self.reset_screen_buffer();
+        // 中文注释：alternate screen 是另一块屏幕缓冲，不是终端模式重置。
+        // bracketed paste、mouse、application cursor/keypad 等 VT mode 会影响后续 tail，
+        // 不能因为进入 alt screen 就在 daemon snapshot 里丢失。
+        self.current_style = current_style;
+        self.modes = modes;
     }
 
     fn leave_alternate_screen(&mut self) {
@@ -797,6 +961,7 @@ impl TerminalScreen {
             self.cursor_col = saved.cursor_col.min(self.cols - 1);
             self.saved_cursor = saved.saved_cursor;
             self.current_style = saved.current_style;
+            self.modes = saved.modes;
             self.scroll_top = saved.scroll_top.min(self.rows - 1);
             self.scroll_bottom = saved.scroll_bottom.min(self.rows).max(self.scroll_top + 1);
         } else {
@@ -815,6 +980,7 @@ impl TerminalScreen {
         self.cursor_col = 0;
         self.saved_cursor = None;
         self.current_style = CellStyle::default();
+        self.modes = TerminalModes::default();
         self.scroll_top = 0;
         self.scroll_bottom = self.rows;
     }
@@ -825,8 +991,58 @@ impl TerminalScreen {
         self.scroll_top = top;
         self.scroll_bottom = bottom;
         // DECSTBM 会把光标移动到 home；后续输出通常会再显式定位。
-        self.cursor_row = 0;
+        self.cursor_row = self.home_row();
         self.cursor_col = 0;
+    }
+
+    fn cursor_row_from_param(&self, params: &[Option<u16>], index: usize) -> usize {
+        let row = one_based_param(params, index);
+        if self.modes.origin {
+            return (self.scroll_top + row).min(self.scroll_bottom.saturating_sub(1));
+        }
+        row.min(self.rows - 1)
+    }
+
+    fn home_row(&self) -> usize {
+        if self.modes.origin {
+            self.scroll_top.min(self.rows - 1)
+        } else {
+            0
+        }
+    }
+
+    fn set_public_modes(&mut self, params: &[Option<u16>], enabled: bool) {
+        for param in params.iter().filter_map(|value| *value) {
+            if param == 4 {
+                self.modes.insert = enabled;
+            }
+        }
+    }
+
+    fn set_private_modes(&mut self, params: &[Option<u16>], enabled: bool) {
+        for param in params.iter().filter_map(|value| *value) {
+            match param {
+                1 => self.modes.application_cursor = enabled,
+                6 => {
+                    self.modes.origin = enabled;
+                    self.cursor_row = self.home_row();
+                    self.cursor_col = 0;
+                }
+                7 => self.modes.auto_wrap = enabled,
+                66 => self.modes.application_keypad = enabled,
+                1000 | 1002 | 1003 | 1005 | 1006 | 1015 => {
+                    if enabled {
+                        self.modes.mouse_modes.insert(param);
+                    } else {
+                        self.modes.mouse_modes.remove(&param);
+                    }
+                }
+                1049 if enabled => self.enter_alternate_screen(),
+                1049 => self.leave_alternate_screen(),
+                2004 => self.modes.bracketed_paste = enabled,
+                _ => {}
+            }
+        }
     }
 
     fn erase_display(&mut self, mode: usize) {
@@ -912,8 +1128,113 @@ fn one_based_param(params: &[Option<u16>], index: usize) -> usize {
     param_or(params, index, 1).saturating_sub(1)
 }
 
-fn has_param(params: &[Option<u16>], expected: u16) -> bool {
-    params.iter().any(|value| *value == Some(expected))
+fn snapshot_state_bytes(
+    lines: &VecDeque<TerminalLine>,
+    rows: usize,
+    cols: usize,
+    cursor_row: usize,
+    cursor_col: usize,
+    saved_cursor: Option<(usize, usize)>,
+    current_style: &CellStyle,
+    modes: &TerminalModes,
+    scroll_top: usize,
+    scroll_bottom: usize,
+) -> Vec<u8> {
+    let mut output = Vec::new();
+    let Some((start, end)) = snapshot_line_bounds_for(lines, rows) else {
+        output.extend_from_slice(&modes.restore_bytes());
+        output.extend_from_slice(&scroll_region_bytes(scroll_top, scroll_bottom, rows));
+        output.extend_from_slice(&saved_cursor_restore_bytes(saved_cursor, cols, rows));
+        output.extend_from_slice(cursor_position_bytes(cursor_row, cursor_col, cols).as_bytes());
+        if !current_style.is_default() {
+            output.extend_from_slice(&current_style.sgr_bytes(false));
+        }
+        return output;
+    };
+
+    for (index, row) in lines.iter().enumerate().skip(start).take(end - start) {
+        output.extend_from_slice(&row_ansi_bytes(row));
+        if index + 1 < end {
+            output.extend_from_slice(b"\r\n");
+        }
+    }
+    output.extend_from_slice(&modes.restore_bytes());
+    output.extend_from_slice(&scroll_region_bytes(scroll_top, scroll_bottom, rows));
+    output.extend_from_slice(&saved_cursor_restore_bytes(saved_cursor, cols, rows));
+    output.extend_from_slice(cursor_position_bytes(cursor_row, cursor_col, cols).as_bytes());
+    // 中文注释：snapshot 写完内容后必须恢复当前 SGR 状态；否则后续 tail 如果依赖
+    // 终端里仍处于红色/背景色等状态，重新 attach 的 xterm 会按默认样式继续渲染。
+    if !current_style.is_default() {
+        output.extend_from_slice(&current_style.sgr_bytes(false));
+    }
+    output
+}
+
+fn snapshot_line_bounds_for(lines: &VecDeque<TerminalLine>, rows: usize) -> Option<(usize, usize)> {
+    let first_visible = lines
+        .iter()
+        .position(|line| line.touched || !line.is_blank())?;
+    let last_visible = lines
+        .iter()
+        .rposition(|line| line.touched || !line.is_blank())
+        .unwrap_or(first_visible);
+    let visible_start = lines.len().saturating_sub(rows);
+
+    // 如果内容只存在于当前 viewport 的中下部，也要从 viewport 顶部开始回放。
+    // 这样绝对光标定位或局部刷新后的第 N 行不会被压到第 1 行。
+    let start = if first_visible >= visible_start {
+        visible_start
+    } else {
+        first_visible
+    };
+    Some((start, last_visible + 1))
+}
+
+fn scroll_region_bytes(scroll_top: usize, scroll_bottom: usize, rows: usize) -> Vec<u8> {
+    if scroll_top == 0 && scroll_bottom == rows {
+        return b"\x1b[r".to_vec();
+    }
+    format!(
+        "\x1b[{};{}r",
+        scroll_top + 1,
+        scroll_bottom.min(rows).max(1)
+    )
+    .into_bytes()
+}
+
+fn cursor_position_bytes(cursor_row: usize, cursor_col: usize, cols: usize) -> String {
+    format!("\x1b[{};{}H", cursor_row + 1, cursor_col.min(cols - 1) + 1)
+}
+
+fn saved_cursor_restore_bytes(
+    saved_cursor: Option<(usize, usize)>,
+    cols: usize,
+    rows: usize,
+) -> Vec<u8> {
+    let Some((saved_row, saved_col)) = saved_cursor else {
+        return Vec::new();
+    };
+    // 中文注释：ESC 7 只能保存“当前光标”，因此先临时移动到 saved cursor 保存，
+    // 再由调用方已经写出的最终 cursor CSI 把实际光标位置恢复回来。
+    format!(
+        "\x1b[{};{}H\x1b7",
+        saved_row.min(rows - 1) + 1,
+        saved_col.min(cols - 1) + 1
+    )
+    .into_bytes()
+}
+
+fn insert_blank_cells(line: &mut TerminalLine, cursor_col: usize, width: usize, style: &CellStyle) {
+    if cursor_col >= line.cells.len() || width == 0 {
+        return;
+    }
+    let shift = width.min(line.cells.len() - cursor_col);
+    for index in (cursor_col + shift..line.cells.len()).rev() {
+        line.cells[index] = line.cells[index - shift].clone();
+    }
+    for index in cursor_col..cursor_col + shift {
+        line.cells[index] = TerminalCell::styled_blank(style);
+    }
 }
 
 fn parse_extended_color(values: &[u16]) -> Option<(SgrColor, usize)> {
@@ -1109,7 +1430,7 @@ mod tests {
     }
 
     #[test]
-    fn alternate_screen_snapshot_drops_previous_scrollback() {
+    fn alternate_screen_snapshot_keeps_alt_as_active_screen() {
         let mut screen = TerminalScreen::new(6, 20);
 
         screen.apply(b"shell scrollback\nbefore tui\n\x1b[?1049h\x1b[3;1HTUI");
@@ -1120,9 +1441,143 @@ mod tests {
             "alternate screen snapshot should preserve TUI row coordinates: {snapshot:?}"
         );
         assert!(
-            !snapshot.contains("shell scrollback") && !snapshot.contains("before tui"),
-            "alternate screen snapshot should not replay previous shell scrollback: {snapshot:?}"
+            snapshot.contains("\x1b[?1049h"),
+            "alternate screen snapshot should explicitly switch to alt screen: {snapshot:?}"
         );
+    }
+
+    #[test]
+    fn alternate_screen_snapshot_rebuilds_normal_buffer_before_switching_to_alt() {
+        let mut source = TerminalScreen::new(4, 20);
+
+        // 中文注释：用户 attach 到 vim/top 这类 alternate screen 时，snapshot 不能只包含
+        // 当前 TUI 页；它还要先重建普通屏，这样 TUI 退出后 xterm 能恢复原来的 shell 内容。
+        source.apply(b"shell-1\nshell-2\x1b[?1049h\x1b[2;1HTUI");
+
+        let snapshot = source.snapshot_bytes();
+        let snapshot_text = String::from_utf8_lossy(&snapshot);
+        let normal_index = snapshot_text
+            .find("shell-1")
+            .expect("snapshot should contain normal screen content");
+        let alt_switch_index = snapshot_text
+            .find("\x1b[?1049h")
+            .expect("snapshot should switch to alternate screen");
+        let alt_index = snapshot_text
+            .find("TUI")
+            .expect("snapshot should contain active alternate screen content");
+        assert!(
+            normal_index < alt_switch_index && alt_switch_index < alt_index,
+            "snapshot should replay normal screen, then switch to alt, then replay alt: {snapshot_text:?}"
+        );
+
+        let mut replayed = TerminalScreen::new(4, 20);
+        replayed.apply(&snapshot);
+        replayed.apply(b"\x1b[?1049l");
+
+        assert!(
+            replayed
+                .cached_plain_lines()
+                .iter()
+                .any(|line| line == "shell-1"),
+            "leaving alt after snapshot should restore normal scrollback: {:?}",
+            replayed.cached_plain_lines()
+        );
+        assert_eq!(
+            replayed.visible_lines()[1],
+            "shell-2",
+            "normal screen cursor/page should survive alternate screen restore"
+        );
+    }
+
+    #[test]
+    fn snapshot_restores_modes_needed_by_following_tail() {
+        let mut source = TerminalScreen::new(4, 5);
+
+        // 中文注释：tail 里可能只包含后半段输出。如果 snapshot 没有恢复 wrap/origin/insert
+        // 等模式，后续 tail 会被 xterm 按错误语义解释，表现为行错位或字符插入位置错误。
+        source.apply(b"\x1b[?7l12345");
+        let snapshot = source.snapshot_bytes();
+        source.apply(b"X\x1b[2;4r\x1b[?6h\x1b[1;1HORG\x1b[4h\x1b[2;2HI");
+
+        let mut replayed = TerminalScreen::new(4, 5);
+        replayed.apply(&snapshot);
+        replayed.apply(b"X\x1b[2;4r\x1b[?6h\x1b[1;1HORG\x1b[4h\x1b[2;2HI");
+
+        assert_eq!(
+            replayed.visible_lines(),
+            source.visible_lines(),
+            "snapshot 应恢复影响后续 tail 解释的终端模式"
+        );
+    }
+
+    #[test]
+    fn alternate_screen_switch_keeps_modes_needed_by_following_tail() {
+        let mut source = TerminalScreen::new(4, 10);
+
+        // 中文注释：bracketed paste、mouse、application cursor/keypad 这类 mode 是终端状态，
+        // 不是普通屏缓冲内容。进入 alternate screen 时不能把它们清掉，否则 attach 后 tail
+        // 会按错误输入/鼠标协议解释。
+        source.apply(b"\x1b[?1h\x1b=\x1b[?1006h\x1b[?2004h\x1b[?1049hTUI");
+        let snapshot = source.snapshot_bytes();
+        let snapshot_text = String::from_utf8_lossy(&snapshot);
+
+        assert!(
+            snapshot_text.contains("\x1b[?1h"),
+            "snapshot should preserve application cursor mode: {snapshot_text:?}"
+        );
+        assert!(
+            snapshot_text.contains("\x1b="),
+            "snapshot should preserve application keypad mode: {snapshot_text:?}"
+        );
+        assert!(
+            snapshot_text.contains("\x1b[?1006h"),
+            "snapshot should preserve SGR mouse mode: {snapshot_text:?}"
+        );
+        assert!(
+            snapshot_text.contains("\x1b[?2004h"),
+            "snapshot should preserve bracketed paste mode: {snapshot_text:?}"
+        );
+    }
+
+    #[test]
+    fn snapshot_preserves_incomplete_control_sequence_for_tail() {
+        let mut source = TerminalScreen::new(2, 20);
+
+        // 中文注释：PTY 读取边界可能切在 CSI 中间；snapshot 必须把未完成控制序列
+        // 附在末尾，让后续 tail 能继续完成它，而不是把 `mred` 当普通文本打印。
+        source.apply(b"plain \x1b[31");
+        let snapshot = source.snapshot_bytes();
+        source.apply(b"mred");
+
+        let mut replayed = TerminalScreen::new(2, 20);
+        replayed.apply(&snapshot);
+        replayed.apply(b"mred");
+
+        assert_eq!(replayed.visible_lines(), source.visible_lines());
+        let replayed_snapshot = String::from_utf8(replayed.snapshot_bytes()).unwrap();
+        assert!(
+            replayed_snapshot.contains("\x1b[31mred\x1b[0m"),
+            "tail should continue the pending CSI and render red text: {replayed_snapshot:?}"
+        );
+    }
+
+    #[test]
+    fn snapshot_preserves_incomplete_utf8_for_tail() {
+        let mut source = TerminalScreen::new(2, 20);
+
+        // 中文注释：PTY chunk 也可能切在 UTF-8 字符中间；snapshot 需要带上这几个
+        // 未完成字节，否则 tail 到来后会被当成坏编码并产生替换字符。
+        source.apply(b"prefix ");
+        source.apply(&[0xe4, 0xb8]);
+        let snapshot = source.snapshot_bytes();
+        source.apply(&[0xad]);
+
+        let mut replayed = TerminalScreen::new(2, 20);
+        replayed.apply(&snapshot);
+        replayed.apply(&[0xad]);
+
+        assert_eq!(replayed.visible_lines(), source.visible_lines());
+        assert_eq!(replayed.visible_lines()[0], "prefix 中");
     }
 
     #[test]

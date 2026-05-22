@@ -5,10 +5,12 @@
 //! 统一封装为 E2EE 内的 `packet`。relay 因而只能看到 server_id、sequence 和密文。
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
 use futures_util::{SinkExt, StreamExt};
+use rustls::{ClientConfig, RootCertStore};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use termd::auth::{
@@ -19,28 +21,37 @@ use termd::net::protocol::{JsonEnvelope, decode_payload, envelope_value};
 use termd::net::signature::Ed25519SignatureVerifier;
 use termd::net::{
     E2eeKeyPair, E2eePeerPublicKey, E2eeSession, E2eeSessionContext, E2eeSessionRole,
+    decode_binary_encrypted_frame, encode_binary_encrypted_frame,
 };
 use termd_proto::{
-    AuthChallengePayload, AuthPayload, ControlGrantPayload, ControlRequestPayload, DeviceId,
-    E2eeKeyExchangePayload, EncryptedFramePayload, ErrorPayload, MessageType,
+    AuthChallengePayload, AuthPayload, BINARY_PROTOCOL_VERSION, BinaryPacketErrorPayload,
+    BinaryPacketKind, BinaryProtocolPacket, BinarySessionDataPayload, BinaryTerminalFrameKind,
+    BinaryTerminalFramePayload, BinaryTerminalSize, ControlGrantPayload, ControlRequestPayload,
+    DeviceId, E2eeKeyExchangePayload, EncryptedFramePayload, ErrorPayload, MessageType,
     PROTOCOL_PACKET_VERSION, PacketErrorPayload, PacketKind, PacketRequestId, PacketStreamId,
     PairAcceptPayload, PairRequestPayload, PairingToken, PingPayload, PongPayload, ProtocolPacket,
     ProtocolVersion, PublicKey, RouteHelloPayload, RouteReadyPayload, RouteRole, ServerId,
     SessionAttachPayload, SessionAttachedPayload, SessionCreatePayload, SessionCreatedPayload,
     SessionDataPayload, SessionId, SessionListPayload, SessionListResultPayload,
     SessionResizePayload, SessionResizedPayload, TerminalFramePayload, TerminalSize,
+    binary_protocol_packet, decode_binary_protocol_packet, encode_binary_protocol_packet,
 };
 use tokio::net::TcpStream;
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
+use tokio_tungstenite::{Connector, MaybeTlsStream, WebSocketStream};
+use uuid::Uuid;
 
 use crate::crypto;
 use crate::error::{Result, TermctlError};
 use crate::state::PairedServerState;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const CONNECT_ATTEMPTS: usize = 3;
+const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(200);
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
+const SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const METHOD_PAIR_REQUEST: &str = "pair.request";
 const METHOD_AUTH: &str = "auth";
 const METHOD_AUTH_CHALLENGE: &str = "auth.challenge";
@@ -116,6 +127,7 @@ pub struct DirectClient {
     device_id: DeviceId,
     daemon_identity: DaemonPublicIdentity,
     e2ee_auth_transcript: E2eeAuthTranscript,
+    binary_mode: bool,
 }
 
 impl DirectClient {
@@ -125,7 +137,7 @@ impl DirectClient {
         device_id: DeviceId,
         expected_daemon_public_key: PublicKey,
     ) -> Result<Self> {
-        let (mut socket, _) = connect_async(url)
+        let (mut socket, _) = connect_websocket(url)
             .await
             .map_err(|_| TermctlError::ConnectFailed)?;
 
@@ -138,6 +150,7 @@ impl DirectClient {
                     role: RouteRole::Client,
                     protocol_version: ProtocolVersion(PROTOCOL_PACKET_VERSION),
                     nonce: crypto::nonce(),
+                    route_generation: None,
                     timestamp_ms: crypto::now_ms(),
                 },
             )?,
@@ -211,7 +224,8 @@ impl DirectClient {
             crypto::nonce(),
             crypto::now_ms(),
         )
-        .with_packet_version(ProtocolVersion(PROTOCOL_PACKET_VERSION));
+        .with_packet_version(ProtocolVersion(PROTOCOL_PACKET_VERSION))
+        .with_binary_version(ProtocolVersion(BINARY_PROTOCOL_VERSION));
         let e2ee_auth_transcript = E2eeAuthTranscript::from_key_exchanges(
             &server_e2ee_exchange,
             &device_e2ee_exchange,
@@ -223,6 +237,9 @@ impl DirectClient {
             device_id,
             daemon_identity,
             e2ee_auth_transcript,
+            binary_mode: server_e2ee_exchange
+                .binary_version
+                .is_some_and(|version| version.0 == BINARY_PROTOCOL_VERSION),
         };
 
         client
@@ -437,24 +454,42 @@ impl DirectClient {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub async fn receive_inner(&mut self) -> Result<JsonEnvelope> {
-        let envelope = read_outer(&mut self.socket).await?;
+        let message = read_outer_message(&mut self.socket).await?;
 
-        match envelope.kind {
-            MessageType::EncryptedFrame => {
-                let frame: EncryptedFramePayload =
-                    decode_payload(envelope.payload).map_err(|_| TermctlError::InvalidEnvelope)?;
-                let inner: JsonEnvelope = self
-                    .e2ee
-                    .decrypt_json_payload(&frame)
-                    .map_err(|_| TermctlError::E2eeFailed)?;
-                if inner.kind == MessageType::Error {
-                    return Err(protocol_error(inner.payload));
+        match message {
+            OuterMessage::Json(envelope) => match envelope.kind {
+                MessageType::EncryptedFrame => {
+                    let frame: EncryptedFramePayload = decode_payload(envelope.payload)
+                        .map_err(|_| TermctlError::InvalidEnvelope)?;
+                    let inner: JsonEnvelope = self
+                        .e2ee
+                        .decrypt_json_payload(&frame)
+                        .map_err(|_| TermctlError::E2eeFailed)?;
+                    if inner.kind == MessageType::Error {
+                        return Err(protocol_error(inner.payload));
+                    }
+                    Ok(inner)
                 }
-                Ok(inner)
+                MessageType::Error => Err(protocol_error(envelope.payload)),
+                _ => Err(TermctlError::UnexpectedMessage),
+            },
+            OuterMessage::Binary(raw) => {
+                let frame = decode_binary_encrypted_frame(&raw)
+                    .map_err(|_| TermctlError::InvalidEnvelope)?;
+                let plaintext = self
+                    .e2ee
+                    .decrypt_binary_payload(&frame)
+                    .map_err(|_| TermctlError::E2eeFailed)?;
+                let binary_packet = decode_binary_protocol_packet(&plaintext)
+                    .map_err(|_| TermctlError::InvalidEnvelope)?;
+                let packet = protocol_packet_from_binary(binary_packet)?;
+                if packet.kind == PacketKind::Error {
+                    return Err(packet_error(packet.payload));
+                }
+                Ok(packet_envelope(packet)?)
             }
-            MessageType::Error => Err(protocol_error(envelope.payload)),
-            _ => Err(TermctlError::UnexpectedMessage),
         }
     }
 
@@ -464,7 +499,7 @@ impl DirectClient {
         T: DeserializeOwned,
     {
         let request_id = PacketRequestId::new();
-        self.send_inner(packet_request_envelope(request_id, method, payload)?)
+        self.send_packet(packet_request(request_id, method, payload)?)
             .await?;
         self.expect_packet_response(request_id, method).await
     }
@@ -506,18 +541,43 @@ impl DirectClient {
         }
     }
 
-    async fn send_packet(&mut self, packet: ProtocolPacket<Value>) -> Result<()> {
-        self.send_inner(packet_envelope(packet)?).await
-    }
-
     async fn receive_packet(&mut self) -> Result<ProtocolPacket<Value>> {
-        let envelope = self.receive_inner().await?;
-        if envelope.kind != MessageType::Packet {
-            return Err(TermctlError::UnexpectedMessage);
-        }
+        let message = read_outer_message(&mut self.socket).await?;
 
-        let packet: ProtocolPacket<Value> =
-            decode_payload(envelope.payload).map_err(|_| TermctlError::InvalidEnvelope)?;
+        let packet = match message {
+            OuterMessage::Json(envelope) => match envelope.kind {
+                MessageType::EncryptedFrame => {
+                    let frame: EncryptedFramePayload = decode_payload(envelope.payload)
+                        .map_err(|_| TermctlError::InvalidEnvelope)?;
+                    let inner: JsonEnvelope = self
+                        .e2ee
+                        .decrypt_json_payload(&frame)
+                        .map_err(|_| TermctlError::E2eeFailed)?;
+                    if inner.kind == MessageType::Error {
+                        return Err(protocol_error(inner.payload));
+                    }
+                    if inner.kind != MessageType::Packet {
+                        return Err(TermctlError::UnexpectedMessage);
+                    }
+                    decode_payload(inner.payload).map_err(|_| TermctlError::InvalidEnvelope)?
+                }
+                MessageType::Error => return Err(protocol_error(envelope.payload)),
+                _ => return Err(TermctlError::UnexpectedMessage),
+            },
+            OuterMessage::Binary(raw) => {
+                let frame = decode_binary_encrypted_frame(&raw)
+                    .map_err(|_| TermctlError::InvalidEnvelope)?;
+                let plaintext = self
+                    .e2ee
+                    .decrypt_binary_payload(&frame)
+                    .map_err(|_| TermctlError::E2eeFailed)?;
+                protocol_packet_from_binary(
+                    decode_binary_protocol_packet(&plaintext)
+                        .map_err(|_| TermctlError::InvalidEnvelope)?,
+                )?
+            }
+        };
+
         validate_packet_version(&packet)?;
         Ok(packet)
     }
@@ -526,6 +586,22 @@ impl DirectClient {
         timeout(RESPONSE_TIMEOUT, self.receive_packet())
             .await
             .map_err(|_| TermctlError::ConnectionClosed)?
+    }
+
+    async fn send_packet(&mut self, packet: ProtocolPacket<Value>) -> Result<()> {
+        if self.binary_mode {
+            let binary_packet = protocol_packet_to_binary(packet)?;
+            let plaintext = encode_binary_protocol_packet(&binary_packet);
+            let frame = self
+                .e2ee
+                .encrypt_binary_payload(&plaintext)
+                .map_err(|_| TermctlError::E2eeFailed)?;
+            return self
+                .send_binary_outer(encode_binary_encrypted_frame(&frame))
+                .await;
+        }
+
+        self.send_inner(packet_envelope(packet)?).await
     }
 
     async fn send_inner(&mut self, inner: JsonEnvelope) -> Result<()> {
@@ -537,13 +613,83 @@ impl DirectClient {
             .await
     }
 
-    async fn send_outer(&mut self, envelope: JsonEnvelope) -> Result<()> {
-        let raw = serde_json::to_string(&envelope).map_err(|_| TermctlError::InvalidEnvelope)?;
-        self.socket
-            .send(Message::Text(raw.into()))
+    async fn send_binary_outer(&mut self, raw: Vec<u8>) -> Result<()> {
+        timeout(SEND_TIMEOUT, self.socket.send(Message::Binary(raw.into())))
             .await
+            .map_err(|_| TermctlError::SendFailed)?
             .map_err(|_| TermctlError::SendFailed)
     }
+
+    async fn send_outer(&mut self, envelope: JsonEnvelope) -> Result<()> {
+        let raw = serde_json::to_string(&envelope).map_err(|_| TermctlError::InvalidEnvelope)?;
+        timeout(SEND_TIMEOUT, self.socket.send(Message::Text(raw.into())))
+            .await
+            .map_err(|_| TermctlError::SendFailed)?
+            .map_err(|_| TermctlError::SendFailed)
+    }
+}
+
+async fn connect_websocket(
+    url: &str,
+) -> Result<(
+    WsStream,
+    tokio_tungstenite::tungstenite::handshake::client::Response,
+)> {
+    for attempt in 1..=CONNECT_ATTEMPTS {
+        let result = timeout(
+            CONNECT_TIMEOUT,
+            tokio_tungstenite::connect_async_tls_with_config(
+                url,
+                None,
+                false,
+                Some(termctl_tls_connector()),
+            ),
+        )
+        .await
+        .map_err(|_| TermctlError::ConnectFailed)
+        .and_then(|result| result.map_err(|_| TermctlError::ConnectFailed));
+
+        match result {
+            Ok(socket) => return Ok(socket),
+            Err(error) if attempt < CONNECT_ATTEMPTS => {
+                // termctl 是一次性 CLI，没有 daemon/web 那样的长连接自动恢复；TCP/TLS 建连阶段
+                // 允许很短的重试，避免公网入口瞬时抖动直接变成用户可见失败。
+                let _ = error;
+                sleep(CONNECT_RETRY_DELAY).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(TermctlError::ConnectFailed)
+}
+
+fn termctl_tls_connector() -> Connector {
+    Connector::Rustls(Arc::new(termctl_tls_client_config()))
+}
+
+fn termctl_tls_client_config() -> ClientConfig {
+    let mut root_store = RootCertStore::empty();
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+    let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+    provider.kx_groups = termctl_tls_kx_groups();
+
+    // 部分公网 TLS 入口会吞掉 rustls 默认 hybrid ClientHello；termctl 作为人工操作工具，
+    // 这里和 daemon relay 连接保持一致，优先使用传统 ECDHE，避免连接建立阶段假死。
+    ClientConfig::builder_with_provider(Arc::new(provider))
+        .with_safe_default_protocol_versions()
+        .expect("termctl TLS protocol versions should be valid")
+        .with_root_certificates(root_store)
+        .with_no_client_auth()
+}
+
+fn termctl_tls_kx_groups() -> Vec<&'static dyn rustls::crypto::SupportedKxGroup> {
+    vec![
+        rustls::crypto::aws_lc_rs::kx_group::X25519,
+        rustls::crypto::aws_lc_rs::kx_group::SECP256R1,
+        rustls::crypto::aws_lc_rs::kx_group::SECP384R1,
+    ]
 }
 
 async fn expect_outer_payload<T>(socket: &mut WsStream, expected: MessageType) -> Result<T>
@@ -565,23 +711,37 @@ where
 
 async fn send_outer_on_socket(socket: &mut WsStream, envelope: JsonEnvelope) -> Result<()> {
     let raw = serde_json::to_string(&envelope).map_err(|_| TermctlError::InvalidEnvelope)?;
-    socket
-        .send(Message::Text(raw.into()))
+    timeout(SEND_TIMEOUT, socket.send(Message::Text(raw.into())))
         .await
+        .map_err(|_| TermctlError::SendFailed)?
         .map_err(|_| TermctlError::SendFailed)
 }
 
 async fn read_outer(socket: &mut WsStream) -> Result<JsonEnvelope> {
+    match read_outer_message(socket).await? {
+        OuterMessage::Json(envelope) => Ok(envelope),
+        // 握手阶段还没有 E2EE session，daemon 不应发送 binary E2EE frame。
+        OuterMessage::Binary(_) => Err(TermctlError::UnexpectedMessage),
+    }
+}
+
+enum OuterMessage {
+    Json(JsonEnvelope),
+    Binary(Vec<u8>),
+}
+
+async fn read_outer_message(socket: &mut WsStream) -> Result<OuterMessage> {
     while let Some(message) = socket.next().await {
         let message = message.map_err(|_| TermctlError::ReceiveFailed)?;
 
         match message {
             Message::Text(raw) => {
-                return serde_json::from_str(raw.as_str())
-                    .map_err(|_| TermctlError::InvalidEnvelope);
+                let envelope = serde_json::from_str(raw.as_str())
+                    .map_err(|_| TermctlError::InvalidEnvelope)?;
+                return Ok(OuterMessage::Json(envelope));
             }
             Message::Binary(raw) => {
-                return serde_json::from_slice(&raw).map_err(|_| TermctlError::InvalidEnvelope);
+                return Ok(OuterMessage::Binary(raw.to_vec()));
             }
             Message::Ping(payload) => {
                 socket
@@ -626,6 +786,7 @@ fn verify_daemon_e2ee_key_exchange(
         .map_err(|_| TermctlError::E2eeFailed)
 }
 
+#[cfg(test)]
 fn packet_request_envelope<P>(
     request_id: PacketRequestId,
     method: &'static str,
@@ -636,6 +797,18 @@ where
 {
     let payload = serde_json::to_value(payload).map_err(|_| TermctlError::InvalidEnvelope)?;
     packet_envelope(ProtocolPacket::request(request_id, method, payload))
+}
+
+fn packet_request<P>(
+    request_id: PacketRequestId,
+    method: &'static str,
+    payload: P,
+) -> Result<ProtocolPacket<Value>>
+where
+    P: Serialize,
+{
+    let payload = serde_json::to_value(payload).map_err(|_| TermctlError::InvalidEnvelope)?;
+    Ok(ProtocolPacket::request(request_id, method, payload))
 }
 
 fn packet_stream_open<P>(
@@ -718,6 +891,315 @@ fn packet_envelope(packet: ProtocolPacket<Value>) -> Result<JsonEnvelope> {
     envelope_value(MessageType::Packet, packet).map_err(Into::into)
 }
 
+fn protocol_packet_to_binary(packet: ProtocolPacket<Value>) -> Result<BinaryProtocolPacket> {
+    let payload = match packet.kind {
+        PacketKind::StreamChunk => binary_stream_chunk_payload(&packet.payload)?,
+        PacketKind::Error => {
+            let error: PacketErrorPayload =
+                decode_payload(packet.payload).map_err(|_| TermctlError::InvalidEnvelope)?;
+            Some(binary_protocol_packet::Payload::Error(
+                BinaryPacketErrorPayload {
+                    code: error.code,
+                    message: error.message,
+                    retryable: error.retryable,
+                },
+            ))
+        }
+        _ => Some(binary_protocol_packet::Payload::Json(
+            serde_json::to_vec(&packet.payload).map_err(|_| TermctlError::InvalidEnvelope)?,
+        )),
+    };
+
+    Ok(BinaryProtocolPacket {
+        version: u32::from(packet.version),
+        kind: binary_packet_kind(packet.kind),
+        id: packet
+            .id
+            .map(|id| id.0.as_bytes().to_vec())
+            .unwrap_or_default(),
+        stream_id: packet
+            .stream_id
+            .map(|stream_id| stream_id.0.as_bytes().to_vec())
+            .unwrap_or_default(),
+        method: packet.method.unwrap_or_default(),
+        seq: packet.seq,
+        ack: packet.ack.unwrap_or(0),
+        credit: packet.credit.unwrap_or(0),
+        payload,
+    })
+}
+
+fn protocol_packet_from_binary(packet: BinaryProtocolPacket) -> Result<ProtocolPacket<Value>> {
+    let kind = packet_kind_from_binary(packet.kind)?;
+    let payload = match packet.payload {
+        Some(binary_protocol_packet::Payload::Json(bytes)) => {
+            serde_json::from_slice(&bytes).map_err(|_| TermctlError::InvalidEnvelope)?
+        }
+        Some(binary_protocol_packet::Payload::SessionData(payload)) => {
+            serde_json::to_value(SessionDataPayload {
+                session_id: session_id_from_binary(&payload.session_id)?,
+                data_base64: crypto::encode_session_data(&payload.data),
+            })
+            .map_err(|_| TermctlError::InvalidEnvelope)?
+        }
+        Some(binary_protocol_packet::Payload::TerminalFrame(payload)) => {
+            serde_json::to_value(terminal_frame_from_binary(payload)?)
+                .map_err(|_| TermctlError::InvalidEnvelope)?
+        }
+        Some(binary_protocol_packet::Payload::Error(error)) => {
+            serde_json::to_value(PacketErrorPayload {
+                code: error.code,
+                message: error.message,
+                retryable: error.retryable,
+            })
+            .map_err(|_| TermctlError::InvalidEnvelope)?
+        }
+        None => serde_json::json!({}),
+    };
+
+    Ok(ProtocolPacket {
+        version: packet.version as u16,
+        kind,
+        id: optional_packet_request_id(&packet.id)?,
+        stream_id: optional_packet_stream_id(&packet.stream_id)?,
+        method: (!packet.method.is_empty()).then_some(packet.method),
+        seq: packet.seq,
+        ack: (packet.ack != 0).then_some(packet.ack),
+        credit: (packet.credit != 0).then_some(packet.credit),
+        payload,
+    })
+}
+
+fn binary_stream_chunk_payload(payload: &Value) -> Result<Option<binary_protocol_packet::Payload>> {
+    if payload.get("kind").is_some() {
+        let frame = serde_json::from_value::<TerminalFramePayload>(payload.clone())
+            .map_err(|_| TermctlError::InvalidEnvelope)?;
+        return Ok(Some(binary_protocol_packet::Payload::TerminalFrame(
+            terminal_frame_to_binary(frame)?,
+        )));
+    }
+
+    if let Ok(session_data) = serde_json::from_value::<SessionDataPayload>(payload.clone()) {
+        let data = crypto::decode_session_data(&session_data.data_base64)?;
+        return Ok(Some(binary_protocol_packet::Payload::SessionData(
+            BinarySessionDataPayload {
+                session_id: session_data.session_id.0.as_bytes().to_vec(),
+                data,
+            },
+        )));
+    }
+
+    Ok(Some(binary_protocol_packet::Payload::Json(
+        serde_json::to_vec(payload).map_err(|_| TermctlError::InvalidEnvelope)?,
+    )))
+}
+
+fn binary_packet_kind(kind: PacketKind) -> i32 {
+    match kind {
+        PacketKind::Request => BinaryPacketKind::Request as i32,
+        PacketKind::Response => BinaryPacketKind::Response as i32,
+        PacketKind::Event => BinaryPacketKind::Event as i32,
+        PacketKind::StreamOpen => BinaryPacketKind::StreamOpen as i32,
+        PacketKind::StreamChunk => BinaryPacketKind::StreamChunk as i32,
+        PacketKind::StreamEnd => BinaryPacketKind::StreamEnd as i32,
+        PacketKind::Cancel => BinaryPacketKind::Cancel as i32,
+        PacketKind::Flow => BinaryPacketKind::Flow as i32,
+        PacketKind::Error => BinaryPacketKind::Error as i32,
+    }
+}
+
+fn packet_kind_from_binary(kind: i32) -> Result<PacketKind> {
+    let Some(kind) = BinaryPacketKind::try_from(kind).ok() else {
+        return Err(TermctlError::InvalidEnvelope);
+    };
+    Ok(match kind {
+        BinaryPacketKind::Request => PacketKind::Request,
+        BinaryPacketKind::Response => PacketKind::Response,
+        BinaryPacketKind::Event => PacketKind::Event,
+        BinaryPacketKind::StreamOpen => PacketKind::StreamOpen,
+        BinaryPacketKind::StreamChunk => PacketKind::StreamChunk,
+        BinaryPacketKind::StreamEnd => PacketKind::StreamEnd,
+        BinaryPacketKind::Cancel => PacketKind::Cancel,
+        BinaryPacketKind::Flow => PacketKind::Flow,
+        BinaryPacketKind::Error => PacketKind::Error,
+    })
+}
+
+fn terminal_frame_to_binary(frame: TerminalFramePayload) -> Result<BinaryTerminalFramePayload> {
+    Ok(match frame {
+        TerminalFramePayload::Snapshot {
+            session_id,
+            base_seq,
+            size,
+            data_base64,
+        } => BinaryTerminalFramePayload {
+            kind: BinaryTerminalFrameKind::Snapshot as i32,
+            session_id: session_id.0.as_bytes().to_vec(),
+            base_seq,
+            terminal_seq: 0,
+            size: Some(binary_terminal_size(size)),
+            data: crypto::decode_session_data(&data_base64)?,
+            frames: Vec::new(),
+            exit_code: None,
+        },
+        TerminalFramePayload::Output {
+            session_id,
+            terminal_seq,
+            data_base64,
+        } => BinaryTerminalFramePayload {
+            kind: BinaryTerminalFrameKind::Output as i32,
+            session_id: session_id.0.as_bytes().to_vec(),
+            base_seq: 0,
+            terminal_seq,
+            size: None,
+            data: crypto::decode_session_data(&data_base64)?,
+            frames: Vec::new(),
+            exit_code: None,
+        },
+        TerminalFramePayload::Resize {
+            session_id,
+            terminal_seq,
+            size,
+        } => BinaryTerminalFramePayload {
+            kind: BinaryTerminalFrameKind::Resize as i32,
+            session_id: session_id.0.as_bytes().to_vec(),
+            base_seq: 0,
+            terminal_seq,
+            size: Some(binary_terminal_size(size)),
+            data: Vec::new(),
+            frames: Vec::new(),
+            exit_code: None,
+        },
+        TerminalFramePayload::Exit {
+            session_id,
+            terminal_seq,
+            code,
+        } => BinaryTerminalFramePayload {
+            kind: BinaryTerminalFrameKind::Exit as i32,
+            session_id: session_id.0.as_bytes().to_vec(),
+            base_seq: 0,
+            terminal_seq,
+            size: None,
+            data: Vec::new(),
+            frames: Vec::new(),
+            exit_code: code,
+        },
+        TerminalFramePayload::Batch { session_id, frames } => BinaryTerminalFramePayload {
+            kind: BinaryTerminalFrameKind::Batch as i32,
+            session_id: session_id.0.as_bytes().to_vec(),
+            base_seq: 0,
+            terminal_seq: 0,
+            size: None,
+            data: Vec::new(),
+            frames: frames
+                .into_iter()
+                .map(terminal_frame_to_binary)
+                .collect::<Result<Vec<_>>>()?,
+            exit_code: None,
+        },
+    })
+}
+
+fn terminal_frame_from_binary(frame: BinaryTerminalFramePayload) -> Result<TerminalFramePayload> {
+    let kind = match BinaryTerminalFrameKind::try_from(frame.kind)
+        .map_err(|_| TermctlError::InvalidEnvelope)?
+    {
+        BinaryTerminalFrameKind::Unspecified if frame.size.is_some() => {
+            BinaryTerminalFrameKind::Snapshot
+        }
+        BinaryTerminalFrameKind::Unspecified => return Err(TermctlError::InvalidEnvelope),
+        kind => kind,
+    };
+    let session_id = session_id_from_binary(&frame.session_id)?;
+    Ok(match kind {
+        BinaryTerminalFrameKind::Unspecified => return Err(TermctlError::InvalidEnvelope),
+        BinaryTerminalFrameKind::Snapshot => TerminalFramePayload::Snapshot {
+            session_id,
+            base_seq: frame.base_seq,
+            size: terminal_size_from_binary(frame.size)?,
+            data_base64: crypto::encode_session_data(&frame.data),
+        },
+        BinaryTerminalFrameKind::Output => TerminalFramePayload::Output {
+            session_id,
+            terminal_seq: frame.terminal_seq,
+            data_base64: crypto::encode_session_data(&frame.data),
+        },
+        BinaryTerminalFrameKind::Resize => TerminalFramePayload::Resize {
+            session_id,
+            terminal_seq: frame.terminal_seq,
+            size: terminal_size_from_binary(frame.size)?,
+        },
+        BinaryTerminalFrameKind::Exit => TerminalFramePayload::Exit {
+            session_id,
+            terminal_seq: frame.terminal_seq,
+            code: frame.exit_code,
+        },
+        BinaryTerminalFrameKind::Batch => TerminalFramePayload::Batch {
+            session_id,
+            frames: frame
+                .frames
+                .into_iter()
+                .map(terminal_frame_from_binary)
+                .collect::<Result<Vec<_>>>()?,
+        },
+    })
+}
+
+fn binary_terminal_size(size: TerminalSize) -> BinaryTerminalSize {
+    BinaryTerminalSize {
+        rows: u32::from(size.rows),
+        cols: u32::from(size.cols),
+        pixel_width: u32::from(size.pixel_width),
+        pixel_height: u32::from(size.pixel_height),
+    }
+}
+
+fn terminal_size_from_binary(size: Option<BinaryTerminalSize>) -> Result<TerminalSize> {
+    let Some(size) = size else {
+        return Err(TermctlError::InvalidEnvelope);
+    };
+    Ok(TerminalSize {
+        rows: size
+            .rows
+            .try_into()
+            .map_err(|_| TermctlError::InvalidEnvelope)?,
+        cols: size
+            .cols
+            .try_into()
+            .map_err(|_| TermctlError::InvalidEnvelope)?,
+        pixel_width: size
+            .pixel_width
+            .try_into()
+            .map_err(|_| TermctlError::InvalidEnvelope)?,
+        pixel_height: size
+            .pixel_height
+            .try_into()
+            .map_err(|_| TermctlError::InvalidEnvelope)?,
+    })
+}
+
+fn optional_packet_request_id(bytes: &[u8]) -> Result<Option<PacketRequestId>> {
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(PacketRequestId(uuid_from_binary(bytes)?)))
+}
+
+fn optional_packet_stream_id(bytes: &[u8]) -> Result<Option<PacketStreamId>> {
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(PacketStreamId(uuid_from_binary(bytes)?)))
+}
+
+fn session_id_from_binary(bytes: &[u8]) -> Result<SessionId> {
+    Ok(SessionId(uuid_from_binary(bytes)?))
+}
+
+fn uuid_from_binary(bytes: &[u8]) -> Result<Uuid> {
+    Uuid::from_slice(bytes).map_err(|_| TermctlError::InvalidEnvelope)
+}
+
 fn decode_packet_response_for_request<T>(
     packet: ProtocolPacket<Value>,
     request_id: PacketRequestId,
@@ -790,6 +1272,18 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn termctl_tls_kx_groups_exclude_hybrid_post_quantum_groups() {
+        let names = termctl_tls_kx_groups()
+            .into_iter()
+            .map(|group| format!("{:?}", group.name()))
+            .collect::<Vec<_>>();
+
+        assert!(names.iter().any(|name| name.contains("X25519")));
+        assert!(names.iter().any(|name| name.contains("secp256r1")));
+        assert!(!names.iter().any(|name| name.contains("MLKEM")));
+    }
 
     #[test]
     fn daemon_e2ee_key_exchange_requires_packet_v3_and_valid_signature() {
@@ -1027,6 +1521,35 @@ mod tests {
         assert!(!wire.contains("session_data"));
         assert!(!wire.contains("stream_chunk"));
         assert!(!wire.contains("terminal secret"));
+    }
+
+    #[test]
+    fn binary_packet_roundtrips_terminal_stream_data_without_json_payload() {
+        let session_id = SessionId::new();
+        let mut stream = TerminalStream::new();
+        let packet = stream
+            .data_chunk_packet(session_id, b"terminal secret\n")
+            .unwrap();
+
+        let binary = protocol_packet_to_binary(packet).unwrap();
+        let encoded = encode_binary_protocol_packet(&binary);
+        let decoded = protocol_packet_from_binary(
+            decode_binary_protocol_packet(&encoded).expect("binary packet should decode"),
+        )
+        .expect("binary packet should map back to protocol packet");
+
+        assert!(matches!(
+            binary.payload,
+            Some(binary_protocol_packet::Payload::SessionData(_))
+        ));
+        assert_eq!(decoded.kind, PacketKind::StreamChunk);
+        assert_eq!(decoded.stream_id, Some(stream.id));
+        let payload: SessionDataPayload = decode_payload(decoded.payload).unwrap();
+        assert_eq!(payload.session_id, session_id);
+        assert_eq!(
+            crypto::decode_session_data(&payload.data_base64).unwrap(),
+            b"terminal secret\n"
+        );
     }
 
     #[test]

@@ -69,6 +69,7 @@ export function daemonE2eeSigningInputBytes(
     canonicalField("nonce", payload.nonce),
     canonicalField("timestamp_ms", String(payload.timestamp_ms)),
     canonicalField("packet_version", String(payload.packet_version ?? 0)),
+    canonicalField("binary_version", String(payload.binary_version ?? 0)),
   );
 }
 
@@ -86,6 +87,7 @@ export function e2eeAuthTranscriptDigestWire(
     canonicalField("daemon_nonce", daemonExchange.nonce),
     canonicalField("daemon_timestamp_ms", String(daemonExchange.timestamp_ms)),
     canonicalField("daemon_packet_version", String(daemonExchange.packet_version ?? 0)),
+    canonicalField("daemon_binary_version", String(daemonExchange.binary_version ?? 0)),
   ];
   if (daemonExchange.signature) {
     fields.push(canonicalField("daemon_signature", daemonExchange.signature));
@@ -96,6 +98,7 @@ export function e2eeAuthTranscriptDigestWire(
     canonicalField("device_nonce", deviceExchange.nonce),
     canonicalField("device_timestamp_ms", String(deviceExchange.timestamp_ms)),
     canonicalField("device_packet_version", String(deviceExchange.packet_version ?? 0)),
+    canonicalField("device_binary_version", String(deviceExchange.binary_version ?? 0)),
   );
   return `sha256-v1:${bytesToBase64(sha256(concatBytes(...fields)))}`;
 }

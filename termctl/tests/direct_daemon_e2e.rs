@@ -1,14 +1,14 @@
 use std::fs;
 use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 use termd::auth::current_unix_timestamp_millis;
 use termd::config::DaemonConfig;
-use termd::net::server::{DefaultDaemonProtocol, serve_listener};
+use termd::net::server::{SharedDaemonProtocol, serve_listener};
 use termd_proto::{PairingQrPayload, ServerId};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
@@ -17,7 +17,7 @@ const TERMD_READY_SENTINEL: &str = "termd-e2e-ready";
 
 struct TestDaemon {
     url: String,
-    protocol: Arc<Mutex<DefaultDaemonProtocol>>,
+    protocol: SharedDaemonProtocol,
     _state_dir: TempDir,
     task: JoinHandle<()>,
 }
@@ -53,11 +53,8 @@ impl TestDaemon {
         }
     }
 
-    fn issue_pairing_invite(&self) -> String {
-        let mut protocol = self
-            .protocol
-            .lock()
-            .expect("daemon protocol mutex should not be poisoned");
+    async fn issue_pairing_invite(&self) -> String {
+        let mut protocol = self.protocol.lock().await;
         let server_id = protocol.server_id();
         let daemon_public_key = protocol.daemon_public_identity().public_key.clone();
         let record = protocol
@@ -69,11 +66,8 @@ impl TestDaemon {
             .to_invite_code()
     }
 
-    fn issue_pairing_invite_for_server(&self, server_id: ServerId) -> String {
-        let mut protocol = self
-            .protocol
-            .lock()
-            .expect("daemon protocol mutex should not be poisoned");
+    async fn issue_pairing_invite_for_server(&self, server_id: ServerId) -> String {
+        let mut protocol = self.protocol.lock().await;
         let daemon_public_key = protocol.daemon_public_identity().public_key.clone();
         let record = protocol
             .issue_pairing_token(current_unix_timestamp_millis())
@@ -84,11 +78,8 @@ impl TestDaemon {
             .to_invite_code()
     }
 
-    fn issue_pairing_token(&self) -> String {
-        let mut protocol = self
-            .protocol
-            .lock()
-            .expect("daemon protocol mutex should not be poisoned");
+    async fn issue_pairing_token(&self) -> String {
+        let mut protocol = self.protocol.lock().await;
         protocol
             .issue_pairing_token(current_unix_timestamp_millis())
             .expect("pairing token should be issued")
@@ -146,7 +137,9 @@ async fn direct_termctl_binary_covers_session_flow_and_invariants() {
     assert!(bad_token_only_stderr.contains("missing_route_server_id"));
     assert!(!bad_token_only_stderr.contains("wrong-token"));
 
-    let wrong_route_invite = daemon.issue_pairing_invite_for_server(ServerId::new());
+    let wrong_route_invite = daemon
+        .issue_pairing_invite_for_server(ServerId::new())
+        .await;
     let wrong_route_pair = run_termctl_failure(
         &paired_state,
         &[
@@ -161,7 +154,7 @@ async fn direct_termctl_binary_covers_session_flow_and_invariants() {
     assert!(wrong_route_stderr.contains("invalid_envelope"));
     assert!(!wrong_route_stderr.contains("termd-pair"));
 
-    let invite = daemon.issue_pairing_invite();
+    let invite = daemon.issue_pairing_invite().await;
     let pair = run_termctl_success(
         &paired_state,
         &["pair", "--payload", &invite, "--url", &daemon.url],
@@ -185,7 +178,7 @@ async fn direct_termctl_binary_covers_session_flow_and_invariants() {
     );
     assert!(!bad_known_pair_stderr.contains("wrong-token"));
 
-    let second_token = daemon.issue_pairing_token();
+    let second_token = daemon.issue_pairing_token().await;
     let second_pair = run_termctl_success(
         &paired_state,
         &["pair", "--token", &second_token, "--url", &daemon.url],
@@ -229,19 +222,7 @@ async fn direct_termctl_binary_covers_session_flow_and_invariants() {
     // resize owner 只属于当前持有尺寸权的 attach 连接；短连接 CLI resize 需要等旧 attach 释放。
     drop(attach);
 
-    let resize = run_termctl_success(
-        &paired_state,
-        &[
-            "resize",
-            &session_id,
-            "--rows",
-            "40",
-            "--cols",
-            "120",
-            "--url",
-            &daemon.url,
-        ],
-    );
+    let resize = run_resize_until_success(&paired_state, &daemon.url, &session_id, "40", "120");
     assert!(stdout_string(&resize).contains("size=40x120"));
 
     let list_after_detach = run_termctl_success(&paired_state, &["list", "--url", &daemon.url]);
@@ -276,6 +257,38 @@ fn run_control_until_success(state_path: &Path, url: &str, session_id: &str) -> 
         assert!(
             Instant::now() < deadline,
             "control did not succeed before timeout; last stderr:\n{last_stderr}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn run_resize_until_success(
+    state_path: &Path,
+    url: &str,
+    session_id: &str,
+    rows: &str,
+    cols: &str,
+) -> Output {
+    let deadline = Instant::now() + Duration::from_secs(3);
+
+    loop {
+        let output = run_termctl_raw(
+            state_path,
+            &[
+                "resize", session_id, "--rows", rows, "--cols", cols, "--url", url,
+            ],
+            Stdio::null(),
+            Stdio::piped(),
+            Stdio::piped(),
+        );
+        if output.status.success() {
+            return output;
+        }
+
+        let last_stderr = stderr_string(&output);
+        assert!(
+            Instant::now() < deadline,
+            "resize did not succeed before timeout; last stderr:\n{last_stderr}"
         );
         thread::sleep(Duration::from_millis(50));
     }

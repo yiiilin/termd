@@ -81,14 +81,18 @@ const MAX_FILES_PANEL_WIDTH = 640;
 const CONNECTION_AUTO_RETRY_DELAY_MS = 1500;
 const CONNECTION_AUTO_RETRY_LIMIT = 3;
 const ATTACH_RECONNECT_DELAYS_MS = [250, 1000, 2500, 5000, 10000, 20000];
-// terminal frame 的 credit 回补不要拖太久，否则输出会先把额度耗光再卡住。
-const TERMINAL_RENDER_ACK_FLUSH_BYTES = 16 * 1024;
-const TERMINAL_RENDER_ACK_FLUSH_DELAY_MS = 10;
+const ATTACH_SWITCH_COALESCE_DELAY_MS = 80;
+// terminal frame 的 credit 回补按渲染批次合并；64KB 能避免 flow 风暴，同时让大 snapshot
+// 更早把 credit 还给 daemon，避免输出连接长时间处于 zero-credit。
+const TERMINAL_RENDER_ACK_FLUSH_BYTES = 64 * 1024;
+const TERMINAL_RENDER_ACK_FLUSH_DELAY_MS = 16;
 const FILES_CWD_FOLLOW_POLL_INTERVAL_MS = 1000;
 const TEXT_FILE_EDITOR_MAX_BYTES = 1024 * 1024;
 const FILE_TRANSFER_MEMORY_FALLBACK_MAX_BYTES = 16 * 1024 * 1024;
 const FILE_DOWNLOAD_CHUNK_BYTES = 256 * 1024;
 const FILE_UPLOAD_MAX_BYTES = 16 * 1024 * 1024;
+const RECEIVE_LOOP_YIELD_MESSAGES = 64;
+const RECEIVE_LOOP_YIELD_BYTES = 256 * 1024;
 const MOBILE_LAYOUT_QUERY = "(max-width: 760px)";
 const MOBILE_LAYOUT_BREAKPOINT = 760;
 const CPU_HISTORY_LIMIT = 48;
@@ -100,6 +104,12 @@ const APP_CONNECTION_TIMEOUT_MS = 2000;
 const PAIRING_CONNECTION_TIMEOUT_MS = 5000;
 const ATTACH_CONNECTION_TIMEOUT_MS = 15000;
 type AppSurface = "admin" | "workspace";
+interface AttachReconnectOptions {
+  lastTerminalSeq?: number;
+  sessionId?: UUID;
+  reconnectKey?: string;
+  skipCurrentClientClose?: boolean;
+}
 
 const RETRYABLE_CONNECTION_ERROR_CODES = new Set([
   "connection_closed",
@@ -192,6 +202,10 @@ export default function App() {
   const [activeSurface, setActiveSurface] = useState<AppSurface>("admin");
   const [status, setStatus] = useState("idle");
   const [error, setError] = useState<SafeError | undefined>();
+  // attachClientRef 是接收终端输出的连接；控制连接单独承载输入和普通 RPC，
+  // 避免大量 terminal frame 把输入回显、状态轮询等控制面请求排在同一个 WebSocket 后面。
+  const attachControlClientRef = useRef<DirectClient | undefined>(undefined);
+  const pendingAttachControlClientRef = useRef<DirectClient | undefined>(undefined);
   const attachClientRef = useRef<DirectClient | undefined>(undefined);
   const pendingAttachClientRef = useRef<DirectClient | undefined>(undefined);
   const attachedSessionRef = useRef<UUID | undefined>(undefined);
@@ -199,10 +213,14 @@ export default function App() {
   const autoAttachAttemptedSessionRef = useRef<UUID | undefined>(undefined);
   const attachingSessionIdRef = useRef<UUID | undefined>(undefined);
   const attachRequestIdRef = useRef(0);
+  const sessionCreateRequestIdRef = useRef(0);
+  const attachSwitchTimerRef = useRef<number | undefined>(undefined);
+  const attachSwitchGenerationRef = useRef(0);
   const reattachCurrentSessionOnOpenRef = useRef(false);
   const userDetachedRef = useRef(false);
   const pendingResizeKeyRef = useRef<string | undefined>(undefined);
   const confirmedSessionSizesRef = useRef<Map<UUID, TerminalSize>>(new Map());
+  const controlReceiveLoopActiveRef = useRef(false);
   const receiveLoopActiveRef = useRef(false);
   const closingSessionIdsRef = useRef<Set<UUID>>(new Set());
   const forgettingClientIdsRef = useRef<Set<UUID>>(new Set());
@@ -227,7 +245,7 @@ export default function App() {
   const lastRenderedTerminalSeqRef = useRef<Map<UUID, number>>(new Map());
   const terminalOutputResetVersionRef = useRef(0);
   const terminalOutputAppliedResetVersionRef = useRef(0);
-  const terminalOutputResetWaitersRef = useRef<Map<number, () => void>>(new Map());
+  const terminalOutputResetWaitersRef = useRef<Map<number, Set<() => void>>>(new Map());
   const terminalOutputFlushFrameRef = useRef<number | undefined>(undefined);
   const terminalOutputDrainRef = useRef<(() => void) | undefined>(undefined);
   const selectedSessionIdRef = useRef<UUID | undefined>(undefined);
@@ -238,7 +256,7 @@ export default function App() {
   const attachReconnectKeyRef = useRef<string | undefined>(undefined);
   const attachReconnectAttemptsRef = useRef(0);
   const attachReconnectLastErrorRef = useRef<unknown>(undefined);
-  const attachReconnectHandlerRef = useRef<(client: DirectClient, caught: unknown) => boolean>(() => false);
+  const attachReconnectHandlerRef = useRef<(client: DirectClient, caught: unknown, options?: AttachReconnectOptions) => boolean>(() => false);
   const daemonNetworkSampleRef = useRef<DaemonNetworkCounterSample | undefined>(undefined);
   const daemonStatusRefreshInFlightRef = useRef(false);
   const daemonClientsRefreshInFlightRef = useRef(false);
@@ -522,12 +540,23 @@ export default function App() {
       terminalOutputAppliedResetVersionRef.current,
       version,
     );
-    for (const [pendingVersion, resolve] of terminalOutputResetWaitersRef.current) {
+    for (const [pendingVersion, resolvers] of terminalOutputResetWaitersRef.current) {
       if (pendingVersion <= terminalOutputAppliedResetVersionRef.current) {
         terminalOutputResetWaitersRef.current.delete(pendingVersion);
+        for (const resolve of resolvers) {
+          resolve();
+        }
+      }
+    }
+  }, []);
+
+  const resolveTerminalOutputResetWaiters = useCallback(() => {
+    for (const resolvers of terminalOutputResetWaitersRef.current.values()) {
+      for (const resolve of resolvers) {
         resolve();
       }
     }
+    terminalOutputResetWaitersRef.current.clear();
   }, []);
 
   const waitForTerminalOutputResetApplied = useCallback((version: number) => {
@@ -535,14 +564,11 @@ export default function App() {
       return Promise.resolve();
     }
     return new Promise<void>((resolve) => {
-      const timer = window.setTimeout(() => {
-        terminalOutputResetWaitersRef.current.delete(version);
-        resolve();
-      }, 250);
-      terminalOutputResetWaitersRef.current.set(version, () => {
-        window.clearTimeout(timer);
+      const resolvers = terminalOutputResetWaitersRef.current.get(version) ?? new Set<() => void>();
+      resolvers.add(() => {
         resolve();
       });
+      terminalOutputResetWaitersRef.current.set(version, resolvers);
     });
   }, []);
 
@@ -556,18 +582,39 @@ export default function App() {
     attachReconnectLastErrorRef.current = undefined;
   }, []);
 
+  const cancelScheduledAttachSwitch = useCallback(() => {
+    attachSwitchGenerationRef.current += 1;
+    if (attachSwitchTimerRef.current !== undefined) {
+      window.clearTimeout(attachSwitchTimerRef.current);
+      attachSwitchTimerRef.current = undefined;
+    }
+  }, []);
+
   const closeAttachForReconnect = useCallback((client?: DirectClient) => {
+    const belongsToCurrentAttach =
+      !client ||
+      attachClientRef.current === client ||
+      attachControlClientRef.current === client ||
+      pendingAttachClientRef.current === client ||
+      pendingAttachControlClientRef.current === client;
+    if (!belongsToCurrentAttach) {
+      // 中文注释：旧 control/output client 的异步 RPC 可能在用户已经切到新 session 后才失败。
+      // 这类 stale 错误只关闭旧 client，不能取消新的 attach 计时器，也不能触发旧 session 重连。
+      client?.close();
+      return false;
+    }
+    cancelScheduledAttachSwitch();
+    controlReceiveLoopActiveRef.current = false;
     receiveLoopActiveRef.current = false;
-    if (pendingAttachClientRef.current && (!client || pendingAttachClientRef.current === client)) {
-      pendingAttachClientRef.current.close();
-      pendingAttachClientRef.current = undefined;
-    }
-    if (!client || attachClientRef.current === client) {
-      attachClientRef.current?.close();
-      attachClientRef.current = undefined;
-    } else {
-      client.close();
-    }
+    pendingAttachControlClientRef.current?.close();
+    pendingAttachControlClientRef.current = undefined;
+    pendingAttachClientRef.current?.close();
+    pendingAttachClientRef.current = undefined;
+    attachControlClientRef.current?.close();
+    attachControlClientRef.current = undefined;
+    attachClientRef.current?.close();
+    attachClientRef.current = undefined;
+    terminalRenderAckRef.current = undefined;
     pendingResizeKeyRef.current = undefined;
     updateTerminalResizeOwner(false);
     lastCursorReportRef.current = "";
@@ -576,7 +623,8 @@ export default function App() {
       window.clearTimeout(cursorRefreshTimerRef.current);
       cursorRefreshTimerRef.current = undefined;
     }
-  }, [updateTerminalResizeOwner]);
+    return true;
+  }, [cancelScheduledAttachSwitch, updateTerminalResizeOwner]);
 
   const flushTerminalOutput = useCallback(() => {
     terminalOutputFlushFrameRef.current = undefined;
@@ -637,15 +685,7 @@ export default function App() {
   }, [flushRenderedTerminalAck, scheduleRenderedTerminalAckFlush]);
 
   const enqueueTerminalOutput = useCallback((item: TerminalOutputItem) => {
-    const queue = terminalOutputQueueRef.current;
-    const previous = queue.at(-1);
-    if (item.kind === "data" && previous?.kind === "data") {
-      // legacy `session_data` 没有 terminal_seq/transport_seq 边界，可以安全合并成
-      // 一个 xterm write；新的 terminal_frame 仍逐帧保留，用于渲染完成后精确补 credit。
-      previous.bytes = concatByteChunks([previous.bytes, item.bytes]);
-    } else {
-      queue.push(item);
-    }
+    terminalOutputQueueRef.current.push(item);
     scheduleTerminalOutputFlush();
   }, [scheduleTerminalOutputFlush]);
 
@@ -667,14 +707,22 @@ export default function App() {
   }, []);
 
   const disconnectAttach = useCallback(() => {
+    cancelScheduledAttachSwitch();
     resetAttachReconnectState();
+    resolveTerminalOutputResetWaiters();
+    controlReceiveLoopActiveRef.current = false;
     receiveLoopActiveRef.current = false;
     // 快速切换 session 时，新的 attach 可能还没完成且尚未进入 attachClientRef。
     // 这里必须关闭 pending client，避免 daemon 继续为过时 attach 生成大 snapshot。
+    pendingAttachControlClientRef.current?.close();
+    pendingAttachControlClientRef.current = undefined;
     pendingAttachClientRef.current?.close();
     pendingAttachClientRef.current = undefined;
+    attachControlClientRef.current?.close();
+    attachControlClientRef.current = undefined;
     attachClientRef.current?.close();
     attachClientRef.current = undefined;
+    terminalRenderAckRef.current = undefined;
     if (attachedSessionRef.current) {
       lastRenderedTerminalSeqRef.current.delete(attachedSessionRef.current);
     }
@@ -693,7 +741,7 @@ export default function App() {
     clearSessionFiles();
     setMobilePanel(undefined);
     setMobileMenuOpen(false);
-  }, [clearSessionFiles, clearTerminalOutput, resetAttachReconnectState, updateTerminalResizeOwner]);
+  }, [cancelScheduledAttachSwitch, clearSessionFiles, clearTerminalOutput, resetAttachReconnectState, resolveTerminalOutputResetWaiters, updateTerminalResizeOwner]);
 
   const handleDisconnectAttach = useCallback(() => {
     // 用户主动断开时不要被“默认打开第一个 session”的自动流程立即重新 attach。
@@ -705,7 +753,7 @@ export default function App() {
   }, [disconnectAttach, selectSession]);
 
   useEffect(() => {
-    if (activeSurface !== "admin" || !attachClientRef.current) {
+    if (activeSurface !== "admin" || (!attachClientRef.current && !attachControlClientRef.current)) {
       return;
     }
 
@@ -721,13 +769,23 @@ export default function App() {
   const resetWorkspaceState = useCallback(() => {
     setSessions([]);
     confirmedSessionSizesRef.current.clear();
+    controlReceiveLoopActiveRef.current = false;
+    receiveLoopActiveRef.current = false;
+    pendingAttachControlClientRef.current?.close();
+    pendingAttachControlClientRef.current = undefined;
     pendingAttachClientRef.current?.close();
     pendingAttachClientRef.current = undefined;
+    attachControlClientRef.current?.close();
+    attachControlClientRef.current = undefined;
+    attachClientRef.current?.close();
+    attachClientRef.current = undefined;
     setSessionOrder([]);
     sessionOrderRef.current = [];
     autoAttachAttemptedSessionRef.current = undefined;
     attachingSessionIdRef.current = undefined;
     attachRequestIdRef.current += 1;
+    cancelScheduledAttachSwitch();
+    resolveTerminalOutputResetWaiters();
     reattachCurrentSessionOnOpenRef.current = false;
     userDetachedRef.current = false;
     setNewOutputSessionIds(new Set());
@@ -747,7 +805,7 @@ export default function App() {
     clearTerminalOutput();
     clearSessionFiles();
     autoCheckedServerRef.current = undefined;
-  }, [clearSessionFiles, clearTerminalOutput, selectSession]);
+  }, [cancelScheduledAttachSwitch, clearSessionFiles, clearTerminalOutput, resolveTerminalOutputResetWaiters, selectSession]);
 
   const handleStartDaemonRename = useCallback(
     (serverId: UUID) => {
@@ -1052,12 +1110,12 @@ export default function App() {
         setSessionFilesLoading(true);
         setSessionFilesError(undefined);
       }
-      const attachedClient = attachClientRef.current;
+      const attachedClient = attachControlClientRef.current ?? attachClientRef.current;
       let client: DirectClient | undefined;
       let request: Promise<SessionFilesResultPayload>;
       try {
         if (attachedSessionRef.current === sessionId && attachedClient) {
-          // 直接请求可以拿到一次性的响应，避免把文件树状态和后台推送混在同一条回写链路里。
+          // 已 attach 时优先走控制连接，避免文件树 RPC 排在终端输出流后面。
           request = attachedClient.listSessionFiles(sessionId, path);
         } else {
           client = await authenticatedSessionClient(sessionId);
@@ -1100,12 +1158,14 @@ export default function App() {
         setSessionGitLoading(true);
         setSessionGitError(undefined);
       }
-      const attachedClient = attachClientRef.current;
+      const attachedClient = attachControlClientRef.current ?? attachClientRef.current;
       if (attachedSessionRef.current === sessionId && attachedClient) {
         try {
-          // Git tab 和文件树一样复用当前 attach 连接，响应仍交给 receive loop，
-          // 避免多个 reader 同时消费同一个 WebSocket。
-          await attachedClient.requestSessionGit(sessionId);
+          // Git tab 和文件树一样优先走控制连接，避免普通 RPC 和终端输出共用输出 WebSocket。
+          const git = await attachedClient.getSessionGit(sessionId);
+          setSessionGit(git);
+          setSessionGitError(undefined);
+          setSessionGitLoading(false);
           return;
         } catch (caught) {
           if (!silent) {
@@ -1142,12 +1202,15 @@ export default function App() {
     setError(undefined);
     setStatus("listing");
     const requestOrderGeneration = sessionOrderGenerationRef.current;
+    const requestCreateGeneration = sessionCreateRequestIdRef.current;
+    let client: DirectClient | undefined;
     try {
-      const client = await authenticatedClient();
+      client = await authenticatedClient();
       const list = await client.listSessions();
-      const clients = await client.listDaemonClients();
-      client.close();
-      if (activeServerIdRef.current !== requestServerId) {
+      if (
+        activeServerIdRef.current !== requestServerId ||
+        requestCreateGeneration !== sessionCreateRequestIdRef.current
+      ) {
         return;
       }
       const canApplyDaemonOrder =
@@ -1176,7 +1239,6 @@ export default function App() {
           attachedSessionRef.current,
         ], nextOrder),
       );
-      setDaemonClients(clients.clients);
       // 列表刷新可能晚于用户点击 session 返回；不能用“第一行”覆盖用户刚选择/正在 attach 的目标。
       selectSession(nextSelectedSessionId);
       // session 列表刷新可能来自后台轮询或 cursor 同步；已有 attach 时保留右侧文件树，
@@ -1187,12 +1249,30 @@ export default function App() {
       if (!attachingSessionIdRef.current) {
         setStatus(attachedSessionRef.current ? "attached" : "ready");
       }
+      try {
+        // session.list 是进入工作台的关键路径；daemon.clients 只是操作员展示元数据。
+        // relay 或大量输出让该旁路 RPC 变慢时，不能把已经成功拿到的 session 列表回滚成连接失败。
+        const clients = await client.listDaemonClients();
+        if (
+          activeServerIdRef.current === requestServerId &&
+          requestCreateGeneration === sessionCreateRequestIdRef.current
+        ) {
+          setDaemonClients(clients.clients);
+        }
+      } catch {
+        // 客户端列表下一轮后台刷新会再补；这里保持旧值，避免非关键元数据影响 attach。
+      }
     } catch (caught) {
-      if (activeServerIdRef.current !== requestServerId) {
+      if (
+        activeServerIdRef.current !== requestServerId ||
+        requestCreateGeneration !== sessionCreateRequestIdRef.current
+      ) {
         return;
       }
       setActiveSurface("admin");
       setSafeError(caught);
+    } finally {
+      client?.close();
     }
   }, [activeServer?.server_id, authenticatedClient, clearSessionFiles, selectSession, setSafeError]);
 
@@ -1205,16 +1285,14 @@ export default function App() {
       const requestServerId = activeServer?.server_id;
       const requestOrderGeneration = sessionOrderGenerationRef.current;
       try {
-        const attachedClient = attachClientRef.current;
+        const attachedClient = attachControlClientRef.current ?? attachClientRef.current;
         const ownsClient = !attachedClient;
         const client = attachedClient ?? await authenticatedClient();
         try {
-          // 已 attach 时复用 xterm 主连接，避免状态轮询每 2 秒创建一次 relay client。
-          // receive pump 会按 packet id 分发 response，不会和终端输出读取互相抢 socket。
-          const [sessionList, clientList] = await Promise.all([
-            client.listSessions(),
-            client.listDaemonClients(),
-          ]);
+          // 已 attach 时复用控制连接，避免状态轮询每 2 秒创建一次 relay client，
+          // 同时不让终端输出流影响 session/client 列表 RPC。
+          const sessionList = await client.listSessions();
+          const clientList = await client.listDaemonClients().catch(() => undefined);
           if (activeServerIdRef.current !== requestServerId) {
             return;
           }
@@ -1235,7 +1313,9 @@ export default function App() {
               attachedSessionRef.current,
             ], nextOrder),
           );
-          setDaemonClients(clientList.clients);
+          if (clientList) {
+            setDaemonClients(clientList.clients);
+          }
         } catch (caught) {
           if (attachedClient && isRetryableConnectionError(caught)) {
             attachReconnectHandlerRef.current(attachedClient, caught);
@@ -1265,11 +1345,12 @@ export default function App() {
     setDaemonStatusLoading(true);
     setDaemonStatusError(undefined);
     try {
-      const attachedClient = attachClientRef.current;
+      const attachedClient = attachControlClientRef.current ?? attachClientRef.current;
       const ownsClient = !attachedClient;
       const client = attachedClient ?? await authenticatedClient();
       try {
-        // 状态栏和 RTT 都走同一条主连接；relay 页面不会再因为每秒状态刷新看到短连接风暴。
+        // 状态栏和 RTT 走控制连接；relay 页面不会因为状态刷新产生短连接风暴，
+        // 也不会被大量终端输出拖慢 RTT 采样。
         const status = await client.getDaemonStatus();
         const latencyMs = await client.measureLatency().catch(() => undefined);
         const nextNetworkSample = networkCounterSampleFromStatus(status, Date.now());
@@ -1293,7 +1374,7 @@ export default function App() {
       }
     } catch (caught) {
       setDaemonStatusError(toSafeError(caught));
-      if (!attachClientRef.current) {
+      if (!attachClientRef.current && !attachControlClientRef.current) {
         setDaemonNetworkLatencyMs(undefined);
       }
     } finally {
@@ -1343,40 +1424,101 @@ export default function App() {
     void handleRefresh();
   }, [activeServer, handleRefresh, state.device, status]);
 
+  const startControlReceiveLoop = useCallback((client: DirectClient) => {
+    controlReceiveLoopActiveRef.current = true;
+    const read = async () => {
+      while (controlReceiveLoopActiveRef.current && attachControlClientRef.current === client) {
+        try {
+          // 控制连接不接收终端输出，但会收到输入 stream 的错误等异步控制面事件。
+          // 普通 RPC response 已由 DirectClient 的 packet pump 按 request id 分发，这里只负责兜住事件队列。
+          await client.receiveInner();
+        } catch (caught) {
+          if (controlReceiveLoopActiveRef.current && attachControlClientRef.current === client) {
+            if (attachReconnectHandlerRef.current(client, caught)) {
+              return;
+            }
+            setSafeError(caught);
+          }
+          return;
+        }
+      }
+    };
+    void read();
+  }, [setSafeError]);
+
   const startReceiveLoop = useCallback((client: DirectClient) => {
     receiveLoopActiveRef.current = true;
     const read = async () => {
+      let processedMessages = 0;
+      let processedBytes = 0;
       while (receiveLoopActiveRef.current && attachClientRef.current === client) {
         try {
           const inner = await client.receiveInner();
+          processedMessages += 1;
           if (inner.type === "session_data") {
             const payload = inner.payload as SessionDataPayload;
             if (payload.session_id !== attachedSessionRef.current) {
               markNewOutputIfBackground(payload.session_id);
+              if (processedMessages >= RECEIVE_LOOP_YIELD_MESSAGES) {
+                processedMessages = 0;
+                await yieldToEventLoop();
+              }
               continue;
             }
-            enqueueTerminalOutput({ kind: "data", bytes: sessionDataFromBase64(payload.data_base64) });
+            const bytes = payload.data_bytes ?? sessionDataFromBase64(payload.data_base64 ?? "");
+            const transportSeq = typeof payload.transport_seq === "number" && Number.isFinite(payload.transport_seq)
+              ? payload.transport_seq
+              : undefined;
+            const renderCredit = typeof payload.render_credit === "number" && Number.isFinite(payload.render_credit)
+              ? payload.render_credit
+              : undefined;
+            // legacy session_data 只有来自 packet stream 时才带内部 seq/credit。
+            // 老协议没有这些字段时保持无 ACK，避免给无法归属的输出流错误补 credit。
+            const onRendered =
+              transportSeq !== undefined && transportSeq > 0 && renderCredit !== undefined && renderCredit > 0
+                ? (renderedBytes?: number) =>
+                    markTerminalFrameRendered(
+                      payload.session_id,
+                      transportSeq,
+                      renderedBytes ?? renderCredit,
+                    )
+                : undefined;
+            enqueueTerminalOutput({ kind: "data", bytes, onRendered });
+            processedBytes += bytes.byteLength;
           } else if (inner.type === "terminal_frame") {
             const payload = inner.payload as RenderableTerminalFramePayload;
             if (payload.session_id !== attachedSessionRef.current) {
               markNewOutputIfBackground(payload.session_id);
+              if (processedMessages >= RECEIVE_LOOP_YIELD_MESSAGES) {
+                processedMessages = 0;
+                await yieldToEventLoop();
+              }
               continue;
             }
-            const onRendered = () => markTerminalFrameRendered(payload.session_id, payload.transport_seq, payload.render_credit);
+            const onRendered = (renderedBytes?: number) =>
+              markTerminalFrameRendered(
+                payload.session_id,
+                payload.transport_seq,
+                renderedBytes ?? payload.render_credit,
+              );
             if (payload.kind === "snapshot") {
+              const bytes = payload.data_bytes ?? sessionDataFromBase64(payload.data_base64 ?? "");
               enqueueTerminalOutput({
                 kind: "snapshot",
-                bytes: sessionDataFromBase64(payload.data_base64),
+                bytes,
                 baseSeq: payload.base_seq,
                 onRendered,
               });
+              processedBytes += bytes.byteLength;
             } else if (payload.kind === "output") {
+              const bytes = payload.data_bytes ?? sessionDataFromBase64(payload.data_base64 ?? "");
               enqueueTerminalOutput({
                 kind: "output",
-                bytes: sessionDataFromBase64(payload.data_base64),
+                bytes,
                 terminalSeq: payload.terminal_seq,
                 onRendered,
               });
+              processedBytes += bytes.byteLength;
             } else if (payload.kind === "resize") {
               enqueueTerminalOutput({ kind: "resize", terminalSeq: payload.terminal_seq, onRendered });
             } else if (payload.kind === "exit") {
@@ -1418,6 +1560,11 @@ export default function App() {
               }
             }
           }
+          if (processedMessages >= RECEIVE_LOOP_YIELD_MESSAGES || processedBytes >= RECEIVE_LOOP_YIELD_BYTES) {
+            processedMessages = 0;
+            processedBytes = 0;
+            await yieldToEventLoop();
+          }
         } catch (caught) {
           // 旧 attach 关闭可能晚于新 attach 启动；只有当前 client 的错误才能切到错误态。
           if (receiveLoopActiveRef.current && attachClientRef.current === client) {
@@ -1433,15 +1580,27 @@ export default function App() {
     void read();
   }, [enqueueTerminalOutput, markNewOutputIfBackground, markTerminalFrameRendered, setSafeError, updateTerminalResizeOwner]);
 
-  const scheduleAttachReconnect = useCallback((staleClient: DirectClient, caught: unknown, options: { lastTerminalSeq?: number } = {}) => {
-    const sessionId = attachedSessionRef.current ?? attachedSessionId ?? selectedSessionId;
-    if (!sessionId || userDetachedRef.current || !isRetryableConnectionError(caught)) {
+  const scheduleAttachReconnect = useCallback((staleClient: DirectClient, caught: unknown, options: AttachReconnectOptions = {}) => {
+    if (userDetachedRef.current || !isRetryableConnectionError(caught)) {
       return false;
+    }
+    const sessionId = options.sessionId ?? attachedSessionRef.current ?? attachedSessionId ?? selectedSessionId;
+    if (!sessionId) {
+      return false;
+    }
+    const reconnectKey = options.reconnectKey ?? `${activeServer?.server_id ?? "unknown"}:${sessionId}`;
+    if (options.skipCurrentClientClose) {
+      // retry catch 已经只清理了本轮重连创建的 pending client；这里按 key 续排，
+      // 不能再拿最初的 stale client 去判断“是否属于当前 attach”。
+      if (attachReconnectKeyRef.current !== reconnectKey) {
+        return true;
+      }
+    } else if (!closeAttachForReconnect(staleClient)) {
+      return true;
     }
     const lastTerminalSeq =
       options.lastTerminalSeq ?? lastRenderedTerminalSeqRef.current.get(sessionId);
 
-    const reconnectKey = `${activeServer?.server_id ?? "unknown"}:${sessionId}`;
     if (attachReconnectKeyRef.current !== reconnectKey) {
       attachReconnectKeyRef.current = reconnectKey;
       attachReconnectAttemptsRef.current = 0;
@@ -1450,7 +1609,6 @@ export default function App() {
       attachReconnectLastErrorRef.current = caught;
     }
 
-    closeAttachForReconnect(staleClient);
     discardPendingTerminalOutput();
     setError(undefined);
 
@@ -1471,34 +1629,58 @@ export default function App() {
     attachReconnectTimerRef.current = window.setTimeout(() => {
       attachReconnectTimerRef.current = undefined;
       void (async () => {
-        let client: DirectClient | undefined;
+        let controlClient: DirectClient | undefined;
+        let outputClient: DirectClient | undefined;
         try {
-          client = await authenticatedClient(ATTACH_CONNECTION_TIMEOUT_MS);
-          pendingAttachClientRef.current = client;
-          const attached = await client.attachSession(
+          const isCurrentReconnect = () =>
+            !userDetachedRef.current && attachReconnectKeyRef.current === reconnectKey;
+          const closePendingReconnectClients = () => {
+            // 重连计时器可能晚于用户手动切换 session；过期重连只关闭自己创建的连接。
+            if (controlClient && pendingAttachControlClientRef.current === controlClient) {
+              pendingAttachControlClientRef.current = undefined;
+            }
+            if (outputClient && pendingAttachClientRef.current === outputClient) {
+              pendingAttachClientRef.current = undefined;
+            }
+            controlClient?.close();
+            outputClient?.close();
+            controlClient = undefined;
+            outputClient = undefined;
+          };
+          controlClient = await authenticatedClient(ATTACH_CONNECTION_TIMEOUT_MS);
+          if (!isCurrentReconnect()) {
+            closePendingReconnectClients();
+            return;
+          }
+          pendingAttachControlClientRef.current = controlClient;
+          await controlClient.attachSession(sessionId, { watchUpdates: false });
+          if (!isCurrentReconnect()) {
+            closePendingReconnectClients();
+            return;
+          }
+          outputClient = await authenticatedClient(ATTACH_CONNECTION_TIMEOUT_MS);
+          if (!isCurrentReconnect()) {
+            closePendingReconnectClients();
+            return;
+          }
+          pendingAttachClientRef.current = outputClient;
+          const attached = await outputClient.attachSession(
             sessionId,
             lastTerminalSeq !== undefined ? { lastTerminalSeq } : {},
           );
-          if (userDetachedRef.current) {
-            resetAttachReconnectState();
-            if (pendingAttachClientRef.current === client) {
-              pendingAttachClientRef.current = undefined;
-            }
-            client.close();
+          if (!isCurrentReconnect()) {
+            closePendingReconnectClients();
             return;
           }
-          if (attachReconnectKeyRef.current !== reconnectKey) {
-            if (pendingAttachClientRef.current === client) {
-              pendingAttachClientRef.current = undefined;
-            }
-            client.close();
-            return;
-          }
-
-          const attachedClient = client;
-          client = undefined;
+          const attachedControlClient = controlClient;
+          const attachedClient = outputClient;
+          controlClient = undefined;
+          outputClient = undefined;
+          pendingAttachControlClientRef.current = undefined;
           pendingAttachClientRef.current = undefined;
-          resetAttachReconnectState();
+          // 中文注释：重连拿到 attach ack 后先发布控制连接和当前 session。
+          // reset 期间用户可能已经能在新 xterm 里输入；输入不能等 snapshot 开始消费后才生效。
+          attachControlClientRef.current = attachedControlClient;
           attachClientRef.current = attachedClient;
           attachedSessionRef.current = sessionId;
           confirmedSessionSizesRef.current.set(attached.session_id, attached.size);
@@ -1507,25 +1689,44 @@ export default function App() {
           setSessions((current) => upsertAttachedSession(current, attached, sessionOrderRef.current));
           clearNewOutputMark(sessionId);
           setStatus("attached");
+          startControlReceiveLoop(attachedControlClient);
           if (lastTerminalSeq === undefined) {
+            // 普通重连会重放完整 snapshot，必须等 TerminalPane 清屏确认后再启动输出消费；
+            // 否则旧 xterm 的异步回调可能把 snapshot 写进旧实例。
             await waitForTerminalOutputResetApplied(clearTerminalOutput());
-            if (userDetachedRef.current || attachClientRef.current !== attachedClient) {
+            if (!isCurrentReconnect() || userDetachedRef.current) {
+              attachedControlClient.close();
               attachedClient.close();
               return;
             }
           }
+          if (!isCurrentReconnect() || userDetachedRef.current || attachClientRef.current !== attachedClient) {
+            attachedClient.close();
+            attachedControlClient.close();
+            return;
+          }
+          resetAttachReconnectState();
           startReceiveLoop(attachedClient);
           updateTerminalResizeOwner(Boolean(attached.resize_owner));
           void loadSessionFiles(sessionId, undefined, { silent: true, source: "initial" });
           void loadSessionGit(sessionId, { silent: true });
           void refreshDaemonClients();
         } catch (retryError) {
-          if (client && pendingAttachClientRef.current === client) {
+          if (controlClient && pendingAttachControlClientRef.current === controlClient) {
+            pendingAttachControlClientRef.current = undefined;
+          }
+          if (outputClient && pendingAttachClientRef.current === outputClient) {
             pendingAttachClientRef.current = undefined;
           }
-          client?.close();
+          controlClient?.close();
+          outputClient?.close();
           attachReconnectLastErrorRef.current = retryError;
-          if (!attachReconnectHandlerRef.current(staleClient, retryError)) {
+          if (!attachReconnectHandlerRef.current(staleClient, retryError, {
+            lastTerminalSeq,
+            sessionId,
+            reconnectKey,
+            skipCurrentClientClose: true,
+          })) {
             resetAttachReconnectState();
             setSafeError(retryError);
           }
@@ -1549,6 +1750,7 @@ export default function App() {
     selectedSessionId,
     selectSession,
     setSafeError,
+    startControlReceiveLoop,
     startReceiveLoop,
     updateTerminalResizeOwner,
     waitForTerminalOutputResetApplied,
@@ -1580,32 +1782,45 @@ export default function App() {
     lastRenderedTerminalSeqRef.current.set(sessionId, terminalSeq);
   }, []);
 
-  const handleAttach = useCallback(
+  const performAttach = useCallback(
     async (sessionId: UUID) => {
       if (attachingSessionIdRef.current === sessionId) {
-        selectSession(sessionId);
         clearNewOutputMark(sessionId);
         setMobilePanel(undefined);
         setMobileMenuOpen(false);
         return;
       }
       userDetachedRef.current = false;
-      // 用户点击 session 后立即更新选中态；实际 attach 完成后再切换 xterm 数据流。
-      // 这样慢 attach 或迟到刷新不会让列表视觉上跳回旧 session。
-      selectSession(sessionId);
       setError(undefined);
       setStatus("attaching");
       const attachRequestId = attachRequestIdRef.current + 1;
       attachRequestIdRef.current = attachRequestId;
       attachingSessionIdRef.current = sessionId;
-      let client: DirectClient | undefined;
+      let controlClient: DirectClient | undefined;
+      let outputClient: DirectClient | undefined;
       try {
+        const isCurrentAttachRequest = () =>
+          attachRequestIdRef.current === attachRequestId &&
+          attachingSessionIdRef.current === sessionId;
+        const closePendingAttachClients = () => {
+          // 快速点击 session 时，旧连接可能刚完成握手才回到这里；只能关闭自己持有的 client，
+          // 不能清掉更新一轮点击已经写入的 pending ref。
+          if (controlClient && pendingAttachControlClientRef.current === controlClient) {
+            pendingAttachControlClientRef.current = undefined;
+          }
+          if (outputClient && pendingAttachClientRef.current === outputClient) {
+            pendingAttachClientRef.current = undefined;
+          }
+          controlClient?.close();
+          outputClient?.close();
+          controlClient = undefined;
+          outputClient = undefined;
+        };
         const shouldRefreshCurrentAttach =
           reattachCurrentSessionOnOpenRef.current &&
           attachedSessionRef.current === sessionId &&
           Boolean(attachClientRef.current);
         if (attachedSessionRef.current === sessionId && attachClientRef.current && !shouldRefreshCurrentAttach) {
-          selectSession(sessionId);
           clearNewOutputMark(sessionId);
           setStatus("attached");
           setMobilePanel(undefined);
@@ -1614,24 +1829,39 @@ export default function App() {
         }
         reattachCurrentSessionOnOpenRef.current = false;
         disconnectAttach();
-        clearTerminalOutput();
-        client = await authenticatedClient(ATTACH_CONNECTION_TIMEOUT_MS);
-        pendingAttachClientRef.current = client;
-        const attached = await client.attachSession(sessionId);
-        if (
-          attachRequestIdRef.current !== attachRequestId ||
-          attachingSessionIdRef.current !== sessionId
-        ) {
-          if (pendingAttachClientRef.current === client) {
-            pendingAttachClientRef.current = undefined;
-          }
-          client.close();
-          client = undefined;
+        const resetVersion = clearTerminalOutput();
+        controlClient = await authenticatedClient(ATTACH_CONNECTION_TIMEOUT_MS);
+        if (!isCurrentAttachRequest()) {
+          closePendingAttachClients();
           return;
         }
-        const attachedClient = client;
-        client = undefined;
+        pendingAttachControlClientRef.current = controlClient;
+        await controlClient.attachSession(sessionId, { watchUpdates: false });
+        if (!isCurrentAttachRequest()) {
+          closePendingAttachClients();
+          return;
+        }
+        outputClient = await authenticatedClient(ATTACH_CONNECTION_TIMEOUT_MS);
+        if (!isCurrentAttachRequest()) {
+          closePendingAttachClients();
+          return;
+        }
+        pendingAttachClientRef.current = outputClient;
+        const attached = await outputClient.attachSession(sessionId);
+        if (!isCurrentAttachRequest()) {
+          closePendingAttachClients();
+          return;
+        }
+        const attachedControlClient = controlClient;
+        const attachedClient = outputClient;
+        controlClient = undefined;
+        outputClient = undefined;
+        pendingAttachControlClientRef.current = undefined;
         pendingAttachClientRef.current = undefined;
+        // 中文注释：输入通道的生命周期不能被 xterm reset 阻塞。
+        // 到这里 daemon 已确认 attach，先发布控制连接和 session id，让 reset 窗口内的键盘输入
+        // 能进入正确 stream；输出 receive loop 仍在 reset 确认后才启动，避免 snapshot 写到旧实例。
+        attachControlClientRef.current = attachedControlClient;
         attachClientRef.current = attachedClient;
         attachedSessionRef.current = sessionId;
         confirmedSessionSizesRef.current.set(attached.session_id, attached.size);
@@ -1647,6 +1877,22 @@ export default function App() {
           // 真实 resize 权限仍由 daemon 下发的 resize_owner 控制。
           setTerminalFocusRequest((request) => request + 1);
         }
+        // 中文注释：DirectClient 的 WebSocket pump 会在 attach response 前后持续收包，
+        // 但 App 的 receive loop 只有在这里启动。快速切换多个大输出 session 时，必须先
+        // 等 TerminalPane 确认旧 xterm 已经清屏/重建，再把新 snapshot 从 DirectClient
+        // 队列排进 xterm；否则新 snapshot 可能先写入旧实例。
+        startControlReceiveLoop(attachedControlClient);
+        await waitForTerminalOutputResetApplied(resetVersion);
+        if (!isCurrentAttachRequest() || userDetachedRef.current) {
+          attachedControlClient.close();
+          attachedClient.close();
+          return;
+        }
+        if (!isCurrentAttachRequest() || userDetachedRef.current || attachClientRef.current !== attachedClient) {
+          attachedClient.close();
+          attachedControlClient.close();
+          return;
+        }
         startReceiveLoop(attachedClient);
         updateTerminalResizeOwner(Boolean(attached.resize_owner));
         void loadSessionFiles(sessionId, undefined, { source: "initial" });
@@ -1660,10 +1906,14 @@ export default function App() {
           setSafeError(caught);
         }
       } finally {
-        if (client && pendingAttachClientRef.current === client) {
+        if (controlClient && pendingAttachControlClientRef.current === controlClient) {
+          pendingAttachControlClientRef.current = undefined;
+        }
+        if (outputClient && pendingAttachClientRef.current === outputClient) {
           pendingAttachClientRef.current = undefined;
         }
-        client?.close();
+        controlClient?.close();
+        outputClient?.close();
         if (
           attachRequestIdRef.current === attachRequestId &&
           attachingSessionIdRef.current === sessionId
@@ -1683,9 +1933,61 @@ export default function App() {
       selectSession,
       setSafeError,
       isMobileLayout,
+      startControlReceiveLoop,
       startReceiveLoop,
       updateTerminalResizeOwner,
+      waitForTerminalOutputResetApplied,
     ],
+  );
+
+  const handleAttach = useCallback(
+    (sessionId: UUID) => {
+      userDetachedRef.current = false;
+      // 中文注释：点击 session 先只更新 UI 选中态；真正 attach 延迟一个很短窗口。
+      // 快速扫过多个大输出 session 时，只有最后停住的 session 会触发 daemon snapshot。
+      selectSession(sessionId);
+      clearNewOutputMark(sessionId);
+      setMobilePanel(undefined);
+      setMobileMenuOpen(false);
+
+      if (attachingSessionIdRef.current === sessionId) {
+        return;
+      }
+      if (attachedSessionRef.current === sessionId && attachClientRef.current && !reattachCurrentSessionOnOpenRef.current) {
+        setStatus("attached");
+        return;
+      }
+
+      cancelScheduledAttachSwitch();
+      attachRequestIdRef.current += 1;
+      // 中文注释：新 session 一旦被点中，旧的 in-flight attach 立刻失效；
+      // 只保留最后停住的目标，避免上一个 session 的大 snapshot 继续占用共享协议锁。
+      if (
+        attachedSessionRef.current !== undefined ||
+        attachClientRef.current !== undefined ||
+        attachControlClientRef.current !== undefined
+      ) {
+        // 80ms 合并窗口只延迟“新 session attach”，不能让旧 session 的输出继续进入
+        // xterm。否则旧的大 snapshot/持续输出会占住主线程和 relay flow credit。
+        disconnectAttach();
+      }
+      pendingAttachControlClientRef.current?.close();
+      pendingAttachControlClientRef.current = undefined;
+      pendingAttachClientRef.current?.close();
+      pendingAttachClientRef.current = undefined;
+      attachingSessionIdRef.current = undefined;
+      setError(undefined);
+      setStatus("attaching");
+      const generation = attachSwitchGenerationRef.current;
+      attachSwitchTimerRef.current = window.setTimeout(() => {
+        attachSwitchTimerRef.current = undefined;
+        if (attachSwitchGenerationRef.current !== generation) {
+          return;
+        }
+        void performAttach(sessionId);
+      }, ATTACH_SWITCH_COALESCE_DELAY_MS);
+    },
+    [cancelScheduledAttachSwitch, clearNewOutputMark, performAttach, selectSession],
   );
 
   const handleOpenWorkspace = useCallback(() => {
@@ -1714,6 +2016,7 @@ export default function App() {
       !connectionReady ||
       status !== "ready" ||
       !sessionId ||
+      attachControlClientRef.current ||
       attachClientRef.current ||
       attachedSessionRef.current ||
       userDetachedRef.current ||
@@ -1729,15 +2032,55 @@ export default function App() {
 
   const handleCreateSession = useCallback(async () => {
     userDetachedRef.current = false;
+    const createRequestId = sessionCreateRequestIdRef.current + 1;
+    sessionCreateRequestIdRef.current = createRequestId;
     setError(undefined);
     disconnectAttach();
     clearTerminalOutput();
     setStatus("creating");
+    let outputClient: DirectClient | undefined;
+    let controlClient: DirectClient | undefined;
     try {
-      const client = await authenticatedClient();
+      const isCurrentCreateRequest = () => sessionCreateRequestIdRef.current === createRequestId;
+      outputClient = await authenticatedClient(ATTACH_CONNECTION_TIMEOUT_MS);
+      if (!isCurrentCreateRequest()) {
+        outputClient.close();
+        outputClient = undefined;
+        return;
+      }
+      pendingAttachClientRef.current = outputClient;
       // Web 只创建完整的默认 shell 会话，避免把 session 误导成一次性命令执行。
-      const created = await client.createSession([], DEFAULT_SESSION_SIZE);
-      attachClientRef.current = client;
+      const created = await outputClient.createSession([], DEFAULT_SESSION_SIZE);
+      if (!isCurrentCreateRequest()) {
+        outputClient.close();
+        outputClient = undefined;
+        return;
+      }
+      controlClient = await authenticatedClient(ATTACH_CONNECTION_TIMEOUT_MS);
+      if (!isCurrentCreateRequest()) {
+        outputClient.close();
+        outputClient = undefined;
+        controlClient.close();
+        controlClient = undefined;
+        return;
+      }
+      pendingAttachControlClientRef.current = controlClient;
+      await controlClient.attachSession(created.session_id, { watchUpdates: false });
+      if (!isCurrentCreateRequest()) {
+        outputClient.close();
+        outputClient = undefined;
+        controlClient.close();
+        controlClient = undefined;
+        return;
+      }
+      const attachedOutputClient = outputClient;
+      const attachedControlClient = controlClient;
+      outputClient = undefined;
+      controlClient = undefined;
+      pendingAttachClientRef.current = undefined;
+      pendingAttachControlClientRef.current = undefined;
+      attachClientRef.current = attachedOutputClient;
+      attachControlClientRef.current = attachedControlClient;
       attachedSessionRef.current = created.session_id;
       confirmedSessionSizesRef.current.set(created.session_id, created.size);
       updateTerminalResizeOwner(Boolean(created.resize_owner));
@@ -1754,11 +2097,23 @@ export default function App() {
       // 普通打开历史 session 仍保持 viewer 逻辑，避免意外接管其他客户端的 PTY 尺寸。
       setTerminalFocusRequest((request) => request + 1);
       setStatus("attached");
-      startReceiveLoop(client);
+      startControlReceiveLoop(attachedControlClient);
+      startReceiveLoop(attachedOutputClient);
       void loadSessionFiles(created.session_id, undefined, { source: "initial" });
       void refreshDaemonClients();
     } catch (caught) {
-      setSafeError(caught);
+      if (sessionCreateRequestIdRef.current === createRequestId) {
+        setSafeError(caught);
+      }
+    } finally {
+      if (outputClient && pendingAttachClientRef.current === outputClient) {
+        pendingAttachClientRef.current = undefined;
+      }
+      if (controlClient && pendingAttachControlClientRef.current === controlClient) {
+        pendingAttachControlClientRef.current = undefined;
+      }
+      outputClient?.close();
+      controlClient?.close();
     }
   }, [
     authenticatedClient,
@@ -1769,6 +2124,7 @@ export default function App() {
     refreshDaemonClients,
     selectSession,
     setSafeError,
+    startControlReceiveLoop,
     startReceiveLoop,
     updateTerminalResizeOwner,
   ]);
@@ -1995,7 +2351,7 @@ export default function App() {
 
   const handleTerminalInput = useCallback(
     async (data: string) => {
-      const client = attachClientRef.current;
+      const client = attachControlClientRef.current ?? attachClientRef.current;
       const sessionId = attachedSessionRef.current;
       if (!client || !sessionId) {
         return;
@@ -2036,7 +2392,7 @@ export default function App() {
       }
       pendingResizeKeyRef.current = nextResizeKey;
       // 这里仅向 daemon 请求 resize，不乐观改本地 session size，也不等待这个调用读取回执。
-      // attach receive loop 收到 session_resized 后才会更新 state，避免和终端输出读取循环抢 socket。
+      // resize_owner 仍归属于输出连接；输入和普通 RPC 已走控制连接，避免高频输入被输出流阻塞。
       void client.requestSessionResize(sessionId, size).catch((caught) => {
         if (isRetryableConnectionError(caught) && attachReconnectHandlerRef.current(client, caught)) {
           return;
@@ -2054,7 +2410,7 @@ export default function App() {
 
   const handleCursorChange = useCallback(
     (presence: SessionCursorPresence) => {
-      const client = attachClientRef.current;
+      const client = attachControlClientRef.current ?? attachClientRef.current;
       const sessionId = attachedSessionRef.current;
       if (!client || !sessionId) {
         return;
@@ -4013,6 +4369,10 @@ function concatByteChunks(chunks: Uint8Array[]): Uint8Array {
     offset += chunk.byteLength;
   }
   return out;
+}
+
+function yieldToEventLoop(): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, 0));
 }
 
 function triggerBrowserDownload(name: string, bytes: Uint8Array): void {

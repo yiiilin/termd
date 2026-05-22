@@ -23,12 +23,17 @@ use serde::{Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use termd_proto::{DeviceId, EncryptedFramePayload, PublicKey, ServerId};
 use thiserror::Error;
+use uuid::Uuid;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 
 const PUBLIC_KEY_PREFIX: &str = "x25519-v1:";
 const PROTOCOL_LABEL: &[u8] = b"termd-e2ee-v1";
 const CLIENT_TO_SERVER_INFO: &[u8] = b"termd-e2ee-v1/client-to-server";
 const SERVER_TO_CLIENT_INFO: &[u8] = b"termd-e2ee-v1/server-to-client";
+pub const BINARY_E2EE_FRAME_MAGIC: &[u8; 4] = b"TD2E";
+const BINARY_E2EE_FRAME_VERSION: u8 = 1;
+const BINARY_E2EE_FRAME_KIND_ENCRYPTED: u8 = 1;
+const BINARY_E2EE_FRAME_HEADER_LEN: usize = 32;
 
 /// E2EE 内核错误保持可判定，方便 WebSocket 层后续映射成关闭原因或错误消息。
 #[derive(Debug, Error)]
@@ -57,8 +62,17 @@ pub enum E2eeError {
     EncryptFailed,
     #[error("failed to decrypt E2EE frame")]
     DecryptFailed,
+    #[error("invalid binary E2EE frame")]
+    InvalidBinaryFrame,
     #[error("failed to process E2EE JSON payload")]
     Json(#[from] serde_json::Error),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BinaryEncryptedFramePayload {
+    pub server_id: ServerId,
+    pub sequence: u64,
+    pub ciphertext: Vec<u8>,
 }
 
 /// X25519 公钥的稳定 wire 形式，和 auth 层历史占位字符串明确区分。
@@ -301,6 +315,42 @@ impl E2eeSession {
     }
 
     pub fn encrypt_bytes(&mut self, plaintext: &[u8]) -> Result<EncryptedFramePayload, E2eeError> {
+        let (sequence, ciphertext) = self.encrypt_ciphertext(plaintext)?;
+
+        Ok(EncryptedFramePayload {
+            server_id: self.context.server_id,
+            sequence,
+            ciphertext_base64: general_purpose::STANDARD.encode(ciphertext),
+        })
+    }
+
+    pub fn encrypt_binary_payload(
+        &mut self,
+        plaintext: &[u8],
+    ) -> Result<BinaryEncryptedFramePayload, E2eeError> {
+        let (sequence, ciphertext) = self.encrypt_ciphertext(plaintext)?;
+        Ok(BinaryEncryptedFramePayload {
+            server_id: self.context.server_id,
+            sequence,
+            ciphertext,
+        })
+    }
+
+    pub fn decrypt_bytes(&mut self, frame: &EncryptedFramePayload) -> Result<Vec<u8>, E2eeError> {
+        let ciphertext = general_purpose::STANDARD
+            .decode(&frame.ciphertext_base64)
+            .map_err(E2eeError::InvalidCiphertextEncoding)?;
+        self.decrypt_ciphertext(frame.server_id, frame.sequence, &ciphertext)
+    }
+
+    pub fn decrypt_binary_payload(
+        &mut self,
+        frame: &BinaryEncryptedFramePayload,
+    ) -> Result<Vec<u8>, E2eeError> {
+        self.decrypt_ciphertext(frame.server_id, frame.sequence, &frame.ciphertext)
+    }
+
+    fn encrypt_ciphertext(&mut self, plaintext: &[u8]) -> Result<(u64, Vec<u8>), E2eeError> {
         let sequence = self.next_send_sequence;
         let next_sequence = sequence.checked_add(1).ok_or(E2eeError::SequenceOverflow)?;
         let nonce = nonce_for_sequence(sequence);
@@ -317,39 +367,36 @@ impl E2eeSession {
             .map_err(|_| E2eeError::EncryptFailed)?;
 
         self.next_send_sequence = next_sequence;
-
-        Ok(EncryptedFramePayload {
-            server_id: self.context.server_id,
-            sequence,
-            ciphertext_base64: general_purpose::STANDARD.encode(ciphertext),
-        })
+        Ok((sequence, ciphertext))
     }
 
-    pub fn decrypt_bytes(&mut self, frame: &EncryptedFramePayload) -> Result<Vec<u8>, E2eeError> {
-        if frame.server_id != self.context.server_id {
+    fn decrypt_ciphertext(
+        &mut self,
+        server_id: ServerId,
+        sequence: u64,
+        ciphertext: &[u8],
+    ) -> Result<Vec<u8>, E2eeError> {
+        if server_id != self.context.server_id {
             return Err(E2eeError::ServerIdMismatch);
         }
 
         let expected = self.next_receive_sequence;
-        if frame.sequence != expected {
+        if sequence != expected {
             return Err(E2eeError::UnexpectedSequence {
                 expected,
-                received: frame.sequence,
+                received: sequence,
             });
         }
 
         let next_sequence = expected.checked_add(1).ok_or(E2eeError::SequenceOverflow)?;
-        let ciphertext = general_purpose::STANDARD
-            .decode(&frame.ciphertext_base64)
-            .map_err(E2eeError::InvalidCiphertextEncoding)?;
-        let nonce = nonce_for_sequence(frame.sequence);
-        let associated_data = self.context.associated_data(frame.sequence);
+        let nonce = nonce_for_sequence(sequence);
+        let associated_data = self.context.associated_data(sequence);
         let plaintext = self
             .receive_cipher
             .decrypt(
                 AeadNonce::from_slice(&nonce),
                 Payload {
-                    msg: ciphertext.as_slice(),
+                    msg: ciphertext,
                     aad: &associated_data,
                 },
             )
@@ -359,6 +406,48 @@ impl E2eeSession {
 
         Ok(plaintext)
     }
+}
+
+pub fn encode_binary_encrypted_frame(frame: &BinaryEncryptedFramePayload) -> Vec<u8> {
+    let mut wire = Vec::with_capacity(BINARY_E2EE_FRAME_HEADER_LEN + frame.ciphertext.len());
+    wire.extend_from_slice(BINARY_E2EE_FRAME_MAGIC);
+    wire.push(BINARY_E2EE_FRAME_VERSION);
+    wire.push(BINARY_E2EE_FRAME_KIND_ENCRYPTED);
+    wire.extend_from_slice(&[0, 0]);
+    wire.extend_from_slice(frame.server_id.0.as_bytes());
+    wire.extend_from_slice(&frame.sequence.to_be_bytes());
+    wire.extend_from_slice(&frame.ciphertext);
+    wire
+}
+
+pub fn decode_binary_encrypted_frame(
+    wire: &[u8],
+) -> Result<BinaryEncryptedFramePayload, E2eeError> {
+    if wire.len() < BINARY_E2EE_FRAME_HEADER_LEN
+        || &wire[0..4] != BINARY_E2EE_FRAME_MAGIC
+        || wire[4] != BINARY_E2EE_FRAME_VERSION
+        || wire[5] != BINARY_E2EE_FRAME_KIND_ENCRYPTED
+        || wire[6] != 0
+        || wire[7] != 0
+    {
+        return Err(E2eeError::InvalidBinaryFrame);
+    }
+
+    let server_id = ServerId(Uuid::from_bytes(
+        wire[8..24]
+            .try_into()
+            .map_err(|_| E2eeError::InvalidBinaryFrame)?,
+    ));
+    let sequence = u64::from_be_bytes(
+        wire[24..32]
+            .try_into()
+            .map_err(|_| E2eeError::InvalidBinaryFrame)?,
+    );
+    Ok(BinaryEncryptedFramePayload {
+        server_id,
+        sequence,
+        ciphertext: wire[32..].to_vec(),
+    })
 }
 
 fn validate_context(
@@ -665,5 +754,69 @@ mod tests {
         assert_eq!(first.sequence, 0);
         assert_eq!(second.sequence, 1);
         assert_ne!(first.ciphertext_base64, second.ciphertext_base64);
+    }
+
+    #[test]
+    fn net_binary_encrypted_frame_roundtrips_without_base64_json_wrapper() {
+        let daemon = E2eeKeyPair::generate();
+        let device = E2eeKeyPair::generate();
+        let (server_id, _, context) = test_context(&daemon, &device);
+        let plaintext = b"\x00terminal-bytes\xff";
+        let mut sender = E2eeSession::new(
+            E2eeSessionRole::Device,
+            &device,
+            daemon.public_key(),
+            context.clone(),
+        )
+        .unwrap();
+        let mut receiver = E2eeSession::new(
+            E2eeSessionRole::Daemon,
+            &daemon,
+            device.public_key(),
+            context,
+        )
+        .unwrap();
+
+        let binary = sender.encrypt_binary_payload(plaintext).unwrap();
+        let wire = encode_binary_encrypted_frame(&binary);
+        let decoded = decode_binary_encrypted_frame(&wire).unwrap();
+        let decrypted = receiver.decrypt_binary_payload(&decoded).unwrap();
+
+        assert_eq!(decoded.server_id, server_id);
+        assert_eq!(decoded.sequence, 0);
+        assert_eq!(decrypted, plaintext);
+        assert!(wire.starts_with(BINARY_E2EE_FRAME_MAGIC));
+        assert!(!String::from_utf8_lossy(&wire).contains("ciphertext_base64"));
+        assert!(!String::from_utf8_lossy(&wire).contains("encrypted_frame"));
+    }
+
+    #[test]
+    fn net_binary_encrypted_frame_rejects_tampered_sequence_without_advancing() {
+        let daemon = E2eeKeyPair::generate();
+        let device = E2eeKeyPair::generate();
+        let (_, _, context) = test_context(&daemon, &device);
+        let mut sender = E2eeSession::new(
+            E2eeSessionRole::Device,
+            &device,
+            daemon.public_key(),
+            context.clone(),
+        )
+        .unwrap();
+        let first = sender.encrypt_binary_payload(b"first").unwrap();
+        let second = sender.encrypt_binary_payload(b"second").unwrap();
+        let mut tampered = first.clone();
+        tampered.sequence = 7;
+        let mut receiver = E2eeSession::new(
+            E2eeSessionRole::Daemon,
+            &daemon,
+            device.public_key(),
+            context,
+        )
+        .unwrap();
+
+        assert!(receiver.decrypt_binary_payload(&tampered).is_err());
+        assert_eq!(receiver.decrypt_binary_payload(&first).unwrap(), b"first");
+        assert!(receiver.decrypt_binary_payload(&first).is_err());
+        assert_eq!(receiver.decrypt_binary_payload(&second).unwrap(), b"second");
     }
 }

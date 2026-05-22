@@ -3,10 +3,10 @@
 //! 这里只把 socket 字节流接到 `protocol` 状态机；pairing、auth、session 和 E2EE
 //! 规则都由协议核心执行，避免网络框架层夹带业务判断。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{AddrParseError, IpAddr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -25,7 +25,7 @@ use termd_proto::{
 };
 use thiserror::Error;
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Mutex, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, timeout};
 use tracing::{debug, info, warn};
@@ -38,7 +38,8 @@ use crate::state::{DaemonState, SessionStateRecord, StateError, StateStore};
 
 use super::protocol::{
     DaemonProtocol, JsonEnvelope, ProtocolConnection, ProtocolConnectionDebugSnapshot,
-    ProtocolConnectionDebugTraffic, ProtocolError, decode_payload, envelope_value,
+    ProtocolConnectionDebugTraffic, ProtocolError, ProtocolWireMessage, decode_payload,
+    envelope_value,
 };
 use super::signature::Ed25519SignatureVerifier;
 
@@ -59,8 +60,15 @@ const WEBSOCKET_SEND_DEBUG_BATCH_ENVELOPES: usize = 8;
 const WEBSOCKET_SEND_DEBUG_BATCH_BYTES: usize = 32 * 1024;
 const WEBSOCKET_SEND_INFO_BATCH_ENVELOPES: usize = 20;
 const WEBSOCKET_SEND_INFO_BATCH_BYTES: usize = 256 * 1024;
+const WEBSOCKET_RAW_CONTROL_QUEUE_CAPACITY: usize = 256;
+const WEBSOCKET_WIRE_QUEUE_CAPACITY: usize = 256;
+const WEBSOCKET_WRITE_OUTCOME_QUEUE_CAPACITY: usize = 256;
+const WEBSOCKET_PUSH_EVENT_QUEUE_CAPACITY: usize = 1024;
+const WEBSOCKET_PUSH_DRAIN_MAX_EVENTS_PER_TICK: usize = 4;
+const WEBSOCKET_PUSH_DRAIN_MAX_ENQUEUED_BYTES_PER_TICK: usize = 256 * 1024;
+const WEBSOCKET_PUSH_DRAIN_MAX_ELAPSED: Duration = Duration::from_millis(2);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum SessionPushEvent {
     Output(SessionId),
     Activity(SessionId),
@@ -80,6 +88,80 @@ impl SessionPushEvent {
             | SessionPushEvent::Resize(_) => None,
         }
     }
+}
+
+#[derive(Debug, Default)]
+struct SessionPushEventQueue {
+    pending: VecDeque<SessionPushEvent>,
+    pending_set: HashSet<SessionPushEvent>,
+    inflight: HashSet<SessionPushEvent>,
+    dirty_inflight: HashSet<SessionPushEvent>,
+}
+
+impl SessionPushEventQueue {
+    fn enqueue(&mut self, event: SessionPushEvent) {
+        if self.pending_set.contains(&event) {
+            return;
+        }
+        if self.inflight.contains(&event) {
+            // 中文注释：同一个 session 的 output 正在收集或等待写出时，新 watch 信号只需要
+            // 标记为 dirty。当前批次发送完成后再补排一次，避免无界重复事件把 daemon 拖慢。
+            self.dirty_inflight.insert(event);
+            return;
+        }
+        self.pending_set.insert(event);
+        self.pending.push_back(event);
+    }
+
+    fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    fn peek_front(&self) -> Option<SessionPushEvent> {
+        self.pending.front().copied()
+    }
+
+    fn pop_front_for_inflight(&mut self) -> Option<SessionPushEvent> {
+        let event = self.pending.pop_front()?;
+        self.pending_set.remove(&event);
+        self.inflight.insert(event);
+        Some(event)
+    }
+
+    fn finish_inflight_after_send(&mut self, events: &[SessionPushEvent]) {
+        for event in events {
+            let should_requeue = self.dirty_inflight.remove(event);
+            self.inflight.remove(event);
+            if should_requeue {
+                self.enqueue(*event);
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+enum WebSocketWrite {
+    Wire {
+        kind: WebSocketOutKind,
+        messages: Vec<ProtocolWireMessage>,
+        push_events: Vec<SessionPushEvent>,
+    },
+    Raw {
+        kind: WebSocketOutKind,
+        message: Message,
+        bytes: usize,
+    },
+}
+
+#[derive(Debug)]
+enum WebSocketWriteOutcome {
+    Sent {
+        kind: WebSocketOutKind,
+        envelopes: usize,
+        bytes: usize,
+        push_events: Vec<SessionPushEvent>,
+    },
+    Failed,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -174,7 +256,7 @@ impl WebSocketTrafficCounters {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WebSocketOutKind {
     RouteReady,
     Initial,
@@ -219,6 +301,11 @@ struct WebSocketWatcherCounts {
 }
 
 pub type DefaultDaemonProtocol = DaemonProtocol<SupervisorPtyBackend, Ed25519SignatureVerifier>;
+/// daemon 的协议核心仍是单线程语义，但等待这把锁必须让出 Tokio worker。
+///
+/// 直连 WebSocket 和 relay mux 共用同一个协议状态；如果使用 `std::sync::Mutex`，
+/// 快速切换大输出 session 时多个任务会在 worker 线程上阻塞等待锁，连心跳、输入和
+/// relay 主干读写都会一起迟滞。`tokio::sync::Mutex` 保持串行临界区，同时让等待者挂起。
 pub type SharedDaemonProtocol = Arc<Mutex<DefaultDaemonProtocol>>;
 
 #[derive(Debug, Error)]
@@ -597,7 +684,7 @@ async fn serve_rustls_listener(
 }
 
 async fn healthz(State(protocol): State<SharedDaemonProtocol>) -> Json<HealthzPayload> {
-    let protocol = protocol.lock().expect("daemon protocol mutex poisoned");
+    let protocol = protocol.lock().await;
 
     Json(HealthzPayload {
         status: "ok",
@@ -623,7 +710,7 @@ async fn local_pairing_token(
     }
 
     let now_ms = current_unix_timestamp_millis();
-    let mut protocol = protocol.lock().expect("daemon protocol mutex poisoned");
+    let mut protocol = protocol.lock().await;
     let ttl_ms = protocol.config().pairing_token_ttl_ms;
     let server_id = protocol.server_id();
     let daemon_public_key = protocol.daemon_public_identity().public_key.clone();
@@ -823,6 +910,7 @@ fn info_websocket_traffic(
         watchers_file_tree = watchers.file_tree,
         watchers_resize = watchers.resize,
         flow_packet_mode = flow.packet_mode,
+        flow_binary_mode = flow.binary_mode,
         flow_attached_sessions = flow.attached_sessions,
         flow_watched_sessions = flow.watched_sessions,
         flow_terminal_streams = flow.terminal_streams,
@@ -850,6 +938,7 @@ fn debug_websocket_traffic(
         watchers_file_tree = watchers.file_tree,
         watchers_resize = watchers.resize,
         flow_packet_mode = flow.packet_mode,
+        flow_binary_mode = flow.binary_mode,
         flow_attached_sessions = flow.attached_sessions,
         flow_watched_sessions = flow.watched_sessions,
         flow_terminal_streams = flow.terminal_streams,
@@ -863,16 +952,19 @@ fn debug_websocket_traffic(
 
 async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_addr: SocketAddr) {
     let (mut sender, mut receiver) = socket.split();
-    let (push_event_tx, mut push_event_rx) = mpsc::unbounded_channel::<SessionPushEvent>();
+    let (push_event_tx, mut push_event_rx) =
+        mpsc::channel::<SessionPushEvent>(WEBSOCKET_PUSH_EVENT_QUEUE_CAPACITY);
     let mut watched_output_sessions = HashSet::new();
     let mut watched_activity_sessions = HashSet::new();
     let mut watched_file_tree_sessions = HashSet::new();
     let mut watched_resize_sessions = HashSet::new();
     let mut watcher_tasks: Vec<JoinHandle<()>> = Vec::new();
+    let mut push_event_queue = SessionPushEventQueue::default();
+    let mut push_drain_wake_pending = false;
     let mut traffic = WebSocketTrafficCounters::default();
     let mut last_traffic_log = Instant::now();
     let server_id = {
-        let protocol = protocol.lock().expect("daemon protocol mutex poisoned");
+        let protocol = protocol.lock().await;
         protocol.server_id()
     };
 
@@ -919,7 +1011,7 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
     }
 
     let (mut connection, initial_messages) = {
-        let protocol = protocol.lock().expect("daemon protocol mutex poisoned");
+        let protocol = protocol.lock().await;
         protocol.start_connection_for_peer(Some(peer_addr.ip().to_string()))
     };
 
@@ -928,6 +1020,22 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
         Ok(bytes) => traffic.record_out(WebSocketOutKind::Initial, initial_count, bytes),
         Err(()) => return,
     }
+
+    let (write_raw_control_tx, write_raw_control_rx) =
+        mpsc::channel::<WebSocketWrite>(WEBSOCKET_RAW_CONTROL_QUEUE_CAPACITY);
+    let (write_wire_tx, write_wire_rx) =
+        mpsc::channel::<WebSocketWrite>(WEBSOCKET_WIRE_QUEUE_CAPACITY);
+    let (write_outcome_tx, mut write_outcome_rx) =
+        mpsc::channel::<WebSocketWriteOutcome>(WEBSOCKET_WRITE_OUTCOME_QUEUE_CAPACITY);
+    // 中文注释：直连 WebSocket 和 relay 一样，把读控制帧和写大量 terminal output 拆开。
+    // 慢浏览器或大 snapshot 只能拖住 writer，不能阻塞主循环读取 close/input/pong。
+    let writer_task = tokio::spawn(run_websocket_writer(
+        peer_addr,
+        write_raw_control_rx,
+        write_wire_rx,
+        write_outcome_tx,
+        sender,
+    ));
 
     let mut idle_deadline = Instant::now() + WEBSOCKET_IDLE_TIMEOUT;
     let mut heartbeat = tokio::time::interval_at(
@@ -939,6 +1047,8 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
     loop {
         let pending_pong_deadline_snapshot = pending_pong_deadline;
         // 控制和 client close 必须先于输出队列处理；快速切换时旧 attach 才能及时取消。
+        // 中文注释：writer outcome 可能在大量输出时形成热循环。它只能驱动后续输出续传，
+        // 不能排在入站消息前面，否则用户输入、close、pong 会被“已发送”通知饿住。
         tokio::select! {
             biased;
 
@@ -973,19 +1083,16 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
                 match message {
                     Message::Ping(payload) => {
                         let pong_bytes = payload.len();
-                        if send_message_with_deadline(
-                            &mut sender,
+                        if enqueue_websocket_control_raw(
+                            &write_raw_control_tx,
+                            WebSocketOutKind::Pong,
                             Message::Pong(payload),
-                            WEBSOCKET_PONG_DEADLINE,
-                            "websocket pong failed",
+                            pong_bytes,
                         )
-                        .await
-                        .is_err()
-                        {
+                        .is_err() {
                             traffic.record_send_error();
                             break;
                         }
-                        traffic.record_out(WebSocketOutKind::Pong, 0, pong_bytes);
                         maybe_log_websocket_traffic(
                             peer_addr,
                             &mut traffic,
@@ -1020,20 +1127,18 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
                     }
                     Message::Close(_) => break,
                     other => {
-                        let Some(envelope) = (match message_to_envelope(other) {
-                            Ok(envelope) => envelope,
+                        let Some(wire_message) = (match message_to_wire_message(other) {
+                            Ok(message) => message,
                             Err(error) => {
-                                match send_envelope_logged(
-                                    peer_addr,
-                                    &mut sender,
-                                    plaintext_error(error),
-                                    "plain_error",
-                                    true,
+                                if enqueue_websocket_wire(
+                                    &write_wire_tx,
+                                    WebSocketOutKind::PlainError,
+                                    vec![ProtocolWireMessage::Json(plaintext_error(error))],
                                 )
-                                .await
+                                .is_err()
                                 {
-                                    Ok(bytes) => traffic.record_out(WebSocketOutKind::PlainError, 1, bytes),
-                                    Err(()) => traffic.record_send_error(),
+                                    traffic.record_send_error();
+                                    break;
                                 }
                                 maybe_log_websocket_traffic(
                                     peer_addr,
@@ -1055,17 +1160,20 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
                         };
 
                         let responses = {
-                            let mut protocol = protocol.lock().expect("daemon protocol mutex poisoned");
-                            connection.handle_wire_envelope(&mut protocol, envelope)
+                            let mut protocol = protocol.lock().await;
+                            connection.handle_wire_message(&mut protocol, wire_message)
                         };
+                        queue_deferred_output_wakeups(&mut connection, &mut push_event_queue);
 
-                        let response_count = responses.len();
-                        match send_envelopes_logged(peer_addr, &mut sender, responses, "response").await {
-                            Ok(bytes) => traffic.record_out(WebSocketOutKind::Response, response_count, bytes),
-                            Err(()) => {
-                                traffic.record_send_error();
-                                break;
-                            }
+                        if enqueue_websocket_wire(
+                            &write_wire_tx,
+                            WebSocketOutKind::Response,
+                            responses,
+                        )
+                        .is_err()
+                        {
+                            traffic.record_send_error();
+                            break;
                         }
 
                         let initial_output_sessions = register_session_watchers(
@@ -1077,8 +1185,22 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
                             &mut watched_resize_sessions,
                             &push_event_tx,
                             &mut watcher_tasks,
-                        );
-                        queue_initial_output_events(&initial_output_sessions, &push_event_tx);
+                        )
+                        .await;
+                        queue_initial_output_events(&initial_output_sessions, &mut push_event_queue);
+                        if let Err(()) = drain_websocket_push_events(
+                            &protocol,
+                            &mut connection,
+                            &mut push_event_queue,
+                            &write_wire_tx,
+                            &push_event_tx,
+                            &mut push_drain_wake_pending,
+                        )
+                        .await
+                        {
+                            traffic.record_send_error();
+                            break;
+                        }
                         maybe_log_websocket_traffic(
                             peer_addr,
                             &mut traffic,
@@ -1095,22 +1217,54 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
                     }
                 };
             }
+            write_outcome = write_outcome_rx.recv() => {
+                let Some(write_outcome) = write_outcome else {
+                    traffic.record_send_error();
+                    break;
+                };
+                match write_outcome {
+                    WebSocketWriteOutcome::Sent { kind, envelopes, bytes, push_events } => {
+                        traffic.record_out(kind, envelopes, bytes);
+                        push_event_queue.finish_inflight_after_send(&push_events);
+                        queue_websocket_push_drain_wakeup(
+                            &push_event_queue,
+                            &push_event_tx,
+                            &mut push_drain_wake_pending,
+                        );
+                    }
+                    WebSocketWriteOutcome::Failed => {
+                        traffic.record_send_error();
+                        break;
+                    }
+                }
+                maybe_log_websocket_traffic(
+                    peer_addr,
+                    &mut traffic,
+                    &mut last_traffic_log,
+                    &mut connection,
+                    current_websocket_watcher_counts(
+                        &watched_output_sessions,
+                        &watched_activity_sessions,
+                        &watched_file_tree_sessions,
+                        &watched_resize_sessions,
+                    ),
+                    false,
+                );
+            }
             _ = heartbeat.tick() => {
                 if pending_pong_deadline.is_none() {
                     let ping_bytes = 0;
-                    if send_message_with_deadline(
-                        &mut sender,
+                    if enqueue_websocket_control_raw(
+                        &write_raw_control_tx,
+                        WebSocketOutKind::Ping,
                         Message::Ping(Vec::new()),
-                        WEBSOCKET_SEND_DEADLINE,
-                        "websocket ping failed",
+                        ping_bytes,
                     )
-                    .await
                     .is_err()
                     {
                         traffic.record_send_error();
                         break;
                     }
-                    traffic.record_out(WebSocketOutKind::Ping, 0, ping_bytes);
                     maybe_log_websocket_traffic(
                         peer_addr,
                         &mut traffic,
@@ -1132,46 +1286,20 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
                     break;
                 };
                 idle_deadline = Instant::now() + WEBSOCKET_IDLE_TIMEOUT;
-                let (kind, responses) = {
-                    let mut protocol = protocol.lock().expect("daemon protocol mutex poisoned");
-                    match event {
-                        SessionPushEvent::Output(session_id) => {
-                            (
-                                WebSocketOutKind::PushOutput,
-                                connection.read_session_output(
-                                    &mut protocol,
-                                    session_id,
-                                    OUTPUT_FLUSH_MAX_BYTES_PER_SESSION,
-                                ),
-                            )
-                        }
-                        SessionPushEvent::Activity(session_id) => {
-                            (
-                                WebSocketOutKind::PushActivity,
-                                connection.read_session_activity(&mut protocol, session_id),
-                            )
-                        }
-                        SessionPushEvent::FileTree(session_id) => {
-                            (
-                                WebSocketOutKind::PushFileTree,
-                                connection.read_session_file_tree_update(&mut protocol, session_id),
-                            )
-                        }
-                        SessionPushEvent::Resize(session_id) => {
-                            (
-                                WebSocketOutKind::PushResize,
-                                connection.read_session_resize_update(&mut protocol, session_id),
-                            )
-                        }
-                    }
-                };
-                let response_count = responses.len();
-                match send_envelopes_logged(peer_addr, &mut sender, responses, kind.label()).await {
-                    Ok(bytes) => traffic.record_out(kind, response_count, bytes),
-                    Err(()) => {
-                        traffic.record_send_error();
-                        break;
-                    }
+                push_drain_wake_pending = false;
+                push_event_queue.enqueue(event);
+                if let Err(()) = drain_websocket_push_events(
+                    &protocol,
+                    &mut connection,
+                    &mut push_event_queue,
+                    &write_wire_tx,
+                    &push_event_tx,
+                    &mut push_drain_wake_pending,
+                )
+                .await
+                {
+                    traffic.record_send_error();
+                    break;
                 }
                 maybe_log_websocket_traffic(
                     peer_addr,
@@ -1208,24 +1336,193 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
         task.abort();
     }
 
-    let mut protocol = protocol.lock().expect("daemon protocol mutex poisoned");
+    let mut protocol = protocol.lock().await;
     connection.close(&mut protocol);
+    writer_task.abort();
     debug!("websocket connection closed and detached");
 }
 
-fn register_session_watchers(
+fn queue_websocket_push_drain_wakeup(
+    queue: &SessionPushEventQueue,
+    push_event_tx: &mpsc::Sender<SessionPushEvent>,
+    push_drain_wake_pending: &mut bool,
+) {
+    if *push_drain_wake_pending {
+        return;
+    }
+    let Some(event) = queue.peek_front() else {
+        return;
+    };
+    // 中文注释：writer outcome 是高频事件。发送完成后只唤醒下一轮 drain，
+    // 不能在 outcome 分支里递归继续读 PTY/加密/入队，否则大输出会压住输入、close 和 pong。
+    if push_event_tx.try_send(event).is_ok() {
+        *push_drain_wake_pending = true;
+    }
+}
+
+fn websocket_push_drain_budget_exhausted(
+    drained_events: usize,
+    enqueued_bytes: usize,
+    started_at: Instant,
+) -> bool {
+    drained_events >= WEBSOCKET_PUSH_DRAIN_MAX_EVENTS_PER_TICK
+        || enqueued_bytes >= WEBSOCKET_PUSH_DRAIN_MAX_ENQUEUED_BYTES_PER_TICK
+        || started_at.elapsed() >= WEBSOCKET_PUSH_DRAIN_MAX_ELAPSED
+}
+
+fn websocket_wire_messages_wire_len(messages: &[ProtocolWireMessage]) -> usize {
+    messages
+        .iter()
+        .map(|message| match message {
+            ProtocolWireMessage::Json(envelope) => match serde_json::to_vec(envelope) {
+                Ok(raw) => raw.len(),
+                Err(_) => 0,
+            },
+            ProtocolWireMessage::Binary(raw) => raw.len(),
+        })
+        .sum()
+}
+
+async fn drain_websocket_push_events(
+    protocol: &SharedDaemonProtocol,
+    connection: &mut ProtocolConnection,
+    queue: &mut SessionPushEventQueue,
+    write_wire_tx: &mpsc::Sender<WebSocketWrite>,
+    push_event_tx: &mpsc::Sender<SessionPushEvent>,
+    push_drain_wake_pending: &mut bool,
+) -> Result<(), ()> {
+    let started_at = Instant::now();
+    let mut drained_events = 0_usize;
+    let mut enqueued_bytes = 0_usize;
+    while queue.has_pending() {
+        let Some(event) = queue.pop_front_for_inflight() else {
+            break;
+        };
+        let permit = match write_wire_tx.try_reserve() {
+            Ok(permit) => permit,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                // 中文注释：直连慢浏览器只能给自己的 wire 队列施压；不能让 daemon
+                // 为它无界累积 terminal output，进而拖住 relay mux 和其它直连控制帧。
+                queue.finish_inflight_after_send(&[event]);
+                queue.enqueue(event);
+                break;
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                queue.finish_inflight_after_send(&[event]);
+                queue.enqueue(event);
+                return Err(());
+            }
+        };
+        let (kind, responses) = collect_websocket_push_event(protocol, connection, event).await;
+        queue_deferred_output_wakeups(connection, queue);
+        if responses.is_empty() {
+            queue.finish_inflight_after_send(&[event]);
+            drained_events = drained_events.saturating_add(1);
+            if websocket_push_drain_budget_exhausted(drained_events, enqueued_bytes, started_at) {
+                queue_websocket_push_drain_wakeup(queue, push_event_tx, push_drain_wake_pending);
+                break;
+            }
+            continue;
+        }
+        let batch_bytes = websocket_wire_messages_wire_len(&responses);
+        permit.send(WebSocketWrite::Wire {
+            kind,
+            messages: responses,
+            push_events: vec![event],
+        });
+        drained_events = drained_events.saturating_add(1);
+        enqueued_bytes = enqueued_bytes.saturating_add(batch_bytes);
+        if websocket_push_drain_budget_exhausted(drained_events, enqueued_bytes, started_at) {
+            // 中文注释：直连 WebSocket 和 relay 使用同一类输出调度预算。
+            // 一轮输出入队后主动回到 select!，让输入、cancel、close、pong 和新 attach
+            // 有机会插队处理，避免多个大输出窗口一起占住 daemon 协议状态。
+            queue_websocket_push_drain_wakeup(queue, push_event_tx, push_drain_wake_pending);
+            break;
+        }
+    }
+    Ok(())
+}
+
+async fn collect_websocket_push_event(
+    protocol: &SharedDaemonProtocol,
+    connection: &mut ProtocolConnection,
+    event: SessionPushEvent,
+) -> (WebSocketOutKind, Vec<ProtocolWireMessage>) {
+    match event {
+        SessionPushEvent::Output(session_id) => {
+            let lock_started = Instant::now();
+            let collect_started = Instant::now();
+            let (lock_wait, messages) = {
+                let mut protocol = protocol.lock().await;
+                let lock_wait = lock_started.elapsed();
+                // 中文注释：protocol lock 只覆盖 PTY/runtime 读取；E2EE 加密在锁外完成。
+                // 这能避免某个直连 WebSocket 的大输出阻塞 relay mux 或其它直连输入。
+                let messages = connection.collect_session_output_messages(
+                    &mut protocol,
+                    session_id,
+                    OUTPUT_FLUSH_MAX_BYTES_PER_SESSION,
+                );
+                (lock_wait, messages)
+            };
+            let collect_elapsed = collect_started.elapsed();
+            if lock_wait >= WEBSOCKET_SEND_DEBUG_LOG_THRESHOLD
+                || collect_elapsed >= WEBSOCKET_SEND_DEBUG_LOG_THRESHOLD
+            {
+                debug!(
+                    session_id = ?session_id,
+                    lock_wait_ms = lock_wait.as_millis(),
+                    collect_ms = collect_elapsed.as_millis(),
+                    "websocket output collection latency"
+                );
+            }
+            (
+                WebSocketOutKind::PushOutput,
+                connection.encrypt_collected_inner_messages_wire(messages),
+            )
+        }
+        SessionPushEvent::Activity(session_id) => {
+            let mut protocol = protocol.lock().await;
+            (
+                WebSocketOutKind::PushActivity,
+                connection.read_session_activity_wire(&mut protocol, session_id),
+            )
+        }
+        SessionPushEvent::FileTree(session_id) => {
+            let messages = {
+                let mut protocol = protocol.lock().await;
+                connection.read_session_file_tree_update_messages(&mut protocol, session_id)
+            };
+            (
+                WebSocketOutKind::PushFileTree,
+                connection.encrypt_collected_inner_messages_wire(messages),
+            )
+        }
+        SessionPushEvent::Resize(session_id) => {
+            let messages = {
+                let mut protocol = protocol.lock().await;
+                connection.read_session_resize_update_messages(&mut protocol, session_id)
+            };
+            (
+                WebSocketOutKind::PushResize,
+                connection.encrypt_collected_inner_messages_wire(messages),
+            )
+        }
+    }
+}
+
+async fn register_session_watchers(
     connection: &ProtocolConnection,
     protocol: &SharedDaemonProtocol,
     watched_output_sessions: &mut HashSet<SessionId>,
     watched_activity_sessions: &mut HashSet<SessionId>,
     watched_file_tree_sessions: &mut HashSet<SessionId>,
     watched_resize_sessions: &mut HashSet<SessionId>,
-    push_event_tx: &mpsc::UnboundedSender<SessionPushEvent>,
+    push_event_tx: &mpsc::Sender<SessionPushEvent>,
     watcher_tasks: &mut Vec<JoinHandle<()>>,
 ) -> Vec<SessionId> {
     let mut initial_output_sessions = Vec::new();
     let (output_signals, activity_signals, file_tree_signals, resize_signals) = {
-        let protocol = protocol.lock().expect("daemon protocol mutex poisoned");
+        let protocol = protocol.lock().await;
         (
             connection.attached_output_signals(&protocol),
             connection.session_activity_signals(&protocol),
@@ -1233,6 +1530,39 @@ fn register_session_watchers(
             connection.attached_resize_signals(&protocol),
         )
     };
+    let desired_output_sessions: HashSet<_> = output_signals
+        .iter()
+        .map(|(session_id, _)| *session_id)
+        .collect();
+    let desired_activity_sessions: HashSet<_> = activity_signals
+        .iter()
+        .map(|(session_id, _)| *session_id)
+        .collect();
+    let desired_file_tree_sessions: HashSet<_> = file_tree_signals
+        .iter()
+        .map(|(session_id, _)| *session_id)
+        .collect();
+    let desired_resize_sessions: HashSet<_> = resize_signals
+        .iter()
+        .map(|(session_id, _)| *session_id)
+        .collect();
+
+    if !watched_output_sessions.is_subset(&desired_output_sessions)
+        || !watched_activity_sessions.is_subset(&desired_activity_sessions)
+        || !watched_file_tree_sessions.is_subset(&desired_file_tree_sessions)
+        || !watched_resize_sessions.is_subset(&desired_resize_sessions)
+    {
+        // 中文注释：切换 terminal stream 后旧 session 不应继续产生 push。
+        // 一旦发现当前 watcher 集合不再是 desired 集合的子集，就整体重建本连接 watcher。
+        debug!("rebuilding websocket watchers after subscription set changed");
+        for task in watcher_tasks.drain(..) {
+            task.abort();
+        }
+        watched_output_sessions.clear();
+        watched_activity_sessions.clear();
+        watched_file_tree_sessions.clear();
+        watched_resize_sessions.clear();
+    }
 
     for (session_id, signal) in output_signals {
         if !watched_output_sessions.insert(session_id) {
@@ -1299,12 +1629,23 @@ fn register_session_watchers(
 
 fn queue_initial_output_events(
     initial_output_sessions: &[SessionId],
-    push_event_tx: &mpsc::UnboundedSender<SessionPushEvent>,
+    push_event_queue: &mut SessionPushEventQueue,
 ) {
     for session_id in initial_output_sessions {
         // attach/create 刚完成时 watcher 会忽略当前 watch 值；显式排一次输出读取，
         // 但让它走 push 队列，给 close、cancel、pong 等控制事件抢先处理的机会。
-        let _ = push_event_tx.send(SessionPushEvent::Output(*session_id));
+        push_event_queue.enqueue(SessionPushEvent::Output(*session_id));
+    }
+}
+
+fn queue_deferred_output_wakeups(
+    connection: &mut ProtocolConnection,
+    push_event_queue: &mut SessionPushEventQueue,
+) {
+    for session_id in connection.take_deferred_output_wakeups() {
+        // 中文注释：flow credit 到达后只唤醒输出 drain。实际 PTY 读取、batch 组装和
+        // E2EE 加密会在后续 push 分支中执行，让 input/cancel/pong 可以先被 select 处理。
+        push_event_queue.enqueue(SessionPushEvent::Output(session_id));
     }
 }
 
@@ -1312,7 +1653,7 @@ fn spawn_session_push_watcher<T>(
     session_id: SessionId,
     mut signal: watch::Receiver<T>,
     event: SessionPushEvent,
-    push_event_tx: &mpsc::UnboundedSender<SessionPushEvent>,
+    push_event_tx: &mpsc::Sender<SessionPushEvent>,
     watcher_tasks: &mut Vec<JoinHandle<()>>,
 ) where
     T: Clone + Send + Sync + 'static,
@@ -1334,7 +1675,7 @@ fn spawn_session_push_watcher<T>(
                 SessionPushEvent::FileTree(_) => SessionPushEvent::FileTree(session_id),
                 SessionPushEvent::Resize(_) => SessionPushEvent::Resize(session_id),
             };
-            if push_event_tx.send(next_event).is_err() {
+            if push_event_tx.send(next_event).await.is_err() {
                 break;
             }
             if let Some(interval) = min_interval {
@@ -1352,6 +1693,16 @@ fn message_to_envelope(message: Message) -> Result<Option<JsonEnvelope>, Protoco
         Message::Binary(raw) => serde_json::from_slice(&raw)
             .map(Some)
             .map_err(|_| ProtocolError::InvalidEnvelope),
+        Message::Close(_) | Message::Ping(_) | Message::Pong(_) => Ok(None),
+    }
+}
+
+fn message_to_wire_message(message: Message) -> Result<Option<ProtocolWireMessage>, ProtocolError> {
+    match message {
+        Message::Text(raw) => serde_json::from_str(&raw)
+            .map(|envelope| Some(ProtocolWireMessage::Json(envelope)))
+            .map_err(|_| ProtocolError::InvalidEnvelope),
+        Message::Binary(raw) => Ok(Some(ProtocolWireMessage::Binary(raw.to_vec()))),
         Message::Close(_) | Message::Ping(_) | Message::Pong(_) => Ok(None),
     }
 }
@@ -1376,6 +1727,127 @@ fn route_prelude_timeout_error() -> JsonEnvelope {
         },
     )
     .expect("route prelude timeout payload should serialize")
+}
+
+fn enqueue_websocket_wire(
+    tx: &mpsc::Sender<WebSocketWrite>,
+    kind: WebSocketOutKind,
+    messages: Vec<ProtocolWireMessage>,
+) -> Result<(), ()> {
+    // 中文注释：所有已经完成 E2EE 的业务帧都必须进入同一个 FIFO。
+    // 这样 response、push_output、error 的相对顺序就和加密顺序一致，不会把 seq 打乱。
+    tx.try_send(WebSocketWrite::Wire {
+        kind,
+        messages,
+        push_events: Vec::new(),
+    })
+    .map_err(|_| ())
+}
+
+fn enqueue_websocket_control_raw(
+    tx: &mpsc::Sender<WebSocketWrite>,
+    kind: WebSocketOutKind,
+    message: Message,
+    bytes: usize,
+) -> Result<(), ()> {
+    match tx.try_send(WebSocketWrite::Raw {
+        kind,
+        message,
+        bytes,
+    }) {
+        Ok(()) => Ok(()),
+        Err(mpsc::error::TrySendError::Full(_)) if kind == WebSocketOutKind::Ping => {
+            // 中文注释：Ping 只是保活探测。control 队列满说明已有其它控制帧待写，
+            // 此时丢弃本次 Ping 比断开整条直连 WebSocket 更符合背压语义。
+            Ok(())
+        }
+        Err(_) => Err(()),
+    }
+}
+
+async fn run_websocket_writer(
+    peer_addr: SocketAddr,
+    mut raw_control_rx: mpsc::Receiver<WebSocketWrite>,
+    mut wire_rx: mpsc::Receiver<WebSocketWrite>,
+    outcome_tx: mpsc::Sender<WebSocketWriteOutcome>,
+    mut sender: futures_util::stream::SplitSink<WebSocket, Message>,
+) {
+    loop {
+        // 中文注释：raw ping/pong 仍然可以独立处理，但所有业务帧必须只走一个 FIFO。
+        // 这样 writer 就不会把已加密的 seq=4 插到 seq=3 前面。
+        tokio::select! {
+            biased;
+
+            write = raw_control_rx.recv() => {
+                let Some(write) = write else {
+                    break;
+                };
+                if !send_websocket_write(peer_addr, &mut sender, write, &outcome_tx).await {
+                    break;
+                }
+            }
+            write = wire_rx.recv() => {
+                let Some(write) = write else {
+                    break;
+                };
+                if !send_websocket_write(peer_addr, &mut sender, write, &outcome_tx).await {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+async fn send_websocket_write(
+    peer_addr: SocketAddr,
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    write: WebSocketWrite,
+    outcome_tx: &mpsc::Sender<WebSocketWriteOutcome>,
+) -> bool {
+    let outcome = match write {
+        WebSocketWrite::Wire {
+            kind,
+            messages,
+            push_events,
+        } => {
+            let envelope_count = messages.len();
+            match send_wire_messages_logged(peer_addr, sender, messages, kind.label()).await {
+                Ok(bytes) => WebSocketWriteOutcome::Sent {
+                    kind,
+                    envelopes: envelope_count,
+                    bytes,
+                    push_events,
+                },
+                Err(()) => WebSocketWriteOutcome::Failed,
+            }
+        }
+        WebSocketWrite::Raw {
+            kind,
+            message,
+            bytes,
+        } => {
+            let deadline = match kind {
+                WebSocketOutKind::Pong => WEBSOCKET_PONG_DEADLINE,
+                _ => WEBSOCKET_SEND_DEADLINE,
+            };
+            match send_message_with_deadline(sender, message, deadline, "websocket control frame")
+                .await
+            {
+                Ok(()) => WebSocketWriteOutcome::Sent {
+                    kind,
+                    envelopes: 0,
+                    bytes,
+                    push_events: Vec::new(),
+                },
+                Err(()) => WebSocketWriteOutcome::Failed,
+            }
+        }
+    };
+    let should_continue = matches!(outcome, WebSocketWriteOutcome::Sent { .. });
+    if outcome_tx.send(outcome).await.is_err() {
+        return false;
+    }
+    should_continue
 }
 
 async fn send_message_with_deadline(
@@ -1447,6 +1919,46 @@ async fn send_envelopes_logged(
         peer_addr,
         label,
         envelope_count,
+        bytes,
+        started_at.elapsed(),
+        "websocket send batch",
+    );
+    Ok(bytes)
+}
+
+async fn send_wire_messages_logged(
+    peer_addr: SocketAddr,
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    messages: Vec<ProtocolWireMessage>,
+    label: &'static str,
+) -> Result<usize, ()> {
+    let message_count = messages.len();
+    let mut bytes = 0_usize;
+    let started_at = Instant::now();
+    for message in messages {
+        match message {
+            ProtocolWireMessage::Json(envelope) => {
+                bytes = bytes.saturating_add(
+                    send_envelope_logged(peer_addr, sender, envelope, label, false).await?,
+                );
+            }
+            ProtocolWireMessage::Binary(raw) => {
+                let len = raw.len();
+                send_message_with_deadline(
+                    sender,
+                    Message::Binary(raw),
+                    WEBSOCKET_SEND_DEADLINE,
+                    "websocket binary packet",
+                )
+                .await?;
+                bytes = bytes.saturating_add(len);
+            }
+        }
+    }
+    log_websocket_send(
+        peer_addr,
+        label,
+        message_count,
         bytes,
         started_at.elapsed(),
         "websocket send batch",
@@ -1544,6 +2056,212 @@ mod tests {
         traffic.record_out(WebSocketOutKind::PushOutput, 0, 0);
 
         assert!(!traffic.has_activity());
+    }
+
+    #[test]
+    fn websocket_binary_message_stays_opaque_for_protocol_layer() {
+        let raw = b"TD2E-binary-frame".to_vec();
+        let decoded = message_to_wire_message(Message::Binary(raw.clone().into()))
+            .expect("binary websocket message should be accepted")
+            .expect("binary websocket message should not be control frame");
+
+        assert_eq!(decoded, ProtocolWireMessage::Binary(raw));
+    }
+
+    #[test]
+    fn websocket_push_queue_coalesces_duplicate_pending_events() {
+        let session_id = SessionId::new();
+        let mut queue = SessionPushEventQueue::default();
+
+        queue.enqueue(SessionPushEvent::Output(session_id));
+        queue.enqueue(SessionPushEvent::Output(session_id));
+
+        assert_eq!(
+            queue.pop_front_for_inflight(),
+            Some(SessionPushEvent::Output(session_id))
+        );
+        assert_eq!(queue.pop_front_for_inflight(), None);
+    }
+
+    #[test]
+    fn websocket_push_queue_requeues_dirty_inflight_once_after_send() {
+        let session_id = SessionId::new();
+        let event = SessionPushEvent::Output(session_id);
+        let mut queue = SessionPushEventQueue::default();
+
+        queue.enqueue(event);
+        assert_eq!(queue.pop_front_for_inflight(), Some(event));
+        queue.enqueue(event);
+        queue.enqueue(event);
+        queue.finish_inflight_after_send(&[event]);
+
+        assert_eq!(queue.pop_front_for_inflight(), Some(event));
+        assert_eq!(queue.pop_front_for_inflight(), None);
+    }
+
+    #[test]
+    fn websocket_push_wakeup_peeks_without_draining_after_writer_outcome() {
+        let session_id = SessionId::new();
+        let event = SessionPushEvent::Output(session_id);
+        let mut queue = SessionPushEventQueue::default();
+        let (tx, mut rx) = mpsc::channel(1);
+        let mut wake_pending = false;
+
+        queue.enqueue(event);
+        assert_eq!(queue.pop_front_for_inflight(), Some(event));
+        queue.enqueue(event);
+        queue.finish_inflight_after_send(&[event]);
+        queue_websocket_push_drain_wakeup(&queue, &tx, &mut wake_pending);
+        queue_websocket_push_drain_wakeup(&queue, &tx, &mut wake_pending);
+
+        // 中文注释：writer outcome 只能唤醒下一轮 select，不能同步继续 drain。
+        // 这样输入、close、pong 才能在大输出续发之间获得调度机会。
+        assert_eq!(queue.peek_front(), Some(event));
+        assert_eq!(rx.try_recv(), Ok(event));
+        assert_eq!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty));
+        assert!(wake_pending);
+    }
+
+    #[test]
+    fn websocket_wire_queue_preserves_e2ee_sequence_order_across_kinds() {
+        let (wire_tx, mut wire_rx) = mpsc::channel(4);
+
+        enqueue_websocket_wire(
+            &wire_tx,
+            WebSocketOutKind::PushOutput,
+            vec![ProtocolWireMessage::Binary(vec![3])],
+        )
+        .unwrap();
+        enqueue_websocket_wire(
+            &wire_tx,
+            WebSocketOutKind::Response,
+            vec![ProtocolWireMessage::Binary(vec![4])],
+        )
+        .unwrap();
+
+        // 中文注释：PushOutput 和 Response 都是 E2EE 业务帧，不能再分队列插队。
+        // 这里用 3/4 模拟已加密 sequence，保证 writer 看到的顺序就是加密顺序。
+        let first = wire_rx.try_recv().unwrap();
+        let second = wire_rx.try_recv().unwrap();
+        match first {
+            WebSocketWrite::Wire { kind, messages, .. } => {
+                assert_eq!(kind, WebSocketOutKind::PushOutput);
+                assert_eq!(messages, vec![ProtocolWireMessage::Binary(vec![3])]);
+            }
+            other => panic!("expected first wire write, got {other:?}"),
+        }
+        match second {
+            WebSocketWrite::Wire { kind, messages, .. } => {
+                assert_eq!(kind, WebSocketOutKind::Response);
+                assert_eq!(messages, vec![ProtocolWireMessage::Binary(vec![4])]);
+            }
+            other => panic!("expected second wire write, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn websocket_push_drain_requeues_when_data_queue_is_full() {
+        let protocol = test_protocol("websocket-data-queue-full");
+        let (mut connection, _) = {
+            let protocol = protocol.lock().await;
+            protocol.start_connection()
+        };
+        let (write_wire_tx, mut _write_wire_rx) = mpsc::channel(1);
+        let event = SessionPushEvent::Output(SessionId::new());
+        let mut queue = SessionPushEventQueue::default();
+        queue.enqueue(event);
+        write_wire_tx
+            .try_send(WebSocketWrite::Wire {
+                kind: WebSocketOutKind::PushOutput,
+                messages: Vec::new(),
+                push_events: Vec::new(),
+            })
+            .unwrap();
+
+        let (push_event_tx, _push_event_rx) = mpsc::channel(1);
+        let mut wake_pending = false;
+
+        drain_websocket_push_events(
+            &protocol,
+            &mut connection,
+            &mut queue,
+            &write_wire_tx,
+            &push_event_tx,
+            &mut wake_pending,
+        )
+        .await
+        .unwrap();
+
+        // 中文注释：wire 队列满时只能暂停当前连接输出，不能丢掉 dirty output；
+        // 下一次 writer 释放容量后还要能继续 flush。
+        assert_eq!(queue.pop_front_for_inflight(), Some(event));
+    }
+
+    #[test]
+    fn websocket_push_drain_budget_limits_hot_loop() {
+        assert!(!websocket_push_drain_budget_exhausted(
+            1,
+            1024,
+            Instant::now()
+        ));
+        assert!(websocket_push_drain_budget_exhausted(
+            WEBSOCKET_PUSH_DRAIN_MAX_EVENTS_PER_TICK,
+            0,
+            Instant::now()
+        ));
+        assert!(websocket_push_drain_budget_exhausted(
+            1,
+            WEBSOCKET_PUSH_DRAIN_MAX_ENQUEUED_BYTES_PER_TICK,
+            Instant::now()
+        ));
+        assert!(websocket_push_drain_budget_exhausted(
+            1,
+            0,
+            Instant::now() - WEBSOCKET_PUSH_DRAIN_MAX_ELAPSED
+        ));
+    }
+
+    #[tokio::test]
+    async fn websocket_push_drain_stops_after_event_budget_and_wakes_once() {
+        let protocol = test_protocol("websocket-drain-budget");
+        let (mut connection, _) = {
+            let protocol = protocol.lock().await;
+            protocol.start_connection()
+        };
+        let (write_wire_tx, _write_wire_rx) = mpsc::channel(WEBSOCKET_WIRE_QUEUE_CAPACITY);
+        let (push_event_tx, mut push_event_rx) = mpsc::channel(8);
+        let mut queue = SessionPushEventQueue::default();
+        let mut wake_pending = false;
+        let events: Vec<_> = (0..WEBSOCKET_PUSH_DRAIN_MAX_EVENTS_PER_TICK + 2)
+            .map(|_| SessionPushEvent::Output(SessionId::new()))
+            .collect();
+        for event in &events {
+            queue.enqueue(*event);
+        }
+
+        drain_websocket_push_events(
+            &protocol,
+            &mut connection,
+            &mut queue,
+            &write_wire_tx,
+            &push_event_tx,
+            &mut wake_pending,
+        )
+        .await
+        .unwrap();
+
+        // 中文注释：即使当前事件没有真实输出，direct drain 也必须按事件预算让出调度权。
+        // 否则多窗口快速切换时，一个连接能在同一轮 select 里清完大量 session 事件。
+        assert!(wake_pending);
+        assert!(queue.has_pending());
+        assert_eq!(
+            push_event_rx.try_recv(),
+            Ok(events[WEBSOCKET_PUSH_DRAIN_MAX_EVENTS_PER_TICK])
+        );
+        assert_eq!(
+            push_event_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        );
     }
 
     fn test_config(name: &str) -> DaemonConfig {
@@ -1742,12 +2460,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn local_pairing_token_endpoint_issues_runtime_token() {
         let protocol = test_protocol("local-pairing-token");
-        let server_id = {
-            protocol
-                .lock()
-                .expect("daemon protocol mutex poisoned")
-                .server_id()
-        };
+        let server_id = protocol.lock().await.server_id();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server_protocol = protocol.clone();
@@ -1770,7 +2483,7 @@ mod tests {
         assert!(!response.body.contains("server_private_key"));
         assert!(!response.body.contains("terminal sentinel"));
 
-        let pair_accept = pair_device_with_http_token(protocol, payload.token);
+        let pair_accept = pair_device_with_http_token(protocol, payload.token).await;
         assert_eq!(pair_accept.server_id, server_id);
     }
 
@@ -1828,16 +2541,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn websocket_pushes_session_output_without_client_poll_frame() {
         let protocol = test_protocol("websocket-push");
-        let server_id = {
-            protocol
-                .lock()
-                .expect("daemon protocol mutex poisoned")
-                .server_id()
-        };
+        let server_id = protocol.lock().await.server_id();
         let pairing_token = {
             protocol
                 .lock()
-                .expect("daemon protocol mutex poisoned")
+                .await
                 .issue_pairing_token(current_unix_timestamp_millis())
                 .unwrap()
                 .token()
@@ -1926,7 +2634,7 @@ mod tests {
     async fn session_push_watcher_ignores_initial_watch_value() {
         let session_id = SessionId::new();
         let (signal_tx, signal_rx) = watch::channel(41_u64);
-        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut event_rx) = mpsc::channel(2);
         let mut watcher_tasks = Vec::new();
 
         spawn_session_push_watcher(
@@ -1960,7 +2668,7 @@ mod tests {
     async fn session_activity_push_watcher_coalesces_frequent_output_signals() {
         let session_id = SessionId::new();
         let (signal_tx, signal_rx) = watch::channel(1_u64);
-        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut event_rx) = mpsc::channel(2);
         let mut watcher_tasks = Vec::new();
 
         spawn_session_push_watcher(
@@ -2030,12 +2738,7 @@ mod tests {
         let (cert_path, key_path) = write_test_tls_files("healthz");
         let tls_paths = TlsPaths::new(&cert_path, &key_path);
         let protocol = test_protocol("tls-healthz");
-        let server_id = {
-            protocol
-                .lock()
-                .expect("daemon protocol mutex poisoned")
-                .server_id()
-        };
+        let server_id = protocol.lock().await.server_id();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server_protocol = protocol.clone();
@@ -2123,6 +2826,7 @@ mod tests {
                 role: RouteRole::Client,
                 protocol_version: ProtocolVersion(PROTOCOL_PACKET_VERSION),
                 nonce: termd_proto::Nonce("route-test-nonce".to_owned()),
+                route_generation: None,
                 timestamp_ms: current_unix_timestamp_millis(),
             },
         );
@@ -2295,11 +2999,11 @@ joi6qSEnJBpLL35fFZfHkF1jBOfv8otRgWJuJwyit3B7LR89GAw2VgZWu03QugPN
 zZZR5LzKVu9X7paftR7K8Q==
 -----END PRIVATE KEY-----"#;
 
-    fn pair_device_with_http_token(
+    async fn pair_device_with_http_token(
         protocol: SharedDaemonProtocol,
         token: String,
     ) -> PairAcceptPayload {
-        let mut protocol = protocol.lock().expect("daemon protocol mutex poisoned");
+        let mut protocol = protocol.lock().await;
         let (mut connection, _) = protocol.start_connection();
         let device_id = DeviceId::new();
         let device_keypair = E2eeKeyPair::generate();

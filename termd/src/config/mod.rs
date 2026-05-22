@@ -39,7 +39,10 @@ pub const DEFAULT_RELAY_RECONNECT_INITIAL_DELAY_MS: u64 = 250;
 pub const DEFAULT_RELAY_RECONNECT_MAX_DELAY_MS: u64 = 5_000;
 
 /// relay mux socket 的默认心跳间隔。
-pub const DEFAULT_RELAY_HEARTBEAT_INTERVAL_MS: u64 = 15_000;
+///
+/// daemon 是 relay 主干连接的 owner；空闲 5 秒主动发标准 WebSocket Ping，
+/// 避免公网代理或 NAT 因为 daemon -> relay 方向静默而清理长连接。
+pub const DEFAULT_RELAY_HEARTBEAT_INTERVAL_MS: u64 = 5_000;
 
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 

@@ -29,6 +29,8 @@ const MOBILE_DIRECTION_REPEAT_MS = 500;
 const MOBILE_DIRECTION_TIER_TWO_PX = 56;
 const MOBILE_DIRECTION_TIER_THREE_PX = 84;
 const MOBILE_DIRECTION_CANCEL_PX = 10;
+// 单次 xterm.write 过大时会占用浏览器主线程，连控制 WebSocket 和 relay 页面心跳都会被拖慢。
+// 64KB 仍是批量写入，不会退回逐字/逐行渲染，同时给输入和切 session 留出帧间隙。
 const MAX_WRITE_BYTES = 64 * 1024;
 const TERMINAL_SEARCH_OPTIONS: ISearchOptions = {
   caseSensitive: false,
@@ -46,11 +48,11 @@ type MobileDirection = "up" | "down" | "left" | "right";
 type MobileDirectionTier = 1 | 2 | 3;
 
 export type TerminalOutputItem =
-  | { kind: "data"; bytes: Uint8Array; onRendered?: () => void }
-  | { kind: "snapshot"; bytes: Uint8Array; baseSeq: number; onRendered?: () => void }
-  | { kind: "output"; bytes: Uint8Array; terminalSeq: number; onRendered?: () => void }
-  | { kind: "resize"; terminalSeq: number; onRendered?: () => void }
-  | { kind: "exit"; terminalSeq: number; onRendered?: () => void };
+  | { kind: "data"; bytes: Uint8Array; onRendered?: (renderedBytes?: number) => void }
+  | { kind: "snapshot"; bytes: Uint8Array; baseSeq: number; onRendered?: (renderedBytes?: number) => void }
+  | { kind: "output"; bytes: Uint8Array; terminalSeq: number; onRendered?: (renderedBytes?: number) => void }
+  | { kind: "resize"; terminalSeq: number; onRendered?: (renderedBytes?: number) => void }
+  | { kind: "exit"; terminalSeq: number; onRendered?: (renderedBytes?: number) => void };
 
 interface ActiveTerminalWrite {
   item: TerminalOutputItem;
@@ -60,6 +62,7 @@ interface ActiveTerminalWrite {
 
 interface TerminalWriteBatch {
   bytes: Uint8Array;
+  renderedCredits: Array<{ item: TerminalOutputItem; bytes: number }>;
   renderedItems: TerminalOutputItem[];
 }
 
@@ -1109,7 +1112,6 @@ export function TerminalPane(props: TerminalPaneProps) {
         lastTerminalSeqRef.current = item.terminalSeq;
         onTerminalSeqRenderedRef.current?.(item.terminalSeq);
       }
-      item.onRendered?.();
     };
     const completeActiveWrite = () => {
       const active = activeWriteRef.current;
@@ -1144,7 +1146,7 @@ export function TerminalPane(props: TerminalPaneProps) {
         if (sequenceCursor === undefined || item.terminalSeq !== expected) {
           // 中文注释：terminal_seq 缺口说明 snapshot/tail 已经不连续，必须重新 attach 获取权威 snapshot。
           onTerminalResyncRef.current?.(sequenceCursor);
-          item.onRendered?.();
+          item.onRendered?.(item.kind === "output" ? item.bytes.byteLength : 1);
           activeWriteRef.current = undefined;
           return false;
         }
@@ -1153,6 +1155,7 @@ export function TerminalPane(props: TerminalPaneProps) {
     };
     const takePendingWrite = (): TerminalWriteBatch | undefined => {
       const chunks: Uint8Array[] = [];
+      const renderedCredits: Array<{ item: TerminalOutputItem; bytes: number }> = [];
       const renderedItems: TerminalOutputItem[] = [];
       let byteCount = 0;
       let sequenceCursor = lastTerminalSeqRef.current;
@@ -1174,6 +1177,7 @@ export function TerminalPane(props: TerminalPaneProps) {
 
         const { item } = active;
         if (item.kind === "resize" || item.kind === "exit" || byteLengthForItem(item) === 0) {
+          renderedCredits.push({ item, bytes: 1 });
           renderedItems.push(item);
           sequenceCursor = advanceSequenceCursor(item, sequenceCursor);
           activeWriteRef.current = undefined;
@@ -1188,6 +1192,7 @@ export function TerminalPane(props: TerminalPaneProps) {
         const end = Math.min(item.bytes.byteLength, active.offset + remaining);
         const slice = item.bytes.subarray(active.offset, end);
         chunks.push(slice);
+        renderedCredits.push({ item, bytes: slice.byteLength });
         byteCount += slice.byteLength;
         active.offset = end;
 
@@ -1202,6 +1207,9 @@ export function TerminalPane(props: TerminalPaneProps) {
       }
 
       if (byteCount === 0) {
+        for (const credit of renderedCredits) {
+          credit.item.onRendered?.(credit.bytes);
+        }
         for (const item of renderedItems) {
           markItemRendered(item);
         }
@@ -1210,6 +1218,7 @@ export function TerminalPane(props: TerminalPaneProps) {
 
       return {
         bytes: concatWriteChunks(chunks, byteCount),
+        renderedCredits,
         renderedItems,
       };
     };
@@ -1245,6 +1254,9 @@ export function TerminalPane(props: TerminalPaneProps) {
           return;
         }
         writeInFlightRef.current = false;
+        for (const credit of output.renderedCredits) {
+          credit.item.onRendered?.(credit.bytes);
+        }
         for (const item of output.renderedItems) {
           markItemRendered(item);
         }
@@ -1357,7 +1369,16 @@ export function TerminalPane(props: TerminalPaneProps) {
     fitRef.current = fit;
     searchAddonRef.current = searchAddon;
     outputResetVersionRef.current = props.outputResetVersion;
-    onOutputResetAppliedRef.current?.(props.outputResetVersion);
+    const confirmOutputReset = () => onOutputResetAppliedRef.current?.(props.outputResetVersion);
+    // 测试桩可以延迟 reset 确认，用来覆盖“新 snapshot 必须等 xterm reset 完成后才能消费”的竞态。
+    const deferOutputResetApplied = (globalThis as {
+      __TERMD_TEST_DEFER_OUTPUT_RESET_APPLIED__?: (confirm: () => void) => void;
+    }).__TERMD_TEST_DEFER_OUTPUT_RESET_APPLIED__;
+    if (deferOutputResetApplied) {
+      deferOutputResetApplied(confirmOutputReset);
+    } else {
+      confirmOutputReset();
+    }
     needsPostWriteRefreshRef.current = true;
     // attach 输出可能早于 xterm 初始化到达；创建实例时先取走待写队列，避免首屏输出丢失。
     drainOutputRef.current = drainOutput;

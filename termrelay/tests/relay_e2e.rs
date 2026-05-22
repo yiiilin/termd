@@ -9,7 +9,8 @@ use termd::net::{E2eeKeyPair, E2eeSession, E2eeSessionContext, E2eeSessionRole};
 use termd_proto::{
     DeviceId, EncryptedFramePayload, Envelope, MessageType, Nonce, PairRequestPayload,
     PairingToken, ProtocolVersion, PublicKey, RelayMuxEnvelope, RelayOpaqueFrame,
-    RouteHelloPayload, RouteReadyPayload, RouteRole, ServerId,
+    RouteHelloPayload, RouteReadyPayload, RouteRole, ServerId, decode_binary_relay_mux_envelope,
+    encode_binary_relay_mux_envelope,
 };
 use tokio::time::{sleep, timeout};
 use tokio_tungstenite::tungstenite::Message;
@@ -215,6 +216,58 @@ async fn relay_forwards_business_shaped_text_and_binary_without_parsing() {
 
     assert_eq!(expect_client_text(&mut daemon_mux, client_id).await, text);
     assert_eq!(next_binary(&mut client).await, binary);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relay_daemon_mux_data_forwards_output_but_not_client_lifecycle() {
+    let relay = RelayProcess::spawn().await;
+    let server_id = ServerId::new();
+    let mut daemon_mux = connect_registered_socket(relay.ws_url(), server_id, RouteRole::DaemonMux)
+        .await
+        .expect("daemon control mux should connect");
+    let mut daemon_data =
+        connect_registered_socket(relay.ws_url(), server_id, RouteRole::DaemonMuxData)
+            .await
+            .expect("daemon data mux should connect after control mux");
+    let mut client = connect_registered_socket(relay.ws_url(), server_id, RouteRole::Client)
+        .await
+        .expect("client should connect");
+    let client_id = expect_client_connected(&mut daemon_mux).await;
+
+    assert!(
+        timeout(Duration::from_millis(150), daemon_data.next())
+            .await
+            .is_err(),
+        "client lifecycle notifications must stay on daemon_mux control channel"
+    );
+
+    client
+        .send(Message::Text("client-input".to_owned()))
+        .await
+        .expect("client should send input");
+    assert_eq!(
+        expect_client_text(&mut daemon_mux, client_id).await,
+        "client-input"
+    );
+    assert!(
+        timeout(Duration::from_millis(150), daemon_data.next())
+            .await
+            .is_err(),
+        "client input must not be routed to daemon_mux_data"
+    );
+
+    send_mux(
+        &mut daemon_data,
+        RelayMuxEnvelope::DaemonFrame {
+            client_id,
+            frame: RelayOpaqueFrame::Text {
+                data: "output-from-data-channel".to_owned(),
+            },
+        },
+    )
+    .await;
+
+    assert_eq!(next_text(&mut client).await, "output-from-data-channel");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -473,6 +526,12 @@ async fn send_route_hello(
             role,
             protocol_version: ProtocolVersion::default(),
             nonce: Nonce(format!("route-nonce-{}", Uuid::new_v4())),
+            route_generation: match role {
+                RouteRole::DaemonMux | RouteRole::DaemonMuxData => {
+                    Some(Nonce("relay-e2e-generation".to_owned()))
+                }
+                RouteRole::Client => None,
+            },
             timestamp_ms: current_unix_timestamp_millis(),
         },
     );
@@ -528,7 +587,19 @@ async fn next_binary(socket: &mut RelaySocket) -> Vec<u8> {
 }
 
 async fn next_mux(socket: &mut RelaySocket) -> RelayMuxEnvelope {
-    serde_json::from_str(&next_text(socket).await).expect("relay mux envelope should decode")
+    match timeout(Duration::from_secs(2), socket.next())
+        .await
+        .expect("relay frame should arrive before timeout")
+        .expect("relay websocket should remain open")
+        .expect("relay websocket frame should be valid")
+    {
+        Message::Text(text) => {
+            serde_json::from_str(&text).expect("relay mux envelope should decode")
+        }
+        Message::Binary(bytes) => decode_binary_relay_mux_envelope(&bytes)
+            .expect("binary relay mux envelope should decode"),
+        other => panic!("expected mux frame, got {other:?}"),
+    }
 }
 
 async fn expect_client_connected(socket: &mut RelaySocket) -> termd_proto::RelayClientId {
@@ -552,9 +623,10 @@ async fn expect_client_text(
 }
 
 async fn send_mux(socket: &mut RelaySocket, envelope: RelayMuxEnvelope) {
-    let raw = serde_json::to_string(&envelope).expect("relay mux envelope should encode");
+    let raw = encode_binary_relay_mux_envelope(&envelope)
+        .expect("relay mux envelope should encode as binary");
     socket
-        .send(Message::Text(raw))
+        .send(Message::Binary(raw))
         .await
         .expect("daemon mux should send envelope");
 }

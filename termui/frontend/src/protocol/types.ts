@@ -78,6 +78,7 @@ export interface Envelope<P = unknown> {
 }
 
 export const PROTOCOL_PACKET_VERSION = 3;
+export const BINARY_PROTOCOL_VERSION = 1;
 
 export type PacketKind =
   | "request"
@@ -108,13 +109,14 @@ export interface ProtocolPacket<P = unknown> {
   payload: P;
 }
 
-export type RouteRole = "client" | "daemon_mux";
+export type RouteRole = "client" | "daemon_mux" | "daemon_mux_data";
 
 export interface RouteHelloPayload {
   server_id: UUID;
   role: RouteRole;
   protocol_version: number;
   nonce: Nonce;
+  route_generation?: Nonce;
   timestamp_ms: UnixTimestampMillis;
 }
 
@@ -138,6 +140,7 @@ export interface E2eeKeyExchangePayload {
   nonce: Nonce;
   timestamp_ms: UnixTimestampMillis;
   packet_version?: number | null;
+  binary_version?: number | null;
   signature?: SignatureWire | null;
 }
 
@@ -486,7 +489,15 @@ export interface SessionFileDownloadChunkResultPayload {
 
 export interface SessionDataPayload {
   session_id: UUID;
-  data_base64: string;
+  data_base64?: string;
+  data_bytes?: Uint8Array;
+  /**
+   * 前端内部字段：只有 packet stream 承载的 legacy session_data 才会带这些字段。
+   * 老协议或非 stream 事件没有这些字段时，渲染后不能回补 flow credit。
+   */
+  stream_id?: PacketStreamId;
+  transport_seq?: number;
+  render_credit?: number;
 }
 
 export type TerminalFrameKind = "snapshot" | "output" | "resize" | "exit" | "batch";
@@ -497,13 +508,15 @@ export type TerminalFramePayload =
       session_id: UUID;
       base_seq: number;
       size: TerminalSize;
-      data_base64: string;
+      data_base64?: string;
+      data_bytes?: Uint8Array;
     }
   | {
       kind: "output";
       session_id: UUID;
       terminal_seq: number;
-      data_base64: string;
+      data_base64?: string;
+      data_bytes?: Uint8Array;
     }
   | {
       kind: "resize";

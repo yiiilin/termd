@@ -81,6 +81,7 @@ describe("设备认证签名", () => {
       nonce: "daemon-nonce",
       timestamp_ms: 1710000000200,
       packet_version: 3,
+      binary_version: 1,
       signature: "ed25519-v1:daemon-signature",
     };
     const deviceExchange: E2eeKeyExchangePayload = {
@@ -90,6 +91,7 @@ describe("设备认证签名", () => {
       nonce: "device-nonce",
       timestamp_ms: 1710000000300,
       packet_version: 3,
+      binary_version: 1,
     };
     const authPayload: AuthPayload = {
       device_id: deviceExchange.device_id,
@@ -111,7 +113,8 @@ describe("设备认证签名", () => {
         "e2ee_public_key:21:x25519-v1:daemon-e2ee\n" +
         "nonce:12:daemon-nonce\n" +
         "timestamp_ms:13:1710000000200\n" +
-        "packet_version:1:3\n",
+        "packet_version:1:3\n" +
+        "binary_version:1:1\n",
     );
     expect(transcriptDigest).toMatch(/^sha256-v1:/);
     expect(authSigningText).toContain(`e2ee_transcript_sha256:${transcriptDigest.length}:${transcriptDigest}\n`);
