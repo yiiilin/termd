@@ -1254,10 +1254,7 @@ mod tests {
                 let Some(route_hello) = read_route_hello(&mut socket).await else {
                     return;
                 };
-                if !matches!(
-                    route_hello.role,
-                    RouteRole::DaemonMux | RouteRole::DaemonMuxData
-                ) {
+                if !matches!(route_hello.role, RouteRole::DaemonMux) {
                     return;
                 }
                 let route_ready = Envelope::new(
@@ -1363,7 +1360,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 if flaky_state.attempts.load(Ordering::SeqCst) >= 2
-                    && healthy_state.route_ready_sent.load(Ordering::SeqCst) >= 2
+                    && healthy_state.route_ready_sent.load(Ordering::SeqCst) >= 1
                 {
                     break;
                 }
@@ -1380,8 +1377,13 @@ mod tests {
         );
         assert_eq!(
             healthy_state.attempts.load(Ordering::SeqCst),
+            1,
+            "健康 relay supervisor 应只建立一条稳定连接，不能被其他 endpoint 的重连牵连"
+        );
+        assert_eq!(
+            flaky_state.attempts.load(Ordering::SeqCst),
             2,
-            "健康 relay supervisor 应保持第一组 control/data mux 连接，不能因为 WebSocket Ping 重连"
+            "故障 relay endpoint 仍应按退避独立重连一次"
         );
 
         for handle in relay_tasks {

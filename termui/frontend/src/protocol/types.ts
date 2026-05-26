@@ -109,7 +109,7 @@ export interface ProtocolPacket<P = unknown> {
   payload: P;
 }
 
-export type RouteRole = "client" | "daemon_mux" | "daemon_mux_data";
+export type RouteRole = "client" | "daemon_mux";
 
 export interface RouteHelloPayload {
   server_id: UUID;
@@ -491,13 +491,9 @@ export interface SessionDataPayload {
   session_id: UUID;
   data_base64?: string;
   data_bytes?: Uint8Array;
-  /**
-   * 前端内部字段：只有 packet stream 承载的 legacy session_data 才会带这些字段。
-   * 老协议或非 stream 事件没有这些字段时，渲染后不能回补 flow credit。
-   */
+  /** 前端内部字段：packet stream 承载时用于调试和测试 stream 归属，不参与流控。 */
   stream_id?: PacketStreamId;
   transport_seq?: number;
-  render_credit?: number;
 }
 
 export type TerminalFrameKind = "snapshot" | "output" | "resize" | "exit" | "batch";
@@ -539,19 +535,10 @@ export type TerminalFramePayload =
 export type SingleTerminalFramePayload = Exclude<TerminalFramePayload, { kind: "batch" }>;
 
 export type RenderableTerminalFramePayload = SingleTerminalFramePayload & {
-  /**
-   * 前端内部字段：连接内 stream seq，用于 xterm 渲染完成后补 flow credit。
-   * 这个字段不属于 wire payload，不能由 daemon/relay 解释。
-   */
+  /** 前端内部字段：连接内 stream seq，用于调试和测试 stream 归属，不参与流控。 */
   transport_seq: number;
-  /**
-   * 前端内部字段：当前 packet stream id，方便调试和测试流控归属。
-   */
+  /** 前端内部字段：当前 packet stream id，方便调试。 */
   stream_id: PacketStreamId;
-  /**
-   * 前端内部字段：本 frame 渲染完成后应该补回 daemon 的字节 credit。
-   */
-  render_credit: number;
 };
 
 export interface SessionActivityPayload {

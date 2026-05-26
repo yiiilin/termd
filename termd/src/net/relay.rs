@@ -4,7 +4,7 @@
 //! 每个 relay client 映射成独立的 daemon `ProtocolConnection`。
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use base64::{Engine as _, engine::general_purpose};
@@ -20,7 +20,7 @@ use termd_proto::{
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, timeout};
 use tokio_tungstenite::{
@@ -48,7 +48,7 @@ const RELAY_ROUTE_READY_TIMEOUT: Duration = Duration::from_secs(5);
 const RELAY_SEND_DEADLINE: Duration = Duration::from_secs(10);
 const RELAY_PONG_DEADLINE: Duration = Duration::from_secs(10);
 #[cfg(test)]
-const RELAY_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+const RELAY_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const RELAY_RECONNECT_STABLE_RESET_AFTER: Duration = Duration::from_secs(60);
 const RELAY_MAX_FRAME_SIZE: usize = 1024 * 1024;
@@ -60,16 +60,14 @@ const RELAY_SEND_DEBUG_BATCH_ENVELOPES: usize = 8;
 const RELAY_SEND_DEBUG_BATCH_BYTES: usize = 32 * 1024;
 const RELAY_SEND_INFO_BATCH_ENVELOPES: usize = 20;
 const RELAY_SEND_INFO_BATCH_BYTES: usize = 256 * 1024;
-const RELAY_MUX_CONTROL_QUEUE_CAPACITY: usize = 256;
-const RELAY_MUX_OUTPUT_QUEUE_CAPACITY: usize = 256;
-const RELAY_MUX_WRITE_OUTCOME_QUEUE_CAPACITY: usize = 256;
 const RELAY_PUSH_EVENT_QUEUE_CAPACITY: usize = 2048;
 const RELAY_PUSH_DRAIN_MAX_EVENTS_PER_TICK: usize = 4;
-const RELAY_PUSH_DRAIN_MAX_ENQUEUED_BYTES_PER_TICK: usize = 256 * 1024;
+const RELAY_PUSH_DRAIN_MAX_TRANSPORTED_BYTES_PER_TICK: usize = 256 * 1024;
 const RELAY_PUSH_DRAIN_MAX_ELAPSED: Duration = Duration::from_millis(2);
 
 type RelayWs = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>;
 type RelaySender = futures_util::stream::SplitSink<RelayWs, Message>;
+type RelaySharedSender = Arc<AsyncMutex<RelaySender>>;
 type RelayReceiver = futures_util::stream::SplitStream<RelayWs>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -88,23 +86,41 @@ enum RelayPushEvent {
     },
 }
 
+impl RelayPushEvent {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Output { .. } => "output",
+            Self::FileTree { .. } => "file_tree",
+            Self::Resize { .. } => "resize",
+        }
+    }
+
+    fn client_id(self) -> RelayClientId {
+        match self {
+            Self::Output { client_id, .. }
+            | Self::FileTree { client_id, .. }
+            | Self::Resize { client_id, .. } => client_id,
+        }
+    }
+
+    fn session_id(self) -> SessionId {
+        match self {
+            Self::Output { session_id, .. }
+            | Self::FileTree { session_id, .. }
+            | Self::Resize { session_id, .. } => session_id,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct RelayPushEventQueue {
     pending: VecDeque<RelayPushEvent>,
     pending_set: HashSet<RelayPushEvent>,
-    inflight: HashSet<RelayPushEvent>,
-    dirty_inflight: HashSet<RelayPushEvent>,
 }
 
 impl RelayPushEventQueue {
     fn enqueue(&mut self, event: RelayPushEvent) {
         if self.pending_set.contains(&event) {
-            return;
-        }
-        if self.inflight.contains(&event) {
-            // 中文注释：relay output 发送期间的重复 watch 信号只标脏。
-            // 发送完成后最多补一次，避免一个慢 relay/client 把 daemon 事件队列刷爆。
-            self.dirty_inflight.insert(event);
             return;
         }
         self.pending_set.insert(event);
@@ -115,70 +131,54 @@ impl RelayPushEventQueue {
         !self.pending.is_empty()
     }
 
-    fn pop_front_for_inflight(&mut self) -> Option<RelayPushEvent> {
+    fn len(&self) -> usize {
+        self.pending.len()
+    }
+
+    fn pop_front(&mut self) -> Option<RelayPushEvent> {
         let event = self.pending.pop_front()?;
         self.pending_set.remove(&event);
-        self.inflight.insert(event);
         Some(event)
     }
 
-    fn peek_front(&self) -> Option<RelayPushEvent> {
-        self.pending.front().copied()
-    }
-
-    fn finish_inflight_after_send(&mut self, events: &[RelayPushEvent]) {
-        for event in events {
-            let should_requeue = self.dirty_inflight.remove(event);
-            self.inflight.remove(event);
-            if should_requeue {
-                self.enqueue(*event);
-            }
+    fn remove_client(&mut self, client_id: RelayClientId) {
+        // 中文注释：client 断开后，尚未加密的 watcher 事件已经没有接收方。
+        // 立即清理 pending，避免旧会话输出在 daemon mux 内继续排队。
+        let before = self.pending.len();
+        self.pending
+            .retain(|event| relay_push_event_client_id(*event) != client_id);
+        self.pending_set
+            .retain(|event| relay_push_event_client_id(*event) != client_id);
+        let removed = before.saturating_sub(self.pending.len());
+        if removed > 0 {
+            debug!(
+                client_id = client_id.0,
+                removed,
+                queue_pending = self.pending.len(),
+                "relay mux pending events removed for inactive client"
+            );
         }
     }
 }
 
-#[derive(Debug)]
-enum RelayMuxWrite {
-    Envelopes {
-        kind: RelayOutKind,
-        envelopes: Vec<RelayMuxEnvelope>,
-        push_events: Vec<RelayPushEvent>,
-    },
-    Raw {
-        kind: RelayOutKind,
-        message: Message,
-        bytes: usize,
-    },
-}
+type RelayActiveClients = Arc<Mutex<HashSet<RelayClientId>>>;
 
-#[derive(Debug)]
-enum RelayMuxWriteOutcome {
-    Sent {
-        channel: RelayMuxChannel,
-        kind: RelayOutKind,
-        envelopes: usize,
-        bytes: usize,
-        push_events: Vec<RelayPushEvent>,
-    },
-    Failed {
-        channel: RelayMuxChannel,
-        error: RelayConnectorError,
-    },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RelayMuxChannel {
-    Control,
-    Data,
-}
-
-impl RelayMuxChannel {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Control => "control",
-            Self::Data => "data",
-        }
+fn mark_relay_client_active(active_clients: &RelayActiveClients, client_id: RelayClientId) {
+    if let Ok(mut active) = active_clients.lock() {
+        active.insert(client_id);
     }
+}
+
+fn mark_relay_client_inactive(active_clients: &RelayActiveClients, client_id: RelayClientId) {
+    if let Ok(mut active) = active_clients.lock() {
+        active.remove(&client_id);
+    }
+}
+
+fn relay_client_is_active(active_clients: &RelayActiveClients, client_id: RelayClientId) -> bool {
+    active_clients
+        .lock()
+        .is_ok_and(|active| active.contains(&client_id))
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -296,12 +296,6 @@ impl RelayHeartbeatDebug {
         self.last_inbound_kind = kind;
     }
 
-    fn record_outbound(&mut self, kind: &'static str, _bytes: usize) {
-        let now = Instant::now();
-        self.last_outbound_at = now;
-        self.last_outbound_kind = kind;
-    }
-
     fn snapshot(&self) -> RelayTransportDebugSnapshot {
         RelayTransportDebugSnapshot {
             since_last_inbound_ms: self
@@ -332,7 +326,7 @@ enum RelayOutKind {
 
 impl RelayOutKind {
     fn is_payload_batch(self) -> bool {
-        // 空业务 batch 不会写 WebSocket；忽略它，避免零 credit 时把 watcher 空转记成输出流量。
+        // 空业务 batch 不会写 WebSocket；忽略它，避免把无输出的 watcher 唤醒记成流量。
         !matches!(self, Self::Pong | Self::IdlePing)
     }
 
@@ -369,10 +363,33 @@ fn relay_message_bytes(message: &Message) -> usize {
     }
 }
 
+fn relay_mux_envelope_kind(envelope: &RelayMuxEnvelope) -> &'static str {
+    match envelope {
+        RelayMuxEnvelope::Keepalive { .. } => "keepalive",
+        RelayMuxEnvelope::KeepaliveAck { .. } => "keepalive_ack",
+        RelayMuxEnvelope::ClientConnected { .. } => "client_connected",
+        RelayMuxEnvelope::ClientDisconnected { .. } => "client_disconnected",
+        RelayMuxEnvelope::ClientFrame { .. } => "client_frame",
+        RelayMuxEnvelope::DaemonFrame { .. } => "daemon_frame",
+    }
+}
+
 fn relay_daemon_mux_idle_ping_enabled() -> bool {
     // daemon 是 relay mux 主干连接的 owner；空闲时由 daemon 主动发标准 WebSocket Ping。
     // relay 不解析业务心跳，连接断开后才裁定 daemon 离线。
     true
+}
+
+fn relay_idle_ping_due(
+    now: Instant,
+    last_activity: Instant,
+    last_idle_ping_sent_at: Instant,
+    heartbeat_interval: Duration,
+) -> bool {
+    // 中文注释：daemon -> relay 的 Ping 只用于保活出站方向。
+    // 任何 control/data 写出都算 activity，必须重新等待完整 heartbeat interval。
+    now.duration_since(last_activity) >= heartbeat_interval
+        && now.duration_since(last_idle_ping_sent_at) >= heartbeat_interval
 }
 
 fn relay_daemon_mux_inbound_idle_timeout_enabled() -> bool {
@@ -794,10 +811,10 @@ async fn connect_relay_mux_base_once(
     let server_id = { protocol.lock().await.server_id() };
     let relay_endpoint = base.canonical_url();
     let url = base.daemon_mux_url_with_auth(server_id, auth_token);
-    // 中文注释：control/data 两条 WebSocket 必须带同一个公开 route generation。
-    // relay 只用它做连接代际绑定，防止旧 data 通道把上一个 daemon mux 的输出投给新 client。
+    // 中文注释：daemon 到 relay 只有一条主 WebSocket。
+    // relay 仍用 route generation 判断新 mux 是否替换旧 mux，避免旧连接跨代污染新 client。
     let route_generation = relay_route_nonce();
-    let (control_sender, mut control_receiver) = connect_relay_mux_socket(
+    let (sender, mut control_receiver) = connect_relay_mux_socket(
         &url,
         proxy.as_ref(),
         server_id,
@@ -805,38 +822,8 @@ async fn connect_relay_mux_base_once(
         route_generation.clone(),
     )
     .await?;
-    let (data_sender, data_receiver) = connect_relay_mux_socket(
-        &url,
-        proxy.as_ref(),
-        server_id,
-        ProtoRouteRole::DaemonMuxData,
-        route_generation,
-    )
-    .await?;
-    let (write_raw_control_tx, write_raw_control_rx) =
-        mpsc::channel::<RelayMuxWrite>(RELAY_MUX_CONTROL_QUEUE_CAPACITY);
-    let (write_client_tx, write_client_rx) =
-        mpsc::channel::<RelayMuxWrite>(RELAY_MUX_OUTPUT_QUEUE_CAPACITY);
-    let (write_outcome_tx, mut write_outcome_rx) =
-        mpsc::channel::<RelayMuxWriteOutcome>(RELAY_MUX_WRITE_OUTCOME_QUEUE_CAPACITY);
-    // 中文注释：control/data 使用两条物理 WebSocket。
-    // 仅拆队列还不够：单条 WebSocket 正在 flush 大 output frame 时无法抢占，
-    // fresh client hello、输入响应和断开通知仍会排在旧输出后面。
-    let control_writer_task = tokio::spawn(run_relay_mux_writer(
-        relay_endpoint.clone(),
-        RelayMuxChannel::Control,
-        control_sender,
-        write_raw_control_rx,
-        write_outcome_tx.clone(),
-    ));
-    let data_task = tokio::spawn(run_relay_mux_data_task(
-        relay_endpoint.clone(),
-        data_sender,
-        data_receiver,
-        write_client_rx,
-        write_outcome_tx,
-        heartbeat_interval,
-    ));
+    let sender = Arc::new(AsyncMutex::new(sender));
+    let active_clients: RelayActiveClients = Arc::new(Mutex::new(HashSet::new()));
 
     let mut connections = HashMap::<RelayClientId, ProtocolConnection>::new();
     let (push_event_tx, mut push_event_rx) =
@@ -848,301 +835,297 @@ async fn connect_relay_mux_base_once(
     let mut watcher_tasks = HashMap::<RelayClientId, Vec<JoinHandle<()>>>::new();
     let mut pending_push_events = RelayPushEventQueue::default();
     let mut idle_deadline = Instant::now() + RELAY_IDLE_TIMEOUT;
-    let mut heartbeat =
-        tokio::time::interval_at(Instant::now() + heartbeat_interval, heartbeat_interval);
-    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let idle_ping_enabled = relay_daemon_mux_idle_ping_enabled();
-    let mut last_control_activity = Instant::now();
-    let mut last_idle_ping_sent_at = Instant::now();
-    let mut idle_ping_nonce: u64 = 0;
     let mut traffic = RelayTrafficCounters::default();
     let mut last_traffic_log = Instant::now();
     let mut heartbeat_debug = RelayHeartbeatDebug::new(Instant::now());
+    let mut heartbeat =
+        tokio::time::interval_at(Instant::now() + heartbeat_interval, heartbeat_interval);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_activity = Instant::now();
+    let mut last_idle_ping_sent_at = Instant::now();
+    let mut idle_ping_nonce: u64 = 0;
 
     let result = loop {
         // relay control frame 必须先于业务输出处理，避免大量 PTY 输出让 Ping/Pong 被调度延迟。
-        // 中文注释：writer outcome 可能在大输出期间形成热循环。它只能推动输出续传，
-        // 不能排在 relay control 入站帧前面，否则 attach/input/disconnect 会被饿住。
+        // 中文注释：daemon->relay 不再有独立写队列；所有输出在这里拿写锁后
+        // 直接写同一条 WebSocket。写慢时让 mux 主干自然承压，避免“已入队但未发出”。
         tokio::select! {
-                biased;
+            biased;
 
-                _ = tokio::time::sleep_until(idle_deadline), if relay_daemon_mux_inbound_idle_timeout_enabled() => {
-                    break Err(RelayConnectorError::IdleTimeout);
-                }
-                inbound = control_receiver.next() => {
-                    let Some(message) = inbound else {
-                        break Ok(());
-                    };
-                    let message = match message {
-                        Ok(message) => message,
-                        Err(error) => {
-                            warn!(
-                                relay = %relay_endpoint,
-                                ?server_id,
-                                %error,
-                                heartbeat_debug = ?heartbeat_debug.snapshot(),
-                                "relay daemon mux receive failed"
-                            );
-                            break Err(RelayConnectorError::ReceiveFailed);
-                        }
-                    };
-                    idle_deadline = Instant::now() + RELAY_IDLE_TIMEOUT;
-                    last_control_activity = Instant::now();
-                    traffic.record_in(&message);
-                    heartbeat_debug
-                        .record_inbound(relay_message_kind(&message), relay_message_bytes(&message));
+            _ = tokio::time::sleep_until(idle_deadline), if relay_daemon_mux_inbound_idle_timeout_enabled() => {
+                break Err(RelayConnectorError::IdleTimeout);
+            }
+            inbound = control_receiver.next() => {
+                let Some(message) = inbound else {
+                    break Ok(());
+                };
+                let message = match message {
+                    Ok(message) => message,
+                    Err(error) => {
+                        warn!(
+                            relay = %relay_endpoint,
+                            ?server_id,
+                            %error,
+                            heartbeat_debug = ?heartbeat_debug.snapshot(),
+                            "relay daemon mux receive failed"
+                        );
+                        break Err(RelayConnectorError::ReceiveFailed);
+                    }
+                };
+                idle_deadline = Instant::now() + RELAY_IDLE_TIMEOUT;
+                traffic.record_in(&message);
+                heartbeat_debug
+                    .record_inbound(relay_message_kind(&message), relay_message_bytes(&message));
+                debug!(
+                    relay = %relay_endpoint,
+                    ?server_id,
+                    message_kind = relay_message_kind(&message),
+                    message_bytes = relay_message_bytes(&message),
+                    "relay daemon mux inbound frame received"
+                );
 
-                    match message {
-                        Message::Text(raw) => {
-                            let envelope: RelayMuxEnvelope = match serde_json::from_str(raw.as_str()) {
-                                Ok(envelope) => envelope,
-                                Err(_) => break Err(RelayConnectorError::InvalidEnvelope),
-                            };
-                            let client_id = relay_envelope_client_id(&envelope);
-                            let responses = match handle_mux_envelope(envelope, &protocol, &mut connections).await {
-                                Ok(responses) => responses,
-                                Err(error) => break Err(error),
-                            };
-                            if let Some(client_id) = client_id {
-                                if let Some(connection) = connections.get_mut(&client_id) {
-                                    queue_relay_deferred_output_wakeups(
-                                        client_id,
-                                        connection,
-                                        &mut pending_push_events,
-                                    );
-                                }
+                match message {
+                    Message::Text(raw) => {
+                        let envelope: RelayMuxEnvelope = match serde_json::from_str(raw.as_str()) {
+                            Ok(envelope) => envelope,
+                            Err(_) => break Err(RelayConnectorError::InvalidEnvelope),
+                        };
+                        let client_id = relay_envelope_client_id(&envelope);
+                        debug!(
+                            relay = %relay_endpoint,
+                            ?server_id,
+                            client_id = client_id.map(|id| id.0),
+                            envelope = relay_mux_envelope_kind(&envelope),
+                            "relay daemon mux envelope decoded"
+                        );
+                        let responses = match handle_mux_envelope(envelope, &protocol, &mut connections, &active_clients).await {
+                            Ok(responses) => responses,
+                            Err(error) => break Err(error),
+                        };
+                        if let Some(client_id) = client_id {
+                            if let Some(connection) = connections.get_mut(&client_id) {
+                                queue_relay_deferred_output_wakeups(
+                                    client_id,
+                                    connection,
+                                    &mut pending_push_events,
+                                );
+                            } else {
+                                pending_push_events.remove_client(client_id);
                             }
-                            if let Err(error) = enqueue_relay_mux_response(
-                                &write_raw_control_tx,
-                                &write_client_tx,
-                                RelayOutKind::Response,
-                                responses,
-                            ) {
-                                traffic.record_send_error();
-                                break Err(error);
-                            }
-                            let initial_output_sessions = sync_relay_watchers_for_client(
-                                client_id,
-                                &connections,
-                                &protocol,
-                                &mut watched_output_sessions,
-                                &mut watched_file_tree_sessions,
-                                &mut watched_resize_sessions,
-                                &push_event_tx,
-                                &mut watcher_tasks,
-                            )
-                            .await;
-                            queue_relay_initial_output_events(
-                                client_id,
-                                &initial_output_sessions,
-                                &mut pending_push_events,
-                            );
-                            maybe_log_relay_traffic(
-                                &relay_endpoint,
-                                &mut traffic,
-                                &mut last_traffic_log,
-                                &mut connections,
-                                relay_watcher_counts(
-                                    &watched_output_sessions,
-                                    &watched_file_tree_sessions,
-                                    &watched_resize_sessions,
-                                ),
-                                false,
-                            );
                         }
-                        Message::Binary(raw) => {
-                            let envelope: RelayMuxEnvelope = match decode_binary_relay_mux_envelope(&raw)
-                                .or_else(|_| serde_json::from_slice(&raw).map_err(|_| ()))
-                            {
-                                Ok(envelope) => envelope,
-                                Err(_) => break Err(RelayConnectorError::InvalidEnvelope),
-                            };
-                            let client_id = relay_envelope_client_id(&envelope);
-                            let responses = match handle_mux_envelope(envelope, &protocol, &mut connections).await {
-                                Ok(responses) => responses,
-                                Err(error) => break Err(error),
-                            };
-                            if let Some(client_id) = client_id {
-                                if let Some(connection) = connections.get_mut(&client_id) {
-                                    queue_relay_deferred_output_wakeups(
-                                        client_id,
-                                        connection,
-                                        &mut pending_push_events,
-                                    );
-                                }
-                            }
-                            if let Err(error) = enqueue_relay_mux_response(
-                                &write_raw_control_tx,
-                                &write_client_tx,
-                                RelayOutKind::Response,
-                                responses,
-                            ) {
-                                traffic.record_send_error();
-                                break Err(error);
-                            }
-                            let initial_output_sessions = sync_relay_watchers_for_client(
-                                client_id,
-                                &connections,
-                                &protocol,
-                                &mut watched_output_sessions,
-                                &mut watched_file_tree_sessions,
-                                &mut watched_resize_sessions,
-                                &push_event_tx,
-                                &mut watcher_tasks,
-                            )
-                            .await;
-                            queue_relay_initial_output_events(
-                                client_id,
-                                &initial_output_sessions,
-                                &mut pending_push_events,
-                            );
-                            maybe_log_relay_traffic(
-                                &relay_endpoint,
-                                &mut traffic,
-                                &mut last_traffic_log,
-                                &mut connections,
-                                relay_watcher_counts(
-                                    &watched_output_sessions,
-                                    &watched_file_tree_sessions,
-                                    &watched_resize_sessions,
-                                ),
-                                false,
-                            );
-                        }
-                        Message::Ping(payload) => {
-                            let pong_bytes = payload.len();
-                            if let Err(error) = enqueue_relay_mux_control_message(
-                                &write_raw_control_tx,
-                                RelayOutKind::Pong,
-                                Message::Pong(payload),
-                                pong_bytes,
-                            )
-                            {
-                                traffic.record_send_error();
-                                break Err(error);
-                            }
-                            maybe_log_relay_traffic(
-                                &relay_endpoint,
-                                &mut traffic,
-                                &mut last_traffic_log,
-                                &mut connections,
-                                relay_watcher_counts(
-                                    &watched_output_sessions,
-                                    &watched_file_tree_sessions,
-                                    &watched_resize_sessions,
-                                ),
-                                false,
-                            );
-                        }
-                        Message::Pong(_) => {
-                            maybe_log_relay_traffic(
-                                &relay_endpoint,
-                                &mut traffic,
-                                &mut last_traffic_log,
-                                &mut connections,
-                                relay_watcher_counts(
-                                    &watched_output_sessions,
-                                    &watched_file_tree_sessions,
-                                    &watched_resize_sessions,
-                                ),
-                                false,
-                            );
-                        }
-                        Message::Close(_) => break Ok(()),
-                        Message::Frame(_) => {}
-                    }
-                }
-                write_outcome = write_outcome_rx.recv() => {
-                    let Some(write_outcome) = write_outcome else {
-                        break Err(RelayConnectorError::SendFailed);
-                    };
-                    match write_outcome {
-                        RelayMuxWriteOutcome::Sent { channel, kind, envelopes, bytes, push_events } => {
-                            if channel == RelayMuxChannel::Control {
-                                last_control_activity = Instant::now();
-                                heartbeat_debug.record_outbound(kind.label(), bytes);
-                            }
-                            traffic.record_out(kind, envelopes, bytes);
-                            pending_push_events.finish_inflight_after_send(&push_events);
-                            queue_relay_push_drain_wakeup(
-                                &pending_push_events,
-                                &push_event_tx,
-                                &mut push_drain_wake_pending,
-                            );
-                            maybe_log_relay_traffic(
-                                &relay_endpoint,
-                                &mut traffic,
-                                &mut last_traffic_log,
-                                &mut connections,
-                                relay_watcher_counts(
-                                    &watched_output_sessions,
-                                    &watched_file_tree_sessions,
-                                    &watched_resize_sessions,
-                                ),
-                                false,
-                            );
-                        }
-                        RelayMuxWriteOutcome::Failed { channel, error } => {
-                            warn!(
-                                relay = %relay_endpoint,
-                                channel = channel.label(),
-                                %error,
-                                "relay mux writer failed"
-                            );
-                            traffic.record_send_error();
-                            break Err(error);
-                        }
-                    }
-                }
-                _ = heartbeat.tick(), if idle_ping_enabled => {
-                    let now = Instant::now();
-                    if last_control_activity.elapsed() >= heartbeat_interval
-                        && now.duration_since(last_idle_ping_sent_at) >= heartbeat_interval
-                    {
-                        idle_ping_nonce = idle_ping_nonce.wrapping_add(1);
-                        let payload = idle_ping_nonce.to_be_bytes().to_vec();
-                        let payload_len = payload.len();
-                        match enqueue_relay_mux_control_message(
-                            &write_raw_control_tx,
-                            RelayOutKind::IdlePing,
-                            Message::Ping(payload),
-                            payload_len,
-                        )
-                        {
-                            Ok(()) => {
-                                last_idle_ping_sent_at = Instant::now();
-                                // heartbeat 使用标准 WebSocket Ping，仅用于保活 daemon -> relay 长连接；
-                                // relay 不解析它，也不把它纳入业务协议。
-                            }
+                        let response_count = responses.len();
+                        let response_bytes = match send_relay_mux_envelopes_locked(
+                            &relay_endpoint,
+                            &sender,
+                            &active_clients,
+                            client_id,
+                            RelayOutKind::Response,
+                            responses,
+                        ).await {
+                            Ok(bytes) => bytes,
                             Err(error) => {
                                 traffic.record_send_error();
                                 break Err(error);
                             }
+                        };
+                        if response_bytes > 0 {
+                            last_activity = Instant::now();
                         }
+                        traffic.record_out(
+                            RelayOutKind::Response,
+                            if response_bytes > 0 { response_count } else { 0 },
+                            response_bytes,
+                        );
+                        let initial_output_sessions = sync_relay_watchers_for_client(
+                            client_id,
+                            &connections,
+                            &protocol,
+                            &mut watched_output_sessions,
+                            &mut watched_file_tree_sessions,
+                            &mut watched_resize_sessions,
+                            &push_event_tx,
+                            &mut watcher_tasks,
+                        )
+                        .await;
+                        queue_relay_initial_output_events(
+                            client_id,
+                            &initial_output_sessions,
+                            &mut pending_push_events,
+                        );
+                        queue_relay_push_drain_wakeup(
+                            &pending_push_events,
+                            &mut push_drain_wake_pending,
+                        );
+                        maybe_log_relay_traffic(
+                            &relay_endpoint,
+                            &mut traffic,
+                            &mut last_traffic_log,
+                            &mut connections,
+                            relay_watcher_counts(
+                                &watched_output_sessions,
+                                &watched_file_tree_sessions,
+                                &watched_resize_sessions,
+                            ),
+                            false,
+                        );
                     }
+                    Message::Binary(raw) => {
+                        let envelope: RelayMuxEnvelope = match decode_binary_relay_mux_envelope(&raw)
+                            .or_else(|_| serde_json::from_slice(&raw).map_err(|_| ()))
+                        {
+                            Ok(envelope) => envelope,
+                            Err(_) => break Err(RelayConnectorError::InvalidEnvelope),
+                        };
+                        let client_id = relay_envelope_client_id(&envelope);
+                        debug!(
+                            relay = %relay_endpoint,
+                            ?server_id,
+                            client_id = client_id.map(|id| id.0),
+                            envelope = relay_mux_envelope_kind(&envelope),
+                            "relay daemon mux envelope decoded"
+                        );
+                        let responses = match handle_mux_envelope(envelope, &protocol, &mut connections, &active_clients).await {
+                            Ok(responses) => responses,
+                            Err(error) => break Err(error),
+                        };
+                        if let Some(client_id) = client_id {
+                            if let Some(connection) = connections.get_mut(&client_id) {
+                                queue_relay_deferred_output_wakeups(
+                                    client_id,
+                                    connection,
+                                    &mut pending_push_events,
+                                );
+                            } else {
+                                pending_push_events.remove_client(client_id);
+                            }
+                        }
+                        let response_count = responses.len();
+                        let response_bytes = match send_relay_mux_envelopes_locked(
+                            &relay_endpoint,
+                            &sender,
+                            &active_clients,
+                            client_id,
+                            RelayOutKind::Response,
+                            responses,
+                        ).await {
+                            Ok(bytes) => bytes,
+                            Err(error) => {
+                                traffic.record_send_error();
+                                break Err(error);
+                            }
+                        };
+                        if response_bytes > 0 {
+                            last_activity = Instant::now();
+                        }
+                        traffic.record_out(
+                            RelayOutKind::Response,
+                            if response_bytes > 0 { response_count } else { 0 },
+                            response_bytes,
+                        );
+                        let initial_output_sessions = sync_relay_watchers_for_client(
+                            client_id,
+                            &connections,
+                            &protocol,
+                            &mut watched_output_sessions,
+                            &mut watched_file_tree_sessions,
+                            &mut watched_resize_sessions,
+                            &push_event_tx,
+                            &mut watcher_tasks,
+                        )
+                        .await;
+                        queue_relay_initial_output_events(
+                            client_id,
+                            &initial_output_sessions,
+                            &mut pending_push_events,
+                        );
+                        queue_relay_push_drain_wakeup(
+                            &pending_push_events,
+                            &mut push_drain_wake_pending,
+                        );
+                        maybe_log_relay_traffic(
+                            &relay_endpoint,
+                            &mut traffic,
+                            &mut last_traffic_log,
+                            &mut connections,
+                            relay_watcher_counts(
+                                &watched_output_sessions,
+                                &watched_file_tree_sessions,
+                                &watched_resize_sessions,
+                            ),
+                            false,
+                        );
+                    }
+                    Message::Ping(payload) => {
+                        let pong_bytes = payload.len();
+                        if let Err(error) = send_relay_control_message_locked(
+                            &sender,
+                            RelayOutKind::Pong,
+                            Message::Pong(payload),
+                        )
+                        .await
+                        {
+                            traffic.record_send_error();
+                            break Err(error);
+                        }
+                        last_activity = Instant::now();
+                        traffic.record_out(RelayOutKind::Pong, 0, pong_bytes);
+                        maybe_log_relay_traffic(
+                            &relay_endpoint,
+                            &mut traffic,
+                            &mut last_traffic_log,
+                            &mut connections,
+                            relay_watcher_counts(
+                                &watched_output_sessions,
+                                &watched_file_tree_sessions,
+                                &watched_resize_sessions,
+                            ),
+                            false,
+                        );
+                    }
+                    Message::Pong(_) => {
+                        maybe_log_relay_traffic(
+                            &relay_endpoint,
+                            &mut traffic,
+                            &mut last_traffic_log,
+                            &mut connections,
+                            relay_watcher_counts(
+                                &watched_output_sessions,
+                                &watched_file_tree_sessions,
+                                &watched_resize_sessions,
+                            ),
+                            false,
+                        );
+                    }
+                    Message::Close(_) => break Ok(()),
+                    Message::Frame(_) => {}
                 }
-        maybe_event = push_event_rx.recv() => {
-                    let Some(event) = maybe_event else {
-                        break Err(RelayConnectorError::SendFailed);
-                    };
-                    idle_deadline = Instant::now() + RELAY_IDLE_TIMEOUT;
-                    push_drain_wake_pending = false;
-                    pending_push_events.enqueue(event);
-                    if let Err(error) = drain_relay_push_events(
-                        &relay_endpoint,
-                        server_id,
-                        &protocol,
-                        &mut connections,
-                        &mut pending_push_events,
-                        &write_client_tx,
-                        &push_event_tx,
-                        &mut push_drain_wake_pending,
+            }
+            _ = heartbeat.tick() => {
+                let now = Instant::now();
+                if relay_daemon_mux_idle_ping_enabled()
+                    && relay_idle_ping_due(
+                        now,
+                        last_activity,
+                        last_idle_ping_sent_at,
+                        heartbeat_interval,
+                    )
+                {
+                    idle_ping_nonce = idle_ping_nonce.wrapping_add(1);
+                    let payload = idle_ping_nonce.to_be_bytes().to_vec();
+                    let ping_bytes = payload.len();
+                    if let Err(error) = send_relay_control_message_locked(
+                        &sender,
+                        RelayOutKind::IdlePing,
+                        Message::Ping(payload),
                     )
                     .await
                     {
                         traffic.record_send_error();
                         break Err(error);
                     }
+                    last_idle_ping_sent_at = Instant::now();
+                    last_activity = Instant::now();
+                    traffic.record_out(RelayOutKind::IdlePing, 0, ping_bytes);
                     maybe_log_relay_traffic(
                         &relay_endpoint,
                         &mut traffic,
@@ -1157,6 +1140,106 @@ async fn connect_relay_mux_base_once(
                     );
                 }
             }
+            _ = tokio::task::yield_now(), if push_drain_wake_pending => {
+                // 中文注释：内部 deferred output 不能再塞回 watcher 的有界 mpsc 队列自唤醒。
+                // 高输出和快切时该队列可能正好满，若唤醒丢失，pending snapshot/tail 会停在
+                // daemon mux 内。用 mux 主循环自己的布尔调度位承接下一轮 drain。
+                push_drain_wake_pending = false;
+                debug!(
+                    relay = %relay_endpoint,
+                    ?server_id,
+                    queue_pending = pending_push_events.len(),
+                    "relay mux deferred push drain wakeup fired"
+                );
+                match drain_relay_push_events(
+                    &relay_endpoint,
+                    server_id,
+                    &protocol,
+                    &mut connections,
+                    &mut pending_push_events,
+                    &sender,
+                    &active_clients,
+                    &mut traffic,
+                    &mut push_drain_wake_pending,
+                )
+                .await
+                {
+                    Ok(sent) => {
+                        if sent {
+                            last_activity = Instant::now();
+                        }
+                    }
+                    Err(error) => {
+                        traffic.record_send_error();
+                        break Err(error);
+                    }
+                }
+                maybe_log_relay_traffic(
+                    &relay_endpoint,
+                    &mut traffic,
+                    &mut last_traffic_log,
+                    &mut connections,
+                    relay_watcher_counts(
+                        &watched_output_sessions,
+                        &watched_file_tree_sessions,
+                        &watched_resize_sessions,
+                    ),
+                    false,
+                );
+            }
+            maybe_event = push_event_rx.recv() => {
+                let Some(event) = maybe_event else {
+                    break Err(RelayConnectorError::SendFailed);
+                };
+                idle_deadline = Instant::now() + RELAY_IDLE_TIMEOUT;
+                push_drain_wake_pending = false;
+                debug!(
+                    relay = %relay_endpoint,
+                    ?server_id,
+                    client_id = event.client_id().0,
+                    session_id = ?event.session_id(),
+                    event = event.label(),
+                    queue_pending_before = pending_push_events.len(),
+                    "relay mux push event received from watcher"
+                );
+                pending_push_events.enqueue(event);
+                match drain_relay_push_events(
+                    &relay_endpoint,
+                    server_id,
+                    &protocol,
+                    &mut connections,
+                    &mut pending_push_events,
+                    &sender,
+                    &active_clients,
+                    &mut traffic,
+                    &mut push_drain_wake_pending,
+                )
+                .await
+                {
+                    Ok(sent) => {
+                        if sent {
+                            last_activity = Instant::now();
+                        }
+                    }
+                    Err(error) => {
+                        traffic.record_send_error();
+                        break Err(error);
+                    }
+                }
+                maybe_log_relay_traffic(
+                    &relay_endpoint,
+                    &mut traffic,
+                    &mut last_traffic_log,
+                    &mut connections,
+                    relay_watcher_counts(
+                        &watched_output_sessions,
+                        &watched_file_tree_sessions,
+                        &watched_resize_sessions,
+                    ),
+                    false,
+                );
+            }
+        }
     };
 
     maybe_log_relay_traffic(
@@ -1173,8 +1256,6 @@ async fn connect_relay_mux_base_once(
     );
 
     abort_relay_watcher_tasks(watcher_tasks);
-    control_writer_task.abort();
-    data_task.abort();
     close_relay_connections(protocol, connections).await;
     result
 }
@@ -1257,11 +1338,7 @@ fn maybe_log_relay_traffic(
 
     let flow = relay_mux_debug_snapshot(connections);
     let protocol_traffic = relay_protocol_debug_traffic(connections);
-    if relay_traffic_should_promote_to_info(
-        traffic,
-        &protocol_traffic,
-        flow.zero_credit_terminal_streams,
-    ) {
+    if relay_traffic_should_promote_to_info(traffic, &protocol_traffic) {
         info_relay_traffic(relay_endpoint, traffic, &protocol_traffic, watchers, flow);
     } else {
         debug_relay_traffic(relay_endpoint, traffic, &protocol_traffic, watchers, flow);
@@ -1273,7 +1350,6 @@ fn maybe_log_relay_traffic(
 fn relay_traffic_should_promote_to_info(
     traffic: &RelayTrafficCounters,
     protocol_traffic: &ProtocolConnectionDebugTraffic,
-    zero_credit_terminal_streams: usize,
 ) -> bool {
     // relay 是所有公网 client 共享的单条 daemon mux；只把异常放大、背压或发送错误提升到 info。
     traffic.send_errors > 0
@@ -1283,8 +1359,6 @@ fn relay_traffic_should_promote_to_info(
         || protocol_traffic.method_count_exceeds(20)
         || protocol_traffic.inbound_stream_chunks > 100
         || protocol_traffic.outbound_stream_chunks > 100
-        || (zero_credit_terminal_streams > 0
-            && (traffic.out_push_output.calls > 0 || traffic.out_response.calls > 0))
 }
 
 fn info_relay_traffic(
@@ -1443,6 +1517,7 @@ async fn handle_mux_envelope(
     envelope: RelayMuxEnvelope,
     protocol: &SharedDaemonProtocol,
     connections: &mut HashMap<RelayClientId, ProtocolConnection>,
+    active_clients: &RelayActiveClients,
 ) -> Result<Vec<RelayMuxEnvelope>, RelayConnectorError> {
     match envelope {
         RelayMuxEnvelope::Keepalive { .. } | RelayMuxEnvelope::KeepaliveAck { .. } => {
@@ -1455,6 +1530,7 @@ async fn handle_mux_envelope(
                 protocol.start_connection()
             };
             connections.insert(client_id, connection);
+            mark_relay_client_active(active_clients, client_id);
             debug!(
                 client_id = client_id.0,
                 "relay client connected to daemon mux"
@@ -1462,6 +1538,7 @@ async fn handle_mux_envelope(
             client_envelopes(client_id, initial_messages)
         }
         RelayMuxEnvelope::ClientDisconnected { client_id } => {
+            mark_relay_client_inactive(active_clients, client_id);
             if let Some(mut connection) = connections.remove(&client_id) {
                 let mut protocol = protocol.lock().await;
                 connection.close(&mut protocol);
@@ -1481,11 +1558,18 @@ async fn handle_mux_envelope(
                 return Ok(Vec::new());
             };
 
+            debug!(
+                client_id = client_id.0,
+                frame_kind = relay_opaque_frame_kind(&frame),
+                frame_bytes = relay_opaque_frame_transport_bytes(&frame),
+                "relay client frame received by daemon mux"
+            );
             let frame = match wire_message_from_mux_frame(frame) {
                 Ok(frame) => frame,
                 Err(error) => {
                     // relay client 是非可信输入源；坏业务 frame 只能影响该 client，不能杀掉
                     // daemon outbound connector 或 direct daemon。
+                    mark_relay_client_inactive(active_clients, client_id);
                     close_client_connection(protocol, connections, client_id).await;
                     warn!(
                         client_id = client_id.0,
@@ -1495,6 +1579,12 @@ async fn handle_mux_envelope(
                     return Ok(Vec::new());
                 }
             };
+            debug!(
+                client_id = client_id.0,
+                frame_kind = protocol_wire_message_kind(&frame),
+                frame_bytes = protocol_wire_message_bytes(&frame),
+                "relay client frame decoded by daemon mux"
+            );
             let responses = {
                 let connection = connections
                     .get_mut(&client_id)
@@ -1502,9 +1592,50 @@ async fn handle_mux_envelope(
                 let mut protocol = protocol.lock().await;
                 connection.handle_wire_message(&mut protocol, frame)
             };
+            debug!(
+                client_id = client_id.0,
+                responses = responses.len(),
+                response_bytes = protocol_wire_messages_wire_len(&responses),
+                "relay client frame handled by daemon protocol"
+            );
             client_wire_messages(client_id, responses)
         }
         RelayMuxEnvelope::DaemonFrame { .. } => Err(RelayConnectorError::InvalidEnvelope),
+    }
+}
+
+fn relay_opaque_frame_kind(frame: &RelayOpaqueFrame) -> &'static str {
+    match frame {
+        RelayOpaqueFrame::Text { .. } => "text",
+        RelayOpaqueFrame::Binary { .. } => "binary",
+    }
+}
+
+fn relay_opaque_frame_transport_bytes(frame: &RelayOpaqueFrame) -> usize {
+    match frame {
+        RelayOpaqueFrame::Text { data } => data.len(),
+        RelayOpaqueFrame::Binary { data_base64 } => data_base64.len(),
+    }
+}
+
+fn protocol_wire_messages_wire_len(messages: &[ProtocolWireMessage]) -> usize {
+    messages.iter().map(protocol_wire_message_bytes).sum()
+}
+
+fn protocol_wire_message_kind(message: &ProtocolWireMessage) -> &'static str {
+    match message {
+        ProtocolWireMessage::Json(_) => "json",
+        ProtocolWireMessage::Binary(_) => "binary",
+    }
+}
+
+fn protocol_wire_message_bytes(message: &ProtocolWireMessage) -> usize {
+    match message {
+        ProtocolWireMessage::Json(envelope) => match serde_json::to_vec(envelope) {
+            Ok(raw) => raw.len(),
+            Err(_) => 0,
+        },
+        ProtocolWireMessage::Binary(raw) => raw.len(),
     }
 }
 
@@ -1622,8 +1753,20 @@ async fn sync_relay_watchers_for_client(
                         .await
                         .is_err()
                     {
+                        debug!(
+                            client_id = client_id.0,
+                            session_id = ?session_id,
+                            event = "output",
+                            "relay mux output watcher stopped because event queue closed"
+                        );
                         break;
                     }
+                    debug!(
+                        client_id = client_id.0,
+                        session_id = ?session_id,
+                        event = "output",
+                        "relay mux output watcher enqueued event"
+                    );
                 }
             }));
     }
@@ -1651,8 +1794,20 @@ async fn sync_relay_watchers_for_client(
                         .await
                         .is_err()
                     {
+                        debug!(
+                            client_id = client_id.0,
+                            session_id = ?session_id,
+                            event = "file_tree",
+                            "relay mux file tree watcher stopped because event queue closed"
+                        );
                         break;
                     }
+                    debug!(
+                        client_id = client_id.0,
+                        session_id = ?session_id,
+                        event = "file_tree",
+                        "relay mux file tree watcher enqueued event"
+                    );
                 }
             }));
     }
@@ -1681,8 +1836,20 @@ async fn sync_relay_watchers_for_client(
                         .await
                         .is_err()
                     {
+                        debug!(
+                            client_id = client_id.0,
+                            session_id = ?session_id,
+                            event = "resize",
+                            "relay mux resize watcher stopped because event queue closed"
+                        );
                         break;
                     }
+                    debug!(
+                        client_id = client_id.0,
+                        session_id = ?session_id,
+                        event = "resize",
+                        "relay mux resize watcher enqueued event"
+                    );
                 }
             }));
     }
@@ -1705,6 +1872,12 @@ fn queue_relay_initial_output_events(
             client_id,
             session_id: *session_id,
         });
+        debug!(
+            client_id = client_id.0,
+            session_id = ?session_id,
+            queue_pending = pending_push_events.len(),
+            "relay mux initial output event queued"
+        );
     }
 }
 
@@ -1714,87 +1887,90 @@ fn queue_relay_deferred_output_wakeups(
     pending_push_events: &mut RelayPushEventQueue,
 ) {
     for session_id in connection.take_deferred_output_wakeups() {
-        // 中文注释：flow ACK 只补 credit 并唤醒输出 drain；真正读取 PTY、组包和加密
-        // 放到 push 队列里做，避免 relay client 的 ACK 风暴占住 daemon 全局协议锁。
+        // 中文注释：terminal 输出不再等待 flow ACK/credit；这里仅处理 batch/transport
+        // 上限导致的后续 drain，避免单个 relay client 占住 daemon 全局协议锁。
         pending_push_events.enqueue(RelayPushEvent::Output {
             client_id,
             session_id,
         });
+        debug!(
+            client_id = client_id.0,
+            session_id = ?session_id,
+            queue_pending = pending_push_events.len(),
+            "relay mux deferred output event queued"
+        );
     }
 }
 
-fn enqueue_relay_mux_response(
-    write_raw_control_tx: &mpsc::Sender<RelayMuxWrite>,
-    write_client_tx: &mpsc::Sender<RelayMuxWrite>,
+async fn send_relay_mux_envelopes_locked(
+    relay_endpoint: &str,
+    sender: &RelaySharedSender,
+    active_clients: &RelayActiveClients,
+    client_id: Option<RelayClientId>,
     kind: RelayOutKind,
     envelopes: Vec<RelayMuxEnvelope>,
-) -> Result<(), RelayConnectorError> {
+) -> Result<usize, RelayConnectorError> {
     if envelopes.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
-    let contains_e2ee_payload = relay_mux_envelopes_contain_e2ee_payload(&envelopes);
-    let write = RelayMuxWrite::Envelopes {
-        kind,
-        envelopes,
-        push_events: Vec::new(),
-    };
-    if contains_e2ee_payload {
-        // 中文注释：EncryptedFrame/binary payload 承载同一条 client E2EE sequence。
-        // 它们必须和 terminal output 一起走 data FIFO，不能被 control socket 插队。
-        write_client_tx
-            .try_send(write)
-            .map_err(|_| RelayConnectorError::SendFailed)
-    } else {
-        // 中文注释：hello / e2ee_key_exchange 还没有 E2EE sequence，可以继续走 control。
-        // 这样新 client 的首包不会被其它 client 的大 terminal output 队列挡住。
-        write_raw_control_tx
-            .try_send(write)
-            .map_err(|_| RelayConnectorError::SendFailed)
+    if client_id.is_some_and(|client_id| !relay_client_is_active(active_clients, client_id)) {
+        // 中文注释：client 已断开时，旧输出不能再占用 daemon->relay 主干。
+        // 新连接会通过 daemon mirror cache 重新拿 snapshot/tail。
+        debug!(
+            relay = relay_endpoint,
+            client_id = client_id.map(|id| id.0),
+            kind = kind.label(),
+            envelopes = envelopes.len(),
+            "relay mux dropped outbound batch for inactive client"
+        );
+        return Ok(0);
     }
+    let envelope_count = envelopes.len();
+    let bytes = relay_mux_envelopes_wire_len(&envelopes);
+    debug!(
+        relay = relay_endpoint,
+        client_id = client_id.map(|id| id.0),
+        kind = kind.label(),
+        envelopes = envelope_count,
+        bytes,
+        "relay mux waiting for websocket send lock"
+    );
+    let lock_started = Instant::now();
+    let mut sender = sender.lock().await;
+    let lock_wait = lock_started.elapsed();
+    debug!(
+        relay = relay_endpoint,
+        client_id = client_id.map(|id| id.0),
+        kind = kind.label(),
+        envelopes = envelope_count,
+        bytes,
+        lock_wait_ms = lock_wait.as_millis(),
+        "relay mux websocket send lock acquired"
+    );
+    send_mux_envelopes_logged(relay_endpoint, &mut sender, envelopes, kind.label()).await
 }
 
-fn relay_mux_envelopes_contain_e2ee_payload(envelopes: &[RelayMuxEnvelope]) -> bool {
-    envelopes.iter().any(relay_mux_envelope_is_e2ee_payload)
-}
-
-fn relay_mux_envelope_is_e2ee_payload(envelope: &RelayMuxEnvelope) -> bool {
-    match envelope {
-        RelayMuxEnvelope::DaemonFrame {
-            frame: RelayOpaqueFrame::Binary { .. },
-            ..
-        } => true,
-        RelayMuxEnvelope::DaemonFrame {
-            frame: RelayOpaqueFrame::Text { data },
-            ..
-        } => serde_json::from_str::<JsonEnvelope>(data)
-            .is_ok_and(|envelope| envelope.kind == ProtoMessageType::EncryptedFrame),
-        RelayMuxEnvelope::Keepalive { .. }
-        | RelayMuxEnvelope::KeepaliveAck { .. }
-        | RelayMuxEnvelope::ClientConnected { .. }
-        | RelayMuxEnvelope::ClientDisconnected { .. }
-        | RelayMuxEnvelope::ClientFrame { .. } => false,
-    }
-}
-
-fn enqueue_relay_mux_control_message(
-    write_control_tx: &mpsc::Sender<RelayMuxWrite>,
+async fn send_relay_control_message_locked(
+    sender: &RelaySharedSender,
     kind: RelayOutKind,
     message: Message,
-    bytes: usize,
 ) -> Result<(), RelayConnectorError> {
-    match write_control_tx.try_send(RelayMuxWrite::Raw {
-        kind,
-        message,
+    let message_kind = relay_message_kind(&message);
+    let bytes = relay_message_bytes(&message);
+    debug!(
+        kind = kind.label(),
+        message_kind, bytes, "relay mux waiting for control send lock"
+    );
+    let lock_started = Instant::now();
+    let mut sender = sender.lock().await;
+    debug!(
+        kind = kind.label(),
+        message_kind,
         bytes,
-    }) {
-        Ok(()) => Ok(()),
-        Err(mpsc::error::TrySendError::Full(_)) if kind == RelayOutKind::IdlePing => {
-            // 中文注释：daemon idle Ping 只用于保活；control 队列满时说明连接不空闲，
-            // 丢弃本次 Ping，不能把背压误判成 relay mux transport failure。
-            Ok(())
-        }
-        Err(_) => Err(RelayConnectorError::SendFailed),
-    }
+        lock_wait_ms = lock_started.elapsed().as_millis(),
+        "relay mux control send lock acquired"
+    );
+    send_relay_message_with_deadline(&mut sender, message, relay_send_deadline(kind)).await
 }
 
 async fn drain_relay_push_events(
@@ -1803,33 +1979,38 @@ async fn drain_relay_push_events(
     protocol: &SharedDaemonProtocol,
     connections: &mut HashMap<RelayClientId, ProtocolConnection>,
     pending_push_events: &mut RelayPushEventQueue,
-    write_client_tx: &mpsc::Sender<RelayMuxWrite>,
-    push_event_tx: &mpsc::Sender<RelayPushEvent>,
+    sender: &RelaySharedSender,
+    active_clients: &RelayActiveClients,
+    traffic: &mut RelayTrafficCounters,
     push_drain_wake_pending: &mut bool,
-) -> Result<(), RelayConnectorError> {
+) -> Result<bool, RelayConnectorError> {
     let started_at = Instant::now();
     let mut drained_events = 0_usize;
-    let mut enqueued_bytes = 0_usize;
+    let mut sent_bytes = 0_usize;
+    let mut wrote_to_relay = false;
     while pending_push_events.has_pending() {
-        let Some(event) = pending_push_events.pop_front_for_inflight() else {
+        let Some(event) = pending_push_events.pop_front() else {
             break;
         };
-        let permit = match write_client_tx.try_reserve() {
-            Ok(permit) => permit,
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                pending_push_events.finish_inflight_after_send(&[event]);
-                pending_push_events.enqueue(event);
-                break;
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                pending_push_events.finish_inflight_after_send(&[event]);
-                pending_push_events.enqueue(event);
-                return Err(RelayConnectorError::SendFailed);
-            }
-        };
         let (client_id, session_id, kind) = relay_push_event_parts(event);
+        debug!(
+            relay = %relay_endpoint,
+            ?server_id,
+            client_id = client_id.0,
+            session_id = ?session_id,
+            kind = kind.label(),
+            queue_pending_after_pop = pending_push_events.len(),
+            "relay mux push event dequeued"
+        );
         let Some(connection) = connections.get_mut(&client_id) else {
-            pending_push_events.finish_inflight_after_send(&[event]);
+            debug!(
+                relay = %relay_endpoint,
+                ?server_id,
+                client_id = client_id.0,
+                session_id = ?session_id,
+                kind = kind.label(),
+                "relay mux dropped push event for missing client connection"
+            );
             continue;
         };
         let responses = match kind {
@@ -1883,14 +2064,26 @@ async fn drain_relay_push_events(
         queue_relay_deferred_output_wakeups(client_id, connection, pending_push_events);
         let response_count = responses.len();
         if response_count == 0 {
-            pending_push_events.finish_inflight_after_send(&[event]);
             drained_events = drained_events.saturating_add(1);
-            if relay_push_drain_budget_exhausted(drained_events, enqueued_bytes, started_at) {
-                queue_relay_push_drain_wakeup(
-                    pending_push_events,
-                    push_event_tx,
-                    push_drain_wake_pending,
+            debug!(
+                relay = %relay_endpoint,
+                ?server_id,
+                client_id = client_id.0,
+                session_id = ?session_id,
+                kind = kind.label(),
+                "relay mux push event produced no output"
+            );
+            if relay_push_drain_budget_exhausted(drained_events, sent_bytes, started_at) {
+                log_relay_push_drain_reschedule(
+                    relay_endpoint,
+                    server_id,
+                    kind,
+                    drained_events,
+                    sent_bytes,
+                    pending_push_events.len(),
+                    started_at.elapsed(),
                 );
+                queue_relay_push_drain_wakeup(pending_push_events, push_drain_wake_pending);
                 break;
             }
             continue;
@@ -1903,55 +2096,105 @@ async fn drain_relay_push_events(
                 ?server_id,
                 client_id = client_id.0,
                 kind = kind.label(),
-                queued_envelopes = envelopes.len(),
-                queued_bytes = batch_bytes,
-                "relay mux queued large deferred output"
+                direct_envelopes = envelopes.len(),
+                direct_bytes = batch_bytes,
+                "relay mux direct large deferred output"
             );
         }
-        permit.send(RelayMuxWrite::Envelopes {
+        let sent = send_relay_mux_envelopes_locked(
+            relay_endpoint,
+            sender,
+            active_clients,
+            Some(client_id),
             kind,
             envelopes,
-            push_events: vec![event],
-        });
+        )
+        .await?;
+        debug!(
+            relay = %relay_endpoint,
+            ?server_id,
+            client_id = client_id.0,
+            session_id = ?session_id,
+            kind = kind.label(),
+            response_count,
+            batch_bytes,
+            sent_bytes = sent,
+            queue_pending = pending_push_events.len(),
+            "relay mux push batch written to relay"
+        );
+        wrote_to_relay |= sent > 0;
+        traffic.record_out(kind, if sent > 0 { response_count } else { 0 }, sent);
         drained_events = drained_events.saturating_add(1);
-        enqueued_bytes = enqueued_bytes.saturating_add(batch_bytes);
-        if relay_push_drain_budget_exhausted(drained_events, enqueued_bytes, started_at) {
+        sent_bytes = sent_bytes.saturating_add(sent);
+        if relay_push_drain_budget_exhausted(drained_events, sent_bytes, started_at) {
             // 中文注释：这里主动让 relay mux 主循环回到 select!，让输入、attach、disconnect
-            // 和 Ping/Pong 有机会插队处理，避免多个大输出 session 把 control 面饿住。
-            queue_relay_push_drain_wakeup(
-                pending_push_events,
-                push_event_tx,
-                push_drain_wake_pending,
+            // 和 Ping/Pong 有机会插队处理；下一轮仍然直接写 WebSocket，不经过写队列。
+            log_relay_push_drain_reschedule(
+                relay_endpoint,
+                server_id,
+                kind,
+                drained_events,
+                sent_bytes,
+                pending_push_events.len(),
+                started_at.elapsed(),
             );
+            queue_relay_push_drain_wakeup(pending_push_events, push_drain_wake_pending);
             break;
         }
     }
-    Ok(())
+    Ok(wrote_to_relay)
+}
+
+fn log_relay_push_drain_reschedule(
+    relay_endpoint: &str,
+    server_id: ServerId,
+    kind: RelayOutKind,
+    drained_events: usize,
+    sent_bytes: usize,
+    pending_events: usize,
+    elapsed: Duration,
+) {
+    if pending_events == 0 {
+        return;
+    }
+    if pending_events >= 16
+        || sent_bytes >= RELAY_SEND_DEBUG_BATCH_BYTES
+        || elapsed >= RELAY_SEND_DEBUG_LOG_THRESHOLD
+    {
+        debug!(
+            relay = relay_endpoint,
+            ?server_id,
+            kind = kind.label(),
+            drained_events,
+            sent_bytes,
+            pending_events,
+            elapsed_ms = elapsed.as_millis(),
+            "relay mux deferred output rescheduled"
+        );
+    }
 }
 
 fn queue_relay_push_drain_wakeup(
     pending_push_events: &RelayPushEventQueue,
-    push_event_tx: &mpsc::Sender<RelayPushEvent>,
     push_drain_wake_pending: &mut bool,
 ) {
     if *push_drain_wake_pending || !pending_push_events.has_pending() {
         return;
     }
-    let Some(event) = pending_push_events.peek_front() else {
-        return;
-    };
-    if push_event_tx.try_send(event).is_ok() {
-        *push_drain_wake_pending = true;
-    }
+    *push_drain_wake_pending = true;
+    debug!(
+        queue_pending = pending_push_events.len(),
+        "relay mux push drain wakeup scheduled"
+    );
 }
 
 fn relay_push_drain_budget_exhausted(
     drained_events: usize,
-    enqueued_bytes: usize,
+    transported_bytes: usize,
     started_at: Instant,
 ) -> bool {
     drained_events >= RELAY_PUSH_DRAIN_MAX_EVENTS_PER_TICK
-        || enqueued_bytes >= RELAY_PUSH_DRAIN_MAX_ENQUEUED_BYTES_PER_TICK
+        || transported_bytes >= RELAY_PUSH_DRAIN_MAX_TRANSPORTED_BYTES_PER_TICK
         || started_at.elapsed() >= RELAY_PUSH_DRAIN_MAX_ELAPSED
 }
 
@@ -1982,6 +2225,14 @@ fn relay_push_event_parts(event: RelayPushEvent) -> (RelayClientId, SessionId, R
     }
 }
 
+fn relay_push_event_client_id(event: RelayPushEvent) -> RelayClientId {
+    match event {
+        RelayPushEvent::Output { client_id, .. }
+        | RelayPushEvent::FileTree { client_id, .. }
+        | RelayPushEvent::Resize { client_id, .. } => client_id,
+    }
+}
+
 fn remove_relay_watchers_for_client(
     client_id: RelayClientId,
     watched_output_sessions: &mut HashMap<RelayClientId, HashSet<SessionId>>,
@@ -2005,282 +2256,6 @@ fn abort_relay_watcher_tasks(watcher_tasks: HashMap<RelayClientId, Vec<JoinHandl
             task.abort();
         }
     }
-}
-
-async fn run_relay_mux_writer(
-    relay_endpoint: String,
-    channel: RelayMuxChannel,
-    mut sender: RelaySender,
-    mut rx: mpsc::Receiver<RelayMuxWrite>,
-    outcome_tx: mpsc::Sender<RelayMuxWriteOutcome>,
-) {
-    while let Some(write) = rx.recv().await {
-        if !send_relay_mux_write(&relay_endpoint, channel, &mut sender, write, &outcome_tx).await {
-            break;
-        }
-    }
-}
-
-async fn run_relay_mux_data_task(
-    relay_endpoint: String,
-    mut sender: RelaySender,
-    mut receiver: RelayReceiver,
-    mut rx: mpsc::Receiver<RelayMuxWrite>,
-    outcome_tx: mpsc::Sender<RelayMuxWriteOutcome>,
-    heartbeat_interval: Duration,
-) {
-    let mut heartbeat =
-        tokio::time::interval_at(Instant::now() + heartbeat_interval, heartbeat_interval);
-    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut last_data_activity = Instant::now();
-    let mut last_idle_ping_sent_at = Instant::now();
-    let mut idle_ping_nonce: u64 = 0;
-    let mut prefer_inbound_once = false;
-
-    loop {
-        if prefer_inbound_once {
-            tokio::select! {
-                biased;
-
-                inbound = receiver.next() => {
-                    prefer_inbound_once = false;
-                    if !handle_relay_mux_data_inbound(&relay_endpoint, &mut sender, inbound, &outcome_tx, &mut last_data_activity).await {
-                        break;
-                    }
-                }
-                write = rx.recv() => {
-                    prefer_inbound_once = true;
-                    let Some(write) = write else {
-                        break;
-                    };
-                    if !send_relay_mux_write(
-                        &relay_endpoint,
-                        RelayMuxChannel::Data,
-                        &mut sender,
-                        write,
-                        &outcome_tx,
-                    )
-                    .await
-                    {
-                        break;
-                    }
-                    last_data_activity = Instant::now();
-                }
-                _ = heartbeat.tick() => {
-                    let now = Instant::now();
-                    if last_data_activity.elapsed() >= heartbeat_interval
-                        && now.duration_since(last_idle_ping_sent_at) >= heartbeat_interval
-                    {
-                        idle_ping_nonce = idle_ping_nonce.wrapping_add(1);
-                        let payload = idle_ping_nonce.to_be_bytes().to_vec();
-                        let bytes = payload.len();
-                        let write = RelayMuxWrite::Raw {
-                            kind: RelayOutKind::IdlePing,
-                            message: Message::Ping(payload),
-                            bytes,
-                        };
-                        if !send_relay_mux_write(
-                            &relay_endpoint,
-                            RelayMuxChannel::Data,
-                            &mut sender,
-                            write,
-                            &outcome_tx,
-                        )
-                        .await
-                        {
-                            break;
-                        }
-                        last_idle_ping_sent_at = Instant::now();
-                        last_data_activity = Instant::now();
-                    }
-                }
-            }
-            continue;
-        }
-
-        tokio::select! {
-            biased;
-
-            write = rx.recv() => {
-                let Some(write) = write else {
-                    break;
-                };
-                if !send_relay_mux_write(
-                    &relay_endpoint,
-                    RelayMuxChannel::Data,
-                    &mut sender,
-                    write,
-                    &outcome_tx,
-                )
-                .await
-                {
-                    break;
-                }
-                last_data_activity = Instant::now();
-                prefer_inbound_once = true;
-            }
-            inbound = receiver.next() => {
-                prefer_inbound_once = false;
-                if !handle_relay_mux_data_inbound(&relay_endpoint, &mut sender, inbound, &outcome_tx, &mut last_data_activity).await {
-                    break;
-                }
-            }
-            _ = heartbeat.tick() => {
-                let now = Instant::now();
-                if last_data_activity.elapsed() >= heartbeat_interval
-                    && now.duration_since(last_idle_ping_sent_at) >= heartbeat_interval
-                {
-                    idle_ping_nonce = idle_ping_nonce.wrapping_add(1);
-                    let payload = idle_ping_nonce.to_be_bytes().to_vec();
-                    let bytes = payload.len();
-                    let write = RelayMuxWrite::Raw {
-                        kind: RelayOutKind::IdlePing,
-                        message: Message::Ping(payload),
-                        bytes,
-                    };
-                    if !send_relay_mux_write(
-                        &relay_endpoint,
-                        RelayMuxChannel::Data,
-                        &mut sender,
-                        write,
-                        &outcome_tx,
-                    )
-                    .await
-                    {
-                        break;
-                    }
-                    last_idle_ping_sent_at = Instant::now();
-                    last_data_activity = Instant::now();
-                }
-            }
-        }
-    }
-}
-
-async fn send_relay_mux_write(
-    relay_endpoint: &str,
-    channel: RelayMuxChannel,
-    sender: &mut RelaySender,
-    write: RelayMuxWrite,
-    outcome_tx: &mpsc::Sender<RelayMuxWriteOutcome>,
-) -> bool {
-    let outcome = match write {
-        RelayMuxWrite::Envelopes {
-            kind,
-            envelopes,
-            push_events,
-        } => {
-            let envelope_count = envelopes.len();
-            match send_mux_envelopes_logged(relay_endpoint, sender, envelopes, kind.label()).await {
-                Ok(bytes) => RelayMuxWriteOutcome::Sent {
-                    channel,
-                    kind,
-                    envelopes: envelope_count,
-                    bytes,
-                    push_events,
-                },
-                Err(error) => RelayMuxWriteOutcome::Failed { channel, error },
-            }
-        }
-        RelayMuxWrite::Raw {
-            kind,
-            message,
-            bytes,
-        } => {
-            match send_relay_message_with_deadline(sender, message, relay_send_deadline(kind)).await
-            {
-                Ok(()) => RelayMuxWriteOutcome::Sent {
-                    channel,
-                    kind,
-                    envelopes: 0,
-                    bytes,
-                    push_events: Vec::new(),
-                },
-                Err(error) => RelayMuxWriteOutcome::Failed { channel, error },
-            }
-        }
-    };
-    let should_continue = matches!(outcome, RelayMuxWriteOutcome::Sent { .. });
-    if outcome_tx.send(outcome).await.is_err() {
-        return false;
-    }
-    should_continue
-}
-
-async fn handle_relay_mux_data_inbound(
-    relay_endpoint: &str,
-    sender: &mut RelaySender,
-    inbound: Option<Result<Message, tokio_tungstenite::tungstenite::Error>>,
-    outcome_tx: &mpsc::Sender<RelayMuxWriteOutcome>,
-    last_data_activity: &mut Instant,
-) -> bool {
-    let Some(message) = inbound else {
-        let _ = outcome_tx.try_send(RelayMuxWriteOutcome::Failed {
-            channel: RelayMuxChannel::Data,
-            error: RelayConnectorError::ReceiveFailed,
-        });
-        return false;
-    };
-    let message = match message {
-        Ok(message) => message,
-        Err(error) => {
-            warn!(
-                relay = %relay_endpoint,
-                %error,
-                "relay data mux receive failed"
-            );
-            let _ = outcome_tx.try_send(RelayMuxWriteOutcome::Failed {
-                channel: RelayMuxChannel::Data,
-                error: RelayConnectorError::ReceiveFailed,
-            });
-            return false;
-        }
-    };
-    *last_data_activity = Instant::now();
-    match message {
-        Message::Ping(payload) => {
-            let payload_len = payload.len();
-            let write = RelayMuxWrite::Raw {
-                kind: RelayOutKind::Pong,
-                message: Message::Pong(payload),
-                bytes: payload_len,
-            };
-            if !send_relay_mux_write(
-                relay_endpoint,
-                RelayMuxChannel::Data,
-                sender,
-                write,
-                outcome_tx,
-            )
-            .await
-            {
-                return false;
-            };
-            *last_data_activity = Instant::now();
-        }
-        Message::Pong(_) | Message::Frame(_) => {}
-        Message::Close(_) => {
-            let _ = outcome_tx.try_send(RelayMuxWriteOutcome::Failed {
-                channel: RelayMuxChannel::Data,
-                error: RelayConnectorError::ReceiveFailed,
-            });
-            return false;
-        }
-        Message::Text(_) | Message::Binary(_) => {
-            warn!(
-                relay = %relay_endpoint,
-                kind = relay_message_kind(&message),
-                bytes = relay_message_bytes(&message),
-                "relay data mux received unexpected business frame"
-            );
-            let _ = outcome_tx.try_send(RelayMuxWriteOutcome::Failed {
-                channel: RelayMuxChannel::Data,
-                error: RelayConnectorError::InvalidEnvelope,
-            });
-            return false;
-        }
-    }
-    true
 }
 
 fn relay_send_deadline(kind: RelayOutKind) -> Duration {
@@ -2341,12 +2316,28 @@ async fn send_mux_envelopes_logged(
     let envelope_count = envelopes.len();
     let mut bytes = 0_usize;
     let started_at = Instant::now();
-    for envelope in envelopes {
+    for (index, envelope) in envelopes.into_iter().enumerate() {
         let raw = encode_binary_relay_mux_envelope(&envelope)
             .map_err(|_| RelayConnectorError::InvalidEnvelope)?;
+        let frame_bytes = raw.len();
+        let frame_started_at = Instant::now();
         bytes = bytes.saturating_add(raw.len());
         send_relay_message_with_deadline(sender, Message::Binary(raw.into()), RELAY_SEND_DEADLINE)
             .await?;
+        let frame_elapsed = frame_started_at.elapsed();
+        if frame_elapsed >= RELAY_SEND_SLOW_LOG_THRESHOLD
+            || frame_bytes >= RELAY_SEND_INFO_BATCH_BYTES
+        {
+            info!(
+                relay = relay_endpoint,
+                label,
+                envelope_index = index,
+                envelope_count,
+                frame_bytes,
+                elapsed_ms = frame_elapsed.as_millis(),
+                "relay mux websocket frame send pressure"
+            );
+        }
     }
     log_relay_send(
         relay_endpoint,
@@ -2842,7 +2833,7 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     };
     use std::time::Duration;
@@ -2855,6 +2846,10 @@ mod tests {
 
     fn test_protocol(name: &str) -> SharedDaemonProtocol {
         default_protocol(DaemonConfig::default_for_state_path(temp_state_path(name)))
+    }
+
+    fn test_active_clients() -> RelayActiveClients {
+        Arc::new(Mutex::new(HashSet::new()))
     }
 
     #[test]
@@ -2870,12 +2865,12 @@ mod tests {
         queue.enqueue(event);
         queue.enqueue(event);
 
-        assert_eq!(queue.pop_front_for_inflight(), Some(event));
-        assert_eq!(queue.pop_front_for_inflight(), None);
+        assert_eq!(queue.pop_front(), Some(event));
+        assert_eq!(queue.pop_front(), None);
     }
 
     #[test]
-    fn relay_push_queue_requeues_dirty_inflight_once_after_send() {
+    fn relay_push_queue_pop_boundary_allows_new_pending_event() {
         let client_id = RelayClientId(1);
         let session_id = SessionId::new();
         let event = RelayPushEvent::Output {
@@ -2885,40 +2880,37 @@ mod tests {
         let mut queue = RelayPushEventQueue::default();
 
         queue.enqueue(event);
-        assert_eq!(queue.pop_front_for_inflight(), Some(event));
+        assert_eq!(queue.pop_front(), Some(event));
         queue.enqueue(event);
         queue.enqueue(event);
-        queue.finish_inflight_after_send(&[event]);
 
-        assert_eq!(queue.pop_front_for_inflight(), Some(event));
-        assert_eq!(queue.pop_front_for_inflight(), None);
+        // 中文注释：事件被 mux 主循环取出后就离开 pending_set。
+        // 后续 watcher 看到同一 session 有新输出时，可以重新排入 pending。
+        assert_eq!(queue.pop_front(), Some(event));
+        assert_eq!(queue.pop_front(), None);
     }
 
     #[test]
-    fn relay_push_wakeup_peeks_without_draining_after_writer_outcome() {
+    fn relay_push_wakeup_schedules_pending_without_draining() {
         let event = RelayPushEvent::Output {
             client_id: RelayClientId(1),
             session_id: SessionId::new(),
         };
         let mut queue = RelayPushEventQueue::default();
-        let (tx, mut rx) = mpsc::channel(1);
         let mut wake_pending = false;
 
         queue.enqueue(event);
-        assert_eq!(queue.pop_front_for_inflight(), Some(event));
-        queue.enqueue(event);
-        queue.finish_inflight_after_send(&[event]);
-        queue_relay_push_drain_wakeup(&queue, &tx, &mut wake_pending);
+        queue_relay_push_drain_wakeup(&queue, &mut wake_pending);
+        queue_relay_push_drain_wakeup(&queue, &mut wake_pending);
 
-        // 中文注释：relay writer outcome 只投递一次普通 push 事件；不能同步继续
-        // drain，否则 output writer 会形成自激循环，把 control 入站帧压在后面。
-        assert_eq!(queue.peek_front(), Some(event));
-        assert_eq!(rx.try_recv(), Ok(event));
+        // 中文注释：唤醒只是把 pending 事件交回 mux 主循环调度，不能同步 drain。
+        // 真正的输出责任边界是拿写锁后直接写入 relay WebSocket。
+        assert!(queue.has_pending());
         assert!(wake_pending);
     }
 
     #[test]
-    fn relay_push_queue_peek_front_does_not_dequeue() {
+    fn relay_push_queue_has_pending_does_not_dequeue() {
         let event = RelayPushEvent::Output {
             client_id: RelayClientId(1),
             session_id: SessionId::new(),
@@ -2927,8 +2919,8 @@ mod tests {
 
         queue.enqueue(event);
 
-        assert_eq!(queue.peek_front(), Some(event));
-        assert_eq!(queue.pop_front_for_inflight(), Some(event));
+        assert!(queue.has_pending());
+        assert_eq!(queue.pop_front(), Some(event));
     }
 
     #[test]
@@ -2941,7 +2933,7 @@ mod tests {
         ));
         assert!(relay_push_drain_budget_exhausted(
             1,
-            RELAY_PUSH_DRAIN_MAX_ENQUEUED_BYTES_PER_TICK,
+            RELAY_PUSH_DRAIN_MAX_TRANSPORTED_BYTES_PER_TICK,
             Instant::now()
         ));
         assert!(relay_push_drain_budget_exhausted(
@@ -2959,15 +2951,29 @@ mod tests {
         };
         let mut queue = RelayPushEventQueue::default();
         queue.enqueue(event);
-        let (tx, mut rx) = mpsc::channel(2);
         let mut pending = false;
 
-        queue_relay_push_drain_wakeup(&queue, &tx, &mut pending);
-        queue_relay_push_drain_wakeup(&queue, &tx, &mut pending);
+        queue_relay_push_drain_wakeup(&queue, &mut pending);
+        queue_relay_push_drain_wakeup(&queue, &mut pending);
 
         assert!(pending);
-        assert_eq!(rx.try_recv().unwrap(), event);
-        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn relay_push_drain_wakeup_is_independent_from_external_queue() {
+        let pending_event = RelayPushEvent::Output {
+            client_id: RelayClientId(2),
+            session_id: SessionId::new(),
+        };
+        let mut queue = RelayPushEventQueue::default();
+        let mut pending = false;
+
+        queue.enqueue(pending_event);
+        queue_relay_push_drain_wakeup(&queue, &mut pending);
+
+        // 中文注释：内部 deferred output 不能依赖同一个有界 watcher 队列自唤醒。
+        // 否则外部 watcher 承压时，snapshot/tail 可能停在 daemon mux 内。
+        assert!(pending);
     }
 
     #[test]
@@ -2982,62 +2988,150 @@ mod tests {
         assert!(relay_mux_envelopes_wire_len(&[envelope]) > 0);
     }
 
-    #[test]
-    fn relay_mux_client_frame_queue_preserves_e2ee_sequence_order_across_kinds() {
-        let client_id = RelayClientId(7);
-        let (control_tx, mut control_rx) = mpsc::channel(4);
-        let (client_tx, mut client_rx) = mpsc::channel(4);
-        let seq3 = RelayMuxEnvelope::DaemonFrame {
-            client_id,
-            frame: RelayOpaqueFrame::Binary {
-                data_base64: "Aw==".to_owned(),
-            },
-        };
-        let seq4 = RelayMuxEnvelope::DaemonFrame {
-            client_id,
-            frame: RelayOpaqueFrame::Binary {
-                data_base64: "BA==".to_owned(),
-            },
-        };
+    #[tokio::test(flavor = "multi_thread")]
+    async fn relay_mux_direct_sender_streams_frames_without_queue() {
+        let expected_frames = 300_usize;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (seen_tx, mut seen_rx) = mpsc::channel(expected_frames);
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut seen = 0_usize;
+            while let Some(message) = socket.next().await {
+                let Ok(message) = message else {
+                    break;
+                };
+                match message {
+                    Message::Text(_) | Message::Binary(_) => {
+                        seen = seen.saturating_add(1);
+                        if seen_tx.send(seen).await.is_err() {
+                            break;
+                        }
+                    }
+                    Message::Ping(payload) => {
+                        socket.send(Message::Pong(payload)).await.unwrap();
+                    }
+                    Message::Pong(_) | Message::Frame(_) => {}
+                    Message::Close(_) => break,
+                }
+            }
+        });
 
-        client_tx
-            .try_send(RelayMuxWrite::Envelopes {
-                kind: RelayOutKind::PushOutput,
-                envelopes: vec![seq3.clone()],
-                push_events: Vec::new(),
-            })
+        let (socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
             .unwrap();
-        enqueue_relay_mux_response(
-            &control_tx,
-            &client_tx,
-            RelayOutKind::Response,
-            vec![seq4.clone()],
-        )
-        .unwrap();
+        let (sender, _) = socket.split();
+        let sender = Arc::new(AsyncMutex::new(sender));
+        for index in 0..expected_frames {
+            let raw = format!("frame-{index}");
+            send_relay_control_message_locked(
+                &sender,
+                RelayOutKind::Response,
+                Message::Text(raw.into()),
+            )
+            .await
+            .unwrap();
+        }
 
-        // 中文注释：同一 client 的 DaemonFrame 承载同一条 E2EE sequence。
-        // output 和 response 必须在 relay data 队列里保持加密后的 FIFO 顺序。
-        assert!(control_rx.try_recv().is_err());
-        let first = client_rx.try_recv().unwrap();
-        let second = client_rx.try_recv().unwrap();
-        match first {
-            RelayMuxWrite::Envelopes {
-                kind, envelopes, ..
-            } => {
-                assert_eq!(kind, RelayOutKind::PushOutput);
-                assert_eq!(envelopes, vec![seq3]);
+        // 中文注释：这里没有 daemon->relay 写队列。
+        // 发送方拿同一个写锁后直接写 relay WebSocket，成功返回即代表已经交给 socket。
+        let reached = timeout(Duration::from_secs(2), async {
+            let mut last_seen = 0_usize;
+            while let Some(seen) = seen_rx.recv().await {
+                last_seen = seen;
+                if seen >= expected_frames {
+                    return seen;
+                }
             }
-            other => panic!("expected first client frame batch, got {other:?}"),
-        }
-        match second {
-            RelayMuxWrite::Envelopes {
-                kind, envelopes, ..
-            } => {
-                assert_eq!(kind, RelayOutKind::Response);
-                assert_eq!(envelopes, vec![seq4]);
+            last_seen
+        })
+        .await
+        .expect("relay mux direct sender should keep writing without queue");
+        assert_eq!(reached, expected_frames);
+
+        server_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn relay_mux_direct_sender_uses_lock_and_drops_inactive_client() {
+        let client_id = RelayClientId(701);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (seen_tx, mut seen_rx) = mpsc::channel(2);
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while let Some(message) = socket.next().await {
+                let Ok(Message::Binary(raw)) = message else {
+                    continue;
+                };
+                let envelope = decode_binary_relay_mux_envelope(&raw).unwrap();
+                let RelayMuxEnvelope::DaemonFrame { client_id, .. } = envelope else {
+                    continue;
+                };
+                if seen_tx.send(client_id).await.is_err() {
+                    break;
+                }
             }
-            other => panic!("expected second client frame batch, got {other:?}"),
-        }
+        });
+
+        let (socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .unwrap();
+        let (sender, _) = socket.split();
+        let sender = Arc::new(AsyncMutex::new(sender));
+        let active_clients = test_active_clients();
+        mark_relay_client_active(&active_clients, client_id);
+        let sent = send_relay_mux_envelopes_locked(
+            "ws://relay-direct-lock-test/ws",
+            &sender,
+            &active_clients,
+            Some(client_id),
+            RelayOutKind::Response,
+            vec![RelayMuxEnvelope::DaemonFrame {
+                client_id,
+                frame: RelayOpaqueFrame::Binary {
+                    data_base64: "AQ==".to_owned(),
+                },
+            }],
+        )
+        .await
+        .unwrap();
+        assert!(sent > 0);
+
+        assert_eq!(
+            timeout(Duration::from_secs(1), seen_rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            client_id
+        );
+
+        mark_relay_client_inactive(&active_clients, client_id);
+        let dropped = send_relay_mux_envelopes_locked(
+            "ws://relay-direct-lock-test/ws",
+            &sender,
+            &active_clients,
+            Some(client_id),
+            RelayOutKind::PushOutput,
+            vec![RelayMuxEnvelope::DaemonFrame {
+                client_id,
+                frame: RelayOpaqueFrame::Binary {
+                    data_base64: "Ag==".to_owned(),
+                },
+            }],
+        )
+        .await
+        .unwrap();
+        assert_eq!(dropped, 0);
+        assert!(
+            timeout(Duration::from_millis(100), seen_rx.recv())
+                .await
+                .is_err()
+        );
+
+        server_task.abort();
     }
 
     fn temp_state_path(name: &str) -> PathBuf {
@@ -3237,9 +3331,34 @@ mod tests {
     fn relay_daemon_mux_uses_websocket_ping_without_pong_deadline() {
         assert_eq!(
             RelayReconnectPolicy::default().heartbeat_interval(),
-            Duration::from_secs(5)
+            Duration::from_secs(10)
         );
         assert!(relay_daemon_mux_idle_ping_enabled());
+    }
+
+    #[test]
+    fn relay_idle_ping_requires_full_outbound_idle_interval() {
+        let start = Instant::now();
+        let heartbeat_interval = Duration::from_millis(10);
+
+        assert!(!relay_idle_ping_due(
+            start + Duration::from_millis(9),
+            start,
+            start,
+            heartbeat_interval
+        ));
+        assert!(relay_idle_ping_due(
+            start + heartbeat_interval,
+            start,
+            start,
+            heartbeat_interval
+        ));
+        assert!(!relay_idle_ping_due(
+            start + Duration::from_millis(20),
+            start + Duration::from_millis(15),
+            start,
+            heartbeat_interval
+        ));
     }
 
     #[test]
@@ -3276,7 +3395,7 @@ mod tests {
 
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                if state.attempts.load(Ordering::SeqCst) >= 3 {
+                if state.attempts.load(Ordering::SeqCst) >= 2 {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -3292,8 +3411,8 @@ mod tests {
         );
         assert_eq!(
             state.attempts.load(Ordering::SeqCst),
-            3,
-            "首个 control socket 故意失败后，稳定连接应只包含 control/data 两条 WebSocket"
+            2,
+            "首个连接故意失败后，稳定连接应只重拨一次并保持单条 daemon mux"
         );
 
         connector.abort();
@@ -3333,7 +3452,7 @@ mod tests {
         let server_id = protocol.lock().await.server_id();
 
         let server = tokio::spawn(async move {
-            let (mut socket, _data_socket) = accept_relay_mux_pair(&listener, server_id).await;
+            let mut socket = accept_relay_mux_pair(&listener, server_id).await;
 
             socket.send(Message::Ping(vec![1, 2, 3])).await.unwrap();
             let pong = tokio::time::timeout(Duration::from_secs(1), async {
@@ -3397,10 +3516,7 @@ mod tests {
             let Some(route_hello) = read_axum_route_hello(&mut socket).await else {
                 return;
             };
-            if !matches!(
-                route_hello.role,
-                RouteRole::DaemonMux | RouteRole::DaemonMuxData
-            ) {
+            if !matches!(route_hello.role, RouteRole::DaemonMux) {
                 return;
             }
             let route_ready = Envelope::new(
@@ -3491,11 +3607,13 @@ mod tests {
     async fn mux_keepalive_is_ignored_by_daemon_connector() {
         let protocol = test_protocol("mux-keepalive-ignore");
         let mut connections = HashMap::new();
+        let active_clients = test_active_clients();
 
         let keepalive = handle_mux_envelope(
             RelayMuxEnvelope::Keepalive { nonce: 42 },
             &protocol,
             &mut connections,
+            &active_clients,
         )
         .await
         .unwrap();
@@ -3503,6 +3621,7 @@ mod tests {
             RelayMuxEnvelope::KeepaliveAck { nonce: 42 },
             &protocol,
             &mut connections,
+            &active_clients,
         )
         .await
         .unwrap();
@@ -3516,11 +3635,13 @@ mod tests {
         let protocol = test_protocol("mux-pairing");
         let client_id = RelayClientId(42);
         let mut connections = HashMap::new();
+        let active_clients = test_active_clients();
 
         let initial = handle_mux_envelope(
             RelayMuxEnvelope::ClientConnected { client_id },
             &protocol,
             &mut connections,
+            &active_clients,
         )
         .await
         .unwrap();
@@ -3575,6 +3696,7 @@ mod tests {
             },
             &protocol,
             &mut connections,
+            &active_clients,
         )
         .await
         .unwrap();
@@ -3603,6 +3725,7 @@ mod tests {
             },
             &protocol,
             &mut connections,
+            &active_clients,
         )
         .await
         .unwrap();
@@ -3623,6 +3746,7 @@ mod tests {
         let bad_client_id = RelayClientId(1);
         let good_client_id = RelayClientId(2);
         let mut connections = HashMap::new();
+        let active_clients = test_active_clients();
 
         handle_mux_envelope(
             RelayMuxEnvelope::ClientConnected {
@@ -3630,6 +3754,7 @@ mod tests {
             },
             &protocol,
             &mut connections,
+            &active_clients,
         )
         .await
         .unwrap();
@@ -3642,6 +3767,7 @@ mod tests {
             },
             &protocol,
             &mut connections,
+            &active_clients,
         )
         .await;
 
@@ -3654,6 +3780,7 @@ mod tests {
             },
             &protocol,
             &mut connections,
+            &active_clients,
         )
         .await
         .unwrap();
@@ -3679,6 +3806,7 @@ mod tests {
             good_client_id,
             server_key_exchange,
             token,
+            &active_clients,
         )
         .await;
 
@@ -3701,8 +3829,7 @@ mod tests {
         ));
         let client_id = RelayClientId(77);
         let expected_server_id = protocol.lock().await.server_id();
-        let (mut relay_socket, mut data_socket) =
-            accept_relay_mux_pair(&listener, expected_server_id).await;
+        let mut relay_socket = accept_relay_mux_pair(&listener, expected_server_id).await;
 
         send_mux_to_connector(
             &mut relay_socket,
@@ -3778,7 +3905,7 @@ mod tests {
         )
         .await;
         let pair_accept =
-            read_encrypted_daemon_frame(&mut data_socket, client_id, &mut device_e2ee).await;
+            read_encrypted_daemon_frame(&mut relay_socket, client_id, &mut device_e2ee).await;
         assert_eq!(pair_accept.kind, MessageType::PairAccept);
 
         send_encrypted_mux_client_json(
@@ -3800,7 +3927,7 @@ mod tests {
         )
         .await;
         let created =
-            read_encrypted_daemon_frame(&mut data_socket, client_id, &mut device_e2ee).await;
+            read_encrypted_daemon_frame(&mut relay_socket, client_id, &mut device_e2ee).await;
         assert_eq!(created.kind, MessageType::SessionCreated);
         let created_payload: termd_proto::SessionCreatedPayload =
             decode_payload(created.payload).unwrap();
@@ -3808,7 +3935,7 @@ mod tests {
         // relay client 不再发送 ping 或任何业务帧；daemon mux 必须像直连 WebSocket 一样主动推送。
         let pushed = tokio::time::timeout(
             Duration::from_secs(2),
-            read_encrypted_daemon_frame(&mut data_socket, client_id, &mut device_e2ee),
+            read_encrypted_daemon_frame(&mut relay_socket, client_id, &mut device_e2ee),
         )
         .await
         .expect("relay mux should push PTY output without client polling");
@@ -3839,8 +3966,7 @@ mod tests {
         let slow_client_id = RelayClientId(701);
         let fresh_client_id = RelayClientId(702);
         let expected_server_id = protocol.lock().await.server_id();
-        let (mut relay_socket, mut data_socket) =
-            accept_relay_mux_pair(&listener, expected_server_id).await;
+        let mut relay_socket = accept_relay_mux_pair(&listener, expected_server_id).await;
 
         send_mux_to_connector(
             &mut relay_socket,
@@ -3891,7 +4017,7 @@ mod tests {
         )
         .await;
         let pair_accept =
-            read_encrypted_daemon_frame(&mut data_socket, slow_client_id, &mut slow_e2ee).await;
+            read_encrypted_daemon_frame(&mut relay_socket, slow_client_id, &mut slow_e2ee).await;
         assert_eq!(pair_accept.kind, MessageType::PairAccept);
 
         send_encrypted_mux_client_json(
@@ -3913,13 +4039,13 @@ mod tests {
         )
         .await;
         let created =
-            read_encrypted_daemon_frame(&mut data_socket, slow_client_id, &mut slow_e2ee).await;
+            read_encrypted_daemon_frame(&mut relay_socket, slow_client_id, &mut slow_e2ee).await;
         assert_eq!(created.kind, MessageType::SessionCreated);
 
         // 先读到第一批 output，证明 slow client 已经触发大量推送；随后故意不再
         // 消费它的剩余 output，模拟公网 relay/web 侧慢写。
         let first_output =
-            read_encrypted_daemon_frame(&mut data_socket, slow_client_id, &mut slow_e2ee).await;
+            read_encrypted_daemon_frame(&mut relay_socket, slow_client_id, &mut slow_e2ee).await;
         assert_eq!(first_output.kind, MessageType::SessionData);
 
         send_mux_to_connector(
@@ -3949,6 +4075,30 @@ mod tests {
         .await
         .expect("新 client 的 hello 不能被旧 client 的 terminal output 卡住");
         assert_eq!(fresh_hello.kind, MessageType::Hello);
+        let fresh_key_exchange =
+            read_daemon_frame_for_connector(&mut relay_socket, fresh_client_id).await;
+        assert_eq!(fresh_key_exchange.kind, MessageType::E2eeKeyExchange);
+        let fresh_server_key_exchange: termd_proto::E2eeKeyExchangePayload =
+            decode_payload(fresh_key_exchange.payload).unwrap();
+        let mut fresh_e2ee = open_mux_e2ee_for_device(
+            &mut relay_socket,
+            fresh_client_id,
+            slow_device_id,
+            fresh_server_key_exchange,
+            "relay-backpressure-fresh-e2ee-nonce",
+        )
+        .await;
+        let auth_challenge = tokio::time::timeout(
+            Duration::from_secs(1),
+            read_encrypted_daemon_frame_for_connector(
+                &mut relay_socket,
+                fresh_client_id,
+                &mut fresh_e2ee,
+            ),
+        )
+        .await
+        .expect("新 client 的 auth.challenge 不能被旧 client 的 terminal output 卡住");
+        assert_eq!(auth_challenge.kind, MessageType::AuthChallenge);
 
         connector.abort();
     }
@@ -3980,8 +4130,7 @@ mod tests {
         ));
         let client_id = RelayClientId(78);
         let expected_server_id = protocol.lock().await.server_id();
-        let (mut relay_socket, mut data_socket) =
-            accept_relay_mux_pair(&listener, expected_server_id).await;
+        let mut relay_socket = accept_relay_mux_pair(&listener, expected_server_id).await;
 
         send_mux_to_connector(
             &mut relay_socket,
@@ -4031,7 +4180,7 @@ mod tests {
         )
         .await;
         let pair_accept =
-            read_encrypted_daemon_frame(&mut data_socket, client_id, &mut device_e2ee).await;
+            read_encrypted_daemon_frame(&mut relay_socket, client_id, &mut device_e2ee).await;
         assert_eq!(pair_accept.kind, MessageType::PairAccept);
 
         send_encrypted_mux_client_json(
@@ -4049,7 +4198,7 @@ mod tests {
         )
         .await;
         let created =
-            read_encrypted_daemon_frame(&mut data_socket, client_id, &mut device_e2ee).await;
+            read_encrypted_daemon_frame(&mut relay_socket, client_id, &mut device_e2ee).await;
         assert_eq!(created.kind, MessageType::SessionCreated);
         let created_payload: termd_proto::SessionCreatedPayload =
             decode_payload(created.payload).unwrap();
@@ -4069,7 +4218,7 @@ mod tests {
         )
         .await;
         let initial_files =
-            read_encrypted_daemon_frame(&mut data_socket, client_id, &mut device_e2ee).await;
+            read_encrypted_daemon_frame(&mut relay_socket, client_id, &mut device_e2ee).await;
         assert_eq!(initial_files.kind, MessageType::SessionFilesResult);
 
         let mut direct_protocol = protocol.lock().await;
@@ -4180,7 +4329,7 @@ mod tests {
         let pushed = tokio::time::timeout(
             Duration::from_secs(2),
             read_session_files_result_with_path(
-                &mut data_socket,
+                &mut relay_socket,
                 client_id,
                 &mut device_e2ee,
                 &file_root.to_string_lossy(),
@@ -4201,6 +4350,7 @@ mod tests {
         client_id: RelayClientId,
         server_key_exchange: termd_proto::E2eeKeyExchangePayload,
         token: String,
+        active_clients: &RelayActiveClients,
     ) -> JsonEnvelope {
         let device_id = termd_proto::DeviceId::new();
         let device_keypair = E2eeKeyPair::generate();
@@ -4237,6 +4387,7 @@ mod tests {
             },
             protocol,
             connections,
+            active_clients,
         )
         .await
         .unwrap();
@@ -4265,6 +4416,7 @@ mod tests {
             },
             protocol,
             connections,
+            active_clients,
         )
         .await
         .unwrap();
@@ -4291,10 +4443,7 @@ mod tests {
     async fn accept_relay_mux_pair(
         listener: &tokio::net::TcpListener,
         expected_server_id: ServerId,
-    ) -> (
-        tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
-        tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
-    ) {
+    ) -> tokio_tungstenite::WebSocketStream<tokio::net::TcpStream> {
         let (control_tcp, _) = listener.accept().await.unwrap();
         let mut control_socket = tokio_tungstenite::accept_async(control_tcp).await.unwrap();
         complete_relay_route_prelude(
@@ -4303,17 +4452,7 @@ mod tests {
             RouteRole::DaemonMux,
         )
         .await;
-
-        let (data_tcp, _) = listener.accept().await.unwrap();
-        let mut data_socket = tokio_tungstenite::accept_async(data_tcp).await.unwrap();
-        complete_relay_route_prelude(
-            &mut data_socket,
-            expected_server_id,
-            RouteRole::DaemonMuxData,
-        )
-        .await;
-
-        (control_socket, data_socket)
+        control_socket
     }
 
     async fn complete_relay_route_prelude(
@@ -4426,6 +4565,18 @@ mod tests {
         nonce: &str,
     ) -> (termd_proto::DeviceId, E2eeSession) {
         let device_id = termd_proto::DeviceId::new();
+        let device_e2ee =
+            open_mux_e2ee_for_device(socket, client_id, device_id, daemon_exchange, nonce).await;
+        (device_id, device_e2ee)
+    }
+
+    async fn open_mux_e2ee_for_device(
+        socket: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+        client_id: RelayClientId,
+        device_id: termd_proto::DeviceId,
+        daemon_exchange: termd_proto::E2eeKeyExchangePayload,
+        nonce: &str,
+    ) -> E2eeSession {
         let device_keypair = E2eeKeyPair::generate();
         let server_e2ee_key =
             crate::net::E2eePeerPublicKey::try_from(&daemon_exchange.public_key).unwrap();
@@ -4460,7 +4611,7 @@ mod tests {
         )
         .await;
 
-        (device_id, device_e2ee)
+        device_e2ee
     }
 
     async fn read_mux_from_connector(
@@ -4493,12 +4644,41 @@ mod tests {
         json_envelope_from_mux_frame(frame).unwrap()
     }
 
+    async fn read_daemon_frame_for_connector(
+        socket: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+        expected_client_id: RelayClientId,
+    ) -> JsonEnvelope {
+        loop {
+            let RelayMuxEnvelope::DaemonFrame { client_id, frame } =
+                read_mux_from_connector(socket).await
+            else {
+                continue;
+            };
+            if client_id != expected_client_id {
+                // 中文注释：backpressure 测试允许旧 client 的 output 和新 client 握手帧交错；
+                // 只要新 client 能在时限内出现，就证明 relay 没被旧输出卡死。
+                continue;
+            }
+            return json_envelope_from_mux_frame(frame).unwrap();
+        }
+    }
+
     async fn read_encrypted_daemon_frame(
         socket: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
         expected_client_id: RelayClientId,
         device_e2ee: &mut E2eeSession,
     ) -> JsonEnvelope {
         let outer = read_daemon_frame_from_connector(socket, expected_client_id).await;
+        let frame = encrypted_frame_from_envelope(outer).unwrap();
+        device_e2ee.decrypt_json_payload(&frame).unwrap()
+    }
+
+    async fn read_encrypted_daemon_frame_for_connector(
+        socket: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+        expected_client_id: RelayClientId,
+        device_e2ee: &mut E2eeSession,
+    ) -> JsonEnvelope {
+        let outer = read_daemon_frame_for_connector(socket, expected_client_id).await;
         let frame = encrypted_frame_from_envelope(outer).unwrap();
         device_e2ee.decrypt_json_payload(&frame).unwrap()
     }

@@ -959,7 +959,7 @@ struct SupervisorShared {
 
 struct SupervisorState {
     next_controller_id: u64,
-    controller: Option<ControllerHandle>,
+    controllers: HashMap<u64, ControllerHandle>,
     retained_output: VecDeque<u8>,
     terminal: SupervisorTerminalCache,
 }
@@ -1306,7 +1306,7 @@ impl SupervisorState {
     fn new(size: PtySize) -> Self {
         Self {
             next_controller_id: 1,
-            controller: None,
+            controllers: HashMap::new(),
             retained_output: VecDeque::new(),
             terminal: SupervisorTerminalCache::new(size),
         }
@@ -1348,10 +1348,8 @@ impl SupervisorState {
     ) -> (u64, SupervisorAttachSyncPayload) {
         let id = self.next_controller_id;
         self.next_controller_id = self.next_controller_id.saturating_add(1);
-        self.controller = Some(ControllerHandle {
-            id,
-            tx: controller_tx,
-        });
+        self.controllers
+            .insert(id, ControllerHandle { tx: controller_tx });
         let snapshot = SupervisorSnapshotPayload {
             size: self.size(),
             process_id,
@@ -1366,6 +1364,35 @@ impl SupervisorState {
                 frames,
             },
         )
+    }
+
+    fn has_controller(&self, controller_id: u64) -> bool {
+        self.controllers.contains_key(&controller_id)
+    }
+
+    fn remove_controller(&mut self, controller_id: u64) {
+        self.controllers.remove(&controller_id);
+    }
+
+    fn broadcast_terminal_frame(&mut self, frame: PtyTerminalFrame) {
+        let mut closed = Vec::new();
+        for (id, controller) in &self.controllers {
+            if controller
+                .tx
+                .send(SupervisorFrame::TerminalFrame {
+                    frame: frame.clone(),
+                })
+                .is_err()
+            {
+                closed.push(*id);
+            }
+        }
+
+        // 中文注释：发送失败代表对应 daemon IPC 已经断开，立即清理，避免后续广播继续
+        // 在无效 receiver 上做无意义工作。
+        for id in closed {
+            self.controllers.remove(&id);
+        }
     }
 }
 
@@ -1385,7 +1412,6 @@ impl SupervisorTerminalCache {
 
 #[derive(Clone)]
 struct ControllerHandle {
-    id: u64,
     tx: tokio_mpsc::UnboundedSender<SupervisorFrame>,
 }
 
@@ -1584,13 +1610,10 @@ async fn handle_supervisor_connection(
                     SupervisorRequest::Resize { size } => {
                         ensure_current_controller(&shared, controller_id).await?;
                         shared.session.lock().await.resize(size)?;
-                        let (frame, controller) = {
+                        {
                             let mut state = shared.state.lock().await;
                             let frame = state.resize(size);
-                            (frame, state.controller.clone())
-                        };
-                        if let Some(controller) = controller {
-                            let _ = controller.tx.send(SupervisorFrame::TerminalFrame { frame });
+                            state.broadcast_terminal_frame(frame);
                         }
                         SupervisorResponse::ok(SupervisorResponsePayload::Empty)
                     }
@@ -1677,9 +1700,7 @@ async fn handle_supervisor_connection(
     writer_task.abort();
     if let Some(id) = controller_id {
         let mut state = shared.state.lock().await;
-        if state.controller.as_ref().map(|controller| controller.id) == Some(id) {
-            state.controller = None;
-        }
+        state.remove_controller(id);
     }
 
     result
@@ -1747,9 +1768,9 @@ async fn ensure_current_controller(
         ));
     };
     let state = shared.state.lock().await;
-    if state.controller.as_ref().map(|controller| controller.id) != Some(controller_id) {
+    if !state.has_controller(controller_id) {
         return Err(PtyError::Backend(
-            "session supervisor controller was replaced".to_owned(),
+            "session supervisor connection is no longer attached".to_owned(),
         ));
     }
     Ok(())
@@ -1760,7 +1781,7 @@ async fn is_current_controller(shared: &SupervisorShared, controller_id: Option<
         return false;
     };
     let state = shared.state.lock().await;
-    state.controller.as_ref().map(|controller| controller.id) == Some(controller_id)
+    state.has_controller(controller_id)
 }
 
 fn drain_controller_frames_after_sync(
@@ -1828,15 +1849,7 @@ async fn drain_supervisor_output(shared: &SupervisorShared) -> bool {
         bytes = bytes.saturating_add(read);
         let mut state = shared.state.lock().await;
         let frame = state.record_output(&buffer);
-        if let Some(controller) = state.controller.clone() {
-            if controller
-                .tx
-                .send(SupervisorFrame::TerminalFrame { frame })
-                .is_err()
-            {
-                state.controller = None;
-            }
-        }
+        state.broadcast_terminal_frame(frame);
     }
 }
 
@@ -1858,9 +1871,7 @@ async fn supervisor_exit_watcher(shared: SupervisorShared) {
         };
         let mut state = shared.state.lock().await;
         let frame = state.record_exit(code);
-        if let Some(controller) = state.controller.clone() {
-            let _ = controller.tx.send(SupervisorFrame::TerminalFrame { frame });
-        }
+        state.broadcast_terminal_frame(frame);
         return;
     }
 }
@@ -2343,12 +2354,7 @@ mod tests {
         ));
 
         let frame = state.record_output(b"after\n");
-        if let Some(controller) = state.controller.clone() {
-            controller
-                .tx
-                .send(SupervisorFrame::TerminalFrame { frame })
-                .expect("new controller should receive live output");
-        }
+        state.broadcast_terminal_frame(frame);
         assert!(matches!(
             controller_rx
                 .try_recv()
@@ -2405,7 +2411,7 @@ mod tests {
     }
 
     #[test]
-    fn attach_sync_replaces_old_controller_and_invalidates_old_controller_id() {
+    fn attach_sync_keeps_multiple_controllers_and_broadcasts_live_output() {
         let mut state = SupervisorState::new(PtySize::new(4, 40));
         let (old_tx, mut old_rx) = tokio_mpsc::unbounded_channel();
         let (old_id, _old_sync) = state.attach_sync(old_tx, Some(42), None);
@@ -2413,31 +2419,23 @@ mod tests {
         let (new_id, _new_sync) = state.attach_sync(new_tx, Some(42), Some(0));
 
         assert_ne!(old_id, new_id);
-        assert_eq!(
-            state.controller.as_ref().map(|controller| controller.id),
-            Some(new_id)
-        );
+        assert_eq!(state.controllers.len(), 2);
 
-        let frame = state.record_output(b"new-controller-only\n");
-        if let Some(controller) = state.controller.clone() {
-            controller
-                .tx
-                .send(SupervisorFrame::TerminalFrame { frame })
-                .expect("new controller should receive live output");
-        }
+        let frame = state.record_output(b"shared-live-output\n");
+        state.broadcast_terminal_frame(frame);
 
         assert!(
-            old_rx.try_recv().is_err(),
-            "old controller must not receive live frames after replacement"
+            old_rx.try_recv().is_ok(),
+            "old controller should keep receiving live frames after another attach"
         );
         assert!(
             new_rx.try_recv().is_ok(),
-            "new controller should receive live frames after replacement"
+            "new controller should receive live frames after attach"
         );
     }
 
     #[tokio::test]
-    async fn attach_sync_rejects_requests_from_replaced_controller_id() {
+    async fn attach_sync_allows_requests_from_multiple_attached_controller_ids() {
         let mut state = SupervisorState::new(PtySize::new(4, 40));
         let (old_tx, _old_rx) = tokio_mpsc::unbounded_channel();
         let (old_id, _old_sync) = state.attach_sync(old_tx, Some(42), None);
@@ -2450,12 +2448,9 @@ mod tests {
             shutdown_tx,
         };
 
-        assert!(
-            ensure_current_controller(&shared, Some(old_id))
-                .await
-                .is_err(),
-            "old controller id must not be allowed to input or resize after replacement"
-        );
+        ensure_current_controller(&shared, Some(old_id))
+            .await
+            .expect("old controller id should remain valid after another attach");
         ensure_current_controller(&shared, Some(new_id))
             .await
             .expect("new controller id should remain valid");
@@ -2539,8 +2534,10 @@ mod tests {
             .state
             .lock()
             .await
-            .controller
-            .clone()
+            .controllers
+            .values()
+            .next()
+            .cloned()
             .expect("attach should install controller");
         for seq in 1..=128_u64 {
             controller

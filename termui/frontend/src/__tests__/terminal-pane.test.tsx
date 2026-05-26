@@ -28,7 +28,6 @@ function renderMobileTerminalPane(onInput = vi.fn()) {
       attached
       sessionSize={{ rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 }}
       mobileInputMode
-      resizeEnabled
       outputResetVersion={0}
       takeOutput={takeOutput}
       registerOutputDrain={registerOutputDrain}
@@ -38,12 +37,12 @@ function renderMobileTerminalPane(onInput = vi.fn()) {
     />,
   );
   return {
-    frame: screen.getByTestId("terminal-pane").querySelector<HTMLElement>(".terminal-viewer-frame")!,
+    frame: screen.getByTestId("terminal-pane").querySelector<HTMLElement>(".terminal-frame")!,
     onInput,
   };
 }
 
-function mockTerminalViewerLayout(input: { viewportWidth: number; viewportHeight: number }) {
+function mockTerminalLayout(input: { viewportWidth: number; viewportHeight: number }) {
   let viewportHeight = input.viewportHeight;
   const clientWidthSpy = vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockImplementation(function (this: HTMLElement) {
     return this.classList.contains("terminal-scrollport") ? input.viewportWidth : 0;
@@ -52,14 +51,14 @@ function mockTerminalViewerLayout(input: { viewportWidth: number; viewportHeight
     return this.classList.contains("terminal-scrollport") ? viewportHeight : 0;
   });
   const offsetWidthSpy = vi.spyOn(HTMLElement.prototype, "offsetWidth", "get").mockImplementation(function (this: HTMLElement) {
-    return this.classList.contains("terminal-viewer-frame") ? Number.parseFloat(this.style.width || "0") : 0;
+    return this.classList.contains("terminal-frame") ? Number.parseFloat(this.style.width || "0") : 0;
   });
   const offsetHeightSpy = vi.spyOn(HTMLElement.prototype, "offsetHeight", "get").mockImplementation(function (this: HTMLElement) {
-    return this.classList.contains("terminal-viewer-frame") ? Number.parseFloat(this.style.height || "0") : 0;
+    return this.classList.contains("terminal-frame") ? Number.parseFloat(this.style.height || "0") : 0;
   });
   const scrollHeightSpy = vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockImplementation(function (this: HTMLElement) {
     return this.classList.contains("terminal-scrollport")
-      ? Math.max(viewportHeight, Number.parseFloat(this.querySelector<HTMLElement>(".terminal-viewer-frame")?.style.height || "0"))
+      ? Math.max(viewportHeight, Number.parseFloat(this.querySelector<HTMLElement>(".terminal-frame")?.style.height || "0"))
       : 0;
   });
 
@@ -77,7 +76,7 @@ function mockTerminalViewerLayout(input: { viewportWidth: number; viewportHeight
   };
 }
 
-function viewerScaleFromHost(): number {
+function terminalHostScale(): number {
   const host = screen.getByTestId("terminal-pane").querySelector<HTMLElement>(".terminal-host");
   expect(host).not.toBeNull();
   const match = /scale\(([^)]+)\)/.exec(host!.style.transform);
@@ -110,7 +109,6 @@ function renderTerminalPaneWithOutput(items: TerminalOutputItem[], options: {
     <TerminalPane
       attached
       sessionSize={{ rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 }}
-      resizeEnabled
       outputResetVersion={0}
       takeOutput={takeOutput}
       registerOutputDrain={registerOutputDrain}
@@ -205,7 +203,6 @@ describe("TerminalPane terminal sequence rendering", () => {
         <TerminalPane
           attached
           sessionSize={{ rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 }}
-          resizeEnabled
           outputResetVersion={0}
           takeOutput={takeOutput}
           registerOutputDrain={registerOutputDrain}
@@ -230,7 +227,6 @@ describe("TerminalPane terminal sequence rendering", () => {
         <TerminalPane
           attached
           sessionSize={{ rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 }}
-          resizeEnabled
           outputResetVersion={1}
           takeOutput={takeOutput}
           registerOutputDrain={registerOutputDrain}
@@ -360,9 +356,9 @@ describe("TerminalPane mobile direction gesture", () => {
   });
 });
 
-describe("TerminalPane mobile viewer layout", () => {
-  it("移动端 viewer 模式在软键盘打开后按新的可视高度重新缩放并贴底", async () => {
-    const layout = mockTerminalViewerLayout({ viewportWidth: 390, viewportHeight: 420 });
+describe("TerminalPane terminal sizing", () => {
+  it("分辨率不一致时也不显示缩放工具", async () => {
+    const layout = mockTerminalLayout({ viewportWidth: 390, viewportHeight: 420 });
     try {
       const takeOutput = vi.fn(() => []);
       const registerOutputDrain = vi.fn(() => () => undefined);
@@ -372,7 +368,6 @@ describe("TerminalPane mobile viewer layout", () => {
           sessionSize={{ rows: 30, cols: 80, pixel_width: 0, pixel_height: 0 }}
           mobileInputMode
           mobileKeyboardOpen={false}
-          resizeEnabled={false}
           outputResetVersion={0}
           takeOutput={takeOutput}
           registerOutputDrain={registerOutputDrain}
@@ -382,9 +377,8 @@ describe("TerminalPane mobile viewer layout", () => {
         />,
       );
 
-      await waitFor(() => expect(screen.getByTestId("terminal-pane")).toHaveAttribute("data-viewer-mode", "true"));
-      await waitFor(() => expect(viewerScaleFromHost()).toBeLessThan(1));
-      const scaleBeforeKeyboard = viewerScaleFromHost();
+      expect(screen.queryByRole("button", { name: /zoom/i })).toBeNull();
+      expect(terminalHostScale()).toBe(1);
 
       layout.setViewportHeight(260);
       rerender(
@@ -393,7 +387,6 @@ describe("TerminalPane mobile viewer layout", () => {
           sessionSize={{ rows: 30, cols: 80, pixel_width: 0, pixel_height: 0 }}
           mobileInputMode
           mobileKeyboardOpen
-          resizeEnabled={false}
           outputResetVersion={0}
           takeOutput={takeOutput}
           registerOutputDrain={registerOutputDrain}
@@ -403,9 +396,8 @@ describe("TerminalPane mobile viewer layout", () => {
         />,
       );
 
-      await waitFor(() => expect(viewerScaleFromHost()).toBeLessThan(scaleBeforeKeyboard));
-      const scrollport = screen.getByTestId("terminal-pane").querySelector<HTMLElement>(".terminal-scrollport");
-      await waitFor(() => expect(scrollport?.scrollTop).toBeGreaterThan(0));
+      expect(screen.queryByRole("button", { name: /zoom/i })).toBeNull();
+      expect(terminalHostScale()).toBe(1);
     } finally {
       layout.restore();
     }

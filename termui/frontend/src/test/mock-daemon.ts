@@ -77,6 +77,7 @@ interface MockDaemonOptions {
   sessionCreateDelayMs?: number;
   routePreludeError?: ErrorPayload;
   routeReadyDelayMs?: number;
+  routeReadyDelayOnceMs?: number;
   daemonPacketVersion?: number;
   pairFailure?: ErrorPayload;
   sessionDataError?: ErrorPayload;
@@ -87,6 +88,7 @@ interface MockDaemonOptions {
   daemonStatus?: DaemonStatusResultPayload;
   daemonStatusResponses?: DaemonStatusResultPayload[];
   daemonStatusDelayMs?: number;
+  dropAuthChallenge?: boolean;
   sessionFiles?: Record<UUID, SessionFilesResultPayload>;
   sessionGit?: Record<UUID, SessionGitResultPayload>;
   sessionFileReads?: Record<string, SessionFileReadResultPayload>;
@@ -111,13 +113,13 @@ interface MockTerminalStream {
 }
 
 interface MockConnection {
+  id: number;
   socket: WebSocket;
   routed: boolean;
   deviceId?: UUID;
   e2ee?: E2eeSession;
   attachedSessionIds: Set<UUID>;
   watchedSessionIds: Set<UUID>;
-  resizeOwnerSessionIds: Set<UUID>;
   terminalStreamsById: Map<PacketStreamId, MockTerminalStream>;
   terminalStreamsBySession: Map<UUID, MockTerminalStream>;
   daemonE2eeExchange?: E2eeKeyExchangePayload;
@@ -149,6 +151,8 @@ export class MockDaemon {
   public readonly binaryPacketLog: MockBinaryPacketLog[] = [];
   public readonly receivedPackets: ProtocolPacket[] = [];
   public readonly sentPackets: ProtocolPacket[] = [];
+  public readonly receivedPacketLog: Array<{ connection_id: number; packet: ProtocolPacket }> = [];
+  public readonly sentPacketLog: Array<{ connection_id: number; packet: ProtocolPacket }> = [];
   public readonly createdCommands: string[][] = [];
   public readonly sessionDataMessages: string[] = [];
   public readonly attachedSessions: UUID[] = [];
@@ -171,6 +175,7 @@ export class MockDaemon {
   public daemonStatusRequests = 0;
   public pingMessages = 0;
   public acceptedConnections = 0;
+  private nextConnectionId = 1;
   public failedTerminalAttachRequests = 0;
   public readonly decryptedInputs: string[] = [];
   public nextAttachRole = "operator" as const;
@@ -307,6 +312,17 @@ export class MockDaemon {
     this.server.clients.forEach((client) => client.close());
   }
 
+  setDropAuthChallenge(drop: boolean): void {
+    // 用来模拟 relay/daemon 卡在认证挑战前的半开连接，覆盖前端是否会主动收口 socket。
+    this.options.dropAuthChallenge = drop;
+  }
+
+  delayNextRouteReady(delayMs: number): void {
+    // 中文注释：恢复链路测试需要先完成初次 pairing/attach，再只把下一条新连接变慢。
+    // 直接在启动参数里设置一次性延迟会误伤初次 pairing，无法覆盖真实的后台恢复路径。
+    this.options.routeReadyDelayOnceMs = delayMs;
+  }
+
   private accept(socket: WebSocket, requestPath: string): void {
     const pathname = requestPath.split("?")[0] || requestPath;
     if (this.options.relayClientPathOnly && pathname !== "/ws") {
@@ -316,22 +332,17 @@ export class MockDaemon {
     }
 
     const connection: MockConnection = {
+      id: this.nextConnectionId++,
       socket,
       routed: false,
       attachedSessionIds: new Set(),
       watchedSessionIds: new Set(),
-      resizeOwnerSessionIds: new Set(),
       terminalStreamsById: new Map(),
       terminalStreamsBySession: new Map(),
     };
     this.connections.add(connection);
     this.acceptedConnections += 1;
-    socket.on("close", () => {
-      this.connections.delete(connection);
-      for (const sessionId of connection.resizeOwnerSessionIds) {
-        this.promoteResizeOwner(sessionId);
-      }
-    });
+    socket.on("close", () => this.connections.delete(connection));
 
     socket.on("message", (raw, isBinary) => {
       if (isBinary) {
@@ -396,7 +407,7 @@ export class MockDaemon {
         connection.daemonE2eeExchange.binary_version === BINARY_PROTOCOL_VERSION &&
         payload.binary_version === BINARY_PROTOCOL_VERSION;
 
-      if (this.trustedDevices.has(payload.device_id)) {
+      if (this.trustedDevices.has(payload.device_id) && !this.options.dropAuthChallenge) {
         this.sendPacket(
           connection,
           {
@@ -479,8 +490,14 @@ export class MockDaemon {
         envelope("e2ee_key_exchange", daemonE2eeExchange),
       );
     };
-    if (this.options.routeReadyDelayMs) {
-      setTimeout(sendPrelude, this.options.routeReadyDelayMs);
+    const routeReadyDelayMs = this.options.routeReadyDelayOnceMs ?? this.options.routeReadyDelayMs;
+    if (this.options.routeReadyDelayOnceMs !== undefined) {
+      // 中文注释：一次性慢 route prelude 用来复现浏览器从后台恢复时，
+      // 第一条 relay/client 连接被短超时误杀，后续 attach 仍应按长超时恢复。
+      this.options.routeReadyDelayOnceMs = undefined;
+    }
+    if (routeReadyDelayMs) {
+      setTimeout(sendPrelude, routeReadyDelayMs);
       return;
     }
     sendPrelude();
@@ -496,6 +513,7 @@ export class MockDaemon {
 
   private async handlePacket(connection: MockConnection, packet: ProtocolPacket): Promise<void> {
     this.receivedPackets.push(packet);
+    this.receivedPacketLog.push({ connection_id: connection.id, packet });
     if (packet.version !== PROTOCOL_PACKET_VERSION) {
       this.sendPacketError(connection, packet, "unsupported_protocol_version", "unsupported protocol packet version");
       return;
@@ -599,6 +617,7 @@ export class MockDaemon {
         return envelope("daemon_status", payload);
       case "terminal.create":
         return envelope("session_create", payload);
+      case "session.attach":
       case "terminal.attach":
         return envelope("session_attach", payload);
       case "session.cursor":
@@ -729,7 +748,9 @@ export class MockDaemon {
         }
         const session = this.options.sessions.find((candidate) => candidate.session_id === payload.session_id);
         this.attachRequests.push(payload);
-        this.attachedSessions.push(payload.session_id);
+        if (watchUpdates) {
+          this.attachedSessions.push(payload.session_id);
+        }
         connection.attachedSessionIds.add(payload.session_id);
         if (watchUpdates) {
           connection.watchedSessionIds.add(payload.session_id);
@@ -744,7 +765,7 @@ export class MockDaemon {
             role: this.nextAttachRole,
             state: session?.state ?? "running",
             size: session?.size ?? { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
-            resize_owner: watchUpdates ? this.assignResizeOwner(connection, payload.session_id) : false,
+            resize_owner: watchUpdates,
           }),
         );
         if (watchUpdates && this.options.attachOutput) {
@@ -779,8 +800,7 @@ export class MockDaemon {
       }
       case "session_resize": {
         const payload = inner.payload as { session_id: UUID; size: TerminalSize };
-        if (!connection.resizeOwnerSessionIds.has(payload.session_id)) {
-          this.sendError(connection, "invalid_state", "invalid protocol state");
+        if (!this.ensureAttached(connection, payload.session_id)) {
           return;
         }
         this.sessionResizes.push(payload);
@@ -1027,7 +1047,7 @@ export class MockDaemon {
       role: this.nextAttachRole,
       state: "running",
       size: payload.size,
-      resize_owner: this.assignResizeOwner(connection, sessionId),
+      resize_owner: true,
     } satisfies SessionCreatedPayload;
 
     // mock daemon 模拟真实 daemon：session_create 会立刻 attach 当前连接。
@@ -1116,34 +1136,6 @@ export class MockDaemon {
     return false;
   }
 
-  private assignResizeOwner(connection: MockConnection, sessionId: UUID): boolean {
-    for (const candidate of this.connections) {
-      if (candidate !== connection && candidate.e2ee && candidate.resizeOwnerSessionIds.has(sessionId)) {
-        return false;
-      }
-    }
-    connection.resizeOwnerSessionIds.add(sessionId);
-    return true;
-  }
-
-  private promoteResizeOwner(sessionId: UUID): void {
-    for (const connection of this.connections) {
-      if (connection.e2ee && connection.watchedSessionIds.has(sessionId)) {
-        connection.resizeOwnerSessionIds.add(sessionId);
-        const session = this.options.sessions.find((candidate) => candidate.session_id === sessionId);
-        this.sendInner(
-          connection,
-          envelope("session_resized", {
-            session_id: sessionId,
-            size: session?.size ?? { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
-            resize_owner: true,
-          }),
-        );
-        return;
-      }
-    }
-  }
-
   private broadcastSessionResized(sessionId: UUID, size: TerminalSize): void {
     for (const connection of this.connections) {
       if (connection.e2ee && connection.watchedSessionIds.has(sessionId)) {
@@ -1152,7 +1144,7 @@ export class MockDaemon {
           envelope("session_resized", {
             session_id: sessionId,
             size,
-            resize_owner: connection.resizeOwnerSessionIds.has(sessionId),
+            resize_owner: true,
           }),
         );
       }
@@ -1277,6 +1269,7 @@ export class MockDaemon {
       return;
     }
     this.sentPackets.push(packet);
+    this.sentPacketLog.push({ connection_id: connection.id, packet });
     if (connection.binaryMode) {
       const binaryPacket = protocolPacketToBinary(packet);
       this.recordBinaryPacket("out", binaryPacket);
@@ -1399,7 +1392,6 @@ export class MockDaemon {
     connection.terminalStreamsById.delete(streamId);
     connection.terminalStreamsBySession.delete(stream.sessionId);
     connection.watchedSessionIds.delete(stream.sessionId);
-    connection.resizeOwnerSessionIds.delete(stream.sessionId);
   }
 
   private legacyEventMethod(type: Envelope["type"]): string {

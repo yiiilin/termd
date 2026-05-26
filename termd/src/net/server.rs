@@ -45,11 +45,11 @@ use super::signature::Ed25519SignatureVerifier;
 
 const OUTPUT_FLUSH_MAX_BYTES_PER_SESSION: usize = 16 * 1024;
 // transport 超时只关闭当前 WebSocket 连接；session/supervisor 仍由协议和 PTY 层保持持久。
-const ROUTE_PRELUDE_TIMEOUT: Duration = Duration::from_secs(2);
+const ROUTE_PRELUDE_TIMEOUT: Duration = Duration::from_secs(5);
 const WEBSOCKET_SEND_DEADLINE: Duration = Duration::from_secs(10);
 const WEBSOCKET_PONG_DEADLINE: Duration = Duration::from_secs(10);
 const WEBSOCKET_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
-const WEBSOCKET_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(25);
+const WEBSOCKET_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const WEBSOCKET_MAX_FRAME_SIZE: usize = 1024 * 1024;
 const WEBSOCKET_MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
 const SESSION_ACTIVITY_PUSH_MIN_INTERVAL: Duration = Duration::from_millis(250);
@@ -60,13 +60,17 @@ const WEBSOCKET_SEND_DEBUG_BATCH_ENVELOPES: usize = 8;
 const WEBSOCKET_SEND_DEBUG_BATCH_BYTES: usize = 32 * 1024;
 const WEBSOCKET_SEND_INFO_BATCH_ENVELOPES: usize = 20;
 const WEBSOCKET_SEND_INFO_BATCH_BYTES: usize = 256 * 1024;
-const WEBSOCKET_RAW_CONTROL_QUEUE_CAPACITY: usize = 256;
 const WEBSOCKET_WIRE_QUEUE_CAPACITY: usize = 256;
-const WEBSOCKET_WRITE_OUTCOME_QUEUE_CAPACITY: usize = 256;
 const WEBSOCKET_PUSH_EVENT_QUEUE_CAPACITY: usize = 1024;
 const WEBSOCKET_PUSH_DRAIN_MAX_EVENTS_PER_TICK: usize = 4;
 const WEBSOCKET_PUSH_DRAIN_MAX_ENQUEUED_BYTES_PER_TICK: usize = 256 * 1024;
 const WEBSOCKET_PUSH_DRAIN_MAX_ELAPSED: Duration = Duration::from_millis(2);
+
+fn websocket_idle_timeout_enabled() -> bool {
+    // 浏览器页面打开时，WebSocket 的生命周期应由真实 close/error 决定。
+    // 后台标签页、移动端挂起或终端长时间静默都不能因为 daemon 侧固定 idle timer 被关闭。
+    false
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum SessionPushEvent {
@@ -77,6 +81,24 @@ enum SessionPushEvent {
 }
 
 impl SessionPushEvent {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Output(_) => "output",
+            Self::Activity(_) => "activity",
+            Self::FileTree(_) => "file_tree",
+            Self::Resize(_) => "resize",
+        }
+    }
+
+    fn session_id(self) -> SessionId {
+        match self {
+            Self::Output(session_id)
+            | Self::Activity(session_id)
+            | Self::FileTree(session_id)
+            | Self::Resize(session_id) => session_id,
+        }
+    }
+
     fn min_interval(self) -> Option<Duration> {
         match self {
             // Activity 只是前端列表里的“后台有新输出”提示；不需要按 PTY 输出频率逐包推送。
@@ -94,19 +116,11 @@ impl SessionPushEvent {
 struct SessionPushEventQueue {
     pending: VecDeque<SessionPushEvent>,
     pending_set: HashSet<SessionPushEvent>,
-    inflight: HashSet<SessionPushEvent>,
-    dirty_inflight: HashSet<SessionPushEvent>,
 }
 
 impl SessionPushEventQueue {
     fn enqueue(&mut self, event: SessionPushEvent) {
         if self.pending_set.contains(&event) {
-            return;
-        }
-        if self.inflight.contains(&event) {
-            // 中文注释：同一个 session 的 output 正在收集或等待写出时，新 watch 信号只需要
-            // 标记为 dirty。当前批次发送完成后再补排一次，避免无界重复事件把 daemon 拖慢。
-            self.dirty_inflight.insert(event);
             return;
         }
         self.pending_set.insert(event);
@@ -117,25 +131,18 @@ impl SessionPushEventQueue {
         !self.pending.is_empty()
     }
 
+    fn len(&self) -> usize {
+        self.pending.len()
+    }
+
     fn peek_front(&self) -> Option<SessionPushEvent> {
         self.pending.front().copied()
     }
 
-    fn pop_front_for_inflight(&mut self) -> Option<SessionPushEvent> {
+    fn pop_front_after_queue_accept(&mut self) -> Option<SessionPushEvent> {
         let event = self.pending.pop_front()?;
         self.pending_set.remove(&event);
-        self.inflight.insert(event);
         Some(event)
-    }
-
-    fn finish_inflight_after_send(&mut self, events: &[SessionPushEvent]) {
-        for event in events {
-            let should_requeue = self.dirty_inflight.remove(event);
-            self.inflight.remove(event);
-            if should_requeue {
-                self.enqueue(*event);
-            }
-        }
     }
 }
 
@@ -144,24 +151,38 @@ enum WebSocketWrite {
     Wire {
         kind: WebSocketOutKind,
         messages: Vec<ProtocolWireMessage>,
-        push_events: Vec<SessionPushEvent>,
     },
     Raw {
         kind: WebSocketOutKind,
         message: Message,
-        bytes: usize,
     },
 }
 
-#[derive(Debug)]
-enum WebSocketWriteOutcome {
-    Sent {
-        kind: WebSocketOutKind,
-        envelopes: usize,
-        bytes: usize,
-        push_events: Vec<SessionPushEvent>,
-    },
-    Failed,
+#[derive(Debug, Clone, Copy)]
+struct WebSocketWriteDebug {
+    kind: WebSocketOutKind,
+    messages: usize,
+    bytes: usize,
+    raw: bool,
+}
+
+impl WebSocketWrite {
+    fn debug_snapshot(&self) -> WebSocketWriteDebug {
+        match self {
+            Self::Wire { kind, messages } => WebSocketWriteDebug {
+                kind: *kind,
+                messages: messages.len(),
+                bytes: websocket_wire_messages_wire_len(messages),
+                raw: false,
+            },
+            Self::Raw { kind, message } => WebSocketWriteDebug {
+                kind: *kind,
+                messages: 1,
+                bytes: websocket_message_bytes(message),
+                raw: true,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -234,6 +255,10 @@ impl WebSocketTrafficCounters {
 
     fn record_send_error(&mut self) {
         self.send_errors = self.send_errors.saturating_add(1);
+    }
+
+    fn record_queued_raw(&mut self, kind: WebSocketOutKind, bytes: usize) {
+        self.record_out(kind, 0, bytes);
     }
 
     fn has_activity(&self) -> bool {
@@ -769,7 +794,7 @@ async fn ws_handler(
 }
 
 async fn read_route_hello(
-    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    write_wire_tx: &mpsc::Sender<WebSocketWrite>,
     receiver: &mut futures_util::stream::SplitStream<WebSocket>,
     expected_server_id: ServerId,
 ) -> Result<RouteHelloPayload, ProtocolError> {
@@ -784,11 +809,10 @@ async fn read_route_hello(
 
         match message {
             Message::Ping(payload) => {
-                if send_message_with_deadline(
-                    sender,
+                if enqueue_websocket_control_raw(
+                    write_wire_tx,
+                    WebSocketOutKind::Pong,
                     Message::Pong(payload),
-                    WEBSOCKET_PONG_DEADLINE,
-                    "websocket route prelude pong failed",
                 )
                 .await
                 .is_err()
@@ -845,6 +869,25 @@ fn current_websocket_watcher_counts(
     }
 }
 
+fn websocket_message_kind(message: &Message) -> &'static str {
+    match message {
+        Message::Text(_) => "text",
+        Message::Binary(_) => "binary",
+        Message::Ping(_) => "ping",
+        Message::Pong(_) => "pong",
+        Message::Close(_) => "close",
+    }
+}
+
+fn websocket_message_bytes(message: &Message) -> usize {
+    match message {
+        Message::Text(raw) => raw.len(),
+        Message::Binary(raw) => raw.len(),
+        Message::Ping(payload) | Message::Pong(payload) => payload.len(),
+        Message::Close(_) => 0,
+    }
+}
+
 fn maybe_log_websocket_traffic(
     peer_addr: SocketAddr,
     traffic: &mut WebSocketTrafficCounters,
@@ -862,11 +905,7 @@ fn maybe_log_websocket_traffic(
 
     let flow = connection.debug_snapshot();
     let protocol_traffic = connection.take_debug_traffic();
-    if websocket_traffic_should_promote_to_info(
-        traffic,
-        &protocol_traffic,
-        flow.zero_credit_terminal_streams,
-    ) {
+    if websocket_traffic_should_promote_to_info(traffic, &protocol_traffic) {
         info_websocket_traffic(peer_addr, traffic, &protocol_traffic, watchers, flow);
     } else {
         debug_websocket_traffic(peer_addr, traffic, &protocol_traffic, watchers, flow);
@@ -878,7 +917,6 @@ fn maybe_log_websocket_traffic(
 fn websocket_traffic_should_promote_to_info(
     traffic: &WebSocketTrafficCounters,
     protocol_traffic: &ProtocolConnectionDebugTraffic,
-    zero_credit_terminal_streams: usize,
 ) -> bool {
     // 正常心跳、RPC 和 activity 计数只进 debug；只有疑似空转/背压/断连时提升到 info，
     // 这样线上默认日志能抓到异常，又不会长期刷屏。
@@ -891,7 +929,6 @@ fn websocket_traffic_should_promote_to_info(
         || protocol_traffic.method_count_exceeds(20)
         || protocol_traffic.inbound_stream_chunks > 100
         || protocol_traffic.outbound_stream_chunks > 100
-        || (zero_credit_terminal_streams > 0 && traffic.out_push_output.calls > 0)
 }
 
 fn info_websocket_traffic(
@@ -951,7 +988,19 @@ fn debug_websocket_traffic(
 }
 
 async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_addr: SocketAddr) {
-    let (mut sender, mut receiver) = socket.split();
+    let (sender, mut receiver) = socket.split();
+    let (write_wire_tx, write_wire_rx) =
+        mpsc::channel::<WebSocketWrite>(WEBSOCKET_WIRE_QUEUE_CAPACITY);
+    let (writer_failed_tx, mut writer_failed_rx) = mpsc::channel::<()>(1);
+    // 中文注释：直连从 route prelude 开始就只保留一条有界 writer queue。
+    // 入队成功即代表当前连接的输出责任已经交给 transport；真实 socket 失败
+    // 只通过 writer_failed_rx 传播回来，关闭当前连接。
+    let writer_task = tokio::spawn(run_websocket_writer(
+        peer_addr,
+        write_wire_rx,
+        writer_failed_tx,
+        sender,
+    ));
     let (push_event_tx, mut push_event_rx) =
         mpsc::channel::<SessionPushEvent>(WEBSOCKET_PUSH_EVENT_QUEUE_CAPACITY);
     let mut watched_output_sessions = HashSet::new();
@@ -970,45 +1019,60 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
 
     let route_hello = match timeout(
         ROUTE_PRELUDE_TIMEOUT,
-        read_route_hello(&mut sender, &mut receiver, server_id),
+        read_route_hello(&write_wire_tx, &mut receiver, server_id),
     )
     .await
     {
         Ok(Ok(route_hello)) => route_hello,
         Ok(Err(error)) => {
-            if let Ok(bytes) = send_envelope_logged(
-                peer_addr,
-                &mut sender,
-                plaintext_error(error),
-                "plain_error",
-                true,
-            )
-            .await
+            let envelope = plaintext_error(error);
+            let messages = vec![ProtocolWireMessage::Json(envelope)];
+            let bytes = websocket_wire_messages_wire_len(&messages);
+            if enqueue_websocket_wire(&write_wire_tx, WebSocketOutKind::PlainError, messages)
+                .await
+                .is_ok()
             {
                 traffic.record_out(WebSocketOutKind::PlainError, 1, bytes);
+                finish_websocket_writer(write_wire_tx, writer_task).await;
+            } else {
+                traffic.record_send_error();
+                writer_task.abort();
             }
             return;
         }
         Err(_) => {
-            if let Ok(bytes) = send_envelope_logged(
-                peer_addr,
-                &mut sender,
-                route_prelude_timeout_error(),
-                "plain_error",
-                true,
-            )
-            .await
+            let envelope = route_prelude_timeout_error();
+            let messages = vec![ProtocolWireMessage::Json(envelope)];
+            let bytes = websocket_wire_messages_wire_len(&messages);
+            if enqueue_websocket_wire(&write_wire_tx, WebSocketOutKind::PlainError, messages)
+                .await
+                .is_ok()
             {
                 traffic.record_out(WebSocketOutKind::PlainError, 1, bytes);
+                finish_websocket_writer(write_wire_tx, writer_task).await;
+            } else {
+                traffic.record_send_error();
+                writer_task.abort();
             }
             return;
         }
     };
     let route_ready = route_ready_envelope(route_hello.server_id, route_hello.role);
-    match send_envelope_logged(peer_addr, &mut sender, route_ready, "route_ready", true).await {
-        Ok(bytes) => traffic.record_out(WebSocketOutKind::RouteReady, 1, bytes),
-        Err(()) => return,
+    let route_ready_bytes =
+        websocket_wire_messages_wire_len(&[ProtocolWireMessage::Json(route_ready.clone())]);
+    if enqueue_websocket_wire(
+        &write_wire_tx,
+        WebSocketOutKind::RouteReady,
+        vec![ProtocolWireMessage::Json(route_ready)],
+    )
+    .await
+    .is_err()
+    {
+        traffic.record_send_error();
+        writer_task.abort();
+        return;
     }
+    traffic.record_out(WebSocketOutKind::RouteReady, 1, route_ready_bytes);
 
     let (mut connection, initial_messages) = {
         let protocol = protocol.lock().await;
@@ -1016,26 +1080,24 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
     };
 
     let initial_count = initial_messages.len();
-    match send_envelopes_logged(peer_addr, &mut sender, initial_messages, "initial").await {
-        Ok(bytes) => traffic.record_out(WebSocketOutKind::Initial, initial_count, bytes),
-        Err(()) => return,
+    let initial_wire_messages = initial_messages
+        .into_iter()
+        .map(ProtocolWireMessage::Json)
+        .collect::<Vec<_>>();
+    let initial_bytes = websocket_wire_messages_wire_len(&initial_wire_messages);
+    if enqueue_websocket_wire(
+        &write_wire_tx,
+        WebSocketOutKind::Initial,
+        initial_wire_messages,
+    )
+    .await
+    .is_err()
+    {
+        traffic.record_send_error();
+        writer_task.abort();
+        return;
     }
-
-    let (write_raw_control_tx, write_raw_control_rx) =
-        mpsc::channel::<WebSocketWrite>(WEBSOCKET_RAW_CONTROL_QUEUE_CAPACITY);
-    let (write_wire_tx, write_wire_rx) =
-        mpsc::channel::<WebSocketWrite>(WEBSOCKET_WIRE_QUEUE_CAPACITY);
-    let (write_outcome_tx, mut write_outcome_rx) =
-        mpsc::channel::<WebSocketWriteOutcome>(WEBSOCKET_WRITE_OUTCOME_QUEUE_CAPACITY);
-    // 中文注释：直连 WebSocket 和 relay 一样，把读控制帧和写大量 terminal output 拆开。
-    // 慢浏览器或大 snapshot 只能拖住 writer，不能阻塞主循环读取 close/input/pong。
-    let writer_task = tokio::spawn(run_websocket_writer(
-        peer_addr,
-        write_raw_control_rx,
-        write_wire_rx,
-        write_outcome_tx,
-        sender,
-    ));
+    traffic.record_out(WebSocketOutKind::Initial, initial_count, initial_bytes);
 
     let mut idle_deadline = Instant::now() + WEBSOCKET_IDLE_TIMEOUT;
     let mut heartbeat = tokio::time::interval_at(
@@ -1044,15 +1106,16 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
     );
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut pending_pong_deadline: Option<Instant> = None;
+    let mut last_activity = Instant::now();
     loop {
         let pending_pong_deadline_snapshot = pending_pong_deadline;
         // 控制和 client close 必须先于输出队列处理；快速切换时旧 attach 才能及时取消。
-        // 中文注释：writer outcome 可能在大量输出时形成热循环。它只能驱动后续输出续传，
-        // 不能排在入站消息前面，否则用户输入、close、pong 会被“已发送”通知饿住。
+        // 中文注释：push drain 只在主循环内按预算推进，writer 成功发送不再产生回调。
+        // 队列容量就是背压边界，避免高频发送回执反过来饿住输入、close 和 pong。
         tokio::select! {
             biased;
 
-            _ = tokio::time::sleep_until(idle_deadline) => {
+            _ = tokio::time::sleep_until(idle_deadline), if websocket_idle_timeout_enabled() => {
                 warn!(peer_addr = %peer_addr, "websocket idle timeout");
                 break;
             }
@@ -1077,22 +1140,31 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
                         break;
                     }
                 };
-                idle_deadline = Instant::now() + WEBSOCKET_IDLE_TIMEOUT;
+                let now = Instant::now();
+                idle_deadline = now + WEBSOCKET_IDLE_TIMEOUT;
+                last_activity = now;
                 traffic.record_in(&message);
+                debug!(
+                    peer_addr = %peer_addr,
+                    message_kind = websocket_message_kind(&message),
+                    message_bytes = websocket_message_bytes(&message),
+                    "websocket inbound frame received"
+                );
 
                 match message {
                     Message::Ping(payload) => {
                         let pong_bytes = payload.len();
                         if enqueue_websocket_control_raw(
-                            &write_raw_control_tx,
+                            &write_wire_tx,
                             WebSocketOutKind::Pong,
                             Message::Pong(payload),
-                            pong_bytes,
                         )
+                        .await
                         .is_err() {
                             traffic.record_send_error();
                             break;
                         }
+                        traffic.record_queued_raw(WebSocketOutKind::Pong, pong_bytes);
                         maybe_log_websocket_traffic(
                             peer_addr,
                             &mut traffic,
@@ -1130,22 +1202,32 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
                         let Some(wire_message) = (match message_to_wire_message(other) {
                             Ok(message) => message,
                             Err(error) => {
+                                let responses =
+                                    vec![ProtocolWireMessage::Json(plaintext_error(error))];
+                                let response_count = responses.len();
+                                let response_bytes = websocket_wire_messages_wire_len(&responses);
                                 if enqueue_websocket_wire(
                                     &write_wire_tx,
                                     WebSocketOutKind::PlainError,
-                                    vec![ProtocolWireMessage::Json(plaintext_error(error))],
+                                    responses,
                                 )
+                                .await
                                 .is_err()
                                 {
                                     traffic.record_send_error();
                                     break;
                                 }
+                                traffic.record_out(
+                                    WebSocketOutKind::PlainError,
+                                    response_count,
+                                    response_bytes,
+                                );
                                 maybe_log_websocket_traffic(
                                     peer_addr,
                                     &mut traffic,
                                     &mut last_traffic_log,
                                     &mut connection,
-                            current_websocket_watcher_counts(
+                                    current_websocket_watcher_counts(
                                         &watched_output_sessions,
                                         &watched_activity_sessions,
                                         &watched_file_tree_sessions,
@@ -1164,17 +1246,25 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
                             connection.handle_wire_message(&mut protocol, wire_message)
                         };
                         queue_deferred_output_wakeups(&mut connection, &mut push_event_queue);
+                        let response_count = responses.len();
+                        let response_bytes = websocket_wire_messages_wire_len(&responses);
 
                         if enqueue_websocket_wire(
                             &write_wire_tx,
                             WebSocketOutKind::Response,
                             responses,
                         )
+                        .await
                         .is_err()
                         {
                             traffic.record_send_error();
                             break;
                         }
+                        traffic.record_out(
+                            WebSocketOutKind::Response,
+                            response_count,
+                            response_bytes,
+                        );
 
                         let initial_output_sessions = register_session_watchers(
                             &connection,
@@ -1193,6 +1283,7 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
                             &mut connection,
                             &mut push_event_queue,
                             &write_wire_tx,
+                            &mut traffic,
                             &push_event_tx,
                             &mut push_drain_wake_pending,
                         )
@@ -1217,25 +1308,13 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
                     }
                 };
             }
-            write_outcome = write_outcome_rx.recv() => {
-                let Some(write_outcome) = write_outcome else {
+            maybe_failed = writer_failed_rx.recv() => {
+                if maybe_failed.is_some() {
                     traffic.record_send_error();
-                    break;
-                };
-                match write_outcome {
-                    WebSocketWriteOutcome::Sent { kind, envelopes, bytes, push_events } => {
-                        traffic.record_out(kind, envelopes, bytes);
-                        push_event_queue.finish_inflight_after_send(&push_events);
-                        queue_websocket_push_drain_wakeup(
-                            &push_event_queue,
-                            &push_event_tx,
-                            &mut push_drain_wake_pending,
-                        );
-                    }
-                    WebSocketWriteOutcome::Failed => {
-                        traffic.record_send_error();
-                        break;
-                    }
+                    warn!(
+                        peer_addr = %peer_addr,
+                        "websocket writer reported failure"
+                    );
                 }
                 maybe_log_websocket_traffic(
                     peer_addr,
@@ -1250,21 +1329,25 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
                     ),
                     false,
                 );
+                break;
             }
             _ = heartbeat.tick() => {
-                if pending_pong_deadline.is_none() {
+                if pending_pong_deadline.is_none()
+                    && last_activity.elapsed() >= WEBSOCKET_HEARTBEAT_INTERVAL
+                {
                     let ping_bytes = 0;
                     if enqueue_websocket_control_raw(
-                        &write_raw_control_tx,
+                        &write_wire_tx,
                         WebSocketOutKind::Ping,
                         Message::Ping(Vec::new()),
-                        ping_bytes,
                     )
+                    .await
                     .is_err()
                     {
                         traffic.record_send_error();
                         break;
                     }
+                    traffic.record_queued_raw(WebSocketOutKind::Ping, ping_bytes);
                     maybe_log_websocket_traffic(
                         peer_addr,
                         &mut traffic,
@@ -1287,12 +1370,20 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
                 };
                 idle_deadline = Instant::now() + WEBSOCKET_IDLE_TIMEOUT;
                 push_drain_wake_pending = false;
+                debug!(
+                    peer_addr = %peer_addr,
+                    event = event.label(),
+                    session_id = ?event.session_id(),
+                    queue_pending_before = push_event_queue.len(),
+                    "websocket push event received from watcher"
+                );
                 push_event_queue.enqueue(event);
                 if let Err(()) = drain_websocket_push_events(
                     &protocol,
                     &mut connection,
                     &mut push_event_queue,
                     &write_wire_tx,
+                    &mut traffic,
                     &push_event_tx,
                     &mut push_drain_wake_pending,
                 )
@@ -1338,7 +1429,8 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
 
     let mut protocol = protocol.lock().await;
     connection.close(&mut protocol);
-    writer_task.abort();
+    drop(protocol);
+    finish_websocket_writer(write_wire_tx, writer_task).await;
     debug!("websocket connection closed and detached");
 }
 
@@ -1353,10 +1445,23 @@ fn queue_websocket_push_drain_wakeup(
     let Some(event) = queue.peek_front() else {
         return;
     };
-    // 中文注释：writer outcome 是高频事件。发送完成后只唤醒下一轮 drain，
-    // 不能在 outcome 分支里递归继续读 PTY/加密/入队，否则大输出会压住输入、close 和 pong。
+    // 中文注释：唤醒只把 pending 事件交回主循环，不能在当前调用栈继续递归 drain。
+    // 大输出需要按预算让出调度权，避免压住输入、close 和 pong。
     if push_event_tx.try_send(event).is_ok() {
         *push_drain_wake_pending = true;
+        debug!(
+            event = event.label(),
+            session_id = ?event.session_id(),
+            queue_pending = queue.len(),
+            "websocket push drain wakeup queued"
+        );
+    } else {
+        warn!(
+            event = event.label(),
+            session_id = ?event.session_id(),
+            queue_pending = queue.len(),
+            "websocket push drain wakeup queue full"
+        );
     }
 }
 
@@ -1388,6 +1493,7 @@ async fn drain_websocket_push_events(
     connection: &mut ProtocolConnection,
     queue: &mut SessionPushEventQueue,
     write_wire_tx: &mpsc::Sender<WebSocketWrite>,
+    traffic: &mut WebSocketTrafficCounters,
     push_event_tx: &mpsc::Sender<SessionPushEvent>,
     push_drain_wake_pending: &mut bool,
 ) -> Result<(), ()> {
@@ -1395,52 +1501,102 @@ async fn drain_websocket_push_events(
     let mut drained_events = 0_usize;
     let mut enqueued_bytes = 0_usize;
     while queue.has_pending() {
-        let Some(event) = queue.pop_front_for_inflight() else {
-            break;
-        };
-        let permit = match write_wire_tx.try_reserve() {
+        debug!(
+            queue_pending = queue.len(),
+            drained_events, enqueued_bytes, "websocket push drain reserving writer queue"
+        );
+        let permit = match write_wire_tx.reserve().await {
             Ok(permit) => permit,
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                // 中文注释：直连慢浏览器只能给自己的 wire 队列施压；不能让 daemon
-                // 为它无界累积 terminal output，进而拖住 relay mux 和其它直连控制帧。
-                queue.finish_inflight_after_send(&[event]);
-                queue.enqueue(event);
-                break;
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                queue.finish_inflight_after_send(&[event]);
-                queue.enqueue(event);
+            Err(_) => {
+                warn!(
+                    queue_pending = queue.len(),
+                    drained_events,
+                    enqueued_bytes,
+                    "websocket writer queue closed while reserving push output"
+                );
                 return Err(());
             }
         };
+        let Some(event) = queue.pop_front_after_queue_accept() else {
+            break;
+        };
+        debug!(
+            event = event.label(),
+            session_id = ?event.session_id(),
+            queue_pending_after_pop = queue.len(),
+            "websocket push event dequeued"
+        );
         let (kind, responses) = collect_websocket_push_event(protocol, connection, event).await;
         queue_deferred_output_wakeups(connection, queue);
         if responses.is_empty() {
-            queue.finish_inflight_after_send(&[event]);
             drained_events = drained_events.saturating_add(1);
             if websocket_push_drain_budget_exhausted(drained_events, enqueued_bytes, started_at) {
+                log_websocket_push_drain_reschedule(
+                    kind,
+                    drained_events,
+                    enqueued_bytes,
+                    queue.len(),
+                    started_at.elapsed(),
+                );
                 queue_websocket_push_drain_wakeup(queue, push_event_tx, push_drain_wake_pending);
                 break;
             }
             continue;
         }
+        let response_count = responses.len();
         let batch_bytes = websocket_wire_messages_wire_len(&responses);
         permit.send(WebSocketWrite::Wire {
             kind,
             messages: responses,
-            push_events: vec![event],
         });
+        debug!(
+            kind = kind.label(),
+            response_count,
+            batch_bytes,
+            queue_pending = queue.len(),
+            "websocket push batch accepted by writer queue"
+        );
+        traffic.record_out(kind, response_count, batch_bytes);
         drained_events = drained_events.saturating_add(1);
         enqueued_bytes = enqueued_bytes.saturating_add(batch_bytes);
+        // 中文注释：统计记录 queue accepted，而不是 socket send completed。
+        // 成功入队就是这条连接的背压边界；失败只在 writer 层关闭连接。
         if websocket_push_drain_budget_exhausted(drained_events, enqueued_bytes, started_at) {
             // 中文注释：直连 WebSocket 和 relay 使用同一类输出调度预算。
             // 一轮输出入队后主动回到 select!，让输入、cancel、close、pong 和新 attach
             // 有机会插队处理，避免多个大输出窗口一起占住 daemon 协议状态。
+            log_websocket_push_drain_reschedule(
+                kind,
+                drained_events,
+                enqueued_bytes,
+                queue.len(),
+                started_at.elapsed(),
+            );
             queue_websocket_push_drain_wakeup(queue, push_event_tx, push_drain_wake_pending);
             break;
         }
     }
     Ok(())
+}
+
+fn log_websocket_push_drain_reschedule(
+    kind: WebSocketOutKind,
+    drained_events: usize,
+    enqueued_bytes: usize,
+    pending_events: usize,
+    elapsed: Duration,
+) {
+    if pending_events == 0 {
+        return;
+    }
+    debug!(
+        kind = kind.label(),
+        drained_events,
+        enqueued_bytes,
+        pending_events,
+        elapsed_ms = elapsed.as_millis(),
+        "websocket push drain rescheduled"
+    );
 }
 
 async fn collect_websocket_push_event(
@@ -1635,6 +1791,11 @@ fn queue_initial_output_events(
         // attach/create 刚完成时 watcher 会忽略当前 watch 值；显式排一次输出读取，
         // 但让它走 push 队列，给 close、cancel、pong 等控制事件抢先处理的机会。
         push_event_queue.enqueue(SessionPushEvent::Output(*session_id));
+        debug!(
+            session_id = ?session_id,
+            queue_pending = push_event_queue.len(),
+            "websocket initial output event queued"
+        );
     }
 }
 
@@ -1643,9 +1804,14 @@ fn queue_deferred_output_wakeups(
     push_event_queue: &mut SessionPushEventQueue,
 ) {
     for session_id in connection.take_deferred_output_wakeups() {
-        // 中文注释：flow credit 到达后只唤醒输出 drain。实际 PTY 读取、batch 组装和
-        // E2EE 加密会在后续 push 分支中执行，让 input/cancel/pong 可以先被 select 处理。
+        // 中文注释：terminal 输出不再等待 flow credit；这里只处理 batch/transport 上限
+        // 造成的后续 drain，让 input/cancel/pong 可以先被 select 处理。
         push_event_queue.enqueue(SessionPushEvent::Output(session_id));
+        debug!(
+            session_id = ?session_id,
+            queue_pending = push_event_queue.len(),
+            "websocket deferred output event queued"
+        );
     }
 }
 
@@ -1676,8 +1842,18 @@ fn spawn_session_push_watcher<T>(
                 SessionPushEvent::Resize(_) => SessionPushEvent::Resize(session_id),
             };
             if push_event_tx.send(next_event).await.is_err() {
+                debug!(
+                    event = next_event.label(),
+                    session_id = ?session_id,
+                    "websocket push watcher stopped because event queue closed"
+                );
                 break;
             }
+            debug!(
+                event = next_event.label(),
+                session_id = ?session_id,
+                "websocket push watcher enqueued event"
+            );
             if let Some(interval) = min_interval {
                 tokio::time::sleep(interval).await;
             }
@@ -1729,125 +1905,120 @@ fn route_prelude_timeout_error() -> JsonEnvelope {
     .expect("route prelude timeout payload should serialize")
 }
 
-fn enqueue_websocket_wire(
+async fn enqueue_websocket_wire(
     tx: &mpsc::Sender<WebSocketWrite>,
     kind: WebSocketOutKind,
     messages: Vec<ProtocolWireMessage>,
 ) -> Result<(), ()> {
     // 中文注释：所有已经完成 E2EE 的业务帧都必须进入同一个 FIFO。
     // 这样 response、push_output、error 的相对顺序就和加密顺序一致，不会把 seq 打乱。
-    tx.try_send(WebSocketWrite::Wire {
-        kind,
-        messages,
-        push_events: Vec::new(),
-    })
-    .map_err(|_| ())
+    if messages.is_empty() {
+        return Ok(());
+    }
+    let message_count = messages.len();
+    let bytes = websocket_wire_messages_wire_len(&messages);
+    tx.send(WebSocketWrite::Wire { kind, messages })
+        .await
+        .map(|()| {
+            debug!(
+                kind = kind.label(),
+                messages = message_count,
+                bytes,
+                "websocket writer queue accepted wire batch"
+            );
+        })
+        .map_err(|_| {
+            warn!(
+                kind = kind.label(),
+                messages = message_count,
+                bytes,
+                "websocket writer queue closed while enqueueing wire batch"
+            );
+        })
 }
 
-fn enqueue_websocket_control_raw(
+async fn enqueue_websocket_control_raw(
     tx: &mpsc::Sender<WebSocketWrite>,
     kind: WebSocketOutKind,
     message: Message,
-    bytes: usize,
 ) -> Result<(), ()> {
-    match tx.try_send(WebSocketWrite::Raw {
-        kind,
-        message,
-        bytes,
-    }) {
-        Ok(()) => Ok(()),
-        Err(mpsc::error::TrySendError::Full(_)) if kind == WebSocketOutKind::Ping => {
-            // 中文注释：Ping 只是保活探测。control 队列满说明已有其它控制帧待写，
-            // 此时丢弃本次 Ping 比断开整条直连 WebSocket 更符合背压语义。
-            Ok(())
-        }
-        Err(_) => Err(()),
-    }
+    // 中文注释：WebSocket 控制帧也走同一条 writer queue。队列满时等待容量，
+    // 让当前连接整体承压，而不是再维护一条旁路控制队列。
+    let message_kind = websocket_message_kind(&message);
+    let bytes = websocket_message_bytes(&message);
+    tx.send(WebSocketWrite::Raw { kind, message })
+        .await
+        .map(|()| {
+            debug!(
+                kind = kind.label(),
+                message_kind, bytes, "websocket writer queue accepted raw frame"
+            );
+        })
+        .map_err(|_| {
+            warn!(
+                kind = kind.label(),
+                message_kind, bytes, "websocket writer queue closed while enqueueing raw frame"
+            );
+        })
 }
 
 async fn run_websocket_writer(
     peer_addr: SocketAddr,
-    mut raw_control_rx: mpsc::Receiver<WebSocketWrite>,
     mut wire_rx: mpsc::Receiver<WebSocketWrite>,
-    outcome_tx: mpsc::Sender<WebSocketWriteOutcome>,
+    writer_failed_tx: mpsc::Sender<()>,
     mut sender: futures_util::stream::SplitSink<WebSocket, Message>,
 ) {
-    loop {
-        // 中文注释：raw ping/pong 仍然可以独立处理，但所有业务帧必须只走一个 FIFO。
-        // 这样 writer 就不会把已加密的 seq=4 插到 seq=3 前面。
-        tokio::select! {
-            biased;
-
-            write = raw_control_rx.recv() => {
-                let Some(write) = write else {
-                    break;
-                };
-                if !send_websocket_write(peer_addr, &mut sender, write, &outcome_tx).await {
-                    break;
-                }
-            }
-            write = wire_rx.recv() => {
-                let Some(write) = write else {
-                    break;
-                };
-                if !send_websocket_write(peer_addr, &mut sender, write, &outcome_tx).await {
-                    break;
-                }
-            }
+    // 中文注释：writer 只负责把有界队列里的内容顺序写入 WebSocket。
+    // 成功写入不再回报；queue accepted 已经是本连接的背压边界。
+    while let Some(write) = wire_rx.recv().await {
+        let snapshot = write.debug_snapshot();
+        debug!(
+            peer_addr = %peer_addr,
+            kind = snapshot.kind.label(),
+            messages = snapshot.messages,
+            bytes = snapshot.bytes,
+            raw = snapshot.raw,
+            "websocket writer dequeued frame"
+        );
+        if !send_websocket_write(peer_addr, &mut sender, write).await {
+            let _ = writer_failed_tx.try_send(());
+            break;
         }
     }
+    debug!(peer_addr = %peer_addr, "websocket writer stopped");
+}
+
+async fn finish_websocket_writer(
+    write_wire_tx: mpsc::Sender<WebSocketWrite>,
+    writer_task: JoinHandle<()>,
+) {
+    // 中文注释：关闭所有 producer 后让 writer 自然 drain 已接受的队列内容。
+    // queue accepted 是输出责任边界；正常收尾不能再 abort 掉已入队帧。
+    drop(write_wire_tx);
+    let _ = writer_task.await;
 }
 
 async fn send_websocket_write(
     peer_addr: SocketAddr,
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
     write: WebSocketWrite,
-    outcome_tx: &mpsc::Sender<WebSocketWriteOutcome>,
 ) -> bool {
-    let outcome = match write {
-        WebSocketWrite::Wire {
-            kind,
-            messages,
-            push_events,
-        } => {
-            let envelope_count = messages.len();
-            match send_wire_messages_logged(peer_addr, sender, messages, kind.label()).await {
-                Ok(bytes) => WebSocketWriteOutcome::Sent {
-                    kind,
-                    envelopes: envelope_count,
-                    bytes,
-                    push_events,
-                },
-                Err(()) => WebSocketWriteOutcome::Failed,
-            }
+    match write {
+        WebSocketWrite::Wire { kind, messages } => {
+            send_wire_messages_logged(peer_addr, sender, messages, kind.label())
+                .await
+                .is_ok()
         }
-        WebSocketWrite::Raw {
-            kind,
-            message,
-            bytes,
-        } => {
+        WebSocketWrite::Raw { kind, message } => {
             let deadline = match kind {
                 WebSocketOutKind::Pong => WEBSOCKET_PONG_DEADLINE,
                 _ => WEBSOCKET_SEND_DEADLINE,
             };
-            match send_message_with_deadline(sender, message, deadline, "websocket control frame")
+            send_message_with_deadline(sender, message, deadline, "websocket control frame")
                 .await
-            {
-                Ok(()) => WebSocketWriteOutcome::Sent {
-                    kind,
-                    envelopes: 0,
-                    bytes,
-                    push_events: Vec::new(),
-                },
-                Err(()) => WebSocketWriteOutcome::Failed,
-            }
+                .is_ok()
         }
-    };
-    let should_continue = matches!(outcome, WebSocketWriteOutcome::Sent { .. });
-    if outcome_tx.send(outcome).await.is_err() {
-        return false;
     }
-    should_continue
 }
 
 async fn send_message_with_deadline(
@@ -1899,30 +2070,6 @@ async fn send_envelope_logged(
             "websocket send batch",
         );
     }
-    Ok(bytes)
-}
-
-async fn send_envelopes_logged(
-    peer_addr: SocketAddr,
-    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
-    envelopes: Vec<JsonEnvelope>,
-    label: &'static str,
-) -> Result<usize, ()> {
-    let envelope_count = envelopes.len();
-    let mut bytes = 0_usize;
-    let started_at = Instant::now();
-    for envelope in envelopes {
-        bytes = bytes
-            .saturating_add(send_envelope_logged(peer_addr, sender, envelope, label, false).await?);
-    }
-    log_websocket_send(
-        peer_addr,
-        label,
-        envelope_count,
-        bytes,
-        started_at.elapsed(),
-        "websocket send batch",
-    );
     Ok(bytes)
 }
 
@@ -2077,30 +2224,14 @@ mod tests {
         queue.enqueue(SessionPushEvent::Output(session_id));
 
         assert_eq!(
-            queue.pop_front_for_inflight(),
+            queue.pop_front_after_queue_accept(),
             Some(SessionPushEvent::Output(session_id))
         );
-        assert_eq!(queue.pop_front_for_inflight(), None);
+        assert_eq!(queue.pop_front_after_queue_accept(), None);
     }
 
     #[test]
-    fn websocket_push_queue_requeues_dirty_inflight_once_after_send() {
-        let session_id = SessionId::new();
-        let event = SessionPushEvent::Output(session_id);
-        let mut queue = SessionPushEventQueue::default();
-
-        queue.enqueue(event);
-        assert_eq!(queue.pop_front_for_inflight(), Some(event));
-        queue.enqueue(event);
-        queue.enqueue(event);
-        queue.finish_inflight_after_send(&[event]);
-
-        assert_eq!(queue.pop_front_for_inflight(), Some(event));
-        assert_eq!(queue.pop_front_for_inflight(), None);
-    }
-
-    #[test]
-    fn websocket_push_wakeup_peeks_without_draining_after_writer_outcome() {
+    fn websocket_push_wakeup_peeks_pending_event_without_draining() {
         let session_id = SessionId::new();
         let event = SessionPushEvent::Output(session_id);
         let mut queue = SessionPushEventQueue::default();
@@ -2108,22 +2239,19 @@ mod tests {
         let mut wake_pending = false;
 
         queue.enqueue(event);
-        assert_eq!(queue.pop_front_for_inflight(), Some(event));
-        queue.enqueue(event);
-        queue.finish_inflight_after_send(&[event]);
         queue_websocket_push_drain_wakeup(&queue, &tx, &mut wake_pending);
         queue_websocket_push_drain_wakeup(&queue, &tx, &mut wake_pending);
 
-        // 中文注释：writer outcome 只能唤醒下一轮 select，不能同步继续 drain。
-        // 这样输入、close、pong 才能在大输出续发之间获得调度机会。
+        // 中文注释：唤醒只是把 pending 事件交回主循环调度，不能同步 drain。
+        // writer queue accepted 才是输出责任边界，不再等待 socket 成功发送回执。
         assert_eq!(queue.peek_front(), Some(event));
         assert_eq!(rx.try_recv(), Ok(event));
         assert_eq!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty));
         assert!(wake_pending);
     }
 
-    #[test]
-    fn websocket_wire_queue_preserves_e2ee_sequence_order_across_kinds() {
+    #[tokio::test]
+    async fn websocket_wire_queue_preserves_e2ee_sequence_order_across_kinds() {
         let (wire_tx, mut wire_rx) = mpsc::channel(4);
 
         enqueue_websocket_wire(
@@ -2131,12 +2259,14 @@ mod tests {
             WebSocketOutKind::PushOutput,
             vec![ProtocolWireMessage::Binary(vec![3])],
         )
+        .await
         .unwrap();
         enqueue_websocket_wire(
             &wire_tx,
             WebSocketOutKind::Response,
             vec![ProtocolWireMessage::Binary(vec![4])],
         )
+        .await
         .unwrap();
 
         // 中文注释：PushOutput 和 Response 都是 E2EE 业务帧，不能再分队列插队。
@@ -2144,14 +2274,14 @@ mod tests {
         let first = wire_rx.try_recv().unwrap();
         let second = wire_rx.try_recv().unwrap();
         match first {
-            WebSocketWrite::Wire { kind, messages, .. } => {
+            WebSocketWrite::Wire { kind, messages } => {
                 assert_eq!(kind, WebSocketOutKind::PushOutput);
                 assert_eq!(messages, vec![ProtocolWireMessage::Binary(vec![3])]);
             }
             other => panic!("expected first wire write, got {other:?}"),
         }
         match second {
-            WebSocketWrite::Wire { kind, messages, .. } => {
+            WebSocketWrite::Wire { kind, messages } => {
                 assert_eq!(kind, WebSocketOutKind::Response);
                 assert_eq!(messages, vec![ProtocolWireMessage::Binary(vec![4])]);
             }
@@ -2174,27 +2304,45 @@ mod tests {
             .try_send(WebSocketWrite::Wire {
                 kind: WebSocketOutKind::PushOutput,
                 messages: Vec::new(),
-                push_events: Vec::new(),
             })
             .unwrap();
 
         let (push_event_tx, _push_event_rx) = mpsc::channel(1);
         let mut wake_pending = false;
+        let mut traffic = WebSocketTrafficCounters::default();
+        let mut drain = Box::pin(drain_websocket_push_events(
+            &protocol,
+            &mut connection,
+            &mut queue,
+            &write_wire_tx,
+            &mut traffic,
+            &push_event_tx,
+            &mut wake_pending,
+        ));
 
+        tokio::select! {
+            result = &mut drain => panic!("drain should wait for writer queue capacity, got {result:?}"),
+            _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+        drop(drain);
+        assert_eq!(queue.peek_front(), Some(event));
+
+        let _queued = _write_wire_rx.try_recv().unwrap();
         drain_websocket_push_events(
             &protocol,
             &mut connection,
             &mut queue,
             &write_wire_tx,
+            &mut traffic,
             &push_event_tx,
             &mut wake_pending,
         )
         .await
         .unwrap();
 
-        // 中文注释：wire 队列满时只能暂停当前连接输出，不能丢掉 dirty output；
-        // 下一次 writer 释放容量后还要能继续 flush。
-        assert_eq!(queue.pop_front_for_inflight(), Some(event));
+        // 中文注释：queue accepted 是输出责任边界。容量释放后事件才会被弹出，
+        // 避免 writer queue 满时提前消费 daemon terminal cache。
+        assert_eq!(queue.peek_front(), None);
     }
 
     #[test]
@@ -2232,6 +2380,7 @@ mod tests {
         let (push_event_tx, mut push_event_rx) = mpsc::channel(8);
         let mut queue = SessionPushEventQueue::default();
         let mut wake_pending = false;
+        let mut traffic = WebSocketTrafficCounters::default();
         let events: Vec<_> = (0..WEBSOCKET_PUSH_DRAIN_MAX_EVENTS_PER_TICK + 2)
             .map(|_| SessionPushEvent::Output(SessionId::new()))
             .collect();
@@ -2244,6 +2393,7 @@ mod tests {
             &mut connection,
             &mut queue,
             &write_wire_tx,
+            &mut traffic,
             &push_event_tx,
             &mut wake_pending,
         )
@@ -2522,11 +2672,14 @@ mod tests {
         let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
             .await
             .unwrap();
-        let message = timeout(Duration::from_secs(4), socket.next())
-            .await
-            .expect("daemon should reject missing route_hello before the outer test timeout")
-            .expect("daemon should send a route prelude error")
-            .expect("route prelude error should be a websocket message");
+        let message = timeout(
+            ROUTE_PRELUDE_TIMEOUT + Duration::from_secs(2),
+            socket.next(),
+        )
+        .await
+        .expect("daemon should reject missing route_hello before the outer test timeout")
+        .expect("daemon should send a route prelude error")
+        .expect("route prelude error should be a websocket message");
         let ClientWsMessage::Text(raw) = message else {
             panic!("expected plaintext route prelude error, got {message:?}");
         };
@@ -2534,6 +2687,129 @@ mod tests {
         assert_eq!(envelope.kind, MessageType::Error);
         let error: ErrorPayload = decode_payload(envelope.payload).unwrap();
         assert_eq!(error.code, "route_prelude_timeout");
+
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn websocket_route_prelude_ping_is_written_through_writer_queue() {
+        let protocol = test_protocol("websocket-route-prelude-ping");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_protocol = protocol.clone();
+        let server = tokio::spawn(async move {
+            let _ = serve_listener(listener, server_protocol, false).await;
+        });
+
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .unwrap();
+        socket
+            .send(ClientWsMessage::Ping(vec![4, 2]))
+            .await
+            .unwrap();
+        let message = timeout(Duration::from_secs(1), socket.next())
+            .await
+            .expect("route prelude ping should be answered by the writer queue")
+            .expect("websocket should remain open")
+            .expect("pong frame should be readable");
+
+        // 中文注释：route prelude 发生在认证和 initial 之前，也必须复用同一条 writer queue。
+        // 这个断言防止后续重新引入握手阶段的旁路直写。
+        assert_eq!(message, ClientWsMessage::Pong(vec![4, 2].into()));
+
+        server.abort();
+    }
+
+    #[test]
+    fn websocket_timeout_policy_matches_browser_lifecycle() {
+        assert_eq!(ROUTE_PRELUDE_TIMEOUT, Duration::from_secs(5));
+        assert_eq!(WEBSOCKET_HEARTBEAT_INTERVAL, Duration::from_secs(10));
+        assert!(!websocket_idle_timeout_enabled());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn websocket_writer_streams_frames_without_send_ack() {
+        let expected_frames = 300_usize;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/ws",
+            get(move |websocket: WebSocketUpgrade| async move {
+                websocket.on_upgrade(move |socket| async move {
+                    let peer_addr = SocketAddr::from(([127, 0, 0, 1], 0));
+                    let (sender, mut receiver) = socket.split();
+                    let reader_task = tokio::spawn(async move {
+                        while let Some(message) = receiver.next().await {
+                            if message.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                    let (wire_tx, wire_rx) = mpsc::channel(WEBSOCKET_WIRE_QUEUE_CAPACITY);
+                    let (failure_tx, mut failure_rx) = mpsc::channel(1);
+                    let writer_task =
+                        tokio::spawn(run_websocket_writer(peer_addr, wire_rx, failure_tx, sender));
+
+                    for index in 0..expected_frames {
+                        wire_tx
+                            .send(WebSocketWrite::Wire {
+                                kind: WebSocketOutKind::Initial,
+                                messages: vec![ProtocolWireMessage::Binary(
+                                    format!("frame-{index}").into_bytes(),
+                                )],
+                            })
+                            .await
+                            .unwrap();
+                    }
+
+                    drop(wire_tx);
+                    let _ = writer_task.await;
+                    assert!(failure_rx.try_recv().is_err());
+                    // 中文注释：测试只验证 writer 不再依赖成功发送回执。
+                    // 保持连接短暂存活，让客户端把已经写入 socket 的帧读完，避免 drop
+                    // websocket 时的关闭握手噪声污染断言。
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    reader_task.abort();
+                })
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service())
+                .await
+                .unwrap();
+        });
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .unwrap();
+
+        // 中文注释：writer 成功发送没有任何回执消费者。
+        // 真实 WebSocket 字节流不能被诊断/记账通道反向限制。
+        let reached = timeout(Duration::from_secs(2), async {
+            let mut seen = 0_usize;
+            while let Some(message) = socket.next().await {
+                let Ok(message) = message else {
+                    break;
+                };
+                match message {
+                    ClientWsMessage::Text(_) | ClientWsMessage::Binary(_) => {
+                        seen = seen.saturating_add(1);
+                        if seen >= expected_frames {
+                            return seen;
+                        }
+                    }
+                    ClientWsMessage::Ping(payload) => {
+                        socket.send(ClientWsMessage::Pong(payload)).await.unwrap();
+                    }
+                    ClientWsMessage::Pong(_) | ClientWsMessage::Frame(_) => {}
+                    ClientWsMessage::Close(_) => break,
+                }
+            }
+            seen
+        })
+        .await
+        .expect("websocket writer should keep writing without send ack");
+        assert_eq!(reached, expected_frames);
 
         server.abort();
     }

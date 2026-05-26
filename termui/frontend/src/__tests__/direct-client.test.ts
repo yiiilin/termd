@@ -90,6 +90,28 @@ describe("DirectClient", () => {
     expect(daemon.activeConnectionCount()).toBe(0);
   });
 
+  it("连接阶段被取消时关闭半开 WebSocket，避免后台标签页残留 relay client", async () => {
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [],
+      routeReadyDelayMs: 200,
+    });
+    const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000317");
+    const controller = new AbortController();
+    const connect = DirectClient.connect(daemon.url, daemon.serverId, device.device_id, {
+      timeoutMs: 3000,
+      expectedDaemonPublicKey: daemon.daemonPublicKey,
+      signal: controller.signal,
+    });
+
+    controller.abort();
+
+    await expect(connect).rejects.toMatchObject({ code: "connection_closed" });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(daemon.activeConnectionCount()).toBe(0);
+  });
+
   it("完成 E2EE 内层 pairing，并且 outer wire 不包含 token", async () => {
     const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000302");
     const client = await connectDevice(device.device_id);
@@ -188,6 +210,41 @@ describe("DirectClient", () => {
     expect(daemon.createdCommands).toEqual([[], []]);
   });
 
+  it("连接认证长预算不会放大普通请求短超时", async () => {
+    const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000318");
+    const pairClient = await connectDevice(device.device_id, 300);
+    const accepted = await pairClient.pair("secret-token", device.device_public_key);
+    pairClient.close();
+
+    daemon.delayNextRouteReady(80);
+    const client = await DirectClient.connect(daemon.url, daemon.serverId, device.device_id, {
+      timeoutMs: 300,
+      requestTimeoutMs: 30,
+      expectedDaemonPublicKey: daemon.daemonPublicKey,
+    });
+    await client.authenticate(device, {
+      server_id: accepted.server_id,
+      daemon_public_key: accepted.daemon_public_key,
+      url: daemon.url,
+      paired_at_ms: 1710000000000,
+    });
+
+    // 中文注释：relay route/E2EE/auth 可以比普通 RPC 慢；但连接成功后，
+    // session.list 仍要按 UI 的短请求预算失败，不能被长握手预算拖住。
+    daemon.queueSessionListResponse(
+      [
+        {
+          session_id: "00000000-0000-0000-0000-000000000301",
+          state: "running",
+          size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+        },
+      ],
+      80,
+    );
+    await expect(client.listSessions()).rejects.toMatchObject({ code: "response_timeout" });
+    client.close();
+  });
+
   it("packet dispatcher 按 request id 归属响应和错误，错误不会污染并发请求", async () => {
     const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000310");
     const pairClient = await connectDevice(device.device_id);
@@ -234,7 +291,7 @@ describe("DirectClient", () => {
     expect(errorPacket?.id).toBe(closePacket?.id);
   });
 
-  it("terminal attach 使用 stream packet，输出和输入带 seq，渲染完成后按字节发送 flow 与 cancel", async () => {
+  it("terminal attach 使用 stream packet，输出和输入带 seq，关闭发送 cancel 但不发送 flow", async () => {
     const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000311");
     const pairClient = await connectDevice(device.device_id);
     const accepted = await pairClient.pair("secret-token", device.device_public_key);
@@ -251,7 +308,6 @@ describe("DirectClient", () => {
     const list = await client.listSessions();
     const attached = await client.attachSession(list.sessions[0].session_id);
     const output = await client.receiveInner();
-    client.ackTerminalRender(attached.session_id, 1, 64 * 1024);
     await client.sendSessionData(attached.session_id, new TextEncoder().encode("stream-input"));
     client.close();
     await new Promise((resolve) => setTimeout(resolve, 20));
@@ -278,11 +334,45 @@ describe("DirectClient", () => {
     expect(receivedPackets.find((packet) => packet.kind === "stream_chunk" && packet.stream_id === streamId)).toMatchObject({
       seq: 1,
     });
-    expect(receivedPackets.find((packet) => packet.kind === "flow" && packet.stream_id === streamId)).toMatchObject({
-      ack: 1,
-      credit: 64 * 1024,
-    });
+    expect(attachOpen).not.toHaveProperty("credit");
+    expect(receivedPackets.find((packet) => packet.kind === "flow" && packet.stream_id === streamId)).toBeUndefined();
     expect(receivedPackets.find((packet) => packet.kind === "cancel" && packet.stream_id === streamId)).toBeTruthy();
+  });
+
+  it("取消 terminal stream 不关闭工作台 WebSocket，后续 RPC 继续可用", async () => {
+    const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000319");
+    const pairClient = await connectDevice(device.device_id);
+    const accepted = await pairClient.pair("secret-token", device.device_public_key);
+    pairClient.close();
+
+    const client = await connectDevice(device.device_id);
+    await client.authenticate(device, {
+      server_id: accepted.server_id,
+      daemon_public_key: accepted.daemon_public_key,
+      url: daemon.url,
+      paired_at_ms: 1710000000000,
+    });
+
+    const list = await client.listSessions();
+    const attached = await client.attachSession(list.sessions[0].session_id);
+    await client.receiveInner();
+    client.detachSession(attached.session_id);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    // 中文注释：session 切换只取消 terminal stream；同一条 WebSocket 仍要承载状态/RPC。
+    expect(daemon.activeConnectionCount()).toBe(1);
+    await expect(client.getDaemonStatus()).resolves.toMatchObject({ host_name: "mock-daemon" });
+    await expect(client.sendSessionData(attached.session_id, new TextEncoder().encode("after-detach"))).rejects.toMatchObject({
+      code: "invalid_state",
+    });
+    client.close();
+
+    const cancelPacket = daemon.receivedPackets.find(
+      (packet) => packet.kind === "cancel" && packet.stream_id === daemon.receivedPackets.find(
+        (candidate) => candidate.kind === "stream_open" && candidate.method === "terminal.attach",
+      )?.stream_id,
+    );
+    expect(cancelPacket).toBeTruthy();
   });
 
   it("二进制模式下 terminal stream packet 使用 WebSocket binary 和 raw bytes", async () => {
@@ -394,7 +484,7 @@ describe("DirectClient", () => {
     ).toBe(true);
   });
 
-  it("terminal stream batch 会展开为多个 terminal_frame，并按每帧字节数补 credit", async () => {
+  it("terminal stream batch 会展开为多个 terminal_frame，且不携带 render_credit", async () => {
     const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000315");
     const pairClient = await connectDevice(device.device_id);
     const accepted = await pairClient.pair("secret-token", device.device_public_key);
@@ -429,19 +519,19 @@ describe("DirectClient", () => {
     const first = await client.receiveInner();
     const second = await client.receiveInner();
     const batchTransportSeq = (first.payload as { transport_seq: number }).transport_seq;
-    client.ackTerminalRender(attached.session_id, batchTransportSeq, (first.payload as { render_credit: number }).render_credit);
-    client.ackTerminalRender(attached.session_id, batchTransportSeq, (second.payload as { render_credit: number }).render_credit);
     client.close();
     await new Promise((resolve) => setTimeout(resolve, 20));
 
     expect(first).toMatchObject({
       type: "terminal_frame",
-      payload: { kind: "output", terminal_seq: 1, transport_seq: batchTransportSeq, render_credit: 4 },
+      payload: { kind: "output", terminal_seq: 1, transport_seq: batchTransportSeq },
     });
     expect(second).toMatchObject({
       type: "terminal_frame",
-      payload: { kind: "output", terminal_seq: 2, transport_seq: batchTransportSeq, render_credit: 6 },
+      payload: { kind: "output", terminal_seq: 2, transport_seq: batchTransportSeq },
     });
+    expect(first.payload).not.toHaveProperty("render_credit");
+    expect(second.payload).not.toHaveProperty("render_credit");
 
     const streamId = (
       daemon as unknown as {
@@ -453,7 +543,7 @@ describe("DirectClient", () => {
         receivedPackets?: Array<{ kind: string; stream_id?: string; ack?: number; credit?: number }>;
       }
     ).receivedPackets?.filter((packet) => packet.kind === "flow" && packet.stream_id === streamId && packet.ack === batchTransportSeq) ?? [];
-    expect(flows.reduce((total, packet) => total + (packet.credit ?? 0), 0)).toBe(10);
+    expect(flows).toHaveLength(0);
   });
 
   it("短连接 attach 可以只拿 session 权限，不订阅终端输出", async () => {

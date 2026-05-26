@@ -43,7 +43,6 @@ import type {
   PongPayload,
   ProtocolPacket,
   PublicKeyWire,
-  RenderableTerminalFramePayload,
   RouteReadyPayload,
   SessionAttachPayload,
   SessionClosePayload,
@@ -103,8 +102,10 @@ import {
 
 interface DirectClientOptions {
   timeoutMs?: number;
+  requestTimeoutMs?: number;
   expectedDaemonPublicKey?: PublicKeyWire;
   webSocketFactory?: (url: string) => WebSocket;
+  signal?: AbortSignal;
 }
 
 interface QueuedMessage {
@@ -132,16 +133,10 @@ interface TerminalStreamState {
 }
 
 const DEFAULT_TIMEOUT_MS = 30000;
-const INITIAL_TERMINAL_STREAM_CREDIT = 256 * 1024;
 const RECEIVE_PUMP_YIELD_MESSAGES = 64;
 const RECEIVE_PUMP_YIELD_BYTES = 256 * 1024;
 
 export { ProtocolClientError };
-
-function base64DecodedLength(dataBase64: string): number {
-  const trimmed = dataBase64.replace(/=+$/, "");
-  return Math.floor((trimmed.length * 3) / 4);
-}
 
 function queuedMessageBytes(message: QueuedMessage): number {
   if (message.binary) {
@@ -156,6 +151,7 @@ function yieldToEventLoop(): Promise<void> {
 
 export class DirectClient {
   private readonly timeoutMs: number;
+  private readonly authTimeoutMs: number;
   private e2ee: E2eeSession;
   private closed = false;
   private receivePumpStarted = false;
@@ -172,11 +168,12 @@ export class DirectClient {
     private readonly serverIdValue: UUID,
     private readonly deviceId: UUID,
     e2ee: E2eeSession,
-    options: Required<Pick<DirectClientOptions, "timeoutMs">>,
+    options: Required<Pick<DirectClientOptions, "timeoutMs" | "requestTimeoutMs">>,
     private readonly binaryMode: boolean,
   ) {
     this.e2ee = e2ee;
-    this.timeoutMs = options.timeoutMs;
+    this.authTimeoutMs = options.timeoutMs;
+    this.timeoutMs = options.requestTimeoutMs;
   }
 
   static async connect(
@@ -188,10 +185,15 @@ export class DirectClient {
     const socket = options.webSocketFactory?.(url) ?? new WebSocket(url);
     socket.binaryType = "arraybuffer";
     const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    const requestTimeoutMs = options.requestTimeoutMs ?? timeoutMs;
     const inbox = new SocketInbox(socket);
+    const abortSignal = options.signal;
+    const closeSocketOnAbort = () => socket.close();
+    abortSignal?.addEventListener("abort", closeSocketOnAbort, { once: true });
 
     try {
-      await waitForOpen(socket, timeoutMs);
+      throwIfAborted(abortSignal);
+      await withAbort(waitForOpen(socket, timeoutMs), abortSignal);
 
       // route_hello 是统一 /ws 入口的第一帧；relay/daemon 先确认路由，再进入原有业务握手。
       sendOuterMessage(
@@ -205,7 +207,10 @@ export class DirectClient {
         }),
       );
       const routeReady = expectQueuedEnvelope(
-        await withTimeout(inbox.read(), timeoutMs, "route_prelude_timeout"),
+        await withAbort(
+          withTimeout(inbox.read(), timeoutMs, "route_prelude_timeout"),
+          abortSignal,
+        ),
       );
       if (routeReady.type === "error") {
         throw protocolError(routeReady.payload as ErrorPayload);
@@ -219,7 +224,10 @@ export class DirectClient {
       }
 
       const initial = (
-        await withTimeout(Promise.all([inbox.read(), inbox.read()]), timeoutMs, "handshake_timeout")
+        await withAbort(
+          withTimeout(Promise.all([inbox.read(), inbox.read()]), timeoutMs, "handshake_timeout"),
+          abortSignal,
+        )
       ).map(expectQueuedEnvelope);
 
       const expectedDaemonPublicKey = options.expectedDaemonPublicKey;
@@ -276,7 +284,7 @@ export class DirectClient {
         daemonPublicKeyWire: daemonKeyExchange.public_key,
       });
       const binaryMode = daemonKeyExchange.binary_version === BINARY_PROTOCOL_VERSION;
-      const client = new DirectClient(socket, inbox, routeServerId, deviceId, e2ee, { timeoutMs }, binaryMode);
+      const client = new DirectClient(socket, inbox, routeServerId, deviceId, e2ee, { timeoutMs, requestTimeoutMs }, binaryMode);
       const deviceKeyExchange: E2eeKeyExchangePayload = {
         server_id: routeServerId,
         device_id: deviceId,
@@ -304,11 +312,17 @@ export class DirectClient {
       socket.close();
       inbox.rejectPending(new ProtocolClientError("connection_closed", "connection closed"));
       throw error;
+    } finally {
+      abortSignal?.removeEventListener("abort", closeSocketOnAbort);
     }
   }
 
   get serverId(): UUID {
     return this.serverIdValue;
+  }
+
+  get isClosed(): boolean {
+    return this.closed || this.socket.readyState === WebSocket.CLOSING || this.socket.readyState === WebSocket.CLOSED;
   }
 
   async pair(token: string, devicePublicKey: PublicKeyWire): Promise<PairAcceptPayload> {
@@ -322,15 +336,15 @@ export class DirectClient {
   }
 
   async authenticate(device: DeviceState, server: PairedServerState): Promise<void> {
-    const challenge = await this.expectQueuedPayload<AuthChallengePayload>("auth_challenge");
+    const challenge = await this.expectQueuedPayload<AuthChallengePayload>("auth_challenge", this.authTimeoutMs);
     const auth = await signAuthPayload(
       authPayloadForChallenge(device.device_id, challenge.challenge),
       server,
       device.device_signing_key_secret,
       this.e2eeTranscriptSha256,
     );
-    await this.request("auth.verify", auth);
-    await this.request("client.hello", { name: device.name?.trim() || "Web client" } satisfies ClientHelloPayload);
+    await this.request("auth.verify", auth, this.authTimeoutMs);
+    await this.request("client.hello", { name: device.name?.trim() || "Web client" } satisfies ClientHelloPayload, this.authTimeoutMs);
   }
 
   async listSessions(): Promise<SessionListResultPayload> {
@@ -497,6 +511,16 @@ export class DirectClient {
     );
   }
 
+  async attachSessionPermission(sessionId: UUID): Promise<SessionAttachedPayload> {
+    return this.request<SessionAttachedPayload>(
+      "session.attach",
+      {
+        session_id: sessionId,
+        watch_updates: false,
+      } satisfies SessionAttachPayload,
+    );
+  }
+
   async sendSessionData(sessionId: UUID, bytes: Uint8Array): Promise<void> {
     const stream = this.terminalStreamsBySession.get(sessionId);
     if (!stream) {
@@ -577,7 +601,7 @@ export class DirectClient {
     return Math.max(0, performance.now() - startedAt);
   }
 
-  async request<T = unknown>(method: string, payload: unknown): Promise<T> {
+  async request<T = unknown>(method: string, payload: unknown, timeoutMs = this.timeoutMs): Promise<T> {
     const id = randomUuid();
     return this.sendTrackedPacket<T>(
       {
@@ -589,6 +613,7 @@ export class DirectClient {
       },
       id,
       method,
+      timeoutMs,
     );
   }
 
@@ -613,6 +638,27 @@ export class DirectClient {
         reject,
       });
     });
+  }
+
+  detachSession(sessionId: UUID, reason = "client_detached"): void {
+    const stream = this.terminalStreamsBySession.get(sessionId);
+    if (!stream) {
+      return;
+    }
+    // 中文注释：切换会话只取消当前 terminal stream，不能关闭承载 RPC/事件的工作台 WebSocket。
+    this.sendPacketBestEffort({
+      version: PROTOCOL_PACKET_VERSION,
+      kind: "cancel",
+      stream_id: stream.streamId,
+      payload: { reason },
+    });
+    this.removeStream(stream.streamId);
+  }
+
+  interruptReceiveWaiters(): void {
+    // 中文注释：App 暂停终端输出消费时不能关闭 socket；这里只唤醒正在 await
+    // receiveInner 的 UI 循环，后续入站 segment 继续留在 DirectClient 队列里。
+    this.rejectInnerWaiters(new ProtocolClientError("receive_interrupted", "receive interrupted"));
   }
 
   close(): void {
@@ -677,8 +723,13 @@ export class DirectClient {
       } catch (caught) {
         if (!this.closed) {
           const error = caught instanceof Error ? caught : new ProtocolClientError("protocol_error", "protocol operation failed");
+          // receive pump 已经证明这条 WebSocket 不再可信；标记关闭并主动 close，
+          // 避免上层继续复用一个不会再消费入站消息的 DirectClient。
+          this.closed = true;
           this.rejectPendingRequests(error);
           this.rejectInnerWaiters(error);
+          this.socket.close();
+          this.inbox.rejectPending(error);
         }
         return;
       }
@@ -808,10 +859,9 @@ export class DirectClient {
   private enqueueSessionData(payload: SessionDataPayload, streamId: PacketStreamId, transportSeq: number): void {
     this.enqueueInner(envelope("session_data", {
       ...payload,
-      // 这三个字段只供前端内部流控使用：daemon/relay 仍只理解原始 session_data。
+      // 这两个字段只供前端定位 stream 归属；daemon/relay 仍只理解原始 session_data。
       stream_id: streamId,
       transport_seq: transportSeq,
-      render_credit: this.sessionDataRenderCredit(payload),
     } satisfies SessionDataPayload));
   }
 
@@ -824,8 +874,7 @@ export class DirectClient {
       ...(payload as object),
       transport_seq: transportSeq,
       stream_id: streamId,
-      render_credit: this.terminalFrameRenderCredit(payload),
-    } as RenderableTerminalFramePayload));
+    }));
   }
 
   private isTerminalFramePayload(payload: unknown): payload is SingleTerminalFramePayload {
@@ -836,37 +885,11 @@ export class DirectClient {
     return kind === "snapshot" || kind === "output" || kind === "resize" || kind === "exit";
   }
 
-  private terminalFrameRenderCredit(payload: SingleTerminalFramePayload): number {
-    if (payload.kind === "snapshot" || payload.kind === "output") {
-      return Math.max(1, payload.data_bytes?.byteLength ?? base64DecodedLength(payload.data_base64 ?? ""));
-    }
-    return 1;
-  }
-
-  private sessionDataRenderCredit(payload: SessionDataPayload): number {
-    return Math.max(1, payload.data_bytes?.byteLength ?? base64DecodedLength(payload.data_base64 ?? ""));
-  }
-
-  ackTerminalRender(sessionId: UUID, transportSeq: number, credit: number): void {
-    const stream = this.terminalStreamsBySession.get(sessionId);
-    if (!stream || credit <= 0 || transportSeq <= 0) {
-      return;
-    }
-    this.sendPacketBestEffort({
-      version: PROTOCOL_PACKET_VERSION,
-      kind: "flow",
-      stream_id: stream.streamId,
-      ack: transportSeq,
-      credit,
-      payload: {},
-    });
-  }
-
-  private async expectQueuedPayload<T>(expectedType: Envelope["type"]): Promise<T> {
+  private async expectQueuedPayload<T>(expectedType: Envelope["type"], timeoutMs = this.timeoutMs): Promise<T> {
     const buffered: Envelope[] = [];
     try {
       while (true) {
-        const inner = await withTimeout(this.receiveInner(), this.timeoutMs, "response_timeout");
+        const inner = await withTimeout(this.receiveInner(), timeoutMs, "response_timeout");
         if (inner.type === expectedType) {
           return inner.payload as T;
         }
@@ -900,7 +923,6 @@ export class DirectClient {
         id,
         stream_id: streamId,
         method,
-        credit: INITIAL_TERMINAL_STREAM_CREDIT,
         payload,
       },
       id,
@@ -924,7 +946,7 @@ export class DirectClient {
     );
   }
 
-  private sendTrackedPacket<T>(packet: ProtocolPacket, id: UUID, method: string): Promise<T> {
+  private sendTrackedPacket<T>(packet: ProtocolPacket, id: UUID, method: string, timeoutMs = this.timeoutMs): Promise<T> {
     if (this.closed) {
       return Promise.reject(new ProtocolClientError("connection_closed", "connection closed"));
     }
@@ -932,7 +954,7 @@ export class DirectClient {
       const timer = setTimeout(() => {
         this.pendingRequests.delete(id);
         reject(new ProtocolClientError("response_timeout", "operation timed out"));
-      }, this.timeoutMs);
+      }, timeoutMs);
       this.pendingRequests.set(id, {
         method,
         resolve: (payload) => resolve(payload as T),
@@ -1004,7 +1026,7 @@ export class DirectClient {
     try {
       this.sendPacket(packet);
     } catch {
-      // flow/cancel 是流控提示；socket 已关闭时不能影响其它请求归属。
+      // cancel 是连接关闭提示；socket 已关闭时不能影响其它请求归属。
     }
   }
 
@@ -1214,6 +1236,37 @@ function waitForOpen(socket: WebSocket, timeoutMs: number): Promise<void> {
     timeoutMs,
     "connect_timeout",
   );
+}
+
+function abortedConnectionError(): ProtocolClientError {
+  return new ProtocolClientError("connection_closed", "connection closed");
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) {
+    throw abortedConnectionError();
+  }
+}
+
+function withAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) {
+    return promise;
+  }
+  throwIfAborted(signal);
+  return new Promise((resolve, reject) => {
+    const abort = () => reject(abortedConnectionError());
+    signal.addEventListener("abort", abort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", abort);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener("abort", abort);
+        reject(error);
+      },
+    );
+  });
 }
 
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number, code: string): Promise<T> {

@@ -574,11 +574,6 @@ pub fn decode_binary_protocol_packet(
 pub enum RouteRole {
     Client,
     DaemonMux,
-    /// daemon 到 relay 的输出数据通道。
-    ///
-    /// 它只用于把高吞吐 terminal output 从控制通道中拆出去，不表达任何 session/operator
-    /// 权限。旧 relay 不认识该角色时会拒绝连接，避免把 data 通道误注册成新的控制 mux。
-    DaemonMuxData,
 }
 
 /// WebSocket 第一帧路由前置握手。
@@ -590,9 +585,9 @@ pub struct RouteHelloPayload {
     pub role: RouteRole,
     pub protocol_version: ProtocolVersion,
     pub nonce: Nonce,
-    /// daemon control/data mux 的公开连接代际。
+    /// daemon mux 的公开连接代际。
     ///
-    /// relay 只用它确认 `daemon_mux_data` 附属于当前 `daemon_mux`，不解析任何业务密文。
+    /// relay 只用它确认新 mux 是否替换旧 mux，不解析任何业务密文。
     #[serde(default)]
     pub route_generation: Option<Nonce>,
     pub timestamp_ms: UnixTimestampMillis,

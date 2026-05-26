@@ -173,24 +173,21 @@ struct PendingRestoreSession {
 /// 0.2.0 packet terminal stream 的连接内状态。
 ///
 /// stream id 只在单条 E2EE 连接内有效；它把 terminal attach 的 request/response、后续
-/// input/output chunk、flow credit 和 cancel 都绑定到同一个 session。
+/// input/output chunk 和 cancel 都绑定到同一个 session。旧协议里的 flow/credit 字段仍会被
+/// 解码和统计，但不再作为 terminal 输出闸门；连接级背压交给 WebSocket/TCP 和外层 bounded queue。
 #[derive(Debug, Clone)]
 struct PacketTerminalStream {
     session_id: SessionId,
     next_input_seq: u64,
     next_output_seq: u64,
-    // 中文注释：terminal output credit 使用“已渲染字节数”作为单位，不再按 frame 计数。
-    // 这样大量小 frame 不会因为 frame 数过多而被 8 个 credit 人为限速。
-    output_credit: u32,
 }
 
 impl PacketTerminalStream {
-    fn new(session_id: SessionId, output_credit: u32) -> Self {
+    fn new(session_id: SessionId) -> Self {
         Self {
             session_id,
             next_input_seq: 1,
             next_output_seq: 1,
-            output_credit,
         }
     }
 }
@@ -680,7 +677,6 @@ pub struct DaemonProtocol<B: PtyBackend, V> {
     session_terminal_frame_logs: HashMap<SessionId, SessionTerminalFrameLog>,
     session_file_tree_signals: HashMap<SessionId, watch::Sender<u64>>,
     session_resize_signals: HashMap<SessionId, watch::Sender<TerminalSize>>,
-    session_resize_owners: HashMap<SessionId, ClientId>,
     pending_restore_sessions: HashMap<SessionId, PendingRestoreSession>,
 }
 
@@ -777,7 +773,6 @@ where
             session_terminal_frame_logs: HashMap::new(),
             session_file_tree_signals: HashMap::new(),
             session_resize_signals: HashMap::new(),
-            session_resize_owners: HashMap::new(),
             pending_restore_sessions: HashMap::new(),
         })
     }
@@ -1189,7 +1184,6 @@ where
         };
         connection.attach(wire_session_id, output_offset, initial_output, true);
         self.record_daemon_client_attach(wire_session_id, connection, device_id);
-        let resize_owner = self.assign_resize_owner_if_missing(wire_session_id, connection);
 
         let response_state = self.runtime_state_proto(&internal_session_id)?;
         let response = SessionCreatedPayload {
@@ -1198,7 +1192,7 @@ where
             role: wire_role,
             state: response_state,
             size: response_size,
-            resize_owner,
+            resize_owner: true,
         };
         self.client_history.record_session_runtime_state(
             wire_session_id,
@@ -1284,7 +1278,7 @@ where
         );
         let resize_owner = if payload.watch_updates {
             self.record_daemon_client_attach(payload.session_id, connection, device_id);
-            self.assign_resize_owner_if_missing(payload.session_id, connection)
+            true
         } else {
             false
         };
@@ -1337,9 +1331,6 @@ where
             .get(&payload.session_id)
             .ok_or(ProtocolError::SessionNotFound)?;
         connection.ensure_attached_to(payload.session_id)?;
-        if !self.connection_is_resize_owner(payload.session_id, connection) {
-            return Err(ProtocolError::InvalidState);
-        }
 
         self.runtime
             .resize(internal_session_id, proto_size_to_runtime(payload.size))
@@ -1538,7 +1529,6 @@ where
         self.session_terminal_frame_logs.remove(&session_id);
         self.session_file_tree_signals.remove(&session_id);
         self.session_resize_signals.remove(&session_id);
-        self.session_resize_owners.remove(&session_id);
         self.pending_restore_sessions.remove(&session_id);
         for record in self.daemon_clients.values_mut() {
             for sessions in record.active_connections.values_mut() {
@@ -2275,62 +2265,6 @@ where
         );
     }
 
-    fn assign_resize_owner_if_missing(
-        &mut self,
-        session_id: SessionId,
-        connection: &ProtocolConnection,
-    ) -> bool {
-        // resize owner 是连接级状态，同一设备的两个浏览器标签页也不能同时改 PTY 尺寸。
-        let owner = self
-            .session_resize_owners
-            .entry(session_id)
-            .or_insert(connection.client_id);
-        *owner == connection.client_id
-    }
-
-    fn connection_is_resize_owner(
-        &self,
-        session_id: SessionId,
-        connection: &ProtocolConnection,
-    ) -> bool {
-        self.session_resize_owners
-            .get(&session_id)
-            .map(|owner| *owner == connection.client_id)
-            .unwrap_or(false)
-    }
-
-    fn first_attached_connection_for_session(&self, session_id: SessionId) -> Option<ClientId> {
-        let mut candidates: Vec<_> = self
-            .daemon_clients
-            .values()
-            .filter(|record| record.online)
-            .flat_map(|record| {
-                record
-                    .active_connections
-                    .iter()
-                    .filter(move |(_, sessions)| sessions.contains(&session_id))
-                    .map(move |(client_id, _)| (*client_id, record.connected_at_ms))
-            })
-            .collect();
-        candidates.sort_by_key(|(client_id, connected_at_ms)| (connected_at_ms.0, client_id.0));
-        candidates.first().map(|(client_id, _)| *client_id)
-    }
-
-    fn refresh_resize_owner_after_detach(&mut self, session_id: SessionId, old_owner: ClientId) {
-        if self.session_resize_owners.get(&session_id) != Some(&old_owner) {
-            return;
-        }
-        match self.first_attached_connection_for_session(session_id) {
-            Some(next_owner) => {
-                self.session_resize_owners.insert(session_id, next_owner);
-                self.notify_session_resized_with_current_size(session_id);
-            }
-            None => {
-                self.session_resize_owners.remove(&session_id);
-            }
-        }
-    }
-
     fn mark_daemon_client_connection_offline(
         &mut self,
         device_id: DeviceId,
@@ -2773,16 +2707,6 @@ where
         let _ = signal.send(size);
     }
 
-    fn notify_session_resized_with_current_size(&self, session_id: SessionId) {
-        let Some(internal_session_id) = self.session_index.get(&session_id) else {
-            return;
-        };
-        let Ok(size) = self.runtime_size_proto(internal_session_id) else {
-            return;
-        };
-        self.notify_session_resized(session_id, size);
-    }
-
     fn detach_connection(&mut self, connection: &mut ProtocolConnection) {
         let Some(device_id) = connection.authenticated_device_id else {
             connection.state = ProtocolConnectionState::Closed;
@@ -2808,7 +2732,6 @@ where
         // 断开 WebSocket 只 detach 当前连接关联的 session，不 close/terminate PTY。
         // 同一浏览器/设备如果还有另一条 attach 连接在线，不能撤掉设备级 operator 角色。
         for wire_session_id in attached_sessions {
-            self.refresh_resize_owner_after_detach(wire_session_id, connection.client_id);
             if remaining_sessions.contains(&wire_session_id) {
                 continue;
             }
@@ -3649,7 +3572,9 @@ pub struct ProtocolConnectionDebugSnapshot {
     pub attached_sessions: usize,
     pub watched_sessions: usize,
     pub terminal_streams: usize,
+    /// 兼容旧日志字段。terminal 输出不再按 browser render credit 限流，因此这里恒为 0。
     pub zero_credit_terminal_streams: usize,
+    /// 兼容旧日志字段。terminal 输出不再维护应用层 output credit，因此这里恒为 0。
     pub total_output_credit: u64,
     pub pending_raw_chunks: usize,
     pub pending_terminal_frames: usize,
@@ -3675,7 +3600,7 @@ pub struct ProtocolConnectionDebugTraffic {
     pub outbound_session_data_bytes: u64,
     pub outbound_terminal_frame_chunks: u64,
     pub outbound_terminal_frame_count: u64,
-    pub outbound_terminal_frame_credit: u64,
+    pub outbound_terminal_frame_bytes: u64,
     pub outbound_terminal_frame_transport_bytes: u64,
 }
 
@@ -3764,14 +3689,14 @@ impl ProtocolConnectionDebugTraffic {
             .saturating_add(base64_payload_decoded_len(data_base64) as u64);
     }
 
-    fn record_outbound_terminal_frame(&mut self, frame: &TerminalFramePayload, credit_cost: u32) {
+    fn record_outbound_terminal_frame(&mut self, frame: &TerminalFramePayload) {
         self.outbound_terminal_frame_chunks = self.outbound_terminal_frame_chunks.saturating_add(1);
         self.outbound_terminal_frame_count = self
             .outbound_terminal_frame_count
             .saturating_add(terminal_frame_payload_count(frame) as u64);
-        self.outbound_terminal_frame_credit = self
-            .outbound_terminal_frame_credit
-            .saturating_add(u64::from(credit_cost));
+        self.outbound_terminal_frame_bytes = self
+            .outbound_terminal_frame_bytes
+            .saturating_add(terminal_frame_payload_bytes(frame) as u64);
         self.outbound_terminal_frame_transport_bytes = self
             .outbound_terminal_frame_transport_bytes
             .saturating_add(terminal_frame_transport_cost(frame) as u64);
@@ -3822,9 +3747,9 @@ impl ProtocolConnectionDebugTraffic {
         self.outbound_terminal_frame_count = self
             .outbound_terminal_frame_count
             .saturating_add(other.outbound_terminal_frame_count);
-        self.outbound_terminal_frame_credit = self
-            .outbound_terminal_frame_credit
-            .saturating_add(other.outbound_terminal_frame_credit);
+        self.outbound_terminal_frame_bytes = self
+            .outbound_terminal_frame_bytes
+            .saturating_add(other.outbound_terminal_frame_bytes);
         self.outbound_terminal_frame_transport_bytes = self
             .outbound_terminal_frame_transport_bytes
             .saturating_add(other.outbound_terminal_frame_transport_bytes);
@@ -3908,7 +3833,7 @@ impl ProtocolConnection {
     }
 
     pub fn debug_snapshot(&self) -> ProtocolConnectionDebugSnapshot {
-        // 该快照只暴露计数和 credit，不包含 PTY 明文或设备密钥，可安全写入 daemon 日志。
+        // 该快照只暴露队列计数，不包含 PTY 明文或设备密钥，可安全写入 daemon 日志。
         let pending_raw_chunks = self.pending_outputs.values().map(VecDeque::len).sum();
         let pending_terminal_frames = self
             .pending_terminal_frames
@@ -3921,16 +3846,8 @@ impl ProtocolConnection {
             attached_sessions: self.attached_sessions.len(),
             watched_sessions: self.watched_sessions.len(),
             terminal_streams: self.packet_terminal_streams.len(),
-            zero_credit_terminal_streams: self
-                .packet_terminal_streams
-                .values()
-                .filter(|stream| stream.output_credit == 0)
-                .count(),
-            total_output_credit: self
-                .packet_terminal_streams
-                .values()
-                .map(|stream| u64::from(stream.output_credit))
-                .sum(),
+            zero_credit_terminal_streams: 0,
+            total_output_credit: 0,
             pending_raw_chunks,
             pending_terminal_frames,
         }
@@ -3942,9 +3859,8 @@ impl ProtocolConnection {
 
     /// 取走需要在释放全局 daemon 锁后继续 flush 的 session。
     ///
-    /// 中文注释：`flow` 只应该更新 credit 并唤醒输出路径，不能在收到 ACK 的同一个
-    /// protocol 临界区里继续读 PTY、组 batch、编码和加密。否则前端渲染完成后的高频
-    /// credit 会把 direct WebSocket 与 relay mux 共享的 daemon 协议锁占住。
+    /// 中文注释：terminal 输出不再等待浏览器 render ACK / credit。这里的 wakeup 只用于
+    /// batch/transport 上限截断后继续排下一轮 push，避免单轮输出占住 daemon 主循环。
     pub fn take_deferred_output_wakeups(&mut self) -> Vec<SessionId> {
         self.deferred_output_wakeups.drain().collect()
     }
@@ -4398,11 +4314,6 @@ impl ProtocolConnection {
             return Ok(Vec::new());
         }
         if self.packet_mode {
-            let max_credit = self.packet_stream_output_credit(session_id).unwrap_or(0) as usize;
-            if max_credit == 0 {
-                return Ok(Vec::new());
-            }
-
             let mut frames = Vec::new();
             let mut frame_bytes = 0_usize;
             let mut frame_transport_bytes = 0_usize;
@@ -4416,14 +4327,13 @@ impl ProtocolConnection {
                 let Some(frame) = pending_frame else {
                     break;
                 };
-                let cost = terminal_frame_credit_cost(&frame);
+                let cost = terminal_frame_payload_bytes(&frame);
                 let transport_cost = terminal_frame_transport_cost(&frame);
-                if !terminal_frame_fits_credit_batch(
+                if !terminal_frame_fits_output_batch(
                     frame_bytes,
                     frame_transport_bytes,
                     cost,
                     transport_cost,
-                    max_credit,
                 ) {
                     self.pending_terminal_frames
                         .entry(session_id)
@@ -4463,14 +4373,13 @@ impl ProtocolConnection {
                         stopped = true;
                         break;
                     }
-                    let cost = terminal_frame_credit_cost(&frame);
+                    let cost = terminal_frame_payload_bytes(&frame);
                     let transport_cost = terminal_frame_transport_cost(&frame);
-                    if !terminal_frame_fits_credit_batch(
+                    if !terminal_frame_fits_output_batch(
                         frame_bytes,
                         frame_transport_bytes,
                         cost,
                         transport_cost,
-                        max_credit,
                     ) {
                         let pending = self.pending_terminal_frames.entry(session_id).or_default();
                         pending.push_back(frame);
@@ -4488,19 +4397,16 @@ impl ProtocolConnection {
                 }
             }
 
-            // 中文注释：当前批次可能因为 transport/单轮 frame 预算先停下，但 output
-            // credit 仍有剩余。此时必须自己排下一轮 push；否则只有等浏览器下一次 ACK
-            // 才会继续，真实 relay 下大量小 frame 会表现成一批一批慢慢蹦。
-            let remaining_credit = max_credit.saturating_sub(frame_bytes);
-            if remaining_credit > 0
-                && (self
-                    .pending_terminal_frames
-                    .get(&session_id)
-                    .is_some_and(|pending| !pending.is_empty())
-                    || protocol.terminal_frame_log_has_from(
-                        session_id,
-                        self.next_terminal_frame_seq(session_id),
-                    ))
+            // 中文注释：terminal 输出不再等待 browser flow ACK。当前批次如果被字节或
+            // transport 上限截断，直接排下一轮 push；慢客户端由 WebSocket 写入队列负责断开。
+            if self
+                .pending_terminal_frames
+                .get(&session_id)
+                .is_some_and(|pending| !pending.is_empty())
+                || protocol.terminal_frame_log_has_from(
+                    session_id,
+                    self.next_terminal_frame_seq(session_id),
+                )
             {
                 self.deferred_output_wakeups.insert(session_id);
             }
@@ -4508,11 +4414,7 @@ impl ProtocolConnection {
             return terminal_frame_batch_messages(session_id, frames);
         }
         let max_packet_chunks = if self.packet_mode {
-            let credit = self.packet_stream_output_credit(session_id).unwrap_or(0) as usize;
-            if credit == 0 {
-                return Ok(Vec::new());
-            }
-            credit.min(RAW_OUTPUT_BATCH_MAX_CHUNKS)
+            RAW_OUTPUT_BATCH_MAX_CHUNKS
         } else {
             RAW_OUTPUT_BATCH_MAX_CHUNKS
         };
@@ -4808,7 +4710,7 @@ impl ProtocolConnection {
             SessionResizedPayload {
                 session_id,
                 size,
-                resize_owner: protocol.connection_is_resize_owner(session_id, self),
+                resize_owner: true,
             },
         )?])
     }
@@ -5136,10 +5038,9 @@ impl ProtocolConnection {
             .method
             .clone()
             .ok_or(ProtocolError::InvalidEnvelope)?;
-        let credit = packet.credit.unwrap_or(0);
         // 中文注释：同一条 WebSocket 连接只有一个活跃 terminal 输出流。
         // Web 快速切换 session 时，旧流可能还没来得及 cancel；先清掉旧 stream/pending，
-        // 再让新的 attach/create 生成自己的 snapshot/tail，避免旧输出继续占用 credit 和队列。
+        // 再让新的 attach/create 生成自己的 snapshot/tail，避免旧输出继续占用队列。
         if matches!(
             method.as_str(),
             METHOD_TERMINAL_CREATE | METHOD_TERMINAL_ATTACH
@@ -5163,8 +5064,8 @@ impl ProtocolConnection {
             Err(error) => return Ok(vec![packet_request_error(id, error)?]),
         };
         let session_id = packet_stream_session_id(method.as_str(), &envelopes)?;
-        self.register_packet_terminal_stream(stream_id, session_id, credit);
-        packetize_handler_stream_open_response(id, stream_id, method.as_str(), credit, envelopes)
+        self.register_packet_terminal_stream(stream_id, session_id);
+        packetize_handler_stream_open_response(id, stream_id, method.as_str(), envelopes)
     }
 
     fn handle_packet_stream_chunk<B, V>(
@@ -5244,25 +5145,9 @@ impl ProtocolConnection {
         packet: ProtocolPacket<Value>,
     ) -> Result<Vec<ProtocolPacket<Value>>, ProtocolError> {
         let stream_id = packet.stream_id.ok_or(ProtocolError::InvalidEnvelope)?;
-        let credit = packet.credit.unwrap_or(0);
-        let Some(session_id) = self
-            .packet_terminal_streams
-            .get(&stream_id)
-            .map(|stream| stream.session_id)
-        else {
-            return Ok(Vec::new());
-        };
-        if let Some(stream) = self.packet_terminal_streams.get_mut(&stream_id) {
-            stream.output_credit = stream.output_credit.saturating_add(credit);
-        }
-        if credit == 0 {
-            return Ok(Vec::new());
-        }
-
-        // 中文注释：flow 只做 credit 记账和输出唤醒。真正读取 PTY/backlog、打包和加密
-        // 由 server/relay 在释放全局 daemon 锁后走 push 队列完成，避免渲染 ACK 风暴
-        // 把输入、attach、relay mux 读循环都压在同一把锁后面。
-        self.deferred_output_wakeups.insert(session_id);
+        // 中文注释：旧客户端可能继续发送 flow。新模型中 WebSocket/TCP 已保证可靠有序，
+        // terminal 输出不再等待 render ACK/credit；这里仅确认 stream 存在并把 flow 当 no-op。
+        let _ = self.packet_terminal_streams.get(&stream_id);
         Ok(Vec::new())
     }
 
@@ -5416,14 +5301,11 @@ impl ProtocolConnection {
         &mut self,
         stream_id: PacketStreamId,
         session_id: SessionId,
-        output_credit: u32,
     ) {
         self.packet_terminal_streams_by_session
             .insert(session_id, stream_id);
-        self.packet_terminal_streams.insert(
-            stream_id,
-            PacketTerminalStream::new(session_id, output_credit),
-        );
+        self.packet_terminal_streams
+            .insert(stream_id, PacketTerminalStream::new(session_id));
     }
 
     fn clear_packet_terminal_streams(&mut self) {
@@ -5462,13 +5344,6 @@ impl ProtocolConnection {
             .copied()
     }
 
-    fn packet_stream_output_credit(&self, session_id: SessionId) -> Option<u32> {
-        let stream_id = self.packet_stream_id_for_session(session_id)?;
-        self.packet_terminal_streams
-            .get(&stream_id)
-            .map(|stream| stream.output_credit)
-    }
-
     fn next_terminal_frame_seq(&self, session_id: SessionId) -> u64 {
         self.terminal_frame_next_seq
             .get(&session_id)
@@ -5499,17 +5374,12 @@ impl ProtocolConnection {
     fn next_packet_stream_output_seq(
         &mut self,
         session_id: SessionId,
-        credit_cost: u32,
     ) -> Option<(PacketStreamId, u64)> {
         let stream_id = self.packet_stream_id_for_session(session_id)?;
         let stream = self.packet_terminal_streams.get_mut(&stream_id)?;
-        if stream.output_credit == 0 {
-            return None;
-        }
 
         let seq = stream.next_output_seq;
         stream.next_output_seq = stream.next_output_seq.saturating_add(1);
-        stream.output_credit = stream.output_credit.saturating_sub(credit_cost.max(1));
         Some((stream_id, seq))
     }
 
@@ -5587,7 +5457,7 @@ fn base64_payload_decoded_len(data_base64: &str) -> usize {
     trimmed.len().saturating_mul(3) / 4
 }
 
-fn terminal_frame_credit_cost(frame: &TerminalFramePayload) -> usize {
+fn terminal_frame_payload_bytes(frame: &TerminalFramePayload) -> usize {
     match frame {
         TerminalFramePayload::Snapshot { data_base64, .. }
         | TerminalFramePayload::Output { data_base64, .. } => {
@@ -5598,7 +5468,7 @@ fn terminal_frame_credit_cost(frame: &TerminalFramePayload) -> usize {
         }
         TerminalFramePayload::Batch { frames, .. } => frames
             .iter()
-            .map(terminal_frame_credit_cost)
+            .map(terminal_frame_payload_bytes)
             .sum::<usize>()
             .max(TERMINAL_STREAM_METADATA_CREDIT_BYTES),
     }
@@ -5643,22 +5513,19 @@ fn terminal_frame_transport_cost(frame: &TerminalFramePayload) -> usize {
     }
 }
 
-fn terminal_frame_fits_credit_batch(
+fn terminal_frame_fits_output_batch(
     current_bytes: usize,
     current_transport_bytes: usize,
     frame_bytes: usize,
     frame_transport_bytes: usize,
-    max_credit: usize,
 ) -> bool {
     let frame_bytes = frame_bytes.max(TERMINAL_STREAM_METADATA_CREDIT_BYTES);
     if current_bytes == 0 {
-        // 中文注释：terminal frame 是不可拆的协议边界；单个 snapshot/output 可能大于当前
-        // credit 或 transport 上限，此时允许它独占一个 stream_chunk，并通过 saturating 扣减把
-        // credit 清零，等待客户端按实际渲染字节补回，避免大 snapshot 永久卡住。
-        return max_credit > 0;
+        // 中文注释：terminal frame 是不可拆的协议边界；单个 snapshot/output 可能大于
+        // batch 或 transport 上限，此时允许它独占一个 stream_chunk，避免大 snapshot 永久卡住。
+        return true;
     }
-    current_bytes.saturating_add(frame_bytes) <= max_credit
-        && current_bytes.saturating_add(frame_bytes) <= TERMINAL_STREAM_BATCH_MAX_BYTES
+    current_bytes.saturating_add(frame_bytes) <= TERMINAL_STREAM_BATCH_MAX_BYTES
         && current_transport_bytes.saturating_add(frame_transport_bytes)
             <= TERMINAL_STREAM_BATCH_MAX_TRANSPORT_BYTES
 }
@@ -5725,13 +5592,11 @@ fn packetize_handler_stream_open_response(
     id: PacketRequestId,
     stream_id: PacketStreamId,
     method: &str,
-    credit: u32,
     envelopes: Vec<JsonEnvelope>,
 ) -> Result<Vec<ProtocolPacket<Value>>, ProtocolError> {
     let mut packets = packetize_handler_responses(id, method, envelopes)?;
     if let Some(first) = packets.first_mut() {
         first.stream_id = Some(stream_id);
-        first.credit = Some(credit);
     }
     Ok(packets)
 }
@@ -5765,9 +5630,8 @@ fn packet_from_envelope(
 
     if envelope.kind == MessageType::SessionData {
         let payload: SessionDataPayload = decode_payload(envelope.payload)?;
-        let credit_cost = base64_payload_credit_cost(&payload.data_base64);
         let (stream_id, seq) = connection
-            .next_packet_stream_output_seq(payload.session_id, credit_cost)
+            .next_packet_stream_output_seq(payload.session_id)
             .ok_or(ProtocolError::InvalidState)?;
         connection
             .debug_traffic
@@ -5778,13 +5642,12 @@ fn packet_from_envelope(
 
     if envelope.kind == MessageType::TerminalFrame {
         let payload: TerminalFramePayload = decode_payload(envelope.payload)?;
-        let credit_cost = terminal_frame_credit_cost(&payload).min(u32::MAX as usize) as u32;
         let (stream_id, seq) = connection
-            .next_packet_stream_output_seq(payload.session_id(), credit_cost)
+            .next_packet_stream_output_seq(payload.session_id())
             .ok_or(ProtocolError::InvalidState)?;
         connection
             .debug_traffic
-            .record_outbound_terminal_frame(&payload, credit_cost);
+            .record_outbound_terminal_frame(&payload);
         let payload = serde_json::to_value(payload).map_err(|_| ProtocolError::InvalidEnvelope)?;
         return Ok(ProtocolPacket::stream_chunk(stream_id, seq, payload));
     }
@@ -8293,7 +8156,7 @@ mod tests {
         assert_eq!(output_traffic.outbound_stream_chunks, 1);
         assert_eq!(output_traffic.outbound_terminal_frame_chunks, 1);
         assert!(output_traffic.outbound_terminal_frame_count >= 1);
-        assert!(output_traffic.outbound_terminal_frame_credit >= 5);
+        assert!(output_traffic.outbound_terminal_frame_bytes >= 5);
 
         let _ = send_encrypted_packet(
             &mut protocol,
@@ -9164,7 +9027,7 @@ mod tests {
     }
 
     #[test]
-    fn packet_terminal_output_batches_frames_by_byte_credit() {
+    fn packet_terminal_output_batches_frames_by_output_bytes_without_credit() {
         let (mut protocol, backend) = protocol();
         let (mut connection, _) = protocol.start_connection();
         let device_id = DeviceId::new();
@@ -9230,7 +9093,7 @@ mod tests {
                 PacketRequestId::new(),
                 stream_id,
                 METHOD_TERMINAL_ATTACH,
-                20,
+                0,
                 serde_json::to_value(SessionAttachPayload {
                     session_id: created.session_id,
                     watch_updates: true,
@@ -9254,20 +9117,21 @@ mod tests {
         match first_batch {
             TerminalFramePayload::Batch { session_id, frames } => {
                 assert_eq!(session_id, created.session_id);
-                assert_eq!(frames.len(), 2);
+                assert_eq!(frames.len(), 3);
                 assert_eq!(frames[0].terminal_seq(), Some(1));
                 assert_eq!(frames[1].terminal_seq(), Some(2));
+                assert_eq!(frames[2].terminal_seq(), Some(3));
             }
             other => panic!("expected first byte-budgeted terminal batch, got {other:?}"),
         }
 
-        let blocked = decrypt_packets(
+        let drained = decrypt_packets(
             &mut device_session,
             connection.read_session_output(&mut protocol, created.session_id, 1024),
         );
         assert!(
-            blocked.is_empty(),
-            "no output should be sent after byte credit is exhausted: {blocked:?}"
+            drained.is_empty(),
+            "all frames should already be sent without waiting for render credit: {drained:?}"
         );
 
         let flow_responses = send_encrypted_packet(
@@ -9278,22 +9142,71 @@ mod tests {
         );
         assert!(
             flow_responses.is_empty(),
-            "flow credit should defer output production to the push drain path"
+            "legacy flow packets are accepted as no-op compatibility frames"
+        );
+        assert!(connection.take_deferred_output_wakeups().is_empty());
+    }
+
+    #[test]
+    fn packet_terminal_output_does_not_wait_for_stream_credit() {
+        let (mut protocol, backend) = protocol();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let (_, mut device_session, _) =
+            open_packet_e2ee(&mut protocol, &mut connection, device_id);
+        pair_packet_device(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            device_id,
+            PublicKey("device-public-key".to_owned()),
+        );
+        let session_id =
+            create_test_packet_session(&mut protocol, &mut connection, &mut device_session);
+        backend.push_terminal_journal_frame_for_session(
+            session_id,
+            PtyTerminalFrame::Output {
+                terminal_seq: 1,
+                data: b"zero-credit-still-streams".to_vec(),
+            },
+        );
+
+        let stream_id = PacketStreamId::new();
+        let attach_responses = send_encrypted_packet(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            ProtocolPacket::stream_open(
+                PacketRequestId::new(),
+                stream_id,
+                METHOD_TERMINAL_ATTACH,
+                0,
+                serde_json::to_value(SessionAttachPayload {
+                    session_id,
+                    watch_updates: true,
+                    last_terminal_seq: Some(0),
+                })
+                .unwrap(),
+            ),
         );
         assert_eq!(
-            connection.take_deferred_output_wakeups(),
-            vec![created.session_id]
+            decrypt_first_packet(&mut device_session, attach_responses).kind,
+            PacketKind::Response
         );
-        let second_packets = decrypt_packets(
+
+        // 中文注释：新模型不再把 browser render ACK / credit 作为终端输出闸门。
+        // 即使旧客户端没有发送初始 credit，daemon 也必须按 WebSocket/TCP 背压直接推流。
+        let output_packets = decrypt_packets(
             &mut device_session,
-            connection.read_session_output(&mut protocol, created.session_id, 1024),
+            connection.read_session_output(&mut protocol, session_id, 1024),
         );
-        assert_eq!(second_packets.len(), 1);
-        assert_eq!(second_packets[0].kind, PacketKind::StreamChunk);
-        assert_eq!(second_packets[0].seq, 2);
-        let second: TerminalFramePayload =
-            decode_payload(second_packets[0].payload.clone()).unwrap();
-        assert_eq!(second.terminal_seq(), Some(3));
+        assert_eq!(output_packets.len(), 1);
+        assert_eq!(output_packets[0].kind, PacketKind::StreamChunk);
+        assert_eq!(output_packets[0].stream_id, Some(stream_id));
+        let frame: TerminalFramePayload =
+            decode_payload(output_packets[0].payload.clone()).unwrap();
+        assert_eq!(frame.terminal_seq(), Some(1));
+        assert_eq!(connection.debug_snapshot().zero_credit_terminal_streams, 0);
     }
 
     #[test]
@@ -9399,17 +9312,17 @@ mod tests {
         );
         assert!(
             connection.debug_snapshot().pending_terminal_frames > 0,
-            "unsent terminal frames should remain pending for the next flow credit"
+            "unsent terminal frames should remain pending for the next bounded push"
         );
         assert_eq!(
             connection.take_deferred_output_wakeups(),
             vec![created.session_id],
-            "仍有待发 terminal frames 且 credit 充足时，应由 server/relay 下一轮 push 继续发送，不能等浏览器 ACK 才推进"
+            "仍有待发 terminal frames 时，应由 server/relay 下一轮 push 继续发送，不能等浏览器 ACK 才推进"
         );
     }
 
     #[test]
-    fn packet_terminal_flow_credit_defers_pending_terminal_frames_until_push_drain() {
+    fn packet_terminal_flow_is_noop_and_pending_frames_drain_on_push() {
         let (mut protocol, backend) = protocol();
         let (mut connection, _) = protocol.start_connection();
         let device_id = DeviceId::new();
@@ -9455,14 +9368,13 @@ mod tests {
         );
         let created_packet = decrypt_first_packet(&mut device_session, create_responses);
         let created: SessionCreatedPayload = decode_payload(created_packet.payload).unwrap();
-        for (terminal_seq, data) in [
-            (1, b"abcdefghij".to_vec()),
-            (2, b"klmnopqrst".to_vec()),
-            (3, b"uvwxyz1234".to_vec()),
-        ] {
+        for terminal_seq in 1..=1800 {
             backend.push_terminal_journal_frame_for_session(
                 created.session_id,
-                PtyTerminalFrame::Output { terminal_seq, data },
+                PtyTerminalFrame::Output {
+                    terminal_seq,
+                    data: b"small-output-frame\n".to_vec(),
+                },
             );
         }
 
@@ -9494,9 +9406,14 @@ mod tests {
         assert_eq!(first_packets.len(), 1);
         assert_eq!(first_packets[0].seq, 1);
         assert_eq!(
-            connection.debug_snapshot().pending_terminal_frames,
-            1,
-            "第三帧应因为 credit 不足暂存在连接内 pending 队列"
+            connection.debug_snapshot().pending_terminal_frames > 0,
+            true,
+            "部分 frame 应因为单批输出预算暂存在连接内 pending 队列"
+        );
+        assert_eq!(
+            connection.take_deferred_output_wakeups(),
+            vec![created.session_id],
+            "pending frame 应由下一轮 push drain 推进，而不是等 flow ACK"
         );
 
         let flow_responses = send_encrypted_packet(
@@ -9508,12 +9425,11 @@ mod tests {
         assert_eq!(
             flow_responses.len(),
             0,
-            "flow 只应补 credit 并登记输出唤醒，不能在同一个全局锁临界区里继续组包和加密"
+            "flow 只是旧协议兼容 no-op，不能成为输出推进条件"
         );
-        assert_eq!(
-            connection.take_deferred_output_wakeups(),
-            vec![created.session_id],
-            "server/relay 释放 daemon 协议锁后应按这个 wakeup 继续 flush 输出"
+        assert!(
+            connection.take_deferred_output_wakeups().is_empty(),
+            "flow no-op 不应重新登记输出 wakeup"
         );
 
         let second_packets = decrypt_packets(
@@ -9525,7 +9441,7 @@ mod tests {
         assert_eq!(second_packets[0].seq, 2);
         let second: TerminalFramePayload =
             decode_payload(second_packets[0].payload.clone()).unwrap();
-        assert_eq!(second.terminal_seq(), Some(3));
+        assert!(terminal_frame_payload_count(&second) > 0);
     }
 
     #[test]
@@ -9547,14 +9463,13 @@ mod tests {
             create_test_packet_session(&mut protocol, &mut connection, &mut device_session);
         let second_session =
             create_test_packet_session(&mut protocol, &mut connection, &mut device_session);
-        for (terminal_seq, data) in [
-            (1, b"first-a".to_vec()),
-            (2, b"first-b".to_vec()),
-            (3, b"first-c".to_vec()),
-        ] {
+        for terminal_seq in 1..=1800 {
             backend.push_terminal_journal_frame_for_session(
                 first_session,
-                PtyTerminalFrame::Output { terminal_seq, data },
+                PtyTerminalFrame::Output {
+                    terminal_seq,
+                    data: b"first-output-frame\n".to_vec(),
+                },
             );
         }
         backend.push_terminal_journal_frame_for_session(
@@ -9594,7 +9509,7 @@ mod tests {
         assert_eq!(first_output.len(), 1);
         assert!(
             connection.debug_snapshot().pending_terminal_frames > 0,
-            "first session should leave unsent frames because credit is intentionally small"
+            "first session should leave unsent frames because the bounded batch is intentionally small"
         );
 
         let second_stream = PacketStreamId::new();
@@ -9622,10 +9537,6 @@ mod tests {
         let snapshot = connection.debug_snapshot();
         assert_eq!(snapshot.terminal_streams, 1);
         assert_eq!(snapshot.zero_credit_terminal_streams, 0);
-        assert_eq!(
-            snapshot.pending_terminal_frames, 1,
-            "only the new session's freshly generated tail should remain pending"
-        );
 
         let old_session_output = decrypt_packets(
             &mut device_session,
@@ -9760,14 +9671,13 @@ mod tests {
         );
         let session_id =
             create_test_packet_session(&mut protocol, &mut connection, &mut device_session);
-        for (terminal_seq, data) in [
-            (1, b"cancel-a".to_vec()),
-            (2, b"cancel-b".to_vec()),
-            (3, b"cancel-c".to_vec()),
-        ] {
+        for terminal_seq in 1..=1800 {
             backend.push_terminal_journal_frame_for_session(
                 session_id,
-                PtyTerminalFrame::Output { terminal_seq, data },
+                PtyTerminalFrame::Output {
+                    terminal_seq,
+                    data: b"cancel-output-frame\n".to_vec(),
+                },
             );
         }
 
@@ -9868,7 +9778,7 @@ mod tests {
     }
 
     #[test]
-    fn packet_terminal_output_allows_one_frame_larger_than_current_credit() {
+    fn packet_terminal_output_allows_one_frame_larger_than_batch_limit() {
         let (mut protocol, backend) = protocol();
         let (mut connection, _) = protocol.start_connection();
         let device_id = DeviceId::new();
@@ -9957,21 +9867,25 @@ mod tests {
         assert_eq!(
             first_packets.len(),
             1,
-            "单个 terminal frame 大于 credit 时也必须向前推进，否则大 snapshot 会卡死"
+            "单个 terminal frame 大于 batch 上限时也必须向前推进，否则大 snapshot 会卡死"
         );
         assert_eq!(first_packets[0].kind, PacketKind::StreamChunk);
         assert_eq!(first_packets[0].seq, 1);
         let first: TerminalFramePayload = decode_payload(first_packets[0].payload.clone()).unwrap();
-        assert_eq!(first.terminal_seq(), Some(1));
+        match first {
+            TerminalFramePayload::Batch { frames, .. } => {
+                assert_eq!(frames.len(), 2);
+                assert_eq!(frames[0].terminal_seq(), Some(1));
+                assert_eq!(frames[1].terminal_seq(), Some(2));
+            }
+            other => assert_eq!(other.terminal_seq(), Some(1)),
+        }
 
-        let blocked = decrypt_packets(
+        let drained = decrypt_packets(
             &mut device_session,
             connection.read_session_output(&mut protocol, created.session_id, 1024),
         );
-        assert!(
-            blocked.is_empty(),
-            "超额发送后必须等客户端按实际字节数补 credit，不能继续透支"
-        );
+        assert!(drained.is_empty());
 
         let flow_responses = send_encrypted_packet(
             &mut protocol,
@@ -9981,21 +9895,13 @@ mod tests {
         );
         assert!(
             flow_responses.is_empty(),
-            "flow credit should defer output production to the push drain path"
+            "legacy flow stays accepted but does not drive terminal output"
         );
-        assert_eq!(
-            connection.take_deferred_output_wakeups(),
-            vec![created.session_id]
-        );
-        let second_packets = decrypt_packets(
+        let drained = decrypt_packets(
             &mut device_session,
             connection.read_session_output(&mut protocol, created.session_id, 1024),
         );
-        assert_eq!(second_packets.len(), 1);
-        assert_eq!(second_packets[0].seq, 2);
-        let second: TerminalFramePayload =
-            decode_payload(second_packets[0].payload.clone()).unwrap();
-        assert_eq!(second.terminal_seq(), Some(2));
+        assert!(drained.is_empty());
     }
 
     #[test]
@@ -11928,7 +11834,7 @@ mod tests {
     }
 
     #[test]
-    fn non_owner_attached_connection_cannot_resize_session() {
+    fn attached_connection_can_resize_session_after_focus() {
         let (mut protocol, _) = protocol();
         let (mut first_connection, _) = protocol.start_connection();
         let device_id = DeviceId::new();
@@ -11983,7 +11889,8 @@ mod tests {
         let attached = decrypt_first(&mut second_crypto, attach_responses);
         let attached_payload: SessionAttachedPayload = decode_payload(attached.payload).unwrap();
         assert_eq!(attached.kind, MessageType::SessionAttached);
-        assert!(!attached_payload.resize_owner);
+        // 中文注释：终端尺寸以最后聚焦客户端为准；后 attach 的连接聚焦后也必须能接管 resize。
+        assert!(attached_payload.resize_owner);
 
         let resize_responses = send_encrypted(
             &mut protocol,
@@ -12003,16 +11910,18 @@ mod tests {
             )
             .unwrap(),
         );
-        let resize_error = decrypt_first(&mut second_crypto, resize_responses);
-        let resize_error_payload: ErrorPayload = decode_payload(resize_error.payload).unwrap();
+        let resized = decrypt_first(&mut second_crypto, resize_responses);
+        let resized_payload: SessionResizedPayload = decode_payload(resized.payload).unwrap();
 
-        // 非 owner 可以继续作为 operator 输入，但不能覆盖 shared PTY 的尺寸。
-        assert_eq!(resize_error.kind, MessageType::Error);
-        assert_eq!(resize_error_payload.code, "invalid_state");
+        assert_eq!(resized.kind, MessageType::SessionResized);
+        assert_eq!(resized_payload.session_id, created_payload.session_id);
+        assert_eq!(resized_payload.size.rows, 40);
+        assert_eq!(resized_payload.size.cols, 120);
+        assert!(resized_payload.resize_owner);
     }
 
     #[test]
-    fn resize_owner_moves_to_attached_connection_after_owner_disconnect() {
+    fn attached_connection_keeps_resize_capability_after_another_connection_disconnects() {
         let (mut protocol, _) = protocol();
         let (mut first_connection, _) = protocol.start_connection();
         let device_id = DeviceId::new();
@@ -12065,25 +11974,9 @@ mod tests {
         );
         let attached = decrypt_first(&mut second_crypto, attach_responses);
         let attached_payload: SessionAttachedPayload = decode_payload(attached.payload).unwrap();
-        assert!(!attached_payload.resize_owner);
-
-        let mut resize_signal = second_connection
-            .attached_resize_signals(&protocol)
-            .into_iter()
-            .find(|(session_id, _)| *session_id == created_payload.session_id)
-            .map(|(_, signal)| signal)
-            .expect("attached connection should subscribe to resize owner changes");
-        resize_signal.borrow_and_update();
+        assert!(attached_payload.resize_owner);
 
         first_connection.close(&mut protocol);
-        assert!(resize_signal.has_changed().unwrap());
-        let owner_update =
-            second_connection.read_session_resize_update(&mut protocol, created_payload.session_id);
-        let owner_update = decrypt_first(&mut second_crypto, owner_update);
-        let owner_update_payload: SessionResizedPayload =
-            decode_payload(owner_update.payload).unwrap();
-        assert_eq!(owner_update.kind, MessageType::SessionResized);
-        assert!(owner_update_payload.resize_owner);
 
         let resized_size = TerminalSize {
             rows: 32,
@@ -13120,11 +13013,8 @@ mod tests {
         file_tree_signal.borrow_and_update();
 
         connection.packet_mode = true;
-        connection.register_packet_terminal_stream(
-            PacketStreamId::new(),
-            created_payload.session_id,
-            256 * 1024,
-        );
+        connection
+            .register_packet_terminal_stream(PacketStreamId::new(), created_payload.session_id);
         backend.set_cwd_for_session(created_payload.session_id, work);
         for line in [
             b"one\n".as_slice(),

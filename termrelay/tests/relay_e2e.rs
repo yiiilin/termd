@@ -191,83 +191,73 @@ async fn relay_forwards_business_shaped_text_and_binary_without_parsing() {
         .await
         .expect("client side should connect");
     let client_id = expect_client_connected(&mut daemon_mux).await;
-    let text =
-        "{not-json session_data control_request pairing_token relay-secret-plaintext".to_owned();
-    let binary = b"\x00session_data\xffpairing_token\x00relay-secret-plaintext".to_vec();
+    let text_payloads = [
+        "{not-json session_data control_request pairing_token relay-secret-plaintext".to_owned(),
+        r#"{"kind":"stream_open","method":"terminal.attach","payload":{"session_id":"session-a","watch_updates":true}}"#
+            .to_owned(),
+        r#"{"kind":"stream_chunk","method":"terminal.stdout","payload":{"kind":"snapshot","session_id":"session-a"}}"#
+            .to_owned(),
+        r#"{"kind":"stream_chunk","method":"terminal.stdin","payload":{"data_base64":"aW5wdXQ="}}"#
+            .to_owned(),
+        r#"{"kind":"request","method":"terminal.resize","payload":{"cols":120,"rows":40}}"#
+            .to_owned(),
+        r#"{"kind":"flow","ack":99,"credit":65536,"render_ack":true,"stale_session":true}"#
+            .to_owned(),
+    ];
+    let binary_payloads = [
+        b"\x00session_data\xffpairing_token\x00relay-secret-plaintext".to_vec(),
+        b"\x01terminal.attach snapshot stdout stdin resize\x02flow ack credit render_ack stale_session".to_vec(),
+    ];
 
-    // 这些 frame 故意长得像业务 payload；relay 只能把它们当不透明字节转发。
-    client
-        .send(Message::Text(text.clone()))
-        .await
-        .expect("client should send opaque text");
-    send_mux(
-        &mut daemon_mux,
-        RelayMuxEnvelope::DaemonFrame {
-            client_id,
-            frame: RelayOpaqueFrame::Binary {
-                data_base64: base64::Engine::encode(
-                    &base64::engine::general_purpose::STANDARD,
-                    &binary,
-                ),
+    // 这些 frame 故意长得像 terminal/flow 业务 payload；relay 只能把它们当不透明字节转发。
+    for text in text_payloads {
+        client
+            .send(Message::Text(text.clone()))
+            .await
+            .expect("client should send opaque text");
+        assert_eq!(expect_client_text(&mut daemon_mux, client_id).await, text);
+
+        let daemon_text = format!("daemon-to-client:{text}");
+        send_mux(
+            &mut daemon_mux,
+            RelayMuxEnvelope::DaemonFrame {
+                client_id,
+                frame: RelayOpaqueFrame::Text {
+                    data: daemon_text.clone(),
+                },
             },
-        },
-    )
-    .await;
+        )
+        .await;
+        assert_eq!(next_text(&mut client).await, daemon_text);
+    }
 
-    assert_eq!(expect_client_text(&mut daemon_mux, client_id).await, text);
-    assert_eq!(next_binary(&mut client).await, binary);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn relay_daemon_mux_data_forwards_output_but_not_client_lifecycle() {
-    let relay = RelayProcess::spawn().await;
-    let server_id = ServerId::new();
-    let mut daemon_mux = connect_registered_socket(relay.ws_url(), server_id, RouteRole::DaemonMux)
-        .await
-        .expect("daemon control mux should connect");
-    let mut daemon_data =
-        connect_registered_socket(relay.ws_url(), server_id, RouteRole::DaemonMuxData)
+    for binary in binary_payloads {
+        client
+            .send(Message::Binary(binary.clone()))
             .await
-            .expect("daemon data mux should connect after control mux");
-    let mut client = connect_registered_socket(relay.ws_url(), server_id, RouteRole::Client)
-        .await
-        .expect("client should connect");
-    let client_id = expect_client_connected(&mut daemon_mux).await;
+            .expect("client should send opaque binary");
+        assert_eq!(
+            expect_client_binary(&mut daemon_mux, client_id).await,
+            binary
+        );
 
-    assert!(
-        timeout(Duration::from_millis(150), daemon_data.next())
-            .await
-            .is_err(),
-        "client lifecycle notifications must stay on daemon_mux control channel"
-    );
-
-    client
-        .send(Message::Text("client-input".to_owned()))
-        .await
-        .expect("client should send input");
-    assert_eq!(
-        expect_client_text(&mut daemon_mux, client_id).await,
-        "client-input"
-    );
-    assert!(
-        timeout(Duration::from_millis(150), daemon_data.next())
-            .await
-            .is_err(),
-        "client input must not be routed to daemon_mux_data"
-    );
-
-    send_mux(
-        &mut daemon_data,
-        RelayMuxEnvelope::DaemonFrame {
-            client_id,
-            frame: RelayOpaqueFrame::Text {
-                data: "output-from-data-channel".to_owned(),
+        let mut daemon_binary = b"daemon-to-client:".to_vec();
+        daemon_binary.extend_from_slice(&binary);
+        send_mux(
+            &mut daemon_mux,
+            RelayMuxEnvelope::DaemonFrame {
+                client_id,
+                frame: RelayOpaqueFrame::Binary {
+                    data_base64: base64::Engine::encode(
+                        &base64::engine::general_purpose::STANDARD,
+                        &daemon_binary,
+                    ),
+                },
             },
-        },
-    )
-    .await;
-
-    assert_eq!(next_text(&mut client).await, "output-from-data-channel");
+        )
+        .await;
+        assert_eq!(next_binary(&mut client).await, daemon_binary);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -527,9 +517,7 @@ async fn send_route_hello(
             protocol_version: ProtocolVersion::default(),
             nonce: Nonce(format!("route-nonce-{}", Uuid::new_v4())),
             route_generation: match role {
-                RouteRole::DaemonMux | RouteRole::DaemonMuxData => {
-                    Some(Nonce("relay-e2e-generation".to_owned()))
-                }
+                RouteRole::DaemonMux => Some(Nonce("relay-e2e-generation".to_owned())),
                 RouteRole::Client => None,
             },
             timestamp_ms: current_unix_timestamp_millis(),
@@ -619,6 +607,22 @@ async fn expect_client_text(
             frame: RelayOpaqueFrame::Text { data },
         } if client_id == expected_client_id => data,
         other => panic!("expected client text frame, got {other:?}"),
+    }
+}
+
+async fn expect_client_binary(
+    socket: &mut RelaySocket,
+    expected_client_id: termd_proto::RelayClientId,
+) -> Vec<u8> {
+    match next_mux(socket).await {
+        RelayMuxEnvelope::ClientFrame {
+            client_id,
+            frame: RelayOpaqueFrame::Binary { data_base64 },
+        } if client_id == expected_client_id => {
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, data_base64)
+                .expect("client binary frame should be valid base64")
+        }
+        other => panic!("expected client binary frame, got {other:?}"),
     }
 }
 

@@ -12,10 +12,12 @@ describe("mobile layout regressions", () => {
     expect(css).toContain(".app-shell.mobile-keyboard-open .workspace {\n    grid-template-rows: 42px minmax(0, 1fr);");
     expect(css).toContain(".app-shell.mobile-keyboard-open .daemon-status-strip {\n    display: none;");
     expect(css).toContain(".terminal-host {\n    min-width: 0;\n    overflow: hidden;");
-    expect(css).toContain(".terminal-pane:not(.terminal-pane-viewer) .terminal-host {\n    max-width: 100%;");
-    expect(css).toContain(".terminal-pane:not(.terminal-pane-viewer) .terminal-host .xterm");
+    expect(css).toContain(".terminal-host {\n    max-width: 100%;");
+    expect(css).toContain(".terminal-host .xterm");
     expect(css).toContain(".terminal-host .xterm .xterm-helper-textarea");
     expect(css).toContain(".daemon-cpu-bar-chart {\n    display: none;");
+    expect(css).toContain("minmax(124px, 1.25fr);");
+    expect(css).toContain(".daemon-status-strip .daemon-status-network strong {\n    min-width: max-content;");
     expect(css).toContain("position: fixed !important;");
     expect(css).toContain("min-height: 0 !important;");
   });

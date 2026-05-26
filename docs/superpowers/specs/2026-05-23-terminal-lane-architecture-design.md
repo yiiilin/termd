@@ -1,232 +1,220 @@
-# 终端双线架构设计
+# 单 WebSocket Segment 架构设计
 
-> 目标：把浏览器侧通信收敛成 `terminal lane` 和 `aux lane` 两条独立通道，并让 direct / relay 走同一套 daemon-side client controller 语义。
+> 目标：把 browser 到 daemon 的连接语义固定为“一条可靠 WebSocket 逻辑流”。terminal 和非 terminal 只是 E2EE 内层 segment 类型；direct 与 relay 只改变传输路径，不改变 daemon 的 client controller 语义。
 
-## 背景
+## 1. 背景
 
-当前系统已经具备持久 session、E2EE、relay 路由和 PTY supervisor，但历史实现把终端输出、控制 RPC、文件/Git/状态查询混在一起，容易出现以下问题：
+termd 的核心目标是像 `sshd + tmux` 一样提供持久终端。历史实现曾尝试拆出 terminal / aux 多条 WebSocket，并用 ACK / credit 或额外连接边界解决大输出、快速切换、relay 卡顿等问题。这个方向会引入新的复杂度：
 
-1. 大量终端输出把普通 RPC 和输入响应挤在后面。
-2. relay / daemon 的重连边界不清，容易留下半开连接或旧 session 残留。
-3. snapshot / tail / resize 的顺序不够明确，导致重连时画面恢复和实时 tail 可能错位。
+1. browser 切换 session 时，多条 WebSocket 的生命周期容易互相误伤。
+2. relay 会被迫感知 stale 连接、terminal flow 等业务语义，偏离 dumb pipe 原则。
+3. terminal 与 files/git/status 等操作其实都属于同一个已认证 browser client，多线会放大状态同步成本。
+4. WebSocket/TCP 已经提供可靠有序传输，应用层 ACK 不应成为输出卡死的条件。
 
-本设计把这些问题拆成两条明确的数据线，并把 relay 限制为纯转发层。
+最终模型收敛为：外层只保留一条可靠 WebSocket；E2EE 明文内使用 `ProtocolPacket` 作为 segment/batch 复用层。
 
-## 设计原则
+## 2. 设计结论
 
-1. relay 只做路由，不解释业务。
-2. 终端相关操作必须在同一条 terminal lane 上保持顺序。
-3. 非终端 RPC 不能被大输出阻塞。
-4. session 生命周期独立于 browser 连接生命周期。
-5. direct 和 relay 的语义必须一致，只允许 transport 不同。
+1. browser 对一个 daemon 只保留一条 active workspace WebSocket。
+2. pairing 可以使用一次性 bootstrap 连接；配对完成后关闭。
+3. terminal attach、snapshot/stdout、stdin、resize、session.list、daemon.status、files、git 等都复用 workspace WebSocket。
+4. 业务分类只发生在 E2EE 内层 segment：`request`、`response`、`event`、`stream_open`、`stream_chunk`、`stream_end`、`cancel`、`error`。
+5. terminal stream 是这条 WebSocket 上的一个 `stream_id`，切换 session 时发送 `cancel` 取消旧 stream，再 `stream_open terminal.attach` 打开新 stream。
+6. relay 是 dumb pipe：按 `server_id` 路由并转发 opaque binary frame，不解密、不解析 session、不判断 terminal/非 terminal。
+7. terminal 输出不等待 browser render ACK，也不使用应用层 credit；背压由 WebSocket/TCP、daemon bounded queue 和慢连接关闭处理。
 
-## 术语
-
-- `terminal lane`：承载 `snapshot`、`stdout`、`stdin`、`resize`。
-- `aux lane`：承载文件、Git、状态、列表、重命名、关闭等非终端操作。
-- `snapshot`：连接恢复时的权威终端快照。
-- `tail`：snapshot 之后的连续增量输出。
-- `mirror`：daemon 侧为 reconnect 和 attach 维护的终端缓存副本。
-
-## 总体结构
+## 3. 总体架构
 
 ```text
+Direct:
+
 Browser
-  ├─ terminal websocket ───────────────┐
-  └─ aux websocket ────────────────────┤
-                                       v
-                                 direct daemon
-                                       │
+  |-- workspace websocket
+  |     E2EE ProtocolPacket segments
+  v
+daemon http/ws controller
+  -> daemon client controller
+  -> daemon core
+
+
+Relay:
+
 Browser
-  ├─ terminal websocket ─ relay ───────┤
-  └─ aux websocket ─ relay ────────────┘
-                                       v
-                              daemon client controller
-                                       │
-                                 session / PTY supervisor
+  |-- workspace websocket
+  v
+relay dumb pipe
+  |-- opaque binary tunnel
+  v
+daemon relay adapter
+  -> daemon client controller
+  -> daemon core
 ```
 
-### 选择理由
+direct 与 relay 最终都进入同一个 daemon client controller。relay adapter 只把 relay 转来的 opaque stream 变成 controller 能处理的连接事件。
 
-我们不采用“单 websocket 混合终端和 RPC”方案，原因是：
+## 4. Segment 格式
 
-1. 大 snapshot 和长 tail 会造成 head-of-line blocking。
-2. 输入和 resize 需要和终端输出保持严格顺序，但普通 RPC 不需要。
-3. relay 侧只要出现发送背压，就不该拖慢 aux RPC 的恢复。
+当前实现复用 `ProtocolPacket` 作为 segment 层：
 
-所以终端线和非终端线分离是最稳妥的边界。
+```text
+request       普通 unary RPC，例如 session.list / daemon.status / files / git
+response      request 或 stream_open 的结果
+event         daemon 主动事件，例如 session.activity / session.files / session.git
+stream_open   打开一个有序 stream，例如 terminal.attach / terminal.create
+stream_chunk  stream 上的有序数据，例如 stdout batch / stdin bytes
+stream_end    daemon 正常结束 stream
+cancel        browser 取消 stream，例如切换 session
+error         request 或 stream 级错误
+```
 
-## direct / relay 语义
+外层 WebSocket 可以是 binary frame。E2EE 后的 `ProtocolPacket` 使用二进制编码，terminal bytes 不再为了 JSON 可读性额外 base64 化；只有兼容路径需要 JSON fallback。
 
-### direct 模式
+## 5. Terminal Stream
 
-- Browser 直接连 daemon。
-- terminal lane 进入 daemon 的 terminal controller。
-- aux lane 进入 daemon 的 control / metadata controller。
+terminal 只需要下面几类语义：
 
-### relay 模式
+```text
+browser -> daemon:
+  stream_open terminal.attach(session_id, last_terminal_seq?)
+  stream_chunk stdin(bytes)
+  request/session.resize 或 terminal resize segment
+  cancel(stream_id)
 
-- Browser 先连 relay。
-- relay 只做 websocket 路由和连接管理。
-- relay 不解密、不解析 session 内容、不做权限判断。
-- relay 只把两条 lane 原样转发到 daemon。
+daemon -> browser:
+  response terminal.attach(...)
+  stream_chunk snapshot(base_seq, bytes)
+  stream_chunk output(seq, bytes)
+  stream_chunk resize/exit frame
+```
 
-### 统一语义
+约束：
 
-无论 direct 还是 relay，daemon 看到的都是同一组 controller 事件：
+- 一个 terminal stream 绑定一个 session。
+- 切换 session 只取消旧 terminal stream，不关闭 workspace WebSocket。
+- `stdin`、`stdout`、`resize` 必须保持相对顺序；它们都走同一条可靠 WebSocket。
+- PTY exit 后 daemon 删除 session，UI 通过正常 session list / event 感知。
+- 多个 browser 可以同时打开同一 session，各自拥有独立 workspace WebSocket 和 terminal stream。
 
-- terminal attach / snapshot / stdout / stdin / resize
-- aux RPC：files / git / status / list / rename / reorder / close / control_request
+## 6. 非 Terminal RPC
 
-## terminal lane 设计
+非 terminal 操作继续使用 request/response 或 event：
 
-terminal lane 只做终端语义，不混入管理 RPC。
+```text
+session.list
+session.rename
+session.reorder
+session.close
+session.files
+session.git
+session.search
+daemon.status
+daemon.clients
+daemon.client_forget
+ping
+```
 
-### 入站
+这些 RPC 与 terminal stream 共用同一条 WebSocket，但不共享 terminal stream 的 `stream_id`。大输出不能让 daemon 等待应用层 ACK；浏览器端消费慢时只能形成正常传输排队或触发连接级关闭，不能卡住 PTY session。
 
-- `stdin`：用户键盘输入。
-- `resize`：终端尺寸变化。
+## 7. Snapshot / Tail 事务
 
-### 出站
+terminal attach 时，daemon 必须按下面顺序发送：
 
-- `snapshot`：重连或首次 attach 时的全量画面。
-- `stdout`：PTY 后续增量输出。
+1. `stream_open terminal.attach` 被认证连接接受。
+2. 从 daemon mirror 读取当前 session snapshot。
+3. 发送 snapshot，browser 清空旧 renderer 并重建画面。
+4. 从 snapshot 对应的 `base_seq` 开始发送 tail / live stdout。
 
-### 约束
+如果 snapshot 生成期间 PTY 有新输出，daemon 先写入 mirror，再把这些输出排入该 stream 的 live queue。snapshot 与 tail 的边界属于同一个 `stream_id`。
 
-1. `stdin` 和 `resize` 必须和同一 session 的 `snapshot/stdout` 保持顺序。
-2. `close` 不作为 terminal message 单独存在。
-3. PTY 退出时直接由 daemon 清理 session。
-4. 终端输出按字节批量发送，不按“每一行一条消息”推送。
-5. 批量 flush 以字节阈值或短时间窗口为准，避免一字节一字节蹦。
+## 8. Supervisor / Daemon Mirror
 
-## aux lane 设计
+supervisor 是 PTY 的原始权威源。daemon mirror 是 browser attach 时生成 snapshot 的近端缓存。
 
-aux lane 只承载非终端 RPC：
+supervisor 和 daemon mirror 都应表达：
 
-- session list
-- daemon status
-- daemon clients
-- files / download / write / delete
-- git / diff / action
-- rename / reorder / close
+1. 普通屏幕 snapshot。
+2. 替代屏幕 snapshot。
+3. 当前屏幕模式。
+4. 光标、保存光标、SGR、VT mode、scroll region、wrap / origin / insert 等可恢复状态。
+5. raw output seq / tail cursor。
 
-### 约束
+daemon 收到 supervisor raw bytes 后，顺序必须是：
 
-1. aux lane 不能要求终端 renderer 参与。
-2. aux lane 不能等待 terminal tail 结束。
-3. aux lane 不得依赖 PTY 输出是否清空。
+```text
+raw bytes -> daemon mirror emulator -> session room live stream -> workspace websocket terminal streams
+```
 
-## supervisor / daemon 缓存模型
+这样新 browser attach 不需要回 supervisor 读取缓存，也能拿到与 daemon 当前输出完全一致的 snapshot。
 
-### supervisor 侧
+## 9. Relay 原则
 
-supervisor 维护三类状态：
+relay 必须保持 dumb pipe。
 
-1. 普通屏幕 snapshot
-   - 最近 1000 行逻辑内容
-   - cursor 位置
-   - saved cursor
-   - 当前终端模式
-   - scrollback 范围
-2. 替代屏幕 snapshot
-   - 当前可见页
-   - cursor 位置
-   - 当前终端模式
-3. 当前模式
-   - normal
-   - alternate
+允许：
 
-supervisor 在读取 PTY 输出时，必须同步更新这些缓存。
+- 接收 browser websocket。
+- 接收 daemon 到 relay 的长期连接。
+- 按 `server_id` 路由。
+- 转发 binary frame。
+- 记录连接级别日志和吞吐统计。
+- 在连接断开时释放连接记录。
 
-### daemon 侧 mirror
+禁止：
 
-daemon 为每个 session 维护和 supervisor 等价的 mirror：
+- 解密业务数据。
+- 解析 session 内容。
+- 判断 terminal / 非 terminal 的业务含义。
+- 维护 terminal ACK、credit、snapshot、stale session。
+- 代替 daemon 做控制权判断。
 
-- normal screen mirror
-- alternate screen mirror
-- current mode
-- cursor / saved cursor / modes
-- terminal sequence / tail cursor
+relay 看到的应该只是“某个 browser 连接”和“某个 daemon 连接”之间的 opaque bytes。
 
-mirror 的作用有两个：
+## 10. 背压模型
 
-1. 新 browser attach 时直接出 snapshot。
-2. daemon 与 supervisor 连接重建时，能判断是否需要回源 supervisor 重新取权威 snapshot。
+terminal 输出不使用 render ACK / credit。
 
-### mirror 更新规则
+新的背压规则：
 
-daemon 收到 raw bytes 后必须先喂给本地 mirror emulator，完成状态更新，再进入 browser room live stream。
-这样后来的 attach 可以直接拿到最新 snapshot，不需要回读 PTY 原始流。
+1. daemon 对每个 workspace WebSocket 使用 bounded queue。
+2. queue 满或写入超时，daemon 关闭该慢 workspace WebSocket。
+3. 关闭 workspace WebSocket 不影响 PTY session。
+4. 切换 session 时使用 `cancel(stream_id)` 停止旧 terminal stream。
+5. 大输出按字节批量 flush，目标是 4 KiB 到 16 KiB 或约 10 ms flush。
+6. 不按行、不按 terminal frame 数量限速。
 
-## snapshot / tail 生命周期
+## 11. 失败处理
 
-### 首次 attach
+1. browser workspace WebSocket 断开：daemon 清理该 browser 连接上的 streams；session 继续运行。
+2. browser 切后台：如果 WebSocket 被系统或网络断开，前台恢复时重建 workspace WebSocket 并重新 attach。
+3. relay 断开：daemon 到 relay 的通道离线；session 仍在 daemon/supervisor 中存活。
+4. daemon / supervisor 重连：按 supervisor/daemon mirror 同步机制恢复，不通过 relay 兜底业务逻辑。
+5. PTY exit：daemon 删除 session，session list 反映删除结果。
 
-1. Browser 建立 terminal lane。
-2. Daemon 发送当前权威 snapshot。
-3. Browser 清空旧 renderer 并应用 snapshot。
-4. Daemon 继续发送 tail。
-
-### reconnect
-
-1. 如果 connection generation 未变，daemon 先发新的 snapshot。
-2. Browser 必须先 clear / reset，再重放 snapshot。
-3. snapshot 结束后才能继续接 tail。
-4. 如果 sequence gap 无法证明连续性，直接回源 supervisor 重新生成 snapshot。
-
-### 断线
-
-- browser 断开只关闭当前 attachment，不终止 session。
-- daemon / supervisor 断开只会触发 reconnect 或回源重建，不自动杀 PTY。
-
-## 顺序与背压
-
-### terminal lane
-
-- 终端 lane 的顺序是强约束。
-- 输入、resize、stdout、snapshot 的相对顺序不能乱。
-- 大 snapshot 不能把 aux lane 一起堵住。
-
-### aux lane
-
-- aux RPC 可以独立重试。
-- aux lane 不应因为终端输出 backlog 而延迟数秒。
-
-### relay
-
-- relay 必须把 terminal lane 和 aux lane 的队列分开。
-- control frame、disconnect 通知、新 attach 不能排在旧大输出后面。
-- relay 只做批量转发，不做内容级拆包或重排。
-
-## 失败处理
-
-1. relay 连接断开：只裁定该路由不可用，不清理 session。
-2. daemon / supervisor 断开：terminal lane 重连后重新拿 snapshot。
-3. browser hidden / background：暂停主动重连，避免残留半开连接。
-4. PTY exit：daemon 直接结束 session。
-5. sequence gap：回源 snapshot，不做局部补洞。
-
-## 测试矩阵
+## 12. 必测场景
 
 必须覆盖：
 
-1. direct 模式下快速切换多个大输出 session。
-2. relay 模式下快速切换多个大输出 session。
-3. relay 下双客户端同时打开同一 session。
-4. 100ms 双向延迟下的 attach / 输入 / resize / 切换恢复。
-5. browser hidden / visible 切换时不会堆积半开 websocket。
-6. supervisor normal / alternate screen snapshot 能正确还原。
-7. daemon mirror 缺失时会回源 supervisor，而不是拼接错误 tail。
+1. direct 模式快速切换多个大输出 session。
+2. relay 模式快速切换多个大输出 session。
+3. relay 下两个客户端同时打开同一持续大输出 session。
+4. 两个不同分辨率客户端同时 attach 同一 session，并轮流输入和 resize。
+5. 100 ms 双向延迟下，relay 仍能 attach、输入、resize、切换并在秒级恢复。
+6. browser hidden / visible 或刷新后，不会保留半开 terminal stream 状态。
+7. terminal 输出不会因为缺少 render ACK / credit 停住。
+8. 非 terminal RPC 不会新建第二条 browser-daemon WebSocket。
+9. relay 日志中不出现业务级 terminal ACK / credit / stale session 处理。
+10. supervisor normal / alternate screen snapshot 能正确恢复。
 
-## 不变式
+## 13. 不变式
 
 1. relay 不可访问明文。
-2. 未 attach 的连接不能操作 session。
+2. 未 attach 的 terminal stream 不能操作 PTY stdin/stdout。
 3. session 不因 browser 断开而终止。
-4. terminal lane 顺序优先于 aux lane 的响应速度。
-5. snapshot 和 tail 必须属于同一代连接视图。
+4. terminal stream 的 snapshot 和 stdout 必须属于同一 `stream_id`。
+5. 非 terminal RPC 不依赖 terminal stream 生命周期。
+6. terminal 输出不等待 browser render ACK。
+7. daemon mirror 与 supervisor 可恢复状态保持一致。
 
-## 结论
+## 14. 结论
 
-这个架构把终端高频流量和普通管理 RPC 分开，保留 direct / relay 的一致语义，同时把 snapshot / tail / reconnect 的边界固定下来。后续实现只需要围绕这份边界收敛，不要再把业务逻辑塞进 relay。
+新模型把 browser-daemon/browser-relay-daemon 都抽象成同一条可靠加密流。terminal 与非 terminal 的区别只存在于 E2EE 内层 segment，而不是 WebSocket 数量或 relay 业务逻辑。这个结构保留 TCP/WebSocket 的原生可靠性，降低 relay 耦合，同时让 session 切换、snapshot/tail、文件/Git/状态和多客户端 attach 的边界保持一致。
