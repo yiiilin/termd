@@ -171,6 +171,55 @@ test("pair、list、attach 的浏览器 smoke", async ({ page }, testInfo: TestI
   }
 });
 
+test("direct Web 慢普通 RPC 超时后终端仍可输入", async ({ page }, testInfo: TestInfo) => {
+  test.skip(testInfo.project.name === "mobile-chrome", "差网络 direct 回归只需要桌面布局覆盖");
+  test.setTimeout(25_000);
+  const sessionId = "00000000-0000-0000-0000-000000000511";
+  const daemon = await MockDaemon.start({
+    token: "secret-token",
+    sessions: [
+      {
+        session_id: sessionId,
+        state: "running",
+        size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+      },
+    ],
+    attachOutput: "direct-slow-ready\n",
+    daemonStatusDelayMs: 5_600,
+    sessionFilesDelayMs: 5_600,
+    sessionFiles: {
+      [sessionId]: {
+        session_id: sessionId,
+        path: "/slow/files",
+        entries: [],
+      },
+    },
+  });
+
+  try {
+    await page.goto("/");
+    await page.getByLabel("WS URL").fill(daemon.url);
+    await page.getByLabel("Pairing token").fill(pairingInviteCode(daemon));
+    await activateButton(page, "Pair");
+
+    const terminalPane = page.getByTestId("terminal-pane");
+    await expect(terminalPane.getByText("direct-slow-ready")).toBeVisible();
+    // 中文注释：files/status 都是非终端 segment；超过普通 UI deadline 后，
+    // 页面应只把对应 panel 标成不可用，terminal stream 仍保持可输入。
+    await expect(page.getByLabel("session files").getByText("unavailable")).toBeVisible({ timeout: 8_000 });
+    await expect(page.getByRole("alert", { name: "Connection error" })).toHaveCount(0);
+
+    await terminalPane.click();
+    await page.getByRole("textbox", { name: "Terminal input" }).focus();
+    await page.keyboard.type("direct-after-timeout");
+    await page.keyboard.press("Enter");
+    await expect.poll(() => daemon.decryptedInputs.join("")).toContain("direct-after-timeout");
+    expect(daemon.activeConnectionCount()).toBe(1);
+  } finally {
+    await daemon.stop();
+  }
+});
+
 function pairingInviteCode(daemon: MockDaemon): string {
   const payload = JSON.stringify({
     type: "termd_pairing_qr",

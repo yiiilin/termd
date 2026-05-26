@@ -13,7 +13,7 @@ import App, {
   networkRateFromSamples,
   pairingWsUrlCandidates,
 } from "../App";
-import type { ProtocolPacket, SessionDataPayload, SessionFilesResultPayload } from "../protocol/types";
+import type { ProtocolPacket, SessionDataPayload, SessionFilesResultPayload, SessionGitResultPayload } from "../protocol/types";
 import { sessionDataFromBase64 } from "../protocol/wire";
 import { clearBrowserState, loadBrowserState } from "../state/browser-state";
 import { MockDaemon } from "../test/mock-daemon";
@@ -483,6 +483,45 @@ describe("termui web 工作台", () => {
     await waitFor(() => expect(daemon.daemonStatusRequests).toBeGreaterThan(hiddenRequestCount));
   });
 
+  it("页面 hidden 期间普通状态超时不关闭终端，visible 后继续恢复轮询", async () => {
+    const user = userEvent.setup();
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [
+        {
+          session_id: DEFAULT_SESSION_ID,
+          state: "running",
+          size: { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 },
+        },
+      ],
+      attachOutput: "termd-e2e-ready\n",
+      daemonStatusDelayMs: APP_CONNECTION_TIMEOUT_MS + 500,
+    });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await screen.findByText(/termd-e2e-ready/);
+    await waitFor(() => expect(daemon.daemonStatusRequests).toBeGreaterThan(0));
+
+    setDocumentVisibility("hidden");
+    await new Promise((resolve) =>
+      window.setTimeout(resolve, APP_CONNECTION_TIMEOUT_MS + 700),
+    );
+
+    // 中文注释：后台期间 status 这类普通 segment 可能超时；它只能影响状态栏，
+    // 不能关闭承载 terminal stream 的 workspace WebSocket。
+    expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
+    expect(screen.getByTestId("terminal-pane")).toBeInTheDocument();
+    expect(daemon.activeConnectionCount()).toBe(1);
+
+    const hiddenRequestCount = daemon.daemonStatusRequests;
+    setDocumentVisibility("visible");
+    await waitFor(() => expect(daemon.daemonStatusRequests).toBeGreaterThan(hiddenRequestCount));
+    expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
+  }, 15_000);
+
   it("已 attach 时旁路 RPC 超时不能关闭工作台 WebSocket", async () => {
     const user = userEvent.setup();
     await daemon.stop();
@@ -510,6 +549,46 @@ describe("termui web 工作台", () => {
 
     // 中文注释：单 WebSocket 模型下，status/files/git 这类非终端 RPC 可能被大输出排队。
     // 普通 request timeout 只能标记该 RPC 失败，不能关闭承载 terminal stream 的工作台连接。
+    expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
+    expect(screen.getByTestId("terminal-pane")).toBeInTheDocument();
+    expect(daemon.activeConnectionCount()).toBe(1);
+  }, 15_000);
+
+  it("session.files 超时只影响文件 panel，不卸载终端", async () => {
+    const user = userEvent.setup();
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [
+        {
+          session_id: DEFAULT_SESSION_ID,
+          state: "running",
+          size: { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 },
+        },
+      ],
+      attachOutput: "termd-e2e-ready\n",
+      sessionFilesDelayMs: APP_CONNECTION_TIMEOUT_MS + 500,
+      sessionFiles: {
+        [DEFAULT_SESSION_ID]: {
+          session_id: DEFAULT_SESSION_ID,
+          path: "/slow/files",
+          entries: [],
+        },
+      },
+    });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await screen.findByText(/termd-e2e-ready/);
+    await waitFor(() => expect(daemon.sessionFileRequests.length).toBeGreaterThan(0));
+    await new Promise((resolve) =>
+      window.setTimeout(resolve, APP_CONNECTION_TIMEOUT_MS + 700),
+    );
+
+    // 中文注释：文件树 timeout 是右侧 panel 的状态，不代表 terminal stream 断开。
+    const panel = await screen.findByLabelText("session files");
+    expect(within(panel).getByText("unavailable")).toBeInTheDocument();
     expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
     expect(screen.getByTestId("terminal-pane")).toBeInTheDocument();
     expect(daemon.activeConnectionCount()).toBe(1);
@@ -1395,6 +1474,79 @@ describe("termui web 工作台", () => {
     expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
   });
 
+  it("迟到的 Git 结果不能覆盖当前 session panel", async () => {
+    const user = userEvent.setup();
+    const alphaSession = {
+      session_id: "00000000-0000-0000-0000-000000000493",
+      name: "alpha",
+      state: "running",
+      size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+    } as const;
+    const betaSession = {
+      session_id: "00000000-0000-0000-0000-000000000494",
+      name: "beta",
+      state: "running",
+      size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+    } as const;
+    const gitResult = (sessionId: string, branch: string): SessionGitResultPayload => ({
+      session_id: sessionId,
+      cwd: `/repo/${branch}`,
+      repository_root: `/repo/${branch}`,
+      worktrees: [
+        {
+          path: `/repo/${branch}`,
+          branch,
+          head: branch.slice(0, 6),
+          is_current: true,
+          staged: [],
+          unstaged: [],
+        },
+      ],
+      graph: [`* ${branch.slice(0, 6)} ${branch} commit`],
+      error: null,
+    });
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [alphaSession, betaSession],
+      attachOutput: "session-ready\n",
+      sessionFiles: {
+        [alphaSession.session_id]: { session_id: alphaSession.session_id, path: "/repo/alpha", entries: [] },
+        [betaSession.session_id]: { session_id: betaSession.session_id, path: "/repo/beta", entries: [] },
+      },
+      sessionGitDelayMsBySession: {
+        [alphaSession.session_id]: APP_CONNECTION_TIMEOUT_MS - 400,
+      },
+      sessionGit: {
+        [alphaSession.session_id]: gitResult(alphaSession.session_id, "alpha-branch"),
+        [betaSession.session_id]: gitResult(betaSession.session_id, "beta-branch"),
+      },
+    });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession("alpha");
+    await screen.findByText(/session-ready/);
+    await waitFor(() =>
+      expect(daemon.sessionGitRequests.some((request) => request.session_id === alphaSession.session_id)).toBe(true),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Open beta" }));
+    await waitFor(() => expect(selectedSessionName()).toBe("beta"));
+    await waitFor(() => expect(daemon.attachedSessions).toContain(betaSession.session_id));
+    const panel = await screen.findByLabelText("session files");
+    await user.click(within(panel).getByRole("tab", { name: "Git" }));
+    await waitFor(() => expect(within(panel).getAllByText("beta-branch").length).toBeGreaterThan(0));
+    await waitFor(() =>
+      expect(daemon.sessionGitRequests.some((request) => request.session_id === betaSession.session_id)).toBe(true),
+    );
+
+    // 中文注释：alpha 的旧 Git RPC 比 beta 晚返回；它不能再覆盖当前 beta panel。
+    await new Promise((resolve) => window.setTimeout(resolve, APP_CONNECTION_TIMEOUT_MS));
+    expect(within(panel).queryByText("alpha-branch")).toBeNull();
+    expect(within(panel).getAllByText("beta-branch").length).toBeGreaterThan(0);
+  });
+
   it("持续输出时合并写入 xterm，并且不为每个输出刷新布局", async () => {
     const user = userEvent.setup();
     render(<App />);
@@ -1989,6 +2141,31 @@ describe("termui web 工作台", () => {
       () =>
         expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID, DEFAULT_SESSION_ID]),
       { timeout: 2200 },
+    );
+    expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
+    expect(screen.getByTestId("terminal-pane")).toBeInTheDocument();
+  });
+
+  it("浏览器 offline 后 online 会丢弃半开 WebSocket 并重连当前 session", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await screen.findByText(/termd-e2e-ready/);
+    await waitFor(() => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID]));
+
+    window.dispatchEvent(new Event("offline"));
+    await waitFor(() => expect(daemon.activeConnectionCount()).toBe(0));
+
+    // 中文注释：浏览器 offline 不保证 WebSocket 及时 close；online 时必须基于当前
+    // session 重新建立 workspace client，而不是复用旧的半开 transport。
+    window.dispatchEvent(new Event("online"));
+
+    await waitFor(
+      () =>
+        expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID, DEFAULT_SESSION_ID]),
+      { timeout: 2800 },
     );
     expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
     expect(screen.getByTestId("terminal-pane")).toBeInTheDocument();

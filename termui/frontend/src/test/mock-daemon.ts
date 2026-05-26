@@ -89,7 +89,10 @@ interface MockDaemonOptions {
   daemonStatusResponses?: DaemonStatusResultPayload[];
   daemonStatusDelayMs?: number;
   dropAuthChallenge?: boolean;
+  sessionFilesDelayMs?: number;
   sessionFiles?: Record<UUID, SessionFilesResultPayload>;
+  sessionGitDelayMs?: number;
+  sessionGitDelayMsBySession?: Record<UUID, number>;
   sessionGit?: Record<UUID, SessionGitResultPayload>;
   sessionFileReads?: Record<string, SessionFileReadResultPayload>;
   relayClientPathOnly?: boolean;
@@ -592,6 +595,40 @@ export class MockDaemon {
         this.sendPacketResponse(connection, packet, payload);
         return true;
       }
+      case "session.files": {
+        const payload = packet.payload as { session_id: UUID; path?: string | null };
+        if (!connection.attachedSessionIds.has(payload.session_id)) {
+          this.sendPacketError(connection, packet, "invalid_state", "invalid protocol state");
+          return true;
+        }
+        this.sessionFileRequests.push(payload);
+        if (this.options.sessionFilesDelayMs) {
+          // 中文注释：packet response 按 id 返回；慢 files 请求不能抢占同连接上的其他请求。
+          await new Promise((resolve) => setTimeout(resolve, this.options.sessionFilesDelayMs));
+        }
+        const files = this.resolveSessionFilesResult(payload);
+        this.sendPacketResponse(connection, packet, files);
+        return true;
+      }
+      case "session.git": {
+        const payload = packet.payload as { session_id: UUID };
+        if (!connection.attachedSessionIds.has(payload.session_id)) {
+          this.sendPacketError(connection, packet, "invalid_state", "invalid protocol state");
+          return true;
+        }
+        this.sessionGitRequests.push(payload);
+        const gitDelayMs = this.options.sessionGitDelayMsBySession?.[payload.session_id] ?? this.options.sessionGitDelayMs;
+        if (gitDelayMs) {
+          // 中文注释：Git packet response 必须保留原 request id，模拟真实 daemon 并发响应。
+          await new Promise((resolve) => setTimeout(resolve, gitDelayMs));
+        }
+        this.sendPacketResponse(
+          connection,
+          packet,
+          this.options.sessionGit?.[payload.session_id] ?? defaultSessionGit(payload.session_id),
+        );
+        return true;
+      }
       default:
         return false;
     }
@@ -860,26 +897,11 @@ export class MockDaemon {
           return;
         }
         this.sessionFileRequests.push(payload);
-        // 指定 path 时必须按该目录返回，避免测试里把“任意切换目录”误回退成 session 根目录。
-        const lookupPath =
-          payload.path && payload.path.trim()
-            ? payload.path
-            : this.sessionFilePositions.get(payload.session_id) ?? payload.session_id;
-        const files = this.options.sessionFiles?.[lookupPath];
-        if (files) {
-          this.sessionFilePositions.set(payload.session_id, files.path);
+        if (this.options.sessionFilesDelayMs) {
+          // 中文注释：文件树是终端旁路信息；测试用延迟模拟它被大输出或差网络排队。
+          await new Promise((resolve) => setTimeout(resolve, this.options.sessionFilesDelayMs));
         }
-        this.sendInner(
-          connection,
-          envelope(
-            "session_files_result",
-            files ?? {
-              session_id: payload.session_id,
-              path: payload.path ?? this.sessionFilePositions.get(payload.session_id) ?? "",
-              entries: [],
-            },
-          ),
-        );
+        this.sendInner(connection, envelope("session_files_result", this.resolveSessionFilesResult(payload)));
         return;
       }
       case "session_search": {
@@ -898,6 +920,11 @@ export class MockDaemon {
           return;
         }
         this.sessionGitRequests.push(payload);
+        const gitDelayMs = this.options.sessionGitDelayMsBySession?.[payload.session_id] ?? this.options.sessionGitDelayMs;
+        if (gitDelayMs) {
+          // 中文注释：Git 状态请求可能迟到；App 必须按当前 session 代际决定是否接受结果。
+          await new Promise((resolve) => setTimeout(resolve, gitDelayMs));
+        }
         this.sendInner(
           connection,
           envelope("session_git_result", this.options.sessionGit?.[payload.session_id] ?? defaultSessionGit(payload.session_id)),
@@ -1086,6 +1113,23 @@ export class MockDaemon {
   private appendSessionOutput(sessionId: UUID, text: string): void {
     const current = this.sessionOutputSnapshots.get(sessionId) ?? "";
     this.sessionOutputSnapshots.set(sessionId, `${current}${text}`);
+  }
+
+  private resolveSessionFilesResult(payload: { session_id: UUID; path?: string | null }): SessionFilesResultPayload {
+    // 指定 path 时必须按该目录返回，避免测试里把“任意切换目录”误回退成 session 根目录。
+    const lookupPath =
+      payload.path && payload.path.trim()
+        ? payload.path
+        : this.sessionFilePositions.get(payload.session_id) ?? payload.session_id;
+    const files = this.options.sessionFiles?.[lookupPath];
+    if (files) {
+      this.sessionFilePositions.set(payload.session_id, files.path);
+    }
+    return files ?? {
+      session_id: payload.session_id,
+      path: payload.path ?? this.sessionFilePositions.get(payload.session_id) ?? "",
+      entries: [],
+    };
   }
 
   private applyMockFileWrite(sessionId: UUID, path: string): void {

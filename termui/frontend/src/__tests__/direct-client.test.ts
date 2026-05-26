@@ -242,6 +242,49 @@ describe("DirectClient", () => {
       80,
     );
     await expect(client.listSessions()).rejects.toMatchObject({ code: "response_timeout" });
+
+    // 中文注释：普通 RPC timeout 是 UI deadline，不是连接失败。
+    // 迟到的 session.list response 会被 request id 丢弃；同一 WebSocket 后续 RPC 仍可继续。
+    await new Promise((resolve) => setTimeout(resolve, 90));
+    await expect(client.getDaemonStatus()).resolves.toMatchObject({ host_name: "mock-daemon" });
+    expect(daemon.activeConnectionCount()).toBe(1);
+    client.close();
+  });
+
+  it("terminal attach 可以使用长于普通 RPC 的 stream 超时", async () => {
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [
+        {
+          session_id: "00000000-0000-0000-0000-000000000301",
+          state: "running",
+          size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+        },
+      ],
+      attachDelayMs: 80,
+    });
+    const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000320");
+    const pairClient = await connectDevice(device.device_id, 300);
+    const accepted = await pairClient.pair("secret-token", device.device_public_key);
+    pairClient.close();
+
+    const client = await DirectClient.connect(daemon.url, daemon.serverId, device.device_id, {
+      timeoutMs: 300,
+      requestTimeoutMs: 30,
+      expectedDaemonPublicKey: daemon.daemonPublicKey,
+    });
+    await client.authenticate(device, {
+      server_id: accepted.server_id,
+      daemon_public_key: accepted.daemon_public_key,
+      url: daemon.url,
+      paired_at_ms: 1710000000000,
+    });
+
+    const list = await client.listSessions();
+    await expect(client.attachSession(list.sessions[0].session_id, { timeoutMs: 300 })).resolves.toMatchObject({
+      session_id: list.sessions[0].session_id,
+    });
     client.close();
   });
 

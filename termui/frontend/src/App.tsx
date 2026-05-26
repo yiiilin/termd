@@ -146,8 +146,16 @@ function isDocumentHidden(): boolean {
   return typeof document !== "undefined" && document.visibilityState === "hidden";
 }
 
+function isBrowserOffline(): boolean {
+  return typeof navigator !== "undefined" && navigator.onLine === false;
+}
+
+function isPagePaused(): boolean {
+  return isDocumentHidden() || isBrowserOffline();
+}
+
 function pageHiddenConnectionError(): ProtocolClientError {
-  return new ProtocolClientError("connection_closed", "connection paused while page is hidden");
+  return new ProtocolClientError("connection_closed", "connection paused while page is hidden or offline");
 }
 
 function createVisibilityAbortController(): { controller: AbortController; dispose: () => void } | undefined {
@@ -156,15 +164,19 @@ function createVisibilityAbortController(): { controller: AbortController; dispo
   }
   const controller = new AbortController();
   const abortWhenHidden = () => {
-    if (isDocumentHidden()) {
+    if (isPagePaused()) {
       controller.abort();
     }
   };
   document.addEventListener("visibilitychange", abortWhenHidden);
+  window.addEventListener("offline", abortWhenHidden);
   abortWhenHidden();
   return {
     controller,
-    dispose: () => document.removeEventListener("visibilitychange", abortWhenHidden),
+    dispose: () => {
+      document.removeEventListener("visibilitychange", abortWhenHidden);
+      window.removeEventListener("offline", abortWhenHidden);
+    },
   };
 }
 
@@ -269,6 +281,7 @@ export default function App() {
   const filesPanelWidthRef = useRef(DEFAULT_FILES_PANEL_WIDTH);
   const sessionFilesFollowTerminalCwdRef = useRef(sessionFilesFollowTerminalCwd);
   const sessionFilesRequestSeqRef = useRef(0);
+  const sessionGitRequestSeqRef = useRef(0);
   const sessionFilesFollowRefreshInFlightRef = useRef(false);
   const filesPanelResizeRef = useRef<{
     pointerId: number;
@@ -300,6 +313,7 @@ export default function App() {
   const attachReconnectHandlerRef = useRef<(client: DirectClient, caught: unknown, options?: AttachReconnectOptions) => boolean>(() => false);
   const daemonNetworkSampleRef = useRef<DaemonNetworkCounterSample | undefined>(undefined);
   const daemonStatusRefreshInFlightRef = useRef(false);
+  const daemonStatusRequestSeqRef = useRef(0);
   const daemonClientsRefreshInFlightRef = useRef(false);
   const lastNotificationAtRef = useRef(0);
   const isMobileLayout = useMobileLayout();
@@ -567,6 +581,7 @@ export default function App() {
 
   const clearSessionFiles = useCallback(() => {
     sessionFilesRequestSeqRef.current += 1;
+    sessionGitRequestSeqRef.current += 1;
     sessionFilesFollowRefreshInFlightRef.current = false;
     setSessionFiles(undefined);
     setSessionFilesError(undefined);
@@ -1036,7 +1051,7 @@ export default function App() {
     if (!server || !device) {
       throw new ProtocolClientError("missing_pairing", "device is not paired");
     }
-    if (isDocumentHidden()) {
+    if (isPagePaused()) {
       throw pageHiddenConnectionError();
     }
     const visibilityAbort = createVisibilityAbortController();
@@ -1052,11 +1067,11 @@ export default function App() {
         signal: visibilityAbort?.controller.signal,
       });
       visibilityAbort?.controller.signal.addEventListener("abort", closeClientOnAbort, { once: true });
-      if (visibilityAbort?.controller.signal.aborted || isDocumentHidden()) {
+      if (visibilityAbort?.controller.signal.aborted || isPagePaused()) {
         throw pageHiddenConnectionError();
       }
       await client.authenticate(device, { ...server, url: routeUrl });
-      if (visibilityAbort?.controller.signal.aborted || isDocumentHidden()) {
+      if (visibilityAbort?.controller.signal.aborted || isPagePaused()) {
         throw pageHiddenConnectionError();
       }
       return client;
@@ -1177,6 +1192,13 @@ export default function App() {
   const loadSessionGit = useCallback(
     async (sessionId: UUID, options: { silent?: boolean } = {}) => {
       const silent = Boolean(options.silent);
+      const requestServerId = activeServer?.server_id;
+      const requestSeq = sessionGitRequestSeqRef.current + 1;
+      sessionGitRequestSeqRef.current = requestSeq;
+      const isCurrentRequest = () =>
+        requestSeq === sessionGitRequestSeqRef.current &&
+        activeServerIdRef.current === requestServerId &&
+        attachedSessionRef.current === sessionId;
       if (!silent) {
         setSessionGitLoading(true);
         setSessionGitError(undefined);
@@ -1185,24 +1207,27 @@ export default function App() {
       try {
         client = await authenticatedSessionClient(sessionId);
         const git = await client.getSessionGit(sessionId);
+        if (!isCurrentRequest()) {
+          return;
+        }
         setSessionGit(git);
         setSessionGitError(undefined);
       } catch (caught) {
-        if (!silent) {
+        if (!silent && isCurrentRequest()) {
           setSessionGit(undefined);
           setSessionGitError(toSafeError(caught));
         }
       } finally {
-        if (!silent) {
+        if (!silent && isCurrentRequest()) {
           setSessionGitLoading(false);
         }
       }
     },
-    [authenticatedSessionClient],
+    [activeServer?.server_id, authenticatedSessionClient],
   );
 
   const handleRefresh = useCallback(async () => {
-    if (isDocumentHidden()) {
+    if (isPagePaused()) {
       return;
     }
     const requestServerId = activeServer?.server_id;
@@ -1299,7 +1324,7 @@ export default function App() {
 
   const refreshDaemonClients = useCallback(
     async () => {
-      if (isDocumentHidden()) {
+      if (isPagePaused()) {
         return;
       }
       if (daemonClientsRefreshInFlightRef.current) {
@@ -1355,13 +1380,19 @@ export default function App() {
   );
 
   const loadDaemonStatus = useCallback(async () => {
-    if (isDocumentHidden()) {
+    if (isPagePaused()) {
       return;
     }
     if (daemonStatusRefreshInFlightRef.current) {
       return;
     }
     daemonStatusRefreshInFlightRef.current = true;
+    const requestServerId = activeServer?.server_id;
+    const requestSeq = daemonStatusRequestSeqRef.current + 1;
+    daemonStatusRequestSeqRef.current = requestSeq;
+    const isCurrentRequest = () =>
+      requestSeq === daemonStatusRequestSeqRef.current &&
+      activeServerIdRef.current === requestServerId;
     setDaemonStatusLoading(true);
     setDaemonStatusError(undefined);
     try {
@@ -1370,6 +1401,9 @@ export default function App() {
         // 中文注释：状态栏和 RTT 是非终端 segment，仍复用工作台可靠 WebSocket。
         const status = await client.getDaemonStatus();
         const latencyMs = await client.measureLatency().catch(() => undefined);
+        if (!isCurrentRequest()) {
+          return;
+        }
         const nextNetworkSample = networkCounterSampleFromStatus(status, Date.now());
         setDaemonNetworkRate(networkRateFromSamples(daemonNetworkSampleRef.current, nextNetworkSample));
         daemonNetworkSampleRef.current = nextNetworkSample;
@@ -1386,15 +1420,19 @@ export default function App() {
         throw caught;
       }
     } catch (caught) {
-      setDaemonStatusError(toSafeError(caught));
-      if (!attachClientRef.current) {
+      if (isCurrentRequest()) {
+        setDaemonStatusError(toSafeError(caught));
+      }
+      if (isCurrentRequest() && !attachClientRef.current) {
         setDaemonNetworkLatencyMs(undefined);
       }
     } finally {
       daemonStatusRefreshInFlightRef.current = false;
-      setDaemonStatusLoading(false);
+      if (isCurrentRequest()) {
+        setDaemonStatusLoading(false);
+      }
     }
-  }, [authenticatedWorkspaceClient, closeWorkspaceClient]);
+  }, [activeServer?.server_id, authenticatedWorkspaceClient, closeWorkspaceClient]);
 
   const clearNewOutputMark = useCallback((sessionId: UUID) => {
     // 新输出提示只属于本地 UI；用户打开该 session 后立即清除，不回写 daemon。
@@ -1434,7 +1472,7 @@ export default function App() {
       !state.device ||
       status !== "idle" ||
       autoCheckedServerRef.current === activeServer.server_id ||
-      isDocumentHidden()
+      isPagePaused()
     ) {
       return;
     }
@@ -1592,6 +1630,13 @@ export default function App() {
     discardPendingTerminalOutput();
     setError(undefined);
 
+    if (isPagePaused()) {
+      // 中文注释：offline/hidden 期间不主动建新 WebSocket；恢复事件会按当前
+      // session 重新进入 handleRetryConnection，避免离线时的半开连接和浏览器报错。
+      setStatus("ready");
+      return true;
+    }
+
     if (attachReconnectTimerRef.current !== undefined) {
       return true;
     }
@@ -1611,6 +1656,10 @@ export default function App() {
       void (async () => {
         let client: DirectClient | undefined;
         try {
+          if (isPagePaused()) {
+            setStatus("ready");
+            return;
+          }
           const isCurrentReconnect = () =>
             !userDetachedRef.current && attachReconnectKeyRef.current === reconnectKey;
           const closePendingReconnectClient = () => {
@@ -1633,7 +1682,10 @@ export default function App() {
           pendingTerminalAttachSessionRef.current = sessionId;
           const attached = await client.attachSession(
             sessionId,
-            lastTerminalSeq !== undefined ? { lastTerminalSeq } : {},
+            {
+              ...(lastTerminalSeq !== undefined ? { lastTerminalSeq } : {}),
+              timeoutMs: ATTACH_CONNECTION_TIMEOUT_MS,
+            },
           );
           if (!isCurrentReconnect()) {
             client.detachSession(sessionId, "stale_reconnect");
@@ -1803,7 +1855,9 @@ export default function App() {
         }
         pendingAttachClientRef.current = outputClient;
         pendingTerminalAttachSessionRef.current = sessionId;
-        const attached = await outputClient.attachSession(sessionId);
+        const attached = await outputClient.attachSession(sessionId, {
+          timeoutMs: ATTACH_CONNECTION_TIMEOUT_MS,
+        });
         if (!isCurrentAttachRequest()) {
           outputClient.detachSession(sessionId, "stale_attach");
           closePendingAttachClients();
@@ -2062,7 +2116,7 @@ export default function App() {
   ]);
 
   const handleRetryConnection = useCallback(async () => {
-    if (isDocumentHidden()) {
+    if (isPagePaused()) {
       return;
     }
     const sessionId = attachedSessionRef.current ?? attachedSessionId ?? selectedSessionId;
@@ -2126,13 +2180,26 @@ export default function App() {
   }, [activeServer?.server_id, activeSurface, attachedSessionId, error, handleRetryConnection, hasPairedServer, selectedSessionId]);
 
   useEffect(() => {
+    const pauseOfflineConnection = () => {
+      if (activeSurface !== "workspace") {
+        return;
+      }
+      // 中文注释：浏览器切 offline 时，WebSocket 不一定会立刻触发 close。
+      // 主动丢弃旧 transport，避免恢复后继续向半开连接写 terminal.attach/input。
+      closeWorkspaceClient();
+    };
+
     const resumeVisibleConnection = () => {
-      if (isDocumentHidden() || activeSurface !== "workspace") {
+      if (isPagePaused() || activeSurface !== "workspace") {
         return;
       }
       // 页面从后台回来后只做一次主动恢复；hidden 期间的轮询/重试已经暂停，
       // 避免浏览器恢复时把过期定时器一次性打到 relay 上。
       if (error) {
+        void handleRetryConnection();
+        return;
+      }
+      if ((attachedSessionId || selectedSessionId) && !attachClientRef.current) {
         void handleRetryConnection();
         return;
       }
@@ -2149,20 +2216,25 @@ export default function App() {
     };
 
     document.addEventListener("visibilitychange", resumeVisibleConnection);
+    window.addEventListener("offline", pauseOfflineConnection);
     window.addEventListener("online", resumeVisibleConnection);
     return () => {
       document.removeEventListener("visibilitychange", resumeVisibleConnection);
+      window.removeEventListener("offline", pauseOfflineConnection);
       window.removeEventListener("online", resumeVisibleConnection);
     };
   }, [
     activeServer,
     activeSurface,
+    attachedSessionId,
+    closeWorkspaceClient,
     connectionReady,
     error,
     handleRefresh,
     handleRetryConnection,
     loadDaemonStatus,
     refreshDaemonClients,
+    selectedSessionId,
     state.device,
     status,
   ]);

@@ -499,7 +499,10 @@ export class DirectClient {
     );
   }
 
-  async attachSession(sessionId: UUID, options: { watchUpdates?: boolean; lastTerminalSeq?: number } = {}): Promise<SessionAttachedPayload> {
+  async attachSession(
+    sessionId: UUID,
+    options: { watchUpdates?: boolean; lastTerminalSeq?: number; timeoutMs?: number } = {},
+  ): Promise<SessionAttachedPayload> {
     return this.openTerminalStream<SessionAttachedPayload>(
       "terminal.attach",
       {
@@ -508,6 +511,7 @@ export class DirectClient {
         ...(options.lastTerminalSeq !== undefined ? { last_terminal_seq: options.lastTerminalSeq } : {}),
       } satisfies SessionAttachPayload,
       sessionId,
+      options.timeoutMs,
     );
   }
 
@@ -906,6 +910,7 @@ export class DirectClient {
     method: string,
     payload: unknown,
     sessionId?: UUID,
+    timeoutMs = this.timeoutMs,
   ): Promise<T> {
     const id = randomUuid();
     const streamId = randomUuid();
@@ -927,6 +932,7 @@ export class DirectClient {
       },
       id,
       method,
+      timeoutMs,
     ).then(
       (response) => {
         const resolvedSessionId = response.session_id;
