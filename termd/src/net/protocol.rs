@@ -78,7 +78,10 @@ use super::{
 const AUTH_CHALLENGE_TTL_MS: u64 = 60_000;
 const LIVE_OUTPUT_MIN_BYTES: usize = 16 * 1024;
 const LIVE_OUTPUT_BYTES_PER_CELL: usize = 8;
-const LIVE_OUTPUT_DRAIN_MAX_CHUNKS: usize = 8;
+// 中文注释：supervisor 会按 PTY read 边界生成 terminal frame，很多命令会变成
+// “一行一个 frame”。live drain 不能只取几个小 frame，否则 relay/Web 会看到逐行蹦。
+// 真正的上限仍由下面的 64KB payload/transport budget 控制。
+const LIVE_OUTPUT_DRAIN_MAX_CHUNKS: usize = 512;
 const RAW_OUTPUT_BATCH_MAX_CHUNKS: usize = 8;
 const TERMINAL_STREAM_BATCH_MAX_BYTES: usize = 64 * 1024;
 const TERMINAL_STREAM_BATCH_MAX_TRANSPORT_BYTES: usize = 64 * 1024;
@@ -4399,16 +4402,18 @@ impl ProtocolConnection {
 
             // 中文注释：terminal 输出不再等待 browser flow ACK。当前批次如果被字节或
             // transport 上限截断，直接排下一轮 push；慢客户端由 WebSocket 写入队列负责断开。
-            if self
+            let terminal_output_has_more = self
                 .pending_terminal_frames
                 .get(&session_id)
                 .is_some_and(|pending| !pending.is_empty())
                 || protocol.terminal_frame_log_has_from(
                     session_id,
                     self.next_terminal_frame_seq(session_id),
-                )
-            {
+                );
+            if terminal_output_has_more {
                 self.deferred_output_wakeups.insert(session_id);
+            } else {
+                self.deferred_output_wakeups.remove(&session_id);
             }
 
             return terminal_frame_batch_messages(session_id, frames);
@@ -5413,11 +5418,19 @@ impl ProtocolConnection {
     ) {
         let queue = self.pending_terminal_frames.entry(session_id).or_default();
         let mut max_seq = None;
+        let mut queued_any = false;
         for frame in frames {
+            queued_any = true;
             if let Some(seq) = terminal_frame_covered_seq(&frame) {
                 max_seq = Some(max_seq.unwrap_or(0_u64).max(seq));
             }
             queue.push_back(frame);
+        }
+        if queued_any {
+            // 中文注释：terminal attach 的 snapshot/tail 是先进入连接 pending 队列，
+            // 后续由 direct/relay 主循环异步 drain。这里显式登记 wakeup，避免 watcher
+            // 初始事件丢失或被重建时，pending frame 停在 daemon 内无人推进。
+            self.deferred_output_wakeups.insert(session_id);
         }
         if let Some(max_seq) = max_seq {
             // 中文注释：snapshot/tail 已经覆盖到 max_seq；当前连接之后只需要读取
@@ -9210,6 +9223,131 @@ mod tests {
     }
 
     #[test]
+    fn packet_terminal_attach_pending_frames_schedule_output_wakeup() {
+        let (mut protocol, backend) = protocol();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let (_, mut device_session, _) =
+            open_packet_e2ee(&mut protocol, &mut connection, device_id);
+        pair_packet_device(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            device_id,
+            PublicKey("device-public-key".to_owned()),
+        );
+        let session_id =
+            create_test_packet_session(&mut protocol, &mut connection, &mut device_session);
+        backend.push_terminal_journal_frame_for_session(
+            session_id,
+            PtyTerminalFrame::Output {
+                terminal_seq: 1,
+                data: b"attach-wakeup-output".to_vec(),
+            },
+        );
+
+        let stream_id = PacketStreamId::new();
+        let attach_responses = send_encrypted_packet(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            ProtocolPacket::stream_open(
+                PacketRequestId::new(),
+                stream_id,
+                METHOD_TERMINAL_ATTACH,
+                0,
+                serde_json::to_value(SessionAttachPayload {
+                    session_id,
+                    watch_updates: true,
+                    last_terminal_seq: Some(0),
+                })
+                .unwrap(),
+            ),
+        );
+        assert_eq!(
+            decrypt_first_packet(&mut device_session, attach_responses).kind,
+            PacketKind::Response
+        );
+
+        // 中文注释：attach 入队 snapshot/tail 后必须立刻登记输出唤醒。
+        // relay/direct 主循环随后才会安排 push drain；不能只依赖 watcher 的初始事件。
+        assert!(
+            connection.debug_snapshot().pending_terminal_frames > 0,
+            "attach 应先把 terminal frame 放入连接内待发送队列"
+        );
+        assert_eq!(
+            connection.take_deferred_output_wakeups(),
+            vec![session_id],
+            "pending terminal frames 必须显式唤醒 server/relay 输出 drain"
+        );
+    }
+
+    #[test]
+    fn packet_terminal_live_output_bursts_are_batched_beyond_tiny_frame_count() {
+        let (mut protocol, backend) = protocol();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let (_, mut device_session, _) =
+            open_packet_e2ee(&mut protocol, &mut connection, device_id);
+        pair_packet_device(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            device_id,
+            PublicKey("device-public-key".to_owned()),
+        );
+        let session_id =
+            create_test_packet_session(&mut protocol, &mut connection, &mut device_session);
+
+        let stream_id = PacketStreamId::new();
+        let attach_responses = send_encrypted_packet(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            ProtocolPacket::stream_open(
+                PacketRequestId::new(),
+                stream_id,
+                METHOD_TERMINAL_ATTACH,
+                0,
+                serde_json::to_value(SessionAttachPayload {
+                    session_id,
+                    watch_updates: true,
+                    last_terminal_seq: Some(0),
+                })
+                .unwrap(),
+            ),
+        );
+        assert_eq!(
+            decrypt_first_packet(&mut device_session, attach_responses).kind,
+            PacketKind::Response
+        );
+        let _ = decrypt_packets(
+            &mut device_session,
+            connection.read_session_output(&mut protocol, session_id, 1024),
+        );
+
+        for index in 1..=200 {
+            backend.push_output_for_session(session_id, format!("live-burst-{index:04}\n"));
+        }
+
+        let output_packets = decrypt_packets(
+            &mut device_session,
+            connection.read_session_output(&mut protocol, session_id, 1024),
+        );
+        assert_eq!(output_packets.len(), 1);
+        let payload: TerminalFramePayload =
+            decode_payload(output_packets[0].payload.clone()).unwrap();
+
+        // 中文注释：实时输出已经在 daemon log 中形成 backlog 时，不能按 8 个小 frame
+        // 慢慢推；应该尽量填满 terminal batch 的字节预算，避免 relay Web 看起来逐行蹦。
+        assert!(
+            terminal_frame_payload_count(&payload) > 128,
+            "live burst 应按批量发送，实际只发送 {} 个 frame",
+            terminal_frame_payload_count(&payload)
+        );
+    }
+
+    #[test]
     fn packet_terminal_output_batches_frames_by_transport_size() {
         let (mut protocol, backend) = protocol();
         let (mut connection, _) = protocol.start_connection();
@@ -9303,8 +9441,9 @@ mod tests {
         let payload: TerminalFramePayload =
             decode_payload(output_packets[0].payload.clone()).unwrap();
         assert!(
-            terminal_frame_payload_count(&payload) > LIVE_OUTPUT_DRAIN_MAX_CHUNKS,
-            "credit 充足时不应被 live drain 的 8 frame 小预算限速"
+            terminal_frame_payload_count(&payload) > 128,
+            "credit 充足时不应被小 frame 数预算限速，实际 {} 个 frame",
+            terminal_frame_payload_count(&payload)
         );
         assert!(
             terminal_frame_payload_count(&payload) < 1800,

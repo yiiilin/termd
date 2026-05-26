@@ -656,6 +656,7 @@ export class DirectClient {
       stream_id: stream.streamId,
       payload: { reason },
     });
+    this.discardQueuedTerminalOutput(stream.streamId, stream.sessionId);
     this.removeStream(stream.streamId);
   }
 
@@ -840,9 +841,13 @@ export class DirectClient {
     }
     const seq = packet.seq ?? 0;
     const stream = this.terminalStreamsById.get(packet.stream_id);
-    if (stream) {
-      stream.lastOutputSeq = seq;
+    if (!stream) {
+      // 中文注释：用户快速切换 session 后，旧 stream 的少量输出可能已经在
+      // WebSocket/TCP 队列里。stream 已取消时这些 chunk 必须在协议层丢弃，
+      // 否则会继续堆进 pendingInner，把新 session 的 snapshot/tail 挡在后面。
+      return;
     }
+    stream.lastOutputSeq = seq;
     const payload = packet.payload as { kind?: unknown; session_id?: unknown; frames?: unknown };
     if (payload.kind === "batch" && Array.isArray(payload.frames)) {
       for (const frame of payload.frames) {
@@ -998,6 +1003,25 @@ export class DirectClient {
       return;
     }
     this.pendingInner.push(inner);
+  }
+
+  private discardQueuedTerminalOutput(streamId: PacketStreamId, sessionId: UUID): void {
+    if (this.pendingInner.length === 0) {
+      return;
+    }
+    const retained = this.pendingInner.filter((inner) => !this.isTerminalOutputForStream(inner, streamId, sessionId));
+    if (retained.length === this.pendingInner.length) {
+      return;
+    }
+    this.pendingInner.splice(0, this.pendingInner.length, ...retained);
+  }
+
+  private isTerminalOutputForStream(inner: Envelope, streamId: PacketStreamId, sessionId: UUID): boolean {
+    if (inner.type !== "session_data" && inner.type !== "terminal_frame") {
+      return false;
+    }
+    const payload = inner.payload as { stream_id?: unknown; session_id?: unknown };
+    return payload.stream_id === streamId || payload.session_id === sessionId;
   }
 
   private rejectInnerWaiters(error: Error): void {

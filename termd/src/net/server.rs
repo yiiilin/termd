@@ -65,6 +65,7 @@ const WEBSOCKET_PUSH_EVENT_QUEUE_CAPACITY: usize = 1024;
 const WEBSOCKET_PUSH_DRAIN_MAX_EVENTS_PER_TICK: usize = 4;
 const WEBSOCKET_PUSH_DRAIN_MAX_ENQUEUED_BYTES_PER_TICK: usize = 256 * 1024;
 const WEBSOCKET_PUSH_DRAIN_MAX_ELAPSED: Duration = Duration::from_millis(2);
+const TERMINAL_OUTPUT_PUSH_COALESCE_DELAY: Duration = Duration::from_millis(10);
 
 fn websocket_idle_timeout_enabled() -> bool {
     // 浏览器页面打开时，WebSocket 的生命周期应由真实 close/error 决定。
@@ -106,6 +107,17 @@ impl SessionPushEvent {
             // 造成浏览器 WebSocket 队列和 daemon 事件循环都被固定长度小包拖慢。
             SessionPushEvent::Activity(_) => Some(SESSION_ACTIVITY_PUSH_MIN_INTERVAL),
             SessionPushEvent::Output(_)
+            | SessionPushEvent::FileTree(_)
+            | SessionPushEvent::Resize(_) => None,
+        }
+    }
+
+    fn coalesce_delay(self) -> Option<Duration> {
+        match self {
+            // 中文注释：终端输出是高频数据面。等待一个很短窗口可以把“一行一个 signal”
+            // 合并为一次 drain，仍保持交互延迟在用户无感范围内。
+            SessionPushEvent::Output(_) => Some(TERMINAL_OUTPUT_PUSH_COALESCE_DELAY),
+            SessionPushEvent::Activity(_)
             | SessionPushEvent::FileTree(_)
             | SessionPushEvent::Resize(_) => None,
         }
@@ -1830,10 +1842,17 @@ fn spawn_session_push_watcher<T>(
 
     let push_event_tx = push_event_tx.clone();
     let min_interval = event.min_interval();
+    let coalesce_delay = event.coalesce_delay();
     watcher_tasks.push(tokio::spawn(async move {
         loop {
             if signal.changed().await.is_err() {
                 break;
+            }
+            if let Some(delay) = coalesce_delay {
+                tokio::time::sleep(delay).await;
+                // 中文注释：coalesce 窗口内发生的多次 watch 更新只需要一个 push 事件；
+                // 真正读取时会从 daemon terminal log 一次 drain 已累计的 frames。
+                signal.borrow_and_update();
             }
             let next_event = match event {
                 SessionPushEvent::Output(_) => SessionPushEvent::Output(session_id),
@@ -2248,6 +2267,51 @@ mod tests {
         assert_eq!(rx.try_recv(), Ok(event));
         assert_eq!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty));
         assert!(wake_pending);
+    }
+
+    #[tokio::test]
+    async fn websocket_output_watcher_coalesces_bursty_terminal_signals() {
+        let session_id = SessionId::new();
+        let (signal_tx, signal_rx) = watch::channel(0_u64);
+        let (push_event_tx, mut push_event_rx) = mpsc::channel(8);
+        let mut watcher_tasks = Vec::new();
+
+        spawn_session_push_watcher(
+            session_id,
+            signal_rx,
+            SessionPushEvent::Output(session_id),
+            &push_event_tx,
+            &mut watcher_tasks,
+        );
+
+        signal_tx.send(1).unwrap();
+        signal_tx.send(2).unwrap();
+        signal_tx.send(3).unwrap();
+
+        // 中文注释：高频 PTY 输出不能一变更就立刻形成一个 WebSocket 小包；
+        // watcher 应该等待一个很短 coalesce 窗口，让 daemon 一次 drain 已累计的 frames。
+        assert!(
+            tokio::time::timeout(Duration::from_millis(5), push_event_rx.recv())
+                .await
+                .is_err(),
+            "output watcher should not push immediately for bursty terminal output"
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(100), push_event_rx.recv())
+                .await
+                .unwrap(),
+            Some(SessionPushEvent::Output(session_id))
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), push_event_rx.recv())
+                .await
+                .is_err(),
+            "coalesced watch changes should produce one output event"
+        );
+
+        for task in watcher_tasks {
+            task.abort();
+        }
     }
 
     #[tokio::test]

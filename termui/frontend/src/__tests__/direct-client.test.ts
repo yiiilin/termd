@@ -418,6 +418,60 @@ describe("DirectClient", () => {
     expect(cancelPacket).toBeTruthy();
   });
 
+  it("切换 session 后丢弃已取消 terminal stream 的排队输出", async () => {
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [
+        {
+          session_id: "00000000-0000-0000-0000-000000000321",
+          state: "running",
+          size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+        },
+        {
+          session_id: "00000000-0000-0000-0000-000000000322",
+          state: "running",
+          size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+        },
+      ],
+      attachOutput: "termd-e2e-ready\n",
+    });
+    const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000323");
+    const pairClient = await connectDevice(device.device_id);
+    const accepted = await pairClient.pair("secret-token", device.device_public_key);
+    pairClient.close();
+
+    const client = await connectDevice(device.device_id);
+    await client.authenticate(device, {
+      server_id: accepted.server_id,
+      daemon_public_key: accepted.daemon_public_key,
+      url: daemon.url,
+      paired_at_ms: 1710000000000,
+    });
+
+    const list = await client.listSessions();
+    const firstSessionId = list.sessions[0].session_id;
+    const secondSessionId = list.sessions[1].session_id;
+    await client.attachSession(firstSessionId);
+    await client.receiveInner();
+    daemon.pushTerminalFrame(firstSessionId, {
+      kind: "output",
+      session_id: firstSessionId,
+      terminal_seq: 1,
+      data_base64: "c3RhbGUtc3RyZWFtLW91dHB1dAo=",
+    });
+    // 中文注释：模拟旧 stream 的大输出已经进入 DirectClient 待消费队列，
+    // 用户随后切到另一个 session；这些旧输出不能继续挡在新 session 前面。
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    client.detachSession(firstSessionId);
+
+    await client.attachSession(secondSessionId);
+    const output = await client.receiveInner();
+    client.close();
+
+    expect(output.payload).toMatchObject({ session_id: secondSessionId });
+  });
+
   it("二进制模式下 terminal stream packet 使用 WebSocket binary 和 raw bytes", async () => {
     const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000316");
     const pairClient = await connectDevice(device.device_id);
