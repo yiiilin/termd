@@ -105,6 +105,58 @@ function setMobileVisualViewport(layoutHeight: number, visualHeight: number, off
   window.dispatchEvent(new Event("resize"));
 }
 
+function installMutableMobileVisualViewport(layoutHeight: number, visualHeight: number, offsetTop = 0) {
+  let metrics = { layoutHeight, visualHeight, offsetTop };
+  const target = new EventTarget();
+  const viewport = {
+    get height() {
+      return metrics.visualHeight;
+    },
+    get offsetTop() {
+      return metrics.offsetTop;
+    },
+    get width() {
+      return window.innerWidth;
+    },
+    get offsetLeft() {
+      return 0;
+    },
+    get pageLeft() {
+      return 0;
+    },
+    get pageTop() {
+      return metrics.offsetTop;
+    },
+    get scale() {
+      return 1;
+    },
+    addEventListener: target.addEventListener.bind(target),
+    removeEventListener: target.removeEventListener.bind(target),
+    dispatchEvent: target.dispatchEvent.bind(target),
+  } as unknown as VisualViewport;
+  Object.defineProperty(window, "innerHeight", {
+    configurable: true,
+    get: () => metrics.layoutHeight,
+  });
+  Object.defineProperty(window, "visualViewport", {
+    configurable: true,
+    value: viewport,
+    writable: true,
+  });
+
+  return {
+    setMetrics(nextLayoutHeight: number, nextVisualHeight: number, nextOffsetTop = 0) {
+      metrics = {
+        layoutHeight: nextLayoutHeight,
+        visualHeight: nextVisualHeight,
+        offsetTop: nextOffsetTop,
+      };
+      // 部分移动浏览器只派发 visualViewport 事件，不会同步派发 window.resize。
+      target.dispatchEvent(new Event("resize"));
+    },
+  };
+}
+
 let mockedDocumentVisibilityState: DocumentVisibilityState = "visible";
 
 function setDocumentVisibility(state: DocumentVisibilityState): void {
@@ -371,7 +423,6 @@ describe("termui web 工作台", () => {
     expect(screen.queryByRole("button", { name: "Edit connection" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Manage daemons" })).toBeNull();
     expect(screen.queryByLabelText("Daemon")).toBeNull();
-    await user.click(screen.getByRole("button", { name: "Refresh" }));
     await waitForWorkspaceSession();
     expect(document.body.textContent).not.toContain("00000000-0000-0000-0000-000000000401");
     expect(screen.queryByRole("button", { name: "Open" })).toBeNull();
@@ -437,28 +488,19 @@ describe("termui web 工作台", () => {
     );
     await new Promise((resolve) => window.setTimeout(resolve, DAEMON_STATUS_POLL_INTERVAL_MS + 250));
 
-    const statusLog = daemon.receivedPacketLog.find(
-      (entry) => entry.packet.kind === "request" && entry.packet.method === "daemon.status",
-    );
-    const listLog = daemon.receivedPacketLog.find(
-      (entry) => entry.packet.kind === "request" && entry.packet.method === "session.list",
-    );
-    const filesLog = daemon.receivedPacketLog.find(
-      (entry) => entry.packet.kind === "request" && entry.packet.method === "session.files",
-    );
-    const gitLog = daemon.receivedPacketLog.find(
-      (entry) => entry.packet.kind === "request" && entry.packet.method === "session.git",
-    );
-    expect(statusLog).toBeDefined();
-    expect(listLog).toBeDefined();
-    expect(filesLog).toBeDefined();
-    expect(gitLog).toBeDefined();
-    // 中文注释：WebSocket 外层是可靠流；终端和旁路 RPC 只在 E2EE segment 内分类，
-    // relay/direct 两条路径都不应该再额外拆出 aux 连接。
-    expect(statusLog!.connection_id).toBe(terminalConnectionId);
-    expect(listLog!.connection_id).toBe(terminalConnectionId);
-    expect(filesLog!.connection_id).toBe(terminalConnectionId);
-    expect(gitLog!.connection_id).toBe(terminalConnectionId);
+    const requestOnTerminalConnection = (method: string) =>
+      daemon.receivedPacketLog.some(
+        (entry) =>
+          entry.connection_id === terminalConnectionId &&
+          entry.packet.kind === "request" &&
+          entry.packet.method === method,
+      );
+    // 中文注释：初始 session.list/status 可能发生在 attach 前的 bootstrap 连接上；
+    // attach 完成后，当前 session 的终端流和旁路 RPC 必须复用同一条 WebSocket segment 通道。
+    await waitFor(() => expect(requestOnTerminalConnection("daemon.status")).toBe(true));
+    expect(requestOnTerminalConnection("session.list")).toBe(true);
+    expect(requestOnTerminalConnection("session.files")).toBe(true);
+    expect(requestOnTerminalConnection("session.git")).toBe(true);
     expect(daemon.activeConnectionCount()).toBe(1);
     expect(daemon.pingMessages).toBeGreaterThan(0);
   });
@@ -511,7 +553,7 @@ describe("termui web 工作台", () => {
     );
 
     // 中文注释：后台期间 status 这类普通 segment 可能超时；它只能影响状态栏，
-    // 不能关闭承载 terminal stream 的 workspace WebSocket。
+    // 不能关闭承载 terminal stream 的当前 session WebSocket。
     expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
     expect(screen.getByTestId("terminal-pane")).toBeInTheDocument();
     expect(daemon.activeConnectionCount()).toBe(1);
@@ -522,7 +564,7 @@ describe("termui web 工作台", () => {
     expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
   }, 15_000);
 
-  it("已 attach 时旁路 RPC 超时不能关闭工作台 WebSocket", async () => {
+  it("已 attach 时旁路 RPC 超时不能关闭当前 session WebSocket", async () => {
     const user = userEvent.setup();
     await daemon.stop();
     daemon = await MockDaemon.start({
@@ -548,7 +590,7 @@ describe("termui web 工作台", () => {
     );
 
     // 中文注释：单 WebSocket 模型下，status/files/git 这类非终端 RPC 可能被大输出排队。
-    // 普通 request timeout 只能标记该 RPC 失败，不能关闭承载 terminal stream 的工作台连接。
+    // 普通 request timeout 只能标记该 RPC 失败，不能关闭承载 terminal stream 的当前 session 连接。
     expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
     expect(screen.getByTestId("terminal-pane")).toBeInTheDocument();
     expect(daemon.activeConnectionCount()).toBe(1);
@@ -594,7 +636,7 @@ describe("termui web 工作台", () => {
     expect(daemon.activeConnectionCount()).toBe(1);
   }, 15_000);
 
-  it("切换 session 复用已认证工作台连接，不重新进入 auth 握手", async () => {
+  it("切换 session 会关闭旧 WebSocket 并为新 session 重建连接", async () => {
     const user = userEvent.setup();
     const nextSession = {
       session_id: "00000000-0000-0000-0000-000000000402",
@@ -616,19 +658,17 @@ describe("termui web 工作台", () => {
       },
       nextSession,
     ]);
-    await user.click(screen.getByRole("button", { name: "Refresh" }));
     await waitForWorkspaceSession("beta");
-    const attachedConnectionCount = daemon.activeConnectionCount();
     const acceptedBeforeSwitch = daemon.acceptedConnections;
 
-    daemon.setDropAuthChallenge(true);
     await clickSessionCard(user, "beta");
 
     await waitFor(() => expect(daemon.attachedSessions).toContain(nextSession.session_id));
-    // 中文注释：session 切换只是在同一条 WebSocket 上取消旧 terminal stream 并打开新 stream；
-    // 不应因为新 session 重新走 route/E2EE/auth，也就不会留下半开认证连接。
-    expect(daemon.acceptedConnections).toBe(acceptedBeforeSwitch);
-    await waitFor(() => expect(daemon.activeConnectionCount()).toBeLessThanOrEqual(attachedConnectionCount), {
+    // 中文注释：终端会话切换以 WebSocket 生命周期为边界。新 session 必须重新走
+    // route/E2EE/auth/terminal.attach，旧连接关闭后 relay/daemon 都能用 transport close
+    // 明确清理旧 client context。
+    expect(daemon.acceptedConnections).toBeGreaterThan(acceptedBeforeSwitch);
+    await waitFor(() => expect(daemon.activeConnectionCount()).toBe(1), {
       timeout: 3500,
     });
   });
@@ -942,11 +982,10 @@ describe("termui web 工作台", () => {
       ]),
     );
 
-    await user.click(screen.getByRole("button", { name: "Refresh" }));
     await waitFor(() => expect(visibleSessionNames()).toEqual(["shell", "work"]));
   });
 
-  it("刷新 session list 时采用 daemon 返回顺序，而不是本地旧排序", async () => {
+  it("初次加载 session list 时采用 daemon 返回顺序", async () => {
     const user = userEvent.setup();
     const workSession = {
       session_id: "00000000-0000-0000-0000-000000000402",
@@ -973,10 +1012,6 @@ describe("termui web 工作台", () => {
     await waitForWorkspaceSession("work");
     expect(visibleSessionNames()).toEqual(["work", "shell"]);
 
-    daemon.setSessions([shellSession, workSession]);
-    await user.click(screen.getByRole("button", { name: "Refresh" }));
-
-    await waitFor(() => expect(visibleSessionNames()).toEqual(["shell", "work"]));
     expect(daemon.sessionReorders).toEqual([]);
   });
 
@@ -1008,7 +1043,6 @@ describe("termui web 工作台", () => {
     expect(visibleSessionNames()).toEqual(["work", "shell"]);
 
     daemon.queueSessionListResponse([workSession, shellSession], 30);
-    void user.click(screen.getByRole("button", { name: "Refresh" }));
 
     await waitFor(() => {
       const rows = Array.from(document.querySelectorAll<HTMLElement>(".session-row"));
@@ -1083,7 +1117,6 @@ describe("termui web 工作台", () => {
     expect(selectedSessionName()).toBe("alpha");
 
     daemon.queueSessionListResponse([alphaSession, betaSession, gammaSession], 120);
-    await user.click(screen.getByRole("button", { name: "Refresh" }));
     await clickSessionCard(user, "gamma");
     await waitFor(() => expect(selectedSessionName()).toBe("gamma"));
     await new Promise((resolve) => window.setTimeout(resolve, 180));
@@ -1303,7 +1336,7 @@ describe("termui web 工作台", () => {
     daemon.pushSessionData(alphaSession.session_id, "late-alpha-output\n");
 
     // 旧输出 stream 的关闭必须发生在 attach 合并窗口之前；否则旧 session 的大输出会继续占用
-    // xterm 渲染和工作台 WebSocket，把新 session 的恢复拖慢。
+    // xterm 渲染和当前 session 连接，把新 session 的恢复拖慢。
     await new Promise((resolve) => window.setTimeout(resolve, 30));
 
     expect(cancelCount()).toBeGreaterThan(beforeSwitch);
@@ -1749,12 +1782,71 @@ describe("termui web 工作台", () => {
       expect(element).toHaveClass("mobile-keyboard-open");
       return element!;
     });
-    expect(shell.style.getPropertyValue("--termd-visual-viewport-height")).toBe("460px");
+    expect(shell.style.getPropertyValue("--termd-layout-viewport-height")).toBe("820px");
+    expect(shell.style.getPropertyValue("--termd-visual-viewport-height")).toBe("820px");
+    expect(shell.style.getPropertyValue("--termd-visual-viewport-keyboard-inset")).toBe("340px");
     expect(shell.style.getPropertyValue("--termd-visual-viewport-offset-top")).toBe("20px");
     expect(screen.getByRole("contentinfo", { name: "daemon server status" })).toHaveClass(
       "daemon-status-strip",
     );
     expect(screen.getByLabelText("mobile terminal shortcuts")).toBeInTheDocument();
+  });
+
+  it("移动端软键盘弹出时不上报更小 PTY 尺寸，只通过视觉位移露出输入区", async () => {
+    setViewportWidth(390);
+    const viewport = installMutableMobileVisualViewport(820, 820, 0);
+    const restoreTerminalLayout = mockTerminalLayout({
+      viewportWidth: 390,
+      viewportHeight: 720,
+      frameWidth: 390,
+      frameHeight: 720,
+    });
+    (globalThis as { __TERMD_TEST_FIT_DIMENSIONS__?: { rows: number; cols: number } }).__TERMD_TEST_FIT_DIMENSIONS__ = {
+      rows: 24,
+      cols: 80,
+    };
+    try {
+      const user = userEvent.setup();
+      render(<App />);
+
+      await pairWithInvite(user, daemon);
+      await waitForWorkspaceSession();
+      await screen.findByText(/termd-e2e-ready/);
+
+      const terminalInput = await waitFor(() => {
+        const element = document.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
+        expect(element).not.toBeNull();
+        return element!;
+      });
+      terminalInput.focus();
+      await waitFor(() =>
+        expect(daemon.sessionResizes).toContainEqual({
+          session_id: DEFAULT_SESSION_ID,
+          size: { rows: 24, cols: 80, pixel_width: expect.any(Number), pixel_height: expect.any(Number) },
+        }),
+      );
+      const resizeCountAfterFocus = daemon.sessionResizes.length;
+      (globalThis as { __TERMD_TEST_FIT_DIMENSIONS__?: { rows: number; cols: number } }).__TERMD_TEST_FIT_DIMENSIONS__ = {
+        rows: 12,
+        cols: 80,
+      };
+
+      await act(async () => {
+        viewport.setMetrics(820, 460, 20);
+      });
+
+      const shell = await waitFor(() => {
+        const element = document.querySelector<HTMLElement>(".app-shell");
+        expect(element).not.toBeNull();
+        expect(element).toHaveClass("mobile-keyboard-open");
+        return element!;
+      });
+      expect(shell.style.getPropertyValue("--termd-visual-viewport-keyboard-inset")).toBe("340px");
+      expect(shell.style.getPropertyValue("--termd-visual-viewport-offset-top")).toBe("20px");
+      expect(daemon.sessionResizes).toHaveLength(resizeCountAfterFocus);
+    } finally {
+      restoreTerminalLayout();
+    }
   });
 
   it("移动端软键盘未打开时隐藏快捷键栏", async () => {
@@ -1769,6 +1861,54 @@ describe("termui web 工作台", () => {
     const shell = document.querySelector<HTMLElement>(".app-shell");
     expect(shell).not.toHaveClass("mobile-keyboard-open");
     expect(screen.queryByLabelText("mobile terminal shortcuts")).toBeNull();
+  });
+
+  it("移动端收起键盘后通过 visualViewport 事件恢复终端尺寸", async () => {
+    setViewportWidth(390);
+    const viewport = installMutableMobileVisualViewport(820, 460, 20);
+    (globalThis as { __TERMD_TEST_FIT_DIMENSIONS__?: { rows: number; cols: number } }).__TERMD_TEST_FIT_DIMENSIONS__ = {
+      rows: 12,
+      cols: 80,
+    };
+    const user = userEvent.setup();
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await screen.findByText(/termd-e2e-ready/);
+
+    const terminalInput = await waitFor(() => {
+      const element = document.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
+      expect(element).not.toBeNull();
+      return element!;
+    });
+    terminalInput.focus();
+    await act(async () => {
+      await new Promise((resolve) => window.setTimeout(resolve, 80));
+    });
+    // 中文注释：键盘打开时 visualViewport 变矮只代表输入法遮挡，不代表 PTY 应改成小尺寸。
+    expect(daemon.sessionResizes).toEqual([]);
+
+    terminalInput.blur();
+    await act(async () => {
+      await new Promise((resolve) => window.setTimeout(resolve, 160));
+    });
+    const resizeCountAfterBlur = daemon.sessionResizes.length;
+    (globalThis as { __TERMD_TEST_FIT_DIMENSIONS__?: { rows: number; cols: number } }).__TERMD_TEST_FIT_DIMENSIONS__ = {
+      rows: 24,
+      cols: 80,
+    };
+
+    await act(async () => {
+      viewport.setMetrics(820, 820, 0);
+    });
+
+    await waitFor(() =>
+      expect(daemon.sessionResizes.slice(resizeCountAfterBlur)).toContainEqual({
+        session_id: DEFAULT_SESSION_ID,
+        size: { rows: 24, cols: 80, pixel_width: expect.any(Number), pixel_height: expect.any(Number) },
+      }),
+    );
   });
 
   it("未保存 daemon 时手动 token 不会猜测 server_id", async () => {
@@ -1825,7 +1965,6 @@ describe("termui web 工作台", () => {
     await waitForWorkspaceSession();
     await expectDaemonUrlInAdmin(user, relayUrl);
     await user.click(screen.getByRole("button", { name: "Open workspace" }));
-    await user.click(screen.getByRole("button", { name: "Refresh" }));
     await waitForWorkspaceSession();
   });
 
@@ -1867,7 +2006,6 @@ describe("termui web 工作台", () => {
       expect(screen.queryByLabelText("Daemon")).toBeNull();
 
       await user.click(screen.getByRole("button", { name: "Open workspace" }));
-      await user.click(screen.getByRole("button", { name: "Refresh" }));
       await waitForWorkspaceSession();
 
       await user.click(screen.getByRole("button", { name: "Daemons" }));
@@ -2011,7 +2149,6 @@ describe("termui web 工作台", () => {
 
     await pairWithInvite(user, daemon);
     await waitForWorkspaceSession();
-    await user.click(screen.getByRole("button", { name: "Refresh" }));
 
     await waitForWorkspaceSession();
     await clickSessionCard(user);
@@ -2043,7 +2180,6 @@ describe("termui web 工作台", () => {
 
     await pairWithInvite(user, daemon);
     await waitForWorkspaceSession();
-    await user.click(screen.getByRole("button", { name: "Refresh" }));
     await clickSessionCard(user);
 
     let terminalInput: HTMLTextAreaElement | null = null;
@@ -2171,7 +2307,7 @@ describe("termui web 工作台", () => {
     expect(screen.getByTestId("terminal-pane")).toBeInTheDocument();
   });
 
-  it("relay 后台恢复时普通超时不能把 workspace 切回 admin", async () => {
+  it("relay 后台恢复时保持 workspace，不依赖侧栏手动刷新", async () => {
     const user = userEvent.setup();
     render(<App />);
 
@@ -2180,21 +2316,6 @@ describe("termui web 工作台", () => {
     await screen.findByText(/termd-e2e-ready/);
     await waitFor(() => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID]));
 
-    daemon.queueSessionListResponse(
-      [
-        {
-          session_id: DEFAULT_SESSION_ID,
-          name: DEFAULT_SESSION_NAME,
-          state: "running",
-          size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
-        },
-      ],
-      APP_CONNECTION_TIMEOUT_MS + 500,
-    );
-    await user.click(screen.getByRole("button", { name: "Refresh" }));
-
-    // 中文注释：relay/后台恢复时普通列表刷新可能被普通超时打断；这类旁路探测失败
-    // 不能把已 attach 的工作台切回 daemon admin，也不能显示全局连接错误。
     await new Promise((resolve) =>
       window.setTimeout(resolve, APP_CONNECTION_TIMEOUT_MS + 700),
     );
@@ -2202,10 +2323,10 @@ describe("termui web 工作台", () => {
     expect(screen.queryByLabelText("daemon admin")).toBeNull();
     expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
     expect(screen.getByTestId("terminal-pane")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Refresh" })).not.toBeDisabled();
+    expect(screen.queryByRole("button", { name: "Refresh" })).toBeNull();
   }, 12_000);
 
-  it("relay 慢握手时首次工作台连接不能被普通超时误杀", async () => {
+  it("relay 慢握手时首次 session 连接不能被普通超时误杀", async () => {
     const user = userEvent.setup();
     render(<App />);
 
@@ -2217,7 +2338,7 @@ describe("termui web 工作台", () => {
     await waitFor(() => expect(screen.queryByLabelText("Pairing token")).toBeNull());
 
     // 中文注释：relay 真实路径包含浏览器->relay、relay->daemon mux、E2EE 和 auth。
-    // 工作台连接建立阶段不能继续使用普通 RPC 预算，否则 relay 正常但 Web 会自己关闭半开连接。
+    // session 连接建立阶段不能继续使用普通 RPC 预算，否则 relay 正常但 Web 会自己关闭半开连接。
     daemon.delayNextRouteReady(APP_CONNECTION_TIMEOUT_MS + 500);
     await waitFor(
       () => expect(daemon.receivedPackets.filter((packet) => packet.method === "session.list").length).toBeGreaterThan(0),
@@ -2340,7 +2461,6 @@ describe("termui web 工作台", () => {
 
     await pairWithInvite(user, daemon);
     await waitForWorkspaceSession();
-    await user.click(screen.getByRole("button", { name: "Refresh" }));
     await clickSessionCard(user);
 
     await screen.findByText(/termd-e2e-ready/);
@@ -2533,7 +2653,6 @@ describe("termui web 工作台", () => {
 
     await pairWithInvite(user, daemon);
     await waitForWorkspaceSession();
-    await user.click(screen.getByRole("button", { name: "Refresh" }));
     await clickSessionCard(user);
 
     const panel = await screen.findByLabelText("session files");
@@ -2697,7 +2816,6 @@ describe("termui web 工作台", () => {
 
     await pairWithInvite(user, daemon);
     await waitForWorkspaceSession();
-    await user.click(screen.getByRole("button", { name: "Refresh" }));
     await clickSessionCard(user);
 
     const panel = await screen.findByLabelText("session files");
@@ -2836,7 +2954,6 @@ describe("termui web 工作台", () => {
 
     await pairWithInvite(user, daemon);
     await waitForWorkspaceSession();
-    await user.click(screen.getByRole("button", { name: "Refresh" }));
     await clickSessionCard(user);
 
     const panel = await screen.findByLabelText("session files");
@@ -2925,7 +3042,6 @@ describe("termui web 工作台", () => {
 
     await pairWithInvite(user, daemon);
     await waitForWorkspaceSession();
-    await user.click(screen.getByRole("button", { name: "Refresh" }));
     await clickSessionCard(user);
 
     const panel = await screen.findByLabelText("session files");
@@ -3009,7 +3125,6 @@ describe("termui web 工作台", () => {
 
     await pairWithInvite(user, daemon);
     await waitForWorkspaceSession();
-    await user.click(screen.getByRole("button", { name: "Refresh" }));
     await clickSessionCard(user);
 
     const panel = await screen.findByLabelText("session files");
@@ -3071,7 +3186,6 @@ describe("termui web 工作台", () => {
 
     await pairWithInvite(user, daemon);
     await waitForWorkspaceSession();
-    await user.click(screen.getByRole("button", { name: "Refresh" }));
     await clickSessionCard(user);
 
     const panel = await screen.findByLabelText("session files");
@@ -3082,10 +3196,10 @@ describe("termui web 工作台", () => {
     await user.click(within(panel).getByRole("button", { name: "Go" }));
     await within(panel).findByText("beta.log");
 
-    await user.click(screen.getByRole("button", { name: "Disconnect" }));
-    await waitFor(() => expect(screen.getByRole("button", { name: "Disconnect" })).toBeDisabled());
-    await waitFor(() => expect(screen.getByText("No session")).toBeInTheDocument());
-    expect(document.querySelector(".session-row.selected")).toBeNull();
+    await user.click(screen.getByRole("button", { name: "Daemons" }));
+    await screen.findByLabelText("daemon admin");
+    await user.click(screen.getByRole("button", { name: "Open workspace" }));
+    await waitForWorkspaceSession();
 
     const requestCountBeforeReattach = daemon.sessionFileRequests.length;
     await clickSessionCard(user);
@@ -3123,7 +3237,6 @@ describe("termui web 工作台", () => {
 
     await pairWithInvite(user, daemon);
     await waitForWorkspaceSession();
-    await user.click(screen.getByRole("button", { name: "Refresh" }));
     await clickSessionCard(user);
 
     const panel = await screen.findByLabelText("session files");
@@ -3188,7 +3301,6 @@ describe("termui web 工作台", () => {
 
     await pairWithInvite(user, daemon);
     await waitForWorkspaceSession();
-    await user.click(screen.getByRole("button", { name: "Refresh" }));
     await clickSessionCard(user);
 
     const operators = await screen.findByLabelText("session operators");
@@ -3221,7 +3333,6 @@ describe("termui web 工作台", () => {
 
     await pairWithInvite(user, daemon);
     await waitForWorkspaceSession();
-    await user.click(screen.getByRole("button", { name: "Refresh" }));
 
     const actions = await screen.findByLabelText("Session actions");
 
@@ -3230,13 +3341,39 @@ describe("termui web 工作台", () => {
     expect(actions).toContainElement(screen.getByRole("button", { name: "Close session" }));
   });
 
+  it("桌面侧栏固定标题和新建按钮，只让 session 列表滚动", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+
+    const sidebar = document.querySelector<HTMLElement>(".sidebar");
+    expect(sidebar).not.toBeNull();
+    const newSession = screen.getByRole("button", { name: "New session" });
+    const sessionList = screen.getByRole("region", { name: "sessions" });
+    const css = readFileSync(resolve(process.cwd(), "src/styles.css"), "utf8");
+
+    // 中文注释：侧栏顶端品牌和新建按钮是固定头部；不能再把新建按钮包进 panel，
+    // session 很多时也只滚动 session-list，避免 title 跟着列表一起滚走。
+    expect(newSession.closest(".panel")).toBeNull();
+    expect(newSession.closest(".sidebar-fixed-header")).toBe(sidebar!.querySelector(".sidebar-fixed-header"));
+    expect(sessionList.closest(".sidebar-scroll-region")).toBe(sidebar!.querySelector(".sidebar-scroll-region"));
+    expect(css).toContain(".sidebar {\n  ");
+    expect(css).toContain("overflow: hidden;");
+    expect(css).toContain(".sidebar-fixed-header {\n  min-width: 0;\n  display: grid;\n  gap: 12px;\n}");
+    expect(css).toContain(".sidebar-scroll-region {\n  min-height: 0;\n  overflow: hidden;\n}");
+    expect(css).toContain(".session-list {\n  min-height: 0;\n  max-height: 100%;\n  overflow-y: auto;");
+    expect(screen.queryByRole("button", { name: "Refresh" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Disconnect" })).toBeNull();
+  });
+
   it("左侧栏可折叠成图标栏，右侧文件 panel 可隐藏后再展开", async () => {
     const user = userEvent.setup();
     render(<App />);
 
     await pairWithInvite(user, daemon);
     await waitForWorkspaceSession();
-    await user.click(screen.getByRole("button", { name: "Refresh" }));
     await clickSessionCard(user);
 
     expect(await screen.findByLabelText("session files")).toBeInTheDocument();
@@ -3268,7 +3405,6 @@ describe("termui web 工作台", () => {
 
     await pairWithInvite(user, daemon);
     await waitForWorkspaceSession();
-    await user.click(screen.getByRole("button", { name: "Refresh" }));
     await clickSessionCard(user);
 
     const workspaceBody = document.querySelector<HTMLElement>(".workspace-body");
@@ -3397,7 +3533,6 @@ describe("termui web 工作台", () => {
 
     await pairWithInvite(user, daemon);
     await waitForWorkspaceSession();
-    await user.click(await screen.findByRole("button", { name: "Refresh" }));
     await clickSessionCard(user);
 
     expect(screen.queryByRole("button", { name: "Take control" })).toBeNull();
@@ -3411,13 +3546,11 @@ describe("termui web 工作台", () => {
 
     await pairWithInvite(user, daemon);
     await waitForWorkspaceSession();
-    await user.click(screen.getByRole("button", { name: "Refresh" }));
 
     await user.click(await screen.findByRole("button", { name: "Rename session" }));
     expect(screen.getByRole("button", { name: "Save session name" })).toBeDisabled();
     expect(daemon.sessionRenames).toEqual([]);
     daemon.queueSessionListResponse([], 30);
-    await user.click(screen.getByRole("button", { name: "Refresh" }));
     await waitFor(() => expect(screen.getByLabelText("Session name")).toHaveValue(DEFAULT_SESSION_NAME));
     await user.clear(screen.getByLabelText("Session name"));
     await user.type(screen.getByLabelText("Session name"), "work shell");
@@ -3445,7 +3578,6 @@ describe("termui web 工作台", () => {
 
     await pairWithInvite(user, daemon);
     await waitForWorkspaceSession();
-    await user.click(screen.getByRole("button", { name: "Refresh" }));
 
     const sessionId = "00000000-0000-0000-0000-000000000401";
     await waitForWorkspaceSession();
@@ -3484,7 +3616,6 @@ describe("termui web 工作台", () => {
 
       await pairWithInvite(user, daemon);
       await waitForWorkspaceSession();
-      await user.click(screen.getByRole("button", { name: "Refresh" }));
       await clickSessionCard(user);
 
       let terminalInput: HTMLTextAreaElement | null = null;
@@ -3624,7 +3755,6 @@ describe("termui web 工作台", () => {
 
     await pairWithInvite(user, daemon);
     await waitForWorkspaceSession();
-    await user.click(screen.getByRole("button", { name: "Refresh" }));
     await clickSessionCard(user);
 
     await waitFor(() => {
@@ -3677,7 +3807,6 @@ describe("termui web 工作台", () => {
 
     await pairWithInvite(user, daemon);
     await waitForWorkspaceSession();
-    await user.click(screen.getByRole("button", { name: "Refresh" }));
     await clickSessionCard(user);
 
     let terminalInput: HTMLTextAreaElement | null = null;
@@ -3729,7 +3858,6 @@ describe("termui web 工作台", () => {
 
     await pairWithInvite(user, daemon);
     await waitForWorkspaceSession();
-    await user.click(screen.getByRole("button", { name: "Refresh" }));
     await clickSessionCard(user);
 
     let terminalInput: HTMLTextAreaElement | null = null;
@@ -3777,7 +3905,6 @@ describe("termui web 工作台", () => {
 
     await pairWithInvite(user, daemon);
     await waitForWorkspaceSession();
-    await user.click(screen.getByRole("button", { name: "Refresh" }));
     await clickSessionCard(user);
 
     let terminalInput: HTMLTextAreaElement | null = null;
@@ -3828,7 +3955,6 @@ describe("termui web 工作台", () => {
 
     await pairWithInvite(user, daemon);
     await waitForWorkspaceSession();
-    await user.click(screen.getByRole("button", { name: "Refresh" }));
     await clickSessionCard(user);
 
     await waitFor(() => expect(screen.getByTestId("terminal-pane")).toBeInTheDocument());
@@ -3926,7 +4052,6 @@ describe("termui web 工作台", () => {
 
     await pairWithInvite(user, daemon);
     await waitForWorkspaceSession();
-    await user.click(screen.getByRole("button", { name: "Refresh" }));
     await clickSessionCard(user);
 
     await waitFor(() => expect(screen.getByTestId("terminal-pane")).toBeInTheDocument());
@@ -4002,7 +4127,6 @@ describe("termui web 工作台", () => {
 
     await pairWithInvite(user, daemon);
     await waitForWorkspaceSession();
-    await user.click(screen.getByRole("button", { name: "Refresh" }));
     await clickSessionCard(user);
 
     let terminalInput: HTMLTextAreaElement | null = null;
@@ -4060,7 +4184,6 @@ describe("termui web 工作台", () => {
 
     await pairWithInvite(user, daemon);
     await waitForWorkspaceSession();
-    await user.click(screen.getByRole("button", { name: "Refresh" }));
     await clickSessionCard(user);
 
     let firstTerminalInput: HTMLTextAreaElement | null = null;
@@ -4090,7 +4213,6 @@ describe("termui web 工作台", () => {
     const resizeCountAfterBlur = daemon.sessionResizes.length;
     const secondRender = render(<App />);
     await waitForWorkspaceSession();
-    await user.click(screen.getAllByRole("button", { name: "Refresh" }).at(-1)!);
     await clickSessionCard(user, undefined, secondRender.container);
 
     await waitFor(() => {
@@ -4141,7 +4263,6 @@ describe("termui web 工作台", () => {
 
       await pairWithInvite(user, daemon);
       await waitForWorkspaceSession();
-      await user.click(screen.getByRole("button", { name: "Refresh" }));
       await clickSessionCard(user);
 
       let terminalInput: HTMLTextAreaElement | null = null;

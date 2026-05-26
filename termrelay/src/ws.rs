@@ -27,8 +27,6 @@ const CONTROL_CHANNEL_CAPACITY: usize = 256;
 const ROUTE_PRELUDE_TIMEOUT: Duration = Duration::from_secs(5);
 const WEBSOCKET_SEND_DEADLINE: Duration = Duration::from_secs(10);
 const WEBSOCKET_PONG_DEADLINE: Duration = Duration::from_secs(10);
-const WEBSOCKET_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
-const WEBSOCKET_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(25);
 pub(crate) const WEBSOCKET_MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub(crate) const WEBSOCKET_MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
 type ConnectionId = u64;
@@ -57,10 +55,6 @@ struct RelayConnectionTraffic {
     in_ping: RelayTrafficBucket,
     in_pong: RelayTrafficBucket,
     in_close: RelayTrafficBucket,
-    out_text: RelayTrafficBucket,
-    out_binary: RelayTrafficBucket,
-    out_ping: RelayTrafficBucket,
-    out_pong: RelayTrafficBucket,
     forwarded_attempted: u64,
     forwarded_delivered: u64,
     forwarded_dropped: u64,
@@ -74,16 +68,6 @@ impl RelayConnectionTraffic {
             Message::Ping(payload) => self.in_ping.record(payload.len()),
             Message::Pong(payload) => self.in_pong.record(payload.len()),
             Message::Close(_) => self.in_close.record(0),
-        }
-    }
-
-    fn record_outbound(&mut self, frame_kind: &'static str, frame_len: usize) {
-        match frame_kind {
-            "text" => self.out_text.record(frame_len),
-            "binary" => self.out_binary.record(frame_len),
-            "ping" => self.out_ping.record(frame_len),
-            "pong" => self.out_pong.record(frame_len),
-            _ => {}
         }
     }
 
@@ -103,10 +87,6 @@ impl RelayConnectionTraffic {
             || !self.in_ping.is_empty()
             || !self.in_pong.is_empty()
             || !self.in_close.is_empty()
-            || !self.out_text.is_empty()
-            || !self.out_binary.is_empty()
-            || !self.out_ping.is_empty()
-            || !self.out_pong.is_empty()
             || self.forwarded_attempted > 0
             || self.forwarded_delivered > 0
             || self.forwarded_dropped > 0
@@ -372,7 +352,6 @@ enum RelayOutbound {
         client_id: RelayClientId,
         frame: OpaqueFrame,
     },
-    Ping(Vec<u8>),
     Pong(Vec<u8>),
     Close,
 }
@@ -382,7 +361,6 @@ impl RelayOutbound {
         match self {
             Self::Frame(_) => "frame",
             Self::MuxClientFrame { .. } => "mux_client_frame",
-            Self::Ping(_) => "ping",
             Self::Pong(_) => "pong",
             Self::Close => "close",
         }
@@ -391,7 +369,6 @@ impl RelayOutbound {
     fn frame_kind(&self) -> &'static str {
         match self {
             Self::Frame(frame) | Self::MuxClientFrame { frame, .. } => frame.kind(),
-            Self::Ping(_) => "ping",
             Self::Pong(_) => "pong",
             Self::Close => "close",
         }
@@ -401,7 +378,7 @@ impl RelayOutbound {
         match self {
             Self::Frame(frame) => frame.len(),
             Self::MuxClientFrame { frame, .. } => frame.len(),
-            Self::Ping(_) | Self::Pong(_) | Self::Close => 0,
+            Self::Pong(_) | Self::Close => 0,
         }
     }
 }
@@ -409,21 +386,14 @@ impl RelayOutbound {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PreparedRelayOutbound {
     Frame(OpaqueFrame),
-    Ping(Vec<u8>),
     Pong(Vec<u8>),
     Close,
     Drop,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SentRelayOutbound {
-    frame_kind: &'static str,
-    frame_len: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RelayWriteResult {
-    Sent(SentRelayOutbound),
+    Sent,
     Dropped,
     Closed,
     Failed,
@@ -431,115 +401,34 @@ enum RelayWriteResult {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RelayWriterOutcome {
-    Sent(SentRelayOutbound),
     Closed,
     Failed,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
-struct WebSocketHeartbeatPendingSnapshot {
-    pending_for_ms: u64,
-    since_last_inbound_ms: u64,
-    since_last_outbound_ms: u64,
-    last_inbound_kind: &'static str,
-    last_outbound_kind: &'static str,
-    inbound_messages_since_ping: u64,
-    inbound_bytes_since_ping: u64,
-    outbound_messages_since_ping: u64,
-    outbound_bytes_since_ping: u64,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct WebSocketHeartbeatDebug {
+struct WebSocketReceiveDebug {
     last_inbound_at: Instant,
-    last_outbound_at: Instant,
     last_inbound_kind: &'static str,
-    last_outbound_kind: &'static str,
-    pending_ping_sent_at: Option<Instant>,
-    inbound_messages_since_ping: u64,
-    inbound_bytes_since_ping: u64,
-    outbound_messages_since_ping: u64,
-    outbound_bytes_since_ping: u64,
+    inbound_messages: u64,
+    inbound_bytes: u64,
 }
 
-impl WebSocketHeartbeatDebug {
+impl WebSocketReceiveDebug {
     fn new(now: Instant) -> Self {
         Self {
             last_inbound_at: now,
-            last_outbound_at: now,
             last_inbound_kind: "none",
-            last_outbound_kind: "none",
-            pending_ping_sent_at: None,
-            inbound_messages_since_ping: 0,
-            inbound_bytes_since_ping: 0,
-            outbound_messages_since_ping: 0,
-            outbound_bytes_since_ping: 0,
+            inbound_messages: 0,
+            inbound_bytes: 0,
         }
     }
 
-    fn record_inbound(&mut self, kind: &'static str, bytes: usize) {
+    fn record(&mut self, kind: &'static str, bytes: usize) {
         let now = Instant::now();
         self.last_inbound_at = now;
         self.last_inbound_kind = kind;
-        if self.pending_ping_sent_at.is_some() {
-            self.inbound_messages_since_ping = self.inbound_messages_since_ping.saturating_add(1);
-            self.inbound_bytes_since_ping =
-                self.inbound_bytes_since_ping.saturating_add(bytes as u64);
-        }
-    }
-
-    fn record_outbound(&mut self, kind: &'static str, bytes: usize) {
-        let now = Instant::now();
-        self.last_outbound_at = now;
-        self.last_outbound_kind = kind;
-        if self.pending_ping_sent_at.is_some() {
-            self.outbound_messages_since_ping = self.outbound_messages_since_ping.saturating_add(1);
-            self.outbound_bytes_since_ping =
-                self.outbound_bytes_since_ping.saturating_add(bytes as u64);
-        }
-    }
-
-    fn note_ping_sent(&mut self) {
-        let now = Instant::now();
-        self.last_outbound_at = now;
-        self.last_outbound_kind = "ping";
-        self.pending_ping_sent_at = Some(now);
-        self.inbound_messages_since_ping = 0;
-        self.inbound_bytes_since_ping = 0;
-        self.outbound_messages_since_ping = 0;
-        self.outbound_bytes_since_ping = 0;
-    }
-
-    fn note_pong_received(&mut self) {
-        self.pending_ping_sent_at = None;
-        self.inbound_messages_since_ping = 0;
-        self.inbound_bytes_since_ping = 0;
-        self.outbound_messages_since_ping = 0;
-        self.outbound_bytes_since_ping = 0;
-    }
-
-    fn pending_snapshot(&self) -> Option<WebSocketHeartbeatPendingSnapshot> {
-        let ping_sent_at = self.pending_ping_sent_at?;
-        Some(WebSocketHeartbeatPendingSnapshot {
-            pending_for_ms: ping_sent_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
-            since_last_inbound_ms: self
-                .last_inbound_at
-                .elapsed()
-                .as_millis()
-                .min(u128::from(u64::MAX)) as u64,
-            since_last_outbound_ms: self
-                .last_outbound_at
-                .elapsed()
-                .as_millis()
-                .min(u128::from(u64::MAX)) as u64,
-            last_inbound_kind: self.last_inbound_kind,
-            last_outbound_kind: self.last_outbound_kind,
-            inbound_messages_since_ping: self.inbound_messages_since_ping,
-            inbound_bytes_since_ping: self.inbound_bytes_since_ping,
-            outbound_messages_since_ping: self.outbound_messages_since_ping,
-            outbound_bytes_since_ping: self.outbound_bytes_since_ping,
-        })
+        self.inbound_messages = self.inbound_messages.saturating_add(1);
+        self.inbound_bytes = self.inbound_bytes.saturating_add(bytes as u64);
     }
 }
 
@@ -587,23 +476,6 @@ fn websocket_message_bytes(message: &Message) -> usize {
         Message::Ping(payload) | Message::Pong(payload) => payload.len(),
         Message::Close(_) => 0,
     }
-}
-
-fn websocket_heartbeat_enabled(role: ConnectionRole) -> bool {
-    // 中文注释：relay 是 dumb pipe，不能用自己的心跳策略裁决 browser/daemon 是否“在线”。
-    // daemon mux 的长连接由 daemon 主动发标准 WebSocket Ping 保活；browser client 则以
-    // TCP/WebSocket 实际 close、读写失败或队列背压作为清理信号。后台标签页、手机浏览器和
-    // 公网代理都可能延迟 Pong，如果 relay 主动要求 Pong，会把仍可恢复的连接误杀成超时。
-    let _ = role;
-    false
-}
-
-fn websocket_idle_timeout_enabled(role: ConnectionRole) -> bool {
-    // 中文注释：同上，relay 只按真实 transport 事件清理连接，不按“多久没业务帧”清理。
-    // 终端会话可以长时间静默；browser 从后台回来后应该复用或重新建立连接，而不是被 relay
-    // 的固定 idle timer 提前关闭并造成前端看到操作超时。
-    let _ = role;
-    false
 }
 
 impl From<OpaqueFrame> for RelayOpaqueFrame {
@@ -1472,10 +1344,9 @@ pub async fn handle_socket(mut socket: WebSocket, state: RelayState) {
     let server_id = prelude.server_id;
     let role = prelude.connection_role;
     let (tx, control_rx, data_rx) = FrameSender::channel(DATA_CHANNEL_CAPACITY);
-    let self_sender = tx.clone();
-    let mut endpoint_close_rx = self_sender.subscribe_close();
-    let writer_close_rx = self_sender.subscribe_close();
-    let data_budget = self_sender.data_budget.clone();
+    let mut endpoint_close_rx = tx.subscribe_close();
+    let writer_close_rx = tx.subscribe_close();
+    let data_budget = tx.data_budget.clone();
     let registration = match state.register_route(&prelude, tx) {
         Ok(registration) => registration,
         Err(error) => {
@@ -1542,22 +1413,15 @@ pub async fn handle_socket(mut socket: WebSocket, state: RelayState) {
     );
 
     let (sender, mut receiver) = socket.split();
-    let mut idle_deadline = Instant::now() + WEBSOCKET_IDLE_TIMEOUT;
-    let mut heartbeat = tokio::time::interval_at(
-        Instant::now() + WEBSOCKET_HEARTBEAT_INTERVAL,
-        WEBSOCKET_HEARTBEAT_INTERVAL,
-    );
-    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let heartbeat_enabled = websocket_heartbeat_enabled(role);
-    let idle_timeout_enabled = websocket_idle_timeout_enabled(role);
-    let mut pending_pong_deadline: Option<Instant> = None;
-    let mut ping_enqueued = false;
-    let mut heartbeat_debug = WebSocketHeartbeatDebug::new(Instant::now());
+    let mut receive_debug = WebSocketReceiveDebug::new(Instant::now());
     let mut traffic = RelayConnectionTraffic::default();
     let (writer_outcome_tx, mut writer_outcome_rx) = mpsc::unbounded_channel();
     // 中文注释：relay 必须是 dumb pipe，但 transport 读写不能互相拖住。
     // 每条 WebSocket 的写侧单独跑，主循环只负责持续读取输入并转发到目标队列；
     // 这样慢 daemon/client 写不会阻塞本连接继续读取反方向的控制帧或新 client hello。
+    //
+    // outcome 只承载 close/failed 这类生命周期信号，不能按每个成功写出的 frame 回报。
+    // 大输出时每帧回报会形成无界统计缓存；成功发送的细粒度日志由 writer 侧直接打印。
     let writer_task = tokio::spawn(run_relay_websocket_writer(
         state.clone(),
         sender,
@@ -1572,38 +1436,12 @@ pub async fn handle_socket(mut socket: WebSocket, state: RelayState) {
     ));
 
     loop {
-        let pending_pong_deadline_snapshot = pending_pong_deadline;
         // 写侧由 writer task 消费；这里持续读入站帧，避免慢写把反方向输入也卡住。
-        // 中文注释：writer outcome 在大输出期间可能持续就绪。它只能更新统计和心跳状态，
-        // 不能排在 inbound 前面，否则 relay client 的输入/close 会被输出完成通知饿住。
+        // 中文注释：writer outcome 只携带关闭/失败生命周期信号；成功写入不回报，
+        // 避免大输出期间把“已发送统计”变成另一条缓存队列。
         tokio::select! {
             biased;
 
-            _ = tokio::time::sleep_until(idle_deadline), if idle_timeout_enabled => {
-                warn!(
-                    server_id = %server_id.0,
-                    ?role,
-                    connection_id = registration.id,
-                    "relay websocket idle timeout"
-                );
-                break;
-            }
-            _ = async move {
-                if let Some(deadline) = pending_pong_deadline_snapshot {
-                    tokio::time::sleep_until(deadline).await;
-                } else {
-                    std::future::pending::<()>().await;
-                }
-            }, if heartbeat_enabled => {
-                warn!(
-                    server_id = %server_id.0,
-                    ?role,
-                    connection_id = registration.id,
-                    heartbeat_debug = ?heartbeat_debug.pending_snapshot(),
-                    "relay websocket pong timed out"
-                );
-                break;
-            }
             _ = endpoint_close_rx.closed() => {
                 debug!(
                     server_id = %server_id.0,
@@ -1625,14 +1463,13 @@ pub async fn handle_socket(mut socket: WebSocket, state: RelayState) {
                             role,
                             registration.id,
                             &error,
-                            &heartbeat_debug,
+                            &receive_debug,
                         );
                         break;
                     }
                 };
-                idle_deadline = Instant::now() + WEBSOCKET_IDLE_TIMEOUT;
                 traffic.record_inbound(&inbound);
-                heartbeat_debug.record_inbound(
+                receive_debug.record(
                     websocket_message_kind(&inbound),
                     websocket_message_bytes(&inbound),
                 );
@@ -1644,7 +1481,6 @@ pub async fn handle_socket(mut socket: WebSocket, state: RelayState) {
                     message_bytes = websocket_message_bytes(&inbound),
                     "relay websocket inbound frame received"
                 );
-                let is_pong = matches!(inbound, Message::Pong(_));
 
                 let forward_report = handle_inbound_message(
                     &state,
@@ -1655,34 +1491,12 @@ pub async fn handle_socket(mut socket: WebSocket, state: RelayState) {
                 if !forward_report.should_continue {
                     break;
                 }
-                if is_pong {
-                    pending_pong_deadline = None;
-                    heartbeat_debug.note_pong_received();
-                }
             }
             outcome = writer_outcome_rx.recv() => {
                 let Some(outcome) = outcome else {
                     break;
                 };
                 match outcome {
-                    RelayWriterOutcome::Sent(sent) => {
-                        debug!(
-                            server_id = %server_id.0,
-                            ?role,
-                            connection_id = registration.id,
-                            frame_kind = sent.frame_kind,
-                            frame_len = sent.frame_len,
-                            "relay websocket writer reported sent frame"
-                        );
-                        traffic.record_outbound(sent.frame_kind, sent.frame_len);
-                        heartbeat_debug.record_outbound(sent.frame_kind, sent.frame_len);
-                        if sent.frame_kind == "ping" {
-                            ping_enqueued = false;
-                            heartbeat_debug.note_ping_sent();
-                            pending_pong_deadline = Some(Instant::now() + WEBSOCKET_PONG_DEADLINE);
-                        }
-                        idle_deadline = Instant::now() + WEBSOCKET_IDLE_TIMEOUT;
-                    }
                     RelayWriterOutcome::Closed => {
                         debug!(
                             server_id = %server_id.0,
@@ -1701,17 +1515,6 @@ pub async fn handle_socket(mut socket: WebSocket, state: RelayState) {
                         );
                         break;
                     }
-                }
-            }
-            _ = heartbeat.tick(), if heartbeat_enabled => {
-                if pending_pong_deadline.is_none() && !ping_enqueued {
-                    if self_sender
-                        .try_send_control(RelayOutbound::Ping(Vec::new()))
-                        .is_err()
-                    {
-                        break;
-                    }
-                    ping_enqueued = true;
                 }
             }
         }
@@ -1741,7 +1544,7 @@ fn log_websocket_receive_failed(
     role: ConnectionRole,
     connection_id: ConnectionId,
     error: &axum::Error,
-    heartbeat_debug: &WebSocketHeartbeatDebug,
+    receive_debug: &WebSocketReceiveDebug,
 ) {
     let error_text = error.to_string();
     if websocket_receive_failed_is_noisy_client_disconnect(role, &error_text) {
@@ -1750,7 +1553,7 @@ fn log_websocket_receive_failed(
             ?role,
             connection_id,
             %error,
-            heartbeat_debug = ?heartbeat_debug.pending_snapshot(),
+            ?receive_debug,
             "relay websocket receive failed"
         );
     } else {
@@ -1759,7 +1562,7 @@ fn log_websocket_receive_failed(
             ?role,
             connection_id,
             %error,
-            heartbeat_debug = ?heartbeat_debug.pending_snapshot(),
+            ?receive_debug,
             "relay websocket receive failed"
         );
     }
@@ -1786,25 +1589,7 @@ async fn send_relay_outbound(
         PreparedRelayOutbound::Frame(frame) => {
             send_relay_opaque_frame(sender, server_id, role, connection_id, frame, channel).await
         }
-        PreparedRelayOutbound::Ping(payload) => {
-            let frame_len = payload.len();
-            match send_message_with_deadline(
-                sender,
-                Message::Ping(payload),
-                WEBSOCKET_SEND_DEADLINE,
-                "relay websocket ping",
-            )
-            .await
-            {
-                Ok(()) => RelayWriteResult::Sent(SentRelayOutbound {
-                    frame_kind: "ping",
-                    frame_len,
-                }),
-                Err(()) => RelayWriteResult::Failed,
-            }
-        }
         PreparedRelayOutbound::Pong(payload) => {
-            let frame_len = payload.len();
             match send_message_with_deadline(
                 sender,
                 Message::Pong(payload),
@@ -1813,10 +1598,7 @@ async fn send_relay_outbound(
             )
             .await
             {
-                Ok(()) => RelayWriteResult::Sent(SentRelayOutbound {
-                    frame_kind: "pong",
-                    frame_len,
-                }),
+                Ok(()) => RelayWriteResult::Sent,
                 Err(()) => RelayWriteResult::Failed,
             }
         }
@@ -1869,7 +1651,6 @@ fn prepare_relay_outbound(
             });
             PreparedRelayOutbound::Frame(frame)
         }
-        RelayOutbound::Ping(payload) => PreparedRelayOutbound::Ping(payload),
         RelayOutbound::Pong(payload) => PreparedRelayOutbound::Pong(payload),
         RelayOutbound::Close => PreparedRelayOutbound::Close,
     }
@@ -2088,10 +1869,7 @@ async fn write_relay_outbound_and_report(
     )
     .await
     {
-        RelayWriteResult::Sent(sent) => {
-            let _ = outcome_tx.send(RelayWriterOutcome::Sent(sent));
-            true
-        }
+        RelayWriteResult::Sent => true,
         RelayWriteResult::Dropped => {
             debug!(
                 server_id = %server_id.0,
@@ -2160,10 +1938,7 @@ async fn send_relay_opaque_frame(
             "relay websocket outbound frame pressure"
         );
     }
-    RelayWriteResult::Sent(SentRelayOutbound {
-        frame_kind,
-        frame_len,
-    })
+    RelayWriteResult::Sent
 }
 
 async fn read_route_prelude(socket: &mut WebSocket) -> Result<RoutePrelude, RoutePreludeError> {
@@ -2637,36 +2412,16 @@ mod tests {
     }
 
     #[test]
-    fn websocket_heartbeat_requires_pong_even_when_data_flows() {
-        let mut heartbeat = WebSocketHeartbeatDebug::new(Instant::now());
-        heartbeat.note_ping_sent();
-
-        heartbeat.record_outbound("text", 128);
-
-        assert!(heartbeat.pending_snapshot().is_some());
-    }
-
-    #[test]
-    fn websocket_heartbeat_pong_clears_pending_ping() {
-        let mut heartbeat = WebSocketHeartbeatDebug::new(Instant::now());
-        heartbeat.note_ping_sent();
-
-        heartbeat.note_pong_received();
-
-        assert!(heartbeat.pending_snapshot().is_none());
-    }
-
-    #[test]
-    fn relay_does_not_heartbeat_or_idle_timeout_transport_roles() {
-        assert!(!websocket_heartbeat_enabled(ConnectionRole::DaemonMux));
-        assert!(!websocket_heartbeat_enabled(ConnectionRole::Client));
-        assert!(!websocket_idle_timeout_enabled(ConnectionRole::DaemonMux));
-        assert!(!websocket_idle_timeout_enabled(ConnectionRole::Client));
-    }
-
-    #[test]
     fn relay_route_prelude_uses_browser_friendly_timeout() {
         assert_eq!(ROUTE_PRELUDE_TIMEOUT, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn relay_established_transport_has_no_internal_heartbeat_or_idle_timeout() {
+        // 中文注释：完成 route prelude 后，relay 只作为 dumb pipe 转发。
+        // 是否断开由 WebSocket close/读写错误决定，不再由 relay 自己的心跳或空闲计时器裁决。
+        assert_eq!(WEBSOCKET_SEND_DEADLINE, Duration::from_secs(10));
+        assert_eq!(WEBSOCKET_PONG_DEADLINE, Duration::from_secs(10));
     }
 
     #[test]
@@ -2756,12 +2511,7 @@ mod tests {
         let (mut client, _client_response) = connect_async(url).await.unwrap();
         register_test_route(&mut client, server_id, RouteRole::Client).await;
 
-        match timeout(
-            WEBSOCKET_HEARTBEAT_INTERVAL + Duration::from_millis(200),
-            client.next(),
-        )
-        .await
-        {
+        match timeout(Duration::from_millis(200), client.next()).await {
             Err(_) => {}
             Ok(Some(Ok(ClientMessage::Ping(_)))) => {
                 panic!("relay must not ping browser clients; background tabs can delay pong")
@@ -3259,7 +3009,7 @@ mod tests {
         );
 
         mux_tx
-            .try_send_control(RelayOutbound::Ping(Vec::new()))
+            .try_send_control(RelayOutbound::Pong(Vec::new()))
             .unwrap();
 
         let response = mux_envelope_frame(RelayMuxEnvelope::DaemonFrame {
@@ -3295,7 +3045,7 @@ mod tests {
         timeout(Duration::from_millis(50), other_close_rx.closed())
             .await
             .expect("known sibling client should close when daemon mux is reset");
-        assert_eq!(mux_rx.try_recv().unwrap(), RelayOutbound::Ping(Vec::new()));
+        assert_eq!(mux_rx.try_recv().unwrap(), RelayOutbound::Pong(Vec::new()));
         assert_eq!(client_rx.try_recv().unwrap(), RelayOutbound::Close);
     }
 
@@ -3307,7 +3057,7 @@ mod tests {
         let (client_tx, _client_rx) = channel();
 
         mux_tx
-            .try_send_control(RelayOutbound::Ping(Vec::new()))
+            .try_send_control(RelayOutbound::Pong(Vec::new()))
             .unwrap();
         state
             .register(server_id, ConnectionRole::DaemonMux, mux_tx)
@@ -3334,7 +3084,7 @@ mod tests {
         let mut fresh_close_rx = fresh_client_tx.subscribe_close();
 
         mux_tx
-            .try_send_control(RelayOutbound::Ping(Vec::new()))
+            .try_send_control(RelayOutbound::Pong(Vec::new()))
             .unwrap();
         state
             .register(server_id, ConnectionRole::DaemonMux, mux_tx)
@@ -3373,7 +3123,7 @@ mod tests {
         let mut existing_close_rx = existing_client_tx.subscribe_close();
 
         mux_tx
-            .try_send_control(RelayOutbound::Ping(Vec::new()))
+            .try_send_control(RelayOutbound::Pong(Vec::new()))
             .unwrap();
         state
             .register(server_id, ConnectionRole::DaemonMux, mux_tx)
@@ -3409,7 +3159,7 @@ mod tests {
         let mut close_rx = sender.subscribe_close();
 
         sender
-            .try_send_control(RelayOutbound::Ping(Vec::new()))
+            .try_send_control(RelayOutbound::Pong(Vec::new()))
             .unwrap();
         assert!(matches!(
             sender.try_send_control(RelayOutbound::Close),
@@ -3423,7 +3173,7 @@ mod tests {
             .expect("endpoint close signal should not wait for queue capacity");
         assert_eq!(
             receiver.try_recv().unwrap(),
-            RelayOutbound::Ping(Vec::new())
+            RelayOutbound::Pong(Vec::new())
         );
         assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
     }
@@ -3438,10 +3188,10 @@ mod tests {
         let mut client_close_rx = client_tx.subscribe_close();
 
         mux_tx
-            .try_send_control(RelayOutbound::Ping(Vec::new()))
+            .try_send_control(RelayOutbound::Pong(Vec::new()))
             .unwrap();
         client_tx
-            .try_send_control(RelayOutbound::Ping(Vec::new()))
+            .try_send_control(RelayOutbound::Pong(Vec::new()))
             .unwrap();
         let daemon_mux = state
             .register(server, ConnectionRole::DaemonMux, mux_tx)
@@ -3458,10 +3208,10 @@ mod tests {
         timeout(Duration::from_millis(50), client_close_rx.closed())
             .await
             .expect("client close signal should bypass its full control queue");
-        assert_eq!(mux_rx.try_recv().unwrap(), RelayOutbound::Ping(Vec::new()));
+        assert_eq!(mux_rx.try_recv().unwrap(), RelayOutbound::Pong(Vec::new()));
         assert_eq!(
             client_rx.try_recv().unwrap(),
-            RelayOutbound::Ping(Vec::new())
+            RelayOutbound::Pong(Vec::new())
         );
         assert_no_queued_close(&mut mux_rx);
         assert_no_queued_close(&mut client_rx);
@@ -3490,7 +3240,6 @@ mod tests {
         let mut traffic = RelayConnectionTraffic::default();
 
         traffic.record_inbound(&Message::Binary(vec![1, 2, 3]));
-        traffic.record_outbound("text", 5);
         traffic.record_forward(ForwardReport {
             attempted: 2,
             delivered: 1,
@@ -3500,8 +3249,6 @@ mod tests {
         assert!(traffic.has_activity());
         assert_eq!(traffic.in_binary.calls, 1);
         assert_eq!(traffic.in_binary.bytes, 3);
-        assert_eq!(traffic.out_text.calls, 1);
-        assert_eq!(traffic.out_text.bytes, 5);
         assert_eq!(traffic.forwarded_attempted, 2);
         assert_eq!(traffic.forwarded_delivered, 1);
         assert_eq!(traffic.forwarded_dropped, 1);
@@ -3648,7 +3395,7 @@ mod tests {
             }
         );
         mux_tx
-            .try_send_control(RelayOutbound::Ping(Vec::new()))
+            .try_send_control(RelayOutbound::Pong(Vec::new()))
             .unwrap();
 
         state.unregister(&client);
@@ -3660,7 +3407,7 @@ mod tests {
             .expect("full lifecycle queue should reset daemon mux");
         assert!(!state.has_client(server_id, RelayClientId(client.id)));
         assert_eq!(state.room_count(), 0);
-        assert_eq!(mux_rx.try_recv().unwrap(), RelayOutbound::Ping(Vec::new()));
+        assert_eq!(mux_rx.try_recv().unwrap(), RelayOutbound::Pong(Vec::new()));
         assert_eq!(mux_rx.try_recv().unwrap_err(), TryRecvError::Empty);
 
         let report = state

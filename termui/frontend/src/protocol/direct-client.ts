@@ -649,7 +649,8 @@ export class DirectClient {
     if (!stream) {
       return;
     }
-    // 中文注释：切换会话只取消当前 terminal stream，不能关闭承载 RPC/事件的工作台 WebSocket。
+    // 中文注释：切换会话只取消当前 terminal stream，不能关闭当前 session 的 WebSocket。
+    // 同一条连接还要继续承载 RPC / 事件 / 其他非终端 segment。
     this.sendPacketBestEffort({
       version: PROTOCOL_PACKET_VERSION,
       kind: "cancel",

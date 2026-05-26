@@ -128,7 +128,8 @@ test("pair、list、attach 的浏览器 smoke", async ({ page }, testInfo: TestI
 
     await page.getByRole("textbox", { name: "Terminal input" }).focus();
     if (testInfo.project.name === "mobile-chrome") {
-      await expect(terminalPane).toHaveAttribute("data-viewer-mode", "false");
+      // 缩放/viewer 模式已经移除；移动端只验证终端本体没有退回旧的缩放控件。
+      await expect(page.getByRole("button", { name: /zoom/i })).toHaveCount(0);
       await expect
         .poll(async () => (await terminalPane.boundingBox())?.height ?? 0)
         .toBeGreaterThan(280);
@@ -148,7 +149,7 @@ test("pair、list、attach 的浏览器 smoke", async ({ page }, testInfo: TestI
           document.activeElement.blur();
         }
       });
-      await expect(terminalPane).toHaveAttribute("data-viewer-mode", "false");
+      await expect(page.getByRole("button", { name: /zoom/i })).toHaveCount(0);
       await expect
         .poll(async () => (await terminalPane.boundingBox())?.height ?? 0)
         .toBeGreaterThan(280);

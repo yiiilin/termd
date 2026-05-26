@@ -382,7 +382,7 @@ describe("DirectClient", () => {
     expect(receivedPackets.find((packet) => packet.kind === "cancel" && packet.stream_id === streamId)).toBeTruthy();
   });
 
-  it("取消 terminal stream 不关闭工作台 WebSocket，后续 RPC 继续可用", async () => {
+  it("取消 terminal stream 不关闭当前 WebSocket，后续 RPC 继续可用", async () => {
     const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000319");
     const pairClient = await connectDevice(device.device_id);
     const accepted = await pairClient.pair("secret-token", device.device_public_key);
@@ -402,7 +402,8 @@ describe("DirectClient", () => {
     client.detachSession(attached.session_id);
     await new Promise((resolve) => setTimeout(resolve, 20));
 
-    // 中文注释：session 切换只取消 terminal stream；同一条 WebSocket 仍要承载状态/RPC。
+    // 中文注释：DirectClient 内部取消 terminal stream 时，同一条 WebSocket 仍要承载状态/RPC。
+    // App 层的 session 切换会额外关闭 DirectClient，以 WebSocket 生命周期清理旧 client context。
     expect(daemon.activeConnectionCount()).toBe(1);
     await expect(client.getDaemonStatus()).resolves.toMatchObject({ host_name: "mock-daemon" });
     await expect(client.sendSessionData(attached.session_id, new TextEncoder().encode("after-detach"))).rejects.toMatchObject({

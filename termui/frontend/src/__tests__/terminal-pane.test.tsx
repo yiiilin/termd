@@ -178,6 +178,61 @@ describe("TerminalPane terminal sequence rendering", () => {
     expect(onTerminalSeqRendered).toHaveBeenCalledTimes(33);
   });
 
+  it("live output 停止后也刷新最后一笔写入，不需要等待下一次输入", async () => {
+    vi.useFakeTimers();
+    try {
+      (globalThis as { __TERMD_TEST_DEFER_XTERM_RENDER_UNTIL_WRITE_CALLBACK__?: boolean })
+        .__TERMD_TEST_DEFER_XTERM_RENDER_UNTIL_WRITE_CALLBACK__ = true;
+      const encoder = new TextEncoder();
+      const onTerminalSeqRendered = vi.fn();
+      let queue: TerminalOutputItem[] = [
+        { kind: "snapshot", bytes: encoder.encode("snapshot\n"), baseSeq: 0 },
+      ];
+      let drainOutput: (() => void) | undefined;
+      const takeOutput = vi.fn(() => queue.splice(0));
+      const registerOutputDrain = vi.fn((drain: () => void) => {
+        drainOutput = drain;
+        drain();
+        return () => undefined;
+      });
+
+      render(
+        <TerminalPane
+          attached
+          sessionSize={{ rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 }}
+          outputResetVersion={0}
+          takeOutput={takeOutput}
+          registerOutputDrain={registerOutputDrain}
+          onTerminalSeqRendered={onTerminalSeqRendered}
+          onInput={vi.fn()}
+          onResize={vi.fn()}
+          onCursorChange={vi.fn()}
+        />,
+      );
+
+      act(() => {
+        vi.advanceTimersByTime(animationFrameMs * 12);
+      });
+      const xterm = screen.getByTestId("terminal-pane").querySelector<HTMLElement>(".xterm");
+      expect(xterm?.dataset.buffer).toContain("snapshot");
+
+      queue = [
+        { kind: "output", bytes: encoder.encode("final-tail\n"), terminalSeq: 1 },
+      ];
+      act(() => {
+        drainOutput?.();
+        vi.advanceTimersByTime(animationFrameMs * 12);
+      });
+
+      // 中文注释：真实 xterm 某些渲染时序下，最后一笔 write 已解析但尚未 repaint。
+      // 如果 TerminalPane 只在下一次输入/resize 时 refresh，就会表现为“按一下键才出现尾巴”。
+      expect(xterm?.dataset.buffer).toContain("final-tail");
+      expect(onTerminalSeqRendered.mock.calls).toEqual([[0], [1]]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("切换 session 时旧的异步 write 回调不能阻塞或确认新 session", async () => {
     vi.useFakeTimers();
     try {
@@ -357,6 +412,189 @@ describe("TerminalPane mobile direction gesture", () => {
 });
 
 describe("TerminalPane terminal sizing", () => {
+  it("移动端软键盘弹出导致可视高度变小时不向 daemon 上报较小尺寸", async () => {
+    const onResize = vi.fn();
+    const takeOutput = vi.fn(() => []);
+    const registerOutputDrain = vi.fn(() => () => undefined);
+    (globalThis as { __TERMD_TEST_FIT_DIMENSIONS__?: { rows: number; cols: number } }).__TERMD_TEST_FIT_DIMENSIONS__ = {
+      rows: 24,
+      cols: 80,
+    };
+    const { rerender } = render(
+      <TerminalPane
+        attached
+        sessionSize={{ rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 }}
+        mobileInputMode
+        mobileKeyboardOpen={false}
+        mobileViewportHeight={820}
+        mobileViewportOffsetTop={0}
+        outputResetVersion={0}
+        takeOutput={takeOutput}
+        registerOutputDrain={registerOutputDrain}
+        onInput={vi.fn()}
+        onResize={onResize}
+        onCursorChange={vi.fn()}
+      />,
+    );
+    const terminalInput = document.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
+    expect(terminalInput).not.toBeNull();
+    terminalInput!.focus();
+    await waitFor(() => expect(document.activeElement).toBe(terminalInput));
+    onResize.mockClear();
+
+    (globalThis as { __TERMD_TEST_FIT_DIMENSIONS__?: { rows: number; cols: number } }).__TERMD_TEST_FIT_DIMENSIONS__ = {
+      rows: 12,
+      cols: 80,
+    };
+    rerender(
+      <TerminalPane
+        attached
+        sessionSize={{ rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 }}
+        mobileInputMode
+        mobileKeyboardOpen
+        mobileViewportHeight={460}
+        mobileViewportOffsetTop={20}
+        outputResetVersion={0}
+        takeOutput={takeOutput}
+        registerOutputDrain={registerOutputDrain}
+        onInput={vi.fn()}
+        onResize={onResize}
+        onCursorChange={vi.fn()}
+      />,
+    );
+    await act(async () => {
+      await new Promise((resolve) => window.setTimeout(resolve, animationFrameMs * 4));
+    });
+
+    expect(onResize).not.toHaveBeenCalled();
+  });
+
+  it("移动端 visualViewport 高度变化但 keyboardOpen 不变时也重新上报尺寸", async () => {
+    const onResize = vi.fn();
+    const takeOutput = vi.fn(() => []);
+    const registerOutputDrain = vi.fn(() => () => undefined);
+    (globalThis as { __TERMD_TEST_FIT_DIMENSIONS__?: { rows: number; cols: number } }).__TERMD_TEST_FIT_DIMENSIONS__ = {
+      rows: 12,
+      cols: 80,
+    };
+    const { rerender } = render(
+      <TerminalPane
+        attached
+        sessionSize={{ rows: 12, cols: 80, pixel_width: 0, pixel_height: 0 }}
+        mobileInputMode
+        mobileKeyboardOpen={false}
+        mobileViewportHeight={460}
+        mobileViewportOffsetTop={0}
+        outputResetVersion={0}
+        takeOutput={takeOutput}
+        registerOutputDrain={registerOutputDrain}
+        onInput={vi.fn()}
+        onResize={onResize}
+        onCursorChange={vi.fn()}
+      />,
+    );
+    const terminalInput = document.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
+    expect(terminalInput).not.toBeNull();
+    terminalInput!.focus();
+    await waitFor(() => expect(document.activeElement).toBe(terminalInput));
+    onResize.mockClear();
+
+    (globalThis as { __TERMD_TEST_FIT_DIMENSIONS__?: { rows: number; cols: number } }).__TERMD_TEST_FIT_DIMENSIONS__ = {
+      rows: 24,
+      cols: 80,
+    };
+    rerender(
+      <TerminalPane
+        attached
+        sessionSize={{ rows: 12, cols: 80, pixel_width: 0, pixel_height: 0 }}
+        mobileInputMode
+        mobileKeyboardOpen={false}
+        mobileViewportHeight={820}
+        mobileViewportOffsetTop={0}
+        outputResetVersion={0}
+        takeOutput={takeOutput}
+        registerOutputDrain={registerOutputDrain}
+        onInput={vi.fn()}
+        onResize={onResize}
+        onCursorChange={vi.fn()}
+      />,
+    );
+
+    await waitFor(() =>
+      expect(onResize).toHaveBeenCalledWith({
+        rows: 24,
+        cols: 80,
+        pixel_width: expect.any(Number),
+        pixel_height: expect.any(Number),
+      }),
+    );
+  });
+
+  it("移动端收起键盘导致输入框 blur 后仍按恢复后的可视高度上报尺寸", async () => {
+    const onResize = vi.fn();
+    const takeOutput = vi.fn(() => []);
+    const registerOutputDrain = vi.fn(() => () => undefined);
+    (globalThis as { __TERMD_TEST_FIT_DIMENSIONS__?: { rows: number; cols: number } }).__TERMD_TEST_FIT_DIMENSIONS__ = {
+      rows: 12,
+      cols: 80,
+    };
+    const { rerender } = render(
+      <TerminalPane
+        attached
+        sessionSize={{ rows: 12, cols: 80, pixel_width: 0, pixel_height: 0 }}
+        mobileInputMode
+        mobileKeyboardOpen
+        mobileViewportHeight={460}
+        mobileViewportOffsetTop={20}
+        outputResetVersion={0}
+        takeOutput={takeOutput}
+        registerOutputDrain={registerOutputDrain}
+        onInput={vi.fn()}
+        onResize={onResize}
+        onCursorChange={vi.fn()}
+      />,
+    );
+    const terminalInput = document.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
+    expect(terminalInput).not.toBeNull();
+    terminalInput!.focus();
+    await waitFor(() => expect(document.activeElement).toBe(terminalInput));
+    terminalInput!.blur();
+    await act(async () => {
+      await new Promise((resolve) => window.setTimeout(resolve, 160));
+    });
+    onResize.mockClear();
+
+    (globalThis as { __TERMD_TEST_FIT_DIMENSIONS__?: { rows: number; cols: number } }).__TERMD_TEST_FIT_DIMENSIONS__ = {
+      rows: 24,
+      cols: 80,
+    };
+    rerender(
+      <TerminalPane
+        attached
+        sessionSize={{ rows: 12, cols: 80, pixel_width: 0, pixel_height: 0 }}
+        mobileInputMode
+        mobileKeyboardOpen={false}
+        mobileViewportHeight={820}
+        mobileViewportOffsetTop={0}
+        outputResetVersion={0}
+        takeOutput={takeOutput}
+        registerOutputDrain={registerOutputDrain}
+        onInput={vi.fn()}
+        onResize={onResize}
+        onCursorChange={vi.fn()}
+      />,
+    );
+
+    await waitFor(() =>
+      expect(onResize).toHaveBeenCalledWith({
+        rows: 24,
+        cols: 80,
+        pixel_width: expect.any(Number),
+        pixel_height: expect.any(Number),
+      }),
+    );
+  });
+
   it("分辨率不一致时也不显示缩放工具", async () => {
     const layout = mockTerminalLayout({ viewportWidth: 390, viewportHeight: 420 });
     try {

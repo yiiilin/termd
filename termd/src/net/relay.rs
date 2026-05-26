@@ -412,23 +412,9 @@ fn relay_idle_ping_due(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RelayPendingPing {
-    nonce: u64,
-    sent_at: Instant,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RelayPendingMuxKeepalive {
     nonce: u64,
     sent_at: Instant,
-}
-
-fn relay_pending_ping_timed_out(now: Instant, pending_ping: Option<RelayPendingPing>) -> bool {
-    pending_ping.is_some_and(|pending| now.duration_since(pending.sent_at) >= RELAY_PONG_DEADLINE)
-}
-
-fn relay_pong_matches_pending(payload: &[u8], pending_ping: Option<RelayPendingPing>) -> bool {
-    pending_ping.is_some_and(|pending| payload == pending.nonce.to_be_bytes().as_slice())
 }
 
 fn relay_mux_keepalive_due(
@@ -564,8 +550,6 @@ pub enum RelayConnectorError {
     SendTimeout,
     #[error("relay websocket send failed")]
     SendFailed,
-    #[error("relay websocket pong timed out")]
-    PongTimeout,
     #[error("relay mux keepalive ack timed out")]
     MuxKeepaliveTimeout,
     #[error("relay websocket idle timeout")]
@@ -916,7 +900,6 @@ async fn connect_relay_mux_base_once(
     let mut last_activity = Instant::now();
     let mut last_idle_ping_sent_at = Instant::now();
     let mut idle_ping_nonce: u64 = 0;
-    let mut pending_idle_ping: Option<RelayPendingPing> = None;
     let mut last_mux_write_at = Instant::now();
     let mut last_mux_keepalive_sent_at = Instant::now();
     let mut mux_keepalive_nonce: u64 = 0;
@@ -1254,10 +1237,11 @@ async fn connect_relay_mux_base_once(
                         );
                     }
                     Message::Pong(payload) => {
-                        if relay_pong_matches_pending(payload.as_ref(), pending_idle_ping) {
-                            pending_idle_ping = None;
-                            last_activity = Instant::now();
-                        }
+                        // 中文注释：WebSocket Pong 只说明代理/内核控制帧路径有响应。
+                        // 缺 Pong 不能直接裁定 mux 死亡；真正判活交给同一条数据通道里的
+                        // mux keepalive ack 和实际读写错误。
+                        let _ = payload;
+                        last_activity = Instant::now();
                         maybe_log_relay_traffic(
                             &relay_endpoint,
                             &mut traffic,
@@ -1277,16 +1261,6 @@ async fn connect_relay_mux_base_once(
             }
             _ = heartbeat.tick() => {
                 let now = Instant::now();
-                if relay_pending_ping_timed_out(now, pending_idle_ping) {
-                    if let Some(pending) = pending_idle_ping {
-                        warn!(
-                            nonce = pending.nonce,
-                            elapsed_ms = now.duration_since(pending.sent_at).as_millis(),
-                            "relay daemon mux pong timed out; reconnecting"
-                        );
-                    }
-                    break Err(RelayConnectorError::PongTimeout);
-                }
                 if relay_mux_keepalive_timed_out(now, pending_mux_keepalive) {
                     if let Some(pending) = pending_mux_keepalive {
                         warn!(
@@ -1347,7 +1321,6 @@ async fn connect_relay_mux_base_once(
                     );
                 }
                 if relay_daemon_mux_idle_ping_enabled()
-                    && pending_idle_ping.is_none()
                     && relay_idle_ping_due(
                         now,
                         last_activity,
@@ -1369,10 +1342,6 @@ async fn connect_relay_mux_base_once(
                         break Err(error);
                     }
                     let sent_at = Instant::now();
-                    pending_idle_ping = Some(RelayPendingPing {
-                        nonce: idle_ping_nonce,
-                        sent_at,
-                    });
                     last_idle_ping_sent_at = sent_at;
                     last_activity = sent_at;
                     traffic.record_out(RelayOutKind::IdlePing, 0, ping_bytes);
@@ -3726,28 +3695,15 @@ mod tests {
     }
 
     #[test]
-    fn relay_daemon_mux_uses_websocket_ping_with_pong_deadline() {
+    fn relay_daemon_mux_uses_websocket_ping_without_pong_liveness_judgement() {
         assert_eq!(
             RelayReconnectPolicy::default().heartbeat_interval(),
             Duration::from_secs(10)
         );
         assert!(relay_daemon_mux_idle_ping_enabled());
-        assert_eq!(RELAY_PONG_DEADLINE, Duration::from_millis(50));
-        let start = Instant::now();
-        let pending = Some(RelayPendingPing {
-            nonce: 42,
-            sent_at: start,
-        });
-        assert!(!relay_pending_ping_timed_out(
-            start + RELAY_PONG_DEADLINE - Duration::from_millis(1),
-            pending
-        ));
-        assert!(relay_pending_ping_timed_out(
-            start + RELAY_PONG_DEADLINE,
-            pending
-        ));
-        assert!(relay_pong_matches_pending(&42_u64.to_be_bytes(), pending));
-        assert!(!relay_pong_matches_pending(&43_u64.to_be_bytes(), pending));
+        // 中文注释：Ping 只用于穿透公网代理的空闲保活。连接是否可用由 mux keepalive
+        // ack 和真实读写错误判断，不能因为代理/实现延迟 Pong 就重建 daemon mux。
+        assert_eq!(relay_send_deadline(RelayOutKind::Pong), RELAY_PONG_DEADLINE);
     }
 
     #[test]
@@ -3905,25 +3861,26 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn relay_mux_reconnects_when_idle_ping_pong_is_missing() {
+    async fn relay_mux_stays_connected_when_only_idle_ping_pong_is_missing() {
         let protocol = test_protocol("relay-pong-timeout");
         let server_id = protocol.lock().await.server_id();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            handle_raw_daemon_mux_ignores_ping(stream, server_id).await;
+            handle_raw_daemon_mux_ignores_ping_then_closes_after_keepalives(stream, server_id, 3)
+                .await;
         });
 
         let base = RelayBaseUrl::parse(&format!("ws://{addr}")).unwrap();
         let result = tokio::time::timeout(
-            Duration::from_secs(2),
+            Duration::from_secs(3),
             connect_relay_mux_base_once(base, None, None, protocol, Duration::from_millis(10)),
         )
         .await
-        .expect("daemon mux should fail fast when relay stops answering ping");
+        .expect("daemon mux should keep running until the relay side closes normally");
 
-        assert!(matches!(result, Err(RelayConnectorError::PongTimeout)));
+        assert!(result.is_ok());
         server.abort();
     }
 
@@ -4019,7 +3976,11 @@ mod tests {
         })
     }
 
-    async fn handle_raw_daemon_mux_ignores_ping(mut stream: TcpStream, server_id: ServerId) {
+    async fn handle_raw_daemon_mux_ignores_ping_then_closes_after_keepalives(
+        mut stream: TcpStream,
+        server_id: ServerId,
+        keepalive_count: usize,
+    ) {
         let mut request = Vec::new();
         let mut byte = [0_u8; 1];
         while !request.ends_with(b"\r\n\r\n") {
@@ -4069,18 +4030,25 @@ mod tests {
             return;
         }
 
-        while let Some((opcode, _payload)) = read_raw_ws_frame(&mut stream).await {
+        let mut keepalive_seen = 0;
+        while let Some((opcode, payload)) = read_raw_ws_frame(&mut stream).await {
             match opcode {
-                // 中文注释：这里故意吞掉 Ping，不发送 Pong，也不使用 WebSocket 库的
-                // 自动 pong，稳定复现半开连接下 daemon 只能靠 pong deadline 自救。
+                // 中文注释：故意忽略 WebSocket Ping，证明它不是 mux 生死判据。
                 0x9 => {}
                 0x2 => {
                     if let Ok(RelayMuxEnvelope::Keepalive { nonce }) =
-                        decode_binary_relay_mux_envelope(&_payload)
+                        decode_binary_relay_mux_envelope(&payload)
                     {
                         let ack = RelayMuxEnvelope::KeepaliveAck { nonce };
                         if let Ok(raw) = encode_binary_relay_mux_envelope(&ack) {
-                            let _ = write_raw_ws_frame(&mut stream, 0x2, &raw).await;
+                            if write_raw_ws_frame(&mut stream, 0x2, &raw).await.is_err() {
+                                return;
+                            }
+                            keepalive_seen += 1;
+                            if keepalive_seen >= keepalive_count {
+                                let _ = write_raw_ws_frame(&mut stream, 0x8, &[]).await;
+                                return;
+                            }
                         }
                     }
                 }

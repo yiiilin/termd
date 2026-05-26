@@ -35,7 +35,7 @@ const TERMINAL_SEARCH_OPTIONS: ISearchOptions = {
     activeMatchColorOverviewRuler: "#e69875",
   },
 };
-type ResizeSource = "layout" | "focus" | "session";
+type ResizeSource = "layout" | "focus" | "session" | "mobile-viewport";
 type MobileDirection = "up" | "down" | "left" | "right";
 type MobileDirectionTier = 1 | 2 | 3;
 
@@ -91,6 +91,8 @@ interface TerminalPaneProps {
   focusRequest?: number;
   mobileInputMode?: boolean;
   mobileKeyboardOpen?: boolean;
+  mobileViewportHeight?: number;
+  mobileViewportOffsetTop?: number;
   theme?: EffectiveTheme;
   outputResetVersion: number;
   takeOutput: () => TerminalOutputItem[];
@@ -124,6 +126,7 @@ export function TerminalPane(props: TerminalPaneProps) {
   const takeOutputRef = useRef(props.takeOutput);
   const sessionSizeRef = useRef(props.sessionSize);
   const mobileInputModeRef = useRef(Boolean(props.mobileInputMode));
+  const mobileKeyboardOpenRef = useRef(Boolean(props.mobileKeyboardOpen));
   const resizeRef = useRef<((source?: ResizeSource) => void) | undefined>(undefined);
   const stabilizeRef = useRef<((source?: ResizeSource) => void) | undefined>(undefined);
   const drainOutputRef = useRef<() => void>(() => undefined);
@@ -157,6 +160,7 @@ export function TerminalPane(props: TerminalPaneProps) {
   const lastNativePasteRef = useRef<{ text: string; atMs: number } | undefined>(undefined);
   const focusedRef = useRef(false);
   const clientSizeRef = useRef<TerminalSize | undefined>(undefined);
+  const mobileViewportResizeOwnerRef = useRef(false);
   const focusActivationArmedRef = useRef(false);
   const suppressPassiveFocusRef = useRef(false);
   const windowActiveRef = useRef(true);
@@ -229,7 +233,8 @@ export function TerminalPane(props: TerminalPaneProps) {
     takeOutputRef.current = props.takeOutput;
     sessionSizeRef.current = props.sessionSize;
     mobileInputModeRef.current = Boolean(props.mobileInputMode);
-  }, [props.mobileInputMode, props.onCursorChange, props.onInput, props.onOutputResetApplied, props.onResize, props.onTerminalResync, props.onTerminalSeqRendered, props.sessionSize, props.takeOutput]);
+    mobileKeyboardOpenRef.current = Boolean(props.mobileKeyboardOpen);
+  }, [props.mobileInputMode, props.mobileKeyboardOpen, props.onCursorChange, props.onInput, props.onOutputResetApplied, props.onResize, props.onTerminalResync, props.onTerminalSeqRendered, props.sessionSize, props.takeOutput]);
 
   useEffect(() => props.registerOutputDrain(() => drainOutputRef.current()), [props.registerOutputDrain]);
 
@@ -237,6 +242,7 @@ export function TerminalPane(props: TerminalPaneProps) {
     if (props.mobileInputMode) {
       return;
     }
+    mobileViewportResizeOwnerRef.current = false;
     setMobileScrollRatio(1);
     setMobileScrollAvailable(false);
     setMobileScrollDragging(false);
@@ -246,10 +252,11 @@ export function TerminalPane(props: TerminalPaneProps) {
     if (!props.mobileInputMode) {
       return;
     }
-    // 移动端软键盘会改变 visual viewport；最后聚焦的客户端需要用新的可视高度重新计算 PTY 尺寸。
-    stabilizeRef.current?.(hasActiveTerminalFocus() ? "focus" : "layout");
+    // 移动端软键盘会改变 visual viewport；只看 keyboardOpen 布尔值不够，
+    // 因为部分浏览器会让 innerHeight 跟着缩放，导致键盘开关前后布尔值都为 false。
+    stabilizeRef.current?.(hasActiveTerminalFocus() ? "focus" : "mobile-viewport");
     scheduleScrollToBottom();
-  }, [props.mobileInputMode, props.mobileKeyboardOpen]);
+  }, [props.mobileInputMode, props.mobileKeyboardOpen, props.mobileViewportHeight, props.mobileViewportOffsetTop]);
 
   useEffect(() => {
     resizeRef.current?.(focused ? "focus" : "layout");
@@ -710,6 +717,11 @@ export function TerminalPane(props: TerminalPaneProps) {
     }
     focusedRef.current = nextFocused;
     setFocused(nextFocused);
+    if (nextFocused) {
+      // 收起移动端软键盘时 textarea 可能先 blur，visualViewport 稍后才恢复。
+      // 只要窗口仍活跃，最后显式聚焦过终端的客户端仍负责把 PTY 尺寸恢复到当前可视高度。
+      mobileViewportResizeOwnerRef.current = true;
+    }
     if (!nextFocused) {
       suppressPassiveFocusRef.current = true;
     }
@@ -847,6 +859,17 @@ export function TerminalPane(props: TerminalPaneProps) {
       const hostHeight = terminalHost.clientHeight;
       const remoteSize = sessionSizeRef.current;
       const terminalHasActiveFocus = hasActiveTerminalFocus();
+      const mobileKeyboardIsOpen =
+        mobileInputModeRef.current &&
+        mobileKeyboardOpenRef.current;
+      const hasMobileViewportResizeOwnership =
+        source === "mobile-viewport" &&
+        mobileInputModeRef.current &&
+        windowActiveRef.current &&
+        mobileViewportResizeOwnerRef.current;
+      const canReportLocalResize =
+        !mobileKeyboardIsOpen &&
+        (terminalHasActiveFocus || hasMobileViewportResizeOwnership);
       if (proposed) {
         clientSizeRef.current = {
           rows: proposed.rows,
@@ -855,7 +878,7 @@ export function TerminalPane(props: TerminalPaneProps) {
           pixel_height: hostHeight,
         };
       }
-      if (!terminalHasActiveFocus) {
+      if (!canReportLocalResize) {
         applyFontSize(terminal, currentTerminalFontSize());
         if (remoteSize) {
           if (sameTerminalDimensions(terminal, remoteSize)) {
@@ -884,8 +907,8 @@ export function TerminalPane(props: TerminalPaneProps) {
           queueCursorReport({ immediate: true });
           return;
         }
-        // 聚焦状态下只向 daemon 请求新尺寸；在收到 session_resized 并更新
-        // sessionSize 之前，不主动调整本地 xterm，避免前端和 daemon 状态分叉。
+        // 只有拥有本地 resize 权限时才向 daemon 请求新尺寸；在收到 session_resized
+        // 并更新 sessionSize 之前，不主动调整本地 xterm，避免前端和 daemon 状态分叉。
         onResizeRef.current({
           rows: proposed.rows,
           cols: proposed.cols,
@@ -1026,12 +1049,18 @@ export function TerminalPane(props: TerminalPaneProps) {
       }
       queueCursorReport();
       scheduleMobileScrollPosition();
-      if (!needsPostWriteRefreshRef.current) {
+      const outputQueueIdle = !activeWriteRef.current && pendingWriteItemsRef.current.length === 0;
+      if (!needsPostWriteRefreshRef.current && !outputQueueIdle) {
         return;
       }
       needsPostWriteRefreshRef.current = false;
-      // 首屏或清屏后的首个 write 需要一次轻量 refresh，避免 prompt 等到下一次输入才出现。
-      // 持续输出路径不再反复 proposeDimensions/refresh，降低 layout 和绘制压力。
+      // 首屏/清屏后的首个 write，以及一次 live 输出停止后的最后一笔 write，都需要
+      // 一次轻量 refresh。否则某些 xterm 渲染时序会等到下一次输入/resize 才 repaint 尾包。
+      if (outputQueueIdle) {
+        requestTrackedFrame(() => terminal.refresh(0, Math.max(0, terminal.rows - 1)));
+        return;
+      }
+      // 持续输出路径不反复 proposeDimensions/refresh，降低 layout 和绘制压力。
       requestTrackedFrame(() => terminal.refresh(0, Math.max(0, terminal.rows - 1)));
     };
     const flushPendingWrite = () => {
@@ -1134,6 +1163,7 @@ export function TerminalPane(props: TerminalPaneProps) {
     const handleWindowBlur = () => {
       windowActiveRef.current = false;
       focusActivationArmedRef.current = false;
+      mobileViewportResizeOwnerRef.current = false;
       suppressPassiveFocusRef.current = true;
       clearPendingFocusOut();
       // 真实浏览器切到另一个窗口后，旧窗口的 textarea 可能仍留着 DOM focus。
@@ -1266,6 +1296,7 @@ export function TerminalPane(props: TerminalPaneProps) {
       needsPostWriteRefreshRef.current = false;
       focusedRef.current = false;
       clientSizeRef.current = undefined;
+      mobileViewportResizeOwnerRef.current = false;
       focusActivationArmedRef.current = false;
       suppressPassiveFocusRef.current = true;
       windowActiveRef.current = true;

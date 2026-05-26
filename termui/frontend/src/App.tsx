@@ -12,7 +12,6 @@ import {
   RefreshCcw,
   Server,
   Settings,
-  Unplug,
   UsersRound,
   X,
 } from "lucide-react";
@@ -142,6 +141,15 @@ function isBrokenWorkspaceConnectionError(caught: unknown): boolean {
   return BROKEN_WORKSPACE_CONNECTION_ERROR_CODES.has(toSafeError(caught).code);
 }
 
+const LOCALLY_SUPERSEDED_CONNECTION_ERROR_CODES = new Set([
+  "connection_closed",
+  "stale_connection",
+]);
+
+function isLocallySupersededConnectionError(caught: unknown): boolean {
+  return LOCALLY_SUPERSEDED_CONNECTION_ERROR_CODES.has(toSafeError(caught).code);
+}
+
 function isDocumentHidden(): boolean {
   return typeof document !== "undefined" && document.visibilityState === "hidden";
 }
@@ -254,8 +262,9 @@ export default function App() {
   const [activeSurface, setActiveSurface] = useState<AppSurface>("admin");
   const [status, setStatus] = useState("idle");
   const [error, setError] = useState<SafeError | undefined>();
-  // 中文注释：浏览器工作台只保留一条可靠 WebSocket；terminal 与普通 RPC 都在
-  // E2EE 内层 ProtocolPacket segment 中分类，relay 只转发这条加密流。
+  // 中文注释：当前打开的 session 只绑定一条可靠 WebSocket；terminal 与普通 RPC 都在
+  // 这条连接的 E2EE 内层 ProtocolPacket segment 中分类。切换 session 或重连时必须
+  // 关闭旧连接并重建，保证 relay/daemon 都能用 transport close 明确清理旧 client。
   const attachClientRef = useRef<DirectClient | undefined>(undefined);
   const pendingAttachClientRef = useRef<DirectClient | undefined>(undefined);
   const workspaceClientPromiseRef = useRef<Promise<DirectClient> | undefined>(undefined);
@@ -534,13 +543,15 @@ export default function App() {
     !isMobileLayout && showDesktopFilesPanel
       ? { gridTemplateColumns: `minmax(0, 1fr) ${filesPanelWidth}px` }
       : undefined;
+  const mobileKeyboardOpen = isMobileLayout && activeSurface === "workspace" && visualViewportMetrics.keyboardOpen;
   const appShellStyle = isMobileLayout
     ? ({
-        "--termd-visual-viewport-height": `${visualViewportMetrics.height}px`,
+        "--termd-layout-viewport-height": `${window.innerHeight}px`,
+        "--termd-visual-viewport-height": `${mobileKeyboardOpen ? window.innerHeight : visualViewportMetrics.height}px`,
         "--termd-visual-viewport-offset-top": `${visualViewportMetrics.offsetTop}px`,
+        "--termd-visual-viewport-keyboard-inset": `${visualViewportMetrics.keyboardInset}px`,
       } as CSSProperties)
     : undefined;
-  const mobileKeyboardOpen = isMobileLayout && activeSurface === "workspace" && visualViewportMetrics.keyboardOpen;
   const canOpenWorkspace = Boolean(activeServer && state.device);
   const canSaveRename = Boolean(renameDraft.trim()) && renameDraft.trim() !== renameOriginalName.trim();
   const activeDaemonLabel =
@@ -734,34 +745,10 @@ export default function App() {
     resolveTerminalOutputResetWaiters();
     receiveLoopActiveRef.current = false;
     receiveLoopGenerationRef.current += 1;
-    attachClientRef.current?.interruptReceiveWaiters();
-    pendingAttachClientRef.current?.interruptReceiveWaiters();
-    if (pendingTerminalAttachSessionRef.current) {
-      const pendingSessionId = pendingTerminalAttachSessionRef.current;
-      // 中文注释：terminal.attach 已发出但 ack 未返回时，DirectClient 已知道 stream_id。
-      // 快速切换 session 必须立刻 cancel 这个 provisional stream，避免 daemon 继续
-      // 为旧 session 建 watcher，把旧输出灌进共享 WebSocket。
-      const clients = new Set<DirectClient>();
-      if (attachClientRef.current) {
-        clients.add(attachClientRef.current);
-      }
-      if (pendingAttachClientRef.current) {
-        clients.add(pendingAttachClientRef.current);
-      }
-      for (const client of clients) {
-        client.detachSession(pendingSessionId);
-      }
-      pendingTerminalAttachSessionRef.current = undefined;
-    }
-    // 中文注释：切换/退出当前终端只取消 terminal stream；工作台 WebSocket 继续承载
-    // session.list、状态、文件/Git 等 segment，避免 relay/direct 之间来回建链。
-    if (attachedSessionRef.current) {
-      attachClientRef.current?.detachSession(attachedSessionRef.current);
-    }
-    if (pendingAttachClientRef.current && pendingAttachClientRef.current !== attachClientRef.current) {
-      pendingAttachClientRef.current.close();
-    }
-    pendingAttachClientRef.current = undefined;
+    // 中文注释：切换 session、主动断开、恢复重连都以 WebSocket 生命周期作为边界。
+    // DirectClient.close 会先尽力 cancel 已知 terminal stream，再关闭 transport；即使 cancel
+    // 没送达，daemon/relay 也能通过 WebSocket close 清掉旧 client context。
+    closeWorkspaceClient();
     if (attachedSessionRef.current) {
       lastRenderedTerminalSeqRef.current.delete(attachedSessionRef.current);
     }
@@ -781,16 +768,7 @@ export default function App() {
       setMobilePanel(undefined);
       setMobileMenuOpen(false);
     }
-  }, [cancelScheduledAttachSwitch, clearSessionFiles, clearTerminalOutput, resetAttachReconnectState, resolveTerminalOutputResetWaiters]);
-
-  const handleDisconnectAttach = useCallback(() => {
-    // 用户主动断开时不要被“默认打开第一个 session”的自动流程立即重新 attach。
-    userDetachedRef.current = true;
-    autoAttachAttemptedSessionRef.current = undefined;
-    disconnectAttach();
-    selectSession(undefined);
-    setStatus("ready");
-  }, [disconnectAttach, selectSession]);
+  }, [cancelScheduledAttachSwitch, clearSessionFiles, clearTerminalOutput, closeWorkspaceClient, resetAttachReconnectState, resolveTerminalOutputResetWaiters]);
 
   useEffect(() => {
     if (activeSurface !== "admin" || !attachClientRef.current) {
@@ -1103,10 +1081,10 @@ export default function App() {
     promise = authenticatedClient(timeoutMs)
       .then((client) => {
         if (workspaceClientGenerationRef.current !== requestGeneration) {
-          // 中文注释：daemon 切换或 workspace reset 可能发生在握手进行中。
-          // 迟到的旧 client 只能关闭，不能重新写回 attachClientRef 污染新 daemon。
+          // 中文注释：daemon 切换、session 切换或 workspace reset 可能发生在握手进行中。
+          // 迟到的旧 client 只能关闭，不能重新写回 attachClientRef 污染当前 session。
           client.close();
-          throw new ProtocolClientError("stale_connection", "workspace connection was superseded");
+          throw new ProtocolClientError("stale_connection", "session connection was superseded");
         }
         attachClientRef.current = client;
         workspaceClientPromiseRef.current = undefined;
@@ -1124,8 +1102,8 @@ export default function App() {
 
   const authenticatedSessionClient = useCallback(
     async (sessionId: UUID) => {
-      // 中文注释：普通 session RPC 和 terminal stream 共用同一条工作台 WebSocket；
-      // 只有尚未 terminal.attach 过的 session 才补一次旧版权限 attach。
+      // 中文注释：普通 session RPC 和 terminal stream 共用当前 session 的 WebSocket；
+      // session 切换/重连会关闭旧 WebSocket 并重新认证，新连接需要重新补权限 attach。
       const client = await authenticatedWorkspaceClient();
       if (!sessionPermissionIdsRef.current.has(sessionId)) {
         await client.attachSessionPermission(sessionId);
@@ -1235,6 +1213,7 @@ export default function App() {
     setStatus("listing");
     const requestOrderGeneration = sessionOrderGenerationRef.current;
     const requestCreateGeneration = sessionCreateRequestIdRef.current;
+    let sessionListApplied = false;
     try {
       const client = await authenticatedWorkspaceClient();
       const list = await client.listSessions();
@@ -1280,6 +1259,9 @@ export default function App() {
       if (!attachingSessionIdRef.current) {
         setStatus(attachedSessionRef.current ? "attached" : "ready");
       }
+      // 中文注释：session.list 是刷新工作台的提交点。它成功后，即使后续非关键
+      // daemon.clients 因 session 切换关闭了同一条 WebSocket，也不能把页面回滚到 admin。
+      sessionListApplied = true;
       try {
         // session.list 是进入工作台的关键路径；daemon.clients 只是操作员展示元数据。
         // relay 或大量输出让该旁路 RPC 变慢时，不能把已经成功拿到的 session 列表回滚成连接失败。
@@ -1300,11 +1282,31 @@ export default function App() {
       ) {
         return;
       }
+      if (sessionListApplied) {
+        return;
+      }
+      if (
+        activeSurfaceRef.current === "workspace" &&
+        isLocallySupersededConnectionError(caught) &&
+        (selectedSessionIdRef.current || attachingSessionIdRef.current || attachedSessionRef.current)
+      ) {
+        // 中文注释：session 切换/自动 attach 会关闭旧 WebSocket。旧的 Refresh
+        // 可能正复用这条连接，收到 connection_closed/stale_connection 只能说明它被本地
+        // 新 session 连接取代，不能把 workspace 切回 admin。
+        const nextStatus =
+          statusRef.current === "attaching"
+            ? "attaching"
+            : attachedSessionRef.current
+              ? "attached"
+              : "ready";
+        setStatus(nextStatus);
+        return;
+      }
       if (
         activeSurfaceRef.current === "workspace" &&
         (attachedSessionRef.current || attachClientRef.current)
       ) {
-        // 中文注释：workspace 中已经有工作台 WebSocket 时，session/list 只是旁路 segment。
+        // 中文注释：workspace 中已经有当前 session 的 WebSocket 时，session/list 只是旁路 segment。
         // relay 恢复或后台唤醒导致的短超时不能卸载 xterm，也不能升级成全局连接错误；
         // 真实终端断线由 attach receive loop 按长超时重连链路处理。
         const nextStatus =
@@ -1336,7 +1338,7 @@ export default function App() {
       try {
         const client = await authenticatedWorkspaceClient();
         try {
-          // 中文注释：状态和客户端列表复用同一条工作台 WebSocket，只在内层 segment 分类。
+          // 中文注释：状态和客户端列表复用当前 session 的 WebSocket，只在内层 segment 分类。
           const sessionList = await client.listSessions();
           const clientList = await client.listDaemonClients().catch(() => undefined);
           if (activeServerIdRef.current !== requestServerId) {
@@ -1869,7 +1871,7 @@ export default function App() {
         if (pendingTerminalAttachSessionRef.current === sessionId) {
           pendingTerminalAttachSessionRef.current = undefined;
         }
-        // 中文注释：输入和 resize 属于 terminal segment，必须复用工作台 WebSocket。
+        // 中文注释：输入和 resize 属于 terminal segment，必须复用当前 session 的 WebSocket。
         // 到这里 daemon 已确认 attach，先发布 client 和 session id，让 reset 窗口内的键盘输入
         // 能进入正确 stream；输出 receive loop 仍在 reset 确认后才启动，避免 snapshot 写到旧实例。
         attachClientRef.current = attachedClient;
@@ -1971,13 +1973,13 @@ export default function App() {
       cancelScheduledAttachSwitch();
       attachRequestIdRef.current += 1;
       // 中文注释：新 session 一旦被点中，旧的 in-flight attach 立刻失效；
-      // 只保留最后停住的目标，避免上一个 session 的大 snapshot 继续占用共享协议锁。
+      // 只保留最后停住的目标，避免上一个 session 的大 snapshot 继续占用当前连接。
       if (
         attachedSessionRef.current !== undefined ||
         attachClientRef.current !== undefined
       ) {
         // 80ms 合并窗口只延迟“新 session attach”，不能让旧 session 的输出继续进入
-        // xterm。否则旧的大 snapshot/持续输出会占住主线程和工作台 WebSocket。
+        // xterm。否则旧的大 snapshot/持续输出会占住主线程和当前 session 连接。
         disconnectAttach();
       }
       if (pendingAttachClientRef.current && pendingAttachClientRef.current !== attachClientRef.current) {
@@ -2400,7 +2402,7 @@ export default function App() {
 
   const handleTerminalInput = useCallback(
     async (data: string) => {
-      // 中文注释：终端输入必须和终端输出落在同一条可靠 WebSocket 上，靠 segment 顺序
+      // 中文注释：终端输入必须和终端输出落在当前 session 的同一条可靠 WebSocket 上，靠 segment 顺序
       // 保证 stdin/stdout/resize 的相对顺序；普通 RPC 只是同一连接里的非终端 segment。
       const client = attachClientRef.current;
       const sessionId = attachedSessionRef.current;
@@ -2440,7 +2442,7 @@ export default function App() {
       }
       pendingResizeKeyRef.current = nextResizeKey;
       // 这里仅向 daemon 请求 resize，不乐观改本地 session size，也不等待这个调用读取回执。
-      // 中文注释：resize 和输入都在 terminal segment；普通 RPC 是同一连接里的非终端 segment。
+      // 中文注释：resize 和输入都在 terminal segment；普通 RPC 是当前 session 连接里的非终端 segment。
       void client.requestSessionResize(sessionId, size).catch((caught) => {
         if (isRetryableConnectionError(caught) && attachReconnectHandlerRef.current(client, caught)) {
           return;
@@ -3053,18 +3055,6 @@ export default function App() {
                   >
                     <Plus size={16} aria-hidden="true" />
                   </button>
-                  <button
-                    type="button"
-                    className="icon-button"
-                    aria-label={t("app.refresh")}
-                    onClick={handleRefresh}
-                    disabled={status === "listing"}
-                  >
-                    <RefreshCcw size={16} aria-hidden="true" />
-                  </button>
-                  <button type="button" className="icon-button" aria-label={t("app.disconnect")} onClick={handleDisconnectAttach} disabled={!attachedSessionId}>
-                    <Unplug size={16} aria-hidden="true" />
-                  </button>
                 </div>
                 <section className="collapsed-session-list" aria-label={t("app.collapsedSessions")}>
                   {orderedSessions.map((session) => (
@@ -3094,38 +3084,36 @@ export default function App() {
           </>
         ) : (
           <>
-            <div className="brand-row">
-            <div className="brand-title">
-              <Cable size={18} aria-hidden="true" />
-                <span>{t("app.termd")}</span>
+            <div className="sidebar-fixed-header">
+              <div className="brand-row">
+                <div className="brand-title">
+                  <Cable size={18} aria-hidden="true" />
+                  <span>{t("app.termd")}</span>
+                </div>
+                <button
+                  type="button"
+                  className="icon-button sidebar-collapse-toggle"
+                  aria-label={t("app.collapseSidebar")}
+                  onClick={() => setSidebarCollapsed(true)}
+                >
+                  <PanelLeftClose size={16} aria-hidden="true" />
+                </button>
               </div>
-              <button
-                type="button"
-                className="icon-button sidebar-collapse-toggle"
-                aria-label={t("app.collapseSidebar")}
-                onClick={() => setSidebarCollapsed(true)}
-              >
-                <PanelLeftClose size={16} aria-hidden="true" />
-              </button>
+              {!isMobileLayout && connectionReady ? (
+                <button
+                  type="button"
+                  className="session-create-button"
+                  aria-label={t("app.newSession")}
+                  onClick={handleCreateSession}
+                  disabled={status === "creating"}
+                >
+                  <Plus size={16} aria-hidden="true" />
+                  {t("app.newSession")}
+                </button>
+              ) : null}
             </div>
             {!isMobileLayout && connectionReady ? (
-              <>
-                <div className="panel session-create" aria-label={t("app.newSession")}>
-                  <button type="button" onClick={handleCreateSession} disabled={status === "creating"}>
-                    <Plus size={16} aria-hidden="true" />
-                    {t("app.newSession")}
-                  </button>
-                </div>
-                <div className="panel-actions">
-                  <button type="button" onClick={handleRefresh} disabled={status === "listing"}>
-                    <RefreshCcw size={16} aria-hidden="true" />
-                    {t("app.refresh")}
-                  </button>
-                  <button type="button" onClick={handleDisconnectAttach} disabled={!attachedSessionId}>
-                    <Unplug size={16} aria-hidden="true" />
-                    {t("app.disconnect")}
-                  </button>
-                </div>
+              <div className="sidebar-scroll-region">
                 <SessionList
                   sessions={orderedSessions}
                   selectedSessionId={selectedSessionId}
@@ -3141,7 +3129,7 @@ export default function App() {
                   onClose={handleCloseSession}
                   onReorder={handleReorderSessions}
                 />
-              </>
+              </div>
             ) : null}
           </>
         )}
@@ -3266,6 +3254,8 @@ export default function App() {
                 focusRequest={terminalFocusRequest}
                 mobileInputMode={isMobileLayout}
                 mobileKeyboardOpen={mobileKeyboardOpen}
+                mobileViewportHeight={isMobileLayout ? window.innerHeight : undefined}
+                mobileViewportOffsetTop={isMobileLayout ? visualViewportMetrics.offsetTop : undefined}
                 theme={effectiveTheme}
                 outputResetVersion={terminalOutputResetVersion}
                 takeOutput={takeTerminalOutput}
@@ -3725,17 +3715,17 @@ function useSystemTheme(): "dark" | "light" {
   return systemTheme;
 }
 
-function useVisualViewportMetrics(enabled: boolean): { height: number; offsetTop: number; keyboardOpen: boolean } {
+function useVisualViewportMetrics(enabled: boolean): { height: number; offsetTop: number; keyboardInset: number; keyboardOpen: boolean } {
   const metricsFromWindow = () => {
     if (typeof window === "undefined") {
-      return { height: 0, offsetTop: 0, keyboardOpen: false };
+      return { height: 0, offsetTop: 0, keyboardInset: 0, keyboardOpen: false };
     }
     const viewport = window.visualViewport;
     const height = Math.round(viewport?.height ?? window.innerHeight);
     const offsetTop = Math.round(viewport?.offsetTop ?? 0);
     const keyboardInset = Math.max(0, Math.round(window.innerHeight - height - offsetTop));
     // 地址栏收缩也会改变 visualViewport，高度差超过常见工具栏后才按软键盘处理。
-    return { height, offsetTop, keyboardOpen: keyboardInset >= 80 };
+    return { height, offsetTop, keyboardInset, keyboardOpen: keyboardInset >= 80 };
   };
   const [metrics, setMetrics] = useState(metricsFromWindow);
 
@@ -3749,6 +3739,7 @@ function useVisualViewportMetrics(enabled: boolean): { height: number; offsetTop
         const next = metricsFromWindow();
         return current.height === next.height &&
           current.offsetTop === next.offsetTop &&
+          current.keyboardInset === next.keyboardInset &&
           current.keyboardOpen === next.keyboardOpen
           ? current
           : next;
@@ -3766,7 +3757,7 @@ function useVisualViewportMetrics(enabled: boolean): { height: number; offsetTop
 
   return metrics.height
     ? metrics
-    : { height: typeof window === "undefined" ? 0 : window.innerHeight, offsetTop: 0, keyboardOpen: false };
+    : { height: typeof window === "undefined" ? 0 : window.innerHeight, offsetTop: 0, keyboardInset: 0, keyboardOpen: false };
 }
 
 function clampFilesPanelWidth(width: number, viewportWidth: number): number {

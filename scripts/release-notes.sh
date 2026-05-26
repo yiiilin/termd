@@ -12,6 +12,25 @@ version="${1:-}"
 }
 
 case "$version" in
+  0.3.6)
+    cat <<'EOF'
+termd 0.3.6
+
+用户可见变化:
+- relay 建立 route 后进一步收敛成 dumb pipe：不再由 relay 自己的 idle timer 或 WebSocket Pong 判定连接死亡，只按真实 close、读写错误和通道背压清理连接；后台浏览器、手机切出再回来、公网代理延迟 Pong 时不再容易误断。
+- daemon 到 relay 的长连接继续由 daemon 空闲保活和 mux keepalive 维持；缺少 WebSocket Pong 不再立即重建 daemon mux，实际可用性由同一条 mux 数据通道里的 keepalive ack 与读写错误判断。
+- relay 写侧不再为每个成功发送的 frame 回报 outcome 统计，避免大输出时形成额外“成功回报队列”；成功写入直接在 writer 侧记录，主循环只处理关闭/失败生命周期信号。
+- Web 端切换 session 或重连时会关闭旧 WebSocket，并为新 session 重新认证和 attach；relay/daemon 可以直接通过 transport close 清理旧 client context，快速切换多个大输出 session 后不再让旧 client 包继续拖慢新 session。
+- Web 侧边栏简化为固定标题和新建按钮，session 列表单独滚动；移除桌面侧边栏里的刷新和断开按钮，避免误操作和多余外层面板。
+- 修复 xterm 最后一笔 live 输出可能等到下一次输入或 resize 才 repaint 的问题；输出停止后的尾包会主动刷新，不需要再按一下键才看到最后内容。
+- 移动端软键盘弹出时不再把 visual viewport 变小上报成 PTY resize；终端分辨率保持不变，整个工作区按键盘高度上移，键盘收起后再按恢复后的高度上报尺寸。
+- 移动端网络状态区域在窄屏下继续保持可读，避免键盘或侧栏改动后被挤压成不可见内容。
+
+兼容性:
+- supervisor 兼容版本未变化，仍为 `0.3.5`；从 0.3.5 更新到 0.3.6 不应终止或清空已有 live session supervisor。
+- packet protocol version 仍为 3；relay 仍不解密、不解析业务明文，只负责 route prelude 后转发 WebSocket frame。建议 daemon、Web UI、termctl 和 relay 同步升级到 0.3.6。
+EOF
+    ;;
   0.3.4)
     cat <<'EOF'
 termd 0.3.4

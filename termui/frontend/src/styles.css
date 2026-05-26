@@ -429,9 +429,9 @@ label {
   background: var(--color-bg-shell);
   padding: 14px;
   display: grid;
-  align-content: start;
+  grid-template-rows: auto minmax(0, 1fr);
   gap: 12px;
-  overflow: auto;
+  overflow: hidden;
 }
 
 .collapsed-sidebar {
@@ -469,6 +469,17 @@ label {
 
 .sidebar-collapse-toggle {
   margin-left: auto;
+}
+
+.sidebar-fixed-header {
+  min-width: 0;
+  display: grid;
+  gap: 12px;
+}
+
+.sidebar-scroll-region {
+  min-height: 0;
+  overflow: hidden;
 }
 
 .clients-popover {
@@ -950,12 +961,16 @@ label {
   text-transform: uppercase;
 }
 
-.session-create button {
+.session-create-button {
   width: 100%;
 }
 
 .session-list {
+  min-height: 0;
+  max-height: 100%;
+  overflow-y: auto;
   display: grid;
+  align-content: start;
   gap: 8px;
 }
 
@@ -2711,10 +2726,15 @@ label {
     top: var(--termd-visual-viewport-offset-top, 0px);
     width: min(100vw, 100dvw);
     max-width: min(100vw, 100dvw);
-    height: var(--termd-visual-viewport-height, 100dvh);
+    height: var(--termd-layout-viewport-height, var(--termd-visual-viewport-height, 100dvh));
     grid-template-columns: 1fr;
     grid-template-rows: auto minmax(0, 1fr);
     overflow: hidden;
+  }
+
+  .app-shell.mobile-keyboard-open {
+    /* 软键盘弹出时保持 terminal rows/cols 不变，只把整个工作区抬到键盘上方。 */
+    transform: translate3d(0, calc(-1 * var(--termd-visual-viewport-keyboard-inset, 0px)), 0);
   }
 
   .app-shell.connection-ready {
@@ -2817,7 +2837,7 @@ label {
     width: 100%;
     max-width: 100%;
     min-height: 0;
-    height: var(--termd-visual-viewport-height, 100%);
+    height: var(--termd-layout-viewport-height, var(--termd-visual-viewport-height, 100%));
     grid-template-rows: 42px minmax(0, 1fr) 30px;
   }
 
