@@ -18,6 +18,12 @@ afterEach(() => {
     .__TERMD_TEST_FIT_DIMENSIONS__;
   delete (globalThis as { __TERMD_TEST_DEFER_XTERM_RENDER_UNTIL_WRITE_CALLBACK__?: boolean })
     .__TERMD_TEST_DEFER_XTERM_RENDER_UNTIL_WRITE_CALLBACK__;
+  delete (globalThis as { __TERMD_TEST_DEFER_XTERM_RENDER_READY_AFTER_WRITE_CALLBACK__?: boolean })
+    .__TERMD_TEST_DEFER_XTERM_RENDER_READY_AFTER_WRITE_CALLBACK__;
+  delete (globalThis as { __TERMD_TEST_DEFER_XTERM_BUFFER_UNTIL_WRITE_CALLBACK__?: boolean })
+    .__TERMD_TEST_DEFER_XTERM_BUFFER_UNTIL_WRITE_CALLBACK__;
+  delete (globalThis as { __TERMD_TEST_KEEP_XTERM_VIEWPORT_AT_TOP_AFTER_WRITE__?: boolean })
+    .__TERMD_TEST_KEEP_XTERM_VIEWPORT_AT_TOP_AFTER_WRITE__;
   delete (globalThis as { __TERMD_TEST_SERIALIZE_XTERM_WRITES__?: boolean })
     .__TERMD_TEST_SERIALIZE_XTERM_WRITES__;
   delete (globalThis as { __TERMD_TEST_DEFER_OUTPUT_RESET_APPLIED__?: (confirm: () => void) => void })
@@ -85,11 +91,17 @@ vi.mock("@xterm/xterm", () => {
       });
       this.element.append(textarea);
       element.append(this.element);
-      (globalThis as { __TERMD_TEST_XTERM__?: { select: (text: string) => void } }).__TERMD_TEST_XTERM__ = {
+      (globalThis as { __TERMD_TEST_XTERM__?: {
+        select: (text: string) => void;
+        viewportY: () => number;
+        baseY: () => number;
+      } }).__TERMD_TEST_XTERM__ = {
         select: (text: string) => {
           this.selection = text;
           this.selectionChangeListeners.forEach((listener) => listener());
         },
+        viewportY: () => this.buffer.active.viewportY,
+        baseY: () => this.buffer.active.baseY,
       };
     }
 
@@ -131,26 +143,48 @@ vi.mock("@xterm/xterm", () => {
         (globalThis as { __TERMD_TEST_DEFER_XTERM_RENDER_UNTIL_WRITE_CALLBACK__?: boolean })
           .__TERMD_TEST_DEFER_XTERM_RENDER_UNTIL_WRITE_CALLBACK__,
       );
+      const deferRenderReadyAfterCallback = Boolean(
+        (globalThis as { __TERMD_TEST_DEFER_XTERM_RENDER_READY_AFTER_WRITE_CALLBACK__?: boolean })
+          .__TERMD_TEST_DEFER_XTERM_RENDER_READY_AFTER_WRITE_CALLBACK__,
+      );
+      const deferBufferUntilCallback = Boolean(
+        (globalThis as { __TERMD_TEST_DEFER_XTERM_BUFFER_UNTIL_WRITE_CALLBACK__?: boolean })
+          .__TERMD_TEST_DEFER_XTERM_BUFFER_UNTIL_WRITE_CALLBACK__,
+      );
+      const keepViewportAtTop = Boolean(
+        (globalThis as { __TERMD_TEST_KEEP_XTERM_VIEWPORT_AT_TOP_AFTER_WRITE__?: boolean })
+          .__TERMD_TEST_KEEP_XTERM_VIEWPORT_AT_TOP_AFTER_WRITE__,
+      );
       if (deferRender) {
         this.pendingRender += text;
         this.pendingRenderReady = false;
       } else {
         this.renderData(text);
       }
-      const lines = text.split("\n");
-      const lastLine = lines[lines.length - 1] ?? "";
-      if (text.includes("\n")) {
-        this.buffer.active.cursorY += lines.length - 1;
-        this.buffer.active.cursorX = lastLine.length;
-      } else {
-        this.buffer.active.cursorX += text.length;
+      const applyBufferEffects = () => {
+        const lines = text.split("\n");
+        const lastLine = lines[lines.length - 1] ?? "";
+        if (text.includes("\n")) {
+          this.buffer.active.cursorY += lines.length - 1;
+          this.buffer.active.cursorX = lastLine.length;
+        } else {
+          this.buffer.active.cursorX += text.length;
+        }
+        this.buffer.active.baseY = Math.max(0, this.buffer.active.cursorY - this.rows + 1);
+        this.buffer.active.viewportY = keepViewportAtTop
+          ? Math.min(this.buffer.active.viewportY, this.buffer.active.baseY)
+          : this.buffer.active.baseY;
+        this.writeParsedListeners.forEach((listener) => listener());
+        this.cursorMoveListeners.forEach((listener) => listener());
+        this.scrollListeners.forEach((listener) => listener(this.buffer.active.viewportY));
+      };
+      if (!deferBufferUntilCallback) {
+        applyBufferEffects();
       }
-      this.buffer.active.baseY = Math.max(0, this.buffer.active.cursorY - this.rows + 1);
-      this.buffer.active.viewportY = this.buffer.active.baseY;
-      this.writeParsedListeners.forEach((listener) => listener());
-      this.cursorMoveListeners.forEach((listener) => listener());
-      this.scrollListeners.forEach((listener) => listener(this.buffer.active.viewportY));
       if (!deferRender) {
+        if (deferBufferUntilCallback) {
+          applyBufferEffects();
+        }
         callback?.();
         return;
       }
@@ -160,7 +194,20 @@ vi.mock("@xterm/xterm", () => {
       window.requestAnimationFrame(() => {
         window.requestAnimationFrame(() => {
           window.requestAnimationFrame(() => {
+            if (deferRenderReadyAfterCallback) {
+              if (deferBufferUntilCallback) {
+                applyBufferEffects();
+              }
+              callback?.();
+              window.requestAnimationFrame(() => {
+                this.pendingRenderReady = true;
+              });
+              return;
+            }
             this.pendingRenderReady = true;
+            if (deferBufferUntilCallback) {
+              applyBufferEffects();
+            }
             callback?.();
           });
         });

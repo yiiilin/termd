@@ -1442,7 +1442,12 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
     let mut protocol = protocol.lock().await;
     connection.close(&mut protocol);
     drop(protocol);
-    finish_websocket_writer(write_wire_tx, writer_task).await;
+    // 中文注释：进入业务态后，WebSocket 断开就是当前 client context 的生命周期结束。
+    // 此时不能继续 drain 已入队的 terminal/file push，否则旧连接关闭后还会尝试写 socket，
+    // 既浪费带宽，也会刷出 misleading 的 "Sending after closing" 日志。
+    drop(write_wire_tx);
+    writer_task.abort();
+    let _ = writer_task.await;
     debug!("websocket connection closed and detached");
 }
 
@@ -2874,6 +2879,38 @@ mod tests {
         .await
         .expect("websocket writer should keep writing without send ack");
         assert_eq!(reached, expected_frames);
+
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn websocket_writer_is_aborted_when_client_context_closes() {
+        let protocol = test_protocol("websocket-writer-abort-on-close");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_protocol = protocol.clone();
+        let server = tokio::spawn(async move {
+            let _ = serve_listener(listener, server_protocol, false).await;
+        });
+
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .unwrap();
+        let server_id = protocol.lock().await.server_id();
+        send_ws_route_hello(&mut socket, server_id).await;
+        let _hello = timeout(Duration::from_secs(1), socket.next())
+            .await
+            .expect("hello should arrive")
+            .expect("websocket should stay open")
+            .expect("hello frame should decode");
+
+        socket.close(None).await.unwrap();
+
+        // 中文注释：客户端关闭后 daemon 必须取消该 client 的 writer context。
+        // 如果继续 drain 旧队列，连接清理会卡在 socket write 上并产生 Sending-after-closing 日志。
+        timeout(Duration::from_secs(1), socket.next())
+            .await
+            .expect("server should finish websocket promptly after client close");
 
         server.abort();
     }

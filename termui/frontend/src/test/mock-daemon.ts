@@ -185,6 +185,8 @@ export class MockDaemon {
   private createdSessionCounter = 0;
   private failTerminalAttachRequests = 0;
   private failWatchedTerminalAttachRequests = 0;
+  private closeDaemonStatusRequests = 0;
+  private closeDaemonClientsRequests = 0;
   private readonly queuedSessionListResponses: QueuedSessionListResponse[] = [];
   private readonly e2eeKeypair: E2eeKeyPair;
   private readonly trustedDevices = new Map<UUID, TrustedDevice>();
@@ -241,6 +243,16 @@ export class MockDaemon {
     // 输出连接 watch_updates=true；只让这条 attach 失败，可以覆盖“控制连接已恢复但输出连接失败”
     // 之后还要继续排下一次重连的场景。
     this.failWatchedTerminalAttachRequests = Math.max(0, Math.floor(count));
+  }
+
+  closeNextDaemonStatusRequests(count = 1): void {
+    // 用 transport close 模拟真实浏览器/relay 中“旁路状态请求发现连接已关闭”的路径。
+    this.closeDaemonStatusRequests = Math.max(0, Math.floor(count));
+  }
+
+  closeNextDaemonClientsRequests(count = 1): void {
+    // daemon.clients 是后台元数据请求；关闭它不能被前端升级成终端永久断线。
+    this.closeDaemonClientsRequests = Math.max(0, Math.floor(count));
   }
 
   queueSessionListResponse(sessions: SessionSummaryPayload[], delayMs = 0): void {
@@ -723,6 +735,11 @@ export class MockDaemon {
         return;
       }
       case "daemon_clients": {
+        if (this.closeDaemonClientsRequests > 0) {
+          this.closeDaemonClientsRequests -= 1;
+          connection.socket.close();
+          return;
+        }
         if (this.options.daemonClientsDelayMs) {
           await new Promise((resolve) => setTimeout(resolve, this.options.daemonClientsDelayMs));
         }
@@ -753,6 +770,11 @@ export class MockDaemon {
       }
       case "daemon_status": {
         this.daemonStatusRequests += 1;
+        if (this.closeDaemonStatusRequests > 0) {
+          this.closeDaemonStatusRequests -= 1;
+          connection.socket.close();
+          return;
+        }
         if (this.options.daemonStatusDelayMs) {
           await new Promise((resolve) => setTimeout(resolve, this.options.daemonStatusDelayMs));
         }

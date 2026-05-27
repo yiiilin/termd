@@ -173,6 +173,8 @@ export function TerminalPane(props: TerminalPaneProps) {
   const writeGenerationRef = useRef(0);
   const writeFrameRef = useRef<number | undefined>(undefined);
   const needsPostWriteRefreshRef = useRef(false);
+  const needsPostWriteScrollBottomRef = useRef(false);
+  const bottomScrollPassesRef = useRef(0);
   const [focused, setFocused] = useState(false);
   const [copyToastVisible, setCopyToastVisible] = useState(false);
   const [mobileScrollRatio, setMobileScrollRatio] = useState(1);
@@ -198,19 +200,24 @@ export function TerminalPane(props: TerminalPaneProps) {
     }
     scrollport.scrollTop = Math.max(0, scrollport.scrollHeight - scrollport.clientHeight);
   };
-  const scheduleScrollToBottom = () => {
+  const scheduleScrollToBottom = (passes = 2) => {
+    bottomScrollPassesRef.current = Math.max(bottomScrollPassesRef.current, Math.max(1, passes));
     if (bottomScrollFrameRef.current !== undefined) {
       return;
     }
-    bottomScrollFrameRef.current = window.requestAnimationFrame(() => {
+    const runScrollPass = () => {
       bottomScrollFrameRef.current = undefined;
       scrollToBottom();
-      // resize 后浏览器会在下一帧才稳定 scrollHeight；再贴底一次避免停在顶部。
-      bottomScrollFrameRef.current = window.requestAnimationFrame(() => {
-        bottomScrollFrameRef.current = undefined;
-        scrollToBottom();
-      });
-    });
+      bottomScrollPassesRef.current -= 1;
+      if (bottomScrollPassesRef.current <= 0) {
+        bottomScrollPassesRef.current = 0;
+        return;
+      }
+      // resize / xterm renderer / 移动端 visual viewport 可能分多帧稳定。
+      // attach 后的贴底只在首屏执行，多补几帧不会放大持续输出路径压力。
+      bottomScrollFrameRef.current = window.requestAnimationFrame(runScrollPass);
+    };
+    bottomScrollFrameRef.current = window.requestAnimationFrame(runScrollPass);
   };
   const showCopyToast = () => {
     setCopyToastVisible(true);
@@ -968,6 +975,9 @@ export function TerminalPane(props: TerminalPaneProps) {
       if (item.kind === "snapshot") {
         terminal.reset();
         needsPostWriteRefreshRef.current = true;
+        // 中文注释：snapshot 写入可能晚于 attach 初期的 resize/stabilize。
+        // 写完后必须再贴底一次，否则用户进入 session 时可能停在历史顶部附近。
+        needsPostWriteScrollBottomRef.current = true;
         return true;
       }
       if (item.kind === "output" || item.kind === "resize" || item.kind === "exit") {
@@ -1053,11 +1063,29 @@ export function TerminalPane(props: TerminalPaneProps) {
       if (!needsPostWriteRefreshRef.current && !outputQueueIdle) {
         return;
       }
+      const shouldScrollBottomAfterWrite = outputQueueIdle && needsPostWriteScrollBottomRef.current;
       needsPostWriteRefreshRef.current = false;
+      if (shouldScrollBottomAfterWrite) {
+        needsPostWriteScrollBottomRef.current = false;
+      }
       // 首屏/清屏后的首个 write，以及一次 live 输出停止后的最后一笔 write，都需要
       // 一次轻量 refresh。否则某些 xterm 渲染时序会等到下一次输入/resize 才 repaint 尾包。
       if (outputQueueIdle) {
-        requestTrackedFrame(() => terminal.refresh(0, Math.max(0, terminal.rows - 1)));
+        requestTrackedFrame(() => {
+          if (shouldScrollBottomAfterWrite) {
+            scrollToBottom();
+            scheduleScrollToBottom(4);
+          }
+          terminal.refresh(0, Math.max(0, terminal.rows - 1));
+          // 切换 session 后浏览器布局和 xterm renderer 可能比 write callback 再晚一帧可绘制。
+          // 队列已经 idle 时补第二帧刷新，不会放大持续输出路径的绘制压力。
+          requestTrackedFrame(() => {
+            if (shouldScrollBottomAfterWrite) {
+              scrollToBottom();
+            }
+            terminal.refresh(0, Math.max(0, terminal.rows - 1));
+          });
+        });
         return;
       }
       // 持续输出路径不反复 proposeDimensions/refresh，降低 layout 和绘制压力。
@@ -1205,6 +1233,7 @@ export function TerminalPane(props: TerminalPaneProps) {
       confirmOutputReset();
     }
     needsPostWriteRefreshRef.current = true;
+    needsPostWriteScrollBottomRef.current = true;
     // attach 输出可能早于 xterm 初始化到达；创建实例时先取走待写队列，避免首屏输出丢失。
     drainOutputRef.current = drainOutput;
     drainOutput();
@@ -1294,6 +1323,7 @@ export function TerminalPane(props: TerminalPaneProps) {
       writeGenerationRef.current += 1;
       writeFrameRef.current = undefined;
       needsPostWriteRefreshRef.current = false;
+      needsPostWriteScrollBottomRef.current = false;
       focusedRef.current = false;
       clientSizeRef.current = undefined;
       mobileViewportResizeOwnerRef.current = false;

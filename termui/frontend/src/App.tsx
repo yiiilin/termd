@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from "react";
 import {
   Cable,
   CircleAlert,
@@ -81,6 +81,7 @@ const CONNECTION_AUTO_RETRY_DELAY_MS = 1500;
 const CONNECTION_AUTO_RETRY_LIMIT = 3;
 const ATTACH_RECONNECT_DELAYS_MS = [250, 1000, 2500, 5000, 10000, 20000];
 const ATTACH_SWITCH_COALESCE_DELAY_MS = 80;
+const WORKSPACE_BLUR_REATTACH_AFTER_MS = 10_000;
 const FILES_CWD_FOLLOW_POLL_INTERVAL_MS = 1000;
 const TEXT_FILE_EDITOR_MAX_BYTES = 1024 * 1024;
 const FILE_TRANSFER_MEMORY_FALLBACK_MAX_BYTES = 16 * 1024 * 1024;
@@ -90,6 +91,9 @@ const RECEIVE_LOOP_YIELD_MESSAGES = 64;
 const RECEIVE_LOOP_YIELD_BYTES = 256 * 1024;
 const MOBILE_LAYOUT_QUERY = "(max-width: 760px)";
 const MOBILE_LAYOUT_BREAKPOINT = 760;
+const MOBILE_TITLE_PULL_START_PX = 8;
+const MOBILE_TITLE_PULL_REFRESH_PX = 52;
+const MOBILE_TITLE_PULL_MAX_PX = 72;
 const CPU_HISTORY_LIMIT = 48;
 const CPU_BAR_CHART_WIDTH = 56;
 const CPU_BAR_CHART_HEIGHT = 18;
@@ -110,6 +114,13 @@ interface AttachReconnectOptions {
   sessionId?: UUID;
   reconnectKey?: string;
   skipCurrentClientClose?: boolean;
+}
+
+interface MobileTitlePullGesture {
+  pointerId: number;
+  startX: number;
+  startY: number;
+  dragging: boolean;
 }
 
 const RETRYABLE_CONNECTION_ERROR_CODES = new Set([
@@ -254,6 +265,7 @@ export default function App() {
   const [isFilesPanelResizing, setIsFilesPanelResizing] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [mobilePanel, setMobilePanel] = useState<"sessions" | "files" | undefined>();
+  const [mobileTitlePullDistance, setMobileTitlePullDistance] = useState(0);
   const [connectionEditorOpen, setConnectionEditorOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [qrScannerOpen, setQrScannerOpen] = useState(false);
@@ -269,6 +281,8 @@ export default function App() {
   const pendingAttachClientRef = useRef<DirectClient | undefined>(undefined);
   const workspaceClientPromiseRef = useRef<Promise<DirectClient> | undefined>(undefined);
   const workspaceClientGenerationRef = useRef(0);
+  const mobileTitlePullGestureRef = useRef<MobileTitlePullGesture | undefined>(undefined);
+  const suppressMobileTitleClickRef = useRef(false);
   const pendingTerminalAttachSessionRef = useRef<UUID | undefined>(undefined);
   const sessionPermissionIdsRef = useRef<Set<UUID>>(new Set());
   const attachedSessionRef = useRef<UUID | undefined>(undefined);
@@ -320,6 +334,8 @@ export default function App() {
   const attachReconnectAttemptsRef = useRef(0);
   const attachReconnectLastErrorRef = useRef<unknown>(undefined);
   const attachReconnectHandlerRef = useRef<(client: DirectClient, caught: unknown, options?: AttachReconnectOptions) => boolean>(() => false);
+  const workspacePausedAtRef = useRef<number | undefined>(undefined);
+  const workspacePausedByVisibilityRef = useRef(false);
   const daemonNetworkSampleRef = useRef<DaemonNetworkCounterSample | undefined>(undefined);
   const daemonStatusRefreshInFlightRef = useRef(false);
   const daemonStatusRequestSeqRef = useRef(0);
@@ -538,6 +554,11 @@ export default function App() {
   const showMobileWorkspaceMenu = isMobileLayout && connectionReady;
   const showMobileSessionsPanel = showMobileWorkspaceMenu && mobilePanel === "sessions";
   const showMobileFilesPanel = showMobileWorkspaceMenu && mobilePanel === "files";
+  const mobileTitlePullReady = mobileTitlePullDistance >= MOBILE_TITLE_PULL_REFRESH_PX;
+  const mobileTitlePullStyle =
+    showMobileWorkspaceMenu && mobileTitlePullDistance > 0
+      ? ({ "--termd-mobile-title-pull": `${mobileTitlePullDistance}px` } as CSSProperties)
+      : undefined;
   const showDesktopFilesPanel = !isMobileLayout && filesPanelOpen;
   const desktopWorkspaceStyle =
     !isMobileLayout && showDesktopFilesPanel
@@ -1329,6 +1350,11 @@ export default function App() {
       if (isPagePaused()) {
         return;
       }
+      if (statusRef.current === "creating" || statusRef.current === "attaching") {
+        // 中文注释：terminal.create/attach 是当前工作台的主链路。
+        // 后台 session/client 刷新不能在慢 relay 上和终端建连竞争同一条 WebSocket。
+        return;
+      }
       if (daemonClientsRefreshInFlightRef.current) {
         return;
       }
@@ -1365,8 +1391,11 @@ export default function App() {
             setDaemonClients(clientList.clients);
           }
         } catch (caught) {
-          if (isBrokenWorkspaceConnectionError(caught)) {
-            closeWorkspaceClient();
+          if (isBrokenWorkspaceConnectionError(caught) && attachClientRef.current === client) {
+            // 中文注释：后台列表刷新是旁路 segment；它只能把当前 transport 判为需要重连，
+            // 不能自己直接清空 workspace。真正的终端收口统一走 attach 重连状态机，
+            // 避免“连接已关闭”后页面停在无 client 状态。
+            attachReconnectHandlerRef.current(client, caught);
           }
           throw caught;
         }
@@ -1378,11 +1407,16 @@ export default function App() {
         daemonClientsRefreshInFlightRef.current = false;
       }
     },
-    [activeServer?.server_id, authenticatedWorkspaceClient, closeWorkspaceClient],
+    [activeServer?.server_id, authenticatedWorkspaceClient],
   );
 
   const loadDaemonStatus = useCallback(async () => {
     if (isPagePaused()) {
+      return;
+    }
+    if (statusRef.current === "creating" || statusRef.current === "attaching") {
+      // 中文注释：状态栏是旁路信息；创建/进入终端期间跳过一轮，
+      // 避免 RTT/status 请求在低带宽 relay 上排到 terminal.create 前后。
       return;
     }
     if (daemonStatusRefreshInFlightRef.current) {
@@ -1416,8 +1450,11 @@ export default function App() {
         // CPU 柱状图只做当前页面内缓存，避免把瞬时监控数据写入浏览器持久状态。
         setDaemonCpuHistory((current) => appendCpuSample(current, status.cpu_percent));
       } catch (caught) {
-        if (isBrokenWorkspaceConnectionError(caught)) {
-          closeWorkspaceClient();
+        if (isBrokenWorkspaceConnectionError(caught) && attachClientRef.current === client) {
+          // 中文注释：状态轮询是旁路请求。它发现当前 transport 关闭时，只触发
+          // terminal attach 的统一重连流程；不能在这里直接关闭 workspace client，
+          // 否则前端会丢掉当前 session 连接并显示“连接已关闭”。
+          attachReconnectHandlerRef.current(client, caught);
         }
         throw caught;
       }
@@ -1434,7 +1471,7 @@ export default function App() {
         setDaemonStatusLoading(false);
       }
     }
-  }, [activeServer?.server_id, authenticatedWorkspaceClient, closeWorkspaceClient]);
+  }, [activeServer?.server_id, authenticatedWorkspaceClient]);
 
   const clearNewOutputMark = useCallback((sessionId: UUID) => {
     // 新输出提示只属于本地 UI；用户打开该 session 后立即清除，不回写 daemon。
@@ -2061,7 +2098,11 @@ export default function App() {
       }
       pendingAttachClientRef.current = outputClient;
       // Web 只创建完整的默认 shell 会话，避免把 session 误导成一次性命令执行。
-      const created = await outputClient.createSession([], DEFAULT_SESSION_SIZE);
+      const created = await outputClient.createSession([], DEFAULT_SESSION_SIZE, {
+        // 中文注释：terminal.create 会同时建立新的 terminal stream，属于终端 attach 生命周期。
+        // relay 低带宽抖动时不能套用普通 5s RPC 超时，否则响应晚到会被前端丢弃。
+        timeoutMs: ATTACH_CONNECTION_TIMEOUT_MS,
+      });
       if (!isCurrentCreateRequest()) {
         outputClient.detachSession(created.session_id);
         outputClient = undefined;
@@ -2126,7 +2167,7 @@ export default function App() {
       // PWA 从后台恢复时旧 WebSocket 可能已经被系统关闭；先断开旧 attach，
       // 否则 handleAttach 会误以为当前 session 已连接而直接短路返回。
       disconnectAttach();
-      await handleAttach(sessionId);
+      await performAttach(sessionId);
       return;
     }
 
@@ -2134,7 +2175,20 @@ export default function App() {
     setActiveSurface("workspace");
     autoCheckedServerRef.current = undefined;
     await handleRefresh();
-  }, [attachedSessionId, disconnectAttach, handleAttach, handleRefresh, selectedSessionId]);
+  }, [attachedSessionId, disconnectAttach, handleRefresh, performAttach, selectedSessionId]);
+
+  const scheduleResumeMetadataRefresh = useCallback(() => {
+    window.setTimeout(() => {
+      if (isPagePaused() || activeSurfaceRef.current !== "workspace") {
+        return;
+      }
+      // 中文注释：后台恢复时 terminal WebSocket 重建和普通状态轮询是两条语义。
+      // 即使恢复入口已经走了 attach 重建，也要补一轮状态刷新，避免后台期间超时的
+      // status 请求把状态栏卡在旧采样上。
+      void loadDaemonStatus();
+      void refreshDaemonClients();
+    }, 0);
+  }, [loadDaemonStatus, refreshDaemonClients]);
 
   useEffect(() => {
     if (!error && (status === "ready" || status === "attached")) {
@@ -2182,10 +2236,19 @@ export default function App() {
   }, [activeServer?.server_id, activeSurface, attachedSessionId, error, handleRetryConnection, hasPairedServer, selectedSessionId]);
 
   useEffect(() => {
+    const rememberWorkspacePause = (byVisibility: boolean) => {
+      if (activeSurface !== "workspace") {
+        return;
+      }
+      workspacePausedAtRef.current = Date.now();
+      workspacePausedByVisibilityRef.current = workspacePausedByVisibilityRef.current || byVisibility;
+    };
+
     const pauseOfflineConnection = () => {
       if (activeSurface !== "workspace") {
         return;
       }
+      rememberWorkspacePause(false);
       // 中文注释：浏览器切 offline 时，WebSocket 不一定会立刻触发 close。
       // 主动丢弃旧 transport，避免恢复后继续向半开连接写 terminal.attach/input。
       closeWorkspaceClient();
@@ -2195,14 +2258,29 @@ export default function App() {
       if (isPagePaused() || activeSurface !== "workspace") {
         return;
       }
+      const pausedAt = workspacePausedAtRef.current;
+      const wasHidden = workspacePausedByVisibilityRef.current;
+      workspacePausedAtRef.current = undefined;
+      workspacePausedByVisibilityRef.current = false;
+      const pausedLongEnough =
+        pausedAt !== undefined && Date.now() - pausedAt >= WORKSPACE_BLUR_REATTACH_AFTER_MS;
+      if (
+        (attachedSessionId || selectedSessionId) &&
+        (wasHidden || pausedLongEnough || !attachClientRef.current)
+      ) {
+        // 中文注释：后台标签页和长时间失焦后，浏览器 WebSocket 可能已经半开。
+        // 恢复时按当前 session 重建 terminal 连接，比继续复用旧 transport 后等待超时更稳。
+        void handleRetryConnection().finally(scheduleResumeMetadataRefresh);
+        return;
+      }
       // 页面从后台回来后只做一次主动恢复；hidden 期间的轮询/重试已经暂停，
       // 避免浏览器恢复时把过期定时器一次性打到 relay 上。
       if (error) {
-        void handleRetryConnection();
+        void handleRetryConnection().finally(scheduleResumeMetadataRefresh);
         return;
       }
       if ((attachedSessionId || selectedSessionId) && !attachClientRef.current) {
-        void handleRetryConnection();
+        void handleRetryConnection().finally(scheduleResumeMetadataRefresh);
         return;
       }
       if (activeServer && state.device && (status === "idle" || status === "connecting")) {
@@ -2217,11 +2295,24 @@ export default function App() {
       }
     };
 
-    document.addEventListener("visibilitychange", resumeVisibleConnection);
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "hidden") {
+        rememberWorkspacePause(true);
+        return;
+      }
+      resumeVisibleConnection();
+    };
+    const handleWindowBlur = () => rememberWorkspacePause(false);
+
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    window.addEventListener("blur", handleWindowBlur);
+    window.addEventListener("focus", resumeVisibleConnection);
     window.addEventListener("offline", pauseOfflineConnection);
     window.addEventListener("online", resumeVisibleConnection);
     return () => {
-      document.removeEventListener("visibilitychange", resumeVisibleConnection);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+      window.removeEventListener("blur", handleWindowBlur);
+      window.removeEventListener("focus", resumeVisibleConnection);
       window.removeEventListener("offline", pauseOfflineConnection);
       window.removeEventListener("online", resumeVisibleConnection);
     };
@@ -2236,6 +2327,7 @@ export default function App() {
     handleRetryConnection,
     loadDaemonStatus,
     refreshDaemonClients,
+    scheduleResumeMetadataRefresh,
     selectedSessionId,
     state.device,
     status,
@@ -2875,6 +2967,88 @@ export default function App() {
     setMobilePanel("sessions");
   }, []);
 
+  const resetMobileTitlePull = useCallback(() => {
+    mobileTitlePullGestureRef.current = undefined;
+    setMobileTitlePullDistance(0);
+  }, []);
+
+  const handleMobileTitlePointerDown = useCallback((event: ReactPointerEvent<HTMLButtonElement>) => {
+    if (!isMobileLayout || !connectionReady || event.pointerType !== "touch" || event.button !== 0) {
+      return;
+    }
+    mobileTitlePullGestureRef.current = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      dragging: false,
+    };
+    setMobileTitlePullDistance(0);
+    try {
+      event.currentTarget.setPointerCapture(event.pointerId);
+    } catch {
+      // jsdom 和部分旧移动浏览器不支持 pointer capture；手势仍可按当前事件序列工作。
+    }
+  }, [connectionReady, isMobileLayout]);
+
+  const handleMobileTitlePointerMove = useCallback((event: ReactPointerEvent<HTMLButtonElement>) => {
+    const gesture = mobileTitlePullGestureRef.current;
+    if (!gesture || gesture.pointerId !== event.pointerId || event.pointerType !== "touch") {
+      return;
+    }
+    const dx = event.clientX - gesture.startX;
+    const dy = event.clientY - gesture.startY;
+    if (!gesture.dragging) {
+      if (dy < MOBILE_TITLE_PULL_START_PX || dy <= Math.abs(dx) * 1.5) {
+        return;
+      }
+      gesture.dragging = true;
+      suppressMobileTitleClickRef.current = true;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    setMobileTitlePullDistance(Math.min(MOBILE_TITLE_PULL_MAX_PX, Math.max(0, dy)));
+  }, []);
+
+  const handleMobileTitlePointerUp = useCallback((event: ReactPointerEvent<HTMLButtonElement>) => {
+    const gesture = mobileTitlePullGestureRef.current;
+    if (!gesture || gesture.pointerId !== event.pointerId) {
+      return;
+    }
+    const shouldRefresh = gesture.dragging && event.clientY - gesture.startY >= MOBILE_TITLE_PULL_REFRESH_PX;
+    if (gesture.dragging) {
+      event.preventDefault();
+      event.stopPropagation();
+      suppressMobileTitleClickRef.current = true;
+    }
+    try {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    } catch {
+      // pointer capture 不是刷新动作的前置条件；释放失败只说明浏览器没有捕获该 pointer。
+    }
+    resetMobileTitlePull();
+    if (shouldRefresh) {
+      void handleRefresh();
+    }
+  }, [handleRefresh, resetMobileTitlePull]);
+
+  const handleMobileTitlePointerCancel = useCallback((event: ReactPointerEvent<HTMLButtonElement>) => {
+    const gesture = mobileTitlePullGestureRef.current;
+    if (!gesture || gesture.pointerId !== event.pointerId) {
+      return;
+    }
+    resetMobileTitlePull();
+  }, [resetMobileTitlePull]);
+
+  const handleMobileTitleClick = useCallback((event: ReactMouseEvent<HTMLButtonElement>) => {
+    if (suppressMobileTitleClickRef.current) {
+      event.preventDefault();
+      event.stopPropagation();
+      suppressMobileTitleClickRef.current = false;
+      return;
+    }
+    handleOpenMobileSessions();
+  }, [handleOpenMobileSessions]);
+
   const handleOpenMobileFiles = useCallback(() => {
     if (!attachedSessionId) {
       return;
@@ -3150,10 +3324,20 @@ export default function App() {
           {showMobileWorkspaceMenu ? (
             <button
               type="button"
-              className="toolbar-title toolbar-title-button"
+              className={[
+                "toolbar-title toolbar-title-button",
+                mobileTitlePullDistance > 0 ? "toolbar-title-pulling" : "",
+                mobileTitlePullReady ? "toolbar-title-pull-ready" : "",
+                status === "listing" ? "toolbar-title-refreshing" : "",
+              ].filter(Boolean).join(" ")}
+              style={mobileTitlePullStyle}
               aria-label={t("app.openSessionListFromTitle")}
               aria-expanded={showMobileSessionsPanel}
-              onClick={handleOpenMobileSessions}
+              onPointerDown={handleMobileTitlePointerDown}
+              onPointerMove={handleMobileTitlePointerMove}
+              onPointerUp={handleMobileTitlePointerUp}
+              onPointerCancel={handleMobileTitlePointerCancel}
+              onClick={handleMobileTitleClick}
             >
               <MonitorUp size={16} aria-hidden="true" />
               <span>{toolbarSessionName}</span>
@@ -3167,6 +3351,9 @@ export default function App() {
                   {toolbarLatency}
                 </small>
               ) : null}
+              <span className="toolbar-title-pull-indicator" aria-hidden="true">
+                <RefreshCcw size={13} />
+              </span>
             </button>
           ) : (
             <div className="toolbar-title">

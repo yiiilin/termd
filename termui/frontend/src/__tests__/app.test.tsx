@@ -15,6 +15,7 @@ import App, {
 } from "../App";
 import type { ProtocolPacket, SessionDataPayload, SessionFilesResultPayload, SessionGitResultPayload } from "../protocol/types";
 import { sessionDataFromBase64 } from "../protocol/wire";
+import { DirectClient } from "../protocol/direct-client";
 import { clearBrowserState, loadBrowserState } from "../state/browser-state";
 import { MockDaemon } from "../test/mock-daemon";
 import { fallbackSessionDisplayName } from "../session-names";
@@ -522,6 +523,12 @@ describe("termui web 工作台", () => {
     expect(daemon.daemonStatusRequests).toBe(hiddenRequestCount);
 
     setDocumentVisibility("visible");
+    // 中文注释：后台恢复时不复用可能半开的 terminal WebSocket，而是按当前 session 重建。
+    await waitFor(
+      () =>
+        expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID, DEFAULT_SESSION_ID]),
+      { timeout: 2800 },
+    );
     await waitFor(() => expect(daemon.daemonStatusRequests).toBeGreaterThan(hiddenRequestCount));
   });
 
@@ -595,6 +602,29 @@ describe("termui web 工作台", () => {
     expect(screen.getByTestId("terminal-pane")).toBeInTheDocument();
     expect(daemon.activeConnectionCount()).toBe(1);
   }, 15_000);
+
+  it("已 attach 时旁路 RPC 关闭 socket 会走终端重连而不是卡在连接已关闭", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await screen.findByText(/termd-e2e-ready/);
+    await waitFor(() => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID]));
+
+    daemon.closeNextDaemonStatusRequests(1);
+    await waitFor(() => expect(daemon.activeConnectionCount()).toBe(0));
+
+    // 中文注释：状态轮询只是同一 WebSocket 上的旁路 segment；它发现 transport 关闭后
+    // 必须触发当前 terminal attach 重连，而不是把 workspace client 清空后停在错误态。
+    await waitFor(
+      () =>
+        expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID, DEFAULT_SESSION_ID]),
+      { timeout: 2800 },
+    );
+    expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
+    expect(screen.getByTestId("terminal-pane")).toBeInTheDocument();
+  });
 
   it("session.files 超时只影响文件 panel，不卸载终端", async () => {
     const user = userEvent.setup();
@@ -1395,6 +1425,65 @@ describe("termui web 工作台", () => {
     expect(stats.writes).toBeGreaterThan(0);
   });
 
+  it("切换 session 后最后一笔 terminal_frame output 不需要输入也会刷新", async () => {
+    const user = userEvent.setup();
+    const alphaSession = {
+      session_id: "00000000-0000-0000-0000-000000000471",
+      name: "alpha",
+      state: "running",
+      size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+    } as const;
+    const betaSession = {
+      session_id: "00000000-0000-0000-0000-000000000472",
+      name: "beta",
+      state: "running",
+      size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+    } as const;
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [alphaSession, betaSession],
+      attachOutput: "alpha-ready\n",
+    });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession("alpha");
+    await screen.findByText(/alpha-ready/);
+    (globalThis as { __TERMD_TEST_DEFER_XTERM_RENDER_UNTIL_WRITE_CALLBACK__?: boolean })
+      .__TERMD_TEST_DEFER_XTERM_RENDER_UNTIL_WRITE_CALLBACK__ = true;
+    (globalThis as { __TERMD_TEST_DEFER_XTERM_RENDER_READY_AFTER_WRITE_CALLBACK__?: boolean })
+      .__TERMD_TEST_DEFER_XTERM_RENDER_READY_AFTER_WRITE_CALLBACK__ = true;
+
+    fireEvent.click(screen.getByRole("button", { name: "Open beta" }));
+    await waitFor(() => expect(daemon.attachedSessions).toContain(betaSession.session_id));
+    await new Promise((resolve) => window.setTimeout(resolve, 120));
+    daemon.sessionDataMessages.length = 0;
+    const stats = resetXtermStats();
+
+    daemon.pushTerminalFrameBatch(betaSession.session_id, [
+      {
+        kind: "snapshot",
+        session_id: betaSession.session_id,
+        base_seq: 0,
+        size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+        data_base64: btoa("beta-snapshot\n"),
+      },
+      {
+        kind: "output",
+        session_id: betaSession.session_id,
+        terminal_seq: 1,
+        data_base64: btoa("beta-final-tail\n"),
+      },
+    ]);
+
+    await waitFor(() =>
+      expect(document.querySelector<HTMLElement>(".xterm")?.textContent ?? "").toContain("beta-final-tail"),
+    );
+    expect(stats.refreshes).toBeGreaterThanOrEqual(2);
+    expect(daemon.sessionDataMessages).toEqual([]);
+  });
+
   it("session 切换等待 reset 时不能丢弃最后目标 session 的输入", async () => {
     const user = userEvent.setup();
     const alphaSession = {
@@ -1602,7 +1691,8 @@ describe("termui web 工作台", () => {
     await new Promise((resolve) => window.setTimeout(resolve, 160));
 
     expect(stats.writes).toBeLessThan(80);
-    expect(stats.refreshes).toBeLessThanOrEqual(1);
+    // 队列真正 idle 后允许双帧 refresh 兜住 xterm 尾包绘制；持续输出期间仍不能逐条刷新。
+    expect(stats.refreshes).toBeLessThanOrEqual(2);
     expect(daemon.sessionCursorUpdates.length).toBeLessThan(20);
   });
 
@@ -1764,6 +1854,29 @@ describe("termui web 工作台", () => {
     await expect(filesPanel).toBeVisible();
     await user.click(screen.getByRole("button", { name: "Hide files panel" }));
     await expect(screen.queryByLabelText("session files")).toBeNull();
+  });
+
+  it("移动端标题栏向下拖动会刷新 session list 且不打开 session 面板", async () => {
+    setViewportWidth(390);
+    const user = userEvent.setup();
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await screen.findByText(/termd-e2e-ready/);
+
+    const sessionListRequests = () =>
+      daemon.receivedPackets.filter((packet) => packet.kind === "request" && packet.method === "session.list").length;
+    await new Promise((resolve) => window.setTimeout(resolve, 150));
+    const beforePull = sessionListRequests();
+    const title = screen.getByRole("button", { name: "Open session list from title" });
+
+    fireTouchPointer(title, "pointerdown", { pointerId: 7, clientX: 180, clientY: 18 });
+    fireTouchPointer(title, "pointermove", { pointerId: 7, clientX: 182, clientY: 82 });
+    fireTouchPointer(title, "pointerup", { pointerId: 7, clientX: 182, clientY: 82 });
+
+    await waitFor(() => expect(sessionListRequests()).toBeGreaterThan(beforePull), { timeout: 200 });
+    expect(screen.queryByLabelText("sessions panel")).toBeNull();
   });
 
   it("移动端软键盘打开时让快捷键栏贴近键盘并隐藏底部状态行", async () => {
@@ -2520,6 +2633,37 @@ describe("termui web 工作台", () => {
     expect(
       daemon.receivedPackets.filter((packet) => packet.kind === "stream_open" && packet.method === "terminal.attach"),
     ).toHaveLength(0);
+  });
+
+  it("新建 session 将 terminal.create 作为终端级请求处理", async () => {
+    const user = userEvent.setup();
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [],
+      attachOutput: "slow-create-ready\n",
+    });
+    const createSpy = vi.spyOn(DirectClient.prototype, "createSession");
+    render(<App />);
+
+    try {
+      await pairWithInvite(user, daemon);
+      await waitForWorkspaceSession("No session");
+      await user.click(screen.getByRole("button", { name: "New session" }));
+
+      await waitFor(() => expect(createSpy).toHaveBeenCalled());
+      // 中文注释：新建 shell 会建立 terminal stream，不能套用普通 5s RPC 预算。
+      // App 必须显式传入终端级超时；DirectClient 自身仍保留默认短超时供普通请求使用。
+      expect(createSpy.mock.calls.at(-1)?.[2]).toMatchObject({
+        timeoutMs: expect.any(Number),
+      });
+      expect(createSpy.mock.calls.at(-1)?.[2]?.timeoutMs).toBeGreaterThan(APP_CONNECTION_TIMEOUT_MS);
+      await waitFor(() => expect(visibleSessionNames()).toHaveLength(1));
+      await waitFor(() => expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull());
+      await screen.findByText(/slow-create-ready/);
+    } finally {
+      createSpy.mockRestore();
+    }
   });
 
   it("新建 session 后不输入内容也会刷新初始回显", async () => {

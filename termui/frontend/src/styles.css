@@ -1223,12 +1223,15 @@ label {
 }
 
 .toolbar-title-button {
+  --termd-mobile-title-pull: 0px;
+  position: relative;
   border: 0;
   min-height: 0;
   padding: 0;
   background: transparent;
   color: inherit;
   justify-content: flex-start;
+  touch-action: pan-y;
 }
 
 .toolbar-title-button:hover:not(:disabled) {
@@ -1239,6 +1242,43 @@ label {
 .toolbar-title-button:focus-visible {
   outline: 1px solid var(--color-accent);
   outline-offset: 4px;
+}
+
+.toolbar-title .toolbar-title-pull-indicator {
+  position: absolute;
+  top: -14px;
+  left: 50%;
+  display: grid;
+  width: 20px;
+  height: 20px;
+  place-items: center;
+  border: 1px solid var(--color-border-chip);
+  border-radius: 999px;
+  background: var(--color-surface-raised);
+  color: var(--color-text-muted);
+  opacity: 0;
+  pointer-events: none;
+  transform: translate(-50%, calc(var(--termd-mobile-title-pull) * 0.32)) rotate(calc(var(--termd-mobile-title-pull) * 3deg));
+  transition: opacity 120ms ease, color 120ms ease, border-color 120ms ease;
+}
+
+.toolbar-title-pulling .toolbar-title-pull-indicator {
+  opacity: 0.95;
+}
+
+.toolbar-title-pull-ready .toolbar-title-pull-indicator {
+  border-color: var(--color-accent);
+  color: var(--color-accent);
+}
+
+.toolbar-title-refreshing .toolbar-title-pull-indicator svg {
+  animation: toolbar-title-refresh-spin 720ms linear infinite;
+}
+
+@keyframes toolbar-title-refresh-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .toolbar-title span {

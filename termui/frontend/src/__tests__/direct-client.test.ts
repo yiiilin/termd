@@ -172,7 +172,7 @@ describe("DirectClient", () => {
     expect(daemon.outerWireText()).not.toContain("session_cursor");
   });
 
-  it("terminal.create 使用当前连接的请求超时", async () => {
+  it("terminal.create 默认使用当前连接超时，也支持终端级超时覆盖", async () => {
     await daemon.stop();
     daemon = await MockDaemon.start({
       token: "secret-token",
@@ -196,6 +196,20 @@ describe("DirectClient", () => {
     });
     shortClient.close();
 
+    const overrideClient = await connectDevice(device.device_id, 30);
+    await overrideClient.authenticate(device, {
+      server_id: accepted.server_id,
+      daemon_public_key: accepted.daemon_public_key,
+      url: daemon.url,
+      paired_at_ms: 1710000000000,
+    });
+    const overrideCreated = await overrideClient.createSession(
+      [],
+      { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+      { timeoutMs: 300 },
+    );
+    overrideClient.close();
+
     const longClient = await connectDevice(device.device_id, 300);
     await longClient.authenticate(device, {
       server_id: accepted.server_id,
@@ -206,8 +220,9 @@ describe("DirectClient", () => {
     const created = await longClient.createSession([], { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 });
     longClient.close();
 
+    expect(overrideCreated.session_id).toMatch(/^00000000-0000-0000-0000-/);
     expect(created.session_id).toMatch(/^00000000-0000-0000-0000-/);
-    expect(daemon.createdCommands).toEqual([[], []]);
+    expect(daemon.createdCommands).toEqual([[], [], []]);
   });
 
   it("连接认证长预算不会放大普通请求短超时", async () => {

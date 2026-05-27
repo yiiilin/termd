@@ -13,20 +13,24 @@ use termd_proto::{
     encode_binary_relay_mux_envelope,
 };
 use thiserror::Error;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Notify, mpsc, watch};
 use tokio::time::{Instant, timeout};
 use tracing::{debug, info, warn};
 
-// 中文注释：真实终端输出常见为几百字节的小 frame。容量如果只按 frame 数限制，
-// 几百 KB 输出就会把慢客户端队列塞满并反向卡住 daemon mux。实际保护应主要由
-// DATA_CHANNEL_BYTE_BUDGET 控制；这里给小 frame 足够槽位，让 8MB 字节预算成为主闸门。
+// 中文注释：relay 是 dumb pipe，不能长期替慢浏览器缓存终端流。
+// 预算必须足够小：慢 client 消费不过来时尽快关闭，让前端重连拿 snapshot；
+// 但也要容纳数个 64KB terminal frame 的正常公网突发，避免健康连接被过早关闭。
 const DATA_CHANNEL_CAPACITY: usize = 32 * 1024;
-const DATA_CHANNEL_BYTE_BUDGET: usize = 8 * 1024 * 1024;
+const DATA_CHANNEL_BYTE_BUDGET: usize = 512 * 1024;
 const CONTROL_CHANNEL_CAPACITY: usize = 256;
 // relay 只关闭当前 WebSocket transport；不会解释或终止 E2EE 内部的 daemon session。
 const ROUTE_PRELUDE_TIMEOUT: Duration = Duration::from_secs(5);
 const WEBSOCKET_SEND_DEADLINE: Duration = Duration::from_secs(10);
 const WEBSOCKET_PONG_DEADLINE: Duration = Duration::from_secs(10);
+#[cfg(not(test))]
+const WEBSOCKET_IDLE_PING_INTERVAL: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const WEBSOCKET_IDLE_PING_INTERVAL: Duration = Duration::from_millis(50);
 pub(crate) const WEBSOCKET_MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub(crate) const WEBSOCKET_MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
 type ConnectionId = u64;
@@ -163,6 +167,68 @@ impl FrameSender {
         }
     }
 
+    async fn send_data(&self, outbound: RelayOutbound) -> Result<(), RelayDataSendError> {
+        let queued_bytes = outbound.queued_data_bytes();
+        let outbound_label = outbound.label();
+        let frame_kind = outbound.frame_kind();
+        if self.data_budget.exceeds_limit(queued_bytes) {
+            warn!(
+                outbound = outbound_label,
+                frame_kind, queued_bytes, "relay data frame exceeds byte budget"
+            );
+            return Err(RelayDataSendError::BudgetFull(outbound));
+        }
+        let mut close_rx = self.subscribe_close();
+        let budget_reserved = tokio::select! {
+            biased;
+
+            _ = self.data.closed() => false,
+            reserved = self.data_budget.reserve_or_wait(queued_bytes, &mut close_rx) => reserved,
+        };
+        if !budget_reserved {
+            warn!(
+                outbound = outbound_label,
+                frame_kind, queued_bytes, "relay data queue closed while waiting for byte budget"
+            );
+            return Err(RelayDataSendError::Closed(outbound));
+        }
+
+        let permit = tokio::select! {
+            biased;
+
+            _ = close_rx.closed() => {
+                self.data_budget.release(queued_bytes);
+                warn!(
+                    outbound = outbound_label,
+                    frame_kind,
+                    queued_bytes,
+                    "relay data queue closed while waiting for channel capacity"
+                );
+                return Err(RelayDataSendError::Closed(outbound));
+            }
+            permit = self.data.reserve() => permit,
+        };
+
+        match permit {
+            Ok(permit) => {
+                permit.send(outbound);
+                debug!(
+                    outbound = outbound_label,
+                    frame_kind, queued_bytes, "relay data queue accepted frame"
+                );
+                Ok(())
+            }
+            Err(_closed) => {
+                self.data_budget.release(queued_bytes);
+                warn!(
+                    outbound = outbound_label,
+                    frame_kind, queued_bytes, "relay data queue closed"
+                );
+                Err(RelayDataSendError::Closed(outbound))
+            }
+        }
+    }
+
     #[cfg(test)]
     fn try_send(
         &self,
@@ -233,6 +299,7 @@ enum RelayDataSendError {
 struct DataQueueByteBudget {
     limit: usize,
     queued: AtomicUsize,
+    notify: Notify,
 }
 
 impl DataQueueByteBudget {
@@ -240,6 +307,7 @@ impl DataQueueByteBudget {
         Self {
             limit,
             queued: AtomicUsize::new(0),
+            notify: Notify::new(),
         }
     }
 
@@ -279,6 +347,35 @@ impl DataQueueByteBudget {
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 Some(current.saturating_sub(bytes))
             });
+        self.notify.notify_waiters();
+    }
+
+    fn exceeds_limit(&self, bytes: usize) -> bool {
+        bytes > self.limit
+    }
+
+    async fn reserve_or_wait(&self, bytes: usize, close_rx: &mut EndpointCloseReceiver) -> bool {
+        if bytes == 0 {
+            return true;
+        }
+        debug_assert!(!self.exceeds_limit(bytes));
+        loop {
+            // 中文注释：必须先注册/enable 通知，再检查容量。
+            // 如果先 try_reserve 再 notified().await，release 可能刚好夹在两者之间，
+            // notify_waiters 不会为未来 waiter 保留许可，等待方就会永久睡眠。
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.try_reserve(bytes) {
+                return true;
+            }
+            tokio::select! {
+                biased;
+
+                _ = close_rx.closed() => return false,
+                _ = &mut notified => {}
+            }
+        }
     }
 }
 
@@ -625,6 +722,10 @@ struct RelayRoom {
 }
 
 impl RelayRoom {
+    fn is_empty(&self) -> bool {
+        self.daemon_mux.is_none() && self.clients.is_empty()
+    }
+
     fn close_clients(&mut self) {
         for (_, client) in self.clients.drain() {
             // daemon mux 已不可用时，client 必须尽快收到 close，避免继续等待业务响应直到超时。
@@ -782,6 +883,12 @@ enum RoutePreludeError {
 }
 
 impl RelayRegistry {
+    fn remove_room_if_empty(rooms: &mut HashMap<ServerId, RelayRoom>, server_id: ServerId) {
+        if rooms.get(&server_id).is_some_and(RelayRoom::is_empty) {
+            rooms.remove(&server_id);
+        }
+    }
+
     fn room_count(&self) -> usize {
         self.rooms
             .lock()
@@ -887,13 +994,20 @@ impl RelayRegistry {
                 }
             }
             ConnectionRole::Client => {
-                let removed = room.clients.remove(&registration.id).is_some();
+                let removed_client = room.clients.remove(&registration.id);
+                let removed = removed_client.is_some();
                 debug!(
                     server_id = %registration.server_id.0,
                     connection_id = registration.id,
                     remaining_clients = room.clients.len(),
                     "relay unregistering client"
                 );
+                if let Some(client) = removed_client {
+                    // 中文注释：client 从 room 移除时，必须同步关闭它自己的 endpoint 信号。
+                    // daemon mux 读循环可能正 await 这个 client 的 data 队列容量；只从
+                    // HashMap 删除不会唤醒那个等待，最终会卡住 daemon->relay 主干读。
+                    client.sender.request_close();
+                }
                 // 中文注释：只有已经成功送出 ClientConnected 的 client 才需要通知 daemon。
                 // 如果通知送不进 daemon mux control 队列，说明 mux 生命周期状态已经不可靠，
                 // 直接重置 mux，让 daemon 按主干断线清理所有 relay client context。
@@ -903,9 +1017,7 @@ impl RelayRegistry {
             }
         }
 
-        if room.daemon_mux.is_none() && room.clients.is_empty() {
-            rooms.remove(&registration.server_id);
-        }
+        Self::remove_room_if_empty(&mut rooms, registration.server_id);
     }
 
     fn has_client(&self, server_id: ServerId, client_id: RelayClientId) -> bool {
@@ -978,10 +1090,13 @@ impl RelayRegistry {
 
         let frame_kind = frame.kind();
         let frame_len = frame.len();
-        match daemon_mux_sender.try_send_data(RelayOutbound::MuxClientFrame {
-            client_id: RelayClientId(registration.id),
-            frame,
-        }) {
+        match daemon_mux_sender
+            .send_data(RelayOutbound::MuxClientFrame {
+                client_id: RelayClientId(registration.id),
+                frame,
+            })
+            .await
+        {
             Ok(()) => {
                 debug!(
                     server_id = %registration.server_id.0,
@@ -1052,6 +1167,7 @@ impl RelayRegistry {
                         room.clear_daemon_mux_and_dependents();
                     }
                 }
+                Self::remove_room_if_empty(&mut rooms, registration.server_id);
                 ForwardReport {
                     attempted: 1,
                     delivered: 0,
@@ -1167,6 +1283,7 @@ impl RelayRegistry {
                         {
                             room.clear_daemon_mux_and_dependents();
                         }
+                        Self::remove_room_if_empty(&mut rooms, registration.server_id);
                         return ForwardReport {
                             attempted: 1,
                             delivered: 0,
@@ -1268,15 +1385,14 @@ impl RelayRegistry {
                     dropped: 0,
                 }
             }
-            Err(error) => {
+            Err(RelayDataSendError::Closed(_)) => {
                 warn!(
                     server_id = %registration.server_id.0,
                     connection_id = client_id.0,
-                    ?error,
-                    "dropping slow relay mux client"
+                    "dropping closed relay mux client"
                 );
                 let Ok(mut rooms) = self.rooms.lock() else {
-                    warn!("relay registry mutex poisoned during slow client cleanup");
+                    warn!("relay registry mutex poisoned during closed client cleanup");
                     return ForwardReport {
                         attempted: 1,
                         delivered: 0,
@@ -1288,6 +1404,34 @@ impl RelayRegistry {
                     // 否则它还能继续把输入帧塞向 daemon mux，形成“已下线 client 占用主干”的假活连接。
                     room.close_client_and_notify_daemon_if_known(client_id.0);
                 }
+                Self::remove_room_if_empty(&mut rooms, registration.server_id);
+                ForwardReport {
+                    attempted: 1,
+                    delivered: 0,
+                    dropped: 1,
+                }
+            }
+            Err(RelayDataSendError::BudgetFull(_)) => {
+                warn!(
+                    server_id = %registration.server_id.0,
+                    daemon_connection_id = registration.id,
+                    client_connection_id = client_id.0,
+                    "closing slow relay client because its data queue is full"
+                );
+                let Ok(mut rooms) = self.rooms.lock() else {
+                    warn!("relay registry mutex poisoned during slow client cleanup");
+                    return ForwardReport {
+                        attempted: 1,
+                        delivered: 0,
+                        dropped: 1,
+                    };
+                };
+                if let Some(room) = rooms.get_mut(&registration.server_id) {
+                    // 中文注释：daemon mux 的读循环绝不能等待某个 browser client。
+                    // client 自己的 WebSocket 如果消费不过来，就关闭它，让前端重连后拿 snapshot。
+                    room.close_client_and_notify_daemon_if_known(client_id.0);
+                }
+                Self::remove_room_if_empty(&mut rooms, registration.server_id);
                 ForwardReport {
                     attempted: 1,
                     delivered: 0,
@@ -1473,6 +1617,9 @@ pub async fn handle_socket(mut socket: WebSocket, state: RelayState) {
                     websocket_message_kind(&inbound),
                     websocket_message_bytes(&inbound),
                 );
+                // 中文注释：入站帧只作为当前连接的统计信号。
+                // relay 不能因为 control pong 排在大量 stdout 后面就主动判 daemon 离线；
+                // daemon 是否在线只由 WebSocket close/read/write error 暴露。
                 debug!(
                     server_id = %server_id.0,
                     ?role,
@@ -1576,6 +1723,10 @@ fn websocket_receive_failed_is_noisy_client_disconnect(
         && error_text.contains("Connection reset without closing handshake")
 }
 
+fn websocket_idle_ping_due(now: Instant, last_write_at: Instant) -> bool {
+    now.duration_since(last_write_at) >= WEBSOCKET_IDLE_PING_INTERVAL
+}
+
 async fn send_relay_outbound(
     state: &RelayState,
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
@@ -1590,10 +1741,9 @@ async fn send_relay_outbound(
             send_relay_opaque_frame(sender, server_id, role, connection_id, frame, channel).await
         }
         PreparedRelayOutbound::Pong(payload) => {
-            match send_message_with_deadline(
+            match send_relay_established_message(
                 sender,
                 Message::Pong(payload),
-                WEBSOCKET_PONG_DEADLINE,
                 "relay websocket pong",
             )
             .await
@@ -1669,6 +1819,13 @@ async fn run_relay_websocket_writer(
     outcome_tx: mpsc::UnboundedSender<RelayWriterOutcome>,
 ) {
     let mut prefer_data_once = false;
+    let mut last_write_at = Instant::now();
+    let mut idle_ping = tokio::time::interval_at(
+        Instant::now() + WEBSOCKET_IDLE_PING_INTERVAL,
+        WEBSOCKET_IDLE_PING_INTERVAL,
+    );
+    idle_ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut idle_ping_nonce = 0_u64;
     loop {
         if prefer_data_once {
             tokio::select! {
@@ -1715,6 +1872,7 @@ async fn run_relay_websocket_writer(
                     {
                         break;
                     }
+                    last_write_at = Instant::now();
                 }
                 outbound = control_rx.recv() => {
                     let Some(outbound) = outbound else {
@@ -1744,6 +1902,24 @@ async fn run_relay_websocket_writer(
                     .await
                     {
                         break;
+                    }
+                    last_write_at = Instant::now();
+                }
+                _ = idle_ping.tick() => {
+                    if websocket_idle_ping_due(Instant::now(), last_write_at) {
+                        if !write_relay_idle_ping_and_report(
+                            &mut sender,
+                            server_id,
+                            role,
+                            connection_id,
+                            &mut idle_ping_nonce,
+                            &outcome_tx,
+                        )
+                        .await
+                        {
+                            break;
+                        }
+                        last_write_at = Instant::now();
                     }
                 }
             }
@@ -1790,6 +1966,7 @@ async fn run_relay_websocket_writer(
                 {
                     break;
                 }
+                last_write_at = Instant::now();
             }
             outbound = data_rx.recv() => {
                 prefer_data_once = false;
@@ -1824,6 +2001,24 @@ async fn run_relay_websocket_writer(
                 {
                     break;
                 }
+                last_write_at = Instant::now();
+            }
+            _ = idle_ping.tick() => {
+                if websocket_idle_ping_due(Instant::now(), last_write_at) {
+                    if !write_relay_idle_ping_and_report(
+                        &mut sender,
+                        server_id,
+                        role,
+                        connection_id,
+                        &mut idle_ping_nonce,
+                        &outcome_tx,
+                    )
+                    .await
+                    {
+                        break;
+                    }
+                    last_write_at = Instant::now();
+                }
             }
         }
     }
@@ -1843,6 +2038,49 @@ async fn write_relay_close_and_report(
     )
     .await;
     let _ = outcome_tx.send(RelayWriterOutcome::Closed);
+}
+
+async fn write_relay_idle_ping_and_report(
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    server_id: ServerId,
+    role: ConnectionRole,
+    connection_id: ConnectionId,
+    idle_ping_nonce: &mut u64,
+    outcome_tx: &mpsc::UnboundedSender<RelayWriterOutcome>,
+) -> bool {
+    *idle_ping_nonce = idle_ping_nonce.wrapping_add(1);
+    let payload = idle_ping_nonce.to_be_bytes().to_vec();
+    // 中文注释：这是 WebSocket 控制帧保活，不进入 E2EE 业务协议。
+    // relay 不等待业务 ACK，也不解析终端内容；ping 只用于让代理/NAT 看见连接活动。
+    // 是否离线只能由底层 WebSocket read/write close/error 暴露，不能由 relay 自己计数裁定。
+    match send_message_with_deadline(
+        sender,
+        Message::Ping(payload),
+        WEBSOCKET_SEND_DEADLINE,
+        "relay websocket idle ping",
+    )
+    .await
+    {
+        Ok(()) => {
+            debug!(
+                server_id = %server_id.0,
+                ?role,
+                connection_id,
+                "relay websocket idle ping sent"
+            );
+            true
+        }
+        Err(()) => {
+            warn!(
+                server_id = %server_id.0,
+                ?role,
+                connection_id,
+                "relay websocket idle ping failed"
+            );
+            let _ = outcome_tx.send(RelayWriterOutcome::Failed);
+            false
+        }
+    }
 }
 
 async fn write_relay_outbound_and_report(
@@ -1905,14 +2143,9 @@ async fn send_relay_opaque_frame(
     let frame_kind = frame.kind();
     let frame_len = frame.len();
     let started_at = Instant::now();
-    if send_message_with_deadline(
-        sender,
-        frame.into(),
-        WEBSOCKET_SEND_DEADLINE,
-        "relay websocket outbound frame",
-    )
-    .await
-    .is_err()
+    if send_relay_established_message(sender, frame.into(), "relay websocket outbound frame")
+        .await
+        .is_err()
     {
         warn!(
             server_id = %server_id.0,
@@ -1939,6 +2172,18 @@ async fn send_relay_opaque_frame(
         );
     }
     RelayWriteResult::Sent
+}
+
+async fn send_relay_established_message(
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    message: Message,
+    context: &'static str,
+) -> Result<(), ()> {
+    // relay 建连之后就是 dumb pipe：慢网络只应该形成 WebSocket/TCP 背压，
+    // 不能由 relay 自己用短发送超时把仍然打开的连接判死。
+    sender.send(message).await.map_err(|error| {
+        warn!(%error, context = context, "relay websocket send failed");
+    })
 }
 
 async fn read_route_prelude(socket: &mut WebSocket) -> Result<RoutePrelude, RoutePreludeError> {
@@ -2406,7 +2651,7 @@ mod tests {
 
     #[test]
     fn relay_data_channel_capacity_does_not_limit_small_terminal_frames_before_byte_budget() {
-        // 中文注释：浏览器离线或慢消费时，小 terminal frame 应主要受 8MB 字节预算保护。
+        // 中文注释：浏览器离线或慢消费时，小 terminal frame 应主要受字节预算保护。
         // 如果 frame 槽位太小，几百 KB 的输出就会反向卡住 daemon mux。
         assert!(DATA_CHANNEL_CAPACITY >= DATA_CHANNEL_BYTE_BUDGET / 512);
     }
@@ -2417,11 +2662,80 @@ mod tests {
     }
 
     #[test]
-    fn relay_established_transport_has_no_internal_heartbeat_or_idle_timeout() {
-        // 中文注释：完成 route prelude 后，relay 只作为 dumb pipe 转发。
-        // 是否断开由 WebSocket close/读写错误决定，不再由 relay 自己的心跳或空闲计时器裁决。
+    fn relay_established_transport_uses_only_websocket_idle_ping() {
+        // 中文注释：完成 route prelude 后，relay 仍只作为 dumb pipe 转发业务。
+        // idle ping 是 WebSocket 控制帧，只保活代理/NAT，不进入 E2EE 业务协议。
+        // relay 不维护 ping miss 计数；daemon 是否在线只由 WebSocket close/read/write error 决定。
         assert_eq!(WEBSOCKET_SEND_DEADLINE, Duration::from_secs(10));
         assert_eq!(WEBSOCKET_PONG_DEADLINE, Duration::from_secs(10));
+        assert_eq!(WEBSOCKET_IDLE_PING_INTERVAL, Duration::from_millis(50));
+        let now = Instant::now();
+        assert!(!websocket_idle_ping_due(
+            now + WEBSOCKET_IDLE_PING_INTERVAL - Duration::from_millis(1),
+            now
+        ));
+        assert!(websocket_idle_ping_due(
+            now + WEBSOCKET_IDLE_PING_INTERVAL,
+            now
+        ));
+    }
+
+    #[tokio::test]
+    async fn daemon_mux_is_not_closed_when_idle_pong_is_delayed_behind_data() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router(RelayState::default(), false))
+                .await
+                .unwrap();
+        });
+        let server_id = server_id(92);
+        let url = format!("ws://{addr}/ws");
+        let (mut daemon_mux, _daemon_response) = connect_async(url.clone()).await.unwrap();
+        register_test_route(&mut daemon_mux, server_id, RouteRole::DaemonMux).await;
+        let (mut client, _client_response) = connect_async(url).await.unwrap();
+        register_test_route(&mut client, server_id, RouteRole::Client).await;
+
+        // 中文注释：这里刻意不读取 daemon_mux，因此 relay 发出的 idle ping 不会收到 pong。
+        // relay 仍必须保持 dumb-pipe 语义，不能因为 pong 延迟就把 daemon 主干判死。
+        tokio::time::sleep(WEBSOCKET_IDLE_PING_INTERVAL * 45).await;
+
+        let frame = RelayMuxEnvelope::DaemonFrame {
+            client_id: RelayClientId(2),
+            frame: RelayOpaqueFrame::Text {
+                data: "daemon-still-online".to_owned(),
+            },
+        };
+        daemon_mux
+            .send(ClientMessage::Binary(
+                encode_binary_relay_mux_envelope(&frame).unwrap(),
+            ))
+            .await
+            .expect("daemon mux should still be writable after delayed pongs");
+
+        let received = timeout(Duration::from_secs(1), async {
+            loop {
+                let message = client
+                    .next()
+                    .await
+                    .expect("client websocket should stay open")
+                    .expect("client frame should be valid");
+                if matches!(message, ClientMessage::Ping(_)) {
+                    continue;
+                }
+                break message;
+            }
+        })
+        .await
+        .expect("relay must still forward daemon frames after delayed pongs");
+        assert_eq!(
+            received,
+            ClientMessage::Text("daemon-still-online".to_owned())
+        );
+
+        daemon_mux.close(None).await.unwrap();
+        client.close(None).await.unwrap();
+        server.abort();
     }
 
     #[test]
@@ -2496,7 +2810,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relay_client_socket_does_not_receive_relay_initiated_ping() {
+    async fn relay_client_socket_receives_transport_idle_ping() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -2511,12 +2825,11 @@ mod tests {
         let (mut client, _client_response) = connect_async(url).await.unwrap();
         register_test_route(&mut client, server_id, RouteRole::Client).await;
 
-        match timeout(Duration::from_millis(200), client.next()).await {
-            Err(_) => {}
-            Ok(Some(Ok(ClientMessage::Ping(_)))) => {
-                panic!("relay must not ping browser clients; background tabs can delay pong")
+        match timeout(Duration::from_secs(1), client.next()).await {
+            Ok(Some(Ok(ClientMessage::Ping(payload)))) => {
+                assert_eq!(payload.len(), std::mem::size_of::<u64>());
             }
-            Ok(other) => panic!("expected no relay-initiated frame, got {other:?}"),
+            other => panic!("expected relay transport idle ping, got {other:?}"),
         }
 
         daemon_mux.close(None).await.unwrap();
@@ -2545,15 +2858,17 @@ mod tests {
         register_test_route(&mut fresh_client, server_id, RouteRole::Client).await;
 
         let noisy_payload = vec![b'x'; WEBSOCKET_MAX_FRAME_SIZE / 2];
-        for _ in 0..384 {
-            if noisy_client
-                .send(ClientMessage::Binary(noisy_payload.clone()))
-                .await
-                .is_err()
-            {
-                break;
+        let noisy_sender = tokio::spawn(async move {
+            for _ in 0..384 {
+                if noisy_client
+                    .send(ClientMessage::Binary(noisy_payload.clone()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
             }
-        }
+        });
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         // 连接 id 在这个独立 RelayState 内按注册顺序递增：
@@ -2571,15 +2886,28 @@ mod tests {
             .await
             .unwrap();
 
-        let received = timeout(Duration::from_millis(500), fresh_client.next())
-            .await
-            .expect("daemon->client frame must not wait behind client->daemon backpressure")
-            .expect("fresh client websocket should stay open")
-            .expect("fresh client frame should be valid");
+        let received = timeout(Duration::from_millis(500), async {
+            loop {
+                let message = fresh_client
+                    .next()
+                    .await
+                    .expect("fresh client websocket should stay open")
+                    .expect("fresh client frame should be valid");
+                if matches!(message, ClientMessage::Ping(_)) {
+                    // 中文注释：relay 的 transport idle ping 是控制帧；这里测试业务转发，
+                    // 需要跳过它，确保真正的 daemon frame 没被旧 client 背压挡住。
+                    continue;
+                }
+                break message;
+            }
+        })
+        .await
+        .expect("daemon->client frame must not wait behind client->daemon backpressure");
         assert_eq!(
             received,
             ClientMessage::Text("fresh-client-ready".to_owned())
         );
+        noisy_sender.abort();
         server.abort();
     }
 
@@ -2913,13 +3241,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn slow_client_data_queue_is_not_awaited_and_closes_client() {
+    async fn slow_client_data_queue_is_closed_without_blocking_daemon_mux_forward() {
         let state = RelayState::default();
         let server_id = server_id(1);
         let (mux_tx, mut mux_rx) = channel();
-        let (client_tx, mut client_rx) = channel_with_data_capacity(1);
+        let (client_tx, _client_rx) = channel_with_data_capacity(1);
         let mut client_close_rx = client_tx.subscribe_close();
 
+        // 中文注释：模拟浏览器连接还没 close、但已经不消费 WebSocket 输出。
+        // 这种旧 client 不能反压 daemon mux，否则 mux 读循环会连 keepalive 都读不到。
         client_tx
             .try_send(RelayOutbound::Frame(OpaqueFrame::Text("queued".to_owned())))
             .unwrap();
@@ -2943,12 +3273,13 @@ mod tests {
                 data: "response".to_owned(),
             },
         });
+
         let report = timeout(
             Duration::from_millis(50),
             state.forward_from(&mux, response),
         )
         .await
-        .expect("relay must not await slow client data queue");
+        .expect("慢 client 不能卡住 daemon mux 转发");
         assert_eq!(
             report,
             ForwardReport {
@@ -2960,22 +3291,15 @@ mod tests {
         assert!(!state.has_client(server_id, RelayClientId(client.id)));
         timeout(Duration::from_millis(50), client_close_rx.closed())
             .await
-            .expect("slow client should be closed through its lifecycle signal");
-        assert_eq!(
-            decode_mux(mux_rx.try_recv().unwrap()),
-            RelayMuxEnvelope::ClientDisconnected {
-                client_id: RelayClientId(client.id)
-            }
-        );
-        assert_eq!(client_rx.try_recv().unwrap(), RelayOutbound::Close);
+            .expect("慢 client 必须被关闭，让浏览器走重连并重新拿 snapshot");
     }
 
     #[tokio::test]
-    async fn known_slow_client_disconnect_closes_daemon_mux_when_lifecycle_queue_is_full() {
+    async fn slow_client_close_resets_daemon_mux_when_lifecycle_queue_is_full() {
         let state = RelayState::default();
         let server_id = server_id(1);
         let (mux_tx, mut mux_rx) = channel_with_control_capacity(1);
-        let (client_tx, mut client_rx) = channel_with_data_capacity(1);
+        let (client_tx, _client_rx) = channel_with_data_capacity(1);
         let (other_client_tx, _other_client_rx) = channel();
         let mut mux_close_rx = mux_tx.subscribe_close();
         let mut client_close_rx = client_tx.subscribe_close();
@@ -3023,7 +3347,7 @@ mod tests {
             state.forward_from(&mux, response),
         )
         .await
-        .expect("relay must not await slow client before lifecycle cleanup");
+        .expect("慢 client 关闭路径不能等待 data 队列释放");
         assert_eq!(
             report,
             ForwardReport {
@@ -3032,21 +3356,22 @@ mod tests {
                 dropped: 1
             }
         );
-        assert!(!state.has_client(server_id, RelayClientId(client.id)));
-        assert!(!state.has_client(server_id, RelayClientId(other_client.id)));
+        // 中文注释：daemon 已经知道这个 client，但断开通知塞不进 control 队列。
+        // 此时继续保留 mux 会让 daemon 与 relay 的 client 生命周期不一致，所以复用既有规则重置 mux。
         timeout(Duration::from_millis(50), mux_close_rx.closed())
             .await
-            .expect(
-                "failed lifecycle notify means daemon mux state is inconsistent and must close",
-            );
+            .expect("full lifecycle queue should reset daemon mux");
         timeout(Duration::from_millis(50), client_close_rx.closed())
             .await
-            .expect("slow known client should be closed");
+            .expect("slow client should be closed");
         timeout(Duration::from_millis(50), other_close_rx.closed())
             .await
-            .expect("known sibling client should close when daemon mux is reset");
+            .expect("daemon mux reset should close sibling clients");
+        assert!(!state.has_client(server_id, RelayClientId(client.id)));
+        assert!(!state.has_client(server_id, RelayClientId(other_client.id)));
+        assert_eq!(state.room_count(), 0);
         assert_eq!(mux_rx.try_recv().unwrap(), RelayOutbound::Pong(Vec::new()));
-        assert_eq!(client_rx.try_recv().unwrap(), RelayOutbound::Close);
+        assert_eq!(mux_rx.try_recv().unwrap_err(), TryRecvError::Empty);
     }
 
     #[test]
@@ -3221,9 +3546,11 @@ mod tests {
     #[test]
     fn data_queue_rejects_large_frames_by_byte_budget_before_frame_capacity() {
         let (sender, mut receiver) = channel_with_data_capacity(DATA_CHANNEL_CAPACITY);
-        let frame = RelayOutbound::Frame(OpaqueFrame::Binary(vec![7; WEBSOCKET_MAX_FRAME_SIZE]));
+        let frame_size = 16 * 1024;
+        let frame = RelayOutbound::Frame(OpaqueFrame::Binary(vec![7; frame_size]));
+        let accepted_before_budget_full = DATA_CHANNEL_BYTE_BUDGET / frame_size;
 
-        for _ in 0..8 {
+        for _ in 0..accepted_before_budget_full {
             sender.try_send(frame.clone()).unwrap();
         }
 
@@ -3300,7 +3627,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn full_daemon_mux_data_queue_is_not_awaited_and_closes_only_source_client() {
+    async fn full_daemon_mux_data_queue_backpressures_without_closing_source_client() {
         let state = RelayState::default();
         let server_id = server_id(1);
         let (mux_tx, mut mux_rx) = channel_with_data_capacity(1);
@@ -3335,40 +3662,52 @@ mod tests {
         let mut forward =
             Box::pin(state.forward_from(&client, OpaqueFrame::Text("overflow".to_owned())));
 
-        let report = timeout(Duration::from_millis(50), &mut forward)
-            .await
-            .expect("relay client frame must not await daemon mux data queue capacity");
-        assert_eq!(
-            report,
-            ForwardReport {
-                attempted: 1,
-                delivered: 0,
-                dropped: 1
-            }
+        assert!(
+            timeout(Duration::from_millis(30), &mut forward)
+                .await
+                .is_err(),
+            "daemon mux data 队列满时应背压源 client 的读循环，而不是关闭它"
         );
-        timeout(Duration::from_millis(50), client_close_rx.closed())
-            .await
-            .expect("client that hit daemon mux backpressure should close");
+        assert!(state.has_client(server_id, RelayClientId(client.id)));
+        assert!(state.has_client(server_id, RelayClientId(other_client.id)));
+        assert!(
+            timeout(Duration::from_millis(30), client_close_rx.closed())
+                .await
+                .is_err()
+        );
         assert!(
             timeout(Duration::from_millis(30), other_close_rx.closed())
                 .await
                 .is_err()
         );
+        assert_eq!(client_rx.try_recv().unwrap_err(), TryRecvError::Empty);
         assert_eq!(other_client_rx.try_recv().unwrap_err(), TryRecvError::Empty);
-        assert_eq!(client_rx.try_recv().unwrap(), RelayOutbound::Close);
-        assert!(!state.has_client(server_id, RelayClientId(client.id)));
-        assert!(state.has_client(server_id, RelayClientId(other_client.id)));
-        assert_eq!(
-            decode_mux(mux_rx.try_recv().unwrap()),
-            RelayMuxEnvelope::ClientDisconnected {
-                client_id: RelayClientId(client.id)
-            }
-        );
         assert_eq!(
             mux_rx.try_recv().unwrap(),
             RelayOutbound::MuxClientFrame {
                 client_id: RelayClientId(999),
                 frame: OpaqueFrame::Text("queued-data".to_owned())
+            }
+        );
+
+        let report = timeout(Duration::from_millis(50), &mut forward)
+            .await
+            .expect("daemon mux data 队列释放后 client 输入应继续送达");
+        assert_eq!(
+            report,
+            ForwardReport {
+                attempted: 1,
+                delivered: 1,
+                dropped: 0
+            }
+        );
+        assert!(state.has_client(server_id, RelayClientId(client.id)));
+        assert!(state.has_client(server_id, RelayClientId(other_client.id)));
+        assert_eq!(
+            mux_rx.try_recv().unwrap(),
+            RelayOutbound::MuxClientFrame {
+                client_id: RelayClientId(client.id),
+                frame: OpaqueFrame::Text("overflow".to_owned())
             }
         );
     }

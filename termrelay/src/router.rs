@@ -253,11 +253,15 @@ mod tests {
             .await
             .unwrap();
 
-        let received = timeout(Duration::from_millis(300), target_client.next())
-            .await
-            .expect("daemon mux reader must keep forwarding daemon frames while writer is backpressured")
-            .expect("target client websocket should stay open")
-            .expect("target client frame should be valid");
+        let received = timeout(
+            Duration::from_millis(300),
+            next_data_frame(&mut target_client),
+        )
+        .await
+        .expect(
+            "daemon mux reader must keep forwarding daemon frames while writer is backpressured",
+        )
+        .expect("target client websocket should produce a data frame");
         assert_eq!(
             received,
             ClientMessage::Text("daemon-response-while-backpressured".to_owned())
@@ -298,10 +302,31 @@ mod tests {
     }
 
     async fn next_mux(socket: &mut TestSocket) -> RelayMuxEnvelope {
-        match socket.next().await.unwrap().unwrap() {
-            ClientMessage::Text(text) => serde_json::from_str(&text).unwrap(),
-            ClientMessage::Binary(bytes) => decode_binary_relay_mux_envelope(&bytes).unwrap(),
-            other => panic!("expected mux frame, got {other:?}"),
+        loop {
+            match socket.next().await.unwrap().unwrap() {
+                ClientMessage::Text(text) => return serde_json::from_str(&text).unwrap(),
+                ClientMessage::Binary(bytes) => {
+                    return decode_binary_relay_mux_envelope(&bytes).unwrap();
+                }
+                ClientMessage::Ping(_) | ClientMessage::Pong(_) => {
+                    // 中文注释：relay 的 idle ping 是 WebSocket 控制帧。
+                    // 这些帧不能影响 mux 业务断言，测试只等待下一笔业务 frame。
+                    continue;
+                }
+                other => panic!("expected mux frame, got {other:?}"),
+            }
+        }
+    }
+
+    async fn next_data_frame(socket: &mut TestSocket) -> Option<ClientMessage> {
+        loop {
+            match socket.next().await?.unwrap() {
+                ClientMessage::Ping(_) | ClientMessage::Pong(_) => {
+                    // 中文注释：控制帧由 transport 使用，不是 relay 业务输出。
+                    continue;
+                }
+                frame => return Some(frame),
+            }
         }
     }
 }

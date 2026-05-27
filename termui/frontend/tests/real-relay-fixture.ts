@@ -485,9 +485,11 @@ function httpRequest(url: string, options: { method: "GET" | "POST" }): Promise<
 
 function spawnCargo(args: string[], label: string, cwd: string): StartedProcess {
   const log: string[] = [];
+  // 中文注释：默认保持测试日志简短；排查真实 relay 压力问题时允许单次命令提高 Rust 日志级别。
+  const rustLog = process.env.REAL_RELAY_RUST_LOG ?? "termd=info,termrelay=info";
   const child = spawn("cargo", args, {
     cwd,
-    env: { ...process.env, RUST_LOG: "termd=info,termrelay=info" },
+    env: { ...process.env, RUST_LOG: rustLog },
   });
 
   child.stdout.on("data", (chunk) => log.push(`[${label}:stdout] ${chunk.toString()}`));

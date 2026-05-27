@@ -31,10 +31,11 @@ use termd_proto::{
     PROTOCOL_PACKET_VERSION, PacketErrorPayload, PacketKind, PacketRequestId, PacketStreamId,
     PairAcceptPayload, PairRequestPayload, PairingToken, PingPayload, PongPayload, ProtocolPacket,
     ProtocolVersion, PublicKey, RouteHelloPayload, RouteReadyPayload, RouteRole, ServerId,
-    SessionAttachPayload, SessionAttachedPayload, SessionCreatePayload, SessionCreatedPayload,
-    SessionDataPayload, SessionId, SessionListPayload, SessionListResultPayload,
-    SessionResizePayload, SessionResizedPayload, TerminalFramePayload, TerminalSize,
-    binary_protocol_packet, decode_binary_protocol_packet, encode_binary_protocol_packet,
+    SessionAttachPayload, SessionAttachedPayload, SessionClosePayload, SessionClosedPayload,
+    SessionCreatePayload, SessionCreatedPayload, SessionDataPayload, SessionId, SessionListPayload,
+    SessionListResultPayload, SessionResizePayload, SessionResizedPayload, TerminalFramePayload,
+    TerminalSize, binary_protocol_packet, decode_binary_protocol_packet,
+    encode_binary_protocol_packet,
 };
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
@@ -57,6 +58,7 @@ const METHOD_AUTH: &str = "auth";
 const METHOD_AUTH_CHALLENGE: &str = "auth.challenge";
 const METHOD_SESSION_CREATE: &str = "session.create";
 const METHOD_SESSION_LIST: &str = "session.list";
+const METHOD_SESSION_CLOSE: &str = "session.close";
 const METHOD_SESSION_RESIZE: &str = "session.resize";
 const METHOD_CONTROL_REQUEST: &str = "control.request";
 const METHOD_TERMINAL_ATTACH: &str = "terminal.attach";
@@ -372,6 +374,13 @@ impl DirectClient {
 
     pub async fn list_sessions(&mut self) -> Result<SessionListResultPayload> {
         self.request_packet(METHOD_SESSION_LIST, SessionListPayload {})
+            .await
+    }
+
+    pub async fn close_session(&mut self, session_id: SessionId) -> Result<SessionClosedPayload> {
+        // 中文注释：关闭 session 必须走 daemon 的协议路径，由 daemon 终止 supervisor
+        // 并同步清理 SQLite 状态；不能只往 PTY 写 exit 之类的 shell 命令。
+        self.request_packet(METHOD_SESSION_CLOSE, SessionClosePayload { session_id })
             .await
     }
 

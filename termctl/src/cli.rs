@@ -39,6 +39,8 @@ pub enum Command {
     New(NewArgs),
     /// attach 到已有 session，并桥接 stdin/stdout。
     Attach(SessionUrlArgs),
+    /// 关闭持久 session，并让 daemon 终止对应 PTY/supervisor。
+    Close(SessionUrlArgs),
     /// 确认当前设备已作为 shared-control operator attach 到指定 session。
     Control(SessionUrlArgs),
     /// 调整指定 session 的终端尺寸。
@@ -96,6 +98,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Pair(args) => pair(args, state_path).await,
         Command::New(args) => new_session(args, state_path).await,
         Command::Attach(args) => attach(args, state_path).await,
+        Command::Close(args) => close(args, state_path).await,
         Command::Control(args) => control(args, state_path).await,
         Command::Resize(args) => resize(args, state_path).await,
         Command::List(args) => list(args, state_path).await,
@@ -261,6 +264,14 @@ async fn control(args: SessionUrlArgs, state_path: PathBuf) -> Result<()> {
         "control_granted session={} device={}",
         granted.session_id.0, granted.device_id.0
     );
+    Ok(())
+}
+
+async fn close(args: SessionUrlArgs, state_path: PathBuf) -> Result<()> {
+    let session_id = parse_session_id(&args.session_id)?;
+    let mut client = connect_authenticated(&state_path, args.url.as_deref()).await?;
+    let closed = client.close_session(session_id).await?;
+    println!("closed session={}", closed.session_id.0);
     Ok(())
 }
 

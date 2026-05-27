@@ -233,6 +233,37 @@ describe("TerminalPane terminal sequence rendering", () => {
     }
   });
 
+  it("进入 session 的异步 snapshot 写入完成后会贴到底部", async () => {
+    vi.useFakeTimers();
+    try {
+      (globalThis as { __TERMD_TEST_DEFER_XTERM_RENDER_UNTIL_WRITE_CALLBACK__?: boolean })
+        .__TERMD_TEST_DEFER_XTERM_RENDER_UNTIL_WRITE_CALLBACK__ = true;
+      (globalThis as { __TERMD_TEST_DEFER_XTERM_BUFFER_UNTIL_WRITE_CALLBACK__?: boolean })
+        .__TERMD_TEST_DEFER_XTERM_BUFFER_UNTIL_WRITE_CALLBACK__ = true;
+      (globalThis as { __TERMD_TEST_KEEP_XTERM_VIEWPORT_AT_TOP_AFTER_WRITE__?: boolean })
+        .__TERMD_TEST_KEEP_XTERM_VIEWPORT_AT_TOP_AFTER_WRITE__ = true;
+      const snapshot = Array.from({ length: 80 }, (_, index) => `snapshot-line-${index}\n`).join("");
+
+      renderTerminalPaneWithOutput([
+        { kind: "snapshot", bytes: new TextEncoder().encode(snapshot), baseSeq: 0 },
+      ]);
+
+      act(() => {
+        vi.advanceTimersByTime(animationFrameMs * 12);
+      });
+
+      const xterm = (globalThis as {
+        __TERMD_TEST_XTERM__?: { viewportY: () => number; baseY: () => number };
+      }).__TERMD_TEST_XTERM__;
+      expect(xterm?.baseY()).toBeGreaterThan(0);
+      // 中文注释：刚 attach 时早期 resize/stabilize 可能已经在 snapshot 写完前执行过。
+      // write callback 后仍必须再次贴底，否则用户会停在 snapshot 顶部附近。
+      expect(xterm?.viewportY()).toBe(xterm?.baseY());
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("切换 session 时旧的异步 write 回调不能阻塞或确认新 session", async () => {
     vi.useFakeTimers();
     try {

@@ -489,13 +489,19 @@ export class DirectClient {
     );
   }
 
-  async createSession(command: string[], size: TerminalSize): Promise<SessionCreatedPayload> {
+  async createSession(
+    command: string[],
+    size: TerminalSize,
+    options: { timeoutMs?: number } = {},
+  ): Promise<SessionCreatedPayload> {
     return this.openTerminalStream<SessionCreatedPayload>(
       "terminal.create",
       {
         command,
         size,
       } satisfies SessionCreatePayload,
+      undefined,
+      options.timeoutMs,
     );
   }
 
