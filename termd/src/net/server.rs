@@ -43,7 +43,7 @@ use super::protocol::{
 };
 use super::signature::Ed25519SignatureVerifier;
 
-const OUTPUT_FLUSH_MAX_BYTES_PER_SESSION: usize = 16 * 1024;
+const OUTPUT_FLUSH_MAX_BYTES_PER_SESSION: usize = 512 * 1024;
 // transport 超时只关闭当前 WebSocket 连接；session/supervisor 仍由协议和 PTY 层保持持久。
 const ROUTE_PRELUDE_TIMEOUT: Duration = Duration::from_secs(5);
 const WEBSOCKET_SEND_DEADLINE: Duration = Duration::from_secs(10);
@@ -57,14 +57,13 @@ const WEBSOCKET_TRAFFIC_LOG_INTERVAL: Duration = Duration::from_secs(1);
 const WEBSOCKET_SEND_SLOW_LOG_THRESHOLD: Duration = Duration::from_millis(50);
 const WEBSOCKET_SEND_DEBUG_LOG_THRESHOLD: Duration = Duration::from_millis(10);
 const WEBSOCKET_SEND_DEBUG_BATCH_ENVELOPES: usize = 8;
-const WEBSOCKET_SEND_DEBUG_BATCH_BYTES: usize = 32 * 1024;
-const WEBSOCKET_SEND_INFO_BATCH_ENVELOPES: usize = 20;
-const WEBSOCKET_SEND_INFO_BATCH_BYTES: usize = 256 * 1024;
+const WEBSOCKET_SEND_DEBUG_BATCH_BYTES: usize = 512 * 1024;
+const WEBSOCKET_SEND_INFO_BATCH_ENVELOPES: usize = 64;
+const WEBSOCKET_SEND_INFO_BATCH_BYTES: usize = 8 * 1024 * 1024;
 const WEBSOCKET_WIRE_QUEUE_CAPACITY: usize = 256;
 const WEBSOCKET_PUSH_EVENT_QUEUE_CAPACITY: usize = 1024;
-const WEBSOCKET_PUSH_DRAIN_MAX_EVENTS_PER_TICK: usize = 4;
-const WEBSOCKET_PUSH_DRAIN_MAX_ENQUEUED_BYTES_PER_TICK: usize = 256 * 1024;
-const WEBSOCKET_PUSH_DRAIN_MAX_ELAPSED: Duration = Duration::from_millis(2);
+const WEBSOCKET_PUSH_DRAIN_MAX_EVENTS_PER_TICK: usize = 64;
+const WEBSOCKET_PUSH_DRAIN_MAX_ENQUEUED_BYTES_PER_TICK: usize = 16 * 1024 * 1024;
 const TERMINAL_OUTPUT_PUSH_COALESCE_DELAY: Duration = Duration::from_millis(10);
 
 fn websocket_idle_timeout_enabled() -> bool {
@@ -1485,11 +1484,10 @@ fn queue_websocket_push_drain_wakeup(
 fn websocket_push_drain_budget_exhausted(
     drained_events: usize,
     enqueued_bytes: usize,
-    started_at: Instant,
+    _started_at: Instant,
 ) -> bool {
     drained_events >= WEBSOCKET_PUSH_DRAIN_MAX_EVENTS_PER_TICK
         || enqueued_bytes >= WEBSOCKET_PUSH_DRAIN_MAX_ENQUEUED_BYTES_PER_TICK
-        || started_at.elapsed() >= WEBSOCKET_PUSH_DRAIN_MAX_ELAPSED
 }
 
 fn websocket_wire_messages_wire_len(messages: &[ProtocolWireMessage]) -> usize {
@@ -2416,6 +2414,10 @@ mod tests {
 
     #[test]
     fn websocket_push_drain_budget_limits_hot_loop() {
+        // 中文注释：direct WebSocket 和 relay 一样走高速 terminal 字节流；
+        // 小 batch 只适合低频交互输出，大量输出必须保留 MB 级 in-flight 空间。
+        assert!(OUTPUT_FLUSH_MAX_BYTES_PER_SESSION >= 512 * 1024);
+        assert!(WEBSOCKET_PUSH_DRAIN_MAX_ENQUEUED_BYTES_PER_TICK >= 8 * 1024 * 1024);
         assert!(!websocket_push_drain_budget_exhausted(
             1,
             1024,
@@ -2431,10 +2433,10 @@ mod tests {
             WEBSOCKET_PUSH_DRAIN_MAX_ENQUEUED_BYTES_PER_TICK,
             Instant::now()
         ));
-        assert!(websocket_push_drain_budget_exhausted(
+        assert!(!websocket_push_drain_budget_exhausted(
             1,
             0,
-            Instant::now() - WEBSOCKET_PUSH_DRAIN_MAX_ELAPSED
+            Instant::now() - Duration::from_secs(60)
         ));
     }
 

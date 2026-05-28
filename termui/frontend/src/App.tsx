@@ -1505,6 +1505,27 @@ export default function App() {
     );
   }, [preferences, sessions, t]);
 
+  const applyConfirmedSessionSize = useCallback((sessionId: UUID, size: TerminalSize) => {
+    const currentSize = confirmedSessionSizesRef.current.get(sessionId);
+    if (currentSize && sameTerminalSize(currentSize, size)) {
+      return;
+    }
+    // 中文注释：terminal snapshot/resize frame 里的 size 是渲染这些字节时的权威尺寸。
+    // 先更新本地 session size，避免 TerminalPane 在写 snapshot 时被旧 sessionSize 拉回旧列宽。
+    confirmedSessionSizesRef.current.set(sessionId, size);
+    setSessions((current) =>
+      current.map((session) =>
+        session.session_id === sessionId ? { ...session, size } : session,
+      ),
+    );
+    if (sessionId === attachedSessionRef.current) {
+      const confirmedResizeKey = terminalSizeKey(sessionId, size);
+      if (pendingResizeKeyRef.current === confirmedResizeKey) {
+        pendingResizeKeyRef.current = undefined;
+      }
+    }
+  }, []);
+
   useEffect(() => {
     if (
       !activeServer ||
@@ -1562,11 +1583,13 @@ export default function App() {
               continue;
             }
             if (payload.kind === "snapshot") {
+              applyConfirmedSessionSize(payload.session_id, payload.size);
               const bytes = payload.data_bytes ?? sessionDataFromBase64(payload.data_base64 ?? "");
               enqueueTerminalOutput({
                 kind: "snapshot",
                 bytes,
                 baseSeq: payload.base_seq,
+                size: payload.size,
               });
               processedBytes += bytes.byteLength;
             } else if (payload.kind === "output") {
@@ -1578,7 +1601,7 @@ export default function App() {
               });
               processedBytes += bytes.byteLength;
             } else if (payload.kind === "resize") {
-              enqueueTerminalOutput({ kind: "resize", terminalSeq: payload.terminal_seq });
+              enqueueTerminalOutput({ kind: "resize", terminalSeq: payload.terminal_seq, size: payload.size });
             } else if (payload.kind === "exit") {
               enqueueTerminalOutput({ kind: "exit", terminalSeq: payload.terminal_seq });
             }
@@ -1602,20 +1625,7 @@ export default function App() {
             }
           } else if (inner.type === "session_resized") {
             const payload = inner.payload as SessionResizedPayload;
-            // session_resize 是请求，session_resized 才是 daemon 确认；前端只在这里更新
-            // session size，TerminalPane 随后按这份确认尺寸执行本地 xterm resize。
-            confirmedSessionSizesRef.current.set(payload.session_id, payload.size);
-            setSessions((current) =>
-              current.map((session) =>
-                session.session_id === payload.session_id ? { ...session, size: payload.size } : session,
-              ),
-            );
-            if (payload.session_id === attachedSessionRef.current) {
-              const confirmedResizeKey = terminalSizeKey(payload.session_id, payload.size);
-              if (pendingResizeKeyRef.current === confirmedResizeKey) {
-                pendingResizeKeyRef.current = undefined;
-              }
-            }
+            applyConfirmedSessionSize(payload.session_id, payload.size);
           }
           if (processedMessages >= RECEIVE_LOOP_YIELD_MESSAGES || processedBytes >= RECEIVE_LOOP_YIELD_BYTES) {
             processedMessages = 0;
@@ -1635,7 +1645,7 @@ export default function App() {
       }
     };
     void read();
-  }, [enqueueTerminalOutput, markNewOutputIfBackground, setSafeError]);
+  }, [applyConfirmedSessionSize, enqueueTerminalOutput, markNewOutputIfBackground, setSafeError]);
 
   const scheduleAttachReconnect = useCallback((staleClient: DirectClient, caught: unknown, options: AttachReconnectOptions = {}) => {
     if (userDetachedRef.current || !isRetryableConnectionError(caught)) {
@@ -1833,6 +1843,14 @@ export default function App() {
     }
     lastRenderedTerminalSeqRef.current.set(sessionId, terminalSeq);
   }, []);
+
+  const handleTerminalSizeRendered = useCallback((size: TerminalSize) => {
+    const sessionId = attachedSessionRef.current;
+    if (!sessionId) {
+      return;
+    }
+    applyConfirmedSessionSize(sessionId, size);
+  }, [applyConfirmedSessionSize]);
 
   const performAttach = useCallback(
     async (sessionId: UUID, options: AttachUiOptions = {}) => {
@@ -3450,6 +3468,7 @@ export default function App() {
                 onOutputResetApplied={handleTerminalOutputResetApplied}
                 onTerminalResync={handleTerminalResync}
                 onTerminalSeqRendered={handleTerminalSeqRendered}
+                onTerminalSizeRendered={handleTerminalSizeRendered}
                 mobileShortcuts={preferences.mobileShortcuts}
                 onSearch={handleTerminalSearch}
                 onInput={handleTerminalInput}

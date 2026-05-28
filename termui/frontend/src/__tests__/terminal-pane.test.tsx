@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import { TerminalPane, type TerminalOutputItem } from "../components/TerminalPane";
 
 const animationFrameMs = 16;
+const DEFAULT_TERMINAL_SIZE = { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 };
 
 function fireTouchPointer(
   target: HTMLElement,
@@ -127,7 +128,7 @@ describe("TerminalPane terminal sequence rendering", () => {
 
     renderTerminalPaneWithOutput(
       [
-        { kind: "snapshot", bytes: new TextEncoder().encode("snapshot\n"), baseSeq: 10 },
+        { kind: "snapshot", bytes: new TextEncoder().encode("snapshot\n"), baseSeq: 10, size: DEFAULT_TERMINAL_SIZE },
         { kind: "output", bytes: new TextEncoder().encode("tail\n"), terminalSeq: 11 },
       ],
       { onTerminalSeqRendered },
@@ -139,13 +140,54 @@ describe("TerminalPane terminal sequence rendering", () => {
     expect(onTerminalSeqRendered.mock.calls).toEqual([[10], [11]]);
   });
 
+  it("snapshot 按自身尺寸重绘，并在 tail resize 后再写后续 output", async () => {
+    const encoder = new TextEncoder();
+    const onTerminalSeqRendered = vi.fn();
+    const snapshotSize = { rows: 32, cols: 120, pixel_width: 0, pixel_height: 0 };
+    const tailSize = { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 };
+
+    renderTerminalPaneWithOutput(
+      [
+        { kind: "snapshot", bytes: encoder.encode("wide-snapshot\n"), baseSeq: 0, size: snapshotSize },
+        { kind: "output", bytes: encoder.encode("before-resize\n"), terminalSeq: 1 },
+        { kind: "resize", terminalSeq: 2, size: tailSize },
+        { kind: "output", bytes: encoder.encode("after-resize\n"), terminalSeq: 3 },
+      ],
+      { onTerminalSeqRendered },
+    );
+
+    const xterm = screen.getByTestId("terminal-pane").querySelector<HTMLElement>(".xterm");
+    await waitFor(() => expect(xterm?.dataset.buffer).toContain("after-resize"));
+    const operations = (globalThis as {
+      __TERMD_TEST_XTERM_STATS__?: {
+        operations: Array<{ op: string; cols?: number; rows?: number }>;
+      };
+    }).__TERMD_TEST_XTERM_STATS__?.operations ?? [];
+    const firstWriteIndex = operations.findIndex((operation) => operation.op === "write");
+    const snapshotResizeIndex = operations.findIndex(
+      (operation) => operation.op === "resize" && operation.cols === 120 && operation.rows === 32,
+    );
+    const tailResizeIndex = operations.findIndex(
+      (operation) => operation.op === "resize" && operation.cols === 80 && operation.rows === 24,
+    );
+    const writeAfterTailResizeIndex = operations.findIndex(
+      (operation, index) => operation.op === "write" && index > tailResizeIndex,
+    );
+
+    expect(snapshotResizeIndex).toBeGreaterThanOrEqual(0);
+    expect(snapshotResizeIndex).toBeLessThan(firstWriteIndex);
+    expect(tailResizeIndex).toBeGreaterThan(firstWriteIndex);
+    expect(writeAfterTailResizeIndex).toBeGreaterThan(tailResizeIndex);
+    expect(onTerminalSeqRendered.mock.calls).toEqual([[0], [1], [2], [3]]);
+  });
+
   it("output terminal_seq 不连续时触发 resync，且不推进到跳号 frame", async () => {
     const onTerminalResync = vi.fn();
     const onTerminalSeqRendered = vi.fn();
 
     renderTerminalPaneWithOutput(
       [
-        { kind: "snapshot", bytes: new TextEncoder().encode("snapshot\n"), baseSeq: 10 },
+        { kind: "snapshot", bytes: new TextEncoder().encode("snapshot\n"), baseSeq: 10, size: DEFAULT_TERMINAL_SIZE },
         { kind: "output", bytes: new TextEncoder().encode("gap\n"), terminalSeq: 13 },
       ],
       { onTerminalResync, onTerminalSeqRendered },
@@ -159,7 +201,7 @@ describe("TerminalPane terminal sequence rendering", () => {
   it("连续 output frame 合并成批量 xterm write，但仍逐帧确认 terminal_seq", async () => {
     const onTerminalSeqRendered = vi.fn();
     const items: TerminalOutputItem[] = [
-      { kind: "snapshot", bytes: new TextEncoder().encode("snapshot\n"), baseSeq: 0 },
+      { kind: "snapshot", bytes: new TextEncoder().encode("snapshot\n"), baseSeq: 0, size: DEFAULT_TERMINAL_SIZE },
       ...Array.from({ length: 32 }, (_, index) => ({
         kind: "output" as const,
         bytes: new TextEncoder().encode(`line-${index + 1}\n`),
@@ -186,7 +228,7 @@ describe("TerminalPane terminal sequence rendering", () => {
       const encoder = new TextEncoder();
       const onTerminalSeqRendered = vi.fn();
       let queue: TerminalOutputItem[] = [
-        { kind: "snapshot", bytes: encoder.encode("snapshot\n"), baseSeq: 0 },
+        { kind: "snapshot", bytes: encoder.encode("snapshot\n"), baseSeq: 0, size: DEFAULT_TERMINAL_SIZE },
       ];
       let drainOutput: (() => void) | undefined;
       const takeOutput = vi.fn(() => queue.splice(0));
@@ -245,7 +287,7 @@ describe("TerminalPane terminal sequence rendering", () => {
       const snapshot = Array.from({ length: 80 }, (_, index) => `snapshot-line-${index}\n`).join("");
 
       renderTerminalPaneWithOutput([
-        { kind: "snapshot", bytes: new TextEncoder().encode(snapshot), baseSeq: 0 },
+        { kind: "snapshot", bytes: new TextEncoder().encode(snapshot), baseSeq: 0, size: DEFAULT_TERMINAL_SIZE },
       ]);
 
       act(() => {
@@ -273,7 +315,7 @@ describe("TerminalPane terminal sequence rendering", () => {
         .__TERMD_TEST_SERIALIZE_XTERM_WRITES__ = true;
       const encoder = new TextEncoder();
       let queue: TerminalOutputItem[] = [
-        { kind: "snapshot", bytes: encoder.encode("old-session\n"), baseSeq: 10 },
+        { kind: "snapshot", bytes: encoder.encode("old-session\n"), baseSeq: 10, size: DEFAULT_TERMINAL_SIZE },
       ];
       let drainOutput: (() => void) | undefined;
       const takeOutput = vi.fn(() => queue.splice(0));
@@ -307,7 +349,7 @@ describe("TerminalPane terminal sequence rendering", () => {
       expect(onTerminalSeqRendered).not.toHaveBeenCalled();
 
       queue = [
-        { kind: "snapshot", bytes: encoder.encode("new-session\n"), baseSeq: 30 },
+        { kind: "snapshot", bytes: encoder.encode("new-session\n"), baseSeq: 30, size: DEFAULT_TERMINAL_SIZE },
       ];
       rerender(
         <TerminalPane

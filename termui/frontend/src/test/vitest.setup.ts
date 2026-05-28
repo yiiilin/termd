@@ -28,7 +28,13 @@ afterEach(() => {
     .__TERMD_TEST_SERIALIZE_XTERM_WRITES__;
   delete (globalThis as { __TERMD_TEST_DEFER_OUTPUT_RESET_APPLIED__?: (confirm: () => void) => void })
     .__TERMD_TEST_DEFER_OUTPUT_RESET_APPLIED__;
-  delete (globalThis as { __TERMD_TEST_XTERM_STATS__?: { writes: number; refreshes: number; writtenBytes: number } })
+  delete (globalThis as { __TERMD_TEST_XTERM_STATS__?: {
+    writes: number;
+    refreshes: number;
+    writtenBytes: number;
+    resizes: number;
+    operations: Array<{ op: string; cols?: number; rows?: number; bytes?: number }>;
+  } })
     .__TERMD_TEST_XTERM_STATS__;
   delete (globalThis as { __TERMD_TEST_XTERM__?: { select: (text: string) => void } }).__TERMD_TEST_XTERM__;
   clipboardWriteTextMock.mockClear();
@@ -39,8 +45,16 @@ vi.mock("@xterm/xterm", () => {
   const textDecoder = new TextDecoder();
 
   function xtermStats() {
-    const scope = globalThis as { __TERMD_TEST_XTERM_STATS__?: { writes: number; refreshes: number; writtenBytes: number } };
-    scope.__TERMD_TEST_XTERM_STATS__ ??= { writes: 0, refreshes: 0, writtenBytes: 0 };
+    const scope = globalThis as { __TERMD_TEST_XTERM_STATS__?: {
+      writes: number;
+      refreshes: number;
+      writtenBytes: number;
+      resizes: number;
+      operations: Array<{ op: string; cols?: number; rows?: number; bytes?: number }>;
+    } };
+    scope.__TERMD_TEST_XTERM_STATS__ ??= { writes: 0, refreshes: 0, writtenBytes: 0, resizes: 0, operations: [] };
+    scope.__TERMD_TEST_XTERM_STATS__.resizes ??= 0;
+    scope.__TERMD_TEST_XTERM_STATS__.operations ??= [];
     return scope.__TERMD_TEST_XTERM_STATS__;
   }
 
@@ -139,6 +153,7 @@ vi.mock("@xterm/xterm", () => {
       const stats = xtermStats();
       stats.writes += 1;
       stats.writtenBytes += typeof data === "string" ? data.length : data.byteLength;
+      stats.operations.push({ op: "write", bytes: typeof data === "string" ? data.length : data.byteLength });
       const deferRender = Boolean(
         (globalThis as { __TERMD_TEST_DEFER_XTERM_RENDER_UNTIL_WRITE_CALLBACK__?: boolean })
           .__TERMD_TEST_DEFER_XTERM_RENDER_UNTIL_WRITE_CALLBACK__,
@@ -253,6 +268,9 @@ vi.mock("@xterm/xterm", () => {
     }
 
     resize(cols: number, rows: number) {
+      const stats = xtermStats();
+      stats.resizes += 1;
+      stats.operations.push({ op: "resize", cols, rows });
       const previousBaseY = this.buffer.active.baseY;
       const wasAtBottom = this.buffer.active.viewportY >= previousBaseY;
       this.cols = cols;
@@ -279,6 +297,7 @@ vi.mock("@xterm/xterm", () => {
     }
 
     clear() {
+      xtermStats().operations.push({ op: "clear" });
       // mock 要真实清空 DOM buffer，才能覆盖 WebSocket 断线重连后的 snapshot 重放不会叠加旧内容。
       this.pendingRender = "";
       this.pendingRenderReady = false;
@@ -298,6 +317,7 @@ vi.mock("@xterm/xterm", () => {
     }
 
     reset() {
+      xtermStats().operations.push({ op: "reset" });
       // xterm.reset() 会清空终端状态；测试 mock 复用 clear 的 DOM/游标重置逻辑即可。
       this.clear();
     }

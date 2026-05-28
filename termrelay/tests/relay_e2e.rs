@@ -8,7 +8,7 @@ use termd::net::protocol::{JsonEnvelope, decode_payload, envelope_value};
 use termd::net::{E2eeKeyPair, E2eeSession, E2eeSessionContext, E2eeSessionRole};
 use termd_proto::{
     DeviceId, EncryptedFramePayload, Envelope, MessageType, Nonce, PairRequestPayload,
-    PairingToken, ProtocolVersion, PublicKey, RelayMuxEnvelope, RelayOpaqueFrame,
+    PairingToken, ProtocolVersion, PublicKey, RelayClientId, RelayMuxEnvelope, RelayOpaqueFrame,
     RouteHelloPayload, RouteReadyPayload, RouteRole, ServerId, decode_binary_relay_mux_envelope,
     encode_binary_relay_mux_envelope,
 };
@@ -105,10 +105,10 @@ async fn relay_forwards_real_encrypted_frame_without_plaintext_or_rewrite() {
     let mut daemon_mux = connect_registered_socket(relay.ws_url(), server_id, RouteRole::DaemonMux)
         .await
         .expect("daemon mux side should connect");
-    let mut client = connect_registered_socket(relay.ws_url(), server_id, RouteRole::Client)
-        .await
-        .expect("client side should connect");
-    let client_id = expect_client_connected(&mut daemon_mux).await;
+    let (mut client, client_id) =
+        connect_registered_client_socket(relay.ws_url(), server_id, &mut daemon_mux)
+            .await
+            .expect("client side should connect");
     let (wire, mut daemon_e2ee) = encrypted_pair_request_wire(server_id, RELAY_SECRET_SENTINEL);
 
     assert!(wire.contains("encrypted_frame"));
@@ -150,14 +150,14 @@ async fn relay_isolates_encrypted_frames_by_server_id() {
     let mut daemon_b = connect_registered_socket(relay.ws_url(), server_b, RouteRole::DaemonMux)
         .await
         .expect("daemon B should connect");
-    let mut client_a = connect_registered_socket(relay.ws_url(), server_a, RouteRole::Client)
-        .await
-        .expect("client A should connect");
-    let _client_a_id = expect_client_connected(&mut daemon_a).await;
-    let _client_b = connect_registered_socket(relay.ws_url(), server_b, RouteRole::Client)
-        .await
-        .expect("client B should connect");
-    let _client_b_id = expect_client_connected(&mut daemon_b).await;
+    let (mut client_a, _client_a_id) =
+        connect_registered_client_socket(relay.ws_url(), server_a, &mut daemon_a)
+            .await
+            .expect("client A should connect");
+    let (_client_b, _client_b_id) =
+        connect_registered_client_socket(relay.ws_url(), server_b, &mut daemon_b)
+            .await
+            .expect("client B should connect");
     let (wire_a, _daemon_a_e2ee) = encrypted_pair_request_wire(server_a, RELAY_SECRET_SENTINEL);
 
     client_a
@@ -187,10 +187,10 @@ async fn relay_forwards_business_shaped_text_and_binary_without_parsing() {
     let mut daemon_mux = connect_registered_socket(relay.ws_url(), server_id, RouteRole::DaemonMux)
         .await
         .expect("daemon mux side should connect");
-    let mut client = connect_registered_socket(relay.ws_url(), server_id, RouteRole::Client)
-        .await
-        .expect("client side should connect");
-    let client_id = expect_client_connected(&mut daemon_mux).await;
+    let (mut client, client_id) =
+        connect_registered_client_socket(relay.ws_url(), server_id, &mut daemon_mux)
+            .await
+            .expect("client side should connect");
     let text_payloads = [
         "{not-json session_data control_request pairing_token relay-secret-plaintext".to_owned(),
         r#"{"kind":"stream_open","method":"terminal.attach","payload":{"session_id":"session-a","watch_updates":true}}"#
@@ -271,14 +271,14 @@ async fn relay_keeps_daemon_mux_targeted_frames_within_server_id() {
     let mut daemon_b = connect_registered_socket(relay.ws_url(), server_b, RouteRole::DaemonMux)
         .await
         .expect("daemon B should connect");
-    let mut client_a = connect_registered_socket(relay.ws_url(), server_a, RouteRole::Client)
-        .await
-        .expect("client A should connect");
-    let mut client_b = connect_registered_socket(relay.ws_url(), server_b, RouteRole::Client)
-        .await
-        .expect("client B should connect");
-    let client_a_id = expect_client_connected(&mut daemon_a).await;
-    let _client_b_id = expect_client_connected(&mut daemon_b).await;
+    let (mut client_a, client_a_id) =
+        connect_registered_client_socket(relay.ws_url(), server_a, &mut daemon_a)
+            .await
+            .expect("client A should connect");
+    let (mut client_b, _client_b_id) =
+        connect_registered_client_socket(relay.ws_url(), server_b, &mut daemon_b)
+            .await
+            .expect("client B should connect");
     let targeted_frame = b"ciphertext-for-server-a-only".to_vec();
 
     send_mux(
@@ -311,26 +311,14 @@ async fn relay_mux_routes_client_frames_and_targeted_daemon_responses() {
     let mut daemon_mux = connect_registered_socket(relay.ws_url(), server_id, RouteRole::DaemonMux)
         .await
         .expect("daemon mux side should connect");
-    let mut client_a = connect_registered_socket(relay.ws_url(), server_id, RouteRole::Client)
-        .await
-        .expect("client A should connect");
-    let mut client_b = connect_registered_socket(relay.ws_url(), server_id, RouteRole::Client)
-        .await
-        .expect("client B should connect");
-
-    let first_connected = next_mux(&mut daemon_mux).await;
-    let second_connected = next_mux(&mut daemon_mux).await;
-    let connected_ids = match (first_connected, second_connected) {
-        (
-            RelayMuxEnvelope::ClientConnected {
-                client_id: first_id,
-            },
-            RelayMuxEnvelope::ClientConnected {
-                client_id: second_id,
-            },
-        ) => [first_id, second_id],
-        other => panic!("expected two client_connected envelopes, got {other:?}"),
-    };
+    let (mut client_a, expected_client_a_id) =
+        connect_registered_client_socket(relay.ws_url(), server_id, &mut daemon_mux)
+            .await
+            .expect("client A should connect");
+    let (mut client_b, client_b_id) =
+        connect_registered_client_socket(relay.ws_url(), server_id, &mut daemon_mux)
+            .await
+            .expect("client B should connect");
 
     let business_shaped_text =
         "{\"type\":\"pair_request\",\"payload\":{\"token\":\"relay-secret-plaintext\"}}";
@@ -339,7 +327,6 @@ async fn relay_mux_routes_client_frames_and_targeted_daemon_responses() {
         .await
         .expect("client A should send opaque text");
 
-    // connect 通知是生命周期控制消息；不同 socket task 的调度顺序不等于测试里的 A/B 变量顺序。
     let RelayMuxEnvelope::ClientFrame {
         client_id: client_a_id,
         frame: RelayOpaqueFrame::Text {
@@ -349,12 +336,8 @@ async fn relay_mux_routes_client_frames_and_targeted_daemon_responses() {
     else {
         panic!("expected client A frame");
     };
-    assert!(connected_ids.contains(&client_a_id));
+    assert_eq!(client_a_id, expected_client_a_id);
     assert_eq!(client_a_text, business_shaped_text);
-    let client_b_id = connected_ids
-        .into_iter()
-        .find(|client_id| *client_id != client_a_id)
-        .expect("client B id should be the other connected client");
 
     send_mux(
         &mut daemon_mux,
@@ -425,14 +408,13 @@ async fn relay_auth_allows_dumb_pipe_forwarding_with_correct_token() {
     )
     .await
     .expect("authenticated daemon mux should connect");
-    let mut client = connect_registered_socket(
+    let (mut client, client_id) = connect_registered_client_socket(
         format!("{}?relay_token=relay-secret-1", relay.ws_url()),
         server_id,
-        RouteRole::Client,
+        &mut daemon_mux,
     )
     .await
     .expect("authenticated client should connect");
-    let client_id = expect_client_connected(&mut daemon_mux).await;
     let business_shaped_text =
         "{\"type\":\"pair_request\",\"payload\":{\"token\":\"relay-secret-plaintext\"}}";
 
@@ -502,6 +484,32 @@ async fn connect_registered_socket(
     expect_route_ready(&mut socket, server_id, role).await?;
 
     Ok(socket)
+}
+
+async fn connect_registered_client_socket(
+    url: String,
+    server_id: ServerId,
+    daemon_mux: &mut RelaySocket,
+) -> Result<(RelaySocket, RelayClientId), tokio_tungstenite::tungstenite::Error> {
+    let (mut socket, _) = connect_async(url.as_str()).await?;
+    send_route_hello(&mut socket, server_id, RouteRole::Client).await?;
+    let client_id = expect_client_connected(daemon_mux).await;
+    // 中文注释：relay 现在把 client route_ready 作为路由事务提交点。
+    // daemon mux 必须先回一个首帧，证明 daemon->relay->client 方向已可用。
+    send_mux(
+        daemon_mux,
+        RelayMuxEnvelope::DaemonFrame {
+            client_id,
+            frame: RelayOpaqueFrame::Text {
+                data: "route-bootstrap".to_owned(),
+            },
+        },
+    )
+    .await;
+    expect_route_ready(&mut socket, server_id, RouteRole::Client).await?;
+    assert_eq!(next_text(&mut socket).await, "route-bootstrap");
+
+    Ok((socket, client_id))
 }
 
 async fn send_route_hello(

@@ -159,11 +159,9 @@ mod tests {
         let (mut daemon_mux, _daemon_response) = connect_async(url.clone()).await.unwrap();
         register_route(&mut daemon_mux, server_id, RouteRole::DaemonMux).await;
         let (mut client, _client_response) = connect_async(url).await.unwrap();
-        register_route(&mut client, server_id, RouteRole::Client).await;
-        let client_id = match next_mux(&mut daemon_mux).await {
-            RelayMuxEnvelope::ClientConnected { client_id } => client_id,
-            other => panic!("expected client_connected envelope, got {other:?}"),
-        };
+        let client_id =
+            register_client_route_with_daemon_bootstrap(&mut client, &mut daemon_mux, server_id)
+                .await;
 
         // The post-prelude frame is intentionally invalid JSON; relay must keep it opaque.
         client
@@ -212,17 +210,19 @@ mod tests {
         let (mut daemon_mux, _daemon_response) = connect_async(url.clone()).await.unwrap();
         register_route(&mut daemon_mux, server_id, RouteRole::DaemonMux).await;
         let (mut target_client, _target_response) = connect_async(url.clone()).await.unwrap();
-        register_route(&mut target_client, server_id, RouteRole::Client).await;
-        let target_client_id = match next_mux(&mut daemon_mux).await {
-            RelayMuxEnvelope::ClientConnected { client_id } => client_id,
-            other => panic!("expected target client_connected envelope, got {other:?}"),
-        };
+        let target_client_id = register_client_route_with_daemon_bootstrap(
+            &mut target_client,
+            &mut daemon_mux,
+            server_id,
+        )
+        .await;
         let (mut flood_client, _flood_response) = connect_async(url).await.unwrap();
-        register_route(&mut flood_client, server_id, RouteRole::Client).await;
-        let _flood_client_id = match next_mux(&mut daemon_mux).await {
-            RelayMuxEnvelope::ClientConnected { client_id } => client_id,
-            other => panic!("expected flood client_connected envelope, got {other:?}"),
-        };
+        let _flood_client_id = register_client_route_with_daemon_bootstrap(
+            &mut flood_client,
+            &mut daemon_mux,
+            server_id,
+        )
+        .await;
 
         // 中文注释：这里刻意不再读取 daemon_mux。旧实现的 relay daemon-mux task 会在把
         // flood client 的大帧写向 daemon 时卡住，因而无法继续读取 daemon 反向发来的响应。
@@ -292,6 +292,56 @@ mod tests {
         assert_eq!(ready.kind, MessageType::RouteReady);
         assert_eq!(ready.payload.server_id, server_id);
         assert_eq!(ready.payload.role, role);
+    }
+
+    async fn register_client_route_with_daemon_bootstrap(
+        client: &mut TestSocket,
+        daemon_mux: &mut TestSocket,
+        server_id: ServerId,
+    ) -> termd_proto::RelayClientId {
+        let hello = Envelope::new(
+            MessageType::RouteHello,
+            RouteHelloPayload {
+                server_id,
+                role: RouteRole::Client,
+                protocol_version: ProtocolVersion::default(),
+                nonce: Nonce("route-test-client-nonce".to_owned()),
+                route_generation: None,
+                timestamp_ms: termd_proto::UnixTimestampMillis(1_710_000_000_000),
+            },
+        );
+        client
+            .send(ClientMessage::Text(serde_json::to_string(&hello).unwrap()))
+            .await
+            .unwrap();
+
+        let client_id = match next_mux(daemon_mux).await {
+            RelayMuxEnvelope::ClientConnected { client_id } => client_id,
+            other => panic!("expected client_connected envelope, got {other:?}"),
+        };
+        let bootstrap = RelayMuxEnvelope::DaemonFrame {
+            client_id,
+            frame: RelayOpaqueFrame::Text {
+                data: "route-bootstrap".to_owned(),
+            },
+        };
+        daemon_mux
+            .send(ClientMessage::Binary(
+                encode_binary_relay_mux_envelope(&bootstrap).unwrap(),
+            ))
+            .await
+            .unwrap();
+
+        let ready: Envelope<RouteReadyPayload> =
+            serde_json::from_str(&next_text(client).await).unwrap();
+        assert_eq!(ready.kind, MessageType::RouteReady);
+        assert_eq!(ready.payload.server_id, server_id);
+        assert_eq!(ready.payload.role, RouteRole::Client);
+        assert_eq!(
+            next_data_frame(client).await.unwrap(),
+            ClientMessage::Text("route-bootstrap".to_owned())
+        );
+        client_id
     }
 
     async fn next_text(socket: &mut TestSocket) -> String {

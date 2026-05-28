@@ -12,6 +12,22 @@ version="${1:-}"
 }
 
 case "$version" in
+  0.3.7)
+    cat <<'EOF'
+termd 0.3.7
+
+用户可见变化:
+- 修复浏览器 attach / reconnect 时 snapshot 可能按旧分辨率写入 xterm 的问题；Web 会先按 snapshot 自带的 rows/cols 调整终端，再清屏重绘 snapshot，避免长行换行、光标位置和 TUI 画面在切换 session 后错乱。
+- terminal tail 中的 resize frame 现在按 `terminal_seq` 原始顺序消费；如果 resize 前后都有输出，前面的输出会先写完，再应用 resize，再写后续输出，避免 resize 通过侧路提前改变 xterm 尺寸。
+- Web 在收到 snapshot/resize frame 时会保留并传递权威 size，不再只依赖 session 列表里的旧 size；快速切换不同分辨率 session 后，首屏恢复更稳定。
+- relay/direct 大输出链路继续使用 0.3.6 的批量传输和连接生命周期模型；本次同步保留此前修复的 relay backpressure、旧 client 清理、WebSocket 重建和尾包主动 repaint 行为。
+- 本地和远端 relay 服务已按本版本代码验证过 healthz 与 daemon mux 重连路径。
+
+兼容性:
+- supervisor 兼容版本未变化，仍为 `0.3.5`；从 0.3.6 更新到 0.3.7 不应终止或清空已有 live session supervisor。
+- packet protocol version 仍为 3；terminal frame 语义不变，只是 Web UI 更严格按 snapshot/resize 携带的 size 顺序渲染。建议 daemon、Web UI、termctl 和 relay 同步升级到 0.3.7。
+EOF
+    ;;
   0.3.6)
     cat <<'EOF'
 termd 0.3.6

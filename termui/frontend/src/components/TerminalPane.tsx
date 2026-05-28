@@ -41,9 +41,9 @@ type MobileDirectionTier = 1 | 2 | 3;
 
 export type TerminalOutputItem =
   | { kind: "data"; bytes: Uint8Array }
-  | { kind: "snapshot"; bytes: Uint8Array; baseSeq: number }
+  | { kind: "snapshot"; bytes: Uint8Array; baseSeq: number; size: TerminalSize }
   | { kind: "output"; bytes: Uint8Array; terminalSeq: number }
-  | { kind: "resize"; terminalSeq: number }
+  | { kind: "resize"; terminalSeq: number; size: TerminalSize }
   | { kind: "exit"; terminalSeq: number };
 
 interface ActiveTerminalWrite {
@@ -100,6 +100,7 @@ interface TerminalPaneProps {
   onOutputResetApplied?: (version: number) => void;
   onTerminalResync?: (lastTerminalSeq?: number) => void;
   onTerminalSeqRendered?: (terminalSeq: number) => void;
+  onTerminalSizeRendered?: (size: TerminalSize) => void;
   mobileShortcuts?: BrowserMobileShortcut[];
   onSearch?: (query: string) => Promise<SessionSearchResultPayload>;
   onInput: (data: string) => void;
@@ -122,6 +123,7 @@ export function TerminalPane(props: TerminalPaneProps) {
   const onCursorChangeRef = useRef(props.onCursorChange);
   const onTerminalResyncRef = useRef(props.onTerminalResync);
   const onTerminalSeqRenderedRef = useRef(props.onTerminalSeqRendered);
+  const onTerminalSizeRenderedRef = useRef(props.onTerminalSizeRendered);
   const onOutputResetAppliedRef = useRef(props.onOutputResetApplied);
   const takeOutputRef = useRef(props.takeOutput);
   const sessionSizeRef = useRef(props.sessionSize);
@@ -174,6 +176,7 @@ export function TerminalPane(props: TerminalPaneProps) {
   const writeFrameRef = useRef<number | undefined>(undefined);
   const needsPostWriteRefreshRef = useRef(false);
   const needsPostWriteScrollBottomRef = useRef(false);
+  const snapshotRedrawInProgressRef = useRef(false);
   const bottomScrollPassesRef = useRef(0);
   const [focused, setFocused] = useState(false);
   const [copyToastVisible, setCopyToastVisible] = useState(false);
@@ -236,12 +239,13 @@ export function TerminalPane(props: TerminalPaneProps) {
     onCursorChangeRef.current = props.onCursorChange;
     onTerminalResyncRef.current = props.onTerminalResync;
     onTerminalSeqRenderedRef.current = props.onTerminalSeqRendered;
+    onTerminalSizeRenderedRef.current = props.onTerminalSizeRendered;
     onOutputResetAppliedRef.current = props.onOutputResetApplied;
     takeOutputRef.current = props.takeOutput;
     sessionSizeRef.current = props.sessionSize;
     mobileInputModeRef.current = Boolean(props.mobileInputMode);
     mobileKeyboardOpenRef.current = Boolean(props.mobileKeyboardOpen);
-  }, [props.mobileInputMode, props.mobileKeyboardOpen, props.onCursorChange, props.onInput, props.onOutputResetApplied, props.onResize, props.onTerminalResync, props.onTerminalSeqRendered, props.sessionSize, props.takeOutput]);
+  }, [props.mobileInputMode, props.mobileKeyboardOpen, props.onCursorChange, props.onInput, props.onOutputResetApplied, props.onResize, props.onTerminalResync, props.onTerminalSeqRendered, props.onTerminalSizeRendered, props.sessionSize, props.takeOutput]);
 
   useEffect(() => props.registerOutputDrain(() => drainOutputRef.current()), [props.registerOutputDrain]);
 
@@ -857,6 +861,11 @@ export function TerminalPane(props: TerminalPaneProps) {
     // 本地 xterm 只有在当前浏览器窗口聚焦终端时才把尺寸写回 shared PTY。
     // 未聚焦客户端按 daemon 确认的 session rows/cols 渲染，不再做本地等比缩放。
     const resize = (source: ResizeSource = "layout") => {
+      if (snapshotRedrawInProgressRef.current) {
+        // 中文注释：snapshot 字节按生成时的列宽解释；写入完成前禁止 layout/session resize
+        // 把 xterm 改回旧尺寸，否则宽行换行和光标位置会被错误解析。
+        return;
+      }
       const terminalHost = hostRef.current;
       if (!terminalHost) {
         return;
@@ -942,6 +951,7 @@ export function TerminalPane(props: TerminalPaneProps) {
       item.kind === "data" || item.kind === "snapshot" || item.kind === "output" ? item.bytes.byteLength : 0;
     const markItemRendered = (item: TerminalOutputItem) => {
       if (item.kind === "snapshot") {
+        snapshotRedrawInProgressRef.current = false;
         lastTerminalSeqRef.current = item.baseSeq;
         onTerminalSeqRenderedRef.current?.(item.baseSeq);
       } else if (item.kind === "output" || item.kind === "resize" || item.kind === "exit") {
@@ -973,6 +983,11 @@ export function TerminalPane(props: TerminalPaneProps) {
       active.sequenceChecked = true;
       const { item } = active;
       if (item.kind === "snapshot") {
+        snapshotRedrawInProgressRef.current = true;
+        sessionSizeRef.current = item.size;
+        if (!sameTerminalDimensions(terminal, item.size)) {
+          terminal.resize(item.size.cols, item.size.rows);
+        }
         terminal.reset();
         needsPostWriteRefreshRef.current = true;
         // 中文注释：snapshot 写入可能晚于 attach 初期的 resize/stabilize。
@@ -991,6 +1006,16 @@ export function TerminalPane(props: TerminalPaneProps) {
       }
       return true;
     };
+    const applyResizeFrame = (item: Extract<TerminalOutputItem, { kind: "resize" }>) => {
+      sessionSizeRef.current = item.size;
+      if (!sameTerminalDimensions(terminal, item.size)) {
+        terminal.resize(item.size.cols, item.size.rows);
+      }
+      onTerminalSizeRenderedRef.current?.(item.size);
+      needsPostWriteRefreshRef.current = true;
+      needsPostWriteScrollBottomRef.current = true;
+      queueCursorReport({ immediate: true });
+    };
     const takePendingWrite = (): TerminalWriteBatch | undefined => {
       const chunks: Uint8Array[] = [];
       const renderedItems: TerminalOutputItem[] = [];
@@ -1007,13 +1032,21 @@ export function TerminalPane(props: TerminalPaneProps) {
           pendingWriteBytesRef.current = Math.max(0, pendingWriteBytesRef.current - byteLengthForItem(item));
           active = { item, offset: 0, sequenceChecked: false };
           activeWriteRef.current = active;
-          if (!ensureActiveWriteSequence(active, sequenceCursor)) {
-            continue;
-          }
         }
 
         const { item } = active;
+        if ((item.kind === "resize" || item.kind === "exit" || byteLengthForItem(item) === 0) && byteCount > 0) {
+          break;
+        }
+
+        if (!ensureActiveWriteSequence(active, sequenceCursor)) {
+          continue;
+        }
+
         if (item.kind === "resize" || item.kind === "exit" || byteLengthForItem(item) === 0) {
+          if (item.kind === "resize") {
+            applyResizeFrame(item);
+          }
           renderedItems.push(item);
           sequenceCursor = advanceSequenceCursor(item, sequenceCursor);
           activeWriteRef.current = undefined;
@@ -1324,6 +1357,7 @@ export function TerminalPane(props: TerminalPaneProps) {
       writeFrameRef.current = undefined;
       needsPostWriteRefreshRef.current = false;
       needsPostWriteScrollBottomRef.current = false;
+      snapshotRedrawInProgressRef.current = false;
       focusedRef.current = false;
       clientSizeRef.current = undefined;
       mobileViewportResizeOwnerRef.current = false;

@@ -38,7 +38,7 @@ use super::protocol::{
 };
 use super::server::SharedDaemonProtocol;
 
-const OUTPUT_FLUSH_MAX_BYTES_PER_SESSION: usize = 16 * 1024;
+const OUTPUT_FLUSH_MAX_BYTES_PER_SESSION: usize = 512 * 1024;
 const MIN_RELAY_RETRY_DELAY_MS: u64 = 1;
 const MIN_RELAY_HEARTBEAT_INTERVAL_MS: u64 = 1;
 // relay mux transport 失败只会断开当前 relay 连接并触发重连，不关闭持久 session/supervisor。
@@ -61,15 +61,14 @@ const RELAY_TRAFFIC_LOG_INTERVAL: Duration = Duration::from_secs(1);
 const RELAY_SEND_SLOW_LOG_THRESHOLD: Duration = Duration::from_millis(50);
 const RELAY_SEND_DEBUG_LOG_THRESHOLD: Duration = Duration::from_millis(10);
 const RELAY_SEND_DEBUG_BATCH_ENVELOPES: usize = 8;
-const RELAY_SEND_DEBUG_BATCH_BYTES: usize = 32 * 1024;
-const RELAY_SEND_INFO_BATCH_ENVELOPES: usize = 20;
-const RELAY_SEND_INFO_BATCH_BYTES: usize = 256 * 1024;
+const RELAY_SEND_DEBUG_BATCH_BYTES: usize = 512 * 1024;
+const RELAY_SEND_INFO_BATCH_ENVELOPES: usize = 64;
+const RELAY_SEND_INFO_BATCH_BYTES: usize = 8 * 1024 * 1024;
 const RELAY_PUSH_EVENT_QUEUE_CAPACITY: usize = 2048;
 const RELAY_MUX_CONTROL_QUEUE_CAPACITY: usize = 256;
 const RELAY_MUX_DATA_QUEUE_CAPACITY: usize = 32;
-const RELAY_PUSH_DRAIN_MAX_EVENTS_PER_TICK: usize = 4;
-const RELAY_PUSH_DRAIN_MAX_TRANSPORTED_BYTES_PER_TICK: usize = 64 * 1024;
-const RELAY_PUSH_DRAIN_MAX_ELAPSED: Duration = Duration::from_millis(2);
+const RELAY_PUSH_DRAIN_MAX_EVENTS_PER_TICK: usize = 64;
+const RELAY_PUSH_DRAIN_MAX_TRANSPORTED_BYTES_PER_TICK: usize = 16 * 1024 * 1024;
 const RELAY_PUSH_DRAIN_RETRY_DELAY: Duration = Duration::from_millis(5);
 const RELAY_OUTPUT_PUSH_COALESCE_DELAY: Duration = Duration::from_millis(10);
 
@@ -580,7 +579,8 @@ fn relay_mux_envelope_kind(envelope: &RelayMuxEnvelope) -> &'static str {
 
 fn relay_daemon_mux_idle_ping_enabled() -> bool {
     // daemon 是 relay mux 主干连接的 owner；空闲时由 daemon 主动发标准 WebSocket Ping。
-    // relay 不解析业务心跳，连接断开后才裁定 daemon 离线。
+    // 中文注释：这里是传输层半开检测，不是业务 ACK。只有对应 Pong 能证明
+    // daemon->relay 出站方向可达；relay 主动发来的 Ping 不能证明这个方向。
     true
 }
 
@@ -1099,9 +1099,6 @@ async fn connect_relay_mux_base_once(
                 traffic.record_in(&message);
                 heartbeat_debug
                     .record_inbound(relay_message_kind(&message), relay_message_bytes(&message));
-                // 中文注释：任何 relay 入站帧都证明主干 transport 仍可回写。
-                // 这里只做 WebSocket 半开检测，不引入 mux 业务 ACK。
-                pending_idle_ping_misses = 0;
                 debug!(
                     relay = %relay_endpoint,
                     ?server_id,
@@ -1381,7 +1378,9 @@ async fn connect_relay_mux_base_once(
                             traffic.record_send_error();
                             break Err(error);
                         }
-                        last_activity = Instant::now();
+                        // 中文注释：回复 relay 主动 Ping 只是一次本地写入尝试。
+                        // 在 daemon->relay 半断时，这个 Pong 可能同样到不了 relay，
+                        // 所以不能用它推迟 daemon 自己的 Ping/Pong 探测。
                         traffic.record_out(RelayOutKind::Pong, 0, pong_bytes);
                         maybe_log_relay_traffic(
                             &relay_endpoint,
@@ -1397,9 +1396,11 @@ async fn connect_relay_mux_base_once(
                         );
                     }
                     Message::Pong(payload) => {
-                        // 中文注释：WebSocket Pong 只说明代理/内核控制帧路径有响应。
-                        // 新模型不再维护应用层 mux ACK 判活，真正断线由 WebSocket 读写错误暴露。
+                        // 中文注释：只有 relay 对 daemon 主动 Ping 的 Pong，才能证明
+                        // daemon->relay 出站方向仍可达。relay 主动发来的 Ping 只能证明
+                        // relay->daemon 入站方向可达，不能清除这里的半开检测计数。
                         let _ = payload;
+                        pending_idle_ping_misses = 0;
                         last_activity = Instant::now();
                         maybe_log_relay_traffic(
                             &relay_endpoint,
@@ -2709,11 +2710,10 @@ fn queue_relay_push_drain_wakeup(
 fn relay_push_drain_budget_exhausted(
     drained_events: usize,
     transported_bytes: usize,
-    started_at: Instant,
+    _started_at: Instant,
 ) -> bool {
     drained_events >= RELAY_PUSH_DRAIN_MAX_EVENTS_PER_TICK
         || transported_bytes >= RELAY_PUSH_DRAIN_MAX_TRANSPORTED_BYTES_PER_TICK
-        || started_at.elapsed() >= RELAY_PUSH_DRAIN_MAX_ELAPSED
 }
 
 fn relay_mux_envelopes_wire_len(envelopes: &[RelayMuxEnvelope]) -> usize {
@@ -3786,6 +3786,10 @@ mod tests {
 
     #[test]
     fn relay_push_drain_budget_limits_hot_loop() {
+        // 中文注释：relay 主干按高速字节流处理，预算必须是 MB 级；
+        // 否则 16KB/64KB 小批量会把千兆链路拆成大量小事务。
+        assert!(OUTPUT_FLUSH_MAX_BYTES_PER_SESSION >= 512 * 1024);
+        assert!(RELAY_PUSH_DRAIN_MAX_TRANSPORTED_BYTES_PER_TICK >= 8 * 1024 * 1024);
         assert!(!relay_push_drain_budget_exhausted(1, 1024, Instant::now()));
         assert!(relay_push_drain_budget_exhausted(
             RELAY_PUSH_DRAIN_MAX_EVENTS_PER_TICK,
@@ -3797,10 +3801,10 @@ mod tests {
             RELAY_PUSH_DRAIN_MAX_TRANSPORTED_BYTES_PER_TICK,
             Instant::now()
         ));
-        assert!(relay_push_drain_budget_exhausted(
+        assert!(!relay_push_drain_budget_exhausted(
             1,
             0,
-            Instant::now() - RELAY_PUSH_DRAIN_MAX_ELAPSED
+            Instant::now() - Duration::from_secs(60)
         ));
     }
 
@@ -4731,6 +4735,29 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn relay_mux_closes_when_outbound_pong_is_missing_even_if_relay_sends_ping() {
+        let protocol = test_protocol("relay-half-open-outbound");
+        let server_id = protocol.lock().await.server_id();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_raw_daemon_mux_sends_relay_ping_but_ignores_daemon_ping(stream, server_id).await;
+        });
+
+        let base = RelayBaseUrl::parse(&format!("ws://{addr}")).unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            connect_relay_mux_base_once(base, None, None, protocol, Duration::from_millis(10)),
+        )
+        .await
+        .expect("daemon mux should stop when daemon->relay ping never gets a pong");
+
+        assert!(matches!(result, Err(RelayConnectorError::IdleTimeout)));
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn relay_mux_does_not_require_application_keepalive_ack() {
         let protocol = test_protocol("relay-mux-no-keepalive-ack");
         let server_id = protocol.lock().await.server_id();
@@ -4899,6 +4926,104 @@ mod tests {
                 }
                 0x8 => break,
                 _ => {}
+            }
+        }
+    }
+
+    async fn handle_raw_daemon_mux_sends_relay_ping_but_ignores_daemon_ping(
+        mut stream: TcpStream,
+        server_id: ServerId,
+    ) {
+        let mut request = Vec::new();
+        let mut byte = [0_u8; 1];
+        while !request.ends_with(b"\r\n\r\n") {
+            if stream.read_exact(&mut byte).await.is_err() {
+                return;
+            }
+            request.push(byte[0]);
+        }
+        let request_text = String::from_utf8_lossy(&request);
+        let Some(key) = request_text.lines().find_map(|line| {
+            line.strip_prefix("Sec-WebSocket-Key:")
+                .map(|value| value.trim())
+        }) else {
+            return;
+        };
+        let accept_key =
+            tokio_tungstenite::tungstenite::handshake::derive_accept_key(key.as_bytes());
+        let response = format!(
+            "HTTP/1.1 101 Switching Protocols\r\n\
+             Upgrade: websocket\r\n\
+             Connection: Upgrade\r\n\
+             Sec-WebSocket-Accept: {accept_key}\r\n\
+             \r\n"
+        );
+        if stream.write_all(response.as_bytes()).await.is_err() {
+            return;
+        }
+
+        let Some((opcode, _payload)) = read_raw_ws_frame(&mut stream).await else {
+            return;
+        };
+        if opcode != 0x1 && opcode != 0x2 {
+            return;
+        }
+        let route_ready = Envelope::new(
+            MessageType::RouteReady,
+            RouteReadyPayload {
+                server_id,
+                role: RouteRole::DaemonMux,
+            },
+        );
+        let raw = serde_json::to_string(&route_ready).unwrap();
+        if write_raw_ws_frame(&mut stream, 0x1, raw.as_bytes())
+            .await
+            .is_err()
+        {
+            return;
+        }
+
+        let mut relay_ping = tokio::time::interval(Duration::from_millis(5));
+        relay_ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut relay_ping_nonce = 0_u64;
+        loop {
+            tokio::select! {
+                _ = relay_ping.tick() => {
+                    relay_ping_nonce = relay_ping_nonce.wrapping_add(1);
+                    // 中文注释：持续给 daemon 发 Ping，模拟 relay->daemon 方向仍可达。
+                    // daemon 如果把这些入站 Ping 当作出站可达证明，就会永远不重连。
+                    if write_raw_ws_frame(&mut stream, 0x9, &relay_ping_nonce.to_be_bytes())
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                frame = read_raw_ws_frame(&mut stream) => {
+                    let Some((opcode, payload)) = frame else {
+                        return;
+                    };
+                    match opcode {
+                        // 中文注释：故意不回 daemon 的 Ping，模拟 daemon->relay 方向半断。
+                        0x9 => {}
+                        // daemon 对 relay Ping 的 Pong 会证明入站方向可达，但不能证明出站方向。
+                        0xA => {}
+                        0x2 => {
+                            if let Ok(RelayMuxEnvelope::Keepalive { nonce }) =
+                                decode_binary_relay_mux_envelope(&payload)
+                            {
+                                let ack = RelayMuxEnvelope::KeepaliveAck { nonce };
+                                if let Ok(raw) = encode_binary_relay_mux_envelope(&ack) {
+                                    if write_raw_ws_frame(&mut stream, 0x2, &raw).await.is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                        0x8 => return,
+                        _ => {}
+                    }
+                }
             }
         }
     }

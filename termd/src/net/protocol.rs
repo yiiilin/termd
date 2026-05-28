@@ -80,11 +80,11 @@ const LIVE_OUTPUT_MIN_BYTES: usize = 16 * 1024;
 const LIVE_OUTPUT_BYTES_PER_CELL: usize = 8;
 // 中文注释：supervisor 会按 PTY read 边界生成 terminal frame，很多命令会变成
 // “一行一个 frame”。live drain 不能只取几个小 frame，否则 relay/Web 会看到逐行蹦。
-// 真正的上限仍由下面的 64KB payload/transport budget 控制。
+// 真正的上限仍由下面的 MB 级 payload/transport budget 控制。
 const LIVE_OUTPUT_DRAIN_MAX_CHUNKS: usize = 512;
 const RAW_OUTPUT_BATCH_MAX_CHUNKS: usize = 8;
-const TERMINAL_STREAM_BATCH_MAX_BYTES: usize = 64 * 1024;
-const TERMINAL_STREAM_BATCH_MAX_TRANSPORT_BYTES: usize = 64 * 1024;
+const TERMINAL_STREAM_BATCH_MAX_BYTES: usize = 512 * 1024;
+const TERMINAL_STREAM_BATCH_MAX_TRANSPORT_BYTES: usize = 768 * 1024;
 const TERMINAL_STREAM_BATCH_TRANSPORT_OVERHEAD_BYTES: usize = 128;
 const TERMINAL_STREAM_FRAME_TRANSPORT_OVERHEAD_BYTES: usize = 256;
 const TERMINAL_STREAM_METADATA_CREDIT_BYTES: usize = 1;
@@ -6987,6 +6987,21 @@ mod tests {
 
     static TEST_STATE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+    #[test]
+    fn terminal_output_batch_allows_megabyte_scale_aggregation() {
+        let nearly_full = 496 * 1024;
+        let next_frame = 16 * 1024;
+
+        // 中文注释：relay/direct 输出不应该被 64KB 级别的小 batch 限死。
+        // 512KB 仍低于 WebSocket 单帧上限，但已经能显著减少加密、封包和调度次数。
+        assert!(terminal_frame_fits_output_batch(
+            nearly_full,
+            nearly_full,
+            next_frame,
+            next_frame,
+        ));
+    }
+
     #[derive(Clone, Default)]
     struct FakePtyBackend {
         state: Arc<Mutex<FakePtyState>>,
@@ -9394,7 +9409,7 @@ mod tests {
         );
         let created_packet = decrypt_first_packet(&mut device_session, create_responses);
         let created: SessionCreatedPayload = decode_payload(created_packet.payload).unwrap();
-        for terminal_seq in 1..=1800 {
+        for terminal_seq in 1..=6000 {
             backend.push_terminal_journal_frame_for_session(
                 created.session_id,
                 PtyTerminalFrame::Output {
@@ -9432,7 +9447,7 @@ mod tests {
             .expect("encrypted envelope should serialize")
             .len();
         assert!(
-            encrypted_wire_bytes <= 160 * 1024,
+            encrypted_wire_bytes <= 1024 * 1024,
             "transport cap should keep one websocket message small, got {encrypted_wire_bytes} bytes"
         );
 
@@ -9446,7 +9461,7 @@ mod tests {
             terminal_frame_payload_count(&payload)
         );
         assert!(
-            terminal_frame_payload_count(&payload) < 1800,
+            terminal_frame_payload_count(&payload) < 6000,
             "transport cap should leave the remaining tiny frames pending instead of one huge batch"
         );
         assert!(
@@ -9507,7 +9522,7 @@ mod tests {
         );
         let created_packet = decrypt_first_packet(&mut device_session, create_responses);
         let created: SessionCreatedPayload = decode_payload(created_packet.payload).unwrap();
-        for terminal_seq in 1..=1800 {
+        for terminal_seq in 1..=6000 {
             backend.push_terminal_journal_frame_for_session(
                 created.session_id,
                 PtyTerminalFrame::Output {
@@ -9602,7 +9617,7 @@ mod tests {
             create_test_packet_session(&mut protocol, &mut connection, &mut device_session);
         let second_session =
             create_test_packet_session(&mut protocol, &mut connection, &mut device_session);
-        for terminal_seq in 1..=1800 {
+        for terminal_seq in 1..=6000 {
             backend.push_terminal_journal_frame_for_session(
                 first_session,
                 PtyTerminalFrame::Output {
@@ -9810,7 +9825,7 @@ mod tests {
         );
         let session_id =
             create_test_packet_session(&mut protocol, &mut connection, &mut device_session);
-        for terminal_seq in 1..=1800 {
+        for terminal_seq in 1..=6000 {
             backend.push_terminal_journal_frame_for_session(
                 session_id,
                 PtyTerminalFrame::Output {
