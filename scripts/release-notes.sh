@@ -12,6 +12,22 @@ version="${1:-}"
 }
 
 case "$version" in
+  0.3.8)
+    cat <<'EOF'
+termd 0.3.8
+
+用户可见变化:
+- daemon 端终端输出恢复改为 poll/cursor 模型：attach/create 只记录客户端上次看到的 terminal_seq，真正发送时再从 daemon 终端缓存或 supervisor 快照读取，减少旧 WebSocket、旧 session 切换和慢客户端对新连接的影响。
+- Web 在 relay/direct 下快速切换多个大输出 session 时，不再依赖 per-client 预填 snapshot/tail 队列；旧连接断开后，新连接可直接按 cursor 获取 snapshot 或连续 tail，恢复路径更接近“重新接入终端”而不是“继续消费旧队列”。
+- daemon 仍会持续消费 supervisor 输出并更新本地 terminal mirror/cache；relay 短暂断开或浏览器重新连接后，优先用 daemon cache 补画面，cache 不完整时再回源 supervisor 获取权威 snapshot。
+- tail 跨过 resize 时会自动退回 snapshot 重绘，避免用旧分辨率的历史输出继续追加到新尺寸终端，降低切换不同分辨率客户端后画面错乱的概率。
+- supervisor attach tail 遇到 resize 时也会选择 snapshot 恢复，保持 daemon cache、runtime fallback 和 supervisor 权威恢复规则一致。
+
+兼容性:
+- supervisor 兼容版本未变化，仍为 `0.3.5`；从 0.3.7 更新到 0.3.8 不应终止或清空已有 live session supervisor。
+- packet protocol version 仍为 3；前端 wire protocol 不变，浏览器、termctl、daemon 和 relay 建议同步升级到 0.3.8。relay 仍是 dumb pipe，不解密、不解析业务明文。
+EOF
+    ;;
   0.3.7)
     cat <<'EOF'
 termd 0.3.7

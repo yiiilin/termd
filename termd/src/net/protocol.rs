@@ -496,22 +496,6 @@ impl SessionTerminalFrameLog {
         }
     }
 
-    fn read_from(&self, next_terminal_seq: u64, max_frames: usize) -> Vec<TerminalFramePayload> {
-        if max_frames == 0 {
-            return Vec::new();
-        }
-        self.frames
-            .iter()
-            .filter(|frame| {
-                frame
-                    .terminal_seq()
-                    .is_some_and(|seq| seq >= next_terminal_seq)
-            })
-            .take(max_frames)
-            .cloned()
-            .collect()
-    }
-
     fn has_from(&self, next_terminal_seq: u64) -> bool {
         self.frames.iter().any(|frame| {
             frame
@@ -525,6 +509,15 @@ impl SessionTerminalFrameLog {
         session_id: SessionId,
         last_terminal_seq: Option<u64>,
     ) -> Option<Vec<TerminalFramePayload>> {
+        self.snapshot_or_tail_limited(session_id, last_terminal_seq, None)
+    }
+
+    fn snapshot_or_tail_limited(
+        &self,
+        session_id: SessionId,
+        last_terminal_seq: Option<u64>,
+        max_frames: Option<usize>,
+    ) -> Option<Vec<TerminalFramePayload>> {
         if self.has_sequence_gap {
             return None;
         }
@@ -535,7 +528,7 @@ impl SessionTerminalFrameLog {
                 return Some(Vec::new());
             }
             if last_terminal_seq < current_seq {
-                let tail = self
+                let mut tail = self
                     .frames
                     .iter()
                     .filter(|frame| {
@@ -547,6 +540,17 @@ impl SessionTerminalFrameLog {
                     .collect::<Vec<_>>();
                 let first_seq = tail.first().and_then(TerminalFramePayload::terminal_seq);
                 if first_seq == Some(last_terminal_seq.saturating_add(1)) {
+                    if terminal_frame_list_crosses_resize(&tail) {
+                        return Some(vec![TerminalFramePayload::Snapshot {
+                            session_id,
+                            base_seq: current_seq,
+                            size: self.size,
+                            data_base64: general_purpose::STANDARD.encode(screen.snapshot_bytes()),
+                        }]);
+                    }
+                    if let Some(max_frames) = max_frames {
+                        tail.truncate(max_frames);
+                    }
                     return Some(tail);
                 }
             }
@@ -559,6 +563,16 @@ impl SessionTerminalFrameLog {
             data_base64: general_purpose::STANDARD.encode(screen.snapshot_bytes()),
         }])
     }
+}
+
+fn terminal_frame_list_crosses_resize(frames: &[TerminalFramePayload]) -> bool {
+    frames.iter().any(|frame| match frame {
+        TerminalFramePayload::Resize { .. } => true,
+        TerminalFramePayload::Batch { frames, .. } => terminal_frame_list_crosses_resize(frames),
+        TerminalFramePayload::Snapshot { .. }
+        | TerminalFramePayload::Output { .. }
+        | TerminalFramePayload::Exit { .. } => false,
+    })
 }
 
 fn terminal_frame_covered_seq(frame: &TerminalFramePayload) -> Option<u64> {
@@ -1170,11 +1184,10 @@ where
         let response_size = self.runtime_size_proto(&internal_session_id)?;
         let (output_offset, initial_output) = if connection.packet_mode {
             if enqueue_terminal_snapshot {
-                // 普通 packet `session.create` 只创建 session；只有 terminal stream
-                // create 才需要立即入队 snapshot，避免无 stream 的短命令触发终端恢复路径。
-                let frames =
-                    self.terminal_snapshot_frames(wire_session_id, &internal_session_id, None)?;
-                connection.enqueue_terminal_frames(wire_session_id, frames);
+                // 中文注释：terminal.create 只登记首轮 poll 需要 snapshot，不再把
+                // snapshot 预先塞进 per-client 队列。stream 注册完成后的 push drain 会
+                // 从 daemon cache/supervisor poll 出相同的 terminal frame。
+                connection.set_terminal_poll_cursor(wire_session_id, None);
             }
             (0, Vec::new())
         } else {
@@ -1236,21 +1249,10 @@ where
         let response_size = self.runtime_size_proto(&internal_session_id)?;
         let (output_offset, initial_output) = if payload.watch_updates {
             if connection.packet_mode {
-                let frames = self.terminal_snapshot_frames(
-                    payload.session_id,
-                    &internal_session_id,
-                    payload.last_terminal_seq,
-                )?;
-                if frames.is_empty() {
-                    if let Some(last_terminal_seq) = payload.last_terminal_seq {
-                        // 中文注释：空 tail 也是一次成功同步，表示该连接已经追平到
-                        // last_terminal_seq。否则后续从 daemon session log 读取时会从 seq=1
-                        // 重放旧 frame。
-                        connection.mark_terminal_seq_covered(payload.session_id, last_terminal_seq);
-                    }
-                } else {
-                    connection.enqueue_terminal_frames(payload.session_id, frames);
-                }
+                // 中文注释：attach 阶段只保存 browser 的 terminal cursor。真正的
+                // snapshot/tail 在后续 output drain 中通过 daemon poll 读取，这样快速
+                // 切换 session 时不会给旧 client 留下待发送 terminal 队列。
+                connection.set_terminal_poll_cursor(payload.session_id, payload.last_terminal_seq);
                 (0, Vec::new())
             } else {
                 self.drain_runtime_output_to_history_until_empty(
@@ -2364,13 +2366,29 @@ where
             return Ok(frames);
         }
 
-        let frames = self
+        let mut frames = self
             .runtime
             .terminal_snapshot(internal_session_id, last_terminal_seq)
             .map_err(map_runtime_error)?
             .into_iter()
             .map(|frame| terminal_frame_payload(session_id, frame))
             .collect::<Result<Vec<_>, _>>()?;
+        if terminal_frame_list_crosses_resize(&frames)
+            && !frames
+                .iter()
+                .any(|frame| matches!(frame, TerminalFramePayload::Snapshot { .. }))
+        {
+            // 中文注释：部分 backend 可能先按 last_terminal_seq 返回 tail。只要 tail
+            // 跨过 resize，就重新请求当前 snapshot，保持 daemon poll 与 supervisor
+            // 权威恢复规则一致。
+            frames = self
+                .runtime
+                .terminal_snapshot(internal_session_id, None)
+                .map_err(map_runtime_error)?
+                .into_iter()
+                .map(|frame| terminal_frame_payload(session_id, frame))
+                .collect::<Result<Vec<_>, _>>()?;
+        }
         self.seed_terminal_frame_log_from_snapshot_frames(session_id, &frames);
         Ok(frames)
     }
@@ -2409,7 +2427,7 @@ where
 
     fn read_terminal_frames_for_connection(
         &mut self,
-        connection: &mut ProtocolConnection,
+        connection: &ProtocolConnection,
         session_id: SessionId,
         internal_session_id: &str,
         max_frames: usize,
@@ -2436,13 +2454,24 @@ where
             log.push(frame);
         }
 
-        let next_terminal_seq = connection.next_terminal_frame_seq(session_id);
-        let frames = self
+        let last_terminal_seq = connection.terminal_poll_last_seq(session_id);
+        let cached_frames = self
             .session_terminal_frame_logs
             .get(&session_id)
-            .map(|log| log.read_from(next_terminal_seq, max_frames))
-            .unwrap_or_default();
-        connection.mark_terminal_frames_read(session_id, &frames);
+            .and_then(|log| {
+                log.snapshot_or_tail_limited(session_id, last_terminal_seq, Some(max_frames))
+            });
+        let mut frames = if let Some(frames) = cached_frames {
+            frames
+        } else {
+            // 中文注释：daemon mirror 缺失或存在 seq gap 时不能用本地不完整 screen
+            // 生成恢复数据；回源 supervisor 获取权威 snapshot/tail，再用同一条
+            // terminal stream 发给前端。
+            self.terminal_snapshot_frames(session_id, internal_session_id, last_terminal_seq)?
+        };
+        if frames.len() > max_frames {
+            frames.truncate(max_frames);
+        }
         Ok(frames)
     }
 
@@ -2727,9 +2756,9 @@ where
             .collect();
         connection.output_offsets.clear();
         connection.pending_outputs.clear();
-        connection.pending_terminal_frames.clear();
         connection.watched_sessions.clear();
         connection.stale_watched_sessions.clear();
+        connection.terminal_frame_snapshot_required.clear();
         self.mark_daemon_client_connection_offline(device_id, connection.client_id, now_ms);
 
         // 断开 WebSocket 只 detach 当前连接关联的 session，不 close/terminate PTY。
@@ -3562,8 +3591,10 @@ pub struct ProtocolConnection {
     stale_watched_sessions: HashSet<SessionId>,
     output_offsets: HashMap<SessionId, u64>,
     pending_outputs: HashMap<SessionId, VecDeque<Vec<u8>>>,
-    pending_terminal_frames: HashMap<SessionId, VecDeque<TerminalFramePayload>>,
     terminal_frame_next_seq: HashMap<SessionId, u64>,
+    // 中文注释：`last_terminal_seq = None` 是明确的 snapshot poll 语义，不能和
+    // `Some(0)` 混在一起。这里记录首轮必须 snapshot 的 terminal stream。
+    terminal_frame_snapshot_required: HashSet<SessionId>,
     deferred_output_wakeups: HashSet<SessionId>,
     debug_traffic: ProtocolConnectionDebugTraffic,
 }
@@ -3815,8 +3846,8 @@ impl ProtocolConnection {
             stale_watched_sessions: HashSet::new(),
             output_offsets: HashMap::new(),
             pending_outputs: HashMap::new(),
-            pending_terminal_frames: HashMap::new(),
             terminal_frame_next_seq: HashMap::new(),
+            terminal_frame_snapshot_required: HashSet::new(),
             deferred_output_wakeups: HashSet::new(),
             debug_traffic: ProtocolConnectionDebugTraffic::default(),
         }
@@ -3838,11 +3869,6 @@ impl ProtocolConnection {
     pub fn debug_snapshot(&self) -> ProtocolConnectionDebugSnapshot {
         // 该快照只暴露队列计数，不包含 PTY 明文或设备密钥，可安全写入 daemon 日志。
         let pending_raw_chunks = self.pending_outputs.values().map(VecDeque::len).sum();
-        let pending_terminal_frames = self
-            .pending_terminal_frames
-            .values()
-            .map(VecDeque::len)
-            .sum();
         ProtocolConnectionDebugSnapshot {
             packet_mode: self.packet_mode,
             binary_mode: self.binary_mode,
@@ -3852,7 +3878,7 @@ impl ProtocolConnection {
             zero_credit_terminal_streams: 0,
             total_output_credit: 0,
             pending_raw_chunks,
-            pending_terminal_frames,
+            pending_terminal_frames: 0,
         }
     }
 
@@ -4322,33 +4348,6 @@ impl ProtocolConnection {
             let mut frame_transport_bytes = 0_usize;
             let mut drained_chunks = 0_usize;
 
-            loop {
-                let pending_frame = self
-                    .pending_terminal_frames
-                    .get_mut(&session_id)
-                    .and_then(VecDeque::pop_front);
-                let Some(frame) = pending_frame else {
-                    break;
-                };
-                let cost = terminal_frame_payload_bytes(&frame);
-                let transport_cost = terminal_frame_transport_cost(&frame);
-                if !terminal_frame_fits_output_batch(
-                    frame_bytes,
-                    frame_transport_bytes,
-                    cost,
-                    transport_cost,
-                ) {
-                    self.pending_terminal_frames
-                        .entry(session_id)
-                        .or_default()
-                        .push_front(frame);
-                    break;
-                }
-                frame_bytes = frame_bytes.saturating_add(cost);
-                frame_transport_bytes = frame_transport_bytes.saturating_add(transport_cost);
-                frames.push(frame);
-            }
-
             while drained_chunks < LIVE_OUTPUT_DRAIN_MAX_CHUNKS {
                 if frame_bytes >= TERMINAL_STREAM_BATCH_MAX_BYTES
                     || frame_transport_bytes >= TERMINAL_STREAM_BATCH_MAX_TRANSPORT_BYTES
@@ -4365,14 +4364,11 @@ impl ProtocolConnection {
                     break;
                 }
                 let mut stopped = false;
-                let mut live_frames = live_frames.into_iter().peekable();
-                while let Some(frame) = live_frames.next() {
+                let before_len = frames.len();
+                for frame in live_frames {
                     if frame_bytes >= TERMINAL_STREAM_BATCH_MAX_BYTES
                         || frame_transport_bytes >= TERMINAL_STREAM_BATCH_MAX_TRANSPORT_BYTES
                     {
-                        let pending = self.pending_terminal_frames.entry(session_id).or_default();
-                        pending.push_back(frame);
-                        pending.extend(live_frames);
                         stopped = true;
                         break;
                     }
@@ -4384,9 +4380,6 @@ impl ProtocolConnection {
                         cost,
                         transport_cost,
                     ) {
-                        let pending = self.pending_terminal_frames.entry(session_id).or_default();
-                        pending.push_back(frame);
-                        pending.extend(live_frames);
                         stopped = true;
                         break;
                     }
@@ -4395,21 +4388,18 @@ impl ProtocolConnection {
                     frames.push(frame);
                     drained_chunks += 1;
                 }
+                self.mark_terminal_frames_read(session_id, &frames[before_len..]);
                 if stopped {
                     break;
                 }
             }
 
-            // 中文注释：terminal 输出不再等待 browser flow ACK。当前批次如果被字节或
-            // transport 上限截断，直接排下一轮 push；慢客户端由 WebSocket 写入队列负责断开。
+            // 中文注释：terminal 输出不再等待 browser flow ACK，也不在连接里保存
+            // 未发送 frame。batch 被字节或 transport 上限截断时，只推进已发送前缀的
+            // cursor；下一轮 push 从 daemon session log 继续 poll。
             let terminal_output_has_more = self
-                .pending_terminal_frames
-                .get(&session_id)
-                .is_some_and(|pending| !pending.is_empty())
-                || protocol.terminal_frame_log_has_from(
-                    session_id,
-                    self.next_terminal_frame_seq(session_id),
-                );
+                .terminal_frame_next_seq(session_id)
+                .is_some_and(|next_seq| protocol.terminal_frame_log_has_from(session_id, next_seq));
             if terminal_output_has_more {
                 self.deferred_output_wakeups.insert(session_id);
             } else {
@@ -5151,7 +5141,7 @@ impl ProtocolConnection {
     ) -> Result<Vec<ProtocolPacket<Value>>, ProtocolError> {
         let stream_id = packet.stream_id.ok_or(ProtocolError::InvalidEnvelope)?;
         // 中文注释：旧客户端可能继续发送 flow。新模型中 WebSocket/TCP 已保证可靠有序，
-        // terminal 输出不再等待 render ACK/credit；这里仅确认 stream 存在并把 flow 当 no-op。
+        // terminal 输出不再等待 render ACK/credit；flow 只保留为兼容 no-op，不能驱动输出。
         let _ = self.packet_terminal_streams.get(&stream_id);
         Ok(Vec::new())
     }
@@ -5324,8 +5314,8 @@ impl ProtocolConnection {
         }
         self.packet_terminal_streams.clear();
         self.packet_terminal_streams_by_session.clear();
-        self.pending_terminal_frames.clear();
         self.terminal_frame_next_seq.clear();
+        self.terminal_frame_snapshot_required.clear();
         self.deferred_output_wakeups.clear();
     }
 
@@ -5335,8 +5325,9 @@ impl ProtocolConnection {
         };
         self.packet_terminal_streams_by_session
             .remove(&stream.session_id);
-        self.pending_terminal_frames.remove(&stream.session_id);
         self.terminal_frame_next_seq.remove(&stream.session_id);
+        self.terminal_frame_snapshot_required
+            .remove(&stream.session_id);
         self.deferred_output_wakeups.remove(&stream.session_id);
         if self.watched_sessions.remove(&stream.session_id) {
             self.stale_watched_sessions.insert(stream.session_id);
@@ -5349,11 +5340,35 @@ impl ProtocolConnection {
             .copied()
     }
 
-    fn next_terminal_frame_seq(&self, session_id: SessionId) -> u64 {
-        self.terminal_frame_next_seq
-            .get(&session_id)
-            .copied()
-            .unwrap_or(1)
+    fn terminal_frame_next_seq(&self, session_id: SessionId) -> Option<u64> {
+        if self.terminal_frame_snapshot_required.contains(&session_id) {
+            return None;
+        }
+        Some(
+            self.terminal_frame_next_seq
+                .get(&session_id)
+                .copied()
+                .unwrap_or(1),
+        )
+    }
+
+    fn terminal_poll_last_seq(&self, session_id: SessionId) -> Option<u64> {
+        self.terminal_frame_next_seq(session_id)
+            .map(|next_seq| next_seq.saturating_sub(1))
+    }
+
+    fn set_terminal_poll_cursor(&mut self, session_id: SessionId, last_terminal_seq: Option<u64>) {
+        match last_terminal_seq {
+            Some(seq) => {
+                self.terminal_frame_snapshot_required.remove(&session_id);
+                self.terminal_frame_next_seq
+                    .insert(session_id, seq.saturating_add(1));
+            }
+            None => {
+                self.terminal_frame_next_seq.remove(&session_id);
+                self.terminal_frame_snapshot_required.insert(session_id);
+            }
+        }
     }
 
     fn mark_terminal_frames_read(
@@ -5367,13 +5382,9 @@ impl ProtocolConnection {
             .max()
             .map(|seq| seq.saturating_add(1))
         {
+            self.terminal_frame_snapshot_required.remove(&session_id);
             self.terminal_frame_next_seq.insert(session_id, next_seq);
         }
-    }
-
-    fn mark_terminal_seq_covered(&mut self, session_id: SessionId, terminal_seq: u64) {
-        self.terminal_frame_next_seq
-            .insert(session_id, terminal_seq.saturating_add(1));
     }
 
     fn next_packet_stream_output_seq(
@@ -5408,35 +5419,6 @@ impl ProtocolConnection {
                     .or_default()
                     .push_back(initial_output);
             }
-        }
-    }
-
-    fn enqueue_terminal_frames(
-        &mut self,
-        session_id: SessionId,
-        frames: impl IntoIterator<Item = TerminalFramePayload>,
-    ) {
-        let queue = self.pending_terminal_frames.entry(session_id).or_default();
-        let mut max_seq = None;
-        let mut queued_any = false;
-        for frame in frames {
-            queued_any = true;
-            if let Some(seq) = terminal_frame_covered_seq(&frame) {
-                max_seq = Some(max_seq.unwrap_or(0_u64).max(seq));
-            }
-            queue.push_back(frame);
-        }
-        if queued_any {
-            // 中文注释：terminal attach 的 snapshot/tail 是先进入连接 pending 队列，
-            // 后续由 direct/relay 主循环异步 drain。这里显式登记 wakeup，避免 watcher
-            // 初始事件丢失或被重建时，pending frame 停在 daemon 内无人推进。
-            self.deferred_output_wakeups.insert(session_id);
-        }
-        if let Some(max_seq) = max_seq {
-            // 中文注释：snapshot/tail 已经覆盖到 max_seq；当前连接之后只需要读取
-            // session live log 中更大的 seq。不能全局裁剪 live log，否则其它慢连接会丢 tail。
-            self.terminal_frame_next_seq
-                .insert(session_id, max_seq.saturating_add(1));
         }
     }
 }
@@ -8198,7 +8180,7 @@ mod tests {
     }
 
     #[test]
-    fn packet_terminal_stream_open_batches_snapshot_and_output_with_stream_sequence() {
+    fn packet_terminal_stream_open_polls_snapshot_with_stream_sequence() {
         let (mut protocol, backend) = protocol();
         let (mut connection, _) = protocol.start_connection();
         let device_id = DeviceId::new();
@@ -8267,41 +8249,26 @@ mod tests {
         assert_eq!(batch_packet.kind, PacketKind::StreamChunk);
         assert_eq!(batch_packet.stream_id, Some(stream_id));
         assert_eq!(batch_packet.seq, 1);
-        let batch: TerminalFramePayload = decode_payload(batch_packet.payload.clone()).unwrap();
-        match batch {
-            TerminalFramePayload::Batch { session_id, frames } => {
+        let frame: TerminalFramePayload = decode_payload(batch_packet.payload.clone()).unwrap();
+        match frame {
+            TerminalFramePayload::Snapshot {
+                session_id,
+                base_seq,
+                data_base64,
+                ..
+            } => {
                 assert_eq!(session_id, created.session_id);
-                assert_eq!(frames.len(), 2);
-                match &frames[0] {
-                    TerminalFramePayload::Snapshot {
-                        session_id,
-                        base_seq,
-                        data_base64,
-                        ..
-                    } => {
-                        assert_eq!(*session_id, created.session_id);
-                        assert_eq!(*base_seq, 0);
-                        assert!(data_base64.is_empty());
-                    }
-                    other => panic!("expected snapshot as first batch frame, got {other:?}"),
-                }
-                match &frames[1] {
-                    TerminalFramePayload::Output {
-                        session_id,
-                        terminal_seq,
-                        data_base64,
-                    } => {
-                        assert_eq!(*session_id, created.session_id);
-                        assert_eq!(*terminal_seq, 1);
-                        assert_eq!(
-                            general_purpose::STANDARD.decode(data_base64).unwrap(),
-                            b"hello"
-                        );
-                    }
-                    other => panic!("expected output as second batch frame, got {other:?}"),
-                }
+                assert_eq!(base_seq, 1);
+                assert!(
+                    general_purpose::STANDARD
+                        .decode(data_base64)
+                        .unwrap()
+                        .windows(b"hello".len())
+                        .any(|window| window == b"hello"),
+                    "terminal.create 首轮 poll 应返回包含当前输出的 snapshot"
+                );
             }
-            other => panic!("expected batched terminal frames, got {other:?}"),
+            other => panic!("expected terminal poll snapshot, got {other:?}"),
         }
     }
 
@@ -8397,14 +8364,17 @@ mod tests {
             panic!("expected binary terminal frame payload");
         };
         match terminal_frame_from_binary(frame).unwrap() {
-            TerminalFramePayload::Batch { frames, .. } => {
-                assert!(frames.iter().any(|frame| matches!(
-                    frame,
-                    TerminalFramePayload::Output { data_base64, .. }
-                        if general_purpose::STANDARD.decode(data_base64).unwrap() == b"hello"
-                )));
+            TerminalFramePayload::Snapshot { data_base64, .. } => {
+                assert!(
+                    general_purpose::STANDARD
+                        .decode(data_base64)
+                        .unwrap()
+                        .windows(b"hello".len())
+                        .any(|window| window == b"hello"),
+                    "binary terminal frame snapshot should carry raw terminal bytes"
+                );
             }
-            other => panic!("expected terminal frame batch, got {other:?}"),
+            other => panic!("expected binary terminal frame snapshot, got {other:?}"),
         }
     }
 
@@ -8619,6 +8589,83 @@ mod tests {
     }
 
     #[test]
+    fn packet_terminal_attach_rebases_to_snapshot_when_tail_crosses_resize() {
+        let (mut protocol, backend) = protocol();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let (_, mut device_session, _) =
+            open_packet_e2ee(&mut protocol, &mut connection, device_id);
+        pair_packet_device(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            device_id,
+            PublicKey("device-public-key".to_owned()),
+        );
+        let session_id =
+            create_test_packet_session(&mut protocol, &mut connection, &mut device_session);
+        backend.push_terminal_journal_frame_for_session(
+            session_id,
+            PtyTerminalFrame::Output {
+                terminal_seq: 1,
+                data: b"before-resize".to_vec(),
+            },
+        );
+        backend.push_terminal_journal_frame_for_session(
+            session_id,
+            PtyTerminalFrame::Resize {
+                terminal_seq: 2,
+                size: PtySize::new(40, 120),
+            },
+        );
+        backend.push_terminal_journal_frame_for_session(
+            session_id,
+            PtyTerminalFrame::Output {
+                terminal_seq: 3,
+                data: b"after-resize".to_vec(),
+            },
+        );
+
+        let attach_responses = send_encrypted_packet(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            ProtocolPacket::stream_open(
+                PacketRequestId::new(),
+                PacketStreamId::new(),
+                METHOD_TERMINAL_ATTACH,
+                128 * 1024,
+                serde_json::to_value(SessionAttachPayload {
+                    session_id,
+                    watch_updates: true,
+                    last_terminal_seq: Some(1),
+                })
+                .unwrap(),
+            ),
+        );
+        let _ = decrypt_first_packet(&mut device_session, attach_responses);
+
+        let output_packets = decrypt_packets(
+            &mut device_session,
+            connection.read_session_output(&mut protocol, session_id, 1024),
+        );
+        assert_eq!(output_packets.len(), 1);
+        let snapshot: TerminalFramePayload =
+            decode_payload(output_packets[0].payload.clone()).unwrap();
+        match snapshot {
+            TerminalFramePayload::Snapshot {
+                session_id: snapshot_session_id,
+                base_seq,
+                ..
+            } => {
+                assert_eq!(snapshot_session_id, session_id);
+                assert_eq!(base_seq, 3);
+            }
+            other => panic!("resize-crossing tail must rebase to snapshot, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn packet_terminal_snapshot_attach_advances_connection_cursor() {
         let (mut protocol, backend) = protocol();
         let (mut connection, _) = protocol.start_connection();
@@ -8700,6 +8747,87 @@ mod tests {
                 );
             }
             other => panic!("expected only fresh live output after snapshot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn packet_terminal_live_output_rebases_to_snapshot_when_poll_crosses_resize() {
+        let (mut protocol, backend) = protocol();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let (_, mut device_session, _) =
+            open_packet_e2ee(&mut protocol, &mut connection, device_id);
+        pair_packet_device(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            device_id,
+            PublicKey("device-public-key".to_owned()),
+        );
+        let session_id =
+            create_test_packet_session(&mut protocol, &mut connection, &mut device_session);
+
+        let attach_responses = send_encrypted_packet(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            ProtocolPacket::stream_open(
+                PacketRequestId::new(),
+                PacketStreamId::new(),
+                METHOD_TERMINAL_ATTACH,
+                128 * 1024,
+                serde_json::to_value(SessionAttachPayload {
+                    session_id,
+                    watch_updates: true,
+                    last_terminal_seq: None,
+                })
+                .unwrap(),
+            ),
+        );
+        let _ = decrypt_first_packet(&mut device_session, attach_responses);
+        let initial = decrypt_packets(
+            &mut device_session,
+            connection.read_session_output(&mut protocol, session_id, 1024),
+        );
+        assert_eq!(initial.len(), 1);
+        let initial_frame: TerminalFramePayload =
+            decode_payload(initial[0].payload.clone()).unwrap();
+        assert!(matches!(
+            initial_frame,
+            TerminalFramePayload::Snapshot { base_seq: 0, .. }
+        ));
+
+        let resize_size = TerminalSize::new(40, 120);
+        let resize_responses = send_encrypted_packet(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            ProtocolPacket::request(
+                PacketRequestId::new(),
+                METHOD_SESSION_RESIZE,
+                serde_json::to_value(SessionResizePayload {
+                    session_id,
+                    size: resize_size,
+                })
+                .unwrap(),
+            ),
+        );
+        let _ = decrypt_first_packet(&mut device_session, resize_responses);
+        backend.push_output_for_session(session_id, b"after-resize".to_vec());
+
+        let output_packets = decrypt_packets(
+            &mut device_session,
+            connection.read_session_output(&mut protocol, session_id, 1024),
+        );
+        assert_eq!(output_packets.len(), 1);
+        let snapshot: TerminalFramePayload =
+            decode_payload(output_packets[0].payload.clone()).unwrap();
+        match snapshot {
+            TerminalFramePayload::Snapshot { base_seq, size, .. } => {
+                assert_eq!(base_seq, 2);
+                assert_eq!(size, resize_size);
+            }
+            other => panic!("live resize-crossing poll must return snapshot, got {other:?}"),
         }
     }
 
@@ -9005,8 +9133,8 @@ mod tests {
         assert!(!first_packets.is_empty());
         assert_eq!(
             backend.terminal_snapshot_count_for_session(session_id),
-            1,
-            "第一次 attach 可以向 runtime/supervisor 同步权威 snapshot"
+            0,
+            "last_terminal_seq=0 且 live tail 连续时，第一次 poll 应直接使用 daemon log tail，不请求 supervisor snapshot"
         );
 
         let second_device_id = DeviceId::new();
@@ -9042,7 +9170,7 @@ mod tests {
 
         assert_eq!(
             backend.terminal_snapshot_count_for_session(session_id),
-            1,
+            0,
             "daemon 已有 terminal mirror/log 后，新 browser attach 不应再请求 supervisor snapshot"
         );
         let second_packets = decrypt_packets(
@@ -9238,7 +9366,7 @@ mod tests {
     }
 
     #[test]
-    fn packet_terminal_attach_pending_frames_schedule_output_wakeup() {
+    fn packet_terminal_attach_is_polled_without_pending_frame_queue() {
         let (mut protocol, backend) = protocol();
         let (mut connection, _) = protocol.start_connection();
         let device_id = DeviceId::new();
@@ -9284,16 +9412,22 @@ mod tests {
             PacketKind::Response
         );
 
-        // 中文注释：attach 入队 snapshot/tail 后必须立刻登记输出唤醒。
-        // relay/direct 主循环随后才会安排 push drain；不能只依赖 watcher 的初始事件。
-        assert!(
-            connection.debug_snapshot().pending_terminal_frames > 0,
-            "attach 应先把 terminal frame 放入连接内待发送队列"
+        // 中文注释：packet terminal attach 只建立 stream 与 poll cursor，不再把
+        // snapshot/tail 放进 per-client pending 队列；server/relay 后续通过一次
+        // output wakeup 调用 daemon poll 即可取到初始输出。
+        assert_eq!(connection.debug_snapshot().pending_terminal_frames, 0);
+        let output_packets = decrypt_packets(
+            &mut device_session,
+            connection.read_session_output(&mut protocol, session_id, 1024),
         );
+        assert_eq!(output_packets.len(), 1);
+        let frame: TerminalFramePayload =
+            decode_payload(output_packets[0].payload.clone()).unwrap();
+        assert_eq!(frame.terminal_seq(), Some(1));
         assert_eq!(
             connection.take_deferred_output_wakeups(),
-            vec![session_id],
-            "pending terminal frames 必须显式唤醒 server/relay 输出 drain"
+            Vec::<SessionId>::new(),
+            "attach 本身不再依赖连接内 pending 队列自唤醒"
         );
     }
 
@@ -9464,15 +9598,22 @@ mod tests {
             terminal_frame_payload_count(&payload) < 6000,
             "transport cap should leave the remaining tiny frames pending instead of one huge batch"
         );
-        assert!(
-            connection.debug_snapshot().pending_terminal_frames > 0,
-            "unsent terminal frames should remain pending for the next bounded push"
+        assert_eq!(
+            connection.debug_snapshot().pending_terminal_frames,
+            0,
+            "bounded terminal output should leave unsent frames behind the cursor, not in a per-client queue"
         );
         assert_eq!(
             connection.take_deferred_output_wakeups(),
             vec![created.session_id],
             "仍有待发 terminal frames 时，应由 server/relay 下一轮 push 继续发送，不能等浏览器 ACK 才推进"
         );
+        let second_packets = decrypt_packets(
+            &mut device_session,
+            connection.read_session_output(&mut protocol, created.session_id, 1024),
+        );
+        assert_eq!(second_packets.len(), 1);
+        assert_eq!(second_packets[0].seq, 2);
     }
 
     #[test]
@@ -9560,9 +9701,9 @@ mod tests {
         assert_eq!(first_packets.len(), 1);
         assert_eq!(first_packets[0].seq, 1);
         assert_eq!(
-            connection.debug_snapshot().pending_terminal_frames > 0,
-            true,
-            "部分 frame 应因为单批输出预算暂存在连接内 pending 队列"
+            connection.debug_snapshot().pending_terminal_frames,
+            0,
+            "部分 frame 应留在 daemon session log 中等待下一次 poll，而不是暂存在连接队列"
         );
         assert_eq!(
             connection.take_deferred_output_wakeups(),
@@ -9661,9 +9802,10 @@ mod tests {
             connection.read_session_output(&mut protocol, first_session, 1024),
         );
         assert_eq!(first_output.len(), 1);
-        assert!(
-            connection.debug_snapshot().pending_terminal_frames > 0,
-            "first session should leave unsent frames because the bounded batch is intentionally small"
+        assert_eq!(
+            connection.debug_snapshot().pending_terminal_frames,
+            0,
+            "bounded batch should not leave per-client terminal frame debt"
         );
 
         let second_stream = PacketStreamId::new();
@@ -9861,7 +10003,7 @@ mod tests {
             &mut device_session,
             connection.read_session_output(&mut protocol, session_id, 1024),
         );
-        assert!(connection.debug_snapshot().pending_terminal_frames > 0);
+        assert_eq!(connection.debug_snapshot().pending_terminal_frames, 0);
 
         let cancel_result = send_encrypted_packet(
             &mut protocol,
@@ -9909,7 +10051,7 @@ mod tests {
             &mut device_session,
             connection.read_session_output(&mut protocol, session_id, 1024),
         );
-        assert!(connection.debug_snapshot().pending_terminal_frames > 0);
+        assert_eq!(connection.debug_snapshot().pending_terminal_frames, 0);
         let end_result = send_encrypted_packet(
             &mut protocol,
             &mut connection,

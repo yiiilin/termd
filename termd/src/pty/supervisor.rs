@@ -1110,6 +1110,14 @@ impl SupervisorTerminalCache {
     }
 
     fn should_replay_attach_tail(&self, tail_events: &[&TerminalEvent]) -> bool {
+        if tail_events
+            .iter()
+            .any(|event| matches!(event, TerminalEvent::Resize { .. }))
+        {
+            // 中文注释：resize 会改变后续字节的换行和光标解释；跨 resize 的恢复必须
+            // 使用当前 screen snapshot，不能让客户端按旧尺寸 replay tail。
+            return false;
+        }
         let tail_bytes = tail_events
             .iter()
             .map(|event| event.replay_cost_bytes())
@@ -1289,6 +1297,14 @@ impl SupervisorTerminalMirror {
     }
 
     fn should_replay_attach_tail(&self, tail_events: &[&TerminalEvent]) -> bool {
+        if tail_events
+            .iter()
+            .any(|event| matches!(event, TerminalEvent::Resize { .. }))
+        {
+            // 中文注释：daemon mirror 是 supervisor snapshot 的副本，也必须保持同样的
+            // resize rebase 语义，避免 supervisor 重连前后恢复规则不一致。
+            return false;
+        }
         let tail_bytes = tail_events
             .iter()
             .map(|event| event.replay_cost_bytes())
@@ -2652,17 +2668,35 @@ mod tests {
     }
 
     #[test]
-    fn supervisor_terminal_resize_consumes_session_seq() {
+    fn supervisor_terminal_resize_rebases_tail_to_snapshot() {
         let mut state = SupervisorState::new(PtySize::new(4, 40));
         let output = state.record_output(b"before resize");
         let resize = state.resize(PtySize::new(10, 100));
 
         assert_eq!(output.terminal_seq(), Some(1));
         assert_eq!(resize.terminal_seq(), Some(2));
-        assert_eq!(
-            state.terminal_snapshot_or_tail_with_base(Some(1)).1,
-            vec![resize]
-        );
+        match state
+            .terminal_snapshot_or_tail_with_base(Some(1))
+            .1
+            .as_slice()
+        {
+            [
+                PtyTerminalFrame::Snapshot {
+                    base_seq,
+                    size,
+                    data,
+                },
+            ] => {
+                assert_eq!(*base_seq, 2);
+                assert_eq!(*size, PtySize::new(10, 100));
+                assert!(
+                    data.windows(b"before resize".len())
+                        .any(|window| window == b"before resize"),
+                    "resize 跨越恢复必须返回包含当前屏幕内容的 snapshot"
+                );
+            }
+            other => panic!("resize-crossing tail must return snapshot, got {other:?}"),
+        }
     }
 
     #[test]
