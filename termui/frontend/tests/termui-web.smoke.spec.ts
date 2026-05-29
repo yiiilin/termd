@@ -251,6 +251,85 @@ test("direct Web 慢普通 RPC 超时后终端仍可输入", async ({ page }, te
   }
 });
 
+test("direct Web 多个大输出 session 快速切换后仍贴底并能输入", async ({ page }, testInfo: TestInfo) => {
+  test.skip(testInfo.project.name === "mobile-chrome", "多 session 输出切换回归只需要桌面布局覆盖");
+  const firstSessionId = "00000000-0000-0000-0000-000000000521";
+  const secondSessionId = "00000000-0000-0000-0000-000000000522";
+  const daemon = await MockDaemon.start({
+    token: "secret-token",
+    sessions: [
+      {
+        session_id: firstSessionId,
+        name: "Direct Alpha",
+        state: "running",
+        size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+      },
+      {
+        session_id: secondSessionId,
+        name: "Direct Beta",
+        state: "running",
+        size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+      },
+    ],
+    attachOutput: "direct-attach-ready\n",
+  });
+
+  try {
+    await page.goto("/");
+    await page.getByLabel("WS URL").fill(daemon.url);
+    await page.getByLabel("Pairing token").fill(pairingInviteCode(daemon));
+    await activateButton(page, "Pair");
+
+    const terminalPane = page.getByTestId("terminal-pane");
+    await openSession(page, "Direct Alpha");
+    await expect.poll(() => daemon.attachedSessions.includes(firstSessionId)).toBe(true);
+    await expect(terminalPane.getByText("direct-attach-ready")).toBeVisible();
+    daemon.pushSessionData(
+      firstSessionId,
+      Array.from({ length: 180 }, (_, index) => `direct-alpha-bulk-${index}\n`).join("") + "direct-alpha-ready\n",
+    );
+    await expect(terminalPane.getByText("direct-alpha-ready")).toBeVisible();
+
+    await openSession(page, "Direct Beta");
+    await expect.poll(() => daemon.attachedSessions.includes(secondSessionId)).toBe(true);
+    await expect(terminalPane.getByText("direct-attach-ready")).toBeVisible();
+    daemon.pushSessionData(
+      secondSessionId,
+      Array.from({ length: 180 }, (_, index) => `direct-beta-bulk-${index}\n`).join("") + "direct-beta-ready\n",
+    );
+    await expect(terminalPane.getByText("direct-beta-ready")).toBeVisible();
+
+    // 中文注释：快速切换后旧 session 的 backlog 不能挡住当前 session 的最后输出。
+    for (let round = 0; round < 10; round += 1) {
+      await openSession(page, round % 2 === 0 ? "Direct Alpha" : "Direct Beta");
+    }
+    await openSession(page, "Direct Beta");
+    await expect.poll(() => daemon.attachedSessions.at(-1)).toBe(secondSessionId);
+    await expect(terminalPane.getByText("direct-attach-ready")).toBeVisible();
+    daemon.pushSessionData(secondSessionId, "direct-beta-tail-after-switch\n");
+    await expect(terminalPane.getByText("direct-beta-tail-after-switch")).toBeVisible();
+    await expectTerminalScrollAtBottom(page);
+
+    const resizer = page.getByRole("separator", { name: "Resize files panel" });
+    const box = await resizer.boundingBox();
+    expect(box).not.toBeNull();
+    await page.mouse.move((box?.x ?? 0) + (box?.width ?? 1) / 2, (box?.y ?? 0) + 20);
+    await page.mouse.down();
+    await page.mouse.move((box?.x ?? 0) - 120, (box?.y ?? 0) + 20);
+    await page.mouse.up();
+    await expectTerminalScrollAtBottom(page);
+
+    await terminalPane.click();
+    await page.getByRole("textbox", { name: "Terminal input" }).focus();
+    await page.keyboard.type("direct-switch-input-ok");
+    await page.keyboard.press("Enter");
+    await expect.poll(() => daemon.decryptedInputs.join("")).toContain("direct-switch-input-ok");
+    await expect(page.getByRole("alert", { name: "Connection error" })).toHaveCount(0);
+  } finally {
+    await daemon.stop();
+  }
+});
+
 function pairingInviteCode(daemon: MockDaemon): string {
   const payload = JSON.stringify({
     type: "termd_pairing_qr",
@@ -261,4 +340,19 @@ function pairingInviteCode(daemon: MockDaemon): string {
     expires_at_ms: Date.now() + 60_000,
   });
   return `termd-pair:v1:${Buffer.from(payload, "utf8").toString("base64url")}`;
+}
+
+async function openSession(page: Page, name: string): Promise<void> {
+  await page.getByRole("button", { name: `Open ${name}` }).click();
+}
+
+async function expectTerminalScrollAtBottom(page: Page): Promise<void> {
+  await expect
+    .poll(async () =>
+      page.locator(".terminal-scrollport").evaluate((element) => {
+        const maxScrollTop = Math.max(0, element.scrollHeight - element.clientHeight);
+        return element.scrollTop >= maxScrollTop - 2;
+      }),
+    )
+    .toBe(true);
 }

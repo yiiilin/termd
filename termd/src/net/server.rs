@@ -64,6 +64,7 @@ const WEBSOCKET_WIRE_QUEUE_CAPACITY: usize = 256;
 const WEBSOCKET_PUSH_EVENT_QUEUE_CAPACITY: usize = 1024;
 const WEBSOCKET_PUSH_DRAIN_MAX_EVENTS_PER_TICK: usize = 64;
 const WEBSOCKET_PUSH_DRAIN_MAX_ENQUEUED_BYTES_PER_TICK: usize = 16 * 1024 * 1024;
+const WEBSOCKET_PUSH_DRAIN_MAX_ELAPSED_PER_TICK: Duration = Duration::from_millis(4);
 const TERMINAL_OUTPUT_PUSH_COALESCE_DELAY: Duration = Duration::from_millis(10);
 
 fn websocket_idle_timeout_enabled() -> bool {
@@ -1484,10 +1485,13 @@ fn queue_websocket_push_drain_wakeup(
 fn websocket_push_drain_budget_exhausted(
     drained_events: usize,
     enqueued_bytes: usize,
-    _started_at: Instant,
+    started_at: Instant,
 ) -> bool {
+    let elapsed_budget_exhausted =
+        drained_events > 0 && started_at.elapsed() >= WEBSOCKET_PUSH_DRAIN_MAX_ELAPSED_PER_TICK;
     drained_events >= WEBSOCKET_PUSH_DRAIN_MAX_EVENTS_PER_TICK
         || enqueued_bytes >= WEBSOCKET_PUSH_DRAIN_MAX_ENQUEUED_BYTES_PER_TICK
+        || elapsed_budget_exhausted
 }
 
 fn websocket_wire_messages_wire_len(messages: &[ProtocolWireMessage]) -> usize {
@@ -1628,7 +1632,7 @@ async fn collect_websocket_push_event(
                 let lock_wait = lock_started.elapsed();
                 // 中文注释：protocol lock 只覆盖 PTY/runtime 读取；E2EE 加密在锁外完成。
                 // 这能避免某个直连 WebSocket 的大输出阻塞 relay mux 或其它直连输入。
-                let messages = connection.collect_session_output_messages(
+                let messages = connection.drain_session_output_messages_for_push(
                     &mut protocol,
                     session_id,
                     OUTPUT_FLUSH_MAX_BYTES_PER_SESSION,
@@ -2433,11 +2437,20 @@ mod tests {
             WEBSOCKET_PUSH_DRAIN_MAX_ENQUEUED_BYTES_PER_TICK,
             Instant::now()
         ));
-        assert!(!websocket_push_drain_budget_exhausted(
+        assert!(websocket_push_drain_budget_exhausted(
             1,
             0,
             Instant::now() - Duration::from_secs(60)
         ));
+    }
+
+    #[test]
+    fn websocket_push_drain_budget_stops_after_elapsed_window() {
+        let started_at = Instant::now() - WEBSOCKET_PUSH_DRAIN_MAX_ELAPSED_PER_TICK;
+
+        // 中文注释：时间预算只在至少 drain 过一个事件后生效，避免空 tick 自旋。
+        assert!(websocket_push_drain_budget_exhausted(1, 1024, started_at));
+        assert!(!websocket_push_drain_budget_exhausted(0, 1024, started_at));
     }
 
     #[tokio::test]
@@ -2918,7 +2931,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn websocket_pushes_session_output_without_client_poll_frame() {
+    async fn websocket_pushes_session_output_without_client_pull_frame() {
         let protocol = test_protocol("websocket-push");
         let server_id = protocol.lock().await.server_id();
         let pairing_token = {
@@ -2997,7 +3010,7 @@ mod tests {
             read_encrypted_ws(&mut socket, &mut device_session),
         )
         .await
-        .expect("daemon should push PTY output without client polling");
+        .expect("daemon should push PTY output without client pull frames");
         assert_eq!(pushed.kind, MessageType::SessionData);
         let payload: SessionDataPayload = decode_payload(pushed.payload).unwrap();
         assert_eq!(payload.session_id, created_payload.session_id);

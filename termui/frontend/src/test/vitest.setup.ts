@@ -24,6 +24,8 @@ afterEach(() => {
     .__TERMD_TEST_DEFER_XTERM_BUFFER_UNTIL_WRITE_CALLBACK__;
   delete (globalThis as { __TERMD_TEST_KEEP_XTERM_VIEWPORT_AT_TOP_AFTER_WRITE__?: boolean })
     .__TERMD_TEST_KEEP_XTERM_VIEWPORT_AT_TOP_AFTER_WRITE__;
+  delete (globalThis as { __TERMD_TEST_KEEP_XTERM_VIEWPORT_AT_TOP_AFTER_RESIZE__?: boolean })
+    .__TERMD_TEST_KEEP_XTERM_VIEWPORT_AT_TOP_AFTER_RESIZE__;
   delete (globalThis as { __TERMD_TEST_SERIALIZE_XTERM_WRITES__?: boolean })
     .__TERMD_TEST_SERIALIZE_XTERM_WRITES__;
   delete (globalThis as { __TERMD_TEST_DEFER_OUTPUT_RESET_APPLIED__?: (confirm: () => void) => void })
@@ -279,10 +281,16 @@ vi.mock("@xterm/xterm", () => {
       stats.operations.push({ op: "resize", cols, rows });
       const previousBaseY = this.buffer.active.baseY;
       const wasAtBottom = this.buffer.active.viewportY >= previousBaseY;
+      const keepViewportAtTop = Boolean(
+        (globalThis as { __TERMD_TEST_KEEP_XTERM_VIEWPORT_AT_TOP_AFTER_RESIZE__?: boolean })
+          .__TERMD_TEST_KEEP_XTERM_VIEWPORT_AT_TOP_AFTER_RESIZE__,
+      );
       this.cols = cols;
       this.rows = rows;
       this.buffer.active.baseY = Math.max(0, this.buffer.active.cursorY - this.rows + 1);
-      this.buffer.active.viewportY = wasAtBottom
+      this.buffer.active.viewportY = keepViewportAtTop
+        ? Math.min(this.buffer.active.viewportY, this.buffer.active.baseY)
+        : wasAtBottom
         ? this.buffer.active.baseY
         : Math.min(this.buffer.active.viewportY, this.buffer.active.baseY);
     }

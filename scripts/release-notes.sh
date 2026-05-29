@@ -12,6 +12,23 @@ version="${1:-}"
 }
 
 case "$version" in
+  0.3.10)
+    cat <<'EOF'
+termd 0.3.10
+
+用户可见变化:
+- direct 和 relay 的终端输出推送 drain 增加短时间预算；多个大输出 session 快速切换时，单个连接不会长时间占住发送循环，输入和切换恢复更及时。
+- 修复 resize、exit 等零字节 terminal frame 后，Web 终端可能等到下一次按键才刷新或滚到底部的问题；切换 session、调整尺寸和命令结束后的尾部内容会主动完成渲染收尾。
+- Vite/Monaco 构建拆分为更明确的 lazy chunks，消除前端构建的大 chunk 警告；编辑器仍按需加载，不增加终端首屏主路径负担。
+- relay 大帧发送日志降噪：快速发送的大 frame 不再刷 info 日志，真正慢发送或异常仍会保留可诊断日志。
+- 补充 direct Web 和真实 relay Web 的大输出快速切换回归测试，覆盖 0.5 秒切换 20 次后仍能贴底、恢复状态和继续输入。
+
+兼容性:
+- supervisor 兼容版本未变化，仍为 `0.3.5`；从 0.3.9 更新到 0.3.10 不应终止或清空已有 live session supervisor。
+- packet protocol version 仍为 3；relay 仍保持 dumb pipe，不解密、不解析业务明文。
+- 本版本没有引入 xterm 动态 chunk sizing；主要变化集中在 daemon/relay 发送调度、Web 渲染收尾和前端构建拆包。
+EOF
+    ;;
   0.3.9)
     cat <<'EOF'
 termd 0.3.9

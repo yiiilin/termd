@@ -1144,7 +1144,7 @@ export function TerminalPane(props: TerminalPaneProps) {
         renderedItems,
       };
     };
-    const afterTerminalWrite = () => {
+    const afterTerminalMutation = () => {
       if (disposed) {
         return;
       }
@@ -1154,16 +1154,16 @@ export function TerminalPane(props: TerminalPaneProps) {
       if (!needsPostWriteRefreshRef.current && !outputQueueIdle) {
         return;
       }
-      const shouldScrollBottomAfterWrite = outputQueueIdle && needsPostWriteScrollBottomRef.current;
+      const shouldScrollBottomAfterMutation = outputQueueIdle && needsPostWriteScrollBottomRef.current;
       needsPostWriteRefreshRef.current = false;
-      if (shouldScrollBottomAfterWrite) {
+      if (shouldScrollBottomAfterMutation) {
         needsPostWriteScrollBottomRef.current = false;
       }
-      // 首屏/清屏后的首个 write，以及一次 live 输出停止后的最后一笔 write，都需要
+      // 首屏/清屏后的首个 write，以及 resize/exit 这类零字节 mutation，都需要
       // 一次轻量 refresh。否则某些 xterm 渲染时序会等到下一次输入/resize 才 repaint 尾包。
       if (outputQueueIdle) {
         requestTrackedFrame(() => {
-          if (shouldScrollBottomAfterWrite) {
+          if (shouldScrollBottomAfterMutation) {
             scrollToBottom();
             scheduleScrollToBottom(4);
           }
@@ -1171,7 +1171,7 @@ export function TerminalPane(props: TerminalPaneProps) {
           // 切换 session 后浏览器布局和 xterm renderer 可能比 write callback 再晚一帧可绘制。
           // 队列已经 idle 时补第二帧刷新，不会放大持续输出路径的绘制压力。
           requestTrackedFrame(() => {
-            if (shouldScrollBottomAfterWrite) {
+            if (shouldScrollBottomAfterMutation) {
               scrollToBottom();
             }
             terminal.refresh(0, Math.max(0, terminal.rows - 1));
@@ -1188,6 +1188,11 @@ export function TerminalPane(props: TerminalPaneProps) {
       }
       const output = takePendingWrite();
       if (!output || output.bytes.byteLength === 0) {
+        if (needsPostWriteRefreshRef.current || needsPostWriteScrollBottomRef.current) {
+          // 中文注释：resize/exit 这类零字节 terminal frame 不会触发 xterm.write callback。
+          // 但 resize 已经改变了 xterm buffer/viewport，仍必须执行 terminal mutation 完成后的刷新和贴底收尾。
+          afterTerminalMutation();
+        }
         if (activeWriteRef.current || pendingWriteItemsRef.current.length > 0) {
           schedulePendingWrite();
         }
@@ -1203,7 +1208,7 @@ export function TerminalPane(props: TerminalPaneProps) {
         for (const item of output.renderedItems) {
           markItemRendered(item);
         }
-        afterTerminalWrite();
+        afterTerminalMutation();
         if (activeWriteRef.current || pendingWriteItemsRef.current.length > 0) {
           schedulePendingWrite();
         }

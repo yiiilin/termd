@@ -25,6 +25,8 @@ const CONTROL_CHANNEL_CAPACITY: usize = 256;
 const ROUTE_PRELUDE_TIMEOUT: Duration = Duration::from_secs(5);
 const WEBSOCKET_SEND_DEADLINE: Duration = Duration::from_secs(10);
 const WEBSOCKET_PONG_DEADLINE: Duration = Duration::from_secs(10);
+const WEBSOCKET_OUTBOUND_FRAME_PRESSURE_INFO_THRESHOLD: Duration = Duration::from_millis(50);
+const WEBSOCKET_OUTBOUND_FRAME_PRESSURE_DEBUG_BYTES: usize = 128 * 1024;
 #[cfg(not(test))]
 const WEBSOCKET_IDLE_PING_INTERVAL: Duration = Duration::from_secs(10);
 #[cfg(test)]
@@ -32,6 +34,26 @@ const WEBSOCKET_IDLE_PING_INTERVAL: Duration = Duration::from_millis(50);
 pub(crate) const WEBSOCKET_MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub(crate) const WEBSOCKET_MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
 type ConnectionId = u64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutboundFramePressureLevel {
+    None,
+    Debug,
+    Info,
+}
+
+fn websocket_outbound_frame_pressure_level(
+    frame_len: usize,
+    elapsed: Duration,
+) -> OutboundFramePressureLevel {
+    if elapsed >= WEBSOCKET_OUTBOUND_FRAME_PRESSURE_INFO_THRESHOLD {
+        return OutboundFramePressureLevel::Info;
+    }
+    if frame_len >= WEBSOCKET_OUTBOUND_FRAME_PRESSURE_DEBUG_BYTES {
+        return OutboundFramePressureLevel::Debug;
+    }
+    OutboundFramePressureLevel::None
+}
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct RelayTrafficBucket {
@@ -1999,17 +2021,32 @@ async fn send_relay_opaque_frame(
         return RelayWriteResult::Failed;
     }
     let elapsed = started_at.elapsed();
-    if elapsed >= Duration::from_millis(50) || frame_len >= 128 * 1024 {
-        info!(
-            server_id = %server_id.0,
-            ?role,
-            connection_id,
-            frame_kind,
-            frame_len,
-            channel,
-            elapsed_ms = elapsed.as_millis(),
-            "relay websocket outbound frame pressure"
-        );
+    match websocket_outbound_frame_pressure_level(frame_len, elapsed) {
+        OutboundFramePressureLevel::Info => {
+            info!(
+                server_id = %server_id.0,
+                ?role,
+                connection_id,
+                frame_kind,
+                frame_len,
+                channel,
+                elapsed_ms = elapsed.as_millis(),
+                "relay websocket outbound frame pressure"
+            );
+        }
+        OutboundFramePressureLevel::Debug => {
+            debug!(
+                server_id = %server_id.0,
+                ?role,
+                connection_id,
+                frame_kind,
+                frame_len,
+                channel,
+                elapsed_ms = elapsed.as_millis(),
+                "relay websocket outbound large frame"
+            );
+        }
+        OutboundFramePressureLevel::None => {}
     }
     RelayWriteResult::Sent
 }
@@ -2777,6 +2814,23 @@ mod tests {
             now + WEBSOCKET_IDLE_PING_INTERVAL,
             now
         ));
+    }
+
+    #[test]
+    fn websocket_outbound_frame_pressure_distinguishes_slow_from_fast_large_frames() {
+        // 中文注释：快速大帧是 terminal 流量的正常形态，不应刷 info 日志；慢发送才需要显眼诊断。
+        assert_eq!(
+            websocket_outbound_frame_pressure_level(256 * 1024, Duration::ZERO),
+            OutboundFramePressureLevel::Debug
+        );
+        assert_eq!(
+            websocket_outbound_frame_pressure_level(8 * 1024, Duration::from_millis(49)),
+            OutboundFramePressureLevel::None
+        );
+        assert_eq!(
+            websocket_outbound_frame_pressure_level(8 * 1024, Duration::from_millis(50)),
+            OutboundFramePressureLevel::Info
+        );
     }
 
     #[test]

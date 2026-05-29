@@ -399,6 +399,65 @@ describe("TerminalPane terminal sequence rendering", () => {
     }
   });
 
+  it("位于底部时纯 resize frame 也会重新贴到新的 PTY 底部", async () => {
+    vi.useFakeTimers();
+    try {
+      (globalThis as { __TERMD_TEST_KEEP_XTERM_VIEWPORT_AT_TOP_AFTER_RESIZE__?: boolean })
+        .__TERMD_TEST_KEEP_XTERM_VIEWPORT_AT_TOP_AFTER_RESIZE__ = true;
+      const encoder = new TextEncoder();
+      let queue: TerminalOutputItem[] = [
+        {
+          kind: "snapshot",
+          bytes: encoder.encode(Array.from({ length: 80 }, (_, index) => `snapshot-line-${index}\n`).join("")),
+          baseSeq: 0,
+          size: DEFAULT_TERMINAL_SIZE,
+        },
+      ];
+      let drainOutput: (() => void) | undefined;
+      const takeOutput = vi.fn(() => queue.splice(0));
+      const registerOutputDrain = vi.fn((drain: () => void) => {
+        drainOutput = drain;
+        drain();
+        return () => undefined;
+      });
+
+      render(
+        <TerminalPane
+          attached
+          sessionSize={{ rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 }}
+          outputResetVersion={0}
+          takeOutput={takeOutput}
+          registerOutputDrain={registerOutputDrain}
+          onInput={vi.fn()}
+          onResize={vi.fn()}
+          onCursorChange={vi.fn()}
+        />,
+      );
+
+      act(() => {
+        vi.advanceTimersByTime(animationFrameMs * 12);
+      });
+      const xterm = (globalThis as {
+        __TERMD_TEST_XTERM__?: { viewportY: () => number; baseY: () => number };
+      }).__TERMD_TEST_XTERM__;
+      expect(xterm?.baseY()).toBeGreaterThan(0);
+      expect(xterm?.viewportY()).toBe(xterm?.baseY());
+      const baseYBeforeResize = xterm?.baseY() ?? 0;
+
+      queue = [{ kind: "resize", terminalSeq: 1, size: { rows: 12, cols: 80, pixel_width: 0, pixel_height: 0 } }];
+      act(() => {
+        drainOutput?.();
+        vi.advanceTimersByTime(animationFrameMs * 8);
+      });
+
+      // 中文注释：resize frame 没有 output bytes；即使没有后续 write callback，也必须完成贴底。
+      expect(xterm?.baseY()).toBeGreaterThan(baseYBeforeResize);
+      expect(xterm?.viewportY()).toBe(xterm?.baseY());
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("不在底部时新输出不打断用户查看历史", async () => {
     vi.useFakeTimers();
     try {

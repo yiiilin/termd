@@ -83,6 +83,7 @@ const RELAY_MUX_DATA_QUEUE_CAPACITY: usize = 32;
 const RELAY_DATA_WIRE_QUEUE_CAPACITY: usize = 2048;
 const RELAY_PUSH_DRAIN_MAX_EVENTS_PER_TICK: usize = 64;
 const RELAY_PUSH_DRAIN_MAX_TRANSPORTED_BYTES_PER_TICK: usize = 16 * 1024 * 1024;
+const RELAY_PUSH_DRAIN_MAX_ELAPSED_PER_TICK: Duration = Duration::from_millis(4);
 const RELAY_PUSH_DRAIN_RETRY_DELAY: Duration = Duration::from_millis(5);
 const RELAY_OUTPUT_PUSH_COALESCE_DELAY: Duration = Duration::from_millis(10);
 
@@ -1606,7 +1607,7 @@ async fn drain_relay_data_push_events(
                 let (lock_wait, messages) = {
                     let lock_started = Instant::now();
                     let mut protocol = protocol.lock().await;
-                    let messages = connection.collect_session_output_messages(
+                    let messages = connection.drain_session_output_messages_for_push(
                         &mut protocol,
                         session_id,
                         OUTPUT_FLUSH_MAX_BYTES_PER_SESSION,
@@ -3328,7 +3329,7 @@ async fn drain_relay_push_events(
                     let lock_wait = lock_started.elapsed();
                     // 中文注释：全局 daemon protocol lock 只覆盖 runtime/状态读取。
                     // E2EE 加密和 mux 封包在锁外做，避免 relay 大输出拖慢直连 WebSocket。
-                    let messages = connection.collect_session_output_messages(
+                    let messages = connection.drain_session_output_messages_for_push(
                         &mut protocol,
                         session_id,
                         OUTPUT_FLUSH_MAX_BYTES_PER_SESSION,
@@ -3501,10 +3502,13 @@ fn queue_relay_push_drain_wakeup(
 fn relay_push_drain_budget_exhausted(
     drained_events: usize,
     transported_bytes: usize,
-    _started_at: Instant,
+    started_at: Instant,
 ) -> bool {
+    let elapsed_budget_exhausted =
+        drained_events > 0 && started_at.elapsed() >= RELAY_PUSH_DRAIN_MAX_ELAPSED_PER_TICK;
     drained_events >= RELAY_PUSH_DRAIN_MAX_EVENTS_PER_TICK
         || transported_bytes >= RELAY_PUSH_DRAIN_MAX_TRANSPORTED_BYTES_PER_TICK
+        || elapsed_budget_exhausted
 }
 
 #[cfg(test)]
@@ -4635,11 +4639,20 @@ mod tests {
             RELAY_PUSH_DRAIN_MAX_TRANSPORTED_BYTES_PER_TICK,
             Instant::now()
         ));
-        assert!(!relay_push_drain_budget_exhausted(
+        assert!(relay_push_drain_budget_exhausted(
             1,
             0,
             Instant::now() - Duration::from_secs(60)
         ));
+    }
+
+    #[test]
+    fn relay_push_drain_budget_stops_after_elapsed_window() {
+        let started_at = Instant::now() - RELAY_PUSH_DRAIN_MAX_ELAPSED_PER_TICK;
+
+        // 中文注释：时间预算只在至少 drain 过一个事件后生效，空 tick 不应被 reschedule。
+        assert!(relay_push_drain_budget_exhausted(1, 1024, started_at));
+        assert!(!relay_push_drain_budget_exhausted(0, 1024, started_at));
     }
 
     #[test]
@@ -6399,7 +6412,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn relay_mux_pushes_session_output_without_client_poll_frame() {
+    async fn relay_mux_pushes_session_output_without_client_pull_frame() {
         let protocol = test_protocol("mux-output-push");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -6522,7 +6535,7 @@ mod tests {
             read_encrypted_daemon_frame(&mut relay_socket, client_id, &mut device_e2ee),
         )
         .await
-        .expect("relay mux should push PTY output without client polling");
+        .expect("relay mux should push PTY output without client pull frames");
         assert_eq!(pushed.kind, MessageType::SessionData);
         let payload: termd_proto::SessionDataPayload = decode_payload(pushed.payload).unwrap();
         assert_eq!(payload.session_id, created_payload.session_id);
@@ -6688,7 +6701,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn relay_mux_pushes_file_tree_updates_without_client_poll_frame() {
+    async fn relay_mux_pushes_file_tree_updates_without_client_pull_frame() {
         let file_root = std::env::temp_dir().join(format!(
             "termd-relay-file-tree-root-{}-{}",
             std::process::id(),
@@ -6920,7 +6933,7 @@ mod tests {
             ),
         )
         .await
-        .expect("relay mux should push file tree updates without client polling");
+        .expect("relay mux should push file tree updates without client pull frames");
         assert_eq!(pushed.session_id, created_payload.session_id);
 
         fs::remove_dir_all(file_root).ok();

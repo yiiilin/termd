@@ -1184,10 +1184,10 @@ where
         let response_size = self.runtime_size_proto(&internal_session_id)?;
         let (output_offset, initial_output) = if connection.packet_mode {
             if enqueue_terminal_snapshot {
-                // 中文注释：terminal.create 只登记首轮 poll 需要 snapshot，不再把
+                // 中文注释：terminal.create 只登记首轮 drain 需要 snapshot，不再把
                 // snapshot 预先塞进 per-client 队列。stream 注册完成后的 push drain 会
-                // 从 daemon cache/supervisor poll 出相同的 terminal frame。
-                connection.set_terminal_poll_cursor(wire_session_id, None);
+                // 从 daemon cache/supervisor drain 出相同的 terminal frame。
+                connection.set_terminal_drain_cursor(wire_session_id, None);
             }
             (0, Vec::new())
         } else {
@@ -1250,9 +1250,9 @@ where
         let (output_offset, initial_output) = if payload.watch_updates {
             if connection.packet_mode {
                 // 中文注释：attach 阶段只保存 browser 的 terminal cursor。真正的
-                // snapshot/tail 在后续 output drain 中通过 daemon poll 读取，这样快速
+                // snapshot/tail 在后续 output drain 中通过 daemon drain cursor 读取，这样快速
                 // 切换 session 时不会给旧 client 留下待发送 terminal 队列。
-                connection.set_terminal_poll_cursor(payload.session_id, payload.last_terminal_seq);
+                connection.set_terminal_drain_cursor(payload.session_id, payload.last_terminal_seq);
                 (0, Vec::new())
             } else {
                 self.drain_runtime_output_to_history_until_empty(
@@ -2379,7 +2379,7 @@ where
                 .any(|frame| matches!(frame, TerminalFramePayload::Snapshot { .. }))
         {
             // 中文注释：部分 backend 可能先按 last_terminal_seq 返回 tail。只要 tail
-            // 跨过 resize，就重新请求当前 snapshot，保持 daemon poll 与 supervisor
+            // 跨过 resize，就重新请求当前 snapshot，保持 daemon drain cursor 与 supervisor
             // 权威恢复规则一致。
             frames = self
                 .runtime
@@ -2454,7 +2454,7 @@ where
             log.push(frame);
         }
 
-        let last_terminal_seq = connection.terminal_poll_last_seq(session_id);
+        let last_terminal_seq = connection.terminal_drain_last_seq(session_id);
         let cached_frames = self
             .session_terminal_frame_logs
             .get(&session_id)
@@ -3967,7 +3967,7 @@ impl ProtocolConnection {
     /// server/relay 层会先短暂持有全局 daemon protocol 锁调用这里，然后释放锁再调用
     /// `encrypt_collected_inner_messages_wire`。这样大 snapshot 或大 terminal batch 的加密与
     /// protobuf/JSON 编码不会阻塞其它 direct/relay 连接的控制请求。
-    pub fn collect_session_output_messages<B, V>(
+    pub fn drain_session_output_messages_for_push<B, V>(
         &mut self,
         protocol: &mut DaemonProtocol<B, V>,
         session_id: SessionId,
@@ -3977,7 +3977,7 @@ impl ProtocolConnection {
         B: PtyBackend,
         V: SignatureVerifier,
     {
-        self.try_collect_session_output_messages(protocol, session_id, max_bytes)
+        self.try_drain_session_output_messages_for_push(protocol, session_id, max_bytes)
     }
 
     /// 对已经离开 daemon 全局锁的内层消息做 E2EE 封包。
@@ -4314,7 +4314,7 @@ impl ProtocolConnection {
         }
     }
 
-    fn try_collect_session_output_messages<B, V>(
+    fn try_drain_session_output_messages_for_push<B, V>(
         &mut self,
         protocol: &mut DaemonProtocol<B, V>,
         session_id: SessionId,
@@ -4396,7 +4396,7 @@ impl ProtocolConnection {
 
             // 中文注释：terminal 输出不再等待 browser flow ACK，也不在连接里保存
             // 未发送 frame。batch 被字节或 transport 上限截断时，只推进已发送前缀的
-            // cursor；下一轮 push 从 daemon session log 继续 poll。
+            // cursor；下一轮 push 从 daemon session log 继续 drain。
             let terminal_output_has_more = self
                 .terminal_frame_next_seq(session_id)
                 .is_some_and(|next_seq| protocol.terminal_frame_log_has_from(session_id, next_seq));
@@ -4502,7 +4502,8 @@ impl ProtocolConnection {
         B: PtyBackend,
         V: SignatureVerifier,
     {
-        let messages = self.try_collect_session_output_messages(protocol, session_id, max_bytes)?;
+        let messages =
+            self.try_drain_session_output_messages_for_push(protocol, session_id, max_bytes)?;
         self.encrypt_inner_messages(messages)
     }
 
@@ -4516,7 +4517,8 @@ impl ProtocolConnection {
         B: PtyBackend,
         V: SignatureVerifier,
     {
-        let messages = self.try_collect_session_output_messages(protocol, session_id, max_bytes)?;
+        let messages =
+            self.try_drain_session_output_messages_for_push(protocol, session_id, max_bytes)?;
         self.encrypt_inner_messages_wire(messages)
     }
 
@@ -5352,12 +5354,12 @@ impl ProtocolConnection {
         )
     }
 
-    fn terminal_poll_last_seq(&self, session_id: SessionId) -> Option<u64> {
+    fn terminal_drain_last_seq(&self, session_id: SessionId) -> Option<u64> {
         self.terminal_frame_next_seq(session_id)
             .map(|next_seq| next_seq.saturating_sub(1))
     }
 
-    fn set_terminal_poll_cursor(&mut self, session_id: SessionId, last_terminal_seq: Option<u64>) {
+    fn set_terminal_drain_cursor(&mut self, session_id: SessionId, last_terminal_seq: Option<u64>) {
         match last_terminal_seq {
             Some(seq) => {
                 self.terminal_frame_snapshot_required.remove(&session_id);
@@ -8265,10 +8267,10 @@ mod tests {
                         .unwrap()
                         .windows(b"hello".len())
                         .any(|window| window == b"hello"),
-                    "terminal.create 首轮 poll 应返回包含当前输出的 snapshot"
+                    "terminal.create 首轮 drain 应返回包含当前输出的 snapshot"
                 );
             }
-            other => panic!("expected terminal poll snapshot, got {other:?}"),
+            other => panic!("expected terminal drain snapshot, got {other:?}"),
         }
     }
 
@@ -8827,7 +8829,7 @@ mod tests {
                 assert_eq!(base_seq, 2);
                 assert_eq!(size, resize_size);
             }
-            other => panic!("live resize-crossing poll must return snapshot, got {other:?}"),
+            other => panic!("live resize-crossing drain must return snapshot, got {other:?}"),
         }
     }
 
@@ -9134,7 +9136,7 @@ mod tests {
         assert_eq!(
             backend.terminal_snapshot_count_for_session(session_id),
             0,
-            "last_terminal_seq=0 且 live tail 连续时，第一次 poll 应直接使用 daemon log tail，不请求 supervisor snapshot"
+            "last_terminal_seq=0 且 live tail 连续时，第一次 drain 应直接使用 daemon log tail，不请求 supervisor snapshot"
         );
 
         let second_device_id = DeviceId::new();
@@ -9366,7 +9368,7 @@ mod tests {
     }
 
     #[test]
-    fn packet_terminal_attach_is_polled_without_pending_frame_queue() {
+    fn packet_terminal_attach_is_drained_without_pending_frame_queue() {
         let (mut protocol, backend) = protocol();
         let (mut connection, _) = protocol.start_connection();
         let device_id = DeviceId::new();
@@ -9412,9 +9414,9 @@ mod tests {
             PacketKind::Response
         );
 
-        // 中文注释：packet terminal attach 只建立 stream 与 poll cursor，不再把
+        // 中文注释：packet terminal attach 只建立 stream 与 drain cursor，不再把
         // snapshot/tail 放进 per-client pending 队列；server/relay 后续通过一次
-        // output wakeup 调用 daemon poll 即可取到初始输出。
+        // output wakeup 调用 daemon push drain 即可取到初始输出。
         assert_eq!(connection.debug_snapshot().pending_terminal_frames, 0);
         let output_packets = decrypt_packets(
             &mut device_session,
@@ -9703,7 +9705,7 @@ mod tests {
         assert_eq!(
             connection.debug_snapshot().pending_terminal_frames,
             0,
-            "部分 frame 应留在 daemon session log 中等待下一次 poll，而不是暂存在连接队列"
+            "部分 frame 应留在 daemon session log 中等待下一次 push drain，而不是暂存在连接队列"
         );
         assert_eq!(
             connection.take_deferred_output_wakeups(),
@@ -13321,7 +13323,11 @@ mod tests {
         }
 
         let messages = connection
-            .try_collect_session_output_messages(&mut protocol, created_payload.session_id, 4096)
+            .try_drain_session_output_messages_for_push(
+                &mut protocol,
+                created_payload.session_id,
+                4096,
+            )
             .unwrap();
 
         assert!(!messages.is_empty());
@@ -13995,7 +14001,7 @@ mod tests {
         );
 
         let messages = connection
-            .try_collect_session_output_messages(&mut protocol, session_id, 4)
+            .try_drain_session_output_messages_for_push(&mut protocol, session_id, 4)
             .unwrap();
         let data_chunks = messages
             .into_iter()

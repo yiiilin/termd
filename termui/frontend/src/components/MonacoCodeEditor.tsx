@@ -1,5 +1,5 @@
 import { useEffect, useRef, type ReactNode } from "react";
-import * as monaco from "monaco-editor/esm/vs/editor/editor.api.js";
+import * as monaco from "monaco-editor/esm/vs/editor/edcore.main.js";
 import "monaco-editor/min/vs/editor/editor.main.css";
 import "monaco-editor/esm/vs/basic-languages/markdown/markdown.contribution";
 import "monaco-editor/esm/vs/basic-languages/python/python.contribution";
