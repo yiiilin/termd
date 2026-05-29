@@ -161,6 +161,11 @@ function isLocallySupersededConnectionError(caught: unknown): boolean {
   return LOCALLY_SUPERSEDED_CONNECTION_ERROR_CODES.has(toSafeError(caught).code);
 }
 
+function isBackgroundStatusTransientError(caught: unknown): boolean {
+  const code = toSafeError(caught).code;
+  return code === "response_timeout" || isLocallySupersededConnectionError(caught);
+}
+
 function isDocumentHidden(): boolean {
   return typeof document !== "undefined" && document.visibilityState === "hidden";
 }
@@ -197,6 +202,63 @@ function createVisibilityAbortController(): { controller: AbortController; dispo
       window.removeEventListener("offline", abortWhenHidden);
     },
   };
+}
+
+function createLinkedAbortController(
+  ...signals: Array<AbortSignal | undefined>
+): { controller: AbortController; dispose: () => void } | undefined {
+  const activeSignals = signals.filter((signal): signal is AbortSignal => Boolean(signal));
+  if (activeSignals.length === 0) {
+    return undefined;
+  }
+  const controller = new AbortController();
+  const abortLinked = () => controller.abort();
+  for (const signal of activeSignals) {
+    if (signal.aborted) {
+      controller.abort();
+      continue;
+    }
+    signal.addEventListener("abort", abortLinked, { once: true });
+  }
+  return {
+    controller,
+    dispose: () => {
+      for (const signal of activeSignals) {
+        signal.removeEventListener("abort", abortLinked);
+      }
+    },
+  };
+}
+
+function connectionAbortedError(): ProtocolClientError {
+  return new ProtocolClientError("connection_closed", "connection closed");
+}
+
+function throwIfConnectionAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) {
+    throw connectionAbortedError();
+  }
+}
+
+function abortableConnectionStep<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) {
+    return promise;
+  }
+  throwIfConnectionAborted(signal);
+  return new Promise((resolve, reject) => {
+    const abort = () => reject(connectionAbortedError());
+    signal.addEventListener("abort", abort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", abort);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener("abort", abort);
+        reject(error);
+      },
+    );
+  });
 }
 
 export interface DaemonNetworkCounterSample {
@@ -280,6 +342,7 @@ export default function App() {
   const attachClientRef = useRef<DirectClient | undefined>(undefined);
   const pendingAttachClientRef = useRef<DirectClient | undefined>(undefined);
   const workspaceClientPromiseRef = useRef<Promise<DirectClient> | undefined>(undefined);
+  const workspaceClientAbortControllerRef = useRef<AbortController | undefined>(undefined);
   const workspaceClientGenerationRef = useRef(0);
   const mobileTitlePullGestureRef = useRef<MobileTitlePullGesture | undefined>(undefined);
   const suppressMobileTitleClickRef = useRef(false);
@@ -351,6 +414,8 @@ export default function App() {
 
   const closeWorkspaceClient = useCallback(() => {
     workspaceClientGenerationRef.current += 1;
+    workspaceClientAbortControllerRef.current?.abort();
+    workspaceClientAbortControllerRef.current = undefined;
     receiveLoopActiveRef.current = false;
     receiveLoopGenerationRef.current += 1;
     workspaceClientPromiseRef.current = undefined;
@@ -1044,7 +1109,7 @@ export default function App() {
     [activeServer?.server_id, resetWorkspaceState, state.pairedServers],
   );
 
-  const authenticatedClient = useCallback(async (timeoutMs = APP_CONNECTION_TIMEOUT_MS) => {
+  const authenticatedClient = useCallback(async (timeoutMs = APP_CONNECTION_TIMEOUT_MS, signal?: AbortSignal) => {
     const server = activeServer;
     const device = state.device;
     if (!server || !device) {
@@ -1054,23 +1119,28 @@ export default function App() {
       throw pageHiddenConnectionError();
     }
     const visibilityAbort = createVisibilityAbortController();
+    const linkedAbort = createLinkedAbortController(signal, visibilityAbort?.controller.signal);
+    const abortSignal = linkedAbort?.controller.signal;
     let client: DirectClient | undefined;
     const closeClientOnAbort = () => client?.close();
     const reachableUrl = browserReachableWsUrl(server.url);
     const routeUrl = routeWsUrlForKnownServer(reachableUrl, server.server_id) ?? reachableUrl;
     try {
+      throwIfConnectionAborted(abortSignal);
       client = await DirectClient.connect(routeUrl, server.server_id, device.device_id, {
         expectedDaemonPublicKey: server.daemon_public_key,
         timeoutMs,
         requestTimeoutMs: APP_CONNECTION_TIMEOUT_MS,
-        signal: visibilityAbort?.controller.signal,
+        signal: abortSignal,
       });
-      visibilityAbort?.controller.signal.addEventListener("abort", closeClientOnAbort, { once: true });
-      if (visibilityAbort?.controller.signal.aborted || isPagePaused()) {
+      abortSignal?.addEventListener("abort", closeClientOnAbort, { once: true });
+      if (abortSignal?.aborted || isPagePaused()) {
         throw pageHiddenConnectionError();
       }
-      await client.authenticate(device, { ...server, url: routeUrl });
-      if (visibilityAbort?.controller.signal.aborted || isPagePaused()) {
+      // 中文注释：connect 后的 auth 仍属于同一个 workspace 建连生命周期；
+      // session 切换 abort 时要立刻 reject 并关闭 socket，不能等 request timeout。
+      await abortableConnectionStep(client.authenticate(device, { ...server, url: routeUrl }), abortSignal);
+      if (abortSignal?.aborted || isPagePaused()) {
         throw pageHiddenConnectionError();
       }
       return client;
@@ -1080,7 +1150,8 @@ export default function App() {
       client?.close();
       throw caught;
     } finally {
-      visibilityAbort?.controller.signal.removeEventListener("abort", closeClientOnAbort);
+      abortSignal?.removeEventListener("abort", closeClientOnAbort);
+      linkedAbort?.dispose();
       visibilityAbort?.dispose();
     }
   }, [activeServer, state.device]);
@@ -1098,9 +1169,17 @@ export default function App() {
       return workspaceClientPromiseRef.current;
     }
     const requestGeneration = workspaceClientGenerationRef.current;
+    const abortController = new AbortController();
+    workspaceClientAbortControllerRef.current = abortController;
+    const clearAbortController = () => {
+      if (workspaceClientAbortControllerRef.current === abortController) {
+        workspaceClientAbortControllerRef.current = undefined;
+      }
+    };
     let promise: Promise<DirectClient>;
-    promise = authenticatedClient(timeoutMs)
+    promise = authenticatedClient(timeoutMs, abortController.signal)
       .then((client) => {
+        clearAbortController();
         if (workspaceClientGenerationRef.current !== requestGeneration) {
           // 中文注释：daemon 切换、session 切换或 workspace reset 可能发生在握手进行中。
           // 迟到的旧 client 只能关闭，不能重新写回 attachClientRef 污染当前 session。
@@ -1112,6 +1191,7 @@ export default function App() {
         return client;
       })
       .catch((caught) => {
+        clearAbortController();
         if (workspaceClientGenerationRef.current === requestGeneration) {
           workspaceClientPromiseRef.current = undefined;
         }
@@ -1459,7 +1539,12 @@ export default function App() {
         throw caught;
       }
     } catch (caught) {
-      if (isCurrentRequest()) {
+      // 中文注释：daemon.status 是旁路状态轮询。session 切换会主动关闭旧 WebSocket，
+      // 大量 terminal 输出也可能让状态 RPC 晚于 5s 返回；这些都不代表当前终端不可用。
+      // 真实终端断线由 attach receive loop 和 workspace 刷新链路收口。
+      if (isCurrentRequest() && isBackgroundStatusTransientError(caught)) {
+        setDaemonStatusError(undefined);
+      } else if (isCurrentRequest()) {
         setDaemonStatusError(toSafeError(caught));
       }
       if (isCurrentRequest() && !attachClientRef.current) {
@@ -2031,7 +2116,9 @@ export default function App() {
       // 只保留最后停住的目标，避免上一个 session 的大 snapshot 继续占用当前连接。
       if (
         attachedSessionRef.current !== undefined ||
-        attachClientRef.current !== undefined
+        attachClientRef.current !== undefined ||
+        pendingAttachClientRef.current !== undefined ||
+        workspaceClientPromiseRef.current !== undefined
       ) {
         // 80ms 合并窗口只延迟“新 session attach”，不能让旧 session 的输出继续进入
         // xterm。否则旧的大 snapshot/持续输出会占住主线程和当前 session 连接。

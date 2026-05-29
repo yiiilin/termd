@@ -109,6 +109,7 @@ vi.mock("@xterm/xterm", () => {
         select: (text: string) => void;
         viewportY: () => number;
         baseY: () => number;
+        scrollToLine: (line: number) => void;
       } }).__TERMD_TEST_XTERM__ = {
         select: (text: string) => {
           this.selection = text;
@@ -116,6 +117,7 @@ vi.mock("@xterm/xterm", () => {
         },
         viewportY: () => this.buffer.active.viewportY,
         baseY: () => this.buffer.active.baseY,
+        scrollToLine: (line: number) => this.scrollToLine(line),
       };
     }
 
@@ -179,6 +181,8 @@ vi.mock("@xterm/xterm", () => {
       const applyBufferEffects = () => {
         const lines = text.split("\n");
         const lastLine = lines[lines.length - 1] ?? "";
+        const previousBaseY = this.buffer.active.baseY;
+        const wasAtBottom = this.buffer.active.viewportY >= previousBaseY;
         if (text.includes("\n")) {
           this.buffer.active.cursorY += lines.length - 1;
           this.buffer.active.cursorX = lastLine.length;
@@ -188,7 +192,9 @@ vi.mock("@xterm/xterm", () => {
         this.buffer.active.baseY = Math.max(0, this.buffer.active.cursorY - this.rows + 1);
         this.buffer.active.viewportY = keepViewportAtTop
           ? Math.min(this.buffer.active.viewportY, this.buffer.active.baseY)
-          : this.buffer.active.baseY;
+          : wasAtBottom
+            ? this.buffer.active.baseY
+            : Math.min(this.buffer.active.viewportY, this.buffer.active.baseY);
         this.writeParsedListeners.forEach((listener) => listener());
         this.cursorMoveListeners.forEach((listener) => listener());
         this.scrollListeners.forEach((listener) => listener(this.buffer.active.viewportY));

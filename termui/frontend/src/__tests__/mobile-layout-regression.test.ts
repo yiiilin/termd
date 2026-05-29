@@ -18,8 +18,10 @@ describe("mobile layout regressions", () => {
     expect(css).toContain(".daemon-cpu-bar-chart {\n    display: none;");
     expect(css).toContain("minmax(124px, 1.25fr);");
     expect(css).toContain(".daemon-status-strip .daemon-status-network strong {\n    min-width: max-content;");
-    expect(css).toContain("position: fixed !important;");
-    expect(css).toContain("min-height: 0 !important;");
+    const helperTextareaBlock = css.match(/\.terminal-host \.xterm \.xterm-helper-textarea \{[^}]+\}/)?.[0] ?? "";
+    expect(helperTextareaBlock).toContain("IME 候选窗和系统复制/粘贴菜单都依赖它的坐标");
+    expect(helperTextareaBlock).not.toContain("position: fixed !important;");
+    expect(helperTextareaBlock).not.toContain("width: 1px !important;");
   });
 
   it("keeps terminal search result text in its own grid column before the close button", () => {

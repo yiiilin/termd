@@ -3206,6 +3206,8 @@ mod tests {
                 protocol_version: ProtocolVersion(PROTOCOL_PACKET_VERSION),
                 nonce: termd_proto::Nonce("route-test-nonce".to_owned()),
                 route_generation: None,
+                client_id: None,
+                data_token: None,
                 timestamp_ms: current_unix_timestamp_millis(),
             },
         );

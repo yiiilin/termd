@@ -3258,14 +3258,8 @@ label {
   }
 
   .terminal-host .xterm .xterm-helper-textarea {
-    position: fixed !important;
-    left: 0 !important;
-    top: 0 !important;
-    right: auto !important;
-    bottom: auto !important;
-    width: 1px !important;
+    /* 中文注释：xterm 会按光标位置移动这个 textarea，IME 候选窗和系统复制/粘贴菜单都依赖它的坐标。 */
     min-width: 0 !important;
-    height: 1px !important;
     min-height: 0 !important;
     padding: 0 !important;
     border: 0 !important;

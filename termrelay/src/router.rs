@@ -71,9 +71,8 @@ mod tests {
     use futures_util::{SinkExt, StreamExt};
     use std::time::Duration;
     use termd_proto::{
-        Envelope, MessageType, Nonce, ProtocolVersion, RelayMuxEnvelope, RelayOpaqueFrame,
+        Envelope, MessageType, Nonce, ProtocolVersion, RelayClientId, RelayControlEnvelope,
         RouteHelloPayload, RouteReadyPayload, RouteRole, ServerId,
-        decode_binary_relay_mux_envelope, encode_binary_relay_mux_envelope,
     };
     use tokio::net::TcpListener;
     use tokio::time::timeout;
@@ -145,7 +144,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn websocket_route_prelude_forwards_non_json_text_and_binary() {
+    async fn websocket_route_prelude_forwards_non_json_text_and_binary_raw() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let _server = tokio::spawn(async move {
@@ -154,50 +153,34 @@ mod tests {
                 .unwrap();
         });
         let server_id = ServerId::new();
-
         let url = format!("ws://{addr}/ws");
-        let (mut daemon_mux, _daemon_response) = connect_async(url.clone()).await.unwrap();
-        register_route(&mut daemon_mux, server_id, RouteRole::DaemonMux).await;
-        let (mut client, _client_response) = connect_async(url).await.unwrap();
-        let client_id =
-            register_client_route_with_daemon_bootstrap(&mut client, &mut daemon_mux, server_id)
-                .await;
+        let (mut daemon_control, _daemon_response) = connect_async(url.clone()).await.unwrap();
+        register_route(&mut daemon_control, server_id, RouteRole::DaemonControl).await;
+        let (mut client, mut daemon_data, _) =
+            register_client_data_pipe(&url, server_id, &mut daemon_control).await;
 
-        // The post-prelude frame is intentionally invalid JSON; relay must keep it opaque.
+        // 中文注释：prelude 之后的帧必须保持 opaque，即使它不是 JSON，也不能被 relay 解析。
         client
             .send(ClientMessage::Text("{not-json".to_owned()))
             .await
             .unwrap();
         assert_eq!(
-            next_mux(&mut daemon_mux).await,
-            RelayMuxEnvelope::ClientFrame {
-                client_id,
-                frame: RelayOpaqueFrame::Text {
-                    data: "{not-json".to_owned(),
-                },
-            }
+            next_data_frame(&mut daemon_data).await.unwrap(),
+            ClientMessage::Text("{not-json".to_owned())
         );
 
-        let response = RelayMuxEnvelope::DaemonFrame {
-            client_id,
-            frame: RelayOpaqueFrame::Binary {
-                data_base64: "AAECAw==".to_owned(),
-            },
-        };
-        daemon_mux
-            .send(ClientMessage::Text(
-                serde_json::to_string(&response).unwrap(),
-            ))
+        daemon_data
+            .send(ClientMessage::Binary(vec![0, 1, 2, 3]))
             .await
             .unwrap();
         assert_eq!(
-            client.next().await.unwrap().unwrap(),
+            next_data_frame(&mut client).await.unwrap(),
             ClientMessage::Binary(vec![0, 1, 2, 3])
         );
     }
 
     #[tokio::test]
-    async fn daemon_mux_reader_is_not_blocked_by_client_to_daemon_backpressure() {
+    async fn independent_data_pipes_keep_forwarding_when_another_client_backpressures() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let _server = tokio::spawn(async move {
@@ -207,27 +190,15 @@ mod tests {
         });
         let server_id = ServerId::new();
         let url = format!("ws://{addr}/ws");
-        let (mut daemon_mux, _daemon_response) = connect_async(url.clone()).await.unwrap();
-        register_route(&mut daemon_mux, server_id, RouteRole::DaemonMux).await;
-        let (mut target_client, _target_response) = connect_async(url.clone()).await.unwrap();
-        let target_client_id = register_client_route_with_daemon_bootstrap(
-            &mut target_client,
-            &mut daemon_mux,
-            server_id,
-        )
-        .await;
-        let (mut flood_client, _flood_response) = connect_async(url).await.unwrap();
-        let _flood_client_id = register_client_route_with_daemon_bootstrap(
-            &mut flood_client,
-            &mut daemon_mux,
-            server_id,
-        )
-        .await;
+        let (mut daemon_control, _daemon_response) = connect_async(url.clone()).await.unwrap();
+        register_route(&mut daemon_control, server_id, RouteRole::DaemonControl).await;
+        let (mut target_client, mut target_data, _) =
+            register_client_data_pipe(&url, server_id, &mut daemon_control).await;
+        let (mut flood_client, _flood_data, _) =
+            register_client_data_pipe(&url, server_id, &mut daemon_control).await;
 
-        // 中文注释：这里刻意不再读取 daemon_mux。旧实现的 relay daemon-mux task 会在把
-        // flood client 的大帧写向 daemon 时卡住，因而无法继续读取 daemon 反向发来的响应。
         let flood_payload = vec![b'x'; 900 * 1024];
-        for _ in 0..96 {
+        for _ in 0..16 {
             if tokio::time::timeout(
                 Duration::from_millis(20),
                 flood_client.send(ClientMessage::Binary(flood_payload.clone())),
@@ -238,17 +209,10 @@ mod tests {
                 break;
             }
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let response = RelayMuxEnvelope::DaemonFrame {
-            client_id: target_client_id,
-            frame: RelayOpaqueFrame::Text {
-                data: "daemon-response-while-backpressured".to_owned(),
-            },
-        };
-        daemon_mux
-            .send(ClientMessage::Binary(
-                encode_binary_relay_mux_envelope(&response).unwrap(),
+        target_data
+            .send(ClientMessage::Text(
+                "daemon-response-while-other-pipe-backpressured".to_owned(),
             ))
             .await
             .unwrap();
@@ -258,30 +222,18 @@ mod tests {
             next_data_frame(&mut target_client),
         )
         .await
-        .expect(
-            "daemon mux reader must keep forwarding daemon frames while writer is backpressured",
-        )
+        .expect("independent daemon data pipe should keep forwarding")
         .expect("target client websocket should produce a data frame");
         assert_eq!(
             received,
-            ClientMessage::Text("daemon-response-while-backpressured".to_owned())
+            ClientMessage::Text("daemon-response-while-other-pipe-backpressured".to_owned())
         );
     }
 
     type TestSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
     async fn register_route(socket: &mut TestSocket, server_id: ServerId, role: RouteRole) {
-        let hello = Envelope::new(
-            MessageType::RouteHello,
-            RouteHelloPayload {
-                server_id,
-                role,
-                protocol_version: ProtocolVersion::default(),
-                nonce: Nonce("route-test-nonce".to_owned()),
-                route_generation: None,
-                timestamp_ms: termd_proto::UnixTimestampMillis(1_710_000_000_000),
-            },
-        );
+        let hello = route_hello(server_id, role, None, None);
         socket
             .send(ClientMessage::Text(serde_json::to_string(&hello).unwrap()))
             .await
@@ -294,76 +246,94 @@ mod tests {
         assert_eq!(ready.payload.role, role);
     }
 
-    async fn register_client_route_with_daemon_bootstrap(
-        client: &mut TestSocket,
-        daemon_mux: &mut TestSocket,
+    async fn register_client_data_pipe(
+        url: &str,
         server_id: ServerId,
-    ) -> termd_proto::RelayClientId {
-        let hello = Envelope::new(
-            MessageType::RouteHello,
-            RouteHelloPayload {
-                server_id,
-                role: RouteRole::Client,
-                protocol_version: ProtocolVersion::default(),
-                nonce: Nonce("route-test-client-nonce".to_owned()),
-                route_generation: None,
-                timestamp_ms: termd_proto::UnixTimestampMillis(1_710_000_000_000),
-            },
-        );
+        daemon_control: &mut TestSocket,
+    ) -> (TestSocket, TestSocket, RelayClientId) {
+        let (mut client, _client_response) = connect_async(url).await.unwrap();
         client
-            .send(ClientMessage::Text(serde_json::to_string(&hello).unwrap()))
+            .send(ClientMessage::Text(
+                serde_json::to_string(&route_hello(server_id, RouteRole::Client, None, None))
+                    .unwrap(),
+            ))
             .await
             .unwrap();
+        let (client_id, data_token) = expect_open_data(daemon_control).await;
 
-        let client_id = match next_mux(daemon_mux).await {
-            RelayMuxEnvelope::ClientConnected { client_id } => client_id,
-            other => panic!("expected client_connected envelope, got {other:?}"),
-        };
-        let bootstrap = RelayMuxEnvelope::DaemonFrame {
-            client_id,
-            frame: RelayOpaqueFrame::Text {
-                data: "route-bootstrap".to_owned(),
-            },
-        };
-        daemon_mux
-            .send(ClientMessage::Binary(
-                encode_binary_relay_mux_envelope(&bootstrap).unwrap(),
+        let (mut daemon_data, _data_response) = connect_async(url).await.unwrap();
+        let data_hello = route_hello(
+            server_id,
+            RouteRole::DaemonData,
+            Some(client_id),
+            Some(data_token),
+        );
+        daemon_data
+            .send(ClientMessage::Text(
+                serde_json::to_string(&data_hello).unwrap(),
             ))
             .await
             .unwrap();
 
-        let ready: Envelope<RouteReadyPayload> =
-            serde_json::from_str(&next_text(client).await).unwrap();
-        assert_eq!(ready.kind, MessageType::RouteReady);
-        assert_eq!(ready.payload.server_id, server_id);
-        assert_eq!(ready.payload.role, RouteRole::Client);
-        assert_eq!(
-            next_data_frame(client).await.unwrap(),
-            ClientMessage::Text("route-bootstrap".to_owned())
-        );
-        client_id
+        let data_ready: Envelope<RouteReadyPayload> =
+            serde_json::from_str(&next_text(&mut daemon_data).await).unwrap();
+        assert_eq!(data_ready.kind, MessageType::RouteReady);
+        assert_eq!(data_ready.payload.role, RouteRole::DaemonData);
+        let client_ready: Envelope<RouteReadyPayload> =
+            serde_json::from_str(&next_text(&mut client).await).unwrap();
+        assert_eq!(client_ready.kind, MessageType::RouteReady);
+        assert_eq!(client_ready.payload.role, RouteRole::Client);
+
+        (client, daemon_data, client_id)
     }
 
-    async fn next_text(socket: &mut TestSocket) -> String {
-        match socket.next().await.unwrap().unwrap() {
-            ClientMessage::Text(text) => text,
-            other => panic!("expected text frame, got {other:?}"),
+    fn route_hello(
+        server_id: ServerId,
+        role: RouteRole,
+        client_id: Option<RelayClientId>,
+        data_token: Option<Nonce>,
+    ) -> Envelope<RouteHelloPayload> {
+        Envelope::new(
+            MessageType::RouteHello,
+            RouteHelloPayload {
+                server_id,
+                role,
+                protocol_version: ProtocolVersion::default(),
+                nonce: Nonce("route-test-nonce".to_owned()),
+                route_generation: None,
+                client_id,
+                data_token,
+                timestamp_ms: termd_proto::UnixTimestampMillis(1_710_000_000_000),
+            },
+        )
+    }
+
+    async fn expect_open_data(socket: &mut TestSocket) -> (RelayClientId, Nonce) {
+        loop {
+            match socket.next().await.unwrap().unwrap() {
+                ClientMessage::Text(text) => {
+                    match serde_json::from_str::<RelayControlEnvelope>(&text)
+                        .expect("relay control envelope should decode")
+                    {
+                        RelayControlEnvelope::OpenData {
+                            client_id,
+                            data_token,
+                        } => return (client_id, data_token),
+                        other => panic!("expected open_data, got {other:?}"),
+                    }
+                }
+                ClientMessage::Ping(_) | ClientMessage::Pong(_) => continue,
+                other => panic!("expected relay control text frame, got {other:?}"),
+            }
         }
     }
 
-    async fn next_mux(socket: &mut TestSocket) -> RelayMuxEnvelope {
+    async fn next_text(socket: &mut TestSocket) -> String {
         loop {
             match socket.next().await.unwrap().unwrap() {
-                ClientMessage::Text(text) => return serde_json::from_str(&text).unwrap(),
-                ClientMessage::Binary(bytes) => {
-                    return decode_binary_relay_mux_envelope(&bytes).unwrap();
-                }
-                ClientMessage::Ping(_) | ClientMessage::Pong(_) => {
-                    // 中文注释：relay 的 idle ping 是 WebSocket 控制帧。
-                    // 这些帧不能影响 mux 业务断言，测试只等待下一笔业务 frame。
-                    continue;
-                }
-                other => panic!("expected mux frame, got {other:?}"),
+                ClientMessage::Text(text) => return text,
+                ClientMessage::Ping(_) | ClientMessage::Pong(_) => continue,
+                other => panic!("expected text frame, got {other:?}"),
             }
         }
     }
@@ -371,10 +341,7 @@ mod tests {
     async fn next_data_frame(socket: &mut TestSocket) -> Option<ClientMessage> {
         loop {
             match socket.next().await?.unwrap() {
-                ClientMessage::Ping(_) | ClientMessage::Pong(_) => {
-                    // 中文注释：控制帧由 transport 使用，不是 relay 业务输出。
-                    continue;
-                }
+                ClientMessage::Ping(_) | ClientMessage::Pong(_) => continue,
                 frame => return Some(frame),
             }
         }

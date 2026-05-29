@@ -187,6 +187,7 @@ export class MockDaemon {
   private failWatchedTerminalAttachRequests = 0;
   private closeDaemonStatusRequests = 0;
   private closeDaemonClientsRequests = 0;
+  private nextRouteReadyGate: Promise<void> | undefined;
   private readonly queuedSessionListResponses: QueuedSessionListResponse[] = [];
   private readonly e2eeKeypair: E2eeKeyPair;
   private readonly trustedDevices = new Map<UUID, TrustedDevice>();
@@ -336,6 +337,18 @@ export class MockDaemon {
     // 中文注释：恢复链路测试需要先完成初次 pairing/attach，再只把下一条新连接变慢。
     // 直接在启动参数里设置一次性延迟会误伤初次 pairing，无法覆盖真实的后台恢复路径。
     this.options.routeReadyDelayOnceMs = delayMs;
+  }
+
+  holdNextRouteReady(): () => void {
+    let releaseGate: () => void = () => {};
+    // 中文注释：快速切换测试需要精确卡住某一次 route_ready，而不是依赖计时器；
+    // 这样可以稳定复现“旧 workspace connect 未完成就切到新 session”的半开连接。
+    this.nextRouteReadyGate = new Promise<void>((resolve) => {
+      releaseGate = resolve;
+    });
+    return () => {
+      releaseGate();
+    };
   }
 
   private accept(socket: WebSocket, requestPath: string): void {
@@ -510,6 +523,12 @@ export class MockDaemon {
       // 中文注释：一次性慢 route prelude 用来复现浏览器从后台恢复时，
       // 第一条 relay/client 连接被短超时误杀，后续 attach 仍应按长超时恢复。
       this.options.routeReadyDelayOnceMs = undefined;
+    }
+    const routeReadyGate = this.nextRouteReadyGate;
+    if (routeReadyGate) {
+      this.nextRouteReadyGate = undefined;
+      void routeReadyGate.then(sendPrelude);
+      return;
     }
     if (routeReadyDelayMs) {
       setTimeout(sendPrelude, routeReadyDelayMs);

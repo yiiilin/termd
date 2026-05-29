@@ -179,13 +179,23 @@ function restoreDocumentVisibility(): void {
   Reflect.deleteProperty(document, "hidden");
 }
 
-function dispatchMobileTextInput(target: HTMLTextAreaElement, data: string): InputEvent {
+function dispatchMobileTextInput(
+  target: HTMLTextAreaElement,
+  data: string,
+  options: { isComposing?: boolean } = {},
+): InputEvent {
   const event = new InputEvent("beforeinput", {
     bubbles: true,
     cancelable: true,
     data,
     inputType: "insertText",
   });
+  if (options.isComposing !== undefined) {
+    Object.defineProperty(event, "isComposing", {
+      configurable: true,
+      value: options.isComposing,
+    });
+  }
   target.dispatchEvent(event);
   return event;
 }
@@ -466,6 +476,36 @@ describe("termui web 工作台", () => {
     expect(document.body.textContent).not.toContain("response_timeout");
   }, 15_000);
 
+  it("daemon.status 旁路超时不污染已 attach 的终端", async () => {
+    const user = userEvent.setup();
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [
+        {
+          session_id: DEFAULT_SESSION_ID,
+          state: "running",
+          size: { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 },
+        },
+      ],
+      attachOutput: "attached-ready\n",
+      daemonStatusDelayMs: APP_CONNECTION_TIMEOUT_MS + 300,
+    });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await screen.findByText(/attached-ready/);
+    await waitFor(() => expect(daemon.daemonStatusRequests).toBeGreaterThan(0));
+    await new Promise((resolve) =>
+      window.setTimeout(resolve, APP_CONNECTION_TIMEOUT_MS + 700),
+    );
+
+    expect(screen.queryByLabelText("Connection error")).toBeNull();
+    expect(document.body.textContent).not.toContain("response_timeout");
+    expect(document.body.textContent).not.toContain("operation timed out");
+  }, 15_000);
+
   it("已 attach 后 terminal 和普通 RPC 复用同一条 WebSocket segment 通道", async () => {
     const user = userEvent.setup();
     render(<App />);
@@ -701,6 +741,64 @@ describe("termui web 工作台", () => {
     await waitFor(() => expect(daemon.activeConnectionCount()).toBe(1), {
       timeout: 3500,
     });
+  });
+
+  it("切换 session 会取消尚未完成的 workspace WebSocket 握手", async () => {
+    const user = userEvent.setup();
+    const alphaSession = {
+      session_id: "00000000-0000-0000-0000-000000000405",
+      name: "alpha",
+      state: "running",
+      size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+    } as const;
+    const betaSession = {
+      session_id: "00000000-0000-0000-0000-000000000406",
+      name: "beta",
+      state: "running",
+      size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+    } as const;
+    const gammaSession = {
+      session_id: "00000000-0000-0000-0000-000000000407",
+      name: "gamma",
+      state: "running",
+      size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+    } as const;
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [alphaSession, betaSession, gammaSession],
+      attachOutput: "attached-ready\n",
+    });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession("alpha");
+    await screen.findByText(/attached-ready/);
+    const acceptedBeforeSwitch = daemon.acceptedConnections;
+    const releaseBetaRouteReady = daemon.holdNextRouteReady();
+
+    try {
+      fireEvent.click(screen.getByRole("button", { name: "Open beta" }));
+      await waitFor(() => expect(daemon.acceptedConnections).toBeGreaterThan(acceptedBeforeSwitch));
+
+      fireEvent.click(screen.getByRole("button", { name: "Open gamma" }));
+
+      // 中文注释：beta 的 relay route_ready 被故意卡住；切到 gamma 时必须 abort
+      // 这个半开 workspace client，而不是复用它继续等到前一次握手超时。
+      await waitFor(() => expect(daemon.acceptedConnections).toBeGreaterThanOrEqual(acceptedBeforeSwitch + 2), {
+        timeout: 650,
+      });
+      await waitFor(() => expect(daemon.attachedSessions).toContain(gammaSession.session_id), {
+        timeout: 1000,
+      });
+      await waitFor(() => expect(daemon.activeConnectionCount()).toBe(1), {
+        timeout: 1500,
+      });
+    } finally {
+      releaseBetaRouteReady();
+    }
+    expect(selectedSessionName()).toBe("gamma");
+    expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
   });
 
   it("终端输入走同一条 terminal stream，不再拆出额外 attach stream", async () => {
@@ -1594,6 +1692,7 @@ describe("termui web 工作台", () => {
     expect(daemon.attachRequests.every((request) => request.session_id === betaSession.session_id)).toBe(true);
     expect(daemon.acceptedConnections).toBeLessThanOrEqual(acceptedBeforeSwitch + 2);
     expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
+    expect(document.body.textContent).not.toContain("connection_closed");
   });
 
   it("迟到的 Git 结果不能覆盖当前 session panel", async () => {
@@ -2507,7 +2606,7 @@ describe("termui web 工作台", () => {
     expect(screen.getByTestId("terminal-pane")).toBeInTheDocument();
   });
 
-  it("移动端软键盘可以通过 beforeinput 输入空格和逗号", async () => {
+  it("移动端软键盘可以通过 beforeinput 输入空格、逗号和数字", async () => {
     setViewportWidth(390);
     const user = userEvent.setup();
     render(<App />);
@@ -2524,10 +2623,40 @@ describe("termui web 工作台", () => {
 
     const spaceEvent = dispatchMobileTextInput(terminalInput!, " ");
     const commaEvent = dispatchMobileTextInput(terminalInput!, ",");
+    const digitEvent = dispatchMobileTextInput(terminalInput!, "1");
 
     expect(spaceEvent.defaultPrevented).toBe(true);
     expect(commaEvent.defaultPrevented).toBe(true);
-    await waitFor(() => expect(daemon.sessionDataMessages).toEqual([" ", ","]));
+    expect(digitEvent.defaultPrevented).toBe(true);
+    await waitFor(() => expect(daemon.sessionDataMessages).toEqual([" ", ",", "1"]));
+  });
+
+  it("移动端中文组合输入期间 beforeinput 空格不会额外发送到终端", async () => {
+    setViewportWidth(390);
+    const user = userEvent.setup();
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+
+    const terminalInput = await waitFor(() => {
+      const input = document.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
+      expect(input).not.toBeNull();
+      return input!;
+    });
+    terminalInput.focus();
+
+    terminalInput.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true }));
+    const candidateSpaceEvent = dispatchMobileTextInput(terminalInput, " ", { isComposing: true });
+    terminalInput.dispatchEvent(new CompositionEvent("compositionend", { bubbles: true, data: "你" }));
+
+    expect(candidateSpaceEvent.defaultPrevented).toBe(false);
+    expect(daemon.sessionDataMessages).toEqual([]);
+
+    // 中文注释：组合输入最终内容仍交给 xterm 的 input/composition 逻辑发送，fallback 不重复发送候选空格。
+    terminalInput.value = "你";
+    fireEvent.input(terminalInput);
+    await waitFor(() => expect(daemon.sessionDataMessages).toEqual(["你"]));
   });
 
   it("移动端可以通过快捷栏按钮和原生粘贴事件输入剪贴板文本", async () => {
@@ -3864,12 +3993,13 @@ describe("termui web 工作台", () => {
         vi.advanceTimersByTime(1000);
       });
 
-      expect(screen.getByLabelText("mobile direction gesture")).toBeInTheDocument();
+      expect(screen.queryByLabelText("mobile direction gesture")).toBeNull();
       fireTouchPointer(terminalFrame, "pointermove", {
         pointerId: 11,
         clientX: 160,
         clientY: 150,
       });
+      expect(screen.getByLabelText("mobile direction gesture")).toBeInTheDocument();
       fireTouchPointer(terminalFrame, "pointerup", {
         pointerId: 11,
         clientX: 160,

@@ -93,7 +93,7 @@ function activateMobileDirectionGesture(frame: HTMLElement, pointerId: number, s
   act(() => {
     vi.advanceTimersByTime(1000);
   });
-  expect(screen.getByLabelText("mobile direction gesture")).toBeInTheDocument();
+  expect(screen.queryByLabelText("mobile direction gesture")).toBeNull();
 }
 
 function renderTerminalPaneWithOutput(items: TerminalOutputItem[], options: {
@@ -306,6 +306,159 @@ describe("TerminalPane terminal sequence rendering", () => {
     }
   });
 
+  it("点击终端空白处不会把已上滚的 scrollback 强制贴底", async () => {
+    vi.useFakeTimers();
+    try {
+      const snapshot = Array.from({ length: 80 }, (_, index) => `snapshot-line-${index}\n`).join("");
+
+      renderTerminalPaneWithOutput([
+        { kind: "snapshot", bytes: new TextEncoder().encode(snapshot), baseSeq: 0, size: DEFAULT_TERMINAL_SIZE },
+      ]);
+
+      act(() => {
+        vi.advanceTimersByTime(animationFrameMs * 12);
+      });
+
+      const xterm = (globalThis as {
+        __TERMD_TEST_XTERM__?: { viewportY: () => number; baseY: () => number; scrollToLine: (line: number) => void };
+      }).__TERMD_TEST_XTERM__;
+      expect(xterm?.baseY()).toBeGreaterThan(0);
+      expect(xterm?.viewportY()).toBe(xterm?.baseY());
+
+      act(() => {
+        xterm?.scrollToLine(0);
+      });
+      expect(xterm?.viewportY()).toBe(0);
+
+      const frame = screen.getByTestId("terminal-pane").querySelector<HTMLElement>(".terminal-frame");
+      expect(frame).not.toBeNull();
+      fireEvent.mouseDown(frame!);
+      fireEvent.click(frame!);
+      act(() => {
+        vi.advanceTimersByTime(animationFrameMs * 8);
+      });
+
+      // 中文注释：点击空白处只应该聚焦终端；如果用户正在看历史，不能强行滚回最新输出。
+      expect(xterm?.viewportY()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("位于底部时新输出继续跟随 PTY 底部滚动", async () => {
+    vi.useFakeTimers();
+    try {
+      const encoder = new TextEncoder();
+      let queue: TerminalOutputItem[] = [
+        {
+          kind: "snapshot",
+          bytes: encoder.encode(Array.from({ length: 40 }, (_, index) => `snapshot-line-${index}\n`).join("")),
+          baseSeq: 0,
+          size: DEFAULT_TERMINAL_SIZE,
+        },
+      ];
+      let drainOutput: (() => void) | undefined;
+      const takeOutput = vi.fn(() => queue.splice(0));
+      const registerOutputDrain = vi.fn((drain: () => void) => {
+        drainOutput = drain;
+        drain();
+        return () => undefined;
+      });
+
+      render(
+        <TerminalPane
+          attached
+          sessionSize={{ rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 }}
+          outputResetVersion={0}
+          takeOutput={takeOutput}
+          registerOutputDrain={registerOutputDrain}
+          onInput={vi.fn()}
+          onResize={vi.fn()}
+          onCursorChange={vi.fn()}
+        />,
+      );
+
+      act(() => {
+        vi.advanceTimersByTime(animationFrameMs * 12);
+      });
+      const xterm = (globalThis as {
+        __TERMD_TEST_XTERM__?: { viewportY: () => number; baseY: () => number };
+      }).__TERMD_TEST_XTERM__;
+      expect(xterm?.viewportY()).toBe(xterm?.baseY());
+
+      queue = [{ kind: "output", bytes: encoder.encode("tail\n"), terminalSeq: 1 }];
+      act(() => {
+        drainOutput?.();
+        vi.advanceTimersByTime(animationFrameMs * 8);
+      });
+
+      expect(xterm?.baseY()).toBeGreaterThan(0);
+      expect(xterm?.viewportY()).toBe(xterm?.baseY());
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("不在底部时新输出不打断用户查看历史", async () => {
+    vi.useFakeTimers();
+    try {
+      const encoder = new TextEncoder();
+      let queue: TerminalOutputItem[] = [
+        {
+          kind: "snapshot",
+          bytes: encoder.encode(Array.from({ length: 40 }, (_, index) => `snapshot-line-${index}\n`).join("")),
+          baseSeq: 0,
+          size: DEFAULT_TERMINAL_SIZE,
+        },
+      ];
+      let drainOutput: (() => void) | undefined;
+      const takeOutput = vi.fn(() => queue.splice(0));
+      const registerOutputDrain = vi.fn((drain: () => void) => {
+        drainOutput = drain;
+        drain();
+        return () => undefined;
+      });
+
+      render(
+        <TerminalPane
+          attached
+          sessionSize={{ rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 }}
+          outputResetVersion={0}
+          takeOutput={takeOutput}
+          registerOutputDrain={registerOutputDrain}
+          onInput={vi.fn()}
+          onResize={vi.fn()}
+          onCursorChange={vi.fn()}
+        />,
+      );
+
+      act(() => {
+        vi.advanceTimersByTime(animationFrameMs * 12);
+      });
+      const xterm = (globalThis as {
+        __TERMD_TEST_XTERM__?: { viewportY: () => number; baseY: () => number; scrollToLine: (line: number) => void };
+      }).__TERMD_TEST_XTERM__;
+      expect(xterm?.baseY()).toBeGreaterThan(0);
+
+      act(() => {
+        xterm?.scrollToLine(0);
+      });
+      expect(xterm?.viewportY()).toBe(0);
+
+      queue = [{ kind: "output", bytes: encoder.encode("tail\n"), terminalSeq: 1 }];
+      act(() => {
+        drainOutput?.();
+        vi.advanceTimersByTime(animationFrameMs * 8);
+      });
+
+      // 中文注释：用户已经上滚时，PTY 继续输出只能更新 buffer，不能把视口抢回底部。
+      expect(xterm?.baseY()).toBeGreaterThan(0);
+      expect(xterm?.viewportY()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("切换 session 时旧的异步 write 回调不能阻塞或确认新 session", async () => {
     vi.useFakeTimers();
     try {
@@ -395,6 +548,37 @@ describe("TerminalPane terminal sequence rendering", () => {
 });
 
 describe("TerminalPane mobile direction gesture", () => {
+  it("静止长按不抢系统长按菜单，contextmenu 也不会被阻止", () => {
+    vi.useFakeTimers();
+    try {
+      const onInput = vi.fn();
+      const { frame } = renderMobileTerminalPane(onInput);
+      fireTouchPointer(frame, "pointerdown", {
+        pointerId: 20,
+        clientX: 160,
+        clientY: 240,
+      });
+      act(() => {
+        vi.advanceTimersByTime(1000);
+      });
+
+      expect(screen.queryByLabelText("mobile direction gesture")).toBeNull();
+      const contextMenuEvent = new Event("contextmenu", { bubbles: true, cancelable: true });
+      fireEvent(frame, contextMenuEvent);
+      expect(contextMenuEvent.defaultPrevented).toBe(false);
+
+      fireTouchPointer(frame, "pointermove", {
+        pointerId: 20,
+        clientX: 160,
+        clientY: 196,
+      });
+      expect(screen.queryByLabelText("mobile direction gesture")).toBeNull();
+      expect(onInput).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("一档每半秒发送一个方向键，并在松手后停止", () => {
     vi.useFakeTimers();
     try {

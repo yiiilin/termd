@@ -153,6 +153,8 @@ impl DirectClient {
                     protocol_version: ProtocolVersion(PROTOCOL_PACKET_VERSION),
                     nonce: crypto::nonce(),
                     route_generation: None,
+                    client_id: None,
+                    data_token: None,
                     timestamp_ms: crypto::now_ms(),
                 },
             )?,

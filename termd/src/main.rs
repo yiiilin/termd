@@ -1254,7 +1254,7 @@ mod tests {
                 let Some(route_hello) = read_route_hello(&mut socket).await else {
                     return;
                 };
-                if !matches!(route_hello.role, RouteRole::DaemonMux) {
+                if !matches!(route_hello.role, RouteRole::DaemonControl) {
                     return;
                 }
                 let route_ready = Envelope::new(

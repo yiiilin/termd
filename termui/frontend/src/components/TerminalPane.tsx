@@ -21,6 +21,8 @@ const MOBILE_DIRECTION_REPEAT_MS = 500;
 const MOBILE_DIRECTION_TIER_TWO_PX = 56;
 const MOBILE_DIRECTION_TIER_THREE_PX = 84;
 const MOBILE_DIRECTION_CANCEL_PX = 10;
+const MOBILE_COMPOSITION_SETTLE_MS = 80;
+const TERMINAL_BOTTOM_EPSILON = 1;
 // 单次 xterm.write 过大时会占用浏览器主线程，连控制 WebSocket 和 relay 页面心跳都会被拖慢。
 // 64KB 仍是批量写入，不会退回逐字/逐行渲染，同时给输入和切 session 留出帧间隙。
 const MAX_WRITE_BYTES = 64 * 1024;
@@ -153,6 +155,7 @@ export function TerminalPane(props: TerminalPaneProps) {
     startY: number;
     lastStepX: number;
     lastStepY: number;
+    ready: boolean;
     active: boolean;
     timer: number;
     repeatTimer?: number;
@@ -160,6 +163,8 @@ export function TerminalPane(props: TerminalPaneProps) {
     repeatCount: number;
   } | undefined>(undefined);
   const lastNativePasteRef = useRef<{ text: string; atMs: number } | undefined>(undefined);
+  const mobileCompositionActiveRef = useRef(false);
+  const lastMobileCompositionEndAtRef = useRef(0);
   const focusedRef = useRef(false);
   const clientSizeRef = useRef<TerminalSize | undefined>(undefined);
   const mobileViewportResizeOwnerRef = useRef(false);
@@ -191,6 +196,18 @@ export function TerminalPane(props: TerminalPaneProps) {
   const [searchError, setSearchError] = useState<string | undefined>();
   const [searchResult, setSearchResult] = useState<SessionSearchResultPayload | undefined>();
   const [activeSearchIndex, setActiveSearchIndex] = useState(0);
+  const isTerminalPinnedToBottom = (terminal = terminalRef.current) => {
+    const activeBuffer = terminal?.buffer?.active;
+    const xtermPinned =
+      !activeBuffer ||
+      activeBuffer.viewportY >= Math.max(0, activeBuffer.baseY - TERMINAL_BOTTOM_EPSILON);
+    const scrollport = scrollportRef.current;
+    const scrollportPinned =
+      !scrollport ||
+      scrollport.scrollHeight <= scrollport.clientHeight + TERMINAL_BOTTOM_EPSILON ||
+      scrollport.scrollTop >= scrollport.scrollHeight - scrollport.clientHeight - TERMINAL_BOTTOM_EPSILON;
+    return xtermPinned && scrollportPinned;
+  };
   const scrollToBottom = () => {
     const terminal = terminalRef.current;
     const activeBuffer = terminal?.buffer?.active;
@@ -221,6 +238,11 @@ export function TerminalPane(props: TerminalPaneProps) {
       bottomScrollFrameRef.current = window.requestAnimationFrame(runScrollPass);
     };
     bottomScrollFrameRef.current = window.requestAnimationFrame(runScrollPass);
+  };
+  const scheduleScrollToBottomIfPinned = (wasPinnedToBottom = isTerminalPinnedToBottom(), passes = 2) => {
+    if (wasPinnedToBottom) {
+      scheduleScrollToBottom(passes);
+    }
   };
   const showCopyToast = () => {
     setCopyToastVisible(true);
@@ -265,8 +287,9 @@ export function TerminalPane(props: TerminalPaneProps) {
     }
     // 移动端软键盘会改变 visual viewport；只看 keyboardOpen 布尔值不够，
     // 因为部分浏览器会让 innerHeight 跟着缩放，导致键盘开关前后布尔值都为 false。
+    const wasPinnedToBottom = isTerminalPinnedToBottom();
     stabilizeRef.current?.(hasActiveTerminalFocus() ? "focus" : "mobile-viewport");
-    scheduleScrollToBottom();
+    scheduleScrollToBottomIfPinned(wasPinnedToBottom);
   }, [props.mobileInputMode, props.mobileKeyboardOpen, props.mobileViewportHeight, props.mobileViewportOffsetTop]);
 
   useEffect(() => {
@@ -625,12 +648,9 @@ export function TerminalPane(props: TerminalPaneProps) {
       if (!gesture || gesture.pointerId !== pointerId) {
         return;
       }
-      gesture.active = true;
-      gesture.lastStepX = startX;
-      gesture.lastStepY = startY;
-      setMobileDirectionActive(true);
-      setMobileDirection(undefined);
-      terminalRef.current?.focus();
+      // 中文注释：静止长按要留给系统复制/粘贴菜单。这里只标记“已长按”，
+      // 等用户继续拖动超过死区后才真正进入方向手势。
+      gesture.ready = true;
     }, MOBILE_DIRECTION_HOLD_MS);
     mobileDirectionGestureRef.current = {
       pointerId,
@@ -638,6 +658,7 @@ export function TerminalPane(props: TerminalPaneProps) {
       startY,
       lastStepX: startX,
       lastStepY: startY,
+      ready: false,
       active: false,
       timer,
       repeatCount: 0,
@@ -652,10 +673,22 @@ export function TerminalPane(props: TerminalPaneProps) {
     const deltaX = event.clientX - gesture.startX;
     const deltaY = event.clientY - gesture.startY;
     if (!gesture.active) {
-      if (Math.hypot(deltaX, deltaY) > MOBILE_DIRECTION_CANCEL_PX) {
-        clearMobileDirectionGesture();
+      const distance = Math.hypot(deltaX, deltaY);
+      if (!gesture.ready) {
+        if (distance > MOBILE_DIRECTION_CANCEL_PX) {
+          clearMobileDirectionGesture();
+        }
+        return;
       }
-      return;
+      if (distance < MOBILE_DIRECTION_DEAD_ZONE_PX) {
+        return;
+      }
+      gesture.active = true;
+      gesture.lastStepX = gesture.startX;
+      gesture.lastStepY = gesture.startY;
+      setMobileDirectionActive(true);
+      setMobileDirection(undefined);
+      terminalRef.current?.focus();
     }
     event.preventDefault();
     event.stopPropagation();
@@ -701,6 +734,10 @@ export function TerminalPane(props: TerminalPaneProps) {
         sendMobileDirection(direction);
       }
     }
+    clearMobileDirectionGesture();
+  };
+
+  const handleTerminalContextMenu = () => {
     clearMobileDirectionGesture();
   };
 
@@ -755,6 +792,7 @@ export function TerminalPane(props: TerminalPaneProps) {
     if (!isTerminalActivationTarget(target)) {
       return;
     }
+    const wasPinnedToBottom = isTerminalPinnedToBottom();
     windowActiveRef.current = true;
     // 点击终端 frame 是用户显式接管终端的动作；有些浏览器和 jsdom mock
     // 不会把外层 frame 点击稳定转成内部 textarea 的 focusin，因此这里先同步本地聚焦态。
@@ -763,9 +801,9 @@ export function TerminalPane(props: TerminalPaneProps) {
     reportTerminalFocus(true);
     terminalRef.current?.focus();
     resizeRef.current?.("focus");
-    // 当前客户端接管 PTY 尺寸时，xterm 和外层 scrollport 会连续重排；点击后立即贴底，
-    // 避免浏览器把滚动位置恢复到顶部。
-    scheduleScrollToBottom();
+    // 当前客户端接管 PTY 尺寸时，只在用户本来就在底部时继续贴底。
+    // 用户已经上滚查看历史时，点击空白处应该只聚焦终端，不能强行跳到最新输出。
+    scheduleScrollToBottomIfPinned(wasPinnedToBottom);
   };
 
   useEffect(() => {
@@ -805,15 +843,29 @@ export function TerminalPane(props: TerminalPaneProps) {
       onInputRef.current(data);
     });
     const helperTextarea = host.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
+    const isMobileCompositionInput = (event: InputEvent) => {
+      const inputType = event.inputType.toLowerCase();
+      const recentlyEnded =
+        lastMobileCompositionEndAtRef.current > 0 &&
+        nowForThrottle() - lastMobileCompositionEndAtRef.current < MOBILE_COMPOSITION_SETTLE_MS;
+      return event.isComposing || mobileCompositionActiveRef.current || inputType.includes("composition") || recentlyEnded;
+    };
+    const handleMobileCompositionStart = () => {
+      mobileCompositionActiveRef.current = true;
+    };
+    const handleMobileCompositionEnd = () => {
+      mobileCompositionActiveRef.current = false;
+      lastMobileCompositionEndAtRef.current = nowForThrottle();
+    };
     const handleMobileBeforeInput = (event: InputEvent) => {
-      if (!mobileInputModeRef.current || event.defaultPrevented) {
+      if (!mobileInputModeRef.current || event.defaultPrevented || isMobileCompositionInput(event)) {
         return;
       }
 
       const text =
         event.inputType === "insertFromPaste" && event.data
           ? event.data
-          : event.inputType === "insertText" && (event.data === " " || event.data === ",")
+          : event.inputType === "insertText" && event.data
             ? event.data
             : undefined;
       if (!text) {
@@ -821,9 +873,10 @@ export function TerminalPane(props: TerminalPaneProps) {
       }
 
       // iOS/Safari 软键盘有时只给 beforeinput，不走 xterm 的 keydown/keypress。
-      // 对空格、逗号和粘贴文本做兜底，并阻止后续 input，避免同一份内容发送两次。
+      // 对非组合文本和粘贴文本做兜底，并阻止后续 input，避免同一份内容发送两次。
       event.preventDefault();
       event.stopPropagation();
+      event.stopImmediatePropagation();
       if (event.inputType === "insertFromPaste") {
         sendNativePasteText(text);
         return;
@@ -840,10 +893,13 @@ export function TerminalPane(props: TerminalPaneProps) {
       }
       event.preventDefault();
       event.stopPropagation();
+      event.stopImmediatePropagation();
       sendNativePasteText(text);
     };
-    helperTextarea?.addEventListener("beforeinput", handleMobileBeforeInput);
-    helperTextarea?.addEventListener("paste", handleMobilePaste);
+    helperTextarea?.addEventListener("compositionstart", handleMobileCompositionStart, true);
+    helperTextarea?.addEventListener("compositionend", handleMobileCompositionEnd, true);
+    helperTextarea?.addEventListener("beforeinput", handleMobileBeforeInput, true);
+    helperTextarea?.addEventListener("paste", handleMobilePaste, true);
     const cursorMoveSubscription = terminal.onCursorMove(() => queueCursorReport());
     const writeParsedSubscription = terminal.onWriteParsed(() => queueCursorReport());
     const scrollSubscription = terminal.onScroll(() => scheduleMobileScrollPosition());
@@ -886,6 +942,7 @@ export function TerminalPane(props: TerminalPaneProps) {
       const canReportLocalResize =
         !mobileKeyboardIsOpen &&
         (terminalHasActiveFocus || hasMobileViewportResizeOwnership);
+      const wasPinnedToBottom = isTerminalPinnedToBottom(terminal);
       if (proposed) {
         clientSizeRef.current = {
           rows: proposed.rows,
@@ -898,12 +955,12 @@ export function TerminalPane(props: TerminalPaneProps) {
         applyFontSize(terminal, currentTerminalFontSize());
         if (remoteSize) {
           if (sameTerminalDimensions(terminal, remoteSize)) {
-            scheduleScrollToBottom();
+            scheduleScrollToBottomIfPinned(wasPinnedToBottom);
             queueCursorReport({ immediate: true });
             return;
           }
           terminal.resize(remoteSize.cols, remoteSize.rows);
-          scheduleScrollToBottom();
+          scheduleScrollToBottomIfPinned(wasPinnedToBottom);
           queueCursorReport({ immediate: true });
         }
         return;
@@ -919,7 +976,7 @@ export function TerminalPane(props: TerminalPaneProps) {
           if (source === "session" || !sameTerminalDimensions(terminal, proposed)) {
             fit.fit();
           }
-          scheduleScrollToBottom();
+          scheduleScrollToBottomIfPinned(wasPinnedToBottom);
           queueCursorReport({ immediate: true });
           return;
         }
@@ -1007,13 +1064,14 @@ export function TerminalPane(props: TerminalPaneProps) {
       return true;
     };
     const applyResizeFrame = (item: Extract<TerminalOutputItem, { kind: "resize" }>) => {
+      const wasPinnedToBottom = isTerminalPinnedToBottom(terminal);
       sessionSizeRef.current = item.size;
       if (!sameTerminalDimensions(terminal, item.size)) {
         terminal.resize(item.size.cols, item.size.rows);
       }
       onTerminalSizeRenderedRef.current?.(item.size);
       needsPostWriteRefreshRef.current = true;
-      needsPostWriteScrollBottomRef.current = true;
+      needsPostWriteScrollBottomRef.current = needsPostWriteScrollBottomRef.current || wasPinnedToBottom;
       queueCursorReport({ immediate: true });
     };
     const takePendingWrite = (): TerminalWriteBatch | undefined => {
@@ -1205,8 +1263,9 @@ export function TerminalPane(props: TerminalPaneProps) {
       focusActivationArmedRef.current = false;
       suppressPassiveFocusRef.current = false;
       reportTerminalFocus(true);
-      // 主动点击或程序 focus 回到终端时默认看最新输出，尤其覆盖 resize 后的回聚焦路径。
-      scheduleScrollToBottom();
+      // 主动点击或程序 focus 回到终端时，只有原本就在底部才继续跟随最新输出；
+      // 否则会打断用户查看 scrollback 或搜索结果。
+      scheduleScrollToBottomIfPinned();
     };
     const handleFocusOut = () => {
       focusActivationArmedRef.current = false;
@@ -1332,8 +1391,10 @@ export function TerminalPane(props: TerminalPaneProps) {
       resizeObserver?.disconnect();
       host.removeEventListener("focusin", handleFocusIn);
       host.removeEventListener("focusout", handleFocusOut);
-      helperTextarea?.removeEventListener("beforeinput", handleMobileBeforeInput);
-      helperTextarea?.removeEventListener("paste", handleMobilePaste);
+      helperTextarea?.removeEventListener("compositionstart", handleMobileCompositionStart, true);
+      helperTextarea?.removeEventListener("compositionend", handleMobileCompositionEnd, true);
+      helperTextarea?.removeEventListener("beforeinput", handleMobileBeforeInput, true);
+      helperTextarea?.removeEventListener("paste", handleMobilePaste, true);
       dataSubscription.dispose();
       cursorMoveSubscription.dispose();
       writeParsedSubscription.dispose();
@@ -1359,6 +1420,8 @@ export function TerminalPane(props: TerminalPaneProps) {
       needsPostWriteScrollBottomRef.current = false;
       snapshotRedrawInProgressRef.current = false;
       focusedRef.current = false;
+      mobileCompositionActiveRef.current = false;
+      lastMobileCompositionEndAtRef.current = 0;
       clientSizeRef.current = undefined;
       mobileViewportResizeOwnerRef.current = false;
       focusActivationArmedRef.current = false;
@@ -1450,6 +1513,7 @@ export function TerminalPane(props: TerminalPaneProps) {
             onPointerMove={handleMobileDirectionPointerMove}
             onPointerUp={handleMobileDirectionPointerEnd}
             onPointerCancel={handleMobileDirectionPointerEnd}
+            onContextMenuCapture={handleTerminalContextMenu}
           >
             <div
               className="terminal-host"

@@ -573,6 +573,8 @@ pub fn decode_binary_protocol_packet(
 #[serde(rename_all = "snake_case")]
 pub enum RouteRole {
     Client,
+    DaemonControl,
+    DaemonData,
     DaemonMux,
 }
 
@@ -590,6 +592,18 @@ pub struct RouteHelloPayload {
     /// relay 只用它确认新 mux 是否替换旧 mux，不解析任何业务密文。
     #[serde(default)]
     pub route_generation: Option<Nonce>,
+    /// daemon data 连接要绑定的 relay client。
+    ///
+    /// browser client 和 daemon data 是一一配对的数据管道；relay 只用该字段做连接配对，
+    /// 不解析后续 E2EE 业务内容。
+    #[serde(default)]
+    pub client_id: Option<RelayClientId>,
+    /// daemon data 连接的一次性配对令牌。
+    ///
+    /// 令牌由 relay 通过 daemon control 线下发；daemon 反连 data 线时带回。relay 用它
+    /// 防止迟到的旧 data 连接误配到新的 browser client。
+    #[serde(default)]
+    pub data_token: Option<Nonce>,
     pub timestamp_ms: UnixTimestampMillis,
 }
 
@@ -1379,6 +1393,23 @@ pub struct PongPayload {
 #[serde(transparent)]
 pub struct RelayClientId(pub u64);
 
+/// relay control 线上的生命周期消息。
+///
+/// 该消息只用于建立/关闭 relay transport 数据管道，不包含 terminal、session、auth 或
+/// E2EE 明文。真正的 browser-daemon 业务流仍只在配对后的 data 线上按原始 WebSocket
+/// frame 透传。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum RelayControlEnvelope {
+    OpenData {
+        client_id: RelayClientId,
+        data_token: Nonce,
+    },
+    ClientDisconnected {
+        client_id: RelayClientId,
+    },
+}
+
 /// relay mux 通道承载的不透明 WebSocket frame。
 ///
 /// relay 只知道 frame 是 text 还是 binary；binary 通过 base64 放进 JSON transport envelope。
@@ -1744,6 +1775,8 @@ mod tests {
                 protocol_version: ProtocolVersion::default(),
                 nonce: Nonce("route-nonce".to_owned()),
                 route_generation: None,
+                client_id: None,
+                data_token: None,
                 timestamp_ms: UnixTimestampMillis(1_710_000_000_000),
             },
         );

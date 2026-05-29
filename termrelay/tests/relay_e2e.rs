@@ -8,9 +8,8 @@ use termd::net::protocol::{JsonEnvelope, decode_payload, envelope_value};
 use termd::net::{E2eeKeyPair, E2eeSession, E2eeSessionContext, E2eeSessionRole};
 use termd_proto::{
     DeviceId, EncryptedFramePayload, Envelope, MessageType, Nonce, PairRequestPayload,
-    PairingToken, ProtocolVersion, PublicKey, RelayClientId, RelayMuxEnvelope, RelayOpaqueFrame,
-    RouteHelloPayload, RouteReadyPayload, RouteRole, ServerId, decode_binary_relay_mux_envelope,
-    encode_binary_relay_mux_envelope,
+    PairingToken, ProtocolVersion, PublicKey, RelayClientId, RelayControlEnvelope,
+    RouteHelloPayload, RouteReadyPayload, RouteRole, ServerId,
 };
 use tokio::time::{sleep, timeout};
 use tokio_tungstenite::tungstenite::Message;
@@ -43,7 +42,6 @@ impl RelayProcess {
             command.args(["--auth-token", auth_token]);
         }
         let child = command
-            // relay 日志不参与不变量断言，避免测试依赖日志格式或落盘行为。
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -63,7 +61,7 @@ impl RelayProcess {
             let probe_url = self.authenticated_url(self.ws_url(), auth_token);
             if let Ok(Ok(mut socket)) = timeout(
                 Duration::from_millis(200),
-                connect_registered_socket(probe_url, probe_server_id, RouteRole::DaemonMux),
+                connect_registered_socket(probe_url, probe_server_id, RouteRole::DaemonControl),
             )
             .await
             {
@@ -99,18 +97,98 @@ impl Drop for RelayProcess {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relay_pairs_control_and_data_connections_as_raw_dumb_pipe() {
+    let relay = RelayProcess::spawn().await;
+    let server_id = ServerId::new();
+    let mut daemon_control =
+        connect_registered_socket(relay.ws_url(), server_id, RouteRole::DaemonControl)
+            .await
+            .expect("daemon control should connect");
+
+    let (mut client, _) = connect_async(relay.ws_url().as_str())
+        .await
+        .expect("client should connect relay");
+    send_route_hello(&mut client, server_id, RouteRole::Client)
+        .await
+        .expect("client route_hello should send");
+    let (client_id, data_token) = expect_open_data(&mut daemon_control).await;
+    assert!(
+        timeout(Duration::from_millis(60), client.next())
+            .await
+            .is_err(),
+        "client route_ready must wait until daemon data route is paired"
+    );
+
+    let (mut daemon_data, _) = connect_async(relay.ws_url().as_str())
+        .await
+        .expect("daemon data should connect relay");
+    send_route_hello_with_data(
+        &mut daemon_data,
+        server_id,
+        RouteRole::DaemonData,
+        Some(client_id),
+        Some(data_token),
+    )
+    .await
+    .expect("daemon data route_hello should send");
+    expect_route_ready(&mut daemon_data, server_id, RouteRole::DaemonData)
+        .await
+        .expect("daemon data should receive route_ready");
+    expect_route_ready(&mut client, server_id, RouteRole::Client)
+        .await
+        .expect("client should receive route_ready after data pair");
+
+    let (wire, _) = encrypted_pair_request_wire(server_id, RELAY_SECRET_SENTINEL);
+    client
+        .send(Message::Text(wire.clone()))
+        .await
+        .expect("client should send raw encrypted frame");
+    assert_eq!(next_text(&mut daemon_data).await, wire);
+
+    let binary = b"daemon-to-browser-binary-frame".to_vec();
+    daemon_data
+        .send(Message::Binary(binary.clone()))
+        .await
+        .expect("daemon data should send raw binary");
+    assert_eq!(next_binary(&mut client).await, binary);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn relay_forwards_real_encrypted_frame_without_plaintext_or_rewrite() {
     let relay = RelayProcess::spawn().await;
     let server_id = ServerId::new();
-    let mut daemon_mux = connect_registered_socket(relay.ws_url(), server_id, RouteRole::DaemonMux)
-        .await
-        .expect("daemon mux side should connect");
-    let (mut client, client_id) =
-        connect_registered_client_socket(relay.ws_url(), server_id, &mut daemon_mux)
+    let mut daemon_control =
+        connect_registered_socket(relay.ws_url(), server_id, RouteRole::DaemonControl)
             .await
-            .expect("client side should connect");
-    let (wire, mut daemon_e2ee) = encrypted_pair_request_wire(server_id, RELAY_SECRET_SENTINEL);
+            .expect("daemon control side should connect");
+    let (mut client, _) = connect_async(relay.ws_url().as_str())
+        .await
+        .expect("client side should connect");
+    send_route_hello(&mut client, server_id, RouteRole::Client)
+        .await
+        .expect("client route_hello should send");
+    let (client_id, data_token) = expect_open_data(&mut daemon_control).await;
 
+    let (mut daemon_data, _) = connect_async(relay.ws_url().as_str())
+        .await
+        .expect("daemon data should connect");
+    send_route_hello_with_data(
+        &mut daemon_data,
+        server_id,
+        RouteRole::DaemonData,
+        Some(client_id),
+        Some(data_token),
+    )
+    .await
+    .expect("daemon data route_hello should send");
+    expect_route_ready(&mut daemon_data, server_id, RouteRole::DaemonData)
+        .await
+        .expect("daemon data should receive route_ready");
+    expect_route_ready(&mut client, server_id, RouteRole::Client)
+        .await
+        .expect("client should receive route_ready");
+
+    let (wire, mut daemon_e2ee) = encrypted_pair_request_wire(server_id, RELAY_SECRET_SENTINEL);
     assert!(wire.contains("encrypted_frame"));
     assert!(!wire.contains("pair_request"));
     assert!(!wire.contains(RELAY_SECRET_SENTINEL));
@@ -119,7 +197,7 @@ async fn relay_forwards_real_encrypted_frame_without_plaintext_or_rewrite() {
         .send(Message::Text(wire.clone()))
         .await
         .expect("client should send encrypted frame");
-    let received = expect_client_text(&mut daemon_mux, client_id).await;
+    let received = next_text(&mut daemon_data).await;
 
     assert_eq!(received, wire);
     assert!(!received.contains("pair_request"));
@@ -144,36 +222,78 @@ async fn relay_isolates_encrypted_frames_by_server_id() {
     let relay = RelayProcess::spawn().await;
     let server_a = ServerId::new();
     let server_b = ServerId::new();
-    let mut daemon_a = connect_registered_socket(relay.ws_url(), server_a, RouteRole::DaemonMux)
-        .await
-        .expect("daemon A should connect");
-    let mut daemon_b = connect_registered_socket(relay.ws_url(), server_b, RouteRole::DaemonMux)
-        .await
-        .expect("daemon B should connect");
-    let (mut client_a, _client_a_id) =
-        connect_registered_client_socket(relay.ws_url(), server_a, &mut daemon_a)
+    let mut daemon_control_a =
+        connect_registered_socket(relay.ws_url(), server_a, RouteRole::DaemonControl)
             .await
-            .expect("client A should connect");
-    let (_client_b, _client_b_id) =
-        connect_registered_client_socket(relay.ws_url(), server_b, &mut daemon_b)
+            .expect("daemon A should connect");
+    let mut daemon_control_b =
+        connect_registered_socket(relay.ws_url(), server_b, RouteRole::DaemonControl)
             .await
-            .expect("client B should connect");
-    let (wire_a, _daemon_a_e2ee) = encrypted_pair_request_wire(server_a, RELAY_SECRET_SENTINEL);
+            .expect("daemon B should connect");
 
+    let (mut client_a, _) = connect_async(relay.ws_url().as_str())
+        .await
+        .expect("client A should connect");
+    send_route_hello(&mut client_a, server_a, RouteRole::Client)
+        .await
+        .expect("client A route_hello should send");
+    let (client_a_id, data_token_a) = expect_open_data(&mut daemon_control_a).await;
+
+    let (mut client_b, _) = connect_async(relay.ws_url().as_str())
+        .await
+        .expect("client B should connect");
+    send_route_hello(&mut client_b, server_b, RouteRole::Client)
+        .await
+        .expect("client B route_hello should send");
+    let (client_b_id, data_token_b) = expect_open_data(&mut daemon_control_b).await;
+
+    let (mut daemon_data_a, _) = connect_async(relay.ws_url().as_str())
+        .await
+        .expect("daemon data A should connect");
+    send_route_hello_with_data(
+        &mut daemon_data_a,
+        server_a,
+        RouteRole::DaemonData,
+        Some(client_a_id),
+        Some(data_token_a),
+    )
+    .await
+    .expect("daemon data A route_hello should send");
+    expect_route_ready(&mut daemon_data_a, server_a, RouteRole::DaemonData)
+        .await
+        .expect("daemon data A should receive route_ready");
+    expect_route_ready(&mut client_a, server_a, RouteRole::Client)
+        .await
+        .expect("client A should receive route_ready");
+
+    let (mut daemon_data_b, _) = connect_async(relay.ws_url().as_str())
+        .await
+        .expect("daemon data B should connect");
+    send_route_hello_with_data(
+        &mut daemon_data_b,
+        server_b,
+        RouteRole::DaemonData,
+        Some(client_b_id),
+        Some(data_token_b),
+    )
+    .await
+    .expect("daemon data B route_hello should send");
+    expect_route_ready(&mut daemon_data_b, server_b, RouteRole::DaemonData)
+        .await
+        .expect("daemon data B should receive route_ready");
+    expect_route_ready(&mut client_b, server_b, RouteRole::Client)
+        .await
+        .expect("client B should receive route_ready");
+
+    let (wire_a, _) = encrypted_pair_request_wire(server_a, RELAY_SECRET_SENTINEL);
     client_a
         .send(Message::Text(wire_a.clone()))
         .await
         .expect("client A should send encrypted frame");
 
-    assert!(matches!(
-        next_mux(&mut daemon_a).await,
-        RelayMuxEnvelope::ClientFrame {
-            frame: RelayOpaqueFrame::Text { data },
-            ..
-        } if data == wire_a
-    ));
+    assert_eq!(next_text(&mut daemon_data_a).await, wire_a);
     assert!(
-        timeout(Duration::from_millis(150), daemon_b.next())
+        timeout(Duration::from_millis(150), daemon_data_b.next())
             .await
             .is_err(),
         "server_id B daemon must not receive server_id A frame"
@@ -184,13 +304,37 @@ async fn relay_isolates_encrypted_frames_by_server_id() {
 async fn relay_forwards_business_shaped_text_and_binary_without_parsing() {
     let relay = RelayProcess::spawn().await;
     let server_id = ServerId::new();
-    let mut daemon_mux = connect_registered_socket(relay.ws_url(), server_id, RouteRole::DaemonMux)
-        .await
-        .expect("daemon mux side should connect");
-    let (mut client, client_id) =
-        connect_registered_client_socket(relay.ws_url(), server_id, &mut daemon_mux)
+    let mut daemon_control =
+        connect_registered_socket(relay.ws_url(), server_id, RouteRole::DaemonControl)
             .await
-            .expect("client side should connect");
+            .expect("daemon control side should connect");
+    let (mut client, _) = connect_async(relay.ws_url().as_str())
+        .await
+        .expect("client should connect");
+    send_route_hello(&mut client, server_id, RouteRole::Client)
+        .await
+        .expect("client route_hello should send");
+    let (client_id, data_token) = expect_open_data(&mut daemon_control).await;
+
+    let (mut daemon_data, _) = connect_async(relay.ws_url().as_str())
+        .await
+        .expect("daemon data should connect");
+    send_route_hello_with_data(
+        &mut daemon_data,
+        server_id,
+        RouteRole::DaemonData,
+        Some(client_id),
+        Some(data_token),
+    )
+    .await
+    .expect("daemon data route_hello should send");
+    expect_route_ready(&mut daemon_data, server_id, RouteRole::DaemonData)
+        .await
+        .expect("daemon data should receive route_ready");
+    expect_route_ready(&mut client, server_id, RouteRole::Client)
+        .await
+        .expect("client should receive route_ready");
+
     let text_payloads = [
         "{not-json session_data control_request pairing_token relay-secret-plaintext".to_owned(),
         r#"{"kind":"stream_open","method":"terminal.attach","payload":{"session_id":"session-a","watch_updates":true}}"#
@@ -209,25 +353,18 @@ async fn relay_forwards_business_shaped_text_and_binary_without_parsing() {
         b"\x01terminal.attach snapshot stdout stdin resize\x02flow ack credit render_ack stale_session".to_vec(),
     ];
 
-    // 这些 frame 故意长得像 terminal/flow 业务 payload；relay 只能把它们当不透明字节转发。
     for text in text_payloads {
         client
             .send(Message::Text(text.clone()))
             .await
             .expect("client should send opaque text");
-        assert_eq!(expect_client_text(&mut daemon_mux, client_id).await, text);
+        assert_eq!(next_text(&mut daemon_data).await, text);
 
         let daemon_text = format!("daemon-to-client:{text}");
-        send_mux(
-            &mut daemon_mux,
-            RelayMuxEnvelope::DaemonFrame {
-                client_id,
-                frame: RelayOpaqueFrame::Text {
-                    data: daemon_text.clone(),
-                },
-            },
-        )
-        .await;
+        daemon_data
+            .send(Message::Text(daemon_text.clone()))
+            .await
+            .expect("daemon data should send text");
         assert_eq!(next_text(&mut client).await, daemon_text);
     }
 
@@ -236,153 +373,16 @@ async fn relay_forwards_business_shaped_text_and_binary_without_parsing() {
             .send(Message::Binary(binary.clone()))
             .await
             .expect("client should send opaque binary");
-        assert_eq!(
-            expect_client_binary(&mut daemon_mux, client_id).await,
-            binary
-        );
+        assert_eq!(next_binary(&mut daemon_data).await, binary);
 
         let mut daemon_binary = b"daemon-to-client:".to_vec();
         daemon_binary.extend_from_slice(&binary);
-        send_mux(
-            &mut daemon_mux,
-            RelayMuxEnvelope::DaemonFrame {
-                client_id,
-                frame: RelayOpaqueFrame::Binary {
-                    data_base64: base64::Engine::encode(
-                        &base64::engine::general_purpose::STANDARD,
-                        &daemon_binary,
-                    ),
-                },
-            },
-        )
-        .await;
+        daemon_data
+            .send(Message::Binary(daemon_binary.clone()))
+            .await
+            .expect("daemon data should send binary");
         assert_eq!(next_binary(&mut client).await, daemon_binary);
     }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn relay_keeps_daemon_mux_targeted_frames_within_server_id() {
-    let relay = RelayProcess::spawn().await;
-    let server_a = ServerId::new();
-    let server_b = ServerId::new();
-    let mut daemon_a = connect_registered_socket(relay.ws_url(), server_a, RouteRole::DaemonMux)
-        .await
-        .expect("daemon A should connect");
-    let mut daemon_b = connect_registered_socket(relay.ws_url(), server_b, RouteRole::DaemonMux)
-        .await
-        .expect("daemon B should connect");
-    let (mut client_a, client_a_id) =
-        connect_registered_client_socket(relay.ws_url(), server_a, &mut daemon_a)
-            .await
-            .expect("client A should connect");
-    let (mut client_b, _client_b_id) =
-        connect_registered_client_socket(relay.ws_url(), server_b, &mut daemon_b)
-            .await
-            .expect("client B should connect");
-    let targeted_frame = b"ciphertext-for-server-a-only".to_vec();
-
-    send_mux(
-        &mut daemon_a,
-        RelayMuxEnvelope::DaemonFrame {
-            client_id: client_a_id,
-            frame: RelayOpaqueFrame::Binary {
-                data_base64: base64::Engine::encode(
-                    &base64::engine::general_purpose::STANDARD,
-                    &targeted_frame,
-                ),
-            },
-        },
-    )
-    .await;
-
-    assert_eq!(next_binary(&mut client_a).await, targeted_frame);
-    assert!(
-        timeout(Duration::from_millis(150), client_b.next())
-            .await
-            .is_err(),
-        "server_id B client must not receive server_id A daemon fanout"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn relay_mux_routes_client_frames_and_targeted_daemon_responses() {
-    let relay = RelayProcess::spawn().await;
-    let server_id = ServerId::new();
-    let mut daemon_mux = connect_registered_socket(relay.ws_url(), server_id, RouteRole::DaemonMux)
-        .await
-        .expect("daemon mux side should connect");
-    let (mut client_a, expected_client_a_id) =
-        connect_registered_client_socket(relay.ws_url(), server_id, &mut daemon_mux)
-            .await
-            .expect("client A should connect");
-    let (mut client_b, client_b_id) =
-        connect_registered_client_socket(relay.ws_url(), server_id, &mut daemon_mux)
-            .await
-            .expect("client B should connect");
-
-    let business_shaped_text =
-        "{\"type\":\"pair_request\",\"payload\":{\"token\":\"relay-secret-plaintext\"}}";
-    client_a
-        .send(Message::Text(business_shaped_text.to_owned()))
-        .await
-        .expect("client A should send opaque text");
-
-    let RelayMuxEnvelope::ClientFrame {
-        client_id: client_a_id,
-        frame: RelayOpaqueFrame::Text {
-            data: client_a_text,
-        },
-    } = next_mux(&mut daemon_mux).await
-    else {
-        panic!("expected client A frame");
-    };
-    assert_eq!(client_a_id, expected_client_a_id);
-    assert_eq!(client_a_text, business_shaped_text);
-
-    send_mux(
-        &mut daemon_mux,
-        RelayMuxEnvelope::DaemonFrame {
-            client_id: client_a_id,
-            frame: RelayOpaqueFrame::Text {
-                data: "daemon-response-for-a".to_owned(),
-            },
-        },
-    )
-    .await;
-
-    assert_eq!(next_text(&mut client_a).await, "daemon-response-for-a");
-    assert!(
-        timeout(Duration::from_millis(150), client_b.next())
-            .await
-            .is_err(),
-        "client B must not receive client A mux response"
-    );
-
-    client_b
-        .send(Message::Binary(vec![9, 8, 7]))
-        .await
-        .expect("client B should send opaque binary");
-    assert_eq!(
-        next_mux(&mut daemon_mux).await,
-        RelayMuxEnvelope::ClientFrame {
-            client_id: client_b_id,
-            frame: RelayOpaqueFrame::Binary {
-                data_base64: "CQgH".to_owned(),
-            },
-        }
-    );
-
-    send_mux(
-        &mut daemon_mux,
-        RelayMuxEnvelope::DaemonFrame {
-            client_id: client_b_id,
-            frame: RelayOpaqueFrame::Binary {
-                data_base64: "AQID".to_owned(),
-            },
-        },
-    )
-    .await;
-    assert_eq!(next_binary(&mut client_b).await, vec![1, 2, 3]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -401,32 +401,49 @@ async fn relay_auth_rejects_missing_and_wrong_transport_token() {
 async fn relay_auth_allows_dumb_pipe_forwarding_with_correct_token() {
     let relay = RelayProcess::spawn_auth_required("relay-secret-1").await;
     let server_id = ServerId::new();
-    let mut daemon_mux = connect_registered_socket(
+    let mut daemon_control = connect_registered_socket(
         format!("{}?relay_token=relay-secret-1", relay.ws_url()),
         server_id,
-        RouteRole::DaemonMux,
+        RouteRole::DaemonControl,
     )
     .await
-    .expect("authenticated daemon mux should connect");
-    let (mut client, client_id) = connect_registered_client_socket(
-        format!("{}?relay_token=relay-secret-1", relay.ws_url()),
+    .expect("authenticated daemon control should connect");
+    let (mut client, _) = connect_async(format!("{}?relay_token=relay-secret-1", relay.ws_url()))
+        .await
+        .expect("authenticated client should connect");
+    send_route_hello(&mut client, server_id, RouteRole::Client)
+        .await
+        .expect("authenticated client route_hello should send");
+    let (client_id, data_token) = expect_open_data(&mut daemon_control).await;
+
+    let (mut daemon_data, _) =
+        connect_async(format!("{}?relay_token=relay-secret-1", relay.ws_url()))
+            .await
+            .expect("authenticated daemon data should connect");
+    send_route_hello_with_data(
+        &mut daemon_data,
         server_id,
-        &mut daemon_mux,
+        RouteRole::DaemonData,
+        Some(client_id),
+        Some(data_token),
     )
     .await
-    .expect("authenticated client should connect");
+    .expect("authenticated daemon data route_hello should send");
+    expect_route_ready(&mut daemon_data, server_id, RouteRole::DaemonData)
+        .await
+        .expect("daemon data should receive route_ready");
+    expect_route_ready(&mut client, server_id, RouteRole::Client)
+        .await
+        .expect("client should receive route_ready");
+
     let business_shaped_text =
         "{\"type\":\"pair_request\",\"payload\":{\"token\":\"relay-secret-plaintext\"}}";
-
     client
         .send(Message::Text(business_shaped_text.to_owned()))
         .await
         .expect("authenticated client should send opaque text");
 
-    assert_eq!(
-        expect_client_text(&mut daemon_mux, client_id).await,
-        business_shaped_text
-    );
+    assert_eq!(next_text(&mut daemon_data).await, business_shaped_text);
 }
 
 fn encrypted_pair_request_wire(server_id: ServerId, token: &str) -> (String, E2eeSession) {
@@ -486,36 +503,20 @@ async fn connect_registered_socket(
     Ok(socket)
 }
 
-async fn connect_registered_client_socket(
-    url: String,
-    server_id: ServerId,
-    daemon_mux: &mut RelaySocket,
-) -> Result<(RelaySocket, RelayClientId), tokio_tungstenite::tungstenite::Error> {
-    let (mut socket, _) = connect_async(url.as_str()).await?;
-    send_route_hello(&mut socket, server_id, RouteRole::Client).await?;
-    let client_id = expect_client_connected(daemon_mux).await;
-    // 中文注释：relay 现在把 client route_ready 作为路由事务提交点。
-    // daemon mux 必须先回一个首帧，证明 daemon->relay->client 方向已可用。
-    send_mux(
-        daemon_mux,
-        RelayMuxEnvelope::DaemonFrame {
-            client_id,
-            frame: RelayOpaqueFrame::Text {
-                data: "route-bootstrap".to_owned(),
-            },
-        },
-    )
-    .await;
-    expect_route_ready(&mut socket, server_id, RouteRole::Client).await?;
-    assert_eq!(next_text(&mut socket).await, "route-bootstrap");
-
-    Ok((socket, client_id))
-}
-
 async fn send_route_hello(
     socket: &mut RelaySocket,
     server_id: ServerId,
     role: RouteRole,
+) -> Result<(), tokio_tungstenite::tungstenite::Error> {
+    send_route_hello_with_data(socket, server_id, role, None, None).await
+}
+
+async fn send_route_hello_with_data(
+    socket: &mut RelaySocket,
+    server_id: ServerId,
+    role: RouteRole,
+    client_id: Option<RelayClientId>,
+    data_token: Option<Nonce>,
 ) -> Result<(), tokio_tungstenite::tungstenite::Error> {
     let route_hello = Envelope::new(
         MessageType::RouteHello,
@@ -524,15 +525,37 @@ async fn send_route_hello(
             role,
             protocol_version: ProtocolVersion::default(),
             nonce: Nonce(format!("route-nonce-{}", Uuid::new_v4())),
-            route_generation: match role {
-                RouteRole::DaemonMux => Some(Nonce("relay-e2e-generation".to_owned())),
-                RouteRole::Client => None,
-            },
+            route_generation: None,
+            client_id,
+            data_token,
             timestamp_ms: current_unix_timestamp_millis(),
         },
     );
     let raw = serde_json::to_string(&route_hello).expect("route_hello should encode");
     socket.send(Message::Text(raw)).await
+}
+
+async fn expect_open_data(socket: &mut RelaySocket) -> (RelayClientId, Nonce) {
+    loop {
+        match timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("relay control frame should arrive")
+            .expect("daemon control should stay open")
+            .expect("daemon control frame should be valid")
+        {
+            Message::Text(raw) => match serde_json::from_str::<RelayControlEnvelope>(&raw)
+                .expect("relay control envelope should decode")
+            {
+                RelayControlEnvelope::OpenData {
+                    client_id,
+                    data_token,
+                } => return (client_id, data_token),
+                other => panic!("expected open_data, got {other:?}"),
+            },
+            Message::Ping(_) | Message::Pong(_) => continue,
+            other => panic!("expected relay control text, got {other:?}"),
+        }
+    }
 }
 
 async fn expect_route_ready(
@@ -559,88 +582,33 @@ async fn expect_route_ready(
 }
 
 async fn next_text(socket: &mut RelaySocket) -> String {
-    match timeout(Duration::from_secs(2), socket.next())
-        .await
-        .expect("relay frame should arrive before timeout")
-        .expect("relay websocket should remain open")
-        .expect("relay websocket frame should be valid")
-    {
-        Message::Text(text) => text,
-        other => panic!("expected text frame, got {other:?}"),
+    loop {
+        match timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("relay frame should arrive before timeout")
+            .expect("relay websocket should remain open")
+            .expect("relay websocket frame should be valid")
+        {
+            Message::Text(text) => return text,
+            Message::Ping(_) | Message::Pong(_) => continue,
+            other => panic!("expected text frame, got {other:?}"),
+        }
     }
 }
 
 async fn next_binary(socket: &mut RelaySocket) -> Vec<u8> {
-    match timeout(Duration::from_secs(2), socket.next())
-        .await
-        .expect("relay frame should arrive before timeout")
-        .expect("relay websocket should remain open")
-        .expect("relay websocket frame should be valid")
-    {
-        Message::Binary(bytes) => bytes,
-        other => panic!("expected binary frame, got {other:?}"),
-    }
-}
-
-async fn next_mux(socket: &mut RelaySocket) -> RelayMuxEnvelope {
-    match timeout(Duration::from_secs(2), socket.next())
-        .await
-        .expect("relay frame should arrive before timeout")
-        .expect("relay websocket should remain open")
-        .expect("relay websocket frame should be valid")
-    {
-        Message::Text(text) => {
-            serde_json::from_str(&text).expect("relay mux envelope should decode")
+    loop {
+        match timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("relay frame should arrive before timeout")
+            .expect("relay websocket should remain open")
+            .expect("relay websocket frame should be valid")
+        {
+            Message::Binary(bytes) => return bytes,
+            Message::Ping(_) | Message::Pong(_) => continue,
+            other => panic!("expected binary frame, got {other:?}"),
         }
-        Message::Binary(bytes) => decode_binary_relay_mux_envelope(&bytes)
-            .expect("binary relay mux envelope should decode"),
-        other => panic!("expected mux frame, got {other:?}"),
     }
-}
-
-async fn expect_client_connected(socket: &mut RelaySocket) -> termd_proto::RelayClientId {
-    match next_mux(socket).await {
-        RelayMuxEnvelope::ClientConnected { client_id } => client_id,
-        other => panic!("expected client_connected envelope, got {other:?}"),
-    }
-}
-
-async fn expect_client_text(
-    socket: &mut RelaySocket,
-    expected_client_id: termd_proto::RelayClientId,
-) -> String {
-    match next_mux(socket).await {
-        RelayMuxEnvelope::ClientFrame {
-            client_id,
-            frame: RelayOpaqueFrame::Text { data },
-        } if client_id == expected_client_id => data,
-        other => panic!("expected client text frame, got {other:?}"),
-    }
-}
-
-async fn expect_client_binary(
-    socket: &mut RelaySocket,
-    expected_client_id: termd_proto::RelayClientId,
-) -> Vec<u8> {
-    match next_mux(socket).await {
-        RelayMuxEnvelope::ClientFrame {
-            client_id,
-            frame: RelayOpaqueFrame::Binary { data_base64 },
-        } if client_id == expected_client_id => {
-            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, data_base64)
-                .expect("client binary frame should be valid base64")
-        }
-        other => panic!("expected client binary frame, got {other:?}"),
-    }
-}
-
-async fn send_mux(socket: &mut RelaySocket, envelope: RelayMuxEnvelope) {
-    let raw = encode_binary_relay_mux_envelope(&envelope)
-        .expect("relay mux envelope should encode as binary");
-    socket
-        .send(Message::Binary(raw))
-        .await
-        .expect("daemon mux should send envelope");
 }
 
 fn unused_listen_addr() -> SocketAddr {

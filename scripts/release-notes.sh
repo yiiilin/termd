@@ -12,6 +12,24 @@ version="${1:-}"
 }
 
 case "$version" in
+  0.3.9)
+    cat <<'EOF'
+termd 0.3.9
+
+用户可见变化:
+- relay 架构从旧 daemon mux 收敛为 daemon control 长连接 + 每个 browser client 独立 daemon data 连接；client 只有在 data pipe 配对完成后才收到 route_ready，减少 relay 长时间使用和快速切换 session 后卡住或操作超时的情况。
+- relay 进一步保持 dumb pipe：route prelude 后只原样转发 browser 与 daemon data 之间的 text/binary WebSocket frame，不再解析或封装 terminal/session 等业务内容。
+- daemon 通过 control 线接收 OpenData 后为每个外部 client 反连独立 data pipe；client 断开时 relay 会关闭对应 data pipe 并通知 daemon 清理该 client 上下文，旧客户端不再影响新客户端。
+- direct 和 relay 下的 Web 连接生命周期继续收敛：session 切换会取消正在进行的建连/auth/attach，后台状态轮询的 transient timeout 不再误伤当前终端。
+- 移动端终端交互修复：中文输入组合态下按键处理更稳，长按终端/输入框可让系统复制粘贴菜单接管，键盘/viewport 变化时如果本来在底部会保持跟随底部。
+- 终端滚动跟随修复：只有当前视图已经在 PTY 底部时，新的输出或布局变化才自动跟到底部；用户滚到历史时不会被无关点击强制刷新或拉回。
+
+兼容性:
+- supervisor 兼容版本未变化，仍为 `0.3.5`；从 0.3.8 更新到 0.3.9 不应终止或清空已有 live session supervisor。
+- packet protocol version 仍为 3；relay route role 新增 `daemon_control` / `daemon_data`，daemon 与 relay 必须同步升级到 0.3.9 才能使用新 relay 架构。relay 仍不解密、不解析业务明文。
+- 旧 `daemon_mux` route 在新 termrelay 中会被明确拒绝；旧 daemon 不能继续通过新版 relay 的生产路径连接。
+EOF
+    ;;
   0.3.8)
     cat <<'EOF'
 termd 0.3.8
