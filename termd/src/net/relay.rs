@@ -4,32 +4,35 @@
 //! 每个 relay client 映射成独立的 daemon `ProtocolConnection`。
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::io;
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::Mutex;
 use std::time::Duration;
 
+use axum::body::{Body, Bytes};
 #[cfg(test)]
 use base64::{Engine as _, engine::general_purpose};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{Sink, SinkExt, StreamExt};
 use rustls::{ClientConfig, RootCertStore};
 use termd_proto::{
     Envelope as ProtoEnvelope, MessageType as ProtoMessageType, Nonce as ProtoNonce,
     PROTOCOL_PACKET_VERSION, ProtocolVersion as ProtoProtocolVersion, RelayClientId,
-    RelayControlEnvelope, RouteHelloPayload as ProtoRouteHelloPayload,
+    RelayControlEnvelope, RelayHttpTunnelFrame, RouteHelloPayload as ProtoRouteHelloPayload,
     RouteReadyPayload as ProtoRouteReadyPayload, RouteRole as ProtoRouteRole, ServerId, SessionId,
+    decode_relay_data_control, decode_relay_http_tunnel_frame,
+    encode_relay_http_tunnel_response_body, encode_relay_http_tunnel_response_end,
+    encode_relay_http_tunnel_response_head,
 };
 #[cfg(test)]
 use termd_proto::{
     RelayMuxEnvelope, RelayOpaqueFrame, decode_binary_relay_mux_envelope,
-    encode_binary_relay_mux_envelope,
+    encode_binary_relay_mux_envelope, encode_relay_data_control,
 };
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
-#[cfg(test)]
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, timeout};
 use tokio_tungstenite::{
@@ -45,6 +48,7 @@ use crate::config::RelayReconnectConfig;
 use super::protocol::ProtocolConnectionDebugTraffic;
 use super::protocol::{JsonEnvelope, ProtocolConnection, ProtocolError, ProtocolWireMessage};
 use super::server::SharedDaemonProtocol;
+use super::server::handle_http_file_tunnel_stream_request;
 
 const OUTPUT_FLUSH_MAX_BYTES_PER_SESSION: usize = 512 * 1024;
 const MIN_RELAY_RETRY_DELAY_MS: u64 = 1;
@@ -52,6 +56,8 @@ const MIN_RELAY_HEARTBEAT_INTERVAL_MS: u64 = 1;
 // relay mux transport 失败只会断开当前 relay 连接并触发重连，不关闭持久 session/supervisor。
 // 公网 relay 往往还隔着 TLS 和反向代理，2s 级 deadline 容易把短暂抖动误判成断线。
 const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+const RELAY_DATA_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const RELAY_IDLE_DATA_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const RELAY_ROUTE_READY_TIMEOUT: Duration = Duration::from_secs(5);
 const RELAY_SEND_DEADLINE: Duration = Duration::from_secs(10);
 #[cfg(test)]
@@ -65,8 +71,10 @@ const RELAY_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 #[cfg(test)]
 const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const RELAY_RECONNECT_STABLE_RESET_AFTER: Duration = Duration::from_secs(60);
-const RELAY_MAX_FRAME_SIZE: usize = 1024 * 1024;
-const RELAY_MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
+// relay 是加密 dumb pipe，daemon 侧不能依赖 relay 解析业务分片。
+// 允许 MB 级 terminal snapshot 通过，同时保留明确的单帧/单消息内存上限。
+const RELAY_MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
+const RELAY_MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 #[cfg(test)]
 const RELAY_TRAFFIC_LOG_INTERVAL: Duration = Duration::from_secs(1);
 const RELAY_SEND_SLOW_LOG_THRESHOLD: Duration = Duration::from_millis(50);
@@ -80,7 +88,17 @@ const RELAY_PUSH_EVENT_QUEUE_CAPACITY: usize = 2048;
 const RELAY_MUX_CONTROL_QUEUE_CAPACITY: usize = 256;
 #[cfg(test)]
 const RELAY_MUX_DATA_QUEUE_CAPACITY: usize = 32;
-const RELAY_DATA_WIRE_QUEUE_CAPACITY: usize = 2048;
+// 中文注释：daemon->relay data writer 只保留一个待写批次，让 WebSocket 写速率成为真实背压。
+// HTTP tunnel 下载不能在 daemon 侧按 256KiB * 2048 继续堆积。
+const RELAY_DATA_WIRE_QUEUE_CAPACITY: usize = 1;
+// 中文注释：relay client 接入不能依赖即时新建公网 TLS/WebSocket。daemon 预先维持少量
+// idle data pipe，client 到达时 relay 只做本地配对，避免反代或网络偶发慢连接进入用户路径。
+#[cfg(not(test))]
+const RELAY_IDLE_DATA_POOL_TARGET: usize = 8;
+#[cfg(test)]
+const RELAY_IDLE_DATA_POOL_TARGET: usize = 0;
+const RELAY_IDLE_DATA_REFILL_MIN_DELAY: Duration = Duration::from_secs(1);
+const RELAY_IDLE_DATA_REFILL_MAX_DELAY: Duration = Duration::from_secs(5);
 const RELAY_PUSH_DRAIN_MAX_EVENTS_PER_TICK: usize = 64;
 const RELAY_PUSH_DRAIN_MAX_TRANSPORTED_BYTES_PER_TICK: usize = 16 * 1024 * 1024;
 const RELAY_PUSH_DRAIN_MAX_ELAPSED_PER_TICK: Duration = Duration::from_millis(4);
@@ -90,6 +108,38 @@ const RELAY_OUTPUT_PUSH_COALESCE_DELAY: Duration = Duration::from_millis(10);
 type RelayWs = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>;
 type RelaySender = futures_util::stream::SplitSink<RelayWs, Message>;
 type RelayReceiver = futures_util::stream::SplitStream<RelayWs>;
+type RelayDataTaskMap = HashMap<RelayClientId, JoinHandle<()>>;
+type RelayIdleDataTaskMap = HashMap<u64, JoinHandle<()>>;
+
+#[derive(Debug, Clone, Copy)]
+enum RelayIdleDataEvent {
+    Ready {
+        task_id: u64,
+    },
+    Assigned {
+        task_id: u64,
+        client_id: RelayClientId,
+    },
+    Closed {
+        task_id: u64,
+    },
+}
+
+enum RelayEstablishedDataOutcome {
+    SocketClosed,
+}
+
+#[derive(Debug)]
+enum RelayDataWriterOutcome<S> {
+    Reusable(S),
+    Closed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelayEstablishedDataEnd {
+    SocketClosed,
+    ClientDisconnected,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum RelayPushEvent {
@@ -150,7 +200,6 @@ impl RelayPushEventQueue {
         self.pending.push_back(event);
     }
 
-    #[cfg(test)]
     fn requeue_front(&mut self, event: RelayPushEvent) {
         if self.pending_set.contains(&event) {
             return;
@@ -288,6 +337,7 @@ impl RelayTrafficCounters {
         }
         match kind {
             RelayOutKind::Response => self.out_response.record(envelopes, bytes),
+            RelayOutKind::FileTunnelBody => self.out_response.record(envelopes, bytes),
             RelayOutKind::PushOutput => self.out_push_output.record(envelopes, bytes),
             RelayOutKind::PushFileTree => self.out_push_file_tree.record(envelopes, bytes),
             RelayOutKind::PushResize => self.out_push_resize.record(envelopes, bytes),
@@ -380,6 +430,7 @@ impl RelayHeartbeatDebug {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RelayOutKind {
     Response,
+    FileTunnelBody,
     PushOutput,
     PushFileTree,
     PushResize,
@@ -408,6 +459,7 @@ impl RelayOutKind {
     fn label(self) -> &'static str {
         match self {
             Self::Response => "response",
+            Self::FileTunnelBody => "file_tunnel_body",
             Self::PushOutput => "push_output",
             Self::PushFileTree => "push_file_tree",
             Self::PushResize => "push_resize",
@@ -1127,65 +1179,130 @@ async fn connect_relay_control_base_once(
     let mut last_activity = Instant::now();
     let mut last_idle_ping_sent_at = Instant::now();
     let mut idle_ping_nonce = 0_u64;
+    let mut data_tasks = RelayDataTaskMap::new();
+    let mut idle_data_tasks = RelayIdleDataTaskMap::new();
+    let mut idle_data_connecting = HashSet::<u64>::new();
+    let mut idle_data_waiting = HashSet::<u64>::new();
+    let mut next_idle_data_task_id = 1_u64;
+    let mut next_idle_data_refill_at = Instant::now();
+    let mut idle_data_refill_delay = RELAY_IDLE_DATA_REFILL_MIN_DELAY;
+    let (idle_data_event_tx, mut idle_data_event_rx) = mpsc::channel::<RelayIdleDataEvent>(32);
+    ensure_relay_idle_data_pool(
+        &base,
+        auth_token,
+        &proxy,
+        protocol.clone(),
+        server_id,
+        &mut idle_data_tasks,
+        &mut idle_data_connecting,
+        &mut idle_data_waiting,
+        &mut next_idle_data_task_id,
+        &idle_data_event_tx,
+        Instant::now(),
+        next_idle_data_refill_at,
+    );
 
-    loop {
+    let result = loop {
+        prune_finished_relay_data_tasks(&mut data_tasks);
+        if prune_finished_relay_idle_data_tasks(
+            &mut idle_data_tasks,
+            &mut idle_data_connecting,
+            &mut idle_data_waiting,
+        ) {
+            schedule_relay_idle_data_refill_backoff(
+                &mut next_idle_data_refill_at,
+                &mut idle_data_refill_delay,
+            );
+        }
+        ensure_relay_idle_data_pool(
+            &base,
+            auth_token,
+            &proxy,
+            protocol.clone(),
+            server_id,
+            &mut idle_data_tasks,
+            &mut idle_data_connecting,
+            &mut idle_data_waiting,
+            &mut next_idle_data_task_id,
+            &idle_data_event_tx,
+            Instant::now(),
+            next_idle_data_refill_at,
+        );
         tokio::select! {
             biased;
 
             inbound = receiver.next() => {
                 let Some(message) = inbound else {
-                    return Ok(());
+                    break Ok(());
                 };
-                let message = message.map_err(|error| {
-                    warn!(
-                        relay = %relay_endpoint,
-                        ?server_id,
-                        %error,
-                        "relay daemon control receive failed"
-                    );
-                    RelayConnectorError::ReceiveFailed
-                })?;
+                let message = match message {
+                    Ok(message) => message,
+                    Err(error) => {
+                        warn!(
+                            relay = %relay_endpoint,
+                            ?server_id,
+                            %error,
+                            "relay daemon control receive failed"
+                        );
+                        break Err(RelayConnectorError::ReceiveFailed);
+                    }
+                };
                 match message {
                     Message::Text(raw) => {
                         last_activity = Instant::now();
-                        let envelope: RelayControlEnvelope = serde_json::from_str(raw.as_str())
-                            .map_err(|_| RelayConnectorError::InvalidEnvelope)?;
-                        handle_relay_control_envelope(
+                        let envelope: RelayControlEnvelope = match serde_json::from_str(raw.as_str()) {
+                            Ok(envelope) => envelope,
+                            Err(_) => break Err(RelayConnectorError::InvalidEnvelope),
+                        };
+                        if let Err(error) = handle_relay_control_envelope(
                             envelope,
                             base.clone(),
                             auth_token.map(str::to_owned),
                             proxy.clone(),
                             protocol.clone(),
                             server_id,
+                            &mut data_tasks,
                         )
-                        .await?;
+                        .await
+                        {
+                            break Err(error);
+                        }
                     }
                     Message::Binary(raw) => {
                         last_activity = Instant::now();
-                        let envelope: RelayControlEnvelope = serde_json::from_slice(&raw)
-                            .map_err(|_| RelayConnectorError::InvalidEnvelope)?;
-                        handle_relay_control_envelope(
+                        let envelope: RelayControlEnvelope = match serde_json::from_slice(&raw) {
+                            Ok(envelope) => envelope,
+                            Err(_) => break Err(RelayConnectorError::InvalidEnvelope),
+                        };
+                        if let Err(error) = handle_relay_control_envelope(
                             envelope,
                             base.clone(),
                             auth_token.map(str::to_owned),
                             proxy.clone(),
                             protocol.clone(),
                             server_id,
+                            &mut data_tasks,
                         )
-                        .await?;
+                        .await
+                        {
+                            break Err(error);
+                        }
                     }
                     Message::Ping(payload) => {
-                        send_relay_message_with_deadline(
+                        if let Err(error) = send_relay_message_with_deadline(
                             &mut sender,
                             Message::Pong(payload),
                             RELAY_PONG_DEADLINE,
                         )
-                        .await?;
+                        .await
+                        {
+                            break Err(error);
+                        }
                     }
                     Message::Pong(_) => {
                         last_activity = Instant::now();
                     }
-                    Message::Close(_) => return Ok(()),
+                    Message::Close(_) => break Ok(()),
                     Message::Frame(_) => {}
                 }
             }
@@ -1194,12 +1311,15 @@ async fn connect_relay_control_base_once(
                 if relay_idle_ping_due(now, last_activity, last_idle_ping_sent_at, heartbeat_interval) {
                     idle_ping_nonce = idle_ping_nonce.wrapping_add(1);
                     let payload = idle_ping_nonce.to_be_bytes().to_vec();
-                    send_relay_message_with_deadline(
+                    if let Err(error) = send_relay_message_with_deadline(
                         &mut sender,
                         Message::Ping(payload),
                         RELAY_SEND_DEADLINE,
                     )
-                    .await?;
+                    .await
+                    {
+                        break Err(error);
+                    }
                     last_activity = Instant::now();
                     last_idle_ping_sent_at = last_activity;
                     trace!(
@@ -1209,8 +1329,42 @@ async fn connect_relay_control_base_once(
                     );
                 }
             }
+            maybe_event = idle_data_event_rx.recv() => {
+                let Some(event) = maybe_event else {
+                    break Err(RelayConnectorError::ReceiveFailed);
+                };
+                handle_relay_idle_data_event(
+                    &mut idle_data_tasks,
+                    &mut idle_data_connecting,
+                    &mut idle_data_waiting,
+                    event,
+                    &mut next_idle_data_refill_at,
+                    &mut idle_data_refill_delay,
+                );
+            }
+            _ = tokio::time::sleep_until(next_idle_data_refill_at), if relay_idle_data_pool_refill_waiting(&idle_data_connecting, &idle_data_waiting, next_idle_data_refill_at) => {}
         }
+    };
+
+    let aborted = abort_all_relay_data_tasks(&mut data_tasks);
+    let aborted_idle = abort_all_relay_idle_data_tasks(&mut idle_data_tasks);
+    if aborted > 0 {
+        debug!(
+            relay = %relay_endpoint,
+            ?server_id,
+            aborted,
+            "relay daemon control aborted data pipes on shutdown"
+        );
     }
+    if aborted_idle > 0 {
+        debug!(
+            relay = %relay_endpoint,
+            ?server_id,
+            aborted = aborted_idle,
+            "relay daemon control aborted idle data pipes on shutdown"
+        );
+    }
+    result
 }
 
 async fn handle_relay_control_envelope(
@@ -1220,17 +1374,25 @@ async fn handle_relay_control_envelope(
     proxy: Option<RelayProxyUrl>,
     protocol: SharedDaemonProtocol,
     server_id: ServerId,
+    data_tasks: &mut RelayDataTaskMap,
 ) -> Result<(), RelayConnectorError> {
     match envelope {
         RelayControlEnvelope::OpenData {
             client_id,
             data_token,
         } => {
+            prune_finished_relay_data_tasks(data_tasks);
+            if abort_relay_data_task(data_tasks, client_id) {
+                debug!(
+                    client_id = client_id.0,
+                    "relay daemon control aborted stale data pipe before replacement"
+                );
+            }
             debug!(
                 client_id = client_id.0,
                 "relay daemon control requested data pipe"
             );
-            tokio::spawn(async move {
+            let task = tokio::spawn(async move {
                 if let Err(error) = run_relay_data_connection(
                     base, auth_token, proxy, protocol, server_id, client_id, data_token,
                 )
@@ -1243,15 +1405,229 @@ async fn handle_relay_control_envelope(
                     );
                 }
             });
+            data_tasks.insert(client_id, task);
         }
         RelayControlEnvelope::ClientDisconnected { client_id } => {
-            debug!(
-                client_id = client_id.0,
-                "relay daemon control observed client disconnect"
-            );
+            if abort_relay_data_task(data_tasks, client_id) {
+                debug!(
+                    client_id = client_id.0,
+                    "relay daemon control aborted data pipe after client disconnect"
+                );
+            } else {
+                debug!(
+                    client_id = client_id.0,
+                    "relay daemon control observed client disconnect"
+                );
+            }
+        }
+        RelayControlEnvelope::DataReady => {
+            // 中文注释：data_ready 只允许 daemon data pipe 发给 relay；control 线收到说明
+            // 对端版本或路由异常。这里忽略，避免影响 control 长连接生命周期。
+            debug!("relay daemon control ignored unexpected data_ready");
         }
     }
     Ok(())
+}
+
+fn prune_finished_relay_data_tasks(data_tasks: &mut RelayDataTaskMap) {
+    data_tasks.retain(|_, task| !task.is_finished());
+}
+
+fn abort_relay_data_task(data_tasks: &mut RelayDataTaskMap, client_id: RelayClientId) -> bool {
+    let Some(task) = data_tasks.remove(&client_id) else {
+        return false;
+    };
+    task.abort();
+    true
+}
+
+fn abort_all_relay_data_tasks(data_tasks: &mut RelayDataTaskMap) -> usize {
+    let aborted = data_tasks.len();
+    for (_, task) in data_tasks.drain() {
+        task.abort();
+    }
+    aborted
+}
+
+fn prune_finished_relay_idle_data_tasks(
+    idle_data_tasks: &mut RelayIdleDataTaskMap,
+    idle_data_connecting: &mut HashSet<u64>,
+    idle_data_waiting: &mut HashSet<u64>,
+) -> bool {
+    let mut removed_available_task = false;
+    idle_data_tasks.retain(|task_id, task| {
+        let keep = !task.is_finished();
+        if !keep {
+            if idle_data_connecting.remove(task_id) || idle_data_waiting.remove(task_id) {
+                removed_available_task = true;
+            }
+        }
+        keep
+    });
+    removed_available_task
+}
+
+fn abort_all_relay_idle_data_tasks(idle_data_tasks: &mut RelayIdleDataTaskMap) -> usize {
+    let aborted = idle_data_tasks.len();
+    for (_, task) in idle_data_tasks.drain() {
+        task.abort();
+    }
+    aborted
+}
+
+fn handle_relay_idle_data_event(
+    idle_data_tasks: &mut RelayIdleDataTaskMap,
+    idle_data_connecting: &mut HashSet<u64>,
+    idle_data_waiting: &mut HashSet<u64>,
+    event: RelayIdleDataEvent,
+    next_refill_at: &mut Instant,
+    refill_delay: &mut Duration,
+) {
+    match event {
+        RelayIdleDataEvent::Ready { task_id } => {
+            if idle_data_tasks.contains_key(&task_id) && !idle_data_waiting.contains(&task_id) {
+                let was_connecting = idle_data_connecting.remove(&task_id);
+                if !was_connecting
+                    && relay_idle_data_pool_slots(idle_data_connecting, idle_data_waiting)
+                        >= RELAY_IDLE_DATA_POOL_TARGET
+                {
+                    if let Some(task) = idle_data_tasks.remove(&task_id) {
+                        task.abort();
+                    }
+                    debug!(
+                        task_id,
+                        idle_connecting = idle_data_connecting.len(),
+                        idle_waiting = idle_data_waiting.len(),
+                        "relay daemon idle data pipe closed after surplus ready"
+                    );
+                    return;
+                }
+                idle_data_waiting.insert(task_id);
+                reset_relay_idle_data_refill_backoff(next_refill_at, refill_delay);
+                debug!(
+                    task_id,
+                    idle_connecting = idle_data_connecting.len(),
+                    idle_waiting = idle_data_waiting.len(),
+                    "relay daemon idle data pipe ready"
+                );
+            }
+        }
+        RelayIdleDataEvent::Assigned { task_id, client_id } => {
+            idle_data_waiting.remove(&task_id);
+            schedule_relay_idle_data_refill_after_assignment(next_refill_at, refill_delay);
+            debug!(
+                task_id,
+                client_id = client_id.0,
+                idle_waiting = idle_data_waiting.len(),
+                "relay daemon idle data pipe assigned"
+            );
+        }
+        RelayIdleDataEvent::Closed { task_id } => {
+            let was_connecting = idle_data_connecting.remove(&task_id);
+            let was_waiting = idle_data_waiting.remove(&task_id);
+            idle_data_tasks.remove(&task_id);
+            if was_connecting || was_waiting {
+                schedule_relay_idle_data_refill_backoff(next_refill_at, refill_delay);
+            } else {
+                reset_relay_idle_data_refill_backoff(next_refill_at, refill_delay);
+            }
+            debug!(
+                task_id,
+                idle_connecting = idle_data_connecting.len(),
+                idle_waiting = idle_data_waiting.len(),
+                was_connecting,
+                was_waiting,
+                "relay daemon idle data pipe task closed"
+            );
+        }
+    }
+}
+
+fn reset_relay_idle_data_refill_backoff(next_refill_at: &mut Instant, refill_delay: &mut Duration) {
+    *next_refill_at = Instant::now();
+    *refill_delay = RELAY_IDLE_DATA_REFILL_MIN_DELAY;
+}
+
+fn schedule_relay_idle_data_refill_after_assignment(
+    next_refill_at: &mut Instant,
+    refill_delay: &mut Duration,
+) {
+    // 中文注释：短连接常在数百毫秒内把同一条 data pipe 回收到 idle 池。
+    // assignment 后立刻补池会制造多余 TLS/WebSocket 连接；延迟补池让短切换优先复用。
+    *next_refill_at = Instant::now() + RELAY_IDLE_DATA_REFILL_MIN_DELAY;
+    *refill_delay = RELAY_IDLE_DATA_REFILL_MIN_DELAY;
+}
+
+fn schedule_relay_idle_data_refill_backoff(
+    next_refill_at: &mut Instant,
+    refill_delay: &mut Duration,
+) {
+    let now = Instant::now();
+    *next_refill_at = now + *refill_delay;
+    *refill_delay = refill_delay
+        .saturating_mul(2)
+        .min(RELAY_IDLE_DATA_REFILL_MAX_DELAY);
+}
+
+fn relay_idle_data_pool_refill_waiting(
+    idle_data_connecting: &HashSet<u64>,
+    idle_data_waiting: &HashSet<u64>,
+    next_refill_at: Instant,
+) -> bool {
+    RELAY_IDLE_DATA_POOL_TARGET > 0
+        && relay_idle_data_pool_slots(idle_data_connecting, idle_data_waiting)
+            < RELAY_IDLE_DATA_POOL_TARGET
+        && Instant::now() < next_refill_at
+}
+
+fn relay_idle_data_pool_slots(
+    idle_data_connecting: &HashSet<u64>,
+    idle_data_waiting: &HashSet<u64>,
+) -> usize {
+    idle_data_connecting.len() + idle_data_waiting.len()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ensure_relay_idle_data_pool(
+    base: &RelayBaseUrl,
+    auth_token: Option<&str>,
+    proxy: &Option<RelayProxyUrl>,
+    protocol: SharedDaemonProtocol,
+    server_id: ServerId,
+    idle_data_tasks: &mut RelayIdleDataTaskMap,
+    idle_data_connecting: &mut HashSet<u64>,
+    idle_data_waiting: &mut HashSet<u64>,
+    next_idle_data_task_id: &mut u64,
+    idle_data_event_tx: &mpsc::Sender<RelayIdleDataEvent>,
+    now: Instant,
+    next_refill_at: Instant,
+) {
+    if RELAY_IDLE_DATA_POOL_TARGET == 0 || now < next_refill_at {
+        return;
+    }
+    while relay_idle_data_pool_slots(idle_data_connecting, idle_data_waiting)
+        < RELAY_IDLE_DATA_POOL_TARGET
+    {
+        let task_id = *next_idle_data_task_id;
+        *next_idle_data_task_id = (*next_idle_data_task_id).saturating_add(1);
+        idle_data_connecting.insert(task_id);
+        let task = tokio::spawn(run_relay_idle_data_connection(
+            base.clone(),
+            auth_token.map(str::to_owned),
+            proxy.clone(),
+            protocol.clone(),
+            server_id,
+            task_id,
+            idle_data_event_tx.clone(),
+        ));
+        idle_data_tasks.insert(task_id, task);
+        debug!(
+            task_id,
+            idle_connecting = idle_data_connecting.len(),
+            idle_waiting = idle_data_waiting.len(),
+            "relay daemon started idle data pipe"
+        );
+    }
 }
 
 async fn run_relay_data_connection(
@@ -1265,7 +1641,7 @@ async fn run_relay_data_connection(
 ) -> Result<(), RelayConnectorError> {
     let relay_endpoint = base.canonical_url();
     let url = base.daemon_mux_url_with_auth(server_id, auth_token.as_deref());
-    let (sender, mut receiver) = connect_relay_route_socket(
+    let (sender, mut receiver) = connect_relay_route_socket_with_timeout(
         &url,
         proxy.as_ref(),
         server_id,
@@ -1273,16 +1649,127 @@ async fn run_relay_data_connection(
         None,
         Some(client_id),
         Some(data_token),
+        RELAY_DATA_CONNECT_TIMEOUT,
     )
     .await?;
+    let _ = run_relay_established_data_connection(
+        relay_endpoint,
+        protocol,
+        server_id,
+        client_id,
+        sender,
+        &mut receiver,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn run_relay_idle_data_connection(
+    base: RelayBaseUrl,
+    auth_token: Option<String>,
+    proxy: Option<RelayProxyUrl>,
+    protocol: SharedDaemonProtocol,
+    server_id: ServerId,
+    task_id: u64,
+    idle_data_event_tx: mpsc::Sender<RelayIdleDataEvent>,
+) {
+    let relay_endpoint = base.canonical_url();
+    let result: Result<(), RelayConnectorError> = async {
+        let url = base.daemon_mux_url_with_auth(server_id, auth_token.as_deref());
+        let (mut sender, mut receiver) = connect_relay_route_socket_with_timeout(
+            &url,
+            proxy.as_ref(),
+            server_id,
+            ProtoRouteRole::DaemonData,
+            None,
+            None,
+            None,
+            RELAY_IDLE_DATA_CONNECT_TIMEOUT,
+        )
+        .await?;
+        let _ = idle_data_event_tx
+            .send(RelayIdleDataEvent::Ready { task_id })
+            .await;
+        debug!(
+            relay = %relay_endpoint,
+            ?server_id,
+            task_id,
+            "relay daemon idle data pipe connected"
+        );
+        loop {
+            let (client_id, _data_token) = read_relay_idle_data_assignment(
+                &relay_endpoint,
+                task_id,
+                &mut sender,
+                &mut receiver,
+            )
+            .await?;
+            let _ = idle_data_event_tx
+                .send(RelayIdleDataEvent::Assigned { task_id, client_id })
+                .await;
+            debug!(
+                relay = %relay_endpoint,
+                ?server_id,
+                task_id,
+                client_id = client_id.0,
+                data_token_present = true,
+                "relay daemon idle data pipe received assignment"
+            );
+            match run_relay_established_data_connection(
+                relay_endpoint.clone(),
+                protocol.clone(),
+                server_id,
+                client_id,
+                sender,
+                &mut receiver,
+            )
+            .await?
+            {
+                RelayEstablishedDataOutcome::SocketClosed => break Ok(()),
+            }
+        }
+    }
+    .await;
+
+    match result {
+        Ok(()) => {
+            let _ = idle_data_event_tx
+                .send(RelayIdleDataEvent::Closed { task_id })
+                .await;
+        }
+        Err(error) => {
+            debug!(
+                relay = %base.canonical_url(),
+                ?server_id,
+                task_id,
+                %error,
+                "relay daemon idle data pipe stopped"
+            );
+            let _ = idle_data_event_tx
+                .send(RelayIdleDataEvent::Closed { task_id })
+                .await;
+        }
+    }
+}
+
+async fn run_relay_established_data_connection(
+    relay_endpoint: String,
+    protocol: SharedDaemonProtocol,
+    server_id: ServerId,
+    client_id: RelayClientId,
+    sender: RelaySender,
+    receiver: &mut RelayReceiver,
+) -> Result<RelayEstablishedDataOutcome, RelayConnectorError> {
     let (write_tx, write_rx) = mpsc::channel::<RelayDataWrite>(RELAY_DATA_WIRE_QUEUE_CAPACITY);
     let (writer_failed_tx, mut writer_failed_rx) = mpsc::channel::<()>(1);
+    let (writer_stop_tx, writer_stop_rx) = oneshot::channel();
     let writer_task = tokio::spawn(run_relay_data_writer(
         relay_endpoint.clone(),
         client_id,
         write_rx,
         writer_failed_tx,
         sender,
+        writer_stop_rx,
     ));
 
     let (connection, initial_messages) = {
@@ -1312,7 +1799,7 @@ async fn run_relay_data_connection(
 
             inbound = receiver.next() => {
                 let Some(message) = inbound else {
-                    break Ok(());
+                    break Ok(RelayEstablishedDataEnd::SocketClosed);
                 };
                 let message = match message {
                     Ok(message) => message,
@@ -1328,22 +1815,87 @@ async fn run_relay_data_connection(
                 };
                 match message {
                     Message::Ping(payload) => {
-                        enqueue_relay_data_raw(
+                        let control = decode_relay_data_control(&payload);
+                        if let Some(control) = control {
+                            match control {
+                                RelayControlEnvelope::ClientDisconnected { client_id: disconnected_client_id }
+                                    if disconnected_client_id == client_id =>
+                                {
+                                    debug!(
+                                        relay = %relay_endpoint,
+                                        client_id = client_id.0,
+                                        "relay daemon data received client disconnect"
+                                    );
+                                    break Ok(RelayEstablishedDataEnd::ClientDisconnected);
+                                }
+                                RelayControlEnvelope::ClientDisconnected { client_id: disconnected_client_id } => {
+                                    warn!(
+                                        relay = %relay_endpoint,
+                                        client_id = client_id.0,
+                                        disconnected_client_id = disconnected_client_id.0,
+                                        "relay daemon data ignored mismatched client disconnect"
+                                    );
+                                }
+                                RelayControlEnvelope::OpenData { .. } | RelayControlEnvelope::DataReady => {
+                                    debug!(
+                                        relay = %relay_endpoint,
+                                        client_id = client_id.0,
+                                        ?control,
+                                        "relay daemon data ignored unexpected control ping"
+                                    );
+                                }
+                            }
+                        }
+                        let queued = try_enqueue_relay_data_raw(
                             &write_tx,
                             RelayOutKind::Pong,
                             Message::Pong(payload),
-                        )
-                        .await?;
+                        )?;
+                        if !queued {
+                            trace!(
+                                relay = %relay_endpoint,
+                                client_id = client_id.0,
+                                "relay daemon data dropped pong because writer queue is full"
+                            );
+                        }
                     }
                     Message::Pong(_) | Message::Frame(_) => {}
-                    Message::Close(_) => break Ok(()),
+                    Message::Close(_) => break Ok(RelayEstablishedDataEnd::SocketClosed),
                     other => {
-                        let Some(wire_message) = relay_data_message_to_wire_message(other)? else {
-                            break Ok(());
+                        let Some(inbound) = relay_data_message_to_inbound(other)? else {
+                            break Ok(RelayEstablishedDataEnd::SocketClosed);
                         };
+                        let wire_message = match inbound {
+                            RelayDataInbound::Wire(wire_message) => wire_message,
+                        };
+                        if let ProtocolWireMessage::Binary(raw) = &wire_message
+                            && let Some(RelayHttpTunnelFrame::RequestHead { method, path, headers }) =
+                                decode_relay_http_tunnel_frame(raw)
+                        {
+                            debug!(
+                                relay = %relay_endpoint,
+                                client_id = client_id.0,
+                                method = %method,
+                                path = %path,
+                                headers = headers.len(),
+                                "relay daemon data received HTTP tunnel request head"
+                            );
+                            break handle_relay_http_tunnel_stream(
+                                &relay_endpoint,
+                                protocol.clone(),
+                                client_id,
+                                method,
+                                path,
+                                headers,
+                                &write_tx,
+                                receiver,
+                                &mut writer_failed_rx,
+                            )
+                            .await;
+                        }
                         let responses = {
                             let Some(connection) = connections.get_mut(&client_id) else {
-                                break Ok(());
+                                break Ok(RelayEstablishedDataEnd::SocketClosed);
                             };
                             let mut protocol = protocol.lock().await;
                             connection.handle_wire_message(&mut protocol, wire_message)
@@ -1391,11 +1943,11 @@ async fn run_relay_data_connection(
                 if maybe_failed.is_some() {
                     break Err(RelayConnectorError::SendFailed);
                 }
-                break Ok(());
+                break Ok(RelayEstablishedDataEnd::SocketClosed);
             }
             maybe_event = push_event_rx.recv() => {
                 let Some(event) = maybe_event else {
-                    break Ok(());
+                    break Ok(RelayEstablishedDataEnd::SocketClosed);
                 };
                 pending_push_events.enqueue(event);
                 drain_relay_data_push_events(
@@ -1440,10 +1992,452 @@ async fn run_relay_data_connection(
         &mut watcher_tasks,
     );
     abort_relay_watcher_tasks(watcher_tasks);
-    drop(write_tx);
-    writer_task.abort();
-    let _ = writer_task.await;
-    result
+    match result {
+        Ok(RelayEstablishedDataEnd::ClientDisconnected) => {
+            // 中文注释：client 断开后不再复用当前 daemon data pipe。
+            // relay 侧 control/data 分队列可能让旧 client 的 frame 残留在同一条
+            // WebSocket 上；关闭整条 data 线能从机制上避免旧 frame 污染下一次 attach/upload。
+            drop(write_tx);
+            let _ = writer_stop_tx.send(());
+            let _ = writer_task.await;
+            Ok(RelayEstablishedDataOutcome::SocketClosed)
+        }
+        Ok(RelayEstablishedDataEnd::SocketClosed) => {
+            drop(write_tx);
+            writer_task.abort();
+            let _ = writer_task.await;
+            Ok(RelayEstablishedDataOutcome::SocketClosed)
+        }
+        Err(error) => {
+            drop(write_tx);
+            writer_task.abort();
+            let _ = writer_task.await;
+            Err(error)
+        }
+    }
+}
+
+async fn read_relay_idle_data_assignment(
+    relay_endpoint: &str,
+    task_id: u64,
+    sender: &mut RelaySender,
+    receiver: &mut RelayReceiver,
+) -> Result<(RelayClientId, ProtoNonce), RelayConnectorError> {
+    loop {
+        let Some(message) = receiver.next().await else {
+            return Err(RelayConnectorError::ReceiveFailed);
+        };
+        let message = message.map_err(|_| RelayConnectorError::ReceiveFailed)?;
+        match message {
+            Message::Text(raw) => {
+                let envelope: RelayControlEnvelope = serde_json::from_str(raw.as_str())
+                    .map_err(|_| RelayConnectorError::InvalidEnvelope)?;
+                if let RelayControlEnvelope::OpenData {
+                    client_id,
+                    data_token,
+                } = envelope
+                {
+                    return Ok((client_id, data_token));
+                }
+                if matches!(
+                    envelope,
+                    RelayControlEnvelope::ClientDisconnected { .. }
+                        | RelayControlEnvelope::DataReady
+                ) {
+                    continue;
+                }
+                return Err(RelayConnectorError::InvalidEnvelope);
+            }
+            Message::Binary(raw) => {
+                let envelope: RelayControlEnvelope = serde_json::from_slice(&raw)
+                    .map_err(|_| RelayConnectorError::InvalidEnvelope)?;
+                if let RelayControlEnvelope::OpenData {
+                    client_id,
+                    data_token,
+                } = envelope
+                {
+                    return Ok((client_id, data_token));
+                }
+                if matches!(
+                    envelope,
+                    RelayControlEnvelope::ClientDisconnected { .. }
+                        | RelayControlEnvelope::DataReady
+                ) {
+                    continue;
+                }
+                return Err(RelayConnectorError::InvalidEnvelope);
+            }
+            Message::Ping(payload) => {
+                send_relay_message_with_deadline(
+                    sender,
+                    Message::Pong(payload.clone()),
+                    RELAY_PONG_DEADLINE,
+                )
+                .await?;
+                if let Some(envelope) = decode_relay_data_control(&payload) {
+                    if let RelayControlEnvelope::OpenData {
+                        client_id,
+                        data_token,
+                    } = envelope
+                    {
+                        return Ok((client_id, data_token));
+                    }
+                    if matches!(
+                        envelope,
+                        RelayControlEnvelope::ClientDisconnected { .. }
+                            | RelayControlEnvelope::DataReady
+                    ) {
+                        continue;
+                    }
+                    return Err(RelayConnectorError::InvalidEnvelope);
+                }
+            }
+            Message::Pong(_) | Message::Frame(_) => {}
+            Message::Close(_) => return Err(RelayConnectorError::ReceiveFailed),
+        }
+        trace!(
+            relay = %relay_endpoint,
+            task_id,
+            "relay daemon idle data pipe ignored non-assignment frame"
+        );
+    }
+}
+
+async fn handle_relay_http_tunnel_stream(
+    relay_endpoint: &str,
+    protocol: SharedDaemonProtocol,
+    client_id: RelayClientId,
+    method: String,
+    path: String,
+    headers: Vec<(String, String)>,
+    write_tx: &mpsc::Sender<RelayDataWrite>,
+    receiver: &mut RelayReceiver,
+    writer_failed_rx: &mut mpsc::Receiver<()>,
+) -> Result<RelayEstablishedDataEnd, RelayConnectorError> {
+    debug!(
+        relay = %relay_endpoint,
+        client_id = client_id.0,
+        method = %method,
+        path = %path,
+        headers = headers.len(),
+        "relay daemon HTTP tunnel stream started"
+    );
+    let (body_tx, body_rx) =
+        mpsc::channel::<Result<Bytes, io::Error>>(RELAY_DATA_WIRE_QUEUE_CAPACITY);
+    let body_stream = futures_util::stream::unfold(body_rx, |mut body_rx| async move {
+        body_rx.recv().await.map(|item| (item, body_rx))
+    });
+    let request_body = Body::from_stream(body_stream);
+    let response_write_tx = write_tx.clone();
+    let abort_response_on_client_disconnect = is_relay_http_tunnel_download(&method, &path);
+    let mut response_task = tokio::spawn(send_relay_http_tunnel_response(
+        protocol,
+        method,
+        path,
+        headers,
+        request_body,
+        response_write_tx,
+    ));
+    let mut body_tx = Some(body_tx);
+    let mut request_open = true;
+    let mut response_done = false;
+
+    loop {
+        tokio::select! {
+            biased;
+
+            response = &mut response_task, if !response_done => {
+                match response {
+                    Ok(Ok(())) => {
+                        debug!(
+                            relay = %relay_endpoint,
+                            client_id = client_id.0,
+                            "relay daemon HTTP tunnel response task completed; waiting for relay close"
+                        );
+                        response_done = true;
+                        body_tx.take();
+                        continue;
+                    }
+                    Ok(Err(error)) => {
+                        warn!(
+                            relay = %relay_endpoint,
+                            client_id = client_id.0,
+                            %error,
+                            "relay daemon HTTP tunnel response task failed"
+                        );
+                        return Err(error);
+                    }
+                    Err(error) => {
+                        warn!(
+                            relay = %relay_endpoint,
+                            client_id = client_id.0,
+                            %error,
+                            "relay daemon HTTP tunnel response task panicked"
+                        );
+                        return Err(RelayConnectorError::SendFailed);
+                    }
+                };
+            }
+            maybe_failed = writer_failed_rx.recv() => {
+                if !response_done {
+                    cleanup_relay_http_tunnel_response_task(
+                        &mut body_tx,
+                        response_task,
+                        abort_response_on_client_disconnect,
+                    )
+                    .await;
+                }
+                if maybe_failed.is_some() {
+                    warn!(
+                        relay = %relay_endpoint,
+                        client_id = client_id.0,
+                        "relay daemon HTTP tunnel writer failed"
+                    );
+                    return Err(RelayConnectorError::SendFailed);
+                }
+                debug!(
+                    relay = %relay_endpoint,
+                    client_id = client_id.0,
+                    "relay daemon HTTP tunnel writer closed"
+                );
+                return Ok(RelayEstablishedDataEnd::SocketClosed);
+            }
+            inbound = receiver.next() => {
+                let Some(message) = inbound else {
+                    if !response_done {
+                        cleanup_relay_http_tunnel_response_task(
+                            &mut body_tx,
+                            response_task,
+                            abort_response_on_client_disconnect,
+                        )
+                        .await;
+                    }
+                    return Ok(RelayEstablishedDataEnd::SocketClosed);
+                };
+                let message = match message {
+                    Ok(message) => message,
+                    Err(error) => {
+                        warn!(
+                            relay = %relay_endpoint,
+                            client_id = client_id.0,
+                            %error,
+                            "relay daemon HTTP tunnel receive failed"
+                        );
+                        if !response_done {
+                            cleanup_relay_http_tunnel_response_task(
+                                &mut body_tx,
+                                response_task,
+                                abort_response_on_client_disconnect,
+                            )
+                            .await;
+                        }
+                        return Err(RelayConnectorError::ReceiveFailed);
+                    }
+                };
+                match message {
+                    Message::Ping(payload) => {
+                        let control = decode_relay_data_control(&payload);
+                        if let Some(RelayControlEnvelope::ClientDisconnected {
+                            client_id: disconnected_client_id,
+                        }) = control
+                        {
+                            if !response_done {
+                                cleanup_relay_http_tunnel_response_task(
+                                    &mut body_tx,
+                                    response_task,
+                                    abort_response_on_client_disconnect,
+                                )
+                                .await;
+                            }
+                            if disconnected_client_id == client_id {
+                                return Ok(RelayEstablishedDataEnd::ClientDisconnected);
+                            }
+                            warn!(
+                                relay = %relay_endpoint,
+                                client_id = client_id.0,
+                                disconnected_client_id = disconnected_client_id.0,
+                                "relay daemon HTTP tunnel ignored mismatched client disconnect"
+                            );
+                            return Ok(RelayEstablishedDataEnd::SocketClosed);
+                        }
+                        let queued = try_enqueue_relay_data_raw(
+                            write_tx,
+                            RelayOutKind::Pong,
+                            Message::Pong(payload),
+                        )?;
+                        if !queued {
+                            trace!(
+                                relay = %relay_endpoint,
+                                client_id = client_id.0,
+                                "relay daemon HTTP tunnel dropped pong because writer queue is full"
+                            );
+                        }
+                    }
+                    Message::Pong(_) | Message::Frame(_) => {}
+                    Message::Close(_) => {
+                        debug!(
+                            relay = %relay_endpoint,
+                            client_id = client_id.0,
+                            "relay daemon HTTP tunnel received websocket close"
+                        );
+                        if !response_done {
+                            cleanup_relay_http_tunnel_response_task(
+                                &mut body_tx,
+                                response_task,
+                                abort_response_on_client_disconnect,
+                            )
+                            .await;
+                        }
+                        return Ok(RelayEstablishedDataEnd::SocketClosed);
+                    }
+                    other => {
+                        let Some(inbound) = relay_data_message_to_inbound(other)? else {
+                            continue;
+                        };
+                        if response_done {
+                            trace!(
+                                relay = %relay_endpoint,
+                                client_id = client_id.0,
+                                "relay daemon HTTP tunnel ignored frame after response"
+                            );
+                            continue;
+                        }
+                        match inbound {
+                            RelayDataInbound::Wire(ProtocolWireMessage::Binary(raw)) => {
+                                if !request_open {
+                                    cleanup_relay_http_tunnel_response_task(
+                                        &mut body_tx,
+                                        response_task,
+                                        abort_response_on_client_disconnect,
+                                    )
+                                    .await;
+                                    return Err(RelayConnectorError::InvalidEnvelope);
+                                }
+                                match decode_relay_http_tunnel_frame(&raw) {
+                                    Some(RelayHttpTunnelFrame::RequestBody { body }) => {
+                                        trace!(
+                                            relay = %relay_endpoint,
+                                            client_id = client_id.0,
+                                            bytes = body.len(),
+                                            "relay daemon HTTP tunnel received request body chunk"
+                                        );
+                                        if let Some(tx) = body_tx.as_ref()
+                                            && tx.send(Ok(Bytes::from(body))).await.is_err()
+                                        {
+                                            request_open = false;
+                                            body_tx.take();
+                                        }
+                                    }
+                                    Some(RelayHttpTunnelFrame::RequestEnd) => {
+                                        debug!(
+                                            relay = %relay_endpoint,
+                                            client_id = client_id.0,
+                                            "relay daemon HTTP tunnel received request end"
+                                        );
+                                        request_open = false;
+                                        body_tx.take();
+                                    }
+                                    _ => {
+                                        cleanup_relay_http_tunnel_response_task(
+                                            &mut body_tx,
+                                            response_task,
+                                            abort_response_on_client_disconnect,
+                                        )
+                                        .await;
+                                        return Err(RelayConnectorError::InvalidEnvelope);
+                                    }
+                                }
+                            }
+                            RelayDataInbound::Wire(ProtocolWireMessage::Json(_)) => {
+                                cleanup_relay_http_tunnel_response_task(
+                                    &mut body_tx,
+                                    response_task,
+                                    abort_response_on_client_disconnect,
+                                )
+                                .await;
+                                return Err(RelayConnectorError::InvalidEnvelope);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn cleanup_relay_http_tunnel_response_task(
+    body_tx: &mut Option<mpsc::Sender<Result<Bytes, io::Error>>>,
+    response_task: JoinHandle<Result<(), RelayConnectorError>>,
+    abort_response: bool,
+) {
+    // 中文注释：upload 断线时要关闭请求 body；daemon 端会保留已 patch 区间，
+    // 后续显式 abort 或 idle prune 再清理未完成目标。
+    // download 断线时 client 已经不存在，继续读文件/排队响应只会占住 data pipe。
+    body_tx.take();
+    if abort_response {
+        response_task.abort();
+    }
+    let _ = response_task.await;
+}
+
+fn is_relay_http_tunnel_download(method: &str, path: &str) -> bool {
+    method.eq_ignore_ascii_case("POST") && path == "/api/files/download"
+}
+
+async fn send_relay_http_tunnel_response(
+    protocol: SharedDaemonProtocol,
+    method: String,
+    path: String,
+    headers: Vec<(String, String)>,
+    body: Body,
+    write_tx: mpsc::Sender<RelayDataWrite>,
+) -> Result<(), RelayConnectorError> {
+    debug!(
+        method = %method,
+        path = %path,
+        headers = headers.len(),
+        "relay daemon HTTP tunnel handler started"
+    );
+    let response =
+        handle_http_file_tunnel_stream_request(protocol, method, path, headers, body).await;
+    let status = response.status().as_u16();
+    debug!(status, "relay daemon HTTP tunnel handler returned response");
+    enqueue_relay_data_raw(
+        &write_tx,
+        RelayOutKind::Response,
+        Message::Binary(encode_relay_http_tunnel_response_head(status)),
+    )
+    .await?;
+    debug!(status, "relay daemon HTTP tunnel response head queued");
+
+    let mut body = response.into_body().into_data_stream();
+    let mut chunks = 0_usize;
+    let mut bytes = 0_usize;
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk.map_err(|_| RelayConnectorError::ReceiveFailed)?;
+        if chunk.is_empty() {
+            continue;
+        }
+        chunks = chunks.saturating_add(1);
+        bytes = bytes.saturating_add(chunk.len());
+        enqueue_relay_data_raw(
+            &write_tx,
+            RelayOutKind::FileTunnelBody,
+            Message::Binary(encode_relay_http_tunnel_response_body(chunk.to_vec())),
+        )
+        .await?;
+    }
+    enqueue_relay_data_raw(
+        &write_tx,
+        RelayOutKind::FileTunnelBody,
+        Message::Binary(encode_relay_http_tunnel_response_end()),
+    )
+    .await?;
+    debug!(
+        status,
+        chunks, bytes, "relay daemon HTTP tunnel response body queued"
+    );
+    Ok(())
 }
 
 async fn enqueue_relay_data_wire(
@@ -1471,37 +2465,101 @@ async fn enqueue_relay_data_raw(
         .map_err(|_| RelayConnectorError::SendFailed)
 }
 
-async fn run_relay_data_writer(
+fn try_enqueue_relay_data_raw(
+    tx: &mpsc::Sender<RelayDataWrite>,
+    kind: RelayOutKind,
+    message: Message,
+) -> Result<bool, RelayConnectorError> {
+    match tx.try_send(RelayDataWrite::Raw { kind, message }) {
+        Ok(()) => Ok(true),
+        Err(mpsc::error::TrySendError::Full(_)) => Ok(false),
+        Err(mpsc::error::TrySendError::Closed(_)) => Err(RelayConnectorError::SendFailed),
+    }
+}
+
+fn try_reserve_relay_data_push_slot(
+    tx: &mpsc::Sender<RelayDataWrite>,
+) -> Result<Option<mpsc::Permit<'_, RelayDataWrite>>, RelayConnectorError> {
+    match tx.try_reserve() {
+        Ok(permit) => Ok(Some(permit)),
+        Err(mpsc::error::TrySendError::Full(_)) => Ok(None),
+        Err(mpsc::error::TrySendError::Closed(_)) => Err(RelayConnectorError::SendFailed),
+    }
+}
+
+fn enqueue_relay_data_wire_with_permit(
+    permit: mpsc::Permit<'_, RelayDataWrite>,
+    kind: RelayOutKind,
+    messages: Vec<ProtocolWireMessage>,
+) -> usize {
+    let bytes = protocol_wire_messages_wire_len(&messages);
+    permit.send(RelayDataWrite::Wire { kind, messages });
+    bytes
+}
+
+async fn run_relay_data_writer<S>(
     relay_endpoint: String,
     client_id: RelayClientId,
     mut write_rx: mpsc::Receiver<RelayDataWrite>,
     writer_failed_tx: mpsc::Sender<()>,
-    mut sender: RelaySender,
-) {
-    while let Some(write) = write_rx.recv().await {
-        let snapshot = write.debug_snapshot();
-        trace!(
-            relay = %relay_endpoint,
-            client_id = client_id.0,
-            kind = snapshot.kind.label(),
-            messages = snapshot.envelopes,
-            bytes = snapshot.bytes,
-            raw = snapshot.raw,
-            "relay daemon data writer dequeued frame"
-        );
-        if !send_relay_data_write(&relay_endpoint, client_id, &mut sender, write).await {
-            let _ = writer_failed_tx.try_send(());
-            break;
+    mut sender: S,
+    mut stop_rx: oneshot::Receiver<()>,
+) -> RelayDataWriterOutcome<S>
+where
+    S: Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+{
+    loop {
+        tokio::select! {
+            biased;
+
+            _ = &mut stop_rx => {
+                // 中文注释：client 已断开时，旧输出队列必须整体丢弃，不能继续写到
+                // 已废弃的 data pipe；这里尽力发送 close，让 relay 尽快释放对应通道。
+                let _ = send_relay_message(&mut sender, Message::Close(None), Some(RELAY_SEND_DEADLINE))
+                    .await;
+                return RelayDataWriterOutcome::Closed;
+            }
+            maybe_write = write_rx.recv() => {
+                let Some(write) = maybe_write else {
+                    return RelayDataWriterOutcome::Reusable(sender);
+                };
+                let snapshot = write.debug_snapshot();
+                trace!(
+                    relay = %relay_endpoint,
+                    client_id = client_id.0,
+                    kind = snapshot.kind.label(),
+                    messages = snapshot.envelopes,
+                    bytes = snapshot.bytes,
+                    raw = snapshot.raw,
+                    "relay daemon data writer dequeued frame"
+                );
+                let sent = tokio::select! {
+                    biased;
+                    _ = &mut stop_rx => {
+                        // 中文注释：writer 在真正写出过程中收到 stop，说明旧 client 的 body
+                        // 已经可能卡在不可取消的 send 阶段。此时不能把 sender 回收到 idle 池。
+                        return RelayDataWriterOutcome::Closed;
+                    }
+                    sent = send_relay_data_write(&relay_endpoint, client_id, &mut sender, write) => sent,
+                };
+                if !sent {
+                    let _ = writer_failed_tx.try_send(());
+                    return RelayDataWriterOutcome::Closed;
+                }
+            }
         }
     }
 }
 
-async fn send_relay_data_write(
+async fn send_relay_data_write<S>(
     relay_endpoint: &str,
     client_id: RelayClientId,
-    sender: &mut RelaySender,
+    sender: &mut S,
     write: RelayDataWrite,
-) -> bool {
+) -> bool
+where
+    S: Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+{
     match write {
         RelayDataWrite::Wire { kind, messages } => {
             send_relay_data_wire_messages(relay_endpoint, client_id, sender, messages, kind)
@@ -1509,20 +2567,23 @@ async fn send_relay_data_write(
                 .is_ok()
         }
         RelayDataWrite::Raw { kind, message } => {
-            send_relay_message_with_deadline(sender, message, relay_send_deadline(kind))
+            send_relay_message(sender, message, relay_send_deadline(kind))
                 .await
                 .is_ok()
         }
     }
 }
 
-async fn send_relay_data_wire_messages(
+async fn send_relay_data_wire_messages<S>(
     relay_endpoint: &str,
     client_id: RelayClientId,
-    sender: &mut RelaySender,
+    sender: &mut S,
     messages: Vec<ProtocolWireMessage>,
     kind: RelayOutKind,
-) -> Result<usize, RelayConnectorError> {
+) -> Result<usize, RelayConnectorError>
+where
+    S: Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+{
     let message_count = messages.len();
     let mut bytes = 0_usize;
     let started_at = Instant::now();
@@ -1566,14 +2627,20 @@ async fn send_relay_data_wire_messages(
     Ok(bytes)
 }
 
-fn relay_data_message_to_wire_message(
+enum RelayDataInbound {
+    Wire(ProtocolWireMessage),
+}
+
+fn relay_data_message_to_inbound(
     message: Message,
-) -> Result<Option<ProtocolWireMessage>, RelayConnectorError> {
+) -> Result<Option<RelayDataInbound>, RelayConnectorError> {
     match message {
         Message::Text(raw) => serde_json::from_str(raw.as_str())
-            .map(|envelope| Some(ProtocolWireMessage::Json(envelope)))
+            .map(|envelope| Some(RelayDataInbound::Wire(ProtocolWireMessage::Json(envelope))))
             .map_err(|_| RelayConnectorError::InvalidEnvelope),
-        Message::Binary(raw) => Ok(Some(ProtocolWireMessage::Binary(raw.to_vec()))),
+        Message::Binary(raw) => Ok(Some(RelayDataInbound::Wire(ProtocolWireMessage::Binary(
+            raw.to_vec(),
+        )))),
         Message::Close(_) | Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => Ok(None),
     }
 }
@@ -1601,6 +2668,28 @@ async fn drain_relay_data_push_events(
         let (_, session_id, kind) = relay_push_event_parts(event);
         let Some(connection) = connections.get_mut(&client_id) else {
             continue;
+        };
+        let push_permit = match try_reserve_relay_data_push_slot(write_tx)? {
+            Some(permit) => permit,
+            None => {
+                // 中文注释：terminal 输出走 data lane；当下行 writer 正在被慢网络/浏览器背压
+                // 卡住时，不能在这里 await 容量，否则同一 data pipe 的 stdin/close 也读不到。
+                pending_push_events.requeue_front(event);
+                if pending_push_events.has_pending() {
+                    *push_drain_wake_pending = true;
+                }
+                trace!(
+                    relay = %relay_endpoint,
+                    ?server_id,
+                    client_id = client_id.0,
+                    session_id = ?session_id,
+                    kind = kind.label(),
+                    queue_capacity = write_tx.capacity(),
+                    queue_pending = pending_push_events.len(),
+                    "relay data writer queue is full"
+                );
+                break;
+            }
         };
         let responses = match kind {
             RelayOutKind::PushOutput => {
@@ -1640,13 +2729,20 @@ async fn drain_relay_data_push_events(
                 };
                 connection.encrypt_collected_inner_messages_wire(messages)
             }
-            RelayOutKind::Response | RelayOutKind::Pong => Vec::new(),
+            RelayOutKind::Response | RelayOutKind::FileTunnelBody | RelayOutKind::Pong => {
+                Vec::new()
+            }
             #[cfg(test)]
             RelayOutKind::MuxKeepalive | RelayOutKind::IdlePing => Vec::new(),
         };
         queue_relay_deferred_output_wakeups(client_id, connection, pending_push_events);
         let response_count = responses.len();
-        let bytes = enqueue_relay_data_wire(write_tx, kind, responses).await?;
+        if response_count == 0 {
+            drop(push_permit);
+            drained_events = drained_events.saturating_add(1);
+            continue;
+        }
+        let bytes = enqueue_relay_data_wire_with_permit(push_permit, kind, responses);
         drained_events = drained_events.saturating_add(1);
         sent_bytes = sent_bytes.saturating_add(bytes);
         trace!(
@@ -2455,7 +3551,31 @@ async fn connect_relay_route_socket(
     client_id: Option<RelayClientId>,
     data_token: Option<ProtoNonce>,
 ) -> Result<(RelaySender, RelayReceiver), RelayConnectorError> {
-    let (socket, _) = connect_relay_websocket(url, proxy).await?;
+    connect_relay_route_socket_with_timeout(
+        url,
+        proxy,
+        server_id,
+        role,
+        route_generation,
+        client_id,
+        data_token,
+        RELAY_CONNECT_TIMEOUT,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn connect_relay_route_socket_with_timeout(
+    url: &str,
+    proxy: Option<&RelayProxyUrl>,
+    server_id: ServerId,
+    role: ProtoRouteRole,
+    route_generation: Option<ProtoNonce>,
+    client_id: Option<RelayClientId>,
+    data_token: Option<ProtoNonce>,
+    connect_timeout: Duration,
+) -> Result<(RelaySender, RelayReceiver), RelayConnectorError> {
+    let (socket, _) = connect_relay_websocket(url, proxy, connect_timeout).await?;
     let (mut sender, mut receiver) = socket.split();
     send_route_hello(
         &mut sender,
@@ -3367,6 +4487,7 @@ async fn drain_relay_push_events(
                 connection.encrypt_collected_inner_messages_wire(messages)
             }
             RelayOutKind::Response
+            | RelayOutKind::FileTunnelBody
             | RelayOutKind::MuxKeepalive
             | RelayOutKind::IdlePing
             | RelayOutKind::Pong => Vec::new(),
@@ -3572,10 +4693,11 @@ fn abort_relay_watcher_tasks(watcher_tasks: HashMap<RelayClientId, Vec<JoinHandl
     }
 }
 
-fn relay_send_deadline(kind: RelayOutKind) -> Duration {
+fn relay_send_deadline(kind: RelayOutKind) -> Option<Duration> {
     match kind {
-        RelayOutKind::Pong => RELAY_PONG_DEADLINE,
-        _ => RELAY_SEND_DEADLINE,
+        RelayOutKind::FileTunnelBody => None,
+        RelayOutKind::Pong => Some(RELAY_PONG_DEADLINE),
+        _ => Some(RELAY_SEND_DEADLINE),
     }
 }
 
@@ -3905,7 +5027,7 @@ async fn send_relay_mux_write(
         .await
         .is_ok(),
         RelayMuxWrite::Raw { kind, message } => {
-            send_relay_message_with_deadline(sender, message, relay_send_deadline(kind))
+            send_relay_message(sender, message, relay_send_deadline(kind))
                 .await
                 .is_ok()
         }
@@ -3972,15 +5094,37 @@ async fn send_mux_envelopes_logged(
     Ok(bytes)
 }
 
-async fn send_relay_message_with_deadline(
-    sender: &mut RelaySender,
+async fn send_relay_message_with_deadline<S>(
+    sender: &mut S,
     message: Message,
     deadline: Duration,
-) -> Result<(), RelayConnectorError> {
+) -> Result<(), RelayConnectorError>
+where
+    S: Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+{
     match timeout(deadline, sender.send(message)).await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(_)) => Err(RelayConnectorError::SendFailed),
         Err(_) => Err(RelayConnectorError::SendTimeout),
+    }
+}
+
+async fn send_relay_message<S>(
+    sender: &mut S,
+    message: Message,
+    deadline: Option<Duration>,
+) -> Result<(), RelayConnectorError>
+where
+    S: Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+{
+    // 中文注释：文件 tunnel body 是真实字节流，不能被 10s 应用层 deadline 截断；
+    // 这里让 WebSocket/TCP 背压自然传播，只有真实 send error 才终止连接。
+    match deadline {
+        Some(deadline) => send_relay_message_with_deadline(sender, message, deadline).await,
+        None => sender
+            .send(message)
+            .await
+            .map_err(|_| RelayConnectorError::SendFailed),
     }
 }
 
@@ -4048,6 +5192,7 @@ fn wire_message_from_mux_frame(
 async fn connect_relay_websocket(
     url: &str,
     proxy: Option<&RelayProxyUrl>,
+    connect_timeout: Duration,
 ) -> Result<
     (
         RelayWs,
@@ -4058,7 +5203,7 @@ async fn connect_relay_websocket(
     let tls_connector = relay_tls_connector();
     let Some(proxy) = proxy else {
         return timeout(
-            RELAY_CONNECT_TIMEOUT,
+            connect_timeout,
             tokio_tungstenite::connect_async_tls_with_config(
                 url,
                 Some(relay_websocket_config()),
@@ -4073,13 +5218,13 @@ async fn connect_relay_websocket(
 
     let target =
         relay_target_from_ws_url(url).ok_or_else(|| RelayConnectorError::UnsupportedUrl)?;
-    let stream = timeout(RELAY_CONNECT_TIMEOUT, connect_proxy_tunnel(proxy, &target))
+    let stream = timeout(connect_timeout, connect_proxy_tunnel(proxy, &target))
         .await
         .map_err(|_| RelayConnectorError::ConnectTimeout)?
         .map_err(|_| RelayConnectorError::ConnectFailed)?;
 
     timeout(
-        RELAY_CONNECT_TIMEOUT,
+        connect_timeout,
         tokio_tungstenite::client_async_tls_with_config(
             url,
             stream,
@@ -4462,11 +5607,15 @@ mod tests {
         atomic::{AtomicU64, AtomicUsize, Ordering},
     };
     use std::time::Duration;
+    use std::{
+        pin::Pin,
+        task::{Context, Poll},
+    };
     use termd_proto::{
         Envelope, MessageType, PingPayload, ProtocolVersion, RouteHelloPayload, RouteReadyPayload,
         RouteRole,
     };
-    use tokio::sync::oneshot;
+    use tokio::sync::{Notify, mpsc, oneshot};
 
     static TEST_STATE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -4476,6 +5625,58 @@ mod tests {
 
     fn test_active_clients() -> RelayActiveClients {
         Arc::new(Mutex::new(HashSet::new()))
+    }
+
+    struct PendingSink {
+        ready_polls: Arc<AtomicUsize>,
+        ready_notify: Arc<Notify>,
+    }
+
+    impl PendingSink {
+        fn new() -> (Self, Arc<AtomicUsize>, Arc<Notify>) {
+            let ready_polls = Arc::new(AtomicUsize::new(0));
+            let ready_notify = Arc::new(Notify::new());
+            (
+                Self {
+                    ready_polls: ready_polls.clone(),
+                    ready_notify: ready_notify.clone(),
+                },
+                ready_polls,
+                ready_notify,
+            )
+        }
+    }
+
+    impl Sink<Message> for PendingSink {
+        type Error = tokio_tungstenite::tungstenite::Error;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            let this = self.get_mut();
+            this.ready_polls.fetch_add(1, Ordering::Relaxed);
+            this.ready_notify.notify_waiters();
+            Poll::Pending
+        }
+
+        fn start_send(self: Pin<&mut Self>, _item: Message) -> Result<(), Self::Error> {
+            unreachable!("poll_ready never completes in this test sink")
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Pending
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
     }
 
     #[test]
@@ -4886,6 +6087,95 @@ mod tests {
         drop(writer_queues);
         let _ = writer_task.await;
         server_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn relay_data_writer_stops_without_waiting_for_stalled_file_tunnel_send() {
+        let (write_tx, write_rx) = mpsc::channel(1);
+        let (writer_failed_tx, mut writer_failed_rx) = mpsc::channel(1);
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let (pending_sink, ready_polls, ready_notify) = PendingSink::new();
+        let writer_task = tokio::spawn(run_relay_data_writer(
+            "ws://relay-writer-stop-test/ws".to_owned(),
+            RelayClientId(903),
+            write_rx,
+            writer_failed_tx,
+            pending_sink,
+            stop_rx,
+        ));
+
+        write_tx
+            .send(RelayDataWrite::Raw {
+                kind: RelayOutKind::FileTunnelBody,
+                message: Message::Binary(vec![0; 1024]),
+            })
+            .await
+            .unwrap();
+        while ready_polls.load(Ordering::Relaxed) == 0 {
+            ready_notify.notified().await;
+        }
+        let _ = stop_tx.send(());
+
+        let outcome = timeout(Duration::from_secs(1), writer_task)
+            .await
+            .expect("writer task should stop after receiving stop signal")
+            .expect("writer task should not panic");
+        assert!(matches!(outcome, RelayDataWriterOutcome::Closed));
+        assert!(writer_failed_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn relay_data_push_drain_does_not_block_when_writer_queue_is_full() {
+        let protocol = test_protocol("relay-data-push-drain-backpressure");
+        let (connection, _) = {
+            let protocol = protocol.lock().await;
+            protocol.start_connection()
+        };
+        let client_id = RelayClientId(914);
+        let session_id = SessionId::new();
+        let event = RelayPushEvent::Output {
+            client_id,
+            session_id,
+        };
+        let mut connections = HashMap::from([(client_id, connection)]);
+        let mut pending_push_events = RelayPushEventQueue::default();
+        pending_push_events.enqueue(event);
+        let (write_tx, mut write_rx) =
+            mpsc::channel::<RelayDataWrite>(RELAY_DATA_WIRE_QUEUE_CAPACITY);
+        write_tx
+            .try_send(RelayDataWrite::Raw {
+                kind: RelayOutKind::Pong,
+                message: Message::Pong(Vec::new()),
+            })
+            .expect("test writer queue should start full");
+        let mut push_drain_wake_pending = false;
+
+        // 中文注释：下行 writer 队列满时，terminal push 不能 await 队列腾挪；
+        // data pipe 主循环必须回到 select 继续读 stdin/close，并靠定时 wakeup 重试输出。
+        let result = timeout(
+            Duration::from_millis(50),
+            drain_relay_data_push_events(
+                "ws://relay-data-push-backpressure/ws",
+                ServerId::new(),
+                client_id,
+                &protocol,
+                &mut connections,
+                &mut pending_push_events,
+                &write_tx,
+                &mut push_drain_wake_pending,
+            ),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "relay data push drain must not block the data pipe read loop"
+        );
+        result.unwrap().unwrap();
+        assert!(push_drain_wake_pending);
+        assert_eq!(pending_push_events.pop_front(), Some(event));
+        assert!(write_rx.try_recv().is_ok());
+        assert!(write_rx.try_recv().is_err());
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -5476,7 +6766,11 @@ mod tests {
         assert!(relay_daemon_mux_idle_ping_enabled());
         // 中文注释：Ping 只用于穿透公网代理的空闲保活，不进入 mux 业务协议。
         // 是否断开只能由底层 WebSocket/TCP close/read/write error 暴露。
-        assert_eq!(relay_send_deadline(RelayOutKind::Pong), RELAY_PONG_DEADLINE);
+        assert_eq!(
+            relay_send_deadline(RelayOutKind::Pong),
+            Some(RELAY_PONG_DEADLINE)
+        );
+        assert_eq!(relay_send_deadline(RelayOutKind::FileTunnelBody), None);
     }
 
     #[test]
@@ -5630,6 +6924,288 @@ mod tests {
         .expect("relay connector should finish after mock relay closes control");
         connector.unwrap();
         server.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn relay_idle_data_pipe_accepts_assignment_and_sends_initial_hello() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let protocol = test_protocol("relay-idle-data-assignment");
+        let server_id = protocol.lock().await.server_id();
+        let client_id = RelayClientId(5150);
+        let data_token = ProtoNonce("idle-data-token".to_owned());
+
+        let server = tokio::spawn(async move {
+            let (data_tcp, _) = listener.accept().await.unwrap();
+            let mut data_socket = tokio_tungstenite::accept_async(data_tcp).await.unwrap();
+            let route_hello = read_route_hello_from_connector(&mut data_socket).await;
+            assert_eq!(route_hello.server_id, server_id);
+            assert_eq!(route_hello.role, RouteRole::DaemonData);
+            assert_eq!(route_hello.client_id, None);
+            assert_eq!(route_hello.data_token, None);
+            send_route_ready_to_connector(&mut data_socket, server_id, RouteRole::DaemonData).await;
+
+            let assign = RelayControlEnvelope::OpenData {
+                client_id,
+                data_token,
+            };
+            data_socket
+                .send(Message::Text(
+                    serde_json::to_string(&assign).unwrap().into(),
+                ))
+                .await
+                .unwrap();
+
+            let initial = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    match data_socket.next().await.unwrap().unwrap() {
+                        Message::Text(raw) => break raw.to_string(),
+                        Message::Ping(payload) => {
+                            data_socket.send(Message::Pong(payload)).await.unwrap();
+                        }
+                        Message::Pong(_) | Message::Frame(_) => continue,
+                        Message::Binary(raw) => {
+                            panic!("expected daemon initial JSON text, got binary {raw:?}")
+                        }
+                        Message::Close(frame) => panic!("idle data pipe closed early: {frame:?}"),
+                    }
+                }
+            })
+            .await
+            .expect("assigned idle daemon data pipe should send initial hello");
+            let envelope: JsonEnvelope = serde_json::from_str(&initial).unwrap();
+            assert_eq!(envelope.kind, MessageType::Hello);
+            // 中文注释：daemon 在 mock relay 关闭前可能已经因为测试结束主动断开；
+            // 这里的 close 只负责收尾，BrokenPipe 不应让复用语义测试随机失败。
+            let _ = data_socket.close(None).await;
+        });
+
+        let base = RelayBaseUrl::parse(&format!("ws://{addr}")).unwrap();
+        let (event_tx, mut event_rx) = mpsc::channel(4);
+        let task = tokio::spawn(run_relay_idle_data_connection(
+            base, None, None, protocol, server_id, 1, event_tx,
+        ));
+
+        let ready = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+            .await
+            .expect("idle data ready event should arrive")
+            .expect("idle data event channel should stay open");
+        assert!(matches!(ready, RelayIdleDataEvent::Ready { task_id: 1 }));
+
+        let event = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+            .await
+            .expect("idle data assignment event should arrive")
+            .expect("idle data event channel should stay open");
+        assert!(matches!(
+            event,
+            RelayIdleDataEvent::Assigned {
+                task_id: 1,
+                client_id: observed
+            } if observed == client_id
+        ));
+
+        server.await.unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn relay_idle_data_pipe_closes_socket_after_client_disconnect() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let protocol = test_protocol("relay-idle-data-close-after-disconnect");
+        let server_id = protocol.lock().await.server_id();
+        let client_id = RelayClientId(6101);
+
+        let server = tokio::spawn(async move {
+            let (data_tcp, _) = listener.accept().await.unwrap();
+            let mut data_socket = tokio_tungstenite::accept_async(data_tcp).await.unwrap();
+            let route_hello = read_route_hello_from_connector(&mut data_socket).await;
+            assert_eq!(route_hello.server_id, server_id);
+            assert_eq!(route_hello.role, RouteRole::DaemonData);
+            assert_eq!(route_hello.client_id, None);
+            assert_eq!(route_hello.data_token, None);
+            send_route_ready_to_connector(&mut data_socket, server_id, RouteRole::DaemonData).await;
+
+            let assign = RelayControlEnvelope::OpenData {
+                client_id,
+                data_token: ProtoNonce(format!("idle-close-token-{}", client_id.0)),
+            };
+            data_socket
+                .send(Message::Text(
+                    serde_json::to_string(&assign).unwrap().into(),
+                ))
+                .await
+                .unwrap();
+
+            let hello = read_json_envelope_from_connector(&mut data_socket).await;
+            assert_eq!(hello.kind, MessageType::Hello);
+
+            let disconnect = RelayControlEnvelope::ClientDisconnected { client_id };
+            data_socket
+                .send(Message::Ping(
+                    encode_relay_data_control(&disconnect).unwrap(),
+                ))
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    match data_socket.next().await {
+                        Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                        Some(Ok(Message::Ping(payload))) => {
+                            let _ = data_socket.send(Message::Pong(payload)).await;
+                        }
+                        Some(Ok(_)) => {}
+                    }
+                }
+            })
+            .await
+            .expect("daemon should close data pipe after client disconnect");
+        });
+
+        let base = RelayBaseUrl::parse(&format!("ws://{addr}")).unwrap();
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let task = tokio::spawn(run_relay_idle_data_connection(
+            base, None, None, protocol, server_id, 1, event_tx,
+        ));
+
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            RelayIdleDataEvent::Ready { task_id: 1 }
+        ));
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            RelayIdleDataEvent::Assigned {
+                task_id: 1,
+                client_id: observed
+            } if observed == client_id
+        ));
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            RelayIdleDataEvent::Closed { task_id: 1 }
+        ));
+
+        server.await.unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn relay_control_open_data_starts_data_pipes_concurrently() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let protocol = test_protocol("relay-control-concurrent-data-pipes");
+        let server_id = protocol.lock().await.server_id();
+        let first_client = RelayClientId(811);
+        let second_client = RelayClientId(812);
+        let first_token = ProtoNonce("first-data-token".to_owned());
+        let second_token = ProtoNonce("second-data-token".to_owned());
+
+        let server = tokio::spawn(async move {
+            let (control_tcp, _) = listener.accept().await.unwrap();
+            let mut control_socket = tokio_tungstenite::accept_async(control_tcp).await.unwrap();
+            complete_relay_route_prelude(&mut control_socket, server_id, RouteRole::DaemonControl)
+                .await;
+
+            for (client_id, data_token) in [
+                (first_client, first_token.clone()),
+                (second_client, second_token.clone()),
+            ] {
+                let open_data = RelayControlEnvelope::OpenData {
+                    client_id,
+                    data_token,
+                };
+                control_socket
+                    .send(Message::Text(
+                        serde_json::to_string(&open_data).unwrap().into(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+
+            let mut seen = HashSet::new();
+            tokio::time::timeout(Duration::from_millis(800), async {
+                while seen.len() < 2 {
+                    let (data_tcp, _) = listener.accept().await.unwrap();
+                    let mut data_socket = tokio_tungstenite::accept_async(data_tcp).await.unwrap();
+                    let route_hello = read_route_hello_from_connector(&mut data_socket).await;
+                    assert_eq!(route_hello.server_id, server_id);
+                    assert_eq!(route_hello.role, RouteRole::DaemonData);
+                    let client_id = route_hello
+                        .client_id
+                        .expect("data route should name client");
+                    seen.insert(client_id);
+                    // 中文注释：故意不回第一个 route_ready；第二条 data pipe 仍必须能并发发出
+                    // route_hello。否则一个慢握手会挡住后续快速切换的新 client。
+                    if client_id == second_client {
+                        send_route_ready_to_connector(
+                            &mut data_socket,
+                            server_id,
+                            RouteRole::DaemonData,
+                        )
+                        .await;
+                    }
+                }
+            })
+            .await
+            .expect("both daemon data pipes should connect without serial route_ready blocking");
+
+            assert!(seen.contains(&first_client));
+            assert!(seen.contains(&second_client));
+            control_socket.close(None).await.unwrap();
+        });
+
+        let base = RelayBaseUrl::parse(&format!("ws://{addr}")).unwrap();
+        let connector = tokio::time::timeout(
+            Duration::from_secs(4),
+            connect_relay_mux_base(base, None, protocol),
+        )
+        .await
+        .expect("relay connector should finish after mock relay closes control");
+        connector.unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn relay_control_client_disconnect_aborts_pending_data_task() {
+        let client_id = RelayClientId(909);
+        let (dropped_tx, dropped_rx) = oneshot::channel();
+        let mut data_tasks = RelayDataTaskMap::new();
+        let task = tokio::spawn(async move {
+            // 中文注释：模拟卡在 WebSocket connect 阶段的 data pipe；旧 client 断开时
+            // control 线必须能主动 abort，而不是等连接超时自然结束。
+            let _drop_notify = DropNotify(Some(dropped_tx));
+            std::future::pending::<()>().await;
+        });
+        data_tasks.insert(client_id, task);
+
+        handle_relay_control_envelope(
+            RelayControlEnvelope::ClientDisconnected { client_id },
+            RelayBaseUrl::parse("ws://127.0.0.1:1").unwrap(),
+            None,
+            None,
+            test_protocol("relay-control-client-disconnect-aborts-data-task"),
+            ServerId::new(),
+            &mut data_tasks,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            data_tasks.is_empty(),
+            "client 断开后不能继续保留旧 data pipe 任务句柄"
+        );
+        tokio::time::timeout(Duration::from_secs(1), dropped_rx)
+            .await
+            .expect("pending data pipe should be aborted promptly")
+            .expect("drop notification should be delivered");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -7100,6 +8676,33 @@ mod tests {
             ))
             .await
             .unwrap();
+    }
+
+    async fn read_json_envelope_from_connector(
+        socket: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    ) -> JsonEnvelope {
+        loop {
+            let message = socket.next().await.unwrap().unwrap();
+            match message {
+                Message::Text(raw) => {
+                    if let Ok(envelope) = serde_json::from_str(raw.as_str()) {
+                        return envelope;
+                    }
+                    continue;
+                }
+                Message::Binary(raw) => {
+                    if let Ok(envelope) = serde_json::from_slice(&raw) {
+                        return envelope;
+                    }
+                    continue;
+                }
+                Message::Ping(payload) => {
+                    socket.send(Message::Pong(payload)).await.unwrap();
+                }
+                Message::Pong(_) | Message::Frame(_) => continue,
+                Message::Close(frame) => panic!("relay mux closed unexpectedly: {frame:?}"),
+            }
+        }
     }
 
     async fn read_route_hello_from_connector(

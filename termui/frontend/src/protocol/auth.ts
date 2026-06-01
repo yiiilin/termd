@@ -1,6 +1,6 @@
 import { ed25519 } from "@noble/curves/ed25519";
 import { sha256 } from "@noble/hashes/sha2";
-import type { AuthPayload, DeviceState, E2eeKeyExchangePayload, PairedServerState, PublicKeyWire, UUID } from "./types";
+import type { AuthPayload, DeviceState, E2eeKeyExchangePayload, HttpE2eeAuthPayload, PairedServerState, PublicKeyWire, UUID } from "./types";
 import { base64ToBytes, bytesToBase64, concatBytes, encodeUtf8, nonce, nowMs, randomUuid } from "./wire";
 
 const ED25519_WIRE_PREFIX = "ed25519-v1:";
@@ -51,6 +51,35 @@ export async function signAuthPayload(
   const unsigned: AuthPayload = { ...payload, signature: "ed25519-v1:placeholder" };
   const secretKey = decodeEd25519SecretKey(deviceSigningKeySecret);
   const signature = ed25519.sign(authSigningInputBytes(unsigned, daemon, e2eeTranscriptSha256), secretKey);
+
+  return { ...payload, signature: encodeEd25519Wire(signature) };
+}
+
+export function httpE2eeSigningInputBytes(
+  payload: HttpE2eeAuthPayload,
+  daemon: DaemonPublicIdentity,
+): Uint8Array {
+  return concatBytes(
+    encodeUtf8("termd-http-e2ee-v1\n"),
+    canonicalField("server_id", daemon.server_id),
+    canonicalField("daemon_public_key", daemon.daemon_public_key),
+    canonicalField("device_id", payload.device_id),
+    canonicalField("e2ee_public_key", payload.e2ee_public_key),
+    canonicalField("nonce", payload.nonce),
+    canonicalField("timestamp_ms", String(payload.timestamp_ms)),
+    canonicalField("method", payload.method),
+    canonicalField("path", payload.path),
+  );
+}
+
+export async function signHttpE2eeAuthPayload(
+  payload: Omit<HttpE2eeAuthPayload, "signature">,
+  daemon: DaemonPublicIdentity,
+  deviceSigningKeySecret: string,
+): Promise<HttpE2eeAuthPayload> {
+  const unsigned: HttpE2eeAuthPayload = { ...payload, signature: "ed25519-v1:placeholder" };
+  const secretKey = decodeEd25519SecretKey(deviceSigningKeySecret);
+  const signature = ed25519.sign(httpE2eeSigningInputBytes(unsigned, daemon), secretKey);
 
   return { ...payload, signature: encodeEd25519Wire(signature) };
 }

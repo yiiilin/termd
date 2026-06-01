@@ -1014,6 +1014,24 @@ impl ClientHistoryStore {
 
         Ok(clients)
     }
+
+    #[cfg(test)]
+    pub(crate) fn active_connection_count_for_test(
+        &self,
+        device_id: DeviceId,
+    ) -> Result<Option<i64>, StateError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT active_connection_count FROM daemon_clients WHERE device_id = ?1")
+            .map_err(|source| sqlite_error(&self.path, source))?;
+        let count = stmt
+            .query_row(params![device_id_text(device_id)], |row| {
+                row.get::<_, i64>(0)
+            })
+            .optional()
+            .map_err(|source| sqlite_error(&self.path, source))?;
+        Ok(count)
+    }
 }
 
 #[derive(Debug)]

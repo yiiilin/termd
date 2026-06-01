@@ -12,7 +12,8 @@ export type BinaryProtocolPacketPayload =
   | { type: "json"; data: Uint8Array }
   | { type: "session_data"; session_id: UUID; data: Uint8Array }
   | { type: "terminal_frame"; frame: BinaryTerminalFramePayload }
-  | { type: "error"; code: string; message: string; retryable: boolean };
+  | { type: "error"; code: string; message: string; retryable: boolean }
+  | { type: "file_chunk"; session_id: UUID; offset_bytes: number; data: Uint8Array; size_bytes: number; eof: boolean };
 
 export interface BinaryProtocolPacket {
   version: number;
@@ -93,6 +94,14 @@ export function encodeBinaryProtocolPacket(packet: BinaryProtocolPacket): Uint8A
     payload.string(2, packet.payload.message);
     payload.bool(3, packet.payload.retryable);
     writer.bytes(23, payload.finish());
+  } else if (packet.payload?.type === "file_chunk") {
+    const payload = new ProtoWriter();
+    payload.bytes(1, uuidToBytes(packet.payload.session_id));
+    payload.uint64(2, packet.payload.offset_bytes);
+    payload.bytes(3, packet.payload.data);
+    payload.uint64(4, packet.payload.size_bytes);
+    payload.bool(5, packet.payload.eof);
+    writer.bytes(24, payload.finish());
   }
   return writer.finish();
 }
@@ -148,6 +157,9 @@ export function decodeBinaryProtocolPacket(bytes: Uint8Array): BinaryProtocolPac
       case 23:
         packet.payload = decodeErrorPayload(reader.bytes(wireType));
         break;
+      case 24:
+        packet.payload = decodeFileChunkPayload(reader.bytes(wireType));
+        break;
       default:
         reader.skip(wireType);
         break;
@@ -174,6 +186,35 @@ function decodeSessionDataPayload(bytes: Uint8Array): BinaryProtocolPacketPayloa
     throw new Error("invalid_binary_session_data");
   }
   return { type: "session_data", session_id: sessionId, data };
+}
+
+function decodeFileChunkPayload(bytes: Uint8Array): BinaryProtocolPacketPayload {
+  const reader = new ProtoReader(bytes);
+  let sessionId: UUID | undefined;
+  let offsetBytes = 0;
+  let data = new Uint8Array();
+  let sizeBytes = 0;
+  let eof = false;
+  while (!reader.done()) {
+    const { field, wireType } = reader.tag();
+    if (field === 1) {
+      sessionId = bytesToUuid(reader.bytes(wireType));
+    } else if (field === 2) {
+      offsetBytes = reader.uint64(wireType);
+    } else if (field === 3) {
+      data = new Uint8Array(reader.bytes(wireType));
+    } else if (field === 4) {
+      sizeBytes = reader.uint64(wireType);
+    } else if (field === 5) {
+      eof = reader.bool(wireType);
+    } else {
+      reader.skip(wireType);
+    }
+  }
+  if (!sessionId) {
+    throw new Error("invalid_binary_file_chunk");
+  }
+  return { type: "file_chunk", session_id: sessionId, offset_bytes: offsetBytes, data, size_bytes: sizeBytes, eof };
 }
 
 export function terminalFrameJsonToBinary(payload: unknown): BinaryTerminalFramePayload {
@@ -446,7 +487,10 @@ class ProtoWriter {
   bytes(field: number, value: Uint8Array): void {
     this.tag(field, 2);
     this.varint(BigInt(value.length));
-    this.chunks.push(...value);
+    // 中文注释：file_chunk 正常就是 256KiB 级别；数组 spread 会触发 JS 参数数量上限。
+    for (const byte of value) {
+      this.chunks.push(byte);
+    }
   }
 
   finish(): Uint8Array {

@@ -13,13 +13,26 @@ import App, {
   networkRateFromSamples,
   pairingWsUrlCandidates,
 } from "../App";
-import type { ProtocolPacket, SessionDataPayload, SessionFilesResultPayload, SessionGitResultPayload } from "../protocol/types";
-import { sessionDataFromBase64 } from "../protocol/wire";
+import { E2eeSession, decodeBinaryEncryptedFrame, encodeBinaryEncryptedFrame, type E2eeKeyPair } from "../protocol/e2ee";
+import type {
+  ProtocolPacket,
+  PublicKeyWire,
+  SessionDataPayload,
+  SessionFileDownloadStreamReadyPayload,
+  SessionFileHttpUploadStreamPayload,
+  SessionFileHttpUploadReadyPayload,
+  SessionFileUploadProgressPayload,
+  SessionFilesResultPayload,
+  SessionGitResultPayload,
+  UUID,
+} from "../protocol/types";
+import { concatBytes, encodeUtf8, sessionDataFromBase64 } from "../protocol/wire";
 import { DirectClient } from "../protocol/direct-client";
 import { clearBrowserState, loadBrowserState } from "../state/browser-state";
 import { MockDaemon } from "../test/mock-daemon";
 import { fallbackSessionDisplayName } from "../session-names";
 import { resetFileEditorDialogMonacoCacheForTests } from "../components/FileEditorDialog";
+import { SessionFilesPanel } from "../components/SessionFilesPanel";
 
 const DEFAULT_SESSION_ID = "00000000-0000-0000-0000-000000000401";
 const DEFAULT_SESSION_NAME = fallbackSessionDisplayName(DEFAULT_SESSION_ID);
@@ -104,6 +117,243 @@ function setMobileVisualViewport(layoutHeight: number, visualHeight: number, off
     writable: true,
   });
   window.dispatchEvent(new Event("resize"));
+}
+
+function httpE2eeSessionFromHeaders(daemon: MockDaemon, headers: Headers): E2eeSession {
+  const deviceId = headers.get("x-termd-device-id");
+  const devicePublicKey = headers.get("x-termd-e2ee-public-key");
+  if (!deviceId || !devicePublicKey) {
+    throw new Error("missing HTTP E2EE test headers");
+  }
+  const daemonKeypair = (daemon as unknown as { e2eeKeypair: E2eeKeyPair }).e2eeKeypair;
+  return E2eeSession.daemon({
+    serverId: daemon.serverId,
+    deviceId,
+    localKeypair: daemonKeypair,
+    devicePublicKeyWire: devicePublicKey as PublicKeyWire,
+  });
+}
+
+function encodeHttpE2eeTestFrames(e2ee: E2eeSession, frames: Uint8Array[]): Uint8Array {
+  return concatBytes(
+    ...frames.map((frame) => {
+      const encrypted = encodeBinaryEncryptedFrame(e2ee.encryptBinary(frame));
+      const wire = new Uint8Array(4 + encrypted.byteLength);
+      new DataView(wire.buffer, wire.byteOffset, 4).setUint32(0, encrypted.byteLength, false);
+      wire.set(encrypted, 4);
+      return wire;
+    }),
+  );
+}
+
+function decodeHttpE2eeTestFrames(e2ee: E2eeSession, wire: Uint8Array): Uint8Array[] {
+  const frames: Uint8Array[] = [];
+  let offset = 0;
+  while (offset < wire.byteLength) {
+    const len = new DataView(wire.buffer, wire.byteOffset + offset, 4).getUint32(0, false);
+    offset += 4;
+    const encrypted = decodeBinaryEncryptedFrame(wire.slice(offset, offset + len));
+    frames.push(e2ee.decryptBinary(encrypted));
+    offset += len;
+  }
+  return frames;
+}
+
+function responseBodyBytes(bytes: Uint8Array): ArrayBuffer {
+  return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+}
+
+async function requestBodyBytes(body: BodyInit | null | undefined): Promise<Uint8Array> {
+  if (!body) {
+    throw new Error("missing request body");
+  }
+  if (body instanceof ReadableStream) {
+    throw new Error("upload body must not be a ReadableStream");
+  }
+  if (body instanceof Blob) {
+    if ("arrayBuffer" in body && typeof body.arrayBuffer === "function") {
+      return new Uint8Array(await body.arrayBuffer());
+    }
+    return await new Promise<Uint8Array>((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onerror = () => reject(reader.error ?? new Error("failed to read blob"));
+      reader.onload = () => resolve(new Uint8Array(reader.result as ArrayBuffer));
+      reader.readAsArrayBuffer(body);
+    });
+  }
+  if (body instanceof ArrayBuffer || Object.prototype.toString.call(body) === "[object ArrayBuffer]") {
+    return new Uint8Array(body as ArrayBuffer);
+  }
+  if (ArrayBuffer.isView(body)) {
+    const view = body as ArrayBufferView;
+    return new Uint8Array(view.buffer.slice(view.byteOffset, view.byteOffset + view.byteLength));
+  }
+  return encodeUtf8(String(body));
+}
+
+interface HttpUploadMockRecord {
+  session_id: UUID;
+  path: string;
+  bytes: Uint8Array;
+}
+
+function installHttpUploadOnceMock(
+  daemon: MockDaemon,
+  sessionId: UUID,
+  uploadPath: string,
+  file: File,
+): { restore: () => void; uploads: HttpUploadMockRecord[] } {
+  const originalFetch = globalThis.fetch;
+  const uploads: HttpUploadMockRecord[] = [];
+  (globalThis as unknown as { fetch: typeof fetch }).fetch = (async (input, init) => {
+    const url = new URL(input instanceof Request ? input.url : String(input));
+    const headers = new Headers(init?.headers);
+    const e2ee = httpE2eeSessionFromHeaders(daemon, headers);
+    if (url.pathname.endsWith("/api/files/upload/init")) {
+      const ready = {
+        session_id: sessionId,
+        path: uploadPath,
+        upload_id: "mock-app-binary-fallback-upload",
+        size_bytes: file.size,
+        offset_bytes: 0,
+      } satisfies SessionFileHttpUploadReadyPayload;
+      return new Response(responseBodyBytes(encodeHttpE2eeTestFrames(e2ee, [encodeUtf8(JSON.stringify(ready))])));
+    }
+    if (url.pathname.endsWith("/api/files/upload")) {
+      const frames = decodeHttpE2eeTestFrames(e2ee, await requestBodyBytes(init?.body));
+      const meta = JSON.parse(new TextDecoder().decode(frames[0])) as SessionFileHttpUploadStreamPayload;
+      const bytes = concatBytes(...frames.slice(1));
+      uploads.push({ session_id: meta.session_id, path: meta.path, bytes });
+      const progress = {
+        session_id: meta.session_id,
+        path: meta.path,
+        offset_bytes: bytes.byteLength,
+        size_bytes: meta.size_bytes,
+        eof: bytes.byteLength === meta.size_bytes,
+        modified_at_ms: null,
+      } satisfies SessionFileUploadProgressPayload;
+      return new Response(responseBodyBytes(encodeHttpE2eeTestFrames(e2ee, [encodeUtf8(JSON.stringify(progress))])));
+    }
+    return originalFetch(input, init);
+  }) as typeof fetch;
+  return {
+    restore: () => {
+      (globalThis as unknown as { fetch: typeof fetch }).fetch = originalFetch;
+    },
+    uploads,
+  };
+}
+
+function installDelayedHttpUploadInitMock(
+  daemon: MockDaemon,
+  sessionId: UUID,
+  uploadPath: string,
+  file: File,
+): { restore: () => void; releaseInit: () => void; uploads: HttpUploadMockRecord[] } {
+  const originalFetch = globalThis.fetch;
+  const uploads: HttpUploadMockRecord[] = [];
+  let releaseInit: (() => void) | undefined;
+  const initReleased = new Promise<void>((resolve) => {
+    releaseInit = resolve;
+  });
+  (globalThis as unknown as { fetch: typeof fetch }).fetch = (async (input, init) => {
+    const url = new URL(input instanceof Request ? input.url : String(input));
+    const headers = new Headers(init?.headers);
+    const e2ee = httpE2eeSessionFromHeaders(daemon, headers);
+    if (url.pathname.endsWith("/api/files/upload/init")) {
+      await initReleased;
+      const ready = {
+        session_id: sessionId,
+        path: uploadPath,
+        upload_id: "mock-app-delayed-binary-fallback-upload",
+        size_bytes: file.size,
+        offset_bytes: 0,
+      } satisfies SessionFileHttpUploadReadyPayload;
+      return new Response(responseBodyBytes(encodeHttpE2eeTestFrames(e2ee, [encodeUtf8(JSON.stringify(ready))])));
+    }
+    if (url.pathname.endsWith("/api/files/upload")) {
+      const frames = decodeHttpE2eeTestFrames(e2ee, await requestBodyBytes(init?.body));
+      const meta = JSON.parse(new TextDecoder().decode(frames[0])) as SessionFileHttpUploadStreamPayload;
+      const bytes = concatBytes(...frames.slice(1));
+      uploads.push({ session_id: meta.session_id, path: meta.path, bytes });
+      const progress = {
+        session_id: meta.session_id,
+        path: meta.path,
+        offset_bytes: bytes.byteLength,
+        size_bytes: meta.size_bytes,
+        eof: bytes.byteLength === meta.size_bytes,
+        modified_at_ms: null,
+      } satisfies SessionFileUploadProgressPayload;
+      return new Response(responseBodyBytes(encodeHttpE2eeTestFrames(e2ee, [encodeUtf8(JSON.stringify(progress))])));
+    }
+    return originalFetch(input, init);
+  }) as typeof fetch;
+  return {
+    restore: () => {
+      (globalThis as unknown as { fetch: typeof fetch }).fetch = originalFetch;
+    },
+    releaseInit: () => releaseInit?.(),
+    uploads,
+  };
+}
+
+function installDelayedHttpUploadInitFailure(): { restore: () => void; failInit: () => void } {
+  const originalFetch = globalThis.fetch;
+  let failInit: (() => void) | undefined;
+  const initFailed = new Promise<void>((resolve) => {
+    failInit = resolve;
+  });
+  (globalThis as unknown as { fetch: typeof fetch }).fetch = (async (input, init) => {
+    const url = new URL(input instanceof Request ? input.url : String(input));
+    if (url.pathname.endsWith("/api/files/upload/init")) {
+      await initFailed;
+      throw new TypeError("upload init failed");
+    }
+    return originalFetch(input, init);
+  }) as typeof fetch;
+  return {
+    restore: () => {
+      (globalThis as unknown as { fetch: typeof fetch }).fetch = originalFetch;
+    },
+    failInit: () => failInit?.(),
+  };
+}
+
+function installHttpDownloadMock(
+  daemon: MockDaemon,
+  sessionId: UUID,
+  filePath: string,
+  name: string,
+  bytes: Uint8Array,
+): { restore: () => void; calls: () => number } {
+  const originalFetch = globalThis.fetch;
+  let calls = 0;
+  (globalThis as unknown as { fetch: typeof fetch }).fetch = (async (input, init) => {
+    const url = new URL(input instanceof Request ? input.url : String(input));
+    if (!url.pathname.endsWith("/api/files/download")) {
+      return originalFetch(input, init);
+    }
+    calls += 1;
+    const headers = new Headers(init?.headers);
+    const e2ee = httpE2eeSessionFromHeaders(daemon, headers);
+    const ready = {
+      session_id: sessionId,
+      path: filePath,
+      name,
+      size_bytes: bytes.byteLength,
+      modified_at_ms: null,
+    } satisfies SessionFileDownloadStreamReadyPayload;
+    return new Response(responseBodyBytes(encodeHttpE2eeTestFrames(e2ee, [
+      encodeUtf8(JSON.stringify(ready)),
+      bytes,
+    ])));
+  }) as typeof fetch;
+  return {
+    restore: () => {
+      (globalThis as unknown as { fetch: typeof fetch }).fetch = originalFetch;
+    },
+    calls: () => calls,
+  };
 }
 
 function installMutableMobileVisualViewport(layoutHeight: number, visualHeight: number, offsetTop = 0) {
@@ -377,6 +627,65 @@ describe("termui web 工作台", () => {
     expect(APP_CONNECTION_TIMEOUT_MS).toBe(5000);
   });
 
+  it("0 字节文件传输只有完成确认后才显示 100%", () => {
+    const panelProps = {
+      attachedSessionId: DEFAULT_SESSION_ID,
+      activeTab: "files" as const,
+      files: { session_id: DEFAULT_SESSION_ID, path: "/tmp", entries: [] },
+      loading: false,
+      gitLoading: false,
+      followTerminalCwd: true,
+      onTabChange: vi.fn(),
+      onOpenDirectory: vi.fn(),
+      onOpenFile: vi.fn(),
+      onOpenGitFile: vi.fn(),
+      onOpenGitDiff: vi.fn(),
+      onGitAction: vi.fn(),
+      onGoToPath: vi.fn(),
+      onRefresh: vi.fn(),
+      onRefreshGit: vi.fn(),
+      onFollowTerminalCwdChange: vi.fn(),
+      onUpload: vi.fn(),
+      onDownload: vi.fn(),
+      onDelete: vi.fn(),
+      onHide: vi.fn(),
+    };
+    const { rerender } = render(
+      <SessionFilesPanel
+        {...panelProps}
+        uploadProgress={{ name: "empty.txt", offsetBytes: 0, sizeBytes: 0, phase: "sending", completed: false }}
+      />,
+    );
+
+    expect(
+      screen.getByRole("status", { name: "Uploading empty.txt" }).querySelector<HTMLElement>(".files-transfer-bar-fill")
+        ?.style.getPropertyValue("--files-transfer-progress"),
+    ).toBe("0%");
+
+    rerender(
+      <SessionFilesPanel
+        {...panelProps}
+        uploadProgress={{ name: "empty.txt", offsetBytes: 0, sizeBytes: 0, phase: "confirmed", completed: true }}
+      />,
+    );
+    expect(
+      screen.getByRole("status", { name: "Uploading empty.txt" }).querySelector<HTMLElement>(".files-transfer-bar-fill")
+        ?.style.getPropertyValue("--files-transfer-progress"),
+    ).toBe("100%");
+
+    rerender(
+      <SessionFilesPanel
+        {...panelProps}
+        uploadProgress={{ name: "sent.bin", offsetBytes: 4, sizeBytes: 4, phase: "committing", completed: false }}
+      />,
+    );
+    expect(screen.getByRole("status", { name: "Saving sent.bin" })).toBeInTheDocument();
+    expect(
+      screen.getByRole("status", { name: "Saving sent.bin" }).querySelector<HTMLElement>(".files-transfer-bar-fill")
+        ?.style.getPropertyValue("--files-transfer-progress"),
+    ).toBe("99%");
+  });
+
   beforeEach(async () => {
     // app 集成测试运行在 jsdom 中；这里固定使用 fallback 编辑器，Monaco 的生产加载由构建验证覆盖。
     (globalThis as { __TERMD_TEST_DISABLE_MONACO__?: boolean }).__TERMD_TEST_DISABLE_MONACO__ = true;
@@ -546,7 +855,7 @@ describe("termui web 工作台", () => {
     expect(daemon.pingMessages).toBeGreaterThan(0);
   });
 
-  it("页面 hidden 时暂停后台状态轮询，visible 后恢复一次", async () => {
+  it("页面 hidden 时暂停后台状态轮询但保持终端流接收，visible 后不重新 attach", async () => {
     const user = userEvent.setup();
     render(<App />);
 
@@ -558,18 +867,53 @@ describe("termui web 工作台", () => {
 
     setDocumentVisibility("hidden");
     const hiddenRequestCount = daemon.daemonStatusRequests;
+    daemon.pushSessionData(DEFAULT_SESSION_ID, "hidden-live-output\n");
+    await screen.findByText(/hidden-live-output/);
     await new Promise((resolve) => window.setTimeout(resolve, DAEMON_STATUS_POLL_INTERVAL_MS + 250));
 
     expect(daemon.daemonStatusRequests).toBe(hiddenRequestCount);
+    expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID]);
 
     setDocumentVisibility("visible");
-    // 中文注释：后台恢复时不复用可能半开的 terminal WebSocket，而是按当前 session 重建。
-    await waitFor(
-      () =>
-        expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID, DEFAULT_SESSION_ID]),
-      { timeout: 2800 },
-    );
+    // 中文注释：hidden/visible 只是页面可见性变化，不能主动重建 terminal WebSocket；
+    // 否则会触发 snapshot 重绘，并让后台已经持续接收的输出被重复恢复。
+    expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID]);
     await waitFor(() => expect(daemon.daemonStatusRequests).toBeGreaterThan(hiddenRequestCount));
+    expect(screen.getByText(/hidden-live-output/)).toBeInTheDocument();
+  });
+
+  it("窗口 blur/focus 不主动重建终端 WebSocket", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await screen.findByText(/termd-e2e-ready/);
+    await waitFor(() => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID]));
+    const acceptedConnectionsBeforeBlur = daemon.acceptedConnections;
+
+    window.dispatchEvent(new Event("blur"));
+    daemon.pushSessionData(DEFAULT_SESSION_ID, "blur-live-output\n");
+    await screen.findByText(/blur-live-output/);
+    window.dispatchEvent(new Event("focus"));
+    const terminalFrame = screen.getByTestId("terminal-pane").querySelector<HTMLElement>(".terminal-frame");
+    expect(terminalFrame).not.toBeNull();
+    await user.click(terminalFrame!);
+    const terminalInput = document.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
+    expect(terminalInput).not.toBeNull();
+    terminalInput!.value = "after-focus-input";
+    fireEvent.input(terminalInput!);
+    daemon.pushSessionData(DEFAULT_SESSION_ID, "post-focus-click-output\n");
+    await new Promise((resolve) => window.setTimeout(resolve, 650));
+
+    // 中文注释：普通窗口失焦不等于 transport 断开；focus 只能补状态轮询，
+    // 点击 xterm 也只能走同一条 terminal WebSocket 的 resize/cursor/input segment，
+    // 不能关闭当前 terminal stream 后重新 attach，否则会触发完整 snapshot 重绘。
+    expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID]);
+    expect(daemon.acceptedConnections).toBe(acceptedConnectionsBeforeBlur);
+    expect(daemon.sessionDataMessages).toContain("after-focus-input");
+    expect(screen.getByText(/blur-live-output/)).toBeInTheDocument();
+    await screen.findByText(/post-focus-click-output/);
   });
 
   it("页面 hidden 期间普通状态超时不关闭终端，visible 后继续恢复轮询", async () => {
@@ -651,9 +995,17 @@ describe("termui web 工作台", () => {
     await waitForWorkspaceSession();
     await screen.findByText(/termd-e2e-ready/);
     await waitFor(() => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID]));
+    const panel = await screen.findByLabelText("session files");
 
     daemon.closeNextDaemonStatusRequests(1);
     await waitFor(() => expect(daemon.activeConnectionCount()).toBe(0));
+    const acceptedAfterClose = daemon.acceptedConnections;
+
+    await user.click(within(panel).getByRole("button", { name: "Refresh files" }));
+    await new Promise((resolve) => window.setTimeout(resolve, 80));
+    // 中文注释：terminal reconnect 的等待窗口里，文件刷新不能抢先创建
+    // 未 terminal.attach 的认证-only WebSocket 来覆盖 attachClientRef。
+    expect(daemon.acceptedConnections).toBe(acceptedAfterClose);
 
     // 中文注释：状态轮询只是同一 WebSocket 上的旁路 segment；它发现 transport 关闭后
     // 必须触发当前 terminal attach 重连，而不是把 workspace client 清空后停在错误态。
@@ -664,6 +1016,11 @@ describe("termui web 工作台", () => {
     );
     expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
     expect(screen.getByTestId("terminal-pane")).toBeInTheDocument();
+    const terminalInput = document.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
+    expect(terminalInput).not.toBeNull();
+    terminalInput!.value = "after-status-close-input";
+    fireEvent.input(terminalInput!);
+    await waitFor(() => expect(daemon.sessionDataMessages).toContain("after-status-close-input"));
   });
 
   it("session.files 超时只影响文件 panel，不卸载终端", async () => {
@@ -2957,14 +3314,12 @@ describe("termui web 工作台", () => {
     await user.click(within(panel).getByRole("button", { name: "Edit alpha.txt" }));
     const editor = await screen.findByRole("dialog", { name: "alpha.txt" });
     await waitFor(() => {
-      expect(daemon.sessionFileDownloadChunkRequests).toContainEqual({
+      expect(daemon.sessionFileReadRequests).toContainEqual({
         session_id: sessionId,
         path: "/home/me/project/alpha.txt",
-        offset_bytes: 0,
-        max_bytes: 262144,
       });
     });
-    expect(daemon.sessionFileReadRequests).toEqual([]);
+    expect(daemon.sessionFileDownloadChunkRequests).toEqual([]);
     const fileText = within(editor).getByLabelText("File text") as HTMLTextAreaElement;
     fireEvent.change(fileText, { target: { value: "edited from browser" } });
     await user.click(within(editor).getByRole("button", { name: "Save" }));
@@ -2977,17 +3332,23 @@ describe("termui web 工作台", () => {
     });
     await user.click(within(editor).getByRole("button", { name: "Close editor" }));
 
-    await user.click(within(panel).getByRole("button", { name: "Download alpha.txt" }));
-    await waitFor(() => {
-      expect(daemon.sessionFileDownloadChunkRequests.filter((request) => request.path === "/home/me/project/alpha.txt")).toHaveLength(2);
-      expect(daemon.sessionFileDownloadChunkRequests).toContainEqual({
-        session_id: sessionId,
-        path: "/home/me/project/alpha.txt",
-        offset_bytes: 0,
-        max_bytes: 262144,
+    const downloadMock = installHttpDownloadMock(
+      daemon,
+      sessionId,
+      "/home/me/project/alpha.txt",
+      "alpha.txt",
+      new TextEncoder().encode("hello world\n"),
+    );
+    try {
+      await user.click(within(panel).getByRole("button", { name: "Download alpha.txt" }));
+      await waitFor(() => {
+        expect(downloadMock.calls()).toBe(1);
+        expect(daemon.binaryPacketLog.some((entry) => entry.direction === "out" && entry.payload_type === "file_chunk")).toBe(false);
       });
-    });
-    expect(daemon.sessionFileReadRequests).toEqual([]);
+    } finally {
+      downloadMock.restore();
+    }
+    expect(daemon.sessionFileDownloadChunkRequests).toEqual([]);
 
     expect(within(panel).queryByRole("button", { name: "Copy alpha.txt" })).toBeNull();
     expect(within(panel).queryByRole("button", { name: "Move alpha.txt" })).toBeNull();
@@ -3024,17 +3385,1071 @@ describe("termui web 工作台", () => {
     await user.click(within(panel).getByRole("button", { name: "Parent directory" }));
     await within(panel).findByText("empty directory");
 
-    await user.upload(
-      within(panel).getByLabelText("Upload file"),
-      new File(["uploaded web file\n"], "notes.txt", { type: "text/plain" }),
-    );
-    await waitFor(() => {
-      expect(daemon.sessionFileWrites).toContainEqual({
-        session_id: sessionId,
-        path: "/tmp/notes.txt",
-        text: "uploaded web file\n",
+    const uploadFile = new File(["uploaded web file\n"], "notes.txt", { type: "text/plain" });
+    const uploadMock = installHttpUploadOnceMock(daemon, sessionId, "/tmp/notes.txt", uploadFile);
+    try {
+      await user.upload(
+        within(panel).getByLabelText("Upload file"),
+        uploadFile,
+      );
+      await within(panel).findByRole("status", { name: "Uploading notes.txt" });
+      await waitFor(() => {
+        const uploaded = uploadMock.uploads.find((write) => write.path === "/tmp/notes.txt");
+        expect(uploaded?.session_id).toBe(sessionId);
+        expect(Array.from(uploaded?.bytes ?? [])).toEqual(Array.from(new TextEncoder().encode("uploaded web file\n")));
       });
+    } finally {
+      uploadMock.restore();
+    }
+    expect(
+      daemon.receivedPacketLog.some((entry) => entry.packet.method === "session.file_upload"),
+    ).toBe(false);
+    expect(daemon.sessionFileWrites.some((write) => write.path === "/tmp/notes.txt")).toBe(false);
+  });
+
+  it("上传进度在切换 session 后仍保留", async () => {
+    const user = userEvent.setup();
+    const alphaSession = {
+      session_id: "00000000-0000-0000-0000-000000000431",
+      name: "alpha",
+      state: "running",
+      size: { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 },
+    } as const;
+    const betaSession = {
+      session_id: "00000000-0000-0000-0000-000000000432",
+      name: "beta",
+      state: "running",
+      size: { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 },
+    } as const;
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [alphaSession, betaSession],
+      sessionFiles: {
+        [alphaSession.session_id]: {
+          session_id: alphaSession.session_id,
+          path: "/home/alpha",
+          entries: [],
+        },
+        [betaSession.session_id]: {
+          session_id: betaSession.session_id,
+          path: "/home/beta",
+          entries: [],
+        },
+      },
     });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession("alpha");
+    await clickSessionCard(user, "alpha");
+    const panel = await screen.findByLabelText("session files");
+    await waitFor(() => expect(within(panel).getByLabelText("Current directory")).toHaveValue("/home/alpha"));
+
+    const uploadFile = new File(["upload while switching\n"], "notes.txt", { type: "text/plain" });
+    const uploadMock = installDelayedHttpUploadInitMock(
+      daemon,
+      alphaSession.session_id,
+      "/home/alpha/notes.txt",
+      uploadFile,
+    );
+    try {
+      await user.upload(within(panel).getByLabelText("Upload file"), uploadFile);
+      await screen.findByRole("status", { name: "Uploading notes.txt" });
+
+      await clickSessionCard(user, "beta");
+      await waitFor(() => expect(daemon.attachedSessions).toContain(betaSession.session_id));
+      // 中文注释：文件传输使用独立操作连接；切换当前 terminal attach
+      // 不能把仍在进行的上传进度从右侧文件面板清掉。
+      expect(screen.getByRole("status", { name: "Uploading notes.txt" })).toBeInTheDocument();
+
+      uploadMock.releaseInit();
+      await waitFor(() => {
+        const uploaded = uploadMock.uploads.find((write) => write.path === "/home/alpha/notes.txt");
+        expect(uploaded?.session_id).toBe(alphaSession.session_id);
+        expect(Array.from(uploaded?.bytes ?? [])).toEqual(Array.from(new TextEncoder().encode("upload while switching\n")));
+      });
+    } finally {
+      uploadMock.releaseInit();
+      uploadMock.restore();
+    }
+  });
+
+  it("下载进度在切换 session 后仍保留", async () => {
+    const user = userEvent.setup();
+    const alphaPath = "/home/alpha/alpha.txt";
+    const alphaSession = {
+      session_id: "00000000-0000-0000-0000-000000000433",
+      name: "alpha",
+      state: "running",
+      size: { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 },
+    } as const;
+    const betaSession = {
+      session_id: "00000000-0000-0000-0000-000000000434",
+      name: "beta",
+      state: "running",
+      size: { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 },
+    } as const;
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [alphaSession, betaSession],
+      sessionFiles: {
+        [alphaSession.session_id]: {
+          session_id: alphaSession.session_id,
+          path: "/home/alpha",
+          entries: [
+            {
+              name: "alpha.txt",
+              path: alphaPath,
+              kind: "file",
+              size_bytes: 6,
+              modified_at_ms: null,
+            },
+          ],
+        },
+        [betaSession.session_id]: {
+          session_id: betaSession.session_id,
+          path: "/home/beta",
+          entries: [],
+        },
+      },
+      sessionFileReads: {
+        [alphaPath]: {
+          session_id: alphaSession.session_id,
+          path: alphaPath,
+          data_base64: Buffer.from("alpha\n", "utf8").toString("base64"),
+          size_bytes: 6,
+          modified_at_ms: null,
+        },
+      },
+    });
+    let resolveClose: (() => void) | undefined;
+    const write = vi.fn<() => Promise<void>>(() => Promise.resolve());
+    const close = vi.fn<() => Promise<void>>(() => new Promise((resolve) => {
+      resolveClose = resolve;
+    }));
+    const abort = vi.fn<() => Promise<void>>(() => Promise.resolve());
+    const originalPicker = (globalThis as { showSaveFilePicker?: unknown }).showSaveFilePicker;
+    Object.defineProperty(globalThis, "showSaveFilePicker", {
+      configurable: true,
+      value: vi.fn(() =>
+        Promise.resolve({
+          createWritable: () => Promise.resolve({ write, close, abort }),
+        }),
+      ),
+    });
+    const downloadMock = installHttpDownloadMock(
+      daemon,
+      alphaSession.session_id,
+      alphaPath,
+      "alpha.txt",
+      new TextEncoder().encode("alpha\n"),
+    );
+    try {
+      render(<App />);
+
+      await pairWithInvite(user, daemon);
+      await waitForWorkspaceSession("alpha");
+      await clickSessionCard(user, "alpha");
+
+      const panel = await screen.findByLabelText("session files");
+      await within(panel).findByText("alpha.txt");
+      await user.click(within(panel).getByRole("button", { name: "Download alpha.txt" }));
+      await screen.findByRole("status", { name: "Downloading alpha.txt" });
+      await waitFor(() => expect(close).toHaveBeenCalledTimes(1));
+
+      await clickSessionCard(user, "beta");
+      await waitFor(() => expect(daemon.attachedSessions).toContain(betaSession.session_id));
+      // 中文注释：下载 close 尚未提交时，切换 session 只能重建 terminal attach，
+      // 不能把当前下载进度误认为旧 session UI 状态而清除。
+      expect(screen.getByRole("status", { name: "Downloading alpha.txt" })).toBeInTheDocument();
+
+      resolveClose?.();
+      await waitFor(() => {
+        expect(screen.getByRole("status", { name: "Downloading alpha.txt" })
+          .querySelector<HTMLElement>(".files-transfer-bar-fill")
+          ?.style.getPropertyValue("--files-transfer-progress")).toBe("100%");
+      });
+      expect(abort).not.toHaveBeenCalled();
+    } finally {
+      resolveClose?.();
+      downloadMock.restore();
+      if (originalPicker === undefined) {
+        delete (globalThis as { showSaveFilePicker?: unknown }).showSaveFilePicker;
+      } else {
+        Object.defineProperty(globalThis, "showSaveFilePicker", {
+          configurable: true,
+          value: originalPicker,
+        });
+      }
+    }
+  });
+
+  it("旧 session 上传失败后不污染当前文件 panel", async () => {
+    const user = userEvent.setup();
+    const alphaSession = {
+      session_id: "00000000-0000-0000-0000-000000000435",
+      name: "alpha",
+      state: "running",
+      size: { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 },
+    } as const;
+    const betaSession = {
+      session_id: "00000000-0000-0000-0000-000000000436",
+      name: "beta",
+      state: "running",
+      size: { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 },
+    } as const;
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [alphaSession, betaSession],
+      sessionFiles: {
+        [alphaSession.session_id]: {
+          session_id: alphaSession.session_id,
+          path: "/home/alpha",
+          entries: [],
+        },
+        [betaSession.session_id]: {
+          session_id: betaSession.session_id,
+          path: "/home/beta",
+          entries: [
+            {
+              name: "beta.txt",
+              path: "/home/beta/beta.txt",
+              kind: "file",
+              size_bytes: 4,
+              modified_at_ms: null,
+            },
+          ],
+        },
+        "/home/beta": {
+          session_id: betaSession.session_id,
+          path: "/home/beta",
+          entries: [
+            {
+              name: "beta.txt",
+              path: "/home/beta/beta.txt",
+              kind: "file",
+              size_bytes: 4,
+              modified_at_ms: null,
+            },
+          ],
+        },
+      },
+    });
+    const uploadMock = installDelayedHttpUploadInitFailure();
+    try {
+      render(<App />);
+
+      await pairWithInvite(user, daemon);
+      await waitForWorkspaceSession("alpha");
+      await clickSessionCard(user, "alpha");
+
+      const panel = await screen.findByLabelText("session files");
+      await waitFor(() => expect(within(panel).getByLabelText("Current directory")).toHaveValue("/home/alpha"));
+      await user.upload(
+        within(panel).getByLabelText("Upload file"),
+        new File(["broken upload\n"], "broken.txt", { type: "text/plain" }),
+      );
+      await screen.findByRole("status", { name: "Uploading broken.txt" });
+
+      await clickSessionCard(user, "beta");
+      await waitFor(() => expect(daemon.attachedSessions).toContain(betaSession.session_id));
+      await within(panel).findByText("beta.txt");
+
+      uploadMock.failInit();
+      await waitFor(() => expect(screen.queryByRole("status", { name: "Uploading broken.txt" })).toBeNull(), {
+        timeout: 3500,
+      });
+      await waitFor(() => expect(within(panel).getByLabelText("Current directory")).toHaveValue("/home/beta"));
+      // 中文注释：alpha 上传失败发生在切到 beta 之后，只能收敛 alpha 的传输；
+      // 当前 beta 文件面板不能被旧错误改成 unavailable。
+      expect(within(panel).queryByText("unavailable")).toBeNull();
+      expect(within(panel).getByText("beta.txt")).toBeInTheDocument();
+    } finally {
+      uploadMock.failInit();
+      uploadMock.restore();
+    }
+  });
+
+  it("旧 session 下载失败后不污染当前文件 panel", async () => {
+    const user = userEvent.setup();
+    const alphaPath = "/home/alpha/alpha.txt";
+    const alphaSession = {
+      session_id: "00000000-0000-0000-0000-000000000437",
+      name: "alpha",
+      state: "running",
+      size: { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 },
+    } as const;
+    const betaSession = {
+      session_id: "00000000-0000-0000-0000-000000000438",
+      name: "beta",
+      state: "running",
+      size: { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 },
+    } as const;
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [alphaSession, betaSession],
+      sessionFiles: {
+        [alphaSession.session_id]: {
+          session_id: alphaSession.session_id,
+          path: "/home/alpha",
+          entries: [
+            {
+              name: "alpha.txt",
+              path: alphaPath,
+              kind: "file",
+              size_bytes: 6,
+              modified_at_ms: null,
+            },
+          ],
+        },
+        [betaSession.session_id]: {
+          session_id: betaSession.session_id,
+          path: "/home/beta",
+          entries: [
+            {
+              name: "beta.txt",
+              path: "/home/beta/beta.txt",
+              kind: "file",
+              size_bytes: 4,
+              modified_at_ms: null,
+            },
+          ],
+        },
+        "/home/beta": {
+          session_id: betaSession.session_id,
+          path: "/home/beta",
+          entries: [
+            {
+              name: "beta.txt",
+              path: "/home/beta/beta.txt",
+              kind: "file",
+              size_bytes: 4,
+              modified_at_ms: null,
+            },
+          ],
+        },
+      },
+    });
+    let rejectClose: ((error: Error) => void) | undefined;
+    const write = vi.fn<() => Promise<void>>(() => Promise.resolve());
+    const close = vi.fn<() => Promise<void>>(() => new Promise((_, reject) => {
+      rejectClose = reject;
+    }));
+    const abort = vi.fn<() => Promise<void>>(() => Promise.resolve());
+    const originalPicker = (globalThis as { showSaveFilePicker?: unknown }).showSaveFilePicker;
+    Object.defineProperty(globalThis, "showSaveFilePicker", {
+      configurable: true,
+      value: vi.fn(() =>
+        Promise.resolve({
+          createWritable: () => Promise.resolve({ write, close, abort }),
+        }),
+      ),
+    });
+    const downloadMock = installHttpDownloadMock(
+      daemon,
+      alphaSession.session_id,
+      alphaPath,
+      "alpha.txt",
+      new TextEncoder().encode("alpha\n"),
+    );
+    try {
+      render(<App />);
+
+      await pairWithInvite(user, daemon);
+      await waitForWorkspaceSession("alpha");
+      await clickSessionCard(user, "alpha");
+
+      const panel = await screen.findByLabelText("session files");
+      await within(panel).findByText("alpha.txt");
+      await user.click(within(panel).getByRole("button", { name: "Download alpha.txt" }));
+      await screen.findByRole("status", { name: "Downloading alpha.txt" });
+      await waitFor(() => expect(close).toHaveBeenCalledTimes(1));
+
+      await clickSessionCard(user, "beta");
+      await waitFor(() => expect(daemon.attachedSessions).toContain(betaSession.session_id));
+      await within(panel).findByText("beta.txt");
+
+      rejectClose?.(new Error("download commit failed"));
+      await waitFor(() => expect(screen.queryByRole("status", { name: "Downloading alpha.txt" })).toBeNull(), {
+        timeout: 3500,
+      });
+      await waitFor(() => expect(within(panel).getByLabelText("Current directory")).toHaveValue("/home/beta"));
+      // 中文注释：alpha 下载提交失败不能把 beta 文件面板覆盖成错误态。
+      expect(within(panel).queryByText("unavailable")).toBeNull();
+      expect(within(panel).getByText("beta.txt")).toBeInTheDocument();
+    } finally {
+      rejectClose?.(new Error("test cleanup"));
+      downloadMock.restore();
+      if (originalPicker === undefined) {
+        delete (globalThis as { showSaveFilePicker?: unknown }).showSaveFilePicker;
+      } else {
+        Object.defineProperty(globalThis, "showSaveFilePicker", {
+          configurable: true,
+          value: originalPicker,
+        });
+      }
+    }
+  });
+
+  it("流式保存下载失败时 abort writer 而不是 close 半截文件", async () => {
+    const user = userEvent.setup();
+    const sessionId = "00000000-0000-0000-0000-000000000416";
+    const rootPath = "/home/me/project";
+    const filePath = "/home/me/project/alpha.txt";
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [
+        {
+          session_id: sessionId,
+          state: "running",
+          size: { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 },
+        },
+      ],
+      sessionFiles: {
+        [sessionId]: {
+          session_id: sessionId,
+          path: rootPath,
+          entries: [
+            {
+              name: "alpha.txt",
+              path: filePath,
+              kind: "file",
+              size_bytes: 6,
+              modified_at_ms: null,
+            },
+          ],
+        },
+      },
+      sessionFileReads: {
+        [filePath]: {
+          session_id: sessionId,
+          path: filePath,
+          data_base64: Buffer.from("hello\n", "utf8").toString("base64"),
+          size_bytes: 6,
+          modified_at_ms: null,
+        },
+      },
+    });
+    const write = vi.fn<() => Promise<void>>(() => Promise.reject(new Error("disk full")));
+    const close = vi.fn<() => Promise<void>>(() => Promise.resolve());
+    const abort = vi.fn<() => Promise<void>>(() => Promise.resolve());
+    const originalPicker = (globalThis as { showSaveFilePicker?: unknown }).showSaveFilePicker;
+    Object.defineProperty(globalThis, "showSaveFilePicker", {
+      configurable: true,
+      value: vi.fn(() =>
+        Promise.resolve({
+          createWritable: () => Promise.resolve({ write, close, abort }),
+        }),
+      ),
+    });
+    const downloadMock = installHttpDownloadMock(daemon, sessionId, filePath, "alpha.txt", new TextEncoder().encode("hello\n"));
+    try {
+      render(<App />);
+
+      await pairWithInvite(user, daemon);
+      await waitForWorkspaceSession();
+      await clickSessionCard(user);
+
+      const panel = await screen.findByLabelText("session files");
+      await within(panel).findByText("alpha.txt");
+      await user.click(within(panel).getByRole("button", { name: "Download alpha.txt" }));
+
+      await waitFor(() => expect(abort).toHaveBeenCalledTimes(1));
+      expect(close).not.toHaveBeenCalled();
+      expect(write).toHaveBeenCalled();
+    } finally {
+      downloadMock.restore();
+      if (originalPicker === undefined) {
+        delete (globalThis as { showSaveFilePicker?: unknown }).showSaveFilePicker;
+      } else {
+        Object.defineProperty(globalThis, "showSaveFilePicker", {
+          configurable: true,
+          value: originalPicker,
+        });
+      }
+    }
+  });
+
+  it("流式保存下载失败且 writer 没有 abort 时也不会 close 半截文件", async () => {
+    const user = userEvent.setup();
+    const sessionId = "00000000-0000-0000-0000-000000000417";
+    const filePath = "/home/me/project/alpha.txt";
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [
+        {
+          session_id: sessionId,
+          state: "running",
+          size: { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 },
+        },
+      ],
+      sessionFiles: {
+        [sessionId]: {
+          session_id: sessionId,
+          path: "/home/me/project",
+          entries: [
+            {
+              name: "alpha.txt",
+              path: filePath,
+              kind: "file",
+              size_bytes: 6,
+              modified_at_ms: null,
+            },
+          ],
+        },
+        "/home/me/project": {
+          session_id: sessionId,
+          path: "/home/me/project",
+          entries: [
+            {
+              name: "alpha.txt",
+              path: filePath,
+              kind: "file",
+              size_bytes: 6,
+              modified_at_ms: null,
+            },
+          ],
+        },
+      },
+      sessionFileReads: {
+        [filePath]: {
+          session_id: sessionId,
+          path: filePath,
+          data_base64: Buffer.from("hello\n", "utf8").toString("base64"),
+          size_bytes: 6,
+          modified_at_ms: null,
+        },
+      },
+    });
+    const write = vi.fn<() => Promise<void>>(() => Promise.reject(new Error("disk full")));
+    const close = vi.fn<() => Promise<void>>(() => Promise.resolve());
+    const originalPicker = (globalThis as { showSaveFilePicker?: unknown }).showSaveFilePicker;
+    Object.defineProperty(globalThis, "showSaveFilePicker", {
+      configurable: true,
+      value: vi.fn(() =>
+        Promise.resolve({
+          createWritable: () => Promise.resolve({ write, close }),
+        }),
+      ),
+    });
+    const downloadMock = installHttpDownloadMock(daemon, sessionId, filePath, "alpha.txt", new TextEncoder().encode("hello\n"));
+    try {
+      render(<App />);
+
+      await pairWithInvite(user, daemon);
+      await waitForWorkspaceSession();
+      await clickSessionCard(user);
+
+      const panel = await screen.findByLabelText("session files");
+      await within(panel).findByText("alpha.txt");
+      await user.click(within(panel).getByRole("button", { name: "Download alpha.txt" }));
+
+      await waitFor(() => expect(write).toHaveBeenCalled());
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(close).not.toHaveBeenCalled();
+    } finally {
+      downloadMock.restore();
+      if (originalPicker === undefined) {
+        delete (globalThis as { showSaveFilePicker?: unknown }).showSaveFilePicker;
+      } else {
+        Object.defineProperty(globalThis, "showSaveFilePicker", {
+          configurable: true,
+          value: originalPicker,
+        });
+      }
+    }
+  });
+
+  it("选择保存位置后 createWritable 非取消失败时不会回退到内存下载", async () => {
+    const user = userEvent.setup();
+    const sessionId = "00000000-0000-0000-0000-000000000420";
+    const filePath = "/home/me/project/alpha.txt";
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [
+        {
+          session_id: sessionId,
+          state: "running",
+          size: { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 },
+        },
+      ],
+      sessionFiles: {
+        [sessionId]: {
+          session_id: sessionId,
+          path: "/home/me/project",
+          entries: [
+            {
+              name: "alpha.txt",
+              path: filePath,
+              kind: "file",
+              size_bytes: 6,
+              modified_at_ms: null,
+            },
+          ],
+        },
+        "/home/me/project": {
+          session_id: sessionId,
+          path: "/home/me/project",
+          entries: [
+            {
+              name: "alpha.txt",
+              path: filePath,
+              kind: "file",
+              size_bytes: 6,
+              modified_at_ms: null,
+            },
+          ],
+        },
+      },
+      sessionFileReads: {
+        [filePath]: {
+          session_id: sessionId,
+          path: filePath,
+          data_base64: Buffer.from("hello\n", "utf8").toString("base64"),
+          size_bytes: 6,
+          modified_at_ms: null,
+        },
+      },
+    });
+    const write = vi.fn<() => Promise<void>>(() => Promise.resolve());
+    const close = vi.fn<() => Promise<void>>(() => Promise.resolve());
+    const clickSpy = vi.spyOn(HTMLAnchorElement.prototype, "click");
+    const originalPicker = (globalThis as { showSaveFilePicker?: unknown }).showSaveFilePicker;
+    Object.defineProperty(globalThis, "showSaveFilePicker", {
+      configurable: true,
+      value: vi.fn(() =>
+        Promise.resolve({
+          createWritable: () => Promise.reject(new Error("writer setup failed")),
+        }),
+      ),
+    });
+    try {
+      render(<App />);
+
+      await pairWithInvite(user, daemon);
+      await waitForWorkspaceSession();
+      await clickSessionCard(user);
+
+      const panel = await screen.findByLabelText("session files");
+      await within(panel).findByText("alpha.txt");
+      await user.click(within(panel).getByRole("button", { name: "Download alpha.txt" }));
+
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(clickSpy).not.toHaveBeenCalled();
+      expect(write).not.toHaveBeenCalled();
+      expect(close).not.toHaveBeenCalled();
+    } finally {
+      clickSpy.mockRestore();
+      if (originalPicker === undefined) {
+        delete (globalThis as { showSaveFilePicker?: unknown }).showSaveFilePicker;
+      } else {
+        Object.defineProperty(globalThis, "showSaveFilePicker", {
+          configurable: true,
+          value: originalPicker,
+        });
+      }
+    }
+  });
+
+  it("流式保存 close 失败时 abort writer 并保留 close 错误", async () => {
+    const user = userEvent.setup();
+    const sessionId = "00000000-0000-0000-0000-000000000418";
+    const filePath = "/home/me/project/alpha.txt";
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [
+        {
+          session_id: sessionId,
+          state: "running",
+          size: { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 },
+        },
+      ],
+      sessionFiles: {
+        [sessionId]: {
+          session_id: sessionId,
+          path: "/home/me/project",
+          entries: [
+            {
+              name: "alpha.txt",
+              path: filePath,
+              kind: "file",
+              size_bytes: 6,
+              modified_at_ms: null,
+            },
+          ],
+        },
+        "/home/me/project": {
+          session_id: sessionId,
+          path: "/home/me/project",
+          entries: [
+            {
+              name: "alpha.txt",
+              path: filePath,
+              kind: "file",
+              size_bytes: 6,
+              modified_at_ms: null,
+            },
+          ],
+        },
+      },
+      sessionFileReads: {
+        [filePath]: {
+          session_id: sessionId,
+          path: filePath,
+          data_base64: Buffer.from("hello\n", "utf8").toString("base64"),
+          size_bytes: 6,
+          modified_at_ms: null,
+        },
+      },
+    });
+    const write = vi.fn<() => Promise<void>>(() => Promise.resolve());
+    const close = vi.fn<() => Promise<void>>(() => Promise.reject(new Error("commit failed")));
+    const abort = vi.fn<() => Promise<void>>(() => Promise.resolve());
+    const originalPicker = (globalThis as { showSaveFilePicker?: unknown }).showSaveFilePicker;
+    Object.defineProperty(globalThis, "showSaveFilePicker", {
+      configurable: true,
+      value: vi.fn(() =>
+        Promise.resolve({
+          createWritable: () => Promise.resolve({ write, close, abort }),
+        }),
+      ),
+    });
+    const downloadMock = installHttpDownloadMock(daemon, sessionId, filePath, "alpha.txt", new TextEncoder().encode("hello\n"));
+    try {
+      render(<App />);
+
+      await pairWithInvite(user, daemon);
+      await waitForWorkspaceSession();
+      await clickSessionCard(user);
+
+      const panel = await screen.findByLabelText("session files");
+      await within(panel).findByText("alpha.txt");
+      await user.click(within(panel).getByRole("button", { name: "Download alpha.txt" }));
+
+      await waitFor(() => expect(close).toHaveBeenCalledTimes(1));
+      await waitFor(() => expect(abort).toHaveBeenCalledTimes(1));
+      expect(write).toHaveBeenCalled();
+    } finally {
+      downloadMock.restore();
+      if (originalPicker === undefined) {
+        delete (globalThis as { showSaveFilePicker?: unknown }).showSaveFilePicker;
+      } else {
+        Object.defineProperty(globalThis, "showSaveFilePicker", {
+          configurable: true,
+          value: originalPicker,
+        });
+      }
+    }
+  });
+
+  it("下载进度在 writer.close 成功后才显示完成", async () => {
+    const user = userEvent.setup();
+    const sessionId = "00000000-0000-0000-0000-000000000419";
+    const filePath = "/home/me/project/alpha.txt";
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [
+        {
+          session_id: sessionId,
+          state: "running",
+          size: { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 },
+        },
+      ],
+      sessionFiles: {
+        [sessionId]: {
+          session_id: sessionId,
+          path: "/home/me/project",
+          entries: [
+            {
+              name: "alpha.txt",
+              path: filePath,
+              kind: "file",
+              size_bytes: 6,
+              modified_at_ms: null,
+            },
+          ],
+        },
+      },
+      sessionFileReads: {
+        [filePath]: {
+          session_id: sessionId,
+          path: filePath,
+          data_base64: Buffer.from("hello\n", "utf8").toString("base64"),
+          size_bytes: 6,
+          modified_at_ms: null,
+        },
+      },
+    });
+    let resolveClose: (() => void) | undefined;
+    const write = vi.fn<() => Promise<void>>(() => Promise.resolve());
+    const close = vi.fn<() => Promise<void>>(() => new Promise((resolve) => {
+      resolveClose = resolve;
+    }));
+    const abort = vi.fn<() => Promise<void>>(() => Promise.resolve());
+    const originalPicker = (globalThis as { showSaveFilePicker?: unknown }).showSaveFilePicker;
+    Object.defineProperty(globalThis, "showSaveFilePicker", {
+      configurable: true,
+      value: vi.fn(() =>
+        Promise.resolve({
+          createWritable: () => Promise.resolve({ write, close, abort }),
+        }),
+      ),
+    });
+    const downloadMock = installHttpDownloadMock(daemon, sessionId, filePath, "alpha.txt", new TextEncoder().encode("hello\n"));
+    try {
+      render(<App />);
+
+      await pairWithInvite(user, daemon);
+      await waitForWorkspaceSession();
+      await clickSessionCard(user);
+
+      const panel = await screen.findByLabelText("session files");
+      await within(panel).findByText("alpha.txt");
+      await user.click(within(panel).getByRole("button", { name: "Download alpha.txt" }));
+
+      const progress = await within(panel).findByRole("status", { name: "Downloading alpha.txt" });
+      await waitFor(() => expect(close).toHaveBeenCalledTimes(1));
+      const fill = progress.querySelector<HTMLElement>(".files-transfer-bar-fill");
+      expect(fill?.style.getPropertyValue("--files-transfer-progress")).toBe("0%");
+
+      resolveClose?.();
+      await waitFor(() => {
+        const currentProgress = within(panel).getByRole("status", { name: "Downloading alpha.txt" });
+        expect(currentProgress.querySelector<HTMLElement>(".files-transfer-bar-fill")?.style.getPropertyValue("--files-transfer-progress")).toBe("100%");
+      });
+      expect(abort).not.toHaveBeenCalled();
+    } finally {
+      downloadMock.restore();
+      if (originalPicker === undefined) {
+        delete (globalThis as { showSaveFilePicker?: unknown }).showSaveFilePicker;
+      } else {
+        Object.defineProperty(globalThis, "showSaveFilePicker", {
+          configurable: true,
+          value: originalPicker,
+        });
+      }
+    }
+  });
+
+  it("旧下载完成后的延迟清理不会覆盖新的下载进度", async () => {
+    const user = userEvent.setup();
+    const sessionId = "00000000-0000-0000-0000-000000000421";
+    const alphaPath = "/home/me/project/alpha.txt";
+    const betaPath = "/home/me/project/beta.txt";
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [
+        {
+          session_id: sessionId,
+          state: "running",
+          size: { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 },
+        },
+      ],
+      sessionFiles: {
+        [sessionId]: {
+          session_id: sessionId,
+          path: "/home/me/project",
+          entries: [
+            {
+              name: "alpha.txt",
+              path: alphaPath,
+              kind: "file",
+              size_bytes: 6,
+              modified_at_ms: null,
+            },
+            {
+              name: "beta.txt",
+              path: betaPath,
+              kind: "file",
+              size_bytes: 5,
+              modified_at_ms: null,
+            },
+          ],
+        },
+      },
+      sessionFileReads: {
+        [alphaPath]: {
+          session_id: sessionId,
+          path: alphaPath,
+          data_base64: Buffer.from("alpha\n", "utf8").toString("base64"),
+          size_bytes: 6,
+          modified_at_ms: null,
+        },
+        [betaPath]: {
+          session_id: sessionId,
+          path: betaPath,
+          data_base64: Buffer.from("beta\n", "utf8").toString("base64"),
+          size_bytes: 5,
+          modified_at_ms: null,
+        },
+      },
+    });
+    let resolveFirstClose: (() => void) | undefined;
+    let resolveSecondClose: (() => void) | undefined;
+    const writers: Array<{
+      write: ReturnType<typeof vi.fn>;
+      close: ReturnType<typeof vi.fn>;
+      abort: ReturnType<typeof vi.fn>;
+    }> = [];
+    const originalPicker = (globalThis as { showSaveFilePicker?: unknown }).showSaveFilePicker;
+    Object.defineProperty(globalThis, "showSaveFilePicker", {
+      configurable: true,
+      value: vi.fn(() =>
+        Promise.resolve({
+          createWritable: () => {
+            const index = writers.length;
+            const writer = {
+              write: vi.fn<() => Promise<void>>(() => Promise.resolve()),
+              close: vi.fn<() => Promise<void>>(
+                () =>
+                  new Promise((resolve) => {
+                    if (index === 0) {
+                      resolveFirstClose = resolve;
+                    } else {
+                      resolveSecondClose = resolve;
+                    }
+                  }),
+              ),
+              abort: vi.fn<() => Promise<void>>(() => Promise.resolve()),
+            };
+            writers.push(writer);
+            return Promise.resolve(writer);
+          },
+        }),
+      ),
+    });
+    const downloadMock = installHttpDownloadMock(daemon, sessionId, alphaPath, "alpha.txt", new TextEncoder().encode("hello\n"));
+    try {
+      render(<App />);
+
+      await pairWithInvite(user, daemon);
+      await waitForWorkspaceSession();
+      await clickSessionCard(user);
+
+      const panel = await screen.findByLabelText("session files");
+      await within(panel).findByText("alpha.txt");
+      await within(panel).findByText("beta.txt");
+      await user.click(within(panel).getByRole("button", { name: "Download alpha.txt" }));
+      await waitFor(() => expect(writers[0]?.close).toHaveBeenCalledTimes(1));
+
+      await user.click(within(panel).getByRole("button", { name: "Download beta.txt" }));
+      await waitFor(() => expect(writers[1]?.close).toHaveBeenCalledTimes(1));
+      await within(panel).findByRole("status", { name: "Downloading beta.txt" });
+
+      // 中文注释：alpha 的 close 此时才完成，旧 transfer 的 finally 会尝试延迟清理；
+      // 它不能清掉当前 beta transfer 的进度条。
+      resolveFirstClose?.();
+      await new Promise((resolve) => setTimeout(resolve, 1300));
+
+      expect(within(panel).queryByRole("status", { name: "Downloading alpha.txt" })).toBeNull();
+      expect(within(panel).getByRole("status", { name: "Downloading beta.txt" })).toBeTruthy();
+      resolveSecondClose?.();
+    } finally {
+      downloadMock.restore();
+      if (originalPicker === undefined) {
+        delete (globalThis as { showSaveFilePicker?: unknown }).showSaveFilePicker;
+      } else {
+        Object.defineProperty(globalThis, "showSaveFilePicker", {
+          configurable: true,
+          value: originalPicker,
+        });
+      }
+    }
+  });
+
+  it("没有 File System Access 时下载内存 fallback 也显示进度", async () => {
+    const user = userEvent.setup();
+    const sessionId = "00000000-0000-0000-0000-000000000420";
+    const filePath = "/home/me/project/alpha.txt";
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [
+        {
+          session_id: sessionId,
+          state: "running",
+          size: { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 },
+        },
+      ],
+      sessionFiles: {
+        [sessionId]: {
+          session_id: sessionId,
+          path: "/home/me/project",
+          entries: [
+            {
+              name: "alpha.txt",
+              path: filePath,
+              kind: "file",
+              size_bytes: 6,
+              modified_at_ms: null,
+            },
+          ],
+        },
+        "/home/me/project": {
+          session_id: sessionId,
+          path: "/home/me/project",
+          entries: [
+            {
+              name: "alpha.txt",
+              path: filePath,
+              kind: "file",
+              size_bytes: 6,
+              modified_at_ms: null,
+            },
+          ],
+        },
+      },
+      sessionFileReads: {
+        [filePath]: {
+          session_id: sessionId,
+          path: filePath,
+          data_base64: Buffer.from("hello\n", "utf8").toString("base64"),
+          size_bytes: 6,
+          modified_at_ms: null,
+        },
+      },
+    });
+    const originalPicker = (globalThis as { showSaveFilePicker?: unknown }).showSaveFilePicker;
+    delete (globalThis as { showSaveFilePicker?: unknown }).showSaveFilePicker;
+    const downloadMock = installHttpDownloadMock(daemon, sessionId, filePath, "alpha.txt", new TextEncoder().encode("hello\n"));
+    try {
+      render(<App />);
+
+      await pairWithInvite(user, daemon);
+      await waitForWorkspaceSession();
+      await clickSessionCard(user);
+
+      const panel = await screen.findByLabelText("session files");
+      await within(panel).findByText("alpha.txt");
+      await user.click(within(panel).getByRole("button", { name: "Download alpha.txt" }));
+
+      await within(panel).findByRole("status", { name: "Downloading alpha.txt" });
+      await waitFor(
+        () => {
+          const currentProgress = within(panel).getByRole("status", { name: "Downloading alpha.txt" });
+          expect(currentProgress.querySelector<HTMLElement>(".files-transfer-bar-fill")?.style.getPropertyValue("--files-transfer-progress")).toBe("100%");
+        },
+        { timeout: 6000 },
+      );
+    } finally {
+      if (originalPicker !== undefined) {
+        Object.defineProperty(globalThis, "showSaveFilePicker", {
+          configurable: true,
+          value: originalPicker,
+        });
+      }
+      downloadMock.restore();
+    }
   });
 
   it("文件 panel 可以切到 Git tab 查看未提交文件和提交图", async () => {
@@ -3133,11 +4548,9 @@ describe("termui web 工作台", () => {
 
     await user.click(within(panel).getByRole("button", { name: "Open README.md" }));
     await waitFor(() =>
-      expect(daemon.sessionFileDownloadChunkRequests).toContainEqual({
+      expect(daemon.sessionFileReadRequests).toContainEqual({
         session_id: sessionId,
         path: "/home/me/project/README.md",
-        offset_bytes: 0,
-        max_bytes: expect.any(Number),
       }),
     );
 

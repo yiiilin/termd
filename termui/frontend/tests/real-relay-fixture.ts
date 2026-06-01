@@ -39,6 +39,7 @@ interface RealRelayFixtureOptions {
   blackoutAfterMs?: number;
   blackoutDurationMs?: number;
   enableRelayInterrupt?: boolean;
+  daemonEnv?: Record<string, string>;
 }
 
 interface LatencyProxy {
@@ -125,6 +126,7 @@ export async function startRealRelayFixture(options: RealRelayFixtureOptions = {
     ],
     "termd",
     tempDir,
+    options.daemonEnv,
   );
   await waitForPort(termdPort, daemon, "termd");
 
@@ -483,13 +485,13 @@ function httpRequest(url: string, options: { method: "GET" | "POST" }): Promise<
   });
 }
 
-function spawnCargo(args: string[], label: string, cwd: string): StartedProcess {
+function spawnCargo(args: string[], label: string, cwd: string, extraEnv: Record<string, string> = {}): StartedProcess {
   const log: string[] = [];
   // 中文注释：默认保持测试日志简短；排查真实 relay 压力问题时允许单次命令提高 Rust 日志级别。
   const rustLog = process.env.REAL_RELAY_RUST_LOG ?? "termd=info,termrelay=info";
   const child = spawn("cargo", args, {
     cwd,
-    env: { ...process.env, RUST_LOG: rustLog },
+    env: { ...process.env, ...extraEnv, RUST_LOG: rustLog },
   });
 
   child.stdout.on("data", (chunk) => log.push(`[${label}:stdout] ${chunk.toString()}`));

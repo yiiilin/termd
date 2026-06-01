@@ -18,8 +18,9 @@ use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub use termd_proto::{
-    AuthPayload, Challenge, DeviceId, E2eeKeyExchangePayload, Nonce, PairAcceptPayload,
-    PairRequestPayload, PairingToken, PublicKey, ServerId, Signature, UnixTimestampMillis,
+    AuthPayload, Challenge, DeviceId, E2eeKeyExchangePayload, HttpE2eeAuthPayload, Nonce,
+    PairAcceptPayload, PairRequestPayload, PairingToken, PublicKey, ServerId, Signature,
+    UnixTimestampMillis,
 };
 
 /// auth 模块统一使用的 Result 类型。
@@ -860,11 +861,11 @@ impl ReplayProtector {
         }
     }
 
-    /// 检查 timestamp 与 nonce，并在通过时记录 nonce。
+    /// 检查 timestamp 与 nonce，但不记录 nonce。
     ///
-    /// 同一 device id 下 nonce 一次通过后，在保留窗口内不能再次使用；不同 device id 的
-    /// nonce 空间互相隔离。
-    pub fn check_and_record(
+    /// HTTP 这类先验证签名再建立短期 E2EE 的路径需要先做 replay 预检，签名通过后再
+    /// 记录 nonce，避免坏签名请求消耗合法 nonce。
+    pub fn check(
         &mut self,
         device_id: &DeviceId,
         nonce: &Nonce,
@@ -881,21 +882,51 @@ impl ReplayProtector {
             });
         }
 
-        let device_nonces = self.nonces_by_device.entry(*device_id).or_default();
         let nonce_key = nonce_key(nonce).to_owned();
 
-        if device_nonces.contains_key(&nonce_key) {
+        if self
+            .nonces_by_device
+            .get(device_id)
+            .is_some_and(|device_nonces| device_nonces.contains_key(&nonce_key))
+        {
             return Err(ReplayError::ReplayedNonce {
                 device_id: *device_id,
             });
         }
 
+        Ok(())
+    }
+
+    /// 在调用方已经完成 `check` 和签名验证后记录 nonce。
+    pub fn record_checked(
+        &mut self,
+        device_id: &DeviceId,
+        nonce: &Nonce,
+        now_ms: UnixTimestampMillis,
+    ) {
+        let device_nonces = self.nonces_by_device.entry(*device_id).or_default();
+        let nonce_key = nonce_key(nonce).to_owned();
         device_nonces.insert(
             nonce_key,
             ReplayNonceRecord {
                 recorded_at_ms: now_ms,
             },
         );
+    }
+
+    /// 检查 timestamp 与 nonce，并在通过时记录 nonce。
+    ///
+    /// 同一 device id 下 nonce 一次通过后，在保留窗口内不能再次使用；不同 device id 的
+    /// nonce 空间互相隔离。
+    pub fn check_and_record(
+        &mut self,
+        device_id: &DeviceId,
+        nonce: &Nonce,
+        timestamp_ms: UnixTimestampMillis,
+        now_ms: UnixTimestampMillis,
+    ) -> Result<(), ReplayError> {
+        self.check(device_id, nonce, timestamp_ms, now_ms)?;
+        self.record_checked(device_id, nonce, now_ms);
         Ok(())
     }
 
@@ -907,7 +938,7 @@ impl ReplayProtector {
         self.nonces_by_device.retain(|_, device_nonces| {
             let before = device_nonces.len();
             device_nonces
-                .retain(|_, record| now_ms.0.saturating_sub(record.recorded_at_ms.0) < window_ms);
+                .retain(|_, record| now_ms.0.saturating_sub(record.recorded_at_ms.0) <= window_ms);
             removed += before - device_nonces.len();
             !device_nonces.is_empty()
         });
@@ -1078,6 +1109,63 @@ impl DaemonE2eeSigningInput {
             "binary_version",
             &self.binary_version.to_string(),
         );
+        bytes
+    }
+}
+
+/// HTTP E2EE 短期通道的规范化待签名字节。
+///
+/// 和 WebSocket auth 不同，这里没有服务端 challenge；安全边界来自已配对 device key、
+/// nonce/timestamp replay protection，以及 method/path 绑定。这样每次 HTTP transfer 都能
+/// 独立认证，不依赖某条 WebSocket 连接的状态。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpE2eeSigningInput {
+    server_id: ServerId,
+    daemon_public_key: PublicKey,
+    device_id: DeviceId,
+    e2ee_public_key: PublicKey,
+    nonce: Nonce,
+    timestamp_ms: UnixTimestampMillis,
+    method: String,
+    path: String,
+}
+
+impl HttpE2eeSigningInput {
+    pub fn from_payload(
+        payload: &HttpE2eeAuthPayload,
+        daemon_identity: &DaemonPublicIdentity,
+    ) -> Self {
+        Self {
+            server_id: daemon_identity.server_id,
+            daemon_public_key: daemon_identity.public_key.clone(),
+            device_id: payload.device_id,
+            e2ee_public_key: payload.e2ee_public_key.clone(),
+            nonce: payload.nonce.clone(),
+            timestamp_ms: payload.timestamp_ms,
+            method: payload.method.clone(),
+            path: payload.path.clone(),
+        }
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"termd-http-e2ee-v1\n");
+        append_canonical_field(&mut bytes, "server_id", &self.server_id.0.to_string());
+        append_canonical_field(
+            &mut bytes,
+            "daemon_public_key",
+            self.daemon_public_key.0.as_str(),
+        );
+        append_canonical_field(&mut bytes, "device_id", &self.device_id.0.to_string());
+        append_canonical_field(
+            &mut bytes,
+            "e2ee_public_key",
+            self.e2ee_public_key.0.as_str(),
+        );
+        append_canonical_field(&mut bytes, "nonce", self.nonce.0.as_str());
+        append_canonical_field(&mut bytes, "timestamp_ms", &self.timestamp_ms.0.to_string());
+        append_canonical_field(&mut bytes, "method", self.method.as_str());
+        append_canonical_field(&mut bytes, "path", self.path.as_str());
         bytes
     }
 }
@@ -2301,10 +2389,29 @@ mod tests {
             .unwrap();
 
         assert_eq!(protector.prune(timestamp(1499)), 0);
-        assert_eq!(protector.prune(timestamp(1500)), 1);
+        assert_eq!(protector.prune(timestamp(1500)), 0);
+        assert_eq!(protector.prune(timestamp(1501)), 1);
         protector
             .check_and_record(&device_id, &nonce, timestamp(1500), timestamp(1500))
             .unwrap();
+    }
+
+    #[test]
+    fn replay_rejects_nonce_replay_at_inclusive_window_boundary() {
+        let mut protector = ReplayProtector::new(500);
+        let device_id = DeviceId::new();
+        let nonce = nonce("boundary-nonce");
+
+        protector
+            .check_and_record(&device_id, &nonce, timestamp(1000), timestamp(1000))
+            .unwrap();
+
+        assert_eq!(
+            protector
+                .check_and_record(&device_id, &nonce, timestamp(1000), timestamp(1500))
+                .unwrap_err(),
+            ReplayError::ReplayedNonce { device_id }
+        );
     }
 
     #[test]

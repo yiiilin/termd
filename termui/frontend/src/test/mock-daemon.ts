@@ -42,6 +42,9 @@ import type {
   SessionCursorPayload,
   SessionDataPayload,
   SessionFileReadResultPayload,
+  SessionFileTransferChunkPayload,
+  SessionFileUploadProgressPayload,
+  SessionFileUploadReadyPayload,
   SessionFileWrittenPayload,
   SessionGitActionPayload,
   SessionGitDiffPayload,
@@ -95,6 +98,7 @@ interface MockDaemonOptions {
   sessionGitDelayMsBySession?: Record<UUID, number>;
   sessionGit?: Record<UUID, SessionGitResultPayload>;
   sessionFileReads?: Record<string, SessionFileReadResultPayload>;
+  fileUploadProgressOverrides?: Record<string, Partial<SessionFileUploadProgressPayload>>;
   relayClientPathOnly?: boolean;
 }
 
@@ -115,6 +119,23 @@ interface MockTerminalStream {
   watchUpdates: boolean;
 }
 
+interface MockFileUploadStream {
+  sessionId: UUID;
+  path: string;
+  sizeBytes: number;
+  offsetBytes: number;
+  chunks: Uint8Array[];
+  nextOutputSeq: number;
+}
+
+interface MockFileDownloadStream {
+  sessionId: UUID;
+  path: string;
+  bytes: Uint8Array;
+  offsetBytes: number;
+  nextOutputSeq: number;
+}
+
 interface MockConnection {
   id: number;
   socket: WebSocket;
@@ -125,6 +146,8 @@ interface MockConnection {
   watchedSessionIds: Set<UUID>;
   terminalStreamsById: Map<PacketStreamId, MockTerminalStream>;
   terminalStreamsBySession: Map<UUID, MockTerminalStream>;
+  fileUploadsById: Map<PacketStreamId, MockFileUploadStream>;
+  fileDownloadsById: Map<PacketStreamId, MockFileDownloadStream>;
   daemonE2eeExchange?: E2eeKeyExchangePayload;
   e2eeAuthTranscriptSha256?: string;
   activeRequest?: ProtocolPacket;
@@ -170,6 +193,7 @@ export class MockDaemon {
   public readonly sessionFileDownloadPrepareRequests: Array<{ session_id: UUID; path: string }> = [];
   public readonly sessionFileDownloadChunkRequests: Array<{ session_id: UUID; path: string; offset_bytes: number; max_bytes: number }> = [];
   public readonly sessionFileWrites: Array<{ session_id: UUID; path: string; text: string }> = [];
+  public readonly sessionFileBinaryWrites: Array<{ session_id: UUID; path: string; bytes: Uint8Array }> = [];
   public readonly sessionFileDeletes: Array<{ session_id: UUID; path: string }> = [];
   public readonly sessionGitRequests: Array<{ session_id: UUID }> = [];
   public readonly sessionGitActions: SessionGitActionPayload[] = [];
@@ -194,6 +218,7 @@ export class MockDaemon {
   private readonly connections = new Set<MockConnection>();
   private readonly sessionFilePositions = new Map<UUID, string>();
   private readonly sessionOutputSnapshots = new Map<UUID, string>();
+  private readonly fileStore = new Map<string, Uint8Array>();
 
   private constructor(
     private readonly server: WebSocketServer,
@@ -367,6 +392,8 @@ export class MockDaemon {
       watchedSessionIds: new Set(),
       terminalStreamsById: new Map(),
       terminalStreamsBySession: new Map(),
+      fileUploadsById: new Map(),
+      fileDownloadsById: new Map(),
     };
     this.connections.add(connection);
     this.acceptedConnections += 1;
@@ -554,10 +581,17 @@ export class MockDaemon {
     }
 
     if (packet.kind === "flow") {
+      if (packet.stream_id && connection.fileDownloadsById.has(packet.stream_id)) {
+        this.handleFileDownloadFlow(connection, packet);
+      }
       return;
     }
     if (packet.kind === "cancel") {
       this.removeTerminalStream(connection, packet.stream_id);
+      if (packet.stream_id) {
+        connection.fileUploadsById.delete(packet.stream_id);
+        connection.fileDownloadsById.delete(packet.stream_id);
+      }
       return;
     }
     if (packet.kind === "stream_chunk") {
@@ -566,6 +600,9 @@ export class MockDaemon {
     }
     if (packet.kind !== "request" && packet.kind !== "stream_open") {
       this.sendPacketError(connection, packet, "invalid_packet", "invalid protocol packet");
+      return;
+    }
+    if (packet.kind === "stream_open" && await this.handleFileStreamOpen(connection, packet)) {
       return;
     }
     if (packet.kind === "request" && await this.handleDirectPacketRequest(connection, packet)) {
@@ -592,6 +629,10 @@ export class MockDaemon {
   }
 
   private async handlePacketStreamChunk(connection: MockConnection, packet: ProtocolPacket): Promise<void> {
+    if (packet.stream_id && connection.fileUploadsById.has(packet.stream_id)) {
+      this.handleFileUploadChunk(connection, packet);
+      return;
+    }
     if (!packet.stream_id || !connection.terminalStreamsById.has(packet.stream_id)) {
       this.sendPacketError(connection, packet, "invalid_state", "invalid protocol state");
       return;
@@ -601,6 +642,147 @@ export class MockDaemon {
       await this.handleLegacyInner(connection, envelope("session_data", packet.payload));
     } finally {
       connection.activeStreamId = undefined;
+    }
+  }
+
+  private async handleFileStreamOpen(connection: MockConnection, packet: ProtocolPacket): Promise<boolean> {
+    if (!packet.stream_id) {
+      return false;
+    }
+    if (packet.method === "session.file_upload") {
+      const payload = packet.payload as { session_id: UUID; path: string; size_bytes: number };
+      if (!connection.attachedSessionIds.has(payload.session_id)) {
+        this.sendPacketError(connection, packet, "invalid_state", "invalid protocol state");
+        return true;
+      }
+      connection.fileUploadsById.set(packet.stream_id, {
+        sessionId: payload.session_id,
+        path: payload.path,
+        sizeBytes: payload.size_bytes,
+        offsetBytes: 0,
+        chunks: [],
+        nextOutputSeq: 1,
+      });
+      this.sendPacketResponse(connection, packet, {
+        session_id: payload.session_id,
+        path: payload.path,
+        size_bytes: payload.size_bytes,
+        offset_bytes: 0,
+      } satisfies SessionFileUploadReadyPayload);
+      return true;
+    }
+    if (packet.method === "session.file_download") {
+      const payload = packet.payload as { session_id: UUID; path: string };
+      if (!connection.attachedSessionIds.has(payload.session_id)) {
+        this.sendPacketError(connection, packet, "invalid_state", "invalid protocol state");
+        return true;
+      }
+      const bytes = this.fileStore.get(payload.path) ?? sessionDataFromBase64(this.options.sessionFileReads?.[payload.path]?.data_base64 ?? "");
+      connection.fileDownloadsById.set(packet.stream_id, {
+        sessionId: payload.session_id,
+        path: payload.path,
+        bytes,
+        offsetBytes: 0,
+        nextOutputSeq: 1,
+      });
+      this.sendPacketResponse(connection, packet, {
+        session_id: payload.session_id,
+        path: payload.path,
+        name: basenamePath(payload.path),
+        size_bytes: bytes.byteLength,
+        modified_at_ms: this.options.sessionFileReads?.[payload.path]?.modified_at_ms ?? null,
+      });
+      return true;
+    }
+    return false;
+  }
+
+  private handleFileUploadChunk(connection: MockConnection, packet: ProtocolPacket): void {
+    const streamId = packet.stream_id!;
+    const stream = connection.fileUploadsById.get(streamId);
+    if (!stream) {
+      this.sendPacketError(connection, packet, "invalid_state", "invalid protocol state");
+      return;
+    }
+    const payload = packet.payload as SessionFileTransferChunkPayload;
+    const bytes = payload.data_bytes ?? sessionDataFromBase64(payload.data_base64 ?? "");
+    if (payload.session_id !== stream.sessionId || payload.offset_bytes !== stream.offsetBytes || payload.size_bytes !== stream.sizeBytes) {
+      this.sendPacketError(connection, packet, "invalid_packet", "invalid file upload chunk");
+      return;
+    }
+    stream.chunks.push(bytes);
+    stream.offsetBytes += bytes.byteLength;
+    const complete = Boolean(payload.eof || stream.offsetBytes >= stream.sizeBytes);
+    if (complete) {
+      const uploaded = concatByteChunks(stream.chunks);
+      this.fileStore.set(stream.path, uploaded);
+      this.sessionFileBinaryWrites.push({ session_id: stream.sessionId, path: stream.path, bytes: uploaded });
+      connection.fileUploadsById.delete(streamId);
+    }
+    const progress: SessionFileUploadProgressPayload = {
+      session_id: stream.sessionId,
+      path: stream.path,
+      offset_bytes: stream.offsetBytes,
+      size_bytes: stream.sizeBytes,
+      eof: complete,
+      modified_at_ms: complete ? nowMs() : null,
+      ...(this.options.fileUploadProgressOverrides?.[stream.path] ?? {}),
+    };
+    this.sendPacket(connection, {
+      version: PROTOCOL_PACKET_VERSION,
+      kind: "stream_chunk",
+      stream_id: streamId,
+      seq: stream.nextOutputSeq,
+      payload: progress,
+    });
+    stream.nextOutputSeq += 1;
+    if (complete) {
+      this.sendPacket(connection, {
+        version: PROTOCOL_PACKET_VERSION,
+        kind: "stream_end",
+        stream_id: streamId,
+        seq: stream.nextOutputSeq,
+        payload: {},
+      });
+    }
+  }
+
+  private handleFileDownloadFlow(connection: MockConnection, packet: ProtocolPacket): void {
+    const streamId = packet.stream_id!;
+    const stream = connection.fileDownloadsById.get(streamId);
+    if (!stream) {
+      this.sendPacketError(connection, packet, "invalid_state", "invalid protocol state");
+      return;
+    }
+    const maxBytes = Math.max(1, Math.min(packet.credit ?? 256 * 1024, 256 * 1024));
+    const start = stream.offsetBytes;
+    const end = Math.min(stream.bytes.byteLength, start + maxBytes);
+    const bytes = stream.bytes.slice(start, end);
+    stream.offsetBytes = end;
+    const eof = end >= stream.bytes.byteLength;
+    this.sendPacket(connection, {
+      version: PROTOCOL_PACKET_VERSION,
+      kind: "stream_chunk",
+      stream_id: streamId,
+      seq: stream.nextOutputSeq,
+      payload: {
+        session_id: stream.sessionId,
+        offset_bytes: start,
+        data_bytes: bytes,
+        size_bytes: stream.bytes.byteLength,
+        eof,
+      } satisfies SessionFileTransferChunkPayload,
+    });
+    stream.nextOutputSeq += 1;
+    if (eof) {
+      connection.fileDownloadsById.delete(streamId);
+      this.sendPacket(connection, {
+        version: PROTOCOL_PACKET_VERSION,
+        kind: "stream_end",
+        stream_id: streamId,
+        seq: stream.nextOutputSeq,
+        payload: {},
+      });
     }
   }
 
@@ -991,11 +1173,11 @@ export class MockDaemon {
         return;
       }
       case "session_file_read": {
-        const payload = inner.payload as { session_id: UUID; path: string };
+        const payload = inner.payload as { session_id: UUID; path: string; max_bytes?: number };
         if (!this.ensureAttached(connection, payload.session_id)) {
           return;
         }
-        this.sessionFileReadRequests.push(payload);
+        this.sessionFileReadRequests.push({ session_id: payload.session_id, path: payload.path });
         const result =
           this.options.sessionFileReads?.[payload.path] ??
           ({
@@ -1005,6 +1187,10 @@ export class MockDaemon {
             size_bytes: 21,
             modified_at_ms: null,
           } satisfies SessionFileReadResultPayload);
+        if (payload.max_bytes !== undefined && result.size_bytes > payload.max_bytes) {
+          this.sendInner(connection, envelope("error", { code: "invalid_envelope", message: "message envelope is invalid" }));
+          return;
+        }
         this.sendInner(connection, envelope("session_file_read_result", result));
         return;
       }
@@ -1387,6 +1573,15 @@ export class MockDaemon {
       });
       return;
     }
+    if (packet.payload?.type === "file_chunk") {
+      this.binaryPacketLog.push({
+        direction,
+        kind: packet.kind,
+        payload_type: packet.payload.type,
+        data_text: decodeUtf8(packet.payload.data),
+      });
+      return;
+    }
     this.binaryPacketLog.push({
       direction,
       kind: packet.kind,
@@ -1533,11 +1728,39 @@ function protocolPacketToBinary(packet: ProtocolPacket): BinaryProtocolPacket {
     credit: packet.credit,
   };
   if (packet.kind === "stream_chunk") {
-    const payload = packet.payload as { session_id?: UUID; data_base64?: string; data_bytes?: Uint8Array; kind?: string };
+    const payload = packet.payload as {
+      session_id?: UUID;
+      data_base64?: string;
+      data_bytes?: Uint8Array;
+      kind?: string;
+      offset_bytes?: number;
+      size_bytes?: number;
+      eof?: boolean;
+    };
     if (payload.kind) {
       return {
         ...binary,
         payload: { type: "terminal_frame", frame: terminalFrameJsonToBinary(payload) },
+      };
+    }
+    if (
+      payload.session_id &&
+      typeof payload.offset_bytes === "number" &&
+      typeof payload.size_bytes === "number" &&
+      typeof payload.eof === "boolean" &&
+      (payload.data_bytes instanceof Uint8Array || typeof payload.data_base64 === "string")
+    ) {
+      const data = payload.data_bytes ?? base64ToBytes(payload.data_base64 ?? "");
+      return {
+        ...binary,
+        payload: {
+          type: "file_chunk",
+          session_id: payload.session_id,
+          offset_bytes: payload.offset_bytes,
+          data,
+          size_bytes: payload.size_bytes,
+          eof: payload.eof,
+        },
       };
     }
     if (payload.session_id && (typeof payload.data_base64 === "string" || payload.data_bytes instanceof Uint8Array)) {
@@ -1575,6 +1798,14 @@ function binaryPacketToProtocol(packet: BinaryProtocolPacket): ProtocolPacket {
     } satisfies SessionDataPayload;
   } else if (packet.payload?.type === "terminal_frame") {
     payload = terminalFrameBinaryToJson(packet.payload.frame);
+  } else if (packet.payload?.type === "file_chunk") {
+    payload = {
+      session_id: packet.payload.session_id,
+      offset_bytes: packet.payload.offset_bytes,
+      data_bytes: packet.payload.data,
+      size_bytes: packet.payload.size_bytes,
+      eof: packet.payload.eof,
+    } satisfies SessionFileTransferChunkPayload;
   } else if (packet.payload?.type === "error") {
     payload = {
       code: packet.payload.code,
@@ -1593,6 +1824,17 @@ function binaryPacketToProtocol(packet: BinaryProtocolPacket): ProtocolPacket {
     ...(packet.credit ? { credit: packet.credit } : {}),
     payload,
   };
+}
+
+function concatByteChunks(chunks: Uint8Array[]): Uint8Array {
+  const length = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
+  const out = new Uint8Array(length);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
 }
 
 function bytesFromWsMessage(raw: RawData): Uint8Array {

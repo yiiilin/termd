@@ -1,7 +1,7 @@
 {
   "name": "termd-termui-web",
   "private": true,
-  "version": "0.3.10",
+  "version": "0.3.11",
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1",
@@ -9,7 +9,8 @@
     "build": "tsc --noEmit -p tsconfig.json && vite build",
     "typecheck": "tsc --noEmit -p tsconfig.json --pretty false",
     "test": "vitest --config vitest.config.ts",
-    "test:e2e": "playwright test"
+    "test:e2e": "playwright test",
+    "test:e2e:real-relay-upload-300mb": "REAL_RELAY_UPLOAD_BYTES=314572800 playwright test tests/termui-web.real-relay.spec.ts -g \"relay Web \u4e0a\u4f20\u6587\u4ef6\" --project=chromium"
   },
   "dependencies": {
     "@noble/ciphers": "^1.3.0",

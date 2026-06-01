@@ -81,12 +81,9 @@ const CONNECTION_AUTO_RETRY_DELAY_MS = 1500;
 const CONNECTION_AUTO_RETRY_LIMIT = 3;
 const ATTACH_RECONNECT_DELAYS_MS = [250, 1000, 2500, 5000, 10000, 20000];
 const ATTACH_SWITCH_COALESCE_DELAY_MS = 80;
-const WORKSPACE_BLUR_REATTACH_AFTER_MS = 10_000;
 const FILES_CWD_FOLLOW_POLL_INTERVAL_MS = 1000;
 const TEXT_FILE_EDITOR_MAX_BYTES = 1024 * 1024;
 const FILE_TRANSFER_MEMORY_FALLBACK_MAX_BYTES = 16 * 1024 * 1024;
-const FILE_DOWNLOAD_CHUNK_BYTES = 256 * 1024;
-const FILE_UPLOAD_MAX_BYTES = 16 * 1024 * 1024;
 const RECEIVE_LOOP_YIELD_MESSAGES = 64;
 const RECEIVE_LOOP_YIELD_BYTES = 256 * 1024;
 const MOBILE_LAYOUT_QUERY = "(max-width: 760px)";
@@ -102,9 +99,29 @@ export const DAEMON_STATUS_POLL_INTERVAL_MS = 1000;
 // 普通前端操作走同一条可靠 WebSocket；relay 下终端输出可能排在 RPC 响应前面。
 // 5 秒给公网 relay 和浏览器调度留出缓冲，避免把短暂排队误报成“操作超时”。
 export const APP_CONNECTION_TIMEOUT_MS = 5000;
+// WebSocket 新建连接偶发卡住时，不能把整个 session attach 挂到 15 秒。
+// terminal snapshot 仍有自己的 attach timeout；这里只约束 route/E2EE 建连阶段。
+const APP_SOCKET_CONNECT_TIMEOUT_MS = 3000;
+// 中文注释：真实故障里慢点出现在 socket open 的 TCP/TLS/WebSocket 阶段。
+// 该阶段单独快速失败并重试，避免一次半卡住的 TLS 握手拖慢整个 relay attach。
+const APP_SOCKET_OPEN_TIMEOUT_MS = 1200;
+const APP_SOCKET_OPEN_HEDGE_DELAY_MS = 300;
+const APP_SOCKET_CONNECT_ATTEMPTS = 4;
+const APP_SOCKET_CONNECT_RETRY_DELAY_MS = 80;
 const PAIRING_CONNECTION_TIMEOUT_MS = 5000;
 const ATTACH_CONNECTION_TIMEOUT_MS = 15000;
 type AppSurface = "admin" | "workspace";
+
+interface FileTransferProgressState {
+  sessionId: UUID;
+  transferId: number;
+  name: string;
+  offsetBytes: number;
+  sizeBytes: number;
+  phase?: "sending" | "committing" | "confirmed";
+  completed?: boolean;
+}
+
 interface AttachUiOptions {
   closeMobilePanel?: boolean;
 }
@@ -178,28 +195,30 @@ function isPagePaused(): boolean {
   return isDocumentHidden() || isBrowserOffline();
 }
 
-function pageHiddenConnectionError(): ProtocolClientError {
-  return new ProtocolClientError("connection_closed", "connection paused while page is hidden or offline");
+function isTerminalTransportPaused(): boolean {
+  return isBrowserOffline();
 }
 
-function createVisibilityAbortController(): { controller: AbortController; dispose: () => void } | undefined {
-  if (typeof document === "undefined") {
+function terminalTransportPausedError(): ProtocolClientError {
+  return new ProtocolClientError("connection_closed", "connection paused while browser is offline");
+}
+
+function createTransportAbortController(): { controller: AbortController; dispose: () => void } | undefined {
+  if (typeof window === "undefined") {
     return undefined;
   }
   const controller = new AbortController();
-  const abortWhenHidden = () => {
-    if (isPagePaused()) {
+  const abortWhenOffline = () => {
+    if (isTerminalTransportPaused()) {
       controller.abort();
     }
   };
-  document.addEventListener("visibilitychange", abortWhenHidden);
-  window.addEventListener("offline", abortWhenHidden);
-  abortWhenHidden();
+  window.addEventListener("offline", abortWhenOffline);
+  abortWhenOffline();
   return {
     controller,
     dispose: () => {
-      document.removeEventListener("visibilitychange", abortWhenHidden);
-      window.removeEventListener("offline", abortWhenHidden);
+      window.removeEventListener("offline", abortWhenOffline);
     },
   };
 }
@@ -261,6 +280,15 @@ function abortableConnectionStep<T>(promise: Promise<T>, signal?: AbortSignal): 
   });
 }
 
+function waitForConnectionRetryDelay(signal?: AbortSignal): Promise<void> {
+  return abortableConnectionStep(
+    new Promise((resolve) => {
+      globalThis.setTimeout(resolve, APP_SOCKET_CONNECT_RETRY_DELAY_MS);
+    }),
+    signal,
+  );
+}
+
 export interface DaemonNetworkCounterSample {
   rxBytes: number;
   txBytes: number;
@@ -302,6 +330,8 @@ export default function App() {
   const [sessionFilesLoading, setSessionFilesLoading] = useState(false);
   const [sessionFilesError, setSessionFilesError] = useState<SafeError | undefined>();
   const [sessionFilesFollowTerminalCwd, setSessionFilesFollowTerminalCwd] = useState(true);
+  const [sessionFileUploadProgress, setSessionFileUploadProgress] = useState<FileTransferProgressState | undefined>();
+  const [sessionFileDownloadProgress, setSessionFileDownloadProgress] = useState<FileTransferProgressState | undefined>();
   const [sessionFilesPanelTab, setSessionFilesPanelTab] = useState<"files" | "git">("files");
   const [sessionGit, setSessionGit] = useState<SessionGitResultPayload | undefined>();
   const [sessionGitLoading, setSessionGitLoading] = useState(false);
@@ -366,6 +396,11 @@ export default function App() {
   const renamingSessionIdRef = useRef<UUID | undefined>(undefined);
   const filesPanelWidthRef = useRef(DEFAULT_FILES_PANEL_WIDTH);
   const sessionFilesFollowTerminalCwdRef = useRef(sessionFilesFollowTerminalCwd);
+  const sessionFileUploadProgressClearTimeoutRef = useRef<number | undefined>(undefined);
+  const sessionFileDownloadProgressClearTimeoutRef = useRef<number | undefined>(undefined);
+  const fileTransferIdRef = useRef(0);
+  const activeUploadTransferIdRef = useRef<number | undefined>(undefined);
+  const activeDownloadTransferIdRef = useRef<number | undefined>(undefined);
   const sessionFilesRequestSeqRef = useRef(0);
   const sessionGitRequestSeqRef = useRef(0);
   const sessionFilesFollowRefreshInFlightRef = useRef(false);
@@ -397,8 +432,6 @@ export default function App() {
   const attachReconnectAttemptsRef = useRef(0);
   const attachReconnectLastErrorRef = useRef<unknown>(undefined);
   const attachReconnectHandlerRef = useRef<(client: DirectClient, caught: unknown, options?: AttachReconnectOptions) => boolean>(() => false);
-  const workspacePausedAtRef = useRef<number | undefined>(undefined);
-  const workspacePausedByVisibilityRef = useRef(false);
   const daemonNetworkSampleRef = useRef<DaemonNetworkCounterSample | undefined>(undefined);
   const daemonStatusRefreshInFlightRef = useRef(false);
   const daemonStatusRequestSeqRef = useRef(0);
@@ -453,6 +486,99 @@ export default function App() {
     sessionFilesFollowTerminalCwdRef.current = sessionFilesFollowTerminalCwd;
   }, [sessionFilesFollowTerminalCwd]);
 
+  const nextFileTransferId = useCallback(() => {
+    fileTransferIdRef.current += 1;
+    return fileTransferIdRef.current;
+  }, []);
+
+  const clearSessionFileUploadProgressTimer = useCallback(() => {
+    if (sessionFileUploadProgressClearTimeoutRef.current !== undefined) {
+      window.clearTimeout(sessionFileUploadProgressClearTimeoutRef.current);
+      sessionFileUploadProgressClearTimeoutRef.current = undefined;
+    }
+  }, []);
+
+  const clearSessionFileDownloadProgressTimer = useCallback(() => {
+    if (sessionFileDownloadProgressClearTimeoutRef.current !== undefined) {
+      window.clearTimeout(sessionFileDownloadProgressClearTimeoutRef.current);
+      sessionFileDownloadProgressClearTimeoutRef.current = undefined;
+    }
+  }, []);
+
+  const updateUploadProgressForTransfer = useCallback((
+    transferId: number,
+    sessionId: UUID,
+    progress: Omit<FileTransferProgressState, "sessionId" | "transferId">,
+  ) => {
+    // 中文注释：上传使用独立的会话操作 client；用户切到其他 session 时传输仍可继续。
+    // 因此进度只能按 transferId 判定是否过期，不能用当前 attached session 过滤掉。
+    if (activeUploadTransferIdRef.current !== transferId) {
+      return;
+    }
+    setSessionFileUploadProgress((current) => {
+      if (!current || current.transferId !== transferId) {
+        return current;
+      }
+      const offsetBytes = Math.max(current.offsetBytes, progress.offsetBytes);
+      const completed = current.completed || progress.completed;
+      // 中文注释：HTTP 上传现在允许 2 并发；sent progress 和 committed progress
+      // 可能乱序到达。UI 状态必须只前进，不能被较旧的 non-eof 响应拉回。
+      return {
+        sessionId,
+        transferId,
+        ...progress,
+        offsetBytes,
+        phase: completed ? "confirmed" : progress.phase,
+        completed,
+      };
+    });
+  }, []);
+
+  const updateDownloadProgressForTransfer = useCallback((
+    transferId: number,
+    sessionId: UUID,
+    progress: Omit<FileTransferProgressState, "sessionId" | "transferId">,
+  ) => {
+    // 中文注释：下载同样可能跨 session 切换继续执行，进度条应保持到传输完成或失败。
+    if (activeDownloadTransferIdRef.current !== transferId) {
+      return;
+    }
+    setSessionFileDownloadProgress((current) => {
+      if (!current || current.transferId !== transferId) {
+        return current;
+      }
+      return { sessionId, transferId, ...progress };
+    });
+  }, []);
+
+  const scheduleUploadProgressClear = useCallback((transferId: number) => {
+    if (activeUploadTransferIdRef.current !== transferId) {
+      return;
+    }
+    clearSessionFileUploadProgressTimer();
+    sessionFileUploadProgressClearTimeoutRef.current = window.setTimeout(() => {
+      if (activeUploadTransferIdRef.current === transferId) {
+        activeUploadTransferIdRef.current = undefined;
+        setSessionFileUploadProgress((current) => current?.transferId === transferId ? undefined : current);
+      }
+      sessionFileUploadProgressClearTimeoutRef.current = undefined;
+    }, 1200);
+  }, [clearSessionFileUploadProgressTimer]);
+
+  const scheduleDownloadProgressClear = useCallback((transferId: number) => {
+    if (activeDownloadTransferIdRef.current !== transferId) {
+      return;
+    }
+    clearSessionFileDownloadProgressTimer();
+    sessionFileDownloadProgressClearTimeoutRef.current = window.setTimeout(() => {
+      if (activeDownloadTransferIdRef.current === transferId) {
+        activeDownloadTransferIdRef.current = undefined;
+        setSessionFileDownloadProgress((current) => current?.transferId === transferId ? undefined : current);
+      }
+      sessionFileDownloadProgressClearTimeoutRef.current = undefined;
+    }, 1200);
+  }, [clearSessionFileDownloadProgressTimer]);
+
   useEffect(() => {
     void loadBrowserState().then((loaded) => {
       setState(loaded);
@@ -488,9 +614,11 @@ export default function App() {
         window.clearTimeout(attachReconnectTimerRef.current);
         attachReconnectTimerRef.current = undefined;
       }
+      clearSessionFileUploadProgressTimer();
+      clearSessionFileDownloadProgressTimer();
       closeWorkspaceClient();
     };
-  }, [closeWorkspaceClient]);
+  }, [clearSessionFileDownloadProgressTimer, clearSessionFileUploadProgressTimer, closeWorkspaceClient]);
 
   useEffect(() => {
     renamingSessionIdRef.current = renamingSessionId;
@@ -1115,11 +1243,13 @@ export default function App() {
     if (!server || !device) {
       throw new ProtocolClientError("missing_pairing", "device is not paired");
     }
-    if (isPagePaused()) {
-      throw pageHiddenConnectionError();
+    if (isTerminalTransportPaused()) {
+      throw terminalTransportPausedError();
     }
-    const visibilityAbort = createVisibilityAbortController();
-    const linkedAbort = createLinkedAbortController(signal, visibilityAbort?.controller.signal);
+    // 中文注释：document hidden 不能中断 terminal WebSocket。后台标签页仍应继续接收
+    // stdout；这里只在浏览器明确 offline 时取消建连，避免恢复可见时被迫 snapshot 重绘。
+    const transportAbort = createTransportAbortController();
+    const linkedAbort = createLinkedAbortController(signal, transportAbort?.controller.signal);
     const abortSignal = linkedAbort?.controller.signal;
     let client: DirectClient | undefined;
     const closeClientOnAbort = () => client?.close();
@@ -1127,21 +1257,46 @@ export default function App() {
     const routeUrl = routeWsUrlForKnownServer(reachableUrl, server.server_id) ?? reachableUrl;
     try {
       throwIfConnectionAborted(abortSignal);
-      client = await DirectClient.connect(routeUrl, server.server_id, device.device_id, {
-        expectedDaemonPublicKey: server.daemon_public_key,
-        timeoutMs,
-        requestTimeoutMs: APP_CONNECTION_TIMEOUT_MS,
-        signal: abortSignal,
-      });
+      let lastConnectError: unknown;
+      const connectTimeoutMs = Math.min(timeoutMs, APP_SOCKET_CONNECT_TIMEOUT_MS);
+      for (let attempt = 1; attempt <= APP_SOCKET_CONNECT_ATTEMPTS; attempt += 1) {
+        try {
+          client = await DirectClient.connect(routeUrl, server.server_id, device.device_id, {
+            expectedDaemonPublicKey: server.daemon_public_key,
+            timeoutMs: connectTimeoutMs,
+            socketOpenTimeoutMs: Math.min(connectTimeoutMs, APP_SOCKET_OPEN_TIMEOUT_MS),
+            socketOpenHedgeDelayMs: APP_SOCKET_OPEN_HEDGE_DELAY_MS,
+            requestTimeoutMs: APP_CONNECTION_TIMEOUT_MS,
+            signal: abortSignal,
+          });
+          break;
+        } catch (caught) {
+          lastConnectError = caught;
+          client?.close();
+          client = undefined;
+          if (
+            attempt >= APP_SOCKET_CONNECT_ATTEMPTS ||
+            abortSignal?.aborted ||
+            isTerminalTransportPaused() ||
+            !isRetryableConnectionError(caught)
+          ) {
+            throw caught;
+          }
+          await waitForConnectionRetryDelay(abortSignal);
+        }
+      }
+      if (!client) {
+        throw lastConnectError ?? new ProtocolClientError("connection_error", "connection error");
+      }
       abortSignal?.addEventListener("abort", closeClientOnAbort, { once: true });
-      if (abortSignal?.aborted || isPagePaused()) {
-        throw pageHiddenConnectionError();
+      if (abortSignal?.aborted || isTerminalTransportPaused()) {
+        throw terminalTransportPausedError();
       }
       // 中文注释：connect 后的 auth 仍属于同一个 workspace 建连生命周期；
       // session 切换 abort 时要立刻 reject 并关闭 socket，不能等 request timeout。
       await abortableConnectionStep(client.authenticate(device, { ...server, url: routeUrl }), abortSignal);
-      if (abortSignal?.aborted || isPagePaused()) {
-        throw pageHiddenConnectionError();
+      if (abortSignal?.aborted || isTerminalTransportPaused()) {
+        throw terminalTransportPausedError();
       }
       return client;
     } catch (caught) {
@@ -1152,7 +1307,7 @@ export default function App() {
     } finally {
       abortSignal?.removeEventListener("abort", closeClientOnAbort);
       linkedAbort?.dispose();
-      visibilityAbort?.dispose();
+      transportAbort?.dispose();
     }
   }, [activeServer, state.device]);
 
@@ -1161,7 +1316,22 @@ export default function App() {
     if (existing && !existing.isClosed) {
       return existing;
     }
+    if (!existing && attachedSessionRef.current) {
+      // 中文注释：terminal reconnect 窗口里 attachedSessionRef 会保留当前会话，
+      // attachClientRef 可能已被 closeWorkspaceClient 清空。此时 metadata/files/git
+      // 不能抢先创建认证-only WebSocket，否则会覆盖后续 terminal attach 的主连接。
+      throw new ProtocolClientError("connection_closed", "terminal connection is reconnecting");
+    }
     if (existing?.isClosed) {
+      if (attachedSessionRef.current) {
+        const error = new ProtocolClientError("connection_closed", "terminal connection closed");
+        // 中文注释：已有 attached session 时，关闭的 terminal client 不能被普通
+        // metadata refresh 悄悄替换成“只认证未 terminal.attach”的 WebSocket。
+        // 否则会出现上行 RPC 还能发、下行 terminal stream 不再消费的半活状态。
+        if (attachReconnectHandlerRef.current(existing, error)) {
+          throw error;
+        }
+      }
       attachClientRef.current = undefined;
       sessionPermissionIdsRef.current.clear();
     }
@@ -1220,6 +1390,22 @@ export default function App() {
       return { client: await authenticatedSessionClient(sessionId), ownsClient: false };
     },
     [authenticatedSessionClient],
+  );
+
+  const openSessionOperationClient = useCallback(
+    async (sessionId: UUID): Promise<{ client: DirectClient; ownsClient: true }> => {
+      const client = await authenticatedClient(APP_CONNECTION_TIMEOUT_MS);
+      try {
+        // 文件上传/下载不应排在当前 terminal stream 的大 snapshot 后面。
+        // 独立 permission-only 连接只拿 session 操作权限，不订阅 stdout。
+        await client.attachSessionPermission(sessionId);
+        return { client, ownsClient: true };
+      } catch (caught) {
+        client.close();
+        throw caught;
+      }
+    },
+    [authenticatedClient],
   );
 
   const loadSessionFiles = useCallback(
@@ -1764,9 +1950,9 @@ export default function App() {
     discardPendingTerminalOutput();
     setError(undefined);
 
-    if (isPagePaused()) {
-      // 中文注释：offline/hidden 期间不主动建新 WebSocket；恢复事件会按当前
-      // session 重新进入 handleRetryConnection，避免离线时的半开连接和浏览器报错。
+    if (isTerminalTransportPaused()) {
+      // 中文注释：offline 期间不主动建新 WebSocket；恢复事件会按当前
+      // session 重新进入 handleRetryConnection。hidden/blur 不应暂停 terminal stream。
       setStatus("ready");
       return true;
     }
@@ -1790,7 +1976,7 @@ export default function App() {
       void (async () => {
         let client: DirectClient | undefined;
         try {
-          if (isPagePaused()) {
+          if (isTerminalTransportPaused()) {
             setStatus("ready");
             return;
           }
@@ -1980,8 +2166,13 @@ export default function App() {
         const shouldRefreshCurrentAttach =
           reattachCurrentSessionOnOpenRef.current &&
           attachedSessionRef.current === sessionId &&
-          Boolean(attachClientRef.current);
-        if (attachedSessionRef.current === sessionId && attachClientRef.current && !shouldRefreshCurrentAttach) {
+          Boolean(attachClientRef.current && !attachClientRef.current.isClosed);
+        if (
+          attachedSessionRef.current === sessionId &&
+          attachClientRef.current &&
+          !attachClientRef.current.isClosed &&
+          !shouldRefreshCurrentAttach
+        ) {
           clearNewOutputMark(sessionId);
           setStatus("attached");
           closeMobileAttachChrome();
@@ -2105,7 +2296,12 @@ export default function App() {
       if (attachingSessionIdRef.current === sessionId) {
         return;
       }
-      if (attachedSessionRef.current === sessionId && attachClientRef.current && !reattachCurrentSessionOnOpenRef.current) {
+      if (
+        attachedSessionRef.current === sessionId &&
+        attachClientRef.current &&
+        !attachClientRef.current.isClosed &&
+        !reattachCurrentSessionOnOpenRef.current
+      ) {
         setStatus("attached");
         return;
       }
@@ -2264,7 +2460,7 @@ export default function App() {
   ]);
 
   const handleRetryConnection = useCallback(async () => {
-    if (isPagePaused()) {
+    if (isTerminalTransportPaused()) {
       return;
     }
     const sessionId = attachedSessionRef.current ?? attachedSessionId ?? selectedSessionId;
@@ -2341,19 +2537,10 @@ export default function App() {
   }, [activeServer?.server_id, activeSurface, attachedSessionId, error, handleRetryConnection, hasPairedServer, selectedSessionId]);
 
   useEffect(() => {
-    const rememberWorkspacePause = (byVisibility: boolean) => {
-      if (activeSurface !== "workspace") {
-        return;
-      }
-      workspacePausedAtRef.current = Date.now();
-      workspacePausedByVisibilityRef.current = workspacePausedByVisibilityRef.current || byVisibility;
-    };
-
     const pauseOfflineConnection = () => {
       if (activeSurface !== "workspace") {
         return;
       }
-      rememberWorkspacePause(false);
       // 中文注释：浏览器切 offline 时，WebSocket 不一定会立刻触发 close。
       // 主动丢弃旧 transport，避免恢复后继续向半开连接写 terminal.attach/input。
       closeWorkspaceClient();
@@ -2363,28 +2550,13 @@ export default function App() {
       if (isPagePaused() || activeSurface !== "workspace") {
         return;
       }
-      const pausedAt = workspacePausedAtRef.current;
-      const wasHidden = workspacePausedByVisibilityRef.current;
-      workspacePausedAtRef.current = undefined;
-      workspacePausedByVisibilityRef.current = false;
-      const pausedLongEnough =
-        pausedAt !== undefined && Date.now() - pausedAt >= WORKSPACE_BLUR_REATTACH_AFTER_MS;
-      if (
-        (attachedSessionId || selectedSessionId) &&
-        (wasHidden || pausedLongEnough || !attachClientRef.current)
-      ) {
-        // 中文注释：后台标签页和长时间失焦后，浏览器 WebSocket 可能已经半开。
-        // 恢复时按当前 session 重建 terminal 连接，比继续复用旧 transport 后等待超时更稳。
-        void handleRetryConnection().finally(scheduleResumeMetadataRefresh);
-        return;
-      }
-      // 页面从后台回来后只做一次主动恢复；hidden 期间的轮询/重试已经暂停，
-      // 避免浏览器恢复时把过期定时器一次性打到 relay 上。
+      // 中文注释：hidden/blur 不能再作为 terminal WebSocket 的断开依据。
+      // 如果连接还在，就继续让后台收到的 stdout 留在同一条流里；恢复可见时只补旁路元数据。
       if (error) {
         void handleRetryConnection().finally(scheduleResumeMetadataRefresh);
         return;
       }
-      if ((attachedSessionId || selectedSessionId) && !attachClientRef.current) {
+      if ((attachedSessionId || selectedSessionId) && (!attachClientRef.current || attachClientRef.current.isClosed)) {
         void handleRetryConnection().finally(scheduleResumeMetadataRefresh);
         return;
       }
@@ -2402,21 +2574,17 @@ export default function App() {
 
     const handleVisibilityChange = () => {
       if (document.visibilityState === "hidden") {
-        rememberWorkspacePause(true);
         return;
       }
       resumeVisibleConnection();
     };
-    const handleWindowBlur = () => rememberWorkspacePause(false);
 
     document.addEventListener("visibilitychange", handleVisibilityChange);
-    window.addEventListener("blur", handleWindowBlur);
     window.addEventListener("focus", resumeVisibleConnection);
     window.addEventListener("offline", pauseOfflineConnection);
     window.addEventListener("online", resumeVisibleConnection);
     return () => {
       document.removeEventListener("visibilitychange", handleVisibilityChange);
-      window.removeEventListener("blur", handleWindowBlur);
       window.removeEventListener("focus", resumeVisibleConnection);
       window.removeEventListener("offline", pauseOfflineConnection);
       window.removeEventListener("online", resumeVisibleConnection);
@@ -2869,30 +3037,74 @@ export default function App() {
       if (!sessionId) {
         return;
       }
-      if (file.size > FILE_UPLOAD_MAX_BYTES) {
-        setSessionFilesError({
-          code: "file_too_large",
-          message: "file is too large to upload in browser",
-        });
-        return;
-      }
+      const transferId = nextFileTransferId();
+      const uploadPath = joinRemotePath(sessionFiles?.path ?? "", file.name);
+      activeUploadTransferIdRef.current = transferId;
+      clearSessionFileUploadProgressTimer();
+      setSessionFileUploadProgress({
+        sessionId,
+        transferId,
+        name: file.name,
+        offsetBytes: 0,
+        sizeBytes: file.size,
+        phase: "sending",
+        completed: false,
+      });
       setSessionFilesLoading(true);
       setSessionFilesError(undefined);
       let sessionClient: { client: DirectClient; ownsClient: boolean } | undefined;
       try {
-        sessionClient = await resolveSessionScopedClient(sessionId);
-        await sessionClient.client.writeSessionFile(sessionId, joinRemotePath(sessionFiles?.path ?? "", file.name), await fileToBytes(file));
-        await loadSessionFiles(sessionId, sessionFiles?.path, { source: "manual" });
+        sessionClient = await openSessionOperationClient(sessionId);
+        await sessionClient.client.uploadSessionFile(sessionId, uploadPath, file, {
+          onProgress: (progress) => {
+            updateUploadProgressForTransfer(transferId, sessionId, {
+              name: file.name,
+              offsetBytes: progress.offset_bytes,
+              sizeBytes: progress.size_bytes,
+              phase: progress.eof ? "confirmed" : "committing",
+              completed: progress.eof,
+            });
+          },
+          onSentProgress: (sentBytes, sizeBytes) => {
+            updateUploadProgressForTransfer(transferId, sessionId, {
+              name: file.name,
+              offsetBytes: sentBytes,
+              sizeBytes,
+              phase: sentBytes >= sizeBytes ? "committing" : "sending",
+              completed: false,
+            });
+          },
+        });
+        const refreshed = await sessionClient.client.listSessionFiles(sessionId, sessionFiles?.path);
+        if (attachedSessionRef.current === sessionId) {
+          setSessionFiles(refreshed);
+          setSessionFilesError(undefined);
+        }
       } catch (caught) {
-        setSessionFilesError(toSafeError(caught));
+        // 中文注释：上传可能在用户切到其他 session 后才失败；
+        // 旧 session 的错误不能污染当前文件 panel。
+        if (attachedSessionRef.current === sessionId) {
+          setSessionFilesError(toSafeError(caught));
+        }
       } finally {
         if (sessionClient?.ownsClient) {
           sessionClient.client.close();
         }
-        setSessionFilesLoading(false);
+        // 完成后保留很短时间，避免小文件上传时进度条一闪而过。
+        scheduleUploadProgressClear(transferId);
+        if (attachedSessionRef.current === sessionId) {
+          setSessionFilesLoading(false);
+        }
       }
     },
-    [loadSessionFiles, resolveSessionScopedClient, sessionFiles?.path],
+    [
+      clearSessionFileUploadProgressTimer,
+      nextFileTransferId,
+      openSessionOperationClient,
+      scheduleUploadProgressClear,
+      sessionFiles?.path,
+      updateUploadProgressForTransfer,
+    ],
   );
 
   const handleOpenFile = useCallback(
@@ -2996,25 +3208,54 @@ export default function App() {
   );
 
   const handleDownloadFile = useCallback(
-    async (entry: { name: string; path: string }) => {
+    async (entry: { name: string; path: string; size_bytes?: number }) => {
       const sessionId = attachedSessionRef.current;
       if (!sessionId) {
         return;
       }
+      const transferId = nextFileTransferId();
+      activeDownloadTransferIdRef.current = transferId;
+      clearSessionFileDownloadProgressTimer();
+      setSessionFileDownloadProgress({
+        sessionId,
+        transferId,
+        name: entry.name,
+        offsetBytes: 0,
+        sizeBytes: entry.size_bytes ?? 0,
+        completed: false,
+      });
       setSessionFilesError(undefined);
       let sessionClient: { client: DirectClient; ownsClient: boolean } | undefined;
       try {
-        sessionClient = await resolveSessionScopedClient(sessionId);
-        await downloadSessionFile(sessionClient.client, sessionId, entry.name, entry.path);
+        sessionClient = await openSessionOperationClient(sessionId);
+        await downloadSessionFile(sessionClient.client, sessionId, entry.name, entry.path, (receivedBytes, sizeBytes, completed) => {
+          updateDownloadProgressForTransfer(transferId, sessionId, {
+            name: entry.name,
+            offsetBytes: receivedBytes,
+            sizeBytes,
+            completed,
+          });
+        });
       } catch (caught) {
-        setSessionFilesError(toSafeError(caught));
+        // 中文注释：下载错误只属于发起下载的 session；切换后不覆盖新 session 文件状态。
+        if (attachedSessionRef.current === sessionId) {
+          setSessionFilesError(toSafeError(caught));
+        }
       } finally {
         if (sessionClient?.ownsClient) {
           sessionClient.client.close();
         }
+        // 完成或失败后短暂停留，给用户看清最后一次传输状态。
+        scheduleDownloadProgressClear(transferId);
       }
     },
-    [resolveSessionScopedClient],
+    [
+      clearSessionFileDownloadProgressTimer,
+      nextFileTransferId,
+      openSessionOperationClient,
+      scheduleDownloadProgressClear,
+      updateDownloadProgressForTransfer,
+    ],
   );
 
   const handleDeleteFile = useCallback(
@@ -3570,6 +3811,8 @@ export default function App() {
                     files={sessionFiles}
                     loading={sessionFilesLoading}
                     error={sessionFilesError}
+                    uploadProgress={sessionFileUploadProgress}
+                    downloadProgress={sessionFileDownloadProgress}
                     git={sessionGit}
                     gitLoading={sessionGitLoading}
                     gitError={sessionGitError}
@@ -3679,6 +3922,8 @@ export default function App() {
               files={sessionFiles}
               loading={sessionFilesLoading}
               error={sessionFilesError}
+              uploadProgress={sessionFileUploadProgress}
+              downloadProgress={sessionFileDownloadProgress}
               git={sessionGit}
               gitLoading={sessionGitLoading}
               gitError={sessionGitError}
@@ -4564,23 +4809,23 @@ function normalizeRemotePath(path: string): string {
   return parts.join("/") || ".";
 }
 
-function fileToBytes(file: File): Promise<Uint8Array> {
-  if (typeof file.arrayBuffer === "function") {
-    return file.arrayBuffer().then((buffer) => new Uint8Array(buffer));
+function remoteParentPath(path: string): string {
+  const normalized = normalizeRemotePath(path || "/");
+  const index = normalized.lastIndexOf("/");
+  if (index <= 0) {
+    return "/";
   }
+  return normalized.slice(0, index);
+}
 
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.addEventListener("load", () => {
-      if (reader.result instanceof ArrayBuffer) {
-        resolve(new Uint8Array(reader.result));
-        return;
-      }
-      reject(new Error("invalid_file_data"));
-    });
-    reader.addEventListener("error", () => reject(reader.error ?? new Error("file_read_failed")));
-    reader.readAsArrayBuffer(file);
-  });
+async function getSessionFileEntry(
+  client: DirectClient,
+  sessionId: UUID,
+  path: string,
+): Promise<SessionFileEntryPayload | undefined> {
+  const normalized = normalizeRemotePath(path);
+  const files = await client.listSessionFiles(sessionId, remoteParentPath(normalized));
+  return files.entries.find((entry) => entry.path === normalized);
 }
 
 async function readEditableSessionFile(
@@ -4588,37 +4833,18 @@ async function readEditableSessionFile(
   sessionId: UUID,
   path: string,
 ): Promise<{ path: string; bytes: Uint8Array }> {
-  let offset = 0;
-  let resolvedPath = path;
-  let totalBytes = 0;
-  const chunks: Uint8Array[] = [];
-
-  while (true) {
-    const chunk = await client.readSessionFileDownloadChunk(sessionId, path, offset, FILE_DOWNLOAD_CHUNK_BYTES);
-    if (chunk.size_bytes > TEXT_FILE_EDITOR_MAX_BYTES) {
-      throw new ProtocolClientError("file_too_large", "file is too large to edit in browser");
-    }
-    const bytes = sessionDataFromBase64(chunk.data_base64);
-    if (bytes.includes(0)) {
-      throw new ProtocolClientError("binary_file", "binary files cannot be edited in browser");
-    }
-    totalBytes += bytes.byteLength;
-    if (totalBytes > TEXT_FILE_EDITOR_MAX_BYTES) {
-      throw new ProtocolClientError("file_too_large", "file is too large to edit in browser");
-    }
-    chunks.push(bytes);
-    resolvedPath = chunk.path;
-    if (chunk.eof) {
-      break;
-    }
-    if (chunk.next_offset_bytes <= offset) {
-      // daemon 必须单调推进 offset，否则前端会无限循环等待同一个 chunk。
-      throw new ProtocolClientError("invalid_file_chunk", "file chunk did not advance");
-    }
-    offset = chunk.next_offset_bytes;
+  const payload = await client.readSessionFile(sessionId, path, { maxBytes: TEXT_FILE_EDITOR_MAX_BYTES });
+  if (payload.size_bytes > TEXT_FILE_EDITOR_MAX_BYTES) {
+    throw new ProtocolClientError("file_too_large", "file is too large to edit in browser");
   }
-
-  return { path: resolvedPath, bytes: concatByteChunks(chunks) };
+  const bytes = sessionDataFromBase64(payload.data_base64);
+  if (bytes.byteLength > TEXT_FILE_EDITOR_MAX_BYTES) {
+    throw new ProtocolClientError("file_too_large", "file is too large to edit in browser");
+  }
+  if (bytes.includes(0)) {
+    throw new ProtocolClientError("binary_file", "binary files cannot be edited in browser");
+  }
+  return { path: payload.path, bytes };
 }
 
 async function downloadSessionFile(
@@ -4626,70 +4852,143 @@ async function downloadSessionFile(
   sessionId: UUID,
   name: string,
   path: string,
+  onProgress?: (receivedBytes: number, sizeBytes: number, completed: boolean) => void,
 ): Promise<void> {
   const writer = await createDownloadWriter(name);
   if (writer) {
-    let offset = 0;
+    let completed = false;
+    let lastReceivedBytes = 0;
+    let lastSizeBytes = 0;
     try {
-      while (true) {
-        const chunk = await client.readSessionFileDownloadChunk(sessionId, path, offset, FILE_DOWNLOAD_CHUNK_BYTES);
-        const bytes = sessionDataFromBase64(chunk.data_base64);
-        await writer.write(bytes);
-        offset = chunk.next_offset_bytes;
-        if (chunk.eof) {
-          break;
+      await client.downloadSessionFile(sessionId, path, {
+        collectBytes: false,
+        onChunk: (bytes) => writer.write(bytes),
+        onProgress: (receivedBytes, sizeBytes) => {
+          lastReceivedBytes = receivedBytes;
+          lastSizeBytes = sizeBytes;
+          // 中文注释：showSaveFilePicker 的 close 才是真正提交文件；
+          // 最后一帧先不显示 100%，避免 close 失败时误导用户已经保存成功。
+          if (receivedBytes < sizeBytes) {
+            onProgress?.(receivedBytes, sizeBytes, false);
+          }
+        },
+      });
+      completed = true;
+    } finally {
+      // 中文注释：streaming writer 的 close 会提交文件；下载校验失败或网络中断时必须 abort，
+      // 否则浏览器可能把半截文件落盘。
+      if (completed) {
+        try {
+          await writer.close();
+        } catch (error) {
+          // 中文注释：close 失败表示浏览器提交文件失败；尽量 abort 让底层 writer 回滚，
+          // 但保留原始 close 错误给调用方展示。
+          if (writer.abort) {
+            try {
+              await writer.abort();
+            } catch {
+              // 保留 close 的原始错误。
+            }
+          }
+          throw error;
+        }
+        onProgress?.(lastSizeBytes || lastReceivedBytes, lastSizeBytes || lastReceivedBytes, true);
+      } else if (writer.abort) {
+        try {
+          await writer.abort();
+        } catch {
+          // 中文注释：abort 是清理动作；下载/写入的原始错误才是用户需要看到的失败原因。
         }
       }
-    } finally {
-      await writer.close();
     }
     return;
   }
 
-  let offset = 0;
-  let sizeBytes: number | undefined;
-  const chunks: Uint8Array[] = [];
-  while (true) {
-    const chunk = await client.readSessionFileDownloadChunk(sessionId, path, offset, FILE_DOWNLOAD_CHUNK_BYTES);
-    sizeBytes = chunk.size_bytes;
-    if (sizeBytes > FILE_TRANSFER_MEMORY_FALLBACK_MAX_BYTES) {
-      throw new ProtocolClientError("file_too_large", "browser streaming download is unavailable for this file");
-    }
-    const bytes = sessionDataFromBase64(chunk.data_base64);
-    chunks.push(bytes);
-    offset = chunk.next_offset_bytes;
-    if (chunk.eof) {
-      break;
-    }
+  const entry = await getSessionFileEntry(client, sessionId, path);
+  if (!entry || entry.kind !== "file") {
+    throw new ProtocolClientError("file_not_found", "file not found");
   }
-  triggerBrowserDownload(name, concatByteChunks(chunks));
+  if (entry.size_bytes > FILE_TRANSFER_MEMORY_FALLBACK_MAX_BYTES) {
+    throw new ProtocolClientError("file_too_large", "browser streaming download is unavailable for this file");
+  }
+  const chunks: Uint8Array[] = [];
+  let lastReceivedBytes = 0;
+  let lastSizeBytes = entry.size_bytes;
+  await client.downloadSessionFile(sessionId, path, {
+    collectBytes: false,
+    onChunk: (bytes, receivedBytes, sizeBytes) => {
+      if (sizeBytes > FILE_TRANSFER_MEMORY_FALLBACK_MAX_BYTES || receivedBytes > FILE_TRANSFER_MEMORY_FALLBACK_MAX_BYTES) {
+        throw new ProtocolClientError("file_too_large", "browser streaming download is unavailable for this file");
+      }
+      chunks.push(bytes);
+    },
+    onProgress: (receivedBytes, sizeBytes) => {
+      lastReceivedBytes = receivedBytes;
+      lastSizeBytes = sizeBytes;
+      if (receivedBytes < sizeBytes) {
+        onProgress?.(receivedBytes, sizeBytes, false);
+      }
+    },
+  });
+  triggerBrowserDownload(name, concatUint8Arrays(chunks));
+  onProgress?.(lastSizeBytes || lastReceivedBytes, lastSizeBytes || lastReceivedBytes, true);
 }
 
-async function createDownloadWriter(name: string): Promise<{ write: (bytes: Uint8Array) => Promise<void>; close: () => Promise<void> } | undefined> {
+function concatUint8Arrays(chunks: Uint8Array[]): Uint8Array {
+  const length = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
+  const out = new Uint8Array(length);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
+}
+
+type DownloadWriter = {
+  write: (bytes: Uint8Array) => Promise<void>;
+  close: () => Promise<void>;
+  abort?: () => Promise<void>;
+};
+
+async function createDownloadWriter(name: string): Promise<DownloadWriter | undefined> {
   const picker = (globalThis as {
     showSaveFilePicker?: (options?: { suggestedName?: string }) => Promise<{
       createWritable: () => Promise<{
         write: (data: Uint8Array) => Promise<void>;
         close: () => Promise<void>;
+        abort?: () => Promise<void>;
       }>;
     }>;
   }).showSaveFilePicker;
   if (!picker) {
     return undefined;
   }
+  let handle: Awaited<ReturnType<NonNullable<typeof picker>>>;
   try {
-    const handle = await picker({ suggestedName: name || "download" });
-    const writable = await handle.createWritable();
-    return {
-      write: (bytes) => writable.write(bytes),
-      close: () => writable.close(),
-    };
+    handle = await picker({ suggestedName: name || "download" });
   } catch (caught) {
     if (caught instanceof DOMException && caught.name === "AbortError") {
       throw new ProtocolClientError("download_cancelled", "download was cancelled");
     }
-    return undefined;
+    throw caught;
   }
+  let writable: Awaited<ReturnType<typeof handle.createWritable>>;
+  try {
+    writable = await handle.createWritable();
+  } catch (caught) {
+    if (caught instanceof DOMException && caught.name === "AbortError") {
+      throw new ProtocolClientError("download_cancelled", "download was cancelled");
+    }
+    // 中文注释：用户已选择保存目标后，createWritable 失败属于真实保存失败；
+    // 不能静默改走内存下载，否则 UI 会显示完成但文件没有写到用户选择的位置。
+    throw caught;
+  }
+  return {
+    write: (bytes) => writable.write(bytes),
+    close: () => writable.close(),
+    abort: writable.abort ? () => writable.abort!() : undefined,
+  };
 }
 
 function concatByteChunks(chunks: Uint8Array[]): Uint8Array {

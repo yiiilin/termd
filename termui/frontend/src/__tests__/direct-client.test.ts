@@ -1,7 +1,22 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DirectClient, ProtocolClientError } from "../protocol/direct-client";
-import { generateDeviceIdentity } from "../protocol/auth";
+import {
+  decodeEd25519PublicKey,
+  generateDeviceIdentity,
+  httpE2eeSigningInputBytes,
+  verifyEd25519Signature,
+} from "../protocol/auth";
+import { E2eeSession, decodeBinaryEncryptedFrame, encodeBinaryEncryptedFrame, type E2eeKeyPair } from "../protocol/e2ee";
 import { PROTOCOL_PACKET_VERSION } from "../protocol/types";
+import type {
+  HttpE2eeAuthPayload,
+  PublicKeyWire,
+  SessionFileDownloadStreamReadyPayload,
+  SessionFileHttpUploadStreamPayload,
+  SessionFileHttpUploadReadyPayload,
+  SessionFileUploadProgressPayload,
+} from "../protocol/types";
+import { concatBytes, encodeUtf8 } from "../protocol/wire";
 import { MockDaemon } from "../test/mock-daemon";
 
 describe("DirectClient", () => {
@@ -26,11 +41,100 @@ describe("DirectClient", () => {
     await daemon.stop();
   });
 
-  function connectDevice(deviceId: string, timeoutMs = 3000): Promise<DirectClient> {
-    return DirectClient.connect(daemon.url, daemon.serverId, deviceId, {
+  function connectDevice(deviceId: string, timeoutMs = 3000, url = daemon.url): Promise<DirectClient> {
+    return DirectClient.connect(url, daemon.serverId, deviceId, {
       timeoutMs,
       expectedDaemonPublicKey: daemon.daemonPublicKey,
     });
+  }
+
+  function httpE2eeSessionFromHeaders(headers: Headers): E2eeSession {
+    const deviceId = headers.get("x-termd-device-id");
+    const devicePublicKey = headers.get("x-termd-e2ee-public-key");
+    if (!deviceId || !devicePublicKey) {
+      throw new Error("missing HTTP E2EE test headers");
+    }
+    const daemonKeypair = (daemon as unknown as { e2eeKeypair: E2eeKeyPair }).e2eeKeypair;
+    return E2eeSession.daemon({
+      serverId: daemon.serverId,
+      deviceId,
+      localKeypair: daemonKeypair,
+      devicePublicKeyWire: devicePublicKey as PublicKeyWire,
+    });
+  }
+
+  function encodeHttpE2eeTestFrames(e2ee: E2eeSession, frames: Uint8Array[]): Uint8Array {
+    return concatBytes(
+      ...frames.map((frame) => {
+        const encrypted = encodeBinaryEncryptedFrame(e2ee.encryptBinary(frame));
+        const wire = new Uint8Array(4 + encrypted.byteLength);
+        new DataView(wire.buffer, wire.byteOffset, 4).setUint32(0, encrypted.byteLength, false);
+        wire.set(encrypted, 4);
+        return wire;
+      }),
+    );
+  }
+
+  function decodeHttpE2eeTestFrames(e2ee: E2eeSession, wire: Uint8Array): Uint8Array[] {
+    const frames: Uint8Array[] = [];
+    let offset = 0;
+    while (offset < wire.byteLength) {
+      const len = new DataView(wire.buffer, wire.byteOffset + offset, 4).getUint32(0, false);
+      offset += 4;
+      const encrypted = decodeBinaryEncryptedFrame(wire.slice(offset, offset + len));
+      frames.push(e2ee.decryptBinary(encrypted));
+      offset += len;
+    }
+    return frames;
+  }
+
+  function httpE2eeRawFrameLengths(wire: Uint8Array): number[] {
+    const lengths: number[] = [];
+    let offset = 0;
+    while (offset < wire.byteLength) {
+      const len = new DataView(wire.buffer, wire.byteOffset + offset, 4).getUint32(0, false);
+      lengths.push(len);
+      offset += 4 + len;
+    }
+    expect(offset).toBe(wire.byteLength);
+    return lengths;
+  }
+
+  async function requestBodyBytes(body: BodyInit | null | undefined): Promise<Uint8Array> {
+    if (!body) {
+      throw new Error("missing request body");
+    }
+    if (body instanceof ReadableStream) {
+      throw new Error("upload body must not be a ReadableStream");
+    }
+    if (body instanceof Blob) {
+      if ("arrayBuffer" in body && typeof body.arrayBuffer === "function") {
+        return new Uint8Array(await body.arrayBuffer());
+      }
+      return await new Promise<Uint8Array>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onerror = () => reject(reader.error ?? new Error("failed to read blob"));
+        reader.onload = () => resolve(new Uint8Array(reader.result as ArrayBuffer));
+        reader.readAsArrayBuffer(body);
+      });
+    }
+    if (body instanceof ArrayBuffer || Object.prototype.toString.call(body) === "[object ArrayBuffer]") {
+      return new Uint8Array(body as ArrayBuffer);
+    }
+    if (ArrayBuffer.isView(body)) {
+      const view = body as ArrayBufferView;
+      return new Uint8Array(view.buffer.slice(view.byteOffset, view.byteOffset + view.byteLength));
+    }
+    return encodeUtf8(String(body));
+  }
+
+  function responseBodyBytes(bytes: Uint8Array): ArrayBuffer {
+    return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+  }
+
+  function testLargeUploadChunkMarker(offsetBytes: number): number {
+    // 中文注释：大文件分片测试用小 Blob 标记块模拟真实 10MiB 分片，避免单测占用大量内存。
+    return Math.floor(offsetBytes / (10 * 1024 * 1024));
   }
 
   it("连接后第一帧发送 route_hello，然后才进入 hello/E2EE 握手", async () => {
@@ -681,6 +785,1120 @@ describe("DirectClient", () => {
     expect(attached.resize_owner).toBe(false);
     expect(files.session_id).toBe(attached.session_id);
     expect(daemon.attachRequests.at(-1)).toEqual({ session_id: attached.session_id, watch_updates: false });
+  });
+
+  it("未使用 HTTP E2EE 时仍可走 binary file stream 并回报提交进度", async () => {
+    const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000315");
+    const pairClient = await connectDevice(device.device_id);
+    const accepted = await pairClient.pair("secret-token", device.device_public_key);
+    pairClient.close();
+
+    const client = await connectDevice(device.device_id);
+    await client.authenticate(device, {
+      server_id: accepted.server_id,
+      daemon_public_key: accepted.daemon_public_key,
+      url: daemon.url,
+      paired_at_ms: 1710000000000,
+    });
+
+    const list = await client.listSessions();
+    const sessionId = list.sessions[0].session_id;
+    await client.attachSessionPermission(sessionId);
+    const progress: number[] = [];
+    const file = new File([new Uint8Array([0, 1, 2, 3, 255])], "raw.bin");
+    // 中文注释：binary file stream 只作为没有 HTTP E2EE 身份时的兼容路径；
+    // 已认证的大文件上传不再因 HTTP 请求失败退回主 WebSocket。
+    (client as unknown as { authenticatedDevice?: unknown; authenticatedServer?: unknown }).authenticatedDevice = undefined;
+    (client as unknown as { authenticatedDevice?: unknown; authenticatedServer?: unknown }).authenticatedServer = undefined;
+
+    try {
+      await client.uploadSessionFile(sessionId, "/tmp/raw.bin", file, {
+        onProgress: (update) => progress.push(update.offset_bytes),
+      });
+    } finally {
+      client.close();
+    }
+
+    expect(progress.at(-1)).toBe(file.size);
+    expect(daemon.sessionFileWrites).toHaveLength(0);
+    expect(daemon.sessionFileDownloadChunkRequests).toHaveLength(0);
+    expect(daemon.binaryPacketLog.some((entry) => entry.direction === "in" && entry.payload_type === "file_chunk")).toBe(true);
+  });
+
+  it("legacy RPC upload 不会把超过 RPC cap 的文件整包 base64 发送", async () => {
+    const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000331");
+    const pairClient = await connectDevice(device.device_id);
+    const accepted = await pairClient.pair("secret-token", device.device_public_key);
+    pairClient.close();
+
+    const client = await connectDevice(device.device_id);
+    await client.authenticate(device, {
+      server_id: accepted.server_id,
+      daemon_public_key: accepted.daemon_public_key,
+      url: daemon.url,
+      paired_at_ms: 1710000000000,
+    });
+    const list = await client.listSessions();
+    const sessionId = list.sessions[0].session_id;
+    await client.attachSessionPermission(sessionId);
+    (client as unknown as { binaryMode: boolean }).binaryMode = false;
+    (client as unknown as { authenticatedDevice?: unknown; authenticatedServer?: unknown }).authenticatedDevice = undefined;
+    (client as unknown as { authenticatedDevice?: unknown; authenticatedServer?: unknown }).authenticatedServer = undefined;
+    const file = new File([new Uint8Array((1024 * 1024) + 1)], "too-large-legacy.bin");
+    try {
+      await expect(client.uploadSessionFile(sessionId, "/tmp/too-large-legacy.bin", file)).rejects.toMatchObject({
+        code: "file_too_large",
+      });
+    } finally {
+      client.close();
+    }
+
+    expect(daemon.sessionFileWrites).toHaveLength(0);
+    expect(daemon.receivedPackets.some((packet) => packet.method === "session.file_write")).toBe(false);
+  });
+
+  it("HTTP 上传只在 daemon 确认后回报完成进度", async () => {
+    const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000320");
+    const pairClient = await connectDevice(device.device_id);
+    const accepted = await pairClient.pair("secret-token", device.device_public_key);
+    pairClient.close();
+
+    const client = await connectDevice(device.device_id);
+    await client.authenticate(device, {
+      server_id: accepted.server_id,
+      daemon_public_key: accepted.daemon_public_key,
+      url: daemon.url,
+      paired_at_ms: 1710000000000,
+    });
+    const list = await client.listSessions();
+    const sessionId = list.sessions[0].session_id;
+    const file = new File([new Uint8Array([1, 2, 3, 4])], "raw.bin");
+    const progress: number[] = [];
+    const sentProgress: number[] = [];
+    const originalFetch = globalThis.fetch;
+    let progressCallsBeforeResponse = -1;
+    let sentProgressCallsBeforeResponse = -1;
+    let uploadBodyBytes = 0;
+
+    (globalThis as unknown as { fetch: typeof fetch }).fetch = (async (input, init) => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      const headers = new Headers(init?.headers);
+      const e2ee = httpE2eeSessionFromHeaders(headers);
+      if (url.pathname.endsWith("/api/files/upload/init")) {
+        const ready = {
+          session_id: sessionId,
+          path: "/tmp/raw.bin",
+          upload_id: "mock-upload",
+          size_bytes: file.size,
+          offset_bytes: 0,
+        } satisfies SessionFileHttpUploadReadyPayload;
+        return new Response(responseBodyBytes(encodeHttpE2eeTestFrames(e2ee, [encodeUtf8(JSON.stringify(ready))])));
+      }
+      if (url.pathname.endsWith("/api/files/upload")) {
+        uploadBodyBytes = (await requestBodyBytes(init?.body)).byteLength;
+        // 中文注释：请求体交给 fetch 时，文件还没有得到 daemon 响应确认。
+        progressCallsBeforeResponse = progress.length;
+        sentProgressCallsBeforeResponse = sentProgress.length;
+        const committed = {
+          session_id: sessionId,
+          path: "/tmp/raw.bin",
+          offset_bytes: file.size,
+          size_bytes: file.size,
+          eof: true,
+          modified_at_ms: null,
+        } satisfies SessionFileUploadProgressPayload;
+        return new Response(responseBodyBytes(encodeHttpE2eeTestFrames(e2ee, [encodeUtf8(JSON.stringify(committed))])));
+      }
+      return new Response(JSON.stringify({ code: "not_found", message: "not found" }), { status: 404 });
+    }) as typeof fetch;
+
+    try {
+      await client.uploadSessionFile(sessionId, "/tmp/raw.bin", file, {
+        onProgress: (update) => progress.push(update.offset_bytes),
+        onSentProgress: (sentBytes) => sentProgress.push(sentBytes),
+      });
+    } finally {
+      (globalThis as unknown as { fetch: typeof fetch }).fetch = originalFetch;
+      client.close();
+    }
+
+    expect(uploadBodyBytes).toBeGreaterThan(0);
+    expect(progressCallsBeforeResponse).toBe(0);
+    expect(sentProgressCallsBeforeResponse).toBeGreaterThan(0);
+    expect(sentProgress.at(-1)).toBe(file.size);
+    expect(progress).toEqual([file.size]);
+  });
+
+  it("HTTP 大文件上传使用 10MiB 分片且最多 2 个 POST 并发", async () => {
+    const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000332");
+    const pairClient = await connectDevice(device.device_id);
+    const accepted = await pairClient.pair("secret-token", device.device_public_key);
+    pairClient.close();
+
+    const client = await connectDevice(device.device_id);
+    await client.authenticate(device, {
+      server_id: accepted.server_id,
+      daemon_public_key: accepted.daemon_public_key,
+      url: daemon.url,
+      paired_at_ms: 1710000000000,
+    });
+    const list = await client.listSessions();
+    const sessionId = list.sessions[0].session_id;
+    const fileSize = (10 * 1024 * 1024 * 2) + 17;
+    const file = {
+      size: fileSize,
+      slice: (start: number, end: number) =>
+        // 中文注释：测试只关心 offset 分片和并发，不需要真的在 Vitest 里加解密 20MiB。
+        // 用小标记块保留 Blob 行为，避免测试 worker 因大数组和 E2EE 副本放大而 OOM。
+        new Blob([new Uint8Array([Math.floor(start / (10 * 1024 * 1024)), end - start > 1 ? 1 : 0])]),
+    } as unknown as Blob;
+    const originalFetch = globalThis.fetch;
+    let uploadCalls = 0;
+    let activeUploads = 0;
+    let maxActiveUploads = 0;
+    const received = new Set<number>();
+
+    (globalThis as unknown as { fetch: typeof fetch }).fetch = (async (input, init) => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      const headers = new Headers(init?.headers);
+      const e2ee = httpE2eeSessionFromHeaders(headers);
+      if (url.pathname.endsWith("/api/files/upload/init")) {
+        const ready = {
+          session_id: sessionId,
+          path: "/tmp/large-chunked.bin",
+          upload_id: "mock-large-chunked-upload",
+          size_bytes: fileSize,
+          offset_bytes: 0,
+        } satisfies SessionFileHttpUploadReadyPayload;
+        return new Response(responseBodyBytes(encodeHttpE2eeTestFrames(e2ee, [encodeUtf8(JSON.stringify(ready))])));
+      }
+      if (url.pathname.endsWith("/api/files/upload")) {
+        uploadCalls += 1;
+        activeUploads += 1;
+        maxActiveUploads = Math.max(maxActiveUploads, activeUploads);
+        const wire = await requestBodyBytes(init?.body);
+        const frames = decodeHttpE2eeTestFrames(e2ee, wire);
+        const meta = JSON.parse(new TextDecoder().decode(frames[0])) as SessionFileHttpUploadStreamPayload;
+        expect(meta).toMatchObject({
+          session_id: sessionId,
+          path: "/tmp/large-chunked.bin",
+          upload_id: "mock-large-chunked-upload",
+          size_bytes: fileSize,
+        });
+        const requestBytes = new Uint8Array(frames.slice(1).reduce((sum, frame) => sum + frame.byteLength, 0));
+        let offset = meta.offset_bytes;
+        for (const frame of frames.slice(1)) {
+          requestBytes.set(frame, offset - meta.offset_bytes);
+          offset += frame.byteLength;
+        }
+        expect(Array.from(requestBytes)).toEqual([
+          testLargeUploadChunkMarker(meta.offset_bytes),
+          1,
+        ]);
+        received.add(meta.offset_bytes);
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        activeUploads -= 1;
+        const receivedBytes = [...received].reduce((sum, chunkOffset) => {
+          if (chunkOffset >= 20 * 1024 * 1024) {
+            return sum + 17;
+          }
+          return sum + 10 * 1024 * 1024;
+        }, 0);
+        const committed = {
+          session_id: sessionId,
+          path: "/tmp/large-chunked.bin",
+          offset_bytes: receivedBytes,
+          size_bytes: fileSize,
+          eof: receivedBytes === fileSize,
+          modified_at_ms: receivedBytes === fileSize ? null : undefined,
+        } satisfies SessionFileUploadProgressPayload;
+        return new Response(responseBodyBytes(encodeHttpE2eeTestFrames(e2ee, [encodeUtf8(JSON.stringify(committed))])));
+      }
+      return originalFetch(input, init);
+    }) as typeof fetch;
+
+    try {
+      const progress = await client.uploadSessionFile(sessionId, "/tmp/large-chunked.bin", file);
+      expect(progress.offset_bytes).toBe(fileSize);
+    } finally {
+      (globalThis as unknown as { fetch: typeof fetch }).fetch = originalFetch;
+      client.close();
+    }
+
+    expect(uploadCalls).toBe(3);
+    expect(maxActiveUploads).toBe(2);
+    expect(daemon.sessionFileBinaryWrites).toHaveLength(0);
+  });
+
+  it("HTTP 上传 10MiB 业务分片内部会拆成小于 2MiB 的 E2EE frame", async () => {
+    const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000333");
+    const pairClient = await connectDevice(device.device_id);
+    const accepted = await pairClient.pair("secret-token", device.device_public_key);
+    pairClient.close();
+
+    const client = await connectDevice(device.device_id);
+    await client.authenticate(device, {
+      server_id: accepted.server_id,
+      daemon_public_key: accepted.daemon_public_key,
+      url: daemon.url,
+      paired_at_ms: 1710000000000,
+    });
+    const list = await client.listSessions();
+    const sessionId = list.sessions[0].session_id;
+    const payload = new Uint8Array((2 * 1024 * 1024) + 100);
+    payload[0] = 7;
+    payload[payload.length - 1] = 9;
+    const file = new File([payload], "frame-cap.bin");
+    const originalFetch = globalThis.fetch;
+    let sawSplitUploadBody = false;
+
+    (globalThis as unknown as { fetch: typeof fetch }).fetch = (async (input, init) => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      const headers = new Headers(init?.headers);
+      const e2ee = httpE2eeSessionFromHeaders(headers);
+      if (url.pathname.endsWith("/api/files/upload/init")) {
+        const ready = {
+          session_id: sessionId,
+          path: "/tmp/frame-cap.bin",
+          upload_id: "mock-frame-cap-upload",
+          size_bytes: file.size,
+          offset_bytes: 0,
+        } satisfies SessionFileHttpUploadReadyPayload;
+        return new Response(responseBodyBytes(encodeHttpE2eeTestFrames(e2ee, [encodeUtf8(JSON.stringify(ready))])));
+      }
+      if (url.pathname.endsWith("/api/files/upload")) {
+        const wire = await requestBodyBytes(init?.body);
+        const lengths = httpE2eeRawFrameLengths(wire);
+        expect(lengths.every((len) => len <= 2 * 1024 * 1024)).toBe(true);
+        const frames = decodeHttpE2eeTestFrames(e2ee, wire);
+        const uploaded = concatBytes(...frames.slice(1));
+        expect(uploaded.byteLength).toBe(file.size);
+        expect(uploaded[0]).toBe(7);
+        expect(uploaded[uploaded.length - 1]).toBe(9);
+        sawSplitUploadBody = frames.length > 2;
+        const committed = {
+          session_id: sessionId,
+          path: "/tmp/frame-cap.bin",
+          offset_bytes: file.size,
+          size_bytes: file.size,
+          eof: true,
+          modified_at_ms: null,
+        } satisfies SessionFileUploadProgressPayload;
+        return new Response(responseBodyBytes(encodeHttpE2eeTestFrames(e2ee, [encodeUtf8(JSON.stringify(committed))])));
+      }
+      return originalFetch(input, init);
+    }) as typeof fetch;
+
+    try {
+      const progress = await client.uploadSessionFile(sessionId, "/tmp/frame-cap.bin", file);
+      expect(progress.eof).toBe(true);
+    } finally {
+      (globalThis as unknown as { fetch: typeof fetch }).fetch = originalFetch;
+      client.close();
+    }
+
+    expect(sawSplitUploadBody).toBe(true);
+  });
+
+  it("HTTP 并发上传最终 eof 进度不会被较晚返回的旧 non-eof 响应覆盖", async () => {
+    const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000334");
+    const pairClient = await connectDevice(device.device_id);
+    const accepted = await pairClient.pair("secret-token", device.device_public_key);
+    pairClient.close();
+
+    const client = await connectDevice(device.device_id);
+    await client.authenticate(device, {
+      server_id: accepted.server_id,
+      daemon_public_key: accepted.daemon_public_key,
+      url: daemon.url,
+      paired_at_ms: 1710000000000,
+    });
+    const list = await client.listSessions();
+    const sessionId = list.sessions[0].session_id;
+    const fileSize = 20 * 1024 * 1024;
+    const file = {
+      size: fileSize,
+      slice: (start: number) => new Blob([new Uint8Array([testLargeUploadChunkMarker(start)])]),
+    } as unknown as Blob;
+    const originalFetch = globalThis.fetch;
+    const progressOffsets: number[] = [];
+
+    (globalThis as unknown as { fetch: typeof fetch }).fetch = (async (input, init) => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      const headers = new Headers(init?.headers);
+      const e2ee = httpE2eeSessionFromHeaders(headers);
+      if (url.pathname.endsWith("/api/files/upload/init")) {
+        const ready = {
+          session_id: sessionId,
+          path: "/tmp/progress-race.bin",
+          upload_id: "mock-progress-race-upload",
+          size_bytes: fileSize,
+          offset_bytes: 0,
+        } satisfies SessionFileHttpUploadReadyPayload;
+        return new Response(responseBodyBytes(encodeHttpE2eeTestFrames(e2ee, [encodeUtf8(JSON.stringify(ready))])));
+      }
+      if (url.pathname.endsWith("/api/files/upload")) {
+        const frames = decodeHttpE2eeTestFrames(e2ee, await requestBodyBytes(init?.body));
+        const meta = JSON.parse(new TextDecoder().decode(frames[0])) as SessionFileHttpUploadStreamPayload;
+        if (meta.offset_bytes === 0) {
+          await new Promise((resolve) => setTimeout(resolve, 40));
+        }
+        const committed = {
+          session_id: sessionId,
+          path: "/tmp/progress-race.bin",
+          offset_bytes: meta.offset_bytes === 0 ? 10 * 1024 * 1024 : fileSize,
+          size_bytes: fileSize,
+          eof: meta.offset_bytes !== 0,
+          modified_at_ms: meta.offset_bytes !== 0 ? null : undefined,
+        } satisfies SessionFileUploadProgressPayload;
+        return new Response(responseBodyBytes(encodeHttpE2eeTestFrames(e2ee, [encodeUtf8(JSON.stringify(committed))])));
+      }
+      return originalFetch(input, init);
+    }) as typeof fetch;
+
+    try {
+      const progress = await client.uploadSessionFile(sessionId, "/tmp/progress-race.bin", file, {
+        onProgress: (update) => progressOffsets.push(update.offset_bytes),
+      });
+      expect(progress.eof).toBe(true);
+      expect(progress.offset_bytes).toBe(fileSize);
+    } finally {
+      (globalThis as unknown as { fetch: typeof fetch }).fetch = originalFetch;
+      client.close();
+    }
+
+    expect(progressOffsets).toEqual([fileSize]);
+  });
+
+  it("HTTP 上传已收到 eof 后忽略旧并发分片的取消错误", async () => {
+    const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000336");
+    const pairClient = await connectDevice(device.device_id);
+    const accepted = await pairClient.pair("secret-token", device.device_public_key);
+    pairClient.close();
+
+    const client = await connectDevice(device.device_id);
+    await client.authenticate(device, {
+      server_id: accepted.server_id,
+      daemon_public_key: accepted.daemon_public_key,
+      url: daemon.url,
+      paired_at_ms: 1710000000000,
+    });
+    const list = await client.listSessions();
+    const sessionId = list.sessions[0].session_id;
+    const fileSize = 20 * 1024 * 1024;
+    const file = {
+      size: fileSize,
+      slice: (start: number) => new Blob([new Uint8Array([testLargeUploadChunkMarker(start)])]),
+    } as unknown as Blob;
+    const originalFetch = globalThis.fetch;
+    const paths: string[] = [];
+
+    (globalThis as unknown as { fetch: typeof fetch }).fetch = (async (input, init) => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      paths.push(url.pathname);
+      const headers = new Headers(init?.headers);
+      const e2ee = httpE2eeSessionFromHeaders(headers);
+      if (url.pathname.endsWith("/api/files/upload/init")) {
+        const ready = {
+          session_id: sessionId,
+          path: "/tmp/eof-wins.bin",
+          upload_id: "mock-eof-wins-upload",
+          size_bytes: fileSize,
+          offset_bytes: 0,
+        } satisfies SessionFileHttpUploadReadyPayload;
+        return new Response(responseBodyBytes(encodeHttpE2eeTestFrames(e2ee, [encodeUtf8(JSON.stringify(ready))])));
+      }
+      if (url.pathname.endsWith("/api/files/upload")) {
+        const frames = decodeHttpE2eeTestFrames(e2ee, await requestBodyBytes(init?.body));
+        const meta = JSON.parse(new TextDecoder().decode(frames[0])) as SessionFileHttpUploadStreamPayload;
+        if (meta.offset_bytes === 0) {
+          await new Promise((resolve) => setTimeout(resolve, 30));
+          throw new TypeError("stale chunk was cancelled");
+        }
+        const committed = {
+          session_id: sessionId,
+          path: "/tmp/eof-wins.bin",
+          offset_bytes: fileSize,
+          size_bytes: fileSize,
+          eof: true,
+          modified_at_ms: null,
+        } satisfies SessionFileUploadProgressPayload;
+        return new Response(responseBodyBytes(encodeHttpE2eeTestFrames(e2ee, [encodeUtf8(JSON.stringify(committed))])));
+      }
+      return originalFetch(input, init);
+    }) as typeof fetch;
+
+    try {
+      const progress = await client.uploadSessionFile(sessionId, "/tmp/eof-wins.bin", file);
+      expect(progress.eof).toBe(true);
+      expect(progress.offset_bytes).toBe(fileSize);
+    } finally {
+      (globalThis as unknown as { fetch: typeof fetch }).fetch = originalFetch;
+      client.close();
+    }
+
+    expect(paths).toEqual(["/api/files/upload/init", "/api/files/upload", "/api/files/upload"]);
+  });
+
+  it("HTTP 上传所有分片结束但没有 eof 时会请求 abort 清理", async () => {
+    const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000335");
+    const pairClient = await connectDevice(device.device_id);
+    const accepted = await pairClient.pair("secret-token", device.device_public_key);
+    pairClient.close();
+
+    const client = await connectDevice(device.device_id);
+    await client.authenticate(device, {
+      server_id: accepted.server_id,
+      daemon_public_key: accepted.daemon_public_key,
+      url: daemon.url,
+      paired_at_ms: 1710000000000,
+    });
+    const list = await client.listSessions();
+    const sessionId = list.sessions[0].session_id;
+    const file = new File([new Uint8Array([1, 2, 3])], "missing-eof.bin");
+    const originalFetch = globalThis.fetch;
+    const paths: string[] = [];
+
+    (globalThis as unknown as { fetch: typeof fetch }).fetch = (async (input, init) => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      paths.push(url.pathname);
+      const headers = new Headers(init?.headers);
+      const e2ee = httpE2eeSessionFromHeaders(headers);
+      if (url.pathname.endsWith("/api/files/upload/init")) {
+        const ready = {
+          session_id: sessionId,
+          path: "/tmp/missing-eof.bin",
+          upload_id: "mock-missing-eof-upload",
+          size_bytes: file.size,
+          offset_bytes: 0,
+        } satisfies SessionFileHttpUploadReadyPayload;
+        return new Response(responseBodyBytes(encodeHttpE2eeTestFrames(e2ee, [encodeUtf8(JSON.stringify(ready))])));
+      }
+      if (url.pathname.endsWith("/api/files/upload/abort")) {
+        return new Response(responseBodyBytes(encodeHttpE2eeTestFrames(e2ee, [encodeUtf8(JSON.stringify({ ok: true }))])));
+      }
+      if (url.pathname.endsWith("/api/files/upload")) {
+        const committed = {
+          session_id: sessionId,
+          path: "/tmp/missing-eof.bin",
+          offset_bytes: 0,
+          size_bytes: file.size,
+          eof: false,
+          modified_at_ms: undefined,
+        } satisfies SessionFileUploadProgressPayload;
+        return new Response(responseBodyBytes(encodeHttpE2eeTestFrames(e2ee, [encodeUtf8(JSON.stringify(committed))])));
+      }
+      return originalFetch(input, init);
+    }) as typeof fetch;
+
+    try {
+      await expect(client.uploadSessionFile(sessionId, "/tmp/missing-eof.bin", file)).rejects.toMatchObject({
+        code: "invalid_file_transfer",
+      });
+    } finally {
+      (globalThis as unknown as { fetch: typeof fetch }).fetch = originalFetch;
+      client.close();
+    }
+
+    expect(paths).toEqual(["/api/files/upload/init", "/api/files/upload", "/api/files/upload/abort"]);
+  });
+
+  it("HTTP 上传请求 TypeError 不回退到 WebSocket 文件流", async () => {
+    const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000322");
+    const pairClient = await connectDevice(device.device_id);
+    const accepted = await pairClient.pair("secret-token", device.device_public_key);
+    pairClient.close();
+
+    const client = await connectDevice(device.device_id);
+    await client.authenticate(device, {
+      server_id: accepted.server_id,
+      daemon_public_key: accepted.daemon_public_key,
+      url: daemon.url,
+      paired_at_ms: 1710000000000,
+    });
+    const list = await client.listSessions();
+    const sessionId = list.sessions[0].session_id;
+    await client.attachSessionPermission(sessionId);
+    const originalFetch = globalThis.fetch;
+    let fetchCalls = 0;
+    const paths: string[] = [];
+    const file = new File([new Uint8Array([7, 8])], "fallback.bin");
+    (globalThis as unknown as { fetch: typeof fetch }).fetch = (async (input, init) => {
+      fetchCalls += 1;
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      paths.push(url.pathname);
+      const headers = new Headers(init?.headers);
+      const e2ee = httpE2eeSessionFromHeaders(headers);
+      if (url.pathname.endsWith("/api/files/upload/init")) {
+        const ready = {
+          session_id: sessionId,
+          path: "/tmp/fallback.bin",
+          upload_id: "mock-fallback-upload",
+          size_bytes: file.size,
+          offset_bytes: 0,
+        } satisfies SessionFileHttpUploadReadyPayload;
+        return new Response(responseBodyBytes(encodeHttpE2eeTestFrames(e2ee, [encodeUtf8(JSON.stringify(ready))])));
+      }
+      if (url.pathname.endsWith("/api/files/upload/abort")) {
+        return new Response(responseBodyBytes(encodeHttpE2eeTestFrames(e2ee, [encodeUtf8(JSON.stringify({ ok: true }))])));
+      }
+      throw new TypeError("ReadableStream request body is not supported");
+    }) as typeof fetch;
+    try {
+      await expect(client.uploadSessionFile(sessionId, "/tmp/fallback.bin", file)).rejects.toThrow(TypeError);
+    } finally {
+      (globalThis as unknown as { fetch: typeof fetch }).fetch = originalFetch;
+      client.close();
+    }
+
+    expect(fetchCalls).toBe(3);
+    expect(paths).toEqual(["/api/files/upload/init", "/api/files/upload", "/api/files/upload/abort"]);
+    expect(daemon.sessionFileBinaryWrites).toHaveLength(0);
+  });
+
+  it("WebSocket 上传必须等待 daemon eof 确认", async () => {
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [
+        {
+          session_id: "00000000-0000-0000-0000-000000000301",
+          state: "running",
+          size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+        },
+      ],
+      attachOutput: "termd-e2e-ready\n",
+      fileUploadProgressOverrides: {
+        "/tmp/bad-progress.bin": { eof: false },
+      },
+    });
+    const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000329");
+    const pairClient = await connectDevice(device.device_id);
+    const accepted = await pairClient.pair("secret-token", device.device_public_key);
+    pairClient.close();
+
+    const client = await connectDevice(device.device_id);
+    await client.authenticate(device, {
+      server_id: accepted.server_id,
+      daemon_public_key: accepted.daemon_public_key,
+      url: daemon.url,
+      paired_at_ms: 1710000000000,
+    });
+    const list = await client.listSessions();
+    const sessionId = list.sessions[0].session_id;
+    await client.attachSessionPermission(sessionId);
+    const file = new File([new Uint8Array([9])], "bad-progress.bin");
+    (client as unknown as { authenticatedDevice?: unknown; authenticatedServer?: unknown }).authenticatedDevice = undefined;
+    (client as unknown as { authenticatedDevice?: unknown; authenticatedServer?: unknown }).authenticatedServer = undefined;
+    try {
+      await expect(client.uploadSessionFile(sessionId, "/tmp/bad-progress.bin", file)).rejects.toMatchObject({
+        code: "invalid_file_transfer",
+      });
+    } finally {
+      client.close();
+    }
+  });
+
+  it("HTTP 上传初始化阶段网络 TypeError 不回退到 WebSocket 文件流", async () => {
+    const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000324");
+    const pairClient = await connectDevice(device.device_id);
+    const accepted = await pairClient.pair("secret-token", device.device_public_key);
+    pairClient.close();
+
+    const client = await connectDevice(device.device_id);
+    await client.authenticate(device, {
+      server_id: accepted.server_id,
+      daemon_public_key: accepted.daemon_public_key,
+      url: daemon.url,
+      paired_at_ms: 1710000000000,
+    });
+    const list = await client.listSessions();
+    const sessionId = list.sessions[0].session_id;
+    await client.attachSessionPermission(sessionId);
+    const originalFetch = globalThis.fetch;
+    (globalThis as unknown as { fetch: typeof fetch }).fetch = (async () => {
+      throw new TypeError("Failed to fetch");
+    }) as typeof fetch;
+    try {
+      await expect(
+        client.uploadSessionFile(sessionId, "/tmp/no-fallback.bin", new File([new Uint8Array([1])], "no-fallback.bin")),
+      ).rejects.toThrow(TypeError);
+    } finally {
+      (globalThis as unknown as { fetch: typeof fetch }).fetch = originalFetch;
+      client.close();
+    }
+
+    expect(daemon.sessionFileBinaryWrites).toHaveLength(0);
+  });
+
+  it("HTTP 上传初始化返回不支持状态时仅小文件回退 WebSocket 兼容路径", async () => {
+    const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000326");
+    const pairClient = await connectDevice(device.device_id);
+    const accepted = await pairClient.pair("secret-token", device.device_public_key);
+    pairClient.close();
+
+    const client = await connectDevice(device.device_id);
+    await client.authenticate(device, {
+      server_id: accepted.server_id,
+      daemon_public_key: accepted.daemon_public_key,
+      url: daemon.url,
+      paired_at_ms: 1710000000000,
+    });
+    const list = await client.listSessions();
+    const sessionId = list.sessions[0].session_id;
+    await client.attachSessionPermission(sessionId);
+    const originalFetch = globalThis.fetch;
+    (globalThis as unknown as { fetch: typeof fetch }).fetch = (async () =>
+      new Response(null, { status: 426 })) as typeof fetch;
+    try {
+      await client.uploadSessionFile(sessionId, "/tmp/http-required.bin", new File([new Uint8Array([1])], "http-required.bin"));
+    } finally {
+      (globalThis as unknown as { fetch: typeof fetch }).fetch = originalFetch;
+      client.close();
+    }
+
+    expect(daemon.sessionFileBinaryWrites).toHaveLength(1);
+    expect(Array.from(daemon.sessionFileBinaryWrites[0].bytes)).toEqual([1]);
+  });
+
+  it("HTTP 上传不支持时大文件不会回退到 WebSocket 兼容路径", async () => {
+    const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000334");
+    const pairClient = await connectDevice(device.device_id);
+    const accepted = await pairClient.pair("secret-token", device.device_public_key);
+    pairClient.close();
+
+    const client = await connectDevice(device.device_id);
+    await client.authenticate(device, {
+      server_id: accepted.server_id,
+      daemon_public_key: accepted.daemon_public_key,
+      url: daemon.url,
+      paired_at_ms: 1710000000000,
+    });
+    const list = await client.listSessions();
+    const sessionId = list.sessions[0].session_id;
+    await client.attachSessionPermission(sessionId);
+    const originalFetch = globalThis.fetch;
+    (globalThis as unknown as { fetch: typeof fetch }).fetch = (async () =>
+      new Response(null, { status: 426 })) as typeof fetch;
+    const largeFile = {
+      size: (16 * 1024 * 1024) + 1,
+      slice: () => {
+        throw new Error("large unsupported HTTP upload should not be read");
+      },
+    } as unknown as Blob;
+    try {
+      await expect(client.uploadSessionFile(sessionId, "/tmp/large-http-required.bin", largeFile)).rejects.toMatchObject({
+        code: "file_too_large",
+      });
+    } finally {
+      (globalThis as unknown as { fetch: typeof fetch }).fetch = originalFetch;
+      client.close();
+    }
+
+    expect(daemon.sessionFileBinaryWrites).toHaveLength(0);
+  });
+
+  it("HTTP 上传 body 阶段 TypeError 不回退到 WebSocket 文件流", async () => {
+    const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000325");
+    const pairClient = await connectDevice(device.device_id);
+    const accepted = await pairClient.pair("secret-token", device.device_public_key);
+    pairClient.close();
+
+    const client = await connectDevice(device.device_id);
+    await client.authenticate(device, {
+      server_id: accepted.server_id,
+      daemon_public_key: accepted.daemon_public_key,
+      url: daemon.url,
+      paired_at_ms: 1710000000000,
+    });
+    const list = await client.listSessions();
+    const sessionId = list.sessions[0].session_id;
+    await client.attachSessionPermission(sessionId);
+    const originalFetch = globalThis.fetch;
+    const file = new File([new Uint8Array([2])], "no-stream-fallback.bin");
+    (globalThis as unknown as { fetch: typeof fetch }).fetch = (async (input, init) => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      const headers = new Headers(init?.headers);
+      const e2ee = httpE2eeSessionFromHeaders(headers);
+      if (url.pathname.endsWith("/api/files/upload/init")) {
+        const ready = {
+          session_id: sessionId,
+          path: "/tmp/no-stream-fallback.bin",
+          upload_id: "mock-no-stream-fallback-upload",
+          size_bytes: file.size,
+          offset_bytes: 0,
+        } satisfies SessionFileHttpUploadReadyPayload;
+        return new Response(responseBodyBytes(encodeHttpE2eeTestFrames(e2ee, [encodeUtf8(JSON.stringify(ready))])));
+      }
+      throw new TypeError("Failed to fetch");
+    }) as typeof fetch;
+    try {
+      await expect(client.uploadSessionFile(sessionId, "/tmp/no-stream-fallback.bin", file)).rejects.toThrow(TypeError);
+    } finally {
+      (globalThis as unknown as { fetch: typeof fetch }).fetch = originalFetch;
+      client.close();
+    }
+
+    expect(daemon.sessionFileBinaryWrites).toHaveLength(0);
+  });
+
+  it("HTTP 上传 body 端点返回不支持状态时仅小文件回退 WebSocket 兼容路径", async () => {
+    const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000327");
+    const pairClient = await connectDevice(device.device_id);
+    const accepted = await pairClient.pair("secret-token", device.device_public_key);
+    pairClient.close();
+
+    const client = await connectDevice(device.device_id);
+    await client.authenticate(device, {
+      server_id: accepted.server_id,
+      daemon_public_key: accepted.daemon_public_key,
+      url: daemon.url,
+      paired_at_ms: 1710000000000,
+    });
+    const list = await client.listSessions();
+    const sessionId = list.sessions[0].session_id;
+    await client.attachSessionPermission(sessionId);
+    const originalFetch = globalThis.fetch;
+    const file = new File([new Uint8Array([3])], "http-required-stream.bin");
+    (globalThis as unknown as { fetch: typeof fetch }).fetch = (async (input, init) => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      const headers = new Headers(init?.headers);
+      const e2ee = httpE2eeSessionFromHeaders(headers);
+      if (url.pathname.endsWith("/api/files/upload/init")) {
+        const ready = {
+          session_id: sessionId,
+          path: "/tmp/http-required-stream.bin",
+          upload_id: "mock-http-required-upload",
+          size_bytes: file.size,
+          offset_bytes: 0,
+        } satisfies SessionFileHttpUploadReadyPayload;
+        return new Response(responseBodyBytes(encodeHttpE2eeTestFrames(e2ee, [encodeUtf8(JSON.stringify(ready))])));
+      }
+      return new Response(null, { status: 426 });
+    }) as typeof fetch;
+    try {
+      await client.uploadSessionFile(sessionId, "/tmp/http-required-stream.bin", file);
+    } finally {
+      (globalThis as unknown as { fetch: typeof fetch }).fetch = originalFetch;
+      client.close();
+    }
+
+    expect(daemon.sessionFileBinaryWrites).toHaveLength(1);
+    expect(Array.from(daemon.sessionFileBinaryWrites[0].bytes)).toEqual([3]);
+  });
+
+  it("HTTP 下载首个元数据响应帧使用短超时", async () => {
+    const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000321");
+    const pairClient = await connectDevice(device.device_id);
+    const accepted = await pairClient.pair("secret-token", device.device_public_key);
+    pairClient.close();
+
+    const client = await connectDevice(device.device_id);
+    await client.authenticate(device, {
+      server_id: accepted.server_id,
+      daemon_public_key: accepted.daemon_public_key,
+      url: daemon.url,
+      paired_at_ms: 1710000000000,
+    });
+    const list = await client.listSessions();
+    const sessionId = list.sessions[0].session_id;
+    const originalFetch = globalThis.fetch;
+    (globalThis as unknown as { fetch: typeof fetch }).fetch = ((_input, init) =>
+      new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => {
+          reject(new DOMException("Aborted", "AbortError"));
+        }, { once: true });
+      })) as typeof fetch;
+    try {
+      await expect(client.downloadSessionFile(sessionId, "/tmp/raw.bin", { timeoutMs: 20 })).rejects.toMatchObject({
+        code: "response_timeout",
+      });
+    } finally {
+      (globalThis as unknown as { fetch: typeof fetch }).fetch = originalFetch;
+      client.close();
+    }
+  });
+
+  it("HTTP 下载响应头已返回但元数据首帧缺失时仍使用短超时", async () => {
+    const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000323");
+    const pairClient = await connectDevice(device.device_id);
+    const accepted = await pairClient.pair("secret-token", device.device_public_key);
+    pairClient.close();
+
+    const client = await connectDevice(device.device_id);
+    await client.authenticate(device, {
+      server_id: accepted.server_id,
+      daemon_public_key: accepted.daemon_public_key,
+      url: daemon.url,
+      paired_at_ms: 1710000000000,
+    });
+    const list = await client.listSessions();
+    const sessionId = list.sessions[0].session_id;
+    const originalFetch = globalThis.fetch;
+    (globalThis as unknown as { fetch: typeof fetch }).fetch = ((_input, init) => {
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          init?.signal?.addEventListener("abort", () => {
+            controller.error(new DOMException("Aborted", "AbortError"));
+          }, { once: true });
+          setTimeout(() => {
+            controller.error(new Error("metadata guard reached"));
+          }, 100);
+        },
+      });
+      return Promise.resolve(new Response(body, { status: 200 }));
+    }) as typeof fetch;
+    try {
+      await expect(client.downloadSessionFile(sessionId, "/tmp/raw.bin", { timeoutMs: 20 })).rejects.toMatchObject({
+        code: "response_timeout",
+      });
+    } finally {
+      (globalThis as unknown as { fetch: typeof fetch }).fetch = originalFetch;
+      client.close();
+    }
+  });
+
+  it("HTTP 文件传输 400 错误不会回退到 WebSocket 文件流", async () => {
+    const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000318");
+    const pairClient = await connectDevice(device.device_id);
+    const accepted = await pairClient.pair("secret-token", device.device_public_key);
+    pairClient.close();
+
+    const client = await connectDevice(device.device_id);
+    await client.authenticate(device, {
+      server_id: accepted.server_id,
+      daemon_public_key: accepted.daemon_public_key,
+      url: daemon.url,
+      paired_at_ms: 1710000000000,
+    });
+    const list = await client.listSessions();
+    const sessionId = list.sessions[0].session_id;
+    await client.attachSessionPermission(sessionId);
+
+    const originalFetch = globalThis.fetch;
+    const originalSetTimeout = globalThis.setTimeout;
+    const setTimeoutDelays: number[] = [];
+    (globalThis as unknown as { fetch: typeof fetch }).fetch = (async (_input, init) => {
+      const headers = new Headers(init?.headers);
+      const e2ee = httpE2eeSessionFromHeaders(headers);
+      return new Response(responseBodyBytes(encodeHttpE2eeTestFrames(e2ee, [
+        encodeUtf8(JSON.stringify({ code: "invalid_file_transfer", message: "bad request" })),
+      ])), {
+        status: 400,
+        headers: { "content-type": "application/octet-stream" },
+      });
+    }) as typeof fetch;
+    (globalThis as unknown as { setTimeout: typeof setTimeout }).setTimeout = ((handler: TimerHandler, timeout?: number, ...args: unknown[]) => {
+      // 中文注释：HTTP 下载允许首个元数据帧短超时，但不能给后续文件体注册整体超时。
+      setTimeoutDelays.push(Number(timeout ?? 0));
+      return originalSetTimeout(handler, timeout, ...args);
+    }) as typeof setTimeout;
+    try {
+      await expect(client.downloadSessionFile(sessionId, "/tmp/raw.bin")).rejects.toMatchObject({
+        code: "invalid_file_transfer",
+      });
+    } finally {
+      (globalThis as unknown as { fetch: typeof fetch }).fetch = originalFetch;
+      (globalThis as unknown as { setTimeout: typeof setTimeout }).setTimeout = originalSetTimeout;
+      client.close();
+    }
+
+    expect(setTimeoutDelays).toEqual([3000]);
+    expect(daemon.receivedPackets.some((packet) => packet.method === "session.file_download")).toBe(false);
+    expect(daemon.sessionFileDownloadChunkRequests).toHaveLength(0);
+  });
+
+  it("HTTP 下载端点不支持时不会回退到 WebSocket 文件流", async () => {
+    const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000328");
+    const pairClient = await connectDevice(device.device_id);
+    const accepted = await pairClient.pair("secret-token", device.device_public_key);
+    pairClient.close();
+
+    const client = await connectDevice(device.device_id);
+    await client.authenticate(device, {
+      server_id: accepted.server_id,
+      daemon_public_key: accepted.daemon_public_key,
+      url: daemon.url,
+      paired_at_ms: 1710000000000,
+    });
+    const list = await client.listSessions();
+    const sessionId = list.sessions[0].session_id;
+    await client.attachSessionPermission(sessionId);
+    const originalFetch = globalThis.fetch;
+    (globalThis as unknown as { fetch: typeof fetch }).fetch = (async () =>
+      new Response(null, { status: 426 })) as typeof fetch;
+    try {
+      await expect(client.downloadSessionFile(sessionId, "/tmp/raw.bin")).rejects.toThrow("http_file_transfer_unsupported");
+    } finally {
+      (globalThis as unknown as { fetch: typeof fetch }).fetch = originalFetch;
+      client.close();
+    }
+
+    expect(daemon.receivedPackets.some((packet) => packet.method === "session.file_download")).toBe(false);
+    expect(daemon.sessionFileDownloadChunkRequests).toHaveLength(0);
+  });
+
+  it("HTTP 下载没有 ReadableStream body 时不会退回整包 arrayBuffer 缓冲", async () => {
+    const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000329");
+    const pairClient = await connectDevice(device.device_id);
+    const accepted = await pairClient.pair("secret-token", device.device_public_key);
+    pairClient.close();
+
+    const client = await connectDevice(device.device_id);
+    await client.authenticate(device, {
+      server_id: accepted.server_id,
+      daemon_public_key: accepted.daemon_public_key,
+      url: daemon.url,
+      paired_at_ms: 1710000000000,
+    });
+    const list = await client.listSessions();
+    const sessionId = list.sessions[0].session_id;
+    await client.attachSessionPermission(sessionId);
+    const originalFetch = globalThis.fetch;
+    const arrayBuffer = vi.fn<() => Promise<ArrayBuffer>>();
+    (globalThis as unknown as { fetch: typeof fetch }).fetch = (async (_input, init) => {
+      const headers = new Headers(init?.headers);
+      const e2ee = httpE2eeSessionFromHeaders(headers);
+      const ready = {
+        session_id: sessionId,
+        path: "/tmp/raw.bin",
+        name: "raw.bin",
+        size_bytes: 3,
+        modified_at_ms: null,
+      } satisfies SessionFileDownloadStreamReadyPayload;
+      const encryptedBody = responseBodyBytes(encodeHttpE2eeTestFrames(e2ee, [encodeUtf8(JSON.stringify(ready))]));
+      arrayBuffer.mockResolvedValue(encryptedBody);
+      const response = new Response(null, { status: 200 });
+      Object.defineProperty(response, "body", { value: null });
+      Object.defineProperty(response, "arrayBuffer", { value: arrayBuffer });
+      return response;
+    }) as typeof fetch;
+    try {
+      await expect(
+        client.downloadSessionFile(sessionId, "/tmp/raw.bin", { collectBytes: false }),
+      ).rejects.toThrow("http_file_transfer_unsupported");
+    } finally {
+      (globalThis as unknown as { fetch: typeof fetch }).fetch = originalFetch;
+      client.close();
+    }
+
+    expect(arrayBuffer).not.toHaveBeenCalled();
+    expect(daemon.receivedPackets.some((packet) => packet.method === "session.file_download")).toBe(false);
+  });
+
+  it("HTTP E2EE 认证签名绑定 method、path 和 header 公钥", async () => {
+    const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000330");
+    const pairClient = await connectDevice(device.device_id);
+    const accepted = await pairClient.pair("secret-token", device.device_public_key);
+    pairClient.close();
+
+    const client = await connectDevice(device.device_id);
+    await client.authenticate(device, {
+      server_id: accepted.server_id,
+      daemon_public_key: accepted.daemon_public_key,
+      url: daemon.url,
+      paired_at_ms: 1710000000000,
+    });
+    const list = await client.listSessions();
+    const sessionId = list.sessions[0].session_id;
+    await client.attachSessionPermission(sessionId);
+
+    const originalFetch = globalThis.fetch;
+    let verified = false;
+    let tamperedPathRejected = false;
+    (globalThis as unknown as { fetch: typeof fetch }).fetch = (async (_input, init) => {
+      const headers = new Headers(init?.headers);
+      const auth: HttpE2eeAuthPayload = {
+        device_id: headers.get("x-termd-device-id") ?? "",
+        e2ee_public_key: headers.get("x-termd-e2ee-public-key") ?? "",
+        nonce: headers.get("x-termd-e2ee-nonce") ?? "",
+        timestamp_ms: Number(headers.get("x-termd-e2ee-timestamp-ms") ?? "0"),
+        method: "POST",
+        path: "/api/files/download",
+        signature: headers.get("x-termd-e2ee-signature") ?? "",
+      };
+      const publicKey = decodeEd25519PublicKey(device.device_public_key);
+      const daemonIdentity = {
+        server_id: daemon.serverId,
+        daemon_public_key: daemon.daemonPublicKey,
+      };
+      verified = await verifyEd25519Signature(
+        publicKey,
+        httpE2eeSigningInputBytes(auth, daemonIdentity),
+        auth.signature,
+      );
+      tamperedPathRejected = !(await verifyEd25519Signature(
+        publicKey,
+        httpE2eeSigningInputBytes({ ...auth, path: "/api/files/upload" }, daemonIdentity),
+        auth.signature,
+      ));
+
+      const e2ee = httpE2eeSessionFromHeaders(headers);
+      const ready = {
+        session_id: sessionId,
+        path: "/tmp/raw.bin",
+        name: "raw.bin",
+        size_bytes: 3,
+        modified_at_ms: null,
+      } satisfies SessionFileDownloadStreamReadyPayload;
+      return new Response(responseBodyBytes(encodeHttpE2eeTestFrames(e2ee, [
+        encodeUtf8(JSON.stringify(ready)),
+        new Uint8Array([1, 2, 3]),
+      ])));
+    }) as typeof fetch;
+    try {
+      await client.downloadSessionFile(sessionId, "/tmp/raw.bin", {
+        collectBytes: false,
+        onChunk: () => undefined,
+      });
+    } finally {
+      (globalThis as unknown as { fetch: typeof fetch }).fetch = originalFetch;
+      client.close();
+    }
+
+    expect(verified).toBe(true);
+    expect(tamperedPathRejected).toBe(true);
+  });
+
+  it("HTTP 文件传输保留 WebSocket 子路径前缀和 query", async () => {
+    const prefixedUrl = daemon.url.replace("/ws", "/termd/ws?relay_token=abc");
+    const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000319");
+    const pairClient = await connectDevice(device.device_id, 3000, prefixedUrl);
+    const accepted = await pairClient.pair("secret-token", device.device_public_key);
+    pairClient.close();
+
+    const client = await connectDevice(device.device_id, 3000, prefixedUrl);
+    await client.authenticate(device, {
+      server_id: accepted.server_id,
+      daemon_public_key: accepted.daemon_public_key,
+      url: prefixedUrl,
+      paired_at_ms: 1710000000000,
+    });
+    const list = await client.listSessions();
+    const sessionId = list.sessions[0].session_id;
+    await client.attachSessionPermission(sessionId);
+
+    const originalFetch = globalThis.fetch;
+    let requestedUrl = "";
+    (globalThis as unknown as { fetch: typeof fetch }).fetch = (async (input) => {
+      requestedUrl = input instanceof Request ? input.url : String(input);
+      return new Response(JSON.stringify({ code: "invalid_file_transfer", message: "bad request" }), {
+        status: 400,
+        headers: { "content-type": "application/json" },
+      });
+    }) as typeof fetch;
+    try {
+      await expect(client.downloadSessionFile(sessionId, "/tmp/raw.bin")).rejects.toMatchObject({
+        code: "invalid_file_transfer",
+      });
+    } finally {
+      (globalThis as unknown as { fetch: typeof fetch }).fetch = originalFetch;
+      client.close();
+    }
+
+    const url = new URL(requestedUrl);
+    expect(url.pathname).toBe("/termd/api/files/download");
+    expect(url.searchParams.get("relay_token")).toBe("abc");
   });
 
   it("terminal attach 会把已渲染的 session terminal_seq 作为 last_terminal_seq 发送", async () => {

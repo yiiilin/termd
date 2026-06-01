@@ -12,6 +12,26 @@ version="${1:-}"
 }
 
 case "$version" in
+  0.3.11)
+    cat <<'EOF'
+termd 0.3.11
+
+用户可见变化:
+- 文件上传/下载新增 E2EE HTTP 传输路径；大文件不再通过 WebSocket RPC/base64 传输，relay 和 direct 下都可以走更接近原生 HTTP 的二进制 body。
+- Web 文件上传改为 10MiB 分片、最多 2 并发提交；上传时会显示悬浮进度，切换 session 后进度不会立刻丢失，300MB 文件通过真实 relay 上传到 `/tmp` 已覆盖回归测试。
+- daemon 端 HTTP 上传会直接在目标路径 `create_new + set_len`，再按 offset seek 写入目标文件；不再先写临时文件再 rename，避免大文件上传中途失败后目标状态不清晰。
+- 上传中的目标文件会被 daemon active guard 保护；文件列表、编辑读写、删除、下载和 Git 操作都会避开或拒绝正在上传的目标，避免半成品文件被误读、覆盖或提交。
+- 上传失败、浏览器取消、daemon 重启后的上传清理更保守：只有能证明目标仍是同一个上传文件时才删除；遇到文件被替换、hardlink alias 或文件 identity 缺失时 fail-closed，保留 guard/recovery 记录等待人工确认。
+- relay 新增 HTTP file tunnel，但仍保持 dumb pipe：只转发允许的文件传输 route，不解密、不解析业务明文；client 断开会关闭对应 daemon data pipe，旧连接不会继续污染新上传或新终端连接。
+- Web terminal 连接在浏览器失焦/后台时不再主动断开；只有浏览器 offline 才中断 terminal transport，并且 WebSocket 建连增加短超时重试/hedging，降低“切出去一会儿回来只发不收”的概率。
+- RPC `file_read` / `file_write` 收口为内置文本编辑器的小文件通道；大文件传输必须走 HTTP E2EE 或 binary stream，避免再次把大文件塞回 JSON/base64。
+
+兼容性:
+- supervisor 兼容版本未变化，仍为 `0.3.5`；从 0.3.10 更新到 0.3.11 不应终止或清空已有 live session supervisor。
+- packet protocol version 仍为 3，但新增 HTTP E2EE 文件传输接口和 relay HTTP tunnel；为了使用 relay 大文件上传/下载，daemon、Web UI 和 termrelay 应同步升级到 0.3.11。
+- 旧 daemon/relay 不支持 HTTP 文件端点时，Web 上传小文件可回退到旧 RPC/binary stream；HTTP 下载不做旧协议回退，需同步升级 daemon/relay/Web UI 才能使用新下载路径。
+EOF
+    ;;
   0.3.10)
     cat <<'EOF'
 termd 0.3.10

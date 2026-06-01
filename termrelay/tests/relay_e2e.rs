@@ -9,7 +9,7 @@ use termd::net::{E2eeKeyPair, E2eeSession, E2eeSessionContext, E2eeSessionRole};
 use termd_proto::{
     DeviceId, EncryptedFramePayload, Envelope, MessageType, Nonce, PairRequestPayload,
     PairingToken, ProtocolVersion, PublicKey, RelayClientId, RelayControlEnvelope,
-    RouteHelloPayload, RouteReadyPayload, RouteRole, ServerId,
+    RouteHelloPayload, RouteReadyPayload, RouteRole, ServerId, decode_relay_data_control,
 };
 use tokio::time::{sleep, timeout};
 use tokio_tungstenite::tungstenite::Message;
@@ -112,12 +112,141 @@ async fn relay_pairs_control_and_data_connections_as_raw_dumb_pipe() {
         .await
         .expect("client route_hello should send");
     let (client_id, data_token) = expect_open_data(&mut daemon_control).await;
-    assert!(
-        timeout(Duration::from_millis(60), client.next())
+    expect_route_ready(&mut client, server_id, RouteRole::Client)
+        .await
+        .expect("client should receive route_ready before data pair");
+
+    let (early_wire, _) = encrypted_pair_request_wire(server_id, RELAY_SECRET_SENTINEL);
+    client
+        .send(Message::Text(early_wire.clone()))
+        .await
+        .expect("client should send raw encrypted frame before data pair");
+
+    let (mut daemon_data, _) = connect_async(relay.ws_url().as_str())
+        .await
+        .expect("daemon data should connect relay");
+    send_route_hello_with_data(
+        &mut daemon_data,
+        server_id,
+        RouteRole::DaemonData,
+        Some(client_id),
+        Some(data_token),
+    )
+    .await
+    .expect("daemon data route_hello should send");
+    expect_route_ready(&mut daemon_data, server_id, RouteRole::DaemonData)
+        .await
+        .expect("daemon data should receive route_ready");
+    assert_eq!(next_text(&mut daemon_data).await, early_wire);
+
+    let (wire, _) = encrypted_pair_request_wire(server_id, RELAY_SECRET_SENTINEL);
+    client
+        .send(Message::Text(wire.clone()))
+        .await
+        .expect("client should send raw encrypted frame");
+    assert_eq!(next_text(&mut daemon_data).await, wire);
+
+    let binary = b"daemon-to-browser-binary-frame".to_vec();
+    daemon_data
+        .send(Message::Binary(binary.clone()))
+        .await
+        .expect("daemon data should send raw binary");
+    assert_eq!(next_binary(&mut client).await, binary);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relay_assigns_preconnected_idle_daemon_data_pipe_to_client() {
+    let relay = RelayProcess::spawn().await;
+    let server_id = ServerId::new();
+    let mut daemon_control =
+        connect_registered_socket(relay.ws_url(), server_id, RouteRole::DaemonControl)
             .await
-            .is_err(),
-        "client route_ready must wait until daemon data route is paired"
+            .expect("daemon control should connect");
+
+    let mut idle_daemon_data =
+        connect_registered_socket(relay.ws_url(), server_id, RouteRole::DaemonData)
+            .await
+            .expect("idle daemon data should connect without client_id");
+
+    let (mut client, _) = connect_async(relay.ws_url().as_str())
+        .await
+        .expect("client should connect relay");
+    send_route_hello(&mut client, server_id, RouteRole::Client)
+        .await
+        .expect("client route_hello should send");
+    expect_route_ready(&mut client, server_id, RouteRole::Client)
+        .await
+        .expect("client should receive route_ready");
+
+    let (assigned_client_id, _data_token) = expect_open_data(&mut idle_daemon_data).await;
+    let control_open_data = timeout(
+        Duration::from_millis(150),
+        expect_open_data(&mut daemon_control),
+    )
+    .await;
+    assert!(
+        control_open_data.is_err(),
+        "idle data pipe 可用时 relay 不应再要求 daemon 冷启动反连"
     );
+
+    let wire = "encrypted-client-frame-after-idle-assign".to_owned();
+    client
+        .send(Message::Text(wire.clone()))
+        .await
+        .expect("client should send raw frame through assigned pipe");
+    assert_eq!(next_text(&mut idle_daemon_data).await, wire);
+
+    let daemon_frame = b"daemon-frame-through-idle-pipe".to_vec();
+    idle_daemon_data
+        .send(Message::Binary(daemon_frame.clone()))
+        .await
+        .expect("daemon data should send raw binary");
+    assert_eq!(next_binary(&mut client).await, daemon_frame);
+    assert!(
+        assigned_client_id.0 > 0,
+        "relay 应给 idle data pipe 分配真实 client_id"
+    );
+
+    client.close(None).await.expect("client close should send");
+    match timeout(Duration::from_secs(2), idle_daemon_data.next())
+        .await
+        .expect("relay should close old daemon data pipe")
+    {
+        Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {}
+        Some(Ok(other)) => {
+            panic!("expected daemon data close after client disconnect, got {other:?}")
+        }
+    }
+
+    let (mut second_client, _) = connect_async(relay.ws_url().as_str())
+        .await
+        .expect("second client should connect relay");
+    send_route_hello(&mut second_client, server_id, RouteRole::Client)
+        .await
+        .expect("second client route_hello should send");
+    expect_route_ready(&mut second_client, server_id, RouteRole::Client)
+        .await
+        .expect("second client should receive route_ready");
+    let (second_client_id, _second_token) = expect_open_data(&mut daemon_control).await;
+    assert!(second_client_id.0 > assigned_client_id.0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relay_forwards_large_terminal_snapshot_sized_binary_frame() {
+    let relay = RelayProcess::spawn().await;
+    let server_id = ServerId::new();
+    let mut daemon_control =
+        connect_registered_socket(relay.ws_url(), server_id, RouteRole::DaemonControl)
+            .await
+            .expect("daemon control should connect");
+
+    let (mut client, _) = connect_async(relay.ws_url().as_str())
+        .await
+        .expect("client should connect relay");
+    send_route_hello(&mut client, server_id, RouteRole::Client)
+        .await
+        .expect("client route_hello should send");
+    let (client_id, data_token) = expect_open_data(&mut daemon_control).await;
 
     let (mut daemon_data, _) = connect_async(relay.ws_url().as_str())
         .await
@@ -138,19 +267,14 @@ async fn relay_pairs_control_and_data_connections_as_raw_dumb_pipe() {
         .await
         .expect("client should receive route_ready after data pair");
 
-    let (wire, _) = encrypted_pair_request_wire(server_id, RELAY_SECRET_SENTINEL);
-    client
-        .send(Message::Text(wire.clone()))
-        .await
-        .expect("client should send raw encrypted frame");
-    assert_eq!(next_text(&mut daemon_data).await, wire);
-
-    let binary = b"daemon-to-browser-binary-frame".to_vec();
+    // 真实终端 snapshot 是 E2EE 后的单个 opaque binary WebSocket frame。
+    // relay 不能解析后分片，因此传输层必须允许 MB 级重绘帧原样通过。
+    let snapshot_sized_frame = vec![0x5a; 6 * 1024 * 1024];
     daemon_data
-        .send(Message::Binary(binary.clone()))
+        .send(Message::Binary(snapshot_sized_frame.clone()))
         .await
-        .expect("daemon data should send raw binary");
-    assert_eq!(next_binary(&mut client).await, binary);
+        .expect("daemon data should send large terminal snapshot frame");
+    assert_eq!(next_binary(&mut client).await, snapshot_sized_frame);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -552,7 +676,17 @@ async fn expect_open_data(socket: &mut RelaySocket) -> (RelayClientId, Nonce) {
                 } => return (client_id, data_token),
                 other => panic!("expected open_data, got {other:?}"),
             },
-            Message::Ping(_) | Message::Pong(_) => continue,
+            Message::Ping(payload) => {
+                let _ = socket.send(Message::Pong(payload.clone())).await;
+                if let Some(RelayControlEnvelope::OpenData {
+                    client_id,
+                    data_token,
+                }) = decode_relay_data_control(&payload)
+                {
+                    return (client_id, data_token);
+                }
+            }
+            Message::Pong(_) => continue,
             other => panic!("expected relay control text, got {other:?}"),
         }
     }

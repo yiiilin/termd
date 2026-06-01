@@ -1,10 +1,13 @@
+use axum::body::Body;
 use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::{Query, State};
-use axum::http::StatusCode;
-use axum::response::IntoResponse;
-use axum::routing::get;
+use axum::http::{HeaderMap, Method, StatusCode, Uri};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
+use termd_proto::ServerId;
+use uuid::Uuid;
 
 use crate::ws::{RelayState, WEBSOCKET_MAX_FRAME_SIZE, WEBSOCKET_MAX_MESSAGE_SIZE, handle_socket};
 
@@ -12,12 +15,56 @@ pub fn router(state: RelayState, web_enabled: bool) -> Router {
     let router = Router::new()
         .route("/healthz", get(healthz))
         .route("/ws", get(relay_ws))
+        .route("/api/files/upload/init", post(relay_http_tunnel))
+        .route("/api/files/upload", post(relay_http_tunnel))
+        .route("/api/files/upload/abort", post(relay_http_tunnel))
+        .route("/api/files/download", post(relay_http_tunnel))
         .with_state(state);
 
     if web_enabled {
         router.fallback(termweb::embedded_web_handler)
     } else {
         router
+    }
+}
+
+async fn relay_http_tunnel(
+    State(state): State<RelayState>,
+    Query(auth): Query<RelayAuthQuery>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    if !state.authorizes(auth.relay_token.as_deref()) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let Some(server_id) = headers
+        .get("x-termd-server-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .map(ServerId)
+    else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let forwarded_headers = headers
+        .iter()
+        .filter_map(|(name, value)| {
+            Some((name.as_str().to_owned(), value.to_str().ok()?.to_owned()))
+        })
+        .collect::<Vec<_>>();
+    match state
+        .http_tunnel(
+            server_id,
+            method.as_str().to_owned(),
+            uri.path().to_owned(),
+            forwarded_headers,
+            body.into_data_stream(),
+        )
+        .await
+    {
+        Ok(response) => response,
+        Err(status) => status.into_response(),
     }
 }
 

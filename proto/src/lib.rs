@@ -257,7 +257,7 @@ fn is_zero_u64(value: &u64) -> bool {
 /// 0.2.0 的加密业务包版本；外层 WebSocket/relay 仍只承担 transport。
 pub const PROTOCOL_PACKET_VERSION: u16 = 3;
 /// 二进制数据面版本；双方都声明该版本时，E2EE 后的 packet 使用 WebSocket binary + Protobuf。
-pub const BINARY_PROTOCOL_VERSION: u16 = 1;
+pub const BINARY_PROTOCOL_VERSION: u16 = 2;
 
 /// 一次 request/response 交互的关联 id。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -486,7 +486,7 @@ pub struct BinaryProtocolPacket {
     pub ack: u64,
     #[prost(uint32, tag = "8")]
     pub credit: u32,
-    #[prost(oneof = "binary_protocol_packet::Payload", tags = "20, 21, 22, 23")]
+    #[prost(oneof = "binary_protocol_packet::Payload", tags = "20, 21, 22, 23, 24")]
     pub payload: Option<binary_protocol_packet::Payload>,
 }
 
@@ -502,6 +502,8 @@ pub mod binary_protocol_packet {
         TerminalFrame(super::BinaryTerminalFramePayload),
         #[prost(message, tag = "23")]
         Error(super::BinaryPacketErrorPayload),
+        #[prost(message, tag = "24")]
+        FileChunk(super::BinaryFileChunkPayload),
     }
 }
 
@@ -511,6 +513,20 @@ pub struct BinarySessionDataPayload {
     pub session_id: Vec<u8>,
     #[prost(bytes = "vec", tag = "2")]
     pub data: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct BinaryFileChunkPayload {
+    #[prost(bytes = "vec", tag = "1")]
+    pub session_id: Vec<u8>,
+    #[prost(uint64, tag = "2")]
+    pub offset_bytes: u64,
+    #[prost(bytes = "vec", tag = "3")]
+    pub data: Vec<u8>,
+    #[prost(uint64, tag = "4")]
+    pub size_bytes: u64,
+    #[prost(bool, tag = "5")]
+    pub eof: bool,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
@@ -595,13 +611,15 @@ pub struct RouteHelloPayload {
     /// daemon data 连接要绑定的 relay client。
     ///
     /// browser client 和 daemon data 是一一配对的数据管道；relay 只用该字段做连接配对，
-    /// 不解析后续 E2EE 业务内容。
+    /// 不解析后续 E2EE 业务内容。该字段为空时表示 daemon 预先建立的 idle data pipe，
+    /// relay 会在后续 client 接入时通过公开生命周期帧把它分配给具体 client。
     #[serde(default)]
     pub client_id: Option<RelayClientId>,
     /// daemon data 连接的一次性配对令牌。
     ///
     /// 令牌由 relay 通过 daemon control 线下发；daemon 反连 data 线时带回。relay 用它
-    /// 防止迟到的旧 data 连接误配到新的 browser client。
+    /// 防止迟到的旧 data 连接误配到新的 browser client。idle data pipe 初始为空，真正
+    /// 分配时仍会携带一次性令牌。
     #[serde(default)]
     pub data_token: Option<Nonce>,
     pub timestamp_ms: UnixTimestampMillis,
@@ -631,6 +649,21 @@ pub struct AuthPayload {
     pub challenge: Challenge,
     pub nonce: Nonce,
     pub timestamp_ms: UnixTimestampMillis,
+    pub signature: Signature,
+}
+
+/// HTTP E2EE 短期通道的设备认证材料。
+///
+/// 该 payload 通常来自 HTTP header：body 仍保持端到端加密，公开字段只用于让 daemon
+/// 验证本次请求确实由已配对设备发起，并把签名绑定到具体 method/path。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HttpE2eeAuthPayload {
+    pub device_id: DeviceId,
+    pub e2ee_public_key: PublicKey,
+    pub nonce: Nonce,
+    pub timestamp_ms: UnixTimestampMillis,
+    pub method: String,
+    pub path: String,
     pub signature: Signature,
 }
 
@@ -1280,6 +1313,8 @@ pub struct SessionGitDiffResultPayload {
 pub struct SessionFileReadPayload {
     pub session_id: SessionId,
     pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1355,6 +1390,81 @@ pub struct SessionFileDownloadChunkResultPayload {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionFileUploadPayload {
+    pub session_id: SessionId,
+    pub path: String,
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionFileUploadReadyPayload {
+    pub session_id: SessionId,
+    pub path: String,
+    pub size_bytes: u64,
+    pub offset_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionFileHttpUploadReadyPayload {
+    pub session_id: SessionId,
+    pub path: String,
+    pub upload_id: String,
+    pub size_bytes: u64,
+    pub offset_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionFileHttpUploadStreamPayload {
+    pub session_id: SessionId,
+    pub path: String,
+    pub upload_id: String,
+    pub size_bytes: u64,
+    pub offset_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionFileHttpDownloadPayload {
+    pub session_id: SessionId,
+    pub path: String,
+    #[serde(default)]
+    pub offset_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionFileUploadProgressPayload {
+    pub session_id: SessionId,
+    pub path: String,
+    pub offset_bytes: u64,
+    pub size_bytes: u64,
+    pub eof: bool,
+    pub modified_at_ms: Option<UnixTimestampMillis>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionFileDownloadStreamPayload {
+    pub session_id: SessionId,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionFileDownloadStreamReadyPayload {
+    pub session_id: SessionId,
+    pub path: String,
+    pub name: String,
+    pub size_bytes: u64,
+    pub modified_at_ms: Option<UnixTimestampMillis>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionFileTransferChunkPayload {
+    pub session_id: SessionId,
+    pub offset_bytes: u64,
+    pub data_base64: String,
+    pub size_bytes: u64,
+    pub eof: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControlRequestPayload {
     pub session_id: SessionId,
     pub device_id: DeviceId,
@@ -1393,11 +1503,11 @@ pub struct PongPayload {
 #[serde(transparent)]
 pub struct RelayClientId(pub u64);
 
-/// relay control 线上的生命周期消息。
+/// relay transport 生命周期消息。
 ///
-/// 该消息只用于建立/关闭 relay transport 数据管道，不包含 terminal、session、auth 或
-/// E2EE 明文。真正的 browser-daemon 业务流仍只在配对后的 data 线上按原始 WebSocket
-/// frame 透传。
+/// 该消息只用于建立/关闭/分配 relay transport 数据管道，不包含 terminal、session、
+/// auth 或 E2EE 明文。真正的 browser-daemon 业务流仍只在配对后的 data 线上按原始
+/// WebSocket frame 透传。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RelayControlEnvelope {
@@ -1408,6 +1518,79 @@ pub enum RelayControlEnvelope {
     ClientDisconnected {
         client_id: RelayClientId,
     },
+    /// daemon data pipe 已完成旧 client 上下文清理，可以重新进入 relay idle 池。
+    DataReady,
+}
+
+const RELAY_DATA_CONTROL_MAGIC: &[u8] = b"tdc1";
+
+/// 把 relay data 线生命周期控制编码进 WebSocket control frame payload。
+///
+/// data 线的 text/binary frame 必须保持业务原样透传；因此不能再用普通 JSON text
+/// 承载 `data_ready` / `client_disconnected` 等 transport 控制消息，否则会和合法业务
+/// text frame 的 JSON 形状发生碰撞。这里使用 WebSocket ping/pong payload 中的紧凑二进制
+/// 控制格式，避开业务 text/binary 命名空间，并保持 payload 小于控制帧 125 字节限制。
+pub fn encode_relay_data_control(envelope: &RelayControlEnvelope) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(96);
+    out.extend_from_slice(RELAY_DATA_CONTROL_MAGIC);
+    match envelope {
+        RelayControlEnvelope::OpenData {
+            client_id,
+            data_token,
+        } => {
+            let token = data_token.0.as_bytes();
+            let token_len = u8::try_from(token.len()).ok()?;
+            out.push(1);
+            out.extend_from_slice(&client_id.0.to_be_bytes());
+            out.push(token_len);
+            out.extend_from_slice(token);
+        }
+        RelayControlEnvelope::ClientDisconnected { client_id } => {
+            out.push(2);
+            out.extend_from_slice(&client_id.0.to_be_bytes());
+        }
+        RelayControlEnvelope::DataReady => {
+            out.push(3);
+        }
+    }
+    (out.len() <= 125).then_some(out)
+}
+
+/// 解码 relay data 线 WebSocket control frame payload。
+pub fn decode_relay_data_control(payload: &[u8]) -> Option<RelayControlEnvelope> {
+    let rest = payload.strip_prefix(RELAY_DATA_CONTROL_MAGIC)?;
+    let (&kind, rest) = rest.split_first()?;
+    match kind {
+        1 => {
+            if rest.len() < 9 {
+                return None;
+            }
+            let mut client_id = [0_u8; 8];
+            client_id.copy_from_slice(&rest[..8]);
+            let token_len = rest[8] as usize;
+            let token = rest.get(9..9 + token_len)?;
+            if rest.len() != 9 + token_len {
+                return None;
+            }
+            let data_token = String::from_utf8(token.to_vec()).ok()?;
+            Some(RelayControlEnvelope::OpenData {
+                client_id: RelayClientId(u64::from_be_bytes(client_id)),
+                data_token: Nonce(data_token),
+            })
+        }
+        2 => {
+            if rest.len() != 8 {
+                return None;
+            }
+            let mut client_id = [0_u8; 8];
+            client_id.copy_from_slice(rest);
+            Some(RelayControlEnvelope::ClientDisconnected {
+                client_id: RelayClientId(u64::from_be_bytes(client_id)),
+            })
+        }
+        3 => rest.is_empty().then_some(RelayControlEnvelope::DataReady),
+        _ => None,
+    }
 }
 
 /// relay mux 通道承载的不透明 WebSocket frame。
@@ -1576,6 +1759,121 @@ pub fn decode_binary_relay_mux_envelope(
             },
         }),
     }
+}
+
+const RELAY_HTTP_TUNNEL_STREAM_MAGIC: &[u8; 4] = b"TDHT";
+const RELAY_HTTP_TUNNEL_REQUEST_HEAD: u8 = 1;
+const RELAY_HTTP_TUNNEL_REQUEST_BODY: u8 = 2;
+const RELAY_HTTP_TUNNEL_REQUEST_END: u8 = 3;
+const RELAY_HTTP_TUNNEL_RESPONSE_HEAD: u8 = 4;
+const RELAY_HTTP_TUNNEL_RESPONSE_BODY: u8 = 5;
+const RELAY_HTTP_TUNNEL_RESPONSE_END: u8 = 6;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct RelayHttpTunnelHead {
+    method: String,
+    path: String,
+    headers: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RelayHttpTunnelFrame {
+    RequestHead {
+        method: String,
+        path: String,
+        headers: Vec<(String, String)>,
+    },
+    RequestBody {
+        body: Vec<u8>,
+    },
+    RequestEnd,
+    ResponseHead {
+        status: u16,
+    },
+    ResponseBody {
+        body: Vec<u8>,
+    },
+    ResponseEnd,
+}
+
+pub fn encode_relay_http_tunnel_request_head(
+    method: String,
+    path: String,
+    headers: Vec<(String, String)>,
+) -> Result<Vec<u8>, serde_json::Error> {
+    let head = serde_json::to_vec(&RelayHttpTunnelHead {
+        method,
+        path,
+        headers,
+    })?;
+    Ok(encode_relay_http_tunnel_stream_frame(
+        RELAY_HTTP_TUNNEL_REQUEST_HEAD,
+        &head,
+    ))
+}
+
+pub fn encode_relay_http_tunnel_request_body(body: Vec<u8>) -> Vec<u8> {
+    encode_relay_http_tunnel_stream_frame(RELAY_HTTP_TUNNEL_REQUEST_BODY, &body)
+}
+
+pub fn encode_relay_http_tunnel_request_end() -> Vec<u8> {
+    encode_relay_http_tunnel_stream_frame(RELAY_HTTP_TUNNEL_REQUEST_END, &[])
+}
+
+pub fn encode_relay_http_tunnel_response_head(status: u16) -> Vec<u8> {
+    encode_relay_http_tunnel_stream_frame(RELAY_HTTP_TUNNEL_RESPONSE_HEAD, &status.to_be_bytes())
+}
+
+pub fn encode_relay_http_tunnel_response_body(body: Vec<u8>) -> Vec<u8> {
+    encode_relay_http_tunnel_stream_frame(RELAY_HTTP_TUNNEL_RESPONSE_BODY, &body)
+}
+
+pub fn encode_relay_http_tunnel_response_end() -> Vec<u8> {
+    encode_relay_http_tunnel_stream_frame(RELAY_HTTP_TUNNEL_RESPONSE_END, &[])
+}
+
+pub fn decode_relay_http_tunnel_frame(raw: &[u8]) -> Option<RelayHttpTunnelFrame> {
+    if raw.len() < 5 || &raw[0..4] != RELAY_HTTP_TUNNEL_STREAM_MAGIC {
+        return None;
+    }
+    let kind = raw[4];
+    let payload = &raw[5..];
+    match kind {
+        RELAY_HTTP_TUNNEL_REQUEST_HEAD => {
+            let head: RelayHttpTunnelHead = serde_json::from_slice(payload).ok()?;
+            Some(RelayHttpTunnelFrame::RequestHead {
+                method: head.method,
+                path: head.path,
+                headers: head.headers,
+            })
+        }
+        RELAY_HTTP_TUNNEL_REQUEST_BODY => Some(RelayHttpTunnelFrame::RequestBody {
+            body: payload.to_vec(),
+        }),
+        RELAY_HTTP_TUNNEL_REQUEST_END if payload.is_empty() => {
+            Some(RelayHttpTunnelFrame::RequestEnd)
+        }
+        RELAY_HTTP_TUNNEL_RESPONSE_HEAD if payload.len() == 2 => {
+            Some(RelayHttpTunnelFrame::ResponseHead {
+                status: u16::from_be_bytes(payload.try_into().ok()?),
+            })
+        }
+        RELAY_HTTP_TUNNEL_RESPONSE_BODY => Some(RelayHttpTunnelFrame::ResponseBody {
+            body: payload.to_vec(),
+        }),
+        RELAY_HTTP_TUNNEL_RESPONSE_END if payload.is_empty() => {
+            Some(RelayHttpTunnelFrame::ResponseEnd)
+        }
+        _ => None,
+    }
+}
+
+fn encode_relay_http_tunnel_stream_frame(kind: u8, payload: &[u8]) -> Vec<u8> {
+    let mut wire = Vec::with_capacity(5 + payload.len());
+    wire.extend_from_slice(RELAY_HTTP_TUNNEL_STREAM_MAGIC);
+    wire.push(kind);
+    wire.extend_from_slice(payload);
+    wire
 }
 
 fn binary_relay_mux_payload(
@@ -2037,6 +2335,12 @@ mod tests {
         assert_roundtrip(SessionFileReadPayload {
             session_id,
             path: "src/main.rs".to_owned(),
+            max_bytes: None,
+        });
+        assert_roundtrip(SessionFileReadPayload {
+            session_id,
+            path: "large.txt".to_owned(),
+            max_bytes: Some(1024),
         });
         assert_roundtrip(SessionFileReadResultPayload {
             session_id,
@@ -2472,6 +2776,55 @@ mod tests {
                 BinarySessionDataPayload {
                     session_id: session_id.0.as_bytes().to_vec(),
                     data: terminal_bytes,
+                },
+            )),
+        );
+    }
+
+    #[test]
+    fn binary_protocol_packet_file_chunk_carries_raw_file_bytes_without_base64() {
+        let session_id = SessionId::new();
+        let stream_id = PacketStreamId::new();
+        let file_bytes = b"\x00raw-file-upload-download\xff".to_vec();
+        let packet = BinaryProtocolPacket {
+            version: PROTOCOL_PACKET_VERSION as u32,
+            kind: BinaryPacketKind::StreamChunk as i32,
+            id: Vec::new(),
+            stream_id: stream_id.0.as_bytes().to_vec(),
+            method: String::new(),
+            seq: 3,
+            ack: 0,
+            credit: 0,
+            payload: Some(binary_protocol_packet::Payload::FileChunk(
+                BinaryFileChunkPayload {
+                    session_id: session_id.0.as_bytes().to_vec(),
+                    offset_bytes: 5,
+                    data: file_bytes.clone(),
+                    size_bytes: 128,
+                    eof: false,
+                },
+            )),
+        };
+
+        let encoded = encode_binary_protocol_packet(&packet);
+        let decoded = decode_binary_protocol_packet(&encoded).expect("binary packet should decode");
+
+        assert_eq!(decoded.kind, BinaryPacketKind::StreamChunk as i32);
+        assert_eq!(decoded.seq, 3);
+        assert_eq!(decoded.stream_id, stream_id.0.as_bytes());
+        assert!(!String::from_utf8_lossy(&encoded).contains("data_base64"));
+        assert!(
+            !String::from_utf8_lossy(&encoded).contains("AHJhdy1maWxlLXVwbG9hZC1kb3dubG9hZP8=")
+        );
+        assert_eq!(
+            decoded.payload,
+            Some(binary_protocol_packet::Payload::FileChunk(
+                BinaryFileChunkPayload {
+                    session_id: session_id.0.as_bytes().to_vec(),
+                    offset_bytes: 5,
+                    data: file_bytes,
+                    size_bytes: 128,
+                    eof: false,
                 },
             )),
         );

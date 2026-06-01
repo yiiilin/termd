@@ -69,6 +69,22 @@ pub struct SessionStateRecord {
     pub restore_info: Option<PtyRestoreInfo>,
 }
 
+/// 未完成 HTTP upload 的恢复清理记录。
+///
+/// 这里只保存最终目标路径和创建时的文件 identity；daemon 重启后只用它做安全 cleanup，
+/// 不保存任何文件内容或 E2EE 明文。Unix/Windows 下 `dev/ino` 是原生文件对象 ID；
+/// Windows 缺失 file id 时用协议层 sentinel 表示；其他平台没有稳定 file id，cleanup
+/// 会安全失败，不静默删除未知对象。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HttpUploadRecoveryRecord {
+    pub upload_id: String,
+    pub target_path: PathBuf,
+    pub size_bytes: u64,
+    pub dev: u64,
+    pub ino: u64,
+    pub updated_at_ms: UnixTimestampMillis,
+}
+
 /// daemon 本地持久状态。
 ///
 /// `version` 是 schema 迁移锚点；MVP 中 load/save 只接受当前结构，后续需要兼容旧版本时可以在
@@ -191,6 +207,67 @@ impl StateStore {
         let mut conn = open_state_connection(&sqlite_path)?;
         initialize_daemon_state_schema(&conn, &sqlite_path)?;
         prune_closed_runtime_sessions_except(&mut conn, &sqlite_path, protected_session_ids)
+    }
+
+    pub fn list_http_uploads(
+        path: impl AsRef<Path>,
+    ) -> Result<Vec<HttpUploadRecoveryRecord>, StateError> {
+        let sqlite_path = sqlite_state_path_for_state_path(path.as_ref());
+        let conn = open_state_connection(&sqlite_path)?;
+        initialize_daemon_state_schema(&conn, &sqlite_path)?;
+        list_http_uploads(&conn, &sqlite_path)
+    }
+
+    pub fn record_http_upload(
+        path: impl AsRef<Path>,
+        record: &HttpUploadRecoveryRecord,
+    ) -> Result<(), StateError> {
+        let sqlite_path = sqlite_state_path_for_state_path(path.as_ref());
+        let conn = open_state_connection(&sqlite_path)?;
+        initialize_daemon_state_schema(&conn, &sqlite_path)?;
+        conn.execute(
+            r#"
+            INSERT INTO http_uploads (
+                upload_id,
+                target_path,
+                size_bytes,
+                dev,
+                ino,
+                updated_at_ms
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            ON CONFLICT(upload_id) DO UPDATE SET
+                target_path = excluded.target_path,
+                size_bytes = excluded.size_bytes,
+                dev = excluded.dev,
+                ino = excluded.ino,
+                updated_at_ms = excluded.updated_at_ms
+            "#,
+            params![
+                record.upload_id,
+                record.target_path.to_string_lossy().as_ref(),
+                record.size_bytes.to_string(),
+                record.dev.to_string(),
+                record.ino.to_string(),
+                record.updated_at_ms.0 as i64,
+            ],
+        )
+        .map_err(|source| sqlite_error(&sqlite_path, source))?;
+        Ok(())
+    }
+
+    pub fn remove_http_upload(path: impl AsRef<Path>, upload_id: &str) -> Result<bool, StateError> {
+        let sqlite_path = sqlite_state_path_for_state_path(path.as_ref());
+        let conn = open_state_connection(&sqlite_path)?;
+        initialize_daemon_state_schema(&conn, &sqlite_path)?;
+        let deleted = conn
+            .execute(
+                "DELETE FROM http_uploads WHERE upload_id = ?1",
+                params![upload_id],
+            )
+            .map_err(|source| sqlite_error(&sqlite_path, source))?
+            > 0;
+        Ok(deleted)
     }
 }
 
@@ -329,9 +406,59 @@ fn initialize_daemon_state_schema(conn: &Connection, path: &Path) -> Result<(), 
             restore_kind TEXT,
             restore_value TEXT
         );
+
+        CREATE TABLE IF NOT EXISTS http_uploads (
+            upload_id TEXT PRIMARY KEY,
+            target_path TEXT NOT NULL,
+            size_bytes TEXT NOT NULL,
+            dev TEXT NOT NULL,
+            ino TEXT NOT NULL,
+            updated_at_ms INTEGER NOT NULL
+        );
         "#,
     )
     .map_err(|source| sqlite_error(path, source))
+}
+
+fn list_http_uploads(
+    conn: &Connection,
+    path: &Path,
+) -> Result<Vec<HttpUploadRecoveryRecord>, StateError> {
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT upload_id, target_path, size_bytes, dev, ino, updated_at_ms
+            FROM http_uploads
+            ORDER BY updated_at_ms, upload_id
+            "#,
+        )
+        .map_err(|source| sqlite_error(path, source))?;
+    let rows = stmt
+        .query_map([], |row| {
+            let size_raw = row.get::<_, String>(2)?;
+            let dev_raw = row.get::<_, String>(3)?;
+            let ino_raw = row.get::<_, String>(4)?;
+            Ok(HttpUploadRecoveryRecord {
+                upload_id: row.get::<_, String>(0)?,
+                target_path: PathBuf::from(row.get::<_, String>(1)?),
+                size_bytes: size_raw.parse::<u64>().map_err(|source| {
+                    rusqlite::Error::FromSqlConversionFailure(2, Type::Text, Box::new(source))
+                })?,
+                dev: dev_raw.parse::<u64>().map_err(|source| {
+                    rusqlite::Error::FromSqlConversionFailure(3, Type::Text, Box::new(source))
+                })?,
+                ino: ino_raw.parse::<u64>().map_err(|source| {
+                    rusqlite::Error::FromSqlConversionFailure(4, Type::Text, Box::new(source))
+                })?,
+                updated_at_ms: UnixTimestampMillis(row.get::<_, i64>(5)? as u64),
+            })
+        })
+        .map_err(|source| sqlite_error(path, source))?;
+    let mut records = Vec::new();
+    for row in rows {
+        records.push(row.map_err(|source| sqlite_error(path, source))?);
+    }
+    Ok(records)
 }
 
 fn load_sqlite_state(conn: &Connection, path: &Path) -> Result<DaemonState, StateError> {

@@ -5,8 +5,12 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::env;
-use std::fs;
-use std::io::{Read, Seek, SeekFrom};
+use std::fs::{self, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
+#[cfg(unix)]
+use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
+#[cfg(windows)]
+use std::os::windows::fs::{FileExt as WindowsFileExt, MetadataExt as WindowsMetadataExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::time::UNIX_EPOCH;
@@ -19,30 +23,35 @@ use rand_core::{OsRng, RngCore};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use termd_proto::{
-    AttachRole, AuthChallengePayload, AuthPayload, BINARY_PROTOCOL_VERSION,
+    AttachRole, AuthChallengePayload, AuthPayload, BINARY_PROTOCOL_VERSION, BinaryFileChunkPayload,
     BinaryPacketErrorPayload, BinaryPacketKind, BinaryProtocolPacket, BinarySessionDataPayload,
     BinaryTerminalFrameKind, BinaryTerminalFramePayload, BinaryTerminalSize, ClientHelloPayload,
     ClientId, ControlGrantPayload, ControlRequestPayload, DaemonClientForgetPayload,
     DaemonClientForgotPayload, DaemonClientSummaryPayload, DaemonClientsPayload,
     DaemonClientsResultPayload, DaemonStatusPayload, DaemonStatusResultPayload, DeviceId,
     E2eeKeyExchangePayload, EncryptedFramePayload, Envelope, ErrorPayload, HelloPayload,
-    MessageType, Nonce, PROTOCOL_PACKET_VERSION, PacketErrorPayload, PacketKind, PacketRequestId,
-    PacketStreamId, PairRequestPayload, PingPayload, PongPayload, ProtocolPacket, ProtocolVersion,
-    ServerId, SessionActivityPayload, SessionAttachPayload, SessionAttachedPayload,
-    SessionClosePayload, SessionClosedPayload, SessionCreatePayload, SessionCreatedPayload,
-    SessionCursorPayload, SessionDataPayload, SessionFileDeletePayload, SessionFileDeletedPayload,
-    SessionFileDownloadChunkPayload, SessionFileDownloadChunkResultPayload,
-    SessionFileDownloadPreparePayload, SessionFileDownloadReadyPayload, SessionFileEntryPayload,
-    SessionFileKind, SessionFileReadPayload, SessionFileReadResultPayload, SessionFileWritePayload,
-    SessionFileWrittenPayload, SessionFilesPayload, SessionFilesResultPayload,
-    SessionGitActionKind, SessionGitActionPayload, SessionGitActionResultPayload,
-    SessionGitDiffPayload, SessionGitDiffResultPayload, SessionGitFileChangePayload,
-    SessionGitPayload, SessionGitResultPayload, SessionGitWorktreePayload, SessionId,
-    SessionListPayload, SessionListResultPayload, SessionRenamePayload, SessionRenamedPayload,
-    SessionReorderPayload, SessionReorderedPayload, SessionResizePayload, SessionResizedPayload,
-    SessionSearchMatchPayload, SessionSearchPayload, SessionSearchResultPayload, SessionState,
-    SessionSummaryPayload, TerminalFramePayload, TerminalSize, UnixTimestampMillis,
-    binary_protocol_packet, decode_binary_protocol_packet, encode_binary_protocol_packet,
+    HttpE2eeAuthPayload, MessageType, Nonce, PROTOCOL_PACKET_VERSION, PacketErrorPayload,
+    PacketKind, PacketRequestId, PacketStreamId, PairRequestPayload, PingPayload, PongPayload,
+    ProtocolPacket, ProtocolVersion, ServerId, SessionActivityPayload, SessionAttachPayload,
+    SessionAttachedPayload, SessionClosePayload, SessionClosedPayload, SessionCreatePayload,
+    SessionCreatedPayload, SessionCursorPayload, SessionDataPayload, SessionFileDeletePayload,
+    SessionFileDeletedPayload, SessionFileDownloadChunkPayload,
+    SessionFileDownloadChunkResultPayload, SessionFileDownloadPreparePayload,
+    SessionFileDownloadReadyPayload, SessionFileDownloadStreamPayload,
+    SessionFileDownloadStreamReadyPayload, SessionFileEntryPayload, SessionFileHttpDownloadPayload,
+    SessionFileHttpUploadReadyPayload, SessionFileHttpUploadStreamPayload, SessionFileKind,
+    SessionFileReadPayload, SessionFileReadResultPayload, SessionFileTransferChunkPayload,
+    SessionFileUploadPayload, SessionFileUploadProgressPayload, SessionFileUploadReadyPayload,
+    SessionFileWritePayload, SessionFileWrittenPayload, SessionFilesPayload,
+    SessionFilesResultPayload, SessionGitActionKind, SessionGitActionPayload,
+    SessionGitActionResultPayload, SessionGitDiffPayload, SessionGitDiffResultPayload,
+    SessionGitFileChangePayload, SessionGitPayload, SessionGitResultPayload,
+    SessionGitWorktreePayload, SessionId, SessionListPayload, SessionListResultPayload,
+    SessionRenamePayload, SessionRenamedPayload, SessionReorderPayload, SessionReorderedPayload,
+    SessionResizePayload, SessionResizedPayload, SessionSearchMatchPayload, SessionSearchPayload,
+    SessionSearchResultPayload, SessionState, SessionSummaryPayload, TerminalFramePayload,
+    TerminalSize, UnixTimestampMillis, binary_protocol_packet, decode_binary_protocol_packet,
+    encode_binary_protocol_packet,
 };
 use thiserror::Error;
 use tokio::sync::watch;
@@ -50,9 +59,9 @@ use uuid::Uuid;
 
 use crate::auth::{
     AuthChallengeManager, ChallengeResponseService, DaemonE2eeSigningInput, DaemonIdentity,
-    DaemonPublicIdentity, DeviceIdentity, E2eeAuthTranscript, InMemoryTrustedDeviceStore,
-    PairingService, PairingTokenManager, ReplayProtector, SignatureVerifier, TrustedDevice,
-    TrustedDeviceStore, current_unix_timestamp_millis,
+    DaemonPublicIdentity, DeviceIdentity, E2eeAuthTranscript, HttpE2eeSigningInput,
+    InMemoryTrustedDeviceStore, PairingService, PairingTokenManager, ReplayProtector,
+    SignatureVerifier, TrustedDevice, TrustedDeviceStore, current_unix_timestamp_millis,
 };
 use crate::config::DaemonConfig;
 use crate::pty::{
@@ -64,8 +73,8 @@ use crate::session::{
     TerminalSize as RuntimeTerminalSize,
 };
 use crate::state::{
-    DaemonIdentitySnapshot, DaemonState, SessionStateRecord, StateError, StateStore,
-    TrustedDeviceState,
+    DaemonIdentitySnapshot, DaemonState, HttpUploadRecoveryRecord, SessionStateRecord, StateError,
+    StateStore, TrustedDeviceState,
     client_history::{ClientHistoryRecord, ClientHistoryStore, SessionHistoryRecord},
 };
 
@@ -92,7 +101,18 @@ const TERMINAL_LIVE_FRAME_LOG_MAX_FRAMES: usize = 8192;
 const SESSION_TERMINAL_CWD_PROBE_MIN_INTERVAL_MS: u64 = 1_000;
 const SESSION_FILE_DOWNLOAD_TOKEN_TTL_MS: u64 = 60_000;
 const SESSION_FILE_DOWNLOAD_GRANT_LIMIT: usize = 128;
+const SESSION_FILE_HTTP_UPLOAD_ACTIVE_IDLE_TTL_MS: u64 = 60 * 60 * 1000;
+const SESSION_FILE_HTTP_UPLOAD_TOMBSTONE_TTL_MS: u64 = 10 * 60 * 1000;
+#[cfg(windows)]
+const SESSION_FILE_HTTP_UPLOAD_IDENTITY_UNKNOWN: u64 = u64::MAX;
+// 中文注释：RPC file_read/file_write 只服务浏览器内置文本编辑器；大文件传输必须走
+// HTTP E2EE 或 binary stream，避免 JSON/base64 RPC 重新变成大文件通道。
+const SESSION_FILE_RPC_MAX_BYTES: usize = 1024 * 1024;
+const SESSION_FILE_READ_MAX_BYTES: u64 = SESSION_FILE_RPC_MAX_BYTES as u64;
+const SESSION_FILE_WRITE_MAX_BYTES: usize = SESSION_FILE_RPC_MAX_BYTES;
+const SESSION_FILE_WRITE_MAX_BASE64_BYTES: usize = ((SESSION_FILE_WRITE_MAX_BYTES + 2) / 3) * 4;
 const SESSION_FILE_DOWNLOAD_CHUNK_MAX_BYTES: u32 = 256 * 1024;
+const SESSION_FILE_TRANSFER_CHUNK_MAX_BYTES: u32 = 256 * 1024;
 const METHOD_PAIR_REQUEST: &str = "pair.request";
 const METHOD_AUTH: &str = "auth";
 const METHOD_AUTH_VERIFY: &str = "auth.verify";
@@ -120,6 +140,8 @@ const METHOD_SESSION_FILE_WRITE: &str = "session.file_write";
 const METHOD_SESSION_FILE_DELETE: &str = "session.file_delete";
 const METHOD_SESSION_FILE_DOWNLOAD_PREPARE: &str = "session.file_download_prepare";
 const METHOD_SESSION_FILE_DOWNLOAD_CHUNK: &str = "session.file_download_chunk";
+const METHOD_SESSION_FILE_UPLOAD_STREAM: &str = "session.file_upload";
+const METHOD_SESSION_FILE_DOWNLOAD_STREAM: &str = "session.file_download";
 const METHOD_SESSION_LIST: &str = "session.list";
 const METHOD_DAEMON_CLIENTS: &str = "daemon.clients";
 const METHOD_DAEMON_CLIENT_FORGET: &str = "daemon.client_forget";
@@ -192,6 +214,386 @@ impl PacketTerminalStream {
             next_input_seq: 1,
             next_output_seq: 1,
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PacketFileUploadStream {
+    session_id: SessionId,
+    path: PathBuf,
+    temp_path: PathBuf,
+    size_bytes: u64,
+    offset_bytes: u64,
+    next_input_seq: u64,
+    next_output_seq: u64,
+}
+
+#[derive(Debug)]
+struct PacketFileDownloadStream {
+    session_id: SessionId,
+    file: fs::File,
+    size_bytes: u64,
+    offset_bytes: u64,
+    next_output_seq: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionFileHttpUploadStatus {
+    Active,
+    Complete,
+    Aborted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionFileHttpUploadCleanupOutcome {
+    Removed,
+    AlreadyGone,
+    TargetReplaced,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionFileHttpUploadCleanupIdentityMode {
+    InMemoryOpenHandle,
+    PersistedRecovery,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionFileHttpUploadCleanupIdentityMatch {
+    Same,
+    Replaced,
+}
+
+#[derive(Debug)]
+struct SessionFileHttpUploadState {
+    session_id: SessionId,
+    target: PathBuf,
+    file: fs::File,
+    upload_id: String,
+    size_bytes: u64,
+    file_identity: SessionFileHttpUploadFileIdentity,
+    status: SessionFileHttpUploadStatus,
+    written_ranges: BTreeMap<u64, u64>,
+    inflight_ranges: BTreeMap<u64, u64>,
+    modified_at_ms: Option<UnixTimestampMillis>,
+    updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveSessionFileHttpUploadTarget {
+    target: PathBuf,
+    file_identity: SessionFileHttpUploadFileIdentity,
+}
+
+#[derive(Debug)]
+pub(crate) struct SessionFileHttpUploadWritePlan {
+    pub(crate) target: PathBuf,
+    file: fs::File,
+    pub(crate) size_bytes: u64,
+    pub(crate) offset_bytes: u64,
+    file_identity: SessionFileHttpUploadFileIdentity,
+    written_ranges: BTreeMap<u64, u64>,
+    pub(crate) reserved_range: Option<(u64, u64)>,
+}
+
+#[derive(Debug)]
+pub(crate) struct SessionFileHttpUploadFileWriteResult {
+    written_ranges: Vec<(u64, u64)>,
+    reserved_range: Option<(u64, u64)>,
+    pub(crate) modified_at_ms: Option<UnixTimestampMillis>,
+}
+
+#[derive(Debug)]
+pub(crate) enum SessionFileHttpUploadBegin {
+    Write(SessionFileHttpUploadWritePlan),
+    Complete(SessionFileUploadProgressPayload),
+}
+
+#[derive(Debug)]
+pub(crate) enum SessionFileHttpUploadCommit {
+    Progress(SessionFileUploadProgressPayload),
+    Complete(SessionFileUploadProgressPayload),
+}
+
+impl SessionFileHttpUploadState {
+    fn progress(&self, eof: bool) -> SessionFileUploadProgressPayload {
+        let offset_bytes = if eof { self.size_bytes } else { 0 };
+        self.progress_with_offset(offset_bytes, eof)
+    }
+
+    fn progress_with_offset(
+        &self,
+        offset_bytes: u64,
+        eof: bool,
+    ) -> SessionFileUploadProgressPayload {
+        SessionFileUploadProgressPayload {
+            session_id: self.session_id,
+            path: absolute_path_string(&self.target),
+            offset_bytes,
+            size_bytes: self.size_bytes,
+            eof,
+            modified_at_ms: if eof { self.modified_at_ms } else { None },
+        }
+    }
+
+    fn received_bytes(&self) -> Result<u64, ProtocolError> {
+        self.written_ranges
+            .values()
+            .try_fold(0_u64, |sum, len| sum.checked_add(*len))
+            .ok_or(ProtocolError::InvalidEnvelope)
+    }
+
+    fn has_complete_coverage(&self) -> Result<bool, ProtocolError> {
+        if self.size_bytes == 0 {
+            return Ok(true);
+        }
+        let mut expected_offset = 0_u64;
+        for (&offset, &len) in &self.written_ranges {
+            if offset != expected_offset || len == 0 {
+                return Ok(false);
+            }
+            expected_offset = expected_offset
+                .checked_add(len)
+                .ok_or(ProtocolError::InvalidEnvelope)?;
+        }
+        Ok(expected_offset == self.size_bytes)
+    }
+
+    fn record_written_range(&mut self, start: u64, end: u64) -> Result<(), ProtocolError> {
+        if start == end {
+            return Ok(());
+        }
+        if start > end || end > self.size_bytes {
+            return Err(ProtocolError::InvalidEnvelope);
+        }
+        let len = end
+            .checked_sub(start)
+            .ok_or(ProtocolError::InvalidEnvelope)?;
+        if let Some((&previous_start, &previous_len)) =
+            self.written_ranges.range(..=start).next_back()
+        {
+            let previous_end = previous_start
+                .checked_add(previous_len)
+                .ok_or(ProtocolError::InvalidEnvelope)?;
+            if previous_end > start {
+                // 中文注释：已确认写入的区间不能被另一段重复覆盖；完成后的重试会在
+                // status=Complete 路径直接返回，避免旧请求覆盖最终文件。
+                if previous_start == start && previous_end == end {
+                    return Ok(());
+                }
+                return Err(ProtocolError::InvalidEnvelope);
+            }
+        }
+        if let Some((&next_start, _)) = self.written_ranges.range(start..).next() {
+            if next_start < end {
+                return Err(ProtocolError::InvalidEnvelope);
+            }
+        }
+        self.written_ranges.insert(start, len);
+        Ok(())
+    }
+
+    fn reserve_write_range(
+        &mut self,
+        start: u64,
+        len: u64,
+    ) -> Result<Option<(u64, u64)>, ProtocolError> {
+        if len == 0 {
+            if start == self.size_bytes {
+                return Ok(None);
+            }
+            return Err(ProtocolError::InvalidEnvelope);
+        }
+        let end = start
+            .checked_add(len)
+            .ok_or(ProtocolError::InvalidEnvelope)?;
+        if end > self.size_bytes {
+            return Err(ProtocolError::InvalidEnvelope);
+        }
+        if range_is_fully_covered(&self.written_ranges, start, end) {
+            return Ok(None);
+        }
+        if range_overlaps(&self.written_ranges, start, end)
+            || range_overlaps(&self.inflight_ranges, start, end)
+        {
+            return Err(ProtocolError::InvalidState);
+        }
+        self.inflight_ranges.insert(start, len);
+        Ok(Some((start, end)))
+    }
+
+    fn release_inflight_range(&mut self, range: Option<(u64, u64)>) -> Result<(), ProtocolError> {
+        let Some((start, end)) = range else {
+            return Ok(());
+        };
+        let expected_len = end
+            .checked_sub(start)
+            .ok_or(ProtocolError::InvalidEnvelope)?;
+        match self.inflight_ranges.remove(&start) {
+            Some(len) if len == expected_len => Ok(()),
+            _ => Err(ProtocolError::InvalidState),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SessionFileHttpUploadFileIdentity {
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+    #[cfg(windows)]
+    volume_serial_number: Option<u32>,
+    #[cfg(windows)]
+    file_index: Option<u64>,
+    #[cfg(not(any(unix, windows)))]
+    modified_at_ms: Option<UnixTimestampMillis>,
+    #[cfg(not(any(unix, windows)))]
+    created_at_ms: Option<UnixTimestampMillis>,
+    len: u64,
+}
+
+impl SessionFileHttpUploadFileIdentity {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        Self {
+            #[cfg(unix)]
+            dev: metadata.dev(),
+            #[cfg(unix)]
+            ino: metadata.ino(),
+            #[cfg(windows)]
+            volume_serial_number: metadata.volume_serial_number(),
+            #[cfg(windows)]
+            file_index: metadata.file_index(),
+            #[cfg(not(any(unix, windows)))]
+            modified_at_ms: metadata_modified_at_ms(metadata),
+            #[cfg(not(any(unix, windows)))]
+            created_at_ms: metadata_created_at_ms(metadata),
+            len: metadata.len(),
+        }
+    }
+
+    fn dev(self) -> u64 {
+        #[cfg(unix)]
+        {
+            self.dev
+        }
+        #[cfg(not(unix))]
+        {
+            #[cfg(windows)]
+            {
+                self.volume_serial_number
+                    .map(u64::from)
+                    .unwrap_or(SESSION_FILE_HTTP_UPLOAD_IDENTITY_UNKNOWN)
+            }
+            #[cfg(not(any(unix, windows)))]
+            {
+                self.modified_at_ms.map(|time| time.0).unwrap_or(0)
+            }
+        }
+    }
+
+    fn ino(self) -> u64 {
+        #[cfg(unix)]
+        {
+            self.ino
+        }
+        #[cfg(not(unix))]
+        {
+            #[cfg(windows)]
+            {
+                self.file_index
+                    .unwrap_or(SESSION_FILE_HTTP_UPLOAD_IDENTITY_UNKNOWN)
+            }
+            #[cfg(not(any(unix, windows)))]
+            {
+                self.created_at_ms.map(|time| time.0).unwrap_or(0)
+            }
+        }
+    }
+
+    fn has_stable_filesystem_object_identity(self) -> bool {
+        #[cfg(unix)]
+        {
+            true
+        }
+        #[cfg(windows)]
+        {
+            self.volume_serial_number.is_some() && self.file_index.is_some()
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            false
+        }
+    }
+
+    fn is_same_filesystem_object(self, other: Self) -> bool {
+        #[cfg(unix)]
+        {
+            return self.dev == other.dev && self.ino == other.ino;
+        }
+        #[cfg(windows)]
+        {
+            return self.volume_serial_number.is_some()
+                && self.volume_serial_number == other.volume_serial_number
+                && self.file_index.is_some()
+                && self.file_index == other.file_index;
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            // 中文注释：非 Unix/Windows 平台没有稳定 inode；退回到原完整 identity。
+            return self == other;
+        }
+    }
+}
+
+fn session_file_http_upload_cleanup_identity_match(
+    actual: SessionFileHttpUploadFileIdentity,
+    expected: SessionFileHttpUploadFileIdentity,
+    mode: SessionFileHttpUploadCleanupIdentityMode,
+) -> Result<SessionFileHttpUploadCleanupIdentityMatch, ProtocolError> {
+    #[cfg(any(unix, windows))]
+    {
+        #[cfg(windows)]
+        {
+            if !actual.has_stable_filesystem_object_identity()
+                || !expected.has_stable_filesystem_object_identity()
+            {
+                return Err(ProtocolError::InvalidState);
+            }
+        }
+        if actual == expected {
+            return Ok(SessionFileHttpUploadCleanupIdentityMatch::Same);
+        }
+        if actual.is_same_filesystem_object(expected) {
+            return match mode {
+                // 中文注释：运行中 cleanup 持有原 upload 文件句柄；同一个对象即使长度
+                // 被外部改变，仍然是 daemon 创建的 active 目标，可以安全移除。
+                SessionFileHttpUploadCleanupIdentityMode::InMemoryOpenHandle => {
+                    Ok(SessionFileHttpUploadCleanupIdentityMatch::Same)
+                }
+                // 中文注释：启动 recovery 没有原文件句柄。dev/ino 相同但完整 identity
+                // 不同可能是原文件被改，也可能是 inode 被复用；安全失败并保留记录。
+                SessionFileHttpUploadCleanupIdentityMode::PersistedRecovery => {
+                    Err(ProtocolError::InvalidState)
+                }
+            };
+        }
+        match mode {
+            SessionFileHttpUploadCleanupIdentityMode::InMemoryOpenHandle => {
+                Ok(SessionFileHttpUploadCleanupIdentityMatch::Replaced)
+            }
+            // 中文注释：启动 recovery 没有原文件句柄；只要完整 identity 不一致，
+            // 就不能证明原 active 对象已经不可达，必须保留 recovery record。
+            SessionFileHttpUploadCleanupIdentityMode::PersistedRecovery => {
+                Err(ProtocolError::InvalidState)
+            }
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        // 中文注释：非 Unix/Windows 平台没有稳定 file id，也不能可靠判断 hardlink。
+        // HTTP upload cleanup 统一安全失败，避免静默删除未知对象或丢失 guard。
+        let _ = (actual, expected, mode);
+        Err(ProtocolError::InvalidState)
     }
 }
 
@@ -688,6 +1090,7 @@ pub struct DaemonProtocol<B: PtyBackend, V> {
     session_terminal_cwds: HashMap<SessionId, PathBuf>,
     session_terminal_cwd_probe_notified_at_ms: HashMap<SessionId, u64>,
     session_file_downloads: HashMap<String, SessionFileDownloadGrant>,
+    session_file_http_uploads: HashMap<String, SessionFileHttpUploadState>,
     daemon_clients: HashMap<DeviceId, DaemonClientRecord>,
     client_history: ClientHistoryStore,
     session_output_history: HashMap<SessionId, SessionOutputHistory>,
@@ -784,6 +1187,7 @@ where
             session_terminal_cwds: HashMap::new(),
             session_terminal_cwd_probe_notified_at_ms: HashMap::new(),
             session_file_downloads: HashMap::new(),
+            session_file_http_uploads: HashMap::new(),
             daemon_clients: HashMap::new(),
             client_history,
             session_output_history: HashMap::new(),
@@ -892,6 +1296,81 @@ where
 
     pub fn config(&self) -> &DaemonConfig {
         &self.config
+    }
+
+    pub fn open_http_e2ee_session(
+        &mut self,
+        auth: HttpE2eeAuthPayload,
+    ) -> Result<(DeviceId, E2eeSession), ProtocolError> {
+        let now_ms = current_unix_timestamp_millis();
+        let trusted = self
+            .trusted_store
+            .require_trusted(&auth.device_id)
+            .map_err(|_| ProtocolError::AuthFailed)?
+            .clone();
+        self.auth_service
+            .replay_protector_mut()
+            .check(&auth.device_id, &auth.nonce, auth.timestamp_ms, now_ms)
+            .map_err(|_| ProtocolError::AuthFailed)?;
+        let signing_input =
+            HttpE2eeSigningInput::from_payload(&auth, self.daemon_public_identity()).to_bytes();
+        self.verifier
+            .verify(trusted.public_key(), &signing_input, &auth.signature)
+            .map_err(|_| ProtocolError::AuthFailed)?;
+        self.auth_service.replay_protector_mut().record_checked(
+            &auth.device_id,
+            &auth.nonce,
+            now_ms,
+        );
+        self.trusted_store
+            .mark_seen(&auth.device_id, now_ms)
+            .map_err(|_| ProtocolError::AuthFailed)?;
+
+        let peer_public_key = E2eePeerPublicKey::try_from(&auth.e2ee_public_key)
+            .map_err(|_| ProtocolError::InvalidEnvelope)?;
+        let context = E2eeSessionContext::new(
+            self.server_id(),
+            auth.device_id,
+            self.e2ee_keypair.public_key(),
+            peer_public_key,
+        );
+        let e2ee = E2eeSession::new(
+            E2eeSessionRole::Daemon,
+            &self.e2ee_keypair,
+            peer_public_key,
+            context,
+        )
+        .map_err(|_| ProtocolError::InvalidEnvelope)?;
+
+        Ok((auth.device_id, e2ee))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn runtime_write_input_as_device_for_test(
+        &mut self,
+        session_id: SessionId,
+        device_id: DeviceId,
+        bytes: &[u8],
+    ) -> Result<(), ProtocolError> {
+        // 中文注释：测试专用探针，用 runtime 权限面确认临时 HTTP attach 是否已经被清理。
+        // 这里故意绕过 ProtocolConnection 的 attached_sessions，直接检查 runtime 里是否还认这个设备。
+        let internal_session_id = self
+            .session_index
+            .get(&session_id)
+            .cloned()
+            .ok_or(ProtocolError::SessionNotFound)?;
+        self.runtime
+            .write_input(&internal_session_id, &device_key(device_id), bytes)
+            .map_err(map_runtime_error)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn client_history_active_connection_count_for_test(
+        &self,
+        device_id: DeviceId,
+    ) -> Result<Option<i64>, StateError> {
+        self.client_history
+            .active_connection_count_for_test(device_id)
     }
 
     /// 本地 CLI 或测试可通过服务层签发 token；WebSocket 不暴露 token 签发入口。
@@ -1222,7 +1701,7 @@ where
         Ok(vec![envelope_value(MessageType::SessionCreated, response)?])
     }
 
-    fn attach_session(
+    pub(crate) fn attach_session(
         &mut self,
         connection: &mut ProtocolConnection,
         payload: SessionAttachPayload,
@@ -1241,40 +1720,64 @@ where
             .cloned()
             .ok_or(ProtocolError::SessionNotFound)?;
         let state_before_attach = self.runtime_state_proto(&internal_session_id)?;
+        let runtime_device_key = device_key(device_id);
+        let was_runtime_attached = self
+            .runtime
+            .role(&internal_session_id, &runtime_device_key)
+            .map_err(map_runtime_error)?
+            .is_some();
         let role = self
             .runtime
-            .attach(&internal_session_id, device_key(device_id))
+            .attach(&internal_session_id, runtime_device_key.clone())
             .map_err(map_runtime_error)?;
         let wire_role = runtime_role_to_proto(role);
-        let response_size = self.runtime_size_proto(&internal_session_id)?;
-        let (output_offset, initial_output) = if payload.watch_updates {
-            if connection.packet_mode {
-                // 中文注释：attach 阶段只保存 browser 的 terminal cursor。真正的
-                // snapshot/tail 在后续 output drain 中通过 daemon drain cursor 读取，这样快速
-                // 切换 session 时不会给旧 client 留下待发送 terminal 队列。
-                connection.set_terminal_drain_cursor(payload.session_id, payload.last_terminal_seq);
-                (0, Vec::new())
-            } else {
-                self.drain_runtime_output_to_history_until_empty(
+        let attach_result =
+            (|| -> Result<(TerminalSize, u64, Vec<u8>, SessionState), ProtocolError> {
+                let response_size = self.runtime_size_proto(&internal_session_id)?;
+                let (output_offset, initial_output) = if payload.watch_updates {
+                    if connection.packet_mode {
+                        // 中文注释：attach 阶段只保存 browser 的 terminal cursor。真正的
+                        // snapshot/tail 在后续 output drain 中通过 daemon drain cursor 读取，这样快速
+                        // 切换 session 时不会给旧 client 留下待发送 terminal 队列。
+                        connection.set_terminal_drain_cursor(
+                            payload.session_id,
+                            payload.last_terminal_seq,
+                        );
+                        (0, Vec::new())
+                    } else {
+                        self.drain_runtime_output_to_history_until_empty(
+                            payload.session_id,
+                            &internal_session_id,
+                            16 * 1024,
+                        )?;
+                        self.output_history_attach_snapshot(payload.session_id, response_size)
+                    }
+                } else {
+                    (0, Vec::new())
+                };
+                let response_state = self.runtime_state_proto(&internal_session_id)?;
+                self.client_history.record_session_runtime_state(
                     payload.session_id,
-                    &internal_session_id,
-                    16 * 1024,
+                    response_state,
+                    response_size,
+                    current_unix_timestamp_millis(),
                 )?;
-                self.output_history_attach_snapshot(payload.session_id, response_size)
+                if state_before_attach != response_state {
+                    self.persist_state()?;
+                }
+                Ok((response_size, output_offset, initial_output, response_state))
+            })();
+        let (response_size, output_offset, initial_output, response_state) = match attach_result {
+            Ok(result) => result,
+            Err(error) => {
+                if !was_runtime_attached {
+                    let _ = self
+                        .runtime
+                        .detach(&internal_session_id, &runtime_device_key);
+                }
+                return Err(error);
             }
-        } else {
-            (0, Vec::new())
         };
-        let response_state = self.runtime_state_proto(&internal_session_id)?;
-        self.client_history.record_session_runtime_state(
-            payload.session_id,
-            response_state,
-            response_size,
-            current_unix_timestamp_millis(),
-        )?;
-        if state_before_attach != response_state {
-            self.persist_state()?;
-        }
         connection.attach(
             payload.session_id,
             output_offset,
@@ -1644,6 +2147,11 @@ where
         validate_git_relative_file_path(&payload.file_path)?;
         let worktree =
             self.session_git_worktree_path(payload.session_id, &payload.worktree_path)?;
+        self.ensure_no_active_session_file_http_upload_target_in_git_scope(
+            payload.session_id,
+            &worktree,
+            Some(&payload.file_path),
+        )?;
         apply_git_file_action(&worktree, &payload.file_path, payload.action)?;
 
         Ok(vec![envelope_value(
@@ -1677,6 +2185,19 @@ where
         }
         let worktree =
             self.session_git_worktree_path(payload.session_id, &payload.worktree_path)?;
+        if let Some(path) = file_path {
+            self.ensure_no_active_session_file_http_upload_target_in_git_scope(
+                payload.session_id,
+                &worktree,
+                Some(path),
+            )?;
+        } else {
+            self.ensure_no_active_session_file_http_upload_target_in_git_scope(
+                payload.session_id,
+                &worktree,
+                None,
+            )?;
+        }
         let diff = read_git_diff(&worktree, file_path, payload.staged)?;
 
         Ok(vec![envelope_value(
@@ -1706,11 +2227,26 @@ where
             .get(&payload.session_id)
             .ok_or(ProtocolError::SessionNotFound)?;
         let target = resolve_existing_session_file_target(root, &payload.path)?;
+        self.ensure_not_active_session_file_http_upload_target(payload.session_id, &target)?;
         let metadata = fs::metadata(&target).map_err(map_file_path_error)?;
         if metadata.is_dir() {
             return Err(ProtocolError::InvalidEnvelope);
         }
-        let bytes = fs::read(&target).map_err(map_file_path_error)?;
+        let max_bytes = payload
+            .max_bytes
+            .unwrap_or(SESSION_FILE_READ_MAX_BYTES)
+            .min(SESSION_FILE_READ_MAX_BYTES);
+        if metadata.len() > max_bytes {
+            return Err(ProtocolError::InvalidEnvelope);
+        }
+        let file = fs::File::open(&target).map_err(map_file_path_error)?;
+        let mut bytes = Vec::new();
+        file.take(max_bytes.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(map_file_path_error)?;
+        if bytes.len() as u64 > max_bytes {
+            return Err(ProtocolError::InvalidEnvelope);
+        }
 
         Ok(vec![envelope_value(
             MessageType::SessionFileReadResult,
@@ -1739,9 +2275,18 @@ where
             .get(&payload.session_id)
             .ok_or(ProtocolError::SessionNotFound)?;
         let target = resolve_writable_session_file_target(root, &payload.path)?;
+        self.ensure_not_active_session_file_http_upload_target(payload.session_id, &target)?;
+        if payload.data_base64.len() > SESSION_FILE_WRITE_MAX_BASE64_BYTES
+            || base64_payload_decoded_len(&payload.data_base64) > SESSION_FILE_WRITE_MAX_BYTES
+        {
+            return Err(ProtocolError::InvalidEnvelope);
+        }
         let bytes = general_purpose::STANDARD
             .decode(payload.data_base64)
             .map_err(|_| ProtocolError::InvalidEnvelope)?;
+        if bytes.len() > SESSION_FILE_WRITE_MAX_BYTES {
+            return Err(ProtocolError::InvalidEnvelope);
+        }
 
         if target.is_dir() {
             return Err(ProtocolError::InvalidEnvelope);
@@ -1776,6 +2321,7 @@ where
             .get(&payload.session_id)
             .ok_or(ProtocolError::SessionNotFound)?;
         let target = resolve_writable_session_file_target(root, &payload.path)?;
+        self.ensure_not_active_session_file_http_upload_target(payload.session_id, &target)?;
         let metadata = fs::symlink_metadata(&target).map_err(map_file_path_error)?;
 
         // 删除目录只删除空目录；递归删除风险过高，后续需要单独交互确认再扩展。
@@ -1795,6 +2341,633 @@ where
         )?])
     }
 
+    fn prepare_session_file_upload_stream(
+        &mut self,
+        connection: &ProtocolConnection,
+        payload: SessionFileUploadPayload,
+    ) -> Result<(SessionFileUploadReadyPayload, PacketFileUploadStream), ProtocolError> {
+        connection.authenticated_device_id()?;
+        connection.ensure_attached_to(payload.session_id)?;
+        if !self.session_index.contains_key(&payload.session_id) {
+            return Err(ProtocolError::SessionNotFound);
+        }
+        let root = self
+            .session_roots
+            .get(&payload.session_id)
+            .ok_or(ProtocolError::SessionNotFound)?;
+        let target = resolve_writable_session_file_target(root, &payload.path)?;
+        self.ensure_not_active_session_file_http_upload_target(payload.session_id, &target)?;
+        if target.is_dir() {
+            return Err(ProtocolError::InvalidEnvelope);
+        }
+        let parent = target.parent().ok_or(ProtocolError::InvalidEnvelope)?;
+        let file_name = target.file_name().ok_or(ProtocolError::InvalidEnvelope)?;
+        let temp_name = format!(
+            ".{}.termd-upload-{}.part",
+            file_name.to_string_lossy(),
+            Uuid::new_v4()
+        );
+        let temp_path = parent.join(temp_name);
+        // 中文注释：上传先写同目录临时文件，完整收到后再 rename，避免中途失败留下半个目标文件。
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .map_err(map_file_path_error)?;
+
+        Ok((
+            SessionFileUploadReadyPayload {
+                session_id: payload.session_id,
+                path: absolute_path_string(&target),
+                size_bytes: payload.size_bytes,
+                offset_bytes: 0,
+            },
+            PacketFileUploadStream {
+                session_id: payload.session_id,
+                path: target,
+                temp_path,
+                size_bytes: payload.size_bytes,
+                offset_bytes: 0,
+                next_input_seq: 1,
+                next_output_seq: 1,
+            },
+        ))
+    }
+
+    pub fn prepare_session_file_http_upload(
+        &mut self,
+        connection: &ProtocolConnection,
+        payload: SessionFileUploadPayload,
+        _device_id: DeviceId,
+    ) -> Result<SessionFileHttpUploadReadyPayload, ProtocolError> {
+        self.prune_session_file_http_uploads();
+        connection.authenticated_device_id()?;
+        connection.ensure_attached_to(payload.session_id)?;
+        if !self.session_index.contains_key(&payload.session_id) {
+            return Err(ProtocolError::SessionNotFound);
+        }
+        let root = self
+            .session_roots
+            .get(&payload.session_id)
+            .ok_or(ProtocolError::SessionNotFound)?;
+        let target = resolve_writable_session_file_target(root, &payload.path)?;
+        if target.is_dir() {
+            return Err(ProtocolError::InvalidEnvelope);
+        }
+        let upload_id = session_file_http_upload_id();
+        let (file, file_identity) =
+            create_session_file_http_upload_target(&target, payload.size_bytes)?;
+        if let Err(error) = StateStore::record_http_upload(
+            &self.config.state_path,
+            &HttpUploadRecoveryRecord {
+                upload_id: upload_id.clone(),
+                target_path: target.clone(),
+                size_bytes: payload.size_bytes,
+                dev: file_identity.dev(),
+                ino: file_identity.ino(),
+                updated_at_ms: current_unix_timestamp_millis(),
+            },
+        ) {
+            tracing::debug!(%error, "failed to persist HTTP upload recovery record detail");
+            tracing::warn!("failed to persist HTTP upload recovery record");
+            let cleanup = remove_session_file_http_upload_target(&target, file_identity);
+            let keep_guard = match cleanup {
+                Ok(SessionFileHttpUploadCleanupOutcome::Removed) => false,
+                Ok(
+                    SessionFileHttpUploadCleanupOutcome::AlreadyGone
+                    | SessionFileHttpUploadCleanupOutcome::TargetReplaced,
+                ) => session_file_http_upload_open_file_has_remaining_links(&file, file_identity),
+                Err(cleanup_error) => {
+                    tracing::debug!(
+                        %cleanup_error,
+                        target = %target.display(),
+                        "failed to cleanup HTTP upload target after recovery persist failure detail"
+                    );
+                    true
+                }
+            };
+            if keep_guard {
+                let now_ms = current_unix_timestamp_millis().0;
+                // 中文注释：recovery record 持久化失败后，如果目标清理也不能证明
+                // 未完成对象已不可达，仍要保留内存 guard，避免当前 daemon 生命周期内暴露。
+                self.session_file_http_uploads.insert(
+                    upload_id.clone(),
+                    SessionFileHttpUploadState {
+                        session_id: payload.session_id,
+                        target: target.clone(),
+                        file,
+                        upload_id: upload_id.clone(),
+                        size_bytes: payload.size_bytes,
+                        file_identity,
+                        status: SessionFileHttpUploadStatus::Active,
+                        written_ranges: BTreeMap::new(),
+                        inflight_ranges: BTreeMap::new(),
+                        modified_at_ms: None,
+                        updated_at_ms: now_ms,
+                    },
+                );
+            }
+            return Err(ProtocolError::StateFailed);
+        }
+        let now_ms = current_unix_timestamp_millis().0;
+        // 中文注释：HTTP upload 的 init 就是文件创建事务：直接在最终目标路径创建新文件，
+        // 并把长度设置为声明大小。后续 POST 只按 offset seek 写目标文件，不再生成 .part/.chunk。
+        self.session_file_http_uploads.insert(
+            upload_id.clone(),
+            SessionFileHttpUploadState {
+                session_id: payload.session_id,
+                target: target.clone(),
+                file,
+                upload_id: upload_id.clone(),
+                size_bytes: payload.size_bytes,
+                file_identity,
+                status: SessionFileHttpUploadStatus::Active,
+                written_ranges: BTreeMap::new(),
+                inflight_ranges: BTreeMap::new(),
+                modified_at_ms: None,
+                updated_at_ms: now_ms,
+            },
+        );
+
+        Ok(SessionFileHttpUploadReadyPayload {
+            session_id: payload.session_id,
+            path: absolute_path_string(&target),
+            upload_id,
+            size_bytes: payload.size_bytes,
+            offset_bytes: 0,
+        })
+    }
+
+    fn prune_session_file_http_uploads(&mut self) {
+        let now_ms = current_unix_timestamp_millis().0;
+        let stale_upload_ids: Vec<String> = self
+            .session_file_http_uploads
+            .iter()
+            .filter_map(|(upload_id, state)| match state.status {
+                SessionFileHttpUploadStatus::Active
+                    if now_ms.saturating_sub(state.updated_at_ms)
+                        > SESSION_FILE_HTTP_UPLOAD_ACTIVE_IDLE_TTL_MS =>
+                {
+                    Some(upload_id.clone())
+                }
+                SessionFileHttpUploadStatus::Complete | SessionFileHttpUploadStatus::Aborted
+                    if now_ms.saturating_sub(state.updated_at_ms)
+                        > SESSION_FILE_HTTP_UPLOAD_TOMBSTONE_TTL_MS =>
+                {
+                    Some(upload_id.clone())
+                }
+                SessionFileHttpUploadStatus::Active
+                | SessionFileHttpUploadStatus::Complete
+                | SessionFileHttpUploadStatus::Aborted => None,
+            })
+            .collect();
+        for upload_id in stale_upload_ids {
+            let Some(mut state) = self.session_file_http_uploads.remove(&upload_id) else {
+                continue;
+            };
+            if state.status == SessionFileHttpUploadStatus::Active {
+                // 中文注释：Active idle 超时代表浏览器在 init 后中断；这里删除本 upload_id
+                // 预分配的新目标文件，避免半截文件永久留在文件列表。
+                match remove_session_file_http_upload_target(&state.target, state.file_identity) {
+                    Ok(
+                        SessionFileHttpUploadCleanupOutcome::AlreadyGone
+                        | SessionFileHttpUploadCleanupOutcome::TargetReplaced,
+                    ) if session_file_http_upload_open_file_has_remaining_links(
+                        &state.file,
+                        state.file_identity,
+                    ) =>
+                    {
+                        tracing::warn!(
+                            upload_id = %upload_id,
+                            "stale HTTP upload target is gone or replaced but original file still has links"
+                        );
+                        // 中文注释：target path 已缺失或被替换，但原 active 文件对象仍有
+                        // hardlink alias；不能删除 guard，否则 alias 会暴露未完成内容。
+                        state.updated_at_ms = now_ms;
+                        self.session_file_http_uploads.insert(upload_id, state);
+                    }
+                    Ok(
+                        SessionFileHttpUploadCleanupOutcome::Removed
+                        | SessionFileHttpUploadCleanupOutcome::AlreadyGone
+                        | SessionFileHttpUploadCleanupOutcome::TargetReplaced,
+                    ) => {
+                        let _ = StateStore::remove_http_upload(&self.config.state_path, &upload_id);
+                    }
+                    Err(error) => {
+                        tracing::debug!(
+                            %error,
+                            upload_id = %upload_id,
+                            target = %state.target.display(),
+                            "failed to prune stale HTTP upload target detail"
+                        );
+                        tracing::warn!(
+                            %error,
+                            upload_id = %upload_id,
+                            "failed to prune stale HTTP upload target"
+                        );
+                        // 中文注释：清理失败时不能丢内存 active state；guard 依赖它隐藏
+                        // 未完成目标。刷新更新时间，避免每次文件列表/Git 请求都重复清理失败。
+                        state.updated_at_ms = now_ms;
+                        self.session_file_http_uploads.insert(upload_id, state);
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) fn begin_session_file_http_upload_write(
+        &mut self,
+        connection: &ProtocolConnection,
+        payload: SessionFileHttpUploadStreamPayload,
+        _device_id: DeviceId,
+        write_len: u64,
+    ) -> Result<SessionFileHttpUploadBegin, ProtocolError> {
+        connection.authenticated_device_id()?;
+        connection.ensure_attached_to(payload.session_id)?;
+        if !self.session_index.contains_key(&payload.session_id) {
+            return Err(ProtocolError::SessionNotFound);
+        }
+        if !session_file_http_upload_id_is_safe(&payload.upload_id) {
+            return Err(ProtocolError::InvalidEnvelope);
+        }
+        let root = self
+            .session_roots
+            .get(&payload.session_id)
+            .ok_or(ProtocolError::SessionNotFound)?;
+        let target = resolve_writable_session_file_target(root, &payload.path)?;
+        if target.is_dir() {
+            return Err(ProtocolError::InvalidEnvelope);
+        }
+        let Some(state) = self.session_file_http_uploads.get_mut(&payload.upload_id) else {
+            return Err(ProtocolError::InvalidEnvelope);
+        };
+        if state.session_id != payload.session_id
+            || state.target != target
+            || state.upload_id != payload.upload_id
+            || state.size_bytes != payload.size_bytes
+        {
+            return Err(ProtocolError::InvalidEnvelope);
+        }
+        state.updated_at_ms = current_unix_timestamp_millis().0;
+        match state.status {
+            SessionFileHttpUploadStatus::Active => {
+                let file = state.file.try_clone().map_err(map_file_path_error)?;
+                let reserved_range = state.reserve_write_range(payload.offset_bytes, write_len)?;
+                Ok(SessionFileHttpUploadBegin::Write(
+                    SessionFileHttpUploadWritePlan {
+                        target,
+                        file,
+                        size_bytes: payload.size_bytes,
+                        offset_bytes: payload.offset_bytes,
+                        file_identity: state.file_identity,
+                        written_ranges: state.written_ranges.clone(),
+                        reserved_range,
+                    },
+                ))
+            }
+            SessionFileHttpUploadStatus::Complete => {
+                Ok(SessionFileHttpUploadBegin::Complete(state.progress(true)))
+            }
+            SessionFileHttpUploadStatus::Aborted => Err(ProtocolError::InvalidState),
+        }
+    }
+
+    pub(crate) fn commit_session_file_http_upload_write(
+        &mut self,
+        payload: &SessionFileHttpUploadStreamPayload,
+        file_result: &SessionFileHttpUploadFileWriteResult,
+    ) -> Result<SessionFileHttpUploadCommit, ProtocolError> {
+        let complete_progress = {
+            let Some(state) = self.session_file_http_uploads.get_mut(&payload.upload_id) else {
+                return Err(ProtocolError::InvalidEnvelope);
+            };
+            if state.session_id != payload.session_id || state.size_bytes != payload.size_bytes {
+                return Err(ProtocolError::InvalidEnvelope);
+            }
+            state.updated_at_ms = current_unix_timestamp_millis().0;
+            match state.status {
+                SessionFileHttpUploadStatus::Active => {
+                    state.release_inflight_range(file_result.reserved_range)?;
+                    for &(start, end) in &file_result.written_ranges {
+                        state.record_written_range(start, end)?;
+                    }
+                    let received_bytes = state.received_bytes()?;
+                    if state.has_complete_coverage()? {
+                        state.modified_at_ms = file_result.modified_at_ms;
+                        Some(state.progress(true))
+                    } else {
+                        return Ok(SessionFileHttpUploadCommit::Progress(
+                            state.progress_with_offset(received_bytes, false),
+                        ));
+                    }
+                }
+                SessionFileHttpUploadStatus::Complete => {
+                    let _ = state.release_inflight_range(file_result.reserved_range);
+                    return Ok(SessionFileHttpUploadCommit::Complete(state.progress(true)));
+                }
+                SessionFileHttpUploadStatus::Aborted => {
+                    let _ = state.release_inflight_range(file_result.reserved_range);
+                    return Err(ProtocolError::InvalidState);
+                }
+            }
+        };
+
+        if let Some(progress) = complete_progress {
+            // 中文注释：recovery record 是“未完成 upload”的持久化事实；必须先删除它，
+            // 再把内存状态切到 Complete，避免崩溃恢复误删已经完整写入的目标文件。
+            StateStore::remove_http_upload(&self.config.state_path, &payload.upload_id)
+                .map_err(|_| ProtocolError::StateFailed)?;
+            let Some(state) = self.session_file_http_uploads.get_mut(&payload.upload_id) else {
+                return Err(ProtocolError::InvalidEnvelope);
+            };
+            state.status = SessionFileHttpUploadStatus::Complete;
+            self.notify_session_file_tree_changed(payload.session_id);
+            return Ok(SessionFileHttpUploadCommit::Complete(progress));
+        }
+        Err(ProtocolError::InvalidState)
+    }
+
+    pub(crate) fn cancel_session_file_http_upload_write(
+        &mut self,
+        payload: &SessionFileHttpUploadStreamPayload,
+        reserved_range: Option<(u64, u64)>,
+    ) {
+        if let Some(state) = self.session_file_http_uploads.get_mut(&payload.upload_id) {
+            let _ = state.release_inflight_range(reserved_range);
+            state.updated_at_ms = current_unix_timestamp_millis().0;
+        }
+    }
+
+    pub fn write_session_file_http_upload(
+        &mut self,
+        connection: &ProtocolConnection,
+        payload: SessionFileHttpUploadStreamPayload,
+        device_id: DeviceId,
+        chunks: impl IntoIterator<Item = Vec<u8>>,
+    ) -> Result<SessionFileUploadProgressPayload, ProtocolError> {
+        let chunks: Vec<Vec<u8>> = chunks.into_iter().collect();
+        let write_len = session_file_http_upload_chunks_len(&chunks)?;
+        let plan = match self.begin_session_file_http_upload_write(
+            connection,
+            payload.clone(),
+            device_id,
+            write_len,
+        )? {
+            SessionFileHttpUploadBegin::Write(plan) => plan,
+            SessionFileHttpUploadBegin::Complete(progress) => return Ok(progress),
+        };
+        let reserved_range = plan.reserved_range;
+        let file_result = match write_session_file_http_upload_files(plan, chunks) {
+            Ok(result) => result,
+            Err(error) => {
+                self.cancel_session_file_http_upload_write(&payload, reserved_range);
+                return Err(error);
+            }
+        };
+        match self.commit_session_file_http_upload_write(&payload, &file_result)? {
+            SessionFileHttpUploadCommit::Progress(progress)
+            | SessionFileHttpUploadCommit::Complete(progress) => Ok(progress),
+        }
+    }
+
+    pub fn abort_session_file_http_upload(
+        &mut self,
+        connection: &ProtocolConnection,
+        payload: &SessionFileHttpUploadStreamPayload,
+    ) -> Result<(), ProtocolError> {
+        connection.authenticated_device_id()?;
+        connection.ensure_attached_to(payload.session_id)?;
+        // 中文注释：HTTP upload 直接写目标文件；abort 只能删除本 upload_id 创建的
+        // 未完成目标。完成后的 tombstone 不能删除用户已经上传成功的文件。
+        if !session_file_http_upload_id_is_safe(&payload.upload_id) {
+            return Err(ProtocolError::InvalidEnvelope);
+        }
+        let root = self
+            .session_roots
+            .get(&payload.session_id)
+            .ok_or(ProtocolError::SessionNotFound)?;
+        let target = resolve_writable_session_file_target(root, &payload.path)?;
+        let Some(state) = self.session_file_http_uploads.get_mut(&payload.upload_id) else {
+            return Ok(());
+        };
+        if state.session_id != payload.session_id
+            || state.target != target
+            || state.size_bytes != payload.size_bytes
+        {
+            return Err(ProtocolError::InvalidEnvelope);
+        }
+        if state.status == SessionFileHttpUploadStatus::Complete {
+            return Ok(());
+        }
+        state.inflight_ranges.clear();
+        let cleanup_outcome = remove_session_file_http_upload_target(&target, state.file_identity)?;
+        if matches!(
+            cleanup_outcome,
+            SessionFileHttpUploadCleanupOutcome::AlreadyGone
+                | SessionFileHttpUploadCleanupOutcome::TargetReplaced
+        ) && session_file_http_upload_open_file_has_remaining_links(
+            &state.file,
+            state.file_identity,
+        ) {
+            // 中文注释：用户删除或替换了 target path，但原 upload 对象还可通过
+            // hardlink alias 访问；abort 必须失败并保留 active guard。
+            state.updated_at_ms = current_unix_timestamp_millis().0;
+            return Err(ProtocolError::InvalidState);
+        }
+        StateStore::remove_http_upload(&self.config.state_path, &payload.upload_id)
+            .map_err(|_| ProtocolError::StateFailed)?;
+        state.status = SessionFileHttpUploadStatus::Aborted;
+        state.updated_at_ms = current_unix_timestamp_millis().0;
+        if cleanup_outcome == SessionFileHttpUploadCleanupOutcome::TargetReplaced {
+            Err(ProtocolError::InvalidState)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn prepare_session_file_http_download(
+        &mut self,
+        connection: &ProtocolConnection,
+        payload: SessionFileHttpDownloadPayload,
+    ) -> Result<(SessionFileDownloadStreamReadyPayload, fs::File, u64), ProtocolError> {
+        connection.authenticated_device_id()?;
+        connection.ensure_attached_to(payload.session_id)?;
+        if !self.session_index.contains_key(&payload.session_id) {
+            return Err(ProtocolError::SessionNotFound);
+        }
+        let root = self
+            .session_roots
+            .get(&payload.session_id)
+            .ok_or(ProtocolError::SessionNotFound)?;
+        let target = resolve_existing_session_file_target(root, &payload.path)?;
+        self.ensure_not_active_session_file_http_upload_target(payload.session_id, &target)?;
+        let file = fs::File::open(&target).map_err(map_file_path_error)?;
+        let metadata = file.metadata().map_err(map_file_path_error)?;
+        if metadata.is_dir() || payload.offset_bytes > metadata.len() {
+            return Err(ProtocolError::InvalidEnvelope);
+        }
+        let ready = SessionFileDownloadStreamReadyPayload {
+            session_id: payload.session_id,
+            path: absolute_path_string(&target),
+            name: session_file_download_name(&target),
+            size_bytes: metadata.len(),
+            modified_at_ms: metadata_modified_at_ms(&metadata),
+        };
+        Ok((ready, file, payload.offset_bytes))
+    }
+
+    fn write_session_file_upload_stream_chunk(
+        &mut self,
+        stream: &mut PacketFileUploadStream,
+        payload: SessionFileTransferChunkPayload,
+    ) -> Result<(SessionFileUploadProgressPayload, bool), ProtocolError> {
+        if payload.session_id != stream.session_id
+            || payload.offset_bytes != stream.offset_bytes
+            || payload.size_bytes != stream.size_bytes
+        {
+            return Err(ProtocolError::InvalidEnvelope);
+        }
+        let bytes = general_purpose::STANDARD
+            .decode(payload.data_base64)
+            .map_err(|_| ProtocolError::InvalidEnvelope)?;
+        if bytes.len() > SESSION_FILE_TRANSFER_CHUNK_MAX_BYTES as usize {
+            return Err(ProtocolError::InvalidEnvelope);
+        }
+        let next_offset = stream.offset_bytes.saturating_add(bytes.len() as u64);
+        if next_offset > stream.size_bytes {
+            return Err(ProtocolError::InvalidEnvelope);
+        }
+
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(&stream.temp_path)
+            .map_err(map_file_path_error)?;
+        file.write_all(&bytes).map_err(map_file_path_error)?;
+        stream.offset_bytes = next_offset;
+        let complete = payload.eof || stream.offset_bytes == stream.size_bytes;
+        if complete && stream.offset_bytes != stream.size_bytes {
+            return Err(ProtocolError::InvalidEnvelope);
+        }
+
+        let mut modified_at_ms = None;
+        if complete {
+            self.ensure_not_active_session_file_http_upload_target(
+                stream.session_id,
+                &stream.path,
+            )?;
+            fs::rename(&stream.temp_path, &stream.path).map_err(map_file_path_error)?;
+            let metadata = fs::metadata(&stream.path).map_err(map_file_path_error)?;
+            modified_at_ms = metadata_modified_at_ms(&metadata);
+            self.notify_session_file_tree_changed(stream.session_id);
+        }
+
+        Ok((
+            SessionFileUploadProgressPayload {
+                session_id: stream.session_id,
+                path: absolute_path_string(&stream.path),
+                offset_bytes: stream.offset_bytes,
+                size_bytes: stream.size_bytes,
+                eof: complete,
+                modified_at_ms,
+            },
+            complete,
+        ))
+    }
+
+    fn prepare_session_file_download_stream(
+        &mut self,
+        connection: &ProtocolConnection,
+        payload: SessionFileDownloadStreamPayload,
+    ) -> Result<
+        (
+            SessionFileDownloadStreamReadyPayload,
+            PacketFileDownloadStream,
+        ),
+        ProtocolError,
+    > {
+        connection.authenticated_device_id()?;
+        connection.ensure_attached_to(payload.session_id)?;
+        if !self.session_index.contains_key(&payload.session_id) {
+            return Err(ProtocolError::SessionNotFound);
+        }
+        let root = self
+            .session_roots
+            .get(&payload.session_id)
+            .ok_or(ProtocolError::SessionNotFound)?;
+        let target = resolve_existing_session_file_target(root, &payload.path)?;
+        self.ensure_not_active_session_file_http_upload_target(payload.session_id, &target)?;
+        let file = fs::File::open(&target).map_err(map_file_path_error)?;
+        let metadata = file.metadata().map_err(map_file_path_error)?;
+        if metadata.is_dir() {
+            return Err(ProtocolError::InvalidEnvelope);
+        }
+        let modified_at_ms = metadata_modified_at_ms(&metadata);
+        let name = session_file_download_name(&target);
+        let path = absolute_path_string(&target);
+
+        Ok((
+            SessionFileDownloadStreamReadyPayload {
+                session_id: payload.session_id,
+                path,
+                name: name.clone(),
+                size_bytes: metadata.len(),
+                modified_at_ms,
+            },
+            PacketFileDownloadStream {
+                session_id: payload.session_id,
+                file,
+                size_bytes: metadata.len(),
+                offset_bytes: 0,
+                next_output_seq: 1,
+            },
+        ))
+    }
+
+    fn read_session_file_download_stream_chunk(
+        &mut self,
+        stream: &mut PacketFileDownloadStream,
+        max_bytes: u32,
+    ) -> Result<(SessionFileTransferChunkPayload, bool), ProtocolError> {
+        if max_bytes == 0 {
+            return Err(ProtocolError::InvalidEnvelope);
+        }
+        if stream.offset_bytes > stream.size_bytes {
+            return Err(ProtocolError::InvalidEnvelope);
+        }
+        let remaining = stream.size_bytes.saturating_sub(stream.offset_bytes);
+        if remaining == 0 {
+            return Ok((
+                SessionFileTransferChunkPayload {
+                    session_id: stream.session_id,
+                    offset_bytes: stream.offset_bytes,
+                    data_base64: String::new(),
+                    size_bytes: stream.size_bytes,
+                    eof: true,
+                },
+                true,
+            ));
+        }
+        let read_len = remaining.min(u64::from(
+            max_bytes.min(SESSION_FILE_TRANSFER_CHUNK_MAX_BYTES),
+        )) as usize;
+        let mut bytes = vec![0_u8; read_len];
+        read_session_file_exact_at(&stream.file, &mut bytes, stream.offset_bytes)?;
+        let offset = stream.offset_bytes;
+        stream.offset_bytes = stream.offset_bytes.saturating_add(read_len as u64);
+        let eof = stream.offset_bytes >= stream.size_bytes;
+
+        Ok((
+            SessionFileTransferChunkPayload {
+                session_id: stream.session_id,
+                offset_bytes: offset,
+                data_base64: general_purpose::STANDARD.encode(bytes),
+                size_bytes: stream.size_bytes,
+                eof,
+            },
+            eof,
+        ))
+    }
+
     fn prepare_session_file_download(
         &mut self,
         connection: &ProtocolConnection,
@@ -1810,6 +2983,7 @@ where
             .get(&payload.session_id)
             .ok_or(ProtocolError::SessionNotFound)?;
         let target = resolve_existing_session_file_target(root, &payload.path)?;
+        self.ensure_not_active_session_file_http_upload_target(payload.session_id, &target)?;
         let metadata = fs::metadata(&target).map_err(map_file_path_error)?;
         if metadata.is_dir() {
             return Err(ProtocolError::InvalidEnvelope);
@@ -1868,6 +3042,7 @@ where
             .get(&payload.session_id)
             .ok_or(ProtocolError::SessionNotFound)?;
         let target = resolve_existing_session_file_target(root, &payload.path)?;
+        self.ensure_not_active_session_file_http_upload_target(payload.session_id, &target)?;
         let metadata = fs::metadata(&target).map_err(map_file_path_error)?;
         if metadata.is_dir() {
             return Err(ProtocolError::InvalidEnvelope);
@@ -2178,6 +3353,9 @@ where
         device_id: DeviceId,
         name: Option<&str>,
     ) {
+        if !connection.track_daemon_client_history {
+            return;
+        }
         let now_ms = current_unix_timestamp_millis();
         let stable_client_id = stable_client_id_for_device(device_id);
 
@@ -2231,6 +3409,9 @@ where
         connection: &ProtocolConnection,
         device_id: DeviceId,
     ) {
+        if !connection.track_daemon_client_history {
+            return;
+        }
         let now_ms = current_unix_timestamp_millis();
         if let Err(error) =
             self.client_history
@@ -2607,6 +3788,9 @@ where
         requested_path: Option<String>,
         fallback_to_root: bool,
     ) -> Result<SessionFilesResultPayload, ProtocolError> {
+        // 中文注释：文件列表是 active upload 目标可见性的入口；进入列表前先清理
+        // 已超时的 upload 状态，避免断开的旧上传把预分配目标永久隐藏。
+        self.prune_session_file_http_uploads();
         let root = self
             .session_roots
             .get(&session_id)
@@ -2620,7 +3804,18 @@ where
             }
             Err(error) => return Err(error),
         };
-        let entries = read_session_file_entries(&root, &target)?;
+        let mut entries = read_session_file_entries(&root, &target)?;
+        let active_upload_targets = self.active_session_file_http_upload_targets(session_id);
+        if !active_upload_targets.is_empty() {
+            // 中文注释：HTTP upload 的 init 会直接创建最终目标并 set_len；在 commit 前
+            // 这个文件还不是用户可用文件，文件列表必须隐藏它，避免前端提前判定上传完成。
+            entries.retain(|entry| {
+                !path_matches_active_session_file_http_upload_target(
+                    Path::new(&entry.path),
+                    &active_upload_targets,
+                )
+            });
+        }
         self.client_history.record_session_files_path(
             session_id,
             &normalized_path,
@@ -2634,10 +3829,78 @@ where
         })
     }
 
+    fn active_session_file_http_upload_targets(
+        &self,
+        _session_id: SessionId,
+    ) -> Vec<ActiveSessionFileHttpUploadTarget> {
+        self.session_file_http_uploads
+            .values()
+            .filter(|state| {
+                // 中文注释：不同 session 可以指向同一个目录。active upload 是文件系统对象级
+                // 保护，不能只按所属 session 过滤，否则另一个 session 能读写同一未完成目标。
+                state.status == SessionFileHttpUploadStatus::Active
+            })
+            .map(|state| ActiveSessionFileHttpUploadTarget {
+                target: state.target.clone(),
+                file_identity: state.file_identity,
+            })
+            .collect()
+    }
+
+    fn ensure_not_active_session_file_http_upload_target(
+        &mut self,
+        session_id: SessionId,
+        target: &Path,
+    ) -> Result<(), ProtocolError> {
+        // 中文注释：Git 面板也能操作文件。HTTP upload commit 前的预分配目标不能被
+        // git add/clean/restore/diff 读取或删除，否则 stream 侧会在后续分片提交时失去目标。
+        self.prune_session_file_http_uploads();
+        let active_targets = self.active_session_file_http_upload_targets(session_id);
+        if path_matches_active_session_file_http_upload_target(target, &active_targets) {
+            return Err(ProtocolError::InvalidState);
+        }
+        Ok(())
+    }
+
+    fn ensure_no_active_session_file_http_upload_target_in_git_scope(
+        &mut self,
+        session_id: SessionId,
+        worktree: &Path,
+        file_path: Option<&str>,
+    ) -> Result<(), ProtocolError> {
+        // 中文注释：Git 的目录级操作会递归读取/删除目录内路径；不仅要挡住
+        // active 目标自身，也要挡住其父目录，以及指向同一 inode 的 hardlink/symlink alias。
+        self.prune_session_file_http_uploads();
+        let active_targets = self.active_session_file_http_upload_targets(session_id);
+        if active_targets.is_empty() {
+            return Ok(());
+        }
+        let scope = file_path
+            .map(|path| worktree.join(path))
+            .unwrap_or_else(|| worktree.to_path_buf());
+        if active_targets
+            .iter()
+            .any(|active| active.target == scope || active.target.starts_with(&scope))
+        {
+            return Err(ProtocolError::InvalidState);
+        }
+        if path_matches_active_session_file_http_upload_target(&scope, &active_targets)
+            || git_scope_contains_active_session_file_http_upload_alias(
+                worktree,
+                file_path,
+                &active_targets,
+            )
+        {
+            return Err(ProtocolError::InvalidState);
+        }
+        Ok(())
+    }
+
     fn session_git_result(
         &mut self,
         session_id: SessionId,
     ) -> Result<SessionGitResultPayload, ProtocolError> {
+        self.prune_session_file_http_uploads();
         let root = self
             .session_roots
             .get(&session_id)
@@ -2651,8 +3914,14 @@ where
                 resolve_session_file_target(&root, None)?
             }
         };
+        let active_upload_targets = self.active_session_file_http_upload_targets(session_id);
 
-        Ok(read_session_git_snapshot(session_id, &cwd, normalized_cwd))
+        Ok(read_session_git_snapshot(
+            session_id,
+            &cwd,
+            normalized_cwd,
+            &active_upload_targets,
+        ))
     }
 
     fn session_git_worktree_path(
@@ -2759,7 +4028,9 @@ where
         connection.watched_sessions.clear();
         connection.stale_watched_sessions.clear();
         connection.terminal_frame_snapshot_required.clear();
-        self.mark_daemon_client_connection_offline(device_id, connection.client_id, now_ms);
+        if connection.track_daemon_client_history {
+            self.mark_daemon_client_connection_offline(device_id, connection.client_id, now_ms);
+        }
 
         // 断开 WebSocket 只 detach 当前连接关联的 session，不 close/terminate PTY。
         // 同一浏览器/设备如果还有另一条 attach 连接在线，不能撤掉设备级 operator 角色。
@@ -3571,6 +4842,9 @@ pub struct ProtocolConnection {
     client_id: ClientId,
     peer_ip: Option<String>,
     state: ProtocolConnectionState,
+    // 中文注释：只有真实 WebSocket daemon/client 连接才写入 daemon_clients / client_history。
+    // HTTP 临时文件连接只用于短生命周期文件 RPC，不应影响活跃连接计数。
+    track_daemon_client_history: bool,
     device_id: Option<DeviceId>,
     authenticated_device_id: Option<DeviceId>,
     e2ee: Option<E2eeSession>,
@@ -3581,6 +4855,8 @@ pub struct ProtocolConnection {
     binary_mode: bool,
     packet_terminal_streams: HashMap<PacketStreamId, PacketTerminalStream>,
     packet_terminal_streams_by_session: HashMap<SessionId, PacketStreamId>,
+    packet_file_upload_streams: HashMap<PacketStreamId, PacketFileUploadStream>,
+    packet_file_download_streams: HashMap<PacketStreamId, PacketFileDownloadStream>,
     attached_sessions: Vec<SessionId>,
     // `attached_sessions` 表示权限范围；`watched_sessions` 才表示该连接要接收实时输出。
     // 文件/Git/search 等短连接会只 attach 权限，避免大流量终端输出堵住 RPC 响应。
@@ -3831,6 +5107,7 @@ impl ProtocolConnection {
             client_id: ClientId::new(),
             peer_ip,
             state: ProtocolConnectionState::Init,
+            track_daemon_client_history: true,
             device_id: None,
             authenticated_device_id: None,
             e2ee: None,
@@ -3841,6 +5118,8 @@ impl ProtocolConnection {
             binary_mode: false,
             packet_terminal_streams: HashMap::new(),
             packet_terminal_streams_by_session: HashMap::new(),
+            packet_file_upload_streams: HashMap::new(),
+            packet_file_download_streams: HashMap::new(),
             attached_sessions: Vec::new(),
             watched_sessions: HashSet::new(),
             stale_watched_sessions: HashSet::new(),
@@ -3851,6 +5130,15 @@ impl ProtocolConnection {
             deferred_output_wakeups: HashSet::new(),
             debug_traffic: ProtocolConnectionDebugTraffic::default(),
         }
+    }
+
+    pub fn authenticated_http(device_id: DeviceId) -> Self {
+        let mut connection = Self::new(None);
+        connection.device_id = Some(device_id);
+        connection.authenticated_device_id = Some(device_id);
+        connection.state = ProtocolConnectionState::Authenticated;
+        connection.track_daemon_client_history = false;
+        connection
     }
 
     pub fn state(&self) -> ProtocolConnectionState {
@@ -4222,6 +5510,10 @@ impl ProtocolConnection {
         B: PtyBackend,
         V: SignatureVerifier,
     {
+        for (_, stream) in self.packet_file_upload_streams.drain() {
+            cleanup_upload_temp(&stream);
+        }
+        self.packet_file_download_streams.clear();
         protocol.detach_connection(self);
     }
 
@@ -4862,7 +6154,7 @@ impl ProtocolConnection {
             PacketKind::StreamChunk => self.handle_packet_stream_chunk(protocol, packet),
             PacketKind::StreamEnd => self.handle_packet_stream_end(packet),
             PacketKind::Cancel => self.handle_packet_cancel(packet),
-            PacketKind::Flow => self.handle_packet_flow(packet),
+            PacketKind::Flow => self.handle_packet_flow(protocol, packet),
             PacketKind::Response | PacketKind::Event | PacketKind::Error => {
                 Err(ProtocolError::InvalidState)
             }
@@ -5053,6 +6345,25 @@ impl ProtocolConnection {
                 let payload = decode_payload(packet.payload)?;
                 protocol.attach_session(self, payload)
             }
+            METHOD_SESSION_FILE_UPLOAD_STREAM => {
+                let payload = decode_payload(packet.payload)?;
+                let (ready, stream) = protocol.prepare_session_file_upload_stream(self, payload)?;
+                self.packet_file_upload_streams.insert(stream_id, stream);
+                Ok(vec![envelope_value(
+                    MessageType::SessionFileWritten,
+                    ready,
+                )?])
+            }
+            METHOD_SESSION_FILE_DOWNLOAD_STREAM => {
+                let payload = decode_payload(packet.payload)?;
+                let (ready, stream) =
+                    protocol.prepare_session_file_download_stream(self, payload)?;
+                self.packet_file_download_streams.insert(stream_id, stream);
+                Ok(vec![envelope_value(
+                    MessageType::SessionFileDownloadReady,
+                    ready,
+                )?])
+            }
             _ => Err(ProtocolError::InvalidEnvelope),
         };
 
@@ -5060,8 +6371,13 @@ impl ProtocolConnection {
             Ok(envelopes) => envelopes,
             Err(error) => return Ok(vec![packet_request_error(id, error)?]),
         };
-        let session_id = packet_stream_session_id(method.as_str(), &envelopes)?;
-        self.register_packet_terminal_stream(stream_id, session_id);
+        if matches!(
+            method.as_str(),
+            METHOD_TERMINAL_CREATE | METHOD_TERMINAL_ATTACH
+        ) {
+            let session_id = packet_stream_session_id(method.as_str(), &envelopes)?;
+            self.register_packet_terminal_stream(stream_id, session_id);
+        }
         packetize_handler_stream_open_response(id, stream_id, method.as_str(), envelopes)
     }
 
@@ -5075,6 +6391,9 @@ impl ProtocolConnection {
         V: SignatureVerifier,
     {
         let stream_id = packet.stream_id.ok_or(ProtocolError::InvalidEnvelope)?;
+        if self.packet_file_upload_streams.contains_key(&stream_id) {
+            return self.handle_packet_file_upload_chunk(protocol, stream_id, packet);
+        }
         let Some(stream) = self.packet_terminal_streams.get(&stream_id).cloned() else {
             return Ok(vec![packet_stream_error(
                 stream_id,
@@ -5109,11 +6428,80 @@ impl ProtocolConnection {
         Ok(Vec::new())
     }
 
+    fn handle_packet_file_upload_chunk<B, V>(
+        &mut self,
+        protocol: &mut DaemonProtocol<B, V>,
+        stream_id: PacketStreamId,
+        packet: ProtocolPacket<Value>,
+    ) -> Result<Vec<ProtocolPacket<Value>>, ProtocolError>
+    where
+        B: PtyBackend,
+        V: SignatureVerifier,
+    {
+        let Some(mut stream) = self.packet_file_upload_streams.remove(&stream_id) else {
+            return Ok(vec![packet_stream_error(
+                stream_id,
+                ProtocolError::InvalidState,
+            )?]);
+        };
+        if packet.seq != stream.next_input_seq {
+            self.packet_file_upload_streams.insert(stream_id, stream);
+            return Ok(vec![packet_stream_error(
+                stream_id,
+                ProtocolError::InvalidEnvelope,
+            )?]);
+        }
+        let payload: SessionFileTransferChunkPayload = match decode_payload(packet.payload) {
+            Ok(payload) => payload,
+            Err(error) => {
+                self.packet_file_upload_streams.insert(stream_id, stream);
+                return Ok(vec![packet_stream_error(stream_id, error)?]);
+            }
+        };
+        let (progress, complete) =
+            match protocol.write_session_file_upload_stream_chunk(&mut stream, payload) {
+                Ok(result) => result,
+                Err(error) => {
+                    cleanup_upload_temp(&stream);
+                    return Ok(vec![packet_stream_error(stream_id, error)?]);
+                }
+            };
+        let seq = stream.next_output_seq;
+        stream.next_output_seq = stream.next_output_seq.saturating_add(1);
+        stream.next_input_seq = stream.next_input_seq.saturating_add(1);
+        let mut packets = vec![ProtocolPacket::stream_chunk(
+            stream_id,
+            seq,
+            serde_json::to_value(progress).map_err(|_| ProtocolError::InvalidEnvelope)?,
+        )];
+        if complete {
+            packets.push(ProtocolPacket::stream_end(
+                stream_id,
+                stream.next_output_seq,
+                serde_json::json!({}),
+            ));
+        } else {
+            self.packet_file_upload_streams.insert(stream_id, stream);
+        }
+        Ok(packets)
+    }
+
     fn handle_packet_stream_end(
         &mut self,
         packet: ProtocolPacket<Value>,
     ) -> Result<Vec<ProtocolPacket<Value>>, ProtocolError> {
         let stream_id = packet.stream_id.ok_or(ProtocolError::InvalidEnvelope)?;
+        if let Some(stream) = self.packet_file_upload_streams.remove(&stream_id) {
+            cleanup_upload_temp(&stream);
+            return Ok(Vec::new());
+        }
+        if self
+            .packet_file_download_streams
+            .remove(&stream_id)
+            .is_some()
+        {
+            return Ok(Vec::new());
+        }
         if let Some(stream) = self.packet_terminal_streams.get_mut(&stream_id) {
             if packet.seq == stream.next_input_seq {
                 stream.next_input_seq = stream.next_input_seq.saturating_add(1);
@@ -5128,6 +6516,17 @@ impl ProtocolConnection {
         packet: ProtocolPacket<Value>,
     ) -> Result<Vec<ProtocolPacket<Value>>, ProtocolError> {
         if let Some(stream_id) = packet.stream_id {
+            if let Some(stream) = self.packet_file_upload_streams.remove(&stream_id) {
+                cleanup_upload_temp(&stream);
+                return Ok(Vec::new());
+            }
+            if self
+                .packet_file_download_streams
+                .remove(&stream_id)
+                .is_some()
+            {
+                return Ok(Vec::new());
+            }
             self.remove_packet_terminal_stream(stream_id);
             return Ok(Vec::new());
         }
@@ -5137,15 +6536,67 @@ impl ProtocolConnection {
         Err(ProtocolError::InvalidEnvelope)
     }
 
-    fn handle_packet_flow(
+    fn handle_packet_flow<B, V>(
         &mut self,
+        protocol: &mut DaemonProtocol<B, V>,
         packet: ProtocolPacket<Value>,
-    ) -> Result<Vec<ProtocolPacket<Value>>, ProtocolError> {
+    ) -> Result<Vec<ProtocolPacket<Value>>, ProtocolError>
+    where
+        B: PtyBackend,
+        V: SignatureVerifier,
+    {
         let stream_id = packet.stream_id.ok_or(ProtocolError::InvalidEnvelope)?;
+        if self.packet_file_download_streams.contains_key(&stream_id) {
+            return self.handle_packet_file_download_flow(protocol, stream_id, packet);
+        }
         // 中文注释：旧客户端可能继续发送 flow。新模型中 WebSocket/TCP 已保证可靠有序，
         // terminal 输出不再等待 render ACK/credit；flow 只保留为兼容 no-op，不能驱动输出。
         let _ = self.packet_terminal_streams.get(&stream_id);
         Ok(Vec::new())
+    }
+
+    fn handle_packet_file_download_flow<B, V>(
+        &mut self,
+        protocol: &mut DaemonProtocol<B, V>,
+        stream_id: PacketStreamId,
+        packet: ProtocolPacket<Value>,
+    ) -> Result<Vec<ProtocolPacket<Value>>, ProtocolError>
+    where
+        B: PtyBackend,
+        V: SignatureVerifier,
+    {
+        let Some(mut stream) = self.packet_file_download_streams.remove(&stream_id) else {
+            return Ok(vec![packet_stream_error(
+                stream_id,
+                ProtocolError::InvalidState,
+            )?]);
+        };
+        let max_bytes = packet
+            .credit
+            .unwrap_or(SESSION_FILE_TRANSFER_CHUNK_MAX_BYTES)
+            .min(SESSION_FILE_TRANSFER_CHUNK_MAX_BYTES);
+        let (chunk, eof) =
+            match protocol.read_session_file_download_stream_chunk(&mut stream, max_bytes) {
+                Ok(result) => result,
+                Err(error) => return Ok(vec![packet_stream_error(stream_id, error)?]),
+            };
+        let seq = stream.next_output_seq;
+        stream.next_output_seq = stream.next_output_seq.saturating_add(1);
+        let mut packets = vec![ProtocolPacket::stream_chunk(
+            stream_id,
+            seq,
+            serde_json::to_value(chunk).map_err(|_| ProtocolError::InvalidEnvelope)?,
+        )];
+        if eof {
+            packets.push(ProtocolPacket::stream_end(
+                stream_id,
+                stream.next_output_seq,
+                serde_json::json!({}),
+            ));
+        } else {
+            self.packet_file_download_streams.insert(stream_id, stream);
+        }
+        Ok(packets)
     }
 
     fn e2ee_mut(&mut self) -> Result<&mut E2eeSession, ProtocolError> {
@@ -5712,6 +7163,16 @@ fn protocol_packet_from_binary(
             serde_json::to_value(terminal_frame_from_binary(payload)?)
                 .map_err(|_| ProtocolError::InvalidEnvelope)?
         }
+        Some(binary_protocol_packet::Payload::FileChunk(payload)) => {
+            serde_json::to_value(SessionFileTransferChunkPayload {
+                session_id: session_id_from_binary(&payload.session_id)?,
+                offset_bytes: payload.offset_bytes,
+                data_base64: general_purpose::STANDARD.encode(payload.data),
+                size_bytes: payload.size_bytes,
+                eof: payload.eof,
+            })
+            .map_err(|_| ProtocolError::InvalidEnvelope)?
+        }
         Some(binary_protocol_packet::Payload::Error(error)) => {
             serde_json::to_value(PacketErrorPayload {
                 code: error.code,
@@ -5744,6 +7205,23 @@ fn binary_stream_chunk_payload(
             .map_err(|_| ProtocolError::InvalidEnvelope)?;
         return Ok(Some(binary_protocol_packet::Payload::TerminalFrame(
             terminal_frame_to_binary(frame)?,
+        )));
+    }
+
+    if let Ok(file_chunk) =
+        serde_json::from_value::<SessionFileTransferChunkPayload>(payload.clone())
+    {
+        let data = general_purpose::STANDARD
+            .decode(file_chunk.data_base64)
+            .map_err(|_| ProtocolError::InvalidEnvelope)?;
+        return Ok(Some(binary_protocol_packet::Payload::FileChunk(
+            BinaryFileChunkPayload {
+                session_id: file_chunk.session_id.0.as_bytes().to_vec(),
+                offset_bytes: file_chunk.offset_bytes,
+                data,
+                size_bytes: file_chunk.size_bytes,
+                eof: file_chunk.eof,
+            },
         )));
     }
 
@@ -6262,8 +7740,86 @@ fn ensure_path_inside_root(root: &Path, target: &Path) -> Result<(), ProtocolErr
     Err(ProtocolError::InvalidEnvelope)
 }
 
+fn path_matches_active_session_file_http_upload_target(
+    path: &Path,
+    active_targets: &[ActiveSessionFileHttpUploadTarget],
+) -> bool {
+    if active_targets.iter().any(|active| active.target == path) {
+        return true;
+    }
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    let identity = SessionFileHttpUploadFileIdentity::from_metadata(&metadata);
+    active_targets.iter().any(|active| {
+        if !active.file_identity.has_stable_filesystem_object_identity()
+            || !identity.has_stable_filesystem_object_identity()
+        {
+            // 中文注释：无法可靠识别 alias 时按命中处理，避免 active upload
+            // 在缺失 file id 的文件系统上被读写删或 Git 操作绕过。
+            return true;
+        }
+        active.file_identity.is_same_filesystem_object(identity)
+    })
+}
+
+fn git_scope_contains_active_session_file_http_upload_alias(
+    worktree: &Path,
+    file_path: Option<&str>,
+    active_targets: &[ActiveSessionFileHttpUploadTarget],
+) -> bool {
+    // 中文注释：不要自己递归扫描 worktree。Git action/diff 只会影响 Git 认为有变化
+    // 的 pathspec，直接用 `git status -z -- <scope>` 找候选路径，再按 inode 识别 alias。
+    let output = if let Some(path) = file_path {
+        run_git_command(
+            worktree,
+            &[
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                "-z",
+                "--",
+                path,
+            ],
+        )
+    } else {
+        run_git_command(
+            worktree,
+            &["status", "--porcelain=v1", "--untracked-files=all", "-z"],
+        )
+    };
+    let Ok(output) = output else {
+        return false;
+    };
+    if !output.success {
+        return false;
+    }
+    parse_git_status_entries(&output.stdout)
+        .into_iter()
+        .any(|change| {
+            path_matches_active_session_file_http_upload_target(
+                &worktree.join(change.path),
+                active_targets,
+            )
+        })
+}
+
 fn validate_git_relative_file_path(path: &str) -> Result<(), ProtocolError> {
-    let path = Path::new(path.trim());
+    let raw = path.trim();
+    if raw.starts_with(':') {
+        // 中文注释：Git 的 pathspec magic（如 `:(glob)*`）即使放在 `--` 后仍会生效；
+        // 当前 UI 只支持普通相对路径，因此直接拒绝 magic 入口，避免绕过 active upload guard。
+        return Err(ProtocolError::InvalidEnvelope);
+    }
+    if raw
+        .bytes()
+        .any(|byte| matches!(byte, b'*' | b'?' | b'[' | b']'))
+    {
+        // 中文注释：`--` 不会禁用 Git wildcard pathspec；这里禁用 glob 字符，
+        // 保证 guard 检查到的字面路径和 Git 实际操作的路径一致。
+        return Err(ProtocolError::InvalidEnvelope);
+    }
+    let path = Path::new(raw);
     if path.as_os_str().is_empty() || path.is_absolute() {
         return Err(ProtocolError::InvalidEnvelope);
     }
@@ -6347,6 +7903,7 @@ fn read_session_git_snapshot(
     session_id: SessionId,
     cwd: &Path,
     cwd_text: String,
+    active_upload_targets: &[ActiveSessionFileHttpUploadTarget],
 ) -> SessionGitResultPayload {
     let repo_output = match run_git_command(cwd, &["rev-parse", "--show-toplevel"]) {
         Ok(output) => output,
@@ -6378,7 +7935,8 @@ fn read_session_git_snapshot(
     let worktrees = worktree_infos
         .into_iter()
         .map(|worktree| {
-            let (staged, unstaged) = read_git_worktree_changes(&worktree.path);
+            let (staged, unstaged) =
+                read_git_worktree_changes(&worktree.path, active_upload_targets);
             let is_current = same_path(&worktree.path, &current_root);
             SessionGitWorktreePayload {
                 path: absolute_path_string(&worktree.path),
@@ -6465,7 +8023,8 @@ fn read_git_diff(
     }
     let output = run_git_command(worktree, &args).map_err(|_| ProtocolError::RuntimeFailed)?;
     if !output.success {
-        tracing::warn!(stderr = %output.stderr, "git diff failed");
+        tracing::debug!(stderr = %output.stderr, "git diff failed detail");
+        tracing::warn!("git diff failed");
         return Err(ProtocolError::RuntimeFailed);
     }
     Ok(limit_text_for_payload(output.stdout, 256 * 1024))
@@ -6496,7 +8055,8 @@ fn discard_git_file_change(worktree: &Path, file_path: &str) -> Result<(), Proto
     )
     .map_err(|_| ProtocolError::RuntimeFailed)?;
     if !status.success {
-        tracing::warn!(stderr = %status.stderr, "git status for discard failed");
+        tracing::debug!(stderr = %status.stderr, "git status for discard failed detail");
+        tracing::warn!("git status for discard failed");
         return Err(ProtocolError::RuntimeFailed);
     }
     let has_untracked = status.stdout.lines().any(|line| line.starts_with("??"));
@@ -6523,7 +8083,8 @@ fn run_git_checked(cwd: &Path, args: &[&str]) -> Result<(), ProtocolError> {
         return Ok(());
     }
 
-    tracing::warn!(stderr = %output.stderr, "git action failed");
+    tracing::debug!(stderr = %output.stderr, "git action failed detail");
+    tracing::warn!("git action failed");
     Err(ProtocolError::RuntimeFailed)
 }
 
@@ -6610,13 +8171,14 @@ fn read_git_head(worktree: &Path) -> Option<String> {
 
 fn read_git_worktree_changes(
     worktree: &Path,
+    active_upload_targets: &[ActiveSessionFileHttpUploadTarget],
 ) -> (
     Vec<SessionGitFileChangePayload>,
     Vec<SessionGitFileChangePayload>,
 ) {
     let Some(output) = run_git_command(
         worktree,
-        &["status", "--porcelain=v1", "--untracked-files=all"],
+        &["status", "--porcelain=v1", "--untracked-files=all", "-z"],
     )
     .ok()
     .filter(|output| output.success) else {
@@ -6624,24 +8186,50 @@ fn read_git_worktree_changes(
     };
     let mut staged = Vec::new();
     let mut unstaged = Vec::new();
-    for line in output.stdout.lines() {
-        if let Some(change) = parse_git_status_line(line) {
-            if change.staged {
-                staged.push(SessionGitFileChangePayload {
-                    path: change.path.clone(),
-                    status: change.status.clone(),
-                });
-            }
-            if change.unstaged {
-                unstaged.push(SessionGitFileChangePayload {
-                    path: change.path,
-                    status: change.status,
-                });
-            }
+    for change in parse_git_status_entries(&output.stdout) {
+        if path_matches_active_session_file_http_upload_target(
+            &worktree.join(&change.path),
+            active_upload_targets,
+        ) {
+            // 中文注释：active HTTP upload 目标在 Git 看来是 untracked/modified，
+            // 但它还不是已完成文件；hardlink/symlink alias 也必须隐藏。
+            continue;
+        }
+        if change.staged {
+            staged.push(SessionGitFileChangePayload {
+                path: change.path.clone(),
+                status: change.status.clone(),
+            });
+        }
+        if change.unstaged {
+            unstaged.push(SessionGitFileChangePayload {
+                path: change.path,
+                status: change.status,
+            });
         }
     }
 
     (staged, unstaged)
+}
+
+fn parse_git_status_entries(output: &str) -> Vec<GitStatusLine> {
+    if output.contains('\0') {
+        let mut changes = Vec::new();
+        let mut fields = output.split('\0').filter(|field| !field.is_empty());
+        while let Some(field) = fields.next() {
+            let Some(change) = parse_git_status_line(field) else {
+                continue;
+            };
+            if change.status.starts_with('R') || change.status.starts_with('C') {
+                // 中文注释：`git status -z` 的 rename/copy 记录会额外跟一个旧路径；
+                // UI 当前只展示新路径，旧路径字段必须消费掉，避免错位解析。
+                let _ = fields.next();
+            }
+            changes.push(change);
+        }
+        return changes;
+    }
+    output.lines().filter_map(parse_git_status_line).collect()
 }
 
 struct GitStatusLine {
@@ -6655,7 +8243,7 @@ fn parse_git_status_line(line: &str) -> Option<GitStatusLine> {
     let mut chars = line.chars();
     let index = chars.next()?;
     let worktree = chars.next()?;
-    let path = line.get(3..)?.trim();
+    let path = line.get(3..)?;
     if path.is_empty() {
         return None;
     }
@@ -6766,8 +8354,576 @@ fn session_file_download_name(path: &Path) -> String {
         .unwrap_or_else(|| "download".to_owned())
 }
 
+fn session_file_http_upload_id() -> String {
+    let mut bytes = [0_u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+fn session_file_http_upload_id_is_safe(upload_id: &str) -> bool {
+    !upload_id.is_empty()
+        && upload_id.len() <= 128
+        && upload_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+pub(crate) fn cleanup_persisted_session_file_http_uploads(
+    state_path: &Path,
+) -> Result<(), StateError> {
+    for record in StateStore::list_http_uploads(state_path)? {
+        // 中文注释：存在 recovery record 就表示 upload 尚未完成 commit；启动恢复时
+        // 只删除与 record identity 匹配的预分配目标。如果用户已经替换了该路径，保留新文件。
+        let expected_identity = session_file_http_upload_identity_from_recovery_record(&record);
+        let cleanup = remove_persisted_session_file_http_upload_target(
+            &record.target_path,
+            expected_identity,
+        );
+        if let Err(error) = &cleanup {
+            tracing::debug!(
+                %error,
+                upload_id = %record.upload_id,
+                target = %record.target_path.display(),
+                "failed to cleanup stale HTTP upload recovery target detail"
+            );
+            tracing::warn!(
+                upload_id = %record.upload_id,
+                "failed to cleanup stale HTTP upload recovery target"
+            );
+            return Err(StateError::Read {
+                path: record.target_path,
+                source: std::io::Error::other("failed to cleanup stale HTTP upload target"),
+            });
+        }
+        StateStore::remove_http_upload(state_path, &record.upload_id)?;
+        tracing::debug!(
+            upload_id = %record.upload_id,
+            target = %record.target_path.display(),
+            outcome = ?cleanup.as_ref().ok(),
+            "discarded stale HTTP upload recovery record detail"
+        );
+        tracing::warn!(
+            upload_id = %record.upload_id,
+            "discarded stale HTTP upload recovery record"
+        );
+    }
+    Ok(())
+}
+
+fn session_file_http_upload_identity_from_recovery_record(
+    record: &HttpUploadRecoveryRecord,
+) -> SessionFileHttpUploadFileIdentity {
+    SessionFileHttpUploadFileIdentity {
+        #[cfg(unix)]
+        dev: record.dev,
+        #[cfg(unix)]
+        ino: record.ino,
+        #[cfg(windows)]
+        volume_serial_number: if record.dev == SESSION_FILE_HTTP_UPLOAD_IDENTITY_UNKNOWN {
+            None
+        } else {
+            u32::try_from(record.dev).ok()
+        },
+        #[cfg(windows)]
+        file_index: if record.ino == SESSION_FILE_HTTP_UPLOAD_IDENTITY_UNKNOWN {
+            None
+        } else {
+            Some(record.ino)
+        },
+        #[cfg(not(any(unix, windows)))]
+        modified_at_ms: Some(UnixTimestampMillis(record.dev)),
+        #[cfg(not(any(unix, windows)))]
+        created_at_ms: Some(UnixTimestampMillis(record.ino)),
+        len: record.size_bytes,
+    }
+}
+
+pub(crate) fn write_session_file_http_upload_files(
+    plan: SessionFileHttpUploadWritePlan,
+    chunks: impl IntoIterator<Item = Vec<u8>>,
+) -> Result<SessionFileHttpUploadFileWriteResult, ProtocolError> {
+    let file = plan.file;
+    let mut current_offset = plan.offset_bytes;
+    let mut written_ranges = Vec::new();
+    let mut saw_chunk = false;
+    for chunk in chunks {
+        saw_chunk = true;
+        let next_offset = current_offset
+            .checked_add(chunk.len() as u64)
+            .ok_or(ProtocolError::InvalidEnvelope)?;
+        if chunk.is_empty() || next_offset > plan.size_bytes {
+            tracing::debug!(
+                target = %plan.target.display(),
+                offset_bytes = current_offset,
+                chunk_len = chunk.len(),
+                next_offset,
+                size_bytes = plan.size_bytes,
+                "HTTP upload file write chunk is outside declared range detail"
+            );
+            tracing::warn!(
+                offset_bytes = current_offset,
+                chunk_len = chunk.len(),
+                next_offset,
+                size_bytes = plan.size_bytes,
+                "HTTP upload file write chunk is outside declared range"
+            );
+            return Err(ProtocolError::InvalidEnvelope);
+        }
+        if range_is_fully_covered(&plan.written_ranges, current_offset, next_offset) {
+            let existing = read_session_file_http_upload_range(&file, current_offset, chunk.len())?;
+            if existing != chunk {
+                tracing::debug!(
+                    target = %plan.target.display(),
+                    offset_bytes = current_offset,
+                    next_offset,
+                    "HTTP upload duplicate range does not match existing bytes detail"
+                );
+                tracing::warn!(
+                    offset_bytes = current_offset,
+                    next_offset,
+                    "HTTP upload duplicate range does not match existing bytes"
+                );
+                return Err(ProtocolError::InvalidEnvelope);
+            }
+        } else {
+            if range_overlaps(&plan.written_ranges, current_offset, next_offset) {
+                tracing::debug!(
+                    target = %plan.target.display(),
+                    offset_bytes = current_offset,
+                    next_offset,
+                    written_ranges = plan.written_ranges.len(),
+                    "HTTP upload file write overlaps committed range detail"
+                );
+                tracing::warn!(
+                    offset_bytes = current_offset,
+                    next_offset,
+                    written_ranges = plan.written_ranges.len(),
+                    "HTTP upload file write overlaps committed range"
+                );
+                return Err(ProtocolError::InvalidEnvelope);
+            }
+            write_session_file_http_upload_range(&file, current_offset, &chunk)?;
+            written_ranges.push((current_offset, next_offset));
+        }
+        current_offset = next_offset;
+    }
+    if !saw_chunk && current_offset != plan.size_bytes {
+        tracing::debug!(
+            target = %plan.target.display(),
+            offset_bytes = current_offset,
+            size_bytes = plan.size_bytes,
+            "HTTP upload empty write did not point at EOF detail"
+        );
+        tracing::warn!(
+            offset_bytes = current_offset,
+            size_bytes = plan.size_bytes,
+            "HTTP upload empty write did not point at EOF"
+        );
+        return Err(ProtocolError::InvalidEnvelope);
+    }
+    ensure_session_file_http_upload_target_identity(&plan.target, plan.file_identity)?;
+    let metadata = file.metadata().map_err(map_file_path_error)?;
+    if metadata.len() != plan.size_bytes {
+        tracing::debug!(
+            target = %plan.target.display(),
+            actual_len = metadata.len(),
+            size_bytes = plan.size_bytes,
+            "HTTP upload target length changed during write detail"
+        );
+        tracing::warn!(
+            actual_len = metadata.len(),
+            size_bytes = plan.size_bytes,
+            "HTTP upload target length changed during write"
+        );
+        return Err(ProtocolError::InvalidEnvelope);
+    }
+    Ok(SessionFileHttpUploadFileWriteResult {
+        written_ranges,
+        reserved_range: plan.reserved_range,
+        modified_at_ms: metadata_modified_at_ms(&metadata),
+    })
+}
+
+pub(crate) fn session_file_http_upload_chunks_len(
+    chunks: &[Vec<u8>],
+) -> Result<u64, ProtocolError> {
+    chunks
+        .iter()
+        .try_fold(0_u64, |sum, chunk| sum.checked_add(chunk.len() as u64))
+        .ok_or(ProtocolError::InvalidEnvelope)
+}
+
+fn range_is_fully_covered(ranges: &BTreeMap<u64, u64>, start: u64, end: u64) -> bool {
+    if start == end {
+        return true;
+    }
+    let mut cursor = start;
+    while cursor < end {
+        let Some((&range_start, &len)) = ranges.range(..=cursor).next_back() else {
+            return false;
+        };
+        let Some(range_end) = range_start.checked_add(len) else {
+            return false;
+        };
+        if range_start > cursor || range_end <= cursor {
+            return false;
+        }
+        cursor = range_end;
+    }
+    true
+}
+
+fn range_overlaps(ranges: &BTreeMap<u64, u64>, start: u64, end: u64) -> bool {
+    if start == end {
+        return false;
+    }
+    if ranges
+        .range(..=start)
+        .next_back()
+        .and_then(|(&range_start, &len)| range_start.checked_add(len))
+        .is_some_and(|range_end| range_end > start)
+    {
+        return true;
+    }
+    ranges
+        .range(start..)
+        .next()
+        .is_some_and(|(&next_start, _)| next_start < end)
+}
+
+fn read_session_file_http_upload_range(
+    file: &fs::File,
+    offset: u64,
+    len: usize,
+) -> Result<Vec<u8>, ProtocolError> {
+    let mut bytes = vec![0_u8; len];
+    read_session_file_exact_at(file, &mut bytes, offset)?;
+    Ok(bytes)
+}
+
+fn write_session_file_http_upload_range(
+    file: &fs::File,
+    offset: u64,
+    bytes: &[u8],
+) -> Result<(), ProtocolError> {
+    write_session_file_all_at(file, bytes, offset)
+}
+
+#[cfg(unix)]
+fn read_session_file_exact_at(
+    file: &fs::File,
+    bytes: &mut [u8],
+    offset: u64,
+) -> Result<(), ProtocolError> {
+    // 中文注释：HTTP upload 支持 2 并发分片，必须使用 positional I/O；
+    // `try_clone + seek` 会共享文件游标，两个分片会互相改 offset。
+    let mut read_len = 0_usize;
+    while read_len < bytes.len() {
+        let n = file
+            .read_at(&mut bytes[read_len..], offset + read_len as u64)
+            .map_err(map_file_path_error)?;
+        if n == 0 {
+            return Err(ProtocolError::InvalidEnvelope);
+        }
+        read_len += n;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn read_session_file_exact_at(
+    file: &fs::File,
+    bytes: &mut [u8],
+    offset: u64,
+) -> Result<(), ProtocolError> {
+    let mut read_len = 0_usize;
+    while read_len < bytes.len() {
+        let n = file
+            .seek_read(&mut bytes[read_len..], offset + read_len as u64)
+            .map_err(map_file_path_error)?;
+        if n == 0 {
+            return Err(ProtocolError::InvalidEnvelope);
+        }
+        read_len += n;
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn read_session_file_exact_at(
+    file: &fs::File,
+    bytes: &mut [u8],
+    offset: u64,
+) -> Result<(), ProtocolError> {
+    let mut file = file.try_clone().map_err(map_file_path_error)?;
+    file.seek(SeekFrom::Start(offset))
+        .map_err(map_file_path_error)?;
+    file.read_exact(bytes).map_err(map_file_path_error)
+}
+
+#[cfg(unix)]
+fn write_session_file_all_at(
+    file: &fs::File,
+    bytes: &[u8],
+    offset: u64,
+) -> Result<(), ProtocolError> {
+    let mut written = 0_usize;
+    while written < bytes.len() {
+        let n = file
+            .write_at(&bytes[written..], offset + written as u64)
+            .map_err(map_file_path_error)?;
+        if n == 0 {
+            return Err(ProtocolError::RuntimeFailed);
+        }
+        written += n;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn write_session_file_all_at(
+    file: &fs::File,
+    bytes: &[u8],
+    offset: u64,
+) -> Result<(), ProtocolError> {
+    let mut written = 0_usize;
+    while written < bytes.len() {
+        let n = file
+            .seek_write(&bytes[written..], offset + written as u64)
+            .map_err(map_file_path_error)?;
+        if n == 0 {
+            return Err(ProtocolError::RuntimeFailed);
+        }
+        written += n;
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn write_session_file_all_at(
+    file: &fs::File,
+    bytes: &[u8],
+    offset: u64,
+) -> Result<(), ProtocolError> {
+    let mut file = file.try_clone().map_err(map_file_path_error)?;
+    file.seek(SeekFrom::Start(offset))
+        .map_err(map_file_path_error)?;
+    file.write_all(bytes).map_err(map_file_path_error)
+}
+
+fn create_session_file_http_upload_target(
+    target: &Path,
+    size_bytes: u64,
+) -> Result<(fs::File, SessionFileHttpUploadFileIdentity), ProtocolError> {
+    create_session_file_http_upload_target_with_set_len(target, size_bytes, |file, size_bytes| {
+        file.set_len(size_bytes)
+    })
+}
+
+fn create_session_file_http_upload_target_with_set_len(
+    target: &Path,
+    size_bytes: u64,
+    set_len: impl FnOnce(&fs::File, u64) -> std::io::Result<()>,
+) -> Result<(fs::File, SessionFileHttpUploadFileIdentity), ProtocolError> {
+    let mut options = OpenOptions::new();
+    options.write(true).read(true).create_new(true);
+    #[cfg(unix)]
+    {
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    // 中文注释：init 在最终路径创建新文件并设置声明大小；后续请求只 seek 写这个文件。
+    let file = match options.open(target) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(ProtocolError::InvalidEnvelope);
+        }
+        Err(error) => return Err(map_file_path_error(error)),
+    };
+    let created_metadata = file.metadata().map_err(map_file_path_error)?;
+    let created_identity = SessionFileHttpUploadFileIdentity::from_metadata(&created_metadata);
+    if let Err(error) = set_len(&file, size_bytes) {
+        // 中文注释：state 尚未登记时 set_len 失败，必须清理刚创建的最终目标文件；
+        // 否则下一次 init 会被 create_new 的 AlreadyExists 卡住。
+        let _ = remove_session_file_http_upload_target(target, created_identity);
+        return Err(map_file_path_error(error));
+    }
+    let metadata = file.metadata().map_err(map_file_path_error)?;
+    let identity = SessionFileHttpUploadFileIdentity::from_metadata(&metadata);
+    Ok((file, identity))
+}
+
+fn ensure_session_file_http_upload_target_identity(
+    target: &Path,
+    expected_identity: SessionFileHttpUploadFileIdentity,
+) -> Result<(), ProtocolError> {
+    let metadata = match fs::symlink_metadata(target) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            tracing::debug!(
+                target = %target.display(),
+                kind = ?error.kind(),
+                "HTTP upload target identity check could not stat target detail"
+            );
+            tracing::warn!(
+                kind = ?error.kind(),
+                "HTTP upload target identity check could not stat target"
+            );
+            return Err(map_file_path_error(error));
+        }
+    };
+    let actual_identity = SessionFileHttpUploadFileIdentity::from_metadata(&metadata);
+    if actual_identity == expected_identity {
+        Ok(())
+    } else {
+        tracing::debug!(
+            target = %target.display(),
+            expected = ?expected_identity,
+            actual = ?actual_identity,
+            "HTTP upload target identity changed detail"
+        );
+        tracing::warn!(
+            expected = ?expected_identity,
+            actual = ?actual_identity,
+            "HTTP upload target identity changed"
+        );
+        Err(ProtocolError::InvalidState)
+    }
+}
+
+fn session_file_http_upload_target_has_external_links(metadata: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        return metadata.nlink() > 1;
+    }
+    #[cfg(windows)]
+    {
+        // 中文注释：Windows 也支持 hardlink。active upload 清理前必须检查链接数，
+        // 否则删除目标路径后，未完成内容仍可能通过 hardlink alias 暴露。
+        return metadata
+            .number_of_links()
+            .map(|links| links > 1)
+            .unwrap_or(true);
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = metadata;
+        true
+    }
+}
+
+fn session_file_http_upload_open_file_has_remaining_links(
+    file: &fs::File,
+    expected_identity: SessionFileHttpUploadFileIdentity,
+) -> bool {
+    let metadata = match file.metadata() {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            tracing::debug!(
+                kind = ?error.kind(),
+                "HTTP upload open file link check could not stat target detail"
+            );
+            tracing::warn!("HTTP upload open file link check could not stat target");
+            return true;
+        }
+    };
+    let identity = SessionFileHttpUploadFileIdentity::from_metadata(&metadata);
+    if !identity.is_same_filesystem_object(expected_identity) {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        return metadata.nlink() > 0;
+    }
+    #[cfg(windows)]
+    {
+        return metadata
+            .number_of_links()
+            .map(|links| links > 0)
+            .unwrap_or(true);
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = metadata;
+        true
+    }
+}
+
+fn remove_session_file_http_upload_target(
+    target: &Path,
+    expected_identity: SessionFileHttpUploadFileIdentity,
+) -> Result<SessionFileHttpUploadCleanupOutcome, ProtocolError> {
+    remove_session_file_http_upload_target_with_mode(
+        target,
+        expected_identity,
+        SessionFileHttpUploadCleanupIdentityMode::InMemoryOpenHandle,
+    )
+}
+
+fn remove_persisted_session_file_http_upload_target(
+    target: &Path,
+    expected_identity: SessionFileHttpUploadFileIdentity,
+) -> Result<SessionFileHttpUploadCleanupOutcome, ProtocolError> {
+    remove_session_file_http_upload_target_with_mode(
+        target,
+        expected_identity,
+        SessionFileHttpUploadCleanupIdentityMode::PersistedRecovery,
+    )
+}
+
+fn remove_session_file_http_upload_target_with_mode(
+    target: &Path,
+    expected_identity: SessionFileHttpUploadFileIdentity,
+    mode: SessionFileHttpUploadCleanupIdentityMode,
+) -> Result<SessionFileHttpUploadCleanupOutcome, ProtocolError> {
+    let target_metadata = match fs::symlink_metadata(target) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => match mode {
+            SessionFileHttpUploadCleanupIdentityMode::InMemoryOpenHandle => {
+                return Ok(SessionFileHttpUploadCleanupOutcome::AlreadyGone);
+            }
+            // 中文注释：启动 recovery 没有 open file handle；target 缺失时不能证明
+            // 原 active 对象没有 hardlink alias，必须保留 recovery record。
+            SessionFileHttpUploadCleanupIdentityMode::PersistedRecovery => {
+                return Err(ProtocolError::InvalidState);
+            }
+        },
+        Err(error) => return Err(map_file_path_error(error)),
+    };
+    let target_identity = SessionFileHttpUploadFileIdentity::from_metadata(&target_metadata);
+    match session_file_http_upload_cleanup_identity_match(target_identity, expected_identity, mode)?
+    {
+        SessionFileHttpUploadCleanupIdentityMatch::Same => {}
+        SessionFileHttpUploadCleanupIdentityMatch::Replaced => {
+            return Ok(SessionFileHttpUploadCleanupOutcome::TargetReplaced);
+        }
+    }
+    if session_file_http_upload_target_has_external_links(&target_metadata) {
+        // 中文注释：如果 active upload 目标有 hardlink alias，删除原路径并不能删除
+        // 未完成内容。必须保留 active/recovery 状态继续隔离，等 alias 被移除后再清理。
+        return Err(ProtocolError::InvalidState);
+    }
+    match fs::remove_file(target) {
+        Ok(()) => Ok(SessionFileHttpUploadCleanupOutcome::Removed),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(SessionFileHttpUploadCleanupOutcome::AlreadyGone)
+        }
+        Err(error) => Err(map_file_path_error(error)),
+    }
+}
+
+fn cleanup_upload_temp(stream: &PacketFileUploadStream) {
+    let _ = fs::remove_file(&stream.temp_path);
+}
+
 fn metadata_modified_at_ms(metadata: &fs::Metadata) -> Option<UnixTimestampMillis> {
     let duration = metadata.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
+    let millis = duration.as_millis().min(u128::from(u64::MAX)) as u64;
+    Some(UnixTimestampMillis(millis))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn metadata_created_at_ms(metadata: &fs::Metadata) -> Option<UnixTimestampMillis> {
+    let duration = metadata.created().ok()?.duration_since(UNIX_EPOCH).ok()?;
     let millis = duration.as_millis().min(u128::from(u64::MAX)) as u64;
     Some(UnixTimestampMillis(millis))
 }
@@ -6960,7 +9116,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::auth::AuthSigningInput;
+    use crate::auth::{AuthSigningInput, HttpE2eeSigningInput};
     use crate::net::signature::Ed25519SignatureVerifier;
     use crate::pty::{
         PtyBackend, PtyError, PtyExitStatus, PtyRestoreInfo, PtyResult, PtySession, PtySize,
@@ -7003,6 +9159,7 @@ mod tests {
         cwd_read_count_by_session: HashMap<String, usize>,
         writes: Vec<Vec<u8>>,
         reconnects: Vec<String>,
+        read_error: Option<String>,
         reconnect_error: Option<String>,
         terminate_error: Option<String>,
         terminate_count: usize,
@@ -7086,6 +9243,14 @@ mod tests {
             self.state.lock().unwrap().reconnect_error = Some(message.into());
         }
 
+        fn fail_reads(&self, message: impl Into<String>) {
+            self.state.lock().unwrap().read_error = Some(message.into());
+        }
+
+        fn allow_reads(&self) {
+            self.state.lock().unwrap().read_error = None;
+        }
+
         fn allow_reconnects(&self) {
             self.state.lock().unwrap().reconnect_error = None;
         }
@@ -7149,6 +9314,9 @@ mod tests {
     impl PtySession for FakePtySession {
         fn read(&mut self, buffer: &mut [u8]) -> PtyResult<usize> {
             let mut state = self.state.lock().unwrap();
+            if let Some(message) = state.read_error.clone() {
+                return Err(PtyError::Backend(message));
+            }
             if let Some(session_id) = &self.session_id {
                 if let Some(outputs) = state.outputs_by_session.get_mut(session_id) {
                     if let Some(read) = read_fake_output_queue(outputs, buffer) {
@@ -7839,6 +10007,30 @@ mod tests {
         assert!(responses.is_empty());
         assert!(connection.is_authenticated());
         device_session
+    }
+
+    fn signed_http_e2ee_auth(
+        protocol: &DaemonProtocol<FakePtyBackend, Ed25519SignatureVerifier>,
+        device_id: DeviceId,
+        signing_key: &SigningKey,
+        request_nonce: Nonce,
+        method: &str,
+        path: &str,
+    ) -> HttpE2eeAuthPayload {
+        let http_keypair = E2eeKeyPair::generate();
+        let mut auth = HttpE2eeAuthPayload {
+            device_id,
+            e2ee_public_key: http_keypair.public_key_wire(),
+            nonce: request_nonce,
+            timestamp_ms: current_unix_timestamp_millis(),
+            method: method.to_owned(),
+            path: path.to_owned(),
+            signature: Signature("ed25519-v1:placeholder".to_owned()),
+        };
+        let signing_input =
+            HttpE2eeSigningInput::from_payload(&auth, protocol.daemon_public_identity()).to_bytes();
+        auth.signature = Signature(wire(&signing_key.sign(&signing_input).to_bytes()));
+        auth
     }
 
     #[test]
@@ -12663,6 +14855,569 @@ mod tests {
     }
 
     #[test]
+    fn session_git_hides_active_http_upload_targets_and_rejects_actions() {
+        let base = temp_state_path("git-active-upload-base");
+        let root = base.join("project");
+        fs::create_dir_all(&root).unwrap();
+        run_test_git(&root, &["init", "-b", "main"]);
+        run_test_git(&root, &["config", "user.email", "test@example.com"]);
+        run_test_git(&root, &["config", "user.name", "Termd Test"]);
+        fs::write(root.join("README.md"), b"initial\n").unwrap();
+        run_test_git(&root, &["add", "README.md"]);
+        run_test_git(&root, &["commit", "-m", "initial"]);
+
+        let backend = FakePtyBackend::default();
+        let mut config =
+            DaemonConfig::default_for_state_path(temp_state_path("git-active-upload-state.json"));
+        config.default_command = vec!["sh".to_owned()];
+        config.default_working_directory = Some(root.clone());
+        let mut protocol =
+            DaemonProtocol::new(config, backend.clone(), Ed25519SignatureVerifier).unwrap();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = PublicKey(wire(signing_key.verifying_key().as_bytes()));
+        let (_, mut device_session) = open_e2ee(&mut protocol, &mut connection, device_id);
+        pair_device(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            device_id,
+            public_key,
+        );
+        let session_id = create_test_session(&mut protocol, &mut connection, &mut device_session);
+        backend.set_cwd_for_session(session_id, root.clone());
+
+        let ready = protocol
+            .prepare_session_file_http_upload(
+                &connection,
+                SessionFileUploadPayload {
+                    session_id,
+                    path: "partial.bin".to_owned(),
+                    size_bytes: 8,
+                },
+                device_id,
+            )
+            .unwrap();
+        let meta = SessionFileHttpUploadStreamPayload {
+            session_id,
+            path: ready.path.clone(),
+            upload_id: ready.upload_id.clone(),
+            size_bytes: ready.size_bytes,
+            offset_bytes: 0,
+        };
+        let target = root.join("partial.bin");
+        assert!(target.exists(), "init 必须先预分配最终目标文件");
+        fs::hard_link(&target, root.join("hardlink.bin")).unwrap();
+        fs::create_dir_all(root.join("aliases")).unwrap();
+        fs::hard_link(&target, root.join("aliases").join("hardlink.bin")).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("partial.bin", root.join("alias.bin")).unwrap();
+        }
+
+        let root_files = protocol
+            .session_files_result(session_id, Some(root.to_string_lossy().to_string()), false)
+            .unwrap();
+        assert!(
+            root_files
+                .entries
+                .iter()
+                .all(|entry| entry.name != "partial.bin"
+                    && entry.name != "hardlink.bin"
+                    && entry.name != "alias.bin"),
+            "文件列表不应暴露 active HTTP upload 目标及其 alias"
+        );
+        let alias_files = protocol
+            .session_files_result(
+                session_id,
+                Some(root.join("aliases").to_string_lossy().to_string()),
+                false,
+            )
+            .unwrap();
+        assert!(
+            alias_files
+                .entries
+                .iter()
+                .all(|entry| entry.name != "hardlink.bin"),
+            "子目录文件列表不应暴露 active HTTP upload hardlink alias"
+        );
+        let other_session_id =
+            create_test_session(&mut protocol, &mut connection, &mut device_session);
+        backend.set_cwd_for_session(other_session_id, root.clone());
+        let other_root_files = protocol
+            .session_files_result(
+                other_session_id,
+                Some(root.to_string_lossy().to_string()),
+                false,
+            )
+            .unwrap();
+        assert!(
+            other_root_files
+                .entries
+                .iter()
+                .all(|entry| entry.name != "partial.bin" && entry.name != "hardlink.bin"),
+            "另一个 session 指向同一目录时也不能暴露 active HTTP upload 目标"
+        );
+        let other_read = protocol.read_session_file(
+            &connection,
+            SessionFileReadPayload {
+                session_id: other_session_id,
+                path: "partial.bin".to_owned(),
+                max_bytes: Some(8),
+            },
+        );
+        assert!(matches!(other_read, Err(ProtocolError::InvalidState)));
+
+        let payload = protocol.session_git_result(session_id).unwrap();
+        let current_worktree = payload
+            .worktrees
+            .iter()
+            .find(|worktree| worktree.is_current)
+            .expect("current worktree should be marked");
+        assert!(
+            current_worktree
+                .staged
+                .iter()
+                .chain(current_worktree.unstaged.iter())
+                .all(|change| change.path != "partial.bin"
+                    && change.path != "hardlink.bin"
+                    && change.path != "alias.bin"
+                    && change.path != "aliases/hardlink.bin"),
+            "Git 状态不应暴露 active HTTP upload 目标及其 alias"
+        );
+
+        let discard = protocol.apply_session_git_action(
+            &connection,
+            SessionGitActionPayload {
+                session_id,
+                worktree_path: root.to_string_lossy().to_string(),
+                file_path: "partial.bin".to_owned(),
+                action: SessionGitActionKind::Discard,
+            },
+        );
+        assert!(matches!(discard, Err(ProtocolError::InvalidState)));
+        assert!(
+            target.exists(),
+            "Git discard 不能删除 active HTTP upload 目标"
+        );
+
+        let diff = protocol.read_session_git_diff(
+            &connection,
+            SessionGitDiffPayload {
+                session_id,
+                worktree_path: root.to_string_lossy().to_string(),
+                file_path: Some("partial.bin".to_owned()),
+                staged: false,
+            },
+        );
+        assert!(matches!(diff, Err(ProtocolError::InvalidState)));
+
+        let full_diff = protocol.read_session_git_diff(
+            &connection,
+            SessionGitDiffPayload {
+                session_id,
+                worktree_path: root.to_string_lossy().to_string(),
+                file_path: None,
+                staged: false,
+            },
+        );
+        assert!(matches!(full_diff, Err(ProtocolError::InvalidState)));
+
+        let pathspec_discard = protocol.apply_session_git_action(
+            &connection,
+            SessionGitActionPayload {
+                session_id,
+                worktree_path: root.to_string_lossy().to_string(),
+                file_path: ":(glob)*".to_owned(),
+                action: SessionGitActionKind::Discard,
+            },
+        );
+        assert!(matches!(
+            pathspec_discard,
+            Err(ProtocolError::InvalidEnvelope)
+        ));
+
+        let pathspec_diff = protocol.read_session_git_diff(
+            &connection,
+            SessionGitDiffPayload {
+                session_id,
+                worktree_path: root.to_string_lossy().to_string(),
+                file_path: Some(":(glob)*".to_owned()),
+                staged: false,
+            },
+        );
+        assert!(matches!(pathspec_diff, Err(ProtocolError::InvalidEnvelope)));
+
+        let wildcard_discard = protocol.apply_session_git_action(
+            &connection,
+            SessionGitActionPayload {
+                session_id,
+                worktree_path: root.to_string_lossy().to_string(),
+                file_path: "*.bin".to_owned(),
+                action: SessionGitActionKind::Discard,
+            },
+        );
+        assert!(matches!(
+            wildcard_discard,
+            Err(ProtocolError::InvalidEnvelope)
+        ));
+
+        let wildcard_diff = protocol.read_session_git_diff(
+            &connection,
+            SessionGitDiffPayload {
+                session_id,
+                worktree_path: root.to_string_lossy().to_string(),
+                file_path: Some("*.bin".to_owned()),
+                staged: false,
+            },
+        );
+        assert!(matches!(wildcard_diff, Err(ProtocolError::InvalidEnvelope)));
+
+        let alias_dir_discard = protocol.apply_session_git_action(
+            &connection,
+            SessionGitActionPayload {
+                session_id,
+                worktree_path: root.to_string_lossy().to_string(),
+                file_path: "aliases".to_owned(),
+                action: SessionGitActionKind::Discard,
+            },
+        );
+        assert!(matches!(
+            alias_dir_discard,
+            Err(ProtocolError::InvalidState)
+        ));
+
+        let alias_dir_diff = protocol.read_session_git_diff(
+            &connection,
+            SessionGitDiffPayload {
+                session_id,
+                worktree_path: root.to_string_lossy().to_string(),
+                file_path: Some("aliases".to_owned()),
+                staged: false,
+            },
+        );
+        assert!(matches!(alias_dir_diff, Err(ProtocolError::InvalidState)));
+
+        fs::create_dir_all(root.join("uploads")).unwrap();
+        let nested_ready = protocol
+            .prepare_session_file_http_upload(
+                &connection,
+                SessionFileUploadPayload {
+                    session_id,
+                    path: "uploads/partial.bin".to_owned(),
+                    size_bytes: 4,
+                },
+                device_id,
+            )
+            .unwrap();
+        let nested_target = root.join("uploads").join("partial.bin");
+        let nested_dir_discard = protocol.apply_session_git_action(
+            &connection,
+            SessionGitActionPayload {
+                session_id,
+                worktree_path: root.to_string_lossy().to_string(),
+                file_path: "uploads".to_owned(),
+                action: SessionGitActionKind::Discard,
+            },
+        );
+        assert!(matches!(
+            nested_dir_discard,
+            Err(ProtocolError::InvalidState)
+        ));
+        assert!(
+            nested_target.exists(),
+            "Git 目录级 discard 不能删除目录内的 active HTTP upload 目标"
+        );
+        let nested_dir_diff = protocol.read_session_git_diff(
+            &connection,
+            SessionGitDiffPayload {
+                session_id,
+                worktree_path: root.to_string_lossy().to_string(),
+                file_path: Some("uploads".to_owned()),
+                staged: false,
+            },
+        );
+        assert!(matches!(nested_dir_diff, Err(ProtocolError::InvalidState)));
+        protocol
+            .abort_session_file_http_upload(
+                &connection,
+                &SessionFileHttpUploadStreamPayload {
+                    session_id,
+                    path: nested_ready.path,
+                    upload_id: nested_ready.upload_id,
+                    size_bytes: nested_ready.size_bytes,
+                    offset_bytes: 0,
+                },
+            )
+            .unwrap();
+
+        let read = protocol.read_session_file(
+            &connection,
+            SessionFileReadPayload {
+                session_id,
+                path: "partial.bin".to_owned(),
+                max_bytes: Some(8),
+            },
+        );
+        assert!(matches!(read, Err(ProtocolError::InvalidState)));
+
+        let write = protocol.write_session_file(
+            &connection,
+            SessionFileWritePayload {
+                session_id,
+                path: "partial.bin".to_owned(),
+                data_base64: general_purpose::STANDARD.encode(b"overwrite"),
+            },
+        );
+        assert!(matches!(write, Err(ProtocolError::InvalidState)));
+
+        let hardlink_write = protocol.write_session_file(
+            &connection,
+            SessionFileWritePayload {
+                session_id,
+                path: "hardlink.bin".to_owned(),
+                data_base64: general_purpose::STANDARD.encode(b"hardlink"),
+            },
+        );
+        assert!(matches!(hardlink_write, Err(ProtocolError::InvalidState)));
+
+        OpenOptions::new()
+            .write(true)
+            .open(&target)
+            .unwrap()
+            .set_len(16)
+            .unwrap();
+        let resized_hardlink_write = protocol.write_session_file(
+            &connection,
+            SessionFileWritePayload {
+                session_id,
+                path: "hardlink.bin".to_owned(),
+                data_base64: general_purpose::STANDARD.encode(b"resized"),
+            },
+        );
+        assert!(matches!(
+            resized_hardlink_write,
+            Err(ProtocolError::InvalidState)
+        ));
+
+        #[cfg(unix)]
+        {
+            let symlink_write = protocol.write_session_file(
+                &connection,
+                SessionFileWritePayload {
+                    session_id,
+                    path: "alias.bin".to_owned(),
+                    data_base64: general_purpose::STANDARD.encode(b"symlink"),
+                },
+            );
+            assert!(matches!(symlink_write, Err(ProtocolError::InvalidState)));
+        }
+
+        let delete = protocol.delete_session_file(
+            &connection,
+            SessionFileDeletePayload {
+                session_id,
+                path: "partial.bin".to_owned(),
+            },
+        );
+        assert!(matches!(delete, Err(ProtocolError::InvalidState)));
+        assert!(
+            target.exists(),
+            "普通 file RPC 不能删除 active HTTP upload 目标"
+        );
+
+        let http_download = protocol.prepare_session_file_http_download(
+            &connection,
+            SessionFileHttpDownloadPayload {
+                session_id,
+                path: "partial.bin".to_owned(),
+                offset_bytes: 0,
+            },
+        );
+        assert!(matches!(http_download, Err(ProtocolError::InvalidState)));
+
+        let stream_download = protocol.prepare_session_file_download_stream(
+            &connection,
+            SessionFileDownloadStreamPayload {
+                session_id,
+                path: "partial.bin".to_owned(),
+            },
+        );
+        assert!(matches!(stream_download, Err(ProtocolError::InvalidState)));
+
+        let token_download = protocol.prepare_session_file_download(
+            &connection,
+            SessionFileDownloadPreparePayload {
+                session_id,
+                path: "partial.bin".to_owned(),
+            },
+        );
+        assert!(matches!(token_download, Err(ProtocolError::InvalidState)));
+
+        let chunk_download = protocol.read_session_file_download_chunk(
+            &connection,
+            SessionFileDownloadChunkPayload {
+                session_id,
+                path: "partial.bin".to_owned(),
+                offset_bytes: 0,
+                max_bytes: 8,
+            },
+        );
+        assert!(matches!(chunk_download, Err(ProtocolError::InvalidState)));
+
+        let legacy_prepare = protocol.prepare_session_file_upload_stream(
+            &connection,
+            SessionFileUploadPayload {
+                session_id,
+                path: "partial.bin".to_owned(),
+                size_bytes: 4,
+            },
+        );
+        assert!(matches!(legacy_prepare, Err(ProtocolError::InvalidState)));
+
+        let mutated_abort = protocol.abort_session_file_http_upload(&connection, &meta);
+        assert!(matches!(mutated_abort, Err(ProtocolError::InvalidState)));
+        assert!(
+            protocol
+                .session_file_http_uploads
+                .contains_key(&ready.upload_id),
+            "存在 hardlink alias 时 abort 失败后必须保留 active state"
+        );
+
+        fs::write(root.join("download-race.bin"), b"stable").unwrap();
+        let (_stream_ready, mut download_stream) = protocol
+            .prepare_session_file_download_stream(
+                &connection,
+                SessionFileDownloadStreamPayload {
+                    session_id,
+                    path: "download-race.bin".to_owned(),
+                },
+            )
+            .unwrap();
+        fs::remove_file(root.join("download-race.bin")).unwrap();
+        let download_race_ready = protocol
+            .prepare_session_file_http_upload(
+                &connection,
+                SessionFileUploadPayload {
+                    session_id,
+                    path: "download-race.bin".to_owned(),
+                    size_bytes: 6,
+                },
+                device_id,
+            )
+            .unwrap();
+        let (download_chunk, _) = protocol
+            .read_session_file_download_stream_chunk(&mut download_stream, 16)
+            .unwrap();
+        assert_eq!(
+            general_purpose::STANDARD
+                .decode(download_chunk.data_base64)
+                .unwrap(),
+            b"stable"
+        );
+        protocol
+            .abort_session_file_http_upload(
+                &connection,
+                &SessionFileHttpUploadStreamPayload {
+                    session_id,
+                    path: download_race_ready.path,
+                    upload_id: download_race_ready.upload_id,
+                    size_bytes: download_race_ready.size_bytes,
+                    offset_bytes: 0,
+                },
+            )
+            .unwrap();
+
+        fs::write(root.join("http-download-race.bin"), b"http-stable").unwrap();
+        let (_http_ready, mut http_file, http_offset) = protocol
+            .prepare_session_file_http_download(
+                &connection,
+                SessionFileHttpDownloadPayload {
+                    session_id,
+                    path: "http-download-race.bin".to_owned(),
+                    offset_bytes: 0,
+                },
+            )
+            .unwrap();
+        fs::remove_file(root.join("http-download-race.bin")).unwrap();
+        let http_download_race_ready = protocol
+            .prepare_session_file_http_upload(
+                &connection,
+                SessionFileUploadPayload {
+                    session_id,
+                    path: "http-download-race.bin".to_owned(),
+                    size_bytes: 11,
+                },
+                device_id,
+            )
+            .unwrap();
+        http_file.seek(SeekFrom::Start(http_offset)).unwrap();
+        let mut http_download_bytes = Vec::new();
+        http_file.read_to_end(&mut http_download_bytes).unwrap();
+        assert_eq!(http_download_bytes, b"http-stable");
+        protocol
+            .abort_session_file_http_upload(
+                &connection,
+                &SessionFileHttpUploadStreamPayload {
+                    session_id,
+                    path: http_download_race_ready.path,
+                    upload_id: http_download_race_ready.upload_id,
+                    size_bytes: http_download_race_ready.size_bytes,
+                    offset_bytes: 0,
+                },
+            )
+            .unwrap();
+
+        let (_legacy_ready, mut legacy_stream) = protocol
+            .prepare_session_file_upload_stream(
+                &connection,
+                SessionFileUploadPayload {
+                    session_id,
+                    path: "race.bin".to_owned(),
+                    size_bytes: 4,
+                },
+            )
+            .unwrap();
+        let race_ready = protocol
+            .prepare_session_file_http_upload(
+                &connection,
+                SessionFileUploadPayload {
+                    session_id,
+                    path: "race.bin".to_owned(),
+                    size_bytes: 4,
+                },
+                device_id,
+            )
+            .unwrap();
+        let legacy_commit = protocol.write_session_file_upload_stream_chunk(
+            &mut legacy_stream,
+            SessionFileTransferChunkPayload {
+                session_id,
+                offset_bytes: 0,
+                data_base64: general_purpose::STANDARD.encode(b"race"),
+                size_bytes: 4,
+                eof: true,
+            },
+        );
+        assert!(matches!(legacy_commit, Err(ProtocolError::InvalidState)));
+        cleanup_upload_temp(&legacy_stream);
+        protocol
+            .abort_session_file_http_upload(
+                &connection,
+                &SessionFileHttpUploadStreamPayload {
+                    session_id,
+                    path: race_ready.path,
+                    upload_id: race_ready.upload_id,
+                    size_bytes: race_ready.size_bytes,
+                    offset_bytes: 0,
+                },
+            )
+            .unwrap();
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
     fn attached_session_can_read_git_diff() {
         let base = temp_state_path("git-workflow-base");
         let root = base.join("project");
@@ -13341,6 +16096,1837 @@ mod tests {
     }
 
     #[test]
+    fn session_file_http_upload_id_is_random_and_path_safe() {
+        let first = session_file_http_upload_id();
+        let second = session_file_http_upload_id();
+
+        assert_ne!(first, second);
+        assert!(session_file_http_upload_id_is_safe(&first));
+        assert!(session_file_http_upload_id_is_safe(&second));
+        assert!(!session_file_http_upload_id_is_safe("../escape"));
+        assert!(!session_file_http_upload_id_is_safe("with/slash"));
+    }
+
+    #[test]
+    fn session_file_http_upload_init_cleans_target_when_set_len_fails() {
+        let base = temp_state_path("http-upload-set-len-fail-base");
+        let root = base.join("project");
+        fs::create_dir_all(&root).unwrap();
+        let target = root.join("failed.bin");
+
+        let result = create_session_file_http_upload_target_with_set_len(
+            &target,
+            8,
+            |_file, _size_bytes| Err(std::io::Error::other("forced set_len failure")),
+        );
+
+        assert!(result.is_err());
+        assert!(
+            !target.exists(),
+            "set_len 失败时不能留下未登记的最终目标文件"
+        );
+        fs::remove_dir_all(base).ok();
+    }
+
+    fn http_upload_temp_names(parent: &Path) -> Vec<String> {
+        // 中文注释：HTTP upload 新模型必须直接 patch 目标文件；测试用这个 helper
+        // 拦住旧的 .chunk/.part 临时文件路径回流。
+        let mut names: Vec<String> = fs::read_dir(parent)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| {
+                name.contains(".termd-http-upload-")
+                    || name.ends_with(".part")
+                    || name.ends_with(".chunk")
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn http_e2ee_invalid_signature_does_not_consume_replay_nonce() {
+        let backend = FakePtyBackend::default();
+        let config = DaemonConfig::default_for_state_path(temp_state_path(
+            "http-e2ee-invalid-signature-state.json",
+        ));
+        let mut protocol =
+            DaemonProtocol::new(config, backend.clone(), Ed25519SignatureVerifier).unwrap();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = PublicKey(wire(signing_key.verifying_key().as_bytes()));
+        let (_, mut device_session) = open_e2ee(&mut protocol, &mut connection, device_id);
+        pair_device(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            device_id,
+            public_key,
+        );
+
+        let auth = signed_http_e2ee_auth(
+            &protocol,
+            device_id,
+            &signing_key,
+            Nonce("http-replay-nonce".to_owned()),
+            "POST",
+            "/api/files/download",
+        );
+        let mut invalid = auth.clone();
+        invalid.signature = Signature("ed25519-v1:invalid".to_owned());
+
+        assert!(matches!(
+            protocol.open_http_e2ee_session(invalid),
+            Err(ProtocolError::AuthFailed)
+        ));
+        assert!(
+            protocol.open_http_e2ee_session(auth).is_ok(),
+            "valid HTTP E2EE request must still be accepted after an invalid signature reused its nonce"
+        );
+    }
+
+    #[test]
+    fn session_file_http_upload_abort_requires_attached_connection() {
+        let base = temp_state_path("http-upload-abort-base");
+        let root = base.join("project");
+        fs::create_dir_all(&root).unwrap();
+        let backend = FakePtyBackend::default();
+        let mut config =
+            DaemonConfig::default_for_state_path(temp_state_path("http-upload-abort-state.json"));
+        config.default_command = vec!["sh".to_owned()];
+        config.default_working_directory = Some(root.clone());
+        let mut protocol =
+            DaemonProtocol::new(config, backend.clone(), Ed25519SignatureVerifier).unwrap();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = PublicKey(wire(signing_key.verifying_key().as_bytes()));
+        let (_, mut device_session) = open_e2ee(&mut protocol, &mut connection, device_id);
+        pair_device(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            device_id,
+            public_key,
+        );
+        let create_responses = send_encrypted(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            envelope_value(
+                MessageType::SessionCreate,
+                SessionCreatePayload {
+                    command: Vec::new(),
+                    size: TerminalSize::new(24, 80),
+                },
+            )
+            .unwrap(),
+        );
+        let created = decrypt_first(&mut device_session, create_responses);
+        let created_payload: SessionCreatedPayload = decode_payload(created.payload).unwrap();
+        let ready = protocol
+            .prepare_session_file_http_upload(
+                &connection,
+                SessionFileUploadPayload {
+                    session_id: created_payload.session_id,
+                    path: "partial.bin".to_owned(),
+                    size_bytes: 8,
+                },
+                device_id,
+            )
+            .unwrap();
+        let meta = SessionFileHttpUploadStreamPayload {
+            session_id: created_payload.session_id,
+            path: ready.path.clone(),
+            upload_id: ready.upload_id.clone(),
+            size_bytes: ready.size_bytes,
+            offset_bytes: 0,
+        };
+        let target = root.join("partial.bin");
+        assert!(target.exists(), "init 必须直接创建最终目标文件");
+        assert_eq!(
+            fs::metadata(&target).unwrap().len(),
+            8,
+            "init 必须把最终目标文件长度设置为声明大小"
+        );
+        assert!(
+            http_upload_temp_names(&root).is_empty(),
+            "HTTP upload 不应再产生临时分片文件"
+        );
+        let active_files = protocol
+            .session_files_result(
+                created_payload.session_id,
+                Some(absolute_path_string(&root)),
+                false,
+            )
+            .unwrap();
+        assert!(
+            active_files
+                .entries
+                .iter()
+                .all(|entry| entry.name != "partial.bin"),
+            "active HTTP upload 目标文件在 commit 前不应出现在文件列表里"
+        );
+
+        protocol
+            .write_session_file_http_upload(
+                &connection,
+                meta.clone(),
+                device_id,
+                vec![b"part".to_vec()],
+            )
+            .unwrap();
+        assert_eq!(&fs::read(&target).unwrap()[..4], b"part");
+        assert!(
+            http_upload_temp_names(&root).is_empty(),
+            "分片写入也只能 patch 目标文件，不能创建临时文件"
+        );
+        let partial_files = protocol
+            .session_files_result(
+                created_payload.session_id,
+                Some(absolute_path_string(&root)),
+                false,
+            )
+            .unwrap();
+        assert!(
+            partial_files
+                .entries
+                .iter()
+                .all(|entry| entry.name != "partial.bin"),
+            "未完成 HTTP upload 仍然必须从文件列表隐藏"
+        );
+
+        let http_connection = ProtocolConnection::authenticated_http(device_id);
+        assert!(matches!(
+            protocol.abort_session_file_http_upload(&http_connection, &meta),
+            Err(ProtocolError::InvalidState)
+        ));
+        protocol
+            .abort_session_file_http_upload(&connection, &meta)
+            .unwrap();
+
+        assert!(!target.exists());
+        assert!(http_upload_temp_names(&root).is_empty());
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn session_file_http_upload_accepts_out_of_order_chunks_and_assembles() {
+        let base = temp_state_path("http-upload-out-of-order-base");
+        let root = base.join("project");
+        fs::create_dir_all(&root).unwrap();
+        let backend = FakePtyBackend::default();
+        let mut config = DaemonConfig::default_for_state_path(temp_state_path(
+            "http-upload-out-of-order-state.json",
+        ));
+        config.default_command = vec!["sh".to_owned()];
+        config.default_working_directory = Some(root.clone());
+        let mut protocol =
+            DaemonProtocol::new(config, backend.clone(), Ed25519SignatureVerifier).unwrap();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = PublicKey(wire(signing_key.verifying_key().as_bytes()));
+        let (_, mut device_session) = open_e2ee(&mut protocol, &mut connection, device_id);
+        pair_device(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            device_id,
+            public_key,
+        );
+        let create_responses = send_encrypted(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            envelope_value(
+                MessageType::SessionCreate,
+                SessionCreatePayload {
+                    command: Vec::new(),
+                    size: TerminalSize::new(24, 80),
+                },
+            )
+            .unwrap(),
+        );
+        let created = decrypt_first(&mut device_session, create_responses);
+        let created_payload: SessionCreatedPayload = decode_payload(created.payload).unwrap();
+        let ready = protocol
+            .prepare_session_file_http_upload(
+                &connection,
+                SessionFileUploadPayload {
+                    session_id: created_payload.session_id,
+                    path: "joined.bin".to_owned(),
+                    size_bytes: 10,
+                },
+                device_id,
+            )
+            .unwrap();
+
+        let second_half = SessionFileHttpUploadStreamPayload {
+            session_id: created_payload.session_id,
+            path: ready.path.clone(),
+            upload_id: ready.upload_id.clone(),
+            size_bytes: ready.size_bytes,
+            offset_bytes: 5,
+        };
+        let target = root.join("joined.bin");
+        assert!(target.exists(), "init 后目标文件应立即存在");
+        assert_eq!(fs::metadata(&target).unwrap().len(), 10);
+        assert!(
+            http_upload_temp_names(&root).is_empty(),
+            "init 不应生成 .part/.chunk"
+        );
+
+        let progress = protocol
+            .write_session_file_http_upload(
+                &connection,
+                second_half,
+                device_id,
+                vec![b"world".to_vec()],
+            )
+            .unwrap();
+        assert_eq!(progress.offset_bytes, 5);
+        assert!(!progress.eof);
+        assert_eq!(&fs::read(&target).unwrap()[5..], b"world");
+        assert!(
+            http_upload_temp_names(&root).is_empty(),
+            "乱序分片也不应落临时文件"
+        );
+
+        let first_half = SessionFileHttpUploadStreamPayload {
+            session_id: created_payload.session_id,
+            path: ready.path,
+            upload_id: ready.upload_id,
+            size_bytes: ready.size_bytes,
+            offset_bytes: 0,
+        };
+        let progress = protocol
+            .write_session_file_http_upload(
+                &connection,
+                first_half,
+                device_id,
+                vec![b"hello".to_vec()],
+            )
+            .unwrap();
+        assert_eq!(progress.offset_bytes, 10);
+        assert!(progress.eof);
+        assert_eq!(fs::read(&target).unwrap(), b"helloworld");
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn session_file_http_upload_concurrent_non_overlapping_writes_keep_offsets() {
+        let base = temp_state_path("http-upload-concurrent-offset-base");
+        let root = base.join("project");
+        fs::create_dir_all(&root).unwrap();
+        let backend = FakePtyBackend::default();
+        let mut config = DaemonConfig::default_for_state_path(temp_state_path(
+            "http-upload-concurrent-offset-state.json",
+        ));
+        config.default_command = vec!["sh".to_owned()];
+        config.default_working_directory = Some(root.clone());
+        let mut protocol =
+            DaemonProtocol::new(config, backend.clone(), Ed25519SignatureVerifier).unwrap();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = PublicKey(wire(signing_key.verifying_key().as_bytes()));
+        let (_, mut device_session) = open_e2ee(&mut protocol, &mut connection, device_id);
+        pair_device(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            device_id,
+            public_key,
+        );
+        let session_id = create_test_session(&mut protocol, &mut connection, &mut device_session);
+        let chunk_len = 512 * 1024;
+        let ready = protocol
+            .prepare_session_file_http_upload(
+                &connection,
+                SessionFileUploadPayload {
+                    session_id,
+                    path: "concurrent.bin".to_owned(),
+                    size_bytes: (chunk_len * 2) as u64,
+                },
+                device_id,
+            )
+            .unwrap();
+        let first_meta = SessionFileHttpUploadStreamPayload {
+            session_id,
+            path: ready.path.clone(),
+            upload_id: ready.upload_id.clone(),
+            size_bytes: ready.size_bytes,
+            offset_bytes: 0,
+        };
+        let second_meta = SessionFileHttpUploadStreamPayload {
+            offset_bytes: chunk_len as u64,
+            ..first_meta.clone()
+        };
+        let first_plan = match protocol
+            .begin_session_file_http_upload_write(
+                &connection,
+                first_meta.clone(),
+                device_id,
+                chunk_len as u64,
+            )
+            .unwrap()
+        {
+            SessionFileHttpUploadBegin::Write(plan) => plan,
+            SessionFileHttpUploadBegin::Complete(_) => panic!("upload should not be complete"),
+        };
+        let second_plan = match protocol
+            .begin_session_file_http_upload_write(
+                &connection,
+                second_meta.clone(),
+                device_id,
+                chunk_len as u64,
+            )
+            .unwrap()
+        {
+            SessionFileHttpUploadBegin::Write(plan) => plan,
+            SessionFileHttpUploadBegin::Complete(_) => panic!("upload should not be complete"),
+        };
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let first_barrier = barrier.clone();
+        let first_handle = std::thread::spawn(move || {
+            first_barrier.wait();
+            write_session_file_http_upload_files(first_plan, vec![vec![b'a'; chunk_len]])
+        });
+        let second_barrier = barrier.clone();
+        let second_handle = std::thread::spawn(move || {
+            second_barrier.wait();
+            write_session_file_http_upload_files(second_plan, vec![vec![b'b'; chunk_len]])
+        });
+        barrier.wait();
+        let first_result = first_handle.join().unwrap().unwrap();
+        let second_result = second_handle.join().unwrap().unwrap();
+
+        protocol
+            .commit_session_file_http_upload_write(&first_meta, &first_result)
+            .unwrap();
+        let progress = match protocol
+            .commit_session_file_http_upload_write(&second_meta, &second_result)
+            .unwrap()
+        {
+            SessionFileHttpUploadCommit::Progress(progress)
+            | SessionFileHttpUploadCommit::Complete(progress) => progress,
+        };
+
+        assert!(progress.eof);
+        let bytes = fs::read(root.join("concurrent.bin")).unwrap();
+        assert_eq!(&bytes[..chunk_len], vec![b'a'; chunk_len].as_slice());
+        assert_eq!(&bytes[chunk_len..], vec![b'b'; chunk_len].as_slice());
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn session_file_http_upload_retries_same_offset_idempotently() {
+        let base = temp_state_path("http-upload-idempotent-base");
+        let root = base.join("project");
+        fs::create_dir_all(&root).unwrap();
+        let backend = FakePtyBackend::default();
+        let mut config = DaemonConfig::default_for_state_path(temp_state_path(
+            "http-upload-idempotent-state.json",
+        ));
+        config.default_command = vec!["sh".to_owned()];
+        config.default_working_directory = Some(root.clone());
+        let mut protocol =
+            DaemonProtocol::new(config, backend.clone(), Ed25519SignatureVerifier).unwrap();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = PublicKey(wire(signing_key.verifying_key().as_bytes()));
+        let (_, mut device_session) = open_e2ee(&mut protocol, &mut connection, device_id);
+        pair_device(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            device_id,
+            public_key,
+        );
+        let create_responses = send_encrypted(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            envelope_value(
+                MessageType::SessionCreate,
+                SessionCreatePayload {
+                    command: Vec::new(),
+                    size: TerminalSize::new(24, 80),
+                },
+            )
+            .unwrap(),
+        );
+        let created = decrypt_first(&mut device_session, create_responses);
+        let created_payload: SessionCreatedPayload = decode_payload(created.payload).unwrap();
+        let ready = protocol
+            .prepare_session_file_http_upload(
+                &connection,
+                SessionFileUploadPayload {
+                    session_id: created_payload.session_id,
+                    path: "retry.bin".to_owned(),
+                    size_bytes: 5,
+                },
+                device_id,
+            )
+            .unwrap();
+        let meta = SessionFileHttpUploadStreamPayload {
+            session_id: created_payload.session_id,
+            path: ready.path.clone(),
+            upload_id: ready.upload_id.clone(),
+            size_bytes: ready.size_bytes,
+            offset_bytes: 0,
+        };
+
+        protocol
+            .write_session_file_http_upload(
+                &connection,
+                meta.clone(),
+                device_id,
+                vec![b"hello".to_vec()],
+            )
+            .unwrap();
+        let retry = protocol
+            .write_session_file_http_upload(&connection, meta, device_id, vec![b"hello".to_vec()])
+            .unwrap();
+
+        assert!(retry.eof);
+        assert_eq!(fs::read(root.join("retry.bin")).unwrap(), b"hello");
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn session_file_http_upload_retry_can_cover_adjacent_written_ranges() {
+        let base = temp_state_path("http-upload-adjacent-retry-base");
+        let root = base.join("project");
+        fs::create_dir_all(&root).unwrap();
+        let backend = FakePtyBackend::default();
+        let mut config = DaemonConfig::default_for_state_path(temp_state_path(
+            "http-upload-adjacent-retry-state.json",
+        ));
+        config.default_command = vec!["sh".to_owned()];
+        config.default_working_directory = Some(root.clone());
+        let mut protocol =
+            DaemonProtocol::new(config, backend.clone(), Ed25519SignatureVerifier).unwrap();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = PublicKey(wire(signing_key.verifying_key().as_bytes()));
+        let (_, mut device_session) = open_e2ee(&mut protocol, &mut connection, device_id);
+        pair_device(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            device_id,
+            public_key,
+        );
+        let create_responses = send_encrypted(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            envelope_value(
+                MessageType::SessionCreate,
+                SessionCreatePayload {
+                    command: Vec::new(),
+                    size: TerminalSize::new(24, 80),
+                },
+            )
+            .unwrap(),
+        );
+        let created = decrypt_first(&mut device_session, create_responses);
+        let created_payload: SessionCreatedPayload = decode_payload(created.payload).unwrap();
+        let ready = protocol
+            .prepare_session_file_http_upload(
+                &connection,
+                SessionFileUploadPayload {
+                    session_id: created_payload.session_id,
+                    path: "adjacent-retry.bin".to_owned(),
+                    size_bytes: 10,
+                },
+                device_id,
+            )
+            .unwrap();
+        let first_meta = SessionFileHttpUploadStreamPayload {
+            session_id: created_payload.session_id,
+            path: ready.path.clone(),
+            upload_id: ready.upload_id.clone(),
+            size_bytes: ready.size_bytes,
+            offset_bytes: 0,
+        };
+
+        protocol
+            .write_session_file_http_upload(
+                &connection,
+                first_meta.clone(),
+                device_id,
+                vec![b"he".to_vec(), b"llo".to_vec()],
+            )
+            .unwrap();
+        let retry = protocol
+            .write_session_file_http_upload(
+                &connection,
+                first_meta,
+                device_id,
+                vec![b"hello".to_vec()],
+            )
+            .unwrap();
+
+        assert_eq!(retry.offset_bytes, 5);
+        assert!(!retry.eof);
+        assert_eq!(
+            &fs::read(root.join("adjacent-retry.bin")).unwrap()[..5],
+            b"hello"
+        );
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn session_file_http_upload_rejects_partial_duplicate_overwrite() {
+        let base = temp_state_path("http-upload-partial-duplicate-base");
+        let root = base.join("project");
+        fs::create_dir_all(&root).unwrap();
+        let backend = FakePtyBackend::default();
+        let mut config = DaemonConfig::default_for_state_path(temp_state_path(
+            "http-upload-partial-duplicate-state.json",
+        ));
+        config.default_command = vec!["sh".to_owned()];
+        config.default_working_directory = Some(root.clone());
+        let mut protocol =
+            DaemonProtocol::new(config, backend.clone(), Ed25519SignatureVerifier).unwrap();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = PublicKey(wire(signing_key.verifying_key().as_bytes()));
+        let (_, mut device_session) = open_e2ee(&mut protocol, &mut connection, device_id);
+        pair_device(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            device_id,
+            public_key,
+        );
+        let create_responses = send_encrypted(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            envelope_value(
+                MessageType::SessionCreate,
+                SessionCreatePayload {
+                    command: Vec::new(),
+                    size: TerminalSize::new(24, 80),
+                },
+            )
+            .unwrap(),
+        );
+        let created = decrypt_first(&mut device_session, create_responses);
+        let created_payload: SessionCreatedPayload = decode_payload(created.payload).unwrap();
+        let ready = protocol
+            .prepare_session_file_http_upload(
+                &connection,
+                SessionFileUploadPayload {
+                    session_id: created_payload.session_id,
+                    path: "partial-duplicate.bin".to_owned(),
+                    size_bytes: 10,
+                },
+                device_id,
+            )
+            .unwrap();
+        let meta = SessionFileHttpUploadStreamPayload {
+            session_id: created_payload.session_id,
+            path: ready.path.clone(),
+            upload_id: ready.upload_id.clone(),
+            size_bytes: ready.size_bytes,
+            offset_bytes: 0,
+        };
+
+        protocol
+            .write_session_file_http_upload(
+                &connection,
+                meta.clone(),
+                device_id,
+                vec![b"hello".to_vec()],
+            )
+            .unwrap();
+        let overwrite = protocol.write_session_file_http_upload(
+            &connection,
+            meta,
+            device_id,
+            vec![b"xxxxx".to_vec()],
+        );
+
+        assert!(
+            overwrite.is_err(),
+            "未完成上传的已写区间不能被不同内容的旧请求覆盖"
+        );
+        assert_eq!(
+            &fs::read(root.join("partial-duplicate.bin")).unwrap()[..5],
+            b"hello"
+        );
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn session_file_http_upload_reserves_inflight_ranges_before_file_io() {
+        let base = temp_state_path("http-upload-inflight-range-base");
+        let root = base.join("project");
+        fs::create_dir_all(&root).unwrap();
+        let backend = FakePtyBackend::default();
+        let mut config = DaemonConfig::default_for_state_path(temp_state_path(
+            "http-upload-inflight-range-state.json",
+        ));
+        config.default_command = vec!["sh".to_owned()];
+        config.default_working_directory = Some(root.clone());
+        let mut protocol =
+            DaemonProtocol::new(config, backend.clone(), Ed25519SignatureVerifier).unwrap();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = PublicKey(wire(signing_key.verifying_key().as_bytes()));
+        let (_, mut device_session) = open_e2ee(&mut protocol, &mut connection, device_id);
+        pair_device(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            device_id,
+            public_key,
+        );
+        let create_responses = send_encrypted(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            envelope_value(
+                MessageType::SessionCreate,
+                SessionCreatePayload {
+                    command: Vec::new(),
+                    size: TerminalSize::new(24, 80),
+                },
+            )
+            .unwrap(),
+        );
+        let created = decrypt_first(&mut device_session, create_responses);
+        let created_payload: SessionCreatedPayload = decode_payload(created.payload).unwrap();
+        let ready = protocol
+            .prepare_session_file_http_upload(
+                &connection,
+                SessionFileUploadPayload {
+                    session_id: created_payload.session_id,
+                    path: "reserved.bin".to_owned(),
+                    size_bytes: 10,
+                },
+                device_id,
+            )
+            .unwrap();
+        let meta = SessionFileHttpUploadStreamPayload {
+            session_id: created_payload.session_id,
+            path: ready.path.clone(),
+            upload_id: ready.upload_id.clone(),
+            size_bytes: ready.size_bytes,
+            offset_bytes: 0,
+        };
+
+        protocol
+            .begin_session_file_http_upload_write(&connection, meta.clone(), device_id, 5)
+            .unwrap();
+        let duplicate_begin =
+            protocol.begin_session_file_http_upload_write(&connection, meta, device_id, 5);
+
+        assert!(
+            matches!(duplicate_begin, Err(ProtocolError::InvalidState)),
+            "锁外文件 I/O 开始前必须预留区间，阻止并发旧请求覆盖同一 offset"
+        );
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn session_file_http_upload_abort_clears_inflight_before_late_commit() {
+        let base = temp_state_path("http-upload-abort-inflight-base");
+        let root = base.join("project");
+        fs::create_dir_all(&root).unwrap();
+        let backend = FakePtyBackend::default();
+        let mut config = DaemonConfig::default_for_state_path(temp_state_path(
+            "http-upload-abort-inflight-state.json",
+        ));
+        config.default_command = vec!["sh".to_owned()];
+        config.default_working_directory = Some(root.clone());
+        let mut protocol =
+            DaemonProtocol::new(config, backend.clone(), Ed25519SignatureVerifier).unwrap();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = PublicKey(wire(signing_key.verifying_key().as_bytes()));
+        let (_, mut device_session) = open_e2ee(&mut protocol, &mut connection, device_id);
+        pair_device(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            device_id,
+            public_key,
+        );
+        let session_id = create_test_session(&mut protocol, &mut connection, &mut device_session);
+        let ready = protocol
+            .prepare_session_file_http_upload(
+                &connection,
+                SessionFileUploadPayload {
+                    session_id,
+                    path: "late-commit.bin".to_owned(),
+                    size_bytes: 5,
+                },
+                device_id,
+            )
+            .unwrap();
+        let meta = SessionFileHttpUploadStreamPayload {
+            session_id,
+            path: ready.path.clone(),
+            upload_id: ready.upload_id.clone(),
+            size_bytes: ready.size_bytes,
+            offset_bytes: 0,
+        };
+        let plan = match protocol
+            .begin_session_file_http_upload_write(&connection, meta.clone(), device_id, 5)
+            .unwrap()
+        {
+            SessionFileHttpUploadBegin::Write(plan) => plan,
+            SessionFileHttpUploadBegin::Complete(_) => panic!("upload should not be complete"),
+        };
+        let file_result = write_session_file_http_upload_files(plan, vec![b"hello".to_vec()])
+            .expect("file write should finish before abort wins commit race");
+
+        protocol
+            .abort_session_file_http_upload(&connection, &meta)
+            .unwrap();
+        let late_commit = protocol.commit_session_file_http_upload_write(&meta, &file_result);
+
+        assert!(matches!(late_commit, Err(ProtocolError::InvalidState)));
+        assert!(
+            protocol
+                .session_file_http_uploads
+                .get(&ready.upload_id)
+                .unwrap()
+                .inflight_ranges
+                .is_empty(),
+            "abort 与 late commit 竞态后不能残留 in-flight range"
+        );
+        assert!(!root.join("late-commit.bin").exists());
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn session_file_http_upload_startup_cleanup_removes_matching_target_and_drops_record() {
+        let base = temp_state_path("http-upload-startup-cleanup-base");
+        let root = base.join("project");
+        let state_path = temp_state_path("http-upload-startup-cleanup-state.json");
+        fs::create_dir_all(&root).unwrap();
+        let backend = FakePtyBackend::default();
+        let mut config = DaemonConfig::default_for_state_path(&state_path);
+        config.default_command = vec!["sh".to_owned()];
+        config.default_working_directory = Some(root.clone());
+        let target = root.join("stale-after-restart.bin");
+        let upload_id = {
+            let mut protocol =
+                DaemonProtocol::new(config, backend.clone(), Ed25519SignatureVerifier).unwrap();
+            let (mut connection, _) = protocol.start_connection();
+            let device_id = DeviceId::new();
+            let signing_key = SigningKey::generate(&mut OsRng);
+            let public_key = PublicKey(wire(signing_key.verifying_key().as_bytes()));
+            let (_, mut device_session) = open_e2ee(&mut protocol, &mut connection, device_id);
+            pair_device(
+                &mut protocol,
+                &mut connection,
+                &mut device_session,
+                device_id,
+                public_key,
+            );
+            let session_id =
+                create_test_session(&mut protocol, &mut connection, &mut device_session);
+            let ready = protocol
+                .prepare_session_file_http_upload(
+                    &connection,
+                    SessionFileUploadPayload {
+                        session_id,
+                        path: "stale-after-restart.bin".to_owned(),
+                        size_bytes: 8,
+                    },
+                    device_id,
+                )
+                .unwrap();
+            assert!(target.exists());
+            assert_eq!(StateStore::list_http_uploads(&state_path).unwrap().len(), 1);
+            ready.upload_id
+        };
+
+        cleanup_persisted_session_file_http_uploads(&state_path).unwrap();
+
+        assert!(
+            !target.exists(),
+            "daemon 重启后 recovery record 仍存在，说明 upload 未 commit，必须删除预分配目标"
+        );
+        assert!(
+            StateStore::list_http_uploads(&state_path)
+                .unwrap()
+                .into_iter()
+                .all(|record| record.upload_id != upload_id)
+        );
+        fs::remove_dir_all(base).ok();
+        fs::remove_file(state_path.with_extension("sqlite")).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_file_http_upload_cleanup_removes_same_object_after_length_change() {
+        let base = temp_state_path("http-upload-cleanup-mutated-length-base");
+        let root = base.join("project");
+        fs::create_dir_all(&root).unwrap();
+        let target = root.join("mutated-length.bin");
+        let (_file, identity) = create_session_file_http_upload_target(&target, 8).unwrap();
+        OpenOptions::new()
+            .write(true)
+            .open(&target)
+            .unwrap()
+            .set_len(4)
+            .unwrap();
+
+        let outcome = remove_session_file_http_upload_target(&target, identity).unwrap();
+
+        assert_eq!(outcome, SessionFileHttpUploadCleanupOutcome::Removed);
+        assert!(
+            !target.exists(),
+            "同一个文件对象只改了长度，cleanup 仍应删除 active upload 目标"
+        );
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_file_http_upload_startup_cleanup_keeps_record_for_ambiguous_same_object_change() {
+        let base = temp_state_path("http-upload-startup-ambiguous-same-object-base");
+        let root = base.join("project");
+        let state_path = temp_state_path("http-upload-startup-ambiguous-same-object-state.json");
+        fs::create_dir_all(&root).unwrap();
+        let target = root.join("ambiguous.bin");
+        let (_file, identity) = create_session_file_http_upload_target(&target, 8).unwrap();
+        let upload_id = session_file_http_upload_id();
+        StateStore::record_http_upload(
+            &state_path,
+            &HttpUploadRecoveryRecord {
+                upload_id: upload_id.clone(),
+                target_path: target.clone(),
+                size_bytes: 8,
+                dev: identity.dev(),
+                ino: identity.ino(),
+                updated_at_ms: current_unix_timestamp_millis(),
+            },
+        )
+        .unwrap();
+        OpenOptions::new()
+            .write(true)
+            .open(&target)
+            .unwrap()
+            .set_len(4)
+            .unwrap();
+
+        let cleanup = cleanup_persisted_session_file_http_uploads(&state_path);
+
+        assert!(
+            cleanup.is_err(),
+            "启动 recovery 没有 open file handle，same inode 但长度变化必须安全失败"
+        );
+        assert!(target.exists());
+        assert!(
+            StateStore::list_http_uploads(&state_path)
+                .unwrap()
+                .into_iter()
+                .any(|record| record.upload_id == upload_id),
+            "歧义 cleanup 失败时必须保留 recovery record，避免丢 guard"
+        );
+        fs::remove_dir_all(base).ok();
+        fs::remove_file(state_path.with_extension("sqlite")).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_file_http_upload_startup_cleanup_keeps_record_when_target_missing() {
+        let base = temp_state_path("http-upload-startup-missing-target-base");
+        let root = base.join("project");
+        let state_path = temp_state_path("http-upload-startup-missing-target-state.json");
+        fs::create_dir_all(&root).unwrap();
+        let target = root.join("missing-target.bin");
+        let alias = root.join("missing-target-hardlink.bin");
+        let (_file, identity) = create_session_file_http_upload_target(&target, 8).unwrap();
+        let upload_id = session_file_http_upload_id();
+        StateStore::record_http_upload(
+            &state_path,
+            &HttpUploadRecoveryRecord {
+                upload_id: upload_id.clone(),
+                target_path: target.clone(),
+                size_bytes: 8,
+                dev: identity.dev(),
+                ino: identity.ino(),
+                updated_at_ms: current_unix_timestamp_millis(),
+            },
+        )
+        .unwrap();
+        fs::hard_link(&target, &alias).unwrap();
+        fs::remove_file(&target).unwrap();
+
+        let cleanup = cleanup_persisted_session_file_http_uploads(&state_path);
+
+        assert!(
+            cleanup.is_err(),
+            "启动 recovery 没有 open file handle，target missing 也必须安全失败"
+        );
+        assert!(alias.exists());
+        assert!(
+            StateStore::list_http_uploads(&state_path)
+                .unwrap()
+                .into_iter()
+                .any(|record| record.upload_id == upload_id),
+            "target missing 不能删除 recovery record，避免 hardlink alias 暴露"
+        );
+        fs::remove_dir_all(base).ok();
+        fs::remove_file(state_path.with_extension("sqlite")).ok();
+    }
+
+    #[test]
+    fn session_file_http_upload_init_rejects_existing_target_without_truncating() {
+        let base = temp_state_path("http-upload-existing-target-base");
+        let root = base.join("project");
+        fs::create_dir_all(&root).unwrap();
+        let existing = root.join("existing.bin");
+        fs::write(&existing, b"keep-existing").unwrap();
+        let backend = FakePtyBackend::default();
+        let mut config = DaemonConfig::default_for_state_path(temp_state_path(
+            "http-upload-existing-target-state.json",
+        ));
+        config.default_command = vec!["sh".to_owned()];
+        config.default_working_directory = Some(root.clone());
+        let mut protocol =
+            DaemonProtocol::new(config, backend.clone(), Ed25519SignatureVerifier).unwrap();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = PublicKey(wire(signing_key.verifying_key().as_bytes()));
+        let (_, mut device_session) = open_e2ee(&mut protocol, &mut connection, device_id);
+        pair_device(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            device_id,
+            public_key,
+        );
+        let create_responses = send_encrypted(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            envelope_value(
+                MessageType::SessionCreate,
+                SessionCreatePayload {
+                    command: Vec::new(),
+                    size: TerminalSize::new(24, 80),
+                },
+            )
+            .unwrap(),
+        );
+        let created = decrypt_first(&mut device_session, create_responses);
+        let created_payload: SessionCreatedPayload = decode_payload(created.payload).unwrap();
+        let result = protocol.prepare_session_file_http_upload(
+            &connection,
+            SessionFileUploadPayload {
+                session_id: created_payload.session_id,
+                path: "existing.bin".to_owned(),
+                size_bytes: 4,
+            },
+            device_id,
+        );
+
+        assert!(result.is_err(), "直接目标写模型不能静默覆盖已有文件");
+        assert_eq!(fs::read(&existing).unwrap(), b"keep-existing");
+        assert!(http_upload_temp_names(&root).is_empty());
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_file_http_upload_startup_cleanup_keeps_record_for_replaced_target() {
+        let base = temp_state_path("http-upload-startup-replaced-base");
+        let root = base.join("project");
+        let state_path = temp_state_path("http-upload-startup-replaced-state.json");
+        fs::create_dir_all(&root).unwrap();
+        let backend = FakePtyBackend::default();
+        let mut config = DaemonConfig::default_for_state_path(&state_path);
+        config.default_command = vec!["sh".to_owned()];
+        config.default_working_directory = Some(root.clone());
+        let target = root.join("startup-replacement.bin");
+        let upload_id = {
+            let mut protocol =
+                DaemonProtocol::new(config, backend.clone(), Ed25519SignatureVerifier).unwrap();
+            let (mut connection, _) = protocol.start_connection();
+            let device_id = DeviceId::new();
+            let signing_key = SigningKey::generate(&mut OsRng);
+            let public_key = PublicKey(wire(signing_key.verifying_key().as_bytes()));
+            let (_, mut device_session) = open_e2ee(&mut protocol, &mut connection, device_id);
+            pair_device(
+                &mut protocol,
+                &mut connection,
+                &mut device_session,
+                device_id,
+                public_key,
+            );
+            let session_id =
+                create_test_session(&mut protocol, &mut connection, &mut device_session);
+            let ready = protocol
+                .prepare_session_file_http_upload(
+                    &connection,
+                    SessionFileUploadPayload {
+                        session_id,
+                        path: "startup-replacement.bin".to_owned(),
+                        size_bytes: 8,
+                    },
+                    device_id,
+                )
+                .unwrap();
+            assert_eq!(StateStore::list_http_uploads(&state_path).unwrap().len(), 1);
+            ready.upload_id
+        };
+        let replacement = root.join("startup-replacement-source.bin");
+        fs::write(&replacement, b"user-file").unwrap();
+        fs::rename(&replacement, &target).unwrap();
+
+        let cleanup = cleanup_persisted_session_file_http_uploads(&state_path);
+
+        assert!(
+            cleanup.is_err(),
+            "启动 recovery 遇到 replacement 时没有原文件句柄，必须保留 record 并安全失败"
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"user-file");
+        assert!(
+            StateStore::list_http_uploads(&state_path)
+                .unwrap()
+                .into_iter()
+                .any(|record| record.upload_id == upload_id),
+            "replacement cleanup 不能删除 recovery record，避免原 active 对象仍有 alias"
+        );
+        fs::remove_dir_all(base).ok();
+        fs::remove_file(state_path.with_extension("sqlite")).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_file_http_upload_abort_does_not_delete_replaced_target() {
+        let base = temp_state_path("http-upload-replaced-target-base");
+        let root = base.join("project");
+        let state_path = temp_state_path("http-upload-replaced-target-state.json");
+        fs::create_dir_all(&root).unwrap();
+        let backend = FakePtyBackend::default();
+        let mut config = DaemonConfig::default_for_state_path(&state_path);
+        config.default_command = vec!["sh".to_owned()];
+        config.default_working_directory = Some(root.clone());
+        let mut protocol =
+            DaemonProtocol::new(config, backend.clone(), Ed25519SignatureVerifier).unwrap();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = PublicKey(wire(signing_key.verifying_key().as_bytes()));
+        let (_, mut device_session) = open_e2ee(&mut protocol, &mut connection, device_id);
+        pair_device(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            device_id,
+            public_key,
+        );
+        let session_id = create_test_session(&mut protocol, &mut connection, &mut device_session);
+        let ready = protocol
+            .prepare_session_file_http_upload(
+                &connection,
+                SessionFileUploadPayload {
+                    session_id,
+                    path: "replacement.bin".to_owned(),
+                    size_bytes: 8,
+                },
+                device_id,
+            )
+            .unwrap();
+        let target = root.join("replacement.bin");
+        fs::remove_file(&target).unwrap();
+        fs::write(&target, b"user-file").unwrap();
+        let upload_id = ready.upload_id.clone();
+        let meta = SessionFileHttpUploadStreamPayload {
+            session_id,
+            path: ready.path,
+            upload_id: upload_id.clone(),
+            size_bytes: ready.size_bytes,
+            offset_bytes: 0,
+        };
+        let abort = protocol.abort_session_file_http_upload(&connection, &meta);
+
+        assert!(
+            matches!(abort, Err(ProtocolError::InvalidState)),
+            "旧 upload_id 不能删除 init 后被外部替换的同名目标文件"
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"user-file");
+        assert!(
+            StateStore::list_http_uploads(&state_path)
+                .unwrap()
+                .into_iter()
+                .all(|record| record.upload_id != upload_id),
+            "replacement abort 后旧 recovery record 必须收敛删除"
+        );
+        fs::remove_dir_all(base).ok();
+        fs::remove_file(state_path.with_extension("sqlite")).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_file_http_upload_abort_keeps_guard_when_replaced_target_has_hardlink_alias() {
+        let base = temp_state_path("http-upload-replaced-hardlink-alias-base");
+        let root = base.join("project");
+        let state_path = temp_state_path("http-upload-replaced-hardlink-alias-state.json");
+        fs::create_dir_all(&root).unwrap();
+        let backend = FakePtyBackend::default();
+        let mut config = DaemonConfig::default_for_state_path(&state_path);
+        config.default_command = vec!["sh".to_owned()];
+        config.default_working_directory = Some(root.clone());
+        let mut protocol =
+            DaemonProtocol::new(config, backend.clone(), Ed25519SignatureVerifier).unwrap();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = PublicKey(wire(signing_key.verifying_key().as_bytes()));
+        let (_, mut device_session) = open_e2ee(&mut protocol, &mut connection, device_id);
+        pair_device(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            device_id,
+            public_key,
+        );
+        let session_id = create_test_session(&mut protocol, &mut connection, &mut device_session);
+        let ready = protocol
+            .prepare_session_file_http_upload(
+                &connection,
+                SessionFileUploadPayload {
+                    session_id,
+                    path: "replacement-with-alias.bin".to_owned(),
+                    size_bytes: 8,
+                },
+                device_id,
+            )
+            .unwrap();
+        let target = root.join("replacement-with-alias.bin");
+        let alias = root.join("replacement-with-alias-hardlink.bin");
+        fs::hard_link(&target, &alias).unwrap();
+        fs::remove_file(&target).unwrap();
+        fs::write(&target, b"user-file").unwrap();
+        let upload_id = ready.upload_id.clone();
+        let meta = SessionFileHttpUploadStreamPayload {
+            session_id,
+            path: ready.path,
+            upload_id: upload_id.clone(),
+            size_bytes: ready.size_bytes,
+            offset_bytes: 0,
+        };
+
+        let abort = protocol.abort_session_file_http_upload(&connection, &meta);
+
+        assert!(matches!(abort, Err(ProtocolError::InvalidState)));
+        assert!(
+            protocol.session_file_http_uploads.contains_key(&upload_id),
+            "target path 被替换但原 active 对象仍有 hardlink alias 时必须保留 guard"
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"user-file");
+        assert!(alias.exists());
+        assert!(
+            StateStore::list_http_uploads(&state_path)
+                .unwrap()
+                .into_iter()
+                .any(|record| record.upload_id == upload_id),
+            "hardlink alias 仍可访问未完成对象时 recovery record 不能被删除"
+        );
+        fs::remove_dir_all(base).ok();
+        fs::remove_file(state_path.with_extension("sqlite")).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_file_http_upload_abort_keeps_guard_when_missing_target_has_hardlink_alias() {
+        let base = temp_state_path("http-upload-missing-hardlink-alias-base");
+        let root = base.join("project");
+        let state_path = temp_state_path("http-upload-missing-hardlink-alias-state.json");
+        fs::create_dir_all(&root).unwrap();
+        let backend = FakePtyBackend::default();
+        let mut config = DaemonConfig::default_for_state_path(&state_path);
+        config.default_command = vec!["sh".to_owned()];
+        config.default_working_directory = Some(root.clone());
+        let mut protocol =
+            DaemonProtocol::new(config, backend.clone(), Ed25519SignatureVerifier).unwrap();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = PublicKey(wire(signing_key.verifying_key().as_bytes()));
+        let (_, mut device_session) = open_e2ee(&mut protocol, &mut connection, device_id);
+        pair_device(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            device_id,
+            public_key,
+        );
+        let session_id = create_test_session(&mut protocol, &mut connection, &mut device_session);
+        let ready = protocol
+            .prepare_session_file_http_upload(
+                &connection,
+                SessionFileUploadPayload {
+                    session_id,
+                    path: "missing-with-alias.bin".to_owned(),
+                    size_bytes: 8,
+                },
+                device_id,
+            )
+            .unwrap();
+        let target = root.join("missing-with-alias.bin");
+        let alias = root.join("missing-with-alias-hardlink.bin");
+        fs::hard_link(&target, &alias).unwrap();
+        fs::remove_file(&target).unwrap();
+        let upload_id = ready.upload_id.clone();
+        let meta = SessionFileHttpUploadStreamPayload {
+            session_id,
+            path: ready.path,
+            upload_id: upload_id.clone(),
+            size_bytes: ready.size_bytes,
+            offset_bytes: 0,
+        };
+
+        let abort = protocol.abort_session_file_http_upload(&connection, &meta);
+
+        assert!(matches!(abort, Err(ProtocolError::InvalidState)));
+        assert!(
+            protocol.session_file_http_uploads.contains_key(&upload_id),
+            "target path 缺失但原 active 对象仍有 hardlink alias 时必须保留 guard"
+        );
+        assert!(alias.exists());
+        assert!(
+            StateStore::list_http_uploads(&state_path)
+                .unwrap()
+                .into_iter()
+                .any(|record| record.upload_id == upload_id),
+            "hardlink alias 仍可访问未完成对象时 recovery record 不能被删除"
+        );
+        fs::remove_dir_all(base).ok();
+        fs::remove_file(state_path.with_extension("sqlite")).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_file_http_upload_idle_prune_keeps_replaced_target() {
+        let base = temp_state_path("http-upload-replaced-prune-base");
+        let root = base.join("project");
+        let state_path = temp_state_path("http-upload-replaced-prune-state.json");
+        fs::create_dir_all(&root).unwrap();
+        let backend = FakePtyBackend::default();
+        let mut config = DaemonConfig::default_for_state_path(&state_path);
+        config.default_command = vec!["sh".to_owned()];
+        config.default_working_directory = Some(root.clone());
+        let mut protocol =
+            DaemonProtocol::new(config, backend.clone(), Ed25519SignatureVerifier).unwrap();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = PublicKey(wire(signing_key.verifying_key().as_bytes()));
+        let (_, mut device_session) = open_e2ee(&mut protocol, &mut connection, device_id);
+        pair_device(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            device_id,
+            public_key,
+        );
+        let session_id = create_test_session(&mut protocol, &mut connection, &mut device_session);
+        let ready = protocol
+            .prepare_session_file_http_upload(
+                &connection,
+                SessionFileUploadPayload {
+                    session_id,
+                    path: "prune-replacement.bin".to_owned(),
+                    size_bytes: 8,
+                },
+                device_id,
+            )
+            .unwrap();
+        let target = root.join("prune-replacement.bin");
+        fs::remove_file(&target).unwrap();
+        fs::write(&target, b"user-file").unwrap();
+        protocol
+            .session_file_http_uploads
+            .get_mut(&ready.upload_id)
+            .unwrap()
+            .updated_at_ms = 0;
+
+        protocol.prune_session_file_http_uploads();
+
+        assert_eq!(fs::read(&target).unwrap(), b"user-file");
+        assert!(
+            !protocol
+                .session_file_http_uploads
+                .contains_key(&ready.upload_id)
+        );
+        assert!(
+            StateStore::list_http_uploads(&state_path)
+                .unwrap()
+                .into_iter()
+                .all(|record| record.upload_id != ready.upload_id),
+            "replacement prune 后旧 recovery record 必须收敛删除"
+        );
+        fs::remove_dir_all(base).ok();
+        fs::remove_file(state_path.with_extension("sqlite")).ok();
+    }
+
+    #[test]
+    fn session_file_http_upload_prunes_idle_active_target() {
+        let base = temp_state_path("http-upload-idle-active-base");
+        let root = base.join("project");
+        let state_path = temp_state_path("http-upload-idle-active-state.json");
+        fs::create_dir_all(&root).unwrap();
+        let backend = FakePtyBackend::default();
+        let mut config = DaemonConfig::default_for_state_path(&state_path);
+        config.default_command = vec!["sh".to_owned()];
+        config.default_working_directory = Some(root.clone());
+        let mut protocol =
+            DaemonProtocol::new(config, backend.clone(), Ed25519SignatureVerifier).unwrap();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = PublicKey(wire(signing_key.verifying_key().as_bytes()));
+        let (_, mut device_session) = open_e2ee(&mut protocol, &mut connection, device_id);
+        pair_device(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            device_id,
+            public_key,
+        );
+        let create_responses = send_encrypted(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            envelope_value(
+                MessageType::SessionCreate,
+                SessionCreatePayload {
+                    command: Vec::new(),
+                    size: TerminalSize::new(24, 80),
+                },
+            )
+            .unwrap(),
+        );
+        let created = decrypt_first(&mut device_session, create_responses);
+        let created_payload: SessionCreatedPayload = decode_payload(created.payload).unwrap();
+        let ready = protocol
+            .prepare_session_file_http_upload(
+                &connection,
+                SessionFileUploadPayload {
+                    session_id: created_payload.session_id,
+                    path: "stale.bin".to_owned(),
+                    size_bytes: 8,
+                },
+                device_id,
+            )
+            .unwrap();
+        let target = root.join("stale.bin");
+        protocol
+            .session_file_http_uploads
+            .get_mut(&ready.upload_id)
+            .unwrap()
+            .updated_at_ms = 0;
+
+        protocol.prune_session_file_http_uploads();
+
+        assert!(
+            !target.exists(),
+            "idle Active upload 需要清理预分配目标文件"
+        );
+        assert!(
+            !protocol
+                .session_file_http_uploads
+                .contains_key(&ready.upload_id)
+        );
+        assert!(
+            StateStore::list_http_uploads(&state_path)
+                .unwrap()
+                .into_iter()
+                .all(|record| record.upload_id != ready.upload_id)
+        );
+        fs::remove_dir_all(base).ok();
+        fs::remove_file(state_path.with_extension("sqlite")).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn session_file_http_upload_idle_prune_keeps_state_when_cleanup_fails() {
+        let base = temp_state_path("http-upload-idle-active-failed-cleanup-base");
+        let root = base.join("project");
+        let state_path = temp_state_path("http-upload-idle-active-failed-cleanup-state.json");
+        fs::create_dir_all(&root).unwrap();
+        let backend = FakePtyBackend::default();
+        let mut config = DaemonConfig::default_for_state_path(&state_path);
+        config.default_command = vec!["sh".to_owned()];
+        config.default_working_directory = Some(root.clone());
+        let mut protocol =
+            DaemonProtocol::new(config, backend.clone(), Ed25519SignatureVerifier).unwrap();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = PublicKey(wire(signing_key.verifying_key().as_bytes()));
+        let (_, mut device_session) = open_e2ee(&mut protocol, &mut connection, device_id);
+        pair_device(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            device_id,
+            public_key,
+        );
+        let session_id = create_test_session(&mut protocol, &mut connection, &mut device_session);
+        let ready = protocol
+            .prepare_session_file_http_upload(
+                &connection,
+                SessionFileUploadPayload {
+                    session_id,
+                    path: "stale-failed-cleanup.bin".to_owned(),
+                    size_bytes: 8,
+                },
+                device_id,
+            )
+            .unwrap();
+        let protected_target = PathBuf::from("/");
+        let protected_metadata = fs::symlink_metadata(&protected_target).unwrap();
+        {
+            let state = protocol
+                .session_file_http_uploads
+                .get_mut(&ready.upload_id)
+                .unwrap();
+            state.target = protected_target;
+            state.file_identity =
+                SessionFileHttpUploadFileIdentity::from_metadata(&protected_metadata);
+            state.updated_at_ms = 0;
+        }
+
+        protocol.prune_session_file_http_uploads();
+
+        assert!(
+            protocol
+                .session_file_http_uploads
+                .contains_key(&ready.upload_id),
+            "cleanup 失败时必须保留 active state，继续隔离未完成目标"
+        );
+        assert!(
+            protocol
+                .session_file_http_uploads
+                .get(&ready.upload_id)
+                .unwrap()
+                .updated_at_ms
+                > 0,
+            "cleanup 失败后要刷新 updated_at，避免每次请求都重复失败清理"
+        );
+        assert!(
+            StateStore::list_http_uploads(&state_path)
+                .unwrap()
+                .into_iter()
+                .any(|record| record.upload_id == ready.upload_id),
+            "cleanup 失败时 recovery record 必须保留，供后续启动重试"
+        );
+        fs::remove_dir_all(base).ok();
+        fs::remove_file(state_path.with_extension("sqlite")).ok();
+    }
+
+    #[test]
+    fn session_file_http_upload_complete_tombstone_rejects_late_overwrite() {
+        let base = temp_state_path("http-upload-complete-tombstone-base");
+        let root = base.join("project");
+        let state_path = temp_state_path("http-upload-complete-tombstone-state.json");
+        fs::create_dir_all(&root).unwrap();
+        let backend = FakePtyBackend::default();
+        let mut config = DaemonConfig::default_for_state_path(&state_path);
+        config.default_command = vec!["sh".to_owned()];
+        config.default_working_directory = Some(root.clone());
+        let mut protocol =
+            DaemonProtocol::new(config, backend.clone(), Ed25519SignatureVerifier).unwrap();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = PublicKey(wire(signing_key.verifying_key().as_bytes()));
+        let (_, mut device_session) = open_e2ee(&mut protocol, &mut connection, device_id);
+        pair_device(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            device_id,
+            public_key,
+        );
+        let create_responses = send_encrypted(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            envelope_value(
+                MessageType::SessionCreate,
+                SessionCreatePayload {
+                    command: Vec::new(),
+                    size: TerminalSize::new(24, 80),
+                },
+            )
+            .unwrap(),
+        );
+        let created = decrypt_first(&mut device_session, create_responses);
+        let created_payload: SessionCreatedPayload = decode_payload(created.payload).unwrap();
+        let ready = protocol
+            .prepare_session_file_http_upload(
+                &connection,
+                SessionFileUploadPayload {
+                    session_id: created_payload.session_id,
+                    path: "late.bin".to_owned(),
+                    size_bytes: 5,
+                },
+                device_id,
+            )
+            .unwrap();
+        let meta = SessionFileHttpUploadStreamPayload {
+            session_id: created_payload.session_id,
+            path: ready.path.clone(),
+            upload_id: ready.upload_id.clone(),
+            size_bytes: ready.size_bytes,
+            offset_bytes: 0,
+        };
+
+        protocol
+            .write_session_file_http_upload(
+                &connection,
+                meta.clone(),
+                device_id,
+                vec![b"hello".to_vec()],
+            )
+            .unwrap();
+        let late = protocol
+            .write_session_file_http_upload(&connection, meta, device_id, vec![b"xxxxx".to_vec()])
+            .unwrap();
+
+        assert!(late.eof);
+        assert_eq!(fs::read(root.join("late.bin")).unwrap(), b"hello");
+        assert!(
+            StateStore::list_http_uploads(&state_path)
+                .unwrap()
+                .into_iter()
+                .all(|record| record.upload_id != ready.upload_id)
+        );
+        fs::remove_dir_all(base).ok();
+        fs::remove_file(state_path.with_extension("sqlite")).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_file_http_upload_rejects_symlink_target_escape() {
+        let base = temp_state_path("http-upload-target-symlink-base");
+        let root = base.join("project");
+        let outside_target = base.join("outside.txt");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&outside_target, b"outside-original").unwrap();
+        let backend = FakePtyBackend::default();
+        let mut config = DaemonConfig::default_for_state_path(temp_state_path(
+            "http-upload-target-symlink-state.json",
+        ));
+        config.default_command = vec!["sh".to_owned()];
+        config.default_working_directory = Some(root.clone());
+        let mut protocol =
+            DaemonProtocol::new(config, backend.clone(), Ed25519SignatureVerifier).unwrap();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = PublicKey(wire(signing_key.verifying_key().as_bytes()));
+        let (_, mut device_session) = open_e2ee(&mut protocol, &mut connection, device_id);
+        pair_device(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            device_id,
+            public_key,
+        );
+        let create_responses = send_encrypted(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            envelope_value(
+                MessageType::SessionCreate,
+                SessionCreatePayload {
+                    command: Vec::new(),
+                    size: TerminalSize::new(24, 80),
+                },
+            )
+            .unwrap(),
+        );
+        let created = decrypt_first(&mut device_session, create_responses);
+        let created_payload: SessionCreatedPayload = decode_payload(created.payload).unwrap();
+        let target = root.join("escape.bin");
+        std::os::unix::fs::symlink(&outside_target, &target).unwrap();
+        let result = protocol.prepare_session_file_http_upload(
+            &connection,
+            SessionFileUploadPayload {
+                session_id: created_payload.session_id,
+                path: "escape.bin".to_owned(),
+                size_bytes: 4,
+            },
+            device_id,
+        );
+
+        assert!(
+            result.is_err(),
+            "HTTP upload init 不能跟随 root 内 symlink 写到 root 外"
+        );
+        assert_eq!(fs::read(&outside_target).unwrap(), b"outside-original");
+        assert!(
+            fs::symlink_metadata(&target)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(http_upload_temp_names(&root).is_empty());
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn session_file_download_stream_stops_at_declared_size_when_file_grows() {
+        let base = temp_state_path("stream-download-grow-base");
+        let root = base.join("project");
+        let target = root.join("artifact.bin");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&target, b"abc").unwrap();
+        let backend = FakePtyBackend::default();
+        let mut config = DaemonConfig::default_for_state_path(temp_state_path(
+            "stream-download-grow-state.json",
+        ));
+        config.default_command = vec!["sh".to_owned()];
+        config.default_working_directory = Some(root.clone());
+        let mut protocol =
+            DaemonProtocol::new(config, backend.clone(), Ed25519SignatureVerifier).unwrap();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = PublicKey(wire(signing_key.verifying_key().as_bytes()));
+        let (_, mut device_session) = open_e2ee(&mut protocol, &mut connection, device_id);
+        pair_device(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            device_id,
+            public_key,
+        );
+        let create_responses = send_encrypted(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            envelope_value(
+                MessageType::SessionCreate,
+                SessionCreatePayload {
+                    command: Vec::new(),
+                    size: TerminalSize::new(24, 80),
+                },
+            )
+            .unwrap(),
+        );
+        let created = decrypt_first(&mut device_session, create_responses);
+        let created_payload: SessionCreatedPayload = decode_payload(created.payload).unwrap();
+        let (ready, mut stream) = protocol
+            .prepare_session_file_download_stream(
+                &connection,
+                SessionFileDownloadStreamPayload {
+                    session_id: created_payload.session_id,
+                    path: "artifact.bin".to_owned(),
+                },
+            )
+            .unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&target)
+            .unwrap()
+            .write_all(b"extra")
+            .unwrap();
+
+        let (chunk, eof) = protocol
+            .read_session_file_download_stream_chunk(
+                &mut stream,
+                SESSION_FILE_TRANSFER_CHUNK_MAX_BYTES,
+            )
+            .unwrap();
+
+        assert_eq!(ready.size_bytes, 3);
+        assert_eq!(chunk.size_bytes, 3);
+        assert_eq!(
+            general_purpose::STANDARD.decode(chunk.data_base64).unwrap(),
+            b"abc"
+        );
+        assert!(eof);
+        assert!(chunk.eof);
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn session_file_read_without_max_bytes_uses_daemon_memory_cap() {
+        let base = temp_state_path("file-read-default-cap-base");
+        let root = base.join("project");
+        let target = root.join("large.txt");
+        fs::create_dir_all(&root).unwrap();
+        fs::File::create(&target)
+            .unwrap()
+            .set_len(SESSION_FILE_READ_MAX_BYTES + 1)
+            .unwrap();
+        let backend = FakePtyBackend::default();
+        let mut config = DaemonConfig::default_for_state_path(temp_state_path(
+            "file-read-default-cap-state.json",
+        ));
+        config.default_command = vec!["sh".to_owned()];
+        config.default_working_directory = Some(root.clone());
+        let mut protocol =
+            DaemonProtocol::new(config, backend.clone(), Ed25519SignatureVerifier).unwrap();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = PublicKey(wire(signing_key.verifying_key().as_bytes()));
+        let (_, mut device_session) = open_e2ee(&mut protocol, &mut connection, device_id);
+        pair_device(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            device_id,
+            public_key,
+        );
+        let create_responses = send_encrypted(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            envelope_value(
+                MessageType::SessionCreate,
+                SessionCreatePayload {
+                    command: Vec::new(),
+                    size: TerminalSize::new(24, 80),
+                },
+            )
+            .unwrap(),
+        );
+        let created = decrypt_first(&mut device_session, create_responses);
+        let created_payload: SessionCreatedPayload = decode_payload(created.payload).unwrap();
+
+        let result = protocol.read_session_file(
+            &connection,
+            SessionFileReadPayload {
+                session_id: created_payload.session_id,
+                path: "large.txt".to_owned(),
+                max_bytes: None,
+            },
+        );
+
+        assert!(matches!(result, Err(ProtocolError::InvalidEnvelope)));
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
     fn session_file_download_prepare_returns_one_time_ready_token() {
         let base = temp_state_path("download-base");
         let root = base.join("project");
@@ -13526,6 +18112,140 @@ mod tests {
         fs::remove_dir_all(base).ok();
     }
 
+    #[test]
+    fn packet_file_transfer_stream_uploads_and_downloads_binary_chunks() {
+        let base = temp_state_path("file-stream-base");
+        let root = base.join("project");
+        fs::create_dir_all(&root).unwrap();
+        let backend = FakePtyBackend::default();
+        let mut config =
+            DaemonConfig::default_for_state_path(temp_state_path("file-stream-state.json"));
+        config.default_command = vec!["sh".to_owned()];
+        config.default_working_directory = Some(root.clone());
+        let mut protocol =
+            DaemonProtocol::new(config, backend.clone(), Ed25519SignatureVerifier).unwrap();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = PublicKey(wire(signing_key.verifying_key().as_bytes()));
+        let (_, mut device_session, _) =
+            open_binary_packet_e2ee(&mut protocol, &mut connection, device_id);
+        let token = protocol
+            .issue_pairing_token(current_unix_timestamp_millis())
+            .unwrap()
+            .token()
+            .clone();
+        let pair_responses = send_binary_packet(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            ProtocolPacket::request(
+                PacketRequestId::new(),
+                METHOD_PAIR_REQUEST,
+                serde_json::to_value(PairRequestPayload {
+                    device_id,
+                    device_public_key: public_key,
+                    token,
+                    nonce: nonce(),
+                    timestamp_ms: UnixTimestampMillis(1_000),
+                })
+                .unwrap(),
+            ),
+        );
+        let _ = decrypt_binary_packets(&mut device_session, pair_responses);
+        let session_id =
+            create_test_packet_session(&mut protocol, &mut connection, &mut device_session);
+        let upload_stream_id = PacketStreamId::new();
+        let upload_open = send_binary_packet(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            ProtocolPacket::stream_open(
+                PacketRequestId::new(),
+                upload_stream_id,
+                METHOD_SESSION_FILE_UPLOAD_STREAM,
+                0,
+                serde_json::to_value(SessionFileUploadPayload {
+                    session_id,
+                    path: "uploaded.bin".to_owned(),
+                    size_bytes: 11,
+                })
+                .unwrap(),
+            ),
+        );
+        let upload_ready = decrypt_binary_packets(&mut device_session, upload_open);
+        assert_eq!(upload_ready[0].1.kind, PacketKind::Response);
+
+        let upload_chunk = send_binary_packet(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            ProtocolPacket::stream_chunk(
+                upload_stream_id,
+                1,
+                serde_json::to_value(SessionFileTransferChunkPayload {
+                    session_id,
+                    offset_bytes: 0,
+                    data_base64: general_purpose::STANDARD.encode(b"hello file\n"),
+                    size_bytes: 11,
+                    eof: true,
+                })
+                .unwrap(),
+            ),
+        );
+        let upload_progress = decrypt_binary_packets(&mut device_session, upload_chunk);
+        assert!(
+            matches!(
+                upload_progress[0].0.payload,
+                Some(binary_protocol_packet::Payload::Json(_))
+            ),
+            "upload progress is metadata only; file bytes must not be returned as base64"
+        );
+        assert_eq!(
+            fs::read(root.join("uploaded.bin")).unwrap(),
+            b"hello file\n"
+        );
+
+        let download_stream_id = PacketStreamId::new();
+        let download_open = send_binary_packet(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            ProtocolPacket::stream_open(
+                PacketRequestId::new(),
+                download_stream_id,
+                METHOD_SESSION_FILE_DOWNLOAD_STREAM,
+                0,
+                serde_json::to_value(SessionFileDownloadStreamPayload {
+                    session_id,
+                    path: "uploaded.bin".to_owned(),
+                })
+                .unwrap(),
+            ),
+        );
+        let download_ready = decrypt_binary_packets(&mut device_session, download_open);
+        assert_eq!(download_ready[0].1.kind, PacketKind::Response);
+
+        let download_chunk = send_binary_packet(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            ProtocolPacket::flow(download_stream_id, 0, 256 * 1024),
+        );
+        let download_packets = decrypt_binary_packets(&mut device_session, download_chunk);
+        let Some(binary_protocol_packet::Payload::FileChunk(chunk)) =
+            download_packets[0].0.payload.clone()
+        else {
+            panic!("download stream must return a binary file_chunk payload");
+        };
+        assert_eq!(chunk.data, b"hello file\n");
+        assert_eq!(chunk.offset_bytes, 0);
+        assert_eq!(chunk.size_bytes, 11);
+        assert!(chunk.eof);
+
+        fs::remove_dir_all(base).ok();
+    }
+
     #[cfg(unix)]
     #[test]
     fn session_file_write_rejects_symlink_target_escape() {
@@ -13597,6 +18317,57 @@ mod tests {
     }
 
     #[test]
+    fn session_file_write_rejects_payload_above_rpc_editor_cap() {
+        let base = temp_state_path("write-large-base");
+        let root = base.join("project");
+        fs::create_dir_all(&root).unwrap();
+        let backend = FakePtyBackend::default();
+        let mut config =
+            DaemonConfig::default_for_state_path(temp_state_path("write-large-state.json"));
+        config.default_command = vec!["sh".to_owned()];
+        config.default_working_directory = Some(root.clone());
+        let mut protocol =
+            DaemonProtocol::new(config, backend.clone(), Ed25519SignatureVerifier).unwrap();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = PublicKey(wire(signing_key.verifying_key().as_bytes()));
+        let (_, mut device_session) = open_e2ee(&mut protocol, &mut connection, device_id);
+        pair_device(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            device_id,
+            public_key,
+        );
+        let session_id = create_test_session(&mut protocol, &mut connection, &mut device_session);
+        let target = root.join("too-large.txt");
+        let oversized = vec![b'x'; SESSION_FILE_WRITE_MAX_BYTES + 1];
+
+        let write_responses = send_encrypted(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            envelope_value(
+                MessageType::SessionFileWrite,
+                SessionFileWritePayload {
+                    session_id,
+                    path: target.to_string_lossy().to_string(),
+                    data_base64: general_purpose::STANDARD.encode(oversized),
+                },
+            )
+            .unwrap(),
+        );
+        let written = decrypt_first(&mut device_session, write_responses);
+
+        assert_eq!(written.kind, MessageType::Error);
+        assert!(!target.exists());
+        assert!(backend.writes().is_empty());
+
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
     fn session_file_transfer_can_navigate_parent_read_write_and_delete() {
         let base = temp_state_path("files-base");
         let root = base.join("project");
@@ -13662,6 +18433,7 @@ mod tests {
                 SessionFileReadPayload {
                     session_id: created_payload.session_id,
                     path: outside.join("readme.txt").to_string_lossy().to_string(),
+                    max_bytes: None,
                 },
             )
             .unwrap(),
@@ -14311,6 +19083,72 @@ mod tests {
         );
         let files = decrypt_first(&mut rpc_device_session, files_responses);
         assert_eq!(files.kind, MessageType::SessionFilesResult);
+    }
+
+    #[test]
+    fn attach_session_rolls_back_runtime_attach_when_late_step_fails() {
+        let (mut protocol, backend) = protocol();
+        let (mut first_connection, _) = protocol.start_connection();
+        let first_device_id = DeviceId::new();
+        let first_signing_key = SigningKey::generate(&mut OsRng);
+        let first_public_key = PublicKey(wire(first_signing_key.verifying_key().as_bytes()));
+        let (_, mut first_device_session) =
+            open_e2ee(&mut protocol, &mut first_connection, first_device_id);
+        pair_device(
+            &mut protocol,
+            &mut first_connection,
+            &mut first_device_session,
+            first_device_id,
+            first_public_key,
+        );
+        let session_id = create_test_session(
+            &mut protocol,
+            &mut first_connection,
+            &mut first_device_session,
+        );
+        let internal_session_id = protocol.session_index.get(&session_id).cloned().unwrap();
+
+        let (mut second_connection, _) = protocol.start_connection();
+        let second_device_id = DeviceId::new();
+        let second_signing_key = SigningKey::generate(&mut OsRng);
+        let second_public_key = PublicKey(wire(second_signing_key.verifying_key().as_bytes()));
+        let (_, mut second_device_session) =
+            open_e2ee(&mut protocol, &mut second_connection, second_device_id);
+        pair_device(
+            &mut protocol,
+            &mut second_connection,
+            &mut second_device_session,
+            second_device_id,
+            second_public_key,
+        );
+
+        backend.fail_reads("forced attach drain failure");
+        let responses = send_encrypted(
+            &mut protocol,
+            &mut second_connection,
+            &mut second_device_session,
+            envelope_value(
+                MessageType::SessionAttach,
+                SessionAttachPayload {
+                    session_id,
+                    watch_updates: true,
+                    last_terminal_seq: None,
+                },
+            )
+            .unwrap(),
+        );
+        let response = decrypt_first(&mut second_device_session, responses);
+        backend.allow_reads();
+
+        assert_eq!(response.kind, MessageType::Error);
+        assert!(
+            protocol
+                .runtime
+                .role(&internal_session_id, &device_key(second_device_id))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(second_connection.debug_snapshot().attached_sessions, 0);
     }
 
     #[test]

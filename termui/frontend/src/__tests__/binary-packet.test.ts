@@ -53,6 +53,30 @@ describe("binary protobuf protocol packet", () => {
     expect(decodeBinaryProtocolPacket(encodeBinaryProtocolPacket(error))).toEqual(error);
   });
 
+  it("file_chunk 可以编码 256KiB raw bytes 而不触发参数数量上限", () => {
+    const bytes = new Uint8Array(256 * 1024);
+    bytes[0] = 1;
+    bytes[bytes.length - 1] = 255;
+    const packet = {
+      version: 3,
+      kind: "stream_chunk" as const,
+      stream_id: "00000000-0000-0000-0000-000000000324",
+      seq: 1,
+      payload: {
+        type: "file_chunk" as const,
+        session_id: "00000000-0000-0000-0000-000000000301",
+        offset_bytes: 0,
+        data: bytes,
+        size_bytes: bytes.byteLength,
+        eof: false,
+      },
+    };
+
+    const decoded = decodeBinaryProtocolPacket(encodeBinaryProtocolPacket(packet));
+
+    expect(decoded).toEqual(packet);
+  });
+
   it("兼容省略 kind 字段的早期 snapshot terminal frame", () => {
     const legacySnapshotPayload = new Uint8Array([
       0x12, 0x10,

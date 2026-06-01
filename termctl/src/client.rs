@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{SinkExt, StreamExt, stream::FuturesUnordered};
 use rustls::{ClientConfig, RootCertStore};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -24,18 +24,18 @@ use termd::net::{
     decode_binary_encrypted_frame, encode_binary_encrypted_frame,
 };
 use termd_proto::{
-    AuthChallengePayload, AuthPayload, BINARY_PROTOCOL_VERSION, BinaryPacketErrorPayload,
-    BinaryPacketKind, BinaryProtocolPacket, BinarySessionDataPayload, BinaryTerminalFrameKind,
-    BinaryTerminalFramePayload, BinaryTerminalSize, ControlGrantPayload, ControlRequestPayload,
-    DeviceId, E2eeKeyExchangePayload, EncryptedFramePayload, ErrorPayload, MessageType,
-    PROTOCOL_PACKET_VERSION, PacketErrorPayload, PacketKind, PacketRequestId, PacketStreamId,
-    PairAcceptPayload, PairRequestPayload, PairingToken, PingPayload, PongPayload, ProtocolPacket,
-    ProtocolVersion, PublicKey, RouteHelloPayload, RouteReadyPayload, RouteRole, ServerId,
-    SessionAttachPayload, SessionAttachedPayload, SessionClosePayload, SessionClosedPayload,
-    SessionCreatePayload, SessionCreatedPayload, SessionDataPayload, SessionId, SessionListPayload,
-    SessionListResultPayload, SessionResizePayload, SessionResizedPayload, TerminalFramePayload,
-    TerminalSize, binary_protocol_packet, decode_binary_protocol_packet,
-    encode_binary_protocol_packet,
+    AuthChallengePayload, AuthPayload, BINARY_PROTOCOL_VERSION, BinaryFileChunkPayload,
+    BinaryPacketErrorPayload, BinaryPacketKind, BinaryProtocolPacket, BinarySessionDataPayload,
+    BinaryTerminalFrameKind, BinaryTerminalFramePayload, BinaryTerminalSize, ControlGrantPayload,
+    ControlRequestPayload, DeviceId, E2eeKeyExchangePayload, EncryptedFramePayload, ErrorPayload,
+    MessageType, PROTOCOL_PACKET_VERSION, PacketErrorPayload, PacketKind, PacketRequestId,
+    PacketStreamId, PairAcceptPayload, PairRequestPayload, PairingToken, PingPayload, PongPayload,
+    ProtocolPacket, ProtocolVersion, PublicKey, RouteHelloPayload, RouteReadyPayload, RouteRole,
+    ServerId, SessionAttachPayload, SessionAttachedPayload, SessionClosePayload,
+    SessionClosedPayload, SessionCreatePayload, SessionCreatedPayload, SessionDataPayload,
+    SessionFileTransferChunkPayload, SessionId, SessionListPayload, SessionListResultPayload,
+    SessionResizePayload, SessionResizedPayload, TerminalFramePayload, TerminalSize,
+    binary_protocol_packet, decode_binary_protocol_packet, encode_binary_protocol_packet,
 };
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
@@ -48,9 +48,12 @@ use crate::error::{Result, TermctlError};
 use crate::state::PairedServerState;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const CONNECT_ATTEMPTS: usize = 3;
-const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(200);
+// 公网 relay 偶发卡在 TCP/TLS/WebSocket open 阶段；一次性 CLI 不应让单次半开握手
+// 吃掉数秒。快速失败后重试，最后仍保留多次机会覆盖真实网络抖动。
+const CONNECT_TIMEOUT: Duration = Duration::from_millis(1200);
+const CONNECT_HEDGE_DELAY: Duration = Duration::from_millis(300);
+const CONNECT_ATTEMPTS: usize = 4;
+const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(80);
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 const SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const METHOD_PAIR_REQUEST: &str = "pair.request";
@@ -66,6 +69,7 @@ const METHOD_PING: &str = "ping";
 const TERMINAL_STREAM_INITIAL_CREDIT: u32 = 256 * 1024;
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
+type WsResponse = tokio_tungstenite::tungstenite::handshake::client::Response;
 
 #[derive(Debug, Clone)]
 pub struct TerminalStream {
@@ -640,25 +644,9 @@ impl DirectClient {
     }
 }
 
-async fn connect_websocket(
-    url: &str,
-) -> Result<(
-    WsStream,
-    tokio_tungstenite::tungstenite::handshake::client::Response,
-)> {
+async fn connect_websocket(url: &str) -> Result<(WsStream, WsResponse)> {
     for attempt in 1..=CONNECT_ATTEMPTS {
-        let result = timeout(
-            CONNECT_TIMEOUT,
-            tokio_tungstenite::connect_async_tls_with_config(
-                url,
-                None,
-                false,
-                Some(termctl_tls_connector()),
-            ),
-        )
-        .await
-        .map_err(|_| TermctlError::ConnectFailed)
-        .and_then(|result| result.map_err(|_| TermctlError::ConnectFailed));
+        let result = connect_websocket_hedged(url).await;
 
         match result {
             Ok(socket) => return Ok(socket),
@@ -673,6 +661,58 @@ async fn connect_websocket(
     }
 
     Err(TermctlError::ConnectFailed)
+}
+
+async fn connect_websocket_hedged(url: &str) -> Result<(WsStream, WsResponse)> {
+    // 中文注释：公网 relay 偶发卡在单条 TLS/WebSocket open 上。这里必须让第一条
+    // 连接继续推进，300ms 后再补开第二条；谁先成功就用谁，失败的一条不会立刻拖垮
+    // 另一条，避免一次坏握手或半开 TLS 连接把 CLI 卡到秒级。
+    let owned_url = url.to_owned();
+    let mut connections: FuturesUnordered<_> = FuturesUnordered::new();
+    connections.push(connect_websocket_once_owned(owned_url.clone()));
+
+    let hedge_delay = sleep(CONNECT_HEDGE_DELAY);
+    tokio::pin!(hedge_delay);
+    let mut hedge_started = false;
+    let mut last_error: Option<TermctlError> = None;
+
+    loop {
+        tokio::select! {
+            result = connections.next() => {
+                match result {
+                    Some(Ok(socket)) => return Ok(socket),
+                    Some(Err(error)) => {
+                        last_error = Some(error);
+                        if hedge_started && connections.is_empty() {
+                            return Err(last_error.unwrap_or(TermctlError::ConnectFailed));
+                        }
+                    }
+                    None => {
+                        return Err(last_error.unwrap_or(TermctlError::ConnectFailed));
+                    }
+                }
+            }
+            _ = &mut hedge_delay, if !hedge_started => {
+                hedge_started = true;
+                connections.push(connect_websocket_once_owned(owned_url.clone()));
+            }
+        }
+    }
+}
+
+async fn connect_websocket_once_owned(url: String) -> Result<(WsStream, WsResponse)> {
+    timeout(
+        CONNECT_TIMEOUT,
+        tokio_tungstenite::connect_async_tls_with_config(
+            url.as_str(),
+            None,
+            false,
+            Some(termctl_tls_connector()),
+        ),
+    )
+    .await
+    .map_err(|_| TermctlError::ConnectFailed)
+    .and_then(|result| result.map_err(|_| TermctlError::ConnectFailed))
 }
 
 fn termctl_tls_connector() -> Connector {
@@ -957,6 +997,16 @@ fn protocol_packet_from_binary(packet: BinaryProtocolPacket) -> Result<ProtocolP
             serde_json::to_value(terminal_frame_from_binary(payload)?)
                 .map_err(|_| TermctlError::InvalidEnvelope)?
         }
+        Some(binary_protocol_packet::Payload::FileChunk(payload)) => {
+            serde_json::to_value(SessionFileTransferChunkPayload {
+                session_id: session_id_from_binary(&payload.session_id)?,
+                offset_bytes: payload.offset_bytes,
+                data_base64: crypto::encode_session_data(&payload.data),
+                size_bytes: payload.size_bytes,
+                eof: payload.eof,
+            })
+            .map_err(|_| TermctlError::InvalidEnvelope)?
+        }
         Some(binary_protocol_packet::Payload::Error(error)) => {
             serde_json::to_value(PacketErrorPayload {
                 code: error.code,
@@ -987,6 +1037,22 @@ fn binary_stream_chunk_payload(payload: &Value) -> Result<Option<binary_protocol
             .map_err(|_| TermctlError::InvalidEnvelope)?;
         return Ok(Some(binary_protocol_packet::Payload::TerminalFrame(
             terminal_frame_to_binary(frame)?,
+        )));
+    }
+
+    // 中文注释：文件流和终端流共用 packet stream_chunk，但二进制层必须保留原始文件字节。
+    if let Ok(file_chunk) =
+        serde_json::from_value::<SessionFileTransferChunkPayload>(payload.clone())
+    {
+        let data = crypto::decode_session_data(&file_chunk.data_base64)?;
+        return Ok(Some(binary_protocol_packet::Payload::FileChunk(
+            BinaryFileChunkPayload {
+                session_id: file_chunk.session_id.0.as_bytes().to_vec(),
+                offset_bytes: file_chunk.offset_bytes,
+                data,
+                size_bytes: file_chunk.size_bytes,
+                eof: file_chunk.eof,
+            },
         )));
     }
 
@@ -1561,6 +1627,45 @@ mod tests {
             crypto::decode_session_data(&payload.data_base64).unwrap(),
             b"terminal secret\n"
         );
+    }
+
+    #[test]
+    fn binary_packet_roundtrips_file_chunk_without_becoming_terminal_data() {
+        let session_id = SessionId::new();
+        let stream_id = PacketStreamId::new();
+        let raw = b"\x00file-bytes\xff".to_vec();
+        let packet = ProtocolPacket::stream_chunk(
+            stream_id,
+            1,
+            serde_json::to_value(SessionFileTransferChunkPayload {
+                session_id,
+                offset_bytes: 0,
+                data_base64: crypto::encode_session_data(&raw),
+                size_bytes: raw.len() as u64,
+                eof: true,
+            })
+            .unwrap(),
+        );
+
+        let binary = protocol_packet_to_binary(packet).unwrap();
+        let encoded = encode_binary_protocol_packet(&binary);
+        let decoded = protocol_packet_from_binary(
+            decode_binary_protocol_packet(&encoded).expect("binary packet should decode"),
+        )
+        .expect("binary packet should map back to protocol packet");
+
+        assert!(matches!(
+            binary.payload,
+            Some(binary_protocol_packet::Payload::FileChunk(_))
+        ));
+        let payload: SessionFileTransferChunkPayload = decode_payload(decoded.payload).unwrap();
+        assert_eq!(payload.session_id, session_id);
+        assert_eq!(payload.offset_bytes, 0);
+        assert_eq!(
+            crypto::decode_session_data(&payload.data_base64).unwrap(),
+            raw
+        );
+        assert!(payload.eof);
     }
 
     #[test]

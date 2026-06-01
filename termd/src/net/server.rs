@@ -4,14 +4,16 @@
 //! 规则都由协议核心执行，避免网络框架层夹带业务判断。
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::net::{AddrParseError, IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::body::{Body, Bytes, to_bytes};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, Method, Request, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -19,15 +21,18 @@ use futures_util::{SinkExt, StreamExt};
 use rustls::pki_types::pem::PemObject;
 use serde::Serialize;
 use termd_proto::{
-    ErrorPayload, MessageType, PROTOCOL_PACKET_VERSION, PairingToken, ProtocolVersion,
-    RouteHelloPayload, RouteReadyPayload, RouteRole, ServerId, SessionId, SessionState,
-    TerminalSize, UnixTimestampMillis,
+    ErrorPayload, HttpE2eeAuthPayload, MessageType, PROTOCOL_PACKET_VERSION, PairingToken,
+    ProtocolVersion, PublicKey, RouteHelloPayload, RouteReadyPayload, RouteRole, ServerId,
+    SessionAttachPayload, SessionFileHttpDownloadPayload, SessionFileHttpUploadStreamPayload,
+    SessionFileUploadPayload, SessionId, SessionState, Signature, TerminalSize,
+    UnixTimestampMillis,
 };
 use thiserror::Error;
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, timeout};
+use tower::ServiceExt as _;
 use tracing::{debug, info, warn};
 
 use crate::auth::current_unix_timestamp_millis;
@@ -38,10 +43,12 @@ use crate::state::{DaemonState, SessionStateRecord, StateError, StateStore};
 
 use super::protocol::{
     DaemonProtocol, JsonEnvelope, ProtocolConnection, ProtocolConnectionDebugSnapshot,
-    ProtocolConnectionDebugTraffic, ProtocolError, ProtocolWireMessage, decode_payload,
-    envelope_value,
+    ProtocolConnectionDebugTraffic, ProtocolError, ProtocolWireMessage, SessionFileHttpUploadBegin,
+    SessionFileHttpUploadCommit, cleanup_persisted_session_file_http_uploads, decode_payload,
+    envelope_value, session_file_http_upload_chunks_len, write_session_file_http_upload_files,
 };
 use super::signature::Ed25519SignatureVerifier;
+use super::{decode_binary_encrypted_frame, encode_binary_encrypted_frame};
 
 const OUTPUT_FLUSH_MAX_BYTES_PER_SESSION: usize = 512 * 1024;
 // transport 超时只关闭当前 WebSocket 连接；session/supervisor 仍由协议和 PTY 层保持持久。
@@ -50,8 +57,20 @@ const WEBSOCKET_SEND_DEADLINE: Duration = Duration::from_secs(10);
 const WEBSOCKET_PONG_DEADLINE: Duration = Duration::from_secs(10);
 const WEBSOCKET_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const WEBSOCKET_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
-const WEBSOCKET_MAX_FRAME_SIZE: usize = 1024 * 1024;
-const WEBSOCKET_MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
+// direct WebSocket 与 relay 传输保持同量级限制；终端 snapshot 可能是数 MB 的
+// 单个 E2EE binary frame，过小的 frame limit 会把正常重连误判为异常大消息。
+const WEBSOCKET_MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
+const WEBSOCKET_MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
+const HTTP_E2EE_INIT_MAX_BYTES: usize = 1024 * 1024;
+#[cfg(not(test))]
+const HTTP_E2EE_SHORT_BODY_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const HTTP_E2EE_SHORT_BODY_TIMEOUT: Duration = Duration::from_millis(50);
+const HTTP_E2EE_FRAME_LEN_BYTES: usize = 4;
+const HTTP_E2EE_MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
+// 中文注释：HTTP body 是流式输入，必须在追加到 pending 前限制未解析数据大小，
+// 否则一个异常大的底层 body chunk 会先占用内存，再等帧解析时报错。
+const HTTP_E2EE_MAX_PENDING_BYTES: usize = HTTP_E2EE_FRAME_LEN_BYTES + HTTP_E2EE_MAX_FRAME_BYTES;
 const SESSION_ACTIVITY_PUSH_MIN_INTERVAL: Duration = Duration::from_millis(250);
 const WEBSOCKET_TRAFFIC_LOG_INTERVAL: Duration = Duration::from_secs(1);
 const WEBSOCKET_SEND_SLOW_LOG_THRESHOLD: Duration = Duration::from_millis(50);
@@ -411,6 +430,7 @@ struct LocalPairingTokenPayload {
 
 /// 构造生产默认协议状态，并接入本地状态文件。
 pub fn try_default_protocol(config: DaemonConfig) -> Result<SharedDaemonProtocol, ServerError> {
+    cleanup_persisted_session_file_http_uploads(&config.state_path)?;
     let mut state = StateStore::load(&config.state_path)?;
     let supervisor_backend = SupervisorPtyBackend::for_state_path(&config.state_path);
     let mut live_supervisor_session_ids: Option<HashSet<SessionId>> = None;
@@ -571,6 +591,10 @@ pub fn router(protocol: SharedDaemonProtocol, web_enabled: bool) -> Router {
     let router = Router::new()
         .route("/healthz", get(healthz))
         .route("/local/pairing-token", post(local_pairing_token))
+        .route("/api/files/upload/init", post(http_file_upload_init))
+        .route("/api/files/upload", post(http_file_upload_stream))
+        .route("/api/files/upload/abort", post(http_file_upload_abort))
+        .route("/api/files/download", post(http_file_download))
         .route("/ws", get(ws_handler))
         .with_state(protocol);
 
@@ -637,6 +661,64 @@ pub async fn serve_tls_listener(
 
     // TLS 只替换 transport accept 层；router 和协议状态机保持同一套路径与 E2EE 规则。
     serve_rustls_listener(listener, router(protocol, web_enabled), tls_config).await
+}
+
+pub(crate) async fn handle_http_file_tunnel_stream_request(
+    protocol: SharedDaemonProtocol,
+    method: String,
+    path: String,
+    headers: Vec<(String, String)>,
+    body: Body,
+) -> Response {
+    if !is_http_file_tunnel_allowed(&method, &path) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ErrorPayload {
+                code: "invalid_http_tunnel".to_owned(),
+                message: "invalid HTTP tunnel request".to_owned(),
+            }),
+        )
+            .into_response();
+    }
+    let mut builder = Request::builder()
+        .method(method.as_str())
+        .uri(path.as_str());
+    for (name, value) in headers {
+        builder = builder.header(name.as_str(), value.as_str());
+    }
+    let request = match builder.body(body) {
+        Ok(request) => request,
+        Err(_) => {
+            let error = ErrorPayload {
+                code: "invalid_http_tunnel".to_owned(),
+                message: "invalid HTTP tunnel request".to_owned(),
+            };
+            return (StatusCode::BAD_REQUEST, Json(error)).into_response();
+        }
+    };
+    match router(protocol, false).oneshot(request).await {
+        Ok(response) => response,
+        Err(_) => {
+            let error = ErrorPayload {
+                code: "http_tunnel_failed".to_owned(),
+                message: "HTTP tunnel request failed".to_owned(),
+            };
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(error)).into_response()
+        }
+    }
+}
+
+fn is_http_file_tunnel_allowed(method: &str, path: &str) -> bool {
+    // 中文注释：relay 是不可信 dumb pipe；daemon 不能依赖 relay 的 HTTP route 限制。
+    // tunnel 入口只允许文件传输 API，避免把 `/healthz`、本地配对等非文件路由暴露出去。
+    method.eq_ignore_ascii_case("POST")
+        && matches!(
+            path,
+            "/api/files/upload/init"
+                | "/api/files/upload"
+                | "/api/files/upload/abort"
+                | "/api/files/download"
+        )
 }
 
 fn load_rustls_server_config(tls_paths: &TlsPaths) -> Result<rustls::ServerConfig, ServerError> {
@@ -780,6 +862,932 @@ async fn local_pairing_token(
         }),
     )
         .into_response()
+}
+
+async fn http_file_upload_init(
+    State(protocol): State<SharedDaemonProtocol>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let auth = match http_e2ee_auth_from_headers(&headers, &method, uri.path()) {
+        Ok(auth) => auth,
+        Err(response) => return response,
+    };
+    let body = match read_http_e2ee_short_body(body).await {
+        Ok(body) => body,
+        Err(error) => return http_e2ee_error(StatusCode::BAD_REQUEST, error),
+    };
+    let mut protocol = protocol.lock().await;
+    let (device_id, mut e2ee) = match protocol.open_http_e2ee_session(auth) {
+        Ok(result) => result,
+        Err(error) => return http_e2ee_error(StatusCode::UNAUTHORIZED, error),
+    };
+    let payload: SessionFileUploadPayload = match decrypt_single_http_e2ee_json(&mut e2ee, &body) {
+        Ok(payload) => payload,
+        Err(error) => return http_e2ee_error(StatusCode::BAD_REQUEST, error),
+    };
+    let mut connection = ProtocolConnection::authenticated_http(device_id);
+    if let Err(error) = protocol.attach_session(
+        &mut connection,
+        SessionAttachPayload {
+            session_id: payload.session_id,
+            watch_updates: false,
+            last_terminal_seq: None,
+        },
+    ) {
+        return http_e2ee_encrypted_error(&mut e2ee, StatusCode::BAD_REQUEST, error);
+    }
+    let response = match protocol.prepare_session_file_http_upload(&connection, payload, device_id)
+    {
+        Ok(ready) => match encrypt_single_http_e2ee_json(&mut e2ee, &ready) {
+            Ok(body) => (StatusCode::OK, body).into_response(),
+            Err(error) => http_e2ee_error(StatusCode::INTERNAL_SERVER_ERROR, error),
+        },
+        Err(error) => http_e2ee_encrypted_error(&mut e2ee, StatusCode::BAD_REQUEST, error),
+    };
+    connection.close(&mut protocol);
+    response
+}
+
+async fn http_file_upload_stream(
+    State(protocol): State<SharedDaemonProtocol>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let auth = match http_e2ee_auth_from_headers(&headers, &method, uri.path()) {
+        Ok(auth) => auth,
+        Err(response) => return response,
+    };
+    let mut protocol_guard = protocol.lock().await;
+    let (device_id, mut e2ee) = match protocol_guard.open_http_e2ee_session(auth) {
+        Ok(result) => result,
+        Err(error) => return http_e2ee_error(StatusCode::UNAUTHORIZED, error),
+    };
+    drop(protocol_guard);
+    let mut stream = HttpE2eeBodyFrameStream::new(body);
+    let meta_frame = match read_http_e2ee_metadata_frame(&mut stream, &mut e2ee).await {
+        Ok(frame) => frame,
+        Err(error) => {
+            warn!(
+                code = error.code(),
+                "HTTP upload stream rejected metadata frame"
+            );
+            return http_e2ee_error(StatusCode::BAD_REQUEST, error);
+        }
+    };
+    let mut meta: SessionFileHttpUploadStreamPayload = match serde_json::from_slice(&meta_frame) {
+        Ok(meta) => meta,
+        Err(_) => {
+            return http_e2ee_encrypted_error(
+                &mut e2ee,
+                StatusCode::BAD_REQUEST,
+                ProtocolError::InvalidEnvelope,
+            );
+        }
+    };
+    let mut connection = ProtocolConnection::authenticated_http(device_id);
+    {
+        let mut protocol_guard = protocol.lock().await;
+        if let Err(error) = protocol_guard.attach_session(
+            &mut connection,
+            SessionAttachPayload {
+                session_id: meta.session_id,
+                watch_updates: false,
+                last_terminal_seq: None,
+            },
+        ) {
+            return http_e2ee_encrypted_error(&mut e2ee, StatusCode::BAD_REQUEST, error);
+        }
+    }
+    let mut connection_guard = HttpConnectionCloseGuard::new(protocol.clone(), connection);
+    let mut progress = None;
+    let mut saw_chunk = false;
+    loop {
+        let chunk = match stream.next_plaintext(&mut e2ee).await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(error) => {
+                debug!(
+                    session_id = %meta.session_id.0,
+                    path = %meta.path,
+                    upload_id = %meta.upload_id,
+                    offset_bytes = meta.offset_bytes,
+                    code = error.code(),
+                    "HTTP upload stream rejected data frame detail"
+                );
+                warn!(
+                    session_id = %meta.session_id.0,
+                    upload_id = %meta.upload_id,
+                    offset_bytes = meta.offset_bytes,
+                    code = error.code(),
+                    "HTTP upload stream rejected data frame"
+                );
+                connection_guard.close_now().await;
+                return http_e2ee_encrypted_error(&mut e2ee, StatusCode::BAD_REQUEST, error);
+            }
+        };
+        saw_chunk = true;
+        let chunk_len = chunk.len() as u64;
+        match write_http_file_upload_chunks_without_protocol_io_lock(
+            protocol.clone(),
+            connection_guard.connection(),
+            meta.clone(),
+            device_id,
+            vec![chunk],
+        )
+        .await
+        {
+            Ok(update) => {
+                // 中文注释：update.offset_bytes 表示整个 upload_id 当前已收到多少字节；
+                // 2 并发乱序上传时它不是本 POST 的下一个 offset。当前请求内多个
+                // E2EE frame 必须只按本请求已消费的明文长度递增。
+                meta.offset_bytes = meta
+                    .offset_bytes
+                    .checked_add(chunk_len)
+                    .unwrap_or(meta.size_bytes);
+                progress = Some(update);
+            }
+            Err(error) => {
+                debug!(
+                    session_id = %meta.session_id.0,
+                    path = %meta.path,
+                    upload_id = %meta.upload_id,
+                    offset_bytes = meta.offset_bytes,
+                    chunk_len,
+                    code = error.code(),
+                    "HTTP upload stream write failed detail"
+                );
+                warn!(
+                    session_id = %meta.session_id.0,
+                    upload_id = %meta.upload_id,
+                    offset_bytes = meta.offset_bytes,
+                    chunk_len,
+                    code = error.code(),
+                    "HTTP upload stream write failed"
+                );
+                connection_guard.close_now().await;
+                return http_e2ee_encrypted_error(&mut e2ee, StatusCode::BAD_REQUEST, error);
+            }
+        }
+    }
+    if !saw_chunk && meta.offset_bytes == meta.size_bytes {
+        match write_http_file_upload_chunks_without_protocol_io_lock(
+            protocol.clone(),
+            connection_guard.connection(),
+            meta.clone(),
+            device_id,
+            Vec::new(),
+        )
+        .await
+        {
+            Ok(update) => progress = Some(update),
+            Err(error) => {
+                debug!(
+                    session_id = %meta.session_id.0,
+                    path = %meta.path,
+                    upload_id = %meta.upload_id,
+                    offset_bytes = meta.offset_bytes,
+                    code = error.code(),
+                    "HTTP empty upload stream write failed detail"
+                );
+                warn!(
+                    session_id = %meta.session_id.0,
+                    upload_id = %meta.upload_id,
+                    offset_bytes = meta.offset_bytes,
+                    code = error.code(),
+                    "HTTP empty upload stream write failed"
+                );
+                connection_guard.close_now().await;
+                return http_e2ee_encrypted_error(&mut e2ee, StatusCode::BAD_REQUEST, error);
+            }
+        }
+    }
+    let Some(progress) = progress else {
+        debug!(
+            session_id = %meta.session_id.0,
+            path = %meta.path,
+            upload_id = %meta.upload_id,
+            offset_bytes = meta.offset_bytes,
+            "HTTP upload stream ended without payload progress detail"
+        );
+        warn!(
+            session_id = %meta.session_id.0,
+            upload_id = %meta.upload_id,
+            offset_bytes = meta.offset_bytes,
+            "HTTP upload stream ended without payload progress"
+        );
+        connection_guard.close_now().await;
+        return http_e2ee_encrypted_error(
+            &mut e2ee,
+            StatusCode::BAD_REQUEST,
+            ProtocolError::InvalidEnvelope,
+        );
+    };
+    // 中文注释：HTTP 上传现在允许一个 upload_id 被多个分片 POST 顺序或并发提交；
+    // 非 eof 进度表示本次分片已落盘，不能再按旧单请求模型 abort。
+    connection_guard.close_now().await;
+    match encrypt_single_http_e2ee_json(&mut e2ee, &progress) {
+        Ok(body) => (StatusCode::OK, body).into_response(),
+        Err(error) => http_e2ee_error(StatusCode::INTERNAL_SERVER_ERROR, error),
+    }
+}
+
+async fn http_file_upload_abort(
+    State(protocol): State<SharedDaemonProtocol>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let auth = match http_e2ee_auth_from_headers(&headers, &method, uri.path()) {
+        Ok(auth) => auth,
+        Err(response) => return response,
+    };
+    let body = match read_http_e2ee_short_body(body).await {
+        Ok(body) => body,
+        Err(error) => return http_e2ee_error(StatusCode::BAD_REQUEST, error),
+    };
+    let mut protocol_guard = protocol.lock().await;
+    let (device_id, mut e2ee) = match protocol_guard.open_http_e2ee_session(auth) {
+        Ok(result) => result,
+        Err(error) => return http_e2ee_error(StatusCode::UNAUTHORIZED, error),
+    };
+    let payload: SessionFileHttpUploadStreamPayload =
+        match decrypt_single_http_e2ee_json(&mut e2ee, &body) {
+            Ok(payload) => payload,
+            Err(error) => return http_e2ee_error(StatusCode::BAD_REQUEST, error),
+        };
+    let mut connection = ProtocolConnection::authenticated_http(device_id);
+    if let Err(error) = protocol_guard.attach_session(
+        &mut connection,
+        SessionAttachPayload {
+            session_id: payload.session_id,
+            watch_updates: false,
+            last_terminal_seq: None,
+        },
+    ) {
+        return http_e2ee_encrypted_error(&mut e2ee, StatusCode::BAD_REQUEST, error);
+    }
+    let response = match protocol_guard.abort_session_file_http_upload(&connection, &payload) {
+        Ok(()) => match encrypt_single_http_e2ee_json(&mut e2ee, &payload) {
+            Ok(body) => (StatusCode::OK, body).into_response(),
+            Err(error) => http_e2ee_error(StatusCode::INTERNAL_SERVER_ERROR, error),
+        },
+        Err(error) => http_e2ee_encrypted_error(&mut e2ee, StatusCode::BAD_REQUEST, error),
+    };
+    connection.close(&mut protocol_guard);
+    response
+}
+
+struct HttpConnectionCloseGuard {
+    protocol: SharedDaemonProtocol,
+    connection: Option<ProtocolConnection>,
+}
+
+impl HttpConnectionCloseGuard {
+    fn new(protocol: SharedDaemonProtocol, connection: ProtocolConnection) -> Self {
+        Self {
+            protocol,
+            connection: Some(connection),
+        }
+    }
+
+    fn connection(&self) -> &ProtocolConnection {
+        self.connection
+            .as_ref()
+            .expect("HTTP connection guard should still own connection")
+    }
+
+    async fn close_now(&mut self) {
+        if let Some(connection) = self.connection.as_mut() {
+            let mut protocol = self.protocol.lock().await;
+            connection.close(&mut protocol);
+        }
+        self.connection = None;
+    }
+}
+
+impl Drop for HttpConnectionCloseGuard {
+    fn drop(&mut self) {
+        let Some(mut connection) = self.connection.take() else {
+            return;
+        };
+        let protocol = self.protocol.clone();
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        // 中文注释：HTTP upload stream 会临时 attach 到 session；handler 被浏览器取消时
+        // 正常 close 路径不会执行，Drop 必须补一次 detach，避免 operator/runtime 计数泄漏。
+        handle.spawn(async move {
+            let mut protocol = protocol.lock().await;
+            connection.close(&mut protocol);
+        });
+    }
+}
+
+struct HttpUploadInflightGuard {
+    protocol: SharedDaemonProtocol,
+    meta: SessionFileHttpUploadStreamPayload,
+    reserved_range: Option<(u64, u64)>,
+    file_result: Option<super::protocol::SessionFileHttpUploadFileWriteResult>,
+    armed: bool,
+}
+
+impl HttpUploadInflightGuard {
+    fn new(
+        protocol: SharedDaemonProtocol,
+        meta: SessionFileHttpUploadStreamPayload,
+        reserved_range: Option<(u64, u64)>,
+    ) -> Self {
+        Self {
+            protocol,
+            meta,
+            reserved_range,
+            file_result: None,
+            armed: true,
+        }
+    }
+
+    fn mark_written(&mut self, file_result: super::protocol::SessionFileHttpUploadFileWriteResult) {
+        self.file_result = Some(file_result);
+    }
+
+    async fn cancel_now(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut protocol = self.protocol.lock().await;
+        protocol.cancel_session_file_http_upload_write(&self.meta, self.reserved_range);
+        drop(protocol);
+        self.disarm();
+    }
+
+    async fn commit_now(&mut self) -> Result<SessionFileHttpUploadCommit, ProtocolError> {
+        let file_result = self
+            .file_result
+            .as_ref()
+            .ok_or(ProtocolError::InvalidState)?;
+        let mut protocol = self.protocol.lock().await;
+        let commit = protocol.commit_session_file_http_upload_write(&self.meta, file_result);
+        drop(protocol);
+        if commit.is_ok() {
+            self.disarm();
+        }
+        commit
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+        self.file_result = None;
+    }
+}
+
+impl Drop for HttpUploadInflightGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let protocol = self.protocol.clone();
+        let meta = self.meta.clone();
+        let reserved_range = self.reserved_range;
+        let file_result = self.file_result.take();
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        // 中文注释：reserve 后文件写入过程本身不再 await；因此 Drop 只会发生在写入前后。
+        // 写入前取消就释放 in-flight；写入后取消必须提交结果，不能让 retry 覆盖已落盘数据。
+        handle.spawn(async move {
+            let mut protocol = protocol.lock().await;
+            if let Some(file_result) = file_result {
+                if let Err(error) =
+                    protocol.commit_session_file_http_upload_write(&meta, &file_result)
+                {
+                    warn!(%error, "failed to commit HTTP upload write after handler drop");
+                }
+            } else {
+                protocol.cancel_session_file_http_upload_write(&meta, reserved_range);
+            }
+        });
+    }
+}
+
+async fn write_http_file_upload_chunks_without_protocol_io_lock(
+    protocol: SharedDaemonProtocol,
+    connection: &ProtocolConnection,
+    meta: SessionFileHttpUploadStreamPayload,
+    device_id: termd_proto::DeviceId,
+    chunks: Vec<Vec<u8>>,
+) -> Result<termd_proto::SessionFileUploadProgressPayload, ProtocolError> {
+    let write_len = session_file_http_upload_chunks_len(&chunks)?;
+    let begin = {
+        let mut protocol = protocol.lock().await;
+        protocol.begin_session_file_http_upload_write(
+            connection,
+            meta.clone(),
+            device_id,
+            write_len,
+        )
+    };
+    let begin = match begin {
+        Ok(begin) => begin,
+        Err(error) => {
+            debug!(
+                session_id = %meta.session_id.0,
+                path = %meta.path,
+                upload_id = %meta.upload_id,
+                offset_bytes = meta.offset_bytes,
+                write_len,
+                code = error.code(),
+                "HTTP upload begin write failed detail"
+            );
+            warn!(
+                session_id = %meta.session_id.0,
+                upload_id = %meta.upload_id,
+                offset_bytes = meta.offset_bytes,
+                write_len,
+                code = error.code(),
+                "HTTP upload begin write failed"
+            );
+            return Err(error);
+        }
+    };
+    let plan = match begin {
+        SessionFileHttpUploadBegin::Write(plan) => plan,
+        SessionFileHttpUploadBegin::Complete(progress) => return Ok(progress),
+    };
+    let reserved_range = plan.reserved_range;
+    let mut inflight_guard =
+        HttpUploadInflightGuard::new(protocol.clone(), meta.clone(), reserved_range);
+    let file_result = match write_session_file_http_upload_files(plan, chunks) {
+        Ok(result) => result,
+        Err(error) => {
+            debug!(
+                session_id = %meta.session_id.0,
+                path = %meta.path,
+                upload_id = %meta.upload_id,
+                offset_bytes = meta.offset_bytes,
+                write_len,
+                code = error.code(),
+                "HTTP upload positional file write failed detail"
+            );
+            warn!(
+                session_id = %meta.session_id.0,
+                upload_id = %meta.upload_id,
+                offset_bytes = meta.offset_bytes,
+                write_len,
+                code = error.code(),
+                "HTTP upload positional file write failed"
+            );
+            inflight_guard.cancel_now().await;
+            return Err(error);
+        }
+    };
+    inflight_guard.mark_written(file_result);
+    let commit = match inflight_guard.commit_now().await {
+        Ok(commit) => commit,
+        Err(error) => {
+            debug!(
+                session_id = %meta.session_id.0,
+                path = %meta.path,
+                upload_id = %meta.upload_id,
+                offset_bytes = meta.offset_bytes,
+                write_len,
+                code = error.code(),
+                "HTTP upload commit failed detail"
+            );
+            warn!(
+                session_id = %meta.session_id.0,
+                upload_id = %meta.upload_id,
+                offset_bytes = meta.offset_bytes,
+                write_len,
+                code = error.code(),
+                "HTTP upload commit failed"
+            );
+            return Err(error);
+        }
+    };
+    match commit {
+        SessionFileHttpUploadCommit::Progress(progress) => Ok(progress),
+        SessionFileHttpUploadCommit::Complete(progress) => Ok(progress),
+    }
+}
+
+async fn http_file_download(
+    State(protocol): State<SharedDaemonProtocol>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let auth = match http_e2ee_auth_from_headers(&headers, &method, uri.path()) {
+        Ok(auth) => auth,
+        Err(response) => return response,
+    };
+    let body = match read_http_e2ee_short_body(body).await {
+        Ok(body) => body,
+        Err(error) => return http_e2ee_error(StatusCode::BAD_REQUEST, error),
+    };
+    let mut protocol = protocol.lock().await;
+    let (device_id, mut e2ee) = match protocol.open_http_e2ee_session(auth) {
+        Ok(result) => result,
+        Err(error) => return http_e2ee_error(StatusCode::UNAUTHORIZED, error),
+    };
+    let payload: SessionFileHttpDownloadPayload =
+        match decrypt_single_http_e2ee_json(&mut e2ee, &body) {
+            Ok(payload) => payload,
+            Err(error) => return http_e2ee_error(StatusCode::BAD_REQUEST, error),
+        };
+    let mut connection = ProtocolConnection::authenticated_http(device_id);
+    if let Err(error) = protocol.attach_session(
+        &mut connection,
+        SessionAttachPayload {
+            session_id: payload.session_id,
+            watch_updates: false,
+            last_terminal_seq: None,
+        },
+    ) {
+        return http_e2ee_encrypted_error(&mut e2ee, StatusCode::BAD_REQUEST, error);
+    }
+    let (ready, mut file, offset) =
+        match protocol.prepare_session_file_http_download(&connection, payload) {
+            Ok(result) => result,
+            Err(error) => {
+                connection.close(&mut protocol);
+                return http_e2ee_encrypted_error(&mut e2ee, StatusCode::BAD_REQUEST, error);
+            }
+        };
+    connection.close(&mut protocol);
+    drop(protocol);
+
+    if file.seek(SeekFrom::Start(offset)).is_err() {
+        return http_e2ee_encrypted_error(
+            &mut e2ee,
+            StatusCode::BAD_REQUEST,
+            ProtocolError::InvalidEnvelope,
+        );
+    }
+    let remaining = ready
+        .size_bytes
+        .checked_sub(offset)
+        .ok_or(ProtocolError::InvalidEnvelope)
+        .map_err(|error| http_e2ee_encrypted_error(&mut e2ee, StatusCode::BAD_REQUEST, error));
+    let remaining = match remaining {
+        Ok(remaining) => remaining,
+        Err(response) => return response,
+    };
+    // 中文注释：只有文件已经可读并完成 seek 后才加密 ready 帧。否则错误响应会
+    // 使用“跳过 ready 帧后”的 E2EE 序号，客户端收到第一帧错误时无法解密。
+    let mut ready_body = Vec::new();
+    if let Err(error) = append_http_e2ee_json_frame(&mut e2ee, &mut ready_body, &ready) {
+        return http_e2ee_error(StatusCode::INTERNAL_SERVER_ERROR, error);
+    }
+    let stream = futures_util::stream::unfold(
+        (
+            Some(ready_body),
+            file,
+            e2ee,
+            vec![0_u8; 256 * 1024],
+            remaining,
+        ),
+        |(mut ready_body, mut file, mut e2ee, mut chunk, mut remaining)| async move {
+            if let Some(body) = ready_body.take() {
+                return Some((
+                    Ok::<Bytes, io::Error>(Bytes::from(body)),
+                    (ready_body, file, e2ee, chunk, remaining),
+                ));
+            }
+            if remaining == 0 {
+                return None;
+            }
+            let max_read = chunk.len().min(remaining as usize);
+            let read = match file.read(&mut chunk[..max_read]) {
+                Ok(read) => read,
+                Err(error) => {
+                    return Some((Err(error), (ready_body, file, e2ee, chunk, remaining)));
+                }
+            };
+            if read == 0 {
+                return Some((
+                    Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "file ended before advertised download size",
+                    )),
+                    (ready_body, file, e2ee, chunk, remaining),
+                ));
+            }
+            let mut body = Vec::new();
+            if append_http_e2ee_binary_frame(&mut e2ee, &mut body, &chunk[..read]).is_err() {
+                return Some((
+                    Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "failed to encrypt HTTP E2EE download frame",
+                    )),
+                    (ready_body, file, e2ee, chunk, remaining),
+                ));
+            }
+            remaining = remaining.saturating_sub(read as u64);
+            Some((
+                Ok::<Bytes, io::Error>(Bytes::from(body)),
+                (ready_body, file, e2ee, chunk, remaining),
+            ))
+        },
+    );
+    (StatusCode::OK, Body::from_stream(stream)).into_response()
+}
+
+fn http_e2ee_auth_from_headers(
+    headers: &HeaderMap,
+    method: &Method,
+    path: &str,
+) -> Result<HttpE2eeAuthPayload, Response> {
+    let device_id = http_header(headers, "x-termd-device-id")?
+        .parse()
+        .map(termd_proto::DeviceId)
+        .map_err(|_| http_e2ee_error(StatusCode::UNAUTHORIZED, ProtocolError::AuthFailed))?;
+    let e2ee_public_key = PublicKey(http_header(headers, "x-termd-e2ee-public-key")?.to_owned());
+    let nonce = termd_proto::Nonce(http_header(headers, "x-termd-e2ee-nonce")?.to_owned());
+    let timestamp_ms = http_header(headers, "x-termd-e2ee-timestamp-ms")?
+        .parse()
+        .map(UnixTimestampMillis)
+        .map_err(|_| http_e2ee_error(StatusCode::UNAUTHORIZED, ProtocolError::AuthFailed))?;
+    let signature = Signature(http_header(headers, "x-termd-e2ee-signature")?.to_owned());
+
+    Ok(HttpE2eeAuthPayload {
+        device_id,
+        e2ee_public_key,
+        nonce,
+        timestamp_ms,
+        method: method.as_str().to_owned(),
+        path: path.to_owned(),
+        signature,
+    })
+}
+
+fn http_header<'a>(headers: &'a HeaderMap, name: &str) -> Result<&'a str, Response> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(ErrorPayload {
+                    code: "http_e2ee_required".to_owned(),
+                    message: "HTTP E2EE headers are required".to_owned(),
+                }),
+            )
+                .into_response()
+        })
+}
+
+async fn read_http_e2ee_short_body(body: Body) -> Result<Bytes, ProtocolError> {
+    // 中文注释：upload init 和 download metadata 都是短请求；不能让慢客户端无限占住
+    // daemon handler。真正的大文件 upload body 不走这里，仍由连接背压自然推进。
+    match timeout(
+        HTTP_E2EE_SHORT_BODY_TIMEOUT,
+        to_bytes(body, HTTP_E2EE_INIT_MAX_BYTES),
+    )
+    .await
+    {
+        Ok(Ok(body)) => Ok(body),
+        Ok(Err(_)) | Err(_) => Err(ProtocolError::InvalidEnvelope),
+    }
+}
+
+async fn read_http_e2ee_metadata_frame(
+    stream: &mut HttpE2eeBodyFrameStream,
+    e2ee: &mut super::E2eeSession,
+) -> Result<Vec<u8>, ProtocolError> {
+    // 中文注释：upload 长流只有首个 metadata frame 是短控制信息；它必须快速到达。
+    // 后续文件内容不设置整体耗时上限，避免弱网大文件上传被误杀。
+    match timeout(HTTP_E2EE_SHORT_BODY_TIMEOUT, stream.next_plaintext(e2ee)).await {
+        Ok(Ok(Some(frame))) => Ok(frame),
+        Ok(Ok(None)) => Err(ProtocolError::InvalidEnvelope),
+        Ok(Err(error)) => Err(error),
+        Err(_) => Err(ProtocolError::InvalidEnvelope),
+    }
+}
+
+fn decrypt_single_http_e2ee_json<T>(
+    e2ee: &mut super::E2eeSession,
+    body: &Bytes,
+) -> Result<T, ProtocolError>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let mut frames = decrypt_http_e2ee_frames(e2ee, body)?;
+    if frames.len() != 1 {
+        return Err(ProtocolError::InvalidEnvelope);
+    }
+    serde_json::from_slice(&frames.remove(0)).map_err(|_| ProtocolError::InvalidEnvelope)
+}
+
+fn decrypt_http_e2ee_frames(
+    e2ee: &mut super::E2eeSession,
+    body: &Bytes,
+) -> Result<Vec<Vec<u8>>, ProtocolError> {
+    let mut offset = 0;
+    let mut frames = Vec::new();
+    while offset < body.len() {
+        let frame = read_http_e2ee_frame(body, &mut offset)?;
+        let binary =
+            decode_binary_encrypted_frame(frame).map_err(|_| ProtocolError::InvalidEnvelope)?;
+        let plaintext = e2ee
+            .decrypt_binary_payload(&binary)
+            .map_err(|_| ProtocolError::InvalidEnvelope)?;
+        frames.push(plaintext);
+    }
+    Ok(frames)
+}
+
+struct HttpE2eeBodyFrameStream {
+    stream: axum::body::BodyDataStream,
+    pending: Vec<u8>,
+    buffered: Option<Bytes>,
+    buffered_offset: usize,
+}
+
+impl HttpE2eeBodyFrameStream {
+    fn new(body: Body) -> Self {
+        Self {
+            stream: body.into_data_stream(),
+            pending: Vec::new(),
+            buffered: None,
+            buffered_offset: 0,
+        }
+    }
+
+    async fn next_plaintext(
+        &mut self,
+        e2ee: &mut super::E2eeSession,
+    ) -> Result<Option<Vec<u8>>, ProtocolError> {
+        loop {
+            if let Some(frame) = self.try_pop_frame()? {
+                let binary = decode_binary_encrypted_frame(&frame)
+                    .map_err(|_| ProtocolError::InvalidEnvelope)?;
+                return e2ee
+                    .decrypt_binary_payload(&binary)
+                    .map(Some)
+                    .map_err(|_| ProtocolError::InvalidEnvelope);
+            }
+            if self.drain_buffered_body_bytes()? {
+                continue;
+            }
+            match self.stream.next().await {
+                Some(Ok(bytes)) if bytes.is_empty() => {}
+                Some(Ok(bytes)) => {
+                    self.buffered = Some(bytes);
+                    self.buffered_offset = 0;
+                }
+                Some(Err(_)) => return Err(ProtocolError::InvalidEnvelope),
+                None if self.pending.is_empty() => return Ok(None),
+                None => return Err(ProtocolError::InvalidEnvelope),
+            }
+        }
+    }
+
+    fn drain_buffered_body_bytes(&mut self) -> Result<bool, ProtocolError> {
+        let Some(bytes) = self.buffered.as_ref() else {
+            return Ok(false);
+        };
+        if self.buffered_offset >= bytes.len() {
+            self.buffered = None;
+            self.buffered_offset = 0;
+            return Ok(false);
+        }
+        let capacity = HTTP_E2EE_MAX_PENDING_BYTES.saturating_sub(self.pending.len());
+        if capacity == 0 {
+            return Err(ProtocolError::InvalidEnvelope);
+        }
+        // 中文注释：底层 HTTP body chunk 可能合并多个合法 E2EE frame；分段搬入
+        // pending，既保留 append 前内存上限，也允许大 coalesced chunk 被逐帧消费。
+        let remaining = bytes.len().saturating_sub(self.buffered_offset);
+        let take = capacity.min(remaining);
+        let end = self.buffered_offset.saturating_add(take);
+        self.pending
+            .extend_from_slice(&bytes[self.buffered_offset..end]);
+        self.buffered_offset = end;
+        if self.buffered_offset >= bytes.len() {
+            self.buffered = None;
+            self.buffered_offset = 0;
+        }
+        Ok(true)
+    }
+
+    fn try_pop_frame(&mut self) -> Result<Option<Vec<u8>>, ProtocolError> {
+        if self.pending.len() < HTTP_E2EE_FRAME_LEN_BYTES {
+            return Ok(None);
+        }
+        let len = u32::from_be_bytes(
+            self.pending[0..HTTP_E2EE_FRAME_LEN_BYTES]
+                .try_into()
+                .map_err(|_| ProtocolError::InvalidEnvelope)?,
+        ) as usize;
+        if len == 0 || len > HTTP_E2EE_MAX_FRAME_BYTES {
+            return Err(ProtocolError::InvalidEnvelope);
+        }
+        let frame_end = HTTP_E2EE_FRAME_LEN_BYTES.saturating_add(len);
+        if self.pending.len() < frame_end {
+            return Ok(None);
+        }
+        let frame = self.pending[HTTP_E2EE_FRAME_LEN_BYTES..frame_end].to_vec();
+        self.pending.drain(0..frame_end);
+        Ok(Some(frame))
+    }
+}
+
+fn encrypt_single_http_e2ee_json<T>(
+    e2ee: &mut super::E2eeSession,
+    payload: &T,
+) -> Result<Body, ProtocolError>
+where
+    T: serde::Serialize,
+{
+    let mut body = Vec::new();
+    append_http_e2ee_json_frame(e2ee, &mut body, payload)?;
+    Ok(Body::from(body))
+}
+
+fn append_http_e2ee_json_frame<T>(
+    e2ee: &mut super::E2eeSession,
+    body: &mut Vec<u8>,
+    payload: &T,
+) -> Result<(), ProtocolError>
+where
+    T: serde::Serialize,
+{
+    let plaintext = serde_json::to_vec(payload).map_err(|_| ProtocolError::InvalidEnvelope)?;
+    append_http_e2ee_binary_frame(e2ee, body, &plaintext)
+}
+
+fn append_http_e2ee_binary_frame(
+    e2ee: &mut super::E2eeSession,
+    body: &mut Vec<u8>,
+    plaintext: &[u8],
+) -> Result<(), ProtocolError> {
+    let encrypted = e2ee
+        .encrypt_binary_payload(plaintext)
+        .map_err(|_| ProtocolError::InvalidEnvelope)?;
+    body.extend_from_slice(&write_http_e2ee_frame(&encode_binary_encrypted_frame(
+        &encrypted,
+    )));
+    Ok(())
+}
+
+fn read_http_e2ee_frame<'a>(body: &'a [u8], offset: &mut usize) -> Result<&'a [u8], ProtocolError> {
+    if body.len().saturating_sub(*offset) < HTTP_E2EE_FRAME_LEN_BYTES {
+        return Err(ProtocolError::InvalidEnvelope);
+    }
+    let len = u32::from_be_bytes(
+        body[*offset..*offset + HTTP_E2EE_FRAME_LEN_BYTES]
+            .try_into()
+            .map_err(|_| ProtocolError::InvalidEnvelope)?,
+    ) as usize;
+    *offset += HTTP_E2EE_FRAME_LEN_BYTES;
+    if len == 0 || len > HTTP_E2EE_MAX_FRAME_BYTES || body.len().saturating_sub(*offset) < len {
+        return Err(ProtocolError::InvalidEnvelope);
+    }
+    let frame = &body[*offset..*offset + len];
+    *offset += len;
+    Ok(frame)
+}
+
+fn write_http_e2ee_frame(frame: &[u8]) -> Vec<u8> {
+    let len = u32::try_from(frame.len()).expect("HTTP E2EE frame length should fit u32");
+    let mut out = Vec::with_capacity(HTTP_E2EE_FRAME_LEN_BYTES + frame.len());
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(frame);
+    out
+}
+
+fn http_e2ee_error(status: StatusCode, error: ProtocolError) -> Response {
+    (
+        status,
+        Json(ErrorPayload {
+            code: error.code().to_owned(),
+            message: error.safe_message().to_owned(),
+        }),
+    )
+        .into_response()
+}
+
+fn http_e2ee_encrypted_error(
+    e2ee: &mut super::E2eeSession,
+    status: StatusCode,
+    error: ProtocolError,
+) -> Response {
+    let payload = ErrorPayload {
+        code: error.code().to_owned(),
+        message: error.safe_message().to_owned(),
+    };
+    match encrypt_single_http_e2ee_json(e2ee, &payload) {
+        Ok(body) => (status, body).into_response(),
+        Err(error) => http_e2ee_error(StatusCode::INTERNAL_SERVER_ERROR, error),
+    }
 }
 
 fn pairing_ws_url_from_config(config: &DaemonConfig, server_id: ServerId) -> String {
@@ -2180,20 +3188,24 @@ fn log_websocket_send(
 mod tests {
     use super::*;
     use base64::Engine as _;
+    use ed25519_dalek::{Signer, SigningKey};
+    use rand_core::OsRng;
     use serde::Deserialize;
     use std::fs;
     use std::io::{Read, Write};
     use std::path::PathBuf;
     use termd_proto::{
-        DeviceId, E2eeKeyExchangePayload, Envelope, PairAcceptPayload, PairRequestPayload,
-        PublicKey, SessionCreatePayload, SessionCreatedPayload, SessionDataPayload, TerminalSize,
-        UnixTimestampMillis,
+        DeviceId, E2eeKeyExchangePayload, Envelope, HttpE2eeAuthPayload, PairAcceptPayload,
+        PairRequestPayload, PublicKey, SessionCreatePayload, SessionCreatedPayload,
+        SessionDataPayload, SessionFileDownloadStreamReadyPayload, SessionFileHttpDownloadPayload,
+        SessionFileHttpUploadReadyPayload, SessionFileHttpUploadStreamPayload,
+        SessionFileUploadPayload, Signature, TerminalSize, UnixTimestampMillis,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::time::{Duration, timeout};
     use tokio_tungstenite::tungstenite::Message as ClientWsMessage;
 
-    use crate::auth::current_unix_timestamp_millis;
+    use crate::auth::{HttpE2eeSigningInput, current_unix_timestamp_millis};
     use crate::net::protocol::{
         ProtocolConnection, decode_payload, encrypted_frame_from_envelope, envelope_value,
     };
@@ -2207,7 +3219,6 @@ mod tests {
     };
     use axum::body::Body;
     use axum::http::Request;
-    use tower::ServiceExt as _;
 
     #[derive(Debug, Deserialize)]
     struct PairingTokenResponse {
@@ -2686,6 +3697,1076 @@ mod tests {
         assert_eq!(enabled_response.status(), StatusCode::OK);
     }
 
+    #[tokio::test]
+    async fn http_file_upload_init_requires_e2ee_headers() {
+        let protocol = test_protocol("http-file-upload-init-requires-e2ee");
+        let response = router(protocol, false)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/files/upload/init")
+                    .body(Body::empty())
+                    .expect("test request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn http_file_tunnel_rejects_non_file_routes_before_router_dispatch() {
+        let protocol = test_protocol("http-file-tunnel-allowlist");
+        let response = handle_http_file_tunnel_stream_request(
+            protocol,
+            "GET".to_owned(),
+            "/healthz".to_owned(),
+            Vec::new(),
+            Body::empty(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn http_file_upload_init_accepts_signed_e2ee_body() {
+        let protocol = test_protocol("http-file-upload-init-e2ee");
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let device_public_key =
+            PublicKey(test_ed25519_wire(signing_key.verifying_key().as_bytes()));
+        let (device_id, session_id) =
+            pair_real_device_and_create_session(protocol.clone(), device_public_key.clone()).await;
+        let server_id = protocol.lock().await.server_id();
+        let daemon_identity = protocol.lock().await.daemon_public_identity().clone();
+        let daemon_e2ee_public = protocol.lock().await.e2ee_public_key();
+        let http_keypair = E2eeKeyPair::generate();
+        let mut http_e2ee = E2eeSession::new(
+            E2eeSessionRole::Device,
+            &http_keypair,
+            daemon_e2ee_public,
+            E2eeSessionContext::new(
+                server_id,
+                device_id,
+                daemon_e2ee_public,
+                http_keypair.public_key(),
+            ),
+        )
+        .unwrap();
+        let path = "/api/files/upload/init";
+        let mut auth = HttpE2eeAuthPayload {
+            device_id,
+            e2ee_public_key: http_keypair.public_key_wire(),
+            nonce: termd_proto::Nonce("http-upload-init-nonce".to_owned()),
+            timestamp_ms: current_unix_timestamp_millis(),
+            method: "POST".to_owned(),
+            path: path.to_owned(),
+            signature: Signature("ed25519-v1:placeholder".to_owned()),
+        };
+        auth.signature = Signature(test_ed25519_wire(
+            &signing_key
+                .sign(&HttpE2eeSigningInput::from_payload(&auth, &daemon_identity).to_bytes())
+                .to_bytes(),
+        ));
+        let upload_path = format!("http-upload-{}.bin", session_id.0);
+        let encrypted = http_e2ee
+            .encrypt_binary_payload(
+                &serde_json::to_vec(&SessionFileUploadPayload {
+                    session_id,
+                    path: upload_path,
+                    size_bytes: 3,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        let request_body = write_http_e2ee_frame(&encode_binary_encrypted_frame(&encrypted));
+        let response = router(protocol, false)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("x-termd-device-id", device_id.0.to_string())
+                    .header("x-termd-e2ee-public-key", auth.e2ee_public_key.0)
+                    .header("x-termd-e2ee-nonce", auth.nonce.0)
+                    .header("x-termd-e2ee-timestamp-ms", auth.timestamp_ms.0.to_string())
+                    .header("x-termd-e2ee-signature", auth.signature.0)
+                    .body(Body::from(request_body))
+                    .expect("test request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let response_body = to_bytes(response.into_body(), HTTP_E2EE_INIT_MAX_BYTES)
+            .await
+            .unwrap();
+        let mut offset = 0;
+        let frame = read_http_e2ee_frame(&response_body, &mut offset).unwrap();
+        let encrypted = decode_binary_encrypted_frame(frame).unwrap();
+        let ready: SessionFileHttpUploadReadyPayload =
+            serde_json::from_slice(&http_e2ee.decrypt_binary_payload(&encrypted).unwrap()).unwrap();
+
+        assert_eq!(ready.session_id, session_id);
+        assert_eq!(ready.size_bytes, 3);
+        assert_eq!(ready.offset_bytes, 0);
+        assert!(!ready.upload_id.is_empty());
+        fs::remove_file(&ready.path).ok();
+    }
+
+    #[tokio::test]
+    async fn http_file_download_stream_stops_at_advertised_size() {
+        let root = std::env::temp_dir().join(format!(
+            "termd-http-download-exact-{}-{}",
+            std::process::id(),
+            current_unix_timestamp_millis().0
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let file_path = root.join("download.bin");
+        fs::write(&file_path, b"abc").unwrap();
+        let mut config = test_config("http-file-download-exact-size");
+        config.default_working_directory = Some(root.clone());
+        let protocol = default_protocol(config);
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let device_public_key =
+            PublicKey(test_ed25519_wire(signing_key.verifying_key().as_bytes()));
+        let (device_id, session_id) =
+            pair_real_device_and_create_session(protocol.clone(), device_public_key).await;
+        let server_id = protocol.lock().await.server_id();
+        let daemon_identity = protocol.lock().await.daemon_public_identity().clone();
+        let daemon_e2ee_public = protocol.lock().await.e2ee_public_key();
+        let http_keypair = E2eeKeyPair::generate();
+        let mut http_e2ee = E2eeSession::new(
+            E2eeSessionRole::Device,
+            &http_keypair,
+            daemon_e2ee_public,
+            E2eeSessionContext::new(
+                server_id,
+                device_id,
+                daemon_e2ee_public,
+                http_keypair.public_key(),
+            ),
+        )
+        .unwrap();
+        let path = "/api/files/download";
+        let mut auth = HttpE2eeAuthPayload {
+            device_id,
+            e2ee_public_key: http_keypair.public_key_wire(),
+            nonce: termd_proto::Nonce("http-download-exact-nonce".to_owned()),
+            timestamp_ms: current_unix_timestamp_millis(),
+            method: "POST".to_owned(),
+            path: path.to_owned(),
+            signature: Signature("ed25519-v1:placeholder".to_owned()),
+        };
+        auth.signature = Signature(test_ed25519_wire(
+            &signing_key
+                .sign(&HttpE2eeSigningInput::from_payload(&auth, &daemon_identity).to_bytes())
+                .to_bytes(),
+        ));
+        let encrypted = http_e2ee
+            .encrypt_binary_payload(
+                &serde_json::to_vec(&SessionFileHttpDownloadPayload {
+                    session_id,
+                    path: "download.bin".to_owned(),
+                    offset_bytes: 0,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        let request_body = write_http_e2ee_frame(&encode_binary_encrypted_frame(&encrypted));
+        let response = router(protocol, false)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("x-termd-device-id", device_id.0.to_string())
+                    .header("x-termd-e2ee-public-key", auth.e2ee_public_key.0)
+                    .header("x-termd-e2ee-nonce", auth.nonce.0)
+                    .header("x-termd-e2ee-timestamp-ms", auth.timestamp_ms.0.to_string())
+                    .header("x-termd-e2ee-signature", auth.signature.0)
+                    .body(Body::from(request_body))
+                    .expect("test request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        // 中文注释：handler 签发 ready 后文件继续增长时，本次 HTTP 响应仍只能发送
+        // ready 中声明的大小，不能把后续新增字节混入当前下载。
+        let mut appended = fs::OpenOptions::new()
+            .append(true)
+            .open(&file_path)
+            .unwrap();
+        appended.write_all(b"extra").unwrap();
+        drop(appended);
+
+        let response_body = to_bytes(response.into_body(), HTTP_E2EE_INIT_MAX_BYTES)
+            .await
+            .unwrap();
+        let mut offset = 0;
+        let ready_frame = read_http_e2ee_frame(&response_body, &mut offset).unwrap();
+        let ready_encrypted = decode_binary_encrypted_frame(ready_frame).unwrap();
+        let ready: SessionFileDownloadStreamReadyPayload =
+            serde_json::from_slice(&http_e2ee.decrypt_binary_payload(&ready_encrypted).unwrap())
+                .unwrap();
+        let data_frame = read_http_e2ee_frame(&response_body, &mut offset).unwrap();
+        let data_encrypted = decode_binary_encrypted_frame(data_frame).unwrap();
+        let bytes = http_e2ee.decrypt_binary_payload(&data_encrypted).unwrap();
+
+        assert_eq!(ready.size_bytes, 3);
+        assert_eq!(bytes, b"abc");
+        assert_eq!(offset, response_body.len());
+    }
+
+    #[tokio::test]
+    async fn http_file_download_business_error_is_e2ee_encrypted() {
+        let root = std::env::temp_dir().join(format!(
+            "termd-http-download-encrypted-error-{}-{}",
+            std::process::id(),
+            current_unix_timestamp_millis().0
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let mut config = test_config("http-file-download-encrypted-error");
+        config.default_working_directory = Some(root.clone());
+        let protocol = default_protocol(config);
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let device_public_key =
+            PublicKey(test_ed25519_wire(signing_key.verifying_key().as_bytes()));
+        let (device_id, session_id) =
+            pair_real_device_and_create_session(protocol.clone(), device_public_key).await;
+        let (request, mut http_e2ee) = signed_http_e2ee_request(
+            &protocol,
+            &signing_key,
+            device_id,
+            "/api/files/download",
+            "http-download-encrypted-business-error",
+            vec![
+                serde_json::to_vec(&SessionFileHttpDownloadPayload {
+                    session_id,
+                    path: "missing.bin".to_owned(),
+                    offset_bytes: 0,
+                })
+                .unwrap(),
+            ],
+        )
+        .await;
+
+        let response = router(protocol, false)
+            .oneshot(request)
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let response_body = to_bytes(response.into_body(), HTTP_E2EE_INIT_MAX_BYTES)
+            .await
+            .unwrap();
+        assert!(
+            serde_json::from_slice::<ErrorPayload>(&response_body).is_err(),
+            "post-auth HTTP E2EE business errors must not be plaintext JSON"
+        );
+        let mut offset = 0;
+        let frame = read_http_e2ee_frame(&response_body, &mut offset).unwrap();
+        let encrypted = decode_binary_encrypted_frame(frame).unwrap();
+        let error: ErrorPayload =
+            serde_json::from_slice(&http_e2ee.decrypt_binary_payload(&encrypted).unwrap()).unwrap();
+
+        assert!(
+            !error.code.is_empty(),
+            "客户端应能解开业务错误，具体错误码由协议层按失败原因决定"
+        );
+        assert_eq!(offset, response_body.len());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn http_file_upload_stream_accepts_split_frames_after_out_of_order_chunk() {
+        let root = std::env::temp_dir().join(format!(
+            "termd-http-upload-split-{}-{}",
+            std::process::id(),
+            current_unix_timestamp_millis().0
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let mut config = test_config("http-file-upload-split");
+        config.default_working_directory = Some(root.clone());
+        let protocol = default_protocol(config);
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = PublicKey(test_ed25519_wire(signing_key.verifying_key().as_bytes()));
+        let (device_id, session_id) =
+            pair_real_device_and_create_session(protocol.clone(), public_key).await;
+
+        let upload_init_path = "/api/files/upload/init";
+        let (request, mut upload_init_e2ee) = signed_http_e2ee_request(
+            &protocol,
+            &signing_key,
+            device_id,
+            upload_init_path,
+            "http-upload-split-init",
+            vec![
+                serde_json::to_vec(&SessionFileUploadPayload {
+                    session_id,
+                    path: "split.bin".to_owned(),
+                    size_bytes: 6,
+                })
+                .unwrap(),
+            ],
+        )
+        .await;
+        let response = router(protocol.clone(), false)
+            .oneshot(request)
+            .await
+            .expect("router should respond");
+        assert_eq!(response.status(), StatusCode::OK);
+        let response_body = to_bytes(response.into_body(), HTTP_E2EE_INIT_MAX_BYTES)
+            .await
+            .unwrap();
+        let mut offset = 0;
+        let ready_frame = read_http_e2ee_frame(&response_body, &mut offset).unwrap();
+        let ready_encrypted = decode_binary_encrypted_frame(ready_frame).unwrap();
+        let ready: SessionFileHttpUploadReadyPayload = serde_json::from_slice(
+            &upload_init_e2ee
+                .decrypt_binary_payload(&ready_encrypted)
+                .unwrap(),
+        )
+        .unwrap();
+
+        for (nonce, offset_bytes, frames) in [
+            (
+                "http-upload-split-tail",
+                3_u64,
+                vec![b"d".to_vec(), b"ef".to_vec()],
+            ),
+            (
+                "http-upload-split-head",
+                0_u64,
+                vec![b"a".to_vec(), b"bc".to_vec()],
+            ),
+        ] {
+            let mut plaintext_frames = vec![
+                serde_json::to_vec(&SessionFileHttpUploadStreamPayload {
+                    session_id,
+                    path: "split.bin".to_owned(),
+                    upload_id: ready.upload_id.clone(),
+                    size_bytes: 6,
+                    offset_bytes,
+                })
+                .unwrap(),
+            ];
+            plaintext_frames.extend(frames);
+            let (request, _upload_e2ee) = signed_http_e2ee_request(
+                &protocol,
+                &signing_key,
+                device_id,
+                "/api/files/upload",
+                nonce,
+                plaintext_frames,
+            )
+            .await;
+            let response = router(protocol.clone(), false)
+                .oneshot(request)
+                .await
+                .expect("router should respond");
+            assert_eq!(response.status(), StatusCode::OK);
+            let _ = to_bytes(response.into_body(), HTTP_E2EE_INIT_MAX_BYTES)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(fs::read(root.join("split.bin")).unwrap(), b"abcdef");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn http_file_upload_stream_error_does_not_abort_active_upload() {
+        let root = std::env::temp_dir().join(format!(
+            "termd-http-upload-stale-error-{}-{}",
+            std::process::id(),
+            current_unix_timestamp_millis().0
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let mut config = test_config("http-file-upload-stale-error");
+        config.default_working_directory = Some(root.clone());
+        let protocol = default_protocol(config);
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = PublicKey(test_ed25519_wire(signing_key.verifying_key().as_bytes()));
+        let (device_id, session_id) =
+            pair_real_device_and_create_session(protocol.clone(), public_key).await;
+
+        let (request, mut upload_init_e2ee) = signed_http_e2ee_request(
+            &protocol,
+            &signing_key,
+            device_id,
+            "/api/files/upload/init",
+            "http-upload-stale-error-init",
+            vec![
+                serde_json::to_vec(&SessionFileUploadPayload {
+                    session_id,
+                    path: "stale-error.bin".to_owned(),
+                    size_bytes: 6,
+                })
+                .unwrap(),
+            ],
+        )
+        .await;
+        let response = router(protocol.clone(), false)
+            .oneshot(request)
+            .await
+            .expect("router should respond");
+        assert_eq!(response.status(), StatusCode::OK);
+        let response_body = to_bytes(response.into_body(), HTTP_E2EE_INIT_MAX_BYTES)
+            .await
+            .unwrap();
+        let mut offset = 0;
+        let ready_frame = read_http_e2ee_frame(&response_body, &mut offset).unwrap();
+        let ready_encrypted = decode_binary_encrypted_frame(ready_frame).unwrap();
+        let ready: SessionFileHttpUploadReadyPayload = serde_json::from_slice(
+            &upload_init_e2ee
+                .decrypt_binary_payload(&ready_encrypted)
+                .unwrap(),
+        )
+        .unwrap();
+
+        for (nonce, offset_bytes, bytes, expected_status) in [
+            (
+                "http-upload-stale-error-head",
+                0_u64,
+                b"abc".to_vec(),
+                StatusCode::OK,
+            ),
+            (
+                "http-upload-stale-error-duplicate",
+                0_u64,
+                b"xxx".to_vec(),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "http-upload-stale-error-tail",
+                3_u64,
+                b"def".to_vec(),
+                StatusCode::OK,
+            ),
+        ] {
+            let (request, _upload_e2ee) = signed_http_e2ee_request(
+                &protocol,
+                &signing_key,
+                device_id,
+                "/api/files/upload",
+                nonce,
+                vec![
+                    serde_json::to_vec(&SessionFileHttpUploadStreamPayload {
+                        session_id,
+                        path: "stale-error.bin".to_owned(),
+                        upload_id: ready.upload_id.clone(),
+                        size_bytes: 6,
+                        offset_bytes,
+                    })
+                    .unwrap(),
+                    bytes,
+                ],
+            )
+            .await;
+            let response = router(protocol.clone(), false)
+                .oneshot(request)
+                .await
+                .expect("router should respond");
+            assert_eq!(response.status(), expected_status);
+            let _ = to_bytes(response.into_body(), HTTP_E2EE_INIT_MAX_BYTES)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(fs::read(root.join("stale-error.bin")).unwrap(), b"abcdef");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn http_file_upload_cancel_guard_releases_reserved_range() {
+        let root = std::env::temp_dir().join(format!(
+            "termd-http-upload-cancel-guard-{}-{}",
+            std::process::id(),
+            current_unix_timestamp_millis().0
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let mut config = test_config("http-file-upload-cancel-guard");
+        config.default_working_directory = Some(root.clone());
+        let protocol = default_protocol(config);
+        let creator_signing_key = SigningKey::generate(&mut OsRng);
+        let creator_public_key = PublicKey(test_ed25519_wire(
+            creator_signing_key.verifying_key().as_bytes(),
+        ));
+        let (_, session_id) =
+            pair_real_device_and_create_session(protocol.clone(), creator_public_key).await;
+        let http_signing_key = SigningKey::generate(&mut OsRng);
+        let http_public_key = PublicKey(test_ed25519_wire(
+            http_signing_key.verifying_key().as_bytes(),
+        ));
+        let http_device_id = pair_real_device(protocol.clone(), http_public_key).await;
+        let mut connection = ProtocolConnection::authenticated_http(http_device_id);
+        let ready = {
+            let mut protocol_guard = protocol.lock().await;
+            protocol_guard
+                .attach_session(
+                    &mut connection,
+                    SessionAttachPayload {
+                        session_id,
+                        watch_updates: false,
+                        last_terminal_seq: None,
+                    },
+                )
+                .unwrap();
+            protocol_guard
+                .prepare_session_file_http_upload(
+                    &connection,
+                    SessionFileUploadPayload {
+                        session_id,
+                        path: "cancel-guard.bin".to_owned(),
+                        size_bytes: 3,
+                    },
+                    http_device_id,
+                )
+                .unwrap()
+        };
+        let meta = SessionFileHttpUploadStreamPayload {
+            session_id,
+            path: "cancel-guard.bin".to_owned(),
+            upload_id: ready.upload_id,
+            size_bytes: ready.size_bytes,
+            offset_bytes: 0,
+        };
+        let reserved_range = {
+            let mut protocol_guard = protocol.lock().await;
+            match protocol_guard
+                .begin_session_file_http_upload_write(&connection, meta.clone(), http_device_id, 3)
+                .unwrap()
+            {
+                SessionFileHttpUploadBegin::Write(plan) => plan.reserved_range,
+                SessionFileHttpUploadBegin::Complete(_) => {
+                    panic!("upload should still be active")
+                }
+            }
+        };
+
+        drop(HttpUploadInflightGuard::new(
+            protocol.clone(),
+            meta.clone(),
+            reserved_range,
+        ));
+        // 中文注释：Drop 里的释放任务是异步执行的；等它拿到 protocol lock 后，
+        // 同 offset 的重试才能重新预约并完成写入。
+        tokio::time::sleep(Duration::from_millis(25)).await;
+
+        let progress = write_http_file_upload_chunks_without_protocol_io_lock(
+            protocol.clone(),
+            &connection,
+            meta,
+            http_device_id,
+            vec![b"abc".to_vec()],
+        )
+        .await
+        .unwrap();
+
+        assert!(progress.eof);
+        assert_eq!(fs::read(root.join("cancel-guard.bin")).unwrap(), b"abc");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn http_file_upload_drop_after_file_write_commits_before_retry() {
+        let root = std::env::temp_dir().join(format!(
+            "termd-http-upload-drop-commit-{}-{}",
+            std::process::id(),
+            current_unix_timestamp_millis().0
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let mut config = test_config("http-file-upload-drop-commit");
+        config.default_working_directory = Some(root.clone());
+        let protocol = default_protocol(config);
+        let creator_signing_key = SigningKey::generate(&mut OsRng);
+        let creator_public_key = PublicKey(test_ed25519_wire(
+            creator_signing_key.verifying_key().as_bytes(),
+        ));
+        let (_, session_id) =
+            pair_real_device_and_create_session(protocol.clone(), creator_public_key).await;
+        let http_signing_key = SigningKey::generate(&mut OsRng);
+        let http_public_key = PublicKey(test_ed25519_wire(
+            http_signing_key.verifying_key().as_bytes(),
+        ));
+        let http_device_id = pair_real_device(protocol.clone(), http_public_key).await;
+        let mut connection = ProtocolConnection::authenticated_http(http_device_id);
+        let ready = {
+            let mut protocol_guard = protocol.lock().await;
+            protocol_guard
+                .attach_session(
+                    &mut connection,
+                    SessionAttachPayload {
+                        session_id,
+                        watch_updates: false,
+                        last_terminal_seq: None,
+                    },
+                )
+                .unwrap();
+            protocol_guard
+                .prepare_session_file_http_upload(
+                    &connection,
+                    SessionFileUploadPayload {
+                        session_id,
+                        path: "drop-commit.bin".to_owned(),
+                        size_bytes: 3,
+                    },
+                    http_device_id,
+                )
+                .unwrap()
+        };
+        let meta = SessionFileHttpUploadStreamPayload {
+            session_id,
+            path: "drop-commit.bin".to_owned(),
+            upload_id: ready.upload_id,
+            size_bytes: ready.size_bytes,
+            offset_bytes: 0,
+        };
+        let (reserved_range, file_result) = {
+            let mut protocol_guard = protocol.lock().await;
+            let plan = match protocol_guard
+                .begin_session_file_http_upload_write(&connection, meta.clone(), http_device_id, 3)
+                .unwrap()
+            {
+                SessionFileHttpUploadBegin::Write(plan) => plan,
+                SessionFileHttpUploadBegin::Complete(_) => panic!("upload should still be active"),
+            };
+            let reserved_range = plan.reserved_range;
+            drop(protocol_guard);
+            let file_result = write_session_file_http_upload_files(plan, vec![b"abc".to_vec()])
+                .expect("file write should succeed before handler drop");
+            (reserved_range, file_result)
+        };
+        let mut inflight_guard =
+            HttpUploadInflightGuard::new(protocol.clone(), meta.clone(), reserved_range);
+        inflight_guard.mark_written(file_result);
+        drop(inflight_guard);
+        // 中文注释：模拟 handler 在文件已经落盘、commit response 前被取消；
+        // Drop 必须补 commit，后续 retry 不能用不同内容覆盖同一区间。
+        tokio::time::sleep(Duration::from_millis(25)).await;
+
+        let retry = write_http_file_upload_chunks_without_protocol_io_lock(
+            protocol.clone(),
+            &connection,
+            meta,
+            http_device_id,
+            vec![b"xxx".to_vec()],
+        )
+        .await
+        .unwrap();
+
+        assert!(retry.eof);
+        assert_eq!(fs::read(root.join("drop-commit.bin")).unwrap(), b"abc");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn http_file_upload_connection_guard_detaches_on_drop() {
+        let root = std::env::temp_dir().join(format!(
+            "termd-http-upload-connection-drop-{}-{}",
+            std::process::id(),
+            current_unix_timestamp_millis().0
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let mut config = test_config("http-file-upload-connection-drop");
+        config.default_working_directory = Some(root.clone());
+        let protocol = default_protocol(config);
+        let creator_signing_key = SigningKey::generate(&mut OsRng);
+        let creator_public_key = PublicKey(test_ed25519_wire(
+            creator_signing_key.verifying_key().as_bytes(),
+        ));
+        let (_, session_id) =
+            pair_real_device_and_create_session(protocol.clone(), creator_public_key).await;
+        let http_signing_key = SigningKey::generate(&mut OsRng);
+        let http_public_key = PublicKey(test_ed25519_wire(
+            http_signing_key.verifying_key().as_bytes(),
+        ));
+        let http_device_id = pair_real_device(protocol.clone(), http_public_key).await;
+        let mut connection = ProtocolConnection::authenticated_http(http_device_id);
+        {
+            let mut protocol_guard = protocol.lock().await;
+            protocol_guard
+                .attach_session(
+                    &mut connection,
+                    SessionAttachPayload {
+                        session_id,
+                        watch_updates: false,
+                        last_terminal_seq: None,
+                    },
+                )
+                .unwrap();
+        }
+        drop(HttpConnectionCloseGuard::new(protocol.clone(), connection));
+        tokio::time::sleep(Duration::from_millis(25)).await;
+
+        assert_http_device_detached(&protocol, session_id, http_device_id).await;
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn http_file_handlers_detach_temporary_runtime_connection() {
+        let root = std::env::temp_dir().join(format!(
+            "termd-http-file-detach-{}-{}",
+            std::process::id(),
+            current_unix_timestamp_millis().0
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let mut config = test_config("http-file-detach");
+        config.default_working_directory = Some(root);
+        let protocol = default_protocol(config);
+        let creator_signing_key = SigningKey::generate(&mut OsRng);
+        let creator_public_key = PublicKey(test_ed25519_wire(
+            creator_signing_key.verifying_key().as_bytes(),
+        ));
+        let (_, session_id) =
+            pair_real_device_and_create_session(protocol.clone(), creator_public_key).await;
+        let http_signing_key = SigningKey::generate(&mut OsRng);
+        let http_public_key = PublicKey(test_ed25519_wire(
+            http_signing_key.verifying_key().as_bytes(),
+        ));
+        let http_device_id = pair_real_device(protocol.clone(), http_public_key).await;
+        assert_http_device_detached(&protocol, session_id, http_device_id).await;
+
+        let upload_init_path = "/api/files/upload/init";
+        let (request, mut upload_init_e2ee) = signed_http_e2ee_request(
+            &protocol,
+            &http_signing_key,
+            http_device_id,
+            upload_init_path,
+            "http-file-detach-upload-init",
+            vec![
+                serde_json::to_vec(&SessionFileUploadPayload {
+                    session_id,
+                    path: "detach.bin".to_owned(),
+                    size_bytes: 3,
+                })
+                .unwrap(),
+            ],
+        )
+        .await;
+        let response = router(protocol.clone(), false)
+            .oneshot(request)
+            .await
+            .expect("router should respond");
+        assert_eq!(response.status(), StatusCode::OK);
+        let response_body = to_bytes(response.into_body(), HTTP_E2EE_INIT_MAX_BYTES)
+            .await
+            .unwrap();
+        let mut offset = 0;
+        let ready_frame = read_http_e2ee_frame(&response_body, &mut offset).unwrap();
+        let ready_encrypted = decode_binary_encrypted_frame(ready_frame).unwrap();
+        let ready: SessionFileHttpUploadReadyPayload = serde_json::from_slice(
+            &upload_init_e2ee
+                .decrypt_binary_payload(&ready_encrypted)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_http_device_detached(&protocol, session_id, http_device_id).await;
+
+        let upload_path = "/api/files/upload";
+        let (request, _upload_e2ee) = signed_http_e2ee_request(
+            &protocol,
+            &http_signing_key,
+            http_device_id,
+            upload_path,
+            "http-file-detach-upload-stream",
+            vec![
+                serde_json::to_vec(&SessionFileHttpUploadStreamPayload {
+                    session_id,
+                    path: "detach.bin".to_owned(),
+                    upload_id: ready.upload_id,
+                    size_bytes: 3,
+                    offset_bytes: 0,
+                })
+                .unwrap(),
+                b"abc".to_vec(),
+            ],
+        )
+        .await;
+        let response = router(protocol.clone(), false)
+            .oneshot(request)
+            .await
+            .expect("router should respond");
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = to_bytes(response.into_body(), HTTP_E2EE_INIT_MAX_BYTES)
+            .await
+            .unwrap();
+        assert_http_device_detached(&protocol, session_id, http_device_id).await;
+
+        let download_path = "/api/files/download";
+        let (request, _download_e2ee) = signed_http_e2ee_request(
+            &protocol,
+            &http_signing_key,
+            http_device_id,
+            download_path,
+            "http-file-detach-download",
+            vec![
+                serde_json::to_vec(&SessionFileHttpDownloadPayload {
+                    session_id,
+                    path: "detach.bin".to_owned(),
+                    offset_bytes: 0,
+                })
+                .unwrap(),
+            ],
+        )
+        .await;
+        let response = router(protocol.clone(), false)
+            .oneshot(request)
+            .await
+            .expect("router should respond");
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = to_bytes(response.into_body(), HTTP_E2EE_INIT_MAX_BYTES)
+            .await
+            .unwrap();
+        assert_http_device_detached(&protocol, session_id, http_device_id).await;
+    }
+
+    #[tokio::test]
+    async fn http_file_handlers_do_not_decrement_active_client_history_counts() {
+        let root = std::env::temp_dir().join(format!(
+            "termd-http-file-history-{}-{}",
+            std::process::id(),
+            current_unix_timestamp_millis().0
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let mut config = test_config("http-file-history");
+        config.default_working_directory = Some(root);
+        let protocol = default_protocol(config);
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = PublicKey(test_ed25519_wire(signing_key.verifying_key().as_bytes()));
+
+        let (device_id, session_id, mut live_connection, live_device_session) = {
+            let mut protocol_guard = protocol.lock().await;
+            let (mut connection, _) = protocol_guard.start_connection();
+            let device_id = DeviceId::new();
+            let device_keypair = E2eeKeyPair::generate();
+            let mut device_session = open_test_e2ee(
+                &mut protocol_guard,
+                &mut connection,
+                device_id,
+                &device_keypair,
+            );
+            let pair_request = envelope_value(
+                MessageType::PairRequest,
+                PairRequestPayload {
+                    device_id,
+                    device_public_key: public_key.clone(),
+                    token: protocol_guard
+                        .issue_pairing_token(current_unix_timestamp_millis())
+                        .unwrap()
+                        .token()
+                        .clone(),
+                    nonce: termd_proto::Nonce("http-file-history-pair".to_owned()),
+                    timestamp_ms: current_unix_timestamp_millis(),
+                },
+            )
+            .unwrap();
+            let frame = device_session.encrypt_json_payload(&pair_request).unwrap();
+            let pair_responses = connection.handle_wire_envelope(
+                &mut protocol_guard,
+                envelope_value(MessageType::EncryptedFrame, frame).unwrap(),
+            );
+            let response_frame =
+                encrypted_frame_from_envelope(pair_responses.into_iter().next().unwrap()).unwrap();
+            let pair_accept = device_session
+                .decrypt_json_payload::<JsonEnvelope>(&response_frame)
+                .unwrap();
+            assert_eq!(pair_accept.kind, MessageType::PairAccept);
+
+            let create_request = envelope_value(
+                MessageType::SessionCreate,
+                SessionCreatePayload {
+                    command: vec!["sh".to_owned()],
+                    size: TerminalSize::default(),
+                },
+            )
+            .unwrap();
+            let create_frame = device_session
+                .encrypt_json_payload(&create_request)
+                .unwrap();
+            let create_responses = connection.handle_wire_envelope(
+                &mut protocol_guard,
+                envelope_value(MessageType::EncryptedFrame, create_frame).unwrap(),
+            );
+            let created_frame = encrypted_frame_from_envelope(
+                create_responses
+                    .into_iter()
+                    .next()
+                    .expect("session create should return a response"),
+            )
+            .unwrap();
+            let created_envelope = device_session
+                .decrypt_json_payload::<JsonEnvelope>(&created_frame)
+                .unwrap();
+            let created_payload: SessionCreatedPayload =
+                decode_payload(created_envelope.payload).unwrap();
+            let session_id = created_payload.session_id;
+            assert_eq!(
+                protocol_guard
+                    .client_history_active_connection_count_for_test(device_id)
+                    .unwrap(),
+                Some(1)
+            );
+            (device_id, session_id, connection, device_session)
+        };
+
+        let upload_init_path = "/api/files/upload/init";
+        let (request, _http_e2ee) = signed_http_e2ee_request(
+            &protocol,
+            &signing_key,
+            device_id,
+            upload_init_path,
+            "http-file-history-upload-init",
+            vec![
+                serde_json::to_vec(&SessionFileUploadPayload {
+                    session_id,
+                    path: "history.bin".to_owned(),
+                    size_bytes: 0,
+                })
+                .unwrap(),
+            ],
+        )
+        .await;
+        let response = router(protocol.clone(), false)
+            .oneshot(request)
+            .await
+            .expect("router should respond");
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = to_bytes(response.into_body(), HTTP_E2EE_INIT_MAX_BYTES)
+            .await
+            .unwrap();
+
+        let protocol_guard = protocol.lock().await;
+        assert_eq!(
+            protocol_guard
+                .client_history_active_connection_count_for_test(device_id)
+                .unwrap(),
+            Some(1)
+        );
+        drop(protocol_guard);
+        drop(live_device_session);
+        let mut protocol_guard = protocol.lock().await;
+        live_connection.close(&mut protocol_guard);
+    }
+
+    #[tokio::test]
+    async fn http_e2ee_short_body_read_times_out() {
+        let body =
+            Body::from_stream(futures_util::stream::pending::<Result<Bytes, std::io::Error>>());
+
+        assert!(matches!(
+            read_http_e2ee_short_body(body).await,
+            Err(ProtocolError::InvalidEnvelope)
+        ));
+    }
+
+    #[tokio::test]
+    async fn http_e2ee_upload_metadata_frame_read_times_out() {
+        let daemon_keypair = E2eeKeyPair::generate();
+        let device_keypair = E2eeKeyPair::generate();
+        let mut e2ee = E2eeSession::new(
+            E2eeSessionRole::Daemon,
+            &daemon_keypair,
+            device_keypair.public_key(),
+            E2eeSessionContext::new(
+                ServerId::new(),
+                DeviceId::new(),
+                daemon_keypair.public_key(),
+                device_keypair.public_key(),
+            ),
+        )
+        .unwrap();
+        let body =
+            Body::from_stream(futures_util::stream::pending::<Result<Bytes, std::io::Error>>());
+        let mut stream = HttpE2eeBodyFrameStream::new(body);
+
+        assert!(matches!(
+            read_http_e2ee_metadata_frame(&mut stream, &mut e2ee).await,
+            Err(ProtocolError::InvalidEnvelope)
+        ));
+    }
+
+    #[tokio::test]
+    async fn http_e2ee_body_stream_rejects_oversized_pending_before_buffering() {
+        let daemon_keypair = E2eeKeyPair::generate();
+        let device_keypair = E2eeKeyPair::generate();
+        let mut e2ee = E2eeSession::new(
+            E2eeSessionRole::Daemon,
+            &daemon_keypair,
+            device_keypair.public_key(),
+            E2eeSessionContext::new(
+                ServerId::new(),
+                DeviceId::new(),
+                daemon_keypair.public_key(),
+                device_keypair.public_key(),
+            ),
+        )
+        .unwrap();
+        let raw = vec![0_u8; HTTP_E2EE_MAX_PENDING_BYTES + 1];
+        let mut stream = HttpE2eeBodyFrameStream::new(Body::from(raw));
+
+        assert!(matches!(
+            stream.next_plaintext(&mut e2ee).await,
+            Err(ProtocolError::InvalidEnvelope)
+        ));
+    }
+
+    #[tokio::test]
+    async fn http_e2ee_body_stream_accepts_coalesced_valid_frames() {
+        let daemon_keypair = E2eeKeyPair::generate();
+        let device_keypair = E2eeKeyPair::generate();
+        let server_id = ServerId::new();
+        let device_id = DeviceId::new();
+        let mut daemon_e2ee = E2eeSession::new(
+            E2eeSessionRole::Daemon,
+            &daemon_keypair,
+            device_keypair.public_key(),
+            E2eeSessionContext::new(
+                server_id,
+                device_id,
+                daemon_keypair.public_key(),
+                device_keypair.public_key(),
+            ),
+        )
+        .unwrap();
+        let mut device_e2ee = E2eeSession::new(
+            E2eeSessionRole::Device,
+            &device_keypair,
+            daemon_keypair.public_key(),
+            E2eeSessionContext::new(
+                server_id,
+                device_id,
+                daemon_keypair.public_key(),
+                device_keypair.public_key(),
+            ),
+        )
+        .unwrap();
+        let mut raw = Vec::new();
+        let frame_count = 10_u8;
+        for value in 0..frame_count {
+            append_http_e2ee_binary_frame(&mut device_e2ee, &mut raw, &vec![value; 256 * 1024])
+                .unwrap();
+        }
+        assert!(raw.len() > HTTP_E2EE_MAX_PENDING_BYTES);
+        let mut stream = HttpE2eeBodyFrameStream::new(Body::from(raw));
+
+        for value in 0..frame_count {
+            let plaintext = stream
+                .next_plaintext(&mut daemon_e2ee)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(plaintext, vec![value; 256 * 1024]);
+        }
+        assert!(
+            stream
+                .next_plaintext(&mut daemon_e2ee)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
     struct RawHttpResponse {
         status: u16,
         body: String,
@@ -3120,8 +5201,8 @@ mod tests {
 
     #[test]
     fn websocket_transport_limits_keep_frames_smaller_than_messages() {
-        assert_eq!(WEBSOCKET_MAX_FRAME_SIZE, 1024 * 1024);
-        assert_eq!(WEBSOCKET_MAX_MESSAGE_SIZE, 4 * 1024 * 1024);
+        assert_eq!(WEBSOCKET_MAX_FRAME_SIZE, 16 * 1024 * 1024);
+        assert_eq!(WEBSOCKET_MAX_MESSAGE_SIZE, 16 * 1024 * 1024);
         assert!(WEBSOCKET_MAX_FRAME_SIZE <= WEBSOCKET_MAX_MESSAGE_SIZE);
     }
 
@@ -3429,6 +5510,192 @@ zZZR5LzKVu9X7paftR7K8Q==
         assert_eq!(response.kind, MessageType::PairAccept);
         assert!(connection.is_authenticated());
         decode_payload(response.payload).unwrap()
+    }
+
+    async fn signed_http_e2ee_request(
+        protocol: &SharedDaemonProtocol,
+        signing_key: &SigningKey,
+        device_id: DeviceId,
+        path: &str,
+        nonce: &str,
+        plaintext_frames: Vec<Vec<u8>>,
+    ) -> (Request<Body>, E2eeSession) {
+        let protocol_guard = protocol.lock().await;
+        let server_id = protocol_guard.server_id();
+        let daemon_identity = protocol_guard.daemon_public_identity().clone();
+        let daemon_e2ee_public = protocol_guard.e2ee_public_key();
+        drop(protocol_guard);
+
+        let http_keypair = E2eeKeyPair::generate();
+        let mut http_e2ee = E2eeSession::new(
+            E2eeSessionRole::Device,
+            &http_keypair,
+            daemon_e2ee_public,
+            E2eeSessionContext::new(
+                server_id,
+                device_id,
+                daemon_e2ee_public,
+                http_keypair.public_key(),
+            ),
+        )
+        .unwrap();
+        let mut auth = HttpE2eeAuthPayload {
+            device_id,
+            e2ee_public_key: http_keypair.public_key_wire(),
+            nonce: termd_proto::Nonce(nonce.to_owned()),
+            timestamp_ms: current_unix_timestamp_millis(),
+            method: "POST".to_owned(),
+            path: path.to_owned(),
+            signature: Signature("ed25519-v1:placeholder".to_owned()),
+        };
+        auth.signature = Signature(test_ed25519_wire(
+            &signing_key
+                .sign(&HttpE2eeSigningInput::from_payload(&auth, &daemon_identity).to_bytes())
+                .to_bytes(),
+        ));
+
+        let mut request_body = Vec::new();
+        for plaintext in plaintext_frames {
+            let encrypted = http_e2ee.encrypt_binary_payload(&plaintext).unwrap();
+            request_body.extend(write_http_e2ee_frame(&encode_binary_encrypted_frame(
+                &encrypted,
+            )));
+        }
+
+        let request = Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("content-type", "application/octet-stream")
+            .header("x-termd-device-id", device_id.0.to_string())
+            .header("x-termd-e2ee-public-key", auth.e2ee_public_key.0)
+            .header("x-termd-e2ee-nonce", auth.nonce.0)
+            .header("x-termd-e2ee-timestamp-ms", auth.timestamp_ms.0.to_string())
+            .header("x-termd-e2ee-signature", auth.signature.0)
+            .body(Body::from(request_body))
+            .expect("test request should build");
+
+        (request, http_e2ee)
+    }
+
+    async fn assert_http_device_detached(
+        protocol: &SharedDaemonProtocol,
+        session_id: SessionId,
+        device_id: DeviceId,
+    ) {
+        let mut protocol = protocol.lock().await;
+        assert!(matches!(
+            protocol.runtime_write_input_as_device_for_test(session_id, device_id, b""),
+            Err(ProtocolError::RuntimeFailed)
+        ));
+    }
+
+    async fn pair_real_device(
+        protocol: SharedDaemonProtocol,
+        device_public_key: PublicKey,
+    ) -> DeviceId {
+        let mut protocol = protocol.lock().await;
+        let pairing_token = protocol
+            .issue_pairing_token(current_unix_timestamp_millis())
+            .unwrap()
+            .token()
+            .clone();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let device_keypair = E2eeKeyPair::generate();
+        let mut device_session =
+            open_test_e2ee(&mut protocol, &mut connection, device_id, &device_keypair);
+        let pair_request = envelope_value(
+            MessageType::PairRequest,
+            PairRequestPayload {
+                device_id,
+                device_public_key,
+                token: pairing_token,
+                nonce: termd_proto::Nonce("http-real-device-pair-only".to_owned()),
+                timestamp_ms: current_unix_timestamp_millis(),
+            },
+        )
+        .unwrap();
+        let frame = device_session.encrypt_json_payload(&pair_request).unwrap();
+        let pair_responses = connection.handle_wire_envelope(
+            &mut protocol,
+            envelope_value(MessageType::EncryptedFrame, frame).unwrap(),
+        );
+        let response_frame =
+            encrypted_frame_from_envelope(pair_responses.into_iter().next().unwrap()).unwrap();
+        let pair_accept = device_session
+            .decrypt_json_payload::<JsonEnvelope>(&response_frame)
+            .unwrap();
+        assert_eq!(pair_accept.kind, MessageType::PairAccept);
+        connection.close(&mut protocol);
+        device_id
+    }
+
+    async fn pair_real_device_and_create_session(
+        protocol: SharedDaemonProtocol,
+        device_public_key: PublicKey,
+    ) -> (DeviceId, SessionId) {
+        let mut protocol = protocol.lock().await;
+        let pairing_token = protocol
+            .issue_pairing_token(current_unix_timestamp_millis())
+            .unwrap()
+            .token()
+            .clone();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let device_keypair = E2eeKeyPair::generate();
+        let mut device_session =
+            open_test_e2ee(&mut protocol, &mut connection, device_id, &device_keypair);
+        let pair_request = envelope_value(
+            MessageType::PairRequest,
+            PairRequestPayload {
+                device_id,
+                device_public_key,
+                token: pairing_token,
+                nonce: termd_proto::Nonce("http-real-device-pair".to_owned()),
+                timestamp_ms: current_unix_timestamp_millis(),
+            },
+        )
+        .unwrap();
+        let frame = device_session.encrypt_json_payload(&pair_request).unwrap();
+        let pair_responses = connection.handle_wire_envelope(
+            &mut protocol,
+            envelope_value(MessageType::EncryptedFrame, frame).unwrap(),
+        );
+        let response_frame =
+            encrypted_frame_from_envelope(pair_responses.into_iter().next().unwrap()).unwrap();
+        let pair_accept = device_session
+            .decrypt_json_payload::<JsonEnvelope>(&response_frame)
+            .unwrap();
+        assert_eq!(pair_accept.kind, MessageType::PairAccept);
+
+        let create = envelope_value(
+            MessageType::SessionCreate,
+            SessionCreatePayload {
+                command: vec!["sh".to_owned(), "-lc".to_owned(), "cat".to_owned()],
+                size: TerminalSize::default(),
+            },
+        )
+        .unwrap();
+        let frame = device_session.encrypt_json_payload(&create).unwrap();
+        let create_responses = connection.handle_wire_envelope(
+            &mut protocol,
+            envelope_value(MessageType::EncryptedFrame, frame).unwrap(),
+        );
+        let response_frame =
+            encrypted_frame_from_envelope(create_responses.into_iter().next().unwrap()).unwrap();
+        let created = device_session
+            .decrypt_json_payload::<JsonEnvelope>(&response_frame)
+            .unwrap();
+        assert_eq!(created.kind, MessageType::SessionCreated);
+        let payload: SessionCreatedPayload = decode_payload(created.payload).unwrap();
+        (device_id, payload.session_id)
+    }
+
+    fn test_ed25519_wire(bytes: &[u8]) -> String {
+        format!(
+            "ed25519-v1:{}",
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        )
     }
 
     fn open_test_e2ee(

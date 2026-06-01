@@ -32,6 +32,9 @@ pub const DEFAULT_LISTEN_PORT: u16 = 8765;
 /// pairing token 的默认有效期：5 分钟。
 pub const DEFAULT_PAIRING_TOKEN_TTL_MS: u64 = 5 * 60 * 1000;
 
+/// 覆盖新建 PTY session 默认工作目录的环境变量。
+const ENV_DEFAULT_WORKING_DIRECTORY: &str = "TERMD_DEFAULT_WORKING_DIRECTORY";
+
 /// daemon 主动连接 relay 的默认初始退避。
 pub const DEFAULT_RELAY_RECONNECT_INITIAL_DELAY_MS: u64 = 250;
 
@@ -479,7 +482,11 @@ fn platform_default_shell() -> String {
 }
 
 fn default_working_directory() -> Option<PathBuf> {
-    std::env::var_os("HOME")
+    // 中文注释：systemd/测试环境可以用专用变量覆盖新建 session 的默认 cwd；
+    // 不复用 HOME，避免影响 cargo、shell 配置和用户身份相关路径。
+    std::env::var_os(ENV_DEFAULT_WORKING_DIRECTORY)
+        .filter(|path| !path.is_empty())
+        .or_else(|| std::env::var_os("HOME"))
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
         .filter(|path| !path.as_os_str().is_empty())

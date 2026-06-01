@@ -1236,6 +1236,9 @@ mod tests {
         #[derive(Clone, Default)]
         struct MockMuxState {
             attempts: Arc<AtomicUsize>,
+            control_attempts: Arc<AtomicUsize>,
+            data_attempts: Arc<AtomicUsize>,
+            early_closes: Arc<AtomicUsize>,
             idle_pings: Arc<AtomicUsize>,
             route_ready_sent: Arc<AtomicUsize>,
             close_first_attempt: bool,
@@ -1249,13 +1252,22 @@ mod tests {
                 let attempt = state.attempts.fetch_add(1, Ordering::SeqCst) + 1;
                 if state.close_first_attempt && attempt == 1 {
                     // 故意让这个 relay 首连失败，验证另一个 endpoint 仍然可以独立存活。
+                    state.early_closes.fetch_add(1, Ordering::SeqCst);
                     return;
                 }
                 let Some(route_hello) = read_route_hello(&mut socket).await else {
                     return;
                 };
-                if !matches!(route_hello.role, RouteRole::DaemonControl) {
-                    return;
+                match route_hello.role {
+                    RouteRole::DaemonControl => {
+                        state.control_attempts.fetch_add(1, Ordering::SeqCst);
+                    }
+                    RouteRole::DaemonData => {
+                        // 新架构会预热 daemon data pipe。mock 必须接受 data 连接，否则测试会
+                        // 把预热线误判成 control 重连。
+                        state.data_attempts.fetch_add(1, Ordering::SeqCst);
+                    }
+                    _ => return,
                 }
                 let route_ready = Envelope::new(
                     MessageType::RouteReady,
@@ -1376,14 +1388,23 @@ mod tests {
             "健康 relay supervisor 空闲时应发送 WebSocket Ping，避免公网代理清理静默主干"
         );
         assert_eq!(
-            healthy_state.attempts.load(Ordering::SeqCst),
+            healthy_state.control_attempts.load(Ordering::SeqCst),
             1,
-            "健康 relay supervisor 应只建立一条稳定连接，不能被其他 endpoint 的重连牵连"
+            "健康 relay supervisor 应只建立一条稳定 control 连接，不能被其他 endpoint 的重连牵连"
+        );
+        assert!(
+            healthy_state.data_attempts.load(Ordering::SeqCst) <= 8,
+            "健康 relay 的 idle data 预热不能形成高速重连风暴"
         );
         assert_eq!(
-            flaky_state.attempts.load(Ordering::SeqCst),
-            2,
+            flaky_state.early_closes.load(Ordering::SeqCst),
+            1,
             "故障 relay endpoint 仍应按退避独立重连一次"
+        );
+        assert_eq!(
+            flaky_state.control_attempts.load(Ordering::SeqCst),
+            1,
+            "故障 relay endpoint 重连后应只留下自己的稳定 control 连接"
         );
 
         for handle in relay_tasks {

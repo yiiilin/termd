@@ -78,7 +78,7 @@ export interface Envelope<P = unknown> {
 }
 
 export const PROTOCOL_PACKET_VERSION = 3;
-export const BINARY_PROTOCOL_VERSION = 1;
+export const BINARY_PROTOCOL_VERSION = 2;
 
 export type PacketKind =
   | "request"
@@ -186,6 +186,16 @@ export interface AuthPayload {
   challenge: Challenge;
   nonce: Nonce;
   timestamp_ms: UnixTimestampMillis;
+  signature: SignatureWire;
+}
+
+export interface HttpE2eeAuthPayload {
+  device_id: UUID;
+  e2ee_public_key: PublicKeyWire;
+  nonce: Nonce;
+  timestamp_ms: UnixTimestampMillis;
+  method: string;
+  path: string;
   signature: SignatureWire;
 }
 
@@ -422,6 +432,7 @@ export interface SessionGitDiffResultPayload {
 export interface SessionFileReadPayload {
   session_id: UUID;
   path: string;
+  max_bytes?: number;
 }
 
 export interface SessionFileReadResultPayload {
@@ -485,6 +496,72 @@ export interface SessionFileDownloadChunkResultPayload {
   size_bytes: number;
   eof: boolean;
   modified_at_ms?: UnixTimestampMillis | null;
+}
+
+export interface SessionFileUploadPayload {
+  session_id: UUID;
+  path: string;
+  size_bytes: number;
+}
+
+export interface SessionFileUploadReadyPayload {
+  session_id: UUID;
+  path: string;
+  size_bytes: number;
+  offset_bytes: number;
+}
+
+export interface SessionFileHttpUploadReadyPayload {
+  session_id: UUID;
+  path: string;
+  upload_id: string;
+  size_bytes: number;
+  offset_bytes: number;
+}
+
+export interface SessionFileHttpUploadStreamPayload {
+  session_id: UUID;
+  path: string;
+  upload_id: string;
+  size_bytes: number;
+  offset_bytes: number;
+}
+
+export interface SessionFileHttpDownloadPayload {
+  session_id: UUID;
+  path: string;
+  offset_bytes?: number;
+}
+
+export interface SessionFileUploadProgressPayload {
+  session_id: UUID;
+  path: string;
+  offset_bytes: number;
+  size_bytes: number;
+  eof: boolean;
+  modified_at_ms?: UnixTimestampMillis | null;
+}
+
+export interface SessionFileDownloadStreamPayload {
+  session_id: UUID;
+  path: string;
+}
+
+export interface SessionFileDownloadStreamReadyPayload {
+  session_id: UUID;
+  path: string;
+  name: string;
+  size_bytes: number;
+  modified_at_ms?: UnixTimestampMillis | null;
+}
+
+export interface SessionFileTransferChunkPayload {
+  session_id: UUID;
+  offset_bytes: number;
+  data_base64?: string;
+  data_bytes?: Uint8Array;
+  size_bytes: number;
+  eof: boolean;
 }
 
 export interface SessionDataPayload {

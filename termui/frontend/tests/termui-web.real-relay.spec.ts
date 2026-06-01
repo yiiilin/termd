@@ -1,4 +1,7 @@
 import { expect, test, type Locator, type Page } from "@playwright/test";
+import { mkdtemp, open, rm, stat, truncate, writeFile, type FileHandle } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { startRealRelayFixture } from "./real-relay-fixture";
 
 async function activateButton(page: Page, name: string): Promise<void> {
@@ -563,6 +566,140 @@ test("relay Web 在 daemon relay 主干断开重连后仍能恢复输入", async
   }
 });
 
+test("relay Web 上传文件时有发送进度并写入当前会话目录", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name === "mobile-chrome", "文件上传链路用桌面布局覆盖真实 relay");
+  const largeUploadBytes = Number(process.env.REAL_RELAY_UPLOAD_BYTES ?? "0");
+  const requiredLargeUploadBytes = 300 * 1024 * 1024;
+  if (largeUploadBytes > 0 && largeUploadBytes !== requiredLargeUploadBytes) {
+    throw new Error(`REAL_RELAY_UPLOAD_BYTES must be ${requiredLargeUploadBytes} for the 300MB relay upload check`);
+  }
+  test.setTimeout(largeUploadBytes > 0 ? 300_000 : 90_000);
+  let uploadTargetDir: string | undefined;
+  if (largeUploadBytes > 0) {
+    // 中文注释：300MB 浏览器验收必须落在 /tmp 下，但不能直接列 /tmp 根目录；
+    // 测试机 /tmp 可能有大量临时文件，会把文件树响应放大到数 MB 并干扰终端链路。
+    uploadTargetDir = await mkdtemp(path.join(tmpdir(), "termd-relay-upload-target-"));
+    const resolvedTmpDir = path.resolve(tmpdir());
+    const resolvedUploadTargetDir = path.resolve(uploadTargetDir);
+    if (resolvedTmpDir !== "/tmp" || !resolvedUploadTargetDir.startsWith(`${resolvedTmpDir}${path.sep}`)) {
+      throw new Error(`300MB relay upload target must be under /tmp, got ${resolvedUploadTargetDir}`);
+    }
+  }
+  const fixture = await startRealRelayFixture(largeUploadBytes > 0
+    ? { daemonEnv: { TERMD_DEFAULT_WORKING_DIRECTORY: uploadTargetDir ?? "/tmp" } }
+    : {
+      daemonToRelayLatencyMs: 100,
+      relayToDaemonLatencyMs: 100,
+      daemonToRelayBytesPerSecond: 64 * 1024,
+      relayToDaemonBytesPerSecond: 64 * 1024,
+    });
+  const createdNames: string[] = [];
+  const browserErrors: string[] = [];
+  let uploadTempDir: string | undefined;
+  collectBrowserErrors(page, "client", browserErrors);
+
+  try {
+    await page.goto(fixture.relayWebUrl);
+    await page.getByLabel("WS URL").fill(fixture.relayClientUrl);
+    await page.getByLabel("Pairing token").fill(pairingInviteCode(fixture));
+    await page.getByRole("button", { name: "Pair" }).click();
+    await expect(page.getByLabel("Pairing token")).toBeHidden();
+    await expect(page.getByText("No sessions")).toBeVisible();
+
+    const fileName = largeUploadBytes > 0 ? "relay-upload-large.bin" : "relay-upload-progress.txt";
+    const fileHead = "relay upload progress line";
+    const fileTail = "termd-large-upload-tail";
+    const content = `${fileHead}\n`.repeat(16384);
+    const expectedBytes = largeUploadBytes > 0 ? largeUploadBytes : Buffer.byteLength(content, "utf8");
+    const uploadTargetPath = largeUploadBytes > 0 ? `${uploadTargetDir}/${fileName}` : fileName;
+    const uploadDirMarker = `termd-upload-dir-${Date.now()}`;
+    const largeUploadMarkers = largeUploadBytes > 0
+      ? largeUploadMarkerSpecs(largeUploadBytes, fileHead, fileTail)
+      : [];
+
+    const name = await createShellSession(page, createdNames);
+    createdNames.push(name);
+    const prepareUploadCommand = largeUploadBytes > 0
+      ? `cd ${uploadTargetDir} && rm -f ${fileName} ${uploadDirMarker}; : > ${uploadDirMarker}; printf '${marker(name)}-upload-ready\\n'`
+      : `rm -f ${fileName}; printf '${marker(name)}-upload-ready\\n'`;
+    await runTerminalCommand(page, prepareUploadCommand);
+    await expectTerminalLine(page, `${marker(name)}-upload-ready`, 8_000);
+
+    const filesPanel = page.getByLabel("session files");
+    await expect(filesPanel).toBeVisible();
+    if (largeUploadBytes > 0) {
+      // 中文注释：300MB 验收要求目标目录在 /tmp 下；fixture 通过 daemon 专用环境变量
+      // 把新 session 默认 cwd 固定到 /tmp 临时目录，再用 marker 确认文件面板状态确实切到目标目录。
+      await expect(filesPanel.getByLabel("Current directory")).toHaveValue(uploadTargetDir ?? "", { timeout: 10_000 });
+      await filesPanel.getByRole("button", { name: "Refresh files", exact: true }).click();
+      await expect.poll(async () => sessionFileNames(filesPanel), { timeout: 20_000 }).toContain(uploadDirMarker);
+    }
+    if (largeUploadBytes > 0) {
+      uploadTempDir = await mkdtemp(path.join(tmpdir(), "termd-large-upload-"));
+      const filePath = path.join(uploadTempDir, fileName);
+      await writeSparseLargeUploadFixture(filePath, largeUploadBytes, fileHead, fileTail, largeUploadMarkers);
+      await filesPanel.getByLabel("Upload file").setInputFiles(filePath);
+    } else {
+      await filesPanel.getByLabel("Upload file").setInputFiles({
+        name: fileName,
+        mimeType: "text/plain",
+        buffer: Buffer.from(content, "utf8"),
+      });
+    }
+
+    await expect(filesPanel.getByRole("status", { name: `Uploading ${fileName}` })).toBeVisible();
+    await expect
+      .poll(async () => uploadProgressPercentValue(filesPanel), { timeout: 15_000 })
+      .toBeGreaterThan(0);
+    await expect
+      .poll(async () => sessionFileNames(filesPanel), { timeout: largeUploadBytes > 0 ? 180_000 : 30_000 })
+      .toContain(fileName);
+
+    if (largeUploadBytes > 0) {
+      await verifySparseLargeUploadTarget(uploadTargetPath, largeUploadBytes, fileHead, fileTail, largeUploadMarkers);
+    }
+
+    const verifyCommand = largeUploadBytes > 0
+      ? `bytes=$(wc -c < ${uploadTargetPath}); printf '${marker(name)}-upload-size:%s\\n' "$bytes"; printf '${marker(name)}-upload-head:'; head -c 26 ${uploadTargetPath}; printf '\\n'; printf '${marker(name)}-upload-tail:'; tail -c ${Buffer.byteLength(fileTail, "utf8")} ${uploadTargetPath}; printf '\\n'; printf '${marker(name)}-upload-markers:%s\\n' '${largeUploadMarkers.length}'; rm -f ${uploadTargetPath} ${uploadTargetDir}/${uploadDirMarker}`
+      : `bytes=$(wc -c < ${uploadTargetPath}); printf '${marker(name)}-upload-size:%s\\n' "$bytes"; printf '${marker(name)}-upload-head:'; head -c 26 ${uploadTargetPath}; printf '\\n'; rm -f ${uploadTargetPath}`;
+    await runTerminalCommand(page, verifyCommand);
+    await expectTerminalLine(page, `${marker(name)}-upload-size:${expectedBytes}`, largeUploadBytes > 0 ? 60_000 : 20_000);
+    await expectTerminalLine(page, `${marker(name)}-upload-head:${fileHead}`, 20_000);
+    if (largeUploadBytes > 0) {
+      await expectTerminalLine(page, `${marker(name)}-upload-tail:${fileTail}`, 20_000);
+      await expectTerminalLine(page, `${marker(name)}-upload-markers:${largeUploadMarkers.length}`, 20_000);
+    }
+    await expect(page.getByRole("alert", { name: "Connection error" })).toHaveCount(0);
+    expect(browserErrors).toEqual([]);
+  } finally {
+    if (process.env.REAL_RELAY_PRINT_DIAGNOSTICS === "1") {
+      // 中文注释：默认不刷真实 relay 上传日志；单次排查 CI/本地失败时可显式打开。
+      console.log(fixture.diagnostics());
+    }
+    await testInfo.attach("real-relay-fixture.log", {
+      body: fixture.diagnostics(),
+      contentType: "text/plain",
+    });
+    if (browserErrors.length > 0) {
+      await testInfo.attach("browser-errors.log", {
+        body: browserErrors.join("\n"),
+        contentType: "text/plain",
+      });
+    }
+    try {
+      await closeCreatedSessions(page, createdNames);
+      await fixture.stop();
+    } finally {
+      if (uploadTempDir) {
+        await rm(uploadTempDir, { recursive: true, force: true });
+      }
+      if (uploadTargetDir) {
+        await rm(uploadTargetDir, { recursive: true, force: true });
+      }
+    }
+  }
+});
+
 test("relay Web 双客户端同会话不同分辨率轮番离线上线后仍能恢复", async ({ page, browser }, testInfo) => {
   test.skip(testInfo.project.name === "mobile-chrome", "多客户端断续回归只需要桌面布局覆盖真实 relay 链路");
   test.setTimeout(150_000);
@@ -821,6 +958,79 @@ function collectBrowserErrors(page: Page, label: string, browserErrors: string[]
   });
 }
 
+interface LargeUploadMarker {
+  offset: number;
+  text: string;
+}
+
+function largeUploadMarkerSpecs(sizeBytes: number, fileHead: string, fileTail: string): LargeUploadMarker[] {
+  const markerStepBytes = 1024 * 1024;
+  const tailBytes = Buffer.byteLength(fileTail, "utf8");
+  const protectedHeadBytes = Buffer.byteLength(`${fileHead}\n`, "utf8");
+  const markers: LargeUploadMarker[] = [];
+  for (let offset = markerStepBytes; offset + 64 < sizeBytes - tailBytes; offset += markerStepBytes) {
+    // 中文注释：每 1MB 放一个非零标记，避免 300MB 稀疏文件只校验头尾时漏掉中间分片丢失。
+    markers.push({
+      offset: Math.max(offset, protectedHeadBytes + 4096),
+      text: `termd-large-upload-marker-${markers.length.toString().padStart(4, "0")}`,
+    });
+  }
+  return markers;
+}
+
+async function writeSparseLargeUploadFixture(
+  filePath: string,
+  sizeBytes: number,
+  fileHead: string,
+  fileTail: string,
+  markers: LargeUploadMarker[],
+): Promise<void> {
+  // 中文注释：按需大文件回归不把 300MB 内容放进测试源码；文件保持稀疏，
+  // 但每个 1MB 区间都有可校验标记，浏览器仍按真实 File 路径上传。
+  await writeFile(filePath, Buffer.from(`${fileHead}\n`, "utf8"));
+  await truncate(filePath, sizeBytes);
+  const handle = await open(filePath, "r+");
+  try {
+    for (const marker of markers) {
+      const markerBytes = Buffer.from(marker.text, "utf8");
+      await handle.write(markerBytes, 0, markerBytes.byteLength, marker.offset);
+    }
+    const tailBytes = Buffer.from(fileTail, "utf8");
+    await handle.write(tailBytes, 0, tailBytes.byteLength, Math.max(0, sizeBytes - tailBytes.byteLength));
+  } finally {
+    await handle.close();
+  }
+}
+
+async function verifySparseLargeUploadTarget(
+  filePath: string,
+  sizeBytes: number,
+  fileHead: string,
+  fileTail: string,
+  markers: LargeUploadMarker[],
+): Promise<void> {
+  const fileInfo = await stat(filePath);
+  expect(fileInfo.size).toBe(sizeBytes);
+  const handle = await open(filePath, "r");
+  try {
+    await expectReadUtf8At(handle, 0, fileHead);
+    for (const marker of markers) {
+      await expectReadUtf8At(handle, marker.offset, marker.text);
+    }
+    await expectReadUtf8At(handle, sizeBytes - Buffer.byteLength(fileTail, "utf8"), fileTail);
+  } finally {
+    await handle.close();
+  }
+}
+
+async function expectReadUtf8At(handle: FileHandle, offset: number, expected: string): Promise<void> {
+  const expectedBytes = Buffer.from(expected, "utf8");
+  const actual = Buffer.alloc(expectedBytes.byteLength);
+  const { bytesRead } = await handle.read(actual, 0, actual.byteLength, offset);
+  expect(bytesRead).toBe(expectedBytes.byteLength);
+  expect(actual.equals(expectedBytes)).toBe(true);
+}
+
 async function expectTerminalLine(page: Page, text: string, timeout: number): Promise<void> {
   // xterm 会同时显示命令回显和命令输出；压力测试只关心最终输出行，
   // 这里必须用精确文本，避免 strict locator 被命令回显里的子串干扰。
@@ -862,6 +1072,17 @@ async function sessionNames(page: Page): Promise<string[]> {
     .getByRole("region", { name: "sessions" })
     .locator(".session-row strong")
     .allTextContents();
+}
+
+async function sessionFileNames(filesPanel: Locator): Promise<string[]> {
+  return filesPanel.locator(".file-name").allTextContents();
+}
+
+async function uploadProgressPercentValue(filesPanel: Locator): Promise<number> {
+  return filesPanel.locator(".files-transfer-bar-fill").evaluate((element) => {
+    const raw = window.getComputedStyle(element).getPropertyValue("--files-transfer-progress");
+    return Number.parseFloat(raw) || 0;
+  });
 }
 
 async function openSession(page: Page, name: string): Promise<void> {

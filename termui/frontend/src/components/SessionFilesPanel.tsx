@@ -43,6 +43,19 @@ interface SessionFilesPanelProps {
   files?: SessionFilesResultPayload;
   loading: boolean;
   error?: SafeError;
+  uploadProgress?: {
+    name: string;
+    offsetBytes: number;
+    sizeBytes: number;
+    phase?: "sending" | "committing" | "confirmed";
+    completed?: boolean;
+  };
+  downloadProgress?: {
+    name: string;
+    offsetBytes: number;
+    sizeBytes: number;
+    completed?: boolean;
+  };
   git?: SessionGitResultPayload;
   gitLoading: boolean;
   gitError?: SafeError;
@@ -75,6 +88,8 @@ export function SessionFilesPanel({
   files,
   loading,
   error,
+  uploadProgress,
+  downloadProgress,
   git,
   gitLoading,
   gitError,
@@ -100,6 +115,11 @@ export function SessionFilesPanel({
   const entries = files?.entries ?? [];
   const currentPath = files?.path ?? "";
   const hasCachedEntries = entries.length > 0;
+  const transferProgress = uploadProgress
+    ? { ...uploadProgress, label: t(uploadProgress.phase === "committing" ? "files.uploadCommitting" : "files.uploadProgress", { name: uploadProgress.name }) }
+    : downloadProgress
+      ? { ...downloadProgress, label: t("files.downloadProgress", { name: downloadProgress.name }) }
+      : undefined;
   const [pathDraft, setPathDraft] = useState(currentPath);
   const uploadRef = useRef<HTMLInputElement | null>(null);
 
@@ -243,6 +263,23 @@ export function SessionFilesPanel({
                 ))
               : null}
           </div>
+          {transferProgress ? (
+            <div
+              className="files-transfer-progress"
+              role="status"
+              aria-label={transferProgress.label}
+            >
+              <div className="files-transfer-name" title={transferProgress.name}>
+                {transferProgress.name}
+              </div>
+              <div className="files-transfer-bar" aria-hidden="true">
+                <div
+                  className="files-transfer-bar-fill"
+                  style={{ "--files-transfer-progress": `${uploadProgressPercent(transferProgress)}%` } as CSSProperties}
+                />
+              </div>
+            </div>
+          ) : null}
           <footer className="files-follow-footer">
             <label className="files-follow-toggle">
               <input
@@ -269,6 +306,14 @@ export function SessionFilesPanel({
       )}
     </aside>
   );
+}
+
+function uploadProgressPercent(progress: { offsetBytes: number; sizeBytes: number; completed?: boolean }): number {
+  if (progress.sizeBytes <= 0) {
+    return progress.completed ? 100 : 0;
+  }
+  const percent = Math.max(0, Math.min(100, (progress.offsetBytes / progress.sizeBytes) * 100));
+  return progress.completed ? percent : Math.min(99, percent);
 }
 
 function GitPanel({
