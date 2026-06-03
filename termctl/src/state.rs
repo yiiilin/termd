@@ -3,7 +3,7 @@
 //! 状态只保存设备身份、设备签名私钥 secret 和已配对 daemon 的公开身份。pairing token、
 //! daemon/server private key 和终端明文输出都不属于客户端持久化范围。
 
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -59,22 +59,43 @@ impl TermctlState {
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
         {
+            let parent_existed = parent.exists();
             fs::create_dir_all(parent).map_err(|_| TermctlError::StateWrite)?;
-            set_owner_only_dir_permissions(parent)?;
+            if !parent_existed {
+                set_owner_only_dir_permissions(parent)?;
+            }
         }
 
-        let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(path)
-            .map_err(|_| TermctlError::StateWrite)?;
-        set_owner_only_file_permissions(path)?;
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let temp_path = unique_temp_state_path(parent, path);
+        let save_result = (|| -> Result<()> {
+            let open_options = secure_state_file_open_options();
+            let mut file = open_options
+                .open(&temp_path)
+                .map_err(|_| TermctlError::StateWrite)?;
+            set_owner_only_file_permissions(&temp_path)?;
 
-        serde_json::to_writer_pretty(&mut file, self).map_err(|_| TermctlError::StateWrite)?;
-        file.write_all(b"\n")
-            .map_err(|_| TermctlError::StateWrite)?;
-        Ok(())
+            serde_json::to_writer_pretty(&mut file, self).map_err(|_| TermctlError::StateWrite)?;
+            file.write_all(b"\n")
+                .map_err(|_| TermctlError::StateWrite)?;
+            file.flush().map_err(|_| TermctlError::StateWrite)?;
+            file.sync_all().map_err(|_| TermctlError::StateWrite)?;
+            drop(file);
+
+            // 同目录 rename 是本地文件系统上的原子替换；不会跟随目标 symlink。
+            fs::rename(&temp_path, path).map_err(|_| TermctlError::StateWrite)?;
+            fsync_parent_dir(parent)?;
+            Ok(())
+        })();
+
+        if save_result.is_err() {
+            let _ = fs::remove_file(&temp_path);
+        }
+
+        save_result
     }
 
     pub fn ensure_device(&mut self) -> DeviceState {
@@ -212,6 +233,54 @@ impl TermctlState {
         Ok(SelectedServerTarget { server, url })
     }
 }
+
+fn unique_temp_state_path(parent: &Path, final_path: &Path) -> PathBuf {
+    let file_name = final_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("termctl-state.json");
+    let now_ms = crypto::now_ms().0;
+
+    for attempt in 0..100_u32 {
+        let temp_path = parent.join(format!(
+            ".{file_name}.{}.{}.tmp",
+            std::process::id(),
+            now_ms.saturating_add(u64::from(attempt))
+        ));
+        if !temp_path.exists() {
+            return temp_path;
+        }
+    }
+
+    parent.join(format!(".{file_name}.{}.fallback.tmp", std::process::id()))
+}
+
+fn fsync_parent_dir(path: &Path) -> Result<()> {
+    // 目录 fsync 确保 rename 元数据落盘；不支持目录 open 的平台保留文件级 fsync。
+    match File::open(path) {
+        Ok(dir) => dir.sync_all().map_err(|_| TermctlError::StateWrite),
+        Err(_) => Ok(()),
+    }
+}
+
+fn secure_state_file_open_options() -> OpenOptions {
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    secure_state_file_open_options_platform(&mut options);
+    options
+}
+
+#[cfg(unix)]
+fn secure_state_file_open_options_platform(options: &mut OpenOptions) {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    // 临时文件创建时即 0600，避免 create 后 chmod 前的短窗口泄露本机设备私钥。
+    options.mode(0o600);
+}
+
+#[cfg(not(unix))]
+fn secure_state_file_open_options_platform(_options: &mut OpenOptions) {}
 
 pub fn normalize_ws_url(value: &str) -> Option<String> {
     let trimmed = value.trim();
@@ -354,6 +423,58 @@ mod tests {
         assert!(!raw.contains("pairing_token"));
         assert!(!raw.contains("server_private_key"));
         assert!(!raw.contains(&PairingToken("secret-token".to_owned()).0));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_replaces_symlink_atomically_without_mutating_target() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let symlink_target = dir.path().join("must-not-be-overwritten.json");
+        fs::write(&symlink_target, b"do-not-touch").unwrap();
+        symlink(&symlink_target, &path).unwrap();
+
+        let mut state = TermctlState::default();
+        state.ensure_device();
+        state.save(&path).unwrap();
+
+        assert_eq!(fs::read_to_string(&symlink_target).unwrap(), "do-not-touch");
+        assert!(
+            !fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(TermctlState::load(&path).unwrap(), state);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_does_not_chmod_existing_parent_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let path = dir.path().join("state.json");
+
+        let mut state = TermctlState::default();
+        state.ensure_device();
+        state.save(&path).unwrap();
+
+        assert_eq!(
+            fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]

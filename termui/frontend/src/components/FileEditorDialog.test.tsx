@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FileEditorDialog, resetFileEditorDialogMonacoCacheForTests } from "./FileEditorDialog";
@@ -75,7 +75,8 @@ describe("FileEditorDialog", () => {
     expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
   });
 
-  it("saving 时保持内容可见并禁用关闭保存按钮", () => {
+  it("saving 时保持内容可见并禁用所有关闭路径", () => {
+    const onClose = vi.fn();
     render(
       <FileEditorDialog
         open
@@ -83,13 +84,16 @@ describe("FileEditorDialog", () => {
         initialText="pending"
         saving
         onSave={vi.fn()}
-        onClose={vi.fn()}
+        onClose={onClose}
       />,
     );
 
     expect(screen.getByLabelText("File text")).toHaveValue("pending");
     expect(screen.getByRole("button", { name: "Saving" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Close editor" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Cancel" })).toBeDisabled();
+    fireEvent.mouseDown(screen.getByRole("dialog").parentElement!);
+    expect(onClose).not.toHaveBeenCalled();
   });
 
   it("展示错误并允许用户继续编辑", async () => {

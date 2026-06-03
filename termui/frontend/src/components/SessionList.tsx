@@ -178,9 +178,6 @@ export function SessionList(props: SessionListProps) {
                 rowRefs.current.delete(session.session_id);
               }
             }}
-            role="button"
-            tabIndex={0}
-            aria-label={hasNewOutput ? t("sessions.openNewOutput", { name: displayName }) : t("sessions.open", { name: displayName })}
             onDragOver={(event) => {
               if (!draggingSessionId || draggingSessionId === session.session_id) {
                 return;
@@ -193,16 +190,6 @@ export function SessionList(props: SessionListProps) {
               moveSessionBefore(session.session_id);
               setDraggingSessionId(undefined);
               setDragTargetSessionId(undefined);
-            }}
-            onClick={() => props.onAttach(session.session_id)}
-            onKeyDown={(event) => {
-              if (event.target !== event.currentTarget) {
-                return;
-              }
-              if (event.key === "Enter" || event.key === " ") {
-                event.preventDefault();
-                props.onAttach(session.session_id);
-              }
             }}
           >
             <div className="session-row-heading">
@@ -299,7 +286,14 @@ export function SessionList(props: SessionListProps) {
                     />
                   </form>
                 ) : (
-                  <strong>{displayName}</strong>
+                  <button
+                    type="button"
+                    className={["session-open-button", hasNewOutput ? "has-new-output" : ""].filter(Boolean).join(" ")}
+                    aria-label={hasNewOutput ? t("sessions.openNewOutput", { name: displayName }) : t("sessions.open", { name: displayName })}
+                    onClick={() => props.onAttach(session.session_id)}
+                  >
+                    <strong>{displayName}</strong>
+                  </button>
                 )}
               </div>
               <div className="session-actions" aria-label={t("sessions.actions")} onClick={(event) => event.stopPropagation()}>

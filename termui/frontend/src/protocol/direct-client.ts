@@ -14,14 +14,14 @@ import {
   generateE2eeKeyPair,
 } from "./e2ee";
 import {
-  type BinaryProtocolPacket,
   decodeBinaryProtocolPacket,
   encodeBinaryProtocolPacket,
-  terminalFrameBinaryToJson,
-  terminalFrameJsonToBinary,
 } from "./binary-packet";
 import { ProtocolClientError, protocolError } from "./errors";
+import { envelopeTypeForProtocolEventMethod } from "./methods";
+import { binaryPacketToProtocol, protocolPacketToBinary } from "./packet-codec";
 import { BINARY_PROTOCOL_VERSION, PROTOCOL_PACKET_VERSION } from "./types";
+import { recordTermdDiagnostic } from "../diagnostics";
 import type {
   AuthChallengePayload,
   ClientHelloPayload,
@@ -98,7 +98,6 @@ import type {
 } from "./types";
 import {
   base64ToBytes,
-  bytesToBase64,
   decodeUtf8,
   envelope,
   encodeUtf8,
@@ -137,9 +136,14 @@ interface QueuedInnerWaiter {
   reject: (error: Error) => void;
 }
 
+type DirectClientPhase = "connecting" | "e2ee_ready" | "authenticated" | "terminal_stream_open" | "closed";
+
+const E2EE_READY_PACKET_METHODS = new Set(["pair.request", "auth", "auth.verify"]);
+
 interface TerminalStreamState {
   sessionId: UUID;
   streamId: PacketStreamId;
+  open: boolean;
   nextInputSeq: number;
   lastOutputSeq: number;
 }
@@ -224,6 +228,8 @@ export class DirectClient {
   private readonly authTimeoutMs: number;
   private e2ee: E2eeSession;
   private closed = false;
+  private closedError: Error | undefined;
+  private phase: DirectClientPhase = "connecting";
   private receivePumpStarted = false;
   private e2eeTranscriptSha256?: string;
   private readonly pendingRequests = new Map<UUID, PendingRequest>();
@@ -249,6 +255,7 @@ export class DirectClient {
     this.e2ee = e2ee;
     this.authTimeoutMs = options.timeoutMs;
     this.timeoutMs = options.requestTimeoutMs;
+    this.phase = "e2ee_ready";
   }
 
   static async connect(
@@ -417,16 +424,20 @@ export class DirectClient {
   }
 
   async pair(token: string, devicePublicKey: PublicKeyWire): Promise<PairAcceptPayload> {
-    return this.request<PairAcceptPayload>("pair.request", {
+    this.requireE2eeReady();
+    const accepted = await this.request<PairAcceptPayload>("pair.request", {
       device_id: this.deviceId,
       device_public_key: devicePublicKey,
       token,
       nonce: nonce(),
       timestamp_ms: nowMs(),
     } satisfies PairRequestPayload);
+    this.phase = "authenticated";
+    return accepted;
   }
 
   async authenticate(device: DeviceState, server: PairedServerState): Promise<void> {
+    this.requireE2eeReady();
     const challenge = await this.expectQueuedPayload<AuthChallengePayload>("auth_challenge", this.authTimeoutMs);
     const auth = await signAuthPayload(
       authPayloadForChallenge(device.device_id, challenge.challenge),
@@ -435,6 +446,7 @@ export class DirectClient {
       this.e2eeTranscriptSha256,
     );
     await this.request("auth.verify", auth, this.authTimeoutMs);
+    this.phase = "authenticated";
     await this.request("client.hello", { name: device.name?.trim() || "Web client" } satisfies ClientHelloPayload, this.authTimeoutMs);
     this.authenticatedDevice = device;
     this.authenticatedServer = server;
@@ -599,6 +611,7 @@ export class DirectClient {
       timeoutMs?: number;
     } = {},
   ): Promise<SessionFileUploadProgressPayload> {
+    this.requireAuthenticated();
     if (this.authenticatedDevice && this.authenticatedServer) {
       try {
         return await this.uploadSessionFileHttp(sessionId, path, file, options);
@@ -612,7 +625,7 @@ export class DirectClient {
             "HTTP file upload is required for large files",
           );
         }
-        // 中文注释：只有 404/426 这类“老 daemon/old relay 明确不支持 HTTP 文件端点”
+        // 中文注释：只有 404/426/501 这类“老 daemon/old relay 明确不支持 HTTP 文件端点”
         // 才允许小文件走 WebSocket 兼容路径；网络 TypeError 不会进入这里，避免大文件
         // 在 relay 下重新退回主 WebSocket 后逐块等待确认。
       }
@@ -676,6 +689,9 @@ export class DirectClient {
             eof,
           } satisfies SessionFileTransferChunkPayload,
         });
+        // 中文注释：WebSocket 兼容上传没有浏览器原生 upload progress；
+        // 分片写入 socket 队列后先回报发送进度，daemon 提交 ack 再回报 confirmed/committing 进度。
+        options.onSentProgress?.(end, file.size);
         seq += 1;
         const progress = await this.waitForFileUploadProgress(state, options.timeoutMs ?? this.timeoutMs);
         if (progress.session_id !== sessionId || progress.size_bytes !== file.size) {
@@ -721,7 +737,10 @@ export class DirectClient {
       timeoutMs?: number;
     } = {},
   ): Promise<{ path: string; name: string; bytes: Uint8Array; size_bytes: number; modified_at_ms?: number | null }> {
+    this.requireAuthenticated();
     if (this.authenticatedDevice && this.authenticatedServer) {
+      // 中文注释：认证后的下载优先保证 HTTP E2EE 流式路径；端点不支持时不退回主 WebSocket，
+      // 避免大文件下载重新占用终端控制连接或在浏览器内存中整包缓冲。
       return await this.downloadSessionFileHttp(sessionId, path, options);
     }
     if (!this.binaryMode) {
@@ -1239,7 +1258,7 @@ export class DirectClient {
         init.duplex = "half";
       }
       const response = await fetch(httpUrlFromSocketUrl(this.socketUrl, path), init);
-      if (response.status === 404 || response.status === 426) {
+      if (response.status === 404 || response.status === 426 || response.status === 501) {
         throw new HttpFileTransferUnsupported();
       }
       if (!response.ok) {
@@ -1281,6 +1300,7 @@ export class DirectClient {
     size: TerminalSize,
     options: { timeoutMs?: number } = {},
   ): Promise<SessionCreatedPayload> {
+    this.requireAuthenticated();
     return this.openTerminalStream<SessionCreatedPayload>(
       "terminal.create",
       {
@@ -1296,6 +1316,7 @@ export class DirectClient {
     sessionId: UUID,
     options: { watchUpdates?: boolean; lastTerminalSeq?: number; timeoutMs?: number } = {},
   ): Promise<SessionAttachedPayload> {
+    this.requireAuthenticated();
     return this.openTerminalStream<SessionAttachedPayload>(
       "terminal.attach",
       {
@@ -1319,10 +1340,7 @@ export class DirectClient {
   }
 
   async sendSessionData(sessionId: UUID, bytes: Uint8Array): Promise<void> {
-    const stream = this.terminalStreamsBySession.get(sessionId);
-    if (!stream) {
-      throw new ProtocolClientError("invalid_state", "terminal stream is not attached");
-    }
+    const stream = this.requireTerminalStream(sessionId);
     const seq = stream.nextInputSeq;
     stream.nextInputSeq += 1;
     this.sendPacket({
@@ -1338,6 +1356,7 @@ export class DirectClient {
   }
 
   async sendSessionCursor(sessionId: UUID, presence: SessionCursorPresence): Promise<void> {
+    this.requireTerminalStream(sessionId);
     await this.request(
       "session.cursor",
       {
@@ -1350,10 +1369,12 @@ export class DirectClient {
   }
 
   async resizeSession(sessionId: UUID, size: TerminalSize): Promise<SessionResizedPayload> {
+    this.requireTerminalStream(sessionId);
     return this.request<SessionResizedPayload>("session.resize", { session_id: sessionId, size } satisfies SessionResizePayload);
   }
 
   async requestSessionResize(sessionId: UUID, size: TerminalSize): Promise<void> {
+    this.requireTerminalStream(sessionId);
     const payload = await this.request<SessionResizedPayload>(
       "session.resize",
       { session_id: sessionId, size } satisfies SessionResizePayload,
@@ -1399,6 +1420,11 @@ export class DirectClient {
   }
 
   async request<T = unknown>(method: string, payload: unknown, timeoutMs = this.timeoutMs): Promise<T> {
+    if (E2EE_READY_PACKET_METHODS.has(method)) {
+      this.requireE2eeReady();
+    } else {
+      this.requireAuthenticated();
+    }
     const id = randomUuid();
     return this.sendTrackedPacket<T>(
       {
@@ -1421,6 +1447,11 @@ export class DirectClient {
         throw protocolError(pending.payload as ErrorPayload);
       }
       return pending;
+    }
+    if (this.closed || this.phase === "closed") {
+      // 中文注释：receive pump 可能在 UI 消费 backlog 期间已经关闭连接；
+      // 已排队输出必须先按 FIFO 交付，队列清空后不能再创建永远不会被唤醒的 waiter。
+      throw this.connectionClosedError();
     }
 
     return new Promise((resolve, reject) => {
@@ -1462,6 +1493,7 @@ export class DirectClient {
 
   close(): void {
     const error = new ProtocolClientError("connection_closed", "connection closed");
+    this.closedError ??= error;
     for (const stream of this.terminalStreamsById.values()) {
       this.sendPacketBestEffort({
         version: PROTOCOL_PACKET_VERSION,
@@ -1476,6 +1508,7 @@ export class DirectClient {
       this.removeFileStream(streamId, error);
     }
     this.closed = true;
+    this.phase = "closed";
     this.rejectPendingRequests(error);
     this.rejectInnerWaiters(error);
     this.socket.close();
@@ -1527,7 +1560,9 @@ export class DirectClient {
           const error = caught instanceof Error ? caught : new ProtocolClientError("protocol_error", "protocol operation failed");
           // receive pump 已经证明这条 WebSocket 不再可信；标记关闭并主动 close，
           // 避免上层继续复用一个不会再消费入站消息的 DirectClient。
+          this.closedError ??= error;
           this.closed = true;
+          this.phase = "closed";
           this.rejectPendingRequests(error);
           this.rejectInnerWaiters(error);
           this.rejectFileStreams(error);
@@ -1612,29 +1647,17 @@ export class DirectClient {
       }
       // stream 级错误只进入事件队列，不能误伤其他 pending unary request。
       this.enqueueInner(envelope("error", { code: error.code, message: error.message } satisfies ErrorPayload));
+      return;
     }
+    this.enqueueInner(envelope("error", { code: error.code, message: error.message } satisfies ErrorPayload));
   }
 
   private enqueuePacketEvent(packet: ProtocolPacket): void {
-    switch (packet.method) {
-      case "auth.challenge":
-        this.enqueueInner(envelope("auth_challenge", packet.payload as AuthChallengePayload));
-        return;
-      case "session.activity":
-        this.enqueueInner(envelope("session_activity", packet.payload));
-        return;
-      case "session.files":
-        this.enqueueInner(envelope("session_files_result", packet.payload));
-        return;
-      case "session.git":
-        this.enqueueInner(envelope("session_git_result", packet.payload));
-        return;
-      case "session.resized":
-        this.enqueueInner(envelope("session_resized", packet.payload));
-        return;
-      default:
-        return;
+    const envelopeType = envelopeTypeForProtocolEventMethod(packet.method);
+    if (!envelopeType) {
+      return;
     }
+    this.enqueueInner(envelope(envelopeType, packet.payload));
   }
 
   private handleStreamChunk(packet: ProtocolPacket): void {
@@ -1720,6 +1743,21 @@ export class DirectClient {
     streamId: PacketStreamId,
     transportSeq: number,
   ): void {
+    if (payload.kind === "snapshot") {
+      recordTermdDiagnostic("direct_client_enqueue_snapshot", {
+        sessionId: payload.session_id,
+        streamId,
+        transportSeq,
+        baseSeq: payload.base_seq,
+      });
+    } else if (payload.kind === "output" && payload.terminal_seq % 1024 === 1) {
+      recordTermdDiagnostic("direct_client_enqueue_output_sample", {
+        sessionId: payload.session_id,
+        streamId,
+        transportSeq,
+        terminalSeq: payload.terminal_seq,
+      });
+    }
     this.enqueueInner(envelope("terminal_frame", {
       ...(payload as object),
       transport_seq: transportSeq,
@@ -1805,7 +1843,7 @@ export class DirectClient {
     const streamId = randomUuid();
     let provisionalStream: TerminalStreamState | undefined;
     if (sessionId) {
-      provisionalStream = { sessionId, streamId, nextInputSeq: 1, lastOutputSeq: 0 };
+      provisionalStream = { sessionId, streamId, open: false, nextInputSeq: 1, lastOutputSeq: 0 };
       this.terminalStreamsBySession.set(sessionId, provisionalStream);
       this.terminalStreamsById.set(streamId, provisionalStream);
     }
@@ -1828,10 +1866,12 @@ export class DirectClient {
         if (provisionalStream && provisionalStream.sessionId !== resolvedSessionId) {
           this.terminalStreamsBySession.delete(provisionalStream.sessionId);
         }
-        const stream = provisionalStream ?? { sessionId: resolvedSessionId, streamId, nextInputSeq: 1, lastOutputSeq: 0 };
+        const stream = provisionalStream ?? { sessionId: resolvedSessionId, streamId, open: false, nextInputSeq: 1, lastOutputSeq: 0 };
         stream.sessionId = resolvedSessionId;
+        stream.open = true;
         this.terminalStreamsBySession.set(resolvedSessionId, stream);
         this.terminalStreamsById.set(streamId, stream);
+        this.phase = "terminal_stream_open";
         return response;
       },
       (error) => {
@@ -1841,9 +1881,51 @@ export class DirectClient {
     );
   }
 
+  private requireOpen(): void {
+    if (this.closed || this.phase === "closed") {
+      throw this.connectionClosedError();
+    }
+  }
+
+  private requireE2eeReady(): void {
+    this.requireOpen();
+    if (this.phase !== "e2ee_ready") {
+      throw new ProtocolClientError("invalid_state", "client is not ready for pairing or authentication");
+    }
+  }
+
+  private requireAuthenticated(): void {
+    this.requireOpen();
+    if (this.phase !== "authenticated" && this.phase !== "terminal_stream_open") {
+      throw new ProtocolClientError("invalid_state", "client is not authenticated");
+    }
+  }
+
+  private requireTerminalStream(sessionId: UUID): TerminalStreamState {
+    this.requireAuthenticated();
+    const stream = this.terminalStreamsBySession.get(sessionId);
+    if (!stream?.open) {
+      throw new ProtocolClientError("invalid_state", "terminal stream is not attached");
+    }
+    return stream;
+  }
+
+  private refreshTerminalStreamPhase(): void {
+    if (this.closed || this.phase === "closed") {
+      return;
+    }
+    if ([...this.terminalStreamsById.values()].some((stream) => stream.open)) {
+      this.phase = "terminal_stream_open";
+      return;
+    }
+    if (this.phase === "terminal_stream_open") {
+      this.phase = "authenticated";
+    }
+  }
+
   private sendTrackedPacket<T>(packet: ProtocolPacket, id: UUID, method: string, timeoutMs = this.timeoutMs): Promise<T> {
     if (this.closed) {
-      return Promise.reject(new ProtocolClientError("connection_closed", "connection closed"));
+      return Promise.reject(this.connectionClosedError());
     }
     return new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -1930,6 +2012,7 @@ export class DirectClient {
     }
     this.terminalStreamsById.delete(streamId);
     this.terminalStreamsBySession.delete(stream.sessionId);
+    this.refreshTerminalStreamPhase();
   }
 
   private removeFileStream(streamId: PacketStreamId, error?: Error): void {
@@ -1951,6 +2034,10 @@ export class DirectClient {
     for (const streamId of [...this.fileStreamsById.keys()]) {
       this.removeFileStream(streamId, error);
     }
+  }
+
+  private connectionClosedError(): Error {
+    return this.closedError ?? new ProtocolClientError("connection_closed", "connection closed");
   }
 
   private sendPacket(packet: ProtocolPacket): void {
@@ -2004,6 +2091,7 @@ class SocketInbox {
   private readonly queue: QueuedMessage[] = [];
   private readonly waiters: Array<(message: QueuedMessage) => void> = [];
   private readonly errors: Array<(error: Error) => void> = [];
+  private closedError: Error | undefined;
 
   constructor(private readonly socket: WebSocket) {
     // 监听器必须在等待 open 前注册；route_ready 和后续 hello/E2EE 可能会连续到达。
@@ -2018,6 +2106,15 @@ class SocketInbox {
     if (this.queue.length > 0) {
       return Promise.resolve(this.queue.shift()!);
     }
+    if (this.closedError) {
+      return Promise.reject(this.closedError);
+    }
+    if (this.socket.readyState === WebSocket.CLOSING || this.socket.readyState === WebSocket.CLOSED) {
+      // 中文注释：极端事件顺序下 close 事件可能还没派发，但 readyState 已关闭；
+      // read 不能继续挂起，否则上层 receive pump 无法进入重连路径。
+      this.closedError = new ProtocolClientError("connection_closed", "connection closed");
+      return Promise.reject(this.closedError);
+    }
     return new Promise((resolve, reject) => {
       this.waiters.push(resolve);
       this.errors.push(reject);
@@ -2025,6 +2122,9 @@ class SocketInbox {
   }
 
   rejectPending(error: Error): void {
+    // 中文注释：close/error 可能发生在 receive pump 处理积压消息并让出事件循环期间；
+    // 此时没有 read waiter，必须记住错误，等队列清空后让下一次 read 失败触发上层重连。
+    this.closedError ??= error;
     let reject = this.errors.shift();
     while (reject) {
       this.waiters.shift();
@@ -2051,121 +2151,16 @@ class SocketInbox {
   }
 }
 
+// 中文注释：只给 Vitest 覆盖传输层边界条件使用；业务代码不应依赖这些内部类型。
+export const __directClientTestInternals = {
+  SocketInbox,
+};
+
 function expectQueuedEnvelope(message: QueuedMessage): Envelope {
   if (!message.envelope) {
     throw new ProtocolClientError("unexpected_message", "expected JSON outer message");
   }
   return message.envelope;
-}
-
-function protocolPacketToBinary(packet: ProtocolPacket): BinaryProtocolPacket {
-  const binary: BinaryProtocolPacket = {
-    version: packet.version,
-    kind: packet.kind,
-    id: packet.id,
-    stream_id: packet.stream_id,
-    method: packet.method,
-    seq: packet.seq,
-    ack: packet.ack,
-    credit: packet.credit,
-  };
-  if (packet.kind === "stream_chunk") {
-    const payload = packet.payload as {
-      session_id?: UUID;
-      data_base64?: string;
-      data_bytes?: Uint8Array;
-      kind?: string;
-      offset_bytes?: number;
-      size_bytes?: number;
-      eof?: boolean;
-    };
-    if (payload.kind) {
-      return {
-        ...binary,
-        payload: { type: "terminal_frame", frame: terminalFrameJsonToBinary(payload) },
-      };
-    }
-    if (
-      payload.session_id &&
-      typeof payload.offset_bytes === "number" &&
-      typeof payload.size_bytes === "number" &&
-      typeof payload.eof === "boolean" &&
-      (payload.data_bytes instanceof Uint8Array || typeof payload.data_base64 === "string")
-    ) {
-      const data = payload.data_bytes ?? base64ToBytes(payload.data_base64 ?? "");
-      return {
-        ...binary,
-        payload: {
-          type: "file_chunk",
-          session_id: payload.session_id,
-          offset_bytes: payload.offset_bytes,
-          data,
-          size_bytes: payload.size_bytes,
-          eof: payload.eof,
-        },
-      };
-    }
-    if (payload.session_id && (typeof payload.data_base64 === "string" || payload.data_bytes instanceof Uint8Array)) {
-      const data = payload.data_bytes ?? base64ToBytes(payload.data_base64 ?? "");
-      return {
-        ...binary,
-        payload: { type: "session_data", session_id: payload.session_id, data },
-      };
-    }
-  }
-  if (packet.kind === "error") {
-    const payload = packet.payload as { code?: string; message?: string; retryable?: boolean };
-    if (payload.code && payload.message) {
-      return {
-        ...binary,
-        payload: { type: "error", code: payload.code, message: payload.message, retryable: Boolean(payload.retryable) },
-      };
-    }
-  }
-  return {
-    ...binary,
-    payload: { type: "json", data: encodeUtf8(JSON.stringify(packet.payload ?? {})) },
-  };
-}
-
-function binaryPacketToProtocol(packet: BinaryProtocolPacket): ProtocolPacket {
-  let payload: unknown = {};
-  if (packet.payload?.type === "json") {
-    payload = JSON.parse(decodeUtf8(packet.payload.data));
-  } else if (packet.payload?.type === "session_data") {
-    payload = {
-      session_id: packet.payload.session_id,
-      data_base64: bytesToBase64(packet.payload.data),
-      data_bytes: packet.payload.data,
-    } satisfies SessionDataPayload;
-  } else if (packet.payload?.type === "terminal_frame") {
-    payload = terminalFrameBinaryToJson(packet.payload.frame);
-  } else if (packet.payload?.type === "file_chunk") {
-    payload = {
-      session_id: packet.payload.session_id,
-      offset_bytes: packet.payload.offset_bytes,
-      data_bytes: packet.payload.data,
-      size_bytes: packet.payload.size_bytes,
-      eof: packet.payload.eof,
-    } satisfies SessionFileTransferChunkPayload;
-  } else if (packet.payload?.type === "error") {
-    payload = {
-      code: packet.payload.code,
-      message: packet.payload.message,
-      retryable: packet.payload.retryable,
-    } satisfies PacketErrorPayload;
-  }
-  return {
-    version: packet.version,
-    kind: packet.kind,
-    ...(packet.id ? { id: packet.id } : {}),
-    ...(packet.stream_id ? { stream_id: packet.stream_id } : {}),
-    ...(packet.method ? { method: packet.method } : {}),
-    ...(packet.seq ? { seq: packet.seq } : {}),
-    ...(packet.ack ? { ack: packet.ack } : {}),
-    ...(packet.credit ? { credit: packet.credit } : {}),
-    payload,
-  };
 }
 
 async function messageDataToBytes(data: unknown): Promise<Uint8Array> {

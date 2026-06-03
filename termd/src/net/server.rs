@@ -13,6 +13,7 @@ use std::time::Duration;
 use axum::body::{Body, Bytes, to_bytes};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, State};
+use axum::http::header::{CONTENT_TYPE, HeaderName};
 use axum::http::{HeaderMap, Method, Request, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -33,6 +34,7 @@ use tokio::sync::{Mutex, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, timeout};
 use tower::ServiceExt as _;
+use tower_http::cors::{Any, CorsLayer};
 use tracing::{debug, info, warn};
 
 use crate::auth::current_unix_timestamp_millis;
@@ -596,13 +598,32 @@ pub fn router(protocol: SharedDaemonProtocol, web_enabled: bool) -> Router {
         .route("/api/files/upload/abort", post(http_file_upload_abort))
         .route("/api/files/download", post(http_file_download))
         .route("/ws", get(ws_handler))
-        .with_state(protocol);
+        .with_state(protocol)
+        .layer(http_file_api_cors_layer());
 
     if web_enabled {
         router.fallback(termweb::embedded_web_handler)
     } else {
         router
     }
+}
+
+fn http_file_api_cors_layer() -> CorsLayer {
+    // 中文注释：文件上传/下载的 HTTP E2EE 通道会带自定义签名头，浏览器在跨源预览或
+    // 分离部署时一定会先发 OPTIONS 预检。这里仅放开文件 API 所需的 method/header；
+    // 真正的访问控制仍由设备签名、nonce 和 session attach 校验负责。
+    CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods([Method::POST, Method::OPTIONS])
+        .allow_headers([
+            CONTENT_TYPE,
+            HeaderName::from_static("x-termd-server-id"),
+            HeaderName::from_static("x-termd-device-id"),
+            HeaderName::from_static("x-termd-e2ee-public-key"),
+            HeaderName::from_static("x-termd-e2ee-nonce"),
+            HeaderName::from_static("x-termd-e2ee-timestamp-ms"),
+            HeaderName::from_static("x-termd-e2ee-signature"),
+        ])
 }
 
 pub async fn serve(
@@ -3712,6 +3733,36 @@ mod tests {
             .expect("router should respond");
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn http_file_routes_answer_cors_preflight() {
+        let protocol = test_protocol("http-file-cors-preflight");
+        let response = router(protocol, false)
+            .oneshot(
+                Request::builder()
+                    .method(Method::OPTIONS)
+                    .uri("/api/files/upload/init")
+                    .header("origin", "http://127.0.0.1:4173")
+                    .header("access-control-request-method", "POST")
+                    .header(
+                        "access-control-request-headers",
+                        "content-type,x-termd-server-id,x-termd-device-id,x-termd-e2ee-public-key,x-termd-e2ee-nonce,x-termd-e2ee-timestamp-ms,x-termd-e2ee-signature",
+                    )
+                    .body(Body::empty())
+                    .expect("test request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert!(response.status().is_success());
+        assert_eq!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .and_then(|value| value.to_str().ok()),
+            Some("*")
+        );
     }
 
     #[tokio::test]

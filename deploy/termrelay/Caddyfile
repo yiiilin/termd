@@ -1,5 +1,14 @@
-{$TERMRELAY_DOMAIN} {
-  encode zstd gzip
-  reverse_proxy termrelay:8080
+{
+	log {
+		format filter {
+			request>uri query {
+				replace relay_token REDACTED
+			}
+		}
+	}
 }
 
+{$TERMRELAY_DOMAIN} {
+	encode zstd gzip
+	reverse_proxy termrelay:8080
+}

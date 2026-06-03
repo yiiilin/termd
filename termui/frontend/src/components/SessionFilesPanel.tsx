@@ -121,11 +121,37 @@ export function SessionFilesPanel({
       ? { ...downloadProgress, label: t("files.downloadProgress", { name: downloadProgress.name }) }
       : undefined;
   const [pathDraft, setPathDraft] = useState(currentPath);
+  const [pathDraftDirty, setPathDraftDirty] = useState(false);
+  const submittedPathDraftRef = useRef<string | undefined>(undefined);
   const uploadRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
+    if (!pathDraftDirty || submittedPathDraftRef.current === currentPath) {
+      setPathDraft(currentPath);
+      setPathDraftDirty(false);
+      submittedPathDraftRef.current = undefined;
+    }
+  }, [currentPath, pathDraftDirty]);
+
+  useEffect(() => {
+    // 切换 session 时草稿必须跟随新的文件树根，避免把上一个 session 的手输路径带过去。
     setPathDraft(currentPath);
-  }, [currentPath]);
+    setPathDraftDirty(false);
+    submittedPathDraftRef.current = undefined;
+  }, [attachedSessionId]);
+
+  const submitPathDraft = () => {
+    submittedPathDraftRef.current = pathDraft;
+    onGoToPath(pathDraft);
+  };
+
+  const goToParentPath = () => {
+    const nextPath = parentPath(currentPath);
+    submittedPathDraftRef.current = nextPath;
+    setPathDraft(nextPath);
+    setPathDraftDirty(true);
+    onGoToPath(nextPath);
+  };
 
   return (
     <aside className="files-panel" aria-label={t("files.panelAria")}>
@@ -175,7 +201,7 @@ export function SessionFilesPanel({
               className="icon-button"
               aria-label={t("files.parentDirectory")}
               disabled={!attachedSessionId || loading || !currentPath}
-              onClick={() => onGoToPath(parentPath(currentPath))}
+              onClick={goToParentPath}
             >
               <ArrowUp size={15} aria-hidden="true" />
             </button>
@@ -185,10 +211,14 @@ export function SessionFilesPanel({
                 aria-label={t("files.currentDirectory")}
                 value={pathDraft}
                 disabled={!attachedSessionId || loading}
-                onChange={(event) => setPathDraft(event.target.value)}
+                onChange={(event) => {
+                  submittedPathDraftRef.current = undefined;
+                  setPathDraftDirty(true);
+                  setPathDraft(event.target.value);
+                }}
                 onKeyDown={(event) => {
                   if (event.key === "Enter") {
-                    onGoToPath(pathDraft);
+                    submitPathDraft();
                   }
                 }}
               />
@@ -197,7 +227,7 @@ export function SessionFilesPanel({
               type="button"
               className="files-go-button"
               disabled={!attachedSessionId || loading}
-              onClick={() => onGoToPath(pathDraft)}
+              onClick={submitPathDraft}
             >
               {t("files.go")}
             </button>

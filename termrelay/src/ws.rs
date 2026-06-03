@@ -34,10 +34,20 @@ const HTTP_TUNNEL_BODY_CHANNEL_CAPACITY: usize = 1;
 const HTTP_TUNNEL_SHORT_REQUEST_BODY_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(test)]
 const HTTP_TUNNEL_SHORT_REQUEST_BODY_TIMEOUT: Duration = Duration::from_millis(50);
+// 中文注释：route_ready 之后 client 可能先发少量 E2EE 数据，但 daemon data 必须及时接上；
+// 超时后只关闭 relay transport，daemon session 本身仍由 daemon 管理。
+#[cfg(not(test))]
+const PENDING_CLIENT_PAIR_DEADLINE: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const PENDING_CLIENT_PAIR_DEADLINE: Duration = Duration::from_millis(250);
+const PENDING_CLIENTS_PER_ROOM_LIMIT: usize = 64;
 // 中文注释：client route_ready 先于 daemon data 反连完成返回时，browser 可能立刻发送
 // E2EE hello/auth/attach。relay 只做短暂 opaque 缓冲，避免公网反连慢几百毫秒就让前端超时。
 const PRE_PAIR_CLIENT_BUFFER_MAX_FRAMES: usize = 256;
 const PRE_PAIR_CLIENT_BUFFER_MAX_BYTES: usize = 4 * 1024 * 1024;
+const PRE_PAIR_ROOM_BUFFER_MAX_BYTES: usize = PRE_PAIR_CLIENT_BUFFER_MAX_BYTES * 2;
+const IDLE_DAEMON_DATA_PIPE_LIMIT: usize = 8;
+const RELAY_AUTH_TOKEN_MIN_BYTES: usize = 8;
 // relay 只关闭当前 WebSocket transport；不会解释或终止 E2EE 内部的 daemon session。
 const ROUTE_PRELUDE_TIMEOUT: Duration = Duration::from_secs(5);
 const WEBSOCKET_SEND_DEADLINE: Duration = Duration::from_secs(10);
@@ -58,7 +68,6 @@ type ConnectionId = u64;
 enum RelayHttpTunnelRequestBodyDeadline {
     None,
     FirstChunk(Duration),
-    Whole(Duration),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -623,6 +632,26 @@ impl From<OpaqueFrame> for Message {
     }
 }
 
+fn relay_auth_token_has_safe_length(token: &str) -> bool {
+    token.as_bytes().len() >= RELAY_AUTH_TOKEN_MIN_BYTES
+}
+
+fn relay_auth_token_constant_time_eq(expected: &str, provided: &str) -> bool {
+    let expected = expected.as_bytes();
+    let provided = provided.as_bytes();
+    let max_len = expected.len().max(provided.len());
+    let mut diff = expected.len() ^ provided.len();
+
+    // 中文注释：这里按最大长度完整扫描，避免普通字符串比较在首个不同字节提前返回。
+    for index in 0..max_len {
+        let expected_byte = expected.get(index).copied().unwrap_or(0);
+        let provided_byte = provided.get(index).copied().unwrap_or(0);
+        diff |= usize::from(expected_byte ^ provided_byte);
+    }
+
+    diff == 0
+}
+
 #[derive(Clone)]
 pub struct RelayState {
     inner: Arc<RelayRegistry>,
@@ -648,6 +677,14 @@ impl Default for RelayState {
 
 impl RelayState {
     pub fn new(auth_token: Option<String>) -> Self {
+        if let Some(token) = auth_token.as_deref()
+            && !relay_auth_token_has_safe_length(token)
+        {
+            warn!(
+                min_bytes = RELAY_AUTH_TOKEN_MIN_BYTES,
+                "relay auth token is too short; authenticated relay requests will be rejected"
+            );
+        }
         Self {
             inner: Arc::new(RelayRegistry::default()),
             auth_token,
@@ -656,13 +693,37 @@ impl RelayState {
 
     pub fn authorizes(&self, token: Option<&str>) -> bool {
         match self.auth_token.as_deref() {
-            Some(expected) => token == Some(expected),
+            Some(expected) => token.is_some_and(|provided| {
+                relay_auth_token_has_safe_length(expected)
+                    && relay_auth_token_has_safe_length(provided)
+                    && relay_auth_token_constant_time_eq(expected, provided)
+            }),
             None => true,
         }
     }
 
     pub fn room_count(&self) -> usize {
         self.inner.room_count()
+    }
+
+    fn start_pending_client_pair_deadline(&self, registration: &ConnectionRegistration) {
+        if registration.role != ConnectionRole::Client {
+            return;
+        }
+
+        let state = self.clone();
+        let registration = registration.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(PENDING_CLIENT_PAIR_DEADLINE).await;
+            if state.inner.close_pending_client_if_unpaired(&registration) {
+                warn!(
+                    server_id = %registration.server_id.0,
+                    client_connection_id = registration.id,
+                    timeout_ms = PENDING_CLIENT_PAIR_DEADLINE.as_millis(),
+                    "relay pending client data pair deadline exceeded"
+                );
+            }
+        });
     }
 
     fn register_route(
@@ -744,7 +805,7 @@ impl RelayState {
         headers: Vec<(String, String)>,
         body: BodyDataStream,
     ) -> Result<Response, StatusCode> {
-        let request_body_deadline = relay_http_tunnel_request_body_deadline(&method, &path);
+        let request_body_deadline = relay_http_tunnel_request_body_deadline(&method);
         let request_head =
             encode_relay_http_tunnel_request_head(method.clone(), path.clone(), headers)
                 .map_err(|_| StatusCode::BAD_REQUEST)?;
@@ -761,9 +822,12 @@ impl RelayState {
             .register_route(&prelude, sender)
             .map_err(|error| match error {
                 RelayError::DaemonControlOffline => StatusCode::SERVICE_UNAVAILABLE,
-                RelayError::DaemonControlBusy => StatusCode::TOO_MANY_REQUESTS,
+                RelayError::DaemonControlBusy | RelayError::PendingClientLimitExceeded => {
+                    StatusCode::TOO_MANY_REQUESTS
+                }
                 _ => StatusCode::BAD_GATEWAY,
             })?;
+        self.start_pending_client_pair_deadline(&registration);
         debug!(
             server_id = %server_id.0,
             client_connection_id = registration.id,
@@ -975,13 +1039,6 @@ async fn relay_http_tunnel_forward_request_body(
     deadline: RelayHttpTunnelRequestBodyDeadline,
 ) -> Result<(), StatusCode> {
     match deadline {
-        RelayHttpTunnelRequestBodyDeadline::Whole(deadline) => {
-            let forward =
-                relay_http_tunnel_forward_request_body_inner(state, registration, body, None);
-            timeout(deadline, forward)
-                .await
-                .unwrap_or(Err(StatusCode::GATEWAY_TIMEOUT))
-        }
         RelayHttpTunnelRequestBodyDeadline::FirstChunk(deadline) => {
             relay_http_tunnel_forward_request_body_inner(state, registration, body, Some(deadline))
                 .await
@@ -1068,23 +1125,15 @@ async fn relay_http_tunnel_forward_request_body_inner(
     Ok(())
 }
 
-fn relay_http_tunnel_request_body_deadline(
-    method: &str,
-    path: &str,
-) -> RelayHttpTunnelRequestBodyDeadline {
-    // 中文注释：只有短 metadata body 需要 deadline；`/api/files/upload` 是真实文件长流，
-    // 因此只限制首个 metadata chunk，不限制后续文件内容的整体耗时。
-    if !method.eq_ignore_ascii_case("POST") {
-        return RelayHttpTunnelRequestBodyDeadline::None;
-    }
-    match path {
-        "/api/files/upload/init" | "/api/files/upload/abort" | "/api/files/download" => {
-            RelayHttpTunnelRequestBodyDeadline::Whole(HTTP_TUNNEL_SHORT_REQUEST_BODY_TIMEOUT)
-        }
-        "/api/files/upload" => {
-            RelayHttpTunnelRequestBodyDeadline::FirstChunk(HTTP_TUNNEL_SHORT_REQUEST_BODY_TIMEOUT)
-        }
-        _ => RelayHttpTunnelRequestBodyDeadline::None,
+fn relay_http_tunnel_request_body_deadline(method: &str) -> RelayHttpTunnelRequestBodyDeadline {
+    // 中文注释：relay 只按通用 HTTP tunnel 传输规则限时，不识别文件 API path 或业务语义。
+    if method.eq_ignore_ascii_case("POST")
+        || method.eq_ignore_ascii_case("PUT")
+        || method.eq_ignore_ascii_case("PATCH")
+    {
+        RelayHttpTunnelRequestBodyDeadline::FirstChunk(HTTP_TUNNEL_SHORT_REQUEST_BODY_TIMEOUT)
+    } else {
+        RelayHttpTunnelRequestBodyDeadline::None
     }
 }
 
@@ -1175,6 +1224,7 @@ struct RelayRoom {
     daemon_data: HashMap<ConnectionId, ConnectionEndpoint>,
     idle_daemon_data: VecDeque<ConnectionId>,
     clients: HashMap<ConnectionId, ConnectionEndpoint>,
+    pre_pair_client_bytes: usize,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -1202,6 +1252,14 @@ impl PrePairBuffer {
         Ok(())
     }
 
+    fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    fn is_empty(&self) -> bool {
+        self.frames.is_empty()
+    }
+
     fn drain(&mut self) -> Vec<OpaqueFrame> {
         self.bytes = 0;
         self.frames.drain(..).collect()
@@ -1224,6 +1282,7 @@ impl RelayRoom {
             client.pair_signal.notify_waiters();
             client.sender.request_close();
         }
+        self.pre_pair_client_bytes = 0;
         for (_, daemon_data) in self.daemon_data.drain() {
             daemon_data.sender.request_close();
         }
@@ -1248,6 +1307,7 @@ impl RelayRoom {
             removed: true,
             notified_data_pipe: false,
         };
+        self.release_client_pre_pair_bytes(&client);
         client.pair_signal.notify_waiters();
         if let Some(data_id) = client.paired_daemon_data_id {
             self.idle_daemon_data.retain(|idle_id| *idle_id != data_id);
@@ -1284,6 +1344,7 @@ impl RelayRoom {
             .any(|idle_id| *idle_id == data_id)
         {
             self.idle_daemon_data.push_back(data_id);
+            self.enforce_idle_daemon_data_limit();
         }
         true
     }
@@ -1349,19 +1410,33 @@ impl RelayRoom {
         client_id: ConnectionId,
         frame: OpaqueFrame,
     ) -> Result<(), OpaqueFrame> {
-        let Some(client) = self.clients.get_mut(&client_id) else {
+        if !self.clients.contains_key(&client_id) {
             return Err(frame);
-        };
-        client.pre_pair_buffer.push(frame)
+        }
+
+        let frame_len = frame.len();
+        if self.pre_pair_client_bytes.saturating_add(frame_len) > PRE_PAIR_ROOM_BUFFER_MAX_BYTES {
+            return Err(frame);
+        }
+
+        let client = self
+            .clients
+            .get_mut(&client_id)
+            .expect("client existence was checked before pre-pair buffering");
+        client.pre_pair_buffer.push(frame)?;
+        self.pre_pair_client_bytes = self.pre_pair_client_bytes.saturating_add(frame_len);
+        Ok(())
     }
 
     fn drain_pre_pair_client_frames(
         &mut self,
         client_id: ConnectionId,
     ) -> Option<Vec<OpaqueFrame>> {
-        self.clients
-            .get_mut(&client_id)
-            .map(|client| client.pre_pair_buffer.drain())
+        let client = self.clients.get_mut(&client_id)?;
+        let bytes = client.pre_pair_buffer.bytes();
+        let frames = client.pre_pair_buffer.drain();
+        self.pre_pair_client_bytes = self.pre_pair_client_bytes.saturating_sub(bytes);
+        Some(frames)
     }
 
     fn notify_client_disconnected_to_control(&mut self, client_id: ConnectionId) {
@@ -1380,6 +1455,44 @@ impl RelayRoom {
             self.clear_daemon_control_and_dependents();
         }
     }
+
+    fn pending_client_count(&self) -> usize {
+        self.clients
+            .values()
+            .filter(|client| client.paired_daemon_data_id.is_none())
+            .count()
+    }
+
+    fn has_assignable_idle_daemon_data(&self) -> bool {
+        self.idle_daemon_data.iter().any(|data_id| {
+            self.daemon_data
+                .get(data_id)
+                .is_some_and(|daemon_data| daemon_data.paired_client_id.is_none())
+        })
+    }
+
+    fn enforce_idle_daemon_data_limit(&mut self) {
+        while self.idle_daemon_data.len() > IDLE_DAEMON_DATA_PIPE_LIMIT {
+            let Some(data_id) = self.idle_daemon_data.pop_front() else {
+                break;
+            };
+            let Some(daemon_data) = self.daemon_data.remove(&data_id) else {
+                continue;
+            };
+            warn!(
+                daemon_data_connection_id = data_id,
+                idle_data_pipe_limit = IDLE_DAEMON_DATA_PIPE_LIMIT,
+                "relay closing oldest idle daemon data pipe over room limit"
+            );
+            daemon_data.sender.request_close();
+        }
+    }
+
+    fn release_client_pre_pair_bytes(&mut self, client: &ConnectionEndpoint) {
+        self.pre_pair_client_bytes = self
+            .pre_pair_client_bytes
+            .saturating_sub(client.pre_pair_buffer.bytes());
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1390,6 +1503,7 @@ struct ConnectionEndpoint {
     paired_daemon_data_id: Option<ConnectionId>,
     paired_client_id: Option<ConnectionId>,
     pre_pair_buffer: PrePairBuffer,
+    pre_pair_flush_in_progress: bool,
     pair_signal: Arc<Notify>,
 }
 
@@ -1402,6 +1516,7 @@ impl ConnectionEndpoint {
             paired_daemon_data_id: None,
             paired_client_id: None,
             pre_pair_buffer: PrePairBuffer::default(),
+            pre_pair_flush_in_progress: false,
             pair_signal: Arc::new(Notify::new()),
         }
     }
@@ -1414,6 +1529,7 @@ impl ConnectionEndpoint {
             paired_daemon_data_id: None,
             paired_client_id: None,
             pre_pair_buffer: PrePairBuffer::default(),
+            pre_pair_flush_in_progress: false,
             pair_signal: Arc::new(Notify::new()),
         }
     }
@@ -1426,6 +1542,7 @@ impl ConnectionEndpoint {
             paired_daemon_data_id: None,
             paired_client_id: Some(client_id),
             pre_pair_buffer: PrePairBuffer::default(),
+            pre_pair_flush_in_progress: false,
             pair_signal: Arc::new(Notify::new()),
         }
     }
@@ -1438,6 +1555,7 @@ impl ConnectionEndpoint {
             paired_daemon_data_id: None,
             paired_client_id: None,
             pre_pair_buffer: PrePairBuffer::default(),
+            pre_pair_flush_in_progress: false,
             pair_signal: Arc::new(Notify::new()),
         }
     }
@@ -1486,6 +1604,8 @@ enum RelayError {
     DaemonControlOffline,
     #[error("daemon control channel is backpressured")]
     DaemonControlBusy,
+    #[error("relay room has too many pending clients")]
+    PendingClientLimitExceeded,
     #[error("daemon data route is missing client_id or data_token")]
     DaemonDataRouteInvalid,
     #[error("daemon data route does not match a pending client")]
@@ -1499,6 +1619,7 @@ impl RelayError {
         match self {
             Self::DaemonControlOffline => "relay_daemon_offline",
             Self::DaemonControlBusy => "relay_busy",
+            Self::PendingClientLimitExceeded => "relay_pending_client_limit",
             Self::DaemonDataRouteInvalid => "relay_data_route_invalid",
             Self::DaemonDataRouteRejected => "relay_data_route_rejected",
             Self::Poisoned => "relay_state_unavailable",
@@ -1511,6 +1632,9 @@ impl RelayError {
                 "relay daemon control is not connected; retry after daemon reconnects"
             }
             Self::DaemonControlBusy => "relay daemon control is busy; retry shortly",
+            Self::PendingClientLimitExceeded => {
+                "relay room has too many clients waiting for daemon data; retry shortly"
+            }
             Self::DaemonDataRouteInvalid => "relay daemon data route is invalid",
             Self::DaemonDataRouteRejected => "relay daemon data route was rejected",
             Self::Poisoned => "relay state is temporarily unavailable",
@@ -1611,6 +1735,10 @@ impl RelayRegistry {
                             return Err(RelayError::DaemonDataRouteRejected);
                         }
                         client.paired_daemon_data_id = Some(id);
+                        // 中文注释：data pipe 已经完成身份配对，但配对前 client 可能已有
+                        // 业务帧排在预缓冲里。flush 完成前，新来的帧仍必须继续进入同一
+                        // 预缓冲队列，否则会越过旧帧直达 daemon data。
+                        client.pre_pair_flush_in_progress = !client.pre_pair_buffer.is_empty();
                         client.pair_signal.notify_waiters();
                         room.daemon_data.insert(
                             id,
@@ -1627,6 +1755,7 @@ impl RelayRegistry {
                         room.daemon_data
                             .insert(id, ConnectionEndpoint::new_idle_daemon_data(id, sender));
                         room.idle_daemon_data.push_back(id);
+                        room.enforce_idle_daemon_data_limit();
                         debug!(
                             server_id = %server_id.0,
                             connection_id = id,
@@ -1641,6 +1770,11 @@ impl RelayRegistry {
                 let room = rooms
                     .get_mut(&server_id)
                     .ok_or(RelayError::DaemonControlOffline)?;
+                if !room.has_assignable_idle_daemon_data()
+                    && room.pending_client_count() >= PENDING_CLIENTS_PER_ROOM_LIMIT
+                {
+                    return Err(RelayError::PendingClientLimitExceeded);
+                }
                 let data_token = Nonce(format!("relay-data-{}-{id}", uuid::Uuid::new_v4()));
                 let control_sender = room
                     .daemon_control
@@ -1677,6 +1811,10 @@ impl RelayRegistry {
                         id,
                         paired_client_id: None,
                     });
+                }
+                if room.pending_client_count() > PENDING_CLIENTS_PER_ROOM_LIMIT {
+                    room.close_client_transport(id);
+                    return Err(RelayError::PendingClientLimitExceeded);
                 }
                 match control_sender
                     .try_send_control(RelayOutbound::Frame(relay_control_frame(open_data)))
@@ -1807,6 +1945,33 @@ impl RelayRegistry {
             .is_some_and(|client| client.paired_daemon_data_id.is_some())
     }
 
+    fn close_pending_client_if_unpaired(&self, registration: &ConnectionRegistration) -> bool {
+        if registration.role != ConnectionRole::Client {
+            return false;
+        }
+
+        let Ok(mut rooms) = self.rooms.lock() else {
+            warn!("relay registry mutex poisoned during pending client deadline cleanup");
+            return false;
+        };
+        let Some(room) = rooms.get_mut(&registration.server_id) else {
+            return false;
+        };
+        let Some(client) = room.clients.get(&registration.id) else {
+            return false;
+        };
+        if client.paired_daemon_data_id.is_some() {
+            return false;
+        }
+
+        let close = room.close_client_transport(registration.id);
+        if close.removed && !close.notified_data_pipe {
+            room.notify_client_disconnected_to_control(registration.id);
+        }
+        Self::remove_room_if_empty(&mut rooms, registration.server_id);
+        close.removed
+    }
+
     async fn wait_client_data_pair(&self, registration: &ConnectionRegistration) -> bool {
         if registration.role != ConnectionRole::Client {
             return false;
@@ -1896,6 +2061,10 @@ impl RelayRegistry {
                     dropped: 1,
                 };
             };
+            if client.pre_pair_flush_in_progress {
+                drop(rooms);
+                return self.buffer_unpaired_client_frame(registration, frame);
+            }
             let Some(data_id) = client.paired_daemon_data_id else {
                 drop(rooms);
                 return self.buffer_unpaired_client_frame(registration, frame);
@@ -2082,22 +2251,25 @@ impl RelayRegistry {
         let Some(client_id) = registration.paired_client_id else {
             return;
         };
-        let Some((frames, daemon_sender)) =
-            self.take_pre_pair_client_frames(registration, client_id)
-        else {
-            return;
-        };
-        let frame_count = frames.len();
-        if frame_count == 0 {
-            return;
-        }
+        let mut frame_count = 0_usize;
         let mut delivered = 0_usize;
-        for frame in frames {
-            match daemon_sender.send_data(RelayOutbound::Frame(frame)).await {
-                Ok(()) => delivered = delivered.saturating_add(1),
-                Err(RelayDataSendError::BudgetFull) | Err(RelayDataSendError::Closed) => {
-                    self.close_client_after_pre_pair_flush_failure(registration, client_id);
-                    break;
+        loop {
+            let Some((frames, daemon_sender)) =
+                self.take_pre_pair_client_frames(registration, client_id)
+            else {
+                return;
+            };
+            if frames.is_empty() {
+                break;
+            }
+            frame_count = frame_count.saturating_add(frames.len());
+            for frame in frames {
+                match daemon_sender.send_data(RelayOutbound::Frame(frame)).await {
+                    Ok(()) => delivered = delivered.saturating_add(1),
+                    Err(RelayDataSendError::BudgetFull) | Err(RelayDataSendError::Closed) => {
+                        self.close_client_after_pre_pair_flush_failure(registration, client_id);
+                        break;
+                    }
                 }
             }
         }
@@ -2122,7 +2294,19 @@ impl RelayRegistry {
         };
         let room = rooms.get_mut(&registration.server_id)?;
         let daemon_sender = room.daemon_data.get(&registration.id)?.sender.clone();
+        let client = room.clients.get(&client_id)?;
+        if client.paired_daemon_data_id != Some(registration.id) {
+            return None;
+        }
         let frames = room.drain_pre_pair_client_frames(client_id)?;
+        if frames.is_empty()
+            && let Some(client) = room.clients.get_mut(&client_id)
+            && client.paired_daemon_data_id == Some(registration.id)
+        {
+            // 中文注释：只在确认预缓冲已经为空时结束 flushing 阶段；此前新帧会继续
+            // 进入预缓冲，确保配对前后的 client 帧按原始 FIFO 顺序送到 daemon。
+            client.pre_pair_flush_in_progress = false;
+        }
         Some((frames, daemon_sender))
     }
 
@@ -2427,6 +2611,7 @@ pub async fn handle_socket(mut socket: WebSocket, state: RelayState) {
             return;
         }
     };
+    state.start_pending_client_pair_deadline(&registration);
 
     if role == ConnectionRole::Client {
         debug!(
@@ -2467,13 +2652,6 @@ pub async fn handle_socket(mut socket: WebSocket, state: RelayState) {
         "relay websocket registered"
     );
 
-    if role == ConnectionRole::DaemonData {
-        state
-            .inner
-            .flush_pre_pair_client_frames(&registration)
-            .await;
-    }
-
     let (sender, mut receiver) = socket.split();
     let mut receive_debug = WebSocketReceiveDebug::new(Instant::now());
     let mut traffic = RelayConnectionTraffic::default();
@@ -2495,6 +2673,16 @@ pub async fn handle_socket(mut socket: WebSocket, state: RelayState) {
         writer_close_rx,
         writer_outcome_tx,
     ));
+
+    if role == ConnectionRole::DaemonData {
+        // 中文注释：预配对帧 flush 会写入当前 daemon data 的 outbound data 队列。
+        // 必须先启动 writer 消费该队列，再执行 flush；否则队列/字节预算被填满时，
+        // flush 会等待一个尚未存在的消费者，造成连接读写启动前的饥饿等待。
+        state
+            .inner
+            .flush_pre_pair_client_frames(&registration)
+            .await;
+    }
 
     loop {
         // 写侧由 writer task 消费；这里持续读入站帧，避免慢写把反方向输入也卡住。
@@ -3424,6 +3612,32 @@ mod tests {
         )
     }
 
+    async fn recv_data_text(receiver: &mut TestReceiver) -> String {
+        let outbound = receiver
+            .data
+            .recv()
+            .await
+            .expect("daemon data receiver should stay open");
+        receiver.data_budget.release(outbound.queued_data_bytes());
+        let RelayOutbound::Frame(OpaqueFrame::Text(text)) = outbound else {
+            panic!("expected text data frame, got {outbound:?}");
+        };
+        text
+    }
+
+    async fn recv_data_frame(receiver: &mut TestReceiver) -> OpaqueFrame {
+        let outbound = receiver
+            .data
+            .recv()
+            .await
+            .expect("daemon data receiver should stay open");
+        receiver.data_budget.release(outbound.queued_data_bytes());
+        let RelayOutbound::Frame(frame) = outbound else {
+            panic!("expected data frame, got {outbound:?}");
+        };
+        frame
+    }
+
     fn route_hello(
         server_id: ServerId,
         role: RouteRole,
@@ -3516,8 +3730,14 @@ mod tests {
         >,
         wait: Duration,
     ) -> RelayClientId {
+        let deadline = tokio::time::Instant::now() + wait;
         loop {
-            let next = timeout(wait, socket.next())
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "daemon control should receive client_disconnected before timeout"
+            );
+            let next = timeout(remaining, socket.next())
                 .await
                 .expect("daemon control should quickly receive client_disconnected")
                 .expect("daemon control websocket should stay open")
@@ -3567,8 +3787,17 @@ mod tests {
             tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
         >,
     ) -> Option<ClientMessage> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
         loop {
-            match socket.next().await?.unwrap() {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "timed out waiting for relay data frame"
+            );
+            let next = timeout(remaining, socket.next())
+                .await
+                .expect("timed out waiting for relay data frame")?;
+            match next.unwrap() {
                 ClientMessage::Ping(_) | ClientMessage::Pong(_) => continue,
                 frame => return Some(frame),
             }
@@ -3643,7 +3872,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            axum::serve(listener, router(RelayState::default(), false))
+            axum::serve(listener, router(RelayState::default(), false, false))
                 .await
                 .unwrap();
         });
@@ -3707,7 +3936,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            axum::serve(listener, router(RelayState::default(), false))
+            axum::serve(listener, router(RelayState::default(), false, false))
                 .await
                 .unwrap();
         });
@@ -3732,11 +3961,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_client_pair_deadline_closes_unpaired_client_and_notifies_daemon() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router(RelayState::default(), false, false))
+                .await
+                .unwrap();
+        });
+        let server_id = server_id(97);
+        let url = format!("ws://{addr}/ws");
+        let (mut daemon_control, _daemon_response) = connect_async(url.clone()).await.unwrap();
+        register_test_route(&mut daemon_control, server_id, RouteRole::DaemonControl).await;
+
+        let (mut client, _client_response) = connect_async(url).await.unwrap();
+        send_client_route_hello_only(&mut client, server_id).await;
+        let (client_id, _data_token) = expect_open_data(&mut daemon_control).await;
+        expect_route_ready(&mut client, server_id, RouteRole::Client).await;
+
+        // 中文注释：daemon data 一直不反连时，relay 必须自己回收 pending client，
+        // 不能让公网连接和预配对缓冲无限占用 room 资源。
+        let disconnected =
+            expect_client_disconnected(&mut daemon_control, Duration::from_millis(500)).await;
+        assert_eq!(disconnected, client_id);
+        timeout(Duration::from_millis(500), async {
+            loop {
+                match client.next().await {
+                    None | Some(Err(_)) | Some(Ok(ClientMessage::Close(_))) => break,
+                    Some(Ok(ClientMessage::Ping(payload))) => {
+                        let _ = client.send(ClientMessage::Pong(payload)).await;
+                    }
+                    Some(Ok(ClientMessage::Pong(_))) => {}
+                    Some(Ok(other)) => {
+                        panic!("expected pending client websocket close, got {other:?}")
+                    }
+                }
+            }
+        })
+        .await
+        .expect("pending client should close after pair deadline");
+
+        daemon_control.close(None).await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn legacy_daemon_mux_route_is_rejected() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            axum::serve(listener, router(RelayState::default(), false))
+            axum::serve(listener, router(RelayState::default(), false, false))
                 .await
                 .unwrap();
         });
@@ -3760,7 +4034,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            axum::serve(listener, router(RelayState::default(), false))
+            axum::serve(listener, router(RelayState::default(), false, false))
                 .await
                 .unwrap();
         });
@@ -3821,7 +4095,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            axum::serve(listener, router(RelayState::default(), false))
+            axum::serve(listener, router(RelayState::default(), false, false))
                 .await
                 .unwrap();
         });
@@ -3846,7 +4120,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            axum::serve(listener, router(RelayState::default(), false))
+            axum::serve(listener, router(RelayState::default(), false, false))
                 .await
                 .unwrap();
         });
@@ -3895,22 +4169,26 @@ mod tests {
     }
 
     #[test]
-    fn relay_http_tunnel_deadline_applies_only_to_short_request_bodies() {
+    fn relay_http_tunnel_deadline_is_not_file_api_path_specific() {
         assert_eq!(
-            relay_http_tunnel_request_body_deadline("POST", "/api/files/upload/init"),
-            RelayHttpTunnelRequestBodyDeadline::Whole(HTTP_TUNNEL_SHORT_REQUEST_BODY_TIMEOUT)
-        );
-        assert_eq!(
-            relay_http_tunnel_request_body_deadline("POST", "/api/files/download"),
-            RelayHttpTunnelRequestBodyDeadline::Whole(HTTP_TUNNEL_SHORT_REQUEST_BODY_TIMEOUT)
-        );
-        assert_eq!(
-            relay_http_tunnel_request_body_deadline("POST", "/api/files/upload/abort"),
-            RelayHttpTunnelRequestBodyDeadline::Whole(HTTP_TUNNEL_SHORT_REQUEST_BODY_TIMEOUT)
-        );
-        assert_eq!(
-            relay_http_tunnel_request_body_deadline("POST", "/api/files/upload"),
+            relay_http_tunnel_request_body_deadline("POST"),
             RelayHttpTunnelRequestBodyDeadline::FirstChunk(HTTP_TUNNEL_SHORT_REQUEST_BODY_TIMEOUT)
+        );
+        assert_eq!(
+            relay_http_tunnel_request_body_deadline("post"),
+            RelayHttpTunnelRequestBodyDeadline::FirstChunk(HTTP_TUNNEL_SHORT_REQUEST_BODY_TIMEOUT)
+        );
+        assert_eq!(
+            relay_http_tunnel_request_body_deadline("PUT"),
+            RelayHttpTunnelRequestBodyDeadline::FirstChunk(HTTP_TUNNEL_SHORT_REQUEST_BODY_TIMEOUT)
+        );
+        assert_eq!(
+            relay_http_tunnel_request_body_deadline("PATCH"),
+            RelayHttpTunnelRequestBodyDeadline::FirstChunk(HTTP_TUNNEL_SHORT_REQUEST_BODY_TIMEOUT)
+        );
+        assert_eq!(
+            relay_http_tunnel_request_body_deadline("GET"),
+            RelayHttpTunnelRequestBodyDeadline::None
         );
     }
 
@@ -4001,6 +4279,281 @@ mod tests {
         assert_eq!(data.paired_client_id, Some(client.id));
         assert!(state.client_has_data_pair(&client));
         assert!(state.has_client(server_id, RelayClientId(client.id)));
+    }
+
+    #[test]
+    fn room_rejects_pending_clients_over_room_limit() {
+        let state = RelayState::default();
+        let server_id = server_id(81);
+        let (control_tx, mut control_rx) = channel();
+        state
+            .register(server_id, ConnectionRole::DaemonControl, control_tx)
+            .unwrap();
+
+        // 中文注释：这里故意不接 daemon data，让 client 都停在 pending 状态。
+        for _ in 0..64 {
+            let (client_tx, _client_rx) = channel();
+            register_pending_client(&state, server_id, client_tx, &mut control_rx);
+        }
+
+        let (overflow_tx, _overflow_rx) = channel();
+        assert!(
+            state
+                .register(server_id, ConnectionRole::Client, overflow_tx)
+                .is_err(),
+            "第 65 个未配对 client 应被 room 级 pending 数量上限拒绝"
+        );
+    }
+
+    #[tokio::test]
+    async fn room_pre_pair_buffer_uses_room_byte_budget() {
+        let state = RelayState::default();
+        let server_id = server_id(82);
+        let (control_tx, mut control_rx) = channel();
+        state
+            .register(server_id, ConnectionRole::DaemonControl, control_tx)
+            .unwrap();
+
+        let mut clients = Vec::new();
+        for _ in 0..3 {
+            let (client_tx, _client_rx) = channel();
+            let (client, _client_id, _data_token) =
+                register_pending_client(&state, server_id, client_tx, &mut control_rx);
+            clients.push(client);
+        }
+
+        // 中文注释：每个 frame 都低于单 client 上限；第三个只应因 room 总预算被拒绝。
+        let frame = vec![7; PRE_PAIR_CLIENT_BUFFER_MAX_BYTES * 3 / 4];
+        assert_eq!(
+            state
+                .forward_from(&clients[0], OpaqueFrame::Binary(frame.clone()))
+                .await,
+            ForwardReport {
+                attempted: 1,
+                delivered: 1,
+                dropped: 0,
+            }
+        );
+        assert_eq!(
+            state
+                .forward_from(&clients[1], OpaqueFrame::Binary(frame.clone()))
+                .await,
+            ForwardReport {
+                attempted: 1,
+                delivered: 1,
+                dropped: 0,
+            }
+        );
+        assert_eq!(
+            state
+                .forward_from(&clients[2], OpaqueFrame::Binary(frame))
+                .await,
+            ForwardReport {
+                attempted: 1,
+                delivered: 0,
+                dropped: 1,
+            }
+        );
+        assert!(
+            !state.has_client(server_id, RelayClientId(clients[2].id)),
+            "超出 room 预配对字节预算的 client 应被清理"
+        );
+    }
+
+    #[tokio::test]
+    async fn paired_client_frames_wait_behind_pre_pair_flush() {
+        let state = RelayState::default();
+        let server_id = server_id(84);
+        let (control_tx, mut control_rx) = channel();
+        let (client_tx, _client_rx) = channel();
+        let (data_tx, mut data_rx) = channel_with_data_capacity(1);
+        state
+            .register(server_id, ConnectionRole::DaemonControl, control_tx)
+            .unwrap();
+        let (client, client_id, data_token) =
+            register_pending_client(&state, server_id, client_tx, &mut control_rx);
+
+        assert_eq!(
+            state
+                .forward_from(&client, OpaqueFrame::Text("before-1".to_owned()))
+                .await,
+            ForwardReport {
+                attempted: 1,
+                delivered: 1,
+                dropped: 0,
+            }
+        );
+        assert_eq!(
+            state
+                .forward_from(&client, OpaqueFrame::Text("before-2".to_owned()))
+                .await,
+            ForwardReport {
+                attempted: 1,
+                delivered: 1,
+                dropped: 0,
+            }
+        );
+
+        data_tx
+            .try_send_data(RelayOutbound::Frame(OpaqueFrame::Text(
+                "occupy-capacity".to_owned(),
+            )))
+            .unwrap();
+        let data_registration = state
+            .register_route(
+                &RoutePrelude {
+                    server_id,
+                    route_role: RouteRole::DaemonData,
+                    connection_role: ConnectionRole::DaemonData,
+                    client_id: Some(client_id),
+                    data_token: Some(data_token),
+                },
+                data_tx,
+            )
+            .unwrap();
+
+        let flush_state = state.clone();
+        let flush_registration = data_registration.clone();
+        let mut flush_task = tokio::spawn(async move {
+            flush_state
+                .inner
+                .flush_pre_pair_client_frames(&flush_registration)
+                .await;
+        });
+        assert!(
+            timeout(Duration::from_millis(20), &mut flush_task)
+                .await
+                .is_err(),
+            "预缓冲 flush 应先被占满的 daemon data 队列卡住"
+        );
+
+        // 中文注释：配对已经完成但旧预缓冲尚未冲刷完；新帧必须继续排到旧帧后面，
+        // 不能因为 paired_daemon_data_id 已设置就绕过预缓冲直发。
+        assert_eq!(
+            state
+                .forward_from(&client, OpaqueFrame::Text("during-flush".to_owned()))
+                .await,
+            ForwardReport {
+                attempted: 1,
+                delivered: 1,
+                dropped: 0,
+            }
+        );
+
+        assert_eq!(recv_data_text(&mut data_rx).await, "occupy-capacity");
+        assert_eq!(recv_data_text(&mut data_rx).await, "before-1");
+        assert_eq!(recv_data_text(&mut data_rx).await, "before-2");
+        assert_eq!(recv_data_text(&mut data_rx).await, "during-flush");
+        timeout(Duration::from_secs(1), flush_task)
+            .await
+            .expect("预缓冲 flush 应在队列被读取后完成")
+            .unwrap();
+        assert!(state.has_client(server_id, RelayClientId(client.id)));
+    }
+
+    #[tokio::test]
+    async fn empty_pre_pair_frame_keeps_flush_fifo_gate_open() {
+        let state = RelayState::default();
+        let server_id = server_id(85);
+        let (control_tx, mut control_rx) = channel();
+        let (client_tx, _client_rx) = channel();
+        let (data_tx, mut data_rx) = channel();
+        state
+            .register(server_id, ConnectionRole::DaemonControl, control_tx)
+            .unwrap();
+        let (client, client_id, data_token) =
+            register_pending_client(&state, server_id, client_tx, &mut control_rx);
+
+        assert_eq!(
+            state
+                .forward_from(&client, OpaqueFrame::Text(String::new()))
+                .await,
+            ForwardReport {
+                attempted: 1,
+                delivered: 1,
+                dropped: 0,
+            }
+        );
+        let data_registration = state
+            .register_route(
+                &RoutePrelude {
+                    server_id,
+                    route_role: RouteRole::DaemonData,
+                    connection_role: ConnectionRole::DaemonData,
+                    client_id: Some(client_id),
+                    data_token: Some(data_token),
+                },
+                data_tx,
+            )
+            .unwrap();
+
+        // 中文注释：空 text frame 没有字节但仍是有效的 opaque 业务 frame。
+        // data 已配对但 flush 尚未显式执行时，新 frame 必须继续进入预缓冲，
+        // 否则会排到这个空 frame 前面。
+        assert_eq!(
+            state
+                .forward_from(&client, OpaqueFrame::Text("after-empty".to_owned()))
+                .await,
+            ForwardReport {
+                attempted: 1,
+                delivered: 1,
+                dropped: 0,
+            }
+        );
+
+        state
+            .inner
+            .flush_pre_pair_client_frames(&data_registration)
+            .await;
+
+        assert_eq!(
+            recv_data_frame(&mut data_rx).await,
+            OpaqueFrame::Text(String::new())
+        );
+        assert_eq!(
+            recv_data_frame(&mut data_rx).await,
+            OpaqueFrame::Text("after-empty".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn room_closes_oldest_idle_daemon_data_pipe_over_room_limit() {
+        let state = RelayState::default();
+        let server_id = server_id(83);
+        let (control_tx, _control_rx) = channel();
+        state
+            .register(server_id, ConnectionRole::DaemonControl, control_tx)
+            .unwrap();
+
+        let (oldest_tx, _oldest_rx) = channel();
+        let mut oldest_close_rx = oldest_tx.subscribe_close();
+        state
+            .register(server_id, ConnectionRole::DaemonData, oldest_tx)
+            .unwrap();
+
+        for _ in 0..8 {
+            let (data_tx, _data_rx) = channel();
+            state
+                .register(server_id, ConnectionRole::DaemonData, data_tx)
+                .unwrap();
+        }
+
+        timeout(Duration::from_millis(50), oldest_close_rx.closed())
+            .await
+            .expect("超过 idle data pipe 上限时应关闭最旧的空闲 data pipe");
+    }
+
+    #[test]
+    fn relay_auth_rejects_unsafe_short_configured_token() {
+        let short_state = RelayState::new(Some("short".to_owned()));
+        assert!(
+            !short_state.authorizes(Some("short")),
+            "公网 relay token 明显过短时不能被接受"
+        );
+
+        let long_state = RelayState::new(Some("relay-secret-1".to_owned()));
+        assert!(long_state.authorizes(Some("relay-secret-1")));
+        assert!(!long_state.authorizes(Some("relay-secret-2")));
     }
 
     #[tokio::test]

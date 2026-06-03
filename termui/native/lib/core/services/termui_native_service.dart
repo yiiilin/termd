@@ -75,10 +75,10 @@ final class TermuiNativeService {
     required String url,
     required String oneTimePairingCode,
   }) async {
-    final normalizedUrl = url.trim();
+    final normalizedUrl = normalizePairedServerUrl(url);
     final code = oneTimePairingCode.trim();
-    if (normalizedUrl.isEmpty || code.isEmpty) {
-      throw NativeValidationError('需要 daemon URL 和一次性配对码。');
+    if (code.isEmpty) {
+      throw NativeValidationError('需要一次性配对码。');
     }
 
     // 配对码只在本方法栈上短暂停留，当前骨架不记录、不缓存、不写 secure storage。

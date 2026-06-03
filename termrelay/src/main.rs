@@ -82,10 +82,18 @@ async fn main() -> Result<(), MainError> {
         listen = %args.listen,
         tls = tls.is_some(),
         web = args.web,
+        http_tunnel = args.http_tunnel,
         "starting termrelay dumb pipe"
     );
 
-    serve_listener(listener, RelayState::new(args.auth_token), tls, args.web).await
+    serve_listener(
+        listener,
+        RelayState::new(args.auth_token),
+        tls,
+        args.web,
+        args.http_tunnel,
+    )
+    .await
 }
 
 fn help_text() -> String {
@@ -97,14 +105,16 @@ fn help_text() -> String {
             "OPTIONS:\n",
             "  --listen, -l <HOST:PORT>      Listen address, default 127.0.0.1:8080\n",
             "  --auth-token <TOKEN>          Transport auth token required from daemon/client relay sockets\n",
+            "  --auth-token-file <PATH>      Read transport auth token from a file; conflicts with --auth-token\n",
             "  --tls-cert <CERT_PEM>         TLS certificate path\n",
             "  --tls-key <KEY_PEM>           TLS private key path; must be paired with --tls-cert\n",
             "  --web                         Serve embedded Web UI\n",
+            "  --http-tunnel                 Enable compatibility HTTP file tunnel paths\n",
             "  -h, --help                    Print help\n",
             "  -V, --version                 Print version\n\n",
             "EXAMPLES:\n",
-            "  termrelay --listen 0.0.0.0:8080\n",
-            "  termrelay --listen 127.0.0.1:8080 --auth-token env-token\n"
+            "  termrelay --listen 127.0.0.1:8080\n",
+            "  termrelay --listen 0.0.0.0:8080 --auth-token-file /run/secrets/termrelay_auth_token\n"
         ),
         env!("CARGO_PKG_VERSION")
     )
@@ -132,10 +142,13 @@ async fn serve_listener(
     state: RelayState,
     tls: Option<TlsPaths>,
     web_enabled: bool,
+    http_tunnel_enabled: bool,
 ) -> Result<(), MainError> {
     match tls {
-        Some(paths) => serve_tls_listener(listener, state, paths, web_enabled).await,
-        None => axum::serve(listener, router(state, web_enabled))
+        Some(paths) => {
+            serve_tls_listener(listener, state, paths, web_enabled, http_tunnel_enabled).await
+        }
+        None => axum::serve(listener, router(state, web_enabled, http_tunnel_enabled))
             .with_graceful_shutdown(shutdown_signal())
             .await
             .map_err(MainError::Serve),
@@ -147,9 +160,15 @@ async fn serve_tls_listener(
     state: RelayState,
     tls_paths: TlsPaths,
     web_enabled: bool,
+    http_tunnel_enabled: bool,
 ) -> Result<(), MainError> {
     let tls_config = load_rustls_server_config(&tls_paths)?;
-    serve_rustls_listener(listener, router(state, web_enabled), tls_config).await
+    serve_rustls_listener(
+        listener,
+        router(state, web_enabled, http_tunnel_enabled),
+        tls_config,
+    )
+    .await
 }
 
 fn load_rustls_server_config(tls_paths: &TlsPaths) -> Result<rustls::ServerConfig, MainError> {
@@ -245,7 +264,8 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            let _ = serve_tls_listener(listener, RelayState::default(), tls_paths, false).await;
+            let _ =
+                serve_tls_listener(listener, RelayState::default(), tls_paths, false, false).await;
         });
 
         let response = tls_healthz_request(addr, &cert_path).await;

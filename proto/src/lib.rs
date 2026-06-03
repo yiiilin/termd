@@ -3,8 +3,12 @@
 //! 这个 crate 只描述客户端、daemon 与 relay 都需要知道的稳定外壳。
 //! 具体业务规则仍由 daemon 执行，relay 只能基于外层路由字段转发密文。
 
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use base64::{
+    Engine as _,
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use uuid::Uuid;
 
 /// 所有 JSON 消息都使用同一个 envelope，避免不同层混用协议格式。
@@ -258,6 +262,94 @@ fn is_zero_u64(value: &u64) -> bool {
 pub const PROTOCOL_PACKET_VERSION: u16 = 3;
 /// 二进制数据面版本；双方都声明该版本时，E2EE 后的 packet 使用 WebSocket binary + Protobuf。
 pub const BINARY_PROTOCOL_VERSION: u16 = 2;
+
+pub const METHOD_PAIR_REQUEST: &str = "pair.request";
+pub const METHOD_AUTH: &str = "auth";
+pub const METHOD_AUTH_VERIFY: &str = "auth.verify";
+pub const METHOD_AUTH_CHALLENGE: &str = "auth.challenge";
+pub const METHOD_CLIENT_HELLO: &str = "client.hello";
+pub const METHOD_SESSION_CREATE: &str = "session.create";
+pub const METHOD_SESSION_ATTACH: &str = "session.attach";
+pub const METHOD_TERMINAL_CREATE: &str = "terminal.create";
+pub const METHOD_TERMINAL_ATTACH: &str = "terminal.attach";
+pub const METHOD_TERMINAL_OUTPUT: &str = "terminal.output";
+pub const METHOD_SESSION_DATA: &str = "session.data";
+pub const METHOD_SESSION_ACTIVITY: &str = "session.activity";
+pub const METHOD_SESSION_CURSOR: &str = "session.cursor";
+pub const METHOD_SESSION_RESIZE: &str = "session.resize";
+pub const METHOD_SESSION_RESIZED: &str = "session.resized";
+pub const METHOD_SESSION_RENAME: &str = "session.rename";
+pub const METHOD_SESSION_REORDER: &str = "session.reorder";
+pub const METHOD_SESSION_CLOSE: &str = "session.close";
+pub const METHOD_SESSION_SEARCH: &str = "session.search";
+pub const METHOD_SESSION_FILES: &str = "session.files";
+pub const METHOD_SESSION_GIT: &str = "session.git";
+pub const METHOD_SESSION_GIT_ACTION: &str = "session.git_action";
+pub const METHOD_SESSION_GIT_DIFF: &str = "session.git_diff";
+pub const METHOD_SESSION_FILE_READ: &str = "session.file_read";
+pub const METHOD_SESSION_FILE_WRITE: &str = "session.file_write";
+pub const METHOD_SESSION_FILE_DELETE: &str = "session.file_delete";
+pub const METHOD_SESSION_FILE_DOWNLOAD_PREPARE: &str = "session.file_download_prepare";
+pub const METHOD_SESSION_FILE_DOWNLOAD_CHUNK: &str = "session.file_download_chunk";
+pub const METHOD_SESSION_FILE_UPLOAD_STREAM: &str = "session.file_upload";
+pub const METHOD_SESSION_FILE_DOWNLOAD_STREAM: &str = "session.file_download";
+pub const METHOD_SESSION_LIST: &str = "session.list";
+pub const METHOD_DAEMON_CLIENTS: &str = "daemon.clients";
+pub const METHOD_DAEMON_CLIENT_FORGET: &str = "daemon.client_forget";
+pub const METHOD_DAEMON_STATUS: &str = "daemon.status";
+pub const METHOD_CONTROL_REQUEST: &str = "control.request";
+pub const METHOD_PING: &str = "ping";
+
+/// packet method 到旧 envelope 类型的最小注册表。
+///
+/// 中文注释：daemon dispatch 仍负责真正的鉴权和业务处理；这里仅保存 wire 名称映射，
+/// 避免 CLI/Web/daemon 各自手写字符串后出现漂移。
+pub fn legacy_message_type_for_packet_method(method: &str) -> Option<MessageType> {
+    match method {
+        METHOD_PAIR_REQUEST => Some(MessageType::PairRequest),
+        METHOD_AUTH | METHOD_AUTH_VERIFY => Some(MessageType::Auth),
+        METHOD_CLIENT_HELLO => Some(MessageType::ClientHello),
+        METHOD_SESSION_CREATE => Some(MessageType::SessionCreate),
+        METHOD_SESSION_ATTACH => Some(MessageType::SessionAttach),
+        METHOD_TERMINAL_CREATE => Some(MessageType::SessionCreate),
+        METHOD_TERMINAL_ATTACH => Some(MessageType::SessionAttach),
+        METHOD_SESSION_DATA => Some(MessageType::SessionData),
+        METHOD_SESSION_CURSOR => Some(MessageType::SessionCursor),
+        METHOD_SESSION_RESIZE => Some(MessageType::SessionResize),
+        METHOD_SESSION_RENAME => Some(MessageType::SessionRename),
+        METHOD_SESSION_REORDER => Some(MessageType::SessionReorder),
+        METHOD_SESSION_CLOSE => Some(MessageType::SessionClose),
+        METHOD_SESSION_SEARCH => Some(MessageType::SessionSearch),
+        METHOD_SESSION_FILES => Some(MessageType::SessionFiles),
+        METHOD_SESSION_GIT => Some(MessageType::SessionGit),
+        METHOD_SESSION_GIT_ACTION => Some(MessageType::SessionGitAction),
+        METHOD_SESSION_GIT_DIFF => Some(MessageType::SessionGitDiff),
+        METHOD_SESSION_FILE_READ => Some(MessageType::SessionFileRead),
+        METHOD_SESSION_FILE_WRITE => Some(MessageType::SessionFileWrite),
+        METHOD_SESSION_FILE_DELETE => Some(MessageType::SessionFileDelete),
+        METHOD_SESSION_FILE_DOWNLOAD_PREPARE => Some(MessageType::SessionFileDownloadPrepare),
+        METHOD_SESSION_FILE_DOWNLOAD_CHUNK => Some(MessageType::SessionFileDownloadChunk),
+        METHOD_CONTROL_REQUEST => Some(MessageType::ControlRequest),
+        METHOD_SESSION_LIST => Some(MessageType::SessionList),
+        METHOD_DAEMON_CLIENTS => Some(MessageType::DaemonClients),
+        METHOD_DAEMON_CLIENT_FORGET => Some(MessageType::DaemonClientForget),
+        METHOD_DAEMON_STATUS => Some(MessageType::DaemonStatus),
+        METHOD_PING => Some(MessageType::Ping),
+        _ => None,
+    }
+}
+
+pub fn packet_event_method_for_message(kind: MessageType) -> Option<&'static str> {
+    match kind {
+        MessageType::AuthChallenge => Some(METHOD_AUTH_CHALLENGE),
+        MessageType::SessionActivity => Some(METHOD_SESSION_ACTIVITY),
+        MessageType::SessionFilesResult => Some(METHOD_SESSION_FILES),
+        MessageType::SessionGitResult => Some(METHOD_SESSION_GIT),
+        MessageType::SessionResized => Some(METHOD_SESSION_RESIZED),
+        MessageType::SessionData => Some(METHOD_TERMINAL_OUTPUT),
+        _ => None,
+    }
+}
 
 /// 一次 request/response 交互的关联 id。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -579,6 +671,358 @@ pub fn decode_binary_protocol_packet(
     bytes: &[u8],
 ) -> Result<BinaryProtocolPacket, prost::DecodeError> {
     <BinaryProtocolPacket as prost::Message>::decode(bytes)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProtocolCodecError;
+
+pub type ProtocolCodecResult<T> = Result<T, ProtocolCodecError>;
+
+pub fn protocol_packet_to_binary(
+    packet: ProtocolPacket<Value>,
+) -> ProtocolCodecResult<BinaryProtocolPacket> {
+    let payload = match packet.kind {
+        PacketKind::StreamChunk => binary_stream_chunk_payload(&packet.payload)?,
+        PacketKind::Error => {
+            let error: PacketErrorPayload =
+                serde_json::from_value(packet.payload).map_err(|_| ProtocolCodecError)?;
+            Some(binary_protocol_packet::Payload::Error(
+                BinaryPacketErrorPayload {
+                    code: error.code,
+                    message: error.message,
+                    retryable: error.retryable,
+                },
+            ))
+        }
+        _ => Some(binary_protocol_packet::Payload::Json(
+            serde_json::to_vec(&packet.payload).map_err(|_| ProtocolCodecError)?,
+        )),
+    };
+
+    Ok(BinaryProtocolPacket {
+        version: u32::from(packet.version),
+        kind: binary_packet_kind(packet.kind),
+        id: packet
+            .id
+            .map(|id| id.0.as_bytes().to_vec())
+            .unwrap_or_default(),
+        stream_id: packet
+            .stream_id
+            .map(|stream_id| stream_id.0.as_bytes().to_vec())
+            .unwrap_or_default(),
+        method: packet.method.unwrap_or_default(),
+        seq: packet.seq,
+        ack: packet.ack.unwrap_or(0),
+        credit: packet.credit.unwrap_or(0),
+        payload,
+    })
+}
+
+pub fn protocol_packet_from_binary(
+    packet: BinaryProtocolPacket,
+) -> ProtocolCodecResult<ProtocolPacket<Value>> {
+    let kind = packet_kind_from_binary(packet.kind)?;
+    let payload = match packet.payload {
+        Some(binary_protocol_packet::Payload::Json(bytes)) => {
+            serde_json::from_slice(&bytes).map_err(|_| ProtocolCodecError)?
+        }
+        Some(binary_protocol_packet::Payload::SessionData(payload)) => {
+            serde_json::to_value(SessionDataPayload {
+                session_id: session_id_from_binary(&payload.session_id)?,
+                data_base64: STANDARD.encode(payload.data),
+            })
+            .map_err(|_| ProtocolCodecError)?
+        }
+        Some(binary_protocol_packet::Payload::TerminalFrame(payload)) => {
+            serde_json::to_value(terminal_frame_from_binary(payload)?)
+                .map_err(|_| ProtocolCodecError)?
+        }
+        Some(binary_protocol_packet::Payload::FileChunk(payload)) => {
+            serde_json::to_value(SessionFileTransferChunkPayload {
+                session_id: session_id_from_binary(&payload.session_id)?,
+                offset_bytes: payload.offset_bytes,
+                data_base64: STANDARD.encode(payload.data),
+                size_bytes: payload.size_bytes,
+                eof: payload.eof,
+            })
+            .map_err(|_| ProtocolCodecError)?
+        }
+        Some(binary_protocol_packet::Payload::Error(error)) => {
+            serde_json::to_value(PacketErrorPayload {
+                code: error.code,
+                message: error.message,
+                retryable: error.retryable,
+            })
+            .map_err(|_| ProtocolCodecError)?
+        }
+        None => serde_json::json!({}),
+    };
+
+    Ok(ProtocolPacket {
+        version: packet.version as u16,
+        kind,
+        id: optional_packet_request_id(&packet.id)?,
+        stream_id: optional_packet_stream_id(&packet.stream_id)?,
+        method: (!packet.method.is_empty()).then_some(packet.method),
+        seq: packet.seq,
+        ack: (packet.ack != 0).then_some(packet.ack),
+        credit: (packet.credit != 0).then_some(packet.credit),
+        payload,
+    })
+}
+
+fn binary_stream_chunk_payload(
+    payload: &Value,
+) -> ProtocolCodecResult<Option<binary_protocol_packet::Payload>> {
+    if payload.get("kind").is_some() {
+        let frame = serde_json::from_value::<TerminalFramePayload>(payload.clone())
+            .map_err(|_| ProtocolCodecError)?;
+        return Ok(Some(binary_protocol_packet::Payload::TerminalFrame(
+            terminal_frame_to_binary(frame)?,
+        )));
+    }
+
+    if let Ok(file_chunk) =
+        serde_json::from_value::<SessionFileTransferChunkPayload>(payload.clone())
+    {
+        let data = STANDARD
+            .decode(file_chunk.data_base64)
+            .map_err(|_| ProtocolCodecError)?;
+        return Ok(Some(binary_protocol_packet::Payload::FileChunk(
+            BinaryFileChunkPayload {
+                session_id: file_chunk.session_id.0.as_bytes().to_vec(),
+                offset_bytes: file_chunk.offset_bytes,
+                data,
+                size_bytes: file_chunk.size_bytes,
+                eof: file_chunk.eof,
+            },
+        )));
+    }
+
+    if let Ok(session_data) = serde_json::from_value::<SessionDataPayload>(payload.clone()) {
+        let data = STANDARD
+            .decode(session_data.data_base64)
+            .map_err(|_| ProtocolCodecError)?;
+        return Ok(Some(binary_protocol_packet::Payload::SessionData(
+            BinarySessionDataPayload {
+                session_id: session_data.session_id.0.as_bytes().to_vec(),
+                data,
+            },
+        )));
+    }
+
+    Ok(Some(binary_protocol_packet::Payload::Json(
+        serde_json::to_vec(payload).map_err(|_| ProtocolCodecError)?,
+    )))
+}
+
+fn binary_packet_kind(kind: PacketKind) -> i32 {
+    match kind {
+        PacketKind::Request => BinaryPacketKind::Request as i32,
+        PacketKind::Response => BinaryPacketKind::Response as i32,
+        PacketKind::Event => BinaryPacketKind::Event as i32,
+        PacketKind::StreamOpen => BinaryPacketKind::StreamOpen as i32,
+        PacketKind::StreamChunk => BinaryPacketKind::StreamChunk as i32,
+        PacketKind::StreamEnd => BinaryPacketKind::StreamEnd as i32,
+        PacketKind::Cancel => BinaryPacketKind::Cancel as i32,
+        PacketKind::Flow => BinaryPacketKind::Flow as i32,
+        PacketKind::Error => BinaryPacketKind::Error as i32,
+    }
+}
+
+fn packet_kind_from_binary(kind: i32) -> ProtocolCodecResult<PacketKind> {
+    let Some(kind) = BinaryPacketKind::try_from(kind).ok() else {
+        return Err(ProtocolCodecError);
+    };
+    Ok(match kind {
+        BinaryPacketKind::Request => PacketKind::Request,
+        BinaryPacketKind::Response => PacketKind::Response,
+        BinaryPacketKind::Event => PacketKind::Event,
+        BinaryPacketKind::StreamOpen => PacketKind::StreamOpen,
+        BinaryPacketKind::StreamChunk => PacketKind::StreamChunk,
+        BinaryPacketKind::StreamEnd => PacketKind::StreamEnd,
+        BinaryPacketKind::Cancel => PacketKind::Cancel,
+        BinaryPacketKind::Flow => PacketKind::Flow,
+        BinaryPacketKind::Error => PacketKind::Error,
+    })
+}
+
+fn terminal_frame_to_binary(
+    frame: TerminalFramePayload,
+) -> ProtocolCodecResult<BinaryTerminalFramePayload> {
+    Ok(match frame {
+        TerminalFramePayload::Snapshot {
+            session_id,
+            base_seq,
+            size,
+            data_base64,
+        } => BinaryTerminalFramePayload {
+            kind: BinaryTerminalFrameKind::Snapshot as i32,
+            session_id: session_id.0.as_bytes().to_vec(),
+            base_seq,
+            terminal_seq: 0,
+            size: Some(binary_terminal_size(size)),
+            data: STANDARD
+                .decode(data_base64)
+                .map_err(|_| ProtocolCodecError)?,
+            frames: Vec::new(),
+            exit_code: None,
+        },
+        TerminalFramePayload::Output {
+            session_id,
+            terminal_seq,
+            data_base64,
+        } => BinaryTerminalFramePayload {
+            kind: BinaryTerminalFrameKind::Output as i32,
+            session_id: session_id.0.as_bytes().to_vec(),
+            base_seq: 0,
+            terminal_seq,
+            size: None,
+            data: STANDARD
+                .decode(data_base64)
+                .map_err(|_| ProtocolCodecError)?,
+            frames: Vec::new(),
+            exit_code: None,
+        },
+        TerminalFramePayload::Resize {
+            session_id,
+            terminal_seq,
+            size,
+        } => BinaryTerminalFramePayload {
+            kind: BinaryTerminalFrameKind::Resize as i32,
+            session_id: session_id.0.as_bytes().to_vec(),
+            base_seq: 0,
+            terminal_seq,
+            size: Some(binary_terminal_size(size)),
+            data: Vec::new(),
+            frames: Vec::new(),
+            exit_code: None,
+        },
+        TerminalFramePayload::Exit {
+            session_id,
+            terminal_seq,
+            code,
+        } => BinaryTerminalFramePayload {
+            kind: BinaryTerminalFrameKind::Exit as i32,
+            session_id: session_id.0.as_bytes().to_vec(),
+            base_seq: 0,
+            terminal_seq,
+            size: None,
+            data: Vec::new(),
+            frames: Vec::new(),
+            exit_code: code,
+        },
+        TerminalFramePayload::Batch { session_id, frames } => BinaryTerminalFramePayload {
+            kind: BinaryTerminalFrameKind::Batch as i32,
+            session_id: session_id.0.as_bytes().to_vec(),
+            base_seq: 0,
+            terminal_seq: 0,
+            size: None,
+            data: Vec::new(),
+            frames: frames
+                .into_iter()
+                .map(terminal_frame_to_binary)
+                .collect::<ProtocolCodecResult<Vec<_>>>()?,
+            exit_code: None,
+        },
+    })
+}
+
+fn terminal_frame_from_binary(
+    frame: BinaryTerminalFramePayload,
+) -> ProtocolCodecResult<TerminalFramePayload> {
+    let kind =
+        match BinaryTerminalFrameKind::try_from(frame.kind).map_err(|_| ProtocolCodecError)? {
+            BinaryTerminalFrameKind::Unspecified if frame.size.is_some() => {
+                BinaryTerminalFrameKind::Snapshot
+            }
+            BinaryTerminalFrameKind::Unspecified => return Err(ProtocolCodecError),
+            kind => kind,
+        };
+    let session_id = session_id_from_binary(&frame.session_id)?;
+    Ok(match kind {
+        BinaryTerminalFrameKind::Unspecified => return Err(ProtocolCodecError),
+        BinaryTerminalFrameKind::Snapshot => TerminalFramePayload::Snapshot {
+            session_id,
+            base_seq: frame.base_seq,
+            size: terminal_size_from_binary(frame.size)?,
+            data_base64: STANDARD.encode(frame.data),
+        },
+        BinaryTerminalFrameKind::Output => TerminalFramePayload::Output {
+            session_id,
+            terminal_seq: frame.terminal_seq,
+            data_base64: STANDARD.encode(frame.data),
+        },
+        BinaryTerminalFrameKind::Resize => TerminalFramePayload::Resize {
+            session_id,
+            terminal_seq: frame.terminal_seq,
+            size: terminal_size_from_binary(frame.size)?,
+        },
+        BinaryTerminalFrameKind::Exit => TerminalFramePayload::Exit {
+            session_id,
+            terminal_seq: frame.terminal_seq,
+            code: frame.exit_code,
+        },
+        BinaryTerminalFrameKind::Batch => TerminalFramePayload::Batch {
+            session_id,
+            frames: frame
+                .frames
+                .into_iter()
+                .map(terminal_frame_from_binary)
+                .collect::<ProtocolCodecResult<Vec<_>>>()?,
+        },
+    })
+}
+
+fn binary_terminal_size(size: TerminalSize) -> BinaryTerminalSize {
+    BinaryTerminalSize {
+        rows: u32::from(size.rows),
+        cols: u32::from(size.cols),
+        pixel_width: u32::from(size.pixel_width),
+        pixel_height: u32::from(size.pixel_height),
+    }
+}
+
+fn terminal_size_from_binary(
+    size: Option<BinaryTerminalSize>,
+) -> ProtocolCodecResult<TerminalSize> {
+    let Some(size) = size else {
+        return Err(ProtocolCodecError);
+    };
+    Ok(TerminalSize {
+        rows: size.rows.try_into().map_err(|_| ProtocolCodecError)?,
+        cols: size.cols.try_into().map_err(|_| ProtocolCodecError)?,
+        pixel_width: size
+            .pixel_width
+            .try_into()
+            .map_err(|_| ProtocolCodecError)?,
+        pixel_height: size
+            .pixel_height
+            .try_into()
+            .map_err(|_| ProtocolCodecError)?,
+    })
+}
+
+fn optional_packet_request_id(bytes: &[u8]) -> ProtocolCodecResult<Option<PacketRequestId>> {
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(PacketRequestId(uuid_from_binary(bytes)?)))
+}
+
+fn optional_packet_stream_id(bytes: &[u8]) -> ProtocolCodecResult<Option<PacketStreamId>> {
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(PacketStreamId(uuid_from_binary(bytes)?)))
+}
+
+fn session_id_from_binary(bytes: &[u8]) -> ProtocolCodecResult<SessionId> {
+    Ok(SessionId(uuid_from_binary(bytes)?))
+}
+
+fn uuid_from_binary(bytes: &[u8]) -> ProtocolCodecResult<Uuid> {
+    Uuid::from_slice(bytes).map_err(|_| ProtocolCodecError)
 }
 
 /// WebSocket 建立后的明文路由角色。
@@ -2713,6 +3157,134 @@ mod tests {
         assert_eq!(flow_json.get("kind"), Some(&serde_json::json!("flow")));
         assert_eq!(flow_json.get("ack"), Some(&serde_json::json!(7)));
         assert_eq!(flow_json.get("credit"), Some(&serde_json::json!(64)));
+    }
+
+    #[test]
+    fn protocol_packet_shared_binary_codec_roundtrips_packet_shapes() {
+        let request_id = PacketRequestId::new();
+        let stream_id = PacketStreamId::new();
+        let session_id = SessionId::new();
+        let size = TerminalSize::new(24, 80);
+        let cases = [
+            ProtocolPacket::request(
+                request_id,
+                METHOD_SESSION_LIST,
+                serde_json::json!({"include_closed": false}),
+            ),
+            ProtocolPacket::response(
+                request_id,
+                METHOD_SESSION_LIST,
+                serde_json::json!({"sessions": []}),
+            ),
+            ProtocolPacket::event(
+                METHOD_SESSION_ACTIVITY,
+                serde_json::json!({"session_id": session_id, "timestamp_ms": 1710000000000_u64}),
+            ),
+            ProtocolPacket::stream_open(
+                request_id,
+                stream_id,
+                METHOD_TERMINAL_ATTACH,
+                65_536,
+                serde_json::json!({"session_id": session_id, "size": size}),
+            ),
+            ProtocolPacket::stream_chunk(
+                stream_id,
+                7,
+                serde_json::to_value(SessionDataPayload {
+                    session_id,
+                    data_base64: STANDARD.encode(b"terminal bytes"),
+                })
+                .unwrap(),
+            ),
+            ProtocolPacket::stream_end(stream_id, 8, serde_json::json!({"reason": "client"})),
+            ProtocolPacket::stream_chunk(
+                stream_id,
+                9,
+                serde_json::to_value(TerminalFramePayload::Snapshot {
+                    session_id,
+                    base_seq: 9,
+                    size,
+                    data_base64: STANDARD.encode(b"snapshot bytes"),
+                })
+                .unwrap(),
+            ),
+        ];
+
+        for packet in cases {
+            // 中文注释：共享 codec 是 Rust 各端的唯一转换入口，必须保持所有 packet 形状可逆。
+            let binary = protocol_packet_to_binary(packet.clone()).unwrap();
+            let decoded = protocol_packet_from_binary(binary).unwrap();
+            assert_eq!(decoded, packet);
+        }
+    }
+
+    #[test]
+    fn protocol_method_registries_cover_legacy_request_and_event_mappings() {
+        let request_cases = [
+            (METHOD_PAIR_REQUEST, MessageType::PairRequest),
+            (METHOD_AUTH, MessageType::Auth),
+            (METHOD_AUTH_VERIFY, MessageType::Auth),
+            (METHOD_CLIENT_HELLO, MessageType::ClientHello),
+            (METHOD_SESSION_CREATE, MessageType::SessionCreate),
+            (METHOD_SESSION_ATTACH, MessageType::SessionAttach),
+            (METHOD_TERMINAL_CREATE, MessageType::SessionCreate),
+            (METHOD_TERMINAL_ATTACH, MessageType::SessionAttach),
+            (METHOD_SESSION_DATA, MessageType::SessionData),
+            (METHOD_SESSION_CURSOR, MessageType::SessionCursor),
+            (METHOD_SESSION_RESIZE, MessageType::SessionResize),
+            (METHOD_SESSION_RENAME, MessageType::SessionRename),
+            (METHOD_SESSION_REORDER, MessageType::SessionReorder),
+            (METHOD_SESSION_CLOSE, MessageType::SessionClose),
+            (METHOD_SESSION_SEARCH, MessageType::SessionSearch),
+            (METHOD_SESSION_FILES, MessageType::SessionFiles),
+            (METHOD_SESSION_GIT, MessageType::SessionGit),
+            (METHOD_SESSION_GIT_ACTION, MessageType::SessionGitAction),
+            (METHOD_SESSION_GIT_DIFF, MessageType::SessionGitDiff),
+            (METHOD_SESSION_FILE_READ, MessageType::SessionFileRead),
+            (METHOD_SESSION_FILE_WRITE, MessageType::SessionFileWrite),
+            (METHOD_SESSION_FILE_DELETE, MessageType::SessionFileDelete),
+            (
+                METHOD_SESSION_FILE_DOWNLOAD_PREPARE,
+                MessageType::SessionFileDownloadPrepare,
+            ),
+            (
+                METHOD_SESSION_FILE_DOWNLOAD_CHUNK,
+                MessageType::SessionFileDownloadChunk,
+            ),
+            (METHOD_CONTROL_REQUEST, MessageType::ControlRequest),
+            (METHOD_SESSION_LIST, MessageType::SessionList),
+            (METHOD_DAEMON_CLIENTS, MessageType::DaemonClients),
+            (METHOD_DAEMON_CLIENT_FORGET, MessageType::DaemonClientForget),
+            (METHOD_DAEMON_STATUS, MessageType::DaemonStatus),
+            (METHOD_PING, MessageType::Ping),
+        ];
+        for (method, expected) in request_cases {
+            assert_eq!(
+                legacy_message_type_for_packet_method(method),
+                Some(expected)
+            );
+        }
+
+        let event_cases = [
+            (MessageType::AuthChallenge, METHOD_AUTH_CHALLENGE),
+            (MessageType::SessionActivity, METHOD_SESSION_ACTIVITY),
+            (MessageType::SessionFilesResult, METHOD_SESSION_FILES),
+            (MessageType::SessionGitResult, METHOD_SESSION_GIT),
+            (MessageType::SessionResized, METHOD_SESSION_RESIZED),
+            (MessageType::SessionData, METHOD_TERMINAL_OUTPUT),
+        ];
+        for (kind, expected) in event_cases {
+            assert_eq!(packet_event_method_for_message(kind), Some(expected));
+        }
+
+        assert_eq!(
+            legacy_message_type_for_packet_method("unknown.method"),
+            None
+        );
+        assert_eq!(
+            packet_event_method_for_message(MessageType::SessionClose),
+            None
+        );
     }
 
     #[test]

@@ -20,9 +20,13 @@ import {
   type BinaryProtocolPacket,
   decodeBinaryProtocolPacket,
   encodeBinaryProtocolPacket,
-  terminalFrameBinaryToJson,
-  terminalFrameJsonToBinary,
 } from "../protocol/binary-packet";
+import {
+  legacyEnvelopeTypeForProtocolMethod,
+  protocolEventMethodForLegacyEnvelopeType,
+  protocolMethodNeedsEmptyAck,
+} from "../protocol/methods";
+import { binaryPacketToProtocol, protocolPacketToBinary } from "../protocol/packet-codec";
 import { fallbackSessionDisplayName } from "../session-names";
 import { BINARY_PROTOCOL_VERSION, PROTOCOL_PACKET_VERSION } from "../protocol/types";
 import type {
@@ -59,8 +63,6 @@ import type {
   UUID,
 } from "../protocol/types";
 import {
-  base64ToBytes,
-  bytesToBase64,
   decodeUtf8,
   encodeUtf8,
   envelope,
@@ -85,6 +87,7 @@ interface MockDaemonOptions {
   pairFailure?: ErrorPayload;
   sessionDataError?: ErrorPayload;
   resizeAckDelayMs?: number;
+  cursorAckDelayMs?: number;
   daemonClients?: DaemonClientSummaryPayload[];
   daemonClientsDelayMs?: number;
   dropDaemonClients?: boolean;
@@ -98,7 +101,10 @@ interface MockDaemonOptions {
   sessionGitDelayMsBySession?: Record<UUID, number>;
   sessionGit?: Record<UUID, SessionGitResultPayload>;
   sessionFileReads?: Record<string, SessionFileReadResultPayload>;
+  sessionFileReadDelayMsByPath?: Record<string, number>;
+  sessionGitDiffDelayMsByPath?: Record<string, number>;
   fileUploadProgressOverrides?: Record<string, Partial<SessionFileUploadProgressPayload>>;
+  fileUploadProgressDelayMs?: number;
   relayClientPathOnly?: boolean;
 }
 
@@ -293,6 +299,18 @@ export class MockDaemon {
         this.sendInner(connection, envelope("session_files_result", files));
       }
     }
+  }
+
+  sendUnownedPacketError(code: string, message: string): void {
+    const connection = [...this.connections].find((candidate) => candidate.e2ee);
+    if (!connection) {
+      throw new Error("no E2EE connection is available");
+    }
+    this.sendPacket(connection, {
+      version: PROTOCOL_PACKET_VERSION,
+      kind: "error",
+      payload: { code, message, retryable: false },
+    } satisfies ProtocolPacket<PacketErrorPayload>);
   }
 
   setSessionFilePosition(sessionId: UUID, path: string): void {
@@ -630,7 +648,7 @@ export class MockDaemon {
 
   private async handlePacketStreamChunk(connection: MockConnection, packet: ProtocolPacket): Promise<void> {
     if (packet.stream_id && connection.fileUploadsById.has(packet.stream_id)) {
-      this.handleFileUploadChunk(connection, packet);
+      await this.handleFileUploadChunk(connection, packet);
       return;
     }
     if (!packet.stream_id || !connection.terminalStreamsById.has(packet.stream_id)) {
@@ -697,7 +715,7 @@ export class MockDaemon {
     return false;
   }
 
-  private handleFileUploadChunk(connection: MockConnection, packet: ProtocolPacket): void {
+  private async handleFileUploadChunk(connection: MockConnection, packet: ProtocolPacket): Promise<void> {
     const streamId = packet.stream_id!;
     const stream = connection.fileUploadsById.get(streamId);
     if (!stream) {
@@ -728,6 +746,10 @@ export class MockDaemon {
       modified_at_ms: complete ? nowMs() : null,
       ...(this.options.fileUploadProgressOverrides?.[stream.path] ?? {}),
     };
+    if (this.options.fileUploadProgressDelayMs) {
+      // 中文注释：测试用延迟让客户端稳定进入 file stream waiter，便于验证 close/error 会唤醒它。
+      await new Promise((resolve) => setTimeout(resolve, this.options.fileUploadProgressDelayMs));
+    }
     this.sendPacket(connection, {
       version: PROTOCOL_PACKET_VERSION,
       kind: "stream_chunk",
@@ -848,69 +870,15 @@ export class MockDaemon {
   }
 
   private packetToLegacyEnvelope(packet: ProtocolPacket): Envelope | undefined {
-    const payload = packet.payload;
-    switch (packet.method) {
-      case "pair.request":
-        return envelope("pair_request", payload);
-      case "auth":
-      case "auth.verify":
-        return envelope("auth", payload);
-      case "client.hello":
-        return envelope("client_hello", payload);
-      case "session.list":
-        return envelope("session_list", payload);
-      case "daemon.clients":
-        return envelope("daemon_clients", payload);
-      case "daemon.client_forget":
-        return envelope("daemon_client_forget", payload);
-      case "daemon.status":
-        return envelope("daemon_status", payload);
-      case "terminal.create":
-        return envelope("session_create", payload);
-      case "session.attach":
-      case "terminal.attach":
-        return envelope("session_attach", payload);
-      case "session.cursor":
-        return envelope("session_cursor", payload);
-      case "session.resize":
-        return envelope("session_resize", payload);
-      case "session.rename":
-        return envelope("session_rename", payload);
-      case "session.reorder":
-        return envelope("session_reorder", payload);
-      case "session.close":
-        return envelope("session_close", payload);
-      case "session.files":
-        return envelope("session_files", payload);
-      case "session.search":
-        return envelope("session_search", payload);
-      case "session.git":
-        return envelope("session_git", payload);
-      case "session.git_diff":
-        return envelope("session_git_diff", payload);
-      case "session.git_action":
-        return envelope("session_git_action", payload);
-      case "session.file_read":
-        return envelope("session_file_read", payload);
-      case "session.file_download_prepare":
-        return envelope("session_file_download_prepare", payload);
-      case "session.file_download_chunk":
-        return envelope("session_file_download_chunk", payload);
-      case "session.file_write":
-        return envelope("session_file_write", payload);
-      case "session.file_delete":
-        return envelope("session_file_delete", payload);
-      case "control.request":
-        return envelope("control_request", payload);
-      case "ping":
-        return envelope("ping", payload);
-      default:
-        return undefined;
+    const type = legacyEnvelopeTypeForProtocolMethod(packet.method);
+    if (!type) {
+      return undefined;
     }
+    return envelope(type, packet.payload);
   }
 
   private packetMethodNeedsEmptyAck(method?: string): boolean {
-    return method === "auth" || method === "auth.verify" || method === "client.hello" || method === "session.cursor";
+    return protocolMethodNeedsEmptyAck(method);
   }
 
   private async handleLegacyInner(connection: MockConnection, inner: Envelope): Promise<void> {
@@ -1056,6 +1024,10 @@ export class MockDaemon {
       }
       case "session_cursor": {
         this.sessionCursorUpdates.push(inner.payload as SessionCursorPayload);
+        if (this.options.cursorAckDelayMs) {
+          // 中文注释：cursor 走普通 request ack；测试用延迟模拟它被持续 stdout 挤到超时。
+          await new Promise((resolve) => setTimeout(resolve, this.options.cursorAckDelayMs));
+        }
         return;
       }
       case "session_resize": {
@@ -1160,6 +1132,11 @@ export class MockDaemon {
           return;
         }
         this.sessionGitDiffRequests.push(payload);
+        const diffDelayMs = this.options.sessionGitDiffDelayMsByPath?.[payload.file_path ?? payload.worktree_path];
+        if (diffDelayMs) {
+          // 中文注释：测试慢 diff 返回，用来覆盖 UI requestId/path 防过期逻辑。
+          await new Promise((resolve) => setTimeout(resolve, diffDelayMs));
+        }
         this.sendInner(connection, envelope("session_git_diff_result", mockSessionGitDiffResult(payload)));
         return;
       }
@@ -1178,6 +1155,11 @@ export class MockDaemon {
           return;
         }
         this.sessionFileReadRequests.push({ session_id: payload.session_id, path: payload.path });
+        const readDelayMs = this.options.sessionFileReadDelayMsByPath?.[payload.path];
+        if (readDelayMs) {
+          // 中文注释：测试慢文件读取返回，用来确认旧响应不会复活或覆盖当前编辑器。
+          await new Promise((resolve) => setTimeout(resolve, readDelayMs));
+        }
         const result =
           this.options.sessionFileReads?.[payload.path] ??
           ({
@@ -1675,22 +1657,7 @@ export class MockDaemon {
   }
 
   private legacyEventMethod(type: Envelope["type"]): string {
-    switch (type) {
-      case "auth_challenge":
-        return "auth.challenge";
-      case "session_activity":
-        return "session.activity";
-      case "session_files_result":
-        return "session.files";
-      case "session_git_result":
-        return "session.git";
-      case "session_resized":
-        return "session.resized";
-      case "session_data":
-        return "terminal.output";
-      default:
-        return type.replaceAll("_", ".");
-    }
+    return protocolEventMethodForLegacyEnvelopeType(type);
   }
 
   private sendOuter(socket: WebSocket, outer: Envelope): void {
@@ -1713,116 +1680,6 @@ function mockDaemonStatus(): DaemonStatusResultPayload {
     network_tx_bytes: 6 * 1024 * 1024,
     process_count: 123,
     atop_available: false,
-  };
-}
-
-function protocolPacketToBinary(packet: ProtocolPacket): BinaryProtocolPacket {
-  const binary: BinaryProtocolPacket = {
-    version: packet.version,
-    kind: packet.kind,
-    id: packet.id,
-    stream_id: packet.stream_id,
-    method: packet.method,
-    seq: packet.seq,
-    ack: packet.ack,
-    credit: packet.credit,
-  };
-  if (packet.kind === "stream_chunk") {
-    const payload = packet.payload as {
-      session_id?: UUID;
-      data_base64?: string;
-      data_bytes?: Uint8Array;
-      kind?: string;
-      offset_bytes?: number;
-      size_bytes?: number;
-      eof?: boolean;
-    };
-    if (payload.kind) {
-      return {
-        ...binary,
-        payload: { type: "terminal_frame", frame: terminalFrameJsonToBinary(payload) },
-      };
-    }
-    if (
-      payload.session_id &&
-      typeof payload.offset_bytes === "number" &&
-      typeof payload.size_bytes === "number" &&
-      typeof payload.eof === "boolean" &&
-      (payload.data_bytes instanceof Uint8Array || typeof payload.data_base64 === "string")
-    ) {
-      const data = payload.data_bytes ?? base64ToBytes(payload.data_base64 ?? "");
-      return {
-        ...binary,
-        payload: {
-          type: "file_chunk",
-          session_id: payload.session_id,
-          offset_bytes: payload.offset_bytes,
-          data,
-          size_bytes: payload.size_bytes,
-          eof: payload.eof,
-        },
-      };
-    }
-    if (payload.session_id && (typeof payload.data_base64 === "string" || payload.data_bytes instanceof Uint8Array)) {
-      const data = payload.data_bytes ?? base64ToBytes(payload.data_base64 ?? "");
-      return {
-        ...binary,
-        payload: { type: "session_data", session_id: payload.session_id, data },
-      };
-    }
-  }
-  if (packet.kind === "error") {
-    const payload = packet.payload as { code?: string; message?: string; retryable?: boolean };
-    if (payload.code && payload.message) {
-      return {
-        ...binary,
-        payload: { type: "error", code: payload.code, message: payload.message, retryable: Boolean(payload.retryable) },
-      };
-    }
-  }
-  return {
-    ...binary,
-    payload: { type: "json", data: encodeUtf8(JSON.stringify(packet.payload ?? {})) },
-  };
-}
-
-function binaryPacketToProtocol(packet: BinaryProtocolPacket): ProtocolPacket {
-  let payload: unknown = {};
-  if (packet.payload?.type === "json") {
-    payload = JSON.parse(decodeUtf8(packet.payload.data));
-  } else if (packet.payload?.type === "session_data") {
-    payload = {
-      session_id: packet.payload.session_id,
-      data_base64: bytesToBase64(packet.payload.data),
-      data_bytes: packet.payload.data,
-    } satisfies SessionDataPayload;
-  } else if (packet.payload?.type === "terminal_frame") {
-    payload = terminalFrameBinaryToJson(packet.payload.frame);
-  } else if (packet.payload?.type === "file_chunk") {
-    payload = {
-      session_id: packet.payload.session_id,
-      offset_bytes: packet.payload.offset_bytes,
-      data_bytes: packet.payload.data,
-      size_bytes: packet.payload.size_bytes,
-      eof: packet.payload.eof,
-    } satisfies SessionFileTransferChunkPayload;
-  } else if (packet.payload?.type === "error") {
-    payload = {
-      code: packet.payload.code,
-      message: packet.payload.message,
-      retryable: packet.payload.retryable,
-    } satisfies PacketErrorPayload;
-  }
-  return {
-    version: packet.version,
-    kind: packet.kind,
-    ...(packet.id ? { id: packet.id } : {}),
-    ...(packet.stream_id ? { stream_id: packet.stream_id } : {}),
-    ...(packet.method ? { method: packet.method } : {}),
-    ...(packet.seq ? { seq: packet.seq } : {}),
-    ...(packet.ack ? { ack: packet.ack } : {}),
-    ...(packet.credit ? { credit: packet.credit } : {}),
-    payload,
   };
 }
 

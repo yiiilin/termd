@@ -23,35 +23,43 @@ use rand_core::{OsRng, RngCore};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use termd_proto::{
-    AttachRole, AuthChallengePayload, AuthPayload, BINARY_PROTOCOL_VERSION, BinaryFileChunkPayload,
-    BinaryPacketErrorPayload, BinaryPacketKind, BinaryProtocolPacket, BinarySessionDataPayload,
-    BinaryTerminalFrameKind, BinaryTerminalFramePayload, BinaryTerminalSize, ClientHelloPayload,
+    AttachRole, AuthChallengePayload, AuthPayload, BINARY_PROTOCOL_VERSION, ClientHelloPayload,
     ClientId, ControlGrantPayload, ControlRequestPayload, DaemonClientForgetPayload,
     DaemonClientForgotPayload, DaemonClientSummaryPayload, DaemonClientsPayload,
     DaemonClientsResultPayload, DaemonStatusPayload, DaemonStatusResultPayload, DeviceId,
     E2eeKeyExchangePayload, EncryptedFramePayload, Envelope, ErrorPayload, HelloPayload,
-    HttpE2eeAuthPayload, MessageType, Nonce, PROTOCOL_PACKET_VERSION, PacketErrorPayload,
-    PacketKind, PacketRequestId, PacketStreamId, PairRequestPayload, PingPayload, PongPayload,
-    ProtocolPacket, ProtocolVersion, ServerId, SessionActivityPayload, SessionAttachPayload,
-    SessionAttachedPayload, SessionClosePayload, SessionClosedPayload, SessionCreatePayload,
-    SessionCreatedPayload, SessionCursorPayload, SessionDataPayload, SessionFileDeletePayload,
-    SessionFileDeletedPayload, SessionFileDownloadChunkPayload,
-    SessionFileDownloadChunkResultPayload, SessionFileDownloadPreparePayload,
-    SessionFileDownloadReadyPayload, SessionFileDownloadStreamPayload,
-    SessionFileDownloadStreamReadyPayload, SessionFileEntryPayload, SessionFileHttpDownloadPayload,
-    SessionFileHttpUploadReadyPayload, SessionFileHttpUploadStreamPayload, SessionFileKind,
-    SessionFileReadPayload, SessionFileReadResultPayload, SessionFileTransferChunkPayload,
-    SessionFileUploadPayload, SessionFileUploadProgressPayload, SessionFileUploadReadyPayload,
-    SessionFileWritePayload, SessionFileWrittenPayload, SessionFilesPayload,
-    SessionFilesResultPayload, SessionGitActionKind, SessionGitActionPayload,
-    SessionGitActionResultPayload, SessionGitDiffPayload, SessionGitDiffResultPayload,
-    SessionGitFileChangePayload, SessionGitPayload, SessionGitResultPayload,
-    SessionGitWorktreePayload, SessionId, SessionListPayload, SessionListResultPayload,
-    SessionRenamePayload, SessionRenamedPayload, SessionReorderPayload, SessionReorderedPayload,
-    SessionResizePayload, SessionResizedPayload, SessionSearchMatchPayload, SessionSearchPayload,
-    SessionSearchResultPayload, SessionState, SessionSummaryPayload, TerminalFramePayload,
-    TerminalSize, UnixTimestampMillis, binary_protocol_packet, decode_binary_protocol_packet,
-    encode_binary_protocol_packet,
+    HttpE2eeAuthPayload, METHOD_AUTH, METHOD_AUTH_VERIFY, METHOD_CLIENT_HELLO,
+    METHOD_CONTROL_REQUEST, METHOD_DAEMON_CLIENT_FORGET, METHOD_DAEMON_CLIENTS,
+    METHOD_DAEMON_STATUS, METHOD_PAIR_REQUEST, METHOD_PING, METHOD_SESSION_ATTACH,
+    METHOD_SESSION_CLOSE, METHOD_SESSION_CREATE, METHOD_SESSION_CURSOR, METHOD_SESSION_DATA,
+    METHOD_SESSION_FILE_DELETE, METHOD_SESSION_FILE_DOWNLOAD_CHUNK,
+    METHOD_SESSION_FILE_DOWNLOAD_PREPARE, METHOD_SESSION_FILE_DOWNLOAD_STREAM,
+    METHOD_SESSION_FILE_READ, METHOD_SESSION_FILE_UPLOAD_STREAM, METHOD_SESSION_FILE_WRITE,
+    METHOD_SESSION_FILES, METHOD_SESSION_GIT, METHOD_SESSION_GIT_ACTION, METHOD_SESSION_GIT_DIFF,
+    METHOD_SESSION_LIST, METHOD_SESSION_RENAME, METHOD_SESSION_REORDER, METHOD_SESSION_RESIZE,
+    METHOD_SESSION_SEARCH, METHOD_TERMINAL_ATTACH, METHOD_TERMINAL_CREATE, MessageType, Nonce,
+    PROTOCOL_PACKET_VERSION, PacketErrorPayload, PacketKind, PacketRequestId, PacketStreamId,
+    PairRequestPayload, PingPayload, PongPayload, ProtocolPacket, ProtocolVersion, ServerId,
+    SessionActivityPayload, SessionAttachPayload, SessionAttachedPayload, SessionClosePayload,
+    SessionClosedPayload, SessionCreatePayload, SessionCreatedPayload, SessionCursorPayload,
+    SessionDataPayload, SessionFileDeletePayload, SessionFileDeletedPayload,
+    SessionFileDownloadChunkPayload, SessionFileDownloadChunkResultPayload,
+    SessionFileDownloadPreparePayload, SessionFileDownloadReadyPayload,
+    SessionFileDownloadStreamPayload, SessionFileDownloadStreamReadyPayload,
+    SessionFileEntryPayload, SessionFileHttpDownloadPayload, SessionFileHttpUploadReadyPayload,
+    SessionFileHttpUploadStreamPayload, SessionFileKind, SessionFileReadPayload,
+    SessionFileReadResultPayload, SessionFileTransferChunkPayload, SessionFileUploadPayload,
+    SessionFileUploadProgressPayload, SessionFileUploadReadyPayload, SessionFileWritePayload,
+    SessionFileWrittenPayload, SessionFilesPayload, SessionFilesResultPayload,
+    SessionGitActionKind, SessionGitActionPayload, SessionGitActionResultPayload,
+    SessionGitDiffPayload, SessionGitDiffResultPayload, SessionGitFileChangePayload,
+    SessionGitPayload, SessionGitResultPayload, SessionGitWorktreePayload, SessionId,
+    SessionListPayload, SessionListResultPayload, SessionRenamePayload, SessionRenamedPayload,
+    SessionReorderPayload, SessionReorderedPayload, SessionResizePayload, SessionResizedPayload,
+    SessionSearchMatchPayload, SessionSearchPayload, SessionSearchResultPayload, SessionState,
+    SessionSummaryPayload, TerminalFramePayload, TerminalSize, UnixTimestampMillis,
+    decode_binary_protocol_packet, encode_binary_protocol_packet, packet_event_method_for_message,
+    protocol_packet_from_binary, protocol_packet_to_binary,
 };
 use thiserror::Error;
 use tokio::sync::watch;
@@ -113,41 +121,6 @@ const SESSION_FILE_WRITE_MAX_BYTES: usize = SESSION_FILE_RPC_MAX_BYTES;
 const SESSION_FILE_WRITE_MAX_BASE64_BYTES: usize = ((SESSION_FILE_WRITE_MAX_BYTES + 2) / 3) * 4;
 const SESSION_FILE_DOWNLOAD_CHUNK_MAX_BYTES: u32 = 256 * 1024;
 const SESSION_FILE_TRANSFER_CHUNK_MAX_BYTES: u32 = 256 * 1024;
-const METHOD_PAIR_REQUEST: &str = "pair.request";
-const METHOD_AUTH: &str = "auth";
-const METHOD_AUTH_VERIFY: &str = "auth.verify";
-const METHOD_AUTH_CHALLENGE: &str = "auth.challenge";
-const METHOD_CLIENT_HELLO: &str = "client.hello";
-const METHOD_SESSION_CREATE: &str = "session.create";
-const METHOD_SESSION_ATTACH: &str = "session.attach";
-const METHOD_TERMINAL_CREATE: &str = "terminal.create";
-const METHOD_TERMINAL_ATTACH: &str = "terminal.attach";
-const METHOD_SESSION_DATA: &str = "session.data";
-const METHOD_SESSION_ACTIVITY: &str = "session.activity";
-const METHOD_SESSION_CURSOR: &str = "session.cursor";
-const METHOD_SESSION_RESIZE: &str = "session.resize";
-const METHOD_SESSION_RESIZED: &str = "session.resized";
-const METHOD_SESSION_RENAME: &str = "session.rename";
-const METHOD_SESSION_REORDER: &str = "session.reorder";
-const METHOD_SESSION_CLOSE: &str = "session.close";
-const METHOD_SESSION_SEARCH: &str = "session.search";
-const METHOD_SESSION_FILES: &str = "session.files";
-const METHOD_SESSION_GIT: &str = "session.git";
-const METHOD_SESSION_GIT_ACTION: &str = "session.git_action";
-const METHOD_SESSION_GIT_DIFF: &str = "session.git_diff";
-const METHOD_SESSION_FILE_READ: &str = "session.file_read";
-const METHOD_SESSION_FILE_WRITE: &str = "session.file_write";
-const METHOD_SESSION_FILE_DELETE: &str = "session.file_delete";
-const METHOD_SESSION_FILE_DOWNLOAD_PREPARE: &str = "session.file_download_prepare";
-const METHOD_SESSION_FILE_DOWNLOAD_CHUNK: &str = "session.file_download_chunk";
-const METHOD_SESSION_FILE_UPLOAD_STREAM: &str = "session.file_upload";
-const METHOD_SESSION_FILE_DOWNLOAD_STREAM: &str = "session.file_download";
-const METHOD_SESSION_LIST: &str = "session.list";
-const METHOD_DAEMON_CLIENTS: &str = "daemon.clients";
-const METHOD_DAEMON_CLIENT_FORGET: &str = "daemon.client_forget";
-const METHOD_DAEMON_STATUS: &str = "daemon.status";
-const METHOD_CONTROL_REQUEST: &str = "control.request";
-const METHOD_PING: &str = "ping";
 
 /// 协议层统一使用的 JSON envelope。
 pub type JsonEnvelope = Envelope<Value>;
@@ -185,16 +158,6 @@ struct RestoredSessionMetadata {
     root_path: PathBuf,
 }
 
-/// daemon 启动时暂时没接回的 Running session。
-///
-/// 这类记录不能立刻标记为 Closed：supervisor 进程可能仍在，只是 socket 文件或 IPC
-/// 短暂不可达。保留它可以让后续 list/attach 或下一次 daemon 重启继续尝试恢复。
-#[derive(Debug, Clone)]
-struct PendingRestoreSession {
-    record: SessionStateRecord,
-    metadata: RestoredSessionMetadata,
-}
-
 /// 0.2.0 packet terminal stream 的连接内状态。
 ///
 /// stream id 只在单条 E2EE 连接内有效；它把 terminal attach 的 request/response、后续
@@ -215,6 +178,26 @@ impl PacketTerminalStream {
             next_output_seq: 1,
         }
     }
+}
+
+/// terminal stream 替换前的连接内状态快照。
+///
+/// 中文注释：packet terminal stream-open 可能在 payload 已解码后，因 session 权限、
+/// session 状态或内部响应转换失败而返回错误。替换旧 stream 前保存这组字段，失败时
+/// 精确回滚，避免一次坏请求把仍可用的 terminal 输出订阅和 deferred wakeup 清掉。
+#[derive(Debug, Clone)]
+struct PacketTerminalStreamStateSnapshot {
+    state: ProtocolConnectionState,
+    packet_terminal_streams: HashMap<PacketStreamId, PacketTerminalStream>,
+    packet_terminal_streams_by_session: HashMap<SessionId, PacketStreamId>,
+    attached_sessions: Vec<SessionId>,
+    watched_sessions: HashSet<SessionId>,
+    stale_watched_sessions: HashSet<SessionId>,
+    output_offsets: HashMap<SessionId, u64>,
+    pending_outputs: HashMap<SessionId, VecDeque<Vec<u8>>>,
+    terminal_frame_next_seq: HashMap<SessionId, u64>,
+    terminal_frame_snapshot_required: HashSet<SessionId>,
+    deferred_output_wakeups: HashSet<SessionId>,
 }
 
 #[derive(Debug, Clone)]
@@ -1097,7 +1080,17 @@ pub struct DaemonProtocol<B: PtyBackend, V> {
     session_terminal_frame_logs: HashMap<SessionId, SessionTerminalFrameLog>,
     session_file_tree_signals: HashMap<SessionId, watch::Sender<u64>>,
     session_resize_signals: HashMap<SessionId, watch::Sender<TerminalSize>>,
-    pending_restore_sessions: HashMap<SessionId, PendingRestoreSession>,
+}
+
+/// session 作用域 handler 共用的已认证、已 attach 上下文。
+struct AttachedSessionContext {
+    device_id: DeviceId,
+    internal_session_id: String,
+}
+
+/// 文件/Git handler 额外需要 session root，和基础 attach 上下文一起解析。
+struct AttachedSessionRootContext {
+    root: PathBuf,
 }
 
 impl<B, V> DaemonProtocol<B, V>
@@ -1194,7 +1187,6 @@ where
             session_terminal_frame_logs: HashMap::new(),
             session_file_tree_signals: HashMap::new(),
             session_resize_signals: HashMap::new(),
-            pending_restore_sessions: HashMap::new(),
         })
     }
 
@@ -1239,10 +1231,6 @@ where
                 restore_info: Some(restore_info),
             });
         }
-        for pending in self.pending_restore_sessions.values() {
-            sessions.push(pending.record.clone());
-        }
-
         DaemonState {
             version: crate::state::STATE_SCHEMA_VERSION,
             daemon_identity: Some(DaemonIdentitySnapshot {
@@ -1707,13 +1695,6 @@ where
         payload: SessionAttachPayload,
     ) -> Result<Vec<JsonEnvelope>, ProtocolError> {
         let device_id = connection.authenticated_device_id()?;
-        if !self.session_index.contains_key(&payload.session_id) {
-            match self.reconnect_pending_session(payload.session_id) {
-                Ok(true) => self.persist_state()?,
-                Ok(false) => {}
-                Err(error) => return Err(map_runtime_error(error)),
-            }
-        }
         let internal_session_id = self
             .session_index
             .get(&payload.session_id)
@@ -1806,23 +1787,79 @@ where
         )?])
     }
 
+    fn require_attached_session(
+        &self,
+        connection: &ProtocolConnection,
+        session_id: SessionId,
+    ) -> Result<AttachedSessionContext, ProtocolError> {
+        let device_id = connection.authenticated_device_id()?;
+        // 中文注释：多数 session RPC 的旧兼容顺序是先确认当前连接已 attach，
+        // 再暴露 session 是否存在，避免 authenticated-unattached 连接探测 session id。
+        connection.ensure_attached_to(session_id)?;
+        let internal_session_id = self
+            .session_index
+            .get(&session_id)
+            .cloned()
+            .ok_or(ProtocolError::SessionNotFound)?;
+
+        Ok(AttachedSessionContext {
+            device_id,
+            internal_session_id,
+        })
+    }
+
+    fn require_existing_attached_session(
+        &self,
+        connection: &ProtocolConnection,
+        session_id: SessionId,
+    ) -> Result<AttachedSessionContext, ProtocolError> {
+        let device_id = connection.authenticated_device_id()?;
+        let internal_session_id = self
+            .session_index
+            .get(&session_id)
+            .cloned()
+            .ok_or(ProtocolError::SessionNotFound)?;
+        // 中文注释：输入、resize 和旧 control 路径历史上先解析 session，再检查 attach；
+        // 这里保留该错误优先级，同时仍禁止未 attach 的当前连接操作 session。
+        connection.ensure_attached_to(session_id)?;
+
+        Ok(AttachedSessionContext {
+            device_id,
+            internal_session_id,
+        })
+    }
+
+    fn require_attached_session_root(
+        &self,
+        connection: &ProtocolConnection,
+        session_id: SessionId,
+    ) -> Result<AttachedSessionRootContext, ProtocolError> {
+        self.require_attached_session(connection, session_id)?;
+        let root = self
+            .session_roots
+            .get(&session_id)
+            .cloned()
+            .ok_or(ProtocolError::SessionNotFound)?;
+
+        Ok(AttachedSessionRootContext { root })
+    }
+
     fn write_session_data(
         &mut self,
         connection: &ProtocolConnection,
         payload: SessionDataPayload,
     ) -> Result<Vec<JsonEnvelope>, ProtocolError> {
-        let device_id = connection.authenticated_device_id()?;
-        let internal_session_id = self
-            .session_index
-            .get(&payload.session_id)
-            .ok_or(ProtocolError::SessionNotFound)?;
-        connection.ensure_attached_to(payload.session_id)?;
+        let attached = self.require_existing_attached_session(connection, payload.session_id)?;
         let bytes = general_purpose::STANDARD
             .decode(payload.data_base64)
             .map_err(|_| ProtocolError::InvalidEnvelope)?;
 
         self.runtime
-            .write_input(internal_session_id, &device_key(device_id), &bytes)
+            .write_input(
+                &attached.internal_session_id,
+                &device_key(attached.device_id),
+                &bytes,
+            )
             .map_err(map_runtime_error)?;
 
         Ok(Vec::new())
@@ -1833,15 +1870,13 @@ where
         connection: &ProtocolConnection,
         payload: SessionResizePayload,
     ) -> Result<Vec<JsonEnvelope>, ProtocolError> {
-        connection.authenticated_device_id()?;
-        let internal_session_id = self
-            .session_index
-            .get(&payload.session_id)
-            .ok_or(ProtocolError::SessionNotFound)?;
-        connection.ensure_attached_to(payload.session_id)?;
+        let attached = self.require_existing_attached_session(connection, payload.session_id)?;
 
         self.runtime
-            .resize(internal_session_id, proto_size_to_runtime(payload.size))
+            .resize(
+                &attached.internal_session_id,
+                proto_size_to_runtime(payload.size),
+            )
             .map_err(map_runtime_error)?;
         if let Some(history) = self.session_output_history.get_mut(&payload.session_id) {
             history.resize(payload.size);
@@ -1869,22 +1904,19 @@ where
         connection: &ProtocolConnection,
         payload: SessionCursorPayload,
     ) -> Result<Vec<JsonEnvelope>, ProtocolError> {
-        let device_id = connection.authenticated_device_id()?;
+        connection.authenticated_device_id()?;
         if payload.row == 0 || payload.col == 0 {
             return Err(ProtocolError::InvalidEnvelope);
         }
-        if !self.session_index.contains_key(&payload.session_id) {
-            return Err(ProtocolError::SessionNotFound);
-        }
-        connection.ensure_attached_to(payload.session_id)?;
+        let attached = self.require_existing_attached_session(connection, payload.session_id)?;
 
         let now_ms = current_unix_timestamp_millis();
         let record = self
             .daemon_clients
-            .entry(device_id)
+            .entry(attached.device_id)
             .or_insert_with(|| DaemonClientRecord {
-                client_id: stable_client_id_for_device(device_id),
-                device_id,
+                client_id: stable_client_id_for_device(attached.device_id),
+                device_id: attached.device_id,
                 name: None,
                 peer_ip: connection.peer_ip.clone(),
                 online: true,
@@ -1911,11 +1943,7 @@ where
         connection: &ProtocolConnection,
         payload: SessionRenamePayload,
     ) -> Result<Vec<JsonEnvelope>, ProtocolError> {
-        connection.authenticated_device_id()?;
-        connection.ensure_attached_to(payload.session_id)?;
-        if !self.session_index.contains_key(&payload.session_id) {
-            return Err(ProtocolError::SessionNotFound);
-        }
+        self.require_attached_session(connection, payload.session_id)?;
         let name = sanitize_session_name(payload.name)?;
         self.session_names.insert(payload.session_id, name.clone());
         self.client_history.record_session_renamed(
@@ -1975,21 +2003,16 @@ where
         connection: &ProtocolConnection,
         payload: SessionClosePayload,
     ) -> Result<Vec<JsonEnvelope>, ProtocolError> {
-        connection.authenticated_device_id()?;
-        let internal_session_id = self
-            .session_index
-            .get(&payload.session_id)
-            .cloned()
-            .ok_or(ProtocolError::SessionNotFound)?;
+        let attached = self.require_attached_session(connection, payload.session_id)?;
 
-        let close_result = self.runtime.close(&internal_session_id);
+        let close_result = self.runtime.close(&attached.internal_session_id);
         if let Err(error) = &close_result {
             tracing::warn!(
                 %error,
                 session_id = %payload.session_id.0,
                 "failed to terminate runtime session during explicit close"
             );
-            let _ = self.runtime.discard(&internal_session_id);
+            let _ = self.runtime.discard(&attached.internal_session_id);
         }
         self.close_visible_session_state(payload.session_id);
         if let Err(error) = self
@@ -2037,7 +2060,6 @@ where
         self.session_terminal_frame_logs.remove(&session_id);
         self.session_file_tree_signals.remove(&session_id);
         self.session_resize_signals.remove(&session_id);
-        self.pending_restore_sessions.remove(&session_id);
         for record in self.daemon_clients.values_mut() {
             for sessions in record.active_connections.values_mut() {
                 sessions.remove(&session_id);
@@ -2050,13 +2072,7 @@ where
         connection: &ProtocolConnection,
         payload: SessionSearchPayload,
     ) -> Result<Vec<JsonEnvelope>, ProtocolError> {
-        connection.authenticated_device_id()?;
-        connection.ensure_attached_to(payload.session_id)?;
-        let internal_session_id = self
-            .session_index
-            .get(&payload.session_id)
-            .cloned()
-            .ok_or(ProtocolError::SessionNotFound)?;
+        let attached = self.require_attached_session(connection, payload.session_id)?;
         let query = payload.query.trim();
         if query.is_empty() || query.chars().any(char::is_control) {
             return Err(ProtocolError::InvalidEnvelope);
@@ -2065,10 +2081,10 @@ where
         // 搜索前先尽量把 PTY 已输出内容读入内存 snapshot；不写入 SQLite/state。
         self.drain_runtime_output_to_history_until_empty(
             payload.session_id,
-            &internal_session_id,
+            &attached.internal_session_id,
             16 * 1024,
         )?;
-        let size = self.runtime_size_proto(&internal_session_id)?;
+        let size = self.runtime_size_proto(&attached.internal_session_id)?;
         let history = self.session_output_history_mut(payload.session_id, size);
         let max_results = payload.max_results.unwrap_or(80).clamp(1, 500);
         let (matches, truncated, line_count) =
@@ -2091,11 +2107,7 @@ where
         connection: &ProtocolConnection,
         payload: SessionFilesPayload,
     ) -> Result<Vec<JsonEnvelope>, ProtocolError> {
-        connection.authenticated_device_id()?;
-        connection.ensure_attached_to(payload.session_id)?;
-        if !self.session_index.contains_key(&payload.session_id) {
-            return Err(ProtocolError::SessionNotFound);
-        }
+        self.require_attached_session(connection, payload.session_id)?;
 
         let has_explicit_path = payload
             .path
@@ -2123,11 +2135,7 @@ where
         connection: &ProtocolConnection,
         payload: SessionGitPayload,
     ) -> Result<Vec<JsonEnvelope>, ProtocolError> {
-        connection.authenticated_device_id()?;
-        connection.ensure_attached_to(payload.session_id)?;
-        if !self.session_index.contains_key(&payload.session_id) {
-            return Err(ProtocolError::SessionNotFound);
-        }
+        self.require_attached_session(connection, payload.session_id)?;
 
         let result = self.session_git_result(payload.session_id)?;
         Ok(vec![envelope_value(MessageType::SessionGitResult, result)?])
@@ -2138,11 +2146,7 @@ where
         connection: &ProtocolConnection,
         payload: SessionGitActionPayload,
     ) -> Result<Vec<JsonEnvelope>, ProtocolError> {
-        connection.authenticated_device_id()?;
-        connection.ensure_attached_to(payload.session_id)?;
-        if !self.session_index.contains_key(&payload.session_id) {
-            return Err(ProtocolError::SessionNotFound);
-        }
+        self.require_attached_session(connection, payload.session_id)?;
 
         validate_git_relative_file_path(&payload.file_path)?;
         let worktree =
@@ -2170,11 +2174,7 @@ where
         connection: &ProtocolConnection,
         payload: SessionGitDiffPayload,
     ) -> Result<Vec<JsonEnvelope>, ProtocolError> {
-        connection.authenticated_device_id()?;
-        connection.ensure_attached_to(payload.session_id)?;
-        if !self.session_index.contains_key(&payload.session_id) {
-            return Err(ProtocolError::SessionNotFound);
-        }
+        self.require_attached_session(connection, payload.session_id)?;
         let file_path = payload
             .file_path
             .as_deref()
@@ -2217,16 +2217,8 @@ where
         connection: &ProtocolConnection,
         payload: SessionFileReadPayload,
     ) -> Result<Vec<JsonEnvelope>, ProtocolError> {
-        connection.authenticated_device_id()?;
-        connection.ensure_attached_to(payload.session_id)?;
-        if !self.session_index.contains_key(&payload.session_id) {
-            return Err(ProtocolError::SessionNotFound);
-        }
-        let root = self
-            .session_roots
-            .get(&payload.session_id)
-            .ok_or(ProtocolError::SessionNotFound)?;
-        let target = resolve_existing_session_file_target(root, &payload.path)?;
+        let attached = self.require_attached_session_root(connection, payload.session_id)?;
+        let target = resolve_existing_session_file_target(&attached.root, &payload.path)?;
         self.ensure_not_active_session_file_http_upload_target(payload.session_id, &target)?;
         let metadata = fs::metadata(&target).map_err(map_file_path_error)?;
         if metadata.is_dir() {
@@ -2265,16 +2257,8 @@ where
         connection: &ProtocolConnection,
         payload: SessionFileWritePayload,
     ) -> Result<Vec<JsonEnvelope>, ProtocolError> {
-        connection.authenticated_device_id()?;
-        connection.ensure_attached_to(payload.session_id)?;
-        if !self.session_index.contains_key(&payload.session_id) {
-            return Err(ProtocolError::SessionNotFound);
-        }
-        let root = self
-            .session_roots
-            .get(&payload.session_id)
-            .ok_or(ProtocolError::SessionNotFound)?;
-        let target = resolve_writable_session_file_target(root, &payload.path)?;
+        let attached = self.require_attached_session_root(connection, payload.session_id)?;
+        let target = resolve_writable_session_file_target(&attached.root, &payload.path)?;
         self.ensure_not_active_session_file_http_upload_target(payload.session_id, &target)?;
         if payload.data_base64.len() > SESSION_FILE_WRITE_MAX_BASE64_BYTES
             || base64_payload_decoded_len(&payload.data_base64) > SESSION_FILE_WRITE_MAX_BYTES
@@ -2311,16 +2295,8 @@ where
         connection: &ProtocolConnection,
         payload: SessionFileDeletePayload,
     ) -> Result<Vec<JsonEnvelope>, ProtocolError> {
-        connection.authenticated_device_id()?;
-        connection.ensure_attached_to(payload.session_id)?;
-        if !self.session_index.contains_key(&payload.session_id) {
-            return Err(ProtocolError::SessionNotFound);
-        }
-        let root = self
-            .session_roots
-            .get(&payload.session_id)
-            .ok_or(ProtocolError::SessionNotFound)?;
-        let target = resolve_writable_session_file_target(root, &payload.path)?;
+        let attached = self.require_attached_session_root(connection, payload.session_id)?;
+        let target = resolve_writable_session_file_target(&attached.root, &payload.path)?;
         self.ensure_not_active_session_file_http_upload_target(payload.session_id, &target)?;
         let metadata = fs::symlink_metadata(&target).map_err(map_file_path_error)?;
 
@@ -2346,16 +2322,8 @@ where
         connection: &ProtocolConnection,
         payload: SessionFileUploadPayload,
     ) -> Result<(SessionFileUploadReadyPayload, PacketFileUploadStream), ProtocolError> {
-        connection.authenticated_device_id()?;
-        connection.ensure_attached_to(payload.session_id)?;
-        if !self.session_index.contains_key(&payload.session_id) {
-            return Err(ProtocolError::SessionNotFound);
-        }
-        let root = self
-            .session_roots
-            .get(&payload.session_id)
-            .ok_or(ProtocolError::SessionNotFound)?;
-        let target = resolve_writable_session_file_target(root, &payload.path)?;
+        let attached = self.require_attached_session_root(connection, payload.session_id)?;
+        let target = resolve_writable_session_file_target(&attached.root, &payload.path)?;
         self.ensure_not_active_session_file_http_upload_target(payload.session_id, &target)?;
         if target.is_dir() {
             return Err(ProtocolError::InvalidEnvelope);
@@ -2401,16 +2369,8 @@ where
         _device_id: DeviceId,
     ) -> Result<SessionFileHttpUploadReadyPayload, ProtocolError> {
         self.prune_session_file_http_uploads();
-        connection.authenticated_device_id()?;
-        connection.ensure_attached_to(payload.session_id)?;
-        if !self.session_index.contains_key(&payload.session_id) {
-            return Err(ProtocolError::SessionNotFound);
-        }
-        let root = self
-            .session_roots
-            .get(&payload.session_id)
-            .ok_or(ProtocolError::SessionNotFound)?;
-        let target = resolve_writable_session_file_target(root, &payload.path)?;
+        let attached = self.require_attached_session_root(connection, payload.session_id)?;
+        let target = resolve_writable_session_file_target(&attached.root, &payload.path)?;
         if target.is_dir() {
             return Err(ProtocolError::InvalidEnvelope);
         }
@@ -2582,19 +2542,11 @@ where
         _device_id: DeviceId,
         write_len: u64,
     ) -> Result<SessionFileHttpUploadBegin, ProtocolError> {
-        connection.authenticated_device_id()?;
-        connection.ensure_attached_to(payload.session_id)?;
-        if !self.session_index.contains_key(&payload.session_id) {
-            return Err(ProtocolError::SessionNotFound);
-        }
+        let attached = self.require_attached_session_root(connection, payload.session_id)?;
         if !session_file_http_upload_id_is_safe(&payload.upload_id) {
             return Err(ProtocolError::InvalidEnvelope);
         }
-        let root = self
-            .session_roots
-            .get(&payload.session_id)
-            .ok_or(ProtocolError::SessionNotFound)?;
-        let target = resolve_writable_session_file_target(root, &payload.path)?;
+        let target = resolve_writable_session_file_target(&attached.root, &payload.path)?;
         if target.is_dir() {
             return Err(ProtocolError::InvalidEnvelope);
         }
@@ -2735,18 +2687,13 @@ where
         connection: &ProtocolConnection,
         payload: &SessionFileHttpUploadStreamPayload,
     ) -> Result<(), ProtocolError> {
-        connection.authenticated_device_id()?;
-        connection.ensure_attached_to(payload.session_id)?;
+        let attached = self.require_attached_session_root(connection, payload.session_id)?;
         // 中文注释：HTTP upload 直接写目标文件；abort 只能删除本 upload_id 创建的
         // 未完成目标。完成后的 tombstone 不能删除用户已经上传成功的文件。
         if !session_file_http_upload_id_is_safe(&payload.upload_id) {
             return Err(ProtocolError::InvalidEnvelope);
         }
-        let root = self
-            .session_roots
-            .get(&payload.session_id)
-            .ok_or(ProtocolError::SessionNotFound)?;
-        let target = resolve_writable_session_file_target(root, &payload.path)?;
+        let target = resolve_writable_session_file_target(&attached.root, &payload.path)?;
         let Some(state) = self.session_file_http_uploads.get_mut(&payload.upload_id) else {
             return Ok(());
         };
@@ -2790,16 +2737,8 @@ where
         connection: &ProtocolConnection,
         payload: SessionFileHttpDownloadPayload,
     ) -> Result<(SessionFileDownloadStreamReadyPayload, fs::File, u64), ProtocolError> {
-        connection.authenticated_device_id()?;
-        connection.ensure_attached_to(payload.session_id)?;
-        if !self.session_index.contains_key(&payload.session_id) {
-            return Err(ProtocolError::SessionNotFound);
-        }
-        let root = self
-            .session_roots
-            .get(&payload.session_id)
-            .ok_or(ProtocolError::SessionNotFound)?;
-        let target = resolve_existing_session_file_target(root, &payload.path)?;
+        let attached = self.require_attached_session_root(connection, payload.session_id)?;
+        let target = resolve_existing_session_file_target(&attached.root, &payload.path)?;
         self.ensure_not_active_session_file_http_upload_target(payload.session_id, &target)?;
         let file = fs::File::open(&target).map_err(map_file_path_error)?;
         let metadata = file.metadata().map_err(map_file_path_error)?;
@@ -2885,16 +2824,8 @@ where
         ),
         ProtocolError,
     > {
-        connection.authenticated_device_id()?;
-        connection.ensure_attached_to(payload.session_id)?;
-        if !self.session_index.contains_key(&payload.session_id) {
-            return Err(ProtocolError::SessionNotFound);
-        }
-        let root = self
-            .session_roots
-            .get(&payload.session_id)
-            .ok_or(ProtocolError::SessionNotFound)?;
-        let target = resolve_existing_session_file_target(root, &payload.path)?;
+        let attached = self.require_attached_session_root(connection, payload.session_id)?;
+        let target = resolve_existing_session_file_target(&attached.root, &payload.path)?;
         self.ensure_not_active_session_file_http_upload_target(payload.session_id, &target)?;
         let file = fs::File::open(&target).map_err(map_file_path_error)?;
         let metadata = file.metadata().map_err(map_file_path_error)?;
@@ -2973,16 +2904,8 @@ where
         connection: &ProtocolConnection,
         payload: SessionFileDownloadPreparePayload,
     ) -> Result<Vec<JsonEnvelope>, ProtocolError> {
-        connection.authenticated_device_id()?;
-        connection.ensure_attached_to(payload.session_id)?;
-        if !self.session_index.contains_key(&payload.session_id) {
-            return Err(ProtocolError::SessionNotFound);
-        }
-        let root = self
-            .session_roots
-            .get(&payload.session_id)
-            .ok_or(ProtocolError::SessionNotFound)?;
-        let target = resolve_existing_session_file_target(root, &payload.path)?;
+        let attached = self.require_attached_session_root(connection, payload.session_id)?;
+        let target = resolve_existing_session_file_target(&attached.root, &payload.path)?;
         self.ensure_not_active_session_file_http_upload_target(payload.session_id, &target)?;
         let metadata = fs::metadata(&target).map_err(map_file_path_error)?;
         if metadata.is_dir() {
@@ -3029,19 +2952,11 @@ where
         connection: &ProtocolConnection,
         payload: SessionFileDownloadChunkPayload,
     ) -> Result<Vec<JsonEnvelope>, ProtocolError> {
-        connection.authenticated_device_id()?;
-        connection.ensure_attached_to(payload.session_id)?;
+        let attached = self.require_attached_session_root(connection, payload.session_id)?;
         if payload.max_bytes == 0 {
             return Err(ProtocolError::InvalidEnvelope);
         }
-        if !self.session_index.contains_key(&payload.session_id) {
-            return Err(ProtocolError::SessionNotFound);
-        }
-        let root = self
-            .session_roots
-            .get(&payload.session_id)
-            .ok_or(ProtocolError::SessionNotFound)?;
-        let target = resolve_existing_session_file_target(root, &payload.path)?;
+        let target = resolve_existing_session_file_target(&attached.root, &payload.path)?;
         self.ensure_not_active_session_file_http_upload_target(payload.session_id, &target)?;
         let metadata = fs::metadata(&target).map_err(map_file_path_error)?;
         if metadata.is_dir() {
@@ -3103,19 +3018,18 @@ where
         if payload.device_id != device_id {
             return Err(ProtocolError::InvalidEnvelope);
         }
+        let attached = self.require_existing_attached_session(connection, payload.session_id)?;
 
-        let internal_session_id = self
-            .session_index
-            .get(&payload.session_id)
-            .ok_or(ProtocolError::SessionNotFound)?;
-        connection.ensure_attached_to(payload.session_id)?;
         self.runtime
-            .steal_control(internal_session_id, &device_key(device_id))
+            .steal_control(
+                &attached.internal_session_id,
+                &device_key(attached.device_id),
+            )
             .map_err(map_runtime_error)?;
 
         let response = ControlGrantPayload {
             session_id: payload.session_id,
-            device_id,
+            device_id: attached.device_id,
         };
 
         Ok(vec![envelope_value(MessageType::ControlGrant, response)?])
@@ -3127,7 +3041,6 @@ where
         _payload: SessionListPayload,
     ) -> Result<Vec<JsonEnvelope>, ProtocolError> {
         connection.authenticated_device_id()?;
-        self.retry_pending_restore_sessions();
         self.repair_visible_session_metadata();
 
         let sessions_by_id: HashMap<SessionId, _> = match self.client_history.list_sessions() {
@@ -3162,23 +3075,6 @@ where
                 })
             })
             .collect();
-        sessions.extend(self.pending_restore_sessions.values().map(|pending| {
-            let persisted = sessions_by_id.get(&pending.record.session_id);
-            SessionSummaryPayload {
-                session_id: pending.record.session_id,
-                name: pending
-                    .metadata
-                    .name
-                    .clone()
-                    .or_else(|| persisted.and_then(|session| session.name.clone())),
-                state: pending.record.state,
-                size: pending.record.size,
-                files_path: persisted
-                    .and_then(|session| session.files_path.clone())
-                    .or_else(|| Some(pending.metadata.root_path.to_string_lossy().to_string())),
-                created_at_ms: Some(pending.record.created_at_ms),
-            }
-        }));
         // HashMap 迭代没有业务顺序；session 列表固定按 daemon 持久化顺序返回。
         sessions.sort_by(|left, right| {
             let left_order = sessions_by_id
@@ -4103,11 +3999,7 @@ where
     }
 
     fn visible_session_ids(&self) -> HashSet<SessionId> {
-        self.session_index
-            .keys()
-            .copied()
-            .chain(self.pending_restore_sessions.keys().copied())
-            .collect()
+        self.session_index.keys().copied().collect()
     }
 
     fn repair_visible_session_metadata(&mut self) {
@@ -4177,37 +4069,6 @@ where
             return Ok(());
         }
 
-        if let Some(pending) = self.pending_restore_sessions.get(&session_id).cloned() {
-            let root_path = pending.metadata.root_path;
-            let files_path = current_record
-                .as_ref()
-                .and_then(|record| record.files_path.as_ref().map(PathBuf::from))
-                .unwrap_or_else(|| root_path.clone());
-            let default_name = pending
-                .metadata
-                .name
-                .or_else(|| {
-                    current_record
-                        .as_ref()
-                        .and_then(|record| record.name.clone())
-                })
-                .unwrap_or_else(|| default_restored_session_name(session_id));
-            let created_at_ms = current_record
-                .as_ref()
-                .map(|record| record.created_at_ms)
-                .unwrap_or(pending.record.created_at_ms);
-            self.client_history.record_session_restored(
-                session_id,
-                pending.record.state,
-                pending.record.size,
-                &root_path,
-                &default_name,
-                &files_path,
-                created_at_ms,
-                current_unix_timestamp_millis(),
-            )?;
-        }
-
         Ok(())
     }
 
@@ -4233,16 +4094,15 @@ where
                     self.register_restored_runtime_session(&session, metadata);
                 }
                 Err(error) => {
-                    tracing::warn!(%error, session_id = %wire_session_id.0, "failed to reconnect persisted session supervisor");
-                    let metadata = self
-                        .restored_session_metadata(&session, persisted_by_id.get(&wire_session_id));
-                    self.pending_restore_sessions.insert(
-                        wire_session_id,
-                        PendingRestoreSession {
-                            record: session,
-                            metadata,
-                        },
+                    tracing::warn!(
+                        %error,
+                        session_id = %wire_session_id.0,
+                        "failed to reconnect persisted session supervisor; marking session closed"
                     );
+                    // 中文注释：session 的运行事实只能来自 live supervisor。启动恢复已经给
+                    // stale socket 一次重连机会；失败后必须关闭并移除可见状态，不能再把
+                    // 它保留成 running，也不能让 session.list/attach 同步重试旧 socket。
+                    self.mark_persisted_session_closed(wire_session_id);
                 }
             }
         }
@@ -4258,7 +4118,6 @@ where
     ) {
         let wire_session_id = session.session_id;
         let internal_session_id = wire_session_id.0.to_string();
-        self.pending_restore_sessions.remove(&wire_session_id);
         self.session_index
             .insert(wire_session_id, internal_session_id);
         self.session_output_history_mut(wire_session_id, session.size);
@@ -4273,37 +4132,6 @@ where
         if let Some(name) = metadata.name {
             self.session_names.insert(wire_session_id, name);
         }
-    }
-
-    fn retry_pending_restore_sessions(&mut self) {
-        let session_ids: Vec<_> = self.pending_restore_sessions.keys().copied().collect();
-        let mut restored = false;
-        for session_id in session_ids {
-            match self.reconnect_pending_session(session_id) {
-                Ok(true) => restored = true,
-                Ok(false) => {}
-                Err(error) => {
-                    tracing::warn!(%error, session_id = %session_id.0, "pending session supervisor is still unreachable");
-                }
-            }
-        }
-        if restored {
-            if let Err(error) = self.persist_state() {
-                tracing::warn!(%error, "failed to persist recovered pending session supervisor state");
-            }
-        }
-    }
-
-    fn reconnect_pending_session(&mut self, session_id: SessionId) -> Result<bool, RuntimeError> {
-        if self.session_index.contains_key(&session_id) {
-            return Ok(true);
-        }
-        let Some(pending) = self.pending_restore_sessions.get(&session_id).cloned() else {
-            return Ok(false);
-        };
-        self.runtime.reconnect_session(&pending.record)?;
-        self.register_restored_runtime_session(&pending.record, pending.metadata);
-        Ok(true)
     }
 
     fn visible_session_metadata_by_id(&self) -> HashMap<SessionId, SessionHistoryRecord> {
@@ -4327,11 +4155,7 @@ where
         // snapshot_state 和 list_sessions 只看可见行；恢复路径还必须补查 closed 行。
         // 之前安装/重启流程可能把仍存活的 session 元数据标成 closed，此时如果不补查，
         // 领养 live supervisor 时就会丢掉用户设置的 session 名称。
-        for session_id in self
-            .session_index
-            .keys()
-            .chain(self.pending_restore_sessions.keys())
-        {
+        for session_id in self.session_index.keys() {
             if records.contains_key(session_id) {
                 continue;
             }
@@ -5599,7 +5423,8 @@ impl ProtocolConnection {
                 let plaintext = self.e2ee_mut()?.decrypt_binary_payload(&frame)?;
                 let binary_packet = decode_binary_protocol_packet(&plaintext)
                     .map_err(|_| ProtocolError::InvalidEnvelope)?;
-                let packet = protocol_packet_from_binary(binary_packet)?;
+                let packet = protocol_packet_from_binary(binary_packet)
+                    .map_err(|_| ProtocolError::InvalidEnvelope)?;
                 let packet_responses = self.handle_inner_packet(protocol, packet)?;
                 self.encrypt_packets_wire(packet_responses)
             }
@@ -6327,24 +6152,48 @@ impl ProtocolConnection {
             .method
             .clone()
             .ok_or(ProtocolError::InvalidEnvelope)?;
-        // 中文注释：同一条 WebSocket 连接只有一个活跃 terminal 输出流。
-        // Web 快速切换 session 时，旧流可能还没来得及 cancel；先清掉旧 stream/pending，
-        // 再让新的 attach/create 生成自己的 snapshot/tail，避免旧输出继续占用队列。
-        if matches!(
-            method.as_str(),
-            METHOD_TERMINAL_CREATE | METHOD_TERMINAL_ATTACH
-        ) {
-            self.clear_packet_terminal_streams();
+        if method == METHOD_TERMINAL_CREATE {
+            let payload = match decode_payload(packet.payload) {
+                Ok(payload) => payload,
+                Err(error) => return Ok(vec![packet_request_error(id, error)?]),
+            };
+            return match self.replace_packet_terminal_streams_with_rollback(
+                |connection| protocol.create_terminal_stream_session(connection, payload),
+                |connection, envelopes| {
+                    connection.finish_packet_terminal_stream_open(
+                        id,
+                        stream_id,
+                        method.as_str(),
+                        envelopes,
+                    )
+                },
+            ) {
+                Ok(packets) => Ok(packets),
+                Err(error) => Ok(vec![packet_request_error(id, error)?]),
+            };
         }
+        if method == METHOD_TERMINAL_ATTACH {
+            let payload = match decode_payload(packet.payload) {
+                Ok(payload) => payload,
+                Err(error) => return Ok(vec![packet_request_error(id, error)?]),
+            };
+            return match self.replace_packet_terminal_streams_with_rollback(
+                |connection| protocol.attach_session(connection, payload),
+                |connection, envelopes| {
+                    connection.finish_packet_terminal_stream_open(
+                        id,
+                        stream_id,
+                        method.as_str(),
+                        envelopes,
+                    )
+                },
+            ) {
+                Ok(packets) => Ok(packets),
+                Err(error) => Ok(vec![packet_request_error(id, error)?]),
+            };
+        }
+
         let responses = match method.as_str() {
-            METHOD_TERMINAL_CREATE => {
-                let payload = decode_payload(packet.payload)?;
-                protocol.create_terminal_stream_session(self, payload)
-            }
-            METHOD_TERMINAL_ATTACH => {
-                let payload = decode_payload(packet.payload)?;
-                protocol.attach_session(self, payload)
-            }
             METHOD_SESSION_FILE_UPLOAD_STREAM => {
                 let payload = decode_payload(packet.payload)?;
                 let (ready, stream) = protocol.prepare_session_file_upload_stream(self, payload)?;
@@ -6371,13 +6220,6 @@ impl ProtocolConnection {
             Ok(envelopes) => envelopes,
             Err(error) => return Ok(vec![packet_request_error(id, error)?]),
         };
-        if matches!(
-            method.as_str(),
-            METHOD_TERMINAL_CREATE | METHOD_TERMINAL_ATTACH
-        ) {
-            let session_id = packet_stream_session_id(method.as_str(), &envelopes)?;
-            self.register_packet_terminal_stream(stream_id, session_id);
-        }
         packetize_handler_stream_open_response(id, stream_id, method.as_str(), envelopes)
     }
 
@@ -6729,7 +6571,8 @@ impl ProtocolConnection {
             .map(|packet| {
                 self.debug_traffic.record_outbound_packet(&packet);
                 if self.binary_mode {
-                    let binary = protocol_packet_to_binary(packet)?;
+                    let binary = protocol_packet_to_binary(packet)
+                        .map_err(|_| ProtocolError::InvalidEnvelope)?;
                     let plaintext = encode_binary_protocol_packet(&binary);
                     let frame = self.e2ee_mut()?.encrypt_binary_payload(&plaintext)?;
                     return Ok(ProtocolWireMessage::Binary(encode_binary_encrypted_frame(
@@ -6754,6 +6597,80 @@ impl ProtocolConnection {
             .insert(session_id, stream_id);
         self.packet_terminal_streams
             .insert(stream_id, PacketTerminalStream::new(session_id));
+    }
+
+    fn replace_packet_terminal_streams_with_rollback(
+        &mut self,
+        replace: impl FnOnce(&mut Self) -> Result<Vec<JsonEnvelope>, ProtocolError>,
+        finish: impl FnOnce(
+            &mut Self,
+            Vec<JsonEnvelope>,
+        ) -> Result<Vec<ProtocolPacket<Value>>, ProtocolError>,
+    ) -> Result<Vec<ProtocolPacket<Value>>, ProtocolError> {
+        let snapshot = self.snapshot_packet_terminal_stream_state();
+        // 中文注释：同一条 WebSocket 连接只有一个活跃 terminal 输出流。只有在新
+        // stream-open payload 已成功解码后才清旧流；如果后续 attach/create 失败，
+        // 或响应转换失败，立即回滚，避免坏请求切断仍可用的旧输出流。
+        self.clear_packet_terminal_streams();
+        let envelopes = match replace(self) {
+            Ok(envelopes) => envelopes,
+            Err(error) => {
+                self.restore_packet_terminal_stream_state(snapshot);
+                return Err(error);
+            }
+        };
+        match finish(self, envelopes) {
+            Ok(packets) => Ok(packets),
+            Err(error) => {
+                self.restore_packet_terminal_stream_state(snapshot);
+                Err(error)
+            }
+        }
+    }
+
+    fn finish_packet_terminal_stream_open(
+        &mut self,
+        id: PacketRequestId,
+        stream_id: PacketStreamId,
+        method: &str,
+        envelopes: Vec<JsonEnvelope>,
+    ) -> Result<Vec<ProtocolPacket<Value>>, ProtocolError> {
+        let session_id = packet_stream_session_id(method, &envelopes)?;
+        self.register_packet_terminal_stream(stream_id, session_id);
+        packetize_handler_stream_open_response(id, stream_id, method, envelopes)
+    }
+
+    fn snapshot_packet_terminal_stream_state(&self) -> PacketTerminalStreamStateSnapshot {
+        PacketTerminalStreamStateSnapshot {
+            state: self.state,
+            packet_terminal_streams: self.packet_terminal_streams.clone(),
+            packet_terminal_streams_by_session: self.packet_terminal_streams_by_session.clone(),
+            attached_sessions: self.attached_sessions.clone(),
+            watched_sessions: self.watched_sessions.clone(),
+            stale_watched_sessions: self.stale_watched_sessions.clone(),
+            output_offsets: self.output_offsets.clone(),
+            pending_outputs: self.pending_outputs.clone(),
+            terminal_frame_next_seq: self.terminal_frame_next_seq.clone(),
+            terminal_frame_snapshot_required: self.terminal_frame_snapshot_required.clone(),
+            deferred_output_wakeups: self.deferred_output_wakeups.clone(),
+        }
+    }
+
+    fn restore_packet_terminal_stream_state(
+        &mut self,
+        snapshot: PacketTerminalStreamStateSnapshot,
+    ) {
+        self.state = snapshot.state;
+        self.packet_terminal_streams = snapshot.packet_terminal_streams;
+        self.packet_terminal_streams_by_session = snapshot.packet_terminal_streams_by_session;
+        self.attached_sessions = snapshot.attached_sessions;
+        self.watched_sessions = snapshot.watched_sessions;
+        self.stale_watched_sessions = snapshot.stale_watched_sessions;
+        self.output_offsets = snapshot.output_offsets;
+        self.pending_outputs = snapshot.pending_outputs;
+        self.terminal_frame_next_seq = snapshot.terminal_frame_next_seq;
+        self.terminal_frame_snapshot_required = snapshot.terminal_frame_snapshot_required;
+        self.deferred_output_wakeups = snapshot.deferred_output_wakeups;
     }
 
     fn clear_packet_terminal_streams(&mut self) {
@@ -7103,371 +7020,6 @@ fn packet_from_envelope(
     let method =
         packet_event_method_for_message(envelope.kind).ok_or(ProtocolError::InvalidEnvelope)?;
     Ok(ProtocolPacket::event(method, envelope.payload))
-}
-
-fn protocol_packet_to_binary(
-    packet: ProtocolPacket<Value>,
-) -> Result<BinaryProtocolPacket, ProtocolError> {
-    let payload = match packet.kind {
-        PacketKind::StreamChunk => binary_stream_chunk_payload(&packet.payload)?,
-        PacketKind::Error => {
-            let error: PacketErrorPayload = decode_payload(packet.payload)?;
-            Some(binary_protocol_packet::Payload::Error(
-                BinaryPacketErrorPayload {
-                    code: error.code,
-                    message: error.message,
-                    retryable: error.retryable,
-                },
-            ))
-        }
-        _ => Some(binary_protocol_packet::Payload::Json(
-            serde_json::to_vec(&packet.payload).map_err(|_| ProtocolError::InvalidEnvelope)?,
-        )),
-    };
-
-    Ok(BinaryProtocolPacket {
-        version: u32::from(packet.version),
-        kind: binary_packet_kind(packet.kind),
-        id: packet
-            .id
-            .map(|id| id.0.as_bytes().to_vec())
-            .unwrap_or_default(),
-        stream_id: packet
-            .stream_id
-            .map(|stream_id| stream_id.0.as_bytes().to_vec())
-            .unwrap_or_default(),
-        method: packet.method.unwrap_or_default(),
-        seq: packet.seq,
-        ack: packet.ack.unwrap_or(0),
-        credit: packet.credit.unwrap_or(0),
-        payload,
-    })
-}
-
-fn protocol_packet_from_binary(
-    packet: BinaryProtocolPacket,
-) -> Result<ProtocolPacket<Value>, ProtocolError> {
-    let kind = packet_kind_from_binary(packet.kind)?;
-    let payload = match packet.payload {
-        Some(binary_protocol_packet::Payload::Json(bytes)) => {
-            serde_json::from_slice(&bytes).map_err(|_| ProtocolError::InvalidEnvelope)?
-        }
-        Some(binary_protocol_packet::Payload::SessionData(payload)) => {
-            serde_json::to_value(SessionDataPayload {
-                session_id: session_id_from_binary(&payload.session_id)?,
-                data_base64: general_purpose::STANDARD.encode(payload.data),
-            })
-            .map_err(|_| ProtocolError::InvalidEnvelope)?
-        }
-        Some(binary_protocol_packet::Payload::TerminalFrame(payload)) => {
-            serde_json::to_value(terminal_frame_from_binary(payload)?)
-                .map_err(|_| ProtocolError::InvalidEnvelope)?
-        }
-        Some(binary_protocol_packet::Payload::FileChunk(payload)) => {
-            serde_json::to_value(SessionFileTransferChunkPayload {
-                session_id: session_id_from_binary(&payload.session_id)?,
-                offset_bytes: payload.offset_bytes,
-                data_base64: general_purpose::STANDARD.encode(payload.data),
-                size_bytes: payload.size_bytes,
-                eof: payload.eof,
-            })
-            .map_err(|_| ProtocolError::InvalidEnvelope)?
-        }
-        Some(binary_protocol_packet::Payload::Error(error)) => {
-            serde_json::to_value(PacketErrorPayload {
-                code: error.code,
-                message: error.message,
-                retryable: error.retryable,
-            })
-            .map_err(|_| ProtocolError::InvalidEnvelope)?
-        }
-        None => serde_json::json!({}),
-    };
-
-    Ok(ProtocolPacket {
-        version: packet.version as u16,
-        kind,
-        id: optional_packet_request_id(&packet.id)?,
-        stream_id: optional_packet_stream_id(&packet.stream_id)?,
-        method: (!packet.method.is_empty()).then_some(packet.method),
-        seq: packet.seq,
-        ack: (packet.ack != 0).then_some(packet.ack),
-        credit: (packet.credit != 0).then_some(packet.credit),
-        payload,
-    })
-}
-
-fn binary_stream_chunk_payload(
-    payload: &Value,
-) -> Result<Option<binary_protocol_packet::Payload>, ProtocolError> {
-    if payload.get("kind").is_some() {
-        let frame = serde_json::from_value::<TerminalFramePayload>(payload.clone())
-            .map_err(|_| ProtocolError::InvalidEnvelope)?;
-        return Ok(Some(binary_protocol_packet::Payload::TerminalFrame(
-            terminal_frame_to_binary(frame)?,
-        )));
-    }
-
-    if let Ok(file_chunk) =
-        serde_json::from_value::<SessionFileTransferChunkPayload>(payload.clone())
-    {
-        let data = general_purpose::STANDARD
-            .decode(file_chunk.data_base64)
-            .map_err(|_| ProtocolError::InvalidEnvelope)?;
-        return Ok(Some(binary_protocol_packet::Payload::FileChunk(
-            BinaryFileChunkPayload {
-                session_id: file_chunk.session_id.0.as_bytes().to_vec(),
-                offset_bytes: file_chunk.offset_bytes,
-                data,
-                size_bytes: file_chunk.size_bytes,
-                eof: file_chunk.eof,
-            },
-        )));
-    }
-
-    if let Ok(session_data) = serde_json::from_value::<SessionDataPayload>(payload.clone()) {
-        let data = general_purpose::STANDARD
-            .decode(session_data.data_base64)
-            .map_err(|_| ProtocolError::InvalidEnvelope)?;
-        return Ok(Some(binary_protocol_packet::Payload::SessionData(
-            BinarySessionDataPayload {
-                session_id: session_data.session_id.0.as_bytes().to_vec(),
-                data,
-            },
-        )));
-    }
-
-    Ok(Some(binary_protocol_packet::Payload::Json(
-        serde_json::to_vec(payload).map_err(|_| ProtocolError::InvalidEnvelope)?,
-    )))
-}
-
-fn binary_packet_kind(kind: PacketKind) -> i32 {
-    match kind {
-        PacketKind::Request => BinaryPacketKind::Request as i32,
-        PacketKind::Response => BinaryPacketKind::Response as i32,
-        PacketKind::Event => BinaryPacketKind::Event as i32,
-        PacketKind::StreamOpen => BinaryPacketKind::StreamOpen as i32,
-        PacketKind::StreamChunk => BinaryPacketKind::StreamChunk as i32,
-        PacketKind::StreamEnd => BinaryPacketKind::StreamEnd as i32,
-        PacketKind::Cancel => BinaryPacketKind::Cancel as i32,
-        PacketKind::Flow => BinaryPacketKind::Flow as i32,
-        PacketKind::Error => BinaryPacketKind::Error as i32,
-    }
-}
-
-fn packet_kind_from_binary(kind: i32) -> Result<PacketKind, ProtocolError> {
-    let Some(kind) = BinaryPacketKind::try_from(kind).ok() else {
-        return Err(ProtocolError::InvalidEnvelope);
-    };
-    Ok(match kind {
-        BinaryPacketKind::Request => PacketKind::Request,
-        BinaryPacketKind::Response => PacketKind::Response,
-        BinaryPacketKind::Event => PacketKind::Event,
-        BinaryPacketKind::StreamOpen => PacketKind::StreamOpen,
-        BinaryPacketKind::StreamChunk => PacketKind::StreamChunk,
-        BinaryPacketKind::StreamEnd => PacketKind::StreamEnd,
-        BinaryPacketKind::Cancel => PacketKind::Cancel,
-        BinaryPacketKind::Flow => PacketKind::Flow,
-        BinaryPacketKind::Error => PacketKind::Error,
-    })
-}
-
-fn terminal_frame_to_binary(
-    frame: TerminalFramePayload,
-) -> Result<BinaryTerminalFramePayload, ProtocolError> {
-    Ok(match frame {
-        TerminalFramePayload::Snapshot {
-            session_id,
-            base_seq,
-            size,
-            data_base64,
-        } => BinaryTerminalFramePayload {
-            kind: BinaryTerminalFrameKind::Snapshot as i32,
-            session_id: session_id.0.as_bytes().to_vec(),
-            base_seq,
-            terminal_seq: 0,
-            size: Some(binary_terminal_size(size)),
-            data: general_purpose::STANDARD
-                .decode(data_base64)
-                .map_err(|_| ProtocolError::InvalidEnvelope)?,
-            frames: Vec::new(),
-            exit_code: None,
-        },
-        TerminalFramePayload::Output {
-            session_id,
-            terminal_seq,
-            data_base64,
-        } => BinaryTerminalFramePayload {
-            kind: BinaryTerminalFrameKind::Output as i32,
-            session_id: session_id.0.as_bytes().to_vec(),
-            base_seq: 0,
-            terminal_seq,
-            size: None,
-            data: general_purpose::STANDARD
-                .decode(data_base64)
-                .map_err(|_| ProtocolError::InvalidEnvelope)?,
-            frames: Vec::new(),
-            exit_code: None,
-        },
-        TerminalFramePayload::Resize {
-            session_id,
-            terminal_seq,
-            size,
-        } => BinaryTerminalFramePayload {
-            kind: BinaryTerminalFrameKind::Resize as i32,
-            session_id: session_id.0.as_bytes().to_vec(),
-            base_seq: 0,
-            terminal_seq,
-            size: Some(binary_terminal_size(size)),
-            data: Vec::new(),
-            frames: Vec::new(),
-            exit_code: None,
-        },
-        TerminalFramePayload::Exit {
-            session_id,
-            terminal_seq,
-            code,
-        } => BinaryTerminalFramePayload {
-            kind: BinaryTerminalFrameKind::Exit as i32,
-            session_id: session_id.0.as_bytes().to_vec(),
-            base_seq: 0,
-            terminal_seq,
-            size: None,
-            data: Vec::new(),
-            frames: Vec::new(),
-            exit_code: code,
-        },
-        TerminalFramePayload::Batch { session_id, frames } => BinaryTerminalFramePayload {
-            kind: BinaryTerminalFrameKind::Batch as i32,
-            session_id: session_id.0.as_bytes().to_vec(),
-            base_seq: 0,
-            terminal_seq: 0,
-            size: None,
-            data: Vec::new(),
-            frames: frames
-                .into_iter()
-                .map(terminal_frame_to_binary)
-                .collect::<Result<Vec<_>, _>>()?,
-            exit_code: None,
-        },
-    })
-}
-
-fn terminal_frame_from_binary(
-    frame: BinaryTerminalFramePayload,
-) -> Result<TerminalFramePayload, ProtocolError> {
-    let kind = match BinaryTerminalFrameKind::try_from(frame.kind)
-        .map_err(|_| ProtocolError::InvalidEnvelope)?
-    {
-        BinaryTerminalFrameKind::Unspecified if frame.size.is_some() => {
-            // 兼容早期 binary v1：snapshot 曾经使用 enum 默认值 0，prost 会省略 kind 字段。
-            BinaryTerminalFrameKind::Snapshot
-        }
-        BinaryTerminalFrameKind::Unspecified => return Err(ProtocolError::InvalidEnvelope),
-        kind => kind,
-    };
-    let session_id = session_id_from_binary(&frame.session_id)?;
-    Ok(match kind {
-        BinaryTerminalFrameKind::Unspecified => return Err(ProtocolError::InvalidEnvelope),
-        BinaryTerminalFrameKind::Snapshot => TerminalFramePayload::Snapshot {
-            session_id,
-            base_seq: frame.base_seq,
-            size: terminal_size_from_binary(frame.size)?,
-            data_base64: general_purpose::STANDARD.encode(frame.data),
-        },
-        BinaryTerminalFrameKind::Output => TerminalFramePayload::Output {
-            session_id,
-            terminal_seq: frame.terminal_seq,
-            data_base64: general_purpose::STANDARD.encode(frame.data),
-        },
-        BinaryTerminalFrameKind::Resize => TerminalFramePayload::Resize {
-            session_id,
-            terminal_seq: frame.terminal_seq,
-            size: terminal_size_from_binary(frame.size)?,
-        },
-        BinaryTerminalFrameKind::Exit => TerminalFramePayload::Exit {
-            session_id,
-            terminal_seq: frame.terminal_seq,
-            code: frame.exit_code,
-        },
-        BinaryTerminalFrameKind::Batch => TerminalFramePayload::Batch {
-            session_id,
-            frames: frame
-                .frames
-                .into_iter()
-                .map(terminal_frame_from_binary)
-                .collect::<Result<Vec<_>, _>>()?,
-        },
-    })
-}
-
-fn binary_terminal_size(size: TerminalSize) -> BinaryTerminalSize {
-    BinaryTerminalSize {
-        rows: u32::from(size.rows),
-        cols: u32::from(size.cols),
-        pixel_width: u32::from(size.pixel_width),
-        pixel_height: u32::from(size.pixel_height),
-    }
-}
-
-fn terminal_size_from_binary(
-    size: Option<BinaryTerminalSize>,
-) -> Result<TerminalSize, ProtocolError> {
-    let Some(size) = size else {
-        return Err(ProtocolError::InvalidEnvelope);
-    };
-    Ok(TerminalSize {
-        rows: size
-            .rows
-            .try_into()
-            .map_err(|_| ProtocolError::InvalidEnvelope)?,
-        cols: size
-            .cols
-            .try_into()
-            .map_err(|_| ProtocolError::InvalidEnvelope)?,
-        pixel_width: size
-            .pixel_width
-            .try_into()
-            .map_err(|_| ProtocolError::InvalidEnvelope)?,
-        pixel_height: size
-            .pixel_height
-            .try_into()
-            .map_err(|_| ProtocolError::InvalidEnvelope)?,
-    })
-}
-
-fn optional_packet_request_id(bytes: &[u8]) -> Result<Option<PacketRequestId>, ProtocolError> {
-    if bytes.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(PacketRequestId(uuid_from_binary(bytes)?)))
-}
-
-fn optional_packet_stream_id(bytes: &[u8]) -> Result<Option<PacketStreamId>, ProtocolError> {
-    if bytes.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(PacketStreamId(uuid_from_binary(bytes)?)))
-}
-
-fn session_id_from_binary(bytes: &[u8]) -> Result<SessionId, ProtocolError> {
-    Ok(SessionId(uuid_from_binary(bytes)?))
-}
-
-fn uuid_from_binary(bytes: &[u8]) -> Result<Uuid, ProtocolError> {
-    Uuid::from_slice(bytes).map_err(|_| ProtocolError::InvalidEnvelope)
-}
-
-fn packet_event_method_for_message(kind: MessageType) -> Option<&'static str> {
-    match kind {
-        MessageType::AuthChallenge => Some(METHOD_AUTH_CHALLENGE),
-        MessageType::SessionActivity => Some(METHOD_SESSION_ACTIVITY),
-        MessageType::SessionFilesResult => Some(METHOD_SESSION_FILES),
-        MessageType::SessionGitResult => Some(METHOD_SESSION_GIT),
-        MessageType::SessionResized => Some(METHOD_SESSION_RESIZED),
-        _ => None,
-    }
 }
 
 fn packet_bound_error(
@@ -9107,12 +8659,14 @@ mod tests {
     use ed25519_dalek::{Signer, SigningKey};
     use rand_core::OsRng;
     use termd_proto::{
-        PairAcceptPayload, PairingToken, PublicKey, SessionFileDeletePayload,
-        SessionFileDeletedPayload, SessionFileKind, SessionFileReadPayload,
-        SessionFileReadResultPayload, SessionFileWritePayload, SessionFileWrittenPayload,
-        SessionFilesPayload, SessionFilesResultPayload, SessionGitActionKind,
-        SessionGitActionPayload, SessionGitActionResultPayload, SessionGitPayload,
-        SessionGitResultPayload, Signature,
+        BinaryPacketKind, BinaryProtocolPacket, BinarySessionDataPayload, BinaryTerminalFrameKind,
+        BinaryTerminalFramePayload, BinaryTerminalSize, METHOD_AUTH_CHALLENGE, PairAcceptPayload,
+        PairingToken, PublicKey, SessionFileDeletePayload, SessionFileDeletedPayload,
+        SessionFileKind, SessionFileReadPayload, SessionFileReadResultPayload,
+        SessionFileWritePayload, SessionFileWrittenPayload, SessionFilesPayload,
+        SessionFilesResultPayload, SessionGitActionKind, SessionGitActionPayload,
+        SessionGitActionResultPayload, SessionGitPayload, SessionGitResultPayload, Signature,
+        binary_protocol_packet,
     };
 
     use super::*;
@@ -9704,6 +9258,44 @@ mod tests {
         assert!(responses.is_empty());
 
         (device_keypair, device_session)
+    }
+
+    fn open_auth_e2ee(
+        protocol: &mut DaemonProtocol<FakePtyBackend, Ed25519SignatureVerifier>,
+        connection: &mut ProtocolConnection,
+        device_id: DeviceId,
+    ) -> (E2eeSession, AuthChallengePayload) {
+        let device_e2ee_keypair = E2eeKeyPair::generate();
+        let context = E2eeSessionContext::new(
+            protocol.server_id(),
+            device_id,
+            protocol.e2ee_public_key(),
+            device_e2ee_keypair.public_key(),
+        );
+        let mut device_session = E2eeSession::new(
+            E2eeSessionRole::Device,
+            &device_e2ee_keypair,
+            protocol.e2ee_public_key(),
+            context,
+        )
+        .unwrap();
+        let handshake = envelope_value(
+            MessageType::E2eeKeyExchange,
+            E2eeKeyExchangePayload::new(
+                protocol.server_id(),
+                device_id,
+                device_e2ee_keypair.public_key_wire(),
+                nonce(),
+                current_unix_timestamp_millis(),
+            ),
+        )
+        .unwrap();
+        let challenge_response = connection.handle_wire_envelope(protocol, handshake);
+        let challenge_envelope = decrypt_first(&mut device_session, challenge_response);
+
+        assert_eq!(challenge_envelope.kind, MessageType::AuthChallenge);
+        let challenge: AuthChallengePayload = decode_payload(challenge_envelope.payload).unwrap();
+        (device_session, challenge)
     }
 
     fn open_packet_e2ee(
@@ -10552,12 +10144,14 @@ mod tests {
             connection.read_session_output_wire(&mut protocol, created.session_id, 1024);
         let output_packets = decrypt_binary_packets(&mut device_session, output_messages);
         assert!(!String::from_utf8_lossy(&output_packets[0].2).contains("data_base64"));
-        let Some(binary_protocol_packet::Payload::TerminalFrame(frame)) =
+        let Some(binary_protocol_packet::Payload::TerminalFrame(_frame)) =
             output_packets[0].0.payload.clone()
         else {
             panic!("expected binary terminal frame payload");
         };
-        match terminal_frame_from_binary(frame).unwrap() {
+        let decoded_frame: TerminalFramePayload =
+            decode_payload(output_packets[0].1.payload.clone()).unwrap();
+        match decoded_frame {
             TerminalFramePayload::Snapshot { data_base64, .. } => {
                 assert!(
                     general_purpose::STANDARD
@@ -10653,7 +10247,12 @@ mod tests {
                     session_id: session_id.0.as_bytes().to_vec(),
                     base_seq: 7,
                     terminal_seq: 0,
-                    size: Some(binary_terminal_size(TerminalSize::new(24, 80))),
+                    size: Some(BinaryTerminalSize {
+                        rows: 24,
+                        cols: 80,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    }),
                     data: b"legacy-snapshot".to_vec(),
                     frames: Vec::new(),
                     exit_code: None,
@@ -12045,6 +11644,311 @@ mod tests {
     }
 
     #[test]
+    fn packet_terminal_stream_open_failure_keeps_previous_stream_and_deferred_wakeup() {
+        let (mut protocol, backend) = protocol();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let (_, mut device_session, _) =
+            open_packet_e2ee(&mut protocol, &mut connection, device_id);
+        pair_packet_device(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            device_id,
+            PublicKey("device-public-key".to_owned()),
+        );
+
+        let session_id =
+            create_test_packet_session(&mut protocol, &mut connection, &mut device_session);
+        for terminal_seq in 1..=6000 {
+            backend.push_terminal_journal_frame_for_session(
+                session_id,
+                PtyTerminalFrame::Output {
+                    terminal_seq,
+                    data: b"failure-safe-output-frame\n".to_vec(),
+                },
+            );
+        }
+
+        let old_stream = PacketStreamId::new();
+        let attach_responses = send_encrypted_packet(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            ProtocolPacket::stream_open(
+                PacketRequestId::new(),
+                old_stream,
+                METHOD_TERMINAL_ATTACH,
+                16,
+                serde_json::to_value(SessionAttachPayload {
+                    session_id,
+                    watch_updates: true,
+                    last_terminal_seq: Some(0),
+                })
+                .unwrap(),
+            ),
+        );
+        assert_eq!(
+            decrypt_first_packet(&mut device_session, attach_responses).kind,
+            PacketKind::Response
+        );
+        let first_output = decrypt_packets(
+            &mut device_session,
+            connection.read_session_output(&mut protocol, session_id, 1024),
+        );
+        assert_eq!(first_output.len(), 1);
+        assert_eq!(first_output[0].stream_id, Some(old_stream));
+        assert_eq!(first_output[0].seq, 1);
+
+        let malformed_open = send_encrypted_packet(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            ProtocolPacket::stream_open(
+                PacketRequestId::new(),
+                PacketStreamId::new(),
+                METHOD_TERMINAL_ATTACH,
+                16,
+                serde_json::json!({
+                    "watch_updates": true,
+                    "last_terminal_seq": 0
+                }),
+            ),
+        );
+        let malformed_response = decrypt_first_packet(&mut device_session, malformed_open);
+        assert_eq!(malformed_response.kind, PacketKind::Error);
+        assert_eq!(
+            connection.debug_snapshot().terminal_streams,
+            1,
+            "malformed replacement stream-open 不能清掉旧 terminal stream"
+        );
+        assert_eq!(
+            connection.take_deferred_output_wakeups(),
+            vec![session_id],
+            "malformed replacement stream-open 不能丢失旧 stream 的 deferred wakeup"
+        );
+
+        let second_output = decrypt_packets(
+            &mut device_session,
+            connection.read_session_output(&mut protocol, session_id, 1024),
+        );
+        assert_eq!(second_output.len(), 1);
+        assert_eq!(second_output[0].kind, PacketKind::StreamChunk);
+        assert_eq!(second_output[0].stream_id, Some(old_stream));
+        assert_eq!(second_output[0].seq, 2);
+        let second_payload: TerminalFramePayload =
+            decode_payload(second_output[0].payload.clone()).unwrap();
+        assert!(terminal_frame_payload_count(&second_payload) > 0);
+    }
+
+    #[test]
+    fn packet_terminal_stream_open_handler_failure_rolls_back_previous_stream() {
+        let (mut protocol, backend) = protocol();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let (_, mut device_session, _) =
+            open_packet_e2ee(&mut protocol, &mut connection, device_id);
+        pair_packet_device(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            device_id,
+            PublicKey("device-public-key".to_owned()),
+        );
+
+        let session_id =
+            create_test_packet_session(&mut protocol, &mut connection, &mut device_session);
+        for terminal_seq in 1..=6000 {
+            backend.push_terminal_journal_frame_for_session(
+                session_id,
+                PtyTerminalFrame::Output {
+                    terminal_seq,
+                    data: b"rollback-safe-output-frame\n".to_vec(),
+                },
+            );
+        }
+
+        let old_stream = PacketStreamId::new();
+        let attach_responses = send_encrypted_packet(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            ProtocolPacket::stream_open(
+                PacketRequestId::new(),
+                old_stream,
+                METHOD_TERMINAL_ATTACH,
+                16,
+                serde_json::to_value(SessionAttachPayload {
+                    session_id,
+                    watch_updates: true,
+                    last_terminal_seq: Some(0),
+                })
+                .unwrap(),
+            ),
+        );
+        assert_eq!(
+            decrypt_first_packet(&mut device_session, attach_responses).kind,
+            PacketKind::Response
+        );
+        let first_output = decrypt_packets(
+            &mut device_session,
+            connection.read_session_output(&mut protocol, session_id, 1024),
+        );
+        assert_eq!(first_output.len(), 1);
+        assert_eq!(first_output[0].stream_id, Some(old_stream));
+        assert_eq!(first_output[0].seq, 1);
+
+        let invalid_session_open = send_encrypted_packet(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            ProtocolPacket::stream_open(
+                PacketRequestId::new(),
+                PacketStreamId::new(),
+                METHOD_TERMINAL_ATTACH,
+                16,
+                serde_json::to_value(SessionAttachPayload {
+                    session_id: SessionId::new(),
+                    watch_updates: true,
+                    last_terminal_seq: Some(0),
+                })
+                .unwrap(),
+            ),
+        );
+        let invalid_session_response =
+            decrypt_first_packet(&mut device_session, invalid_session_open);
+        assert_eq!(invalid_session_response.kind, PacketKind::Error);
+        assert_eq!(
+            connection.debug_snapshot().terminal_streams,
+            1,
+            "valid payload 进入 handler 后失败时也必须恢复旧 terminal stream"
+        );
+        assert_eq!(
+            connection.take_deferred_output_wakeups(),
+            vec![session_id],
+            "handler 失败回滚不能丢失旧 stream 的 deferred wakeup"
+        );
+
+        let second_output = decrypt_packets(
+            &mut device_session,
+            connection.read_session_output(&mut protocol, session_id, 1024),
+        );
+        assert_eq!(second_output.len(), 1);
+        assert_eq!(second_output[0].kind, PacketKind::StreamChunk);
+        assert_eq!(second_output[0].stream_id, Some(old_stream));
+        assert_eq!(second_output[0].seq, 2);
+        let second_payload: TerminalFramePayload =
+            decode_payload(second_output[0].payload.clone()).unwrap();
+        assert!(terminal_frame_payload_count(&second_payload) > 0);
+    }
+
+    #[test]
+    fn packet_terminal_stream_open_late_failure_rolls_back_connection_attach_state() {
+        let (mut protocol, backend) = protocol();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let (_, mut device_session, _) =
+            open_packet_e2ee(&mut protocol, &mut connection, device_id);
+        pair_packet_device(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            device_id,
+            PublicKey("device-public-key".to_owned()),
+        );
+
+        let session_id =
+            create_test_packet_session(&mut protocol, &mut connection, &mut device_session);
+        for terminal_seq in 1..=6000 {
+            backend.push_terminal_journal_frame_for_session(
+                session_id,
+                PtyTerminalFrame::Output {
+                    terminal_seq,
+                    data: b"late-rollback-output-frame\n".to_vec(),
+                },
+            );
+        }
+
+        let old_stream = PacketStreamId::new();
+        let attach_responses = send_encrypted_packet(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            ProtocolPacket::stream_open(
+                PacketRequestId::new(),
+                old_stream,
+                METHOD_TERMINAL_ATTACH,
+                16,
+                serde_json::to_value(SessionAttachPayload {
+                    session_id,
+                    watch_updates: true,
+                    last_terminal_seq: Some(0),
+                })
+                .unwrap(),
+            ),
+        );
+        assert_eq!(
+            decrypt_first_packet(&mut device_session, attach_responses).kind,
+            PacketKind::Response
+        );
+        let first_output = decrypt_packets(
+            &mut device_session,
+            connection.read_session_output(&mut protocol, session_id, 1024),
+        );
+        assert_eq!(first_output.len(), 1);
+        assert_eq!(first_output[0].stream_id, Some(old_stream));
+        assert_eq!(connection.debug_snapshot().attached_sessions, 1);
+
+        // 中文注释：让状态文件的父路径变成普通文件，persist_state 必然失败。
+        // terminal.create 会在 connection.attach 之后写状态，用来覆盖“清旧流后晚失败”的
+        // rollback 分支。
+        let parent_file = temp_state_path("state-parent-file");
+        std::fs::write(&parent_file, b"not-a-directory").unwrap();
+        protocol.config.state_path = parent_file.join("daemon-state.json");
+        let request_id = PacketRequestId::new();
+        let late_failure = send_encrypted_packet(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            ProtocolPacket::stream_open(
+                request_id,
+                PacketStreamId::new(),
+                METHOD_TERMINAL_CREATE,
+                16,
+                serde_json::to_value(SessionCreatePayload {
+                    command: vec!["sh".to_owned()],
+                    size: TerminalSize::new(24, 80),
+                })
+                .unwrap(),
+            ),
+        );
+        let late_failure_packet = decrypt_first_packet(&mut device_session, late_failure);
+        assert_eq!(late_failure_packet.kind, PacketKind::Error);
+        assert_eq!(late_failure_packet.id, Some(request_id));
+        let error: PacketErrorPayload = decode_payload(late_failure_packet.payload).unwrap();
+        assert_eq!(error.code, "state_failed");
+        assert_eq!(
+            connection.debug_snapshot().attached_sessions,
+            1,
+            "terminal.create late failure 不能把失败的新 session 留在连接 attach 集合里"
+        );
+        assert_eq!(
+            connection.debug_snapshot().terminal_streams,
+            1,
+            "terminal.create late failure 必须恢复旧 terminal stream"
+        );
+        assert_eq!(connection.take_deferred_output_wakeups(), vec![session_id]);
+
+        let second_output = decrypt_packets(
+            &mut device_session,
+            connection.read_session_output(&mut protocol, session_id, 1024),
+        );
+        assert_eq!(second_output.len(), 1);
+        assert_eq!(second_output[0].stream_id, Some(old_stream));
+        assert_eq!(second_output[0].seq, 2);
+    }
+
+    #[test]
     fn packet_terminal_live_frames_are_fanned_out_to_multiple_connections() {
         let (mut protocol, backend) = protocol();
         let (mut first_connection, _) = protocol.start_connection();
@@ -12689,6 +12593,74 @@ mod tests {
     }
 
     #[test]
+    fn websocket_auth_invalid_signature_does_not_consume_replay_nonce() {
+        let (mut protocol, _) = protocol();
+        let device_id = DeviceId::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = PublicKey(wire(signing_key.verifying_key().as_bytes()));
+        let shared_nonce = Nonce("websocket-auth-replay-nonce".to_owned());
+
+        let (mut pair_connection, _) = protocol.start_connection();
+        let (_, mut pair_device_session) =
+            open_e2ee(&mut protocol, &mut pair_connection, device_id);
+        pair_device(
+            &mut protocol,
+            &mut pair_connection,
+            &mut pair_device_session,
+            device_id,
+            public_key,
+        );
+
+        let (mut invalid_connection, _) = protocol.start_connection();
+        let (mut invalid_device_session, invalid_challenge) =
+            open_auth_e2ee(&mut protocol, &mut invalid_connection, device_id);
+        let invalid_payload = AuthPayload {
+            device_id,
+            challenge: invalid_challenge.challenge,
+            nonce: shared_nonce.clone(),
+            timestamp_ms: current_unix_timestamp_millis(),
+            signature: Signature(wire(&signing_key.sign(b"wrong-auth-input").to_bytes())),
+        };
+        let invalid_responses = send_encrypted(
+            &mut protocol,
+            &mut invalid_connection,
+            &mut invalid_device_session,
+            envelope_value(MessageType::Auth, invalid_payload).unwrap(),
+        );
+        let error = decrypt_first(&mut invalid_device_session, invalid_responses);
+        let error_payload: ErrorPayload = decode_payload(error.payload).unwrap();
+
+        assert_eq!(error.kind, MessageType::Error);
+        assert_eq!(error_payload.code, "auth_failed");
+        assert!(!invalid_connection.is_authenticated());
+
+        let (mut valid_connection, _) = protocol.start_connection();
+        let (mut valid_device_session, valid_challenge) =
+            open_auth_e2ee(&mut protocol, &mut valid_connection, device_id);
+        let mut valid_payload = AuthPayload {
+            device_id,
+            challenge: valid_challenge.challenge,
+            nonce: shared_nonce,
+            timestamp_ms: current_unix_timestamp_millis(),
+            signature: Signature("ed25519-v1:placeholder".to_owned()),
+        };
+        let signing_input =
+            AuthSigningInput::from_payload(&valid_payload, protocol.daemon_public_identity())
+                .to_bytes();
+        valid_payload.signature = Signature(wire(&signing_key.sign(&signing_input).to_bytes()));
+
+        let valid_responses = send_encrypted(
+            &mut protocol,
+            &mut valid_connection,
+            &mut valid_device_session,
+            envelope_value(MessageType::Auth, valid_payload).unwrap(),
+        );
+
+        assert!(valid_responses.is_empty());
+        assert!(valid_connection.is_authenticated());
+    }
+
+    #[test]
     fn paired_device_can_authenticate_after_protocol_state_reload() {
         let backend = FakePtyBackend::default();
         let state_path = temp_state_path("paired-device.json");
@@ -13315,7 +13287,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_keeps_stale_running_restore_records_pending() {
+    fn startup_closes_stale_running_restore_records() {
         let backend = FakePtyBackend::default();
         backend.fail_reconnects("stale supervisor socket");
         let state_path = temp_state_path("restore-stale-session.json");
@@ -13396,7 +13368,7 @@ mod tests {
                 .into_iter()
                 .map(|session| session.session_id)
                 .collect::<Vec<_>>(),
-            vec![stale_session_id]
+            Vec::<SessionId>::new()
         );
         let mut connection = ProtocolConnection::new(None);
         connection.authenticated_device_id = Some(DeviceId::new());
@@ -13405,11 +13377,9 @@ mod tests {
             .unwrap();
         let payload: SessionListResultPayload =
             decode_payload(response[0].payload.clone()).unwrap();
-        assert_eq!(payload.sessions.len(), 1);
-        assert_eq!(payload.sessions[0].session_id, stale_session_id);
-        assert_eq!(
-            payload.sessions[0].name.as_deref(),
-            Some(stale_session_name)
+        assert!(
+            payload.sessions.is_empty(),
+            "死掉的 supervisor 不应继续作为 running session 展示并拖慢 list"
         );
         assert!(!protocol.session_index.contains_key(&stale_session_id));
 
@@ -13419,38 +13389,23 @@ mod tests {
             .unwrap();
         let payload: SessionListResultPayload =
             decode_payload(response[0].payload.clone()).unwrap();
-        assert_eq!(payload.sessions.len(), 1);
-        assert_eq!(payload.sessions[0].session_id, stale_session_id);
+        assert!(payload.sessions.is_empty());
         assert!(
-            protocol.session_index.contains_key(&stale_session_id),
-            "后续 socket 恢复后，list_sessions 应该自动把 pending session 接回"
-        );
-        assert!(
-            !protocol
-                .pending_restore_sessions
-                .contains_key(&stale_session_id)
+            !protocol.session_index.contains_key(&stale_session_id),
+            "启动时已判定不可恢复的 session 不应在后续 list 中复活"
         );
 
         let reloaded_state = StateStore::load(&config.state_path).unwrap();
-        let sessions_by_id: HashMap<_, _> = reloaded_state
-            .sessions
-            .into_iter()
-            .map(|session| (session.session_id, session))
-            .collect();
-        let stale_session = sessions_by_id
-            .get(&stale_session_id)
-            .expect("unreachable running supervisor must remain retryable");
-        assert_eq!(stale_session.state, SessionState::Running);
-        assert!(stale_session.restore_info.is_some());
-        let closing_session = sessions_by_id
-            .get(&closing_session_id)
-            .expect("non-running restore record should remain as closed fact");
-        assert_eq!(closing_session.state, SessionState::Closed);
-        assert!(closing_session.restore_info.is_none());
+        assert!(
+            reloaded_state.sessions.iter().all(|session| {
+                session.state == SessionState::Closed || session.restore_info.is_none()
+            }),
+            "持久状态不能继续保存 running + restore_info 的死 supervisor"
+        );
     }
 
     #[test]
-    fn pending_restore_session_can_be_attached_after_socket_recovers() {
+    fn stale_restore_session_cannot_be_attached_after_reconnect_failure() {
         let backend = FakePtyBackend::default();
         backend.fail_reconnects("stale supervisor socket");
         let state_path = temp_state_path("pending-attach-session.json");
@@ -13492,14 +13447,13 @@ mod tests {
             DaemonProtocol::from_state(config, backend.clone(), Ed25519SignatureVerifier, state)
                 .unwrap();
         assert!(protocol.session_index.is_empty());
-        assert!(protocol.pending_restore_sessions.contains_key(&session_id));
         let reconnect_attempts_before = backend.reconnects().len();
 
         backend.allow_reconnects();
         let mut connection = ProtocolConnection::new(None);
         connection.authenticated_device_id = Some(DeviceId::new());
 
-        let response = protocol
+        let error = protocol
             .attach_session(
                 &mut connection,
                 SessionAttachPayload {
@@ -13508,21 +13462,15 @@ mod tests {
                     last_terminal_seq: None,
                 },
             )
-            .unwrap();
-        let attached: SessionAttachedPayload = decode_payload(response[0].payload.clone()).unwrap();
+            .unwrap_err();
 
-        assert_eq!(response[0].kind, MessageType::SessionAttached);
-        assert_eq!(attached.session_id, session_id);
-        assert!(protocol.session_index.contains_key(&session_id));
-        assert!(!protocol.pending_restore_sessions.contains_key(&session_id));
+        assert!(matches!(error, ProtocolError::SessionNotFound));
+        assert!(!protocol.session_index.contains_key(&session_id));
         let reconnect_attempts_after = backend.reconnects();
         assert_eq!(
             reconnect_attempts_after.len(),
-            reconnect_attempts_before + 1
-        );
-        assert_eq!(
-            reconnect_attempts_after.last().map(String::as_str),
-            Some(session_id.0.to_string().as_str())
+            reconnect_attempts_before,
+            "已判定 dead 的 session attach 时不能再同步重试旧 socket"
         );
     }
 
@@ -19567,6 +19515,627 @@ mod tests {
         let control_payload: ErrorPayload = decode_payload(control_error.payload).unwrap();
         assert_eq!(control_error.kind, MessageType::Error);
         assert_eq!(control_payload.code, "invalid_state");
+    }
+
+    #[test]
+    fn authenticated_but_unattached_connection_cannot_close_attached_session() {
+        let (mut protocol, backend) = protocol();
+        let device_id = DeviceId::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = PublicKey(wire(signing_key.verifying_key().as_bytes()));
+
+        let (mut controller, _) = protocol.start_connection();
+        let (_, mut controller_crypto) = open_e2ee(&mut protocol, &mut controller, device_id);
+        pair_device(
+            &mut protocol,
+            &mut controller,
+            &mut controller_crypto,
+            device_id,
+            public_key,
+        );
+        let responses = send_encrypted(
+            &mut protocol,
+            &mut controller,
+            &mut controller_crypto,
+            envelope_value(
+                MessageType::SessionCreate,
+                SessionCreatePayload {
+                    command: vec!["sh".to_owned()],
+                    size: TerminalSize::new(24, 80),
+                },
+            )
+            .unwrap(),
+        );
+        let created = decrypt_first(&mut controller_crypto, responses);
+        let created_payload: SessionCreatedPayload = decode_payload(created.payload).unwrap();
+
+        let (mut second_connection, _) = protocol.start_connection();
+        let mut second_crypto = authenticate_paired_connection(
+            &mut protocol,
+            &mut second_connection,
+            device_id,
+            &signing_key,
+        );
+        assert_eq!(
+            second_connection.state(),
+            ProtocolConnectionState::Authenticated
+        );
+
+        // close 是 session 级破坏性操作，不能只凭同设备认证状态绕过当前连接的 attach 关系。
+        let close_responses = send_encrypted(
+            &mut protocol,
+            &mut second_connection,
+            &mut second_crypto,
+            envelope_value(
+                MessageType::SessionClose,
+                SessionClosePayload {
+                    session_id: created_payload.session_id,
+                },
+            )
+            .unwrap(),
+        );
+        let close_error = decrypt_first(&mut second_crypto, close_responses);
+        assert_eq!(close_error.kind, MessageType::Error);
+        let close_payload: ErrorPayload = decode_payload(close_error.payload).unwrap();
+        assert_eq!(close_payload.code, "invalid_state");
+
+        let state = StateStore::load(&protocol.config.state_path).unwrap();
+        let persisted_session = state
+            .sessions
+            .iter()
+            .find(|session| session.session_id == created_payload.session_id)
+            .expect("unattached close must not remove the backing session");
+        assert_eq!(persisted_session.state, SessionState::Running);
+        assert_eq!(backend.terminate_count(), 0);
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum SessionScopedConnectionCase {
+        Unauthenticated,
+        AuthenticatedUnattached,
+        AttachedWrongSession,
+        AttachedCorrectSession,
+    }
+
+    impl SessionScopedConnectionCase {
+        fn expected_error_code(self) -> Option<&'static str> {
+            match self {
+                Self::Unauthenticated => Some("unauthenticated"),
+                Self::AuthenticatedUnattached | Self::AttachedWrongSession => Some("invalid_state"),
+                Self::AttachedCorrectSession => None,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum SessionScopedMutatingHandler {
+        WriteData,
+        Resize,
+        Cursor,
+        Rename,
+        Control,
+        FileWrite,
+        FileDelete,
+        FileUploadPrepare,
+        FileHttpUploadPrepare,
+        FileHttpUploadBegin,
+        FileHttpUploadAbort,
+        FileHttpDownloadPrepare,
+        FileDownloadStreamPrepare,
+        FileDownloadPrepare,
+        FileDownloadChunk,
+        GitAction,
+        Close,
+    }
+
+    impl SessionScopedMutatingHandler {
+        fn all() -> &'static [Self] {
+            &[
+                Self::WriteData,
+                Self::Resize,
+                Self::Cursor,
+                Self::Rename,
+                Self::Control,
+                Self::FileWrite,
+                Self::FileDelete,
+                Self::FileUploadPrepare,
+                Self::FileHttpUploadPrepare,
+                Self::FileHttpUploadBegin,
+                Self::FileHttpUploadAbort,
+                Self::FileHttpDownloadPrepare,
+                Self::FileDownloadStreamPrepare,
+                Self::FileDownloadPrepare,
+                Self::FileDownloadChunk,
+                Self::GitAction,
+                Self::Close,
+            ]
+        }
+
+        fn needs_git(self) -> bool {
+            matches!(self, Self::GitAction)
+        }
+
+        fn needs_existing_http_upload(self) -> bool {
+            matches!(self, Self::FileHttpUploadBegin | Self::FileHttpUploadAbort)
+        }
+
+        fn invoke(
+            self,
+            fixture: &mut SessionScopedMutatingFixture,
+            connection: &ProtocolConnection,
+        ) -> Result<(), ProtocolError> {
+            match self {
+                Self::WriteData => fixture
+                    .protocol
+                    .write_session_data(
+                        connection,
+                        SessionDataPayload {
+                            session_id: fixture.target_session_id,
+                            data_base64: general_purpose::STANDARD.encode(b"scoped input\n"),
+                        },
+                    )
+                    .map(drop),
+                Self::Resize => fixture
+                    .protocol
+                    .resize_session(
+                        connection,
+                        SessionResizePayload {
+                            session_id: fixture.target_session_id,
+                            size: TerminalSize::new(40, 120),
+                        },
+                    )
+                    .map(drop),
+                Self::Cursor => fixture
+                    .protocol
+                    .record_session_cursor(
+                        connection,
+                        SessionCursorPayload {
+                            session_id: fixture.target_session_id,
+                            row: 2,
+                            col: 3,
+                            focused: true,
+                        },
+                    )
+                    .map(drop),
+                Self::Rename => fixture
+                    .protocol
+                    .rename_session(
+                        connection,
+                        SessionRenamePayload {
+                            session_id: fixture.target_session_id,
+                            name: "scoped rename".to_owned(),
+                        },
+                    )
+                    .map(drop),
+                Self::Control => fixture
+                    .protocol
+                    .request_control(
+                        connection,
+                        ControlRequestPayload {
+                            session_id: fixture.target_session_id,
+                            device_id: fixture.device_id,
+                        },
+                    )
+                    .map(drop),
+                Self::FileWrite => fixture
+                    .protocol
+                    .write_session_file(
+                        connection,
+                        SessionFileWritePayload {
+                            session_id: fixture.target_session_id,
+                            path: "write.txt".to_owned(),
+                            data_base64: general_purpose::STANDARD.encode(b"scoped file\n"),
+                        },
+                    )
+                    .map(drop),
+                Self::FileDelete => fixture
+                    .protocol
+                    .delete_session_file(
+                        connection,
+                        SessionFileDeletePayload {
+                            session_id: fixture.target_session_id,
+                            path: "delete-me.txt".to_owned(),
+                        },
+                    )
+                    .map(drop),
+                Self::FileUploadPrepare => {
+                    let result = fixture.protocol.prepare_session_file_upload_stream(
+                        connection,
+                        SessionFileUploadPayload {
+                            session_id: fixture.target_session_id,
+                            path: "stream-upload.bin".to_owned(),
+                            size_bytes: 6,
+                        },
+                    );
+                    match result {
+                        Ok((_, stream)) => {
+                            cleanup_upload_temp(&stream);
+                            Ok(())
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+                Self::FileHttpUploadPrepare => fixture
+                    .protocol
+                    .prepare_session_file_http_upload(
+                        connection,
+                        SessionFileUploadPayload {
+                            session_id: fixture.target_session_id,
+                            path: "http-upload-prepare.bin".to_owned(),
+                            size_bytes: 6,
+                        },
+                        fixture.device_id,
+                    )
+                    .map(drop),
+                Self::FileHttpUploadBegin => {
+                    let payload = fixture
+                        .http_upload_payload
+                        .clone()
+                        .expect("HTTP upload begin fixture should create upload state");
+                    fixture
+                        .protocol
+                        .begin_session_file_http_upload_write(
+                            connection,
+                            payload,
+                            fixture.device_id,
+                            3,
+                        )
+                        .map(drop)
+                }
+                Self::FileHttpUploadAbort => {
+                    let payload = fixture
+                        .http_upload_payload
+                        .clone()
+                        .expect("HTTP upload abort fixture should create upload state");
+                    fixture
+                        .protocol
+                        .abort_session_file_http_upload(connection, &payload)
+                }
+                Self::FileHttpDownloadPrepare => fixture
+                    .protocol
+                    .prepare_session_file_http_download(
+                        connection,
+                        SessionFileHttpDownloadPayload {
+                            session_id: fixture.target_session_id,
+                            path: "download.txt".to_owned(),
+                            offset_bytes: 0,
+                        },
+                    )
+                    .map(drop),
+                Self::FileDownloadStreamPrepare => fixture
+                    .protocol
+                    .prepare_session_file_download_stream(
+                        connection,
+                        SessionFileDownloadStreamPayload {
+                            session_id: fixture.target_session_id,
+                            path: "download.txt".to_owned(),
+                        },
+                    )
+                    .map(drop),
+                Self::FileDownloadPrepare => fixture
+                    .protocol
+                    .prepare_session_file_download(
+                        connection,
+                        SessionFileDownloadPreparePayload {
+                            session_id: fixture.target_session_id,
+                            path: "download.txt".to_owned(),
+                        },
+                    )
+                    .map(drop),
+                Self::FileDownloadChunk => fixture
+                    .protocol
+                    .read_session_file_download_chunk(
+                        connection,
+                        SessionFileDownloadChunkPayload {
+                            session_id: fixture.target_session_id,
+                            path: "download.txt".to_owned(),
+                            offset_bytes: 0,
+                            max_bytes: 8,
+                        },
+                    )
+                    .map(drop),
+                Self::GitAction => fixture
+                    .protocol
+                    .apply_session_git_action(
+                        connection,
+                        SessionGitActionPayload {
+                            session_id: fixture.target_session_id,
+                            worktree_path: fixture.root.to_string_lossy().to_string(),
+                            file_path: "tracked.txt".to_owned(),
+                            action: SessionGitActionKind::Stage,
+                        },
+                    )
+                    .map(drop),
+                Self::Close => fixture
+                    .protocol
+                    .close_session(
+                        connection,
+                        SessionClosePayload {
+                            session_id: fixture.target_session_id,
+                        },
+                    )
+                    .map(drop),
+            }
+        }
+    }
+
+    struct SessionScopedMutatingFixture {
+        protocol: DaemonProtocol<FakePtyBackend, Ed25519SignatureVerifier>,
+        backend: FakePtyBackend,
+        device_id: DeviceId,
+        target_session_id: SessionId,
+        other_session_id: SessionId,
+        root: PathBuf,
+        http_upload_payload: Option<SessionFileHttpUploadStreamPayload>,
+    }
+
+    impl SessionScopedMutatingFixture {
+        fn connection_for(&self, case: SessionScopedConnectionCase) -> ProtocolConnection {
+            match case {
+                SessionScopedConnectionCase::Unauthenticated => ProtocolConnection::new(None),
+                SessionScopedConnectionCase::AuthenticatedUnattached => {
+                    ProtocolConnection::authenticated_http(self.device_id)
+                }
+                SessionScopedConnectionCase::AttachedWrongSession => {
+                    let mut connection = ProtocolConnection::authenticated_http(self.device_id);
+                    connection.attach(self.other_session_id, 0, Vec::new(), false);
+                    connection
+                }
+                SessionScopedConnectionCase::AttachedCorrectSession => {
+                    let mut connection = ProtocolConnection::authenticated_http(self.device_id);
+                    connection.attach(self.target_session_id, 0, Vec::new(), false);
+                    connection
+                }
+            }
+        }
+
+        fn assert_rejected_without_mutation(&self, handler: SessionScopedMutatingHandler) {
+            match handler {
+                SessionScopedMutatingHandler::WriteData => {
+                    assert!(
+                        self.backend.writes().is_empty(),
+                        "rejected session data must not reach PTY"
+                    );
+                }
+                SessionScopedMutatingHandler::FileWrite => {
+                    assert!(
+                        !self.root.join("write.txt").exists(),
+                        "rejected file write must not create the target"
+                    );
+                }
+                SessionScopedMutatingHandler::FileDelete => {
+                    assert!(
+                        self.root.join("delete-me.txt").exists(),
+                        "rejected file delete must leave the target in place"
+                    );
+                }
+                SessionScopedMutatingHandler::FileHttpUploadPrepare => {
+                    assert!(
+                        !self.root.join("http-upload-prepare.bin").exists(),
+                        "rejected HTTP upload prepare must not create the target"
+                    );
+                }
+                SessionScopedMutatingHandler::Close => {
+                    assert_eq!(
+                        self.backend.terminate_count(),
+                        0,
+                        "rejected close must not terminate the PTY"
+                    );
+                }
+                SessionScopedMutatingHandler::Resize
+                | SessionScopedMutatingHandler::Cursor
+                | SessionScopedMutatingHandler::Rename
+                | SessionScopedMutatingHandler::Control
+                | SessionScopedMutatingHandler::FileUploadPrepare
+                | SessionScopedMutatingHandler::FileHttpUploadBegin
+                | SessionScopedMutatingHandler::FileHttpUploadAbort
+                | SessionScopedMutatingHandler::FileHttpDownloadPrepare
+                | SessionScopedMutatingHandler::FileDownloadStreamPrepare
+                | SessionScopedMutatingHandler::FileDownloadPrepare
+                | SessionScopedMutatingHandler::FileDownloadChunk
+                | SessionScopedMutatingHandler::GitAction => {}
+            }
+        }
+    }
+
+    fn session_scoped_mutating_fixture(
+        handler: SessionScopedMutatingHandler,
+    ) -> SessionScopedMutatingFixture {
+        let base = temp_state_path("session-scoped-mutating-base");
+        let root = base.join("project");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("delete-me.txt"), b"delete target\n").unwrap();
+        fs::write(root.join("download.txt"), b"download target\n").unwrap();
+        fs::write(root.join("tracked.txt"), b"initial\n").unwrap();
+        if handler.needs_git() {
+            run_test_git(&root, &["init", "-b", "main"]);
+            run_test_git(&root, &["config", "user.email", "test@example.com"]);
+            run_test_git(&root, &["config", "user.name", "Termd Test"]);
+            run_test_git(&root, &["add", "tracked.txt"]);
+            run_test_git(&root, &["commit", "-m", "initial"]);
+            fs::write(root.join("tracked.txt"), b"initial\nchanged\n").unwrap();
+        }
+
+        let backend = FakePtyBackend::default();
+        let mut config =
+            DaemonConfig::default_for_state_path(temp_state_path("session-scoped-mutating-state"));
+        config.default_command = vec!["sh".to_owned()];
+        config.default_working_directory = Some(root.clone());
+        let mut protocol =
+            DaemonProtocol::new(config, backend.clone(), Ed25519SignatureVerifier).unwrap();
+        let device_id = DeviceId::new();
+        let mut controller = ProtocolConnection::authenticated_http(device_id);
+
+        // 中文注释：两个 session 共享同一 device runtime 角色，测试连接只能通过
+        // ProtocolConnection.attached_sessions 声明自己的 session 作用域。
+        let target_session_id = create_test_session_direct(&mut protocol, &mut controller);
+        let other_session_id = create_test_session_direct(&mut protocol, &mut controller);
+        let http_upload_payload = if handler.needs_existing_http_upload() {
+            let ready = protocol
+                .prepare_session_file_http_upload(
+                    &controller,
+                    SessionFileUploadPayload {
+                        session_id: target_session_id,
+                        path: "http-upload-active.bin".to_owned(),
+                        size_bytes: 6,
+                    },
+                    device_id,
+                )
+                .unwrap();
+            Some(SessionFileHttpUploadStreamPayload {
+                session_id: target_session_id,
+                path: ready.path,
+                upload_id: ready.upload_id,
+                size_bytes: ready.size_bytes,
+                offset_bytes: 0,
+            })
+        } else {
+            None
+        };
+
+        SessionScopedMutatingFixture {
+            protocol,
+            backend,
+            device_id,
+            target_session_id,
+            other_session_id,
+            root,
+            http_upload_payload,
+        }
+    }
+
+    fn create_test_session_direct(
+        protocol: &mut DaemonProtocol<FakePtyBackend, Ed25519SignatureVerifier>,
+        connection: &mut ProtocolConnection,
+    ) -> SessionId {
+        let responses = protocol
+            .create_session(
+                connection,
+                SessionCreatePayload {
+                    command: Vec::new(),
+                    size: TerminalSize::new(24, 80),
+                },
+            )
+            .unwrap();
+        let created: SessionCreatedPayload =
+            decode_payload(responses.into_iter().next().unwrap().payload).unwrap();
+        created.session_id
+    }
+
+    #[test]
+    fn session_scoped_mutating_handlers_enforce_connection_scope_table() {
+        let cases = [
+            SessionScopedConnectionCase::Unauthenticated,
+            SessionScopedConnectionCase::AuthenticatedUnattached,
+            SessionScopedConnectionCase::AttachedWrongSession,
+            SessionScopedConnectionCase::AttachedCorrectSession,
+        ];
+
+        for handler in SessionScopedMutatingHandler::all() {
+            for case in cases {
+                let mut fixture = session_scoped_mutating_fixture(*handler);
+                let connection = fixture.connection_for(case);
+                let result = handler.invoke(&mut fixture, &connection);
+
+                match case.expected_error_code() {
+                    Some(expected_code) => {
+                        let Err(error) = result else {
+                            panic!("{handler:?} unexpectedly accepted {case:?}");
+                        };
+                        assert_eq!(
+                            error.code(),
+                            expected_code,
+                            "{handler:?} returned wrong error for {case:?}"
+                        );
+                        fixture.assert_rejected_without_mutation(*handler);
+                    }
+                    None => {
+                        result.unwrap_or_else(|error| {
+                            panic!(
+                                "{handler:?} rejected attached correct session with {}",
+                                error.code()
+                            )
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn session_scoped_unknown_session_preserves_handler_error_order() {
+        let mut fixture = session_scoped_mutating_fixture(SessionScopedMutatingHandler::Rename);
+        let connection = ProtocolConnection::authenticated_http(fixture.device_id);
+        let unknown_session_id = SessionId::new();
+
+        let rename = fixture.protocol.rename_session(
+            &connection,
+            SessionRenamePayload {
+                session_id: unknown_session_id,
+                name: "unknown".to_owned(),
+            },
+        );
+        assert_eq!(rename.unwrap_err().code(), "invalid_state");
+
+        let files = fixture.protocol.list_session_files(
+            &connection,
+            SessionFilesPayload {
+                session_id: unknown_session_id,
+                path: None,
+            },
+        );
+        assert_eq!(files.unwrap_err().code(), "invalid_state");
+
+        let git = fixture.protocol.list_session_git(
+            &connection,
+            SessionGitPayload {
+                session_id: unknown_session_id,
+            },
+        );
+        assert_eq!(git.unwrap_err().code(), "invalid_state");
+
+        let close = fixture.protocol.close_session(
+            &connection,
+            SessionClosePayload {
+                session_id: unknown_session_id,
+            },
+        );
+        assert_eq!(close.unwrap_err().code(), "invalid_state");
+
+        let write = fixture.protocol.write_session_data(
+            &connection,
+            SessionDataPayload {
+                session_id: unknown_session_id,
+                data_base64: general_purpose::STANDARD.encode(b"unknown\n"),
+            },
+        );
+        assert_eq!(write.unwrap_err().code(), "session_not_found");
+
+        let resize = fixture.protocol.resize_session(
+            &connection,
+            SessionResizePayload {
+                session_id: unknown_session_id,
+                size: TerminalSize::new(40, 120),
+            },
+        );
+        assert_eq!(resize.unwrap_err().code(), "session_not_found");
+    }
+
+    #[test]
+    fn session_scoped_control_request_rejects_wrong_payload_device_before_session_scope() {
+        let mut fixture = session_scoped_mutating_fixture(SessionScopedMutatingHandler::Control);
+        let connection = ProtocolConnection::authenticated_http(fixture.device_id);
+        let wrong_device_id = DeviceId::new();
+        let unknown_session_id = SessionId::new();
+
+        let control = fixture.protocol.request_control(
+            &connection,
+            ControlRequestPayload {
+                session_id: unknown_session_id,
+                device_id: wrong_device_id,
+            },
+        );
+        assert_eq!(control.unwrap_err().code(), "invalid_envelope");
     }
 
     #[test]

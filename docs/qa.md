@@ -6,15 +6,28 @@
 
 | 范围 | 命令 |
 | --- | --- |
+| shell 脚本语法 | `bash -n scripts/*.sh` |
 | Rust 格式 | `cargo fmt --all -- --check` |
-| Rust workspace | `cargo test --workspace` |
+| Rust workspace | `cargo test --workspace --locked` |
 | pairing CLI E2E | 启动本地 `termd`，运行 `termd pair --qr` 获取 `termd-pair:v1` 邀请码，再运行 `termctl pair --payload` 完成设备配对 |
 | termctl direct E2E | `cargo test -p termctl --test direct_daemon_e2e` |
 | termrelay E2E | `cargo test -p termrelay --test relay_e2e` |
 | relay runtime E2E | 启动本地 `termrelay` 和 `termd --relay`，通过统一 `/ws` relay URL 运行 `termctl pair/new/list` |
 | 安装脚本 smoke | `bash scripts/test-installers.sh`，检查三个安装脚本的帮助和 systemd 语义 |
-| termui Web | `npm run typecheck`、`npm run test -- --run`、`npm run build`、`npm run test:e2e`、`npm audit --audit-level=high`；Playwright 覆盖 mock daemon 和真实 relay daemon |
+| termui Web | `npm ci`、`npm run typecheck`、`npm run test -- --run`、`npm run build`、`npm run test:e2e`、`npm audit --audit-level=high`；Playwright 覆盖 mock daemon 和真实 relay daemon |
 | termui Native | 有 Flutter/Dart 时运行 `flutter pub get`、`flutter analyze`、`flutter test`；缺失时运行结构和敏感字符串 fallback 检查。 |
+
+## 前端依赖安装
+
+`scripts/qa.sh` 默认每次都会在 `termui/frontend` 运行 `npm ci`，保证本地 QA、PR CI 和发版验证使用 `package-lock.json` 固定的依赖树。
+
+只有在明确知道当前 `node_modules/` 已由同一个 lockfile 安装、且需要离线或加速复跑时，才可以显式跳过：
+
+```bash
+TERMD_QA_SKIP_NPM_CI=1 bash scripts/qa.sh
+```
+
+不要依赖 `node_modules/` 是否存在来隐式跳过安装。
 
 ## 公网部署 smoke QA
 

@@ -8,14 +8,18 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PUSH=0
 SKIP_VERIFY=0
+ALLOW_DIRTY=0
 
 usage() {
   cat <<'EOF'
-usage: scripts/prepare-release.sh <version> [--push] [--skip-verify]
+usage: scripts/prepare-release.sh <version> [--push] [--skip-verify] [--allow-dirty]
 
 Examples:
   scripts/prepare-release.sh 0.1.30
   scripts/prepare-release.sh 0.1.30 --push
+
+Options:
+  --allow-dirty  Explicitly allow preparing a release from a non-clean worktree.
 EOF
 }
 
@@ -39,6 +43,9 @@ while (($#)); do
     --skip-verify)
       SKIP_VERIFY=1
       ;;
+    --allow-dirty)
+      ALLOW_DIRTY=1
+      ;;
     -h|--help)
       usage
       exit 0
@@ -57,6 +64,13 @@ cd "$ROOT_DIR"
 [[ -d .git ]] || die "must run inside a git checkout"
 [[ "$(git branch --show-current)" == "main" ]] || die "release must be prepared from main"
 git rev-parse --verify "refs/tags/${version}" >/dev/null 2>&1 && die "tag ${version} already exists"
+
+if [[ "$ALLOW_DIRTY" -eq 0 ]] && [[ -n "$(git status --porcelain=v1 --untracked-files=all)" ]]; then
+  die "worktree must be clean before version changes; commit/stash changes or pass --allow-dirty explicitly"
+fi
+if [[ "$ALLOW_DIRTY" -eq 1 ]]; then
+  printf '[prepare-release] WARNING: --allow-dirty set; existing worktree changes may be included in the release commit.\n' >&2
+fi
 
 python3 - "$version" <<'PY'
 import json
@@ -94,17 +108,8 @@ if grep -q "请在 scripts/release-notes.sh" "$notes_file"; then
 fi
 
 if [[ "$SKIP_VERIFY" -eq 0 ]]; then
-  bash -n scripts/*.sh
-  bash scripts/test-installers.sh
-  cargo fmt --check
-  cargo test --workspace --locked
-  (
-    cd termui/frontend
-    npm run typecheck
-    npm test -- --run src/__tests__/app.test.tsx src/__tests__/terminal-pane.test.tsx
-    npm run build
-  )
-  cargo build --release -p termd --bin termd
+  bash scripts/qa.sh
+  cargo build --release --locked -p termd --bin termd
 fi
 
 git diff --check

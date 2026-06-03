@@ -1,23 +1,16 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:termui_native/core/device/paired_server.dart';
-import 'package:termui_native/core/storage/secure_storage.dart';
+import 'package:termui_native/core/errors/native_error.dart';
 import 'package:termui_native/core/storage/secure_storage_keys.dart';
+
+import '../support/fake_secure_storage.dart';
 
 void main() {
   test('paired server store persists only public daemon and device state', () async {
     final storage = FakeSecureStorage();
     final store = PairedServerStore(storage);
 
-    await store.recordPairedServer(
-      const PairedServer(
-        serverId: 'server-test-1',
-        daemonPublicKey: 'daemon-public-key',
-        url: 'ws://127.0.0.1:8765/ws',
-        pairedAtMs: 1710000000000,
-        deviceId: 'device-test-1',
-        devicePublicKey: 'ed25519-v1:device-public-1',
-      ),
-    );
+    await store.recordPairedServer(_server());
 
     final raw = storage.values[SecureStorageKeys.pairedServers]!;
     final servers = await store.listPairedServers();
@@ -40,23 +33,175 @@ void main() {
       expect(raw, isNot(contains(fragment)));
     }
   });
+
+  test('paired server store rejects malformed json state', () async {
+    final storage = FakeSecureStorage(<String, String>{
+      SecureStorageKeys.pairedServers: '{not-json',
+    });
+    final store = PairedServerStore(storage);
+
+    await expectLater(
+      store.listPairedServers(),
+      throwsA(isA<NativeStateCorrupted>()),
+    );
+  });
+
+  test('paired server store rejects present but empty state', () async {
+    final storage = FakeSecureStorage(<String, String>{
+      SecureStorageKeys.pairedServers: '',
+    });
+    final store = PairedServerStore(storage);
+
+    await expectLater(
+      store.listPairedServers(),
+      throwsA(isA<NativeStateCorrupted>()),
+    );
+  });
+
+  test('paired server store rejects present empty server list', () async {
+    final storage = FakeSecureStorage(<String, String>{
+      SecureStorageKeys.pairedServers: '[]',
+    });
+    final store = PairedServerStore(storage);
+
+    await expectLater(
+      store.listPairedServers(),
+      throwsA(isA<NativeStateCorrupted>()),
+    );
+  });
+
+  test('paired server store rejects entries with missing fields', () async {
+    final storage = FakeSecureStorage(<String, String>{
+      SecureStorageKeys.pairedServers: '[{"server_id":"server-test-1"}]',
+    });
+    final store = PairedServerStore(storage);
+
+    await expectLater(
+      store.listPairedServers(),
+      throwsA(isA<NativeStateCorrupted>()),
+    );
+  });
+
+  test('paired server store rejects non-map list entries', () async {
+    final storage = FakeSecureStorage(<String, String>{
+      SecureStorageKeys.pairedServers: '["server-test-1"]',
+    });
+    final store = PairedServerStore(storage);
+
+    await expectLater(
+      store.listPairedServers(),
+      throwsA(isA<NativeStateCorrupted>()),
+    );
+  });
+
+  test('paired server store rejects duplicate server IDs in persisted state', () async {
+    final storage = FakeSecureStorage(<String, String>{
+      SecureStorageKeys.pairedServers:
+          '[${_serverJson('server-test-1')},${_serverJson('server-test-1')}]',
+    });
+    final store = PairedServerStore(storage);
+
+    await expectLater(
+      store.listPairedServers(),
+      throwsA(isA<NativeStateCorrupted>()),
+    );
+  });
+
+  test('paired server store rejects multiple persisted daemon IDs', () async {
+    final storage = FakeSecureStorage(<String, String>{
+      SecureStorageKeys.pairedServers:
+          '[${_serverJson('server-test-1')},${_serverJson('server-test-2')}]',
+    });
+    final store = PairedServerStore(storage);
+
+    await expectLater(
+      store.listPairedServers(),
+      throwsA(isA<NativeStateCorrupted>()),
+    );
+  });
+
+  test('paired server store persists normalized websocket URLs', () async {
+    final storage = FakeSecureStorage();
+    final store = PairedServerStore(storage);
+
+    await store.recordPairedServer(
+      _server(url: '  WSS://Example.COM:443/shell/../ws?relay_token=relay-secret  '),
+    );
+
+    final servers = await store.listPairedServers();
+
+    expect(
+      servers.single.url,
+      'wss://example.com:443/ws?relay_token=relay-secret',
+    );
+    expect(
+      storage.values[SecureStorageKeys.pairedServers],
+      contains('"url":"wss://example.com:443/ws?relay_token=relay-secret"'),
+    );
+  });
+
+  test('paired server store rejects URLs with persisted credentials or fragment', () async {
+    final storage = FakeSecureStorage();
+    final store = PairedServerStore(storage);
+
+    for (final url in <String>[
+      'wss://user:pass@example.test/ws',
+      'wss://example.test/ws#token',
+    ]) {
+      await expectLater(
+        store.recordPairedServer(_server(url: url)),
+        throwsA(isA<NativeValidationError>()),
+      );
+    }
+  });
+
+  test('paired server store validates fields before writing state', () async {
+    final storage = FakeSecureStorage();
+    final store = PairedServerStore(storage);
+
+    await expectLater(
+      store.recordPairedServer(_server(serverId: '')),
+      throwsA(isA<NativeValidationError>()),
+    );
+    expect(storage.values[SecureStorageKeys.pairedServers], isNull);
+  });
+
+  test('paired server store enforces native single-daemon mode', () async {
+    final storage = FakeSecureStorage();
+    final store = PairedServerStore(storage);
+
+    await store.recordPairedServer(_server(serverId: 'server-test-1'));
+
+    await expectLater(
+      store.recordPairedServer(_server(serverId: 'server-test-2')),
+      throwsA(isA<NativeValidationError>()),
+    );
+  });
 }
 
-final class FakeSecureStorage implements SecureStorage {
-  final Map<String, String> values = <String, String>{};
+PairedServer _server({
+  String serverId = 'server-test-1',
+  String url = 'ws://127.0.0.1:8765/ws',
+}) {
+  return PairedServer(
+    serverId: serverId,
+    daemonPublicKey: 'daemon-public-key',
+    url: url,
+    pairedAtMs: 1710000000000,
+    deviceId: 'device-test-1',
+    devicePublicKey: 'ed25519-v1:device-public-1',
+  );
+}
 
-  @override
-  Future<void> delete(String key) async {
-    values.remove(key);
-  }
-
-  @override
-  Future<String?> read(String key) async {
-    return values[key];
-  }
-
-  @override
-  Future<void> write(String key, String value) async {
-    values[key] = value;
-  }
+String _serverJson(String serverId) {
+  return '''
+{
+  "server_id": "$serverId",
+  "daemon_public_key": "daemon-public-key",
+  "url": "ws://127.0.0.1:8765/ws",
+  "paired_at_ms": 1710000000000,
+  "device_id": "device-test-1",
+  "device_public_key": "ed25519-v1:device-public-1"
+}
+''';
 }

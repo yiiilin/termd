@@ -11,12 +11,15 @@ use termd_proto::{
     PairingToken, ProtocolVersion, PublicKey, RelayClientId, RelayControlEnvelope,
     RouteHelloPayload, RouteReadyPayload, RouteRole, ServerId, decode_relay_data_control,
 };
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::{sleep, timeout};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use uuid::Uuid;
 
 const RELAY_SECRET_SENTINEL: &str = "relay-secret-plaintext";
+const RELAY_AUTH_TOKEN: &str = "relay-secret-1-with-enough-length";
+const RELAY_WRONG_AUTH_TOKEN: &str = "relay-secret-2-with-enough-length";
 
 type RelaySocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -30,16 +33,27 @@ impl RelayProcess {
         Self::spawn_with_auth_token(None).await
     }
 
+    async fn spawn_with_http_tunnel() -> Self {
+        Self::spawn_with_options(None, true).await
+    }
+
     async fn spawn_auth_required(token: &str) -> Self {
         Self::spawn_with_auth_token(Some(token)).await
     }
 
     async fn spawn_with_auth_token(auth_token: Option<&str>) -> Self {
+        Self::spawn_with_options(auth_token, false).await
+    }
+
+    async fn spawn_with_options(auth_token: Option<&str>, http_tunnel: bool) -> Self {
         let addr = unused_listen_addr();
         let mut command = Command::new(env!("CARGO_BIN_EXE_termrelay"));
         command.args(["--listen", &addr.to_string()]);
         if let Some(auth_token) = auth_token {
             command.args(["--auth-token", auth_token]);
+        }
+        if http_tunnel {
+            command.arg("--http-tunnel");
         }
         let child = command
             .stdin(Stdio::null())
@@ -94,6 +108,42 @@ impl Drop for RelayProcess {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relay_http_file_tunnel_is_disabled_by_default() {
+    let relay = RelayProcess::spawn().await;
+    let response = raw_http_request(
+        relay.addr,
+        &format!(
+            "POST /api/files/upload/init HTTP/1.1\r\nHost: {}\r\nx-termd-server-id: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            relay.addr,
+            ServerId::new().0
+        ),
+    )
+    .await;
+
+    assert!(response.starts_with("HTTP/1.1 501 Not Implemented"));
+    assert!(response.contains("--http-tunnel"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relay_http_file_tunnel_flag_reaches_binary_router() {
+    let relay = RelayProcess::spawn_with_http_tunnel().await;
+    let response = raw_http_request(
+        relay.addr,
+        &format!(
+            "POST /api/files/upload/init HTTP/1.1\r\nHost: {}\r\nx-termd-server-id: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            relay.addr,
+            ServerId::new().0
+        ),
+    )
+    .await;
+
+    // 中文注释：这里不启动 daemon control，503 说明请求已经通过 --http-tunnel 进入
+    // 兼容 tunnel 路径；若 flag 没接到 router，会继续返回默认禁用的 501。
+    assert!(response.starts_with("HTTP/1.1 503 Service Unavailable"));
+    assert!(!response.contains("--http-tunnel"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -229,6 +279,94 @@ async fn relay_assigns_preconnected_idle_daemon_data_pipe_to_client() {
         .expect("second client should receive route_ready");
     let (second_client_id, _second_token) = expect_open_data(&mut daemon_control).await;
     assert!(second_client_id.0 > assigned_client_id.0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relay_closes_oldest_idle_daemon_data_pipe_when_room_cap_is_exceeded() {
+    let relay = RelayProcess::spawn().await;
+    let server_id = ServerId::new();
+    let mut daemon_control =
+        connect_registered_socket(relay.ws_url(), server_id, RouteRole::DaemonControl)
+            .await
+            .expect("daemon control should connect");
+
+    let mut idle_daemon_data = Vec::new();
+    for _ in 0..9 {
+        idle_daemon_data.push(
+            connect_registered_socket(relay.ws_url(), server_id, RouteRole::DaemonData)
+                .await
+                .expect("idle daemon data should connect"),
+        );
+    }
+
+    // 中文注释：relay 只按 transport 资源计数；超过上限时关闭最旧 idle pipe，
+    // 不读取或解释任何业务 payload。
+    expect_socket_closed(&mut idle_daemon_data[0], Duration::from_secs(2)).await;
+
+    for socket in idle_daemon_data.iter_mut().skip(1) {
+        let _ = socket.close(None).await;
+    }
+    daemon_control
+        .close(None)
+        .await
+        .expect("daemon control close should send");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relay_forwards_business_type_envelopes_without_interpreting_them() {
+    let relay = RelayProcess::spawn().await;
+    let server_id = ServerId::new();
+    let mut daemon_control =
+        connect_registered_socket(relay.ws_url(), server_id, RouteRole::DaemonControl)
+            .await
+            .expect("daemon control should connect");
+    let (mut client, _) = connect_async(relay.ws_url().as_str())
+        .await
+        .expect("client should connect relay");
+    send_route_hello(&mut client, server_id, RouteRole::Client)
+        .await
+        .expect("client route_hello should send");
+    let (client_id, data_token) = expect_open_data(&mut daemon_control).await;
+
+    let (mut daemon_data, _) = connect_async(relay.ws_url().as_str())
+        .await
+        .expect("daemon data should connect relay");
+    send_route_hello_with_data(
+        &mut daemon_data,
+        server_id,
+        RouteRole::DaemonData,
+        Some(client_id),
+        Some(data_token),
+    )
+    .await
+    .expect("daemon data route_hello should send");
+    expect_route_ready(&mut daemon_data, server_id, RouteRole::DaemonData)
+        .await
+        .expect("daemon data should receive route_ready");
+    expect_route_ready(&mut client, server_id, RouteRole::Client)
+        .await
+        .expect("client should receive route_ready");
+
+    // 中文注释：这些看起来像业务 envelope，但 route prelude 之后都只是 opaque WebSocket frame。
+    let business_frames = [
+        r#"{"type":"auth","payload":{"device_id":"dev-a","signature":"sig"}}"#,
+        r#"{"type":"session_data","payload":{"session_id":"session-a","data_base64":"aWQ="}}"#,
+        r#"{"type":"control_request","payload":{"session_id":"session-a"}}"#,
+    ];
+    for frame in business_frames {
+        client
+            .send(Message::Text(frame.to_owned()))
+            .await
+            .expect("client should send business-shaped text");
+        assert_eq!(next_text(&mut daemon_data).await, frame);
+    }
+
+    let binary = b"\x00auth\x00session_data\x00control_request\x00".to_vec();
+    client
+        .send(Message::Binary(binary.clone()))
+        .await
+        .expect("client should send business-shaped binary");
+    assert_eq!(next_binary(&mut daemon_data).await, binary);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -511,37 +649,41 @@ async fn relay_forwards_business_shaped_text_and_binary_without_parsing() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn relay_auth_rejects_missing_and_wrong_transport_token() {
-    let relay = RelayProcess::spawn_auth_required("relay-secret-1").await;
+    let relay = RelayProcess::spawn_auth_required(RELAY_AUTH_TOKEN).await;
 
     assert!(connect_async(relay.ws_url()).await.is_err());
     assert!(
-        connect_async(format!("{}?relay_token=wrong-secret", relay.ws_url()))
-            .await
-            .is_err()
+        connect_async(format!(
+            "{}?relay_token={RELAY_WRONG_AUTH_TOKEN}",
+            relay.ws_url()
+        ))
+        .await
+        .is_err()
     );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn relay_auth_allows_dumb_pipe_forwarding_with_correct_token() {
-    let relay = RelayProcess::spawn_auth_required("relay-secret-1").await;
+    let relay = RelayProcess::spawn_auth_required(RELAY_AUTH_TOKEN).await;
     let server_id = ServerId::new();
     let mut daemon_control = connect_registered_socket(
-        format!("{}?relay_token=relay-secret-1", relay.ws_url()),
+        format!("{}?relay_token={RELAY_AUTH_TOKEN}", relay.ws_url()),
         server_id,
         RouteRole::DaemonControl,
     )
     .await
     .expect("authenticated daemon control should connect");
-    let (mut client, _) = connect_async(format!("{}?relay_token=relay-secret-1", relay.ws_url()))
-        .await
-        .expect("authenticated client should connect");
+    let (mut client, _) =
+        connect_async(format!("{}?relay_token={RELAY_AUTH_TOKEN}", relay.ws_url()))
+            .await
+            .expect("authenticated client should connect");
     send_route_hello(&mut client, server_id, RouteRole::Client)
         .await
         .expect("authenticated client route_hello should send");
     let (client_id, data_token) = expect_open_data(&mut daemon_control).await;
 
     let (mut daemon_data, _) =
-        connect_async(format!("{}?relay_token=relay-secret-1", relay.ws_url()))
+        connect_async(format!("{}?relay_token={RELAY_AUTH_TOKEN}", relay.ws_url()))
             .await
             .expect("authenticated daemon data should connect");
     send_route_hello_with_data(
@@ -697,7 +839,10 @@ async fn expect_route_ready(
     server_id: ServerId,
     role: RouteRole,
 ) -> Result<(), tokio_tungstenite::tungstenite::Error> {
-    let Some(message) = socket.next().await else {
+    let Some(message) = timeout(Duration::from_secs(2), socket.next())
+        .await
+        .expect("route_ready should arrive before timeout")
+    else {
         return Err(tokio_tungstenite::tungstenite::Error::ConnectionClosed);
     };
     let message = message?;
@@ -743,6 +888,39 @@ async fn next_binary(socket: &mut RelaySocket) -> Vec<u8> {
             other => panic!("expected binary frame, got {other:?}"),
         }
     }
+}
+
+async fn expect_socket_closed(socket: &mut RelaySocket, wait: Duration) {
+    timeout(wait, async {
+        loop {
+            match socket.next().await {
+                None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break,
+                Some(Ok(Message::Ping(payload))) => {
+                    let _ = socket.send(Message::Pong(payload)).await;
+                }
+                Some(Ok(Message::Pong(_))) => {}
+                Some(Ok(other)) => panic!("expected relay websocket close, got {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("relay websocket should close before timeout");
+}
+
+async fn raw_http_request(addr: SocketAddr, request: &str) -> String {
+    let mut stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("relay HTTP port should accept TCP");
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("HTTP request should write");
+    let mut response = Vec::new();
+    timeout(Duration::from_secs(2), stream.read_to_end(&mut response))
+        .await
+        .expect("HTTP response should finish before timeout")
+        .expect("HTTP response should read");
+    String::from_utf8(response).expect("HTTP response should be UTF-8")
 }
 
 fn unused_listen_addr() -> SocketAddr {

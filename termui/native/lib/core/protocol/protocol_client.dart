@@ -26,6 +26,7 @@ final class TerminalAttachPreview {
 }
 
 abstract interface class TermdProtocolClient {
+  // PairedServerStore 当前强制 native 单 daemon；解除该限制时，这些方法必须先加入 server scope。
   Future<ProtocolConnectionStatus> connectionStatus();
 
   Future<List<RemoteSessionSummary>> listSessions();

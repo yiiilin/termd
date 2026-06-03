@@ -6,6 +6,12 @@ import { ChevronDown, ChevronUp, ClipboardPaste, GripVertical, Search, X } from 
 import type { BrowserMobileShortcut, EffectiveTheme, SessionCursorPresence, SessionSearchResultPayload, TerminalSize } from "../protocol/types";
 import { useI18n } from "../i18n";
 import { terminalTheme } from "../theme";
+import type { TerminalOutputItem } from "./terminal/types";
+import { useTerminalOutputWriter } from "./terminal/useTerminalOutputWriter";
+import { useTerminalFocusResizeState } from "./terminal/useTerminalFocusResize";
+import { recordTermdDiagnostic } from "../diagnostics";
+
+export type { TerminalOutputItem } from "./terminal/types";
 
 const TERMINAL_FONT_SIZE = 13;
 const MOBILE_TERMINAL_FONT_SIZE = 12;
@@ -23,9 +29,6 @@ const MOBILE_DIRECTION_TIER_THREE_PX = 84;
 const MOBILE_DIRECTION_CANCEL_PX = 10;
 const MOBILE_COMPOSITION_SETTLE_MS = 80;
 const TERMINAL_BOTTOM_EPSILON = 1;
-// 单次 xterm.write 过大时会占用浏览器主线程，连控制 WebSocket 和 relay 页面心跳都会被拖慢。
-// 64KB 仍是批量写入，不会退回逐字/逐行渲染，同时给输入和切 session 留出帧间隙。
-const MAX_WRITE_BYTES = 64 * 1024;
 const TERMINAL_SEARCH_OPTIONS: ISearchOptions = {
   caseSensitive: false,
   decorations: {
@@ -37,27 +40,9 @@ const TERMINAL_SEARCH_OPTIONS: ISearchOptions = {
     activeMatchColorOverviewRuler: "#e69875",
   },
 };
-type ResizeSource = "layout" | "focus" | "session" | "mobile-viewport";
+type ResizeSource = "layout" | "focus" | "session" | "snapshot" | "mobile-viewport";
 type MobileDirection = "up" | "down" | "left" | "right";
 type MobileDirectionTier = 1 | 2 | 3;
-
-export type TerminalOutputItem =
-  | { kind: "data"; bytes: Uint8Array }
-  | { kind: "snapshot"; bytes: Uint8Array; baseSeq: number; size: TerminalSize }
-  | { kind: "output"; bytes: Uint8Array; terminalSeq: number }
-  | { kind: "resize"; terminalSeq: number; size: TerminalSize }
-  | { kind: "exit"; terminalSeq: number };
-
-interface ActiveTerminalWrite {
-  item: TerminalOutputItem;
-  offset: number;
-  sequenceChecked: boolean;
-}
-
-interface TerminalWriteBatch {
-  bytes: Uint8Array;
-  renderedItems: TerminalOutputItem[];
-}
 
 const MOBILE_SHORTCUT_KEYS = [
   { label: "Tab", ariaKey: "terminal.sendTab", data: "\t" },
@@ -72,19 +57,6 @@ function sameTerminalDimensions(
   b: { rows: number; cols: number } | undefined,
 ): boolean {
   return Boolean(a) && Boolean(b) && a!.rows === b!.rows && a!.cols === b!.cols;
-}
-
-function concatWriteChunks(chunks: Uint8Array[], totalBytes: number): Uint8Array {
-  if (chunks.length === 1 && chunks[0].byteLength === totalBytes) {
-    return chunks[0];
-  }
-  const merged = new Uint8Array(totalBytes);
-  let offset = 0;
-  for (const chunk of chunks) {
-    merged.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return merged;
 }
 
 interface TerminalPaneProps {
@@ -119,6 +91,7 @@ export function TerminalPane(props: TerminalPaneProps) {
   const terminalRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const searchAddonRef = useRef<SearchAddon | null>(null);
+  const searchRequestSeqRef = useRef(0);
   const outputResetVersionRef = useRef(props.outputResetVersion);
   const onInputRef = useRef(props.onInput);
   const onResizeRef = useRef(props.onResize);
@@ -127,16 +100,15 @@ export function TerminalPane(props: TerminalPaneProps) {
   const onTerminalSeqRenderedRef = useRef(props.onTerminalSeqRendered);
   const onTerminalSizeRenderedRef = useRef(props.onTerminalSizeRendered);
   const onOutputResetAppliedRef = useRef(props.onOutputResetApplied);
-  const takeOutputRef = useRef(props.takeOutput);
   const sessionSizeRef = useRef(props.sessionSize);
   const mobileInputModeRef = useRef(Boolean(props.mobileInputMode));
   const mobileKeyboardOpenRef = useRef(Boolean(props.mobileKeyboardOpen));
   const resizeRef = useRef<((source?: ResizeSource) => void) | undefined>(undefined);
   const stabilizeRef = useRef<((source?: ResizeSource) => void) | undefined>(undefined);
+  const pendingResizeAfterSnapshotRef = useRef<ResizeSource | undefined>(undefined);
   const drainOutputRef = useRef<() => void>(() => undefined);
   const cursorFrameRef = useRef<number | undefined>(undefined);
   const cursorReportTimerRef = useRef<number | undefined>(undefined);
-  const focusOutTimerRef = useRef<number | undefined>(undefined);
   const bottomScrollFrameRef = useRef<number | undefined>(undefined);
   const copyToastTimerRef = useRef<number | undefined>(undefined);
   const lastCursorReportAtRef = useRef(0);
@@ -165,25 +137,31 @@ export function TerminalPane(props: TerminalPaneProps) {
   const lastNativePasteRef = useRef<{ text: string; atMs: number } | undefined>(undefined);
   const mobileCompositionActiveRef = useRef(false);
   const lastMobileCompositionEndAtRef = useRef(0);
-  const focusedRef = useRef(false);
-  const clientSizeRef = useRef<TerminalSize | undefined>(undefined);
-  const mobileViewportResizeOwnerRef = useRef(false);
-  const focusActivationArmedRef = useRef(false);
-  const suppressPassiveFocusRef = useRef(false);
-  const windowActiveRef = useRef(true);
   const currentFontSizeRef = useRef(TERMINAL_FONT_SIZE);
-  const pendingWriteItemsRef = useRef<TerminalOutputItem[]>([]);
-  const pendingWriteBytesRef = useRef(0);
-  const activeWriteRef = useRef<ActiveTerminalWrite | undefined>(undefined);
-  const lastTerminalSeqRef = useRef<number | undefined>(undefined);
-  const writeInFlightRef = useRef(false);
-  const writeGenerationRef = useRef(0);
-  const writeFrameRef = useRef<number | undefined>(undefined);
-  const needsPostWriteRefreshRef = useRef(false);
-  const needsPostWriteScrollBottomRef = useRef(false);
-  const snapshotRedrawInProgressRef = useRef(false);
   const bottomScrollPassesRef = useRef(0);
-  const [focused, setFocused] = useState(false);
+  const forcedCursorBottomModeRef = useRef(false);
+  const {
+    focused,
+    setFocused,
+    focusedRef,
+    clientSizeRef,
+    mobileViewportResizeOwnerRef,
+    focusActivationArmedRef,
+    suppressPassiveFocusRef,
+    windowActiveRef,
+    focusOutTimerRef,
+    clearPendingFocusOut,
+    installTerminalFocusResizeListeners,
+  } = useTerminalFocusResizeState();
+  const {
+    snapshotRedrawInProgressRef,
+    resetWriterState,
+    markWriterNeedsRefreshAndScroll,
+    createTerminalOutputDrain,
+  } = useTerminalOutputWriter(
+    () => props.takeOutput(),
+    () => onTerminalResyncRef.current?.(undefined),
+  );
   const [copyToastVisible, setCopyToastVisible] = useState(false);
   const [mobileScrollRatio, setMobileScrollRatio] = useState(1);
   const [mobileScrollAvailable, setMobileScrollAvailable] = useState(false);
@@ -196,11 +174,27 @@ export function TerminalPane(props: TerminalPaneProps) {
   const [searchError, setSearchError] = useState<string | undefined>();
   const [searchResult, setSearchResult] = useState<SessionSearchResultPayload | undefined>();
   const [activeSearchIndex, setActiveSearchIndex] = useState(0);
+
+  useEffect(() => {
+    // 搜索结果绑定当前 terminal buffer；attach/reset 后旧请求即使返回也不能落到新 buffer。
+    searchRequestSeqRef.current += 1;
+    setSearchLoading(false);
+    setSearchError(undefined);
+    setSearchResult(undefined);
+    searchAddonRef.current?.clearDecorations();
+  }, [props.attached, props.outputResetVersion]);
+
   const isTerminalPinnedToBottom = (terminal = terminalRef.current) => {
     const activeBuffer = terminal?.buffer?.active;
+    const cursorBottomLine =
+      terminal && activeBuffer
+        ? Math.max(0, activeBuffer.baseY + activeBuffer.cursorY - terminal.rows + 1)
+        : 0;
     const xtermPinned =
       !activeBuffer ||
-      activeBuffer.viewportY >= Math.max(0, activeBuffer.baseY - TERMINAL_BOTTOM_EPSILON);
+      activeBuffer.viewportY >= Math.max(0, activeBuffer.baseY - TERMINAL_BOTTOM_EPSILON) ||
+      (forcedCursorBottomModeRef.current &&
+        Math.abs(activeBuffer.viewportY - cursorBottomLine) <= TERMINAL_BOTTOM_EPSILON);
     const scrollport = scrollportRef.current;
     const scrollportPinned =
       !scrollport ||
@@ -208,11 +202,105 @@ export function TerminalPane(props: TerminalPaneProps) {
       scrollport.scrollTop >= scrollport.scrollHeight - scrollport.clientHeight - TERMINAL_BOTTOM_EPSILON;
     return xtermPinned && scrollportPinned;
   };
+  const syncTerminalInputAnchor = (terminal = terminalRef.current, reason: "scroll" | "refresh" = "refresh") => {
+    if (!terminal) {
+      return;
+    }
+    const xtermCore = (terminal as Terminal & {
+      _core?: { _syncTextArea?: () => void };
+      textarea?: HTMLTextAreaElement;
+    })._core;
+    const keepAnchorOnLastRow = (textarea: HTMLTextAreaElement) => {
+      const activeBuffer = terminal.buffer?.active;
+      const host = hostRef.current;
+      if (!activeBuffer || !host || terminal.cols <= 0) {
+        return;
+      }
+      const cursorBottomLine = Math.max(0, activeBuffer.baseY + activeBuffer.cursorY - terminal.rows + 1);
+      if (
+        !forcedCursorBottomModeRef.current ||
+        Math.abs(activeBuffer.viewportY - cursorBottomLine) > TERMINAL_BOTTOM_EPSILON
+      ) {
+        return;
+      }
+      const screen = host.querySelector<HTMLElement>(".xterm-screen");
+      const lastRow = host.querySelector<HTMLElement>(".xterm-rows > div:last-child");
+      const screenRect = screen?.getBoundingClientRect();
+      const lastRowRect = lastRow?.getBoundingClientRect();
+      const cellWidth = screenRect ? screenRect.width / terminal.cols : undefined;
+      const cellHeight = lastRowRect?.height;
+      if (!lastRow || !cellWidth || !cellHeight) {
+        return;
+      }
+      // 中文注释：当终端被我们判定为“贴着当前光标的底部”时，xterm 后续 refresh
+      // 仍可能把隐藏 textarea 按旧 cursor 行回写到中间。这里直接锚到最后一行，
+      // 保证输入、IME 和复制粘贴都跟着用户看到的底部光标走。
+      textarea.style.top = `${lastRow.offsetTop}px`;
+      textarea.style.left = `${Math.min(activeBuffer.cursorX, terminal.cols - 1) * cellWidth}px`;
+      textarea.style.width = `${cellWidth}px`;
+      textarea.style.height = `${cellHeight}px`;
+      textarea.style.lineHeight = `${cellHeight}px`;
+      textarea.style.zIndex = "-5";
+    };
+    if (typeof xtermCore?._syncTextArea === "function") {
+      // 中文注释：xterm 5.x 只在 cursor move 时更新隐藏 textarea 的坐标；
+      // 单纯 resize / scroll 到底不会触发这条路径，导致 IME/粘贴锚点留在旧高度。
+      xtermCore._syncTextArea();
+      if (terminal.textarea) {
+        keepAnchorOnLastRow(terminal.textarea);
+      }
+      recordTermdDiagnostic("terminal_pane_sync_input_anchor", {
+        reason,
+        mode: "private",
+        cursorY: terminal.buffer?.active?.cursorY,
+        baseY: terminal.buffer?.active?.baseY,
+        viewportY: terminal.buffer?.active?.viewportY,
+        rows: terminal.rows,
+        forcedCursorBottom: forcedCursorBottomModeRef.current,
+        top: terminal.textarea?.style.top,
+      });
+      return;
+    }
+    const textarea = terminal.textarea;
+    const activeBuffer = terminal.buffer?.active;
+    const host = hostRef.current;
+    if (!textarea || !activeBuffer || !host || terminal.cols <= 0) {
+      return;
+    }
+    const screen = host.querySelector<HTMLElement>(".xterm-screen");
+    const firstRow = host.querySelector<HTMLElement>(".xterm-rows > div");
+    const screenRect = screen?.getBoundingClientRect();
+    const cellHeight = firstRow?.getBoundingClientRect().height;
+    const cellWidth = screenRect ? screenRect.width / terminal.cols : undefined;
+    if (!cellHeight || !cellWidth) {
+      return;
+    }
+    textarea.style.left = `${Math.min(activeBuffer.cursorX, terminal.cols - 1) * cellWidth}px`;
+    textarea.style.top = `${activeBuffer.cursorY * cellHeight}px`;
+    textarea.style.width = `${cellWidth}px`;
+    textarea.style.height = `${cellHeight}px`;
+    textarea.style.lineHeight = `${cellHeight}px`;
+    textarea.style.zIndex = "-5";
+    keepAnchorOnLastRow(textarea);
+    recordTermdDiagnostic("terminal_pane_sync_input_anchor", {
+      reason,
+      mode: "fallback",
+      cursorY: activeBuffer.cursorY,
+      baseY: activeBuffer.baseY,
+      viewportY: activeBuffer.viewportY,
+      rows: terminal.rows,
+      forcedCursorBottom: forcedCursorBottomModeRef.current,
+      top: textarea.style.top,
+    });
+  };
   const scrollToBottom = () => {
     const terminal = terminalRef.current;
     const activeBuffer = terminal?.buffer?.active;
     if (terminal && activeBuffer) {
-      terminal.scrollToLine(Math.max(0, activeBuffer.baseY));
+      const cursorBottomLine = Math.max(0, activeBuffer.baseY + activeBuffer.cursorY - terminal.rows + 1);
+      forcedCursorBottomModeRef.current = cursorBottomLine < activeBuffer.baseY - TERMINAL_BOTTOM_EPSILON;
+      terminal.scrollToLine(cursorBottomLine);
+      syncTerminalInputAnchor(terminal, "scroll");
     }
     const scrollport = scrollportRef.current;
     if (!scrollport) {
@@ -263,7 +351,6 @@ export function TerminalPane(props: TerminalPaneProps) {
     onTerminalSeqRenderedRef.current = props.onTerminalSeqRendered;
     onTerminalSizeRenderedRef.current = props.onTerminalSizeRendered;
     onOutputResetAppliedRef.current = props.onOutputResetApplied;
-    takeOutputRef.current = props.takeOutput;
     sessionSizeRef.current = props.sessionSize;
     mobileInputModeRef.current = Boolean(props.mobileInputMode);
     mobileKeyboardOpenRef.current = Boolean(props.mobileKeyboardOpen);
@@ -298,7 +385,7 @@ export function TerminalPane(props: TerminalPaneProps) {
 
   useEffect(() => {
     sessionSizeRef.current = props.sessionSize;
-    resizeRef.current?.(hasActiveTerminalFocus() ? "session" : "layout");
+    resizeRef.current?.("session");
   }, [props.sessionSize?.cols, props.sessionSize?.pixel_height, props.sessionSize?.pixel_width, props.sessionSize?.rows]);
 
   const requestCursorReportFrame = () => {
@@ -453,8 +540,13 @@ export function TerminalPane(props: TerminalPaneProps) {
 
   const runSearch = async (event?: FormEvent<HTMLFormElement>) => {
     event?.preventDefault();
+    const requestId = searchRequestSeqRef.current + 1;
+    searchRequestSeqRef.current = requestId;
     const query = searchDraft.trim();
     if (!query || !props.onSearch) {
+      setSearchLoading(false);
+      setSearchError(undefined);
+      setSearchResult(undefined);
       searchAddonRef.current?.clearDecorations();
       return;
     }
@@ -462,16 +554,24 @@ export function TerminalPane(props: TerminalPaneProps) {
     setSearchError(undefined);
     try {
       const result = await props.onSearch(query);
+      if (searchRequestSeqRef.current !== requestId) {
+        return;
+      }
       setSearchResult(result);
       setActiveSearchIndex(0);
       scrollToSearchMatch(result, 0);
       highlightSearchMatches(query, "next");
     } catch {
+      if (searchRequestSeqRef.current !== requestId) {
+        return;
+      }
       setSearchResult(undefined);
       searchAddonRef.current?.clearDecorations();
       setSearchError(t("terminal.searchFailed"));
     } finally {
-      setSearchLoading(false);
+      if (searchRequestSeqRef.current === requestId) {
+        setSearchLoading(false);
+      }
     }
   };
 
@@ -758,6 +858,16 @@ export function TerminalPane(props: TerminalPaneProps) {
   };
 
   const hasActiveTerminalFocus = () => focusedRef.current && windowActiveRef.current;
+  const terminalDomHasActiveFocus = () => {
+    const terminalHost = hostRef.current;
+    const activeElement = document.activeElement;
+    return Boolean(
+      windowActiveRef.current &&
+      terminalHost &&
+      activeElement instanceof HTMLElement &&
+      terminalHost.contains(activeElement),
+    );
+  };
 
   const reportTerminalFocus = (nextFocused: boolean) => {
     if (focusedRef.current === nextFocused) {
@@ -810,6 +920,11 @@ export function TerminalPane(props: TerminalPaneProps) {
     if (!props.attached || !hostRef.current || terminalRef.current) {
       return undefined;
     }
+    recordTermdDiagnostic("terminal_pane_create", {
+      outputResetVersion: props.outputResetVersion,
+      attached: props.attached,
+      sessionSize: props.sessionSize,
+    });
 
     const terminal = new Terminal({
       cursorBlink: true,
@@ -902,7 +1017,16 @@ export function TerminalPane(props: TerminalPaneProps) {
     helperTextarea?.addEventListener("paste", handleMobilePaste, true);
     const cursorMoveSubscription = terminal.onCursorMove(() => queueCursorReport());
     const writeParsedSubscription = terminal.onWriteParsed(() => queueCursorReport());
-    const scrollSubscription = terminal.onScroll(() => scheduleMobileScrollPosition());
+    const scrollSubscription = terminal.onScroll(() => {
+      const activeBuffer = terminal.buffer?.active;
+      if (forcedCursorBottomModeRef.current && activeBuffer) {
+        const cursorBottomLine = Math.max(0, activeBuffer.baseY + activeBuffer.cursorY - terminal.rows + 1);
+        if (Math.abs(activeBuffer.viewportY - cursorBottomLine) > TERMINAL_BOTTOM_EPSILON) {
+          forcedCursorBottomModeRef.current = false;
+        }
+      }
+      scheduleMobileScrollPosition();
+    });
     const selectionSubscription = terminal.onSelectionChange(() => {
       if (!terminal.hasSelection()) {
         return;
@@ -918,6 +1042,15 @@ export function TerminalPane(props: TerminalPaneProps) {
     // 未聚焦客户端按 daemon 确认的 session rows/cols 渲染，不再做本地等比缩放。
     const resize = (source: ResizeSource = "layout") => {
       if (snapshotRedrawInProgressRef.current) {
+        if (
+          source === "focus" ||
+          source === "mobile-viewport" ||
+          (source === "layout" && hasActiveTerminalFocus())
+        ) {
+          // 中文注释：snapshot 字节写入期间不能改变 xterm 尺寸；但用户主动聚焦/窗口变化
+          // 不能丢，等 snapshot 渲染完成后再补一次真实 resize 上报。
+          pendingResizeAfterSnapshotRef.current = source;
+        }
         // 中文注释：snapshot 字节按生成时的列宽解释；写入完成前禁止 layout/session resize
         // 把 xterm 改回旧尺寸，否则宽行换行和光标位置会被错误解析。
         return;
@@ -940,8 +1073,14 @@ export function TerminalPane(props: TerminalPaneProps) {
         windowActiveRef.current &&
         mobileViewportResizeOwnerRef.current;
       const canReportLocalResize =
+        source !== "session" &&
+        source !== "snapshot" &&
         !mobileKeyboardIsOpen &&
         (terminalHasActiveFocus || hasMobileViewportResizeOwnership);
+      const canFitLocalAfterSnapshot =
+        source === "snapshot" &&
+        !mobileKeyboardIsOpen &&
+        (terminalHasActiveFocus || terminalDomHasActiveFocus());
       const wasPinnedToBottom = isTerminalPinnedToBottom(terminal);
       if (proposed) {
         clientSizeRef.current = {
@@ -953,6 +1092,21 @@ export function TerminalPane(props: TerminalPaneProps) {
       }
       if (!canReportLocalResize) {
         applyFontSize(terminal, currentTerminalFontSize());
+        if (
+          canFitLocalAfterSnapshot &&
+          proposed &&
+          proposed.rows >= MIN_FOCUSED_RESIZE_ROWS &&
+          proposed.cols >= MIN_FOCUSED_RESIZE_COLS
+        ) {
+          // 中文注释：snapshot 后仍要把本地 xterm 贴合当前容器，避免内容停在旧高度；
+          // 但这是被动重绘，不能回写 daemon，否则不同分辨率客户端会形成 resize/snapshot 风暴。
+          if (!sameTerminalDimensions(terminal, proposed)) {
+            fit.fit();
+          }
+          scheduleScrollToBottomIfPinned(wasPinnedToBottom);
+          queueCursorReport({ immediate: true });
+          return;
+        }
         if (remoteSize) {
           if (sameTerminalDimensions(terminal, remoteSize)) {
             scheduleScrollToBottomIfPinned(wasPinnedToBottom);
@@ -973,15 +1127,20 @@ export function TerminalPane(props: TerminalPaneProps) {
           remoteSize?.rows === proposed.rows &&
           remoteSize?.cols === proposed.cols;
         if (approvedBySession) {
-          if (source === "session" || !sameTerminalDimensions(terminal, proposed)) {
+          if (!sameTerminalDimensions(terminal, proposed)) {
             fit.fit();
           }
           scheduleScrollToBottomIfPinned(wasPinnedToBottom);
           queueCursorReport({ immediate: true });
           return;
         }
-        // 只有拥有本地 resize 权限时才向 daemon 请求新尺寸；在收到 session_resized
-        // 并更新 sessionSize 之前，不主动调整本地 xterm，避免前端和 daemon 状态分叉。
+        // 只有拥有本地 resize 权限时才向 daemon 请求新尺寸。这里先把当前聚焦客户端的
+        // xterm 撑到真实容器高度：resize ack 可能被持续输出排到几秒后，若一直等 daemon
+        // 确认，本地视口会停在新会话默认 24 行，外层面板下方出现大片空白。
+        if (!sameTerminalDimensions(terminal, proposed)) {
+          fit.fit();
+          scheduleScrollToBottomIfPinned(wasPinnedToBottom);
+        }
         onResizeRef.current({
           rows: proposed.rows,
           cols: proposed.cols,
@@ -995,6 +1154,7 @@ export function TerminalPane(props: TerminalPaneProps) {
     const refreshTerminal = (source: ResizeSource = "layout") => {
       resize(source);
       terminal.refresh(0, Math.max(0, terminal.rows - 1));
+      syncTerminalInputAnchor(terminal, "refresh");
     };
     const stabilizeTerminal = (source: ResizeSource = "layout") => {
       // xterm 在 CSS grid / 右侧文件 panel 同步变化时可能先按旧尺寸完成 open/write。
@@ -1004,317 +1164,53 @@ export function TerminalPane(props: TerminalPaneProps) {
         requestTrackedFrame(() => refreshTerminal(source));
       });
     };
-    const byteLengthForItem = (item: TerminalOutputItem) =>
-      item.kind === "data" || item.kind === "snapshot" || item.kind === "output" ? item.bytes.byteLength : 0;
-    const markItemRendered = (item: TerminalOutputItem) => {
-      if (item.kind === "snapshot") {
-        snapshotRedrawInProgressRef.current = false;
-        lastTerminalSeqRef.current = item.baseSeq;
-        onTerminalSeqRenderedRef.current?.(item.baseSeq);
-      } else if (item.kind === "output" || item.kind === "resize" || item.kind === "exit") {
-        lastTerminalSeqRef.current = item.terminalSeq;
-        onTerminalSeqRenderedRef.current?.(item.terminalSeq);
-      }
-    };
-    const completeActiveWrite = () => {
-      const active = activeWriteRef.current;
-      if (!active) {
-        return;
-      }
-      activeWriteRef.current = undefined;
-      markItemRendered(active.item);
-    };
-    const advanceSequenceCursor = (item: TerminalOutputItem, current: number | undefined) => {
-      if (item.kind === "snapshot") {
-        return item.baseSeq;
-      }
-      if (item.kind === "output" || item.kind === "resize" || item.kind === "exit") {
-        return item.terminalSeq;
-      }
-      return current;
-    };
-    const ensureActiveWriteSequence = (active: ActiveTerminalWrite, sequenceCursor = lastTerminalSeqRef.current): boolean => {
-      if (active.sequenceChecked) {
-        return true;
-      }
-      active.sequenceChecked = true;
-      const { item } = active;
-      if (item.kind === "snapshot") {
-        snapshotRedrawInProgressRef.current = true;
-        sessionSizeRef.current = item.size;
-        if (!sameTerminalDimensions(terminal, item.size)) {
-          terminal.resize(item.size.cols, item.size.rows);
-        }
-        terminal.reset();
-        needsPostWriteRefreshRef.current = true;
-        // 中文注释：snapshot 写入可能晚于 attach 初期的 resize/stabilize。
-        // 写完后必须再贴底一次，否则用户进入 session 时可能停在历史顶部附近。
-        needsPostWriteScrollBottomRef.current = true;
-        return true;
-      }
-      if (item.kind === "output" || item.kind === "resize" || item.kind === "exit") {
-        const expected = (sequenceCursor ?? -1) + 1;
-        if (sequenceCursor === undefined || item.terminalSeq !== expected) {
-          // 中文注释：terminal_seq 缺口说明 snapshot/tail 已经不连续，必须重新 attach 获取权威 snapshot。
-          onTerminalResyncRef.current?.(sequenceCursor);
-          activeWriteRef.current = undefined;
-          return false;
-        }
-      }
-      return true;
-    };
-    const applyResizeFrame = (item: Extract<TerminalOutputItem, { kind: "resize" }>) => {
-      const wasPinnedToBottom = isTerminalPinnedToBottom(terminal);
-      sessionSizeRef.current = item.size;
-      if (!sameTerminalDimensions(terminal, item.size)) {
-        terminal.resize(item.size.cols, item.size.rows);
-      }
-      onTerminalSizeRenderedRef.current?.(item.size);
-      needsPostWriteRefreshRef.current = true;
-      needsPostWriteScrollBottomRef.current = needsPostWriteScrollBottomRef.current || wasPinnedToBottom;
-      queueCursorReport({ immediate: true });
-    };
-    const takePendingWrite = (): TerminalWriteBatch | undefined => {
-      const chunks: Uint8Array[] = [];
-      const renderedItems: TerminalOutputItem[] = [];
-      let byteCount = 0;
-      let sequenceCursor = lastTerminalSeqRef.current;
-
-      while (byteCount < MAX_WRITE_BYTES) {
-        let active = activeWriteRef.current;
-        if (!active) {
-          const item = pendingWriteItemsRef.current.shift();
-          if (!item) {
-            break;
+    const drainOutput = createTerminalOutputDrain({
+      terminal,
+      sessionSizeRef,
+      isDisposed: () => disposed,
+      requestTrackedFrame,
+      sameTerminalDimensions,
+      isTerminalPinnedToBottom,
+      scrollToBottom,
+      scheduleScrollToBottom,
+      queueCursorReport,
+      scheduleMobileScrollPosition,
+      onTerminalResync: (lastTerminalSeq) => {
+        pendingResizeAfterSnapshotRef.current = undefined;
+        onTerminalResyncRef.current?.(lastTerminalSeq);
+      },
+      onTerminalSeqRendered: (terminalSeq) => onTerminalSeqRenderedRef.current?.(terminalSeq),
+      onTerminalSizeRendered: (size) => onTerminalSizeRenderedRef.current?.(size),
+      // 中文注释：snapshot 会先按 daemon 生成时的尺寸重放历史屏幕；重放完成后必须
+      // 再按当前浏览器容器 fit 一次，否则后续输出会沿旧 24 行滚动，最终悬在上半截。
+      onSnapshotRendered: () => {
+        const pendingResizeSource = pendingResizeAfterSnapshotRef.current;
+        pendingResizeAfterSnapshotRef.current = undefined;
+        const replayPendingResize = () => {
+          if (!pendingResizeSource) {
+            return;
           }
-          pendingWriteBytesRef.current = Math.max(0, pendingWriteBytesRef.current - byteLengthForItem(item));
-          active = { item, offset: 0, sequenceChecked: false };
-          activeWriteRef.current = active;
-        }
-
-        const { item } = active;
-        if ((item.kind === "resize" || item.kind === "exit" || byteLengthForItem(item) === 0) && byteCount > 0) {
-          break;
-        }
-
-        if (!ensureActiveWriteSequence(active, sequenceCursor)) {
-          continue;
-        }
-
-        if (item.kind === "resize" || item.kind === "exit" || byteLengthForItem(item) === 0) {
-          if (item.kind === "resize") {
-            applyResizeFrame(item);
-          }
-          renderedItems.push(item);
-          sequenceCursor = advanceSequenceCursor(item, sequenceCursor);
-          activeWriteRef.current = undefined;
-          continue;
-        }
-
-        if (item.kind !== "data" && item.kind !== "snapshot" && item.kind !== "output") {
-          break;
-        }
-
-        const remaining = MAX_WRITE_BYTES - byteCount;
-        const end = Math.min(item.bytes.byteLength, active.offset + remaining);
-        const slice = item.bytes.subarray(active.offset, end);
-        chunks.push(slice);
-        byteCount += slice.byteLength;
-        active.offset = end;
-
-        if (active.offset >= byteLengthForItem(item)) {
-          renderedItems.push(item);
-          sequenceCursor = advanceSequenceCursor(item, sequenceCursor);
-          activeWriteRef.current = undefined;
-          continue;
-        }
-
-        break;
-      }
-
-      if (byteCount === 0) {
-        for (const item of renderedItems) {
-          markItemRendered(item);
-        }
-        return undefined;
-      }
-
-      return {
-        bytes: concatWriteChunks(chunks, byteCount),
-        renderedItems,
-      };
-    };
-    const afterTerminalMutation = () => {
-      if (disposed) {
-        return;
-      }
-      queueCursorReport();
-      scheduleMobileScrollPosition();
-      const outputQueueIdle = !activeWriteRef.current && pendingWriteItemsRef.current.length === 0;
-      if (!needsPostWriteRefreshRef.current && !outputQueueIdle) {
-        return;
-      }
-      const shouldScrollBottomAfterMutation = outputQueueIdle && needsPostWriteScrollBottomRef.current;
-      needsPostWriteRefreshRef.current = false;
-      if (shouldScrollBottomAfterMutation) {
-        needsPostWriteScrollBottomRef.current = false;
-      }
-      // 首屏/清屏后的首个 write，以及 resize/exit 这类零字节 mutation，都需要
-      // 一次轻量 refresh。否则某些 xterm 渲染时序会等到下一次输入/resize 才 repaint 尾包。
-      if (outputQueueIdle) {
-        requestTrackedFrame(() => {
-          if (shouldScrollBottomAfterMutation) {
-            scrollToBottom();
-            scheduleScrollToBottom(4);
-          }
-          terminal.refresh(0, Math.max(0, terminal.rows - 1));
-          // 切换 session 后浏览器布局和 xterm renderer 可能比 write callback 再晚一帧可绘制。
-          // 队列已经 idle 时补第二帧刷新，不会放大持续输出路径的绘制压力。
-          requestTrackedFrame(() => {
-            if (shouldScrollBottomAfterMutation) {
-              scrollToBottom();
-            }
-            terminal.refresh(0, Math.max(0, terminal.rows - 1));
-          });
-        });
-        return;
-      }
-      // 持续输出路径不反复 proposeDimensions/refresh，降低 layout 和绘制压力。
-      requestTrackedFrame(() => terminal.refresh(0, Math.max(0, terminal.rows - 1)));
-    };
-    const flushPendingWrite = () => {
-      if (writeInFlightRef.current) {
-        return;
-      }
-      const output = takePendingWrite();
-      if (!output || output.bytes.byteLength === 0) {
-        if (needsPostWriteRefreshRef.current || needsPostWriteScrollBottomRef.current) {
-          // 中文注释：resize/exit 这类零字节 terminal frame 不会触发 xterm.write callback。
-          // 但 resize 已经改变了 xterm buffer/viewport，仍必须执行 terminal mutation 完成后的刷新和贴底收尾。
-          afterTerminalMutation();
-        }
-        if (activeWriteRef.current || pendingWriteItemsRef.current.length > 0) {
-          schedulePendingWrite();
-        }
-        return;
-      }
-      writeInFlightRef.current = true;
-      const writeGeneration = writeGenerationRef.current;
-      terminal.write(output.bytes, () => {
-        if (disposed || writeGeneration !== writeGenerationRef.current) {
+          requestTrackedFrame(() => resizeRef.current?.(pendingResizeSource));
+        };
+        if (hasActiveTerminalFocus() || terminalDomHasActiveFocus()) {
+          refreshTerminal("snapshot");
+          stabilizeTerminal("snapshot");
+          replayPendingResize();
           return;
         }
-        writeInFlightRef.current = false;
-        for (const item of output.renderedItems) {
-          markItemRendered(item);
-        }
-        afterTerminalMutation();
-        if (activeWriteRef.current || pendingWriteItemsRef.current.length > 0) {
-          schedulePendingWrite();
-        }
-      });
-    };
-    function schedulePendingWrite() {
-      if (writeInFlightRef.current || writeFrameRef.current !== undefined) {
-        return;
-      }
-      writeFrameRef.current = requestTrackedFrame(() => {
-        if (disposed) {
-          return;
-        }
-        writeFrameRef.current = undefined;
-        flushPendingWrite();
-      });
-    }
-    const drainOutput = () => {
-      const items = takeOutputRef.current();
-      if (items.length === 0) {
-        return;
-      }
-      pendingWriteItemsRef.current.push(...items);
-      pendingWriteBytesRef.current += items.reduce((sum, item) => sum + byteLengthForItem(item), 0);
-      schedulePendingWrite();
-    };
+        stabilizeTerminal("snapshot");
+        replayPendingResize();
+      },
+    });
     stabilizeRef.current = stabilizeTerminal;
-    const clearPendingFocusOut = () => {
-      if (focusOutTimerRef.current === undefined) {
-        return;
-      }
-      window.clearTimeout(focusOutTimerRef.current);
-      focusOutTimerRef.current = undefined;
-    };
-    const blurActiveTerminalElement = () => {
-      const activeElement = document.activeElement;
-      if (activeElement instanceof HTMLElement && host.contains(activeElement)) {
-        activeElement.blur();
-      }
-    };
-    const handleFocusIn = () => {
-      clearPendingFocusOut();
-      if (!windowActiveRef.current) {
-        focusedRef.current = false;
-        setFocused(false);
-        blurActiveTerminalElement();
-        queueCursorReport({ immediate: true });
-        return;
-      }
-      if (suppressPassiveFocusRef.current && !focusActivationArmedRef.current) {
-        focusedRef.current = false;
-        setFocused(false);
-        blurActiveTerminalElement();
-        queueCursorReport({ immediate: true });
-        return;
-      }
-      focusActivationArmedRef.current = false;
-      suppressPassiveFocusRef.current = false;
-      reportTerminalFocus(true);
-      // 主动点击或程序 focus 回到终端时，只有原本就在底部才继续跟随最新输出；
-      // 否则会打断用户查看 scrollback 或搜索结果。
-      scheduleScrollToBottomIfPinned();
-    };
-    const handleFocusOut = () => {
-      focusActivationArmedRef.current = false;
-      if (!focusedRef.current || focusOutTimerRef.current !== undefined) {
-        return;
-      }
-      // 浏览器窗口 resize、移动端视觉视口变化和 xterm 内部重排都可能短暂触发
-      // focusout -> focusin。延迟确认失焦，避免把这种瞬时 DOM 抖动上报成
-      // operator 在 focused/blurred 之间来回切换。
-      focusOutTimerRef.current = window.setTimeout(() => {
-        focusOutTimerRef.current = undefined;
-        reportTerminalFocus(false);
-      }, FOCUS_OUT_SETTLE_MS);
-    };
-    const handleWindowBlur = () => {
-      windowActiveRef.current = false;
-      focusActivationArmedRef.current = false;
-      mobileViewportResizeOwnerRef.current = false;
-      suppressPassiveFocusRef.current = true;
-      clearPendingFocusOut();
-      // 真实浏览器切到另一个窗口后，旧窗口的 textarea 可能仍留着 DOM focus。
-      // 这里立即撤销 operator 聚焦态，避免旧窗口继续按自己的布局上报 PTY resize。
-      reportTerminalFocus(false);
-      blurActiveTerminalElement();
-      resize("layout");
-    };
-    const handleWindowFocus = () => {
-      windowActiveRef.current = true;
-      focusActivationArmedRef.current = false;
-      // 回到浏览器窗口不等于用户要接管 PTY；仍需点击终端区域重新激活。
-      suppressPassiveFocusRef.current = true;
-    };
-    const handleVisibilityChange = () => {
-      if (document.visibilityState === "hidden") {
-        handleWindowBlur();
-        return;
-      }
-      handleWindowFocus();
-    };
-    host.addEventListener("focusin", handleFocusIn);
-    host.addEventListener("focusout", handleFocusOut);
-    window.addEventListener("blur", handleWindowBlur);
-    window.addEventListener("focus", handleWindowFocus);
-    document.addEventListener("visibilitychange", handleVisibilityChange);
+    const cleanupFocusResizeListeners = installTerminalFocusResizeListeners({
+      host,
+      focusOutSettleMs: FOCUS_OUT_SETTLE_MS,
+      reportTerminalFocus,
+      queueCursorReport,
+      scheduleScrollToBottomIfPinned,
+      resize,
+    });
     terminalRef.current = terminal;
     fitRef.current = fit;
     searchAddonRef.current = searchAddon;
@@ -1329,8 +1225,7 @@ export function TerminalPane(props: TerminalPaneProps) {
     } else {
       confirmOutputReset();
     }
-    needsPostWriteRefreshRef.current = true;
-    needsPostWriteScrollBottomRef.current = true;
+    markWriterNeedsRefreshAndScroll();
     // attach 输出可能早于 xterm 初始化到达；创建实例时先取走待写队列，避免首屏输出丢失。
     drainOutputRef.current = drainOutput;
     drainOutput();
@@ -1353,6 +1248,10 @@ export function TerminalPane(props: TerminalPaneProps) {
     }
 
     return () => {
+      recordTermdDiagnostic("terminal_pane_dispose", {
+        outputResetVersion: props.outputResetVersion,
+        attached: props.attached,
+      });
       disposed = true;
       for (const frame of scheduledFrames) {
         window.cancelAnimationFrame(frame);
@@ -1390,12 +1289,8 @@ export function TerminalPane(props: TerminalPaneProps) {
       clearMobileDirectionGesture();
       lastMobileScrollReportAtRef.current = 0;
       window.removeEventListener("resize", handleWindowResize);
-      window.removeEventListener("blur", handleWindowBlur);
-      window.removeEventListener("focus", handleWindowFocus);
-      document.removeEventListener("visibilitychange", handleVisibilityChange);
+      cleanupFocusResizeListeners();
       resizeObserver?.disconnect();
-      host.removeEventListener("focusin", handleFocusIn);
-      host.removeEventListener("focusout", handleFocusOut);
       helperTextarea?.removeEventListener("compositionstart", handleMobileCompositionStart, true);
       helperTextarea?.removeEventListener("compositionend", handleMobileCompositionEnd, true);
       helperTextarea?.removeEventListener("beforeinput", handleMobileBeforeInput, true);
@@ -1413,17 +1308,10 @@ export function TerminalPane(props: TerminalPaneProps) {
       searchAddonRef.current = null;
       resizeRef.current = undefined;
       stabilizeRef.current = undefined;
+      pendingResizeAfterSnapshotRef.current = undefined;
       drainOutputRef.current = () => undefined;
-      pendingWriteItemsRef.current = [];
-      pendingWriteBytesRef.current = 0;
-      activeWriteRef.current = undefined;
-      lastTerminalSeqRef.current = undefined;
-      writeInFlightRef.current = false;
-      writeGenerationRef.current += 1;
-      writeFrameRef.current = undefined;
-      needsPostWriteRefreshRef.current = false;
-      needsPostWriteScrollBottomRef.current = false;
-      snapshotRedrawInProgressRef.current = false;
+      resetWriterState();
+      forcedCursorBottomModeRef.current = false;
       focusedRef.current = false;
       mobileCompositionActiveRef.current = false;
       lastMobileCompositionEndAtRef.current = 0;
@@ -1461,6 +1349,10 @@ export function TerminalPane(props: TerminalPaneProps) {
     }
     // session 切换时上面的 terminal effect 会按 outputResetVersion 重建 xterm 实例。
     // 这里仅保留防御式同步清屏：如果未来 effect 条件调整导致实例未重建，也不能残留旧 session 明文。
+    recordTermdDiagnostic("terminal_pane_defensive_reset", {
+      previousResetVersion: outputResetVersionRef.current,
+      outputResetVersion: props.outputResetVersion,
+    });
     terminal.reset();
   }, [props.outputResetVersion]);
 
@@ -1537,7 +1429,12 @@ export function TerminalPane(props: TerminalPaneProps) {
                   value={searchDraft}
                   autoFocus
                   placeholder={t("terminal.searchPlaceholder")}
-                  onChange={(event) => setSearchDraft(event.currentTarget.value)}
+                  onChange={(event) => {
+                    searchRequestSeqRef.current += 1;
+                    setSearchLoading(false);
+                    setSearchError(undefined);
+                    setSearchDraft(event.currentTarget.value);
+                  }}
                 />
               </label>
               <button type="submit" className="icon-button" aria-label={t("terminal.search")} disabled={searchLoading || !searchDraft.trim()}>
@@ -1557,7 +1454,11 @@ export function TerminalPane(props: TerminalPaneProps) {
                 className="icon-button"
                 aria-label={t("terminal.closeSearch")}
                 onClick={() => {
+                  searchRequestSeqRef.current += 1;
                   searchAddonRef.current?.clearDecorations();
+                  setSearchLoading(false);
+                  setSearchError(undefined);
+                  setSearchResult(undefined);
                   setSearchOpen(false);
                 }}
               >

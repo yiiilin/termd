@@ -206,9 +206,9 @@ checksum = "bef38d45163c2f1dde094a7dfd33ccf595c92905c8f8f4fdc18d06fb1037718a"
 
 [[package]]
 name = "bitflags"
-version = "2.11.1"
+version = "2.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c4512299f36f043ab09a583e57bceb5a5aab7a73db1805848e8fef3c9e8c78b3"
+checksum = "84d7ced0ae9557296835c32bf1b1e02b44c746701f898460fb000d7eaa84f00a"
 
 [[package]]
 name = "block-buffer"
@@ -908,9 +908,9 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "log"
-version = "0.4.30"
+version = "0.4.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "616ec5685824bcc94416c6d4a7a446eea774a31efd7062c8480ba6fd06d7a6e5"
+checksum = "113b30b4cd05f7c06868fdb2854f66a7b9fece9a48425351cd532e810d74024f"
 
 [[package]]
 name = "matchers"
@@ -966,7 +966,7 @@ version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ab2156c4fce2f8df6c499cc1c763e4394b7482525bf2a9701c9d79d215f519e4"
 dependencies = [
- "bitflags 2.11.1",
+ "bitflags 2.12.1",
  "cfg-if",
  "cfg_aliases",
  "libc",
@@ -1204,7 +1204,7 @@ version = "0.32.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7753b721174eb8ff87a9a0e799e2d7bc3749323e773db92e0984debb00019d6e"
 dependencies = [
- "bitflags 2.11.1",
+ "bitflags 2.12.1",
  "fallible-iterator",
  "fallible-streaming-iterator",
  "hashlink",
@@ -1227,7 +1227,7 @@ version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
 dependencies = [
- "bitflags 2.11.1",
+ "bitflags 2.12.1",
  "errno",
  "libc",
  "linux-raw-sys",
@@ -1513,12 +1513,13 @@ dependencies = [
 
 [[package]]
 name = "termctl"
-version = "0.3.11"
+version = "0.3.12"
 dependencies = [
  "base64",
  "clap",
  "ed25519-dalek",
  "futures-util",
+ "libc",
  "rand_core",
  "rustls",
  "serde",
@@ -1535,7 +1536,7 @@ dependencies = [
 
 [[package]]
 name = "termd"
-version = "0.3.11"
+version = "0.3.12"
 dependencies = [
  "axum",
  "axum-core",
@@ -1562,6 +1563,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-tungstenite",
  "tower",
+ "tower-http",
  "tower-service",
  "tracing",
  "tracing-subscriber",
@@ -1573,7 +1575,7 @@ dependencies = [
 
 [[package]]
 name = "termd-proto"
-version = "0.3.11"
+version = "0.3.12"
 dependencies = [
  "base64",
  "prost",
@@ -1584,7 +1586,7 @@ dependencies = [
 
 [[package]]
 name = "termrelay"
-version = "0.3.11"
+version = "0.3.12"
 dependencies = [
  "axum",
  "axum-core",
@@ -1603,6 +1605,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-tungstenite",
  "tower",
+ "tower-http",
  "tower-service",
  "tracing",
  "tracing-subscriber",
@@ -1611,7 +1614,7 @@ dependencies = [
 
 [[package]]
 name = "termweb"
-version = "0.3.11"
+version = "0.3.12"
 dependencies = [
  "axum",
  "mime_guess",
@@ -1746,6 +1749,20 @@ dependencies = [
  "tower-layer",
  "tower-service",
  "tracing",
+]
+
+[[package]]
+name = "tower-http"
+version = "0.6.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4cfcf7e2740e6fc6d4d688b4ef00650406bb94adf4731e43c096c3a19fe40840"
+dependencies = [
+ "bitflags 2.12.1",
+ "bytes",
+ "http",
+ "pin-project-lite",
+ "tower-layer",
+ "tower-service",
 ]
 
 [[package]]
@@ -2027,7 +2044,7 @@ version = "0.244.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47b807c72e1bac69382b3a6fb3dbe8ea4c0ed87ff5629b8685ae6b9a611028fe"
 dependencies = [
- "bitflags 2.11.1",
+ "bitflags 2.12.1",
  "hashbrown 0.15.5",
  "indexmap",
  "semver",
@@ -2234,7 +2251,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9d66ea20e9553b30172b5e831994e35fbde2d165325bec84fc43dbf6f4eb9cb2"
 dependencies = [
  "anyhow",
- "bitflags 2.11.1",
+ "bitflags 2.12.1",
  "indexmap",
  "log",
  "serde",

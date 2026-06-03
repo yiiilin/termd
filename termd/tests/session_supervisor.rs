@@ -25,8 +25,8 @@ use termd::session::TerminalSize;
 use termd::state::{DaemonIdentitySnapshot, DaemonState, SessionStateRecord, StateStore};
 use termd_proto::{
     DeviceId, E2eeKeyExchangePayload, MessageType, Nonce, PairAcceptPayload, PairRequestPayload,
-    PublicKey, ServerId, SessionClosePayload, SessionClosedPayload, SessionId, SessionListPayload,
-    SessionListResultPayload, SessionState, UnixTimestampMillis,
+    PublicKey, ServerId, SessionAttachPayload, SessionClosePayload, SessionClosedPayload,
+    SessionId, SessionListPayload, SessionListResultPayload, SessionState, UnixTimestampMillis,
 };
 
 fn temp_state_path(name: &str) -> PathBuf {
@@ -687,6 +687,24 @@ fn daemon_session_list_shows_restored_supervisor_without_client_history_metadata
         list_payload.sessions[0].files_path.as_deref(),
         Some(default_root.to_string_lossy().as_ref())
     );
+
+    // close 现在受 attach 不变量保护；恢复出来的 session 先 attach，再验证可被显式关闭。
+    let attach_responses = send_encrypted(
+        &mut protocol,
+        &mut connection,
+        &mut device_session,
+        envelope_value(
+            MessageType::SessionAttach,
+            SessionAttachPayload {
+                session_id,
+                watch_updates: false,
+                last_terminal_seq: None,
+            },
+        )
+        .unwrap(),
+    );
+    let attached = decrypt_first(&mut device_session, attach_responses);
+    assert_eq!(attached.kind, MessageType::SessionAttached);
 
     let close_responses = send_encrypted(
         &mut protocol,

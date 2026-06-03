@@ -387,6 +387,8 @@ impl TerminalScreen {
     pub(crate) fn resize(&mut self, rows: u16, cols: u16) {
         let rows = usize::from(rows.max(1));
         let cols = usize::from(cols.max(1));
+        let old_rows = self.rows;
+        let scroll_region_was_full_screen = self.scroll_top == 0 && self.scroll_bottom == old_rows;
         self.rows = rows;
         self.cols = cols;
         self.max_cached_lines = self.max_cached_lines.max(rows);
@@ -398,12 +400,19 @@ impl TerminalScreen {
         }
         self.trim_cached_lines();
         if let Some(normal_screen) = &mut self.normal_screen {
-            normal_screen.resize(rows, cols, self.max_cached_lines);
+            normal_screen.resize(old_rows, rows, cols, self.max_cached_lines);
         }
         self.cursor_row = self.cursor_row.min(self.rows - 1);
         self.cursor_col = self.cursor_col.min(self.cols - 1);
-        self.scroll_top = self.scroll_top.min(self.rows - 1);
-        self.scroll_bottom = self.scroll_bottom.min(self.rows).max(self.scroll_top + 1);
+        if scroll_region_was_full_screen {
+            // 中文注释：默认全屏滚动区域随 PTY 高度一起扩展。否则 24 行新会话 resize 到
+            // 44 行后仍只在前 24 行滚动，浏览器看起来就会“悬在上半截”。
+            self.scroll_top = 0;
+            self.scroll_bottom = self.rows;
+        } else {
+            self.scroll_top = self.scroll_top.min(self.rows - 1);
+            self.scroll_bottom = self.scroll_bottom.min(self.rows).max(self.scroll_top + 1);
+        }
     }
 
     pub(crate) fn apply(&mut self, bytes: &[u8]) {
@@ -1097,7 +1106,8 @@ impl TerminalScreen {
 }
 
 impl SavedScreen {
-    fn resize(&mut self, rows: usize, cols: usize, max_cached_lines: usize) {
+    fn resize(&mut self, old_rows: usize, rows: usize, cols: usize, max_cached_lines: usize) {
+        let scroll_region_was_full_screen = self.scroll_top == 0 && self.scroll_bottom == old_rows;
         for line in &mut self.lines {
             line.resize(cols);
         }
@@ -1112,6 +1122,13 @@ impl SavedScreen {
         }
         self.cursor_row = self.cursor_row.min(rows - 1);
         self.cursor_col = self.cursor_col.min(cols - 1);
+        if scroll_region_was_full_screen {
+            self.scroll_top = 0;
+            self.scroll_bottom = rows;
+        } else {
+            self.scroll_top = self.scroll_top.min(rows - 1);
+            self.scroll_bottom = self.scroll_bottom.min(rows).max(self.scroll_top + 1);
+        }
     }
 }
 
@@ -1426,6 +1443,75 @@ mod tests {
             vec![
                 "top-2", "top-3", "top-4", "next-top", "prompt-a", "prompt-b"
             ]
+        );
+    }
+
+    #[test]
+    fn resize_expands_default_scroll_region_to_new_height() {
+        let mut screen = TerminalScreen::new(24, 80);
+
+        screen.apply(b"root@host:~# ");
+        screen.resize(44, 99);
+
+        let snapshot = String::from_utf8(screen.snapshot_bytes()).unwrap();
+        assert!(
+            snapshot.contains("\x1b[r"),
+            "默认全屏 scroll region resize 后应恢复为新高度全屏区域: {snapshot:?}"
+        );
+        assert!(
+            !snapshot.contains("\x1b[1;24r"),
+            "不能把旧 24 行 scroll region 带到 44 行 snapshot 中: {snapshot:?}"
+        );
+
+        let mut replayed = TerminalScreen::new(44, 99);
+        replayed.apply(snapshot.as_bytes());
+        for _ in 0..60 {
+            replayed.apply(b"\r\nroot@host:~# ");
+        }
+        let last_non_empty = replayed
+            .visible_lines()
+            .iter()
+            .rposition(|line| !line.trim().is_empty());
+        assert_eq!(
+            last_non_empty,
+            Some(43),
+            "回放后持续回车应滚动到 44 行底部，而不是停在旧 24 行区域"
+        );
+    }
+
+    #[test]
+    fn resize_preserves_explicit_scroll_region_instead_of_expanding_to_full_screen() {
+        let mut screen = TerminalScreen::new(24, 80);
+
+        screen.apply(b"\x1b[2;10r\x1b[10;1Hfixed-region");
+        screen.resize(44, 99);
+
+        let snapshot = String::from_utf8(screen.snapshot_bytes()).unwrap();
+        assert!(
+            snapshot.contains("\x1b[2;10r"),
+            "显式 scroll region resize 后必须保留，不能误扩成全屏: {snapshot:?}"
+        );
+        assert!(
+            !snapshot.contains("\x1b[r\x1b[10;"),
+            "非全屏 scroll region 不应被默认全屏恢复覆盖: {snapshot:?}"
+        );
+    }
+
+    #[test]
+    fn resize_preserves_alternate_screen_explicit_scroll_region() {
+        let mut screen = TerminalScreen::new(24, 80);
+
+        screen.apply(b"normal-screen\x1b[?1049h\x1b[2;10r\x1b[10;1HTUI");
+        screen.resize(44, 99);
+
+        let snapshot = String::from_utf8(screen.snapshot_bytes()).unwrap();
+        let alternate = snapshot
+            .split("\x1b[?1049h")
+            .nth(1)
+            .expect("snapshot should switch to alternate screen");
+        assert!(
+            alternate.contains("\x1b[2;10r"),
+            "active alternate screen 的显式 scroll region 必须在 resize 后保留: {snapshot:?}"
         );
     }
 

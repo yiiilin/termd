@@ -16,9 +16,12 @@ const _sensitiveErrorFragments = <String>[
   'session_data',
   'pty_output',
   'token=',
+  'secret=',
   'private=',
   'signature=',
   'ciphertext=',
+  'authorization:',
+  'bearer ',
   'terminal-secret',
 ];
 

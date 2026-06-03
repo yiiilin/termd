@@ -25,6 +25,15 @@ void main() {
     _expectSafeNativeError(error);
     expect(error.safeMessage, '输入不合法，敏感内容已隐藏。');
   });
+
+  test('dynamic validation errors redact generic secret query fragments', () {
+    final error = NativeValidationError(
+      'url=wss://example.test/ws?secret=PAIR-CODE-1',
+    );
+
+    _expectSafeNativeError(error);
+    expect(error.safeMessage, '输入不合法，敏感内容已隐藏。');
+  });
 }
 
 void _expectSafeNativeError(NativeError error) {
@@ -42,6 +51,7 @@ void _expectSafeNativeError(NativeError error) {
     'pty_output',
     'signature=',
     'ciphertext=',
+    'secret=',
   ];
 
   for (final fragment in forbiddenFragments) {

@@ -1,6 +1,6 @@
 # 技术架构
 
-本文记录当前代码库的真实技术状态。当前 Rust workspace 包含 `proto`、`termd`、`termctl` 和 `termrelay`；`termui/frontend` 是已验证的 Web MVP，`termui/native` 是 Flutter Native 架构骨架。
+本文记录当前代码库的真实技术状态。当前 Rust workspace 包含 `proto`、`termd`、`termctl`、`termrelay` 和 `termweb`；`termui/frontend` 是已验证的 Web MVP，`termui/native` 是 Flutter Native 架构骨架。
 
 ---
 
@@ -11,6 +11,7 @@
 /termd
 /termctl
 /termrelay
+/termweb
 ```
 
 前端与 Native 目录不在 Cargo workspace 内：
@@ -116,6 +117,12 @@ WebSocket 路径：
 
 relay 只按 URL 中公开的 `server_id` 路由 frame。`/daemon-mux` 只解析 relay transport wrapper，用于 `client_id` 定向转发；它不解密、不解析内层业务 envelope，也不参与 pairing/auth/session/control 判断。
 公网部署方案、反向代理示例和 health check 细节见 [docs/deployment.md](docs/deployment.md)。
+
+### `termweb`
+
+`termweb` 是 Rust workspace 内的嵌入式 Web 静态资源 crate。发布构建会把 `termui/frontend/dist` 嵌入 `termd` 和 `termrelay` 二进制；本地未构建前端时，build script 会嵌入最小占位页，保证 Rust workspace 测试和构建不依赖前端产物已经存在。
+
+`termweb` 只负责静态资源响应和 SPA fallback，不保存 UI 状态，不处理 pairing/auth/session/control 业务协议。
 
 ### 发布与安装
 

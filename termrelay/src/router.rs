@@ -1,31 +1,80 @@
 use axum::body::Body;
 use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::{Query, State};
+use axum::http::header::{CONTENT_TYPE, HeaderName};
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use termd_proto::ServerId;
+use tower_http::cors::{Any, CorsLayer};
 use uuid::Uuid;
 
 use crate::ws::{RelayState, WEBSOCKET_MAX_FRAME_SIZE, WEBSOCKET_MAX_MESSAGE_SIZE, handle_socket};
 
-pub fn router(state: RelayState, web_enabled: bool) -> Router {
-    let router = Router::new()
+const HTTP_FILE_TUNNEL_PATHS: &[&str] = &[
+    "/api/files/upload/init",
+    "/api/files/upload",
+    "/api/files/upload/abort",
+    "/api/files/download",
+];
+
+pub fn router(state: RelayState, web_enabled: bool, http_tunnel_enabled: bool) -> Router {
+    let mut router = Router::new()
         .route("/healthz", get(healthz))
-        .route("/ws", get(relay_ws))
-        .route("/api/files/upload/init", post(relay_http_tunnel))
-        .route("/api/files/upload", post(relay_http_tunnel))
-        .route("/api/files/upload/abort", post(relay_http_tunnel))
-        .route("/api/files/download", post(relay_http_tunnel))
-        .with_state(state);
+        .route("/ws", get(relay_ws));
+
+    for path in HTTP_FILE_TUNNEL_PATHS {
+        router = if http_tunnel_enabled {
+            router.route(path, post(relay_http_tunnel))
+        } else {
+            // 中文注释：默认显式挡住文件 API，避免 Web fallback 把禁用的 tunnel 当作前端路由。
+            router.route(path, any(relay_http_tunnel_disabled))
+        };
+    }
+
+    // 中文注释：所有 API namespace 都要在 Web fallback 前截止，未知 API 不能返回 SPA index。
+    router = router
+        .route("/api", any(api_not_found))
+        .route("/api/", any(api_not_found))
+        .route("/api/*path", any(api_not_found));
+
+    let router = router.with_state(state).layer(http_file_api_cors_layer());
 
     if web_enabled {
         router.fallback(termweb::embedded_web_handler)
     } else {
         router
     }
+}
+
+fn http_file_api_cors_layer() -> CorsLayer {
+    // 中文注释：relay 只转发 HTTP 文件 tunnel，不解密也不解析业务内容；但浏览器从
+    // 独立前端 origin 访问 relay file API 时仍需要通过标准 CORS 预检。
+    CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods([Method::POST, Method::OPTIONS])
+        .allow_headers([
+            CONTENT_TYPE,
+            HeaderName::from_static("x-termd-server-id"),
+            HeaderName::from_static("x-termd-device-id"),
+            HeaderName::from_static("x-termd-e2ee-public-key"),
+            HeaderName::from_static("x-termd-e2ee-nonce"),
+            HeaderName::from_static("x-termd-e2ee-timestamp-ms"),
+            HeaderName::from_static("x-termd-e2ee-signature"),
+        ])
+}
+
+async fn relay_http_tunnel_disabled() -> impl IntoResponse {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        "relay HTTP tunnel is disabled; start termrelay with --http-tunnel to enable compatibility file APIs\n",
+    )
+}
+
+async fn api_not_found() -> impl IntoResponse {
+    (StatusCode::NOT_FOUND, "relay API path not found\n")
 }
 
 async fn relay_http_tunnel(
@@ -130,12 +179,127 @@ mod tests {
 
     #[test]
     fn router_can_be_constructed() {
-        let _router = router(RelayState::default(), false);
+        let _router = router(RelayState::default(), false, false);
+    }
+
+    #[tokio::test]
+    async fn router_disables_http_file_tunnel_by_default() {
+        for path in [
+            "/api/files/upload/init",
+            "/api/files/upload",
+            "/api/files/upload/abort",
+            "/api/files/download",
+        ] {
+            let response = router(RelayState::default(), true, false)
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(path)
+                        .header("x-termd-server-id", ServerId::new().0.to_string())
+                        .body(Body::empty())
+                        .expect("test request should build"),
+                )
+                .await
+                .expect("router should respond");
+
+            // 中文注释：即使启用了 Web fallback，文件 tunnel 默认也不能落到兼容路径或 SPA。
+            assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .expect("disabled response body should be readable");
+            let body = std::str::from_utf8(&body).expect("disabled response should be UTF-8");
+            assert!(body.contains("--http-tunnel"));
+        }
+    }
+
+    #[tokio::test]
+    async fn router_does_not_fallback_to_web_for_api_namespace() {
+        for (method, path) in [
+            (Method::GET, "/api/"),
+            (Method::GET, "/api/unknown"),
+            (Method::POST, "/api/files/download/extra"),
+        ] {
+            let response = router(RelayState::default(), true, false)
+                .oneshot(
+                    Request::builder()
+                        .method(method.clone())
+                        .uri(path)
+                        .body(Body::empty())
+                        .expect("test request should build"),
+                )
+                .await
+                .expect("router should respond");
+
+            // 中文注释：API namespace 必须在 Web fallback 前截止，不能返回 SPA index。
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {path}");
+        }
+
+        let slash_variant = router(RelayState::default(), true, false)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/files/upload/")
+                    .body(Body::empty())
+                    .expect("test request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert!(
+            !slash_variant.status().is_success(),
+            "POST /api/files/upload/ must not be served by Web fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn router_mounts_http_file_tunnel_only_when_explicitly_enabled() {
+        let response = router(RelayState::default(), true, true)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/files/download")
+                    .header("x-termd-server-id", ServerId::new().0.to_string())
+                    .body(Body::empty())
+                    .expect("test request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        // 中文注释：启用后应进入 tunnel 兼容路径；没有 daemon 在线时会返回 503，而不是禁用提示。
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn router_answers_cors_preflight_for_http_file_tunnel() {
+        let response = router(RelayState::default(), true, true)
+            .oneshot(
+                Request::builder()
+                    .method(Method::OPTIONS)
+                    .uri("/api/files/upload/init")
+                    .header("origin", "http://127.0.0.1:4173")
+                    .header("access-control-request-method", "POST")
+                    .header(
+                        "access-control-request-headers",
+                        "content-type,x-termd-server-id,x-termd-device-id,x-termd-e2ee-public-key,x-termd-e2ee-nonce,x-termd-e2ee-timestamp-ms,x-termd-e2ee-signature",
+                    )
+                    .body(Body::empty())
+                    .expect("test request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert!(response.status().is_success());
+        assert_eq!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .and_then(|value| value.to_str().ok()),
+            Some("*")
+        );
     }
 
     #[tokio::test]
     async fn web_fallback_is_opt_in() {
-        let disabled_response = router(RelayState::default(), false)
+        let disabled_response = router(RelayState::default(), false, false)
             .oneshot(
                 Request::builder()
                     .uri("/")
@@ -146,7 +310,7 @@ mod tests {
             .expect("router should respond");
         assert_eq!(disabled_response.status(), StatusCode::NOT_FOUND);
 
-        let enabled_response = router(RelayState::default(), true)
+        let enabled_response = router(RelayState::default(), true, false)
             .oneshot(
                 Request::builder()
                     .uri("/")
@@ -176,7 +340,7 @@ mod tests {
             format!("/ws/{}/daemon-mux", server_id.0),
             format!("/ws/{}/client", server_id.0),
         ] {
-            let response = router(RelayState::default(), false)
+            let response = router(RelayState::default(), false, false)
                 .oneshot(
                     Request::builder()
                         .uri(path)
@@ -195,7 +359,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let _server = tokio::spawn(async move {
-            axum::serve(listener, router(RelayState::default(), false))
+            axum::serve(listener, router(RelayState::default(), false, false))
                 .await
                 .unwrap();
         });
@@ -231,7 +395,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let _server = tokio::spawn(async move {
-            axum::serve(listener, router(RelayState::default(), false))
+            axum::serve(listener, router(RelayState::default(), false, false))
                 .await
                 .unwrap();
         });

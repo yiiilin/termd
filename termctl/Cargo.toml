@@ -10,6 +10,7 @@ base64 = "0.22"
 clap = { version = "4.5", features = ["derive"] }
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+libc = "0.2"
 rand_core = { version = "0.6", features = ["getrandom"] }
 serde.workspace = true
 serde_json.workspace = true
@@ -17,7 +18,7 @@ rustls = "0.23"
 termd = { path = "../termd" }
 termd-proto = { path = "../proto" }
 thiserror.workspace = true
-tokio = { version = "1", features = ["io-std", "io-util", "macros", "rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["io-std", "io-util", "macros", "rt-multi-thread", "signal", "time"] }
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 uuid.workspace = true
 webpki-roots = "1"

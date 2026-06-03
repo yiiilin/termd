@@ -24,6 +24,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 - "${GITHUB_REF_NAME}" <<'PY'
+          import json
           import pathlib
           import re
           import sys
@@ -58,6 +59,19 @@ jobs:
               if version != tag:
                   mismatches.append(f"{manifest}: {version}")
 
+          package_json = pathlib.Path("termui/frontend/package.json")
+          package_data = json.loads(package_json.read_text())
+          if package_data.get("version") != tag:
+              mismatches.append(f"{package_json}: {package_data.get('version')}")
+
+          package_lock = pathlib.Path("termui/frontend/package-lock.json")
+          lock_data = json.loads(package_lock.read_text())
+          if lock_data.get("version") != tag:
+              mismatches.append(f"{package_lock}: {lock_data.get('version')}")
+          root_package = lock_data.get("packages", {}).get("", {})
+          if root_package.get("version") != tag:
+              mismatches.append(f"{package_lock} packages['']: {root_package.get('version')}")
+
           if mismatches:
               raise SystemExit(
                   "tag/version mismatch:\n" + "\n".join(f"- {line}" for line in mismatches)
@@ -66,11 +80,43 @@ jobs:
           print(f"validated release tag {tag}")
           PY
 
+      - name: Validate release notes
+        run: |
+          set -euo pipefail
+          notes_file="$(mktemp)"
+          trap 'rm -f "$notes_file"' EXIT
+          ./scripts/release-notes.sh "${GITHUB_REF_NAME}" > "$notes_file"
+          placeholder_text="请在 scripts/release-notes.sh 中补充此版本的功能、修复和兼容性说明。"
+          if ! grep -q "用户可见变化" "$notes_file"; then
+            printf 'release notes for %s must include user-visible changes\n' "${GITHUB_REF_NAME}" >&2
+            exit 1
+          fi
+          if grep -Fq "$placeholder_text" "$notes_file"; then
+            printf 'release notes for %s still contain placeholder text\n' "${GITHUB_REF_NAME}" >&2
+            exit 1
+          fi
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Run workspace tests
-        run: cargo test --workspace --locked
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: termui/frontend/package-lock.json
+
+      - name: Install QA dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ripgrep
+          cd termui/frontend
+          npm ci
+          npx playwright install --with-deps chromium
+
+      - name: Run release QA
+        run: bash scripts/qa.sh
 
   package:
     name: build release assets
@@ -204,6 +250,15 @@ jobs:
           tag="${GITHUB_REF_NAME}"
           notes_file="$(mktemp)"
           ./scripts/release-notes.sh "$tag" > "$notes_file"
+          placeholder_text="请在 scripts/release-notes.sh 中补充此版本的功能、修复和兼容性说明。"
+          if ! grep -q "用户可见变化" "$notes_file"; then
+            printf 'release notes for %s must include user-visible changes\n' "$tag" >&2
+            exit 1
+          fi
+          if grep -Fq "$placeholder_text" "$notes_file"; then
+            printf 'release notes for %s still contain placeholder text\n' "$tag" >&2
+            exit 1
+          fi
           cd dist/release
 
           files=(*.tar.gz checksums.txt install-*.sh)

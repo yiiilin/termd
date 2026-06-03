@@ -21,6 +21,7 @@ thiserror.workspace = true
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync"] }
 tokio-rustls = "0.26"
 tower = "0.5"
+tower-http = { version = "0.6", features = ["cors"] }
 tower-service = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

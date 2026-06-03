@@ -97,6 +97,7 @@ export function FileEditorDialog({
   const title = name?.trim() || basename(path) || t("editor.untitled");
   const disabled = loading || saving;
   const canEdit = !disabled && !readOnly;
+  const canClose = !saving;
   const isDirty = text !== initialText;
   const saveLabel = saving ? t("editor.savingButton") : t("editor.save");
   const statusText = useMemo(() => {
@@ -117,7 +118,15 @@ export function FileEditorDialog({
   }
 
   return (
-    <div className="file-editor-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
+    <div
+      className="file-editor-backdrop"
+      role="presentation"
+      onMouseDown={(event) => {
+        if (canClose && event.target === event.currentTarget) {
+          onClose();
+        }
+      }}
+    >
       <section
         className="file-editor-dialog"
         role="dialog"
@@ -141,7 +150,7 @@ export function FileEditorDialog({
             <span className="file-editor-status" aria-live="polite">
               {statusText}
             </span>
-            <button type="button" className="icon-button" aria-label={t("editor.close")} disabled={saving} onClick={onClose}>
+            <button type="button" className="icon-button" aria-label={t("editor.close")} disabled={!canClose} onClick={onClose}>
               <X size={16} aria-hidden="true" />
             </button>
           </div>
@@ -197,7 +206,7 @@ export function FileEditorDialog({
         </div>
 
         <footer className="file-editor-footer single-row">
-          <button type="button" disabled={saving} onClick={onClose}>
+          <button type="button" disabled={!canClose} onClick={onClose}>
             {t("editor.cancel")}
           </button>
           <button

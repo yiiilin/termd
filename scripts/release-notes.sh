@@ -11,7 +11,29 @@ version="${1:-}"
   exit 2
 }
 
+PLACEHOLDER_TEXT="请在 scripts/release-notes.sh 中补充此版本的功能、修复和兼容性说明。"
+
 case "$version" in
+  0.3.12)
+    cat <<'EOF'
+termd 0.3.12
+
+用户可见变化:
+- 修复 Web 终端新建 session 或 resize 后内容只在上方 24 行滚动、底部大片空白的问题；默认全屏 scroll region 会随 PTY 新高度扩展，direct 和公网 relay 下连续回车、`seq 1 120` 都已覆盖真实浏览器回归。
+- Web 终端在 snapshot 重放完成后会按当前聚焦浏览器的真实容器尺寸补一次本地 fit，但不会向 xterm 注入额外控制字节；TUI、alternate screen、saved cursor 和 snapshot/tail 边界不会被前端改写。
+- 旧 PWA/service worker 缓存会被主动清理并注销，避免浏览器继续运行旧 bundle 造成 WebSocket、attach 或终端渲染行为和 daemon/relay 版本不一致。
+- relay 新增 `--auth-token-file` 和显式 `--http-tunnel` 开关；部署模板、Caddy/openresty 反代说明和 release QA 覆盖 relay HTTP tunnel/代理配置，relay 默认仍不额外暴露 HTTP tunnel 面。
+- termctl、Web 和 daemon 共用更多协议 method/packet codec 定义；direct daemon E2EE、二进制 packet、文件/终端 stream 的兼容测试更完整，减少 CLI/Web/daemon 字符串协议漂移。
+- native 设备身份存储收敛为单条版本化 secure-storage 记录，并会迁移旧的分散 device id/public key/signing secret；损坏或缺字段时会给出明确 native error，而不是继续使用半残身份。
+- release 流程会校验前端 package/package-lock 版本、release notes 和完整 QA；打 tag 或 GitHub Release 时会复用同一份用户可见说明。
+
+兼容性:
+- supervisor 兼容版本未变化，仍为 `0.3.5`；从 0.3.11 更新到 0.3.12 不应终止或清空已有 live session supervisor。
+- packet protocol version 仍为 3，binary protocol version 仍为 2；建议 daemon、Web UI、termctl 和 termrelay 同步升级到 0.3.12。
+- relay 仍是 dumb pipe，不解密、不解析 E2EE 业务明文；HTTP tunnel 必须显式开启，未开启时公网 relay 只提供原有 WebSocket relay/Web UI 行为。
+- PWA 离线外壳缓存会被清理；升级后浏览器应从 daemon/relay 重新加载最新 Web UI，不再依赖旧缓存离线打开旧版本工作台。
+EOF
+    ;;
   0.3.11)
     cat <<'EOF'
 termd 0.3.11
@@ -348,7 +370,7 @@ EOF
 termd ${version}
 
 用户可见变化:
-- 请在 scripts/release-notes.sh 中补充此版本的功能、修复和兼容性说明。
+- ${PLACEHOLDER_TEXT}
 EOF
     ;;
 esac

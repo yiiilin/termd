@@ -11,14 +11,16 @@ usage() {
 用法：bash scripts/qa.sh
 
 从任意目录调用时，脚本会先切回仓库根目录，然后依次运行：
+- shell 脚本语法检查
 - Rust fmt 和 workspace 测试
 - 本地 pairing CLI E2E：termd pair -> termctl pair
 - termctl direct daemon E2E
 - termrelay E2E
 - relay runtime E2E：termd --relay -> termctl pair/new/list
-- termui Web typecheck/test/build/e2e/audit
+- termui Web npm ci/typecheck/test/build/e2e/audit
 - termui Native Flutter analyze/test，或在缺少 Flutter/Dart 时运行 fallback 静态检查
 
+默认每次都会在 termui/frontend 运行 npm ci；只有显式设置 TERMD_QA_SKIP_NPM_CI=1 才会跳过。
 脚本不会安装 Flutter/Dart/Playwright 浏览器，不会启动外部服务，也不会写 checklist。
 USAGE
 }
@@ -87,6 +89,9 @@ require_cmd cargo
 require_cmd npm
 require_cmd rg
 
+section "shell" "bash -n scripts/*.sh"
+bash -n scripts/*.sh
+
 port_is_open() {
   local port="$1"
   (exec 9<>"/dev/tcp/127.0.0.1/${port}") >/dev/null 2>&1
@@ -122,6 +127,36 @@ with socket.socket() as sock:
 PY
 }
 
+cargo_run_in_temp_dir() (
+  local temp_dir="$1"
+  shift
+
+  cd "$temp_dir"
+  cargo run --manifest-path "$REPO_ROOT/Cargo.toml" -q "$@"
+)
+
+debug_binary_path() {
+  local binary_name="$1"
+  local target_dir="${CARGO_TARGET_DIR:-${REPO_ROOT}/target}"
+  case "$target_dir" in
+    /*) ;;
+    *) target_dir="${REPO_ROOT}/${target_dir}" ;;
+  esac
+  printf '%s/debug/%s\n' "$target_dir" "$binary_name"
+}
+
+start_process_in_dir() {
+  local work_dir="$1"
+  local log_path="$2"
+  shift 2
+
+  (
+    cd "$work_dir"
+    exec "$@"
+  ) >"$log_path" 2>&1 &
+  printf '%s\n' "$!"
+}
+
 run_pairing_cli_e2e() (
   set -euo pipefail
 
@@ -141,8 +176,9 @@ run_pairing_cli_e2e() (
   }
   trap cleanup EXIT
 
-  cargo run -q -p termd -- --listen "127.0.0.1:${daemon_port}" >"$temp_dir/termd.log" 2>&1 &
-  daemon_pid="$!"
+  # daemon 默认使用当前工作目录下的 daemon-state.json；QA 必须隔离到临时目录，
+  # 避免恢复开发环境或上一次失败留下的持久 session。
+  daemon_pid="$(start_process_in_dir "$temp_dir" "$temp_dir/termd.log" "$(debug_binary_path termd)" --listen "127.0.0.1:${daemon_port}")"
 
   for _ in $(seq 1 200); do
     if ! kill -0 "$daemon_pid" 2>/dev/null; then
@@ -163,7 +199,7 @@ run_pairing_cli_e2e() (
   fi
 
   if ! pair_stdout="$(
-    cargo run -q -p termd -- pair --qr --url "$daemon_url" 2>"$temp_dir/termd-pair.err"
+    cargo_run_in_temp_dir "$temp_dir" -p termd -- pair --qr --url "$daemon_url" 2>"$temp_dir/termd-pair.err"
   )"; then
     printf '[termctl] termd pair 签发 invite 失败：\n' >&2
     cat "$temp_dir/termd-pair.err" >&2
@@ -234,15 +270,14 @@ run_relay_runtime_e2e() (
     exit 1
   fi
 
-  cargo run -q -p termrelay -- --listen "$relay_addr" >"$temp_dir/termrelay.log" 2>&1 &
-  relay_pid="$!"
+  relay_pid="$(start_process_in_dir "$temp_dir" "$temp_dir/termrelay.log" "$(debug_binary_path termrelay)" --listen "$relay_addr")"
   if ! wait_for_port "$relay_port" "termrelay"; then
     cat "$temp_dir/termrelay.log" >&2
     exit 1
   fi
 
-  cargo run -q -p termd -- --listen "127.0.0.1:${daemon_port}" --relay "ws://${relay_addr}" >"$temp_dir/termd-relay.log" 2>&1 &
-  daemon_pid="$!"
+  # relay runtime E2E 同样需要隔离 daemon 状态，避免旧 session 恢复影响本轮监听启动。
+  daemon_pid="$(start_process_in_dir "$temp_dir" "$temp_dir/termd-relay.log" "$(debug_binary_path termd)" --listen "127.0.0.1:${daemon_port}" --relay "ws://${relay_addr}")"
 
   for _ in $(seq 1 200); do
     if ! kill -0 "$daemon_pid" 2>/dev/null; then
@@ -320,8 +355,11 @@ PY
 section "rust" "cargo fmt --all -- --check"
 cargo fmt --all -- --check
 
-section "rust" "cargo test --workspace"
-cargo test --workspace
+section "rust" "cargo test --workspace --locked"
+cargo test --workspace --locked
+
+section "rust" "cargo build --locked -p termd -p termrelay"
+cargo build --locked -p termd -p termrelay
 
 section "installers" "scripts/test-installers.sh"
 bash scripts/test-installers.sh
@@ -338,11 +376,11 @@ cargo test -p termrelay --test relay_e2e
 section "termrelay" "runtime relay E2E"
 run_relay_runtime_e2e
 
-section "termui-web" "安装前端依赖检查"
-if [[ ! -d termui/frontend/node_modules ]]; then
-  (cd termui/frontend && npm ci)
+section "termui-web" "npm ci"
+if [[ "${TERMD_QA_SKIP_NPM_CI:-}" == "1" ]]; then
+  printf '[termui-web] TERMD_QA_SKIP_NPM_CI=1，显式跳过 npm ci。\n'
 else
-  printf '[termui-web] node_modules 已存在，跳过 npm ci。\n'
+  (cd termui/frontend && npm ci)
 fi
 
 section "termui-web" "npm run typecheck"

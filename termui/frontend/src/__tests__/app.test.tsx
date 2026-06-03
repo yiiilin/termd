@@ -9,6 +9,7 @@ import App, {
   connectPairingClient,
   DAEMON_STATUS_POLL_INTERVAL_MS,
   defaultWsUrlFromPage,
+  knownServerWsUrlCandidates,
   latencyLevelClass,
   networkRateFromSamples,
   pairingWsUrlCandidates,
@@ -195,6 +196,40 @@ interface HttpUploadMockRecord {
   session_id: UUID;
   path: string;
   bytes: Uint8Array;
+}
+
+interface TestDiagnosticEvent {
+  name: string;
+  fields?: Record<string, unknown>;
+}
+
+function testDiagnostics(): { __TERMD_TRACE__?: boolean; __TERMD_DIAG_EVENTS__?: TestDiagnosticEvent[] } {
+  return globalThis as { __TERMD_TRACE__?: boolean; __TERMD_DIAG_EVENTS__?: TestDiagnosticEvent[] };
+}
+
+function enableTermdDiagnosticsForTest(): void {
+  const scope = testDiagnostics();
+  scope.__TERMD_TRACE__ = true;
+  scope.__TERMD_DIAG_EVENTS__ = [];
+}
+
+function clearTermdDiagnosticsForTest(): void {
+  const scope = testDiagnostics();
+  delete scope.__TERMD_TRACE__;
+  delete scope.__TERMD_DIAG_EVENTS__;
+}
+
+async function waitForSidecarTimeoutIgnored(kind: "resize" | "cursor", sessionId: UUID): Promise<void> {
+  await waitFor(() => {
+    expect(testDiagnostics().__TERMD_DIAG_EVENTS__).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          name: "app_terminal_sidecar_timeout_ignored",
+          fields: expect.objectContaining({ kind, sessionId }),
+        }),
+      ]),
+    );
+  }, { timeout: APP_CONNECTION_TIMEOUT_MS + 1500 });
 }
 
 function installHttpUploadOnceMock(
@@ -686,6 +721,49 @@ describe("termui web 工作台", () => {
     ).toBe("99%");
   });
 
+  it("文件 path 输入编辑时不会被 cwd polling 覆盖", async () => {
+    const user = userEvent.setup();
+    const onGoToPath = vi.fn();
+    const panelProps = {
+      attachedSessionId: DEFAULT_SESSION_ID,
+      activeTab: "files" as const,
+      files: { session_id: DEFAULT_SESSION_ID, path: "/home/me", entries: [] },
+      loading: false,
+      gitLoading: false,
+      followTerminalCwd: true,
+      onTabChange: vi.fn(),
+      onOpenDirectory: vi.fn(),
+      onOpenFile: vi.fn(),
+      onOpenGitFile: vi.fn(),
+      onOpenGitDiff: vi.fn(),
+      onGitAction: vi.fn(),
+      onGoToPath,
+      onRefresh: vi.fn(),
+      onRefreshGit: vi.fn(),
+      onFollowTerminalCwdChange: vi.fn(),
+      onUpload: vi.fn(),
+      onDownload: vi.fn(),
+      onDelete: vi.fn(),
+      onHide: vi.fn(),
+    };
+    const { rerender } = render(<SessionFilesPanel {...panelProps} />);
+
+    const pathInput = screen.getByLabelText("Current directory");
+    await user.clear(pathInput);
+    await user.type(pathInput, "/home/me/project");
+
+    rerender(
+      <SessionFilesPanel
+        {...panelProps}
+        files={{ session_id: DEFAULT_SESSION_ID, path: "/tmp/work", entries: [] }}
+      />,
+    );
+
+    expect(screen.getByLabelText("Current directory")).toHaveValue("/home/me/project");
+    await user.click(screen.getByRole("button", { name: "Go" }));
+    expect(onGoToPath).toHaveBeenCalledWith("/home/me/project");
+  });
+
   beforeEach(async () => {
     // app 集成测试运行在 jsdom 中；这里固定使用 fallback 编辑器，Monaco 的生产加载由构建验证覆盖。
     (globalThis as { __TERMD_TEST_DISABLE_MONACO__?: boolean }).__TERMD_TEST_DISABLE_MONACO__ = true;
@@ -727,6 +805,7 @@ describe("termui web 工作台", () => {
   afterEach(async () => {
     restoreDocumentVisibility();
     resetFileEditorDialogMonacoCacheForTests();
+    clearTermdDiagnosticsForTest();
     delete (globalThis as { __TERMD_TEST_DISABLE_MONACO__?: boolean }).__TERMD_TEST_DISABLE_MONACO__;
     await daemon.stop();
   });
@@ -2830,6 +2909,51 @@ describe("termui web 工作台", () => {
     expect(sawConnectionAlert).toBe(false);
   });
 
+  it("attach WebSocket error 时保留终端并静默重连当前 session", async () => {
+    type WsEmitter = WebSocket & { emit: (event: "error", error: Error) => boolean };
+    const OriginalWebSocket = globalThis.WebSocket;
+    const sockets: WsEmitter[] = [];
+    const CapturingWebSocket = class extends (OriginalWebSocket as unknown as { new(url: string, protocols?: string | string[]): WebSocket }) {
+      constructor(url: string, protocols?: string | string[]) {
+        super(url, protocols);
+        sockets.push(this as unknown as WsEmitter);
+      }
+    } as unknown as typeof WebSocket;
+    (globalThis as unknown as { WebSocket: typeof WebSocket }).WebSocket = CapturingWebSocket;
+    const user = userEvent.setup();
+    try {
+      render(<App />);
+
+      await pairWithInvite(user, daemon);
+      await waitForWorkspaceSession();
+      await screen.findByText(/termd-e2e-ready/);
+      await waitFor(() => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID]));
+
+      let sawConnectionAlert = false;
+      const observer = new MutationObserver(() => {
+        if (document.querySelector('[role="alert"][aria-label="Connection error"]')) {
+          sawConnectionAlert = true;
+        }
+      });
+      observer.observe(document.body, { childList: true, subtree: true });
+      // 中文注释：直接触发客户端 WebSocket error，覆盖 close/drop 之外的 transport error 重连路径。
+      sockets.at(-1)?.emit("error", new Error("mock transport error"));
+      await waitFor(
+        () =>
+          expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID, DEFAULT_SESSION_ID]),
+        { timeout: 2200 },
+      );
+
+      expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
+      expect(screen.getByTestId("terminal-pane")).toBeInTheDocument();
+      await screen.findByText(/termd-e2e-ready/);
+      observer.disconnect();
+      expect(sawConnectionAlert).toBe(false);
+    } finally {
+      (globalThis as unknown as { WebSocket: typeof WebSocket }).WebSocket = OriginalWebSocket;
+    }
+  });
+
   it("connection closed 后会静默按短延迟重试当前 session", async () => {
     setViewportWidth(390);
     const user = userEvent.setup();
@@ -3407,6 +3531,77 @@ describe("termui web 工作台", () => {
     expect(daemon.sessionFileWrites.some((write) => write.path === "/tmp/notes.txt")).toBe(false);
   });
 
+  it("旧文件读取迟到后不会复活或覆盖当前编辑器", async () => {
+    const user = userEvent.setup();
+    const sessionId = "00000000-0000-0000-0000-000000000423";
+    const alphaPath = "/home/me/project/alpha.txt";
+    const betaPath = "/home/me/project/beta.txt";
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [
+        {
+          session_id: sessionId,
+          state: "running",
+          size: { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 },
+        },
+      ],
+      sessionFiles: {
+        [sessionId]: {
+          session_id: sessionId,
+          path: "/home/me/project",
+          entries: [
+            { name: "alpha.txt", path: alphaPath, kind: "file", size_bytes: 6, modified_at_ms: null },
+            { name: "beta.txt", path: betaPath, kind: "file", size_bytes: 5, modified_at_ms: null },
+          ],
+        },
+      },
+      sessionFileReads: {
+        [alphaPath]: {
+          session_id: sessionId,
+          path: alphaPath,
+          data_base64: Buffer.from("alpha\n", "utf8").toString("base64"),
+          size_bytes: 6,
+          modified_at_ms: null,
+        },
+        [betaPath]: {
+          session_id: sessionId,
+          path: betaPath,
+          data_base64: Buffer.from("beta\n", "utf8").toString("base64"),
+          size_bytes: 5,
+          modified_at_ms: null,
+        },
+      },
+      sessionFileReadDelayMsByPath: {
+        [alphaPath]: 120,
+      },
+    });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await clickSessionCard(user);
+
+    const panel = await screen.findByLabelText("session files");
+    await within(panel).findByText("alpha.txt");
+    await within(panel).findByText("beta.txt");
+
+    await user.click(within(panel).getByRole("button", { name: "Edit alpha.txt" }));
+    await screen.findByRole("dialog", { name: "alpha.txt" });
+    await waitFor(() => expect(daemon.sessionFileReadRequests).toContainEqual({ session_id: sessionId, path: alphaPath }));
+    await user.click(screen.getByRole("button", { name: "Close editor" }));
+
+    await user.click(within(panel).getByRole("button", { name: "Edit beta.txt" }));
+    const betaEditor = await screen.findByRole("dialog", { name: "beta.txt" });
+    await waitFor(() => expect(within(betaEditor).getByLabelText("File text")).toHaveValue("beta\n"));
+    await waitFor(() => expect(daemon.sessionFileReadRequests).toContainEqual({ session_id: sessionId, path: betaPath }));
+
+    await new Promise((resolve) => window.setTimeout(resolve, 180));
+    expect(screen.getByRole("dialog", { name: "beta.txt" })).toBeInTheDocument();
+    expect(screen.getByLabelText("File text")).toHaveValue("beta\n");
+    expect(screen.queryByText("alpha\n")).toBeNull();
+  });
+
   it("上传进度在切换 session 后仍保留", async () => {
     const user = userEvent.setup();
     const alphaSession = {
@@ -3459,9 +3654,12 @@ describe("termui web 工作台", () => {
 
       await clickSessionCard(user, "beta");
       await waitFor(() => expect(daemon.attachedSessions).toContain(betaSession.session_id));
-      // 中文注释：文件传输使用独立操作连接；切换当前 terminal attach
-      // 不能把仍在进行的上传进度从右侧文件面板清掉。
-      expect(screen.getByRole("status", { name: "Uploading notes.txt" })).toBeInTheDocument();
+      // 中文注释：文件传输使用独立操作连接继续完成，但右侧文件面板只展示
+      // 当前 attached session 的进度，避免旧 session 状态污染当前面板。
+      expect(screen.queryByRole("status", { name: "Uploading notes.txt" })).not.toBeInTheDocument();
+
+      await clickSessionCard(user, "alpha");
+      expect(await screen.findByRole("status", { name: "Uploading notes.txt" })).toBeInTheDocument();
 
       uploadMock.releaseInit();
       await waitFor(() => {
@@ -3561,9 +3759,12 @@ describe("termui web 工作台", () => {
 
       await clickSessionCard(user, "beta");
       await waitFor(() => expect(daemon.attachedSessions).toContain(betaSession.session_id));
-      // 中文注释：下载 close 尚未提交时，切换 session 只能重建 terminal attach，
-      // 不能把当前下载进度误认为旧 session UI 状态而清除。
-      expect(screen.getByRole("status", { name: "Downloading alpha.txt" })).toBeInTheDocument();
+      // 中文注释：下载 close 尚未提交时，下载连接继续完成；但当前 beta
+      // 文件面板不展示 alpha 的进度，避免跨 session UI 漂移。
+      expect(screen.queryByRole("status", { name: "Downloading alpha.txt" })).not.toBeInTheDocument();
+
+      await clickSessionCard(user, "alpha");
+      expect(await screen.findByRole("status", { name: "Downloading alpha.txt" })).toBeInTheDocument();
 
       resolveClose?.();
       await waitFor(() => {
@@ -4602,6 +4803,96 @@ describe("termui web 工作台", () => {
     expect(panel.querySelector(".git-graph-commit")).toBeNull();
   });
 
+  it("旧 Git diff 迟到后不会覆盖当前 diff 弹窗", async () => {
+    const user = userEvent.setup();
+    const sessionId = "00000000-0000-0000-0000-000000000424";
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [
+        {
+          session_id: sessionId,
+          state: "running",
+          size: { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 },
+        },
+      ],
+      sessionFiles: {
+        [sessionId]: {
+          session_id: sessionId,
+          path: "/home/me/project",
+          entries: [],
+        },
+      },
+      sessionGit: {
+        [sessionId]: {
+          session_id: sessionId,
+          cwd: "/home/me/project",
+          repository_root: "/home/me/project",
+          worktrees: [
+            {
+              path: "/home/me/project",
+              branch: "main",
+              head: "a1b2c3d",
+              is_current: true,
+              staged: [{ path: "src/lib.rs", status: "M " }],
+              unstaged: [{ path: "README.md", status: " M" }],
+            },
+          ],
+          graph: ["* a1b2c3d main commit"],
+          error: null,
+        },
+      },
+      sessionGitDiffDelayMsByPath: {
+        "README.md": 120,
+      },
+    });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await clickSessionCard(user);
+
+    const panel = await screen.findByLabelText("session files");
+    await user.click(within(panel).getByRole("tab", { name: "Git" }));
+    await within(panel).findByText("README.md");
+    await within(panel).findByText("src/lib.rs");
+    const changesTree = await within(panel).findByRole("tree", { name: "Git changes tree" });
+    const readmeTreeItem = within(changesTree).getByRole("treeitem", { name: "M README.md" });
+    const libTreeItem = within(changesTree).getByRole("treeitem", { name: "M src/lib.rs" });
+
+    await user.click(within(readmeTreeItem).getByRole("button", { name: "Diff README.md" }));
+    await screen.findByRole("dialog", { name: "README.md" });
+    await waitFor(() =>
+      expect(daemon.sessionGitDiffRequests).toContainEqual({
+        session_id: sessionId,
+        worktree_path: "/home/me/project",
+        file_path: "README.md",
+        staged: false,
+      }),
+    );
+    await user.click(screen.getByRole("button", { name: "Close editor" }));
+
+    await user.click(within(libTreeItem).getByRole("button", { name: "Diff src/lib.rs" }));
+    const libDiff = await screen.findByRole("dialog", { name: "lib.rs" });
+    await waitFor(() =>
+      expect((within(libDiff).getByLabelText("File text") as HTMLTextAreaElement).value).toContain("mock staged diff for src/lib.rs"),
+    );
+    await waitFor(() =>
+      expect(daemon.sessionGitDiffRequests).toContainEqual({
+        session_id: sessionId,
+        worktree_path: "/home/me/project",
+        file_path: "src/lib.rs",
+        staged: true,
+      }),
+    );
+
+    await new Promise((resolve) => window.setTimeout(resolve, 180));
+    const currentDiff = screen.getByRole("dialog", { name: "lib.rs" });
+    const currentDiffText = (within(currentDiff).getByLabelText("File text") as HTMLTextAreaElement).value;
+    expect(currentDiffText).toContain("mock staged diff for src/lib.rs");
+    expect(currentDiffText).not.toContain("mock unstaged diff for README.md");
+  });
+
   it("文件 panel 默认每秒跟随终端 cwd，并可关闭跟随", async () => {
     const user = userEvent.setup();
     const sessionId = "00000000-0000-0000-0000-000000000414";
@@ -5575,6 +5866,97 @@ describe("termui web 工作台", () => {
     expect(screen.queryByText("80x24")).toBeNull();
   });
 
+  it("持续输出场景下 resize ack 超时不卸载已 attach 终端", async () => {
+    const user = userEvent.setup();
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      attachOutput: "resize-timeout-ready\n",
+      resizeAckDelayMs: APP_CONNECTION_TIMEOUT_MS + 700,
+      sessions: [
+        {
+          session_id: "00000000-0000-0000-0000-000000000408",
+          state: "running",
+          size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+        },
+      ],
+    });
+    enableTermdDiagnosticsForTest();
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await screen.findByText(/resize-timeout-ready/);
+    await clickSessionCard(user);
+
+    const terminalInput = document.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
+    expect(terminalInput).not.toBeNull();
+    terminalInput!.focus();
+    (globalThis as { __TERMD_TEST_FIT_DIMENSIONS__?: { rows: number; cols: number } }).__TERMD_TEST_FIT_DIMENSIONS__ = {
+      rows: 31,
+      cols: 101,
+    };
+    fireEvent(window, new Event("resize"));
+
+    await waitFor(() =>
+      expect(daemon.sessionResizes).toContainEqual({
+        session_id: "00000000-0000-0000-0000-000000000408",
+        size: { rows: 31, cols: 101, pixel_width: expect.any(Number), pixel_height: expect.any(Number) },
+      }),
+    );
+    await waitForSidecarTimeoutIgnored("resize", "00000000-0000-0000-0000-000000000408");
+
+    // 中文注释：resize/cursor 这类终端辅助 RPC 的 ack 可能被持续 stdout 压到超时；
+    // 超时只能丢弃本次辅助 ack，不能把 workspace 置为全局错误导致 xterm 卸载。
+    expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
+    expect(document.body.textContent).not.toContain("response_timeout");
+    expect(screen.getByText(/resize-timeout-ready/)).toBeInTheDocument();
+    expect(document.querySelector(".xterm-helper-textarea")).not.toBeNull();
+  }, 15_000);
+
+  it("持续输出场景下 cursor ack 超时不卸载已 attach 终端", async () => {
+    const user = userEvent.setup();
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      attachOutput: "cursor-timeout-ready\n",
+      cursorAckDelayMs: APP_CONNECTION_TIMEOUT_MS + 700,
+      sessions: [
+        {
+          session_id: "00000000-0000-0000-0000-000000000409",
+          state: "running",
+          size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+        },
+      ],
+    });
+    enableTermdDiagnosticsForTest();
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await screen.findByText(/cursor-timeout-ready/);
+    await clickSessionCard(user);
+
+    const terminalInput = document.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
+    expect(terminalInput).not.toBeNull();
+    terminalInput!.focus();
+    await waitFor(() =>
+      expect(daemon.sessionCursorUpdates).toContainEqual({
+        session_id: "00000000-0000-0000-0000-000000000409",
+        row: expect.any(Number),
+        col: expect.any(Number),
+        focused: true,
+      }),
+    );
+    await waitForSidecarTimeoutIgnored("cursor", "00000000-0000-0000-0000-000000000409");
+
+    // 中文注释：cursor ack 超时只表示协作元数据迟到，不能把 terminal WebSocket 判死。
+    expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
+    expect(document.body.textContent).not.toContain("response_timeout");
+    expect(screen.getByText(/cursor-timeout-ready/)).toBeInTheDocument();
+    expect(document.querySelector(".xterm-helper-textarea")).not.toBeNull();
+  }, 15_000);
+
   it("浏览器窗口 resize 引发的短暂 focusout/focusin 不会上报聚焦抖动", async () => {
     const user = userEvent.setup();
     await daemon.stop();
@@ -6018,6 +6400,27 @@ describe("termui web 工作台", () => {
     ]);
     expect(pairingWsUrlCandidates("wss://relay.example/termd/ws/00000000-0000-0000-0000-000000000123/client", serverId, relayPage)).toEqual([
       "wss://relay.example/termd/ws",
+    ]);
+  });
+
+  it("已配对 daemon 从 relay 页面打开时优先使用当前页面 /ws，再回退到旧保存地址", () => {
+    const serverId = "00000000-0000-0000-0000-000000000123";
+    const relayPage = {
+      protocol: "https:",
+      host: "termd.yiln.de",
+      hostname: "termd.yiln.de",
+      pathname: "/",
+    };
+
+    expect(
+      knownServerWsUrlCandidates(
+        "wss://old-relay.example/ws/00000000-0000-0000-0000-000000000123/client?relay_token=abc",
+        serverId,
+        relayPage,
+      ),
+    ).toEqual([
+      "wss://termd.yiln.de/ws?relay_token=abc",
+      "wss://old-relay.example/ws?relay_token=abc",
     ]);
   });
 

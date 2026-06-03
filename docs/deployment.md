@@ -24,7 +24,7 @@ Reverse Proxy (TLS termination + access log control)
 | 组件 | 推荐绑定 | 对外暴露 | 说明 |
 | --- | --- | --- | --- |
 | `termd` | `127.0.0.1:8765` | 不直接暴露 | 提供 `/healthz`、`/ws`、`/local/pairing-token` |
-| `termrelay` | `127.0.0.1:8080` | 通过反向代理暴露到 443 | 提供 `/healthz`、`/ws`；首个 WebSocket frame 必须是 `route_hello` |
+| `termrelay` | `127.0.0.1:8080` | 通过反向代理暴露到 443 | 提供 `/healthz`、`/ws`；首个 WebSocket frame 必须是 `route_hello`；HTTP 文件 tunnel 默认关闭 |
 | 反向代理 | `0.0.0.0:443` | 是 | 负责 TLS 终止、WebSocket upgrade、日志脱敏 |
 
 公网 client 和 daemon outbound connector 使用同一个 WebSocket 入口：
@@ -87,8 +87,20 @@ server {
 
 - `termd /local/pairing-token` 只适合 loopback 或私网管理面，不要通过公网反代公开。
 - `termctl pair` 和 Web MVP 只消费 token，不负责签发 token。
-- 如果公网 relay 开启了 `--auth-token`，浏览器和 `termctl` 都需要把 `relay_token` 带在 relay URL query string 中。
+- 如果公网 relay 配置了 transport token（生产建议通过 `--auth-token-file` 注入），浏览器和 `termctl` 都需要把 `relay_token` 带在 relay URL query string 中。
 - 由于浏览器 WebSocket 不能自由设置自定义 header，`relay_token` 的 query 形式是当前实现的 transport 约束，不应把它当作用户认证方案。
+
+## HTTP 文件 tunnel 兼容开关
+
+`termrelay` 默认只挂载 `/healthz`、`/ws` 和可选 Web fallback。`/api/files/upload/init`、`/api/files/upload`、`/api/files/upload/abort`、`/api/files/download` 默认返回非成功状态，并提示需要 `--http-tunnel`。
+
+只有需要旧版浏览器文件上传/下载经 relay 中转时，才显式启用：
+
+```bash
+cargo run -p termrelay -- --listen 127.0.0.1:8080 --auth-token-file /etc/termd/termrelay_auth_token --http-tunnel
+```
+
+启用后 relay 仍只是 HTTP/WebSocket dumb pipe：它只把 HTTP request/response body 编码为 opaque tunnel frame 转发给 daemon data pipe，不解密、不读取、不判断 `auth`、`session_data`、`control_request` 等 E2EE 内层业务载荷。
 
 ## Health check
 
@@ -99,9 +111,16 @@ server {
 ## 最小部署命令
 
 ```bash
-cargo run -p termrelay -- --listen 127.0.0.1:8080 --auth-token "$RELAY_TOKEN"
+sudo install -d -m 0755 /etc/termd
+RELAY_TOKEN="$(openssl rand -hex 32)"
+printf '%s\n' "$RELAY_TOKEN" | sudo tee /etc/termd/termrelay_auth_token >/dev/null
+sudo chown "$(id -u):$(id -g)" /etc/termd/termrelay_auth_token
+sudo chmod 400 /etc/termd/termrelay_auth_token
+cargo run -p termrelay -- --listen 127.0.0.1:8080 --auth-token-file /etc/termd/termrelay_auth_token
 cargo run -p termd -- --relay wss://relay.example:443 --relay-auth-token "$RELAY_TOKEN"
 ```
+
+公网部署不要把 relay token 放进 `termrelay --auth-token ...` 的 argv；内联 `--auth-token` 只保留给本机 smoke/dev 或兼容旧脚本。
 
 生成一份可在 daemon Web 和 relay Web 里直接使用的单行邀请码。邀请码只包含 daemon 标识和短期 token；Web 默认使用当前页面的连接地址，普通使用者不需要查看或拼接 `server_id`：
 
@@ -175,6 +194,8 @@ wget -qO- https://github.com/OWNER/REPO/releases/latest/download/install-termrel
 
 如果需要嵌入 Web UI，把 `/etc/termd/termrelay.env` 里的 `TERMRELAY_WEB_ENABLED=1` 打开即可；脚本会自动追加 `--web`。
 
+如果需要通过 relay 使用旧版 HTTP 文件上传/下载路径，还需要给 `termrelay` 额外传入 `--http-tunnel`。默认关闭时，WebSocket 终端、pairing 和 session 控制流仍通过 `/ws` 正常工作。
+
 ## GitHub Release 与 GHCR
 
 - tag 采用纯版本号，例如 `0.1.2`。
@@ -208,7 +229,34 @@ wget -qO- https://github.com/OWNER/REPO/releases/latest/download/install-termrel
 ```bash
 cd deploy/termrelay
 cp .env.example .env
+```
+
+`.env` 里至少要填写 `TERMRELAY_IMAGE`、`TERMRELAY_DOMAIN` 和 `TERMRELAY_AUTH_TOKEN_FILE`。这个 compose 文件面向公网 Caddy 部署，启动时会要求 secret 文件路径非空；compose 通过 Caddy 终止 TLS，再反向代理到 `termrelay:8080`。
+
+先生成只包含 relay token 的 secret 文件，再把 `.env` 里的 `TERMRELAY_AUTH_TOKEN_FILE` 指向它，最后启动 compose：
+
+```bash
+sudo install -d -m 0755 /etc/termd
+openssl rand -hex 32 | sudo tee /etc/termd/termrelay_auth_token >/dev/null
+sudo chown 10001:10001 /etc/termd/termrelay_auth_token
+sudo chmod 400 /etc/termd/termrelay_auth_token
 docker compose up -d
 ```
 
-`.env` 里至少要填写 `TERMRELAY_IMAGE`、`TERMRELAY_DOMAIN`，可选填写 `TERMRELAY_AUTH_TOKEN`。compose 通过 Caddy 终止 TLS，再反向代理到 `termrelay:8080`。
+compose 会把该文件作为 Docker secret 挂载到 `/run/secrets/termrelay_auth_token`，`termrelay` 通过 `--auth-token-file` 读取；release 镜像以 UID/GID `10001` 运行，因此 host 上的 secret 文件需要对 `10001:10001` 可读，同时不能 world-readable。末尾换行会被忽略，空文件或全空白内容会导致启动失败。不要把真实 token 写进 `.env` 或 compose command，这样 `docker compose config` 和 Docker inspect metadata 只会包含 secret 文件路径，不会展开 token 明文。secret 文件不要放在仓库目录内，也不要提交到 git。
+
+该 compose 默认不传 `--http-tunnel`。如果必须保留旧版文件 HTTP tunnel，在 `termrelay.command` 里追加 `--http-tunnel`，同时确认反向代理只暴露预期路径。
+
+随 compose 提供的 Caddyfile 会在全局日志层把 `request.uri` 里的 `relay_token` 替换成 `REDACTED`，用于覆盖 upstream error、`reverse_proxy` 502 等错误日志路径。如果改用自定义 Caddyfile 或额外启用 access log，也必须同时对 error log 和 access log 做同等脱敏，避免 `/ws?relay_token=...` 进入 stdout、文件日志或集中日志系统。
+
+仅本机开发或一次性 smoke 才可以不启用 relay token，并且不要复用上面的公网 Caddy compose。可以直接在 loopback 上运行：
+
+```bash
+cargo run -p termrelay -- --listen 127.0.0.1:8080
+```
+
+如果使用容器做本机无认证检查，也应只绑定到 loopback：
+
+```bash
+docker run --rm -p 127.0.0.1:8080:8080 ghcr.io/OWNER/termrelay:0.3.11 --listen 0.0.0.0:8080
+```

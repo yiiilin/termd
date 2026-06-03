@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { DirectClient, ProtocolClientError } from "../protocol/direct-client";
+import { DirectClient, ProtocolClientError, __directClientTestInternals } from "../protocol/direct-client";
 import {
   decodeEd25519PublicKey,
   generateDeviceIdentity,
@@ -46,6 +46,51 @@ describe("DirectClient", () => {
       timeoutMs,
       expectedDaemonPublicKey: daemon.daemonPublicKey,
     });
+  }
+
+  async function pairedDevice(deviceId: string) {
+    const device = await generateDeviceIdentity(deviceId);
+    const pairClient = await connectDevice(device.device_id);
+    const accepted = await pairClient.pair("secret-token", device.device_public_key);
+    pairClient.close();
+    return {
+      device,
+      server: {
+        server_id: accepted.server_id,
+        daemon_public_key: accepted.daemon_public_key,
+        url: daemon.url,
+        paired_at_ms: 1710000000000,
+      },
+    };
+  }
+
+  async function authenticatedClient(deviceId: string): Promise<{ client: DirectClient; device: Awaited<ReturnType<typeof generateDeviceIdentity>>; server: Awaited<ReturnType<typeof pairedDevice>>["server"] }> {
+    const { device, server } = await pairedDevice(deviceId);
+    const client = await connectDevice(device.device_id);
+    await client.authenticate(device, server);
+    return { client, device, server };
+  }
+
+  function settleWithin<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+    return Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        setTimeout(() => reject(new Error(`${label} timed out`)), timeoutMs);
+      }),
+    ]);
+  }
+
+  function waitUntil(predicate: () => boolean, label: string, timeoutMs = 500): Promise<void> {
+    return settleWithin(new Promise<void>((resolve) => {
+      const tick = () => {
+        if (predicate()) {
+          resolve();
+          return;
+        }
+        setTimeout(tick, 5);
+      };
+      tick();
+    }), timeoutMs, label);
   }
 
   function httpE2eeSessionFromHeaders(headers: Headers): E2eeSession {
@@ -229,6 +274,71 @@ describe("DirectClient", () => {
     expect(daemon.outerWireText()).not.toContain("pair_request");
   });
 
+  it("pairing 成功后同一连接可以继续执行 authenticated session RPC", async () => {
+    const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000333");
+    const client = await connectDevice(device.device_id);
+
+    await client.pair("secret-token", device.device_public_key);
+    const list = await client.listSessions();
+    const attached = await client.attachSession(list.sessions[0].session_id);
+    client.close();
+
+    expect(list.sessions).toHaveLength(1);
+    expect(attached.session_id).toBe(list.sessions[0].session_id);
+  });
+
+  it("wrong phase calls fail locally without sending protocol requests", async () => {
+    const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000330");
+    const unauthenticated = await connectDevice(device.device_id);
+    const originalFetch = globalThis.fetch;
+    let fetchCalls = 0;
+    (globalThis as unknown as { fetch: typeof fetch }).fetch = (async () => {
+      fetchCalls += 1;
+      return new Response(null, { status: 500 });
+    }) as typeof fetch;
+
+    try {
+      await expect(unauthenticated.listSessions()).rejects.toMatchObject({ code: "invalid_state" });
+      await expect(unauthenticated.attachSession(missingSessionId)).rejects.toMatchObject({ code: "invalid_state" });
+      await expect(unauthenticated.request("client.hello", { name: "too early" })).rejects.toMatchObject({ code: "invalid_state" });
+      await expect(unauthenticated.uploadSessionFile(missingSessionId, "/tmp/bad.bin", new File([new Uint8Array([1])], "bad.bin"))).rejects.toMatchObject({ code: "invalid_state" });
+      await expect(unauthenticated.downloadSessionFile(missingSessionId, "/tmp/bad.bin")).rejects.toMatchObject({ code: "invalid_state" });
+      expect(daemon.receivedPackets.some((packet) => packet.method === "session.list")).toBe(false);
+      expect(daemon.receivedPackets.some((packet) => packet.method === "terminal.attach")).toBe(false);
+      expect(daemon.receivedPackets.some((packet) => packet.method === "client.hello")).toBe(false);
+      expect(daemon.receivedPackets.some((packet) => packet.method === "session.file_upload")).toBe(false);
+      expect(daemon.receivedPackets.some((packet) => packet.method === "session.file_download")).toBe(false);
+      expect(fetchCalls).toBe(0);
+      unauthenticated.close();
+
+      const { client, device: paired, server } = await authenticatedClient("00000000-0000-0000-0000-000000000331");
+      await expect(client.pair("secret-token", paired.device_public_key)).rejects.toMatchObject({ code: "invalid_state" });
+      await expect(client.authenticate(paired, server)).rejects.toMatchObject({ code: "invalid_state" });
+      await expect(client.sendSessionData(missingSessionId, new TextEncoder().encode("input"))).rejects.toMatchObject({ code: "invalid_state" });
+      await expect(client.sendSessionCursor(missingSessionId, { row: 1, col: 2, focused: true })).rejects.toMatchObject({ code: "invalid_state" });
+      await expect(client.resizeSession(missingSessionId, { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })).rejects.toMatchObject({ code: "invalid_state" });
+      client.close();
+      await expect(client.uploadSessionFile(missingSessionId, "/tmp/closed.bin", new File([new Uint8Array([1])], "closed.bin"))).rejects.toMatchObject({ code: "connection_closed" });
+      await expect(client.downloadSessionFile(missingSessionId, "/tmp/closed.bin")).rejects.toMatchObject({ code: "connection_closed" });
+      expect(fetchCalls).toBe(0);
+    } finally {
+      (globalThis as unknown as { fetch: typeof fetch }).fetch = originalFetch;
+      unauthenticated.close();
+    }
+  });
+
+  it("unowned packet error reaches the UI-facing error queue", async () => {
+    const { client } = await authenticatedClient("00000000-0000-0000-0000-000000000332");
+
+    daemon.sendUnownedPacketError("daemon_warning", "daemon sent an unowned error");
+
+    await expect(client.receiveInner()).rejects.toMatchObject({
+      code: "daemon_warning",
+      message: "daemon sent an unowned error",
+    });
+    client.close();
+  });
+
   it("已信任的同一浏览器 device 可以重新 pairing", async () => {
     const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000305");
     const firstClient = await connectDevice(device.device_id);
@@ -404,6 +514,33 @@ describe("DirectClient", () => {
     await expect(client.attachSession(list.sessions[0].session_id, { timeoutMs: 300 })).resolves.toMatchObject({
       session_id: list.sessions[0].session_id,
     });
+    client.close();
+  });
+
+  it("pending terminal attach does not allow terminal operations before attach response", async () => {
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [
+        {
+          session_id: "00000000-0000-0000-0000-000000000301",
+          state: "running",
+          size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+        },
+      ],
+      attachDelayMs: 80,
+    });
+    const { client } = await authenticatedClient("00000000-0000-0000-0000-000000000334");
+    const list = await client.listSessions();
+    const sessionId = list.sessions[0].session_id;
+
+    const attach = client.attachSession(sessionId, { timeoutMs: 300 });
+
+    await expect(client.sendSessionData(sessionId, new TextEncoder().encode("too-early"))).rejects.toMatchObject({ code: "invalid_state" });
+    await expect(client.sendSessionCursor(sessionId, { row: 1, col: 1, focused: true })).rejects.toMatchObject({ code: "invalid_state" });
+    await expect(client.resizeSession(sessionId, { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })).rejects.toMatchObject({ code: "invalid_state" });
+    await expect(attach).resolves.toMatchObject({ session_id: sessionId });
+    await expect(client.sendSessionData(sessionId, new TextEncoder().encode("after-attach"))).resolves.toBeUndefined();
     client.close();
   });
 
@@ -763,6 +900,169 @@ describe("DirectClient", () => {
     expect(flows).toHaveLength(0);
   });
 
+  it("SocketInbox 在积压消息后收到 close 时会先清空队列再暴露连接关闭", async () => {
+    const socket = new EventTarget() as WebSocket;
+    (socket as unknown as { readyState: number }).readyState = WebSocket.OPEN;
+    const inbox = new __directClientTestInternals.SocketInbox(socket);
+
+    socket.dispatchEvent(new MessageEvent("message", {
+      data: JSON.stringify({ type: "hello", payload: { protocol_version: PROTOCOL_PACKET_VERSION } }),
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    (socket as unknown as { readyState: number }).readyState = WebSocket.CLOSED;
+    socket.dispatchEvent(new Event("close"));
+
+    // 中文注释：复现 receive pump 处理 backlog 期间没有 read waiter 的窗口；
+    // close 必须被记住，并且不能抢掉已经进入队列的消息。
+    await expect(inbox.read()).resolves.toMatchObject({ envelope: { type: "hello" } });
+    await expect(inbox.read()).rejects.toMatchObject({ code: "connection_closed" });
+  });
+
+  it.each([
+    { transportEvent: "close" as const, expectedCode: "connection_closed" },
+    { transportEvent: "error" as const, expectedCode: "connection_error" },
+  ])("WebSocket $transportEvent 在 receive pump yield 窗口会关闭 pending RPC", async ({ transportEvent, expectedCode }) => {
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [
+        {
+          session_id: "00000000-0000-0000-0000-000000000301",
+          state: "running",
+          size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+        },
+      ],
+      attachOutput: "termd-e2e-ready\n",
+      dropDaemonClients: true,
+    });
+    type WsEmitter = WebSocket & { emit: (event: "close" | "error", ...args: unknown[]) => boolean };
+    let capturedSocket: WsEmitter | undefined;
+    const { device, server } = await pairedDevice(`00000000-0000-0000-0000-00000000033${transportEvent === "close" ? "5" : "6"}`);
+    const client = await DirectClient.connect(daemon.url, daemon.serverId, device.device_id, {
+      timeoutMs: 3000,
+      expectedDaemonPublicKey: daemon.daemonPublicKey,
+      webSocketFactory: (url) => {
+        const socket = new WebSocket(url) as WsEmitter;
+        capturedSocket = socket;
+        return socket;
+      },
+    });
+    await client.authenticate(device, server);
+    const list = await client.listSessions();
+    const attached = await client.attachSession(list.sessions[0].session_id);
+    await client.receiveInner();
+    const probeError = client.listDaemonClients().then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    const originalSetTimeout = globalThis.setTimeout;
+    let armed = false;
+    let injected = false;
+    (globalThis as unknown as { setTimeout: typeof setTimeout }).setTimeout = ((handler: TimerHandler, timeout?: number, ...args: unknown[]) => {
+      if (armed && timeout === 0 && !injected) {
+        injected = true;
+        return originalSetTimeout((...timerArgs: unknown[]) => {
+          // 中文注释：先触发 transport event，再恢复 receive pump yield；
+          // 这样 close/error 一定发生在 inbox 没有 read waiter 的窗口。
+          if (transportEvent === "close") {
+            capturedSocket?.emit("close", 1006, Buffer.from("mock close"));
+          } else {
+            capturedSocket?.emit("error", new Error("mock transport error"));
+          }
+          if (typeof handler === "function") {
+            (handler as (...callbackArgs: unknown[]) => void)(...timerArgs);
+          }
+        }, timeout, ...args);
+      }
+      return originalSetTimeout(handler, timeout, ...args);
+    }) as typeof setTimeout;
+
+    try {
+      armed = true;
+      for (let index = 0; index < 80; index += 1) {
+        daemon.pushTerminalFrame(attached.session_id, {
+          kind: "output",
+          session_id: attached.session_id,
+          terminal_seq: index + 1,
+          data_base64: "bGluZQo=",
+        });
+      }
+      await expect(settleWithin(probeError, 800, "daemon.clients probe")).resolves.toMatchObject({ code: expectedCode });
+      for (let index = 0; index < 80; index += 1) {
+        const frame = await settleWithin(client.receiveInner(), 800, "terminal frame drain");
+        expect(frame).toMatchObject({
+          type: "terminal_frame",
+          payload: { kind: "output", terminal_seq: index + 1 },
+        });
+      }
+      await expect(settleWithin(client.receiveInner(), 250, "post-close receive")).rejects.toMatchObject({ code: expectedCode });
+      expect(injected).toBe(true);
+      expect(client.isClosed).toBe(true);
+    } finally {
+      (globalThis as unknown as { setTimeout: typeof setTimeout }).setTimeout = originalSetTimeout;
+      client.close();
+    }
+  });
+
+  it.each([
+    { transportEvent: "close" as const, expectedCode: "connection_closed" },
+    { transportEvent: "error" as const, expectedCode: "connection_error" },
+  ])("WebSocket $transportEvent 会唤醒等待中的 binary file upload stream", async ({ transportEvent, expectedCode }) => {
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [
+        {
+          session_id: "00000000-0000-0000-0000-000000000301",
+          state: "running",
+          size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+        },
+      ],
+      fileUploadProgressDelayMs: 120,
+    });
+    type WsEmitter = WebSocket & { emit: (event: "close" | "error", ...args: unknown[]) => boolean };
+    let capturedSocket: WsEmitter | undefined;
+    const { device, server } = await pairedDevice(`00000000-0000-0000-0000-00000000034${transportEvent === "close" ? "5" : "6"}`);
+    const client = await DirectClient.connect(daemon.url, daemon.serverId, device.device_id, {
+      timeoutMs: 3000,
+      expectedDaemonPublicKey: daemon.daemonPublicKey,
+      webSocketFactory: (url) => {
+        const socket = new WebSocket(url) as WsEmitter;
+        capturedSocket = socket;
+        return socket;
+      },
+    });
+    await client.authenticate(device, server);
+    const list = await client.listSessions();
+    const sessionId = list.sessions[0].session_id;
+    await client.attachSessionPermission(sessionId);
+    // 中文注释：关闭 HTTP E2EE 路径，强制覆盖主 WebSocket 上的 binary file stream waiter。
+    (client as unknown as { authenticatedDevice?: unknown; authenticatedServer?: unknown }).authenticatedDevice = undefined;
+    (client as unknown as { authenticatedDevice?: unknown; authenticatedServer?: unknown }).authenticatedServer = undefined;
+    const uploadError = client.uploadSessionFile(
+      sessionId,
+      `/tmp/waiter-${transportEvent}.bin`,
+      new File([new Uint8Array([1, 2, 3])], `waiter-${transportEvent}.bin`),
+      { timeoutMs: 1000 },
+    ).then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+
+    try {
+      await waitUntil(() => daemon.sessionFileBinaryWrites.length > 0, "file upload chunk accepted");
+      if (transportEvent === "close") {
+        capturedSocket?.emit("close", 1006, Buffer.from("mock close"));
+      } else {
+        capturedSocket?.emit("error", new Error("mock transport error"));
+      }
+      await expect(settleWithin(uploadError, 800, "file upload close")).resolves.toMatchObject({ code: expectedCode });
+      expect(client.isClosed).toBe(true);
+    } finally {
+      client.close();
+    }
+  });
+
   it("短连接 attach 可以只拿 session 权限，不订阅终端输出", async () => {
     const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000307");
     const pairClient = await connectDevice(device.device_id);
@@ -805,6 +1105,7 @@ describe("DirectClient", () => {
     const sessionId = list.sessions[0].session_id;
     await client.attachSessionPermission(sessionId);
     const progress: number[] = [];
+    const sentProgress: number[] = [];
     const file = new File([new Uint8Array([0, 1, 2, 3, 255])], "raw.bin");
     // 中文注释：binary file stream 只作为没有 HTTP E2EE 身份时的兼容路径；
     // 已认证的大文件上传不再因 HTTP 请求失败退回主 WebSocket。
@@ -814,11 +1115,13 @@ describe("DirectClient", () => {
     try {
       await client.uploadSessionFile(sessionId, "/tmp/raw.bin", file, {
         onProgress: (update) => progress.push(update.offset_bytes),
+        onSentProgress: (sentBytes) => sentProgress.push(sentBytes),
       });
     } finally {
       client.close();
     }
 
+    expect(sentProgress.at(-1)).toBe(file.size);
     expect(progress.at(-1)).toBe(file.size);
     expect(daemon.sessionFileWrites).toHaveLength(0);
     expect(daemon.sessionFileDownloadChunkRequests).toHaveLength(0);
@@ -1431,7 +1734,7 @@ describe("DirectClient", () => {
     expect(daemon.sessionFileBinaryWrites).toHaveLength(0);
   });
 
-  it("HTTP 上传初始化返回不支持状态时仅小文件回退 WebSocket 兼容路径", async () => {
+  it("HTTP 上传初始化返回 relay 未实现状态时仅小文件回退 WebSocket 兼容路径", async () => {
     const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000326");
     const pairClient = await connectDevice(device.device_id);
     const accepted = await pairClient.pair("secret-token", device.device_public_key);
@@ -1448,8 +1751,9 @@ describe("DirectClient", () => {
     const sessionId = list.sessions[0].session_id;
     await client.attachSessionPermission(sessionId);
     const originalFetch = globalThis.fetch;
+    // 中文注释：termrelay 默认禁用 HTTP 文件隧道时返回 501；小文件必须能退回 WebSocket 兼容上传。
     (globalThis as unknown as { fetch: typeof fetch }).fetch = (async () =>
-      new Response(null, { status: 426 })) as typeof fetch;
+      new Response(null, { status: 501 })) as typeof fetch;
     try {
       await client.uploadSessionFile(sessionId, "/tmp/http-required.bin", new File([new Uint8Array([1])], "http-required.bin"));
     } finally {
@@ -1725,10 +2029,13 @@ describe("DirectClient", () => {
     const sessionId = list.sessions[0].session_id;
     await client.attachSessionPermission(sessionId);
     const originalFetch = globalThis.fetch;
-    (globalThis as unknown as { fetch: typeof fetch }).fetch = (async () =>
-      new Response(null, { status: 426 })) as typeof fetch;
     try {
-      await expect(client.downloadSessionFile(sessionId, "/tmp/raw.bin")).rejects.toThrow("http_file_transfer_unsupported");
+      for (const status of [426, 501]) {
+        // 中文注释：下载不做 WebSocket fallback；501 来自默认禁用 HTTP tunnel 的 relay。
+        (globalThis as unknown as { fetch: typeof fetch }).fetch = (async () =>
+          new Response(null, { status })) as typeof fetch;
+        await expect(client.downloadSessionFile(sessionId, `/tmp/raw-${status}.bin`)).rejects.toThrow("http_file_transfer_unsupported");
+      }
     } finally {
       (globalThis as unknown as { fetch: typeof fetch }).fetch = originalFetch;
       client.close();

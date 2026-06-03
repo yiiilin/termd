@@ -443,6 +443,7 @@ impl PairingTokenManager {
                 .checked_add(ttl_ms)
                 .ok_or(PairingError::InvalidTtl { ttl_ms })?,
         );
+        self.prune_expired(now_ms);
 
         loop {
             let token = generate_pairing_token();
@@ -471,9 +472,12 @@ impl PairingTokenManager {
         token: &PairingToken,
         now_ms: UnixTimestampMillis,
     ) -> PairingResult<PairingTokenRecord> {
+        let token_key = pairing_token_key(token).to_owned();
+        self.prune_expired_except(now_ms, Some(token_key.as_str()));
+
         let record = self
             .tokens
-            .get_mut(pairing_token_key(token))
+            .get_mut(&token_key)
             .ok_or(PairingError::InvalidToken)?;
 
         match record.state {
@@ -483,10 +487,13 @@ impl PairingTokenManager {
         }
 
         if record.is_expired(now_ms) {
-            return Err(PairingError::ExpiredToken {
+            let error = PairingError::ExpiredToken {
                 expires_at_ms: record.expires_at_ms,
                 now_ms,
-            });
+            };
+            // 过期 token 的第一次消费仍返回精确错误，随后立即删除避免内存长期保留。
+            self.tokens.remove(&token_key);
+            return Err(error);
         }
 
         record.state = PairingTokenState::Consumed;
@@ -512,8 +519,19 @@ impl PairingTokenManager {
 
     /// 清理已经过期的 token 记录，返回被删除数量。
     pub fn prune_expired(&mut self, now_ms: UnixTimestampMillis) -> usize {
+        self.prune_expired_except(now_ms, None)
+    }
+
+    fn prune_expired_except(
+        &mut self,
+        now_ms: UnixTimestampMillis,
+        protected_key: Option<&str>,
+    ) -> usize {
         let before = self.tokens.len();
-        self.tokens.retain(|_, record| !record.is_expired(now_ms));
+        self.tokens.retain(|key, record| {
+            protected_key.is_some_and(|protected| protected == key.as_str())
+                || !record.is_expired(now_ms)
+        });
         before - self.tokens.len()
     }
 
@@ -707,6 +725,9 @@ pub struct AuthChallengeManager {
 }
 
 impl AuthChallengeManager {
+    /// 单设备最多保留的未消费 challenge 数量，防止同一设备反复握手撑大内存状态。
+    pub const MAX_OUTSTANDING_PER_DEVICE: usize = 8;
+
     /// 创建空的 challenge 管理器。
     pub fn new() -> Self {
         Self::default()
@@ -729,6 +750,8 @@ impl AuthChallengeManager {
                 .checked_add(ttl_ms)
                 .ok_or(ChallengeError::InvalidTtl { ttl_ms })?,
         );
+        self.prune_unusable_except(now_ms, None);
+        self.enforce_device_outstanding_cap(device_id);
 
         loop {
             let challenge = generate_auth_challenge();
@@ -759,9 +782,12 @@ impl AuthChallengeManager {
         challenge: &Challenge,
         now_ms: UnixTimestampMillis,
     ) -> ChallengeResult<AuthChallengeRecord> {
+        let challenge_key = challenge_key(challenge).to_owned();
+        self.prune_unusable_except(now_ms, Some(challenge_key.as_str()));
+
         let record = self
             .challenges
-            .get_mut(challenge_key(challenge))
+            .get_mut(&challenge_key)
             .ok_or(ChallengeError::InvalidChallenge)?;
 
         match record.state {
@@ -771,10 +797,13 @@ impl AuthChallengeManager {
         }
 
         if record.is_expired(now_ms) {
-            return Err(ChallengeError::ExpiredChallenge {
+            let error = ChallengeError::ExpiredChallenge {
                 expires_at_ms: record.expires_at_ms,
                 now_ms,
-            });
+            };
+            // 过期 challenge 的第一次消费保留精确错误，同时删除记录避免重复占用。
+            self.challenges.remove(&challenge_key);
+            return Err(error);
         }
 
         if record.device_id != *device_id {
@@ -813,6 +842,58 @@ impl AuthChallengeManager {
         self.challenges
             .retain(|_, record| !record.is_expired(now_ms));
         before - self.challenges.len()
+    }
+
+    fn prune_unusable_except(
+        &mut self,
+        now_ms: UnixTimestampMillis,
+        protected_key: Option<&str>,
+    ) -> usize {
+        let before = self.challenges.len();
+        self.challenges.retain(|key, record| {
+            if protected_key.is_some_and(|protected| protected == key.as_str()) {
+                return true;
+            }
+
+            !record.is_expired(now_ms) && record.state != AuthChallengeState::Consumed
+        });
+        before - self.challenges.len()
+    }
+
+    fn enforce_device_outstanding_cap(&mut self, device_id: DeviceId) -> usize {
+        let mut removed = 0;
+
+        while self
+            .challenges
+            .values()
+            .filter(|record| {
+                record.device_id == device_id && record.state == AuthChallengeState::Active
+            })
+            .count()
+            >= Self::MAX_OUTSTANDING_PER_DEVICE
+        {
+            let Some(oldest_key) = self
+                .challenges
+                .iter()
+                .filter(|(_, record)| {
+                    record.device_id == device_id && record.state == AuthChallengeState::Active
+                })
+                .min_by(|(left_key, left), (right_key, right)| {
+                    left.issued_at_ms
+                        .cmp(&right.issued_at_ms)
+                        .then_with(|| left_key.cmp(right_key))
+                })
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+
+            // cap 只淘汰同一 device 最旧的 active challenge；其他设备互不影响。
+            self.challenges.remove(&oldest_key);
+            removed += 1;
+        }
+
+        removed
     }
 
     /// 返回当前保留的 challenge 记录数量。
@@ -863,8 +944,8 @@ impl ReplayProtector {
 
     /// 检查 timestamp 与 nonce，但不记录 nonce。
     ///
-    /// HTTP 这类先验证签名再建立短期 E2EE 的路径需要先做 replay 预检，签名通过后再
-    /// 记录 nonce，避免坏签名请求消耗合法 nonce。
+    /// HTTP E2EE 与 WebSocket auth 这类需要先验证签名的路径先做 replay 预检，
+    /// 签名通过后再记录 nonce，避免坏签名请求消耗合法 nonce。
     pub fn check(
         &mut self,
         device_id: &DeviceId,
@@ -1308,8 +1389,9 @@ pub struct AuthenticatedDevice {
 
 /// challenge-response auth 的 daemon 内核服务。
 ///
-/// 服务流程固定为：先确认 device id 已配对，再一次性消费 challenge，再检查 timestamp/nonce，
-/// 再把可信 public key 和规范化输入交给 verifier。只有全部通过才刷新 `last_seen`。
+/// 服务流程固定为：先确认 device id 已配对，再一次性消费 challenge，预检 timestamp/nonce，
+/// 再把可信 public key 和规范化输入交给 verifier；签名通过后才记录 nonce 并刷新
+/// `last_seen`。
 #[derive(Debug)]
 pub struct ChallengeResponseService {
     daemon_identity: DaemonPublicIdentity,
@@ -1403,12 +1485,15 @@ impl ChallengeResponseService {
             .public_key()
             .clone();
 
+        let challenge_record_key = challenge_key(&payload.challenge).to_owned();
+        self.challenge_manager
+            .prune_unusable_except(now_ms, Some(challenge_record_key.as_str()));
         self.challenge_manager
             .consume(&payload.device_id, &payload.challenge, now_ms)
             .map_err(ChallengeAuthError::from)?;
 
         self.replay_protector
-            .check_and_record(
+            .check(
                 &payload.device_id,
                 &payload.nonce,
                 payload.timestamp_ms,
@@ -1425,6 +1510,8 @@ impl ChallengeResponseService {
         verifier
             .verify(&device_public_key, &signing_input, &payload.signature)
             .map_err(ChallengeAuthError::from)?;
+        self.replay_protector
+            .record_checked(&payload.device_id, &payload.nonce, now_ms);
 
         trusted_store
             .mark_seen(&payload.device_id, now_ms)
@@ -2126,6 +2213,18 @@ mod tests {
     }
 
     #[test]
+    fn pairing_token_issue_prunes_expired_records() {
+        let mut manager = PairingTokenManager::new();
+        let expired = manager.issue(timestamp(1000), 500).unwrap().token().clone();
+
+        let active = manager.issue(timestamp(1500), 500).unwrap().token().clone();
+
+        assert!(manager.record(&expired).is_none());
+        assert!(manager.record(&active).is_some());
+        assert_eq!(manager.len(), 1);
+    }
+
+    #[test]
     fn pairing_token_can_be_consumed_only_once_before_expiration() {
         let mut manager = PairingTokenManager::new();
         let issued = manager.issue(timestamp(1000), 500).unwrap();
@@ -2141,19 +2240,38 @@ mod tests {
     }
 
     #[test]
+    fn pairing_token_consume_prunes_other_expired_records() {
+        let mut manager = PairingTokenManager::new();
+        let expired = manager.issue(timestamp(1000), 500).unwrap().token().clone();
+        let active = manager
+            .issue(timestamp(1000), 1000)
+            .unwrap()
+            .token()
+            .clone();
+
+        manager.consume(&active, timestamp(1500)).unwrap();
+
+        assert!(manager.record(&expired).is_none());
+        assert_eq!(
+            manager.record(&active).unwrap().state(),
+            PairingTokenState::Consumed
+        );
+    }
+
+    #[test]
     fn pairing_token_rejects_expired_token() {
         let mut manager = PairingTokenManager::new();
         let issued = manager.issue(timestamp(1000), 500).unwrap();
+        let token = issued.token().clone();
 
         assert_eq!(
-            manager
-                .consume(issued.token(), timestamp(1500))
-                .unwrap_err(),
+            manager.consume(&token, timestamp(1500)).unwrap_err(),
             PairingError::ExpiredToken {
                 expires_at_ms: timestamp(1500),
                 now_ms: timestamp(1500),
             }
         );
+        assert!(manager.record(&token).is_none());
     }
 
     #[test]
@@ -2211,6 +2329,82 @@ mod tests {
     }
 
     #[test]
+    fn auth_challenge_issue_prunes_expired_records() {
+        let mut manager = AuthChallengeManager::new();
+        let device_id = DeviceId::new();
+        let expired = manager
+            .issue(device_id, timestamp(1000), 500)
+            .unwrap()
+            .challenge()
+            .clone();
+
+        let active = manager
+            .issue(device_id, timestamp(1500), 500)
+            .unwrap()
+            .challenge()
+            .clone();
+
+        assert!(manager.record(&expired).is_none());
+        assert!(manager.record(&active).is_some());
+        assert_eq!(manager.len(), 1);
+    }
+
+    #[test]
+    fn auth_challenge_issue_prunes_consumed_records() {
+        let mut manager = AuthChallengeManager::new();
+        let device_id = DeviceId::new();
+        let consumed = manager
+            .issue(device_id, timestamp(1000), 500)
+            .unwrap()
+            .challenge()
+            .clone();
+        manager
+            .consume(&device_id, &consumed, timestamp(1100))
+            .unwrap();
+
+        let active = manager
+            .issue(device_id, timestamp(1100), 500)
+            .unwrap()
+            .challenge()
+            .clone();
+
+        assert!(manager.record(&consumed).is_none());
+        assert!(manager.record(&active).is_some());
+        assert_eq!(manager.len(), 1);
+    }
+
+    #[test]
+    fn auth_challenge_issue_caps_outstanding_records_per_device() {
+        let mut manager = AuthChallengeManager::new();
+        let device_id = DeviceId::new();
+        let other_device_id = DeviceId::new();
+        let other_challenge = manager
+            .issue(other_device_id, timestamp(1000), 60_000)
+            .unwrap()
+            .challenge()
+            .clone();
+        let mut challenges = Vec::new();
+
+        for offset in 0..=AuthChallengeManager::MAX_OUTSTANDING_PER_DEVICE {
+            challenges.push(
+                manager
+                    .issue(device_id, timestamp(1000 + offset as u64), 60_000)
+                    .unwrap()
+                    .challenge()
+                    .clone(),
+            );
+        }
+
+        assert!(manager.record(&challenges[0]).is_none());
+        assert!(manager.record(challenges.last().unwrap()).is_some());
+        assert!(manager.record(&other_challenge).is_some());
+        assert_eq!(
+            manager.len(),
+            AuthChallengeManager::MAX_OUTSTANDING_PER_DEVICE + 1
+        );
+    }
+
+    #[test]
     fn challenge_can_be_consumed_only_once_before_expiration() {
         let mut manager = AuthChallengeManager::new();
         let device_id = DeviceId::new();
@@ -2235,16 +2429,18 @@ mod tests {
         let mut manager = AuthChallengeManager::new();
         let device_id = DeviceId::new();
         let issued = manager.issue(device_id, timestamp(1000), 500).unwrap();
+        let challenge = issued.challenge().clone();
 
         assert_eq!(
             manager
-                .consume(&device_id, issued.challenge(), timestamp(1500))
+                .consume(&device_id, &challenge, timestamp(1500))
                 .unwrap_err(),
             ChallengeError::ExpiredChallenge {
                 expires_at_ms: timestamp(1500),
                 now_ms: timestamp(1500),
             }
         );
+        assert!(manager.record(&challenge).is_none());
     }
 
     #[test]
@@ -2503,6 +2699,148 @@ mod tests {
                 .authenticate(payload, timestamp(1100), &mut trusted_store, &verifier)
                 .unwrap_err(),
             ChallengeAuthError::UsedChallenge
+        );
+    }
+
+    #[test]
+    fn auth_invalid_signature_does_not_consume_replay_nonce() {
+        let daemon_identity = DaemonIdentity::generate();
+        let device_id = DeviceId::new();
+        let device_public_key = public_key("device-a-public");
+        let mut trusted_store = InMemoryTrustedDeviceStore::new();
+        trusted_store.trust_device(
+            DeviceIdentity::new(device_id, device_public_key.clone()),
+            timestamp(1000),
+            None,
+        );
+        let mut service = ChallengeResponseService::new(
+            daemon_identity.public_identity(),
+            AuthChallengeManager::new(),
+            ReplayProtector::new(500),
+        );
+        let first_challenge = service
+            .issue_challenge(device_id, timestamp(1000), 500)
+            .unwrap()
+            .challenge()
+            .clone();
+        let first_payload = termd_proto::AuthPayload {
+            device_id,
+            challenge: first_challenge,
+            nonce: nonce("auth-reused-after-bad-signature"),
+            timestamp_ms: timestamp(1100),
+            signature: signature("bad-sig"),
+        };
+        let verifier = ExactSignatureVerifier::new(
+            device_public_key.clone(),
+            AuthSigningInput::from_payload(&first_payload, service.daemon_public_identity())
+                .to_bytes(),
+            signature("good-sig"),
+        );
+
+        assert_eq!(
+            service
+                .authenticate(
+                    first_payload,
+                    timestamp(1100),
+                    &mut trusted_store,
+                    &verifier
+                )
+                .unwrap_err(),
+            ChallengeAuthError::InvalidSignature
+        );
+
+        let second_challenge = service
+            .issue_challenge(device_id, timestamp(1101), 500)
+            .unwrap()
+            .challenge()
+            .clone();
+        let second_payload = termd_proto::AuthPayload {
+            device_id,
+            challenge: second_challenge,
+            nonce: nonce("auth-reused-after-bad-signature"),
+            timestamp_ms: timestamp(1101),
+            signature: signature("good-sig"),
+        };
+        let verifier = ExactSignatureVerifier::new(
+            device_public_key,
+            AuthSigningInput::from_payload(&second_payload, service.daemon_public_identity())
+                .to_bytes(),
+            signature("good-sig"),
+        );
+
+        service
+            .authenticate(
+                second_payload,
+                timestamp(1101),
+                &mut trusted_store,
+                &verifier,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn auth_verification_prunes_expired_and_consumed_challenges() {
+        let daemon_identity = DaemonIdentity::generate();
+        let device_id = DeviceId::new();
+        let device_public_key = public_key("device-a-public");
+        let mut trusted_store = InMemoryTrustedDeviceStore::new();
+        trusted_store.trust_device(
+            DeviceIdentity::new(device_id, device_public_key.clone()),
+            timestamp(1000),
+            None,
+        );
+        let mut service = ChallengeResponseService::new(
+            daemon_identity.public_identity(),
+            AuthChallengeManager::new(),
+            ReplayProtector::new(500),
+        );
+        let current_challenge = service
+            .issue_challenge(device_id, timestamp(1000), 500)
+            .unwrap()
+            .challenge()
+            .clone();
+        let expired_challenge = service
+            .issue_challenge(device_id, timestamp(1000), 100)
+            .unwrap()
+            .challenge()
+            .clone();
+        let consumed_challenge = service
+            .issue_challenge(device_id, timestamp(1000), 500)
+            .unwrap()
+            .challenge()
+            .clone();
+        service
+            .challenge_manager_mut()
+            .consume(&device_id, &consumed_challenge, timestamp(1001))
+            .unwrap();
+        let payload = termd_proto::AuthPayload {
+            device_id,
+            challenge: current_challenge,
+            nonce: nonce("auth-cleanup-nonce"),
+            timestamp_ms: timestamp(1100),
+            signature: signature("good-sig"),
+        };
+        let verifier = ExactSignatureVerifier::new(
+            device_public_key,
+            AuthSigningInput::from_payload(&payload, service.daemon_public_identity()).to_bytes(),
+            signature("good-sig"),
+        );
+
+        service
+            .authenticate(payload, timestamp(1100), &mut trusted_store, &verifier)
+            .unwrap();
+
+        assert!(
+            service
+                .challenge_manager()
+                .record(&expired_challenge)
+                .is_none()
+        );
+        assert!(
+            service
+                .challenge_manager()
+                .record(&consumed_challenge)
+                .is_none()
         );
     }
 

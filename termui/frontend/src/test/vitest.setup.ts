@@ -52,7 +52,7 @@ vi.mock("@xterm/xterm", () => {
       refreshes: number;
       writtenBytes: number;
       resizes: number;
-      operations: Array<{ op: string; cols?: number; rows?: number; bytes?: number }>;
+      operations: Array<{ op: string; cols?: number; rows?: number; bytes?: number; text?: string }>;
     } };
     scope.__TERMD_TEST_XTERM_STATS__ ??= { writes: 0, refreshes: 0, writtenBytes: 0, resizes: 0, operations: [] };
     scope.__TERMD_TEST_XTERM_STATS__.resizes ??= 0;
@@ -72,6 +72,7 @@ vi.mock("@xterm/xterm", () => {
     private serializedWriteInFlight = false;
     private serializedWriteQueue: Array<{ data: string | Uint8Array; callback?: () => void }> = [];
     private selection = "";
+    private absoluteCursorY = 0;
     public buffer = { active: { cursorY: 0, cursorX: 0, viewportY: 0, baseY: 0 } };
     public cols = 80;
     public rows = 24;
@@ -127,6 +128,14 @@ vi.mock("@xterm/xterm", () => {
       addon?.activate?.(this);
     }
 
+    private syncCursorWindow() {
+      this.buffer.active.baseY = Math.max(0, this.absoluteCursorY - this.rows + 1);
+      // 中文注释：真实 xterm 的公开 cursorY 表示当前 screen 内的光标行，
+      // 不是累计 scrollback 行号；测试桩也要保持这个语义，才能覆盖 resize 后
+      // “内容已经铺满，但光标还停在旧高度”的真实浏览器问题。
+      this.buffer.active.cursorY = Math.max(0, this.absoluteCursorY - this.buffer.active.baseY);
+    }
+
     write(data: string | Uint8Array, callback?: () => void) {
       const serializeWrites = Boolean(
         (globalThis as { __TERMD_TEST_SERIALIZE_XTERM_WRITES__?: boolean })
@@ -157,7 +166,11 @@ vi.mock("@xterm/xterm", () => {
       const stats = xtermStats();
       stats.writes += 1;
       stats.writtenBytes += typeof data === "string" ? data.length : data.byteLength;
-      stats.operations.push({ op: "write", bytes: typeof data === "string" ? data.length : data.byteLength });
+      stats.operations.push({
+        op: "write",
+        bytes: typeof data === "string" ? data.length : data.byteLength,
+        text: text.length <= 32 ? text : undefined,
+      });
       const deferRender = Boolean(
         (globalThis as { __TERMD_TEST_DEFER_XTERM_RENDER_UNTIL_WRITE_CALLBACK__?: boolean })
           .__TERMD_TEST_DEFER_XTERM_RENDER_UNTIL_WRITE_CALLBACK__,
@@ -186,17 +199,17 @@ vi.mock("@xterm/xterm", () => {
         const previousBaseY = this.buffer.active.baseY;
         const wasAtBottom = this.buffer.active.viewportY >= previousBaseY;
         if (text.includes("\n")) {
-          this.buffer.active.cursorY += lines.length - 1;
+          this.absoluteCursorY += lines.length - 1;
           this.buffer.active.cursorX = lastLine.length;
         } else {
           this.buffer.active.cursorX += text.length;
         }
-        this.buffer.active.baseY = Math.max(0, this.buffer.active.cursorY - this.rows + 1);
+        this.syncCursorWindow();
         this.buffer.active.viewportY = keepViewportAtTop
           ? Math.min(this.buffer.active.viewportY, this.buffer.active.baseY)
-          : wasAtBottom
-            ? this.buffer.active.baseY
-            : Math.min(this.buffer.active.viewportY, this.buffer.active.baseY);
+            : wasAtBottom
+              ? this.buffer.active.baseY
+              : Math.min(this.buffer.active.viewportY, this.buffer.active.baseY);
         this.writeParsedListeners.forEach((listener) => listener());
         this.cursorMoveListeners.forEach((listener) => listener());
         this.scrollListeners.forEach((listener) => listener(this.buffer.active.viewportY));
@@ -287,7 +300,7 @@ vi.mock("@xterm/xterm", () => {
       );
       this.cols = cols;
       this.rows = rows;
-      this.buffer.active.baseY = Math.max(0, this.buffer.active.cursorY - this.rows + 1);
+      this.syncCursorWindow();
       this.buffer.active.viewportY = keepViewportAtTop
         ? Math.min(this.buffer.active.viewportY, this.buffer.active.baseY)
         : wasAtBottom
@@ -324,6 +337,7 @@ vi.mock("@xterm/xterm", () => {
           node.remove();
         }
       }
+      this.absoluteCursorY = 0;
       this.buffer.active.cursorY = 0;
       this.buffer.active.cursorX = 0;
       this.buffer.active.baseY = 0;

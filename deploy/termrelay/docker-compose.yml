@@ -3,13 +3,12 @@ services:
     image: ${TERMRELAY_IMAGE}
     restart: unless-stopped
     command:
-      - /bin/sh
-      - -ec
-      - |
-        if [ -n "${TERMRELAY_AUTH_TOKEN:-}" ]; then
-          exec termrelay --listen 0.0.0.0:8080 --auth-token "$TERMRELAY_AUTH_TOKEN"
-        fi
-        exec termrelay --listen 0.0.0.0:8080
+      - --listen
+      - 0.0.0.0:8080
+      - --auth-token-file
+      - /run/secrets/termrelay_auth_token
+    secrets:
+      - termrelay_auth_token
     expose:
       - "8080"
 
@@ -18,6 +17,8 @@ services:
     restart: unless-stopped
     depends_on:
       - termrelay
+    environment:
+      TERMRELAY_DOMAIN: "${TERMRELAY_DOMAIN:?TERMRELAY_DOMAIN must be set for public Caddy deployment}"
     ports:
       - "80:80"
       - "443:443"
@@ -30,3 +31,6 @@ volumes:
   caddy_data:
   caddy_config:
 
+secrets:
+  termrelay_auth_token:
+    file: "${TERMRELAY_AUTH_TOKEN_FILE:?TERMRELAY_AUTH_TOKEN_FILE must point to a token file for public Caddy deployment}"

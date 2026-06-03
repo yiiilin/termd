@@ -1,6 +1,7 @@
 use std::env;
 use std::ffi::OsString;
 use std::fmt;
+use std::fs;
 use std::net::{AddrParseError, SocketAddr};
 use std::path::PathBuf;
 
@@ -19,6 +20,8 @@ pub struct Args {
     pub tls_key: Option<PathBuf>,
     /// 是否挂载内嵌 Web 静态资源；默认关闭，避免 relay 默认暴露 UI 面。
     pub web: bool,
+    /// 是否启用 HTTP 文件 tunnel 兼容路径；默认关闭，避免 relay 默认暴露额外 HTTP 面。
+    pub http_tunnel: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,6 +29,11 @@ pub enum RelayCommand {
     Serve(Args),
     Help,
     Version,
+}
+
+enum AuthTokenSource {
+    Argument(String),
+    File(PathBuf),
 }
 
 impl fmt::Debug for Args {
@@ -38,6 +46,7 @@ impl fmt::Debug for Args {
             .field("tls_cert", &self.tls_cert)
             .field("tls_key_configured", &self.tls_key.is_some())
             .field("web", &self.web)
+            .field("http_tunnel", &self.http_tunnel)
             .finish()
     }
 }
@@ -81,6 +90,10 @@ pub enum ArgsError {
     MissingValue(&'static str),
     #[error("{0} requires a non-empty value")]
     EmptyValue(&'static str),
+    #[error("failed to read auth token file")]
+    ReadAuthTokenFile,
+    #[error("--auth-token and --auth-token-file cannot be used together")]
+    ConflictingAuthTokenSources,
     #[error("invalid listen address")]
     InvalidListenAddress(#[from] AddrParseError),
     #[error("TLS cert and key must be configured together")]
@@ -94,10 +107,11 @@ impl Args {
         S: Into<OsString>,
     {
         let mut listen = DEFAULT_LISTEN.parse()?;
-        let mut auth_token = None;
+        let mut auth_token_source = None;
         let mut tls_cert = None;
         let mut tls_key = None;
         let mut web = false;
+        let mut http_tunnel = false;
         let mut args = args.into_iter().map(Into::into);
 
         // 第一个参数是程序名；不要求存在，方便单元测试直接传空迭代器。
@@ -105,6 +119,14 @@ impl Args {
 
         while let Some(arg) = args.next() {
             let arg = arg.to_string_lossy().into_owned();
+            if let Some(value) = arg.strip_prefix("--auth-token=") {
+                set_auth_token_argument(&mut auth_token_source, value.to_owned())?;
+                continue;
+            }
+            if let Some(value) = arg.strip_prefix("--auth-token-file=") {
+                set_auth_token_file(&mut auth_token_source, value.to_owned())?;
+                continue;
+            }
             match arg.as_str() {
                 "--listen" | "-l" => {
                     let value = args.next().ok_or(ArgsError::MissingValue("--listen"))?;
@@ -112,11 +134,19 @@ impl Args {
                 }
                 "--auth-token" => {
                     let value = args.next().ok_or(ArgsError::MissingValue("--auth-token"))?;
-                    let value = value.to_string_lossy().into_owned();
-                    if value.is_empty() {
-                        return Err(ArgsError::EmptyValue("--auth-token"));
-                    }
-                    auth_token = Some(value);
+                    set_auth_token_argument(
+                        &mut auth_token_source,
+                        value.to_string_lossy().into_owned(),
+                    )?;
+                }
+                "--auth-token-file" => {
+                    let value = args
+                        .next()
+                        .ok_or(ArgsError::MissingValue("--auth-token-file"))?;
+                    set_auth_token_file(
+                        &mut auth_token_source,
+                        value.to_string_lossy().into_owned(),
+                    )?;
                 }
                 "--tls-cert" => {
                     let value = args.next().ok_or(ArgsError::MissingValue("--tls-cert"))?;
@@ -137,6 +167,9 @@ impl Args {
                 "--web" => {
                     web = true;
                 }
+                "--http-tunnel" => {
+                    http_tunnel = true;
+                }
                 other => return Err(ArgsError::UnknownArgument(other.to_owned())),
             }
         }
@@ -145,19 +178,84 @@ impl Args {
             return Err(ArgsError::IncompleteTlsConfig);
         }
 
+        let auth_token = resolve_auth_token_source(auth_token_source)?;
+
         Ok(Self {
             listen,
             auth_token,
             tls_cert,
             tls_key,
             web,
+            http_tunnel,
         })
     }
+}
+
+fn set_auth_token_source(
+    current: &mut Option<AuthTokenSource>,
+    next: AuthTokenSource,
+) -> Result<(), ArgsError> {
+    if matches!(
+        (current.as_ref(), &next),
+        (Some(AuthTokenSource::Argument(_)), AuthTokenSource::File(_))
+            | (Some(AuthTokenSource::File(_)), AuthTokenSource::Argument(_))
+    ) {
+        return Err(ArgsError::ConflictingAuthTokenSources);
+    }
+
+    *current = Some(next);
+    Ok(())
+}
+
+fn set_auth_token_argument(
+    current: &mut Option<AuthTokenSource>,
+    value: String,
+) -> Result<(), ArgsError> {
+    if value.is_empty() {
+        return Err(ArgsError::EmptyValue("--auth-token"));
+    }
+    set_auth_token_source(current, AuthTokenSource::Argument(value))
+}
+
+fn set_auth_token_file(
+    current: &mut Option<AuthTokenSource>,
+    value: String,
+) -> Result<(), ArgsError> {
+    if value.is_empty() {
+        return Err(ArgsError::EmptyValue("--auth-token-file"));
+    }
+    set_auth_token_source(current, AuthTokenSource::File(PathBuf::from(value)))
+}
+
+fn resolve_auth_token_source(source: Option<AuthTokenSource>) -> Result<Option<String>, ArgsError> {
+    match source {
+        Some(AuthTokenSource::Argument(token)) => Ok(Some(token)),
+        Some(AuthTokenSource::File(path)) => read_auth_token_file(path).map(Some),
+        None => Ok(None),
+    }
+}
+
+fn read_auth_token_file(path: PathBuf) -> Result<String, ArgsError> {
+    let token = fs::read_to_string(path).map_err(|_| ArgsError::ReadAuthTokenFile)?;
+    let token = trim_trailing_line_endings(token);
+    if token.trim().is_empty() {
+        return Err(ArgsError::EmptyValue("--auth-token-file"));
+    }
+    Ok(token)
+}
+
+fn trim_trailing_line_endings(mut value: String) -> String {
+    while value.ends_with('\n') || value.ends_with('\r') {
+        value.pop();
+    }
+    value
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn uses_localhost_default_listen_address() {
@@ -168,6 +266,7 @@ mod tests {
         assert_eq!(args.tls_cert, None);
         assert_eq!(args.tls_key, None);
         assert!(!args.web);
+        assert!(!args.http_tunnel);
     }
 
     #[test]
@@ -183,6 +282,115 @@ mod tests {
 
         assert_eq!(args.auth_token.as_deref(), Some("relay-secret-1"));
         assert!(!format!("{args:?}").contains("relay-secret-1"));
+    }
+
+    #[test]
+    fn parses_equals_auth_token_without_debug_leakage() {
+        let args = Args::parse_from(["termrelay", "--auth-token=relay-secret-equals"]).unwrap();
+
+        assert_eq!(args.auth_token.as_deref(), Some("relay-secret-equals"));
+        assert!(!format!("{args:?}").contains("relay-secret-equals"));
+    }
+
+    #[test]
+    fn parses_auth_token_file_without_debug_path_or_token_leakage() {
+        let token_file = write_temp_auth_token("relay-secret-from-file\n\n");
+        let token_file_arg = token_file.to_string_lossy().into_owned();
+
+        let args = Args::parse_from(["termrelay", "--auth-token-file", &token_file_arg]).unwrap();
+
+        assert_eq!(args.auth_token.as_deref(), Some("relay-secret-from-file"));
+        let rendered = format!("{args:?}");
+        assert!(!rendered.contains("relay-secret-from-file"));
+        assert!(!rendered.contains(&token_file_arg));
+        let _ = fs::remove_file(token_file);
+    }
+
+    #[test]
+    fn parses_equals_auth_token_file_without_debug_path_or_token_leakage() {
+        let token_file = write_temp_auth_token("relay-secret-from-equals-file\n");
+        let token_file_arg = token_file.to_string_lossy().into_owned();
+        let argument = format!("--auth-token-file={token_file_arg}");
+
+        let args = Args::parse_from(["termrelay", &argument]).unwrap();
+
+        assert_eq!(
+            args.auth_token.as_deref(),
+            Some("relay-secret-from-equals-file")
+        );
+        let rendered = format!("{args:?}");
+        assert!(!rendered.contains("relay-secret-from-equals-file"));
+        assert!(!rendered.contains(&token_file_arg));
+        let _ = fs::remove_file(token_file);
+    }
+
+    #[test]
+    fn rejects_blank_auth_token_file() {
+        let token_file = write_temp_auth_token("  \n");
+        let token_file_arg = token_file.to_string_lossy().into_owned();
+
+        let error =
+            Args::parse_from(["termrelay", "--auth-token-file", &token_file_arg]).unwrap_err();
+
+        assert_eq!(error, ArgsError::EmptyValue("--auth-token-file"));
+        let _ = fs::remove_file(token_file);
+    }
+
+    #[test]
+    fn rejects_conflicting_auth_token_sources() {
+        let token_file = write_temp_auth_token("relay-secret-from-file\n");
+        let token_file_arg = token_file.to_string_lossy().into_owned();
+
+        let error = Args::parse_from([
+            "termrelay",
+            "--auth-token",
+            "relay-secret-inline",
+            "--auth-token-file",
+            &token_file_arg,
+        ])
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("--auth-token and --auth-token-file")
+        );
+        let _ = fs::remove_file(token_file);
+    }
+
+    #[test]
+    fn rejects_file_first_auth_token_conflict_before_reading_file() {
+        let missing_token_file =
+            std::env::temp_dir().join("termrelay-auth-token-test-missing-conflict.txt");
+        let missing_token_file_arg = missing_token_file.to_string_lossy().into_owned();
+
+        let error = Args::parse_from([
+            "termrelay",
+            "--auth-token-file",
+            &missing_token_file_arg,
+            "--auth-token",
+            "relay-secret-inline",
+        ])
+        .unwrap_err();
+
+        assert_eq!(error, ArgsError::ConflictingAuthTokenSources);
+    }
+
+    #[test]
+    fn rejects_equals_file_first_auth_token_conflict_before_reading_file() {
+        let missing_token_file =
+            std::env::temp_dir().join("termrelay-auth-token-test-missing-equals-conflict.txt");
+        let missing_token_file_arg = missing_token_file.to_string_lossy().into_owned();
+        let token_file_argument = format!("--auth-token-file={missing_token_file_arg}");
+
+        let error = Args::parse_from([
+            "termrelay",
+            &token_file_argument,
+            "--auth-token=relay-secret-inline",
+        ])
+        .unwrap_err();
+
+        assert_eq!(error, ArgsError::ConflictingAuthTokenSources);
     }
 
     #[test]
@@ -212,6 +420,13 @@ mod tests {
         let args = Args::parse_from(["termrelay", "--web"]).unwrap();
 
         assert!(args.web);
+    }
+
+    #[test]
+    fn parses_http_tunnel_flag() {
+        let args = Args::parse_from(["termrelay", "--http-tunnel"]).unwrap();
+
+        assert!(args.http_tunnel);
     }
 
     #[test]
@@ -256,6 +471,13 @@ mod tests {
     }
 
     #[test]
+    fn rejects_missing_auth_token_file_value() {
+        let error = Args::parse_from(["termrelay", "--auth-token-file"]).unwrap_err();
+
+        assert_eq!(error, ArgsError::MissingValue("--auth-token-file"));
+    }
+
+    #[test]
     fn rejects_incomplete_tls_config() {
         let error =
             Args::parse_from(["termrelay", "--tls-cert", "/etc/termd/fullchain.pem"]).unwrap_err();
@@ -268,5 +490,18 @@ mod tests {
         let error = Args::parse_from(["termrelay", "--auth"]).unwrap_err();
 
         assert_eq!(error, ArgsError::UnknownArgument("--auth".to_owned()));
+    }
+
+    fn write_temp_auth_token(contents: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "termrelay-auth-token-test-{}-{unique}.txt",
+            std::process::id()
+        ));
+        fs::write(&path, contents).unwrap();
+        path
     }
 }

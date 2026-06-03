@@ -134,7 +134,7 @@ async fn direct_termctl_binary_covers_session_flow_and_invariants() {
         &["pair", "--token", "wrong-token", "--url", &daemon.url],
     );
     let bad_token_only_stderr = stderr_string(&bad_token_only_pair);
-    assert!(bad_token_only_stderr.contains("missing_route_server_id"));
+    assert!(bad_token_only_stderr.contains("token_requires_known_daemon"));
     assert!(!bad_token_only_stderr.contains("wrong-token"));
 
     let wrong_route_invite = daemon
@@ -155,10 +155,7 @@ async fn direct_termctl_binary_covers_session_flow_and_invariants() {
     assert!(!wrong_route_stderr.contains("termd-pair"));
 
     let invite = daemon.issue_pairing_invite().await;
-    let pair = run_termctl_success(
-        &paired_state,
-        &["pair", "--payload", &invite, "--url", &daemon.url],
-    );
+    let pair = run_termctl_success(&paired_state, &["pair", &invite, "--url", &daemon.url]);
     assert!(stdout_string(&pair).contains("paired server="));
 
     let state_after_pair =
@@ -214,6 +211,18 @@ async fn direct_termctl_binary_covers_session_flow_and_invariants() {
     assert!(list_stdout.contains(&session_id));
     assert!(list_stdout.contains("state=running"));
 
+    let json_list_after_new =
+        run_termctl_success(&paired_state, &["--json", "list", "--url", &daemon.url]);
+    let json_list: serde_json::Value =
+        serde_json::from_slice(&json_list_after_new.stdout).expect("list JSON should parse");
+    assert!(
+        json_list["sessions"]
+            .as_array()
+            .expect("sessions should be an array")
+            .iter()
+            .any(|session| session["session_id"] == session_id)
+    );
+
     let attach = AttachGuard::spawn(&paired_state, &daemon.url, &session_id);
     let control_stdout = run_control_until_success(&paired_state, &daemon.url, &session_id);
     assert!(control_stdout.contains("control_granted"));
@@ -236,6 +245,44 @@ async fn direct_termctl_binary_covers_session_flow_and_invariants() {
     assert!(!state_after_session.contains("termd-pair"));
     assert!(!state_after_session.contains("server_private_key"));
     assert!(!state_after_session.contains(TERMD_READY_SENTINEL));
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn direct_termctl_close_attaches_before_closing_session() {
+    let daemon = TestDaemon::spawn().await;
+    let temp = tempfile::tempdir().expect("termctl state tempdir should be created");
+    let paired_state = temp.path().join("paired-state.json");
+
+    let invite = daemon.issue_pairing_invite().await;
+    let pair = run_termctl_success(
+        &paired_state,
+        &["pair", "--payload", &invite, "--url", &daemon.url],
+    );
+    assert!(stdout_string(&pair).contains("paired server="));
+
+    let new_session = run_termctl_success(
+        &paired_state,
+        &[
+            "new",
+            "--url",
+            &daemon.url,
+            "--",
+            "/bin/sh",
+            "-lc",
+            "sleep 5",
+        ],
+    );
+    let session_id = parse_session_id(&stdout_string(&new_session));
+
+    // daemon 要求 session 级操作绑定到当前连接；CLI close 必须自己建立临时 attach。
+    let close = run_termctl_success(&paired_state, &["close", &session_id, "--url", &daemon.url]);
+    let close_stdout = stdout_string(&close);
+    assert!(close_stdout.contains("closed session="));
+    assert!(close_stdout.contains(&session_id));
+
+    let list_after_close = run_termctl_success(&paired_state, &["list", "--url", &daemon.url]);
+    assert!(!stdout_string(&list_after_close).contains(&session_id));
 }
 
 fn run_control_until_success(state_path: &Path, url: &str, session_id: &str) -> String {
