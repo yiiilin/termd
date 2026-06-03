@@ -21,10 +21,27 @@ const HTTP_FILE_TUNNEL_PATHS: &[&str] = &[
 ];
 
 pub fn router(state: RelayState, web_enabled: bool, http_tunnel_enabled: bool) -> Router {
-    let mut router = Router::new()
+    let router = Router::new()
         .route("/healthz", get(healthz))
-        .route("/ws", get(relay_ws));
+        .route("/ws", get(relay_ws))
+        .merge(http_file_tunnel_router(http_tunnel_enabled));
 
+    // 中文注释：所有 API namespace 都要在 Web fallback 前截止，未知 API 不能返回 SPA index。
+    let router = router
+        .route("/api", any(api_not_found))
+        .route("/api/", any(api_not_found))
+        .route("/api/*path", any(api_not_found))
+        .with_state(state);
+
+    if web_enabled {
+        router.fallback(termweb::embedded_web_handler)
+    } else {
+        router
+    }
+}
+
+fn http_file_tunnel_router(http_tunnel_enabled: bool) -> Router<RelayState> {
+    let mut router = Router::new();
     for path in HTTP_FILE_TUNNEL_PATHS {
         router = if http_tunnel_enabled {
             router.route(path, post(relay_http_tunnel))
@@ -34,19 +51,8 @@ pub fn router(state: RelayState, web_enabled: bool, http_tunnel_enabled: bool) -
         };
     }
 
-    // 中文注释：所有 API namespace 都要在 Web fallback 前截止，未知 API 不能返回 SPA index。
-    router = router
-        .route("/api", any(api_not_found))
-        .route("/api/", any(api_not_found))
-        .route("/api/*path", any(api_not_found));
-
-    let router = router.with_state(state).layer(http_file_api_cors_layer());
-
-    if web_enabled {
-        router.fallback(termweb::embedded_web_handler)
-    } else {
-        router
-    }
+    // 中文注释：跨源预检只对文件 tunnel 生效，避免把其他 relay API 路径也变成 CORS 入口。
+    router.route_layer(http_file_api_cors_layer())
 }
 
 fn http_file_api_cors_layer() -> CorsLayer {
@@ -294,6 +300,30 @@ mod tests {
                 .get("access-control-allow-origin")
                 .and_then(|value| value.to_str().ok()),
             Some("*")
+        );
+    }
+
+    #[tokio::test]
+    async fn router_does_not_add_cors_headers_to_non_file_api_routes() {
+        let response = router(RelayState::default(), true, true)
+            .oneshot(
+                Request::builder()
+                    .method(Method::OPTIONS)
+                    .uri("/api/unknown")
+                    .header("origin", "http://127.0.0.1:4173")
+                    .header("access-control-request-method", "POST")
+                    .body(Body::empty())
+                    .expect("test request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .is_none()
         );
     }
 

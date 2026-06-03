@@ -593,19 +593,25 @@ pub fn router(protocol: SharedDaemonProtocol, web_enabled: bool) -> Router {
     let router = Router::new()
         .route("/healthz", get(healthz))
         .route("/local/pairing-token", post(local_pairing_token))
-        .route("/api/files/upload/init", post(http_file_upload_init))
-        .route("/api/files/upload", post(http_file_upload_stream))
-        .route("/api/files/upload/abort", post(http_file_upload_abort))
-        .route("/api/files/download", post(http_file_download))
+        .merge(http_file_api_router())
         .route("/ws", get(ws_handler))
-        .with_state(protocol)
-        .layer(http_file_api_cors_layer());
+        .with_state(protocol);
 
     if web_enabled {
         router.fallback(termweb::embedded_web_handler)
     } else {
         router
     }
+}
+
+fn http_file_api_router() -> Router<SharedDaemonProtocol> {
+    Router::new()
+        .route("/api/files/upload/init", post(http_file_upload_init))
+        .route("/api/files/upload", post(http_file_upload_stream))
+        .route("/api/files/upload/abort", post(http_file_upload_abort))
+        .route("/api/files/download", post(http_file_download))
+        // 中文注释：CORS 只允许挂在文件 HTTP 通道上，不能把本地配对等管理端点一起暴露出去。
+        .route_layer(http_file_api_cors_layer())
 }
 
 fn http_file_api_cors_layer() -> CorsLayer {
@@ -4820,6 +4826,7 @@ mod tests {
 
     struct RawHttpResponse {
         status: u16,
+        headers: String,
         body: String,
     }
 
@@ -4851,6 +4858,35 @@ mod tests {
 
         let pair_accept = pair_device_with_http_token(protocol, payload.token).await;
         assert_eq!(pair_accept.server_id, server_id);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn local_pairing_token_endpoint_does_not_expose_cors_headers() {
+        let protocol = test_protocol("local-pairing-token-no-cors");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_protocol = protocol.clone();
+        let server = tokio::spawn(async move {
+            let _ = serve_listener(listener, server_protocol, false).await;
+        });
+        let response = tokio::task::spawn_blocking(move || {
+            post_pairing_token_with_origin(addr, "http://evil.example")
+        })
+        .await
+        .unwrap();
+        server.abort();
+
+        assert_eq!(response.status, 200);
+        // 中文注释：浏览器能否读取跨源响应，关键看真实 POST 响应里有没有 ACAO；
+        // 这里只要不回该头，恶意网页就拿不到 pairing token 明文。
+        assert!(
+            !response
+                .headers
+                .to_ascii_lowercase()
+                .contains("access-control-allow-origin")
+        );
+        let payload: PairingTokenResponse = serde_json::from_str(&response.body).unwrap();
+        assert!(payload.token.starts_with("termd-pair-"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -5301,9 +5337,20 @@ mod tests {
     }
 
     fn post_pairing_token(addr: SocketAddr) -> RawHttpResponse {
+        pairing_token_request(addr, None)
+    }
+
+    fn post_pairing_token_with_origin(addr: SocketAddr, origin: &str) -> RawHttpResponse {
+        pairing_token_request(addr, Some(origin))
+    }
+
+    fn pairing_token_request(addr: SocketAddr, origin: Option<&str>) -> RawHttpResponse {
         let mut stream = std::net::TcpStream::connect(addr).unwrap();
+        let origin_header = origin
+            .map(|value| format!("Origin: {value}\r\n"))
+            .unwrap_or_default();
         let request = format!(
-            "POST /local/pairing-token HTTP/1.1\r\nHost: {addr}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            "POST /local/pairing-token HTTP/1.1\r\nHost: {addr}\r\n{origin_header}Content-Length: 0\r\nConnection: close\r\n\r\n"
         );
         stream.write_all(request.as_bytes()).unwrap();
 
@@ -5322,6 +5369,7 @@ mod tests {
 
         RawHttpResponse {
             status,
+            headers: head.to_owned(),
             body: body.to_owned(),
         }
     }

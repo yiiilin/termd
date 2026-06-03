@@ -14,6 +14,22 @@ version="${1:-}"
 PLACEHOLDER_TEXT="请在 scripts/release-notes.sh 中补充此版本的功能、修复和兼容性说明。"
 
 case "$version" in
+  0.3.13)
+    cat <<'EOF'
+termd 0.3.13
+
+用户可见变化:
+- 修复 0.3.12 中 daemon 本地 pairing token 端点被文件 API 的跨源预检配置误覆盖的问题；浏览器跨源文件上传/下载仍可正常工作，但任意网页不再能读取本机 `/local/pairing-token` 响应。
+- daemon 和 relay 的 HTTP file API CORS 边界都收紧到 `/api/files/*` 四条文件通道，避免把其他管理或 API 路径一并变成跨源入口。
+- 补充回归测试，覆盖“文件 API 预检继续可用”“本地 pairing token 响应不带 CORS 头”“relay 非文件 API 路径不带 CORS 头”，防止后续再次把 CORS layer 挂到整棵 router。
+- 保留 0.3.12 中对 Web 终端满屏滚动/resize 锚点、旧 PWA 缓存清理、relay HTTP tunnel 开关和协议/codec 收敛等修复。
+
+兼容性:
+- packet protocol version 仍为 3，binary protocol version 仍为 2；supervisor 兼容版本仍为 `0.3.5`。
+- 从 0.3.11 升级时，建议直接升级到 0.3.13，不要停留在 0.3.12。
+- relay 仍保持 dumb pipe，不解密、不解析业务明文；HTTP tunnel 仍需显式开启，且 CORS 只覆盖文件传输兼容路径。
+EOF
+    ;;
   0.3.12)
     cat <<'EOF'
 termd 0.3.12
