@@ -195,6 +195,9 @@ seed_termd_runtime_sqlite() {
   local sqlite_file="$1"
   local supervisor_version="$2"
 
+  # GitHub Actions 上偶发会在 Python 连接 SQLite 时看见父目录尚未就绪。
+  # 先显式补目录，避免测试只因为临时路径状态而失败。
+  mkdir -p "$(dirname "$sqlite_file")"
   python3 - "$sqlite_file" "$supervisor_version" <<'PY'
 import sqlite3
 import sys
@@ -237,6 +240,7 @@ PY
 seed_termd_runtime_sqlite_without_supervisor_version() {
   local sqlite_file="$1"
 
+  mkdir -p "$(dirname "$sqlite_file")"
   python3 - "$sqlite_file" <<'PY'
 import sqlite3
 import sys
@@ -429,6 +433,7 @@ test_termd_state_dir_change_clears_only_session_state() (
   sqlite_file="${STATE_DIR}/daemon-state.sqlite"
   socket_file="${STATE_DIR}/termd-supervisors/stale.sock"
 
+  mkdir -p "$(dirname "$sqlite_file")"
   python3 - "$sqlite_file" <<'PY'
 import sqlite3
 import sys
