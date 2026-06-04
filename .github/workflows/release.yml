@@ -116,6 +116,8 @@ jobs:
           npx playwright install --with-deps chromium
 
       - name: Run release QA
+        env:
+          TERMD_QA_SKIP_NPM_CI: 1
         run: bash scripts/qa.sh
 
   package:
