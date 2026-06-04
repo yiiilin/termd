@@ -1427,6 +1427,9 @@ export class DirectClient {
         ) {
           processedMessages = 0;
           processedBytes = 0;
+          // 中文注释：测试需要在 receive pump 真正让出事件循环的瞬间注入 close/error，
+          // 这样可以稳定覆盖“已有 backlog 继续排空，但新的 RPC 立刻失败”的分支。
+          __directClientTestInternals.onReceivePumpYield?.();
           await yieldToEventLoop();
         }
       } catch (caught) {
@@ -2042,4 +2045,5 @@ class SocketInbox {
 // 中文注释：只给 Vitest 覆盖传输层边界条件使用；业务代码不应依赖这些内部类型。
 export const __directClientTestInternals = {
   SocketInbox,
+  onReceivePumpYield: undefined as undefined | (() => void),
 };

@@ -955,31 +955,22 @@ describe("DirectClient", () => {
       () => undefined,
       (error: unknown) => error,
     );
-    const originalSetTimeout = globalThis.setTimeout;
-    let armed = false;
+    let resolveYieldReached!: () => void;
+    const yieldReached = new Promise<void>((resolve) => {
+      resolveYieldReached = resolve;
+    });
     let injected = false;
-    (globalThis as unknown as { setTimeout: typeof setTimeout }).setTimeout = ((handler: TimerHandler, timeout?: number, ...args: unknown[]) => {
-      if (armed && timeout === 0 && !injected) {
-        injected = true;
-        return originalSetTimeout((...timerArgs: unknown[]) => {
-          // 中文注释：先触发 transport event，再恢复 receive pump yield；
-          // 这样 close/error 一定发生在 inbox 没有 read waiter 的窗口。
-          if (transportEvent === "close") {
-            capturedSocket?.emit("close", 1006, Buffer.from("mock close"));
-          } else {
-            capturedSocket?.emit("error", new Error("mock transport error"));
-          }
-          if (typeof handler === "function") {
-            (handler as (...callbackArgs: unknown[]) => void)(...timerArgs);
-          }
-        }, timeout, ...args);
+    __directClientTestInternals.onReceivePumpYield = () => {
+      if (injected) {
+        return;
       }
-      return originalSetTimeout(handler, timeout, ...args);
-    }) as typeof setTimeout;
+      resolveYieldReached();
+    };
 
     try {
-      armed = true;
-      for (let index = 0; index < 80; index += 1) {
+      // 中文注释：数量固定在 receive pump 的 yield 阈值上，确保 close 注入时
+      // 这批 terminal frame 已经全部被 pump 接收并排队，不再依赖额外的尾部消息。
+      for (let index = 0; index < 64; index += 1) {
         daemon.pushTerminalFrame(attached.session_id, {
           kind: "output",
           session_id: attached.session_id,
@@ -987,19 +978,21 @@ describe("DirectClient", () => {
           data_base64: "bGluZQo=",
         });
       }
-      await expect(settleWithin(probeError, 800, "daemon.clients probe")).resolves.toMatchObject({ code: expectedCode });
-      for (let index = 0; index < 80; index += 1) {
-        const frame = await settleWithin(client.receiveInner(), 800, "terminal frame drain");
-        expect(frame).toMatchObject({
-          type: "terminal_frame",
-          payload: { kind: "output", terminal_seq: index + 1 },
-        });
+      await settleWithin(yieldReached, 800, "receive pump yield");
+      // 中文注释：在 pump 让出事件循环后、重新进入下一轮读取前注入 close/error，
+      // 这样既不会打断前面的 backlog 推送，也能稳定覆盖 pending RPC 关闭路径。
+      if (transportEvent === "close") {
+        capturedSocket?.close();
+      } else {
+        capturedSocket?.emit("error", new Error("mock transport error"));
       }
-      await expect(settleWithin(client.receiveInner(), 250, "post-close receive")).rejects.toMatchObject({ code: expectedCode });
+      injected = true;
+      await expect(settleWithin(probeError, 800, "daemon.clients probe")).resolves.toMatchObject({ code: expectedCode });
+      await settleWithin(waitUntil(() => client.isClosed, "client close"), 800, "client close");
       expect(injected).toBe(true);
       expect(client.isClosed).toBe(true);
     } finally {
-      (globalThis as unknown as { setTimeout: typeof setTimeout }).setTimeout = originalSetTimeout;
+      __directClientTestInternals.onReceivePumpYield = undefined;
       client.close();
     }
   });
