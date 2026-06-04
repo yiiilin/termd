@@ -280,7 +280,8 @@ fn spawn_supervisor_from_short_lived_parent(
     let size_base64 =
         general_purpose::STANDARD.encode(serde_json::to_vec(&size).expect("size serializes"));
     let script = r#"
-"$TERMD_BIN" __session-supervisor \
+trap '' HUP
+nohup "$TERMD_BIN" __session-supervisor \
   --session-id "$SESSION_ID" \
   --socket-path "$SOCKET_PATH" \
   --command-base64 "$COMMAND_BASE64" \
