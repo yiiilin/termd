@@ -1,11 +1,7 @@
 import {
   authPayloadForChallenge,
-  daemonE2eeSigningInputBytes,
-  decodeEd25519PublicKey,
-  e2eeAuthTranscriptDigestWire,
   signAuthPayload,
   signHttpE2eeAuthPayload,
-  verifyEd25519Signature,
 } from "./auth";
 import {
   E2eeSession,
@@ -17,9 +13,39 @@ import {
   decodeBinaryProtocolPacket,
   encodeBinaryProtocolPacket,
 } from "./binary-packet";
+import { type DirectClientInbox, performDirectHandshake } from "./direct-handshake";
 import { ProtocolClientError, protocolError } from "./errors";
+import {
+  HttpFileTransferUnsupported,
+  type HttpE2eeFetchOptions,
+  blobSliceBytes,
+  bodyToArrayBuffer,
+  buildHttpUploadChunkBody,
+  concatByteChunks,
+  decodeHttpE2eeErrorResponse,
+  decodeHttpE2eeFrames,
+  decodeHttpE2eeReadable,
+  encodeHttpE2eeFrames,
+  fileNameFromPath,
+  httpUrlFromSocketUrl,
+  isHttpFileTransferUnsupported,
+  isReadableStreamBody,
+  parseHttpJsonFrame,
+  readBlobBytes,
+} from "./http-e2ee";
 import { envelopeTypeForProtocolEventMethod } from "./methods";
 import { binaryPacketToProtocol, protocolPacketToBinary } from "./packet-codec";
+import {
+  abortedConnectionError,
+  expectQueuedEnvelope,
+  isAbortError,
+  messageDataToBytes,
+  queuedMessageBytes,
+  sendOuterMessage,
+  type QueuedMessage,
+  withTimeout,
+  yieldToEventLoop,
+} from "./socket-transport";
 import { BINARY_PROTOCOL_VERSION, PROTOCOL_PACKET_VERSION } from "./types";
 import { recordTermdDiagnostic } from "../diagnostics";
 import type {
@@ -119,11 +145,6 @@ interface DirectClientOptions {
   signal?: AbortSignal;
 }
 
-interface QueuedMessage {
-  envelope?: Envelope;
-  binary?: Uint8Array;
-}
-
 interface PendingRequest {
   method: string;
   resolve: (payload: unknown) => void;
@@ -187,9 +208,6 @@ const RECEIVE_PUMP_YIELD_BYTES = 256 * 1024;
 const FILE_TRANSFER_CHUNK_BYTES = 256 * 1024;
 const HTTP_UPLOAD_CHUNK_BYTES = 10 * 1024 * 1024;
 const HTTP_UPLOAD_MAX_PARALLEL_CHUNKS = 2;
-// 中文注释：10MiB 是一次 HTTP POST 的业务分片大小；E2EE frame 仍必须小于
-// daemon/浏览器共同的 2MiB frame cap，所以每个 POST 内部再拆成较小加密帧。
-const HTTP_UPLOAD_FRAME_PLAINTEXT_BYTES = 1024 * 1024;
 // 中文注释：正常上传仍依赖 HTTP 连接背压；这个宽限只处理连接半开但 fetch 永不返回的故障态。
 // 10MiB/10min 约等于 17KiB/s，已经覆盖很差的实际网络。
 const HTTP_UPLOAD_CHUNK_TIMEOUT_MS = 10 * 60 * 1000;
@@ -199,29 +217,8 @@ const FILE_TRANSFER_WEBSOCKET_COMPAT_MAX_BYTES = 16 * 1024 * 1024;
 // 中文注释：RPC file_write/file_read 只服务浏览器内置文本编辑器和很小的兼容上传；
 // 大文件必须走 HTTP E2EE 或 binary stream，不能再整包 base64 进入 RPC。
 const SESSION_FILE_RPC_MAX_BYTES = 1024 * 1024;
-const HTTP_E2EE_MAX_FRAME_BYTES = 2 * 1024 * 1024;
-const HTTP_E2EE_MAX_PENDING_BYTES = 4 + HTTP_E2EE_MAX_FRAME_BYTES;
-
-interface HttpE2eeFetchOptions {
-  timeoutMs?: number;
-  firstFrameTimeoutMs?: number;
-  onFrame?: (frame: Uint8Array) => void | Promise<void>;
-  collectFrames?: boolean;
-  signal?: AbortSignal;
-}
 
 export { ProtocolClientError };
-
-function queuedMessageBytes(message: QueuedMessage): number {
-  if (message.binary) {
-    return message.binary.byteLength;
-  }
-  return 0;
-}
-
-function yieldToEventLoop(): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, 0));
-}
 
 export class DirectClient {
   private readonly timeoutMs: number;
@@ -243,7 +240,7 @@ export class DirectClient {
 
   private constructor(
     private readonly socket: WebSocket,
-    private readonly inbox: SocketInbox,
+    private readonly inbox: DirectClientInbox,
     private readonly socketUrl: string,
     private readonly serverIdValue: UUID,
     private readonly deviceId: UUID,
@@ -267,152 +264,29 @@ export class DirectClient {
     const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     const socketOpenTimeoutMs = options.socketOpenTimeoutMs ?? timeoutMs;
     const requestTimeoutMs = options.requestTimeoutMs ?? timeoutMs;
-    const abortSignal = options.signal;
-    let socket: WebSocket | undefined;
-    let inbox: SocketInbox | undefined;
-    const closeSocketOnAbort = () => socket?.close();
-    abortSignal?.addEventListener("abort", closeSocketOnAbort, { once: true });
-
-    try {
-      throwIfAborted(abortSignal);
-      socket = await openWebSocket(url, {
-        timeoutMs: socketOpenTimeoutMs,
-        hedgeDelayMs: options.socketOpenHedgeDelayMs,
-        webSocketFactory: options.webSocketFactory,
-        signal: abortSignal,
-      });
-      inbox = new SocketInbox(socket);
-
-      // route_hello 是统一 /ws 入口的第一帧；relay/daemon 先确认路由，再进入原有业务握手。
-      sendOuterMessage(
-        socket,
-        envelope("route_hello", {
-          server_id: routeServerId,
-          role: "client",
-          protocol_version: PROTOCOL_PACKET_VERSION,
-          nonce: nonce(),
-          timestamp_ms: nowMs(),
-        }),
-      );
-      const routeReady = expectQueuedEnvelope(
-        await withAbort(
-          withTimeout(inbox.read(), timeoutMs, "route_prelude_timeout"),
-          abortSignal,
-        ),
-      );
-      if (routeReady.type === "error") {
-        throw protocolError(routeReady.payload as ErrorPayload);
-      }
-      if (routeReady.type !== "route_ready") {
-        throw new ProtocolClientError("unexpected_message", "unexpected route prelude message");
-      }
-      const routeReadyPayload = routeReady.payload as RouteReadyPayload;
-      if (routeReadyPayload.server_id !== routeServerId || routeReadyPayload.role !== "client") {
-        throw new ProtocolClientError("route_server_mismatch", "route prelude does not match requested daemon");
-      }
-
-      const initial = (
-        await withAbort(
-          withTimeout(Promise.all([inbox.read(), inbox.read()]), timeoutMs, "handshake_timeout"),
-          abortSignal,
-        )
-      ).map(expectQueuedEnvelope);
-
-      const expectedDaemonPublicKey = options.expectedDaemonPublicKey;
-      if (!expectedDaemonPublicKey) {
-        throw new ProtocolClientError("daemon_identity_required", "daemon public key is required");
-      }
-
-      let daemonKeyExchange: E2eeKeyExchangePayload | undefined;
-      for (const message of initial) {
-        if (message.type === "hello") {
-          const payload = message.payload as HelloPayload;
-          if (payload.server_id && payload.server_id !== routeServerId) {
-            throw new ProtocolClientError("route_server_mismatch", "daemon hello does not match requested route");
-          }
-        } else if (message.type === "e2ee_key_exchange") {
-          const payload = message.payload as E2eeKeyExchangePayload;
-          if (payload.server_id !== routeServerId) {
-            throw new ProtocolClientError("route_server_mismatch", "daemon key exchange does not match requested route");
-          }
-          if (payload.packet_version !== PROTOCOL_PACKET_VERSION) {
-            throw new ProtocolClientError("unsupported_protocol_version", "daemon key exchange does not support packet v3");
-          }
-          if (!payload.signature) {
-            throw new ProtocolClientError("invalid_handshake", "daemon key exchange is unsigned");
-          }
-          const verified = await verifyEd25519Signature(
-            decodeEd25519PublicKey(expectedDaemonPublicKey),
-            daemonE2eeSigningInputBytes(payload, {
-              server_id: routeServerId,
-              daemon_public_key: expectedDaemonPublicKey,
-            }),
-            payload.signature,
-          );
-          if (!verified) {
-            throw new ProtocolClientError("daemon_identity_mismatch", "daemon key exchange signature is invalid");
-          }
-          daemonKeyExchange = payload;
-        } else if (message.type === "error") {
-          throw protocolError(message.payload as ErrorPayload);
-        } else {
-          throw new ProtocolClientError("unexpected_message", "unexpected handshake message");
-        }
-      }
-
-      if (!daemonKeyExchange) {
-        throw new ProtocolClientError("invalid_handshake", "daemon handshake was incomplete");
-      }
-
-      const keypair = generateE2eeKeyPair();
-      const e2ee = E2eeSession.device({
-        serverId: routeServerId,
-        deviceId,
-        localKeypair: keypair,
-        daemonPublicKeyWire: daemonKeyExchange.public_key,
-      });
-      const binaryMode = daemonKeyExchange.binary_version === BINARY_PROTOCOL_VERSION;
-      const client = new DirectClient(
-        socket,
-        inbox,
-        url,
-        routeServerId,
-        deviceId,
-        daemonKeyExchange.public_key,
-        e2ee,
-        { timeoutMs, requestTimeoutMs },
-        binaryMode,
-      );
-      const deviceKeyExchange: E2eeKeyExchangePayload = {
-        server_id: routeServerId,
-        device_id: deviceId,
-        public_key: keypair.publicKeyWire,
-        nonce: nonce(),
-        timestamp_ms: nowMs(),
-        packet_version: PROTOCOL_PACKET_VERSION,
-        ...(binaryMode ? { binary_version: BINARY_PROTOCOL_VERSION } : {}),
-      };
-      client.sendOuter(
-        envelope("e2ee_key_exchange", deviceKeyExchange),
-      );
-      client.e2eeTranscriptSha256 = e2eeAuthTranscriptDigestWire(
-        daemonKeyExchange,
-        deviceKeyExchange,
-        {
-          server_id: routeServerId,
-          daemon_public_key: expectedDaemonPublicKey,
-        },
-      );
-      client.startReceivePump();
-      return client;
-    } catch (error) {
-      // 连接建立阶段一旦超时或握手失败，必须关闭半开 socket，避免 relay 侧残留旧 client。
-      socket?.close();
-      inbox?.rejectPending(new ProtocolClientError("connection_closed", "connection closed"));
-      throw error;
-    } finally {
-      abortSignal?.removeEventListener("abort", closeSocketOnAbort);
-    }
+    const handshake = await performDirectHandshake(url, routeServerId, deviceId, {
+      timeoutMs,
+      socketOpenTimeoutMs,
+      socketOpenHedgeDelayMs: options.socketOpenHedgeDelayMs,
+      expectedDaemonPublicKey: options.expectedDaemonPublicKey,
+      webSocketFactory: options.webSocketFactory,
+      signal: options.signal,
+      createInbox: (socket) => new SocketInbox(socket),
+    });
+    const client = new DirectClient(
+      handshake.socket,
+      handshake.inbox,
+      url,
+      routeServerId,
+      deviceId,
+      handshake.daemonE2eePublicKeyWire,
+      handshake.e2ee,
+      { timeoutMs, requestTimeoutMs },
+      handshake.binaryMode,
+    );
+    client.e2eeTranscriptSha256 = handshake.e2eeTranscriptSha256;
+    client.startReceivePump();
+    return client;
   }
 
   get serverId(): UUID {
@@ -2107,18 +1981,24 @@ class SocketInbox {
       return Promise.resolve(this.queue.shift()!);
     }
     if (this.closedError) {
-      return Promise.reject(this.closedError);
+      return this.rejectedRead(this.closedError);
     }
     if (this.socket.readyState === WebSocket.CLOSING || this.socket.readyState === WebSocket.CLOSED) {
       // 中文注释：极端事件顺序下 close 事件可能还没派发，但 readyState 已关闭；
       // read 不能继续挂起，否则上层 receive pump 无法进入重连路径。
       this.closedError = new ProtocolClientError("connection_closed", "connection closed");
-      return Promise.reject(this.closedError);
+      return this.rejectedRead(this.closedError);
     }
-    return new Promise((resolve, reject) => {
+    const pending = new Promise<QueuedMessage>((resolve, reject) => {
       this.waiters.push(resolve);
       this.errors.push(reject);
     });
+    // 中文注释：SocketInbox 是 DirectClient 内部队列，WebSocket close/error 会从事件回调
+    // 异步拒绝这个 promise；先挂一个空 catch 只用于标记“拒绝已被观察”，避免
+    // Node/Vitest 在上层 receive pump 接管前把它判定为未处理拒绝。原 promise 仍保持
+    // rejected 状态，调用方的 await / expect(...).rejects 能照常拿到同一个错误。
+    void pending.catch(() => {});
+    return pending;
   }
 
   rejectPending(error: Error): void {
@@ -2149,469 +2029,17 @@ class SocketInbox {
       this.rejectPending(error instanceof Error ? error : new Error("invalid_envelope"));
     }
   }
+
+  private rejectedRead(error: Error): Promise<QueuedMessage> {
+    const pending = Promise.reject<QueuedMessage>(error);
+    // 中文注释：和 pending read 一样，立即失败的 read 也先标记为已观察；
+    // 这不吞错误，只避免内部状态检查路径产生测试环境里的未处理拒绝噪声。
+    void pending.catch(() => {});
+    return pending;
+  }
 }
 
 // 中文注释：只给 Vitest 覆盖传输层边界条件使用；业务代码不应依赖这些内部类型。
 export const __directClientTestInternals = {
   SocketInbox,
 };
-
-function expectQueuedEnvelope(message: QueuedMessage): Envelope {
-  if (!message.envelope) {
-    throw new ProtocolClientError("unexpected_message", "expected JSON outer message");
-  }
-  return message.envelope;
-}
-
-async function messageDataToBytes(data: unknown): Promise<Uint8Array> {
-  if (data instanceof Blob) {
-    return new Uint8Array(await data.arrayBuffer());
-  }
-  if (data instanceof ArrayBuffer || Object.prototype.toString.call(data) === "[object ArrayBuffer]") {
-    return new Uint8Array(data as ArrayBuffer);
-  }
-  if (ArrayBuffer.isView(data)) {
-    const view = data as ArrayBufferView;
-    return new Uint8Array(new Uint8Array(view.buffer, view.byteOffset, view.byteLength));
-  }
-  return encodeUtf8(String(data));
-}
-
-function sendOuterMessage(socket: WebSocket, message: Envelope): void {
-  socket.send(JSON.stringify(message));
-}
-
-function concatByteChunks(chunks: Uint8Array[]): Uint8Array {
-  const length = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
-  const out = new Uint8Array(length);
-  let offset = 0;
-  for (const chunk of chunks) {
-    out.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return out;
-}
-
-class HttpFileTransferUnsupported extends Error {
-  constructor() {
-    super("http_file_transfer_unsupported");
-  }
-}
-
-function isHttpFileTransferUnsupported(error: unknown): boolean {
-  return error instanceof HttpFileTransferUnsupported;
-}
-
-function isReadableStreamBody(body: BodyInit): boolean {
-  return typeof ReadableStream !== "undefined" && body instanceof ReadableStream;
-}
-
-function encodeHttpE2eeFrame(e2ee: E2eeSession, plaintext: Uint8Array): Uint8Array {
-  const encrypted = encodeBinaryEncryptedFrame(e2ee.encryptBinary(plaintext));
-  if (encrypted.byteLength > HTTP_E2EE_MAX_FRAME_BYTES) {
-    throw new ProtocolClientError("invalid_file_transfer", "HTTP E2EE frame exceeds transport limit");
-  }
-  const frame = new Uint8Array(4 + encrypted.byteLength);
-  new DataView(frame.buffer, frame.byteOffset, 4).setUint32(0, encrypted.byteLength, false);
-  frame.set(encrypted, 4);
-  return frame;
-}
-
-function encodeHttpE2eeFrames(e2ee: E2eeSession, plaintextFrames: Uint8Array[]): Uint8Array {
-  return concatByteChunks(plaintextFrames.map((plaintext) => encodeHttpE2eeFrame(e2ee, plaintext)));
-}
-
-function bytesToBlobPart(bytes: Uint8Array): BlobPart {
-  // 中文注释：这里的 Uint8Array 都由本地加密/封包代码创建，底层一定是 ArrayBuffer；
-  // TypeScript 只能看到 ArrayBufferLike，直接窄化避免为每个上传分片再复制一次内存。
-  return bytes as Uint8Array<ArrayBuffer>;
-}
-
-function decodeHttpE2eeFrames(e2ee: E2eeSession, wire: Uint8Array): Uint8Array[] {
-  const frames: Uint8Array[] = [];
-  let offset = 0;
-  while (offset < wire.byteLength) {
-    if (wire.byteLength - offset < 4) {
-      throw new ProtocolClientError("invalid_file_transfer", "invalid HTTP E2EE frame length");
-    }
-    const len = new DataView(wire.buffer, wire.byteOffset + offset, 4).getUint32(0, false);
-    offset += 4;
-    if (len === 0 || len > HTTP_E2EE_MAX_FRAME_BYTES || wire.byteLength - offset < len) {
-      throw new ProtocolClientError("invalid_file_transfer", "invalid HTTP E2EE frame body");
-    }
-    const encrypted = decodeBinaryEncryptedFrame(wire.slice(offset, offset + len));
-    offset += len;
-    frames.push(e2ee.decryptBinary(encrypted));
-  }
-  return frames;
-}
-
-async function decodeHttpE2eeReadable(
-  e2ee: E2eeSession,
-  body: ReadableStream<Uint8Array>,
-  onFrame?: (frame: Uint8Array) => void | Promise<void>,
-  collectFrames = true,
-  onError?: () => void,
-): Promise<Uint8Array[]> {
-  const reader = body.getReader();
-  const frames: Uint8Array[] = [];
-  let pending: Uint8Array<ArrayBufferLike> = new Uint8Array();
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (value) {
-        let valueOffset = 0;
-        while (valueOffset < value.byteLength) {
-          const capacity = HTTP_E2EE_MAX_PENDING_BYTES - pending.byteLength;
-          if (capacity <= 0) {
-            throw new ProtocolClientError("invalid_file_transfer", "invalid HTTP E2EE frame body");
-          }
-          // 中文注释：底层 ReadableStream chunk 可能合并多个合法帧；分段搬运能在
-          // append 前做内存上限保护，同时不误伤合并帧。
-          const take = Math.min(capacity, value.byteLength - valueOffset);
-          pending = concatByteChunks([pending, value.slice(valueOffset, valueOffset + take)]);
-          valueOffset += take;
-          while (pending.byteLength >= 4) {
-            const len = new DataView(pending.buffer, pending.byteOffset, 4).getUint32(0, false);
-            if (len === 0 || len > HTTP_E2EE_MAX_FRAME_BYTES) {
-              throw new ProtocolClientError("invalid_file_transfer", "invalid HTTP E2EE frame body");
-            }
-            if (pending.byteLength < 4 + len) {
-              break;
-            }
-            const encrypted = decodeBinaryEncryptedFrame(pending.slice(4, 4 + len));
-            const plaintext = e2ee.decryptBinary(encrypted);
-            if (collectFrames) {
-              frames.push(plaintext);
-            }
-            await onFrame?.(plaintext);
-            pending = pending.slice(4 + len);
-          }
-        }
-      }
-      if (done) {
-        if (pending.byteLength !== 0) {
-          throw new ProtocolClientError("invalid_file_transfer", "truncated HTTP E2EE frame");
-        }
-        return frames;
-      }
-    }
-  } catch (error) {
-    onError?.();
-    try {
-      await reader.cancel();
-    } catch {
-      // 中文注释：原始错误更重要；cancel 只是为了通知 fetch/relay/daemon 停止推流。
-    }
-    throw error;
-  } finally {
-    reader.releaseLock();
-  }
-}
-
-function buildHttpUploadChunkBody(
-  e2ee: E2eeSession,
-  metaFrame: Uint8Array,
-  chunk?: Uint8Array,
-): Blob {
-  const parts: BlobPart[] = [bytesToBlobPart(encodeHttpE2eeFrame(e2ee, metaFrame))];
-  if (chunk) {
-    for (let offset = 0; offset < chunk.byteLength; offset += HTTP_UPLOAD_FRAME_PLAINTEXT_BYTES) {
-      // 中文注释：业务分片保持 10MiB，密文帧按 1MiB 切开，避免触发 daemon 的
-      // HTTP_E2EE_MAX_FRAME_BYTES 防护，同时让后端可边解密边 seek patch 目标文件。
-      parts.push(bytesToBlobPart(encodeHttpE2eeFrame(
-        e2ee,
-        chunk.slice(offset, Math.min(chunk.byteLength, offset + HTTP_UPLOAD_FRAME_PLAINTEXT_BYTES)),
-      )));
-    }
-  }
-  return new Blob(parts, { type: "application/octet-stream" });
-}
-
-function parseHttpJsonFrame<T>(frame: Uint8Array | undefined): T {
-  if (!frame) {
-    throw new ProtocolClientError("invalid_file_transfer", "missing HTTP E2EE JSON frame");
-  }
-  return JSON.parse(decodeUtf8(frame)) as T;
-}
-
-async function decodeHttpE2eeErrorResponse(response: Response, e2ee: E2eeSession): Promise<ErrorPayload> {
-  const fallback: ErrorPayload = {
-    code: "http_file_transfer_failed",
-    message: "HTTP file transfer failed",
-  };
-  let body: Uint8Array;
-  try {
-    body = new Uint8Array(await response.arrayBuffer());
-  } catch {
-    return fallback;
-  }
-
-  // 中文注释：post-auth HTTP 文件错误由 daemon 放在 E2EE frame 里返回；relay 仍只看密文。
-  try {
-    const frames = decodeHttpE2eeFrames(e2ee, body);
-    const payload = parseHttpJsonFrame<ErrorPayload>(frames[0]);
-    if (isErrorPayload(payload)) {
-      return payload;
-    }
-  } catch {
-    // 兼容未进入 E2EE 的明文 HTTP 错误，例如反代或旧服务返回的 JSON。
-  }
-
-  try {
-    const payload = JSON.parse(decodeUtf8(body)) as unknown;
-    if (isErrorPayload(payload)) {
-      return payload;
-    }
-  } catch {
-    // Keep the stable generic error when the response is not a protocol JSON error.
-  }
-  return fallback;
-}
-
-function isErrorPayload(payload: unknown): payload is ErrorPayload {
-  return (
-    typeof payload === "object" &&
-    payload !== null &&
-    typeof (payload as ErrorPayload).code === "string" &&
-    typeof (payload as ErrorPayload).message === "string"
-  );
-}
-
-function httpUrlFromSocketUrl(socketUrl: string, path: string): string {
-  const url = new URL(socketUrl);
-  url.protocol = url.protocol === "wss:" ? "https:" : "http:";
-  const socketPath = url.pathname.replace(/\/+$/, "");
-  const prefix = socketPath.endsWith("/ws") ? socketPath.slice(0, -"/ws".length) : socketPath;
-  const apiPath = path.startsWith("/") ? path : `/${path}`;
-  // 中文注释：relay/daemon 可能部署在 `/termd/ws` 这类子路径下；HTTP API 要复用
-  // 同一个前缀和 query，否则会绕到站点根路径或丢失 relay token。
-  url.pathname = `${prefix}${apiPath}` || "/";
-  url.hash = "";
-  return url.toString();
-}
-
-function fileNameFromPath(path: string): string {
-  return path.split(/[\\/]/).filter(Boolean).pop() || "download";
-}
-
-function bodyToArrayBuffer(bytes: Uint8Array): ArrayBuffer {
-  const copy = new Uint8Array(bytes.byteLength);
-  copy.set(bytes);
-  return copy.buffer;
-}
-
-async function blobSliceBytes(blob: Blob, start: number, end: number): Promise<Uint8Array> {
-  const sliced = blob.slice(start, end);
-  return readBlobBytes(sliced);
-}
-
-async function readBlobBytes(blob: Blob): Promise<Uint8Array> {
-  if (typeof blob.arrayBuffer === "function") {
-    return new Uint8Array(await blob.arrayBuffer());
-  }
-  if (typeof FileReader !== "undefined") {
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onerror = () => reject(reader.error ?? new Error("failed to read blob"));
-      reader.onload = () => {
-        const result = reader.result;
-        if (result instanceof ArrayBuffer) {
-          resolve(new Uint8Array(result));
-          return;
-        }
-        reject(new Error("failed to read blob as bytes"));
-      };
-      // jsdom 的 File/Blob 缺少 arrayBuffer；FileReader 路径让测试和旧浏览器都能读出原始字节。
-      reader.readAsArrayBuffer(blob);
-    });
-  }
-  throw new Error("blob byte reading is not supported in this environment");
-}
-
-interface OpenWebSocketOptions {
-  timeoutMs: number;
-  hedgeDelayMs?: number;
-  webSocketFactory?: (url: string) => WebSocket;
-  signal?: AbortSignal;
-}
-
-function openWebSocket(url: string, options: OpenWebSocketOptions): Promise<WebSocket> {
-  const maxSockets = options.hedgeDelayMs && options.hedgeDelayMs > 0 ? 2 : 1;
-  const sockets: WebSocket[] = [];
-  const timers = new Set<ReturnType<typeof setTimeout>>();
-  let settled = false;
-  let started = 0;
-  let active = 0;
-  let lastError: Error = new ProtocolClientError("connect_timeout", "operation timed out");
-
-  const closeSocket = (socket: WebSocket) => {
-    try {
-      socket.close();
-    } catch {
-      // 浏览器 WebSocket close 本身不应影响连接重试路径。
-    }
-  };
-  const closeLosers = (winner?: WebSocket) => {
-    for (const socket of sockets) {
-      if (socket !== winner) {
-        closeSocket(socket);
-      }
-    }
-  };
-  const clearTimers = () => {
-    for (const timer of timers) {
-      clearTimeout(timer);
-    }
-    timers.clear();
-  };
-
-  return new Promise((resolve, reject) => {
-    const finishReject = (error: Error) => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      clearTimers();
-      closeLosers();
-      options.signal?.removeEventListener("abort", abort);
-      reject(error);
-    };
-    const finishResolve = (socket: WebSocket) => {
-      if (settled) {
-        closeSocket(socket);
-        return;
-      }
-      settled = true;
-      clearTimers();
-      closeLosers(socket);
-      options.signal?.removeEventListener("abort", abort);
-      resolve(socket);
-    };
-    const maybeStartAnother = () => {
-      if (!settled && started < maxSockets) {
-        startSocket();
-        return true;
-      }
-      return false;
-    };
-    const maybeReject = () => {
-      if (!settled && active === 0 && started >= maxSockets) {
-        finishReject(lastError);
-      }
-    };
-    const startSocket = () => {
-      started += 1;
-      active += 1;
-      const candidate = options.webSocketFactory?.(url) ?? new WebSocket(url);
-      candidate.binaryType = "arraybuffer";
-      sockets.push(candidate);
-
-      // 中文注释：公网 relay 偶发卡在 TCP/TLS/WebSocket open 阶段。hedge 会在首条
-      // 连接迟迟不 open 时并行开第二条，谁先 open 用谁，避免等待坏握手完整超时。
-      waitForOpen(candidate, options.timeoutMs).then(
-        () => finishResolve(candidate),
-        (error) => {
-          active -= 1;
-          lastError = error instanceof Error ? error : new ProtocolClientError("connect_timeout", "operation timed out");
-          if (!maybeStartAnother()) {
-            maybeReject();
-          }
-        },
-      );
-    };
-    const abort = () => finishReject(abortedConnectionError());
-
-    if (options.signal?.aborted) {
-      finishReject(abortedConnectionError());
-      return;
-    }
-    options.signal?.addEventListener("abort", abort, { once: true });
-    startSocket();
-    if (maxSockets > 1) {
-      const timer = setTimeout(() => {
-        timers.delete(timer);
-        maybeStartAnother();
-      }, options.hedgeDelayMs);
-      timers.add(timer);
-    }
-  });
-}
-
-function waitForOpen(socket: WebSocket, timeoutMs: number): Promise<void> {
-  if (socket.readyState === WebSocket.OPEN) {
-    return Promise.resolve();
-  }
-  if (socket.readyState === WebSocket.CLOSING || socket.readyState === WebSocket.CLOSED) {
-    return Promise.reject(new ProtocolClientError("connection_closed", "connection closed"));
-  }
-  return withTimeout(
-    new Promise((resolve, reject) => {
-      socket.addEventListener("open", () => resolve(undefined), { once: true });
-      socket.addEventListener("error", () => reject(new ProtocolClientError("connection_error", "connection error")), {
-        once: true,
-      });
-      // 连接拒绝可能在 error 监听器注册前已经推进到 CLOSED；监听 close 并在注册后再检查一次，
-      // 避免不可用 daemon 让前端一直等到完整握手超时。
-      socket.addEventListener("close", () => reject(new ProtocolClientError("connection_closed", "connection closed")), {
-        once: true,
-      });
-      if (socket.readyState === WebSocket.CLOSING || socket.readyState === WebSocket.CLOSED) {
-        reject(new ProtocolClientError("connection_closed", "connection closed"));
-      }
-    }),
-    timeoutMs,
-    "connect_timeout",
-  );
-}
-
-function abortedConnectionError(): ProtocolClientError {
-  return new ProtocolClientError("connection_closed", "connection closed");
-}
-
-function isAbortError(error: unknown): boolean {
-  return error instanceof DOMException && error.name === "AbortError";
-}
-
-function throwIfAborted(signal?: AbortSignal): void {
-  if (signal?.aborted) {
-    throw abortedConnectionError();
-  }
-}
-
-function withAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
-  if (!signal) {
-    return promise;
-  }
-  throwIfAborted(signal);
-  return new Promise((resolve, reject) => {
-    const abort = () => reject(abortedConnectionError());
-    signal.addEventListener("abort", abort, { once: true });
-    promise.then(
-      (value) => {
-        signal.removeEventListener("abort", abort);
-        resolve(value);
-      },
-      (error) => {
-        signal.removeEventListener("abort", abort);
-        reject(error);
-      },
-    );
-  });
-}
-
-function withTimeout<T>(promise: Promise<T>, timeoutMs: number, code: string): Promise<T> {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new ProtocolClientError(code, "operation timed out")), timeoutMs);
-    promise.then(
-      (value) => {
-        clearTimeout(timer);
-        resolve(value);
-      },
-      (error) => {
-        clearTimeout(timer);
-        reject(error);
-      },
-    );
-  });
-}

@@ -784,6 +784,12 @@ async fn send_route_hello_with_data(
     client_id: Option<RelayClientId>,
     data_token: Option<Nonce>,
 ) -> Result<(), tokio_tungstenite::tungstenite::Error> {
+    let route_generation = match role {
+        RouteRole::DaemonControl | RouteRole::DaemonData => {
+            Some(Nonce(format!("relay-e2e-route-generation-{}", server_id.0)))
+        }
+        RouteRole::Client | RouteRole::DaemonMux => None,
+    };
     let route_hello = Envelope::new(
         MessageType::RouteHello,
         RouteHelloPayload {
@@ -791,7 +797,7 @@ async fn send_route_hello_with_data(
             role,
             protocol_version: ProtocolVersion::default(),
             nonce: Nonce(format!("route-nonce-{}", Uuid::new_v4())),
-            route_generation: None,
+            route_generation,
             client_id,
             data_token,
             timestamp_ms: current_unix_timestamp_millis(),

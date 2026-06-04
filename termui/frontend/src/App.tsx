@@ -17,6 +17,7 @@ import {
 } from "lucide-react";
 import { DirectClient, ProtocolClientError } from "./protocol/direct-client";
 import { toSafeError } from "./protocol/errors";
+import { connectPairingClient } from "./protocol/pairing-client";
 import { parsePairingQrPayload } from "./protocol/pairing-payload";
 import type {
   BrowserState,
@@ -28,16 +29,13 @@ import type {
   SessionCursorPresence,
   SessionAttachedPayload,
   SessionFileEntryPayload,
-  SessionGitActionKind,
   SessionGitFileChangePayload,
-  SessionGitDiffResultPayload,
   SessionGitWorktreePayload,
   SessionSearchResultPayload,
   SessionSummaryPayload,
   TerminalSize,
   UUID,
 } from "./protocol/types";
-import { sessionDataFromBase64 } from "./protocol/wire";
 import {
   defaultServer,
   DEFAULT_BROWSER_PREFERENCES,
@@ -66,7 +64,14 @@ import {
   useTerminalReceiveLoop,
   useTerminalReconnectScheduler,
 } from "./hooks/useTerminalAttach";
-import { useSessionFiles, useSessionFileLoaders } from "./hooks/useSessionFiles";
+import {
+  useSessionFiles,
+  useSessionFileEditor,
+  useSessionFileLoaders,
+  useSessionMutationActions,
+  useSessionFilesPanelActions,
+  useSessionGitDiffViewer,
+} from "./hooks/useSessionFiles";
 import { PairingQrScanner } from "./components/PairingQrScanner";
 import { SettingsDialog } from "./components/SettingsDialog";
 import { sessionDisplayName } from "./session-names";
@@ -187,96 +192,6 @@ function isTerminalTransportPaused(): boolean {
   return isBrowserOffline();
 }
 
-function terminalTransportPausedError(): ProtocolClientError {
-  return new ProtocolClientError("connection_closed", "connection paused while browser is offline");
-}
-
-function createTransportAbortController(): { controller: AbortController; dispose: () => void } | undefined {
-  if (typeof window === "undefined") {
-    return undefined;
-  }
-  const controller = new AbortController();
-  const abortWhenOffline = () => {
-    if (isTerminalTransportPaused()) {
-      controller.abort();
-    }
-  };
-  window.addEventListener("offline", abortWhenOffline);
-  abortWhenOffline();
-  return {
-    controller,
-    dispose: () => {
-      window.removeEventListener("offline", abortWhenOffline);
-    },
-  };
-}
-
-function createLinkedAbortController(
-  ...signals: Array<AbortSignal | undefined>
-): { controller: AbortController; dispose: () => void } | undefined {
-  const activeSignals = signals.filter((signal): signal is AbortSignal => Boolean(signal));
-  if (activeSignals.length === 0) {
-    return undefined;
-  }
-  const controller = new AbortController();
-  const abortLinked = () => controller.abort();
-  for (const signal of activeSignals) {
-    if (signal.aborted) {
-      controller.abort();
-      continue;
-    }
-    signal.addEventListener("abort", abortLinked, { once: true });
-  }
-  return {
-    controller,
-    dispose: () => {
-      for (const signal of activeSignals) {
-        signal.removeEventListener("abort", abortLinked);
-      }
-    },
-  };
-}
-
-function connectionAbortedError(): ProtocolClientError {
-  return new ProtocolClientError("connection_closed", "connection closed");
-}
-
-function throwIfConnectionAborted(signal?: AbortSignal): void {
-  if (signal?.aborted) {
-    throw connectionAbortedError();
-  }
-}
-
-function abortableConnectionStep<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
-  if (!signal) {
-    return promise;
-  }
-  throwIfConnectionAborted(signal);
-  return new Promise((resolve, reject) => {
-    const abort = () => reject(connectionAbortedError());
-    signal.addEventListener("abort", abort, { once: true });
-    promise.then(
-      (value) => {
-        signal.removeEventListener("abort", abort);
-        resolve(value);
-      },
-      (error) => {
-        signal.removeEventListener("abort", abort);
-        reject(error);
-      },
-    );
-  });
-}
-
-function waitForConnectionRetryDelay(signal?: AbortSignal): Promise<void> {
-  return abortableConnectionStep(
-    new Promise((resolve) => {
-      globalThis.setTimeout(resolve, APP_SOCKET_CONNECT_RETRY_DELAY_MS);
-    }),
-    signal,
-  );
-}
-
 export interface DaemonNetworkCounterSample {
   rxBytes: number;
   txBytes: number;
@@ -315,22 +230,35 @@ export default function App() {
   const [terminalOutputResetVersion, setTerminalOutputResetVersion] = useState(0);
   const [terminalFocusRequest, setTerminalFocusRequest] = useState(0);
   const sessionFilesController = useSessionFiles();
-  const workspaceConnection = useWorkspaceConnection();
   const terminalAttachController = useTerminalAttach();
-  const fileOpenRequestSeqRef = useRef(0);
-  const activeFileOpenRequestRef = useRef<{
-    requestId: number;
-    sessionId: UUID;
-    path: string;
-  } | undefined>(undefined);
-  const gitDiffOpenRequestSeqRef = useRef(0);
-  const activeGitDiffOpenRequestRef = useRef<{
-    requestId: number;
-    sessionId: UUID;
-    worktreePath: string;
-    filePath?: string;
-    staged: boolean;
-  } | undefined>(undefined);
+  const activeServer = useMemo<PairedServerState | undefined>(() => defaultServer(state), [state]);
+  const resolveWorkspaceRouteUrls = useCallback(
+    (server: PairedServerState) => knownServerWsUrlCandidates(server.url, server.server_id),
+    [],
+  );
+  const handleBrokenAttachedClient = useCallback(
+    (client: DirectClient, caught: unknown) => terminalAttachController.attachReconnectHandlerRef.current(client, caught),
+    [terminalAttachController.attachReconnectHandlerRef],
+  );
+  const workspaceConnection = useWorkspaceConnection({
+    activeServer,
+    device: state.device,
+    attachedSessionRef: terminalAttachController.attachedSessionRef,
+    pendingTerminalAttachSessionRef: terminalAttachController.pendingTerminalAttachSessionRef,
+    receiveLoopActiveRef: terminalAttachController.receiveLoopActiveRef,
+    receiveLoopGenerationRef: terminalAttachController.receiveLoopGenerationRef,
+    isTerminalTransportPaused,
+    isRetryableConnectionError,
+    resolveServerRouteUrls: resolveWorkspaceRouteUrls,
+    onBrokenAttachedClient: handleBrokenAttachedClient,
+    requestTimeoutMs: APP_CONNECTION_TIMEOUT_MS,
+    defaultWorkspaceTimeoutMs: ATTACH_CONNECTION_TIMEOUT_MS,
+    socketConnectTimeoutMs: APP_SOCKET_CONNECT_TIMEOUT_MS,
+    socketOpenTimeoutMs: APP_SOCKET_OPEN_TIMEOUT_MS,
+    socketOpenHedgeDelayMs: APP_SOCKET_OPEN_HEDGE_DELAY_MS,
+    socketConnectAttempts: APP_SOCKET_CONNECT_ATTEMPTS,
+    socketConnectRetryDelayMs: APP_SOCKET_CONNECT_RETRY_DELAY_MS,
+  });
   const {
     sessionFiles,
     setSessionFiles,
@@ -390,9 +318,14 @@ export default function App() {
     attachClientRef,
     pendingAttachClientRef,
     workspaceClientPromiseRef,
-    workspaceClientAbortControllerRef,
-    workspaceClientGenerationRef,
+    sessionPermissionIdsRef,
     connectionAutoRetryTimerRef,
+    closeWorkspaceClient,
+    authenticatedClient,
+    authenticatedWorkspaceClient,
+    authenticatedSessionClient,
+    resolveSessionScopedClient,
+    openSessionOperationClient,
   } = workspaceConnection;
   const {
     pendingTerminalAttachSessionRef,
@@ -424,7 +357,6 @@ export default function App() {
   } = terminalAttachController;
   const mobileTitlePullGestureRef = useRef<MobileTitlePullGesture | undefined>(undefined);
   const suppressMobileTitleClickRef = useRef(false);
-  const sessionPermissionIdsRef = useRef<Set<UUID>>(new Set());
   const closingSessionIdsRef = useRef<Set<UUID>>(new Set());
   const forgettingClientIdsRef = useRef<Set<UUID>>(new Set());
   const renamingSessionIdRef = useRef<UUID | undefined>(undefined);
@@ -447,6 +379,7 @@ export default function App() {
   const daemonStatusRequestSeqRef = useRef(0);
   const daemonClientsRefreshInFlightRef = useRef(false);
   const lastNotificationAtRef = useRef(0);
+  const fileEditorResetRef = useRef<() => void>(() => {});
   const isMobileLayout = useMobileLayout();
   const visualViewportMetrics = useVisualViewportMetrics(isMobileLayout && activeSurface === "workspace");
   const systemTheme = useSystemTheme();
@@ -455,41 +388,10 @@ export default function App() {
   const effectiveLocale = resolveLocale(preferences.language);
   const t = useMemo(() => createTranslator(effectiveLocale), [effectiveLocale]);
   const visibleFileTransferProgress = visibleProgressForSession(attachedSessionId);
-  const clearSessionFiles = clearSessionFilesState;
-
-  useEffect(() => {
-    // session 切换会让所有未完成的 file/diff 打开请求过期，避免切回旧 session 时晚响应复活旧弹窗。
-    fileOpenRequestSeqRef.current += 1;
-    activeFileOpenRequestRef.current = undefined;
-    gitDiffOpenRequestSeqRef.current += 1;
-    activeGitDiffOpenRequestRef.current = undefined;
-    setFileEditor(undefined);
-    setDiffViewer(undefined);
-  }, [attachedSessionId, setDiffViewer, setFileEditor]);
-
-  const closeWorkspaceClient = useCallback(() => {
-    workspaceClientGenerationRef.current += 1;
-    workspaceClientAbortControllerRef.current?.abort();
-    workspaceClientAbortControllerRef.current = undefined;
-    receiveLoopActiveRef.current = false;
-    receiveLoopGenerationRef.current += 1;
-    workspaceClientPromiseRef.current = undefined;
-    const clients = new Set<DirectClient>();
-    if (pendingAttachClientRef.current) {
-      clients.add(pendingAttachClientRef.current);
-    }
-    if (attachClientRef.current) {
-      clients.add(attachClientRef.current);
-    }
-    for (const client of clients) {
-      client.interruptReceiveWaiters();
-      client.close();
-    }
-    pendingAttachClientRef.current = undefined;
-    attachClientRef.current = undefined;
-    pendingTerminalAttachSessionRef.current = undefined;
-    sessionPermissionIdsRef.current.clear();
-  }, []);
+  const clearSessionFiles = useCallback(() => {
+    fileEditorResetRef.current();
+    clearSessionFilesState();
+  }, [clearSessionFilesState]);
 
   const selectSession = useCallback((sessionId: UUID | undefined) => {
     selectedSessionIdRef.current = sessionId;
@@ -609,7 +511,6 @@ export default function App() {
     };
   }, []);
 
-  const activeServer = useMemo<PairedServerState | undefined>(() => defaultServer(state), [state]);
   const activeServerIdRef = useRef<UUID | undefined>(activeServer?.server_id);
   useEffect(() => {
     activeServerIdRef.current = activeServer?.server_id;
@@ -1177,165 +1078,6 @@ export default function App() {
     [activeServer?.server_id, resetWorkspaceState, state.pairedServers],
   );
 
-  const authenticatedClient = useCallback(async (timeoutMs = APP_CONNECTION_TIMEOUT_MS, signal?: AbortSignal) => {
-    const server = activeServer;
-    const device = state.device;
-    if (!server || !device) {
-      throw new ProtocolClientError("missing_pairing", "device is not paired");
-    }
-    if (isTerminalTransportPaused()) {
-      throw terminalTransportPausedError();
-    }
-    // 中文注释：document hidden 不能中断 terminal WebSocket。后台标签页仍应继续接收
-    // stdout；这里只在浏览器明确 offline 时取消建连，避免恢复可见时被迫 snapshot 重绘。
-    const transportAbort = createTransportAbortController();
-    const linkedAbort = createLinkedAbortController(signal, transportAbort?.controller.signal);
-    const abortSignal = linkedAbort?.controller.signal;
-    let client: DirectClient | undefined;
-    const routeUrls = knownServerWsUrlCandidates(server.url, server.server_id);
-    try {
-      throwIfConnectionAborted(abortSignal);
-      let lastConnectError: unknown;
-      const connectTimeoutMs = Math.min(timeoutMs, APP_SOCKET_CONNECT_TIMEOUT_MS);
-      for (let attempt = 1; attempt <= APP_SOCKET_CONNECT_ATTEMPTS; attempt += 1) {
-        for (const routeUrl of routeUrls) {
-          try {
-            client = await DirectClient.connect(routeUrl, server.server_id, device.device_id, {
-              expectedDaemonPublicKey: server.daemon_public_key,
-              timeoutMs: connectTimeoutMs,
-              socketOpenTimeoutMs: Math.min(connectTimeoutMs, APP_SOCKET_OPEN_TIMEOUT_MS),
-              socketOpenHedgeDelayMs: APP_SOCKET_OPEN_HEDGE_DELAY_MS,
-              requestTimeoutMs: APP_CONNECTION_TIMEOUT_MS,
-              signal: abortSignal,
-            });
-            await abortableConnectionStep(client.authenticate(device, { ...server, url: routeUrl }), abortSignal);
-            return client;
-          } catch (caught) {
-            lastConnectError = caught;
-            client?.close();
-            client = undefined;
-            if (abortSignal?.aborted || isTerminalTransportPaused()) {
-              throw caught;
-            }
-          }
-        }
-        if (
-          attempt >= APP_SOCKET_CONNECT_ATTEMPTS ||
-          !isRetryableConnectionError(lastConnectError)
-        ) {
-          throw lastConnectError ?? new ProtocolClientError("connection_error", "connection error");
-        }
-        await waitForConnectionRetryDelay(abortSignal);
-      }
-      throw lastConnectError ?? new ProtocolClientError("connection_error", "connection error");
-    } catch (caught) {
-      // authenticate 发生在 route/E2EE 建立之后；这里失败时如果不关闭 socket，
-      // relay 会长期保留一个只完成了前置握手的 client，后台重试会把这些半开连接堆满。
-      client?.close();
-      throw caught;
-    } finally {
-      linkedAbort?.dispose();
-      transportAbort?.dispose();
-    }
-  }, [activeServer, state.device]);
-
-  const authenticatedWorkspaceClient = useCallback(async (timeoutMs = ATTACH_CONNECTION_TIMEOUT_MS) => {
-    const existing = attachClientRef.current;
-    if (existing && !existing.isClosed) {
-      return existing;
-    }
-    if (!existing && attachedSessionRef.current) {
-      // 中文注释：terminal reconnect 窗口里 attachedSessionRef 会保留当前会话，
-      // attachClientRef 可能已被 closeWorkspaceClient 清空。此时 metadata/files/git
-      // 不能抢先创建认证-only WebSocket，否则会覆盖后续 terminal attach 的主连接。
-      throw new ProtocolClientError("connection_closed", "terminal connection is reconnecting");
-    }
-    if (existing?.isClosed) {
-      if (attachedSessionRef.current) {
-        const error = new ProtocolClientError("connection_closed", "terminal connection closed");
-        // 中文注释：已有 attached session 时，关闭的 terminal client 不能被普通
-        // metadata refresh 悄悄替换成“只认证未 terminal.attach”的 WebSocket。
-        // 否则会出现上行 RPC 还能发、下行 terminal stream 不再消费的半活状态。
-        if (attachReconnectHandlerRef.current(existing, error)) {
-          throw error;
-        }
-      }
-      attachClientRef.current = undefined;
-      sessionPermissionIdsRef.current.clear();
-    }
-    if (workspaceClientPromiseRef.current) {
-      return workspaceClientPromiseRef.current;
-    }
-    const requestGeneration = workspaceClientGenerationRef.current;
-    const abortController = new AbortController();
-    workspaceClientAbortControllerRef.current = abortController;
-    const clearAbortController = () => {
-      if (workspaceClientAbortControllerRef.current === abortController) {
-        workspaceClientAbortControllerRef.current = undefined;
-      }
-    };
-    let promise: Promise<DirectClient>;
-    promise = authenticatedClient(timeoutMs, abortController.signal)
-      .then((client) => {
-        clearAbortController();
-        if (workspaceClientGenerationRef.current !== requestGeneration) {
-          // 中文注释：daemon 切换、session 切换或 workspace reset 可能发生在握手进行中。
-          // 迟到的旧 client 只能关闭，不能重新写回 attachClientRef 污染当前 session。
-          client.close();
-          throw new ProtocolClientError("stale_connection", "session connection was superseded");
-        }
-        attachClientRef.current = client;
-        workspaceClientPromiseRef.current = undefined;
-        return client;
-      })
-      .catch((caught) => {
-        clearAbortController();
-        if (workspaceClientGenerationRef.current === requestGeneration) {
-          workspaceClientPromiseRef.current = undefined;
-        }
-        throw caught;
-      });
-    workspaceClientPromiseRef.current = promise;
-    return promise;
-  }, [authenticatedClient]);
-
-  const authenticatedSessionClient = useCallback(
-    async (sessionId: UUID) => {
-      // 中文注释：普通 session RPC 和 terminal stream 共用当前 session 的 WebSocket；
-      // session 切换/重连会关闭旧 WebSocket 并重新认证，新连接需要重新补权限 attach。
-      const client = await authenticatedWorkspaceClient();
-      if (!sessionPermissionIdsRef.current.has(sessionId)) {
-        await client.attachSessionPermission(sessionId);
-        sessionPermissionIdsRef.current.add(sessionId);
-      }
-      return client;
-    },
-    [authenticatedWorkspaceClient],
-  );
-
-  const resolveSessionScopedClient = useCallback(
-    async (sessionId: UUID): Promise<{ client: DirectClient; ownsClient: boolean }> => {
-      return { client: await authenticatedSessionClient(sessionId), ownsClient: false };
-    },
-    [authenticatedSessionClient],
-  );
-
-  const openSessionOperationClient = useCallback(
-    async (sessionId: UUID): Promise<{ client: DirectClient; ownsClient: true }> => {
-      const client = await authenticatedClient(APP_CONNECTION_TIMEOUT_MS);
-      try {
-        // 文件上传/下载不应排在当前 terminal stream 的大 snapshot 后面。
-        // 独立 permission-only 连接只拿 session 操作权限，不订阅 stdout。
-        await client.attachSessionPermission(sessionId);
-        return { client, ownsClient: true };
-      } catch (caught) {
-        client.close();
-        throw caught;
-      }
-    },
-    [authenticatedClient],
-  );
-
   const { loadSessionFiles, loadSessionGit } = useSessionFileLoaders(sessionFilesController, {
     authenticatedSessionClient,
     activeServerId: activeServer?.server_id,
@@ -1345,6 +1087,68 @@ export default function App() {
     connectionReady,
     followPollIntervalMs: FILES_CWD_FOLLOW_POLL_INTERVAL_MS,
   });
+  const {
+    handleOpenDirectory,
+    handleGoToFilePath,
+    handleRefreshSessionFiles,
+    handleRefreshSessionGit,
+    handleSessionFilesPanelTabChange,
+  } = useSessionFilesPanelActions({
+    sessionFilesPath: sessionFiles?.path,
+    sessionFilesFollowTerminalCwd,
+    setSessionFilesPanelTab,
+    handleSessionFilesFollowTerminalCwdChange,
+    attachedSessionRef,
+    loadSessionFiles,
+    loadSessionGit,
+    resolveDirectoryPath: resolveRemoteDirectoryPath,
+  });
+  const { handleCloseGitDiff, handleOpenGitDiff } = useSessionGitDiffViewer({
+    attachedSessionId,
+    attachedSessionRef,
+    setDiffViewer,
+    resolveSessionScopedClient,
+    basenamePath: basenameRemotePath,
+    gitGraphLabel: t("git.graph"),
+    translateError: (caught) => translateSafeErrorMessage(toSafeError(caught), t),
+  });
+  const refreshVisibleDirectory = useCallback(
+    async (sessionId: UUID) => {
+      await loadSessionFiles(sessionId, sessionFiles?.path, { source: "manual" });
+    },
+    [loadSessionFiles, sessionFiles?.path],
+  );
+  const {
+    handleOpenFile,
+    handleSaveOpenFile,
+    resetFileEditor,
+    openRemoteFile,
+  } = useSessionFileEditor({
+    attachedSessionId,
+    attachedSessionRef,
+    fileEditor,
+    setFileEditor,
+    setSessionFilesError,
+    resolveSessionScopedClient,
+    refreshVisibleDirectory,
+    translateError: (caught) => translateSafeErrorMessage(toSafeError(caught), t),
+    textFileMaxBytes: TEXT_FILE_EDITOR_MAX_BYTES,
+  });
+  const {
+    handleDeleteFile,
+    handleSessionGitAction,
+  } = useSessionMutationActions({
+    attachedSessionRef,
+    sessionFilesPath: sessionFiles?.path,
+    loadSessionFiles,
+    loadSessionGit,
+    setSessionGitLoading,
+    setSessionGitError,
+    setSessionFilesLoading,
+    setSessionFilesError,
+    resolveSessionScopedClient,
+  });
+  fileEditorResetRef.current = resetFileEditor;
 
   const handleRefresh = useCallback(async () => {
     if (isPagePaused()) {
@@ -2492,77 +2296,6 @@ export default function App() {
     return () => window.clearInterval(timer);
   }, [connectionReady, loadDaemonStatus]);
 
-  const handleOpenDirectory = useCallback(
-    (path: string) => {
-      const sessionId = attachedSessionRef.current;
-      if (!sessionId) {
-        return;
-      }
-      // 用户开始手动浏览目录时，立即退出自动跟随，避免下一次轮询把目录打回终端 cwd。
-      handleSessionFilesFollowTerminalCwdChange(false);
-      void loadSessionFiles(sessionId, path, { source: "manual" });
-    },
-    [handleSessionFilesFollowTerminalCwdChange, loadSessionFiles],
-  );
-
-  const handleGoToFilePath = useCallback(
-    (path: string) => {
-      const sessionId = attachedSessionRef.current;
-      if (!sessionId) {
-        return;
-      }
-      // 手动输入目录路径时同样切到浏览模式，避免和“跟随终端 cwd”互相覆盖。
-      handleSessionFilesFollowTerminalCwdChange(false);
-      void loadSessionFiles(sessionId, resolveRemoteDirectoryPath(sessionFiles?.path ?? "", path), { source: "manual" });
-    },
-    [handleSessionFilesFollowTerminalCwdChange, loadSessionFiles, sessionFiles?.path],
-  );
-
-  const handleRefreshSessionFiles = useCallback(() => {
-    const sessionId = attachedSessionRef.current;
-    if (!sessionId) {
-      return;
-    }
-    void loadSessionFiles(sessionId, sessionFilesFollowTerminalCwd ? undefined : sessionFiles?.path, { source: "manual" });
-  }, [loadSessionFiles, sessionFiles?.path, sessionFilesFollowTerminalCwd]);
-
-  const handleRefreshSessionGit = useCallback(() => {
-    const sessionId = attachedSessionRef.current;
-    if (!sessionId) {
-      return;
-    }
-    void loadSessionGit(sessionId);
-  }, [loadSessionGit]);
-
-  const handleSessionGitAction = useCallback(
-    async (
-      worktree: SessionGitWorktreePayload,
-      change: SessionGitFileChangePayload,
-      action: SessionGitActionKind,
-    ) => {
-      const sessionId = attachedSessionRef.current;
-      if (!sessionId) {
-        return;
-      }
-      setSessionGitLoading(true);
-      setSessionGitError(undefined);
-      let sessionClient: { client: DirectClient; ownsClient: boolean } | undefined;
-      try {
-        sessionClient = await resolveSessionScopedClient(sessionId);
-        await sessionClient.client.applySessionGitAction(sessionId, worktree.path, change.path, action);
-        await loadSessionGit(sessionId);
-      } catch (caught) {
-        setSessionGitError(toSafeError(caught));
-        setSessionGitLoading(false);
-      } finally {
-        if (sessionClient?.ownsClient) {
-          sessionClient.client.close();
-        }
-      }
-    },
-    [loadSessionGit, resolveSessionScopedClient],
-  );
-
   const handleTerminalSearch = useCallback(
     async (query: string): Promise<SessionSearchResultPayload> => {
       const sessionId = attachedSessionRef.current;
@@ -2575,129 +2308,9 @@ export default function App() {
     [authenticatedSessionClient],
   );
 
-  const beginFileOpenRequest = useCallback((sessionId: UUID, path: string) => {
-    const request = {
-      requestId: fileOpenRequestSeqRef.current + 1,
-      sessionId,
-      path,
-    };
-    fileOpenRequestSeqRef.current = request.requestId;
-    activeFileOpenRequestRef.current = request;
-    return request;
-  }, []);
-
-  const isActiveFileOpenRequest = useCallback((request: { requestId: number; sessionId: UUID; path: string }) => {
-    const active = activeFileOpenRequestRef.current;
-    return (
-      active?.requestId === request.requestId &&
-      active.sessionId === request.sessionId &&
-      active.path === request.path &&
-      attachedSessionRef.current === request.sessionId
-    );
-  }, []);
-
-  const beginGitDiffOpenRequest = useCallback(
-    (sessionId: UUID, worktreePath: string, filePath: string | undefined, staged: boolean) => {
-      const request = {
-        requestId: gitDiffOpenRequestSeqRef.current + 1,
-        sessionId,
-        worktreePath,
-        filePath,
-        staged,
-      };
-      gitDiffOpenRequestSeqRef.current = request.requestId;
-      activeGitDiffOpenRequestRef.current = request;
-      return request;
-    },
-    [],
-  );
-
-  const isActiveGitDiffOpenRequest = useCallback(
-    (request: { requestId: number; sessionId: UUID; worktreePath: string; filePath?: string; staged: boolean }) => {
-      const active = activeGitDiffOpenRequestRef.current;
-      return (
-        active?.requestId === request.requestId &&
-        active.sessionId === request.sessionId &&
-        active.worktreePath === request.worktreePath &&
-        active.filePath === request.filePath &&
-        active.staged === request.staged &&
-        attachedSessionRef.current === request.sessionId
-      );
-    },
-    [],
-  );
-
   const handleCloseFileEditor = useCallback(() => {
-    // 用户关闭弹窗即表示旧 read 响应过期；慢响应不能重新打开编辑器。
-    fileOpenRequestSeqRef.current += 1;
-    activeFileOpenRequestRef.current = undefined;
-    setFileEditor(undefined);
-  }, [setFileEditor]);
-
-  const handleCloseGitDiff = useCallback(() => {
-    // Diff 弹窗也按用户可见状态失效，避免旧 diff 在关闭后晚到覆盖界面。
-    gitDiffOpenRequestSeqRef.current += 1;
-    activeGitDiffOpenRequestRef.current = undefined;
-    setDiffViewer(undefined);
-  }, [setDiffViewer]);
-
-  const handleOpenGitDiff = useCallback(
-    async (worktree: SessionGitWorktreePayload, change?: SessionGitFileChangePayload, staged = false) => {
-      const sessionId = attachedSessionRef.current;
-      if (!sessionId) {
-        return;
-      }
-      const request = beginGitDiffOpenRequest(sessionId, worktree.path, change?.path, staged);
-      const path = change?.path ?? worktree.path;
-      setDiffViewer({
-        path,
-        name: change ? basenameRemotePath(change.path) : t("git.graph"),
-        text: "",
-        loading: true,
-      });
-      let sessionClient: { client: DirectClient; ownsClient: boolean } | undefined;
-      try {
-        sessionClient = await resolveSessionScopedClient(sessionId);
-        const diff: SessionGitDiffResultPayload = await sessionClient.client.getSessionGitDiff(sessionId, worktree.path, change?.path, staged);
-        if (!isActiveGitDiffOpenRequest(request)) {
-          return;
-        }
-        setDiffViewer({
-          path: diff.file_path ?? diff.worktree_path,
-          name: diff.file_path ? basenameRemotePath(diff.file_path) : t("git.graph"),
-          text: diff.diff || "\n",
-          loading: false,
-        });
-      } catch (caught) {
-        if (!isActiveGitDiffOpenRequest(request)) {
-          return;
-        }
-        setDiffViewer((current) => ({
-          path: current?.path ?? path,
-          name: current?.name ?? path,
-          text: current?.text ?? "",
-          loading: false,
-          error: translateSafeErrorMessage(toSafeError(caught), t),
-        }));
-      } finally {
-        if (sessionClient?.ownsClient) {
-          sessionClient.client.close();
-        }
-      }
-    },
-    [beginGitDiffOpenRequest, isActiveGitDiffOpenRequest, resolveSessionScopedClient, t],
-  );
-
-  const handleSessionFilesPanelTabChange = useCallback(
-    (tab: "files" | "git") => {
-      setSessionFilesPanelTab(tab);
-      const sessionId = attachedSessionRef.current;
-      if (tab === "git" && sessionId) {
-        void loadSessionGit(sessionId);
-      }
-    },
-    [loadSessionGit],
-  );
+    resetFileEditor();
+  }, [resetFileEditor]);
 
   const handleUploadFile = useCallback(
     async (file: File) => {
@@ -2775,111 +2388,15 @@ export default function App() {
     ],
   );
 
-  const handleOpenFile = useCallback(
-    async (entry: SessionFileEntryPayload) => {
-      const sessionId = attachedSessionRef.current;
-      if (!sessionId || entry.kind !== "file") {
-        return;
-      }
-      const request = beginFileOpenRequest(sessionId, entry.path);
-      if (entry.size_bytes > TEXT_FILE_EDITOR_MAX_BYTES) {
-        setFileEditor({
-          path: entry.path,
-          name: entry.name,
-          text: "",
-          loading: false,
-          saving: false,
-          error: t("error.fileEditTooLarge"),
-        });
-        return;
-      }
-
-      setSessionFilesError(undefined);
-      setFileEditor({
-        path: entry.path,
-        name: entry.name,
-        text: "",
-        loading: true,
-        saving: false,
-      });
-      let sessionClient: { client: DirectClient; ownsClient: boolean } | undefined;
-      try {
-        sessionClient = await resolveSessionScopedClient(sessionId);
-        const payload = await readEditableSessionFile(sessionClient.client, sessionId, entry.path);
-        if (!isActiveFileOpenRequest(request)) {
-          return;
-        }
-        setFileEditor({
-          path: payload.path,
-          name: entry.name,
-          text: new TextDecoder().decode(payload.bytes),
-          loading: false,
-          saving: false,
-        });
-      } catch (caught) {
-        if (!isActiveFileOpenRequest(request)) {
-          return;
-        }
-        setFileEditor((current) => ({
-          path: current?.path ?? entry.path,
-          name: current?.name ?? entry.name,
-          text: current?.text ?? "",
-          loading: false,
-          saving: false,
-          error: translateSafeErrorMessage(toSafeError(caught), t),
-        }));
-      } finally {
-        if (sessionClient?.ownsClient) {
-          sessionClient.client.close();
-        }
-      }
-    },
-    [beginFileOpenRequest, isActiveFileOpenRequest, resolveSessionScopedClient, t],
-  );
-
   const handleOpenGitFile = useCallback(
     (worktree: SessionGitWorktreePayload, change: SessionGitFileChangePayload) => {
-      const path = joinRemotePath(worktree.path, change.path);
-      void handleOpenFile({
+      void openRemoteFile({
         name: basenameRemotePath(change.path),
-        path,
-        kind: "file",
-        size_bytes: 0,
-        modified_at_ms: null,
+        path: joinRemotePath(worktree.path, change.path),
+        sizeBytes: 0,
       });
     },
-    [handleOpenFile],
-  );
-
-  const handleSaveOpenFile = useCallback(
-    async (text: string) => {
-      const sessionId = attachedSessionRef.current;
-      const editor = fileEditor;
-      if (!sessionId || !editor) {
-        return;
-      }
-      setFileEditor({ ...editor, text, saving: true, error: undefined });
-      let sessionClient: { client: DirectClient; ownsClient: boolean } | undefined;
-      try {
-        sessionClient = await resolveSessionScopedClient(sessionId);
-        const written = await sessionClient.client.writeSessionFile(sessionId, editor.path, new TextEncoder().encode(text));
-        setFileEditor({
-          path: written.path,
-          name: editor.name,
-          text,
-          loading: false,
-          saving: false,
-        });
-        await loadSessionFiles(sessionId, sessionFiles?.path, { source: "manual" });
-      } catch (caught) {
-        setFileEditor({ ...editor, text, loading: false, saving: false, error: translateSafeErrorMessage(toSafeError(caught), t) });
-      } finally {
-        if (sessionClient?.ownsClient) {
-          sessionClient.client.close();
-        }
-      }
-    },
-    [fileEditor, loadSessionFiles, resolveSessionScopedClient, sessionFiles?.path, t],
+    [openRemoteFile],
   );
 
   const handleDownloadFile = useCallback(
@@ -2931,31 +2448,6 @@ export default function App() {
       scheduleDownloadProgressClear,
       updateDownloadProgressForTransfer,
     ],
-  );
-
-  const handleDeleteFile = useCallback(
-    async (entry: { path: string }) => {
-      const sessionId = attachedSessionRef.current;
-      if (!sessionId) {
-        return;
-      }
-      setSessionFilesLoading(true);
-      setSessionFilesError(undefined);
-      let sessionClient: { client: DirectClient; ownsClient: boolean } | undefined;
-      try {
-        sessionClient = await resolveSessionScopedClient(sessionId);
-        await sessionClient.client.deleteSessionFile(sessionId, entry.path);
-        await loadSessionFiles(sessionId, sessionFiles?.path, { source: "manual" });
-      } catch (caught) {
-        setSessionFilesError(toSafeError(caught));
-      } finally {
-        if (sessionClient?.ownsClient) {
-          sessionClient.client.close();
-        }
-        setSessionFilesLoading(false);
-      }
-    },
-    [loadSessionFiles, resolveSessionScopedClient, sessionFiles?.path],
   );
 
   const requestMobileTerminalFocus = useCallback(() => {
@@ -4039,54 +3531,6 @@ export function knownServerWsUrlCandidates(
   return candidates;
 }
 
-export async function connectPairingClient(
-  candidateUrls: string[],
-  routeServerId: UUID,
-  deviceId: UUID,
-  daemonPublicKey: string,
-  timeoutMs = APP_CONNECTION_TIMEOUT_MS,
-): Promise<{ client: DirectClient; effectiveUrl: string }> {
-  if (!routeServerId) {
-    throw new ProtocolClientError("pairing_server_unknown", "pairing requires a known daemon server id");
-  }
-  let lastError: unknown;
-  for (const candidateUrl of candidateUrls) {
-    try {
-      const client = await DirectClient.connect(candidateUrl, routeServerId, deviceId, {
-        expectedDaemonPublicKey: daemonPublicKey,
-        timeoutMs,
-      });
-      if (client.serverId !== routeServerId) {
-        client.close();
-        lastError = new ProtocolClientError(
-          "pairing_payload_server_mismatch",
-          "pairing payload does not match the connected daemon",
-        );
-        continue;
-      }
-      return { client, effectiveUrl: candidateUrl };
-    } catch (caught) {
-      lastError = caught;
-    }
-  }
-
-  throw normalizePairingRouteError(lastError) ??
-    new ProtocolClientError("empty_pairing_candidates", "no pairing URL candidates");
-}
-
-function normalizePairingRouteError(error: unknown): unknown {
-  if (
-    error instanceof ProtocolClientError &&
-    (error.code === "invalid_route_prelude" || error.code === "route_server_mismatch")
-  ) {
-    return new ProtocolClientError(
-      "pairing_payload_server_mismatch",
-      "pairing payload does not match the connected daemon",
-    );
-  }
-  return error;
-}
-
 function routeWsUrlForKnownServer(rawUrl: string, serverId: UUID): string | undefined {
   const normalizedUrl = normalizeRouteWsUrl(rawUrl, serverId);
   try {
@@ -4513,25 +3957,6 @@ async function getSessionFileEntry(
   const normalized = normalizeRemotePath(path);
   const files = await client.listSessionFiles(sessionId, remoteParentPath(normalized));
   return files.entries.find((entry) => entry.path === normalized);
-}
-
-async function readEditableSessionFile(
-  client: DirectClient,
-  sessionId: UUID,
-  path: string,
-): Promise<{ path: string; bytes: Uint8Array }> {
-  const payload = await client.readSessionFile(sessionId, path, { maxBytes: TEXT_FILE_EDITOR_MAX_BYTES });
-  if (payload.size_bytes > TEXT_FILE_EDITOR_MAX_BYTES) {
-    throw new ProtocolClientError("file_too_large", "file is too large to edit in browser");
-  }
-  const bytes = sessionDataFromBase64(payload.data_base64);
-  if (bytes.byteLength > TEXT_FILE_EDITOR_MAX_BYTES) {
-    throw new ProtocolClientError("file_too_large", "file is too large to edit in browser");
-  }
-  if (bytes.includes(0)) {
-    throw new ProtocolClientError("binary_file", "binary files cannot be edited in browser");
-  }
-  return { path: payload.path, bytes };
 }
 
 async function downloadSessionFile(

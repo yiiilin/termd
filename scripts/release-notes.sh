@@ -25,7 +25,7 @@ termd 0.3.13
 - 保留 0.3.12 中对 Web 终端满屏滚动/resize 锚点、旧 PWA 缓存清理、relay HTTP tunnel 开关和协议/codec 收敛等修复。
 
 兼容性:
-- packet protocol version 仍为 3，binary protocol version 仍为 2；supervisor 兼容版本仍为 `0.3.5`。
+- packet protocol version 仍为 3，binary protocol version 仍为 2；supervisor 兼容版本改为日期格式，当前值为 `2026-06-04`。
 - 从 0.3.11 升级时，建议直接升级到 0.3.13，不要停留在 0.3.12。
 - relay 仍保持 dumb pipe，不解密、不解析业务明文；HTTP tunnel 仍需显式开启，且 CORS 只覆盖文件传输兼容路径。
 EOF

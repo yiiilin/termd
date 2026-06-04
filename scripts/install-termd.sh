@@ -4,11 +4,16 @@ set -euo pipefail
 
 # 这个脚本安装 termd 二进制并注册 systemd 服务。
 # 服务默认只监听 loopback，relay 和 TLS 通过 /etc/termd/termd.env 进行可选配置。
+# supervisor 兼容版本默认跟随源码树里的 `SUPERVISOR_VERSION` 文件，格式采用
+# yyyy-mm-dd 或 yyyy-mm-dd.N；release 资产会通过 REQUIRED_SUPERVISOR_VERSION 注入。
 
 COMPONENT="termd"
 BIN_NAME="termd"
 SERVICE_NAME="termd"
 INSTALL_PREFIX="${TERMD_INSTALL_PREFIX:-/usr/local}"
+if [[ -z "${ROOT_DIR:-}" ]]; then
+  ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+fi
 REPO="${TERMD_GITHUB_REPO:-${GITHUB_REPOSITORY:-}}"
 VERSION="${TERMD_VERSION:-}"
 SUPERVISOR_VERSION="${TERMD_SUPERVISOR_VERSION:-}"
@@ -493,6 +498,26 @@ upsert_env_var() {
   rm -f "$tmp"
 }
 
+read_default_supervisor_version() {
+  local supervisor_version_file="$ROOT_DIR/SUPERVISOR_VERSION"
+
+  if [[ -n "$REQUIRED_SUPERVISOR_VERSION" ]]; then
+    printf '%s' "$REQUIRED_SUPERVISOR_VERSION"
+    return 0
+  fi
+
+  if [[ -s "$supervisor_version_file" ]]; then
+    local file_version
+    IFS= read -r file_version <"$supervisor_version_file"
+    if [[ -n "$file_version" ]]; then
+      printf '%s' "$file_version"
+      return 0
+    fi
+  fi
+
+  printf '%s' "${VERSION:-}"
+}
+
 apply_env_overrides() {
   # 命令行参数只覆盖用户显式传入的项，避免重装时意外抹掉已有 systemd 配置。
   if [[ "$INSTALL_SET_LISTEN" -eq 1 ]]; then
@@ -781,7 +806,7 @@ resolve_supervisor_version() {
   elif [[ -n "$current_supervisor_version" ]]; then
     desired_supervisor_version="$current_supervisor_version"
   else
-    desired_supervisor_version="${SUPERVISOR_VERSION:-$VERSION}"
+    desired_supervisor_version="${SUPERVISOR_VERSION:-$(read_default_supervisor_version)}"
   fi
   [[ -n "$desired_supervisor_version" ]] || die "unable to determine supervisor version"
 

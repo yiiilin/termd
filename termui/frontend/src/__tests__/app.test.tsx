@@ -6,7 +6,6 @@ import userEvent from "@testing-library/user-event";
 import App, {
   APP_CONNECTION_TIMEOUT_MS,
   browserReachableWsUrl,
-  connectPairingClient,
   DAEMON_STATUS_POLL_INTERVAL_MS,
   defaultWsUrlFromPage,
   knownServerWsUrlCandidates,
@@ -15,6 +14,7 @@ import App, {
   pairingWsUrlCandidates,
 } from "../App";
 import { E2eeSession, decodeBinaryEncryptedFrame, encodeBinaryEncryptedFrame, type E2eeKeyPair } from "../protocol/e2ee";
+import { connectPairingClient } from "../protocol/pairing-client";
 import type {
   ProtocolPacket,
   PublicKeyWire,
@@ -2781,6 +2781,7 @@ describe("termui web 工作台", () => {
         secondDaemon.serverId,
         "00000000-0000-0000-0000-000000000999",
         secondDaemon.daemonPublicKey,
+        APP_CONNECTION_TIMEOUT_MS,
       );
 
       expect(effectiveUrl).toBe(secondDaemon.url);
@@ -2907,6 +2908,60 @@ describe("termui web 工作台", () => {
     expect(terminalText.match(/termd-e2e-ready/g) ?? []).toHaveLength(1);
     observer.disconnect();
     expect(sawConnectionAlert).toBe(false);
+  });
+
+  it("attach WebSocket 短断恢复后还能继续渲染新的 terminal frame", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await screen.findByText(/termd-e2e-ready/);
+    await waitFor(() => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID]));
+
+    let sawConnectionAlert = false;
+    const observer = new MutationObserver(() => {
+      if (document.querySelector('[role="alert"][aria-label="Connection error"]')) {
+        sawConnectionAlert = true;
+      }
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+    daemon.dropConnections();
+
+    await waitFor(
+      () =>
+        expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID, DEFAULT_SESSION_ID]),
+      { timeout: 2200 },
+    );
+
+    const stats = resetXtermStats();
+    daemon.pushTerminalFrameBatch(DEFAULT_SESSION_ID, [
+      {
+        kind: "snapshot",
+        session_id: DEFAULT_SESSION_ID,
+        base_seq: 0,
+        terminal_seq: 1,
+        size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+        data_base64: btoa("post-reconnect-snapshot\n"),
+      },
+      {
+        kind: "output",
+        session_id: DEFAULT_SESSION_ID,
+        terminal_seq: 1,
+        data_base64: btoa("post-reconnect-output\n"),
+      },
+    ]);
+
+    await waitFor(() =>
+      expect(document.querySelector<HTMLElement>(".xterm")?.textContent ?? "").toContain(
+        "post-reconnect-output",
+      ),
+    );
+    observer.disconnect();
+    expect(stats.writes).toBeGreaterThan(0);
+    expect(sawConnectionAlert).toBe(false);
+    expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
+    expect(screen.getByTestId("terminal-pane")).toBeInTheDocument();
   });
 
   it("attach WebSocket error 时保留终端并静默重连当前 session", async () => {
@@ -3600,6 +3655,88 @@ describe("termui web 工作台", () => {
     expect(screen.getByRole("dialog", { name: "beta.txt" })).toBeInTheDocument();
     expect(screen.getByLabelText("File text")).toHaveValue("beta\n");
     expect(screen.queryByText("alpha\n")).toBeNull();
+  });
+
+  it("旧文件保存迟到后不会在切换 session 后复活编辑器", async () => {
+    const user = userEvent.setup();
+    const alphaSessionId = "00000000-0000-0000-0000-000000000423";
+    const betaSessionId = "00000000-0000-0000-0000-000000000424";
+    const alphaPath = "/home/me/project/alpha.txt";
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [
+        {
+          session_id: alphaSessionId,
+          name: "alpha",
+          state: "running",
+          size: { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 },
+        },
+        {
+          session_id: betaSessionId,
+          name: "beta",
+          state: "running",
+          size: { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 },
+        },
+      ],
+      sessionFiles: {
+        [alphaSessionId]: {
+          session_id: alphaSessionId,
+          path: "/home/me/project",
+          entries: [
+            { name: "alpha.txt", path: alphaPath, kind: "file", size_bytes: 6, modified_at_ms: null },
+          ],
+        },
+        [betaSessionId]: {
+          session_id: betaSessionId,
+          path: "/srv/beta",
+          entries: [],
+        },
+      },
+      sessionFileReads: {
+        [alphaPath]: {
+          session_id: alphaSessionId,
+          path: alphaPath,
+          data_base64: Buffer.from("alpha\n", "utf8").toString("base64"),
+          size_bytes: 6,
+          modified_at_ms: null,
+        },
+      },
+      sessionFileWriteDelayMsByPath: {
+        [alphaPath]: 140,
+      },
+    });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession("alpha");
+    await clickSessionCard(user, "alpha");
+
+    const panel = await screen.findByLabelText("session files");
+    await within(panel).findByText("alpha.txt");
+
+    await user.click(within(panel).getByRole("button", { name: "Edit alpha.txt" }));
+    const editor = await screen.findByRole("dialog", { name: "alpha.txt" });
+    const fileText = within(editor).getByLabelText("File text") as HTMLTextAreaElement;
+    fireEvent.change(fileText, { target: { value: "saved from alpha" } });
+    await user.click(within(editor).getByRole("button", { name: "Save" }));
+    await waitFor(() => {
+      expect(daemon.sessionFileWrites).toContainEqual({
+        session_id: alphaSessionId,
+        path: alphaPath,
+        text: "saved from alpha",
+      });
+    });
+
+    await clickSessionCard(user, "beta");
+    await waitFor(() => expect(selectedSessionName()).toBe("beta"));
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "alpha.txt" })).toBeNull());
+    await waitFor(() => expect(within(screen.getByLabelText("session files")).queryByText("alpha.txt")).toBeNull());
+
+    await new Promise((resolve) => window.setTimeout(resolve, 220));
+    expect(selectedSessionName()).toBe("beta");
+    expect(screen.queryByRole("dialog", { name: "alpha.txt" })).toBeNull();
+    expect(within(screen.getByLabelText("session files")).queryByText("alpha.txt")).toBeNull();
   });
 
   it("上传进度在切换 session 后仍保留", async () => {

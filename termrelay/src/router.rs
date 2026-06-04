@@ -534,6 +534,13 @@ mod tests {
         client_id: Option<RelayClientId>,
         data_token: Option<Nonce>,
     ) -> Envelope<RouteHelloPayload> {
+        let route_generation = match role {
+            RouteRole::DaemonControl | RouteRole::DaemonData => Some(Nonce(format!(
+                "router-test-route-generation-{}",
+                server_id.0
+            ))),
+            RouteRole::Client | RouteRole::DaemonMux => None,
+        };
         Envelope::new(
             MessageType::RouteHello,
             RouteHelloPayload {
@@ -541,7 +548,7 @@ mod tests {
                 role,
                 protocol_version: ProtocolVersion::default(),
                 nonce: Nonce("route-test-nonce".to_owned()),
-                route_generation: None,
+                route_generation,
                 client_id,
                 data_token,
                 timestamp_ms: termd_proto::UnixTimestampMillis(1_710_000_000_000),

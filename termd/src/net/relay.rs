@@ -1163,12 +1163,15 @@ async fn connect_relay_control_base_once(
     let server_id = { protocol.lock().await.server_id() };
     let relay_endpoint = base.canonical_url();
     let url = base.daemon_mux_url_with_auth(server_id, auth_token);
+    // 中文注释：同一条 daemon control 生命周期内派生出的 data pipe 必须共享同一个
+    // route_generation；relay 依赖它拒绝上一代 mux 迟到接入的 idle data pipe。
+    let route_generation = relay_route_nonce();
     let (mut sender, mut receiver) = connect_relay_route_socket(
         &url,
         proxy.as_ref(),
         server_id,
         ProtoRouteRole::DaemonControl,
-        None,
+        Some(route_generation.clone()),
         None,
         None,
     )
@@ -1193,6 +1196,7 @@ async fn connect_relay_control_base_once(
         &proxy,
         protocol.clone(),
         server_id,
+        &route_generation,
         &mut idle_data_tasks,
         &mut idle_data_connecting,
         &mut idle_data_waiting,
@@ -1220,6 +1224,7 @@ async fn connect_relay_control_base_once(
             &proxy,
             protocol.clone(),
             server_id,
+            &route_generation,
             &mut idle_data_tasks,
             &mut idle_data_connecting,
             &mut idle_data_waiting,
@@ -1261,6 +1266,7 @@ async fn connect_relay_control_base_once(
                             proxy.clone(),
                             protocol.clone(),
                             server_id,
+                            route_generation.clone(),
                             &mut data_tasks,
                         )
                         .await
@@ -1281,6 +1287,7 @@ async fn connect_relay_control_base_once(
                             proxy.clone(),
                             protocol.clone(),
                             server_id,
+                            route_generation.clone(),
                             &mut data_tasks,
                         )
                         .await
@@ -1374,6 +1381,7 @@ async fn handle_relay_control_envelope(
     proxy: Option<RelayProxyUrl>,
     protocol: SharedDaemonProtocol,
     server_id: ServerId,
+    route_generation: ProtoNonce,
     data_tasks: &mut RelayDataTaskMap,
 ) -> Result<(), RelayConnectorError> {
     match envelope {
@@ -1394,7 +1402,14 @@ async fn handle_relay_control_envelope(
             );
             let task = tokio::spawn(async move {
                 if let Err(error) = run_relay_data_connection(
-                    base, auth_token, proxy, protocol, server_id, client_id, data_token,
+                    base,
+                    auth_token,
+                    proxy,
+                    protocol,
+                    server_id,
+                    route_generation,
+                    client_id,
+                    data_token,
                 )
                 .await
                 {
@@ -1594,6 +1609,7 @@ fn ensure_relay_idle_data_pool(
     proxy: &Option<RelayProxyUrl>,
     protocol: SharedDaemonProtocol,
     server_id: ServerId,
+    route_generation: &ProtoNonce,
     idle_data_tasks: &mut RelayIdleDataTaskMap,
     idle_data_connecting: &mut HashSet<u64>,
     idle_data_waiting: &mut HashSet<u64>,
@@ -1617,6 +1633,7 @@ fn ensure_relay_idle_data_pool(
             proxy.clone(),
             protocol.clone(),
             server_id,
+            route_generation.clone(),
             task_id,
             idle_data_event_tx.clone(),
         ));
@@ -1636,6 +1653,7 @@ async fn run_relay_data_connection(
     proxy: Option<RelayProxyUrl>,
     protocol: SharedDaemonProtocol,
     server_id: ServerId,
+    route_generation: ProtoNonce,
     client_id: RelayClientId,
     data_token: ProtoNonce,
 ) -> Result<(), RelayConnectorError> {
@@ -1646,7 +1664,7 @@ async fn run_relay_data_connection(
         proxy.as_ref(),
         server_id,
         ProtoRouteRole::DaemonData,
-        None,
+        Some(route_generation),
         Some(client_id),
         Some(data_token),
         RELAY_DATA_CONNECT_TIMEOUT,
@@ -1670,6 +1688,7 @@ async fn run_relay_idle_data_connection(
     proxy: Option<RelayProxyUrl>,
     protocol: SharedDaemonProtocol,
     server_id: ServerId,
+    route_generation: ProtoNonce,
     task_id: u64,
     idle_data_event_tx: mpsc::Sender<RelayIdleDataEvent>,
 ) {
@@ -1681,7 +1700,7 @@ async fn run_relay_idle_data_connection(
             proxy.as_ref(),
             server_id,
             ProtoRouteRole::DaemonData,
-            None,
+            Some(route_generation),
             None,
             None,
             RELAY_IDLE_DATA_CONNECT_TIMEOUT,
@@ -6886,6 +6905,10 @@ mod tests {
             let route_hello = read_route_hello_from_connector(&mut data_socket).await;
             assert_eq!(route_hello.server_id, server_id);
             assert_eq!(route_hello.role, RouteRole::DaemonData);
+            assert!(
+                route_hello.route_generation.is_some(),
+                "daemon data route should inherit mux route_generation"
+            );
             assert_eq!(route_hello.client_id, Some(client_id));
             assert_eq!(route_hello.data_token, Some(data_token));
             send_route_ready_to_connector(&mut data_socket, server_id, RouteRole::DaemonData).await;
@@ -6934,6 +6957,8 @@ mod tests {
         let server_id = protocol.lock().await.server_id();
         let client_id = RelayClientId(5150);
         let data_token = ProtoNonce("idle-data-token".to_owned());
+        let route_generation = ProtoNonce("idle-generation-assignment".to_owned());
+        let expected_route_generation = route_generation.clone();
 
         let server = tokio::spawn(async move {
             let (data_tcp, _) = listener.accept().await.unwrap();
@@ -6941,6 +6966,10 @@ mod tests {
             let route_hello = read_route_hello_from_connector(&mut data_socket).await;
             assert_eq!(route_hello.server_id, server_id);
             assert_eq!(route_hello.role, RouteRole::DaemonData);
+            assert_eq!(
+                route_hello.route_generation,
+                Some(expected_route_generation.clone())
+            );
             assert_eq!(route_hello.client_id, None);
             assert_eq!(route_hello.data_token, None);
             send_route_ready_to_connector(&mut data_socket, server_id, RouteRole::DaemonData).await;
@@ -6983,7 +7012,14 @@ mod tests {
         let base = RelayBaseUrl::parse(&format!("ws://{addr}")).unwrap();
         let (event_tx, mut event_rx) = mpsc::channel(4);
         let task = tokio::spawn(run_relay_idle_data_connection(
-            base, None, None, protocol, server_id, 1, event_tx,
+            base,
+            None,
+            None,
+            protocol,
+            server_id,
+            route_generation,
+            1,
+            event_tx,
         ));
 
         let ready = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
@@ -7015,6 +7051,8 @@ mod tests {
         let protocol = test_protocol("relay-idle-data-close-after-disconnect");
         let server_id = protocol.lock().await.server_id();
         let client_id = RelayClientId(6101);
+        let route_generation = ProtoNonce("idle-generation-disconnect".to_owned());
+        let expected_route_generation = route_generation.clone();
 
         let server = tokio::spawn(async move {
             let (data_tcp, _) = listener.accept().await.unwrap();
@@ -7022,6 +7060,10 @@ mod tests {
             let route_hello = read_route_hello_from_connector(&mut data_socket).await;
             assert_eq!(route_hello.server_id, server_id);
             assert_eq!(route_hello.role, RouteRole::DaemonData);
+            assert_eq!(
+                route_hello.route_generation,
+                Some(expected_route_generation.clone())
+            );
             assert_eq!(route_hello.client_id, None);
             assert_eq!(route_hello.data_token, None);
             send_route_ready_to_connector(&mut data_socket, server_id, RouteRole::DaemonData).await;
@@ -7065,7 +7107,14 @@ mod tests {
         let base = RelayBaseUrl::parse(&format!("ws://{addr}")).unwrap();
         let (event_tx, mut event_rx) = mpsc::channel(8);
         let task = tokio::spawn(run_relay_idle_data_connection(
-            base, None, None, protocol, server_id, 1, event_tx,
+            base,
+            None,
+            None,
+            protocol,
+            server_id,
+            route_generation,
+            1,
+            event_tx,
         ));
 
         assert!(matches!(
@@ -7193,6 +7242,7 @@ mod tests {
             None,
             test_protocol("relay-control-client-disconnect-aborts-data-task"),
             ServerId::new(),
+            ProtoNonce("disconnect-route-generation".to_owned()),
             &mut data_tasks,
         )
         .await

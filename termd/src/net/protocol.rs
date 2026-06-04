@@ -3,6 +3,9 @@
 //! 本模块不依赖真实 socket，便于单元测试直接驱动 hello、E2EE、pair/auth 和 session
 //! 操作。Axum 只负责把网络帧转成这里的统一 envelope。
 
+mod recovery;
+mod terminal_frame_log;
+
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs::{self, OpenOptions};
@@ -65,6 +68,9 @@ use thiserror::Error;
 use tokio::sync::watch;
 use uuid::Uuid;
 
+use self::terminal_frame_log::{
+    SessionTerminalFrameLog, terminal_frame_covered_seq, terminal_frame_list_crosses_resize,
+};
 use crate::auth::{
     AuthChallengeManager, ChallengeResponseService, DaemonE2eeSigningInput, DaemonIdentity,
     DaemonPublicIdentity, DeviceIdentity, E2eeAuthTranscript, HttpE2eeSigningInput,
@@ -105,7 +111,6 @@ const TERMINAL_STREAM_BATCH_MAX_TRANSPORT_BYTES: usize = 768 * 1024;
 const TERMINAL_STREAM_BATCH_TRANSPORT_OVERHEAD_BYTES: usize = 128;
 const TERMINAL_STREAM_FRAME_TRANSPORT_OVERHEAD_BYTES: usize = 256;
 const TERMINAL_STREAM_METADATA_CREDIT_BYTES: usize = 1;
-const TERMINAL_LIVE_FRAME_LOG_MAX_FRAMES: usize = 8192;
 const SESSION_TERMINAL_CWD_PROBE_MIN_INTERVAL_MS: u64 = 1_000;
 const SESSION_FILE_DOWNLOAD_TOKEN_TTL_MS: u64 = 60_000;
 const SESSION_FILE_DOWNLOAD_GRANT_LIMIT: usize = 128;
@@ -149,13 +154,6 @@ struct DaemonClientRecord {
     cursor_row: Option<u16>,
     cursor_col: Option<u16>,
     cursor_focused: Option<bool>,
-}
-
-/// supervisor 恢复后补给协议层的可见 session 元数据。
-#[derive(Debug, Clone)]
-struct RestoredSessionMetadata {
-    name: Option<String>,
-    root_path: PathBuf,
 }
 
 /// 0.2.0 packet terminal stream 的连接内状态。
@@ -746,240 +744,6 @@ where
         .session_output_history
         .get(&session_id)
         .is_some_and(|history| history.has_after(cursor))
-}
-
-/// daemon 内的 session 级 terminal live frame 回放窗口。
-///
-/// 中文注释：supervisor IPC reader 只能把 live frame 放进一个 daemon 侧缓存；如果每条
-/// WebSocket 直接 pop 这个缓存，最先 flush 的连接会独占输出，其他窗口/relay client 就会
-/// 丢 tail。这里把 live frame 提升成 session 级 retained log，再由每条连接用自己的
-/// `next_terminal_seq` cursor 读取，语义上等价于 supervisor snapshot + tail 模型。
-#[derive(Debug, Default, Clone)]
-struct SessionTerminalFrameLog {
-    frames: VecDeque<TerminalFramePayload>,
-    base_seq: u64,
-    size: TerminalSize,
-    screen: Option<TerminalScreen>,
-    has_sequence_gap: bool,
-}
-
-impl SessionTerminalFrameLog {
-    fn ensure_initialized(&mut self, size: TerminalSize) {
-        if self.screen.is_none() {
-            self.size = size;
-            self.screen = Some(TerminalScreen::new(size.rows, size.cols));
-        }
-    }
-
-    fn reset_from_snapshot(&mut self, base_seq: u64, size: TerminalSize, data: &[u8]) {
-        if base_seq < self.base_seq {
-            return;
-        }
-        self.frames.clear();
-        self.base_seq = base_seq;
-        self.size = size;
-        self.has_sequence_gap = false;
-        let mut screen = TerminalScreen::new(size.rows, size.cols);
-        screen.apply(data);
-        self.screen = Some(screen);
-    }
-
-    fn push(&mut self, frame: TerminalFramePayload) {
-        if !self.apply_to_mirror(&frame) {
-            return;
-        }
-        if frame_is_live_loggable(&frame) {
-            self.frames.push_back(frame);
-        }
-        while self.frames.len() > TERMINAL_LIVE_FRAME_LOG_MAX_FRAMES {
-            self.frames.pop_front();
-        }
-    }
-
-    fn apply_to_mirror(&mut self, frame: &TerminalFramePayload) -> bool {
-        match frame {
-            TerminalFramePayload::Snapshot {
-                base_seq,
-                size,
-                data_base64,
-                ..
-            } => {
-                if let Ok(bytes) = general_purpose::STANDARD.decode(data_base64) {
-                    self.reset_from_snapshot(*base_seq, *size, &bytes);
-                    return true;
-                }
-                false
-            }
-            TerminalFramePayload::Output {
-                terminal_seq,
-                data_base64,
-                ..
-            } => {
-                if *terminal_seq <= self.base_seq {
-                    return false;
-                }
-                if *terminal_seq != self.base_seq.saturating_add(1) {
-                    // 中文注释：daemon mirror 只能在 session terminal_seq 连续时产出
-                    // 权威 snapshot。发现 gap 后仍保留 live frame 给当前连接补 tail，
-                    // 但新 attach 必须回源 supervisor，避免用缺前序事件的 screen。
-                    self.has_sequence_gap = true;
-                    self.base_seq = self.base_seq.max(*terminal_seq);
-                    return true;
-                }
-                let Ok(bytes) = general_purpose::STANDARD.decode(data_base64) else {
-                    return false;
-                };
-                if let Some(screen) = &mut self.screen {
-                    screen.apply(&bytes);
-                } else {
-                    let mut screen = TerminalScreen::new(self.size.rows, self.size.cols);
-                    screen.apply(&bytes);
-                    self.screen = Some(screen);
-                }
-                self.base_seq = self.base_seq.max(*terminal_seq);
-                true
-            }
-            TerminalFramePayload::Resize {
-                terminal_seq, size, ..
-            } => {
-                if *terminal_seq <= self.base_seq {
-                    return false;
-                }
-                if *terminal_seq != self.base_seq.saturating_add(1) {
-                    self.has_sequence_gap = true;
-                    self.base_seq = self.base_seq.max(*terminal_seq);
-                    return true;
-                }
-                self.size = *size;
-                if let Some(screen) = &mut self.screen {
-                    screen.resize(size.rows, size.cols);
-                } else {
-                    self.screen = Some(TerminalScreen::new(size.rows, size.cols));
-                }
-                self.base_seq = self.base_seq.max(*terminal_seq);
-                true
-            }
-            TerminalFramePayload::Exit { terminal_seq, .. } => {
-                if *terminal_seq <= self.base_seq {
-                    return false;
-                }
-                if *terminal_seq != self.base_seq.saturating_add(1) {
-                    self.has_sequence_gap = true;
-                    self.base_seq = self.base_seq.max(*terminal_seq);
-                    return true;
-                }
-                self.base_seq = self.base_seq.max(*terminal_seq);
-                true
-            }
-            TerminalFramePayload::Batch { frames, .. } => {
-                let mut applied = false;
-                for frame in frames {
-                    applied |= self.apply_to_mirror(frame);
-                }
-                applied
-            }
-        }
-    }
-
-    fn has_from(&self, next_terminal_seq: u64) -> bool {
-        self.frames.iter().any(|frame| {
-            frame
-                .terminal_seq()
-                .is_some_and(|seq| seq >= next_terminal_seq)
-        })
-    }
-
-    fn snapshot_or_tail(
-        &self,
-        session_id: SessionId,
-        last_terminal_seq: Option<u64>,
-    ) -> Option<Vec<TerminalFramePayload>> {
-        self.snapshot_or_tail_limited(session_id, last_terminal_seq, None)
-    }
-
-    fn snapshot_or_tail_limited(
-        &self,
-        session_id: SessionId,
-        last_terminal_seq: Option<u64>,
-        max_frames: Option<usize>,
-    ) -> Option<Vec<TerminalFramePayload>> {
-        if self.has_sequence_gap {
-            return None;
-        }
-        let screen = self.screen.as_ref()?;
-        let current_seq = self.base_seq;
-        if let Some(last_terminal_seq) = last_terminal_seq {
-            if last_terminal_seq == current_seq {
-                return Some(Vec::new());
-            }
-            if last_terminal_seq < current_seq {
-                let mut tail = self
-                    .frames
-                    .iter()
-                    .filter(|frame| {
-                        frame
-                            .terminal_seq()
-                            .is_some_and(|seq| seq > last_terminal_seq)
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>();
-                let first_seq = tail.first().and_then(TerminalFramePayload::terminal_seq);
-                if first_seq == Some(last_terminal_seq.saturating_add(1)) {
-                    if terminal_frame_list_crosses_resize(&tail) {
-                        return Some(vec![TerminalFramePayload::Snapshot {
-                            session_id,
-                            base_seq: current_seq,
-                            size: self.size,
-                            data_base64: general_purpose::STANDARD.encode(screen.snapshot_bytes()),
-                        }]);
-                    }
-                    if let Some(max_frames) = max_frames {
-                        tail.truncate(max_frames);
-                    }
-                    return Some(tail);
-                }
-            }
-        }
-
-        Some(vec![TerminalFramePayload::Snapshot {
-            session_id,
-            base_seq: current_seq,
-            size: self.size,
-            data_base64: general_purpose::STANDARD.encode(screen.snapshot_bytes()),
-        }])
-    }
-}
-
-fn terminal_frame_list_crosses_resize(frames: &[TerminalFramePayload]) -> bool {
-    frames.iter().any(|frame| match frame {
-        TerminalFramePayload::Resize { .. } => true,
-        TerminalFramePayload::Batch { frames, .. } => terminal_frame_list_crosses_resize(frames),
-        TerminalFramePayload::Snapshot { .. }
-        | TerminalFramePayload::Output { .. }
-        | TerminalFramePayload::Exit { .. } => false,
-    })
-}
-
-fn terminal_frame_covered_seq(frame: &TerminalFramePayload) -> Option<u64> {
-    match frame {
-        TerminalFramePayload::Snapshot { base_seq, .. } => Some(*base_seq),
-        TerminalFramePayload::Output { terminal_seq, .. }
-        | TerminalFramePayload::Resize { terminal_seq, .. }
-        | TerminalFramePayload::Exit { terminal_seq, .. } => Some(*terminal_seq),
-        TerminalFramePayload::Batch { frames, .. } => {
-            frames.iter().filter_map(terminal_frame_covered_seq).max()
-        }
-    }
-}
-
-fn frame_is_live_loggable(frame: &TerminalFramePayload) -> bool {
-    match frame {
-        TerminalFramePayload::Output { .. }
-        | TerminalFramePayload::Resize { .. }
-        | TerminalFramePayload::Exit { .. } => true,
-        TerminalFramePayload::Batch { frames, .. } => frames.iter().any(frame_is_live_loggable),
-        TerminalFramePayload::Snapshot { .. } => false,
-    }
 }
 
 /// WebSocket 连接的协议阶段。
@@ -3466,40 +3230,13 @@ where
                 .map(|frame| terminal_frame_payload(session_id, frame))
                 .collect::<Result<Vec<_>, _>>()?;
         }
-        self.seed_terminal_frame_log_from_snapshot_frames(session_id, &frames);
+        if !frames.is_empty() {
+            self.session_terminal_frame_logs
+                .entry(session_id)
+                .or_default()
+                .seed_from_frames(&frames);
+        }
         Ok(frames)
-    }
-
-    fn seed_terminal_frame_log_from_snapshot_frames(
-        &mut self,
-        session_id: SessionId,
-        frames: &[TerminalFramePayload],
-    ) {
-        if frames.is_empty() {
-            return;
-        }
-        let log = self
-            .session_terminal_frame_logs
-            .entry(session_id)
-            .or_default();
-        for frame in frames {
-            match frame {
-                TerminalFramePayload::Snapshot {
-                    base_seq,
-                    size,
-                    data_base64,
-                    ..
-                } => {
-                    if let Ok(bytes) = general_purpose::STANDARD.decode(data_base64) {
-                        log.reset_from_snapshot(*base_seq, *size, &bytes);
-                    }
-                }
-                TerminalFramePayload::Output { .. }
-                | TerminalFramePayload::Resize { .. }
-                | TerminalFramePayload::Exit { .. }
-                | TerminalFramePayload::Batch { .. } => log.push(frame.clone()),
-            }
-        }
     }
 
     fn read_terminal_frames_for_connection(
@@ -4011,266 +3748,6 @@ where
         }
     }
 
-    fn repair_visible_session_metadata_for(
-        &mut self,
-        session_id: SessionId,
-    ) -> Result<(), ProtocolError> {
-        let current_record = self
-            .client_history
-            .session_record_including_closed(session_id)?;
-        if matches!(
-            current_record.as_ref().map(|record| record.state),
-            Some(SessionState::Running | SessionState::Created)
-        ) {
-            return Ok(());
-        }
-
-        if let Some(internal_id) = self.session_index.get(&session_id).cloned() {
-            let state = self.runtime_state_proto(&internal_id)?;
-            let size = self.runtime_size_proto(&internal_id)?;
-            let root_path = self
-                .session_roots
-                .get(&session_id)
-                .cloned()
-                .or_else(|| {
-                    current_record
-                        .as_ref()
-                        .map(|record| PathBuf::from(&record.root_path))
-                })
-                .unwrap_or_else(|| self.default_restored_session_root());
-            let files_path = current_record
-                .as_ref()
-                .and_then(|record| record.files_path.as_ref().map(PathBuf::from))
-                .unwrap_or_else(|| root_path.clone());
-            let default_name = self
-                .session_names
-                .get(&session_id)
-                .cloned()
-                .or_else(|| {
-                    current_record
-                        .as_ref()
-                        .and_then(|record| record.name.clone())
-                })
-                .unwrap_or_else(|| default_restored_session_name(session_id));
-            let created_at_ms = current_record
-                .as_ref()
-                .map(|record| record.created_at_ms)
-                .unwrap_or_else(current_unix_timestamp_millis);
-            self.client_history.record_session_restored(
-                session_id,
-                state,
-                size,
-                &root_path,
-                &default_name,
-                &files_path,
-                created_at_ms,
-                current_unix_timestamp_millis(),
-            )?;
-            return Ok(());
-        }
-
-        Ok(())
-    }
-
-    fn restore_runtime_sessions(&mut self, sessions: Vec<SessionStateRecord>) {
-        let persisted_by_id = self.visible_session_metadata_by_id();
-
-        for session in sessions {
-            let wire_session_id = session.session_id;
-            // runtime_sessions 的 restore_info 是 supervisor 可重连事实；client history
-            // 缺失只影响展示元数据，不能让存活 session 从 Web 列表消失。
-            if session.state != SessionState::Running
-                || session.restore_info.is_none()
-                || !restore_info_is_reconnectable(session.restore_info.as_ref())
-            {
-                self.mark_persisted_session_closed(wire_session_id);
-                continue;
-            }
-
-            match self.runtime.reconnect_session(&session) {
-                Ok(()) => {
-                    let metadata = self
-                        .restored_session_metadata(&session, persisted_by_id.get(&wire_session_id));
-                    self.register_restored_runtime_session(&session, metadata);
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        %error,
-                        session_id = %wire_session_id.0,
-                        "failed to reconnect persisted session supervisor; marking session closed"
-                    );
-                    // 中文注释：session 的运行事实只能来自 live supervisor。启动恢复已经给
-                    // stale socket 一次重连机会；失败后必须关闭并移除可见状态，不能再把
-                    // 它保留成 running，也不能让 session.list/attach 同步重试旧 socket。
-                    self.mark_persisted_session_closed(wire_session_id);
-                }
-            }
-        }
-        if let Err(error) = self.persist_state() {
-            tracing::warn!(%error, "failed to persist recovered session supervisor state");
-        }
-    }
-
-    fn register_restored_runtime_session(
-        &mut self,
-        session: &SessionStateRecord,
-        metadata: RestoredSessionMetadata,
-    ) {
-        let wire_session_id = session.session_id;
-        let internal_session_id = wire_session_id.0.to_string();
-        self.session_index
-            .insert(wire_session_id, internal_session_id);
-        self.session_output_history_mut(wire_session_id, session.size);
-        let (file_tree_signal, _) = watch::channel(0);
-        self.session_file_tree_signals
-            .insert(wire_session_id, file_tree_signal);
-        let (resize_signal, _) = watch::channel(session.size);
-        self.session_resize_signals
-            .insert(wire_session_id, resize_signal);
-        self.session_roots
-            .insert(wire_session_id, metadata.root_path);
-        if let Some(name) = metadata.name {
-            self.session_names.insert(wire_session_id, name);
-        }
-    }
-
-    fn visible_session_metadata_by_id(&self) -> HashMap<SessionId, SessionHistoryRecord> {
-        match self.restore_session_metadata_by_id() {
-            Ok(records) => records,
-            Err(error) => {
-                tracing::warn!(%error, "failed to load session metadata while restoring supervisors");
-                HashMap::new()
-            }
-        }
-    }
-
-    fn restore_session_metadata_by_id(
-        &self,
-    ) -> Result<HashMap<SessionId, SessionHistoryRecord>, StateError> {
-        let mut records = HashMap::new();
-        for record in self.client_history.list_sessions()? {
-            records.insert(record.session_id, record);
-        }
-
-        // snapshot_state 和 list_sessions 只看可见行；恢复路径还必须补查 closed 行。
-        // 之前安装/重启流程可能把仍存活的 session 元数据标成 closed，此时如果不补查，
-        // 领养 live supervisor 时就会丢掉用户设置的 session 名称。
-        for session_id in self.session_index.keys() {
-            if records.contains_key(session_id) {
-                continue;
-            }
-            if let Some(record) = self
-                .client_history
-                .session_record_including_closed(*session_id)?
-            {
-                records.insert(*session_id, record);
-            }
-        }
-
-        Ok(records)
-    }
-
-    fn restored_session_metadata(
-        &mut self,
-        session: &SessionStateRecord,
-        persisted: Option<&SessionHistoryRecord>,
-    ) -> RestoredSessionMetadata {
-        if let Some(record) = persisted {
-            return self.restore_session_metadata_from_existing_record(session, record);
-        }
-        match self
-            .client_history
-            .session_record_including_closed(session.session_id)
-        {
-            Ok(Some(record)) => {
-                return self.restore_session_metadata_from_existing_record(session, &record);
-            }
-            Ok(None) => {}
-            Err(error) => {
-                tracing::warn!(%error, session_id = %session.session_id.0, "failed to load closed session metadata while restoring supervisor");
-            }
-        }
-
-        let root_path = self.default_restored_session_root();
-        let default_name = default_restored_session_name(session.session_id);
-
-        match self.client_history.record_session_restored(
-            session.session_id,
-            session.state,
-            session.size,
-            &root_path,
-            &default_name,
-            &root_path,
-            session.created_at_ms,
-            session.updated_at_ms,
-        ) {
-            Ok(record) => restored_session_metadata_from_record(&record),
-            Err(error) => {
-                tracing::warn!(%error, session_id = %session.session_id.0, "failed to repair restored session metadata in sqlite history");
-                // SQLite 元数据修复失败不能让已经重连成功的 supervisor 再次不可见。
-                RestoredSessionMetadata {
-                    name: Some(default_name),
-                    root_path,
-                }
-            }
-        }
-    }
-
-    fn restore_session_metadata_from_existing_record(
-        &mut self,
-        session: &SessionStateRecord,
-        record: &SessionHistoryRecord,
-    ) -> RestoredSessionMetadata {
-        let root_path = PathBuf::from(&record.root_path);
-        let files_path = record
-            .files_path
-            .as_ref()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| root_path.clone());
-        let default_name = record
-            .name
-            .clone()
-            .unwrap_or_else(|| default_restored_session_name(session.session_id));
-
-        match self.client_history.record_session_restored(
-            session.session_id,
-            session.state,
-            session.size,
-            &root_path,
-            &default_name,
-            &files_path,
-            record.created_at_ms,
-            session.updated_at_ms,
-        ) {
-            Ok(repaired) => restored_session_metadata_from_record(&repaired),
-            Err(error) => {
-                tracing::warn!(%error, session_id = %session.session_id.0, "failed to repair existing session metadata while restoring supervisor");
-                // 修复 state 失败不影响本次内存恢复；至少保留已读到的名称和 root。
-                restored_session_metadata_from_record(record)
-            }
-        }
-    }
-
-    fn default_restored_session_root(&self) -> PathBuf {
-        if let Some(root) = self
-            .config
-            .default_working_directory
-            .as_ref()
-            .and_then(|path| path.canonicalize().ok())
-        {
-            return root;
-        }
-
-        if let Ok(root) = std::env::current_dir().and_then(|path| path.canonicalize()) {
-            return root;
-        }
-
-        // 极端环境下当前目录不可读时，退回系统临时目录，确保文件树根仍指向真实目录。
-        std::env::temp_dir()
-            .canonicalize()
-            .unwrap_or_else(|_| std::env::temp_dir())
-    }
-
     fn default_created_session_name(&self, session_id: SessionId) -> String {
         let mut occupied_names: HashSet<String> = self.session_names.values().cloned().collect();
         if let Ok(records) = self.client_history.list_sessions() {
@@ -4292,25 +3769,6 @@ where
                 return candidate;
             }
             suffix += 1;
-        }
-    }
-
-    fn mark_persisted_session_closed(&mut self, session_id: SessionId) {
-        self.close_visible_session_state(session_id);
-        let now_ms = current_unix_timestamp_millis();
-        if let Err(error) = self
-            .client_history
-            .record_session_closed(session_id, now_ms)
-        {
-            tracing::warn!(%error, session_id = %session_id.0, "failed to mark restored session closed in sqlite history");
-        }
-        if let Err(error) = self.client_history.remove_session_attachments(session_id) {
-            tracing::warn!(%error, session_id = %session_id.0, "failed to clear restored session attachments from sqlite history");
-        }
-        if let Err(error) =
-            StateStore::record_runtime_session_closed(&self.config.state_path, session_id, now_ms)
-        {
-            tracing::warn!(%error, session_id = %session_id.0, "failed to mark restored runtime session closed in sqlite state");
         }
     }
 
@@ -4562,20 +4020,8 @@ fn non_empty_trimmed(value: String) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_owned())
 }
 
-fn restored_session_metadata_from_record(record: &SessionHistoryRecord) -> RestoredSessionMetadata {
-    RestoredSessionMetadata {
-        name: record.name.clone(),
-        root_path: PathBuf::from(&record.root_path),
-    }
-}
-
 fn session_created_at(session: &SessionSummaryPayload) -> UnixTimestampMillis {
     session.created_at_ms.unwrap_or(UnixTimestampMillis(0))
-}
-
-fn default_restored_session_name(session_id: SessionId) -> String {
-    let raw = session_id.0.to_string();
-    format!("restored-{}", &raw[..8])
 }
 
 // 给新建 session 分配一个稳定、可读、不会随列表顺序变化的默认英文名。
@@ -8566,16 +8012,6 @@ fn runtime_state_to_proto(state: RuntimeSessionState) -> SessionState {
         RuntimeSessionState::Running => SessionState::Running,
         RuntimeSessionState::Closed => SessionState::Closed,
     }
-}
-
-fn restore_info_is_reconnectable(restore_info: Option<&PtyRestoreInfo>) -> bool {
-    matches!(
-        restore_info,
-        Some(PtyRestoreInfo::UnixSocket {
-            supervisor_status: PtySupervisorStatus::Running,
-            ..
-        })
-    )
 }
 
 fn runtime_role_to_proto(role: RuntimeAttachRole) -> AttachRole {

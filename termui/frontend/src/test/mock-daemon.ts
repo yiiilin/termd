@@ -102,6 +102,7 @@ interface MockDaemonOptions {
   sessionGit?: Record<UUID, SessionGitResultPayload>;
   sessionFileReads?: Record<string, SessionFileReadResultPayload>;
   sessionFileReadDelayMsByPath?: Record<string, number>;
+  sessionFileWriteDelayMsByPath?: Record<string, number>;
   sessionGitDiffDelayMsByPath?: Record<string, number>;
   fileUploadProgressOverrides?: Record<string, Partial<SessionFileUploadProgressPayload>>;
   fileUploadProgressDelayMs?: number;
@@ -1234,6 +1235,12 @@ export class MockDaemon {
           path: payload.path,
           text: decodeUtf8(bytes),
         });
+        const writeDelayMs = this.options.sessionFileWriteDelayMsByPath?.[payload.path];
+        if (writeDelayMs) {
+          // 中文注释：这里先记录“daemon 已收到写请求”，再延迟提交和响应，
+          // 让测试可以先观察到 request，再切 session，最后才收到迟到 ack。
+          await new Promise((resolve) => setTimeout(resolve, writeDelayMs));
+        }
         this.applyMockFileWrite(payload.session_id, payload.path);
         this.sendInner(
           connection,

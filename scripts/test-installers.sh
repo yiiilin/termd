@@ -60,11 +60,22 @@ grep -q 'TERMD_REQUIRED_SUPERVISOR_VERSION:-' "${ROOT_DIR}/.github/workflows/rel
 ! grep -q 'TERMD_SUPERVISOR_VERSION:-.*supervisor_version' "${ROOT_DIR}/.github/workflows/release.yml"
 test -s "${ROOT_DIR}/SUPERVISOR_VERSION"
 
+_load_termd_installer_functions_source() {
+  # shellcheck source=/dev/null
+  source <(sed '/^main "\$@"/,$d' "${ROOT_DIR}/scripts/install-termd.sh")
+}
+
 load_termd_installer_functions() {
   # 测试只加载函数和默认变量，跳过脚本末尾的 main 调用，避免触发真实安装。
   unset SUPERVISOR_VERSION REQUIRED_SUPERVISOR_VERSION TERMD_SUPERVISOR_VERSION TERMD_REQUIRED_SUPERVISOR_VERSION TERMD_INSTALL_CONFIRM_FD
-  # shellcheck source=/dev/null
-  source <(sed '/^main "\$@"/,$d' "${ROOT_DIR}/scripts/install-termd.sh")
+  _load_termd_installer_functions_source
+}
+
+load_termd_installer_functions_with_required_supervisor_version() {
+  local required_supervisor_version="$1"
+
+  unset SUPERVISOR_VERSION REQUIRED_SUPERVISOR_VERSION TERMD_SUPERVISOR_VERSION TERMD_INSTALL_CONFIRM_FD
+  TERMD_REQUIRED_SUPERVISOR_VERSION="$required_supervisor_version" _load_termd_installer_functions_source
 }
 
 load_update_local_functions() {
@@ -84,6 +95,23 @@ assert_file_contains() {
     sed -n '1,160p' "$file" >&2
     exit 1
   fi
+}
+
+previous_supervisor_version_from_file() {
+  local version_file="$1"
+
+  python3 - "$version_file" <<'PY'
+from datetime import date, timedelta
+from pathlib import Path
+import sys
+
+repo_version = Path(sys.argv[1]).read_text().strip()
+base_version, _, suffix = repo_version.partition('.')
+legacy_version = (date.fromisoformat(base_version) - timedelta(days=1)).isoformat()
+if suffix:
+    legacy_version = f"{legacy_version}.{suffix}"
+print(legacy_version)
+PY
 }
 
 install_fake_termd_system_commands() {
@@ -127,7 +155,7 @@ install_fake_termd_system_commands() {
 
   require_root() { :; }
   require_cmd() { :; }
-  resolve_version() { VERSION="v-test"; }
+  resolve_version() { VERSION="1970-01-01"; }
   install_from_release() { return 0; }
   install_from_source() { return 1; }
   ensure_system_user() { :; }
@@ -474,7 +502,7 @@ test_termd_supervisor_version_match_keeps_runtime_state() (
   load_termd_installer_functions
   install_fake_termd_system_commands
 
-  local tmp_dir unit_file sqlite_file socket_file
+  local tmp_dir unit_file sqlite_file socket_file supervisor_version
   tmp_dir="$(mktemp -d)"
   trap 'rm -rf "$tmp_dir"' EXIT
   TERMD_STATE_DIR="${tmp_dir}/termd"
@@ -483,15 +511,16 @@ test_termd_supervisor_version_match_keeps_runtime_state() (
   mkdir -p "${STATE_DIR}/termd-supervisors"
   sqlite_file="${STATE_DIR}/daemon-state.sqlite"
   socket_file="${STATE_DIR}/termd-supervisors/stale.sock"
-  seed_termd_runtime_sqlite "$sqlite_file" "v-test"
+  supervisor_version="$(tr -d '\n' <"${ROOT_DIR}/SUPERVISOR_VERSION")"
+  seed_termd_runtime_sqlite "$sqlite_file" "$supervisor_version"
   create_stale_supervisor_socket "$socket_file"
 
-  SUPERVISOR_VERSION="v-test"
+  SUPERVISOR_VERSION="$supervisor_version"
   unit_file="${tmp_dir}/termd.service"
   run_fake_termd_install "$unit_file" >/dev/null
   unset SUPERVISOR_VERSION
 
-  python3 - "$sqlite_file" "$socket_file" <<'PY'
+  python3 - "$sqlite_file" "$socket_file" "$ROOT_DIR/SUPERVISOR_VERSION" <<'PY'
 import pathlib
 import sqlite3
 import sys
@@ -504,18 +533,35 @@ try:
     version = conn.execute(
         "SELECT value FROM daemon_meta WHERE key = 'supervisor_version'"
     ).fetchone()[0]
-    assert version == "v-test", version
+    assert version == pathlib.Path(sys.argv[3]).read_text().strip(), version
 finally:
     conn.close()
 assert pathlib.Path(sys.argv[2]).exists()
 PY
 )
 
+test_termd_default_supervisor_version_uses_repository_version_file() (
+  load_termd_installer_functions
+  install_fake_termd_system_commands
+
+  local tmp_dir
+  tmp_dir="$(mktemp -d)"
+  trap 'rm -rf "$tmp_dir"' EXIT
+  STATE_DIR="${tmp_dir}/termd"
+
+  resolve_supervisor_version
+
+  local supervisor_version
+  supervisor_version="$(tr -d '\n' <"${ROOT_DIR}/SUPERVISOR_VERSION")"
+  [[ "$SUPERVISOR_VERSION_NEEDS_RUNTIME_CLEAR" -eq 0 ]]
+  [[ "$SUPERVISOR_VERSION" == "$supervisor_version" ]]
+)
+
 test_termd_baked_supervisor_default_keeps_runtime_state() (
   load_termd_installer_functions
   install_fake_termd_system_commands
 
-  local tmp_dir unit_file sqlite_file socket_file
+  local tmp_dir unit_file sqlite_file socket_file baked_supervisor_version
   tmp_dir="$(mktemp -d)"
   trap 'rm -rf "$tmp_dir"' EXIT
   TERMD_STATE_DIR="${tmp_dir}/termd"
@@ -524,18 +570,19 @@ test_termd_baked_supervisor_default_keeps_runtime_state() (
   mkdir -p "${STATE_DIR}/termd-supervisors"
   sqlite_file="${STATE_DIR}/daemon-state.sqlite"
   socket_file="${STATE_DIR}/termd-supervisors/stale.sock"
-  seed_termd_runtime_sqlite "$sqlite_file" "v-old"
+  seed_termd_runtime_sqlite_without_supervisor_version "$sqlite_file"
   create_stale_supervisor_socket "$socket_file"
 
-  # release 产物曾把默认 supervisor 版本烘进脚本；这不是用户显式请求升级，
-  # 普通二进制更新必须继续沿用现有 baseline，并保留 runtime session。
-  SUPERVISOR_VERSION="v-new"
+  # 这里模拟一个旧的、已经烘进脚本里的 supervisor 默认值。
+  # 即使数据库里还没有 supervisor_version 元数据，普通二进制更新也不能清掉已有 runtime session。
+  baked_supervisor_version="$(previous_supervisor_version_from_file "${ROOT_DIR}/SUPERVISOR_VERSION")"
+  SUPERVISOR_VERSION="$baked_supervisor_version"
   export TERMD_INSTALL_CONFIRM_FD=0
   unit_file="${tmp_dir}/termd.service"
   run_fake_termd_install "$unit_file" <<<"y" >/dev/null
   unset SUPERVISOR_VERSION TERMD_INSTALL_CONFIRM_FD
 
-  python3 - "$sqlite_file" "$socket_file" <<'PY'
+  python3 - "$sqlite_file" "$socket_file" "$baked_supervisor_version" <<'PY'
 import pathlib
 import sqlite3
 import sys
@@ -548,7 +595,7 @@ try:
     version = conn.execute(
         "SELECT value FROM daemon_meta WHERE key = 'supervisor_version'"
     ).fetchone()[0]
-    assert version == "v-old", version
+    assert version == sys.argv[3], version
 finally:
     conn.close()
 assert pathlib.Path(sys.argv[2]).exists()
@@ -556,7 +603,7 @@ PY
 )
 
 test_termd_required_supervisor_version_mismatch_prompts_and_clears_runtime_state() (
-  load_termd_installer_functions
+  load_termd_installer_functions_with_required_supervisor_version "$(tr -d '\n' <"${ROOT_DIR}/SUPERVISOR_VERSION")"
   install_fake_termd_system_commands
   install_fake_supervisor_termination_tracker
 
@@ -572,14 +619,12 @@ test_termd_required_supervisor_version_mismatch_prompts_and_clears_runtime_state
   seed_termd_runtime_sqlite "$sqlite_file" "v-old"
   create_stale_supervisor_socket "$socket_file"
 
-  REQUIRED_SUPERVISOR_VERSION="v-new"
-  SUPERVISOR_VERSION_REQUIRED=1
   export TERMD_INSTALL_CONFIRM_FD=0
   unit_file="${tmp_dir}/termd.service"
   run_fake_termd_install "$unit_file" <<<"y" >/dev/null
-  unset REQUIRED_SUPERVISOR_VERSION TERMD_INSTALL_CONFIRM_FD
+  unset TERMD_INSTALL_CONFIRM_FD
 
-  python3 - "$sqlite_file" "$socket_file" <<'PY'
+  python3 - "$sqlite_file" "$socket_file" "$ROOT_DIR/SUPERVISOR_VERSION" <<'PY'
 import pathlib
 import sqlite3
 import sys
@@ -595,7 +640,7 @@ try:
     version = conn.execute(
         "SELECT value FROM daemon_meta WHERE key = 'supervisor_version'"
     ).fetchone()[0]
-    assert version == "v-new", version
+    assert version == pathlib.Path(sys.argv[3]).read_text().strip(), version
 finally:
     conn.close()
 assert not pathlib.Path(sys.argv[2]).exists()
@@ -608,7 +653,7 @@ test_termd_missing_supervisor_meta_keeps_runtime_state_on_default_update() (
   load_termd_installer_functions
   install_fake_termd_system_commands
 
-  local tmp_dir unit_file sqlite_file socket_file
+  local tmp_dir unit_file sqlite_file socket_file supervisor_version
   tmp_dir="$(mktemp -d)"
   trap 'rm -rf "$tmp_dir"' EXIT
   TERMD_STATE_DIR="${tmp_dir}/termd"
@@ -622,12 +667,13 @@ test_termd_missing_supervisor_meta_keeps_runtime_state_on_default_update() (
 
   # 旧版本可能还没有 supervisor_version 元数据；默认更新只能补 baseline，
   # 不能把已有 session 当成需要清理的旧 runtime。
+  supervisor_version="$(tr -d '\n' <"${ROOT_DIR}/SUPERVISOR_VERSION")"
   export TERMD_INSTALL_CONFIRM_FD=0
   unit_file="${tmp_dir}/termd.service"
   run_fake_termd_install "$unit_file" <<<"y" >/dev/null
   unset TERMD_INSTALL_CONFIRM_FD
 
-  python3 - "$sqlite_file" "$socket_file" <<'PY'
+  python3 - "$sqlite_file" "$socket_file" "$supervisor_version" <<'PY'
 import pathlib
 import sqlite3
 import sys
@@ -640,7 +686,7 @@ try:
     version = conn.execute(
         "SELECT value FROM daemon_meta WHERE key = 'supervisor_version'"
     ).fetchone()[0]
-    assert version == "v-test", version
+    assert version == sys.argv[3], version
 finally:
     conn.close()
 assert pathlib.Path(sys.argv[2]).exists()
@@ -757,7 +803,7 @@ PY
 )
 
 test_termd_required_supervisor_version_mismatch_decline_preserves_runtime_state() (
-  load_termd_installer_functions
+  load_termd_installer_functions_with_required_supervisor_version "$(tr -d '\n' <"${ROOT_DIR}/SUPERVISOR_VERSION")"
   install_fake_termd_system_commands
 
   local tmp_dir unit_file sqlite_file socket_file status
@@ -772,15 +818,13 @@ test_termd_required_supervisor_version_mismatch_decline_preserves_runtime_state(
   seed_termd_runtime_sqlite "$sqlite_file" "v-old"
   create_stale_supervisor_socket "$socket_file"
 
-  REQUIRED_SUPERVISOR_VERSION="v-new"
-  SUPERVISOR_VERSION_REQUIRED=1
   export TERMD_INSTALL_CONFIRM_FD=0
   unit_file="${tmp_dir}/termd.service"
   set +e
   (run_fake_termd_install "$unit_file" <<<"n" >/dev/null 2>/dev/null)
   status=$?
   set -e
-  unset REQUIRED_SUPERVISOR_VERSION TERMD_INSTALL_CONFIRM_FD
+  unset TERMD_INSTALL_CONFIRM_FD
 
   [[ "$status" -ne 0 ]]
 
@@ -860,6 +904,7 @@ test_termd_upgrade_uses_fixed_state_dir_when_existing_unit_has_no_working_direct
 test_termd_explicit_user_overrides_existing_service_user
 test_termd_proxy_arg_writes_common_proxy_env_vars
 test_termd_state_dir_change_clears_only_session_state
+test_termd_default_supervisor_version_uses_repository_version_file
 test_termd_supervisor_version_match_keeps_runtime_state
 test_termd_baked_supervisor_default_keeps_runtime_state
 test_termd_required_supervisor_version_mismatch_prompts_and_clears_runtime_state

@@ -3,7 +3,9 @@
 //! 这里只把 socket 字节流接到 `protocol` 状态机；pairing、auth、session 和 E2EE
 //! 规则都由协议核心执行，避免网络框架层夹带业务判断。
 
-use std::collections::{HashMap, HashSet, VecDeque};
+mod recovery;
+
+use std::collections::{HashSet, VecDeque};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::net::{AddrParseError, IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -25,8 +27,7 @@ use termd_proto::{
     ErrorPayload, HttpE2eeAuthPayload, MessageType, PROTOCOL_PACKET_VERSION, PairingToken,
     ProtocolVersion, PublicKey, RouteHelloPayload, RouteReadyPayload, RouteRole, ServerId,
     SessionAttachPayload, SessionFileHttpDownloadPayload, SessionFileHttpUploadStreamPayload,
-    SessionFileUploadPayload, SessionId, SessionState, Signature, TerminalSize,
-    UnixTimestampMillis,
+    SessionFileUploadPayload, SessionId, SessionState, Signature, UnixTimestampMillis,
 };
 use thiserror::Error;
 use tokio::net::TcpListener;
@@ -39,9 +40,8 @@ use tracing::{debug, info, warn};
 
 use crate::auth::current_unix_timestamp_millis;
 use crate::config::DaemonConfig;
-use crate::pty::supervisor::{SupervisorPtyBackend, SupervisorRestoreCandidate};
-use crate::pty::{PtyRestoreInfo, PtySupervisorStatus};
-use crate::state::{DaemonState, SessionStateRecord, StateError, StateStore};
+use crate::pty::supervisor::SupervisorPtyBackend;
+use crate::state::{StateError, StateStore};
 
 use super::protocol::{
     DaemonProtocol, JsonEnvelope, ProtocolConnection, ProtocolConnectionDebugSnapshot,
@@ -51,6 +51,8 @@ use super::protocol::{
 };
 use super::signature::Ed25519SignatureVerifier;
 use super::{decode_binary_encrypted_frame, encode_binary_encrypted_frame};
+pub(crate) use recovery::adopt_or_repair_runtime_sessions_from_supervisors;
+use recovery::warn_about_orphaned_supervisors;
 
 const OUTPUT_FLUSH_MAX_BYTES_PER_SESSION: usize = 512 * 1024;
 // transport 超时只关闭当前 WebSocket 连接；session/supervisor 仍由协议和 PTY 层保持持久。
@@ -494,94 +496,6 @@ pub fn try_default_protocol(config: DaemonConfig) -> Result<SharedDaemonProtocol
         }
     }
     Ok(Arc::new(Mutex::new(protocol)))
-}
-
-fn warn_about_orphaned_supervisors<I, S>(backend: &SupervisorPtyBackend, valid_session_ids: I)
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<str>,
-{
-    match backend.orphaned_supervisor_count(valid_session_ids) {
-        Ok(orphaned_count) if orphaned_count > 0 => {
-            // 启动/升级恢复路径绝不能因为判断为孤儿就主动 SIGTERM supervisor。
-            // 如果 socket 文件临时缺失或状态迁移失败，里面仍可能是用户正在跑的 shell。
-            warn!(
-                orphaned_count,
-                "left orphaned session supervisors running during startup"
-            );
-        }
-        Ok(_) => {}
-        Err(error) => warn!(%error, "failed to inspect orphaned session supervisors"),
-    }
-}
-
-pub(crate) fn adopt_or_repair_runtime_sessions_from_supervisors(
-    state: &mut DaemonState,
-    supervisors: impl IntoIterator<Item = SupervisorRestoreCandidate>,
-    now_ms: UnixTimestampMillis,
-) -> usize {
-    let mut session_positions = state
-        .sessions
-        .iter()
-        .enumerate()
-        .map(|(index, session)| (session.session_id, index))
-        .collect::<HashMap<_, _>>();
-    let mut repaired_count = 0;
-
-    for supervisor in supervisors {
-        let Ok(raw_session_id) = uuid::Uuid::parse_str(&supervisor.session_id) else {
-            continue;
-        };
-        let session_id = SessionId(raw_session_id);
-        let mut restored_session = SessionStateRecord {
-            session_id,
-            state: SessionState::Running,
-            size: TerminalSize {
-                rows: supervisor.size.rows,
-                cols: supervisor.size.cols,
-                pixel_width: supervisor.size.pixel_width,
-                pixel_height: supervisor.size.pixel_height,
-            },
-            created_at_ms: now_ms,
-            updated_at_ms: now_ms,
-            restore_info: Some(PtyRestoreInfo::UnixSocket {
-                socket_path: supervisor.socket_path,
-                supervisor_pid: supervisor.supervisor_pid,
-                supervisor_status: PtySupervisorStatus::Running,
-            }),
-        };
-
-        if let Some(index) = session_positions.get(&session_id).copied() {
-            let existing_session = &mut state.sessions[index];
-            // live supervisor 是 runtime 事实来源。旧安装脚本或异常重启可能已经把 SQLite
-            // runtime 行误标成 closed / 去掉 restore_info；supervisor 仍在时必须修回 Running，
-            // 否则 daemon 重启会把用户还在运行的 shell 从 session 列表里“丢掉”。
-            let needs_repair = existing_session.state != SessionState::Running
-                || !restore_info_is_running_supervisor(existing_session.restore_info.as_ref());
-            if needs_repair {
-                restored_session.created_at_ms = existing_session.created_at_ms;
-                *existing_session = restored_session;
-                repaired_count += 1;
-            }
-            continue;
-        }
-
-        state.sessions.push(restored_session);
-        session_positions.insert(session_id, state.sessions.len() - 1);
-        repaired_count += 1;
-    }
-
-    repaired_count
-}
-
-fn restore_info_is_running_supervisor(restore_info: Option<&PtyRestoreInfo>) -> bool {
-    matches!(
-        restore_info,
-        Some(PtyRestoreInfo::UnixSocket {
-            supervisor_status: PtySupervisorStatus::Running,
-            ..
-        })
-    )
 }
 
 /// 测试与旧调用点使用的便捷构造器；生产启动路径使用 `try_default_protocol` 返回结构化错误。
@@ -3239,8 +3153,6 @@ mod tests {
     use crate::net::{
         E2eeKeyPair, E2eePeerPublicKey, E2eeSession, E2eeSessionContext, E2eeSessionRole,
     };
-    use crate::pty::PtySize;
-    use crate::pty::supervisor::SupervisorRestoreCandidate;
     use crate::state::{
         DaemonState, SessionStateRecord, StateStore, client_history::ClientHistoryStore,
     };
@@ -3549,40 +3461,6 @@ mod tests {
     }
 
     #[test]
-    fn missing_runtime_rows_are_adopted_from_live_supervisors_before_cleanup() {
-        let session_id = SessionId::new();
-        let socket_path = PathBuf::from(format!(
-            "/var/lib/termd/termd-supervisors/{}.sock",
-            session_id.0
-        ));
-        let mut state = crate::state::DaemonState::default();
-        let candidates = vec![SupervisorRestoreCandidate {
-            session_id: session_id.0.to_string(),
-            socket_path: socket_path.clone(),
-            supervisor_pid: 4242,
-            size: PtySize::with_pixels(35, 120, 1600, 1000),
-        }];
-
-        let adopted = adopt_or_repair_runtime_sessions_from_supervisors(
-            &mut state,
-            candidates,
-            UnixTimestampMillis(12_345),
-        );
-
-        assert_eq!(adopted, 1);
-        assert_eq!(state.sessions.len(), 1);
-        let adopted_session = &state.sessions[0];
-        assert_eq!(adopted_session.session_id, session_id);
-        assert_eq!(adopted_session.state, SessionState::Running);
-        assert_eq!(adopted_session.size.rows, 35);
-        assert_eq!(adopted_session.size.cols, 120);
-        assert_eq!(adopted_session.size.pixel_width, 1600);
-        assert_eq!(adopted_session.size.pixel_height, 1000);
-        assert_eq!(adopted_session.created_at_ms, UnixTimestampMillis(12_345));
-        assert!(adopted_session.restore_info.is_some());
-    }
-
-    #[test]
     fn startup_prunes_closed_rows_without_live_supervisors() {
         let state_dir = std::env::temp_dir().join(format!(
             "termd-server-startup-prune-{}-{}",
@@ -3645,51 +3523,6 @@ mod tests {
                 .is_none()
         );
         let _ = fs::remove_dir_all(state_dir);
-    }
-
-    #[test]
-    fn closed_runtime_rows_are_repaired_from_live_supervisors_before_cleanup() {
-        let session_id = SessionId::new();
-        let socket_path = PathBuf::from(format!(
-            "/var/lib/termd/termd-supervisors/{}.sock",
-            session_id.0
-        ));
-        let mut state = crate::state::DaemonState {
-            version: crate::state::STATE_SCHEMA_VERSION,
-            daemon_identity: None,
-            trusted_devices: Vec::new(),
-            sessions: vec![SessionStateRecord {
-                session_id,
-                state: SessionState::Closed,
-                size: TerminalSize::new(24, 80),
-                created_at_ms: UnixTimestampMillis(1_000),
-                updated_at_ms: UnixTimestampMillis(1_500),
-                restore_info: None,
-            }],
-        };
-        let candidates = vec![SupervisorRestoreCandidate {
-            session_id: session_id.0.to_string(),
-            socket_path: socket_path.clone(),
-            supervisor_pid: 4242,
-            size: PtySize::with_pixels(35, 120, 1600, 1000),
-        }];
-
-        let adopted = adopt_or_repair_runtime_sessions_from_supervisors(
-            &mut state,
-            candidates,
-            UnixTimestampMillis(12_345),
-        );
-
-        assert_eq!(adopted, 1);
-        assert_eq!(state.sessions.len(), 1);
-        let repaired_session = &state.sessions[0];
-        assert_eq!(repaired_session.session_id, session_id);
-        assert_eq!(repaired_session.state, SessionState::Running);
-        assert_eq!(repaired_session.size.rows, 35);
-        assert_eq!(repaired_session.size.cols, 120);
-        assert_eq!(repaired_session.created_at_ms, UnixTimestampMillis(1_000));
-        assert_eq!(repaired_session.updated_at_ms, UnixTimestampMillis(12_345));
-        assert!(repaired_session.restore_info.is_some());
     }
 
     #[test]
