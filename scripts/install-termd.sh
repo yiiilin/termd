@@ -840,6 +840,12 @@ persist_supervisor_version() {
     clear_runtime_session_state_for_supervisor_upgrade "$sqlite_path" "${STATE_DIR}/termd-supervisors"
   fi
 
+  # 首次安装或被测试桩替换掉系统用户创建逻辑时，state 目录未必已经存在。
+  # 这种情况下不应因为 SQLite baseline 写入失败直接中断安装；daemon 启动后会按需补齐。
+  if [[ ! -d "$STATE_DIR" ]]; then
+    return 0
+  fi
+
   if [[ "$INSTALL_SET_SUPERVISOR_VERSION" -eq 1 ]]; then
     upsert_sqlite_meta_value "$sqlite_path" "supervisor_version" "$SUPERVISOR_VERSION"
   fi
