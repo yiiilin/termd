@@ -302,6 +302,7 @@ run_fake_termd_install() {
   ENV_FILE="${unit_file%.service}.env"
   ENV_DIR="$(dirname "$ENV_FILE")"
   WRAPPER_FILE="${unit_file%.service}-run"
+  WRAPPER_DIR="$(dirname "$WRAPPER_FILE")"
   main "$@" >/dev/null
 }
 
