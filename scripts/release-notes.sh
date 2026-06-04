@@ -14,6 +14,22 @@ version="${1:-}"
 PLACEHOLDER_TEXT="请在 scripts/release-notes.sh 中补充此版本的功能、修复和兼容性说明。"
 
 case "$version" in
+  0.4.0)
+    cat <<'EOF'
+termd 0.4.0
+
+用户可见变化:
+- relay Web 的终端输出链路和路由生命周期做了拆分，writer queue、route binder、transport policy 不再混在一个大文件里；长时间输出和重复 attach/reconnect 的卡顿问题更容易定位，也更不容易被单点逻辑卡住。
+- termd / termrelay / termui 的职责边界进一步收紧，Web 端的 workspace 连接、pairing、file editor、git diff 和 direct handshake 现在各自独立，减少了互相耦合导致的断连或状态错乱。
+- 安装和本地更新统一改为默认读取仓库里的 `SUPERVISOR_VERSION` 文件；普通升级会沿用已有 supervisor baseline，不会因为版本模板变化误清 session，只有显式 supervisor 版本切换才会触发清理。
+- 发版与安装脚本补齐了基于日期的 supervisor 兼容版本回归覆盖，避免以后再把默认版本、release 版本和本地更新版本混成一套旧逻辑。
+
+兼容性:
+- workspace / cargo / frontend 版本同步到 `0.4.0`；supervisor 兼容版本改为日期格式，当前值为 `2026-06-04`。
+- 从 0.3.x 升级时，普通安装和本地更新会保留已有运行态；只有显式传入不同 supervisor 版本时才会清理旧 session。
+- relay 仍然保持 dumb pipe，不解密、不解析业务明文。
+EOF
+    ;;
   0.3.13)
     cat <<'EOF'
 termd 0.3.13
