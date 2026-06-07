@@ -433,6 +433,39 @@ fn tmux_backend_disables_tmux_status_line_for_managed_sessions() {
 
 #[test]
 #[cfg(unix)]
+fn tmux_backend_disables_alternate_screen_switch_for_bridge_term() {
+    if !tmux_available() {
+        eprintln!("tmux unavailable; skipping integration test");
+        return;
+    }
+
+    let dir = temp_dir("terminal-overrides");
+    fs::create_dir_all(&dir).unwrap();
+    let socket_path = dir.join("tmux.sock");
+    let backend = TmuxPtyBackend::with_socket_path(&socket_path);
+    let session_id = "00000000-0000-0000-0000-00000000a00d";
+    let mut session = backend
+        .spawn_named(
+            session_id,
+            &CommandSpec::new("sh").args(["-lc", "printf terminal-overrides-ready; sleep 60"]),
+            PtySize::new(24, 80),
+        )
+        .unwrap();
+
+    read_until_contains(&mut *session, b"terminal-overrides-ready");
+    assert_eq!(
+        tmux_output(&socket_path, &["show-options", "-g", "terminal-overrides"]),
+        "terminal-overrides[0] xterm-256color:smcup@:rmcup@",
+        "tmux bridge 需要保留 xterm 能力，同时仅关闭 smcup/rmcup，避免 codex/vim 一类 TUI 格式错乱"
+    );
+
+    session.terminate().unwrap();
+    cleanup_tmux(&socket_path);
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+#[cfg(unix)]
 fn tmux_backend_reconnect_repairs_status_line_on_existing_server() {
     if !tmux_available() {
         eprintln!("tmux unavailable; skipping integration test");
@@ -491,6 +524,58 @@ fn tmux_backend_reconnect_repairs_status_line_on_existing_server() {
             &["show-options", "-t", &session_name, "status"]
         ),
         "status off"
+    );
+
+    drop(reconnected);
+    session.terminate().unwrap();
+    cleanup_tmux(&socket_path);
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+#[cfg(unix)]
+fn tmux_backend_reconnect_repairs_terminal_overrides_on_existing_server() {
+    if !tmux_available() {
+        eprintln!("tmux unavailable; skipping integration test");
+        return;
+    }
+
+    let dir = temp_dir("terminal-overrides-reconnect");
+    fs::create_dir_all(&dir).unwrap();
+    let socket_path = dir.join("tmux.sock");
+    let backend = TmuxPtyBackend::with_socket_path(&socket_path);
+    let session_id = "00000000-0000-0000-0000-00000000a00e";
+    let mut session = backend
+        .spawn_named(
+            session_id,
+            &CommandSpec::new("sh")
+                .args(["-lc", "printf terminal-overrides-reconnect-ready; sleep 60"]),
+            PtySize::new(24, 80),
+        )
+        .unwrap();
+
+    read_until_contains(&mut *session, b"terminal-overrides-reconnect-ready");
+    let restore_info = session.restore_info().expect("tmux sessions persist");
+
+    tmux_output(
+        &socket_path,
+        &["set-option", "-g", "terminal-overrides", ""],
+    );
+    assert_eq!(
+        tmux_output(&socket_path, &["show-options", "-g", "terminal-overrides"]),
+        "terminal-overrides",
+        "测试前置条件失败：global terminal-overrides 应先被清空"
+    );
+
+    let reconnected = backend
+        .reconnect(session_id, &restore_info, PtySize::new(24, 80))
+        .unwrap();
+
+    // 中文注释：daemon 重连已有 tmux server 时也必须修复 bridge terminal-overrides；
+    // 否则正式环境升级后，旧 server 上继续 attach 的 codex 仍会沿用错误能力集。
+    assert_eq!(
+        tmux_output(&socket_path, &["show-options", "-g", "terminal-overrides"]),
+        "terminal-overrides[0] xterm-256color:smcup@:rmcup@"
     );
 
     drop(reconnected);
@@ -726,6 +811,81 @@ fn tmux_runtime_reconnects_persisted_session_with_saved_size() {
     );
 
     restarted.close(session_id).unwrap();
+    cleanup_tmux(&socket_path);
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+#[cfg(unix)]
+fn tmux_backend_reconnect_applies_saved_size_before_bridge_output_is_consumed() {
+    if !tmux_available() {
+        eprintln!("tmux unavailable; skipping integration test");
+        return;
+    }
+
+    let dir = temp_dir("reconnect-size-before-bridge");
+    fs::create_dir_all(&dir).unwrap();
+    let socket_path = dir.join("tmux.sock");
+    let backend = TmuxPtyBackend::with_socket_path(&socket_path);
+    let session_id = "00000000-0000-0000-0000-00000000a010";
+    let mut session = backend
+        .spawn_named(
+            session_id,
+            &CommandSpec::new("sh").args(["-lc", "printf reconnect-size-ready; cat"]),
+            PtySize::new(24, 80),
+        )
+        .unwrap();
+    read_until_contains(&mut *session, b"reconnect-size-ready");
+    let restore_info = session.restore_info().expect("tmux sessions persist");
+    let PtyRestoreInfo::Tmux { session_name, .. } = restore_info.clone() else {
+        panic!("expected tmux restore info");
+    };
+
+    drop(session);
+
+    let mut reconnected = backend
+        .reconnect(session_id, &restore_info, PtySize::new(31, 100))
+        .unwrap();
+
+    assert_eq!(
+        tmux_output(
+            &socket_path,
+            &[
+                "display-message",
+                "-pt",
+                &session_name,
+                "#{window_width}x#{window_height}",
+            ],
+        ),
+        "100x31",
+        "reconnect 建立 daemon bridge 前必须先把 tmux window 调整到保存尺寸"
+    );
+
+    let mut buffer = [0_u8; 4096];
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut collected = Vec::new();
+    while Instant::now() < deadline {
+        let read = reconnected.read(&mut buffer).unwrap();
+        if read > 0 {
+            collected.extend_from_slice(&buffer[..read]);
+            if collected
+                .windows(b"reconnect-size-ready".len())
+                .any(|window| window == b"reconnect-size-ready")
+            {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        collected
+            .windows(b"reconnect-size-ready".len())
+            .any(|window| window == b"reconnect-size-ready"),
+        "reconnected bridge output missing: {}",
+        String::from_utf8_lossy(&collected)
+    );
+
+    reconnected.terminate().unwrap();
     cleanup_tmux(&socket_path);
     let _ = fs::remove_dir_all(dir);
 }

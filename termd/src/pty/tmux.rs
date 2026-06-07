@@ -26,12 +26,14 @@ const TMUX_ATTACH_STARTUP_CHECK_POLLS: usize = 2;
 const TMUX_ATTACHMENT_STOP_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const TMUX_ATTACHMENT_STOP_POLLS: usize = 50;
 // 中文注释：这是 daemon 持有的 tmux attach client 的外层 TERM，不是用户 shell 里的 TERM。
-// 使用不声明 smcup/rmcup 的 ansi，避免 tmux attach 把浏览器 Ghostty 拉进 alternate screen；
-// 否则 Ghostty 普通 scrollback 不会累积，侧边滚动条无法浏览 tmux pane 输出历史。
-const TMUX_BRIDGE_TERM: &str = "ansi";
+// 这里必须保留完整一些的 xterm 能力集，否则 codex/vim/top 这类 TUI 在 tmux attach
+// 里会因为能力被阉割而频繁清屏、重绘错乱。浏览器 Ghostty 普通 scrollback 需要的
+// 只是禁掉 alternate screen 切换，所以不要再把整个 TERM 降级成 ansi。
+const TMUX_BRIDGE_TERM: &str = "xterm-256color";
 const TMUX_BRIDGE_ENV_REMOVE_KEYS: &[&str] = &["TMUX", "TMUX_PANE"];
 const TMUX_HISTORY_LIMIT_LINES: u16 = 500;
 const TMUX_STATUS: &str = "off";
+const TMUX_TERMINAL_OVERRIDES_VALUE: &str = "xterm-256color:smcup@:rmcup@";
 const TMUX_CLEAR_HISTORY_SCAN_TAIL_MAX_BYTES: usize = 32;
 
 /// 生产 daemon 的 tmux session host backend。
@@ -234,10 +236,12 @@ impl TmuxPtyBackend {
         // 后保留 dead pane 才能让 daemon attach/capture 最后一屏输出。
         // status line 是 tmux 自己的 UI，会占掉 termd/Ghostty 的最后一行；termd
         // 已经有外层 session chrome，所以 tmux 管理的 session 默认关闭它。
+        // terminal-overrides 只去掉 smcup/rmcup，避免 tmux 把浏览器端拉进 alternate
+        // screen，同时保留 xterm-256color 其余能力，保证 codex 等 TUI 正常工作。
         fs::write(
             self.tmux_startup_config_path(),
             format!(
-                "set-option -g history-limit {TMUX_HISTORY_LIMIT_LINES}\nset-option -g remain-on-exit on\nset-option -g status {TMUX_STATUS}\n"
+                "set-option -g history-limit {TMUX_HISTORY_LIMIT_LINES}\nset-option -g remain-on-exit on\nset-option -g status {TMUX_STATUS}\nset-option -g terminal-overrides ',{TMUX_TERMINAL_OVERRIDES_VALUE}'\n"
             ),
         )
         .map_err(PtyError::from)
@@ -284,15 +288,28 @@ impl TmuxPtyBackend {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
-        run_tmux_status(command, "set-option remain-on-exit").and_then(|_| {
-            let mut command = self.tmux_command();
-            command
-                .args(["set-option", "-g", "status", TMUX_STATUS])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::piped());
-            run_tmux_status(command, "set-option status")
-        })
+        run_tmux_status(command, "set-option remain-on-exit")?;
+
+        let mut command = self.tmux_command();
+        command
+            .args(["set-option", "-g", "status", TMUX_STATUS])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        run_tmux_status(command, "set-option status")?;
+
+        let mut command = self.tmux_command();
+        command
+            .args([
+                "set-option",
+                "-g",
+                "terminal-overrides",
+                &format!(",{TMUX_TERMINAL_OVERRIDES_VALUE}"),
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        run_tmux_status(command, "set-option terminal-overrides")
     }
 
     fn set_session_options_for_target(&self, target: &str) -> PtyResult<()> {
@@ -579,8 +596,11 @@ impl PtyBackend for TmuxPtyBackend {
                         "tmux session {session_name} is not running"
                     )));
                 }
-                let attach_client = backend.attach_tmux_client(session_name, size)?;
                 backend.resize_session(session_name, size)?;
+                // 中文注释：恢复已有 tmux session 时，必须先把 tmux window 调到目标尺寸，
+                // 再启动 daemon 的 attach bridge。否则 bridge 可能先读到旧尺寸 redraw，
+                // 紧接着又读到 resize 后 redraw，Ghostty 收到的就是混合几何状态的脏流。
+                let attach_client = backend.attach_tmux_client(session_name, size)?;
                 Ok(Box::new(TmuxPtySession {
                     backend,
                     session_name: session_name.clone(),
@@ -712,8 +732,11 @@ impl PtySession for TmuxPtySession {
     }
 
     fn resize(&mut self, size: PtySize) -> PtyResult<()> {
-        self.attach_client.resize(size)?;
+        // 中文注释：tmux 才是持久 screen 的真相源；live resize 必须先改 tmux window，
+        // 再让外层 bridge PTY 跟上。否则同一次 resize 里会先吐旧窗口的 redraw，再吐
+        // 新窗口的 redraw，浏览器端切换/重连时最容易看到错位和乱屏。
         self.backend.resize_session(&self.session_name, size)?;
+        self.attach_client.resize(size)?;
         self.size = size;
         Ok(())
     }
@@ -1042,8 +1065,8 @@ mod tests {
 
         assert_eq!(
             command.env_map().get("TERM").map(String::as_str),
-            Some(TMUX_BRIDGE_TERM),
-            "tmux attach bridge 不能继承 daemon 的 TERM=dumb"
+            Some("xterm-256color"),
+            "tmux attach bridge 不能继承 daemon 的 TERM=dumb，也不能把外层能力降级到 ansi"
         );
         for key in TMUX_BRIDGE_ENV_REMOVE_KEYS {
             assert!(
