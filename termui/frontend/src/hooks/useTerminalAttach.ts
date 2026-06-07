@@ -21,9 +21,17 @@ import { recordTermdDiagnostic } from "../diagnostics";
 const RECEIVE_LOOP_YIELD_MESSAGES = 64;
 const RECEIVE_LOOP_YIELD_BYTES = 256 * 1024;
 
+interface PendingFullSnapshotToken {
+  reconnectKey: string;
+  token: number;
+  claimed: boolean;
+}
+
 export interface AttachReconnectOptions {
   lastTerminalSeq?: number;
   forceFullSnapshot?: boolean;
+  revealHistory?: boolean;
+  snapshotToken?: number;
   sessionId?: UUID;
   reconnectKey?: string;
   skipCurrentClientClose?: boolean;
@@ -51,6 +59,10 @@ export function useTerminalAttach() {
   const terminalOutputResetWaitersRef = useRef<Map<number, Set<() => void>>>(new Map());
   const terminalOutputFlushFrameRef = useRef<number | undefined>(undefined);
   const terminalOutputDrainRef = useRef<(() => void) | undefined>(undefined);
+  const terminalSnapshotTokenSeqRef = useRef(0);
+  const terminalSnapshotRevealHistoryTokensRef = useRef<Map<UUID, number>>(new Map());
+  const terminalSnapshotPendingFullSnapshotTokensRef = useRef<Map<UUID, PendingFullSnapshotToken>>(new Map());
+  const terminalSnapshotClientFullSnapshotTokensRef = useRef<WeakMap<DirectClient, { sessionId: UUID; token: number }>>(new WeakMap());
   const attachReconnectTimerRef = useRef<number | undefined>(undefined);
   const attachReconnectKeyRef = useRef<string | undefined>(undefined);
   const attachReconnectAttemptsRef = useRef(0);
@@ -79,6 +91,10 @@ export function useTerminalAttach() {
     terminalOutputResetWaitersRef,
     terminalOutputFlushFrameRef,
     terminalOutputDrainRef,
+    terminalSnapshotTokenSeqRef,
+    terminalSnapshotRevealHistoryTokensRef,
+    terminalSnapshotPendingFullSnapshotTokensRef,
+    terminalSnapshotClientFullSnapshotTokensRef,
     attachReconnectTimerRef,
     attachReconnectKeyRef,
     attachReconnectAttemptsRef,
@@ -133,6 +149,9 @@ export function useTerminalReceiveLoop(
     receiveLoopActiveRef,
     receiveLoopGenerationRef,
     attachReconnectHandlerRef,
+    terminalSnapshotRevealHistoryTokensRef,
+    terminalSnapshotPendingFullSnapshotTokensRef,
+    terminalSnapshotClientFullSnapshotTokensRef,
   } = controller;
   const terminalOutputTraceCountRef = useRef(0);
 
@@ -192,17 +211,35 @@ export function useTerminalReceiveLoop(
             if (payload.kind === "snapshot") {
               applyConfirmedSessionSize(payload.session_id, payload.size);
               const bytes = payload.data_bytes ?? sessionDataFromBase64(payload.data_base64 ?? "");
+              const fullSnapshotToken = terminalSnapshotClientFullSnapshotTokensRef.current.get(client);
+              const snapshotToken = fullSnapshotToken?.sessionId === payload.session_id ? fullSnapshotToken.token : undefined;
+              const revealToken = terminalSnapshotRevealHistoryTokensRef.current.get(payload.session_id);
+              const revealHistory = snapshotToken !== undefined && revealToken === snapshotToken;
               recordTermdDiagnostic("receive_loop_terminal_snapshot", {
                 sessionId: payload.session_id,
                 baseSeq: payload.base_seq,
                 bytes: bytes.byteLength,
                 size: payload.size,
+                snapshotToken,
+                revealToken,
+                revealHistory,
               });
+              if (revealHistory) {
+                terminalSnapshotRevealHistoryTokensRef.current.delete(payload.session_id);
+              }
+              if (snapshotToken !== undefined) {
+                const pendingSnapshot = terminalSnapshotPendingFullSnapshotTokensRef.current.get(payload.session_id);
+                if (pendingSnapshot?.token === snapshotToken) {
+                  terminalSnapshotPendingFullSnapshotTokensRef.current.delete(payload.session_id);
+                }
+                terminalSnapshotClientFullSnapshotTokensRef.current.delete(client);
+              }
               enqueueTerminalOutput({
                 kind: "snapshot",
                 bytes,
                 baseSeq: payload.base_seq,
                 size: payload.size,
+                revealHistory,
               });
               processedBytes += bytes.byteLength;
             } else if (payload.kind === "output") {
@@ -299,6 +336,9 @@ export function useTerminalReceiveLoop(
     setSessionGit,
     setSessionGitError,
     setSessionGitLoading,
+    terminalSnapshotClientFullSnapshotTokensRef,
+    terminalSnapshotPendingFullSnapshotTokensRef,
+    terminalSnapshotRevealHistoryTokensRef,
   ]);
 }
 
@@ -325,6 +365,7 @@ interface UseTerminalReconnectSchedulerOptions {
   sessionPermissionIdsRef: MutableRefObject<Set<UUID>>;
   clearNewOutputMark: (sessionId: UUID) => void;
   clearTerminalOutput: () => number;
+  clearTerminalSnapshotRevealHistory: (sessionId?: UUID, snapshotToken?: number) => void;
   waitForTerminalOutputResetApplied: (version: number) => Promise<void>;
   selectSession: (sessionId: UUID | undefined) => void;
   startReceiveLoop: (client: DirectClient) => void;
@@ -364,6 +405,10 @@ export function useTerminalReconnectScheduler(
     attachReconnectKeyRef,
     attachReconnectAttemptsRef,
     attachReconnectLastErrorRef,
+    terminalSnapshotTokenSeqRef,
+    terminalSnapshotRevealHistoryTokensRef,
+    terminalSnapshotPendingFullSnapshotTokensRef,
+    terminalSnapshotClientFullSnapshotTokensRef,
   } = controller;
 
   return useCallback((staleClient: DirectClient, caught: unknown, reconnectOptions: AttachReconnectOptions = {}) => {
@@ -394,11 +439,21 @@ export function useTerminalReconnectScheduler(
       return false;
     }
     const reconnectKey = reconnectOptions.reconnectKey ?? `${options.activeServerId ?? "unknown"}:${sessionId}`;
+    const lastTerminalSeq = reconnectOptions.forceFullSnapshot
+      ? undefined
+      : reconnectOptions.lastTerminalSeq ?? lastRenderedTerminalSeqRef.current.get(sessionId);
+    const isFullSnapshot = lastTerminalSeq === undefined;
     if (reconnectOptions.skipCurrentClientClose) {
       // retry catch 已经只清理了本轮重连创建的 pending client；这里按 key 续排，
       // 不能再拿最初的 stale client 去判断“是否属于当前 attach”。
       if (attachReconnectKeyRef.current !== reconnectKey) {
         return true;
+      }
+      if (isFullSnapshot && reconnectOptions.snapshotToken !== undefined) {
+        const currentPendingSnapshot = terminalSnapshotPendingFullSnapshotTokensRef.current.get(sessionId);
+        if (currentPendingSnapshot?.token !== reconnectOptions.snapshotToken) {
+          return true;
+        }
       }
     } else if (!options.closeAttachForReconnect(staleClient)) {
       recordTermdDiagnostic("reconnect_stale_client_closed", {
@@ -407,9 +462,30 @@ export function useTerminalReconnectScheduler(
       });
       return true;
     }
-    const lastTerminalSeq = reconnectOptions.forceFullSnapshot
-      ? undefined
-      : reconnectOptions.lastTerminalSeq ?? lastRenderedTerminalSeqRef.current.get(sessionId);
+
+    let snapshotToken = isFullSnapshot ? reconnectOptions.snapshotToken : undefined;
+    if (isFullSnapshot) {
+      const pendingFullSnapshot = terminalSnapshotPendingFullSnapshotTokensRef.current.get(sessionId);
+      const shouldTransferRevealIntent =
+        pendingFullSnapshot !== undefined &&
+        terminalSnapshotRevealHistoryTokensRef.current.get(sessionId) === pendingFullSnapshot.token;
+      if (snapshotToken === undefined && pendingFullSnapshot?.reconnectKey === reconnectKey && !pendingFullSnapshot.claimed) {
+        snapshotToken = pendingFullSnapshot.token;
+      }
+      if (snapshotToken === undefined) {
+        terminalSnapshotTokenSeqRef.current += 1;
+        snapshotToken = terminalSnapshotTokenSeqRef.current;
+      }
+      terminalSnapshotPendingFullSnapshotTokensRef.current.set(sessionId, { reconnectKey, token: snapshotToken, claimed: false });
+      if (reconnectOptions.revealHistory || shouldTransferRevealIntent) {
+        terminalSnapshotRevealHistoryTokensRef.current.set(sessionId, snapshotToken);
+      }
+    }
+    const clearCurrentSnapshotIntent = () => {
+      if (isFullSnapshot && snapshotToken !== undefined) {
+        options.clearTerminalSnapshotRevealHistory(sessionId, snapshotToken);
+      }
+    };
 
     if (attachReconnectKeyRef.current !== reconnectKey) {
       attachReconnectKeyRef.current = reconnectKey;
@@ -426,12 +502,15 @@ export function useTerminalReconnectScheduler(
       sessionId,
       lastTerminalSeq,
       forceFullSnapshot: lastTerminalSeq === undefined,
+      snapshotToken,
+      revealHistory: reconnectOptions.revealHistory,
       attempt: attachReconnectAttemptsRef.current,
     });
 
     if (options.isTerminalTransportPaused()) {
       // 中文注释：offline 期间不主动建新 WebSocket；恢复事件会按当前
       // session 重新进入 handleRetryConnection。hidden/blur 不应暂停 terminal stream。
+      clearCurrentSnapshotIntent();
       options.setStatus("ready");
       return true;
     }
@@ -447,7 +526,9 @@ export function useTerminalReconnectScheduler(
         sessionId,
         code: toSafeError(finalError).code,
         message: toSafeError(finalError).message,
+        snapshotToken,
       });
+      clearCurrentSnapshotIntent();
       options.resetAttachReconnectState();
       options.setSafeError(finalError);
       return true;
@@ -471,8 +552,10 @@ export function useTerminalReconnectScheduler(
             reconnectKey,
             sessionId,
             lastTerminalSeq,
+            snapshotToken,
           });
           if (options.isTerminalTransportPaused() || isBrowserOffline()) {
+            clearCurrentSnapshotIntent();
             options.setStatus("ready");
             return;
           }
@@ -491,6 +574,7 @@ export function useTerminalReconnectScheduler(
           };
           client = await options.authenticatedClient(options.attachConnectionTimeoutMs);
           if (!isCurrentReconnect()) {
+            clearCurrentSnapshotIntent();
             closePendingReconnectClient();
             return;
           }
@@ -508,8 +592,10 @@ export function useTerminalReconnectScheduler(
             sessionId,
             lastTerminalSeq,
             attachedSize: attached.size,
+            snapshotToken,
           });
           if (!isCurrentReconnect()) {
+            clearCurrentSnapshotIntent();
             client.detachSession(sessionId, "stale_reconnect");
             closePendingReconnectClient();
             return;
@@ -521,8 +607,20 @@ export function useTerminalReconnectScheduler(
             pendingTerminalAttachSessionRef.current = undefined;
           }
           // 中文注释：重连拿到 attach ack 后先发布当前 session。
-          // reset 期间用户可能已经能在新 xterm 里输入；输入不能等 snapshot 开始消费后才生效。
+          // reset 期间用户可能已经能在新 Ghostty 里输入；输入不能等 snapshot 开始消费后才生效。
           options.attachClientRef.current = attachedClient;
+          if (isFullSnapshot && snapshotToken !== undefined) {
+            const pendingSnapshot = terminalSnapshotPendingFullSnapshotTokensRef.current.get(sessionId);
+            if (pendingSnapshot?.token === snapshotToken) {
+              // 中文注释：token 一旦被某个 attach client claim，后续同 key full resync
+              // 不能再复用它；否则旧 client 的 stale cleanup 会误删新一代 reveal intent。
+              terminalSnapshotPendingFullSnapshotTokensRef.current.set(sessionId, {
+                ...pendingSnapshot,
+                claimed: true,
+              });
+            }
+            terminalSnapshotClientFullSnapshotTokensRef.current.set(attachedClient, { sessionId, token: snapshotToken });
+          }
           attachedSessionRef.current = sessionId;
           options.sessionPermissionIdsRef.current.add(sessionId);
           confirmedSessionSizesRef.current.set(attached.session_id, attached.size);
@@ -533,20 +631,23 @@ export function useTerminalReconnectScheduler(
           options.setStatus("attached");
           if (lastTerminalSeq === undefined) {
             // 普通重连会重放完整 snapshot，必须等 TerminalPane 清屏确认后再启动输出消费；
-            // 否则旧 xterm 的异步回调可能把 snapshot 写进旧实例。
+            // 否则旧 Ghostty 的异步回调可能把 snapshot 写进旧实例。
             const resetVersion = options.clearTerminalOutput();
             recordTermdDiagnostic("reconnect_wait_reset_before_snapshot", {
               reconnectKey,
               sessionId,
               resetVersion,
+              snapshotToken,
             });
             await options.waitForTerminalOutputResetApplied(resetVersion);
             if (!isCurrentReconnect() || userDetachedRef.current) {
+              clearCurrentSnapshotIntent();
               attachedClient.close();
               return;
             }
           }
           if (!isCurrentReconnect() || userDetachedRef.current || options.attachClientRef.current !== attachedClient) {
+            clearCurrentSnapshotIntent();
             attachedClient.close();
             return;
           }
@@ -555,6 +656,7 @@ export function useTerminalReconnectScheduler(
             reconnectKey,
             sessionId,
             lastTerminalSeq,
+            snapshotToken,
           });
           options.startReceiveLoop(attachedClient);
           void options.loadSessionFiles(sessionId, undefined, { silent: true, source: "initial" });
@@ -575,10 +677,13 @@ export function useTerminalReconnectScheduler(
             lastTerminalSeq,
             code: toSafeError(retryError).code,
             message: toSafeError(retryError).message,
+            snapshotToken,
           });
           if (!controller.attachReconnectHandlerRef.current(staleClient, retryError, {
             lastTerminalSeq,
             forceFullSnapshot: lastTerminalSeq === undefined,
+            revealHistory: reconnectOptions.revealHistory,
+            snapshotToken,
             sessionId,
             reconnectKey,
             skipCurrentClientClose: true,
@@ -602,6 +707,10 @@ export function useTerminalReconnectScheduler(
     lastRenderedTerminalSeqRef,
     optionsRef,
     pendingTerminalAttachSessionRef,
+    terminalSnapshotClientFullSnapshotTokensRef,
+    terminalSnapshotPendingFullSnapshotTokensRef,
+    terminalSnapshotRevealHistoryTokensRef,
+    terminalSnapshotTokenSeqRef,
     userDetachedRef,
   ]);
 }

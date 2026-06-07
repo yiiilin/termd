@@ -168,6 +168,12 @@ impl SessionTerminalFrameLog {
         last_terminal_seq: Option<u64>,
         max_frames: Option<usize>,
     ) -> Option<Vec<TerminalFramePayload>> {
+        if last_terminal_seq.is_none() {
+            // 中文注释：`None` 是客户端明确请求权威 full snapshot 的语义。
+            // daemon mirror 只保留 live tail 和当前 screen，不能代表 tmux 的完整
+            // scrollback；这里必须让 protocol 回源 runtime/tmux capture。
+            return None;
+        }
         if self.has_sequence_gap {
             return None;
         }

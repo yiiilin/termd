@@ -234,6 +234,8 @@ export class DirectClient {
   private readonly innerWaiters: QueuedInnerWaiter[] = [];
   private readonly terminalStreamsBySession = new Map<UUID, TerminalStreamState>();
   private readonly terminalStreamsById = new Map<PacketStreamId, TerminalStreamState>();
+  private readonly pendingTerminalStreamIds = new Set<PacketStreamId>();
+  private readonly pendingTerminalStreamLastOutputSeq = new Map<PacketStreamId, number>();
   private readonly fileStreamsById = new Map<PacketStreamId, FileStreamState>();
   private authenticatedDevice?: DeviceState;
   private authenticatedServer?: PairedServerState;
@@ -1549,12 +1551,27 @@ export class DirectClient {
     }
     const stream = this.terminalStreamsById.get(packet.stream_id);
     if (!stream) {
+      if (this.pendingTerminalStreamIds.has(packet.stream_id)) {
+        // 中文注释：terminal.create 的 session_id 要等 response 才知道，但 daemon 可能已经
+        // 按同一个 stream_id 推了首屏 snapshot/output。这里按 stream_id 暂存，response 绑定
+        // session 后 receive loop 会按 payload.session_id 交给当前 Ghostty。
+        this.pendingTerminalStreamLastOutputSeq.set(packet.stream_id, seq);
+        this.enqueueTerminalStreamPayload(packet, seq);
+        return;
+      }
       // 中文注释：用户快速切换 session 后，旧 stream 的少量输出可能已经在
       // WebSocket/TCP 队列里。stream 已取消时这些 chunk 必须在协议层丢弃，
       // 否则会继续堆进 pendingInner，把新 session 的 snapshot/tail 挡在后面。
       return;
     }
     stream.lastOutputSeq = seq;
+    this.enqueueTerminalStreamPayload(packet, seq);
+  }
+
+  private enqueueTerminalStreamPayload(packet: ProtocolPacket, seq: number): void {
+    if (!packet.stream_id) {
+      throw new ProtocolClientError("invalid_packet", "stream chunk is missing stream id");
+    }
     const payload = packet.payload as { kind?: unknown; session_id?: unknown; frames?: unknown };
     if (payload.kind === "batch" && Array.isArray(payload.frames)) {
       for (const frame of payload.frames) {
@@ -1723,6 +1740,8 @@ export class DirectClient {
       provisionalStream = { sessionId, streamId, open: false, nextInputSeq: 1, lastOutputSeq: 0 };
       this.terminalStreamsBySession.set(sessionId, provisionalStream);
       this.terminalStreamsById.set(streamId, provisionalStream);
+    } else {
+      this.pendingTerminalStreamIds.add(streamId);
     }
 
     return this.sendTrackedPacket<T>(
@@ -1740,18 +1759,25 @@ export class DirectClient {
     ).then(
       (response) => {
         const resolvedSessionId = response.session_id;
+        const lastOutputSeq = this.pendingTerminalStreamLastOutputSeq.get(streamId) ?? 0;
+        this.pendingTerminalStreamIds.delete(streamId);
+        this.pendingTerminalStreamLastOutputSeq.delete(streamId);
         if (provisionalStream && provisionalStream.sessionId !== resolvedSessionId) {
           this.terminalStreamsBySession.delete(provisionalStream.sessionId);
         }
-        const stream = provisionalStream ?? { sessionId: resolvedSessionId, streamId, open: false, nextInputSeq: 1, lastOutputSeq: 0 };
+        const stream = provisionalStream ?? { sessionId: resolvedSessionId, streamId, open: false, nextInputSeq: 1, lastOutputSeq };
         stream.sessionId = resolvedSessionId;
         stream.open = true;
+        stream.lastOutputSeq = Math.max(stream.lastOutputSeq, lastOutputSeq);
         this.terminalStreamsBySession.set(resolvedSessionId, stream);
         this.terminalStreamsById.set(streamId, stream);
         this.phase = "terminal_stream_open";
         return response;
       },
       (error) => {
+        this.pendingTerminalStreamIds.delete(streamId);
+        this.pendingTerminalStreamLastOutputSeq.delete(streamId);
+        this.discardQueuedTerminalOutputByStream(streamId);
         this.removeStream(streamId);
         throw error;
       },
@@ -1853,6 +1879,23 @@ export class DirectClient {
       return;
     }
     const retained = this.pendingInner.filter((inner) => !this.isTerminalOutputForStream(inner, streamId, sessionId));
+    if (retained.length === this.pendingInner.length) {
+      return;
+    }
+    this.pendingInner.splice(0, this.pendingInner.length, ...retained);
+  }
+
+  private discardQueuedTerminalOutputByStream(streamId: PacketStreamId): void {
+    if (this.pendingInner.length === 0) {
+      return;
+    }
+    const retained = this.pendingInner.filter((inner) => {
+      if (inner.type !== "session_data" && inner.type !== "terminal_frame") {
+        return true;
+      }
+      const payload = inner.payload as { stream_id?: unknown };
+      return payload.stream_id !== streamId;
+    });
     if (retained.length === this.pendingInner.length) {
       return;
     }

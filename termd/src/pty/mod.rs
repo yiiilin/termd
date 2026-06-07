@@ -5,9 +5,10 @@
 
 pub mod portable;
 pub mod supervisor;
+pub mod tmux;
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{self, Display};
 use std::io;
@@ -71,6 +72,8 @@ pub struct CommandSpec {
     program: String,
     args: Vec<String>,
     env: BTreeMap<String, String>,
+    #[serde(default)]
+    removed_env: BTreeSet<String>,
     cwd: Option<PathBuf>,
 }
 
@@ -81,6 +84,7 @@ impl CommandSpec {
             program: program.into(),
             args: Vec::new(),
             env: BTreeMap::new(),
+            removed_env: BTreeSet::new(),
             cwd: None,
         }
     }
@@ -103,7 +107,20 @@ impl CommandSpec {
 
     /// 设置或覆盖一个环境变量。
     pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
-        self.env.insert(key.into(), value.into());
+        let key = key.into();
+        self.removed_env.remove(&key);
+        self.env.insert(key, value.into());
+        self
+    }
+
+    /// 从子进程环境中移除变量。
+    ///
+    /// 这主要用于 tmux/terminal bridge，避免继承 daemon 自身的 `TMUX` 或 `TERM=dumb`
+    /// 之类运行环境后让子终端误判自己已经在另一个不可用终端里。
+    pub fn remove_env(mut self, key: impl Into<String>) -> Self {
+        let key = key.into();
+        self.env.remove(&key);
+        self.removed_env.insert(key);
         self
     }
 
@@ -126,6 +143,11 @@ impl CommandSpec {
     /// 返回额外环境变量。
     pub fn env_map(&self) -> &BTreeMap<String, String> {
         &self.env
+    }
+
+    /// 返回需要从子进程环境中移除的变量名。
+    pub fn removed_env(&self) -> &BTreeSet<String> {
+        &self.removed_env
     }
 
     /// 返回工作目录。
@@ -219,6 +241,10 @@ pub enum PtyRestoreInfo {
         socket_path: PathBuf,
         supervisor_pid: u32,
         supervisor_status: PtySupervisorStatus,
+    },
+    Tmux {
+        socket_path: PathBuf,
+        session_name: String,
     },
 }
 
@@ -336,12 +362,43 @@ pub trait PtyBackend: Send + Sync {
         &self,
         _session_id: &str,
         _restore_info: &PtyRestoreInfo,
+        _size: PtySize,
     ) -> PtyResult<Box<dyn PtySession>> {
         Err(PtyError::Backend(
             "PTY backend does not support reconnect".to_owned(),
         ))
     }
+
+    /// 为一个已存在 session 创建连接级 attach client。
+    ///
+    /// 中文注释：这个 handle 只表达“当前 Web terminal watcher 有一个对应的 PTY/tmux
+    /// attach 生命周期”，不表达设备权限，也不改变 session 级 terminal_seq 输出模型。
+    /// 普通 backend 没有独立 attach client，因此默认返回 no-op handle；tmux backend 会
+    /// 覆盖为真实的 control-mode tmux client。
+    fn attach_client(
+        &self,
+        _session_id: &str,
+        _restore_info: Option<&PtyRestoreInfo>,
+        _size: PtySize,
+        _attachment_id: &str,
+    ) -> PtyResult<Box<dyn PtyAttachment>> {
+        Ok(Box::new(NoopPtyAttachment))
+    }
 }
+
+/// 连接级 PTY attach handle。
+///
+/// 中文注释：它是 runtime/protocol 的生命周期资源，不是 session host。正常路径会显式
+/// 调用 `detach`；具体 backend 的 Drop 仍应做 best-effort 清理，防止异常路径泄漏 client。
+pub trait PtyAttachment: Send {
+    fn detach(&mut self) -> PtyResult<()> {
+        Ok(())
+    }
+}
+
+struct NoopPtyAttachment;
+
+impl PtyAttachment for NoopPtyAttachment {}
 
 /// 运行中的 PTY session。
 ///
@@ -493,8 +550,22 @@ mod tests {
             command.env_map().get("LANG").map(String::as_str),
             Some("C.UTF-8")
         );
+        assert!(command.removed_env().is_empty());
         assert_eq!(command.cwd_path(), Some(Path::new("/tmp")));
         assert!(command.validate().is_ok());
+    }
+
+    #[test]
+    fn command_spec_can_remove_inherited_env() {
+        let command = CommandSpec::new("tmux")
+            .env("TERM", "xterm-256color")
+            .remove_env("TMUX");
+
+        assert_eq!(
+            command.env_map().get("TERM").map(String::as_str),
+            Some("xterm-256color")
+        );
+        assert!(command.removed_env().contains("TMUX"));
     }
 
     #[test]

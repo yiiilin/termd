@@ -13,8 +13,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::watch;
 
 use crate::pty::{
-    CommandSpec, PtyBackend, PtyError, PtyRestoreInfo, PtySession, PtySize, PtySnapshot,
-    PtyTerminalFrame,
+    CommandSpec, PtyAttachment, PtyBackend, PtyError, PtyRestoreInfo, PtySession, PtySize,
+    PtySnapshot, PtyTerminalFrame,
 };
 use crate::session::{AttachRole, SessionError, SessionManager, SessionState, TerminalSize};
 use crate::state::SessionStateRecord;
@@ -107,6 +107,7 @@ impl From<PtyError> for RuntimeError {
 
 struct RuntimeSession {
     pty: Box<dyn PtySession>,
+    watched_attachments: HashMap<String, Box<dyn PtyAttachment>>,
     created_at_ms: UnixTimestampMillis,
     updated_at_ms: UnixTimestampMillis,
 }
@@ -172,6 +173,7 @@ impl<B: PtyBackend> SessionRuntime<B> {
             session_id.to_owned(),
             RuntimeSession {
                 pty,
+                watched_attachments: HashMap::new(),
                 created_at_ms: now_ms,
                 updated_at_ms: now_ms,
             },
@@ -196,8 +198,11 @@ impl<B: PtyBackend> SessionRuntime<B> {
             .as_ref()
             .ok_or(RuntimeError::NotReconnectable)?;
         let session_id = record.session_id.0.to_string();
-        let pty = self.backend.reconnect(&session_id, restore_info)?;
         let size = proto_size_to_runtime(record.size);
+        let pty_size = terminal_size_to_pty_size(size)?;
+        let pty = self
+            .backend
+            .reconnect(&session_id, restore_info, pty_size)?;
 
         self.sessions.create_session(session_id.clone())?;
         self.sessions.resize(&session_id, size)?;
@@ -211,6 +216,7 @@ impl<B: PtyBackend> SessionRuntime<B> {
             session_id,
             RuntimeSession {
                 pty,
+                watched_attachments: HashMap::new(),
                 created_at_ms: record.created_at_ms,
                 updated_at_ms: record.updated_at_ms,
             },
@@ -228,6 +234,57 @@ impl<B: PtyBackend> SessionRuntime<B> {
     ) -> RuntimeResult<AttachRole> {
         self.ensure_open_session(session_id)?;
         Ok(self.sessions.attach(session_id, device_id)?)
+    }
+
+    /// 为一个 watched terminal 连接创建连接级 PTY/tmux attach handle。
+    ///
+    /// 中文注释：这个 handle 和设备级 operator 角色分离。同一设备可以有多条在线
+    /// WebSocket，每条 watched terminal 连接都用自己的 attachment id 清理自己的后端 client。
+    pub fn start_watched_attachment(
+        &mut self,
+        session_id: &str,
+        attachment_id: &str,
+        size: TerminalSize,
+    ) -> RuntimeResult<()> {
+        self.ensure_open_session(session_id)?;
+        if self
+            .runtime_session(session_id)?
+            .watched_attachments
+            .contains_key(attachment_id)
+        {
+            return Ok(());
+        }
+
+        let pty_size = terminal_size_to_pty_size(size)?;
+        let restore_info = self.runtime_session(session_id)?.pty.restore_info();
+        let attachment = self.backend.attach_client(
+            session_id,
+            restore_info.as_ref(),
+            pty_size,
+            attachment_id,
+        )?;
+        self.runtime_session_mut(session_id)?
+            .watched_attachments
+            .insert(attachment_id.to_owned(), attachment);
+        Ok(())
+    }
+
+    /// 释放一个连接级 watched attachment；普通 session detach 不会自动调用它。
+    pub fn drop_watched_attachment(
+        &mut self,
+        session_id: &str,
+        attachment_id: &str,
+    ) -> RuntimeResult<()> {
+        self.ensure_open_session(session_id)?;
+        let Some(mut attachment) = self
+            .runtime_session_mut(session_id)?
+            .watched_attachments
+            .remove(attachment_id)
+        else {
+            return Ok(());
+        };
+        attachment.detach()?;
+        Ok(())
     }
 
     /// shared-control 模式没有夺权概念；旧 control 命令只确认设备已经 attach。
@@ -296,7 +353,11 @@ impl<B: PtyBackend> SessionRuntime<B> {
     /// PTY 生命周期只由 close 管理；普通 detach 不会调用 terminate。
     pub fn close(&mut self, session_id: &str) -> RuntimeResult<()> {
         self.ensure_open_session(session_id)?;
-        self.runtime_session_mut(session_id)?.pty.terminate()?;
+        {
+            let runtime_session = self.runtime_session_mut(session_id)?;
+            Self::detach_all_watched_attachments(runtime_session);
+            runtime_session.pty.terminate()?;
+        }
         self.runtime_sessions.remove(session_id);
         self.sessions.close(session_id)?;
         Ok(())
@@ -307,9 +368,10 @@ impl<B: PtyBackend> SessionRuntime<B> {
     /// 这个兜底路径只在显式 close 的终止步骤失败时使用，用来确保 daemon 不再保留
     /// 不可见的 runtime 句柄；真正的 PTY 终止仍然优先走 `close`。
     pub fn discard(&mut self, session_id: &str) -> RuntimeResult<()> {
-        if self.runtime_sessions.remove(session_id).is_none() {
+        let Some(mut runtime_session) = self.runtime_sessions.remove(session_id) else {
             return Err(RuntimeError::SessionNotFound);
-        }
+        };
+        Self::detach_all_watched_attachments(&mut runtime_session);
 
         self.sessions.close(session_id)?;
         Ok(())
@@ -441,6 +503,14 @@ impl<B: PtyBackend> SessionRuntime<B> {
             .get_mut(session_id)
             .ok_or(RuntimeError::SessionNotFound)
     }
+
+    fn detach_all_watched_attachments(runtime_session: &mut RuntimeSession) {
+        // 中文注释：session close/discard 已经在收尾阶段，attachment detach 失败不应阻止
+        // host 终止或 runtime 丢弃；具体 backend 的 Drop 仍会做 best-effort 兜底。
+        for (_, mut attachment) in runtime_session.watched_attachments.drain() {
+            let _ = attachment.detach();
+        }
+    }
 }
 
 impl<B: PtyBackend> fmt::Debug for SessionRuntime<B> {
@@ -510,8 +580,8 @@ fn current_unix_timestamp_millis() -> UnixTimestampMillis {
 mod tests {
     use super::*;
     use crate::pty::{
-        CommandSpec, PtyBackend, PtyError, PtyExitStatus, PtyResult, PtySession, PtySize,
-        PtySnapshot,
+        CommandSpec, PtyAttachment, PtyBackend, PtyError, PtyExitStatus, PtyRestoreInfo, PtyResult,
+        PtySession, PtySize, PtySnapshot,
     };
     use crate::session::{AttachRole, TerminalSize};
     use std::sync::{Arc, Mutex};
@@ -524,6 +594,8 @@ mod tests {
     #[derive(Debug, Default)]
     struct FakePtyState {
         spawns: Vec<(CommandSpec, PtySize)>,
+        attachment_starts: Vec<String>,
+        attachment_drops: Vec<String>,
         writes: Vec<Vec<u8>>,
         resizes: Vec<PtySize>,
         terminate_count: usize,
@@ -541,6 +613,14 @@ mod tests {
         fn terminate_count(&self) -> usize {
             self.state.lock().unwrap().terminate_count
         }
+
+        fn attachment_starts(&self) -> Vec<String> {
+            self.state.lock().unwrap().attachment_starts.clone()
+        }
+
+        fn attachment_drops(&self) -> Vec<String> {
+            self.state.lock().unwrap().attachment_drops.clone()
+        }
     }
 
     impl PtyBackend for FakePtyBackend {
@@ -554,6 +634,41 @@ mod tests {
             Ok(Box::new(FakePtySession {
                 state: Arc::clone(&self.state),
             }))
+        }
+
+        fn attach_client(
+            &self,
+            _session_id: &str,
+            _restore_info: Option<&PtyRestoreInfo>,
+            _size: PtySize,
+            attachment_id: &str,
+        ) -> PtyResult<Box<dyn PtyAttachment>> {
+            self.state
+                .lock()
+                .unwrap()
+                .attachment_starts
+                .push(attachment_id.to_owned());
+            Ok(Box::new(FakePtyAttachment {
+                state: Arc::clone(&self.state),
+                attachment_id: attachment_id.to_owned(),
+            }))
+        }
+    }
+
+    struct FakePtyAttachment {
+        state: Arc<Mutex<FakePtyState>>,
+        attachment_id: String,
+    }
+
+    impl PtyAttachment for FakePtyAttachment {}
+
+    impl Drop for FakePtyAttachment {
+        fn drop(&mut self) {
+            self.state
+                .lock()
+                .unwrap()
+                .attachment_drops
+                .push(self.attachment_id.clone());
         }
     }
 
@@ -672,6 +787,81 @@ mod tests {
 
         assert_eq!(role, AttachRole::Operator);
         assert_eq!(backend.terminate_count(), 0);
+    }
+
+    #[test]
+    fn watched_attachments_are_started_and_dropped_independently() {
+        let backend = FakePtyBackend::default();
+        let mut runtime = SessionRuntime::new(backend.clone());
+        let session_id = runtime
+            .create_session(CommandSpec::new("sh"), TerminalSize::cells(24, 80))
+            .unwrap();
+        runtime.attach(&session_id, "dev-a").unwrap();
+
+        runtime
+            .start_watched_attachment(&session_id, "conn-a-watch-1", TerminalSize::cells(24, 80))
+            .unwrap();
+        runtime
+            .start_watched_attachment(&session_id, "conn-b-watch-1", TerminalSize::cells(24, 80))
+            .unwrap();
+        assert_eq!(
+            backend.attachment_starts(),
+            vec!["conn-a-watch-1".to_owned(), "conn-b-watch-1".to_owned()]
+        );
+
+        runtime
+            .drop_watched_attachment(&session_id, "conn-a-watch-1")
+            .unwrap();
+        assert_eq!(
+            backend.attachment_drops(),
+            vec!["conn-a-watch-1".to_owned()]
+        );
+        runtime
+            .write_input(&session_id, "dev-a", b"still-open")
+            .unwrap();
+        assert_eq!(backend.writes(), vec![b"still-open".to_vec()]);
+
+        runtime.close(&session_id).unwrap();
+        assert_eq!(
+            backend.attachment_drops(),
+            vec!["conn-a-watch-1".to_owned(), "conn-b-watch-1".to_owned()]
+        );
+    }
+
+    #[test]
+    fn duplicate_watched_attachment_id_is_reused_until_explicit_drop() {
+        let backend = FakePtyBackend::default();
+        let mut runtime = SessionRuntime::new(backend.clone());
+        let session_id = runtime
+            .create_session(CommandSpec::new("sh"), TerminalSize::cells(24, 80))
+            .unwrap();
+
+        runtime
+            .start_watched_attachment(
+                &session_id,
+                "same-connection-watch",
+                TerminalSize::cells(24, 80),
+            )
+            .unwrap();
+        runtime
+            .start_watched_attachment(
+                &session_id,
+                "same-connection-watch",
+                TerminalSize::cells(30, 100),
+            )
+            .unwrap();
+
+        assert_eq!(
+            backend.attachment_starts(),
+            vec!["same-connection-watch".to_owned()]
+        );
+        runtime
+            .drop_watched_attachment(&session_id, "same-connection-watch")
+            .unwrap();
+        assert_eq!(
+            backend.attachment_drops(),
+            vec!["same-connection-watch".to_owned()]
+        );
     }
 
     #[test]

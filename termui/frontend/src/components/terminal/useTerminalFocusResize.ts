@@ -54,6 +54,9 @@ export function useTerminalFocusResizeState() {
       focusActivationArmedRef.current = false;
       suppressPassiveFocusRef.current = false;
       options.reportTerminalFocus(true);
+      // 中文注释：focusin 是终端重新成为 operator 的可靠边界；这里只触发稳定
+      // resize 流程，真正写回 daemon 仍由 TerminalPane 的多帧 metrics gate 决定。
+      options.resize("focus");
       // 主动点击或程序 focus 回到终端时，只有原本就在底部才继续跟随最新输出；
       // 否则会打断用户查看 scrollback 或搜索结果。
       options.scheduleScrollToBottomIfPinned();
@@ -63,7 +66,7 @@ export function useTerminalFocusResizeState() {
       if (!focusedRef.current || focusOutTimerRef.current !== undefined) {
         return;
       }
-      // 浏览器窗口 resize、移动端视觉视口变化和 xterm 内部重排都可能短暂触发
+      // 浏览器窗口 resize、移动端视觉视口变化和 Ghostty 内部重排都可能短暂触发
       // focusout -> focusin。延迟确认失焦，避免把这种瞬时 DOM 抖动上报成
       // operator 在 focused/blurred 之间来回切换。
       focusOutTimerRef.current = window.setTimeout(() => {

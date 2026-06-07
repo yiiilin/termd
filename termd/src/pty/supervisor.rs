@@ -217,6 +217,7 @@ impl PtyBackend for SupervisorPtyBackend {
         &self,
         session_id: &str,
         restore_info: &PtyRestoreInfo,
+        _size: PtySize,
     ) -> PtyResult<Box<dyn PtySession>> {
         match restore_info {
             PtyRestoreInfo::UnixSocket {
@@ -237,6 +238,9 @@ impl PtyBackend for SupervisorPtyBackend {
                 let _ = session.snapshot()?;
                 Ok(session)
             }
+            PtyRestoreInfo::Tmux { .. } => Err(PtyError::Backend(
+                "supervisor backend cannot reconnect tmux sessions".to_owned(),
+            )),
         }
     }
 }
@@ -384,6 +388,11 @@ impl SupervisorPtySession {
                 supervisor_pid,
                 supervisor_status,
             } => (socket_path.clone(), *supervisor_pid, *supervisor_status),
+            PtyRestoreInfo::Tmux { .. } => {
+                return Err(PtyError::Backend(
+                    "supervisor IPC cannot reconnect tmux restore info".to_owned(),
+                ));
+            }
         };
         if supervisor_status != PtySupervisorStatus::Running {
             return Err(PtyError::Backend(format!(
@@ -748,6 +757,7 @@ fn restore_info_with_status(
             supervisor_pid: *supervisor_pid,
             supervisor_status,
         },
+        PtyRestoreInfo::Tmux { .. } => restore_info.clone(),
     }
 }
 

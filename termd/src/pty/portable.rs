@@ -46,6 +46,9 @@ impl CommandSpec {
         for (key, value) in self.env_map() {
             command.env(key, value);
         }
+        for key in self.removed_env() {
+            command.env_remove(key);
+        }
 
         if let Some(cwd) = self.cwd_path() {
             command.cwd(cwd.as_os_str());

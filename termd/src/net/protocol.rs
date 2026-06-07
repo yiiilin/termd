@@ -190,6 +190,8 @@ struct PacketTerminalStreamStateSnapshot {
     packet_terminal_streams_by_session: HashMap<SessionId, PacketStreamId>,
     attached_sessions: Vec<SessionId>,
     watched_sessions: HashSet<SessionId>,
+    watched_attachment_ids: HashMap<SessionId, String>,
+    next_watched_attachment_number: u64,
     stale_watched_sessions: HashSet<SessionId>,
     output_offsets: HashMap<SessionId, u64>,
     pending_outputs: HashMap<SessionId, VecDeque<Vec<u8>>>,
@@ -1383,74 +1385,87 @@ where
             .create_session_with_id(&wire_session_id.0.to_string(), command, runtime_size)
             .map_err(map_runtime_error)?;
         let internal_session_id = wire_session_id.0.to_string();
-        let session_name = self.default_created_session_name(wire_session_id);
+        let create_result = (|| -> Result<Vec<JsonEnvelope>, ProtocolError> {
+            let session_name = self.default_created_session_name(wire_session_id);
 
-        self.session_index
-            .insert(wire_session_id, internal_session_id.clone());
-        self.session_names
-            .insert(wire_session_id, session_name.clone());
-        self.session_roots
-            .insert(wire_session_id, session_root.clone());
-        self.session_output_history_mut(wire_session_id, payload.size);
-        let (file_tree_signal, _) = watch::channel(0);
-        self.session_file_tree_signals
-            .insert(wire_session_id, file_tree_signal);
-        let (resize_signal, _) = watch::channel(payload.size);
-        self.session_resize_signals
-            .insert(wire_session_id, resize_signal);
-        self.client_history.record_session_created(
-            wire_session_id,
-            self.runtime_state_proto(&internal_session_id)?,
-            self.runtime_size_proto(&internal_session_id)?,
-            Some(session_name.as_str()),
-            &session_root,
-            current_unix_timestamp_millis(),
-        )?;
+            self.session_index
+                .insert(wire_session_id, internal_session_id.clone());
+            self.session_names
+                .insert(wire_session_id, session_name.clone());
+            self.session_roots
+                .insert(wire_session_id, session_root.clone());
+            self.session_output_history_mut(wire_session_id, payload.size);
+            let (file_tree_signal, _) = watch::channel(0);
+            self.session_file_tree_signals
+                .insert(wire_session_id, file_tree_signal);
+            let (resize_signal, _) = watch::channel(payload.size);
+            self.session_resize_signals
+                .insert(wire_session_id, resize_signal);
+            self.client_history.record_session_created(
+                wire_session_id,
+                self.runtime_state_proto(&internal_session_id)?,
+                self.runtime_size_proto(&internal_session_id)?,
+                Some(session_name.as_str()),
+                &session_root,
+                current_unix_timestamp_millis(),
+            )?;
 
-        let role = self
-            .runtime
-            .attach(&internal_session_id, device_key(device_id))
-            .map_err(map_runtime_error)?;
-        let wire_role = runtime_role_to_proto(role);
-        let response_size = self.runtime_size_proto(&internal_session_id)?;
-        let (output_offset, initial_output) = if connection.packet_mode {
-            if enqueue_terminal_snapshot {
-                // 中文注释：terminal.create 只登记首轮 drain 需要 snapshot，不再把
-                // snapshot 预先塞进 per-client 队列。stream 注册完成后的 push drain 会
-                // 从 daemon cache/supervisor drain 出相同的 terminal frame。
-                connection.set_terminal_drain_cursor(wire_session_id, None);
-            }
-            (0, Vec::new())
-        } else {
-            self.drain_runtime_output_to_history_until_empty(
+            let role = self
+                .runtime
+                .attach(&internal_session_id, device_key(device_id))
+                .map_err(map_runtime_error)?;
+            let wire_role = runtime_role_to_proto(role);
+            let response_size = self.runtime_size_proto(&internal_session_id)?;
+            let (output_offset, initial_output) = if connection.packet_mode {
+                if enqueue_terminal_snapshot {
+                    // 中文注释：terminal.create 只登记首轮 drain 需要 snapshot，不再把
+                    // snapshot 预先塞进 per-client 队列。stream 注册完成后的 push drain 会
+                    // 从 daemon cache/supervisor drain 出相同的 terminal frame。
+                    connection.set_terminal_drain_cursor(wire_session_id, None);
+                }
+                (0, Vec::new())
+            } else {
+                self.drain_runtime_output_to_history_until_empty(
+                    wire_session_id,
+                    &internal_session_id,
+                    16 * 1024,
+                )?;
+                self.output_history_attach_snapshot(wire_session_id, response_size)
+            };
+            let response_state = self.runtime_state_proto(&internal_session_id)?;
+            let response = SessionCreatedPayload {
+                session_id: wire_session_id,
+                name: Some(session_name),
+                role: wire_role,
+                state: response_state,
+                size: response_size,
+                resize_owner: true,
+            };
+            self.client_history.record_session_runtime_state(
+                wire_session_id,
+                response_state,
+                response_size,
+                current_unix_timestamp_millis(),
+            )?;
+
+            self.persist_state()?;
+            let response_envelope = envelope_value(MessageType::SessionCreated, response)?;
+            let watched_attachment_id = self.start_watched_attachment(
+                connection,
                 wire_session_id,
                 &internal_session_id,
-                16 * 1024,
+                response_size,
             )?;
-            self.output_history_attach_snapshot(wire_session_id, response_size)
-        };
-        connection.attach(wire_session_id, output_offset, initial_output, true);
-        self.record_daemon_client_attach(wire_session_id, connection, device_id);
-
-        let response_state = self.runtime_state_proto(&internal_session_id)?;
-        let response = SessionCreatedPayload {
-            session_id: wire_session_id,
-            name: Some(session_name),
-            role: wire_role,
-            state: response_state,
-            size: response_size,
-            resize_owner: true,
-        };
-        self.client_history.record_session_runtime_state(
-            wire_session_id,
-            response_state,
-            response_size,
-            current_unix_timestamp_millis(),
-        )?;
-
-        self.persist_state()?;
-        connection.state = ProtocolConnectionState::Attached;
-        Ok(vec![envelope_value(MessageType::SessionCreated, response)?])
+            connection.attach(wire_session_id, output_offset, initial_output, true);
+            connection.remember_watched_attachment(wire_session_id, watched_attachment_id);
+            self.record_daemon_client_attach(wire_session_id, connection, device_id);
+            connection.state = ProtocolConnectionState::Attached;
+            Ok(vec![response_envelope])
+        })();
+        if create_result.is_err() {
+            self.rollback_created_session(wire_session_id, &internal_session_id);
+        }
+        create_result
     }
 
     pub(crate) fn attach_session(
@@ -1523,12 +1538,35 @@ where
                 return Err(error);
             }
         };
+        let watched_attachment_id = if payload.watch_updates {
+            match self.start_watched_attachment(
+                connection,
+                payload.session_id,
+                &internal_session_id,
+                response_size,
+            ) {
+                Ok(attachment_id) => Some(attachment_id),
+                Err(error) => {
+                    if !was_runtime_attached {
+                        let _ = self
+                            .runtime
+                            .detach(&internal_session_id, &runtime_device_key);
+                    }
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
         connection.attach(
             payload.session_id,
             output_offset,
             initial_output,
             payload.watch_updates,
         );
+        if let Some(attachment_id) = watched_attachment_id {
+            connection.remember_watched_attachment(payload.session_id, attachment_id);
+        }
         let resize_owner = if payload.watch_updates {
             self.record_daemon_client_attach(payload.session_id, connection, device_id);
             true
@@ -1829,6 +1867,22 @@ where
                 sessions.remove(&session_id);
             }
         }
+    }
+
+    fn rollback_created_session(&mut self, session_id: SessionId, internal_session_id: &str) {
+        // 中文注释：create 失败后客户端不会持有这个 session，daemon 也不能留下
+        // hidden runtime。先尽力关闭 host；如果 terminate 失败，也要丢弃 runtime 句柄。
+        if self.runtime.close(internal_session_id).is_err() {
+            let _ = self.runtime.discard(internal_session_id);
+        }
+        self.close_visible_session_state(session_id);
+        let now_ms = current_unix_timestamp_millis();
+        let _ = self
+            .client_history
+            .record_session_closed(session_id, now_ms);
+        let _ = self.client_history.remove_session_attachments(session_id);
+        let _ =
+            StateStore::record_runtime_session_closed(&self.config.state_path, session_id, now_ms);
     }
 
     fn search_session_output(
@@ -3371,7 +3425,11 @@ where
 
     fn sync_session_terminal_cwd(&mut self, session_id: SessionId) -> Result<bool, ProtocolError> {
         let Some(cwd) = self.read_session_terminal_cwd(session_id)? else {
-            return Ok(false);
+            // 中文注释：tmux pane cwd 可能在目录被删除或权限变化后暂时不可读。
+            // 这时不能继续使用上一轮成功同步的 terminal cwd cache；否则文件面板
+            // 会在用户手动浏览后又被旧 cwd 拉回去。清掉内存 cache 后让调用方
+            // 回退到 client history 中的最新文件面板位置。
+            return Ok(self.session_terminal_cwds.remove(&session_id).is_some());
         };
         if self
             .session_terminal_cwds
@@ -3641,6 +3699,54 @@ where
         let _ = signal.send(size);
     }
 
+    fn start_watched_attachment(
+        &mut self,
+        connection: &mut ProtocolConnection,
+        wire_session_id: SessionId,
+        internal_session_id: &str,
+        size: TerminalSize,
+    ) -> Result<String, ProtocolError> {
+        let previous_attachment_id = connection.take_watched_attachment_id(wire_session_id);
+        let attachment_id = connection.allocate_watched_attachment_id(wire_session_id);
+        match self
+            .runtime
+            .start_watched_attachment(
+                internal_session_id,
+                &attachment_id,
+                proto_size_to_runtime(size),
+            )
+            .map_err(map_runtime_error)
+        {
+            Ok(()) => {
+                if let Some(previous_attachment_id) = previous_attachment_id {
+                    self.release_watched_attachment(wire_session_id, previous_attachment_id);
+                }
+            }
+            Err(error) => {
+                if let Some(previous_attachment_id) = previous_attachment_id {
+                    connection.remember_watched_attachment(wire_session_id, previous_attachment_id);
+                }
+                return Err(error);
+            }
+        }
+        Ok(attachment_id)
+    }
+
+    fn release_watched_attachment(&mut self, wire_session_id: SessionId, attachment_id: String) {
+        let Some(internal_session_id) = self.session_index.get(&wire_session_id).cloned() else {
+            return;
+        };
+        let _ = self
+            .runtime
+            .drop_watched_attachment(&internal_session_id, &attachment_id);
+    }
+
+    fn release_watched_attachments(&mut self, watched_attachments: Vec<(SessionId, String)>) {
+        for (session_id, attachment_id) in watched_attachments {
+            self.release_watched_attachment(session_id, attachment_id);
+        }
+    }
+
     fn detach_connection(&mut self, connection: &mut ProtocolConnection) {
         let Some(device_id) = connection.authenticated_device_id else {
             connection.state = ProtocolConnectionState::Closed;
@@ -3659,6 +3765,7 @@ where
         connection.output_offsets.clear();
         connection.pending_outputs.clear();
         connection.watched_sessions.clear();
+        self.release_watched_attachments(connection.take_all_watched_attachments());
         connection.stale_watched_sessions.clear();
         connection.terminal_frame_snapshot_required.clear();
         if connection.track_daemon_client_history {
@@ -4131,6 +4238,10 @@ pub struct ProtocolConnection {
     // `attached_sessions` 表示权限范围；`watched_sessions` 才表示该连接要接收实时输出。
     // 文件/Git/search 等短连接会只 attach 权限，避免大流量终端输出堵住 RPC 响应。
     watched_sessions: HashSet<SessionId>,
+    // 中文注释：watched terminal 是连接级资源，不是设备级角色。这里保存 runtime
+    // attachment id，连接断开或 terminal stream 取消时只释放自己的 tmux client。
+    watched_attachment_ids: HashMap<SessionId, String>,
+    next_watched_attachment_number: u64,
     // 中文注释：快速切换 terminal stream 后，旧 watcher 的通知可能已经在队列里。
     // 这类 session 曾经被当前连接 watch 过，但已经主动取消订阅；迟到输出应当是 no-op，
     // 而从未订阅过的 session 仍必须返回 invalid_state。
@@ -4392,6 +4503,8 @@ impl ProtocolConnection {
             packet_file_download_streams: HashMap::new(),
             attached_sessions: Vec::new(),
             watched_sessions: HashSet::new(),
+            watched_attachment_ids: HashMap::new(),
+            next_watched_attachment_number: 1,
             stale_watched_sessions: HashSet::new(),
             output_offsets: HashMap::new(),
             pending_outputs: HashMap::new(),
@@ -5423,8 +5536,8 @@ impl ProtocolConnection {
             PacketKind::Request => self.handle_packet_request(protocol, packet),
             PacketKind::StreamOpen => self.handle_packet_stream_open(protocol, packet),
             PacketKind::StreamChunk => self.handle_packet_stream_chunk(protocol, packet),
-            PacketKind::StreamEnd => self.handle_packet_stream_end(packet),
-            PacketKind::Cancel => self.handle_packet_cancel(packet),
+            PacketKind::StreamEnd => self.handle_packet_stream_end(protocol, packet),
+            PacketKind::Cancel => self.handle_packet_cancel(protocol, packet),
             PacketKind::Flow => self.handle_packet_flow(protocol, packet),
             PacketKind::Response | PacketKind::Event | PacketKind::Error => {
                 Err(ProtocolError::InvalidState)
@@ -5614,8 +5727,14 @@ impl ProtocolConnection {
                     )
                 },
             ) {
-                Ok(packets) => Ok(packets),
-                Err(error) => Ok(vec![packet_request_error(id, error)?]),
+                Ok((packets, removed_attachments)) => {
+                    protocol.release_watched_attachments(removed_attachments);
+                    Ok(packets)
+                }
+                Err((error, created_attachments)) => {
+                    protocol.release_watched_attachments(created_attachments);
+                    Ok(vec![packet_request_error(id, error)?])
+                }
             };
         }
         if method == METHOD_TERMINAL_ATTACH {
@@ -5634,8 +5753,14 @@ impl ProtocolConnection {
                     )
                 },
             ) {
-                Ok(packets) => Ok(packets),
-                Err(error) => Ok(vec![packet_request_error(id, error)?]),
+                Ok((packets, removed_attachments)) => {
+                    protocol.release_watched_attachments(removed_attachments);
+                    Ok(packets)
+                }
+                Err((error, created_attachments)) => {
+                    protocol.release_watched_attachments(created_attachments);
+                    Ok(vec![packet_request_error(id, error)?])
+                }
             };
         }
 
@@ -5774,10 +5899,15 @@ impl ProtocolConnection {
         Ok(packets)
     }
 
-    fn handle_packet_stream_end(
+    fn handle_packet_stream_end<B, V>(
         &mut self,
+        protocol: &mut DaemonProtocol<B, V>,
         packet: ProtocolPacket<Value>,
-    ) -> Result<Vec<ProtocolPacket<Value>>, ProtocolError> {
+    ) -> Result<Vec<ProtocolPacket<Value>>, ProtocolError>
+    where
+        B: PtyBackend,
+        V: SignatureVerifier,
+    {
         let stream_id = packet.stream_id.ok_or(ProtocolError::InvalidEnvelope)?;
         if let Some(stream) = self.packet_file_upload_streams.remove(&stream_id) {
             cleanup_upload_temp(&stream);
@@ -5795,14 +5925,21 @@ impl ProtocolConnection {
                 stream.next_input_seq = stream.next_input_seq.saturating_add(1);
             }
         }
-        self.remove_packet_terminal_stream(stream_id);
+        if let Some((session_id, attachment_id)) = self.remove_packet_terminal_stream(stream_id) {
+            protocol.release_watched_attachment(session_id, attachment_id);
+        }
         Ok(Vec::new())
     }
 
-    fn handle_packet_cancel(
+    fn handle_packet_cancel<B, V>(
         &mut self,
+        protocol: &mut DaemonProtocol<B, V>,
         packet: ProtocolPacket<Value>,
-    ) -> Result<Vec<ProtocolPacket<Value>>, ProtocolError> {
+    ) -> Result<Vec<ProtocolPacket<Value>>, ProtocolError>
+    where
+        B: PtyBackend,
+        V: SignatureVerifier,
+    {
         if let Some(stream_id) = packet.stream_id {
             if let Some(stream) = self.packet_file_upload_streams.remove(&stream_id) {
                 cleanup_upload_temp(&stream);
@@ -5815,7 +5952,10 @@ impl ProtocolConnection {
             {
                 return Ok(Vec::new());
             }
-            self.remove_packet_terminal_stream(stream_id);
+            if let Some((session_id, attachment_id)) = self.remove_packet_terminal_stream(stream_id)
+            {
+                protocol.release_watched_attachment(session_id, attachment_id);
+            }
             return Ok(Vec::new());
         }
         if packet.id.is_some() {
@@ -6052,24 +6192,29 @@ impl ProtocolConnection {
             &mut Self,
             Vec<JsonEnvelope>,
         ) -> Result<Vec<ProtocolPacket<Value>>, ProtocolError>,
-    ) -> Result<Vec<ProtocolPacket<Value>>, ProtocolError> {
+    ) -> Result<
+        (Vec<ProtocolPacket<Value>>, Vec<(SessionId, String)>),
+        (ProtocolError, Vec<(SessionId, String)>),
+    > {
         let snapshot = self.snapshot_packet_terminal_stream_state();
         // 中文注释：同一条 WebSocket 连接只有一个活跃 terminal 输出流。只有在新
         // stream-open payload 已成功解码后才清旧流；如果后续 attach/create 失败，
         // 或响应转换失败，立即回滚，避免坏请求切断仍可用的旧输出流。
-        self.clear_packet_terminal_streams();
+        let removed_attachments = self.clear_packet_terminal_streams();
         let envelopes = match replace(self) {
             Ok(envelopes) => envelopes,
             Err(error) => {
+                let created_attachments = self.watched_attachments_created_since(&snapshot);
                 self.restore_packet_terminal_stream_state(snapshot);
-                return Err(error);
+                return Err((error, created_attachments));
             }
         };
         match finish(self, envelopes) {
-            Ok(packets) => Ok(packets),
+            Ok(packets) => Ok((packets, removed_attachments)),
             Err(error) => {
+                let created_attachments = self.watched_attachments_created_since(&snapshot);
                 self.restore_packet_terminal_stream_state(snapshot);
-                Err(error)
+                Err((error, created_attachments))
             }
         }
     }
@@ -6093,6 +6238,8 @@ impl ProtocolConnection {
             packet_terminal_streams_by_session: self.packet_terminal_streams_by_session.clone(),
             attached_sessions: self.attached_sessions.clone(),
             watched_sessions: self.watched_sessions.clone(),
+            watched_attachment_ids: self.watched_attachment_ids.clone(),
+            next_watched_attachment_number: self.next_watched_attachment_number,
             stale_watched_sessions: self.stale_watched_sessions.clone(),
             output_offsets: self.output_offsets.clone(),
             pending_outputs: self.pending_outputs.clone(),
@@ -6111,6 +6258,8 @@ impl ProtocolConnection {
         self.packet_terminal_streams_by_session = snapshot.packet_terminal_streams_by_session;
         self.attached_sessions = snapshot.attached_sessions;
         self.watched_sessions = snapshot.watched_sessions;
+        self.watched_attachment_ids = snapshot.watched_attachment_ids;
+        self.next_watched_attachment_number = snapshot.next_watched_attachment_number;
         self.stale_watched_sessions = snapshot.stale_watched_sessions;
         self.output_offsets = snapshot.output_offsets;
         self.pending_outputs = snapshot.pending_outputs;
@@ -6119,13 +6268,33 @@ impl ProtocolConnection {
         self.deferred_output_wakeups = snapshot.deferred_output_wakeups;
     }
 
-    fn clear_packet_terminal_streams(&mut self) {
+    fn watched_attachments_created_since(
+        &self,
+        snapshot: &PacketTerminalStreamStateSnapshot,
+    ) -> Vec<(SessionId, String)> {
+        self.watched_attachment_ids
+            .iter()
+            .filter(|(session_id, attachment_id)| {
+                snapshot
+                    .watched_attachment_ids
+                    .get(session_id)
+                    .map_or(true, |snapshot_id| snapshot_id != *attachment_id)
+            })
+            .map(|(session_id, attachment_id)| (*session_id, attachment_id.clone()))
+            .collect()
+    }
+
+    fn clear_packet_terminal_streams(&mut self) -> Vec<(SessionId, String)> {
+        let mut removed_attachments = Vec::new();
         for session_id in self.packet_terminal_streams_by_session.keys() {
             // 中文注释：packet terminal stream 表示当前 xterm 输出订阅。
             // 快速切换 session 时旧 stream 清掉后也必须取消 watched 状态，否则 relay/直连
             // watcher 仍会为旧 session 产生唤醒，继续占用输出队列。
             if self.watched_sessions.remove(session_id) {
                 self.stale_watched_sessions.insert(*session_id);
+                if let Some(attachment_id) = self.watched_attachment_ids.remove(session_id) {
+                    removed_attachments.push((*session_id, attachment_id));
+                }
             }
         }
         self.packet_terminal_streams.clear();
@@ -6133,11 +6302,15 @@ impl ProtocolConnection {
         self.terminal_frame_next_seq.clear();
         self.terminal_frame_snapshot_required.clear();
         self.deferred_output_wakeups.clear();
+        removed_attachments
     }
 
-    fn remove_packet_terminal_stream(&mut self, stream_id: PacketStreamId) {
+    fn remove_packet_terminal_stream(
+        &mut self,
+        stream_id: PacketStreamId,
+    ) -> Option<(SessionId, String)> {
         let Some(stream) = self.packet_terminal_streams.remove(&stream_id) else {
-            return;
+            return None;
         };
         self.packet_terminal_streams_by_session
             .remove(&stream.session_id);
@@ -6147,7 +6320,31 @@ impl ProtocolConnection {
         self.deferred_output_wakeups.remove(&stream.session_id);
         if self.watched_sessions.remove(&stream.session_id) {
             self.stale_watched_sessions.insert(stream.session_id);
+            return self
+                .watched_attachment_ids
+                .remove(&stream.session_id)
+                .map(|attachment_id| (stream.session_id, attachment_id));
         }
+        None
+    }
+
+    fn allocate_watched_attachment_id(&mut self, session_id: SessionId) -> String {
+        let number = self.next_watched_attachment_number;
+        self.next_watched_attachment_number = self.next_watched_attachment_number.saturating_add(1);
+        format!("{}:{}:{number}", self.client_id.0, session_id.0)
+    }
+
+    fn remember_watched_attachment(&mut self, session_id: SessionId, attachment_id: String) {
+        self.watched_attachment_ids
+            .insert(session_id, attachment_id);
+    }
+
+    fn take_watched_attachment_id(&mut self, session_id: SessionId) -> Option<String> {
+        self.watched_attachment_ids.remove(&session_id)
+    }
+
+    fn take_all_watched_attachments(&mut self) -> Vec<(SessionId, String)> {
+        self.watched_attachment_ids.drain().collect()
     }
 
     fn packet_stream_id_for_session(&self, session_id: SessionId) -> Option<PacketStreamId> {
@@ -8109,8 +8306,8 @@ mod tests {
     use crate::auth::{AuthSigningInput, HttpE2eeSigningInput};
     use crate::net::signature::Ed25519SignatureVerifier;
     use crate::pty::{
-        PtyBackend, PtyError, PtyExitStatus, PtyRestoreInfo, PtyResult, PtySession, PtySize,
-        PtySnapshot, PtySupervisorStatus, PtyTerminalFrame,
+        PtyAttachment, PtyBackend, PtyError, PtyExitStatus, PtyRestoreInfo, PtyResult, PtySession,
+        PtySize, PtySnapshot, PtySupervisorStatus, PtyTerminalFrame,
     };
     use crate::session::TerminalSize as RuntimeTerminalSize;
     use crate::state::{StateStore, client_history::ClientHistoryStore};
@@ -8144,11 +8341,16 @@ mod tests {
         terminal_seq_by_session: HashMap<String, u64>,
         terminal_journal_by_session: HashMap<String, Vec<PtyTerminalFrame>>,
         terminal_frames_by_session: HashMap<String, VecDeque<PtyTerminalFrame>>,
+        terminal_screen_by_session: HashMap<String, TerminalScreen>,
+        terminal_size_by_session: HashMap<String, PtySize>,
         terminal_snapshot_count_by_session: HashMap<String, usize>,
         cwd_by_session: HashMap<String, PathBuf>,
         cwd_read_count_by_session: HashMap<String, usize>,
         writes: Vec<Vec<u8>>,
+        attachment_starts: Vec<String>,
+        attachment_drops: Vec<String>,
         reconnects: Vec<String>,
+        reconnect_sizes: Vec<PtySize>,
         read_error: Option<String>,
         reconnect_error: Option<String>,
         terminate_error: Option<String>,
@@ -8221,12 +8423,24 @@ mod tests {
             self.state.lock().unwrap().writes.clone()
         }
 
+        fn attachment_starts(&self) -> Vec<String> {
+            self.state.lock().unwrap().attachment_starts.clone()
+        }
+
+        fn attachment_drops(&self) -> Vec<String> {
+            self.state.lock().unwrap().attachment_drops.clone()
+        }
+
         fn terminate_count(&self) -> usize {
             self.state.lock().unwrap().terminate_count
         }
 
         fn reconnects(&self) -> Vec<String> {
             self.state.lock().unwrap().reconnects.clone()
+        }
+
+        fn reconnect_sizes(&self) -> Vec<PtySize> {
+            self.state.lock().unwrap().reconnect_sizes.clone()
         }
 
         fn fail_reconnects(&self, message: impl Into<String>) {
@@ -8280,9 +8494,11 @@ mod tests {
             &self,
             session_id: &str,
             restore_info: &PtyRestoreInfo,
+            size: PtySize,
         ) -> PtyResult<Box<dyn PtySession>> {
             let mut state = self.state.lock().unwrap();
             state.reconnects.push(session_id.to_owned());
+            state.reconnect_sizes.push(size);
             if let Some(message) = state.reconnect_error.clone() {
                 return Err(PtyError::Backend(message));
             }
@@ -8292,6 +8508,41 @@ mod tests {
                 session_id: Some(session_id.to_owned()),
                 restore_info: Some(restore_info.clone()),
             }))
+        }
+
+        fn attach_client(
+            &self,
+            _session_id: &str,
+            _restore_info: Option<&PtyRestoreInfo>,
+            _size: PtySize,
+            attachment_id: &str,
+        ) -> PtyResult<Box<dyn PtyAttachment>> {
+            self.state
+                .lock()
+                .unwrap()
+                .attachment_starts
+                .push(attachment_id.to_owned());
+            Ok(Box::new(FakePtyAttachment {
+                state: Arc::clone(&self.state),
+                attachment_id: attachment_id.to_owned(),
+            }))
+        }
+    }
+
+    struct FakePtyAttachment {
+        state: Arc<Mutex<FakePtyState>>,
+        attachment_id: String,
+    }
+
+    impl PtyAttachment for FakePtyAttachment {}
+
+    impl Drop for FakePtyAttachment {
+        fn drop(&mut self) {
+            self.state
+                .lock()
+                .unwrap()
+                .attachment_drops
+                .push(self.attachment_id.clone());
         }
     }
 
@@ -8341,6 +8592,14 @@ mod tests {
             );
             // fake PTY 也把 resize 放进 terminal frame 队列，确保协议层测试能覆盖
             // “resize 也是 session 级 terminal_seq 事件”这个不变量。
+            apply_fake_terminal_frame_to_screen(
+                &mut state,
+                session_id,
+                &PtyTerminalFrame::Resize {
+                    terminal_seq: seq,
+                    size,
+                },
+            );
             state
                 .terminal_frames_by_session
                 .entry(session_id.clone())
@@ -8381,6 +8640,11 @@ mod tests {
                 .get(session_id)
                 .copied()
                 .unwrap_or(0);
+            let size = state
+                .terminal_size_by_session
+                .get(session_id)
+                .copied()
+                .unwrap_or_else(|| PtySize::new(24, 80));
             if let Some(last_terminal_seq) = last_terminal_seq {
                 if last_terminal_seq == base_seq {
                     return Ok(Vec::new());
@@ -8407,8 +8671,8 @@ mod tests {
             }
             Ok(vec![PtyTerminalFrame::Snapshot {
                 base_seq,
-                size: PtySize::new(24, 80),
-                data: Vec::new(),
+                size,
+                data: fake_terminal_snapshot_bytes(&state, session_id, size),
             }])
         }
 
@@ -8429,6 +8693,7 @@ mod tests {
                             data,
                         };
                         push_fake_terminal_journal(&mut state, session_id, frame.clone());
+                        apply_fake_terminal_frame_to_screen(&mut state, session_id, &frame);
                         return Ok(Some(frame));
                     }
                 }
@@ -8529,6 +8794,66 @@ mod tests {
             .entry(session_id.to_owned())
             .or_default()
             .push(frame);
+    }
+
+    fn apply_fake_terminal_frame_to_screen(
+        state: &mut FakePtyState,
+        session_id: &str,
+        frame: &PtyTerminalFrame,
+    ) {
+        // 中文注释：fake backend 要模拟真实 tmux/supervisor 的 full snapshot；
+        // 已经从 PTY 读出的 output/resize 必须进入 runtime screen mirror。
+        match frame {
+            PtyTerminalFrame::Output { data, .. } => {
+                let size = state
+                    .terminal_size_by_session
+                    .get(session_id)
+                    .copied()
+                    .unwrap_or_else(|| PtySize::new(24, 80));
+                state
+                    .terminal_screen_by_session
+                    .entry(session_id.to_owned())
+                    .or_insert_with(|| TerminalScreen::new(size.rows, size.cols))
+                    .apply(data);
+            }
+            PtyTerminalFrame::Resize { size, .. } => {
+                state
+                    .terminal_size_by_session
+                    .insert(session_id.to_owned(), *size);
+                state
+                    .terminal_screen_by_session
+                    .entry(session_id.to_owned())
+                    .or_insert_with(|| TerminalScreen::new(size.rows, size.cols))
+                    .resize(size.rows, size.cols);
+            }
+            PtyTerminalFrame::Snapshot {
+                base_seq: _,
+                size,
+                data,
+            } => {
+                state
+                    .terminal_size_by_session
+                    .insert(session_id.to_owned(), *size);
+                let mut screen = TerminalScreen::new(size.rows, size.cols);
+                screen.apply(data);
+                state
+                    .terminal_screen_by_session
+                    .insert(session_id.to_owned(), screen);
+            }
+            PtyTerminalFrame::Exit { .. } => {}
+        }
+    }
+
+    fn fake_terminal_snapshot_bytes(
+        state: &FakePtyState,
+        session_id: &str,
+        size: PtySize,
+    ) -> Vec<u8> {
+        state
+            .terminal_screen_by_session
+            .get(session_id)
+            .map(TerminalScreen::snapshot_bytes)
+            .unwrap_or_else(|| TerminalScreen::new(size.rows, size.cols).snapshot_bytes())
     }
 
     fn protocol() -> (
@@ -10315,6 +10640,102 @@ mod tests {
     }
 
     #[test]
+    fn packet_terminal_full_snapshot_poll_uses_runtime_even_when_daemon_log_is_continuous() {
+        let (mut protocol, backend) = protocol();
+        let (mut first_connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let (_, mut first_device_session, _) =
+            open_packet_e2ee(&mut protocol, &mut first_connection, device_id);
+        pair_packet_device(
+            &mut protocol,
+            &mut first_connection,
+            &mut first_device_session,
+            device_id,
+            PublicKey("device-public-key".to_owned()),
+        );
+        let session_id = create_test_packet_session(
+            &mut protocol,
+            &mut first_connection,
+            &mut first_device_session,
+        );
+        backend.push_output_for_session(session_id, b"alpha\n".to_vec());
+        backend.push_output_for_session(session_id, b"beta\n".to_vec());
+
+        let first_attach = send_encrypted_packet(
+            &mut protocol,
+            &mut first_connection,
+            &mut first_device_session,
+            ProtocolPacket::stream_open(
+                PacketRequestId::new(),
+                PacketStreamId::new(),
+                METHOD_TERMINAL_ATTACH,
+                128 * 1024,
+                serde_json::to_value(SessionAttachPayload {
+                    session_id,
+                    watch_updates: true,
+                    last_terminal_seq: Some(0),
+                })
+                .unwrap(),
+            ),
+        );
+        let _ = decrypt_first_packet(&mut first_device_session, first_attach);
+        let first_packets = decrypt_packets(
+            &mut first_device_session,
+            first_connection.read_session_output(&mut protocol, session_id, 1024),
+        );
+        assert!(!first_packets.is_empty());
+        assert_eq!(
+            backend.terminal_snapshot_count_for_session(session_id),
+            0,
+            "连续 tail 仍应使用 daemon live log，避免普通 reattach 频繁 capture tmux"
+        );
+
+        let mut second_connection = protocol.start_connection().0;
+        let second_device_id = DeviceId::new();
+        let (_, mut second_device_session, _) =
+            open_packet_e2ee(&mut protocol, &mut second_connection, second_device_id);
+        pair_packet_device(
+            &mut protocol,
+            &mut second_connection,
+            &mut second_device_session,
+            second_device_id,
+            PublicKey("second-device-public-key".to_owned()),
+        );
+        let second_attach = send_encrypted_packet(
+            &mut protocol,
+            &mut second_connection,
+            &mut second_device_session,
+            ProtocolPacket::stream_open(
+                PacketRequestId::new(),
+                PacketStreamId::new(),
+                METHOD_TERMINAL_ATTACH,
+                128 * 1024,
+                serde_json::to_value(SessionAttachPayload {
+                    session_id,
+                    watch_updates: true,
+                    last_terminal_seq: None,
+                })
+                .unwrap(),
+            ),
+        );
+        let _ = decrypt_first_packet(&mut second_device_session, second_attach);
+        let second_packets = decrypt_packets(
+            &mut second_device_session,
+            second_connection.read_session_output(&mut protocol, session_id, 1024),
+        );
+
+        assert_eq!(second_packets.len(), 1);
+        let snapshot: TerminalFramePayload =
+            decode_payload(second_packets[0].payload.clone()).unwrap();
+        assert!(matches!(snapshot, TerminalFramePayload::Snapshot { .. }));
+        assert_eq!(
+            backend.terminal_snapshot_count_for_session(session_id),
+            1,
+            "last_terminal_seq=None 是强制 full snapshot 语义，必须回源 runtime/tmux，而不能用 daemon mirror 生成短历史"
+        );
+    }
+
+    #[test]
     fn packet_terminal_reattach_uses_daemon_terminal_log_without_runtime_snapshot() {
         let (mut protocol, backend) = protocol();
         let (mut first_connection, _) = protocol.start_connection();
@@ -11233,6 +11654,8 @@ mod tests {
         assert_eq!(first_output.len(), 1);
         assert_eq!(first_output[0].stream_id, Some(old_stream));
         assert_eq!(first_output[0].seq, 1);
+        assert_eq!(backend.attachment_starts().len(), 2);
+        assert_eq!(backend.attachment_drops().len(), 1);
 
         let invalid_session_open = send_encrypted_packet(
             &mut protocol,
@@ -11258,6 +11681,16 @@ mod tests {
             connection.debug_snapshot().terminal_streams,
             1,
             "valid payload 进入 handler 后失败时也必须恢复旧 terminal stream"
+        );
+        assert_eq!(
+            backend.attachment_starts().len(),
+            2,
+            "handler 失败不能启动新的 watched attachment"
+        );
+        assert_eq!(
+            backend.attachment_drops().len(),
+            1,
+            "handler 失败不能释放仍在使用的旧 watched attachment"
         );
         assert_eq!(
             connection.take_deferred_output_wakeups(),
@@ -11334,6 +11767,8 @@ mod tests {
         assert_eq!(first_output.len(), 1);
         assert_eq!(first_output[0].stream_id, Some(old_stream));
         assert_eq!(connection.debug_snapshot().attached_sessions, 1);
+        assert_eq!(backend.attachment_starts().len(), 2);
+        assert_eq!(backend.attachment_drops().len(), 1);
 
         // 中文注释：让状态文件的父路径变成普通文件，persist_state 必然失败。
         // terminal.create 会在 connection.attach 之后写状态，用来覆盖“清旧流后晚失败”的
@@ -11369,9 +11804,29 @@ mod tests {
             "terminal.create late failure 不能把失败的新 session 留在连接 attach 集合里"
         );
         assert_eq!(
+            protocol.session_index.len(),
+            1,
+            "terminal.create late failure 不能把失败的新 session 留在 daemon session index"
+        );
+        assert_eq!(
+            backend.terminate_count(),
+            1,
+            "terminal.create late failure 必须终止失败的新 runtime host"
+        );
+        assert_eq!(
             connection.debug_snapshot().terminal_streams,
             1,
             "terminal.create late failure 必须恢复旧 terminal stream"
+        );
+        assert_eq!(
+            backend.attachment_starts().len(),
+            2,
+            "terminal.create late failure 发生在持久化阶段时不能启动新 watched attachment"
+        );
+        assert_eq!(
+            backend.attachment_drops().len(),
+            1,
+            "terminal.create late failure 不能释放仍然恢复中的旧 watched attachment"
         );
         assert_eq!(connection.take_deferred_output_wakeups(), vec![session_id]);
 
@@ -12310,6 +12765,73 @@ mod tests {
         assert_eq!(
             payload.sessions[0].files_path.as_deref(),
             Some(default_root.to_string_lossy().as_ref())
+        );
+    }
+
+    #[test]
+    fn startup_restores_tmux_restore_info_records() {
+        let backend = FakePtyBackend::default();
+        let state_path = temp_state_path("restore-tmux-session.json");
+        let config = DaemonConfig::default_for_state_path(&state_path);
+        let session_id = SessionId::new();
+        let root_path = std::env::temp_dir();
+        let size = TerminalSize {
+            rows: 33,
+            cols: 111,
+            pixel_width: 800,
+            pixel_height: 600,
+        };
+        let restore_info = PtyRestoreInfo::Tmux {
+            socket_path: state_path
+                .parent()
+                .expect("temp state path has parent")
+                .join("tmux.sock"),
+            session_name: format!("termd-{}", session_id.0),
+        };
+
+        {
+            let mut history = ClientHistoryStore::open(&state_path).unwrap();
+            history
+                .record_session_created(
+                    session_id,
+                    SessionState::Running,
+                    size,
+                    Some("tmux shell"),
+                    &root_path,
+                    UnixTimestampMillis(1_000),
+                )
+                .unwrap();
+        }
+
+        let state = DaemonState {
+            version: crate::state::STATE_SCHEMA_VERSION,
+            daemon_identity: None,
+            trusted_devices: Vec::new(),
+            sessions: vec![SessionStateRecord {
+                session_id,
+                state: SessionState::Running,
+                size,
+                created_at_ms: UnixTimestampMillis(1_000),
+                updated_at_ms: UnixTimestampMillis(1_002),
+                restore_info: Some(restore_info.clone()),
+            }],
+        };
+        StateStore::save(&state_path, &state).unwrap();
+        let state = StateStore::load(&state_path).unwrap();
+
+        let protocol =
+            DaemonProtocol::from_state(config, backend.clone(), Ed25519SignatureVerifier, state)
+                .unwrap();
+
+        assert_eq!(backend.reconnects(), vec![session_id.0.to_string()]);
+        assert_eq!(
+            backend.reconnect_sizes(),
+            vec![PtySize::with_pixels(33, 111, 800, 600)]
+        );
+        assert!(protocol.session_index.contains_key(&session_id));
+        assert_eq!(
+            protocol.snapshot_state().sessions[0].restore_info,
+            Some(restore_info)
         );
     }
 
@@ -15050,6 +15572,118 @@ mod tests {
         );
         assert!(
             !cwd_payload
+                .entries
+                .iter()
+                .any(|entry| entry.name == "manual.txt")
+        );
+
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn session_files_without_path_keeps_persisted_position_when_terminal_cwd_is_unreadable() {
+        let base = temp_state_path("shared-files-unreadable-cwd-base");
+        let root = base.join("project");
+        let manual = root.join("manual");
+        let terminal_cwd = root.join("terminal-cwd");
+        let missing_terminal_cwd = base.join("deleted-cwd");
+        fs::create_dir_all(&manual).unwrap();
+        fs::create_dir_all(&terminal_cwd).unwrap();
+        fs::write(manual.join("manual.txt"), b"manual\n").unwrap();
+        fs::write(terminal_cwd.join("cwd.txt"), b"cwd\n").unwrap();
+        let backend = FakePtyBackend::default();
+        let mut config = DaemonConfig::default_for_state_path(temp_state_path(
+            "shared-files-unreadable-cwd-state.json",
+        ));
+        config.default_command = vec!["sh".to_owned()];
+        config.default_working_directory = Some(root.clone());
+        let mut protocol =
+            DaemonProtocol::new(config, backend.clone(), Ed25519SignatureVerifier).unwrap();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = PublicKey(wire(signing_key.verifying_key().as_bytes()));
+        let (_, mut device_session) = open_e2ee(&mut protocol, &mut connection, device_id);
+        pair_device(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            device_id,
+            public_key,
+        );
+        let created_responses = send_encrypted(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            envelope_value(
+                MessageType::SessionCreate,
+                SessionCreatePayload {
+                    command: Vec::new(),
+                    size: TerminalSize::new(24, 80),
+                },
+            )
+            .unwrap(),
+        );
+        let created = decrypt_first(&mut device_session, created_responses);
+        let created_payload: SessionCreatedPayload = decode_payload(created.payload).unwrap();
+
+        backend.set_cwd_for_session(created_payload.session_id, terminal_cwd.clone());
+        let terminal_cwd_responses = send_encrypted(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            envelope_value(
+                MessageType::SessionFiles,
+                SessionFilesPayload {
+                    session_id: created_payload.session_id,
+                    path: None,
+                },
+            )
+            .unwrap(),
+        );
+        let terminal_cwd_listed = decrypt_first(&mut device_session, terminal_cwd_responses);
+        let terminal_cwd_payload: SessionFilesResultPayload =
+            decode_payload(terminal_cwd_listed.payload).unwrap();
+        assert_eq!(terminal_cwd_listed.kind, MessageType::SessionFilesResult);
+        assert_eq!(terminal_cwd_payload.path, terminal_cwd.to_string_lossy());
+
+        let manual_responses = send_encrypted(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            envelope_value(
+                MessageType::SessionFiles,
+                SessionFilesPayload {
+                    session_id: created_payload.session_id,
+                    path: Some(manual.to_string_lossy().to_string()),
+                },
+            )
+            .unwrap(),
+        );
+        let manual_listed = decrypt_first(&mut device_session, manual_responses);
+        assert_eq!(manual_listed.kind, MessageType::SessionFilesResult);
+
+        backend.set_cwd_for_session(created_payload.session_id, missing_terminal_cwd);
+        let cwd_responses = send_encrypted(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            envelope_value(
+                MessageType::SessionFiles,
+                SessionFilesPayload {
+                    session_id: created_payload.session_id,
+                    path: None,
+                },
+            )
+            .unwrap(),
+        );
+        let cwd_listed = decrypt_first(&mut device_session, cwd_responses);
+        let cwd_payload: SessionFilesResultPayload = decode_payload(cwd_listed.payload).unwrap();
+
+        assert_eq!(cwd_listed.kind, MessageType::SessionFilesResult);
+        assert_eq!(cwd_payload.path, manual.to_string_lossy());
+        assert!(
+            cwd_payload
                 .entries
                 .iter()
                 .any(|entry| entry.name == "manual.txt")
@@ -18193,17 +18827,17 @@ mod tests {
     }
 
     #[test]
-    fn session_output_history_keeps_pre_clear_text_and_visible_background_rows() {
+    fn session_output_history_drops_pre_clear_text_but_keeps_visible_background_rows() {
         let mut history = SessionOutputHistory::new(TerminalSize::new(3, 8));
 
-        // 普通屏清屏会开启新的空白 viewport，但旧可见内容应保留为 scrollback；
-        // 否则 Codex/CLI 的普通屏重绘会让刚输出的状态块在重新 attach 时少行。
-        history.append(b"alpha\nbeta\n\x1b[48;5;22m\x1b[2J");
+        // 中文注释：`clear` 之后的 snapshot/history 不应再把 pre-clear 内容带回来，
+        // 但当前样式刷出来的空白行仍要被保留。
+        history.append(b"alpha\nbeta\n\x1b[48;5;22m\x1b[H\x1b[2J");
 
         let snapshot = String::from_utf8(history.snapshot_bytes()).unwrap();
 
-        assert!(snapshot.contains("alpha"));
-        assert!(snapshot.contains("beta"));
+        assert!(!snapshot.contains("alpha"));
+        assert!(!snapshot.contains("beta"));
         assert!(
             snapshot.contains("\x1b[48;5;22m        \x1b[0m"),
             "snapshot should preserve styled blank rows: {snapshot:?}"
@@ -18248,7 +18882,7 @@ mod tests {
     }
 
     #[test]
-    fn session_output_history_keeps_status_block_before_screen_redraw() {
+    fn session_output_history_drops_status_block_before_screen_redraw() {
         let mut history = SessionOutputHistory::new(TerminalSize::new(6, 80));
 
         history.append(
@@ -18262,24 +18896,24 @@ mod tests {
              go test ./internal/app/shelves/pkg/deploy\r\n"
                 .as_bytes(),
         );
-        // 全屏 UI 随后滚动并清屏重绘时，已经滚入 scrollback 的状态块不能丢。
-        history.append(b"\n\n\n\n\n\n\x1b[2J\x1b[1;1Hvisible after redraw");
+        // 中文注释：`clear` 之后重新 attach/scrollback 时，不应再看到 pre-clear 状态块。
+        history.append(b"\n\n\n\n\n\n\x1b[1;1H\x1b[2Jvisible after redraw");
 
         let snapshot = String::from_utf8(history.snapshot_bytes()).unwrap();
 
-        assert!(snapshot.contains("当前状态"));
-        assert!(snapshot.contains("工作区干净"));
-        assert!(snapshot.contains("4b70e91a"));
-        assert!(snapshot.contains("go test"));
+        assert!(!snapshot.contains("当前状态"));
+        assert!(!snapshot.contains("工作区干净"));
+        assert!(!snapshot.contains("4b70e91a"));
+        assert!(!snapshot.contains("go test"));
         assert!(snapshot.contains("visible after redraw"));
     }
 
     #[test]
-    fn session_output_history_keeps_visible_status_block_when_plain_screen_clears() {
+    fn session_output_history_drops_visible_status_block_when_plain_screen_clears() {
         let mut history = SessionOutputHistory::new(TerminalSize::new(8, 100));
 
-        // 这个形态贴近 `软件货架` session 的真实尾部：状态块还在普通屏 viewport 内，
-        // 随后 Codex/CLI 用 ESC[2J 做整屏重绘。回放缓存必须把清屏前的可见行保留下来。
+        // 中文注释：即使状态块还在 clear 前的可见 viewport 内，clear 也应该把它切掉，
+        // 避免用户后续 scroll/full snapshot 时又看到旧屏内容。
         history.append(
             "验证过了：\r\n\
              \r\n\
@@ -18291,14 +18925,14 @@ mod tests {
              go test ./internal/app/shelves/pkg/deploy\r\n"
                 .as_bytes(),
         );
-        history.append(b"\x1b[2J\x1b[H\x1b[48;5;236mSummarize recent commits");
+        history.append(b"\x1b[H\x1b[2J\x1b[48;5;236mSummarize recent commits");
 
         let snapshot = String::from_utf8(history.snapshot_bytes()).unwrap();
 
-        assert!(snapshot.contains("当前状态"));
-        assert!(snapshot.contains("工作区干净"));
-        assert!(snapshot.contains("4b70e91a"));
-        assert!(snapshot.contains("go test"));
+        assert!(!snapshot.contains("当前状态"));
+        assert!(!snapshot.contains("工作区干净"));
+        assert!(!snapshot.contains("4b70e91a"));
+        assert!(!snapshot.contains("go test"));
         assert!(snapshot.contains("Summarize recent commits"));
     }
 
@@ -18467,6 +19101,333 @@ mod tests {
         );
         let files = decrypt_first(&mut rpc_device_session, files_responses);
         assert_eq!(files.kind, MessageType::SessionFilesResult);
+    }
+
+    #[test]
+    fn permission_only_attach_does_not_start_watched_attachment_handle() {
+        let (mut protocol, backend) = protocol();
+        let (mut first_connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = PublicKey(wire(signing_key.verifying_key().as_bytes()));
+        let (_, mut first_device_session) =
+            open_e2ee(&mut protocol, &mut first_connection, device_id);
+        pair_device(
+            &mut protocol,
+            &mut first_connection,
+            &mut first_device_session,
+            device_id,
+            public_key,
+        );
+        let created_responses = send_encrypted(
+            &mut protocol,
+            &mut first_connection,
+            &mut first_device_session,
+            envelope_value(
+                MessageType::SessionCreate,
+                SessionCreatePayload {
+                    command: vec!["sh".to_owned()],
+                    size: TerminalSize::new(24, 80),
+                },
+            )
+            .unwrap(),
+        );
+        let created = decrypt_first(&mut first_device_session, created_responses);
+        let created_payload: SessionCreatedPayload = decode_payload(created.payload).unwrap();
+        assert_eq!(backend.attachment_starts().len(), 1);
+
+        let (mut rpc_connection, _) = protocol.start_connection();
+        let mut rpc_device_session = authenticate_paired_connection(
+            &mut protocol,
+            &mut rpc_connection,
+            device_id,
+            &signing_key,
+        );
+        let attached = send_encrypted(
+            &mut protocol,
+            &mut rpc_connection,
+            &mut rpc_device_session,
+            envelope_value(
+                MessageType::SessionAttach,
+                SessionAttachPayload {
+                    session_id: created_payload.session_id,
+                    watch_updates: false,
+                    last_terminal_seq: None,
+                },
+            )
+            .unwrap(),
+        );
+        let attached = decrypt_first(&mut rpc_device_session, attached);
+
+        assert_eq!(attached.kind, MessageType::SessionAttached);
+        assert_eq!(
+            backend.attachment_starts().len(),
+            1,
+            "permission-only attach 不能创建 terminal watcher 的 tmux client handle"
+        );
+        assert!(backend.attachment_drops().is_empty());
+    }
+
+    #[test]
+    fn watched_connection_close_drops_only_its_attachment_handle() {
+        let (mut protocol, backend) = protocol();
+        let (mut first_connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = PublicKey(wire(signing_key.verifying_key().as_bytes()));
+        let (_, mut first_device_session) =
+            open_e2ee(&mut protocol, &mut first_connection, device_id);
+        pair_device(
+            &mut protocol,
+            &mut first_connection,
+            &mut first_device_session,
+            device_id,
+            public_key,
+        );
+        let created_responses = send_encrypted(
+            &mut protocol,
+            &mut first_connection,
+            &mut first_device_session,
+            envelope_value(
+                MessageType::SessionCreate,
+                SessionCreatePayload {
+                    command: vec!["sh".to_owned()],
+                    size: TerminalSize::new(24, 80),
+                },
+            )
+            .unwrap(),
+        );
+        let created = decrypt_first(&mut first_device_session, created_responses);
+        let created_payload: SessionCreatedPayload = decode_payload(created.payload).unwrap();
+
+        let (mut second_connection, _) = protocol.start_connection();
+        let mut second_device_session = authenticate_paired_connection(
+            &mut protocol,
+            &mut second_connection,
+            device_id,
+            &signing_key,
+        );
+        let attached = send_encrypted(
+            &mut protocol,
+            &mut second_connection,
+            &mut second_device_session,
+            envelope_value(
+                MessageType::SessionAttach,
+                SessionAttachPayload {
+                    session_id: created_payload.session_id,
+                    watch_updates: true,
+                    last_terminal_seq: None,
+                },
+            )
+            .unwrap(),
+        );
+        let attached = decrypt_first(&mut second_device_session, attached);
+        assert_eq!(attached.kind, MessageType::SessionAttached);
+        assert_eq!(backend.attachment_starts().len(), 2);
+
+        protocol.detach_connection(&mut second_connection);
+
+        assert_eq!(
+            backend.attachment_drops().len(),
+            1,
+            "关闭第二条 watched 连接只能释放它自己的 attachment"
+        );
+        assert_eq!(backend.terminate_count(), 0);
+        send_encrypted(
+            &mut protocol,
+            &mut first_connection,
+            &mut first_device_session,
+            envelope_value(
+                MessageType::SessionData,
+                SessionDataPayload {
+                    session_id: created_payload.session_id,
+                    data_base64: general_purpose::STANDARD.encode(b"first-still-attached\n"),
+                },
+            )
+            .unwrap(),
+        );
+        assert_eq!(backend.writes(), vec![b"first-still-attached\n".to_vec()]);
+    }
+
+    #[test]
+    fn packet_terminal_stream_replacement_drops_previous_watched_attachment() {
+        let (mut protocol, backend) = protocol();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = PublicKey(wire(signing_key.verifying_key().as_bytes()));
+        let (_, mut device_session, _) =
+            open_packet_e2ee(&mut protocol, &mut connection, device_id);
+        pair_packet_device(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            device_id,
+            public_key,
+        );
+
+        let first_stream = PacketStreamId::new();
+        let first = send_encrypted_packet(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            ProtocolPacket::stream_open(
+                PacketRequestId::new(),
+                first_stream,
+                METHOD_TERMINAL_CREATE,
+                128 * 1024,
+                serde_json::to_value(SessionCreatePayload {
+                    command: vec!["sh".to_owned()],
+                    size: TerminalSize::new(24, 80),
+                })
+                .unwrap(),
+            ),
+        );
+        assert_eq!(
+            decrypt_first_packet(&mut device_session, first).kind,
+            PacketKind::Response
+        );
+        assert_eq!(backend.attachment_starts().len(), 1);
+        assert!(backend.attachment_drops().is_empty());
+
+        let second_stream = PacketStreamId::new();
+        let second = send_encrypted_packet(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            ProtocolPacket::stream_open(
+                PacketRequestId::new(),
+                second_stream,
+                METHOD_TERMINAL_CREATE,
+                128 * 1024,
+                serde_json::to_value(SessionCreatePayload {
+                    command: vec!["sh".to_owned()],
+                    size: TerminalSize::new(24, 80),
+                })
+                .unwrap(),
+            ),
+        );
+        assert_eq!(
+            decrypt_first_packet(&mut device_session, second).kind,
+            PacketKind::Response
+        );
+
+        assert_eq!(backend.attachment_starts().len(), 2);
+        assert_eq!(
+            backend.attachment_drops().len(),
+            1,
+            "terminal stream 替换成功后必须释放旧 watched attachment"
+        );
+        assert_eq!(backend.terminate_count(), 0);
+    }
+
+    #[test]
+    fn packet_terminal_attach_replaces_session_create_watched_attachment() {
+        let (mut protocol, backend) = protocol();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = PublicKey(wire(signing_key.verifying_key().as_bytes()));
+        let (_, mut device_session, _) =
+            open_packet_e2ee(&mut protocol, &mut connection, device_id);
+        pair_packet_device(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            device_id,
+            public_key,
+        );
+
+        let session_id =
+            create_test_packet_session(&mut protocol, &mut connection, &mut device_session);
+        assert_eq!(backend.attachment_starts().len(), 1);
+        assert!(backend.attachment_drops().is_empty());
+
+        let stream_id = PacketStreamId::new();
+        let attached = send_encrypted_packet(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            ProtocolPacket::stream_open(
+                PacketRequestId::new(),
+                stream_id,
+                METHOD_TERMINAL_ATTACH,
+                128 * 1024,
+                serde_json::to_value(SessionAttachPayload {
+                    session_id,
+                    watch_updates: true,
+                    last_terminal_seq: None,
+                })
+                .unwrap(),
+            ),
+        );
+        assert_eq!(
+            decrypt_first_packet(&mut device_session, attached).kind,
+            PacketKind::Response
+        );
+
+        assert_eq!(backend.attachment_starts().len(), 2);
+        assert_eq!(
+            backend.attachment_drops().len(),
+            1,
+            "terminal stream attach 必须替换 packet session.create 留下的旧 watched handle"
+        );
+    }
+
+    #[test]
+    fn packet_terminal_stream_cancel_drops_watched_attachment() {
+        let (mut protocol, backend) = protocol();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = PublicKey(wire(signing_key.verifying_key().as_bytes()));
+        let (_, mut device_session, _) =
+            open_packet_e2ee(&mut protocol, &mut connection, device_id);
+        pair_packet_device(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            device_id,
+            public_key,
+        );
+
+        let stream_id = PacketStreamId::new();
+        let opened = send_encrypted_packet(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            ProtocolPacket::stream_open(
+                PacketRequestId::new(),
+                stream_id,
+                METHOD_TERMINAL_CREATE,
+                128 * 1024,
+                serde_json::to_value(SessionCreatePayload {
+                    command: vec!["sh".to_owned()],
+                    size: TerminalSize::new(24, 80),
+                })
+                .unwrap(),
+            ),
+        );
+        assert_eq!(
+            decrypt_first_packet(&mut device_session, opened).kind,
+            PacketKind::Response
+        );
+        assert_eq!(backend.attachment_starts().len(), 1);
+
+        let canceled = send_encrypted_packet(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            ProtocolPacket::cancel_stream(stream_id, serde_json::json!({"reason": "test"})),
+        );
+
+        assert!(canceled.is_empty());
+        assert_eq!(
+            backend.attachment_drops().len(),
+            1,
+            "terminal stream cancel 必须释放当前 watched attachment"
+        );
+        assert_eq!(backend.terminate_count(), 0);
     }
 
     #[test]

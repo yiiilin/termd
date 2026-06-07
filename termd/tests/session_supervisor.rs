@@ -137,6 +137,9 @@ where
 fn restore_supervisor_pid(restore_info: &PtyRestoreInfo) -> u32 {
     match restore_info {
         PtyRestoreInfo::UnixSocket { supervisor_pid, .. } => *supervisor_pid,
+        PtyRestoreInfo::Tmux { .. } => {
+            panic!("supervisor tests should only pass UnixSocket restore info")
+        }
     }
 }
 
@@ -725,7 +728,7 @@ fn daemon_session_list_shows_restored_supervisor_without_client_history_metadata
 
 #[test]
 #[cfg(target_os = "linux")]
-fn daemon_startup_adopts_live_supervisor_when_runtime_row_is_missing() {
+fn daemon_startup_warns_but_does_not_adopt_unrecorded_live_supervisor() {
     let state_dir = std::env::temp_dir().join(format!(
         "td-a-{}-{}",
         std::process::id(),
@@ -797,18 +800,32 @@ fn daemon_startup_adopts_live_supervisor_when_runtime_row_is_missing() {
         "live supervisor should be discoverable before daemon startup: candidates={candidates:?} state={:?} status={supervisor_status:?} cmdline={debug_cmdline} log={supervisor_log}",
         linux_process_state(supervisor_pid),
     );
+    assert_eq!(
+        backend
+            .orphaned_supervisor_count(std::iter::empty::<&str>())
+            .unwrap(),
+        1,
+        "unrecorded live supervisor should be classified as an orphan warning candidate"
+    );
 
     let config = DaemonConfig::default_for_state_path(&state_path);
     let protocol = try_default_protocol(config).unwrap();
 
     let reloaded = StateStore::load(&state_path).unwrap();
-    assert_eq!(reloaded.sessions.len(), 1);
-    assert_eq!(reloaded.sessions[0].session_id.0.to_string(), session_id);
-    assert_eq!(reloaded.sessions[0].state, SessionState::Running);
-    assert!(reloaded.sessions[0].restore_info.is_some());
+    assert!(
+        reloaded.sessions.is_empty(),
+        "startup must not silently adopt old supervisor runtime rows after the tmux schema bump"
+    );
+    assert_eq!(
+        backend
+            .orphaned_supervisor_count(std::iter::empty::<&str>())
+            .unwrap(),
+        1,
+        "startup should only warn about unrecorded live supervisors, not adopt or reap them"
+    );
     assert!(
         linux_process_state(supervisor_pid).is_some(),
-        "startup must adopt the live supervisor instead of cleaning it as orphan"
+        "startup must leave unrecorded live supervisor running for manual reset/cleanup"
     );
 
     drop(protocol);
@@ -876,7 +893,9 @@ fn reconnects_to_supervisor_after_launcher_parent_process_exits() {
         supervisor_pid,
         supervisor_status: PtySupervisorStatus::Running,
     };
-    let mut session = backend.reconnect(session_id, &restore_info).unwrap();
+    let mut session = backend
+        .reconnect(session_id, &restore_info, PtySize::new(24, 80))
+        .unwrap();
 
     let replayed = read_session_until_contains(&mut *session, b"parent-exited");
     assert!(

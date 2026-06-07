@@ -23,6 +23,7 @@ import type {
   BrowserState,
   DaemonClientSummaryPayload,
   DaemonStatusResultPayload,
+  EffectiveTheme,
   PairedServerState,
   SafeError,
   SessionCreatedPayload,
@@ -57,7 +58,7 @@ import { SessionFilesPanel } from "./components/SessionFilesPanel";
 import { FileEditorDialog } from "./components/FileEditorDialog";
 import { StatusBar } from "./components/StatusBar";
 import { TerminalPane } from "./components/TerminalPane";
-import type { TerminalOutputItem } from "./components/terminal/types";
+import type { TerminalOutputItem, TerminalResyncOptions } from "./components/terminal/types";
 import { useWorkspaceAutoRetry, useWorkspaceConnection } from "./hooks/useWorkspaceConnection";
 import {
   useTerminalAttach,
@@ -208,6 +209,7 @@ export default function App() {
   const [url, setUrl] = useState(() => defaultWsUrlFromPage());
   const [pairingToken, setPairingToken] = useState("");
   const [sessions, setSessions] = useState<SessionSummaryPayload[]>([]);
+  const sessionsRef = useRef<SessionSummaryPayload[]>([]);
   const [sessionOrder, setSessionOrder] = useState<UUID[]>([]);
   const sessionOrderRef = useRef<UUID[]>([]);
   const sessionOrderGenerationRef = useRef(0);
@@ -349,6 +351,8 @@ export default function App() {
     terminalOutputResetWaitersRef,
     terminalOutputFlushFrameRef,
     terminalOutputDrainRef,
+    terminalSnapshotRevealHistoryTokensRef,
+    terminalSnapshotPendingFullSnapshotTokensRef,
     attachReconnectTimerRef,
     attachReconnectKeyRef,
     attachReconnectAttemptsRef,
@@ -371,6 +375,7 @@ export default function App() {
   const lastCursorReportRef = useRef("");
   const lastCursorFocusedRef = useRef<boolean | undefined>(undefined);
   const cursorRefreshTimerRef = useRef<number | undefined>(undefined);
+  const terminalThemeResyncRef = useRef<EffectiveTheme | undefined>(undefined);
   const selectedSessionIdRef = useRef<UUID | undefined>(undefined);
   const activeSurfaceRef = useRef<AppSurface>(activeSurface);
   const statusRef = useRef(status);
@@ -459,6 +464,26 @@ export default function App() {
   }, [sessionOrder]);
 
   useEffect(() => {
+    sessionsRef.current = sessions;
+  }, [sessions]);
+
+  const clearTerminalSnapshotRevealHistory = useCallback((sessionId?: UUID, snapshotToken?: number) => {
+    if (sessionId) {
+      const revealToken = terminalSnapshotRevealHistoryTokensRef.current.get(sessionId);
+      if (snapshotToken === undefined || revealToken === snapshotToken) {
+        terminalSnapshotRevealHistoryTokensRef.current.delete(sessionId);
+      }
+      const pendingSnapshot = terminalSnapshotPendingFullSnapshotTokensRef.current.get(sessionId);
+      if (snapshotToken === undefined || pendingSnapshot?.token === snapshotToken) {
+        terminalSnapshotPendingFullSnapshotTokensRef.current.delete(sessionId);
+      }
+      return;
+    }
+    terminalSnapshotRevealHistoryTokensRef.current.clear();
+    terminalSnapshotPendingFullSnapshotTokensRef.current.clear();
+  }, [terminalSnapshotPendingFullSnapshotTokensRef, terminalSnapshotRevealHistoryTokensRef]);
+
+  useEffect(() => {
     if (typeof window === "undefined") {
       return undefined;
     }
@@ -517,7 +542,7 @@ export default function App() {
   }, [activeServer?.server_id]);
   const hasPairedServer = Boolean(activeServer && state.device);
   const showConnectionStatus = hasPairedServer && !error && status !== "pairing";
-  // session 列表刷新只是旁路请求，不能把正在显示的 xterm 卸载成 disconnected。
+  // session 列表刷新只是旁路请求，不能把正在显示的 Ghostty 卸载成 disconnected。
   const connectionReady = showConnectionStatus && status !== "idle" && status !== "connecting";
   useEffect(() => {
     recordTermdDiagnostic("app_connection_state", {
@@ -642,7 +667,7 @@ export default function App() {
   }, []);
 
   const discardPendingTerminalOutput = useCallback(() => {
-    // 终端输出由 xterm 自己维护 scrollback；React 只保留尚未写入 xterm 的短队列。
+    // 终端输出由 Ghostty 自己维护 scrollback；React 只保留尚未写入 Ghostty 的短队列。
     terminalOutputQueueRef.current = [];
     if (terminalOutputFlushFrameRef.current !== undefined) {
       window.cancelAnimationFrame(terminalOutputFlushFrameRef.current);
@@ -753,7 +778,7 @@ export default function App() {
 
   const flushTerminalOutput = useCallback(() => {
     terminalOutputFlushFrameRef.current = undefined;
-    // 这一帧里累积的 session_data 直接交给 xterm drain，避免每帧输出都触发 React 重渲染。
+    // 这一帧里累积的 session_data 直接交给 Ghostty drain，避免每帧输出都触发 React 重渲染。
     terminalOutputDrainRef.current?.();
   }, []);
 
@@ -806,6 +831,7 @@ export default function App() {
     closeWorkspaceClient();
     if (attachedSessionRef.current) {
       lastRenderedTerminalSeqRef.current.delete(attachedSessionRef.current);
+      clearTerminalSnapshotRevealHistory(attachedSessionRef.current);
     }
     attachedSessionRef.current = undefined;
     pendingResizeKeyRef.current = undefined;
@@ -823,14 +849,14 @@ export default function App() {
       setMobilePanel(undefined);
       setMobileMenuOpen(false);
     }
-  }, [cancelScheduledAttachSwitch, clearSessionFiles, clearTerminalOutput, closeWorkspaceClient, resetAttachReconnectState, resolveTerminalOutputResetWaiters]);
+  }, [cancelScheduledAttachSwitch, clearSessionFiles, clearTerminalOutput, clearTerminalSnapshotRevealHistory, closeWorkspaceClient, resetAttachReconnectState, resolveTerminalOutputResetWaiters]);
 
   useEffect(() => {
     if (activeSurface !== "admin" || !attachClientRef.current) {
       return;
     }
 
-    // 管理页会卸载 TerminalPane；继续保留旧 attach 会让返回工作台时 xterm 为空。
+    // 管理页会卸载 TerminalPane；继续保留旧 attach 会让返回工作台时 Ghostty 为空。
     // 这里仅断开本地 attach，daemon 端 session 仍保持运行，回到工作台后会自动重新 attach。
     userDetachedRef.current = false;
     autoAttachAttemptedSessionRef.current = undefined;
@@ -842,6 +868,7 @@ export default function App() {
   const resetWorkspaceState = useCallback(() => {
     setSessions([]);
     confirmedSessionSizesRef.current.clear();
+    clearTerminalSnapshotRevealHistory();
     closeWorkspaceClient();
     receiveLoopGenerationRef.current += 1;
     setSessionOrder([]);
@@ -876,7 +903,7 @@ export default function App() {
     clearTerminalOutput();
     clearSessionFiles();
     autoCheckedServerRef.current = undefined;
-  }, [cancelScheduledAttachSwitch, clearSessionFiles, clearTerminalOutput, closeWorkspaceClient, resolveTerminalOutputResetWaiters, selectSession]);
+  }, [cancelScheduledAttachSwitch, clearSessionFiles, clearTerminalOutput, clearTerminalSnapshotRevealHistory, closeWorkspaceClient, resolveTerminalOutputResetWaiters, selectSession]);
 
   const handleStartDaemonRename = useCallback(
     (serverId: UUID) => {
@@ -1180,20 +1207,40 @@ export default function App() {
         setSessionOrder(nextOrder);
       }
       const orderedSessions = orderSessions(sortSessionsNewestFirst(list.sessions), nextOrder);
+      clearConfirmedPendingResizeFromSessions(
+        list.sessions,
+        attachedSessionRef.current,
+        pendingResizeKeyRef.current,
+        pendingResizeKeyRef,
+        confirmedSessionSizesRef.current,
+      );
       confirmedSessionSizesRef.current = new Map(list.sessions.map((session) => [session.session_id, session.size]));
       const listedSessionIds = new Set(list.sessions.map((session) => session.session_id));
+      const localKnownSessionIds = new Set([
+        ...sessionsRef.current.map((session) => session.session_id),
+        ...sessionOrderRef.current,
+      ]);
+      const preserveSessionIds = [
+        renamingSessionIdRef.current,
+        pendingTerminalAttachSessionRef.current,
+        attachingSessionIdRef.current,
+        selectedSessionIdRef.current,
+        attachedSessionRef.current,
+      ];
       const stickySessionId =
-        attachingSessionIdRef.current ?? attachedSessionRef.current ?? selectedSessionIdRef.current;
+        attachingSessionIdRef.current ??
+        pendingTerminalAttachSessionRef.current ??
+        selectedSessionIdRef.current ??
+        attachedSessionRef.current;
       const nextSelectedSessionId = userDetachedRef.current
         ? undefined
-        : stickySessionId && listedSessionIds.has(stickySessionId)
+        : stickySessionId && (listedSessionIds.has(stickySessionId) || localKnownSessionIds.has(stickySessionId))
           ? stickySessionId
           : orderedSessions.at(0)?.session_id ?? renamingSessionIdRef.current ?? attachedSessionRef.current;
       setSessions((current) =>
-        mergeSessionRefresh(list.sessions, current, [
-          renamingSessionIdRef.current,
-          attachedSessionRef.current,
-        ], nextOrder),
+        // 中文注释：旧 session.list 可能晚于本地创建、点击切换或 attach 返回。
+        // 正在本地操作的 session 先以当前 React 状态为准，下一轮 daemon 权威列表会再收敛。
+        mergeSessionRefresh(list.sessions, current, preserveSessionIds, nextOrder),
       );
       // 列表刷新可能晚于用户点击 session 返回；不能用“第一行”覆盖用户刚选择/正在 attach 的目标。
       selectSession(nextSelectedSessionId);
@@ -1253,7 +1300,7 @@ export default function App() {
         (attachedSessionRef.current || attachClientRef.current)
       ) {
         // 中文注释：workspace 中已经有当前 session 的 WebSocket 时，session/list 只是旁路 segment。
-        // relay 恢复或后台唤醒导致的短超时不能卸载 xterm，也不能升级成全局连接错误；
+        // relay 恢复或后台唤醒导致的短超时不能卸载 Ghostty，也不能升级成全局连接错误；
         // 真实终端断线由 attach receive loop 按长超时重连链路处理。
         const nextStatus =
           statusRef.current === "attaching"
@@ -1305,10 +1352,21 @@ export default function App() {
             sessionOrderRef.current = nextOrder;
             setSessionOrder(nextOrder);
           }
+          clearConfirmedPendingResizeFromSessions(
+            sessionList.sessions,
+            attachedSessionRef.current,
+            pendingResizeKeyRef.current,
+            pendingResizeKeyRef,
+            confirmedSessionSizesRef.current,
+          );
           confirmedSessionSizesRef.current = new Map(sessionList.sessions.map((session) => [session.session_id, session.size]));
           setSessions((current) =>
+            // 中文注释：后台刷新不能把刚创建、刚选中或正在 attach 的本地 session 行刷成空列表。
             mergeSessionRefresh(sessionList.sessions, current, [
               renamingSessionIdRef.current,
+              pendingTerminalAttachSessionRef.current,
+              attachingSessionIdRef.current,
+              selectedSessionIdRef.current,
               attachedSessionRef.current,
             ], nextOrder),
           );
@@ -1325,7 +1383,7 @@ export default function App() {
           throw caught;
         }
       } catch (caught) {
-        // 后台 client/session 刷新失败不能把正在使用的 xterm 切到错误态；
+        // 后台 client/session 刷新失败不能把正在使用的 Ghostty 切到错误态；
         // 主 attach 连接有自己的重连路径，手动 Refresh 仍会显示错误。
         void caught;
       } finally {
@@ -1416,7 +1474,7 @@ export default function App() {
   }, []);
 
   const markNewOutputIfBackground = useCallback((sessionId: UUID) => {
-    // 当前 attach 的 session 输出会直接进入 xterm，不需要再用列表颜色提示。
+    // 当前 attach 的 session 输出会直接进入 Ghostty，不需要再用列表颜色提示。
     if (sessionId === attachedSessionRef.current) {
       return;
     }
@@ -1436,7 +1494,20 @@ export default function App() {
   }, [preferences, sessions, t]);
 
   const applyConfirmedSessionSize = useCallback((sessionId: UUID, size: TerminalSize) => {
+    const confirmedResizeKey = terminalSizeKey(sessionId, size);
     const currentSize = confirmedSessionSizesRef.current.get(sessionId);
+    if (sessionId === attachedSessionRef.current && pendingResizeKeyRef.current === confirmedResizeKey) {
+      pendingResizeKeyRef.current = undefined;
+    } else if (
+      sessionId === attachedSessionRef.current &&
+      pendingResizeKeyRef.current &&
+      currentSize &&
+      !sameTerminalSize(currentSize, size)
+    ) {
+      // 中文注释：另一个客户端或 daemon snapshot 已确认了不同 grid 时，旧 pending resize
+      // 不再代表当前世界；继续保留会挡住本客户端后续把尺寸改回来的请求。
+      pendingResizeKeyRef.current = undefined;
+    }
     if (currentSize && sameTerminalSize(currentSize, size)) {
       return;
     }
@@ -1448,12 +1519,6 @@ export default function App() {
         session.session_id === sessionId ? { ...session, size } : session,
       ),
     );
-    if (sessionId === attachedSessionRef.current) {
-      const confirmedResizeKey = terminalSizeKey(sessionId, size);
-      if (pendingResizeKeyRef.current === confirmedResizeKey) {
-        pendingResizeKeyRef.current = undefined;
-      }
-    }
   }, []);
 
   useEffect(() => {
@@ -1509,6 +1574,7 @@ export default function App() {
     sessionPermissionIdsRef,
     clearNewOutputMark,
     clearTerminalOutput,
+    clearTerminalSnapshotRevealHistory,
     waitForTerminalOutputResetApplied,
     selectSession,
     startReceiveLoop,
@@ -1520,16 +1586,25 @@ export default function App() {
 
   attachReconnectHandlerRef.current = scheduleAttachReconnect;
 
-  const handleTerminalResync = useCallback((lastTerminalSeq?: number) => {
+  const handleTerminalResync = useCallback((lastTerminalSeq?: number, options?: TerminalResyncOptions) => {
+    const sessionId = attachedSessionRef.current;
+    if (sessionId && lastTerminalSeq === undefined && options?.revealHistory) {
+      // 中文注释：自动 full snapshot 可能已经启动并关闭当前 attach client。
+      // 用户随后上滚时只升级那一次已在路上的 full snapshot token，不能污染后续普通 snapshot。
+      const pendingSnapshot = terminalSnapshotPendingFullSnapshotTokensRef.current.get(sessionId);
+      if (pendingSnapshot) {
+        terminalSnapshotRevealHistoryTokensRef.current.set(sessionId, pendingSnapshot.token);
+      }
+    }
     const client = attachClientRef.current;
     if (!client) {
       return;
     }
-    const sessionId = attachedSessionRef.current;
     recordTermdDiagnostic("app_terminal_resync", {
       sessionId,
       lastTerminalSeq,
       forceFullSnapshot: lastTerminalSeq === undefined,
+      revealHistory: options?.revealHistory,
     }, { stack: true });
     if (sessionId && lastTerminalSeq !== undefined) {
       lastRenderedTerminalSeqRef.current.set(sessionId, lastTerminalSeq);
@@ -1537,9 +1612,30 @@ export default function App() {
     scheduleAttachReconnect(
       client,
       new ProtocolClientError("terminal_resync", "terminal stream out of sync"),
-      lastTerminalSeq === undefined ? { forceFullSnapshot: true } : { lastTerminalSeq },
+      lastTerminalSeq === undefined
+        ? { forceFullSnapshot: true, revealHistory: options?.revealHistory }
+        : { lastTerminalSeq },
     );
-  }, [scheduleAttachReconnect]);
+  }, [scheduleAttachReconnect, terminalSnapshotPendingFullSnapshotTokensRef, terminalSnapshotRevealHistoryTokensRef]);
+
+  useEffect(() => {
+    const previousTheme = terminalThemeResyncRef.current;
+    terminalThemeResyncRef.current = effectiveTheme;
+    if (previousTheme === undefined || previousTheme === effectiveTheme) {
+      return;
+    }
+    if (!attachedSessionRef.current || !attachClientRef.current) {
+      return;
+    }
+    // 中文注释：ghostty-web 运行期 theme setter 不能重写 WASM buffer 里的默认前景/背景色。
+    // 已 attach 终端换主题时走一次完整 snapshot 重放，让新的 Ghostty 实例用新主题创建。
+    recordTermdDiagnostic("app_terminal_theme_resync", {
+      previousTheme,
+      nextTheme: effectiveTheme,
+      sessionId: attachedSessionRef.current,
+    });
+    handleTerminalResync(undefined);
+  }, [effectiveTheme, handleTerminalResync]);
 
   const handleTerminalSeqRendered = useCallback((terminalSeq: number) => {
     const sessionId = attachedSessionRef.current;
@@ -1572,6 +1668,7 @@ export default function App() {
         closeMobileAttachChrome();
         return;
       }
+      clearTerminalSnapshotRevealHistory(sessionId);
       userDetachedRef.current = false;
       setError(undefined);
       setStatus("attaching");
@@ -1649,15 +1746,13 @@ export default function App() {
         clearNewOutputMark(sessionId);
         closeMobileAttachChrome();
         setStatus("attached");
-        if (isMobileLayout) {
-          // 移动端打开历史 session 后主动请求 xterm focus，让软键盘保持在终端下方。
-          // 聚焦后的本地尺寸会作为 shared PTY 的权威尺寸上报给 daemon。
-          setTerminalFocusRequest((request) => request + 1);
-        }
+        // 打开历史 session 后主动请求 Ghostty focus。桌面端用它补发真实容器尺寸；
+        // 移动端也靠它让软键盘保持在终端下方。TerminalPane 会保护 toolbar/files 焦点。
+        setTerminalFocusRequest((request) => request + 1);
         // 中文注释：DirectClient 的 WebSocket pump 会在 attach response 前后持续收包，
         // 但 App 的 receive loop 只有在这里启动。快速切换多个大输出 session 时，必须先
-        // 等 TerminalPane 确认旧 xterm 已经清屏/重建，再把新 snapshot 从 DirectClient
-        // 队列排进 xterm；否则新 snapshot 可能先写入旧实例。
+        // 等 TerminalPane 确认旧 Ghostty 已经清屏/重建，再把新 snapshot 从 DirectClient
+        // 队列排进 Ghostty；否则新 snapshot 可能先写入旧实例。
         await waitForTerminalOutputResetApplied(resetVersion);
         if (!isCurrentAttachRequest() || userDetachedRef.current) {
           attachedClient.detachSession(sessionId);
@@ -1699,6 +1794,7 @@ export default function App() {
     [
       authenticatedWorkspaceClient,
       clearNewOutputMark,
+      clearTerminalSnapshotRevealHistory,
       clearTerminalOutput,
       disconnectAttach,
       loadSessionFiles,
@@ -1751,7 +1847,7 @@ export default function App() {
         workspaceClientPromiseRef.current !== undefined
       ) {
         // 80ms 合并窗口只延迟“新 session attach”，不能让旧 session 的输出继续进入
-        // xterm。否则旧的大 snapshot/持续输出会占住主线程和当前 session 连接。
+        // Ghostty。否则旧的大 snapshot/持续输出会占住主线程和当前 session 连接。
         disconnectAttach();
       }
       if (pendingAttachClientRef.current && pendingAttachClientRef.current !== attachClientRef.current) {
@@ -1862,7 +1958,7 @@ export default function App() {
       sessionOrderRef.current = nextOrder;
       setSessionOrder(nextOrder);
       setSessions((current) => upsertSession(current, created, nextOrder));
-      // 新建 session 等价于打开一个新的 SSH shell，应立即把输入焦点交给 xterm。
+      // 新建 session 等价于打开一个新的 SSH shell，应立即把输入焦点交给 Ghostty。
       // 聚焦客户端会把自己的尺寸同步为 shared PTY 的权威尺寸。
       setTerminalFocusRequest((request) => request + 1);
       setStatus("attached");
@@ -2072,6 +2168,7 @@ export default function App() {
           disconnectAttach();
           clearTerminalOutput();
         }
+        clearTerminalSnapshotRevealHistory(sessionId);
         setSessions((current) => current.filter((session) => session.session_id !== sessionId));
         confirmedSessionSizesRef.current.delete(sessionId);
         sessionOrderRef.current = sessionOrderRef.current.filter((candidate) => candidate !== sessionId);
@@ -2103,6 +2200,7 @@ export default function App() {
     [
       clearSessionFiles,
       clearTerminalOutput,
+      clearTerminalSnapshotRevealHistory,
       disconnectAttach,
       clearNewOutputMark,
       isIgnoredClosingSessionNotFound,
@@ -2254,7 +2352,7 @@ export default function App() {
           return;
         }
         if (isTerminalSidecarTimeout(caught)) {
-          // 中文注释：cursor 上报只是协作元数据；高输出场景下响应超时不能卸载 xterm。
+          // 中文注释：cursor 上报只是协作元数据；高输出场景下响应超时不能卸载 Ghostty。
           recordTermdDiagnostic("app_terminal_sidecar_timeout_ignored", {
             kind: "cursor",
             sessionId,
@@ -2452,7 +2550,7 @@ export default function App() {
 
   const requestMobileTerminalFocus = useCallback(() => {
     if (isMobileLayout && attachedSessionId) {
-      // 移动端关闭覆盖面板后回到终端输入场景，主动恢复 xterm focus 以保持键盘常驻。
+      // 移动端关闭覆盖面板后回到终端输入场景，主动恢复 Ghostty focus 以保持键盘常驻。
       setTerminalFocusRequest((request) => request + 1);
     }
   }, [attachedSessionId, isMobileLayout]);
@@ -2803,6 +2901,7 @@ export default function App() {
               <div className="sidebar-scroll-region">
                 <SessionList
                   sessions={orderedSessions}
+                  creating={status === "creating"}
                   selectedSessionId={selectedSessionId}
                   newOutputSessionIds={newOutputSessionIds}
                   renamingSessionId={renamingSessionId}
@@ -3065,6 +3164,7 @@ export default function App() {
             <div className="mobile-panel-body">
               <SessionList
                 sessions={orderedSessions}
+                creating={status === "creating"}
                 selectedSessionId={selectedSessionId}
                 newOutputSessionIds={newOutputSessionIds}
                 renamingSessionId={renamingSessionId}
@@ -3299,11 +3399,12 @@ function DaemonStatusPanel(props: {
 
 function CpuMetric(props: { value: string; history: number[] }) {
   const { t } = useI18n();
+  const showCpuHistory = props.value !== "..." && props.history.length > 0;
   return (
     <div className="daemon-status-metric daemon-status-cpu">
       <span>{t("daemonStatus.cpu")}</span>
       <strong>{props.value}</strong>
-      <CpuBarChart samples={props.history} />
+      {showCpuHistory ? <CpuBarChart samples={props.history} /> : null}
     </div>
   );
 }
@@ -3318,6 +3419,7 @@ function CpuBarChart(props: { samples: number[] }) {
       role="img"
       aria-label={t("daemonStatus.cpuBars")}
     >
+      <title>{t("daemonStatus.cpuBars")}</title>
       <rect
         className="daemon-cpu-bar-frame"
         x="0.5"
@@ -3519,16 +3621,46 @@ export function knownServerWsUrlCandidates(
   const savedUrl = rawUrl.trim();
   const pageUrl = defaultWsUrlFromPage(page);
   const relayToken = relayTokenFromUrl(savedUrl);
+  const savedCandidate = routeWsUrlForKnownServer(browserReachableWsUrl(savedUrl, page), serverId);
+  const pageCandidate =
+    page?.hostname && !isLoopbackHost(page.hostname)
+      ? routeWsUrlForKnownServer(withRelayToken(pageUrl, relayToken), serverId)
+      : undefined;
 
-  if (page?.hostname && !isLoopbackHost(page.hostname)) {
+  if (shouldPreferPageWsUrl(savedUrl, page)) {
     // 从 relay Web 页面打开时优先使用当前 origin，避免旧 IndexedDB 里的历史 relay host
     // 让用户刷新后继续连到过期地址；query token 会被保留以兼容带 transport token 的 relay。
-    addCandidate(candidates, routeWsUrlForKnownServer(withRelayToken(pageUrl, relayToken), serverId));
+    addCandidate(candidates, pageCandidate);
+    addCandidate(candidates, savedCandidate);
+  } else {
+    // 中文注释：开发/临时环境常见 Web 和 relay 使用同一主机的不同端口。
+    // 用户显式保存的 relay 端口必须优先，否则 attach 会误连到 Vite/Web 静态服务的 /ws。
+    addCandidate(candidates, savedCandidate);
+    addCandidate(candidates, pageCandidate);
   }
 
-  addCandidate(candidates, routeWsUrlForKnownServer(browserReachableWsUrl(savedUrl, page), serverId));
-
   return candidates;
+}
+
+function shouldPreferPageWsUrl(
+  savedUrl: string,
+  page:
+    | (Pick<Location, "host" | "hostname"> & Partial<Pick<Location, "protocol" | "pathname">>)
+    | undefined,
+): boolean {
+  if (!page?.hostname || isLoopbackHost(page.hostname)) {
+    return false;
+  }
+  try {
+    const parsed = new URL(savedUrl);
+    // 页面来源和保存地址是不同主机时，通常表示用户从新的 relay Web 入口打开了旧状态。
+    if (!isLoopbackHost(parsed.hostname) && parsed.hostname !== page.hostname) {
+      return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
 }
 
 function routeWsUrlForKnownServer(rawUrl: string, serverId: UUID): string | undefined {
@@ -4206,14 +4338,39 @@ function upsertAttachedSession(
 }
 
 function sameTerminalSize(a: TerminalSize, b: TerminalSize): boolean {
-  return (
-    a.rows === b.rows &&
-    a.cols === b.cols &&
-    a.pixel_width === b.pixel_width &&
-    a.pixel_height === b.pixel_height
-  );
+  // 中文注释：PTY 的真实尺寸身份只有 rows/cols。pixel_width/height 只是本地布局快照，
+  // 刷新和字体 metrics 稳定前会抖动，不能用来决定是否发起或确认 resize。
+  return a.rows === b.rows && a.cols === b.cols;
 }
 
 function terminalSizeKey(sessionId: UUID, size: TerminalSize): string {
-  return `${sessionId}:${size.rows}:${size.cols}:${size.pixel_width}:${size.pixel_height}`;
+  return `${sessionId}:${size.rows}:${size.cols}`;
+}
+
+function clearConfirmedPendingResizeFromSessions(
+  sessions: SessionSummaryPayload[],
+  attachedSessionId: UUID | undefined,
+  pendingResizeKey: string | undefined,
+  pendingResizeKeyRef: { current: string | undefined },
+  currentSizes: Map<UUID, TerminalSize>,
+): void {
+  if (!attachedSessionId || !pendingResizeKey) {
+    return;
+  }
+  const attachedSession = sessions.find((session) => session.session_id === attachedSessionId);
+  if (!attachedSession) {
+    return;
+  }
+  // 中文注释：session.list 可能先于 session_resized ack 返回同一个新尺寸；
+  // 如果不在这里清理 pending key，后续用户重新聚焦也可能被旧 pending resize 挡掉。
+  if (terminalSizeKey(attachedSessionId, attachedSession.size) === pendingResizeKey) {
+    pendingResizeKeyRef.current = undefined;
+    return;
+  }
+  const currentSize = currentSizes.get(attachedSessionId);
+  if (currentSize && !sameTerminalSize(currentSize, attachedSession.size)) {
+    // 中文注释：session.list 确认了别的 grid，说明旧 pending 已经不是当前会话状态；
+    // 继续保留会把后续本地 resize 请求挡掉。
+    pendingResizeKeyRef.current = undefined;
+  }
 }

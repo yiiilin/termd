@@ -1,10 +1,16 @@
+#[cfg(test)]
 use std::collections::HashMap;
 
+#[cfg(test)]
 use termd_proto::{SessionId, SessionState, TerminalSize, UnixTimestampMillis};
 use tracing::warn;
 
-use crate::pty::supervisor::{SupervisorPtyBackend, SupervisorRestoreCandidate};
+use crate::pty::supervisor::SupervisorPtyBackend;
+#[cfg(test)]
+use crate::pty::supervisor::SupervisorRestoreCandidate;
+#[cfg(test)]
 use crate::pty::{PtyRestoreInfo, PtySupervisorStatus};
+#[cfg(test)]
 use crate::state::{DaemonState, SessionStateRecord};
 
 pub(super) fn warn_about_orphaned_supervisors<I, S>(
@@ -28,6 +34,7 @@ pub(super) fn warn_about_orphaned_supervisors<I, S>(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn adopt_or_repair_runtime_sessions_from_supervisors(
     state: &mut DaemonState,
     supervisors: impl IntoIterator<Item = SupervisorRestoreCandidate>,
@@ -87,6 +94,7 @@ pub(crate) fn adopt_or_repair_runtime_sessions_from_supervisors(
     repaired_count
 }
 
+#[cfg(test)]
 fn restore_info_is_running_supervisor(restore_info: Option<&PtyRestoreInfo>) -> bool {
     matches!(
         restore_info,

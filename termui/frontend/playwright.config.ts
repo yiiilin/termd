@@ -21,7 +21,7 @@ export default defineConfig({
     },
   ],
   webServer: {
-    command: "npm run build && npm run preview",
+    command: "VITE_TERMD_E2E_DEBUG_BUFFER=1 npm run build && npm run preview",
     url: "http://127.0.0.1:4173",
     reuseExistingServer: false,
     timeout: 120000,

@@ -25,6 +25,7 @@ pub(crate) struct TerminalScreen {
     parser: ParserState,
     utf8_pending: Vec<u8>,
     pending_control: Vec<u8>,
+    pending_home_clear_cut: bool,
     normal_screen: Option<SavedScreen>,
     requires_snapshot_redraw: bool,
     scroll_top: usize,
@@ -377,6 +378,7 @@ impl TerminalScreen {
             parser: ParserState::Ground,
             utf8_pending: Vec::new(),
             pending_control: Vec::new(),
+            pending_home_clear_cut: false,
             normal_screen: None,
             requires_snapshot_redraw: false,
             scroll_top: 0,
@@ -673,30 +675,41 @@ impl TerminalScreen {
             }
             b'\r' => {
                 self.flush_invalid_utf8();
+                self.pending_home_clear_cut = false;
                 self.cursor_col = 0;
             }
             b'\n' => {
                 self.flush_invalid_utf8();
+                self.pending_home_clear_cut = false;
                 self.line_feed();
                 self.cursor_col = 0;
             }
             0x08 => {
                 self.flush_invalid_utf8();
+                self.pending_home_clear_cut = false;
                 self.requires_snapshot_redraw = true;
                 self.cursor_col = self.cursor_col.saturating_sub(1);
             }
             b'\t' => {
                 self.flush_invalid_utf8();
+                self.pending_home_clear_cut = false;
                 self.requires_snapshot_redraw = true;
                 let next_tab = ((self.cursor_col / 8) + 1) * 8;
                 self.cursor_col = next_tab.min(self.cols - 1);
             }
-            0x00..=0x1f | 0x7f => self.flush_invalid_utf8(),
+            0x00..=0x1f | 0x7f => {
+                self.pending_home_clear_cut = false;
+                self.flush_invalid_utf8();
+            }
             0x20..=0x7e => {
                 self.flush_invalid_utf8();
+                self.pending_home_clear_cut = false;
                 self.print_char(byte as char);
             }
-            _ => self.push_utf8_byte(byte),
+            _ => {
+                self.pending_home_clear_cut = false;
+                self.push_utf8_byte(byte);
+            }
         }
     }
 
@@ -709,11 +722,13 @@ impl TerminalScreen {
             },
             b']' => ParserState::Osc,
             b'7' => {
+                self.pending_home_clear_cut = false;
                 self.saved_cursor = Some((self.cursor_row, self.cursor_col));
                 self.clear_pending_control();
                 ParserState::Ground
             }
             b'8' => {
+                self.pending_home_clear_cut = false;
                 if let Some((row, col)) = self.saved_cursor {
                     self.cursor_row = row.min(self.rows - 1);
                     self.cursor_col = col.min(self.cols - 1);
@@ -722,18 +737,21 @@ impl TerminalScreen {
                 ParserState::Ground
             }
             b'=' => {
+                self.pending_home_clear_cut = false;
                 self.modes.application_keypad = true;
                 self.clear_pending_control();
                 ParserState::Ground
             }
             b'>' => {
+                self.pending_home_clear_cut = false;
                 self.modes.application_keypad = false;
                 self.clear_pending_control();
                 ParserState::Ground
             }
             b'c' => {
                 self.requires_snapshot_redraw = true;
-                self.clear_screen();
+                self.clear_screen_and_scrollback();
+                self.pending_home_clear_cut = false;
                 self.cursor_row = 0;
                 self.cursor_col = 0;
                 self.saved_cursor = None;
@@ -743,6 +761,7 @@ impl TerminalScreen {
                 ParserState::Ground
             }
             _ => {
+                self.pending_home_clear_cut = false;
                 self.clear_pending_control();
                 ParserState::Ground
             }
@@ -789,27 +808,75 @@ impl TerminalScreen {
             self.requires_snapshot_redraw = true;
         }
         match action {
-            'A' => self.cursor_row = self.cursor_row.saturating_sub(param_or(params, 0, 1)),
-            'B' => self.cursor_row = (self.cursor_row + param_or(params, 0, 1)).min(self.rows - 1),
-            'C' => self.cursor_col = (self.cursor_col + param_or(params, 0, 1)).min(self.cols - 1),
-            'D' => self.cursor_col = self.cursor_col.saturating_sub(param_or(params, 0, 1)),
-            'G' => self.cursor_col = one_based_param(params, 0).min(self.cols - 1),
+            'A' => {
+                self.pending_home_clear_cut = false;
+                self.cursor_row = self.cursor_row.saturating_sub(param_or(params, 0, 1));
+            }
+            'B' => {
+                self.pending_home_clear_cut = false;
+                self.cursor_row = (self.cursor_row + param_or(params, 0, 1)).min(self.rows - 1);
+            }
+            'C' => {
+                self.pending_home_clear_cut = false;
+                self.cursor_col = (self.cursor_col + param_or(params, 0, 1)).min(self.cols - 1);
+            }
+            'D' => {
+                self.pending_home_clear_cut = false;
+                self.cursor_col = self.cursor_col.saturating_sub(param_or(params, 0, 1));
+            }
+            'G' => {
+                self.pending_home_clear_cut = false;
+                self.cursor_col = one_based_param(params, 0).min(self.cols - 1);
+            }
             'H' | 'f' => {
                 self.cursor_row = self.cursor_row_from_param(params, 0);
                 self.cursor_col = one_based_param(params, 1).min(self.cols - 1);
+                self.pending_home_clear_cut = self.cursor_row == 0 && self.cursor_col == 0;
             }
-            'J' => self.erase_display(param_or(params, 0, 0)),
-            'K' => self.erase_line(param_or(params, 0, 0)),
+            'J' => {
+                self.erase_display(param_or(params, 0, 0));
+                self.pending_home_clear_cut = false;
+            }
+            'K' => {
+                self.pending_home_clear_cut = false;
+                self.erase_line(param_or(params, 0, 0));
+            }
             'm' => self.current_style.apply_sgr(params),
-            'r' => self.set_scroll_region(params),
-            'S' => self.scroll_up(param_or(params, 0, 1)),
-            'T' => self.scroll_down(param_or(params, 0, 1)),
-            'd' => self.cursor_row = self.cursor_row_from_param(params, 0),
-            'h' if private => self.set_private_modes(params, true),
-            'l' if private => self.set_private_modes(params, false),
-            'h' => self.set_public_modes(params, true),
-            'l' => self.set_public_modes(params, false),
-            _ => {}
+            'r' => {
+                self.pending_home_clear_cut = false;
+                self.set_scroll_region(params);
+            }
+            'S' => {
+                self.pending_home_clear_cut = false;
+                self.scroll_up(param_or(params, 0, 1));
+            }
+            'T' => {
+                self.pending_home_clear_cut = false;
+                self.scroll_down(param_or(params, 0, 1));
+            }
+            'd' => {
+                self.pending_home_clear_cut = false;
+                self.cursor_row = self.cursor_row_from_param(params, 0);
+            }
+            'h' if private => {
+                self.pending_home_clear_cut = false;
+                self.set_private_modes(params, true);
+            }
+            'l' if private => {
+                self.pending_home_clear_cut = false;
+                self.set_private_modes(params, false);
+            }
+            'h' => {
+                self.pending_home_clear_cut = false;
+                self.set_public_modes(params, true);
+            }
+            'l' => {
+                self.pending_home_clear_cut = false;
+                self.set_public_modes(params, false);
+            }
+            _ => {
+                self.pending_home_clear_cut = false;
+            }
         }
     }
 
@@ -915,16 +982,34 @@ impl TerminalScreen {
         let visible_start = self.visible_start();
         let current_style = self.current_style.clone();
         if self.normal_screen.is_none() {
-            // 普通屏的清屏会开启一个新的可见页；旧 viewport 保留为 scrollback，
-            // 这样 Codex/CLI 这类普通屏全屏重绘不会把刚输出的历史内容从回放缓存里抹掉。
-            for _ in 0..self.rows {
-                self.push_blank_line_with_style(true, &current_style);
+            // 中文注释：普通屏的 `ED 2` 仍然只清空当前 viewport；只有明确命中的
+            // clear-like 序列才会切断 scrollback，避免把其他合法 `CSI 2J` 都改成
+            // “清历史”语义。
+            for line in self.lines.iter_mut().skip(visible_start) {
+                line.clear_with_style(&current_style);
             }
             return;
         }
         for line in self.lines.iter_mut().skip(visible_start) {
             line.clear_with_style(&current_style);
         }
+    }
+
+    fn clear_screen_and_scrollback(&mut self) {
+        let current_style = self.current_style.clone();
+        let cursor_row = self.cursor_row.min(self.rows - 1);
+        let cursor_col = self.cursor_col.min(self.cols - 1);
+
+        // 中文注释：浏览器上滚时可能触发一次 full snapshot 回源 tmux/daemon。
+        // 如果这里继续把 `CSI 2J` 之前的普通屏内容保留成 scrollback，用户执行
+        // `clear` 后再上滚，旧内容仍会回流。这里直接重建当前 screen buffer，让
+        // clear 成为新的历史边界，同时保留当前样式和光标位置。
+        self.lines.clear();
+        for _ in 0..self.rows {
+            self.push_blank_line_with_style(true, &current_style);
+        }
+        self.cursor_row = cursor_row;
+        self.cursor_col = cursor_col;
     }
 
     fn clear_cached_lines(&mut self) {
@@ -1069,6 +1154,7 @@ impl TerminalScreen {
                 }
                 self.erase_line(1);
             }
+            2 if self.pending_home_clear_cut => self.clear_screen_and_scrollback(),
             2 => self.clear_screen(),
             3 => self.clear_cached_lines(),
             _ => {}
@@ -1679,6 +1765,20 @@ mod tests {
             "snapshot should replay styled blank cells: {snapshot:?}"
         );
         assert!(snapshot.contains("\x1b[48;5;22m  OK"));
+    }
+
+    #[test]
+    fn erase_display_drops_pre_clear_scrollback_from_snapshot() {
+        let mut screen = TerminalScreen::new(3, 8);
+
+        screen.apply(b"alpha\nbeta\n\x1b[H\x1b[2Jafter");
+
+        let snapshot = String::from_utf8(screen.snapshot_bytes()).unwrap();
+        assert!(
+            !snapshot.contains("alpha") && !snapshot.contains("beta"),
+            "clear 之后 snapshot 不应再带回 pre-clear 内容: {snapshot:?}"
+        );
+        assert!(snapshot.contains("after"));
     }
 
     #[test]

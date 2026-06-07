@@ -78,6 +78,7 @@ interface MockDaemonOptions {
   token: string;
   sessions: Array<SessionSummaryPayload & { name?: string | null }>;
   attachOutput?: string;
+  createOutputBeforeResponse?: string;
   attachDelayMs?: number;
   sessionCreateDelayMs?: number;
   routePreludeError?: ErrorPayload;
@@ -351,7 +352,7 @@ export class MockDaemon {
   }
 
   pushSessionDataToAll(sessionId: UUID, text: string): void {
-    // 后台 session 只发 activity 标记，不把未打开 session 的输出内容灌进当前 xterm。
+    // 后台 session 只发 activity 标记，不把未打开 session 的输出内容灌进当前 Ghostty。
     for (const connection of this.connections) {
       if (connection.e2ee && connection.watchedSessionIds.size > 0) {
         void text;
@@ -1303,6 +1304,19 @@ export class MockDaemon {
     });
     connection.attachedSessionIds.add(created.session_id);
     connection.watchedSessionIds.add(created.session_id);
+    if (this.options.createOutputBeforeResponse && connection.activeRequest?.stream_id) {
+      this.appendSessionOutput(created.session_id, this.options.createOutputBeforeResponse);
+      this.sendPacket(connection, {
+        version: PROTOCOL_PACKET_VERSION,
+        kind: "stream_chunk",
+        stream_id: connection.activeRequest.stream_id,
+        seq: 1,
+        payload: {
+          session_id: created.session_id,
+          data_base64: sessionDataToBase64(new TextEncoder().encode(this.options.createOutputBeforeResponse)),
+        } satisfies SessionDataPayload,
+      });
+    }
     this.sendInner(connection, envelope("session_created", created));
     if (this.options.attachOutput) {
       this.appendSessionOutput(created.session_id, this.options.attachOutput);
@@ -1643,7 +1657,7 @@ export class MockDaemon {
     const stream: MockTerminalStream = {
       sessionId: response.session_id,
       streamId: request.stream_id,
-      nextOutputSeq: 1,
+      nextOutputSeq: request.method === "terminal.create" && this.options.createOutputBeforeResponse ? 2 : 1,
       watchUpdates,
     };
     connection.terminalStreamsById.set(stream.streamId, stream);

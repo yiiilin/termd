@@ -23,8 +23,9 @@ use crate::pty::{PtyRestoreInfo, PtySupervisorStatus};
 pub mod client_history;
 
 /// 当前 daemon 状态文件的 schema 版本。
-pub const STATE_SCHEMA_VERSION: u32 = 1;
+pub const STATE_SCHEMA_VERSION: u32 = 2;
 
+const META_STATE_SCHEMA_VERSION: &str = "state_schema_version";
 const META_SERVER_ID: &str = "server_id";
 const META_DAEMON_PUBLIC_KEY: &str = "daemon_public_key";
 const META_DAEMON_PRIVATE_KEY: &str = "daemon_private_key";
@@ -113,6 +114,18 @@ impl Default for DaemonState {
 pub struct StateStore;
 
 impl StateStore {
+    /// 检查当前 SQLite 状态库是否可以按本版本打开。
+    ///
+    /// 中文注释：v2 不迁移旧 supervisor restore state；因此只允许两种情况：
+    /// 1. 已有 `state_schema_version = 2`；
+    /// 2. 真正全空的新库，等待后续 v2 写入口初始化。
+    pub fn ensure_compatible(path: impl AsRef<Path>) -> Result<(), StateError> {
+        let sqlite_path = sqlite_state_path_for_state_path(path.as_ref());
+        let conn = open_state_connection(&sqlite_path)?;
+        initialize_daemon_state_schema(&conn, &sqlite_path)?;
+        ensure_sqlite_state_version(&conn, &sqlite_path)
+    }
+
     /// 从 SQLite 状态库读取 `DaemonState`。
     ///
     /// 旧版本的 `daemon-state.json` 只作为迁移来源读取；SQLite 一旦有 daemon 状态，
@@ -122,6 +135,7 @@ impl StateStore {
         let sqlite_path = sqlite_state_path_for_state_path(path);
         let conn = open_state_connection(&sqlite_path)?;
         initialize_daemon_state_schema(&conn, &sqlite_path)?;
+        ensure_sqlite_state_version(&conn, &sqlite_path)?;
         let state = load_sqlite_state(&conn, &sqlite_path)?;
 
         if state.daemon_identity.is_some()
@@ -141,6 +155,7 @@ impl StateStore {
         let sqlite_path = sqlite_state_path_for_state_path(path.as_ref());
         let mut conn = open_state_connection(&sqlite_path)?;
         initialize_daemon_state_schema(&conn, &sqlite_path)?;
+        ensure_sqlite_state_version(&conn, &sqlite_path)?;
         save_sqlite_state(&mut conn, &sqlite_path, state)
     }
 
@@ -152,6 +167,7 @@ impl StateStore {
         let sqlite_path = sqlite_state_path_for_state_path(path.as_ref());
         let conn = open_state_connection(&sqlite_path)?;
         initialize_daemon_state_schema(&conn, &sqlite_path)?;
+        ensure_sqlite_state_version(&conn, &sqlite_path)?;
         let deleted = conn
             .execute(
                 "DELETE FROM runtime_sessions WHERE session_id = ?1 AND state = ?2",
@@ -177,6 +193,7 @@ impl StateStore {
         let sqlite_path = sqlite_state_path_for_state_path(path.as_ref());
         let conn = open_state_connection(&sqlite_path)?;
         initialize_daemon_state_schema(&conn, &sqlite_path)?;
+        ensure_sqlite_state_version(&conn, &sqlite_path)?;
         let updated = conn
             .execute(
                 r#"
@@ -206,6 +223,7 @@ impl StateStore {
         let sqlite_path = sqlite_state_path_for_state_path(path.as_ref());
         let mut conn = open_state_connection(&sqlite_path)?;
         initialize_daemon_state_schema(&conn, &sqlite_path)?;
+        ensure_sqlite_state_version(&conn, &sqlite_path)?;
         prune_closed_runtime_sessions_except(&mut conn, &sqlite_path, protected_session_ids)
     }
 
@@ -215,6 +233,7 @@ impl StateStore {
         let sqlite_path = sqlite_state_path_for_state_path(path.as_ref());
         let conn = open_state_connection(&sqlite_path)?;
         initialize_daemon_state_schema(&conn, &sqlite_path)?;
+        ensure_sqlite_state_version(&conn, &sqlite_path)?;
         list_http_uploads(&conn, &sqlite_path)
     }
 
@@ -225,6 +244,8 @@ impl StateStore {
         let sqlite_path = sqlite_state_path_for_state_path(path.as_ref());
         let conn = open_state_connection(&sqlite_path)?;
         initialize_daemon_state_schema(&conn, &sqlite_path)?;
+        ensure_sqlite_state_version(&conn, &sqlite_path)?;
+        write_sqlite_state_version(&conn, &sqlite_path)?;
         conn.execute(
             r#"
             INSERT INTO http_uploads (
@@ -260,6 +281,7 @@ impl StateStore {
         let sqlite_path = sqlite_state_path_for_state_path(path.as_ref());
         let conn = open_state_connection(&sqlite_path)?;
         initialize_daemon_state_schema(&conn, &sqlite_path)?;
+        ensure_sqlite_state_version(&conn, &sqlite_path)?;
         let deleted = conn
             .execute(
                 "DELETE FROM http_uploads WHERE upload_id = ?1",
@@ -293,6 +315,11 @@ pub enum StateError {
     InvalidDaemonIdentity {
         source: String,
     },
+    IncompatibleVersion {
+        path: PathBuf,
+        found: Option<u32>,
+        expected: u32,
+    },
 }
 
 impl fmt::Display for StateError {
@@ -315,6 +342,22 @@ impl fmt::Display for StateError {
                 write!(f, "failed to access sqlite store at {}", path.display())
             }
             Self::InvalidDaemonIdentity { .. } => write!(f, "failed to restore daemon identity"),
+            Self::IncompatibleVersion {
+                path,
+                found,
+                expected,
+            } => match found {
+                Some(found) => write!(
+                    f,
+                    "daemon state at {} uses schema version {found}, expected {expected}; reset state before using the tmux backend",
+                    path.display()
+                ),
+                None => write!(
+                    f,
+                    "daemon state at {} was created before schema version {expected}; reset state before using the tmux backend",
+                    path.display()
+                ),
+            },
         }
     }
 }
@@ -325,7 +368,7 @@ impl Error for StateError {
             Self::Parse { source, .. } => Some(source),
             Self::Read { source, .. } | Self::CreateDirectory { source, .. } => Some(source),
             Self::Sqlite { source, .. } => Some(source),
-            Self::InvalidDaemonIdentity { .. } => None,
+            Self::InvalidDaemonIdentity { .. } | Self::IncompatibleVersion { .. } => None,
         }
     }
 }
@@ -356,7 +399,11 @@ fn load_legacy_json_state(
     }
 
     match fs::read_to_string(path) {
-        Ok(raw) => parse_json(path, &raw).map(Some),
+        Ok(raw) => {
+            let state: DaemonState = parse_json(path, &raw)?;
+            ensure_state_version(path, state.version)?;
+            Ok(Some(state))
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(source) => Err(StateError::Read {
             path: path.to_path_buf(),
@@ -368,6 +415,96 @@ fn load_legacy_json_state(
 fn open_state_connection(sqlite_path: &Path) -> Result<Connection, StateError> {
     ensure_parent_directory(sqlite_path)?;
     Connection::open(sqlite_path).map_err(|source| sqlite_error(sqlite_path, source))
+}
+
+fn ensure_state_version(path: &Path, found: u32) -> Result<(), StateError> {
+    if found == STATE_SCHEMA_VERSION {
+        return Ok(());
+    }
+
+    Err(StateError::IncompatibleVersion {
+        path: path.to_path_buf(),
+        found: Some(found),
+        expected: STATE_SCHEMA_VERSION,
+    })
+}
+
+fn ensure_sqlite_state_version(conn: &Connection, path: &Path) -> Result<(), StateError> {
+    let schema_version = read_meta_value(conn, path, META_STATE_SCHEMA_VERSION)?;
+    match schema_version {
+        Some(raw) => {
+            let found = raw.parse::<u32>().map_err(|source| StateError::Sqlite {
+                path: path.to_path_buf(),
+                source: rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(source)),
+            })?;
+            ensure_state_version(path, found)
+        }
+        None if sqlite_state_has_content(conn, path)? => Err(StateError::IncompatibleVersion {
+            path: path.to_path_buf(),
+            found: None,
+            expected: STATE_SCHEMA_VERSION,
+        }),
+        None => Ok(()),
+    }
+}
+
+fn sqlite_state_has_content(conn: &Connection, path: &Path) -> Result<bool, StateError> {
+    for (table, where_clause) in [
+        (
+            "daemon_meta",
+            Some("key <> 'state_schema_version'".to_owned()),
+        ),
+        ("trusted_devices", None),
+        ("runtime_sessions", None),
+        ("http_uploads", None),
+        ("daemon_clients", None),
+        ("daemon_client_attached_sessions", None),
+        ("daemon_sessions", None),
+    ] {
+        if sqlite_table_row_count(conn, path, table, where_clause.as_deref())? > 0 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn sqlite_table_row_count(
+    conn: &Connection,
+    path: &Path,
+    table: &str,
+    where_clause: Option<&str>,
+) -> Result<u64, StateError> {
+    let exists = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            params![table],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|source| sqlite_error(path, source))?
+        .is_some();
+    if !exists {
+        return Ok(0);
+    }
+
+    let sql = match where_clause {
+        Some(where_clause) => format!("SELECT COUNT(*) FROM {table} WHERE {where_clause}"),
+        None => format!("SELECT COUNT(*) FROM {table}"),
+    };
+    let count = conn
+        .query_row(&sql, [], |row| row.get::<_, i64>(0))
+        .map_err(|source| sqlite_error(path, source))?;
+    Ok(count.max(0) as u64)
+}
+
+fn write_sqlite_state_version(conn: &Connection, path: &Path) -> Result<(), StateError> {
+    upsert_meta_value(
+        conn,
+        path,
+        META_STATE_SCHEMA_VERSION,
+        &STATE_SCHEMA_VERSION.to_string(),
+        current_unix_timestamp_millis().0 as i64,
+    )
 }
 
 fn initialize_daemon_state_schema(conn: &Connection, path: &Path) -> Result<(), StateError> {
@@ -589,10 +726,22 @@ fn save_sqlite_state(
     path: &Path,
     state: &DaemonState,
 ) -> Result<(), StateError> {
+    ensure_state_version(path, state.version)?;
+
     let now_ms = current_unix_timestamp_millis().0 as i64;
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|source| sqlite_error(path, source))?;
+
+    // 中文注释：v2 开始进入 tmux 作为 session 真相源的重构阶段；旧 supervisor
+    // restore state 不能静默复用，所以每次保存都写入显式 schema 版本。
+    upsert_meta_value(
+        &tx,
+        path,
+        META_STATE_SCHEMA_VERSION,
+        &state.version.to_string(),
+        now_ms,
+    )?;
 
     match &state.daemon_identity {
         Some(identity) => {
@@ -858,6 +1007,22 @@ fn serialize_restore_info(
                 ),
             )
         }
+        Some(PtyRestoreInfo::Tmux {
+            socket_path,
+            session_name,
+        }) => {
+            let value = SerializedTmuxRestoreInfo {
+                socket_path: socket_path.clone(),
+                session_name: session_name.clone(),
+            };
+            (
+                Some("tmux"),
+                Some(
+                    serde_json::to_string(&value)
+                        .expect("tmux restore info should always serialize"),
+                ),
+            )
+        }
         None => (None, None),
     }
 }
@@ -867,6 +1032,12 @@ struct SerializedUnixSocketRestoreInfo {
     socket_path: PathBuf,
     supervisor_pid: u32,
     supervisor_status: PtySupervisorStatus,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SerializedTmuxRestoreInfo {
+    socket_path: PathBuf,
+    session_name: String,
 }
 
 fn parse_restore_info(
@@ -884,6 +1055,16 @@ fn parse_restore_info(
                 socket_path: value.socket_path,
                 supervisor_pid: value.supervisor_pid,
                 supervisor_status: value.supervisor_status,
+            }))
+        }
+        (Some("tmux"), Some(raw_value)) => {
+            let value: SerializedTmuxRestoreInfo =
+                serde_json::from_str(&raw_value).map_err(|source| {
+                    rusqlite::Error::FromSqlConversionFailure(9, Type::Text, Box::new(source))
+                })?;
+            Ok(Some(PtyRestoreInfo::Tmux {
+                socket_path: value.socket_path,
+                session_name: value.session_name,
             }))
         }
         (kind, value) => Err(rusqlite::Error::FromSqlConversionFailure(
@@ -1114,6 +1295,100 @@ mod tests {
             sqlite_state.trusted_devices
         );
         assert_eq!(loaded_from_sqlite.sessions, sqlite_state.sessions);
+        cleanup_state_paths(&state_path);
+    }
+
+    #[test]
+    fn old_legacy_json_state_is_rejected_after_tmux_schema_bump() {
+        let state_path = temp_path("old-legacy-state.json");
+        let mut legacy_state = sample_state();
+        legacy_state.version = 1;
+
+        fs::write(
+            &state_path,
+            serde_json::to_string_pretty(&legacy_state).unwrap(),
+        )
+        .unwrap();
+
+        let error = StateStore::load(&state_path).unwrap_err();
+
+        assert!(matches!(
+            error,
+            StateError::IncompatibleVersion {
+                found: Some(1),
+                expected: STATE_SCHEMA_VERSION,
+                ..
+            }
+        ));
+        cleanup_state_paths(&state_path);
+    }
+
+    #[test]
+    fn old_sqlite_state_without_schema_meta_is_rejected_when_it_has_content() {
+        let state_path = temp_path("old-sqlite-state.json");
+        let sqlite_path = sqlite_state_path_for_state_path(&state_path);
+        let conn = open_state_connection(&sqlite_path).unwrap();
+        initialize_daemon_state_schema(&conn, &sqlite_path).unwrap();
+        conn.execute(
+            r#"
+            INSERT INTO trusted_devices (
+                device_id,
+                public_key,
+                trusted_at_ms,
+                last_seen_at_ms,
+                label
+            )
+            VALUES (?1, ?2, ?3, NULL, NULL)
+            "#,
+            params![DeviceId::new().0.to_string(), "device-public", 1_i64],
+        )
+        .unwrap();
+        conn.execute(
+            r#"
+            INSERT INTO runtime_sessions (
+                session_id,
+                state,
+                rows,
+                cols,
+                pixel_width,
+                pixel_height,
+                created_at_ms,
+                updated_at_ms,
+                restore_kind,
+                restore_value
+            )
+            VALUES (?1, 'running', 24, 80, 0, 0, 1, 1, 'unix_socket', '{}')
+            "#,
+            params![SessionId::new().0.to_string()],
+        )
+        .unwrap();
+        conn.execute(
+            r#"
+            INSERT INTO http_uploads (
+                upload_id,
+                target_path,
+                size_bytes,
+                dev,
+                ino,
+                updated_at_ms
+            )
+            VALUES ('upload-old', '/tmp/target.bin', '1', '1', '1', 1)
+            "#,
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let error = StateStore::load(&state_path).unwrap_err();
+
+        assert!(matches!(
+            error,
+            StateError::IncompatibleVersion {
+                found: None,
+                expected: STATE_SCHEMA_VERSION,
+                ..
+            }
+        ));
         cleanup_state_paths(&state_path);
     }
 

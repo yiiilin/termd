@@ -74,6 +74,98 @@ test("浏览器通过真实 relay 连接 daemon 完成 pairing 和 session list"
   }
 });
 
+test("真实 relay 下 clear 之后上滚不会再看到 pre-clear 历史", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name === "mobile-chrome", "clear/scrollback 回归先覆盖桌面布局");
+  const fixture = await startRealRelayFixture();
+  const createdNames: string[] = [];
+
+  try {
+    await enableTermdDiagnostics(page);
+    await page.goto("/");
+    await page.getByLabel("WS URL").fill(fixture.relayClientUrl);
+    await page.getByLabel("Pairing token").fill(pairingInviteCode(fixture));
+    await page.getByRole("button", { name: "Pair" }).click();
+    await expect(page.getByLabel("Pairing token")).toBeHidden();
+    await expect(page.getByText("No sessions")).toBeVisible();
+
+    const name = await createShellSession(page, createdNames);
+    createdNames.push(name);
+    await runTerminalCommand(
+      page,
+      "for i in $(seq 1 80); do printf 'pre-clear-%03d\\n' \"$i\"; done; clear; for i in $(seq 1 120); do printf 'post-clear-%03d\\n' \"$i\"; done; printf 'clear-scroll-ready\\n'",
+    );
+    await expectTerminalLine(page, "clear-scroll-ready", 20_000);
+    await resetTermdDiagnostics(page);
+
+    const terminalPane = page.getByTestId("terminal-pane");
+    await terminalPane.hover();
+    for (let index = 0; index < 10; index += 1) {
+      await page.mouse.wheel(0, -1200);
+      await page.waitForTimeout(80);
+    }
+
+    await expect
+      .poll(async () => terminalViewportState(page).then((state) => state.viewportRaw), { timeout: 10_000 })
+      .toBeGreaterThan(0);
+    await expect
+      .poll(async () => terminalDebugBufferText(page), { timeout: 10_000 })
+      .toContain("post-clear-001");
+    await expect
+      .poll(
+        async () =>
+          page.evaluate(() =>
+            ((globalThis as { __TERMD_DIAG_EVENTS__?: Array<{ name?: string; fields?: { reason?: string } }> })
+              .__TERMD_DIAG_EVENTS__ ?? []
+            ).filter((event) =>
+              event.name === "receive_loop_terminal_snapshot",
+            ),
+          ),
+        { timeout: 10_000 },
+      )
+      .toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            name: "receive_loop_terminal_snapshot",
+            fields: expect.objectContaining({ revealHistory: true }),
+          }),
+        ]),
+      );
+
+    const scrolledViewport = await terminalDebugBufferText(page);
+    expect(scrolledViewport).not.toContain("pre-clear-001");
+    expect(scrolledViewport).not.toContain("pre-clear-080");
+    const selectedViewportText = await page.evaluate(() => {
+      const bridge = (window as typeof window & {
+        __TERMD_DEBUG_GHOSTTY__?: {
+          selectViewportRange: (
+            start: { col: number; row: number },
+            end: { col: number; row: number },
+          ) => string | undefined;
+          getSelection: () => string;
+        };
+      }).__TERMD_DEBUG_GHOSTTY__;
+      if (!bridge) {
+        return "";
+      }
+      return (
+        bridge.selectViewportRange({ col: 0, row: 0 }, { col: 23, row: 5 }) ??
+        bridge.getSelection()
+      );
+    });
+    expect(selectedViewportText).toContain("post-clear-001");
+    expect(selectedViewportText).not.toContain("pre-clear-001");
+    expect(selectedViewportText).not.toContain("pre-clear-080");
+  } finally {
+    await testInfo.attach("real-relay-fixture.log", {
+      body: fixture.diagnostics(),
+      contentType: "text/plain",
+    });
+    await attachTermdDiagnostics(testInfo, "clear-scroll", page);
+    await closeCreatedSessions(page, createdNames);
+    await fixture.stop();
+  }
+});
+
 test("真实 relay 下多个大输出 session 快速切换后仍能恢复和输入", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name === "mobile-chrome", "压力回归只需要桌面布局覆盖真实 relay 链路");
   const fixture = await startRealRelayFixture();
@@ -512,8 +604,8 @@ test("relay Web 在 daemon relay 短暂冻结恢复后仍能输入", async ({ pa
   }
 });
 
-test("relay Web 放大终端后输入锚点仍跟随底部光标", async ({ page }, testInfo) => {
-  test.skip(testInfo.project.name === "mobile-chrome", "桌面回归即可覆盖 xterm resize 后的输入锚点");
+test("relay Web 放大终端后 Ghostty canvas 和输入仍可用", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name === "mobile-chrome", "桌面回归即可覆盖 Ghostty resize 后的输入路径");
   test.setTimeout(90_000);
   const fixture = await startRealRelayFixture();
   const createdNames: string[] = [];
@@ -528,43 +620,24 @@ test("relay Web 放大终端后输入锚点仍跟随底部光标", async ({ page
 
     const name = await createShellSession(page, createdNames);
     createdNames.push(name);
-    const terminalPane = page.getByTestId("terminal-pane");
     await runTerminalCommand(
       page,
       `for i in $(seq 1 100); do printf '${marker(name)}-anchor-%03d\\n' "$i"; done; printf '${marker(name)}-anchor-ready\\n'`,
     );
     await expectTerminalLine(page, `${marker(name)}-anchor-ready`, 20_000);
 
-    const beforeResize = await terminalCursorAnchorMetrics(page);
-    expect(beforeResize.rowCount).toBeGreaterThan(0);
-    expect(Math.abs(beforeResize.helperTop - beforeResize.lastRowTop)).toBeLessThan(24);
-    expect(beforeResize.cursorTop).not.toBeNull();
-    expect(Math.abs((beforeResize.cursorTop ?? 0) - beforeResize.lastRowTop)).toBeLessThan(24);
+    const beforeResize = await terminalCanvasMetrics(page);
+    expect(beforeResize.canvasCssHeight).toBeGreaterThan(0);
+    expect(beforeResize.canvasPixelHeight).toBeGreaterThan(0);
+    expect(beforeResize.inputAttached).toBe(true);
+    await expectTerminalCanvasPainted(page);
 
     await page.setViewportSize({ width: 1366, height: 960 });
     await expect
-      .poll(async () => (await terminalCursorAnchorMetrics(page)).rowCount, { timeout: 20_000 })
-      .toBeGreaterThan(beforeResize.rowCount);
-    await expect
-      .poll(async () => {
-        const metrics = await terminalCursorAnchorMetrics(page);
-        return Math.abs(metrics.helperTop - metrics.lastRowTop);
-      }, { timeout: 20_000 })
-      .toBeLessThan(24);
-    await expect
-      .poll(async () => {
-        const metrics = await terminalCursorAnchorMetrics(page);
-        return metrics.cursorTop === null ? Number.POSITIVE_INFINITY : Math.abs(metrics.cursorTop - metrics.lastRowTop);
-      }, { timeout: 20_000 })
-      .toBeLessThan(24);
-
-    const afterResize = await terminalCursorAnchorMetrics(page);
-    // 中文注释：放大 terminal 后最后一行已经落到底部时，xterm 的隐藏输入 textarea
-    // 和可见光标都必须同步到底部；否则用户会看到光标停在中间，但输入实际落在另一行。
-    expect(afterResize.lastRowTop).toBeGreaterThan(beforeResize.lastRowTop + 200);
-    expect(Math.abs(afterResize.helperTop - afterResize.lastRowTop)).toBeLessThan(24);
-    expect(afterResize.cursorTop).not.toBeNull();
-    expect(Math.abs((afterResize.cursorTop ?? 0) - afterResize.lastRowTop)).toBeLessThan(24);
+      .poll(async () => (await terminalCanvasMetrics(page)).canvasCssHeight, { timeout: 20_000 })
+      .toBeGreaterThan(beforeResize.canvasCssHeight + 200);
+    await waitForTerminalCanvasStable(page);
+    await expect(page.getByRole("textbox", { name: "Terminal input" })).toBeAttached({ timeout: 8_000 });
     await runTerminalCommand(page, `printf '${marker(name)}-anchor-post-resize\\n'`);
     await expectTerminalLine(page, `${marker(name)}-anchor-post-resize`, 10_000);
   } finally {
@@ -577,8 +650,8 @@ test("relay Web 放大终端后输入锚点仍跟随底部光标", async ({ page
   }
 });
 
-test("relay Web 短输出放大后输入锚点不会误贴到底部", async ({ page }, testInfo) => {
-  test.skip(testInfo.project.name === "mobile-chrome", "桌面回归即可覆盖 xterm resize 边界");
+test("relay Web 短输出放大后 Ghostty 输入仍落入当前 session", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name === "mobile-chrome", "桌面回归即可覆盖 Ghostty resize 边界");
   test.setTimeout(90_000);
   const fixture = await startRealRelayFixture();
   const createdNames: string[] = [];
@@ -593,38 +666,26 @@ test("relay Web 短输出放大后输入锚点不会误贴到底部", async ({ p
 
     const name = await createShellSession(page, createdNames);
     createdNames.push(name);
-    const smallViewport = await terminalCursorAnchorMetrics(page);
-    const lineCount = smallViewport.rowCount + 6;
+    const smallViewport = await terminalCanvasMetrics(page);
+    const lineCount = Math.max(10, Math.floor(smallViewport.canvasCssHeight / 18) + 6);
     await runTerminalCommand(
       page,
       `for i in $(seq 1 ${lineCount}); do printf '${marker(name)}-short-%02d\\n' "$i"; done; printf '${marker(name)}-short-ready\\n'`,
     );
     await expectTerminalLine(page, `${marker(name)}-short-ready`, 20_000);
 
-    const beforeResize = await terminalCursorAnchorMetrics(page);
-    // 中文注释：这里先用“小视口行数 + 少量冗余”制造一个只够填满小窗口、
-    // 但还不够填满放大后大窗口的真实边界。
-    expect(Math.abs(beforeResize.helperTop - beforeResize.lastRowTop)).toBeLessThan(24);
-    expect(beforeResize.cursorTop).not.toBeNull();
-    expect(Math.abs((beforeResize.cursorTop ?? 0) - beforeResize.lastRowTop)).toBeLessThan(24);
+    const beforeResize = await terminalCanvasMetrics(page);
+    expect(beforeResize.inputAttached).toBe(true);
 
     await page.setViewportSize({ width: 1366, height: 960 });
     await expect
-      .poll(async () => (await terminalCursorAnchorMetrics(page)).rowCount, { timeout: 20_000 })
-      .toBeGreaterThan(beforeResize.rowCount);
+      .poll(async () => (await terminalCanvasMetrics(page)).canvasCssHeight, { timeout: 20_000 })
+      .toBeGreaterThan(smallViewport.canvasCssHeight + 200);
     await page.getByRole("textbox", { name: "Terminal input" }).focus();
-    await expect
-      .poll(async () => (await terminalCursorAnchorMetrics(page)).cursorTop, { timeout: 20_000 })
-      .not.toBeNull();
 
-    const afterResize = await terminalCursorAnchorMetrics(page);
-    // 中文注释：这里输出不足以填满放大后的 viewport，真实光标应留在原先那一屏附近，
-    // 不能因为“辅助贴底模式”而被错误拉到最后一行。
-    expect(afterResize.lastRowTop).toBeGreaterThan(beforeResize.lastRowTop + 300);
-    expect(afterResize.helperTop).toBeLessThan(afterResize.lastRowTop - 120);
-    expect(afterResize.cursorTop).not.toBeNull();
-    expect(Math.abs((afterResize.cursorTop ?? 0) - afterResize.helperTop)).toBeLessThan(24);
-    expect((afterResize.cursorTop ?? 0)).toBeLessThan(afterResize.lastRowTop - 120);
+    const afterResize = await terminalCanvasMetrics(page);
+    expect(afterResize.inputAttached).toBe(true);
+    expect(afterResize.canvasPixelHeight).toBeGreaterThan(beforeResize.canvasPixelHeight);
     await runTerminalCommand(page, `printf '${marker(name)}-short-post-resize\\n'`);
     await expectTerminalLine(page, `${marker(name)}-short-post-resize`, 10_000);
   } finally {
@@ -637,8 +698,8 @@ test("relay Web 短输出放大后输入锚点不会误贴到底部", async ({ p
   }
 });
 
-test("relay Web 满屏新会话连续回车后光标锚点仍贴底", async ({ page }, testInfo) => {
-  test.skip(testInfo.project.name === "mobile-chrome", "桌面回归即可覆盖满屏 xterm 光标贴底场景");
+test("relay Web 满屏新会话连续回车后 Ghostty 仍保持可输入", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name === "mobile-chrome", "桌面回归即可覆盖满屏 Ghostty 输入场景");
   test.setTimeout(90_000);
   const fixture = await startRealRelayFixture();
   const createdNames: string[] = [];
@@ -659,25 +720,14 @@ test("relay Web 满屏新会话连续回车后光标锚点仍贴底", async ({ p
     for (let index = 0; index < 100; index += 1) {
       await page.keyboard.press("Enter");
     }
-    await expect
-      .poll(async () => {
-        const metrics = await terminalCursorAnchorMetrics(page);
-        return Math.abs(metrics.helperTop - metrics.lastRowTop);
-      }, { timeout: 20_000 })
-      .toBeLessThan(24);
-    await expect
-      .poll(async () => {
-        const metrics = await terminalCursorAnchorMetrics(page);
-        return metrics.cursorTop === null ? Number.POSITIVE_INFINITY : Math.abs(metrics.cursorTop - metrics.lastRowTop);
-      }, { timeout: 20_000 })
-      .toBeLessThan(24);
-    const metrics = await terminalCursorAnchorMetrics(page);
+    await runTerminalCommand(page, `printf '${marker(name)}-enter-post-input-ok\\n'`);
+    await expectTerminalLine(page, `${marker(name)}-enter-post-input-ok`, 20_000);
+    const metrics = await terminalCanvasMetrics(page);
     // 中文注释：这是用户手工复现路径：新会话在满屏高度下连续回车后，
-    // 不做任何额外点击/命令输入，直接检查隐藏输入框和光标 DOM 是否仍落在最后一行。
-    expect(metrics.rowCount).toBeGreaterThan(40);
-    expect(Math.abs(metrics.helperTop - metrics.lastRowTop)).toBeLessThan(24);
-    expect(metrics.cursorTop).not.toBeNull();
-    expect(Math.abs((metrics.cursorTop ?? 0) - metrics.lastRowTop)).toBeLessThan(24);
+    // 不做任何额外重连，直接验证 Ghostty canvas 仍在渲染且隐藏输入框仍可接收输入。
+    expect(metrics.canvasCssHeight).toBeGreaterThan(500);
+    expect(metrics.inputAttached).toBe(true);
+    await expectTerminalCanvasPainted(page);
   } finally {
     await testInfo.attach("real-relay-fixture.log", {
       body: fixture.diagnostics(),
@@ -1248,14 +1298,19 @@ async function expectReadUtf8At(handle: FileHandle, offset: number, expected: st
 }
 
 async function expectTerminalLine(page: Page, text: string, timeout: number): Promise<void> {
-  // xterm 会同时显示命令回显和命令输出；压力测试只关心最终输出行，
-  // 这里必须用精确文本，避免 strict locator 被命令回显里的子串干扰。
-  await expect(terminalPane(page).getByText(text, { exact: true })).toBeVisible({ timeout });
+  // 中文注释：Ghostty 使用 canvas 渲染终端文本，Playwright 不能直接用 DOM
+  // 文本定位。只有显式 E2E build 会把当前 buffer 镜像到 data-termd-buffer；
+  // 普通 production build 不暴露这个明文快照。
+  await expect
+    .poll(async () => terminalDebugBufferText(page), { timeout })
+    .toContain(text);
 }
 
 async function expectTerminalLineMatching(page: Page, pattern: RegExp, timeout: number): Promise<void> {
   // 中文注释：持续输出期间具体行号会受网络和重连时机影响；正则只用于确认终端流仍在推进。
-  await expect(terminalPane(page).getByText(pattern).first()).toBeVisible({ timeout });
+  await expect
+    .poll(async () => terminalDebugBufferText(page), { timeout })
+    .toMatch(pattern);
 }
 
 async function expectTerminalScrollAtBottom(page: Page): Promise<void> {
@@ -1269,31 +1324,79 @@ async function expectTerminalScrollAtBottom(page: Page): Promise<void> {
     .toBe(true);
 }
 
-async function terminalCursorAnchorMetrics(page: Page): Promise<{
-  helperTop: number;
-  lastRowTop: number;
-  cursorTop: number | null;
-  rowCount: number;
+async function terminalViewportState(page: Page): Promise<{ viewportRaw: number; scrollbackLength: number }> {
+  return page.locator(".terminal-host").evaluate((host) => ({
+    viewportRaw: Number.parseFloat((host as HTMLElement).dataset.termdViewportYRaw ?? "0") || 0,
+    scrollbackLength: Number.parseFloat((host as HTMLElement).dataset.termdScrollbackLength ?? "0") || 0,
+  }));
+}
+
+async function terminalDebugBufferText(page: Page): Promise<string> {
+  return page.locator(".terminal-host").evaluate((host) => (host as HTMLElement).dataset.termdBuffer ?? "");
+}
+
+async function expectTerminalCanvasPainted(page: Page): Promise<void> {
+  await expect
+    .poll(async () => {
+      return page.locator(".terminal-host canvas").evaluate((canvas) => {
+        const typedCanvas = canvas as HTMLCanvasElement;
+        const context = typedCanvas.getContext("2d");
+        if (!context || typedCanvas.width <= 0 || typedCanvas.height <= 0) {
+          return 0;
+        }
+        const sampleWidth = Math.min(typedCanvas.width, 240);
+        const sampleHeight = Math.min(typedCanvas.height, 160);
+        const pixels = context.getImageData(0, 0, sampleWidth, sampleHeight).data;
+        let painted = 0;
+        for (let index = 3; index < pixels.length; index += 4) {
+          if (pixels[index] !== 0) {
+            painted += 1;
+          }
+        }
+        return painted;
+      });
+    }, { timeout: 20_000 })
+    .toBeGreaterThan(0);
+}
+
+async function terminalCanvasMetrics(page: Page): Promise<{
+  canvasCssHeight: number;
+  canvasPixelHeight: number;
+  inputAttached: boolean;
 }> {
   return page.locator(".terminal-host").evaluate((host) => {
-    const helper = host.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
-    const cursor = host.querySelector<HTMLElement>(".xterm-cursor");
-    const rows = Array.from(host.querySelectorAll<HTMLElement>(".xterm-rows > div"));
-    if (!helper || rows.length === 0) {
-      throw new Error("terminal helper textarea or rendered rows are missing");
+    const canvas = host.querySelector<HTMLCanvasElement>("canvas");
+    const input = host.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
+    if (!canvas) {
+      throw new Error("Ghostty canvas is missing");
     }
-    const hostRect = host.getBoundingClientRect();
-    const lastRowRect = rows.at(-1)?.getBoundingClientRect();
-    if (!lastRowRect) {
-      throw new Error("terminal last row is missing");
-    }
+    const canvasRect = canvas.getBoundingClientRect();
     return {
-      helperTop: helper.getBoundingClientRect().top - hostRect.top,
-      lastRowTop: lastRowRect.top - hostRect.top,
-      cursorTop: cursor ? cursor.getBoundingClientRect().top - hostRect.top : null,
-      rowCount: rows.length,
+      canvasCssHeight: canvasRect.height,
+      canvasPixelHeight: canvas.height,
+      inputAttached: Boolean(input),
     };
   });
+}
+
+async function waitForTerminalCanvasStable(page: Page): Promise<void> {
+  const deadline = Date.now() + 5_000;
+  let lastHeight = -1;
+  let stableSamples = 0;
+  while (Date.now() < deadline) {
+    const { canvasCssHeight } = await terminalCanvasMetrics(page);
+    if (Math.abs(canvasCssHeight - lastHeight) < 1) {
+      stableSamples += 1;
+      if (stableSamples >= 3) {
+        return;
+      }
+    } else {
+      lastHeight = canvasCssHeight;
+      stableSamples = 0;
+    }
+    await page.waitForTimeout(100);
+  }
+  throw new Error("terminal canvas did not settle after viewport resize");
 }
 
 async function createShellSession(page: Page, existingNames: string[]): Promise<string> {
@@ -1333,20 +1436,26 @@ async function openSession(page: Page, name: string): Promise<void> {
 }
 
 async function runTerminalCommand(page: Page, command: string): Promise<void> {
-  await terminalPane(page).click();
-  const input = page.getByRole("textbox", { name: "Terminal input" });
-  await expect(input).toBeAttached({ timeout: 8_000 });
-  await input.focus();
-  await page.keyboard.insertText(command);
+  await focusTerminalForKeyboard(page);
+  // 中文注释：Ghostty canvas 终端依赖真实 keydown/input 路径；insertText 只改活动
+  // contenteditable/textarea，聚焦到 renderer host 时不会稳定进入 PTY。
+  await page.keyboard.type(command, { delay: 1 });
   await page.keyboard.press("Enter");
 }
 
 async function interruptTerminalCommand(page: Page): Promise<void> {
-  await terminalPane(page).click();
-  const input = page.getByRole("textbox", { name: "Terminal input" });
-  await expect(input).toBeAttached({ timeout: 8_000 });
-  await input.focus();
+  await focusTerminalForKeyboard(page);
   await page.keyboard.press("Control+C");
+}
+
+async function focusTerminalForKeyboard(page: Page): Promise<void> {
+  await page.locator(".terminal-frame").click();
+  await expect(page.getByRole("textbox", { name: "Terminal input" })).toBeAttached({ timeout: 8_000 });
+  await page.locator(".terminal-host").evaluate((host) => {
+    const input = host.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
+    // 中文注释：aria-hidden 只避免重复暴露给辅助技术；Ghostty 的真实键盘输入仍锚定在这个 textarea。
+    input?.focus();
+  });
 }
 
 async function closeCreatedSessions(page: Page, names: string[]): Promise<void> {

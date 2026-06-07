@@ -8156,19 +8156,30 @@ mod tests {
             decode_payload(created.payload).unwrap();
 
         // relay client 不再发送 ping 或任何业务帧；daemon mux 必须像直连 WebSocket 一样主动推送。
-        let pushed = tokio::time::timeout(
-            Duration::from_secs(2),
-            read_encrypted_daemon_frame(&mut relay_socket, client_id, &mut device_e2ee),
-        )
-        .await
-        .expect("relay mux should push PTY output without client pull frames");
-        assert_eq!(pushed.kind, MessageType::SessionData);
-        let payload: termd_proto::SessionDataPayload = decode_payload(pushed.payload).unwrap();
-        assert_eq!(payload.session_id, created_payload.session_id);
-        let output = general_purpose::STANDARD
-            .decode(payload.data_base64)
-            .unwrap();
-        assert_eq!(output, b"relay-pushed-output");
+        let mut pushed_output = Vec::new();
+        let push_deadline = Instant::now() + Duration::from_secs(2);
+        while !pushed_output
+            .windows(b"relay-pushed-output".len())
+            .any(|window| window == b"relay-pushed-output")
+        {
+            let remaining = push_deadline.saturating_duration_since(Instant::now());
+            let pushed = tokio::time::timeout(
+                remaining,
+                read_encrypted_daemon_frame(&mut relay_socket, client_id, &mut device_e2ee),
+            )
+            .await
+            .expect("relay mux should push PTY output without client pull frames");
+            if pushed.kind != MessageType::SessionData {
+                continue;
+            }
+            let payload: termd_proto::SessionDataPayload = decode_payload(pushed.payload).unwrap();
+            assert_eq!(payload.session_id, created_payload.session_id);
+            pushed_output.extend(
+                general_purpose::STANDARD
+                    .decode(payload.data_base64)
+                    .unwrap(),
+            );
+        }
 
         connector.abort();
     }

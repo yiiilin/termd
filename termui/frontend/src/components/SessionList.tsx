@@ -14,6 +14,7 @@ interface SessionListProps {
   sessions: SessionSummaryPayload[];
   selectedSessionId?: UUID;
   newOutputSessionIds?: ReadonlySet<UUID>;
+  creating?: boolean;
   renamingSessionId?: UUID;
   renameDraft: string;
   canSaveRename: boolean;
@@ -150,7 +151,8 @@ export function SessionList(props: SessionListProps) {
 
   return (
     <section className="session-list" aria-label={t("sessions.aria")}>
-      {props.sessions.length === 0 ? <div className="empty-list">{t("sessions.empty")}</div> : null}
+      {props.sessions.length === 0 && !props.creating ? <div className="empty-list">{t("sessions.empty")}</div> : null}
+      {props.sessions.length === 0 && props.creating ? <div className="empty-list">{t("sessions.creating")}</div> : null}
       {props.sessions.map((session) => {
         const displayName = sessionDisplayName(session);
         const isRenaming = props.renamingSessionId === session.session_id;

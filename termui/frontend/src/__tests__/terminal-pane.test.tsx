@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { TerminalPane, type TerminalOutputItem } from "../components/TerminalPane";
@@ -123,6 +125,12 @@ function renderTerminalPaneWithOutput(items: TerminalOutputItem[], options: {
   );
 }
 
+function terminalHost(): HTMLElement {
+  const host = screen.getByTestId("terminal-pane").querySelector<HTMLElement>(".terminal-host");
+  expect(host).not.toBeNull();
+  return host!;
+}
+
 function deferred<T>() {
   let resolve!: (value: T) => void;
   let reject!: (reason?: unknown) => void;
@@ -148,6 +156,54 @@ function searchResult(query: string, matchCount: number): SessionSearchResultPay
 }
 
 describe("TerminalPane terminal sequence rendering", () => {
+  it("TerminalPane 不直接绑定 Ghostty 私有 DOM 或具体 renderer import", () => {
+    const source = readFileSync(resolve(process.cwd(), "src/components/TerminalPane.tsx"), "utf8");
+
+    expect(source).not.toContain("@Ghostty/");
+    const legacyGhosttyWrapperSelector = [".ghostty", "terminal"].join("-");
+    expect(source).not.toContain(legacyGhosttyWrapperSelector);
+    expect(source).not.toContain("Ghostty-helper-textarea");
+    expect(source).not.toContain("_syncTextArea");
+  });
+
+  it("detach cleanup 会清理 E2E debug buffer 镜像，避免旧明文残留在 host dataset", async () => {
+    let queue: TerminalOutputItem[] = [
+      { kind: "snapshot", bytes: new TextEncoder().encode("debug-old-session\n"), baseSeq: 0, size: DEFAULT_TERMINAL_SIZE },
+    ];
+    const takeOutput = vi.fn(() => queue.splice(0));
+    const registerOutputDrain = vi.fn((drain: () => void) => {
+      drain();
+      return () => undefined;
+    });
+    const props = {
+      sessionSize: DEFAULT_TERMINAL_SIZE,
+      outputResetVersion: 0,
+      takeOutput,
+      registerOutputDrain,
+      onInput: vi.fn(),
+      onResize: vi.fn(),
+      onCursorChange: vi.fn(),
+    };
+    const { rerender } = render(<TerminalPane attached {...props} />);
+
+    await waitFor(() => expect(terminalHost().dataset.termdBuffer).toContain("debug-old-session"));
+
+    rerender(<TerminalPane attached={false} {...props} />);
+
+    await waitFor(() => expect(terminalHost().dataset.termdBuffer).toBeUndefined());
+    expect(terminalHost().dataset.buffer).toBeUndefined();
+  });
+
+  it("隐藏 Ghostty textarea 不重复暴露 Terminal input 可访问名称", async () => {
+    renderTerminalPaneWithOutput([]);
+
+    const terminalInput = screen.getByRole("textbox", { name: "Terminal input" });
+    expect(terminalInput).toHaveClass("terminal-host");
+    const textarea = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
+    expect(textarea).not.toBeNull();
+    expect(textarea).toHaveAttribute("aria-hidden", "true");
+  });
+
   it("snapshot 后推进 base seq，连续 output 正常写入并推进 terminal_seq", async () => {
     const onTerminalSeqRendered = vi.fn();
 
@@ -160,8 +216,8 @@ describe("TerminalPane terminal sequence rendering", () => {
     );
 
     await screen.findByText("snapshot", { exact: false });
-    const xterm = screen.getByTestId("terminal-pane").querySelector<HTMLElement>(".xterm");
-    await waitFor(() => expect(xterm?.dataset.buffer).toContain("tail"));
+    const host = terminalHost();
+    await waitFor(() => expect(host.dataset.buffer).toContain("tail"));
     expect(onTerminalSeqRendered.mock.calls).toEqual([[10], [11]]);
   });
 
@@ -181,13 +237,13 @@ describe("TerminalPane terminal sequence rendering", () => {
       { onTerminalSeqRendered },
     );
 
-    const xterm = screen.getByTestId("terminal-pane").querySelector<HTMLElement>(".xterm");
-    await waitFor(() => expect(xterm?.dataset.buffer).toContain("after-resize"));
+    const host = terminalHost();
+    await waitFor(() => expect(host.dataset.buffer).toContain("after-resize"));
     const operations = (globalThis as {
-      __TERMD_TEST_XTERM_STATS__?: {
+      __TERMD_TEST_TERMINAL_STATS__?: {
         operations: Array<{ op: string; cols?: number; rows?: number }>;
       };
-    }).__TERMD_TEST_XTERM_STATS__?.operations ?? [];
+    }).__TERMD_TEST_TERMINAL_STATS__?.operations ?? [];
     const firstWriteIndex = operations.findIndex((operation) => operation.op === "write");
     const snapshotResizeIndex = operations.findIndex(
       (operation) => operation.op === "resize" && operation.cols === 120 && operation.rows === 32,
@@ -238,7 +294,7 @@ describe("TerminalPane terminal sequence rendering", () => {
 
     await waitFor(
       () => {
-        const stats = (globalThis as { __TERMD_TEST_XTERM_STATS__?: { writtenBytes: number } }).__TERMD_TEST_XTERM_STATS__;
+        const stats = (globalThis as { __TERMD_TEST_TERMINAL_STATS__?: { writtenBytes: number } }).__TERMD_TEST_TERMINAL_STATS__;
         expect(stats?.writtenBytes ?? 0).toBeGreaterThan(4 * 1024 * 1024);
       },
       { timeout: 5000 },
@@ -287,7 +343,7 @@ describe("TerminalPane terminal sequence rendering", () => {
     await waitFor(() => expect(onTerminalResync).toHaveBeenCalledWith(undefined));
   });
 
-  it("连续 output frame 合并成批量 xterm write，但仍逐帧确认 terminal_seq", async () => {
+  it("连续 output frame 合并成批量 Ghostty write，但仍逐帧确认 terminal_seq", async () => {
     const onTerminalSeqRendered = vi.fn();
     const items: TerminalOutputItem[] = [
       { kind: "snapshot", bytes: new TextEncoder().encode("snapshot\n"), baseSeq: 0, size: DEFAULT_TERMINAL_SIZE },
@@ -300,10 +356,10 @@ describe("TerminalPane terminal sequence rendering", () => {
 
     renderTerminalPaneWithOutput(items, { onTerminalSeqRendered });
 
-    const xterm = screen.getByTestId("terminal-pane").querySelector<HTMLElement>(".xterm");
-    await waitFor(() => expect(xterm?.dataset.buffer).toContain("line-32"));
-    const stats = (globalThis as { __TERMD_TEST_XTERM_STATS__?: { writes: number } })
-      .__TERMD_TEST_XTERM_STATS__;
+    const host = terminalHost();
+    await waitFor(() => expect(host.dataset.buffer).toContain("line-32"));
+    const stats = (globalThis as { __TERMD_TEST_TERMINAL_STATS__?: { writes: number } })
+      .__TERMD_TEST_TERMINAL_STATS__;
     expect(stats?.writes ?? 0).toBeLessThan(10);
     expect(onTerminalSeqRendered.mock.calls.at(-1)).toEqual([32]);
     expect(onTerminalSeqRendered).toHaveBeenCalledTimes(33);
@@ -312,8 +368,8 @@ describe("TerminalPane terminal sequence rendering", () => {
   it("live output 停止后也刷新最后一笔写入，不需要等待下一次输入", async () => {
     vi.useFakeTimers();
     try {
-      (globalThis as { __TERMD_TEST_DEFER_XTERM_RENDER_UNTIL_WRITE_CALLBACK__?: boolean })
-        .__TERMD_TEST_DEFER_XTERM_RENDER_UNTIL_WRITE_CALLBACK__ = true;
+      (globalThis as { __TERMD_TEST_DEFER_GHOSTTY_RENDER_UNTIL_WRITE_CALLBACK__?: boolean })
+        .__TERMD_TEST_DEFER_GHOSTTY_RENDER_UNTIL_WRITE_CALLBACK__ = true;
       const encoder = new TextEncoder();
       const onTerminalSeqRendered = vi.fn();
       let queue: TerminalOutputItem[] = [
@@ -344,8 +400,8 @@ describe("TerminalPane terminal sequence rendering", () => {
       act(() => {
         vi.advanceTimersByTime(animationFrameMs * 12);
       });
-      const xterm = screen.getByTestId("terminal-pane").querySelector<HTMLElement>(".xterm");
-      expect(xterm?.dataset.buffer).toContain("snapshot");
+      const host = terminalHost();
+      expect(host.dataset.buffer).toContain("snapshot");
 
       queue = [
         { kind: "output", bytes: encoder.encode("final-tail\n"), terminalSeq: 1 },
@@ -355,9 +411,9 @@ describe("TerminalPane terminal sequence rendering", () => {
         vi.advanceTimersByTime(animationFrameMs * 12);
       });
 
-      // 中文注释：真实 xterm 某些渲染时序下，最后一笔 write 已解析但尚未 repaint。
+      // 中文注释：真实 Ghostty 某些渲染时序下，最后一笔 write 已解析但尚未 repaint。
       // 如果 TerminalPane 只在下一次输入/resize 时 refresh，就会表现为“按一下键才出现尾巴”。
-      expect(xterm?.dataset.buffer).toContain("final-tail");
+      expect(host.dataset.buffer).toContain("final-tail");
       expect(onTerminalSeqRendered.mock.calls).toEqual([[0], [1]]);
     } finally {
       vi.useRealTimers();
@@ -367,12 +423,12 @@ describe("TerminalPane terminal sequence rendering", () => {
   it("进入 session 的异步 snapshot 写入完成后会贴到底部", async () => {
     vi.useFakeTimers();
     try {
-      (globalThis as { __TERMD_TEST_DEFER_XTERM_RENDER_UNTIL_WRITE_CALLBACK__?: boolean })
-        .__TERMD_TEST_DEFER_XTERM_RENDER_UNTIL_WRITE_CALLBACK__ = true;
-      (globalThis as { __TERMD_TEST_DEFER_XTERM_BUFFER_UNTIL_WRITE_CALLBACK__?: boolean })
-        .__TERMD_TEST_DEFER_XTERM_BUFFER_UNTIL_WRITE_CALLBACK__ = true;
-      (globalThis as { __TERMD_TEST_KEEP_XTERM_VIEWPORT_AT_TOP_AFTER_WRITE__?: boolean })
-        .__TERMD_TEST_KEEP_XTERM_VIEWPORT_AT_TOP_AFTER_WRITE__ = true;
+      (globalThis as { __TERMD_TEST_DEFER_GHOSTTY_RENDER_UNTIL_WRITE_CALLBACK__?: boolean })
+        .__TERMD_TEST_DEFER_GHOSTTY_RENDER_UNTIL_WRITE_CALLBACK__ = true;
+      (globalThis as { __TERMD_TEST_DEFER_GHOSTTY_BUFFER_UNTIL_WRITE_CALLBACK__?: boolean })
+        .__TERMD_TEST_DEFER_GHOSTTY_BUFFER_UNTIL_WRITE_CALLBACK__ = true;
+      (globalThis as { __TERMD_TEST_KEEP_GHOSTTY_VIEWPORT_AT_TOP_AFTER_WRITE__?: boolean })
+        .__TERMD_TEST_KEEP_GHOSTTY_VIEWPORT_AT_TOP_AFTER_WRITE__ = true;
       const snapshot = Array.from({ length: 80 }, (_, index) => `snapshot-line-${index}\n`).join("");
 
       renderTerminalPaneWithOutput([
@@ -383,13 +439,13 @@ describe("TerminalPane terminal sequence rendering", () => {
         vi.advanceTimersByTime(animationFrameMs * 12);
       });
 
-      const xterm = (globalThis as {
-        __TERMD_TEST_XTERM__?: { viewportY: () => number; baseY: () => number };
-      }).__TERMD_TEST_XTERM__;
-      expect(xterm?.baseY()).toBeGreaterThan(0);
+      const Ghostty = (globalThis as {
+        __TERMD_TEST_GHOSTTY__?: { viewportY: () => number; baseY: () => number };
+      }).__TERMD_TEST_GHOSTTY__;
+      expect(Ghostty?.baseY()).toBeGreaterThan(0);
       // 中文注释：刚 attach 时早期 resize/stabilize 可能已经在 snapshot 写完前执行过。
       // write callback 后仍必须再次贴底，否则用户会停在 snapshot 顶部附近。
-      expect(xterm?.viewportY()).toBe(xterm?.baseY());
+      expect(Ghostty?.viewportY()).toBe(Ghostty?.baseY());
     } finally {
       vi.useRealTimers();
     }
@@ -408,16 +464,16 @@ describe("TerminalPane terminal sequence rendering", () => {
         vi.advanceTimersByTime(animationFrameMs * 12);
       });
 
-      const xterm = (globalThis as {
-        __TERMD_TEST_XTERM__?: { viewportY: () => number; baseY: () => number; scrollToLine: (line: number) => void };
-      }).__TERMD_TEST_XTERM__;
-      expect(xterm?.baseY()).toBeGreaterThan(0);
-      expect(xterm?.viewportY()).toBe(xterm?.baseY());
+      const Ghostty = (globalThis as {
+        __TERMD_TEST_GHOSTTY__?: { viewportY: () => number; baseY: () => number; scrollToLine: (line: number) => void };
+      }).__TERMD_TEST_GHOSTTY__;
+      expect(Ghostty?.baseY()).toBeGreaterThan(0);
+      expect(Ghostty?.viewportY()).toBe(Ghostty?.baseY());
 
       act(() => {
-        xterm?.scrollToLine(0);
+        Ghostty?.scrollToLine(0);
       });
-      expect(xterm?.viewportY()).toBe(0);
+      expect(Ghostty?.viewportY()).toBe(0);
 
       const frame = screen.getByTestId("terminal-pane").querySelector<HTMLElement>(".terminal-frame");
       expect(frame).not.toBeNull();
@@ -428,10 +484,270 @@ describe("TerminalPane terminal sequence rendering", () => {
       });
 
       // 中文注释：点击空白处只应该聚焦终端；如果用户正在看历史，不能强行滚回最新输出。
-      expect(xterm?.viewportY()).toBe(0);
+      expect(Ghostty?.viewportY()).toBe(0);
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("拖拽选区会驱动 Ghostty selection 并触发复制", async () => {
+    const canvasRect = {
+      x: 0,
+      y: 0,
+      left: 0,
+      top: 0,
+      right: 800,
+      bottom: 240,
+      width: 800,
+      height: 240,
+      toJSON() {
+        return this;
+      },
+    } as DOMRect;
+    const rectSpy = vi.spyOn(HTMLCanvasElement.prototype, "getBoundingClientRect").mockReturnValue(canvasRect);
+    try {
+      renderTerminalPaneWithOutput([
+        { kind: "snapshot", bytes: new TextEncoder().encode("line-001\nline-002\nline-003\n"), baseSeq: 0, size: DEFAULT_TERMINAL_SIZE },
+      ]);
+
+      await waitFor(() => expect(terminalHost().dataset.buffer).toContain("line-003"));
+      const canvas = screen.getByTestId("terminal-pane").querySelector<HTMLCanvasElement>("canvas");
+      expect(canvas).not.toBeNull();
+
+      fireEvent.mouseDown(canvas!, { clientX: 20, clientY: 20, button: 0 });
+      fireEvent.mouseMove(window, { clientX: 180, clientY: 20 });
+      fireEvent.mouseUp(window, { clientX: 180, clientY: 20 });
+
+      await waitFor(() => expect(terminalHost().dataset.termdHasSelection).toBe("true"));
+      expect(terminalHost().dataset.termdSelection).not.toBe("");
+      await waitFor(() => expect(screen.getByRole("status")).toBeVisible());
+    } finally {
+      rectSpy.mockRestore();
+    }
+  });
+
+  it("自定义拖拽复制不依赖 Ghostty 返回的 selectionPosition", async () => {
+    const canvasRect = {
+      x: 0,
+      y: 0,
+      left: 0,
+      top: 0,
+      right: 800,
+      bottom: 240,
+      width: 800,
+      height: 240,
+      toJSON() {
+        return this;
+      },
+    } as DOMRect;
+    const rectSpy = vi.spyOn(HTMLCanvasElement.prototype, "getBoundingClientRect").mockReturnValue(canvasRect);
+    try {
+      (globalThis as {
+        __TERMD_TEST_FORCE_SELECTION_POSITION__?: { start: { x: number; y: number }; end: { x: number; y: number } };
+      }).__TERMD_TEST_FORCE_SELECTION_POSITION__ = {
+        start: { x: 0, y: 0 },
+        end: { x: 10, y: 0 },
+      };
+      renderTerminalPaneWithOutput([
+        { kind: "snapshot", bytes: new TextEncoder().encode("first-line\nsecond-line\nthird-line\n"), baseSeq: 0, size: DEFAULT_TERMINAL_SIZE },
+      ]);
+
+      await waitFor(() => expect(terminalHost().dataset.buffer).toContain("third-line"));
+      const canvas = screen.getByTestId("terminal-pane").querySelector<HTMLCanvasElement>("canvas");
+      expect(canvas).not.toBeNull();
+      const rowHeight = canvasRect.height / DEFAULT_TERMINAL_SIZE.rows;
+      const y = canvasRect.top + rowHeight * 1.5;
+
+      fireEvent.mouseDown(canvas!, { clientX: 2, clientY: y, button: 0 });
+      fireEvent.mouseMove(window, { clientX: 180, clientY: y });
+      fireEvent.mouseUp(window, { clientX: 180, clientY: y });
+
+      await waitFor(() => expect(terminalHost().dataset.termdSelectionCopy).toContain("second-line"));
+      expect(terminalHost().dataset.termdSelectionCopy).not.toContain("first-line");
+    } finally {
+      rectSpy.mockRestore();
+    }
+  });
+
+  it("终端有 Ghostty 选区时 Ctrl+C 会优先走浏览器原生 copy 事务", async () => {
+    renderTerminalPaneWithOutput([
+      { kind: "snapshot", bytes: new TextEncoder().encode("copy-shortcut-line\n"), baseSeq: 0, size: DEFAULT_TERMINAL_SIZE },
+    ]);
+
+    await waitFor(() => expect(terminalHost().dataset.buffer).toContain("copy-shortcut-line"));
+    const Ghostty = (globalThis as {
+      __TERMD_TEST_GHOSTTY__?: { select: (text: string) => void };
+    }).__TERMD_TEST_GHOSTTY__;
+    const clipboardWriteTextMock = navigator.clipboard.writeText as unknown as ReturnType<typeof vi.fn>;
+    const setData = vi.fn();
+    const originalExecCommand = document.execCommand;
+    const execCommandMock = vi.fn((command: string) => {
+      if (command !== "copy") {
+        return false;
+      }
+      const copyEvent = new Event("copy", { bubbles: true, cancelable: true }) as ClipboardEvent;
+      Object.defineProperty(copyEvent, "clipboardData", {
+        configurable: true,
+        value: {
+          setData,
+        },
+      });
+      document.dispatchEvent(copyEvent);
+      return true;
+    });
+    Object.defineProperty(document, "execCommand", {
+      configurable: true,
+      value: execCommandMock,
+    });
+
+    try {
+      Ghostty?.select("copy-shortcut-line");
+      await waitFor(() => expect(terminalHost().dataset.termdSelection).toContain("copy-shortcut-line"));
+      clipboardWriteTextMock.mockClear();
+
+      const copyShortcut = new KeyboardEvent("keydown", {
+        key: "c",
+        ctrlKey: true,
+        bubbles: true,
+        cancelable: true,
+      });
+      document.dispatchEvent(copyShortcut);
+
+      expect(copyShortcut.defaultPrevented).toBe(true);
+      expect(execCommandMock).toHaveBeenCalledWith("copy");
+      expect(setData).toHaveBeenCalledWith("text/plain", "copy-shortcut-line");
+      expect(clipboardWriteTextMock).not.toHaveBeenCalled();
+      expect(terminalHost().dataset.termdSelectionCopy).toBe("copy-shortcut-line");
+    } finally {
+      Object.defineProperty(document, "execCommand", {
+        configurable: true,
+        value: originalExecCommand,
+      });
+    }
+  });
+
+  it("终端原生 copy 事务不可用时 Ctrl+C 会回退到程序化复制", async () => {
+    renderTerminalPaneWithOutput([
+      { kind: "snapshot", bytes: new TextEncoder().encode("copy-shortcut-fallback-line\n"), baseSeq: 0, size: DEFAULT_TERMINAL_SIZE },
+    ]);
+
+    await waitFor(() => expect(terminalHost().dataset.buffer).toContain("copy-shortcut-fallback-line"));
+    const Ghostty = (globalThis as {
+      __TERMD_TEST_GHOSTTY__?: { select: (text: string) => void };
+    }).__TERMD_TEST_GHOSTTY__;
+    const clipboardWriteTextMock = navigator.clipboard.writeText as unknown as ReturnType<typeof vi.fn>;
+    const originalExecCommand = document.execCommand;
+    const execCommandMock = vi.fn(() => false);
+    Object.defineProperty(document, "execCommand", {
+      configurable: true,
+      value: execCommandMock,
+    });
+
+    try {
+      Ghostty?.select("copy-shortcut-fallback-line");
+      await waitFor(() => expect(terminalHost().dataset.termdSelection).toContain("copy-shortcut-fallback-line"));
+      clipboardWriteTextMock.mockClear();
+
+      const copyShortcut = new KeyboardEvent("keydown", {
+        key: "c",
+        ctrlKey: true,
+        bubbles: true,
+        cancelable: true,
+      });
+      document.dispatchEvent(copyShortcut);
+
+      expect(copyShortcut.defaultPrevented).toBe(true);
+      expect(execCommandMock).toHaveBeenCalledWith("copy");
+      await waitFor(() => expect(clipboardWriteTextMock).toHaveBeenCalledWith("copy-shortcut-fallback-line"));
+      expect(terminalHost().dataset.termdSelectionCopy).toBe("copy-shortcut-fallback-line");
+    } finally {
+      Object.defineProperty(document, "execCommand", {
+        configurable: true,
+        value: originalExecCommand,
+      });
+    }
+  });
+
+  it("浏览器 copy 事件会把 Ghostty 选区写入 clipboardData", async () => {
+    renderTerminalPaneWithOutput([
+      { kind: "snapshot", bytes: new TextEncoder().encode("copy-event-line\n"), baseSeq: 0, size: DEFAULT_TERMINAL_SIZE },
+    ]);
+
+    await waitFor(() => expect(terminalHost().dataset.buffer).toContain("copy-event-line"));
+    const Ghostty = (globalThis as {
+      __TERMD_TEST_GHOSTTY__?: { select: (text: string) => void };
+    }).__TERMD_TEST_GHOSTTY__;
+    const clipboardWriteTextMock = navigator.clipboard.writeText as unknown as ReturnType<typeof vi.fn>;
+    const setData = vi.fn();
+
+    Ghostty?.select("copy-event-line");
+    await waitFor(() => expect(terminalHost().dataset.termdSelection).toContain("copy-event-line"));
+    clipboardWriteTextMock.mockClear();
+
+    const copyEvent = new Event("copy", { bubbles: true, cancelable: true }) as ClipboardEvent;
+    Object.defineProperty(copyEvent, "clipboardData", {
+      configurable: true,
+      value: {
+        setData,
+      },
+    });
+    document.dispatchEvent(copyEvent);
+
+    expect(copyEvent.defaultPrevented).toBe(true);
+    expect(setData).toHaveBeenCalledWith("text/plain", "copy-event-line");
+    expect(clipboardWriteTextMock).not.toHaveBeenCalled();
+    expect(terminalHost().dataset.termdSelectionCopy).toBe("copy-event-line");
+  });
+
+  it("点击终端外后，旧的 Ghostty 选区不会继续劫持 Ctrl+C", async () => {
+    const outputItems: TerminalOutputItem[] = [
+      { kind: "snapshot", bytes: new TextEncoder().encode("copy-outside-line\n"), baseSeq: 0, size: DEFAULT_TERMINAL_SIZE },
+    ];
+    const takeOutput = vi.fn(() => outputItems);
+    const registerOutputDrain = vi.fn((drain: () => void) => {
+      drain();
+      return () => undefined;
+    });
+    render(
+      <div>
+        <div data-testid="outside-copy-target">
+          outside
+        </div>
+        <TerminalPane
+          attached
+          sessionSize={DEFAULT_TERMINAL_SIZE}
+          outputResetVersion={0}
+          takeOutput={takeOutput}
+          registerOutputDrain={registerOutputDrain}
+          onInput={vi.fn()}
+          onResize={vi.fn()}
+          onCursorChange={vi.fn()}
+        />
+      </div>,
+    );
+
+    await waitFor(() => expect(terminalHost().dataset.buffer).toContain("copy-outside-line"));
+    const Ghostty = (globalThis as {
+      __TERMD_TEST_GHOSTTY__?: { select: (text: string) => void };
+    }).__TERMD_TEST_GHOSTTY__;
+    const clipboardWriteTextMock = navigator.clipboard.writeText as unknown as ReturnType<typeof vi.fn>;
+
+    Ghostty?.select("copy-outside-line");
+    await waitFor(() => expect(terminalHost().dataset.termdSelection).toContain("copy-outside-line"));
+    clipboardWriteTextMock.mockClear();
+
+    screen.getByRole("textbox", { name: "Terminal input" }).focus();
+    fireEvent.mouseDown(screen.getByTestId("outside-copy-target"));
+    const copyShortcut = new KeyboardEvent("keydown", {
+      key: "c",
+      ctrlKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    document.dispatchEvent(copyShortcut);
+
+    expect(copyShortcut.defaultPrevented).toBe(false);
+    expect(clipboardWriteTextMock).not.toHaveBeenCalled();
   });
 
   it("远端 sessionSize 变化不会让已聚焦客户端回写本地尺寸", async () => {
@@ -489,21 +805,21 @@ describe("TerminalPane terminal sequence rendering", () => {
       // 本端即使仍处于聚焦态，也只能被动按远端尺寸重绘，不能立刻把自己的本地尺寸写回 daemon。
       expect(onResize).not.toHaveBeenCalled();
       const operations = (globalThis as {
-        __TERMD_TEST_XTERM_STATS__?: {
+        __TERMD_TEST_TERMINAL_STATS__?: {
           operations: Array<{ op: string; cols?: number; rows?: number }>;
         };
-      }).__TERMD_TEST_XTERM_STATS__?.operations ?? [];
+      }).__TERMD_TEST_TERMINAL_STATS__?.operations ?? [];
       expect(operations).toContainEqual({ op: "resize", cols: remoteSize.cols, rows: remoteSize.rows });
     } finally {
       vi.useRealTimers();
     }
   });
 
-  it("snapshot 渲染完成后的本地刷新不会回写本地尺寸", async () => {
+  it("snapshot 渲染完成后已聚焦客户端会回写本地尺寸", async () => {
     vi.useFakeTimers();
     try {
-      (globalThis as { __TERMD_TEST_DEFER_XTERM_RENDER_UNTIL_WRITE_CALLBACK__?: boolean })
-        .__TERMD_TEST_DEFER_XTERM_RENDER_UNTIL_WRITE_CALLBACK__ = true;
+      (globalThis as { __TERMD_TEST_DEFER_GHOSTTY_RENDER_UNTIL_WRITE_CALLBACK__?: boolean })
+        .__TERMD_TEST_DEFER_GHOSTTY_RENDER_UNTIL_WRITE_CALLBACK__ = true;
       const localSize = { rows: 37, cols: 89, pixel_width: 716, pixel_height: 668 };
       const snapshotSize = { rows: 33, cols: 53, pixel_width: 434, pixel_height: 600 };
       const onResize = vi.fn();
@@ -546,11 +862,16 @@ describe("TerminalPane terminal sequence rendering", () => {
         vi.advanceTimersByTime(animationFrameMs * 32);
       });
 
-      expect(screen.getByTestId("terminal-pane").querySelector<HTMLElement>(".xterm")?.dataset.buffer)
+      expect(terminalHost().dataset.buffer)
         .toContain("remote-snapshot");
-      // 中文注释：snapshot 渲染完成后的 refresh/stabilize 只修正本地显示，
-      // 不能把聚焦客户端的本地尺寸再次写回 daemon，否则双客户端会形成 resize/snapshot 风暴。
-      expect(onResize).not.toHaveBeenCalled();
+      // 中文注释：reload/重连 snapshot 可能携带旧尺寸；用户已经重新聚焦终端时，
+      // snapshot 完成后必须把当前浏览器布局尺寸写回 daemon/tmux。
+      expect(onResize).toHaveBeenCalledWith({
+        rows: localSize.rows,
+        cols: localSize.cols,
+        pixel_width: expect.any(Number),
+        pixel_height: expect.any(Number),
+      });
     } finally {
       vi.useRealTimers();
     }
@@ -592,10 +913,10 @@ describe("TerminalPane terminal sequence rendering", () => {
       act(() => {
         vi.advanceTimersByTime(animationFrameMs * 12);
       });
-      const xterm = (globalThis as {
-        __TERMD_TEST_XTERM__?: { viewportY: () => number; baseY: () => number };
-      }).__TERMD_TEST_XTERM__;
-      expect(xterm?.viewportY()).toBe(xterm?.baseY());
+      const Ghostty = (globalThis as {
+        __TERMD_TEST_GHOSTTY__?: { viewportY: () => number; baseY: () => number };
+      }).__TERMD_TEST_GHOSTTY__;
+      expect(Ghostty?.viewportY()).toBe(Ghostty?.baseY());
 
       queue = [{ kind: "output", bytes: encoder.encode("tail\n"), terminalSeq: 1 }];
       act(() => {
@@ -603,8 +924,43 @@ describe("TerminalPane terminal sequence rendering", () => {
         vi.advanceTimersByTime(animationFrameMs * 8);
       });
 
-      expect(xterm?.baseY()).toBeGreaterThan(0);
-      expect(xterm?.viewportY()).toBe(xterm?.baseY());
+      expect(Ghostty?.baseY()).toBeGreaterThan(0);
+      expect(Ghostty?.viewportY()).toBe(Ghostty?.baseY());
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("用户上滚后，已经排队的延迟贴底帧不会再把视口拉回底部", async () => {
+    vi.useFakeTimers();
+    try {
+      const snapshot = Array.from({ length: 80 }, (_, index) => `snapshot-line-${index}\n`).join("");
+
+      renderTerminalPaneWithOutput([
+        { kind: "snapshot", bytes: new TextEncoder().encode(snapshot), baseSeq: 0, size: DEFAULT_TERMINAL_SIZE },
+      ]);
+
+      act(() => {
+        vi.advanceTimersByTime(animationFrameMs);
+      });
+
+      const Ghostty = (globalThis as {
+        __TERMD_TEST_GHOSTTY__?: { viewportY: () => number; baseY: () => number; scrollToLine: (line: number) => void };
+      }).__TERMD_TEST_GHOSTTY__;
+      expect(Ghostty?.baseY()).toBeGreaterThan(0);
+      expect(Ghostty?.viewportY()).toBe(Ghostty?.baseY());
+
+      act(() => {
+        Ghostty?.scrollToLine(0);
+      });
+      expect(Ghostty?.viewportY()).toBe(0);
+
+      act(() => {
+        vi.advanceTimersByTime(animationFrameMs * 10);
+      });
+
+      // 中文注释：用户已经开始查看历史后，后续排队的贴底帧只能在“当前仍在底部”时生效。
+      expect(Ghostty?.viewportY()).toBe(0);
     } finally {
       vi.useRealTimers();
     }
@@ -613,8 +969,8 @@ describe("TerminalPane terminal sequence rendering", () => {
   it("位于底部时纯 resize frame 也会重新贴到新的 PTY 底部", async () => {
     vi.useFakeTimers();
     try {
-      (globalThis as { __TERMD_TEST_KEEP_XTERM_VIEWPORT_AT_TOP_AFTER_RESIZE__?: boolean })
-        .__TERMD_TEST_KEEP_XTERM_VIEWPORT_AT_TOP_AFTER_RESIZE__ = true;
+      (globalThis as { __TERMD_TEST_KEEP_GHOSTTY_VIEWPORT_AT_TOP_AFTER_RESIZE__?: boolean })
+        .__TERMD_TEST_KEEP_GHOSTTY_VIEWPORT_AT_TOP_AFTER_RESIZE__ = true;
       const encoder = new TextEncoder();
       let queue: TerminalOutputItem[] = [
         {
@@ -648,12 +1004,12 @@ describe("TerminalPane terminal sequence rendering", () => {
       act(() => {
         vi.advanceTimersByTime(animationFrameMs * 12);
       });
-      const xterm = (globalThis as {
-        __TERMD_TEST_XTERM__?: { viewportY: () => number; baseY: () => number };
-      }).__TERMD_TEST_XTERM__;
-      expect(xterm?.baseY()).toBeGreaterThan(0);
-      expect(xterm?.viewportY()).toBe(xterm?.baseY());
-      const baseYBeforeResize = xterm?.baseY() ?? 0;
+      const Ghostty = (globalThis as {
+        __TERMD_TEST_GHOSTTY__?: { viewportY: () => number; baseY: () => number };
+      }).__TERMD_TEST_GHOSTTY__;
+      expect(Ghostty?.baseY()).toBeGreaterThan(0);
+      expect(Ghostty?.viewportY()).toBe(Ghostty?.baseY());
+      const baseYBeforeResize = Ghostty?.baseY() ?? 0;
 
       queue = [{ kind: "resize", terminalSeq: 1, size: { rows: 12, cols: 80, pixel_width: 0, pixel_height: 0 } }];
       act(() => {
@@ -662,8 +1018,8 @@ describe("TerminalPane terminal sequence rendering", () => {
       });
 
       // 中文注释：resize frame 没有 output bytes；即使没有后续 write callback，也必须完成贴底。
-      expect(xterm?.baseY()).toBeGreaterThan(baseYBeforeResize);
-      expect(xterm?.viewportY()).toBe(xterm?.baseY());
+      expect(Ghostty?.baseY()).toBeGreaterThan(baseYBeforeResize);
+      expect(Ghostty?.viewportY()).toBe(Ghostty?.baseY());
     } finally {
       vi.useRealTimers();
     }
@@ -705,15 +1061,15 @@ describe("TerminalPane terminal sequence rendering", () => {
       act(() => {
         vi.advanceTimersByTime(animationFrameMs * 12);
       });
-      const xterm = (globalThis as {
-        __TERMD_TEST_XTERM__?: { viewportY: () => number; baseY: () => number; scrollToLine: (line: number) => void };
-      }).__TERMD_TEST_XTERM__;
-      expect(xterm?.baseY()).toBeGreaterThan(0);
+      const Ghostty = (globalThis as {
+        __TERMD_TEST_GHOSTTY__?: { viewportY: () => number; baseY: () => number; scrollToLine: (line: number) => void };
+      }).__TERMD_TEST_GHOSTTY__;
+      expect(Ghostty?.baseY()).toBeGreaterThan(0);
 
       act(() => {
-        xterm?.scrollToLine(0);
+        Ghostty?.scrollToLine(0);
       });
-      expect(xterm?.viewportY()).toBe(0);
+      expect(Ghostty?.viewportY()).toBe(0);
 
       queue = [{ kind: "output", bytes: encoder.encode("tail\n"), terminalSeq: 1 }];
       act(() => {
@@ -722,8 +1078,715 @@ describe("TerminalPane terminal sequence rendering", () => {
       });
 
       // 中文注释：用户已经上滚时，PTY 继续输出只能更新 buffer，不能把视口抢回底部。
-      expect(xterm?.baseY()).toBeGreaterThan(0);
-      expect(xterm?.viewportY()).toBe(0);
+      expect(Ghostty?.baseY()).toBeGreaterThan(0);
+      expect(Ghostty?.viewportY()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("桌面终端有 scrollback 时不再渲染 termd 自定义拖动滚动条", async () => {
+    vi.useFakeTimers();
+    try {
+      const snapshot = Array.from({ length: 80 }, (_, index) => `scrollbar-line-${index}\n`).join("");
+
+      renderTerminalPaneWithOutput([
+        { kind: "snapshot", bytes: new TextEncoder().encode(snapshot), baseSeq: 0, size: DEFAULT_TERMINAL_SIZE },
+      ]);
+
+      act(() => {
+        vi.advanceTimersByTime(animationFrameMs * 12);
+      });
+
+      const Ghostty = (globalThis as {
+        __TERMD_TEST_GHOSTTY__?: { viewportY: () => number; baseY: () => number; scrollToLine: (line: number) => void };
+      }).__TERMD_TEST_GHOSTTY__;
+      expect(Ghostty?.baseY()).toBeGreaterThan(0);
+      expect(Ghostty?.viewportY()).toBe(Ghostty?.baseY());
+
+      // 中文注释：scrollback 仍由 Ghostty 自己管理；termd 不再额外渲染 DOM 拖动条。
+      expect(document.querySelector(".terminal-scroll-track")).toBeNull();
+      expect(document.querySelector(".terminal-scroll-thumb")).toBeNull();
+      expect(screen.queryByRole("button", { name: "Terminal scroll" })).toBeNull();
+
+      act(() => {
+        Ghostty?.scrollToLine(0);
+      });
+      expect(Ghostty?.viewportY()).toBe(0);
+
+      act(() => {
+        vi.advanceTimersByTime(animationFrameMs * 2);
+      });
+      expect(document.querySelector(".terminal-scroll-track")).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("tmux 全屏重绘导致 Ghostty 无 scrollback 时会主动请求一次 snapshot resync", async () => {
+    vi.useFakeTimers();
+    try {
+      const onTerminalResync = vi.fn();
+      const largeFullscreenRedraw = "x".repeat(9 * 1024);
+
+      renderTerminalPaneWithOutput(
+        [
+          { kind: "snapshot", bytes: new Uint8Array(), baseSeq: 0, size: DEFAULT_TERMINAL_SIZE },
+          { kind: "output", bytes: new TextEncoder().encode(largeFullscreenRedraw), terminalSeq: 1 },
+        ],
+        { onTerminalResync },
+      );
+
+      act(() => {
+        vi.advanceTimersByTime(animationFrameMs * 12);
+      });
+
+      const Ghostty = (globalThis as {
+        __TERMD_TEST_GHOSTTY__?: { baseY: () => number };
+      }).__TERMD_TEST_GHOSTTY__;
+      expect(Ghostty?.baseY()).toBe(0);
+      expect(onTerminalResync).toHaveBeenCalledTimes(1);
+      expect(onTerminalResync).toHaveBeenCalledWith(undefined);
+
+      act(() => {
+        vi.advanceTimersByTime(animationFrameMs * 30);
+      });
+      // 中文注释：resync 请求发出后，在 snapshot 回来之前不能每帧重复重连。
+      expect(onTerminalResync).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("用户向上滚动但 Ghostty 无本地 scrollback 时会请求 tmux snapshot history", async () => {
+    vi.useFakeTimers();
+    try {
+      const onTerminalResync = vi.fn();
+      const fullscreenRedraw = "x".repeat(4 * 1024);
+
+      renderTerminalPaneWithOutput(
+        [
+          { kind: "snapshot", bytes: new Uint8Array(), baseSeq: 0, size: DEFAULT_TERMINAL_SIZE },
+          { kind: "output", bytes: new TextEncoder().encode(fullscreenRedraw), terminalSeq: 1 },
+        ],
+        { onTerminalResync },
+      );
+
+      await act(async () => {
+        await Promise.resolve();
+        await vi.advanceTimersByTimeAsync(animationFrameMs * 12);
+      });
+      expect(onTerminalResync).toHaveBeenCalledTimes(0);
+
+      const Ghostty = (globalThis as {
+        __TERMD_TEST_GHOSTTY__?: { baseY: () => number };
+      }).__TERMD_TEST_GHOSTTY__;
+      expect(Ghostty?.baseY()).toBe(0);
+
+      const frame = screen.getByTestId("terminal-pane").querySelector<HTMLElement>(".terminal-frame");
+      expect(frame).not.toBeNull();
+      const wheelEvent = new WheelEvent("wheel", { deltaY: -900, bubbles: true, cancelable: true });
+      frame!.dispatchEvent(wheelEvent);
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(animationFrameMs * 4);
+      });
+
+      // 中文注释：真实 tmux attach 输出可能不让 Ghostty 本地形成 scrollback；
+      // 用户一旦向上滚，就应主动拉 daemon/tmux snapshot，而不是等输出超过 8KiB。
+      expect(onTerminalResync).toHaveBeenCalledTimes(1);
+      expect(onTerminalResync).toHaveBeenCalledWith(undefined, { revealHistory: true });
+      expect(wheelEvent.defaultPrevented).toBe(true);
+
+      fireEvent.wheel(frame!, { deltaY: -900 });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(animationFrameMs * 4);
+      });
+      expect(onTerminalResync).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("用户滚轮会把已在路上的自动 scrollback snapshot 升级成 reveal history", async () => {
+    vi.useFakeTimers();
+    try {
+      const onTerminalResync = vi.fn();
+      const fullscreenRedraw = "x".repeat(9 * 1024);
+
+      renderTerminalPaneWithOutput(
+        [
+          { kind: "snapshot", bytes: new Uint8Array(), baseSeq: 0, size: DEFAULT_TERMINAL_SIZE },
+          { kind: "output", bytes: new TextEncoder().encode(fullscreenRedraw), terminalSeq: 1 },
+        ],
+        { onTerminalResync },
+      );
+
+      await act(async () => {
+        await Promise.resolve();
+        await vi.advanceTimersByTimeAsync(animationFrameMs * 12);
+      });
+      expect(onTerminalResync).toHaveBeenCalledTimes(1);
+      expect(onTerminalResync).toHaveBeenNthCalledWith(1, undefined);
+
+      const frame = screen.getByTestId("terminal-pane").querySelector<HTMLElement>(".terminal-frame");
+      expect(frame).not.toBeNull();
+      fireEvent.wheel(frame!, { deltaY: -900 });
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(animationFrameMs * 4);
+      });
+
+      // 中文注释：自动预取可能已经启动 full snapshot；用户随后上滚时必须把
+      // 已在路上的 snapshot 升级成 reveal，否则真实浏览器会拿到历史但仍停在底部。
+      expect(onTerminalResync).toHaveBeenCalledTimes(2);
+      expect(onTerminalResync).toHaveBeenNthCalledWith(2, undefined, { revealHistory: true });
+
+      fireEvent.wheel(frame!, { deltaY: -900 });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(animationFrameMs * 4);
+      });
+      expect(onTerminalResync).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("用户向上滚动且 Ghostty 已有本地 scrollback 时会直接移动 viewport", async () => {
+    vi.useFakeTimers();
+    try {
+      const onTerminalResync = vi.fn();
+      const snapshot = Array.from({ length: 220 }, (_, index) => `${index + 1}\n`).join("");
+
+      renderTerminalPaneWithOutput(
+        [
+          {
+            kind: "snapshot",
+            bytes: new TextEncoder().encode(snapshot),
+            baseSeq: 30,
+            size: DEFAULT_TERMINAL_SIZE,
+          },
+        ],
+        { onTerminalResync },
+      );
+
+      await act(async () => {
+        await Promise.resolve();
+        await vi.advanceTimersByTimeAsync(animationFrameMs * 12);
+      });
+
+      const Ghostty = (globalThis as {
+        __TERMD_TEST_GHOSTTY__?: { viewportY: () => number; baseY: () => number };
+      }).__TERMD_TEST_GHOSTTY__;
+      expect(Ghostty?.baseY()).toBeGreaterThan(0);
+      expect(Ghostty?.viewportY()).toBe(Ghostty?.baseY());
+
+      const frame = screen.getByTestId("terminal-pane").querySelector<HTMLElement>(".terminal-frame");
+      expect(frame).not.toBeNull();
+      fireEvent.wheel(frame!, { deltaY: -320 });
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(animationFrameMs * 4);
+      });
+
+      // 中文注释：真实 Ghostty 有时不会自己消费 React wheel；termd 必须把
+      // wheel 明确转换成 renderer-neutral scrollToLine，避免有 scrollback 也滚不动。
+      expect(Ghostty?.viewportY()).toBeLessThan(Ghostty?.baseY() ?? 0);
+      expect(onTerminalResync).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("高精度小步长滚轮会累积成实际的 scrollback 移动", async () => {
+    vi.useFakeTimers();
+    try {
+      const onTerminalResync = vi.fn();
+      const snapshot = Array.from({ length: 220 }, (_, index) => `${index + 1}\n`).join("");
+
+      renderTerminalPaneWithOutput(
+        [
+          {
+            kind: "snapshot",
+            bytes: new TextEncoder().encode(snapshot),
+            baseSeq: 30,
+            size: DEFAULT_TERMINAL_SIZE,
+          },
+        ],
+        { onTerminalResync },
+      );
+
+      await act(async () => {
+        await Promise.resolve();
+        await vi.advanceTimersByTimeAsync(animationFrameMs * 12);
+      });
+
+      const Ghostty = (globalThis as {
+        __TERMD_TEST_GHOSTTY__?: { viewportY: () => number; baseY: () => number };
+      }).__TERMD_TEST_GHOSTTY__;
+      expect(Ghostty?.baseY()).toBeGreaterThan(0);
+      expect(Ghostty?.viewportY()).toBe(Ghostty?.baseY());
+
+      const frame = screen.getByTestId("terminal-pane").querySelector<HTMLElement>(".terminal-frame");
+      expect(frame).not.toBeNull();
+      for (let index = 0; index < 4; index += 1) {
+        frame!.dispatchEvent(new WheelEvent("wheel", { deltaY: -4, bubbles: true, cancelable: true }));
+      }
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(animationFrameMs * 4);
+      });
+
+      // 中文注释：像素级小 delta 以前会被逐次 trunc 掉；累积后至少应该滚动一行。
+      expect(Ghostty?.viewportY()).toBeLessThan(Ghostty?.baseY() ?? 0);
+      expect(onTerminalResync).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("用户滚轮触发的 scrollback snapshot 回来后会自动停在历史区域", async () => {
+    vi.useFakeTimers();
+    try {
+      const onTerminalResync = vi.fn();
+      const encoder = new TextEncoder();
+      let queue: TerminalOutputItem[] = [
+        { kind: "snapshot", bytes: new Uint8Array(), baseSeq: 0, size: DEFAULT_TERMINAL_SIZE },
+        { kind: "output", bytes: encoder.encode("x".repeat(4 * 1024)), terminalSeq: 1 },
+      ];
+      const takeOutput = vi.fn(() => queue.splice(0));
+      const registerOutputDrain = vi.fn((drain: () => void) => {
+        drain();
+        return () => undefined;
+      });
+      const props = {
+        attached: true,
+        sessionSize: DEFAULT_TERMINAL_SIZE,
+        takeOutput,
+        registerOutputDrain,
+        onTerminalResync,
+        onInput: vi.fn(),
+        onResize: vi.fn(),
+        onCursorChange: vi.fn(),
+      };
+      const { rerender } = render(<TerminalPane {...props} outputResetVersion={0} />);
+
+      await act(async () => {
+        await Promise.resolve();
+        await vi.advanceTimersByTimeAsync(animationFrameMs * 12);
+      });
+
+      const frame = screen.getByTestId("terminal-pane").querySelector<HTMLElement>(".terminal-frame");
+      expect(frame).not.toBeNull();
+      fireEvent.wheel(frame!, { deltaY: -900 });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(animationFrameMs * 4);
+      });
+      expect(onTerminalResync).toHaveBeenCalledTimes(1);
+      expect(onTerminalResync).toHaveBeenCalledWith(undefined, { revealHistory: true });
+
+      queue = [
+        {
+          kind: "snapshot",
+          bytes: encoder.encode(Array.from({ length: 220 }, (_, index) => `${index + 1}\n`).join("")),
+          baseSeq: 30,
+          size: DEFAULT_TERMINAL_SIZE,
+          revealHistory: true,
+        },
+      ];
+      rerender(<TerminalPane {...props} outputResetVersion={1} />);
+
+      await act(async () => {
+        await Promise.resolve();
+        await vi.advanceTimersByTimeAsync(animationFrameMs * 20);
+      });
+
+      const Ghostty = (globalThis as {
+        __TERMD_TEST_GHOSTTY__?: { viewportY: () => number; baseY: () => number };
+      }).__TERMD_TEST_GHOSTTY__;
+      expect(Ghostty?.baseY()).toBeGreaterThan(0);
+      // 中文注释：这次 snapshot 是用户向上滚触发的历史拉取；回来后应该直接看到历史，
+      // 不能像普通 attach 一样又贴回底部，导致用户必须再滚第二次。
+      expect(Ghostty?.viewportY()).toBeLessThan(Ghostty?.baseY() ?? 0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("带 revealHistory 的 snapshot 即使跨 outputResetVersion 重建也不会贴回底部", async () => {
+    vi.useFakeTimers();
+    try {
+      const encoder = new TextEncoder();
+      let queue: TerminalOutputItem[] = [
+        {
+          kind: "snapshot",
+          bytes: encoder.encode(Array.from({ length: 220 }, (_, index) => `${index + 1}\n`).join("")),
+          baseSeq: 30,
+          size: DEFAULT_TERMINAL_SIZE,
+          revealHistory: true,
+        },
+      ];
+      const takeOutput = vi.fn(() => queue.splice(0));
+      const registerOutputDrain = vi.fn((drain: () => void) => {
+        drain();
+        return () => undefined;
+      });
+      const props = {
+        attached: true,
+        sessionSize: DEFAULT_TERMINAL_SIZE,
+        takeOutput,
+        registerOutputDrain,
+        onTerminalResync: vi.fn(),
+        onInput: vi.fn(),
+        onResize: vi.fn(),
+        onCursorChange: vi.fn(),
+      };
+
+      const { rerender } = render(<TerminalPane {...props} outputResetVersion={0} />);
+      await act(async () => {
+        await Promise.resolve();
+        await vi.advanceTimersByTimeAsync(animationFrameMs * 8);
+      });
+
+      queue = [
+        {
+          kind: "snapshot",
+          bytes: encoder.encode(Array.from({ length: 220 }, (_, index) => `${index + 1}\n`).join("")),
+          baseSeq: 31,
+          size: DEFAULT_TERMINAL_SIZE,
+          revealHistory: true,
+        },
+      ];
+      rerender(<TerminalPane {...props} outputResetVersion={1} />);
+      await act(async () => {
+        await Promise.resolve();
+        await vi.advanceTimersByTimeAsync(animationFrameMs * 24);
+      });
+
+      const Ghostty = (globalThis as {
+        __TERMD_TEST_GHOSTTY__?: { viewportY: () => number; baseY: () => number };
+      }).__TERMD_TEST_GHOSTTY__;
+      expect(Ghostty?.baseY()).toBeGreaterThan(0);
+      // 中文注释：App 的 full snapshot 重连会重建 Ghostty；reveal intent 必须跟着
+      // snapshot item 进入新实例，否则新实例会按普通 attach 自动贴底。
+      expect(Ghostty?.viewportY()).toBeLessThan(Ghostty?.baseY() ?? 0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("revealHistory snapshot 渲染后不会污染下一次普通 snapshot 贴底", async () => {
+    vi.useFakeTimers();
+    try {
+      const encoder = new TextEncoder();
+      let queue: TerminalOutputItem[] = [
+        {
+          kind: "snapshot",
+          bytes: encoder.encode(Array.from({ length: 220 }, (_, index) => `${index + 1}\n`).join("")),
+          baseSeq: 30,
+          size: DEFAULT_TERMINAL_SIZE,
+          revealHistory: true,
+        },
+      ];
+      const takeOutput = vi.fn(() => queue.splice(0));
+      const registerOutputDrain = vi.fn((drain: () => void) => {
+        drain();
+        return () => undefined;
+      });
+      const props = {
+        attached: true,
+        sessionSize: DEFAULT_TERMINAL_SIZE,
+        takeOutput,
+        registerOutputDrain,
+        onTerminalResync: vi.fn(),
+        onInput: vi.fn(),
+        onResize: vi.fn(),
+        onCursorChange: vi.fn(),
+      };
+
+      const { rerender } = render(<TerminalPane {...props} outputResetVersion={0} />);
+      await act(async () => {
+        await Promise.resolve();
+        await vi.advanceTimersByTimeAsync(animationFrameMs * 24);
+      });
+
+      const firstGhostty = (globalThis as {
+        __TERMD_TEST_GHOSTTY__?: { viewportY: () => number; baseY: () => number };
+      }).__TERMD_TEST_GHOSTTY__;
+      expect(firstGhostty?.baseY()).toBeGreaterThan(0);
+      expect(firstGhostty?.viewportY()).toBeLessThan(firstGhostty?.baseY() ?? 0);
+
+      queue = [
+        {
+          kind: "snapshot",
+          bytes: encoder.encode(Array.from({ length: 220 }, (_, index) => `${index + 1}\n`).join("")),
+          baseSeq: 31,
+          size: DEFAULT_TERMINAL_SIZE,
+        },
+      ];
+      rerender(<TerminalPane {...props} outputResetVersion={1} />);
+      await act(async () => {
+        await Promise.resolve();
+        await vi.advanceTimersByTimeAsync(animationFrameMs * 24);
+      });
+
+      const secondGhostty = (globalThis as {
+        __TERMD_TEST_GHOSTTY__?: { viewportY: () => number; baseY: () => number };
+      }).__TERMD_TEST_GHOSTTY__;
+      // 中文注释：revealHistory 只属于当前 snapshot。下一次普通 attach/theme/full snapshot
+      // 必须恢复默认贴底，不能被上一轮用户上滚意图污染。
+      expect(secondGhostty?.viewportY()).toBe(secondGhostty?.baseY());
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("未消费的 reveal-history 请求在 outputResetVersion 重建时不会污染普通 snapshot", async () => {
+    vi.useFakeTimers();
+    try {
+      const encoder = new TextEncoder();
+      const onTerminalResync = vi.fn();
+      let queue: TerminalOutputItem[] = [
+        { kind: "snapshot", bytes: new Uint8Array(), baseSeq: 0, size: DEFAULT_TERMINAL_SIZE },
+        { kind: "output", bytes: encoder.encode("x".repeat(4 * 1024)), terminalSeq: 1 },
+      ];
+      const takeOutput = vi.fn(() => queue.splice(0));
+      const registerOutputDrain = vi.fn((drain: () => void) => {
+        drain();
+        return () => undefined;
+      });
+      const props = {
+        attached: true,
+        sessionSize: DEFAULT_TERMINAL_SIZE,
+        takeOutput,
+        registerOutputDrain,
+        onTerminalResync,
+        onInput: vi.fn(),
+        onResize: vi.fn(),
+        onCursorChange: vi.fn(),
+      };
+
+      const { rerender } = render(<TerminalPane {...props} outputResetVersion={0} />);
+      await act(async () => {
+        await Promise.resolve();
+        await vi.advanceTimersByTimeAsync(animationFrameMs * 12);
+      });
+
+      const frame = screen.getByTestId("terminal-pane").querySelector<HTMLElement>(".terminal-frame");
+      expect(frame).not.toBeNull();
+      fireEvent.wheel(frame!, { deltaY: -900 });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(animationFrameMs * 4);
+      });
+      expect(onTerminalResync).toHaveBeenCalledWith(undefined, { revealHistory: true });
+
+      queue = [
+        {
+          kind: "snapshot",
+          bytes: encoder.encode(Array.from({ length: 220 }, (_, index) => `${index + 1}\n`).join("")),
+          baseSeq: 31,
+          size: DEFAULT_TERMINAL_SIZE,
+        },
+      ];
+      rerender(<TerminalPane {...props} outputResetVersion={1} />);
+      await act(async () => {
+        await Promise.resolve();
+        await vi.advanceTimersByTimeAsync(animationFrameMs * 24);
+      });
+
+      const Ghostty = (globalThis as {
+        __TERMD_TEST_GHOSTTY__?: { viewportY: () => number; baseY: () => number };
+      }).__TERMD_TEST_GHOSTTY__;
+      expect(Ghostty?.baseY()).toBeGreaterThan(0);
+      // 中文注释：用户上滚意图如果还没等到 snapshot 就遇到 reset，必须随旧 Ghostty buffer 失效。
+      // 新 buffer 收到普通 snapshot 时仍要贴底，不能继承旧 ref 的“停在历史区”行为。
+      expect(Ghostty?.viewportY()).toBe(Ghostty?.baseY());
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("revealHistory 的延迟 RAF 不会作用到新的普通 snapshot", async () => {
+    const rafQueue: FrameRequestCallback[] = [];
+    const rafSpy = vi.spyOn(window, "requestAnimationFrame").mockImplementation(((callback: FrameRequestCallback) => {
+      rafQueue.push(callback);
+      return rafQueue.length;
+    }) as typeof window.requestAnimationFrame);
+    try {
+      const encoder = new TextEncoder();
+      let queue: TerminalOutputItem[] = [
+        {
+          kind: "snapshot",
+          bytes: encoder.encode(Array.from({ length: 220 }, (_, index) => `reveal-${index + 1}\n`).join("")),
+          baseSeq: 30,
+          size: DEFAULT_TERMINAL_SIZE,
+          revealHistory: true,
+        },
+      ];
+      const takeOutput = vi.fn(() => queue.splice(0));
+      const registerOutputDrain = vi.fn((drain: () => void) => {
+        drain();
+        return () => undefined;
+      });
+      const props = {
+        attached: true,
+        sessionSize: DEFAULT_TERMINAL_SIZE,
+        takeOutput,
+        registerOutputDrain,
+        onTerminalResync: vi.fn(),
+        onInput: vi.fn(),
+        onResize: vi.fn(),
+        onCursorChange: vi.fn(),
+      };
+      const { rerender } = render(<TerminalPane {...props} outputResetVersion={0} />);
+
+      const flushQueueUntil = async (predicate: () => boolean) => {
+        let iterations = 0;
+        while (!predicate() && rafQueue.length > 0 && iterations < 40) {
+          const callback = rafQueue.shift();
+          expect(callback).toBeDefined();
+          await act(async () => {
+            callback?.(performance.now());
+            await Promise.resolve();
+          });
+          iterations += 1;
+        }
+        expect(predicate()).toBe(true);
+      };
+
+      await flushQueueUntil(() => (terminalHost().dataset.buffer ?? "").includes("reveal-220"));
+      const pendingRevealCallbacks = [...rafQueue];
+      expect(pendingRevealCallbacks.length).toBeGreaterThan(0);
+      rafQueue.length = 0;
+
+      queue = [
+        {
+          kind: "snapshot",
+          bytes: encoder.encode(Array.from({ length: 220 }, (_, index) => `normal-${index + 1}\n`).join("")),
+          baseSeq: 31,
+          size: DEFAULT_TERMINAL_SIZE,
+        },
+      ];
+      rerender(<TerminalPane {...props} outputResetVersion={1} />);
+      await flushQueueUntil(() => (terminalHost().dataset.buffer ?? "").includes("normal-220"));
+
+      const Ghostty = (globalThis as {
+        __TERMD_TEST_GHOSTTY__?: { viewportY: () => number; baseY: () => number };
+      }).__TERMD_TEST_GHOSTTY__;
+      expect(Ghostty?.baseY()).toBeGreaterThan(0);
+      expect(Ghostty?.viewportY()).toBe(Ghostty?.baseY());
+
+      for (const callback of pendingRevealCallbacks) {
+        act(() => {
+          callback(performance.now());
+        });
+      }
+      expect(Ghostty?.viewportY()).toBe(Ghostty?.baseY());
+    } finally {
+      rafSpy.mockRestore();
+    }
+  });
+
+  it("tmux 全屏 resync 等待 snapshot 期间不会按 cooldown 周期重复请求", async () => {
+    vi.useFakeTimers();
+    try {
+      const onTerminalResync = vi.fn();
+      const encoder = new TextEncoder();
+      let queue: TerminalOutputItem[] = [
+        { kind: "snapshot", bytes: new Uint8Array(), baseSeq: 0, size: DEFAULT_TERMINAL_SIZE },
+        { kind: "output", bytes: encoder.encode("x".repeat(9 * 1024)), terminalSeq: 1 },
+      ];
+      let drainOutput: (() => void) | undefined;
+      const takeOutput = vi.fn(() => queue.splice(0));
+      const registerOutputDrain = vi.fn((drain: () => void) => {
+        drainOutput = drain;
+        drain();
+        return () => undefined;
+      });
+
+      render(
+        <TerminalPane
+          attached
+          sessionSize={{ rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 }}
+          outputResetVersion={0}
+          takeOutput={takeOutput}
+          registerOutputDrain={registerOutputDrain}
+          onTerminalResync={onTerminalResync}
+          onInput={vi.fn()}
+          onResize={vi.fn()}
+          onCursorChange={vi.fn()}
+        />,
+      );
+
+      act(() => {
+        vi.advanceTimersByTime(animationFrameMs * 12);
+      });
+      expect(onTerminalResync).toHaveBeenCalledTimes(1);
+
+      queue = [{ kind: "output", bytes: encoder.encode("y".repeat(9 * 1024)), terminalSeq: 2 }];
+      act(() => {
+        // 中文注释：超过 cooldown 后如果 snapshot 还没回来，pending 标记必须继续挡住重复全量拉取。
+        vi.advanceTimersByTime(6_000);
+        drainOutput?.();
+        vi.advanceTimersByTime(animationFrameMs * 24);
+      });
+
+      expect(onTerminalResync).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("切换 session 后 scrollback resync 冷却会重置", async () => {
+    vi.useFakeTimers();
+    try {
+      const onTerminalResync = vi.fn();
+      const encoder = new TextEncoder();
+      let queue: TerminalOutputItem[] = [
+        { kind: "snapshot", bytes: new Uint8Array(), baseSeq: 0, size: DEFAULT_TERMINAL_SIZE },
+        { kind: "output", bytes: encoder.encode("x".repeat(9 * 1024)), terminalSeq: 1 },
+      ];
+      let drainOutput: (() => void) | undefined;
+      const takeOutput = vi.fn(() => queue.splice(0));
+      const registerOutputDrain = vi.fn((drain: () => void) => {
+        drainOutput = drain;
+        drain();
+        return () => undefined;
+      });
+      const props = {
+        attached: true,
+        sessionSize: DEFAULT_TERMINAL_SIZE,
+        outputResetVersion: 0,
+        takeOutput,
+        registerOutputDrain,
+        onTerminalResync,
+        onInput: vi.fn(),
+        onResize: vi.fn(),
+        onCursorChange: vi.fn(),
+      };
+
+      const { rerender } = render(<TerminalPane {...props} />);
+
+      await act(async () => {
+        await Promise.resolve();
+        await vi.advanceTimersByTimeAsync(animationFrameMs * 12);
+      });
+      expect(onTerminalResync).toHaveBeenCalledTimes(1);
+
+      queue = [
+        { kind: "snapshot", bytes: new Uint8Array(), baseSeq: 0, size: DEFAULT_TERMINAL_SIZE },
+        { kind: "output", bytes: encoder.encode("y".repeat(9 * 1024)), terminalSeq: 1 },
+      ];
+      rerender(<TerminalPane {...props} outputResetVersion={1} />);
+
+      await act(async () => {
+        drainOutput?.();
+        await vi.advanceTimersByTimeAsync(animationFrameMs * 12);
+      });
+
+      // 中文注释：新 session 重新挂载后，第一次无 scrollback burst 必须能再次触发 resync；
+      // 否则旧 session 的 cooldown 会把历史拉取挡住，用户上滚看到的就不是历史内容。
+      expect(onTerminalResync).toHaveBeenCalledTimes(2);
     } finally {
       vi.useRealTimers();
     }
@@ -732,10 +1795,10 @@ describe("TerminalPane terminal sequence rendering", () => {
   it("切换 session 时旧的异步 write 回调不能阻塞或确认新 session", async () => {
     vi.useFakeTimers();
     try {
-      (globalThis as { __TERMD_TEST_DEFER_XTERM_RENDER_UNTIL_WRITE_CALLBACK__?: boolean })
-        .__TERMD_TEST_DEFER_XTERM_RENDER_UNTIL_WRITE_CALLBACK__ = true;
-      (globalThis as { __TERMD_TEST_SERIALIZE_XTERM_WRITES__?: boolean })
-        .__TERMD_TEST_SERIALIZE_XTERM_WRITES__ = true;
+      (globalThis as { __TERMD_TEST_DEFER_GHOSTTY_RENDER_UNTIL_WRITE_CALLBACK__?: boolean })
+        .__TERMD_TEST_DEFER_GHOSTTY_RENDER_UNTIL_WRITE_CALLBACK__ = true;
+      (globalThis as { __TERMD_TEST_SERIALIZE_GHOSTTY_WRITES__?: boolean })
+        .__TERMD_TEST_SERIALIZE_GHOSTTY_WRITES__ = true;
       const encoder = new TextEncoder();
       let queue: TerminalOutputItem[] = [
         { kind: "snapshot", bytes: encoder.encode("old-session\n"), baseSeq: 10, size: DEFAULT_TERMINAL_SIZE },
@@ -765,10 +1828,11 @@ describe("TerminalPane terminal sequence rendering", () => {
         />,
       );
 
-      act(() => {
-        vi.advanceTimersByTime(animationFrameMs);
+      await act(async () => {
+        await Promise.resolve();
+        await vi.advanceTimersByTimeAsync(animationFrameMs * 2);
       });
-      expect((globalThis as { __TERMD_TEST_XTERM_STATS__?: { writes: number } }).__TERMD_TEST_XTERM_STATS__?.writes).toBe(1);
+      expect((globalThis as { __TERMD_TEST_TERMINAL_STATS__?: { writes: number } }).__TERMD_TEST_TERMINAL_STATS__?.writes).toBe(1);
       expect(onTerminalSeqRendered).not.toHaveBeenCalled();
 
       queue = [
@@ -789,28 +1853,28 @@ describe("TerminalPane terminal sequence rendering", () => {
         />,
       );
 
-      expect(onOutputResetApplied).toHaveBeenCalledWith(1);
-      act(() => {
+      await act(async () => {
         drainOutput?.();
-        vi.advanceTimersByTime(animationFrameMs);
+        await vi.advanceTimersByTimeAsync(animationFrameMs * 2);
       });
+      expect(onOutputResetApplied).toHaveBeenCalledWith(1);
 
       // 中文注释：旧 session 的 write 回调尚未返回时，新 session 的 snapshot 也必须能开始写入；
       // 否则用户快速切 session 会被旧的大量输出拖住，表现为整个 Web 延迟数秒。
-      expect((globalThis as { __TERMD_TEST_XTERM_STATS__?: { writes: number } }).__TERMD_TEST_XTERM_STATS__?.writes).toBe(2);
+      expect((globalThis as { __TERMD_TEST_TERMINAL_STATS__?: { writes: number } }).__TERMD_TEST_TERMINAL_STATS__?.writes).toBe(2);
 
       act(() => {
         vi.advanceTimersByTime(animationFrameMs * 6);
       });
 
       expect(onTerminalSeqRendered.mock.calls).toEqual([[30]]);
-      const xterm = screen.getByTestId("terminal-pane").querySelector<HTMLElement>(".xterm");
+      const host = terminalHost();
       act(() => {
         // 中文注释：TerminalPane 在 write callback 之后再排一帧 refresh；这里单独推进，确认新实例完成绘制。
         vi.advanceTimersByTime(animationFrameMs);
       });
-      expect(xterm?.dataset.buffer).toContain("new-session");
-      expect(xterm?.dataset.buffer).not.toContain("old-session");
+      expect(host.dataset.buffer).toContain("new-session");
+      expect(host.dataset.buffer).not.toContain("old-session");
     } finally {
       vi.useRealTimers();
     }
@@ -854,7 +1918,7 @@ describe("TerminalPane terminal search", () => {
       await betaSearch.promise;
     });
     expect(await screen.findByText("1/2")).toBeInTheDocument();
-    expect(screen.getByTestId("xterm-search-highlight")).toHaveTextContent("beta");
+    expect(screen.getByTestId("terminal-search-highlight")).toHaveTextContent("beta");
 
     await act(async () => {
       alphaSearch.resolve(searchResult("alpha", 1));
@@ -862,7 +1926,7 @@ describe("TerminalPane terminal search", () => {
     });
 
     expect(screen.getByText("1/2")).toBeInTheDocument();
-    expect(screen.getByTestId("xterm-search-highlight")).toHaveTextContent("beta");
+    expect(screen.getByTestId("terminal-search-highlight")).toHaveTextContent("beta");
   });
 });
 
@@ -988,7 +2052,155 @@ describe("TerminalPane mobile direction gesture", () => {
 });
 
 describe("TerminalPane terminal sizing", () => {
-  it("聚焦终端上报 resize 时先按本地可用高度撑开 xterm", async () => {
+  it("刷新和聚焦期间同一行列尺寸只上报一次", () => {
+    vi.useFakeTimers();
+    let hostWidth = 800;
+    let hostHeight = 500;
+    const clientWidthSpy = vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockImplementation(function (this: HTMLElement) {
+      return this.classList.contains("terminal-host") ? hostWidth : 0;
+    });
+    const clientHeightSpy = vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockImplementation(function (this: HTMLElement) {
+      return this.classList.contains("terminal-host") ? hostHeight : 0;
+    });
+    try {
+      const onResize = vi.fn();
+      const takeOutput = vi.fn(() => []);
+      const registerOutputDrain = vi.fn(() => () => undefined);
+      (globalThis as { __TERMD_TEST_FIT_DIMENSIONS__?: { rows: number; cols: number } }).__TERMD_TEST_FIT_DIMENSIONS__ = {
+        rows: 31,
+        cols: 101,
+      };
+      render(
+        <TerminalPane
+          attached
+          sessionSize={{ rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 }}
+          focusRequest={1}
+          outputResetVersion={0}
+          takeOutput={takeOutput}
+          registerOutputDrain={registerOutputDrain}
+          onInput={vi.fn()}
+          onResize={onResize}
+          onCursorChange={vi.fn()}
+        />,
+      );
+
+      act(() => {
+        vi.advanceTimersByTime(animationFrameMs * 12);
+      });
+      hostWidth = 801;
+      hostHeight = 501;
+      act(() => {
+        window.dispatchEvent(new Event("resize"));
+        vi.advanceTimersByTime(animationFrameMs * 4);
+      });
+
+      // 中文注释：刷新后 focusRequest、focusin、ResizeObserver/window resize
+      // 都可能撞在同一轮布局里；相同 rows/cols 不应该因为像素抖动被重复写回 PTY。
+      expect(onResize.mock.calls.map(([size]) => `${size.cols}x${size.rows}`)).toEqual(["101x31"]);
+    } finally {
+      clientWidthSpy.mockRestore();
+      clientHeightSpy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("刷新和聚焦期间经过临时行列尺寸时只上报最终尺寸", () => {
+    vi.useFakeTimers();
+    try {
+      const onResize = vi.fn();
+      const takeOutput = vi.fn(() => []);
+      const registerOutputDrain = vi.fn(() => () => undefined);
+      (globalThis as { __TERMD_TEST_FIT_DIMENSIONS__?: { rows: number; cols: number } }).__TERMD_TEST_FIT_DIMENSIONS__ = {
+        rows: 29,
+        cols: 96,
+      };
+      render(
+        <TerminalPane
+          attached
+          sessionSize={{ rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 }}
+          focusRequest={1}
+          outputResetVersion={0}
+          takeOutput={takeOutput}
+          registerOutputDrain={registerOutputDrain}
+          onInput={vi.fn()}
+          onResize={onResize}
+          onCursorChange={vi.fn()}
+        />,
+      );
+
+      act(() => {
+        vi.advanceTimersByTime(animationFrameMs);
+      });
+      (globalThis as { __TERMD_TEST_FIT_DIMENSIONS__?: { rows: number; cols: number } }).__TERMD_TEST_FIT_DIMENSIONS__ = {
+        rows: 31,
+        cols: 101,
+      };
+      act(() => {
+        window.dispatchEvent(new Event("resize"));
+        vi.advanceTimersByTime(animationFrameMs * 12);
+      });
+
+      // 中文注释：浏览器 reload/focus 时布局可能先给出临时行列，再稳定到最终行列。
+      // 对 shared PTY 只能上报最终行列，避免 tmux/daemon 被中间尺寸来回 resize。
+      expect(onResize.mock.calls.map(([size]) => `${size.cols}x${size.rows}`)).toEqual(["101x31"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("刷新和聚焦期间的临时行列变化会先遮住 canvas", () => {
+    vi.useFakeTimers();
+    try {
+      const onResize = vi.fn();
+      const takeOutput = vi.fn(() => []);
+      const registerOutputDrain = vi.fn(() => () => undefined);
+      (globalThis as { __TERMD_TEST_FIT_DIMENSIONS__?: { rows: number; cols: number } }).__TERMD_TEST_FIT_DIMENSIONS__ = {
+        rows: 29,
+        cols: 96,
+      };
+      render(
+        <TerminalPane
+          attached
+          sessionSize={{ rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 }}
+          outputResetVersion={0}
+          takeOutput={takeOutput}
+          registerOutputDrain={registerOutputDrain}
+          onInput={vi.fn()}
+          onResize={onResize}
+          onCursorChange={vi.fn()}
+        />,
+      );
+
+      const terminalInput = screen.getByRole("textbox", { name: "Terminal input" });
+      act(() => {
+        terminalInput.focus();
+      });
+
+      (globalThis as { __TERMD_TEST_FIT_DIMENSIONS__?: { rows: number; cols: number } }).__TERMD_TEST_FIT_DIMENSIONS__ = {
+        rows: 31,
+        cols: 101,
+      };
+      act(() => {
+        window.dispatchEvent(new Event("resize"));
+      });
+      const host = screen.getByRole("textbox", { name: "Terminal input" });
+      expect(host).toHaveAttribute("data-termd-resize-stabilizing", "true");
+      act(() => {
+        vi.advanceTimersByTime(240);
+      });
+      expect(host).not.toHaveAttribute("data-termd-resize-stabilizing");
+      expect(onResize).toHaveBeenCalledWith({
+        rows: 31,
+        cols: 101,
+        pixel_width: expect.any(Number),
+        pixel_height: expect.any(Number),
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("聚焦终端上报 resize 时先按本地可用高度撑开 Ghostty", async () => {
     const onResize = vi.fn();
     const takeOutput = vi.fn(() => []);
     const registerOutputDrain = vi.fn(() => () => undefined);
@@ -1009,7 +2221,7 @@ describe("TerminalPane terminal sizing", () => {
       />,
     );
 
-    const terminalInput = document.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
+    const terminalInput = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
     expect(terminalInput).not.toBeNull();
     terminalInput!.focus();
 
@@ -1022,12 +2234,12 @@ describe("TerminalPane terminal sizing", () => {
       }),
     );
     const operations = (globalThis as {
-      __TERMD_TEST_XTERM_STATS__?: {
+      __TERMD_TEST_TERMINAL_STATS__?: {
         operations: Array<{ op: string; cols?: number; rows?: number }>;
       };
-    }).__TERMD_TEST_XTERM_STATS__?.operations ?? [];
+    }).__TERMD_TEST_TERMINAL_STATS__?.operations ?? [];
     // 中文注释：daemon 确认可能因为持续输出延迟；聚焦客户端仍要先撑开本地视口，
-    // 否则 xterm 会长期停在默认 24 行，外层面板下方只剩大片空白。
+    // 否则 Ghostty 会长期停在默认 24 行，外层面板下方只剩大片空白。
     expect(operations).toContainEqual({ op: "resize", cols: 101, rows: 31 });
   });
 
@@ -1044,8 +2256,8 @@ describe("TerminalPane terminal sizing", () => {
         drain();
         return () => undefined;
       });
-      (globalThis as { __TERMD_TEST_DEFER_XTERM_RENDER_UNTIL_WRITE_CALLBACK__?: boolean })
-        .__TERMD_TEST_DEFER_XTERM_RENDER_UNTIL_WRITE_CALLBACK__ = true;
+      (globalThis as { __TERMD_TEST_DEFER_GHOSTTY_RENDER_UNTIL_WRITE_CALLBACK__?: boolean })
+        .__TERMD_TEST_DEFER_GHOSTTY_RENDER_UNTIL_WRITE_CALLBACK__ = true;
       (globalThis as { __TERMD_TEST_FIT_DIMENSIONS__?: { rows: number; cols: number } }).__TERMD_TEST_FIT_DIMENSIONS__ = {
         rows: 31,
         cols: 101,
@@ -1094,7 +2306,7 @@ describe("TerminalPane terminal sizing", () => {
       fireEvent.click(frame!);
       expect(onResize).not.toHaveBeenCalled();
 
-      // 中文注释：snapshot 字节写入期间不能改 xterm 尺寸；但用户的主动聚焦不能丢，
+      // 中文注释：snapshot 字节写入期间不能改 Ghostty 尺寸；但用户的主动聚焦不能丢，
       // snapshot 完成后要补发一次 resize，让当前客户端重新接管 shared PTY 尺寸。
       act(() => {
         vi.advanceTimersByTime(animationFrameMs * 32);
@@ -1106,14 +2318,69 @@ describe("TerminalPane terminal sizing", () => {
         pixel_height: expect.any(Number),
       });
       const operations = (globalThis as {
-        __TERMD_TEST_XTERM_STATS__?: {
+        __TERMD_TEST_TERMINAL_STATS__?: {
           operations: Array<{ op: string; cols?: number; rows?: number; text?: string }>;
         };
-      }).__TERMD_TEST_XTERM_STATS__?.operations ?? [];
+      }).__TERMD_TEST_TERMINAL_STATS__?.operations ?? [];
       expect(operations).toContainEqual({ op: "resize", cols: 101, rows: 31 });
       expect(
         operations.some((operation) => operation.op === "write" && operation.text === "\x1b7\x1b[r\x1b8"),
       ).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("reload snapshot 从旧尺寸恢复时只补发最终本地尺寸", () => {
+    vi.useFakeTimers();
+    try {
+      const onResize = vi.fn();
+      const encoder = new TextEncoder();
+      let queue: TerminalOutputItem[] = [
+        {
+          kind: "snapshot",
+          bytes: encoder.encode("reload-old-size\n"),
+          baseSeq: 0,
+          size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+        },
+      ];
+      const takeOutput = vi.fn(() => queue.splice(0));
+      const registerOutputDrain = vi.fn((drain: () => void) => {
+        drain();
+        return () => undefined;
+      });
+      (globalThis as { __TERMD_TEST_FIT_DIMENSIONS__?: { rows: number; cols: number } }).__TERMD_TEST_FIT_DIMENSIONS__ = {
+        rows: 31,
+        cols: 101,
+      };
+      render(
+        <TerminalPane
+          attached
+          sessionSize={{ rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 }}
+          focusRequest={1}
+          outputResetVersion={0}
+          takeOutput={takeOutput}
+          registerOutputDrain={registerOutputDrain}
+          onInput={vi.fn()}
+          onResize={onResize}
+          onCursorChange={vi.fn()}
+        />,
+      );
+
+      act(() => {
+        vi.advanceTimersByTime(animationFrameMs * 32);
+      });
+
+      // 中文注释：reload snapshot 会先按 daemon 的旧 80x24 重放，但对 PTY 的回写
+      // 只能是当前浏览器最终尺寸；不允许 80x24 和中间尺寸反复打回 daemon。
+      expect(onResize.mock.calls.map(([size]) => `${size.cols}x${size.rows}`)).toEqual(["101x31"]);
+      const operations = (globalThis as {
+        __TERMD_TEST_TERMINAL_STATS__?: {
+          operations: Array<{ op: string; cols?: number; rows?: number }>;
+        };
+      }).__TERMD_TEST_TERMINAL_STATS__?.operations ?? [];
+      expect(operations.filter((operation) => operation.op === "resize" && operation.cols === 80 && operation.rows === 24)).toEqual([]);
+      expect(operations).toContainEqual({ op: "resize", cols: 101, rows: 31 });
     } finally {
       vi.useRealTimers();
     }
@@ -1143,7 +2410,7 @@ describe("TerminalPane terminal sizing", () => {
         onCursorChange={vi.fn()}
       />,
     );
-    const terminalInput = document.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
+    const terminalInput = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
     expect(terminalInput).not.toBeNull();
     terminalInput!.focus();
     await waitFor(() => expect(document.activeElement).toBe(terminalInput));
@@ -1200,7 +2467,7 @@ describe("TerminalPane terminal sizing", () => {
         onCursorChange={vi.fn()}
       />,
     );
-    const terminalInput = document.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
+    const terminalInput = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
     expect(terminalInput).not.toBeNull();
     terminalInput!.focus();
     await waitFor(() => expect(document.activeElement).toBe(terminalInput));
@@ -1261,7 +2528,7 @@ describe("TerminalPane terminal sizing", () => {
         onCursorChange={vi.fn()}
       />,
     );
-    const terminalInput = document.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
+    const terminalInput = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
     expect(terminalInput).not.toBeNull();
     terminalInput!.focus();
     await waitFor(() => expect(document.activeElement).toBe(terminalInput));

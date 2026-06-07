@@ -11,7 +11,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, types
 use termd_proto::{ClientId, DeviceId, SessionId, SessionState, TerminalSize, UnixTimestampMillis};
 use uuid::Uuid;
 
-use super::{StateError, sqlite_state_path_for_state_path};
+use super::{StateError, StateStore, sqlite_state_path_for_state_path, write_sqlite_state_version};
 
 /// 客户端列表返回给协议层的持久化摘要。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,12 +55,14 @@ pub struct ClientHistoryStore {
 impl ClientHistoryStore {
     /// 打开或创建 SQLite store，并把运行态字段重置为离线。
     pub fn open(state_path: impl AsRef<Path>) -> Result<Self, StateError> {
+        StateStore::ensure_compatible(state_path.as_ref())?;
         let path = sqlite_state_path_for_state_path(state_path.as_ref());
         ensure_parent_directory(&path)?;
 
         let conn = Connection::open(&path).map_err(|source| sqlite_error(&path, source))?;
         let mut store = Self { path, conn };
         store.initialize()?;
+        write_sqlite_state_version(&store.conn, &store.path)?;
         Ok(store)
     }
 
@@ -1385,9 +1387,9 @@ mod tests {
     }
 
     #[test]
-    fn store_migrates_legacy_session_rows_into_stable_display_order() {
+    fn store_rejects_legacy_session_rows_without_state_schema_version() {
         let state_path = std::env::temp_dir().join(format!(
-            "termd-session-order-migration-{}.json",
+            "termd-session-order-legacy-reject-{}.json",
             std::process::id()
         ));
         let sqlite_path = sqlite_state_path_for_state_path(&state_path);
@@ -1415,6 +1417,82 @@ mod tests {
                 "#,
             )
             .unwrap();
+            conn.execute(
+                r#"
+                INSERT INTO daemon_sessions (
+                    session_id, name, state, rows, cols, pixel_width, pixel_height,
+                    root_path, files_path, created_at_ms, updated_at_ms
+                )
+                VALUES (?1, 'old', 'running', 24, 80, 0, 0, '/home/me', NULL, 1000, 1000)
+                "#,
+                params![session_id_text(old_session_id)],
+            )
+            .unwrap();
+            conn.execute(
+                r#"
+                INSERT INTO daemon_sessions (
+                    session_id, name, state, rows, cols, pixel_width, pixel_height,
+                    root_path, files_path, created_at_ms, updated_at_ms
+                )
+                VALUES (?1, 'new', 'running', 24, 80, 0, 0, '/home/me', NULL, 2000, 2000)
+                "#,
+                params![session_id_text(new_session_id)],
+            )
+            .unwrap();
+        }
+
+        let error = ClientHistoryStore::open(&state_path).unwrap_err();
+
+        assert!(matches!(
+            error,
+            StateError::IncompatibleVersion {
+                found: None,
+                expected: super::super::STATE_SCHEMA_VERSION,
+                ..
+            }
+        ));
+
+        let _ = fs::remove_file(sqlite_state_path_for_state_path(&state_path));
+        let _ = fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn store_patches_v2_session_rows_into_stable_display_order() {
+        let state_path = std::env::temp_dir().join(format!(
+            "termd-session-order-v2-patch-{}.json",
+            std::process::id()
+        ));
+        let sqlite_path = sqlite_state_path_for_state_path(&state_path);
+        let _ = fs::remove_file(&sqlite_path);
+        let old_session_id = SessionId::new();
+        let new_session_id = SessionId::new();
+
+        {
+            let conn = Connection::open(&sqlite_path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE daemon_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at_ms INTEGER NOT NULL
+                );
+                CREATE TABLE daemon_sessions (
+                    session_id TEXT PRIMARY KEY,
+                    name TEXT,
+                    state TEXT NOT NULL,
+                    rows INTEGER NOT NULL,
+                    cols INTEGER NOT NULL,
+                    pixel_width INTEGER NOT NULL,
+                    pixel_height INTEGER NOT NULL,
+                    root_path TEXT NOT NULL,
+                    files_path TEXT,
+                    created_at_ms INTEGER NOT NULL,
+                    updated_at_ms INTEGER NOT NULL
+                );
+                "#,
+            )
+            .unwrap();
+            write_sqlite_state_version(&conn, &sqlite_path).unwrap();
             conn.execute(
                 r#"
                 INSERT INTO daemon_sessions (

@@ -115,6 +115,7 @@ const enUS = {
 
   "sessions.aria": "sessions",
   "sessions.empty": "No sessions",
+  "sessions.creating": "Creating session",
   "sessions.open": "Open {name}",
   "sessions.openNewOutput": "Open {name}, new output",
   "sessions.select": "Select {name}",
@@ -216,7 +217,6 @@ const enUS = {
   "terminal.mobileShortcuts": "mobile terminal shortcuts",
   "terminal.mobileDirection": "mobile direction gesture",
   "terminal.copied": "Copied",
-  "terminal.scroll": "Terminal scroll",
   "terminal.sendTab": "Send Tab",
   "terminal.sendEscape": "Send Escape",
   "terminal.sendCtrlC": "Send Ctrl-C",
@@ -377,6 +377,7 @@ const zhCN: Record<TranslationKey, string> = {
 
   "sessions.aria": "会话",
   "sessions.empty": "没有会话",
+  "sessions.creating": "正在创建会话",
   "sessions.open": "打开 {name}",
   "sessions.openNewOutput": "打开 {name}，有新输出",
   "sessions.select": "选择 {name}",
@@ -478,7 +479,6 @@ const zhCN: Record<TranslationKey, string> = {
   "terminal.mobileShortcuts": "移动端终端快捷键",
   "terminal.mobileDirection": "移动端方向手势",
   "terminal.copied": "复制成功",
-  "terminal.scroll": "终端滚动",
   "terminal.sendTab": "发送 Tab",
   "terminal.sendEscape": "发送 Escape",
   "terminal.sendCtrlC": "发送 Ctrl-C",

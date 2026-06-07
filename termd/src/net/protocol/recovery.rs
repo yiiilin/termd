@@ -340,9 +340,10 @@ fn default_restored_session_name(session_id: SessionId) -> String {
 fn restore_info_is_reconnectable(restore_info: Option<&PtyRestoreInfo>) -> bool {
     matches!(
         restore_info,
-        Some(PtyRestoreInfo::UnixSocket {
-            supervisor_status: PtySupervisorStatus::Running,
-            ..
-        })
+        Some(PtyRestoreInfo::Tmux { .. })
+            | Some(PtyRestoreInfo::UnixSocket {
+                supervisor_status: PtySupervisorStatus::Running,
+                ..
+            })
     )
 }

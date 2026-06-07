@@ -40,7 +40,9 @@ use tracing::{debug, info, warn};
 
 use crate::auth::current_unix_timestamp_millis;
 use crate::config::DaemonConfig;
+use crate::pty::PtyRestoreInfo;
 use crate::pty::supervisor::SupervisorPtyBackend;
+use crate::pty::tmux::TmuxPtyBackend;
 use crate::state::{StateError, StateStore};
 
 use super::protocol::{
@@ -51,6 +53,7 @@ use super::protocol::{
 };
 use super::signature::Ed25519SignatureVerifier;
 use super::{decode_binary_encrypted_frame, encode_binary_encrypted_frame};
+#[cfg(test)]
 pub(crate) use recovery::adopt_or_repair_runtime_sessions_from_supervisors;
 use recovery::warn_about_orphaned_supervisors;
 
@@ -360,7 +363,7 @@ struct WebSocketWatcherCounts {
     resize: usize,
 }
 
-pub type DefaultDaemonProtocol = DaemonProtocol<SupervisorPtyBackend, Ed25519SignatureVerifier>;
+pub type DefaultDaemonProtocol = DaemonProtocol<TmuxPtyBackend, Ed25519SignatureVerifier>;
 /// daemon 的协议核心仍是单线程语义，但等待这把锁必须让出 Tokio worker。
 ///
 /// 直连 WebSocket 和 relay mux 共用同一个协议状态；如果使用 `std::sync::Mutex`，
@@ -384,7 +387,7 @@ pub enum ServerError {
     MissingTlsPrivateKey,
     #[error("TLS configuration is invalid")]
     TlsConfig,
-    #[error("daemon state persistence failed")]
+    #[error("daemon state persistence failed: {0}")]
     State(#[from] StateError),
 }
 
@@ -434,45 +437,28 @@ struct LocalPairingTokenPayload {
 
 /// 构造生产默认协议状态，并接入本地状态文件。
 pub fn try_default_protocol(config: DaemonConfig) -> Result<SharedDaemonProtocol, ServerError> {
+    let state = StateStore::load(&config.state_path)?;
     cleanup_persisted_session_file_http_uploads(&config.state_path)?;
-    let mut state = StateStore::load(&config.state_path)?;
     let supervisor_backend = SupervisorPtyBackend::for_state_path(&config.state_path);
-    let mut live_supervisor_session_ids: Option<HashSet<SessionId>> = None;
-    let repaired_count = match supervisor_backend.live_supervisor_restore_candidates() {
-        Ok(supervisors) => {
-            let session_ids = supervisors
-                .iter()
-                .filter_map(|supervisor| uuid::Uuid::parse_str(&supervisor.session_id).ok())
-                .map(SessionId)
-                .collect::<HashSet<_>>();
-            live_supervisor_session_ids = Some(session_ids);
-            adopt_or_repair_runtime_sessions_from_supervisors(
-                &mut state,
-                supervisors,
-                current_unix_timestamp_millis(),
-            )
-        }
-        // /proc 不可读只会影响异常升级恢复，不能阻断 daemon 正常启动。
-        Err(error) => {
-            warn!(%error, "failed to inspect live session supervisors");
-            0
-        }
-    };
-    if repaired_count > 0 {
-        warn!(
-            repaired_count,
-            "adopted or repaired live session supervisors in runtime state"
-        );
-    }
+    // 中文注释：state schema v2 进入 tmux session host 重构后，旧 supervisor 进程
+    // 不能再被生产启动路径自动 adopt 回 SQLite；否则用户 reset state 后仍可能被旧
+    // UnixSocket restore_info 污染。这里仅保留孤儿告警，后续 tmux backend 会接管恢复。
     let valid_supervisor_session_ids = state
         .sessions
         .iter()
-        .filter(|session| session.state == SessionState::Running && session.restore_info.is_some())
+        .filter(|session| {
+            session.state == SessionState::Running
+                && matches!(
+                    session.restore_info,
+                    Some(PtyRestoreInfo::UnixSocket { .. })
+                )
+        })
         .map(|session| session.session_id.0.to_string());
     warn_about_orphaned_supervisors(&supervisor_backend, valid_supervisor_session_ids);
+    let tmux_backend = TmuxPtyBackend::for_state_path(&config.state_path);
     let protocol = DaemonProtocol::from_state(
         config.clone(),
-        supervisor_backend,
+        tmux_backend,
         Ed25519SignatureVerifier,
         state,
     )?;
@@ -480,7 +466,13 @@ pub fn try_default_protocol(config: DaemonConfig) -> Result<SharedDaemonProtocol
         .snapshot_state()
         .sessions
         .into_iter()
-        .filter(|session| session.state == SessionState::Running && session.restore_info.is_some())
+        .filter(|session| {
+            session.state == SessionState::Running
+                && matches!(
+                    session.restore_info,
+                    Some(PtyRestoreInfo::UnixSocket { .. })
+                )
+        })
         .map(|session| session.session_id.0.to_string())
         .collect::<Vec<_>>();
     warn_about_orphaned_supervisors(
@@ -490,10 +482,9 @@ pub fn try_default_protocol(config: DaemonConfig) -> Result<SharedDaemonProtocol
     // 首次启动时立即写入 daemon identity，避免已展示的 server id 只停留在内存里。
     let mut protocol = protocol;
     protocol.persist_state()?;
-    if let Some(protected_session_ids) = live_supervisor_session_ids.as_ref() {
-        if let Err(error) = protocol.prune_closed_sessions_except(protected_session_ids) {
-            warn!(%error, "failed to prune closed session records during startup");
-        }
+    let protected_session_ids = HashSet::new();
+    if let Err(error) = protocol.prune_closed_sessions_except(&protected_session_ids) {
+        warn!(%error, "failed to prune closed session records during startup");
     }
     Ok(Arc::new(Mutex::new(protocol)))
 }
@@ -3135,6 +3126,7 @@ mod tests {
     use std::fs;
     use std::io::{Read, Write};
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use termd_proto::{
         DeviceId, E2eeKeyExchangePayload, Envelope, HttpE2eeAuthPayload, PairAcceptPayload,
         PairRequestPayload, PublicKey, SessionCreatePayload, SessionCreatedPayload,
@@ -3448,12 +3440,19 @@ mod tests {
         );
     }
 
+    static TEST_CONFIG_COUNTER: AtomicU64 = AtomicU64::new(0);
+
     fn test_config(name: &str) -> DaemonConfig {
-        DaemonConfig::default_for_state_path(std::env::temp_dir().join(format!(
-            "termd-server-test-{}-{}-{name}.json",
+        let unique = TEST_CONFIG_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let state_dir = std::env::temp_dir().join(format!(
+            "termd-server-test-{}-{}-{unique}-{name}",
             std::process::id(),
             current_unix_timestamp_millis().0
-        )))
+        ));
+        // 中文注释：tmux backend 会把 socket 放在 state path 边界内。server 单测仍使用
+        // 独立目录，避免并发测试或遗留 socket 影响同一组 daemon 状态。
+        fs::create_dir_all(&state_dir).unwrap();
+        DaemonConfig::default_for_state_path(state_dir.join("daemon-state.json"))
     }
 
     fn test_protocol(name: &str) -> SharedDaemonProtocol {
@@ -5006,19 +5005,30 @@ mod tests {
         // 这里不再向 WebSocket 发送 ping 或任意业务帧；PTY 后续输出必须由 daemon 主动推送。
         // 等待窗口需要覆盖 CI 或本地 workspace 并发测试时的 PTY 进程启动抖动，
         // 这个值不是产品 WebSocket 的超时语义。
-        let pushed = timeout(
-            Duration::from_secs(8),
-            read_encrypted_ws(&mut socket, &mut device_session),
-        )
-        .await
-        .expect("daemon should push PTY output without client pull frames");
-        assert_eq!(pushed.kind, MessageType::SessionData);
-        let payload: SessionDataPayload = decode_payload(pushed.payload).unwrap();
-        assert_eq!(payload.session_id, created_payload.session_id);
-        let output = base64::engine::general_purpose::STANDARD
-            .decode(payload.data_base64)
-            .unwrap();
-        assert_eq!(output, b"pushed-output");
+        let mut pushed_output = Vec::new();
+        let push_deadline = Instant::now() + Duration::from_secs(8);
+        while !pushed_output
+            .windows(b"pushed-output".len())
+            .any(|window| window == b"pushed-output")
+        {
+            let remaining = push_deadline.saturating_duration_since(Instant::now());
+            let pushed = timeout(
+                remaining,
+                read_encrypted_ws(&mut socket, &mut device_session),
+            )
+            .await
+            .expect("daemon should push PTY output without client pull frames");
+            if pushed.kind != MessageType::SessionData {
+                continue;
+            }
+            let payload: SessionDataPayload = decode_payload(pushed.payload).unwrap();
+            assert_eq!(payload.session_id, created_payload.session_id);
+            pushed_output.extend(
+                base64::engine::general_purpose::STANDARD
+                    .decode(payload.data_base64)
+                    .unwrap(),
+            );
+        }
 
         server.abort();
     }

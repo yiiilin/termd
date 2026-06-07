@@ -600,27 +600,135 @@ async function clickSessionCard(
   await user.click(sessionButtons[0]);
 }
 
+async function exerciseTmuxBackedWebLifecycle(
+  user: ReturnType<typeof userEvent.setup>,
+  daemon: MockDaemon,
+  input: {
+    sessionId: UUID;
+    readyText: string;
+    cwd: string;
+    fileName: string;
+    inputText: string;
+    postReconnectText: string;
+  },
+): Promise<void> {
+  const sessionListRequests = () =>
+    daemon.receivedPackets.filter((packet) => packet.kind === "request" && packet.method === "session.list");
+  const terminalCreateStreams = () =>
+    daemon.receivedPackets.filter((packet) => packet.kind === "stream_open" && packet.method === "terminal.create");
+  const terminalAttachStreams = () =>
+    daemon.receivedPackets.filter((packet) => packet.kind === "stream_open" && packet.method === "terminal.attach");
+
+  await pairWithInvite(user, daemon);
+  await waitForWorkspaceSession("No session");
+  await waitFor(() => expect(sessionListRequests().length).toBeGreaterThan(0));
+
+  await user.click(screen.getByRole("button", { name: "New session" }));
+
+  const sessionName = fallbackSessionDisplayName(input.sessionId);
+  await waitForWorkspaceSession(sessionName);
+  await screen.findByText(new RegExp(input.readyText.trim()));
+  expect(daemon.createdCommands).toEqual([[]]);
+  expect(terminalCreateStreams()).toHaveLength(1);
+  // 中文注释：tmux-backed create 本身已经建立 watched terminal stream；
+  // Web 端不能在 create 后再补一条 attach，否则 relay 排队时会形成重复终端流。
+  expect(terminalAttachStreams()).toHaveLength(0);
+
+  const panel = await screen.findByLabelText("session files");
+  await waitFor(() => expect(within(panel).getByLabelText("Current directory")).toHaveValue(input.cwd));
+  await within(panel).findByText(input.fileName);
+  expect(daemon.sessionFileRequests).toContainEqual({ session_id: input.sessionId });
+
+  const terminalInput = await waitFor(() => {
+    const element = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
+    expect(element).not.toBeNull();
+    return element!;
+  });
+  await waitFor(() => expect(document.activeElement).toBe(terminalInput));
+
+  terminalInput.value = input.inputText;
+  fireEvent.input(terminalInput);
+
+  await waitFor(() => expect(daemon.sessionDataMessages).toContain(input.inputText));
+  expect(daemon.outerWireText()).not.toContain(input.inputText);
+
+  const resizeCountBefore = daemon.sessionResizes.length;
+  (globalThis as { __TERMD_TEST_FIT_DIMENSIONS__?: { rows: number; cols: number } }).__TERMD_TEST_FIT_DIMENSIONS__ = {
+    rows: 33,
+    cols: 111,
+  };
+  terminalInput.focus();
+  fireEvent(window, new Event("resize"));
+  await waitFor(() =>
+    expect(daemon.sessionResizes.slice(resizeCountBefore)).toContainEqual({
+      session_id: input.sessionId,
+      size: { rows: 33, cols: 111, pixel_width: expect.any(Number), pixel_height: expect.any(Number) },
+    }),
+  );
+
+  daemon.dropConnections();
+  await waitFor(
+    () => expect(daemon.attachedSessions).toContain(input.sessionId),
+    { timeout: 2200 },
+  );
+
+  daemon.pushTerminalFrameBatch(input.sessionId, [
+    {
+      kind: "snapshot",
+      session_id: input.sessionId,
+      base_seq: 0,
+      terminal_seq: 1,
+      size: { rows: 33, cols: 111, pixel_width: 0, pixel_height: 0 },
+      data_base64: Buffer.from(input.postReconnectText, "utf8").toString("base64"),
+    },
+  ]);
+
+  await screen.findByText(new RegExp(input.postReconnectText.trim()));
+  expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
+}
+
 function visibleSessionNames(): string[] {
   return Array.from(document.querySelectorAll<HTMLElement>(".session-row strong"))
     .map((element) => element.textContent?.trim() ?? "")
     .filter(Boolean);
 }
 
+function cssRuleBody(css: string, selector: string): string {
+  // 中文注释：这里验证 selector 自己的声明块，避免只搜到零散属性却漏掉全局 button 居中回归。
+  const selectorStart = css.indexOf(`${selector} {`);
+  expect(selectorStart).toBeGreaterThanOrEqual(0);
+  const bodyStart = css.indexOf("{", selectorStart);
+  const bodyEnd = css.indexOf("}", bodyStart);
+  expect(bodyStart).toBeGreaterThanOrEqual(0);
+  expect(bodyEnd).toBeGreaterThan(bodyStart);
+  return css.slice(bodyStart + 1, bodyEnd);
+}
+
 function selectedSessionName(): string | undefined {
   return document.querySelector<HTMLElement>(".session-row.selected strong")?.textContent?.trim();
 }
 
-function resetXtermStats(): { writes: number; refreshes: number; writtenBytes: number } {
-  const scope = globalThis as { __TERMD_TEST_XTERM_STATS__?: { writes: number; refreshes: number; writtenBytes: number } };
-  scope.__TERMD_TEST_XTERM_STATS__ = { writes: 0, refreshes: 0, writtenBytes: 0 };
-  return scope.__TERMD_TEST_XTERM_STATS__;
+function terminalHost(): HTMLElement | null {
+  return document.querySelector<HTMLElement>(".terminal-host");
 }
 
-function triggerXtermSelection(text: string): void {
-  const scope = globalThis as { __TERMD_TEST_XTERM__?: { select: (text: string) => void } };
-  expect(scope.__TERMD_TEST_XTERM__).toBeDefined();
-  // 测试 mock 只暴露选择完成事件，避免测试直接依赖 xterm 内部 DOM 结构。
-  scope.__TERMD_TEST_XTERM__!.select(text);
+function terminalText(): string {
+  // 中文注释：真实 ghostty-web 直接使用 .terminal-host 作为 renderer element；
+  // jsdom mock 会把可断言文本镜像到这个宿主节点，避免测试依赖不存在的内部 wrapper。
+  return terminalHost()?.textContent ?? "";
+}
+
+function resetTerminalStats(): { writes: number; refreshes: number; writtenBytes: number } {
+  const scope = globalThis as { __TERMD_TEST_TERMINAL_STATS__?: { writes: number; refreshes: number; writtenBytes: number } };
+  scope.__TERMD_TEST_TERMINAL_STATS__ = { writes: 0, refreshes: 0, writtenBytes: 0 };
+  return scope.__TERMD_TEST_TERMINAL_STATS__;
+}
+
+function triggerTerminalSelection(text: string): void {
+  const scope = globalThis as { __TERMD_TEST_GHOSTTY__?: { select: (text: string) => void } };
+  expect(scope.__TERMD_TEST_GHOSTTY__).toBeDefined();
+  // 测试 mock 只暴露选择完成事件，避免测试直接依赖 Ghostty 内部 DOM 结构。
+  scope.__TERMD_TEST_GHOSTTY__!.select(text);
 }
 
 function mockTerminalLayout(input: {
@@ -978,7 +1086,7 @@ describe("termui web 工作台", () => {
     const terminalFrame = screen.getByTestId("terminal-pane").querySelector<HTMLElement>(".terminal-frame");
     expect(terminalFrame).not.toBeNull();
     await user.click(terminalFrame!);
-    const terminalInput = document.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
+    const terminalInput = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
     expect(terminalInput).not.toBeNull();
     terminalInput!.value = "after-focus-input";
     fireEvent.input(terminalInput!);
@@ -986,7 +1094,7 @@ describe("termui web 工作台", () => {
     await new Promise((resolve) => window.setTimeout(resolve, 650));
 
     // 中文注释：普通窗口失焦不等于 transport 断开；focus 只能补状态轮询，
-    // 点击 xterm 也只能走同一条 terminal WebSocket 的 resize/cursor/input segment，
+    // 点击 Ghostty 也只能走同一条 terminal WebSocket 的 resize/cursor/input segment，
     // 不能关闭当前 terminal stream 后重新 attach，否则会触发完整 snapshot 重绘。
     expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID]);
     expect(daemon.acceptedConnections).toBe(acceptedConnectionsBeforeBlur);
@@ -1095,7 +1203,7 @@ describe("termui web 工作台", () => {
     );
     expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
     expect(screen.getByTestId("terminal-pane")).toBeInTheDocument();
-    const terminalInput = document.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
+    const terminalInput = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
     expect(terminalInput).not.toBeNull();
     terminalInput!.value = "after-status-close-input";
     fireEvent.input(terminalInput!);
@@ -1261,7 +1369,7 @@ describe("termui web 工作台", () => {
     expect(outputStream?.stream_id).toBeDefined();
 
     const terminalInput = await waitFor(() => {
-      const textarea = document.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
+      const textarea = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
       expect(textarea).not.toBeNull();
       return textarea!;
     });
@@ -1293,6 +1401,32 @@ describe("termui web 工作台", () => {
         preferences: { language: "zh-CN", theme: "light" },
       });
     });
+  });
+
+  it("已 attach 终端切换主题会重建 Ghostty 并请求完整 snapshot", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await screen.findByText(/termd-e2e-ready/);
+    await waitFor(() => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID]));
+
+    const initialTheme = document.documentElement.dataset.theme === "light" ? "light" : "dark";
+    const nextTheme = initialTheme === "light" ? "dark" : "light";
+    await user.click(await screen.findByRole("button", { name: "Settings" }));
+    await user.click(screen.getByLabelText(nextTheme === "light" ? "Light" : "Dark"));
+
+    await waitFor(() => expect(document.documentElement).toHaveAttribute("data-theme", nextTheme));
+    await waitFor(
+      () => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID, DEFAULT_SESSION_ID]),
+      { timeout: 2800 },
+    );
+    const reconnectAttach = daemon.attachRequests.at(-1);
+    // 中文注释：主题变更要走完整 snapshot；如果带 last_terminal_seq，Ghostty 只会增量续写旧主题 buffer。
+    expect(reconnectAttach).toMatchObject({ session_id: DEFAULT_SESSION_ID, watch_updates: true });
+    expect(reconnectAttach?.last_terminal_seq ?? null).toBeNull();
+    expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
   });
 
   it("已配对 web 初次打开和刷新后自动 attach 第一个 session 并显示输出", async () => {
@@ -1797,7 +1931,7 @@ describe("termui web 工作台", () => {
       ).toBe(true),
     );
 
-    const stats = resetXtermStats();
+    const stats = resetTerminalStats();
     daemon.pushTerminalFrame(betaSession.session_id, {
       kind: "output",
       session_id: betaSession.session_id,
@@ -1892,7 +2026,7 @@ describe("termui web 工作台", () => {
     await waitForWorkspaceSession("alpha");
     await screen.findByText(/alpha-ready/);
 
-    const stats = resetXtermStats();
+    const stats = resetTerminalStats();
     const cancelCount = () => daemon.receivedPackets.filter((packet) => packet.kind === "cancel").length;
     const beforeSwitch = cancelCount();
 
@@ -1900,15 +2034,15 @@ describe("termui web 工作台", () => {
     daemon.pushSessionData(alphaSession.session_id, "late-alpha-output\n");
 
     // 旧输出 stream 的关闭必须发生在 attach 合并窗口之前；否则旧 session 的大输出会继续占用
-    // xterm 渲染和当前 session 连接，把新 session 的恢复拖慢。
+    // Ghostty 渲染和当前 session 连接，把新 session 的恢复拖慢。
     await new Promise((resolve) => window.setTimeout(resolve, 30));
 
     expect(cancelCount()).toBeGreaterThan(beforeSwitch);
     expect(stats.writes).toBe(0);
-    expect(document.querySelector<HTMLElement>(".xterm")?.textContent ?? "").not.toContain("late-alpha-output");
+    expect(terminalText()).not.toContain("late-alpha-output");
   });
 
-  it("新 attach 的输出必须等 TerminalPane reset 确认后才写入 xterm", async () => {
+  it("新 attach 的输出必须等 TerminalPane reset 确认后才写入 Ghostty", async () => {
     const user = userEvent.setup();
     const alphaSession = {
       session_id: "00000000-0000-0000-0000-000000000461",
@@ -1943,19 +2077,19 @@ describe("termui web 工作台", () => {
     }
     await screen.findByText(/session-ready/);
 
-    const stats = resetXtermStats();
+    const stats = resetTerminalStats();
     fireEvent.click(screen.getByRole("button", { name: "Open beta" }));
     await waitFor(() => expect(deferredResetConfirmations.length).toBeGreaterThan(0));
     await new Promise((resolve) => window.setTimeout(resolve, 300));
 
     expect(stats.writes).toBe(0);
-    expect(document.querySelector<HTMLElement>(".xterm")?.textContent ?? "").not.toContain("session-ready");
+    expect(terminalText()).not.toContain("session-ready");
 
     while (deferredResetConfirmations.length > 0) {
       deferredResetConfirmations.shift()?.();
     }
 
-    await waitFor(() => expect(document.querySelector<HTMLElement>(".xterm")?.textContent).toContain("session-ready"));
+    await waitFor(() => expect(terminalText()).toContain("session-ready"));
     expect(stats.writes).toBeGreaterThan(0);
   });
 
@@ -1984,16 +2118,16 @@ describe("termui web 工作台", () => {
     await pairWithInvite(user, daemon);
     await waitForWorkspaceSession("alpha");
     await screen.findByText(/alpha-ready/);
-    (globalThis as { __TERMD_TEST_DEFER_XTERM_RENDER_UNTIL_WRITE_CALLBACK__?: boolean })
-      .__TERMD_TEST_DEFER_XTERM_RENDER_UNTIL_WRITE_CALLBACK__ = true;
-    (globalThis as { __TERMD_TEST_DEFER_XTERM_RENDER_READY_AFTER_WRITE_CALLBACK__?: boolean })
-      .__TERMD_TEST_DEFER_XTERM_RENDER_READY_AFTER_WRITE_CALLBACK__ = true;
+    (globalThis as { __TERMD_TEST_DEFER_GHOSTTY_RENDER_UNTIL_WRITE_CALLBACK__?: boolean })
+      .__TERMD_TEST_DEFER_GHOSTTY_RENDER_UNTIL_WRITE_CALLBACK__ = true;
+    (globalThis as { __TERMD_TEST_DEFER_GHOSTTY_RENDER_READY_AFTER_WRITE_CALLBACK__?: boolean })
+      .__TERMD_TEST_DEFER_GHOSTTY_RENDER_READY_AFTER_WRITE_CALLBACK__ = true;
 
     fireEvent.click(screen.getByRole("button", { name: "Open beta" }));
     await waitFor(() => expect(daemon.attachedSessions).toContain(betaSession.session_id));
     await new Promise((resolve) => window.setTimeout(resolve, 120));
     daemon.sessionDataMessages.length = 0;
-    const stats = resetXtermStats();
+    const stats = resetTerminalStats();
 
     daemon.pushTerminalFrameBatch(betaSession.session_id, [
       {
@@ -2012,7 +2146,7 @@ describe("termui web 工作台", () => {
     ]);
 
     await waitFor(() =>
-      expect(document.querySelector<HTMLElement>(".xterm")?.textContent ?? "").toContain("beta-final-tail"),
+      expect(terminalText()).toContain("beta-final-tail"),
     );
     expect(stats.refreshes).toBeGreaterThanOrEqual(2);
     expect(daemon.sessionDataMessages).toEqual([]);
@@ -2058,7 +2192,7 @@ describe("termui web 工作台", () => {
     await waitFor(() => expect(selectedSessionName()).toBe("beta"));
     await waitFor(() => expect(deferredResetConfirmations.length).toBeGreaterThan(0));
     const terminalInput = await waitFor(() => {
-      const input = document.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
+      const input = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
       expect(input).not.toBeNull();
       return input!;
     });
@@ -2204,7 +2338,7 @@ describe("termui web 工作台", () => {
     expect(within(panel).getAllByText("beta-branch").length).toBeGreaterThan(0);
   });
 
-  it("持续输出时合并写入 xterm，并且不为每个输出刷新布局", async () => {
+  it("持续输出时合并写入 Ghostty，并且不为每个输出刷新布局", async () => {
     const user = userEvent.setup();
     render(<App />);
 
@@ -2214,19 +2348,19 @@ describe("termui web 工作台", () => {
     await screen.findByText(/termd-e2e-ready/);
     await new Promise((resolve) => window.setTimeout(resolve, 80));
     daemon.sessionCursorUpdates.length = 0;
-    const stats = resetXtermStats();
+    const stats = resetTerminalStats();
 
     for (let index = 0; index < 80; index += 1) {
       daemon.pushSessionData(DEFAULT_SESSION_ID, `burst-output-${index}\n`);
     }
 
     await waitFor(() =>
-      expect(document.querySelector<HTMLElement>(".xterm")?.textContent).toContain("burst-output-79"),
+      expect(terminalText()).toContain("burst-output-79"),
     );
     await new Promise((resolve) => window.setTimeout(resolve, 160));
 
     expect(stats.writes).toBeLessThan(80);
-    // 队列真正 idle 后允许双帧 refresh 兜住 xterm 尾包绘制；持续输出期间仍不能逐条刷新。
+    // 队列真正 idle 后允许双帧 refresh 兜住 Ghostty 尾包绘制；持续输出期间仍不能逐条刷新。
     expect(stats.refreshes).toBeLessThanOrEqual(2);
     expect(daemon.sessionCursorUpdates.length).toBeLessThan(20);
   });
@@ -2269,14 +2403,14 @@ describe("termui web 工作台", () => {
     // 新输出提示只通过标题颜色表达，避免整行高亮或额外徽标长期占用列表空间。
     expect(screen.queryByText("New output")).toBeNull();
     expect(screen.getByRole("button", { name: "Open shell" })).not.toHaveClass("has-new-output");
-    expect(document.querySelector<HTMLElement>(".xterm")?.textContent).not.toContain("background-work-output");
+    expect(terminalText()).not.toContain("background-work-output");
 
     await clickSessionCard(user, "work");
 
     await waitFor(() => expect(screen.getByRole("button", { name: "Open work" })).not.toHaveClass("has-new-output"));
   });
 
-  it("xterm 鼠标选中后自动复制并提示复制成功", async () => {
+  it("Ghostty 鼠标选中后自动复制并提示复制成功", async () => {
     const user = userEvent.setup();
     const writeTextSpy = vi.spyOn(navigator.clipboard, "writeText").mockResolvedValue();
     render(<App />);
@@ -2286,13 +2420,13 @@ describe("termui web 工作台", () => {
     await clickSessionCard(user);
     await screen.findByText(/termd-e2e-ready/);
 
-    triggerXtermSelection("termd-e2e-ready");
+    triggerTerminalSelection("termd-e2e-ready");
 
     await waitFor(() => expect(writeTextSpy).toHaveBeenCalledWith("termd-e2e-ready"));
     expect(await screen.findByRole("status")).toHaveTextContent("Copied");
   });
 
-  it("点击 xterm 已渲染文字也能聚焦终端", async () => {
+  it("点击 Ghostty 已渲染文字也能聚焦终端", async () => {
     const user = userEvent.setup();
     render(<App />);
 
@@ -2301,19 +2435,19 @@ describe("termui web 工作台", () => {
     await clickSessionCard(user);
     await screen.findByText(/termd-e2e-ready/);
 
-    const terminalInput = document.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
-    const xterm = document.querySelector<HTMLElement>(".xterm");
+    const terminalInput = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
+    const host = terminalHost();
     expect(terminalInput).not.toBeNull();
-    expect(xterm).not.toBeNull();
+    expect(host).not.toBeNull();
     terminalInput!.blur();
 
     const renderedText = document.createElement("span");
     renderedText.textContent = "rendered-terminal-text";
-    // xterm 的文字层会处理鼠标选择，真实浏览器里可能阻断冒泡阶段事件。
+    // Ghostty 的文字层会处理鼠标选择，真实浏览器里可能阻断冒泡阶段事件。
     // 测试这里显式阻断冒泡，确保外层捕获阶段仍能完成聚焦。
     renderedText.addEventListener("mousedown", (event) => event.stopPropagation());
     renderedText.addEventListener("click", (event) => event.stopPropagation());
-    xterm!.append(renderedText);
+    host!.append(renderedText);
 
     fireEvent.mouseDown(renderedText);
     fireEvent.click(renderedText);
@@ -2462,7 +2596,7 @@ describe("termui web 工作台", () => {
       await screen.findByText(/termd-e2e-ready/);
 
       const terminalInput = await waitFor(() => {
-        const element = document.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
+        const element = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
         expect(element).not.toBeNull();
         return element!;
       });
@@ -2526,7 +2660,7 @@ describe("termui web 工作台", () => {
     await screen.findByText(/termd-e2e-ready/);
 
     const terminalInput = await waitFor(() => {
-      const element = document.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
+      const element = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
       expect(element).not.toBeNull();
       return element!;
     });
@@ -2833,7 +2967,7 @@ describe("termui web 工作台", () => {
 
     let terminalInput: HTMLTextAreaElement | null = null;
     await waitFor(() => {
-      terminalInput = document.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
+      terminalInput = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
       expect(terminalInput).not.toBeNull();
     });
     terminalInput!.value = "workspace-input";
@@ -2901,7 +3035,7 @@ describe("termui web 工作台", () => {
       { timeout: 2200 },
     );
     await waitFor(() => {
-      const stats = (globalThis as { __TERMD_TEST_XTERM_STATS__?: { writes: number } }).__TERMD_TEST_XTERM_STATS__;
+      const stats = (globalThis as { __TERMD_TEST_TERMINAL_STATS__?: { writes: number } }).__TERMD_TEST_TERMINAL_STATS__;
       expect(stats?.writes ?? 0).toBeGreaterThanOrEqual(2);
     });
     const terminalText = screen.getByTestId("terminal-pane").textContent ?? "";
@@ -2934,7 +3068,7 @@ describe("termui web 工作台", () => {
       { timeout: 2200 },
     );
 
-    const stats = resetXtermStats();
+    const stats = resetTerminalStats();
     daemon.pushTerminalFrameBatch(DEFAULT_SESSION_ID, [
       {
         kind: "snapshot",
@@ -2953,7 +3087,7 @@ describe("termui web 工作台", () => {
     ]);
 
     await waitFor(() =>
-      expect(document.querySelector<HTMLElement>(".xterm")?.textContent ?? "").toContain(
+      expect(terminalText()).toContain(
         "post-reconnect-output",
       ),
     );
@@ -3152,7 +3286,7 @@ describe("termui web 工作台", () => {
 
     let terminalInput: HTMLTextAreaElement | null = null;
     await waitFor(() => {
-      terminalInput = document.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
+      terminalInput = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
       expect(terminalInput).not.toBeNull();
     });
     terminalInput!.focus();
@@ -3176,7 +3310,7 @@ describe("termui web 工作台", () => {
     await waitForWorkspaceSession();
 
     const terminalInput = await waitFor(() => {
-      const input = document.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
+      const input = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
       expect(input).not.toBeNull();
       return input!;
     });
@@ -3189,7 +3323,7 @@ describe("termui web 工作台", () => {
     expect(candidateSpaceEvent.defaultPrevented).toBe(false);
     expect(daemon.sessionDataMessages).toEqual([]);
 
-    // 中文注释：组合输入最终内容仍交给 xterm 的 input/composition 逻辑发送，fallback 不重复发送候选空格。
+    // 中文注释：组合输入最终内容仍交给 Ghostty 的 input/composition 逻辑发送，fallback 不重复发送候选空格。
     terminalInput.value = "你";
     fireEvent.input(terminalInput);
     await waitFor(() => expect(daemon.sessionDataMessages).toEqual(["你"]));
@@ -3213,7 +3347,7 @@ describe("termui web 工作台", () => {
     await waitForWorkspaceSession();
 
     const terminalInput = await waitFor(() => {
-      const input = document.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
+      const input = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
       expect(input).not.toBeNull();
       return input!;
     });
@@ -3261,7 +3395,7 @@ describe("termui web 工作台", () => {
     );
     await within(terminalPane).findByText("1/2");
     await waitFor(() =>
-      expect(within(terminalPane).getByTestId("xterm-search-highlight")).toHaveTextContent("beta"),
+      expect(within(terminalPane).getByTestId("terminal-search-highlight")).toHaveTextContent("beta"),
     );
     await user.click(within(terminalPane).getByRole("button", { name: "Next match" }));
     await within(terminalPane).findByText("2/2");
@@ -3286,7 +3420,7 @@ describe("termui web 工作台", () => {
     await waitForWorkspaceSession();
     expect(screen.queryByRole("button", { name: "Attached" })).toBeNull();
     await screen.findByText(/web-session-ready/);
-    const terminalInput = document.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
+    const terminalInput = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
     expect(terminalInput).not.toBeNull();
     await waitFor(() => expect(document.activeElement).toBe(terminalInput));
     expect(daemon.createdCommands).toEqual([[]]);
@@ -3331,6 +3465,82 @@ describe("termui web 工作台", () => {
     }
   });
 
+  it("terminal.create 响应前到达的首屏输出不会被丢弃", async () => {
+    const user = userEvent.setup();
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [],
+      createOutputBeforeResponse: "early-create-ready\n",
+    });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession("No session");
+    await user.click(screen.getByRole("button", { name: "New session" }));
+
+    await waitFor(() => expect(visibleSessionNames()).toHaveLength(1));
+    await screen.findByText(/early-create-ready/);
+    expect(
+      daemon.receivedPackets.filter((packet) => packet.kind === "stream_open" && packet.method === "terminal.create"),
+    ).toHaveLength(1);
+    expect(
+      daemon.receivedPackets.filter((packet) => packet.kind === "stream_open" && packet.method === "terminal.attach"),
+    ).toHaveLength(0);
+  });
+
+  it("新建 session 进行中不会把空列表显示成 No sessions", async () => {
+    const user = userEvent.setup();
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [],
+      attachOutput: "web-session-ready\n",
+      sessionCreateDelayMs: 160,
+    });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession("No session");
+    await user.click(screen.getByRole("button", { name: "New session" }));
+
+    const sessionsRegion = screen.getByRole("region", { name: "sessions" });
+    await within(sessionsRegion).findByText("Creating session");
+    expect(within(sessionsRegion).queryByText("No sessions")).toBeNull();
+  });
+
+  it("新建 session 成功后不会被短暂空 session.list 覆盖成 No sessions", async () => {
+    const user = userEvent.setup();
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [],
+      attachOutput: "web-session-ready\n",
+    });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession("No session");
+    await user.click(screen.getByRole("button", { name: "New session" }));
+    await waitFor(() => expect(visibleSessionNames()).toHaveLength(1));
+    const createdName = visibleSessionNames()[0];
+    const sessionListRequestsBeforeStaleRefresh =
+      daemon.receivedPackets.filter((packet) => packet.kind === "request" && packet.method === "session.list").length;
+
+    daemon.queueSessionListResponse([], 0);
+    // 中文注释：桌面侧栏没有手动刷新按钮；这里用真实的后台轮询触发一次旧空列表响应。
+    await waitFor(
+      () =>
+        expect(
+          daemon.receivedPackets.filter((packet) => packet.kind === "request" && packet.method === "session.list").length,
+        ).toBeGreaterThan(sessionListRequestsBeforeStaleRefresh),
+      { timeout: 2600 },
+    );
+
+    await waitFor(() => expect(visibleSessionNames()).toEqual([createdName]));
+    expect(screen.queryByText("No sessions")).toBeNull();
+  });
+
   it("新建 session 后不输入内容也会刷新初始回显", async () => {
     const user = userEvent.setup();
     await daemon.stop();
@@ -3339,8 +3549,8 @@ describe("termui web 工作台", () => {
       sessions: [],
       attachOutput: "idle-shell-prompt$ ",
     });
-    (globalThis as { __TERMD_TEST_DEFER_XTERM_RENDER_UNTIL_WRITE_CALLBACK__?: boolean })
-      .__TERMD_TEST_DEFER_XTERM_RENDER_UNTIL_WRITE_CALLBACK__ = true;
+    (globalThis as { __TERMD_TEST_DEFER_GHOSTTY_RENDER_UNTIL_WRITE_CALLBACK__?: boolean })
+      .__TERMD_TEST_DEFER_GHOSTTY_RENDER_UNTIL_WRITE_CALLBACK__ = true;
     render(<App />);
 
     await pairWithInvite(user, daemon);
@@ -3349,13 +3559,13 @@ describe("termui web 工作台", () => {
     await user.click(screen.getByRole("button", { name: "New session" }));
 
     const terminalInput = await waitFor(() => {
-      const input = document.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
+      const input = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
       expect(input).not.toBeNull();
       return input!;
     });
     await waitFor(() => expect(document.activeElement).toBe(terminalInput));
     await waitFor(() =>
-      expect(document.querySelector<HTMLElement>(".xterm")?.textContent).toContain("idle-shell-prompt$ "),
+      expect(terminalText()).toContain("idle-shell-prompt$ "),
     );
     expect(daemon.decryptedInputs).toEqual([]);
   });
@@ -5455,6 +5665,27 @@ describe("termui web 工作台", () => {
     expect(actions).toContainElement(screen.getByRole("button", { name: "Close session" }));
   });
 
+  it("Session 行名称在会话菜单里左对齐", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+
+    const css = readFileSync(resolve(process.cwd(), "src/styles.css"), "utf8");
+    const openButton = screen.getByRole("button", { name: `Open ${DEFAULT_SESSION_NAME}` });
+    const openButtonRule = cssRuleBody(css, ".session-open-button");
+    const openButtonNameRule = cssRuleBody(css, ".session-open-button strong");
+
+    expect(openButton).toHaveClass("session-open-button");
+    expect(openButtonRule).toMatch(/display:\s*grid;/);
+    expect(openButtonRule).toMatch(/justify-content:\s*stretch;/);
+    expect(openButtonRule).toMatch(/justify-items:\s*start;/);
+    expect(openButtonRule).toMatch(/width:\s*100%;/);
+    expect(openButtonRule).toMatch(/text-align:\s*left;/);
+    expect(openButtonNameRule).toMatch(/text-align:\s*left;/);
+  });
+
   it("桌面侧栏固定标题和新建按钮，只让 session 列表滚动", async () => {
     const user = userEvent.setup();
     render(<App />);
@@ -5476,8 +5707,8 @@ describe("termui web 工作台", () => {
     expect(css).toContain(".sidebar {\n  ");
     expect(css).toContain("overflow: hidden;");
     expect(css).toContain(".sidebar-fixed-header {\n  min-width: 0;\n  display: grid;\n  gap: 12px;\n}");
-    expect(css).toContain(".sidebar-scroll-region {\n  min-height: 0;\n  overflow: hidden;\n}");
-    expect(css).toContain(".session-list {\n  min-height: 0;\n  max-height: 100%;\n  overflow-y: auto;");
+    expect(css).toContain(".sidebar-scroll-region {\n  min-height: 0;\n  overflow: hidden;\n  display: grid;\n}");
+    expect(css).toContain(".session-list {\n  min-height: 0;\n  height: 100%;\n  overflow-y: auto;");
     expect(screen.queryByRole("button", { name: "Refresh" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Disconnect" })).toBeNull();
   });
@@ -5590,6 +5821,80 @@ describe("termui web 工作台", () => {
     await waitForWorkspaceSession("No session");
     await expectDaemonUrlInAdmin(user, relayUrl);
     expect(daemon.outerWireText()).not.toContain("secret-token");
+  });
+
+  it("direct Web 路径串联 tmux-backed session 的 create/list/attach/input/resize/reconnect", async () => {
+    const user = userEvent.setup();
+    const sessionId = "00000000-0000-0000-0000-000000000501";
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [],
+      attachOutput: "direct-tmux-ready\n",
+      sessionFiles: {
+        [sessionId]: {
+          session_id: sessionId,
+          path: "/tmp/direct-tmux-cwd",
+          entries: [
+            {
+              name: "direct.txt",
+              path: "/tmp/direct-tmux-cwd/direct.txt",
+              kind: "file",
+              size_bytes: 12,
+              modified_at_ms: null,
+            },
+          ],
+        },
+      },
+    });
+    render(<App />);
+
+    await exerciseTmuxBackedWebLifecycle(user, daemon, {
+      sessionId,
+      readyText: "direct-tmux-ready",
+      cwd: "/tmp/direct-tmux-cwd",
+      fileName: "direct.txt",
+      inputText: "echo direct-tmux-secret",
+      postReconnectText: "direct-tmux-after-reconnect\n",
+    });
+  });
+
+  it("relay /ws 路径串联 tmux-backed session 的 create/list/attach/input/resize/reconnect", async () => {
+    const user = userEvent.setup();
+    const sessionId = "00000000-0000-0000-0000-000000000501";
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [],
+      attachOutput: "relay-tmux-ready\n",
+      relayClientPathOnly: true,
+      sessionFiles: {
+        [sessionId]: {
+          session_id: sessionId,
+          path: "/tmp/relay-tmux-cwd",
+          entries: [
+            {
+              name: "relay.txt",
+              path: "/tmp/relay-tmux-cwd/relay.txt",
+              kind: "file",
+              size_bytes: 11,
+              modified_at_ms: null,
+            },
+          ],
+        },
+      },
+    });
+    render(<App />);
+
+    await exerciseTmuxBackedWebLifecycle(user, daemon, {
+      sessionId,
+      readyText: "relay-tmux-ready",
+      cwd: "/tmp/relay-tmux-cwd",
+      fileName: "relay.txt",
+      inputText: "echo relay-tmux-secret",
+      postReconnectText: "relay-tmux-after-reconnect\n",
+    });
+    expect(daemon.outerWireText()).not.toContain("relay-tmux-secret");
   });
 
   it("pairing 失败后清空 token，错误 UI 和 outer wire 都不泄漏敏感字段", async () => {
@@ -5708,14 +6013,21 @@ describe("termui web 工作台", () => {
 
   it("shared-control attach 后持续发送终端输入、光标位置和聚焦状态", async () => {
     const user = userEvent.setup();
-    const restoreTerminalLayout = mockTerminalLayout({
-      viewportWidth: 600,
-      viewportHeight: 420,
-      frameWidth: 1200,
-      frameHeight: 592,
-    });
-    try {
-      await daemon.stop();
+      const restoreTerminalLayout = mockTerminalLayout({
+        viewportWidth: 600,
+        viewportHeight: 420,
+        frameWidth: 1200,
+        frameHeight: 592,
+      });
+      // 中文注释：本用例要验证“本地浏览器容器尺寸接管 shared PTY”；
+      // jsdom 的 Ghostty mock 若不显式给 fit 尺寸，会用当前 remote rows/cols
+      // 反推容器大小，导致 focus 后看起来仍是 daemon 的旧 100x30。
+      (globalThis as { __TERMD_TEST_FIT_DIMENSIONS__?: { rows: number; cols: number } }).__TERMD_TEST_FIT_DIMENSIONS__ = {
+        rows: 24,
+        cols: 80,
+      };
+      try {
+        await daemon.stop();
       daemon = await MockDaemon.start({
         token: "secret-token",
         sessions: [
@@ -5734,13 +6046,12 @@ describe("termui web 工作台", () => {
 
       let terminalInput: HTMLTextAreaElement | null = null;
       await waitFor(() => {
-        terminalInput = document.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
+        terminalInput = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
         expect(terminalInput).not.toBeNull();
       });
       expect(screen.queryByRole("button", { name: /zoom/i })).toBeNull();
-      expect(daemon.sessionResizes).toEqual([]);
-
-      terminalInput!.focus();
+      // 中文注释：历史 session attach 后桌面端也会主动 focus 一次，用当前容器尺寸恢复 PTY；
+      // 这覆盖浏览器重新打开页面后停在旧 24/80 尺寸的问题。
       await waitFor(() =>
         expect(daemon.sessionCursorUpdates).toContainEqual({
           session_id: "00000000-0000-0000-0000-000000000402",
@@ -5755,6 +6066,7 @@ describe("termui web 工作台", () => {
           size: { rows: 24, cols: 80, pixel_width: expect.any(Number), pixel_height: expect.any(Number) },
         }),
       );
+      terminalInput!.focus();
       terminalInput!.value = "first-terminal-secret";
       fireEvent.input(terminalInput!);
 
@@ -5797,7 +6109,7 @@ describe("termui web 工作台", () => {
     await pairWithInvite(user, daemon);
     await waitForWorkspaceSession();
     await waitFor(() => {
-      expect(document.querySelector(".xterm-helper-textarea")).not.toBeNull();
+      expect(document.querySelector('textarea[aria-label="Terminal input"]')).not.toBeNull();
     });
 
     await user.click(screen.getByRole("button", { name: "Send Tab" }));
@@ -5815,7 +6127,7 @@ describe("termui web 工作台", () => {
     await pairWithInvite(user, daemon);
     await waitForWorkspaceSession();
     await waitFor(() => {
-      expect(document.querySelector(".xterm-helper-textarea")).not.toBeNull();
+      expect(document.querySelector('textarea[aria-label="Terminal input"]')).not.toBeNull();
     });
     const terminalFrame = await waitFor(() => {
       const frame = document.querySelector<HTMLElement>(".terminal-frame");
@@ -5873,7 +6185,7 @@ describe("termui web 工作台", () => {
     await clickSessionCard(user);
 
     await waitFor(() => {
-      expect(document.querySelector(".xterm-helper-textarea")).not.toBeNull();
+      expect(document.querySelector('textarea[aria-label="Terminal input"]')).not.toBeNull();
     });
     await new Promise((resolve) => window.setTimeout(resolve, 80));
 
@@ -5900,7 +6212,7 @@ describe("termui web 工作台", () => {
     await waitForWorkspaceSession();
 
     await waitFor(() => {
-      expect(document.querySelector(".xterm-helper-textarea")).not.toBeNull();
+      expect(document.querySelector('textarea[aria-label="Terminal input"]')).not.toBeNull();
     });
     expect(screen.queryByRole("button", { name: /zoom/i })).toBeNull();
   });
@@ -5926,7 +6238,7 @@ describe("termui web 工作台", () => {
 
     let terminalInput: HTMLTextAreaElement | null = null;
     await waitFor(() => {
-      terminalInput = document.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
+      terminalInput = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
       expect(terminalInput).not.toBeNull();
     });
     terminalInput!.focus();
@@ -5977,7 +6289,7 @@ describe("termui web 工作台", () => {
 
     let terminalInput: HTMLTextAreaElement | null = null;
     await waitFor(() => {
-      terminalInput = document.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
+      terminalInput = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
       expect(terminalInput).not.toBeNull();
     });
     terminalInput!.focus();
@@ -6026,7 +6338,7 @@ describe("termui web 工作台", () => {
     await screen.findByText(/resize-timeout-ready/);
     await clickSessionCard(user);
 
-    const terminalInput = document.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
+    const terminalInput = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
     expect(terminalInput).not.toBeNull();
     terminalInput!.focus();
     (globalThis as { __TERMD_TEST_FIT_DIMENSIONS__?: { rows: number; cols: number } }).__TERMD_TEST_FIT_DIMENSIONS__ = {
@@ -6044,11 +6356,11 @@ describe("termui web 工作台", () => {
     await waitForSidecarTimeoutIgnored("resize", "00000000-0000-0000-0000-000000000408");
 
     // 中文注释：resize/cursor 这类终端辅助 RPC 的 ack 可能被持续 stdout 压到超时；
-    // 超时只能丢弃本次辅助 ack，不能把 workspace 置为全局错误导致 xterm 卸载。
+    // 超时只能丢弃本次辅助 ack，不能把 workspace 置为全局错误导致 Ghostty 卸载。
     expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
     expect(document.body.textContent).not.toContain("response_timeout");
     expect(screen.getByText(/resize-timeout-ready/)).toBeInTheDocument();
-    expect(document.querySelector(".xterm-helper-textarea")).not.toBeNull();
+    expect(document.querySelector('textarea[aria-label="Terminal input"]')).not.toBeNull();
   }, 15_000);
 
   it("持续输出场景下 cursor ack 超时不卸载已 attach 终端", async () => {
@@ -6074,7 +6386,7 @@ describe("termui web 工作台", () => {
     await screen.findByText(/cursor-timeout-ready/);
     await clickSessionCard(user);
 
-    const terminalInput = document.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
+    const terminalInput = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
     expect(terminalInput).not.toBeNull();
     terminalInput!.focus();
     await waitFor(() =>
@@ -6091,7 +6403,7 @@ describe("termui web 工作台", () => {
     expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
     expect(document.body.textContent).not.toContain("response_timeout");
     expect(screen.getByText(/cursor-timeout-ready/)).toBeInTheDocument();
-    expect(document.querySelector(".xterm-helper-textarea")).not.toBeNull();
+    expect(document.querySelector('textarea[aria-label="Terminal input"]')).not.toBeNull();
   }, 15_000);
 
   it("浏览器窗口 resize 引发的短暂 focusout/focusin 不会上报聚焦抖动", async () => {
@@ -6115,7 +6427,7 @@ describe("termui web 工作台", () => {
 
     let terminalInput: HTMLTextAreaElement | null = null;
     await waitFor(() => {
-      terminalInput = document.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
+      terminalInput = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
       expect(terminalInput).not.toBeNull();
     });
     terminalInput!.focus();
@@ -6130,7 +6442,7 @@ describe("termui web 工作台", () => {
 
     daemon.sessionCursorUpdates.length = 0;
     fireEvent(window, new Event("resize"));
-    // 真实浏览器在拖动窗口边界时可能短暂让 xterm textarea 失焦，随后又恢复焦点；
+    // 真实浏览器在拖动窗口边界时可能短暂让 Ghostty textarea 失焦，随后又恢复焦点；
     // 这类 resize 伴随的瞬时 DOM focus 抖动不应变成 operator 的 focused/blurred 抖动。
     terminalInput!.blur();
     await new Promise((resolve) => window.setTimeout(resolve, 40));
@@ -6167,7 +6479,7 @@ describe("termui web 工作台", () => {
     await waitFor(() =>
       expect(daemon.attachedSessions).toContain("00000000-0000-0000-0000-000000000406"),
     );
-    await waitFor(() => expect(document.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea")).not.toBeNull());
+    await waitFor(() => expect(document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]')).not.toBeNull());
     await new Promise((resolve) => window.setTimeout(resolve, 120));
 
     const receivedPackets = () =>
@@ -6195,7 +6507,7 @@ describe("termui web 工作台", () => {
       },
     ]);
 
-    await waitFor(() => expect(document.querySelector<HTMLElement>(".xterm")?.textContent ?? "").toContain("abcd"));
+    await waitFor(() => expect(terminalText()).toContain("abcd"));
     await new Promise((resolve) => window.setTimeout(resolve, 50));
     expect(countFlowPackets()).toBe(flowPacketsBefore);
   });
@@ -6264,7 +6576,7 @@ describe("termui web 工作台", () => {
     await waitFor(() =>
       expect(daemon.attachedSessions).toContain("00000000-0000-0000-0000-000000000409"),
     );
-    await waitFor(() => expect(document.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea")).not.toBeNull());
+    await waitFor(() => expect(document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]')).not.toBeNull());
     await new Promise((resolve) => window.setTimeout(resolve, 120));
 
     const receivedPackets = () =>
@@ -6311,7 +6623,7 @@ describe("termui web 工作台", () => {
       },
     ]);
 
-    await waitFor(() => expect(document.querySelector<HTMLElement>(".xterm")?.textContent ?? "").toContain("x"));
+    await waitFor(() => expect(terminalText()).toContain("x"));
     await new Promise((resolve) => window.setTimeout(resolve, 50));
     expect(countFlowPackets()).toBe(flowPacketsBefore);
   });
@@ -6337,7 +6649,7 @@ describe("termui web 工作台", () => {
 
     let terminalInput: HTMLTextAreaElement | null = null;
     await waitFor(() => {
-      terminalInput = document.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
+      terminalInput = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
       expect(terminalInput).not.toBeNull();
     });
     terminalInput!.focus();
@@ -6394,7 +6706,7 @@ describe("termui web 工作台", () => {
 
     let firstTerminalInput: HTMLTextAreaElement | null = null;
     await waitFor(() => {
-      firstTerminalInput = document.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
+      firstTerminalInput = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
       expect(firstTerminalInput).not.toBeNull();
     });
     firstTerminalInput!.focus();
@@ -6422,7 +6734,7 @@ describe("termui web 工作台", () => {
     await clickSessionCard(user, undefined, secondRender.container);
 
     await waitFor(() => {
-      expect(secondRender.container.querySelector(".xterm-helper-textarea")).not.toBeNull();
+      expect(secondRender.container.querySelector('textarea[aria-label="Terminal input"]')).not.toBeNull();
     });
     (globalThis as { __TERMD_TEST_FIT_DIMENSIONS__?: { rows: number; cols: number } }).__TERMD_TEST_FIT_DIMENSIONS__ = {
       rows: 30,
@@ -6473,7 +6785,7 @@ describe("termui web 工作台", () => {
 
       let terminalInput: HTMLTextAreaElement | null = null;
       await waitFor(() => {
-        terminalInput = document.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
+        terminalInput = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
         expect(terminalInput).not.toBeNull();
       });
       (globalThis as { __TERMD_TEST_FIT_DIMENSIONS__?: { rows: number; cols: number } }).__TERMD_TEST_FIT_DIMENSIONS__ = {
@@ -6558,6 +6870,21 @@ describe("termui web 工作台", () => {
     ).toEqual([
       "wss://termd.yiln.de/ws?relay_token=abc",
       "wss://old-relay.example/ws?relay_token=abc",
+    ]);
+  });
+
+  it("Web 和 relay 同主机不同端口时优先使用显式 relay URL", () => {
+    const serverId = "00000000-0000-0000-0000-000000000123";
+    const devPage = {
+      protocol: "http:",
+      host: "192.168.55.155:4174",
+      hostname: "192.168.55.155",
+      pathname: "/",
+    };
+
+    expect(knownServerWsUrlCandidates("ws://192.168.55.155:19180/ws", serverId, devPage)).toEqual([
+      "ws://192.168.55.155:19180/ws",
+      "ws://192.168.55.155:4174/ws",
     ]);
   });
 

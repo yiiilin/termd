@@ -480,6 +480,7 @@ label {
 .sidebar-scroll-region {
   min-height: 0;
   overflow: hidden;
+  display: grid;
 }
 
 .clients-popover {
@@ -967,7 +968,7 @@ label {
 
 .session-list {
   min-height: 0;
-  max-height: 100%;
+  height: 100%;
   overflow-y: auto;
   display: grid;
   align-content: start;
@@ -1077,9 +1078,16 @@ label {
   color: inherit;
   display: grid;
   align-content: center;
+  justify-content: stretch;
+  justify-items: start;
+  width: 100%;
   padding: 0;
   text-align: left;
   cursor: pointer;
+}
+
+.session-open-button strong {
+  text-align: left;
 }
 
 .session-row span {
@@ -1620,10 +1628,52 @@ label {
   min-width: 0;
   min-height: 0;
   padding: 0;
+  overflow: hidden;
+  background: var(--color-terminal-bg);
+  caret-color: transparent;
 }
 
-.terminal-mobile-scroll-track {
-  display: none;
+.terminal-host[contenteditable="true"]:focus {
+  /* 中文注释：Ghostty 已在 canvas 内绘制终端光标；浏览器 contenteditable 的原生光标会固定在 host 左上角，必须彻底隐藏。 */
+  outline: none;
+  caret-color: transparent !important;
+}
+
+.terminal-host canvas {
+  display: block;
+  background: var(--color-terminal-bg);
+}
+
+.terminal-host[data-termd-snapshot-redraw="true"] canvas,
+.terminal-host[data-termd-resize-stabilizing="true"] canvas {
+  /* 中文注释：snapshot 会先按 daemon 旧尺寸重放历史；刷新期间先隐藏 canvas，
+     等 Ghostty 按本地容器重新 fit 后再显示，避免 80x24 中间态闪屏。 */
+  visibility: hidden;
+}
+
+.terminal-host-grid-filler {
+  /* 中文注释：不足一列的右侧余量只补终端背景，不能拉伸 canvas，否则字体会被浏览器重采样而发虚。 */
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  pointer-events: none;
+  background: var(--color-terminal-bg);
+}
+
+.terminal-host textarea[aria-label="Terminal input"] {
+  /* 中文注释：Ghostty 的 helper textarea 需要保留 focus/paste/IME 能力，但不能继承全局表单 textarea 的 70px 高度。 */
+  min-width: 0 !important;
+  min-height: 0 !important;
+  padding: 0 !important;
+  border: 0 !important;
+  border-radius: 0 !important;
+  box-shadow: none !important;
+  outline: none !important;
+  color: transparent !important;
+  background: transparent !important;
+  caret-color: transparent !important;
+  -webkit-text-fill-color: transparent;
 }
 
 .terminal-mobile-shortcuts,
@@ -1634,10 +1684,12 @@ label {
 .terminal-search-control {
   position: absolute;
   top: 8px;
-  right: 10px;
+  right: calc(var(--terminal-frame-padding) + 8px);
   z-index: 8;
   display: flex;
+  flex-direction: column;
   align-items: center;
+  gap: 6px;
 }
 
 .terminal-search-button {
@@ -1682,6 +1734,24 @@ label {
   font-size: 11px;
   text-align: right;
   white-space: nowrap;
+}
+
+.terminal-search-highlight {
+  max-width: min(420px, calc(100vw - 28px));
+  margin-top: 6px;
+  margin-left: auto;
+  border: 1px solid var(--color-accent-border);
+  border-radius: 6px;
+  background: var(--color-surface-selected);
+  color: var(--color-accent-soft);
+  padding: 4px 8px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.35;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  pointer-events: none;
 }
 
 .terminal-placeholder {
@@ -3252,62 +3322,15 @@ label {
     color: var(--color-accent-soft);
   }
 
-  .terminal-mobile-scroll-track {
-    position: absolute;
-    top: 56px;
-    right: 6px;
-    bottom: 56px;
-    z-index: 6;
-    display: block;
-    width: 36px;
-    min-height: 96px;
-    pointer-events: none;
-  }
-
-  .terminal-mobile-scroll-thumb {
-    position: absolute;
-    right: 0;
-    width: 34px;
-    min-height: 52px;
-    padding: 0;
-    border-color: var(--color-border-control);
-    border-radius: 8px;
-    background: var(--color-toast-bg);
-    color: var(--color-accent);
-    box-shadow:
-      0 12px 26px var(--color-popover-shadow),
-      inset 0 0 0 1px var(--color-accent-shadow);
-    pointer-events: auto;
-    touch-action: none;
-    user-select: none;
-    backdrop-filter: blur(8px);
-  }
-
-  .terminal-mobile-scroll-track.dragging .terminal-mobile-scroll-thumb,
-  .terminal-mobile-scroll-thumb:active {
-    border-color: var(--color-accent);
-    background: var(--color-direction-bg);
-    color: var(--color-accent-soft);
-  }
-
   .terminal-host {
     min-width: 0;
     overflow: hidden;
-  }
-
-  .terminal-host {
     max-width: 100%;
   }
 
-  .terminal-host .xterm,
-  .terminal-host .xterm-screen,
-  .terminal-host .xterm-viewport,
-  .terminal-host .xterm-rows {
-    max-width: 100%;
-  }
-
-  .terminal-host .xterm .xterm-helper-textarea {
-    /* 中文注释：xterm 会按光标位置移动这个 textarea，IME 候选窗和系统复制/粘贴菜单都依赖它的坐标。 */
+  .terminal-host textarea[aria-label="Terminal input"] {
+    /* 中文注释：Ghostty 会按光标或选择位置移动这个 textarea，IME 候选窗和系统复制/粘贴菜单都依赖它的坐标。 */
+    caret-color: transparent;
     min-width: 0 !important;
     min-height: 0 !important;
     padding: 0 !important;

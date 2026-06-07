@@ -4,19 +4,20 @@
   <p><strong>个人使用的端到端加密持久终端。</strong></p>
 </div>
 
-Termd 让一台机器上的 PTY session 像 `sshd + tmux` 一样长期存在：浏览器或 CLI 断开后可以重新 attach，多个已配对设备默认 shared-control，可以同时操作同一个终端。
+Termd 正在重构为让一台机器上的 tmux session 通过浏览器长期存在：daemon 默认使用 tmux 作为 session host，client 断开后可以重新 attach，多个已配对设备默认 shared-control，可以同时操作同一个终端。
 
 项目定位是个人使用：单用户、设备级信任、轻量 relay，不做企业权限平台。
 
 ## Features
 
-- 持久 PTY session：client 断开不会关闭 session。
-- Web UI：内嵌终端、session 管理、文件面板、daemon 管理和 PWA。
+- tmux-backed 持久 session：当前 daemon 默认创建 tmux session，通过 daemon 侧 attach PTY bridge 分发终端 I/O，并为 watched Web attach 持有独立 tmux client lifecycle handle。
+- Web UI：内嵌终端、session 管理、文件面板、daemon 管理和 PWA；终端渲染通过 adapter 支持默认 xterm 和可选 `ghostty-web`。
 - 多客户端 shared-control：已配对设备都是 operator，可同时 attach 同一个 session。
 - 设备级 pairing/auth：短期 pairing token、device key、challenge-response、timestamp/nonce replay protection。
 - E2EE 通信：业务 frame 使用 X25519 + HKDF + ChaCha20Poly1305；relay 只转发密文。
 - Relay：一个 `termrelay` 可转发多个 daemon，每个 `termd` 主动连接一个 relay。
-- 一键安装：`termd`、`termctl`、`termrelay` 支持 curl/wget；`termd` 和 `termrelay` 支持 systemd。
+- Web-first client：Web 是正式交互客户端；`termctl` 保留为配对/调试工具。
+- 一键安装：`termd`、`termrelay` 支持 curl/wget；`termd` 和 `termrelay` 支持 systemd。
 
 ## 使用方式
 
@@ -49,13 +50,15 @@ TERMD_RELAY_URLS=wss://relay.example
 TERMD_RELAY_AUTH_TOKEN=relay-secret
 ```
 
-daemon identity、SQLite 状态库和 supervisor socket 固定在 `/var/lib/termd`，不随 `--user` 改变。
+当前 daemon identity、SQLite 状态库和 tmux socket 固定在 `/var/lib/termd`，不随 `--user` 改变；旧 supervisor runtime socket 不再作为生产恢复入口。
 
-### CLI client
+### CLI / debug
 
 ```bash
 curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termctl.sh | sudo bash
 ```
+
+`termctl` 在 tmux-backed 架构下不再是正式交互 attach 客户端；它只保留配对、诊断和后续调试入口。
 
 ### Relay
 
