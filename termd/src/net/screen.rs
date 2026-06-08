@@ -96,6 +96,7 @@ enum SgrColor {
 enum ParserState {
     Ground,
     Escape,
+    EscapeIntermediate,
     Osc,
     OscEscape,
     Csi {
@@ -481,6 +482,14 @@ impl TerminalScreen {
             .collect()
     }
 
+    pub(crate) fn is_alternate_screen_active(&self) -> bool {
+        self.normal_screen.is_some()
+    }
+
+    pub(crate) fn requires_runtime_snapshot(&self) -> bool {
+        self.requires_snapshot_redraw
+    }
+
     pub(crate) fn cell_count(&self) -> usize {
         self.lines.len().saturating_mul(self.cols)
     }
@@ -595,6 +604,19 @@ impl TerminalScreen {
             ParserState::Escape => {
                 self.push_pending_control_byte(byte);
                 self.apply_escape_byte(byte);
+            }
+            ParserState::EscapeIntermediate => {
+                self.push_pending_control_byte(byte);
+                self.parser = if (0x20..=0x2f).contains(&byte) {
+                    ParserState::EscapeIntermediate
+                } else {
+                    // 中文注释：`ESC ( B` / `ESC ) 0` / `ESC # 8` 这类带 intermediate
+                    // byte 的 escape 序列，不应该把最终字节当正文打印出来。
+                    // 轻量 screen mirror 目前不完整模拟这些模式切换，所以只吞掉整条
+                    // 序列，并把 full snapshot 权威性交回 runtime/tmux。
+                    self.clear_pending_control();
+                    ParserState::Ground
+                };
             }
             ParserState::Osc => {
                 self.push_pending_control_byte(byte);
@@ -759,6 +781,11 @@ impl TerminalScreen {
                 self.modes = TerminalModes::default();
                 self.clear_pending_control();
                 ParserState::Ground
+            }
+            0x20..=0x2f => {
+                self.pending_home_clear_cut = false;
+                self.requires_snapshot_redraw = true;
+                ParserState::EscapeIntermediate
             }
             _ => {
                 self.pending_home_clear_cut = false;
@@ -1424,6 +1451,31 @@ mod tests {
         screen.apply("一二三四五六\nnext".as_bytes());
 
         assert_eq!(screen.visible_lines(), vec!["一二三四五", "六", "next"]);
+    }
+
+    #[test]
+    fn cursor_addressing_marks_screen_as_runtime_snapshot_only() {
+        let mut screen = TerminalScreen::new(4, 20);
+
+        // 中文注释：线性输出可以安全地靠 retained raw bytes 重放；
+        // 但只要出现光标定位这类“重绘式”控制序列，轻量 screen mirror
+        // 就只能近似最终状态，fresh attach 必须回退到 runtime/tmux snapshot。
+        screen.apply("alpha\r\nbeta\x1b[2;1H本地 Hub".as_bytes());
+
+        assert!(screen.requires_runtime_snapshot());
+    }
+
+    #[test]
+    fn escape_intermediate_sequences_do_not_leak_final_byte_into_visible_text() {
+        let mut screen = TerminalScreen::new(4, 20);
+
+        // 中文注释：很多 curses/tmux 程序都会发 `ESC ( B` 把 G0 字符集切回 ASCII。
+        // 如果 parser 只吞掉 `ESC (`，后面的 `B` 就会被当普通正文画出来，最终每行
+        // 最开头都会多一个大写 B。
+        screen.apply(b"\x1b(Bhello\r\n\x1b)0world");
+
+        assert_eq!(screen.visible_lines(), vec!["hello", "world", "", ""]);
+        assert!(screen.requires_runtime_snapshot());
     }
 
     #[test]

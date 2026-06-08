@@ -102,6 +102,7 @@ function useReconnectHarness(input: {
     sessionFilesFollowTerminalCwdRef,
     applyConfirmedSessionSize: vi.fn(),
     enqueueTerminalOutput: (item) => input.output.push(item),
+    isIgnoredClosingSessionError: vi.fn(() => false),
     markNewOutputIfBackground: vi.fn(),
     setSafeError: vi.fn(),
     setSessionFiles: vi.fn(),
@@ -393,4 +394,5 @@ describe("useTerminalAttach snapshot reveal intent", () => {
     });
     unmount();
   });
+
 });

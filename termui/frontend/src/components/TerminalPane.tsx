@@ -38,6 +38,7 @@ const TERMINAL_BOTTOM_EPSILON = 1;
 const TERMINAL_SERVER_SCROLLBACK_RESYNC_MIN_BYTES = 8 * 1024;
 const TERMINAL_SERVER_SCROLLBACK_RESYNC_USER_MIN_BYTES = 1024;
 const TERMINAL_SERVER_SCROLLBACK_RESYNC_COOLDOWN_MS = 5_000;
+const TERMINAL_SERVER_SCROLLBACK_RESYNC_IDLE_SETTLE_MS = 1_000;
 const TERMINAL_SELECTION_DRAG_THRESHOLD_PX = 4;
 const GHOSTTY_SCROLLBAR_GUTTER_PX = 12;
 const TERMINAL_SEARCH_OPTIONS: TerminalSearchOptions = {
@@ -123,6 +124,7 @@ export function TerminalPane(props: TerminalPaneProps) {
   const onTerminalSizeRenderedRef = useRef(props.onTerminalSizeRendered);
   const onOutputResetAppliedRef = useRef(props.onOutputResetApplied);
   const sessionSizeRef = useRef(props.sessionSize);
+  const confirmedSessionSizeRef = useRef(props.sessionSize);
   const mobileInputModeRef = useRef(Boolean(props.mobileInputMode));
   const mobileKeyboardOpenRef = useRef(Boolean(props.mobileKeyboardOpen));
   const resizeRef = useRef<((source?: ResizeSource) => void) | undefined>(undefined);
@@ -139,7 +141,9 @@ export function TerminalPane(props: TerminalPaneProps) {
   const lastTerminalScrollReportAtRef = useRef(0);
   const terminalRenderedOutputBytesSinceSnapshotRef = useRef(0);
   const terminalOutputIdleRef = useRef(true);
+  const terminalOutputIdleSinceRef = useRef<number | undefined>(undefined);
   const terminalServerScrollbackResyncPendingRef = useRef(false);
+  const terminalServerScrollbackResyncIdleTimerRef = useRef<number | undefined>(undefined);
   const terminalLastServerScrollbackResyncAtRef = useRef(0);
   const terminalRevealHistoryAfterSnapshotRef = useRef(false);
   const terminalRevealHistorySuppressBottomUntilRef = useRef(0);
@@ -188,6 +192,22 @@ export function TerminalPane(props: TerminalPaneProps) {
   const terminalResizeReportPassesRef = useRef(0);
   const terminalResizeReportSizeRef = useRef<TerminalSize | undefined>(undefined);
   const terminalResizeReportSourceRef = useRef<ResizeSource | undefined>(undefined);
+  const pendingSnapshotHistoryRepairRef = useRef<
+    | {
+        snapshotRows: number;
+        snapshotCols: number;
+      }
+    | undefined
+  >(undefined);
+  const lastRenderedSnapshotSizeRef = useRef<
+    | {
+        rows: number;
+        cols: number;
+      }
+    | undefined
+  >(undefined);
+  const pendingSnapshotHistoryRepairFrameRef = useRef<number | undefined>(undefined);
+  const pendingSnapshotHistoryRepairTimerRef = useRef<number | undefined>(undefined);
   const terminalStabilizeSourceRef = useRef<ResizeSource | undefined>(undefined);
   const terminalStabilizeFrameRef = useRef<number | undefined>(undefined);
   const terminalStabilizePassesRef = useRef(0);
@@ -234,6 +254,131 @@ export function TerminalPane(props: TerminalPaneProps) {
   const [searchResult, setSearchResult] = useState<SessionSearchResultPayload | undefined>();
   const [activeSearchIndex, setActiveSearchIndex] = useState(0);
 
+  const clearTerminalServerScrollbackResyncIdleTimer = () => {
+    if (terminalServerScrollbackResyncIdleTimerRef.current !== undefined) {
+      window.clearTimeout(terminalServerScrollbackResyncIdleTimerRef.current);
+      terminalServerScrollbackResyncIdleTimerRef.current = undefined;
+    }
+  };
+
+  const clearPendingSnapshotHistoryRepairSchedule = () => {
+    if (pendingSnapshotHistoryRepairFrameRef.current !== undefined) {
+      window.cancelAnimationFrame(pendingSnapshotHistoryRepairFrameRef.current);
+      pendingSnapshotHistoryRepairFrameRef.current = undefined;
+    }
+    if (pendingSnapshotHistoryRepairTimerRef.current !== undefined) {
+      window.clearTimeout(pendingSnapshotHistoryRepairTimerRef.current);
+      pendingSnapshotHistoryRepairTimerRef.current = undefined;
+    }
+  };
+
+  const clearPendingSnapshotHistoryRepair = () => {
+    pendingSnapshotHistoryRepairRef.current = undefined;
+    clearPendingSnapshotHistoryRepairSchedule();
+  };
+
+  const measurePreferredClientSize = (): TerminalSize | undefined => {
+    const preferred = clientSizeRef.current;
+    if (
+      preferred &&
+      preferred.rows >= MIN_FOCUSED_RESIZE_ROWS &&
+      preferred.cols >= MIN_FOCUSED_RESIZE_COLS
+    ) {
+      return preferred;
+    }
+    const fit = fitRef.current;
+    const host = hostRef.current;
+    const proposed = fit?.proposeStableDimensions?.() ?? fit?.proposeDimensions?.();
+    if (
+      !host ||
+      !proposed ||
+      proposed.rows < MIN_FOCUSED_RESIZE_ROWS ||
+      proposed.cols < MIN_FOCUSED_RESIZE_COLS
+    ) {
+      return undefined;
+    }
+    return {
+      rows: proposed.rows,
+      cols: proposed.cols,
+      pixel_width: host.clientWidth,
+      pixel_height: host.clientHeight,
+    };
+  };
+
+  const evaluatePendingSnapshotHistoryRepair = () => {
+    const pendingRepair = pendingSnapshotHistoryRepairRef.current;
+    const sessionSize = confirmedSessionSizeRef.current;
+    if (!pendingRepair || !sessionSize) {
+      clearPendingSnapshotHistoryRepairSchedule();
+      return;
+    }
+    const preferredSize = measurePreferredClientSize() ?? (() => {
+      const terminal = terminalRef.current;
+      const host = hostRef.current;
+      if (!terminal || !host || !localTerminalOwnsResizeAuthority()) {
+        return undefined;
+      }
+      return {
+        rows: terminal.rows,
+        cols: terminal.cols,
+        pixel_width: host.clientWidth,
+        pixel_height: host.clientHeight,
+      };
+    })();
+    if (
+      !preferredSize ||
+      sessionSize.rows !== preferredSize.rows ||
+      sessionSize.cols !== preferredSize.cols
+    ) {
+      clearPendingSnapshotHistoryRepairSchedule();
+      return;
+    }
+    if (
+      sessionSize.rows === pendingRepair.snapshotRows &&
+      sessionSize.cols === pendingRepair.snapshotCols
+    ) {
+      clearPendingSnapshotHistoryRepairSchedule();
+      return;
+    }
+    const scheduleRepairFrame = () => {
+      if (pendingSnapshotHistoryRepairFrameRef.current !== undefined) {
+        return;
+      }
+      pendingSnapshotHistoryRepairFrameRef.current = window.requestAnimationFrame(() => {
+        pendingSnapshotHistoryRepairFrameRef.current = undefined;
+        if (!pendingSnapshotHistoryRepairRef.current) {
+          return;
+        }
+        pendingSnapshotHistoryRepairRef.current = undefined;
+        onTerminalResyncRef.current?.(undefined);
+      });
+    };
+    if (!terminalOutputIdleRef.current) {
+      clearPendingSnapshotHistoryRepairSchedule();
+      return;
+    }
+    const now = nowForThrottle();
+    const idleSince = terminalOutputIdleSinceRef.current;
+    const idleForMs = idleSince === undefined ? 0 : now - idleSince;
+    if (idleSince === undefined || idleForMs < TERMINAL_SERVER_SCROLLBACK_RESYNC_IDLE_SETTLE_MS) {
+      if (pendingSnapshotHistoryRepairTimerRef.current === undefined) {
+        // 中文注释：repair timer 只在“已经 idle，但 settle window 还没满”时挂起。
+        // 一旦中途又来了 live output，noteTerminalOutputRendered 会取消这里的调度，
+        // 等下一次真正 idle 后再重新计时，避免在 burst 中途打断 attach。
+        pendingSnapshotHistoryRepairTimerRef.current = window.setTimeout(() => {
+          pendingSnapshotHistoryRepairTimerRef.current = undefined;
+          evaluatePendingSnapshotHistoryRepair();
+        }, Math.max(0, TERMINAL_SERVER_SCROLLBACK_RESYNC_IDLE_SETTLE_MS - idleForMs));
+      }
+      return;
+    }
+    if (pendingSnapshotHistoryRepairTimerRef.current !== undefined) {
+      window.clearTimeout(pendingSnapshotHistoryRepairTimerRef.current);
+      pendingSnapshotHistoryRepairTimerRef.current = undefined;
+    }
+    scheduleRepairFrame();
+  };
+
   useEffect(() => {
     // 搜索结果绑定当前 terminal buffer；attach/reset 后旧请求即使返回也不能落到新 buffer。
     searchRequestSeqRef.current += 1;
@@ -243,7 +388,9 @@ export function TerminalPane(props: TerminalPaneProps) {
     searchAddonRef.current?.clearDecorations();
     terminalRenderedOutputBytesSinceSnapshotRef.current = 0;
     terminalOutputIdleRef.current = true;
+    terminalOutputIdleSinceRef.current = undefined;
     terminalServerScrollbackResyncPendingRef.current = false;
+    clearTerminalServerScrollbackResyncIdleTimer();
     terminalResizeRequestKeyRef.current = undefined;
     if (terminalResizeReportFrameRef.current !== undefined) {
       window.cancelAnimationFrame(terminalResizeReportFrameRef.current);
@@ -261,6 +408,8 @@ export function TerminalPane(props: TerminalPaneProps) {
     // 如果沿用旧 session 的时间戳，新 session 首次上滚会被错误地挡在 cooldown 外，
     // 结果看起来像“滚上去不是历史内容”。
     terminalLastServerScrollbackResyncAtRef.current = 0;
+    lastRenderedSnapshotSizeRef.current = undefined;
+    clearPendingSnapshotHistoryRepair();
   }, [props.attached, props.outputResetVersion]);
 
   const isTerminalPinnedToBottom = (terminal = terminalRef.current) => {
@@ -816,17 +965,25 @@ export function TerminalPane(props: TerminalPaneProps) {
     if (item.kind === "snapshot") {
       terminalRenderedOutputBytesSinceSnapshotRef.current = 0;
       terminalOutputIdleRef.current = true;
+      terminalOutputIdleSinceRef.current = undefined;
       terminalServerScrollbackResyncPendingRef.current = false;
+      clearTerminalServerScrollbackResyncIdleTimer();
+      clearPendingSnapshotHistoryRepairSchedule();
       terminalResizeRequestKeyRef.current = undefined;
       return;
     }
     if (item.kind === "data" || item.kind === "output") {
       terminalOutputIdleRef.current = false;
+      terminalOutputIdleSinceRef.current = undefined;
+      clearTerminalServerScrollbackResyncIdleTimer();
+      clearPendingSnapshotHistoryRepairSchedule();
       terminalRenderedOutputBytesSinceSnapshotRef.current += serverScrollableOutputBytes(item.bytes);
     }
   };
   const noteTerminalOutputIdle = () => {
     terminalOutputIdleRef.current = true;
+    terminalOutputIdleSinceRef.current = nowForThrottle();
+    evaluatePendingSnapshotHistoryRepair();
   };
   const maybeRequestServerScrollbackResync = (
     maxViewportY: number,
@@ -835,6 +992,7 @@ export function TerminalPane(props: TerminalPaneProps) {
     if (maxViewportY > 0) {
       terminalRenderedOutputBytesSinceSnapshotRef.current = 0;
       terminalServerScrollbackResyncPendingRef.current = false;
+      clearTerminalServerScrollbackResyncIdleTimer();
       return;
     }
     const renderedBytes = terminalRenderedOutputBytesSinceSnapshotRef.current;
@@ -868,6 +1026,28 @@ export function TerminalPane(props: TerminalPaneProps) {
       return;
     }
     const now = nowForThrottle();
+    if (reason === "auto") {
+      const idleSince = terminalOutputIdleSinceRef.current;
+      const idleForMs = idleSince === undefined ? 0 : now - idleSince;
+      if (idleSince === undefined || idleForMs < TERMINAL_SERVER_SCROLLBACK_RESYNC_IDLE_SETTLE_MS) {
+        if (terminalServerScrollbackResyncIdleTimerRef.current === undefined) {
+          const remainingMs = Math.max(
+            0,
+            TERMINAL_SERVER_SCROLLBACK_RESYNC_IDLE_SETTLE_MS - idleForMs,
+          );
+          // 中文注释：自动 scrollback 预取只应该发生在输出真正稳定之后。
+          // 刚 attach/reconnect/relay 恢复完成时，Ghostty 很容易短暂处于
+          // “baseY=0 但画面还在追平”的中间态；这里等待一个 idle settle window，
+          // 避免把暂态误判成 tmux 全屏重绘，从而过早触发 full snapshot 重连。
+          terminalServerScrollbackResyncIdleTimerRef.current = window.setTimeout(() => {
+            terminalServerScrollbackResyncIdleTimerRef.current = undefined;
+            const retryScrollState = rendererRef.current?.scrollState(terminalRef.current ?? undefined);
+            maybeRequestServerScrollbackResync(retryScrollState?.baseY ?? 0, "auto");
+          }, remainingMs);
+        }
+        return;
+      }
+    }
     if (
       terminalLastServerScrollbackResyncAtRef.current > 0 &&
       now - terminalLastServerScrollbackResyncAtRef.current < TERMINAL_SERVER_SCROLLBACK_RESYNC_COOLDOWN_MS
@@ -957,6 +1137,7 @@ export function TerminalPane(props: TerminalPaneProps) {
     onTerminalSizeRenderedRef.current = props.onTerminalSizeRendered;
     onOutputResetAppliedRef.current = props.onOutputResetApplied;
     sessionSizeRef.current = props.sessionSize;
+    confirmedSessionSizeRef.current = props.sessionSize;
     mobileInputModeRef.current = Boolean(props.mobileInputMode);
     mobileKeyboardOpenRef.current = Boolean(props.mobileKeyboardOpen);
   }, [props.attached, props.mobileInputMode, props.mobileKeyboardOpen, props.onCursorChange, props.onInput, props.onOutputResetApplied, props.onResize, props.onTerminalResync, props.onTerminalSeqRendered, props.onTerminalSizeRendered, props.sessionSize, props.takeOutput]);
@@ -990,11 +1171,21 @@ export function TerminalPane(props: TerminalPaneProps) {
 
   useEffect(() => {
     sessionSizeRef.current = props.sessionSize;
+    confirmedSessionSizeRef.current = props.sessionSize;
     terminalResizeRequestKeyRef.current = undefined;
     terminalResizeReportSizeRef.current = undefined;
     terminalResizeReportPassesRef.current = 0;
     resizeRef.current?.("session");
   }, [props.sessionSize?.cols, props.sessionSize?.pixel_height, props.sessionSize?.pixel_width, props.sessionSize?.rows]);
+
+  useEffect(() => {
+    // 中文注释：旧尺寸 snapshot 的历史修复需要同时满足两件事：
+    // 1) daemon 已确认当前 rows/cols 就是浏览器想要的尺寸；
+    // 2) live output 已经稳定到足够安全，可以重新 full snapshot。
+    // 这里每次 size ack 变化都重评估一次；如果旧 snapshot 反而晚到，也会由
+    // snapshot render / output idle 路径主动再次评估，不依赖下一次 props 变化。
+    evaluatePendingSnapshotHistoryRepair();
+  }, [props.sessionSize?.cols, props.sessionSize?.rows]);
 
   const requestCursorReportFrame = () => {
     if (cursorFrameRef.current !== undefined) {
@@ -1446,6 +1637,16 @@ export function TerminalPane(props: TerminalPaneProps) {
     }, 180);
   };
 
+  const maybeBeginTerminalResizeStabilizationMask = (
+    terminal: TerminalRendererTerminal,
+    nextSize: { rows: number; cols: number } | undefined,
+  ) => {
+    if (!nextSize || sameTerminalDimensions(terminal, nextSize)) {
+      return;
+    }
+    beginTerminalResizeStabilizationMask();
+  };
+
   const clearSnapshotRedrawMask = () => {
     const host = hostRef.current;
     if (!host) {
@@ -1480,6 +1681,12 @@ export function TerminalPane(props: TerminalPaneProps) {
       terminalHost.contains(activeElement),
     );
   };
+  const localTerminalOwnsResizeAuthority = () =>
+    hasActiveTerminalFocus() ||
+    terminalDomHasActiveFocus() ||
+    (windowActiveRef.current && focusActivationArmedRef.current);
+  const localTerminalWillOwnResizeAuthority = () =>
+    localTerminalOwnsResizeAuthority() || pendingFocusRequestRef.current !== undefined;
 
   const reportTerminalFocus = (nextFocused: boolean) => {
     if (focusedRef.current === nextFocused) {
@@ -1642,6 +1849,15 @@ export function TerminalPane(props: TerminalPaneProps) {
       scheduledFrames.add(frame);
       return frame;
     };
+    const canUseArmedFocusResizeAuthority = (source: ResizeSource | undefined) => {
+      if (source !== "focus") {
+        return false;
+      }
+      // 中文注释：真实浏览器里 terminal.focus() 到 host/textarea 变成 activeElement
+      // 之间可能还隔着一轮布局；focusRequest/显式点击触发的首轮 focus resize 不能因为
+      // 这个短暂窗口被吞掉，否则 tmux 会继续维持旧 rows/cols，首屏就会按旧网格乱掉。
+      return windowActiveRef.current && focusActivationArmedRef.current;
+    };
     const canReportLocalResizeForSource = (source: ResizeSource | undefined) => {
       if (!source || source === "session" || source === "snapshot" || snapshotRedrawInProgressRef.current) {
         return false;
@@ -1652,7 +1868,11 @@ export function TerminalPane(props: TerminalPaneProps) {
       if (source === "mobile-viewport") {
         return mobileInputModeRef.current && windowActiveRef.current && mobileViewportResizeOwnerRef.current;
       }
-      return hasActiveTerminalFocus() || (windowActiveRef.current && terminalDomHasActiveFocus());
+      return (
+        hasActiveTerminalFocus() ||
+        (windowActiveRef.current && terminalDomHasActiveFocus()) ||
+        canUseArmedFocusResizeAuthority(source)
+      );
     };
     const scheduleLocalResizeReport = (source: ResizeSource) => {
       const currentReportSource = terminalResizeReportSourceRef.current;
@@ -1929,8 +2149,11 @@ export function TerminalPane(props: TerminalPaneProps) {
       const hostHeight = terminalHost.clientHeight;
       const remoteSize = sessionSizeRef.current;
       const terminalHasActiveFocus = hasActiveTerminalFocus();
+      const armedFocusResizeAuthority = canUseArmedFocusResizeAuthority(source);
       const terminalCanReportActiveFocus =
-        terminalHasActiveFocus || (windowActiveRef.current && terminalDomHasActiveFocus());
+        terminalHasActiveFocus ||
+        (windowActiveRef.current && terminalDomHasActiveFocus()) ||
+        armedFocusResizeAuthority;
       const mobileKeyboardIsOpen =
         mobileInputModeRef.current &&
         mobileKeyboardOpenRef.current;
@@ -1956,6 +2179,29 @@ export function TerminalPane(props: TerminalPaneProps) {
           pixel_width: hostWidth,
           pixel_height: hostHeight,
         };
+        const snapshotSize = lastRenderedSnapshotSizeRef.current;
+        if (
+          canReportLocalResize &&
+          snapshotSize &&
+          (snapshotSize.rows !== proposed.rows || snapshotSize.cols !== proposed.cols) &&
+          (
+            pendingSnapshotHistoryRepairRef.current?.snapshotRows !== snapshotSize.rows ||
+            pendingSnapshotHistoryRepairRef.current?.snapshotCols !== snapshotSize.cols
+          )
+        ) {
+          // 中文注释：页面初开时如果先按 daemon 的旧 snapshot 画出来，用户随后第一次聚焦
+          // 才把 PTY resize 到当前浏览器尺寸，那么现有 buffer 仍是旧网格折行出来的内容。
+          // 这里先记下“需要用新尺寸再拉一次 full snapshot”，等 daemon 真正确认 rows/cols
+          // 后统一重建历史和当前屏幕，避免 Codex 底部输入区相对正文抬高/压低一行。
+          pendingSnapshotHistoryRepairRef.current = {
+            snapshotRows: snapshotSize.rows,
+            snapshotCols: snapshotSize.cols,
+          };
+          // 中文注释：daemon 对新尺寸的 ack 可能已经先于用户聚焦到达。
+          // 如果 repair intent 是在后续 focus/layout resize 中才首次建立，就不能再只等
+          // 下一次 sessionSize 变化；这里要立刻重评估一次，避免 pending repair 永远挂住。
+          evaluatePendingSnapshotHistoryRepair();
+        }
       }
       if (!canReportLocalResize) {
         applyFontSize(terminal, currentTerminalFontSize());
@@ -1967,7 +2213,7 @@ export function TerminalPane(props: TerminalPaneProps) {
         ) {
           // 中文注释：snapshot 后仍要把本地 Ghostty 贴合当前容器，避免内容停在旧高度；
           // 但这是被动重绘，不能回写 daemon，否则不同分辨率客户端会形成 resize/snapshot 风暴。
-          beginTerminalResizeStabilizationMask();
+          maybeBeginTerminalResizeStabilizationMask(terminal, proposed);
           if (!sameTerminalDimensions(terminal, proposed)) {
             fit.fit();
           }
@@ -1975,16 +2221,22 @@ export function TerminalPane(props: TerminalPaneProps) {
           queueCursorReport({ immediate: true });
           return;
         }
-        if (remoteSize) {
-          if (sameTerminalDimensions(terminal, remoteSize)) {
-            scheduleScrollToBottomIfPinned(wasPinnedToBottom);
-            queueCursorReport({ immediate: true });
-            return;
-          }
+        if (
+          source === "session" &&
+          remoteSize &&
+          !localTerminalWillOwnResizeAuthority() &&
+          !sameTerminalDimensions(terminal, remoteSize)
+        ) {
+          // 中文注释：未聚焦客户端虽然不能把自己的布局写回 shared PTY，但 daemon/tmux
+          // 已确认的新 rows/cols 仍然是权威尺寸。这里必须被动跟随远端 grid，否则后续
+          // output/snapshot 仍会按旧列宽解释，tmux/vim/top 这类全屏界面会直接错位。
           terminal.resize(remoteSize.cols, remoteSize.rows);
-          scheduleScrollToBottomIfPinned(wasPinnedToBottom);
-          queueCursorReport({ immediate: true });
         }
+        // 中文注释：窗口失焦后的 layout/blur 抖动不能把本地 Ghostty 立即缩回远端尺寸。
+        // 只有 daemon/tmux 真的确认了新的 sessionSize，未聚焦客户端才跟随权威 grid；
+        // 否则回到页面时会先看到一次旧 grid/旧布局，再被 focus resize 拉回当前容器。
+        scheduleScrollToBottomIfPinned(wasPinnedToBottom);
+        queueCursorReport({ immediate: true });
         return;
       }
       applyFontSize(terminal, currentTerminalFontSize());
@@ -1999,7 +2251,7 @@ export function TerminalPane(props: TerminalPaneProps) {
           if (terminalResizeRequestKeyRef.current === nextResizeKey) {
             terminalResizeRequestKeyRef.current = undefined;
           }
-          beginTerminalResizeStabilizationMask();
+          maybeBeginTerminalResizeStabilizationMask(terminal, proposed);
           if (!sameTerminalDimensions(terminal, proposed)) {
             fit.fit();
           }
@@ -2008,7 +2260,7 @@ export function TerminalPane(props: TerminalPaneProps) {
           return;
         }
         if (terminalResizeRequestKeyRef.current === nextResizeKey) {
-          beginTerminalResizeStabilizationMask();
+          maybeBeginTerminalResizeStabilizationMask(terminal, proposed);
           if (!sameTerminalDimensions(terminal, proposed)) {
             fit.fit();
           }
@@ -2018,7 +2270,7 @@ export function TerminalPane(props: TerminalPaneProps) {
         }
         // 只有拥有本地 resize 权限时才向 daemon 请求新尺寸。这里把本地 fit 也放进
         // 同一条稳定帧通道里，避免 reload/focus 期间把临时测量先写进 Ghostty。
-        beginTerminalResizeStabilizationMask();
+        maybeBeginTerminalResizeStabilizationMask(terminal, proposed);
         if (!sameTerminalDimensions(terminal, proposed)) {
           fit.fit();
           scheduleScrollToBottomIfPinned(wasPinnedToBottom);
@@ -2086,6 +2338,10 @@ export function TerminalPane(props: TerminalPaneProps) {
       // 中文注释：snapshot 会先按 daemon 生成时的尺寸重放历史屏幕；重放完成后必须
       // 再按当前浏览器容器 fit 一次，否则后续输出会沿旧 24 行滚动，最终悬在上半截。
       onSnapshotRendered: (item) => {
+        lastRenderedSnapshotSizeRef.current = {
+          rows: item.size.rows,
+          cols: item.size.cols,
+        };
         clearSnapshotRedrawMask();
         const revealHistory = item.revealHistory || terminalRevealHistoryAfterSnapshotRef.current;
         terminalRevealHistoryAfterSnapshotRef.current = false;
@@ -2141,7 +2397,25 @@ export function TerminalPane(props: TerminalPaneProps) {
           }
           requestTrackedFrame(() => resizeRef.current?.(pendingResizeSource));
         };
-        if (hasActiveTerminalFocus() || terminalDomHasActiveFocus()) {
+        const preferredSize = measurePreferredClientSize();
+        const shouldRepairSnapshotHistory =
+          !revealHistory &&
+          localTerminalWillOwnResizeAuthority() &&
+          preferredSize !== undefined &&
+          (preferredSize.rows !== item.size.rows || preferredSize.cols !== item.size.cols);
+        if (shouldRepairSnapshotHistory) {
+          pendingSnapshotHistoryRepairRef.current = {
+            snapshotRows: item.size.rows,
+            snapshotCols: item.size.cols,
+          };
+          evaluatePendingSnapshotHistoryRepair();
+        } else if (
+          pendingSnapshotHistoryRepairRef.current?.snapshotRows === item.size.rows &&
+          pendingSnapshotHistoryRepairRef.current?.snapshotCols === item.size.cols
+        ) {
+          clearPendingSnapshotHistoryRepair();
+        }
+        if (localTerminalOwnsResizeAuthority()) {
           refreshTerminal("snapshot");
           stabilizeTerminal("snapshot");
           // 中文注释：reload/重连时 daemon snapshot 可能仍是旧的 80x24。若当前客户端
@@ -2257,6 +2531,7 @@ export function TerminalPane(props: TerminalPaneProps) {
         window.clearTimeout(terminalScrollTimerRef.current);
         terminalScrollTimerRef.current = undefined;
       }
+      clearTerminalServerScrollbackResyncIdleTimer();
       clearMobileDirectionGesture();
       lastTerminalScrollReportAtRef.current = 0;
       terminalLastServerScrollbackResyncAtRef.current = 0;
@@ -2267,7 +2542,9 @@ export function TerminalPane(props: TerminalPaneProps) {
       terminalNativeCopyCommandHandledRef.current = false;
       terminalRevealHistoryAfterSnapshotRef.current = false;
       terminalRevealHistorySuppressBottomUntilRef.current = 0;
+      terminalOutputIdleSinceRef.current = undefined;
       terminalSnapshotRedrawGenerationRef.current += 1;
+      clearPendingSnapshotHistoryRepair();
       window.removeEventListener("resize", handleWindowResize);
       cleanupFocusResizeListeners();
       resizeObserver?.disconnect();
@@ -2351,7 +2628,11 @@ export function TerminalPane(props: TerminalPaneProps) {
         screenReaderMode: false,
         scrollback: 2000,
         smoothScrollDuration: 0,
-        fontFamily: '"IBM Plex Mono", "SFMono-Regular", Consolas, monospace',
+        // 中文注释：Ghostty 会把中文等宽字符按 2 个 terminal cells 排版。
+        // 如果主字体本身不覆盖 CJK，浏览器 fallback 过来的非终端字形往往只占
+        // 约 1 个 cell 的视觉宽度，画面就会变成“字字分家”。这里优先使用本机
+        // 常见且真实存在的 CJK monospace 字体，保证中英混排在 fresh attach 时也能稳定对齐。
+        fontFamily: '"Noto Sans Mono CJK SC", "WenQuanYi Zen Hei Mono", "IBM Plex Mono", "SFMono-Regular", Consolas, monospace',
         fontSize: props.mobileInputMode ? MOBILE_TERMINAL_FONT_SIZE : TERMINAL_FONT_SIZE,
         convertEol: true,
         theme: terminalTheme(props.theme ?? "dark"),

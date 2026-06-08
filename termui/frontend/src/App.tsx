@@ -134,6 +134,7 @@ const RETRYABLE_CONNECTION_ERROR_CODES = new Set([
   "connection_closed",
   "connection_error",
   "connect_timeout",
+  "response_timeout",
   "route_prelude_timeout",
   "relay_daemon_offline",
   "relay_state_unavailable",
@@ -164,6 +165,17 @@ const LOCALLY_SUPERSEDED_CONNECTION_ERROR_CODES = new Set([
   "stale_connection",
 ]);
 
+const IGNORED_CLOSING_SESSION_ERROR_CODES = new Set([
+  "session_not_found",
+]);
+
+const IGNORED_CLOSED_SESSION_ERROR_CODES = new Set([
+  "session_not_found",
+  "connection_closed",
+  "stale_connection",
+  "receive_interrupted",
+]);
+
 function isLocallySupersededConnectionError(caught: unknown): boolean {
   return LOCALLY_SUPERSEDED_CONNECTION_ERROR_CODES.has(toSafeError(caught).code);
 }
@@ -191,6 +203,24 @@ function isPagePaused(): boolean {
 
 function isTerminalTransportPaused(): boolean {
   return isBrowserOffline();
+}
+
+function isDocumentAnimationFrameUnsafe(): boolean {
+  return typeof document !== "undefined" && (
+    document.visibilityState === "hidden" ||
+    (typeof document.hasFocus === "function" && !document.hasFocus())
+  );
+}
+
+interface DeferredTerminalFrameTestHook {
+  schedule: (callback: () => void) => number;
+  cancel: (handle: number) => void;
+}
+
+function terminalOutputFlushFrameTestHook(): DeferredTerminalFrameTestHook | undefined {
+  return (globalThis as {
+    __TERMD_TEST_HOLD_TERMINAL_OUTPUT_FLUSH_RAF__?: DeferredTerminalFrameTestHook;
+  }).__TERMD_TEST_HOLD_TERMINAL_OUTPUT_FLUSH_RAF__;
 }
 
 export interface DaemonNetworkCounterSample {
@@ -350,6 +380,7 @@ export default function App() {
     terminalOutputAppliedResetVersionRef,
     terminalOutputResetWaitersRef,
     terminalOutputFlushFrameRef,
+    terminalOutputFlushTimerRef,
     terminalOutputDrainRef,
     terminalSnapshotRevealHistoryTokensRef,
     terminalSnapshotPendingFullSnapshotTokensRef,
@@ -362,6 +393,7 @@ export default function App() {
   const mobileTitlePullGestureRef = useRef<MobileTitlePullGesture | undefined>(undefined);
   const suppressMobileTitleClickRef = useRef(false);
   const closingSessionIdsRef = useRef<Set<UUID>>(new Set());
+  const closedSessionIdsRef = useRef<Set<UUID>>(new Set());
   const forgettingClientIdsRef = useRef<Set<UUID>>(new Set());
   const renamingSessionIdRef = useRef<UUID | undefined>(undefined);
   const filesPanelWidthRef = useRef(DEFAULT_FILES_PANEL_WIDTH);
@@ -435,12 +467,21 @@ export default function App() {
   useEffect(() => {
     return () => {
       if (terminalOutputFlushFrameRef.current !== undefined) {
-        window.cancelAnimationFrame(terminalOutputFlushFrameRef.current);
+        const flushFrameTestHook = terminalOutputFlushFrameTestHook();
+        if (flushFrameTestHook) {
+          flushFrameTestHook.cancel(terminalOutputFlushFrameRef.current);
+        } else {
+          window.cancelAnimationFrame(terminalOutputFlushFrameRef.current);
+        }
         terminalOutputFlushFrameRef.current = undefined;
       }
       if (connectionAutoRetryTimerRef.current !== undefined) {
         window.clearTimeout(connectionAutoRetryTimerRef.current);
         connectionAutoRetryTimerRef.current = undefined;
+      }
+      if (terminalOutputFlushTimerRef.current !== undefined) {
+        window.clearTimeout(terminalOutputFlushTimerRef.current);
+        terminalOutputFlushTimerRef.current = undefined;
       }
       if (attachReconnectTimerRef.current !== undefined) {
         window.clearTimeout(attachReconnectTimerRef.current);
@@ -659,19 +700,35 @@ export default function App() {
     [setSafeError],
   );
 
-  const isIgnoredClosingSessionNotFound = useCallback((sessionId: UUID, caught: unknown) => {
-    if (!closingSessionIdsRef.current.has(sessionId)) {
-      return false;
+  const isIgnoredClosingSessionError = useCallback((sessionId: UUID, caught: unknown) => {
+    const code = toSafeError(caught).code;
+    if (closingSessionIdsRef.current.has(sessionId)) {
+      return IGNORED_CLOSING_SESSION_ERROR_CODES.has(code);
     }
-    return toSafeError(caught).code === "session_not_found";
+    if (closedSessionIdsRef.current.has(sessionId)) {
+      // 中文注释：session 已确认关闭后，旧 attach 上迟到的 input/resize/cursor promise
+      // 只是在汇报“那条 transport 已经结束”。这类尾部 connection_closed/stale_connection
+      // 不能把一个已经成功完成的 close 操作重新升级成全局连接错误。
+      return IGNORED_CLOSED_SESSION_ERROR_CODES.has(code);
+    }
+    return false;
   }, []);
 
   const discardPendingTerminalOutput = useCallback(() => {
     // 终端输出由 Ghostty 自己维护 scrollback；React 只保留尚未写入 Ghostty 的短队列。
     terminalOutputQueueRef.current = [];
     if (terminalOutputFlushFrameRef.current !== undefined) {
-      window.cancelAnimationFrame(terminalOutputFlushFrameRef.current);
+      const flushFrameTestHook = terminalOutputFlushFrameTestHook();
+      if (flushFrameTestHook) {
+        flushFrameTestHook.cancel(terminalOutputFlushFrameRef.current);
+      } else {
+        window.cancelAnimationFrame(terminalOutputFlushFrameRef.current);
+      }
       terminalOutputFlushFrameRef.current = undefined;
+    }
+    if (terminalOutputFlushTimerRef.current !== undefined) {
+      window.clearTimeout(terminalOutputFlushTimerRef.current);
+      terminalOutputFlushTimerRef.current = undefined;
     }
   }, []);
 
@@ -778,12 +835,55 @@ export default function App() {
 
   const flushTerminalOutput = useCallback(() => {
     terminalOutputFlushFrameRef.current = undefined;
+    terminalOutputFlushTimerRef.current = undefined;
     // 这一帧里累积的 session_data 直接交给 Ghostty drain，避免每帧输出都触发 React 重渲染。
     terminalOutputDrainRef.current?.();
   }, []);
 
+  const rescuePendingTerminalOutputFlush = useCallback((force = false) => {
+    if (
+      typeof document === "undefined" ||
+      (!force && !isDocumentAnimationFrameUnsafe()) ||
+      terminalOutputFlushFrameRef.current === undefined ||
+      terminalOutputFlushTimerRef.current !== undefined
+    ) {
+      return;
+    }
+    // 中文注释：如果 stdout 到来时页面还在前台，flush 会先排进 rAF。
+    // 用户随后立刻切后台/切窗口时，这个已排队的 rAF 可能被浏览器冻结；这里要主动
+    // 把 pending flush 改挂到 timer，避免 React 队列里的输出就此卡住。
+    const flushFrameTestHook = terminalOutputFlushFrameTestHook();
+    if (flushFrameTestHook) {
+      flushFrameTestHook.cancel(terminalOutputFlushFrameRef.current);
+    } else {
+      window.cancelAnimationFrame(terminalOutputFlushFrameRef.current);
+    }
+    terminalOutputFlushFrameRef.current = undefined;
+    terminalOutputFlushTimerRef.current = window.setTimeout(() => {
+      flushTerminalOutput();
+    }, 0);
+  }, [flushTerminalOutput]);
+
   const scheduleTerminalOutputFlush = useCallback(() => {
-    if (terminalOutputFlushFrameRef.current !== undefined) {
+    if (
+      terminalOutputFlushFrameRef.current !== undefined ||
+      terminalOutputFlushTimerRef.current !== undefined
+    ) {
+      return;
+    }
+    if (isDocumentAnimationFrameUnsafe()) {
+      // 中文注释：后台标签页、失焦窗口里 requestAnimationFrame 可能被浏览器暂停或重度节流。
+      // terminal stdout 不能因此卡在 React 队列里，所以这类状态直接退回 timer flush。
+      terminalOutputFlushTimerRef.current = window.setTimeout(() => {
+        flushTerminalOutput();
+      }, 0);
+      return;
+    }
+    const flushFrameTestHook = terminalOutputFlushFrameTestHook();
+    if (flushFrameTestHook) {
+      terminalOutputFlushFrameRef.current = flushFrameTestHook.schedule(() => {
+        flushTerminalOutput();
+      });
       return;
     }
     terminalOutputFlushFrameRef.current = window.requestAnimationFrame(() => {
@@ -868,6 +968,8 @@ export default function App() {
   const resetWorkspaceState = useCallback(() => {
     setSessions([]);
     confirmedSessionSizesRef.current.clear();
+    closingSessionIdsRef.current.clear();
+    closedSessionIdsRef.current.clear();
     clearTerminalSnapshotRevealHistory();
     closeWorkspaceClient();
     receiveLoopGenerationRef.current += 1;
@@ -1177,7 +1279,7 @@ export default function App() {
   });
   fileEditorResetRef.current = resetFileEditor;
 
-  const handleRefresh = useCallback(async () => {
+  const handleRefresh = useCallback(async (options: { bootstrap?: boolean } = {}) => {
     if (isPagePaused()) {
       return;
     }
@@ -1189,7 +1291,16 @@ export default function App() {
     let sessionListApplied = false;
     try {
       const client = await authenticatedWorkspaceClient();
-      const list = await client.listSessions();
+      const needsBootstrapBudget =
+        options.bootstrap ||
+        (!attachedSessionRef.current && !attachClientRef.current && !attachingSessionIdRef.current);
+      const sessionListTimeoutMs = needsBootstrapBudget
+        ? ATTACH_CONNECTION_TIMEOUT_MS
+        : APP_CONNECTION_TIMEOUT_MS;
+      // 中文注释：只要当前 workspace 里还没有 attach 中的终端流，session.list 就仍是
+      // 用户可见主路径，应该沿用 terminal 级长预算。已经 attach 之后，手动刷新和后台
+      // 元数据刷新继续保持普通 5s 请求预算，避免非关键刷新拖太久。
+      const list = await client.listSessions(sessionListTimeoutMs);
       if (
         activeServerIdRef.current !== requestServerId ||
         requestCreateGeneration !== sessionCreateRequestIdRef.current
@@ -1216,6 +1327,11 @@ export default function App() {
       );
       confirmedSessionSizesRef.current = new Map(list.sessions.map((session) => [session.session_id, session.size]));
       const listedSessionIds = new Set(list.sessions.map((session) => session.session_id));
+      closedSessionIdsRef.current.forEach((sessionId) => {
+        if (listedSessionIds.has(sessionId)) {
+          closedSessionIdsRef.current.delete(sessionId);
+        }
+      });
       const localKnownSessionIds = new Set([
         ...sessionsRef.current.map((session) => session.session_id),
         ...sessionOrderRef.current,
@@ -1336,8 +1452,14 @@ export default function App() {
       try {
         const client = await authenticatedWorkspaceClient();
         try {
+          const sessionListTimeoutMs =
+            !attachedSessionRef.current && !attachClientRef.current && !attachingSessionIdRef.current
+              ? ATTACH_CONNECTION_TIMEOUT_MS
+              : APP_CONNECTION_TIMEOUT_MS;
           // 中文注释：状态和客户端列表复用当前 session 的 WebSocket，只在内层 segment 分类。
-          const sessionList = await client.listSessions();
+          // ready 且当前还没有 attach 时，这条刷新实际上仍在承担“把用户带回可打开 session 的
+          // 工作台”职责，慢 relay 下继续给它 bootstrap 级预算，避免恢复可见后列表长期陈旧。
+          const sessionList = await client.listSessions(sessionListTimeoutMs);
           const clientList = await client.listDaemonClients().catch(() => undefined);
           if (activeServerIdRef.current !== requestServerId) {
             return;
@@ -1360,6 +1482,12 @@ export default function App() {
             confirmedSessionSizesRef.current,
           );
           confirmedSessionSizesRef.current = new Map(sessionList.sessions.map((session) => [session.session_id, session.size]));
+          const listedSessionIds = new Set(sessionList.sessions.map((session) => session.session_id));
+          closedSessionIdsRef.current.forEach((sessionId) => {
+            if (listedSessionIds.has(sessionId)) {
+              closedSessionIdsRef.current.delete(sessionId);
+            }
+          });
           setSessions((current) =>
             // 中文注释：后台刷新不能把刚创建、刚选中或正在 attach 的本地 session 行刷成空列表。
             mergeSessionRefresh(sessionList.sessions, current, [
@@ -1533,7 +1661,7 @@ export default function App() {
     }
     autoCheckedServerRef.current = activeServer.server_id;
     setStatus("connecting");
-    void handleRefresh();
+    void handleRefresh({ bootstrap: true });
   }, [activeServer, handleRefresh, state.device, status]);
 
   const startReceiveLoop = useTerminalReceiveLoop(terminalAttachController, {
@@ -1541,6 +1669,7 @@ export default function App() {
     sessionFilesFollowTerminalCwdRef,
     applyConfirmedSessionSize,
     enqueueTerminalOutput,
+    isIgnoredClosingSessionError,
     markNewOutputIfBackground,
     setSafeError,
     setSessionFiles,
@@ -2005,7 +2134,7 @@ export default function App() {
     setError(undefined);
     setActiveSurface("workspace");
     autoCheckedServerRef.current = undefined;
-    await handleRefresh();
+    await handleRefresh({ bootstrap: true });
   }, [attachedSessionId, disconnectAttach, handleRefresh, performAttach, selectedSessionId]);
 
   useWorkspaceAutoRetry(workspaceConnection, {
@@ -2062,7 +2191,7 @@ export default function App() {
       if (activeServer && state.device && (status === "idle" || status === "connecting")) {
         autoCheckedServerRef.current = undefined;
         setStatus("idle");
-        void handleRefresh();
+        void handleRefresh({ bootstrap: true });
         return;
       }
       if (connectionReady) {
@@ -2073,17 +2202,23 @@ export default function App() {
 
     const handleVisibilityChange = () => {
       if (document.visibilityState === "hidden") {
+        rescuePendingTerminalOutputFlush(true);
         return;
       }
       resumeVisibleConnection();
     };
 
     document.addEventListener("visibilitychange", handleVisibilityChange);
+    const handleWindowBlur = () => {
+      rescuePendingTerminalOutputFlush(true);
+    };
+    window.addEventListener("blur", handleWindowBlur);
     window.addEventListener("focus", resumeVisibleConnection);
     window.addEventListener("offline", pauseOfflineConnection);
     window.addEventListener("online", resumeVisibleConnection);
     return () => {
       document.removeEventListener("visibilitychange", handleVisibilityChange);
+      window.removeEventListener("blur", handleWindowBlur);
       window.removeEventListener("focus", resumeVisibleConnection);
       window.removeEventListener("offline", pauseOfflineConnection);
       window.removeEventListener("online", resumeVisibleConnection);
@@ -2099,6 +2234,7 @@ export default function App() {
     handleRetryConnection,
     loadDaemonStatus,
     refreshDaemonClients,
+    rescuePendingTerminalOutputFlush,
     scheduleResumeMetadataRefresh,
     selectedSessionId,
     state.device,
@@ -2155,11 +2291,17 @@ export default function App() {
       const wasSelected = selectedSessionId === sessionId;
       let sessionClient: { client: DirectClient; ownsClient: boolean } | undefined;
       try {
+        // 中文注释：关闭当前 attach session 时先声明“这是一次有意断开”。
+        // 这样旧 terminal WebSocket 若在 daemon close 收尾期间报 connection_closed，
+        // receive loop / reconnect 都会把它当作预期行为，而不是重新 attach 回已删除 session。
+        if (wasAttached) {
+          userDetachedRef.current = true;
+        }
         sessionClient = await resolveSessionScopedClient(sessionId);
         try {
           await sessionClient.client.closeSession(sessionId);
         } catch (caught) {
-          if (!isIgnoredClosingSessionNotFound(sessionId, caught)) {
+          if (!isIgnoredClosingSessionError(sessionId, caught)) {
             throw caught;
           }
         }
@@ -2183,18 +2325,18 @@ export default function App() {
         }
         setMobilePanel(undefined);
         setMobileMenuOpen(false);
+        closedSessionIdsRef.current.add(sessionId);
         void refreshDaemonClients();
       } catch (caught) {
+        if (wasAttached) {
+          userDetachedRef.current = false;
+        }
         setSafeError(caught);
       } finally {
         if (sessionClient?.ownsClient) {
           sessionClient.client.close();
         }
-        // 关闭当前会话时，旧 attach 连接上已经发出的 cursor/resize promise 可能稍后才失败；
-        // 短暂保留 closing 标记，避免这些迟到的 session_not_found 覆盖掉成功删除后的 UI。
-        window.setTimeout(() => {
-          closingSessionIdsRef.current.delete(sessionId);
-        }, 1000);
+        closingSessionIdsRef.current.delete(sessionId);
       }
     },
     [
@@ -2203,7 +2345,7 @@ export default function App() {
       clearTerminalSnapshotRevealHistory,
       disconnectAttach,
       clearNewOutputMark,
-      isIgnoredClosingSessionNotFound,
+      isIgnoredClosingSessionError,
       refreshDaemonClients,
       selectedSessionId,
       selectSession,
@@ -2281,12 +2423,12 @@ export default function App() {
         if (isRetryableConnectionError(caught) && attachReconnectHandlerRef.current(client, caught)) {
           return;
         }
-        if (!isIgnoredClosingSessionNotFound(sessionId, caught)) {
+        if (!isIgnoredClosingSessionError(sessionId, caught)) {
           setSafeError(caught);
         }
       }
     },
-    [isIgnoredClosingSessionNotFound, setSafeError],
+    [isIgnoredClosingSessionError, setSafeError],
   );
 
   const handleResize = useCallback(
@@ -2310,27 +2452,31 @@ export default function App() {
       // 这里仅向 daemon 请求 resize，不乐观改本地 session size，也不等待这个调用读取回执。
       // 中文注释：resize 和输入都在 terminal segment；普通 RPC 是当前 session 连接里的非终端 segment。
       void client.requestSessionResize(sessionId, size).catch((caught) => {
-        if (isRetryableConnectionError(caught) && attachReconnectHandlerRef.current(client, caught)) {
-          return;
-        }
-        if (pendingResizeKeyRef.current === nextResizeKey) {
-          pendingResizeKeyRef.current = undefined;
-        }
         if (isTerminalSidecarTimeout(caught)) {
           // 中文注释：resize ack 和 stdout 共用当前 terminal WebSocket。持续输出时 ack
-          // 可能排在大量 terminal_frame 后面超时；这不表示终端流断开，不能升级成全局错误。
+          // 可能排在大量 terminal_frame 后面超时；这不表示终端流断开，不能升级成全局错误
+          // 或 attach reconnect。这里要在 retryable transport 分支之前先拦下来。
+          if (pendingResizeKeyRef.current === nextResizeKey) {
+            pendingResizeKeyRef.current = undefined;
+          }
           recordTermdDiagnostic("app_terminal_sidecar_timeout_ignored", {
             kind: "resize",
             sessionId,
           });
           return;
         }
-        if (!isIgnoredClosingSessionNotFound(sessionId, caught)) {
+        if (isRetryableConnectionError(caught) && attachReconnectHandlerRef.current(client, caught)) {
+          return;
+        }
+        if (pendingResizeKeyRef.current === nextResizeKey) {
+          pendingResizeKeyRef.current = undefined;
+        }
+        if (!isIgnoredClosingSessionError(sessionId, caught)) {
           setSafeError(caught);
         }
       });
     },
-    [isIgnoredClosingSessionNotFound, sessions, setSafeError],
+    [isIgnoredClosingSessionError, sessions, setSafeError],
   );
 
   const handleCursorChange = useCallback(
@@ -2348,18 +2494,19 @@ export default function App() {
       const focusChanged = lastCursorFocusedRef.current !== presence.focused;
       lastCursorFocusedRef.current = presence.focused;
       void client.sendSessionCursor(sessionId, presence).catch((caught) => {
-        if (isRetryableConnectionError(caught) && attachReconnectHandlerRef.current(client, caught)) {
-          return;
-        }
         if (isTerminalSidecarTimeout(caught)) {
-          // 中文注释：cursor 上报只是协作元数据；高输出场景下响应超时不能卸载 Ghostty。
+          // 中文注释：cursor 上报只是协作元数据；高输出场景下响应超时不能卸载 Ghostty，
+          // 也不能触发 attach reconnect。这里同样优先于 retryable transport 处理。
           recordTermdDiagnostic("app_terminal_sidecar_timeout_ignored", {
             kind: "cursor",
             sessionId,
           });
           return;
         }
-        if (!isIgnoredClosingSessionNotFound(sessionId, caught)) {
+        if (isRetryableConnectionError(caught) && attachReconnectHandlerRef.current(client, caught)) {
+          return;
+        }
+        if (!isIgnoredClosingSessionError(sessionId, caught)) {
           setSafeError(caught);
         }
       });
@@ -2370,7 +2517,7 @@ export default function App() {
         }, 500);
       }
     },
-    [isIgnoredClosingSessionNotFound, refreshDaemonClients, setSafeError],
+    [isIgnoredClosingSessionError, refreshDaemonClients, setSafeError],
   );
 
   useEffect(() => {
@@ -3151,7 +3298,9 @@ export default function App() {
                   type="button"
                   className="icon-button"
                   aria-label={t("sessions.refresh")}
-                  onClick={handleRefresh}
+                  onClick={() => {
+                    void handleRefresh();
+                  }}
                   disabled={status === "listing"}
                 >
                   <RefreshCcw size={15} aria-hidden="true" />

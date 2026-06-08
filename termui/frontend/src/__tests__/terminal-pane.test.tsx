@@ -7,6 +7,37 @@ import type { SessionSearchResultPayload } from "../protocol/types";
 
 const animationFrameMs = 16;
 const DEFAULT_TERMINAL_SIZE = { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 };
+let mockedDocumentVisibilityState: DocumentVisibilityState = "visible";
+let mockedDocumentHasFocus = true;
+
+function setDocumentVisibility(state: DocumentVisibilityState): void {
+  mockedDocumentVisibilityState = state;
+  Object.defineProperty(document, "visibilityState", {
+    configurable: true,
+    get: () => mockedDocumentVisibilityState,
+  });
+  Object.defineProperty(document, "hidden", {
+    configurable: true,
+    get: () => mockedDocumentVisibilityState === "hidden",
+  });
+  document.dispatchEvent(new Event("visibilitychange"));
+}
+
+function setDocumentHasFocus(focused: boolean): void {
+  mockedDocumentHasFocus = focused;
+  Object.defineProperty(document, "hasFocus", {
+    configurable: true,
+    value: () => mockedDocumentHasFocus,
+  });
+}
+
+function restoreDocumentVisibility(): void {
+  mockedDocumentVisibilityState = "visible";
+  mockedDocumentHasFocus = true;
+  Reflect.deleteProperty(document, "visibilityState");
+  Reflect.deleteProperty(document, "hidden");
+  Reflect.deleteProperty(document, "hasFocus");
+}
 
 function fireTouchPointer(
   target: HTMLElement,
@@ -802,15 +833,83 @@ describe("TerminalPane terminal sequence rendering", () => {
       });
 
       // 中文注释：另一客户端 resize 后会把权威 sessionSize 推给本端。
-      // 本端即使仍处于聚焦态，也只能被动按远端尺寸重绘，不能立刻把自己的本地尺寸写回 daemon。
+      // 当前客户端不能立刻把自己的本地尺寸写回 daemon；同时也不应在失焦/回焦链路里
+      // 强制把本地 Ghostty 缩回远端尺寸，避免肉眼看到一次远端网格闪回。
       expect(onResize).not.toHaveBeenCalled();
       const operations = (globalThis as {
         __TERMD_TEST_TERMINAL_STATS__?: {
           operations: Array<{ op: string; cols?: number; rows?: number }>;
         };
       }).__TERMD_TEST_TERMINAL_STATS__?.operations ?? [];
+      expect(operations).not.toContainEqual({ op: "resize", cols: remoteSize.cols, rows: remoteSize.rows });
+    } finally {
+      restoreDocumentVisibility();
+      vi.useRealTimers();
+    }
+  });
+
+  it("未聚焦客户端在 sessionSize 变化后会跟随远端权威 grid", async () => {
+    vi.useFakeTimers();
+    try {
+      const initialSize = { rows: 31, cols: 101, pixel_width: 808, pixel_height: 496 };
+      const remoteSize = { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 };
+      const takeOutput = vi.fn(() => []);
+      const registerOutputDrain = vi.fn((drain: () => void) => {
+        drain();
+        return () => undefined;
+      });
+      (globalThis as { __TERMD_TEST_FIT_DIMENSIONS__?: { rows: number; cols: number } })
+        .__TERMD_TEST_FIT_DIMENSIONS__ = { rows: initialSize.rows, cols: initialSize.cols };
+
+      const { rerender } = render(
+        <TerminalPane
+          attached
+          sessionSize={initialSize}
+          outputResetVersion={0}
+          takeOutput={takeOutput}
+          registerOutputDrain={registerOutputDrain}
+          onInput={vi.fn()}
+          onResize={vi.fn()}
+          onCursorChange={vi.fn()}
+        />,
+      );
+
+      const terminalInput = screen.getByRole("textbox", { name: "Terminal input" });
+      act(() => {
+        terminalInput.focus();
+        vi.advanceTimersByTime(animationFrameMs * 8);
+      });
+      act(() => {
+        window.dispatchEvent(new Event("blur"));
+        vi.advanceTimersByTime(240);
+      });
+
+      rerender(
+        <TerminalPane
+          attached
+          sessionSize={remoteSize}
+          outputResetVersion={0}
+          takeOutput={takeOutput}
+          registerOutputDrain={registerOutputDrain}
+          onInput={vi.fn()}
+          onResize={vi.fn()}
+          onCursorChange={vi.fn()}
+        />,
+      );
+      act(() => {
+        vi.advanceTimersByTime(animationFrameMs * 8);
+      });
+
+      const operations = (globalThis as {
+        __TERMD_TEST_TERMINAL_STATS__?: {
+          operations: Array<{ op: string; cols?: number; rows?: number }>;
+        };
+      }).__TERMD_TEST_TERMINAL_STATS__?.operations ?? [];
+      // 中文注释：这里是 daemon/tmux 已确认的 sessionSize 变化，不是本地 blur/layout 抖动。
+      // 未聚焦客户端必须被动切回权威 grid，避免后续输出按旧列宽继续错位。
       expect(operations).toContainEqual({ op: "resize", cols: remoteSize.cols, rows: remoteSize.rows });
     } finally {
+      restoreDocumentVisibility();
       vi.useRealTimers();
     }
   });
@@ -1123,7 +1222,7 @@ describe("TerminalPane terminal sequence rendering", () => {
     }
   });
 
-  it("tmux 全屏重绘导致 Ghostty 无 scrollback 时会主动请求一次 snapshot resync", async () => {
+  it("tmux 全屏重绘导致 Ghostty 无 scrollback 时会在稳定窗口后主动请求一次 snapshot resync", async () => {
     vi.useFakeTimers();
     try {
       const onTerminalResync = vi.fn();
@@ -1145,6 +1244,14 @@ describe("TerminalPane terminal sequence rendering", () => {
         __TERMD_TEST_GHOSTTY__?: { baseY: () => number };
       }).__TERMD_TEST_GHOSTTY__;
       expect(Ghostty?.baseY()).toBe(0);
+      // 中文注释：自动补历史只在输出稳定一小段时间后触发，避免 relay 恢复期的
+      // 暂态输出被误判成 tmux 全屏重绘。
+      expect(onTerminalResync).toHaveBeenCalledTimes(0);
+
+      act(() => {
+        vi.advanceTimersByTime(1000);
+        vi.advanceTimersByTime(animationFrameMs * 2);
+      });
       expect(onTerminalResync).toHaveBeenCalledTimes(1);
       expect(onTerminalResync).toHaveBeenCalledWith(undefined);
 
@@ -1153,6 +1260,42 @@ describe("TerminalPane terminal sequence rendering", () => {
       });
       // 中文注释：resync 请求发出后，在 snapshot 回来之前不能每帧重复重连。
       expect(onTerminalResync).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("自动 scrollback resync 等待稳定窗口期间，用户上滚仍会立即请求历史 snapshot", async () => {
+    vi.useFakeTimers();
+    try {
+      const onTerminalResync = vi.fn();
+      const largeFullscreenRedraw = "x".repeat(9 * 1024);
+
+      renderTerminalPaneWithOutput(
+        [
+          { kind: "snapshot", bytes: new Uint8Array(), baseSeq: 0, size: DEFAULT_TERMINAL_SIZE },
+          { kind: "output", bytes: new TextEncoder().encode(largeFullscreenRedraw), terminalSeq: 1 },
+        ],
+        { onTerminalResync },
+      );
+
+      await act(async () => {
+        await Promise.resolve();
+        await vi.advanceTimersByTimeAsync(animationFrameMs * 12);
+      });
+      expect(onTerminalResync).toHaveBeenCalledTimes(0);
+
+      const frame = screen.getByTestId("terminal-pane").querySelector<HTMLElement>(".terminal-frame");
+      expect(frame).not.toBeNull();
+      fireEvent.wheel(frame!, { deltaY: -900 });
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(animationFrameMs * 4);
+      });
+
+      // 中文注释：稳定窗口只约束自动路径。用户明确向上滚时，仍要立刻回源拉历史。
+      expect(onTerminalResync).toHaveBeenCalledTimes(1);
+      expect(onTerminalResync).toHaveBeenCalledWith(undefined, { revealHistory: true });
     } finally {
       vi.useRealTimers();
     }
@@ -1225,6 +1368,11 @@ describe("TerminalPane terminal sequence rendering", () => {
       await act(async () => {
         await Promise.resolve();
         await vi.advanceTimersByTimeAsync(animationFrameMs * 12);
+      });
+      expect(onTerminalResync).toHaveBeenCalledTimes(0);
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1000 + animationFrameMs * 2);
       });
       expect(onTerminalResync).toHaveBeenCalledTimes(1);
       expect(onTerminalResync).toHaveBeenNthCalledWith(1, undefined);
@@ -1687,6 +1835,199 @@ describe("TerminalPane terminal sequence rendering", () => {
     }
   });
 
+  it("可见时排队的 Ghostty write 在 hidden 后会切到 timer fallback", async () => {
+    vi.useFakeTimers();
+    const rafQueue = new Map<number, FrameRequestCallback>();
+    let nextRafId = 1;
+    const rafSpy = vi.spyOn(window, "requestAnimationFrame").mockImplementation(((callback: FrameRequestCallback) => {
+      const rafId = nextRafId;
+      nextRafId += 1;
+      rafQueue.set(rafId, callback);
+      return rafId;
+    }) as typeof window.requestAnimationFrame);
+    const cancelSpy = vi.spyOn(window, "cancelAnimationFrame").mockImplementation(((rafId: number) => {
+      rafQueue.delete(rafId);
+    }) as typeof window.cancelAnimationFrame);
+    try {
+      const encoder = new TextEncoder();
+      let queue: TerminalOutputItem[] = [];
+      let drainOutput: (() => void) | undefined;
+      const takeOutput = vi.fn(() => queue.splice(0));
+      const registerOutputDrain = vi.fn((drain: () => void) => {
+        drainOutput = drain;
+        return () => undefined;
+      });
+
+      render(
+        <TerminalPane
+          attached
+          sessionSize={DEFAULT_TERMINAL_SIZE}
+          outputResetVersion={0}
+          takeOutput={takeOutput}
+          registerOutputDrain={registerOutputDrain}
+          onInput={vi.fn()}
+          onResize={vi.fn()}
+          onCursorChange={vi.fn()}
+        />,
+      );
+
+      await act(async () => {
+        await Promise.resolve();
+      });
+      setDocumentHasFocus(true);
+      rafQueue.clear();
+      queue = [{ kind: "data", bytes: encoder.encode("writer-hidden-race\n") }];
+
+      act(() => {
+        drainOutput?.();
+      });
+
+      const terminalStats = () => (globalThis as { __TERMD_TEST_TERMINAL_STATS__?: { writes: number } }).__TERMD_TEST_TERMINAL_STATS__;
+      expect(terminalStats()?.writes ?? 0).toBe(0);
+      expect(rafQueue.size).toBeGreaterThan(0);
+
+      act(() => {
+        setDocumentVisibility("hidden");
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+
+      expect(screen.getByText(/writer-hidden-race/)).toBeInTheDocument();
+      expect(terminalStats()?.writes ?? 0).toBe(1);
+    } finally {
+      restoreDocumentVisibility();
+      rafSpy.mockRestore();
+      cancelSpy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("可见时排队的 Ghostty write 在 blur 后会切到 timer fallback", async () => {
+    vi.useFakeTimers();
+    const rafQueue = new Map<number, FrameRequestCallback>();
+    let nextRafId = 1;
+    const rafSpy = vi.spyOn(window, "requestAnimationFrame").mockImplementation(((callback: FrameRequestCallback) => {
+      const rafId = nextRafId;
+      nextRafId += 1;
+      rafQueue.set(rafId, callback);
+      return rafId;
+    }) as typeof window.requestAnimationFrame);
+    const cancelSpy = vi.spyOn(window, "cancelAnimationFrame").mockImplementation(((rafId: number) => {
+      rafQueue.delete(rafId);
+    }) as typeof window.cancelAnimationFrame);
+    try {
+      const encoder = new TextEncoder();
+      let queue: TerminalOutputItem[] = [];
+      let drainOutput: (() => void) | undefined;
+      const takeOutput = vi.fn(() => queue.splice(0));
+      const registerOutputDrain = vi.fn((drain: () => void) => {
+        drainOutput = drain;
+        return () => undefined;
+      });
+
+      render(
+        <TerminalPane
+          attached
+          sessionSize={DEFAULT_TERMINAL_SIZE}
+          outputResetVersion={0}
+          takeOutput={takeOutput}
+          registerOutputDrain={registerOutputDrain}
+          onInput={vi.fn()}
+          onResize={vi.fn()}
+          onCursorChange={vi.fn()}
+        />,
+      );
+
+      await act(async () => {
+        await Promise.resolve();
+      });
+      setDocumentHasFocus(true);
+      rafQueue.clear();
+      queue = [{ kind: "data", bytes: encoder.encode("writer-blur-race\n") }];
+
+      act(() => {
+        drainOutput?.();
+      });
+      expect(rafQueue.size).toBeGreaterThan(0);
+
+      setDocumentHasFocus(false);
+      act(() => {
+        window.dispatchEvent(new Event("blur"));
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+
+      expect(screen.getByText(/writer-blur-race/)).toBeInTheDocument();
+    } finally {
+      restoreDocumentVisibility();
+      rafSpy.mockRestore();
+      cancelSpy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("窗口 blur 后新到的 Ghostty write 直接走 timer fallback", async () => {
+    vi.useFakeTimers();
+    const rafQueue = new Map<number, FrameRequestCallback>();
+    let nextRafId = 1;
+    const rafSpy = vi.spyOn(window, "requestAnimationFrame").mockImplementation(((callback: FrameRequestCallback) => {
+      const rafId = nextRafId;
+      nextRafId += 1;
+      rafQueue.set(rafId, callback);
+      return rafId;
+    }) as typeof window.requestAnimationFrame);
+    const cancelSpy = vi.spyOn(window, "cancelAnimationFrame").mockImplementation(((rafId: number) => {
+      rafQueue.delete(rafId);
+    }) as typeof window.cancelAnimationFrame);
+    try {
+      const encoder = new TextEncoder();
+      let queue: TerminalOutputItem[] = [];
+      let drainOutput: (() => void) | undefined;
+      const takeOutput = vi.fn(() => queue.splice(0));
+      const registerOutputDrain = vi.fn((drain: () => void) => {
+        drainOutput = drain;
+        return () => undefined;
+      });
+
+      render(
+        <TerminalPane
+          attached
+          sessionSize={DEFAULT_TERMINAL_SIZE}
+          outputResetVersion={0}
+          takeOutput={takeOutput}
+          registerOutputDrain={registerOutputDrain}
+          onInput={vi.fn()}
+          onResize={vi.fn()}
+          onCursorChange={vi.fn()}
+        />,
+      );
+
+      await act(async () => {
+        await Promise.resolve();
+      });
+      setDocumentHasFocus(false);
+      window.dispatchEvent(new Event("blur"));
+      rafQueue.clear();
+      queue = [{ kind: "data", bytes: encoder.encode("writer-blur-direct\n") }];
+
+      act(() => {
+        drainOutput?.();
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+
+      expect(screen.getByText(/writer-blur-direct/)).toBeInTheDocument();
+    } finally {
+      restoreDocumentVisibility();
+      rafSpy.mockRestore();
+      cancelSpy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
   it("tmux 全屏 resync 等待 snapshot 期间不会按 cooldown 周期重复请求", async () => {
     vi.useFakeTimers();
     try {
@@ -1720,6 +2061,7 @@ describe("TerminalPane terminal sequence rendering", () => {
 
       act(() => {
         vi.advanceTimersByTime(animationFrameMs * 12);
+        vi.advanceTimersByTime(1000 + animationFrameMs * 2);
       });
       expect(onTerminalResync).toHaveBeenCalledTimes(1);
 
@@ -1770,6 +2112,7 @@ describe("TerminalPane terminal sequence rendering", () => {
       await act(async () => {
         await Promise.resolve();
         await vi.advanceTimersByTimeAsync(animationFrameMs * 12);
+        await vi.advanceTimersByTimeAsync(1000 + animationFrameMs * 2);
       });
       expect(onTerminalResync).toHaveBeenCalledTimes(1);
 
@@ -1782,6 +2125,7 @@ describe("TerminalPane terminal sequence rendering", () => {
       await act(async () => {
         drainOutput?.();
         await vi.advanceTimersByTimeAsync(animationFrameMs * 12);
+        await vi.advanceTimersByTimeAsync(1000 + animationFrameMs * 2);
       });
 
       // 中文注释：新 session 重新挂载后，第一次无 scrollback burst 必须能再次触发 resync；
@@ -2104,6 +2448,43 @@ describe("TerminalPane terminal sizing", () => {
     }
   });
 
+  it("focusRequest 首次 attach 时即使原生 focus 延迟也会上报稳定尺寸", () => {
+    vi.useFakeTimers();
+    try {
+      const onResize = vi.fn();
+      const takeOutput = vi.fn(() => []);
+      const registerOutputDrain = vi.fn(() => () => undefined);
+      (globalThis as { __TERMD_TEST_GHOSTTY_SKIP_NATIVE_FOCUS__?: boolean }).__TERMD_TEST_GHOSTTY_SKIP_NATIVE_FOCUS__ = true;
+      (globalThis as { __TERMD_TEST_FIT_DIMENSIONS__?: { rows: number; cols: number } }).__TERMD_TEST_FIT_DIMENSIONS__ = {
+        rows: 31,
+        cols: 101,
+      };
+      render(
+        <TerminalPane
+          attached
+          sessionSize={{ rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 }}
+          focusRequest={1}
+          outputResetVersion={0}
+          takeOutput={takeOutput}
+          registerOutputDrain={registerOutputDrain}
+          onInput={vi.fn()}
+          onResize={onResize}
+          onCursorChange={vi.fn()}
+        />,
+      );
+
+      act(() => {
+        vi.advanceTimersByTime(animationFrameMs * 16);
+      });
+
+      // 中文注释：真实浏览器里 terminal.focus() 和 focusin 之间可能隔着一轮以上布局；
+      // 即使 DOM focus 还没稳定，也要让首个 focusRequest 把真实 rows/cols 写回 PTY。
+      expect(onResize.mock.calls.map(([size]) => `${size.cols}x${size.rows}`)).toEqual(["101x31"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("刷新和聚焦期间经过临时行列尺寸时只上报最终尺寸", () => {
     vi.useFakeTimers();
     try {
@@ -2241,6 +2622,64 @@ describe("TerminalPane terminal sizing", () => {
     // 中文注释：daemon 确认可能因为持续输出延迟；聚焦客户端仍要先撑开本地视口，
     // 否则 Ghostty 会长期停在默认 24 行，外层面板下方只剩大片空白。
     expect(operations).toContainEqual({ op: "resize", cols: 101, rows: 31 });
+  });
+
+  it("窗口 blur 不会把本地 Ghostty 强制缩回远端尺寸，回焦时不经历远端网格闪回", async () => {
+    vi.useFakeTimers();
+    try {
+      const remoteSize = { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 };
+      const onResize = vi.fn();
+      const takeOutput = vi.fn(() => []);
+      const registerOutputDrain = vi.fn(() => () => undefined);
+      (globalThis as { __TERMD_TEST_FIT_DIMENSIONS__?: { rows: number; cols: number } }).__TERMD_TEST_FIT_DIMENSIONS__ = {
+        rows: 31,
+        cols: 101,
+      };
+      render(
+        <TerminalPane
+          attached
+          sessionSize={remoteSize}
+          outputResetVersion={0}
+          takeOutput={takeOutput}
+          registerOutputDrain={registerOutputDrain}
+          onInput={vi.fn()}
+          onResize={onResize}
+          onCursorChange={vi.fn()}
+        />,
+      );
+
+      const terminalInput = screen.getByRole("textbox", { name: "Terminal input" });
+      act(() => {
+        terminalInput.focus();
+        vi.advanceTimersByTime(animationFrameMs * 12);
+      });
+      onResize.mockClear();
+      const resizeOperationCountBeforeBlur = ((globalThis as {
+        __TERMD_TEST_TERMINAL_STATS__?: {
+          operations: Array<{ op: string; cols?: number; rows?: number }>;
+        };
+      }).__TERMD_TEST_TERMINAL_STATS__?.operations ?? []).length;
+
+      act(() => {
+        window.dispatchEvent(new Event("blur"));
+        vi.advanceTimersByTime(240);
+      });
+
+      const operationsAfterBlur = ((globalThis as {
+        __TERMD_TEST_TERMINAL_STATS__?: {
+          operations: Array<{ op: string; cols?: number; rows?: number }>;
+        };
+      }).__TERMD_TEST_TERMINAL_STATS__?.operations ?? []).slice(resizeOperationCountBeforeBlur);
+      expect(operationsAfterBlur).not.toContainEqual({ op: "resize", cols: remoteSize.cols, rows: remoteSize.rows });
+      expect(onResize).not.toHaveBeenCalledWith({
+        rows: remoteSize.rows,
+        cols: remoteSize.cols,
+        pixel_width: expect.any(Number),
+        pixel_height: expect.any(Number),
+      });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("snapshot 重绘期间的主动聚焦会在 snapshot 完成后补发 resize", () => {
@@ -2381,6 +2820,449 @@ describe("TerminalPane terminal sizing", () => {
       }).__TERMD_TEST_TERMINAL_STATS__?.operations ?? [];
       expect(operations.filter((operation) => operation.op === "resize" && operation.cols === 80 && operation.rows === 24)).toEqual([]);
       expect(operations).toContainEqual({ op: "resize", cols: 101, rows: 31 });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("旧尺寸 snapshot 若在首次聚焦后才接管 resize，daemon 确认新尺寸后也会补一次 full snapshot 修复历史", () => {
+    vi.useFakeTimers();
+    try {
+      const onResize = vi.fn();
+      const onTerminalResync = vi.fn();
+      const encoder = new TextEncoder();
+      let queue: TerminalOutputItem[] = [
+        {
+          kind: "snapshot",
+          bytes: encoder.encode("reload-old-size\n"),
+          baseSeq: 0,
+          size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+        },
+      ];
+      const takeOutput = vi.fn(() => queue.splice(0));
+      const registerOutputDrain = vi.fn((drain: () => void) => {
+        drain();
+        return () => undefined;
+      });
+      (globalThis as { __TERMD_TEST_FIT_DIMENSIONS__?: { rows: number; cols: number } }).__TERMD_TEST_FIT_DIMENSIONS__ = {
+        rows: 31,
+        cols: 101,
+      };
+      const sharedProps = {
+        attached: true,
+        outputResetVersion: 0,
+        takeOutput,
+        registerOutputDrain,
+        onInput: vi.fn(),
+        onResize,
+        onCursorChange: vi.fn(),
+        onTerminalResync,
+      };
+      const { rerender } = render(
+        <TerminalPane
+          {...sharedProps}
+          sessionSize={{ rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 }}
+        />,
+      );
+
+      act(() => {
+        vi.advanceTimersByTime(animationFrameMs * 32);
+      });
+      expect(onResize).not.toHaveBeenCalled();
+      expect(onTerminalResync).not.toHaveBeenCalled();
+
+      const terminalInput = screen.getByRole("textbox", { name: "Terminal input" });
+      act(() => {
+        terminalInput.focus();
+        vi.advanceTimersByTime(animationFrameMs * 20);
+      });
+      expect(onResize.mock.calls.map(([size]) => `${size.cols}x${size.rows}`)).toContain("101x31");
+
+      rerender(
+        <TerminalPane
+          {...sharedProps}
+          sessionSize={{ rows: 31, cols: 101, pixel_width: 0, pixel_height: 0 }}
+        />,
+      );
+      act(() => {
+        vi.advanceTimersByTime(1000 + animationFrameMs * 4);
+      });
+
+      // 中文注释：初开页面时浏览器可能先显示旧 snapshot，直到用户第一次点进终端才接管
+      // PTY resize。此时也必须在 daemon ack 后再拉一遍 full snapshot，否则底部输入区
+      // 和旧网格正文会错开一行。
+      expect(onTerminalResync).toHaveBeenCalledWith(undefined);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("旧尺寸 snapshot 在 daemon 确认新尺寸后会再请求一次 full snapshot 修复历史", () => {
+    vi.useFakeTimers();
+    try {
+      const onResize = vi.fn();
+      const onTerminalResync = vi.fn();
+      const encoder = new TextEncoder();
+      let queue: TerminalOutputItem[] = [
+        {
+          kind: "snapshot",
+          bytes: encoder.encode("reload-old-size\n"),
+          baseSeq: 0,
+          size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+        },
+      ];
+      const takeOutput = vi.fn(() => queue.splice(0));
+      const registerOutputDrain = vi.fn((drain: () => void) => {
+        drain();
+        return () => undefined;
+      });
+      (globalThis as { __TERMD_TEST_FIT_DIMENSIONS__?: { rows: number; cols: number } }).__TERMD_TEST_FIT_DIMENSIONS__ = {
+        rows: 31,
+        cols: 101,
+      };
+      const sharedProps = {
+        attached: true,
+        focusRequest: 1,
+        outputResetVersion: 0,
+        takeOutput,
+        registerOutputDrain,
+        onInput: vi.fn(),
+        onResize,
+        onCursorChange: vi.fn(),
+        onTerminalResync,
+      };
+      const { rerender } = render(
+        <TerminalPane
+          {...sharedProps}
+          sessionSize={{ rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 }}
+        />,
+      );
+
+      act(() => {
+        vi.advanceTimersByTime(animationFrameMs * 32);
+      });
+
+      expect(onResize.mock.calls.map(([size]) => `${size.cols}x${size.rows}`)).toEqual(["101x31"]);
+      expect(onTerminalResync).not.toHaveBeenCalled();
+
+      rerender(
+        <TerminalPane
+          {...sharedProps}
+          sessionSize={{ rows: 31, cols: 101, pixel_width: 0, pixel_height: 0 }}
+        />,
+      );
+
+      act(() => {
+        vi.advanceTimersByTime(1000 + animationFrameMs * 4);
+      });
+
+      // 中文注释：daemon/tmux 已经确认了新的 rows/cols，此时要再做一次 full snapshot，
+      // 把旧 80x24 重放留下的 scrollback 一起按新尺寸重建。
+      expect(onTerminalResync).toHaveBeenCalledWith(undefined);
+
+      onTerminalResync.mockClear();
+      rerender(
+        <TerminalPane
+          {...sharedProps}
+          sessionSize={{ rows: 31, cols: 101, pixel_width: 0, pixel_height: 0 }}
+        />,
+      );
+      act(() => {
+        vi.advanceTimersByTime(animationFrameMs * 4);
+      });
+      expect(onTerminalResync).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("历史修复等待 idle settle 时若继续有输出，不会在 burst 中途提前 full snapshot", () => {
+    vi.useFakeTimers();
+    try {
+      const onResize = vi.fn();
+      const onTerminalResync = vi.fn();
+      const encoder = new TextEncoder();
+      let queue: TerminalOutputItem[] = [
+        {
+          kind: "snapshot",
+          bytes: encoder.encode("reload-old-size\n"),
+          baseSeq: 0,
+          size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+        },
+      ];
+      const takeOutput = vi.fn(() => queue.splice(0));
+      let drainOutput = () => undefined;
+      const registerOutputDrain = vi.fn((drain: () => void) => {
+        drainOutput = drain;
+        drain();
+        return () => undefined;
+      });
+      (globalThis as { __TERMD_TEST_FIT_DIMENSIONS__?: { rows: number; cols: number } }).__TERMD_TEST_FIT_DIMENSIONS__ = {
+        rows: 31,
+        cols: 101,
+      };
+      const sharedProps = {
+        attached: true,
+        focusRequest: 1,
+        outputResetVersion: 0,
+        takeOutput,
+        registerOutputDrain,
+        onInput: vi.fn(),
+        onResize,
+        onCursorChange: vi.fn(),
+        onTerminalResync,
+      };
+      const { rerender } = render(
+        <TerminalPane
+          {...sharedProps}
+          sessionSize={{ rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 }}
+        />,
+      );
+
+      act(() => {
+        vi.advanceTimersByTime(animationFrameMs * 32);
+      });
+      expect(onResize.mock.calls.map(([size]) => `${size.cols}x${size.rows}`)).toEqual(["101x31"]);
+
+      rerender(
+        <TerminalPane
+          {...sharedProps}
+          sessionSize={{ rows: 31, cols: 101, pixel_width: 0, pixel_height: 0 }}
+        />,
+      );
+      act(() => {
+        vi.advanceTimersByTime(300);
+      });
+      expect(onTerminalResync).not.toHaveBeenCalled();
+
+      queue.push({
+        kind: "output",
+        bytes: encoder.encode("live-burst\n"),
+        terminalSeq: 1,
+      });
+      act(() => {
+        drainOutput();
+        vi.advanceTimersByTime(450);
+      });
+      expect(onTerminalResync).not.toHaveBeenCalled();
+
+      act(() => {
+        vi.advanceTimersByTime(500);
+      });
+      expect(onTerminalResync).not.toHaveBeenCalled();
+
+      act(() => {
+        vi.advanceTimersByTime(500);
+      });
+      expect(onTerminalResync).toHaveBeenCalledWith(undefined);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("daemon 新尺寸已先确认时，旧尺寸 snapshot 晚到也会补发历史修复 full snapshot", () => {
+    vi.useFakeTimers();
+    try {
+      const onResize = vi.fn();
+      const onTerminalResync = vi.fn();
+      const encoder = new TextEncoder();
+      let queue: TerminalOutputItem[] = [];
+      const takeOutput = vi.fn(() => queue.splice(0));
+      let drainOutput = () => undefined;
+      const registerOutputDrain = vi.fn((drain: () => void) => {
+        drainOutput = drain;
+        drain();
+        return () => undefined;
+      });
+      (globalThis as { __TERMD_TEST_FIT_DIMENSIONS__?: { rows: number; cols: number } }).__TERMD_TEST_FIT_DIMENSIONS__ = {
+        rows: 31,
+        cols: 101,
+      };
+      const sharedProps = {
+        attached: true,
+        focusRequest: 1,
+        outputResetVersion: 0,
+        takeOutput,
+        registerOutputDrain,
+        onInput: vi.fn(),
+        onResize,
+        onCursorChange: vi.fn(),
+        onTerminalResync,
+      };
+      render(
+        <TerminalPane
+          {...sharedProps}
+          sessionSize={{ rows: 31, cols: 101, pixel_width: 0, pixel_height: 0 }}
+        />,
+      );
+
+      act(() => {
+        vi.advanceTimersByTime(animationFrameMs * 20);
+      });
+      const terminalInput = screen.getByRole("textbox", { name: "Terminal input" });
+      act(() => {
+        terminalInput.focus();
+        vi.advanceTimersByTime(animationFrameMs * 8);
+      });
+      expect(onTerminalResync).not.toHaveBeenCalled();
+
+      queue.push({
+        kind: "snapshot",
+        bytes: encoder.encode("reload-old-size\n"),
+        baseSeq: 0,
+        size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+      });
+      act(() => {
+        drainOutput();
+        vi.advanceTimersByTime(animationFrameMs * 32);
+      });
+      expect(onTerminalResync).not.toHaveBeenCalled();
+
+      act(() => {
+        vi.advanceTimersByTime(1000 + animationFrameMs * 4);
+      });
+      expect(onTerminalResync).toHaveBeenCalledWith(undefined);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("daemon 新尺寸已先确认且用户稍后首次聚焦接管 resize 时，也会补发历史修复 full snapshot", () => {
+    vi.useFakeTimers();
+    try {
+      const onResize = vi.fn();
+      const onTerminalResync = vi.fn();
+      const encoder = new TextEncoder();
+      let queue: TerminalOutputItem[] = [
+        {
+          kind: "snapshot",
+          bytes: encoder.encode("reload-old-size\n"),
+          baseSeq: 0,
+          size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+        },
+      ];
+      const takeOutput = vi.fn(() => queue.splice(0));
+      const registerOutputDrain = vi.fn((drain: () => void) => {
+        drain();
+        return () => undefined;
+      });
+      (globalThis as { __TERMD_TEST_FIT_DIMENSIONS__?: { rows: number; cols: number } }).__TERMD_TEST_FIT_DIMENSIONS__ = {
+        rows: 31,
+        cols: 101,
+      };
+      render(
+        <TerminalPane
+          attached
+          outputResetVersion={0}
+          takeOutput={takeOutput}
+          registerOutputDrain={registerOutputDrain}
+          sessionSize={{ rows: 31, cols: 101, pixel_width: 0, pixel_height: 0 }}
+          onInput={vi.fn()}
+          onResize={onResize}
+          onCursorChange={vi.fn()}
+          onTerminalResync={onTerminalResync}
+        />,
+      );
+
+      act(() => {
+        vi.advanceTimersByTime(animationFrameMs * 32);
+      });
+      expect(onResize).not.toHaveBeenCalled();
+      expect(onTerminalResync).not.toHaveBeenCalled();
+
+      const terminalInput = screen.getByRole("textbox", { name: "Terminal input" });
+      act(() => {
+        terminalInput.focus();
+        vi.advanceTimersByTime(animationFrameMs * 20);
+      });
+      expect(onResize.mock.calls.map(([size]) => `${size.cols}x${size.rows}`)).toContain("101x31");
+      expect(onTerminalResync).not.toHaveBeenCalled();
+
+      act(() => {
+        vi.advanceTimersByTime(1000 + animationFrameMs * 4);
+      });
+      expect(onTerminalResync).toHaveBeenCalledWith(undefined);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("snapshot 历史修复在 ack 后若立刻 detach，不会再触发过期 full snapshot", () => {
+    vi.useFakeTimers();
+    try {
+      const onResize = vi.fn();
+      const onTerminalResync = vi.fn();
+      const encoder = new TextEncoder();
+      let queue: TerminalOutputItem[] = [
+        {
+          kind: "snapshot",
+          bytes: encoder.encode("reload-old-size\n"),
+          baseSeq: 0,
+          size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+        },
+      ];
+      const takeOutput = vi.fn(() => queue.splice(0));
+      const registerOutputDrain = vi.fn((drain: () => void) => {
+        drain();
+        return () => undefined;
+      });
+      (globalThis as { __TERMD_TEST_FIT_DIMENSIONS__?: { rows: number; cols: number } }).__TERMD_TEST_FIT_DIMENSIONS__ = {
+        rows: 31,
+        cols: 101,
+      };
+      const sharedProps = {
+        outputResetVersion: 0,
+        takeOutput,
+        registerOutputDrain,
+        onInput: vi.fn(),
+        onResize,
+        onCursorChange: vi.fn(),
+        onTerminalResync,
+      };
+      const { rerender } = render(
+        <TerminalPane
+          {...sharedProps}
+          attached
+          sessionSize={{ rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 }}
+        />,
+      );
+
+      act(() => {
+        vi.advanceTimersByTime(animationFrameMs * 32);
+      });
+
+      const terminalInput = screen.getByRole("textbox", { name: "Terminal input" });
+      act(() => {
+        terminalInput.focus();
+        vi.advanceTimersByTime(animationFrameMs * 20);
+      });
+      onTerminalResync.mockClear();
+
+      act(() => {
+        rerender(
+          <TerminalPane
+            {...sharedProps}
+            attached
+            sessionSize={{ rows: 31, cols: 101, pixel_width: 0, pixel_height: 0 }}
+          />,
+        );
+      });
+      rerender(
+        <TerminalPane
+          {...sharedProps}
+          attached={false}
+          sessionSize={{ rows: 31, cols: 101, pixel_width: 0, pixel_height: 0 }}
+        />,
+      );
+
+      act(() => {
+        vi.advanceTimersByTime(animationFrameMs * 8);
+      });
+
+      // 中文注释：ack 后排队的历史修复只属于当前 pane。
+      // 一旦 detach/unmount，就必须取消这帧 full snapshot，不能让旧 pane 在下一帧
+      // 再向 daemon 拉一次过期快照。
+      expect(onTerminalResync).not.toHaveBeenCalled();
     } finally {
       vi.useRealTimers();
     }

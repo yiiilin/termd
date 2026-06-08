@@ -328,8 +328,11 @@ export class DirectClient {
     this.authenticatedServer = server;
   }
 
-  async listSessions(): Promise<SessionListResultPayload> {
-    return this.request<SessionListResultPayload>("session.list", {});
+  async listSessions(timeoutMs = this.timeoutMs): Promise<SessionListResultPayload> {
+    // 中文注释：session.list 在 relay bootstrap/recovery 路径里经常和 route/E2EE/auth、
+    // daemon mux/data pipe 配对同处一条用户可见关键路径。调用方可按场景显式放宽预算，
+    // 但普通短请求默认值仍保持不变。
+    return this.request<SessionListResultPayload>("session.list", {}, timeoutMs);
   }
 
   async listDaemonClients(): Promise<DaemonClientsResultPayload> {

@@ -444,6 +444,7 @@ function installMutableMobileVisualViewport(layoutHeight: number, visualHeight: 
 }
 
 let mockedDocumentVisibilityState: DocumentVisibilityState = "visible";
+let mockedDocumentHasFocus = true;
 
 function setDocumentVisibility(state: DocumentVisibilityState): void {
   mockedDocumentVisibilityState = state;
@@ -458,10 +459,20 @@ function setDocumentVisibility(state: DocumentVisibilityState): void {
   document.dispatchEvent(new Event("visibilitychange"));
 }
 
+function setDocumentHasFocus(focused: boolean): void {
+  mockedDocumentHasFocus = focused;
+  Object.defineProperty(document, "hasFocus", {
+    configurable: true,
+    value: () => mockedDocumentHasFocus,
+  });
+}
+
 function restoreDocumentVisibility(): void {
   mockedDocumentVisibilityState = "visible";
+  mockedDocumentHasFocus = true;
   Reflect.deleteProperty(document, "visibilityState");
   Reflect.deleteProperty(document, "hidden");
+  Reflect.deleteProperty(document, "hasFocus");
 }
 
 function dispatchMobileTextInput(
@@ -1067,6 +1078,109 @@ describe("termui web 工作台", () => {
     expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID]);
     await waitFor(() => expect(daemon.daemonStatusRequests).toBeGreaterThan(hiddenRequestCount));
     expect(screen.getByText(/hidden-live-output/)).toBeInTheDocument();
+  });
+
+  it("终端输出在 visible 路径排进 rAF 后切到 hidden 仍会补 timer flush", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await screen.findByText(/termd-e2e-ready/);
+
+    const rafQueue = new Map<number, FrameRequestCallback>();
+    let nextRafId = 1;
+    const rafSpy = vi.spyOn(window, "requestAnimationFrame").mockImplementation(((callback: FrameRequestCallback) => {
+      const rafId = nextRafId;
+      nextRafId += 1;
+      rafQueue.set(rafId, callback);
+      return rafId;
+    }) as typeof window.requestAnimationFrame);
+    const cancelSpy = vi.spyOn(window, "cancelAnimationFrame").mockImplementation(((rafId: number) => {
+      rafQueue.delete(rafId);
+    }) as typeof window.cancelAnimationFrame);
+
+    try {
+      setDocumentHasFocus(true);
+      rafQueue.clear();
+      daemon.pushSessionData(DEFAULT_SESSION_ID, "hidden-raf-race-output\n");
+      await waitFor(() => expect(rafQueue.size).toBeGreaterThan(0));
+
+      setDocumentVisibility("hidden");
+      await screen.findByText(/hidden-raf-race-output/);
+    } finally {
+      rafSpy.mockRestore();
+      cancelSpy.mockRestore();
+      restoreDocumentVisibility();
+    }
+  });
+
+  it("终端输出在 visible 路径排进 rAF 后切到 blur 仍会补 timer flush", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await screen.findByText(/termd-e2e-ready/);
+
+    const rafQueue = new Map<number, FrameRequestCallback>();
+    let nextRafId = 1;
+    const rafSpy = vi.spyOn(window, "requestAnimationFrame").mockImplementation(((callback: FrameRequestCallback) => {
+      const rafId = nextRafId;
+      nextRafId += 1;
+      rafQueue.set(rafId, callback);
+      return rafId;
+    }) as typeof window.requestAnimationFrame);
+    const cancelSpy = vi.spyOn(window, "cancelAnimationFrame").mockImplementation(((rafId: number) => {
+      rafQueue.delete(rafId);
+    }) as typeof window.cancelAnimationFrame);
+
+    try {
+      setDocumentHasFocus(true);
+      daemon.pushSessionData(DEFAULT_SESSION_ID, "blur-raf-race-output\n");
+      await waitFor(() => expect(rafQueue.size).toBeGreaterThan(0));
+
+      setDocumentHasFocus(false);
+      window.dispatchEvent(new Event("blur"));
+      await screen.findByText(/blur-raf-race-output/);
+    } finally {
+      rafSpy.mockRestore();
+      cancelSpy.mockRestore();
+      restoreDocumentVisibility();
+    }
+  });
+
+  it("窗口 blur 后新到的终端输出直接走 timer flush，不依赖后续 rAF", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await screen.findByText(/termd-e2e-ready/);
+
+    const rafQueue = new Map<number, FrameRequestCallback>();
+    let nextRafId = 1;
+    const rafSpy = vi.spyOn(window, "requestAnimationFrame").mockImplementation(((callback: FrameRequestCallback) => {
+      const rafId = nextRafId;
+      nextRafId += 1;
+      rafQueue.set(rafId, callback);
+      return rafId;
+    }) as typeof window.requestAnimationFrame);
+    const cancelSpy = vi.spyOn(window, "cancelAnimationFrame").mockImplementation(((rafId: number) => {
+      rafQueue.delete(rafId);
+    }) as typeof window.cancelAnimationFrame);
+
+    try {
+      setDocumentHasFocus(false);
+      window.dispatchEvent(new Event("blur"));
+      daemon.pushSessionData(DEFAULT_SESSION_ID, "blur-direct-flush-output\n");
+
+      await screen.findByText(/blur-direct-flush-output/);
+    } finally {
+      rafSpy.mockRestore();
+      cancelSpy.mockRestore();
+      restoreDocumentVisibility();
+    }
   });
 
   it("窗口 blur/focus 不主动重建终端 WebSocket", async () => {
@@ -3228,6 +3342,47 @@ describe("termui web 工作台", () => {
     );
     expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
   }, 12_000);
+
+  it("relay 慢 session.list 时首次工作台加载保持在 workspace 并等待长预算结果", async () => {
+    const user = userEvent.setup();
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [
+        {
+          session_id: DEFAULT_SESSION_ID,
+          state: "running",
+          size: { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 },
+        },
+      ],
+      attachOutput: "bootstrap-ready\n",
+    });
+    // 中文注释：首次进入 workspace 时，relay 真实链路上的 session.list 可能比普通 5s
+    // RPC 更慢，但这不应该把页面打回 admin，也不应该立刻升级成全局连接错误。
+    daemon.queueSessionListResponse([
+      {
+        session_id: DEFAULT_SESSION_ID,
+        state: "running",
+        size: { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 },
+      },
+    ], APP_CONNECTION_TIMEOUT_MS + 500);
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitFor(() => expect(screen.queryByLabelText("Pairing token")).toBeNull());
+    await waitFor(() => expect(screen.queryByLabelText("daemon admin")).toBeNull());
+    expect(screen.getByTestId("terminal-pane")).toBeInTheDocument();
+    expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
+
+    await waitFor(() => expect(visibleSessionNames()).toEqual([DEFAULT_SESSION_NAME]), {
+      timeout: APP_CONNECTION_TIMEOUT_MS + 4000,
+    });
+    await waitFor(() => expect(daemon.attachedSessions).toContain(DEFAULT_SESSION_ID), {
+      timeout: APP_CONNECTION_TIMEOUT_MS + 4000,
+    });
+    await screen.findByText(/bootstrap-ready/);
+    expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
+  }, 18_000);
 
   it("relay 恢复慢握手时重新 attach 使用长超时并静默恢复", async () => {
     const user = userEvent.setup();
@@ -6008,6 +6163,63 @@ describe("termui web 工作台", () => {
       expect(screen.queryByText(sessionId)).toBeNull();
     });
     expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
+    expect(daemon.closedSessions).toEqual([]);
+  });
+
+  it("关闭当前已 attach 的 session 时忽略晚到的 session_not_found 错误", async () => {
+    const user = userEvent.setup();
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [
+        {
+          session_id: DEFAULT_SESSION_ID,
+          state: "running",
+          size: { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 },
+        },
+      ],
+      attachOutput: "termd-e2e-ready\n",
+      closeSessionUnownedError: {
+        code: "session_not_found",
+        message: "session was not found",
+      },
+    });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await screen.findByText(/termd-e2e-ready/);
+    await waitFor(() => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID]));
+
+    await user.click(screen.getByRole("button", { name: "Close session" }));
+
+    await waitFor(() => {
+      expect(screen.queryByText(DEFAULT_SESSION_NAME)).toBeNull();
+    });
+    expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
+    expect(daemon.closedSessions).toEqual([DEFAULT_SESSION_ID]);
+  });
+
+  it("关闭当前已 attach 的 session 时 connection_closed 不会被当成关闭成功", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await screen.findByText(/termd-e2e-ready/);
+    await waitFor(() => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID]));
+
+    daemon.dropConnections();
+    // 中文注释：这里要等 transport close 真正传到前端，再点击 Close session。
+    // 否则如果 graceful close 还没完成，RPC 可能偶发抢在 close 生效前送达 daemon，
+    // 用例就会从“关闭失败显示错误”漂成“真的关闭成功”。
+    await waitFor(() => expect(daemon.activeConnectionCount()).toBe(0));
+    await user.click(screen.getByRole("button", { name: "Close session" }));
+
+    const workspaceBody = document.querySelector<HTMLElement>(".workspace-body");
+    expect(workspaceBody).not.toBeNull();
+    await within(workspaceBody!).findByRole("alert", { name: "Connection error" });
+    expect(screen.queryAllByText(DEFAULT_SESSION_NAME).length).toBeGreaterThan(0);
     expect(daemon.closedSessions).toEqual([]);
   });
 

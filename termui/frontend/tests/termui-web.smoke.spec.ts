@@ -645,6 +645,483 @@ test("terminal reload 后只向 daemon 上报最终稳定尺寸", async ({ page 
   }
 });
 
+test("terminal 进入后台标签页时仍持续消费输出，不依赖前台 requestAnimationFrame", async ({ page }, testInfo: TestInfo) => {
+  test.skip(testInfo.project.name === "mobile-chrome", "后台 tab drain 回归先覆盖桌面布局");
+  const sessionId = "00000000-0000-0000-0000-000000000542";
+  const daemon = await MockDaemon.start({
+    token: "secret-token",
+    sessions: [
+      {
+        session_id: sessionId,
+        state: "running",
+        size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+      },
+    ],
+    attachOutput: "background-tab-ready\n",
+  });
+
+  try {
+    await page.goto("/");
+    await page.getByLabel("WS URL").fill(daemon.url);
+    await page.getByLabel("Pairing token").fill(pairingInviteCode(daemon));
+    await activateButton(page, "Pair");
+    await expectTerminalLine(page, "background-tab-ready", 8_000);
+
+    const secondPage = await page.context().newPage();
+    await secondPage.goto("about:blank");
+    await secondPage.bringToFront();
+
+    daemon.pushSessionData(sessionId, "background-tab-live-output\n");
+    await expect
+      .poll(async () => terminalDebugBufferText(page), { timeout: 8_000 })
+      .toContain("background-tab-live-output");
+    expect(daemon.activeConnectionCount()).toBe(1);
+
+    await secondPage.close();
+    await page.bringToFront();
+    await expectTerminalLine(page, "background-tab-live-output", 8_000);
+  } finally {
+    await daemon.stop();
+  }
+});
+
+test("terminal 在前台已排队的 write callback 切到后台后仍会继续推进", async ({ page }, testInfo: TestInfo) => {
+  test.skip(testInfo.project.name === "mobile-chrome", "后台 write rescue 回归先覆盖桌面布局");
+  const sessionId = "00000000-0000-0000-0000-000000000544";
+  const daemon = await MockDaemon.start({
+    token: "secret-token",
+    sessions: [
+      {
+        session_id: sessionId,
+        state: "running",
+        size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+      },
+    ],
+    attachOutput: "background-writer-ready\n",
+  });
+
+  try {
+    await page.goto("/");
+    await page.getByLabel("WS URL").fill(daemon.url);
+    await page.getByLabel("Pairing token").fill(pairingInviteCode(daemon));
+    await activateButton(page, "Pair");
+    await expectTerminalLine(page, "background-writer-ready", 8_000);
+
+    await page.evaluate(() => {
+      const scope = window as typeof window & {
+        __termdHeldWriteRaf?: {
+          pendingCount: () => number;
+          runNext: () => boolean;
+        };
+      };
+      const queuedFrames = new Map<number, FrameRequestCallback>();
+      let nextFrameId = 1;
+      scope.__termdHeldWriteRaf = {
+        pendingCount: () => queuedFrames.size,
+        runNext: () => {
+          const nextFrame = queuedFrames.entries().next();
+          if (nextFrame.done) {
+            return false;
+          }
+          const [frameId, callback] = nextFrame.value;
+          queuedFrames.delete(frameId);
+          callback(performance.now());
+          return true;
+        },
+      };
+      (window as typeof window & {
+        __TERMD_TEST_HOLD_TERMINAL_WRITE_RAF__?: {
+          schedule: (callback: () => void) => number;
+          cancel: (handle: number) => void;
+        };
+      }).__TERMD_TEST_HOLD_TERMINAL_WRITE_RAF__ = {
+        schedule: (callback: () => void) => {
+          const frameId = nextFrameId;
+          nextFrameId += 1;
+          queuedFrames.set(frameId, () => {
+            callback();
+          });
+          return frameId;
+        },
+        cancel: (frameId: number) => {
+          queuedFrames.delete(Number(frameId));
+        },
+      };
+    });
+
+    daemon.pushSessionData(sessionId, "background-writer-race-output\n");
+    await expect
+      .poll(async () =>
+        page.evaluate(() => {
+          const scope = window as typeof window & {
+            __termdHeldWriteRaf?: { pendingCount: () => number };
+          };
+          return scope.__termdHeldWriteRaf?.pendingCount() ?? 0;
+        }), { timeout: 8_000 })
+      .toBeGreaterThan(0);
+    await page.evaluate(() => {
+      const scope = window as typeof window & {
+        __termdHeldWriteRaf?: { runNext: () => boolean };
+      };
+      scope.__termdHeldWriteRaf?.runNext();
+    });
+
+    daemon.pushSessionData(sessionId, "background-writer-race-output-2\n");
+    await expect
+      .poll(async () =>
+        page.evaluate(() => {
+          const scope = window as typeof window & {
+            __termdHeldWriteRaf?: { pendingCount: () => number };
+          };
+          return scope.__termdHeldWriteRaf?.pendingCount() ?? 0;
+        }), { timeout: 8_000 })
+      .toBeGreaterThan(0);
+
+    await page.evaluate(() => {
+      Object.defineProperty(document, "visibilityState", {
+        configurable: true,
+        get: () => "hidden",
+      });
+      Object.defineProperty(document, "hidden", {
+        configurable: true,
+        get: () => true,
+      });
+      window.dispatchEvent(new Event("blur"));
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+
+    await expect
+      .poll(async () => terminalDebugBufferText(page), { timeout: 8_000 })
+      .toContain("background-writer-race-output-2");
+  } finally {
+    await page.evaluate(() => {
+      Reflect.deleteProperty(document, "visibilityState");
+      Reflect.deleteProperty(document, "hidden");
+      window.dispatchEvent(new Event("focus"));
+      document.dispatchEvent(new Event("visibilitychange"));
+      delete (window as typeof window & {
+        __TERMD_TEST_HOLD_TERMINAL_WRITE_RAF__?: {
+          schedule: (callback: () => void) => number;
+          cancel: (handle: number) => void;
+        };
+        __termdHeldWriteRaf?: {
+          pendingCount: () => number;
+          runNext: () => boolean;
+        };
+      }).__TERMD_TEST_HOLD_TERMINAL_WRITE_RAF__;
+      delete (window as typeof window & {
+        __termdHeldWriteRaf?: {
+          pendingCount: () => number;
+          runNext: () => boolean;
+        };
+      }).__termdHeldWriteRaf;
+    });
+    await daemon.stop();
+  }
+});
+
+test("terminal 在前台已排队的 write callback 切到 blur 但仍 visible 后仍会继续推进", async ({ page }, testInfo: TestInfo) => {
+  test.skip(testInfo.project.name === "mobile-chrome", "blur rescue 回归先覆盖桌面布局");
+  const sessionId = "00000000-0000-0000-0000-000000000546";
+  const daemon = await MockDaemon.start({
+    token: "secret-token",
+    sessions: [
+      {
+        session_id: sessionId,
+        state: "running",
+        size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+      },
+    ],
+    attachOutput: "blur-writer-ready\n",
+  });
+
+  try {
+    await page.goto("/");
+    await page.getByLabel("WS URL").fill(daemon.url);
+    await page.getByLabel("Pairing token").fill(pairingInviteCode(daemon));
+    await activateButton(page, "Pair");
+    await expectTerminalLine(page, "blur-writer-ready", 8_000);
+
+    await page.evaluate(() => {
+      const scope = window as typeof window & {
+        __termdHeldBlurWriteRaf?: {
+          pendingCount: () => number;
+          runNext: () => boolean;
+        };
+      };
+      const queuedFrames = new Map<number, FrameRequestCallback>();
+      let nextFrameId = 1;
+      scope.__termdHeldBlurWriteRaf = {
+        pendingCount: () => queuedFrames.size,
+        runNext: () => {
+          const nextFrame = queuedFrames.entries().next();
+          if (nextFrame.done) {
+            return false;
+          }
+          const [frameId, callback] = nextFrame.value;
+          queuedFrames.delete(frameId);
+          callback(performance.now());
+          return true;
+        },
+      };
+      (window as typeof window & {
+        __TERMD_TEST_HOLD_TERMINAL_WRITE_RAF__?: {
+          schedule: (callback: () => void) => number;
+          cancel: (handle: number) => void;
+        };
+      }).__TERMD_TEST_HOLD_TERMINAL_WRITE_RAF__ = {
+        schedule: (callback: () => void) => {
+          const frameId = nextFrameId;
+          nextFrameId += 1;
+          queuedFrames.set(frameId, () => {
+            callback();
+          });
+          return frameId;
+        },
+        cancel: (frameId: number) => {
+          queuedFrames.delete(Number(frameId));
+        },
+      };
+    });
+
+    daemon.pushSessionData(sessionId, "blur-writer-race-output\n");
+    await expect
+      .poll(async () =>
+        page.evaluate(() => {
+          const scope = window as typeof window & {
+            __termdHeldBlurWriteRaf?: { pendingCount: () => number };
+          };
+          return scope.__termdHeldBlurWriteRaf?.pendingCount() ?? 0;
+        }), { timeout: 8_000 })
+      .toBeGreaterThan(0);
+    await page.evaluate(() => {
+      const scope = window as typeof window & {
+        __termdHeldBlurWriteRaf?: { runNext: () => boolean };
+      };
+      scope.__termdHeldBlurWriteRaf?.runNext();
+    });
+
+    daemon.pushSessionData(sessionId, "blur-writer-race-output-2\n");
+    await expect
+      .poll(async () =>
+        page.evaluate(() => {
+          const scope = window as typeof window & {
+            __termdHeldBlurWriteRaf?: { pendingCount: () => number };
+          };
+          return scope.__termdHeldBlurWriteRaf?.pendingCount() ?? 0;
+        }), { timeout: 8_000 })
+      .toBeGreaterThan(0);
+
+    await page.evaluate(() => {
+      Object.defineProperty(document, "hasFocus", {
+        configurable: true,
+        value: () => false,
+      });
+      window.dispatchEvent(new Event("blur"));
+    });
+
+    await expect
+      .poll(async () => terminalDebugBufferText(page), { timeout: 8_000 })
+      .toContain("blur-writer-race-output-2");
+  } finally {
+    await page.evaluate(() => {
+      Reflect.deleteProperty(document, "hasFocus");
+      window.dispatchEvent(new Event("focus"));
+      delete (window as typeof window & {
+        __TERMD_TEST_HOLD_TERMINAL_WRITE_RAF__?: {
+          schedule: (callback: () => void) => number;
+          cancel: (handle: number) => void;
+        };
+        __termdHeldBlurWriteRaf?: {
+          pendingCount: () => number;
+          runNext: () => boolean;
+        };
+      }).__TERMD_TEST_HOLD_TERMINAL_WRITE_RAF__;
+      delete (window as typeof window & {
+        __termdHeldBlurWriteRaf?: {
+          pendingCount: () => number;
+          runNext: () => boolean;
+        };
+      }).__termdHeldBlurWriteRaf;
+    });
+    await daemon.stop();
+  }
+});
+
+test("terminal 在 blur 但仍 visible 时收到新输出也不依赖 rAF", async ({ page }, testInfo: TestInfo) => {
+  test.skip(testInfo.project.name === "mobile-chrome", "blur 直退 timer 的回归先覆盖桌面布局");
+  const sessionId = "00000000-0000-0000-0000-000000000545";
+  const daemon = await MockDaemon.start({
+    token: "secret-token",
+    sessions: [
+      {
+        session_id: sessionId,
+        state: "running",
+        size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+      },
+    ],
+    attachOutput: "blur-direct-ready\n",
+  });
+
+  try {
+    await page.goto("/");
+    await page.getByLabel("WS URL").fill(daemon.url);
+    await page.getByLabel("Pairing token").fill(pairingInviteCode(daemon));
+    await activateButton(page, "Pair");
+    await expectTerminalLine(page, "blur-direct-ready", 8_000);
+
+    await page.evaluate(() => {
+      const heldFrames = new Map<number, () => void>();
+      let nextFrameId = 1;
+      const holdFrame = (callback: () => void) => {
+        const frameId = nextFrameId;
+        nextFrameId += 1;
+        heldFrames.set(frameId, callback);
+        return frameId;
+      };
+      const cancelFrame = (frameId: number) => {
+        heldFrames.delete(Number(frameId));
+      };
+      (window as typeof window & {
+        __TERMD_TEST_HOLD_TERMINAL_OUTPUT_FLUSH_RAF__?: {
+          schedule: (callback: () => void) => number;
+          cancel: (handle: number) => void;
+        };
+        __TERMD_TEST_HOLD_TERMINAL_WRITE_RAF__?: {
+          schedule: (callback: () => void) => number;
+          cancel: (handle: number) => void;
+        };
+      }).__TERMD_TEST_HOLD_TERMINAL_OUTPUT_FLUSH_RAF__ = {
+        schedule: holdFrame,
+        cancel: cancelFrame,
+      };
+      (window as typeof window & {
+        __TERMD_TEST_HOLD_TERMINAL_WRITE_RAF__?: {
+          schedule: (callback: () => void) => number;
+          cancel: (handle: number) => void;
+        };
+      }).__TERMD_TEST_HOLD_TERMINAL_WRITE_RAF__ = {
+        schedule: holdFrame,
+        cancel: cancelFrame,
+      };
+      Object.defineProperty(document, "hasFocus", {
+        configurable: true,
+        value: () => false,
+      });
+      window.dispatchEvent(new Event("blur"));
+    });
+
+    daemon.pushSessionData(sessionId, "blur-direct-live-output\n");
+    await expect
+      .poll(async () => terminalDebugBufferText(page), { timeout: 8_000 })
+      .toContain("blur-direct-live-output");
+  } finally {
+    await page.evaluate(() => {
+      Reflect.deleteProperty(document, "hasFocus");
+      window.dispatchEvent(new Event("focus"));
+      delete (window as typeof window & {
+        __TERMD_TEST_HOLD_TERMINAL_OUTPUT_FLUSH_RAF__?: {
+          schedule: (callback: () => void) => number;
+          cancel: (handle: number) => void;
+        };
+        __TERMD_TEST_HOLD_TERMINAL_WRITE_RAF__?: {
+          schedule: (callback: () => void) => number;
+          cancel: (handle: number) => void;
+        };
+      }).__TERMD_TEST_HOLD_TERMINAL_OUTPUT_FLUSH_RAF__;
+      delete (window as typeof window & {
+        __TERMD_TEST_HOLD_TERMINAL_WRITE_RAF__?: {
+          schedule: (callback: () => void) => number;
+          cancel: (handle: number) => void;
+        };
+      }).__TERMD_TEST_HOLD_TERMINAL_WRITE_RAF__;
+    });
+    await daemon.stop();
+  }
+});
+
+test("terminal 从后台标签页回到前台并重新聚焦时 rows/cols 保持稳定，不闪回远端网格", async ({ page }, testInfo: TestInfo) => {
+  test.skip(testInfo.project.name === "mobile-chrome", "回焦尺寸稳定回归先覆盖桌面布局");
+  const sessionId = "00000000-0000-0000-0000-000000000543";
+  const daemon = await MockDaemon.start({
+    token: "secret-token",
+    sessions: [
+      {
+        session_id: sessionId,
+        state: "running",
+        size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+      },
+    ],
+    attachOutput: "focus-return-ready\n",
+  });
+
+  try {
+    await page.goto("/");
+    await page.getByLabel("WS URL").fill(daemon.url);
+    await page.getByLabel("Pairing token").fill(pairingInviteCode(daemon));
+    await activateButton(page, "Pair");
+    await expectTerminalLine(page, "focus-return-ready", 8_000);
+    await page.getByRole("textbox", { name: "Terminal input" }).focus();
+
+    await expect
+      .poll(async () => terminalHostSize(page), { timeout: 8_000 })
+      .toMatchObject({ cols: expect.any(Number), rows: expect.any(Number) });
+    const stableSize = await terminalHostSize(page);
+    expect(stableSize.cols).toBeGreaterThan(80);
+    expect(stableSize.rows).toBeGreaterThan(24);
+
+    await page.evaluate(() => {
+      const scope = window as typeof window & { __termdFocusReturnSizes?: string[] };
+      scope.__termdFocusReturnSizes = [];
+      const host = document.querySelector<HTMLElement>(".terminal-host");
+      if (!host) {
+        return;
+      }
+      const record = () => {
+        const rows = host.dataset.termdRows;
+        const cols = host.dataset.termdCols;
+        if (!rows || !cols) {
+          return;
+        }
+        const key = `${cols}x${rows}`;
+        if (scope.__termdFocusReturnSizes?.at(-1) !== key) {
+          scope.__termdFocusReturnSizes?.push(key);
+        }
+      };
+      const observer = new MutationObserver(record);
+      observer.observe(host, { attributes: true, attributeFilter: ["data-termd-cols", "data-termd-rows"] });
+      record();
+      (window as typeof window & { __termdFocusReturnSizeObserver?: MutationObserver }).__termdFocusReturnSizeObserver = observer;
+    });
+
+    const secondPage = await page.context().newPage();
+    await secondPage.goto("about:blank");
+    await secondPage.bringToFront();
+    await page.waitForTimeout(300);
+
+    await page.bringToFront();
+    await page.locator(".terminal-frame").click();
+    await page.getByRole("textbox", { name: "Terminal input" }).focus();
+    await page.waitForTimeout(600);
+
+    const sizeSequence = await page.evaluate(() => {
+      const scope = window as typeof window & { __termdFocusReturnSizes?: string[] };
+      return scope.__termdFocusReturnSizes ?? [];
+    });
+    const uniqueSizes = Array.from(new Set(sizeSequence));
+    expect(uniqueSizes).toEqual([`${stableSize.cols}x${stableSize.rows}`]);
+
+    await page.evaluate(() => {
+      const scope = window as typeof window & { __termdFocusReturnSizeObserver?: MutationObserver };
+      scope.__termdFocusReturnSizeObserver?.disconnect();
+      delete scope.__termdFocusReturnSizeObserver;
+    });
+    await secondPage.close();
+  } finally {
+    await daemon.stop();
+  }
+});
+
 function pairingInviteCode(daemon: MockDaemon): string {
   const payload = JSON.stringify({
     type: "termd_pairing_qr",
@@ -692,6 +1169,16 @@ async function terminalViewportState(page: Page): Promise<{ viewportRaw: number;
     return {
       viewportRaw: Number.parseFloat(element.dataset.termdViewportYRaw ?? "0"),
       scrollbackLength: Number.parseFloat(element.dataset.termdScrollbackLength ?? "0"),
+    };
+  });
+}
+
+async function terminalHostSize(page: Page): Promise<{ cols: number; rows: number }> {
+  return page.locator(".terminal-host").evaluate((host) => {
+    const element = host as HTMLElement;
+    return {
+      cols: Number.parseInt(element.dataset.termdCols ?? "0", 10),
+      rows: Number.parseInt(element.dataset.termdRows ?? "0", 10),
     };
   });
 }

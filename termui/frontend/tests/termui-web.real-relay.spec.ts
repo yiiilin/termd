@@ -560,6 +560,7 @@ test("relay Web 在 daemon relay 短暂冻结恢复后仍能输入", async ({ pa
   collectBrowserErrors(page, "client", browserErrors);
 
   try {
+    await enableTermdDiagnostics(page);
     await page.goto("/");
     await page.getByLabel("WS URL").fill(fixture.relayClientUrl);
     await page.getByLabel("Pairing token").fill(pairingInviteCode(fixture));
@@ -593,6 +594,7 @@ test("relay Web 在 daemon relay 短暂冻结恢复后仍能输入", async ({ pa
       body: fixture.diagnostics(),
       contentType: "text/plain",
     });
+    await attachTermdDiagnostics(testInfo, "freeze-recovery", page);
     if (browserErrors.length > 0) {
       await testInfo.attach("browser-errors.log", {
         body: browserErrors.join("\n"),

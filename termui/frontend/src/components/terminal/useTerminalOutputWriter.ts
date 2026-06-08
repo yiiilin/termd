@@ -1,4 +1,4 @@
-import { useCallback, useRef, type MutableRefObject } from "react";
+import { useCallback, useEffect, useRef, type MutableRefObject } from "react";
 import type { TerminalSize } from "../../protocol/types";
 import type { TerminalOutputItem } from "./types";
 import { recordTermdDiagnostic } from "../../diagnostics";
@@ -16,6 +16,11 @@ export interface ActiveTerminalWrite {
   item: TerminalOutputItem;
   offset: number;
   sequenceChecked: boolean;
+}
+
+interface ScheduledWriteHandle {
+  cancel: () => void;
+  rescueHidden: (force?: boolean) => void;
 }
 
 interface TerminalWriteBatch {
@@ -44,6 +49,24 @@ interface CreateTerminalOutputDrainOptions {
   onSnapshotRedrawBegin?: (size: TerminalSize) => void;
   shouldScrollSnapshotToBottom?: (item: Extract<TerminalOutputItem, { kind: "snapshot" }>) => boolean;
   onSnapshotRendered?: (item: Extract<TerminalOutputItem, { kind: "snapshot" }>) => void;
+}
+
+interface DeferredTerminalFrameTestHook {
+  schedule: (callback: () => void) => number;
+  cancel: (handle: number) => void;
+}
+
+function terminalWriteFrameTestHook(): DeferredTerminalFrameTestHook | undefined {
+  return (globalThis as {
+    __TERMD_TEST_HOLD_TERMINAL_WRITE_RAF__?: DeferredTerminalFrameTestHook;
+  }).__TERMD_TEST_HOLD_TERMINAL_WRITE_RAF__;
+}
+
+function isDocumentAnimationFrameUnsafe(): boolean {
+  return typeof document !== "undefined" && (
+    document.visibilityState === "hidden" ||
+    (typeof document.hasFocus === "function" && !document.hasFocus())
+  );
 }
 
 function terminalOutputItemBytes(item: TerminalOutputItem): number {
@@ -91,7 +114,7 @@ export function useTerminalOutputWriter(
   const lastTerminalSeqRef = useRef<number | undefined>(undefined);
   const writeInFlightRef = useRef(false);
   const writeGenerationRef = useRef(0);
-  const writeFrameRef = useRef<number | undefined>(undefined);
+  const writeFrameRef = useRef<ScheduledWriteHandle | undefined>(undefined);
   const needsPostWriteRefreshRef = useRef(false);
   const needsPostWriteScrollBottomRef = useRef(false);
   const snapshotRedrawInProgressRef = useRef(false);
@@ -109,7 +132,7 @@ export function useTerminalOutputWriter(
     writeInFlightRef.current = false;
     writeGenerationRef.current += 1;
     if (writeFrameRef.current !== undefined) {
-      window.cancelAnimationFrame(writeFrameRef.current);
+      writeFrameRef.current.cancel();
       writeFrameRef.current = undefined;
     }
     needsPostWriteRefreshRef.current = false;
@@ -125,6 +148,108 @@ export function useTerminalOutputWriter(
   const markWriterNeedsRefreshAndScroll = useCallback(() => {
     needsPostWriteRefreshRef.current = true;
     needsPostWriteScrollBottomRef.current = true;
+  }, []);
+
+  const scheduleWriteCallback = useCallback((callback: () => void): ScheduledWriteHandle => {
+    const writeFrameTestHook = terminalWriteFrameTestHook();
+    const pageUnsafeAtSchedule = isDocumentAnimationFrameUnsafe();
+    let frame: number | undefined;
+    let timer: number | undefined;
+    let settled = false;
+    const clearScheduled = () => {
+      if (frame !== undefined) {
+        if (writeFrameTestHook) {
+          writeFrameTestHook.cancel(frame);
+        } else {
+          window.cancelAnimationFrame(frame);
+        }
+        frame = undefined;
+      }
+      if (timer !== undefined) {
+        window.clearTimeout(timer);
+        timer = undefined;
+      }
+    };
+    const run = () => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearScheduled();
+      callback();
+    };
+    const armTimer = () => {
+      if (settled || timer !== undefined) {
+        return;
+      }
+      timer = window.setTimeout(() => {
+        run();
+      }, 0);
+    };
+    if (pageUnsafeAtSchedule) {
+      armTimer();
+      return {
+        cancel: () => {
+          settled = true;
+          clearScheduled();
+        },
+        rescueHidden: () => undefined,
+      };
+    }
+    if (writeFrameTestHook) {
+      frame = writeFrameTestHook.schedule(() => {
+        run();
+      });
+    } else {
+      frame = window.requestAnimationFrame(() => {
+        run();
+      });
+    }
+    return {
+      cancel: () => {
+        settled = true;
+        clearScheduled();
+      },
+      rescueHidden: (force = false) => {
+        if (settled || frame === undefined) {
+          return;
+        }
+        if (!force && !isDocumentAnimationFrameUnsafe()) {
+          return;
+        }
+        // 中文注释：write drain 如果先按前台路径挂进 rAF，随后标签页立刻 hidden，
+        // 或者窗口先 blur、hidden 稍后才到，这个 callback 也可能被浏览器暂停。
+        // 这里把 pending write 改挂到 timer，
+        // 让 Ghostty 继续消费 backlog，不依赖前台动画帧。
+        if (writeFrameTestHook) {
+          writeFrameTestHook.cancel(frame);
+        } else {
+          window.cancelAnimationFrame(frame);
+        }
+        frame = undefined;
+        armTimer();
+      },
+    };
+  }, []);
+
+  useEffect(() => {
+    if (typeof document === "undefined") {
+      return undefined;
+    }
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "hidden") {
+        writeFrameRef.current?.rescueHidden(true);
+      }
+    };
+    const handleWindowBlur = () => {
+      writeFrameRef.current?.rescueHidden(true);
+    };
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    window.addEventListener("blur", handleWindowBlur);
+    return () => {
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+      window.removeEventListener("blur", handleWindowBlur);
+    };
   }, []);
 
   const takeOutputIntoPendingQueue = useCallback(() => {
@@ -404,7 +529,7 @@ export function useTerminalOutputWriter(
       if (writeInFlightRef.current || writeFrameRef.current !== undefined) {
         return;
       }
-      writeFrameRef.current = options.requestTrackedFrame(() => {
+      writeFrameRef.current = scheduleWriteCallback(() => {
         if (options.isDisposed()) {
           return;
         }
@@ -418,7 +543,7 @@ export function useTerminalOutputWriter(
       }
       schedulePendingWrite();
     };
-  }, [takeOutputIntoPendingQueue]);
+  }, [scheduleWriteCallback, takeOutputIntoPendingQueue]);
 
   return {
     pendingWriteItemsRef,

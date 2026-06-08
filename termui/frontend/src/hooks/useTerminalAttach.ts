@@ -58,6 +58,7 @@ export function useTerminalAttach() {
   const terminalOutputAppliedResetVersionRef = useRef(0);
   const terminalOutputResetWaitersRef = useRef<Map<number, Set<() => void>>>(new Map());
   const terminalOutputFlushFrameRef = useRef<number | undefined>(undefined);
+  const terminalOutputFlushTimerRef = useRef<number | undefined>(undefined);
   const terminalOutputDrainRef = useRef<(() => void) | undefined>(undefined);
   const terminalSnapshotTokenSeqRef = useRef(0);
   const terminalSnapshotRevealHistoryTokensRef = useRef<Map<UUID, number>>(new Map());
@@ -90,6 +91,7 @@ export function useTerminalAttach() {
     terminalOutputAppliedResetVersionRef,
     terminalOutputResetWaitersRef,
     terminalOutputFlushFrameRef,
+    terminalOutputFlushTimerRef,
     terminalOutputDrainRef,
     terminalSnapshotTokenSeqRef,
     terminalSnapshotRevealHistoryTokensRef,
@@ -116,6 +118,7 @@ interface UseTerminalReceiveLoopOptions {
   sessionFilesFollowTerminalCwdRef: MutableRefObject<boolean>;
   applyConfirmedSessionSize: (sessionId: UUID, size: TerminalSize) => void;
   enqueueTerminalOutput: (item: TerminalOutputItem) => void;
+  isIgnoredClosingSessionError: (sessionId: UUID, caught: unknown) => boolean;
   markNewOutputIfBackground: (sessionId: UUID) => void;
   setSafeError: (caught: unknown) => void;
   setSessionFiles: (files: SessionFilesResultPayload | undefined) => void;
@@ -135,6 +138,7 @@ export function useTerminalReceiveLoop(
     sessionFilesFollowTerminalCwdRef,
     applyConfirmedSessionSize,
     enqueueTerminalOutput,
+    isIgnoredClosingSessionError,
     markNewOutputIfBackground,
     setSafeError,
     setSessionFiles,
@@ -303,12 +307,16 @@ export function useTerminalReceiveLoop(
         } catch (caught) {
           // 旧 attach 关闭可能晚于新 attach 启动；只有当前 client 的错误才能切到错误态。
           if (isCurrentLoop()) {
+            const sessionId = attachedSessionRef.current;
             recordTermdDiagnostic("receive_loop_error", {
               loopGeneration,
-              attachedSessionId: attachedSessionRef.current,
+              attachedSessionId: sessionId,
               code: toSafeError(caught).code,
               message: toSafeError(caught).message,
             });
+            if (sessionId && isIgnoredClosingSessionError(sessionId, caught)) {
+              return;
+            }
             if (attachReconnectHandlerRef.current(client, caught)) {
               return;
             }
@@ -325,6 +333,7 @@ export function useTerminalReceiveLoop(
     applyConfirmedSessionSize,
     attachClientRef,
     enqueueTerminalOutput,
+    isIgnoredClosingSessionError,
     markNewOutputIfBackground,
     receiveLoopActiveRef,
     receiveLoopGenerationRef,

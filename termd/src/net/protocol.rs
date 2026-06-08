@@ -630,7 +630,11 @@ impl SessionOutputHistory {
     }
 
     fn resize(&mut self, size: TerminalSize) {
-        self.screen.resize(size.rows, size.cols);
+        let retained = self.bytes.iter().copied().collect::<Vec<_>>();
+        self.screen = TerminalScreen::new(size.rows, size.cols);
+        if !retained.is_empty() {
+            self.screen.apply(&retained);
+        }
         self.trim_to_live_output_limit();
     }
 
@@ -709,6 +713,22 @@ impl SessionOutputHistory {
 
     fn has_after(&self, cursor: u64) -> bool {
         cursor.max(self.base_offset) < self.end_offset()
+    }
+
+    fn has_output(&self) -> bool {
+        !self.bytes.is_empty()
+    }
+
+    fn is_untrimmed(&self) -> bool {
+        self.base_offset == 0
+    }
+
+    fn is_alternate_screen_active(&self) -> bool {
+        self.screen.is_alternate_screen_active()
+    }
+
+    fn requires_runtime_snapshot(&self) -> bool {
+        self.screen.requires_runtime_snapshot()
     }
 }
 
@@ -3255,12 +3275,92 @@ where
         (history.end_offset(), history.snapshot_bytes())
     }
 
+    fn live_bootstrap_output_history_snapshot_frames(
+        &mut self,
+        session_id: SessionId,
+    ) -> Option<Vec<TerminalFramePayload>> {
+        let (base_seq, size, pending_post_resize_rebuild) = self
+            .session_terminal_frame_logs
+            .get(&session_id)
+            .and_then(|log| {
+                log.live_bootstrap_snapshot_cursor()
+                    .map(|(base_seq, size)| (base_seq, size, log.pending_post_resize_rebuild()))
+            })?;
+        let history = self.session_output_history.get_mut(&session_id)?;
+        history.resize(size);
+        if !history.has_output() {
+            return None;
+        }
+        if !history.is_untrimmed() {
+            // 中文注释：retained raw bytes 是按字节窗口裁剪的；只要发生过 trim，
+            // 回放起点就可能落在普通文本、UTF-8 或控制序列中间。此时它已经不再是
+            // 可拿来重建权威 full snapshot 的完整输入流，必须回退到 runtime/mirror。
+            return None;
+        }
+        if pending_post_resize_rebuild && history.is_alternate_screen_active() {
+            // 中文注释：pure text scrollback 可以在 resize 后直接按新列宽重放原始输出，
+            // 但处于 alternate screen 的全屏 TUI 还依赖应用自己在新尺寸下 redraw。
+            // 如果 redraw 尚未完成，就不能把旧尺寸时期累积的原始字节直接当成
+            // 新尺寸下的权威 full snapshot，否则 reopen Codex/vim/less 仍可能乱屏。
+            return None;
+        }
+        if history.requires_runtime_snapshot() {
+            // 中文注释：raw-history 的轻量 screen mirror 只保证线性输出可靠；
+            // 一旦历史里出现光标定位、滚动区域、clear 等“重绘式”控制序列，
+            // mirror 就可能只近似最终屏幕。fresh attach 若继续把它当成权威
+            // full snapshot，就会像 Codex/CJK 场景那样先乱屏，直到下一次 resize/redraw 才恢复。
+            return None;
+        }
+        // 中文注释：live-bootstrap session 的 full snapshot 优先从原始输出重放结果生成，
+        // 这样 resize 后 scrollback 会按当前列宽重新组织，而不会复用 daemon mirror
+        // 里已经被旧尺寸折行过的历史。
+        Some(vec![TerminalFramePayload::Snapshot {
+            session_id,
+            base_seq,
+            size,
+            data_base64: general_purpose::STANDARD.encode(history.snapshot_bytes()),
+        }])
+    }
+
+    fn record_terminal_frame_output_history(
+        &mut self,
+        session_id: SessionId,
+        current_size: TerminalSize,
+        frame: &TerminalFramePayload,
+    ) {
+        match frame {
+            TerminalFramePayload::Output { data_base64, .. } => {
+                let Ok(bytes) = general_purpose::STANDARD.decode(data_base64) else {
+                    return;
+                };
+                self.session_output_history_mut(session_id, current_size)
+                    .append(&bytes);
+            }
+            TerminalFramePayload::Resize { size, .. } => {
+                self.session_output_history_mut(session_id, *size)
+                    .resize(*size);
+            }
+            TerminalFramePayload::Batch { frames, .. } => {
+                for frame in frames {
+                    self.record_terminal_frame_output_history(session_id, current_size, frame);
+                }
+            }
+            TerminalFramePayload::Snapshot { .. } | TerminalFramePayload::Exit { .. } => {}
+        }
+    }
+
     fn terminal_snapshot_frames(
         &mut self,
         session_id: SessionId,
         internal_session_id: &str,
         last_terminal_seq: Option<u64>,
     ) -> Result<Vec<TerminalFramePayload>, ProtocolError> {
+        if last_terminal_seq.is_none() {
+            if let Some(frames) = self.live_bootstrap_output_history_snapshot_frames(session_id) {
+                return Ok(frames);
+            }
+        }
+
         if let Some(frames) = self
             .session_terminal_frame_logs
             .get(&session_id)
@@ -3324,6 +3424,7 @@ where
                 self.maybe_notify_terminal_cwd_probe(session_id);
             }
             let size = self.runtime_size_proto(internal_session_id)?;
+            self.record_terminal_frame_output_history(session_id, size, &frame);
             let log = self
                 .session_terminal_frame_logs
                 .entry(session_id)
@@ -3333,12 +3434,33 @@ where
         }
 
         let last_terminal_seq = connection.terminal_drain_last_seq(session_id);
+        if last_terminal_seq.is_none() {
+            if let Some(frames) = self.live_bootstrap_output_history_snapshot_frames(session_id) {
+                return Ok(frames);
+            }
+        }
         let cached_frames = self
             .session_terminal_frame_logs
             .get(&session_id)
             .and_then(|log| {
                 log.snapshot_or_tail_limited(session_id, last_terminal_seq, Some(max_frames))
             });
+        if let Some(frames) = self
+            .live_bootstrap_output_history_snapshot_frames(session_id)
+            .filter(|_| {
+                last_terminal_seq.is_none()
+                    || cached_frames
+                        .as_ref()
+                        .map(|frames| {
+                            frames
+                                .iter()
+                                .any(|frame| matches!(frame, TerminalFramePayload::Snapshot { .. }))
+                        })
+                        .unwrap_or(true)
+            })
+        {
+            return Ok(frames);
+        }
         let mut frames = if let Some(frames) = cached_frames {
             frames
         } else {
@@ -10764,6 +10886,312 @@ mod tests {
             backend.terminal_snapshot_count_for_session(session_id),
             0,
             "last_terminal_seq=None 仍然表示 full snapshot，但当 daemon mirror 已连续且权威时，应直接用 mirror 生成完整当前画面"
+        );
+    }
+
+    #[test]
+    fn packet_terminal_full_snapshot_after_resize_reflows_live_bootstrap_history_without_runtime_snapshot()
+     {
+        let (mut protocol, backend) = protocol();
+        let (mut first_connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let (_, mut first_device_session, _) =
+            open_packet_e2ee(&mut protocol, &mut first_connection, device_id);
+        pair_packet_device(
+            &mut protocol,
+            &mut first_connection,
+            &mut first_device_session,
+            device_id,
+            PublicKey("device-public-key".to_owned()),
+        );
+        let session_id = create_test_packet_session(
+            &mut protocol,
+            &mut first_connection,
+            &mut first_device_session,
+        );
+        let long_line =
+            b"1234567890abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdefghijklmnopqrstuvwxyz\r\n";
+        backend.push_output_for_session(session_id, long_line.to_vec());
+
+        let first_attach = send_encrypted_packet(
+            &mut protocol,
+            &mut first_connection,
+            &mut first_device_session,
+            ProtocolPacket::stream_open(
+                PacketRequestId::new(),
+                PacketStreamId::new(),
+                METHOD_TERMINAL_ATTACH,
+                128 * 1024,
+                serde_json::to_value(SessionAttachPayload {
+                    session_id,
+                    watch_updates: true,
+                    last_terminal_seq: Some(0),
+                })
+                .unwrap(),
+            ),
+        );
+        let _ = decrypt_first_packet(&mut first_device_session, first_attach);
+        let _ = decrypt_packets(
+            &mut first_device_session,
+            first_connection.read_session_output(&mut protocol, session_id, 1024),
+        );
+
+        let resize_responses = send_encrypted_packet(
+            &mut protocol,
+            &mut first_connection,
+            &mut first_device_session,
+            ProtocolPacket::request(
+                PacketRequestId::new(),
+                METHOD_SESSION_RESIZE,
+                serde_json::to_value(SessionResizePayload {
+                    session_id,
+                    size: TerminalSize::new(24, 120),
+                })
+                .unwrap(),
+            ),
+        );
+        let _ = decrypt_first_packet(&mut first_device_session, resize_responses);
+        let _ = decrypt_packets(
+            &mut first_device_session,
+            first_connection.read_session_output(&mut protocol, session_id, 1024),
+        );
+
+        let (mut second_connection, _) = protocol.start_connection();
+        let second_device_id = DeviceId::new();
+        let (_, mut second_device_session, _) =
+            open_packet_e2ee(&mut protocol, &mut second_connection, second_device_id);
+        pair_packet_device(
+            &mut protocol,
+            &mut second_connection,
+            &mut second_device_session,
+            second_device_id,
+            PublicKey("second-device-public-key".to_owned()),
+        );
+        let second_attach = send_encrypted_packet(
+            &mut protocol,
+            &mut second_connection,
+            &mut second_device_session,
+            ProtocolPacket::stream_open(
+                PacketRequestId::new(),
+                PacketStreamId::new(),
+                METHOD_TERMINAL_ATTACH,
+                128 * 1024,
+                serde_json::to_value(SessionAttachPayload {
+                    session_id,
+                    watch_updates: true,
+                    last_terminal_seq: None,
+                })
+                .unwrap(),
+            ),
+        );
+        let _ = decrypt_first_packet(&mut second_device_session, second_attach);
+        let second_packets = decrypt_packets(
+            &mut second_device_session,
+            second_connection.read_session_output(&mut protocol, session_id, 1024),
+        );
+
+        assert_eq!(second_packets.len(), 1);
+        let snapshot: TerminalFramePayload =
+            decode_payload(second_packets[0].payload.clone()).unwrap();
+        let TerminalFramePayload::Snapshot { data_base64, .. } = snapshot else {
+            panic!("expected terminal snapshot after resize reflow");
+        };
+        let snapshot_text =
+            String::from_utf8(general_purpose::STANDARD.decode(data_base64).unwrap()).unwrap();
+        assert!(
+            snapshot_text.contains(
+                "1234567890abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdefghijklmnopqrstuvwxyz"
+            ),
+            "resize 后 full snapshot 应该按新列宽重放 live output，而不是保留旧换行: {snapshot_text:?}"
+        );
+        assert_eq!(
+            backend.terminal_snapshot_count_for_session(session_id),
+            0,
+            "live bootstrap session 在 resize 后的 full snapshot 应直接复用 daemon 原始输出重建 screen，避免回源 runtime/tmux capture-pane"
+        );
+    }
+
+    #[test]
+    fn packet_terminal_full_snapshot_after_resize_for_live_bootstrap_alt_screen_waits_for_runtime_snapshot()
+     {
+        let (mut protocol, backend) = protocol();
+        let (mut first_connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let (_, mut first_device_session, _) =
+            open_packet_e2ee(&mut protocol, &mut first_connection, device_id);
+        pair_packet_device(
+            &mut protocol,
+            &mut first_connection,
+            &mut first_device_session,
+            device_id,
+            PublicKey("device-public-key".to_owned()),
+        );
+        let session_id = create_test_packet_session(
+            &mut protocol,
+            &mut first_connection,
+            &mut first_device_session,
+        );
+        backend.push_output_for_session(
+            session_id,
+            b"shell before\r\n\x1b[?1049h\x1b[2J\x1b[Hcodex alt view".to_vec(),
+        );
+
+        let first_attach = send_encrypted_packet(
+            &mut protocol,
+            &mut first_connection,
+            &mut first_device_session,
+            ProtocolPacket::stream_open(
+                PacketRequestId::new(),
+                PacketStreamId::new(),
+                METHOD_TERMINAL_ATTACH,
+                128 * 1024,
+                serde_json::to_value(SessionAttachPayload {
+                    session_id,
+                    watch_updates: true,
+                    last_terminal_seq: Some(0),
+                })
+                .unwrap(),
+            ),
+        );
+        let _ = decrypt_first_packet(&mut first_device_session, first_attach);
+        let _ = decrypt_packets(
+            &mut first_device_session,
+            first_connection.read_session_output(&mut protocol, session_id, 1024),
+        );
+
+        let resize_responses = send_encrypted_packet(
+            &mut protocol,
+            &mut first_connection,
+            &mut first_device_session,
+            ProtocolPacket::request(
+                PacketRequestId::new(),
+                METHOD_SESSION_RESIZE,
+                serde_json::to_value(SessionResizePayload {
+                    session_id,
+                    size: TerminalSize::new(24, 120),
+                })
+                .unwrap(),
+            ),
+        );
+        let _ = decrypt_first_packet(&mut first_device_session, resize_responses);
+        let _ = decrypt_packets(
+            &mut first_device_session,
+            first_connection.read_session_output(&mut protocol, session_id, 1024),
+        );
+
+        let (mut second_connection, _) = protocol.start_connection();
+        let second_device_id = DeviceId::new();
+        let (_, mut second_device_session, _) =
+            open_packet_e2ee(&mut protocol, &mut second_connection, second_device_id);
+        pair_packet_device(
+            &mut protocol,
+            &mut second_connection,
+            &mut second_device_session,
+            second_device_id,
+            PublicKey("second-device-public-key".to_owned()),
+        );
+        let second_attach = send_encrypted_packet(
+            &mut protocol,
+            &mut second_connection,
+            &mut second_device_session,
+            ProtocolPacket::stream_open(
+                PacketRequestId::new(),
+                PacketStreamId::new(),
+                METHOD_TERMINAL_ATTACH,
+                128 * 1024,
+                serde_json::to_value(SessionAttachPayload {
+                    session_id,
+                    watch_updates: true,
+                    last_terminal_seq: None,
+                })
+                .unwrap(),
+            ),
+        );
+        let _ = decrypt_first_packet(&mut second_device_session, second_attach);
+        let second_packets = decrypt_packets(
+            &mut second_device_session,
+            second_connection.read_session_output(&mut protocol, session_id, 1024),
+        );
+
+        assert_eq!(second_packets.len(), 1);
+        let snapshot: TerminalFramePayload =
+            decode_payload(second_packets[0].payload.clone()).unwrap();
+        assert!(
+            matches!(snapshot, TerminalFramePayload::Snapshot { .. }),
+            "alternate screen reopen 应返回 full snapshot"
+        );
+        assert!(
+            backend.terminal_snapshot_count_for_session(session_id) > 0,
+            "alternate screen 在 resize 后未 redraw 前，full snapshot 仍应回源 runtime，不能直接把旧尺寸原始输出按新列宽重放"
+        );
+    }
+
+    #[test]
+    fn live_bootstrap_output_history_snapshot_frames_ignore_trimmed_history() {
+        let (mut protocol, _) = protocol();
+        let session_id = SessionId::new();
+        let size = TerminalSize::new(24, 80);
+        let oversized_output = (0..12000)
+            .map(|index| {
+                format!(
+                    "L{index:03} 0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ\r\n"
+                )
+            })
+            .collect::<String>();
+        let history = protocol.session_output_history_mut(session_id, size);
+        history.append(oversized_output.as_bytes());
+        assert!(
+            !history.is_untrimmed(),
+            "oversized retained output 应触发 trim，避免测试误判未覆盖到裁剪分支"
+        );
+
+        let log = protocol
+            .session_terminal_frame_logs
+            .entry(session_id)
+            .or_default();
+        log.ensure_initialized(size);
+        log.push(TerminalFramePayload::Output {
+            session_id,
+            terminal_seq: 1,
+            data_base64: general_purpose::STANDARD.encode(b"tail"),
+        });
+
+        assert!(
+            protocol
+                .live_bootstrap_output_history_snapshot_frames(session_id)
+                .is_none(),
+            "retained raw bytes 一旦 trim 过，就不能继续拿来重建权威 full snapshot"
+        );
+    }
+
+    #[test]
+    fn live_bootstrap_output_history_snapshot_frames_ignore_repaint_required_history() {
+        let (mut protocol, _) = protocol();
+        let session_id = SessionId::new();
+        let size = TerminalSize::new(24, 80);
+        let history = protocol.session_output_history_mut(session_id, size);
+        history.append("alpha\r\nbeta\x1b[2;1H本地 Hub 这次我已经修完".as_bytes());
+        assert!(
+            history.requires_runtime_snapshot(),
+            "出现光标定位/重绘序列后，retained raw history 不应再被当成权威 full snapshot"
+        );
+
+        let log = protocol
+            .session_terminal_frame_logs
+            .entry(session_id)
+            .or_default();
+        log.ensure_initialized(size);
+        log.push(TerminalFramePayload::Output {
+            session_id,
+            terminal_seq: 1,
+            data_base64: general_purpose::STANDARD.encode(b"tail"),
+        });
+
+        assert!(
+            protocol
+                .live_bootstrap_output_history_snapshot_frames(session_id)
+                .is_none(),
+            "重绘式输出必须回退到 runtime/tmux snapshot，避免 reopen Codex 时先看到乱屏"
         );
     }
 
@@ -19318,6 +19746,32 @@ mod tests {
         assert!(snapshot.contains("另外，这里还有最后一"));
         assert!(snapshot.contains("行"));
         assert!(!snapshot.contains("\x1b[2J\x1b[H"));
+    }
+
+    #[test]
+    fn session_output_history_resize_reflows_retained_output_to_new_width() {
+        let mut history = SessionOutputHistory::new(TerminalSize::new(4, 10));
+
+        history.append(b"1234567890abcdefghij\r\n");
+        let narrow_snapshot = String::from_utf8(history.snapshot_bytes()).unwrap();
+        assert!(narrow_snapshot.contains("1234567890\r\nabcdefghij"));
+
+        history.resize(TerminalSize::new(4, 20));
+        let wide_snapshot = String::from_utf8(history.snapshot_bytes()).unwrap();
+        assert!(wide_snapshot.contains("1234567890abcdefghij"));
+        assert!(!wide_snapshot.contains("1234567890\r\nabcdefghij"));
+    }
+
+    #[test]
+    fn session_output_history_snapshot_does_not_render_charset_designation_bytes_as_text() {
+        let mut history = SessionOutputHistory::new(TerminalSize::new(4, 20));
+
+        history.append(b"\x1b(Bhello\r\n\x1b)0world");
+
+        let snapshot = String::from_utf8(history.snapshot_bytes()).unwrap();
+        assert!(snapshot.contains("hello\r\nworld"));
+        assert!(!snapshot.contains("Bhello"));
+        assert!(!snapshot.contains("0world"));
     }
 
     #[test]

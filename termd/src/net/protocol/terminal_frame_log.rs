@@ -76,6 +76,20 @@ impl SessionTerminalFrameLog {
         self.live_bootstrap_authoritative = false;
     }
 
+    pub(super) fn live_bootstrap_snapshot_cursor(&self) -> Option<(u64, TerminalSize)> {
+        if !self.live_bootstrap_authoritative
+            || !self.has_observed_terminal_state
+            || self.has_sequence_gap
+        {
+            return None;
+        }
+        Some((self.base_seq, self.size))
+    }
+
+    pub(super) fn pending_post_resize_rebuild(&self) -> bool {
+        self.pending_post_resize_rebuild
+    }
+
     fn reset_from_snapshot(&mut self, base_seq: u64, size: TerminalSize, data: &[u8]) {
         if base_seq < self.base_seq {
             return;
@@ -86,6 +100,11 @@ impl SessionTerminalFrameLog {
         self.has_sequence_gap = false;
         self.has_observed_terminal_state = true;
         self.full_snapshot_authoritative = true;
+        // 中文注释：一旦 mirror 接受过外部 snapshot（runtime/daemon fallback）seed，
+        // 后续 full snapshot 就不能再假设“空屏 + 连续 live output”足够重放出
+        // 当前整屏。否则 protocol 层若改用 raw-output history，会和这个 snapshot
+        // 基线发生正文/seq 失配。
+        self.live_bootstrap_authoritative = false;
         self.pending_post_resize_rebuild = false;
         let mut screen = TerminalScreen::new(size.rows, size.cols);
         screen.apply(data);
@@ -140,6 +159,7 @@ impl SessionTerminalFrameLog {
                     // 权威恢复数据。发现 gap 后本地 log 不再生成 snapshot/tail，
                     // 后续恢复必须回源 supervisor，已保留的 frame 只用于 cursor/唤醒判断。
                     self.has_sequence_gap = true;
+                    self.live_bootstrap_authoritative = false;
                     self.full_snapshot_authoritative = false;
                     self.pending_post_resize_rebuild = false;
                     self.base_seq = self.base_seq.max(*terminal_seq);
@@ -174,6 +194,7 @@ impl SessionTerminalFrameLog {
                 }
                 if *terminal_seq != self.base_seq.saturating_add(1) {
                     self.has_sequence_gap = true;
+                    self.live_bootstrap_authoritative = false;
                     self.full_snapshot_authoritative = false;
                     self.pending_post_resize_rebuild = false;
                     self.base_seq = self.base_seq.max(*terminal_seq);
@@ -202,6 +223,7 @@ impl SessionTerminalFrameLog {
                 }
                 if *terminal_seq != self.base_seq.saturating_add(1) {
                     self.has_sequence_gap = true;
+                    self.live_bootstrap_authoritative = false;
                     self.full_snapshot_authoritative = false;
                     self.pending_post_resize_rebuild = false;
                     self.base_seq = self.base_seq.max(*terminal_seq);
@@ -363,6 +385,20 @@ mod tests {
         }
     }
 
+    fn snapshot_frame(
+        session_id: SessionId,
+        base_seq: u64,
+        size: TerminalSize,
+        bytes: &[u8],
+    ) -> TerminalFramePayload {
+        TerminalFramePayload::Snapshot {
+            session_id,
+            base_seq,
+            size,
+            data_base64: general_purpose::STANDARD.encode(bytes),
+        }
+    }
+
     #[test]
     fn restored_tmux_log_stays_non_authoritative_after_resize_without_redraw() {
         let session_id = SessionId::new();
@@ -422,6 +458,26 @@ mod tests {
         assert!(
             log.snapshot_or_tail(session_id, None).is_none(),
             "resize 后如果 terminal_seq 断档，mirror 不能误把不完整 redraw 升成权威整屏"
+        );
+    }
+
+    #[test]
+    fn snapshot_seed_disables_live_bootstrap_history_cursor() {
+        let session_id = SessionId::new();
+        let mut log = SessionTerminalFrameLog::default();
+        let size = TerminalSize::new(24, 80);
+        log.ensure_initialized(size);
+
+        log.push(snapshot_frame(
+            session_id,
+            3,
+            size,
+            b"seeded-from-runtime-snapshot",
+        ));
+
+        assert!(
+            log.live_bootstrap_snapshot_cursor().is_none(),
+            "一旦 daemon log 接受过外部 snapshot seed，就不能再把 raw-output history 当成 live-bootstrap 权威快照源"
         );
     }
 }

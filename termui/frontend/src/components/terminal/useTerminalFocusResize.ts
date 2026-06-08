@@ -84,7 +84,6 @@ export function useTerminalFocusResizeState() {
       // 这里立即撤销 operator 聚焦态，避免旧窗口继续按自己的布局上报 PTY resize。
       options.reportTerminalFocus(false);
       blurActiveTerminalElement();
-      options.resize("layout");
     };
     const handleWindowFocus = () => {
       windowActiveRef.current = true;

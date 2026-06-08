@@ -30,7 +30,9 @@ const ghosttyWebMock = vi.hoisted(() => {
     };
     rendererTheme?: unknown;
     lastWriteData?: string | Uint8Array;
-    rendererMetrics = { width: 8, height: 14 };
+    rendererMetrics = { width: 8, height: 14, baseline: 12 };
+    rendererLatinMeasure = { width: 8, actualBoundingBoxAscent: 10, actualBoundingBoxDescent: 2 };
+    rendererCjkMeasure = { width: 16, actualBoundingBoxAscent: 10, actualBoundingBoxDescent: 2 };
     selectionManager = {
       selectionStart: undefined as { col: number; absoluteRow: number } | undefined,
       selectionEnd: undefined as { col: number; absoluteRow: number } | undefined,
@@ -50,6 +52,18 @@ const ghosttyWebMock = vi.hoisted(() => {
       },
     };
     renderer = {
+      ctx: {
+        font: "",
+        save: () => undefined,
+        restore: () => undefined,
+        measureText: (text: string) => (text === "中" ? this.rendererCjkMeasure : this.rendererLatinMeasure),
+      },
+      fontSize: 13,
+      fontFamily: "mock-mono",
+      measureFont: () => this.rendererMetrics,
+      remeasureFont: () => {
+        this.rendererMetrics = this.renderer.measureFont();
+      },
       getMetrics: () => this.rendererMetrics,
       setTheme: (theme: unknown) => {
         this.rendererTheme = theme;
@@ -385,6 +399,98 @@ describe("ghostty renderer adapter", () => {
     });
   });
 
+  it("open 时会按 CJK 样本抬高 font metrics，避免首行汉字被裁掉", async () => {
+    vi.resetModules();
+    ghosttyWebMock.init.mockClear();
+    ghosttyWebMock.terminals.length = 0;
+    const { createGhosttyRenderer } = await import("../components/terminal/ghostty-renderer");
+
+    const renderer = await createGhosttyRenderer({
+      terminalOptions: { fontSize: 14, convertEol: true },
+      searchOptions: {},
+    });
+
+    const terminal = ghosttyWebMock.terminals[0];
+    terminal.rendererMetrics = { width: 8, height: 14, baseline: 12 };
+    terminal.rendererLatinMeasure = { width: 8, actualBoundingBoxAscent: 9, actualBoundingBoxDescent: 2 };
+    terminal.rendererCjkMeasure = { width: 16, actualBoundingBoxAscent: 11, actualBoundingBoxDescent: 3 };
+
+    const host = document.createElement("div");
+    renderer.terminal.open(host);
+
+    // 中文注释：宽度仍沿用 monospace 单格宽，避免列数抖动；只把高度和 baseline
+    // 抬到能容纳 CJK 首行字头的水平。
+    expect(terminal.rendererMetrics).toEqual({ width: 8, height: 17, baseline: 14 });
+  });
+
+  it("CJK metrics 补偿后 fit 列数保持不变，且重复测量结果稳定", async () => {
+    vi.resetModules();
+    vi.useFakeTimers();
+    try {
+      ghosttyWebMock.init.mockClear();
+      ghosttyWebMock.terminals.length = 0;
+      const { createGhosttyRenderer } = await import("../components/terminal/ghostty-renderer");
+
+      const renderer = await createGhosttyRenderer({
+        terminalOptions: { fontSize: 14, convertEol: true },
+        searchOptions: {},
+      });
+
+      const terminal = ghosttyWebMock.terminals[0];
+      terminal.rendererMetrics = { width: 8, height: 14, baseline: 12 };
+      terminal.rendererLatinMeasure = { width: 8, actualBoundingBoxAscent: 9, actualBoundingBoxDescent: 2 };
+      terminal.rendererCjkMeasure = { width: 16, actualBoundingBoxAscent: 11, actualBoundingBoxDescent: 3 };
+
+      const host = document.createElement("div");
+      Object.defineProperty(host, "clientWidth", { configurable: true, value: 790 });
+      Object.defineProperty(host, "clientHeight", { configurable: true, value: 860 });
+      renderer.terminal.open(host);
+
+      const first = renderer.fit.proposeDimensions();
+      const second = renderer.fit.proposeDimensions();
+
+      // 中文注释：首行中文补偿只能影响行高，不能把单格宽度改掉；
+      // 否则 cols 会在 open/remeasure 之后抖动，重新触发 PTY resize。
+      expect(terminal.rendererMetrics.width).toBe(8);
+      expect(first).toEqual({ cols: 98, rows: 50 });
+      expect(second).toEqual(first);
+
+      renderer.fit.fit();
+      expect(terminal.cols).toBe(first?.cols);
+      expect(terminal.rows).toBe(first?.rows);
+
+      vi.advanceTimersByTime(60);
+      renderer.fit.fit();
+      expect(terminal.cols).toBe(first?.cols);
+      expect(terminal.rows).toBe(first?.rows);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("renderer 缺少 font metrics hooks 时会安全退化，不阻断 open", async () => {
+    vi.resetModules();
+    ghosttyWebMock.init.mockClear();
+    ghosttyWebMock.terminals.length = 0;
+    const { createGhosttyRenderer } = await import("../components/terminal/ghostty-renderer");
+
+    const renderer = await createGhosttyRenderer({
+      terminalOptions: { fontSize: 14, convertEol: true },
+      searchOptions: {},
+    });
+
+    const terminal = ghosttyWebMock.terminals[0];
+    terminal.renderer.measureFont = undefined as unknown as typeof terminal.renderer.measureFont;
+    terminal.renderer.remeasureFont = undefined as unknown as typeof terminal.renderer.remeasureFont;
+    terminal.renderer.ctx = undefined as unknown as typeof terminal.renderer.ctx;
+
+    const host = document.createElement("div");
+
+    expect(() => renderer.terminal.open(host)).not.toThrow();
+    expect(host.querySelector("canvas")).not.toBeNull();
+    expect(host.querySelector('textarea[aria-label="Terminal input"]')).toBe(terminal.textarea);
+  });
+
   it("debug buffer mirror 在上滚时镜像当前 viewport 文本，避免 scrollback 视图和底部尾巴串屏", async () => {
     vi.resetModules();
     ghosttyWebMock.init.mockClear();
@@ -612,7 +718,7 @@ describe("ghostty renderer adapter", () => {
           return this;
         },
       } as DOMRect);
-      terminal.rendererMetrics = { width: 4.8, height: 10 };
+      terminal.rendererMetrics = { width: 4.8, height: 10, baseline: 8 };
       renderer.fit.fit();
 
       // 中文注释：真实 reload 曾出现 host/canvas 已经稳定在 89x47，
@@ -675,7 +781,7 @@ describe("ghostty renderer adapter", () => {
           return this;
         },
       } as DOMRect);
-      terminal.rendererMetrics = { width: 4.8, height: 10 };
+      terminal.rendererMetrics = { width: 4.8, height: 10, baseline: 8 };
 
       // 中文注释：这组 canvas 既解释不了当前错误 metrics，也解释不了上一组稳定 metrics；
       // 因此不能通过 stable proposal 写回 daemon/tmux，否则刷新期间可能上报虚假分辨率。

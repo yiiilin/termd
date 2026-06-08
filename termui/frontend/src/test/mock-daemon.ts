@@ -108,6 +108,7 @@ interface MockDaemonOptions {
   fileUploadProgressOverrides?: Record<string, Partial<SessionFileUploadProgressPayload>>;
   fileUploadProgressDelayMs?: number;
   relayClientPathOnly?: boolean;
+  closeSessionUnownedError?: ErrorPayload;
 }
 
 interface QueuedSessionListResponse {
@@ -829,6 +830,18 @@ export class MockDaemon {
         }
         this.closedSessions.push(payload.session_id);
         this.options.sessions = this.options.sessions.filter((session) => session.session_id !== payload.session_id);
+        if (this.options.closeSessionUnownedError) {
+          // 中文注释：真实 daemon 在显式 close 当前 attach session 时，watch stream 的收尾错误
+          // 可能先于 close RPC ack 到达浏览器。测试桩用未归属 request id 的 error 模拟该竞态。
+          this.sendPacket(connection, {
+            version: PROTOCOL_PACKET_VERSION,
+            kind: "error",
+            payload: {
+              ...this.options.closeSessionUnownedError,
+              retryable: false,
+            },
+          });
+        }
         this.sendPacketResponse(connection, packet, payload);
         return true;
       }
@@ -1085,6 +1098,9 @@ export class MockDaemon {
         }
         this.closedSessions.push(payload.session_id);
         this.options.sessions = this.options.sessions.filter((session) => session.session_id !== payload.session_id);
+        if (this.options.closeSessionUnownedError) {
+          this.sendInner(connection, envelope("error", this.options.closeSessionUnownedError));
+        }
         this.sendInner(connection, envelope("session_closed", payload));
         return;
       }

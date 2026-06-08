@@ -9,6 +9,7 @@ import type {
 let ghosttyInitPromise: Promise<void> | undefined;
 let ghosttyInitialized = false;
 const patchedGhosttyRenderers = new WeakSet<object>();
+const patchedGhosttyMetricRenderers = new WeakSet<object>();
 type ViteImportMeta = ImportMeta & {
   env?: {
     DEV?: boolean;
@@ -70,18 +71,29 @@ type GhosttyStableMetricsResult = {
 
 type GhosttyFitTerminal = InstanceType<typeof Terminal> & {
   requestRender?: () => void;
-  renderer?: {
-    getMetrics?: () => GhosttyFontMetrics | undefined;
-    setTheme?: (theme: Record<string, unknown>) => void;
-    render?: (
-      buffer: unknown,
-      forceAll?: boolean,
-      viewportY?: number,
-      scrollbackProvider?: unknown,
-      scrollbarOpacity?: number,
-    ) => void;
-  };
+  renderer?: unknown;
 };
+
+type GhosttyPatchedRenderer = {
+  getMetrics?: () => GhosttyFontMetrics | undefined;
+  setTheme?: (theme: Record<string, unknown>) => void;
+  measureFont?: () => GhosttyFontMetrics;
+  remeasureFont?: () => void;
+  ctx?: Pick<CanvasRenderingContext2D, "font" | "save" | "restore" | "measureText">;
+  fontSize?: number;
+  fontFamily?: string;
+  render?: (
+    buffer: unknown,
+    forceAll?: boolean,
+    viewportY?: number,
+    scrollbackProvider?: unknown,
+    scrollbarOpacity?: number,
+  ) => void;
+};
+
+function ghosttyPatchedRenderer(terminal: InstanceType<typeof Terminal>): GhosttyPatchedRenderer | undefined {
+  return (terminal as GhosttyFitTerminal).renderer as GhosttyPatchedRenderer | undefined;
+}
 
 type GhosttyTerminalOptions = {
   convertEol?: boolean;
@@ -409,7 +421,6 @@ function ghosttySelectViewportRange(
 }
 
 function syncGhosttyCanvasFiller(terminal: InstanceType<typeof Terminal>): void {
-  const fitTerminal = terminal as GhosttyFitTerminal;
   const element = terminal.element;
   const hideFiller = () => {
     const filler = element?.querySelector<HTMLDivElement>(".terminal-host-grid-filler");
@@ -419,7 +430,7 @@ function syncGhosttyCanvasFiller(terminal: InstanceType<typeof Terminal>): void 
     filler.style.width = "0px";
     filler.hidden = true;
   };
-  const metrics = fitTerminal.renderer?.getMetrics?.();
+  const metrics = ghosttyPatchedRenderer(terminal)?.getMetrics?.();
   if (!element || !metrics || metrics.width <= 0) {
     hideFiller();
     return;
@@ -447,8 +458,7 @@ function syncGhosttyCanvasFiller(terminal: InstanceType<typeof Terminal>): void 
 }
 
 function patchGhosttyRendererViewport(terminal: InstanceType<typeof Terminal>): void {
-  const fitTerminal = terminal as GhosttyFitTerminal;
-  const renderer = fitTerminal.renderer;
+  const renderer = ghosttyPatchedRenderer(terminal);
   if (!renderer || patchedGhosttyRenderers.has(renderer)) {
     return;
   }
@@ -456,7 +466,13 @@ function patchGhosttyRendererViewport(terminal: InstanceType<typeof Terminal>): 
   if (!originalRender) {
     return;
   }
-  renderer.render = (buffer, forceAll, viewportY, scrollbackProvider, scrollbarOpacity) => {
+  renderer.render = (
+    buffer: unknown,
+    forceAll?: boolean,
+    viewportY?: number,
+    scrollbackProvider?: unknown,
+    scrollbarOpacity?: number,
+  ) => {
     // 中文注释：ghostty-web 的 canvas render 会用 viewportY 判断 scrollback/screen 边界，
     // 但只在索引时取 floor；平滑滚动的小数值会让边界行读错并残留旧像素。
     const integerViewportY = viewportY === undefined ? viewportY : Math.max(0, Math.floor(viewportY));
@@ -465,6 +481,51 @@ function patchGhosttyRendererViewport(terminal: InstanceType<typeof Terminal>): 
     originalRender(buffer, forceAll, integerViewportY, scrollbackProvider, scrollbarOpacity);
   };
   patchedGhosttyRenderers.add(renderer);
+}
+
+function patchGhosttyRendererFontMetrics(terminal: InstanceType<typeof Terminal>): void {
+  const renderer = ghosttyPatchedRenderer(terminal);
+  if (!renderer || patchedGhosttyMetricRenderers.has(renderer)) {
+    return;
+  }
+  const originalMeasureFont = renderer.measureFont?.bind(renderer);
+  const ctx = renderer.ctx;
+  if (!originalMeasureFont || !ctx) {
+    return;
+  }
+  renderer.measureFont = () => {
+    const original = originalMeasureFont();
+    const fontSize = typeof renderer.fontSize === "number" && renderer.fontSize > 0
+      ? renderer.fontSize
+      : original.height;
+    ctx.save();
+    try {
+      if (fontSize > 0 && typeof renderer.fontFamily === "string" && renderer.fontFamily.length > 0) {
+        ctx.font = `${fontSize}px ${renderer.fontFamily}`;
+      }
+      // 中文注释：ghostty-web upstream 用 "M" 量字高。对 CJK fallback 字体来说，
+      // 首行汉字的 actualBoundingBoxAscent 往往比拉丁字母更高，结果只有第 1 行会被
+      // canvas 顶边裁掉。这里保留单格宽度仍按拉丁 monospace 计算，只把垂直 metrics
+      // 提升到拉丁/CJK 两套样本里的更大值。
+      const latin = ctx.measureText("M");
+      const cjk = ctx.measureText("中");
+      const latinAscent = latin.actualBoundingBoxAscent || fontSize * 0.8;
+      const latinDescent = latin.actualBoundingBoxDescent || fontSize * 0.2;
+      const cjkAscent = cjk.actualBoundingBoxAscent || latinAscent;
+      const cjkDescent = cjk.actualBoundingBoxDescent || latinDescent;
+      const extraAscent = Math.max(0, cjkAscent - latinAscent);
+      const extraDescent = Math.max(0, cjkDescent - latinDescent);
+      return {
+        width: original.width,
+        height: Math.max(original.height, original.height + Math.ceil(extraAscent + extraDescent)),
+        baseline: Math.max(original.baseline, original.baseline + Math.ceil(extraAscent)),
+      };
+    } finally {
+      ctx.restore();
+    }
+  };
+  renderer.remeasureFont?.();
+  patchedGhosttyMetricRenderers.add(renderer);
 }
 
 function ghosttyMaxViewportY(terminal: GhosttyRuntimeTerminal): number {
@@ -546,6 +607,7 @@ function adaptGhosttyTerminal(
     },
     open: (parent) => {
       terminal.open(parent);
+      patchGhosttyRendererFontMetrics(terminal);
       patchGhosttyRendererViewport(terminal);
       syncGhosttyCanvasFiller(terminal);
       cleanupDebugSelectionBridge();
@@ -633,9 +695,12 @@ function createTermdGhosttyFitAddon(
   let lastMetricsVerified = false;
 
   const proposeDimensionsFromMetrics = (requireVerifiedMetrics: boolean) => {
-    const fitTerminal = terminal as GhosttyFitTerminal;
     const element = terminal.element;
-    const metricsResult = stableGhosttyFontMetrics(terminal, fitTerminal.renderer?.getMetrics?.(), stableMetrics);
+    const metricsResult = stableGhosttyFontMetrics(
+      terminal,
+      ghosttyPatchedRenderer(terminal)?.getMetrics?.(),
+      stableMetrics,
+    );
     stableMetrics = metricsResult.stableMetrics;
     lastMetricsVerified = metricsResult.verified;
     const metrics = metricsResult.metrics;

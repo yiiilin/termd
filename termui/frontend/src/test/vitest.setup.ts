@@ -28,8 +28,16 @@ afterEach(() => {
     .__TERMD_TEST_KEEP_GHOSTTY_VIEWPORT_AT_TOP_AFTER_RESIZE__;
   delete (globalThis as { __TERMD_TEST_SERIALIZE_GHOSTTY_WRITES__?: boolean })
     .__TERMD_TEST_SERIALIZE_GHOSTTY_WRITES__;
+  delete (globalThis as { __TERMD_TEST_GHOSTTY_SKIP_NATIVE_FOCUS__?: boolean })
+    .__TERMD_TEST_GHOSTTY_SKIP_NATIVE_FOCUS__;
   delete (globalThis as { __TERMD_TEST_DEFER_OUTPUT_RESET_APPLIED__?: (confirm: () => void) => void })
     .__TERMD_TEST_DEFER_OUTPUT_RESET_APPLIED__;
+  delete (globalThis as {
+    __TERMD_TEST_HOLD_TERMINAL_OUTPUT_FLUSH_RAF__?: { schedule: (callback: () => void) => number; cancel: (handle: number) => void };
+  }).__TERMD_TEST_HOLD_TERMINAL_OUTPUT_FLUSH_RAF__;
+  delete (globalThis as {
+    __TERMD_TEST_HOLD_TERMINAL_WRITE_RAF__?: { schedule: (callback: () => void) => number; cancel: (handle: number) => void };
+  }).__TERMD_TEST_HOLD_TERMINAL_WRITE_RAF__;
   delete (globalThis as { __TERMD_TEST_TERMINAL_STATS__?: {
     writes: number;
     refreshes: number;
@@ -469,6 +477,9 @@ vi.mock("ghostty-web", () => {
     }
 
     focus() {
+      if ((globalThis as { __TERMD_TEST_GHOSTTY_SKIP_NATIVE_FOCUS__?: boolean }).__TERMD_TEST_GHOSTTY_SKIP_NATIVE_FOCUS__) {
+        return;
+      }
       this.textarea?.focus();
     }
 
