@@ -326,7 +326,7 @@ pub(super) struct DataQueueByteBudget {
 }
 
 impl DataQueueByteBudget {
-    fn new(limit: usize) -> Self {
+    pub(super) fn new(limit: usize) -> Self {
         Self {
             limit,
             queued: AtomicUsize::new(0),
@@ -334,7 +334,7 @@ impl DataQueueByteBudget {
         }
     }
 
-    fn try_reserve(&self, bytes: usize) -> bool {
+    pub(super) fn try_reserve(&self, bytes: usize) -> bool {
         if bytes == 0 {
             return true;
         }
@@ -373,7 +373,7 @@ impl DataQueueByteBudget {
         self.notify.notify_waiters();
     }
 
-    fn exceeds_limit(&self, bytes: usize) -> bool {
+    pub(super) fn exceeds_limit(&self, bytes: usize) -> bool {
         bytes > self.limit
     }
 

@@ -1190,7 +1190,14 @@ impl RelayRegistry {
             (client_id, client.sender.clone())
         };
 
-        match client_sender.try_send_data(RelayOutbound::Frame(frame)) {
+        // 中文注释：daemon -> client 这条链路代表终端下行输出。这里如果像 client -> daemon
+        // 一样在第一次 BudgetFull 就立刻断开，会把几百毫秒到几秒的公网抖动直接放大成
+        // 浏览器重连和 full snapshot，用户体感就是 relay 比直连更容易“卡住后重刷”。
+        //
+        // 对下行链路更合理的策略是让背压沿着 relay 回传到 daemon data WebSocket：
+        // 当前读循环在这里短暂 await，内核 socket buffer 会继续承接一段数据；如果浏览器
+        // 真正长时间不可写，writer 侧的 send deadline/close signal 仍会最终打断这里。
+        match client_sender.send_data(RelayOutbound::Frame(frame)).await {
             Ok(()) => ForwardReport {
                 attempted: 1,
                 delivered: 1,

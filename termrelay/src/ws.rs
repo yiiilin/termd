@@ -1,5 +1,6 @@
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket};
@@ -9,6 +10,7 @@ use termd_proto::{
     decode_relay_data_control, encode_relay_data_control,
 };
 use thiserror::Error;
+use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tracing::{debug, trace, warn};
 
@@ -24,7 +26,9 @@ use self::http_tunnel::{
     RelayHttpTunnelRequestBodyDeadline, relay_http_tunnel_forward_request_body,
     relay_http_tunnel_request_body_deadline,
 };
-use self::pipe_pump::{FrameSender, PipePump, PumpDataReceiver, RelayDataSendError, RelayOutbound};
+use self::pipe_pump::{
+    DataQueueByteBudget, FrameSender, PipePump, PumpDataReceiver, RelayDataSendError, RelayOutbound,
+};
 #[cfg(test)]
 use self::policy::{
     OutboundFramePressureLevel, websocket_idle_ping_due, websocket_outbound_frame_pressure_level,
@@ -72,6 +76,15 @@ const PRE_PAIR_CLIENT_BUFFER_MAX_BYTES: usize = 4 * 1024 * 1024;
 const PRE_PAIR_ROOM_BUFFER_MAX_BYTES: usize = PRE_PAIR_CLIENT_BUFFER_MAX_BYTES * 2;
 const IDLE_DAEMON_DATA_PIPE_LIMIT: usize = 8;
 const RELAY_AUTH_TOKEN_MIN_BYTES: usize = 8;
+// 中文注释：daemon_data 源 socket 需要一个本地短缓冲，把“读 daemon 输出”和“写浏览器”
+// 两条链路拆开，避免单个慢 client 直接把源读循环卡住。这里仍然保持有界缓存，预算耗尽后
+// 就关闭当前 transport，让上层按既有 snapshot/reconnect 路径恢复。
+const DAEMON_DATA_INGRESS_FRAME_CAPACITY: usize = 2048;
+const DAEMON_DATA_INGRESS_BYTE_BUDGET: usize = WEBSOCKET_MAX_FRAME_SIZE;
+#[cfg(not(test))]
+const DAEMON_DATA_INGRESS_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+#[cfg(test)]
+const DAEMON_DATA_INGRESS_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
 type ConnectionId = u64;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -402,6 +415,174 @@ impl RelayState {
     }
 }
 
+#[derive(Debug)]
+struct DaemonDataIngress {
+    sender: mpsc::Sender<OpaqueFrame>,
+    byte_budget: Arc<DataQueueByteBudget>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DaemonDataIngressError {
+    Backpressured,
+    Closed,
+}
+
+impl DaemonDataIngress {
+    fn new(frame_capacity: usize, byte_budget: usize) -> (Self, mpsc::Receiver<OpaqueFrame>) {
+        let (sender, receiver) = mpsc::channel(frame_capacity);
+        (
+            Self {
+                sender,
+                byte_budget: Arc::new(DataQueueByteBudget::new(byte_budget)),
+            },
+            receiver,
+        )
+    }
+
+    fn with_limits(
+        frame_capacity: usize,
+        byte_budget: usize,
+    ) -> (Self, mpsc::Receiver<OpaqueFrame>) {
+        Self::new(frame_capacity, byte_budget)
+    }
+
+    fn try_enqueue(&self, frame: OpaqueFrame) -> Result<(), DaemonDataIngressError> {
+        let queued_bytes = frame.len();
+        if self.byte_budget.exceeds_limit(queued_bytes)
+            || !self.byte_budget.try_reserve(queued_bytes)
+        {
+            return Err(DaemonDataIngressError::Backpressured);
+        }
+        match self.sender.try_send(frame) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(frame)) => {
+                self.byte_budget.release(frame.len());
+                Err(DaemonDataIngressError::Backpressured)
+            }
+            Err(mpsc::error::TrySendError::Closed(frame)) => {
+                self.byte_budget.release(frame.len());
+                Err(DaemonDataIngressError::Closed)
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct DaemonDataForwardTask {
+    ingress: DaemonDataIngress,
+    join_handle: tokio::task::JoinHandle<()>,
+    stats: Arc<DaemonDataForwardStats>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DaemonDataForwardDrainOutcome {
+    Drained,
+    TimedOut,
+}
+
+#[derive(Debug, Default)]
+struct DaemonDataForwardStats {
+    attempted: AtomicUsize,
+    delivered: AtomicUsize,
+    dropped: AtomicUsize,
+}
+
+impl DaemonDataForwardStats {
+    fn record(&self, report: ForwardReport) {
+        self.attempted
+            .fetch_add(report.attempted, Ordering::Relaxed);
+        self.delivered
+            .fetch_add(report.delivered, Ordering::Relaxed);
+        self.dropped.fetch_add(report.dropped, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> ForwardReport {
+        ForwardReport {
+            attempted: self.attempted.load(Ordering::Relaxed),
+            delivered: self.delivered.load(Ordering::Relaxed),
+            dropped: self.dropped.load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl DaemonDataForwardTask {
+    fn spawn(state: RelayState, registration: ConnectionRegistration) -> Self {
+        Self::spawn_with_limits(
+            state,
+            registration,
+            DAEMON_DATA_INGRESS_FRAME_CAPACITY,
+            DAEMON_DATA_INGRESS_BYTE_BUDGET,
+        )
+    }
+
+    fn spawn_with_limits(
+        state: RelayState,
+        registration: ConnectionRegistration,
+        frame_capacity: usize,
+        byte_budget: usize,
+    ) -> Self {
+        let stats = Arc::new(DaemonDataForwardStats::default());
+        let (ingress, receiver) = DaemonDataIngress::with_limits(frame_capacity, byte_budget);
+        let join_handle = tokio::spawn(run_daemon_data_forwarder(
+            state,
+            registration,
+            receiver,
+            ingress.byte_budget.clone(),
+            stats.clone(),
+        ));
+        Self {
+            ingress,
+            join_handle,
+            stats,
+        }
+    }
+
+    fn ingress(&self) -> &DaemonDataIngress {
+        &self.ingress
+    }
+
+    async fn shutdown(self) -> (DaemonDataForwardDrainOutcome, ForwardReport) {
+        let DaemonDataForwardTask {
+            ingress,
+            mut join_handle,
+            stats,
+        } = self;
+        // 中文注释：退出时先关闭 ingress sender，让 forward task 在有限时间内把 relay
+        // 已经收下的尾帧继续推进到 client outbound queue，避免源 socket 一关就截断尾部输出。
+        drop(ingress);
+        let drain_deadline = tokio::time::sleep(DAEMON_DATA_INGRESS_DRAIN_TIMEOUT);
+        tokio::pin!(drain_deadline);
+        let outcome = tokio::select! {
+            result = &mut join_handle => {
+                if let Err(error) = result {
+                    warn!(?error, "relay daemon data forward task exited with join error");
+                }
+                DaemonDataForwardDrainOutcome::Drained
+            }
+            _ = &mut drain_deadline => {
+                join_handle.abort();
+                let _ = join_handle.await;
+                DaemonDataForwardDrainOutcome::TimedOut
+            }
+        };
+        (outcome, stats.snapshot())
+    }
+}
+
+async fn run_daemon_data_forwarder(
+    state: RelayState,
+    registration: ConnectionRegistration,
+    mut receiver: mpsc::Receiver<OpaqueFrame>,
+    byte_budget: Arc<DataQueueByteBudget>,
+    stats: Arc<DaemonDataForwardStats>,
+) {
+    while let Some(frame) = receiver.recv().await {
+        byte_budget.release(frame.len());
+        let report = state.forward_from(&registration, frame).await;
+        stats.record(report);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RoutePrelude {
     server_id: ServerId,
@@ -484,6 +665,8 @@ pub async fn handle_socket(mut socket: WebSocket, state: RelayState) {
     // writer 一旦写失败，会直接关闭 endpoint signal，主循环只认这个 signal 退出，
     // 不再依赖另一条 outcome 队列，避免持续入站时把 writer 失败饿住。
     let writer_task = pipe_pump.spawn_writer(sender, server_id, role, registration.id);
+    let daemon_data_forwarder = (role == ConnectionRole::DaemonData)
+        .then(|| DaemonDataForwardTask::spawn(state.clone(), registration.clone()));
 
     if role == ConnectionRole::DaemonData {
         // 中文注释：预配对帧 flush 会写入当前 daemon data 的 outbound data 队列。
@@ -546,6 +729,7 @@ pub async fn handle_socket(mut socket: WebSocket, state: RelayState) {
                     &state,
                     &registration,
                     inbound,
+                    daemon_data_forwarder.as_ref(),
                 ).await;
                 traffic.record_forward(forward_report.report);
                 if !forward_report.should_continue {
@@ -555,6 +739,18 @@ pub async fn handle_socket(mut socket: WebSocket, state: RelayState) {
         }
     }
 
+    if let Some(forwarder) = daemon_data_forwarder {
+        let (drain_outcome, forward_stats) = forwarder.shutdown().await;
+        traffic.record_forward(forward_stats);
+        if drain_outcome == DaemonDataForwardDrainOutcome::TimedOut {
+            warn!(
+                server_id = %server_id.0,
+                connection_id = registration.id,
+                timeout_ms = DAEMON_DATA_INGRESS_DRAIN_TIMEOUT.as_millis(),
+                "relay daemon data forward task drain timed out during socket shutdown"
+            );
+        }
+    }
     writer_task.abort();
     state.unregister(&registration);
     if traffic.has_activity() {
@@ -578,6 +774,7 @@ async fn handle_inbound_message(
     state: &RelayState,
     registration: &ConnectionRegistration,
     message: Message,
+    daemon_data_forwarder: Option<&DaemonDataForwardTask>,
 ) -> RelayForwardOutcome {
     match message {
         Message::Text(text) => {
@@ -595,7 +792,15 @@ async fn handle_inbound_message(
                     dropped: 1,
                 });
             }
-            forward_opaque(state, registration, OpaqueFrame::Text(text)).await
+            if registration.role == ConnectionRole::DaemonData {
+                queue_daemon_data_ingress_frame(
+                    registration,
+                    daemon_data_forwarder,
+                    OpaqueFrame::Text(text),
+                )
+            } else {
+                forward_opaque(state, registration, OpaqueFrame::Text(text)).await
+            }
         }
         Message::Binary(bytes) => {
             if let Err(len) = reject_oversized_frame(bytes.len()) {
@@ -612,7 +817,15 @@ async fn handle_inbound_message(
                     dropped: 1,
                 });
             }
-            forward_opaque(state, registration, OpaqueFrame::Binary(bytes)).await
+            if registration.role == ConnectionRole::DaemonData {
+                queue_daemon_data_ingress_frame(
+                    registration,
+                    daemon_data_forwarder,
+                    OpaqueFrame::Binary(bytes),
+                )
+            } else {
+                forward_opaque(state, registration, OpaqueFrame::Binary(bytes)).await
+            }
         }
         Message::Ping(payload) => {
             if registration.role == ConnectionRole::DaemonData
@@ -634,6 +847,51 @@ async fn handle_inbound_message(
             attempted: 0,
             delivered: 0,
             dropped: 0,
+        }),
+    }
+}
+
+fn queue_daemon_data_ingress_frame(
+    registration: &ConnectionRegistration,
+    daemon_data_forwarder: Option<&DaemonDataForwardTask>,
+    frame: OpaqueFrame,
+) -> RelayForwardOutcome {
+    let Some(forwarder) = daemon_data_forwarder else {
+        warn!(
+            server_id = %registration.server_id.0,
+            connection_id = registration.id,
+            "relay daemon data ingress task missing"
+        );
+        return RelayForwardOutcome::close_with(ForwardReport {
+            attempted: 1,
+            delivered: 0,
+            dropped: 1,
+        });
+    };
+    match forwarder.ingress().try_enqueue(frame) {
+        Ok(()) => RelayForwardOutcome::continue_with(ForwardReport {
+            attempted: 0,
+            delivered: 0,
+            dropped: 0,
+        }),
+        Err(DaemonDataIngressError::Backpressured) => {
+            warn!(
+                server_id = %registration.server_id.0,
+                connection_id = registration.id,
+                frame_capacity = DAEMON_DATA_INGRESS_FRAME_CAPACITY,
+                byte_budget = DAEMON_DATA_INGRESS_BYTE_BUDGET,
+                "relay daemon data ingress queue exhausted"
+            );
+            RelayForwardOutcome::close_with(ForwardReport {
+                attempted: 1,
+                delivered: 0,
+                dropped: 1,
+            })
+        }
+        Err(DaemonDataIngressError::Closed) => RelayForwardOutcome::close_with(ForwardReport {
+            attempted: 1,
+            delivered: 0,
+            dropped: 1,
         }),
     }
 }
@@ -2273,7 +2531,8 @@ mod tests {
             handle_inbound_message(
                 &state,
                 &daemon_data,
-                Message::Ping(encode_relay_data_control(&RelayControlEnvelope::DataReady).unwrap())
+                Message::Ping(encode_relay_data_control(&RelayControlEnvelope::DataReady).unwrap()),
+                None,
             )
             .await
             .report,
@@ -2451,7 +2710,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn slow_client_data_queue_closes_client_and_data_pipe() {
+    async fn slow_client_data_queue_backpressures_daemon_data_without_immediate_disconnect() {
         let state = RelayState::default();
         let server_id = server_id(1);
         let (control_tx, mut control_rx) = channel();
@@ -2483,36 +2742,236 @@ mod tests {
         client_tx
             .try_send_data(RelayOutbound::Frame(OpaqueFrame::Text("queued".to_owned())))
             .unwrap();
-        let report = state
-            .forward_from(&daemon_data, OpaqueFrame::Text("overflow".to_owned()))
-            .await;
+        let forward_task = tokio::spawn({
+            let state = state.clone();
+            let daemon_data = daemon_data.clone();
+            async move {
+                state
+                    .forward_from(&daemon_data, OpaqueFrame::Text("overflow".to_owned()))
+                    .await
+            }
+        });
 
+        // 中文注释：第一次 frame 占满 client data 队列时，下一个下行 frame 不应立刻触发
+        // client/data pipe 被关闭；它应该先在 relay 内等待浏览器 writer 消费。
+        let client_closed = client_close_rx.closed();
+        let data_closed = data_close_rx.closed();
+        let control_closed = control_close_rx.closed();
+        tokio::pin!(client_closed);
+        tokio::pin!(data_closed);
+        tokio::pin!(control_closed);
+        assert!(
+            timeout(Duration::from_millis(30), &mut client_closed)
+                .await
+                .is_err()
+        );
+        assert!(
+            timeout(Duration::from_millis(30), &mut data_closed)
+                .await
+                .is_err()
+        );
+        assert!(
+            timeout(Duration::from_millis(30), &mut control_closed)
+                .await
+                .is_err()
+        );
+
+        assert_eq!(
+            client_rx.try_recv().unwrap(),
+            RelayOutbound::Frame(OpaqueFrame::Text("queued".to_owned()))
+        );
+        let report = timeout(Duration::from_millis(50), forward_task)
+            .await
+            .expect("forward task should finish after queue drains")
+            .expect("forward task should join cleanly");
         assert_eq!(
             report,
             ForwardReport {
                 attempted: 1,
-                delivered: 0,
-                dropped: 1,
+                delivered: 1,
+                dropped: 0,
             }
         );
-        assert_eq!(data_rx.try_recv().unwrap(), RelayOutbound::Close);
-        assert_eq!(control_rx.try_recv().unwrap_err(), TryRecvError::Empty);
-        timeout(Duration::from_millis(50), client_close_rx.closed())
-            .await
-            .expect("slow client should be closed");
-        timeout(Duration::from_millis(50), data_close_rx.closed())
-            .await
-            .expect("slow client cleanup should close paired daemon data pipe");
-        assert!(!state.has_client(server_id, RelayClientId(client.id)));
-        assert!(
-            timeout(Duration::from_millis(30), control_close_rx.closed())
-                .await
-                .is_err()
+        assert_eq!(
+            client_rx.try_recv().unwrap(),
+            RelayOutbound::Frame(OpaqueFrame::Text("overflow".to_owned()))
         );
-        assert_eq!(client_rx.try_recv().unwrap(), RelayOutbound::Close);
+        assert_eq!(control_rx.try_recv().unwrap_err(), TryRecvError::Empty);
+        assert_eq!(data_rx.try_recv().unwrap_err(), TryRecvError::Empty);
+        assert!(state.has_client(server_id, RelayClientId(client.id)));
+    }
+
+    #[tokio::test]
+    async fn daemon_data_ingress_keeps_ping_path_live_while_client_queue_is_blocked() {
+        let state = RelayState::default();
+        let server_id = server_id(1);
+        let (control_tx, mut control_rx) = channel();
+        let (client_tx, mut client_rx) = channel_with_data_capacity(1);
+        let (data_tx, mut data_rx) = channel();
+
+        state
+            .register(server_id, ConnectionRole::DaemonControl, control_tx)
+            .unwrap();
+        let (_client, client_id, data_token) =
+            register_pending_client(&state, server_id, client_tx.clone(), &mut control_rx);
+        let daemon_data = state
+            .register_route(
+                &RoutePrelude {
+                    server_id,
+                    route_role: RouteRole::DaemonData,
+                    connection_role: ConnectionRole::DaemonData,
+                    route_generation: Some(test_route_generation(server_id)),
+                    client_id: Some(client_id),
+                    data_token: Some(data_token),
+                },
+                data_tx,
+            )
+            .unwrap();
+        let forwarder = DaemonDataForwardTask::spawn_with_limits(
+            state.clone(),
+            daemon_data.clone(),
+            4,
+            WEBSOCKET_MAX_FRAME_SIZE,
+        );
+
+        client_tx
+            .try_send_data(RelayOutbound::Frame(OpaqueFrame::Text("queued".to_owned())))
+            .unwrap();
+        let data_report = handle_inbound_message(
+            &state,
+            &daemon_data,
+            Message::Text("overflow".to_owned()),
+            Some(&forwarder),
+        )
+        .await;
+        assert_eq!(
+            data_report.report,
+            ForwardReport {
+                attempted: 0,
+                delivered: 0,
+                dropped: 0,
+            }
+        );
+
+        let ping_report = handle_inbound_message(
+            &state,
+            &daemon_data,
+            Message::Ping(b"keepalive".to_vec()),
+            Some(&forwarder),
+        )
+        .await;
+        assert!(ping_report.should_continue);
+        assert_eq!(
+            ping_report.report,
+            ForwardReport {
+                attempted: 1,
+                delivered: 1,
+                dropped: 0,
+            }
+        );
+        assert_eq!(
+            data_rx.try_recv().unwrap(),
+            RelayOutbound::Pong(b"keepalive".to_vec())
+        );
         assert_eq!(
             client_rx.try_recv().unwrap(),
             RelayOutbound::Frame(OpaqueFrame::Text("queued".to_owned()))
+        );
+
+        let drained = timeout(Duration::from_millis(50), client_rx.data.recv())
+            .await
+            .expect("queued daemon data frame should flush after client queue drains")
+            .expect("client data channel should stay open");
+        assert_eq!(
+            drained,
+            RelayOutbound::Frame(OpaqueFrame::Text("overflow".to_owned()))
+        );
+
+        let (drain_outcome, forward_stats) = forwarder.shutdown().await;
+        assert_eq!(drain_outcome, DaemonDataForwardDrainOutcome::Drained);
+        assert_eq!(
+            forward_stats,
+            ForwardReport {
+                attempted: 1,
+                delivered: 1,
+                dropped: 0,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_data_forwarder_drains_queued_tail_frames_before_shutdown() {
+        let state = RelayState::default();
+        let server_id = server_id(1);
+        let (control_tx, mut control_rx) = channel();
+        let (client_tx, mut client_rx) = channel_with_data_capacity(1);
+        let (data_tx, _data_rx) = channel();
+
+        state
+            .register(server_id, ConnectionRole::DaemonControl, control_tx)
+            .unwrap();
+        let (_client, client_id, data_token) =
+            register_pending_client(&state, server_id, client_tx.clone(), &mut control_rx);
+        let daemon_data = state
+            .register_route(
+                &RoutePrelude {
+                    server_id,
+                    route_role: RouteRole::DaemonData,
+                    connection_role: ConnectionRole::DaemonData,
+                    route_generation: Some(test_route_generation(server_id)),
+                    client_id: Some(client_id),
+                    data_token: Some(data_token),
+                },
+                data_tx,
+            )
+            .unwrap();
+        let forwarder = DaemonDataForwardTask::spawn_with_limits(
+            state.clone(),
+            daemon_data.clone(),
+            4,
+            WEBSOCKET_MAX_FRAME_SIZE,
+        );
+
+        client_tx
+            .try_send_data(RelayOutbound::Frame(OpaqueFrame::Text("queued".to_owned())))
+            .unwrap();
+        let enqueue_report = handle_inbound_message(
+            &state,
+            &daemon_data,
+            Message::Text("tail".to_owned()),
+            Some(&forwarder),
+        )
+        .await;
+        assert_eq!(
+            enqueue_report.report,
+            ForwardReport {
+                attempted: 0,
+                delivered: 0,
+                dropped: 0,
+            }
+        );
+
+        assert_eq!(
+            client_rx.try_recv().unwrap(),
+            RelayOutbound::Frame(OpaqueFrame::Text("queued".to_owned()))
+        );
+        let (drain_outcome, forward_stats) = forwarder.shutdown().await;
+        assert_eq!(drain_outcome, DaemonDataForwardDrainOutcome::Drained);
+        assert_eq!(
+            forward_stats,
+            ForwardReport {
+                attempted: 1,
+                delivered: 1,
+                dropped: 0,
+            }
+        );
+        let drained = timeout(Duration::from_millis(50), client_rx.data.recv())
+            .await
+            .expect("queued tail frame should flush during shutdown")
+            .expect("client data channel should stay open");
+        assert_eq!(
+            drained,
+            RelayOutbound::Frame(OpaqueFrame::Text("tail".to_owned()))
         );
     }
 
