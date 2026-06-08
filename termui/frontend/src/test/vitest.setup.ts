@@ -28,6 +28,8 @@ afterEach(() => {
     .__TERMD_TEST_KEEP_GHOSTTY_VIEWPORT_AT_TOP_AFTER_RESIZE__;
   delete (globalThis as { __TERMD_TEST_SERIALIZE_GHOSTTY_WRITES__?: boolean })
     .__TERMD_TEST_SERIALIZE_GHOSTTY_WRITES__;
+  delete (globalThis as { __TERMD_TEST_SUPPRESS_GHOSTTY_WRITE_CALLBACK__?: boolean })
+    .__TERMD_TEST_SUPPRESS_GHOSTTY_WRITE_CALLBACK__;
   delete (globalThis as { __TERMD_TEST_GHOSTTY_SKIP_NATIVE_FOCUS__?: boolean })
     .__TERMD_TEST_GHOSTTY_SKIP_NATIVE_FOCUS__;
   delete (globalThis as { __TERMD_TEST_DEFER_OUTPUT_RESET_APPLIED__?: (confirm: () => void) => void })
@@ -323,6 +325,10 @@ vi.mock("ghostty-web", () => {
         (globalThis as { __TERMD_TEST_DEFER_GHOSTTY_BUFFER_UNTIL_WRITE_CALLBACK__?: boolean })
           .__TERMD_TEST_DEFER_GHOSTTY_BUFFER_UNTIL_WRITE_CALLBACK__,
       );
+      const suppressWriteCallback = Boolean(
+        (globalThis as { __TERMD_TEST_SUPPRESS_GHOSTTY_WRITE_CALLBACK__?: boolean })
+          .__TERMD_TEST_SUPPRESS_GHOSTTY_WRITE_CALLBACK__,
+      );
       const keepViewportAtTop = Boolean(
         (globalThis as { __TERMD_TEST_KEEP_GHOSTTY_VIEWPORT_AT_TOP_AFTER_WRITE__?: boolean })
           .__TERMD_TEST_KEEP_GHOSTTY_VIEWPORT_AT_TOP_AFTER_WRITE__,
@@ -364,7 +370,9 @@ vi.mock("ghostty-web", () => {
         if (deferBufferUntilCallback) {
           applyBufferEffects();
         }
-        callback?.();
+        if (!suppressWriteCallback) {
+          callback?.();
+        }
         return;
       }
 
@@ -387,7 +395,9 @@ vi.mock("ghostty-web", () => {
             if (deferBufferUntilCallback) {
               applyBufferEffects();
             }
-            callback?.();
+            if (!suppressWriteCallback) {
+              callback?.();
+            }
           });
         });
       });

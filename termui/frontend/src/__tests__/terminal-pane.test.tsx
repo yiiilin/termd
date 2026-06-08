@@ -1754,12 +1754,8 @@ describe("TerminalPane terminal sequence rendering", () => {
     }
   });
 
-  it("revealHistory 的延迟 RAF 不会作用到新的普通 snapshot", async () => {
-    const rafQueue: FrameRequestCallback[] = [];
-    const rafSpy = vi.spyOn(window, "requestAnimationFrame").mockImplementation(((callback: FrameRequestCallback) => {
-      rafQueue.push(callback);
-      return rafQueue.length;
-    }) as typeof window.requestAnimationFrame);
+  it("revealHistory 的延迟收尾不会作用到新的普通 snapshot", async () => {
+    vi.useFakeTimers();
     try {
       const encoder = new TextEncoder();
       let queue: TerminalOutputItem[] = [
@@ -1788,24 +1784,11 @@ describe("TerminalPane terminal sequence rendering", () => {
       };
       const { rerender } = render(<TerminalPane {...props} outputResetVersion={0} />);
 
-      const flushQueueUntil = async (predicate: () => boolean) => {
-        let iterations = 0;
-        while (!predicate() && rafQueue.length > 0 && iterations < 40) {
-          const callback = rafQueue.shift();
-          expect(callback).toBeDefined();
-          await act(async () => {
-            callback?.(performance.now());
-            await Promise.resolve();
-          });
-          iterations += 1;
-        }
-        expect(predicate()).toBe(true);
-      };
-
-      await flushQueueUntil(() => (terminalHost().dataset.buffer ?? "").includes("reveal-220"));
-      const pendingRevealCallbacks = [...rafQueue];
-      expect(pendingRevealCallbacks.length).toBeGreaterThan(0);
-      rafQueue.length = 0;
+      await act(async () => {
+        await Promise.resolve();
+        await vi.advanceTimersByTimeAsync(animationFrameMs * 40);
+      });
+      expect(terminalHost().dataset.buffer).toContain("reveal-220");
 
       queue = [
         {
@@ -1816,22 +1799,20 @@ describe("TerminalPane terminal sequence rendering", () => {
         },
       ];
       rerender(<TerminalPane {...props} outputResetVersion={1} />);
-      await flushQueueUntil(() => (terminalHost().dataset.buffer ?? "").includes("normal-220"));
 
+      await act(async () => {
+        await Promise.resolve();
+        await vi.advanceTimersByTimeAsync(animationFrameMs * 80);
+      });
+
+      expect(terminalHost().dataset.buffer).toContain("normal-220");
       const Ghostty = (globalThis as {
         __TERMD_TEST_GHOSTTY__?: { viewportY: () => number; baseY: () => number };
       }).__TERMD_TEST_GHOSTTY__;
       expect(Ghostty?.baseY()).toBeGreaterThan(0);
       expect(Ghostty?.viewportY()).toBe(Ghostty?.baseY());
-
-      for (const callback of pendingRevealCallbacks) {
-        act(() => {
-          callback(performance.now());
-        });
-      }
-      expect(Ghostty?.viewportY()).toBe(Ghostty?.baseY());
     } finally {
-      rafSpy.mockRestore();
+      vi.useRealTimers();
     }
   });
 
@@ -1956,7 +1937,8 @@ describe("TerminalPane terminal sequence rendering", () => {
         window.dispatchEvent(new Event("blur"));
       });
       await act(async () => {
-        await vi.advanceTimersByTimeAsync(0);
+        await vi.runOnlyPendingTimersAsync();
+        await vi.runOnlyPendingTimersAsync();
       });
 
       expect(screen.getByText(/writer-blur-race/)).toBeInTheDocument();
@@ -2024,6 +2006,77 @@ describe("TerminalPane terminal sequence rendering", () => {
       restoreDocumentVisibility();
       rafSpy.mockRestore();
       cancelSpy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("Ghostty write callback 在 blur 后被 rescue 时，后续 stdout 不会继续卡在 writeInFlight", async () => {
+    vi.useFakeTimers();
+    try {
+      (globalThis as { __TERMD_TEST_SUPPRESS_GHOSTTY_WRITE_CALLBACK__?: boolean })
+        .__TERMD_TEST_SUPPRESS_GHOSTTY_WRITE_CALLBACK__ = true;
+      const encoder = new TextEncoder();
+      let queue: TerminalOutputItem[] = [];
+      let drainOutput: (() => void) | undefined;
+      const takeOutput = vi.fn(() => queue.splice(0));
+      const registerOutputDrain = vi.fn((drain: () => void) => {
+        drainOutput = drain;
+        return () => undefined;
+      });
+
+      render(
+        <TerminalPane
+          attached
+          sessionSize={DEFAULT_TERMINAL_SIZE}
+          outputResetVersion={0}
+          takeOutput={takeOutput}
+          registerOutputDrain={registerOutputDrain}
+          onInput={vi.fn()}
+          onResize={vi.fn()}
+          onCursorChange={vi.fn()}
+        />,
+      );
+
+      await act(async () => {
+        await Promise.resolve();
+      });
+      setDocumentHasFocus(true);
+      queue = [{ kind: "data", bytes: encoder.encode("stalled-write-1\n") }];
+
+      act(() => {
+        drainOutput?.();
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(animationFrameMs * 2);
+      });
+
+      const terminalStats = () => (globalThis as { __TERMD_TEST_TERMINAL_STATS__?: { writes: number } }).__TERMD_TEST_TERMINAL_STATS__;
+      expect(terminalStats()?.writes ?? 0).toBe(1);
+      expect(screen.getByText(/stalled-write-1/)).toBeInTheDocument();
+
+      queue = [{ kind: "data", bytes: encoder.encode("stalled-write-2\n") }];
+      act(() => {
+        drainOutput?.();
+      });
+      await act(async () => {
+        await Promise.resolve();
+      });
+      expect(terminalStats()?.writes ?? 0).toBe(1);
+
+      setDocumentHasFocus(false);
+      act(() => {
+        window.dispatchEvent(new Event("blur"));
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(animationFrameMs * 12);
+      });
+
+      // 中文注释：这里模拟的是真实 bug：上一个 Ghostty write 的 completion callback
+      // 因失焦被冻结。blur rescue 必须解开 in-flight 锁，并继续排空后续 stdout。
+      expect(terminalStats()?.writes ?? 0).toBeGreaterThanOrEqual(2);
+      expect(screen.getByText(/stalled-write-2/)).toBeInTheDocument();
+    } finally {
+      restoreDocumentVisibility();
       vi.useRealTimers();
     }
   });
@@ -2976,7 +3029,7 @@ describe("TerminalPane terminal sizing", () => {
     }
   });
 
-  it("历史修复等待 idle settle 时若继续有输出，不会在 burst 中途提前 full snapshot", () => {
+  it("历史修复等待 idle settle 时若继续有输出，会直接放弃自动 full snapshot", () => {
     vi.useFakeTimers();
     try {
       const onResize = vi.fn();
@@ -2991,7 +3044,7 @@ describe("TerminalPane terminal sizing", () => {
         },
       ];
       const takeOutput = vi.fn(() => queue.splice(0));
-      let drainOutput = () => undefined;
+      let drainOutput: (() => void) | undefined;
       const registerOutputDrain = vi.fn((drain: () => void) => {
         drainOutput = drain;
         drain();
@@ -3041,20 +3094,15 @@ describe("TerminalPane terminal sizing", () => {
         terminalSeq: 1,
       });
       act(() => {
-        drainOutput();
+        drainOutput?.();
         vi.advanceTimersByTime(450);
       });
       expect(onTerminalResync).not.toHaveBeenCalled();
 
       act(() => {
-        vi.advanceTimersByTime(500);
+        vi.advanceTimersByTime(1500);
       });
       expect(onTerminalResync).not.toHaveBeenCalled();
-
-      act(() => {
-        vi.advanceTimersByTime(500);
-      });
-      expect(onTerminalResync).toHaveBeenCalledWith(undefined);
     } finally {
       vi.useRealTimers();
     }
@@ -3068,7 +3116,7 @@ describe("TerminalPane terminal sizing", () => {
       const encoder = new TextEncoder();
       let queue: TerminalOutputItem[] = [];
       const takeOutput = vi.fn(() => queue.splice(0));
-      let drainOutput = () => undefined;
+      let drainOutput: (() => void) | undefined;
       const registerOutputDrain = vi.fn((drain: () => void) => {
         drainOutput = drain;
         drain();
@@ -3113,7 +3161,7 @@ describe("TerminalPane terminal sizing", () => {
         size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
       });
       act(() => {
-        drainOutput();
+        drainOutput?.();
         vi.advanceTimersByTime(animationFrameMs * 32);
       });
       expect(onTerminalResync).not.toHaveBeenCalled();

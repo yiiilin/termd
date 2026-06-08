@@ -546,6 +546,72 @@ function ghosttyRawViewportToRendererLine(maxViewportY: number, rawViewportFromB
   return clampLine(maxViewportY - rawViewportFromBottom, 0, maxViewportY);
 }
 
+function ghosttyDocumentAnimationFrameUnsafe(): boolean {
+  return typeof document !== "undefined" && document.visibilityState === "hidden";
+}
+
+function scheduleGhosttyWriteCallbackRescue(callback: (() => void) | undefined): (() => void) | undefined {
+  if (!callback) {
+    return undefined;
+  }
+  let settled = false;
+  let rescueTimer: number | undefined;
+  const clearRescueTimer = () => {
+    if (rescueTimer !== undefined) {
+      window.clearTimeout(rescueTimer);
+      rescueTimer = undefined;
+    }
+  };
+  const handleVisibilityChange = () => {
+    if (document.visibilityState === "hidden") {
+      armRescueTimer();
+    }
+  };
+  const handleWindowBlur = () => {
+    armRescueTimer();
+  };
+  const cleanup = () => {
+    clearRescueTimer();
+    if (typeof document !== "undefined") {
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    }
+    if (typeof window !== "undefined") {
+      window.removeEventListener("blur", handleWindowBlur);
+    }
+  };
+  const settle = () => {
+    if (settled) {
+      return;
+    }
+    settled = true;
+    cleanup();
+    callback();
+  };
+  const armRescueTimer = () => {
+    if (settled || rescueTimer !== undefined) {
+      return;
+    }
+    // 中文注释：ghostty-web upstream 的 write callback 直接挂在 requestAnimationFrame 上。
+    // 页面 hidden 或窗口 blur 之后，这个 callback 可能被浏览器冻结，导致上层 writer
+    // 永远停在“有一个 write 在飞行中”。这里补一个 timer rescue，只兜底 callback
+    // 的完成通知，不改变 Ghostty 自己的解析/渲染顺序。
+    rescueTimer = window.setTimeout(() => {
+      rescueTimer = undefined;
+      settle();
+    }, 0);
+  };
+  if (typeof document !== "undefined") {
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+  }
+  if (typeof window !== "undefined") {
+    window.addEventListener("blur", handleWindowBlur);
+  }
+  if (ghosttyDocumentAnimationFrameUnsafe()) {
+    armRescueTimer();
+  }
+  return settle;
+}
+
 function adaptGhosttyTerminal(
   terminal: InstanceType<typeof Terminal>,
   cleanupDebugBufferMirror: () => void = () => undefined,
@@ -631,11 +697,14 @@ function adaptGhosttyTerminal(
         const maxViewportAfterWrite = ghosttyMaxViewportY(runtimeTerminal);
         scrollToLine(ghosttyRendererLineToRawViewport(maxViewportAfterWrite, rendererViewportLine));
       };
-      write(normalizedData, () => {
+      const settleWriteCallback = scheduleGhosttyWriteCallbackRescue(() => {
         restoreScrollbackPosition();
         debugTerminal.__termdDebugBufferSync?.();
         writeParsedListeners.forEach((listener) => listener());
         callback?.();
+      });
+      write(normalizedData, () => {
+        settleWriteCallback?.();
       });
       restoreScrollbackPosition();
     },
