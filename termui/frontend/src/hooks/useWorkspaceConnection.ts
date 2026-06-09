@@ -123,21 +123,33 @@ function waitForConnectionRetryDelay(delayMs: number, signal?: AbortSignal): Pro
 export function useWorkspaceConnection(options: UseWorkspaceConnectionOptions) {
   const attachClientRef = useRef<DirectClient | undefined>(undefined);
   const pendingAttachClientRef = useRef<DirectClient | undefined>(undefined);
+  const workspaceClientRef = useRef<DirectClient | undefined>(undefined);
   const workspaceClientPromiseRef = useRef<Promise<DirectClient> | undefined>(undefined);
   const workspaceClientAbortControllerRef = useRef<AbortController | undefined>(undefined);
   const workspaceClientGenerationRef = useRef(0);
   const sessionPermissionIdsRef = useRef<Set<UUID>>(new Set());
+  const workspaceSessionPermissionIdsRef = useRef<Set<UUID>>(new Set());
   const connectionAutoRetryTimerRef = useRef<number | undefined>(undefined);
   const connectionAutoRetryKeyRef = useRef<string | undefined>(undefined);
   const connectionAutoRetryAttemptsRef = useRef(0);
 
-  const closeWorkspaceClient = useCallback(() => {
+  const closeWorkspaceMetadataClient = useCallback(() => {
     workspaceClientGenerationRef.current += 1;
     workspaceClientAbortControllerRef.current?.abort();
     workspaceClientAbortControllerRef.current = undefined;
+    workspaceClientPromiseRef.current = undefined;
+    workspaceSessionPermissionIdsRef.current.clear();
+    const workspaceClient = workspaceClientRef.current;
+    workspaceClientRef.current = undefined;
+    if (workspaceClient) {
+      workspaceClient.interruptReceiveWaiters();
+      workspaceClient.close();
+    }
+  }, []);
+
+  const closeAttachClient = useCallback(() => {
     options.receiveLoopActiveRef.current = false;
     options.receiveLoopGenerationRef.current += 1;
-    workspaceClientPromiseRef.current = undefined;
     const clients = new Set<DirectClient>();
     if (pendingAttachClientRef.current) {
       clients.add(pendingAttachClientRef.current);
@@ -158,6 +170,19 @@ export function useWorkspaceConnection(options: UseWorkspaceConnectionOptions) {
     options.receiveLoopActiveRef,
     options.receiveLoopGenerationRef,
   ]);
+
+  const closeWorkspaceClient = useCallback(() => {
+    closeWorkspaceMetadataClient();
+    closeAttachClient();
+  }, [closeAttachClient, closeWorkspaceMetadataClient]);
+
+  const claimAttachClient = useCallback((client: DirectClient) => {
+    // 中文注释：terminal attach/create/reconnect 一旦成功，这条 WebSocket 就成为当前
+    // session 的唯一主连接。任何旧 metadata sidecar（包括尚未落地的 pending connect）
+    // 都必须立刻作废，避免迟到 promise 再把孤儿连接写回 workspaceClientRef。
+    closeWorkspaceMetadataClient();
+    attachClientRef.current = client;
+  }, [closeWorkspaceMetadataClient]);
 
   const authenticatedClient = useCallback(async (timeoutMs = options.requestTimeoutMs, signal?: AbortSignal) => {
     const server = options.activeServer;
@@ -230,24 +255,42 @@ export function useWorkspaceConnection(options: UseWorkspaceConnectionOptions) {
   ]);
 
   const authenticatedWorkspaceClient = useCallback(async (timeoutMs = options.defaultWorkspaceTimeoutMs) => {
-    const existing = attachClientRef.current;
-    if (existing && !existing.isClosed) {
-      return existing;
+    const attachedClient = attachClientRef.current;
+    if (attachedClient && !attachedClient.isClosed) {
+      // 中文注释：一旦当前 session 已 attach，普通 metadata RPC 必须回到同一条
+      // terminal WebSocket 上。这样 status/files/git 的超时才只会表现为 segment
+      // 级失败，而不会在后台悄悄多留一条独立 metadata 连接。
+      if (
+        workspaceClientPromiseRef.current ||
+        (workspaceClientRef.current && workspaceClientRef.current !== attachedClient)
+      ) {
+        closeWorkspaceMetadataClient();
+      }
+      return attachedClient;
     }
-    if (!existing && options.attachedSessionRef.current) {
-      // 中文注释：终端重连窗口里 attached session 仍存在时，普通 metadata 不能抢先新建
-      // 认证-only 连接；否则会把真正的 terminal reconnect 主连接挤掉。
-      throw new ProtocolClientError("connection_closed", "terminal connection is reconnecting");
-    }
-    if (existing?.isClosed) {
+    if (attachedClient?.isClosed) {
+      // 中文注释：attach transport 已断开但 attached session 事实仍在时，旁路 metadata
+      // 不能抢先新建另一条认证连接；必须让终端重连状态机先接管当前 session。
+      closeWorkspaceMetadataClient();
       if (options.attachedSessionRef.current) {
         const error = new ProtocolClientError("connection_closed", "terminal connection closed");
-        if (options.onBrokenAttachedClient(existing, error)) {
+        if (options.onBrokenAttachedClient(attachedClient, error)) {
           throw error;
         }
       }
       attachClientRef.current = undefined;
       sessionPermissionIdsRef.current.clear();
+    }
+    if (options.attachedSessionRef.current) {
+      throw new ProtocolClientError("connection_closed", "terminal connection is reconnecting");
+    }
+    const existing = workspaceClientRef.current;
+    if (existing && !existing.isClosed) {
+      return existing;
+    }
+    if (existing?.isClosed) {
+      workspaceClientRef.current = undefined;
+      workspaceSessionPermissionIdsRef.current.clear();
     }
     if (workspaceClientPromiseRef.current) {
       return workspaceClientPromiseRef.current;
@@ -270,7 +313,7 @@ export function useWorkspaceConnection(options: UseWorkspaceConnectionOptions) {
           client.close();
           throw new ProtocolClientError("stale_connection", "session connection was superseded");
         }
-        attachClientRef.current = client;
+        workspaceClientRef.current = client;
         workspaceClientPromiseRef.current = undefined;
         return client;
       })
@@ -284,7 +327,9 @@ export function useWorkspaceConnection(options: UseWorkspaceConnectionOptions) {
     workspaceClientPromiseRef.current = promise;
     return promise;
   }, [
+    attachClientRef,
     authenticatedClient,
+    closeWorkspaceMetadataClient,
     options.attachedSessionRef,
     options.defaultWorkspaceTimeoutMs,
     options.onBrokenAttachedClient,
@@ -293,9 +338,13 @@ export function useWorkspaceConnection(options: UseWorkspaceConnectionOptions) {
   const authenticatedSessionClient = useCallback(
     async (sessionId: UUID) => {
       const client = await authenticatedWorkspaceClient();
-      if (!sessionPermissionIdsRef.current.has(sessionId)) {
+      const permissionIds =
+        client === attachClientRef.current
+          ? sessionPermissionIdsRef.current
+          : workspaceSessionPermissionIdsRef.current;
+      if (!permissionIds.has(sessionId)) {
         await client.attachSessionPermission(sessionId);
-        sessionPermissionIdsRef.current.add(sessionId);
+        permissionIds.add(sessionId);
       }
       return client;
     },
@@ -331,7 +380,12 @@ export function useWorkspaceConnection(options: UseWorkspaceConnectionOptions) {
     workspaceClientPromiseRef,
     workspaceClientAbortControllerRef,
     workspaceClientGenerationRef,
+    workspaceClientRef,
     sessionPermissionIdsRef,
+    workspaceSessionPermissionIdsRef,
+    claimAttachClient,
+    closeAttachClient,
+    closeWorkspaceMetadataClient,
     connectionAutoRetryTimerRef,
     connectionAutoRetryKeyRef,
     connectionAutoRetryAttemptsRef,

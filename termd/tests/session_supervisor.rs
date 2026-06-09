@@ -386,6 +386,104 @@ fn runtime_reconnects_to_live_supervisor_and_replays_snapshot_output() {
 }
 
 #[test]
+fn reconnect_takeover_clears_stale_attached_devices_before_new_attach() {
+    let state_path = temp_state_path("runtime-reconnect-clears-attached.json");
+    let binary_path = PathBuf::from(env!("CARGO_BIN_EXE_termd"));
+    let session_id = "00000000-0000-0000-0000-000000000117";
+
+    let mut runtime = SessionRuntime::new(SupervisorPtyBackend::with_binary_and_state_path(
+        &binary_path,
+        &state_path,
+    ));
+    runtime
+        .create_session_with_id(
+            session_id,
+            CommandSpec::new("sh").args(["-lc", "printf authority-ready; cat"]),
+            TerminalSize::cells(24, 80),
+        )
+        .unwrap();
+    runtime.attach(session_id, "dev-a").unwrap();
+    read_until_contains(&mut runtime, session_id, b"authority-ready");
+
+    let persisted = runtime.persisted_sessions();
+    assert_eq!(persisted.len(), 1);
+
+    let mut restarted = SessionRuntime::new(SupervisorPtyBackend::with_binary_and_state_path(
+        &binary_path,
+        &state_path,
+    ));
+    restarted.reconnect_session(&persisted[0]).unwrap();
+
+    // 中文注释：新的 daemon controller 接管后，supervisor 内旧 attached 集合必须被清空；
+    // 否则掉线设备会在重启后继续被误判为活跃 operator。
+    assert_eq!(restarted.role(session_id, "dev-a").unwrap(), None);
+
+    restarted.attach(session_id, "dev-b").unwrap();
+    restarted
+        .write_input(session_id, "dev-b", b"after-reconnect\n")
+        .unwrap();
+    let echoed = read_until_contains(&mut restarted, session_id, b"after-reconnect");
+    assert!(
+        echoed
+            .windows(b"after-reconnect".len())
+            .any(|window| window == b"after-reconnect")
+    );
+
+    restarted.close(session_id).unwrap();
+}
+
+#[test]
+fn stale_runtime_request_does_not_reconnect_and_steal_active_controller() {
+    let state_path = temp_state_path("runtime-stale-controller.json");
+    let binary_path = PathBuf::from(env!("CARGO_BIN_EXE_termd"));
+    let session_id = "00000000-0000-0000-0000-000000000118";
+
+    let mut first = SessionRuntime::new(SupervisorPtyBackend::with_binary_and_state_path(
+        &binary_path,
+        &state_path,
+    ));
+    first
+        .create_session_with_id(
+            session_id,
+            CommandSpec::new("sh").args(["-lc", "printf stale-owner-ready; cat"]),
+            TerminalSize::cells(24, 80),
+        )
+        .unwrap();
+    first.attach(session_id, "dev-a").unwrap();
+    read_until_contains(&mut first, session_id, b"stale-owner-ready");
+
+    let persisted = first.persisted_sessions();
+    assert_eq!(persisted.len(), 1);
+
+    let mut restarted = SessionRuntime::new(SupervisorPtyBackend::with_binary_and_state_path(
+        &binary_path,
+        &state_path,
+    ));
+    restarted.reconnect_session(&persisted[0]).unwrap();
+    restarted.attach(session_id, "dev-b").unwrap();
+
+    let error = first
+        .role(session_id, "dev-a")
+        .expect_err("stale controller request should be rejected instead of auto-reconnecting");
+    assert!(
+        error.to_string().contains("active controller"),
+        "stale controller should surface authority rejection, got {error}"
+    );
+
+    restarted
+        .write_input(session_id, "dev-b", b"active-controller-still-works\n")
+        .unwrap();
+    let echoed = read_until_contains(&mut restarted, session_id, b"active-controller-still-works");
+    assert!(
+        echoed
+            .windows(b"active-controller-still-works".len())
+            .any(|window| window == b"active-controller-still-works")
+    );
+
+    restarted.close(session_id).unwrap();
+}
+
+#[test]
 fn supervisor_terminal_snapshot_survives_last_client_detach() {
     let state_path = temp_state_path("runtime-detach-snapshot.json");
     let binary_path = PathBuf::from(env!("CARGO_BIN_EXE_termd"));

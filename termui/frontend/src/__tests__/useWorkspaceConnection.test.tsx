@@ -170,6 +170,48 @@ describe("useWorkspaceConnection", () => {
     expect(client.attachSessionPermission).toHaveBeenCalledWith(SESSION_ID);
   });
 
+  it("已 attach 后 workspace metadata 会回到当前 terminal client 并关闭旧 metadata 连接", async () => {
+    const metadataClient = makeClient();
+    const attachClient = makeClient();
+    const connectSpy = vi.spyOn(DirectClient, "connect").mockResolvedValue(metadataClient);
+    const { attachedSessionRef, result } = renderWorkspaceConnection();
+
+    await expect(result.current.authenticatedWorkspaceClient()).resolves.toBe(metadataClient);
+    result.current.workspaceClientRef.current = metadataClient;
+    result.current.attachClientRef.current = attachClient;
+    attachedSessionRef.current = SESSION_ID;
+
+    await expect(result.current.authenticatedWorkspaceClient()).resolves.toBe(attachClient);
+
+    expect(metadataClient.interruptReceiveWaiters).toHaveBeenCalledTimes(1);
+    expect(metadataClient.close).toHaveBeenCalledTimes(1);
+    expect(result.current.workspaceClientRef.current).toBeUndefined();
+    expect(connectSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("metadata 建连未完成时若 terminal 先 attach，迟到 metadata client 会被作废", async () => {
+    const authGate = deferred<void>();
+    const metadataClient = makeClient({
+      authenticate: vi.fn(() => authGate.promise),
+    });
+    const attachClient = makeClient();
+    vi.spyOn(DirectClient, "connect").mockResolvedValue(metadataClient);
+    const { attachedSessionRef, result } = renderWorkspaceConnection();
+
+    const pendingMetadata = result.current.authenticatedWorkspaceClient();
+    result.current.claimAttachClient(attachClient);
+    attachedSessionRef.current = SESSION_ID;
+    authGate.resolve();
+
+    await expect(pendingMetadata).rejects.toMatchObject({
+      code: "connection_closed",
+    });
+    expect(metadataClient.close).toHaveBeenCalledTimes(1);
+    expect(result.current.workspaceClientRef.current).toBeUndefined();
+    expect(result.current.workspaceClientPromiseRef.current).toBeUndefined();
+    await expect(result.current.authenticatedWorkspaceClient()).resolves.toBe(attachClient);
+  });
+
   it("独立 operation client 权限补齐失败时会关闭短连接", async () => {
     const client = makeClient({
       attachSessionPermission: vi.fn(async () => {

@@ -63,6 +63,19 @@ const RESIZE_SOURCE_PRIORITY: Record<ResizeSource, number> = {
 type MobileDirection = "up" | "down" | "left" | "right";
 type MobileDirectionTier = 1 | 2 | 3;
 
+interface DeferredTerminalFrameHandle {
+  id: number;
+  cancel: () => void;
+  rescueHidden: (force?: boolean) => void;
+}
+
+function isDocumentAnimationFrameUnsafe(): boolean {
+  return typeof document !== "undefined" && (
+    document.visibilityState === "hidden" ||
+    (typeof document.hasFocus === "function" && !document.hasFocus())
+  );
+}
+
 function serverScrollableOutputBytes(bytes: Uint8Array): number {
   for (const byte of bytes) {
     if (byte === 10 || byte === 13 || byte === 27 || (byte >= 32 && byte !== 127)) {
@@ -196,6 +209,7 @@ export function TerminalPane(props: TerminalPaneProps) {
     | {
         snapshotRows: number;
         snapshotCols: number;
+        createdAtMs: number;
       }
     | undefined
   >(undefined);
@@ -253,6 +267,108 @@ export function TerminalPane(props: TerminalPaneProps) {
   const [searchError, setSearchError] = useState<string | undefined>();
   const [searchResult, setSearchResult] = useState<SessionSearchResultPayload | undefined>();
   const [activeSearchIndex, setActiveSearchIndex] = useState(0);
+  const deferredFrameIdRef = useRef(0);
+  const deferredFrameHandlesByIdRef = useRef<Map<number, DeferredTerminalFrameHandle>>(new Map());
+  const deferredFrameHandlesRef = useRef<Set<DeferredTerminalFrameHandle>>(new Set());
+
+  const cancelDeferredTerminalFrame = (frameId: number | undefined) => {
+    if (frameId === undefined) {
+      return;
+    }
+    const handle = deferredFrameHandlesByIdRef.current.get(frameId);
+    handle?.cancel();
+  };
+
+  const scheduleDeferredTerminalFrame = (callback: () => void): number => {
+    const pageUnsafeAtSchedule = isDocumentAnimationFrameUnsafe();
+    deferredFrameIdRef.current += 1;
+    const frameId = deferredFrameIdRef.current;
+    let frame: number | undefined;
+    let timer: number | undefined;
+    let settled = false;
+    const clearScheduled = () => {
+      if (frame !== undefined) {
+        window.cancelAnimationFrame(frame);
+        frame = undefined;
+      }
+      if (timer !== undefined) {
+        window.clearTimeout(timer);
+        timer = undefined;
+      }
+    };
+    const finish = () => {
+      deferredFrameHandlesRef.current.delete(handle);
+      deferredFrameHandlesByIdRef.current.delete(frameId);
+    };
+    const run = () => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearScheduled();
+      finish();
+      callback();
+    };
+    const armTimer = () => {
+      if (settled || timer !== undefined) {
+        return;
+      }
+      timer = window.setTimeout(run, 0);
+    };
+    const handle: DeferredTerminalFrameHandle = {
+      id: frameId,
+      cancel: () => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearScheduled();
+        finish();
+      },
+      rescueHidden: (force = false) => {
+        if (settled || frame === undefined) {
+          return;
+        }
+        if (!force && !isDocumentAnimationFrameUnsafe()) {
+          return;
+        }
+        window.cancelAnimationFrame(frame);
+        frame = undefined;
+        armTimer();
+      },
+    };
+    deferredFrameHandlesRef.current.add(handle);
+    deferredFrameHandlesByIdRef.current.set(frameId, handle);
+    if (pageUnsafeAtSchedule) {
+      armTimer();
+      return frameId;
+    }
+    frame = window.requestAnimationFrame(run);
+    return frameId;
+  };
+
+  useEffect(() => {
+    if (typeof document === "undefined") {
+      return undefined;
+    }
+    const rescueDeferredFrames = () => {
+      deferredFrameHandlesRef.current.forEach((handle) => handle.rescueHidden(true));
+    };
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "hidden") {
+        rescueDeferredFrames();
+      }
+    };
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    window.addEventListener("blur", rescueDeferredFrames);
+    return () => {
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+      window.removeEventListener("blur", rescueDeferredFrames);
+      deferredFrameHandlesRef.current.forEach((handle) => handle.cancel());
+      deferredFrameHandlesRef.current.clear();
+      deferredFrameHandlesByIdRef.current.clear();
+    };
+  }, []);
 
   const clearTerminalServerScrollbackResyncIdleTimer = () => {
     if (terminalServerScrollbackResyncIdleTimerRef.current !== undefined) {
@@ -263,7 +379,7 @@ export function TerminalPane(props: TerminalPaneProps) {
 
   const clearPendingSnapshotHistoryRepairSchedule = () => {
     if (pendingSnapshotHistoryRepairFrameRef.current !== undefined) {
-      window.cancelAnimationFrame(pendingSnapshotHistoryRepairFrameRef.current);
+      cancelDeferredTerminalFrame(pendingSnapshotHistoryRepairFrameRef.current);
       pendingSnapshotHistoryRepairFrameRef.current = undefined;
     }
     if (pendingSnapshotHistoryRepairTimerRef.current !== undefined) {
@@ -340,15 +456,38 @@ export function TerminalPane(props: TerminalPaneProps) {
       clearPendingSnapshotHistoryRepairSchedule();
       return;
     }
+    const repairAgeMs = nowForThrottle() - pendingRepair.createdAtMs;
+    if (terminalRenderedOutputBytesSinceSnapshotRef.current > 0) {
+      recordTermdDiagnostic("terminal_snapshot_history_repair_abandoned", {
+        snapshotRows: pendingRepair.snapshotRows,
+        snapshotCols: pendingRepair.snapshotCols,
+        sessionRows: sessionSize.rows,
+        sessionCols: sessionSize.cols,
+        repairAgeMs,
+        renderedBytesSinceSnapshot: terminalRenderedOutputBytesSinceSnapshotRef.current,
+      });
+      // 中文注释：一旦旧尺寸 snapshot 之后已经开始渲染 live output，就不再自动发起
+      // full snapshot repair。此时再重连重放会打断正在恢复的 relay/stdout 流，
+      // 体感比“旧历史暂时未按新列宽重排”更差，尤其是公网冻结恢复场景。
+      clearPendingSnapshotHistoryRepair();
+      return;
+    }
     const scheduleRepairFrame = () => {
       if (pendingSnapshotHistoryRepairFrameRef.current !== undefined) {
         return;
       }
-      pendingSnapshotHistoryRepairFrameRef.current = window.requestAnimationFrame(() => {
+      pendingSnapshotHistoryRepairFrameRef.current = scheduleDeferredTerminalFrame(() => {
         pendingSnapshotHistoryRepairFrameRef.current = undefined;
         if (!pendingSnapshotHistoryRepairRef.current) {
           return;
         }
+        recordTermdDiagnostic("terminal_snapshot_history_repair_resync", {
+          snapshotRows: pendingSnapshotHistoryRepairRef.current.snapshotRows,
+          snapshotCols: pendingSnapshotHistoryRepairRef.current.snapshotCols,
+          sessionRows: sessionSize.rows,
+          sessionCols: sessionSize.cols,
+          renderedBytesSinceSnapshot: terminalRenderedOutputBytesSinceSnapshotRef.current,
+        });
         pendingSnapshotHistoryRepairRef.current = undefined;
         onTerminalResyncRef.current?.(undefined);
       });
@@ -393,7 +532,7 @@ export function TerminalPane(props: TerminalPaneProps) {
     clearTerminalServerScrollbackResyncIdleTimer();
     terminalResizeRequestKeyRef.current = undefined;
     if (terminalResizeReportFrameRef.current !== undefined) {
-      window.cancelAnimationFrame(terminalResizeReportFrameRef.current);
+      cancelDeferredTerminalFrame(terminalResizeReportFrameRef.current);
       terminalResizeReportFrameRef.current = undefined;
     }
     terminalResizeReportPassesRef.current = 0;
@@ -448,7 +587,7 @@ export function TerminalPane(props: TerminalPaneProps) {
     bottomScrollGenerationRef.current += 1;
     bottomScrollPassesRef.current = 0;
     if (bottomScrollFrameRef.current !== undefined) {
-      window.cancelAnimationFrame(bottomScrollFrameRef.current);
+      cancelDeferredTerminalFrame(bottomScrollFrameRef.current);
       bottomScrollFrameRef.current = undefined;
     }
   };
@@ -481,7 +620,7 @@ export function TerminalPane(props: TerminalPaneProps) {
     }
     bottomScrollPassesRef.current = Math.max(bottomScrollPassesRef.current, Math.max(1, passes));
     if (bottomScrollFrameRef.current !== undefined) {
-      window.cancelAnimationFrame(bottomScrollFrameRef.current);
+      cancelDeferredTerminalFrame(bottomScrollFrameRef.current);
       bottomScrollFrameRef.current = undefined;
     }
     const runScrollPass = () => {
@@ -498,9 +637,9 @@ export function TerminalPane(props: TerminalPaneProps) {
       }
       // resize / Ghostty renderer / 移动端 visual viewport 可能分多帧稳定。
       // attach 后的贴底只在首屏执行，多补几帧不会放大持续输出路径压力。
-      bottomScrollFrameRef.current = window.requestAnimationFrame(runScrollPass);
+      bottomScrollFrameRef.current = scheduleDeferredTerminalFrame(runScrollPass);
     };
-    bottomScrollFrameRef.current = window.requestAnimationFrame(runScrollPass);
+    bottomScrollFrameRef.current = scheduleDeferredTerminalFrame(runScrollPass);
   };
   const scheduleScrollToBottomIfPinned = (wasPinnedToBottom = isTerminalPinnedToBottom(), passes = 2) => {
     if (terminalRevealHistorySuppressBottomUntilRef.current > nowForThrottle()) {
@@ -1191,7 +1330,7 @@ export function TerminalPane(props: TerminalPaneProps) {
     if (cursorFrameRef.current !== undefined) {
       return;
     }
-    cursorFrameRef.current = window.requestAnimationFrame(() => {
+    cursorFrameRef.current = scheduleDeferredTerminalFrame(() => {
       cursorFrameRef.current = undefined;
       const terminal = terminalRef.current;
       if (!terminal || !onCursorChangeRef.current) {
@@ -1238,7 +1377,7 @@ export function TerminalPane(props: TerminalPaneProps) {
     if (terminalScrollFrameRef.current !== undefined) {
       return;
     }
-    terminalScrollFrameRef.current = window.requestAnimationFrame(() => {
+    terminalScrollFrameRef.current = scheduleDeferredTerminalFrame(() => {
       terminalScrollFrameRef.current = undefined;
       const scrollState = rendererRef.current?.scrollState(terminalRef.current ?? undefined);
       const maxViewportY = scrollState?.baseY ?? 0;
@@ -1656,8 +1795,8 @@ export function TerminalPane(props: TerminalPaneProps) {
     terminalSnapshotRedrawGenerationRef.current = generation;
     // 中文注释：snapshot 刚写完时 Ghostty 还会补一到两帧 repaint/fit；等稳定帧后再露出 canvas，
     // 避免刷新时肉眼看到旧 80x24 画面闪一下。
-    window.requestAnimationFrame(() => {
-      window.requestAnimationFrame(() => {
+    scheduleDeferredTerminalFrame(() => {
+      scheduleDeferredTerminalFrame(() => {
         if (terminalSnapshotRedrawGenerationRef.current === generation) {
           delete host.dataset.termdSnapshotRedraw;
         }
@@ -1768,6 +1907,7 @@ export function TerminalPane(props: TerminalPaneProps) {
     let disposed = false;
     let cleanupMountedRenderer: (() => void) | undefined;
     let cleanupTerminalSelectionNativeListeners: (() => void) | undefined;
+    const trackedFrames = new Set<number>();
     const host = hostRef.current;
     const mountRenderer = (renderer: TerminalRendererInstance) => {
       if (disposed) {
@@ -1840,14 +1980,13 @@ export function TerminalPane(props: TerminalPaneProps) {
           host.removeEventListener("mousedown", handleMouseDown, true);
         };
       })();
-    const scheduledFrames = new Set<number>();
     const requestTrackedFrame = (callback: () => void) => {
-      const frame = window.requestAnimationFrame(() => {
-        scheduledFrames.delete(frame);
+      const frameId = scheduleDeferredTerminalFrame(() => {
+        trackedFrames.delete(frameId);
         callback();
       });
-      scheduledFrames.add(frame);
-      return frame;
+      trackedFrames.add(frameId);
+      return frameId;
     };
     const canUseArmedFocusResizeAuthority = (source: ResizeSource | undefined) => {
       if (source !== "focus") {
@@ -2196,7 +2335,14 @@ export function TerminalPane(props: TerminalPaneProps) {
           pendingSnapshotHistoryRepairRef.current = {
             snapshotRows: snapshotSize.rows,
             snapshotCols: snapshotSize.cols,
+            createdAtMs: nowForThrottle(),
           };
+          recordTermdDiagnostic("terminal_snapshot_history_repair_pending", {
+            snapshotRows: snapshotSize.rows,
+            snapshotCols: snapshotSize.cols,
+            proposedRows: proposed.rows,
+            proposedCols: proposed.cols,
+          });
           // 中文注释：daemon 对新尺寸的 ack 可能已经先于用户聚焦到达。
           // 如果 repair intent 是在后续 focus/layout resize 中才首次建立，就不能再只等
           // 下一次 sessionSize 变化；这里要立刻重评估一次，避免 pending repair 永远挂住。
@@ -2407,6 +2553,7 @@ export function TerminalPane(props: TerminalPaneProps) {
           pendingSnapshotHistoryRepairRef.current = {
             snapshotRows: item.size.rows,
             snapshotCols: item.size.cols,
+            createdAtMs: nowForThrottle(),
           };
           evaluatePendingSnapshotHistoryRepair();
         } else if (
@@ -2485,19 +2632,19 @@ export function TerminalPane(props: TerminalPaneProps) {
       resizeObserver?.observe(scrollportRef.current);
     }
 
-    cleanupMountedRenderer = () => {
+      cleanupMountedRenderer = () => {
       recordTermdDiagnostic("terminal_pane_dispose", {
         outputResetVersion: props.outputResetVersion,
         attached: props.attached,
         rendererKind: renderer.kind,
       });
       disposed = true;
-      for (const frame of scheduledFrames) {
-        window.cancelAnimationFrame(frame);
+      for (const frameId of trackedFrames) {
+        cancelDeferredTerminalFrame(frameId);
       }
-      scheduledFrames.clear();
+      trackedFrames.clear();
       if (cursorFrameRef.current !== undefined) {
-        window.cancelAnimationFrame(cursorFrameRef.current);
+        cancelDeferredTerminalFrame(cursorFrameRef.current);
         cursorFrameRef.current = undefined;
       }
       if (cursorReportTimerRef.current !== undefined) {
@@ -2517,14 +2664,14 @@ export function TerminalPane(props: TerminalPaneProps) {
         terminalResizeStabilizationTimerRef.current = undefined;
       }
       if (bottomScrollFrameRef.current !== undefined) {
-        window.cancelAnimationFrame(bottomScrollFrameRef.current);
+        cancelDeferredTerminalFrame(bottomScrollFrameRef.current);
         bottomScrollFrameRef.current = undefined;
       }
       lastCursorReportAtRef.current = 0;
       bottomScrollPassesRef.current = 0;
       bottomScrollGenerationRef.current += 1;
       if (terminalScrollFrameRef.current !== undefined) {
-        window.cancelAnimationFrame(terminalScrollFrameRef.current);
+        cancelDeferredTerminalFrame(terminalScrollFrameRef.current);
         terminalScrollFrameRef.current = undefined;
       }
       if (terminalScrollTimerRef.current !== undefined) {
@@ -2592,12 +2739,15 @@ export function TerminalPane(props: TerminalPaneProps) {
       pendingResizeAfterSnapshotRef.current = undefined;
       terminalResizeRequestKeyRef.current = undefined;
       if (terminalResizeReportFrameRef.current !== undefined) {
-        window.cancelAnimationFrame(terminalResizeReportFrameRef.current);
+        cancelDeferredTerminalFrame(terminalResizeReportFrameRef.current);
         terminalResizeReportFrameRef.current = undefined;
       }
       terminalResizeReportPassesRef.current = 0;
       terminalResizeReportSizeRef.current = undefined;
       terminalStabilizeSourceRef.current = undefined;
+      if (terminalStabilizeFrameRef.current !== undefined) {
+        cancelDeferredTerminalFrame(terminalStabilizeFrameRef.current);
+      }
       terminalStabilizeFrameRef.current = undefined;
       terminalStabilizePassesRef.current = 0;
       terminalSelectionCopyGenerationRef.current += 1;
@@ -2695,10 +2845,10 @@ export function TerminalPane(props: TerminalPaneProps) {
     // 新建 session 后要直接进入可输入状态；等一帧可以确保 Ghostty 已完成 open/fit，
     // focusin 事件随后会由聚焦客户端上报真实 PTY 尺寸。
     pendingFocusRequestRef.current = props.focusRequest;
-    const frame = window.requestAnimationFrame(() => {
+    const frame = scheduleDeferredTerminalFrame(() => {
       applyTerminalFocusRequest(props.focusRequest);
     });
-    return () => window.cancelAnimationFrame(frame);
+    return () => cancelDeferredTerminalFrame(frame);
   }, [props.attached, props.focusRequest]);
 
   useEffect(() => {

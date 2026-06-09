@@ -68,6 +68,7 @@ impl SessionTerminalFrameLog {
         self.pending_post_resize_rebuild = true;
     }
 
+    #[cfg(test)]
     pub(super) fn disable_live_bootstrap_authority(&mut self) {
         // 中文注释：恢复出来的 tmux session 在 daemon 看见第一条 live output 前，
         // 实际 screen 早就已经存在。此时哪怕 output seq 连续，也不能把“空 screen

@@ -385,6 +385,7 @@ interface UseTerminalReconnectSchedulerOptions {
   ) => Promise<void>;
   loadSessionGit: (sessionId: UUID, options?: { silent?: boolean }) => Promise<void>;
   refreshDaemonClients: () => Promise<void>;
+  claimAttachClient: (client: DirectClient) => void;
   upsertAttachedSession: (
     current: SessionSummaryPayload[],
     attached: SessionAttachedPayload,
@@ -617,7 +618,9 @@ export function useTerminalReconnectScheduler(
           }
           // 中文注释：重连拿到 attach ack 后先发布当前 session。
           // reset 期间用户可能已经能在新 Ghostty 里输入；输入不能等 snapshot 开始消费后才生效。
-          options.attachClientRef.current = attachedClient;
+          // 中文注释：reconnect 成功后也要立刻晋升为当前 terminal 主连接，并废弃
+          // 所有 metadata sidecar / pending metadata connect，避免迟到 promise 回写。
+          options.claimAttachClient(attachedClient);
           if (isFullSnapshot && snapshotToken !== undefined) {
             const pendingSnapshot = terminalSnapshotPendingFullSnapshotTokensRef.current.get(sessionId);
             if (pendingSnapshot?.token === snapshotToken) {

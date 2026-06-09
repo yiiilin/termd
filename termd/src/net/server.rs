@@ -42,7 +42,6 @@ use crate::auth::current_unix_timestamp_millis;
 use crate::config::DaemonConfig;
 use crate::pty::PtyRestoreInfo;
 use crate::pty::supervisor::SupervisorPtyBackend;
-use crate::pty::tmux::TmuxPtyBackend;
 use crate::state::{StateError, StateStore};
 
 use super::protocol::{
@@ -363,7 +362,7 @@ struct WebSocketWatcherCounts {
     resize: usize,
 }
 
-pub type DefaultDaemonProtocol = DaemonProtocol<TmuxPtyBackend, Ed25519SignatureVerifier>;
+pub type DefaultDaemonProtocol = DaemonProtocol<SupervisorPtyBackend, Ed25519SignatureVerifier>;
 /// daemon 的协议核心仍是单线程语义，但等待这把锁必须让出 Tokio worker。
 ///
 /// 直连 WebSocket 和 relay mux 共用同一个协议状态；如果使用 `std::sync::Mutex`，
@@ -440,9 +439,8 @@ pub fn try_default_protocol(config: DaemonConfig) -> Result<SharedDaemonProtocol
     let state = StateStore::load(&config.state_path)?;
     cleanup_persisted_session_file_http_uploads(&config.state_path)?;
     let supervisor_backend = SupervisorPtyBackend::for_state_path(&config.state_path);
-    // 中文注释：state schema v2 进入 tmux session host 重构后，旧 supervisor 进程
-    // 不能再被生产启动路径自动 adopt 回 SQLite；否则用户 reset state 后仍可能被旧
-    // UnixSocket restore_info 污染。这里仅保留孤儿告警，后续 tmux backend 会接管恢复。
+    // 中文注释：生产路径现在只接受 supervisor Unix socket restore_info；旧 tmux 时代
+    // 遗留的 live supervisor 仍只做孤儿告警，不能再被默认启动路径自动接回运行态。
     let valid_supervisor_session_ids = state
         .sessions
         .iter()
@@ -455,10 +453,9 @@ pub fn try_default_protocol(config: DaemonConfig) -> Result<SharedDaemonProtocol
         })
         .map(|session| session.session_id.0.to_string());
     warn_about_orphaned_supervisors(&supervisor_backend, valid_supervisor_session_ids);
-    let tmux_backend = TmuxPtyBackend::for_state_path(&config.state_path);
     let protocol = DaemonProtocol::from_state(
         config.clone(),
-        tmux_backend,
+        supervisor_backend,
         Ed25519SignatureVerifier,
         state,
     )?;
@@ -4999,7 +4996,11 @@ mod tests {
         )
         .await;
         let created = read_encrypted_ws(&mut socket, &mut device_session).await;
-        assert_eq!(created.kind, MessageType::SessionCreated);
+        assert_eq!(
+            created.kind,
+            MessageType::SessionCreated,
+            "unexpected session create response: {created:?}"
+        );
         let created_payload: SessionCreatedPayload = decode_payload(created.payload).unwrap();
 
         // 这里不再向 WebSocket 发送 ping 或任意业务帧；PTY 后续输出必须由 daemon 主动推送。
@@ -5628,7 +5629,11 @@ zZZR5LzKVu9X7paftR7K8Q==
         let created = device_session
             .decrypt_json_payload::<JsonEnvelope>(&response_frame)
             .unwrap();
-        assert_eq!(created.kind, MessageType::SessionCreated);
+        assert_eq!(
+            created.kind,
+            MessageType::SessionCreated,
+            "unexpected session create response: {created:?}"
+        );
         let payload: SessionCreatedPayload = decode_payload(created.payload).unwrap();
         (device_id, payload.session_id)
     }

@@ -350,8 +350,12 @@ export default function App() {
     attachClientRef,
     pendingAttachClientRef,
     workspaceClientPromiseRef,
+    workspaceClientRef,
     sessionPermissionIdsRef,
+    claimAttachClient,
     connectionAutoRetryTimerRef,
+    closeAttachClient,
+    closeWorkspaceMetadataClient,
     closeWorkspaceClient,
     authenticatedClient,
     authenticatedWorkspaceClient,
@@ -491,6 +495,18 @@ export default function App() {
       closeWorkspaceClient();
     };
   }, [clearFileTransferProgressTimers, closeWorkspaceClient]);
+
+  useEffect(() => {
+    if (!workspaceClientRef.current || activeSurface !== "workspace") {
+      return;
+    }
+    if (status === "creating" || status === "attaching") {
+      return;
+    }
+    // 中文注释：metadata 连接只服务工作台旁路信息。离开 workspace 或进入 attach/create
+    // 主链路时及时回收，避免保留无用 socket 和权限缓存。
+    closeWorkspaceMetadataClient();
+  }, [activeSurface, closeWorkspaceMetadataClient, status, workspaceClientRef]);
 
   useEffect(() => {
     renamingSessionIdRef.current = renamingSessionId;
@@ -822,7 +838,7 @@ export default function App() {
       return false;
     }
     cancelScheduledAttachSwitch();
-    closeWorkspaceClient();
+    closeAttachClient();
     pendingResizeKeyRef.current = undefined;
     lastCursorReportRef.current = "";
     lastCursorFocusedRef.current = undefined;
@@ -831,7 +847,7 @@ export default function App() {
       cursorRefreshTimerRef.current = undefined;
     }
     return true;
-  }, [cancelScheduledAttachSwitch, closeWorkspaceClient]);
+  }, [cancelScheduledAttachSwitch, closeAttachClient]);
 
   const flushTerminalOutput = useCallback(() => {
     terminalOutputFlushFrameRef.current = undefined;
@@ -928,7 +944,7 @@ export default function App() {
     // 中文注释：切换 session、主动断开、恢复重连都以 WebSocket 生命周期作为边界。
     // DirectClient.close 会先尽力 cancel 已知 terminal stream，再关闭 transport；即使 cancel
     // 没送达，daemon/relay 也能通过 WebSocket close 清掉旧 client context。
-    closeWorkspaceClient();
+    closeAttachClient();
     if (attachedSessionRef.current) {
       lastRenderedTerminalSeqRef.current.delete(attachedSessionRef.current);
       clearTerminalSnapshotRevealHistory(attachedSessionRef.current);
@@ -949,7 +965,7 @@ export default function App() {
       setMobilePanel(undefined);
       setMobileMenuOpen(false);
     }
-  }, [cancelScheduledAttachSwitch, clearSessionFiles, clearTerminalOutput, clearTerminalSnapshotRevealHistory, closeWorkspaceClient, resetAttachReconnectState, resolveTerminalOutputResetWaiters]);
+  }, [cancelScheduledAttachSwitch, clearSessionFiles, clearTerminalOutput, clearTerminalSnapshotRevealHistory, closeAttachClient, resetAttachReconnectState, resolveTerminalOutputResetWaiters]);
 
   useEffect(() => {
     if (activeSurface !== "admin" || !attachClientRef.current) {
@@ -1502,12 +1518,6 @@ export default function App() {
             setDaemonClients(clientList.clients);
           }
         } catch (caught) {
-          if (isBrokenWorkspaceConnectionError(caught) && attachClientRef.current === client) {
-            // 中文注释：后台列表刷新是旁路 segment；它只能把当前 transport 判为需要重连，
-            // 不能自己直接清空 workspace。真正的终端收口统一走 attach 重连状态机，
-            // 避免“连接已关闭”后页面停在无 client 状态。
-            attachReconnectHandlerRef.current(client, caught);
-          }
           throw caught;
         }
       } catch (caught) {
@@ -1561,12 +1571,6 @@ export default function App() {
         // CPU 柱状图只做当前页面内缓存，避免把瞬时监控数据写入浏览器持久状态。
         setDaemonCpuHistory((current) => appendCpuSample(current, status.cpu_percent));
       } catch (caught) {
-        if (isBrokenWorkspaceConnectionError(caught) && attachClientRef.current === client) {
-          // 中文注释：状态轮询是旁路请求。它发现当前 transport 关闭时，只触发
-          // terminal attach 的统一重连流程；不能在这里直接关闭 workspace client，
-          // 否则前端会丢掉当前 session 连接并显示“连接已关闭”。
-          attachReconnectHandlerRef.current(client, caught);
-        }
         throw caught;
       }
     } catch (caught) {
@@ -1710,6 +1714,7 @@ export default function App() {
     loadSessionFiles,
     loadSessionGit,
     refreshDaemonClients,
+    claimAttachClient,
     upsertAttachedSession,
   });
 
@@ -1841,7 +1846,7 @@ export default function App() {
         reattachCurrentSessionOnOpenRef.current = false;
         disconnectAttach({ closeMobilePanel: shouldCloseMobilePanel });
         const resetVersion = clearTerminalOutput();
-        outputClient = await authenticatedWorkspaceClient(ATTACH_CONNECTION_TIMEOUT_MS);
+        outputClient = await authenticatedClient(ATTACH_CONNECTION_TIMEOUT_MS);
         if (!isCurrentAttachRequest()) {
           closePendingAttachClients();
           return;
@@ -1865,7 +1870,7 @@ export default function App() {
         // 中文注释：输入和 resize 属于 terminal segment，必须复用当前 session 的 WebSocket。
         // 到这里 daemon 已确认 attach，先发布 client 和 session id，让 reset 窗口内的键盘输入
         // 能进入正确 stream；输出 receive loop 仍在 reset 确认后才启动，避免 snapshot 写到旧实例。
-        attachClientRef.current = attachedClient;
+        claimAttachClient(attachedClient);
         attachedSessionRef.current = sessionId;
         sessionPermissionIdsRef.current.add(sessionId);
         confirmedSessionSizesRef.current.set(attached.session_id, attached.size);
@@ -1921,10 +1926,10 @@ export default function App() {
       }
     },
     [
-      authenticatedWorkspaceClient,
       clearNewOutputMark,
       clearTerminalSnapshotRevealHistory,
       clearTerminalOutput,
+      claimAttachClient,
       disconnectAttach,
       loadSessionFiles,
       loadSessionGit,
@@ -1972,8 +1977,7 @@ export default function App() {
       if (
         attachedSessionRef.current !== undefined ||
         attachClientRef.current !== undefined ||
-        pendingAttachClientRef.current !== undefined ||
-        workspaceClientPromiseRef.current !== undefined
+        pendingAttachClientRef.current !== undefined
       ) {
         // 80ms 合并窗口只延迟“新 session attach”，不能让旧 session 的输出继续进入
         // Ghostty。否则旧的大 snapshot/持续输出会占住主线程和当前 session 连接。
@@ -2048,7 +2052,7 @@ export default function App() {
     let outputClient: DirectClient | undefined;
     try {
       const isCurrentCreateRequest = () => sessionCreateRequestIdRef.current === createRequestId;
-      outputClient = await authenticatedWorkspaceClient(ATTACH_CONNECTION_TIMEOUT_MS);
+      outputClient = await authenticatedClient(ATTACH_CONNECTION_TIMEOUT_MS);
       if (!isCurrentCreateRequest()) {
         if (outputClient !== attachClientRef.current) {
           outputClient.close();
@@ -2074,7 +2078,7 @@ export default function App() {
       const attachedClient = outputClient;
       outputClient = undefined;
       pendingAttachClientRef.current = undefined;
-      attachClientRef.current = attachedClient;
+      claimAttachClient(attachedClient);
       attachedSessionRef.current = created.session_id;
       sessionPermissionIdsRef.current.add(created.session_id);
       confirmedSessionSizesRef.current.set(created.session_id, created.size);
@@ -2107,9 +2111,9 @@ export default function App() {
       }
     }
   }, [
-    authenticatedWorkspaceClient,
     clearNewOutputMark,
     clearTerminalOutput,
+    claimAttachClient,
     disconnectAttach,
     loadSessionFiles,
     refreshDaemonClients,

@@ -133,15 +133,6 @@ where
         let (resize_signal, _) = watch::channel(session.size);
         self.session_resize_signals
             .insert(wire_session_id, resize_signal);
-        if matches!(
-            session.restore_info.as_ref(),
-            Some(PtyRestoreInfo::Tmux { .. })
-        ) {
-            self.session_terminal_frame_logs
-                .entry(wire_session_id)
-                .or_default()
-                .disable_live_bootstrap_authority();
-        }
         self.session_roots
             .insert(wire_session_id, metadata.root_path);
         if let Some(name) = metadata.name {
@@ -349,10 +340,9 @@ fn default_restored_session_name(session_id: SessionId) -> String {
 fn restore_info_is_reconnectable(restore_info: Option<&PtyRestoreInfo>) -> bool {
     matches!(
         restore_info,
-        Some(PtyRestoreInfo::Tmux { .. })
-            | Some(PtyRestoreInfo::UnixSocket {
-                supervisor_status: PtySupervisorStatus::Running,
-                ..
-            })
+        Some(PtyRestoreInfo::UnixSocket {
+            supervisor_status: PtySupervisorStatus::Running,
+            ..
+        })
     )
 }

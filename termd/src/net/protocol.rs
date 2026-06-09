@@ -3496,11 +3496,10 @@ where
             .runtime
             .restore_info(internal_session_id)
             .map_err(map_runtime_error)?;
-        // 中文注释：tmux backend 的 `terminal_snapshot(None)` 本质上是 capture-pane 文本，
-        // 它不是可继续增量重放的权威终端状态。这里必须避免把这种 snapshot 回灌成
-        // daemon mirror 基线；否则后续 reopen/full snapshot 会在错误 screen 上继续叠加
-        // live diff，Codex/vim 这类全屏 TUI 就会乱屏。
-        Ok(matches!(restore_info, Some(PtyRestoreInfo::Tmux { .. })))
+        // 中文注释：生产路径现在只恢复 supervisor 权威 snapshot/tail；它可以直接作为
+        // daemon mirror 的基线，因此不再需要对 tmux capture-pane 做特殊跳过。
+        let _ = restore_info;
+        Ok(false)
     }
 
     fn drain_runtime_output_to_history(
@@ -11196,413 +11195,6 @@ mod tests {
     }
 
     #[test]
-    fn packet_terminal_full_snapshot_for_restored_tmux_session_keeps_using_runtime_until_resize_redraw_rebuilds_authority()
-     {
-        let session_id = SessionId::new();
-        let state = DaemonState {
-            version: crate::state::STATE_SCHEMA_VERSION,
-            daemon_identity: None,
-            trusted_devices: Vec::new(),
-            sessions: vec![SessionStateRecord {
-                session_id,
-                state: SessionState::Running,
-                size: TerminalSize::new(24, 80),
-                created_at_ms: UnixTimestampMillis(1_000),
-                updated_at_ms: UnixTimestampMillis(1_001),
-                restore_info: Some(PtyRestoreInfo::Tmux {
-                    socket_path: std::env::temp_dir().join("termd-test-restored-tmux.sock"),
-                    session_name: format!("termd-{}", session_id.0),
-                }),
-            }],
-        };
-        let (mut protocol, backend) = protocol_from_state(state);
-
-        let (mut first_connection, _) = protocol.start_connection();
-        let device_id = DeviceId::new();
-        let (_, mut first_device_session, _) =
-            open_packet_e2ee(&mut protocol, &mut first_connection, device_id);
-        pair_packet_device(
-            &mut protocol,
-            &mut first_connection,
-            &mut first_device_session,
-            device_id,
-            PublicKey("device-public-key".to_owned()),
-        );
-
-        let first_attach = send_encrypted_packet(
-            &mut protocol,
-            &mut first_connection,
-            &mut first_device_session,
-            ProtocolPacket::stream_open(
-                PacketRequestId::new(),
-                PacketStreamId::new(),
-                METHOD_TERMINAL_ATTACH,
-                128 * 1024,
-                serde_json::to_value(SessionAttachPayload {
-                    session_id,
-                    watch_updates: true,
-                    last_terminal_seq: None,
-                })
-                .unwrap(),
-            ),
-        );
-        let _ = decrypt_first_packet(&mut first_device_session, first_attach);
-        let first_packets = decrypt_packets(
-            &mut first_device_session,
-            first_connection.read_session_output(&mut protocol, session_id, 1024),
-        );
-        assert_eq!(first_packets.len(), 1);
-        let runtime_snapshot_count_after_first_attach =
-            backend.terminal_snapshot_count_for_session(session_id);
-        assert_eq!(
-            runtime_snapshot_count_after_first_attach, 2,
-            "刚恢复的 tmux session 在第一次 full snapshot attach 时，仍应继续回源 runtime，而不是直接复用 daemon mirror"
-        );
-
-        let (mut second_connection, _) = protocol.start_connection();
-        let second_device_id = DeviceId::new();
-        let (_, mut second_device_session, _) =
-            open_packet_e2ee(&mut protocol, &mut second_connection, second_device_id);
-        pair_packet_device(
-            &mut protocol,
-            &mut second_connection,
-            &mut second_device_session,
-            second_device_id,
-            PublicKey("second-device-public-key".to_owned()),
-        );
-        let second_attach = send_encrypted_packet(
-            &mut protocol,
-            &mut second_connection,
-            &mut second_device_session,
-            ProtocolPacket::stream_open(
-                PacketRequestId::new(),
-                PacketStreamId::new(),
-                METHOD_TERMINAL_ATTACH,
-                128 * 1024,
-                serde_json::to_value(SessionAttachPayload {
-                    session_id,
-                    watch_updates: true,
-                    last_terminal_seq: None,
-                })
-                .unwrap(),
-            ),
-        );
-        let _ = decrypt_first_packet(&mut second_device_session, second_attach);
-        let second_packets = decrypt_packets(
-            &mut second_device_session,
-            second_connection.read_session_output(&mut protocol, session_id, 1024),
-        );
-        assert_eq!(second_packets.len(), 1);
-        assert_eq!(
-            backend.terminal_snapshot_count_for_session(session_id)
-                > runtime_snapshot_count_after_first_attach,
-            true,
-            "tmux runtime snapshot 不能被回灌成 daemon mirror 基线；没有 resize 后 redraw 重建 mirror 前，后续 full snapshot 仍必须继续回源"
-        );
-    }
-
-    #[test]
-    fn packet_terminal_full_snapshot_for_restored_tmux_session_still_uses_runtime_after_resize_without_redraw()
-     {
-        let session_id = SessionId::new();
-        let state = DaemonState {
-            version: crate::state::STATE_SCHEMA_VERSION,
-            daemon_identity: None,
-            trusted_devices: Vec::new(),
-            sessions: vec![SessionStateRecord {
-                session_id,
-                state: SessionState::Running,
-                size: TerminalSize::new(24, 80),
-                created_at_ms: UnixTimestampMillis(1_000),
-                updated_at_ms: UnixTimestampMillis(1_001),
-                restore_info: Some(PtyRestoreInfo::Tmux {
-                    socket_path: std::env::temp_dir().join("termd-test-restored-live-tmux.sock"),
-                    session_name: format!("termd-{}", session_id.0),
-                }),
-            }],
-        };
-        let (mut protocol, backend) = protocol_from_state(state);
-
-        let (mut first_connection, _) = protocol.start_connection();
-        let device_id = DeviceId::new();
-        let (_, mut first_device_session, _) =
-            open_packet_e2ee(&mut protocol, &mut first_connection, device_id);
-        pair_packet_device(
-            &mut protocol,
-            &mut first_connection,
-            &mut first_device_session,
-            device_id,
-            PublicKey("device-public-key".to_owned()),
-        );
-
-        let first_attach = send_encrypted_packet(
-            &mut protocol,
-            &mut first_connection,
-            &mut first_device_session,
-            ProtocolPacket::stream_open(
-                PacketRequestId::new(),
-                PacketStreamId::new(),
-                METHOD_TERMINAL_ATTACH,
-                128 * 1024,
-                serde_json::to_value(SessionAttachPayload {
-                    session_id,
-                    watch_updates: true,
-                    last_terminal_seq: None,
-                })
-                .unwrap(),
-            ),
-        );
-        let _ = decrypt_first_packet(&mut first_device_session, first_attach);
-        let first_packets = decrypt_packets(
-            &mut first_device_session,
-            first_connection.read_session_output(&mut protocol, session_id, 1024),
-        );
-        assert_eq!(first_packets.len(), 1);
-        let runtime_snapshot_count_after_first_attach =
-            backend.terminal_snapshot_count_for_session(session_id);
-
-        let resize_responses = send_encrypted_packet(
-            &mut protocol,
-            &mut first_connection,
-            &mut first_device_session,
-            ProtocolPacket::request(
-                PacketRequestId::new(),
-                METHOD_SESSION_RESIZE,
-                serde_json::to_value(SessionResizePayload {
-                    session_id,
-                    size: TerminalSize::new(40, 120),
-                })
-                .unwrap(),
-            ),
-        );
-        let _ = decrypt_first_packet(&mut first_device_session, resize_responses);
-        let resize_packets = decrypt_packets(
-            &mut first_device_session,
-            first_connection.read_session_output(&mut protocol, session_id, 1024),
-        );
-        assert_eq!(resize_packets.len(), 1);
-        let resize_frame: TerminalFramePayload =
-            decode_payload(resize_packets[0].payload.clone()).unwrap();
-        match resize_frame {
-            TerminalFramePayload::Snapshot { base_seq, size, .. } => {
-                assert_eq!(base_seq, 1);
-                assert_eq!(size, TerminalSize::new(40, 120));
-            }
-            other => panic!("expected resize rebase snapshot, got {other:?}"),
-        }
-        let runtime_snapshot_count_after_resize =
-            backend.terminal_snapshot_count_for_session(session_id);
-        assert_eq!(
-            runtime_snapshot_count_after_resize > runtime_snapshot_count_after_first_attach,
-            true,
-            "恢复 tmux session 在 resize 但尚未收到 redraw 时，仍要回源 runtime 提供 resize 之后的权威恢复数据"
-        );
-
-        let (mut second_connection, _) = protocol.start_connection();
-        let second_device_id = DeviceId::new();
-        let (_, mut second_device_session, _) =
-            open_packet_e2ee(&mut protocol, &mut second_connection, second_device_id);
-        pair_packet_device(
-            &mut protocol,
-            &mut second_connection,
-            &mut second_device_session,
-            second_device_id,
-            PublicKey("second-device-public-key".to_owned()),
-        );
-        let second_attach = send_encrypted_packet(
-            &mut protocol,
-            &mut second_connection,
-            &mut second_device_session,
-            ProtocolPacket::stream_open(
-                PacketRequestId::new(),
-                PacketStreamId::new(),
-                METHOD_TERMINAL_ATTACH,
-                128 * 1024,
-                serde_json::to_value(SessionAttachPayload {
-                    session_id,
-                    watch_updates: true,
-                    last_terminal_seq: None,
-                })
-                .unwrap(),
-            ),
-        );
-        let _ = decrypt_first_packet(&mut second_device_session, second_attach);
-        let second_packets = decrypt_packets(
-            &mut second_device_session,
-            second_connection.read_session_output(&mut protocol, session_id, 1024),
-        );
-        assert_eq!(second_packets.len(), 1);
-        let second_snapshot: TerminalFramePayload =
-            decode_payload(second_packets[0].payload.clone()).unwrap();
-        assert!(matches!(
-            second_snapshot,
-            TerminalFramePayload::Snapshot { .. }
-        ));
-        assert!(
-            backend.terminal_snapshot_count_for_session(session_id)
-                > runtime_snapshot_count_after_resize,
-            "恢复 tmux session 只有 resize、没有 redraw 时，full snapshot reopen 仍必须回源 runtime"
-        );
-    }
-
-    #[test]
-    fn packet_terminal_full_snapshot_for_restored_tmux_session_uses_daemon_mirror_after_resize_redraw()
-     {
-        let session_id = SessionId::new();
-        let state = DaemonState {
-            version: crate::state::STATE_SCHEMA_VERSION,
-            daemon_identity: None,
-            trusted_devices: Vec::new(),
-            sessions: vec![SessionStateRecord {
-                session_id,
-                state: SessionState::Running,
-                size: TerminalSize::new(24, 80),
-                created_at_ms: UnixTimestampMillis(1_000),
-                updated_at_ms: UnixTimestampMillis(1_001),
-                restore_info: Some(PtyRestoreInfo::Tmux {
-                    socket_path: std::env::temp_dir().join("termd-test-restored-redraw-tmux.sock"),
-                    session_name: format!("termd-{}", session_id.0),
-                }),
-            }],
-        };
-        let (mut protocol, backend) = protocol_from_state(state);
-
-        let (mut first_connection, _) = protocol.start_connection();
-        let device_id = DeviceId::new();
-        let (_, mut first_device_session, _) =
-            open_packet_e2ee(&mut protocol, &mut first_connection, device_id);
-        pair_packet_device(
-            &mut protocol,
-            &mut first_connection,
-            &mut first_device_session,
-            device_id,
-            PublicKey("device-public-key".to_owned()),
-        );
-
-        let first_attach = send_encrypted_packet(
-            &mut protocol,
-            &mut first_connection,
-            &mut first_device_session,
-            ProtocolPacket::stream_open(
-                PacketRequestId::new(),
-                PacketStreamId::new(),
-                METHOD_TERMINAL_ATTACH,
-                128 * 1024,
-                serde_json::to_value(SessionAttachPayload {
-                    session_id,
-                    watch_updates: true,
-                    last_terminal_seq: None,
-                })
-                .unwrap(),
-            ),
-        );
-        let _ = decrypt_first_packet(&mut first_device_session, first_attach);
-        let first_packets = decrypt_packets(
-            &mut first_device_session,
-            first_connection.read_session_output(&mut protocol, session_id, 1024),
-        );
-        assert_eq!(first_packets.len(), 1);
-
-        let resize_responses = send_encrypted_packet(
-            &mut protocol,
-            &mut first_connection,
-            &mut first_device_session,
-            ProtocolPacket::request(
-                PacketRequestId::new(),
-                METHOD_SESSION_RESIZE,
-                serde_json::to_value(SessionResizePayload {
-                    session_id,
-                    size: TerminalSize::new(40, 120),
-                })
-                .unwrap(),
-            ),
-        );
-        let _ = decrypt_first_packet(&mut first_device_session, resize_responses);
-        let resize_packets = decrypt_packets(
-            &mut first_device_session,
-            first_connection.read_session_output(&mut protocol, session_id, 1024),
-        );
-        assert_eq!(resize_packets.len(), 1);
-        let resize_frame: TerminalFramePayload =
-            decode_payload(resize_packets[0].payload.clone()).unwrap();
-        match resize_frame {
-            TerminalFramePayload::Snapshot { base_seq, size, .. } => {
-                assert_eq!(base_seq, 1);
-                assert_eq!(size, TerminalSize::new(40, 120));
-            }
-            other => panic!("expected resize rebase snapshot, got {other:?}"),
-        }
-
-        backend
-            .push_output_for_session(session_id, b"\x1b[2J\x1b[Hrestored-redraw-ready\n".to_vec());
-        let redraw_packets = decrypt_packets(
-            &mut first_device_session,
-            first_connection.read_session_output(&mut protocol, session_id, 1024),
-        );
-        assert_eq!(redraw_packets.len(), 1);
-        let redraw_frame: TerminalFramePayload =
-            decode_payload(redraw_packets[0].payload.clone()).unwrap();
-        assert!(matches!(
-            redraw_frame,
-            TerminalFramePayload::Output {
-                terminal_seq: 2,
-                ..
-            }
-        ));
-        let runtime_snapshot_count_after_redraw =
-            backend.terminal_snapshot_count_for_session(session_id);
-
-        let (mut second_connection, _) = protocol.start_connection();
-        let second_device_id = DeviceId::new();
-        let (_, mut second_device_session, _) =
-            open_packet_e2ee(&mut protocol, &mut second_connection, second_device_id);
-        pair_packet_device(
-            &mut protocol,
-            &mut second_connection,
-            &mut second_device_session,
-            second_device_id,
-            PublicKey("second-device-public-key".to_owned()),
-        );
-        let second_attach = send_encrypted_packet(
-            &mut protocol,
-            &mut second_connection,
-            &mut second_device_session,
-            ProtocolPacket::stream_open(
-                PacketRequestId::new(),
-                PacketStreamId::new(),
-                METHOD_TERMINAL_ATTACH,
-                128 * 1024,
-                serde_json::to_value(SessionAttachPayload {
-                    session_id,
-                    watch_updates: true,
-                    last_terminal_seq: None,
-                })
-                .unwrap(),
-            ),
-        );
-        let _ = decrypt_first_packet(&mut second_device_session, second_attach);
-        let second_packets = decrypt_packets(
-            &mut second_device_session,
-            second_connection.read_session_output(&mut protocol, session_id, 1024),
-        );
-        assert_eq!(second_packets.len(), 1);
-        let second_snapshot: TerminalFramePayload =
-            decode_payload(second_packets[0].payload.clone()).unwrap();
-        match second_snapshot {
-            TerminalFramePayload::Snapshot { base_seq, size, .. } => {
-                assert_eq!(base_seq, 2);
-                assert_eq!(size, TerminalSize::new(40, 120));
-            }
-            other => panic!("expected daemon mirror snapshot after resize redraw, got {other:?}"),
-        }
-        assert_eq!(
-            backend.terminal_snapshot_count_for_session(session_id),
-            runtime_snapshot_count_after_redraw,
-            "恢复 tmux session 在收到 resize 后连续 redraw 后，下一次 full snapshot reopen 应直接走 daemon mirror，不再回源 runtime"
-        );
-    }
-
-    #[test]
     fn packet_terminal_reattach_uses_daemon_terminal_log_without_runtime_snapshot() {
         let (mut protocol, backend) = protocol();
         let (mut first_connection, _) = protocol.start_connection();
@@ -13636,7 +13228,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_restores_tmux_restore_info_records() {
+    fn startup_marks_tmux_restore_info_records_closed() {
         let backend = FakePtyBackend::default();
         let state_path = temp_state_path("restore-tmux-session.json");
         let config = DaemonConfig::default_for_state_path(&state_path);
@@ -13690,15 +13282,21 @@ mod tests {
             DaemonProtocol::from_state(config, backend.clone(), Ed25519SignatureVerifier, state)
                 .unwrap();
 
-        assert_eq!(backend.reconnects(), vec![session_id.0.to_string()]);
-        assert_eq!(
-            backend.reconnect_sizes(),
-            vec![PtySize::with_pixels(33, 111, 800, 600)]
+        assert!(
+            backend.reconnects().is_empty(),
+            "生产 supervisor 启动路径不应再尝试接回旧 tmux restore 记录"
         );
-        assert!(protocol.session_index.contains_key(&session_id));
-        assert_eq!(
-            protocol.snapshot_state().sessions[0].restore_info,
-            Some(restore_info)
+        assert!(
+            backend.reconnect_sizes().is_empty(),
+            "旧 tmux restore 记录应该在恢复阶段直接降级为 closed"
+        );
+        assert!(
+            !protocol.session_index.contains_key(&session_id),
+            "tmux restore 记录不应继续出现在运行中的 session catalog 里"
+        );
+        assert!(
+            protocol.snapshot_state().sessions.is_empty(),
+            "被淘汰的 tmux restore 记录不应继续作为 live session 持久化回 state"
         );
     }
 

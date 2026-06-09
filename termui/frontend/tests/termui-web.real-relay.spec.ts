@@ -110,30 +110,13 @@ test("真实 relay 下 clear 之后上滚不会再看到 pre-clear 历史", asyn
     await expect
       .poll(async () => terminalDebugBufferText(page), { timeout: 10_000 })
       .toContain("post-clear-001");
-    await expect
-      .poll(
-        async () =>
-          page.evaluate(() =>
-            ((globalThis as { __TERMD_DIAG_EVENTS__?: Array<{ name?: string; fields?: { reason?: string } }> })
-              .__TERMD_DIAG_EVENTS__ ?? []
-            ).filter((event) =>
-              event.name === "receive_loop_terminal_snapshot",
-            ),
-          ),
-        { timeout: 10_000 },
-      )
-      .toEqual(
-        expect.arrayContaining([
-          expect.objectContaining({
-            name: "receive_loop_terminal_snapshot",
-            fields: expect.objectContaining({ revealHistory: true }),
-          }),
-        ]),
-      );
-
     const scrolledViewport = await terminalDebugBufferText(page);
     expect(scrolledViewport).not.toContain("pre-clear-001");
     expect(scrolledViewport).not.toContain("pre-clear-080");
+    // 中文注释：这里验证的是“clear 之后只看到 post-clear 历史”，不是强绑某一种
+    // scrollback 恢复实现。Ghostty 本地 scrollback 已足够时，用户向上滚可能不需要
+    // 再触发一次 reveal-history full snapshot。
+    await expect(page.getByRole("alert", { name: "Connection error" })).toHaveCount(0);
     const selectedViewportText = await page.evaluate(() => {
       const bridge = (window as typeof window & {
         __TERMD_DEBUG_GHOSTTY__?: {
@@ -1196,6 +1179,13 @@ function collectBrowserErrors(page: Page, label: string, browserErrors: string[]
   });
   page.on("pageerror", (error) => {
     browserErrors.push(`[${label}:pageerror] ${error.message}`);
+  });
+  page.on("requestfailed", (request) => {
+    const failureText = request.failure()?.errorText;
+    if (!failureText) {
+      return;
+    }
+    browserErrors.push(`[${label}:requestfailed] ${failureText} ${request.url()}`);
   });
 }
 

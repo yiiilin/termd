@@ -233,6 +233,11 @@ impl<B: PtyBackend> SessionRuntime<B> {
         device_id: impl Into<String>,
     ) -> RuntimeResult<AttachRole> {
         self.ensure_open_session(session_id)?;
+        let device_id = device_id.into();
+        {
+            let runtime_session = self.runtime_session_mut(session_id)?;
+            let _ = runtime_session.pty.authority_attach_device(&device_id)?;
+        }
         Ok(self.sessions.attach(session_id, device_id)?)
     }
 
@@ -290,6 +295,11 @@ impl<B: PtyBackend> SessionRuntime<B> {
     /// shared-control 模式没有夺权概念；旧 control 命令只确认设备已经 attach。
     pub fn steal_control(&mut self, session_id: &str, device_id: &str) -> RuntimeResult<()> {
         self.ensure_open_session(session_id)?;
+        if let Some(attached) = self.session_authority_has_device(session_id, device_id)? {
+            return attached
+                .then_some(())
+                .ok_or(RuntimeError::DeviceNotAttached);
+        }
         Ok(self.sessions.steal_control(session_id, device_id)?)
     }
 
@@ -305,7 +315,13 @@ impl<B: PtyBackend> SessionRuntime<B> {
     ) -> RuntimeResult<()> {
         self.ensure_open_session(session_id)?;
 
-        match self.sessions.role(session_id, device_id)? {
+        let role = match self.session_authority_has_device(session_id, device_id)? {
+            Some(true) => Some(AttachRole::Operator),
+            Some(false) => None,
+            None => self.sessions.role(session_id, device_id)?,
+        };
+
+        match role {
             Some(AttachRole::Operator) => {
                 self.runtime_session_mut(session_id)?.pty.write_all(bytes)?;
                 Ok(())
@@ -345,7 +361,29 @@ impl<B: PtyBackend> SessionRuntime<B> {
     /// 这保证了“client 断开不会杀 session”的核心不变量。
     pub fn detach(&mut self, session_id: &str, device_id: &str) -> RuntimeResult<()> {
         self.ensure_open_session(session_id)?;
-        Ok(self.sessions.detach(session_id, device_id)?)
+        let mut detached_by_authority = false;
+        if let Some(attached) = self.session_authority_has_device(session_id, device_id)? {
+            if !attached {
+                // 中文注释：supervisor 已经确认 host 侧没有这个设备时，仍要继续清理
+                // daemon 本地镜像。这样才能覆盖 “host 已删 / local 仍脏” 的反向漂移，
+                // 让重复 detach 收敛成真正的幂等语义。
+                return match self.sessions.detach(session_id, device_id) {
+                    Ok(()) => Ok(()),
+                    Err(SessionError::DeviceNotAttached) => Err(RuntimeError::DeviceNotAttached),
+                    Err(error) => Err(error.into()),
+                };
+            }
+            let runtime_session = self.runtime_session_mut(session_id)?;
+            detached_by_authority = runtime_session
+                .pty
+                .authority_detach_device(device_id)?
+                .is_some();
+        }
+        match self.sessions.detach(session_id, device_id) {
+            Ok(()) => Ok(()),
+            Err(SessionError::DeviceNotAttached) if detached_by_authority => Ok(()),
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// 显式关闭 runtime session，并终止对应 PTY 进程。
@@ -383,7 +421,12 @@ impl<B: PtyBackend> SessionRuntime<B> {
     }
 
     /// 查询设备在 session 中的角色。
-    pub fn role(&self, session_id: &str, device_id: &str) -> RuntimeResult<Option<AttachRole>> {
+    pub fn role(&mut self, session_id: &str, device_id: &str) -> RuntimeResult<Option<AttachRole>> {
+        if self.runtime_sessions.contains_key(session_id) {
+            if let Some(attached) = self.session_authority_has_device(session_id, device_id)? {
+                return Ok(attached.then_some(AttachRole::Operator));
+            }
+        }
         Ok(self.sessions.role(session_id, device_id)?)
     }
 
@@ -481,6 +524,21 @@ impl<B: PtyBackend> SessionRuntime<B> {
 
     fn ensure_runtime_session(&self, session_id: &str) -> RuntimeResult<()> {
         self.runtime_session(session_id).map(|_| ())
+    }
+
+    /// 查询当前 PTY host 是否自己维护 attached-device 真值。
+    ///
+    /// 中文注释：`None` 表示后端没有 authority 概念，runtime 继续信任本地
+    /// `SessionManager`；`Some(bool)` 表示 supervisor 已成为权威来源。
+    fn session_authority_has_device(
+        &mut self,
+        session_id: &str,
+        device_id: &str,
+    ) -> RuntimeResult<Option<bool>> {
+        Ok(self
+            .runtime_session_mut(session_id)?
+            .pty
+            .authority_has_device(device_id)?)
     }
 
     fn ensure_open_session(&self, session_id: &str) -> RuntimeResult<()> {
@@ -584,6 +642,7 @@ mod tests {
         PtySession, PtySize, PtySnapshot,
     };
     use crate::session::{AttachRole, TerminalSize};
+    use std::collections::HashSet;
     use std::sync::{Arc, Mutex};
 
     #[derive(Clone, Default)]
@@ -599,9 +658,17 @@ mod tests {
         writes: Vec<Vec<u8>>,
         resizes: Vec<PtySize>,
         terminate_count: usize,
+        authority_enabled: bool,
+        attached_devices: HashSet<String>,
     }
 
     impl FakePtyBackend {
+        fn authoritative() -> Self {
+            let backend = Self::default();
+            backend.state.lock().unwrap().authority_enabled = true;
+            backend
+        }
+
         fn writes(&self) -> Vec<Vec<u8>> {
             self.state.lock().unwrap().writes.clone()
         }
@@ -620,6 +687,15 @@ mod tests {
 
         fn attachment_drops(&self) -> Vec<String> {
             self.state.lock().unwrap().attachment_drops.clone()
+        }
+
+        fn replace_attached_devices<I, S>(&self, devices: I)
+        where
+            I: IntoIterator<Item = S>,
+            S: Into<String>,
+        {
+            self.state.lock().unwrap().attached_devices =
+                devices.into_iter().map(Into::into).collect();
         }
     }
 
@@ -684,6 +760,32 @@ mod tests {
         fn write_all(&mut self, bytes: &[u8]) -> PtyResult<()> {
             self.state.lock().unwrap().writes.push(bytes.to_vec());
             Ok(())
+        }
+
+        fn authority_attach_device(&mut self, device_id: &str) -> PtyResult<Option<()>> {
+            let mut state = self.state.lock().unwrap();
+            if !state.authority_enabled {
+                return Ok(None);
+            }
+            state.attached_devices.insert(device_id.to_owned());
+            Ok(Some(()))
+        }
+
+        fn authority_detach_device(&mut self, device_id: &str) -> PtyResult<Option<()>> {
+            let mut state = self.state.lock().unwrap();
+            if !state.authority_enabled {
+                return Ok(None);
+            }
+            state.attached_devices.remove(device_id);
+            Ok(Some(()))
+        }
+
+        fn authority_has_device(&mut self, device_id: &str) -> PtyResult<Option<bool>> {
+            let state = self.state.lock().unwrap();
+            if !state.authority_enabled {
+                return Ok(None);
+            }
+            Ok(Some(state.attached_devices.contains(device_id)))
         }
 
         fn resize(&mut self, size: PtySize) -> PtyResult<()> {
@@ -901,5 +1003,96 @@ mod tests {
         assert_eq!(backend.terminate_count(), 1);
         let error = runtime.attach(&session_id, "dev-b").unwrap_err();
         assert_eq!(error, RuntimeError::SessionClosed);
+    }
+
+    #[test]
+    fn authoritative_backend_write_input_uses_supervisor_truth_instead_of_local_mirror() {
+        let backend = FakePtyBackend::authoritative();
+        let mut runtime = SessionRuntime::new(backend.clone());
+        let session_id = runtime
+            .create_session(CommandSpec::new("sh"), TerminalSize::cells(24, 80))
+            .unwrap();
+        runtime.attach(&session_id, "dev-a").unwrap();
+
+        // 中文注释：模拟 supervisor authority 已经丢失该设备，而 daemon 本地镜像仍停留在旧状态。
+        backend.replace_attached_devices(Vec::<String>::new());
+
+        let error = runtime
+            .write_input(&session_id, "dev-a", b"echo stale\n")
+            .unwrap_err();
+
+        assert_eq!(error, RuntimeError::DeviceNotAttached);
+        assert!(backend.writes().is_empty());
+    }
+
+    #[test]
+    fn authoritative_backend_role_follows_supervisor_truth() {
+        let backend = FakePtyBackend::authoritative();
+        let mut runtime = SessionRuntime::new(backend.clone());
+        let session_id = runtime
+            .create_session(CommandSpec::new("sh"), TerminalSize::cells(24, 80))
+            .unwrap();
+        runtime.attach(&session_id, "dev-a").unwrap();
+
+        backend.replace_attached_devices(["dev-b"]);
+
+        assert_eq!(runtime.role(&session_id, "dev-a").unwrap(), None);
+        assert_eq!(
+            runtime.role(&session_id, "dev-b").unwrap(),
+            Some(AttachRole::Operator)
+        );
+    }
+
+    #[test]
+    fn authoritative_backend_steal_control_requires_supervisor_attachment() {
+        let backend = FakePtyBackend::authoritative();
+        let mut runtime = SessionRuntime::new(backend.clone());
+        let session_id = runtime
+            .create_session(CommandSpec::new("sh"), TerminalSize::cells(24, 80))
+            .unwrap();
+        runtime.attach(&session_id, "dev-a").unwrap();
+
+        backend.replace_attached_devices(Vec::<String>::new());
+
+        let error = runtime.steal_control(&session_id, "dev-a").unwrap_err();
+        assert_eq!(error, RuntimeError::DeviceNotAttached);
+    }
+
+    #[test]
+    fn authoritative_backend_detach_tolerates_local_mirror_drift_after_host_success() {
+        let backend = FakePtyBackend::authoritative();
+        let mut runtime = SessionRuntime::new(backend.clone());
+        let session_id = runtime
+            .create_session(CommandSpec::new("sh"), TerminalSize::cells(24, 80))
+            .unwrap();
+        runtime.attach(&session_id, "dev-a").unwrap();
+        runtime.detach(&session_id, "dev-a").unwrap();
+
+        // 中文注释：模拟 daemon 本地 mirror 已经丢了 attach 记录，但 supervisor 仍保留旧设备。
+        backend.replace_attached_devices(["dev-a"]);
+
+        runtime
+            .detach(&session_id, "dev-a")
+            .expect("authority 已完成 detach 时，不应因为本地 mirror 漂移报假错");
+        assert_eq!(runtime.role(&session_id, "dev-a").unwrap(), None);
+    }
+
+    #[test]
+    fn authoritative_backend_detach_tolerates_host_already_detached_when_local_mirror_is_stale() {
+        let backend = FakePtyBackend::authoritative();
+        let mut runtime = SessionRuntime::new(backend.clone());
+        let session_id = runtime
+            .create_session(CommandSpec::new("sh"), TerminalSize::cells(24, 80))
+            .unwrap();
+        runtime.attach(&session_id, "dev-a").unwrap();
+
+        // 中文注释：模拟 supervisor authority 已经先删掉设备，但 daemon 本地 mirror
+        // 还保留着旧 attach 记录。重复 detach 应收敛为成功，并顺便清掉本地脏状态。
+        backend.replace_attached_devices(Vec::<String>::new());
+
+        runtime
+            .detach(&session_id, "dev-a")
+            .expect("host 已先完成 detach 时，local mirror 仍应能被清理收敛");
+        assert_eq!(runtime.role(&session_id, "dev-a").unwrap(), None);
     }
 }

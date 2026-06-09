@@ -416,6 +416,30 @@ pub trait PtySession: Send {
     /// 写入用户输入或控制序列。调用前应由 session 层确认当前设备具备控制权。
     fn write_all(&mut self, bytes: &[u8]) -> PtyResult<()>;
 
+    /// 如果当前 PTY host 自己维护 session 级 attached-device authority，则在这里注册设备。
+    ///
+    /// 返回 `Ok(Some(()))` 表示 authority 已在 host 侧处理，runtime 只需要同步本地镜像；
+    /// 返回 `Ok(None)` 表示 host 不识别该概念，runtime 应继续使用本地 `SessionManager`。
+    fn authority_attach_device(&mut self, _device_id: &str) -> PtyResult<Option<()>> {
+        Ok(None)
+    }
+
+    /// 从 host 侧 attached-device authority 中移除设备。
+    ///
+    /// 语义与 `authority_attach_device` 一致：`Some(())` 表示 host 已处理，`None` 表示
+    /// 调用方应继续走 daemon 本地状态机。
+    fn authority_detach_device(&mut self, _device_id: &str) -> PtyResult<Option<()>> {
+        Ok(None)
+    }
+
+    /// 查询 host 侧是否认为该设备已经 attached。
+    ///
+    /// 返回 `Some(true/false)` 表示 host 持有权威 attached-device 集合；返回 `None` 表示
+    /// host 不维护该状态，调用方应继续查询 daemon 本地状态机。
+    fn authority_has_device(&mut self, _device_id: &str) -> PtyResult<Option<bool>> {
+        Ok(None)
+    }
+
     /// 调整 PTY 尺寸。
     fn resize(&mut self, size: PtySize) -> PtyResult<()>;
 

@@ -164,6 +164,9 @@ function useReconnectHarness(input: {
     loadSessionFiles: vi.fn(async () => undefined),
     loadSessionGit: vi.fn(async () => undefined),
     refreshDaemonClients: vi.fn(async () => undefined),
+    claimAttachClient: (client) => {
+      attachClientRef.current = client;
+    },
     upsertAttachedSession: (current, attached) => [
       ...current.filter((session) => session.session_id !== attached.session_id),
       attached,

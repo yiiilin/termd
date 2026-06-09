@@ -8,6 +8,7 @@ mod terminal_journal;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::UnixStream as StdUnixStream;
@@ -42,6 +43,7 @@ const RETAINED_OUTPUT_MAX_BYTES: usize = 1024 * 1024;
 const SUPERVISOR_OUTPUT_PUMP_CHUNK_BYTES: usize = 64 * 1024;
 const SUPERVISOR_OUTPUT_PUMP_MAX_CHUNKS_PER_TICK: usize = 64;
 const SUPERVISOR_OUTPUT_PUMP_MAX_BYTES_PER_TICK: usize = 4 * 1024 * 1024;
+const UNIX_SOCKET_PATH_MAX_BYTES: usize = 107;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SupervisorProcess {
@@ -88,7 +90,8 @@ impl SupervisorPtyBackend {
     }
 
     fn socket_path_for_session(&self, session_id: &str) -> PathBuf {
-        self.runtime_dir.join(format!("{session_id}.sock"))
+        self.runtime_dir
+            .join(short_supervisor_socket_file_name(session_id))
     }
 
     /// 统计当前 supervisor 目录中已经不属于有效 runtime session 的孤儿进程。
@@ -251,14 +254,14 @@ struct SupervisorPtySession {
     restore_info: PtyRestoreInfo,
     supervisor_child: StdMutex<Option<Child>>,
     writer: StdMutex<StdUnixStream>,
-    pending_requests:
-        Arc<StdMutex<HashMap<u64, mpsc::Sender<PtyResult<SupervisorResponsePayload>>>>>,
+    pending_requests: Arc<StdMutex<HashMap<u64, mpsc::Sender<SupervisorRequestCompletion>>>>,
     pending_output: Arc<StdMutex<VecDeque<Vec<u8>>>>,
     pending_terminal_frames: Arc<StdMutex<VecDeque<PtyTerminalFrame>>>,
     terminal_mirror: Arc<StdMutex<SupervisorTerminalMirror>>,
     output_signal_tx: watch::Sender<u64>,
     output_signal_rx: watch::Receiver<u64>,
     next_request_id: AtomicU64,
+    controller_identity: StdMutex<Option<ControllerIdentity>>,
     cached_size: StdMutex<PtySize>,
     cached_process_id: StdMutex<Option<u32>>,
 }
@@ -304,12 +307,19 @@ impl SupervisorPtySession {
             output_signal_tx,
             output_signal_rx,
             next_request_id: AtomicU64::new(1),
+            controller_identity: StdMutex::new(None),
             cached_size: StdMutex::new(PtySize::default()),
             cached_process_id: StdMutex::new(None),
         };
 
         let sync = session.attach_sync(None)?;
         session.seed_attach_sync(sync);
+        // 中文注释：新的 daemon controller 接管 session 时，要把旧 daemon 遗留的
+        // attached-device authority 清空；否则 daemon 重启后，已经掉线的设备仍会被
+        // supervisor 当作已 attach。
+        session
+            .request(SupervisorRequest::ResetAttachedDevices)?
+            .expect_empty()?;
 
         Ok(session)
     }
@@ -319,14 +329,22 @@ impl SupervisorPtySession {
         for attempt in 0..3 {
             match self.request_once(request.clone()) {
                 Ok(payload) => return Ok(payload),
-                Err(error) => {
+                Err(SupervisorRequestFailure::Response(error)) => return Err(error),
+                Err(SupervisorRequestFailure::Transport(error)) => {
                     last_error = Some(error);
                     if attempt < 2 {
                         // supervisor 进程仍存活但 Unix IPC 连接可能因为 daemon 侧读写竞态、
                         // 旧连接 EOF 或热升级残留而断开；运行中请求失败时重连同一个 socket
                         // 再做有限重试，避免把活 session 误报为 runtime_failed。
-                        if self.reconnect_ipc().is_ok() {
-                            continue;
+                        //
+                        // 中文注释：这里只能重试传输层故障。supervisor 明确返回的业务拒绝
+                        // 必须原样上抛；否则 stale controller 会借自动重连重新 attach_sync，
+                        // 再次篡夺 active controller 身份。
+                        match self.reconnect_ipc() {
+                            Ok(()) => continue,
+                            Err(reconnect_error) => {
+                                last_error = Some(reconnect_error);
+                            }
                         }
                     }
                 }
@@ -337,7 +355,10 @@ impl SupervisorPtySession {
             .unwrap_or_else(|| PtyError::Backend("session supervisor request failed".to_owned())))
     }
 
-    fn request_once(&self, request: SupervisorRequest) -> PtyResult<SupervisorResponsePayload> {
+    fn request_once(
+        &self,
+        request: SupervisorRequest,
+    ) -> Result<SupervisorResponsePayload, SupervisorRequestFailure> {
         let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         let envelope = SupervisorRequestEnvelope {
             request_id,
@@ -361,22 +382,22 @@ impl SupervisorPtySession {
                 .lock()
                 .expect("supervisor pending request mutex poisoned")
                 .remove(&request_id);
-            return Err(PtyError::from(error));
+            return Err(SupervisorRequestFailure::Transport(PtyError::from(error)));
         }
 
         match rx.recv_timeout(REQUEST_TIMEOUT) {
-            Ok(result) => result,
+            Ok(result) => result.into_result(),
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 self.pending_requests
                     .lock()
                     .expect("supervisor pending request mutex poisoned")
                     .remove(&request_id);
-                Err(PtyError::Backend(
+                Err(SupervisorRequestFailure::Transport(PtyError::Backend(
                     "session supervisor request timed out".to_owned(),
-                ))
+                )))
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => Err(PtyError::Backend(
-                "session supervisor response channel disconnected".to_owned(),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(SupervisorRequestFailure::Transport(
+                PtyError::Backend("session supervisor response channel disconnected".to_owned()),
             )),
         }
     }
@@ -415,10 +436,20 @@ impl SupervisorPtySession {
             self.output_signal_tx.clone(),
         )?;
 
-        let sync = self.attach_sync_once(None)?;
+        let sync = self.attach_sync_once(
+            self.current_controller_id().map(|identity| identity.id),
+            None,
+        )?;
         self.seed_attach_sync(sync);
         let _ = supervisor_pid;
         Ok(())
+    }
+
+    fn current_controller_id(&self) -> Option<ControllerIdentity> {
+        *self
+            .controller_identity
+            .lock()
+            .expect("controller identity mutex poisoned")
     }
 
     fn attach_sync(
@@ -428,22 +459,33 @@ impl SupervisorPtySession {
         self.request(SupervisorRequest::AttachSync {
             session_id: self.session_id.clone(),
             last_terminal_seq,
+            resume_controller_id: None,
         })?
         .into_attach_sync()
     }
 
     fn attach_sync_once(
         &self,
+        resume_controller_id: Option<u64>,
         last_terminal_seq: Option<u64>,
     ) -> PtyResult<SupervisorAttachSyncPayload> {
         self.request_once(SupervisorRequest::AttachSync {
             session_id: self.session_id.clone(),
             last_terminal_seq,
-        })?
+            resume_controller_id,
+        })
+        .map_err(SupervisorRequestFailure::into_pty_error)?
         .into_attach_sync()
     }
 
     fn seed_attach_sync(&self, sync: SupervisorAttachSyncPayload) {
+        *self
+            .controller_identity
+            .lock()
+            .expect("controller identity mutex poisoned") = Some(ControllerIdentity {
+            id: sync.controller_id,
+            connection_id: sync.controller_connection_id,
+        });
         let snapshot = sync.snapshot;
         *self.cached_size.lock().expect("cached size mutex poisoned") = snapshot.size;
         *self
@@ -501,6 +543,27 @@ impl SupervisorPtySession {
             .expect("pending terminal frames mutex poisoned")
             .is_empty()
     }
+
+    fn attach_device(&self, device_id: &str) -> PtyResult<()> {
+        self.request(SupervisorRequest::AttachDevice {
+            device_id: device_id.to_owned(),
+        })?
+        .expect_empty()
+    }
+
+    fn detach_device(&self, device_id: &str) -> PtyResult<()> {
+        self.request(SupervisorRequest::DetachDevice {
+            device_id: device_id.to_owned(),
+        })?
+        .expect_empty()
+    }
+
+    fn has_attached_device(&self, device_id: &str) -> PtyResult<bool> {
+        self.request(SupervisorRequest::DeviceAttached {
+            device_id: device_id.to_owned(),
+        })?
+        .into_device_attached()
+    }
 }
 
 impl Drop for SupervisorPtySession {
@@ -547,9 +610,7 @@ fn connect_supervisor_socket(socket_path: &Path) -> PtyResult<StdUnixStream> {
 fn spawn_supervisor_reader_thread(
     session_id: &str,
     reader: StdUnixStream,
-    pending_requests: Arc<
-        StdMutex<HashMap<u64, mpsc::Sender<PtyResult<SupervisorResponsePayload>>>>,
-    >,
+    pending_requests: Arc<StdMutex<HashMap<u64, mpsc::Sender<SupervisorRequestCompletion>>>>,
     pending_terminal_frames: Arc<StdMutex<VecDeque<PtyTerminalFrame>>>,
     terminal_mirror: Arc<StdMutex<SupervisorTerminalMirror>>,
     output_signal_tx: watch::Sender<u64>,
@@ -623,6 +684,20 @@ impl PtySession for SupervisorPtySession {
             data_base64: general_purpose::STANDARD.encode(bytes),
         })?
         .expect_empty()
+    }
+
+    fn authority_attach_device(&mut self, device_id: &str) -> PtyResult<Option<()>> {
+        self.attach_device(device_id)?;
+        Ok(Some(()))
+    }
+
+    fn authority_detach_device(&mut self, device_id: &str) -> PtyResult<Option<()>> {
+        self.detach_device(device_id)?;
+        Ok(Some(()))
+    }
+
+    fn authority_has_device(&mut self, device_id: &str) -> PtyResult<Option<bool>> {
+        Ok(Some(self.has_attached_device(device_id)?))
     }
 
     fn resize(&mut self, size: PtySize) -> PtyResult<()> {
@@ -763,9 +838,7 @@ fn restore_info_with_status(
 
 fn supervisor_reader_loop(
     mut reader: StdUnixStream,
-    pending_requests: Arc<
-        StdMutex<HashMap<u64, mpsc::Sender<PtyResult<SupervisorResponsePayload>>>>,
-    >,
+    pending_requests: Arc<StdMutex<HashMap<u64, mpsc::Sender<SupervisorRequestCompletion>>>>,
     pending_terminal_frames: Arc<StdMutex<VecDeque<PtyTerminalFrame>>>,
     terminal_mirror: Arc<StdMutex<SupervisorTerminalMirror>>,
     output_signal_tx: watch::Sender<u64>,
@@ -790,7 +863,7 @@ fn supervisor_reader_loop(
                     .expect("supervisor pending request mutex poisoned")
                     .remove(&request_id)
                 {
-                    let _ = sender.send(response.into_result());
+                    let _ = sender.send(SupervisorRequestCompletion::Response(response));
                 }
             }
             SupervisorFrame::TerminalFrame { frame } => {
@@ -812,9 +885,7 @@ fn supervisor_reader_loop(
 }
 
 fn fail_all_pending_requests(
-    pending_requests: &Arc<
-        StdMutex<HashMap<u64, mpsc::Sender<PtyResult<SupervisorResponsePayload>>>>,
-    >,
+    pending_requests: &Arc<StdMutex<HashMap<u64, mpsc::Sender<SupervisorRequestCompletion>>>>,
     message: String,
 ) {
     let pending = std::mem::take(
@@ -823,7 +894,9 @@ fn fail_all_pending_requests(
             .expect("supervisor pending request mutex poisoned"),
     );
     for (_, sender) in pending {
-        let _ = sender.send(Err(PtyError::Backend(message.clone())));
+        let _ = sender.send(SupervisorRequestCompletion::TransportError(
+            PtyError::Backend(message.clone()),
+        ));
     }
 }
 
@@ -841,7 +914,25 @@ fn supervisor_runtime_dir(state_path: &Path) -> PathBuf {
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(std::env::temp_dir);
 
-    base_dir.join("termd-supervisors")
+    let preferred = base_dir.join("termd-supervisors");
+    if preferred.to_string_lossy().len() + 1 + short_supervisor_socket_file_name("probe").len()
+        < UNIX_SOCKET_PATH_MAX_BYTES
+    {
+        preferred
+    } else {
+        // 中文注释：状态目录本身太长时，子目录名也必须跟着压缩；否则即便 socket 文件名
+        // 已经哈希化，最终 Unix socket 路径仍会超过 `sun_path` 上限。
+        base_dir.join("ts")
+    }
+}
+
+fn short_supervisor_socket_file_name(session_id: &str) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    session_id.hash(&mut hasher);
+    // 中文注释：Unix domain socket 路径受平台 `sun_path` 长度限制。state 目录本身
+    // 可能已经很长，所以文件名必须固定且紧凑，不能直接把完整 session id 拼进去。
+    let token = general_purpose::URL_SAFE_NO_PAD.encode(hasher.finish().to_be_bytes());
+    format!("{token}.sock")
 }
 
 fn supervisor_processes_from_proc() -> PtyResult<Vec<SupervisorProcess>> {
@@ -970,7 +1061,12 @@ struct SupervisorShared {
 
 struct SupervisorState {
     next_controller_id: u64,
+    next_controller_connection_id: u64,
+    active_controller_id: Option<u64>,
+    active_controller_connection_id: Option<u64>,
+    controller_resume_lease_id: Option<u64>,
     controllers: HashMap<u64, ControllerHandle>,
+    attached_devices: HashSet<String>,
     retained_output: VecDeque<u8>,
     terminal: SupervisorTerminalCache,
 }
@@ -979,10 +1075,27 @@ impl SupervisorState {
     fn new(size: PtySize) -> Self {
         Self {
             next_controller_id: 1,
+            next_controller_connection_id: 1,
+            active_controller_id: None,
+            active_controller_connection_id: None,
+            controller_resume_lease_id: None,
             controllers: HashMap::new(),
+            attached_devices: HashSet::new(),
             retained_output: VecDeque::new(),
             terminal: SupervisorTerminalCache::new(size),
         }
+    }
+
+    fn attach_device(&mut self, device_id: &str) {
+        self.attached_devices.insert(device_id.to_owned());
+    }
+
+    fn detach_device(&mut self, device_id: &str) {
+        self.attached_devices.remove(device_id);
+    }
+
+    fn has_attached_device(&self, device_id: &str) -> bool {
+        self.attached_devices.contains(device_id)
     }
 
     fn record_output(&mut self, bytes: &[u8]) -> PtyTerminalFrame {
@@ -1013,38 +1126,142 @@ impl SupervisorState {
         self.terminal.size()
     }
 
-    fn attach_sync(
-        &mut self,
-        controller_tx: tokio_mpsc::UnboundedSender<SupervisorFrame>,
+    fn allocate_controller_connection_id(&mut self) -> u64 {
+        let connection_id = self.next_controller_connection_id;
+        self.next_controller_connection_id = self.next_controller_connection_id.saturating_add(1);
+        connection_id
+    }
+
+    fn build_attach_sync_payload(
+        &self,
+        controller_id: u64,
+        controller_connection_id: u64,
         process_id: Option<u32>,
         last_terminal_seq: Option<u64>,
-    ) -> (u64, SupervisorAttachSyncPayload) {
-        let id = self.next_controller_id;
-        self.next_controller_id = self.next_controller_id.saturating_add(1);
-        self.controllers
-            .insert(id, ControllerHandle { tx: controller_tx });
+    ) -> SupervisorAttachSyncPayload {
         let snapshot = SupervisorSnapshotPayload {
             size: self.size(),
             process_id,
             retained_output: self.snapshot_output(),
         };
         let (base_seq, frames) = self.terminal_snapshot_or_tail_with_base(last_terminal_seq);
-        (
+        SupervisorAttachSyncPayload {
+            controller_id,
+            controller_connection_id,
+            snapshot,
+            base_seq,
+            frames,
+        }
+    }
+
+    fn attach_sync(
+        &mut self,
+        controller_tx: tokio_mpsc::UnboundedSender<SupervisorFrame>,
+        process_id: Option<u32>,
+        last_terminal_seq: Option<u64>,
+    ) -> (ControllerIdentity, SupervisorAttachSyncPayload) {
+        let id = self.next_controller_id;
+        let connection_id = self.allocate_controller_connection_id();
+        self.next_controller_id = self.next_controller_id.saturating_add(1);
+        self.controllers.insert(
             id,
-            SupervisorAttachSyncPayload {
-                snapshot,
-                base_seq,
-                frames,
+            ControllerHandle {
+                tx: controller_tx,
+                connection_id,
             },
+        );
+        // 中文注释：最新 attach 的 daemon controller 才有资格继续作为控制面 owner。
+        // 旧 controller 可以暂时残留到连接自然收尾，但它们不能再修改 authority 或驱动 PTY。
+        self.active_controller_id = Some(id);
+        self.active_controller_connection_id = Some(connection_id);
+        self.controller_resume_lease_id = Some(id);
+        (
+            ControllerIdentity { id, connection_id },
+            self.build_attach_sync_payload(id, connection_id, process_id, last_terminal_seq),
         )
     }
 
-    fn has_controller(&self, controller_id: u64) -> bool {
-        self.controllers.contains_key(&controller_id)
+    fn resume_attach_sync(
+        &mut self,
+        controller_id: u64,
+        controller_tx: tokio_mpsc::UnboundedSender<SupervisorFrame>,
+        process_id: Option<u32>,
+        last_terminal_seq: Option<u64>,
+    ) -> PtyResult<(ControllerIdentity, SupervisorAttachSyncPayload)> {
+        if controller_id == 0 || controller_id >= self.next_controller_id {
+            return Err(PtyError::Backend(
+                "session supervisor connection is not the active controller".to_owned(),
+            ));
+        }
+        let Some(lease_controller_id) = self.controller_resume_lease_id else {
+            return Err(PtyError::Backend(
+                "session supervisor connection is not the active controller".to_owned(),
+            ));
+        };
+        if lease_controller_id != controller_id {
+            return Err(PtyError::Backend(
+                "session supervisor connection is not the active controller".to_owned(),
+            ));
+        }
+        if let Some(active_controller_id) = self.active_controller_id
+            && active_controller_id != controller_id
+        {
+            return Err(PtyError::Backend(
+                "session supervisor connection is not the active controller".to_owned(),
+            ));
+        }
+
+        // 中文注释：重连中的 active controller 只能恢复自己已有的 lease，不能申请新的
+        // owner 身份。这样 stale controller 即便碰上传输层错误，也无法借 reconnect
+        // 抢回 authority。
+        let connection_id = self.allocate_controller_connection_id();
+        self.controllers.insert(
+            controller_id,
+            ControllerHandle {
+                tx: controller_tx,
+                connection_id,
+            },
+        );
+        self.active_controller_id = Some(controller_id);
+        self.active_controller_connection_id = Some(connection_id);
+        self.controller_resume_lease_id = Some(controller_id);
+        Ok((
+            ControllerIdentity {
+                id: controller_id,
+                connection_id,
+            },
+            self.build_attach_sync_payload(
+                controller_id,
+                connection_id,
+                process_id,
+                last_terminal_seq,
+            ),
+        ))
     }
 
-    fn remove_controller(&mut self, controller_id: u64) {
-        self.controllers.remove(&controller_id);
+    fn is_active_controller(&self, controller: ControllerIdentity) -> bool {
+        self.active_controller_id == Some(controller.id)
+            && self.active_controller_connection_id == Some(controller.connection_id)
+            && self
+                .controllers
+                .get(&controller.id)
+                .is_some_and(|handle| handle.connection_id == controller.connection_id)
+    }
+
+    fn remove_controller(&mut self, controller: ControllerIdentity) {
+        let should_remove = self
+            .controllers
+            .get(&controller.id)
+            .is_some_and(|handle| handle.connection_id == controller.connection_id);
+        if should_remove {
+            self.controllers.remove(&controller.id);
+        }
+        if self.active_controller_id == Some(controller.id)
+            && self.active_controller_connection_id == Some(controller.connection_id)
+        {
+            self.active_controller_id = None;
+            self.active_controller_connection_id = None;
+        }
     }
 
     fn broadcast_terminal_frame(&mut self, frame: PtyTerminalFrame) {
@@ -1064,7 +1281,12 @@ impl SupervisorState {
         // 中文注释：发送失败代表对应 daemon IPC 已经断开，立即清理，避免后续广播继续
         // 在无效 receiver 上做无意义工作。
         for id in closed {
-            self.controllers.remove(&id);
+            if let Some(handle) = self.controllers.get(&id) {
+                self.remove_controller(ControllerIdentity {
+                    id,
+                    connection_id: handle.connection_id,
+                });
+            }
         }
     }
 }
@@ -1072,6 +1294,13 @@ impl SupervisorState {
 #[derive(Clone)]
 struct ControllerHandle {
     tx: tokio_mpsc::UnboundedSender<SupervisorFrame>,
+    connection_id: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ControllerIdentity {
+    id: u64,
+    connection_id: u64,
 }
 
 /// supervisor 入口，由主二进制的隐藏子命令调用。
@@ -1192,7 +1421,7 @@ async fn handle_supervisor_connection(
         let result = supervisor_connection_writer(writer, writer_control_rx, writer_data_rx).await;
         let _ = writer_done_tx.send(result);
     });
-    let mut controller_id = None;
+    let mut controller_identity = None;
 
     let result = 'connection: loop {
         tokio::select! {
@@ -1225,9 +1454,9 @@ async fn handle_supervisor_connection(
                             let process_id = shared.session.lock().await.process_id();
                             let sync = {
                                 let mut state = shared.state.lock().await;
-                                let (id, sync) =
+                                let (identity, sync) =
                                     state.attach_sync(controller_tx.clone(), process_id, None);
-                                controller_id = Some(id);
+                                controller_identity = Some(identity);
                                 sync
                             };
                             suppress_live_through_base_seq = Some(sync.base_seq);
@@ -1239,27 +1468,65 @@ async fn handle_supervisor_connection(
                     SupervisorRequest::AttachSync {
                         session_id,
                         last_terminal_seq,
+                        resume_controller_id,
                     } => {
                         if session_id != expected_session_id {
                             SupervisorResponse::err("session id mismatch")
                         } else {
                             let process_id = shared.session.lock().await.process_id();
-                            let sync = {
+                            let sync_result = {
                                 let mut state = shared.state.lock().await;
-                                let (id, sync) = state.attach_sync(
-                                    controller_tx.clone(),
-                                    process_id,
-                                    last_terminal_seq,
-                                );
-                                controller_id = Some(id);
-                                sync
+                                match resume_controller_id {
+                                    Some(resume_controller_id) => state.resume_attach_sync(
+                                        resume_controller_id,
+                                        controller_tx.clone(),
+                                        process_id,
+                                        last_terminal_seq,
+                                    ),
+                                    None => Ok(state.attach_sync(
+                                        controller_tx.clone(),
+                                        process_id,
+                                        last_terminal_seq,
+                                    )),
+                                }
                             };
-                            suppress_live_through_base_seq = Some(sync.base_seq);
-                            SupervisorResponse::ok(SupervisorResponsePayload::AttachSync(sync))
+                            match sync_result {
+                                Ok((identity, sync)) => {
+                                    controller_identity = Some(identity);
+                                    suppress_live_through_base_seq = Some(sync.base_seq);
+                                    SupervisorResponse::ok(SupervisorResponsePayload::AttachSync(sync))
+                                }
+                                Err(error) => SupervisorResponse::err(error.to_string()),
+                            }
                         }
                     }
+                    SupervisorRequest::ResetAttachedDevices => {
+                        ensure_current_controller(&shared, controller_identity).await?;
+                        shared.state.lock().await.attached_devices.clear();
+                        SupervisorResponse::ok(SupervisorResponsePayload::Empty)
+                    }
+                    SupervisorRequest::AttachDevice { device_id } => {
+                        ensure_current_controller(&shared, controller_identity).await?;
+                        shared.state.lock().await.attach_device(&device_id);
+                        SupervisorResponse::ok(SupervisorResponsePayload::Empty)
+                    }
+                    SupervisorRequest::DetachDevice { device_id } => {
+                        ensure_current_controller(&shared, controller_identity).await?;
+                        // 中文注释：detach 必须是幂等的。第一次请求如果已经在
+                        // supervisor 侧生效，但响应在 IPC 断线时丢失，重试不能再把它
+                        // 翻译成业务失败，否则 daemon 本地镜像无法继续同步收敛。
+                        shared.state.lock().await.detach_device(&device_id);
+                        SupervisorResponse::ok(SupervisorResponsePayload::Empty)
+                    }
+                    SupervisorRequest::DeviceAttached { device_id } => {
+                        ensure_current_controller(&shared, controller_identity).await?;
+                        let attached = shared.state.lock().await.has_attached_device(&device_id);
+                        SupervisorResponse::ok(SupervisorResponsePayload::DeviceAttached {
+                            attached,
+                        })
+                    }
                     SupervisorRequest::Input { data_base64 } => {
-                        ensure_current_controller(&shared, controller_id).await?;
+                        ensure_current_controller(&shared, controller_identity).await?;
                         let bytes = general_purpose::STANDARD
                             .decode(data_base64)
                             .map_err(PtyError::backend)?;
@@ -1267,7 +1534,7 @@ async fn handle_supervisor_connection(
                         SupervisorResponse::ok(SupervisorResponsePayload::Empty)
                     }
                     SupervisorRequest::Resize { size } => {
-                        ensure_current_controller(&shared, controller_id).await?;
+                        ensure_current_controller(&shared, controller_identity).await?;
                         shared.session.lock().await.resize(size)?;
                         {
                             let mut state = shared.state.lock().await;
@@ -1277,7 +1544,7 @@ async fn handle_supervisor_connection(
                         SupervisorResponse::ok(SupervisorResponsePayload::Empty)
                     }
                     SupervisorRequest::Snapshot => {
-                        ensure_current_controller(&shared, controller_id).await?;
+                        ensure_current_controller(&shared, controller_identity).await?;
                         let process_id = shared.session.lock().await.process_id();
                         let state = shared.state.lock().await;
                         let payload = SupervisorSnapshotPayload {
@@ -1288,7 +1555,7 @@ async fn handle_supervisor_connection(
                         SupervisorResponse::ok(SupervisorResponsePayload::Snapshot(payload))
                     }
                     SupervisorRequest::TerminalSnapshot { last_terminal_seq } => {
-                        ensure_current_controller(&shared, controller_id).await?;
+                        ensure_current_controller(&shared, controller_identity).await?;
                         let (base_seq, frames) = shared
                             .state
                             .lock()
@@ -1301,7 +1568,7 @@ async fn handle_supervisor_connection(
                         })
                     }
                     SupervisorRequest::Close => {
-                        ensure_current_controller(&shared, controller_id).await?;
+                        ensure_current_controller(&shared, controller_identity).await?;
                         {
                             let mut session = shared.session.lock().await;
                             session.terminate()?;
@@ -1311,7 +1578,7 @@ async fn handle_supervisor_connection(
                         SupervisorResponse::ok(SupervisorResponsePayload::Empty)
                     }
                     SupervisorRequest::Ping => {
-                        ensure_current_controller(&shared, controller_id).await?;
+                        ensure_current_controller(&shared, controller_identity).await?;
                         SupervisorResponse::ok(SupervisorResponsePayload::Empty)
                     }
                 };
@@ -1329,7 +1596,7 @@ async fn handle_supervisor_connection(
                     ));
                 }
                 for frame in delayed_live_frames {
-                    if !is_current_controller(&shared, controller_id).await {
+                    if !is_current_controller(&shared, controller_identity).await {
                         break;
                     }
                     if writer_data_tx.send(frame).is_err() {
@@ -1343,7 +1610,7 @@ async fn handle_supervisor_connection(
                 let Some(frame) = outbound else {
                     break Ok(());
                 };
-                if !is_current_controller(&shared, controller_id).await {
+                if !is_current_controller(&shared, controller_identity).await {
                     break Ok(());
                 }
                 if writer_data_tx.send(frame).is_err() {
@@ -1357,9 +1624,9 @@ async fn handle_supervisor_connection(
 
     reader_task.abort();
     writer_task.abort();
-    if let Some(id) = controller_id {
+    if let Some(identity) = controller_identity {
         let mut state = shared.state.lock().await;
-        state.remove_controller(id);
+        state.remove_controller(identity);
     }
 
     result
@@ -1419,28 +1686,31 @@ async fn supervisor_connection_writer(
 
 async fn ensure_current_controller(
     shared: &SupervisorShared,
-    controller_id: Option<u64>,
+    controller: Option<ControllerIdentity>,
 ) -> PtyResult<()> {
-    let Some(controller_id) = controller_id else {
+    let Some(controller) = controller else {
         return Err(PtyError::Backend(
             "session supervisor connection is not attached".to_owned(),
         ));
     };
     let state = shared.state.lock().await;
-    if !state.has_controller(controller_id) {
+    if !state.is_active_controller(controller) {
         return Err(PtyError::Backend(
-            "session supervisor connection is no longer attached".to_owned(),
+            "session supervisor connection is not the active controller".to_owned(),
         ));
     }
     Ok(())
 }
 
-async fn is_current_controller(shared: &SupervisorShared, controller_id: Option<u64>) -> bool {
-    let Some(controller_id) = controller_id else {
+async fn is_current_controller(
+    shared: &SupervisorShared,
+    controller: Option<ControllerIdentity>,
+) -> bool {
+    let Some(controller) = controller else {
         return false;
     };
     let state = shared.state.lock().await;
-    state.has_controller(controller_id)
+    state.is_active_controller(controller)
 }
 
 fn drain_controller_frames_after_sync(
@@ -1557,6 +1827,17 @@ enum SupervisorRequest {
     AttachSync {
         session_id: String,
         last_terminal_seq: Option<u64>,
+        resume_controller_id: Option<u64>,
+    },
+    ResetAttachedDevices,
+    AttachDevice {
+        device_id: String,
+    },
+    DetachDevice {
+        device_id: String,
+    },
+    DeviceAttached {
+        device_id: String,
     },
     Input {
         data_base64: String,
@@ -1582,6 +1863,35 @@ enum SupervisorFrame {
     TerminalFrame {
         frame: PtyTerminalFrame,
     },
+}
+
+enum SupervisorRequestCompletion {
+    Response(SupervisorResponse),
+    TransportError(PtyError),
+}
+
+impl SupervisorRequestCompletion {
+    fn into_result(self) -> Result<SupervisorResponsePayload, SupervisorRequestFailure> {
+        match self {
+            Self::Response(response) => response
+                .into_result()
+                .map_err(SupervisorRequestFailure::Response),
+            Self::TransportError(error) => Err(SupervisorRequestFailure::Transport(error)),
+        }
+    }
+}
+
+enum SupervisorRequestFailure {
+    Response(PtyError),
+    Transport(PtyError),
+}
+
+impl SupervisorRequestFailure {
+    fn into_pty_error(self) -> PtyError {
+        match self {
+            Self::Response(error) | Self::Transport(error) => error,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1616,6 +1926,9 @@ enum SupervisorResponsePayload {
     Empty,
     Snapshot(SupervisorSnapshotPayload),
     AttachSync(SupervisorAttachSyncPayload),
+    DeviceAttached {
+        attached: bool,
+    },
     TerminalFrames {
         base_seq: u64,
         frames: Vec<PtyTerminalFrame>,
@@ -1626,29 +1939,45 @@ impl SupervisorResponsePayload {
     fn expect_empty(self) -> PtyResult<()> {
         match self {
             Self::Empty => Ok(()),
-            Self::Snapshot(_) | Self::AttachSync(_) | Self::TerminalFrames { .. } => {
-                Err(PtyError::Backend(
-                    "session supervisor returned unexpected snapshot payload".to_owned(),
-                ))
-            }
+            Self::Snapshot(_)
+            | Self::AttachSync(_)
+            | Self::DeviceAttached { .. }
+            | Self::TerminalFrames { .. } => Err(PtyError::Backend(
+                "session supervisor returned unexpected snapshot payload".to_owned(),
+            )),
         }
     }
 
     fn into_snapshot(self) -> PtyResult<SupervisorSnapshotPayload> {
         match self {
             Self::Snapshot(payload) => Ok(payload),
-            Self::Empty | Self::AttachSync(_) | Self::TerminalFrames { .. } => Err(
-                PtyError::Backend("session supervisor returned empty payload".to_owned()),
-            ),
+            Self::Empty
+            | Self::AttachSync(_)
+            | Self::DeviceAttached { .. }
+            | Self::TerminalFrames { .. } => Err(PtyError::Backend(
+                "session supervisor returned empty payload".to_owned(),
+            )),
         }
     }
 
     fn into_attach_sync(self) -> PtyResult<SupervisorAttachSyncPayload> {
         match self {
             Self::AttachSync(payload) => Ok(payload),
-            Self::Empty | Self::Snapshot(_) | Self::TerminalFrames { .. } => {
+            Self::Empty
+            | Self::Snapshot(_)
+            | Self::DeviceAttached { .. }
+            | Self::TerminalFrames { .. } => Err(PtyError::Backend(
+                "session supervisor returned unexpected attach sync payload".to_owned(),
+            )),
+        }
+    }
+
+    fn into_device_attached(self) -> PtyResult<bool> {
+        match self {
+            Self::DeviceAttached { attached } => Ok(attached),
+            Self::Empty | Self::Snapshot(_) | Self::AttachSync(_) | Self::TerminalFrames { .. } => {
                 Err(PtyError::Backend(
-                    "session supervisor returned unexpected attach sync payload".to_owned(),
+                    "session supervisor returned unexpected device attachment payload".to_owned(),
                 ))
             }
         }
@@ -1658,9 +1987,11 @@ impl SupervisorResponsePayload {
     fn into_terminal_frames(self) -> PtyResult<(u64, Vec<PtyTerminalFrame>)> {
         match self {
             Self::TerminalFrames { base_seq, frames } => Ok((base_seq, frames)),
-            Self::Empty | Self::Snapshot(_) | Self::AttachSync(_) => Err(PtyError::Backend(
-                "session supervisor returned unexpected terminal frames payload".to_owned(),
-            )),
+            Self::Empty | Self::Snapshot(_) | Self::AttachSync(_) | Self::DeviceAttached { .. } => {
+                Err(PtyError::Backend(
+                    "session supervisor returned unexpected terminal frames payload".to_owned(),
+                ))
+            }
         }
     }
 }
@@ -1675,6 +2006,8 @@ struct SupervisorSnapshotPayload {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SupervisorAttachSyncPayload {
+    controller_id: u64,
+    controller_connection_id: u64,
     snapshot: SupervisorSnapshotPayload,
     base_seq: u64,
     frames: Vec<PtyTerminalFrame>,
@@ -1860,6 +2193,7 @@ mod tests {
             output_signal_tx,
             output_signal_rx,
             next_request_id: AtomicU64::new(1),
+            controller_identity: StdMutex::new(None),
             cached_size: StdMutex::new(PtySize::new(24, 80)),
             cached_process_id: StdMutex::new(Some(42)),
         }
@@ -1884,6 +2218,23 @@ mod tests {
 
         assert_eq!(runtime_dir.parent(), Some(Path::new("/var/lib/termd")));
         assert_eq!(runtime_dir, Path::new("/var/lib/termd/termd-supervisors"));
+    }
+
+    #[test]
+    fn supervisor_socket_file_name_stays_short_under_long_state_directory() {
+        let state_path = Path::new(
+            "/tmp/termd-server-test-1234567890-1234567890-1234567890-very-long-state-name/daemon-state.json",
+        );
+        let backend = SupervisorPtyBackend::for_state_path(state_path);
+        let socket_path = backend.socket_path_for_session(
+            "123e4567-e89b-12d3-a456-426614174000-this-session-name-is-deliberately-long",
+        );
+
+        assert!(
+            socket_path.to_string_lossy().len() < 108,
+            "supervisor socket path must stay under Unix socket path limits: {}",
+            socket_path.display()
+        );
     }
 
     #[test]
@@ -2047,6 +2398,25 @@ mod tests {
     }
 
     #[test]
+    fn supervisor_state_tracks_attached_devices_independently_from_controllers() {
+        let mut state = SupervisorState::new(PtySize::new(4, 40));
+
+        assert!(!state.has_attached_device("dev-a"));
+
+        state.attach_device("dev-a");
+        state.attach_device("dev-a");
+        state.attach_device("dev-b");
+
+        assert!(state.has_attached_device("dev-a"));
+        assert!(state.has_attached_device("dev-b"));
+
+        state.detach_device("dev-a");
+
+        assert!(!state.has_attached_device("dev-a"));
+        assert!(state.has_attached_device("dev-b"));
+    }
+
+    #[test]
     fn attach_sync_prefers_snapshot_when_tail_is_much_larger_than_snapshot() {
         let mut state = SupervisorState::new(PtySize::new(4, 40));
         for index in 0..2000 {
@@ -2094,7 +2464,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn attach_sync_allows_requests_from_multiple_attached_controller_ids() {
+    async fn attach_sync_only_allows_requests_from_latest_controller_id() {
         let mut state = SupervisorState::new(PtySize::new(4, 40));
         let (old_tx, _old_rx) = tokio_mpsc::unbounded_channel();
         let (old_id, _old_sync) = state.attach_sync(old_tx, Some(42), None);
@@ -2107,12 +2477,131 @@ mod tests {
             shutdown_tx,
         };
 
-        ensure_current_controller(&shared, Some(old_id))
+        let old_error = ensure_current_controller(&shared, Some(old_id))
             .await
-            .expect("old controller id should remain valid after another attach");
+            .expect_err("old controller id should lose authority after takeover");
+        assert!(
+            old_error.to_string().contains("not the active controller"),
+            "old controller should be rejected as stale owner"
+        );
         ensure_current_controller(&shared, Some(new_id))
             .await
-            .expect("new controller id should remain valid");
+            .expect("new controller id should become active owner");
+    }
+
+    #[test]
+    fn resume_attach_sync_rejects_stale_controller_after_active_owner_disconnects() {
+        let mut state = SupervisorState::new(PtySize::new(4, 40));
+        let (old_tx, _old_rx) = tokio_mpsc::unbounded_channel();
+        let (old_id, _old_sync) = state.attach_sync(old_tx, Some(42), None);
+        let (new_tx, _new_rx) = tokio_mpsc::unbounded_channel();
+        let (new_id, _new_sync) = state.attach_sync(new_tx, Some(42), Some(0));
+
+        state.remove_controller(new_id);
+        assert_eq!(
+            state.active_controller_id, None,
+            "active owner disconnect should clear only the live owner slot"
+        );
+        assert_eq!(
+            state.active_controller_connection_id, None,
+            "active owner disconnect should clear the live owner connection slot too"
+        );
+        assert_eq!(
+            state.controller_resume_lease_id,
+            Some(new_id.id),
+            "resume lease must stay on the latest owner after disconnect"
+        );
+
+        let (retry_tx, _retry_rx) = tokio_mpsc::unbounded_channel();
+        let error = state
+            .resume_attach_sync(old_id.id, retry_tx, Some(42), Some(0))
+            .expect_err("stale controller must not recover after newer owner disconnects");
+        assert!(
+            error.to_string().contains("not the active controller"),
+            "stale controller should stay fenced even after active slot is empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_attach_sync_allows_latest_lease_holder_after_disconnect() {
+        let mut state = SupervisorState::new(PtySize::new(4, 40));
+        let (owner_tx, _owner_rx) = tokio_mpsc::unbounded_channel();
+        let (owner_identity, _owner_sync) = state.attach_sync(owner_tx, Some(42), None);
+
+        state.remove_controller(owner_identity);
+        let (retry_tx, _retry_rx) = tokio_mpsc::unbounded_channel();
+        let (resumed_identity, _resumed_sync) = state
+            .resume_attach_sync(owner_identity.id, retry_tx, Some(42), Some(0))
+            .expect("latest lease holder should be able to resume after disconnect");
+
+        assert_eq!(resumed_identity.id, owner_identity.id);
+        assert_ne!(
+            resumed_identity.connection_id, owner_identity.connection_id,
+            "resume should mint a fresh connection generation for the same lease holder"
+        );
+        assert_eq!(state.active_controller_id, Some(owner_identity.id));
+        assert_eq!(
+            state.active_controller_connection_id,
+            Some(resumed_identity.connection_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_attach_sync_fences_previous_connection_generation_of_same_controller() {
+        let mut state = SupervisorState::new(PtySize::new(4, 40));
+        let (owner_tx, _owner_rx) = tokio_mpsc::unbounded_channel();
+        let (owner_identity, _owner_sync) = state.attach_sync(owner_tx, Some(42), None);
+
+        state.remove_controller(owner_identity);
+        let (retry_tx, _retry_rx) = tokio_mpsc::unbounded_channel();
+        let (resumed_identity, _resumed_sync) = state
+            .resume_attach_sync(owner_identity.id, retry_tx, Some(42), Some(0))
+            .expect("lease holder resume should succeed");
+        let (shutdown_tx, _shutdown_rx) = watch::channel(false);
+        let shared = SupervisorShared {
+            session: Arc::new(Mutex::new(Box::new(NoopPtySession))),
+            state: Arc::new(Mutex::new(state)),
+            shutdown_tx,
+        };
+
+        let old_error = ensure_current_controller(&shared, Some(owner_identity))
+            .await
+            .expect_err("old connection generation should be fenced after resume");
+        assert!(
+            old_error.to_string().contains("not the active controller"),
+            "stale generation of same lease holder must be rejected"
+        );
+        ensure_current_controller(&shared, Some(resumed_identity))
+            .await
+            .expect("resumed connection generation should become the only active owner");
+    }
+
+    #[test]
+    fn supervisor_request_response_error_is_not_retryable_transport_failure() {
+        let error = SupervisorRequestCompletion::Response(SupervisorResponse::err(
+            "session supervisor connection is not the active controller",
+        ))
+        .into_result()
+        .expect_err("business rejection should not masquerade as transport retry");
+
+        assert!(
+            matches!(error, SupervisorRequestFailure::Response(_)),
+            "stale controller rejection must stay in response lane so request() can stop reconnecting"
+        );
+    }
+
+    #[test]
+    fn supervisor_request_transport_error_stays_retryable() {
+        let error = SupervisorRequestCompletion::TransportError(PtyError::Backend(
+            "session supervisor request timed out".to_owned(),
+        ))
+        .into_result()
+        .expect_err("transport breakage should stay retryable");
+
+        assert!(
+            matches!(error, SupervisorRequestFailure::Transport(_)),
+            "timeout/disconnect failures should remain in transport lane for reconnect retry"
+        );
     }
 
     #[tokio::test]
@@ -2166,6 +2655,7 @@ mod tests {
                 request: SupervisorRequest::AttachSync {
                     session_id: session_id.clone(),
                     last_terminal_seq: None,
+                    resume_controller_id: None,
                 },
             },
         )
@@ -2576,6 +3066,7 @@ mod tests {
             output_signal_tx,
             output_signal_rx,
             next_request_id: AtomicU64::new(1),
+            controller_identity: StdMutex::new(None),
             cached_size: StdMutex::new(PtySize::new(24, 80)),
             cached_process_id: StdMutex::new(Some(42)),
         };
