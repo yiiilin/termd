@@ -13,8 +13,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::watch;
 
 use crate::pty::{
-    CommandSpec, PtyAttachment, PtyBackend, PtyError, PtyRestoreInfo, PtySession, PtySize,
-    PtySnapshot, PtyTerminalFrame,
+    CommandSpec, PtyAttachment, PtyAttachmentBootstrap, PtyBackend, PtyError, PtyRestoreInfo,
+    PtySession, PtySize, PtySnapshot, PtyTerminalFrame,
 };
 use crate::session::{AttachRole, SessionError, SessionManager, SessionState, TerminalSize};
 use crate::state::SessionStateRecord;
@@ -250,6 +250,7 @@ impl<B: PtyBackend> SessionRuntime<B> {
         session_id: &str,
         attachment_id: &str,
         size: TerminalSize,
+        bootstrap: PtyAttachmentBootstrap,
     ) -> RuntimeResult<()> {
         self.ensure_open_session(session_id)?;
         if self
@@ -267,6 +268,7 @@ impl<B: PtyBackend> SessionRuntime<B> {
             restore_info.as_ref(),
             pty_size,
             attachment_id,
+            bootstrap,
         )?;
         self.runtime_session_mut(session_id)?
             .watched_attachments
@@ -342,6 +344,53 @@ impl<B: PtyBackend> SessionRuntime<B> {
     pub fn output_signal(&self, session_id: &str) -> RuntimeResult<Option<watch::Receiver<u64>>> {
         self.ensure_open_session(session_id)?;
         Ok(self.runtime_session(session_id)?.pty.output_signal())
+    }
+
+    /// watched attachment 的输出信号。
+    pub fn watched_attachment_output_signal(
+        &self,
+        session_id: &str,
+        attachment_id: &str,
+    ) -> RuntimeResult<Option<watch::Receiver<u64>>> {
+        self.ensure_open_session(session_id)?;
+        let attachment = self
+            .runtime_session(session_id)?
+            .watched_attachments
+            .get(attachment_id)
+            .ok_or(RuntimeError::SessionNotFound)?;
+        Ok(attachment.output_signal())
+    }
+
+    /// 从 watched attachment 读取一帧 opaque attach bytes。
+    pub fn read_watched_attachment_frame(
+        &mut self,
+        session_id: &str,
+        attachment_id: &str,
+    ) -> RuntimeResult<Option<Vec<u8>>> {
+        self.ensure_open_session(session_id)?;
+        let attachment = self
+            .runtime_session_mut(session_id)?
+            .watched_attachments
+            .get_mut(attachment_id)
+            .ok_or(RuntimeError::SessionNotFound)?;
+        Ok(attachment.read_frame()?)
+    }
+
+    /// 向 watched attachment 写入一帧 opaque attach bytes。
+    pub fn write_watched_attachment_frame(
+        &mut self,
+        session_id: &str,
+        attachment_id: &str,
+        bytes: &[u8],
+    ) -> RuntimeResult<()> {
+        self.ensure_open_session(session_id)?;
+        let attachment = self
+            .runtime_session_mut(session_id)?
+            .watched_attachments
+            .get_mut(attachment_id)
+            .ok_or(RuntimeError::SessionNotFound)?;
+        attachment.write_frame(bytes)?;
+        Ok(())
     }
 
     /// 同步更新 SessionManager 元数据与底层 PTY 尺寸。
@@ -718,6 +767,7 @@ mod tests {
             _restore_info: Option<&PtyRestoreInfo>,
             _size: PtySize,
             attachment_id: &str,
+            _bootstrap: PtyAttachmentBootstrap,
         ) -> PtyResult<Box<dyn PtyAttachment>> {
             self.state
                 .lock()
@@ -901,10 +951,20 @@ mod tests {
         runtime.attach(&session_id, "dev-a").unwrap();
 
         runtime
-            .start_watched_attachment(&session_id, "conn-a-watch-1", TerminalSize::cells(24, 80))
+            .start_watched_attachment(
+                &session_id,
+                "conn-a-watch-1",
+                TerminalSize::cells(24, 80),
+                PtyAttachmentBootstrap::default(),
+            )
             .unwrap();
         runtime
-            .start_watched_attachment(&session_id, "conn-b-watch-1", TerminalSize::cells(24, 80))
+            .start_watched_attachment(
+                &session_id,
+                "conn-b-watch-1",
+                TerminalSize::cells(24, 80),
+                PtyAttachmentBootstrap::default(),
+            )
             .unwrap();
         assert_eq!(
             backend.attachment_starts(),
@@ -943,6 +1003,7 @@ mod tests {
                 &session_id,
                 "same-connection-watch",
                 TerminalSize::cells(24, 80),
+                PtyAttachmentBootstrap::default(),
             )
             .unwrap();
         runtime
@@ -950,6 +1011,7 @@ mod tests {
                 &session_id,
                 "same-connection-watch",
                 TerminalSize::cells(30, 100),
+                PtyAttachmentBootstrap::default(),
             )
             .unwrap();
 

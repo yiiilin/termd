@@ -7,8 +7,10 @@ import {
   verifyEd25519Signature,
 } from "../protocol/auth";
 import { E2eeSession, decodeBinaryEncryptedFrame, encodeBinaryEncryptedFrame, type E2eeKeyPair } from "../protocol/e2ee";
+import { decodeSupervisorTerminalServerFrame } from "../protocol/supervisor-terminal";
 import { PROTOCOL_PACKET_VERSION } from "../protocol/types";
 import type {
+  AttachFramePayload,
   HttpE2eeAuthPayload,
   PublicKeyWire,
   SessionFileDownloadStreamReadyPayload,
@@ -377,7 +379,7 @@ describe("DirectClient", () => {
 
     expect(list.sessions).toHaveLength(1);
     expect(attached.role).toBe("operator");
-    expect(output.type).toBe("session_data");
+    expect(output.type).toBe("attach_frame");
     expect(grant.device_id).toBe(device.device_id);
     expect(daemon.decryptedInputs).toContain("terminal-secret");
     expect(daemon.sessionCursorUpdates).toContainEqual({ session_id: attached.session_id, row: 12, col: 8, focused: true });
@@ -654,7 +656,7 @@ describe("DirectClient", () => {
     const streamId = attachOpen?.stream_id;
 
     expect(attached.session_id).toBe(list.sessions[0].session_id);
-    expect(output.type).toBe("session_data");
+    expect(output.type).toBe("attach_frame");
     expect(streamId).toMatch(/^[0-9a-f-]{36}$/);
     expect(sentPackets.find((packet) => packet.kind === "stream_chunk" && packet.stream_id === streamId)).toMatchObject({
       seq: 1,
@@ -728,7 +730,7 @@ describe("DirectClient", () => {
     const list = await firstClient.listSessions();
     const sessionId = list.sessions[0].session_id;
     await firstClient.attachSession(sessionId);
-    await secondClient.attachSession(sessionId, { watchUpdates: false });
+    await secondClient.attachSessionPermission(sessionId);
 
     await firstClient.closeSession(sessionId);
     await expect(secondClient.listSessionFiles(sessionId)).rejects.toMatchObject({ code: "invalid_state" });
@@ -877,7 +879,7 @@ describe("DirectClient", () => {
       }
     ).binaryPacketLog ?? [];
 
-    expect(output.type).toBe("session_data");
+    expect(output.type).toBe("attach_frame");
     expect(binaryWireFrames.some((frame) => frame.direction === "in" && frame.byteLength > 0)).toBe(true);
     expect(binaryWireFrames.some((frame) => frame.direction === "out" && frame.byteLength > 0)).toBe(true);
     expect(
@@ -885,7 +887,7 @@ describe("DirectClient", () => {
         (packet) =>
           packet.direction === "in" &&
           packet.kind === "stream_chunk" &&
-          packet.payload_type === "session_data" &&
+          packet.payload_type === "attach_frame" &&
           packet.data_text === "stream-input",
       ),
     ).toBe(true);
@@ -894,7 +896,7 @@ describe("DirectClient", () => {
         (packet) =>
           packet.direction === "out" &&
           packet.kind === "stream_chunk" &&
-          packet.payload_type === "session_data" &&
+          packet.payload_type === "attach_frame" &&
           packet.data_text === "termd-e2e-ready\n",
       ),
     ).toBe(true);
@@ -927,24 +929,36 @@ describe("DirectClient", () => {
 
     const frame = await client.receiveInner();
     client.close();
-
     expect(frame).toMatchObject({
-      type: "terminal_frame",
+      type: "attach_frame",
       payload: {
+        session_id: attached.session_id,
+        transport_seq: expect.any(Number),
+        data_bytes: expect.any(Uint8Array),
+      },
+    });
+    const decoded = decodeSupervisorTerminalServerFrame(
+      (frame.payload as AttachFramePayload).data_bytes ?? new Uint8Array(),
+    );
+
+    expect(decoded).toMatchObject({
+      type: "terminal_frame",
+      frame: {
         kind: "output",
         terminal_seq: 9,
         data_bytes: expect.any(Uint8Array),
       },
     });
-    expect(new TextDecoder().decode((frame as { payload: { data_bytes?: Uint8Array } }).payload.data_bytes)).toBe(
-      "single-frame\n",
-    );
+    if (decoded.type !== "terminal_frame" || decoded.frame.kind !== "output") {
+      throw new Error("expected supervisor terminal_frame output");
+    }
+    expect(new TextDecoder().decode(decoded.frame.data_bytes)).toBe("single-frame\n");
     expect(
       daemon.binaryPacketLog.some(
         (packet) =>
           packet.direction === "out" &&
           packet.kind === "stream_chunk" &&
-          packet.payload_type === "terminal_frame",
+          packet.payload_type === "attach_frame",
       ),
     ).toBe(true);
   });
@@ -983,17 +997,47 @@ describe("DirectClient", () => {
 
     const first = await client.receiveInner();
     const second = await client.receiveInner();
-    const batchTransportSeq = (first.payload as { transport_seq: number }).transport_seq;
+    const firstTransportSeq = (first.payload as { transport_seq: number }).transport_seq;
+    const secondTransportSeq = (second.payload as { transport_seq: number }).transport_seq;
     client.close();
     await new Promise((resolve) => setTimeout(resolve, 20));
+    const firstDecoded = decodeSupervisorTerminalServerFrame(
+      (first.payload as AttachFramePayload).data_bytes ?? new Uint8Array(),
+    );
+    const secondDecoded = decodeSupervisorTerminalServerFrame(
+      (second.payload as AttachFramePayload).data_bytes ?? new Uint8Array(),
+    );
 
     expect(first).toMatchObject({
-      type: "terminal_frame",
-      payload: { kind: "output", terminal_seq: 1, transport_seq: batchTransportSeq },
+      type: "attach_frame",
+      payload: {
+        transport_seq: firstTransportSeq,
+        data_bytes: expect.any(Uint8Array),
+      },
     });
     expect(second).toMatchObject({
+      type: "attach_frame",
+      payload: {
+        transport_seq: secondTransportSeq,
+        data_bytes: expect.any(Uint8Array),
+      },
+    });
+    expect(secondTransportSeq).toBeGreaterThan(firstTransportSeq);
+    expect(firstDecoded).toMatchObject({
       type: "terminal_frame",
-      payload: { kind: "output", terminal_seq: 2, transport_seq: batchTransportSeq },
+      frame: {
+        kind: "output",
+        terminal_seq: 1,
+        data_bytes: expect.any(Uint8Array),
+      },
+    });
+    expect(secondDecoded).toMatchObject({
+      type: "terminal_frame",
+      frame: {
+        kind: "output",
+        terminal_seq: 2,
+        data_bytes: expect.any(Uint8Array),
+      },
     });
     expect(first.payload).not.toHaveProperty("render_credit");
     expect(second.payload).not.toHaveProperty("render_credit");
@@ -1007,7 +1051,7 @@ describe("DirectClient", () => {
       daemon as unknown as {
         receivedPackets?: Array<{ kind: string; stream_id?: string; ack?: number; credit?: number }>;
       }
-    ).receivedPackets?.filter((packet) => packet.kind === "flow" && packet.stream_id === streamId && packet.ack === batchTransportSeq) ?? [];
+    ).receivedPackets?.filter((packet) => packet.kind === "flow" && packet.stream_id === streamId) ?? [];
     expect(flows).toHaveLength(0);
   });
 
@@ -1182,7 +1226,7 @@ describe("DirectClient", () => {
     });
 
     const list = await client.listSessions();
-    const attached = await client.attachSession(list.sessions[0].session_id, { watchUpdates: false });
+    const attached = await client.attachSessionPermission(list.sessions[0].session_id);
     const files = await client.listSessionFiles(attached.session_id);
     client.close();
 

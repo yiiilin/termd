@@ -48,6 +48,7 @@ pub enum MessageType {
     SessionAttached,
     SessionData,
     TerminalFrame,
+    AttachFrame,
     SessionActivity,
     SessionCwdChanged,
     SessionCursor,
@@ -581,7 +582,10 @@ pub struct BinaryProtocolPacket {
     pub ack: u64,
     #[prost(uint32, tag = "8")]
     pub credit: u32,
-    #[prost(oneof = "binary_protocol_packet::Payload", tags = "20, 21, 22, 23, 24")]
+    #[prost(
+        oneof = "binary_protocol_packet::Payload",
+        tags = "20, 21, 22, 23, 24, 25"
+    )]
     pub payload: Option<binary_protocol_packet::Payload>,
 }
 
@@ -599,6 +603,8 @@ pub mod binary_protocol_packet {
         Error(super::BinaryPacketErrorPayload),
         #[prost(message, tag = "24")]
         FileChunk(super::BinaryFileChunkPayload),
+        #[prost(message, tag = "25")]
+        AttachFrame(super::BinaryAttachFramePayload),
     }
 }
 
@@ -622,6 +628,14 @@ pub struct BinaryFileChunkPayload {
     pub size_bytes: u64,
     #[prost(bool, tag = "5")]
     pub eof: bool,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct BinaryAttachFramePayload {
+    #[prost(bytes = "vec", tag = "1")]
+    pub session_id: Vec<u8>,
+    #[prost(bytes = "vec", tag = "2")]
+    pub data: Vec<u8>,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
@@ -750,6 +764,13 @@ pub fn protocol_packet_from_binary(
             })
             .map_err(|_| ProtocolCodecError)?
         }
+        Some(binary_protocol_packet::Payload::AttachFrame(payload)) => {
+            serde_json::to_value(AttachFramePayload {
+                session_id: session_id_from_binary(&payload.session_id)?,
+                data_base64: STANDARD.encode(payload.data),
+            })
+            .map_err(|_| ProtocolCodecError)?
+        }
         Some(binary_protocol_packet::Payload::Error(error)) => {
             serde_json::to_value(PacketErrorPayload {
                 code: error.code,
@@ -777,6 +798,20 @@ pub fn protocol_packet_from_binary(
 fn binary_stream_chunk_payload(
     payload: &Value,
 ) -> ProtocolCodecResult<Option<binary_protocol_packet::Payload>> {
+    if payload.get("__attach_frame") == Some(&Value::Bool(true)) {
+        let attach_frame = serde_json::from_value::<AttachFramePayload>(payload.clone())
+            .map_err(|_| ProtocolCodecError)?;
+        let data = STANDARD
+            .decode(attach_frame.data_base64)
+            .map_err(|_| ProtocolCodecError)?;
+        return Ok(Some(binary_protocol_packet::Payload::AttachFrame(
+            BinaryAttachFramePayload {
+                session_id: attach_frame.session_id.0.as_bytes().to_vec(),
+                data,
+            },
+        )));
+    }
+
     if payload.get("kind").is_some() {
         let frame = serde_json::from_value::<TerminalFramePayload>(payload.clone())
             .map_err(|_| ProtocolCodecError)?;
@@ -1454,6 +1489,29 @@ pub struct DaemonStatusResultPayload {
 pub struct SessionDataPayload {
     pub session_id: SessionId,
     pub data_base64: String,
+}
+
+/// attach-scoped opaque terminal frame。
+///
+/// 中文注释：这层 payload 只把 frame 绑定到 session/stream；真正的终端业务语义由
+/// `supervisor` 内部 length-prefixed JSON frame 定义，`termd` / `relay` 不应继续解析。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachFramePayload {
+    pub session_id: SessionId,
+    pub data_base64: String,
+}
+
+/// 生成仅供 packet 二进制编码使用的 attach frame payload。
+///
+/// 中文注释：`attach_frame` 与 `session_data` 的 JSON 结构完全一样，binary codec 需要
+/// 一个只在内部使用的标记来消除歧义；否则 raw `session_data` 会被误编码成
+/// `attach_frame`。
+pub fn attach_frame_payload_value(payload: AttachFramePayload) -> Result<Value, serde_json::Error> {
+    let mut value = serde_json::to_value(payload)?;
+    if let Some(object) = value.as_object_mut() {
+        object.insert("__attach_frame".to_owned(), Value::Bool(true));
+    }
+    Ok(value)
 }
 
 /// terminal stream 内的输出帧类型。
@@ -2380,6 +2438,7 @@ mod tests {
             (MessageType::SessionAttached, "session_attached"),
             (MessageType::SessionData, "session_data"),
             (MessageType::TerminalFrame, "terminal_frame"),
+            (MessageType::AttachFrame, "attach_frame"),
             (MessageType::SessionActivity, "session_activity"),
             (MessageType::SessionCwdChanged, "session_cwd_changed"),
             (MessageType::SessionCursor, "session_cursor"),
@@ -2669,6 +2728,10 @@ mod tests {
         assert_roundtrip(SessionDataPayload {
             session_id,
             data_base64: "aGVsbG8=".to_owned(),
+        });
+        assert_roundtrip(AttachFramePayload {
+            session_id,
+            data_base64: "YXR0YWNoLWZyYW1l".to_owned(),
         });
         assert_roundtrip(TerminalFramePayload::Snapshot {
             session_id,
@@ -3207,16 +3270,25 @@ mod tests {
             ProtocolPacket::stream_chunk(
                 stream_id,
                 7,
+                attach_frame_payload_value(AttachFramePayload {
+                    session_id,
+                    data_base64: STANDARD.encode(b"opaque attach bytes"),
+                })
+                .unwrap(),
+            ),
+            ProtocolPacket::stream_chunk(
+                stream_id,
+                8,
                 serde_json::to_value(SessionDataPayload {
                     session_id,
                     data_base64: STANDARD.encode(b"terminal bytes"),
                 })
                 .unwrap(),
             ),
-            ProtocolPacket::stream_end(stream_id, 8, serde_json::json!({"reason": "client"})),
+            ProtocolPacket::stream_end(stream_id, 9, serde_json::json!({"reason": "client"})),
             ProtocolPacket::stream_chunk(
                 stream_id,
-                9,
+                10,
                 serde_json::to_value(TerminalFramePayload::Snapshot {
                     session_id,
                     base_seq: 9,
@@ -3230,9 +3302,31 @@ mod tests {
         for packet in cases {
             // 中文注释：共享 codec 是 Rust 各端的唯一转换入口，必须保持所有 packet 形状可逆。
             let binary = protocol_packet_to_binary(packet.clone()).unwrap();
+            if packet_uses_internal_attach_frame_marker(&packet) {
+                assert!(matches!(
+                    binary.payload,
+                    Some(binary_protocol_packet::Payload::AttachFrame(_))
+                ));
+            }
             let decoded = protocol_packet_from_binary(binary).unwrap();
-            assert_eq!(decoded, packet);
+            // 中文注释：`__attach_frame` 只是 JSON -> binary 编码时的内部消歧标记，
+            // decode 后不应再把这个私有字段暴露回稳定协议形状。
+            let expected = strip_internal_attach_frame_marker(packet);
+            assert_eq!(decoded, expected);
         }
+    }
+
+    fn packet_uses_internal_attach_frame_marker(packet: &ProtocolPacket<Value>) -> bool {
+        packet.payload.get("__attach_frame") == Some(&Value::Bool(true))
+    }
+
+    fn strip_internal_attach_frame_marker(
+        mut packet: ProtocolPacket<Value>,
+    ) -> ProtocolPacket<Value> {
+        if let Some(payload) = packet.payload.as_object_mut() {
+            payload.remove("__attach_frame");
+        }
+        packet
     }
 
     #[test]
@@ -3366,6 +3460,46 @@ mod tests {
                 BinarySessionDataPayload {
                     session_id: session_id.0.as_bytes().to_vec(),
                     data: terminal_bytes,
+                },
+            )),
+        );
+    }
+
+    #[test]
+    fn binary_protocol_packet_attach_frame_carries_raw_bytes_without_base64() {
+        let session_id = SessionId::new();
+        let stream_id = PacketStreamId::new();
+        let attach_bytes = b"\x00opaque-attach\xff".to_vec();
+        let packet = BinaryProtocolPacket {
+            version: PROTOCOL_PACKET_VERSION as u32,
+            kind: BinaryPacketKind::StreamChunk as i32,
+            id: Vec::new(),
+            stream_id: stream_id.0.as_bytes().to_vec(),
+            method: String::new(),
+            seq: 11,
+            ack: 0,
+            credit: 0,
+            payload: Some(binary_protocol_packet::Payload::AttachFrame(
+                BinaryAttachFramePayload {
+                    session_id: session_id.0.as_bytes().to_vec(),
+                    data: attach_bytes.clone(),
+                },
+            )),
+        };
+
+        let encoded = encode_binary_protocol_packet(&packet);
+        let decoded = decode_binary_protocol_packet(&encoded).expect("binary packet should decode");
+
+        assert_eq!(decoded.kind, BinaryPacketKind::StreamChunk as i32);
+        assert_eq!(decoded.seq, 11);
+        assert_eq!(decoded.stream_id, stream_id.0.as_bytes());
+        assert!(!String::from_utf8_lossy(&encoded).contains("data_base64"));
+        assert_eq!(
+            decoded.payload,
+            Some(binary_protocol_packet::Payload::AttachFrame(
+                BinaryAttachFramePayload {
+                    session_id: session_id.0.as_bytes().to_vec(),
+                    data: attach_bytes,
                 },
             )),
         );

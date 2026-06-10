@@ -1101,6 +1101,9 @@ export function TerminalPane(props: TerminalPaneProps) {
     clearTerminalSelectionDrag();
   };
   const noteTerminalOutputRendered = (item: TerminalOutputItem) => {
+    if (item.kind === "sync") {
+      return;
+    }
     if (item.kind === "snapshot") {
       terminalRenderedOutputBytesSinceSnapshotRef.current = 0;
       terminalOutputIdleRef.current = true;
@@ -2467,6 +2470,7 @@ export function TerminalPane(props: TerminalPaneProps) {
       sessionSizeRef,
       isDisposed: () => disposed,
       requestTrackedFrame,
+      cancelTrackedFrame: cancelDeferredTerminalFrame,
       sameTerminalDimensions,
       isTerminalPinnedToBottom,
       scrollToBottom,

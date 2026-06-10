@@ -15,10 +15,11 @@ import App, {
 } from "../App";
 import { E2eeSession, decodeBinaryEncryptedFrame, encodeBinaryEncryptedFrame, type E2eeKeyPair } from "../protocol/e2ee";
 import { connectPairingClient } from "../protocol/pairing-client";
+import { decodeSupervisorTerminalClientFrame } from "../protocol/supervisor-terminal";
 import type {
+  AttachFramePayload,
   ProtocolPacket,
   PublicKeyWire,
-  SessionDataPayload,
   SessionFileDownloadStreamReadyPayload,
   SessionFileHttpUploadStreamPayload,
   SessionFileHttpUploadReadyPayload,
@@ -733,6 +734,22 @@ function resetTerminalStats(): { writes: number; refreshes: number; writtenBytes
   const scope = globalThis as { __TERMD_TEST_TERMINAL_STATS__?: { writes: number; refreshes: number; writtenBytes: number } };
   scope.__TERMD_TEST_TERMINAL_STATS__ = { writes: 0, refreshes: 0, writtenBytes: 0 };
   return scope.__TERMD_TEST_TERMINAL_STATS__;
+}
+
+async function waitForTerminalStatsToSettle(idleMs = 60, sampleMs = 20): Promise<void> {
+  const scope = globalThis as { __TERMD_TEST_TERMINAL_STATS__?: { writes: number; refreshes: number; writtenBytes: number } };
+  let stableMs = 0;
+  let previous = JSON.stringify(scope.__TERMD_TEST_TERMINAL_STATS__ ?? {});
+  while (stableMs < idleMs) {
+    await new Promise((resolve) => window.setTimeout(resolve, sampleMs));
+    const current = JSON.stringify(scope.__TERMD_TEST_TERMINAL_STATS__ ?? {});
+    if (current === previous) {
+      stableMs += sampleMs;
+      continue;
+    }
+    previous = current;
+    stableMs = 0;
+  }
 }
 
 function triggerTerminalSelection(text: string): void {
@@ -2381,9 +2398,14 @@ describe("termui web 工作台", () => {
       if (packet.kind !== "stream_chunk") {
         return false;
       }
-      const payload = packet.payload as SessionDataPayload;
+      const payload = packet.payload as AttachFramePayload;
       const bytes = payload.data_bytes ?? sessionDataFromBase64(payload.data_base64 ?? "");
-      return new TextDecoder().decode(bytes) === "input-during-reset";
+      try {
+        const frame = decodeSupervisorTerminalClientFrame(bytes);
+        return frame.type === "input" && new TextDecoder().decode(frame.data_bytes) === "input-during-reset";
+      } catch {
+        return false;
+      }
     });
     expect(inputPacket?.stream_id).toBeDefined();
     const betaTerminalAttachPacket = daemon.receivedPackets.find((packet) =>
@@ -2525,6 +2547,9 @@ describe("termui web 工作台", () => {
     await clickSessionCard(user);
     await screen.findByText(/termd-e2e-ready/);
     await new Promise((resolve) => window.setTimeout(resolve, 80));
+    // 中文注释：这条用例只衡量持续输出阶段的 Ghostty drain/refresh 行为；
+    // attach/snapshot 的尾帧 stabilize 必须先完全落稳，避免把前序刷新混进统计。
+    await waitForTerminalStatsToSettle();
     daemon.sessionCursorUpdates.length = 0;
     const stats = resetTerminalStats();
 
@@ -3212,10 +3237,11 @@ describe("termui web 工作台", () => {
         expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID, DEFAULT_SESSION_ID]),
       { timeout: 2200 },
     );
-    await waitFor(() => {
-      const stats = (globalThis as { __TERMD_TEST_TERMINAL_STATS__?: { writes: number } }).__TERMD_TEST_TERMINAL_STATS__;
-      expect(stats?.writes ?? 0).toBeGreaterThanOrEqual(2);
-    });
+    const reconnectAttach = daemon.attachRequests.at(-1);
+    expect(reconnectAttach?.session_id).toBe(DEFAULT_SESSION_ID);
+    // 中文注释：短断恢复后的重连应尽量走“从已渲染 terminal_seq 之后续传”的轻量 attach，
+    // 而不是再次全量回放快照。
+    expect(reconnectAttach?.last_terminal_seq ?? 0).toBeGreaterThan(0);
     const terminalText = screen.getByTestId("terminal-pane").textContent ?? "";
     expect(terminalText.match(/termd-e2e-ready/g) ?? []).toHaveLength(1);
     observer.disconnect();
@@ -5924,7 +5950,7 @@ describe("termui web 工作台", () => {
 
   it("文件树可见刷新进行中收到 cwd 轻事件时，会在请求结束后补拉最新目录", async () => {
     const user = userEvent.setup();
-    const sessionId = "00000000-0000-0000-0000-000000000414b";
+    const sessionId = "00000000-0000-0000-0000-000000000414";
     await daemon.stop();
     daemon = await MockDaemon.start({
       token: "secret-token",

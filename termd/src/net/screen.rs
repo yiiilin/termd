@@ -128,6 +128,7 @@ impl TerminalLine {
         self.cells.iter().all(|cell| cell.is_blank_default())
     }
 
+    #[allow(dead_code)]
     fn plain_text(&self) -> String {
         self.cells
             .iter()
@@ -475,6 +476,7 @@ impl TerminalScreen {
         output
     }
 
+    #[allow(dead_code)]
     pub(crate) fn snapshot_plain_lines(&self) -> Vec<String> {
         self.snapshot_lines()
             .into_iter()
@@ -482,14 +484,12 @@ impl TerminalScreen {
             .collect()
     }
 
-    pub(crate) fn is_alternate_screen_active(&self) -> bool {
-        self.normal_screen.is_some()
-    }
-
+    #[cfg(test)]
     pub(crate) fn requires_runtime_snapshot(&self) -> bool {
         self.requires_snapshot_redraw
     }
 
+    #[allow(dead_code)]
     pub(crate) fn cell_count(&self) -> usize {
         self.lines.len().saturating_mul(self.cols)
     }
@@ -525,6 +525,7 @@ impl TerminalScreen {
         self.lines.iter().skip(self.visible_start()).collect()
     }
 
+    #[allow(dead_code)]
     fn snapshot_lines(&self) -> Vec<&TerminalLine> {
         let Some((start, end)) = self.snapshot_line_bounds() else {
             return Vec::new();

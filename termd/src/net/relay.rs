@@ -450,10 +450,7 @@ impl RelayOutKind {
 
     #[cfg(test)]
     fn uses_data_lane(self) -> bool {
-        matches!(
-            self,
-            Self::PushOutput | Self::PushCwd | Self::PushResize
-        )
+        matches!(self, Self::PushOutput | Self::PushCwd | Self::PushResize)
     }
 
     fn label(self) -> &'static str {

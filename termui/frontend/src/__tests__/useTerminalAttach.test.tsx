@@ -9,6 +9,7 @@ import {
 } from "../hooks/useTerminalAttach";
 import { ProtocolClientError } from "../protocol/errors";
 import type { DirectClient } from "../protocol/direct-client";
+import { buildAttachFramePayload, encodeSupervisorTerminalServerFrame } from "../protocol/supervisor-terminal";
 import type {
   Envelope,
   SessionAttachedPayload,
@@ -18,7 +19,6 @@ import type {
   UUID,
 } from "../protocol/types";
 import type { TerminalOutputItem } from "../components/terminal/types";
-import { sessionDataToBase64 } from "../protocol/wire";
 
 const SESSION_ID = "00000000-0000-0000-0000-000000009901";
 const SERVER_ID = "00000000-0000-0000-0000-000000009902";
@@ -65,15 +65,21 @@ class FakeDirectClient {
 
 function terminalSnapshot(text: string): Envelope {
   return {
-    type: "terminal_frame",
-    payload: {
-      kind: "snapshot",
-      session_id: SESSION_ID,
-      base_seq: 1,
-      terminal_seq: 1,
-      size: DEFAULT_SIZE,
-      data_base64: sessionDataToBase64(new TextEncoder().encode(text)),
-    },
+    type: "attach_frame",
+    payload: buildAttachFramePayload(
+      SESSION_ID,
+      encodeSupervisorTerminalServerFrame({
+        type: "attach_sync",
+        session_id: SESSION_ID,
+        base_seq: 1,
+        snapshot: {
+          size: DEFAULT_SIZE,
+          process_id: 7,
+          retained_output_bytes: new TextEncoder().encode(text),
+        },
+        frames: [],
+      }),
+    ),
   };
 }
 

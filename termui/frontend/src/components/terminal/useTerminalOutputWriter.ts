@@ -33,6 +33,7 @@ interface CreateTerminalOutputDrainOptions {
   sessionSizeRef: MutableRefObject<TerminalSize | undefined>;
   isDisposed: () => boolean;
   requestTrackedFrame: (callback: () => void) => number;
+  cancelTrackedFrame: (frameId: number | undefined) => void;
   sameTerminalDimensions: (a: { rows: number; cols: number } | undefined, b: { rows: number; cols: number } | undefined) => boolean;
   isTerminalPinnedToBottom: (terminal: TerminalRendererTerminal) => boolean;
   scrollToBottom: (generation: number) => void;
@@ -118,6 +119,20 @@ export function useTerminalOutputWriter(
   const needsPostWriteRefreshRef = useRef(false);
   const needsPostWriteScrollBottomRef = useRef(false);
   const snapshotRedrawInProgressRef = useRef(false);
+  const idleRefreshEpochRef = useRef(0);
+  const cancelTrackedFrameRef = useRef<(frameId: number | undefined) => void>(() => undefined);
+  const idleRefreshFrameRef = useRef<number | undefined>(undefined);
+  const idleRefreshFollowupFrameRef = useRef<number | undefined>(undefined);
+
+  const cancelPendingIdleRefreshFrames = useCallback(() => {
+    // 中文注释：attach/reconnect 的尾帧 refresh 可能比后续 burst 输出更晚执行。
+    // 一旦新输出重新入队，旧 refresh 就已经过期；这里直接撤销，避免把前一个
+    // idle 周期的刷新计入新的持续输出路径。
+    cancelTrackedFrameRef.current(idleRefreshFrameRef.current);
+    idleRefreshFrameRef.current = undefined;
+    cancelTrackedFrameRef.current(idleRefreshFollowupFrameRef.current);
+    idleRefreshFollowupFrameRef.current = undefined;
+  }, []);
 
   const clearPendingWriteQueue = useCallback(() => {
     pendingWriteItemsRef.current = [];
@@ -135,10 +150,11 @@ export function useTerminalOutputWriter(
       writeFrameRef.current.cancel();
       writeFrameRef.current = undefined;
     }
+    cancelPendingIdleRefreshFrames();
     needsPostWriteRefreshRef.current = false;
     needsPostWriteScrollBottomRef.current = false;
     snapshotRedrawInProgressRef.current = false;
-  }, [clearPendingWriteQueue]);
+  }, [cancelPendingIdleRefreshFrames, clearPendingWriteQueue]);
 
   const resetWriterState = useCallback(() => {
     invalidateWriterForFullResync();
@@ -257,6 +273,10 @@ export function useTerminalOutputWriter(
     if (items.length === 0) {
       return false;
     }
+    // 中文注释：只要新输出进队，之前按“队列已空”排队的 idle refresh 就可能过期。
+    // 用 epoch 把这些 refresh 变成可失效任务，避免持续输出时每个短暂空窗都真的刷新两帧。
+    idleRefreshEpochRef.current += 1;
+    cancelPendingIdleRefreshFrames();
     pendingWriteItemsRef.current.push(...items);
     pendingWriteBytesRef.current += items.reduce((sum, item) => sum + terminalOutputItemBytes(item), 0);
     if (highWaterBacklogBytes(pendingWriteItemsRef.current) > PENDING_WRITE_HIGH_WATER_BYTES) {
@@ -276,8 +296,12 @@ export function useTerminalOutputWriter(
   }, [invalidateWriterForFullResync, onHighWaterResync, takeOutput]);
 
   const createTerminalOutputDrain = useCallback((options: CreateTerminalOutputDrainOptions) => {
+    cancelTrackedFrameRef.current = options.cancelTrackedFrame;
     const markItemRendered = (item: TerminalOutputItem) => {
-      if (item.kind === "snapshot") {
+      if (item.kind === "sync") {
+        lastTerminalSeqRef.current = item.baseSeq;
+        options.onTerminalSeqRendered(item.baseSeq);
+      } else if (item.kind === "snapshot") {
         snapshotRedrawInProgressRef.current = false;
         lastTerminalSeqRef.current = item.baseSeq;
         options.onTerminalSeqRendered(item.baseSeq);
@@ -298,6 +322,9 @@ export function useTerminalOutputWriter(
       options.onTerminalOutputRendered?.(item);
     };
     const advanceSequenceCursor = (item: TerminalOutputItem, current: number | undefined) => {
+      if (item.kind === "sync") {
+        return item.baseSeq;
+      }
       if (item.kind === "snapshot") {
         return item.baseSeq;
       }
@@ -312,6 +339,9 @@ export function useTerminalOutputWriter(
       }
       active.sequenceChecked = true;
       const { item } = active;
+      if (item.kind === "sync") {
+        return true;
+      }
       if (item.kind === "snapshot") {
         snapshotRedrawInProgressRef.current = true;
         options.sessionSizeRef.current = item.size;
@@ -385,7 +415,7 @@ export function useTerminalOutputWriter(
         }
 
         const { item } = active;
-        if ((item.kind === "resize" || item.kind === "exit" || terminalOutputItemBytes(item) === 0) && byteCount > 0) {
+        if ((item.kind === "sync" || item.kind === "resize" || item.kind === "exit" || terminalOutputItemBytes(item) === 0) && byteCount > 0) {
           break;
         }
 
@@ -393,7 +423,7 @@ export function useTerminalOutputWriter(
           continue;
         }
 
-        if (item.kind === "resize" || item.kind === "exit" || terminalOutputItemBytes(item) === 0) {
+        if (item.kind === "sync" || item.kind === "resize" || item.kind === "exit" || terminalOutputItemBytes(item) === 0) {
           if (item.kind === "resize") {
             applyResizeFrame(item);
           }
@@ -436,13 +466,16 @@ export function useTerminalOutputWriter(
         renderedItems,
       };
     };
-    const afterTerminalMutation = () => {
+    const afterTerminalMutation = (renderedItems: TerminalOutputItem[] = []) => {
       if (options.isDisposed()) {
         return;
       }
       options.queueCursorReport();
       options.scheduleTerminalScrollPosition();
       const outputQueueIdle = !activeWriteRef.current && pendingWriteItemsRef.current.length === 0;
+      const requiresBusyRefresh = renderedItems.some((item) =>
+        item.kind === "snapshot" || item.kind === "resize" || item.kind === "exit",
+      );
       if (!needsPostWriteRefreshRef.current && !outputQueueIdle) {
         return;
       }
@@ -457,10 +490,20 @@ export function useTerminalOutputWriter(
       // 首屏/清屏后的首个 write，以及 resize/exit 这类零字节 mutation，都需要
       // 一次轻量 refresh。否则某些 Ghostty 渲染时序会等到下一次输入/resize 才 repaint 尾包。
       if (outputQueueIdle) {
+        const idleRefreshEpoch = idleRefreshEpochRef.current;
         const bottomScrollGeneration = shouldScrollBottomAfterMutation
           ? options.beginBottomScrollFollow()
           : undefined;
-        options.requestTrackedFrame(() => {
+        idleRefreshFrameRef.current = options.requestTrackedFrame(() => {
+          idleRefreshFrameRef.current = undefined;
+          if (
+            idleRefreshEpoch !== idleRefreshEpochRef.current ||
+            writeInFlightRef.current ||
+            activeWriteRef.current ||
+            pendingWriteItemsRef.current.length > 0
+          ) {
+            return;
+          }
           if (shouldScrollBottomAfterMutation && bottomScrollGeneration !== undefined) {
             if (options.isBottomScrollFollowActive(bottomScrollGeneration)) {
               options.scrollToBottom(bottomScrollGeneration);
@@ -473,7 +516,16 @@ export function useTerminalOutputWriter(
           options.scheduleTerminalScrollPosition({ immediate: true });
           // 切换 session 后浏览器布局和 Ghostty renderer 可能比 write callback 再晚一帧可绘制。
           // 队列已经 idle 时补第二帧刷新，不会放大持续输出路径的绘制压力。
-          options.requestTrackedFrame(() => {
+          idleRefreshFollowupFrameRef.current = options.requestTrackedFrame(() => {
+            idleRefreshFollowupFrameRef.current = undefined;
+            if (
+              idleRefreshEpoch !== idleRefreshEpochRef.current ||
+              writeInFlightRef.current ||
+              activeWriteRef.current ||
+              pendingWriteItemsRef.current.length > 0
+            ) {
+              return;
+            }
             if (shouldScrollBottomAfterMutation && bottomScrollGeneration !== undefined) {
               if (options.isTerminalPinnedToBottom(options.terminal)) {
                 if (options.isBottomScrollFollowActive(bottomScrollGeneration)) {
@@ -485,6 +537,9 @@ export function useTerminalOutputWriter(
             options.scheduleTerminalScrollPosition({ immediate: true });
           });
         });
+        return;
+      }
+      if (!requiresBusyRefresh) {
         return;
       }
       // 持续输出路径不反复 proposeDimensions/refresh，降低 layout 和绘制压力。
@@ -519,7 +574,7 @@ export function useTerminalOutputWriter(
         for (const item of output.renderedItems) {
           markItemRendered(item);
         }
-        afterTerminalMutation();
+        afterTerminalMutation(output.renderedItems);
         if (activeWriteRef.current || pendingWriteItemsRef.current.length > 0) {
           schedulePendingWrite();
         }
@@ -556,6 +611,7 @@ export function useTerminalOutputWriter(
     needsPostWriteRefreshRef,
     needsPostWriteScrollBottomRef,
     snapshotRedrawInProgressRef,
+    idleRefreshEpochRef,
     clearPendingWriteQueue,
     invalidateWriterForFullResync,
     resetWriterState,

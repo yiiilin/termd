@@ -1,11 +1,10 @@
 import { useCallback, useEffect, useRef, type Dispatch, type MutableRefObject, type SetStateAction } from "react";
 import type { DirectClient } from "../protocol/direct-client";
 import type {
-  RenderableTerminalFramePayload,
+  AttachFramePayload,
   SessionActivityPayload,
   SessionAttachedPayload,
   SessionCwdChangedPayload,
-  SessionDataPayload,
   SessionFilesResultPayload,
   SessionGitResultPayload,
   SessionResizedPayload,
@@ -16,8 +15,9 @@ import type {
 } from "../protocol/types";
 import { sessionDataFromBase64 } from "../protocol/wire";
 import type { TerminalOutputItem } from "../components/terminal/types";
-import { toSafeError } from "../protocol/errors";
+import { ProtocolClientError, toSafeError } from "../protocol/errors";
 import { recordTermdDiagnostic } from "../diagnostics";
+import { decodeSupervisorTerminalServerFrame } from "../protocol/supervisor-terminal";
 
 const RECEIVE_LOOP_YIELD_MESSAGES = 64;
 const RECEIVE_LOOP_YIELD_BYTES = 256 * 1024;
@@ -166,6 +166,7 @@ export function useTerminalReceiveLoop(
     receiveLoopActiveRef,
     receiveLoopGenerationRef,
     attachReconnectHandlerRef,
+    lastRenderedTerminalSeqRef,
     terminalSnapshotRevealHistoryTokensRef,
     terminalSnapshotPendingFullSnapshotTokensRef,
     terminalSnapshotClientFullSnapshotTokensRef,
@@ -184,6 +185,35 @@ export function useTerminalReceiveLoop(
       receiveLoopActiveRef.current &&
       receiveLoopGenerationRef.current === loopGeneration &&
       attachClientRef.current === client;
+    const primedSessions = new Set<UUID>();
+    const bufferedPreSyncFrames = new Map<UUID, TerminalOutputItem[]>();
+    const markSessionPrimed = (sessionId: UUID) => {
+      primedSessions.add(sessionId);
+    };
+    const bufferPreSyncFrame = (sessionId: UUID, item: TerminalOutputItem) => {
+      const pending = bufferedPreSyncFrames.get(sessionId) ?? [];
+      pending.push(item);
+      bufferedPreSyncFrames.set(sessionId, pending);
+    };
+    const flushBufferedPreSyncFrames = (sessionId: UUID, options: { seedSequence?: boolean } = {}) => {
+      const pending = bufferedPreSyncFrames.get(sessionId);
+      if (!pending || pending.length === 0) {
+        return;
+      }
+      bufferedPreSyncFrames.delete(sessionId);
+      if (options.seedSequence) {
+        const firstLiveFrame = pending.find((item) => item.kind === "output" || item.kind === "resize" || item.kind === "exit");
+        if (firstLiveFrame && "terminalSeq" in firstLiveFrame) {
+          enqueueTerminalOutput({
+            kind: "sync",
+            baseSeq: Math.max(0, firstLiveFrame.terminalSeq - 1),
+          });
+        }
+      }
+      for (const item of pending) {
+        enqueueTerminalOutput(item);
+      }
+    };
     const read = async () => {
       let processedMessages = 0;
       let processedBytes = 0;
@@ -194,8 +224,8 @@ export function useTerminalReceiveLoop(
             return;
           }
           processedMessages += 1;
-          if (inner.type === "session_data") {
-            const payload = inner.payload as SessionDataPayload;
+          if (inner.type === "attach_frame") {
+            const payload = inner.payload as AttachFramePayload;
             if (payload.session_id !== attachedSessionRef.current) {
               markNewOutputIfBackground(payload.session_id);
               if (processedMessages >= RECEIVE_LOOP_YIELD_MESSAGES) {
@@ -204,91 +234,152 @@ export function useTerminalReceiveLoop(
               }
               continue;
             }
-            const bytes = payload.data_bytes ?? sessionDataFromBase64(payload.data_base64 ?? "");
-            terminalOutputTraceCountRef.current += 1;
-            if (terminalOutputTraceCountRef.current % 256 === 1) {
-              recordTermdDiagnostic("receive_loop_session_data", {
-                sessionId: payload.session_id,
-                bytes: bytes.byteLength,
-                sample: terminalOutputTraceCountRef.current,
-              });
-            }
-            enqueueTerminalOutput({ kind: "data", bytes });
-            processedBytes += bytes.byteLength;
-          } else if (inner.type === "terminal_frame") {
-            const payload = inner.payload as RenderableTerminalFramePayload;
-            if (payload.session_id !== attachedSessionRef.current) {
-              markNewOutputIfBackground(payload.session_id);
-              if (processedMessages >= RECEIVE_LOOP_YIELD_MESSAGES) {
-                processedMessages = 0;
-                await yieldToEventLoop();
-              }
-              continue;
-            }
-            if (payload.kind === "snapshot") {
-              applyConfirmedSessionSize(payload.session_id, payload.size);
-              const bytes = payload.data_bytes ?? sessionDataFromBase64(payload.data_base64 ?? "");
+            const frameBytes = payload.data_bytes ?? sessionDataFromBase64(payload.data_base64 ?? "");
+            const frame = decodeSupervisorTerminalServerFrame(frameBytes);
+            if (frame.type === "attach_sync") {
+              markSessionPrimed(frame.session_id);
+              applyConfirmedSessionSize(frame.session_id, frame.snapshot.size);
               const fullSnapshotToken = terminalSnapshotClientFullSnapshotTokensRef.current.get(client);
-              const snapshotToken = fullSnapshotToken?.sessionId === payload.session_id ? fullSnapshotToken.token : undefined;
-              const revealToken = terminalSnapshotRevealHistoryTokensRef.current.get(payload.session_id);
+              const snapshotToken = fullSnapshotToken?.sessionId === frame.session_id ? fullSnapshotToken.token : undefined;
+              const revealToken = terminalSnapshotRevealHistoryTokensRef.current.get(frame.session_id);
               const revealHistory = snapshotToken !== undefined && revealToken === snapshotToken;
-              recordTermdDiagnostic("receive_loop_terminal_snapshot", {
-                sessionId: payload.session_id,
-                baseSeq: payload.base_seq,
-                bytes: bytes.byteLength,
-                size: payload.size,
-                snapshotToken,
-                revealToken,
-                revealHistory,
-              });
-              if (revealHistory) {
-                terminalSnapshotRevealHistoryTokensRef.current.delete(payload.session_id);
-              }
-              if (snapshotToken !== undefined) {
-                const pendingSnapshot = terminalSnapshotPendingFullSnapshotTokensRef.current.get(payload.session_id);
-                if (pendingSnapshot?.token === snapshotToken) {
-                  terminalSnapshotPendingFullSnapshotTokensRef.current.delete(payload.session_id);
+              let snapshotTokensConsumed = false;
+              const enqueueSnapshotFrame = (input: { bytes: Uint8Array; baseSeq: number; size: TerminalSize }) => {
+                if (!snapshotTokensConsumed) {
+                  if (revealHistory) {
+                    terminalSnapshotRevealHistoryTokensRef.current.delete(frame.session_id);
+                  }
+                  if (snapshotToken !== undefined) {
+                    const pendingSnapshot = terminalSnapshotPendingFullSnapshotTokensRef.current.get(frame.session_id);
+                    if (pendingSnapshot?.token === snapshotToken) {
+                      terminalSnapshotPendingFullSnapshotTokensRef.current.delete(frame.session_id);
+                    }
+                    terminalSnapshotClientFullSnapshotTokensRef.current.delete(client);
+                  }
+                  snapshotTokensConsumed = true;
                 }
-                terminalSnapshotClientFullSnapshotTokensRef.current.delete(client);
-              }
-              enqueueTerminalOutput({
-                kind: "snapshot",
-                bytes,
-                baseSeq: payload.base_seq,
-                size: payload.size,
-                revealHistory,
-              });
-              processedBytes += bytes.byteLength;
-            } else if (payload.kind === "output") {
-              const bytes = payload.data_bytes ?? sessionDataFromBase64(payload.data_base64 ?? "");
-              terminalOutputTraceCountRef.current += 1;
-              if (terminalOutputTraceCountRef.current % 256 === 1) {
-                recordTermdDiagnostic("receive_loop_terminal_output", {
-                  sessionId: payload.session_id,
-                  terminalSeq: payload.terminal_seq,
-                  bytes: bytes.byteLength,
-                  sample: terminalOutputTraceCountRef.current,
+                enqueueTerminalOutput({
+                  kind: "snapshot",
+                  bytes: input.bytes,
+                  baseSeq: input.baseSeq,
+                  size: input.size,
+                  revealHistory,
+                });
+                processedBytes += input.bytes.byteLength;
+              };
+              // 中文注释：带 `last_terminal_seq` 的 attach_sync 可能只表示“在现有本地屏幕上续传 tail”，
+              // 此时 retained_output 会被刻意置空。不能再把它当成一次空 snapshot reset，
+              // 否则重连或复用同一 session 会直接把现有 Ghostty 画面清掉。
+              if (snapshotToken !== undefined || frame.snapshot.retained_output_bytes.byteLength > 0) {
+                enqueueSnapshotFrame({
+                  bytes: frame.snapshot.retained_output_bytes,
+                  baseSeq: frame.base_seq,
+                  size: frame.snapshot.size,
                 });
               }
-              enqueueTerminalOutput({
-                kind: "output",
-                bytes,
-                terminalSeq: payload.terminal_seq,
-              });
-              processedBytes += bytes.byteLength;
-            } else if (payload.kind === "resize") {
-              recordTermdDiagnostic("receive_loop_terminal_resize", {
-                sessionId: payload.session_id,
-                terminalSeq: payload.terminal_seq,
-                size: payload.size,
-              });
-              enqueueTerminalOutput({ kind: "resize", terminalSeq: payload.terminal_seq, size: payload.size });
-            } else if (payload.kind === "exit") {
-              recordTermdDiagnostic("receive_loop_terminal_exit", {
-                sessionId: payload.session_id,
-                terminalSeq: payload.terminal_seq,
-              });
-              enqueueTerminalOutput({ kind: "exit", terminalSeq: payload.terminal_seq });
+              const hasSnapshotSeed =
+                snapshotToken !== undefined ||
+                frame.snapshot.retained_output_bytes.byteLength > 0 ||
+                frame.frames.some((terminalFrame) => terminalFrame.kind === "snapshot");
+              if (!hasSnapshotSeed) {
+                // 中文注释：空白 attach_sync 也是合法 bootstrap，必须先推进 base_seq。
+                enqueueTerminalOutput({
+                  kind: "sync",
+                  baseSeq: frame.base_seq,
+                });
+              }
+              for (const terminalFrame of frame.frames) {
+                if (terminalFrame.kind === "snapshot") {
+                  applyConfirmedSessionSize(frame.session_id, terminalFrame.size);
+                  const bytes = terminalFrame.data_bytes ?? sessionDataFromBase64(terminalFrame.data_base64 ?? "");
+                  enqueueSnapshotFrame({
+                    bytes,
+                    baseSeq: terminalFrame.base_seq,
+                    size: terminalFrame.size,
+                  });
+                } else if (terminalFrame.kind === "output") {
+                  const bytes = terminalFrame.data_bytes ?? sessionDataFromBase64(terminalFrame.data_base64 ?? "");
+                  enqueueTerminalOutput({
+                    kind: "output",
+                    bytes,
+                    terminalSeq: terminalFrame.terminal_seq,
+                  });
+                  processedBytes += bytes.byteLength;
+                } else if (terminalFrame.kind === "resize") {
+                  enqueueTerminalOutput({
+                    kind: "resize",
+                    terminalSeq: terminalFrame.terminal_seq,
+                    size: terminalFrame.size,
+                  });
+                } else if (terminalFrame.kind === "exit") {
+                  enqueueTerminalOutput({
+                    kind: "exit",
+                    terminalSeq: terminalFrame.terminal_seq,
+                  });
+                }
+              }
+              flushBufferedPreSyncFrames(frame.session_id, { seedSequence: !hasSnapshotSeed });
+            } else if (frame.type === "terminal_frame") {
+              if (frame.frame.kind === "snapshot") {
+                markSessionPrimed(frame.session_id);
+                applyConfirmedSessionSize(frame.session_id, frame.frame.size);
+                const bytes = frame.frame.data_bytes ?? sessionDataFromBase64(frame.frame.data_base64 ?? "");
+                enqueueTerminalOutput({
+                  kind: "snapshot",
+                  bytes,
+                  baseSeq: frame.frame.base_seq,
+                  size: frame.frame.size,
+                  revealHistory: false,
+                });
+                processedBytes += bytes.byteLength;
+              } else if (frame.frame.kind === "output") {
+                const bytes = frame.frame.data_bytes ?? sessionDataFromBase64(frame.frame.data_base64 ?? "");
+                const outputItem: TerminalOutputItem = {
+                  kind: "output",
+                  bytes,
+                  terminalSeq: frame.frame.terminal_seq,
+                };
+                if (
+                  !primedSessions.has(frame.session_id) &&
+                  lastRenderedTerminalSeqRef.current.get(frame.session_id) === undefined
+                ) {
+                  bufferPreSyncFrame(frame.session_id, outputItem);
+                } else {
+                  enqueueTerminalOutput(outputItem);
+                  processedBytes += bytes.byteLength;
+                }
+              } else if (frame.frame.kind === "resize") {
+                const resizeItem: TerminalOutputItem = {
+                  kind: "resize",
+                  terminalSeq: frame.frame.terminal_seq,
+                  size: frame.frame.size,
+                };
+                if (
+                  !primedSessions.has(frame.session_id) &&
+                  lastRenderedTerminalSeqRef.current.get(frame.session_id) === undefined
+                ) {
+                  bufferPreSyncFrame(frame.session_id, resizeItem);
+                } else {
+                  enqueueTerminalOutput(resizeItem);
+                }
+              } else if (frame.frame.kind === "exit") {
+                const exitItem: TerminalOutputItem = {
+                  kind: "exit",
+                  terminalSeq: frame.frame.terminal_seq,
+                };
+                if (
+                  !primedSessions.has(frame.session_id) &&
+                  lastRenderedTerminalSeqRef.current.get(frame.session_id) === undefined
+                ) {
+                  bufferPreSyncFrame(frame.session_id, exitItem);
+                } else {
+                  enqueueTerminalOutput(exitItem);
+                }
+              }
+            } else if (frame.type === "heartbeat_ping") {
+              client.sendSupervisorTerminalHeartbeatPong(payload.session_id, frame.nonce);
+            } else if (frame.type === "close") {
+              throw new ProtocolClientError(frame.reason, frame.message ?? frame.reason);
             }
           } else if (inner.type === "session_activity") {
             const payload = inner.payload as SessionActivityPayload;

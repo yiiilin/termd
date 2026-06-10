@@ -36,6 +36,11 @@ import {
 import { envelopeTypeForProtocolEventMethod } from "./methods";
 import { binaryPacketToProtocol, protocolPacketToBinary } from "./packet-codec";
 import {
+  buildAttachFramePayload,
+  decodeSupervisorTerminalServerFrame,
+  encodeSupervisorTerminalClientFrame,
+} from "./supervisor-terminal";
+import {
   abortedConnectionError,
   expectQueuedEnvelope,
   isAbortError,
@@ -49,8 +54,8 @@ import {
   yieldToEventLoop,
 } from "./socket-transport";
 import { BINARY_PROTOCOL_VERSION, PROTOCOL_PACKET_VERSION } from "./types";
-import { recordTermdDiagnostic } from "../diagnostics";
 import type {
+  AttachFramePayload,
   AuthChallengePayload,
   ClientHelloPayload,
   ControlGrantPayload,
@@ -82,7 +87,6 @@ import type {
   SessionCreatedPayload,
   SessionCursorPayload,
   SessionCursorPresence,
-  SessionDataPayload,
   SessionFileDeletePayload,
   SessionFileDeletedPayload,
   SessionFileDownloadChunkPayload,
@@ -120,7 +124,6 @@ import type {
   SessionResizedPayload,
   SessionSearchPayload,
   SessionSearchResultPayload,
-  SingleTerminalFramePayload,
   TerminalSize,
   UUID,
 } from "./types";
@@ -1195,14 +1198,14 @@ export class DirectClient {
 
   async attachSession(
     sessionId: UUID,
-    options: { watchUpdates?: boolean; lastTerminalSeq?: number; timeoutMs?: number; signal?: AbortSignal } = {},
+    options: { lastTerminalSeq?: number; timeoutMs?: number; signal?: AbortSignal } = {},
   ): Promise<SessionAttachedPayload> {
     this.requireAuthenticated();
     return this.openTerminalStream<SessionAttachedPayload>(
       "terminal.attach",
       {
         session_id: sessionId,
-        watch_updates: options.watchUpdates ?? true,
+        watch_updates: true,
         ...(options.lastTerminalSeq !== undefined ? { last_terminal_seq: options.lastTerminalSeq } : {}),
       } satisfies SessionAttachPayload,
       sessionId,
@@ -1216,25 +1219,18 @@ export class DirectClient {
       "session.attach",
       {
         session_id: sessionId,
-        watch_updates: false,
-      } satisfies SessionAttachPayload,
+      },
     );
   }
 
   async sendSessionData(sessionId: UUID, bytes: Uint8Array): Promise<void> {
-    const stream = this.requireTerminalStream(sessionId);
-    const seq = stream.nextInputSeq;
-    stream.nextInputSeq += 1;
-    this.sendPacket({
-      version: PROTOCOL_PACKET_VERSION,
-      kind: "stream_chunk",
-      stream_id: stream.streamId,
-      seq,
-      payload: {
-        session_id: sessionId,
-        data_base64: sessionDataToBase64(bytes),
-      } satisfies SessionDataPayload,
-    });
+    this.sendAttachFrame(
+      sessionId,
+      encodeSupervisorTerminalClientFrame({
+        type: "input",
+        data_bytes: bytes,
+      }),
+    );
   }
 
   async sendSessionCursor(sessionId: UUID, presence: SessionCursorPresence): Promise<void> {
@@ -1257,11 +1253,28 @@ export class DirectClient {
 
   async requestSessionResize(sessionId: UUID, size: TerminalSize): Promise<void> {
     this.requireTerminalStream(sessionId);
+    this.sendAttachFrame(
+      sessionId,
+      encodeSupervisorTerminalClientFrame({
+        type: "resize",
+        size,
+      }),
+    );
     const payload = await this.request<SessionResizedPayload>(
       "session.resize",
       { session_id: sessionId, size } satisfies SessionResizePayload,
     );
     this.enqueueInner(envelope("session_resized", payload));
+  }
+
+  sendSupervisorTerminalHeartbeatPong(sessionId: UUID, nonce: string): void {
+    this.sendAttachFrame(
+      sessionId,
+      encodeSupervisorTerminalClientFrame({
+        type: "heartbeat_pong",
+        nonce,
+      }),
+    );
   }
 
   async renameSession(sessionId: UUID, name: string): Promise<SessionRenamedPayload> {
@@ -1584,21 +1597,13 @@ export class DirectClient {
     if (!packet.stream_id) {
       throw new ProtocolClientError("invalid_packet", "stream chunk is missing stream id");
     }
-    const payload = packet.payload as { kind?: unknown; session_id?: unknown; frames?: unknown };
-    if (payload.kind === "batch" && Array.isArray(payload.frames)) {
-      for (const frame of payload.frames) {
-        if (this.isTerminalFramePayload(frame)) {
-          this.enqueueTerminalFrame(frame, packet.stream_id, seq);
-        }
-      }
-      return;
-    }
-    if (this.isTerminalFramePayload(payload)) {
-      this.enqueueTerminalFrame(payload, packet.stream_id, seq);
+    const payload = packet.payload as { session_id?: unknown };
+    if (this.isAttachFramePayload(payload)) {
+      this.enqueueAttachFrame(payload, packet.stream_id, seq);
       return;
     }
 
-    this.enqueueSessionData(packet.payload as SessionDataPayload, packet.stream_id, seq);
+    throw new ProtocolClientError("invalid_packet", "terminal stream chunk payload is invalid");
   }
 
   private handleFileStreamChunk(stream: FileStreamState, packet: ProtocolPacket): void {
@@ -1635,48 +1640,39 @@ export class DirectClient {
     }
   }
 
-  private enqueueSessionData(payload: SessionDataPayload, streamId: PacketStreamId, transportSeq: number): void {
-    this.enqueueInner(envelope("session_data", {
+  private enqueueAttachFrame(payload: AttachFramePayload, streamId: PacketStreamId, transportSeq: number): void {
+    this.enqueueInner(envelope("attach_frame", {
       ...payload,
-      // 这两个字段只供前端定位 stream 归属；daemon/relay 仍只理解原始 session_data。
       stream_id: streamId,
       transport_seq: transportSeq,
-    } satisfies SessionDataPayload));
+    } satisfies AttachFramePayload));
   }
 
-  private enqueueTerminalFrame(
-    payload: SingleTerminalFramePayload,
-    streamId: PacketStreamId,
-    transportSeq: number,
-  ): void {
-    if (payload.kind === "snapshot") {
-      recordTermdDiagnostic("direct_client_enqueue_snapshot", {
-        sessionId: payload.session_id,
-        streamId,
-        transportSeq,
-        baseSeq: payload.base_seq,
-      });
-    } else if (payload.kind === "output" && payload.terminal_seq % 1024 === 1) {
-      recordTermdDiagnostic("direct_client_enqueue_output_sample", {
-        sessionId: payload.session_id,
-        streamId,
-        transportSeq,
-        terminalSeq: payload.terminal_seq,
-      });
-    }
-    this.enqueueInner(envelope("terminal_frame", {
-      ...(payload as object),
-      transport_seq: transportSeq,
-      stream_id: streamId,
-    }));
-  }
-
-  private isTerminalFramePayload(payload: unknown): payload is SingleTerminalFramePayload {
+  private isAttachFramePayload(payload: unknown): payload is AttachFramePayload {
     if (!payload || typeof payload !== "object") {
       return false;
     }
-    const kind = (payload as { kind?: unknown }).kind;
-    return kind === "snapshot" || kind === "output" || kind === "resize" || kind === "exit";
+    const candidate = payload as {
+      session_id?: unknown;
+      data_base64?: unknown;
+      data_bytes?: unknown;
+    };
+    if (
+      typeof candidate.session_id !== "string" ||
+      (typeof candidate.data_base64 !== "string" && !(candidate.data_bytes instanceof Uint8Array))
+    ) {
+      return false;
+    }
+    const bytes =
+      candidate.data_bytes instanceof Uint8Array
+        ? candidate.data_bytes
+        : base64ToBytes(typeof candidate.data_base64 === "string" ? candidate.data_base64 : "");
+    try {
+      decodeSupervisorTerminalServerFrame(bytes);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   private async expectQueuedPayload<T>(expectedType: Envelope["type"], timeoutMs = this.timeoutMs): Promise<T> {
@@ -1927,7 +1923,7 @@ export class DirectClient {
       return;
     }
     const retained = this.pendingInner.filter((inner) => {
-      if (inner.type !== "session_data" && inner.type !== "terminal_frame") {
+      if (inner.type !== "attach_frame") {
         return true;
       }
       const payload = inner.payload as { stream_id?: unknown };
@@ -1940,11 +1936,24 @@ export class DirectClient {
   }
 
   private isTerminalOutputForStream(inner: Envelope, streamId: PacketStreamId, sessionId: UUID): boolean {
-    if (inner.type !== "session_data" && inner.type !== "terminal_frame") {
+    if (inner.type !== "attach_frame") {
       return false;
     }
     const payload = inner.payload as { stream_id?: unknown; session_id?: unknown };
     return payload.stream_id === streamId || payload.session_id === sessionId;
+  }
+
+  private sendAttachFrame(sessionId: UUID, frame: Uint8Array): void {
+    const stream = this.requireTerminalStream(sessionId);
+    const seq = stream.nextInputSeq;
+    stream.nextInputSeq += 1;
+    this.sendPacket({
+      version: PROTOCOL_PACKET_VERSION,
+      kind: "stream_chunk",
+      stream_id: stream.streamId,
+      seq,
+      payload: buildAttachFramePayload(sessionId, frame),
+    }, { streamChunkPayloadType: "attach_frame" });
   }
 
   private rejectInnerWaiters(error: Error): void {
@@ -1997,9 +2006,12 @@ export class DirectClient {
     return this.closedError ?? new ProtocolClientError("connection_closed", "connection closed");
   }
 
-  private sendPacket(packet: ProtocolPacket): void {
+  private sendPacket(
+    packet: ProtocolPacket,
+    encodingOptions?: import("./packet-codec").ProtocolPacketBinaryEncodingOptions,
+  ): void {
     if (this.binaryMode) {
-      this.sendBinaryPacket(packet);
+      this.sendBinaryPacket(packet, encodingOptions);
       return;
     }
     this.sendInner(envelope("packet", packet));
@@ -2018,8 +2030,13 @@ export class DirectClient {
     this.sendOuter(envelope("encrypted_frame", frame));
   }
 
-  private sendBinaryPacket(packet: ProtocolPacket): void {
-    const frame = this.e2ee.encryptBinary(encodeBinaryProtocolPacket(protocolPacketToBinary(packet)));
+  private sendBinaryPacket(
+    packet: ProtocolPacket,
+    encodingOptions?: import("./packet-codec").ProtocolPacketBinaryEncodingOptions,
+  ): void {
+    const frame = this.e2ee.encryptBinary(
+      encodeBinaryProtocolPacket(protocolPacketToBinary(packet, encodingOptions)),
+    );
     this.sendBinaryOuter(encodeBinaryEncryptedFrame(frame));
   }
 

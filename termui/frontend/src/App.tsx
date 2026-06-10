@@ -244,6 +244,7 @@ export default function App() {
   const sessionOrderRef = useRef<UUID[]>([]);
   const sessionOrderGenerationRef = useRef(0);
   const pendingSessionReorderRef = useRef(false);
+  const terminalCreateOwnsAttachRef = useRef(false);
   const [newOutputSessionIds, setNewOutputSessionIds] = useState<Set<UUID>>(() => new Set());
   const [daemonClients, setDaemonClients] = useState<DaemonClientSummaryPayload[]>([]);
   const [forgettingClientIds, setForgettingClientIds] = useState<Set<UUID>>(() => new Set());
@@ -1335,6 +1336,12 @@ export default function App() {
       ) {
         return;
       }
+      if (statusRef.current === "creating") {
+        // 中文注释：terminal.create 自己会负责把新 session 写入本地列表、选中并接管 attach。
+        // 创建中的旁路 session.list 只能看到 daemon 端“半完成”的新 session，不能反向驱动
+        // 工作台状态，否则会抢跑发出第二条 terminal.attach。
+        return;
+      }
       const canApplyDaemonOrder =
         !pendingSessionReorderRef.current &&
         requestOrderGeneration === sessionOrderGenerationRef.current;
@@ -1400,7 +1407,13 @@ export default function App() {
         clearSessionFiles();
       }
       if (!attachingSessionIdRef.current) {
-        setStatus(attachedSessionRef.current ? "attached" : "ready");
+        const nextStatus =
+          statusRef.current === "creating"
+            ? "creating"
+            : attachedSessionRef.current
+              ? "attached"
+              : "ready";
+        setStatus(nextStatus);
       }
       // 中文注释：session.list 是刷新工作台的提交点。它成功后，即使后续非关键
       // daemon.clients 因 session 切换关闭了同一条 WebSocket，也不能把页面回滚到 admin。
@@ -1437,11 +1450,13 @@ export default function App() {
         // 可能正复用这条连接，收到 connection_closed/stale_connection 只能说明它被本地
         // 新 session 连接取代，不能把 workspace 切回 admin。
         const nextStatus =
-          statusRef.current === "attaching"
-            ? "attaching"
-            : attachedSessionRef.current
-              ? "attached"
-              : "ready";
+          statusRef.current === "creating"
+            ? "creating"
+            : statusRef.current === "attaching"
+              ? "attaching"
+              : attachedSessionRef.current
+                ? "attached"
+                : "ready";
         setStatus(nextStatus);
         return;
       }
@@ -1453,11 +1468,13 @@ export default function App() {
         // relay 恢复或后台唤醒导致的短超时不能卸载 Ghostty，也不能升级成全局连接错误；
         // 真实终端断线由 attach receive loop 按长超时重连链路处理。
         const nextStatus =
-          statusRef.current === "attaching"
-            ? "attaching"
-            : attachedSessionRef.current
-              ? "attached"
-              : "ready";
+          statusRef.current === "creating"
+            ? "creating"
+            : statusRef.current === "attaching"
+              ? "attaching"
+              : attachedSessionRef.current
+                ? "attached"
+                : "ready";
         setStatus(nextStatus);
         return;
       }
@@ -2096,6 +2113,9 @@ export default function App() {
       !sessionId ||
       closingSessionIdsRef.current.has(sessionId) ||
       closedSessionIdsRef.current.has(sessionId) ||
+      terminalCreateOwnsAttachRef.current ||
+      pendingAttachClientRef.current ||
+      pendingTerminalAttachAbortControllerRef.current ||
       attachedSessionRef.current ||
       userDetachedRef.current ||
       (autoAttachAttemptedSessionRef.current === sessionId && !shouldReattachCurrentSession)
@@ -2111,6 +2131,9 @@ export default function App() {
 
   const handleCreateSession = useCallback(async () => {
     userDetachedRef.current = false;
+    // 中文注释：`terminal.create` 自己就会建立并接管 watched terminal stream。
+    // 在它完成接管前，任何自动 attach 都属于重复链路，只会把 create stream cancel 掉。
+    terminalCreateOwnsAttachRef.current = true;
     const createRequestId = sessionCreateRequestIdRef.current + 1;
     sessionCreateRequestIdRef.current = createRequestId;
     setError(undefined);
@@ -2173,6 +2196,7 @@ export default function App() {
       setTerminalFocusRequest((request) => request + 1);
       setStatus("attached");
       startReceiveLoop(attachedClient);
+      terminalCreateOwnsAttachRef.current = false;
       void loadSessionFiles(created.session_id, undefined, { source: "initial" });
       void refreshDaemonClients();
     } catch (caught) {
@@ -2191,6 +2215,9 @@ export default function App() {
       }
       if (outputClient && outputClient !== attachClientRef.current) {
         outputClient.close();
+      }
+      if (sessionCreateRequestIdRef.current === createRequestId) {
+        terminalCreateOwnsAttachRef.current = false;
       }
     }
   }, [

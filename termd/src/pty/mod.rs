@@ -259,6 +259,15 @@ pub struct PtySnapshot {
     pub retained_output: Vec<u8>,
 }
 
+/// watched attachment 的 bootstrap 参数。
+///
+/// 中文注释：这里只保留 attach 建立时确实需要下沉到 supervisor 的最小字段。
+/// `last_terminal_seq` 仍然属于 attach bootstrap，而不是 termd 持续解析的终端业务数据。
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PtyAttachmentBootstrap {
+    pub last_terminal_seq: Option<u64>,
+}
+
 /// supervisor 暴露给 daemon 的 session 级终端帧。
 ///
 /// 中文注释：`terminal_seq` 是 session 级终端事件序号，用于 snapshot 后补 tail；
@@ -381,6 +390,7 @@ pub trait PtyBackend: Send + Sync {
         _restore_info: Option<&PtyRestoreInfo>,
         _size: PtySize,
         _attachment_id: &str,
+        _bootstrap: PtyAttachmentBootstrap,
     ) -> PtyResult<Box<dyn PtyAttachment>> {
         Ok(Box::new(NoopPtyAttachment))
     }
@@ -391,6 +401,24 @@ pub trait PtyBackend: Send + Sync {
 /// 中文注释：它是 runtime/protocol 的生命周期资源，不是 session host。正常路径会显式
 /// 调用 `detach`；具体 backend 的 Drop 仍应做 best-effort 清理，防止异常路径泄漏 client。
 pub trait PtyAttachment: Send {
+    /// watched attachment 的输出唤醒信号。
+    ///
+    /// 中文注释：packet terminal stream 现在跟随 attach proxy 的输出，而不是直接订阅
+    /// daemon session 级 terminal replay。
+    fn output_signal(&self) -> Option<watch::Receiver<u64>> {
+        None
+    }
+
+    /// 读取一帧 opaque attach bytes。
+    fn read_frame(&mut self) -> PtyResult<Option<Vec<u8>>> {
+        Ok(None)
+    }
+
+    /// 写入一帧 opaque attach bytes。
+    fn write_frame(&mut self, _bytes: &[u8]) -> PtyResult<()> {
+        Ok(())
+    }
+
     fn detach(&mut self) -> PtyResult<()> {
         Ok(())
     }

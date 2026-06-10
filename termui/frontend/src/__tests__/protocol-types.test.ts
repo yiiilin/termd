@@ -38,6 +38,7 @@ describe("协议类型", () => {
       "session_attached",
       "session_data",
       "terminal_frame",
+      "attach_frame",
       "session_activity",
       "session_cwd_changed",
       "session_cursor",

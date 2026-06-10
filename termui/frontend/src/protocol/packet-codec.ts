@@ -4,6 +4,7 @@ import {
   terminalFrameJsonToBinary,
 } from "./binary-packet";
 import type {
+  AttachFramePayload,
   PacketErrorPayload,
   ProtocolPacket,
   SessionDataPayload,
@@ -17,7 +18,14 @@ import {
   encodeUtf8,
 } from "./wire";
 
-export function protocolPacketToBinary(packet: ProtocolPacket): BinaryProtocolPacket {
+export interface ProtocolPacketBinaryEncodingOptions {
+  streamChunkPayloadType?: "attach_frame";
+}
+
+export function protocolPacketToBinary(
+  packet: ProtocolPacket,
+  options: ProtocolPacketBinaryEncodingOptions = {},
+): BinaryProtocolPacket {
   const binary: BinaryProtocolPacket = {
     version: packet.version,
     kind: packet.kind,
@@ -39,6 +47,26 @@ export function protocolPacketToBinary(packet: ProtocolPacket): BinaryProtocolPa
       size_bytes?: number;
       eof?: boolean;
     };
+    if (
+      options.streamChunkPayloadType === "attach_frame" &&
+      payload.session_id &&
+      (payload.data_bytes instanceof Uint8Array || typeof payload.data_base64 === "string")
+    ) {
+      const data = payload.data_bytes ?? base64ToBytes(payload.data_base64 ?? "");
+      return {
+        ...binary,
+        payload: { type: "attach_frame", session_id: payload.session_id, data },
+      };
+    }
+    if (
+      payload.session_id &&
+      !(payload.kind) &&
+      !(typeof payload.offset_bytes === "number") &&
+      (payload.data_bytes instanceof Uint8Array || typeof payload.data_base64 === "string")
+    ) {
+      // 中文注释：attach_frame 必须由调用方结合 terminal stream 语义显式标注；
+      // 否则这里按 legacy session_data 处理，避免把普通二进制 chunk 误判成 attach。
+    }
     if (payload.kind) {
       return {
         ...binary,
@@ -99,6 +127,12 @@ export function binaryPacketToProtocol(packet: BinaryProtocolPacket): ProtocolPa
       data_base64: bytesToBase64(packet.payload.data),
       data_bytes: packet.payload.data,
     } satisfies SessionDataPayload;
+  } else if (packet.payload?.type === "attach_frame") {
+    payload = {
+      session_id: packet.payload.session_id,
+      data_base64: bytesToBase64(packet.payload.data),
+      data_bytes: packet.payload.data,
+    } satisfies AttachFramePayload;
   } else if (packet.payload?.type === "terminal_frame") {
     payload = terminalFrameBinaryToJson(packet.payload.frame);
   } else if (packet.payload?.type === "file_chunk") {

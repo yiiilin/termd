@@ -13,7 +13,8 @@ export type BinaryProtocolPacketPayload =
   | { type: "session_data"; session_id: UUID; data: Uint8Array }
   | { type: "terminal_frame"; frame: BinaryTerminalFramePayload }
   | { type: "error"; code: string; message: string; retryable: boolean }
-  | { type: "file_chunk"; session_id: UUID; offset_bytes: number; data: Uint8Array; size_bytes: number; eof: boolean };
+  | { type: "file_chunk"; session_id: UUID; offset_bytes: number; data: Uint8Array; size_bytes: number; eof: boolean }
+  | { type: "attach_frame"; session_id: UUID; data: Uint8Array };
 
 export interface BinaryProtocolPacket {
   version: number;
@@ -102,6 +103,11 @@ export function encodeBinaryProtocolPacket(packet: BinaryProtocolPacket): Uint8A
     payload.uint64(4, packet.payload.size_bytes);
     payload.bool(5, packet.payload.eof);
     writer.bytes(24, payload.finish());
+  } else if (packet.payload?.type === "attach_frame") {
+    const payload = new ProtoWriter();
+    payload.bytes(1, uuidToBytes(packet.payload.session_id));
+    payload.bytes(2, packet.payload.data);
+    writer.bytes(25, payload.finish());
   }
   return writer.finish();
 }
@@ -160,6 +166,9 @@ export function decodeBinaryProtocolPacket(bytes: Uint8Array): BinaryProtocolPac
       case 24:
         packet.payload = decodeFileChunkPayload(reader.bytes(wireType));
         break;
+      case 25:
+        packet.payload = decodeAttachFramePayload(reader.bytes(wireType));
+        break;
       default:
         reader.skip(wireType);
         break;
@@ -215,6 +224,26 @@ function decodeFileChunkPayload(bytes: Uint8Array): BinaryProtocolPacketPayload 
     throw new Error("invalid_binary_file_chunk");
   }
   return { type: "file_chunk", session_id: sessionId, offset_bytes: offsetBytes, data, size_bytes: sizeBytes, eof };
+}
+
+function decodeAttachFramePayload(bytes: Uint8Array): BinaryProtocolPacketPayload {
+  const reader = new ProtoReader(bytes);
+  let sessionId: UUID | undefined;
+  let data = new Uint8Array();
+  while (!reader.done()) {
+    const { field, wireType } = reader.tag();
+    if (field === 1) {
+      sessionId = bytesToUuid(reader.bytes(wireType));
+    } else if (field === 2) {
+      data = new Uint8Array(reader.bytes(wireType));
+    } else {
+      reader.skip(wireType);
+    }
+  }
+  if (!sessionId) {
+    throw new Error("invalid_binary_attach_frame");
+  }
+  return { type: "attach_frame", session_id: sessionId, data };
 }
 
 export function terminalFrameJsonToBinary(payload: unknown): BinaryTerminalFramePayload {

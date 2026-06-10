@@ -12,6 +12,7 @@ export const ALL_MESSAGE_TYPES = [
   "session_attached",
   "session_data",
   "terminal_frame",
+  "attach_frame",
   "session_activity",
   "session_cwd_changed",
   "session_cursor",
@@ -566,6 +567,15 @@ export interface SessionFileTransferChunkPayload {
 }
 
 export interface SessionDataPayload {
+  session_id: UUID;
+  data_base64?: string;
+  data_bytes?: Uint8Array;
+  /** 前端内部字段：packet stream 承载时用于调试和测试 stream 归属，不参与流控。 */
+  stream_id?: PacketStreamId;
+  transport_seq?: number;
+}
+
+export interface AttachFramePayload {
   session_id: UUID;
   data_base64?: string;
   data_bytes?: Uint8Array;

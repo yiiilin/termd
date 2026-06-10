@@ -622,6 +622,7 @@ impl PtyBackend for TmuxPtyBackend {
         restore_info: Option<&PtyRestoreInfo>,
         _size: PtySize,
         attachment_id: &str,
+        _bootstrap: super::PtyAttachmentBootstrap,
     ) -> PtyResult<Box<dyn PtyAttachment>> {
         match restore_info {
             Some(PtyRestoreInfo::Tmux {

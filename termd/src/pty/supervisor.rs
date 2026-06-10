@@ -17,7 +17,7 @@ use std::process::{Child, Command as ProcessCommand, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, mpsc};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::{Engine as _, engine::general_purpose};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -31,8 +31,8 @@ use self::terminal_journal::{SupervisorTerminalCache, SupervisorTerminalMirror};
 #[cfg(test)]
 use self::terminal_journal::{TERMINAL_ATTACH_TAIL_MAX_BYTES, TERMINAL_JOURNAL_MAX_EVENTS};
 use super::{
-    CommandSpec, PtyBackend, PtyError, PtyRestoreInfo, PtyResult, PtySession, PtySize, PtySnapshot,
-    PtySupervisorStatus, PtyTerminalFrame,
+    CommandSpec, PtyAttachment, PtyAttachmentBootstrap, PtyBackend, PtyError, PtyRestoreInfo,
+    PtyResult, PtySession, PtySize, PtySnapshot, PtySupervisorStatus, PtyTerminalFrame,
 };
 
 const SOCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -43,6 +43,8 @@ const RETAINED_OUTPUT_MAX_BYTES: usize = 1024 * 1024;
 const SUPERVISOR_OUTPUT_PUMP_CHUNK_BYTES: usize = 64 * 1024;
 const SUPERVISOR_OUTPUT_PUMP_MAX_CHUNKS_PER_TICK: usize = 64;
 const SUPERVISOR_OUTPUT_PUMP_MAX_BYTES_PER_TICK: usize = 4 * 1024 * 1024;
+const SUPERVISOR_TERMINAL_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+const SUPERVISOR_TERMINAL_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(30);
 const UNIX_SOCKET_PATH_MAX_BYTES: usize = 107;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -245,6 +247,38 @@ impl PtyBackend for SupervisorPtyBackend {
                 "supervisor backend cannot reconnect tmux sessions".to_owned(),
             )),
         }
+    }
+
+    fn attach_client(
+        &self,
+        session_id: &str,
+        restore_info: Option<&PtyRestoreInfo>,
+        _size: PtySize,
+        attachment_id: &str,
+        bootstrap: PtyAttachmentBootstrap,
+    ) -> PtyResult<Box<dyn PtyAttachment>> {
+        let control_socket_path = match restore_info {
+            Some(PtyRestoreInfo::UnixSocket { socket_path, .. }) => socket_path.clone(),
+            Some(PtyRestoreInfo::Tmux { .. }) => {
+                return Err(PtyError::Backend(
+                    "supervisor backend cannot attach tmux sessions".to_owned(),
+                ));
+            }
+            None => {
+                return Err(PtyError::Backend(
+                    "supervisor attach requires reconnect metadata".to_owned(),
+                ));
+            }
+        };
+        let attach_socket_path =
+            attach_socket_path_for_control_socket(&control_socket_path, session_id);
+        let attachment = SupervisorAttachProxy::connect(
+            session_id,
+            attach_socket_path,
+            attachment_id,
+            bootstrap,
+        )?;
+        Ok(Box::new(attachment))
     }
 }
 
@@ -566,6 +600,92 @@ impl SupervisorPtySession {
     }
 }
 
+/// daemon watched attachment 对应的 supervisor attach 代理。
+///
+/// 中文注释：这个代理只搬运 opaque frame，不再把 terminal output/input/heartbeat
+/// 解释回 daemon 业务对象。
+struct SupervisorAttachProxy {
+    writer: StdMutex<StdUnixStream>,
+    pending_frames: Arc<StdMutex<VecDeque<Vec<u8>>>>,
+    output_signal_tx: watch::Sender<u64>,
+    output_signal_rx: watch::Receiver<u64>,
+}
+
+impl SupervisorAttachProxy {
+    fn connect(
+        session_id: &str,
+        socket_path: PathBuf,
+        attachment_id: &str,
+        bootstrap: PtyAttachmentBootstrap,
+    ) -> PtyResult<Self> {
+        let mut stream = connect_supervisor_socket(&socket_path)?;
+        write_frame_sync(
+            &mut stream,
+            &SupervisorTerminalClientFrame::BootstrapAttach {
+                session_id: session_id.to_owned(),
+                last_terminal_seq: bootstrap.last_terminal_seq,
+            },
+        )
+        .map_err(PtyError::from)?;
+        let writer = stream.try_clone().map_err(PtyError::from)?;
+        let pending_frames = Arc::new(StdMutex::new(VecDeque::new()));
+        let (output_signal_tx, output_signal_rx) = watch::channel(OUTPUT_SIGNAL_INIT);
+        spawn_terminal_attach_reader_thread(
+            attachment_id,
+            stream,
+            Arc::clone(&pending_frames),
+            output_signal_tx.clone(),
+        )?;
+        Ok(Self {
+            writer: StdMutex::new(writer),
+            pending_frames,
+            output_signal_tx,
+            output_signal_rx,
+        })
+    }
+
+    fn has_pending_frames(&self) -> bool {
+        !self
+            .pending_frames
+            .lock()
+            .expect("terminal attach pending frame mutex poisoned")
+            .is_empty()
+    }
+
+    fn signal_pending_output(&self) {
+        let next = self.output_signal_tx.borrow().wrapping_add(1);
+        let _ = self.output_signal_tx.send(next);
+    }
+}
+
+impl PtyAttachment for SupervisorAttachProxy {
+    fn output_signal(&self) -> Option<watch::Receiver<u64>> {
+        Some(self.output_signal_rx.clone())
+    }
+
+    fn read_frame(&mut self) -> PtyResult<Option<Vec<u8>>> {
+        let frame = self
+            .pending_frames
+            .lock()
+            .expect("terminal attach pending frame mutex poisoned")
+            .pop_front();
+        if self.has_pending_frames() {
+            self.signal_pending_output();
+        }
+        Ok(frame)
+    }
+
+    fn write_frame(&mut self, bytes: &[u8]) -> PtyResult<()> {
+        let mut writer = self
+            .writer
+            .lock()
+            .expect("terminal attach writer mutex poisoned");
+        writer.write_all(bytes).map_err(PtyError::from)?;
+        writer.flush().map_err(PtyError::from)?;
+        Ok(())
+    }
+}
+
 impl Drop for SupervisorPtySession {
     fn drop(&mut self) {
         let Ok(child_slot) = self.supervisor_child.get_mut() else {
@@ -605,6 +725,29 @@ fn connect_supervisor_socket(socket_path: &Path) -> PtyResult<StdUnixStream> {
     };
     stream.set_nonblocking(false).map_err(PtyError::from)?;
     Ok(stream)
+}
+
+fn spawn_terminal_attach_reader_thread(
+    attachment_id: &str,
+    mut reader: StdUnixStream,
+    pending_frames: Arc<StdMutex<VecDeque<Vec<u8>>>>,
+    output_signal_tx: watch::Sender<u64>,
+) -> PtyResult<()> {
+    let thread_name = format!("termd-supervisor-attach-{attachment_id}");
+    thread::Builder::new()
+        .name(thread_name)
+        .spawn(move || {
+            while let Ok(frame) = read_raw_frame_sync(&mut reader) {
+                pending_frames
+                    .lock()
+                    .expect("terminal attach pending frame mutex poisoned")
+                    .push_back(frame);
+                let next = output_signal_tx.borrow().wrapping_add(1);
+                let _ = output_signal_tx.send(next);
+            }
+        })
+        .map(|_| ())
+        .map_err(PtyError::backend)
 }
 
 fn spawn_supervisor_reader_thread(
@@ -915,14 +1058,23 @@ fn supervisor_runtime_dir(state_path: &Path) -> PathBuf {
         .unwrap_or_else(std::env::temp_dir);
 
     let preferred = base_dir.join("termd-supervisors");
-    if preferred.to_string_lossy().len() + 1 + short_supervisor_socket_file_name("probe").len()
-        < UNIX_SOCKET_PATH_MAX_BYTES
+    let longest_socket_name_len = short_supervisor_socket_file_name("probe")
+        .len()
+        .max(short_supervisor_attach_socket_file_name("probe").len());
+    if preferred.to_string_lossy().len() + 1 + longest_socket_name_len < UNIX_SOCKET_PATH_MAX_BYTES
     {
         preferred
-    } else {
-        // 中文注释：状态目录本身太长时，子目录名也必须跟着压缩；否则即便 socket 文件名
-        // 已经哈希化，最终 Unix socket 路径仍会超过 `sun_path` 上限。
+    } else if base_dir.to_string_lossy().len() + 1 + "ts".len() + 1 + longest_socket_name_len
+        < UNIX_SOCKET_PATH_MAX_BYTES
+    {
+        // 中文注释：优先保留一个专用 runtime 子目录，避免把 socket 直接混在 state
+        // 父目录根下；但这个短目录本身也要重新做长度预算。
         base_dir.join("ts")
+    } else {
+        // 中文注释：极长 state 目录下，即使 `ts` 这样的短子目录也可能让 attach socket
+        // 超过 `sun_path` 上限。最后退回到 state 父目录本身，至少保证 control/attach
+        // socket 都能绑定成功，而不是在 create-session 时迟到地报 `runtime_failed`。
+        base_dir
     }
 }
 
@@ -933,6 +1085,35 @@ fn short_supervisor_socket_file_name(session_id: &str) -> String {
     // 可能已经很长，所以文件名必须固定且紧凑，不能直接把完整 session id 拼进去。
     let token = general_purpose::URL_SAFE_NO_PAD.encode(hasher.finish().to_be_bytes());
     format!("{token}.sock")
+}
+
+fn short_supervisor_attach_socket_file_name(session_id: &str) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    session_id.hash(&mut hasher);
+    let token = general_purpose::URL_SAFE_NO_PAD.encode(hasher.finish().to_be_bytes());
+    format!("{token}.attach.sock")
+}
+
+fn attach_socket_path_for_control_socket(control_socket_path: &Path, session_id: &str) -> PathBuf {
+    let Some(parent) = control_socket_path.parent() else {
+        return control_socket_path.to_path_buf();
+    };
+    let Some(file_name) = control_socket_path
+        .file_name()
+        .and_then(|name| name.to_str())
+    else {
+        return control_socket_path.to_path_buf();
+    };
+    let attach_name = file_name.replacen(".sock", ".attach.sock", 1);
+    let preferred = parent.join(attach_name);
+    if preferred.to_string_lossy().len() < UNIX_SOCKET_PATH_MAX_BYTES {
+        return preferred;
+    }
+
+    // 中文注释：attach socket 文件名比 control socket 更长。长 state 目录下如果继续
+    // 直接拼 `.attach.sock`，路径会超过 Unix `sun_path` 限制，首次 watched attach
+    // 就会因为 socket 根本没绑定成功而超时。
+    parent.join(short_supervisor_attach_socket_file_name(session_id))
 }
 
 fn supervisor_processes_from_proc() -> PtyResult<Vec<SupervisorProcess>> {
@@ -1027,6 +1208,11 @@ fn discover_termd_binary_path() -> PathBuf {
         }
     }
 
+    #[cfg(test)]
+    if let Some(path) = ensure_fresh_test_termd_binary() {
+        return path;
+    }
+
     if let Ok(current_exe) = std::env::current_exe() {
         if let Some(candidate) = current_exe
             .parent()
@@ -1043,6 +1229,49 @@ fn discover_termd_binary_path() -> PathBuf {
     PathBuf::from("termd")
 }
 
+#[cfg(test)]
+fn ensure_fresh_test_termd_binary() -> Option<PathBuf> {
+    static TEST_TERMD_BINARY: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+
+    TEST_TERMD_BINARY
+        .get_or_init(|| {
+            let current_exe = std::env::current_exe().ok()?;
+            let candidate = current_exe
+                .parent()
+                .and_then(|deps_dir| deps_dir.parent())
+                .map(|target_dir| target_dir.join("termd"))?;
+
+            let current_mtime = fs::metadata(&current_exe)
+                .and_then(|meta| meta.modified())
+                .ok();
+            let candidate_mtime = fs::metadata(&candidate)
+                .and_then(|meta| meta.modified())
+                .ok();
+            let needs_build = !candidate.exists()
+                || match (candidate_mtime, current_mtime) {
+                    (Some(candidate_mtime), Some(current_mtime)) => candidate_mtime < current_mtime,
+                    _ => true,
+                };
+
+            if needs_build {
+                // 中文注释：lib 单测运行时，`target/debug/termd` 不一定会随着当前 test
+                // binary 一起重编。supervisor 子进程如果继续启动旧二进制，就不会带上本次
+                // 改动，attach socket 等新行为会在测试里表现成莫名其妙的 runtime_failed。
+                let status = ProcessCommand::new("cargo")
+                    .args(["build", "--bin", "termd", "--quiet"])
+                    .current_dir(env!("CARGO_MANIFEST_DIR"))
+                    .status()
+                    .ok()?;
+                if !status.success() {
+                    return None;
+                }
+            }
+
+            candidate.exists().then_some(candidate)
+        })
+        .clone()
+}
+
 /// 子 supervisor 进程的启动参数。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionSupervisorArgs {
@@ -1054,6 +1283,7 @@ pub struct SessionSupervisorArgs {
 
 #[derive(Clone)]
 struct SupervisorShared {
+    session_id: Arc<String>,
     session: Arc<Mutex<Box<dyn PtySession>>>,
     state: Arc<Mutex<SupervisorState>>,
     shutdown_tx: watch::Sender<bool>,
@@ -1066,6 +1296,8 @@ struct SupervisorState {
     active_controller_connection_id: Option<u64>,
     controller_resume_lease_id: Option<u64>,
     controllers: HashMap<u64, ControllerHandle>,
+    next_terminal_attach_id: u64,
+    terminal_attaches: HashMap<u64, TerminalAttachHandle>,
     attached_devices: HashSet<String>,
     retained_output: VecDeque<u8>,
     terminal: SupervisorTerminalCache,
@@ -1080,6 +1312,8 @@ impl SupervisorState {
             active_controller_connection_id: None,
             controller_resume_lease_id: None,
             controllers: HashMap::new(),
+            next_terminal_attach_id: 1,
+            terminal_attaches: HashMap::new(),
             attached_devices: HashSet::new(),
             retained_output: VecDeque::new(),
             terminal: SupervisorTerminalCache::new(size),
@@ -1142,7 +1376,14 @@ impl SupervisorState {
         let snapshot = SupervisorSnapshotPayload {
             size: self.size(),
             process_id,
-            retained_output: self.snapshot_output(),
+            // 中文注释：last_terminal_seq 存在时，attach_sync 只表达“从哪个 session seq
+            // 开始继续同步”。旧屏幕内容必须由 tail/snapshot frame 决定，不能再把 retained
+            // output 整包回灌给 client，否则重连时会把已经渲染过的内容再播一遍。
+            retained_output: if last_terminal_seq.is_some() {
+                Vec::new()
+            } else {
+                self.snapshot_output()
+            },
         };
         let (base_seq, frames) = self.terminal_snapshot_or_tail_with_base(last_terminal_seq);
         SupervisorAttachSyncPayload {
@@ -1264,7 +1505,22 @@ impl SupervisorState {
         }
     }
 
-    fn broadcast_terminal_frame(&mut self, frame: PtyTerminalFrame) {
+    fn register_terminal_attach(
+        &mut self,
+        tx: tokio_mpsc::UnboundedSender<SupervisorTerminalServerFrame>,
+    ) -> u64 {
+        let id = self.next_terminal_attach_id;
+        self.next_terminal_attach_id = self.next_terminal_attach_id.saturating_add(1);
+        self.terminal_attaches
+            .insert(id, TerminalAttachHandle { tx });
+        id
+    }
+
+    fn remove_terminal_attach(&mut self, attach_id: u64) {
+        self.terminal_attaches.remove(&attach_id);
+    }
+
+    fn broadcast_terminal_frame(&mut self, session_id: &str, frame: PtyTerminalFrame) {
         let mut closed = Vec::new();
         for (id, controller) in &self.controllers {
             if controller
@@ -1288,6 +1544,23 @@ impl SupervisorState {
                 });
             }
         }
+
+        let mut closed_terminal_attaches = Vec::new();
+        for (attach_id, attach) in &self.terminal_attaches {
+            if attach
+                .tx
+                .send(SupervisorTerminalServerFrame::TerminalFrame {
+                    session_id: session_id.to_owned(),
+                    frame: frame.clone(),
+                })
+                .is_err()
+            {
+                closed_terminal_attaches.push(*attach_id);
+            }
+        }
+        for attach_id in closed_terminal_attaches {
+            self.remove_terminal_attach(attach_id);
+        }
     }
 }
 
@@ -1295,6 +1568,11 @@ impl SupervisorState {
 struct ControllerHandle {
     tx: tokio_mpsc::UnboundedSender<SupervisorFrame>,
     connection_id: u64,
+}
+
+#[derive(Clone)]
+struct TerminalAttachHandle {
+    tx: tokio_mpsc::UnboundedSender<SupervisorTerminalServerFrame>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1309,12 +1587,16 @@ pub async fn run_session_supervisor(args: SessionSupervisorArgs) -> PtyResult<()
     let session = backend.spawn(&args.command, args.size)?;
     let session = Arc::new(Mutex::new(session));
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+    let attach_socket_path =
+        attach_socket_path_for_control_socket(&args.socket_path, &args.session_id);
     let shared = SupervisorShared {
+        session_id: Arc::new(args.session_id.clone()),
         session: Arc::clone(&session),
         state: Arc::new(Mutex::new(SupervisorState::new(args.size))),
         shutdown_tx,
     };
     let mut listener = bind_supervisor_listener(&args.socket_path, true)?;
+    let mut attach_listener = bind_supervisor_listener(&attach_socket_path, true)?;
 
     if let Some(signal) = {
         let session = shared.session.lock().await;
@@ -1329,6 +1611,11 @@ pub async fn run_session_supervisor(args: SessionSupervisorArgs) -> PtyResult<()
             // supervisor 的首要职责是保住 PTY；socket 修复失败只能降级为告警，
             // 不能让用户正在跑的 shell 因为一个控制面入口文件异常而退出。
             tracing::warn!(%error, socket_path = %args.socket_path.display(), "failed to repair session supervisor socket");
+        }
+        if let Err(error) =
+            ensure_supervisor_socket_bound(&attach_socket_path, &mut attach_listener)
+        {
+            tracing::warn!(%error, socket_path = %attach_socket_path.display(), "failed to repair session supervisor attach socket");
         }
 
         tokio::select! {
@@ -1353,10 +1640,26 @@ pub async fn run_session_supervisor(args: SessionSupervisorArgs) -> PtyResult<()
                     Err(_) => {}
                 }
             }
+            accepted = tokio::time::timeout(SUPERVISOR_SOCKET_REPAIR_INTERVAL, attach_listener.accept()) => {
+                match accepted {
+                    Ok(Ok((stream, _))) => {
+                        let shared = shared.clone();
+                        let expected_session_id = args.session_id.clone();
+                        tokio::spawn(async move {
+                            if let Err(error) = handle_supervisor_terminal_attach_connection(shared, expected_session_id, stream).await {
+                                tracing::warn!(%error, "session supervisor terminal attach connection failed");
+                            }
+                        });
+                    }
+                    Ok(Err(error)) => return Err(PtyError::from(error)),
+                    Err(_) => {}
+                }
+            }
         }
     }
 
     let _ = fs::remove_file(&args.socket_path);
+    let _ = fs::remove_file(&attach_socket_path);
     Ok(())
 }
 
@@ -1539,7 +1842,7 @@ async fn handle_supervisor_connection(
                         {
                             let mut state = shared.state.lock().await;
                             let frame = state.resize(size);
-                            state.broadcast_terminal_frame(frame);
+                            state.broadcast_terminal_frame(shared.session_id.as_str(), frame);
                         }
                         SupervisorResponse::ok(SupervisorResponsePayload::Empty)
                     }
@@ -1632,6 +1935,169 @@ async fn handle_supervisor_connection(
     result
 }
 
+async fn handle_supervisor_terminal_attach_connection(
+    shared: SupervisorShared,
+    expected_session_id: String,
+    stream: UnixStream,
+) -> PtyResult<()> {
+    let (mut reader, mut writer) = stream.into_split();
+    let bootstrap = read_frame_async::<SupervisorTerminalClientFrame>(&mut reader).await?;
+    let last_terminal_seq = match bootstrap {
+        SupervisorTerminalClientFrame::BootstrapAttach {
+            session_id,
+            last_terminal_seq,
+        } if session_id == expected_session_id => last_terminal_seq,
+        SupervisorTerminalClientFrame::BootstrapAttach { .. } => {
+            let _ = write_frame_async(
+                &mut writer,
+                &SupervisorTerminalServerFrame::Close {
+                    reason: "protocol_error".to_owned(),
+                    message: Some("session id mismatch".to_owned()),
+                },
+            )
+            .await;
+            return Err(PtyError::Backend("session id mismatch".to_owned()));
+        }
+        SupervisorTerminalClientFrame::Input { .. }
+        | SupervisorTerminalClientFrame::Resize { .. }
+        | SupervisorTerminalClientFrame::HeartbeatPong { .. } => {
+            let _ = write_frame_async(
+                &mut writer,
+                &SupervisorTerminalServerFrame::Close {
+                    reason: "protocol_error".to_owned(),
+                    message: Some("missing bootstrap attach".to_owned()),
+                },
+            )
+            .await;
+            return Err(PtyError::Backend(
+                "session supervisor terminal attach is missing bootstrap".to_owned(),
+            ));
+        }
+    };
+
+    let (request_tx, mut request_rx) =
+        tokio_mpsc::unbounded_channel::<io::Result<SupervisorTerminalClientFrame>>();
+    let reader_task = tokio::spawn(supervisor_terminal_connection_reader(reader, request_tx));
+    let (terminal_tx, mut terminal_rx) =
+        tokio_mpsc::unbounded_channel::<SupervisorTerminalServerFrame>();
+    let process_id = shared.session.lock().await.process_id();
+    let (attach_id, attach_sync, base_seq) = {
+        let mut state = shared.state.lock().await;
+        let attach_id = state.register_terminal_attach(terminal_tx.clone());
+        let snapshot = SupervisorSnapshotPayload {
+            size: state.size(),
+            process_id,
+            retained_output: if last_terminal_seq.is_some() {
+                Vec::new()
+            } else {
+                state.snapshot_output()
+            },
+        };
+        let (base_seq, frames) = state.terminal_snapshot_or_tail_with_base(last_terminal_seq);
+        (
+            attach_id,
+            SupervisorTerminalServerFrame::AttachSync {
+                session_id: expected_session_id.clone(),
+                base_seq,
+                snapshot,
+                frames,
+            },
+            base_seq,
+        )
+    };
+
+    let result = async {
+        write_frame_async(&mut writer, &attach_sync).await?;
+        for frame in drain_terminal_attach_frames_after_sync(&mut terminal_rx, base_seq) {
+            write_frame_async(&mut writer, &frame).await?;
+        }
+
+        let mut heartbeat_interval = tokio::time::interval(SUPERVISOR_TERMINAL_HEARTBEAT_INTERVAL);
+        let mut pending_heartbeat_nonce: Option<String> = None;
+        let mut pending_heartbeat_sent_at: Option<Instant> = None;
+
+        loop {
+            tokio::select! {
+                biased;
+
+                inbound = request_rx.recv() => {
+                    let Some(inbound) = inbound else {
+                        return Ok(());
+                    };
+                    let frame = match inbound {
+                        Ok(frame) => frame,
+                        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+                        Err(error) => return Err(PtyError::from(error)),
+                    };
+                    match frame {
+                        SupervisorTerminalClientFrame::BootstrapAttach { .. } => {
+                            return Err(PtyError::Backend(
+                                "terminal attach bootstrap must only be sent once".to_owned(),
+                            ));
+                        }
+                        SupervisorTerminalClientFrame::Input { data } => {
+                            shared.session.lock().await.write_all(&data)?;
+                        }
+                        SupervisorTerminalClientFrame::Resize { size } => {
+                            shared.session.lock().await.resize(size)?;
+                            let mut state = shared.state.lock().await;
+                            let frame = state.resize(size);
+                            state.broadcast_terminal_frame(shared.session_id.as_str(), frame);
+                        }
+                        SupervisorTerminalClientFrame::HeartbeatPong { nonce } => {
+                            if pending_heartbeat_nonce.as_deref() == Some(nonce.as_str()) {
+                                pending_heartbeat_nonce = None;
+                                pending_heartbeat_sent_at = None;
+                            }
+                        }
+                    }
+                }
+                outbound = terminal_rx.recv() => {
+                    let Some(outbound) = outbound else {
+                        return Ok(());
+                    };
+                    write_frame_async(&mut writer, &outbound).await?;
+                }
+                _ = heartbeat_interval.tick() => {
+                    if let (Some(nonce), Some(sent_at)) = (&pending_heartbeat_nonce, pending_heartbeat_sent_at)
+                        && sent_at.elapsed() >= SUPERVISOR_TERMINAL_HEARTBEAT_TIMEOUT
+                    {
+                        let _ = write_frame_async(
+                            &mut writer,
+                            &SupervisorTerminalServerFrame::Close {
+                                reason: "heartbeat_timeout".to_owned(),
+                                message: Some(format!("missed heartbeat pong for nonce {nonce}")),
+                            },
+                        ).await;
+                        return Ok(());
+                    }
+                    if pending_heartbeat_nonce.is_none() {
+                        let nonce = format!(
+                            "{}-{}",
+                            current_unix_timestamp_millis(),
+                            process_id.unwrap_or_default(),
+                        );
+                        pending_heartbeat_sent_at = Some(Instant::now());
+                        pending_heartbeat_nonce = Some(nonce.clone());
+                        write_frame_async(
+                            &mut writer,
+                            &SupervisorTerminalServerFrame::HeartbeatPing {
+                                nonce,
+                                timeout_ms: SUPERVISOR_TERMINAL_HEARTBEAT_TIMEOUT.as_millis() as u64,
+                            },
+                        ).await?;
+                    }
+                }
+            }
+        }
+    }
+    .await;
+
+    reader_task.abort();
+    shared.state.lock().await.remove_terminal_attach(attach_id);
+    result
+}
+
 async fn supervisor_connection_reader(
     mut reader: tokio::net::unix::OwnedReadHalf,
     request_tx: tokio_mpsc::UnboundedSender<io::Result<SupervisorRequestEnvelope>>,
@@ -1640,6 +2106,26 @@ async fn supervisor_connection_reader(
         match read_frame_async::<SupervisorRequestEnvelope>(&mut reader).await {
             Ok(envelope) => {
                 if request_tx.send(Ok(envelope)).is_err() {
+                    break;
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(error) => {
+                let _ = request_tx.send(Err(error));
+                break;
+            }
+        }
+    }
+}
+
+async fn supervisor_terminal_connection_reader(
+    mut reader: tokio::net::unix::OwnedReadHalf,
+    request_tx: tokio_mpsc::UnboundedSender<io::Result<SupervisorTerminalClientFrame>>,
+) {
+    loop {
+        match read_frame_async::<SupervisorTerminalClientFrame>(&mut reader).await {
+            Ok(frame) => {
+                if request_tx.send(Ok(frame)).is_err() {
                     break;
                 }
             }
@@ -1735,6 +2221,28 @@ fn drain_controller_frames_after_sync(
     delayed
 }
 
+fn drain_terminal_attach_frames_after_sync(
+    controller_rx: &mut tokio_mpsc::UnboundedReceiver<SupervisorTerminalServerFrame>,
+    base_seq: u64,
+) -> Vec<SupervisorTerminalServerFrame> {
+    let mut delayed = Vec::new();
+    while let Ok(frame) = controller_rx.try_recv() {
+        match &frame {
+            SupervisorTerminalServerFrame::TerminalFrame {
+                frame: terminal_frame,
+                ..
+            } if terminal_frame
+                .terminal_seq()
+                .is_some_and(|seq| seq <= base_seq) =>
+            {
+                // 中文注释：attach_sync 已经覆盖到 base_seq，队列里更早的 live frame 必须丢弃。
+            }
+            _ => delayed.push(frame),
+        }
+    }
+    delayed
+}
+
 async fn supervisor_output_pump(shared: SupervisorShared, mut output_signal: watch::Receiver<u64>) {
     drain_supervisor_output_until_idle(&shared).await;
 
@@ -1778,7 +2286,7 @@ async fn drain_supervisor_output(shared: &SupervisorShared) -> bool {
         bytes = bytes.saturating_add(read);
         let mut state = shared.state.lock().await;
         let frame = state.record_output(&buffer);
-        state.broadcast_terminal_frame(frame);
+        state.broadcast_terminal_frame(shared.session_id.as_str(), frame);
     }
 }
 
@@ -1800,7 +2308,7 @@ async fn supervisor_exit_watcher(shared: SupervisorShared) {
         };
         let mut state = shared.state.lock().await;
         let frame = state.record_exit(code);
-        state.broadcast_terminal_frame(frame);
+        state.broadcast_terminal_frame(shared.session_id.as_str(), frame);
         return;
     }
 }
@@ -1997,11 +2505,11 @@ impl SupervisorResponsePayload {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct SupervisorSnapshotPayload {
-    size: PtySize,
-    process_id: Option<u32>,
+pub(crate) struct SupervisorSnapshotPayload {
+    pub(crate) size: PtySize,
+    pub(crate) process_id: Option<u32>,
     #[serde(with = "base64_bytes")]
-    retained_output: Vec<u8>,
+    pub(crate) retained_output: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2066,8 +2574,133 @@ where
     Ok(())
 }
 
+fn read_raw_frame_sync(reader: &mut StdUnixStream) -> io::Result<Vec<u8>> {
+    let mut length = [0_u8; 4];
+    reader.read_exact(&mut length)?;
+    let payload_len = u32::from_le_bytes(length) as usize;
+    let mut payload = vec![0_u8; payload_len];
+    reader.read_exact(&mut payload)?;
+    let mut frame = Vec::with_capacity(4 + payload.len());
+    frame.extend_from_slice(&length);
+    frame.extend_from_slice(&payload);
+    Ok(frame)
+}
+
 fn invalid_data(error: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+}
+
+fn current_unix_timestamp_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub(crate) enum SupervisorTerminalClientFrame {
+    BootstrapAttach {
+        session_id: String,
+        last_terminal_seq: Option<u64>,
+    },
+    Input {
+        #[serde(with = "base64_bytes")]
+        data: Vec<u8>,
+    },
+    Resize {
+        size: PtySize,
+    },
+    HeartbeatPong {
+        nonce: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub(crate) enum SupervisorTerminalServerFrame {
+    AttachSync {
+        session_id: String,
+        base_seq: u64,
+        snapshot: SupervisorSnapshotPayload,
+        frames: Vec<PtyTerminalFrame>,
+    },
+    TerminalFrame {
+        session_id: String,
+        frame: PtyTerminalFrame,
+    },
+    HeartbeatPing {
+        nonce: String,
+        timeout_ms: u64,
+    },
+    Close {
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
+}
+
+#[cfg(test)]
+pub(crate) fn encode_supervisor_terminal_client_frame(
+    frame: &SupervisorTerminalClientFrame,
+) -> PtyResult<Vec<u8>> {
+    encode_length_prefixed_json(frame).map_err(PtyError::from)
+}
+
+#[cfg(test)]
+pub(crate) fn decode_supervisor_terminal_client_frame(
+    bytes: &[u8],
+) -> PtyResult<SupervisorTerminalClientFrame> {
+    decode_length_prefixed_json(bytes).map_err(PtyError::from)
+}
+
+#[cfg(test)]
+pub(crate) fn encode_supervisor_terminal_server_frame(
+    frame: &SupervisorTerminalServerFrame,
+) -> PtyResult<Vec<u8>> {
+    encode_length_prefixed_json(frame).map_err(PtyError::from)
+}
+
+#[cfg(test)]
+pub(crate) fn decode_supervisor_terminal_server_frame(
+    bytes: &[u8],
+) -> PtyResult<SupervisorTerminalServerFrame> {
+    decode_length_prefixed_json(bytes).map_err(PtyError::from)
+}
+
+#[cfg(test)]
+fn encode_length_prefixed_json<T>(value: &T) -> io::Result<Vec<u8>>
+where
+    T: Serialize,
+{
+    let payload = serde_json::to_vec(value).map_err(invalid_data)?;
+    let length = u32::try_from(payload.len())
+        .map_err(|_| invalid_data("session supervisor frame too large"))?;
+    let mut frame = Vec::with_capacity(4 + payload.len());
+    frame.extend_from_slice(&length.to_le_bytes());
+    frame.extend_from_slice(&payload);
+    Ok(frame)
+}
+
+#[cfg(test)]
+fn decode_length_prefixed_json<T>(bytes: &[u8]) -> io::Result<T>
+where
+    T: DeserializeOwned,
+{
+    if bytes.len() < 4 {
+        return Err(invalid_data(
+            "session supervisor frame is missing length prefix",
+        ));
+    }
+    let mut length = [0_u8; 4];
+    length.copy_from_slice(&bytes[..4]);
+    let payload_len = u32::from_le_bytes(length) as usize;
+    if bytes.len() != 4 + payload_len {
+        return Err(invalid_data(
+            "session supervisor frame length does not match payload",
+        ));
+    }
+    serde_json::from_slice(&bytes[4..]).map_err(invalid_data)
 }
 
 #[cfg(test)]
@@ -2238,6 +2871,82 @@ mod tests {
     }
 
     #[test]
+    fn supervisor_attach_socket_file_name_stays_short_under_long_state_directory() {
+        let state_path = Path::new(
+            "/tmp/termd-server-test-1234567890-1234567890-1234567890-very-long-state-name/daemon-state.json",
+        );
+        let backend = SupervisorPtyBackend::for_state_path(state_path);
+        let session_id =
+            "123e4567-e89b-12d3-a456-426614174000-this-session-name-is-deliberately-long";
+        let control_socket_path = backend.socket_path_for_session(session_id);
+        let attach_socket_path =
+            attach_socket_path_for_control_socket(&control_socket_path, session_id);
+
+        assert!(
+            attach_socket_path.to_string_lossy().len() < 108,
+            "supervisor attach socket path must stay under Unix socket path limits: {}",
+            attach_socket_path.display()
+        );
+    }
+
+    #[test]
+    fn supervisor_runtime_dir_falls_back_when_attach_socket_is_longer_than_control_socket() {
+        let control_name_len = short_supervisor_socket_file_name("probe").len();
+        let attach_name_len = short_supervisor_attach_socket_file_name("probe").len();
+        assert!(attach_name_len > control_name_len);
+
+        let preferred_dir_name = "termd-supervisors";
+        let preferred_len = UNIX_SOCKET_PATH_MAX_BYTES - 2 - control_name_len;
+        let base_prefix = "/tmp/";
+        let base_dir_len = preferred_len
+            .checked_sub(1 + preferred_dir_name.len())
+            .expect("preferred runtime dir must leave room for base dir");
+        let filler_len = base_dir_len
+            .checked_sub(base_prefix.len())
+            .expect("base dir length must fit under /tmp prefix");
+        let base_dir = PathBuf::from(format!("{base_prefix}{}", "a".repeat(filler_len)));
+        let state_path = base_dir.join("daemon-state.json");
+        let preferred = base_dir.join(preferred_dir_name);
+
+        assert!(
+            preferred.to_string_lossy().len() + 1 + control_name_len < UNIX_SOCKET_PATH_MAX_BYTES,
+            "control socket should still fit under preferred runtime dir",
+        );
+        assert!(
+            preferred.to_string_lossy().len() + 1 + attach_name_len >= UNIX_SOCKET_PATH_MAX_BYTES,
+            "attach socket should overflow preferred runtime dir so the fallback is exercised",
+        );
+
+        let runtime_dir = supervisor_runtime_dir(&state_path);
+        assert_eq!(runtime_dir, base_dir.join("ts"));
+    }
+
+    #[test]
+    fn supervisor_runtime_dir_falls_back_to_state_parent_when_short_subdir_still_overflows() {
+        let attach_name_len = short_supervisor_attach_socket_file_name("probe").len();
+        let base_prefix = "/tmp/";
+        let base_dir_len = UNIX_SOCKET_PATH_MAX_BYTES - 2 - attach_name_len;
+        let filler_len = base_dir_len
+            .checked_sub(base_prefix.len())
+            .expect("base dir length must fit under /tmp prefix");
+        let base_dir = PathBuf::from(format!("{base_prefix}{}", "b".repeat(filler_len)));
+        let state_path = base_dir.join("daemon-state.json");
+
+        assert!(
+            base_dir.to_string_lossy().len() + 1 + attach_name_len < UNIX_SOCKET_PATH_MAX_BYTES,
+            "state parent itself should still fit the attach socket",
+        );
+        assert!(
+            base_dir.to_string_lossy().len() + 1 + "ts".len() + 1 + attach_name_len
+                >= UNIX_SOCKET_PATH_MAX_BYTES,
+            "short runtime subdir should still overflow so the final fallback is exercised",
+        );
+
+        let runtime_dir = supervisor_runtime_dir(&state_path);
+        assert_eq!(runtime_dir, base_dir);
+    }
+
+    #[test]
     fn orphan_detection_selects_only_current_runtime_dir_unrecorded_supervisors() {
         let runtime_dir = Path::new("/var/lib/termd/termd-supervisors");
         let valid_session_ids = HashSet::from(["kept-session".to_owned()]);
@@ -2364,7 +3073,7 @@ mod tests {
         ));
 
         let frame = state.record_output(b"after\n");
-        state.broadcast_terminal_frame(frame);
+        state.broadcast_terminal_frame("session-under-test", frame);
         assert!(matches!(
             controller_rx
                 .try_recv()
@@ -2451,7 +3160,7 @@ mod tests {
         assert_eq!(state.controllers.len(), 2);
 
         let frame = state.record_output(b"shared-live-output\n");
-        state.broadcast_terminal_frame(frame);
+        state.broadcast_terminal_frame("session-under-test", frame);
 
         assert!(
             old_rx.try_recv().is_ok(),
@@ -2472,6 +3181,7 @@ mod tests {
         let (new_id, _new_sync) = state.attach_sync(new_tx, Some(42), Some(0));
         let (shutdown_tx, _shutdown_rx) = watch::channel(false);
         let shared = SupervisorShared {
+            session_id: Arc::new("session-under-test".to_owned()),
             session: Arc::new(Mutex::new(Box::new(NoopPtySession))),
             state: Arc::new(Mutex::new(state)),
             shutdown_tx,
@@ -2559,6 +3269,7 @@ mod tests {
             .expect("lease holder resume should succeed");
         let (shutdown_tx, _shutdown_rx) = watch::channel(false);
         let shared = SupervisorShared {
+            session_id: Arc::new("session-under-test".to_owned()),
             session: Arc::new(Mutex::new(Box::new(NoopPtySession))),
             state: Arc::new(Mutex::new(state)),
             shutdown_tx,
@@ -2606,8 +3317,10 @@ mod tests {
 
     #[tokio::test]
     async fn supervisor_output_drain_yields_after_budget_instead_of_reading_unbounded_backlog() {
+        let session_id = "budget-session".to_owned();
         let (shutdown_tx, _shutdown_rx) = watch::channel(false);
         let shared = SupervisorShared {
+            session_id: Arc::new(session_id.clone()),
             session: Arc::new(Mutex::new(Box::new(BurstPtySession {
                 remaining_chunks: SUPERVISOR_OUTPUT_PUMP_MAX_CHUNKS_PER_TICK + 1,
             }))),
@@ -2636,6 +3349,7 @@ mod tests {
             UnixStream::pair().expect("test unix stream pair should open");
         let (shutdown_tx, _shutdown_rx) = watch::channel(false);
         let shared = SupervisorShared {
+            session_id: Arc::new(session_id.clone()),
             session: Arc::new(Mutex::new(Box::new(NoopPtySession))),
             state: Arc::new(Mutex::new(SupervisorState::new(PtySize::new(24, 80)))),
             shutdown_tx,

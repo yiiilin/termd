@@ -3128,9 +3128,9 @@ mod tests {
         DeviceId, E2eeKeyExchangePayload, Envelope, HttpE2eeAuthPayload, PairAcceptPayload,
         PairRequestPayload, PublicKey, SessionCreatePayload, SessionCreatedPayload,
         SessionCwdChangedPayload, SessionDataPayload, SessionFileDownloadStreamReadyPayload,
-        SessionFileHttpDownloadPayload,
-        SessionFileHttpUploadReadyPayload, SessionFileHttpUploadStreamPayload,
-        SessionFileUploadPayload, Signature, TerminalSize, UnixTimestampMillis,
+        SessionFileHttpDownloadPayload, SessionFileHttpUploadReadyPayload,
+        SessionFileHttpUploadStreamPayload, SessionFileUploadPayload, Signature, TerminalSize,
+        UnixTimestampMillis,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::time::{Duration, timeout};
@@ -5140,9 +5140,12 @@ mod tests {
         let push_deadline = Instant::now() + Duration::from_secs(8);
         loop {
             let remaining = push_deadline.saturating_duration_since(Instant::now());
-            let pushed = timeout(remaining, read_encrypted_ws(&mut socket, &mut device_session))
-                .await
-                .expect("daemon should push cwd updates without client pull frames");
+            let pushed = timeout(
+                remaining,
+                read_encrypted_ws(&mut socket, &mut device_session),
+            )
+            .await
+            .expect("daemon should push cwd updates without client pull frames");
             if pushed.kind != MessageType::SessionCwdChanged {
                 continue;
             }

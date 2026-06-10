@@ -27,9 +27,17 @@ import {
   protocolMethodNeedsEmptyAck,
 } from "../protocol/methods";
 import { binaryPacketToProtocol, protocolPacketToBinary } from "../protocol/packet-codec";
+import {
+  buildAttachFramePayload,
+  decodeSupervisorTerminalClientFrame,
+  decodeSupervisorTerminalServerFrame,
+  encodeSupervisorTerminalServerFrame,
+  type SupervisorTerminalServerFrame,
+} from "../protocol/supervisor-terminal";
 import { fallbackSessionDisplayName } from "../session-names";
 import { BINARY_PROTOCOL_VERSION, PROTOCOL_PACKET_VERSION } from "../protocol/types";
 import type {
+  AttachFramePayload,
   DaemonClientSummaryPayload,
   DaemonStatusResultPayload,
   E2eeKeyExchangePayload,
@@ -44,7 +52,6 @@ import type {
   SessionCreatePayload,
   SessionCreatedPayload,
   SessionCursorPayload,
-  SessionDataPayload,
   SessionFileReadResultPayload,
   SessionFileTransferChunkPayload,
   SessionFileUploadProgressPayload,
@@ -58,6 +65,7 @@ import type {
   SessionSearchMatchPayload,
   SessionSearchPayload,
   SessionSearchResultPayload,
+  SingleTerminalFramePayload,
   SessionSummaryPayload,
   TerminalSize,
   UUID,
@@ -132,7 +140,7 @@ interface TrustedDevice {
 interface MockTerminalStream {
   sessionId: UUID;
   streamId: PacketStreamId;
-  nextOutputSeq: number;
+  nextTransportSeq: number;
   watchUpdates: boolean;
 }
 
@@ -237,6 +245,7 @@ export class MockDaemon {
   private readonly connections = new Set<MockConnection>();
   private readonly sessionFilePositions = new Map<UUID, string>();
   private readonly sessionOutputSnapshots = new Map<UUID, string>();
+  private readonly sessionTerminalNextSeq = new Map<UUID, number>();
   private readonly fileStore = new Map<string, Uint8Array>();
 
   private constructor(
@@ -364,12 +373,20 @@ export class MockDaemon {
     this.appendSessionOutput(sessionId, text);
     for (const connection of this.connections) {
       if (connection.e2ee && connection.watchedSessionIds.has(sessionId)) {
-        this.sendInner(
+        const terminalSeq = this.claimNextMockTerminalSeq(sessionId);
+        this.sendSupervisorTerminalFrame(
           connection,
-          envelope("session_data", {
+          sessionId,
+          {
+            type: "terminal_frame",
             session_id: sessionId,
-            data_base64: sessionDataToBase64(new TextEncoder().encode(text)),
-          }),
+            frame: {
+              kind: "output",
+              session_id: sessionId,
+              terminal_seq: terminalSeq,
+              data_bytes: new TextEncoder().encode(text),
+            },
+          },
         );
       }
     }
@@ -704,7 +721,26 @@ export class MockDaemon {
     }
     connection.activeStreamId = packet.stream_id;
     try {
-      await this.handleLegacyInner(connection, envelope("session_data", packet.payload));
+      const attachFramePayload = packet.payload as {
+        data_base64?: string;
+        data_bytes?: Uint8Array;
+      };
+      const maybeAttachBytes = attachFramePayload.data_bytes ?? (
+        typeof attachFramePayload.data_base64 === "string"
+          ? sessionDataFromBase64(attachFramePayload.data_base64)
+          : undefined
+      );
+      if (!maybeAttachBytes) {
+        this.sendPacketError(connection, packet, "invalid_packet", "terminal stream chunk payload is invalid");
+        return;
+      }
+      try {
+        decodeSupervisorTerminalClientFrame(maybeAttachBytes);
+      } catch {
+        this.sendPacketError(connection, packet, "invalid_packet", "terminal stream chunk payload is invalid");
+        return;
+      }
+      await this.handleLegacyInner(connection, envelope("attach_frame", packet.payload));
     } finally {
       connection.activeStreamId = undefined;
     }
@@ -1022,8 +1058,8 @@ export class MockDaemon {
         this.handleSessionCreate(connection, inner.payload as SessionCreatePayload);
         return;
       case "session_attach": {
-        const payload = inner.payload as { session_id: UUID; watch_updates?: boolean; last_terminal_seq?: number | null };
-        const watchUpdates = payload.watch_updates ?? true;
+        const payload = inner.payload as { session_id: UUID; last_terminal_seq?: number | null };
+        const watchUpdates = connection.activeRequest?.method === "terminal.attach";
         if (!this.options.sessions.some((candidate) => candidate.session_id === payload.session_id)) {
           this.sendError(connection, "session_not_found", "session was not found");
           return;
@@ -1040,7 +1076,11 @@ export class MockDaemon {
           this.sendError(connection, "connection_closed", "mock watched terminal attach closed");
           return;
         }
-        this.attachRequests.push(payload);
+        this.attachRequests.push({
+          session_id: payload.session_id,
+          watch_updates: watchUpdates,
+          ...(payload.last_terminal_seq !== undefined ? { last_terminal_seq: payload.last_terminal_seq } : {}),
+        });
         if (this.options.attachDelayMs) {
           await new Promise((resolve) => setTimeout(resolve, this.options.attachDelayMs));
         }
@@ -1054,12 +1094,19 @@ export class MockDaemon {
         const requestStreamId = connection.activeRequest?.stream_id;
         const canceledBeforeAck = !!requestStreamId && connection.pendingCanceledTerminalStreamIds.has(requestStreamId);
         if (!canceledBeforeAck) {
-          if (watchUpdates) {
+          if (watchUpdates && !connection.watchedSessionIds.has(payload.session_id)) {
             this.attachedSessions.push(payload.session_id);
           }
           connection.attachedSessionIds.add(payload.session_id);
           if (watchUpdates) {
             connection.watchedSessionIds.add(payload.session_id);
+          }
+        }
+        if (watchUpdates && this.options.attachOutput) {
+          if (!this.sessionOutputSnapshots.has(payload.session_id)) {
+            // 中文注释：attach_sync 是 terminal attach 的首个权威 bootstrap。
+            // 必须先把 mock snapshot 写好，再发送 response/attach_sync，否则测试会收到空首屏。
+            this.appendSessionOutput(payload.session_id, this.options.attachOutput);
           }
         }
         this.sendInner(
@@ -1072,30 +1119,24 @@ export class MockDaemon {
             resize_owner: watchUpdates,
           }),
         );
-        if (watchUpdates && this.options.attachOutput) {
-          if (!this.sessionOutputSnapshots.has(payload.session_id)) {
-            this.appendSessionOutput(payload.session_id, this.options.attachOutput);
-          }
-          this.sendInner(
-            connection,
-            envelope("session_data", {
-              session_id: payload.session_id,
-              data_base64: sessionDataToBase64(new TextEncoder().encode(this.options.attachOutput)),
-            }),
-          );
-        }
         return;
       }
-      case "session_data": {
-        const payload = inner.payload as SessionDataPayload;
-        const input = decodeUtf8(sessionDataFromBase64(payload.data_base64 ?? ""));
-        this.sessionDataMessages.push(input);
-        if (this.options.sessionDataError) {
-          // 拒绝路径只记录收到的加密业务帧，不模拟写入 PTY。
-          this.sendError(connection, this.options.sessionDataError.code, this.options.sessionDataError.message);
-          return;
+      case "attach_frame": {
+        const payload = inner.payload as AttachFramePayload & { data_bytes?: Uint8Array };
+        const frame = decodeSupervisorTerminalClientFrame(
+          payload.data_bytes ?? sessionDataFromBase64(payload.data_base64 ?? ""),
+        );
+        if (frame.type === "input") {
+          const input = decodeUtf8(frame.data_bytes);
+          this.sessionDataMessages.push(input);
+          if (this.options.sessionDataError) {
+            this.sendError(connection, this.options.sessionDataError.code, this.options.sessionDataError.message);
+            return;
+          }
+          this.decryptedInputs.push(input);
         }
-        this.decryptedInputs.push(input);
+        // 中文注释：mock daemon 目前只需要验证 attach frame 输入链路。resize 和 heartbeat
+        // 在这里接受即可，不额外模拟 supervisor 行为，避免把测试夹带成第二套实现。
         return;
       }
       case "session_cursor": {
@@ -1386,28 +1427,33 @@ export class MockDaemon {
     connection.watchedSessionIds.add(created.session_id);
     if (this.options.createOutputBeforeResponse && connection.activeRequest?.stream_id) {
       this.appendSessionOutput(created.session_id, this.options.createOutputBeforeResponse);
+      // 中文注释：create response 前先到达的输出也属于同一条 terminal_seq 时间线。
+      // 后续 attach_sync/live output 必须从它之后继续递增，不能再从 1 开始。
+      const terminalSeq = this.claimNextMockTerminalSeq(created.session_id);
+      const preResponseFrame = encodeSupervisorTerminalServerFrame({
+        type: "terminal_frame",
+        session_id: created.session_id,
+        frame: {
+          kind: "output",
+          session_id: created.session_id,
+          terminal_seq: terminalSeq,
+          data_bytes: new TextEncoder().encode(this.options.createOutputBeforeResponse),
+        },
+      });
       this.sendPacket(connection, {
         version: PROTOCOL_PACKET_VERSION,
         kind: "stream_chunk",
         stream_id: connection.activeRequest.stream_id,
         seq: 1,
-        payload: {
-          session_id: created.session_id,
-          data_base64: sessionDataToBase64(new TextEncoder().encode(this.options.createOutputBeforeResponse)),
-        } satisfies SessionDataPayload,
+        payload: buildAttachFramePayload(created.session_id, preResponseFrame),
       });
     }
-    this.sendInner(connection, envelope("session_created", created));
     if (this.options.attachOutput) {
+      // 中文注释：`terminal.create` 的 response 返回后，前端会立刻消费 attach_sync 作为首屏。
+      // attachOutput 必须先写进权威 snapshot，不能等 response 发完再补。
       this.appendSessionOutput(created.session_id, this.options.attachOutput);
-      this.sendInner(
-        connection,
-        envelope("session_data", {
-          session_id: created.session_id,
-          data_base64: sessionDataToBase64(new TextEncoder().encode(this.options.attachOutput)),
-        }),
-      );
     }
+    this.sendInner(connection, envelope("session_created", created));
   }
 
   private handleClientHello(connection: MockConnection, payload: { name: string }): void {
@@ -1470,6 +1516,7 @@ export class MockDaemon {
     }
     this.sessionFilePositions.delete(sessionId);
     this.sessionOutputSnapshots.delete(sessionId);
+    this.sessionTerminalNextSeq.delete(sessionId);
   }
 
   private applyMockFileWrite(sessionId: UUID, path: string): void {
@@ -1581,11 +1628,6 @@ export class MockDaemon {
       this.sendError(connection, "invalid_state", "invalid protocol state");
       return;
     }
-    if (inner.type === "session_data") {
-      this.sendTerminalStreamChunk(connection, inner.payload as SessionDataPayload);
-      return;
-    }
-
     const activeRequest = connection.activeRequest;
     if (activeRequest && !connection.respondedToActiveRequest) {
       this.sendPacketResponse(connection, activeRequest, inner.payload);
@@ -1619,6 +1661,7 @@ export class MockDaemon {
       method: request.method,
       payload,
     });
+    this.sendInitialSupervisorAttachSync(connection, request, payload);
   }
 
   private sendPacketEvent(connection: MockConnection, method: string, payload: unknown): void {
@@ -1655,7 +1698,10 @@ export class MockDaemon {
     this.sentPackets.push(packet);
     this.sentPacketLog.push({ connection_id: connection.id, packet });
     if (connection.binaryMode) {
-      const binaryPacket = protocolPacketToBinary(packet);
+      const binaryPacket = protocolPacketToBinary(
+        packet,
+        this.binaryEncodingOptionsForPacket(connection, packet),
+      );
       this.recordBinaryPacket("out", binaryPacket);
       const frame = connection.e2ee.encryptBinary(encodeBinaryProtocolPacket(binaryPacket));
       const wire = encodeBinaryEncryptedFrame(frame);
@@ -1666,7 +1712,59 @@ export class MockDaemon {
     this.sendOuter(connection.socket, envelope("encrypted_frame", connection.e2ee.encryptJson(envelope("packet", packet))));
   }
 
+  private binaryEncodingOptionsForPacket(
+    connection: MockConnection,
+    packet: ProtocolPacket,
+  ): import("../protocol/packet-codec").ProtocolPacketBinaryEncodingOptions | undefined {
+    if (packet.kind !== "stream_chunk" || !packet.stream_id) {
+      return undefined;
+    }
+    const payload = packet.payload as {
+      session_id?: unknown;
+      data_base64?: unknown;
+      data_bytes?: unknown;
+      offset_bytes?: unknown;
+      kind?: unknown;
+    };
+    const isOpaqueAttachPayload =
+      typeof payload.session_id === "string"
+      && payload.kind === undefined
+      && payload.offset_bytes === undefined
+      && (typeof payload.data_base64 === "string" || payload.data_bytes instanceof Uint8Array);
+    if (!isOpaqueAttachPayload) {
+      return undefined;
+    }
+    if (connection.terminalStreamsById.has(packet.stream_id)) {
+      return { streamChunkPayloadType: "attach_frame" };
+    }
+    if (
+      connection.activeRequest?.stream_id === packet.stream_id
+      && String(connection.activeRequest.method ?? "").startsWith("terminal.")
+    ) {
+      return { streamChunkPayloadType: "attach_frame" };
+    }
+    return undefined;
+  }
+
   private recordBinaryPacket(direction: "in" | "out", packet: BinaryProtocolPacket): void {
+    if (packet.payload?.type === "attach_frame") {
+      const payload = direction === "out"
+        ? decodeSupervisorTerminalServerFrame(packet.payload.data)
+        : decodeSupervisorTerminalClientFrame(packet.payload.data);
+      this.binaryPacketLog.push({
+        direction,
+        kind: packet.kind,
+        payload_type: packet.payload.type,
+        data_text: payload.type === "terminal_frame" && payload.frame.kind === "output"
+          ? decodeUtf8(payload.frame.data_bytes ?? new Uint8Array())
+          : payload.type === "attach_sync"
+            ? decodeUtf8(payload.snapshot.retained_output_bytes)
+            : payload.type === "input"
+              ? decodeUtf8(payload.data_bytes)
+            : undefined,
+      });
+      return;
+    }
     if (packet.payload?.type === "session_data") {
       this.binaryPacketLog.push({
         direction,
@@ -1702,36 +1800,14 @@ export class MockDaemon {
     });
   }
 
-  private sendTerminalStreamChunk(connection: MockConnection, payload: SessionDataPayload): void {
-    const stream = connection.terminalStreamsBySession.get(payload.session_id);
-    if (!stream || !stream.watchUpdates) {
-      return;
-    }
-    const seq = stream.nextOutputSeq;
-    stream.nextOutputSeq += 1;
-    this.sendPacket(connection, {
-      version: PROTOCOL_PACKET_VERSION,
-      kind: "stream_chunk",
-      stream_id: stream.streamId,
-      seq,
-      payload,
-    });
-  }
-
   private sendTerminalStreamFrame(connection: MockConnection, sessionId: UUID, payload: unknown): void {
     const stream = connection.terminalStreamsBySession.get(sessionId);
     if (!stream || !stream.watchUpdates) {
       return;
     }
-    const seq = stream.nextOutputSeq;
-    stream.nextOutputSeq += 1;
-    this.sendPacket(connection, {
-      version: PROTOCOL_PACKET_VERSION,
-      kind: "stream_chunk",
-      stream_id: stream.streamId,
-      seq,
-      payload,
-    });
+    const frame = this.normalizeSupervisorTerminalFrame(sessionId, payload);
+    this.noteTerminalSequencePayload(sessionId, frame.frame);
+    this.sendSupervisorTerminalFrame(connection, sessionId, frame);
   }
 
   private sendTerminalStreamBatch(connection: MockConnection, sessionId: UUID, frames: unknown[]): void {
@@ -1739,19 +1815,154 @@ export class MockDaemon {
     if (!stream || !stream.watchUpdates) {
       return;
     }
-    const seq = stream.nextOutputSeq;
-    stream.nextOutputSeq += 1;
+    this.noteTerminalSequencePayload(sessionId, { kind: "batch", frames });
+    for (const frame of frames) {
+      this.sendSupervisorTerminalFrame(connection, sessionId, this.normalizeSupervisorTerminalFrame(sessionId, frame));
+    }
+  }
+
+  private sendSupervisorTerminalFrame(
+    connection: MockConnection,
+    sessionId: UUID,
+    frame: SupervisorTerminalServerFrame,
+  ): void {
+    const stream = connection.terminalStreamsBySession.get(sessionId);
+    if (!stream || !stream.watchUpdates) {
+      return;
+    }
+    const seq = stream.nextTransportSeq;
+    stream.nextTransportSeq += 1;
+    const payload = buildAttachFramePayload(sessionId, encodeSupervisorTerminalServerFrame(frame));
     this.sendPacket(connection, {
       version: PROTOCOL_PACKET_VERSION,
       kind: "stream_chunk",
       stream_id: stream.streamId,
       seq,
-      payload: {
-        kind: "batch",
-        session_id: sessionId,
-        frames,
-      },
+      payload,
     });
+  }
+
+  private nextMockTerminalSeqBase(sessionId: UUID): number {
+    return (this.sessionTerminalNextSeq.get(sessionId) ?? 1) - 1;
+  }
+
+  private claimNextMockTerminalSeq(sessionId: UUID): number {
+    const nextSeq = this.sessionTerminalNextSeq.get(sessionId) ?? 1;
+    this.sessionTerminalNextSeq.set(sessionId, nextSeq + 1);
+    return nextSeq;
+  }
+
+  private noteTerminalSequencePayload(sessionId: UUID, payload: unknown): void {
+    const nextSeq = this.sessionTerminalNextSeq.get(sessionId) ?? 1;
+    const nextAfterPayload = (() => {
+      if (!payload || typeof payload !== "object") {
+        return nextSeq;
+      }
+      const packetPayload = payload as { kind?: unknown; frames?: unknown };
+      if (packetPayload.kind === "batch" && Array.isArray(packetPayload.frames)) {
+        let candidate = nextSeq;
+        for (const frame of packetPayload.frames) {
+          candidate = Math.max(candidate, this.terminalSequenceCeilingFromPayload(candidate, frame));
+        }
+        return candidate;
+      }
+      return this.terminalSequenceCeilingFromPayload(nextSeq, packetPayload);
+    })();
+    if (nextAfterPayload > nextSeq) {
+      this.sessionTerminalNextSeq.set(sessionId, nextAfterPayload);
+    }
+  }
+
+  private terminalSequenceCeilingFromPayload(current: number, payload: unknown): number {
+    if (!payload || typeof payload !== "object") {
+      return current;
+    }
+    const frame = payload as { terminal_seq?: unknown; base_seq?: unknown };
+    const terminalSeq = typeof frame.terminal_seq === "number" ? frame.terminal_seq : undefined;
+    if (terminalSeq !== undefined) {
+      return Math.max(current, terminalSeq + 1);
+    }
+    const baseSeq = typeof frame.base_seq === "number" ? frame.base_seq : undefined;
+    if (baseSeq !== undefined) {
+      return Math.max(current, baseSeq + 1);
+    }
+    return current;
+  }
+
+  private sendInitialSupervisorAttachSync(connection: MockConnection, request: ProtocolPacket, payload: unknown): void {
+    if (request.kind !== "stream_open" || !request.stream_id || !String(request.method ?? "").startsWith("terminal.")) {
+      return;
+    }
+    const response = payload as { session_id?: UUID; size?: TerminalSize };
+    if (!response.session_id) {
+      return;
+    }
+    const stream = connection.terminalStreamsBySession.get(response.session_id);
+    if (!stream?.watchUpdates) {
+      return;
+    }
+    const snapshotText = this.sessionOutputSnapshots.get(response.session_id) ?? "";
+    const snapshotBytes = new TextEncoder().encode(snapshotText);
+    const requestPayload = request.payload as { last_terminal_seq?: number | null };
+    const requestedLastTerminalSeq =
+      typeof requestPayload.last_terminal_seq === "number" ? requestPayload.last_terminal_seq : undefined;
+    const snapshotSize = response.size ?? { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 };
+    const currentBaseSeq = this.nextMockTerminalSeqBase(response.session_id);
+    let baseSeq = currentBaseSeq;
+    let retainedOutputBytes = snapshotBytes;
+    let frames: SingleTerminalFramePayload[] = [];
+
+    if (request.method === "terminal.create" && this.options.createOutputBeforeResponse) {
+      // 中文注释：create response 前如果已经通过同一条 stream 推过首屏 output，
+      // response 后的 attach_sync 只能作为“已追平”的确认，不能再回放同样的字节。
+      retainedOutputBytes = new Uint8Array();
+      baseSeq = currentBaseSeq;
+    } else if (requestedLastTerminalSeq !== undefined) {
+      retainedOutputBytes = new Uint8Array();
+      if (requestedLastTerminalSeq >= currentBaseSeq) {
+        // 中文注释：client 已经追平当前 terminal_seq 时，重连 bootstrap 只需要确认
+        // base_seq，不应该再回放 retained_output，否则页面会把旧内容再渲染一遍。
+        baseSeq = requestedLastTerminalSeq;
+      } else if (snapshotBytes.byteLength > 0) {
+        // 中文注释：mock 不维护完整 tail journal；当 last_terminal_seq 落后时，
+        // 回退成权威 snapshot frame，模拟真实 supervisor 的“尾巴不可用则重建快照”语义。
+        frames = [{
+          kind: "snapshot",
+          session_id: response.session_id,
+          base_seq: currentBaseSeq,
+          size: snapshotSize,
+          data_bytes: snapshotBytes,
+        }];
+      }
+    }
+    this.sendSupervisorTerminalFrame(connection, response.session_id, {
+      type: "attach_sync",
+      session_id: response.session_id,
+      // 中文注释：base_seq 表达 snapshot/tail 已覆盖到的 terminal_seq，
+      // 不能再拿 packet transport seq 来推导，否则首条 live output 会被误判成缺口。
+      base_seq: baseSeq,
+      snapshot: {
+        size: snapshotSize,
+        process_id: 7,
+        retained_output_bytes: retainedOutputBytes,
+      },
+      frames,
+    });
+  }
+
+  private normalizeSupervisorTerminalFrame(sessionId: UUID, payload: unknown): SupervisorTerminalServerFrame & { type: "terminal_frame" } {
+    if (
+      payload &&
+      typeof payload === "object" &&
+      (payload as { type?: unknown }).type === "terminal_frame"
+    ) {
+      return payload as SupervisorTerminalServerFrame & { type: "terminal_frame" };
+    }
+    return {
+      type: "terminal_frame",
+      session_id: sessionId,
+      frame: payload as SingleTerminalFramePayload,
+    };
   }
 
   private registerTerminalStreamForResponse(connection: MockConnection, request: ProtocolPacket, payload: unknown): void {
@@ -1765,14 +1976,18 @@ export class MockDaemon {
     if (!response.session_id) {
       return;
     }
-    const requestPayload = request.payload as { watch_updates?: boolean };
-    const watchUpdates = request.method === "terminal.attach" ? requestPayload.watch_updates ?? true : true;
+    const retainedOutputBytes = new TextEncoder().encode(this.sessionOutputSnapshots.get(response.session_id) ?? "");
     const stream: MockTerminalStream = {
       sessionId: response.session_id,
       streamId: request.stream_id,
-      nextOutputSeq: request.method === "terminal.create" && this.options.createOutputBeforeResponse ? 2 : 1,
-      watchUpdates,
+      // 中文注释：transport seq 只给 packet stream 自身使用；create 若已在 response 前
+      // 推过一个 chunk，后续 transport seq 要从 2 继续。
+      nextTransportSeq: request.method === "terminal.create" && this.options.createOutputBeforeResponse ? 2 : 1,
+      watchUpdates: true,
     };
+    if (!this.sessionTerminalNextSeq.has(response.session_id)) {
+      this.sessionTerminalNextSeq.set(response.session_id, retainedOutputBytes.byteLength > 0 ? 2 : 1);
+    }
     connection.terminalStreamsById.set(stream.streamId, stream);
     connection.terminalStreamsBySession.set(stream.sessionId, stream);
   }

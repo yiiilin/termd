@@ -4,7 +4,10 @@ use std::process::Command as ProcessCommand;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use termd::pty::tmux::TmuxPtyBackend;
-use termd::pty::{CommandSpec, PtyBackend, PtyRestoreInfo, PtySession, PtySize, PtyTerminalFrame};
+use termd::pty::{
+    CommandSpec, PtyAttachmentBootstrap, PtyBackend, PtyRestoreInfo, PtySession, PtySize,
+    PtyTerminalFrame,
+};
 use termd::runtime::SessionRuntime;
 use termd::session::TerminalSize as RuntimeTerminalSize;
 use termd::state::{DaemonState, SessionStateRecord, StateStore};
@@ -962,6 +965,7 @@ fn tmux_watched_attachment_handles_are_independent_tmux_clients() {
             Some(&restore_info),
             PtySize::new(24, 80),
             "test-watch-1",
+            PtyAttachmentBootstrap::default(),
         )
         .unwrap();
     let second = backend
@@ -970,6 +974,7 @@ fn tmux_watched_attachment_handles_are_independent_tmux_clients() {
             Some(&restore_info),
             PtySize::new(24, 80),
             "test-watch-2",
+            PtyAttachmentBootstrap::default(),
         )
         .unwrap();
     wait_for_tmux_client_count(&socket_path, &session_name, 3);
