@@ -32,6 +32,20 @@ Progress must be tracked in this file only:
 - [x] Task 3: 重写 `TECH.md` 当前实现描述，确保生产路径、职责边界、验证入口与现状一致。
 - [x] Task 4: 跑受影响验证，并完成两轮 subagent 复审后再打勾。
 
+当前状态：验证已完成并通过，且已完成两轮 subagent 复审。
+
+## Verification Notes
+
+- `npm run test:e2e -- tests/termui-web.real-relay.spec.ts -g "relay Web 双客户端同会话不同分辨率轮番离线上线后仍能恢复" --project=chromium`
+  - 结果：通过，`1 passed`。
+- `npm run test:e2e -- tests/termui-web.smoke.spec.ts -g "direct Web 多个大输出 session 快速切换后仍贴底并能输入" --project=chromium`
+  - 结果：通过，`1 passed`。
+- `npm run typecheck`（`termui/frontend`）
+  - 结果：通过。
+- Subagent 复审
+  - 规格复审：`Huygens` 最终结论为“无阻断问题”。
+  - 代码质量复审：`Newton` 最终结论为“无阻断问题”。
+
 ## Verification Targets
 
 - `cargo test --workspace --locked --quiet`

@@ -1183,8 +1183,8 @@ async function terminalViewportState(page: Page): Promise<{ viewportRaw: number;
   return page.locator(".terminal-host").evaluate((host) => {
     const element = host as HTMLElement;
     return {
-      viewportRaw: Number.parseFloat(element.dataset.termdViewportYRaw ?? "0"),
-      scrollbackLength: Number.parseFloat(element.dataset.termdScrollbackLength ?? "0"),
+      viewportRaw: Number.parseFloat(element.dataset.termdViewportYRaw ?? ""),
+      scrollbackLength: Number.parseFloat(element.dataset.termdScrollbackLength ?? ""),
     };
   });
 }
@@ -1200,12 +1200,19 @@ async function terminalHostSize(page: Page): Promise<{ cols: number; rows: numbe
 }
 
 async function expectTerminalScrollAtBottom(page: Page): Promise<void> {
+  // 中文注释：外层 scrollport 可能已经“看起来”在底部，但 Ghostty 视口还没真正
+  // 追平。这里把 renderer 视口一起纳入条件，避免继续把旧历史当作当前屏幕。
   await expect
-    .poll(async () =>
-      page.locator(".terminal-scrollport").evaluate((element) => {
-        const maxScrollTop = Math.max(0, element.scrollHeight - element.clientHeight);
-        return element.scrollTop >= maxScrollTop - 2;
-      }),
-    )
+    .poll(async () => {
+      const [scrollportPinned, viewportState] = await Promise.all([
+        page.locator(".terminal-scrollport").evaluate((element) => {
+          const maxScrollTop = Math.max(0, element.scrollHeight - element.clientHeight);
+          return element.scrollTop >= maxScrollTop - 2;
+        }),
+        terminalViewportState(page),
+      ]);
+      // 中文注释：viewportRaw 表示距底部的原始距离，只允许极小的浮点抖动。
+      return scrollportPinned && Number.isFinite(viewportState.viewportRaw) && viewportState.viewportRaw <= 0.5;
+    })
     .toBe(true);
 }
