@@ -490,7 +490,7 @@ vi.mock("ghostty-web", () => {
       if ((globalThis as { __TERMD_TEST_GHOSTTY_SKIP_NATIVE_FOCUS__?: boolean }).__TERMD_TEST_GHOSTTY_SKIP_NATIVE_FOCUS__) {
         return;
       }
-      this.textarea?.focus();
+      this.element?.focus();
     }
 
     requestRender() {

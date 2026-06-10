@@ -657,6 +657,7 @@ async function exerciseSupervisorBackedWebLifecycle(
     return element!;
   });
   await waitFor(() => expect(document.activeElement).toBe(terminalInput));
+  expect(document.activeElement).not.toBe(terminalHost());
 
   terminalInput.value = input.inputText;
   fireEvent.input(terminalInput);
@@ -2656,6 +2657,7 @@ describe("termui web 工作台", () => {
     fireEvent.click(renderedText);
 
     await waitFor(() => expect(document.activeElement).toBe(terminalInput));
+    expect(document.activeElement).not.toBe(host);
     await waitFor(() =>
       expect(daemon.sessionCursorUpdates).toContainEqual({
         session_id: DEFAULT_SESSION_ID,
@@ -3668,6 +3670,7 @@ describe("termui web 工作台", () => {
     const terminalInput = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
     expect(terminalInput).not.toBeNull();
     await waitFor(() => expect(document.activeElement).toBe(terminalInput));
+    expect(document.activeElement).not.toBe(terminalHost());
     expect(daemon.createdCommands).toEqual([[]]);
     // 中文注释：terminal.create 已经打开 terminal stream；新建会话后不能再追加一次
     // terminal.attach，否则慢 relay 下第二个 attach response 会被 create stream 输出阻塞。
@@ -3809,6 +3812,7 @@ describe("termui web 工作台", () => {
       return input!;
     });
     await waitFor(() => expect(document.activeElement).toBe(terminalInput));
+    expect(document.activeElement).not.toBe(terminalHost());
     await waitFor(() =>
       expect(terminalText()).toContain("idle-shell-prompt$ "),
     );

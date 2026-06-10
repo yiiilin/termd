@@ -122,6 +122,42 @@ test("pair、list、attach 的浏览器 smoke", async ({ page }, testInfo: TestI
       await expect(daemonStatus.getByText("CPU", { exact: true })).toBeVisible();
       await expect(daemonStatus.getByRole("button", { name: "Refresh server status" })).toHaveCount(0);
     }
+
+    if (testInfo.project.name !== "mobile-chrome") {
+      const terminalHost = terminalPane.locator(".terminal-host[role='textbox']");
+      const terminalTextarea = terminalPane.locator('textarea[aria-label="Terminal input"]');
+      await terminalPane.locator(".terminal-host canvas").click({ position: { x: 20, y: 20 } });
+      await expect(terminalTextarea).toBeFocused();
+      await expect(terminalHost).not.toBeFocused();
+      const compositionBaseline = daemon.decryptedInputs.join("");
+      await terminalTextarea.evaluate((element) => {
+        element.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true, cancelable: true }));
+        element.dispatchEvent(
+          new KeyboardEvent("keydown", {
+            bubbles: true,
+            cancelable: true,
+            code: "Space",
+            key: " ",
+            isComposing: true,
+          }),
+        );
+      });
+      await expect.poll(() => daemon.decryptedInputs.join("")).toBe(compositionBaseline);
+      await terminalTextarea.evaluate((element) => {
+        element.dispatchEvent(
+          new CompositionEvent("compositionend", {
+            bubbles: true,
+            cancelable: true,
+            data: "，",
+          }),
+        );
+      });
+      await expect.poll(() => daemon.decryptedInputs.join("").slice(compositionBaseline.length)).toBe("，");
+      await page.keyboard.type("desktop-focus-ok");
+      await page.keyboard.press("Enter");
+      await expect.poll(() => daemon.decryptedInputs.join("")).toContain("desktop-focus-ok");
+    }
+
     const sessionsPanel = page.getByRole("region", { name: "sessions" });
     // session UUID 已从 UI 隐藏；测试按用户实际看到的可访问名称打开会话。
     const sessionRow = sessionsPanel.getByRole("button", { name: "Open Lagrange" });

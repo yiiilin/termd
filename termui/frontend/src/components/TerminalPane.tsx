@@ -1904,14 +1904,17 @@ export function TerminalPane(props: TerminalPaneProps) {
   };
 
   const focusTerminalInputSink = (terminal: TerminalRendererTerminal | null = terminalRef.current) => {
-    terminal?.focus();
     const input = resolveTerminalInputElement();
-    if (!input || document.activeElement === input) {
+    if (!input) {
+      terminal?.focus();
       return;
     }
-    // 中文注释：真实浏览器和 ghostty-web 在高负载或慢布局时，外层 host 可能先拿到
-    // focus，但真正接收键盘事件的隐藏 textarea 还没跟上。这里显式桥接到输入 sink，
-    // 避免“看起来已聚焦、实际上打不进字符”的状态。
+    if (document.activeElement === input) {
+      return;
+    }
+    terminal?.focus();
+    // 中文注释：ghostty-web 的真实键盘/IME 输入最终要落到隐藏 textarea；
+    // host 只保留给可访问性、selection 和 resize 状态，不作为桌面输入终点。
     try {
       input.focus({ preventScroll: true });
     } catch {
@@ -2225,6 +2228,7 @@ export function TerminalPane(props: TerminalPaneProps) {
       if (terminalSelectionDragRef.current?.active || terminalSelectionFocusPendingRef.current) {
         return;
       }
+      // 中文注释：host 只负责把焦点态带进终端；真实的键盘/IME 输入 sink 仍是 textarea。
       if (!helperTextarea || document.activeElement === helperTextarea) {
         return;
       }
@@ -2751,6 +2755,7 @@ export function TerminalPane(props: TerminalPaneProps) {
       // renderer 就绪后必须补一次 focus resize，否则 daemon/supervisor 会继续停在旧 snapshot 尺寸。
       reportTerminalFocus(true);
       stabilizeTerminal("focus");
+      focusTerminalInputSink(terminal);
     }
     if (pendingFocusRequestRef.current !== undefined) {
       requestTrackedFrame(() => applyTerminalFocusRequest(pendingFocusRequestRef.current));

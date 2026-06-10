@@ -246,10 +246,10 @@ describe("TerminalPane terminal sequence rendering", () => {
       terminalInput.focus();
     });
 
-    // 中文注释：Playwright 和部分浏览器会先把 focus 落到外层 host。
-    // TerminalPane 必须把它桥接到 Ghostty 的真实输入 textarea，否则外观看似已聚焦，
-    // 键盘事件却不会进入终端。
+    // 中文注释：桌面端的可见终端仍由 host 承载 role/布局，
+    // 但真实键盘与中文 IME 输入要落到 ghostty-web 的 textarea 输入 sink。
     await waitFor(() => expect(document.activeElement).toBe(textarea));
+    expect(document.activeElement).not.toBe(terminalInput);
   });
 
   it("snapshot 后推进 base seq，连续 output 正常写入并推进 terminal_seq", async () => {
