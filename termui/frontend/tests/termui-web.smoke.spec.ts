@@ -17,6 +17,22 @@ async function openMobileMenu(page: Page) {
   return menu;
 }
 
+async function resetBrowserState(page: Page): Promise<void> {
+  await page.addInitScript(() => {
+    if (window.name === "__TERMD_TEST_STATE_RESET_DONE__") {
+      return;
+    }
+    window.name = "__TERMD_TEST_STATE_RESET_DONE__";
+    window.localStorage.clear();
+    window.sessionStorage.clear();
+    indexedDB.deleteDatabase("termd-termui-web");
+  });
+}
+
+test.beforeEach(async ({ page }) => {
+  await resetBrowserState(page);
+});
+
 test("pair、list、attach 的浏览器 smoke", async ({ page }, testInfo: TestInfo) => {
   const daemon = await MockDaemon.start({
     token: "secret-token",

@@ -557,6 +557,114 @@ describe("TerminalPane terminal sequence rendering", () => {
     }
   });
 
+  it("拖拽命中 canvas 包装层时仍会启动自定义选区复制", async () => {
+    const canvasRect = {
+      x: 0,
+      y: 0,
+      left: 0,
+      top: 0,
+      right: 800,
+      bottom: 240,
+      width: 800,
+      height: 240,
+      toJSON() {
+        return this;
+      },
+    } as DOMRect;
+    const rectSpy = vi.spyOn(HTMLCanvasElement.prototype, "getBoundingClientRect").mockReturnValue(canvasRect);
+    try {
+      renderTerminalPaneWithOutput([
+        { kind: "snapshot", bytes: new TextEncoder().encode("line-001\nline-002\nline-003\n"), baseSeq: 0, size: DEFAULT_TERMINAL_SIZE },
+      ]);
+
+      await waitFor(() => expect(terminalHost().dataset.buffer).toContain("line-003"));
+      fireEvent.mouseDown(terminalHost(), { clientX: 20, clientY: 20, button: 0 });
+      fireEvent.mouseMove(window, { clientX: 180, clientY: 20 });
+      fireEvent.mouseUp(window, { clientX: 180, clientY: 20 });
+
+      await waitFor(() => expect(terminalHost().dataset.termdHasSelection).toBe("true"));
+      expect(terminalHost().dataset.termdSelection).not.toBe("");
+    } finally {
+      rectSpy.mockRestore();
+    }
+  });
+
+  it("拖拽选区结束后的 trailing click 不会把焦点抢回隐藏 textarea", async () => {
+    const canvasRect = {
+      x: 0,
+      y: 0,
+      left: 0,
+      top: 0,
+      right: 800,
+      bottom: 240,
+      width: 800,
+      height: 240,
+      toJSON() {
+        return this;
+      },
+    } as DOMRect;
+    const rectSpy = vi.spyOn(HTMLCanvasElement.prototype, "getBoundingClientRect").mockReturnValue(canvasRect);
+    try {
+      renderTerminalPaneWithOutput([
+        { kind: "snapshot", bytes: new TextEncoder().encode("line-001\nline-002\nline-003\n"), baseSeq: 0, size: DEFAULT_TERMINAL_SIZE },
+      ]);
+
+      await waitFor(() => expect(terminalHost().dataset.buffer).toContain("line-003"));
+      const canvas = screen.getByTestId("terminal-pane").querySelector<HTMLCanvasElement>("canvas");
+      const terminalInput = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
+      expect(canvas).not.toBeNull();
+      expect(terminalInput).not.toBeNull();
+      terminalInput!.blur();
+
+      fireEvent.mouseDown(canvas!, { clientX: 20, clientY: 20, button: 0 });
+      fireEvent.mouseMove(window, { clientX: 180, clientY: 20 });
+      fireEvent.mouseUp(window, { clientX: 180, clientY: 20 });
+      fireEvent.click(canvas!, { clientX: 180, clientY: 20 });
+
+      await waitFor(() => expect(terminalHost().dataset.termdHasSelection).toBe("true"));
+      expect(document.activeElement).not.toBe(terminalInput);
+    } finally {
+      rectSpy.mockRestore();
+    }
+  });
+
+  it("Ghostty scrollbar gutter click 不会把焦点抢回隐藏 textarea", async () => {
+    const canvasRect = {
+      x: 0,
+      y: 0,
+      left: 0,
+      top: 0,
+      right: 800,
+      bottom: 240,
+      width: 800,
+      height: 240,
+      toJSON() {
+        return this;
+      },
+    } as DOMRect;
+    const rectSpy = vi.spyOn(HTMLCanvasElement.prototype, "getBoundingClientRect").mockReturnValue(canvasRect);
+    try {
+      const snapshot = Array.from({ length: 80 }, (_, index) => `scrollbar-line-${index}\n`).join("");
+      renderTerminalPaneWithOutput([
+        { kind: "snapshot", bytes: new TextEncoder().encode(snapshot), baseSeq: 0, size: DEFAULT_TERMINAL_SIZE },
+      ]);
+
+      await waitFor(() => expect(Number(terminalHost().dataset.termdScrollbackLength ?? "0")).toBeGreaterThan(0));
+      const canvas = screen.getByTestId("terminal-pane").querySelector<HTMLCanvasElement>("canvas");
+      const terminalInput = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
+      expect(canvas).not.toBeNull();
+      expect(terminalInput).not.toBeNull();
+      terminalInput!.blur();
+
+      fireEvent.mouseDown(canvas!, { clientX: canvasRect.right - 2, clientY: 20, button: 0 });
+      fireEvent.click(canvas!, { clientX: canvasRect.right - 2, clientY: 20 });
+
+      expect(document.activeElement).not.toBe(terminalInput);
+    } finally {
+      rectSpy.mockRestore();
+    }
+  });
+
   it("自定义拖拽复制不依赖 Ghostty 返回的 selectionPosition", async () => {
     const canvasRect = {
       x: 0,

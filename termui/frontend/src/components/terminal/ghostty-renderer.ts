@@ -912,7 +912,10 @@ function installDebugSelectionBridge(
   };
 }
 
-function installDebugBufferMirror(terminal: InstanceType<typeof Terminal>): () => void {
+function installDebugBufferMirror(
+  terminal: InstanceType<typeof Terminal>,
+  terminalFacade: TerminalRendererTerminal,
+): () => void {
   const debugTerminal = terminal as GhosttyDebugTerminal;
   let disposed = false;
   const sync = () => {
@@ -937,9 +940,11 @@ function installDebugBufferMirror(terminal: InstanceType<typeof Terminal>): () =
       // 用例会写入超长单行，不能在每次 render 时重建这份 viewport 文本。
       terminal.element.dataset.termdViewportText = terminalDebugViewportText(terminal);
     }
-    terminal.element.dataset.termdHasSelection = String(Boolean(terminal.hasSelection?.()));
-    terminal.element.dataset.termdSelection = terminal.getSelection?.() ?? "";
-    terminal.element.dataset.termdSelectionPosition = JSON.stringify(terminal.getSelectionPosition?.() ?? null);
+    // 中文注释：调试 dataset 必须和业务层复制链路共用同一套 facade 语义。
+    // 否则 E2E 通过 viewport bridge 建出的选区，复制能成功，但 dataset 还会显示空。
+    terminal.element.dataset.termdHasSelection = String(terminalFacade.hasSelection());
+    terminal.element.dataset.termdSelection = terminalFacade.getSelection();
+    terminal.element.dataset.termdSelectionPosition = JSON.stringify(terminalFacade.getSelectionPosition?.() ?? null);
   };
   debugTerminal.__termdDebugBufferSync = sync;
   const subscriptions: GhosttyDisposable[] = [
@@ -983,10 +988,11 @@ function buildGhosttyRenderer(options: CreateTerminalRendererOptions): TerminalR
   const upstreamFit = new FitAddon();
   terminal.loadAddon(upstreamFit);
   const fit = createTermdGhosttyFitAddon(terminal, upstreamFit);
-  const cleanupDebugBufferMirror = DEBUG_BUFFER_MIRROR_ENABLED
-    ? installDebugBufferMirror(terminal)
+  let cleanupDebugBufferMirror: () => void = () => undefined;
+  const adaptedTerminal = adaptGhosttyTerminal(terminal, () => cleanupDebugBufferMirror());
+  cleanupDebugBufferMirror = DEBUG_BUFFER_MIRROR_ENABLED
+    ? installDebugBufferMirror(terminal, adaptedTerminal)
     : () => undefined;
-  const adaptedTerminal = adaptGhosttyTerminal(terminal, cleanupDebugBufferMirror);
 
   return {
     kind: "ghostty",
@@ -994,7 +1000,11 @@ function buildGhosttyRenderer(options: CreateTerminalRendererOptions): TerminalR
     fit,
     search: noopSearch(),
     getInputElement: (host) => terminal.textarea ?? host.querySelector<HTMLTextAreaElement>("textarea") ?? undefined,
-    isActivationTarget: (target) => Boolean(target.closest("canvas") || target.closest(".terminal-frame")),
+    isActivationTarget: (target) => Boolean(
+      target.closest("canvas") ||
+      target.closest(".terminal-host") ||
+      target.closest(".terminal-frame"),
+    ),
     setOptions: (nextOptions) => {
       const terminalOptions = terminal.options as unknown as Record<string, unknown>;
       for (const [key, value] of Object.entries(nextOptions)) {

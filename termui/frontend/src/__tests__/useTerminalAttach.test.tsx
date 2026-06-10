@@ -206,6 +206,7 @@ function useReconnectHarness(input: {
       attached,
     ],
   });
+  controller.attachReconnectHandlerRef.current = scheduleReconnect;
 
   return { controller, attachClientRef, scheduleReconnect };
 }
@@ -441,6 +442,73 @@ describe("useTerminalAttach snapshot reveal intent", () => {
 });
 
 describe("useTerminalReceiveLoop", () => {
+  it("tail reconnect 遇到空 attach_sync 且 base_seq 前跳时会升级成 full snapshot", async () => {
+    const output: TerminalOutputItem[] = [];
+    const initialClient = new FakeDirectClient();
+    const gapReconnectClient = new FakeDirectClient([
+      {
+        type: "attach_frame",
+        payload: buildAttachFramePayload(
+          SESSION_ID,
+          encodeSupervisorTerminalServerFrame({
+            type: "attach_sync",
+            session_id: SESSION_ID,
+            base_seq: 22,
+            snapshot: {
+              size: DEFAULT_SIZE,
+              process_id: 7,
+              retained_output_bytes: new Uint8Array(),
+            },
+            frames: [],
+          }),
+        ),
+      },
+    ]);
+    const fullSnapshotReconnectClient = new FakeDirectClient([terminalSnapshot("history-after-gap\n")]);
+    const reconnectClients = [gapReconnectClient, fullSnapshotReconnectClient];
+    const authenticatedClient = vi.fn(async () => {
+      const client = reconnectClients.shift();
+      if (!client) {
+        throw new Error("unexpected reconnect client request");
+      }
+      return asDirectClient(client);
+    });
+    const { result, unmount } = renderHook(() => useReconnectHarness({
+      authenticatedClient,
+      output,
+      reconnectDelaysMs: [0, 0],
+    }));
+
+    act(() => {
+      result.current.controller.attachedSessionRef.current = SESSION_ID;
+      result.current.controller.lastRenderedTerminalSeqRef.current.set(SESSION_ID, 5);
+      result.current.attachClientRef.current = asDirectClient(initialClient);
+      expect(result.current.scheduleReconnect(
+        asDirectClient(initialClient),
+        new ProtocolClientError("connection_closed", "tail reconnect"),
+      )).toBe(true);
+    });
+
+    await waitFor(() => expect(gapReconnectClient.attachCalls).toHaveLength(1));
+    await waitFor(() => expect(fullSnapshotReconnectClient.attachCalls).toHaveLength(1));
+    expect(gapReconnectClient.attachCalls[0]?.options.lastTerminalSeq).toBe(5);
+    expect(fullSnapshotReconnectClient.attachCalls[0]?.options.lastTerminalSeq).toBeUndefined();
+    await waitFor(() => {
+      expect(output).toEqual([
+        expect.objectContaining({
+          kind: "snapshot",
+          revealHistory: false,
+        }),
+      ]);
+    });
+
+    act(() => {
+      result.current.controller.receiveLoopActiveRef.current = false;
+      result.current.controller.receiveLoopGenerationRef.current += 1;
+    });
+    unmount();
+  });
+
   it("跟随 terminal cwd 时收到 session_cwd_changed 会静默重拉 session.files", async () => {
     const loadSessionFiles = vi.fn(async () => undefined);
     const requestFollowSessionFilesRefresh = vi.fn(async () => undefined);

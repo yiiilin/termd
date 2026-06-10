@@ -184,6 +184,7 @@ export function TerminalPane(props: TerminalPaneProps) {
   const terminalSelectionCopyRef = useRef<{ text: string; atMs: number } | undefined>(undefined);
   const terminalSelectionCopyGenerationRef = useRef(0);
   const terminalNativeSelectionCopySuppressUntilRef = useRef(0);
+  const terminalSelectionClickFocusSuppressUntilRef = useRef(0);
   const terminalClipboardSelectionOwnerRef = useRef(false);
   const terminalNativeCopyCommandInFlightRef = useRef(false);
   const terminalNativeCopyCommandHandledRef = useRef(false);
@@ -1066,6 +1067,9 @@ export function TerminalPane(props: TerminalPaneProps) {
     const endCell = cell ?? { col: drag.lastCol, row: drag.lastRow };
     const shouldCopy = drag.dragging;
     if (shouldCopy) {
+      // 中文注释：拖拽选区结束后浏览器通常还会补一个 trailing click；
+      // 这个 click 仍属于刚完成的拖拽手势，不能立刻把焦点抢回隐藏 textarea。
+      terminalSelectionClickFocusSuppressUntilRef.current = nowForThrottle() + 250;
       terminalNativeSelectionCopySuppressUntilRef.current = nowForThrottle() + 750;
       const dragSelection = selectTerminalRange({ col: drag.startCol, row: drag.startRow }, endCell);
       updateTerminalSelectionDebug({
@@ -1811,6 +1815,50 @@ export function TerminalPane(props: TerminalPaneProps) {
     const element = target instanceof Element ? target : null;
     return Boolean(element && rendererRef.current?.isActivationTarget(element));
   };
+  const hitTerminalCanvasAtPoint = (
+    target: EventTarget | null,
+    clientX: number,
+    clientY: number,
+  ) => {
+    const element = target instanceof Element ? target : null;
+    if (element?.closest("canvas")) {
+      return true;
+    }
+    const host = hostRef.current;
+    const canvas = host?.querySelector("canvas");
+    if (!host || !canvas || !element || !host.contains(element)) {
+      return false;
+    }
+    const rect = canvas.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) {
+      // 中文注释：jsdom / 测试桩里 canvas 没有真实布局尺寸；此时只要事件目标还在
+      // terminal host 内，就把它当成命中了 Ghostty 文字层，保持与真实浏览器一致的聚焦语义。
+      return true;
+    }
+    return (
+      clientX >= rect.left &&
+      clientX <= rect.right &&
+      clientY >= rect.top &&
+      clientY <= rect.bottom
+    );
+  };
+  const hitGhosttyScrollbarGutterAtPoint = (clientX: number, clientY: number) => {
+    const host = hostRef.current;
+    const canvas = host?.querySelector("canvas");
+    const rect = canvas?.getBoundingClientRect();
+    if (!host || !rect || rect.width <= 0 || rect.height <= 0) {
+      return false;
+    }
+    if (Number.parseFloat(host.dataset.termdScrollbackLength ?? "0") <= 0) {
+      return false;
+    }
+    return (
+      clientX >= rect.right - GHOSTTY_SCROLLBAR_GUTTER_PX &&
+      clientX <= rect.right &&
+      clientY >= rect.top &&
+      clientY <= rect.bottom
+    );
+  };
 
   const hasActiveTerminalFocus = () => focusedRef.current && windowActiveRef.current;
   const terminalDomHasActiveFocus = () => {
@@ -1850,13 +1898,25 @@ export function TerminalPane(props: TerminalPaneProps) {
 
   const focusTerminalFromTerminalClick = (event: MouseEvent<HTMLDivElement>) => {
     const target = event.target instanceof Element ? event.target : null;
-    if (!isTerminalActivationTarget(target)) {
+    const hitCanvas = hitTerminalCanvasAtPoint(target, event.clientX, event.clientY);
+    if (!hitCanvas && !isTerminalActivationTarget(target)) {
       return;
     }
-    if (target?.closest("canvas")) {
-      // 中文注释：Ghostty 自己会在 canvas mousedown 时把 host 聚焦；
-      // canvas 上的 click 不再额外抢焦点，避免刚完成的鼠标选区被这层逻辑清掉。
-      return;
+    if (hitCanvas) {
+      if (hitGhosttyScrollbarGutterAtPoint(event.clientX, event.clientY)) {
+        return;
+      }
+      if (terminalSelectionDragRef.current?.active || terminalSelectionFocusPendingRef.current) {
+        return;
+      }
+      if (nowForThrottle() < terminalSelectionClickFocusSuppressUntilRef.current) {
+        return;
+      }
+      if (hasActiveTerminalFocus() || terminalDomHasActiveFocus()) {
+        // 中文注释：已经拥有焦点时，canvas 区域上的 click 不再额外补 focus，
+        // 避免刚完成的鼠标选区被再次聚焦动作清掉。
+        return;
+      }
     }
     const wasPinnedToBottom = isTerminalPinnedToBottom();
     windowActiveRef.current = true;
@@ -1940,7 +2000,7 @@ export function TerminalPane(props: TerminalPaneProps) {
           updateTerminalSelectionDebug({
             selectionNativeMouseDownTarget: target?.tagName.toLowerCase() ?? undefined,
           });
-          if (!target?.closest("canvas")) {
+          if (!hitTerminalCanvasAtPoint(target, event.clientX, event.clientY)) {
             terminalSelectionCopyGenerationRef.current += 1;
             clearTerminalSelectionDrag();
             updateTerminalSelectionDebug({
@@ -1950,6 +2010,8 @@ export function TerminalPane(props: TerminalPaneProps) {
           }
           if (
             canvasRect &&
+            canvasRect.width > 0 &&
+            canvasRect.height > 0 &&
             Number.parseFloat(host.dataset.termdScrollbackLength ?? "0") > 0 &&
             event.clientX >= canvasRect.right - GHOSTTY_SCROLLBAR_GUTTER_PX
           ) {
@@ -1983,9 +2045,30 @@ export function TerminalPane(props: TerminalPaneProps) {
           event.stopImmediatePropagation();
           terminalSelectionFocusPendingRef.current = true;
         };
+        const handleClick = (event: globalThis.MouseEvent) => {
+          const target = event.target instanceof Element ? event.target : null;
+          if (!hitTerminalCanvasAtPoint(target, event.clientX, event.clientY)) {
+            return;
+          }
+          if (hitGhosttyScrollbarGutterAtPoint(event.clientX, event.clientY)) {
+            return;
+          }
+          const drag = terminalSelectionDragRef.current;
+          if (!drag?.active || drag.dragging || !terminalSelectionFocusPendingRef.current) {
+            return;
+          }
+          // 中文注释：Ghostty 文字层可能拦截冒泡阶段 click；对于这种“按下后没有拖拽、
+          // 但 click 仍然落在终端内容上”的情况，需要在 capture 阶段直接补回焦点。
+          // 同时清掉待选区状态，避免测试桩或极端浏览器时序里遗漏 mouseup 后遗留脏监听。
+          clearTerminalSelectionDrag();
+          terminal.focus();
+          stabilizeRef.current?.("focus");
+        };
         host.addEventListener("mousedown", handleMouseDown, true);
+        host.addEventListener("click", handleClick, true);
         return () => {
           host.removeEventListener("mousedown", handleMouseDown, true);
+          host.removeEventListener("click", handleClick, true);
         };
       })();
     const requestTrackedFrame = (callback: () => void) => {

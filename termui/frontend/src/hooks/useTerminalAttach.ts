@@ -237,10 +237,39 @@ export function useTerminalReceiveLoop(
             const frameBytes = payload.data_bytes ?? sessionDataFromBase64(payload.data_base64 ?? "");
             const frame = decodeSupervisorTerminalServerFrame(frameBytes);
             if (frame.type === "attach_sync") {
-              markSessionPrimed(frame.session_id);
-              applyConfirmedSessionSize(frame.session_id, frame.snapshot.size);
+              const previousRenderedSeq = lastRenderedTerminalSeqRef.current.get(frame.session_id);
               const fullSnapshotToken = terminalSnapshotClientFullSnapshotTokensRef.current.get(client);
               const snapshotToken = fullSnapshotToken?.sessionId === frame.session_id ? fullSnapshotToken.token : undefined;
+              const hasSnapshotSeed =
+                snapshotToken !== undefined ||
+                frame.snapshot.retained_output_bytes.byteLength > 0 ||
+                frame.frames.some((terminalFrame) => terminalFrame.kind === "snapshot");
+              if (
+                !hasSnapshotSeed &&
+                snapshotToken === undefined &&
+                previousRenderedSeq !== undefined &&
+                frame.base_seq > previousRenderedSeq
+              ) {
+                const gapError = new ProtocolClientError(
+                  "terminal_resync",
+                  "attach sync advanced beyond the last rendered terminal sequence without a snapshot seed",
+                );
+                recordTermdDiagnostic("receive_loop_attach_sync_gap_requires_full_snapshot", {
+                  sessionId: frame.session_id,
+                  previousRenderedSeq,
+                  attachBaseSeq: frame.base_seq,
+                });
+                if (attachReconnectHandlerRef.current(client, gapError, {
+                  forceFullSnapshot: true,
+                  sessionId: frame.session_id,
+                })) {
+                  return;
+                }
+                setSafeError(gapError);
+                return;
+              }
+              markSessionPrimed(frame.session_id);
+              applyConfirmedSessionSize(frame.session_id, frame.snapshot.size);
               const revealToken = terminalSnapshotRevealHistoryTokensRef.current.get(frame.session_id);
               const revealHistory = snapshotToken !== undefined && revealToken === snapshotToken;
               let snapshotTokensConsumed = false;
@@ -277,10 +306,6 @@ export function useTerminalReceiveLoop(
                   size: frame.snapshot.size,
                 });
               }
-              const hasSnapshotSeed =
-                snapshotToken !== undefined ||
-                frame.snapshot.retained_output_bytes.byteLength > 0 ||
-                frame.frames.some((terminalFrame) => terminalFrame.kind === "snapshot");
               if (!hasSnapshotSeed) {
                 // 中文注释：空白 attach_sync 也是合法 bootstrap，必须先推进 base_seq。
                 enqueueTerminalOutput({

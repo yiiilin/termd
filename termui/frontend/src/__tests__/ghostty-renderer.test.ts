@@ -603,6 +603,37 @@ describe("ghostty renderer adapter", () => {
     expect(renderer.terminal.getSelection()).toBe("hist-076");
   });
 
+  it("debug dataset 复用 facade selection 语义，避免 bridge 与复制链路分裂", async () => {
+    vi.resetModules();
+    ghosttyWebMock.init.mockClear();
+    ghosttyWebMock.terminals.length = 0;
+    const { createGhosttyRenderer } = await import("../components/terminal/ghostty-renderer");
+
+    const renderer = await createGhosttyRenderer({
+      terminalOptions: { fontSize: 14, convertEol: true },
+      searchOptions: {},
+    });
+    const terminal = ghosttyWebMock.terminals[0];
+    const host = document.createElement("div");
+    renderer.terminal.open(host);
+    terminal.wasmTerm.scrollbackLength = 80;
+    terminal.viewportY = 10;
+    terminal.scrollbackLines = Array.from({ length: 80 }, (_, row) =>
+      Array.from(`hist-${String(row + 1).padStart(3, "0")}`, (ch) => ({ codepoint: ch.codePointAt(0) ?? 0, grapheme_len: 0 })),
+    );
+    terminal.screenLines = Array.from({ length: 24 }, (_, row) =>
+      Array.from(`screen-${String(row + 1).padStart(3, "0")}`, (ch) => ({ codepoint: ch.codePointAt(0) ?? 0, grapheme_len: 0 })),
+    );
+
+    renderer.terminal.selectViewportRange({ col: 0, row: 5 }, { col: 7, row: 5 });
+    (terminal as typeof terminal & { nativeSelectionText?: string }).nativeSelectionText = "";
+    terminal.renderListeners.forEach((listener) => listener());
+
+    // 中文注释：dataset 必须和 facade 读到的是同一行，不能继续回落到 raw selection 空字符串。
+    expect(host.dataset.termdHasSelection).toBe("true");
+    expect(host.dataset.termdSelection).toBe("hist-076");
+  });
+
   it("fit 使用完整 host 宽度，不沿用 ghostty-web 的 15px 滚动条预留", async () => {
     vi.resetModules();
     vi.useFakeTimers();

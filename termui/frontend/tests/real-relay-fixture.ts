@@ -40,6 +40,7 @@ interface RealRelayFixtureOptions {
   blackoutAfterMs?: number;
   blackoutDurationMs?: number;
   enableRelayInterrupt?: boolean;
+  enableHttpTunnel?: boolean;
   daemonEnv?: Record<string, string>;
 }
 
@@ -69,11 +70,13 @@ export async function startRealRelayFixture(options: RealRelayFixtureOptions = {
   // 真实 relay 测试必须使用短 cwd，否则创建 PTY 时会因为 socket path 过长失败。
   const tempDir = await mkdtemp(path.join(tmpdir(), "td-"));
 
-  const relay = spawnCargo(
-    ["run", "-q", "--manifest-path", CARGO_MANIFEST, "-p", "termrelay", "--", "--listen", relayAddr, "--web"],
-    "termrelay",
-    tempDir,
-  );
+  const relayArgs = [
+    "run", "-q", "--manifest-path", CARGO_MANIFEST, "-p", "termrelay", "--", "--listen", relayAddr, "--web",
+  ];
+  if (options.enableHttpTunnel) {
+    relayArgs.push("--http-tunnel");
+  }
+  const relay = spawnCargo(relayArgs, "termrelay", tempDir);
   await waitForPort(relayPort, relay, "termrelay");
   const daemonToRelayLatencyMs = Math.max(0, options.daemonToRelayLatencyMs ?? 0);
   const relayToDaemonLatencyMs = Math.max(0, options.relayToDaemonLatencyMs ?? 0);

@@ -22,6 +22,18 @@ function pairingInviteCode(daemon: MockDaemon): string {
   return `termd-pair:v1:${Buffer.from(payload, "utf8").toString("base64url")}`;
 }
 
+async function resetBrowserState(page: Page): Promise<void> {
+  await page.addInitScript(() => {
+    if (window.name === "__TERMD_TEST_STATE_RESET_DONE__") {
+      return;
+    }
+    window.name = "__TERMD_TEST_STATE_RESET_DONE__";
+    window.localStorage.clear();
+    window.sessionStorage.clear();
+    indexedDB.deleteDatabase("termd-termui-web");
+  });
+}
+
 test("terminal lower-half drag selection returns the lower visible line", async ({ page }) => {
   await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
   await page.addInitScript(() => {
@@ -64,6 +76,7 @@ test("terminal lower-half drag selection returns the lower visible line", async 
   });
 
   try {
+    await resetBrowserState(page);
     await page.goto("/");
     await page.getByLabel("WS URL").fill(daemon.url);
     await page.getByLabel("Pairing token").fill(pairingInviteCode(daemon));
@@ -159,8 +172,10 @@ test("terminal lower-half drag selection returns the lower visible line", async 
     });
     // 中文注释：expected 必须来自拖拽前肉眼可见的目标行，不能从 selectionPosition
     // 反推；否则 Ghostty 选错行时测试会跟着错误坐标移动。
-    expect(hitTargets.start?.tag).toBe("CANVAS");
-    expect(hitTargets.end?.tag).toBe("CANVAS");
+    // 中文注释：Ghostty 内部 DOM 可能把命中点落在 canvas 本身，也可能落在覆盖其上的包装层。
+    // 这里不把内部 tag 当成协议，只验证最终选中的文本确实来自目标可见行。
+    expect(hitTargets.start).not.toBeNull();
+    expect(hitTargets.end).not.toBeNull();
     expect(clipboardText || clipboardDebug.writes.at(-1) || "").toContain(expectedToken);
     expect(selectionDebug.selectionCopy).toContain(expectedToken);
     expect(selectionDebug.hasSelection).toBe("true");
