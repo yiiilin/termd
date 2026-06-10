@@ -5,7 +5,6 @@
 
 pub mod portable;
 pub mod supervisor;
-pub mod tmux;
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -115,7 +114,7 @@ impl CommandSpec {
 
     /// 从子进程环境中移除变量。
     ///
-    /// 这主要用于 tmux/terminal bridge，避免继承 daemon 自身的 `TMUX` 或 `TERM=dumb`
+    /// 这主要用于终端 bridge，避免继承 daemon 自身的 `TMUX` 或 `TERM=dumb`
     /// 之类运行环境后让子终端误判自己已经在另一个不可用终端里。
     pub fn remove_env(mut self, key: impl Into<String>) -> Self {
         let key = key.into();
@@ -380,10 +379,10 @@ pub trait PtyBackend: Send + Sync {
 
     /// 为一个已存在 session 创建连接级 attach client。
     ///
-    /// 中文注释：这个 handle 只表达“当前 Web terminal watcher 有一个对应的 PTY/tmux
+    /// 中文注释：这个 handle 只表达“当前 Web terminal watcher 有一个对应的连接级
     /// attach 生命周期”，不表达设备权限，也不改变 session 级 terminal_seq 输出模型。
-    /// 普通 backend 没有独立 attach client，因此默认返回 no-op handle；tmux backend 会
-    /// 覆盖为真实的 control-mode tmux client。
+    /// 普通 backend 没有独立 attach 通道，因此默认返回 no-op handle；supervisor
+    /// backend 会覆盖为真实的 attach proxy。
     fn attach_client(
         &self,
         _session_id: &str,
@@ -586,14 +585,14 @@ mod tests {
     fn command_spec_builds_program_args_env_and_cwd() {
         let command = CommandSpec::new("ssh")
             .args(["-tt", "example.com"])
-            .arg("tmux")
+            .arg("bash")
             .env("TERM", "xterm-256color")
             .env("LANG", "C.UTF-8")
             .cwd("/tmp");
 
         assert_eq!(command.program(), "ssh");
-        assert_eq!(command.args_slice(), ["-tt", "example.com", "tmux"]);
-        assert_eq!(command.argv(), ["ssh", "-tt", "example.com", "tmux"]);
+        assert_eq!(command.args_slice(), ["-tt", "example.com", "bash"]);
+        assert_eq!(command.argv(), ["ssh", "-tt", "example.com", "bash"]);
         assert_eq!(
             command.env_map().get("TERM").map(String::as_str),
             Some("xterm-256color")
@@ -609,7 +608,7 @@ mod tests {
 
     #[test]
     fn command_spec_can_remove_inherited_env() {
-        let command = CommandSpec::new("tmux")
+        let command = CommandSpec::new("sh")
             .env("TERM", "xterm-256color")
             .remove_env("TMUX");
 

@@ -272,7 +272,7 @@ function stableGhosttyFontMetrics(
     if (metricJumped) {
       // 中文注释：metrics 大幅跳变时，普通 fit 可以继续沿用上一组已验证 metrics 来避免
       // canvas 视觉抖动；但如果当前 canvas 也不能证明旧 metrics 仍然成立，就不能把它
-      // 标记为 verified stable proposal，否则会把未经验证的尺寸写回 daemon/tmux。
+      // 标记为 verified stable proposal，否则会把未经验证的尺寸写回 daemon/supervisor。
       return { metrics: previousStableMetrics, stableMetrics: previousStableMetrics, verified: false };
     }
   }

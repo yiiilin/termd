@@ -442,6 +442,88 @@ describe("useTerminalAttach snapshot reveal intent", () => {
 });
 
 describe("useTerminalReceiveLoop", () => {
+  it("大 attach_sync 处理中途变 stale 时不会把尾部 output 写进下一代终端队列", async () => {
+    const client = new FakeDirectClient([
+      {
+        type: "attach_frame",
+        payload: buildAttachFramePayload(
+          SESSION_ID,
+          encodeSupervisorTerminalServerFrame({
+            type: "attach_sync",
+            session_id: SESSION_ID,
+            base_seq: 1,
+            snapshot: {
+              size: DEFAULT_SIZE,
+              process_id: 7,
+              retained_output_bytes: new TextEncoder().encode("snapshot-before-stale\n"),
+            },
+            frames: [
+              {
+                kind: "output",
+                session_id: SESSION_ID,
+                terminal_seq: 2,
+                data_bytes: new TextEncoder().encode("late-output-1\n"),
+              },
+              {
+                kind: "output",
+                session_id: SESSION_ID,
+                terminal_seq: 3,
+                data_bytes: new TextEncoder().encode("late-output-2\n"),
+              },
+            ],
+          }),
+        ),
+      },
+    ]);
+    const output: TerminalOutputItem[] = [];
+    const controller = renderHook(() => useTerminalAttach()).result.current;
+    const attachClientRef = { current: asDirectClient(client) };
+    const sessionFilesFollowTerminalCwdRef = { current: false };
+    let enqueueCount = 0;
+    const startReceiveLoop = renderHook(() =>
+      useTerminalReceiveLoop(controller, {
+        attachClientRef,
+        sessionFilesFollowTerminalCwdRef,
+        applyConfirmedSessionSize: vi.fn(),
+        enqueueTerminalOutput: (item) => {
+          output.push(item);
+          enqueueCount += 1;
+          if (enqueueCount === 1) {
+            // 中文注释：模拟用户在旧 loop 还没处理完大 attach_sync 时切 session/reconnect。
+            // 第一帧 snapshot 已经入队后，剩余 output 必须被 generation 栅栏挡住。
+            controller.receiveLoopActiveRef.current = false;
+            controller.receiveLoopGenerationRef.current += 1;
+          }
+        },
+        isIgnoredClosingSessionError: vi.fn(() => false),
+        markNewOutputIfBackground: vi.fn(),
+        setSafeError: vi.fn(),
+        setSessionFiles: vi.fn(),
+        setSessionFilesError: vi.fn(),
+        setSessionFilesLoading: vi.fn(),
+        setSessionGit: vi.fn(),
+        setSessionGitError: vi.fn(),
+        setSessionGitLoading: vi.fn(),
+      }),
+    ).result.current;
+
+    act(() => {
+      controller.attachedSessionRef.current = SESSION_ID;
+      startReceiveLoop(asDirectClient(client));
+    });
+
+    await waitFor(() => {
+      expect(output).toHaveLength(1);
+      expect(output[0]).toEqual(expect.objectContaining({ kind: "snapshot" }));
+    });
+    await act(async () => {
+      await Promise.resolve();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(output).toHaveLength(1);
+    expect(output.some((item) => item.kind === "output")).toBe(false);
+  });
+
   it("tail reconnect 遇到空 attach_sync 且 base_seq 前跳时会升级成 full snapshot", async () => {
     const output: TerminalOutputItem[] = [];
     const initialClient = new FakeDirectClient();

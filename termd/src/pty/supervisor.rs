@@ -244,7 +244,7 @@ impl PtyBackend for SupervisorPtyBackend {
                 Ok(session)
             }
             PtyRestoreInfo::Tmux { .. } => Err(PtyError::Backend(
-                "supervisor backend cannot reconnect tmux sessions".to_owned(),
+                "supervisor backend cannot reconnect obsolete tmux restore metadata".to_owned(),
             )),
         }
     }
@@ -261,7 +261,7 @@ impl PtyBackend for SupervisorPtyBackend {
             Some(PtyRestoreInfo::UnixSocket { socket_path, .. }) => socket_path.clone(),
             Some(PtyRestoreInfo::Tmux { .. }) => {
                 return Err(PtyError::Backend(
-                    "supervisor backend cannot attach tmux sessions".to_owned(),
+                    "supervisor backend cannot attach obsolete tmux restore metadata".to_owned(),
                 ));
             }
             None => {
@@ -445,7 +445,7 @@ impl SupervisorPtySession {
             } => (socket_path.clone(), *supervisor_pid, *supervisor_status),
             PtyRestoreInfo::Tmux { .. } => {
                 return Err(PtyError::Backend(
-                    "supervisor IPC cannot reconnect tmux restore info".to_owned(),
+                    "supervisor IPC cannot reconnect obsolete tmux restore metadata".to_owned(),
                 ));
             }
         };

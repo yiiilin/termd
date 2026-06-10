@@ -1424,13 +1424,13 @@ pub struct DaemonClientSummaryPayload {
     /// 当前客户端最后上报光标所在的 session；离线或未 attach 时为空。
     #[serde(default)]
     pub cursor_session_id: Option<SessionId>,
-    /// xterm 侧上报的 1-based 行号，用于 Web 顶部 operator 列表展示。
+    /// Web 终端 renderer 上报的 1-based 行号，用于顶部 operator 列表展示。
     #[serde(default)]
     pub cursor_row: Option<u16>,
-    /// xterm 侧上报的 1-based 列号，用于 Web 顶部 operator 列表展示。
+    /// Web 终端 renderer 上报的 1-based 列号，用于顶部 operator 列表展示。
     #[serde(default)]
     pub cursor_col: Option<u16>,
-    /// xterm 是否处于聚焦状态；true 表示闪烁方块，false 表示非聚焦轮廓。
+    /// 当前 Web 终端是否处于聚焦状态；true 表示闪烁方块，false 表示非聚焦轮廓。
     #[serde(default)]
     pub cursor_focused: Option<bool>,
 }
@@ -1530,8 +1530,8 @@ pub enum TerminalFrameKind {
 
 /// packet terminal stream 的结构化帧。
 ///
-/// snapshot 是替换语义，浏览器必须 reset xterm 后写入；output/resize/exit 是
-/// `base_seq` 之后的增量 tail。不要把 snapshot 伪装成普通 `session_data`。
+/// snapshot 是替换语义，浏览器必须先 reset 当前 terminal renderer 再写入；output/resize/exit
+/// 是 `base_seq` 之后的增量 tail。不要把 snapshot 伪装成普通 `session_data`。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TerminalFramePayload {

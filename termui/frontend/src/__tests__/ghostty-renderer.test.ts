@@ -815,7 +815,7 @@ describe("ghostty renderer adapter", () => {
       terminal.rendererMetrics = { width: 4.8, height: 10, baseline: 8 };
 
       // 中文注释：这组 canvas 既解释不了当前错误 metrics，也解释不了上一组稳定 metrics；
-      // 因此不能通过 stable proposal 写回 daemon/tmux，否则刷新期间可能上报虚假分辨率。
+      // 因此不能通过 stable proposal 写回 daemon/supervisor，否则刷新期间可能上报虚假分辨率。
       expect(renderer.fit.proposeStableDimensions?.()).toBeUndefined();
     } finally {
       rectSpy.mockRestore();

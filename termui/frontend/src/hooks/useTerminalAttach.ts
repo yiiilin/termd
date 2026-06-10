@@ -21,6 +21,7 @@ import { decodeSupervisorTerminalServerFrame } from "../protocol/supervisor-term
 
 const RECEIVE_LOOP_YIELD_MESSAGES = 64;
 const RECEIVE_LOOP_YIELD_BYTES = 256 * 1024;
+const STALE_RECEIVE_LOOP_ABORT = Symbol("stale_receive_loop_abort");
 
 interface PendingFullSnapshotToken {
   reconnectKey: string;
@@ -185,6 +186,22 @@ export function useTerminalReceiveLoop(
       receiveLoopActiveRef.current &&
       receiveLoopGenerationRef.current === loopGeneration &&
       attachClientRef.current === client;
+    const throwIfLoopStale = () => {
+      if (!isCurrentLoop()) {
+        // 中文注释：disconnect/reconnect 会先推进 generation，再关闭旧 transport。
+        // 如果旧 loop 此时正在处理一个大 attach_sync/output batch，中途必须立刻停下，
+        // 不能再把旧字节排进下一代 Ghostty 队列。
+        throw STALE_RECEIVE_LOOP_ABORT;
+      }
+    };
+    const enqueueTerminalOutputIfCurrent = (item: TerminalOutputItem) => {
+      throwIfLoopStale();
+      enqueueTerminalOutput(item);
+    };
+    const applyConfirmedSessionSizeIfCurrent = (sessionId: UUID, size: TerminalSize) => {
+      throwIfLoopStale();
+      applyConfirmedSessionSize(sessionId, size);
+    };
     const primedSessions = new Set<UUID>();
     const bufferedPreSyncFrames = new Map<UUID, TerminalOutputItem[]>();
     const markSessionPrimed = (sessionId: UUID) => {
@@ -204,14 +221,14 @@ export function useTerminalReceiveLoop(
       if (options.seedSequence) {
         const firstLiveFrame = pending.find((item) => item.kind === "output" || item.kind === "resize" || item.kind === "exit");
         if (firstLiveFrame && "terminalSeq" in firstLiveFrame) {
-          enqueueTerminalOutput({
+          enqueueTerminalOutputIfCurrent({
             kind: "sync",
             baseSeq: Math.max(0, firstLiveFrame.terminalSeq - 1),
           });
         }
       }
       for (const item of pending) {
-        enqueueTerminalOutput(item);
+        enqueueTerminalOutputIfCurrent(item);
       }
     };
     const read = async () => {
@@ -227,6 +244,7 @@ export function useTerminalReceiveLoop(
           if (inner.type === "attach_frame") {
             const payload = inner.payload as AttachFramePayload;
             if (payload.session_id !== attachedSessionRef.current) {
+              throwIfLoopStale();
               markNewOutputIfBackground(payload.session_id);
               if (processedMessages >= RECEIVE_LOOP_YIELD_MESSAGES) {
                 processedMessages = 0;
@@ -269,11 +287,12 @@ export function useTerminalReceiveLoop(
                 return;
               }
               markSessionPrimed(frame.session_id);
-              applyConfirmedSessionSize(frame.session_id, frame.snapshot.size);
+              applyConfirmedSessionSizeIfCurrent(frame.session_id, frame.snapshot.size);
               const revealToken = terminalSnapshotRevealHistoryTokensRef.current.get(frame.session_id);
               const revealHistory = snapshotToken !== undefined && revealToken === snapshotToken;
               let snapshotTokensConsumed = false;
               const enqueueSnapshotFrame = (input: { bytes: Uint8Array; baseSeq: number; size: TerminalSize }) => {
+                throwIfLoopStale();
                 if (!snapshotTokensConsumed) {
                   if (revealHistory) {
                     terminalSnapshotRevealHistoryTokensRef.current.delete(frame.session_id);
@@ -287,7 +306,7 @@ export function useTerminalReceiveLoop(
                   }
                   snapshotTokensConsumed = true;
                 }
-                enqueueTerminalOutput({
+                enqueueTerminalOutputIfCurrent({
                   kind: "snapshot",
                   bytes: input.bytes,
                   baseSeq: input.baseSeq,
@@ -308,14 +327,14 @@ export function useTerminalReceiveLoop(
               }
               if (!hasSnapshotSeed) {
                 // 中文注释：空白 attach_sync 也是合法 bootstrap，必须先推进 base_seq。
-                enqueueTerminalOutput({
+                enqueueTerminalOutputIfCurrent({
                   kind: "sync",
                   baseSeq: frame.base_seq,
                 });
               }
               for (const terminalFrame of frame.frames) {
                 if (terminalFrame.kind === "snapshot") {
-                  applyConfirmedSessionSize(frame.session_id, terminalFrame.size);
+                  applyConfirmedSessionSizeIfCurrent(frame.session_id, terminalFrame.size);
                   const bytes = terminalFrame.data_bytes ?? sessionDataFromBase64(terminalFrame.data_base64 ?? "");
                   enqueueSnapshotFrame({
                     bytes,
@@ -324,20 +343,20 @@ export function useTerminalReceiveLoop(
                   });
                 } else if (terminalFrame.kind === "output") {
                   const bytes = terminalFrame.data_bytes ?? sessionDataFromBase64(terminalFrame.data_base64 ?? "");
-                  enqueueTerminalOutput({
+                  enqueueTerminalOutputIfCurrent({
                     kind: "output",
                     bytes,
                     terminalSeq: terminalFrame.terminal_seq,
                   });
                   processedBytes += bytes.byteLength;
                 } else if (terminalFrame.kind === "resize") {
-                  enqueueTerminalOutput({
+                  enqueueTerminalOutputIfCurrent({
                     kind: "resize",
                     terminalSeq: terminalFrame.terminal_seq,
                     size: terminalFrame.size,
                   });
                 } else if (terminalFrame.kind === "exit") {
-                  enqueueTerminalOutput({
+                  enqueueTerminalOutputIfCurrent({
                     kind: "exit",
                     terminalSeq: terminalFrame.terminal_seq,
                   });
@@ -347,9 +366,9 @@ export function useTerminalReceiveLoop(
             } else if (frame.type === "terminal_frame") {
               if (frame.frame.kind === "snapshot") {
                 markSessionPrimed(frame.session_id);
-                applyConfirmedSessionSize(frame.session_id, frame.frame.size);
+                applyConfirmedSessionSizeIfCurrent(frame.session_id, frame.frame.size);
                 const bytes = frame.frame.data_bytes ?? sessionDataFromBase64(frame.frame.data_base64 ?? "");
-                enqueueTerminalOutput({
+                enqueueTerminalOutputIfCurrent({
                   kind: "snapshot",
                   bytes,
                   baseSeq: frame.frame.base_seq,
@@ -370,7 +389,7 @@ export function useTerminalReceiveLoop(
                 ) {
                   bufferPreSyncFrame(frame.session_id, outputItem);
                 } else {
-                  enqueueTerminalOutput(outputItem);
+                  enqueueTerminalOutputIfCurrent(outputItem);
                   processedBytes += bytes.byteLength;
                 }
               } else if (frame.frame.kind === "resize") {
@@ -385,7 +404,7 @@ export function useTerminalReceiveLoop(
                 ) {
                   bufferPreSyncFrame(frame.session_id, resizeItem);
                 } else {
-                  enqueueTerminalOutput(resizeItem);
+                  enqueueTerminalOutputIfCurrent(resizeItem);
                 }
               } else if (frame.frame.kind === "exit") {
                 const exitItem: TerminalOutputItem = {
@@ -398,19 +417,22 @@ export function useTerminalReceiveLoop(
                 ) {
                   bufferPreSyncFrame(frame.session_id, exitItem);
                 } else {
-                  enqueueTerminalOutput(exitItem);
+                  enqueueTerminalOutputIfCurrent(exitItem);
                 }
               }
             } else if (frame.type === "heartbeat_ping") {
+              throwIfLoopStale();
               client.sendSupervisorTerminalHeartbeatPong(payload.session_id, frame.nonce);
             } else if (frame.type === "close") {
               throw new ProtocolClientError(frame.reason, frame.message ?? frame.reason);
             }
           } else if (inner.type === "session_activity") {
             const payload = inner.payload as SessionActivityPayload;
+            throwIfLoopStale();
             markNewOutputIfBackground(payload.session_id);
           } else if (inner.type === "session_cwd_changed") {
             const payload = inner.payload as SessionCwdChangedPayload;
+            throwIfLoopStale();
             if (
               payload.session_id === attachedSessionRef.current &&
               sessionFilesFollowTerminalCwdRef.current
@@ -426,6 +448,7 @@ export function useTerminalReceiveLoop(
             }
           } else if (inner.type === "session_files_result") {
             const payload = inner.payload as SessionFilesResultPayload;
+            throwIfLoopStale();
             // 中文注释：现在 cwd 变化只推轻事件，文件树由显式 `session.files` 请求回写。
             // 这里保留兼容旧 daemon 的被动结果接收路径，避免 mixed-version 场景闪退。
             if (
@@ -436,6 +459,7 @@ export function useTerminalReceiveLoop(
             }
           } else if (inner.type === "session_git_result") {
             const payload = inner.payload as SessionGitResultPayload;
+            throwIfLoopStale();
             if (payload.session_id === attachedSessionRef.current) {
               setSessionGit(payload);
               setSessionGitError(undefined);
@@ -443,7 +467,7 @@ export function useTerminalReceiveLoop(
             }
           } else if (inner.type === "session_resized") {
             const payload = inner.payload as SessionResizedPayload;
-            applyConfirmedSessionSize(payload.session_id, payload.size);
+            applyConfirmedSessionSizeIfCurrent(payload.session_id, payload.size);
           }
           if (processedMessages >= RECEIVE_LOOP_YIELD_MESSAGES || processedBytes >= RECEIVE_LOOP_YIELD_BYTES) {
             processedMessages = 0;
@@ -451,6 +475,9 @@ export function useTerminalReceiveLoop(
             await yieldToEventLoop();
           }
         } catch (caught) {
+          if (caught === STALE_RECEIVE_LOOP_ABORT) {
+            return;
+          }
           // 旧 attach 关闭可能晚于新 attach 启动；只有当前 client 的错误才能切到错误态。
           if (isCurrentLoop()) {
             const sessionId = attachedSessionRef.current;

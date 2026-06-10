@@ -3452,7 +3452,7 @@ where
         session_id: SessionId,
     ) -> Result<Option<String>, ProtocolError> {
         let Some(cwd) = self.read_session_terminal_cwd(session_id)? else {
-            // 中文注释：tmux pane cwd 可能在目录被删除或权限变化后暂时不可读。
+            // 中文注释：supervisor 上报的 terminal cwd 可能在目录被删除或权限变化后暂时不可读。
             // 这时不能继续使用上一轮成功同步的 terminal cwd cache；否则文件面板
             // 会在用户手动浏览后又被旧 cwd 拉回去。清掉内存 cache 后让调用方
             // 回退到 client history 中的最新文件面板位置。
@@ -4336,7 +4336,7 @@ pub struct ProtocolConnection {
     // 同一 cwd 每秒再推一遍，导致前端 follow 反复重拉 session.files。
     watched_cwd_paths: HashMap<SessionId, Option<String>>,
     // 中文注释：watched terminal 是连接级资源，不是设备级角色。这里保存 runtime
-    // attachment id，连接断开或 terminal stream 取消时只释放自己的 tmux client。
+    // attachment id，连接断开或 terminal stream 取消时只释放自己的 supervisor attach。
     watched_attachment_ids: HashMap<SessionId, String>,
     next_watched_attachment_number: u64,
     // 中文注释：快速切换 terminal stream 后，旧 watcher 的通知可能已经在队列里。
@@ -4912,7 +4912,7 @@ impl ProtocolConnection {
     /// 返回当前连接可订阅的 session 活动信号。
     ///
     /// activity 只告诉前端“这个 session 有新输出”，不读取 PTY 内容；这样后台 session
-    /// 可以在列表里变色，同时避免为了提示而把大块终端输出推给非当前 xterm。
+    /// 可以在列表里变色，同时避免为了提示而把大块终端输出推给非当前终端视图。
     pub fn session_activity_signals<B, V>(
         &self,
         protocol: &DaemonProtocol<B, V>,
@@ -6452,7 +6452,7 @@ impl ProtocolConnection {
     fn clear_packet_terminal_streams(&mut self) -> Vec<(SessionId, String)> {
         let mut removed_attachments = Vec::new();
         for session_id in self.packet_terminal_streams_by_session.keys() {
-            // 中文注释：packet terminal stream 表示当前 xterm 输出订阅。
+            // 中文注释：packet terminal stream 表示当前终端输出订阅。
             // 快速切换 session 时旧 stream 清掉后也必须取消 watched 状态，否则 relay/直连
             // watcher 仍会为旧 session 产生唤醒，继续占用输出队列。
             if self.watched_sessions.remove(session_id) {
@@ -6931,7 +6931,8 @@ fn command_spec_from_payload(
         return Err(ProtocolError::InvalidEnvelope);
     }
 
-    // Web 终端和 CLI attach 都按 xterm-256color 能力集启动 shell，保证颜色和补全体验一致。
+    // 中文注释：这里保留 `TERM=xterm-256color` 只是给 shell/TUI 暴露稳定能力集，
+    // 不代表 Web 端仍在使用 xterm renderer。当前浏览器 renderer 已固定为 Ghostty。
     let mut command = CommandSpec::new(program)
         .args(argv)
         .env("TERM", "xterm-256color");
@@ -8985,7 +8986,7 @@ mod tests {
         session_id: &str,
         frame: &PtyTerminalFrame,
     ) {
-        // 中文注释：fake backend 要模拟真实 tmux/supervisor 的 full snapshot；
+        // 中文注释：fake backend 要模拟真实 supervisor 权威快照；
         // 已经从 PTY 读出的 output/resize 必须进入 runtime screen mirror。
         match frame {
             PtyTerminalFrame::Output { data, .. } => {
@@ -11077,7 +11078,7 @@ mod tests {
         assert_eq!(
             backend.terminal_snapshot_count_for_session(session_id),
             0,
-            "连续 tail 仍应使用 daemon live log，避免普通 reattach 频繁 capture tmux"
+            "连续 tail 仍应使用 daemon live log，避免普通 reattach 频繁回源权威快照"
         );
 
         let mut second_connection = protocol.start_connection().0;
@@ -11244,7 +11245,7 @@ mod tests {
         assert_eq!(
             backend.terminal_snapshot_count_for_session(session_id),
             0,
-            "live bootstrap session 在 resize 后的 full snapshot 应直接复用 daemon 原始输出重建 screen，避免回源 runtime/tmux capture-pane"
+            "live bootstrap session 在 resize 后的 full snapshot 应直接复用 daemon 原始输出重建 screen，避免再次回源 runtime/supervisor"
         );
     }
 
@@ -13513,7 +13514,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_marks_tmux_restore_info_records_closed() {
+    fn startup_marks_obsolete_tmux_restore_info_records_closed() {
         let backend = FakePtyBackend::default();
         let state_path = temp_state_path("restore-tmux-session.json");
         let config = DaemonConfig::default_for_state_path(&state_path);
@@ -20113,7 +20114,7 @@ mod tests {
         assert_eq!(
             backend.attachment_starts().len(),
             1,
-            "permission-only attach 不能创建 terminal watcher 的 tmux client handle"
+            "permission-only attach 不能创建 terminal watcher 的独立 attach handle"
         );
         assert!(backend.attachment_drops().is_empty());
     }

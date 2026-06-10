@@ -235,6 +235,23 @@ describe("TerminalPane terminal sequence rendering", () => {
     expect(textarea).toHaveAttribute("aria-hidden", "true");
   });
 
+  it("可见 Terminal input 获得焦点时会桥接到真实输入 textarea", async () => {
+    renderTerminalPaneWithOutput([]);
+
+    const terminalInput = screen.getByRole("textbox", { name: "Terminal input" });
+    const textarea = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
+    expect(textarea).not.toBeNull();
+
+    act(() => {
+      terminalInput.focus();
+    });
+
+    // 中文注释：Playwright 和部分浏览器会先把 focus 落到外层 host。
+    // TerminalPane 必须把它桥接到 Ghostty 的真实输入 textarea，否则外观看似已聚焦，
+    // 键盘事件却不会进入终端。
+    await waitFor(() => expect(document.activeElement).toBe(textarea));
+  });
+
   it("snapshot 后推进 base seq，连续 output 正常写入并推进 terminal_seq", async () => {
     const onTerminalSeqRendered = vi.fn();
 
@@ -1330,7 +1347,7 @@ describe("TerminalPane terminal sequence rendering", () => {
     }
   });
 
-  it("tmux 全屏重绘导致 Ghostty 无 scrollback 时会在稳定窗口后主动请求一次 snapshot resync", async () => {
+  it("全屏程序重绘导致 Ghostty 无 scrollback 时会在稳定窗口后主动请求一次 snapshot resync", async () => {
     vi.useFakeTimers();
     try {
       const onTerminalResync = vi.fn();
@@ -1353,7 +1370,7 @@ describe("TerminalPane terminal sequence rendering", () => {
       }).__TERMD_TEST_GHOSTTY__;
       expect(Ghostty?.baseY()).toBe(0);
       // 中文注释：自动补历史只在输出稳定一小段时间后触发，避免 relay 恢复期的
-      // 暂态输出被误判成 tmux 全屏重绘。
+      // 暂态输出被误判成全屏程序重绘。
       expect(onTerminalResync).toHaveBeenCalledTimes(0);
 
       act(() => {
@@ -2189,7 +2206,7 @@ describe("TerminalPane terminal sequence rendering", () => {
     }
   });
 
-  it("tmux 全屏 resync 等待 snapshot 期间不会按 cooldown 周期重复请求", async () => {
+  it("全屏程序 resync 等待 snapshot 期间不会按 cooldown 周期重复请求", async () => {
     vi.useFakeTimers();
     try {
       const onTerminalResync = vi.fn();
@@ -2683,7 +2700,7 @@ describe("TerminalPane terminal sizing", () => {
       });
 
       // 中文注释：浏览器 reload/focus 时布局可能先给出临时行列，再稳定到最终行列。
-      // 对 shared PTY 只能上报最终行列，避免 tmux/daemon 被中间尺寸来回 resize。
+      // 对 shared PTY 只能上报最终行列，避免 supervisor/daemon 被中间尺寸来回 resize。
       expect(onResize.mock.calls.map(([size]) => `${size.cols}x${size.rows}`)).toEqual(["101x31"]);
     } finally {
       vi.useRealTimers();

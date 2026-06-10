@@ -6352,15 +6352,15 @@ describe("termui web 工作台", () => {
     daemon = await MockDaemon.start({
       token: "secret-token",
       sessions: [],
-      attachOutput: "direct-tmux-ready\n",
+      attachOutput: "direct-supervisor-ready\n",
       sessionFiles: {
         [sessionId]: {
           session_id: sessionId,
-          path: "/tmp/direct-tmux-cwd",
+          path: "/tmp/direct-supervisor-cwd",
           entries: [
             {
               name: "direct.txt",
-              path: "/tmp/direct-tmux-cwd/direct.txt",
+              path: "/tmp/direct-supervisor-cwd/direct.txt",
               kind: "file",
               size_bytes: 12,
               modified_at_ms: null,
@@ -6373,11 +6373,11 @@ describe("termui web 工作台", () => {
 
     await exerciseSupervisorBackedWebLifecycle(user, daemon, {
       sessionId,
-      readyText: "direct-tmux-ready",
-      cwd: "/tmp/direct-tmux-cwd",
+      readyText: "direct-supervisor-ready",
+      cwd: "/tmp/direct-supervisor-cwd",
       fileName: "direct.txt",
-      inputText: "echo direct-tmux-secret",
-      postReconnectText: "direct-tmux-after-reconnect\n",
+      inputText: "echo direct-supervisor-secret",
+      postReconnectText: "direct-supervisor-after-reconnect\n",
     });
   });
 
@@ -6388,16 +6388,16 @@ describe("termui web 工作台", () => {
     daemon = await MockDaemon.start({
       token: "secret-token",
       sessions: [],
-      attachOutput: "relay-tmux-ready\n",
+      attachOutput: "relay-supervisor-ready\n",
       relayClientPathOnly: true,
       sessionFiles: {
         [sessionId]: {
           session_id: sessionId,
-          path: "/tmp/relay-tmux-cwd",
+          path: "/tmp/relay-supervisor-cwd",
           entries: [
             {
               name: "relay.txt",
-              path: "/tmp/relay-tmux-cwd/relay.txt",
+              path: "/tmp/relay-supervisor-cwd/relay.txt",
               kind: "file",
               size_bytes: 11,
               modified_at_ms: null,
@@ -6410,13 +6410,13 @@ describe("termui web 工作台", () => {
 
     await exerciseSupervisorBackedWebLifecycle(user, daemon, {
       sessionId,
-      readyText: "relay-tmux-ready",
-      cwd: "/tmp/relay-tmux-cwd",
+      readyText: "relay-supervisor-ready",
+      cwd: "/tmp/relay-supervisor-cwd",
       fileName: "relay.txt",
-      inputText: "echo relay-tmux-secret",
-      postReconnectText: "relay-tmux-after-reconnect\n",
+      inputText: "echo relay-supervisor-secret",
+      postReconnectText: "relay-supervisor-after-reconnect\n",
     });
-    expect(daemon.outerWireText()).not.toContain("relay-tmux-secret");
+    expect(daemon.outerWireText()).not.toContain("relay-supervisor-secret");
   });
 
   it("pairing 失败后清空 token，错误 UI 和 outer wire 都不泄漏敏感字段", async () => {

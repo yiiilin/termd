@@ -48,8 +48,6 @@ Progress must be tracked in this file only:
   - 结果：通过。用于确认 `#[cfg(test)]` 收口后生产构建仍然可编译。
 - `cargo test -p termd --lib --quiet`
   - 结果：通过，`412 passed; 0 failed; 20 ignored`。
-- `cargo test -p termd --test tmux_backend --quiet`
-  - 结果：通过，`16 passed; 0 failed`。
 - `cargo test -p termd-proto --lib binary_protocol_packet_attach_frame_carries_raw_bytes_without_base64 -- --nocapture`
   - 结果：通过，`1 passed; 0 failed`。
 - `pnpm --dir termui/frontend exec vitest run`
@@ -65,3 +63,4 @@ Progress must be tracked in this file only:
 补充说明：
 - `termd` 生产构建下已不再持有/消费 daemon-side terminal mirror；该类 legacy/search 辅助逻辑仅保留在 `#[cfg(test)]` 测试路径，用于覆盖旧单测和回归夹具。
 - `session.attach` 已收敛为 workspace 权限附着；`terminal.attach` / `terminal.create` 才负责 watched attachment 与 opaque attach bootstrap。
+- 后续收口清理见 [2026-06-10-supervisor-final-cleanup.md](2026-06-10-supervisor-final-cleanup.md)；其中会移除剩余 tmux backend 代码树与过期口径。

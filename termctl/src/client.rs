@@ -68,8 +68,8 @@ pub struct TerminalStream {
     next_send_seq: u64,
     last_recv_seq: u64,
     last_terminal_seq: Option<u64>,
-    // 中文注释：一个 terminal stream chunk 现在可能携带 batch；termctl 没有 xterm 队列，
-    // 所以需要把同一 packet 解出的 Output/End 事件按顺序暂存在本地。
+    // 中文注释：一个 terminal stream chunk 现在可能携带 batch；termctl 没有浏览器端
+    // renderer 写入队列，所以需要把同一 packet 解出的 Output/End 事件按顺序暂存在本地。
     pending_events: VecDeque<TerminalStreamEvent>,
 }
 
@@ -444,7 +444,7 @@ impl DirectClient {
                         let (events, credit) = terminal_frame_events_and_credit(frame)?;
                         self.send_packet(stream.flow_packet(packet.seq, credit))
                             .await?;
-                        // termctl 没有 xterm 渲染队列；它把 snapshot/output 都作为 stdout bytes 输出。
+                        // termctl 没有浏览器端渲染队列；它把 snapshot/output 都作为 stdout bytes 输出。
                         // resize 只更新远端终端状态，不产生本地字节；exit 则结束流。
                         // 只有 flow ack 成功后才推进 resume 序号，避免 ack 失败重连时跳过未确认帧。
                         stream.record_terminal_progress(terminal_progress);

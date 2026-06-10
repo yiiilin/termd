@@ -967,7 +967,7 @@ export function TerminalPane(props: TerminalPaneProps) {
     if (shouldRestoreFocus && !wasDragging) {
       terminalSelectionFocusPendingRef.current = false;
       window.requestAnimationFrame(() => {
-        terminalRef.current?.focus();
+        focusTerminalInputSink();
       });
     }
   };
@@ -1184,7 +1184,7 @@ export function TerminalPane(props: TerminalPaneProps) {
           // 中文注释：自动 scrollback 预取只应该发生在输出真正稳定之后。
           // 刚 attach/reconnect/relay 恢复完成时，Ghostty 很容易短暂处于
           // “baseY=0 但画面还在追平”的中间态；这里等待一个 idle settle window，
-          // 避免把暂态误判成 tmux 全屏重绘，从而过早触发 full snapshot 重连。
+          // 避免把暂态误判成全屏程序重绘，从而过早触发 full snapshot 重连。
           terminalServerScrollbackResyncIdleTimerRef.current = window.setTimeout(() => {
             terminalServerScrollbackResyncIdleTimerRef.current = undefined;
             const retryScrollState = rendererRef.current?.scrollState(terminalRef.current ?? undefined);
@@ -1421,7 +1421,7 @@ export function TerminalPane(props: TerminalPaneProps) {
     onInputRef.current(data);
     queueCursorReport({ immediate: true });
     if (mobileInputModeRef.current) {
-      terminalRef.current?.focus();
+      focusTerminalInputSink();
     }
   };
 
@@ -1472,7 +1472,7 @@ export function TerminalPane(props: TerminalPaneProps) {
     // daemon 返回的是本次 snapshot 内的行号；renderer buffer 尾部与 snapshot 尾部对齐。
     const firstSnapshotLine = Math.max(0, scrollState.length - result.line_count);
     terminal.scrollToLine(clampNumber(firstSnapshotLine + match.line_index, 0, Math.max(0, scrollState.length - 1)));
-    terminal.focus();
+    focusTerminalInputSink(terminal);
   };
 
   const stepSearchResult = (direction: 1 | -1) => {
@@ -1507,7 +1507,7 @@ export function TerminalPane(props: TerminalPaneProps) {
     event.stopPropagation();
     focusActivationArmedRef.current = true;
     suppressPassiveFocusRef.current = false;
-    terminalRef.current?.focus();
+    focusTerminalInputSink();
   };
 
   const sendNativePasteText = (text: string) => {
@@ -1531,11 +1531,11 @@ export function TerminalPane(props: TerminalPaneProps) {
       if (text) {
         sendTerminalControl(text);
       } else {
-        terminalRef.current?.focus();
+        focusTerminalInputSink();
       }
     } catch {
       // 剪贴板读取可能被浏览器权限或非安全上下文拒绝；失败时只保持终端焦点。
-      terminalRef.current?.focus();
+      focusTerminalInputSink();
     }
   };
 
@@ -1676,7 +1676,7 @@ export function TerminalPane(props: TerminalPaneProps) {
       gesture.lastStepY = gesture.startY;
       setMobileDirectionActive(true);
       setMobileDirection(undefined);
-      terminalRef.current?.focus();
+      focusTerminalInputSink();
     }
     event.preventDefault();
     event.stopPropagation();
@@ -1896,6 +1896,29 @@ export function TerminalPane(props: TerminalPaneProps) {
     queueCursorReport({ immediate: true });
   };
 
+  const resolveTerminalInputElement = (host: HTMLElement | null = hostRef.current) => {
+    if (!host) {
+      return undefined;
+    }
+    return rendererRef.current?.getInputElement(host);
+  };
+
+  const focusTerminalInputSink = (terminal: TerminalRendererTerminal | null = terminalRef.current) => {
+    terminal?.focus();
+    const input = resolveTerminalInputElement();
+    if (!input || document.activeElement === input) {
+      return;
+    }
+    // 中文注释：真实浏览器和 ghostty-web 在高负载或慢布局时，外层 host 可能先拿到
+    // focus，但真正接收键盘事件的隐藏 textarea 还没跟上。这里显式桥接到输入 sink，
+    // 避免“看起来已聚焦、实际上打不进字符”的状态。
+    try {
+      input.focus({ preventScroll: true });
+    } catch {
+      input.focus();
+    }
+  };
+
   const focusTerminalFromTerminalClick = (event: MouseEvent<HTMLDivElement>) => {
     const target = event.target instanceof Element ? event.target : null;
     const hitCanvas = hitTerminalCanvasAtPoint(target, event.clientX, event.clientY);
@@ -1925,7 +1948,7 @@ export function TerminalPane(props: TerminalPaneProps) {
     focusActivationArmedRef.current = false;
     suppressPassiveFocusRef.current = false;
     reportTerminalFocus(true);
-    terminalRef.current?.focus();
+    focusTerminalInputSink();
     resizeRef.current?.("focus");
     // 当前客户端接管 PTY 尺寸时，只在用户本来就在底部时继续贴底。
     // 用户已经上滚查看历史时，点击空白处应该只聚焦终端，不能强行跳到最新输出。
@@ -1955,7 +1978,7 @@ export function TerminalPane(props: TerminalPaneProps) {
     }
     focusActivationArmedRef.current = true;
     suppressPassiveFocusRef.current = false;
-    terminalRef.current?.focus();
+    focusTerminalInputSink();
     stabilizeRef.current?.("focus");
     if (requestId !== undefined && pendingFocusRequestRef.current === requestId) {
       pendingFocusRequestRef.current = undefined;
@@ -2034,7 +2057,7 @@ export function TerminalPane(props: TerminalPaneProps) {
             selectionNativeMouseDownStarted: String(started),
           });
           if (!started) {
-            terminal.focus();
+            focusTerminalInputSink(terminal);
             stabilizeRef.current?.("focus");
             return;
           }
@@ -2061,7 +2084,7 @@ export function TerminalPane(props: TerminalPaneProps) {
           // 但 click 仍然落在终端内容上”的情况，需要在 capture 阶段直接补回焦点。
           // 同时清掉待选区状态，避免测试桩或极端浏览器时序里遗漏 mouseup 后遗留脏监听。
           clearTerminalSelectionDrag();
-          terminal.focus();
+          focusTerminalInputSink(terminal);
           stabilizeRef.current?.("focus");
         };
         host.addEventListener("mousedown", handleMouseDown, true);
@@ -2085,7 +2108,7 @@ export function TerminalPane(props: TerminalPaneProps) {
       }
       // 中文注释：真实浏览器里 terminal.focus() 到 host/textarea 变成 activeElement
       // 之间可能还隔着一轮布局；focusRequest/显式点击触发的首轮 focus resize 不能因为
-      // 这个短暂窗口被吞掉，否则 tmux 会继续维持旧 rows/cols，首屏就会按旧网格乱掉。
+      // 这个短暂窗口被吞掉，否则共享 PTY 仍会维持旧 rows/cols，首屏就会按旧网格乱掉。
       return windowActiveRef.current && focusActivationArmedRef.current;
     };
     const canReportLocalResizeForSource = (source: ResizeSource | undefined) => {
@@ -2191,6 +2214,27 @@ export function TerminalPane(props: TerminalPaneProps) {
       // 对用户和 Playwright role locator 来说，外层 host 才是唯一可见终端输入框。
       helperTextarea.setAttribute("aria-hidden", "true");
     }
+    const handleHostFocusBridge = (event: FocusEvent) => {
+      const target = event.target;
+      if (!(target instanceof HTMLElement)) {
+        return;
+      }
+      if (target !== host && target !== terminal.element) {
+        return;
+      }
+      if (terminalSelectionDragRef.current?.active || terminalSelectionFocusPendingRef.current) {
+        return;
+      }
+      if (!helperTextarea || document.activeElement === helperTextarea) {
+        return;
+      }
+      try {
+        helperTextarea.focus({ preventScroll: true });
+      } catch {
+        helperTextarea.focus();
+      }
+    };
+    host.addEventListener("focusin", handleHostFocusBridge, true);
     const isMobileCompositionInput = (event: InputEvent) => {
       const inputType = event.inputType.toLowerCase();
       const recentlyEnded =
@@ -2791,6 +2835,7 @@ export function TerminalPane(props: TerminalPaneProps) {
       helperTextarea?.removeEventListener("compositionend", handleMobileCompositionEnd, true);
       helperTextarea?.removeEventListener("beforeinput", handleMobileBeforeInput, true);
       helperTextarea?.removeEventListener("paste", handleMobilePaste, true);
+      host.removeEventListener("focusin", handleHostFocusBridge, true);
       terminalFrame?.removeEventListener("wheel", handleTerminalWheel, true);
       document.removeEventListener("keydown", handleTerminalCopyShortcut, true);
       document.removeEventListener("copy", handleTerminalCopyEvent, true);

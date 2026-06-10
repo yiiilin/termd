@@ -349,12 +349,12 @@ impl fmt::Display for StateError {
             } => match found {
                 Some(found) => write!(
                     f,
-                    "daemon state at {} uses schema version {found}, expected {expected}; reset state before using the tmux backend",
+                    "daemon state at {} uses schema version {found}, expected {expected}; reset state before using the current supervisor runtime",
                     path.display()
                 ),
                 None => write!(
                     f,
-                    "daemon state at {} was created before schema version {expected}; reset state before using the tmux backend",
+                    "daemon state at {} was created before schema version {expected}; reset state before using the current supervisor runtime",
                     path.display()
                 ),
             },
@@ -733,8 +733,8 @@ fn save_sqlite_state(
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|source| sqlite_error(path, source))?;
 
-    // 中文注释：v2 开始进入 tmux 作为 session 真相源的重构阶段；旧 supervisor
-    // restore state 不能静默复用，所以每次保存都写入显式 schema 版本。
+    // 中文注释：这里显式写 schema version，避免旧阶段遗留的 restore state 被当前
+    // supervisor-only runtime 静默复用。
     upsert_meta_value(
         &tx,
         path,
@@ -1299,7 +1299,7 @@ mod tests {
     }
 
     #[test]
-    fn old_legacy_json_state_is_rejected_after_tmux_schema_bump() {
+    fn old_legacy_json_state_is_rejected_after_supervisor_schema_bump() {
         let state_path = temp_path("old-legacy-state.json");
         let mut legacy_state = sample_state();
         legacy_state.version = 1;

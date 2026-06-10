@@ -439,8 +439,8 @@ pub fn try_default_protocol(config: DaemonConfig) -> Result<SharedDaemonProtocol
     let state = StateStore::load(&config.state_path)?;
     cleanup_persisted_session_file_http_uploads(&config.state_path)?;
     let supervisor_backend = SupervisorPtyBackend::for_state_path(&config.state_path);
-    // 中文注释：生产路径现在只接受 supervisor Unix socket restore_info；旧 tmux 时代
-    // 遗留的 live supervisor 仍只做孤儿告警，不能再被默认启动路径自动接回运行态。
+    // 中文注释：生产路径现在只接受 supervisor Unix socket restore_info；旧阶段遗留的
+    // live supervisor 仍只做孤儿告警，不能再被默认启动路径自动接回运行态。
     let valid_supervisor_session_ids = state
         .sessions
         .iter()
@@ -3447,8 +3447,8 @@ mod tests {
             std::process::id(),
             current_unix_timestamp_millis().0
         ));
-        // 中文注释：tmux backend 会把 socket 放在 state path 边界内。server 单测仍使用
-        // 独立目录，避免并发测试或遗留 socket 影响同一组 daemon 状态。
+        // 中文注释：server 单测仍使用独立目录，避免并发测试或遗留 supervisor socket
+        // 影响同一组 daemon 状态。
         fs::create_dir_all(&state_dir).unwrap();
         DaemonConfig::default_for_state_path(state_dir.join("daemon-state.json"))
     }

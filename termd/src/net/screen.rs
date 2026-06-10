@@ -439,7 +439,7 @@ impl TerminalScreen {
 
         if let Some(normal_screen) = &self.normal_screen {
             // 中文注释：alternate screen attach 不能只恢复 TUI 当前页。先把普通屏写入
-            // xterm，再切到 alternate screen，后续 TUI 退出时浏览器终端才能恢复普通屏。
+            // 终端模拟器，再切到 alternate screen，后续 TUI 退出时浏览器终端才能恢复普通屏。
             output.extend_from_slice(&snapshot_state_bytes(
                 &normal_screen.lines,
                 self.rows,
@@ -614,7 +614,7 @@ impl TerminalScreen {
                     // 中文注释：`ESC ( B` / `ESC ) 0` / `ESC # 8` 这类带 intermediate
                     // byte 的 escape 序列，不应该把最终字节当正文打印出来。
                     // 轻量 screen mirror 目前不完整模拟这些模式切换，所以只吞掉整条
-                    // 序列，并把 full snapshot 权威性交回 runtime/tmux。
+                    // 序列，并把 full snapshot 权威性交回 runtime/supervisor。
                     self.clear_pending_control();
                     ParserState::Ground
                 };
@@ -1028,7 +1028,7 @@ impl TerminalScreen {
         let cursor_row = self.cursor_row.min(self.rows - 1);
         let cursor_col = self.cursor_col.min(self.cols - 1);
 
-        // 中文注释：浏览器上滚时可能触发一次 full snapshot 回源 tmux/daemon。
+        // 中文注释：浏览器上滚时可能触发一次 full snapshot 回源 supervisor/daemon。
         // 如果这里继续把 `CSI 2J` 之前的普通屏内容保留成 scrollback，用户执行
         // `clear` 后再上滚，旧内容仍会回流。这里直接重建当前 screen buffer，让
         // clear 成为新的历史边界，同时保留当前样式和光标位置。
@@ -1294,7 +1294,7 @@ fn snapshot_state_bytes(
     output.extend_from_slice(&saved_cursor_restore_bytes(saved_cursor, cols, rows));
     output.extend_from_slice(cursor_position_bytes(cursor_row, cursor_col, cols).as_bytes());
     // 中文注释：snapshot 写完内容后必须恢复当前 SGR 状态；否则后续 tail 如果依赖
-    // 终端里仍处于红色/背景色等状态，重新 attach 的 xterm 会按默认样式继续渲染。
+    // 终端里仍处于红色/背景色等状态，重新 attach 的终端模拟器会按默认样式继续渲染。
     if !current_style.is_default() {
         output.extend_from_slice(&current_style.sgr_bytes(false));
     }
@@ -1676,7 +1676,7 @@ mod tests {
         let mut source = TerminalScreen::new(4, 20);
 
         // 中文注释：用户 attach 到 vim/top 这类 alternate screen 时，snapshot 不能只包含
-        // 当前 TUI 页；它还要先重建普通屏，这样 TUI 退出后 xterm 能恢复原来的 shell 内容。
+        // 当前 TUI 页；它还要先重建普通屏，这样 TUI 退出后终端模拟器能恢复原来的 shell 内容。
         source.apply(b"shell-1\nshell-2\x1b[?1049h\x1b[2;1HTUI");
 
         let snapshot = source.snapshot_bytes();
@@ -1719,7 +1719,7 @@ mod tests {
         let mut source = TerminalScreen::new(4, 5);
 
         // 中文注释：tail 里可能只包含后半段输出。如果 snapshot 没有恢复 wrap/origin/insert
-        // 等模式，后续 tail 会被 xterm 按错误语义解释，表现为行错位或字符插入位置错误。
+        // 等模式，后续 tail 会被终端模拟器按错误语义解释，表现为行错位或字符插入位置错误。
         source.apply(b"\x1b[?7l12345");
         let snapshot = source.snapshot_bytes();
         source.apply(b"X\x1b[2;4r\x1b[?6h\x1b[1;1HORG\x1b[4h\x1b[2;2HI");
