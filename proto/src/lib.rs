@@ -49,6 +49,7 @@ pub enum MessageType {
     SessionData,
     TerminalFrame,
     SessionActivity,
+    SessionCwdChanged,
     SessionCursor,
     SessionResize,
     SessionResized,
@@ -275,6 +276,7 @@ pub const METHOD_TERMINAL_ATTACH: &str = "terminal.attach";
 pub const METHOD_TERMINAL_OUTPUT: &str = "terminal.output";
 pub const METHOD_SESSION_DATA: &str = "session.data";
 pub const METHOD_SESSION_ACTIVITY: &str = "session.activity";
+pub const METHOD_SESSION_CWD: &str = "session.cwd";
 pub const METHOD_SESSION_CURSOR: &str = "session.cursor";
 pub const METHOD_SESSION_RESIZE: &str = "session.resize";
 pub const METHOD_SESSION_RESIZED: &str = "session.resized";
@@ -343,6 +345,7 @@ pub fn packet_event_method_for_message(kind: MessageType) -> Option<&'static str
     match kind {
         MessageType::AuthChallenge => Some(METHOD_AUTH_CHALLENGE),
         MessageType::SessionActivity => Some(METHOD_SESSION_ACTIVITY),
+        MessageType::SessionCwdChanged => Some(METHOD_SESSION_CWD),
         MessageType::SessionFilesResult => Some(METHOD_SESSION_FILES),
         MessageType::SessionGitResult => Some(METHOD_SESSION_GIT),
         MessageType::SessionResized => Some(METHOD_SESSION_RESIZED),
@@ -1532,6 +1535,15 @@ pub struct SessionActivityPayload {
     pub timestamp_ms: UnixTimestampMillis,
 }
 
+/// session 当前终端 cwd 已变化的轻量通知。
+///
+/// daemon / supervisor 只推送路径事实；更重的文件树/Git 明细仍由客户端按需向 termd 拉取。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionCwdChangedPayload {
+    pub session_id: SessionId,
+    pub cwd: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionAttachPayload {
     pub session_id: SessionId,
@@ -2369,6 +2381,7 @@ mod tests {
             (MessageType::SessionData, "session_data"),
             (MessageType::TerminalFrame, "terminal_frame"),
             (MessageType::SessionActivity, "session_activity"),
+            (MessageType::SessionCwdChanged, "session_cwd_changed"),
             (MessageType::SessionCursor, "session_cursor"),
             (MessageType::SessionResize, "session_resize"),
             (MessageType::SessionResized, "session_resized"),
@@ -2689,6 +2702,10 @@ mod tests {
         assert_roundtrip(SessionActivityPayload {
             session_id,
             timestamp_ms: UnixTimestampMillis(1_710_000_000_000),
+        });
+        assert_roundtrip(SessionCwdChangedPayload {
+            session_id,
+            cwd: "/tmp/work".to_owned(),
         });
         assert_roundtrip(SessionCursorPayload {
             session_id,
@@ -3268,6 +3285,7 @@ mod tests {
         let event_cases = [
             (MessageType::AuthChallenge, METHOD_AUTH_CHALLENGE),
             (MessageType::SessionActivity, METHOD_SESSION_ACTIVITY),
+            (MessageType::SessionCwdChanged, METHOD_SESSION_CWD),
             (MessageType::SessionFilesResult, METHOD_SESSION_FILES),
             (MessageType::SessionGitResult, METHOD_SESSION_GIT),
             (MessageType::SessionResized, METHOD_SESSION_RESIZED),

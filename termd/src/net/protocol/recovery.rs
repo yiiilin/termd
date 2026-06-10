@@ -1,8 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use tokio::sync::watch;
-
 use super::*;
 
 /// supervisor 恢复后补给协议层的可见 session 元数据。
@@ -127,12 +125,10 @@ where
         self.session_index
             .insert(wire_session_id, internal_session_id);
         self.session_output_history_mut(wire_session_id, session.size);
-        let (file_tree_signal, _) = watch::channel(0);
-        self.session_file_tree_signals
-            .insert(wire_session_id, file_tree_signal);
-        let (resize_signal, _) = watch::channel(session.size);
+        self.session_cwd_signals
+            .insert(wire_session_id, tokio::sync::watch::channel(0).0);
         self.session_resize_signals
-            .insert(wire_session_id, resize_signal);
+            .insert(wire_session_id, tokio::sync::watch::channel(session.size).0);
         self.session_roots
             .insert(wire_session_id, metadata.root_path);
         if let Some(name) = metadata.name {

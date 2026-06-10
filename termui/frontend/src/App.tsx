@@ -365,6 +365,7 @@ export default function App() {
   } = workspaceConnection;
   const {
     pendingTerminalAttachSessionRef,
+    pendingTerminalAttachAbortControllerRef,
     attachedSessionRef,
     autoAttachAttemptedSessionRef,
     attachingSessionIdRef,
@@ -837,6 +838,8 @@ export default function App() {
       client?.close();
       return false;
     }
+    pendingTerminalAttachAbortControllerRef.current?.abort();
+    pendingTerminalAttachAbortControllerRef.current = undefined;
     cancelScheduledAttachSwitch();
     closeAttachClient();
     pendingResizeKeyRef.current = undefined;
@@ -847,7 +850,7 @@ export default function App() {
       cursorRefreshTimerRef.current = undefined;
     }
     return true;
-  }, [cancelScheduledAttachSwitch, closeAttachClient]);
+  }, [cancelScheduledAttachSwitch, closeAttachClient, pendingTerminalAttachAbortControllerRef]);
 
   const flushTerminalOutput = useCallback(() => {
     terminalOutputFlushFrameRef.current = undefined;
@@ -944,6 +947,8 @@ export default function App() {
     // 中文注释：切换 session、主动断开、恢复重连都以 WebSocket 生命周期作为边界。
     // DirectClient.close 会先尽力 cancel 已知 terminal stream，再关闭 transport；即使 cancel
     // 没送达，daemon/relay 也能通过 WebSocket close 清掉旧 client context。
+    pendingTerminalAttachAbortControllerRef.current?.abort();
+    pendingTerminalAttachAbortControllerRef.current = undefined;
     closeAttachClient();
     if (attachedSessionRef.current) {
       lastRenderedTerminalSeqRef.current.delete(attachedSessionRef.current);
@@ -998,6 +1003,8 @@ export default function App() {
     resolveTerminalOutputResetWaiters();
     reattachCurrentSessionOnOpenRef.current = false;
     userDetachedRef.current = false;
+    pendingTerminalAttachAbortControllerRef.current?.abort();
+    pendingTerminalAttachAbortControllerRef.current = undefined;
     setNewOutputSessionIds(new Set());
     lastRenderedTerminalSeqRef.current.clear();
     attachedSessionRef.current = undefined;
@@ -1041,9 +1048,9 @@ export default function App() {
   }, []);
 
   const handleSaveDaemonRename = useCallback(
-    async (serverId: UUID) => {
+    async (serverId: UUID, draftValue?: string) => {
       try {
-        const nextState = await renameDaemon(serverId, daemonRenameDraft);
+        const nextState = await renameDaemon(serverId, draftValue ?? daemonRenameDraft);
         setState(nextState);
         handleCancelDaemonRename();
       } catch (caught) {
@@ -1223,7 +1230,12 @@ export default function App() {
     [activeServer?.server_id, resetWorkspaceState, state.pairedServers],
   );
 
-  const { loadSessionFiles, loadSessionGit } = useSessionFileLoaders(sessionFilesController, {
+  const {
+    loadSessionFiles,
+    loadSessionGit,
+    requestFollowSessionFilesRefresh,
+    handlePassiveSessionFilesResult,
+  } = useSessionFileLoaders(sessionFilesController, {
     authenticatedSessionClient,
     activeServerId: activeServer?.server_id,
     activeServerIdRef,
@@ -1342,12 +1354,7 @@ export default function App() {
         confirmedSessionSizesRef.current,
       );
       confirmedSessionSizesRef.current = new Map(list.sessions.map((session) => [session.session_id, session.size]));
-      const listedSessionIds = new Set(list.sessions.map((session) => session.session_id));
-      closedSessionIdsRef.current.forEach((sessionId) => {
-        if (listedSessionIds.has(sessionId)) {
-          closedSessionIdsRef.current.delete(sessionId);
-        }
-      });
+      const visibleSessions = list.sessions.filter((session) => !closedSessionIdsRef.current.has(session.session_id));
       const localKnownSessionIds = new Set([
         ...sessionsRef.current.map((session) => session.session_id),
         ...sessionOrderRef.current,
@@ -1364,15 +1371,26 @@ export default function App() {
         pendingTerminalAttachSessionRef.current ??
         selectedSessionIdRef.current ??
         attachedSessionRef.current;
-      const nextSelectedSessionId = userDetachedRef.current
-        ? undefined
-        : stickySessionId && (listedSessionIds.has(stickySessionId) || localKnownSessionIds.has(stickySessionId))
-          ? stickySessionId
-          : orderedSessions.at(0)?.session_id ?? renamingSessionIdRef.current ?? attachedSessionRef.current;
+      const nextSelectedSessionId = resolveVisibleSelectedSessionId({
+        userDetached: userDetachedRef.current,
+        stickySessionId,
+        renamingSessionId: renamingSessionIdRef.current,
+        attachedSessionId: attachedSessionRef.current,
+        visibleSessions,
+        sessionOrder: nextOrder,
+        localKnownSessionIds,
+        closedSessionIds: closedSessionIdsRef.current,
+      });
       setSessions((current) =>
         // 中文注释：旧 session.list 可能晚于本地创建、点击切换或 attach 返回。
         // 正在本地操作的 session 先以当前 React 状态为准，下一轮 daemon 权威列表会再收敛。
-        mergeSessionRefresh(list.sessions, current, preserveSessionIds, nextOrder),
+        mergeSessionRefresh(
+          visibleSessions,
+          current,
+          preserveSessionIds,
+          nextOrder,
+          closedSessionIdsRef.current,
+        ),
       );
       // 列表刷新可能晚于用户点击 session 返回；不能用“第一行”覆盖用户刚选择/正在 attach 的目标。
       selectSession(nextSelectedSessionId);
@@ -1498,22 +1516,39 @@ export default function App() {
             confirmedSessionSizesRef.current,
           );
           confirmedSessionSizesRef.current = new Map(sessionList.sessions.map((session) => [session.session_id, session.size]));
-          const listedSessionIds = new Set(sessionList.sessions.map((session) => session.session_id));
-          closedSessionIdsRef.current.forEach((sessionId) => {
-            if (listedSessionIds.has(sessionId)) {
-              closedSessionIdsRef.current.delete(sessionId);
-            }
-          });
+          const visibleSessions = sessionList.sessions.filter((session) => !closedSessionIdsRef.current.has(session.session_id));
+          const localKnownSessionIds = new Set([
+            ...sessionsRef.current.map((session) => session.session_id),
+            ...sessionOrderRef.current,
+          ]);
+          const stickySessionId =
+            attachingSessionIdRef.current ??
+            pendingTerminalAttachSessionRef.current ??
+            selectedSessionIdRef.current ??
+            attachedSessionRef.current;
           setSessions((current) =>
             // 中文注释：后台刷新不能把刚创建、刚选中或正在 attach 的本地 session 行刷成空列表。
-            mergeSessionRefresh(sessionList.sessions, current, [
+            mergeSessionRefresh(visibleSessions, current, [
               renamingSessionIdRef.current,
               pendingTerminalAttachSessionRef.current,
               attachingSessionIdRef.current,
               selectedSessionIdRef.current,
               attachedSessionRef.current,
-            ], nextOrder),
+            ], nextOrder, closedSessionIdsRef.current),
           );
+          const nextSelectedSessionId = resolveVisibleSelectedSessionId({
+            userDetached: userDetachedRef.current,
+            stickySessionId,
+            renamingSessionId: renamingSessionIdRef.current,
+            attachedSessionId: attachedSessionRef.current,
+            visibleSessions,
+            sessionOrder: nextOrder,
+            localKnownSessionIds,
+            closedSessionIds: closedSessionIdsRef.current,
+          });
+          if (nextSelectedSessionId !== selectedSessionIdRef.current) {
+            selectSession(nextSelectedSessionId);
+          }
           if (clientList) {
             setDaemonClients(clientList.clients);
           }
@@ -1682,6 +1717,9 @@ export default function App() {
     setSessionGit,
     setSessionGitError,
     setSessionGitLoading,
+    handlePassiveSessionFilesResult,
+    loadSessionFiles,
+    requestFollowSessionFilesRefresh,
   });
 
   const scheduleAttachReconnect = useTerminalReconnectScheduler(terminalAttachController, {
@@ -1802,15 +1840,22 @@ export default function App() {
         closeMobileAttachChrome();
         return;
       }
+      if (
+        closingSessionIdsRef.current.has(sessionId) ||
+        closedSessionIdsRef.current.has(sessionId)
+      ) {
+        return;
+      }
       clearTerminalSnapshotRevealHistory(sessionId);
       userDetachedRef.current = false;
-      setError(undefined);
-      setStatus("attaching");
-      const attachRequestId = attachRequestIdRef.current + 1;
-      attachRequestIdRef.current = attachRequestId;
-      attachingSessionIdRef.current = sessionId;
-      let outputClient: DirectClient | undefined;
-      try {
+    setError(undefined);
+    setStatus("attaching");
+    const attachRequestId = attachRequestIdRef.current + 1;
+    attachRequestIdRef.current = attachRequestId;
+    attachingSessionIdRef.current = sessionId;
+    let outputClient: DirectClient | undefined;
+    let attachAbortController: AbortController | undefined;
+    try {
         const isCurrentAttachRequest = () =>
           attachRequestIdRef.current === attachRequestId &&
           attachingSessionIdRef.current === sessionId;
@@ -1846,7 +1891,9 @@ export default function App() {
         reattachCurrentSessionOnOpenRef.current = false;
         disconnectAttach({ closeMobilePanel: shouldCloseMobilePanel });
         const resetVersion = clearTerminalOutput();
-        outputClient = await authenticatedClient(ATTACH_CONNECTION_TIMEOUT_MS);
+        attachAbortController = new AbortController();
+        pendingTerminalAttachAbortControllerRef.current = attachAbortController;
+        outputClient = await authenticatedClient(ATTACH_CONNECTION_TIMEOUT_MS, attachAbortController.signal);
         if (!isCurrentAttachRequest()) {
           closePendingAttachClients();
           return;
@@ -1855,6 +1902,7 @@ export default function App() {
         pendingTerminalAttachSessionRef.current = sessionId;
         const attached = await outputClient.attachSession(sessionId, {
           timeoutMs: ATTACH_CONNECTION_TIMEOUT_MS,
+          signal: attachAbortController.signal,
         });
         if (!isCurrentAttachRequest()) {
           outputClient.detachSession(sessionId, "stale_attach");
@@ -1864,6 +1912,12 @@ export default function App() {
         const attachedClient = outputClient;
         outputClient = undefined;
         pendingAttachClientRef.current = undefined;
+        if (
+          attachAbortController &&
+          pendingTerminalAttachAbortControllerRef.current === attachAbortController
+        ) {
+          pendingTerminalAttachAbortControllerRef.current = undefined;
+        }
         if (pendingTerminalAttachSessionRef.current === sessionId) {
           pendingTerminalAttachSessionRef.current = undefined;
         }
@@ -1908,6 +1962,12 @@ export default function App() {
           setSafeError(caught);
         }
       } finally {
+        if (
+          attachAbortController &&
+          pendingTerminalAttachAbortControllerRef.current === attachAbortController
+        ) {
+          pendingTerminalAttachAbortControllerRef.current = undefined;
+        }
         if (outputClient && pendingAttachClientRef.current === outputClient) {
           pendingAttachClientRef.current = undefined;
         }
@@ -1955,6 +2015,12 @@ export default function App() {
       if (attachOptions.closeMobilePanel) {
         setMobilePanel(undefined);
         setMobileMenuOpen(false);
+      }
+      if (
+        closingSessionIdsRef.current.has(sessionId) ||
+        closedSessionIdsRef.current.has(sessionId)
+      ) {
+        return;
       }
 
       if (attachingSessionIdRef.current === sessionId) {
@@ -2028,6 +2094,8 @@ export default function App() {
       !connectionReady ||
       status !== "ready" ||
       !sessionId ||
+      closingSessionIdsRef.current.has(sessionId) ||
+      closedSessionIdsRef.current.has(sessionId) ||
       attachedSessionRef.current ||
       userDetachedRef.current ||
       (autoAttachAttemptedSessionRef.current === sessionId && !shouldReattachCurrentSession)
@@ -2050,9 +2118,12 @@ export default function App() {
     clearTerminalOutput();
     setStatus("creating");
     let outputClient: DirectClient | undefined;
+    let attachAbortController: AbortController | undefined;
     try {
       const isCurrentCreateRequest = () => sessionCreateRequestIdRef.current === createRequestId;
-      outputClient = await authenticatedClient(ATTACH_CONNECTION_TIMEOUT_MS);
+      attachAbortController = new AbortController();
+      pendingTerminalAttachAbortControllerRef.current = attachAbortController;
+      outputClient = await authenticatedClient(ATTACH_CONNECTION_TIMEOUT_MS, attachAbortController.signal);
       if (!isCurrentCreateRequest()) {
         if (outputClient !== attachClientRef.current) {
           outputClient.close();
@@ -2078,6 +2149,12 @@ export default function App() {
       const attachedClient = outputClient;
       outputClient = undefined;
       pendingAttachClientRef.current = undefined;
+      if (
+        attachAbortController &&
+        pendingTerminalAttachAbortControllerRef.current === attachAbortController
+      ) {
+        pendingTerminalAttachAbortControllerRef.current = undefined;
+      }
       claimAttachClient(attachedClient);
       attachedSessionRef.current = created.session_id;
       sessionPermissionIdsRef.current.add(created.session_id);
@@ -2103,6 +2180,12 @@ export default function App() {
         setSafeError(caught);
       }
     } finally {
+      if (
+        attachAbortController &&
+        pendingTerminalAttachAbortControllerRef.current === attachAbortController
+      ) {
+        pendingTerminalAttachAbortControllerRef.current = undefined;
+      }
       if (outputClient && pendingAttachClientRef.current === outputClient) {
         pendingAttachClientRef.current = undefined;
       }
@@ -2260,8 +2343,10 @@ export default function App() {
   }, []);
 
   const handleSaveRename = useCallback(
-    async (sessionId: UUID) => {
-      const nextName = renameDraft.trim();
+    async (sessionId: UUID, draftValue?: string) => {
+      // 中文注释：点击保存和最后一个按键可能发生在同一事件批次里；
+      // 提交时优先使用当前 input 传进来的值，避免 React state 晚一拍导致最后一个字符丢失。
+      const nextName = (draftValue ?? renameDraft).trim();
       if (!nextName || nextName === renameOriginalName.trim()) {
         return;
       }
@@ -2301,6 +2386,14 @@ export default function App() {
         if (wasAttached) {
           userDetachedRef.current = true;
         }
+        cancelScheduledAttachSwitch();
+        if (attachingSessionIdRef.current === sessionId) {
+          attachRequestIdRef.current += 1;
+          attachingSessionIdRef.current = undefined;
+        }
+        if (pendingTerminalAttachSessionRef.current === sessionId) {
+          pendingTerminalAttachSessionRef.current = undefined;
+        }
         sessionClient = await resolveSessionScopedClient(sessionId);
         try {
           await sessionClient.client.closeSession(sessionId);
@@ -2315,13 +2408,22 @@ export default function App() {
           clearTerminalOutput();
         }
         clearTerminalSnapshotRevealHistory(sessionId);
+        const nextSessionOrder = sessionOrderRef.current.filter((candidate) => candidate !== sessionId);
+        const remainingSessions = sessionsRef.current.filter((session) => session.session_id !== sessionId);
         setSessions((current) => current.filter((session) => session.session_id !== sessionId));
         confirmedSessionSizesRef.current.delete(sessionId);
-        sessionOrderRef.current = sessionOrderRef.current.filter((candidate) => candidate !== sessionId);
-        setSessionOrder(sessionOrderRef.current);
+        sessionOrderRef.current = nextSessionOrder;
+        setSessionOrder(nextSessionOrder);
         clearNewOutputMark(sessionId);
         if (wasSelected) {
-          selectSession(undefined);
+          // 中文注释：关闭当前选中 session 后，侧栏选中态应该立即落到剩余的下一项，
+          // 不能先清成 undefined 再等待下一轮 session.list 补选，否则旧刷新结果和本地
+          // close 之间会出现“列表还有行但没有任何选中项”的短空窗。
+          const nextSelectedSessionId = orderSessions(
+            sortSessionsNewestFirst(remainingSessions),
+            nextSessionOrder,
+          ).at(0)?.session_id;
+          selectSession(nextSelectedSessionId);
           clearSessionFiles();
         }
         if (wasAttached || wasSelected) {
@@ -2350,6 +2452,7 @@ export default function App() {
       disconnectAttach,
       clearNewOutputMark,
       isIgnoredClosingSessionError,
+      cancelScheduledAttachSwitch,
       refreshDaemonClients,
       selectedSessionId,
       selectSession,
@@ -2914,7 +3017,7 @@ export default function App() {
               onSelect={(serverId) => void handleSelectServer(serverId)}
               onStartRename={handleStartDaemonRename}
               onRenameDraftChange={setDaemonRenameDraft}
-              onSaveRename={(serverId) => void handleSaveDaemonRename(serverId)}
+              onSaveRename={(serverId, nextName) => void handleSaveDaemonRename(serverId, nextName)}
               onCancelRename={handleCancelDaemonRename}
               onForget={(serverId) => void handleForgetDaemon(serverId)}
             />
@@ -4109,6 +4212,7 @@ function mergeSessionRefresh(
   currentSessions: SessionSummaryPayload[],
   preserveSessionIds: Array<UUID | undefined>,
   sessionOrder: UUID[] = [],
+  closedSessionIds: Set<UUID> = new Set(),
 ): SessionSummaryPayload[] {
   const currentById = new Map(currentSessions.map((session) => [session.session_id, session]));
   const remoteIds = new Set(remoteSessions.map((session) => session.session_id));
@@ -4125,7 +4229,7 @@ function mergeSessionRefresh(
 
   const preservedIds = new Set<UUID>();
   for (const sessionId of preserveSessionIds) {
-    if (!sessionId || remoteIds.has(sessionId)) {
+    if (!sessionId || remoteIds.has(sessionId) || closedSessionIds.has(sessionId)) {
       continue;
     }
     if (preservedIds.has(sessionId)) {
@@ -4165,6 +4269,72 @@ function applyLocalSessionOrder(
   sessionOrder: UUID[],
 ): SessionSummaryPayload[] {
   return orderSessions(sessions, sessionOrder);
+}
+
+function isVisibleSelectedSessionCandidate(
+  sessionId: UUID | undefined,
+  visibleSessionIds: Set<UUID>,
+  localKnownSessionIds: Set<UUID>,
+  closedSessionIds: Set<UUID>,
+): boolean {
+  if (!sessionId || closedSessionIds.has(sessionId)) {
+    return false;
+  }
+  return visibleSessionIds.has(sessionId) || localKnownSessionIds.has(sessionId);
+}
+
+function resolveVisibleSelectedSessionId(input: {
+  userDetached: boolean;
+  stickySessionId?: UUID;
+  renamingSessionId?: UUID;
+  attachedSessionId?: UUID;
+  visibleSessions: SessionSummaryPayload[];
+  sessionOrder: UUID[];
+  localKnownSessionIds: Set<UUID>;
+  closedSessionIds: Set<UUID>;
+}): UUID | undefined {
+  if (input.userDetached) {
+    return undefined;
+  }
+  const visibleSessionIds = new Set(input.visibleSessions.map((session) => session.session_id));
+  if (
+    isVisibleSelectedSessionCandidate(
+      input.stickySessionId,
+      visibleSessionIds,
+      input.localKnownSessionIds,
+      input.closedSessionIds,
+    )
+  ) {
+    return input.stickySessionId;
+  }
+  const firstVisibleSessionId = orderSessions(
+    sortSessionsNewestFirst(input.visibleSessions),
+    input.sessionOrder,
+  ).at(0)?.session_id;
+  if (firstVisibleSessionId) {
+    return firstVisibleSessionId;
+  }
+  if (
+    isVisibleSelectedSessionCandidate(
+      input.renamingSessionId,
+      visibleSessionIds,
+      input.localKnownSessionIds,
+      input.closedSessionIds,
+    )
+  ) {
+    return input.renamingSessionId;
+  }
+  if (
+    isVisibleSelectedSessionCandidate(
+      input.attachedSessionId,
+      visibleSessionIds,
+      input.localKnownSessionIds,
+      input.closedSessionIds,
+    )
+  ) {
+    return input.attachedSessionId;
+  }
+  return undefined;
 }
 
 function sessionOrderFromDaemonList(sessions: SessionSummaryPayload[]): UUID[] {

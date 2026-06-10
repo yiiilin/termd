@@ -544,6 +544,35 @@ describe("DirectClient", () => {
     client.close();
   });
 
+  it("attachSession 的 abort signal 会中断挂起的 terminal attach", async () => {
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [
+        {
+          session_id: "00000000-0000-0000-0000-000000000301",
+          state: "running",
+          size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+        },
+      ],
+      attachDelayMs: 200,
+    });
+    const { client } = await authenticatedClient("00000000-0000-0000-0000-000000000336");
+    const list = await client.listSessions();
+    const sessionId = list.sessions[0].session_id;
+    const controller = new AbortController();
+
+    const attach = client.attachSession(sessionId, {
+      timeoutMs: 1000,
+      signal: controller.signal,
+    });
+
+    controller.abort();
+
+    await expect(attach).rejects.toMatchObject({ code: "connection_closed" });
+    client.close();
+  });
+
   it("packet dispatcher 按 request id 归属响应和错误，错误不会污染并发请求", async () => {
     const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000310");
     const pairClient = await connectDevice(device.device_id);
@@ -673,6 +702,88 @@ describe("DirectClient", () => {
       )?.stream_id,
     );
     expect(cancelPacket).toBeTruthy();
+  });
+
+  it("关闭 session 后其他已 attach 连接也不能继续使用旧的 session 权限", async () => {
+    const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000334");
+    const pairClient = await connectDevice(device.device_id);
+    const accepted = await pairClient.pair("secret-token", device.device_public_key);
+    pairClient.close();
+
+    const firstClient = await connectDevice(device.device_id);
+    await firstClient.authenticate(device, {
+      server_id: accepted.server_id,
+      daemon_public_key: accepted.daemon_public_key,
+      url: daemon.url,
+      paired_at_ms: 1710000000000,
+    });
+    const secondClient = await connectDevice(device.device_id);
+    await secondClient.authenticate(device, {
+      server_id: accepted.server_id,
+      daemon_public_key: accepted.daemon_public_key,
+      url: daemon.url,
+      paired_at_ms: 1710000000000,
+    });
+
+    const list = await firstClient.listSessions();
+    const sessionId = list.sessions[0].session_id;
+    await firstClient.attachSession(sessionId);
+    await secondClient.attachSession(sessionId, { watchUpdates: false });
+
+    await firstClient.closeSession(sessionId);
+    await expect(secondClient.listSessionFiles(sessionId)).rejects.toMatchObject({ code: "invalid_state" });
+    await expect(secondClient.attachSession(sessionId)).rejects.toMatchObject({ code: "session_not_found" });
+
+    firstClient.close();
+    secondClient.close();
+  });
+
+  it("attach 挂起期间若 session 被其他连接关闭，迟到的 attach 返回 session_not_found", async () => {
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [
+        {
+          session_id: "00000000-0000-0000-0000-000000000335",
+          state: "running",
+          size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+        },
+      ],
+      attachDelayMs: 80,
+      attachOutput: "termd-e2e-ready\n",
+    });
+    const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000336");
+    const pairClient = await connectDevice(device.device_id);
+    const accepted = await pairClient.pair("secret-token", device.device_public_key);
+    pairClient.close();
+
+    const firstClient = await connectDevice(device.device_id);
+    await firstClient.authenticate(device, {
+      server_id: accepted.server_id,
+      daemon_public_key: accepted.daemon_public_key,
+      url: daemon.url,
+      paired_at_ms: 1710000000000,
+    });
+    const secondClient = await connectDevice(device.device_id);
+    await secondClient.authenticate(device, {
+      server_id: accepted.server_id,
+      daemon_public_key: accepted.daemon_public_key,
+      url: daemon.url,
+      paired_at_ms: 1710000000000,
+    });
+
+    const list = await firstClient.listSessions();
+    const sessionId = list.sessions[0].session_id;
+    const pendingAttach = secondClient.attachSession(sessionId, { timeoutMs: 500 });
+    await waitUntil(() => daemon.attachRequests.some((request) => request.session_id === sessionId), "pending attach request");
+
+    await firstClient.closeSession(sessionId);
+
+    await expect(pendingAttach).rejects.toMatchObject({ code: "session_not_found" });
+    await expect(secondClient.listSessionFiles(sessionId)).rejects.toMatchObject({ code: "invalid_state" });
+
+    firstClient.close();
+    secondClient.close();
   });
 
   it("切换 session 后丢弃已取消 terminal stream 的排队输出", async () => {

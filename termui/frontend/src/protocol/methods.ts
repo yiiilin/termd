@@ -47,6 +47,7 @@ export const PROTOCOL_EVENT_METHOD_REGISTRY = {
   "auth.challenge": "auth_challenge",
   "session.activity": "session_activity",
   "session.files": "session_files_result",
+  "session.cwd": "session_cwd_changed",
   "session.git": "session_git_result",
   "session.resized": "session_resized",
   "terminal.output": "session_data",

@@ -779,6 +779,59 @@ test("relay Web 在 daemon relay 主干断开重连后仍能恢复输入", async
   }
 });
 
+test("relay Web 在 daemon 重启后自动恢复当前 session 并继续输入", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name === "mobile-chrome", "daemon 重启恢复回归只需要桌面布局覆盖真实 relay 链路");
+  test.setTimeout(120_000);
+  const fixture = await startRealRelayFixture();
+  const createdNames: string[] = [];
+  const browserErrors: string[] = [];
+  collectBrowserErrors(page, "client", browserErrors);
+
+  try {
+    await page.goto("/");
+    await page.getByLabel("WS URL").fill(fixture.relayClientUrl);
+    await page.getByLabel("Pairing token").fill(pairingInviteCode(fixture));
+    await page.getByRole("button", { name: "Pair" }).click();
+    await expect(page.getByLabel("Pairing token")).toBeHidden();
+    await expect(page.getByText("No sessions")).toBeVisible();
+
+    const name = await createShellSession(page, createdNames);
+    createdNames.push(name);
+    await runTerminalCommand(
+      page,
+      `(for i in $(seq 1 40); do printf '${marker(name)}-daemon-restart-stream-%02d\\n' "$i"; sleep 0.25; done) & printf '${marker(name)}-daemon-restart-ready\\n'`,
+    );
+    await expectTerminalLine(page, `${marker(name)}-daemon-restart-ready`, 8_000);
+    await expectTerminalLine(page, `${marker(name)}-daemon-restart-stream-03`, 8_000);
+
+    await fixture.restartDaemon();
+    // 中文注释：daemon 重启后，浏览器必须通过 relay 自动重建 daemon 连接，
+    // 重新同步 session list，并对当前选中的 session 自动重新 attach。
+    // 这里要求在没有任何后续用户输入的情况下看到 restart 之后才会出现的持续输出，
+    // 避免测试只因为重启前遗留 UI 状态而误通过。
+    await expect.poll(async () => sessionNames(page), { timeout: 20_000 }).toContain(name);
+    await expectTerminalLine(page, `${marker(name)}-daemon-restart-stream-20`, 20_000);
+
+    await runTerminalCommand(page, `printf '${marker(name)}-daemon-restart-input-ok\\n'`);
+    await expectTerminalLine(page, `${marker(name)}-daemon-restart-input-ok`, 20_000);
+    await expect(page.getByRole("alert", { name: "Connection error" })).toHaveCount(0);
+    expect(browserErrors).toEqual([]);
+  } finally {
+    await testInfo.attach("real-relay-fixture.log", {
+      body: fixture.diagnostics(),
+      contentType: "text/plain",
+    });
+    if (browserErrors.length > 0) {
+      await testInfo.attach("browser-errors.log", {
+        body: browserErrors.join("\n"),
+        contentType: "text/plain",
+      });
+    }
+    await closeCreatedSessions(page, createdNames);
+    await fixture.stop();
+  }
+});
+
 test("relay Web 上传文件时有发送进度并写入当前会话目录", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name === "mobile-chrome", "文件上传链路用桌面布局覆盖真实 relay");
   const largeUploadBytes = Number(process.env.REAL_RELAY_UPLOAD_BYTES ?? "0");

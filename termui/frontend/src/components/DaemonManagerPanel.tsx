@@ -1,4 +1,5 @@
 import { Check, Pencil, Trash2, X } from "lucide-react";
+import { flushSync } from "react-dom";
 import type { PairedServerState, UUID } from "../protocol/types";
 import { useI18n } from "../i18n";
 
@@ -15,7 +16,7 @@ interface DaemonManagerPanelProps {
   onSelect: (serverId: UUID) => void;
   onStartRename: (serverId: UUID, currentName: string) => void;
   onRenameDraftChange: (name: string) => void;
-  onSaveRename: (serverId: UUID) => void;
+  onSaveRename: (serverId: UUID, nextName: string) => void;
   onCancelRename: () => void;
   onForget: (serverId: UUID) => void;
 }
@@ -34,15 +35,31 @@ export function DaemonManagerPanel(props: DaemonManagerPanelProps) {
         return (
           <div className={active ? "daemon-manager-row active" : "daemon-manager-row"} key={item.server.server_id}>
             {renaming ? (
-              <label className="daemon-rename-form">
+              <form
+                className="daemon-rename-form"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  const formData = new FormData(event.currentTarget);
+                  const nextName = formData.get("daemon-name");
+                  props.onSaveRename(
+                    item.server.server_id,
+                    typeof nextName === "string" ? nextName : props.renameDraft,
+                  );
+                }}
+              >
                 <span>{t("daemons.name")}</span>
                 <input
+                  name="daemon-name"
                   aria-label={t("daemons.name")}
                   value={props.renameDraft}
-                  onChange={(event) => props.onRenameDraftChange(event.target.value)}
+                  onChange={(event) => {
+                    flushSync(() => {
+                      props.onRenameDraftChange(event.target.value);
+                    });
+                  }}
                   autoFocus
                 />
-              </label>
+              </form>
             ) : (
               <div className="daemon-manager-main">
                 <strong>{label}</strong>
@@ -56,7 +73,7 @@ export function DaemonManagerPanel(props: DaemonManagerPanelProps) {
                     type="button"
                     className="icon-button"
                     aria-label={t("daemons.saveName")}
-                    onClick={() => props.onSaveRename(item.server.server_id)}
+                    onClick={() => props.onSaveRename(item.server.server_id, props.renameDraft)}
                   >
                     <Check size={15} aria-hidden="true" />
                   </button>

@@ -25,6 +25,7 @@ export interface RealRelayFixture {
   diagnostics: () => string;
   issuePairingToken: () => Promise<string>;
   interruptRelayMux: () => Promise<void>;
+  restartDaemon: () => Promise<void>;
   waitForRelayReady: () => Promise<void>;
   stop: () => Promise<void>;
 }
@@ -110,24 +111,21 @@ export async function startRealRelayFixture(options: RealRelayFixtureOptions = {
     });
     relayForDaemon = `127.0.0.1:${latencyProxy.listenPort}`;
   }
-  const daemon = spawnCargo(
-    [
-      "run",
-      "-q",
-      "--manifest-path",
-      CARGO_MANIFEST,
-      "-p",
-      "termd",
-      "--",
-      "--listen",
-      `127.0.0.1:${termdPort}`,
-      "--relay",
-      `ws://${relayForDaemon}`,
-    ],
+  const daemonLogs: string[] = [];
+  const daemonArgs = [
+    "run",
+    "-q",
+    "--manifest-path",
+    CARGO_MANIFEST,
+    "-p",
     "termd",
-    tempDir,
-    options.daemonEnv,
-  );
+    "--",
+    "--listen",
+    `127.0.0.1:${termdPort}`,
+    "--relay",
+    `ws://${relayForDaemon}`,
+  ];
+  let daemon = spawnCargo(daemonArgs, "termd", tempDir, options.daemonEnv, daemonLogs);
   await waitForPort(termdPort, daemon, "termd");
 
   const serverId = await serverIdFromHealthz(termdHttp);
@@ -162,11 +160,23 @@ export async function startRealRelayFixture(options: RealRelayFixtureOptions = {
       }
       await latencyProxy.interruptConnections();
     },
+    restartDaemon: async () => {
+      // 中文注释：真实 relay 恢复验收需要保留同一个 state 目录，
+      // 这样 daemon 重启后才能从 supervisor/socket restore 已持久化 session。
+      await stopProcess(daemon, "termd");
+      daemon = spawnCargo(daemonArgs, "termd", tempDir, options.daemonEnv, daemonLogs);
+      await waitForPort(termdPort, daemon, "termd");
+      const restartedServerId = await serverIdFromHealthz(termdHttp);
+      if (restartedServerId !== serverId) {
+        throw new Error(`daemon restart changed server_id: expected ${serverId}, got ${restartedServerId}`);
+      }
+      await waitForRelayDaemonMux(relayClientUrl, serverId, [relay, daemon]);
+    },
     waitForRelayReady: () => waitForRelayDaemonMux(relayClientUrl, serverId, [relay, daemon]),
     stop: async () => {
-      stopProcess(daemon);
+      await stopProcess(daemon, "termd");
       await latencyProxy?.stop();
-      stopProcess(relay);
+      await stopProcess(relay, "termrelay");
       await rm(tempDir, { recursive: true, force: true });
     },
   };
@@ -485,8 +495,14 @@ function httpRequest(url: string, options: { method: "GET" | "POST" }): Promise<
   });
 }
 
-function spawnCargo(args: string[], label: string, cwd: string, extraEnv: Record<string, string> = {}): StartedProcess {
-  const log: string[] = [];
+function spawnCargo(
+  args: string[],
+  label: string,
+  cwd: string,
+  extraEnv: Record<string, string> = {},
+  sharedLog?: string[],
+): StartedProcess {
+  const log = sharedLog ?? [];
   // 中文注释：默认保持测试日志简短；排查真实 relay 压力问题时允许单次命令提高 Rust 日志级别。
   const rustLog = process.env.REAL_RELAY_RUST_LOG ?? "termd=info,termrelay=info";
   const child = spawn("cargo", args, {
@@ -548,10 +564,41 @@ async function pickFreePort(): Promise<number> {
   });
 }
 
-function stopProcess(process: StartedProcess): void {
-  if (process.child.exitCode === null) {
-    process.child.kill();
+async function stopProcess(process: StartedProcess, label: string): Promise<void> {
+  if (process.child.exitCode !== null) {
+    return;
   }
+  process.child.kill();
+  if (await waitForProcessExit(process.child, 5_000)) {
+    return;
+  }
+  process.child.kill("SIGKILL");
+  if (await waitForProcessExit(process.child, 5_000)) {
+    return;
+  }
+  throw new Error(`${label} did not exit after SIGTERM/SIGKILL`);
+}
+
+function waitForProcessExit(process: ChildProcessWithoutNullStreams, timeoutMs: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    if (process.exitCode !== null) {
+      resolve(true);
+      return;
+    }
+    const timer = setTimeout(() => {
+      cleanup();
+      resolve(false);
+    }, timeoutMs);
+    const cleanup = () => {
+      clearTimeout(timer);
+      process.off("exit", handleExit);
+    };
+    const handleExit = () => {
+      cleanup();
+      resolve(true);
+    };
+    process.once("exit", handleExit);
+  });
 }
 
 function sleep(ms: number): Promise<void> {

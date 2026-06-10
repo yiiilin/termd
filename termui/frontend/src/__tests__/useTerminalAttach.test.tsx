@@ -9,7 +9,14 @@ import {
 } from "../hooks/useTerminalAttach";
 import { ProtocolClientError } from "../protocol/errors";
 import type { DirectClient } from "../protocol/direct-client";
-import type { Envelope, SessionAttachedPayload, TerminalSize, UUID } from "../protocol/types";
+import type {
+  Envelope,
+  SessionAttachedPayload,
+  SessionCwdChangedPayload,
+  SessionFilesResultPayload,
+  TerminalSize,
+  UUID,
+} from "../protocol/types";
 import type { TerminalOutputItem } from "../components/terminal/types";
 import { sessionDataToBase64 } from "../protocol/wire";
 
@@ -42,7 +49,7 @@ class FakeDirectClient {
     if (next) {
       return next;
     }
-    // 中文注释：receive loop 会并行启动两个 read；空队列时保持挂起，避免测试因第二个 read
+    // 中文注释：receive loop 是单条顺序读取；空队列时保持挂起，避免测试因为“没有更多消息”
     // 立刻抛错而进入重连分支，掩盖 snapshot token 的断言。
     return new Promise(() => undefined);
   }
@@ -84,8 +91,17 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
+function settleWithin<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<never>((_, reject) => {
+      setTimeout(() => reject(new Error(`${label} timed out`)), timeoutMs);
+    }),
+  ]);
+}
+
 function useReconnectHarness(input: {
-  authenticatedClient: () => Promise<DirectClient>;
+  authenticatedClient: (timeoutMs: number, signal?: AbortSignal) => Promise<DirectClient>;
   output: TerminalOutputItem[];
   reconnectDelaysMs?: number[];
   closeAttachForReconnect?: (client?: DirectClient) => boolean;
@@ -123,7 +139,19 @@ function useReconnectHarness(input: {
     reconnectDelaysMs: input.reconnectDelaysMs ?? [0],
     isRetryableConnectionError: () => true,
     isTerminalTransportPaused: () => false,
-    closeAttachForReconnect: input.closeAttachForReconnect ?? (() => true),
+    closeAttachForReconnect: input.closeAttachForReconnect ?? ((client?: DirectClient) => {
+      const belongsToCurrentAttach =
+        !client ||
+        attachClientRef.current === client ||
+        pendingAttachClientRef.current === client;
+      if (!belongsToCurrentAttach) {
+        client?.close();
+        return false;
+      }
+      controller.pendingTerminalAttachAbortControllerRef.current?.abort();
+      controller.pendingTerminalAttachAbortControllerRef.current = undefined;
+      return true;
+    }),
     discardPendingTerminalOutput: vi.fn(),
     resetAttachReconnectState: () => {
       if (controller.attachReconnectTimerRef.current !== undefined) {
@@ -289,7 +317,13 @@ describe("useTerminalAttach snapshot reveal intent", () => {
     await waitFor(() => expect(waitForTerminalOutputResetApplied).toHaveBeenCalledTimes(1));
 
     act(() => {
-      expect(schedule({ forceFullSnapshot: true })).toBe(true);
+      expect(
+        result.current.scheduleReconnect(
+          asDirectClient(firstReconnectClient as unknown as FakeDirectClient),
+          new ProtocolClientError("terminal_resync", "second resync while first reset is pending"),
+          { forceFullSnapshot: true },
+        ),
+      ).toBe(true);
     });
     const secondToken = result.current.controller.terminalSnapshotPendingFullSnapshotTokensRef.current.get(SESSION_ID)?.token;
     // 中文注释：第一个 reconnect 已经 claim 了 token；后续 full resync 必须换新 token，
@@ -398,4 +432,185 @@ describe("useTerminalAttach snapshot reveal intent", () => {
     unmount();
   });
 
+});
+
+describe("useTerminalReceiveLoop", () => {
+  it("跟随 terminal cwd 时收到 session_cwd_changed 会静默重拉 session.files", async () => {
+    const loadSessionFiles = vi.fn(async () => undefined);
+    const requestFollowSessionFilesRefresh = vi.fn(async () => undefined);
+    const client = new FakeDirectClient([
+      {
+        type: "session_cwd_changed",
+        payload: {
+          session_id: SESSION_ID,
+          cwd: "/tmp/follow-cwd",
+        } satisfies SessionCwdChangedPayload,
+      },
+    ]);
+    const controller = renderHook(() => useTerminalAttach()).result.current;
+    const attachClientRef = { current: asDirectClient(client) };
+    const sessionFilesFollowTerminalCwdRef = { current: true };
+    const startReceiveLoop = renderHook(() =>
+      useTerminalReceiveLoop(controller, {
+        attachClientRef,
+        sessionFilesFollowTerminalCwdRef,
+        applyConfirmedSessionSize: vi.fn(),
+        enqueueTerminalOutput: vi.fn(),
+        isIgnoredClosingSessionError: vi.fn(() => false),
+        markNewOutputIfBackground: vi.fn(),
+        setSafeError: vi.fn(),
+        setSessionFiles: vi.fn(),
+        setSessionFilesError: vi.fn(),
+        setSessionFilesLoading: vi.fn(),
+        setSessionGit: vi.fn(),
+        setSessionGitError: vi.fn(),
+        setSessionGitLoading: vi.fn(),
+        loadSessionFiles,
+        requestFollowSessionFilesRefresh,
+      }),
+    ).result.current;
+
+    act(() => {
+      controller.attachedSessionRef.current = SESSION_ID;
+      startReceiveLoop(asDirectClient(client));
+    });
+
+    await waitFor(() => {
+      expect(requestFollowSessionFilesRefresh).toHaveBeenCalledWith(SESSION_ID);
+    });
+    expect(loadSessionFiles).not.toHaveBeenCalled();
+
+    act(() => {
+      controller.receiveLoopActiveRef.current = false;
+      controller.receiveLoopGenerationRef.current += 1;
+    });
+  });
+
+  it("跟随 terminal cwd 时仍兼容旧 daemon 被动推送 session_files_result", async () => {
+    const handlePassiveSessionFilesResult = vi.fn();
+    const legacyFiles = {
+      session_id: SESSION_ID,
+      path: "/tmp/legacy-follow",
+      entries: [
+        {
+          name: "legacy.txt",
+          path: "/tmp/legacy-follow/legacy.txt",
+          kind: "file",
+          size_bytes: 6,
+          modified_at_ms: null,
+        },
+      ],
+    } satisfies SessionFilesResultPayload;
+    const client = new FakeDirectClient([
+      {
+        type: "session_files_result",
+        payload: legacyFiles,
+      },
+    ]);
+    const controller = renderHook(() => useTerminalAttach()).result.current;
+    const attachClientRef = { current: asDirectClient(client) };
+    const sessionFilesFollowTerminalCwdRef = { current: true };
+    const startReceiveLoop = renderHook(() =>
+      useTerminalReceiveLoop(controller, {
+        attachClientRef,
+        sessionFilesFollowTerminalCwdRef,
+        applyConfirmedSessionSize: vi.fn(),
+        enqueueTerminalOutput: vi.fn(),
+        isIgnoredClosingSessionError: vi.fn(() => false),
+        markNewOutputIfBackground: vi.fn(),
+        setSafeError: vi.fn(),
+        setSessionFiles: vi.fn(),
+        setSessionFilesError: vi.fn(),
+        setSessionFilesLoading: vi.fn(),
+        setSessionGit: vi.fn(),
+        setSessionGitError: vi.fn(),
+        setSessionGitLoading: vi.fn(),
+        handlePassiveSessionFilesResult,
+      }),
+    ).result.current;
+
+    act(() => {
+      controller.attachedSessionRef.current = SESSION_ID;
+      startReceiveLoop(asDirectClient(client));
+    });
+
+    await waitFor(() => {
+      expect(handlePassiveSessionFilesResult).toHaveBeenCalledWith(legacyFiles);
+    });
+
+    act(() => {
+      controller.receiveLoopActiveRef.current = false;
+      controller.receiveLoopGenerationRef.current += 1;
+    });
+  });
+
+  it("stale client 的迟到错误不会中断当前 pending reconnect attach", async () => {
+    const initialClient = new FakeDirectClient();
+    const firstAttach = deferred<SessionAttachedPayload>();
+    const firstReconnectClient = {
+      attachCalls: [] as Array<{ sessionId: UUID; options: { lastTerminalSeq?: number; timeoutMs?: number; signal?: AbortSignal } }>,
+      closed: false,
+      attachSession: vi.fn(async (
+        sessionId: UUID,
+        options: { lastTerminalSeq?: number; timeoutMs?: number; signal?: AbortSignal } = {},
+      ) => {
+        firstReconnectClient.attachCalls.push({ sessionId, options });
+        return firstAttach.promise;
+      }),
+      receiveInner: async () => new Promise<Envelope>(() => undefined),
+      detachSession: () => {
+        firstReconnectClient.closed = true;
+      },
+      close: () => {
+        firstReconnectClient.closed = true;
+      },
+    };
+    const secondReconnectClient = new FakeDirectClient();
+    const clients = [asDirectClient(firstReconnectClient as unknown as FakeDirectClient), asDirectClient(secondReconnectClient)];
+    const authenticatedClient = vi.fn(async (_timeoutMs: number, signal?: AbortSignal) => {
+      expect(signal?.aborted).toBe(false);
+      const client = clients.shift();
+      if (!client) {
+        throw new Error("unexpected reconnect client request");
+      }
+      return client;
+    });
+
+    const { result, unmount } = renderHook(() => useReconnectHarness({
+      authenticatedClient,
+      output: [],
+      reconnectDelaysMs: [0, 0],
+    }));
+
+    act(() => {
+      result.current.controller.attachedSessionRef.current = SESSION_ID;
+      result.current.attachClientRef.current = asDirectClient(initialClient);
+      expect(result.current.scheduleReconnect(
+        asDirectClient(initialClient),
+        new ProtocolClientError("connection_closed", "first reconnect"),
+      )).toBe(true);
+    });
+
+    await waitFor(() => expect(firstReconnectClient.attachSession).toHaveBeenCalledTimes(1));
+
+    act(() => {
+      result.current.scheduleReconnect(
+        asDirectClient(new FakeDirectClient()),
+        new ProtocolClientError("connection_closed", "late stale client error"),
+        { reconnectKey: `${SERVER_ID}:${SESSION_ID}` },
+      );
+    });
+
+    await expect(settleWithin(firstAttach.promise, 50, "stale reconnect should stay pending")).rejects.toThrow(
+      "stale reconnect should stay pending timed out",
+    );
+    expect(firstReconnectClient.closed).toBe(false);
+    expect(secondReconnectClient.attachCalls).toHaveLength(0);
+
+    act(() => {
+      result.current.controller.receiveLoopActiveRef.current = false;
+      result.current.controller.receiveLoopGenerationRef.current += 1;
+    });
+    unmount();
+  });
 });

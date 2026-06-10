@@ -39,6 +39,7 @@ describe("协议类型", () => {
       "session_data",
       "terminal_frame",
       "session_activity",
+      "session_cwd_changed",
       "session_cursor",
       "session_resize",
       "session_resized",

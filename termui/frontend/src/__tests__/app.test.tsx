@@ -611,7 +611,7 @@ async function clickSessionCard(
   await user.click(sessionButtons[0]);
 }
 
-async function exerciseTmuxBackedWebLifecycle(
+async function exerciseSupervisorBackedWebLifecycle(
   user: ReturnType<typeof userEvent.setup>,
   daemon: MockDaemon,
   input: {
@@ -641,7 +641,7 @@ async function exerciseTmuxBackedWebLifecycle(
   await screen.findByText(new RegExp(input.readyText.trim()));
   expect(daemon.createdCommands).toEqual([[]]);
   expect(terminalCreateStreams()).toHaveLength(1);
-  // 中文注释：tmux-backed create 本身已经建立 watched terminal stream；
+  // 中文注释：supervisor-backed `terminal.create` 本身已经建立 watched terminal stream；
   // Web 端不能在 create 后再补一条 attach，否则 relay 排队时会形成重复终端流。
   expect(terminalAttachStreams()).toHaveLength(0);
 
@@ -1459,6 +1459,59 @@ describe("termui web 工作台", () => {
     expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
   });
 
+  it("切换 session 会取消卡在 auth.challenge 前的半开 WebSocket 握手", async () => {
+    const user = userEvent.setup();
+    const alphaSession = {
+      session_id: "00000000-0000-0000-0000-000000000425",
+      name: "alpha",
+      state: "running",
+      size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+    } as const;
+    const betaSession = {
+      session_id: "00000000-0000-0000-0000-000000000426",
+      name: "beta",
+      state: "running",
+      size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+    } as const;
+    const gammaSession = {
+      session_id: "00000000-0000-0000-0000-000000000427",
+      name: "gamma",
+      state: "running",
+      size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+    } as const;
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [alphaSession, betaSession, gammaSession],
+      attachOutput: "attached-ready\n",
+    });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession("alpha");
+    await screen.findByText(/attached-ready/);
+    const acceptedBeforeSwitch = daemon.acceptedConnections;
+
+    daemon.setDropAuthChallenge(true);
+    fireEvent.click(screen.getByRole("button", { name: "Open beta" }));
+    await waitFor(() => expect(daemon.acceptedConnections).toBeGreaterThan(acceptedBeforeSwitch));
+
+    daemon.setDropAuthChallenge(false);
+    fireEvent.click(screen.getByRole("button", { name: "Open gamma" }));
+
+    await waitFor(() => expect(daemon.acceptedConnections).toBeGreaterThanOrEqual(acceptedBeforeSwitch + 2), {
+      timeout: 1000,
+    });
+    await waitFor(() => expect(daemon.attachedSessions).toContain(gammaSession.session_id), {
+      timeout: 1500,
+    });
+    await waitFor(() => expect(daemon.activeConnectionCount()).toBe(1), {
+      timeout: 2000,
+    });
+    expect(selectedSessionName()).toBe("gamma");
+    expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
+  });
+
   it("终端输入走同一条 terminal stream，不再拆出额外 attach stream", async () => {
     const user = userEvent.setup();
     render(<App />);
@@ -2044,6 +2097,17 @@ describe("termui web 工作台", () => {
         ),
       ).toBe(true),
     );
+    await waitFor(() =>
+      expect(
+        daemon.sentPacketLog.some(({ packet }) =>
+          packet.kind === "stream_chunk" &&
+          JSON.stringify(packet.payload).includes(gammaSession.session_id),
+        ),
+      ).toBe(true),
+    );
+    // 中文注释：gamma attach 的首屏输出会稍晚于 attach ack flush 到终端；
+    // 先等当前目标 session 稳定，再统计 stale beta 输出是否误写入。
+    await new Promise((resolve) => window.setTimeout(resolve, 30));
 
     const stats = resetTerminalStats();
     daemon.pushTerminalFrame(betaSession.session_id, {
@@ -5544,7 +5608,7 @@ describe("termui web 工作台", () => {
     expect(within(panel).queryByText("beta.log")).toBeNull();
   });
 
-  it("文件 panel 关闭跟随后忽略 daemon 后台 cwd 推送，仍可手动切目录", async () => {
+  it("文件 panel 关闭跟随后忽略 daemon 后台 cwd 轻事件，仍可手动切目录", async () => {
     const user = userEvent.setup();
     const sessionId = "00000000-0000-0000-0000-000000000417";
     const cwdPushFiles = {
@@ -5612,7 +5676,7 @@ describe("termui web 工作台", () => {
     await user.click(followToggle);
     expect(followToggle).not.toBeChecked();
 
-    daemon.pushSessionFiles(cwdPushFiles);
+    daemon.pushSessionCwdChanged(sessionId, "/tmp/work");
     await new Promise((resolve) => window.setTimeout(resolve, 50));
     expect(within(panel).getByLabelText("Current directory")).toHaveValue("/home/me");
     expect(within(panel).queryByText("beta.log")).toBeNull();
@@ -5621,7 +5685,7 @@ describe("termui web 工作台", () => {
     await within(panel).findByText("src");
     await waitFor(() => expect(within(panel).getByLabelText("Current directory")).toHaveValue("/home/me/project"));
 
-    daemon.pushSessionFiles(cwdPushFiles);
+    daemon.pushSessionCwdChanged(sessionId, "/tmp/work");
     await new Promise((resolve) => window.setTimeout(resolve, 50));
     expect(within(panel).getByLabelText("Current directory")).toHaveValue("/home/me/project");
     expect(within(panel).queryByText("beta.log")).toBeNull();
@@ -5691,7 +5755,7 @@ describe("termui web 工作台", () => {
     await within(panel).findByText("beta.log");
   });
 
-  it("接收 daemon 推送后同步当前 session 的文件树位置", async () => {
+  it("接收 session_cwd_changed 后主动重拉并同步当前 session 的文件树位置", async () => {
     const user = userEvent.setup();
     const sessionId = "00000000-0000-0000-0000-000000000413";
     await daemon.stop();
@@ -5710,6 +5774,19 @@ describe("termui web 工作台", () => {
           path: "/home/me",
           entries: [],
         },
+        "/tmp/work": {
+          session_id: sessionId,
+          path: "/tmp/work",
+          entries: [
+            {
+              name: "beta.log",
+              path: "/tmp/work/beta.log",
+              kind: "file",
+              size_bytes: 4,
+              modified_at_ms: null,
+            },
+          ],
+        },
       },
     });
     render(<App />);
@@ -5721,22 +5798,286 @@ describe("termui web 工作台", () => {
     const panel = await screen.findByLabelText("session files");
     await waitFor(() => expect(within(panel).getByLabelText("Current directory")).toHaveValue("/home/me"));
 
+    const requestCountBeforeFollow = daemon.sessionFileRequests.length;
+    const startedAt = Date.now();
+    daemon.pushSessionCwdChanged(sessionId, "/tmp/work");
+
+    await waitFor(() =>
+      expect(daemon.sessionFileRequests.slice(requestCountBeforeFollow)).toContainEqual({
+        session_id: sessionId,
+      }),
+      { timeout: 800 },
+    );
+    expect(Date.now() - startedAt).toBeLessThan(900);
+    expect(daemon.sessionFileRequests.slice(requestCountBeforeFollow).length).toBe(1);
+    await waitFor(() => expect(within(panel).getByLabelText("Current directory")).toHaveValue("/tmp/work"));
+    await within(panel).findByText("beta.log");
+  });
+
+  it("session_cwd_changed 的旧静默刷新不会覆盖用户刚手动切到的新目录", async () => {
+    const user = userEvent.setup();
+    const sessionId = "00000000-0000-0000-0000-000000000414";
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [
+        {
+          session_id: sessionId,
+          state: "running",
+          size: { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 },
+        },
+      ],
+      sessionFiles: {
+        [sessionId]: {
+          session_id: sessionId,
+          path: "/home/me",
+          entries: [],
+        },
+        "/tmp/follow": {
+          session_id: sessionId,
+          path: "/tmp/follow",
+          entries: [
+            {
+              name: "old.log",
+              path: "/tmp/follow/old.log",
+              kind: "file",
+              size_bytes: 4,
+              modified_at_ms: null,
+            },
+          ],
+        },
+        "/tmp/manual": {
+          session_id: sessionId,
+          path: "/tmp/manual",
+          entries: [
+            {
+              name: "new.log",
+              path: "/tmp/manual/new.log",
+              kind: "file",
+              size_bytes: 4,
+              modified_at_ms: null,
+            },
+          ],
+        },
+      },
+    });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await clickSessionCard(user);
+
+    const panel = await screen.findByLabelText("session files");
+    await waitFor(() => expect(within(panel).getByLabelText("Current directory")).toHaveValue("/home/me"));
+
+    daemon.queueSessionFilesResponse(
+      sessionId,
+      {
+        session_id: sessionId,
+        path: "/tmp/follow",
+        entries: [
+          {
+            name: "old.log",
+            path: "/tmp/follow/old.log",
+            kind: "file",
+            size_bytes: 4,
+            modified_at_ms: null,
+          },
+        ],
+      },
+      { path: undefined, delayMs: 60 },
+    );
+    daemon.queueSessionFilesResponse(
+      sessionId,
+      {
+        session_id: sessionId,
+        path: "/tmp/manual",
+        entries: [
+          {
+            name: "new.log",
+            path: "/tmp/manual/new.log",
+            kind: "file",
+            size_bytes: 4,
+            modified_at_ms: null,
+          },
+        ],
+      },
+      { path: "/tmp/manual", delayMs: 0 },
+    );
+    const requestCountBeforeFollow = daemon.sessionFileRequests.length;
+    daemon.pushSessionCwdChanged(sessionId, "/tmp/follow");
+
+    await waitFor(() =>
+      expect(daemon.sessionFileRequests.slice(requestCountBeforeFollow)).toContainEqual({
+        session_id: sessionId,
+      }),
+    );
+
+    await user.clear(within(panel).getByLabelText("Current directory"));
+    await user.type(within(panel).getByLabelText("Current directory"), "/tmp/manual");
+    await user.click(within(panel).getByRole("button", { name: "Go" }));
+
+    await waitFor(() => expect(within(panel).getByLabelText("Current directory")).toHaveValue("/tmp/manual"));
+    await within(panel).findByText("new.log");
+    expect(within(panel).queryByText("old.log")).toBeNull();
+  });
+
+  it("文件树可见刷新进行中收到 cwd 轻事件时，会在请求结束后补拉最新目录", async () => {
+    const user = userEvent.setup();
+    const sessionId = "00000000-0000-0000-0000-000000000414b";
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [
+        {
+          session_id: sessionId,
+          state: "running",
+          size: { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 },
+        },
+      ],
+      sessionFiles: {
+        [sessionId]: {
+          session_id: sessionId,
+          path: "/home/me",
+          entries: [],
+        },
+        "/tmp/manual": {
+          session_id: sessionId,
+          path: "/tmp/manual",
+          entries: [
+            {
+              name: "manual.log",
+              path: "/tmp/manual/manual.log",
+              kind: "file",
+              size_bytes: 4,
+              modified_at_ms: null,
+            },
+          ],
+        },
+        "/tmp/follow-after-manual": {
+          session_id: sessionId,
+          path: "/tmp/follow-after-manual",
+          entries: [
+            {
+              name: "follow.log",
+              path: "/tmp/follow-after-manual/follow.log",
+              kind: "file",
+              size_bytes: 4,
+              modified_at_ms: null,
+            },
+          ],
+        },
+      },
+    });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await clickSessionCard(user);
+
+    const panel = await screen.findByLabelText("session files");
+    await waitFor(() => expect(within(panel).getByLabelText("Current directory")).toHaveValue("/home/me"));
+
+    daemon.queueSessionFilesResponse(
+      sessionId,
+      {
+        session_id: sessionId,
+        path: "/home/me",
+        entries: [
+          {
+            name: "project",
+            path: "/home/me/project",
+            kind: "file",
+            size_bytes: 4,
+            modified_at_ms: null,
+          },
+        ],
+      },
+      { path: undefined, delayMs: 60 },
+    );
+
+    const requestCountBeforeRefresh = daemon.sessionFileRequests.length;
+    await user.click(within(panel).getByRole("button", { name: "Refresh files" }));
+
+    await waitFor(() =>
+      expect(daemon.sessionFileRequests.slice(requestCountBeforeRefresh)).toContainEqual({
+        session_id: sessionId,
+      }),
+    );
+
+    daemon.pushSessionCwdChanged(sessionId, "/tmp/follow-after-manual");
+
+    await waitFor(() => expect(within(panel).getByLabelText("Current directory")).toHaveValue("/tmp/follow-after-manual"));
+    await within(panel).findByText("follow.log");
+    expect(within(panel).queryByText("project")).toBeNull();
+  });
+
+  it("旧 daemon 晚到的被动 session_files_result 不会覆盖用户刚手动切到的新目录", async () => {
+    const user = userEvent.setup();
+    const sessionId = "00000000-0000-0000-0000-000000000415";
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [
+        {
+          session_id: sessionId,
+          state: "running",
+          size: { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 },
+        },
+      ],
+      sessionFiles: {
+        [sessionId]: {
+          session_id: sessionId,
+          path: "/home/me",
+          entries: [],
+        },
+        "/tmp/manual": {
+          session_id: sessionId,
+          path: "/tmp/manual",
+          entries: [
+            {
+              name: "new.log",
+              path: "/tmp/manual/new.log",
+              kind: "file",
+              size_bytes: 4,
+              modified_at_ms: null,
+            },
+          ],
+        },
+      },
+    });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await clickSessionCard(user);
+
+    const panel = await screen.findByLabelText("session files");
+    await waitFor(() => expect(within(panel).getByLabelText("Current directory")).toHaveValue("/home/me"));
+
+    await user.clear(within(panel).getByLabelText("Current directory"));
+    await user.type(within(panel).getByLabelText("Current directory"), "/tmp/manual");
+    await user.click(within(panel).getByRole("button", { name: "Go" }));
+    await waitFor(() => expect(within(panel).getByLabelText("Current directory")).toHaveValue("/tmp/manual"));
+    await within(panel).findByText("new.log");
+
     daemon.pushSessionFiles({
       session_id: sessionId,
-      path: "/tmp/work",
+      path: "/tmp/stale-follow",
       entries: [
         {
-          name: "beta.log",
-          path: "/tmp/work/beta.log",
+          name: "stale.log",
+          path: "/tmp/stale-follow/stale.log",
           kind: "file",
-          size_bytes: 4,
+          size_bytes: 5,
           modified_at_ms: null,
         },
       ],
     });
 
-    await waitFor(() => expect(within(panel).getByLabelText("Current directory")).toHaveValue("/tmp/work"));
-    await within(panel).findByText("beta.log");
+    await new Promise((resolve) => window.setTimeout(resolve, 50));
+    expect(within(panel).getByLabelText("Current directory")).toHaveValue("/tmp/manual");
+    expect(within(panel).queryByText("stale.log")).toBeNull();
   });
 
   it("显示 daemon 级客户端在线、离线和 attach 状态", async () => {
@@ -5978,7 +6319,7 @@ describe("termui web 工作台", () => {
     expect(daemon.outerWireText()).not.toContain("secret-token");
   });
 
-  it("direct Web 路径串联 tmux-backed session 的 create/list/attach/input/resize/reconnect", async () => {
+  it("direct Web 路径串联 supervisor-backed session 的 create/list/attach/input/resize/reconnect", async () => {
     const user = userEvent.setup();
     const sessionId = "00000000-0000-0000-0000-000000000501";
     await daemon.stop();
@@ -6004,7 +6345,7 @@ describe("termui web 工作台", () => {
     });
     render(<App />);
 
-    await exerciseTmuxBackedWebLifecycle(user, daemon, {
+    await exerciseSupervisorBackedWebLifecycle(user, daemon, {
       sessionId,
       readyText: "direct-tmux-ready",
       cwd: "/tmp/direct-tmux-cwd",
@@ -6014,7 +6355,7 @@ describe("termui web 工作台", () => {
     });
   });
 
-  it("relay /ws 路径串联 tmux-backed session 的 create/list/attach/input/resize/reconnect", async () => {
+  it("relay /ws 路径串联 supervisor-backed session 的 create/list/attach/input/resize/reconnect", async () => {
     const user = userEvent.setup();
     const sessionId = "00000000-0000-0000-0000-000000000501";
     await daemon.stop();
@@ -6041,7 +6382,7 @@ describe("termui web 工作台", () => {
     });
     render(<App />);
 
-    await exerciseTmuxBackedWebLifecycle(user, daemon, {
+    await exerciseSupervisorBackedWebLifecycle(user, daemon, {
       sessionId,
       readyText: "relay-tmux-ready",
       cwd: "/tmp/relay-tmux-cwd",
@@ -6120,6 +6461,8 @@ describe("termui web 工作台", () => {
 
     await pairWithInvite(user, daemon);
     await waitForWorkspaceSession();
+    await screen.findByText(/termd-e2e-ready/);
+    await waitFor(() => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID]));
 
     await user.click(await screen.findByRole("button", { name: "Rename session" }));
     expect(screen.getByRole("button", { name: "Save session name" })).toBeDisabled();
@@ -6144,6 +6487,75 @@ describe("termui web 工作台", () => {
       expect(screen.queryByText("work shell")).toBeNull();
     });
     expect(daemon.closedSessions).toEqual(["00000000-0000-0000-0000-000000000401"]);
+  });
+
+  it("旧 session.list 响应不会把刚关闭的 session 合并回列表", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+
+    daemon.queueSessionListResponse([
+      {
+        session_id: DEFAULT_SESSION_ID,
+        name: DEFAULT_SESSION_NAME,
+        state: "running",
+        size: { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 },
+      },
+    ], 40);
+
+    await user.click(screen.getByRole("button", { name: "Close session" }));
+
+    await waitFor(() => {
+      expect(screen.queryByText(DEFAULT_SESSION_NAME)).toBeNull();
+    });
+    expect(daemon.closedSessions).toEqual([DEFAULT_SESSION_ID]);
+  });
+
+  it("旧 session.list 响应不会把当前选中态指回已关闭且隐藏的 session", async () => {
+    const user = userEvent.setup();
+    const alphaSession = {
+      session_id: "00000000-0000-0000-0000-000000000421",
+      name: "alpha",
+      state: "running",
+      size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+      created_at_ms: 3000,
+    } as const;
+    const betaSession = {
+      session_id: "00000000-0000-0000-0000-000000000422",
+      name: "beta",
+      state: "running",
+      size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+      created_at_ms: 2000,
+    } as const;
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [alphaSession, betaSession],
+      attachOutput: "attached-ready\n",
+    });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession("alpha");
+    await clickSessionCard(user, "beta");
+    await waitFor(() => expect(selectedSessionName()).toBe("beta"));
+
+    daemon.queueSessionListResponse([alphaSession, betaSession], 80);
+    const betaOpenButton = await screen.findByRole("button", { name: "Open beta" });
+    const betaRow = betaOpenButton.closest(".session-row");
+    expect(betaRow).not.toBeNull();
+    await user.click(within(betaRow as HTMLElement).getByRole("button", { name: "Close session" }));
+
+    await waitFor(() => {
+      expect(visibleSessionNames()).toEqual(["alpha"]);
+      expect(selectedSessionName()).toBe("alpha");
+    });
+    await new Promise((resolve) => window.setTimeout(resolve, 140));
+
+    expect(visibleSessionNames()).toEqual(["alpha"]);
+    expect(selectedSessionName()).toBe("alpha");
   });
 
   it("关闭已被 daemon 移除的 session 时按幂等删除处理", async () => {
@@ -6221,6 +6633,69 @@ describe("termui web 工作台", () => {
     await within(workspaceBody!).findByRole("alert", { name: "Connection error" });
     expect(screen.queryAllByText(DEFAULT_SESSION_NAME).length).toBeGreaterThan(0);
     expect(daemon.closedSessions).toEqual([]);
+  });
+
+  it("关闭 session 会取消合并窗口里的迟到 attach，避免已关闭 session 被本地复活", async () => {
+    const user = userEvent.setup();
+    const alphaSession = {
+      session_id: "00000000-0000-0000-0000-0000000004a1",
+      name: "alpha",
+      state: "running",
+      size: { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 },
+    } as const;
+    const betaSession = {
+      session_id: "00000000-0000-0000-0000-0000000004a2",
+      name: "beta",
+      state: "running",
+      size: { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 },
+    } as const;
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [alphaSession, betaSession],
+      attachOutput: "attached-ready\n",
+    });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession("alpha");
+    await screen.findByText(/attached-ready/);
+    await waitFor(() => expect(daemon.attachedSessions).toEqual([alphaSession.session_id]));
+
+    // 中文注释：清掉初始自动 attach 的痕迹，后续只观察“打开 beta 再立刻关闭 beta”
+    // 这一个竞态窗口里新增的 attach 请求。
+    daemon.attachedSessions.splice(0);
+    daemon.attachRequests.splice(0);
+
+    const betaRow = document
+      .querySelectorAll<HTMLElement>(".session-row")
+      .item(1);
+    expect(betaRow).not.toBeNull();
+    const openButton = within(betaRow).getByRole("button", { name: "Open beta" });
+    const closeButton = within(betaRow).getByRole("button", { name: "Close session" });
+
+    act(() => {
+      fireEvent.click(openButton);
+      fireEvent.click(closeButton);
+    });
+
+    await new Promise((resolve) => window.setTimeout(resolve, 160));
+    await waitFor(() => {
+      expect(screen.queryByText("beta")).toBeNull();
+    });
+
+    const betaWatchedAttachRequests = daemon.attachRequests.filter(
+      (request) => request.session_id === betaSession.session_id && request.watch_updates !== false,
+    );
+    const betaPermissionAttachRequests = daemon.attachRequests.filter(
+      (request) => request.session_id === betaSession.session_id && request.watch_updates === false,
+    );
+
+    expect(daemon.closedSessions).toEqual([betaSession.session_id]);
+    expect(betaWatchedAttachRequests).toHaveLength(0);
+    expect(betaPermissionAttachRequests).toEqual([{ session_id: betaSession.session_id, watch_updates: false }]);
+    expect(daemon.attachedSessions).toEqual([]);
+    expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
   });
 
   it("shared-control attach 后持续发送终端输入、光标位置和聚焦状态", async () => {

@@ -1193,8 +1193,8 @@ export function TerminalPane(props: TerminalPaneProps) {
     ) {
       return;
     }
-    // 中文注释：tmux attach client 是全屏 renderer，实时输出可能只重绘可见屏幕，
-    // 不会让 Ghostty 自身生成 scrollback。此时主动拉一次 daemon/tmux snapshot，
+    // 中文注释：supervisor attach 流是全屏 renderer，实时输出可能只重绘可见屏幕，
+    // 不会让 Ghostty 自身生成 scrollback。此时主动拉一次 daemon/supervisor snapshot，
     // 让浏览器获得可滚动历史；snapshot 完成后计数会被 noteTerminalOutputRendered 清零。
     terminalServerScrollbackResyncPendingRef.current = true;
     terminalLastServerScrollbackResyncAtRef.current = now;
@@ -1259,8 +1259,8 @@ export function TerminalPane(props: TerminalPaneProps) {
       return;
     }
     if (event.deltaY < 0) {
-      // 中文注释：tmux attach 的实时输出可能只是全屏 repaint，Ghostty 本地 baseY 仍为 0；
-      // 用户向上滚就是明确的“我要历史”信号，此时主动拉一次 daemon/tmux snapshot。
+      // 中文注释：supervisor attach 的实时输出可能只是全屏 repaint，Ghostty 本地 baseY 仍为 0；
+      // 用户向上滚就是明确的“我要历史”信号，此时主动拉一次 daemon/supervisor snapshot。
       event.preventDefault();
       event.stopPropagation();
       maybeRequestServerScrollbackResync(scrollState.baseY, "user-scroll");
@@ -1876,9 +1876,14 @@ export function TerminalPane(props: TerminalPaneProps) {
       activeElement instanceof HTMLElement &&
       terminalHost &&
       !terminalHost.contains(activeElement) &&
-      Boolean(activeElement.closest(".toolbar, .mobile-menu-popover, .mobile-panel, .files-panel"))
+      (Boolean(activeElement.closest(".toolbar, .mobile-menu-popover, .mobile-panel, .files-panel")) ||
+        activeElement.isContentEditable ||
+        activeElement instanceof HTMLInputElement ||
+        activeElement instanceof HTMLTextAreaElement ||
+        activeElement instanceof HTMLSelectElement)
     ) {
       // 延迟 focusRequest 不能抢走用户刚聚焦的工作台工具栏、菜单、文件面板等控件；
+      // session/daemon 重命名、路径输入、连接表单也属于显式文本编辑，同样不能被 Ghostty 抢焦点。
       // 否则移动端键盘常驻会破坏顶部工具按钮的键盘/辅助技术操作。
       if (requestId !== undefined && pendingFocusRequestRef.current === requestId) {
         pendingFocusRequestRef.current = undefined;
@@ -2373,13 +2378,13 @@ export function TerminalPane(props: TerminalPaneProps) {
           !localTerminalWillOwnResizeAuthority() &&
           !sameTerminalDimensions(terminal, remoteSize)
         ) {
-          // 中文注释：未聚焦客户端虽然不能把自己的布局写回 shared PTY，但 daemon/tmux
+          // 中文注释：未聚焦客户端虽然不能把自己的布局写回 shared PTY，但 daemon/supervisor
           // 已确认的新 rows/cols 仍然是权威尺寸。这里必须被动跟随远端 grid，否则后续
-          // output/snapshot 仍会按旧列宽解释，tmux/vim/top 这类全屏界面会直接错位。
+          // output/snapshot 仍会按旧列宽解释，vim/top 这类全屏界面会直接错位。
           terminal.resize(remoteSize.cols, remoteSize.rows);
         }
         // 中文注释：窗口失焦后的 layout/blur 抖动不能把本地 Ghostty 立即缩回远端尺寸。
-        // 只有 daemon/tmux 真的确认了新的 sessionSize，未聚焦客户端才跟随权威 grid；
+        // 只有 daemon/supervisor 真的确认了新的 sessionSize，未聚焦客户端才跟随权威 grid；
         // 否则回到页面时会先看到一次旧 grid/旧布局，再被 focus resize 拉回当前容器。
         scheduleScrollToBottomIfPinned(wasPinnedToBottom);
         queueCursorReport({ immediate: true });
@@ -2567,7 +2572,7 @@ export function TerminalPane(props: TerminalPaneProps) {
           stabilizeTerminal("snapshot");
           // 中文注释：reload/重连时 daemon snapshot 可能仍是旧的 80x24。若当前客户端
           // 已经重新聚焦终端，snapshot 重放完成后必须按 focus 路径把真实浏览器尺寸
-          // 写回 daemon/tmux；仅本地 fit 会让下一次 attach 继续拿到旧分辨率。
+          // 写回 daemon/supervisor；仅本地 fit 会让下一次 attach 继续拿到旧分辨率。
           requestTrackedFrame(() => resizeRef.current?.(pendingResizeSource ?? "focus"));
           revealHistoryAfterFit();
           return;
@@ -2612,7 +2617,7 @@ export function TerminalPane(props: TerminalPaneProps) {
     stabilizeTerminal();
     if (terminalDomHasActiveFocus()) {
       // 中文注释：reload 后用户或测试可能在 Ghostty canvas mount 前已经把焦点放到 host；
-      // renderer 就绪后必须补一次 focus resize，否则 daemon/tmux 会继续停在旧 snapshot 尺寸。
+      // renderer 就绪后必须补一次 focus resize，否则 daemon/supervisor 会继续停在旧 snapshot 尺寸。
       reportTerminalFocus(true);
       stabilizeTerminal("focus");
     }

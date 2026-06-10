@@ -13,6 +13,7 @@ export const ALL_MESSAGE_TYPES = [
   "session_data",
   "terminal_frame",
   "session_activity",
+  "session_cwd_changed",
   "session_cursor",
   "session_resize",
   "session_resized",
@@ -621,6 +622,11 @@ export type RenderableTerminalFramePayload = SingleTerminalFramePayload & {
 export interface SessionActivityPayload {
   session_id: UUID;
   timestamp_ms: UnixTimestampMillis;
+}
+
+export interface SessionCwdChangedPayload {
+  session_id: UUID;
+  cwd: string;
 }
 
 export interface SessionCursorPayload {

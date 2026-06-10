@@ -45,6 +45,7 @@ use termd_proto::{
     PairRequestPayload, PingPayload, PongPayload, ProtocolPacket, ProtocolVersion, ServerId,
     SessionActivityPayload, SessionAttachPayload, SessionAttachedPayload, SessionClosePayload,
     SessionClosedPayload, SessionCreatePayload, SessionCreatedPayload, SessionCursorPayload,
+    SessionCwdChangedPayload,
     SessionDataPayload, SessionFileDeletePayload, SessionFileDeletedPayload,
     SessionFileDownloadChunkPayload, SessionFileDownloadChunkResultPayload,
     SessionFileDownloadPreparePayload, SessionFileDownloadReadyPayload,
@@ -190,6 +191,8 @@ struct PacketTerminalStreamStateSnapshot {
     packet_terminal_streams_by_session: HashMap<SessionId, PacketStreamId>,
     attached_sessions: Vec<SessionId>,
     watched_sessions: HashSet<SessionId>,
+    watched_cwd_versions: HashMap<SessionId, u64>,
+    watched_cwd_paths: HashMap<SessionId, Option<String>>,
     watched_attachment_ids: HashMap<SessionId, String>,
     next_watched_attachment_number: u64,
     stale_watched_sessions: HashSet<SessionId>,
@@ -864,7 +867,7 @@ pub struct DaemonProtocol<B: PtyBackend, V> {
     client_history: ClientHistoryStore,
     session_output_history: HashMap<SessionId, SessionOutputHistory>,
     session_terminal_frame_logs: HashMap<SessionId, SessionTerminalFrameLog>,
-    session_file_tree_signals: HashMap<SessionId, watch::Sender<u64>>,
+    session_cwd_signals: HashMap<SessionId, watch::Sender<u64>>,
     session_resize_signals: HashMap<SessionId, watch::Sender<TerminalSize>>,
 }
 
@@ -971,7 +974,7 @@ where
             client_history,
             session_output_history: HashMap::new(),
             session_terminal_frame_logs: HashMap::new(),
-            session_file_tree_signals: HashMap::new(),
+            session_cwd_signals: HashMap::new(),
             session_resize_signals: HashMap::new(),
         })
     }
@@ -1415,9 +1418,8 @@ where
             self.session_roots
                 .insert(wire_session_id, session_root.clone());
             self.session_output_history_mut(wire_session_id, payload.size);
-            let (file_tree_signal, _) = watch::channel(0);
-            self.session_file_tree_signals
-                .insert(wire_session_id, file_tree_signal);
+            let (cwd_signal, _) = watch::channel(0);
+            self.session_cwd_signals.insert(wire_session_id, cwd_signal);
             let (resize_signal, _) = watch::channel(payload.size);
             self.session_resize_signals
                 .insert(wire_session_id, resize_signal);
@@ -1888,7 +1890,7 @@ where
             .remove(&session_id);
         self.session_output_history.remove(&session_id);
         self.session_terminal_frame_logs.remove(&session_id);
-        self.session_file_tree_signals.remove(&session_id);
+        self.session_cwd_signals.remove(&session_id);
         self.session_resize_signals.remove(&session_id);
         for record in self.daemon_clients.values_mut() {
             for sessions in record.active_connections.values_mut() {
@@ -1961,15 +1963,21 @@ where
             .map(str::trim)
             .filter(|path| !path.is_empty())
             .is_some();
+        let refreshed_cwd = self.refresh_session_terminal_cwd(payload.session_id)?;
         let requested_path = if has_explicit_path {
             payload.path.clone()
         } else {
-            self.default_session_files_path(payload.session_id)?
+            self.default_session_files_path_after_refresh(
+                payload.session_id,
+                refreshed_cwd.clone(),
+            )?
         };
-        let result =
-            self.session_files_result(payload.session_id, requested_path, !has_explicit_path)?;
-        self.notify_session_file_tree_changed(payload.session_id);
-
+        let result = self.session_files_result_after_refresh(
+            payload.session_id,
+            requested_path,
+            !has_explicit_path,
+            refreshed_cwd,
+        )?;
         Ok(vec![envelope_value(
             MessageType::SessionFilesResult,
             result,
@@ -2123,8 +2131,6 @@ where
         }
         fs::write(&target, &bytes).map_err(map_file_path_error)?;
         let metadata = fs::metadata(&target).map_err(map_file_path_error)?;
-        self.notify_session_file_tree_changed(payload.session_id);
-
         Ok(vec![envelope_value(
             MessageType::SessionFileWritten,
             SessionFileWrittenPayload {
@@ -2152,8 +2158,6 @@ where
         } else {
             fs::remove_file(&target).map_err(map_file_path_error)?;
         }
-        self.notify_session_file_tree_changed(payload.session_id);
-
         Ok(vec![envelope_value(
             MessageType::SessionFileDeleted,
             SessionFileDeletedPayload {
@@ -2479,7 +2483,6 @@ where
                 return Err(ProtocolError::InvalidEnvelope);
             };
             state.status = SessionFileHttpUploadStatus::Complete;
-            self.notify_session_file_tree_changed(payload.session_id);
             return Ok(SessionFileHttpUploadCommit::Complete(progress));
         }
         Err(ProtocolError::InvalidState)
@@ -2643,7 +2646,6 @@ where
             fs::rename(&stream.temp_path, &stream.path).map_err(map_file_path_error)?;
             let metadata = fs::metadata(&stream.path).map_err(map_file_path_error)?;
             modified_at_ms = metadata_modified_at_ms(&metadata);
-            self.notify_session_file_tree_changed(stream.session_id);
         }
 
         Ok((
@@ -3525,8 +3527,7 @@ where
 
         buffer.truncate(read);
         let size = self.runtime_size_proto(internal_session_id)?;
-        self.session_output_history_mut(session_id, size)
-            .append(&buffer);
+        self.session_output_history_mut(session_id, size).append(&buffer);
         self.maybe_notify_terminal_cwd_probe(session_id);
         Ok(true)
     }
@@ -3566,7 +3567,18 @@ where
         &mut self,
         session_id: SessionId,
     ) -> Result<Option<String>, ProtocolError> {
-        self.sync_session_terminal_cwd(session_id)?;
+        let refreshed_cwd = self.refresh_session_terminal_cwd(session_id)?;
+        self.default_session_files_path_after_refresh(session_id, refreshed_cwd)
+    }
+
+    fn default_session_files_path_after_refresh(
+        &mut self,
+        session_id: SessionId,
+        refreshed_cwd: Option<String>,
+    ) -> Result<Option<String>, ProtocolError> {
+        if let Some(cwd) = refreshed_cwd {
+            return Ok(Some(cwd));
+        }
         if let Some(cwd) = self.session_terminal_cwds.get(&session_id) {
             return Ok(Some(absolute_path_string(cwd)));
         }
@@ -3576,29 +3588,61 @@ where
             .map_err(ProtocolError::from)
     }
 
-    fn sync_session_terminal_cwd(&mut self, session_id: SessionId) -> Result<bool, ProtocolError> {
+    fn current_session_terminal_cwd_after_refresh(
+        &self,
+        session_id: SessionId,
+        refreshed_cwd: Option<String>,
+    ) -> Option<String> {
+        if let Some(cwd) = refreshed_cwd {
+            return Some(cwd);
+        }
+        self.session_terminal_cwds
+            .get(&session_id)
+            .map(|cwd| absolute_path_string(cwd))
+    }
+
+    fn session_cwd_value(
+        &mut self,
+        session_id: SessionId,
+    ) -> Result<Option<String>, ProtocolError> {
+        if !self.session_index.contains_key(&session_id) {
+            return Err(ProtocolError::SessionNotFound);
+        }
+        let refreshed_cwd = self.refresh_session_terminal_cwd(session_id)?;
+        // 中文注释：`session.cwd` 是 watcher 事件，不是“仅当本次 RPC 首次发现变化时才返回”。
+        // 如果别的 RPC（如 `session.files`）已经先刷新了 cwd cache，这里仍要返回当前
+        // 已知 terminal cwd，避免 watcher 事件被缓存更新顺序吞掉。
+        Ok(self.current_session_terminal_cwd_after_refresh(session_id, refreshed_cwd))
+    }
+
+    fn refresh_session_terminal_cwd(
+        &mut self,
+        session_id: SessionId,
+    ) -> Result<Option<String>, ProtocolError> {
         let Some(cwd) = self.read_session_terminal_cwd(session_id)? else {
             // 中文注释：tmux pane cwd 可能在目录被删除或权限变化后暂时不可读。
             // 这时不能继续使用上一轮成功同步的 terminal cwd cache；否则文件面板
             // 会在用户手动浏览后又被旧 cwd 拉回去。清掉内存 cache 后让调用方
             // 回退到 client history 中的最新文件面板位置。
-            return Ok(self.session_terminal_cwds.remove(&session_id).is_some());
+            self.session_terminal_cwds.remove(&session_id);
+            return Ok(None);
         };
         if self
             .session_terminal_cwds
             .get(&session_id)
             .is_some_and(|cached| cached == &cwd)
         {
-            return Ok(false);
+            return Ok(None);
         }
 
+        let cwd_string = absolute_path_string(&cwd);
         self.session_terminal_cwds.insert(session_id, cwd.clone());
         self.client_history.record_session_files_path(
             session_id,
             &cwd,
             current_unix_timestamp_millis(),
         )?;
-        Ok(true)
+        Ok(Some(cwd_string))
     }
 
     fn read_session_terminal_cwd(
@@ -3626,15 +3670,37 @@ where
         Ok(Some(cwd))
     }
 
+    #[cfg(test)]
     fn session_files_result(
         &mut self,
         session_id: SessionId,
         requested_path: Option<String>,
         fallback_to_root: bool,
     ) -> Result<SessionFilesResultPayload, ProtocolError> {
+        let refreshed_cwd = self.refresh_session_terminal_cwd(session_id)?;
+        self.session_files_result_after_refresh(
+            session_id,
+            requested_path,
+            fallback_to_root,
+            refreshed_cwd,
+        )
+    }
+
+    fn session_files_result_after_refresh(
+        &mut self,
+        session_id: SessionId,
+        requested_path: Option<String>,
+        fallback_to_root: bool,
+        refreshed_cwd: Option<String>,
+    ) -> Result<SessionFilesResultPayload, ProtocolError> {
         // 中文注释：文件列表是 active upload 目标可见性的入口；进入列表前先清理
         // 已超时的 upload 状态，避免断开的旧上传把预分配目标永久隐藏。
         self.prune_session_file_http_uploads();
+        let requested_path = if requested_path.is_some() {
+            requested_path
+        } else {
+            self.default_session_files_path_after_refresh(session_id, refreshed_cwd)?
+        };
         let root = self
             .session_roots
             .get(&session_id)
@@ -3796,23 +3862,13 @@ where
             .ok_or(ProtocolError::InvalidEnvelope)
     }
 
-    fn session_file_tree_update(
-        &mut self,
-        session_id: SessionId,
-    ) -> Result<JsonEnvelope, ProtocolError> {
-        if !self.session_index.contains_key(&session_id) {
-            return Err(ProtocolError::SessionNotFound);
-        }
-        let requested_path = self.default_session_files_path(session_id)?;
-        let payload = self.session_files_result(session_id, requested_path, true)?;
-        envelope_value(MessageType::SessionFilesResult, payload)
-    }
-
     fn maybe_notify_terminal_cwd_probe(&mut self, session_id: SessionId) {
-        let Some(signal) = self.session_file_tree_signals.get(&session_id) else {
-            return;
-        };
-        if signal.receiver_count() == 0 {
+        let cwd_receivers = self
+            .session_cwd_signals
+            .get(&session_id)
+            .map(watch::Sender::receiver_count)
+            .unwrap_or(0);
+        if cwd_receivers == 0 {
             return;
         }
 
@@ -3827,20 +3883,20 @@ where
             return;
         }
 
-        // 中文注释：terminal output 热路径只能发低频“可能需要刷新文件树”的信号，
-        // 不能在每个输出 frame 后同步读 /proc、canonicalize 或写 history。真正 cwd
-        // 同步放在 file tree 更新读取路径里执行，避免大输出拖住 direct/relay 共用控制面。
+        // 中文注释：daemon 侧仍保留低频输出探测，但这里现在只负责唤醒 cwd watcher。
+        // 共享文件树是 termd 的重资源读取面，client 收到 cwd 轻事件后必须显式再拉
+        // `session.files`，这样 direct websocket 和 relay 的语义才能完全一致。
         self.session_terminal_cwd_probe_notified_at_ms
             .insert(session_id, now_ms);
-        self.notify_session_file_tree_changed(session_id);
+        self.notify_session_cwd_changed(session_id);
     }
 
-    fn notify_session_file_tree_changed(&self, session_id: SessionId) {
-        let Some(signal) = self.session_file_tree_signals.get(&session_id) else {
+    fn notify_session_cwd_changed(&self, session_id: SessionId) {
+        let Some(signal) = self.session_cwd_signals.get(&session_id) else {
             return;
         };
         let next_version = signal.borrow().saturating_add(1);
-        // 没有 watcher 时 send 会返回错误；文件树状态已经写入 SQLite，可以安全忽略。
+        // cwd 变化只是轻量提示，没有 watcher 时也可以直接忽略。
         let _ = signal.send(next_version);
     }
 
@@ -3969,7 +4025,7 @@ where
             .map_err(map_runtime_error)
     }
 
-    fn file_tree_signal(
+    fn cwd_signal(
         &self,
         session_id: SessionId,
     ) -> Result<Option<watch::Receiver<u64>>, ProtocolError> {
@@ -3977,7 +4033,7 @@ where
             return Err(ProtocolError::SessionNotFound);
         }
         Ok(self
-            .session_file_tree_signals
+            .session_cwd_signals
             .get(&session_id)
             .map(watch::Sender::subscribe))
     }
@@ -4391,6 +4447,13 @@ pub struct ProtocolConnection {
     // `attached_sessions` 表示权限范围；`watched_sessions` 才表示该连接要接收实时输出。
     // 文件/Git/search 等短连接会只 attach 权限，避免大流量终端输出堵住 RPC 响应。
     watched_sessions: HashSet<SessionId>,
+    // 中文注释：每条连接单独记住自己已经消费到的 cwd watcher version，避免 daemon
+    // 因低频 probe 重复返回“当前 cwd”时，把同一个 version 多次升级成 changed 事件。
+    watched_cwd_versions: HashMap<SessionId, u64>,
+    // 中文注释：version 只能说明 watcher 收到一次“请检查 cwd”的提示，不能说明 cwd
+    // 本身一定变化。这里按连接缓存最后一次已下发的 cwd 值，避免 probe-only 场景把
+    // 同一 cwd 每秒再推一遍，导致前端 follow 反复重拉 session.files。
+    watched_cwd_paths: HashMap<SessionId, Option<String>>,
     // 中文注释：watched terminal 是连接级资源，不是设备级角色。这里保存 runtime
     // attachment id，连接断开或 terminal stream 取消时只释放自己的 tmux client。
     watched_attachment_ids: HashMap<SessionId, String>,
@@ -4656,6 +4719,8 @@ impl ProtocolConnection {
             packet_file_download_streams: HashMap::new(),
             attached_sessions: Vec::new(),
             watched_sessions: HashSet::new(),
+            watched_cwd_versions: HashMap::new(),
+            watched_cwd_paths: HashMap::new(),
             watched_attachment_ids: HashMap::new(),
             next_watched_attachment_number: 1,
             stale_watched_sessions: HashSet::new(),
@@ -4818,8 +4883,8 @@ impl ProtocolConnection {
         }
     }
 
-    /// 读取并加密当前 session 文件树状态，用于 WebSocket watcher 主动推送。
-    pub fn read_session_file_tree_update<B, V>(
+    /// 读取并加密当前 session 的 cwd 变化事件，用于文件树跟随模式的轻量通知。
+    pub fn read_session_cwd_update<B, V>(
         &mut self,
         protocol: &mut DaemonProtocol<B, V>,
         session_id: SessionId,
@@ -4828,13 +4893,13 @@ impl ProtocolConnection {
         B: PtyBackend,
         V: SignatureVerifier,
     {
-        match self.try_read_session_file_tree_update(protocol, session_id) {
+        match self.try_read_session_cwd_update(protocol, session_id) {
             Ok(messages) => messages,
             Err(error) => vec![self.error_response(error)],
         }
     }
 
-    pub fn read_session_file_tree_update_wire<B, V>(
+    pub fn read_session_cwd_update_wire<B, V>(
         &mut self,
         protocol: &mut DaemonProtocol<B, V>,
         session_id: SessionId,
@@ -4843,7 +4908,7 @@ impl ProtocolConnection {
         B: PtyBackend,
         V: SignatureVerifier,
     {
-        match self.try_collect_session_file_tree_update_messages(protocol, session_id) {
+        match self.try_collect_session_cwd_update_messages(protocol, session_id) {
             Ok(messages) => match self.encrypt_inner_messages_wire(messages) {
                 Ok(messages) => messages,
                 Err(error) => vec![self.error_response_wire(error)],
@@ -4852,11 +4917,8 @@ impl ProtocolConnection {
         }
     }
 
-    /// 只读取当前 session 文件树状态，不做 E2EE 封包。
-    ///
-    /// relay/直连推送热路径会先释放全局 protocol lock，再调用
-    /// `encrypt_collected_inner_messages_wire`，避免慢加密阻塞其它连接输入。
-    pub fn read_session_file_tree_update_messages<B, V>(
+    /// 只读取当前 session 的 cwd 变化事件，不做 E2EE 封包。
+    pub fn read_session_cwd_update_messages<B, V>(
         &mut self,
         protocol: &mut DaemonProtocol<B, V>,
         session_id: SessionId,
@@ -4865,7 +4927,7 @@ impl ProtocolConnection {
         B: PtyBackend,
         V: SignatureVerifier,
     {
-        self.try_collect_session_file_tree_update_messages(protocol, session_id)
+        self.try_collect_session_cwd_update_messages(protocol, session_id)
     }
 
     /// 读取并加密当前 session 的 resize 状态，用于多窗口同步 PTY 尺寸元数据。
@@ -4997,8 +5059,8 @@ impl ProtocolConnection {
             .collect()
     }
 
-    /// 返回当前连接已 attach session 的文件树信号，供 WebSocket 层注册主动推送 watcher。
-    pub fn attached_file_tree_signals<B, V>(
+    /// 返回当前连接已 attach session 的 cwd 变化信号，供 WebSocket/relay 推送轻量 cwd 事件。
+    pub fn attached_cwd_signals<B, V>(
         &self,
         protocol: &DaemonProtocol<B, V>,
     ) -> Vec<(SessionId, watch::Receiver<u64>)>
@@ -5011,7 +5073,7 @@ impl ProtocolConnection {
             .filter(|session_id| self.watched_sessions.contains(*session_id))
             .filter_map(|session_id| {
                 protocol
-                    .file_tree_signal(*session_id)
+                    .cwd_signal(*session_id)
                     .ok()
                     .flatten()
                     .map(|signal| (*session_id, signal))
@@ -5468,7 +5530,7 @@ impl ProtocolConnection {
         }
     }
 
-    fn try_read_session_file_tree_update<B, V>(
+    fn try_read_session_cwd_update<B, V>(
         &mut self,
         protocol: &mut DaemonProtocol<B, V>,
         session_id: SessionId,
@@ -5477,11 +5539,11 @@ impl ProtocolConnection {
         B: PtyBackend,
         V: SignatureVerifier,
     {
-        let messages = self.try_collect_session_file_tree_update_messages(protocol, session_id)?;
+        let messages = self.try_collect_session_cwd_update_messages(protocol, session_id)?;
         self.encrypt_inner_messages(messages)
     }
 
-    fn try_collect_session_file_tree_update_messages<B, V>(
+    fn try_collect_session_cwd_update_messages<B, V>(
         &mut self,
         protocol: &mut DaemonProtocol<B, V>,
         session_id: SessionId,
@@ -5492,11 +5554,39 @@ impl ProtocolConnection {
     {
         self.authenticated_device_id()?;
         if !self.watched_sessions.contains(&session_id) {
+            if self.stale_watched_sessions.contains(&session_id) {
+                return Ok(Vec::new());
+            }
             return Err(ProtocolError::InvalidState);
         }
 
-        let update = protocol.session_file_tree_update(session_id)?;
-        Ok(vec![update])
+        let current_version = protocol
+            .session_cwd_signals
+            .get(&session_id)
+            .map(|signal| *signal.borrow())
+            .unwrap_or(0);
+        let last_seen_version = self.watched_cwd_versions.get(&session_id).copied().unwrap_or(0);
+        if current_version == 0 || current_version == last_seen_version {
+            return Ok(Vec::new());
+        }
+
+        let Some(cwd) = protocol.session_cwd_value(session_id)? else {
+            return Ok(Vec::new());
+        };
+        self.watched_cwd_versions.insert(session_id, current_version);
+        let last_pushed_cwd = self
+            .watched_cwd_paths
+            .get(&session_id)
+            .and_then(|cwd| cwd.clone());
+        if last_pushed_cwd.as_deref() == Some(cwd.as_str()) {
+            return Ok(Vec::new());
+        }
+        self.watched_cwd_paths
+            .insert(session_id, Some(cwd.clone()));
+        Ok(vec![envelope_value(
+            MessageType::SessionCwdChanged,
+            SessionCwdChangedPayload { session_id, cwd },
+        )?])
     }
 
     fn try_read_session_resize_update<B, V>(
@@ -5523,6 +5613,9 @@ impl ProtocolConnection {
     {
         self.authenticated_device_id()?;
         if !self.watched_sessions.contains(&session_id) {
+            if self.stale_watched_sessions.contains(&session_id) {
+                return Ok(Vec::new());
+            }
             return Err(ProtocolError::InvalidState);
         }
         let internal_session_id = protocol
@@ -6391,6 +6484,8 @@ impl ProtocolConnection {
             packet_terminal_streams_by_session: self.packet_terminal_streams_by_session.clone(),
             attached_sessions: self.attached_sessions.clone(),
             watched_sessions: self.watched_sessions.clone(),
+            watched_cwd_versions: self.watched_cwd_versions.clone(),
+            watched_cwd_paths: self.watched_cwd_paths.clone(),
             watched_attachment_ids: self.watched_attachment_ids.clone(),
             next_watched_attachment_number: self.next_watched_attachment_number,
             stale_watched_sessions: self.stale_watched_sessions.clone(),
@@ -6411,6 +6506,8 @@ impl ProtocolConnection {
         self.packet_terminal_streams_by_session = snapshot.packet_terminal_streams_by_session;
         self.attached_sessions = snapshot.attached_sessions;
         self.watched_sessions = snapshot.watched_sessions;
+        self.watched_cwd_versions = snapshot.watched_cwd_versions;
+        self.watched_cwd_paths = snapshot.watched_cwd_paths;
         self.watched_attachment_ids = snapshot.watched_attachment_ids;
         self.next_watched_attachment_number = snapshot.next_watched_attachment_number;
         self.stale_watched_sessions = snapshot.stale_watched_sessions;
@@ -6444,6 +6541,8 @@ impl ProtocolConnection {
             // 快速切换 session 时旧 stream 清掉后也必须取消 watched 状态，否则 relay/直连
             // watcher 仍会为旧 session 产生唤醒，继续占用输出队列。
             if self.watched_sessions.remove(session_id) {
+                self.watched_cwd_versions.remove(session_id);
+                self.watched_cwd_paths.remove(session_id);
                 self.stale_watched_sessions.insert(*session_id);
                 if let Some(attachment_id) = self.watched_attachment_ids.remove(session_id) {
                     removed_attachments.push((*session_id, attachment_id));
@@ -6472,6 +6571,8 @@ impl ProtocolConnection {
             .remove(&stream.session_id);
         self.deferred_output_wakeups.remove(&stream.session_id);
         if self.watched_sessions.remove(&stream.session_id) {
+            self.watched_cwd_versions.remove(&stream.session_id);
+            self.watched_cwd_paths.remove(&stream.session_id);
             self.stale_watched_sessions.insert(stream.session_id);
             return self
                 .watched_attachment_ids
@@ -6578,6 +6679,8 @@ impl ProtocolConnection {
         if watch_updates {
             self.stale_watched_sessions.remove(&session_id);
             self.watched_sessions.insert(session_id);
+            self.watched_cwd_versions.insert(session_id, 0);
+            self.watched_cwd_paths.insert(session_id, None);
             self.output_offsets.insert(session_id, output_base_offset);
             if !initial_output.is_empty() {
                 self.pending_outputs
@@ -13171,6 +13274,71 @@ mod tests {
     }
 
     #[test]
+    fn startup_restores_live_session_cwd_watchers_from_sqlite() {
+        let backend = FakePtyBackend::default();
+        let state_path = temp_state_path("restore-live-session-cwd-watchers.json");
+        let config = DaemonConfig::default_for_state_path(&state_path);
+        let session_id = SessionId::new();
+
+        let state = DaemonState {
+            version: crate::state::STATE_SCHEMA_VERSION,
+            daemon_identity: None,
+            trusted_devices: Vec::new(),
+            sessions: vec![SessionStateRecord {
+                session_id,
+                state: SessionState::Running,
+                size: TerminalSize::new(40, 120),
+                created_at_ms: UnixTimestampMillis(1_000),
+                updated_at_ms: UnixTimestampMillis(1_002),
+                restore_info: Some(socket_restore_info(session_id)),
+            }],
+        };
+        StateStore::save(&state_path, &state).unwrap();
+        let state = StateStore::load(&state_path).unwrap();
+        let mut protocol =
+            DaemonProtocol::from_state(config, backend.clone(), Ed25519SignatureVerifier, state)
+                .unwrap();
+
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = PublicKey(wire(signing_key.verifying_key().as_bytes()));
+        let (_, mut device_session) = open_e2ee(&mut protocol, &mut connection, device_id);
+        pair_device(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            device_id,
+            public_key,
+        );
+
+        let attach_responses = send_encrypted(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            envelope_value(
+                MessageType::SessionAttach,
+                SessionAttachPayload {
+                    session_id,
+                    watch_updates: true,
+                    last_terminal_seq: None,
+                },
+            )
+            .unwrap(),
+        );
+        let attached = decrypt_first(&mut device_session, attach_responses);
+        assert_eq!(attached.kind, MessageType::SessionAttached);
+
+        assert!(
+            connection
+                .attached_cwd_signals(&protocol)
+                .into_iter()
+                .any(|(attached_session_id, _)| attached_session_id == session_id),
+            "恢复后的 live supervisor session 仍必须注册 cwd watcher"
+        );
+    }
+
+    #[test]
     fn startup_restores_reconnectable_session_without_client_history_metadata() {
         let backend = FakePtyBackend::default();
         let state_path = temp_state_path("restore-without-history.json");
@@ -16231,16 +16399,17 @@ mod tests {
     }
 
     #[test]
-    fn attached_connection_receives_file_tree_update_when_another_client_changes_directory() {
-        let base = temp_state_path("shared-files-push-base");
+    fn manual_file_tree_browse_does_not_push_updates_to_other_connections() {
+        let base = temp_state_path("shared-file-tree-browse-base");
         let root = base.join("project");
         let work = base.join("work");
         fs::create_dir_all(&root).unwrap();
         fs::create_dir_all(&work).unwrap();
         fs::write(work.join("beta.log"), b"sync\n").unwrap();
         let backend = FakePtyBackend::default();
-        let mut config =
-            DaemonConfig::default_for_state_path(temp_state_path("shared-files-push-state.json"));
+        let mut config = DaemonConfig::default_for_state_path(temp_state_path(
+            "shared-file-tree-browse-state.json",
+        ));
         config.default_command = vec!["sh".to_owned()];
         config.default_working_directory = Some(root.clone());
         let mut protocol =
@@ -16313,19 +16482,14 @@ mod tests {
         let listed = decrypt_first(&mut first_crypto, list_responses);
         assert_eq!(listed.kind, MessageType::SessionFilesResult);
 
-        let pushed = second_connection
-            .read_session_file_tree_update(&mut protocol, created_payload.session_id);
-        let pushed = decrypt_first(&mut second_crypto, pushed);
-        let pushed_payload: SessionFilesResultPayload = decode_payload(pushed.payload).unwrap();
-
-        assert_eq!(pushed.kind, MessageType::SessionFilesResult);
-        assert_eq!(pushed_payload.path, work.to_string_lossy());
+        let pushed = second_connection.read_session_cwd_update(&mut protocol, created_payload.session_id);
+        assert!(pushed.is_empty());
 
         fs::remove_dir_all(base).ok();
     }
 
     #[test]
-    fn terminal_output_pushes_file_tree_update_when_terminal_cwd_changes() {
+    fn terminal_output_pushes_cwd_update_when_terminal_cwd_changes() {
         let base = temp_state_path("terminal-cwd-push-base");
         let root = base.join("project");
         let work = root.join("work");
@@ -16389,34 +16553,46 @@ mod tests {
         );
         let attached = decrypt_first(&mut second_crypto, attach_responses);
         assert_eq!(attached.kind, MessageType::SessionAttached);
-        let mut file_tree_signal = second_connection
-            .attached_file_tree_signals(&protocol)
+        let mut cwd_signal = second_connection
+            .attached_cwd_signals(&protocol)
             .into_iter()
             .find(|(session_id, _)| *session_id == created_payload.session_id)
             .map(|(_, signal)| signal)
-            .expect("attached connection should subscribe to file tree changes");
-        file_tree_signal.borrow_and_update();
+            .expect("attached connection should subscribe to cwd changes");
+        cwd_signal.borrow_and_update();
 
         backend.set_cwd_for_session(created_payload.session_id, work.clone());
         backend.push_output_for_session(created_payload.session_id, b"$ ");
         let output_responses =
             first_connection.read_session_output(&mut protocol, created_payload.session_id, 4096);
         assert!(!output_responses.is_empty());
-        assert!(file_tree_signal.has_changed().unwrap());
+        assert!(cwd_signal.has_changed().unwrap());
 
-        let pushed = second_connection
-            .read_session_file_tree_update(&mut protocol, created_payload.session_id);
+        let pushed = second_connection.read_session_cwd_update(&mut protocol, created_payload.session_id);
         let pushed = decrypt_first(&mut second_crypto, pushed);
-        let pushed_payload: SessionFilesResultPayload = decode_payload(pushed.payload).unwrap();
+        let pushed_payload: SessionCwdChangedPayload = decode_payload(pushed.payload).unwrap();
 
-        assert_eq!(pushed.kind, MessageType::SessionFilesResult);
-        assert_eq!(pushed_payload.path, work.to_string_lossy());
-        assert!(
-            pushed_payload
-                .entries
-                .iter()
-                .any(|entry| entry.name == "from-cwd.txt")
+        assert_eq!(pushed.kind, MessageType::SessionCwdChanged);
+        assert_eq!(pushed_payload.cwd, work.to_string_lossy());
+
+        let files_responses = send_encrypted(
+            &mut protocol,
+            &mut second_connection,
+            &mut second_crypto,
+            envelope_value(
+                MessageType::SessionFiles,
+                SessionFilesPayload {
+                    session_id: created_payload.session_id,
+                    path: None,
+                },
+            )
+            .unwrap(),
         );
+        let files = decrypt_first(&mut second_crypto, files_responses);
+        let files_payload: SessionFilesResultPayload = decode_payload(files.payload).unwrap();
+        assert_eq!(files.kind, MessageType::SessionFilesResult);
+        assert_eq!(files_payload.path, work.to_string_lossy());
+        assert!(files_payload.entries.iter().any(|entry| entry.name == "from-cwd.txt"));
 
         fs::remove_dir_all(base).ok();
     }
@@ -16463,13 +16639,13 @@ mod tests {
         );
         let created = decrypt_first(&mut device_session, created_responses);
         let created_payload: SessionCreatedPayload = decode_payload(created.payload).unwrap();
-        let mut file_tree_signal = connection
-            .attached_file_tree_signals(&protocol)
+        let mut cwd_signal = connection
+            .attached_cwd_signals(&protocol)
             .into_iter()
             .find(|(session_id, _)| *session_id == created_payload.session_id)
             .map(|(_, signal)| signal)
-            .expect("attached connection should subscribe to file tree changes");
-        file_tree_signal.borrow_and_update();
+            .expect("attached connection should subscribe to cwd changes");
+        cwd_signal.borrow_and_update();
 
         backend.set_cwd_for_session(created_payload.session_id, work.clone());
         backend.push_output_for_session(created_payload.session_id, b"$ ");
@@ -16482,19 +16658,182 @@ mod tests {
             backend.cwd_read_count_for_session(created_payload.session_id),
             0
         );
-        assert!(file_tree_signal.has_changed().unwrap());
+        assert!(cwd_signal.has_changed().unwrap());
 
-        let pushed =
-            connection.read_session_file_tree_update(&mut protocol, created_payload.session_id);
+        let pushed = connection.read_session_cwd_update(&mut protocol, created_payload.session_id);
         let pushed = decrypt_first(&mut device_session, pushed);
-        let pushed_payload: SessionFilesResultPayload = decode_payload(pushed.payload).unwrap();
+        let pushed_payload: SessionCwdChangedPayload = decode_payload(pushed.payload).unwrap();
 
         assert_eq!(
             backend.cwd_read_count_for_session(created_payload.session_id),
             1
         );
-        assert_eq!(pushed.kind, MessageType::SessionFilesResult);
-        assert_eq!(pushed_payload.path, work.to_string_lossy());
+        assert_eq!(pushed.kind, MessageType::SessionCwdChanged);
+        assert_eq!(pushed_payload.cwd, work.to_string_lossy());
+
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn session_cwd_update_survives_prior_session_files_refresh() {
+        let base = temp_state_path("session-cwd-refresh-order-base");
+        let root = base.join("project");
+        let work = root.join("work");
+        fs::create_dir_all(&work).unwrap();
+        let backend = FakePtyBackend::default();
+        let mut config = DaemonConfig::default_for_state_path(temp_state_path(
+            "session-cwd-refresh-order-state.json",
+        ));
+        config.default_command = vec!["sh".to_owned()];
+        config.default_working_directory = Some(root.clone());
+        let mut protocol =
+            DaemonProtocol::new(config, backend.clone(), Ed25519SignatureVerifier).unwrap();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = PublicKey(wire(signing_key.verifying_key().as_bytes()));
+        let (_, mut device_session) = open_e2ee(&mut protocol, &mut connection, device_id);
+        pair_device(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            device_id,
+            public_key,
+        );
+        let created_responses = send_encrypted(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            envelope_value(
+                MessageType::SessionCreate,
+                SessionCreatePayload {
+                    command: Vec::new(),
+                    size: TerminalSize::new(24, 80),
+                },
+            )
+            .unwrap(),
+        );
+        let created = decrypt_first(&mut device_session, created_responses);
+        let created_payload: SessionCreatedPayload = decode_payload(created.payload).unwrap();
+        let mut cwd_signal = connection
+            .attached_cwd_signals(&protocol)
+            .into_iter()
+            .find(|(session_id, _)| *session_id == created_payload.session_id)
+            .map(|(_, signal)| signal)
+            .expect("attached connection should subscribe to cwd changes");
+        cwd_signal.borrow_and_update();
+
+        backend.set_cwd_for_session(created_payload.session_id, work.clone());
+        backend.push_output_for_session(created_payload.session_id, b"$ ");
+        let output_responses =
+            connection.read_session_output(&mut protocol, created_payload.session_id, 4096);
+        assert!(!output_responses.is_empty());
+        let _ = decrypt_first(&mut device_session, output_responses);
+        assert!(cwd_signal.has_changed().unwrap());
+
+        let files_responses = send_encrypted(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            envelope_value(
+                MessageType::SessionFiles,
+                SessionFilesPayload {
+                    session_id: created_payload.session_id,
+                    path: None,
+                },
+            )
+            .unwrap(),
+        );
+        let files = decrypt_first(&mut device_session, files_responses);
+        let files_payload: SessionFilesResultPayload = decode_payload(files.payload).unwrap();
+        assert_eq!(files.kind, MessageType::SessionFilesResult);
+        assert_eq!(files_payload.path, work.to_string_lossy());
+
+        let cwd_update =
+            connection.read_session_cwd_update(&mut protocol, created_payload.session_id);
+        let cwd_update = decrypt_first(&mut device_session, cwd_update);
+        let cwd_payload: SessionCwdChangedPayload = decode_payload(cwd_update.payload).unwrap();
+
+        assert_eq!(cwd_update.kind, MessageType::SessionCwdChanged);
+        assert_eq!(cwd_payload.cwd, work.to_string_lossy());
+
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn terminal_cwd_probe_does_not_repeat_same_cwd_event() {
+        let base = temp_state_path("terminal-cwd-repeat-suppressed-base");
+        let root = base.join("project");
+        let work = root.join("work");
+        fs::create_dir_all(&work).unwrap();
+        let backend = FakePtyBackend::default();
+        let mut config = DaemonConfig::default_for_state_path(temp_state_path(
+            "terminal-cwd-repeat-suppressed-state.json",
+        ));
+        config.default_command = vec!["sh".to_owned()];
+        config.default_working_directory = Some(root.clone());
+        let mut protocol =
+            DaemonProtocol::new(config, backend.clone(), Ed25519SignatureVerifier).unwrap();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = PublicKey(wire(signing_key.verifying_key().as_bytes()));
+        let (_, mut device_session) = open_e2ee(&mut protocol, &mut connection, device_id);
+        pair_device(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            device_id,
+            public_key,
+        );
+        let created_responses = send_encrypted(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            envelope_value(
+                MessageType::SessionCreate,
+                SessionCreatePayload {
+                    command: Vec::new(),
+                    size: TerminalSize::new(24, 80),
+                },
+            )
+            .unwrap(),
+        );
+        let created = decrypt_first(&mut device_session, created_responses);
+        let created_payload: SessionCreatedPayload = decode_payload(created.payload).unwrap();
+        let mut cwd_signal = connection
+            .attached_cwd_signals(&protocol)
+            .into_iter()
+            .find(|(session_id, _)| *session_id == created_payload.session_id)
+            .map(|(_, signal)| signal)
+            .expect("attached connection should subscribe to cwd changes");
+        cwd_signal.borrow_and_update();
+
+        backend.set_cwd_for_session(created_payload.session_id, work.clone());
+        backend.push_output_for_session(created_payload.session_id, b"$ ");
+        let output_responses =
+            connection.read_session_output(&mut protocol, created_payload.session_id, 4096);
+        assert!(!output_responses.is_empty());
+        let _ = decrypt_first(&mut device_session, output_responses);
+        assert!(cwd_signal.has_changed().unwrap());
+
+        let first_update =
+            connection.read_session_cwd_update(&mut protocol, created_payload.session_id);
+        let first_update = decrypt_first(&mut device_session, first_update);
+        let first_payload: SessionCwdChangedPayload = decode_payload(first_update.payload).unwrap();
+        assert_eq!(first_update.kind, MessageType::SessionCwdChanged);
+        assert_eq!(first_payload.cwd, work.to_string_lossy());
+
+        backend.push_output_for_session(created_payload.session_id, b"echo same-cwd\n");
+        let next_output =
+            connection.read_session_output(&mut protocol, created_payload.session_id, 4096);
+        assert!(!next_output.is_empty());
+        let _ = decrypt_first(&mut device_session, next_output);
+        assert!(cwd_signal.has_changed().unwrap());
+
+        let second_update =
+            connection.read_session_cwd_update(&mut protocol, created_payload.session_id);
+        assert!(second_update.is_empty());
 
         fs::remove_dir_all(base).ok();
     }
@@ -16540,13 +16879,13 @@ mod tests {
         );
         let created = decrypt_first(&mut device_session, created_responses);
         let created_payload: SessionCreatedPayload = decode_payload(created.payload).unwrap();
-        let mut file_tree_signal = connection
-            .attached_file_tree_signals(&protocol)
+        let mut cwd_signal = connection
+            .attached_cwd_signals(&protocol)
             .into_iter()
             .find(|(session_id, _)| *session_id == created_payload.session_id)
             .map(|(_, signal)| signal)
-            .expect("attached connection should subscribe to file tree changes");
-        file_tree_signal.borrow_and_update();
+            .expect("attached connection should subscribe to cwd changes");
+        cwd_signal.borrow_and_update();
 
         connection.packet_mode = true;
         connection
@@ -16573,7 +16912,7 @@ mod tests {
             backend.cwd_read_count_for_session(created_payload.session_id),
             0
         );
-        assert!(file_tree_signal.has_changed().unwrap());
+        assert!(cwd_signal.has_changed().unwrap());
 
         fs::remove_dir_all(base).ok();
     }
@@ -19559,11 +19898,6 @@ mod tests {
         assert_eq!(attached.kind, MessageType::SessionAttached);
         assert!(!attached_payload.resize_owner);
         assert!(rpc_connection.attached_output_signals(&protocol).is_empty());
-        assert!(
-            rpc_connection
-                .attached_file_tree_signals(&protocol)
-                .is_empty()
-        );
         assert!(rpc_connection.attached_resize_signals(&protocol).is_empty());
         assert!(
             rpc_connection

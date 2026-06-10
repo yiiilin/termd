@@ -147,7 +147,7 @@ enum RelayPushEvent {
         client_id: RelayClientId,
         session_id: SessionId,
     },
-    FileTree {
+    Cwd {
         client_id: RelayClientId,
         session_id: SessionId,
     },
@@ -162,7 +162,7 @@ impl RelayPushEvent {
     fn label(self) -> &'static str {
         match self {
             Self::Output { .. } => "output",
-            Self::FileTree { .. } => "file_tree",
+            Self::Cwd { .. } => "cwd",
             Self::Resize { .. } => "resize",
         }
     }
@@ -170,7 +170,7 @@ impl RelayPushEvent {
     fn client_id(self) -> RelayClientId {
         match self {
             Self::Output { client_id, .. }
-            | Self::FileTree { client_id, .. }
+            | Self::Cwd { client_id, .. }
             | Self::Resize { client_id, .. } => client_id,
         }
     }
@@ -179,7 +179,7 @@ impl RelayPushEvent {
     fn session_id(self) -> SessionId {
         match self {
             Self::Output { session_id, .. }
-            | Self::FileTree { session_id, .. }
+            | Self::Cwd { session_id, .. }
             | Self::Resize { session_id, .. } => session_id,
         }
     }
@@ -310,7 +310,7 @@ struct RelayTrafficCounters {
     in_frame: RelayTrafficBucket,
     out_response: RelayTrafficBucket,
     out_push_output: RelayTrafficBucket,
-    out_push_file_tree: RelayTrafficBucket,
+    out_push_cwd: RelayTrafficBucket,
     out_push_resize: RelayTrafficBucket,
     out_mux_keepalive: RelayTrafficBucket,
     out_idle_ping: RelayTrafficBucket,
@@ -339,7 +339,7 @@ impl RelayTrafficCounters {
             RelayOutKind::Response => self.out_response.record(envelopes, bytes),
             RelayOutKind::FileTunnelBody => self.out_response.record(envelopes, bytes),
             RelayOutKind::PushOutput => self.out_push_output.record(envelopes, bytes),
-            RelayOutKind::PushFileTree => self.out_push_file_tree.record(envelopes, bytes),
+            RelayOutKind::PushCwd => self.out_push_cwd.record(envelopes, bytes),
             RelayOutKind::PushResize => self.out_push_resize.record(envelopes, bytes),
             RelayOutKind::MuxKeepalive => self.out_mux_keepalive.record(envelopes, bytes),
             RelayOutKind::IdlePing => self.out_idle_ping.record(envelopes, bytes),
@@ -360,7 +360,7 @@ impl RelayTrafficCounters {
             || !self.in_frame.is_empty()
             || !self.out_response.is_empty()
             || !self.out_push_output.is_empty()
-            || !self.out_push_file_tree.is_empty()
+            || !self.out_push_cwd.is_empty()
             || !self.out_push_resize.is_empty()
             || !self.out_mux_keepalive.is_empty()
             || !self.out_pong.is_empty()
@@ -432,7 +432,7 @@ enum RelayOutKind {
     Response,
     FileTunnelBody,
     PushOutput,
-    PushFileTree,
+    PushCwd,
     PushResize,
     #[cfg(test)]
     MuxKeepalive,
@@ -452,7 +452,7 @@ impl RelayOutKind {
     fn uses_data_lane(self) -> bool {
         matches!(
             self,
-            Self::PushOutput | Self::PushFileTree | Self::PushResize
+            Self::PushOutput | Self::PushCwd | Self::PushResize
         )
     }
 
@@ -461,7 +461,7 @@ impl RelayOutKind {
             Self::Response => "response",
             Self::FileTunnelBody => "file_tunnel_body",
             Self::PushOutput => "push_output",
-            Self::PushFileTree => "push_file_tree",
+            Self::PushCwd => "push_cwd",
             Self::PushResize => "push_resize",
             #[cfg(test)]
             Self::MuxKeepalive => "mux_keepalive",
@@ -751,7 +751,7 @@ fn relay_daemon_mux_inbound_idle_timeout_enabled() -> bool {
 #[derive(Debug, Default, Clone, Copy)]
 struct RelayWatcherCounts {
     output: usize,
-    file_tree: usize,
+    cwd: usize,
     resize: usize,
 }
 
@@ -1808,7 +1808,7 @@ async fn run_relay_established_data_connection(
     let mut pending_push_events = RelayPushEventQueue::default();
     let mut push_drain_wake_pending = false;
     let mut watched_output_sessions = HashMap::<RelayClientId, HashSet<SessionId>>::new();
-    let mut watched_file_tree_sessions = HashMap::<RelayClientId, HashSet<SessionId>>::new();
+    let mut watched_cwd_sessions = HashMap::<RelayClientId, HashSet<SessionId>>::new();
     let mut watched_resize_sessions = HashMap::<RelayClientId, HashSet<SessionId>>::new();
     let mut watcher_tasks = HashMap::<RelayClientId, Vec<JoinHandle<()>>>::new();
 
@@ -1933,7 +1933,7 @@ async fn run_relay_established_data_connection(
                             &connections,
                             &protocol,
                             &mut watched_output_sessions,
-                            &mut watched_file_tree_sessions,
+                            &mut watched_cwd_sessions,
                             &mut watched_resize_sessions,
                             &push_event_tx,
                             &mut watcher_tasks,
@@ -2006,7 +2006,7 @@ async fn run_relay_established_data_connection(
         client_id,
         &mut pending_push_events,
         &mut watched_output_sessions,
-        &mut watched_file_tree_sessions,
+        &mut watched_cwd_sessions,
         &mut watched_resize_sessions,
         &mut watcher_tasks,
     );
@@ -2734,10 +2734,10 @@ async fn drain_relay_data_push_events(
                 }
                 connection.encrypt_collected_inner_messages_wire(messages)
             }
-            RelayOutKind::PushFileTree => {
+            RelayOutKind::PushCwd => {
                 let messages = {
                     let mut protocol = protocol.lock().await;
-                    connection.read_session_file_tree_update_messages(&mut protocol, session_id)
+                    connection.read_session_cwd_update_messages(&mut protocol, session_id)
                 };
                 connection.encrypt_collected_inner_messages_wire(messages)
             }
@@ -2836,7 +2836,7 @@ async fn connect_relay_mux_base_once(
         mpsc::channel::<RelayPushEvent>(RELAY_PUSH_EVENT_QUEUE_CAPACITY);
     let mut push_drain_wake_pending = false;
     let mut watched_output_sessions = HashMap::<RelayClientId, HashSet<SessionId>>::new();
-    let mut watched_file_tree_sessions = HashMap::<RelayClientId, HashSet<SessionId>>::new();
+    let mut watched_cwd_sessions = HashMap::<RelayClientId, HashSet<SessionId>>::new();
     let mut watched_resize_sessions = HashMap::<RelayClientId, HashSet<SessionId>>::new();
     let mut watcher_tasks = HashMap::<RelayClientId, Vec<JoinHandle<()>>>::new();
     let mut pending_push_events = RelayPushEventQueue::default();
@@ -2926,7 +2926,7 @@ async fn connect_relay_mux_base_once(
                                     &mut connections,
                                     relay_watcher_counts(
                                         &watched_output_sessions,
-                                        &watched_file_tree_sessions,
+                                        &watched_cwd_sessions,
                                         &watched_resize_sessions,
                                     ),
                                     false,
@@ -2955,7 +2955,7 @@ async fn connect_relay_mux_base_once(
                                     client_id,
                                     &mut pending_push_events,
                                     &mut watched_output_sessions,
-                                    &mut watched_file_tree_sessions,
+                                    &mut watched_cwd_sessions,
                                     &mut watched_resize_sessions,
                                     &mut watcher_tasks,
                                 );
@@ -2991,7 +2991,7 @@ async fn connect_relay_mux_base_once(
                             &connections,
                             &protocol,
                             &mut watched_output_sessions,
-                            &mut watched_file_tree_sessions,
+                            &mut watched_cwd_sessions,
                             &mut watched_resize_sessions,
                             &push_event_tx,
                             &mut watcher_tasks,
@@ -3013,7 +3013,7 @@ async fn connect_relay_mux_base_once(
                             &mut connections,
                             relay_watcher_counts(
                                 &watched_output_sessions,
-                                &watched_file_tree_sessions,
+                                &watched_cwd_sessions,
                                 &watched_resize_sessions,
                             ),
                             false,
@@ -3056,7 +3056,7 @@ async fn connect_relay_mux_base_once(
                                     &mut connections,
                                     relay_watcher_counts(
                                         &watched_output_sessions,
-                                        &watched_file_tree_sessions,
+                                        &watched_cwd_sessions,
                                         &watched_resize_sessions,
                                     ),
                                     false,
@@ -3085,7 +3085,7 @@ async fn connect_relay_mux_base_once(
                                     client_id,
                                     &mut pending_push_events,
                                     &mut watched_output_sessions,
-                                    &mut watched_file_tree_sessions,
+                                    &mut watched_cwd_sessions,
                                     &mut watched_resize_sessions,
                                     &mut watcher_tasks,
                                 );
@@ -3121,7 +3121,7 @@ async fn connect_relay_mux_base_once(
                             &connections,
                             &protocol,
                             &mut watched_output_sessions,
-                            &mut watched_file_tree_sessions,
+                            &mut watched_cwd_sessions,
                             &mut watched_resize_sessions,
                             &push_event_tx,
                             &mut watcher_tasks,
@@ -3143,7 +3143,7 @@ async fn connect_relay_mux_base_once(
                             &mut connections,
                             relay_watcher_counts(
                                 &watched_output_sessions,
-                                &watched_file_tree_sessions,
+                                &watched_cwd_sessions,
                                 &watched_resize_sessions,
                             ),
                             false,
@@ -3172,7 +3172,7 @@ async fn connect_relay_mux_base_once(
                             &mut connections,
                             relay_watcher_counts(
                                 &watched_output_sessions,
-                                &watched_file_tree_sessions,
+                                &watched_cwd_sessions,
                                 &watched_resize_sessions,
                             ),
                             false,
@@ -3191,7 +3191,7 @@ async fn connect_relay_mux_base_once(
                             &mut connections,
                             relay_watcher_counts(
                                 &watched_output_sessions,
-                                &watched_file_tree_sessions,
+                                &watched_cwd_sessions,
                                 &watched_resize_sessions,
                             ),
                             false,
@@ -3246,7 +3246,7 @@ async fn connect_relay_mux_base_once(
                         &mut connections,
                         relay_watcher_counts(
                             &watched_output_sessions,
-                            &watched_file_tree_sessions,
+                                                &watched_cwd_sessions,
                             &watched_resize_sessions,
                         ),
                         false,
@@ -3296,7 +3296,7 @@ async fn connect_relay_mux_base_once(
                     &mut connections,
                     relay_watcher_counts(
                         &watched_output_sessions,
-                        &watched_file_tree_sessions,
+                        &watched_cwd_sessions,
                         &watched_resize_sessions,
                     ),
                     false,
@@ -3350,7 +3350,7 @@ async fn connect_relay_mux_base_once(
                     &mut connections,
                     relay_watcher_counts(
                         &watched_output_sessions,
-                        &watched_file_tree_sessions,
+                        &watched_cwd_sessions,
                         &watched_resize_sessions,
                     ),
                     false,
@@ -3366,7 +3366,7 @@ async fn connect_relay_mux_base_once(
         &mut connections,
         relay_watcher_counts(
             &watched_output_sessions,
-            &watched_file_tree_sessions,
+            &watched_cwd_sessions,
             &watched_resize_sessions,
         ),
         true,
@@ -3382,12 +3382,12 @@ async fn connect_relay_mux_base_once(
 #[cfg(test)]
 fn relay_watcher_counts(
     watched_output_sessions: &HashMap<RelayClientId, HashSet<SessionId>>,
-    watched_file_tree_sessions: &HashMap<RelayClientId, HashSet<SessionId>>,
+    watched_cwd_sessions: &HashMap<RelayClientId, HashSet<SessionId>>,
     watched_resize_sessions: &HashMap<RelayClientId, HashSet<SessionId>>,
 ) -> RelayWatcherCounts {
     RelayWatcherCounts {
         output: watched_output_sessions.values().map(HashSet::len).sum(),
-        file_tree: watched_file_tree_sessions.values().map(HashSet::len).sum(),
+        cwd: watched_cwd_sessions.values().map(HashSet::len).sum(),
         resize: watched_resize_sessions.values().map(HashSet::len).sum(),
     }
 }
@@ -3498,7 +3498,7 @@ fn info_relay_traffic(
         ?traffic,
         ?protocol_traffic,
         watchers_output = watchers.output,
-        watchers_file_tree = watchers.file_tree,
+        watchers_cwd = watchers.cwd,
         watchers_resize = watchers.resize,
         flow_clients = flow.clients,
         flow_packet_mode_clients = flow.packet_mode_clients,
@@ -3526,7 +3526,7 @@ fn debug_relay_traffic(
         ?traffic,
         ?protocol_traffic,
         watchers_output = watchers.output,
-        watchers_file_tree = watchers.file_tree,
+        watchers_cwd = watchers.cwd,
         watchers_resize = watchers.resize,
         flow_clients = flow.clients,
         flow_packet_mode_clients = flow.packet_mode_clients,
@@ -3877,7 +3877,7 @@ async fn sync_relay_watchers_for_client(
     connections: &HashMap<RelayClientId, ProtocolConnection>,
     protocol: &SharedDaemonProtocol,
     watched_output_sessions: &mut HashMap<RelayClientId, HashSet<SessionId>>,
-    watched_file_tree_sessions: &mut HashMap<RelayClientId, HashSet<SessionId>>,
+    watched_cwd_sessions: &mut HashMap<RelayClientId, HashSet<SessionId>>,
     watched_resize_sessions: &mut HashMap<RelayClientId, HashSet<SessionId>>,
     push_event_tx: &mpsc::Sender<RelayPushEvent>,
     watcher_tasks: &mut HashMap<RelayClientId, Vec<JoinHandle<()>>>,
@@ -3890,18 +3890,18 @@ async fn sync_relay_watchers_for_client(
         remove_relay_watchers_for_client(
             client_id,
             watched_output_sessions,
-            watched_file_tree_sessions,
+            watched_cwd_sessions,
             watched_resize_sessions,
             watcher_tasks,
         );
         return initial_output_sessions;
     };
 
-    let (output_signals, file_tree_signals, resize_signals) = {
+    let (output_signals, cwd_signals, resize_signals) = {
         let protocol = protocol.lock().await;
         (
             connection.attached_output_signals(&protocol),
-            connection.attached_file_tree_signals(&protocol),
+            connection.attached_cwd_signals(&protocol),
             connection.attached_resize_signals(&protocol),
         )
     };
@@ -3909,7 +3909,7 @@ async fn sync_relay_watchers_for_client(
         .iter()
         .map(|(session_id, _)| *session_id)
         .collect();
-    let desired_file_tree_sessions: HashSet<_> = file_tree_signals
+    let desired_cwd_sessions: HashSet<_> = cwd_signals
         .iter()
         .map(|(session_id, _)| *session_id)
         .collect();
@@ -3922,7 +3922,7 @@ async fn sync_relay_watchers_for_client(
         .get(&client_id)
         .cloned()
         .unwrap_or_default();
-    let current_file_tree = watched_file_tree_sessions
+    let current_cwd = watched_cwd_sessions
         .get(&client_id)
         .cloned()
         .unwrap_or_default();
@@ -3931,7 +3931,7 @@ async fn sync_relay_watchers_for_client(
         .cloned()
         .unwrap_or_default();
     if !current_output.is_subset(&desired_output_sessions)
-        || !current_file_tree.is_subset(&desired_file_tree_sessions)
+        || !current_cwd.is_subset(&desired_cwd_sessions)
         || !current_resize.is_subset(&desired_resize_sessions)
     {
         // 中文注释：一个 relay client 快速切换 session 后，旧 terminal stream 会取消 watched。
@@ -3944,7 +3944,7 @@ async fn sync_relay_watchers_for_client(
         remove_relay_watchers_for_client(
             client_id,
             watched_output_sessions,
-            watched_file_tree_sessions,
+            watched_cwd_sessions,
             watched_resize_sessions,
             watcher_tasks,
         );
@@ -3997,11 +3997,14 @@ async fn sync_relay_watchers_for_client(
             }));
     }
 
-    for (session_id, mut signal) in file_tree_signals {
-        let watched = watched_file_tree_sessions.entry(client_id).or_default();
+    for (session_id, mut signal) in cwd_signals {
+        let watched = watched_cwd_sessions.entry(client_id).or_default();
         if !watched.insert(session_id) {
             continue;
         }
+        // 中文注释：relay 侧 cwd watcher 语义必须与直连 `/ws` 保持一致；
+        // 新订阅时先消费当前版本，避免 attach 前已存在的 cwd version 被当成新事件。
+        signal.borrow_and_update();
 
         let push_event_tx = push_event_tx.clone();
         watcher_tasks
@@ -4013,7 +4016,7 @@ async fn sync_relay_watchers_for_client(
                         break;
                     }
                     if push_event_tx
-                        .send(RelayPushEvent::FileTree {
+                        .send(RelayPushEvent::Cwd {
                             client_id,
                             session_id,
                         })
@@ -4023,16 +4026,16 @@ async fn sync_relay_watchers_for_client(
                         debug!(
                             client_id = client_id.0,
                             session_id = ?session_id,
-                            event = "file_tree",
-                            "relay mux file tree watcher stopped because event queue closed"
+                            event = "cwd",
+                            "relay mux cwd watcher stopped because event queue closed"
                         );
                         break;
                     }
                     trace!(
                         client_id = client_id.0,
                         session_id = ?session_id,
-                        event = "file_tree",
-                        "relay mux file tree watcher enqueued event"
+                        event = "cwd",
+                        "relay mux cwd watcher enqueued event"
                     );
                 }
             }));
@@ -4132,7 +4135,7 @@ fn drop_relay_client_runtime(
     client_id: RelayClientId,
     pending_push_events: &mut RelayPushEventQueue,
     watched_output_sessions: &mut HashMap<RelayClientId, HashSet<SessionId>>,
-    watched_file_tree_sessions: &mut HashMap<RelayClientId, HashSet<SessionId>>,
+    watched_cwd_sessions: &mut HashMap<RelayClientId, HashSet<SessionId>>,
     watched_resize_sessions: &mut HashMap<RelayClientId, HashSet<SessionId>>,
     watcher_tasks: &mut HashMap<RelayClientId, Vec<JoinHandle<()>>>,
 ) {
@@ -4143,7 +4146,7 @@ fn drop_relay_client_runtime(
     remove_relay_watchers_for_client(
         client_id,
         watched_output_sessions,
-        watched_file_tree_sessions,
+        watched_cwd_sessions,
         watched_resize_sessions,
         watcher_tasks,
     );
@@ -4491,10 +4494,10 @@ async fn drain_relay_push_events(
                 }
                 connection.encrypt_collected_inner_messages_wire(messages)
             }
-            RelayOutKind::PushFileTree => {
+            RelayOutKind::PushCwd => {
                 let messages = {
                     let mut protocol = protocol.lock().await;
-                    connection.read_session_file_tree_update_messages(&mut protocol, session_id)
+                    connection.read_session_cwd_update_messages(&mut protocol, session_id)
                 };
                 connection.encrypt_collected_inner_messages_wire(messages)
             }
@@ -4668,10 +4671,10 @@ fn relay_push_event_parts(event: RelayPushEvent) -> (RelayClientId, SessionId, R
             client_id,
             session_id,
         } => (client_id, session_id, RelayOutKind::PushOutput),
-        RelayPushEvent::FileTree {
+        RelayPushEvent::Cwd {
             client_id,
             session_id,
-        } => (client_id, session_id, RelayOutKind::PushFileTree),
+        } => (client_id, session_id, RelayOutKind::PushCwd),
         RelayPushEvent::Resize {
             client_id,
             session_id,
@@ -4682,7 +4685,7 @@ fn relay_push_event_parts(event: RelayPushEvent) -> (RelayClientId, SessionId, R
 fn relay_push_event_client_id(event: RelayPushEvent) -> RelayClientId {
     match event {
         RelayPushEvent::Output { client_id, .. }
-        | RelayPushEvent::FileTree { client_id, .. }
+        | RelayPushEvent::Cwd { client_id, .. }
         | RelayPushEvent::Resize { client_id, .. } => client_id,
     }
 }
@@ -4690,12 +4693,12 @@ fn relay_push_event_client_id(event: RelayPushEvent) -> RelayClientId {
 fn remove_relay_watchers_for_client(
     client_id: RelayClientId,
     watched_output_sessions: &mut HashMap<RelayClientId, HashSet<SessionId>>,
-    watched_file_tree_sessions: &mut HashMap<RelayClientId, HashSet<SessionId>>,
+    watched_cwd_sessions: &mut HashMap<RelayClientId, HashSet<SessionId>>,
     watched_resize_sessions: &mut HashMap<RelayClientId, HashSet<SessionId>>,
     watcher_tasks: &mut HashMap<RelayClientId, Vec<JoinHandle<()>>>,
 ) {
     watched_output_sessions.remove(&client_id);
-    watched_file_tree_sessions.remove(&client_id);
+    watched_cwd_sessions.remove(&client_id);
     watched_resize_sessions.remove(&client_id);
     if let Some(tasks) = watcher_tasks.remove(&client_id) {
         for task in tasks {
@@ -5794,8 +5797,8 @@ mod tests {
         let mut watched_output_sessions = HashMap::new();
         watched_output_sessions.insert(client_id, HashSet::from([client_session_id]));
         watched_output_sessions.insert(other_client_id, HashSet::from([other_session_id]));
-        let mut watched_file_tree_sessions = HashMap::new();
-        watched_file_tree_sessions.insert(client_id, HashSet::from([client_session_id]));
+        let mut watched_cwd_sessions = HashMap::new();
+        watched_cwd_sessions.insert(client_id, HashSet::from([client_session_id]));
         let mut watched_resize_sessions = HashMap::new();
         watched_resize_sessions.insert(client_id, HashSet::from([client_session_id]));
         let (drop_tx, drop_rx) = oneshot::channel();
@@ -5811,7 +5814,7 @@ mod tests {
             client_id,
             &mut pending_push_events,
             &mut watched_output_sessions,
-            &mut watched_file_tree_sessions,
+            &mut watched_cwd_sessions,
             &mut watched_resize_sessions,
             &mut watcher_tasks,
         );
@@ -5823,7 +5826,7 @@ mod tests {
             watched_output_sessions.get(&other_client_id),
             Some(&HashSet::from([other_session_id]))
         );
-        assert!(!watched_file_tree_sessions.contains_key(&client_id));
+        assert!(!watched_cwd_sessions.contains_key(&client_id));
         assert!(!watched_resize_sessions.contains_key(&client_id));
         assert!(!watcher_tasks.contains_key(&client_id));
         timeout(Duration::from_millis(50), drop_rx)
@@ -8338,19 +8341,20 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn relay_mux_pushes_file_tree_updates_without_client_pull_frame() {
-        let file_root = std::env::temp_dir().join(format!(
-            "termd-relay-file-tree-root-{}-{}",
+    async fn relay_mux_pushes_cwd_updates_without_client_pull_frame() {
+        let workspace_root = std::env::temp_dir().join(format!(
+            "termd-relay-cwd-root-{}-{}",
             std::process::id(),
             TEST_STATE_COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
+        let file_root = workspace_root.join("project");
         fs::create_dir_all(&file_root).unwrap();
         fs::write(file_root.join("alpha.txt"), b"alpha\n").unwrap();
 
         let mut config =
-            DaemonConfig::default_for_state_path(temp_state_path("mux-file-tree-push-state"));
-        // 文件树推送测试不能读取共享 `/tmp`，否则会和并行测试清理临时文件产生竞态。
-        config.default_working_directory = Some(file_root.clone());
+            DaemonConfig::default_for_state_path(temp_state_path("mux-cwd-push-state"));
+        // cwd 变化推送测试不能读取共享 `/tmp`，否则会和并行测试清理临时文件产生竞态。
+        config.default_working_directory = Some(workspace_root.clone());
         let protocol = default_protocol(config);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -8390,7 +8394,7 @@ mod tests {
             &mut relay_socket,
             client_id,
             server_key_exchange.clone(),
-            "relay-file-tree-e2ee-nonce",
+            "relay-cwd-push-e2ee-nonce",
         )
         .await;
 
@@ -8403,10 +8407,10 @@ mod tests {
                 termd_proto::PairRequestPayload {
                     device_id,
                     device_public_key: termd_proto::PublicKey(
-                        "ed25519-v1:relay-file-tree-test-device".to_owned(),
+                        "ed25519-v1:relay-cwd-push-test-device".to_owned(),
                     ),
                     token: termd_proto::PairingToken(token),
-                    nonce: termd_proto::Nonce("relay-file-tree-pair-nonce".to_owned()),
+                    nonce: termd_proto::Nonce("relay-cwd-push-pair-nonce".to_owned()),
                     timestamp_ms: current_unix_timestamp_millis(),
                 },
             )
@@ -8424,7 +8428,14 @@ mod tests {
             envelope_value(
                 MessageType::SessionCreate,
                 termd_proto::SessionCreatePayload {
-                    command: vec!["sh".to_owned(), "-lc".to_owned(), "sleep 2".to_owned()],
+                    command: vec![
+                        "sh".to_owned(),
+                        "-lc".to_owned(),
+                        format!(
+                            "sleep 0.15; cd {}; printf cwd-moved; sleep 2",
+                            file_root.to_string_lossy()
+                        ),
+                    ],
                     size: termd_proto::TerminalSize::default(),
                 },
             )
@@ -8455,114 +8466,11 @@ mod tests {
             read_encrypted_daemon_frame(&mut relay_socket, client_id, &mut device_e2ee).await;
         assert_eq!(initial_files.kind, MessageType::SessionFilesResult);
 
-        let mut direct_protocol = protocol.lock().await;
-        let direct_token = direct_protocol
-            .issue_pairing_token(current_unix_timestamp_millis())
-            .unwrap()
-            .token()
-            .0
-            .clone();
-        let (mut direct_connection, direct_initial) = direct_protocol.start_connection();
-        let direct_server_key_exchange: termd_proto::E2eeKeyExchangePayload =
-            decode_payload(direct_initial[1].payload.clone()).unwrap();
-        let direct_device_id = termd_proto::DeviceId::new();
-        let direct_keypair = E2eeKeyPair::generate();
-        let direct_server_e2ee_key =
-            crate::net::E2eePeerPublicKey::try_from(&direct_server_key_exchange.public_key)
-                .unwrap();
-        let direct_context = E2eeSessionContext::new(
-            direct_server_key_exchange.server_id,
-            direct_device_id,
-            direct_server_e2ee_key,
-            direct_keypair.public_key(),
-        );
-        let mut direct_e2ee = E2eeSession::new(
-            E2eeSessionRole::Device,
-            &direct_keypair,
-            direct_server_e2ee_key,
-            direct_context,
-        )
-        .unwrap();
-        direct_connection.handle_wire_envelope(
-            &mut direct_protocol,
-            envelope_value(
-                MessageType::E2eeKeyExchange,
-                termd_proto::E2eeKeyExchangePayload::new(
-                    direct_server_key_exchange.server_id,
-                    direct_device_id,
-                    direct_keypair.public_key_wire(),
-                    termd_proto::Nonce("direct-file-tree-e2ee-nonce".to_owned()),
-                    current_unix_timestamp_millis(),
-                ),
-            )
-            .unwrap(),
-        );
-        let pair_responses = direct_connection.handle_wire_envelope(
-            &mut direct_protocol,
-            encrypted_outer(
-                &mut direct_e2ee,
-                envelope_value(
-                    MessageType::PairRequest,
-                    termd_proto::PairRequestPayload {
-                        device_id: direct_device_id,
-                        device_public_key: termd_proto::PublicKey(
-                            "ed25519-v1:direct-file-tree-device".to_owned(),
-                        ),
-                        token: termd_proto::PairingToken(direct_token),
-                        nonce: termd_proto::Nonce("direct-file-tree-pair-nonce".to_owned()),
-                        timestamp_ms: current_unix_timestamp_millis(),
-                    },
-                )
-                .unwrap(),
-            ),
-        );
-        assert_eq!(
-            decrypt_protocol_response(&mut direct_e2ee, pair_responses[0].clone()).kind,
-            MessageType::PairAccept
-        );
-        let attach_responses = direct_connection.handle_wire_envelope(
-            &mut direct_protocol,
-            encrypted_outer(
-                &mut direct_e2ee,
-                envelope_value(
-                    MessageType::SessionAttach,
-                    termd_proto::SessionAttachPayload {
-                        session_id: created_payload.session_id,
-                        watch_updates: true,
-                        last_terminal_seq: None,
-                    },
-                )
-                .unwrap(),
-            ),
-        );
-        assert_eq!(
-            decrypt_protocol_response(&mut direct_e2ee, attach_responses[0].clone()).kind,
-            MessageType::SessionAttached
-        );
-        let files_responses = direct_connection.handle_wire_envelope(
-            &mut direct_protocol,
-            encrypted_outer(
-                &mut direct_e2ee,
-                envelope_value(
-                    MessageType::SessionFiles,
-                    termd_proto::SessionFilesPayload {
-                        session_id: created_payload.session_id,
-                        path: Some(file_root.to_string_lossy().to_string()),
-                    },
-                )
-                .unwrap(),
-            ),
-        );
-        assert_eq!(
-            decrypt_protocol_response(&mut direct_e2ee, files_responses[0].clone()).kind,
-            MessageType::SessionFilesResult
-        );
-        drop(direct_protocol);
-
-        // 文件树状态变化来自 direct daemon 连接；当前 relay client 不发送任何帧也必须收到同步结果。
+        // 中文注释：新模型下 relay 只会收到 cwd 变化轻事件；真正文件树内容要由
+        // client 收到事件后主动再拉一次 `session.files`。
         let pushed = tokio::time::timeout(
-            Duration::from_secs(2),
-            read_session_files_result_with_path(
+            Duration::from_secs(5),
+            read_session_cwd_changed_with_path(
                 &mut relay_socket,
                 client_id,
                 &mut device_e2ee,
@@ -8570,10 +8478,10 @@ mod tests {
             ),
         )
         .await
-        .expect("relay mux should push file tree updates without client pull frames");
+        .expect("relay mux should push cwd updates without client pull frames");
         assert_eq!(pushed.session_id, created_payload.session_id);
 
-        fs::remove_dir_all(file_root).ok();
+        fs::remove_dir_all(workspace_root).ok();
 
         connector.abort();
     }
@@ -8820,22 +8728,6 @@ mod tests {
         send_mux_client_json(socket, client_id, encrypted).await;
     }
 
-    fn encrypted_outer(device_e2ee: &mut E2eeSession, inner: JsonEnvelope) -> JsonEnvelope {
-        envelope_value(
-            MessageType::EncryptedFrame,
-            device_e2ee.encrypt_json_payload(&inner).unwrap(),
-        )
-        .unwrap()
-    }
-
-    fn decrypt_protocol_response(
-        device_e2ee: &mut E2eeSession,
-        outer: JsonEnvelope,
-    ) -> JsonEnvelope {
-        let frame = encrypted_frame_from_envelope(outer).unwrap();
-        device_e2ee.decrypt_json_payload(&frame).unwrap()
-    }
-
     async fn open_mux_e2ee(
         socket: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
         client_id: RelayClientId,
@@ -8961,20 +8853,20 @@ mod tests {
         device_e2ee.decrypt_json_payload(&frame).unwrap()
     }
 
-    async fn read_session_files_result_with_path(
+    async fn read_session_cwd_changed_with_path(
         socket: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
         expected_client_id: RelayClientId,
         device_e2ee: &mut E2eeSession,
         expected_path: &str,
-    ) -> termd_proto::SessionFilesResultPayload {
+    ) -> termd_proto::SessionCwdChangedPayload {
         loop {
             let inner = read_encrypted_daemon_frame(socket, expected_client_id, device_e2ee).await;
-            if inner.kind != MessageType::SessionFilesResult {
+            if inner.kind != MessageType::SessionCwdChanged {
                 continue;
             }
-            let payload: termd_proto::SessionFilesResultPayload =
+            let payload: termd_proto::SessionCwdChangedPayload =
                 decode_payload(inner.payload).unwrap();
-            if payload.path == expected_path {
+            if payload.cwd == expected_path {
                 return payload;
             }
         }

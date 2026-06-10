@@ -4,6 +4,7 @@ import type {
   RenderableTerminalFramePayload,
   SessionActivityPayload,
   SessionAttachedPayload,
+  SessionCwdChangedPayload,
   SessionDataPayload,
   SessionFilesResultPayload,
   SessionGitResultPayload,
@@ -39,6 +40,7 @@ export interface AttachReconnectOptions {
 
 export function useTerminalAttach() {
   const pendingTerminalAttachSessionRef = useRef<UUID | undefined>(undefined);
+  const pendingTerminalAttachAbortControllerRef = useRef<AbortController | undefined>(undefined);
   const attachedSessionRef = useRef<UUID | undefined>(undefined);
   const autoAttachAttemptedSessionRef = useRef<UUID | undefined>(undefined);
   const attachingSessionIdRef = useRef<UUID | undefined>(undefined);
@@ -72,6 +74,7 @@ export function useTerminalAttach() {
 
   return {
     pendingTerminalAttachSessionRef,
+    pendingTerminalAttachAbortControllerRef,
     attachedSessionRef,
     autoAttachAttemptedSessionRef,
     attachingSessionIdRef,
@@ -127,6 +130,13 @@ interface UseTerminalReceiveLoopOptions {
   setSessionGit: (git: SessionGitResultPayload | undefined) => void;
   setSessionGitError: (error: SafeError | undefined) => void;
   setSessionGitLoading: (loading: boolean) => void;
+  handlePassiveSessionFilesResult?: (files: SessionFilesResultPayload) => void;
+  loadSessionFiles?: (
+    sessionId: UUID,
+    path?: string,
+    options?: { silent?: boolean; source?: "initial" | "manual" | "follow" },
+  ) => Promise<void>;
+  requestFollowSessionFilesRefresh?: (sessionId?: UUID) => Promise<void>;
 }
 
 export function useTerminalReceiveLoop(
@@ -147,6 +157,9 @@ export function useTerminalReceiveLoop(
     setSessionGit,
     setSessionGitError,
     setSessionGitLoading,
+    handlePassiveSessionFilesResult,
+    loadSessionFiles,
+    requestFollowSessionFilesRefresh,
   } = options;
   const {
     attachedSessionRef,
@@ -280,13 +293,30 @@ export function useTerminalReceiveLoop(
           } else if (inner.type === "session_activity") {
             const payload = inner.payload as SessionActivityPayload;
             markNewOutputIfBackground(payload.session_id);
+          } else if (inner.type === "session_cwd_changed") {
+            const payload = inner.payload as SessionCwdChangedPayload;
+            if (
+              payload.session_id === attachedSessionRef.current &&
+              sessionFilesFollowTerminalCwdRef.current
+            ) {
+              if (requestFollowSessionFilesRefresh) {
+                void requestFollowSessionFilesRefresh(payload.session_id);
+              } else {
+                void loadSessionFiles?.(payload.session_id, undefined, {
+                  silent: true,
+                  source: "follow",
+                });
+              }
+            }
           } else if (inner.type === "session_files_result") {
             const payload = inner.payload as SessionFilesResultPayload;
-            // 非跟随模式下只接受当前请求的直接回写，不再让 daemon 的后台推送覆盖手动浏览目录。
-            if (payload.session_id === attachedSessionRef.current && sessionFilesFollowTerminalCwdRef.current) {
-              setSessionFiles(payload);
-              setSessionFilesError(undefined);
-              setSessionFilesLoading(false);
+            // 中文注释：现在 cwd 变化只推轻事件，文件树由显式 `session.files` 请求回写。
+            // 这里保留兼容旧 daemon 的被动结果接收路径，避免 mixed-version 场景闪退。
+            if (
+              payload.session_id === attachedSessionRef.current &&
+              sessionFilesFollowTerminalCwdRef.current
+            ) {
+              handlePassiveSessionFilesResult?.(payload);
             }
           } else if (inner.type === "session_git_result") {
             const payload = inner.payload as SessionGitResultPayload;
@@ -345,6 +375,8 @@ export function useTerminalReceiveLoop(
     setSessionGit,
     setSessionGitError,
     setSessionGitLoading,
+    handlePassiveSessionFilesResult,
+    loadSessionFiles,
     terminalSnapshotClientFullSnapshotTokensRef,
     terminalSnapshotPendingFullSnapshotTokensRef,
     terminalSnapshotRevealHistoryTokensRef,
@@ -357,7 +389,7 @@ interface UseTerminalReconnectSchedulerOptions {
   activeServerId?: UUID;
   attachedSessionId?: UUID;
   selectedSessionId?: UUID;
-  authenticatedClient: (timeoutMs: number) => Promise<DirectClient>;
+  authenticatedClient: (timeoutMs: number, signal?: AbortSignal) => Promise<DirectClient>;
   attachConnectionTimeoutMs: number;
   reconnectDelaysMs: number[];
   isRetryableConnectionError: (caught: unknown) => boolean;
@@ -407,6 +439,7 @@ export function useTerminalReconnectScheduler(
   }, [options]);
   const {
     pendingTerminalAttachSessionRef,
+    pendingTerminalAttachAbortControllerRef,
     attachedSessionRef,
     userDetachedRef,
     confirmedSessionSizesRef,
@@ -557,6 +590,7 @@ export function useTerminalReconnectScheduler(
       attachReconnectTimerRef.current = undefined;
       void (async () => {
         let client: DirectClient | undefined;
+        let attachAbortController: AbortController | undefined;
         try {
           recordTermdDiagnostic("reconnect_timer_fired", {
             reconnectKey,
@@ -579,10 +613,21 @@ export function useTerminalReconnectScheduler(
             if (pendingTerminalAttachSessionRef.current === sessionId) {
               pendingTerminalAttachSessionRef.current = undefined;
             }
+            if (
+              attachAbortController &&
+              pendingTerminalAttachAbortControllerRef.current === attachAbortController
+            ) {
+              pendingTerminalAttachAbortControllerRef.current = undefined;
+            }
             client?.close();
             client = undefined;
           };
-          client = await options.authenticatedClient(options.attachConnectionTimeoutMs);
+          attachAbortController = new AbortController();
+          pendingTerminalAttachAbortControllerRef.current = attachAbortController;
+          client = await options.authenticatedClient(
+            options.attachConnectionTimeoutMs,
+            attachAbortController.signal,
+          );
           if (!isCurrentReconnect()) {
             clearCurrentSnapshotIntent();
             closePendingReconnectClient();
@@ -595,6 +640,7 @@ export function useTerminalReconnectScheduler(
             {
               ...(lastTerminalSeq !== undefined ? { lastTerminalSeq } : {}),
               timeoutMs: options.attachConnectionTimeoutMs,
+              signal: attachAbortController.signal,
             },
           );
           recordTermdDiagnostic("reconnect_attach_ack", {
@@ -615,6 +661,12 @@ export function useTerminalReconnectScheduler(
           options.pendingAttachClientRef.current = undefined;
           if (pendingTerminalAttachSessionRef.current === sessionId) {
             pendingTerminalAttachSessionRef.current = undefined;
+          }
+          if (
+            attachAbortController &&
+            pendingTerminalAttachAbortControllerRef.current === attachAbortController
+          ) {
+            pendingTerminalAttachAbortControllerRef.current = undefined;
           }
           // 中文注释：重连拿到 attach ack 后先发布当前 session。
           // reset 期间用户可能已经能在新 Ghostty 里输入；输入不能等 snapshot 开始消费后才生效。
@@ -675,6 +727,12 @@ export function useTerminalReconnectScheduler(
           void options.loadSessionGit(sessionId, { silent: true });
           void options.refreshDaemonClients();
         } catch (retryError) {
+          if (
+            attachAbortController &&
+            pendingTerminalAttachAbortControllerRef.current === attachAbortController
+          ) {
+            pendingTerminalAttachAbortControllerRef.current = undefined;
+          }
           if (client && options.pendingAttachClientRef.current === client) {
             options.pendingAttachClientRef.current = undefined;
           }

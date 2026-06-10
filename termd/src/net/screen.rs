@@ -1459,7 +1459,7 @@ mod tests {
 
         // 中文注释：线性输出可以安全地靠 retained raw bytes 重放；
         // 但只要出现光标定位这类“重绘式”控制序列，轻量 screen mirror
-        // 就只能近似最终状态，fresh attach 必须回退到 runtime/tmux snapshot。
+        // 就只能近似最终状态，fresh attach 必须回退到 runtime/supervisor snapshot。
         screen.apply("alpha\r\nbeta\x1b[2;1H本地 Hub".as_bytes());
 
         assert!(screen.requires_runtime_snapshot());

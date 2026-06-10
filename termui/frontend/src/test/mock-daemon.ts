@@ -97,6 +97,7 @@ interface MockDaemonOptions {
   daemonStatusDelayMs?: number;
   dropAuthChallenge?: boolean;
   sessionFilesDelayMs?: number;
+  sessionFilesDelayMsByPath?: Record<string, number>;
   sessionFiles?: Record<UUID, SessionFilesResultPayload>;
   sessionGitDelayMs?: number;
   sessionGitDelayMsBySession?: Record<UUID, number>;
@@ -113,6 +114,13 @@ interface MockDaemonOptions {
 
 interface QueuedSessionListResponse {
   sessions: SessionSummaryPayload[];
+  delayMs: number;
+}
+
+interface QueuedSessionFilesResponse {
+  sessionId: UUID;
+  path?: string | null;
+  files: SessionFilesResultPayload;
   delayMs: number;
 }
 
@@ -153,6 +161,7 @@ interface MockConnection {
   e2ee?: E2eeSession;
   attachedSessionIds: Set<UUID>;
   watchedSessionIds: Set<UUID>;
+  pendingCanceledTerminalStreamIds: Set<PacketStreamId>;
   terminalStreamsById: Map<PacketStreamId, MockTerminalStream>;
   terminalStreamsBySession: Map<UUID, MockTerminalStream>;
   fileUploadsById: Map<PacketStreamId, MockFileUploadStream>;
@@ -222,6 +231,7 @@ export class MockDaemon {
   private closeDaemonClientsRequests = 0;
   private nextRouteReadyGate: Promise<void> | undefined;
   private readonly queuedSessionListResponses: QueuedSessionListResponse[] = [];
+  private readonly queuedSessionFilesResponses: QueuedSessionFilesResponse[] = [];
   private readonly e2eeKeypair: E2eeKeyPair;
   private readonly trustedDevices = new Map<UUID, TrustedDevice>();
   private readonly connections = new Set<MockConnection>();
@@ -295,11 +305,40 @@ export class MockDaemon {
     this.queuedSessionListResponses.push({ sessions, delayMs });
   }
 
+  queueSessionFilesResponse(
+    sessionId: UUID,
+    files: SessionFilesResultPayload,
+    options: { path?: string | null; delayMs?: number } = {},
+  ): void {
+    // 中文注释：按单次请求排队的 file-tree 响应用来构造“旧 follow 晚到覆盖 manual”
+    // 之类的竞态；不能只靠全局固定延迟，否则 follow/manual 的响应顺序仍然不可控。
+    this.queuedSessionFilesResponses.push({
+      sessionId,
+      path: options.path,
+      files,
+      delayMs: options.delayMs ?? 0,
+    });
+  }
+
   pushSessionFiles(files: SessionFilesResultPayload): void {
     this.sessionFilePositions.set(files.session_id, files.path);
+    this.options.sessionFiles = {
+      ...(this.options.sessionFiles ?? {}),
+      [files.path]: files,
+      [files.session_id]: files,
+    };
     for (const connection of this.connections) {
       if (connection.e2ee && connection.watchedSessionIds.has(files.session_id)) {
         this.sendInner(connection, envelope("session_files_result", files));
+      }
+    }
+  }
+
+  pushSessionCwdChanged(sessionId: UUID, cwd: string): void {
+    this.sessionFilePositions.set(sessionId, cwd);
+    for (const connection of this.connections) {
+      if (connection.e2ee && connection.watchedSessionIds.has(sessionId)) {
+        this.sendInner(connection, envelope("session_cwd_changed", { session_id: sessionId, cwd }));
       }
     }
   }
@@ -411,6 +450,7 @@ export class MockDaemon {
       routed: false,
       attachedSessionIds: new Set(),
       watchedSessionIds: new Set(),
+      pendingCanceledTerminalStreamIds: new Set(),
       terminalStreamsById: new Map(),
       terminalStreamsBySession: new Map(),
       fileUploadsById: new Map(),
@@ -608,7 +648,11 @@ export class MockDaemon {
       return;
     }
     if (packet.kind === "cancel") {
-      this.removeTerminalStream(connection, packet.stream_id);
+      if (packet.stream_id && !this.removeTerminalStream(connection, packet.stream_id)) {
+        // 中文注释：terminal.attach 可能仍在延迟响应阶段，此时 stream 尚未注册。
+        // 先记下取消意图，等迟到 ack 返回时不要再把旧 stream/watcher 挂回连接。
+        connection.pendingCanceledTerminalStreamIds.add(packet.stream_id);
+      }
       if (packet.stream_id) {
         connection.fileUploadsById.delete(packet.stream_id);
         connection.fileDownloadsById.delete(packet.stream_id);
@@ -830,6 +874,7 @@ export class MockDaemon {
         }
         this.closedSessions.push(payload.session_id);
         this.options.sessions = this.options.sessions.filter((session) => session.session_id !== payload.session_id);
+        this.cleanupClosedSession(payload.session_id);
         if (this.options.closeSessionUnownedError) {
           // 中文注释：真实 daemon 在显式 close 当前 attach session 时，watch stream 的收尾错误
           // 可能先于 close RPC ack 到达浏览器。测试桩用未归属 request id 的 error 模拟该竞态。
@@ -852,11 +897,13 @@ export class MockDaemon {
           return true;
         }
         this.sessionFileRequests.push(payload);
-        if (this.options.sessionFilesDelayMs) {
+        const queued = this.dequeueSessionFilesResponse(payload);
+        const delayMs = queued?.delayMs ?? this.options.sessionFilesDelayMsByPath?.[payload.path ?? ""] ?? this.options.sessionFilesDelayMs;
+        if (delayMs) {
           // 中文注释：packet response 按 id 返回；慢 files 请求不能抢占同连接上的其他请求。
-          await new Promise((resolve) => setTimeout(resolve, this.options.sessionFilesDelayMs));
+          await new Promise((resolve) => setTimeout(resolve, delayMs));
         }
-        const files = this.resolveSessionFilesResult(payload);
+        const files = queued?.files ?? this.resolveSessionFilesResult(payload);
         this.sendPacketResponse(connection, packet, files);
         return true;
       }
@@ -977,6 +1024,10 @@ export class MockDaemon {
       case "session_attach": {
         const payload = inner.payload as { session_id: UUID; watch_updates?: boolean; last_terminal_seq?: number | null };
         const watchUpdates = payload.watch_updates ?? true;
+        if (!this.options.sessions.some((candidate) => candidate.session_id === payload.session_id)) {
+          this.sendError(connection, "session_not_found", "session was not found");
+          return;
+        }
         if (this.failTerminalAttachRequests > 0) {
           this.failTerminalAttachRequests -= 1;
           this.failedTerminalAttachRequests += 1;
@@ -989,17 +1040,27 @@ export class MockDaemon {
           this.sendError(connection, "connection_closed", "mock watched terminal attach closed");
           return;
         }
-        const session = this.options.sessions.find((candidate) => candidate.session_id === payload.session_id);
         this.attachRequests.push(payload);
-        if (watchUpdates) {
-          this.attachedSessions.push(payload.session_id);
-        }
-        connection.attachedSessionIds.add(payload.session_id);
-        if (watchUpdates) {
-          connection.watchedSessionIds.add(payload.session_id);
-        }
         if (this.options.attachDelayMs) {
           await new Promise((resolve) => setTimeout(resolve, this.options.attachDelayMs));
+        }
+        const session = this.options.sessions.find((candidate) => candidate.session_id === payload.session_id);
+        if (!session) {
+          // 中文注释：attach ack 到达前 session 可能已被另一条连接关闭。
+          // 这种情况下不能再返回成功，否则会制造“attach 成功但权限已被 cleanup 清空”的假阳性。
+          this.sendError(connection, "session_not_found", "session was not found");
+          return;
+        }
+        const requestStreamId = connection.activeRequest?.stream_id;
+        const canceledBeforeAck = !!requestStreamId && connection.pendingCanceledTerminalStreamIds.has(requestStreamId);
+        if (!canceledBeforeAck) {
+          if (watchUpdates) {
+            this.attachedSessions.push(payload.session_id);
+          }
+          connection.attachedSessionIds.add(payload.session_id);
+          if (watchUpdates) {
+            connection.watchedSessionIds.add(payload.session_id);
+          }
         }
         this.sendInner(
           connection,
@@ -1098,6 +1159,7 @@ export class MockDaemon {
         }
         this.closedSessions.push(payload.session_id);
         this.options.sessions = this.options.sessions.filter((session) => session.session_id !== payload.session_id);
+        this.cleanupClosedSession(payload.session_id);
         if (this.options.closeSessionUnownedError) {
           this.sendInner(connection, envelope("error", this.options.closeSessionUnownedError));
         }
@@ -1110,11 +1172,13 @@ export class MockDaemon {
           return;
         }
         this.sessionFileRequests.push(payload);
-        if (this.options.sessionFilesDelayMs) {
+        const queued = this.dequeueSessionFilesResponse(payload);
+        const delayMs = queued?.delayMs ?? this.options.sessionFilesDelayMsByPath?.[payload.path ?? ""] ?? this.options.sessionFilesDelayMs;
+        if (delayMs) {
           // 中文注释：文件树是终端旁路信息；测试用延迟模拟它被大输出或差网络排队。
-          await new Promise((resolve) => setTimeout(resolve, this.options.sessionFilesDelayMs));
+          await new Promise((resolve) => setTimeout(resolve, delayMs));
         }
-        this.sendInner(connection, envelope("session_files_result", this.resolveSessionFilesResult(payload)));
+        this.sendInner(connection, envelope("session_files_result", queued?.files ?? this.resolveSessionFilesResult(payload)));
         return;
       }
       case "session_search": {
@@ -1376,6 +1440,36 @@ export class MockDaemon {
       path: payload.path ?? this.sessionFilePositions.get(payload.session_id) ?? "",
       entries: [],
     };
+  }
+
+  private dequeueSessionFilesResponse(
+    payload: { session_id: UUID; path?: string | null },
+  ): QueuedSessionFilesResponse | undefined {
+    const index = this.queuedSessionFilesResponses.findIndex((entry) =>
+      entry.sessionId === payload.session_id &&
+      (entry.path ?? null) === (payload.path ?? null),
+    );
+    if (index < 0) {
+      return undefined;
+    }
+    return this.queuedSessionFilesResponses.splice(index, 1)[0];
+  }
+
+  private cleanupClosedSession(sessionId: UUID): void {
+    // 中文注释：真实 daemon 关闭 session 后，这个 session 对所有连接都会立刻失效。
+    // mock 也必须做全局清理，避免多连接场景里另一条连接继续保留 attach/watch 权限。
+    for (const connection of this.connections) {
+      connection.attachedSessionIds.delete(sessionId);
+      connection.watchedSessionIds.delete(sessionId);
+      connection.terminalStreamsBySession.delete(sessionId);
+      for (const [streamId, stream] of [...connection.terminalStreamsById.entries()]) {
+        if (stream.sessionId === sessionId) {
+          connection.terminalStreamsById.delete(streamId);
+        }
+      }
+    }
+    this.sessionFilePositions.delete(sessionId);
+    this.sessionOutputSnapshots.delete(sessionId);
   }
 
   private applyMockFileWrite(sessionId: UUID, path: string): void {
@@ -1664,6 +1758,9 @@ export class MockDaemon {
     if (request.kind !== "stream_open" || !request.stream_id || !String(request.method ?? "").startsWith("terminal.")) {
       return;
     }
+    if (connection.pendingCanceledTerminalStreamIds.delete(request.stream_id)) {
+      return;
+    }
     const response = payload as { session_id?: UUID };
     if (!response.session_id) {
       return;
@@ -1680,17 +1777,18 @@ export class MockDaemon {
     connection.terminalStreamsBySession.set(stream.sessionId, stream);
   }
 
-  private removeTerminalStream(connection: MockConnection, streamId?: PacketStreamId): void {
+  private removeTerminalStream(connection: MockConnection, streamId?: PacketStreamId): boolean {
     if (!streamId) {
-      return;
+      return false;
     }
     const stream = connection.terminalStreamsById.get(streamId);
     if (!stream) {
-      return;
+      return false;
     }
     connection.terminalStreamsById.delete(streamId);
     connection.terminalStreamsBySession.delete(stream.sessionId);
     connection.watchedSessionIds.delete(stream.sessionId);
+    return true;
   }
 
   private legacyEventMethod(type: Envelope["type"]): string {

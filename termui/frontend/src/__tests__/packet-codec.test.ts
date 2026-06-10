@@ -201,9 +201,11 @@ describe("protocol method registry", () => {
   it("覆盖 TS 侧 event method 到 envelope 的映射，并保留 mock daemon 反向映射", () => {
     expect(envelopeTypeForProtocolEventMethod("auth.challenge")).toBe("auth_challenge");
     expect(envelopeTypeForProtocolEventMethod("session.files")).toBe("session_files_result");
+    expect(envelopeTypeForProtocolEventMethod("session.cwd")).toBe("session_cwd_changed");
     expect(envelopeTypeForProtocolEventMethod("session.git")).toBe("session_git_result");
     expect(envelopeTypeForProtocolEventMethod("session.resized")).toBe("session_resized");
     expect(envelopeTypeForProtocolEventMethod("unknown.event")).toBeUndefined();
+    expect(protocolEventMethodForLegacyEnvelopeType("session_files_result")).toBe("session.files");
     expect(protocolEventMethodForLegacyEnvelopeType("session_git_result")).toBe("session.git");
     expect(protocolEventMethodForLegacyEnvelopeType("session_renamed")).toBe("session.renamed");
   });

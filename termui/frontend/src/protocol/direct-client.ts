@@ -42,6 +42,8 @@ import {
   messageDataToBytes,
   queuedMessageBytes,
   sendOuterMessage,
+  throwIfAborted,
+  withAbort,
   type QueuedMessage,
   withTimeout,
   yieldToEventLoop,
@@ -1193,7 +1195,7 @@ export class DirectClient {
 
   async attachSession(
     sessionId: UUID,
-    options: { watchUpdates?: boolean; lastTerminalSeq?: number; timeoutMs?: number } = {},
+    options: { watchUpdates?: boolean; lastTerminalSeq?: number; timeoutMs?: number; signal?: AbortSignal } = {},
   ): Promise<SessionAttachedPayload> {
     this.requireAuthenticated();
     return this.openTerminalStream<SessionAttachedPayload>(
@@ -1205,6 +1207,7 @@ export class DirectClient {
       } satisfies SessionAttachPayload,
       sessionId,
       options.timeoutMs,
+      options.signal,
     );
   }
 
@@ -1298,7 +1301,12 @@ export class DirectClient {
     return Math.max(0, performance.now() - startedAt);
   }
 
-  async request<T = unknown>(method: string, payload: unknown, timeoutMs = this.timeoutMs): Promise<T> {
+  async request<T = unknown>(
+    method: string,
+    payload: unknown,
+    timeoutMs = this.timeoutMs,
+    signal?: AbortSignal,
+  ): Promise<T> {
     if (E2EE_READY_PACKET_METHODS.has(method)) {
       this.requireE2eeReady();
     } else {
@@ -1316,6 +1324,7 @@ export class DirectClient {
       id,
       method,
       timeoutMs,
+      signal,
     );
   }
 
@@ -1735,6 +1744,7 @@ export class DirectClient {
     payload: unknown,
     sessionId?: UUID,
     timeoutMs = this.timeoutMs,
+    signal?: AbortSignal,
   ): Promise<T> {
     const id = randomUuid();
     const streamId = randomUuid();
@@ -1759,6 +1769,7 @@ export class DirectClient {
       id,
       method,
       timeoutMs,
+      signal,
     ).then(
       (response) => {
         const resolvedSessionId = response.session_id;
@@ -1829,11 +1840,18 @@ export class DirectClient {
     }
   }
 
-  private sendTrackedPacket<T>(packet: ProtocolPacket, id: UUID, method: string, timeoutMs = this.timeoutMs): Promise<T> {
+  private sendTrackedPacket<T>(
+    packet: ProtocolPacket,
+    id: UUID,
+    method: string,
+    timeoutMs = this.timeoutMs,
+    signal?: AbortSignal,
+  ): Promise<T> {
     if (this.closed) {
       return Promise.reject(this.connectionClosedError());
     }
-    return new Promise<T>((resolve, reject) => {
+    throwIfAborted(signal);
+    return withAbort(new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pendingRequests.delete(id);
         reject(new ProtocolClientError("response_timeout", "operation timed out"));
@@ -1849,6 +1867,22 @@ export class DirectClient {
       } catch (caught) {
         this.rejectTrackedRequest(id, caught instanceof Error ? caught : new Error("send_failed"));
       }
+    }), signal).catch((error) => {
+      if (signal?.aborted) {
+        this.rejectTrackedRequest(id, abortedConnectionError());
+        const streamId = packet.kind === "stream_open" ? packet.stream_id : undefined;
+        if (streamId) {
+          this.sendPacketBestEffort({
+            version: PROTOCOL_PACKET_VERSION,
+            kind: "cancel",
+            stream_id: streamId,
+            payload: { reason: "request_aborted" },
+          });
+          this.discardQueuedTerminalOutputByStream(streamId);
+          this.removeStream(streamId);
+        }
+      }
+      throw error;
     });
   }
 

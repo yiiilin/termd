@@ -82,6 +82,8 @@ export function useSessionFiles() {
   const sessionFilesRequestSeqRef = useRef(0);
   const sessionGitRequestSeqRef = useRef(0);
   const sessionFilesFollowRefreshInFlightRef = useRef(false);
+  const sessionFilesFollowRequestSeqRef = useRef(0);
+  const sessionFilesFollowPendingSessionRef = useRef<UUID | undefined>(undefined);
 
   useEffect(() => {
     sessionFilesFollowTerminalCwdRef.current = sessionFilesFollowTerminalCwd;
@@ -214,8 +216,10 @@ export function useSessionFiles() {
 
   const clearSessionFilesState = useCallback(() => {
     sessionFilesRequestSeqRef.current += 1;
+    sessionFilesFollowRequestSeqRef.current += 1;
     sessionGitRequestSeqRef.current += 1;
     sessionFilesFollowRefreshInFlightRef.current = false;
+    sessionFilesFollowPendingSessionRef.current = undefined;
     setSessionFiles(undefined);
     setSessionFilesError(undefined);
     setSessionFilesLoading(false);
@@ -261,6 +265,8 @@ export function useSessionFiles() {
     sessionFilesRequestSeqRef,
     sessionGitRequestSeqRef,
     sessionFilesFollowRefreshInFlightRef,
+    sessionFilesFollowRequestSeqRef,
+    sessionFilesFollowPendingSessionRef,
     visibleProgressForSession,
     nextFileTransferId,
     clearSessionFileUploadProgressTimer,
@@ -298,6 +304,8 @@ export function useSessionFileLoaders(
     sessionFilesLoadingRef,
     sessionGitLoadingRef,
     sessionFilesFollowRefreshInFlightRef,
+    sessionFilesFollowRequestSeqRef,
+    sessionFilesFollowPendingSessionRef,
     sessionFilesFollowTerminalCwd,
     sessionFilesLoading,
     setSessionFiles,
@@ -328,6 +336,15 @@ export function useSessionFileLoaders(
       if (silent && sessionFilesLoadingRef.current) {
         return;
       }
+      const followRequestSeq =
+        source === "follow" ? sessionFilesFollowRequestSeqRef.current + 1 : sessionFilesFollowRequestSeqRef.current;
+      if (source === "follow") {
+        sessionFilesFollowRequestSeqRef.current = followRequestSeq;
+      } else if (!silent) {
+        // 中文注释：用户显式浏览目录后，任何仍在路上的 follow 静默刷新都必须整体作废；
+        // 否则旧 cwd 的慢响应可能晚到一步，把面板位置覆盖回去。
+        sessionFilesFollowRequestSeqRef.current += 1;
+      }
       // 中文注释：silent follow/reconnect refresh 不能推进可见请求序号；
       // 否则手动打开目录的 finally 会被跳过，文件面板可能永远停在 loading。
       const requestSeq = silent ? sessionFilesRequestSeqRef.current : sessionFilesRequestSeqRef.current + 1;
@@ -343,8 +360,10 @@ export function useSessionFileLoaders(
         // 文件树当前位置是 daemon 端 session 共享状态；不传 path 时由 daemon 返回当前共享目录。
         const files = await client.listSessionFiles(sessionId, path);
         const isCurrentRequest = requestSeq === sessionFilesRequestSeqRef.current;
+        const isCurrentFollowRequest =
+          source !== "follow" || followRequestSeq === sessionFilesFollowRequestSeqRef.current;
         const allowsFollowResult = source !== "follow" || sessionFilesFollowTerminalCwdRef.current;
-        if (!isCurrentRequest || !allowsFollowResult) {
+        if (!isCurrentRequest || !isCurrentFollowRequest || !allowsFollowResult) {
           return;
         }
         setSessionFiles(files);
@@ -364,6 +383,7 @@ export function useSessionFileLoaders(
     [
       authenticatedSessionClient,
       sessionFilesFollowTerminalCwdRef,
+      sessionFilesFollowRequestSeqRef,
       sessionFilesLoadingRef,
       sessionFilesRequestSeqRef,
       setSessionFiles,
@@ -424,6 +444,79 @@ export function useSessionFileLoaders(
     ],
   );
 
+  const requestFollowSessionFilesRefresh = useCallback(
+    async (sessionId?: UUID) => {
+      const targetSessionId = sessionId ?? attachedSessionRef.current;
+      if (!targetSessionId) {
+        return;
+      }
+      if (sessionFilesLoadingRef.current) {
+        // 中文注释：用户正在发起可见文件树请求时，follow 轻事件不能直接放弃；
+        // 否则 cwd 变化会被整次吞掉，只能等下一轮 1s poll 才追上。
+        sessionFilesFollowPendingSessionRef.current = targetSessionId;
+        return;
+      }
+      if (sessionFilesFollowRefreshInFlightRef.current) {
+        // 中文注释：follow 刷新进行中时，新的 cwd 事件不能直接丢掉；
+        // 否则快速 `cd` 两次会停在旧目录，直到下一轮 1s poll 才追上。
+        sessionFilesFollowPendingSessionRef.current = targetSessionId;
+        return;
+      }
+      sessionFilesFollowRefreshInFlightRef.current = true;
+      try {
+        let nextSessionId: UUID | undefined = targetSessionId;
+        while (nextSessionId) {
+          sessionFilesFollowPendingSessionRef.current = undefined;
+          // 中文注释：follow 轻事件和定时 poll 共用同一把单飞锁，避免并发重拉同一个 cwd。
+          await loadSessionFiles(nextSessionId, undefined, {
+            silent: true,
+            source: "follow",
+          });
+          nextSessionId = sessionFilesFollowPendingSessionRef.current;
+        }
+      } finally {
+        sessionFilesFollowRefreshInFlightRef.current = false;
+        sessionFilesFollowPendingSessionRef.current = undefined;
+      }
+    },
+    [
+      attachedSessionRef,
+      loadSessionFiles,
+      sessionFilesLoadingRef,
+      sessionFilesFollowPendingSessionRef,
+      sessionFilesFollowRefreshInFlightRef,
+    ],
+  );
+
+  useEffect(() => {
+    if (sessionFilesLoading) {
+      return;
+    }
+    const pendingSessionId = sessionFilesFollowPendingSessionRef.current;
+    if (!pendingSessionId || !sessionFilesFollowTerminalCwd) {
+      return;
+    }
+    sessionFilesFollowPendingSessionRef.current = undefined;
+    void requestFollowSessionFilesRefresh(pendingSessionId);
+  }, [
+    requestFollowSessionFilesRefresh,
+    sessionFilesFollowPendingSessionRef,
+    sessionFilesFollowTerminalCwd,
+    sessionFilesLoading,
+  ]);
+
+  const handlePassiveSessionFilesResult = useCallback(
+    (files: SessionFilesResultPayload) => {
+      if (!sessionFilesFollowTerminalCwdRef.current) {
+        return;
+      }
+      // 中文注释：旧 daemon 可能仍会被动 push `session_files_result`。
+      // 这里不能直接回写 UI；否则迟到的旧 push 会绕过 request seq，把文件面板打回旧目录。
+      void requestFollowSessionFilesRefresh(files.session_id);
+    },
+    [requestFollowSessionFilesRefresh, sessionFilesFollowTerminalCwdRef],
+  );
+
   useEffect(() => {
     if (
       !attachedSessionId ||
@@ -435,15 +528,7 @@ export function useSessionFileLoaders(
     }
 
     const refreshFromTerminalCwd = () => {
-      const sessionId = attachedSessionRef.current;
-      if (!sessionId || sessionFilesFollowRefreshInFlightRef.current) {
-        return;
-      }
-      sessionFilesFollowRefreshInFlightRef.current = true;
-      // 跟随模式必须不传 path；daemon 会按当前 PTY cwd 返回文件树位置。
-      void loadSessionFiles(sessionId, undefined, { silent: true, source: "follow" }).finally(() => {
-        sessionFilesFollowRefreshInFlightRef.current = false;
-      });
+      void requestFollowSessionFilesRefresh(attachedSessionRef.current);
     };
 
     const timer = window.setInterval(refreshFromTerminalCwd, followPollIntervalMs);
@@ -453,8 +538,7 @@ export function useSessionFileLoaders(
     attachedSessionRef,
     connectionReady,
     followPollIntervalMs,
-    loadSessionFiles,
-    sessionFilesFollowRefreshInFlightRef,
+    requestFollowSessionFilesRefresh,
     sessionFilesFollowTerminalCwd,
     sessionFilesLoading,
   ]);
@@ -462,6 +546,8 @@ export function useSessionFileLoaders(
   return {
     loadSessionFiles,
     loadSessionGit,
+    requestFollowSessionFilesRefresh,
+    handlePassiveSessionFilesResult,
   };
 }
 

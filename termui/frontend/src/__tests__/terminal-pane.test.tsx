@@ -905,7 +905,7 @@ describe("TerminalPane terminal sequence rendering", () => {
           operations: Array<{ op: string; cols?: number; rows?: number }>;
         };
       }).__TERMD_TEST_TERMINAL_STATS__?.operations ?? [];
-      // 中文注释：这里是 daemon/tmux 已确认的 sessionSize 变化，不是本地 blur/layout 抖动。
+      // 中文注释：这里是 daemon/supervisor 已确认的 sessionSize 变化，不是本地 blur/layout 抖动。
       // 未聚焦客户端必须被动切回权威 grid，避免后续输出按旧列宽继续错位。
       expect(operations).toContainEqual({ op: "resize", cols: remoteSize.cols, rows: remoteSize.rows });
     } finally {
@@ -964,7 +964,7 @@ describe("TerminalPane terminal sequence rendering", () => {
       expect(terminalHost().dataset.buffer)
         .toContain("remote-snapshot");
       // 中文注释：reload/重连 snapshot 可能携带旧尺寸；用户已经重新聚焦终端时，
-      // snapshot 完成后必须把当前浏览器布局尺寸写回 daemon/tmux。
+      // snapshot 完成后必须把当前浏览器布局尺寸写回 daemon/supervisor。
       expect(onResize).toHaveBeenCalledWith({
         rows: localSize.rows,
         cols: localSize.cols,
@@ -1301,7 +1301,7 @@ describe("TerminalPane terminal sequence rendering", () => {
     }
   });
 
-  it("用户向上滚动但 Ghostty 无本地 scrollback 时会请求 tmux snapshot history", async () => {
+  it("用户向上滚动但 Ghostty 无本地 scrollback 时会请求 supervisor snapshot history", async () => {
     vi.useFakeTimers();
     try {
       const onTerminalResync = vi.fn();
@@ -1335,8 +1335,8 @@ describe("TerminalPane terminal sequence rendering", () => {
         await vi.advanceTimersByTimeAsync(animationFrameMs * 4);
       });
 
-      // 中文注释：真实 tmux attach 输出可能不让 Ghostty 本地形成 scrollback；
-      // 用户一旦向上滚，就应主动拉 daemon/tmux snapshot，而不是等输出超过 8KiB。
+      // 中文注释：真实 supervisor attach 输出可能不让 Ghostty 本地形成 scrollback；
+      // 用户一旦向上滚，就应主动拉 daemon/supervisor snapshot，而不是等输出超过 8KiB。
       expect(onTerminalResync).toHaveBeenCalledTimes(1);
       expect(onTerminalResync).toHaveBeenCalledWith(undefined, { revealHistory: true });
       expect(wheelEvent.defaultPrevented).toBe(true);
@@ -3009,7 +3009,7 @@ describe("TerminalPane terminal sizing", () => {
         vi.advanceTimersByTime(1000 + animationFrameMs * 4);
       });
 
-      // 中文注释：daemon/tmux 已经确认了新的 rows/cols，此时要再做一次 full snapshot，
+      // 中文注释：daemon/supervisor 已经确认了新的 rows/cols，此时要再做一次 full snapshot，
       // 把旧 80x24 重放留下的 scrollback 一起按新尺寸重建。
       expect(onTerminalResync).toHaveBeenCalledWith(undefined);
 

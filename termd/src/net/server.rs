@@ -102,7 +102,7 @@ fn websocket_idle_timeout_enabled() -> bool {
 enum SessionPushEvent {
     Output(SessionId),
     Activity(SessionId),
-    FileTree(SessionId),
+    Cwd(SessionId),
     Resize(SessionId),
 }
 
@@ -111,7 +111,7 @@ impl SessionPushEvent {
         match self {
             Self::Output(_) => "output",
             Self::Activity(_) => "activity",
-            Self::FileTree(_) => "file_tree",
+            Self::Cwd(_) => "cwd",
             Self::Resize(_) => "resize",
         }
     }
@@ -120,7 +120,7 @@ impl SessionPushEvent {
         match self {
             Self::Output(session_id)
             | Self::Activity(session_id)
-            | Self::FileTree(session_id)
+            | Self::Cwd(session_id)
             | Self::Resize(session_id) => session_id,
         }
     }
@@ -132,7 +132,7 @@ impl SessionPushEvent {
             // 造成浏览器 WebSocket 队列和 daemon 事件循环都被固定长度小包拖慢。
             SessionPushEvent::Activity(_) => Some(SESSION_ACTIVITY_PUSH_MIN_INTERVAL),
             SessionPushEvent::Output(_)
-            | SessionPushEvent::FileTree(_)
+            | SessionPushEvent::Cwd(_)
             | SessionPushEvent::Resize(_) => None,
         }
     }
@@ -143,7 +143,7 @@ impl SessionPushEvent {
             // 合并为一次 drain，仍保持交互延迟在用户无感范围内。
             SessionPushEvent::Output(_) => Some(TERMINAL_OUTPUT_PUSH_COALESCE_DELAY),
             SessionPushEvent::Activity(_)
-            | SessionPushEvent::FileTree(_)
+            | SessionPushEvent::Cwd(_)
             | SessionPushEvent::Resize(_) => None,
         }
     }
@@ -253,7 +253,7 @@ struct WebSocketTrafficCounters {
     out_response: WebSocketTrafficBucket,
     out_push_output: WebSocketTrafficBucket,
     out_push_activity: WebSocketTrafficBucket,
-    out_push_file_tree: WebSocketTrafficBucket,
+    out_push_cwd: WebSocketTrafficBucket,
     out_push_resize: WebSocketTrafficBucket,
     out_plain_error: WebSocketTrafficBucket,
     out_ping: WebSocketTrafficBucket,
@@ -282,7 +282,7 @@ impl WebSocketTrafficCounters {
             WebSocketOutKind::Response => self.out_response.record(envelopes, bytes),
             WebSocketOutKind::PushOutput => self.out_push_output.record(envelopes, bytes),
             WebSocketOutKind::PushActivity => self.out_push_activity.record(envelopes, bytes),
-            WebSocketOutKind::PushFileTree => self.out_push_file_tree.record(envelopes, bytes),
+            WebSocketOutKind::PushCwd => self.out_push_cwd.record(envelopes, bytes),
             WebSocketOutKind::PushResize => self.out_push_resize.record(envelopes, bytes),
             WebSocketOutKind::PlainError => self.out_plain_error.record(envelopes, bytes),
             WebSocketOutKind::Ping => self.out_ping.record(envelopes, bytes),
@@ -309,7 +309,7 @@ impl WebSocketTrafficCounters {
             || !self.out_response.is_empty()
             || !self.out_push_output.is_empty()
             || !self.out_push_activity.is_empty()
-            || !self.out_push_file_tree.is_empty()
+            || !self.out_push_cwd.is_empty()
             || !self.out_push_resize.is_empty()
             || !self.out_plain_error.is_empty()
             || !self.out_ping.is_empty()
@@ -325,7 +325,7 @@ enum WebSocketOutKind {
     Response,
     PushOutput,
     PushActivity,
-    PushFileTree,
+    PushCwd,
     PushResize,
     PlainError,
     Ping,
@@ -345,7 +345,7 @@ impl WebSocketOutKind {
             Self::Response => "response",
             Self::PushOutput => "push_output",
             Self::PushActivity => "push_activity",
-            Self::PushFileTree => "push_file_tree",
+            Self::PushCwd => "push_cwd",
             Self::PushResize => "push_resize",
             Self::PlainError => "plain_error",
             Self::Ping => "ping",
@@ -358,7 +358,7 @@ impl WebSocketOutKind {
 struct WebSocketWatcherCounts {
     output: usize,
     activity: usize,
-    file_tree: usize,
+    cwd: usize,
     resize: usize,
 }
 
@@ -1807,13 +1807,13 @@ fn route_ready_envelope(server_id: ServerId, role: RouteRole) -> JsonEnvelope {
 fn current_websocket_watcher_counts(
     watched_output_sessions: &HashSet<SessionId>,
     watched_activity_sessions: &HashSet<SessionId>,
-    watched_file_tree_sessions: &HashSet<SessionId>,
+    _watched_cwd_sessions: &HashSet<SessionId>,
     watched_resize_sessions: &HashSet<SessionId>,
 ) -> WebSocketWatcherCounts {
     WebSocketWatcherCounts {
         output: watched_output_sessions.len(),
         activity: watched_activity_sessions.len(),
-        file_tree: watched_file_tree_sessions.len(),
+        cwd: _watched_cwd_sessions.len(),
         resize: watched_resize_sessions.len(),
     }
 }
@@ -1893,7 +1893,7 @@ fn info_websocket_traffic(
         ?protocol_traffic,
         watchers_output = watchers.output,
         watchers_activity = watchers.activity,
-        watchers_file_tree = watchers.file_tree,
+        watchers_cwd = watchers.cwd,
         watchers_resize = watchers.resize,
         flow_packet_mode = flow.packet_mode,
         flow_binary_mode = flow.binary_mode,
@@ -1921,7 +1921,7 @@ fn debug_websocket_traffic(
         ?protocol_traffic,
         watchers_output = watchers.output,
         watchers_activity = watchers.activity,
-        watchers_file_tree = watchers.file_tree,
+        watchers_cwd = watchers.cwd,
         watchers_resize = watchers.resize,
         flow_packet_mode = flow.packet_mode,
         flow_binary_mode = flow.binary_mode,
@@ -1954,7 +1954,7 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
         mpsc::channel::<SessionPushEvent>(WEBSOCKET_PUSH_EVENT_QUEUE_CAPACITY);
     let mut watched_output_sessions = HashSet::new();
     let mut watched_activity_sessions = HashSet::new();
-    let mut watched_file_tree_sessions = HashSet::new();
+    let mut watched_cwd_sessions = HashSet::new();
     let mut watched_resize_sessions = HashSet::new();
     let mut watcher_tasks: Vec<JoinHandle<()>> = Vec::new();
     let mut push_event_queue = SessionPushEventQueue::default();
@@ -2122,7 +2122,7 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
                             current_websocket_watcher_counts(
                                 &watched_output_sessions,
                                 &watched_activity_sessions,
-                                &watched_file_tree_sessions,
+                                &watched_cwd_sessions,
                                 &watched_resize_sessions,
                             ),
                             false,
@@ -2139,7 +2139,7 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
                             current_websocket_watcher_counts(
                                 &watched_output_sessions,
                                 &watched_activity_sessions,
-                                &watched_file_tree_sessions,
+                                &watched_cwd_sessions,
                                 &watched_resize_sessions,
                             ),
                             false,
@@ -2179,7 +2179,7 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
                                     current_websocket_watcher_counts(
                                         &watched_output_sessions,
                                         &watched_activity_sessions,
-                                        &watched_file_tree_sessions,
+                                        &watched_cwd_sessions,
                                         &watched_resize_sessions,
                                     ),
                                     false,
@@ -2220,7 +2220,7 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
                             &protocol,
                             &mut watched_output_sessions,
                             &mut watched_activity_sessions,
-                            &mut watched_file_tree_sessions,
+                            &mut watched_cwd_sessions,
                             &mut watched_resize_sessions,
                             &push_event_tx,
                             &mut watcher_tasks,
@@ -2249,7 +2249,7 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
                             current_websocket_watcher_counts(
                                 &watched_output_sessions,
                                 &watched_activity_sessions,
-                                &watched_file_tree_sessions,
+                                &watched_cwd_sessions,
                                 &watched_resize_sessions,
                             ),
                             false,
@@ -2273,7 +2273,7 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
                     current_websocket_watcher_counts(
                         &watched_output_sessions,
                         &watched_activity_sessions,
-                        &watched_file_tree_sessions,
+                        &watched_cwd_sessions,
                         &watched_resize_sessions,
                     ),
                     false,
@@ -2305,7 +2305,7 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
                         current_websocket_watcher_counts(
                             &watched_output_sessions,
                             &watched_activity_sessions,
-                            &watched_file_tree_sessions,
+                            &watched_cwd_sessions,
                             &watched_resize_sessions,
                         ),
                         false,
@@ -2349,7 +2349,7 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
                             current_websocket_watcher_counts(
                         &watched_output_sessions,
                         &watched_activity_sessions,
-                        &watched_file_tree_sessions,
+                        &watched_cwd_sessions,
                         &watched_resize_sessions,
                     ),
                     false,
@@ -2366,7 +2366,7 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
         current_websocket_watcher_counts(
             &watched_output_sessions,
             &watched_activity_sessions,
-            &watched_file_tree_sessions,
+            &watched_cwd_sessions,
             &watched_resize_sessions,
         ),
         true,
@@ -2599,13 +2599,13 @@ async fn collect_websocket_push_event(
                 connection.read_session_activity_wire(&mut protocol, session_id),
             )
         }
-        SessionPushEvent::FileTree(session_id) => {
+        SessionPushEvent::Cwd(session_id) => {
             let messages = {
                 let mut protocol = protocol.lock().await;
-                connection.read_session_file_tree_update_messages(&mut protocol, session_id)
+                connection.read_session_cwd_update_messages(&mut protocol, session_id)
             };
             (
-                WebSocketOutKind::PushFileTree,
+                WebSocketOutKind::PushCwd,
                 connection.encrypt_collected_inner_messages_wire(messages),
             )
         }
@@ -2627,18 +2627,18 @@ async fn register_session_watchers(
     protocol: &SharedDaemonProtocol,
     watched_output_sessions: &mut HashSet<SessionId>,
     watched_activity_sessions: &mut HashSet<SessionId>,
-    watched_file_tree_sessions: &mut HashSet<SessionId>,
+    watched_cwd_sessions: &mut HashSet<SessionId>,
     watched_resize_sessions: &mut HashSet<SessionId>,
     push_event_tx: &mpsc::Sender<SessionPushEvent>,
     watcher_tasks: &mut Vec<JoinHandle<()>>,
 ) -> Vec<SessionId> {
     let mut initial_output_sessions = Vec::new();
-    let (output_signals, activity_signals, file_tree_signals, resize_signals) = {
+    let (output_signals, activity_signals, cwd_signals, resize_signals) = {
         let protocol = protocol.lock().await;
         (
             connection.attached_output_signals(&protocol),
             connection.session_activity_signals(&protocol),
-            connection.attached_file_tree_signals(&protocol),
+            connection.attached_cwd_signals(&protocol),
             connection.attached_resize_signals(&protocol),
         )
     };
@@ -2650,7 +2650,7 @@ async fn register_session_watchers(
         .iter()
         .map(|(session_id, _)| *session_id)
         .collect();
-    let desired_file_tree_sessions: HashSet<_> = file_tree_signals
+    let desired_cwd_sessions: HashSet<_> = cwd_signals
         .iter()
         .map(|(session_id, _)| *session_id)
         .collect();
@@ -2661,7 +2661,7 @@ async fn register_session_watchers(
 
     if !watched_output_sessions.is_subset(&desired_output_sessions)
         || !watched_activity_sessions.is_subset(&desired_activity_sessions)
-        || !watched_file_tree_sessions.is_subset(&desired_file_tree_sessions)
+        || !watched_cwd_sessions.is_subset(&desired_cwd_sessions)
         || !watched_resize_sessions.is_subset(&desired_resize_sessions)
     {
         // 中文注释：切换 terminal stream 后旧 session 不应继续产生 push。
@@ -2672,7 +2672,7 @@ async fn register_session_watchers(
         }
         watched_output_sessions.clear();
         watched_activity_sessions.clear();
-        watched_file_tree_sessions.clear();
+        watched_cwd_sessions.clear();
         watched_resize_sessions.clear();
     }
 
@@ -2708,15 +2708,15 @@ async fn register_session_watchers(
         );
     }
 
-    for (session_id, signal) in file_tree_signals {
-        if !watched_file_tree_sessions.insert(session_id) {
+    for (session_id, signal) in cwd_signals {
+        if !watched_cwd_sessions.insert(session_id) {
             continue;
         }
 
         spawn_session_push_watcher(
             session_id,
             signal,
-            SessionPushEvent::FileTree(session_id),
+            SessionPushEvent::Cwd(session_id),
             push_event_tx,
             watcher_tasks,
         );
@@ -2801,7 +2801,7 @@ fn spawn_session_push_watcher<T>(
             let next_event = match event {
                 SessionPushEvent::Output(_) => SessionPushEvent::Output(session_id),
                 SessionPushEvent::Activity(_) => SessionPushEvent::Activity(session_id),
-                SessionPushEvent::FileTree(_) => SessionPushEvent::FileTree(session_id),
+                SessionPushEvent::Cwd(_) => SessionPushEvent::Cwd(session_id),
                 SessionPushEvent::Resize(_) => SessionPushEvent::Resize(session_id),
             };
             if push_event_tx.send(next_event).await.is_err() {
@@ -3127,7 +3127,8 @@ mod tests {
     use termd_proto::{
         DeviceId, E2eeKeyExchangePayload, Envelope, HttpE2eeAuthPayload, PairAcceptPayload,
         PairRequestPayload, PublicKey, SessionCreatePayload, SessionCreatedPayload,
-        SessionDataPayload, SessionFileDownloadStreamReadyPayload, SessionFileHttpDownloadPayload,
+        SessionCwdChangedPayload, SessionDataPayload, SessionFileDownloadStreamReadyPayload,
+        SessionFileHttpDownloadPayload,
         SessionFileHttpUploadReadyPayload, SessionFileHttpUploadStreamPayload,
         SessionFileUploadPayload, Signature, TerminalSize, UnixTimestampMillis,
     };
@@ -5031,6 +5032,128 @@ mod tests {
             );
         }
 
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn websocket_pushes_cwd_updates_without_client_pull_frame() {
+        let workspace_root = std::env::temp_dir().join(format!(
+            "termd-websocket-cwd-root-{}-{}",
+            std::process::id(),
+            current_unix_timestamp_millis().0
+        ));
+        let file_root = workspace_root.join("project");
+        fs::create_dir_all(&file_root).unwrap();
+        fs::write(file_root.join("alpha.txt"), b"alpha\n").unwrap();
+
+        let mut config = test_config("websocket-cwd-push");
+        config.default_working_directory = Some(workspace_root.clone());
+        let protocol = default_protocol(config);
+        let server_id = protocol.lock().await.server_id();
+        let pairing_token = {
+            protocol
+                .lock()
+                .await
+                .issue_pairing_token(current_unix_timestamp_millis())
+                .unwrap()
+                .token()
+                .clone()
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_protocol = protocol.clone();
+        let server = tokio::spawn(async move {
+            let _ = serve_listener(listener, server_protocol, false).await;
+        });
+
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .unwrap();
+        send_ws_route_hello(&mut socket, server_id).await;
+        let hello = read_ws_envelope(&mut socket).await;
+        assert_eq!(hello.kind, MessageType::Hello);
+        let key_exchange = read_ws_envelope(&mut socket).await;
+        assert_eq!(key_exchange.kind, MessageType::E2eeKeyExchange);
+        let daemon_exchange: E2eeKeyExchangePayload = decode_payload(key_exchange.payload).unwrap();
+        let device_id = DeviceId::new();
+        let mut device_session = open_client_e2ee(&mut socket, daemon_exchange, device_id).await;
+
+        send_encrypted_ws(
+            &mut socket,
+            &mut device_session,
+            envelope_value(
+                MessageType::PairRequest,
+                PairRequestPayload {
+                    device_id,
+                    device_public_key: PublicKey("ed25519-v1:test-device-key".to_owned()),
+                    token: pairing_token,
+                    nonce: termd_proto::Nonce("cwd-push-test-pairing-nonce".to_owned()),
+                    timestamp_ms: current_unix_timestamp_millis(),
+                },
+            )
+            .unwrap(),
+        )
+        .await;
+        let pair_accept = read_encrypted_ws(&mut socket, &mut device_session).await;
+        assert_eq!(pair_accept.kind, MessageType::PairAccept);
+
+        send_encrypted_ws(
+            &mut socket,
+            &mut device_session,
+            envelope_value(
+                MessageType::SessionCreate,
+                SessionCreatePayload {
+                    command: vec![
+                        "sh".to_owned(),
+                        "-lc".to_owned(),
+                        format!(
+                            "sleep 0.15; cd {}; printf cwd-moved; sleep 2",
+                            file_root.to_string_lossy()
+                        ),
+                    ],
+                    size: TerminalSize::default(),
+                },
+            )
+            .unwrap(),
+        )
+        .await;
+        let created = read_encrypted_ws(&mut socket, &mut device_session).await;
+        assert_eq!(created.kind, MessageType::SessionCreated);
+        let created_payload: SessionCreatedPayload = decode_payload(created.payload).unwrap();
+
+        send_encrypted_ws(
+            &mut socket,
+            &mut device_session,
+            envelope_value(
+                MessageType::SessionFiles,
+                termd_proto::SessionFilesPayload {
+                    session_id: created_payload.session_id,
+                    path: None,
+                },
+            )
+            .unwrap(),
+        )
+        .await;
+        let initial_files = read_encrypted_ws(&mut socket, &mut device_session).await;
+        assert_eq!(initial_files.kind, MessageType::SessionFilesResult);
+
+        let push_deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            let remaining = push_deadline.saturating_duration_since(Instant::now());
+            let pushed = timeout(remaining, read_encrypted_ws(&mut socket, &mut device_session))
+                .await
+                .expect("daemon should push cwd updates without client pull frames");
+            if pushed.kind != MessageType::SessionCwdChanged {
+                continue;
+            }
+            let payload: SessionCwdChangedPayload = decode_payload(pushed.payload).unwrap();
+            if payload.cwd == file_root.to_string_lossy() {
+                assert_eq!(payload.session_id, created_payload.session_id);
+                break;
+            }
+        }
+
+        fs::remove_dir_all(workspace_root).ok();
         server.abort();
     }
 

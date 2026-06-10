@@ -6,6 +6,7 @@ import {
   type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent,
 } from "react";
+import { flushSync } from "react-dom";
 import type { SessionSummaryPayload, UUID } from "../protocol/types";
 import { sessionDisplayName } from "../session-names";
 import { useI18n } from "../i18n";
@@ -21,7 +22,7 @@ interface SessionListProps {
   onAttach: (sessionId: UUID) => void;
   onStartRename: (sessionId: UUID, currentName: string) => void;
   onRenameDraftChange: (name: string) => void;
-  onSaveRename: (sessionId: UUID) => void;
+  onSaveRename: (sessionId: UUID, nextName: string) => void;
   onCancelRename: () => void;
   onClose: (sessionId: UUID) => void;
   onReorder?: (sessionIds: UUID[]) => void;
@@ -273,7 +274,14 @@ export function SessionList(props: SessionListProps) {
                     onClick={(event) => event.stopPropagation()}
                     onSubmit={(event) => {
                       event.preventDefault();
-                      props.onSaveRename(session.session_id);
+                      const formData = new FormData(event.currentTarget);
+                      const nextName = formData.get("session-name");
+                      // 中文注释：提交时直接读当前表单值，避免最后一个按键和点击保存
+                      // 落在同一批更新里时，React state 仍停在旧 renameDraft。
+                      props.onSaveRename(
+                        session.session_id,
+                        typeof nextName === "string" ? nextName : props.renameDraft,
+                      );
                     }}
                   >
                     <label className="sr-only" htmlFor={`session-name-${session.session_id}`}>
@@ -281,9 +289,16 @@ export function SessionList(props: SessionListProps) {
                     </label>
                     <input
                       id={`session-name-${session.session_id}`}
+                      name="session-name"
                       aria-label={t("sessions.name")}
                       value={props.renameDraft}
-                      onChange={(event) => props.onRenameDraftChange(event.target.value)}
+                      onChange={(event) => {
+                        // 中文注释：rename 输入框会和 daemon 状态轮询、session.refresh 并发重渲染。
+                        // 这里强制同步提交草稿，避免后台刷新先用旧 draft 回写，吞掉最后一个字符。
+                        flushSync(() => {
+                          props.onRenameDraftChange(event.target.value);
+                        });
+                      }}
                       autoFocus
                     />
                   </form>

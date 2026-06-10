@@ -126,7 +126,7 @@ pub struct SessionRuntime<B: PtyBackend> {
 impl<B: PtyBackend> SessionRuntime<B> {
     /// 创建 runtime，并注入具体 PTY backend。
     ///
-    /// 测试可以传入 fake backend；生产 daemon 后续接入 `PortablePtyBackend`。
+    /// 测试可以传入 fake backend；生产 daemon 默认注入 supervisor backend。
     pub fn new(backend: B) -> Self {
         Self {
             backend,
@@ -241,7 +241,7 @@ impl<B: PtyBackend> SessionRuntime<B> {
         Ok(self.sessions.attach(session_id, device_id)?)
     }
 
-    /// 为一个 watched terminal 连接创建连接级 PTY/tmux attach handle。
+    /// 为一个 watched terminal 连接创建连接级终端 attach handle。
     ///
     /// 中文注释：这个 handle 和设备级 operator 角色分离。同一设备可以有多条在线
     /// WebSocket，每条 watched terminal 连接都用自己的 attachment id 清理自己的后端 client。
