@@ -2993,6 +2993,11 @@ export function TerminalPane(props: TerminalPaneProps) {
     };
     const rendererResult = createTerminalRendererInstance({
       terminalOptions: {
+        // 中文注释：同 session 的 full snapshot repair / reconnect 会重建 xterm 实例。
+        // 如果这里回退到 xterm 默认 80x24，调试镜像和真实 DOM 都会短暂暴露错误网格，
+        // 造成“108x35 -> 80x24 -> 108x35”的闪回。新实例应优先从当前权威 sessionSize 起步。
+        cols: props.sessionSize?.cols ?? 80,
+        rows: props.sessionSize?.rows ?? 24,
         cursorBlink: true,
         cursorStyle: "block",
         cursorInactiveStyle: "outline",

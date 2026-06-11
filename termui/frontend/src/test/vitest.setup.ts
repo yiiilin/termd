@@ -167,6 +167,13 @@ vi.mock("@xterm/xterm", () => {
 
     constructor(options: Record<string, unknown> = {}) {
       this.optionsRecord = options;
+      const seededCols = typeof options.cols === "number" ? options.cols : undefined;
+      const seededRows = typeof options.rows === "number" ? options.rows : undefined;
+      if (seededCols && seededRows) {
+        this.cols = seededCols;
+        this.rows = seededRows;
+        this.buffer.active.length = seededRows;
+      }
     }
 
     get options() {

@@ -2107,6 +2107,40 @@ describe("TerminalPane terminal sequence rendering", () => {
     }
   });
 
+  it("同 session 的 outputResetVersion 重建会沿用已确认 sessionSize，不回退到默认 80x24", async () => {
+    const confirmedSessionSize = { rows: 35, cols: 108, pixel_width: 716, pixel_height: 668 };
+    const takeOutput = vi.fn(() => []);
+    const registerOutputDrain = vi.fn((drain: () => void) => {
+      drain();
+      return () => undefined;
+    });
+    const props = {
+      attached: true,
+      sessionSize: confirmedSessionSize,
+      takeOutput,
+      registerOutputDrain,
+      onInput: vi.fn(),
+      onResize: vi.fn(),
+      onCursorChange: vi.fn(),
+    };
+
+    const { rerender } = render(<TerminalPane {...props} outputResetVersion={0} />);
+
+    await waitFor(() => {
+      const host = document.querySelector<HTMLElement>(".terminal-host");
+      expect(host?.dataset.termdCols).toBe(String(confirmedSessionSize.cols));
+      expect(host?.dataset.termdRows).toBe(String(confirmedSessionSize.rows));
+    });
+
+    rerender(<TerminalPane {...props} outputResetVersion={1} />);
+
+    await waitFor(() => {
+      const host = document.querySelector<HTMLElement>(".terminal-host");
+      expect(host?.dataset.termdCols).toBe(String(confirmedSessionSize.cols));
+      expect(host?.dataset.termdRows).toBe(String(confirmedSessionSize.rows));
+    });
+  });
+
   it("revealHistory snapshot 渲染后不会污染下一次普通 snapshot 贴底", async () => {
     vi.useFakeTimers();
     try {

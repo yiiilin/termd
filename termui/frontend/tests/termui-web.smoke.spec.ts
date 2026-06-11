@@ -457,6 +457,8 @@ test("terminal 上滚后 1..1000 历史顺序和下半区拖拽复制一致", as
     await activateButton(page, "Pair");
 
     await expectTerminalLine(page, "1000", 8_000);
+    await focusTerminalKeyboardSink(page);
+    await waitForStableTerminalSurface(page);
     await page.getByTestId("terminal-pane").hover();
     await page.mouse.wheel(0, -1400);
     await expect
@@ -471,6 +473,7 @@ test("terminal 上滚后 1..1000 历史顺序和下半区拖拽复制一致", as
       expect(viewportLines[index]).toBe(viewportLines[index - 1] + 1);
     }
 
+    await waitForStableTerminalSurface(page);
     const metrics = await terminalSurfaceMetrics(page);
     expect(metrics.rows).toBeGreaterThan(10);
     expect(metrics.cols).toBeGreaterThan(20);
@@ -1212,6 +1215,31 @@ async function terminalHostSize(page: Page): Promise<{ cols: number; rows: numbe
       rows: Number.parseInt(element.dataset.termdRows ?? "0", 10),
     };
   });
+}
+
+async function waitForStableTerminalSurface(page: Page): Promise<void> {
+  await expect
+    .poll(async () => page.locator(".terminal-host").evaluate((host) => {
+      const element = host as HTMLElement;
+      const surface =
+        element.querySelector<HTMLElement>("canvas") ??
+        element.querySelector<HTMLElement>(".xterm-screen") ??
+        element.querySelector<HTMLElement>(".xterm-viewport") ??
+        element.querySelector<HTMLElement>(".xterm");
+      if (!surface) {
+        return false;
+      }
+      const rect = surface.getBoundingClientRect();
+      return (
+        rect.width > 0 &&
+        rect.height > 0 &&
+        element.dataset.termdResizeStabilizing !== "true" &&
+        element.dataset.termdSnapshotRedraw !== "true" &&
+        Number.parseInt(element.dataset.termdRows ?? "0", 10) > 0 &&
+        Number.parseInt(element.dataset.termdCols ?? "0", 10) > 0
+      );
+    }), { timeout: 8_000 })
+    .toBe(true);
 }
 
 async function focusTerminalKeyboardSink(page: Page): Promise<void> {

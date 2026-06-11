@@ -69,6 +69,23 @@ describe("xterm renderer adapter", () => {
     expect(renderer.terminal.getSelection()).toBe("");
   });
 
+  it("创建新 xterm 实例时会沿用传入的初始 rows/cols，而不是回退到默认 80x24", async () => {
+    vi.resetModules();
+    const { createXtermRenderer } = await import("../components/terminal/xterm-renderer");
+
+    const renderer = createXtermRenderer({
+      terminalOptions: { cols: 108, rows: 35, fontSize: 13 },
+      searchOptions: {},
+    });
+    const host = document.createElement("div");
+    renderer.terminal.open(host);
+
+    expect(renderer.terminal.cols).toBe(108);
+    expect(renderer.terminal.rows).toBe(35);
+    expect(host.dataset.termdCols).toBe("108");
+    expect(host.dataset.termdRows).toBe("35");
+  });
+
   it("scroll state 使用 xterm 的 top-based viewport 语义，并在 dispose 后停止 debug mirror", async () => {
     vi.resetModules();
     const { createXtermRenderer } = await import("../components/terminal/xterm-renderer");
