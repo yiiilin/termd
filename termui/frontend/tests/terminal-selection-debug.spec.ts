@@ -85,9 +85,17 @@ test("terminal lower-half drag selection returns the lower visible line", async 
     await expect.poll(async () => page.locator(".terminal-host").evaluate((host) => (host as HTMLElement).dataset.termdBuffer ?? "")).toContain("line-060");
     await page.locator(".terminal-pane").hover();
 
-    const metrics = await page.locator(".terminal-host canvas").evaluate((canvas) => {
-      const rect = (canvas as HTMLCanvasElement).getBoundingClientRect();
-      const host = canvas.parentElement as HTMLElement;
+    const metrics = await page.locator(".terminal-host").evaluate((host) => {
+      const typedHost = host as HTMLElement;
+      const surface =
+        typedHost.querySelector<HTMLElement>("canvas") ??
+        typedHost.querySelector<HTMLElement>(".xterm-screen") ??
+        typedHost.querySelector<HTMLElement>(".xterm-viewport") ??
+        typedHost.querySelector<HTMLElement>(".xterm");
+      if (!surface) {
+        throw new Error("terminal surface is missing");
+      }
+      const rect = surface.getBoundingClientRect();
       const bufferLineCount = (host.dataset.termdBuffer ?? "").split("\n").length;
       return {
         canvasLeft: rect.left,

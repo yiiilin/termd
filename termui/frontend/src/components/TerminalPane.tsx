@@ -40,6 +40,12 @@ const TERMINAL_SERVER_SCROLLBACK_RESYNC_USER_MIN_BYTES = 1024;
 const TERMINAL_SERVER_SCROLLBACK_RESYNC_COOLDOWN_MS = 5_000;
 const TERMINAL_SERVER_SCROLLBACK_RESYNC_IDLE_SETTLE_MS = 1_000;
 const TERMINAL_SELECTION_DRAG_THRESHOLD_PX = 4;
+const TERMINAL_SURFACE_SELECTOR_FALLBACKS = [
+  "canvas",
+  ".xterm-screen",
+  ".xterm-viewport",
+  ".xterm",
+] as const;
 const TERMINAL_SEARCH_OPTIONS: TerminalSearchOptions = {
   caseSensitive: false,
   decorations: {
@@ -66,6 +72,19 @@ interface DeferredTerminalFrameHandle {
   id: number;
   cancel: () => void;
   rescueHidden: (force?: boolean) => void;
+}
+
+function resolveTerminalSurfaceElement(host: HTMLElement | null | undefined): HTMLElement | undefined {
+  if (!host) {
+    return undefined;
+  }
+  for (const selector of TERMINAL_SURFACE_SELECTOR_FALLBACKS) {
+    const surface = host.querySelector<HTMLElement>(selector);
+    if (surface) {
+      return surface;
+    }
+  }
+  return undefined;
 }
 
 function isDocumentAnimationFrameUnsafe(): boolean {
@@ -799,11 +818,11 @@ export function TerminalPane(props: TerminalPaneProps) {
   };
   const terminalCellFromClientPoint = (clientX: number, clientY: number): { col: number; row: number } | undefined => {
     const terminal = terminalRef.current;
-    const canvas = hostRef.current?.querySelector<HTMLCanvasElement>("canvas");
-    if (!terminal || !canvas || terminal.cols <= 0 || terminal.rows <= 0) {
+    const surface = resolveTerminalSurfaceElement(hostRef.current);
+    if (!terminal || !surface || terminal.cols <= 0 || terminal.rows <= 0) {
       return undefined;
     }
-    const rect = canvas.getBoundingClientRect();
+    const rect = surface.getBoundingClientRect();
     if (rect.width <= 0 || rect.height <= 0) {
       return undefined;
     }
@@ -881,7 +900,7 @@ export function TerminalPane(props: TerminalPaneProps) {
     if (options.clipboardData) {
       noteTerminalSelectionCopy(selection);
       // 中文注释：浏览器菜单复制/快捷键 copy event 会提供 clipboardData；
-      // 直接写入这份 payload，能绕过 canvas 终端没有 DOM 文本选区的问题。
+      // 直接写入这份 payload，能绕过终端渲染层本身没有 DOM 文本选区的问题。
       options.clipboardData.setData("text/plain", selection);
       showCopyToast();
       return true;
@@ -1021,12 +1040,11 @@ export function TerminalPane(props: TerminalPaneProps) {
     }
     const terminal = terminalRef.current;
     const host = terminal?.element;
-    const canvas = host?.querySelector("canvas");
-    const canvasRect = canvas?.getBoundingClientRect();
+    const surfaceRect = resolveTerminalSurfaceElement(host)?.getBoundingClientRect();
     const snapshotBufferLineCount = (host?.dataset.termdBuffer ?? "").split("\n").length;
     updateTerminalSelectionDebug({
       selectionNativeMouseDownTerminal: terminal ? JSON.stringify({ cols: terminal.cols, rows: terminal.rows }) : undefined,
-      selectionNativeMouseDownRect: canvasRect ? JSON.stringify({ width: canvasRect.width, height: canvasRect.height }) : undefined,
+      selectionNativeMouseDownRect: surfaceRect ? JSON.stringify({ width: surfaceRect.width, height: surfaceRect.height }) : undefined,
       selectionNativeMouseDownSnapshotScrollback: String(Number.parseFloat(host?.dataset.termdScrollbackLength ?? "0") || 0),
       selectionNativeMouseDownSnapshotLineCount: String(snapshotBufferLineCount),
     });
@@ -1248,9 +1266,8 @@ export function TerminalPane(props: TerminalPaneProps) {
       return;
     }
     if (scrollState.baseY > 0) {
-      const canvas = hostRef.current?.querySelector<HTMLCanvasElement>("canvas");
-      const canvasHeight = canvas?.getBoundingClientRect().height ?? 0;
-      const cellHeight = canvasHeight > 0 && terminal.rows > 0 ? canvasHeight / terminal.rows : 16;
+      const surfaceHeight = resolveTerminalSurfaceElement(hostRef.current)?.getBoundingClientRect().height ?? 0;
+      const cellHeight = surfaceHeight > 0 && terminal.rows > 0 ? surfaceHeight / terminal.rows : 16;
       event.preventDefault();
       event.stopPropagation();
       let deltaLines = 0;
@@ -1346,7 +1363,7 @@ export function TerminalPane(props: TerminalPaneProps) {
     terminalResizeReportSizeRef.current = undefined;
     terminalResizeReportPassesRef.current = 0;
     resizeRef.current?.("session");
-  }, [props.sessionSize?.cols, props.sessionSize?.pixel_height, props.sessionSize?.pixel_width, props.sessionSize?.rows]);
+  }, [props.sessionSize?.cols, props.sessionSize?.rows]);
 
   useEffect(() => {
     // 中文注释：旧尺寸 snapshot 的历史修复需要同时满足两件事：
@@ -1515,7 +1532,7 @@ export function TerminalPane(props: TerminalPaneProps) {
       searchAddonRef.current?.clearDecorations();
       return;
     }
-    // daemon 搜索负责跨 snapshot 的结果数量和目标行；canvas 终端本身不暴露文本
+    // daemon 搜索负责跨 snapshot 的结果数量和目标行；终端渲染层本身不暴露文本
     // decoration API，因此可见反馈由 React 层的搜索结果浮层承担。renderer search hook
     // 只保留为可选扩展点，当前 renderer adapter 是 no-op。
     if (direction === "previous") {
@@ -1847,7 +1864,7 @@ export function TerminalPane(props: TerminalPaneProps) {
       window.clearTimeout(terminalResizeStabilizationTimerRef.current);
     }
     // 中文注释：本地 resize 的临时过渡期通常只有几帧；只要没有新的 resize 事件，
-    // 就把 canvas 露出来。若过程中又来了一次 focus/layout/mobile 变化，就继续延长遮罩。
+    // 就把终端可见表面重新露出来。若过程中又来了一次 focus/layout/mobile 变化，就继续延长遮罩。
     terminalResizeStabilizationTimerRef.current = window.setTimeout(() => {
       terminalResizeStabilizationTimerRef.current = undefined;
       const currentHost = hostRef.current;
@@ -1874,7 +1891,7 @@ export function TerminalPane(props: TerminalPaneProps) {
     }
     const generation = terminalSnapshotRedrawGenerationRef.current + 1;
     terminalSnapshotRedrawGenerationRef.current = generation;
-    // 中文注释：snapshot 刚写完时终端还会补一到两帧 repaint/fit；等稳定帧后再露出 canvas，
+    // 中文注释：snapshot 刚写完时终端还会补一到两帧 repaint/fit；等稳定帧后再露出可见表面，
     // 避免刷新时肉眼看到旧 80x24 画面闪一下。
     scheduleDeferredTerminalFrame(() => {
       scheduleDeferredTerminalFrame(() => {
@@ -1889,23 +1906,27 @@ export function TerminalPane(props: TerminalPaneProps) {
     const element = target instanceof Element ? target : null;
     return Boolean(element && rendererRef.current?.isActivationTarget(element));
   };
-  const hitTerminalCanvasAtPoint = (
+  const hitTerminalSurfaceAtPoint = (
     target: EventTarget | null,
     clientX: number,
     clientY: number,
   ) => {
     const element = target instanceof Element ? target : null;
-    if (element?.closest("canvas")) {
+    if (
+      element?.closest("canvas") ||
+      element?.closest(".xterm-screen") ||
+      element?.closest(".xterm-viewport")
+    ) {
       return true;
     }
     const host = hostRef.current;
-    const canvas = host?.querySelector("canvas");
-    if (!host || !canvas || !element || !host.contains(element)) {
+    const surface = resolveTerminalSurfaceElement(host);
+    if (!host || !surface || !element || !host.contains(element)) {
       return false;
     }
-    const rect = canvas.getBoundingClientRect();
+    const rect = surface.getBoundingClientRect();
     if (rect.width <= 0 || rect.height <= 0) {
-      // 中文注释：jsdom / 测试桩里 canvas 没有真实布局尺寸；此时只要事件目标还在
+      // 中文注释：jsdom / 测试桩里终端表面可能没有真实布局尺寸；此时只要事件目标还在
       // terminal host 内，就把它当成命中了终端文字层，保持与真实浏览器一致的聚焦语义。
       return true;
     }
@@ -1980,12 +2001,10 @@ export function TerminalPane(props: TerminalPaneProps) {
 
   const focusTerminalFromTerminalClick = (event: MouseEvent<HTMLDivElement>) => {
     const target = event.target instanceof Element ? event.target : null;
-    const hitCanvas = hitTerminalCanvasAtPoint(target, event.clientX, event.clientY);
-    const hitActivationTarget = hitCanvas || isTerminalActivationTarget(target);
+    const hitSurface = hitTerminalSurfaceAtPoint(target, event.clientX, event.clientY);
+    const hitActivationTarget = hitSurface || isTerminalActivationTarget(target);
     if (!hitActivationTarget) {
       return;
-    }
-    if (hitCanvas) {
     }
     if (terminalSelectionDragRef.current?.active || terminalSelectionFocusPendingRef.current) {
       return;
@@ -1996,7 +2015,7 @@ export function TerminalPane(props: TerminalPaneProps) {
     const clearedSelection = clearCurrentTerminalSelection();
     if (hasActiveTerminalFocus() || terminalDomHasActiveFocus()) {
       // 中文注释：终端已经有焦点时，普通 click 只需要清掉旧选区，不需要再补一轮 focus。
-      if (clearedSelection || hitCanvas) {
+      if (clearedSelection || hitSurface) {
         return;
       }
     }
@@ -2077,12 +2096,10 @@ export function TerminalPane(props: TerminalPaneProps) {
       cleanupTerminalSelectionNativeListeners = (() => {
         const handleMouseDown = (event: globalThis.MouseEvent) => {
           const target = event.target instanceof Element ? event.target : null;
-          const canvas = host?.querySelector("canvas");
-          const canvasRect = canvas?.getBoundingClientRect();
           updateTerminalSelectionDebug({
             selectionNativeMouseDownTarget: target?.tagName.toLowerCase() ?? undefined,
           });
-          if (!hitTerminalCanvasAtPoint(target, event.clientX, event.clientY)) {
+          if (!hitTerminalSurfaceAtPoint(target, event.clientX, event.clientY)) {
             terminalSelectionCopyGenerationRef.current += 1;
             clearTerminalSelectionDrag();
             updateTerminalSelectionDebug({
@@ -2112,7 +2129,7 @@ export function TerminalPane(props: TerminalPaneProps) {
         };
         const handleClick = (event: globalThis.MouseEvent) => {
           const target = event.target instanceof Element ? event.target : null;
-          if (!hitTerminalCanvasAtPoint(target, event.clientX, event.clientY)) {
+          if (!hitTerminalSurfaceAtPoint(target, event.clientX, event.clientY)) {
             return;
           }
           const drag = terminalSelectionDragRef.current;
@@ -2808,7 +2825,7 @@ export function TerminalPane(props: TerminalPaneProps) {
     // 初次 attach 只做本地 fit；用户聚焦该终端时才接管 shared PTY 的远端尺寸。
     stabilizeTerminal();
     if (terminalDomHasActiveFocus()) {
-      // 中文注释：reload 后用户或测试可能在 canvas mount 前已经把焦点放到 host；
+      // 中文注释：reload 后用户或测试可能在终端表面 mount 前已经把焦点放到 host；
       // renderer 就绪后必须补一次 focus resize，否则 daemon/supervisor 会继续停在旧 snapshot 尺寸。
       reportTerminalFocus(true);
       stabilizeTerminal("focus");

@@ -611,6 +611,43 @@ describe("TerminalPane terminal sequence rendering", () => {
     }
   });
 
+  it("没有 canvas 时点击 host 仍会命中 xterm 可见表面并聚焦隐藏 textarea", async () => {
+    const surfaceRect = {
+      x: 0,
+      y: 0,
+      left: 0,
+      top: 0,
+      right: 800,
+      bottom: 240,
+      width: 800,
+      height: 240,
+      toJSON() {
+        return this;
+      },
+    } as DOMRect;
+    renderTerminalPaneWithOutput([
+      { kind: "snapshot", bytes: new TextEncoder().encode("line-001\nline-002\nline-003\n"), baseSeq: 0, size: DEFAULT_TERMINAL_SIZE },
+    ]);
+
+    await waitFor(() => expect(terminalHost().dataset.buffer).toContain("line-003"));
+    const xtermScreen = screen.getByTestId("terminal-pane").querySelector<HTMLElement>(".xterm-screen");
+    const canvas = screen.getByTestId("terminal-pane").querySelector("canvas");
+    const terminalInput = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
+    expect(xtermScreen).not.toBeNull();
+    expect(canvas).not.toBeNull();
+    expect(terminalInput).not.toBeNull();
+    canvas?.remove();
+    const rectSpy = vi.spyOn(xtermScreen!, "getBoundingClientRect").mockReturnValue(surfaceRect);
+    try {
+      terminalInput!.blur();
+      fireEvent.mouseDown(terminalHost(), { clientX: 20, clientY: 20, button: 0 });
+      fireEvent.click(terminalHost(), { clientX: 20, clientY: 20, button: 0 });
+      await waitFor(() => expect(document.activeElement).toBe(terminalInput));
+    } finally {
+      rectSpy.mockRestore();
+    }
+  });
+
   it("拖拽选区结束后的 trailing click 不会把焦点抢回隐藏 textarea", async () => {
     const canvasRect = {
       x: 0,

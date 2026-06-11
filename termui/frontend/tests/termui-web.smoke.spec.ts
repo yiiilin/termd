@@ -126,7 +126,7 @@ test("pair、list、attach 的浏览器 smoke", async ({ page }, testInfo: TestI
     if (testInfo.project.name !== "mobile-chrome") {
       const terminalHost = terminalPane.locator(".terminal-host[role='textbox']");
       const terminalTextarea = terminalPane.locator('textarea[aria-label="Terminal input"]');
-      await terminalPane.locator(".terminal-host canvas").click({ position: { x: 20, y: 20 } });
+      await terminalPane.locator(".terminal-host .xterm-screen, .terminal-host canvas").first().click({ position: { x: 20, y: 20 } });
       await expect(terminalTextarea).toBeFocused();
       await expect(terminalHost).not.toBeFocused();
       const compositionBaseline = daemon.decryptedInputs.join("");
@@ -144,6 +144,8 @@ test("pair、list、attach 的浏览器 smoke", async ({ page }, testInfo: TestI
       });
       await expect.poll(() => daemon.decryptedInputs.join("")).toBe(compositionBaseline);
       await terminalTextarea.evaluate((element) => {
+        const input = element as HTMLTextAreaElement;
+        input.value = "，";
         element.dispatchEvent(
           new CompositionEvent("compositionend", {
             bubbles: true,
@@ -208,7 +210,7 @@ test("pair、list、attach 的浏览器 smoke", async ({ page }, testInfo: TestI
       await page.screenshot({ path: "test-results/mobile-termui-smoke.png", fullPage: true });
     }
 
-    await page.getByRole("textbox", { name: "Terminal input" }).focus();
+    await focusTerminalKeyboardSink(page);
     if (testInfo.project.name === "mobile-chrome") {
       // 缩放/viewer 模式已经移除；移动端只验证终端本体没有退回旧的缩放控件。
       await expect(page.getByRole("button", { name: /zoom/i })).toHaveCount(0);
@@ -239,7 +241,7 @@ test("pair、list、attach 的浏览器 smoke", async ({ page }, testInfo: TestI
 
     await page.reload();
     await expectTerminalLine(page, "termd-e2e-ready", 8_000);
-    await page.getByRole("textbox", { name: "Terminal input" }).focus();
+    await focusTerminalKeyboardSink(page);
     await page.keyboard.type("terminal-after-reload");
     await page.keyboard.press("Enter");
     await expect
@@ -299,7 +301,7 @@ test("direct Web 慢普通 RPC 超时后终端仍可输入", async ({ page }, te
     await expect(page.getByRole("alert", { name: "Connection error" })).toHaveCount(0);
 
     await terminalPane.click();
-    await page.getByRole("textbox", { name: "Terminal input" }).focus();
+    await focusTerminalKeyboardSink(page);
     await page.keyboard.type("direct-after-timeout");
     await page.keyboard.press("Enter");
     await expect.poll(() => daemon.decryptedInputs.join("")).toContain("direct-after-timeout");
@@ -378,7 +380,7 @@ test("direct Web 多个大输出 session 快速切换后仍贴底并能输入", 
     await expectTerminalScrollAtBottom(page);
 
     await terminalPane.click();
-    await page.getByRole("textbox", { name: "Terminal input" }).focus();
+    await focusTerminalKeyboardSink(page);
     await page.keyboard.type("direct-switch-input-ok");
     await page.keyboard.press("Enter");
     await expect.poll(() => daemon.decryptedInputs.join("")).toContain("direct-switch-input-ok");
@@ -465,22 +467,11 @@ test("terminal 上滚后 1..1000 历史顺序和下半区拖拽复制一致", as
     expect(viewportLines.length).toBeGreaterThan(10);
     for (let index = 1; index < viewportLines.length; index += 1) {
       // 中文注释：用户反馈 “从 1 打印到 1000 后，上滚看到的数字顺序乱掉”；
-      // 当前 viewport 必须仍是逐行递增的历史内容，不能出现 canvas 旧行残留。
+      // 当前 viewport 必须仍是逐行递增的历史内容，不能出现旧表面残留。
       expect(viewportLines[index]).toBe(viewportLines[index - 1] + 1);
     }
 
-    const metrics = await page.locator(".terminal-host canvas").evaluate((canvas) => {
-      const rect = (canvas as HTMLCanvasElement).getBoundingClientRect();
-      const host = canvas.parentElement as HTMLElement;
-      return {
-        left: rect.left,
-        top: rect.top,
-        width: rect.width,
-        height: rect.height,
-        rows: Number.parseInt(host.dataset.termdRows ?? "0", 10),
-        cols: Number.parseInt(host.dataset.termdCols ?? "0", 10),
-      };
-    });
+    const metrics = await terminalSurfaceMetrics(page);
     expect(metrics.rows).toBeGreaterThan(10);
     expect(metrics.cols).toBeGreaterThan(20);
 
@@ -534,18 +525,7 @@ test("terminal 选区存在时 Ctrl+C 会复制选区而不是向 PTY 发送中�
     await expectTerminalLine(page, "copy-120", 8_000);
     await page.getByTestId("terminal-pane").hover();
 
-    const metrics = await page.locator(".terminal-host canvas").evaluate((canvas) => {
-      const rect = (canvas as HTMLCanvasElement).getBoundingClientRect();
-      const host = canvas.parentElement as HTMLElement;
-      return {
-        left: rect.left,
-        top: rect.top,
-        width: rect.width,
-        height: rect.height,
-        rows: Number.parseInt(host.dataset.termdRows ?? "0", 10),
-        cols: Number.parseInt(host.dataset.termdCols ?? "0", 10),
-      };
-    });
+    const metrics = await terminalSurfaceMetrics(page);
     expect(metrics.rows).toBeGreaterThan(5);
     expect(metrics.cols).toBeGreaterThan(10);
 
@@ -590,7 +570,6 @@ test("terminal 选区存在时 Ctrl+C 会复制选区而不是向 PTY 发送中�
 
     await page.evaluate(() => navigator.clipboard.writeText("clipboard-reset"));
     const sessionDataCountBeforeCopy = daemon.sessionDataMessages.length;
-    await page.getByRole("textbox", { name: "Terminal input" }).focus();
     await page.keyboard.press("Control+C");
 
     await expect
@@ -624,7 +603,7 @@ test("terminal reload 后只向 daemon 上报最终稳定尺寸", async ({ page 
     await page.getByLabel("Pairing token").fill(pairingInviteCode(daemon));
     await activateButton(page, "Pair");
     await expectTerminalLine(page, "reload-resize-ready", 8_000);
-    await page.getByRole("textbox", { name: "Terminal input" }).focus();
+    await focusTerminalKeyboardSink(page);
 
     await expect
       .poll(() => daemon.sessionResizes.length, { timeout: 8_000 })
@@ -671,7 +650,7 @@ test("terminal reload 后只向 daemon 上报最终稳定尺寸", async ({ page 
     });
     await page.reload();
     await expectTerminalLine(page, "reload-resize-ready", 8_000);
-    await page.getByRole("textbox", { name: "Terminal input" }).focus();
+    await focusTerminalKeyboardSink(page);
     await page.waitForTimeout(500);
 
     const reloadResizes = daemon.sessionResizes.slice(initialResizeCount);
@@ -1113,7 +1092,7 @@ test("terminal 从后台标签页回到前台并重新聚焦时 rows/cols 保持
     await page.getByLabel("Pairing token").fill(pairingInviteCode(daemon));
     await activateButton(page, "Pair");
     await expectTerminalLine(page, "focus-return-ready", 8_000);
-    await page.getByRole("textbox", { name: "Terminal input" }).focus();
+    await focusTerminalKeyboardSink(page);
 
     await expect
       .poll(async () => terminalHostSize(page), { timeout: 8_000 })
@@ -1153,7 +1132,7 @@ test("terminal 从后台标签页回到前台并重新聚焦时 rows/cols 保持
 
     await page.bringToFront();
     await page.locator(".terminal-frame").click();
-    await page.getByRole("textbox", { name: "Terminal input" }).focus();
+    await focusTerminalKeyboardSink(page);
     await page.waitForTimeout(600);
 
     const sizeSequence = await page.evaluate(() => {
@@ -1191,7 +1170,7 @@ async function openSession(page: Page, name: string): Promise<void> {
 }
 
 async function expectTerminalLine(page: Page, text: string, timeout: number): Promise<void> {
-  // 中文注释：xterm 只把终端文本画进 canvas；E2E build 显式开启安全的
+  // 中文注释：xterm 的真实绘制层不适合作为稳定断言面；E2E build 显式开启安全的
   // data-termd-buffer 镜像，供浏览器测试验证终端内容。
   await expect
     .poll(async () => terminalDebugBufferText(page), { timeout })
@@ -1231,6 +1210,43 @@ async function terminalHostSize(page: Page): Promise<{ cols: number; rows: numbe
     return {
       cols: Number.parseInt(element.dataset.termdCols ?? "0", 10),
       rows: Number.parseInt(element.dataset.termdRows ?? "0", 10),
+    };
+  });
+}
+
+async function focusTerminalKeyboardSink(page: Page): Promise<void> {
+  const terminalSurface = page.locator(".terminal-host .xterm-screen, .terminal-host canvas").first();
+  const terminalInput = page.locator('.terminal-host textarea[aria-label="Terminal input"]').first();
+  await terminalSurface.click({ position: { x: 20, y: 20 } });
+  await expect(terminalInput).toBeFocused();
+}
+
+async function terminalSurfaceMetrics(page: Page): Promise<{
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+  rows: number;
+  cols: number;
+}> {
+  return page.locator(".terminal-host").evaluate((host) => {
+    const element = host as HTMLElement;
+    const surface =
+      element.querySelector<HTMLElement>("canvas") ??
+      element.querySelector<HTMLElement>(".xterm-screen") ??
+      element.querySelector<HTMLElement>(".xterm-viewport") ??
+      element.querySelector<HTMLElement>(".xterm");
+    if (!surface) {
+      throw new Error("terminal surface is missing");
+    }
+    const rect = surface.getBoundingClientRect();
+    return {
+      left: rect.left,
+      top: rect.top,
+      width: rect.width,
+      height: rect.height,
+      rows: Number.parseInt(element.dataset.termdRows ?? "0", 10),
+      cols: Number.parseInt(element.dataset.termdCols ?? "0", 10),
     };
   });
 }

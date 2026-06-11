@@ -243,10 +243,18 @@ function installDebugBufferMirror(
       return;
     }
     const activeBuffer = terminal.buffer.active;
+    const preserveStableGrid =
+      (host.dataset.termdSnapshotRedraw === "true" || host.dataset.termdResizeStabilizing === "true") &&
+      Boolean(host.dataset.termdCols) &&
+      Boolean(host.dataset.termdRows);
     host.dataset.termdBuffer = terminalDebugText(terminal);
-    host.dataset.termdCols = String(terminal.cols);
-    host.dataset.termdRows = String(terminal.rows);
-    host.dataset.termdViewportYRaw = String(activeBuffer.viewportY);
+    if (!preserveStableGrid) {
+      host.dataset.termdCols = String(terminal.cols);
+      host.dataset.termdRows = String(terminal.rows);
+    }
+    // 中文注释：E2E/调试视角沿用“距底部还差多少行”的口径，
+    // 这样浏览器测试可以直接用 0 表示“已经贴底”。
+    host.dataset.termdViewportYRaw = String(Math.max(0, activeBuffer.baseY - activeBuffer.viewportY));
     host.dataset.termdScrollbackLength = String(activeBuffer.baseY);
     if (viewportEnabled) {
       host.dataset.termdViewportText = terminalDebugViewportText(terminal);

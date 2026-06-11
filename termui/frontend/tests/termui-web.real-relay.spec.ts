@@ -605,7 +605,7 @@ test("relay Web 在 daemon relay 短暂冻结恢复后仍能输入", async ({ pa
   }
 });
 
-test("relay Web 放大终端后 xterm canvas 和输入仍可用", async ({ page }, testInfo) => {
+test("relay Web 放大终端后 xterm 终端表面和输入仍可用", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name === "mobile-chrome", "桌面回归即可覆盖 xterm resize 后的输入路径");
   test.setTimeout(90_000);
   const fixture = await startRealRelayFixture();
@@ -725,7 +725,7 @@ test("relay Web 满屏新会话连续回车后 xterm 仍保持可输入", async 
     await expectTerminalLine(page, `${marker(name)}-enter-post-input-ok`, 20_000);
     const metrics = await terminalCanvasMetrics(page);
     // 中文注释：这是用户手工复现路径：新会话在满屏高度下连续回车后，
-    // 不做任何额外重连，直接验证 xterm canvas 仍在渲染且隐藏输入框仍可接收输入。
+    // 不做任何额外重连，直接验证 xterm 终端表面仍在渲染且隐藏输入框仍可接收输入。
     expect(metrics.canvasCssHeight).toBeGreaterThan(500);
     expect(metrics.inputAttached).toBe(true);
     await expectTerminalCanvasPainted(page);
@@ -1406,14 +1406,23 @@ async function terminalDebugBufferText(page: Page): Promise<string> {
 async function expectTerminalCanvasPainted(page: Page): Promise<void> {
   await expect
     .poll(async () => {
-      return page.locator(".terminal-host canvas").evaluate((canvas) => {
-        const typedCanvas = canvas as HTMLCanvasElement;
-        const context = typedCanvas.getContext("2d");
-        if (!context || typedCanvas.width <= 0 || typedCanvas.height <= 0) {
+      return page.locator(".terminal-host").evaluate((host) => {
+        const typedHost = host as HTMLElement;
+        const canvas = typedHost.querySelector<HTMLCanvasElement>("canvas");
+        if (!canvas) {
+          const surface =
+            typedHost.querySelector<HTMLElement>(".xterm-screen") ??
+            typedHost.querySelector<HTMLElement>(".xterm-viewport") ??
+            typedHost.querySelector<HTMLElement>(".xterm");
+          const buffer = typedHost.dataset.termdBuffer ?? "";
+          return surface?.getBoundingClientRect().height && buffer.length > 0 ? 1 : 0;
+        }
+        const context = canvas.getContext("2d");
+        if (!context || canvas.width <= 0 || canvas.height <= 0) {
           return 0;
         }
-        const sampleWidth = Math.min(typedCanvas.width, 240);
-        const sampleHeight = Math.min(typedCanvas.height, 160);
+        const sampleWidth = Math.min(canvas.width, 240);
+        const sampleHeight = Math.min(canvas.height, 160);
         const pixels = context.getImageData(0, 0, sampleWidth, sampleHeight).data;
         let painted = 0;
         for (let index = 3; index < pixels.length; index += 4) {
@@ -1433,15 +1442,21 @@ async function terminalCanvasMetrics(page: Page): Promise<{
   inputAttached: boolean;
 }> {
   return page.locator(".terminal-host").evaluate((host) => {
-    const canvas = host.querySelector<HTMLCanvasElement>("canvas");
-    const input = host.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
-    if (!canvas) {
-      throw new Error("xterm canvas is missing");
+    const typedHost = host as HTMLElement;
+    const surface =
+      typedHost.querySelector<HTMLElement>("canvas") ??
+      typedHost.querySelector<HTMLElement>(".xterm-screen") ??
+      typedHost.querySelector<HTMLElement>(".xterm-viewport") ??
+      typedHost.querySelector<HTMLElement>(".xterm");
+    const canvas = typedHost.querySelector<HTMLCanvasElement>("canvas");
+    const input = typedHost.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
+    if (!surface) {
+      throw new Error("terminal surface is missing");
     }
-    const canvasRect = canvas.getBoundingClientRect();
+    const canvasRect = surface.getBoundingClientRect();
     return {
       canvasCssHeight: canvasRect.height,
-      canvasPixelHeight: canvas.height,
+      canvasPixelHeight: canvas?.height ?? Math.round(canvasRect.height * Math.max(1, window.devicePixelRatio || 1)),
       inputAttached: Boolean(input),
     };
   });
@@ -1464,7 +1479,7 @@ async function waitForTerminalCanvasStable(page: Page): Promise<void> {
     }
     await page.waitForTimeout(100);
   }
-  throw new Error("terminal canvas did not settle after viewport resize");
+  throw new Error("terminal surface did not settle after viewport resize");
 }
 
 async function createShellSession(page: Page, existingNames: string[]): Promise<string> {
@@ -1519,7 +1534,7 @@ async function openSession(page: Page, name: string): Promise<void> {
 
 async function runTerminalCommand(page: Page, command: string): Promise<void> {
   await focusTerminalForKeyboard(page);
-  // 中文注释：xterm canvas 终端依赖真实 keydown/input 路径；insertText 只改活动
+  // 中文注释：xterm 终端依赖真实 keydown/input 路径；insertText 只改活动
   // contenteditable/textarea，聚焦到 renderer host 时不会稳定进入 PTY。
   await page.keyboard.type(command, { delay: 1 });
   await page.keyboard.press("Enter");

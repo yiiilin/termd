@@ -17,7 +17,7 @@ describe("xterm renderer adapter", () => {
 
     expect(host.getAttribute("role")).toBe("textbox");
     expect(host.querySelector(".xterm")).not.toBeNull();
-    expect(host.querySelector("canvas")).not.toBeNull();
+    expect(host.querySelector(".xterm-screen")).not.toBeNull();
     expect(host.querySelector('textarea[aria-label="Terminal input"]')).toBe(renderer.terminal.textarea);
 
     let writeParsedCount = 0;
@@ -87,7 +87,7 @@ describe("xterm renderer adapter", () => {
 
     renderer.terminal.scrollToLine(0);
     expect(renderer.scrollState()?.viewportY).toBe(0);
-    expect(host.dataset.termdViewportYRaw).toBe("0");
+    expect(host.dataset.termdViewportYRaw).toBe(String(bottomState?.baseY ?? 0));
 
     renderer.terminal.dispose();
     host.dataset.termdBuffer = "after-dispose";
