@@ -108,7 +108,7 @@ test("terminal lower-half drag selection returns the lower visible line", async 
     const expectedToken = `line-${String(expectedAbsoluteLine).padStart(3, "0")}`;
     const rowHeight = metrics.canvasHeight / visibleRows;
     const cellWidth = metrics.canvasWidth / Math.max(1, metrics.cols || 80);
-    // 中文注释：目标 token 从第 0 列开始；如果从画布中间拖拽，真实 Ghostty 会选中
+    // 中文注释：目标 token 从第 0 列开始；如果从画布中间拖拽，真实 xterm 会选中
     // 该行右侧空白并返回空字符串。这里仍在下半区测试，但横向命中实际文本列。
     const startX = metrics.canvasLeft + cellWidth * 0.2;
     const endX = metrics.canvasLeft + cellWidth * 8.2;
@@ -171,8 +171,8 @@ test("terminal lower-half drag selection returns the lower visible line", async 
       };
     });
     // 中文注释：expected 必须来自拖拽前肉眼可见的目标行，不能从 selectionPosition
-    // 反推；否则 Ghostty 选错行时测试会跟着错误坐标移动。
-    // 中文注释：Ghostty 内部 DOM 可能把命中点落在 canvas 本身，也可能落在覆盖其上的包装层。
+    // 反推；否则 xterm 选错行时测试会跟着错误坐标移动。
+    // 中文注释：xterm 内部 DOM 可能把命中点落在 canvas 本身，也可能落在覆盖其上的包装层。
     // 这里不把内部 tag 当成协议，只验证最终选中的文本确实来自目标可见行。
     expect(hitTargets.start).not.toBeNull();
     expect(hitTargets.end).not.toBeNull();

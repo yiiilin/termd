@@ -190,7 +190,7 @@ export function useTerminalReceiveLoop(
       if (!isCurrentLoop()) {
         // 中文注释：disconnect/reconnect 会先推进 generation，再关闭旧 transport。
         // 如果旧 loop 此时正在处理一个大 attach_sync/output batch，中途必须立刻停下，
-        // 不能再把旧字节排进下一代 Ghostty 队列。
+        // 不能再把旧字节排进下一代 xterm 队列。
         throw STALE_RECEIVE_LOOP_ABORT;
       }
     };
@@ -317,7 +317,7 @@ export function useTerminalReceiveLoop(
               };
               // 中文注释：带 `last_terminal_seq` 的 attach_sync 可能只表示“在现有本地屏幕上续传 tail”，
               // 此时 retained_output 会被刻意置空。不能再把它当成一次空 snapshot reset，
-              // 否则重连或复用同一 session 会直接把现有 Ghostty 画面清掉。
+              // 否则重连或复用同一 session 会直接把现有 xterm 画面清掉。
               if (snapshotToken !== undefined || frame.snapshot.retained_output_bytes.byteLength > 0) {
                 enqueueSnapshotFrame({
                   bytes: frame.snapshot.retained_output_bytes,
@@ -812,7 +812,7 @@ export function useTerminalReconnectScheduler(
             pendingTerminalAttachAbortControllerRef.current = undefined;
           }
           // 中文注释：重连拿到 attach ack 后先发布当前 session。
-          // reset 期间用户可能已经能在新 Ghostty 里输入；输入不能等 snapshot 开始消费后才生效。
+          // reset 期间用户可能已经能在新 xterm 里输入；输入不能等 snapshot 开始消费后才生效。
           // 中文注释：reconnect 成功后也要立刻晋升为当前 terminal 主连接，并废弃
           // 所有 metadata sidecar / pending metadata connect，避免迟到 promise 回写。
           options.claimAttachClient(attachedClient);
@@ -838,7 +838,7 @@ export function useTerminalReconnectScheduler(
           options.setStatus("attached");
           if (lastTerminalSeq === undefined) {
             // 普通重连会重放完整 snapshot，必须等 TerminalPane 清屏确认后再启动输出消费；
-            // 否则旧 Ghostty 的异步回调可能把 snapshot 写进旧实例。
+            // 否则旧 xterm 的异步回调可能把 snapshot 写进旧实例。
             const resetVersion = options.clearTerminalOutput();
             recordTermdDiagnostic("reconnect_wait_reset_before_snapshot", {
               reconnectKey,

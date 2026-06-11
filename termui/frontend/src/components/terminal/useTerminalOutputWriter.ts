@@ -8,7 +8,7 @@ import type { TerminalRendererTerminal } from "./renderer";
 // 会让前端主动清屏重连，表现成“下行停住，刷新后又恢复”。这里保留内存保护，
 // 但把阈值放到浏览器可以继续分片追赶的量级。
 const PENDING_WRITE_HIGH_WATER_BYTES = 64 * 1024 * 1024;
-// 单次 Ghostty write 过大时会占用浏览器主线程，连控制 WebSocket 和 relay 页面心跳都会被拖慢。
+// 单次 xterm write 过大时会占用浏览器主线程，连控制 WebSocket 和 relay 页面心跳都会被拖慢。
 // 64KB 仍是批量写入，不会退回逐字/逐行渲染，同时给输入和切 session 留出帧间隙。
 const MAX_WRITE_BYTES = 64 * 1024;
 
@@ -82,7 +82,7 @@ function highWaterBacklogBytes(items: TerminalOutputItem[]): number {
   for (const item of items) {
     const bytes = terminalOutputItemBytes(item);
     if (bytes > PENDING_WRITE_HIGH_WATER_BYTES && oversizedFrameAllowance > 0) {
-      // 单个权威 snapshot/output 会被下游按 64KiB 分片写入 Ghostty；
+      // 单个权威 snapshot/output 会被下游按 64KiB 分片写入 xterm；
       // high-water 只处理累计 backlog，不能因为这个单帧本身反复触发 full resync。
       oversizedFrameAllowance -= 1;
       continue;
@@ -140,7 +140,7 @@ export function useTerminalOutputWriter(
   }, []);
 
   const invalidateWriterForFullResync = useCallback(() => {
-    // 中文注释：Ghostty write 无法取消；推进 generation 后，旧 callback 即使稍后触发
+    // 中文注释：xterm write 无法取消；推进 generation 后，旧 callback 即使稍后触发
     // 也不能再确认 terminal_seq。App 会用完整 snapshot 重建画面，而不是从旧 seq 续传。
     clearPendingWriteQueue();
     activeWriteRef.current = undefined;
@@ -236,7 +236,7 @@ export function useTerminalOutputWriter(
         // 中文注释：write drain 如果先按前台路径挂进 rAF，随后标签页立刻 hidden，
         // 或者窗口先 blur、hidden 稍后才到，这个 callback 也可能被浏览器暂停。
         // 这里把 pending write 改挂到 timer，
-        // 让 Ghostty 继续消费 backlog，不依赖前台动画帧。
+        // 让 xterm 继续消费 backlog，不依赖前台动画帧。
         if (writeFrameTestHook) {
           writeFrameTestHook.cancel(frame);
         } else {
@@ -488,7 +488,7 @@ export function useTerminalOutputWriter(
         needsPostWriteScrollBottomRef.current = false;
       }
       // 首屏/清屏后的首个 write，以及 resize/exit 这类零字节 mutation，都需要
-      // 一次轻量 refresh。否则某些 Ghostty 渲染时序会等到下一次输入/resize 才 repaint 尾包。
+      // 一次轻量 refresh。否则某些 xterm 渲染时序会等到下一次输入/resize 才 repaint 尾包。
       if (outputQueueIdle) {
         const idleRefreshEpoch = idleRefreshEpochRef.current;
         const bottomScrollGeneration = shouldScrollBottomAfterMutation
@@ -511,10 +511,10 @@ export function useTerminalOutputWriter(
             }
           }
           options.terminal.refresh(0, Math.max(0, options.terminal.rows - 1));
-          // 中文注释：真实 Ghostty 的 scrollback/baseY 可能到 write callback 后下一帧才稳定；
+          // 中文注释：真实 xterm 的 scrollback/baseY 可能到 write callback 后下一帧才稳定；
           // 这里强制刷新滚动条状态，避免大量输出后侧边滚动条仍停留在“不可用”。
           options.scheduleTerminalScrollPosition({ immediate: true });
-          // 切换 session 后浏览器布局和 Ghostty renderer 可能比 write callback 再晚一帧可绘制。
+          // 切换 session 后浏览器布局和 xterm renderer 可能比 write callback 再晚一帧可绘制。
           // 队列已经 idle 时补第二帧刷新，不会放大持续输出路径的绘制压力。
           idleRefreshFollowupFrameRef.current = options.requestTrackedFrame(() => {
             idleRefreshFollowupFrameRef.current = undefined;
@@ -555,8 +555,8 @@ export function useTerminalOutputWriter(
       const output = takePendingWrite();
       if (!output || output.bytes.byteLength === 0) {
         if (needsPostWriteRefreshRef.current || needsPostWriteScrollBottomRef.current) {
-          // 中文注释：resize/exit 这类零字节 terminal frame 不会触发 Ghostty write callback。
-          // 但 resize 已经改变了 Ghostty buffer/viewport，仍必须执行 terminal mutation 完成后的刷新和贴底收尾。
+          // 中文注释：resize/exit 这类零字节 terminal frame 不会触发 xterm write callback。
+          // 但 resize 已经改变了 xterm buffer/viewport，仍必须执行 terminal mutation 完成后的刷新和贴底收尾。
           afterTerminalMutation();
         }
         if (activeWriteRef.current || pendingWriteItemsRef.current.length > 0) {

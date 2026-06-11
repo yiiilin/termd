@@ -130,19 +130,19 @@ test("真实 relay 下 clear 之后上滚不会再看到 pre-clear 历史", asyn
     expect(scrolledViewport).not.toContain("pre-clear-001");
     expect(scrolledViewport).not.toContain("pre-clear-080");
     // 中文注释：这里验证的是“clear 之后只看到 post-clear 历史”，不是强绑某一种
-    // scrollback 恢复实现。Ghostty 本地 scrollback 已足够时，用户向上滚可能不需要
+    // scrollback 恢复实现。xterm 本地 scrollback 已足够时，用户向上滚可能不需要
     // 再触发一次 reveal-history full snapshot。
     await expect(page.getByRole("alert", { name: "Connection error" })).toHaveCount(0);
     const selectedViewportText = await page.evaluate(() => {
       const bridge = (window as typeof window & {
-        __TERMD_DEBUG_GHOSTTY__?: {
+        __TERMD_DEBUG_TERMINAL__?: {
           selectViewportRange: (
             start: { col: number; row: number },
             end: { col: number; row: number },
           ) => string | undefined;
           getSelection: () => string;
         };
-      }).__TERMD_DEBUG_GHOSTTY__;
+      }).__TERMD_DEBUG_TERMINAL__;
       if (!bridge) {
         return "";
       }
@@ -605,8 +605,8 @@ test("relay Web 在 daemon relay 短暂冻结恢复后仍能输入", async ({ pa
   }
 });
 
-test("relay Web 放大终端后 Ghostty canvas 和输入仍可用", async ({ page }, testInfo) => {
-  test.skip(testInfo.project.name === "mobile-chrome", "桌面回归即可覆盖 Ghostty resize 后的输入路径");
+test("relay Web 放大终端后 xterm canvas 和输入仍可用", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name === "mobile-chrome", "桌面回归即可覆盖 xterm resize 后的输入路径");
   test.setTimeout(90_000);
   const fixture = await startRealRelayFixture();
   const createdNames: string[] = [];
@@ -651,8 +651,8 @@ test("relay Web 放大终端后 Ghostty canvas 和输入仍可用", async ({ pag
   }
 });
 
-test("relay Web 短输出放大后 Ghostty 输入仍落入当前 session", async ({ page }, testInfo) => {
-  test.skip(testInfo.project.name === "mobile-chrome", "桌面回归即可覆盖 Ghostty resize 边界");
+test("relay Web 短输出放大后 xterm 输入仍落入当前 session", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name === "mobile-chrome", "桌面回归即可覆盖 xterm resize 边界");
   test.setTimeout(90_000);
   const fixture = await startRealRelayFixture();
   const createdNames: string[] = [];
@@ -699,8 +699,8 @@ test("relay Web 短输出放大后 Ghostty 输入仍落入当前 session", async
   }
 });
 
-test("relay Web 满屏新会话连续回车后 Ghostty 仍保持可输入", async ({ page }, testInfo) => {
-  test.skip(testInfo.project.name === "mobile-chrome", "桌面回归即可覆盖满屏 Ghostty 输入场景");
+test("relay Web 满屏新会话连续回车后 xterm 仍保持可输入", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name === "mobile-chrome", "桌面回归即可覆盖满屏 xterm 输入场景");
   test.setTimeout(90_000);
   const fixture = await startRealRelayFixture();
   const createdNames: string[] = [];
@@ -725,7 +725,7 @@ test("relay Web 满屏新会话连续回车后 Ghostty 仍保持可输入", asyn
     await expectTerminalLine(page, `${marker(name)}-enter-post-input-ok`, 20_000);
     const metrics = await terminalCanvasMetrics(page);
     // 中文注释：这是用户手工复现路径：新会话在满屏高度下连续回车后，
-    // 不做任何额外重连，直接验证 Ghostty canvas 仍在渲染且隐藏输入框仍可接收输入。
+    // 不做任何额外重连，直接验证 xterm canvas 仍在渲染且隐藏输入框仍可接收输入。
     expect(metrics.canvasCssHeight).toBeGreaterThan(500);
     expect(metrics.inputAttached).toBe(true);
     await expectTerminalCanvasPainted(page);
@@ -1355,7 +1355,7 @@ async function expectReadUtf8At(handle: FileHandle, offset: number, expected: st
 
 async function expectTerminalLine(page: Page, text: string, timeout: number): Promise<void> {
   await page.bringToFront();
-  // 中文注释：Ghostty 使用 canvas 渲染终端文本，Playwright 不能直接用 DOM
+  // 中文注释：xterm 使用 canvas 渲染终端文本，Playwright 不能直接用 DOM
   // 文本定位。只有显式 E2E build 会把当前 buffer 镜像到 data-termd-buffer；
   // 普通 production build 不暴露这个明文快照。
   await expect
@@ -1373,7 +1373,7 @@ async function expectTerminalLineMatching(page: Page, pattern: RegExp, timeout: 
 
 async function expectTerminalScrollAtBottom(page: Page): Promise<void> {
   await page.bringToFront();
-  // 中文注释：terminal-scrollport 只是外层容器，真正决定“是否在底部”的是 Ghostty
+  // 中文注释：terminal-scrollport 只是外层容器，真正决定“是否在底部”的是 xterm
   // 视口本身。这里必须同时等外层容器和 renderer 视口都贴底，避免只看 DOM 容器
   // 就误判“已经到底”。
   await expect
@@ -1436,7 +1436,7 @@ async function terminalCanvasMetrics(page: Page): Promise<{
     const canvas = host.querySelector<HTMLCanvasElement>("canvas");
     const input = host.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
     if (!canvas) {
-      throw new Error("Ghostty canvas is missing");
+      throw new Error("xterm canvas is missing");
     }
     const canvasRect = canvas.getBoundingClientRect();
     return {
@@ -1519,7 +1519,7 @@ async function openSession(page: Page, name: string): Promise<void> {
 
 async function runTerminalCommand(page: Page, command: string): Promise<void> {
   await focusTerminalForKeyboard(page);
-  // 中文注释：Ghostty canvas 终端依赖真实 keydown/input 路径；insertText 只改活动
+  // 中文注释：xterm canvas 终端依赖真实 keydown/input 路径；insertText 只改活动
   // contenteditable/textarea，聚焦到 renderer host 时不会稳定进入 PTY。
   await page.keyboard.type(command, { delay: 1 });
   await page.keyboard.press("Enter");
@@ -1531,7 +1531,7 @@ async function focusTerminalForKeyboard(page: Page): Promise<void> {
   await expect(page.getByRole("textbox", { name: "Terminal input" })).toBeAttached({ timeout: 8_000 });
   await page.locator(".terminal-host").evaluate((host) => {
     const input = host.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
-    // 中文注释：aria-hidden 只避免重复暴露给辅助技术；Ghostty 的真实键盘输入仍锚定在这个 textarea。
+    // 中文注释：aria-hidden 只避免重复暴露给辅助技术；xterm 的真实键盘输入仍锚定在这个 textarea。
     input?.focus();
   });
 }

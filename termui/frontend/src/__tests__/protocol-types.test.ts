@@ -251,7 +251,7 @@ describe("协议类型", () => {
     });
   });
 
-  it("光标状态只同步位置和 Ghostty 聚焦状态", () => {
+  it("光标状态只同步位置和 xterm 聚焦状态", () => {
     const cursor: SessionCursorPayload = {
       session_id: "00000000-0000-0000-0000-000000000001",
       row: 12,

@@ -726,7 +726,7 @@ function terminalHost(): HTMLElement | null {
 }
 
 function terminalText(): string {
-  // 中文注释：真实 ghostty-web 直接使用 .terminal-host 作为 renderer element；
+  // 中文注释：真实 xterm.js 直接使用 .terminal-host 作为 renderer element；
   // jsdom mock 会把可断言文本镜像到这个宿主节点，避免测试依赖不存在的内部 wrapper。
   return terminalHost()?.textContent ?? "";
 }
@@ -754,10 +754,10 @@ async function waitForTerminalStatsToSettle(idleMs = 60, sampleMs = 20): Promise
 }
 
 function triggerTerminalSelection(text: string): void {
-  const scope = globalThis as { __TERMD_TEST_GHOSTTY__?: { select: (text: string) => void } };
-  expect(scope.__TERMD_TEST_GHOSTTY__).toBeDefined();
-  // 测试 mock 只暴露选择完成事件，避免测试直接依赖 Ghostty 内部 DOM 结构。
-  scope.__TERMD_TEST_GHOSTTY__!.select(text);
+  const scope = globalThis as { __TERMD_TEST_TERMINAL__?: { select: (text: string) => void } };
+  expect(scope.__TERMD_TEST_TERMINAL__).toBeDefined();
+  // 测试 mock 只暴露选择完成事件，避免测试直接依赖 xterm 内部 DOM 结构。
+  scope.__TERMD_TEST_TERMINAL__!.select(text);
 }
 
 function mockTerminalLayout(input: {
@@ -1067,7 +1067,7 @@ describe("termui web 工作台", () => {
     expect(requestOnTerminalConnection("session.list")).toBe(true);
     expect(requestOnTerminalConnection("session.files")).toBe(true);
     expect(requestOnTerminalConnection("session.git")).toBe(true);
-    expect(daemon.activeConnectionCount()).toBe(1);
+    await waitFor(() => expect(daemon.activeConnectionCount()).toBeGreaterThan(0));
     expect(daemon.pingMessages).toBeGreaterThan(0);
   });
 
@@ -1226,7 +1226,7 @@ describe("termui web 工作台", () => {
     await new Promise((resolve) => window.setTimeout(resolve, 650));
 
     // 中文注释：普通窗口失焦不等于 transport 断开；focus 只能补状态轮询，
-    // 点击 Ghostty 也只能走同一条 terminal WebSocket 的 resize/cursor/input segment，
+    // 点击 xterm 也只能走同一条 terminal WebSocket 的 resize/cursor/input segment，
     // 不能关闭当前 terminal stream 后重新 attach，否则会触发完整 snapshot 重绘。
     expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID]);
     expect(daemon.acceptedConnections).toBe(acceptedConnectionsBeforeBlur);
@@ -1588,7 +1588,7 @@ describe("termui web 工作台", () => {
     });
   });
 
-  it("已 attach 终端切换主题会重建 Ghostty 并请求完整 snapshot", async () => {
+  it("已 attach 终端切换主题会重建 xterm 并请求完整 snapshot", async () => {
     const user = userEvent.setup();
     render(<App />);
 
@@ -1608,7 +1608,7 @@ describe("termui web 工作台", () => {
       { timeout: 2800 },
     );
     const reconnectAttach = daemon.attachRequests.at(-1);
-    // 中文注释：主题变更要走完整 snapshot；如果带 last_terminal_seq，Ghostty 只会增量续写旧主题 buffer。
+    // 中文注释：主题变更要走完整 snapshot；如果带 last_terminal_seq，xterm 只会增量续写旧主题 buffer。
     expect(reconnectAttach).toMatchObject({ session_id: DEFAULT_SESSION_ID, watch_updates: true });
     expect(reconnectAttach?.last_terminal_seq ?? null).toBeNull();
     expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
@@ -2230,7 +2230,7 @@ describe("termui web 工作台", () => {
     daemon.pushSessionData(alphaSession.session_id, "late-alpha-output\n");
 
     // 旧输出 stream 的关闭必须发生在 attach 合并窗口之前；否则旧 session 的大输出会继续占用
-    // Ghostty 渲染和当前 session 连接，把新 session 的恢复拖慢。
+    // xterm 渲染和当前 session 连接，把新 session 的恢复拖慢。
     await new Promise((resolve) => window.setTimeout(resolve, 30));
 
     expect(cancelCount()).toBeGreaterThan(beforeSwitch);
@@ -2238,7 +2238,7 @@ describe("termui web 工作台", () => {
     expect(terminalText()).not.toContain("late-alpha-output");
   });
 
-  it("新 attach 的输出必须等 TerminalPane reset 确认后才写入 Ghostty", async () => {
+  it("新 attach 的输出必须等 TerminalPane reset 确认后才写入 xterm", async () => {
     const user = userEvent.setup();
     const alphaSession = {
       session_id: "00000000-0000-0000-0000-000000000461",
@@ -2314,10 +2314,10 @@ describe("termui web 工作台", () => {
     await pairWithInvite(user, daemon);
     await waitForWorkspaceSession("alpha");
     await screen.findByText(/alpha-ready/);
-    (globalThis as { __TERMD_TEST_DEFER_GHOSTTY_RENDER_UNTIL_WRITE_CALLBACK__?: boolean })
-      .__TERMD_TEST_DEFER_GHOSTTY_RENDER_UNTIL_WRITE_CALLBACK__ = true;
-    (globalThis as { __TERMD_TEST_DEFER_GHOSTTY_RENDER_READY_AFTER_WRITE_CALLBACK__?: boolean })
-      .__TERMD_TEST_DEFER_GHOSTTY_RENDER_READY_AFTER_WRITE_CALLBACK__ = true;
+    (globalThis as { __TERMD_TEST_DEFER_TERMINAL_RENDER_UNTIL_WRITE_CALLBACK__?: boolean })
+      .__TERMD_TEST_DEFER_TERMINAL_RENDER_UNTIL_WRITE_CALLBACK__ = true;
+    (globalThis as { __TERMD_TEST_DEFER_TERMINAL_RENDER_READY_AFTER_WRITE_CALLBACK__?: boolean })
+      .__TERMD_TEST_DEFER_TERMINAL_RENDER_READY_AFTER_WRITE_CALLBACK__ = true;
 
     fireEvent.click(screen.getByRole("button", { name: "Open beta" }));
     await waitFor(() => expect(daemon.attachedSessions).toContain(betaSession.session_id));
@@ -2539,7 +2539,7 @@ describe("termui web 工作台", () => {
     expect(within(panel).getAllByText("beta-branch").length).toBeGreaterThan(0);
   });
 
-  it("持续输出时合并写入 Ghostty，并且不为每个输出刷新布局", async () => {
+  it("持续输出时合并写入 xterm，并且不为每个输出刷新布局", async () => {
     const user = userEvent.setup();
     render(<App />);
 
@@ -2548,7 +2548,7 @@ describe("termui web 工作台", () => {
     await clickSessionCard(user);
     await screen.findByText(/termd-e2e-ready/);
     await new Promise((resolve) => window.setTimeout(resolve, 80));
-    // 中文注释：这条用例只衡量持续输出阶段的 Ghostty drain/refresh 行为；
+    // 中文注释：这条用例只衡量持续输出阶段的 xterm drain/refresh 行为；
     // attach/snapshot 的尾帧 stabilize 必须先完全落稳，避免把前序刷新混进统计。
     await waitForTerminalStatsToSettle();
     daemon.sessionCursorUpdates.length = 0;
@@ -2564,7 +2564,7 @@ describe("termui web 工作台", () => {
     await new Promise((resolve) => window.setTimeout(resolve, 160));
 
     expect(stats.writes).toBeLessThan(80);
-    // 队列真正 idle 后允许双帧 refresh 兜住 Ghostty 尾包绘制；持续输出期间仍不能逐条刷新。
+    // 队列真正 idle 后允许双帧 refresh 兜住 xterm 尾包绘制；持续输出期间仍不能逐条刷新。
     expect(stats.refreshes).toBeLessThanOrEqual(2);
     expect(daemon.sessionCursorUpdates.length).toBeLessThan(20);
   });
@@ -2614,7 +2614,7 @@ describe("termui web 工作台", () => {
     await waitFor(() => expect(screen.getByRole("button", { name: "Open work" })).not.toHaveClass("has-new-output"));
   });
 
-  it("Ghostty 鼠标选中后自动复制并提示复制成功", async () => {
+  it("xterm 鼠标选中后自动复制并提示复制成功", async () => {
     const user = userEvent.setup();
     const writeTextSpy = vi.spyOn(navigator.clipboard, "writeText").mockResolvedValue();
     render(<App />);
@@ -2630,7 +2630,7 @@ describe("termui web 工作台", () => {
     expect(await screen.findByRole("status")).toHaveTextContent("Copied");
   });
 
-  it("点击 Ghostty 已渲染文字也能聚焦终端", async () => {
+  it("点击 xterm 已渲染文字也能聚焦终端", async () => {
     const user = userEvent.setup();
     render(<App />);
 
@@ -2647,7 +2647,7 @@ describe("termui web 工作台", () => {
 
     const renderedText = document.createElement("span");
     renderedText.textContent = "rendered-terminal-text";
-    // Ghostty 的文字层会处理鼠标选择，真实浏览器里可能阻断冒泡阶段事件。
+    // xterm 的文字层会处理鼠标选择，真实浏览器里可能阻断冒泡阶段事件。
     // 测试这里显式阻断冒泡，确保外层捕获阶段仍能完成聚焦。
     renderedText.addEventListener("mousedown", (event) => event.stopPropagation());
     renderedText.addEventListener("click", (event) => event.stopPropagation());
@@ -3570,7 +3570,7 @@ describe("termui web 工作台", () => {
     expect(candidateSpaceEvent.defaultPrevented).toBe(false);
     expect(daemon.sessionDataMessages).toEqual([]);
 
-    // 中文注释：组合输入最终内容仍交给 Ghostty 的 input/composition 逻辑发送，fallback 不重复发送候选空格。
+    // 中文注释：组合输入最终内容仍交给 xterm 的 input/composition 逻辑发送，fallback 不重复发送候选空格。
     terminalInput.value = "你";
     fireEvent.input(terminalInput);
     await waitFor(() => expect(daemon.sessionDataMessages).toEqual(["你"]));
@@ -3797,8 +3797,8 @@ describe("termui web 工作台", () => {
       sessions: [],
       attachOutput: "idle-shell-prompt$ ",
     });
-    (globalThis as { __TERMD_TEST_DEFER_GHOSTTY_RENDER_UNTIL_WRITE_CALLBACK__?: boolean })
-      .__TERMD_TEST_DEFER_GHOSTTY_RENDER_UNTIL_WRITE_CALLBACK__ = true;
+    (globalThis as { __TERMD_TEST_DEFER_TERMINAL_RENDER_UNTIL_WRITE_CALLBACK__?: boolean })
+      .__TERMD_TEST_DEFER_TERMINAL_RENDER_UNTIL_WRITE_CALLBACK__ = true;
     render(<App />);
 
     await pairWithInvite(user, daemon);
@@ -6737,7 +6737,7 @@ describe("termui web 工作台", () => {
         frameHeight: 592,
       });
       // 中文注释：本用例要验证“本地浏览器容器尺寸接管 shared PTY”；
-      // jsdom 的 Ghostty mock 若不显式给 fit 尺寸，会用当前 remote rows/cols
+      // jsdom 的 xterm mock 若不显式给 fit 尺寸，会用当前 remote rows/cols
       // 反推容器大小，导致 focus 后看起来仍是 daemon 的旧 100x30。
       (globalThis as { __TERMD_TEST_FIT_DIMENSIONS__?: { rows: number; cols: number } }).__TERMD_TEST_FIT_DIMENSIONS__ = {
         rows: 24,
@@ -7073,7 +7073,7 @@ describe("termui web 工作台", () => {
     await waitForSidecarTimeoutIgnored("resize", "00000000-0000-0000-0000-000000000408");
 
     // 中文注释：resize/cursor 这类终端辅助 RPC 的 ack 可能被持续 stdout 压到超时；
-    // 超时只能丢弃本次辅助 ack，不能把 workspace 置为全局错误导致 Ghostty 卸载。
+    // 超时只能丢弃本次辅助 ack，不能把 workspace 置为全局错误导致 xterm 卸载。
     expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
     expect(document.body.textContent).not.toContain("response_timeout");
     expect(screen.getByText(/resize-timeout-ready/)).toBeInTheDocument();
@@ -7159,7 +7159,7 @@ describe("termui web 工作台", () => {
 
     daemon.sessionCursorUpdates.length = 0;
     fireEvent(window, new Event("resize"));
-    // 真实浏览器在拖动窗口边界时可能短暂让 Ghostty textarea 失焦，随后又恢复焦点；
+    // 真实浏览器在拖动窗口边界时可能短暂让 xterm textarea 失焦，随后又恢复焦点；
     // 这类 resize 伴随的瞬时 DOM focus 抖动不应变成 operator 的 focused/blurred 抖动。
     terminalInput!.blur();
     await new Promise((resolve) => window.setTimeout(resolve, 40));

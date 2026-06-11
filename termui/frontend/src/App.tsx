@@ -413,7 +413,6 @@ export default function App() {
   const lastCursorReportRef = useRef("");
   const lastCursorFocusedRef = useRef<boolean | undefined>(undefined);
   const cursorRefreshTimerRef = useRef<number | undefined>(undefined);
-  const terminalThemeResyncRef = useRef<EffectiveTheme | undefined>(undefined);
   const selectedSessionIdRef = useRef<UUID | undefined>(undefined);
   const activeSurfaceRef = useRef<AppSurface>(activeSurface);
   const statusRef = useRef(status);
@@ -601,7 +600,7 @@ export default function App() {
   }, [activeServer?.server_id]);
   const hasPairedServer = Boolean(activeServer && state.device);
   const showConnectionStatus = hasPairedServer && !error && status !== "pairing";
-  // session 列表刷新只是旁路请求，不能把正在显示的 Ghostty 卸载成 disconnected。
+  // session 列表刷新只是旁路请求，不能把正在显示的 xterm 卸载成 disconnected。
   const connectionReady = showConnectionStatus && status !== "idle" && status !== "connecting";
   useEffect(() => {
     recordTermdDiagnostic("app_connection_state", {
@@ -733,7 +732,7 @@ export default function App() {
   }, []);
 
   const discardPendingTerminalOutput = useCallback(() => {
-    // 终端输出由 Ghostty 自己维护 scrollback；React 只保留尚未写入 Ghostty 的短队列。
+    // 终端输出由 xterm 自己维护 scrollback；React 只保留尚未写入 xterm 的短队列。
     terminalOutputQueueRef.current = [];
     if (terminalOutputFlushFrameRef.current !== undefined) {
       const flushFrameTestHook = terminalOutputFlushFrameTestHook();
@@ -856,7 +855,7 @@ export default function App() {
   const flushTerminalOutput = useCallback(() => {
     terminalOutputFlushFrameRef.current = undefined;
     terminalOutputFlushTimerRef.current = undefined;
-    // 这一帧里累积的 session_data 直接交给 Ghostty drain，避免每帧输出都触发 React 重渲染。
+    // 这一帧里累积的 session_data 直接交给 xterm drain，避免每帧输出都触发 React 重渲染。
     terminalOutputDrainRef.current?.();
   }, []);
 
@@ -978,7 +977,7 @@ export default function App() {
       return;
     }
 
-    // 管理页会卸载 TerminalPane；继续保留旧 attach 会让返回工作台时 Ghostty 为空。
+    // 管理页会卸载 TerminalPane；继续保留旧 attach 会让返回工作台时 xterm 为空。
     // 这里仅断开本地 attach，daemon 端 session 仍保持运行，回到工作台后会自动重新 attach。
     userDetachedRef.current = false;
     autoAttachAttemptedSessionRef.current = undefined;
@@ -1465,7 +1464,7 @@ export default function App() {
         (attachedSessionRef.current || attachClientRef.current)
       ) {
         // 中文注释：workspace 中已经有当前 session 的 WebSocket 时，session/list 只是旁路 segment。
-        // relay 恢复或后台唤醒导致的短超时不能卸载 Ghostty，也不能升级成全局连接错误；
+        // relay 恢复或后台唤醒导致的短超时不能卸载 xterm，也不能升级成全局连接错误；
         // 真实终端断线由 attach receive loop 按长超时重连链路处理。
         const nextStatus =
           statusRef.current === "creating"
@@ -1573,7 +1572,7 @@ export default function App() {
           throw caught;
         }
       } catch (caught) {
-        // 后台 client/session 刷新失败不能把正在使用的 Ghostty 切到错误态；
+        // 后台 client/session 刷新失败不能把正在使用的 xterm 切到错误态；
         // 主 attach 连接有自己的重连路径，手动 Refresh 仍会显示错误。
         void caught;
       } finally {
@@ -1658,7 +1657,7 @@ export default function App() {
   }, []);
 
   const markNewOutputIfBackground = useCallback((sessionId: UUID) => {
-    // 当前 attach 的 session 输出会直接进入 Ghostty，不需要再用列表颜色提示。
+    // 当前 attach 的 session 输出会直接进入 xterm，不需要再用列表颜色提示。
     if (sessionId === attachedSessionRef.current) {
       return;
     }
@@ -1807,25 +1806,6 @@ export default function App() {
     );
   }, [scheduleAttachReconnect, terminalSnapshotPendingFullSnapshotTokensRef, terminalSnapshotRevealHistoryTokensRef]);
 
-  useEffect(() => {
-    const previousTheme = terminalThemeResyncRef.current;
-    terminalThemeResyncRef.current = effectiveTheme;
-    if (previousTheme === undefined || previousTheme === effectiveTheme) {
-      return;
-    }
-    if (!attachedSessionRef.current || !attachClientRef.current) {
-      return;
-    }
-    // 中文注释：ghostty-web 运行期 theme setter 不能重写 WASM buffer 里的默认前景/背景色。
-    // 已 attach 终端换主题时走一次完整 snapshot 重放，让新的 Ghostty 实例用新主题创建。
-    recordTermdDiagnostic("app_terminal_theme_resync", {
-      previousTheme,
-      nextTheme: effectiveTheme,
-      sessionId: attachedSessionRef.current,
-    });
-    handleTerminalResync(undefined);
-  }, [effectiveTheme, handleTerminalResync]);
-
   const handleTerminalSeqRendered = useCallback((terminalSeq: number) => {
     const sessionId = attachedSessionRef.current;
     if (!sessionId) {
@@ -1951,13 +1931,13 @@ export default function App() {
         clearNewOutputMark(sessionId);
         closeMobileAttachChrome();
         setStatus("attached");
-        // 打开历史 session 后主动请求 Ghostty focus。桌面端用它补发真实容器尺寸；
+        // 打开历史 session 后主动请求 xterm focus。桌面端用它补发真实容器尺寸；
         // 移动端也靠它让软键盘保持在终端下方。TerminalPane 会保护 toolbar/files 焦点。
         setTerminalFocusRequest((request) => request + 1);
         // 中文注释：DirectClient 的 WebSocket pump 会在 attach response 前后持续收包，
         // 但 App 的 receive loop 只有在这里启动。快速切换多个大输出 session 时，必须先
-        // 等 TerminalPane 确认旧 Ghostty 已经清屏/重建，再把新 snapshot 从 DirectClient
-        // 队列排进 Ghostty；否则新 snapshot 可能先写入旧实例。
+        // 等 TerminalPane 确认旧 xterm 已经清屏/重建，再把新 snapshot 从 DirectClient
+        // 队列排进 xterm；否则新 snapshot 可能先写入旧实例。
         await waitForTerminalOutputResetApplied(resetVersion);
         if (!isCurrentAttachRequest() || userDetachedRef.current) {
           attachedClient.detachSession(sessionId);
@@ -2063,7 +2043,7 @@ export default function App() {
         pendingAttachClientRef.current !== undefined
       ) {
         // 80ms 合并窗口只延迟“新 session attach”，不能让旧 session 的输出继续进入
-        // Ghostty。否则旧的大 snapshot/持续输出会占住主线程和当前 session 连接。
+        // xterm。否则旧的大 snapshot/持续输出会占住主线程和当前 session 连接。
         disconnectAttach();
       }
       if (pendingAttachClientRef.current && pendingAttachClientRef.current !== attachClientRef.current) {
@@ -2191,7 +2171,7 @@ export default function App() {
       sessionOrderRef.current = nextOrder;
       setSessionOrder(nextOrder);
       setSessions((current) => upsertSession(current, created, nextOrder));
-      // 新建 session 等价于打开一个新的 SSH shell，应立即把输入焦点交给 Ghostty。
+      // 新建 session 等价于打开一个新的 SSH shell，应立即把输入焦点交给 xterm。
       // 聚焦客户端会把自己的尺寸同步为 shared PTY 的权威尺寸。
       setTerminalFocusRequest((request) => request + 1);
       setStatus("attached");
@@ -2629,7 +2609,7 @@ export default function App() {
       lastCursorFocusedRef.current = presence.focused;
       void client.sendSessionCursor(sessionId, presence).catch((caught) => {
         if (isTerminalSidecarTimeout(caught)) {
-          // 中文注释：cursor 上报只是协作元数据；高输出场景下响应超时不能卸载 Ghostty，
+          // 中文注释：cursor 上报只是协作元数据；高输出场景下响应超时不能卸载 xterm，
           // 也不能触发 attach reconnect。这里同样优先于 retryable transport 处理。
           recordTermdDiagnostic("app_terminal_sidecar_timeout_ignored", {
             kind: "cursor",
@@ -2831,7 +2811,7 @@ export default function App() {
 
   const requestMobileTerminalFocus = useCallback(() => {
     if (isMobileLayout && attachedSessionId) {
-      // 移动端关闭覆盖面板后回到终端输入场景，主动恢复 Ghostty focus 以保持键盘常驻。
+      // 移动端关闭覆盖面板后回到终端输入场景，主动恢复 xterm focus 以保持键盘常驻。
       setTerminalFocusRequest((request) => request + 1);
     }
   }, [attachedSessionId, isMobileLayout]);

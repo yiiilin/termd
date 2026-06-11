@@ -7,77 +7,107 @@ import WebSocket from "ws";
 // 单元测试在 Node/jsdom 中运行，使用 ws 提供真实 WebSocket，确保 DirectClient
 // 测试仍经过完整 E2EE wire 流程，而不是绕过协议状态机。
 Object.assign(globalThis, { WebSocket });
+
 const clipboardWriteTextMock = vi.fn(() => Promise.resolve());
 Object.defineProperty(globalThis.navigator, "clipboard", {
   configurable: true,
   get: () => ({ writeText: clipboardWriteTextMock }),
 });
 
+type TerminalStats = {
+  writes: number;
+  refreshes: number;
+  writtenBytes: number;
+  resizes: number;
+  operations: Array<{ op: string; cols?: number; rows?: number; bytes?: number; text?: string }>;
+};
+
+type TerminalSelectionPosition = {
+  start: { x: number; y: number };
+  end: { x: number; y: number };
+};
+
+type MockTerminalControl = {
+  select: (text: string) => void;
+  deselect: () => void;
+  viewportY: () => number;
+  baseY: () => number;
+  scrollToLine: (line: number) => void;
+  forceSelectionPosition: (position: TerminalSelectionPosition | undefined) => void;
+};
+
+function terminalStats(): TerminalStats {
+  const scope = globalThis as { __TERMD_TEST_TERMINAL_STATS__?: TerminalStats };
+  scope.__TERMD_TEST_TERMINAL_STATS__ ??= {
+    writes: 0,
+    refreshes: 0,
+    writtenBytes: 0,
+    resizes: 0,
+    operations: [],
+  };
+  scope.__TERMD_TEST_TERMINAL_STATS__.resizes ??= 0;
+  scope.__TERMD_TEST_TERMINAL_STATS__.operations ??= [];
+  return scope.__TERMD_TEST_TERMINAL_STATS__;
+}
+
 afterEach(() => {
   delete (globalThis as { __TERMD_TEST_FIT_DIMENSIONS__?: { rows: number; cols: number } })
     .__TERMD_TEST_FIT_DIMENSIONS__;
-  delete (globalThis as { __TERMD_TEST_DEFER_GHOSTTY_RENDER_UNTIL_WRITE_CALLBACK__?: boolean })
-    .__TERMD_TEST_DEFER_GHOSTTY_RENDER_UNTIL_WRITE_CALLBACK__;
-  delete (globalThis as { __TERMD_TEST_DEFER_GHOSTTY_RENDER_READY_AFTER_WRITE_CALLBACK__?: boolean })
-    .__TERMD_TEST_DEFER_GHOSTTY_RENDER_READY_AFTER_WRITE_CALLBACK__;
-  delete (globalThis as { __TERMD_TEST_DEFER_GHOSTTY_BUFFER_UNTIL_WRITE_CALLBACK__?: boolean })
-    .__TERMD_TEST_DEFER_GHOSTTY_BUFFER_UNTIL_WRITE_CALLBACK__;
-  delete (globalThis as { __TERMD_TEST_KEEP_GHOSTTY_VIEWPORT_AT_TOP_AFTER_WRITE__?: boolean })
-    .__TERMD_TEST_KEEP_GHOSTTY_VIEWPORT_AT_TOP_AFTER_WRITE__;
-  delete (globalThis as { __TERMD_TEST_KEEP_GHOSTTY_VIEWPORT_AT_TOP_AFTER_RESIZE__?: boolean })
-    .__TERMD_TEST_KEEP_GHOSTTY_VIEWPORT_AT_TOP_AFTER_RESIZE__;
-  delete (globalThis as { __TERMD_TEST_SERIALIZE_GHOSTTY_WRITES__?: boolean })
-    .__TERMD_TEST_SERIALIZE_GHOSTTY_WRITES__;
-  delete (globalThis as { __TERMD_TEST_SUPPRESS_GHOSTTY_WRITE_CALLBACK__?: boolean })
-    .__TERMD_TEST_SUPPRESS_GHOSTTY_WRITE_CALLBACK__;
-  delete (globalThis as { __TERMD_TEST_GHOSTTY_SKIP_NATIVE_FOCUS__?: boolean })
-    .__TERMD_TEST_GHOSTTY_SKIP_NATIVE_FOCUS__;
+  delete (globalThis as { __TERMD_TEST_DEFER_TERMINAL_RENDER_UNTIL_WRITE_CALLBACK__?: boolean })
+    .__TERMD_TEST_DEFER_TERMINAL_RENDER_UNTIL_WRITE_CALLBACK__;
+  delete (globalThis as { __TERMD_TEST_DEFER_TERMINAL_RENDER_READY_AFTER_WRITE_CALLBACK__?: boolean })
+    .__TERMD_TEST_DEFER_TERMINAL_RENDER_READY_AFTER_WRITE_CALLBACK__;
+  delete (globalThis as { __TERMD_TEST_DEFER_TERMINAL_BUFFER_UNTIL_WRITE_CALLBACK__?: boolean })
+    .__TERMD_TEST_DEFER_TERMINAL_BUFFER_UNTIL_WRITE_CALLBACK__;
+  delete (globalThis as { __TERMD_TEST_KEEP_TERMINAL_VIEWPORT_AT_TOP_AFTER_WRITE__?: boolean })
+    .__TERMD_TEST_KEEP_TERMINAL_VIEWPORT_AT_TOP_AFTER_WRITE__;
+  delete (globalThis as { __TERMD_TEST_KEEP_TERMINAL_VIEWPORT_AT_TOP_AFTER_RESIZE__?: boolean })
+    .__TERMD_TEST_KEEP_TERMINAL_VIEWPORT_AT_TOP_AFTER_RESIZE__;
+  delete (globalThis as { __TERMD_TEST_SERIALIZE_TERMINAL_WRITES__?: boolean })
+    .__TERMD_TEST_SERIALIZE_TERMINAL_WRITES__;
+  delete (globalThis as { __TERMD_TEST_SUPPRESS_TERMINAL_WRITE_CALLBACK__?: boolean })
+    .__TERMD_TEST_SUPPRESS_TERMINAL_WRITE_CALLBACK__;
+  delete (globalThis as { __TERMD_TEST_TERMINAL_SKIP_NATIVE_FOCUS__?: boolean })
+    .__TERMD_TEST_TERMINAL_SKIP_NATIVE_FOCUS__;
   delete (globalThis as { __TERMD_TEST_DEFER_OUTPUT_RESET_APPLIED__?: (confirm: () => void) => void })
     .__TERMD_TEST_DEFER_OUTPUT_RESET_APPLIED__;
   delete (globalThis as {
-    __TERMD_TEST_HOLD_TERMINAL_OUTPUT_FLUSH_RAF__?: { schedule: (callback: () => void) => number; cancel: (handle: number) => void };
+    __TERMD_TEST_HOLD_TERMINAL_OUTPUT_FLUSH_RAF__?: {
+      schedule: (callback: () => void) => number;
+      cancel: (handle: number) => void;
+    };
   }).__TERMD_TEST_HOLD_TERMINAL_OUTPUT_FLUSH_RAF__;
   delete (globalThis as {
-    __TERMD_TEST_HOLD_TERMINAL_WRITE_RAF__?: { schedule: (callback: () => void) => number; cancel: (handle: number) => void };
+    __TERMD_TEST_HOLD_TERMINAL_WRITE_RAF__?: {
+      schedule: (callback: () => void) => number;
+      cancel: (handle: number) => void;
+    };
   }).__TERMD_TEST_HOLD_TERMINAL_WRITE_RAF__;
-  delete (globalThis as { __TERMD_TEST_TERMINAL_STATS__?: {
-    writes: number;
-    refreshes: number;
-    writtenBytes: number;
-    resizes: number;
-    operations: Array<{ op: string; cols?: number; rows?: number; bytes?: number }>;
-  } })
-    .__TERMD_TEST_TERMINAL_STATS__;
-  delete (globalThis as { __TERMD_TEST_GHOSTTY__?: { select: (text: string) => void; deselect: () => void } }).__TERMD_TEST_GHOSTTY__;
-  delete (globalThis as {
-    __TERMD_TEST_FORCE_SELECTION_POSITION__?: { start: { x: number; y: number }; end: { x: number; y: number } };
-  }).__TERMD_TEST_FORCE_SELECTION_POSITION__;
+  delete (globalThis as { __TERMD_TEST_TERMINAL_STATS__?: TerminalStats }).__TERMD_TEST_TERMINAL_STATS__;
+  delete (globalThis as { __TERMD_TEST_TERMINAL__?: MockTerminalControl }).__TERMD_TEST_TERMINAL__;
+  delete (globalThis as { __TERMD_TEST_FORCE_SELECTION_POSITION__?: TerminalSelectionPosition })
+    .__TERMD_TEST_FORCE_SELECTION_POSITION__;
   clipboardWriteTextMock.mockClear();
   cleanup();
 });
 
-vi.mock("ghostty-web", () => {
+vi.mock("@xterm/xterm", () => {
   const textDecoder = new TextDecoder();
   const mockCellMetrics = { width: 8, height: 16, baseline: 12 };
-  const terminalByCanvas = new WeakMap<HTMLCanvasElement, {
-    cols: number;
-    rows: number;
-    renderer?: { getMetrics?: () => { width: number; height: number; baseline: number } };
-  }>();
+  const terminalByCanvas = new WeakMap<HTMLCanvasElement, MockTerminal>();
   const scope = globalThis as typeof globalThis & {
-    __TERMD_TEST_GHOSTTY_CANVAS_RECT_PATCHED__?: boolean;
+    __TERMD_TEST_TERMINAL_CANVAS_RECT_PATCHED__?: boolean;
   };
-  if (!scope.__TERMD_TEST_GHOSTTY_CANVAS_RECT_PATCHED__) {
-    scope.__TERMD_TEST_GHOSTTY_CANVAS_RECT_PATCHED__ = true;
+  if (!scope.__TERMD_TEST_TERMINAL_CANVAS_RECT_PATCHED__) {
+    scope.__TERMD_TEST_TERMINAL_CANVAS_RECT_PATCHED__ = true;
     const originalGetBoundingClientRect = HTMLCanvasElement.prototype.getBoundingClientRect;
-    HTMLCanvasElement.prototype.getBoundingClientRect = function getMockGhosttyCanvasRect() {
+    HTMLCanvasElement.prototype.getBoundingClientRect = function getMockTerminalCanvasRect() {
       const terminal = terminalByCanvas.get(this);
       if (!terminal) {
         return originalGetBoundingClientRect.call(this);
       }
-      const metrics = terminal.renderer?.getMetrics?.() ?? mockCellMetrics;
-      const width = terminal.cols * metrics.width;
-      const height = terminal.rows * metrics.height;
+      const width = terminal.cols * mockCellMetrics.width;
+      const height = terminal.rows * mockCellMetrics.height;
       return {
         x: 0,
         y: 0,
@@ -94,27 +124,23 @@ vi.mock("ghostty-web", () => {
     };
   }
 
-  function terminalStats() {
-    const scope = globalThis as { __TERMD_TEST_TERMINAL_STATS__?: {
-      writes: number;
-      refreshes: number;
-      writtenBytes: number;
-      resizes: number;
-      operations: Array<{ op: string; cols?: number; rows?: number; bytes?: number; text?: string }>;
-    } };
-    scope.__TERMD_TEST_TERMINAL_STATS__ ??= { writes: 0, refreshes: 0, writtenBytes: 0, resizes: 0, operations: [] };
-    scope.__TERMD_TEST_TERMINAL_STATS__.resizes ??= 0;
-    scope.__TERMD_TEST_TERMINAL_STATS__.operations ??= [];
-    return scope.__TERMD_TEST_TERMINAL_STATS__;
+  class MockBufferLine {
+    constructor(private readonly text: string) {}
+
+    translateToString(trimRight = false, startColumn = 0, endColumn = this.text.length): string {
+      const slice = this.text.slice(startColumn, endColumn);
+      return trimRight ? slice.replace(/\s+$/u, "") : slice;
+    }
   }
 
-  class Terminal {
+  class MockTerminal {
     private dataListeners: Array<(data: string) => void> = [];
     private cursorMoveListeners: Array<() => void> = [];
     private renderListeners: Array<() => void> = [];
     private scrollListeners: Array<(viewportY: number) => void> = [];
     private selectionChangeListeners: Array<() => void> = [];
-    private terminalOptions: Record<string, unknown>;
+    private writeParsedListeners: Array<() => void> = [];
+    private optionsRecord: Record<string, unknown>;
     private pendingRender = "";
     private pendingRenderReady = false;
     private serializedWriteInFlight = false;
@@ -123,76 +149,43 @@ vi.mock("ghostty-web", () => {
     private selectionPosition: { start: { x: number; y: number }; end: { x: number; y: number } } | undefined;
     private absoluteCursorY = 0;
     private allLines: string[] = [""];
-    public selectionManager = {
-      selectionStart: undefined as { col: number; absoluteRow: number } | undefined,
-      selectionEnd: undefined as { col: number; absoluteRow: number } | undefined,
-      clearSelection: () => {
-        this.selectionManager.selectionStart = undefined;
-        this.selectionManager.selectionEnd = undefined;
-      },
-      markCurrentSelectionDirty: () => undefined,
-      requestRender: () => undefined,
-      selectionChangedEmitter: {
-        fire: () => {
-          this.selectionChangeListeners.forEach((listener) => listener());
-        },
-      },
-    };
-    public buffer = { active: { cursorY: 0, cursorX: 0, viewportY: 0, baseY: 0, length: 24 } };
-    public wasmTerm = {
-      scrollbackLength: 0,
-      getScrollbackLength: () => this.wasmTerm.scrollbackLength,
-      getScrollbackLine: (offset: number) => this.cellsForLine(this.allLines[offset] ?? ""),
-      getLine: (row: number) => this.cellsForLine(this.allLines[this.wasmTerm.scrollbackLength + row] ?? ""),
-      getGraphemeString: (row: number, col: number) => this.graphemeForLine(this.allLines[this.wasmTerm.scrollbackLength + row] ?? "", col),
-      getScrollbackGraphemeString: (offset: number, col: number) => this.graphemeForLine(this.allLines[offset] ?? "", col),
-    };
+    private xtermWrapper?: HTMLDivElement;
     public cols = 80;
     public rows = 24;
-    public renderer = {
-      getMetrics: () => {
-        const fitDimensions = (globalThis as { __TERMD_TEST_FIT_DIMENSIONS__?: { rows: number; cols: number } })
-          .__TERMD_TEST_FIT_DIMENSIONS__;
-        if (!this.element || !fitDimensions) {
-          return mockCellMetrics;
-        }
-        // 中文注释：生产 Ghostty 的 fit 从 host 像素和字体 metrics 计算 rows/cols。
-        // 测试仍用 __TERMD_TEST_FIT_DIMENSIONS__ 表达目标行列，但这里把它反推成稳定 metrics，
-        // 避免 daemon resize 路径退回不可信 fallback。
-        return {
-          width: Math.max(1, this.element.clientWidth / fitDimensions.cols),
-          height: Math.max(1, this.element.clientHeight / fitDimensions.rows),
-          baseline: mockCellMetrics.baseline,
-        };
-      },
-      render: () => undefined,
-    };
-    public viewportY = 0;
     public element: HTMLDivElement | undefined;
     public textarea: HTMLTextAreaElement | undefined;
+    public buffer = {
+      active: {
+        cursorY: 0,
+        cursorX: 0,
+        viewportY: 0,
+        baseY: 0,
+        length: 24,
+        getLine: (row: number) => this.getBufferLine(row),
+      },
+    };
 
     constructor(options: Record<string, unknown> = {}) {
-      this.terminalOptions = options;
+      this.optionsRecord = options;
     }
 
     get options() {
-      return { ...this.terminalOptions, cols: this.cols, rows: this.rows };
+      return this.optionsRecord;
     }
 
     set options(nextOptions: Record<string, unknown>) {
-      // 真实 Ghostty 不允许在运行期重新设置 cols/rows；测试里保留这个约束，避免缩放时误写只读配置。
-      if ("cols" in nextOptions || "rows" in nextOptions) {
-        throw new Error('Option "cols" can only be set in the constructor');
-      }
-      this.terminalOptions = { ...this.terminalOptions, ...nextOptions };
+      this.optionsRecord = { ...this.optionsRecord, ...nextOptions };
     }
 
-    open(element: HTMLElement) {
-      this.element = element as HTMLDivElement;
+    loadAddon(addon?: { activate?: (terminal: MockTerminal) => void }) {
+      addon?.activate?.(this);
+    }
+
+    open(parent: HTMLElement) {
+      this.element = parent as HTMLDivElement;
       this.element.dataset.buffer = "";
       this.element.dataset.termdBuffer = "";
       this.element.tabIndex = 0;
-      this.element.setAttribute("contenteditable", "true");
       this.element.setAttribute("role", "textbox");
       this.element.setAttribute("aria-label", "Terminal input");
       this.element.setAttribute("aria-multiline", "true");
@@ -210,9 +203,17 @@ vi.mock("ghostty-web", () => {
               .__TERMD_TEST_FIT_DIMENSIONS__?.rows ?? this.rows) * mockCellMetrics.height,
         });
       }
+      this.xtermWrapper = document.createElement("div");
+      this.xtermWrapper.className = "xterm";
+      const viewport = document.createElement("div");
+      viewport.className = "xterm-viewport";
+      const screen = document.createElement("div");
+      screen.className = "xterm-screen";
       const canvas = document.createElement("canvas");
       terminalByCanvas.set(canvas, this);
+      screen.append(canvas);
       const textarea = document.createElement("textarea");
+      textarea.className = "xterm-helper-textarea";
       textarea.setAttribute("aria-label", "Terminal input");
       textarea.addEventListener("input", () => {
         const value = textarea.value;
@@ -222,83 +223,37 @@ vi.mock("ghostty-web", () => {
         this.cursorMoveListeners.forEach((listener) => listener());
       });
       this.textarea = textarea;
-      this.element.append(canvas, textarea);
-      (globalThis as { __TERMD_TEST_GHOSTTY__?: {
-        select: (text: string) => void;
-        deselect: () => void;
-        viewportY: () => number;
-        baseY: () => number;
-        scrollToLine: (line: number) => void;
-        forceSelectionPosition: (position: { start: { x: number; y: number }; end: { x: number; y: number } } | undefined) => void;
-      } }).__TERMD_TEST_GHOSTTY__ = {
-        select: (text: string) => {
-          this.selectionManager.clearSelection();
+      this.xtermWrapper.append(viewport, screen, textarea);
+      this.element.append(this.xtermWrapper);
+
+      (globalThis as { __TERMD_TEST_TERMINAL__?: MockTerminalControl }).__TERMD_TEST_TERMINAL__ = {
+        select: (text) => {
           this.selection = text;
           this.selectionPosition = {
-            start: { x: 0, y: 0 },
-            end: { x: Math.max(0, text.length - 1), y: 0 },
+            start: { x: 1, y: 1 },
+            end: { x: Math.max(1, text.length), y: 1 },
           };
           this.selectionChangeListeners.forEach((listener) => listener());
         },
-        deselect: () => {
-          this.selectionManager.clearSelection();
-          this.selection = "";
-          this.selectionPosition = undefined;
-          this.selectionChangeListeners.forEach((listener) => listener());
-        },
-        viewportY: () => Math.max(0, this.wasmTerm.scrollbackLength - this.viewportY),
-        baseY: () => this.wasmTerm.scrollbackLength,
-        scrollToLine: (line: number) => this.scrollToRawLine(Math.max(0, this.wasmTerm.scrollbackLength - line)),
+        deselect: () => this.clearSelection(),
+        viewportY: () => this.buffer.active.viewportY,
+        baseY: () => this.buffer.active.baseY,
+        scrollToLine: (line) => this.scrollToLine(line),
         forceSelectionPosition: (position) => {
-          this.selectionPosition = position;
+          this.selectionPosition = position
+            ? {
+                start: { x: position.start.x + 1, y: position.start.y + 1 },
+                end: { x: position.end.x + 1, y: position.end.y + 1 },
+              }
+            : undefined;
         },
       };
     }
 
-    loadAddon(addon?: { activate?: (terminal: Terminal) => void }) {
-      addon?.activate?.(this);
-    }
-
-    private syncCursorWindow() {
-      const baseY = Math.max(0, this.absoluteCursorY - this.rows + 1);
-      this.buffer.active.baseY = baseY;
-      this.buffer.active.length = baseY + this.rows;
-      this.wasmTerm.scrollbackLength = baseY;
-      // 中文注释：真实终端 renderer 的公开 cursorY 表示当前 screen 内的光标行，
-      // 不是累计 scrollback 行号；测试桩也要保持这个语义，才能覆盖 resize 后
-      // “内容已经铺满，但光标还停在旧高度”的真实浏览器问题。
-      this.buffer.active.cursorY = Math.max(0, this.absoluteCursorY - this.buffer.active.baseY);
-    }
-
-    private appendBufferText(text: string) {
-      // 中文注释：测试桩需要维护和 Ghostty wasmTerm 类似的文本行，否则自定义选区复制
-      // 会退回 DOM debug mirror，无法覆盖生产路径。
-      const normalized = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-      for (const char of normalized) {
-        if (char === "\n") {
-          this.allLines.push("");
-        } else {
-          this.allLines[this.allLines.length - 1] = `${this.allLines.at(-1) ?? ""}${char}`;
-        }
-      }
-    }
-
-    private cellsForLine(line: string) {
-      const cells = Array.from(line, (ch) => ({ codepoint: ch.codePointAt(0) ?? 0, grapheme_len: 0 }));
-      while (cells.length < this.cols) {
-        cells.push({ codepoint: 0, grapheme_len: 0 });
-      }
-      return cells;
-    }
-
-    private graphemeForLine(line: string, col: number) {
-      return Array.from(line)[col] ?? "";
-    }
-
     write(data: string | Uint8Array, callback?: () => void) {
       const serializeWrites = Boolean(
-        (globalThis as { __TERMD_TEST_SERIALIZE_GHOSTTY_WRITES__?: boolean })
-          .__TERMD_TEST_SERIALIZE_GHOSTTY_WRITES__,
+        (globalThis as { __TERMD_TEST_SERIALIZE_TERMINAL_WRITES__?: boolean })
+          .__TERMD_TEST_SERIALIZE_TERMINAL_WRITES__,
       );
       if (serializeWrites && this.serializedWriteInFlight) {
         this.serializedWriteQueue.push({ data, callback });
@@ -321,7 +276,7 @@ vi.mock("ghostty-web", () => {
     }
 
     private processWrite(data: string | Uint8Array, callback?: () => void) {
-      const text = typeof data === "string" ? data : textDecoder.decode(data);
+      const text = typeof data === "string" ? data : this.decodeWriteText(data);
       const stats = terminalStats();
       stats.writes += 1;
       stats.writtenBytes += typeof data === "string" ? data.length : data.byteLength;
@@ -331,24 +286,24 @@ vi.mock("ghostty-web", () => {
         text: text.length <= 32 ? text : undefined,
       });
       const deferRender = Boolean(
-        (globalThis as { __TERMD_TEST_DEFER_GHOSTTY_RENDER_UNTIL_WRITE_CALLBACK__?: boolean })
-          .__TERMD_TEST_DEFER_GHOSTTY_RENDER_UNTIL_WRITE_CALLBACK__,
+        (globalThis as { __TERMD_TEST_DEFER_TERMINAL_RENDER_UNTIL_WRITE_CALLBACK__?: boolean })
+          .__TERMD_TEST_DEFER_TERMINAL_RENDER_UNTIL_WRITE_CALLBACK__,
       );
       const deferRenderReadyAfterCallback = Boolean(
-        (globalThis as { __TERMD_TEST_DEFER_GHOSTTY_RENDER_READY_AFTER_WRITE_CALLBACK__?: boolean })
-          .__TERMD_TEST_DEFER_GHOSTTY_RENDER_READY_AFTER_WRITE_CALLBACK__,
+        (globalThis as { __TERMD_TEST_DEFER_TERMINAL_RENDER_READY_AFTER_WRITE_CALLBACK__?: boolean })
+          .__TERMD_TEST_DEFER_TERMINAL_RENDER_READY_AFTER_WRITE_CALLBACK__,
       );
       const deferBufferUntilCallback = Boolean(
-        (globalThis as { __TERMD_TEST_DEFER_GHOSTTY_BUFFER_UNTIL_WRITE_CALLBACK__?: boolean })
-          .__TERMD_TEST_DEFER_GHOSTTY_BUFFER_UNTIL_WRITE_CALLBACK__,
+        (globalThis as { __TERMD_TEST_DEFER_TERMINAL_BUFFER_UNTIL_WRITE_CALLBACK__?: boolean })
+          .__TERMD_TEST_DEFER_TERMINAL_BUFFER_UNTIL_WRITE_CALLBACK__,
       );
       const suppressWriteCallback = Boolean(
-        (globalThis as { __TERMD_TEST_SUPPRESS_GHOSTTY_WRITE_CALLBACK__?: boolean })
-          .__TERMD_TEST_SUPPRESS_GHOSTTY_WRITE_CALLBACK__,
+        (globalThis as { __TERMD_TEST_SUPPRESS_TERMINAL_WRITE_CALLBACK__?: boolean })
+          .__TERMD_TEST_SUPPRESS_TERMINAL_WRITE_CALLBACK__,
       );
       const keepViewportAtTop = Boolean(
-        (globalThis as { __TERMD_TEST_KEEP_GHOSTTY_VIEWPORT_AT_TOP_AFTER_WRITE__?: boolean })
-          .__TERMD_TEST_KEEP_GHOSTTY_VIEWPORT_AT_TOP_AFTER_WRITE__,
+        (globalThis as { __TERMD_TEST_KEEP_TERMINAL_VIEWPORT_AT_TOP_AFTER_WRITE__?: boolean })
+          .__TERMD_TEST_KEEP_TERMINAL_VIEWPORT_AT_TOP_AFTER_WRITE__,
       );
       if (deferRender) {
         this.pendingRender += text;
@@ -369,16 +324,15 @@ vi.mock("ghostty-web", () => {
           this.buffer.active.cursorX += text.length;
         }
         this.syncCursorWindow();
-        const nextViewportY = keepViewportAtTop
+        this.buffer.active.viewportY = keepViewportAtTop
           ? Math.min(this.buffer.active.viewportY, this.buffer.active.baseY)
-            : wasAtBottom
-              ? this.buffer.active.baseY
-              : Math.min(this.buffer.active.viewportY, this.buffer.active.baseY);
-        this.buffer.active.viewportY = nextViewportY;
-        this.viewportY = Math.max(0, this.wasmTerm.scrollbackLength - nextViewportY);
+          : wasAtBottom
+            ? this.buffer.active.baseY
+            : Math.min(this.buffer.active.viewportY, this.buffer.active.baseY);
         this.renderListeners.forEach((listener) => listener());
         this.cursorMoveListeners.forEach((listener) => listener());
         this.scrollListeners.forEach((listener) => listener(this.buffer.active.viewportY));
+        this.writeParsedListeners.forEach((listener) => listener());
       };
       if (!deferBufferUntilCallback) {
         applyBufferEffects();
@@ -393,8 +347,7 @@ vi.mock("ghostty-web", () => {
         return;
       }
 
-      // 真实 Ghostty canvas 会异步完成 write 解析和绘制；这里延后三帧，让测试能覆盖
-      // “write 后立即 refresh 但内容尚不可绘制”的浏览器时序。
+      // 中文注释：测试桩同样把解析/绘制拆到多帧，覆盖“write callback 晚于首轮布局”的竞态。
       window.requestAnimationFrame(() => {
         window.requestAnimationFrame(() => {
           window.requestAnimationFrame(() => {
@@ -405,10 +358,12 @@ vi.mock("ghostty-web", () => {
               callback?.();
               window.requestAnimationFrame(() => {
                 this.pendingRenderReady = true;
+                this.requestRender();
               });
               return;
             }
             this.pendingRenderReady = true;
+            this.requestRender();
             if (deferBufferUntilCallback) {
               applyBufferEffects();
             }
@@ -445,9 +400,12 @@ vi.mock("ghostty-web", () => {
       return { dispose: () => undefined };
     }
 
+    onWriteParsed(listener: () => void) {
+      this.writeParsedListeners.push(listener);
+      return { dispose: () => undefined };
+    }
+
     hasSelection() {
-      // 中文注释：public hasSelection() 故意只反映 Ghostty 原生字符串选区，
-      // 这样测试才能覆盖 production facade 对 selectionManager-only 选区的兜底逻辑。
       return this.selection.length > 0;
     }
 
@@ -455,34 +413,53 @@ vi.mock("ghostty-web", () => {
       return this.selection;
     }
 
-    select(column: number, row: number, length: number) {
-      this.selectionManager.clearSelection();
-      this.selection = "x".repeat(Math.max(0, length));
-      const forcedSelectionPosition = (globalThis as {
-        __TERMD_TEST_FORCE_SELECTION_POSITION__?: { start: { x: number; y: number }; end: { x: number; y: number } };
-      }).__TERMD_TEST_FORCE_SELECTION_POSITION__;
-      this.selectionPosition = forcedSelectionPosition ?? {
-        start: { x: column, y: row },
-        end: { x: column + Math.max(0, length - 1), y: row },
-      };
-      this.selectionChangeListeners.forEach((listener) => listener());
+    getSelectionPosition() {
+      return this.selectionPosition;
     }
 
-    deselect() {
-      this.selectionManager.clearSelection();
+    clearSelection() {
       this.selection = "";
       this.selectionPosition = undefined;
       this.selectionChangeListeners.forEach((listener) => listener());
     }
 
-    private scrollToRawLine(line: number) {
-      this.viewportY = Math.max(0, Math.min(this.wasmTerm.scrollbackLength, line));
-      this.buffer.active.viewportY = Math.max(0, this.wasmTerm.scrollbackLength - this.viewportY);
-      this.scrollListeners.forEach((listener) => listener(this.buffer.active.viewportY));
+    select(column: number, row: number, length: number) {
+      const forcedSelectionPosition = (globalThis as {
+        __TERMD_TEST_FORCE_SELECTION_POSITION__?: TerminalSelectionPosition;
+      }).__TERMD_TEST_FORCE_SELECTION_POSITION__;
+      const range = this.rangeFromLinearSelection(column, row, length);
+      this.selection = this.bufferRangeText(range);
+      this.selectionPosition = forcedSelectionPosition
+        ? {
+            start: { x: forcedSelectionPosition.start.x + 1, y: forcedSelectionPosition.start.y + 1 },
+            end: { x: forcedSelectionPosition.end.x + 1, y: forcedSelectionPosition.end.y + 1 },
+          }
+        : {
+            start: { x: range.startCol + 1, y: range.startRow + 1 },
+            end: { x: range.endCol + 1, y: range.endRow + 1 },
+          };
+      this.selectionChangeListeners.forEach((listener) => listener());
+    }
+
+    selectLines(start: number, end: number) {
+      const startRow = Math.max(0, start);
+      const endRow = Math.max(startRow, end);
+      this.selection = this.bufferRangeText({
+        startCol: 0,
+        startRow,
+        endCol: Math.max(0, this.cols - 1),
+        endRow,
+      });
+      this.selectionPosition = {
+        start: { x: 1, y: startRow + 1 },
+        end: { x: this.cols, y: endRow + 1 },
+      };
+      this.selectionChangeListeners.forEach((listener) => listener());
     }
 
     scrollToLine(line: number) {
-      this.scrollToRawLine(line);
+      this.buffer.active.viewportY = Math.max(0, Math.min(this.buffer.active.baseY, Math.floor(line)));
+      this.scrollListeners.forEach((listener) => listener(this.buffer.active.viewportY));
     }
 
     resize(cols: number, rows: number) {
@@ -492,26 +469,136 @@ vi.mock("ghostty-web", () => {
       const previousBaseY = this.buffer.active.baseY;
       const wasAtBottom = this.buffer.active.viewportY >= previousBaseY;
       const keepViewportAtTop = Boolean(
-        (globalThis as { __TERMD_TEST_KEEP_GHOSTTY_VIEWPORT_AT_TOP_AFTER_RESIZE__?: boolean })
-          .__TERMD_TEST_KEEP_GHOSTTY_VIEWPORT_AT_TOP_AFTER_RESIZE__,
+        (globalThis as { __TERMD_TEST_KEEP_TERMINAL_VIEWPORT_AT_TOP_AFTER_RESIZE__?: boolean })
+          .__TERMD_TEST_KEEP_TERMINAL_VIEWPORT_AT_TOP_AFTER_RESIZE__,
       );
       this.cols = cols;
       this.rows = rows;
       this.syncCursorWindow();
-      const nextViewportY = keepViewportAtTop
+      this.buffer.active.viewportY = keepViewportAtTop
         ? Math.min(this.buffer.active.viewportY, this.buffer.active.baseY)
         : wasAtBottom
-        ? this.buffer.active.baseY
-        : Math.min(this.buffer.active.viewportY, this.buffer.active.baseY);
-      this.buffer.active.viewportY = nextViewportY;
-      this.viewportY = Math.max(0, this.wasmTerm.scrollbackLength - nextViewportY);
+          ? this.buffer.active.baseY
+          : Math.min(this.buffer.active.viewportY, this.buffer.active.baseY);
     }
 
     focus() {
-      if ((globalThis as { __TERMD_TEST_GHOSTTY_SKIP_NATIVE_FOCUS__?: boolean }).__TERMD_TEST_GHOSTTY_SKIP_NATIVE_FOCUS__) {
+      if ((globalThis as { __TERMD_TEST_TERMINAL_SKIP_NATIVE_FOCUS__?: boolean }).__TERMD_TEST_TERMINAL_SKIP_NATIVE_FOCUS__) {
         return;
       }
-      this.element?.focus();
+      this.textarea?.focus();
+    }
+
+    refresh() {
+      terminalStats().refreshes += 1;
+      this.renderListeners.forEach((listener) => listener());
+      this.writeParsedListeners.forEach((listener) => listener());
+    }
+
+    reset() {
+      terminalStats().operations.push({ op: "reset" });
+      this.pendingRender = "";
+      this.pendingRenderReady = false;
+      this.selection = "";
+      this.selectionPosition = undefined;
+      this.absoluteCursorY = 0;
+      this.allLines = [""];
+      this.buffer.active.cursorY = 0;
+      this.buffer.active.cursorX = 0;
+      this.buffer.active.baseY = 0;
+      this.buffer.active.viewportY = 0;
+      this.buffer.active.length = this.rows;
+      if (this.element) {
+        this.element.dataset.buffer = "";
+        this.element.dataset.termdBuffer = "";
+        for (const node of Array.from(this.element.childNodes)) {
+          if (node.nodeType === Node.TEXT_NODE) {
+            node.remove();
+          }
+        }
+      }
+    }
+
+    dispose() {
+      this.element?.replaceChildren();
+      this.element?.removeAttribute("tabindex");
+      this.element?.removeAttribute("role");
+      this.element?.removeAttribute("aria-label");
+      this.element?.removeAttribute("aria-multiline");
+      if (this.element) {
+        delete this.element.dataset.buffer;
+        delete this.element.dataset.termdBuffer;
+      }
+      this.textarea = undefined;
+      this.element = undefined;
+    }
+
+    private syncCursorWindow() {
+      const lineCount = Math.max(1, this.allLines.length);
+      this.buffer.active.length = Math.max(this.rows, lineCount);
+      this.buffer.active.baseY = Math.max(0, this.buffer.active.length - this.rows);
+      this.buffer.active.cursorY = Math.max(0, this.absoluteCursorY - this.buffer.active.baseY);
+    }
+
+    private appendBufferText(text: string) {
+      const normalized = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+      for (const char of normalized) {
+        if (char === "\n") {
+          this.allLines.push("");
+        } else {
+          this.allLines[this.allLines.length - 1] = `${this.allLines.at(-1) ?? ""}${char}`;
+        }
+      }
+    }
+
+    private getBufferLine(row: number) {
+      if (row < 0 || row >= this.buffer.active.length) {
+        return undefined;
+      }
+      return new MockBufferLine(this.allLines[row] ?? "");
+    }
+
+    private rangeFromLinearSelection(column: number, row: number, length: number) {
+      const safeLength = Math.max(1, length);
+      const lastIndex = column + safeLength - 1;
+      return {
+        startCol: Math.max(0, column),
+        startRow: Math.max(0, row),
+        endCol: lastIndex % Math.max(1, this.cols),
+        endRow: Math.max(0, row) + Math.floor(lastIndex / Math.max(1, this.cols)),
+      };
+    }
+
+    private bufferRangeText(range: { startCol: number; startRow: number; endCol: number; endRow: number }) {
+      const lines: string[] = [];
+      for (let row = range.startRow; row <= range.endRow; row += 1) {
+        const line = this.getBufferLine(row);
+        if (!line) {
+          continue;
+        }
+        const startColumn = row === range.startRow ? range.startCol : 0;
+        const endColumn = row === range.endRow ? range.endCol + 1 : this.cols;
+        lines.push(line.translateToString(false, startColumn, endColumn).replace(/\s+$/u, ""));
+      }
+      return lines.join("\n");
+    }
+
+    private renderData(data: string) {
+      if (!this.element || data.length === 0) {
+        return;
+      }
+      this.element.dataset.buffer = `${this.element.dataset.buffer ?? ""}${data}`;
+      this.element.dataset.termdBuffer = this.element.dataset.buffer;
+      this.element.append(document.createTextNode(data));
+    }
+
+    private decodeWriteText(data: Uint8Array) {
+      for (const byte of data) {
+        if (byte !== 0) {
+          return textDecoder.decode(data).replace(/\u0000+/gu, "");
+        }
+      }
+      return "";
     }
 
     requestRender() {
@@ -524,65 +611,14 @@ vi.mock("ghostty-web", () => {
       this.pendingRenderReady = false;
       this.renderData(data);
     }
-
-    clear() {
-      terminalStats().operations.push({ op: "clear" });
-      // mock 要真实清空 DOM buffer，才能覆盖 WebSocket 断线重连后的 snapshot 重放不会叠加旧内容。
-      this.pendingRender = "";
-      this.pendingRenderReady = false;
-      if (!this.element) {
-        return;
-      }
-      this.element.dataset.buffer = "";
-      this.element.dataset.termdBuffer = "";
-      for (const node of Array.from(this.element.childNodes)) {
-        if (node.nodeType === Node.TEXT_NODE) {
-          node.remove();
-        }
-      }
-      this.absoluteCursorY = 0;
-      this.allLines = [""];
-      this.buffer.active.cursorY = 0;
-      this.buffer.active.cursorX = 0;
-      this.buffer.active.baseY = 0;
-      this.buffer.active.viewportY = 0;
-      this.buffer.active.length = this.rows;
-      this.viewportY = 0;
-      this.wasmTerm.scrollbackLength = 0;
-    }
-
-    reset() {
-      terminalStats().operations.push({ op: "reset" });
-      // Ghostty reset 会清空终端状态；测试 mock 复用 clear 的 DOM/游标重置逻辑即可。
-      this.clear();
-    }
-
-    dispose() {
-      if (!this.element) {
-        return;
-      }
-      this.element.replaceChildren();
-      this.element.removeAttribute("tabindex");
-      this.element.removeAttribute("contenteditable");
-      this.element.removeAttribute("role");
-      this.element.removeAttribute("aria-label");
-      this.element.removeAttribute("aria-multiline");
-      delete this.element.dataset.buffer;
-      delete this.element.dataset.termdBuffer;
-      this.textarea = undefined;
-      this.element = undefined;
-    }
-
-    private renderData(data: string) {
-      if (!this.element) {
-        return;
-      }
-      this.element.dataset.buffer = `${this.element.dataset.buffer ?? ""}${data}`;
-      this.element.dataset.termdBuffer = this.element.dataset.buffer;
-      this.element.append(document.createTextNode(data));
-    }
   }
 
+  return {
+    Terminal: MockTerminal,
+  };
+});
+
+vi.mock("@xterm/addon-fit", () => {
   class FitAddon {
     private terminal?: { resize: (cols: number, rows: number) => void };
 
@@ -592,13 +628,10 @@ vi.mock("ghostty-web", () => {
 
     fit() {
       const proposed = this.proposeDimensions();
-      // Ghostty 的 FitAddon.fit 会把终端尺寸同步成 proposeDimensions 的结果；
-      // mock 也要这样做，才能覆盖 resize ack 后回聚焦的滚动保持逻辑。
       this.terminal?.resize(proposed.cols, proposed.rows);
     }
 
     proposeDimensions() {
-      // 测试用例可显式覆盖 Ghostty 当前容器能容纳的尺寸，用来模拟浏览器窗口 resize。
       return (
         (globalThis as { __TERMD_TEST_FIT_DIMENSIONS__?: { rows: number; cols: number } })
           .__TERMD_TEST_FIT_DIMENSIONS__ ?? { rows: 24, cols: 80 }
@@ -606,9 +639,21 @@ vi.mock("ghostty-web", () => {
     }
   }
 
-  return {
-    init: vi.fn(() => undefined),
-    Terminal,
-    FitAddon,
-  };
+  return { FitAddon };
+});
+
+vi.mock("@xterm/addon-search", () => {
+  class SearchAddon {
+    constructor(_options?: unknown) {}
+
+    activate() {}
+
+    clearDecorations() {}
+
+    findNext() {}
+
+    findPrevious() {}
+  }
+
+  return { SearchAddon };
 });

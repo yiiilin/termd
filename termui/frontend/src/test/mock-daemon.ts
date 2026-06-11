@@ -409,7 +409,7 @@ export class MockDaemon {
   }
 
   pushSessionDataToAll(sessionId: UUID, text: string): void {
-    // 后台 session 只发 activity 标记，不把未打开 session 的输出内容灌进当前 Ghostty。
+    // 后台 session 只发 activity 标记，不把未打开 session 的输出内容灌进当前 xterm。
     for (const connection of this.connections) {
       if (connection.e2ee && connection.watchedSessionIds.size > 0) {
         void text;

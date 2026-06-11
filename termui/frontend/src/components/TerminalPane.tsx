@@ -40,7 +40,6 @@ const TERMINAL_SERVER_SCROLLBACK_RESYNC_USER_MIN_BYTES = 1024;
 const TERMINAL_SERVER_SCROLLBACK_RESYNC_COOLDOWN_MS = 5_000;
 const TERMINAL_SERVER_SCROLLBACK_RESYNC_IDLE_SETTLE_MS = 1_000;
 const TERMINAL_SELECTION_DRAG_THRESHOLD_PX = 4;
-const GHOSTTY_SCROLLBAR_GUTTER_PX = 12;
 const TERMINAL_SEARCH_OPTIONS: TerminalSearchOptions = {
   caseSensitive: false,
   decorations: {
@@ -547,7 +546,7 @@ export function TerminalPane(props: TerminalPaneProps) {
     terminalResizeReportSizeRef.current = undefined;
     terminalResizeReportSourceRef.current = undefined;
     terminalSelectionCopyGenerationRef.current += 1;
-    // 中文注释：用户上滚触发的 reveal-history 只属于当前 Ghostty buffer。
+    // 中文注释：用户上滚触发的 reveal-history 只属于当前本地终端 buffer。
     // attach/reset 会换掉 buffer，跨代保留这个本地标记会把下一次普通 snapshot 错当成历史查看。
     terminalRevealHistoryAfterSnapshotRef.current = false;
     terminalRevealHistorySuppressBottomUntilRef.current = 0;
@@ -643,7 +642,7 @@ export function TerminalPane(props: TerminalPaneProps) {
         bottomScrollPassesRef.current = 0;
         return;
       }
-      // resize / Ghostty renderer / 移动端 visual viewport 可能分多帧稳定。
+      // resize / renderer / 移动端 visual viewport 可能分多帧稳定。
       // attach 后的贴底只在首屏执行，多补几帧不会放大持续输出路径压力。
       bottomScrollFrameRef.current = scheduleDeferredTerminalFrame(runScrollPass);
     };
@@ -729,7 +728,7 @@ export function TerminalPane(props: TerminalPaneProps) {
       await navigator.clipboard?.writeText(text);
       return true;
     } catch {
-      // 中文注释：ghostty-web / Chromium 的剪贴板权限和 user activation 时序并不总是稳定；
+      // 中文注释：浏览器 / Chromium 的剪贴板权限和 user activation 时序并不总是稳定；
       // async clipboard 失败时，退回到隐藏 textarea + execCommand，至少保证鼠标选区能复制出去。
     }
     return runExecCommandCopy(text).copied;
@@ -882,7 +881,7 @@ export function TerminalPane(props: TerminalPaneProps) {
     if (options.clipboardData) {
       noteTerminalSelectionCopy(selection);
       // 中文注释：浏览器菜单复制/快捷键 copy event 会提供 clipboardData；
-      // 直接写入这份 payload，能绕过 Ghostty 隐藏 textarea 没有 DOM 选区的问题。
+      // 直接写入这份 payload，能绕过 canvas 终端没有 DOM 文本选区的问题。
       options.clipboardData.setData("text/plain", selection);
       showCopyToast();
       return true;
@@ -941,7 +940,7 @@ export function TerminalPane(props: TerminalPaneProps) {
       return true;
     }
     // 中文注释：自定义拖拽选区结束后，浏览器焦点可能暂时落回 body/document。
-    // 但一旦用户已经点到终端外，就不能再让旧的 Ghostty 选区劫持页面里的普通复制。
+    // 但一旦用户已经点到终端外，就不能再让旧终端选区劫持页面里的普通复制。
     return (
       terminalClipboardSelectionOwnerRef.current &&
       (eventTarget === document ||
@@ -1207,7 +1206,7 @@ export function TerminalPane(props: TerminalPaneProps) {
             TERMINAL_SERVER_SCROLLBACK_RESYNC_IDLE_SETTLE_MS - idleForMs,
           );
           // 中文注释：自动 scrollback 预取只应该发生在输出真正稳定之后。
-          // 刚 attach/reconnect/relay 恢复完成时，Ghostty 很容易短暂处于
+          // 刚 attach/reconnect/relay 恢复完成时，终端 renderer 很容易短暂处于
           // “baseY=0 但画面还在追平”的中间态；这里等待一个 idle settle window，
           // 避免把暂态误判成全屏程序重绘，从而过早触发 full snapshot 重连。
           terminalServerScrollbackResyncIdleTimerRef.current = window.setTimeout(() => {
@@ -1226,7 +1225,7 @@ export function TerminalPane(props: TerminalPaneProps) {
       return;
     }
     // 中文注释：supervisor attach 流是全屏 renderer，实时输出可能只重绘可见屏幕，
-    // 不会让 Ghostty 自身生成 scrollback。此时主动拉一次 daemon/supervisor snapshot，
+    // 不会让本地终端自身生成 scrollback。此时主动拉一次 daemon/supervisor snapshot，
     // 让浏览器获得可滚动历史；snapshot 完成后计数会被 noteTerminalOutputRendered 清零。
     terminalServerScrollbackResyncPendingRef.current = true;
     terminalLastServerScrollbackResyncAtRef.current = now;
@@ -1291,7 +1290,7 @@ export function TerminalPane(props: TerminalPaneProps) {
       return;
     }
     if (event.deltaY < 0) {
-      // 中文注释：supervisor attach 的实时输出可能只是全屏 repaint，Ghostty 本地 baseY 仍为 0；
+      // 中文注释：supervisor attach 的实时输出可能只是全屏 repaint，本地终端 baseY 仍为 0；
       // 用户向上滚就是明确的“我要历史”信号，此时主动拉一次 daemon/supervisor snapshot。
       event.preventDefault();
       event.stopPropagation();
@@ -1370,8 +1369,8 @@ export function TerminalPane(props: TerminalPaneProps) {
       }
       lastCursorReportAtRef.current = nowForThrottle();
 
-      // Ghostty 内部 cursorX/cursorY 是 0-based；协议用 1-based，便于顶部状态条直接展示。
-      // jsdom 测试环境不会完整实现 Ghostty buffer，缺失时用 1:1 兜底，不影响浏览器真实值。
+      // xterm 内部 cursorX/cursorY 是 0-based；协议用 1-based，便于顶部状态条直接展示。
+      // jsdom 测试环境不会完整实现终端 buffer，缺失时用 1:1 兜底，不影响浏览器真实值。
       const activeBuffer = terminal.buffer?.active;
       onCursorChangeRef.current({
         row: activeBuffer ? activeBuffer.cursorY + 1 : 1,
@@ -1516,9 +1515,9 @@ export function TerminalPane(props: TerminalPaneProps) {
       searchAddonRef.current?.clearDecorations();
       return;
     }
-    // daemon 搜索负责跨 snapshot 的结果数量和目标行；Ghostty canvas 暂不暴露文本
+    // daemon 搜索负责跨 snapshot 的结果数量和目标行；canvas 终端本身不暴露文本
     // decoration API，因此可见反馈由 React 层的搜索结果浮层承担。renderer search hook
-    // 只保留为可选扩展点，当前 Ghostty adapter 是 no-op。
+    // 只保留为可选扩展点，当前 renderer adapter 是 no-op。
     if (direction === "previous") {
       searchAddonRef.current?.findPrevious(trimmed, TERMINAL_SEARCH_OPTIONS);
       return;
@@ -1875,7 +1874,7 @@ export function TerminalPane(props: TerminalPaneProps) {
     }
     const generation = terminalSnapshotRedrawGenerationRef.current + 1;
     terminalSnapshotRedrawGenerationRef.current = generation;
-    // 中文注释：snapshot 刚写完时 Ghostty 还会补一到两帧 repaint/fit；等稳定帧后再露出 canvas，
+    // 中文注释：snapshot 刚写完时终端还会补一到两帧 repaint/fit；等稳定帧后再露出 canvas，
     // 避免刷新时肉眼看到旧 80x24 画面闪一下。
     scheduleDeferredTerminalFrame(() => {
       scheduleDeferredTerminalFrame(() => {
@@ -1907,7 +1906,7 @@ export function TerminalPane(props: TerminalPaneProps) {
     const rect = canvas.getBoundingClientRect();
     if (rect.width <= 0 || rect.height <= 0) {
       // 中文注释：jsdom / 测试桩里 canvas 没有真实布局尺寸；此时只要事件目标还在
-      // terminal host 内，就把它当成命中了 Ghostty 文字层，保持与真实浏览器一致的聚焦语义。
+      // terminal host 内，就把它当成命中了终端文字层，保持与真实浏览器一致的聚焦语义。
       return true;
     }
     return (
@@ -1917,24 +1916,6 @@ export function TerminalPane(props: TerminalPaneProps) {
       clientY <= rect.bottom
     );
   };
-  const hitGhosttyScrollbarGutterAtPoint = (clientX: number, clientY: number) => {
-    const host = hostRef.current;
-    const canvas = host?.querySelector("canvas");
-    const rect = canvas?.getBoundingClientRect();
-    if (!host || !rect || rect.width <= 0 || rect.height <= 0) {
-      return false;
-    }
-    if (Number.parseFloat(host.dataset.termdScrollbackLength ?? "0") <= 0) {
-      return false;
-    }
-    return (
-      clientX >= rect.right - GHOSTTY_SCROLLBAR_GUTTER_PX &&
-      clientX <= rect.right &&
-      clientY >= rect.top &&
-      clientY <= rect.bottom
-    );
-  };
-
   const hasActiveTerminalFocus = () => focusedRef.current && windowActiveRef.current;
   const terminalDomHasActiveFocus = () => {
     const terminalHost = hostRef.current;
@@ -1988,7 +1969,7 @@ export function TerminalPane(props: TerminalPaneProps) {
       return;
     }
     terminal?.focus();
-    // 中文注释：ghostty-web 的真实键盘/IME 输入最终要落到隐藏 textarea；
+    // 中文注释：桌面键盘/IME 输入最终要落到隐藏 textarea；
     // host 只保留给可访问性、selection 和 resize 状态，不作为桌面输入终点。
     try {
       input.focus({ preventScroll: true });
@@ -2005,9 +1986,6 @@ export function TerminalPane(props: TerminalPaneProps) {
       return;
     }
     if (hitCanvas) {
-      if (hitGhosttyScrollbarGutterAtPoint(event.clientX, event.clientY)) {
-        return;
-      }
     }
     if (terminalSelectionDragRef.current?.active || terminalSelectionFocusPendingRef.current) {
       return;
@@ -2050,7 +2028,7 @@ export function TerminalPane(props: TerminalPaneProps) {
         activeElement instanceof HTMLSelectElement)
     ) {
       // 延迟 focusRequest 不能抢走用户刚聚焦的工作台工具栏、菜单、文件面板等控件；
-      // session/daemon 重命名、路径输入、连接表单也属于显式文本编辑，同样不能被 Ghostty 抢焦点。
+      // session/daemon 重命名、路径输入、连接表单也属于显式文本编辑，同样不能被终端抢焦点。
       // 否则移动端键盘常驻会破坏顶部工具按钮的键盘/辅助技术操作。
       if (requestId !== undefined && pendingFocusRequestRef.current === requestId) {
         pendingFocusRequestRef.current = undefined;
@@ -2112,23 +2090,6 @@ export function TerminalPane(props: TerminalPaneProps) {
             });
             return;
           }
-          if (
-            canvasRect &&
-            canvasRect.width > 0 &&
-            canvasRect.height > 0 &&
-            Number.parseFloat(host.dataset.termdScrollbackLength ?? "0") > 0 &&
-            event.clientX >= canvasRect.right - GHOSTTY_SCROLLBAR_GUTTER_PX
-          ) {
-            updateTerminalSelectionDebug({
-              selectionNativeMouseDownTarget: target?.tagName.toLowerCase() ?? undefined,
-              selectionNativeMouseDownScrollbarGutter: "true",
-              selectionNativeMouseDownStarted: "false",
-            });
-            event.preventDefault();
-            event.stopPropagation();
-            event.stopImmediatePropagation();
-            return;
-          }
           windowActiveRef.current = true;
           focusActivationArmedRef.current = true;
           suppressPassiveFocusRef.current = false;
@@ -2142,8 +2103,8 @@ export function TerminalPane(props: TerminalPaneProps) {
             stabilizeRef.current?.("focus");
             return;
           }
-          // 中文注释：Ghostty 自己也会在 canvas 上挂鼠标监听；这里必须用原生 capture
-          // 抢在它前面拦截，避免 native selection manager 把拖拽和复制逻辑带偏。
+          // 中文注释：这里使用 capture 抢在 renderer 默认鼠标选区前拦截，
+          // 让自定义拖拽复制与业务选区语义保持一致。
           event.preventDefault();
           event.stopPropagation();
           event.stopImmediatePropagation();
@@ -2154,14 +2115,11 @@ export function TerminalPane(props: TerminalPaneProps) {
           if (!hitTerminalCanvasAtPoint(target, event.clientX, event.clientY)) {
             return;
           }
-          if (hitGhosttyScrollbarGutterAtPoint(event.clientX, event.clientY)) {
-            return;
-          }
           const drag = terminalSelectionDragRef.current;
           if (!drag?.active || drag.dragging || !terminalSelectionFocusPendingRef.current) {
             return;
           }
-          // 中文注释：Ghostty 文字层可能拦截冒泡阶段 click；对于这种“按下后没有拖拽、
+          // 中文注释：终端文字层可能拦截冒泡阶段 click；对于这种“按下后没有拖拽、
           // 但 click 仍然落在终端内容上”的情况，需要在 capture 阶段直接补回焦点。
           // 同时清掉待选区状态，避免测试桩或极端浏览器时序里遗漏 mouseup 后遗留脏监听。
           clearTerminalSelectionDrag();
@@ -2291,7 +2249,7 @@ export function TerminalPane(props: TerminalPaneProps) {
     });
     const helperTextarea = renderer.getInputElement(host);
     if (helperTextarea) {
-      // 中文注释：真实 Ghostty 会同时让 host 和隐藏 textarea 具备输入能力；
+      // 中文注释：真实终端会同时让 host 和隐藏 textarea 具备输入能力；
       // 对用户和 Playwright role locator 来说，外层 host 才是唯一可见终端输入框。
       helperTextarea.setAttribute("aria-hidden", "true");
     }
@@ -2349,7 +2307,7 @@ export function TerminalPane(props: TerminalPaneProps) {
         return;
       }
 
-      // iOS/Safari 软键盘有时只给 beforeinput，不走 Ghostty 的 keydown/keypress。
+      // iOS/Safari 软键盘有时只给 beforeinput，不走 renderer 的 keydown/keypress。
       // 对移动端非组合文本做兜底，并阻止后续 input，避免同一份内容发送两次。
       event.preventDefault();
       event.stopPropagation();
@@ -2497,10 +2455,10 @@ export function TerminalPane(props: TerminalPaneProps) {
         return;
       }
       markTerminalClipboardSelectionOwner();
-      // Ghostty 原生选择完成后同步复制到系统剪贴板；复制失败时不打断终端交互。
+      // 终端原生选择完成后同步复制到系统剪贴板；复制失败时不打断终端交互。
       copyCurrentTerminalSelection({ selectionOverride: selection });
     });
-    // 本地 Ghostty 只有在当前浏览器窗口聚焦终端时才把尺寸写回 shared PTY。
+    // 本地终端只有在当前浏览器窗口聚焦终端时才把尺寸写回 shared PTY。
     // 未聚焦客户端按 daemon 确认的 session rows/cols 渲染，不再做本地等比缩放。
     const resize = (source: ResizeSource = "layout") => {
       if (snapshotRedrawInProgressRef.current) {
@@ -2509,12 +2467,12 @@ export function TerminalPane(props: TerminalPaneProps) {
           source === "mobile-viewport" ||
           (source === "layout" && hasActiveTerminalFocus())
         ) {
-          // 中文注释：snapshot 字节写入期间不能改变 Ghostty 尺寸；但用户主动聚焦/窗口变化
+          // 中文注释：snapshot 字节写入期间不能改变终端尺寸；但用户主动聚焦/窗口变化
           // 不能丢，等 snapshot 渲染完成后再补一次真实 resize 上报。
           pendingResizeAfterSnapshotRef.current = source;
         }
         // 中文注释：snapshot 字节按生成时的列宽解释；写入完成前禁止 layout/session resize
-        // 把 Ghostty 改回旧尺寸，否则宽行换行和光标位置会被错误解析。
+        // 把终端改回旧尺寸，否则宽行换行和光标位置会被错误解析。
         return;
       }
       const terminalHost = hostRef.current;
@@ -2595,7 +2553,7 @@ export function TerminalPane(props: TerminalPaneProps) {
           proposed.rows >= MIN_FOCUSED_RESIZE_ROWS &&
           proposed.cols >= MIN_FOCUSED_RESIZE_COLS
         ) {
-          // 中文注释：snapshot 后仍要把本地 Ghostty 贴合当前容器，避免内容停在旧高度；
+          // 中文注释：snapshot 后仍要把本地终端贴合当前容器，避免内容停在旧高度；
           // 但这是被动重绘，不能回写 daemon，否则不同分辨率客户端会形成 resize/snapshot 风暴。
           maybeBeginTerminalResizeStabilizationMask(terminal, proposed);
           if (!sameTerminalDimensions(terminal, proposed)) {
@@ -2616,7 +2574,7 @@ export function TerminalPane(props: TerminalPaneProps) {
           // output/snapshot 仍会按旧列宽解释，vim/top 这类全屏界面会直接错位。
           terminal.resize(remoteSize.cols, remoteSize.rows);
         }
-        // 中文注释：窗口失焦后的 layout/blur 抖动不能把本地 Ghostty 立即缩回远端尺寸。
+        // 中文注释：窗口失焦后的 layout/blur 抖动不能把本地终端立即缩回远端尺寸。
         // 只有 daemon/supervisor 真的确认了新的 sessionSize，未聚焦客户端才跟随权威 grid；
         // 否则回到页面时会先看到一次旧 grid/旧布局，再被 focus resize 拉回当前容器。
         scheduleScrollToBottomIfPinned(wasPinnedToBottom);
@@ -2624,7 +2582,7 @@ export function TerminalPane(props: TerminalPaneProps) {
         return;
       }
       applyFontSize(terminal, currentTerminalFontSize());
-      // 移动端软键盘或外层 grid 短暂重排时可能把 Ghostty 容器压到 0 高。
+      // 移动端软键盘或外层 grid 短暂重排时可能把终端容器压到 0 高。
       // 这种尺寸不能写回 shared PTY，否则其他客户端会被同步成一行终端。
       if (proposed && proposed.rows >= MIN_FOCUSED_RESIZE_ROWS && proposed.cols >= MIN_FOCUSED_RESIZE_COLS) {
         const nextResizeKey = `${proposed.rows}:${proposed.cols}`;
@@ -2653,7 +2611,7 @@ export function TerminalPane(props: TerminalPaneProps) {
           return;
         }
         // 只有拥有本地 resize 权限时才向 daemon 请求新尺寸。这里把本地 fit 也放进
-        // 同一条稳定帧通道里，避免 reload/focus 期间把临时测量先写进 Ghostty。
+        // 同一条稳定帧通道里，避免 reload/focus 期间把临时测量先写进终端。
         maybeBeginTerminalResizeStabilizationMask(terminal, proposed);
         if (!sameTerminalDimensions(terminal, proposed)) {
           fit.fit();
@@ -2670,7 +2628,7 @@ export function TerminalPane(props: TerminalPaneProps) {
       syncTerminalInputAnchor(terminal, "refresh");
     };
     const stabilizeTerminal = (source: ResizeSource = "layout") => {
-      // Ghostty 在 CSS grid / 右侧文件 panel 同步变化时可能先按旧尺寸完成 open/write。
+      // 终端在 CSS grid / 右侧文件 panel 同步变化时可能先按旧尺寸完成 open/write。
       // 连续两帧刷新可以等浏览器完成布局后再重算 viewport；同一轮内的 focus、
       // ResizeObserver 和 snapshot 回调必须合并，否则会把刷新时的临时尺寸反复写回 PTY。
       const currentSource = terminalStabilizeSourceRef.current;
@@ -2831,7 +2789,7 @@ export function TerminalPane(props: TerminalPaneProps) {
     rendererRef.current = renderer;
     outputResetVersionRef.current = props.outputResetVersion;
     const confirmOutputReset = () => onOutputResetAppliedRef.current?.(props.outputResetVersion);
-    // 测试桩可以延迟 reset 确认，用来覆盖“新 snapshot 必须等 Ghostty reset 完成后才能消费”的竞态。
+    // 测试桩可以延迟 reset 确认，用来覆盖“新 snapshot 必须等 terminal reset 完成后才能消费”的竞态。
     const deferOutputResetApplied = (globalThis as {
       __TERMD_TEST_DEFER_OUTPUT_RESET_APPLIED__?: (confirm: () => void) => void;
     }).__TERMD_TEST_DEFER_OUTPUT_RESET_APPLIED__;
@@ -2841,7 +2799,7 @@ export function TerminalPane(props: TerminalPaneProps) {
       confirmOutputReset();
     }
     markWriterNeedsRefreshAndScroll();
-    // attach 输出可能早于 Ghostty 初始化到达；创建实例时先取走待写队列，避免首屏输出丢失。
+    // attach 输出可能早于终端初始化到达；创建实例时先取走待写队列，避免首屏输出丢失。
     drainOutputRef.current = drainOutput;
     drainOutput();
     queueCursorReport({ immediate: true });
@@ -2850,7 +2808,7 @@ export function TerminalPane(props: TerminalPaneProps) {
     // 初次 attach 只做本地 fit；用户聚焦该终端时才接管 shared PTY 的远端尺寸。
     stabilizeTerminal();
     if (terminalDomHasActiveFocus()) {
-      // 中文注释：reload 后用户或测试可能在 Ghostty canvas mount 前已经把焦点放到 host；
+      // 中文注释：reload 后用户或测试可能在 canvas mount 前已经把焦点放到 host；
       // renderer 就绪后必须补一次 focus resize，否则 daemon/supervisor 会继续停在旧 snapshot 尺寸。
       reportTerminalFocus(true);
       stabilizeTerminal("focus");
@@ -2960,9 +2918,9 @@ export function TerminalPane(props: TerminalPaneProps) {
       cleanupTerminalSelectionNativeListeners?.();
       cleanupTerminalSelectionNativeListeners = undefined;
       terminal.dispose();
-      // 清理 host 里的旧 Ghostty DOM，避免切换 session 后旧终端明文或隐藏 textarea 残留。
+      // 清理 host 里的旧终端 DOM，避免切换 session 后旧终端明文或隐藏 textarea 残留。
       host.replaceChildren();
-      // 中文注释：真实 ghostty-web dispose 不会清理应用层 debug dataset；
+      // 中文注释：真实 renderer dispose 不会清理应用层 debug dataset；
       // 即使该镜像只在 dev/test/E2E 构建启用，detach/reset 后也不能残留旧终端明文。
       delete host.dataset.termdBuffer;
       delete host.dataset.termdCols;
@@ -3025,7 +2983,7 @@ export function TerminalPane(props: TerminalPaneProps) {
         screenReaderMode: false,
         scrollback: 2000,
         smoothScrollDuration: 0,
-        // 中文注释：Ghostty 会把中文等宽字符按 2 个 terminal cells 排版。
+        // 中文注释：xterm 会按 terminal cells 排版；如果主字体不覆盖 CJK，
         // 如果主字体本身不覆盖 CJK，浏览器 fallback 过来的非终端字形往往只占
         // 约 1 个 cell 的视觉宽度，画面就会变成“字字分家”。这里优先使用本机
         // 常见且真实存在的 CJK monospace 字体，保证中英混排在 fresh attach 时也能稳定对齐。
@@ -3053,12 +3011,8 @@ export function TerminalPane(props: TerminalPaneProps) {
     if (!terminal) {
       return;
     }
-    // 中文注释：ghostty-web 运行期换 theme 不会重写 WASM buffer 的颜色。
-    // App 会在 effective theme 变化时触发 full snapshot resync，并通过 outputResetVersion
-    // 重建 Ghostty；这里不再调用 setOptions，避免短暂显示第二套错误颜色和 upstream 警告。
-    if (rendererRef.current?.kind === "ghostty") {
-      return;
-    }
+    // 中文注释：xterm.js 支持运行期原地换 theme；这里直接更新 renderer options，
+    // 不再依赖 outputResetVersion 触发整实例重建。
     rendererRef.current?.setOptions({ theme: terminalTheme(props.theme ?? "dark") });
     terminal.refresh(0, Math.max(0, terminal.rows - 1));
   }, [props.theme]);
@@ -3071,7 +3025,7 @@ export function TerminalPane(props: TerminalPaneProps) {
     if (outputResetVersionRef.current === props.outputResetVersion) {
       return;
     }
-    // session 切换时上面的 terminal effect 会按 outputResetVersion 重建 Ghostty 实例。
+    // session 切换时上面的 terminal effect 会按 outputResetVersion 重建终端实例。
     // 这里仅保留防御式同步清屏：如果未来 effect 条件调整导致实例未重建，也不能残留旧 session 明文。
     recordTermdDiagnostic("terminal_pane_defensive_reset", {
       previousResetVersion: outputResetVersionRef.current,
@@ -3089,7 +3043,7 @@ export function TerminalPane(props: TerminalPaneProps) {
       return undefined;
     }
 
-    // 新建 session 后要直接进入可输入状态；等一帧可以确保 Ghostty 已完成 open/fit，
+    // 新建 session 后要直接进入可输入状态；等一帧可以确保终端已完成 open/fit，
     // focusin 事件随后会由聚焦客户端上报真实 PTY 尺寸。
     pendingFocusRequestRef.current = props.focusRequest;
     const frame = scheduleDeferredTerminalFrame(() => {

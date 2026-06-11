@@ -57,7 +57,7 @@ function fakeRenderer(label: string): TerminalRendererInstance {
   } satisfies TerminalRendererTerminal;
 
   return {
-    kind: "ghostty",
+    kind: "xterm",
     terminal,
     fit: {
       fit: () => undefined,

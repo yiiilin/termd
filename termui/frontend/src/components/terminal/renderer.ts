@@ -1,7 +1,7 @@
 import type { TerminalSize } from "../../protocol/types";
-import { createGhosttyRenderer } from "./ghostty-renderer";
+import { createXtermRenderer } from "./xterm-renderer";
 
-export type TerminalRendererKind = "ghostty";
+export type TerminalRendererKind = "xterm";
 
 export interface TerminalRendererDisposable {
   dispose(): void;
@@ -95,9 +95,9 @@ export interface CreateTerminalRendererOptions {
 export function createTerminalRendererInstance(
   options: CreateTerminalRendererOptions,
 ): TerminalRendererInstance | Promise<TerminalRendererInstance> {
-  // 中文注释：Web 客户端现在只有 Ghostty renderer；如果 Ghostty WASM 加载失败，
-  // 应直接暴露启动错误，避免静默回退到另一套终端语义。
-  return createGhosttyRenderer(options);
+  // 中文注释：Web 客户端现在只保留 xterm.js renderer，不再保留旧 renderer fallback
+  // 或双栈分支，避免终端语义继续分裂。
+  return createXtermRenderer(options);
 }
 
 export function sameTerminalDimensions(

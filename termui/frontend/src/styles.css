@@ -1627,42 +1627,48 @@ label {
   inset: var(--terminal-frame-padding);
   min-width: 0;
   min-height: 0;
+  max-width: 100%;
+  max-height: 100%;
   padding: 0;
   overflow: hidden;
   background: var(--color-terminal-bg);
   caret-color: transparent;
 }
 
-.terminal-host[contenteditable="true"]:focus {
-  /* 中文注释：Ghostty 已在 canvas 内绘制终端光标；浏览器 contenteditable 的原生光标会固定在 host 左上角，必须彻底隐藏。 */
+.terminal-host:focus,
+.terminal-host:focus-within {
+  /* 中文注释：终端光标由 renderer 绘制；host 和 helper textarea 的浏览器原生光标都要隐藏。 */
   outline: none;
   caret-color: transparent !important;
 }
 
-.terminal-host canvas {
+.terminal-host .xterm,
+.terminal-host .xterm-screen,
+.terminal-host .xterm-viewport {
+  width: 100%;
+  height: 100%;
+}
+
+.terminal-host .xterm-viewport {
+  overflow-y: auto;
+  overflow-x: hidden;
+  scrollbar-gutter: stable;
+}
+
+.terminal-host .xterm-screen canvas {
   display: block;
   background: var(--color-terminal-bg);
 }
 
-.terminal-host[data-termd-snapshot-redraw="true"] canvas,
-.terminal-host[data-termd-resize-stabilizing="true"] canvas {
+.terminal-host[data-termd-snapshot-redraw="true"] .xterm-screen canvas,
+.terminal-host[data-termd-resize-stabilizing="true"] .xterm-screen canvas {
   /* 中文注释：snapshot 会先按 daemon 旧尺寸重放历史；刷新期间先隐藏 canvas，
-     等 Ghostty 按本地容器重新 fit 后再显示，避免 80x24 中间态闪屏。 */
+     等 xterm 按本地容器重新 fit 后再显示，避免 80x24 中间态闪屏。 */
   visibility: hidden;
 }
 
-.terminal-host-grid-filler {
-  /* 中文注释：不足一列的右侧余量只补终端背景，不能拉伸 canvas，否则字体会被浏览器重采样而发虚。 */
-  position: absolute;
-  top: 0;
-  right: 0;
-  bottom: 0;
-  pointer-events: none;
-  background: var(--color-terminal-bg);
-}
-
 .terminal-host textarea[aria-label="Terminal input"] {
-  /* 中文注释：Ghostty 的 helper textarea 需要保留 focus/paste/IME 能力，但不能继承全局表单 textarea 的 70px 高度。 */
+  /* 中文注释：helper textarea 需要保留 focus/paste/IME 能力，但不能继承全局表单 textarea 的 70px 高度。 */
   min-width: 0 !important;
   min-height: 0 !important;
   padding: 0 !important;
@@ -3329,7 +3335,7 @@ label {
   }
 
   .terminal-host textarea[aria-label="Terminal input"] {
-    /* 中文注释：Ghostty 会按光标或选择位置移动这个 textarea，IME 候选窗和系统复制/粘贴菜单都依赖它的坐标。 */
+    /* 中文注释：renderer 会按光标或选择位置移动这个 textarea，IME 候选窗和系统复制/粘贴菜单都依赖它的坐标。 */
     caret-color: transparent;
     min-width: 0 !important;
     min-height: 0 !important;

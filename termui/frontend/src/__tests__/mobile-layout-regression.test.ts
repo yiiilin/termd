@@ -3,7 +3,7 @@ import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 
 describe("mobile layout regressions", () => {
-  it("clamps the terminal pane and Ghostty host so mobile width cannot overflow the viewport", () => {
+  it("clamps the terminal pane and xterm host so mobile width cannot overflow the viewport", () => {
     const css = readFileSync(resolve(process.cwd(), "src/styles.css"), "utf8");
 
     expect(css).toContain(".toolbar-actions {\n    display: none;");
@@ -12,13 +12,11 @@ describe("mobile layout regressions", () => {
     expect(css).toContain(".app-shell.mobile-keyboard-open .workspace {\n    grid-template-rows: 42px minmax(0, 1fr);");
     expect(css).toContain(".app-shell.mobile-keyboard-open .daemon-status-strip {\n    display: none;");
     expect(css).toContain(".terminal-host {\n    min-width: 0;\n    overflow: hidden;\n    max-width: 100%;");
-    const terminalCanvasBlock = css.match(/\.terminal-host canvas \{[^}]+\}/)?.[0] ?? "";
+    expect(css).toContain(".terminal-host .xterm,\n.terminal-host .xterm-screen,\n.terminal-host .xterm-viewport {\n  width: 100%;\n  height: 100%;");
+    const terminalCanvasBlock = css.match(/\.terminal-host \.xterm-screen canvas \{[^}]+\}/)?.[0] ?? "";
     expect(terminalCanvasBlock).toContain("display: block;");
-    // 中文注释：Ghostty canvas 不能被 CSS 缩放；移动端只裁剪 host，不给 canvas 加尺寸约束。
-    expect(terminalCanvasBlock).not.toMatch(/\b(?:width|height|max-width|max-height|transform):/);
+    expect(terminalCanvasBlock).toContain("background: var(--color-terminal-bg);");
     expect(css).not.toContain(".terminal-host,\n  .terminal-host canvas");
-    const fillerBlock = css.match(/\.terminal-host-grid-filler \{[^}]+\}/)?.[0] ?? "";
-    expect(fillerBlock).toContain("pointer-events: none;");
     expect(css).toContain('.terminal-host textarea[aria-label="Terminal input"]');
     expect(css).toContain(".daemon-cpu-bar-chart {\n    display: none;");
     expect(css).toContain("minmax(124px, 1.25fr);");
@@ -30,7 +28,7 @@ describe("mobile layout regressions", () => {
     expect(helperTextareaBlock).toContain("caret-color: transparent !important;");
     expect(helperTextareaBlock).not.toContain("position: fixed !important;");
     expect(helperTextareaBlock).not.toContain("width: 1px !important;");
-    const hostFocusBlock = css.match(/\.terminal-host\[contenteditable="true"\]:focus \{[^}]+\}/)?.[0] ?? "";
+    const hostFocusBlock = css.match(/\.terminal-host:focus,\n\.terminal-host:focus-within \{[^}]+\}/)?.[0] ?? "";
     expect(hostFocusBlock).toContain("outline: none;");
     expect(hostFocusBlock).toContain("caret-color: transparent !important;");
   });

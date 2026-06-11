@@ -66,7 +66,7 @@ export function useTerminalFocusResizeState() {
       if (!focusedRef.current || focusOutTimerRef.current !== undefined) {
         return;
       }
-      // 浏览器窗口 resize、移动端视觉视口变化和 Ghostty 内部重排都可能短暂触发
+      // 浏览器窗口 resize、移动端视觉视口变化和 xterm 内部重排都可能短暂触发
       // focusout -> focusin。延迟确认失焦，避免把这种瞬时 DOM 抖动上报成
       // operator 在 focused/blurred 之间来回切换。
       focusOutTimerRef.current = window.setTimeout(() => {

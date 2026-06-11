@@ -1579,7 +1579,7 @@ export class DirectClient {
       if (this.pendingTerminalStreamIds.has(packet.stream_id)) {
         // 中文注释：terminal.create 的 session_id 要等 response 才知道，但 daemon 可能已经
         // 按同一个 stream_id 推了首屏 snapshot/output。这里按 stream_id 暂存，response 绑定
-        // session 后 receive loop 会按 payload.session_id 交给当前 Ghostty。
+        // session 后 receive loop 会按 payload.session_id 交给当前 xterm。
         this.pendingTerminalStreamLastOutputSeq.set(packet.stream_id, seq);
         this.enqueueTerminalStreamPayload(packet, seq);
         return;
