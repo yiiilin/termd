@@ -420,6 +420,21 @@ function ghosttySelectViewportRange(
   return ghosttySelectionTextFromAbsoluteRange(terminal, range);
 }
 
+function ghosttyClearSelection(terminal: GhosttySelectionTerminal): void {
+  const selectionManager = terminal.selectionManager;
+  if (selectionManager) {
+    // 中文注释：先清 selectionManager，再触发 public deselect()。
+    // 否则 onSelectionChange 若先于 manager 清理触发，facade.hasSelection() 仍会看到旧选区。
+    selectionManager.clearSelection?.();
+    selectionManager.selectionStart = undefined;
+    selectionManager.selectionEnd = undefined;
+    selectionManager.markCurrentSelectionDirty?.();
+    selectionManager.requestRender?.();
+  }
+  terminal.deselect?.();
+  terminal.requestRender?.();
+}
+
 function syncGhosttyCanvasFiller(terminal: InstanceType<typeof Terminal>): void {
   const element = terminal.element;
   const hideFiller = () => {
@@ -660,6 +675,9 @@ function adaptGhosttyTerminal(
       if (terminal.hasSelection()) {
         return true;
       }
+      if (selectionTerminal.selectionManager?.selectionStart && selectionTerminal.selectionManager.selectionEnd) {
+        return true;
+      }
       const selection = selectionTerminal.getSelectionPosition?.();
       return Boolean(selection && (selection.start.x !== selection.end.x || selection.start.y !== selection.end.y));
     },
@@ -669,7 +687,7 @@ function adaptGhosttyTerminal(
     selectViewportRange: (start, end) => ghosttySelectViewportRange(selectionTerminal, start, end),
     getViewportRangeText: (start, end) => ghosttyViewportRangeText(selectionTerminal, start, end),
     deselect: () => {
-      selectionTerminal.deselect?.();
+      ghosttyClearSelection(selectionTerminal);
     },
     open: (parent) => {
       terminal.open(parent);

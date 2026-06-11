@@ -123,6 +123,21 @@ vi.mock("ghostty-web", () => {
     private selectionPosition: { start: { x: number; y: number }; end: { x: number; y: number } } | undefined;
     private absoluteCursorY = 0;
     private allLines: string[] = [""];
+    public selectionManager = {
+      selectionStart: undefined as { col: number; absoluteRow: number } | undefined,
+      selectionEnd: undefined as { col: number; absoluteRow: number } | undefined,
+      clearSelection: () => {
+        this.selectionManager.selectionStart = undefined;
+        this.selectionManager.selectionEnd = undefined;
+      },
+      markCurrentSelectionDirty: () => undefined,
+      requestRender: () => undefined,
+      selectionChangedEmitter: {
+        fire: () => {
+          this.selectionChangeListeners.forEach((listener) => listener());
+        },
+      },
+    };
     public buffer = { active: { cursorY: 0, cursorX: 0, viewportY: 0, baseY: 0, length: 24 } };
     public wasmTerm = {
       scrollbackLength: 0,
@@ -217,6 +232,7 @@ vi.mock("ghostty-web", () => {
         forceSelectionPosition: (position: { start: { x: number; y: number }; end: { x: number; y: number } } | undefined) => void;
       } }).__TERMD_TEST_GHOSTTY__ = {
         select: (text: string) => {
+          this.selectionManager.clearSelection();
           this.selection = text;
           this.selectionPosition = {
             start: { x: 0, y: 0 },
@@ -225,6 +241,7 @@ vi.mock("ghostty-web", () => {
           this.selectionChangeListeners.forEach((listener) => listener());
         },
         deselect: () => {
+          this.selectionManager.clearSelection();
           this.selection = "";
           this.selectionPosition = undefined;
           this.selectionChangeListeners.forEach((listener) => listener());
@@ -429,6 +446,8 @@ vi.mock("ghostty-web", () => {
     }
 
     hasSelection() {
+      // 中文注释：public hasSelection() 故意只反映 Ghostty 原生字符串选区，
+      // 这样测试才能覆盖 production facade 对 selectionManager-only 选区的兜底逻辑。
       return this.selection.length > 0;
     }
 
@@ -437,6 +456,7 @@ vi.mock("ghostty-web", () => {
     }
 
     select(column: number, row: number, length: number) {
+      this.selectionManager.clearSelection();
       this.selection = "x".repeat(Math.max(0, length));
       const forcedSelectionPosition = (globalThis as {
         __TERMD_TEST_FORCE_SELECTION_POSITION__?: { start: { x: number; y: number }; end: { x: number; y: number } };
@@ -449,6 +469,7 @@ vi.mock("ghostty-web", () => {
     }
 
     deselect() {
+      this.selectionManager.clearSelection();
       this.selection = "";
       this.selectionPosition = undefined;
       this.selectionChangeListeners.forEach((listener) => listener());

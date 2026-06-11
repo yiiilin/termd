@@ -172,6 +172,12 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
+async function flushPasteShortcutFallbackTick() {
+  await act(async () => {
+    await new Promise((resolve) => window.setTimeout(resolve, 0));
+  });
+}
+
 function searchResult(query: string, matchCount: number): SessionSearchResultPayload {
   return {
     session_id: "00000000-0000-0000-0000-000000000401",
@@ -904,6 +910,323 @@ describe("TerminalPane terminal sequence rendering", () => {
 
     expect(copyShortcut.defaultPrevented).toBe(false);
     expect(clipboardWriteTextMock).not.toHaveBeenCalled();
+  });
+
+  it("已有 Ghostty 选区时，点击终端内其他位置会取消选区", async () => {
+    renderTerminalPaneWithOutput([
+      { kind: "snapshot", bytes: new TextEncoder().encode("selection-clear-line\n"), baseSeq: 0, size: DEFAULT_TERMINAL_SIZE },
+    ]);
+
+    await waitFor(() => expect(terminalHost().dataset.buffer).toContain("selection-clear-line"));
+    const Ghostty = (globalThis as {
+      __TERMD_TEST_GHOSTTY__?: { select: (text: string) => void };
+    }).__TERMD_TEST_GHOSTTY__;
+    const frame = screen.getByTestId("terminal-pane").querySelector<HTMLElement>(".terminal-frame");
+    expect(frame).not.toBeNull();
+
+    Ghostty?.select("selection-clear-line");
+    await waitFor(() => expect(terminalHost().dataset.termdHasSelection).toBe("true"));
+
+    fireEvent.mouseDown(frame!, { clientX: 20, clientY: 20, button: 0 });
+    fireEvent.click(frame!, { clientX: 20, clientY: 20, button: 0 });
+
+    await waitFor(() => expect(terminalHost().dataset.termdHasSelection).toBe("false"));
+    expect(terminalHost().dataset.termdSelection).toBe("");
+  });
+
+  it("selectionManager 持有的 Ghostty 选区也会在终端内点击后清掉", async () => {
+    renderTerminalPaneWithOutput([
+      { kind: "snapshot", bytes: new TextEncoder().encode("selection-manager-line\n"), baseSeq: 0, size: DEFAULT_TERMINAL_SIZE },
+    ]);
+
+    await waitFor(() => expect(terminalHost().dataset.buffer).toContain("selection-manager-line"));
+    const debugGhostty = (window as typeof window & {
+      __TERMD_DEBUG_GHOSTTY__?: {
+        selectViewportRange: (
+          start: { col: number; row: number },
+          end: { col: number; row: number },
+        ) => string | undefined;
+      };
+    }).__TERMD_DEBUG_GHOSTTY__;
+    expect(debugGhostty).toBeDefined();
+    const frame = screen.getByTestId("terminal-pane").querySelector<HTMLElement>(".terminal-frame");
+    expect(frame).not.toBeNull();
+
+    const selection = debugGhostty?.selectViewportRange({ col: 0, row: 0 }, { col: 21, row: 0 });
+    expect(selection).toContain("selection-manager-line");
+    await waitFor(() => expect(terminalHost().dataset.termdHasSelection).toBe("true"));
+
+    fireEvent.mouseDown(frame!, { clientX: 20, clientY: 20, button: 0 });
+    fireEvent.click(frame!, { clientX: 20, clientY: 20, button: 0 });
+
+    await waitFor(() => expect(terminalHost().dataset.termdHasSelection).toBe("false"));
+    expect(terminalHost().dataset.termdSelection).toBe("");
+  });
+
+  it("终端聚焦时 Shift+Insert 会从剪贴板读取并发送粘贴文本", async () => {
+    const onInput = vi.fn();
+    const clipboardDescriptor = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+    const clipboardWriteTextMock = navigator.clipboard.writeText as unknown as ReturnType<typeof vi.fn>;
+    const readTextSpy = vi.fn<() => Promise<string>>(() => Promise.resolve("shift-insert-paste"));
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: {
+        ...navigator.clipboard,
+        writeText: clipboardWriteTextMock,
+        readText: readTextSpy,
+      },
+    });
+
+    try {
+      const takeOutput = vi.fn(() => []);
+      const registerOutputDrain = vi.fn((drain: () => void) => {
+        drain();
+        return () => undefined;
+      });
+      render(
+        <TerminalPane
+          attached
+          sessionSize={DEFAULT_TERMINAL_SIZE}
+          outputResetVersion={0}
+          takeOutput={takeOutput}
+          registerOutputDrain={registerOutputDrain}
+          onInput={onInput}
+          onResize={vi.fn()}
+          onCursorChange={vi.fn()}
+        />,
+      );
+
+      const terminalInput = screen.getByRole("textbox", { name: "Terminal input" });
+      act(() => {
+        terminalInput.focus();
+      });
+
+      const pasteShortcut = new KeyboardEvent("keydown", {
+        key: "Insert",
+        shiftKey: true,
+        bubbles: true,
+        cancelable: true,
+      });
+      document.dispatchEvent(pasteShortcut);
+
+      expect(readTextSpy).not.toHaveBeenCalled();
+      await flushPasteShortcutFallbackTick();
+      await waitFor(() => expect(onInput).toHaveBeenCalledWith("shift-insert-paste"));
+      expect(readTextSpy).toHaveBeenCalledTimes(1);
+      expect(pasteShortcut.defaultPrevented).toBe(false);
+    } finally {
+      if (clipboardDescriptor) {
+        Object.defineProperty(navigator, "clipboard", clipboardDescriptor);
+      }
+    }
+  });
+
+  it("Shift+Insert 读剪贴板失败时仍保留原生 paste 路径", async () => {
+    const onInput = vi.fn();
+    const clipboardDescriptor = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+    const clipboardWriteTextMock = navigator.clipboard.writeText as unknown as ReturnType<typeof vi.fn>;
+    const readTextSpy = vi.fn<() => Promise<string>>(() => Promise.reject(new Error("denied")));
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: {
+        ...navigator.clipboard,
+        writeText: clipboardWriteTextMock,
+        readText: readTextSpy,
+      },
+    });
+
+    try {
+      const takeOutput = vi.fn(() => []);
+      const registerOutputDrain = vi.fn((drain: () => void) => {
+        drain();
+        return () => undefined;
+      });
+      render(
+        <TerminalPane
+          attached
+          sessionSize={DEFAULT_TERMINAL_SIZE}
+          outputResetVersion={0}
+          takeOutput={takeOutput}
+          registerOutputDrain={registerOutputDrain}
+          onInput={onInput}
+          onResize={vi.fn()}
+          onCursorChange={vi.fn()}
+        />,
+      );
+
+      const terminalInput = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
+      expect(terminalInput).not.toBeNull();
+      act(() => {
+        screen.getByRole("textbox", { name: "Terminal input" }).focus();
+      });
+
+      const pasteShortcut = new KeyboardEvent("keydown", {
+        key: "Insert",
+        shiftKey: true,
+        bubbles: true,
+        cancelable: true,
+      });
+      document.dispatchEvent(pasteShortcut);
+
+      expect(readTextSpy).not.toHaveBeenCalled();
+      expect(pasteShortcut.defaultPrevented).toBe(false);
+
+      const pasteEvent = new Event("paste", { bubbles: true, cancelable: true }) as ClipboardEvent;
+      Object.defineProperty(pasteEvent, "clipboardData", {
+        configurable: true,
+        value: {
+          getData: (type: string) => (type === "text" ? "native-fallback-paste" : ""),
+        },
+      });
+      terminalInput!.dispatchEvent(pasteEvent);
+
+      expect(pasteEvent.defaultPrevented).toBe(true);
+      await waitFor(() => expect(onInput).toHaveBeenCalledWith("native-fallback-paste"));
+      await flushPasteShortcutFallbackTick();
+      expect(readTextSpy).not.toHaveBeenCalled();
+    } finally {
+      if (clipboardDescriptor) {
+        Object.defineProperty(navigator, "clipboard", clipboardDescriptor);
+      }
+    }
+  });
+
+  it("Shift+Insert 只在原生链路未消费后才启动 readText 兜底，并避免重复发送", async () => {
+    const onInput = vi.fn();
+    const clipboardDescriptor = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+    const clipboardWriteTextMock = navigator.clipboard.writeText as unknown as ReturnType<typeof vi.fn>;
+    const readTextDeferred = deferred<string>();
+    const readTextSpy = vi.fn<() => Promise<string>>(() => readTextDeferred.promise);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: {
+        ...navigator.clipboard,
+        writeText: clipboardWriteTextMock,
+        readText: readTextSpy,
+      },
+    });
+
+    try {
+      const takeOutput = vi.fn(() => []);
+      const registerOutputDrain = vi.fn((drain: () => void) => {
+        drain();
+        return () => undefined;
+      });
+      render(
+        <TerminalPane
+          attached
+          sessionSize={DEFAULT_TERMINAL_SIZE}
+          outputResetVersion={0}
+          takeOutput={takeOutput}
+          registerOutputDrain={registerOutputDrain}
+          onInput={onInput}
+          onResize={vi.fn()}
+          onCursorChange={vi.fn()}
+        />,
+      );
+
+      const terminalInput = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
+      expect(terminalInput).not.toBeNull();
+      act(() => {
+        screen.getByRole("textbox", { name: "Terminal input" }).focus();
+      });
+
+      const pasteShortcut = new KeyboardEvent("keydown", {
+        key: "Insert",
+        shiftKey: true,
+        bubbles: true,
+        cancelable: true,
+      });
+      document.dispatchEvent(pasteShortcut);
+      expect(readTextSpy).not.toHaveBeenCalled();
+      await flushPasteShortcutFallbackTick();
+      expect(readTextSpy).toHaveBeenCalledTimes(1);
+
+      const pasteEvent = new Event("paste", { bubbles: true, cancelable: true }) as ClipboardEvent;
+      Object.defineProperty(pasteEvent, "clipboardData", {
+        configurable: true,
+        value: {
+          getData: (type: string) => (type === "text" ? "dedup-paste" : ""),
+        },
+      });
+      terminalInput!.dispatchEvent(pasteEvent);
+
+      await waitFor(() => expect(onInput).toHaveBeenCalledWith("dedup-paste"));
+      expect(onInput).toHaveBeenCalledTimes(1);
+
+      await act(async () => {
+        readTextDeferred.resolve("dedup-paste");
+        await Promise.resolve();
+      });
+
+      expect(onInput).toHaveBeenCalledTimes(1);
+    } finally {
+      if (clipboardDescriptor) {
+        Object.defineProperty(navigator, "clipboard", clipboardDescriptor);
+      }
+    }
+  });
+
+  it("Shift+Insert 不会在终端失焦后截走其他输入控件的粘贴", async () => {
+    const onInput = vi.fn();
+    const clipboardDescriptor = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+    const clipboardWriteTextMock = navigator.clipboard.writeText as unknown as ReturnType<typeof vi.fn>;
+    const readTextSpy = vi.fn<() => Promise<string>>(() => Promise.resolve("should-not-paste"));
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: {
+        ...navigator.clipboard,
+        writeText: clipboardWriteTextMock,
+        readText: readTextSpy,
+      },
+    });
+
+    try {
+      const takeOutput = vi.fn(() => []);
+      const registerOutputDrain = vi.fn((drain: () => void) => {
+        drain();
+        return () => undefined;
+      });
+      render(
+        <div>
+          <input data-testid="outside-input" aria-label="outside input" />
+          <TerminalPane
+            attached
+            sessionSize={DEFAULT_TERMINAL_SIZE}
+            outputResetVersion={0}
+            takeOutput={takeOutput}
+            registerOutputDrain={registerOutputDrain}
+            onInput={onInput}
+            onResize={vi.fn()}
+            onCursorChange={vi.fn()}
+          />
+        </div>,
+      );
+
+      act(() => {
+        screen.getByRole("textbox", { name: "Terminal input" }).focus();
+      });
+      act(() => {
+        screen.getByTestId("outside-input").focus();
+      });
+
+      const pasteShortcut = new KeyboardEvent("keydown", {
+        key: "Insert",
+        shiftKey: true,
+        bubbles: true,
+        cancelable: true,
+      });
+      document.dispatchEvent(pasteShortcut);
+
+      await flushPasteShortcutFallbackTick();
+      expect(readTextSpy).not.toHaveBeenCalled();
+      expect(onInput).not.toHaveBeenCalled();
+      expect(pasteShortcut.defaultPrevented).toBe(false);
+    } finally {
+      if (clipboardDescriptor) {
+        Object.defineProperty(navigator, "clipboard", clipboardDescriptor);
+      }
+    }
   });
 
   it("远端 sessionSize 变化不会让已聚焦客户端回写本地尺寸", async () => {

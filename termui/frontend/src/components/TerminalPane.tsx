@@ -175,6 +175,13 @@ export function TerminalPane(props: TerminalPaneProps) {
     repeatCount: number;
   } | undefined>(undefined);
   const lastNativePasteRef = useRef<{ text: string; atMs: number } | undefined>(undefined);
+  const pendingPasteShortcutRef = useRef<{
+    id: number;
+    nativePasteObserved: boolean;
+    fallbackStarted: boolean;
+  } | undefined>(undefined);
+  const pendingPasteShortcutTimerRef = useRef<number | undefined>(undefined);
+  const pasteShortcutSequenceRef = useRef(0);
   const mobileCompositionActiveRef = useRef(false);
   const lastMobileCompositionEndAtRef = useRef(0);
   const currentFontSizeRef = useRef(TERMINAL_FONT_SIZE);
@@ -842,6 +849,17 @@ export function TerminalPane(props: TerminalPaneProps) {
   const clearTerminalClipboardSelectionOwner = () => {
     terminalClipboardSelectionOwnerRef.current = false;
   };
+  const clearCurrentTerminalSelection = () => {
+    const terminal = terminalRef.current;
+    if (!terminal?.hasSelection()) {
+      return false;
+    }
+    terminalSelectionCopyGenerationRef.current += 1;
+    terminal.deselect();
+    clearTerminalClipboardSelectionOwner();
+    updateTerminalSelectionDebug({ selectionCopy: undefined });
+    return true;
+  };
   const copyCurrentTerminalSelection = (
     options: {
       selectionOverride?: string;
@@ -906,6 +924,13 @@ export function TerminalPane(props: TerminalPaneProps) {
       return true;
     }
     return key === "insert" && event.ctrlKey && !event.metaKey;
+  };
+  const isTerminalPasteShortcut = (event: KeyboardEvent) => {
+    const key = event.key.toLowerCase();
+    if (event.altKey || event.ctrlKey || event.metaKey) {
+      return false;
+    }
+    return key === "insert" && event.shiftKey;
   };
   const terminalShouldHandleClipboardEventTarget = (eventTarget: EventTarget | null) => {
     const host = hostRef.current;
@@ -1525,18 +1550,68 @@ export function TerminalPane(props: TerminalPaneProps) {
     sendTerminalControl(text);
   };
 
-  const handlePasteShortcut = async () => {
+  const notePendingPasteShortcutNativePaste = () => {
+    const pendingShortcut = pendingPasteShortcutRef.current;
+    if (!pendingShortcut) {
+      return;
+    }
+    pendingShortcut.nativePasteObserved = true;
+    if (pendingPasteShortcutTimerRef.current !== undefined) {
+      window.clearTimeout(pendingPasteShortcutTimerRef.current);
+      pendingPasteShortcutTimerRef.current = undefined;
+    }
+    if (!pendingShortcut.fallbackStarted) {
+      pendingPasteShortcutRef.current = undefined;
+    }
+  };
+
+  const handlePasteShortcut = async (shortcutId?: number) => {
+    if (shortcutId !== undefined) {
+      const pendingShortcut = pendingPasteShortcutRef.current;
+      if (
+        !pendingShortcut ||
+        pendingShortcut.id !== shortcutId ||
+        pendingShortcut.nativePasteObserved
+      ) {
+        return;
+      }
+      pendingShortcut.fallbackStarted = true;
+    }
     try {
       const text = await navigator.clipboard?.readText?.();
+      if (
+        shortcutId !== undefined &&
+        (
+          !pendingPasteShortcutRef.current ||
+          pendingPasteShortcutRef.current.id !== shortcutId ||
+          pendingPasteShortcutRef.current.nativePasteObserved
+        )
+      ) {
+        return;
+      }
       if (text) {
-        sendTerminalControl(text);
+        sendNativePasteText(text);
       } else {
         focusTerminalInputSink();
       }
     } catch {
       // 剪贴板读取可能被浏览器权限或非安全上下文拒绝；失败时只保持终端焦点。
       focusTerminalInputSink();
+    } finally {
+      if (shortcutId !== undefined && pendingPasteShortcutRef.current?.id === shortcutId) {
+        pendingPasteShortcutRef.current = undefined;
+      }
     }
+  };
+
+  const schedulePasteShortcutFallback = (shortcutId: number) => {
+    if (pendingPasteShortcutTimerRef.current !== undefined) {
+      window.clearTimeout(pendingPasteShortcutTimerRef.current);
+    }
+    pendingPasteShortcutTimerRef.current = window.setTimeout(() => {
+      pendingPasteShortcutTimerRef.current = undefined;
+      void handlePasteShortcut(shortcutId);
+    }, 0);
   };
 
   const sendMobileDirection = (direction: MobileDirection) => {
@@ -1925,22 +2000,25 @@ export function TerminalPane(props: TerminalPaneProps) {
   const focusTerminalFromTerminalClick = (event: MouseEvent<HTMLDivElement>) => {
     const target = event.target instanceof Element ? event.target : null;
     const hitCanvas = hitTerminalCanvasAtPoint(target, event.clientX, event.clientY);
-    if (!hitCanvas && !isTerminalActivationTarget(target)) {
+    const hitActivationTarget = hitCanvas || isTerminalActivationTarget(target);
+    if (!hitActivationTarget) {
       return;
     }
     if (hitCanvas) {
       if (hitGhosttyScrollbarGutterAtPoint(event.clientX, event.clientY)) {
         return;
       }
-      if (terminalSelectionDragRef.current?.active || terminalSelectionFocusPendingRef.current) {
-        return;
-      }
-      if (nowForThrottle() < terminalSelectionClickFocusSuppressUntilRef.current) {
-        return;
-      }
-      if (hasActiveTerminalFocus() || terminalDomHasActiveFocus()) {
-        // 中文注释：已经拥有焦点时，canvas 区域上的 click 不再额外补 focus，
-        // 避免刚完成的鼠标选区被再次聚焦动作清掉。
+    }
+    if (terminalSelectionDragRef.current?.active || terminalSelectionFocusPendingRef.current) {
+      return;
+    }
+    if (nowForThrottle() < terminalSelectionClickFocusSuppressUntilRef.current) {
+      return;
+    }
+    const clearedSelection = clearCurrentTerminalSelection();
+    if (hasActiveTerminalFocus() || terminalDomHasActiveFocus()) {
+      // 中文注释：终端已经有焦点时，普通 click 只需要清掉旧选区，不需要再补一轮 focus。
+      if (clearedSelection || hitCanvas) {
         return;
       }
     }
@@ -2254,33 +2332,32 @@ export function TerminalPane(props: TerminalPaneProps) {
       lastMobileCompositionEndAtRef.current = nowForThrottle();
     };
     const handleMobileBeforeInput = (event: InputEvent) => {
-      if (!mobileInputModeRef.current || event.defaultPrevented || isMobileCompositionInput(event)) {
+      if (event.defaultPrevented || isMobileCompositionInput(event)) {
         return;
       }
-
-      const text =
-        event.inputType === "insertFromPaste" && event.data
-          ? event.data
-          : event.inputType === "insertText" && event.data
-            ? event.data
-            : undefined;
-      if (!text) {
+      if (event.inputType === "insertFromPaste" && event.data) {
+        // 中文注释：桌面和移动端都可能把原生粘贴落成 beforeinput(insertFromPaste)；
+        // 统一在这里接管，并和 readText fallback 共用 sendNativePasteText 去重。
+        event.preventDefault();
+        event.stopPropagation();
+        event.stopImmediatePropagation();
+        notePendingPasteShortcutNativePaste();
+        sendNativePasteText(event.data);
+        return;
+      }
+      if (!mobileInputModeRef.current || event.inputType !== "insertText" || !event.data) {
         return;
       }
 
       // iOS/Safari 软键盘有时只给 beforeinput，不走 Ghostty 的 keydown/keypress。
-      // 对非组合文本和粘贴文本做兜底，并阻止后续 input，避免同一份内容发送两次。
+      // 对移动端非组合文本做兜底，并阻止后续 input，避免同一份内容发送两次。
       event.preventDefault();
       event.stopPropagation();
       event.stopImmediatePropagation();
-      if (event.inputType === "insertFromPaste") {
-        sendNativePasteText(text);
-        return;
-      }
-      sendTerminalControl(text);
+      sendTerminalControl(event.data);
     };
     const handleMobilePaste = (event: ClipboardEvent) => {
-      if (!mobileInputModeRef.current || event.defaultPrevented) {
+      if (event.defaultPrevented) {
         return;
       }
       const text = event.clipboardData?.getData("text");
@@ -2290,6 +2367,7 @@ export function TerminalPane(props: TerminalPaneProps) {
       event.preventDefault();
       event.stopPropagation();
       event.stopImmediatePropagation();
+      notePendingPasteShortcutNativePaste();
       sendNativePasteText(text);
     };
     helperTextarea?.addEventListener("compositionstart", handleMobileCompositionStart, true);
@@ -2338,6 +2416,26 @@ export function TerminalPane(props: TerminalPaneProps) {
       event.stopPropagation();
       event.stopImmediatePropagation();
     };
+    const handleTerminalPasteShortcut = (event: KeyboardEvent) => {
+      if (event.defaultPrevented || !isTerminalPasteShortcut(event)) {
+        return;
+      }
+      // 中文注释：Shift+Insert 只在当前终端真有焦点时接管，避免影响页面其他输入控件。
+      if (!terminalDomHasActiveFocus()) {
+        return;
+      }
+      // 中文注释：这里不阻止默认 paste。浏览器若能把原生粘贴送到隐藏 textarea，
+      // 那条路径兼容性最好；只有当前事件循环结束后仍未看到原生 paste，
+      // 才启动 readText() 兜底，避免 fallback 与原生链路抢跑。
+      pasteShortcutSequenceRef.current += 1;
+      const shortcutId = pasteShortcutSequenceRef.current;
+      pendingPasteShortcutRef.current = {
+        id: shortcutId,
+        nativePasteObserved: false,
+        fallbackStarted: false,
+      };
+      schedulePasteShortcutFallback(shortcutId);
+    };
     const handleTerminalCopyEvent = (event: ClipboardEvent) => {
       if (event.defaultPrevented) {
         return;
@@ -2380,6 +2478,7 @@ export function TerminalPane(props: TerminalPaneProps) {
       updateTerminalClipboardSelectionOwnerFromTarget(event.target);
     };
     document.addEventListener("keydown", handleTerminalCopyShortcut, true);
+    document.addEventListener("keydown", handleTerminalPasteShortcut, true);
     document.addEventListener("copy", handleTerminalCopyEvent, true);
     document.addEventListener("mousedown", handleTerminalClipboardContextMouseDown, true);
     document.addEventListener("focusin", handleTerminalClipboardContextFocusIn, true);
@@ -2843,9 +2942,15 @@ export function TerminalPane(props: TerminalPaneProps) {
       host.removeEventListener("focusin", handleHostFocusBridge, true);
       terminalFrame?.removeEventListener("wheel", handleTerminalWheel, true);
       document.removeEventListener("keydown", handleTerminalCopyShortcut, true);
+      document.removeEventListener("keydown", handleTerminalPasteShortcut, true);
       document.removeEventListener("copy", handleTerminalCopyEvent, true);
       document.removeEventListener("mousedown", handleTerminalClipboardContextMouseDown, true);
       document.removeEventListener("focusin", handleTerminalClipboardContextFocusIn, true);
+      if (pendingPasteShortcutTimerRef.current !== undefined) {
+        window.clearTimeout(pendingPasteShortcutTimerRef.current);
+        pendingPasteShortcutTimerRef.current = undefined;
+      }
+      pendingPasteShortcutRef.current = undefined;
       clearTerminalSelectionDrag();
       dataSubscription.dispose();
       cursorMoveSubscription.dispose();
