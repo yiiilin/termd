@@ -1541,14 +1541,41 @@ async function runTerminalCommand(page: Page, command: string): Promise<void> {
 }
 
 async function focusTerminalForKeyboard(page: Page): Promise<void> {
-  await page.bringToFront();
-  await page.locator(".terminal-frame").click();
-  await expect(page.getByRole("textbox", { name: "Terminal input" })).toBeAttached({ timeout: 8_000 });
-  await page.locator(".terminal-host").evaluate((host) => {
-    const input = host.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
-    // 中文注释：aria-hidden 只避免重复暴露给辅助技术；xterm 的真实键盘输入仍锚定在这个 textarea。
-    input?.focus();
-  });
+  const deadline = Date.now() + 8_000;
+  const terminalSurface = page.locator(".terminal-host .xterm-screen, .terminal-host canvas").first();
+  const terminalInput = page.locator('.terminal-host textarea[aria-label="Terminal input"]').first();
+  while (Date.now() < deadline) {
+    await page.bringToFront();
+    if (await terminalInput.count() === 0) {
+      await page.waitForTimeout(50);
+      continue;
+    }
+    try {
+      // 中文注释：xterm surface 在 snapshot/redraw 窗口可能暂时 hidden；
+      // 单次 click 只给一个很短的 budget，超时后回到外层 deadline 继续重试。
+      await terminalSurface.click({ position: { x: 20, y: 20 }, timeout: 250 });
+    } catch {
+      await page.waitForTimeout(50);
+      continue;
+    }
+    const inputReady = await page.locator(".terminal-host").evaluate(async (host) => {
+      const input = host.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
+      if (!input) {
+        return false;
+      }
+      // 中文注释：Chromium 在多页面 bringToFront + reconnect remount 的组合下，
+      // helper textarea 可能先短暂 focus，随后又在同一拍掉回 BODY。
+      // 这里等待一个小的 settle window，只有稳定留在 activeElement 才允许继续键入。
+      input.focus();
+      await new Promise((resolve) => window.setTimeout(resolve, 32));
+      return document.hasFocus() && document.activeElement === input;
+    });
+    if (inputReady) {
+      return;
+    }
+    await page.waitForTimeout(50);
+  }
+  throw new Error("terminal input sink did not become active");
 }
 
 async function closeCreatedSessions(page: Page, names: string[]): Promise<void> {

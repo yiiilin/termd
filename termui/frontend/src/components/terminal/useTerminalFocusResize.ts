@@ -88,7 +88,7 @@ export function useTerminalFocusResizeState() {
     const handleWindowFocus = () => {
       windowActiveRef.current = true;
       focusActivationArmedRef.current = false;
-      // 回到浏览器窗口不等于用户要接管 PTY；仍需点击终端区域重新激活。
+      // 回到浏览器窗口不等于用户要接管 PTY；没有显式激活动作时仍保持被动聚焦抑制。
       suppressPassiveFocusRef.current = true;
     };
     const handleVisibilityChange = () => {

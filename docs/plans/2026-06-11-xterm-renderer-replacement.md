@@ -57,15 +57,15 @@ Progress must be tracked in this file only:
 
 ## Tasks
 
-- [ ] Task 1: 安装并接入 `xterm.js` 官方依赖，新增 `xterm-renderer.ts`，完整实现 `TerminalRendererInstance` / `TerminalRendererTerminal` / fit / search / scroll state / input anchor 适配层。
-- [ ] Task 2: 用 xterm.js 官方 buffer/selection API 重写当前 Ghostty 私有选区链路，提供 renderer-neutral 的 viewport range text、selection position、clear selection 和 debug bridge。
-- [ ] Task 3: 改造 `renderer.ts` 和 `TerminalPane.tsx`，删除 Ghostty renderer kind 分支、Ghostty 输入说明、Ghostty dispose/theme 假设，收口为 xterm.js 单一路径。
-- [ ] Task 4: 改造 `App.tsx` theme 行为，删除 Ghostty 专属 full snapshot resync 逻辑，改成 xterm.js 原地 theme 更新并验证 attach 会话不抖动。
-- [ ] Task 5: 清理样式层 Ghostty 专有 DOM/CSS 假设，删除 `.terminal-host-grid-filler` 和相关 canvas/layout hack，保留 xterm.js textarea/input 可访问性与移动端 IME 定位需求。
-- [ ] Task 6: 重写 Vitest mock、renderer 单测、TerminalPane/App 测试和 Playwright smoke/real-relay 断言，去掉 `__TERMD_DEBUG_GHOSTTY__`、`selectionManager`、Ghostty wrapper/filler 等假设，补齐 xterm.js 原生选区、theme 热更新、scrollback、输入粘贴回归。
-- [ ] Task 7: 删除 `ghostty-web` 依赖、旧 renderer 文件、旧测试文件和遗留注释，确保生产代码、测试代码、文档注释里不再宣称 Ghostty 是当前 Web renderer。
-- [ ] Task 8: 执行完整验证：前端 typecheck、build、目标 Vitest、全量 Vitest、关键 Playwright smoke；必要时补 direct/relay 浏览器链路验证。
-- [ ] Task 9: 对每个功能任务完成结果做两轮 subagent 审核，所有阻断问题修复后再打勾，最后做一次全局复审。
+- [x] Task 1: 安装并接入 `xterm.js` 官方依赖，新增 `xterm-renderer.ts`，完整实现 `TerminalRendererInstance` / `TerminalRendererTerminal` / fit / search / scroll state / input anchor 适配层。
+- [x] Task 2: 用 xterm.js 官方 buffer/selection API 重写当前 Ghostty 私有选区链路，提供 renderer-neutral 的 viewport range text、selection position、clear selection 和 debug bridge。
+- [x] Task 3: 改造 `renderer.ts` 和 `TerminalPane.tsx`，删除 Ghostty renderer kind 分支、Ghostty 输入说明、Ghostty dispose/theme 假设，收口为 xterm.js 单一路径。
+- [x] Task 4: 改造 `App.tsx` theme 行为，删除 Ghostty 专属 full snapshot resync 逻辑，改成 xterm.js 原地 theme 更新并验证 attach 会话不抖动。
+- [x] Task 5: 清理样式层 Ghostty 专有 DOM/CSS 假设，删除 `.terminal-host-grid-filler` 和相关 canvas/layout hack，保留 xterm.js textarea/input 可访问性与移动端 IME 定位需求。
+- [x] Task 6: 重写 Vitest mock、renderer 单测、TerminalPane/App 测试和 Playwright smoke/real-relay 断言，去掉 `__TERMD_DEBUG_GHOSTTY__`、`selectionManager`、Ghostty wrapper/filler 等假设，补齐 xterm.js 原生选区、theme 热更新、scrollback、输入粘贴回归。
+- [x] Task 7: 删除 `ghostty-web` 依赖、旧 renderer 文件、旧测试文件和遗留注释，确保生产代码、测试代码、文档注释里不再宣称 Ghostty 是当前 Web renderer。
+- [x] Task 8: 执行完整验证：前端 typecheck、build、目标 Vitest、全量 Vitest、关键 Playwright smoke；必要时补 direct/relay 浏览器链路验证。
+- [x] Task 9: 对每个功能任务完成结果做两轮 subagent 审核，所有阻断问题修复后再打勾，最后做一次全局复审。
 
 ## Verification Targets
 
