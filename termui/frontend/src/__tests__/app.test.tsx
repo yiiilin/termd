@@ -3395,6 +3395,77 @@ describe("termui web 工作台", () => {
     expect(screen.getByTestId("terminal-pane")).toBeInTheDocument();
   });
 
+  it("terminal transport 恢复期间输入不会静默丢失，会在重连后补发到当前 session", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await screen.findByText(/termd-e2e-ready/);
+    await waitFor(() => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID]));
+
+    window.dispatchEvent(new Event("offline"));
+    await waitFor(() => expect(daemon.activeConnectionCount()).toBe(0));
+
+    window.dispatchEvent(new Event("online"));
+    const terminalInput = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
+    expect(terminalInput).not.toBeNull();
+    // 中文注释：这里模拟“页面还显示当前 session，但 attach transport 刚断开/正在恢复”时的输入。
+    // App 不能直接 return 掉这段输入，否则 relay 恢复窗口里用户敲下的首条命令会凭空消失。
+    terminalInput!.value = "queued-after-online-reconnect";
+    fireEvent.input(terminalInput!);
+
+    await waitFor(
+      () =>
+        expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID, DEFAULT_SESSION_ID]),
+      { timeout: 2800 },
+    );
+    await waitFor(() => expect(daemon.sessionDataMessages).toContain("queued-after-online-reconnect"));
+  });
+
+  it("focus 和 online 恢复重叠时不会重复 attach 当前 session", async () => {
+    const user = userEvent.setup();
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [
+        {
+          session_id: DEFAULT_SESSION_ID,
+          state: "running",
+          size: { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 },
+        },
+      ],
+      attachOutput: "termd-e2e-ready\n",
+      attachDelayMs: 220,
+    });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await screen.findByText(/termd-e2e-ready/);
+    await waitFor(() => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID]));
+
+    const attachCountBeforeReconnect = daemon.attachRequests.length;
+    daemon.dropConnections();
+    await waitFor(() => expect(daemon.activeConnectionCount()).toBe(0));
+
+    // 中文注释：真实浏览器里 relay/系统恢复可能把 focus、online 等多个恢复入口挤在一起。
+    // 这里只要当前 session 已经在恢复，就不能再发第二次 terminal.attach。
+    fireEvent(window, new Event("focus"));
+    fireEvent(window, new Event("online"));
+
+    await waitFor(
+      () =>
+        expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID, DEFAULT_SESSION_ID]),
+      { timeout: 2800 },
+    );
+    await new Promise((resolve) => window.setTimeout(resolve, 320));
+
+    expect(daemon.attachRequests).toHaveLength(attachCountBeforeReconnect + 1);
+    expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
+    expect(screen.getByTestId("terminal-pane")).toBeInTheDocument();
+  });
+
   it("relay 后台恢复时保持 workspace，不依赖侧栏手动刷新", async () => {
     const user = userEvent.setup();
     render(<App />);

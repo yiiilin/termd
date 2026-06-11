@@ -121,6 +121,7 @@ type AppSurface = "admin" | "workspace";
 
 interface AttachUiOptions {
   closeMobilePanel?: boolean;
+  preservePendingInput?: boolean;
 }
 
 interface MobileTitlePullGesture {
@@ -418,8 +419,12 @@ export default function App() {
   const statusRef = useRef(status);
   const daemonNetworkSampleRef = useRef<DaemonNetworkCounterSample | undefined>(undefined);
   const daemonStatusRefreshInFlightRef = useRef(false);
+  const pendingTerminalInputSessionRef = useRef<UUID | undefined>(undefined);
+  const pendingTerminalInputDataRef = useRef("");
+  const retryConnectionHandlerRef = useRef<(() => Promise<void> | undefined) | undefined>(undefined);
   const daemonStatusRequestSeqRef = useRef(0);
   const daemonClientsRefreshInFlightRef = useRef(false);
+  const retryConnectionTaskRef = useRef<Promise<void> | undefined>(undefined);
   const lastNotificationAtRef = useRef(0);
   const fileEditorResetRef = useRef<() => void>(() => {});
   const isMobileLayout = useMobileLayout();
@@ -790,6 +795,31 @@ export default function App() {
     terminalOutputResetWaitersRef.current.clear();
   }, []);
 
+  const clearPendingTerminalInput = useCallback((sessionId?: UUID) => {
+    if (sessionId !== undefined && pendingTerminalInputSessionRef.current !== sessionId) {
+      return;
+    }
+    pendingTerminalInputSessionRef.current = undefined;
+    pendingTerminalInputDataRef.current = "";
+  }, []);
+
+  const queuePendingTerminalInput = useCallback((sessionId: UUID, data: string) => {
+    if (pendingTerminalInputSessionRef.current !== sessionId) {
+      pendingTerminalInputSessionRef.current = sessionId;
+      pendingTerminalInputDataRef.current = "";
+    }
+    pendingTerminalInputDataRef.current += data;
+  }, []);
+
+  const flushPendingTerminalInput = useCallback(async (client: DirectClient, sessionId: UUID) => {
+    if (pendingTerminalInputSessionRef.current !== sessionId || !pendingTerminalInputDataRef.current) {
+      return;
+    }
+    const bufferedInput = pendingTerminalInputDataRef.current;
+    clearPendingTerminalInput(sessionId);
+    await client.sendSessionData(sessionId, new TextEncoder().encode(bufferedInput));
+  }, [clearPendingTerminalInput]);
+
   const waitForTerminalOutputResetApplied = useCallback((version: number) => {
     if (terminalOutputAppliedResetVersionRef.current >= version) {
       return Promise.resolve();
@@ -851,6 +881,45 @@ export default function App() {
     }
     return true;
   }, [cancelScheduledAttachSwitch, closeAttachClient, pendingTerminalAttachAbortControllerRef]);
+
+  const hasLiveAttachedTransport = useCallback(() => {
+    const client = attachClientRef.current;
+    return Boolean(client && !client.isClosed && attachedSessionRef.current);
+  }, [attachClientRef, attachedSessionRef]);
+
+  const isTerminalRecoveryInProgress = useCallback(() => {
+    if (attachingSessionIdRef.current) {
+      return true;
+    }
+    if (pendingTerminalAttachSessionRef.current || pendingTerminalAttachAbortControllerRef.current) {
+      return true;
+    }
+    if (pendingAttachClientRef.current || attachReconnectTimerRef.current !== undefined) {
+      return true;
+    }
+    // 中文注释：`attachedSessionRef` 只说明“用户还在这条 session 上”，不等于 transport 仍活着。
+    // 一旦 session 还挂着但 attach client 已断开，就属于恢复中的半附着态，不能再把页面
+    // 当成 attached/ready。
+    return Boolean(attachedSessionRef.current && !hasLiveAttachedTransport());
+  }, [
+    attachReconnectTimerRef,
+    attachedSessionRef,
+    attachingSessionIdRef,
+    hasLiveAttachedTransport,
+    pendingAttachClientRef,
+    pendingTerminalAttachAbortControllerRef,
+    pendingTerminalAttachSessionRef,
+  ]);
+
+  const resolveWorkspaceConnectionStatus = useCallback(() => {
+    if (statusRef.current === "creating") {
+      return "creating" as const;
+    }
+    if (isTerminalRecoveryInProgress()) {
+      return "attaching" as const;
+    }
+    return hasLiveAttachedTransport() ? "attached" as const : "ready" as const;
+  }, [hasLiveAttachedTransport, isTerminalRecoveryInProgress]);
 
   const flushTerminalOutput = useCallback(() => {
     terminalOutputFlushFrameRef.current = undefined;
@@ -934,6 +1003,7 @@ export default function App() {
 
   const disconnectAttach = useCallback((options: AttachUiOptions = {}) => {
     const shouldCloseMobilePanel = options.closeMobilePanel ?? true;
+    const preservePendingInput = options.preservePendingInput ?? false;
     recordTermdDiagnostic("app_disconnect_attach", {
       attachedSessionId: attachedSessionRef.current,
       shouldCloseMobilePanel,
@@ -954,6 +1024,9 @@ export default function App() {
       lastRenderedTerminalSeqRef.current.delete(attachedSessionRef.current);
       clearTerminalSnapshotRevealHistory(attachedSessionRef.current);
     }
+    if (!preservePendingInput) {
+      clearPendingTerminalInput(attachedSessionRef.current);
+    }
     attachedSessionRef.current = undefined;
     pendingResizeKeyRef.current = undefined;
     confirmedSessionSizesRef.current.clear();
@@ -970,7 +1043,7 @@ export default function App() {
       setMobilePanel(undefined);
       setMobileMenuOpen(false);
     }
-  }, [cancelScheduledAttachSwitch, clearSessionFiles, clearTerminalOutput, clearTerminalSnapshotRevealHistory, closeAttachClient, resetAttachReconnectState, resolveTerminalOutputResetWaiters]);
+  }, [cancelScheduledAttachSwitch, clearPendingTerminalInput, clearSessionFiles, clearTerminalOutput, clearTerminalSnapshotRevealHistory, closeAttachClient, resetAttachReconnectState, resolveTerminalOutputResetWaiters]);
 
   useEffect(() => {
     if (activeSurface !== "admin" || !attachClientRef.current) {
@@ -1405,14 +1478,8 @@ export default function App() {
       if (!attachedSessionRef.current) {
         clearSessionFiles();
       }
-      if (!attachingSessionIdRef.current) {
-        const nextStatus =
-          statusRef.current === "creating"
-            ? "creating"
-            : attachedSessionRef.current
-              ? "attached"
-              : "ready";
-        setStatus(nextStatus);
+      if (statusRef.current !== "creating") {
+        setStatus(resolveWorkspaceConnectionStatus());
       }
       // 中文注释：session.list 是刷新工作台的提交点。它成功后，即使后续非关键
       // daemon.clients 因 session 切换关闭了同一条 WebSocket，也不能把页面回滚到 admin。
@@ -1448,15 +1515,7 @@ export default function App() {
         // 中文注释：session 切换/自动 attach 会关闭旧 WebSocket。旧的 Refresh
         // 可能正复用这条连接，收到 connection_closed/stale_connection 只能说明它被本地
         // 新 session 连接取代，不能把 workspace 切回 admin。
-        const nextStatus =
-          statusRef.current === "creating"
-            ? "creating"
-            : statusRef.current === "attaching"
-              ? "attaching"
-              : attachedSessionRef.current
-                ? "attached"
-                : "ready";
-        setStatus(nextStatus);
+        setStatus(resolveWorkspaceConnectionStatus());
         return;
       }
       if (
@@ -1466,29 +1525,21 @@ export default function App() {
         // 中文注释：workspace 中已经有当前 session 的 WebSocket 时，session/list 只是旁路 segment。
         // relay 恢复或后台唤醒导致的短超时不能卸载 xterm，也不能升级成全局连接错误；
         // 真实终端断线由 attach receive loop 按长超时重连链路处理。
-        const nextStatus =
-          statusRef.current === "creating"
-            ? "creating"
-            : statusRef.current === "attaching"
-              ? "attaching"
-              : attachedSessionRef.current
-                ? "attached"
-                : "ready";
-        setStatus(nextStatus);
+        setStatus(resolveWorkspaceConnectionStatus());
         return;
       }
       setActiveSurface("admin");
       setSafeError(caught);
     } finally {
     }
-  }, [activeServer?.server_id, authenticatedWorkspaceClient, clearSessionFiles, selectSession, setSafeError]);
+  }, [activeServer?.server_id, authenticatedWorkspaceClient, clearSessionFiles, resolveWorkspaceConnectionStatus, selectSession, setSafeError]);
 
   const refreshDaemonClients = useCallback(
     async () => {
       if (isPagePaused()) {
         return;
       }
-      if (statusRef.current === "creating" || statusRef.current === "attaching") {
+      if (statusRef.current === "creating" || isTerminalRecoveryInProgress()) {
         // 中文注释：terminal.create/attach 是当前工作台的主链路。
         // 后台 session/client 刷新不能在慢 relay 上和终端建连竞争同一条 WebSocket。
         return;
@@ -1579,14 +1630,14 @@ export default function App() {
         daemonClientsRefreshInFlightRef.current = false;
       }
     },
-    [activeServer?.server_id, authenticatedWorkspaceClient],
+    [activeServer?.server_id, authenticatedWorkspaceClient, isTerminalRecoveryInProgress],
   );
 
   const loadDaemonStatus = useCallback(async () => {
     if (isPagePaused()) {
       return;
     }
-    if (statusRef.current === "creating" || statusRef.current === "attaching") {
+    if (statusRef.current === "creating" || isTerminalRecoveryInProgress()) {
       // 中文注释：状态栏是旁路信息；创建/进入终端期间跳过一轮，
       // 避免 RTT/status 请求在低带宽 relay 上排到 terminal.create 前后。
       return;
@@ -1642,7 +1693,7 @@ export default function App() {
         setDaemonStatusLoading(false);
       }
     }
-  }, [activeServer?.server_id, authenticatedWorkspaceClient]);
+  }, [activeServer?.server_id, authenticatedWorkspaceClient, isTerminalRecoveryInProgress]);
 
   const clearNewOutputMark = useCallback((sessionId: UUID) => {
     // 新输出提示只属于本地 UI；用户打开该 session 后立即清除，不回写 daemon。
@@ -1769,6 +1820,7 @@ export default function App() {
     loadSessionGit,
     refreshDaemonClients,
     claimAttachClient,
+    onAttachTransportReady: flushPendingTerminalInput,
     upsertAttachedSession,
   });
 
@@ -1843,6 +1895,12 @@ export default function App() {
       ) {
         return;
       }
+      if (
+        pendingTerminalInputSessionRef.current !== undefined &&
+        pendingTerminalInputSessionRef.current !== sessionId
+      ) {
+        clearPendingTerminalInput();
+      }
       clearTerminalSnapshotRevealHistory(sessionId);
       userDetachedRef.current = false;
     setError(undefined);
@@ -1886,7 +1944,10 @@ export default function App() {
           return;
         }
         reattachCurrentSessionOnOpenRef.current = false;
-        disconnectAttach({ closeMobilePanel: shouldCloseMobilePanel });
+        disconnectAttach({
+          closeMobilePanel: shouldCloseMobilePanel,
+          preservePendingInput: pendingTerminalInputSessionRef.current === sessionId,
+        });
         const resetVersion = clearTerminalOutput();
         attachAbortController = new AbortController();
         pendingTerminalAttachAbortControllerRef.current = attachAbortController;
@@ -1922,6 +1983,7 @@ export default function App() {
         // 到这里 daemon 已确认 attach，先发布 client 和 session id，让 reset 窗口内的键盘输入
         // 能进入正确 stream；输出 receive loop 仍在 reset 确认后才启动，避免 snapshot 写到旧实例。
         claimAttachClient(attachedClient);
+        await flushPendingTerminalInput(attachedClient, sessionId);
         attachedSessionRef.current = sessionId;
         sessionPermissionIdsRef.current.add(sessionId);
         confirmedSessionSizesRef.current.set(attached.session_id, attached.size);
@@ -1988,6 +2050,7 @@ export default function App() {
       clearTerminalOutput,
       claimAttachClient,
       disconnectAttach,
+      flushPendingTerminalInput,
       loadSessionFiles,
       loadSessionGit,
       refreshDaemonClients,
@@ -2003,6 +2066,7 @@ export default function App() {
     (sessionId: UUID, options: AttachUiOptions = {}) => {
       const attachOptions: Required<AttachUiOptions> = {
         closeMobilePanel: options.closeMobilePanel ?? true,
+        preservePendingInput: options.preservePendingInput ?? false,
       };
       userDetachedRef.current = false;
       // 中文注释：点击 session 先只更新 UI 选中态；真正 attach 延迟一个很短窗口。
@@ -2096,7 +2160,8 @@ export default function App() {
       terminalCreateOwnsAttachRef.current ||
       pendingAttachClientRef.current ||
       pendingTerminalAttachAbortControllerRef.current ||
-      attachedSessionRef.current ||
+      hasLiveAttachedTransport() ||
+      isTerminalRecoveryInProgress() ||
       userDetachedRef.current ||
       (autoAttachAttemptedSessionRef.current === sessionId && !shouldReattachCurrentSession)
     ) {
@@ -2107,7 +2172,7 @@ export default function App() {
     autoAttachAttemptedSessionRef.current = sessionId;
     // 从管理页回到工作台的后台 reattach 不能抢走用户刚打开的移动端面板。
     void handleAttach(sessionId, { closeMobilePanel: false });
-  }, [activeSurface, connectionReady, handleAttach, selectedSessionId, status]);
+  }, [activeSurface, connectionReady, handleAttach, hasLiveAttachedTransport, isTerminalRecoveryInProgress, selectedSessionId, status]);
 
   const handleCreateSession = useCallback(async () => {
     userDetachedRef.current = false;
@@ -2216,20 +2281,57 @@ export default function App() {
     if (isTerminalTransportPaused()) {
       return;
     }
-    const sessionId = attachedSessionRef.current ?? attachedSessionId ?? selectedSessionId;
-    if (sessionId) {
-      // PWA 从后台恢复时旧 WebSocket 可能已经被系统关闭；先断开旧 attach，
-      // 否则 handleAttach 会误以为当前 session 已连接而直接短路返回。
-      disconnectAttach();
-      await performAttach(sessionId);
-      return;
+    if (retryConnectionTaskRef.current) {
+      return retryConnectionTaskRef.current;
     }
+    const sessionId = attachedSessionRef.current ?? attachedSessionId ?? selectedSessionId;
+    const task = (async () => {
+      if (sessionId) {
+        if (
+          attachingSessionIdRef.current === sessionId ||
+          pendingTerminalAttachSessionRef.current === sessionId ||
+          pendingTerminalAttachAbortControllerRef.current !== undefined ||
+          pendingAttachClientRef.current !== undefined ||
+          attachReconnectTimerRef.current !== undefined
+        ) {
+          return;
+        }
+        // 中文注释：performAttach 会先把状态推进到 attaching，再按当前 request id
+        // 废弃旧 attach。这里不能额外先 disconnectAttach，否则 focus/online/自动重试
+        // 叠加时，后一轮恢复会把前一轮尚未完成的 attach 直接打断，造成重复 snapshot。
+        await performAttach(sessionId);
+        return;
+      }
 
-    setError(undefined);
-    setActiveSurface("workspace");
-    autoCheckedServerRef.current = undefined;
-    await handleRefresh({ bootstrap: true });
-  }, [attachedSessionId, disconnectAttach, handleRefresh, performAttach, selectedSessionId]);
+      setError(undefined);
+      setActiveSurface("workspace");
+      autoCheckedServerRef.current = undefined;
+      await handleRefresh({ bootstrap: true });
+    })();
+    const trackedTask = task.finally(() => {
+      if (retryConnectionTaskRef.current === trackedTask) {
+        retryConnectionTaskRef.current = undefined;
+      }
+    });
+    retryConnectionTaskRef.current = trackedTask;
+    return trackedTask;
+  }, [
+    attachReconnectTimerRef,
+    attachedSessionId,
+    attachedSessionRef,
+    attachingSessionIdRef,
+    handleRefresh,
+    isTerminalTransportPaused,
+    pendingAttachClientRef,
+    pendingTerminalAttachAbortControllerRef,
+    pendingTerminalAttachSessionRef,
+    performAttach,
+    selectedSessionId,
+  ]);
+
+  useEffect(() => {
+    retryConnectionHandlerRef.current = handleRetryConnection;
+  }, [handleRetryConnection]);
 
   useWorkspaceAutoRetry(workspaceConnection, {
     error,
@@ -2528,21 +2630,31 @@ export default function App() {
       // 保证 stdin/stdout/resize 的相对顺序；普通 RPC 只是同一连接里的非终端 segment。
       const client = attachClientRef.current;
       const sessionId = attachedSessionRef.current;
-      if (!client || !sessionId) {
+      if (!sessionId) {
+        return;
+      }
+      if (!client || client.isClosed) {
+        // 中文注释：恢复窗口里 UI 可能仍显示当前 session，但 attach transport 已经被
+        // offline/reconnect/sidecar close 清掉。这里不能静默丢字，先按 session 排队，
+        // 再触发当前恢复链路把这段输入补发到新 transport。
+        queuePendingTerminalInput(sessionId, data);
+        void retryConnectionHandlerRef.current?.();
         return;
       }
       try {
         await client.sendSessionData(sessionId, new TextEncoder().encode(data));
       } catch (caught) {
+        queuePendingTerminalInput(sessionId, data);
         if (isRetryableConnectionError(caught) && attachReconnectHandlerRef.current(client, caught)) {
           return;
         }
+        clearPendingTerminalInput(sessionId);
         if (!isIgnoredClosingSessionError(sessionId, caught)) {
           setSafeError(caught);
         }
       }
     },
-    [isIgnoredClosingSessionError, setSafeError],
+    [attachClientRef, attachedSessionRef, attachReconnectHandlerRef, clearPendingTerminalInput, isIgnoredClosingSessionError, queuePendingTerminalInput, setSafeError],
   );
 
   const handleResize = useCallback(

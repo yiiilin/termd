@@ -561,6 +561,7 @@ interface UseTerminalReconnectSchedulerOptions {
   loadSessionGit: (sessionId: UUID, options?: { silent?: boolean }) => Promise<void>;
   refreshDaemonClients: () => Promise<void>;
   claimAttachClient: (client: DirectClient) => void;
+  onAttachTransportReady?: (client: DirectClient, sessionId: UUID) => Promise<void> | void;
   upsertAttachedSession: (
     current: SessionSummaryPayload[],
     attached: SessionAttachedPayload,
@@ -816,6 +817,7 @@ export function useTerminalReconnectScheduler(
           // 中文注释：reconnect 成功后也要立刻晋升为当前 terminal 主连接，并废弃
           // 所有 metadata sidecar / pending metadata connect，避免迟到 promise 回写。
           options.claimAttachClient(attachedClient);
+          await options.onAttachTransportReady?.(attachedClient, sessionId);
           if (isFullSnapshot && snapshotToken !== undefined) {
             const pendingSnapshot = terminalSnapshotPendingFullSnapshotTokensRef.current.get(sessionId);
             if (pendingSnapshot?.token === snapshotToken) {
