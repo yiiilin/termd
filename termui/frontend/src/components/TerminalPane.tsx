@@ -2262,6 +2262,13 @@ export function TerminalPane(props: TerminalPaneProps) {
       terminalResizeReportFrameRef.current = requestTrackedFrame(runResizeReportPass);
     };
     const dataSubscription = terminal.onData((data) => {
+      recordTermdDiagnostic("terminal_pane_on_data", {
+        chunkLength: data.length,
+        preview: data
+          .replaceAll("\r", "\\r")
+          .replaceAll("\n", "\\n")
+          .slice(0, 64),
+      });
       onInputRef.current(data);
     });
     const helperTextarea = renderer.getInputElement(host);

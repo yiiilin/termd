@@ -224,6 +224,13 @@ function terminalOutputFlushFrameTestHook(): DeferredTerminalFrameTestHook | und
   }).__TERMD_TEST_HOLD_TERMINAL_OUTPUT_FLUSH_RAF__;
 }
 
+function summarizeTerminalInputForDiagnostics(data: string): string {
+  return data
+    .replaceAll("\r", "\\r")
+    .replaceAll("\n", "\\n")
+    .slice(0, 64);
+}
+
 export interface DaemonNetworkCounterSample {
   rxBytes: number;
   txBytes: number;
@@ -809,6 +816,12 @@ export default function App() {
       pendingTerminalInputDataRef.current = "";
     }
     pendingTerminalInputDataRef.current += data;
+    recordTermdDiagnostic("app_terminal_input_queued", {
+      sessionId,
+      chunkLength: data.length,
+      bufferedLength: pendingTerminalInputDataRef.current.length,
+      preview: summarizeTerminalInputForDiagnostics(data),
+    });
   }, []);
 
   const flushPendingTerminalInput = useCallback(async (client: DirectClient, sessionId: UUID) => {
@@ -817,8 +830,25 @@ export default function App() {
     }
     const bufferedInput = pendingTerminalInputDataRef.current;
     clearPendingTerminalInput(sessionId);
+    recordTermdDiagnostic("app_terminal_input_flushed", {
+      sessionId,
+      bufferedLength: bufferedInput.length,
+      preview: summarizeTerminalInputForDiagnostics(bufferedInput),
+    });
     await client.sendSessionData(sessionId, new TextEncoder().encode(bufferedInput));
   }, [clearPendingTerminalInput]);
+
+  const resolveTerminalInputSessionId = useCallback(() => {
+    // 中文注释：恢复窗口里 transport 可能已经被断开并清掉 attachedSessionRef，
+    // 但用户眼里的“当前终端”仍然是正在重新 attach 的那条 session。
+    // 这里按“已附着 -> 正在 attach -> UI 当前选中”的优先级兜底，避免恢复首个按键丢失。
+    return (
+      attachedSessionRef.current ??
+      attachingSessionIdRef.current ??
+      pendingTerminalAttachSessionRef.current ??
+      selectedSessionId
+    );
+  }, [attachedSessionRef, attachingSessionIdRef, pendingTerminalAttachSessionRef, selectedSessionId]);
 
   const waitForTerminalOutputResetApplied = useCallback((version: number) => {
     if (terminalOutputAppliedResetVersionRef.current >= version) {
@@ -2629,8 +2659,22 @@ export default function App() {
       // 中文注释：终端输入必须和终端输出落在当前 session 的同一条可靠 WebSocket 上，靠 segment 顺序
       // 保证 stdin/stdout/resize 的相对顺序；普通 RPC 只是同一连接里的非终端 segment。
       const client = attachClientRef.current;
-      const sessionId = attachedSessionRef.current;
+      const sessionId = resolveTerminalInputSessionId();
+      recordTermdDiagnostic("app_terminal_input_received", {
+        sessionId,
+        attachedSessionId: attachedSessionRef.current,
+        attachingSessionId: attachingSessionIdRef.current,
+        selectedSessionId,
+        hasClient: Boolean(client),
+        clientClosed: client?.isClosed ?? false,
+        chunkLength: data.length,
+        preview: summarizeTerminalInputForDiagnostics(data),
+      });
       if (!sessionId) {
+        recordTermdDiagnostic("app_terminal_input_drop_no_session", {
+          chunkLength: data.length,
+          preview: summarizeTerminalInputForDiagnostics(data),
+        });
         return;
       }
       if (!client || client.isClosed) {
@@ -2643,7 +2687,18 @@ export default function App() {
       }
       try {
         await client.sendSessionData(sessionId, new TextEncoder().encode(data));
+        recordTermdDiagnostic("app_terminal_input_sent", {
+          sessionId,
+          chunkLength: data.length,
+          preview: summarizeTerminalInputForDiagnostics(data),
+        });
       } catch (caught) {
+        recordTermdDiagnostic("app_terminal_input_send_error", {
+          sessionId,
+          chunkLength: data.length,
+          preview: summarizeTerminalInputForDiagnostics(data),
+          error: toSafeError(caught),
+        });
         queuePendingTerminalInput(sessionId, data);
         if (isRetryableConnectionError(caught) && attachReconnectHandlerRef.current(client, caught)) {
           return;
@@ -2654,7 +2709,7 @@ export default function App() {
         }
       }
     },
-    [attachClientRef, attachedSessionRef, attachReconnectHandlerRef, clearPendingTerminalInput, isIgnoredClosingSessionError, queuePendingTerminalInput, setSafeError],
+    [attachClientRef, attachReconnectHandlerRef, attachedSessionRef, attachingSessionIdRef, clearPendingTerminalInput, isIgnoredClosingSessionError, queuePendingTerminalInput, resolveTerminalInputSessionId, selectedSessionId, setSafeError],
   );
 
   const handleResize = useCallback(
