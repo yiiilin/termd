@@ -48,7 +48,7 @@ use crate::config::RelayReconnectConfig;
 use super::protocol::ProtocolConnectionDebugTraffic;
 use super::protocol::{JsonEnvelope, ProtocolConnection, ProtocolError, ProtocolWireMessage};
 use super::server::SharedDaemonProtocol;
-use super::server::handle_http_file_tunnel_stream_request;
+use super::server::handle_http_tunnel_stream_request;
 
 const OUTPUT_FLUSH_MAX_BYTES_PER_SESSION: usize = 512 * 1024;
 const MIN_RELAY_RETRY_DELAY_MS: u64 = 1;
@@ -2414,8 +2414,7 @@ async fn send_relay_http_tunnel_response(
         headers = headers.len(),
         "relay daemon HTTP tunnel handler started"
     );
-    let response =
-        handle_http_file_tunnel_stream_request(protocol, method, path, headers, body).await;
+    let response = handle_http_tunnel_stream_request(protocol, method, path, headers, body).await;
     let status = response.status().as_u16();
     debug!(status, "relay daemon HTTP tunnel handler returned response");
     enqueue_relay_data_raw(
@@ -8154,6 +8153,13 @@ mod tests {
         assert_eq!(created.kind, MessageType::SessionCreated);
         let created_payload: termd_proto::SessionCreatedPayload =
             decode_payload(created.payload).unwrap();
+        read_expected_mux_session_scope_grant(
+            &mut relay_socket,
+            client_id,
+            &mut device_e2ee,
+            created_payload.session_id,
+        )
+        .await;
 
         // relay client 不再发送 ping 或任何业务帧；daemon mux 必须像直连 WebSocket 一样主动推送。
         let mut pushed_output = Vec::new();
@@ -8275,6 +8281,15 @@ mod tests {
         let created =
             read_encrypted_daemon_frame(&mut relay_socket, slow_client_id, &mut slow_e2ee).await;
         assert_eq!(created.kind, MessageType::SessionCreated);
+        let created_payload: termd_proto::SessionCreatedPayload =
+            decode_payload(created.payload).unwrap();
+        read_expected_mux_session_scope_grant(
+            &mut relay_socket,
+            slow_client_id,
+            &mut slow_e2ee,
+            created_payload.session_id,
+        )
+        .await;
 
         // 先读到第一批 output，证明 slow client 已经触发大量推送；随后故意不再
         // 消费它的剩余 output，模拟公网 relay/web 侧慢写。
@@ -8444,6 +8459,13 @@ mod tests {
         assert_eq!(created.kind, MessageType::SessionCreated);
         let created_payload: termd_proto::SessionCreatedPayload =
             decode_payload(created.payload).unwrap();
+        read_expected_mux_session_scope_grant(
+            &mut relay_socket,
+            client_id,
+            &mut device_e2ee,
+            created_payload.session_id,
+        )
+        .await;
 
         send_encrypted_mux_client_json(
             &mut relay_socket,
@@ -8838,6 +8860,23 @@ mod tests {
         let outer = read_daemon_frame_from_connector(socket, expected_client_id).await;
         let frame = encrypted_frame_from_envelope(outer).unwrap();
         device_e2ee.decrypt_json_payload(&frame).unwrap()
+    }
+
+    async fn read_expected_mux_session_scope_grant(
+        socket: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+        expected_client_id: RelayClientId,
+        device_e2ee: &mut E2eeSession,
+        expected_session_id: termd_proto::SessionId,
+    ) -> termd_proto::SessionScopeGrantPayload {
+        let inner = read_encrypted_daemon_frame(socket, expected_client_id, device_e2ee).await;
+        assert_eq!(
+            inner.kind,
+            MessageType::SessionScopeGrant,
+            "session.create/attach must be followed by exactly one mux scope grant"
+        );
+        let payload: termd_proto::SessionScopeGrantPayload = decode_payload(inner.payload).unwrap();
+        assert_eq!(payload.session_id, expected_session_id);
+        payload
     }
 
     async fn read_encrypted_daemon_frame_for_connector(

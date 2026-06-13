@@ -124,6 +124,8 @@ import type {
   SessionResizedPayload,
   SessionSearchPayload,
   SessionSearchResultPayload,
+  SessionScopeGrantPayload,
+  SessionTokenGrantPayload,
   TerminalSize,
   UUID,
 } from "./types";
@@ -207,6 +209,21 @@ interface FileDownloadStreamState {
 
 type FileStreamState = FileUploadStreamState | FileDownloadStreamState;
 
+interface SessionTokenState {
+  token: string;
+  expires_at_ms: number;
+}
+
+interface SessionScopeState {
+  token: string;
+  expires_at_ms: number;
+}
+
+interface HttpControlRoute {
+  path: string;
+  sessionId?: UUID;
+}
+
 const DEFAULT_TIMEOUT_MS = 30000;
 const RECEIVE_PUMP_YIELD_MESSAGES = 64;
 const RECEIVE_PUMP_YIELD_BYTES = 256 * 1024;
@@ -222,6 +239,44 @@ const FILE_TRANSFER_WEBSOCKET_COMPAT_MAX_BYTES = 16 * 1024 * 1024;
 // 中文注释：RPC file_write/file_read 只服务浏览器内置文本编辑器和很小的兼容上传；
 // 大文件必须走 HTTP E2EE 或 binary stream，不能再整包 base64 进入 RPC。
 const SESSION_FILE_RPC_MAX_BYTES = 1024 * 1024;
+const HTTP_CONTROL_METHODS = new Set([
+  "session.list",
+  "daemon.clients",
+  "daemon.client_forget",
+  "daemon.status",
+  "session.attach",
+  "session.cursor",
+  "session.resize",
+  "session.rename",
+  "session.reorder",
+  "session.close",
+  "session.files",
+  "session.search",
+  "session.git",
+  "session.git_diff",
+  "session.git_action",
+  "session.file_read",
+  "session.file_write",
+  "session.file_delete",
+  "session.file_download_prepare",
+  "session.file_download_chunk",
+]);
+const HTTP_CONTROL_METHODS_REQUIRING_SESSION_SCOPE = new Set([
+  "session.cursor",
+  "session.resize",
+  "session.rename",
+  "session.close",
+  "session.files",
+  "session.search",
+  "session.git",
+  "session.git_diff",
+  "session.git_action",
+  "session.file_read",
+  "session.file_write",
+  "session.file_delete",
+  "session.file_download_prepare",
+  "session.file_download_chunk",
+]);
 
 export { ProtocolClientError };
 
@@ -242,8 +297,12 @@ export class DirectClient {
   private readonly pendingTerminalStreamIds = new Set<PacketStreamId>();
   private readonly pendingTerminalStreamLastOutputSeq = new Map<PacketStreamId, number>();
   private readonly fileStreamsById = new Map<PacketStreamId, FileStreamState>();
+  private readonly sessionScopes = new Map<UUID, SessionScopeState>();
+  private readonly webSocketSessionPermissions = new Set<UUID>();
   private authenticatedDevice?: DeviceState;
   private authenticatedServer?: PairedServerState;
+  private sessionToken?: SessionTokenState;
+  private httpControlAvailable = true;
 
   private constructor(
     private readonly socket: WebSocket,
@@ -304,7 +363,11 @@ export class DirectClient {
     return this.closed || this.socket.readyState === WebSocket.CLOSING || this.socket.readyState === WebSocket.CLOSED;
   }
 
-  async pair(token: string, devicePublicKey: PublicKeyWire): Promise<PairAcceptPayload> {
+  async pair(
+    token: string,
+    devicePublicKey: PublicKeyWire,
+    device?: Pick<DeviceState, "device_id" | "device_public_key" | "device_signing_key_secret" | "name">,
+  ): Promise<PairAcceptPayload> {
     this.requireE2eeReady();
     const accepted = await this.request<PairAcceptPayload>("pair.request", {
       device_id: this.deviceId,
@@ -314,6 +377,23 @@ export class DirectClient {
       timestamp_ms: nowMs(),
     } satisfies PairRequestPayload);
     this.phase = "authenticated";
+    if (device && device.device_signing_key_secret) {
+      // 中文注释：只有调用方显式提供设备签名私钥时，pair 后同连接才具备
+      // HTTP control 所需的完整 E2EE 签名能力。
+      this.authenticatedDevice = {
+        device_id: device.device_id,
+        device_public_key: device.device_public_key,
+        device_signing_key_secret: device.device_signing_key_secret,
+        name: device.name,
+      };
+      this.authenticatedServer = {
+        server_id: accepted.server_id,
+        daemon_public_key: accepted.daemon_public_key,
+        url: this.socketUrl,
+        paired_at_ms: nowMs(),
+      };
+    }
+    await this.refreshSessionToken(this.authTimeoutMs);
     return accepted;
   }
 
@@ -331,6 +411,25 @@ export class DirectClient {
     await this.request("client.hello", { name: device.name?.trim() || "Web client" } satisfies ClientHelloPayload, this.authTimeoutMs);
     this.authenticatedDevice = device;
     this.authenticatedServer = server;
+    await this.refreshSessionToken(this.authTimeoutMs);
+  }
+
+  async refreshSessionToken(timeoutMs = this.authTimeoutMs): Promise<SessionTokenGrantPayload> {
+    this.requireAuthenticated();
+    const grant = await this.request<SessionTokenGrantPayload>("auth.session_token", {}, timeoutMs);
+    this.sessionToken = {
+      token: grant.token,
+      expires_at_ms: grant.expires_at_ms,
+    };
+    return grant;
+  }
+
+  getSessionToken(): SessionTokenState | undefined {
+    return this.sessionToken;
+  }
+
+  getSessionScope(sessionId: UUID): SessionScopeState | undefined {
+    return this.sessionScopes.get(sessionId);
   }
 
   async listSessions(timeoutMs = this.timeoutMs): Promise<SessionListResultPayload> {
@@ -509,6 +608,7 @@ export class DirectClient {
             "HTTP file upload is required for large files",
           );
         }
+        await this.ensureWebSocketSessionPermission(sessionId, options.timeoutMs ?? this.timeoutMs);
         // 中文注释：只有 404/426/501 这类“老 daemon/old relay 明确不支持 HTTP 文件端点”
         // 才允许小文件走 WebSocket 兼容路径；网络 TypeError 不会进入这里，避免大文件
         // 在 relay 下重新退回主 WebSocket 后逐块等待确认。
@@ -517,6 +617,7 @@ export class DirectClient {
     if (!this.binaryMode) {
       return this.uploadSessionFileLegacy(sessionId, path, file, options);
     }
+    await this.ensureSessionPermission(sessionId, options.timeoutMs ?? this.timeoutMs);
     this.ensureBinaryFileTransfer();
     const streamId = randomUuid();
     const state: FileUploadStreamState = {
@@ -630,6 +731,7 @@ export class DirectClient {
     if (!this.binaryMode) {
       return this.downloadSessionFileLegacy(sessionId, path, options);
     }
+    await this.ensureSessionPermission(sessionId, options.timeoutMs ?? this.timeoutMs);
     this.ensureBinaryFileTransfer();
     const streamId = randomUuid();
     const state: FileDownloadStreamState = {
@@ -740,6 +842,7 @@ export class DirectClient {
       timeoutMs?: number;
     } = {},
   ): Promise<SessionFileUploadProgressPayload> {
+    await this.ensureSessionPermission(sessionId, options.timeoutMs ?? this.timeoutMs);
     if (file.size > SESSION_FILE_RPC_MAX_BYTES) {
       throw new ProtocolClientError("file_too_large", "legacy RPC file upload is limited to editor-sized files");
     }
@@ -767,6 +870,7 @@ export class DirectClient {
       timeoutMs?: number;
     } = {},
   ): Promise<{ path: string; name: string; bytes: Uint8Array; size_bytes: number; modified_at_ms?: number | null }> {
+    await this.ensureSessionPermission(sessionId, options.timeoutMs ?? this.timeoutMs);
     const ready = await this.prepareSessionFileDownload(sessionId, path);
     const chunks: Uint8Array[] = [];
     const collectBytes = options.collectBytes ?? true;
@@ -1052,6 +1156,7 @@ export class DirectClient {
     if (!device || !server) {
       throw new HttpFileTransferUnsupported();
     }
+    const requestPath = this.httpRequestPath(path);
     const keypair = generateE2eeKeyPair();
     const e2ee = E2eeSession.device({
       serverId: this.serverIdValue,
@@ -1066,7 +1171,7 @@ export class DirectClient {
         nonce: nonce(),
         timestamp_ms: nowMs(),
         method,
-        path,
+        path: requestPath,
       },
       server,
       device.device_signing_key_secret,
@@ -1141,7 +1246,7 @@ export class DirectClient {
         // 普通 Blob/ArrayBuffer 上传不要声明流式语义，避免 relay/HTTP1.1 路径被浏览器拒绝。
         init.duplex = "half";
       }
-      const response = await fetch(httpUrlFromSocketUrl(this.socketUrl, path), init);
+      const response = await fetch(this.httpRequestUrl(path).toString(), init);
       if (response.status === 404 || response.status === 426 || response.status === 501) {
         throw new HttpFileTransferUnsupported();
       }
@@ -1185,7 +1290,7 @@ export class DirectClient {
     options: { timeoutMs?: number } = {},
   ): Promise<SessionCreatedPayload> {
     this.requireAuthenticated();
-    return this.openTerminalStream<SessionCreatedPayload>(
+    const created = await this.openTerminalStream<SessionCreatedPayload>(
       "terminal.create",
       {
         command,
@@ -1194,6 +1299,8 @@ export class DirectClient {
       undefined,
       options.timeoutMs,
     );
+    await this.waitForSessionScopeGrant(created.session_id, options.timeoutMs ?? this.timeoutMs);
+    return created;
   }
 
   async attachSession(
@@ -1201,7 +1308,7 @@ export class DirectClient {
     options: { lastTerminalSeq?: number; timeoutMs?: number; signal?: AbortSignal } = {},
   ): Promise<SessionAttachedPayload> {
     this.requireAuthenticated();
-    return this.openTerminalStream<SessionAttachedPayload>(
+    const attached = await this.openTerminalStream<SessionAttachedPayload>(
       "terminal.attach",
       {
         session_id: sessionId,
@@ -1212,18 +1319,29 @@ export class DirectClient {
       options.timeoutMs,
       options.signal,
     );
+    await this.waitForSessionScopeGrant(sessionId, options.timeoutMs ?? this.timeoutMs);
+    return attached;
   }
 
-  async attachSessionPermission(sessionId: UUID): Promise<SessionAttachedPayload> {
-    return this.request<SessionAttachedPayload>(
+  async attachSessionPermission(
+    sessionId: UUID,
+    timeoutMs = this.timeoutMs,
+    signal?: AbortSignal,
+  ): Promise<SessionAttachedPayload> {
+    const attached = await this.request<SessionAttachedPayload>(
       "session.attach",
       {
         session_id: sessionId,
       },
+      timeoutMs,
+      signal,
     );
+    await this.waitForSessionScopeGrant(sessionId, timeoutMs);
+    return attached;
   }
 
   async sendSessionData(sessionId: UUID, bytes: Uint8Array): Promise<void> {
+    this.requireTerminalStream(sessionId);
     this.sendAttachFrame(
       sessionId,
       encodeSupervisorTerminalClientFrame({
@@ -1253,13 +1371,6 @@ export class DirectClient {
 
   async requestSessionResize(sessionId: UUID, size: TerminalSize): Promise<void> {
     this.requireTerminalStream(sessionId);
-    this.sendAttachFrame(
-      sessionId,
-      encodeSupervisorTerminalClientFrame({
-        type: "resize",
-        size,
-      }),
-    );
     const payload = await this.request<SessionResizedPayload>(
       "session.resize",
       { session_id: sessionId, size } satisfies SessionResizePayload,
@@ -1325,8 +1436,24 @@ export class DirectClient {
     } else {
       this.requireAuthenticated();
     }
+    if (this.shouldUseHttpControl(method)) {
+      return this.requestViaHttpControl<T>(method, payload, timeoutMs, signal);
+    }
+    return this.requestViaWebSocket<T>(method, payload, timeoutMs, signal);
+  }
+
+  private async requestViaWebSocket<T>(
+    method: string,
+    payload: unknown,
+    timeoutMs: number,
+    signal?: AbortSignal,
+  ): Promise<T> {
+    const sessionId = this.sessionScopedMethodSessionId(method, payload);
+    if (sessionId && this.webSocketMethodRequiresSessionPermission(method)) {
+      await this.ensureWebSocketSessionPermission(sessionId, timeoutMs, signal);
+    }
     const id = randomUuid();
-    return this.sendTrackedPacket<T>(
+    const response = await this.sendTrackedPacket<T>(
       {
         version: PROTOCOL_PACKET_VERSION,
         kind: "request",
@@ -1339,6 +1466,280 @@ export class DirectClient {
       timeoutMs,
       signal,
     );
+    this.afterSuccessfulWebSocketRequest(method, payload, response);
+    return response;
+  }
+
+  private shouldUseHttpControl(method: string): boolean {
+    return HTTP_CONTROL_METHODS.has(method)
+      && this.httpControlAvailable
+      && Boolean(this.authenticatedDevice)
+      && Boolean(this.authenticatedServer);
+  }
+
+  private async requestViaHttpControl<T>(
+    method: string,
+    payload: unknown,
+    timeoutMs: number,
+    signal?: AbortSignal,
+  ): Promise<T> {
+    const route = this.httpControlRoute(method, payload);
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const token = await this.ensureValidSessionToken(timeoutMs);
+      const context = await this.createHttpE2eeContext("POST", route.path);
+      const headers: Record<string, string> = {
+        ...context.headers,
+        authorization: `Bearer ${token.token}`,
+      };
+      if (route.sessionId && this.httpControlMethodRequiresSessionScope(method)) {
+        const scope = await this.ensureValidSessionScope(route.sessionId, timeoutMs, signal);
+        headers["x-termd-session-scope"] = scope.token;
+      }
+      let frames: Uint8Array[];
+      try {
+        frames = await this.httpE2eeFetch(
+          "POST",
+          route.path,
+          headers,
+          bodyToArrayBuffer(encodeHttpE2eeFrames(context.e2ee, [encodeUtf8(JSON.stringify(payload ?? {}))])),
+          context.e2ee,
+          { timeoutMs, signal },
+        );
+      } catch (error) {
+        if (isHttpFileTransferUnsupported(error)) {
+          // 中文注释：过渡部署时若 HTTP control 端点尚未可用，当前连接后续都退回 WebSocket control。
+          this.httpControlAvailable = false;
+          return this.requestViaWebSocket<T>(method, payload, timeoutMs, signal);
+        }
+        if (attempt === 0 && error instanceof ProtocolClientError && error.code === "auth_failed") {
+          // 中文注释：daemon 可能直接拒绝仍在本地缓存中的 bearer 或 session scope。
+          // bearer 失效时刷新 session token；若这是 session 级 HTTP control，则顺带丢弃该
+          // session 的 scope，让下一轮通过 session.attach 重新换取新的 scope token。
+          this.sessionToken = undefined;
+          if (route.sessionId && this.httpControlMethodRequiresSessionScope(method)) {
+            this.invalidateSessionScope(route.sessionId);
+          }
+          continue;
+        }
+        throw error;
+      }
+      if (frames.length === 0) {
+        throw new ProtocolClientError("unexpected_message", "HTTP control response is empty");
+      }
+      let resolvedPayload: T | undefined;
+      let deferredUnboundError: ProtocolClientError | undefined;
+      for (const frame of frames) {
+        const packet = JSON.parse(decodeUtf8(frame)) as ProtocolPacket;
+        if (packet.version !== PROTOCOL_PACKET_VERSION) {
+          throw new ProtocolClientError("unsupported_protocol_version", "unsupported protocol packet version");
+        }
+        if (packet.kind === "response") {
+          resolvedPayload = packet.payload as T;
+          continue;
+        }
+        if (packet.kind === "event") {
+          this.enqueuePacketEvent(packet);
+          continue;
+        }
+        if (packet.kind === "error") {
+          const error = protocolError(packet.payload as PacketErrorPayload);
+          // 中文注释：HTTP control 可能先带一帧未归属的旁路错误，再带当前 request 的真正 response。
+          // 例如 session.close 收尾时，旧 watch stream 的 unowned error 不能吞掉 close ack。
+          if (!packet.id) {
+            deferredUnboundError = error;
+            continue;
+          }
+          throw error;
+        }
+        throw new ProtocolClientError("unexpected_message", "unexpected HTTP control packet");
+      }
+      if (deferredUnboundError) {
+        this.enqueueInner(
+          envelope("error", {
+            code: deferredUnboundError.code,
+            message: deferredUnboundError.message,
+          } satisfies ErrorPayload),
+        );
+      }
+      if (resolvedPayload === undefined) {
+        throw new ProtocolClientError("unexpected_message", "HTTP control response is missing result");
+      }
+      await this.afterSuccessfulHttpControlRequest(method, payload, resolvedPayload);
+      return resolvedPayload;
+    }
+    throw new ProtocolClientError("auth_failed", "auth failed");
+  }
+
+  private httpControlRoute(method: string, payload: unknown): HttpControlRoute {
+    const sessionId = this.httpControlMethodUsesSessionPath(method)
+      ? this.sessionScopedMethodSessionId(method, payload)
+      : undefined;
+    if (sessionId) {
+      return {
+        path: `/api/control/session/${sessionId}/${method.slice("session.".length).replaceAll(".", "/")}`,
+        sessionId,
+      };
+    }
+    return {
+      path: `/api/control/${method.replaceAll(".", "/")}`,
+    };
+  }
+
+  private httpControlMethodUsesSessionPath(method: string): boolean {
+    return HTTP_CONTROL_METHODS_REQUIRING_SESSION_SCOPE.has(method);
+  }
+
+  private httpControlMethodRequiresSessionScope(method: string): boolean {
+    return HTTP_CONTROL_METHODS_REQUIRING_SESSION_SCOPE.has(method);
+  }
+
+  private webSocketMethodRequiresSessionPermission(method: string): boolean {
+    return HTTP_CONTROL_METHODS_REQUIRING_SESSION_SCOPE.has(method);
+  }
+
+  private sessionScopedMethodSessionId(method: string, payload: unknown): UUID | undefined {
+    if (!method.startsWith("session.")) {
+      return undefined;
+    }
+    const candidate = payload as { session_id?: unknown };
+    return typeof candidate?.session_id === "string" ? candidate.session_id : undefined;
+  }
+
+  private async ensureValidSessionToken(timeoutMs: number): Promise<SessionTokenState> {
+    const token = this.sessionToken;
+    if (token && token.expires_at_ms > nowMs()) {
+      return token;
+    }
+    const grant = await this.refreshSessionToken(timeoutMs);
+    return {
+      token: grant.token,
+      expires_at_ms: grant.expires_at_ms,
+    };
+  }
+
+  private async ensureValidSessionScope(
+    sessionId: UUID,
+    timeoutMs: number,
+    signal?: AbortSignal,
+  ): Promise<SessionScopeState> {
+    const scope = this.sessionScopes.get(sessionId);
+    if (scope && scope.expires_at_ms > nowMs()) {
+      return scope;
+    }
+    await this.attachSessionPermission(sessionId, timeoutMs, signal);
+    const refreshed = this.sessionScopes.get(sessionId);
+    if (!refreshed || refreshed.expires_at_ms <= nowMs()) {
+      throw new ProtocolClientError("invalid_state", "session scope is not available");
+    }
+    return refreshed;
+  }
+
+  private invalidateSessionScope(sessionId: UUID): void {
+    this.sessionScopes.delete(sessionId);
+  }
+
+  private async ensureSessionPermission(
+    sessionId: UUID,
+    timeoutMs = this.timeoutMs,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    await this.ensureWebSocketSessionPermission(sessionId, timeoutMs, signal);
+  }
+
+  private async ensureWebSocketSessionPermission(
+    sessionId: UUID,
+    timeoutMs: number,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    if (this.webSocketSessionPermissions.has(sessionId) || this.terminalStreamsBySession.get(sessionId)?.open) {
+      this.webSocketSessionPermissions.add(sessionId);
+      return;
+    }
+    await this.requestWebSocketSessionAttach(sessionId, timeoutMs, signal);
+  }
+
+  private async requestWebSocketSessionAttach(
+    sessionId: UUID,
+    timeoutMs: number,
+    signal?: AbortSignal,
+  ): Promise<SessionAttachedPayload> {
+    const id = randomUuid();
+    const attached = await this.sendTrackedPacket<SessionAttachedPayload>(
+      {
+        version: PROTOCOL_PACKET_VERSION,
+        kind: "request",
+        id,
+        method: "session.attach",
+        payload: {
+          session_id: sessionId,
+        } satisfies SessionAttachPayload,
+      },
+      id,
+      "session.attach",
+      timeoutMs,
+      signal,
+    );
+    this.webSocketSessionPermissions.add(attached.session_id);
+    return attached;
+  }
+
+  private async waitForSessionScopeGrant(sessionId: UUID, timeoutMs: number): Promise<SessionScopeState> {
+    const scope = this.sessionScopes.get(sessionId);
+    if (scope && scope.expires_at_ms > nowMs()) {
+      return scope;
+    }
+    const grant = await this.expectQueuedPayload<SessionScopeGrantPayload>("session_scope_grant", timeoutMs);
+    const grantedScope = {
+      token: grant.token,
+      expires_at_ms: grant.expires_at_ms,
+    };
+    this.sessionScopes.set(grant.session_id, grantedScope);
+    if (grant.session_id !== sessionId) {
+      return this.waitForSessionScopeGrant(sessionId, timeoutMs);
+    }
+    return grantedScope;
+  }
+
+  private afterSuccessfulWebSocketRequest<T>(method: string, payload: unknown, response: T): void {
+    if (method === "session.attach") {
+      const attached = response as { session_id?: unknown };
+      if (typeof attached.session_id === "string") {
+        this.webSocketSessionPermissions.add(attached.session_id);
+      }
+      return;
+    }
+    if (method === "session.close") {
+      this.clearSessionLocalState(this.sessionScopedMethodSessionId(method, payload));
+    }
+  }
+
+  private async afterSuccessfulHttpControlRequest<T>(method: string, payload: unknown, _response: T): Promise<void> {
+    if (method === "session.close") {
+      this.clearSessionLocalState(this.sessionScopedMethodSessionId(method, payload));
+    }
+  }
+
+  private clearSessionLocalState(sessionId: UUID | undefined): void {
+    if (!sessionId) {
+      return;
+    }
+    this.webSocketSessionPermissions.delete(sessionId);
+    this.invalidateSessionScope(sessionId);
+    const stream = this.terminalStreamsBySession.get(sessionId);
+    if (stream) {
+      // 中文注释：远端 close/本端 HTTP close 成功后，本地 stream 已经失效。
+      // 这里只做本地回收，不能再额外发送 cancel 影响已经关闭的 daemon session。
+      this.discardQueuedTerminalOutput(stream.streamId, stream.sessionId);
+      this.removeStream(stream.streamId);
+    }
+  }
+
+  private httpRequestUrl(path: string): URL {
+    return new URL(httpUrlFromSocketUrl(this.socketUrl, path));
+  }
+
+  private httpRequestPath(path: string): string {
+    return this.httpRequestUrl(path).pathname;
   }
 
   async receiveInner(): Promise<Envelope> {
@@ -1410,6 +1811,7 @@ export class DirectClient {
     }
     this.closed = true;
     this.phase = "closed";
+    this.webSocketSessionPermissions.clear();
     this.rejectPendingRequests(error);
     this.rejectInnerWaiters(error);
     this.socket.close();
@@ -1560,6 +1962,17 @@ export class DirectClient {
     const envelopeType = envelopeTypeForProtocolEventMethod(packet.method);
     if (!envelopeType) {
       return;
+    }
+    if (envelopeType === "session_scope_grant") {
+      const payload = packet.payload as SessionScopeGrantPayload;
+      this.sessionScopes.set(payload.session_id, {
+        token: payload.token,
+        expires_at_ms: payload.expires_at_ms,
+      });
+    }
+    if (envelopeType === "session_closed") {
+      const payload = packet.payload as SessionClosedPayload;
+      this.clearSessionLocalState(payload.session_id);
     }
     this.enqueueInner(envelope(envelopeType, packet.payload));
   }
@@ -1779,6 +2192,7 @@ export class DirectClient {
         stream.sessionId = resolvedSessionId;
         stream.open = true;
         stream.lastOutputSeq = Math.max(stream.lastOutputSeq, lastOutputSeq);
+        this.webSocketSessionPermissions.add(resolvedSessionId);
         this.terminalStreamsBySession.set(resolvedSessionId, stream);
         this.terminalStreamsById.set(streamId, stream);
         this.phase = "terminal_stream_open";

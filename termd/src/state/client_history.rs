@@ -66,6 +66,22 @@ impl ClientHistoryStore {
         Ok(store)
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_query_only_for_test(&mut self, enabled: bool) -> Result<(), StateError> {
+        // 中文注释：协议层 rollback 测试需要稳定制造“runtime attach 已完成，
+        // 但后续历史投影写入失败”的窗口。SQLite query_only 只影响当前连接，
+        // 不需要修改文件权限，测试结束后也能明确恢复。
+        let pragma = if enabled {
+            "PRAGMA query_only = ON;"
+        } else {
+            "PRAGMA query_only = OFF;"
+        };
+        self.conn
+            .execute_batch(pragma)
+            .map_err(|source| sqlite_error(&self.path, source))?;
+        Ok(())
+    }
+
     fn initialize(&mut self) -> Result<(), StateError> {
         self.conn
             .execute_batch(

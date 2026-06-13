@@ -8,6 +8,38 @@ import WebSocket from "ws";
 // 测试仍经过完整 E2EE wire 流程，而不是绕过协议状态机。
 Object.assign(globalThis, { WebSocket });
 
+const nativeFetch = globalThis.fetch?.bind(globalThis);
+
+if (nativeFetch) {
+  (globalThis as typeof globalThis & { fetch: typeof fetch }).fetch = (async (input, init) => {
+    const requestUrl = new URL(input instanceof Request ? input.url : String(input));
+    const registry = globalThis as typeof globalThis & {
+      __TERMD_TEST_HTTP_DAEMONS__?: Map<string, { handleHttpControlRequest: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response> }>;
+    };
+    const daemon = registry.__TERMD_TEST_HTTP_DAEMONS__?.get(requestUrl.origin);
+    if (daemon && /\/api\/control\//u.test(requestUrl.pathname)) {
+      const signal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
+      if (signal?.aborted) {
+        throw new DOMException("The operation was aborted", "AbortError");
+      }
+      return await Promise.race([
+        daemon.handleHttpControlRequest(input, init),
+        new Promise<Response>((_, reject) => {
+          if (!signal) {
+            return;
+          }
+          const onAbort = () => {
+            signal.removeEventListener("abort", onAbort);
+            reject(new DOMException("The operation was aborted", "AbortError"));
+          };
+          signal.addEventListener("abort", onAbort, { once: true });
+        }),
+      ]);
+    }
+    return nativeFetch(input as RequestInfo | URL, init);
+  }) as typeof fetch;
+}
+
 const clipboardWriteTextMock = vi.fn(() => Promise.resolve());
 Object.defineProperty(globalThis.navigator, "clipboard", {
   configurable: true,
@@ -181,6 +213,14 @@ vi.mock("@xterm/xterm", () => {
     }
 
     set options(nextOptions: Record<string, unknown>) {
+      // 中文注释：xterm.js v6 把 rows/cols 视为构造期选项，运行期写入会抛错；
+      // mock 必须保持这个约束，才能覆盖 theme/font 热更新时的真实浏览器异常。
+      if (Object.hasOwn(nextOptions, "cols")) {
+        throw new Error('Option "cols" can only be set in the constructor');
+      }
+      if (Object.hasOwn(nextOptions, "rows")) {
+        throw new Error('Option "rows" can only be set in the constructor');
+      }
       this.optionsRecord = { ...this.optionsRecord, ...nextOptions };
     }
 

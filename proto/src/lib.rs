@@ -40,6 +40,8 @@ pub enum MessageType {
     Hello,
     Auth,
     AuthChallenge,
+    SessionTokenGrant,
+    SessionScopeGrant,
     PairRequest,
     PairAccept,
     SessionCreate,
@@ -251,6 +253,13 @@ pub struct Signature(pub String);
 #[serde(transparent)]
 pub struct PairingToken(pub String);
 
+/// 设备完成认证后使用的短期会话凭证。
+///
+/// 该 token 只负责认证后续 HTTP / terminal WS 请求，不替代 E2EE，也不表达控制权。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SessionToken(pub String);
+
 /// 毫秒时间戳用于 replay protection 与 pairing token 过期判断。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -269,6 +278,8 @@ pub const METHOD_PAIR_REQUEST: &str = "pair.request";
 pub const METHOD_AUTH: &str = "auth";
 pub const METHOD_AUTH_VERIFY: &str = "auth.verify";
 pub const METHOD_AUTH_CHALLENGE: &str = "auth.challenge";
+pub const METHOD_AUTH_SESSION_TOKEN: &str = "auth.session_token";
+pub const METHOD_SESSION_SCOPE_TOKEN: &str = "session.scope_token";
 pub const METHOD_CLIENT_HELLO: &str = "client.hello";
 pub const METHOD_SESSION_CREATE: &str = "session.create";
 pub const METHOD_SESSION_ATTACH: &str = "session.attach";
@@ -311,6 +322,8 @@ pub fn legacy_message_type_for_packet_method(method: &str) -> Option<MessageType
     match method {
         METHOD_PAIR_REQUEST => Some(MessageType::PairRequest),
         METHOD_AUTH | METHOD_AUTH_VERIFY => Some(MessageType::Auth),
+        METHOD_AUTH_SESSION_TOKEN => Some(MessageType::SessionTokenGrant),
+        METHOD_SESSION_SCOPE_TOKEN => Some(MessageType::SessionScopeGrant),
         METHOD_CLIENT_HELLO => Some(MessageType::ClientHello),
         METHOD_SESSION_CREATE => Some(MessageType::SessionCreate),
         METHOD_SESSION_ATTACH => Some(MessageType::SessionAttach),
@@ -345,6 +358,8 @@ pub fn legacy_message_type_for_packet_method(method: &str) -> Option<MessageType
 pub fn packet_event_method_for_message(kind: MessageType) -> Option<&'static str> {
     match kind {
         MessageType::AuthChallenge => Some(METHOD_AUTH_CHALLENGE),
+        MessageType::SessionTokenGrant => Some(METHOD_AUTH_SESSION_TOKEN),
+        MessageType::SessionScopeGrant => Some(METHOD_SESSION_SCOPE_TOKEN),
         MessageType::SessionActivity => Some(METHOD_SESSION_ACTIVITY),
         MessageType::SessionCwdChanged => Some(METHOD_SESSION_CWD),
         MessageType::SessionFilesResult => Some(METHOD_SESSION_FILES),
@@ -352,6 +367,63 @@ pub fn packet_event_method_for_message(kind: MessageType) -> Option<&'static str
         MessageType::SessionResized => Some(METHOD_SESSION_RESIZED),
         MessageType::SessionData => Some(METHOD_TERMINAL_OUTPUT),
         _ => None,
+    }
+}
+
+pub const HTTP_FILE_TUNNEL_PATHS: &[&str] = &[
+    "/api/files/upload/init",
+    "/api/files/upload",
+    "/api/files/upload/abort",
+    "/api/files/download",
+];
+
+/// relay/daemon 共同使用的 HTTP tunnel 外层路由白名单。
+///
+/// 中文注释：这里不表达业务权限，只约束哪些 HTTP API 可以进入 relay/daemon tunnel。
+/// bearer、E2EE、session scope 仍在 daemon 内部验证；把路径白名单放在 proto crate 是为了
+/// 避免 relay 和 daemon 分别手写一份字符串后发生协议面漂移。
+pub fn is_http_tunnel_path_allowed(method: &str, path: &str) -> bool {
+    method.eq_ignore_ascii_case("POST")
+        && (is_http_control_tunnel_path_allowed(path) || HTTP_FILE_TUNNEL_PATHS.contains(&path))
+}
+
+pub fn is_http_control_tunnel_path_allowed(path: &str) -> bool {
+    let segments = path
+        .strip_prefix("/api/control/")
+        .map(|trimmed| trimmed.split('/').collect::<Vec<_>>());
+    let Some(segments) = segments else {
+        return false;
+    };
+    match segments.as_slice() {
+        ["session", "list"] => true,
+        ["session", "reorder"] => true,
+        ["daemon", "clients"] => true,
+        ["daemon", "client_forget"] => true,
+        ["daemon", "status"] => true,
+        ["session", "attach"] => true,
+        ["session", session_id, action] => {
+            // 中文注释：session-scoped HTTP control path 必须在 allowlist 层确认 UUID。
+            // 否则 `/api/control/session/not-a-uuid/files` 会绕过 404，提前进入认证/业务层。
+            Uuid::parse_str(session_id).is_ok()
+                && matches!(
+                    *action,
+                    "cursor"
+                        | "resize"
+                        | "rename"
+                        | "close"
+                        | "files"
+                        | "search"
+                        | "git"
+                        | "git_diff"
+                        | "git_action"
+                        | "file_read"
+                        | "file_write"
+                        | "file_delete"
+                        | "file_download_prepare"
+                        | "file_download_chunk"
+                )
+        }
+        _ => false,
     }
 }
 
@@ -1154,6 +1226,26 @@ pub struct HttpE2eeAuthPayload {
 pub struct AuthChallengePayload {
     pub device_id: DeviceId,
     pub challenge: Challenge,
+    pub expires_at_ms: UnixTimestampMillis,
+}
+
+/// daemon 在设备认证成功后签发的短期会话凭证。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionTokenGrantPayload {
+    pub server_id: ServerId,
+    pub device_id: DeviceId,
+    pub token: SessionToken,
+    pub expires_at_ms: UnixTimestampMillis,
+}
+
+/// HTTP control plane 用它恢复某个 session 的 connection scope。
+///
+/// 它只表示“这个设备在这个 daemon 上已经取得某个 session 的 HTTP 作用域”，
+/// 不替代设备认证，也不表达 watched terminal attachment 的生命周期。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionScopeGrantPayload {
+    pub session_id: SessionId,
+    pub token: SessionToken,
     pub expires_at_ms: UnixTimestampMillis,
 }
 
@@ -2635,6 +2727,17 @@ mod tests {
             challenge: Challenge("challenge".to_owned()),
             expires_at_ms: UnixTimestampMillis(1_710_000_060_000),
         };
+        let session_token_grant = SessionTokenGrantPayload {
+            server_id,
+            device_id,
+            token: SessionToken("session-token".to_owned()),
+            expires_at_ms: UnixTimestampMillis(1_710_000_060_000),
+        };
+        let session_scope_grant = SessionScopeGrantPayload {
+            session_id: SessionId::new(),
+            token: SessionToken("session-scope-token".to_owned()),
+            expires_at_ms: UnixTimestampMillis(1_710_000_060_000),
+        };
         let pair_request = PairRequestPayload {
             device_id,
             device_public_key: PublicKey("device-pub".to_owned()),
@@ -2657,9 +2760,64 @@ mod tests {
         assert_roundtrip(hello);
         assert_roundtrip(auth);
         assert_roundtrip(auth_challenge);
+        assert_roundtrip(session_token_grant);
+        assert_roundtrip(session_scope_grant);
         assert_roundtrip(pair_request);
         assert_roundtrip(pair_accept);
         assert_roundtrip(qr_payload);
+    }
+
+    #[test]
+    fn http_tunnel_allowlist_accepts_only_current_control_and_file_routes() {
+        let session_id = SessionId::new();
+
+        for path in [
+            "/api/control/session/list".to_owned(),
+            "/api/control/session/reorder".to_owned(),
+            "/api/control/daemon/clients".to_owned(),
+            "/api/control/daemon/client_forget".to_owned(),
+            "/api/control/daemon/status".to_owned(),
+            "/api/control/session/attach".to_owned(),
+            format!("/api/control/session/{}/cursor", session_id.0),
+            format!("/api/control/session/{}/resize", session_id.0),
+            format!("/api/control/session/{}/rename", session_id.0),
+            format!("/api/control/session/{}/close", session_id.0),
+            format!("/api/control/session/{}/files", session_id.0),
+            format!("/api/control/session/{}/search", session_id.0),
+            format!("/api/control/session/{}/git", session_id.0),
+            format!("/api/control/session/{}/git_diff", session_id.0),
+            format!("/api/control/session/{}/git_action", session_id.0),
+            format!("/api/control/session/{}/file_read", session_id.0),
+            format!("/api/control/session/{}/file_write", session_id.0),
+            format!("/api/control/session/{}/file_delete", session_id.0),
+            format!(
+                "/api/control/session/{}/file_download_prepare",
+                session_id.0
+            ),
+            format!("/api/control/session/{}/file_download_chunk", session_id.0),
+            "/api/files/upload/init".to_owned(),
+            "/api/files/upload".to_owned(),
+            "/api/files/upload/abort".to_owned(),
+            "/api/files/download".to_owned(),
+        ] {
+            assert!(is_http_tunnel_path_allowed("POST", &path), "{path}");
+        }
+
+        for path in [
+            "/healthz",
+            "/api/control/auth/verify",
+            "/api/control/session/not-a-uuid/files",
+            "/api/control/session/list/extra",
+            "/api/files/download/extra",
+        ] {
+            assert!(!is_http_tunnel_path_allowed("POST", path), "{path}");
+        }
+
+        // 中文注释：HTTP tunnel 当前只允许 POST，GET 不能提前进入 relay/daemon tunnel。
+        assert!(!is_http_tunnel_path_allowed(
+            "GET",
+            "/api/control/session/list"
+        ));
     }
 
     #[test]
@@ -3367,6 +3525,8 @@ mod tests {
             (METHOD_DAEMON_CLIENTS, MessageType::DaemonClients),
             (METHOD_DAEMON_CLIENT_FORGET, MessageType::DaemonClientForget),
             (METHOD_DAEMON_STATUS, MessageType::DaemonStatus),
+            (METHOD_AUTH_SESSION_TOKEN, MessageType::SessionTokenGrant),
+            (METHOD_SESSION_SCOPE_TOKEN, MessageType::SessionScopeGrant),
             (METHOD_PING, MessageType::Ping),
         ];
         for (method, expected) in request_cases {
@@ -3378,6 +3538,8 @@ mod tests {
 
         let event_cases = [
             (MessageType::AuthChallenge, METHOD_AUTH_CHALLENGE),
+            (MessageType::SessionTokenGrant, METHOD_AUTH_SESSION_TOKEN),
+            (MessageType::SessionScopeGrant, METHOD_SESSION_SCOPE_TOKEN),
             (MessageType::SessionActivity, METHOD_SESSION_ACTIVITY),
             (MessageType::SessionCwdChanged, METHOD_SESSION_CWD),
             (MessageType::SessionFilesResult, METHOD_SESSION_FILES),

@@ -1,10 +1,13 @@
+import { createServer, type IncomingMessage, type Server as HttpServer, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
+import { Buffer } from "node:buffer";
 import { ed25519 } from "@noble/curves/ed25519";
 import { WebSocketServer, type RawData, type WebSocket } from "ws";
 import {
   authSigningInputBytes,
   daemonE2eeSigningInputBytes,
   decodeEd25519PublicKey,
+  httpE2eeSigningInputBytes,
   e2eeAuthTranscriptDigestWire,
   encodeEd25519Wire,
   verifyEd25519Signature,
@@ -40,6 +43,7 @@ import type {
   AttachFramePayload,
   DaemonClientSummaryPayload,
   DaemonStatusResultPayload,
+  HttpE2eeAuthPayload,
   E2eeKeyExchangePayload,
   EncryptedFramePayload,
   Envelope,
@@ -54,6 +58,7 @@ import type {
   SessionCursorPayload,
   SessionFileReadResultPayload,
   SessionFileTransferChunkPayload,
+  SessionScopeGrantPayload,
   SessionFileUploadProgressPayload,
   SessionFileUploadReadyPayload,
   SessionFileWrittenPayload,
@@ -93,6 +98,7 @@ interface MockDaemonOptions {
   routeReadyDelayMs?: number;
   routeReadyDelayOnceMs?: number;
   daemonPacketVersion?: number;
+  daemonBinaryVersion?: number | null;
   pairFailure?: ErrorPayload;
   sessionDataError?: ErrorPayload;
   resizeAckDelayMs?: number;
@@ -118,6 +124,9 @@ interface MockDaemonOptions {
   fileUploadProgressDelayMs?: number;
   relayClientPathOnly?: boolean;
   closeSessionUnownedError?: ErrorPayload;
+  pingDelayMs?: number;
+  sessionTokenExpiresAtMs?: number;
+  sessionScopeExpiresAtMs?: number;
 }
 
 interface QueuedSessionListResponse {
@@ -135,6 +144,18 @@ interface QueuedSessionFilesResponse {
 interface TrustedDevice {
   deviceId: UUID;
   devicePublicKey: string;
+}
+
+interface SessionScopeRecord {
+  deviceId: UUID;
+  sessionId: UUID;
+  token: string;
+  expiresAtMs: number;
+}
+
+interface SessionTokenRecord {
+  deviceId: UUID;
+  expiresAtMs: number;
 }
 
 interface MockTerminalStream {
@@ -165,6 +186,7 @@ interface MockConnection {
   id: number;
   socket: WebSocket;
   routed: boolean;
+  httpPackets?: ProtocolPacket[];
   deviceId?: UUID;
   e2ee?: E2eeSession;
   attachedSessionIds: Set<UUID>;
@@ -179,7 +201,9 @@ interface MockConnection {
   activeRequest?: ProtocolPacket;
   activeStreamId?: PacketStreamId;
   respondedToActiveRequest?: boolean;
+  requestChain?: Promise<void>;
   binaryMode?: boolean;
+  aborted?: boolean;
 }
 
 interface MockBinaryWireFrameLog {
@@ -204,6 +228,7 @@ export class MockDaemon {
   public readonly receivedPackets: ProtocolPacket[] = [];
   public readonly sentPackets: ProtocolPacket[] = [];
   public readonly receivedPacketLog: Array<{ connection_id: number; packet: ProtocolPacket }> = [];
+  public readonly receivedHttpRequests: Array<{ path: string; method: string; payload: unknown }> = [];
   public readonly sentPacketLog: Array<{ connection_id: number; packet: ProtocolPacket }> = [];
   public readonly createdCommands: string[][] = [];
   public readonly sessionDataMessages: string[] = [];
@@ -242,6 +267,8 @@ export class MockDaemon {
   private readonly queuedSessionFilesResponses: QueuedSessionFilesResponse[] = [];
   private readonly e2eeKeypair: E2eeKeyPair;
   private readonly trustedDevices = new Map<UUID, TrustedDevice>();
+  private readonly sessionTokens = new Map<string, SessionTokenRecord>();
+  private readonly sessionScopes = new Map<string, SessionScopeRecord>();
   private readonly connections = new Set<MockConnection>();
   private readonly sessionFilePositions = new Map<UUID, string>();
   private readonly sessionOutputSnapshots = new Map<UUID, string>();
@@ -249,7 +276,8 @@ export class MockDaemon {
   private readonly fileStore = new Map<string, Uint8Array>();
 
   private constructor(
-    private readonly server: WebSocketServer,
+    private readonly httpServer: HttpServer,
+    private readonly wsServer: WebSocketServer,
     private readonly urlValue: string,
     private readonly options: MockDaemonOptions,
   ) {
@@ -258,11 +286,29 @@ export class MockDaemon {
   }
 
   static async start(options: MockDaemonOptions): Promise<MockDaemon> {
-    const server = new WebSocketServer({ port: 0, host: "127.0.0.1" });
-    await new Promise<void>((resolve) => server.once("listening", resolve));
-    const address = server.address() as AddressInfo;
-    const daemon = new MockDaemon(server, `ws://127.0.0.1:${address.port}/ws`, options);
-    server.on("connection", (socket, request) => daemon.accept(socket, request.url ?? ""));
+    let daemon!: MockDaemon;
+    const httpServer = createServer((request, response) => {
+      void daemon.handleNodeHttpRequest(request, response);
+    });
+    const wsServer = new WebSocketServer({ noServer: true });
+    httpServer.on("upgrade", (request, socket, head) => {
+      const requestUrl = new URL(request.url ?? "/", "http://127.0.0.1");
+      if (!/\/ws$/u.test(requestUrl.pathname)) {
+        socket.destroy();
+        return;
+      }
+      wsServer.handleUpgrade(request, socket, head, (websocket) => {
+        daemon.accept(websocket, request.url ?? "");
+      });
+    });
+    await new Promise<void>((resolve) => httpServer.listen(0, "127.0.0.1", resolve));
+    const address = httpServer.address() as AddressInfo;
+    daemon = new MockDaemon(httpServer, wsServer, `ws://127.0.0.1:${address.port}/ws`, options);
+    const registry = globalThis as typeof globalThis & {
+      __TERMD_TEST_HTTP_DAEMONS__?: Map<string, MockDaemon>;
+    };
+    registry.__TERMD_TEST_HTTP_DAEMONS__ ??= new Map();
+    registry.__TERMD_TEST_HTTP_DAEMONS__.set(`http://127.0.0.1:${address.port}`, daemon);
     return daemon;
   }
 
@@ -307,6 +353,30 @@ export class MockDaemon {
   closeNextDaemonClientsRequests(count = 1): void {
     // daemon.clients 是后台元数据请求；关闭它不能被前端升级成终端永久断线。
     this.closeDaemonClientsRequests = Math.max(0, Math.floor(count));
+  }
+
+  expireSessionToken(token: string, expiresAtMs = 0): void {
+    const record = this.sessionTokens.get(token);
+    if (!record) {
+      return;
+    }
+    // 中文注释：测试 daemon 侧直接判定 bearer 过期的路径，覆盖浏览器本地缓存仍自认为有效的场景。
+    this.sessionTokens.set(token, {
+      ...record,
+      expiresAtMs,
+    });
+  }
+
+  expireSessionScope(token: string, expiresAtMs = 0): void {
+    const record = this.sessionScopes.get(token);
+    if (!record) {
+      return;
+    }
+    // 中文注释：模拟 daemon 直接判定现有 scope 失效，而浏览器本地缓存仍未过期的场景。
+    this.sessionScopes.set(token, {
+      ...record,
+      expiresAtMs,
+    });
   }
 
   queueSessionListResponse(sessions: SessionSummaryPayload[], delayMs = 0): void {
@@ -364,6 +434,15 @@ export class MockDaemon {
     } satisfies ProtocolPacket<PacketErrorPayload>);
   }
 
+  sendSessionClosed(sessionId: UUID): void {
+    for (const connection of this.connections) {
+      if (connection.e2ee) {
+        this.sendInner(connection, envelope("session_closed", { session_id: sessionId }));
+      }
+    }
+    this.cleanupClosedSession(sessionId);
+  }
+
   setSessionFilePosition(sessionId: UUID, path: string): void {
     // 测试轮询时只改变 daemon 端共享目录，不主动 push，才能确认前端真的发起了下一次 session_files。
     this.sessionFilePositions.set(sessionId, path);
@@ -419,15 +498,79 @@ export class MockDaemon {
   }
 
   async stop(): Promise<void> {
-    this.server.clients.forEach((client) => client.close());
+    const registry = globalThis as typeof globalThis & {
+      __TERMD_TEST_HTTP_DAEMONS__?: Map<string, MockDaemon>;
+    };
+    registry.__TERMD_TEST_HTTP_DAEMONS__?.delete(this.httpBaseUrl());
+    this.wsServer.clients.forEach((client) => client.close());
     await new Promise<void>((resolve, reject) => {
-      this.server.close((error) => (error ? reject(error) : resolve()));
+      this.httpServer.close((error) => (error ? reject(error) : resolve()));
     });
+  }
+
+  httpBaseUrl(): string {
+    return this.urlValue.replace(/^ws:/u, "http:").replace(/\/ws$/u, "");
   }
 
   dropConnections(): void {
     // 移动端 PWA 切后台时系统可能只杀掉 WebSocket，而 daemon 本身仍然在线。
-    this.server.clients.forEach((client) => client.close());
+    this.wsServer.clients.forEach((client) => client.close());
+  }
+
+  private async handleNodeHttpRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    const url = new URL(request.url ?? "/", this.httpBaseUrl());
+    const setCorsHeaders = () => {
+      response.setHeader("access-control-allow-origin", "*");
+      response.setHeader("access-control-allow-methods", "POST, OPTIONS");
+      response.setHeader(
+        "access-control-allow-headers",
+        "authorization, content-type, x-termd-server-id, x-termd-device-id, x-termd-e2ee-public-key, x-termd-e2ee-nonce, x-termd-e2ee-timestamp-ms, x-termd-e2ee-signature, x-termd-session-scope",
+      );
+      response.setHeader("access-control-max-age", "600");
+    };
+    setCorsHeaders();
+    if (request.method === "OPTIONS") {
+      // 中文注释：浏览器 direct 模式访问不同端口的 daemon 时，HTTP control 会先走
+      // CORS preflight；测试桩必须显式放行，才能覆盖真实跨源直连路径。
+      response.statusCode = 204;
+      response.end();
+      return;
+    }
+    if (!/^\/api\/control\//u.test(url.pathname)) {
+      response.statusCode = 404;
+      response.end();
+      return;
+    }
+    const abortController = new AbortController();
+    request.on("aborted", () => abortController.abort());
+    response.on("close", () => {
+      if (!response.writableEnded) {
+        abortController.abort();
+      }
+    });
+    const chunks: Buffer[] = [];
+    for await (const chunk of request) {
+      chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
+    }
+    try {
+      const result = await this.handleHttpControlRequest(url.toString(), {
+        method: request.method,
+        headers: request.headers as HeadersInit,
+        body: chunks.length > 0 ? Buffer.concat(chunks) : undefined,
+        signal: abortController.signal,
+      });
+      response.statusCode = result.status;
+      result.headers.forEach((value, key) => response.setHeader(key, value));
+      setCorsHeaders();
+      response.end(Buffer.from(await result.arrayBuffer()));
+    } catch (error) {
+      if (abortController.signal.aborted) {
+        response.destroy();
+        return;
+      }
+      response.statusCode = 500;
+      response.end(String(error instanceof Error ? error.message : error));
+    }
   }
 
   setDropAuthChallenge(drop: boolean): void {
@@ -472,17 +615,23 @@ export class MockDaemon {
       terminalStreamsBySession: new Map(),
       fileUploadsById: new Map(),
       fileDownloadsById: new Map(),
+      requestChain: Promise.resolve(),
     };
     this.connections.add(connection);
     this.acceptedConnections += 1;
     socket.on("close", () => this.connections.delete(connection));
 
     socket.on("message", (raw, isBinary) => {
-      if (isBinary) {
-        void this.handleOuterBinary(connection, bytesFromWsMessage(raw));
-        return;
-      }
-      void this.handleOuter(connection, raw.toString());
+      const run = async () => {
+        if (isBinary) {
+          await this.handleOuterBinary(connection, bytesFromWsMessage(raw));
+          return;
+        }
+        await this.handleOuter(connection, raw.toString());
+      };
+      connection.requestChain = (connection.requestChain ?? Promise.resolve())
+        .catch(() => undefined)
+        .then(run);
     });
   }
 
@@ -494,7 +643,7 @@ export class MockDaemon {
       nonce: nonce(),
       timestamp_ms: nowMs(),
       packet_version: this.options.daemonPacketVersion ?? PROTOCOL_PACKET_VERSION,
-      binary_version: BINARY_PROTOCOL_VERSION,
+      binary_version: this.options.daemonBinaryVersion ?? BINARY_PROTOCOL_VERSION,
     };
     const signature = ed25519.sign(
       daemonE2eeSigningInputBytes(payload, {
@@ -898,6 +1047,7 @@ export class MockDaemon {
         if (queued?.delayMs) {
           await new Promise((resolve) => setTimeout(resolve, queued.delayMs));
         }
+        this.throwIfHttpAborted(connection);
         this.sendPacketResponse(connection, packet, { sessions: queued?.sessions ?? this.options.sessions });
         return true;
       }
@@ -929,9 +1079,11 @@ export class MockDaemon {
       case "session.files": {
         const payload = packet.payload as { session_id: UUID; path?: string | null };
         if (!connection.attachedSessionIds.has(payload.session_id)) {
-          this.sendPacketError(connection, packet, "invalid_state", "invalid protocol state");
+          this.sendPacketError(connection, packet, "auth_failed", "auth failed");
           return true;
         }
+        // 中文注释：真实 daemon 一收到 HTTP files 请求就已经进入服务端处理队列；
+        // 即使浏览器随后超时，测试也应当能观察到“请求已发出”。
         this.sessionFileRequests.push(payload);
         const queued = this.dequeueSessionFilesResponse(payload);
         const delayMs = queued?.delayMs ?? this.options.sessionFilesDelayMsByPath?.[payload.path ?? ""] ?? this.options.sessionFilesDelayMs;
@@ -939,6 +1091,7 @@ export class MockDaemon {
           // 中文注释：packet response 按 id 返回；慢 files 请求不能抢占同连接上的其他请求。
           await new Promise((resolve) => setTimeout(resolve, delayMs));
         }
+        this.throwIfHttpAborted(connection);
         const files = queued?.files ?? this.resolveSessionFilesResult(payload);
         this.sendPacketResponse(connection, packet, files);
         return true;
@@ -946,7 +1099,9 @@ export class MockDaemon {
       case "session.git": {
         const payload = packet.payload as { session_id: UUID };
         if (!connection.attachedSessionIds.has(payload.session_id)) {
-          this.sendPacketError(connection, packet, "invalid_state", "invalid protocol state");
+          // 中文注释：HTTP session scope 缺失/过期时，git 面板也必须走统一的 auth_failed 语义，
+          // 否则会掩盖前端对 scope 失效自愈路径的真实处理。
+          this.sendPacketError(connection, packet, "auth_failed", "auth failed");
           return true;
         }
         this.sessionGitRequests.push(payload);
@@ -962,9 +1117,81 @@ export class MockDaemon {
         );
         return true;
       }
+      case "auth.session_token": {
+        if (!connection.deviceId) {
+          this.sendPacketError(connection, packet, "invalid_state", "invalid protocol state");
+          return true;
+        }
+        const token = `mock-session-token-${connection.deviceId}`;
+        const expiresAtMs = this.options.sessionTokenExpiresAtMs ?? nowMs() + 60_000;
+        this.sessionTokens.set(token, {
+          deviceId: connection.deviceId,
+          expiresAtMs,
+        });
+        this.sendPacketResponse(connection, packet, {
+          server_id: this.serverId,
+          device_id: connection.deviceId,
+          token,
+          expires_at_ms: expiresAtMs,
+        });
+        return true;
+      }
       default:
         return false;
     }
+  }
+
+  async handleHttpControlRequest(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+    const url = new URL(input instanceof Request ? input.url : String(input));
+    const requestInit = input instanceof Request && !init
+      ? {
+          method: input.method,
+          headers: input.headers,
+          body: input.body,
+          signal: input.signal,
+        }
+      : init;
+    const headers = new Headers(requestInit?.headers);
+    if (requestInit?.signal?.aborted) {
+      throw new DOMException("The operation was aborted", "AbortError");
+    }
+    const authorization = headers.get("authorization");
+    const bearer = authorization?.startsWith("Bearer ") ? authorization.slice("Bearer ".length) : undefined;
+    if (!bearer) {
+      return this.jsonError(401, "auth_failed", "auth failed");
+    }
+    const tokenRecord = this.sessionTokens.get(bearer);
+    if (!tokenRecord || tokenRecord.expiresAtMs < nowMs()) {
+      return this.jsonError(401, "auth_failed", "auth failed");
+    }
+    const deviceId = tokenRecord.deviceId;
+    let httpE2ee: E2eeSession;
+    try {
+      httpE2ee = await this.httpE2eeSessionFromHeaders(headers, url.pathname, requestInit?.method ?? "POST");
+    } catch {
+      return this.jsonError(400, "invalid_envelope", "message envelope is invalid");
+    }
+    const body = await this.requestBodyBytes(requestInit?.body);
+    const frames = this.decodeHttpE2eeFrames(httpE2ee, body);
+    const payload = frames[0] ? JSON.parse(decodeUtf8(frames[0])) : {};
+    // 中文注释：HTTP 控制面要把“请求已送达 daemon”与“最终是否成功返回”分开记录，
+    // 这样 timeout/断链测试才能断言真实到达过的请求。
+    this.receivedHttpRequests.push({ path: url.pathname, method: requestInit?.method ?? "POST", payload });
+
+    const sessionScopeToken = headers.get("x-termd-session-scope");
+    const connection = this.httpConnection(deviceId, sessionScopeToken ?? undefined);
+    if (requestInit?.signal) {
+      requestInit.signal.addEventListener("abort", () => {
+        connection.aborted = true;
+      }, { once: true });
+    }
+    const response = await this.dispatchHttpControl(connection, url.pathname, payload);
+    const encoded = this.encodeHttpE2eeFrames(httpE2ee, response.frames.map((frame) => encodeUtf8(JSON.stringify(frame))));
+    const bodyBytes = encoded.slice();
+    return new Response(bodyBytes, {
+      status: response.status,
+      headers: { "content-type": "application/octet-stream" },
+    });
   }
 
   private packetToLegacyEnvelope(packet: ProtocolPacket): Envelope | undefined {
@@ -977,6 +1204,236 @@ export class MockDaemon {
 
   private packetMethodNeedsEmptyAck(method?: string): boolean {
     return protocolMethodNeedsEmptyAck(method);
+  }
+
+  private httpConnection(deviceId: UUID, sessionScopeToken?: string): MockConnection {
+    const connection: MockConnection = {
+      id: 0,
+      socket: {} as WebSocket,
+      routed: true,
+      httpPackets: [],
+      deviceId,
+      attachedSessionIds: new Set(),
+      watchedSessionIds: new Set(),
+      pendingCanceledTerminalStreamIds: new Set(),
+      terminalStreamsById: new Map(),
+      terminalStreamsBySession: new Map(),
+      fileUploadsById: new Map(),
+      fileDownloadsById: new Map(),
+    };
+    if (sessionScopeToken) {
+      const scope = this.sessionScopes.get(sessionScopeToken);
+      if (
+        scope &&
+        scope.deviceId === deviceId &&
+        scope.expiresAtMs >= nowMs() &&
+        this.options.sessions.some((session) => session.session_id === scope.sessionId)
+      ) {
+        connection.attachedSessionIds.add(scope.sessionId);
+      }
+    }
+    return connection;
+  }
+
+  private async dispatchHttpControl(
+    connection: MockConnection,
+    path: string,
+    payload: unknown,
+  ): Promise<{ status: number; frames: unknown[] }> {
+    const method = this.httpControlMethod(path);
+    switch (method.kind) {
+      case "global":
+        return this.dispatchHttpUnary(connection, method.method, payload);
+      case "session": {
+        if (!method.sessionId) {
+          return { status: 400, frames: [{ code: "invalid_envelope", message: "message envelope is invalid" }] };
+        }
+        if (!connection.attachedSessionIds.has(method.sessionId)) {
+          // 中文注释：真实 daemon 在 session scope token 缺失、过期或与 session 不匹配时
+          // 直接返回 401 auth_failed，而不是把它伪装成业务层 invalid_state。
+          return { status: 401, frames: [{ code: "auth_failed", message: "auth failed" }] };
+        }
+        return this.dispatchHttpUnary(connection, method.method, payload);
+      }
+    }
+  }
+
+  private async dispatchHttpUnary(
+    connection: MockConnection,
+    method: string,
+    payload: unknown,
+  ): Promise<{ status: number; frames: unknown[] }> {
+    if (connection.aborted) {
+      throw new DOMException("The operation was aborted", "AbortError");
+    }
+    const sentPacketStart = connection.httpPackets?.length ?? 0;
+    const packet: ProtocolPacket = {
+      version: PROTOCOL_PACKET_VERSION,
+      kind: "request",
+      id: randomUuid(),
+      method,
+      payload,
+    };
+    const previousRequest = connection.activeRequest;
+    const previousResponded = connection.respondedToActiveRequest;
+    connection.activeRequest = packet;
+    connection.respondedToActiveRequest = false;
+    try {
+      if (await this.handleDirectPacketRequest(connection, packet)) {
+        if (connection.aborted) {
+          throw new DOMException("The operation was aborted", "AbortError");
+        }
+        return this.packetFramesForHttpRequest(connection, sentPacketStart);
+      }
+      const legacy = this.packetToLegacyEnvelope(packet);
+      if (!legacy) {
+        // 中文注释：HTTP control 的未知方法也要经过 packet error 路径，
+        // 这样浏览器端看到的语义和 WebSocket request 一致。
+        this.sendPacketError(connection, packet, "unknown_method", "unknown protocol method");
+        return this.packetFramesForHttpRequest(connection, sentPacketStart);
+      }
+      await this.handleLegacyInner(connection, legacy);
+      if (connection.aborted) {
+        throw new DOMException("The operation was aborted", "AbortError");
+      }
+      if (!connection.respondedToActiveRequest && this.packetMethodNeedsEmptyAck(method)) {
+        this.sendPacketResponse(connection, packet, {});
+      }
+      return this.packetFramesForHttpRequest(connection, sentPacketStart);
+    } finally {
+      connection.activeRequest = previousRequest;
+      connection.respondedToActiveRequest = previousResponded;
+    }
+  }
+
+  private httpControlMethod(pathname: string):
+    | { kind: "global"; method: string }
+    | { kind: "session"; method: string; sessionId?: UUID } {
+    const controlPrefix = pathname.match(/\/api\/control\/(.+)$/u);
+    const trimmed = controlPrefix?.[1] ?? pathname.replace(/^\/api\/control\//u, "");
+    const segments = trimmed.split("/").filter(Boolean);
+    if (segments[0] === "session" && segments.length >= 3) {
+      return {
+        kind: "session",
+        sessionId: segments[1],
+        method: `session.${segments.slice(2).join(".")}`,
+      };
+    }
+    return { kind: "global", method: segments.join(".") };
+  }
+
+  private async httpE2eeSessionFromHeaders(headers: Headers, path: string, method: string): Promise<E2eeSession> {
+    const deviceId = headers.get("x-termd-device-id");
+    const devicePublicKey = headers.get("x-termd-e2ee-public-key");
+    const nonceValue = headers.get("x-termd-e2ee-nonce");
+    const timestampValue = headers.get("x-termd-e2ee-timestamp-ms");
+    const signature = headers.get("x-termd-e2ee-signature");
+    if (!deviceId || !devicePublicKey || !nonceValue || !timestampValue || !signature) {
+      throw new Error("missing HTTP E2EE headers");
+    }
+    const trusted = this.trustedDevices.get(deviceId);
+    if (!trusted) {
+      throw new Error("device not trusted");
+    }
+    const auth: HttpE2eeAuthPayload = {
+      device_id: deviceId,
+      e2ee_public_key: devicePublicKey,
+      nonce: nonceValue,
+      timestamp_ms: Number(timestampValue),
+      method,
+      path,
+      signature,
+    };
+    const ok = await verifyEd25519Signature(
+      decodeEd25519PublicKey(trusted.devicePublicKey),
+      httpE2eeSigningInputBytes(auth, {
+        server_id: this.serverId,
+        daemon_public_key: this.daemonPublicKey,
+      }),
+      signature,
+    );
+    if (!ok) {
+      throw new Error("invalid HTTP E2EE signature");
+    }
+    return E2eeSession.daemon({
+      serverId: this.serverId,
+      deviceId,
+      localKeypair: this.e2eeKeypair,
+      devicePublicKeyWire: devicePublicKey,
+    });
+  }
+
+  private decodeHttpE2eeFrames(e2ee: E2eeSession, wire: Uint8Array): Uint8Array[] {
+    const frames: Uint8Array[] = [];
+    let offset = 0;
+    while (offset < wire.byteLength) {
+      const len = new DataView(wire.buffer, wire.byteOffset + offset, 4).getUint32(0, false);
+      offset += 4;
+      const encrypted = decodeBinaryEncryptedFrame(wire.slice(offset, offset + len));
+      frames.push(e2ee.decryptBinary(encrypted));
+      offset += len;
+    }
+    return frames;
+  }
+
+  private encodeHttpE2eeFrames(e2ee: E2eeSession, frames: Uint8Array[]): Uint8Array {
+    const parts = frames.map((frame) => {
+      const encrypted = encodeBinaryEncryptedFrame(e2ee.encryptBinary(frame));
+      const wire = new Uint8Array(4 + encrypted.byteLength);
+      new DataView(wire.buffer, wire.byteOffset, 4).setUint32(0, encrypted.byteLength, false);
+      wire.set(encrypted, 4);
+      return wire;
+    });
+    const total = parts.reduce((sum, part) => sum + part.byteLength, 0);
+    const out = new Uint8Array(total);
+    let offset = 0;
+    for (const part of parts) {
+      out.set(part, offset);
+      offset += part.byteLength;
+    }
+    return out;
+  }
+
+  private async requestBodyBytes(body: BodyInit | null | undefined): Promise<Uint8Array> {
+    if (!body) {
+      return new Uint8Array();
+    }
+    if (body instanceof ArrayBuffer) {
+      return new Uint8Array(body);
+    }
+    if (ArrayBuffer.isView(body)) {
+      return new Uint8Array(body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength));
+    }
+    if (body instanceof Blob) {
+      return new Uint8Array(await body.arrayBuffer());
+    }
+    if (typeof body === "string") {
+      return encodeUtf8(body);
+    }
+    if (typeof Buffer !== "undefined" && body instanceof Buffer) {
+      return new Uint8Array(body);
+    }
+    throw new Error("unsupported HTTP body");
+  }
+
+  private jsonError(status: number, code: string, message: string): Response {
+    return new Response(JSON.stringify({ code, message }), {
+      status,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  private packetFramesForHttpRequest(connection: MockConnection, startIndex: number): { status: number; frames: unknown[] } {
+    const packets = (connection.httpPackets ?? []).slice(startIndex);
+    if (packets.length === 0) {
+      return { status: 500, frames: [{ code: "invalid_state", message: "invalid protocol state" }] };
+    }
+    return {
+      // 中文注释：真实 HTTP control 会把业务层 packet error 也包在 200 + E2EE packet frame 里，
+      // 只有认证/包格式等前置失败才走非 200 HTTP status。
+      status: 200,
+      frames: packets,
+    };
   }
 
   private async handleLegacyInner(connection: MockConnection, inner: Envelope): Promise<void> {
@@ -1039,12 +1496,18 @@ export class MockDaemon {
         this.daemonStatusRequests += 1;
         if (this.closeDaemonStatusRequests > 0) {
           this.closeDaemonStatusRequests -= 1;
+          if (connection.httpPackets) {
+            // 中文注释：HTTP 控制面下，status 失败只应打断这一笔 fetch；
+            // 终端 stream 仍由独立 WebSocket 维持，不能跟着一起被 mock 关掉。
+            throw new TypeError("mock daemon status closed");
+          }
           connection.socket.close();
           return;
         }
         if (this.options.daemonStatusDelayMs) {
           await new Promise((resolve) => setTimeout(resolve, this.options.daemonStatusDelayMs));
         }
+        this.throwIfHttpAborted(connection);
         const queuedStatus = this.options.daemonStatusResponses?.shift();
         this.sendInner(connection, envelope("daemon_status_result", queuedStatus ?? this.options.daemonStatus ?? mockDaemonStatus()));
         return;
@@ -1058,6 +1521,7 @@ export class MockDaemon {
         this.handleSessionCreate(connection, inner.payload as SessionCreatePayload);
         return;
       case "session_attach": {
+        this.throwIfHttpAborted(connection);
         const payload = inner.payload as { session_id: UUID; last_terminal_seq?: number | null };
         const watchUpdates = connection.activeRequest?.method === "terminal.attach";
         if (!this.options.sessions.some((candidate) => candidate.session_id === payload.session_id)) {
@@ -1084,6 +1548,7 @@ export class MockDaemon {
         if (this.options.attachDelayMs) {
           await new Promise((resolve) => setTimeout(resolve, this.options.attachDelayMs));
         }
+        this.throwIfHttpAborted(connection);
         const session = this.options.sessions.find((candidate) => candidate.session_id === payload.session_id);
         if (!session) {
           // 中文注释：attach ack 到达前 session 可能已被另一条连接关闭。
@@ -1119,6 +1584,10 @@ export class MockDaemon {
             resize_owner: watchUpdates,
           }),
         );
+        const scope = this.issueSessionScope(connection, payload.session_id);
+        if (scope) {
+          this.sendInner(connection, envelope("session_scope_grant", scope));
+        }
         return;
       }
       case "attach_frame": {
@@ -1160,7 +1629,14 @@ export class MockDaemon {
         if (session) {
           session.size = payload.size;
         }
-        this.broadcastSessionResized(payload.session_id, payload.size);
+        // 中文注释：真实 termd 会先给当前请求连接返回 `session_resized` ack，
+        // 再通过 watcher 通知其他已 attach 连接。HTTP control 依赖这条 ack 收口 request。
+        this.sendInner(connection, envelope("session_resized", {
+          session_id: payload.session_id,
+          size: payload.size,
+          resize_owner: true,
+        }));
+        this.broadcastSessionResized(payload.session_id, payload.size, connection);
         return;
       }
       case "session_rename": {
@@ -1392,6 +1868,9 @@ export class MockDaemon {
       }
       case "ping": {
         const payload = inner.payload as { nonce: string };
+        if (this.options.pingDelayMs) {
+          await new Promise((resolve) => setTimeout(resolve, this.options.pingDelayMs));
+        }
         this.pingMessages += 1;
         this.sendInner(connection, envelope("pong", { nonce: payload.nonce, timestamp_ms: nowMs() }));
         return;
@@ -1454,6 +1933,10 @@ export class MockDaemon {
       this.appendSessionOutput(created.session_id, this.options.attachOutput);
     }
     this.sendInner(connection, envelope("session_created", created));
+    const scope = this.issueSessionScope(connection, created.session_id);
+    if (scope) {
+      this.sendInner(connection, envelope("session_scope_grant", scope));
+    }
   }
 
   private handleClientHello(connection: MockConnection, payload: { name: string }): void {
@@ -1464,6 +1947,24 @@ export class MockDaemon {
     if (client) {
       client.name = payload.name;
     }
+  }
+
+  private issueSessionScope(connection: MockConnection, sessionId: UUID): SessionScopeGrantPayload | undefined {
+    if (!connection.deviceId) {
+      return undefined;
+    }
+    const grant: SessionScopeGrantPayload = {
+      session_id: sessionId,
+      token: `mock-session-scope-${connection.deviceId}-${sessionId}`,
+      expires_at_ms: this.options.sessionScopeExpiresAtMs ?? nowMs() + 60_000,
+    };
+    this.sessionScopes.set(grant.token, {
+      deviceId: connection.deviceId,
+      sessionId,
+      token: grant.token,
+      expiresAtMs: grant.expires_at_ms,
+    });
+    return grant;
   }
 
   private appendSessionOutput(sessionId: UUID, text: string): void {
@@ -1567,8 +2068,21 @@ export class MockDaemon {
     return false;
   }
 
-  private broadcastSessionResized(sessionId: UUID, size: TerminalSize): void {
+  private throwIfHttpAborted(connection: MockConnection): void {
+    if (connection.httpPackets && connection.aborted) {
+      throw new DOMException("The operation was aborted", "AbortError");
+    }
+  }
+
+  private broadcastSessionResized(
+    sessionId: UUID,
+    size: TerminalSize,
+    sourceConnection?: MockConnection,
+  ): void {
     for (const connection of this.connections) {
+      if (sourceConnection && connection === sourceConnection) {
+        continue;
+      }
       if (connection.e2ee && connection.watchedSessionIds.has(sessionId)) {
         this.sendInner(
           connection,
@@ -1624,6 +2138,15 @@ export class MockDaemon {
   }
 
   private sendInner(connection: MockConnection, inner: Envelope): void {
+    if (connection.httpPackets) {
+      const activeRequest = connection.activeRequest;
+      if (activeRequest && !connection.respondedToActiveRequest) {
+        this.sendPacketResponse(connection, activeRequest, inner.payload);
+        return;
+      }
+      this.sendPacketEvent(connection, this.legacyEventMethod(inner.type), inner.payload);
+      return;
+    }
     if (!connection.e2ee) {
       this.sendError(connection, "invalid_state", "invalid protocol state");
       return;
@@ -1638,6 +2161,10 @@ export class MockDaemon {
   }
 
   private sendError(connection: MockConnection, code: string, message: string): void {
+    if (connection.httpPackets) {
+      this.sendPacketError(connection, connection.activeRequest, code, message);
+      return;
+    }
     if (connection.e2ee) {
       this.sendPacketError(connection, connection.activeRequest, code, message);
       return;
@@ -1691,6 +2218,10 @@ export class MockDaemon {
   }
 
   private sendPacket(connection: MockConnection, packet: ProtocolPacket): void {
+    if (connection.httpPackets) {
+      connection.httpPackets.push(packet);
+      return;
+    }
     if (!connection.e2ee) {
       this.sendOuter(connection.socket, envelope("error", { code: "invalid_state", message: "invalid protocol state" } satisfies ErrorPayload));
       return;

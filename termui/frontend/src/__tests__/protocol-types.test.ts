@@ -30,6 +30,8 @@ describe("协议类型", () => {
       "hello",
       "auth",
       "auth_challenge",
+      "session_token_grant",
+      "session_scope_grant",
       "pair_request",
       "pair_accept",
       "session_create",

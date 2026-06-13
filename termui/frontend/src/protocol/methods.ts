@@ -11,6 +11,8 @@ export const PROTOCOL_METHOD_REGISTRY = {
   "pair.request": { legacyEnvelopeType: "pair_request" },
   auth: { legacyEnvelopeType: "auth", needsEmptyAck: true },
   "auth.verify": { legacyEnvelopeType: "auth", needsEmptyAck: true },
+  "auth.session_token": { legacyEnvelopeType: "session_token_grant" },
+  "session.scope_token": { legacyEnvelopeType: "session_scope_grant" },
   "client.hello": { legacyEnvelopeType: "client_hello", needsEmptyAck: true },
   "session.create": { legacyEnvelopeType: "session_create" },
   "session.list": { legacyEnvelopeType: "session_list" },
@@ -45,10 +47,13 @@ export type ProtocolMethod = keyof typeof PROTOCOL_METHOD_REGISTRY;
 // 中文注释：event method 是 packet 模式的公开名字，envelope type 是旧 JSON 内层名字。
 export const PROTOCOL_EVENT_METHOD_REGISTRY = {
   "auth.challenge": "auth_challenge",
+  "auth.session_token": "session_token_grant",
+  "session.scope_token": "session_scope_grant",
   "session.activity": "session_activity",
   "session.files": "session_files_result",
   "session.cwd": "session_cwd_changed",
   "session.git": "session_git_result",
+  "session.closed": "session_closed",
   "session.resized": "session_resized",
   "terminal.output": "session_data",
 } as const satisfies Record<string, Envelope["type"]>;

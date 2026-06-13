@@ -7,24 +7,17 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
-use termd_proto::ServerId;
+use termd_proto::{HTTP_FILE_TUNNEL_PATHS, ServerId, is_http_tunnel_path_allowed};
 use tower_http::cors::{Any, CorsLayer};
 use uuid::Uuid;
 
 use crate::ws::{RelayState, WEBSOCKET_MAX_FRAME_SIZE, WEBSOCKET_MAX_MESSAGE_SIZE, handle_socket};
 
-const HTTP_FILE_TUNNEL_PATHS: &[&str] = &[
-    "/api/files/upload/init",
-    "/api/files/upload",
-    "/api/files/upload/abort",
-    "/api/files/download",
-];
-
 pub fn router(state: RelayState, web_enabled: bool, http_tunnel_enabled: bool) -> Router {
     let router = Router::new()
         .route("/healthz", get(healthz))
         .route("/ws", get(relay_ws))
-        .merge(http_file_tunnel_router(http_tunnel_enabled));
+        .merge(http_api_tunnel_router(http_tunnel_enabled));
 
     // 中文注释：所有 API namespace 都要在 Web fallback 前截止，未知 API 不能返回 SPA index。
     let router = router
@@ -40,8 +33,11 @@ pub fn router(state: RelayState, web_enabled: bool, http_tunnel_enabled: bool) -
     }
 }
 
-fn http_file_tunnel_router(http_tunnel_enabled: bool) -> Router<RelayState> {
+fn http_api_tunnel_router(http_tunnel_enabled: bool) -> Router<RelayState> {
     let mut router = Router::new();
+    // 中文注释：HTTP control plane 已是当前 Web/relay 主路径，必须默认可用；
+    // relay 只做透明转发，不参与 bearer/E2EE/session scope 业务判断。
+    router = router.route("/api/control/*path", post(relay_http_tunnel));
     for path in HTTP_FILE_TUNNEL_PATHS {
         router = if http_tunnel_enabled {
             router.route(path, post(relay_http_tunnel))
@@ -51,20 +47,22 @@ fn http_file_tunnel_router(http_tunnel_enabled: bool) -> Router<RelayState> {
         };
     }
 
-    // 中文注释：跨源预检只对文件 tunnel 生效，避免把其他 relay API 路径也变成 CORS 入口。
-    router.route_layer(http_file_api_cors_layer())
+    // 中文注释：跨源预检只挂在 relay HTTP API tunnel 上；真正鉴权仍在 daemon bearer/E2EE。
+    router.route_layer(http_api_tunnel_cors_layer())
 }
 
-fn http_file_api_cors_layer() -> CorsLayer {
-    // 中文注释：relay 只转发 HTTP 文件 tunnel，不解密也不解析业务内容；但浏览器从
-    // 独立前端 origin 访问 relay file API 时仍需要通过标准 CORS 预检。
+fn http_api_tunnel_cors_layer() -> CorsLayer {
+    // 中文注释：relay 透明转发 HTTP control/file tunnel，不解密也不解析业务内容；
+    // 浏览器跨源访问时需要放开 control 与 file API 共用的认证/E2EE 头。
     CorsLayer::new()
         .allow_origin(Any)
         .allow_methods([Method::POST, Method::OPTIONS])
         .allow_headers([
             CONTENT_TYPE,
+            HeaderName::from_static("authorization"),
             HeaderName::from_static("x-termd-server-id"),
             HeaderName::from_static("x-termd-device-id"),
+            HeaderName::from_static("x-termd-session-scope"),
             HeaderName::from_static("x-termd-e2ee-public-key"),
             HeaderName::from_static("x-termd-e2ee-nonce"),
             HeaderName::from_static("x-termd-e2ee-timestamp-ms"),
@@ -91,6 +89,9 @@ async fn relay_http_tunnel(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
+    if !is_http_api_tunnel_path_allowed(method.as_str(), uri.path()) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     if !state.authorizes(auth.relay_token.as_deref()) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
@@ -121,6 +122,12 @@ async fn relay_http_tunnel(
         Ok(response) => response,
         Err(status) => status.into_response(),
     }
+}
+
+fn is_http_api_tunnel_path_allowed(method: &str, path: &str) -> bool {
+    // 中文注释：relay 只做 tunnel 前置路由，实际 bearer/E2EE/session scope 都由 daemon 校验。
+    // 路由白名单复用 proto 共享函数，避免 relay 和 daemon 的外层协议面漂移。
+    is_http_tunnel_path_allowed(method, path)
 }
 
 #[derive(Debug, Serialize)]
@@ -219,6 +226,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn router_mounts_http_control_tunnel_even_when_file_tunnel_is_disabled() {
+        for path in [
+            "/api/control/session/list",
+            "/api/control/session/reorder",
+            "/api/control/daemon/client_forget",
+        ] {
+            let response = router(RelayState::default(), true, false)
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(path)
+                        .header("x-termd-server-id", ServerId::new().0.to_string())
+                        .body(Body::empty())
+                        .expect("test request should build"),
+                )
+                .await
+                .expect("router should respond");
+
+            // 中文注释：control plane 是当前 relay Web 的主链路；没有 daemon 在线时也应进入
+            // tunnel 转发路径并返回 503，而不是被当成未知 API 或静态页面。
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn router_rejects_unknown_http_control_tunnel_path() {
+        let response = router(RelayState::default(), true, false)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/control/auth/verify")
+                    .header("x-termd-server-id", ServerId::new().0.to_string())
+                    .body(Body::empty())
+                    .expect("test request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        // 中文注释：relay 仍然只暴露当前 Web/relay 实际需要的 control 路径，不能整段放开 namespace。
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn router_rejects_unknown_http_control_tunnel_path_before_relay_auth() {
+        for path in [
+            "/api/control/auth/verify",
+            "/api/control/session/not-a-uuid/files",
+        ] {
+            let response = router(
+                RelayState::new(Some("relay-secret-1".to_owned())),
+                true,
+                false,
+            )
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(path)
+                    .header("x-termd-server-id", ServerId::new().0.to_string())
+                    .body(Body::empty())
+                    .expect("test request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+            // 中文注释：未知或畸形 control 路径必须在 relay token 认证前被路径层拒绝，避免
+            // untrusted relay 暴露更宽的 API 探测面，也让 direct/tunnel 的失败语义一致。
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        }
+    }
+
+    #[tokio::test]
     async fn router_does_not_fallback_to_web_for_api_namespace() {
         for (method, path) in [
             (Method::GET, "/api/"),
@@ -286,6 +364,35 @@ mod tests {
                     .header(
                         "access-control-request-headers",
                         "content-type,x-termd-server-id,x-termd-device-id,x-termd-e2ee-public-key,x-termd-e2ee-nonce,x-termd-e2ee-timestamp-ms,x-termd-e2ee-signature",
+                    )
+                    .body(Body::empty())
+                    .expect("test request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert!(response.status().is_success());
+        assert_eq!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .and_then(|value| value.to_str().ok()),
+            Some("*")
+        );
+    }
+
+    #[tokio::test]
+    async fn router_answers_cors_preflight_for_http_control_tunnel() {
+        let response = router(RelayState::default(), true, false)
+            .oneshot(
+                Request::builder()
+                    .method(Method::OPTIONS)
+                    .uri("/api/control/session/list")
+                    .header("origin", "http://127.0.0.1:4173")
+                    .header("access-control-request-method", "POST")
+                    .header(
+                        "access-control-request-headers",
+                        "authorization,content-type,x-termd-server-id,x-termd-device-id,x-termd-session-scope,x-termd-e2ee-public-key,x-termd-e2ee-nonce,x-termd-e2ee-timestamp-ms,x-termd-e2ee-signature",
                     )
                     .body(Body::empty())
                     .expect("test request should build"),

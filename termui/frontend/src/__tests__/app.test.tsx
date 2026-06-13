@@ -625,7 +625,7 @@ async function exerciseSupervisorBackedWebLifecycle(
   },
 ): Promise<void> {
   const sessionListRequests = () =>
-    daemon.receivedPackets.filter((packet) => packet.kind === "request" && packet.method === "session.list");
+    daemon.receivedHttpRequests.filter((request) => request.path === "/api/control/session/list");
   const terminalCreateStreams = () =>
     daemon.receivedPackets.filter((packet) => packet.kind === "stream_open" && packet.method === "terminal.create");
   const terminalAttachStreams = () =>
@@ -1031,7 +1031,7 @@ describe("termui web 工作台", () => {
     expect(document.body.textContent).not.toContain("operation timed out");
   }, 15_000);
 
-  it("已 attach 后 terminal 和普通 RPC 复用同一条 WebSocket segment 通道", async () => {
+  it("已 attach 后 terminal 走 terminal stream，普通 RPC 改走 HTTP 控制面", async () => {
     const user = userEvent.setup();
     render(<App />);
 
@@ -1046,11 +1046,11 @@ describe("termui web 工作台", () => {
     const terminalConnectionId = attachOpenLog!.connection_id;
 
     await waitFor(() => expect(daemon.daemonStatusRequests).toBeGreaterThan(0));
-    await waitFor(
-      () => expect(daemon.receivedPacketLog.some((entry) => entry.packet.method === "session.files")).toBe(true),
+    await waitFor(() =>
+      expect(daemon.receivedHttpRequests.some((request) => request.path === `/api/control/session/${DEFAULT_SESSION_ID}/files`)).toBe(true),
     );
-    await waitFor(
-      () => expect(daemon.receivedPacketLog.some((entry) => entry.packet.method === "session.git")).toBe(true),
+    await waitFor(() =>
+      expect(daemon.receivedHttpRequests.some((request) => request.path === `/api/control/session/${DEFAULT_SESSION_ID}/git`)).toBe(true),
     );
     await new Promise((resolve) => window.setTimeout(resolve, DAEMON_STATUS_POLL_INTERVAL_MS + 250));
 
@@ -1061,12 +1061,14 @@ describe("termui web 工作台", () => {
           entry.packet.kind === "request" &&
           entry.packet.method === method,
       );
-    // 中文注释：初始 session.list/status 可能发生在 attach 前的 bootstrap 连接上；
-    // attach 完成后，当前 session 的终端流和旁路 RPC 必须复用同一条 WebSocket segment 通道。
-    await waitFor(() => expect(requestOnTerminalConnection("daemon.status")).toBe(true));
-    expect(requestOnTerminalConnection("session.list")).toBe(true);
-    expect(requestOnTerminalConnection("session.files")).toBe(true);
-    expect(requestOnTerminalConnection("session.git")).toBe(true);
+    // 中文注释：attach 完成后，terminal 继续走当前 terminal WebSocket；
+    // 普通 metadata / session RPC 已迁到 HTTP 控制面，不应再落回 terminal packet request。
+    expect(requestOnTerminalConnection("daemon.status")).toBe(false);
+    expect(requestOnTerminalConnection("session.list")).toBe(false);
+    expect(requestOnTerminalConnection("session.files")).toBe(false);
+    expect(requestOnTerminalConnection("session.git")).toBe(false);
+    expect(daemon.receivedHttpRequests.some((request) => request.path === "/api/control/daemon/status")).toBe(true);
+    expect(daemon.receivedHttpRequests.some((request) => request.path === "/api/control/session/list")).toBe(true);
     await waitFor(() => expect(daemon.activeConnectionCount()).toBeGreaterThan(0));
     expect(daemon.pingMessages).toBeGreaterThan(0);
   });
@@ -1315,24 +1317,23 @@ describe("termui web 工作台", () => {
     await screen.findByText(/termd-e2e-ready/);
     await waitFor(() => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID]));
     const panel = await screen.findByLabelText("session files");
+    const terminalConnectionCountBefore = daemon.activeConnectionCount();
+    const attachedSessionCountBefore = daemon.attachedSessions.length;
 
     daemon.closeNextDaemonStatusRequests(1);
-    await waitFor(() => expect(daemon.activeConnectionCount()).toBe(0));
+    await waitFor(() => expect(daemon.daemonStatusRequests).toBeGreaterThan(0));
     const acceptedAfterClose = daemon.acceptedConnections;
 
     await user.click(within(panel).getByRole("button", { name: "Refresh files" }));
     await new Promise((resolve) => window.setTimeout(resolve, 80));
-    // 中文注释：terminal reconnect 的等待窗口里，文件刷新不能抢先创建
-    // 未 terminal.attach 的认证-only WebSocket 来覆盖 attachClientRef。
+    // 中文注释：HTTP 控制面失败不应误杀 terminal stream，也不应为了 files 刷新额外重建
+    // 认证连接；当前 terminal attach 仍应保持原样。
     expect(daemon.acceptedConnections).toBe(acceptedAfterClose);
+    expect(daemon.activeConnectionCount()).toBe(terminalConnectionCountBefore);
+    expect(daemon.attachedSessions).toHaveLength(attachedSessionCountBefore);
 
-    // 中文注释：状态轮询只是同一 WebSocket 上的旁路 segment；它发现 transport 关闭后
-    // 必须触发当前 terminal attach 重连，而不是把 workspace client 清空后停在错误态。
-    await waitFor(
-      () =>
-        expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID, DEFAULT_SESSION_ID]),
-      { timeout: 2800 },
-    );
+    // 中文注释：新结构里 daemon.status 已迁到 HTTP 控制面；单次 status transport 失败
+    // 只能影响旁路状态，不该触发 terminal attach 重连。
     expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
     expect(screen.getByTestId("terminal-pane")).toBeInTheDocument();
     const terminalInput = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
@@ -1340,6 +1341,39 @@ describe("termui web 工作台", () => {
     terminalInput!.value = "after-status-close-input";
     fireEvent.input(terminalInput!);
     await waitFor(() => expect(daemon.sessionDataMessages).toContain("after-status-close-input"));
+  });
+
+  it("daemon.status 轮询遇到 bearer 被直接拒绝时会自动刷新 session token 并继续 HTTP 控制面", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await screen.findByText(/termd-e2e-ready/);
+    await waitFor(() => expect(daemon.daemonStatusRequests).toBeGreaterThan(0));
+
+    const stateBeforeRefresh = await loadBrowserState();
+    const deviceId = stateBeforeRefresh.device?.device_id;
+    expect(deviceId).toBeTruthy();
+    const issuedToken = `mock-session-token-${deviceId!}`;
+    const sessionTokenRequestsBeforeExpire = daemon.receivedPackets.filter((packet) => packet.method === "auth.session_token").length;
+    const statusRequestsBeforeExpire = daemon.daemonStatusRequests;
+
+    daemon.expireSessionToken(issuedToken, 0);
+
+    await waitFor(() =>
+      expect(daemon.receivedPackets.filter((packet) => packet.method === "auth.session_token").length).toBeGreaterThan(sessionTokenRequestsBeforeExpire),
+    );
+    await waitFor(() => expect(daemon.daemonStatusRequests).toBeGreaterThan(statusRequestsBeforeExpire));
+    expect(daemon.receivedHttpRequests.filter((request) => request.path === "/api/control/daemon/status").length).toBeGreaterThan(1);
+    expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
+    expect(screen.getByTestId("terminal-pane")).toBeInTheDocument();
+
+    const terminalInput = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
+    expect(terminalInput).not.toBeNull();
+    terminalInput!.value = "after-status-auth-refresh";
+    fireEvent.input(terminalInput!);
+    await waitFor(() => expect(daemon.sessionDataMessages).toContain("after-status-auth-refresh"));
   });
 
   it("session.files 超时只影响文件 panel，不卸载终端", async () => {
@@ -2740,7 +2774,7 @@ describe("termui web 工作台", () => {
     await screen.findByText(/termd-e2e-ready/);
 
     const sessionListRequests = () =>
-      daemon.receivedPackets.filter((packet) => packet.kind === "request" && packet.method === "session.list").length;
+      daemon.receivedHttpRequests.filter((request) => request.path === "/api/control/session/list").length;
     await new Promise((resolve) => window.setTimeout(resolve, 150));
     const beforePull = sessionListRequests();
     const title = screen.getByRole("button", { name: "Open session list from title" });
@@ -3500,7 +3534,7 @@ describe("termui web 工作台", () => {
     // session 连接建立阶段不能继续使用普通 RPC 预算，否则 relay 正常但 Web 会自己关闭半开连接。
     daemon.delayNextRouteReady(APP_CONNECTION_TIMEOUT_MS + 500);
     await waitFor(
-      () => expect(daemon.receivedPackets.filter((packet) => packet.method === "session.list").length).toBeGreaterThan(0),
+      () => expect(daemon.receivedHttpRequests.filter((request) => request.path === "/api/control/session/list").length).toBeGreaterThan(0),
       { timeout: APP_CONNECTION_TIMEOUT_MS + 4000 },
     );
     expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
@@ -3844,14 +3878,14 @@ describe("termui web 工作台", () => {
     await waitFor(() => expect(visibleSessionNames()).toHaveLength(1));
     const createdName = visibleSessionNames()[0];
     const sessionListRequestsBeforeStaleRefresh =
-      daemon.receivedPackets.filter((packet) => packet.kind === "request" && packet.method === "session.list").length;
+      daemon.receivedHttpRequests.filter((request) => request.path === "/api/control/session/list").length;
 
     daemon.queueSessionListResponse([], 0);
     // 中文注释：桌面侧栏没有手动刷新按钮；这里用真实的后台轮询触发一次旧空列表响应。
     await waitFor(
       () =>
         expect(
-          daemon.receivedPackets.filter((packet) => packet.kind === "request" && packet.method === "session.list").length,
+          daemon.receivedHttpRequests.filter((request) => request.path === "/api/control/session/list").length,
         ).toBeGreaterThan(sessionListRequestsBeforeStaleRefresh),
       { timeout: 2600 },
     );

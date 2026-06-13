@@ -36,6 +36,7 @@ describe("DirectClient", () => {
         },
       ],
       attachOutput: "termd-e2e-ready\n",
+      pingDelayMs: 200,
     });
   });
 
@@ -93,6 +94,15 @@ describe("DirectClient", () => {
       };
       tick();
     }), timeoutMs, label);
+  }
+
+  async function receiveUntilType(client: DirectClient, expectedType: string): Promise<{ type: string; payload: unknown }> {
+    while (true) {
+      const envelope = await client.receiveInner();
+      if (envelope.type === expectedType) {
+        return envelope as { type: string; payload: unknown };
+      }
+    }
   }
 
   function httpE2eeSessionFromHeaders(headers: Headers): E2eeSession {
@@ -289,6 +299,180 @@ describe("DirectClient", () => {
     expect(attached.session_id).toBe(list.sessions[0].session_id);
   });
 
+  it("pairing 成功并提供完整 device 后，同一连接的 session.list 走 HTTP 控制面", async () => {
+    const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000344");
+    const client = await connectDevice(device.device_id);
+
+    await client.pair("secret-token", device.device_public_key, device);
+    const list = await client.listSessions();
+
+    expect(list.sessions).toHaveLength(1);
+    expect(daemon.receivedHttpRequests.some((request) => request.path === "/api/control/session/list")).toBe(true);
+    expect(daemon.receivedPackets.some((packet) => packet.method === "session.list")).toBe(false);
+    client.close();
+  });
+
+  it("authenticate 成功后会申请并缓存短期 session token", async () => {
+    const { client } = await authenticatedClient("00000000-0000-0000-0000-000000000334");
+
+    expect(daemon.receivedPackets.some((packet) => packet.method === "auth.session_token")).toBe(true);
+    expect(client.getSessionToken()).toMatchObject({
+      token: expect.any(String),
+      expires_at_ms: expect.any(Number),
+    });
+
+    client.close();
+  });
+
+  it("attachSessionPermission 成功后会缓存 session scope token", async () => {
+    const { client } = await authenticatedClient("00000000-0000-0000-0000-000000000337");
+    const list = await client.listSessions();
+    const sessionId = list.sessions[0].session_id;
+
+    await client.attachSessionPermission(sessionId);
+
+    expect(client.getSessionScope(sessionId)).toMatchObject({
+      token: expect.any(String),
+      expires_at_ms: expect.any(Number),
+    });
+    expect(daemon.receivedHttpRequests.at(-1)).toMatchObject({
+      path: "/api/control/session/attach",
+      method: "POST",
+      payload: { session_id: sessionId },
+    });
+    client.close();
+  });
+
+  it("HTTP closeSession 遇到未归属 error 帧时仍会保留当前 close ack", async () => {
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [
+        {
+          session_id: "00000000-0000-0000-0000-000000000301",
+          state: "running",
+          size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+        },
+      ],
+      closeSessionUnownedError: {
+        code: "connection_closed",
+        message: "terminal stream closed during session shutdown",
+      },
+    });
+    const { client } = await authenticatedClient("00000000-0000-0000-0000-000000000343");
+    const list = await client.listSessions();
+    const sessionId = list.sessions[0].session_id;
+
+    await client.attachSessionPermission(sessionId);
+    await receiveUntilType(client, "session_scope_grant");
+    await expect(client.closeSession(sessionId)).resolves.toMatchObject({
+      session_id: sessionId,
+    });
+    await expect(client.receiveInner()).rejects.toMatchObject({
+      code: "connection_closed",
+      message: "terminal stream closed during session shutdown",
+    });
+
+    client.close();
+  });
+
+  it("session token 过期后会在下一次 HTTP control 请求前自动刷新", async () => {
+    const { client } = await authenticatedClient("00000000-0000-0000-0000-000000000341");
+    const initialSessionTokenRequests = daemon.receivedPackets.filter((packet) => packet.method === "auth.session_token").length;
+
+    const tokenState = client.getSessionToken() as { token: string; expires_at_ms: number };
+    tokenState.expires_at_ms = 0;
+    await client.listSessions();
+
+    const sessionTokenRequests = daemon.receivedPackets.filter((packet) => packet.method === "auth.session_token");
+    expect(sessionTokenRequests).toHaveLength(initialSessionTokenRequests + 1);
+    client.close();
+  });
+
+  it("daemon 直接拒绝过期 bearer 时会刷新 session token 并重试 HTTP control", async () => {
+    const { client } = await authenticatedClient("00000000-0000-0000-0000-000000000346");
+    const issuedToken = client.getSessionToken() as { token: string; expires_at_ms: number };
+    daemon.expireSessionToken(issuedToken.token, 0);
+
+    const list = await client.listSessions();
+
+    expect(list.sessions).toHaveLength(1);
+    const sessionTokenRequests = daemon.receivedPackets.filter((packet) => packet.method === "auth.session_token");
+    expect(sessionTokenRequests.length).toBeGreaterThanOrEqual(2);
+    expect(daemon.receivedHttpRequests.some((request) => request.path === "/api/control/session/list")).toBe(true);
+    client.close();
+  });
+
+  it("session scope 过期后会在下一次 session HTTP control 请求前自动续期", async () => {
+    const { client } = await authenticatedClient("00000000-0000-0000-0000-000000000342");
+    const list = await client.listSessions();
+    const sessionId = list.sessions[0].session_id;
+
+    await client.attachSessionPermission(sessionId);
+    const scope = client.getSessionScope(sessionId) as { token: string; expires_at_ms: number };
+    scope.expires_at_ms = 0;
+
+    await client.listSessionFiles(sessionId);
+
+    const attachHttpRequests = daemon.receivedHttpRequests.filter((request) => request.path === "/api/control/session/attach");
+    expect(attachHttpRequests).toHaveLength(2);
+    client.close();
+  });
+
+  it("daemon 直接拒绝本地仍认为有效的 session scope 时会重新 attach 并重试 session HTTP control", async () => {
+    const { client } = await authenticatedClient("00000000-0000-0000-0000-000000000347");
+    const list = await client.listSessions();
+    const sessionId = list.sessions[0].session_id;
+
+    await client.attachSessionPermission(sessionId);
+    const scope = client.getSessionScope(sessionId) as { token: string; expires_at_ms: number };
+    daemon.expireSessionScope(scope.token, 0);
+
+    const files = await client.listSessionFiles(sessionId);
+
+    expect(files.session_id).toBe(sessionId);
+    const attachHttpRequests = daemon.receivedHttpRequests.filter((request) => request.path === "/api/control/session/attach");
+    expect(attachHttpRequests).toHaveLength(2);
+    expect(daemon.sessionFileRequests.at(-1)).toMatchObject({ session_id: sessionId });
+    client.close();
+  });
+
+  it("session.list 和 daemon.status 认证后走 HTTP 控制面", async () => {
+    const { client } = await authenticatedClient("00000000-0000-0000-0000-000000000338");
+
+    const list = await client.listSessions();
+    const status = await client.getDaemonStatus();
+
+    expect(list.sessions).toHaveLength(1);
+    expect(status.host_name).toBe("mock-daemon");
+    expect(daemon.receivedHttpRequests.map((request) => request.path)).toEqual([
+      "/api/control/session/list",
+      "/api/control/daemon/status",
+    ]);
+    expect(daemon.receivedPackets.some((packet) => packet.method === "session.list")).toBe(false);
+    expect(daemon.receivedPackets.some((packet) => packet.method === "daemon.status")).toBe(false);
+    client.close();
+  });
+
+  it("session.files 走 HTTP 控制面并携带 session scope token", async () => {
+    const { client } = await authenticatedClient("00000000-0000-0000-0000-000000000339");
+    const list = await client.listSessions();
+    const sessionId = list.sessions[0].session_id;
+    await client.attachSessionPermission(sessionId);
+
+    const files = await client.listSessionFiles(sessionId);
+
+    expect(files.session_id).toBe(sessionId);
+    expect(daemon.receivedHttpRequests.at(-1)).toMatchObject({
+      path: `/api/control/session/${sessionId}/files`,
+      method: "POST",
+      payload: { session_id: sessionId },
+    });
+    expect(daemon.sessionFileRequests.at(-1)).toMatchObject({ session_id: sessionId });
+    expect(daemon.receivedPackets.some((packet) => packet.method === "session.files")).toBe(false);
+    client.close();
+  });
+
   it("wrong phase calls fail locally without sending protocol requests", async () => {
     const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000330");
     const unauthenticated = await connectDevice(device.device_id);
@@ -373,7 +557,7 @@ describe("DirectClient", () => {
     const attached = await client.attachSession(list.sessions[0].session_id);
     await client.sendSessionData(attached.session_id, new TextEncoder().encode("terminal-secret"));
     await client.sendSessionCursor(attached.session_id, { row: 12, col: 8, focused: true });
-    const output = await client.receiveInner();
+    const output = await receiveUntilType(client, "attach_frame");
     const grant = await client.requestControl(attached.session_id);
     client.close();
 
@@ -576,6 +760,19 @@ describe("DirectClient", () => {
   });
 
   it("packet dispatcher 按 request id 归属响应和错误，错误不会污染并发请求", async () => {
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [
+        {
+          session_id: "00000000-0000-0000-0000-000000000301",
+          state: "running",
+          size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+        },
+      ],
+      pingDelayMs: 40,
+      attachOutput: "termd-e2e-ready\n",
+    });
     const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000310");
     const pairClient = await connectDevice(device.device_id);
     const accepted = await pairClient.pair("secret-token", device.device_public_key);
@@ -589,21 +786,11 @@ describe("DirectClient", () => {
       paired_at_ms: 1710000000000,
     });
 
-    daemon.queueSessionListResponse(
-      [
-        {
-          session_id: "00000000-0000-0000-0000-000000000301",
-          state: "running",
-          size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
-        },
-      ],
-      40,
-    );
-    const listPromise = client.listSessions();
-    const closePromise = client.closeSession(missingSessionId);
+    const pingPromise = client.sendPing();
+    const closePromise = client.attachSession(missingSessionId, { timeoutMs: 500 });
 
     await expect(closePromise).rejects.toMatchObject({ code: "session_not_found" });
-    await expect(listPromise).resolves.toMatchObject({ sessions: [{ session_id: "00000000-0000-0000-0000-000000000301" }] });
+    await expect(pingPromise).resolves.toBeUndefined();
     client.close();
 
     const receivedPackets = (
@@ -611,7 +798,7 @@ describe("DirectClient", () => {
         receivedPackets?: Array<{ id?: string; kind: string; method?: string; payload: unknown }>;
       }
     ).receivedPackets ?? [];
-    const closePacket = receivedPackets.find((packet) => packet.method === "session.close");
+    const closePacket = receivedPackets.find((packet) => packet.kind === "stream_open" && packet.method === "terminal.attach");
     const errorPacket = (
       daemon as unknown as {
         sentPackets?: Array<{ id?: string; kind: string; payload: { code?: string } }>;
@@ -637,7 +824,7 @@ describe("DirectClient", () => {
 
     const list = await client.listSessions();
     const attached = await client.attachSession(list.sessions[0].session_id);
-    const output = await client.receiveInner();
+    const output = await receiveUntilType(client, "attach_frame");
     await client.sendSessionData(attached.session_id, new TextEncoder().encode("stream-input"));
     client.close();
     await new Promise((resolve) => setTimeout(resolve, 20));
@@ -685,7 +872,7 @@ describe("DirectClient", () => {
 
     const list = await client.listSessions();
     const attached = await client.attachSession(list.sessions[0].session_id);
-    await client.receiveInner();
+    await receiveUntilType(client, "attach_frame");
     client.detachSession(attached.session_id);
     await new Promise((resolve) => setTimeout(resolve, 20));
 
@@ -719,6 +906,8 @@ describe("DirectClient", () => {
       url: daemon.url,
       paired_at_ms: 1710000000000,
     });
+    const firstList = await firstClient.listSessions();
+    await firstClient.attachSessionPermission(firstList.sessions[0].session_id);
     const secondClient = await connectDevice(device.device_id);
     await secondClient.authenticate(device, {
       server_id: accepted.server_id,
@@ -733,7 +922,9 @@ describe("DirectClient", () => {
     await secondClient.attachSessionPermission(sessionId);
 
     await firstClient.closeSession(sessionId);
-    await expect(secondClient.listSessionFiles(sessionId)).rejects.toMatchObject({ code: "invalid_state" });
+    // 中文注释：session scope 失效后，客户端会先尝试重新 attach 刷新 scope；
+    // 若 session 已被远端真正删除，最终暴露的应是 session_not_found，而不是中间态 auth_failed。
+    await expect(secondClient.listSessionFiles(sessionId)).rejects.toMatchObject({ code: "session_not_found" });
     await expect(secondClient.attachSession(sessionId)).rejects.toMatchObject({ code: "session_not_found" });
 
     firstClient.close();
@@ -766,6 +957,8 @@ describe("DirectClient", () => {
       url: daemon.url,
       paired_at_ms: 1710000000000,
     });
+    const firstList = await firstClient.listSessions();
+    await firstClient.attachSessionPermission(firstList.sessions[0].session_id);
     const secondClient = await connectDevice(device.device_id);
     await secondClient.authenticate(device, {
       server_id: accepted.server_id,
@@ -774,18 +967,56 @@ describe("DirectClient", () => {
       paired_at_ms: 1710000000000,
     });
 
-    const list = await firstClient.listSessions();
-    const sessionId = list.sessions[0].session_id;
+    const sessionId = firstList.sessions[0].session_id;
     const pendingAttach = secondClient.attachSession(sessionId, { timeoutMs: 500 });
     await waitUntil(() => daemon.attachRequests.some((request) => request.session_id === sessionId), "pending attach request");
 
     await firstClient.closeSession(sessionId);
 
     await expect(pendingAttach).rejects.toMatchObject({ code: "session_not_found" });
-    await expect(secondClient.listSessionFiles(sessionId)).rejects.toMatchObject({ code: "invalid_state" });
+    await expect(secondClient.listSessionFiles(sessionId)).rejects.toMatchObject({ code: "session_not_found" });
 
     firstClient.close();
     secondClient.close();
+  });
+
+  it("HTTP closeSession 成功后会立刻清理本地 terminal stream 和 session 权限", async () => {
+    const { client } = await authenticatedClient("00000000-0000-0000-0000-000000000340");
+    const list = await client.listSessions();
+    const sessionId = list.sessions[0].session_id;
+
+    await client.attachSession(sessionId);
+    await receiveUntilType(client, "attach_frame");
+    await client.closeSession(sessionId);
+
+    await expect(client.sendSessionData(sessionId, new TextEncoder().encode("after-close"))).rejects.toMatchObject({
+      code: "invalid_state",
+    });
+    await expect(client.listSessionFiles(sessionId)).rejects.toMatchObject({
+      code: "session_not_found",
+    });
+    client.close();
+  });
+
+  it("收到远端 session_closed 事件后会清理本地 terminal stream 状态", async () => {
+    const { client } = await authenticatedClient("00000000-0000-0000-0000-000000000344");
+    const list = await client.listSessions();
+    const sessionId = list.sessions[0].session_id;
+
+    await client.attachSession(sessionId);
+    await receiveUntilType(client, "attach_frame");
+    daemon.sendSessionClosed(sessionId);
+    await waitUntil(
+      () => client.getSessionScope(sessionId) === undefined,
+      "session scope cleared after remote close",
+    );
+
+    await expect(client.sendSessionData(sessionId, new TextEncoder().encode("after-remote-close"))).rejects.toMatchObject({
+      code: "invalid_state",
+    });
+    expect(client.getSessionScope(sessionId)).toBeUndefined();
+
+    client.close();
   });
 
   it("切换 session 后丢弃已取消 terminal stream 的排队输出", async () => {
@@ -823,7 +1054,7 @@ describe("DirectClient", () => {
     const firstSessionId = list.sessions[0].session_id;
     const secondSessionId = list.sessions[1].session_id;
     await client.attachSession(firstSessionId);
-    await client.receiveInner();
+    await receiveUntilType(client, "attach_frame");
     daemon.pushTerminalFrame(firstSessionId, {
       kind: "output",
       session_id: firstSessionId,
@@ -836,7 +1067,7 @@ describe("DirectClient", () => {
     client.detachSession(firstSessionId);
 
     await client.attachSession(secondSessionId);
-    const output = await client.receiveInner();
+    const output = await receiveUntilType(client, "attach_frame");
     client.close();
 
     expect(output.payload).toMatchObject({ session_id: secondSessionId });
@@ -858,7 +1089,7 @@ describe("DirectClient", () => {
 
     const list = await client.listSessions();
     const attached = await client.attachSession(list.sessions[0].session_id);
-    const output = await client.receiveInner();
+    const output = await receiveUntilType(client, "attach_frame");
     await client.sendSessionData(attached.session_id, new TextEncoder().encode("stream-input"));
     client.close();
     await new Promise((resolve) => setTimeout(resolve, 20));
@@ -919,7 +1150,7 @@ describe("DirectClient", () => {
 
     const list = await client.listSessions();
     const attached = await client.attachSession(list.sessions[0].session_id);
-    await client.receiveInner();
+    await receiveUntilType(client, "attach_frame");
     daemon.pushTerminalFrame(attached.session_id, {
       kind: "output",
       session_id: attached.session_id,
@@ -927,7 +1158,7 @@ describe("DirectClient", () => {
       data_base64: "c2luZ2xlLWZyYW1lCg==",
     });
 
-    const frame = await client.receiveInner();
+    const frame = await receiveUntilType(client, "attach_frame");
     client.close();
     expect(frame).toMatchObject({
       type: "attach_frame",
@@ -979,7 +1210,7 @@ describe("DirectClient", () => {
 
     const list = await client.listSessions();
     const attached = await client.attachSession(list.sessions[0].session_id);
-    await client.receiveInner();
+    await receiveUntilType(client, "attach_frame");
     daemon.pushTerminalFrameBatch(attached.session_id, [
       {
         kind: "output",
@@ -995,8 +1226,8 @@ describe("DirectClient", () => {
       },
     ]);
 
-    const first = await client.receiveInner();
-    const second = await client.receiveInner();
+    const first = await receiveUntilType(client, "attach_frame");
+    const second = await receiveUntilType(client, "attach_frame");
     const firstTransportSeq = (first.payload as { transport_seq: number }).transport_seq;
     const secondTransportSeq = (second.payload as { transport_seq: number }).transport_seq;
     client.close();
@@ -1088,7 +1319,7 @@ describe("DirectClient", () => {
         },
       ],
       attachOutput: "termd-e2e-ready\n",
-      dropDaemonClients: true,
+      pingDelayMs: 200,
     });
     type WsEmitter = WebSocket & { emit: (event: "close" | "error", ...args: unknown[]) => boolean };
     let capturedSocket: WsEmitter | undefined;
@@ -1105,8 +1336,8 @@ describe("DirectClient", () => {
     await client.authenticate(device, server);
     const list = await client.listSessions();
     const attached = await client.attachSession(list.sessions[0].session_id);
-    await client.receiveInner();
-    const probeError = client.listDaemonClients().then(
+    await receiveUntilType(client, "attach_frame");
+    const probeError = client.sendPing().then(
       () => undefined,
       (error: unknown) => error,
     );
@@ -1142,7 +1373,7 @@ describe("DirectClient", () => {
         capturedSocket?.emit("error", new Error("mock transport error"));
       }
       injected = true;
-      await expect(settleWithin(probeError, 800, "daemon.clients probe")).resolves.toMatchObject({ code: expectedCode });
+      await expect(settleWithin(probeError, 800, "ping probe")).resolves.toMatchObject({ code: expectedCode });
       await settleWithin(waitUntil(() => client.isClosed, "client close"), 800, "client close");
       expect(injected).toBe(true);
       expect(client.isClosed).toBe(true);
@@ -1169,25 +1400,27 @@ describe("DirectClient", () => {
       fileUploadProgressDelayMs: 120,
     });
     type WsEmitter = WebSocket & { emit: (event: "close" | "error", ...args: unknown[]) => boolean };
-    let capturedSocket: WsEmitter | undefined;
+    let controlSocket: WsEmitter | undefined;
     const { device, server } = await pairedDevice(`00000000-0000-0000-0000-00000000034${transportEvent === "close" ? "5" : "6"}`);
-    const client = await DirectClient.connect(daemon.url, daemon.serverId, device.device_id, {
+    const connectWithCapturedSocket = () => DirectClient.connect(daemon.url, daemon.serverId, device.device_id, {
       timeoutMs: 3000,
       expectedDaemonPublicKey: daemon.daemonPublicKey,
       webSocketFactory: (url) => {
         const socket = new WebSocket(url) as WsEmitter;
-        capturedSocket = socket;
+        controlSocket = socket;
         return socket;
       },
     });
+    const client = await connectWithCapturedSocket();
     await client.authenticate(device, server);
-    const list = await client.listSessions();
+    const sessionOperationClient = await connectWithCapturedSocket();
+    await sessionOperationClient.authenticate(device, server);
+    const list = await sessionOperationClient.listSessions();
     const sessionId = list.sessions[0].session_id;
-    await client.attachSessionPermission(sessionId);
-    // 中文注释：关闭 HTTP E2EE 路径，强制覆盖主 WebSocket 上的 binary file stream waiter。
-    (client as unknown as { authenticatedDevice?: unknown; authenticatedServer?: unknown }).authenticatedDevice = undefined;
-    (client as unknown as { authenticatedDevice?: unknown; authenticatedServer?: unknown }).authenticatedServer = undefined;
-    const uploadError = client.uploadSessionFile(
+    // 中文注释：binary file stream fallback 必须在执行上传的那条连接上完成 attach 权限建立。
+    (sessionOperationClient as unknown as { authenticatedDevice?: unknown; authenticatedServer?: unknown }).authenticatedDevice = undefined;
+    (sessionOperationClient as unknown as { authenticatedDevice?: unknown; authenticatedServer?: unknown }).authenticatedServer = undefined;
+    const uploadError = sessionOperationClient.uploadSessionFile(
       sessionId,
       `/tmp/waiter-${transportEvent}.bin`,
       new File([new Uint8Array([1, 2, 3])], `waiter-${transportEvent}.bin`),
@@ -1200,13 +1433,14 @@ describe("DirectClient", () => {
     try {
       await waitUntil(() => daemon.sessionFileBinaryWrites.length > 0, "file upload chunk accepted");
       if (transportEvent === "close") {
-        capturedSocket?.emit("close", 1006, Buffer.from("mock close"));
+        controlSocket?.emit("close", 1006, Buffer.from("mock close"));
       } else {
-        capturedSocket?.emit("error", new Error("mock transport error"));
+        controlSocket?.emit("error", new Error("mock transport error"));
       }
       await expect(settleWithin(uploadError, 800, "file upload close")).resolves.toMatchObject({ code: expectedCode });
-      expect(client.isClosed).toBe(true);
+      expect(sessionOperationClient.isClosed).toBe(true);
     } finally {
+      sessionOperationClient.close();
       client.close();
     }
   });
@@ -1251,21 +1485,27 @@ describe("DirectClient", () => {
 
     const list = await client.listSessions();
     const sessionId = list.sessions[0].session_id;
-    await client.attachSessionPermission(sessionId);
+    const operationClient = await connectDevice(device.device_id);
+    await operationClient.authenticate(device, {
+      server_id: accepted.server_id,
+      daemon_public_key: accepted.daemon_public_key,
+      url: daemon.url,
+      paired_at_ms: 1710000000000,
+    });
     const progress: number[] = [];
     const sentProgress: number[] = [];
     const file = new File([new Uint8Array([0, 1, 2, 3, 255])], "raw.bin");
-    // 中文注释：binary file stream 只作为没有 HTTP E2EE 身份时的兼容路径；
-    // 已认证的大文件上传不再因 HTTP 请求失败退回主 WebSocket。
-    (client as unknown as { authenticatedDevice?: unknown; authenticatedServer?: unknown }).authenticatedDevice = undefined;
-    (client as unknown as { authenticatedDevice?: unknown; authenticatedServer?: unknown }).authenticatedServer = undefined;
+    // 中文注释：兼容路径必须由执行上传的专用连接自己退回到 WebSocket binary stream。
+    (operationClient as unknown as { authenticatedDevice?: unknown; authenticatedServer?: unknown }).authenticatedDevice = undefined;
+    (operationClient as unknown as { authenticatedDevice?: unknown; authenticatedServer?: unknown }).authenticatedServer = undefined;
 
     try {
-      await client.uploadSessionFile(sessionId, "/tmp/raw.bin", file, {
+      await operationClient.uploadSessionFile(sessionId, "/tmp/raw.bin", file, {
         onProgress: (update) => progress.push(update.offset_bytes),
         onSentProgress: (sentBytes) => sentProgress.push(sentBytes),
       });
     } finally {
+      operationClient.close();
       client.close();
     }
 
@@ -1291,13 +1531,16 @@ describe("DirectClient", () => {
     });
     const list = await client.listSessions();
     const sessionId = list.sessions[0].session_id;
-    await client.attachSessionPermission(sessionId);
-    (client as unknown as { binaryMode: boolean }).binaryMode = false;
-    (client as unknown as { authenticatedDevice?: unknown; authenticatedServer?: unknown }).authenticatedDevice = undefined;
-    (client as unknown as { authenticatedDevice?: unknown; authenticatedServer?: unknown }).authenticatedServer = undefined;
     const file = new File([new Uint8Array((1024 * 1024) + 1)], "too-large-legacy.bin");
     try {
-      await expect(client.uploadSessionFile(sessionId, "/tmp/too-large-legacy.bin", file)).rejects.toMatchObject({
+      await expect((client as unknown as {
+        uploadSessionFileLegacy: (
+          sessionId: string,
+          path: string,
+          file: File,
+          options?: Record<string, never>,
+        ) => Promise<unknown>;
+      }).uploadSessionFileLegacy(sessionId, "/tmp/too-large-legacy.bin", file)).rejects.toMatchObject({
         code: "file_too_large",
       });
     } finally {
@@ -1837,15 +2080,22 @@ describe("DirectClient", () => {
     });
     const list = await client.listSessions();
     const sessionId = list.sessions[0].session_id;
-    await client.attachSessionPermission(sessionId);
     const file = new File([new Uint8Array([9])], "bad-progress.bin");
-    (client as unknown as { authenticatedDevice?: unknown; authenticatedServer?: unknown }).authenticatedDevice = undefined;
-    (client as unknown as { authenticatedDevice?: unknown; authenticatedServer?: unknown }).authenticatedServer = undefined;
+    const operationClient = await connectDevice(device.device_id);
+    await operationClient.authenticate(device, {
+      server_id: accepted.server_id,
+      daemon_public_key: accepted.daemon_public_key,
+      url: daemon.url,
+      paired_at_ms: 1710000000000,
+    });
+    (operationClient as unknown as { authenticatedDevice?: unknown; authenticatedServer?: unknown }).authenticatedDevice = undefined;
+    (operationClient as unknown as { authenticatedDevice?: unknown; authenticatedServer?: unknown }).authenticatedServer = undefined;
     try {
-      await expect(client.uploadSessionFile(sessionId, "/tmp/bad-progress.bin", file)).rejects.toMatchObject({
+      await expect(operationClient.uploadSessionFile(sessionId, "/tmp/bad-progress.bin", file)).rejects.toMatchObject({
         code: "invalid_file_transfer",
       });
     } finally {
+      operationClient.close();
       client.close();
     }
   });

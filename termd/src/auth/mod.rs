@@ -19,8 +19,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub use termd_proto::{
     AuthPayload, Challenge, DeviceId, E2eeKeyExchangePayload, HttpE2eeAuthPayload, Nonce,
-    PairAcceptPayload, PairRequestPayload, PairingToken, PublicKey, ServerId, Signature,
-    UnixTimestampMillis,
+    PairAcceptPayload, PairRequestPayload, PairingToken, PublicKey, ServerId, SessionToken,
+    Signature, UnixTimestampMillis,
 };
 
 /// auth 模块统一使用的 Result 类型。
@@ -28,6 +28,7 @@ pub type AuthResult<T> = Result<T, AuthError>;
 
 /// pairing token 生命周期使用的 Result 类型。
 pub type PairingResult<T> = Result<T, PairingError>;
+pub type SessionTokenResult<T> = Result<T, SessionTokenError>;
 
 const ED25519_WIRE_PREFIX: &str = "ed25519-v1:";
 const ED25519_PRIVATE_KEY_LEN: usize = 32;
@@ -75,6 +76,33 @@ pub enum PairingError {
     /// ttl 必须为正数，并且不能让过期时间发生整数溢出。
     InvalidTtl { ttl_ms: u64 },
 }
+
+/// session token 生命周期的拒绝原因。
+///
+/// session token 只负责认证后续控制面/终端连接，不替代 E2EE，也不绑定 session 控制权。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionTokenError {
+    InvalidToken,
+    ExpiredToken {
+        expires_at_ms: UnixTimestampMillis,
+        now_ms: UnixTimestampMillis,
+    },
+    InvalidTtl {
+        ttl_ms: u64,
+    },
+}
+
+impl fmt::Display for SessionTokenError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidToken => write!(f, "session token is invalid"),
+            Self::ExpiredToken { .. } => write!(f, "session token is expired"),
+            Self::InvalidTtl { .. } => write!(f, "session token ttl is invalid"),
+        }
+    }
+}
+
+impl Error for SessionTokenError {}
 
 impl fmt::Display for PairingError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -417,6 +445,337 @@ impl fmt::Debug for PairingTokenRecord {
 #[derive(Default)]
 pub struct PairingTokenManager {
     tokens: HashMap<String, PairingTokenRecord>,
+}
+
+/// daemon 内部保存的短期 session token 记录。
+#[derive(Clone, PartialEq, Eq)]
+pub struct SessionTokenRecord {
+    token: SessionToken,
+    server_id: ServerId,
+    device_id: DeviceId,
+    issued_at_ms: UnixTimestampMillis,
+    expires_at_ms: UnixTimestampMillis,
+}
+
+/// daemon 内部保存的短期 session scope token 记录。
+#[derive(Clone, PartialEq, Eq)]
+pub struct SessionScopeRecord {
+    token: SessionToken,
+    server_id: ServerId,
+    device_id: DeviceId,
+    session_id: termd_proto::SessionId,
+    issued_at_ms: UnixTimestampMillis,
+    expires_at_ms: UnixTimestampMillis,
+}
+
+impl SessionScopeRecord {
+    fn new(
+        token: SessionToken,
+        server_id: ServerId,
+        device_id: DeviceId,
+        session_id: termd_proto::SessionId,
+        issued_at_ms: UnixTimestampMillis,
+        expires_at_ms: UnixTimestampMillis,
+    ) -> Self {
+        Self {
+            token,
+            server_id,
+            device_id,
+            session_id,
+            issued_at_ms,
+            expires_at_ms,
+        }
+    }
+
+    pub fn token(&self) -> &SessionToken {
+        &self.token
+    }
+
+    pub fn server_id(&self) -> ServerId {
+        self.server_id
+    }
+
+    pub fn device_id(&self) -> DeviceId {
+        self.device_id
+    }
+
+    pub fn session_id(&self) -> termd_proto::SessionId {
+        self.session_id
+    }
+
+    pub fn issued_at_ms(&self) -> UnixTimestampMillis {
+        self.issued_at_ms
+    }
+
+    pub fn expires_at_ms(&self) -> UnixTimestampMillis {
+        self.expires_at_ms
+    }
+
+    fn is_expired(&self, now_ms: UnixTimestampMillis) -> bool {
+        now_ms >= self.expires_at_ms
+    }
+}
+
+impl fmt::Debug for SessionScopeRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SessionScopeRecord")
+            .field("token", &"<redacted>")
+            .field("server_id", &self.server_id)
+            .field("device_id", &self.device_id)
+            .field("session_id", &self.session_id)
+            .field("issued_at_ms", &self.issued_at_ms)
+            .field("expires_at_ms", &self.expires_at_ms)
+            .finish()
+    }
+}
+
+impl SessionTokenRecord {
+    fn new(
+        token: SessionToken,
+        server_id: ServerId,
+        device_id: DeviceId,
+        issued_at_ms: UnixTimestampMillis,
+        expires_at_ms: UnixTimestampMillis,
+    ) -> Self {
+        Self {
+            token,
+            server_id,
+            device_id,
+            issued_at_ms,
+            expires_at_ms,
+        }
+    }
+
+    pub fn token(&self) -> &SessionToken {
+        &self.token
+    }
+
+    pub fn server_id(&self) -> ServerId {
+        self.server_id
+    }
+
+    pub fn device_id(&self) -> DeviceId {
+        self.device_id
+    }
+
+    pub fn issued_at_ms(&self) -> UnixTimestampMillis {
+        self.issued_at_ms
+    }
+
+    pub fn expires_at_ms(&self) -> UnixTimestampMillis {
+        self.expires_at_ms
+    }
+
+    fn is_expired(&self, now_ms: UnixTimestampMillis) -> bool {
+        now_ms >= self.expires_at_ms
+    }
+}
+
+impl fmt::Debug for SessionTokenRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SessionTokenRecord")
+            .field("token", &"<redacted>")
+            .field("server_id", &self.server_id)
+            .field("device_id", &self.device_id)
+            .field("issued_at_ms", &self.issued_at_ms)
+            .field("expires_at_ms", &self.expires_at_ms)
+            .finish()
+    }
+}
+
+/// session token 的内存生命周期管理器。
+#[derive(Default, Clone)]
+pub struct SessionTokenManager {
+    tokens: HashMap<String, SessionTokenRecord>,
+}
+
+/// session scope token 的内存生命周期管理器。
+#[derive(Default, Clone)]
+pub struct SessionScopeManager {
+    tokens: HashMap<String, SessionScopeRecord>,
+}
+
+impl SessionTokenManager {
+    pub fn new() -> Self {
+        Self {
+            tokens: HashMap::new(),
+        }
+    }
+
+    pub fn issue(
+        &mut self,
+        server_id: ServerId,
+        device_id: DeviceId,
+        now_ms: UnixTimestampMillis,
+        ttl_ms: u64,
+    ) -> SessionTokenResult<SessionTokenRecord> {
+        if ttl_ms == 0 {
+            return Err(SessionTokenError::InvalidTtl { ttl_ms });
+        }
+        let expires_at_ms = UnixTimestampMillis(
+            now_ms
+                .0
+                .checked_add(ttl_ms)
+                .ok_or(SessionTokenError::InvalidTtl { ttl_ms })?,
+        );
+        self.prune_expired(now_ms);
+        loop {
+            let token = generate_session_token();
+            let key = session_token_key(&token).to_owned();
+            if self.tokens.contains_key(&key) {
+                continue;
+            }
+            let record =
+                SessionTokenRecord::new(token, server_id, device_id, now_ms, expires_at_ms);
+            self.tokens.insert(key, record.clone());
+            return Ok(record);
+        }
+    }
+
+    pub fn record(&self, token: &SessionToken) -> Option<&SessionTokenRecord> {
+        self.tokens.get(session_token_key(token))
+    }
+
+    pub fn verify(
+        &mut self,
+        token: &SessionToken,
+        now_ms: UnixTimestampMillis,
+    ) -> SessionTokenResult<SessionTokenRecord> {
+        let token_key = session_token_key(token).to_owned();
+        self.prune_expired_except(now_ms, Some(token_key.as_str()));
+        let Some(record) = self.tokens.get(&token_key) else {
+            return Err(SessionTokenError::InvalidToken);
+        };
+        if record.is_expired(now_ms) {
+            let expires_at_ms = record.expires_at_ms();
+            self.tokens.remove(&token_key);
+            return Err(SessionTokenError::ExpiredToken {
+                expires_at_ms,
+                now_ms,
+            });
+        }
+        Ok(record.clone())
+    }
+
+    pub fn prune_expired(&mut self, now_ms: UnixTimestampMillis) -> usize {
+        self.prune_expired_except(now_ms, None)
+    }
+
+    fn prune_expired_except(
+        &mut self,
+        now_ms: UnixTimestampMillis,
+        keep_key: Option<&str>,
+    ) -> usize {
+        let before = self.tokens.len();
+        self.tokens.retain(|key, record| {
+            if keep_key.is_some_and(|keep| keep == key) {
+                return true;
+            }
+            !record.is_expired(now_ms)
+        });
+        before - self.tokens.len()
+    }
+}
+
+impl SessionScopeManager {
+    pub fn new() -> Self {
+        Self {
+            tokens: HashMap::new(),
+        }
+    }
+
+    pub fn issue(
+        &mut self,
+        server_id: ServerId,
+        device_id: DeviceId,
+        session_id: termd_proto::SessionId,
+        now_ms: UnixTimestampMillis,
+        ttl_ms: u64,
+    ) -> SessionTokenResult<SessionScopeRecord> {
+        if ttl_ms == 0 {
+            return Err(SessionTokenError::InvalidTtl { ttl_ms });
+        }
+        let expires_at_ms = UnixTimestampMillis(
+            now_ms
+                .0
+                .checked_add(ttl_ms)
+                .ok_or(SessionTokenError::InvalidTtl { ttl_ms })?,
+        );
+        self.prune_expired(now_ms);
+        loop {
+            let token = generate_session_token();
+            let key = session_token_key(&token).to_owned();
+            if self.tokens.contains_key(&key) {
+                continue;
+            }
+            let record = SessionScopeRecord::new(
+                token,
+                server_id,
+                device_id,
+                session_id,
+                now_ms,
+                expires_at_ms,
+            );
+            self.tokens.insert(key, record.clone());
+            return Ok(record);
+        }
+    }
+
+    pub fn verify(
+        &mut self,
+        token: &SessionToken,
+        now_ms: UnixTimestampMillis,
+    ) -> SessionTokenResult<SessionScopeRecord> {
+        let token_key = session_token_key(token).to_owned();
+        self.prune_expired_except(now_ms, Some(token_key.as_str()));
+        let Some(record) = self.tokens.get(&token_key) else {
+            return Err(SessionTokenError::InvalidToken);
+        };
+        if record.is_expired(now_ms) {
+            let expires_at_ms = record.expires_at_ms();
+            self.tokens.remove(&token_key);
+            return Err(SessionTokenError::ExpiredToken {
+                expires_at_ms,
+                now_ms,
+            });
+        }
+        Ok(record.clone())
+    }
+
+    pub fn prune_expired(&mut self, now_ms: UnixTimestampMillis) -> usize {
+        self.prune_expired_except(now_ms, None)
+    }
+
+    fn prune_expired_except(
+        &mut self,
+        now_ms: UnixTimestampMillis,
+        keep_key: Option<&str>,
+    ) -> usize {
+        let before = self.tokens.len();
+        self.tokens.retain(|key, record| {
+            if keep_key.is_some_and(|keep| keep == key) {
+                return true;
+            }
+            !record.is_expired(now_ms)
+        });
+        before - self.tokens.len()
+    }
+}
+
+impl fmt::Debug for SessionScopeManager {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SessionScopeManager")
+            .field("len", &self.tokens.len())
+            .finish()
+    }
+}
+
+impl fmt::Debug for SessionTokenManager {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SessionTokenManager")
+            .field("len", &self.tokens.len())
+            .finish()
+    }
 }
 
 impl PairingTokenManager {
@@ -1981,6 +2340,18 @@ fn pairing_token_key(token: &PairingToken) -> &str {
     token.0.as_str()
 }
 
+fn generate_session_token() -> SessionToken {
+    let token_id = ServerId::new();
+
+    // session token 只表示“这个设备刚刚在这个 daemon 上完成认证”，
+    // 不编码 session id、权限角色或任何可推断的明文业务信息。
+    SessionToken(format!("termd-session-{}", token_id.0))
+}
+
+fn session_token_key(token: &SessionToken) -> &str {
+    token.0.as_str()
+}
+
 fn generate_auth_challenge() -> Challenge {
     let challenge_id = ServerId::new();
 
@@ -2312,6 +2683,56 @@ mod tests {
             manager.issue(timestamp(1000), 0).unwrap_err(),
             PairingError::InvalidTtl { ttl_ms: 0 }
         );
+    }
+
+    #[test]
+    fn session_token_issue_records_expiration_time() {
+        let mut manager = SessionTokenManager::new();
+        let device_id = DeviceId::new();
+        let server_id = ServerId::new();
+
+        let record = manager
+            .issue(server_id, device_id, timestamp(1000), 60_000)
+            .unwrap();
+
+        assert_eq!(record.server_id(), server_id);
+        assert_eq!(record.device_id(), device_id);
+        assert_eq!(record.issued_at_ms(), timestamp(1000));
+        assert_eq!(record.expires_at_ms(), timestamp(61_000));
+        assert!(!record.token().0.is_empty());
+        assert!(manager.record(record.token()).is_some());
+    }
+
+    #[test]
+    fn session_token_rejects_expired_token() {
+        let mut manager = SessionTokenManager::new();
+        let issued = manager
+            .issue(ServerId::new(), DeviceId::new(), timestamp(1000), 500)
+            .unwrap();
+        let token = issued.token().clone();
+
+        assert_eq!(
+            manager.verify(&token, timestamp(1500)).unwrap_err(),
+            SessionTokenError::ExpiredToken {
+                expires_at_ms: timestamp(1500),
+                now_ms: timestamp(1500),
+            }
+        );
+        assert!(manager.record(&token).is_none());
+    }
+
+    #[test]
+    fn session_token_verifies_server_and_device_binding() {
+        let mut manager = SessionTokenManager::new();
+        let server_id = ServerId::new();
+        let device_id = DeviceId::new();
+        let record = manager
+            .issue(server_id, device_id, timestamp(1000), 500)
+            .unwrap();
+
+        let verified = manager.verify(record.token(), timestamp(1200)).unwrap();
+        assert_eq!(verified.server_id(), server_id);
+        assert_eq!(verified.device_id(), device_id);
     }
 
     #[test]

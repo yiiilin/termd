@@ -26,6 +26,7 @@ const MIN_FOCUSED_RESIZE_COLS = 20;
 const CURSOR_REPORT_INTERVAL_MS = 120;
 const TERMINAL_SCROLL_REPORT_INTERVAL_MS = 120;
 const FOCUS_OUT_SETTLE_MS = 120;
+const MOBILE_PASSIVE_FOCUS_BYPASS_SETTLE_MS = 180;
 const MOBILE_DIRECTION_HOLD_MS = 1000;
 const MOBILE_DIRECTION_DEAD_ZONE_PX = 24;
 const MOBILE_DIRECTION_STEP_PX = 38;
@@ -33,6 +34,8 @@ const MOBILE_DIRECTION_REPEAT_MS = 500;
 const MOBILE_DIRECTION_TIER_TWO_PX = 56;
 const MOBILE_DIRECTION_TIER_THREE_PX = 84;
 const MOBILE_DIRECTION_CANCEL_PX = 10;
+const MOBILE_SCROLL_DEAD_ZONE_PX = 12;
+const MOBILE_SCROLL_STEP_DIVISOR = 1.2;
 const MOBILE_COMPOSITION_SETTLE_MS = 80;
 const TERMINAL_BOTTOM_EPSILON = 1;
 const TERMINAL_SERVER_SCROLLBACK_RESYNC_MIN_BYTES = 8 * 1024;
@@ -192,6 +195,14 @@ export function TerminalPane(props: TerminalPaneProps) {
     repeatDirection?: MobileDirection;
     repeatCount: number;
   } | undefined>(undefined);
+  const mobileScrollGestureRef = useRef<{
+    pointerId: number;
+    startX: number;
+    startY: number;
+    lastClientY: number;
+    active: boolean;
+  } | undefined>(undefined);
+  const passiveFocusBypassTimerRef = useRef<number | undefined>(undefined);
   const lastNativePasteRef = useRef<{ text: string; atMs: number } | undefined>(undefined);
   const pendingPasteShortcutRef = useRef<{
     id: number;
@@ -269,6 +280,8 @@ export function TerminalPane(props: TerminalPaneProps) {
     clientSizeRef,
     mobileViewportResizeOwnerRef,
     focusActivationArmedRef,
+    passiveFocusBypassRef,
+    passiveInputFocusRef,
     suppressPassiveFocusRef,
     windowActiveRef,
     focusOutTimerRef,
@@ -1260,59 +1273,156 @@ export function TerminalPane(props: TerminalPaneProps) {
     onTerminalResyncRef.current(undefined);
   };
   const handleTerminalWheel = (event: WheelEvent) => {
-    const terminal = terminalRef.current;
-    const scrollState = rendererRef.current?.scrollState(terminal ?? undefined);
-    if (!terminal || !scrollState) {
+    const deltaLines = terminalDeltaLinesFromWheel(event);
+    if (deltaLines === undefined) {
       return;
     }
-    if (scrollState.baseY > 0) {
-      const surfaceHeight = resolveTerminalSurfaceElement(hostRef.current)?.getBoundingClientRect().height ?? 0;
-      const cellHeight = surfaceHeight > 0 && terminal.rows > 0 ? surfaceHeight / terminal.rows : 16;
-      event.preventDefault();
-      event.stopPropagation();
-      let deltaLines = 0;
-      if (event.deltaMode === 0) {
-        // 中文注释：高精度触控板经常连续发出小于 1 行的像素滚动；
-        // 这里按 cellHeight 折算并跨事件累积，避免“轻滚完全不动”。
-        const shouldResetRemainder =
-          terminalWheelRemainderModeRef.current !== event.deltaMode ||
-          Math.sign(terminalWheelLineRemainderRef.current) !== Math.sign(event.deltaY);
-        if (shouldResetRemainder) {
-          terminalWheelLineRemainderRef.current = 0;
-        }
-        const deltaLinesFloat =
-          terminalWheelLineRemainderRef.current + (event.deltaY / Math.max(1, cellHeight));
-        deltaLines = Math.trunc(deltaLinesFloat);
-        terminalWheelLineRemainderRef.current = deltaLinesFloat - deltaLines;
-        terminalWheelRemainderModeRef.current = event.deltaMode;
-      } else {
+    const consumed = applyTerminalScrollDelta(deltaLines);
+    if (!consumed) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+  };
+  const terminalDeltaLinesFromWheel = (event: WheelEvent): number | undefined => {
+    const terminal = terminalRef.current;
+    if (!terminal) {
+      return undefined;
+    }
+    const surfaceHeight = resolveTerminalSurfaceElement(hostRef.current)?.getBoundingClientRect().height ?? 0;
+    const cellHeight = surfaceHeight > 0 && terminal.rows > 0 ? surfaceHeight / terminal.rows : 16;
+    if (event.deltaMode === 0) {
+      // 中文注释：高精度触控板经常连续发出小于 1 行的像素滚动；
+      // 这里按 cellHeight 折算并跨事件累积，避免“轻滚完全不动”。
+      const shouldResetRemainder =
+        terminalWheelRemainderModeRef.current !== event.deltaMode ||
+        Math.sign(terminalWheelLineRemainderRef.current) !== Math.sign(event.deltaY);
+      if (shouldResetRemainder) {
         terminalWheelLineRemainderRef.current = 0;
-        terminalWheelRemainderModeRef.current = event.deltaMode;
-        deltaLines = Math.trunc(event.deltaY * (event.deltaMode === 2 ? terminal.rows : 1));
       }
-      if (deltaLines === 0) {
-        return;
-      }
+      const deltaLinesFloat =
+        terminalWheelLineRemainderRef.current + (event.deltaY / Math.max(1, cellHeight));
+      const deltaLines = Math.trunc(deltaLinesFloat);
+      terminalWheelLineRemainderRef.current = deltaLinesFloat - deltaLines;
+      terminalWheelRemainderModeRef.current = event.deltaMode;
+      return deltaLines;
+    }
+    terminalWheelLineRemainderRef.current = 0;
+    terminalWheelRemainderModeRef.current = event.deltaMode;
+    return Math.trunc(event.deltaY * (event.deltaMode === 2 ? terminal.rows : 1));
+  };
+  const applyTerminalScrollDelta = (deltaLines: number) => {
+    const terminal = terminalRef.current;
+    const scrollState = rendererRef.current?.scrollState(terminal ?? undefined);
+    if (!terminal || !scrollState || deltaLines === 0) {
+      return false;
+    }
+    if (scrollState.baseY > 0) {
       const nextViewportY = clampNumber(
         scrollState.viewportY + deltaLines,
         0,
         scrollState.baseY,
       );
       if (Math.abs(nextViewportY - scrollState.viewportY) < TERMINAL_BOTTOM_EPSILON) {
-        return;
+        return false;
       }
       terminal.scrollToLine(nextViewportY);
       syncTerminalInputAnchor(terminal, "scroll");
       scheduleTerminalScrollPosition({ immediate: true });
+      return true;
+    }
+    if (deltaLines < 0) {
+      // 中文注释：supervisor attach 的实时输出可能只是全屏 repaint，本地终端 baseY 仍为 0；
+      // 用户向上查看历史就是明确的“我要历史”信号，此时主动拉一次 daemon/supervisor snapshot。
+      maybeRequestServerScrollbackResync(scrollState.baseY, "user-scroll");
+      return true;
+    }
+    return false;
+  };
+  const handleMobileTerminalScrollPointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (!mobileInputModeRef.current || !props.attached || event.pointerType === "mouse") {
       return;
     }
-    if (event.deltaY < 0) {
-      // 中文注释：supervisor attach 的实时输出可能只是全屏 repaint，本地终端 baseY 仍为 0；
-      // 用户向上滚就是明确的“我要历史”信号，此时主动拉一次 daemon/supervisor snapshot。
+    if (!hitTerminalSurfaceAtPoint(event.target, event.clientX, event.clientY)) {
+      mobileScrollGestureRef.current = undefined;
+      return;
+    }
+    mobileScrollGestureRef.current = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      lastClientY: event.clientY,
+      active: false,
+    };
+  };
+  const handleMobileTerminalScrollPointerMove = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const gesture = mobileScrollGestureRef.current;
+    if (!gesture || gesture.pointerId !== event.pointerId) {
+      return;
+    }
+    const directionGesture = mobileDirectionGestureRef.current;
+    if (
+      directionGesture &&
+      directionGesture.pointerId === event.pointerId &&
+      (directionGesture.ready || directionGesture.active)
+    ) {
+      mobileScrollGestureRef.current = undefined;
+      return;
+    }
+    const deltaX = event.clientX - gesture.startX;
+    const deltaY = event.clientY - gesture.startY;
+    if (!gesture.active) {
+      if (Math.abs(deltaY) < MOBILE_SCROLL_DEAD_ZONE_PX || Math.abs(deltaY) <= Math.abs(deltaX)) {
+        return;
+      }
+      // 中文注释：只有“明显的纵向拖动”才接管成 scroll；横向/微小手势继续留给原路径。
+      gesture.active = true;
+      // 中文注释：scroll 手势会在 capture 阶段消费后续 pointermove/pointerup，
+      // bubble 阶段的方向手势清理不一定能跑到；这里必须主动收回 pointerdown 给
+      // helper textarea 的临时 focus 许可，避免滚动后迟到 focus 被误放行。
+      clearPassiveInputFocus();
+      clearMobileDirectionGesture();
+      clearPassiveFocusBypassIfInactive();
+    }
+    const terminal = terminalRef.current;
+    if (!terminal || terminal.rows <= 0) {
+      return;
+    }
+    const surfaceHeight = resolveTerminalSurfaceElement(hostRef.current)?.getBoundingClientRect().height ?? 0;
+    const cellHeight = surfaceHeight > 0 ? surfaceHeight / terminal.rows : 16;
+    // 中文注释：移动端滚动遵循原生触摸直觉：内容跟随手指移动。
+    // 因此手指向下拖应查看更旧历史（viewport 向上），手指向上拖应回到更新内容。
+    const deltaPixels = gesture.lastClientY - event.clientY;
+    const deltaLines = Math.trunc(deltaPixels / Math.max(1, cellHeight * MOBILE_SCROLL_STEP_DIVISOR));
+    if (deltaLines === 0) {
+      return;
+    }
+    gesture.lastClientY = event.clientY;
+    const consumed = applyTerminalScrollDelta(deltaLines);
+    if (!consumed) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+  };
+  const handleMobileTerminalScrollPointerEnd = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const gesture = mobileScrollGestureRef.current;
+    if (!gesture || gesture.pointerId !== event.pointerId) {
+      return;
+    }
+    const directionGesture = mobileDirectionGestureRef.current;
+    if (
+      gesture.active &&
+      !(
+        directionGesture &&
+        directionGesture.pointerId === event.pointerId &&
+        (directionGesture.ready || directionGesture.active)
+      )
+    ) {
       event.preventDefault();
       event.stopPropagation();
-      maybeRequestServerScrollbackResync(scrollState.baseY, "user-scroll");
     }
+    mobileScrollGestureRef.current = undefined;
   };
   useEffect(() => {
     attachedRef.current = props.attached;
@@ -1714,11 +1824,46 @@ export function TerminalPane(props: TerminalPaneProps) {
     setMobileDirection(undefined);
   };
 
+  const clearPassiveFocusBypassTimer = () => {
+    if (passiveFocusBypassTimerRef.current !== undefined) {
+      window.clearTimeout(passiveFocusBypassTimerRef.current);
+      passiveFocusBypassTimerRef.current = undefined;
+    }
+  };
+
+  const clearPassiveFocusBypassIfInactive = () => {
+    if (!terminalInputHasDomFocus() && !focusedRef.current) {
+      passiveFocusBypassRef.current = false;
+      passiveInputFocusRef.current = false;
+    }
+  };
+
+  const clearPassiveInputFocus = () => {
+    clearPassiveFocusBypassTimer();
+    if (!passiveInputFocusRef.current || focusedRef.current) {
+      clearPassiveFocusBypassIfInactive();
+      return;
+    }
+    const terminalHost = hostRef.current;
+    const activeElement = document.activeElement;
+    if (terminalHost && activeElement instanceof HTMLElement && terminalHost.contains(activeElement)) {
+      activeElement.blur();
+    }
+    passiveInputFocusRef.current = false;
+    passiveFocusBypassRef.current = false;
+  };
+
   const handleMobileDirectionPointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
     if (!mobileInputModeRef.current || !props.attached || event.pointerType === "mouse") {
       return;
     }
     clearMobileDirectionGesture();
+    clearPassiveFocusBypassTimer();
+    // 中文注释：移动端点击终端时，浏览器或 xterm 可能在 click 之前的 pointerdown/mousedown
+    // 阶段就把 helper textarea 抢回焦点。这里只放行那次“早到的 focusin”，不提前
+    // 授予 resize authority；真正的 operator 接管仍以 focus/click 路径为准。
+    windowActiveRef.current = true;
+    passiveFocusBypassRef.current = true;
     const pointerId = event.pointerId;
     const startX = event.clientX;
     const startY = event.clientY;
@@ -1755,7 +1900,9 @@ export function TerminalPane(props: TerminalPaneProps) {
       const distance = Math.hypot(deltaX, deltaY);
       if (!gesture.ready) {
         if (distance > MOBILE_DIRECTION_CANCEL_PX) {
+          clearPassiveInputFocus();
           clearMobileDirectionGesture();
+          clearPassiveFocusBypassIfInactive();
         }
         return;
       }
@@ -1813,11 +1960,28 @@ export function TerminalPane(props: TerminalPaneProps) {
         sendMobileDirection(direction);
       }
     }
+    // 中文注释：pointerdown 只允许 click 前的早到 focusin 通过。若整轮触摸结束都没有
+    // 真正聚焦终端，就把这次临时放行收回，避免后续 layout/snapshot 误判本地已接管。
+    if (event.type === "pointercancel") {
+      clearPassiveInputFocus();
+      clearPassiveFocusBypassIfInactive();
+    } else if (!terminalInputHasDomFocus() && !focusedRef.current && !passiveInputFocusRef.current) {
+      clearPassiveFocusBypassTimer();
+      passiveFocusBypassTimerRef.current = window.setTimeout(() => {
+        passiveFocusBypassTimerRef.current = undefined;
+        clearPassiveFocusBypassIfInactive();
+      }, MOBILE_PASSIVE_FOCUS_BYPASS_SETTLE_MS);
+    } else {
+      clearPassiveFocusBypassTimer();
+      clearPassiveFocusBypassIfInactive();
+    }
     clearMobileDirectionGesture();
   };
 
   const handleTerminalContextMenu = () => {
+    clearPassiveInputFocus();
     clearMobileDirectionGesture();
+    clearPassiveFocusBypassIfInactive();
     clearTerminalSelectionDrag();
   };
 
@@ -1921,14 +2085,14 @@ export function TerminalPane(props: TerminalPaneProps) {
     }
     const host = hostRef.current;
     const surface = resolveTerminalSurfaceElement(host);
-    if (!host || !surface || !element || !host.contains(element)) {
+    if (!host || !surface) {
       return false;
     }
     const rect = surface.getBoundingClientRect();
     if (rect.width <= 0 || rect.height <= 0) {
       // 中文注释：jsdom / 测试桩里终端表面可能没有真实布局尺寸；此时只要事件目标还在
       // terminal host 内，就把它当成命中了终端文字层，保持与真实浏览器一致的聚焦语义。
-      return true;
+      return Boolean(element && host.contains(element));
     }
     return (
       clientX >= rect.left &&
@@ -1938,7 +2102,7 @@ export function TerminalPane(props: TerminalPaneProps) {
     );
   };
   const hasActiveTerminalFocus = () => focusedRef.current && windowActiveRef.current;
-  const terminalDomHasActiveFocus = () => {
+  const terminalInputHasDomFocus = () => {
     const terminalHost = hostRef.current;
     const activeElement = document.activeElement;
     return Boolean(
@@ -1948,6 +2112,8 @@ export function TerminalPane(props: TerminalPaneProps) {
       terminalHost.contains(activeElement),
     );
   };
+  const terminalDomHasActiveFocus = () =>
+    terminalInputHasDomFocus() && !passiveInputFocusRef.current;
   const localTerminalOwnsResizeAuthority = () =>
     hasActiveTerminalFocus() ||
     terminalDomHasActiveFocus() ||
@@ -1962,11 +2128,13 @@ export function TerminalPane(props: TerminalPaneProps) {
     focusedRef.current = nextFocused;
     setFocused(nextFocused);
     if (nextFocused) {
+      passiveInputFocusRef.current = false;
       // 收起移动端软键盘时 textarea 可能先 blur，visualViewport 稍后才恢复。
       // 只要窗口仍活跃，最后显式聚焦过终端的客户端仍负责把 PTY 尺寸恢复到当前可视高度。
       mobileViewportResizeOwnerRef.current = true;
     }
     if (!nextFocused) {
+      passiveInputFocusRef.current = false;
       cancelLocalResizeReport();
       suppressPassiveFocusRef.current = true;
     }
@@ -1997,6 +2165,22 @@ export function TerminalPane(props: TerminalPaneProps) {
     } catch {
       input.focus();
     }
+  };
+
+  const promotePassiveInputFocusToActive = (source: ResizeSource = "focus") => {
+    if (!passiveInputFocusRef.current || !terminalInputHasDomFocus()) {
+      return false;
+    }
+    // 中文注释：显式接管路径（focusRequest / click / shortcut 等）可能发生在
+    // helper textarea 已经被动聚焦之后。此时不会再有新的 focusin 可用来升级状态，
+    // 需要同步把 passive helper focus 提升成真正 active focus。
+    passiveFocusBypassRef.current = false;
+    passiveInputFocusRef.current = false;
+    focusActivationArmedRef.current = false;
+    suppressPassiveFocusRef.current = false;
+    reportTerminalFocus(true);
+    resizeRef.current?.(source);
+    return true;
   };
 
   const focusTerminalFromTerminalClick = (event: MouseEvent<HTMLDivElement>) => {
@@ -2056,6 +2240,14 @@ export function TerminalPane(props: TerminalPaneProps) {
     }
     focusActivationArmedRef.current = true;
     suppressPassiveFocusRef.current = false;
+    if (promotePassiveInputFocusToActive("focus")) {
+      focusTerminalInputSink();
+      stabilizeRef.current?.("focus");
+      if (requestId !== undefined && pendingFocusRequestRef.current === requestId) {
+        pendingFocusRequestRef.current = undefined;
+      }
+      return;
+    }
     focusTerminalInputSink();
     stabilizeRef.current?.("focus");
     if (requestId !== undefined && pendingFocusRequestRef.current === requestId) {
@@ -2175,7 +2367,12 @@ export function TerminalPane(props: TerminalPaneProps) {
         return false;
       }
       if (source === "mobile-viewport") {
-        return mobileInputModeRef.current && windowActiveRef.current && mobileViewportResizeOwnerRef.current;
+        return (
+          mobileInputModeRef.current &&
+          windowActiveRef.current &&
+          mobileViewportResizeOwnerRef.current &&
+          !passiveInputFocusRef.current
+        );
       }
       return (
         hasActiveTerminalFocus() ||
@@ -2520,7 +2717,8 @@ export function TerminalPane(props: TerminalPaneProps) {
         source === "mobile-viewport" &&
         mobileInputModeRef.current &&
         windowActiveRef.current &&
-        mobileViewportResizeOwnerRef.current;
+        mobileViewportResizeOwnerRef.current &&
+        !passiveInputFocusRef.current;
       const canReportLocalResize =
         source !== "session" &&
         source !== "snapshot" &&
@@ -2802,6 +3000,7 @@ export function TerminalPane(props: TerminalPaneProps) {
     const cleanupFocusResizeListeners = installTerminalFocusResizeListeners({
       host,
       focusOutSettleMs: FOCUS_OUT_SETTLE_MS,
+      isPassiveInputTarget: (target) => target === helperTextarea,
       reportTerminalFocus,
       queueCursorReport,
       scheduleScrollToBottomIfPinned,
@@ -2881,6 +3080,7 @@ export function TerminalPane(props: TerminalPaneProps) {
         window.clearTimeout(copyToastTimerRef.current);
         copyToastTimerRef.current = undefined;
       }
+      clearPassiveFocusBypassTimer();
       if (terminalResizeStabilizationTimerRef.current !== undefined) {
         window.clearTimeout(terminalResizeStabilizationTimerRef.current);
         terminalResizeStabilizationTimerRef.current = undefined;
@@ -2990,6 +3190,8 @@ export function TerminalPane(props: TerminalPaneProps) {
       clientSizeRef.current = undefined;
       mobileViewportResizeOwnerRef.current = false;
       focusActivationArmedRef.current = false;
+      passiveFocusBypassRef.current = false;
+      passiveInputFocusRef.current = false;
       suppressPassiveFocusRef.current = true;
       windowActiveRef.current = true;
       setFocused(false);
@@ -3103,6 +3305,10 @@ export function TerminalPane(props: TerminalPaneProps) {
             className="terminal-frame"
             ref={frameRef}
             onClickCapture={focusTerminalFromTerminalClick}
+            onPointerDownCapture={handleMobileTerminalScrollPointerDown}
+            onPointerMoveCapture={handleMobileTerminalScrollPointerMove}
+            onPointerUpCapture={handleMobileTerminalScrollPointerEnd}
+            onPointerCancelCapture={handleMobileTerminalScrollPointerEnd}
             onPointerDown={handleMobileDirectionPointerDown}
             onPointerMove={handleMobileDirectionPointerMove}
             onPointerUp={handleMobileDirectionPointerEnd}

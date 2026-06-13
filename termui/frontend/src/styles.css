@@ -1647,6 +1647,9 @@ label {
 .terminal-host .xterm-viewport {
   width: 100%;
   height: 100%;
+  /* 中文注释：xterm.css 默认把 viewport 背景写死成黑色；当 canvas 因行高取整
+     没有完全铺满容器时，底部/右侧会露出一条黑边。这里统一跟随 termd 主题底色。 */
+  background: var(--color-terminal-bg);
 }
 
 .terminal-host .xterm-viewport {

@@ -202,8 +202,26 @@ fn send_encrypted(
 }
 
 fn decrypt_first(device_session: &mut E2eeSession, messages: Vec<JsonEnvelope>) -> JsonEnvelope {
-    let frame = encrypted_frame_from_envelope(messages.into_iter().next().unwrap()).unwrap();
-    device_session.decrypt_json_payload(&frame).unwrap()
+    let mut iter = messages.into_iter();
+    let first = iter
+        .next()
+        .expect("expected at least one encrypted response");
+    let frame = encrypted_frame_from_envelope(first).unwrap();
+    let first_inner = device_session.decrypt_json_payload(&frame).unwrap();
+
+    for trailing in iter {
+        let trailing_frame = encrypted_frame_from_envelope(trailing).unwrap();
+        let trailing_inner: JsonEnvelope = device_session
+            .decrypt_json_payload(&trailing_frame)
+            .unwrap();
+        assert_eq!(
+            trailing_inner.kind,
+            MessageType::SessionScopeGrant,
+            "session supervisor tests must consume only trailing scope grants, got {trailing_inner:?}"
+        );
+    }
+
+    first_inner
 }
 
 fn pair_connection(

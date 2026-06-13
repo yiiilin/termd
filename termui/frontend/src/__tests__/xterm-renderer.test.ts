@@ -86,6 +86,25 @@ describe("xterm renderer adapter", () => {
     expect(host.dataset.termdRows).toBe("35");
   });
 
+  it("运行期主题更新不会把 rows/cols 重新写入 xterm options", async () => {
+    vi.resetModules();
+    const { createXtermRenderer } = await import("../components/terminal/xterm-renderer");
+
+    const renderer = createXtermRenderer({
+      terminalOptions: { cols: 108, rows: 35, fontSize: 13 },
+      searchOptions: {},
+    });
+
+    renderer.setOptions({ theme: { background: "#101418" } });
+
+    expect(renderer.terminal.options).toEqual({
+      cols: 108,
+      rows: 35,
+      fontSize: 13,
+      theme: { background: "#101418" },
+    });
+  });
+
   it("scroll state 使用 xterm 的 top-based viewport 语义，并在 dispose 后停止 debug mirror", async () => {
     vi.resetModules();
     const { createXtermRenderer } = await import("../components/terminal/xterm-renderer");

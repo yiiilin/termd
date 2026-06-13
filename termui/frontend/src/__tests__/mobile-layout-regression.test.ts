@@ -13,6 +13,9 @@ describe("mobile layout regressions", () => {
     expect(css).toContain(".app-shell.mobile-keyboard-open .daemon-status-strip {\n    display: none;");
     expect(css).toContain(".terminal-host {\n    min-width: 0;\n    overflow: hidden;\n    max-width: 100%;");
     expect(css).toContain(".terminal-host .xterm,\n.terminal-host .xterm-screen,\n.terminal-host .xterm-viewport {\n  width: 100%;\n  height: 100%;");
+    const terminalSurfaceBlock =
+      css.match(/\.terminal-host \.xterm,\n\.terminal-host \.xterm-screen,\n\.terminal-host \.xterm-viewport \{[^}]+\}/)?.[0] ?? "";
+    expect(terminalSurfaceBlock).toContain("background: var(--color-terminal-bg);");
     const terminalCanvasBlock = css.match(/\.terminal-host \.xterm-screen canvas \{[^}]+\}/)?.[0] ?? "";
     expect(terminalCanvasBlock).toContain("display: block;");
     expect(terminalCanvasBlock).toContain("background: var(--color-terminal-bg);");

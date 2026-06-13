@@ -21,6 +21,7 @@ type XtermDebugTerminal = Terminal & {
   __termdDebugBufferSync?: () => void;
 };
 type XtermAbsoluteRange = { startCol: number; startRow: number; endCol: number; endRow: number };
+const XTERM_CONSTRUCTOR_ONLY_OPTIONS = new Set(["cols", "rows"]);
 
 function clampLine(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
@@ -442,9 +443,14 @@ export function createXtermRenderer(options: CreateTerminalRendererOptions): Ter
       target.closest(".terminal-frame"),
     ),
     setOptions: (nextOptions) => {
+      const runtimeOptions = Object.fromEntries(
+        Object.entries(nextOptions).filter(([key]) => !XTERM_CONSTRUCTOR_ONLY_OPTIONS.has(key)),
+      );
+      if (Object.keys(runtimeOptions).length === 0) {
+        return;
+      }
       terminal.options = {
-        ...terminal.options,
-        ...nextOptions,
+        ...runtimeOptions,
       };
       (terminal as XtermDebugTerminal).__termdDebugBufferSync?.();
     },

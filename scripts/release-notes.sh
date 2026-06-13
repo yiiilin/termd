@@ -14,6 +14,23 @@ version="${1:-}"
 PLACEHOLDER_TEXT="请在 scripts/release-notes.sh 中补充此版本的功能、修复和兼容性说明。"
 
 case "$version" in
+  0.5.0)
+    cat <<'EOF'
+termd 0.5.0
+
+用户可见变化:
+- HTTP control plane 改用认证后的短期 session token + session scope token；终端 WebSocket 输出链路避开旧 JSON/base64 热路径，更接近 raw stream。
+- `termd` / `termrelay` 的 HTTP control tunnel 增加路径白名单和畸形 session path 拒绝，未知路径会在 bearer/relay auth 前被拒绝。
+- supervisor sharing attach 流程补齐事务回滚：create/attach 失败不会提前污染 connection scope、runtime attach 或 watched attachment 状态。
+- Web 终端切换到 xterm 渲染路径后补齐移动端滚动、输入法恢复、复制/粘贴、focus resize 和 relay reconnect 回归覆盖。
+- 本地更新脚本支持保留 supervisor 进程热更新，并校验 healthz、running session 计数和 supervisor PID 集合，避免更新时误清会话。
+
+兼容性:
+- workspace / cargo / frontend 版本同步到 `0.5.0`。
+- supervisor 兼容版本保持 `2026-06-10`；普通本地更新会保留已有 running session。
+- relay 仍保持 dumb pipe，不解密、不解析业务明文，只做认证后的路由转发。
+EOF
+    ;;
   0.4.0)
     cat <<'EOF'
 termd 0.4.0

@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use axum::body::{Body, Bytes, to_bytes};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{ConnectInfo, State};
+use axum::extract::{ConnectInfo, Path, State};
 use axum::http::header::{CONTENT_TYPE, HeaderName};
 use axum::http::{HeaderMap, Method, Request, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
@@ -24,10 +24,12 @@ use futures_util::{SinkExt, StreamExt};
 use rustls::pki_types::pem::PemObject;
 use serde::Serialize;
 use termd_proto::{
-    ErrorPayload, HttpE2eeAuthPayload, MessageType, PROTOCOL_PACKET_VERSION, PairingToken,
-    ProtocolVersion, PublicKey, RouteHelloPayload, RouteReadyPayload, RouteRole, ServerId,
-    SessionAttachPayload, SessionFileHttpDownloadPayload, SessionFileHttpUploadStreamPayload,
-    SessionFileUploadPayload, SessionId, SessionState, Signature, UnixTimestampMillis,
+    ErrorPayload, HttpE2eeAuthPayload, MessageType, PROTOCOL_PACKET_VERSION, PacketKind,
+    PacketRequestId, PairingToken, ProtocolPacket, ProtocolVersion, PublicKey, RouteHelloPayload,
+    RouteReadyPayload, RouteRole, ServerId, SessionAttachPayload, SessionFileHttpDownloadPayload,
+    SessionFileHttpUploadStreamPayload, SessionFileUploadPayload, SessionId, SessionState,
+    SessionToken, Signature, UnixTimestampMillis, is_http_control_tunnel_path_allowed,
+    is_http_tunnel_path_allowed,
 };
 use thiserror::Error;
 use tokio::net::TcpListener;
@@ -495,6 +497,7 @@ pub fn router(protocol: SharedDaemonProtocol, web_enabled: bool) -> Router {
     let router = Router::new()
         .route("/healthz", get(healthz))
         .route("/local/pairing-token", post(local_pairing_token))
+        .merge(http_control_api_router())
         .merge(http_file_api_router())
         .route("/ws", get(ws_handler))
         .with_state(protocol);
@@ -506,6 +509,12 @@ pub fn router(protocol: SharedDaemonProtocol, web_enabled: bool) -> Router {
     }
 }
 
+fn http_control_api_router() -> Router<SharedDaemonProtocol> {
+    Router::new()
+        .route("/api/control/*path", post(http_control_request))
+        .route_layer(http_control_api_cors_layer())
+}
+
 fn http_file_api_router() -> Router<SharedDaemonProtocol> {
     Router::new()
         .route("/api/files/upload/init", post(http_file_upload_init))
@@ -514,6 +523,25 @@ fn http_file_api_router() -> Router<SharedDaemonProtocol> {
         .route("/api/files/download", post(http_file_download))
         // 中文注释：CORS 只允许挂在文件 HTTP 通道上，不能把本地配对等管理端点一起暴露出去。
         .route_layer(http_file_api_cors_layer())
+}
+
+fn http_control_api_cors_layer() -> CorsLayer {
+    // 中文注释：control plane 允许跨源 Web 前端携带 bearer token 和 session scope 头。
+    // 真正的认证仍由 session token、scope token 与 HTTP E2EE 完成。
+    CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods([Method::POST, Method::OPTIONS])
+        .allow_headers([
+            CONTENT_TYPE,
+            HeaderName::from_static("authorization"),
+            HeaderName::from_static("x-termd-server-id"),
+            HeaderName::from_static("x-termd-device-id"),
+            HeaderName::from_static("x-termd-session-scope"),
+            HeaderName::from_static("x-termd-e2ee-public-key"),
+            HeaderName::from_static("x-termd-e2ee-nonce"),
+            HeaderName::from_static("x-termd-e2ee-timestamp-ms"),
+            HeaderName::from_static("x-termd-e2ee-signature"),
+        ])
 }
 
 fn http_file_api_cors_layer() -> CorsLayer {
@@ -592,14 +620,14 @@ pub async fn serve_tls_listener(
     serve_rustls_listener(listener, router(protocol, web_enabled), tls_config).await
 }
 
-pub(crate) async fn handle_http_file_tunnel_stream_request(
+pub(crate) async fn handle_http_tunnel_stream_request(
     protocol: SharedDaemonProtocol,
     method: String,
     path: String,
     headers: Vec<(String, String)>,
     body: Body,
 ) -> Response {
-    if !is_http_file_tunnel_allowed(&method, &path) {
+    if !is_http_tunnel_allowed(&method, &path) {
         return (
             StatusCode::NOT_FOUND,
             Json(ErrorPayload {
@@ -637,17 +665,10 @@ pub(crate) async fn handle_http_file_tunnel_stream_request(
     }
 }
 
-fn is_http_file_tunnel_allowed(method: &str, path: &str) -> bool {
-    // 中文注释：relay 是不可信 dumb pipe；daemon 不能依赖 relay 的 HTTP route 限制。
-    // tunnel 入口只允许文件传输 API，避免把 `/healthz`、本地配对等非文件路由暴露出去。
-    method.eq_ignore_ascii_case("POST")
-        && matches!(
-            path,
-            "/api/files/upload/init"
-                | "/api/files/upload"
-                | "/api/files/upload/abort"
-                | "/api/files/download"
-        )
+fn is_http_tunnel_allowed(method: &str, path: &str) -> bool {
+    // 中文注释：relay 是不可信 dumb pipe；daemon 侧必须再次校验 tunnel 入口。
+    // 路由白名单来自 proto 共享函数，避免 daemon/relay 各自维护一份字符串后漂移。
+    is_http_tunnel_path_allowed(method, path)
 }
 
 fn load_rustls_server_config(tls_paths: &TlsPaths) -> Result<rustls::ServerConfig, ServerError> {
@@ -838,6 +859,50 @@ async fn http_file_upload_init(
     };
     connection.close(&mut protocol);
     response
+}
+
+async fn http_control_request(
+    State(protocol): State<SharedDaemonProtocol>,
+    Path(path): Path<String>,
+    http_method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    if !is_http_control_tunnel_path_allowed(uri.path()) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let (method, session_scope_session_id) = match parse_http_control_path(&path) {
+        Ok(parsed) => parsed,
+        Err(error) => return http_e2ee_error(StatusCode::BAD_REQUEST, error),
+    };
+    handle_http_control_request(
+        protocol,
+        method,
+        session_scope_session_id,
+        http_method,
+        uri,
+        headers,
+        body,
+    )
+    .await
+}
+
+fn parse_http_control_path(path: &str) -> Result<(String, Option<SessionId>), ProtocolError> {
+    let segments = path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    if segments.is_empty() {
+        return Err(ProtocolError::InvalidEnvelope);
+    }
+    if segments.len() >= 3 && segments[0] == "session" {
+        if let Ok(session_uuid) = segments[1].parse() {
+            let method = format!("session.{}", segments[2..].join("."));
+            return Ok((method, Some(SessionId(session_uuid))));
+        }
+    }
+    Ok((segments.join("."), None))
 }
 
 async fn http_file_upload_stream(
@@ -1072,6 +1137,121 @@ async fn http_file_upload_abort(
     response
 }
 
+async fn handle_http_control_request(
+    protocol: SharedDaemonProtocol,
+    method: String,
+    session_scope_session_id: Option<SessionId>,
+    http_method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let auth = match http_bearer_control_auth_from_headers(&headers) {
+        Ok(auth) => auth,
+        Err(response) => return response,
+    };
+    let http_e2ee_auth =
+        match http_e2ee_auth_from_control_headers(&headers, &http_method, uri.path()) {
+            Ok(auth) => auth,
+            Err(response) => return response,
+        };
+    let body = match read_http_e2ee_short_body(body).await {
+        Ok(body) => body,
+        Err(error) => return http_e2ee_error(StatusCode::BAD_REQUEST, error),
+    };
+
+    let mut protocol_guard = protocol.lock().await;
+    let now_ms = current_unix_timestamp_millis();
+    let session_token = match protocol_guard.verify_session_token(&auth.session_token, now_ms) {
+        Ok(token) => token,
+        Err(_) => return http_e2ee_error(StatusCode::UNAUTHORIZED, ProtocolError::AuthFailed),
+    };
+    if session_token.server_id() != auth.server_id || session_token.device_id() != auth.device_id {
+        return http_e2ee_error(StatusCode::UNAUTHORIZED, ProtocolError::AuthFailed);
+    }
+    if auth.device_id != http_e2ee_auth.device_id {
+        return http_e2ee_error(StatusCode::UNAUTHORIZED, ProtocolError::AuthFailed);
+    }
+    let (device_id, mut e2ee) = match protocol_guard.open_http_e2ee_session(http_e2ee_auth) {
+        Ok(result) => result,
+        Err(error) => return http_e2ee_error(StatusCode::UNAUTHORIZED, error),
+    };
+    if device_id != auth.device_id {
+        return http_e2ee_error(StatusCode::UNAUTHORIZED, ProtocolError::AuthFailed);
+    }
+
+    let payload = match decrypt_single_http_e2ee_json::<serde_json::Value>(&mut e2ee, &body) {
+        Ok(payload) => payload,
+        Err(error) => return http_e2ee_error(StatusCode::BAD_REQUEST, error),
+    };
+
+    let mut connection = ProtocolConnection::authenticated_http(device_id);
+    if let Some(session_id) = session_scope_session_id {
+        let Some(scope_token) = auth.session_scope_token.as_ref() else {
+            return http_e2ee_encrypted_error(
+                &mut e2ee,
+                StatusCode::UNAUTHORIZED,
+                ProtocolError::AuthFailed,
+            );
+        };
+        let scope = match protocol_guard.verify_session_scope_token(scope_token, now_ms) {
+            Ok(scope) => scope,
+            Err(_) => {
+                return http_e2ee_encrypted_error(
+                    &mut e2ee,
+                    StatusCode::UNAUTHORIZED,
+                    ProtocolError::AuthFailed,
+                );
+            }
+        };
+        if scope.server_id() != auth.server_id
+            || scope.device_id() != auth.device_id
+            || scope.session_id() != session_id
+        {
+            return http_e2ee_encrypted_error(
+                &mut e2ee,
+                StatusCode::UNAUTHORIZED,
+                ProtocolError::AuthFailed,
+            );
+        }
+        if let Err(error) = protocol_guard.restore_http_control_scope(&mut connection, session_id) {
+            return http_e2ee_encrypted_error(&mut e2ee, StatusCode::BAD_REQUEST, error);
+        }
+    }
+
+    let mut connection_guard = HttpConnectionCloseGuard::new(protocol.clone(), connection);
+    let packet = ProtocolPacket::<serde_json::Value> {
+        version: PROTOCOL_PACKET_VERSION,
+        kind: PacketKind::Request,
+        id: Some(PacketRequestId::new()),
+        stream_id: None,
+        method: Some(method.clone()),
+        seq: 0,
+        ack: None,
+        credit: None,
+        payload,
+    };
+    let responses = match connection_guard
+        .connection_mut()
+        .dispatch_http_control_packet(&mut protocol_guard, packet)
+    {
+        Ok(responses) => responses,
+        Err(error) => {
+            drop(protocol_guard);
+            connection_guard.close_now().await;
+            return http_e2ee_encrypted_error(&mut e2ee, StatusCode::BAD_REQUEST, error);
+        }
+    };
+
+    let response = match encode_http_control_packet_responses(&mut e2ee, responses) {
+        Ok(body) => (StatusCode::OK, body).into_response(),
+        Err(error) => http_e2ee_error(StatusCode::INTERNAL_SERVER_ERROR, error),
+    };
+    drop(protocol_guard);
+    connection_guard.close_now().await;
+    response
+}
+
 struct HttpConnectionCloseGuard {
     protocol: SharedDaemonProtocol,
     connection: Option<ProtocolConnection>,
@@ -1088,6 +1268,12 @@ impl HttpConnectionCloseGuard {
     fn connection(&self) -> &ProtocolConnection {
         self.connection
             .as_ref()
+            .expect("HTTP connection guard should still own connection")
+    }
+
+    fn connection_mut(&mut self) -> &mut ProtocolConnection {
+        self.connection
+            .as_mut()
             .expect("HTTP connection guard should still own connection")
     }
 
@@ -1454,6 +1640,97 @@ fn http_e2ee_auth_from_headers(
         path: path.to_owned(),
         signature,
     })
+}
+
+fn http_e2ee_auth_from_control_headers(
+    headers: &HeaderMap,
+    method: &Method,
+    path: &str,
+) -> Result<HttpE2eeAuthPayload, Response> {
+    let device_id = http_required_header(headers, "x-termd-device-id")?
+        .parse()
+        .map(termd_proto::DeviceId)
+        .map_err(|_| http_e2ee_error(StatusCode::BAD_REQUEST, ProtocolError::InvalidEnvelope))?;
+    let e2ee_public_key =
+        PublicKey(http_required_header(headers, "x-termd-e2ee-public-key")?.to_owned());
+    let nonce = termd_proto::Nonce(http_required_header(headers, "x-termd-e2ee-nonce")?.to_owned());
+    let timestamp_ms = http_required_header(headers, "x-termd-e2ee-timestamp-ms")?
+        .parse()
+        .map(UnixTimestampMillis)
+        .map_err(|_| http_e2ee_error(StatusCode::BAD_REQUEST, ProtocolError::InvalidEnvelope))?;
+    let signature = Signature(http_required_header(headers, "x-termd-e2ee-signature")?.to_owned());
+
+    Ok(HttpE2eeAuthPayload {
+        device_id,
+        e2ee_public_key,
+        nonce,
+        timestamp_ms,
+        method: method.as_str().to_owned(),
+        path: path.to_owned(),
+        signature,
+    })
+}
+
+struct HttpControlAuth {
+    server_id: ServerId,
+    device_id: termd_proto::DeviceId,
+    session_token: SessionToken,
+    session_scope_token: Option<SessionToken>,
+}
+
+fn http_bearer_control_auth_from_headers(headers: &HeaderMap) -> Result<HttpControlAuth, Response> {
+    let authorization = http_control_header(headers, "authorization")?;
+    let bearer = authorization
+        .strip_prefix("Bearer ")
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| http_e2ee_error(StatusCode::UNAUTHORIZED, ProtocolError::AuthFailed))?;
+    let server_id = http_control_header(headers, "x-termd-server-id")?
+        .parse()
+        .map(ServerId)
+        .map_err(|_| http_e2ee_error(StatusCode::UNAUTHORIZED, ProtocolError::AuthFailed))?;
+    let device_id = http_control_header(headers, "x-termd-device-id")?
+        .parse()
+        .map(termd_proto::DeviceId)
+        .map_err(|_| http_e2ee_error(StatusCode::UNAUTHORIZED, ProtocolError::AuthFailed))?;
+    let session_scope_token = headers
+        .get("x-termd-session-scope")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| SessionToken(value.to_owned()));
+    Ok(HttpControlAuth {
+        server_id,
+        device_id,
+        session_token: SessionToken(bearer.to_owned()),
+        session_scope_token,
+    })
+}
+
+fn http_control_header<'a>(headers: &'a HeaderMap, name: &str) -> Result<&'a str, Response> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| http_e2ee_error(StatusCode::UNAUTHORIZED, ProtocolError::AuthFailed))
+}
+
+fn http_required_header<'a>(headers: &'a HeaderMap, name: &str) -> Result<&'a str, Response> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| http_e2ee_error(StatusCode::BAD_REQUEST, ProtocolError::InvalidEnvelope))
+}
+
+fn encode_http_control_packet_responses(
+    e2ee: &mut super::E2eeSession,
+    responses: Vec<ProtocolPacket<serde_json::Value>>,
+) -> Result<Body, ProtocolError> {
+    let mut body = Vec::new();
+    for packet in responses {
+        append_http_e2ee_json_frame(e2ee, &mut body, &packet)?;
+    }
+    Ok(Body::from(body))
 }
 
 fn http_header<'a>(headers: &'a HeaderMap, name: &str) -> Result<&'a str, Response> {
@@ -3129,8 +3406,8 @@ mod tests {
         PairRequestPayload, PublicKey, SessionCreatePayload, SessionCreatedPayload,
         SessionCwdChangedPayload, SessionDataPayload, SessionFileDownloadStreamReadyPayload,
         SessionFileHttpDownloadPayload, SessionFileHttpUploadReadyPayload,
-        SessionFileHttpUploadStreamPayload, SessionFileUploadPayload, Signature, TerminalSize,
-        UnixTimestampMillis,
+        SessionFileHttpUploadStreamPayload, SessionFileUploadPayload, SessionScopeGrantPayload,
+        Signature, TerminalSize, UnixTimestampMillis,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::time::{Duration, timeout};
@@ -3572,6 +3849,205 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_control_routes_require_bearer_session_token() {
+        let protocol = test_protocol("http-control-requires-bearer");
+        let response = router(protocol, false)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/control/session/list")
+                    .body(Body::empty())
+                    .expect("test request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn http_control_routes_reject_unknown_paths_before_auth() {
+        for path in [
+            "/api/control/auth/verify",
+            "/api/control/auth/session_token",
+            "/api/control/session/not-a-uuid/files",
+        ] {
+            let protocol = test_protocol("http-control-reject-unknown-direct");
+            let response = router(protocol, false)
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .body(Body::empty())
+                        .expect("test request should build"),
+                )
+                .await
+                .expect("router should respond");
+
+            // 中文注释：直连 daemon 与 relay/tunnel 使用同一份 control allowlist；
+            // 未放行的 control 路径必须在认证和协议分发前截止。
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn http_control_routes_accept_valid_bearer_session_token() {
+        let protocol = test_protocol("http-control-accepts-bearer");
+        let (server_id, device_id, token) = {
+            let mut guard = protocol.lock().await;
+            let server_id = guard.server_id();
+            let device_id = DeviceId::new();
+            let token = guard
+                .issue_session_token(device_id, current_unix_timestamp_millis())
+                .expect("session token should be issued")
+                .token()
+                .0
+                .clone();
+            (server_id, device_id, token)
+        };
+
+        let response = router(protocol, false)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/control/session/list")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("x-termd-server-id", server_id.0.to_string())
+                    .header("x-termd-device-id", device_id.0.to_string())
+                    .body(Body::from("{}"))
+                    .expect("test request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_ne!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn http_control_session_list_accepts_bearer_and_e2ee_payload() {
+        let protocol = test_protocol("http-control-session-list-e2ee");
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let device_public_key =
+            PublicKey(test_ed25519_wire(signing_key.verifying_key().as_bytes()));
+        let device_id = pair_real_device(protocol.clone(), device_public_key).await;
+        let bearer = {
+            let mut guard = protocol.lock().await;
+            guard
+                .issue_session_token(device_id, current_unix_timestamp_millis())
+                .unwrap()
+                .token()
+                .0
+                .clone()
+        };
+        let (mut request, mut e2ee) = signed_http_e2ee_request(
+            &protocol,
+            &signing_key,
+            device_id,
+            "/api/control/session/list",
+            "http-control-session-list",
+            vec![serde_json::to_vec(&serde_json::json!({})).unwrap()],
+        )
+        .await;
+        let protocol_guard = protocol.lock().await;
+        request
+            .headers_mut()
+            .insert("authorization", format!("Bearer {bearer}").parse().unwrap());
+        request.headers_mut().insert(
+            "x-termd-server-id",
+            protocol_guard.server_id().0.to_string().parse().unwrap(),
+        );
+        request.headers_mut().insert(
+            "x-termd-device-id",
+            device_id.0.to_string().parse().unwrap(),
+        );
+        drop(protocol_guard);
+
+        let response = router(protocol.clone(), false)
+            .oneshot(request)
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let response_body = to_bytes(response.into_body(), HTTP_E2EE_INIT_MAX_BYTES)
+            .await
+            .unwrap();
+        let frames = decrypt_http_e2ee_frames(&mut e2ee, &response_body).unwrap();
+        assert!(!frames.is_empty());
+        let packet: ProtocolPacket<serde_json::Value> = serde_json::from_slice(&frames[0]).unwrap();
+        assert_eq!(packet.kind, PacketKind::Response);
+        let payload: termd_proto::SessionListResultPayload =
+            serde_json::from_value(packet.payload).unwrap();
+        assert!(payload.sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn http_control_session_files_restores_scope_from_session_scope_token() {
+        let protocol = test_protocol("http-control-session-files-scope");
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let device_public_key =
+            PublicKey(test_ed25519_wire(signing_key.verifying_key().as_bytes()));
+        let (device_id, session_id) =
+            pair_real_device_and_create_session(protocol.clone(), device_public_key).await;
+        let (bearer, scope) = {
+            let mut guard = protocol.lock().await;
+            let bearer = guard
+                .issue_session_token(device_id, current_unix_timestamp_millis())
+                .unwrap()
+                .token()
+                .0
+                .clone();
+            let scope = guard
+                .issue_session_scope_token(device_id, session_id, current_unix_timestamp_millis())
+                .unwrap()
+                .token()
+                .0
+                .clone();
+            (bearer, scope)
+        };
+        let (mut request, mut e2ee) = signed_http_e2ee_request(
+            &protocol,
+            &signing_key,
+            device_id,
+            &format!("/api/control/session/{}/files", session_id.0),
+            "http-control-session-files",
+            vec![serde_json::to_vec(&serde_json::json!({ "session_id": session_id })).unwrap()],
+        )
+        .await;
+        let protocol_guard = protocol.lock().await;
+        request
+            .headers_mut()
+            .insert("authorization", format!("Bearer {bearer}").parse().unwrap());
+        request.headers_mut().insert(
+            "x-termd-server-id",
+            protocol_guard.server_id().0.to_string().parse().unwrap(),
+        );
+        request.headers_mut().insert(
+            "x-termd-device-id",
+            device_id.0.to_string().parse().unwrap(),
+        );
+        request
+            .headers_mut()
+            .insert("x-termd-session-scope", scope.parse().unwrap());
+        drop(protocol_guard);
+
+        let response = router(protocol.clone(), false)
+            .oneshot(request)
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let response_body = to_bytes(response.into_body(), HTTP_E2EE_INIT_MAX_BYTES)
+            .await
+            .unwrap();
+        let frames = decrypt_http_e2ee_frames(&mut e2ee, &response_body).unwrap();
+        let packet: ProtocolPacket<serde_json::Value> = serde_json::from_slice(&frames[0]).unwrap();
+        assert_eq!(packet.kind, PacketKind::Response);
+        let payload: termd_proto::SessionFilesResultPayload =
+            serde_json::from_value(packet.payload).unwrap();
+        assert_eq!(payload.session_id, session_id);
+    }
+
+    #[tokio::test]
     async fn http_file_routes_answer_cors_preflight() {
         let protocol = test_protocol("http-file-cors-preflight");
         let response = router(protocol, false)
@@ -3602,9 +4078,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn http_file_tunnel_rejects_non_file_routes_before_router_dispatch() {
+    async fn http_tunnel_rejects_non_api_routes_before_router_dispatch() {
         let protocol = test_protocol("http-file-tunnel-allowlist");
-        let response = handle_http_file_tunnel_stream_request(
+        let response = handle_http_tunnel_stream_request(
             protocol,
             "GET".to_owned(),
             "/healthz".to_owned(),
@@ -3614,6 +4090,49 @@ mod tests {
         .await;
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn http_tunnel_accepts_control_routes_for_router_dispatch() {
+        for path in [
+            "/api/control/session/list",
+            "/api/control/session/reorder",
+            "/api/control/daemon/client_forget",
+        ] {
+            let protocol = test_protocol("http-control-tunnel-allowlist");
+            let response = handle_http_tunnel_stream_request(
+                protocol,
+                "POST".to_owned(),
+                path.to_owned(),
+                Vec::new(),
+                Body::empty(),
+            )
+            .await;
+
+            // 中文注释：allowlist 只负责放行到 daemon router；没有 bearer 时后续 router 会返回 401。
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn http_tunnel_rejects_unknown_control_routes_before_router_dispatch() {
+        for path in [
+            "/api/control/auth/verify",
+            "/api/control/session/not-a-uuid/files",
+        ] {
+            let protocol = test_protocol("http-control-tunnel-reject-unknown");
+            let response = handle_http_tunnel_stream_request(
+                protocol,
+                "POST".to_owned(),
+                path.to_owned(),
+                Vec::new(),
+                Body::empty(),
+            )
+            .await;
+
+            // 中文注释：畸形 session id 不能被当作普通 method 名进入认证层。
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        }
     }
 
     #[tokio::test]
@@ -4291,6 +4810,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_connection_guard_close_now_detaches_before_error_response() {
+        let root = std::env::temp_dir().join(format!(
+            "termd-http-control-connection-close-now-{}-{}",
+            std::process::id(),
+            current_unix_timestamp_millis().0
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let mut config = test_config("http-control-connection-close-now");
+        config.default_working_directory = Some(root.clone());
+        let protocol = default_protocol(config);
+        let creator_signing_key = SigningKey::generate(&mut OsRng);
+        let creator_public_key = PublicKey(test_ed25519_wire(
+            creator_signing_key.verifying_key().as_bytes(),
+        ));
+        let (_, session_id) =
+            pair_real_device_and_create_session(protocol.clone(), creator_public_key).await;
+        let http_signing_key = SigningKey::generate(&mut OsRng);
+        let http_public_key = PublicKey(test_ed25519_wire(
+            http_signing_key.verifying_key().as_bytes(),
+        ));
+        let http_device_id = pair_real_device(protocol.clone(), http_public_key).await;
+        let mut connection = ProtocolConnection::authenticated_http(http_device_id);
+        {
+            let mut protocol_guard = protocol.lock().await;
+            protocol_guard
+                .restore_http_control_scope(&mut connection, session_id)
+                .unwrap();
+        }
+        let mut connection_guard = HttpConnectionCloseGuard::new(protocol.clone(), connection);
+
+        // 中文注释：HTTP control handler 在 scope 恢复后若要提前返回错误，必须先 close guard，
+        // 否则短连接会把设备级 attach 留在 runtime 里，后续同设备误以为仍有 operator。
+        connection_guard.close_now().await;
+
+        assert_http_device_detached(&protocol, session_id, http_device_id).await;
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
     async fn http_file_handlers_detach_temporary_runtime_connection() {
         let root = std::env::temp_dir().join(format!(
             "termd-http-file-detach-{}-{}",
@@ -4475,16 +5033,8 @@ mod tests {
                 &mut protocol_guard,
                 envelope_value(MessageType::EncryptedFrame, create_frame).unwrap(),
             );
-            let created_frame = encrypted_frame_from_envelope(
-                create_responses
-                    .into_iter()
-                    .next()
-                    .expect("session create should return a response"),
-            )
-            .unwrap();
-            let created_envelope = device_session
-                .decrypt_json_payload::<JsonEnvelope>(&created_frame)
-                .unwrap();
+            let created_envelope =
+                decrypt_first_and_drain_scope_grants(&mut device_session, create_responses);
             let created_payload: SessionCreatedPayload =
                 decode_payload(created_envelope.payload).unwrap();
             let session_id = created_payload.session_id;
@@ -5003,6 +5553,12 @@ mod tests {
             "unexpected session create response: {created:?}"
         );
         let created_payload: SessionCreatedPayload = decode_payload(created.payload).unwrap();
+        read_expected_session_scope_grant(
+            &mut socket,
+            &mut device_session,
+            created_payload.session_id,
+        )
+        .await;
 
         // 这里不再向 WebSocket 发送 ping 或任意业务帧；PTY 后续输出必须由 daemon 主动推送。
         // 等待窗口需要覆盖 CI 或本地 workspace 并发测试时的 PTY 进程启动抖动，
@@ -5120,6 +5676,12 @@ mod tests {
         let created = read_encrypted_ws(&mut socket, &mut device_session).await;
         assert_eq!(created.kind, MessageType::SessionCreated);
         let created_payload: SessionCreatedPayload = decode_payload(created.payload).unwrap();
+        read_expected_session_scope_grant(
+            &mut socket,
+            &mut device_session,
+            created_payload.session_id,
+        )
+        .await;
 
         send_encrypted_ws(
             &mut socket,
@@ -5440,6 +6002,32 @@ mod tests {
         .await;
     }
 
+    fn decrypt_first_and_drain_scope_grants(
+        device_session: &mut E2eeSession,
+        messages: Vec<JsonEnvelope>,
+    ) -> JsonEnvelope {
+        let mut iter = messages.into_iter();
+        let first = iter
+            .next()
+            .expect("expected at least one encrypted response");
+        let first_frame = encrypted_frame_from_envelope(first).unwrap();
+        let first_inner = device_session.decrypt_json_payload(&first_frame).unwrap();
+
+        for trailing in iter {
+            let trailing_frame = encrypted_frame_from_envelope(trailing).unwrap();
+            let trailing_inner: JsonEnvelope = device_session
+                .decrypt_json_payload(&trailing_frame)
+                .unwrap();
+            assert_eq!(
+                trailing_inner.kind,
+                MessageType::SessionScopeGrant,
+                "server tests must consume only trailing scope grants, got {trailing_inner:?}"
+            );
+        }
+
+        first_inner
+    }
+
     async fn read_encrypted_ws(
         socket: &mut TestWs,
         device_session: &mut E2eeSession,
@@ -5447,6 +6035,22 @@ mod tests {
         let outer = read_ws_envelope(socket).await;
         let frame = encrypted_frame_from_envelope(outer).unwrap();
         device_session.decrypt_json_payload(&frame).unwrap()
+    }
+
+    async fn read_expected_session_scope_grant(
+        socket: &mut TestWs,
+        device_session: &mut E2eeSession,
+        expected_session_id: SessionId,
+    ) -> SessionScopeGrantPayload {
+        let inner = read_encrypted_ws(socket, device_session).await;
+        assert_eq!(
+            inner.kind,
+            MessageType::SessionScopeGrant,
+            "session.create/attach must be followed by exactly one scope grant"
+        );
+        let payload: SessionScopeGrantPayload = decode_payload(inner.payload).unwrap();
+        assert_eq!(payload.session_id, expected_session_id);
+        payload
     }
 
     async fn tls_healthz_request(addr: SocketAddr, cert_path: &PathBuf) -> String {
@@ -5750,11 +6354,7 @@ zZZR5LzKVu9X7paftR7K8Q==
             &mut protocol,
             envelope_value(MessageType::EncryptedFrame, frame).unwrap(),
         );
-        let response_frame =
-            encrypted_frame_from_envelope(create_responses.into_iter().next().unwrap()).unwrap();
-        let created = device_session
-            .decrypt_json_payload::<JsonEnvelope>(&response_frame)
-            .unwrap();
+        let created = decrypt_first_and_drain_scope_grants(&mut device_session, create_responses);
         assert_eq!(
             created.kind,
             MessageType::SessionCreated,

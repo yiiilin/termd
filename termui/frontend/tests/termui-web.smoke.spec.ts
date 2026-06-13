@@ -33,6 +33,70 @@ test.beforeEach(async ({ page }) => {
   await resetBrowserState(page);
 });
 
+test("mobile terminal pointerdown 提前解锁 focus suppression，helper textarea 不会被立即 blur", async ({ page }, testInfo: TestInfo) => {
+  test.skip(testInfo.project.name !== "mobile-chrome", "该回归只需要移动端项目覆盖");
+
+  const daemon = await MockDaemon.start({
+    token: "secret-token",
+    sessions: [
+      {
+        session_id: "00000000-0000-0000-0000-0000000005f1",
+        state: "running",
+        size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+      },
+    ],
+    attachOutput: "mobile-focus-ready\n",
+  });
+
+  try {
+    await page.goto("/");
+    await page.getByLabel("WS URL").fill(daemon.url);
+    await page.getByLabel("Pairing token").fill(pairingInviteCode(daemon));
+    await activateButton(page, "Pair");
+    await expectTerminalLine(page, "mobile-focus-ready", 8_000);
+
+    const terminalSurface = page.locator(".terminal-host .xterm-screen, .terminal-host canvas").first();
+    const terminalInput = page.locator('.terminal-host textarea[aria-label="Terminal input"]').first();
+
+    await terminalSurface.click({ position: { x: 20, y: 20 } });
+    await expect(terminalInput).toBeFocused();
+
+    await terminalInput.evaluate((element) => {
+      (element as HTMLTextAreaElement).blur();
+    });
+    await page.waitForTimeout(180);
+    const resizeCountBeforeBypassFocus = daemon.sessionResizes.length;
+
+    await terminalSurface.dispatchEvent("pointerdown", {
+      pointerId: 91,
+      pointerType: "touch",
+      button: 0,
+      clientX: 24,
+      clientY: 24,
+    });
+    await terminalInput.evaluate((element) => {
+      (element as HTMLTextAreaElement).focus();
+    });
+
+    await expect(terminalInput).toBeFocused();
+    await expect.poll(() => daemon.sessionResizes.length).toBe(resizeCountBeforeBypassFocus);
+    const inputBaseline = daemon.decryptedInputs.join("");
+    await terminalInput.evaluate((element) => {
+      element.dispatchEvent(
+        new InputEvent("beforeinput", {
+          bubbles: true,
+          cancelable: true,
+          inputType: "insertText",
+          data: "x",
+        }),
+      );
+    });
+    await expect.poll(() => daemon.decryptedInputs.join("").slice(inputBaseline.length)).toBe("x");
+  } finally {
+    await daemon.stop();
+  }
+});
+
 test("pair、list、attach 的浏览器 smoke", async ({ page }, testInfo: TestInfo) => {
   const daemon = await MockDaemon.start({
     token: "secret-token",
@@ -66,7 +130,7 @@ test("pair、list、attach 的浏览器 smoke", async ({ page }, testInfo: TestI
     if (testInfo.project.name === "mobile-chrome") {
       await expect(page.getByRole("navigation", { name: "mobile workspace actions" })).toHaveCount(0);
       const sessionListRequests = () =>
-        daemon.receivedPackets.filter((packet) => packet.kind === "request" && packet.method === "session.list").length;
+        daemon.receivedHttpRequests.filter((request) => request.path === "/api/control/session/list").length;
       const beforeTitlePull = sessionListRequests();
       const titleButton = page.getByRole("button", { name: "Open session list from title" });
       // 中文注释：移动端标题栏下拉刷新复用 session.list，不打开 session 面板。
@@ -306,6 +370,98 @@ test("direct Web 慢普通 RPC 超时后终端仍可输入", async ({ page }, te
     await page.keyboard.press("Enter");
     await expect.poll(() => daemon.decryptedInputs.join("")).toContain("direct-after-timeout");
     expect(daemon.activeConnectionCount()).toBe(1);
+  } finally {
+    await daemon.stop();
+  }
+});
+
+test("移动端终端触摸滚动遵循内容跟手语义", async ({ page }, testInfo: TestInfo) => {
+  test.skip(testInfo.project.name !== "mobile-chrome", "该回归只需要移动端项目覆盖");
+
+  const daemon = await MockDaemon.start({
+    token: "secret-token",
+    sessions: [
+      {
+        session_id: "00000000-0000-0000-0000-000000000531",
+        state: "running",
+        size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+      },
+    ],
+    attachOutput: `${Array.from({ length: 320 }, (_, index) => `${String(index + 1).padStart(4, "0")}\n`).join("")}mobile-scroll-ready\n`,
+  });
+
+  try {
+    await page.goto("/");
+    await page.getByLabel("WS URL").fill(daemon.url);
+    await page.getByLabel("Pairing token").fill(pairingInviteCode(daemon));
+    await activateButton(page, "Pair");
+    await expectTerminalLine(page, "mobile-scroll-ready", 8_000);
+    await waitForStableTerminalSurface(page);
+
+    const initialState = await terminalViewportState(page);
+    expect(initialState.scrollbackLength).toBeGreaterThan(0);
+    expect(initialState.viewportRaw).toBe(0);
+
+    const frame = page.locator(".terminal-frame");
+    await frame.dispatchEvent("pointerdown", {
+      pointerId: 51,
+      pointerType: "touch",
+      button: 0,
+      clientX: 180,
+      clientY: 420,
+    });
+    await frame.dispatchEvent("pointermove", {
+      pointerId: 51,
+      pointerType: "touch",
+      buttons: 1,
+      clientX: 180,
+      clientY: 520,
+    });
+    await frame.dispatchEvent("pointerup", {
+      pointerId: 51,
+      pointerType: "touch",
+      button: 0,
+      clientX: 180,
+      clientY: 520,
+    });
+
+    await expect
+      .poll(async () => terminalViewportState(page).then((state) => state.viewportRaw), { timeout: 8_000 })
+      .toBeGreaterThan(0);
+
+    const historyViewportRaw = await terminalViewportState(page).then((state) => state.viewportRaw);
+    const scrolledLines = await terminalViewportNumberLines(page);
+    expect(scrolledLines.length).toBeGreaterThan(8);
+    for (let index = 1; index < scrolledLines.length; index += 1) {
+      // 中文注释：移动端触摸滚动后，当前 viewport 里仍必须是顺序连续的历史行。
+      expect(scrolledLines[index]).toBe(scrolledLines[index - 1] + 1);
+    }
+
+    await frame.dispatchEvent("pointerdown", {
+      pointerId: 52,
+      pointerType: "touch",
+      button: 0,
+      clientX: 180,
+      clientY: 520,
+    });
+    await frame.dispatchEvent("pointermove", {
+      pointerId: 52,
+      pointerType: "touch",
+      buttons: 1,
+      clientX: 180,
+      clientY: 420,
+    });
+    await frame.dispatchEvent("pointerup", {
+      pointerId: 52,
+      pointerType: "touch",
+      button: 0,
+      clientX: 180,
+      clientY: 420,
+    });
+
+    await expect
+      .poll(async () => terminalViewportState(page).then((state) => state.viewportRaw), { timeout: 8_000 })
+      .toBeLessThan(historyViewportRaw);
   } finally {
     await daemon.stop();
   }

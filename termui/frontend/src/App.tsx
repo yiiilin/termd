@@ -1232,7 +1232,7 @@ export default function App() {
         daemonPublicKey,
         PAIRING_CONNECTION_TIMEOUT_MS,
       );
-      const accepted = await client.pair(token, device.device_public_key);
+      const accepted = await client.pair(token, device.device_public_key, device);
       client.close();
       const nextState = await recordPairing(accepted, effectiveUrl);
       activeServerIdRef.current = accepted.server_id;

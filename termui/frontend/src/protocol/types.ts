@@ -4,6 +4,8 @@ export const ALL_MESSAGE_TYPES = [
   "hello",
   "auth",
   "auth_challenge",
+  "session_token_grant",
+  "session_scope_grant",
   "pair_request",
   "pair_accept",
   "session_create",
@@ -199,6 +201,19 @@ export interface HttpE2eeAuthPayload {
   method: string;
   path: string;
   signature: SignatureWire;
+}
+
+export interface SessionTokenGrantPayload {
+  server_id: UUID;
+  device_id: UUID;
+  token: string;
+  expires_at_ms: UnixTimestampMillis;
+}
+
+export interface SessionScopeGrantPayload {
+  session_id: UUID;
+  token: string;
+  expires_at_ms: UnixTimestampMillis;
 }
 
 export interface TerminalSize {

@@ -4,6 +4,7 @@ import type { TerminalSize } from "../../protocol/types";
 interface InstallTerminalFocusResizeListenersOptions {
   host: HTMLElement;
   focusOutSettleMs: number;
+  isPassiveInputTarget?: (target: EventTarget | null) => boolean;
   reportTerminalFocus: (focused: boolean) => void;
   queueCursorReport: (options?: { immediate?: boolean }) => void;
   scheduleScrollToBottomIfPinned: () => void;
@@ -15,6 +16,8 @@ export function useTerminalFocusResizeState() {
   const clientSizeRef = useRef<TerminalSize | undefined>(undefined);
   const mobileViewportResizeOwnerRef = useRef(false);
   const focusActivationArmedRef = useRef(false);
+  const passiveFocusBypassRef = useRef(false);
+  const passiveInputFocusRef = useRef(false);
   const suppressPassiveFocusRef = useRef(false);
   const windowActiveRef = useRef(true);
   const focusOutTimerRef = useRef<number | undefined>(undefined);
@@ -35,22 +38,53 @@ export function useTerminalFocusResizeState() {
         activeElement.blur();
       }
     };
-    const handleFocusIn = () => {
+    const handleFocusIn = (event: FocusEvent) => {
       clearPendingFocusOut();
       if (!windowActiveRef.current) {
+        passiveFocusBypassRef.current = false;
+        passiveInputFocusRef.current = false;
         focusedRef.current = false;
         setFocused(false);
         blurActiveTerminalElement();
         options.queueCursorReport({ immediate: true });
         return;
       }
-      if (suppressPassiveFocusRef.current && !focusActivationArmedRef.current) {
+      const allowPassiveFocusBypass = passiveFocusBypassRef.current;
+      const passiveInputTargetFocused = options.isPassiveInputTarget?.(event.target) ?? false;
+      if (
+        passiveInputFocusRef.current &&
+        !focusActivationArmedRef.current &&
+        !passiveInputTargetFocused
+      ) {
+        // 中文注释：helper textarea 已经在 capture 阶段接住了被动焦点后，
+        // 原始 host focusin 事件仍可能继续冒泡到这里。此时不能再把这轮焦点
+        // 当成 suppression 违规处理，否则会把刚拿到的 IME 输入焦点立刻 blur 掉。
+        return;
+      }
+      if (
+        suppressPassiveFocusRef.current &&
+        !focusActivationArmedRef.current &&
+        !allowPassiveFocusBypass
+      ) {
+        passiveInputFocusRef.current = false;
         focusedRef.current = false;
         setFocused(false);
         blurActiveTerminalElement();
         options.queueCursorReport({ immediate: true });
         return;
       }
+      if (allowPassiveFocusBypass && !focusActivationArmedRef.current) {
+        // 中文注释：移动端真实时序里，surface 先 focus 到 host，再由 bridge 同步把
+        // 焦点转交给 helper textarea。只有 textarea 真的接住焦点时，才消费这次
+        // 临时 bypass；否则会把第二跳 textarea focusin 重新打回 suppression。
+        if (passiveInputTargetFocused) {
+          passiveFocusBypassRef.current = false;
+          passiveInputFocusRef.current = true;
+        }
+        return;
+      }
+      passiveFocusBypassRef.current = false;
+      passiveInputFocusRef.current = false;
       focusActivationArmedRef.current = false;
       suppressPassiveFocusRef.current = false;
       options.reportTerminalFocus(true);
@@ -61,7 +95,16 @@ export function useTerminalFocusResizeState() {
       // 否则会打断用户查看 scrollback 或搜索结果。
       options.scheduleScrollToBottomIfPinned();
     };
-    const handleFocusOut = () => {
+    const handleFocusOut = (event: FocusEvent) => {
+      const relatedTarget = event.relatedTarget;
+      if (relatedTarget instanceof HTMLElement && options.host.contains(relatedTarget)) {
+        // 中文注释：host 与 helper textarea 之间的焦点交接属于同一个终端内部流转。
+        // 这时若提前清掉 passive/bypass 状态，下一跳 helper focusin 会被我们自己
+        // 再次当成 suppression 违规处理，移动端输入法就接不住了。
+        return;
+      }
+      passiveFocusBypassRef.current = false;
+      passiveInputFocusRef.current = false;
       focusActivationArmedRef.current = false;
       if (!focusedRef.current || focusOutTimerRef.current !== undefined) {
         return;
@@ -76,6 +119,8 @@ export function useTerminalFocusResizeState() {
     };
     const handleWindowBlur = () => {
       windowActiveRef.current = false;
+      passiveFocusBypassRef.current = false;
+      passiveInputFocusRef.current = false;
       focusActivationArmedRef.current = false;
       mobileViewportResizeOwnerRef.current = false;
       suppressPassiveFocusRef.current = true;
@@ -87,6 +132,8 @@ export function useTerminalFocusResizeState() {
     };
     const handleWindowFocus = () => {
       windowActiveRef.current = true;
+      passiveFocusBypassRef.current = false;
+      passiveInputFocusRef.current = false;
       focusActivationArmedRef.current = false;
       // 回到浏览器窗口不等于用户要接管 PTY；没有显式激活动作时仍保持被动聚焦抑制。
       suppressPassiveFocusRef.current = true;
@@ -122,6 +169,8 @@ export function useTerminalFocusResizeState() {
     clientSizeRef,
     mobileViewportResizeOwnerRef,
     focusActivationArmedRef,
+    passiveFocusBypassRef,
+    passiveInputFocusRef,
     suppressPassiveFocusRef,
     windowActiveRef,
     focusOutTimerRef,

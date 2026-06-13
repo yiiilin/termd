@@ -38,8 +38,16 @@ test.beforeEach(async ({ page }) => {
 
 test("浏览器通过真实 relay 连接 daemon 完成 pairing 和 session list", async ({ page }, testInfo) => {
   const fixture = await startRealRelayFixture();
+  const controlRequests: string[] = [];
+  const relayHttpOrigin = new URL(fixture.relayWebUrl).origin;
 
   try {
+    page.on("request", (request) => {
+      const url = request.url();
+      if (url.includes("/api/control/")) {
+        controlRequests.push(url);
+      }
+    });
     await page.goto("/");
     await page.getByLabel("WS URL").fill(fixture.relayClientUrl);
     await page.getByLabel("Pairing token").fill(pairingInviteCode(fixture));
@@ -78,6 +86,12 @@ test("浏览器通过真实 relay 连接 daemon 完成 pairing 和 session list"
     }
 
     await expect(page.getByLabel("sessions").getByText("No sessions")).toBeVisible();
+    await expect
+      .poll(() => controlRequests.some((url) => {
+        const parsed = new URL(url);
+        return parsed.origin === relayHttpOrigin && parsed.pathname === "/api/control/session/list";
+      }))
+      .toBe(true);
 
     const localStorageText = await page.evaluate(() => JSON.stringify(window.localStorage));
     expect(localStorageText).not.toContain(fixture.token);
@@ -749,7 +763,9 @@ test("relay Web 在 daemon relay 主干断开重连后仍能恢复输入", async
   });
   const createdNames: string[] = [];
   const browserErrors: string[] = [];
-  collectBrowserErrors(page, "client", browserErrors);
+  collectBrowserErrors(page, "client", browserErrors, {
+    ignoreExpectedRelayInterruptHttpErrors: true,
+  });
 
   try {
     await page.goto("/");
@@ -1235,8 +1251,25 @@ function terminalPane(page: Page): Locator {
   return page.getByTestId("terminal-pane");
 }
 
-function collectBrowserErrors(page: Page, label: string, browserErrors: string[]): void {
+function collectBrowserErrors(
+  page: Page,
+  label: string,
+  browserErrors: string[],
+  options: { ignoreExpectedRelayInterruptHttpErrors?: boolean } = {},
+): void {
   page.on("console", (message) => {
+    if (message.text().includes("net::ERR_INTERNET_DISCONNECTED")) {
+      return;
+    }
+    // 中文注释：只有真实 relay 主干被测试主动切断时，浏览器资源请求可能短暂收到
+    // relay 前置层的 502/503；其它用例仍应把这些 console error 视为失败。
+    if (
+      options.ignoreExpectedRelayInterruptHttpErrors &&
+      (message.text().includes("status of 502 (Bad Gateway)") ||
+        message.text().includes("status of 503 (Service Unavailable)"))
+    ) {
+      return;
+    }
     if (message.type() === "error") {
       browserErrors.push(`[${label}:console] ${message.text()}`);
     }
@@ -1247,6 +1280,9 @@ function collectBrowserErrors(page: Page, label: string, browserErrors: string[]
   page.on("requestfailed", (request) => {
     const failureText = request.failure()?.errorText;
     if (!failureText) {
+      return;
+    }
+    if (failureText.includes("net::ERR_INTERNET_DISCONNECTED")) {
       return;
     }
     browserErrors.push(`[${label}:requestfailed] ${failureText} ${request.url()}`);
@@ -1497,10 +1533,19 @@ async function createShellSession(page: Page, existingNames: string[]): Promise<
 }
 
 async function sessionNames(page: Page): Promise<string[]> {
-  return page
+  const openButtons = await page
     .getByRole("region", { name: "sessions" })
-    .locator(".session-row strong")
-    .allTextContents();
+    .getByRole("button", { name: /^Open / })
+    .all();
+  const names: string[] = [];
+  for (const button of openButtons) {
+    const label = await button.getAttribute("aria-label");
+    const name = label?.replace(/^Open /u, "").replace(/, new output$/u, "").trim();
+    if (name) {
+      names.push(name);
+    }
+  }
+  return names;
 }
 
 async function sessionFileNames(filesPanel: Locator): Promise<string[]> {

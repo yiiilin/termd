@@ -30,8 +30,8 @@ use termd_proto::{
     DaemonClientForgetPayload, DaemonClientForgotPayload, DaemonClientSummaryPayload,
     DaemonClientsPayload, DaemonClientsResultPayload, DaemonStatusPayload,
     DaemonStatusResultPayload, DeviceId, E2eeKeyExchangePayload, EncryptedFramePayload, Envelope,
-    ErrorPayload, HelloPayload, HttpE2eeAuthPayload, METHOD_AUTH, METHOD_AUTH_VERIFY,
-    METHOD_CLIENT_HELLO, METHOD_CONTROL_REQUEST, METHOD_DAEMON_CLIENT_FORGET,
+    ErrorPayload, HelloPayload, HttpE2eeAuthPayload, METHOD_AUTH, METHOD_AUTH_SESSION_TOKEN,
+    METHOD_AUTH_VERIFY, METHOD_CLIENT_HELLO, METHOD_CONTROL_REQUEST, METHOD_DAEMON_CLIENT_FORGET,
     METHOD_DAEMON_CLIENTS, METHOD_DAEMON_STATUS, METHOD_PAIR_REQUEST, METHOD_PING,
     METHOD_SESSION_ATTACH, METHOD_SESSION_CLOSE, METHOD_SESSION_CREATE, METHOD_SESSION_CURSOR,
     METHOD_SESSION_FILE_DELETE, METHOD_SESSION_FILE_DOWNLOAD_CHUNK,
@@ -58,13 +58,17 @@ use termd_proto::{
     SessionGitFileChangePayload, SessionGitPayload, SessionGitResultPayload,
     SessionGitWorktreePayload, SessionId, SessionListPayload, SessionListResultPayload,
     SessionRenamePayload, SessionRenamedPayload, SessionReorderPayload, SessionReorderedPayload,
-    SessionResizePayload, SessionResizedPayload, SessionSearchPayload, SessionState,
-    SessionSummaryPayload, TerminalSize, UnixTimestampMillis, attach_frame_payload_value,
-    decode_binary_protocol_packet, encode_binary_protocol_packet, packet_event_method_for_message,
-    protocol_packet_from_binary, protocol_packet_to_binary,
+    SessionResizePayload, SessionResizedPayload, SessionScopeGrantPayload, SessionSearchPayload,
+    SessionState, SessionSummaryPayload, SessionTokenGrantPayload, TerminalSize,
+    UnixTimestampMillis, attach_frame_payload_value, decode_binary_protocol_packet,
+    encode_binary_protocol_packet, packet_event_method_for_message, protocol_packet_from_binary,
+    protocol_packet_to_binary,
 };
 #[cfg(test)]
-use termd_proto::{SessionSearchMatchPayload, SessionSearchResultPayload, TerminalFramePayload};
+use termd_proto::{
+    METHOD_SESSION_SCOPE_TOKEN, SessionSearchMatchPayload, SessionSearchResultPayload,
+    TerminalFramePayload,
+};
 use thiserror::Error;
 use tokio::sync::watch;
 use uuid::Uuid;
@@ -73,7 +77,8 @@ use crate::auth::{
     AuthChallengeManager, ChallengeResponseService, DaemonE2eeSigningInput, DaemonIdentity,
     DaemonPublicIdentity, DeviceIdentity, E2eeAuthTranscript, HttpE2eeSigningInput,
     InMemoryTrustedDeviceStore, PairingService, PairingTokenManager, ReplayProtector,
-    SignatureVerifier, TrustedDevice, TrustedDeviceStore, current_unix_timestamp_millis,
+    SessionScopeManager, SessionTokenManager, SignatureVerifier, TrustedDevice, TrustedDeviceStore,
+    current_unix_timestamp_millis,
 };
 use crate::config::DaemonConfig;
 use crate::pty::{
@@ -853,6 +858,8 @@ pub struct DaemonProtocol<B: PtyBackend, V> {
     e2ee_keypair: E2eeKeyPair,
     pairing_service: PairingService,
     auth_service: ChallengeResponseService,
+    session_token_manager: SessionTokenManager,
+    session_scope_manager: SessionScopeManager,
     trusted_store: InMemoryTrustedDeviceStore,
     runtime: SessionRuntime<B>,
     verifier: V,
@@ -880,6 +887,15 @@ struct AttachedSessionContext {
 /// 文件/Git handler 额外需要 session root，和基础 attach 上下文一起解析。
 struct AttachedSessionRootContext {
     root: PathBuf,
+}
+
+/// 中文注释：watched attachment 替换是两阶段操作。
+/// 先启动新 watcher，但只有 attach 响应和 scope grant 都构造成功后才提交替换；
+/// 否则必须释放新 watcher 并恢复旧 watcher id，避免失败 attach 破坏当前输出订阅。
+struct PendingWatchedAttachmentStart {
+    wire_session_id: SessionId,
+    attachment_id: String,
+    previous_attachment_id: Option<String>,
 }
 
 impl<B, V> DaemonProtocol<B, V>
@@ -960,6 +976,8 @@ where
             e2ee_keypair: E2eeKeyPair::generate(),
             pairing_service: PairingService::new(PairingTokenManager::new()),
             auth_service,
+            session_token_manager: SessionTokenManager::new(),
+            session_scope_manager: SessionScopeManager::new(),
             trusted_store,
             runtime: SessionRuntime::new(backend),
             verifier,
@@ -1157,6 +1175,91 @@ where
     ) -> crate::auth::PairingResult<crate::auth::PairingTokenRecord> {
         self.pairing_service
             .issue_token(now_ms, self.config.pairing_token_ttl_ms)
+    }
+
+    /// 为已认证设备签发短期 session token。
+    pub fn issue_session_token(
+        &mut self,
+        device_id: DeviceId,
+        now_ms: UnixTimestampMillis,
+    ) -> crate::auth::SessionTokenResult<crate::auth::SessionTokenRecord> {
+        self.session_token_manager.issue(
+            self.server_id(),
+            device_id,
+            now_ms,
+            self.config.pairing_token_ttl_ms,
+        )
+    }
+
+    /// 为某个 session 的 HTTP control plane 签发短期 scope token。
+    pub fn issue_session_scope_token(
+        &mut self,
+        device_id: DeviceId,
+        session_id: SessionId,
+        now_ms: UnixTimestampMillis,
+    ) -> crate::auth::SessionTokenResult<crate::auth::SessionScopeRecord> {
+        self.session_scope_manager.issue(
+            self.server_id(),
+            device_id,
+            session_id,
+            now_ms,
+            self.config.pairing_token_ttl_ms,
+        )
+    }
+
+    pub fn verify_session_token(
+        &mut self,
+        token: &termd_proto::SessionToken,
+        now_ms: UnixTimestampMillis,
+    ) -> crate::auth::SessionTokenResult<crate::auth::SessionTokenRecord> {
+        self.session_token_manager.verify(token, now_ms)
+    }
+
+    pub fn verify_session_scope_token(
+        &mut self,
+        token: &termd_proto::SessionToken,
+        now_ms: UnixTimestampMillis,
+    ) -> crate::auth::SessionTokenResult<crate::auth::SessionScopeRecord> {
+        self.session_scope_manager.verify(token, now_ms)
+    }
+
+    /// HTTP control plane 每次请求都会重建一条临时 connection scope。
+    ///
+    /// 中文注释：这里只恢复 session 作用域，不创建 watched terminal attachment，
+    /// 也不把任何 terminal output 订阅绑到 HTTP 短连接上。
+    pub fn restore_http_control_scope(
+        &mut self,
+        connection: &mut ProtocolConnection,
+        session_id: SessionId,
+    ) -> Result<(), ProtocolError> {
+        let device_id = connection.authenticated_device_id()?;
+        let internal_session_id = self
+            .session_index
+            .get(&session_id)
+            .cloned()
+            .ok_or(ProtocolError::SessionNotFound)?;
+        self.runtime
+            .attach(&internal_session_id, device_key(device_id))
+            .map_err(map_runtime_error)?;
+        connection.attach(session_id, 0, Vec::new(), false);
+        connection.state = ProtocolConnectionState::Attached;
+        Ok(())
+    }
+
+    fn issue_session_scope_grant(
+        &mut self,
+        device_id: DeviceId,
+        session_id: SessionId,
+    ) -> Result<SessionScopeGrantPayload, ProtocolError> {
+        let now_ms = current_unix_timestamp_millis();
+        let grant = self
+            .issue_session_scope_token(device_id, session_id, now_ms)
+            .map_err(|_| ProtocolError::AuthFailed)?;
+        Ok(SessionScopeGrantPayload {
+            session_id: grant.session_id(),
+            token: grant.token().clone(),
+            expires_at_ms: grant.expires_at_ms(),
+        })
     }
 
     /// 创建一条新的协议连接，并返回 daemon 立即发送的明文握手消息。
@@ -1377,6 +1480,26 @@ where
         Ok(Vec::new())
     }
 
+    fn issue_session_token_grant(
+        &mut self,
+        connection: &ProtocolConnection,
+    ) -> Result<Vec<JsonEnvelope>, ProtocolError> {
+        let device_id = connection.authenticated_device_id()?;
+        let now_ms = current_unix_timestamp_millis();
+        let grant = self
+            .issue_session_token(device_id, now_ms)
+            .map_err(|_| ProtocolError::AuthFailed)?;
+        Ok(vec![envelope_value(
+            MessageType::SessionTokenGrant,
+            SessionTokenGrantPayload {
+                server_id: grant.server_id(),
+                device_id: grant.device_id(),
+                token: grant.token().clone(),
+                expires_at_ms: grant.expires_at_ms(),
+            },
+        )?])
+    }
+
     fn create_session(
         &mut self,
         connection: &mut ProtocolConnection,
@@ -1481,18 +1604,22 @@ where
 
             self.persist_state()?;
             let response_envelope = envelope_value(MessageType::SessionCreated, response)?;
-            let watched_attachment_id = self.start_watched_attachment(
+            let pending_watched_attachment = self.start_watched_attachment(
                 connection,
                 wire_session_id,
                 &internal_session_id,
                 response_size,
                 PtyAttachmentBootstrap::default(),
             )?;
+            let scope_grant = envelope_value(
+                MessageType::SessionScopeGrant,
+                self.issue_session_scope_grant(device_id, wire_session_id)?,
+            )?;
             connection.attach(wire_session_id, output_offset, initial_output, true);
-            connection.remember_watched_attachment(wire_session_id, watched_attachment_id);
+            self.commit_watched_attachment_start(connection, pending_watched_attachment);
             self.record_daemon_client_attach(wire_session_id, connection, device_id);
             connection.state = ProtocolConnectionState::Attached;
-            Ok(vec![response_envelope])
+            Ok(vec![response_envelope, scope_grant])
         })();
         if create_result.is_err() {
             self.rollback_created_session(wire_session_id, &internal_session_id);
@@ -1512,32 +1639,64 @@ where
             .cloned()
             .ok_or(ProtocolError::SessionNotFound)?;
         let runtime_device_key = device_key(device_id);
+        let was_runtime_attached = self
+            .runtime
+            .role(&internal_session_id, &runtime_device_key)
+            .map_err(map_runtime_error)?
+            .is_some();
         let role = self
             .runtime
-            .attach(&internal_session_id, runtime_device_key)
+            .attach(&internal_session_id, runtime_device_key.clone())
             .map_err(map_runtime_error)?;
         let wire_role = runtime_role_to_proto(role);
-        let response_size = self.runtime_size_proto(&internal_session_id)?;
-        let response_state = self.runtime_state_proto(&internal_session_id)?;
-        self.client_history.record_session_runtime_state(
-            payload.session_id,
-            response_state,
-            response_size,
-            current_unix_timestamp_millis(),
-        )?;
+        let attach_result = (|| -> Result<(JsonEnvelope, JsonEnvelope), ProtocolError> {
+            let response_size = self.runtime_size_proto(&internal_session_id)?;
+            let response_state = self.runtime_state_proto(&internal_session_id)?;
+            self.client_history.record_session_runtime_state(
+                payload.session_id,
+                response_state,
+                response_size,
+                current_unix_timestamp_millis(),
+            )?;
+            let response_envelope = envelope_value(
+                MessageType::SessionAttached,
+                SessionAttachedPayload {
+                    session_id: payload.session_id,
+                    role: wire_role,
+                    state: response_state,
+                    size: response_size,
+                    resize_owner: false,
+                },
+            )?;
+            let scope_grant = envelope_value(
+                MessageType::SessionScopeGrant,
+                self.issue_session_scope_grant(device_id, payload.session_id)?,
+            )?;
+            Ok((response_envelope, scope_grant))
+        })();
+        let (response_envelope, scope_grant) = match attach_result {
+            Ok(result) => result,
+            Err(error) => {
+                if !was_runtime_attached {
+                    // 中文注释：permission-only attach 也会给 supervisor/runtime 增加
+                    // operator 角色；任何后续响应构造或历史写入失败，都必须撤销本次新增
+                    // attach，避免 HTTP/WS 调用方拿到错误但 runtime 仍认为该设备在线。
+                    let _ = self
+                        .runtime
+                        .detach(&internal_session_id, &runtime_device_key);
+                }
+                return Err(error);
+            }
+        };
         connection.attach(payload.session_id, 0, Vec::new(), false);
+        // 中文注释：permission-only WebSocket 虽然不订阅终端输出，但它仍是在线
+        // attached 连接。detach_connection 依赖 active_connections 判断是否还有同设备
+        // 连接持有设备级 operator，必须把它纳入同一张表。HTTP scoped 短连接会在
+        // record_daemon_client_attach 内因 track_daemon_client_history=false 自动跳过。
+        self.record_daemon_client_attach(payload.session_id, connection, device_id);
         connection.state = ProtocolConnectionState::Attached;
 
-        Ok(vec![envelope_value(
-            MessageType::SessionAttached,
-            SessionAttachedPayload {
-                session_id: payload.session_id,
-                role: wire_role,
-                state: response_state,
-                size: response_size,
-                resize_owner: false,
-            },
-        )?])
+        Ok(vec![response_envelope, scope_grant])
     }
 
     pub(crate) fn attach_session(
@@ -1620,7 +1779,7 @@ where
                 return Err(error);
             }
         };
-        let watched_attachment_id = match self.start_watched_attachment(
+        let pending_watched_attachment = match self.start_watched_attachment(
             connection,
             payload.session_id,
             &internal_session_id,
@@ -1639,11 +1798,6 @@ where
                 return Err(error);
             }
         };
-        connection.attach(payload.session_id, output_offset, initial_output, true);
-        connection.remember_watched_attachment(payload.session_id, watched_attachment_id);
-        self.record_daemon_client_attach(payload.session_id, connection, device_id);
-        connection.state = ProtocolConnectionState::Attached;
-
         let response = SessionAttachedPayload {
             session_id: payload.session_id,
             role: wire_role,
@@ -1651,11 +1805,34 @@ where
             size: response_size,
             resize_owner: true,
         };
+        let responses = match (|| -> Result<Vec<JsonEnvelope>, ProtocolError> {
+            let response_envelope = envelope_value(MessageType::SessionAttached, response)?;
+            let scope_grant = envelope_value(
+                MessageType::SessionScopeGrant,
+                self.issue_session_scope_grant(device_id, payload.session_id)?,
+            )?;
+            Ok(vec![response_envelope, scope_grant])
+        })() {
+            Ok(responses) => responses,
+            Err(error) => {
+                // 中文注释：scope grant / response 构造失败虽然罕见，但此时客户端会收到错误；
+                // 连接级 watched attachment 替换和本次新增的 runtime operator 都必须一起撤销。
+                self.rollback_watched_attachment_start(connection, pending_watched_attachment);
+                if !was_runtime_attached {
+                    let _ = self
+                        .runtime
+                        .detach(&internal_session_id, &runtime_device_key);
+                }
+                return Err(error);
+            }
+        };
 
-        Ok(vec![envelope_value(
-            MessageType::SessionAttached,
-            response,
-        )?])
+        connection.attach(payload.session_id, output_offset, initial_output, true);
+        self.commit_watched_attachment_start(connection, pending_watched_attachment);
+        self.record_daemon_client_attach(payload.session_id, connection, device_id);
+        connection.state = ProtocolConnectionState::Attached;
+
+        Ok(responses)
     }
 
     fn require_attached_session(
@@ -3749,10 +3926,10 @@ where
         internal_session_id: &str,
         size: TerminalSize,
         bootstrap: PtyAttachmentBootstrap,
-    ) -> Result<String, ProtocolError> {
+    ) -> Result<PendingWatchedAttachmentStart, ProtocolError> {
         let previous_attachment_id = connection.take_watched_attachment_id(wire_session_id);
         let attachment_id = connection.allocate_watched_attachment_id(wire_session_id);
-        match self
+        if let Err(error) = self
             .runtime
             .start_watched_attachment(
                 internal_session_id,
@@ -3762,19 +3939,38 @@ where
             )
             .map_err(map_runtime_error)
         {
-            Ok(()) => {
-                if let Some(previous_attachment_id) = previous_attachment_id {
-                    self.release_watched_attachment(wire_session_id, previous_attachment_id);
-                }
+            if let Some(previous_attachment_id) = previous_attachment_id {
+                connection.remember_watched_attachment(wire_session_id, previous_attachment_id);
             }
-            Err(error) => {
-                if let Some(previous_attachment_id) = previous_attachment_id {
-                    connection.remember_watched_attachment(wire_session_id, previous_attachment_id);
-                }
-                return Err(error);
-            }
+            return Err(error);
         }
-        Ok(attachment_id)
+        Ok(PendingWatchedAttachmentStart {
+            wire_session_id,
+            attachment_id,
+            previous_attachment_id,
+        })
+    }
+
+    fn commit_watched_attachment_start(
+        &mut self,
+        connection: &mut ProtocolConnection,
+        pending: PendingWatchedAttachmentStart,
+    ) {
+        if let Some(previous_attachment_id) = pending.previous_attachment_id {
+            self.release_watched_attachment(pending.wire_session_id, previous_attachment_id);
+        }
+        connection.remember_watched_attachment(pending.wire_session_id, pending.attachment_id);
+    }
+
+    fn rollback_watched_attachment_start(
+        &mut self,
+        connection: &mut ProtocolConnection,
+        pending: PendingWatchedAttachmentStart,
+    ) {
+        self.release_watched_attachment(pending.wire_session_id, pending.attachment_id);
+        if let Some(previous_attachment_id) = pending.previous_attachment_id {
+            connection.remember_watched_attachment(pending.wire_session_id, previous_attachment_id);
+        }
     }
 
     fn release_watched_attachment(&mut self, wire_session_id: SessionId, attachment_id: String) {
@@ -5665,6 +5861,18 @@ impl ProtocolConnection {
         }
     }
 
+    pub(crate) fn dispatch_http_control_packet<B, V>(
+        &mut self,
+        protocol: &mut DaemonProtocol<B, V>,
+        packet: ProtocolPacket<Value>,
+    ) -> Result<Vec<ProtocolPacket<Value>>, ProtocolError>
+    where
+        B: PtyBackend,
+        V: SignatureVerifier,
+    {
+        self.handle_inner_packet(protocol, packet)
+    }
+
     fn handle_inner_packet<B, V>(
         &mut self,
         protocol: &mut DaemonProtocol<B, V>,
@@ -5735,6 +5943,7 @@ impl ProtocolConnection {
                 let payload = decode_payload(payload)?;
                 protocol.handle_auth(self, payload)
             }
+            METHOD_AUTH_SESSION_TOKEN => protocol.issue_session_token_grant(self),
             METHOD_CLIENT_HELLO => {
                 let payload = decode_payload(payload)?;
                 protocol.record_client_hello(self, payload)
@@ -9471,17 +9680,54 @@ mod tests {
         device_session: &mut E2eeSession,
         messages: Vec<JsonEnvelope>,
     ) -> JsonEnvelope {
-        let frame = encrypted_frame_from_envelope(messages.into_iter().next().unwrap()).unwrap();
-        device_session.decrypt_json_payload(&frame).unwrap()
+        decrypt_first_and_drain_scope_grants(device_session, messages)
+    }
+
+    fn decrypt_first_and_drain_scope_grants(
+        device_session: &mut E2eeSession,
+        messages: Vec<JsonEnvelope>,
+    ) -> JsonEnvelope {
+        let mut iter = messages.into_iter();
+        let first = iter
+            .next()
+            .expect("expected at least one encrypted response");
+        let first_frame = encrypted_frame_from_envelope(first).unwrap();
+        let first_envelope = device_session.decrypt_json_payload(&first_frame).unwrap();
+
+        for trailing in iter {
+            let trailing_frame = encrypted_frame_from_envelope(trailing).unwrap();
+            let trailing_envelope: JsonEnvelope = device_session
+                .decrypt_json_payload(&trailing_frame)
+                .unwrap();
+            assert_eq!(
+                trailing_envelope.kind,
+                MessageType::SessionScopeGrant,
+                "create/attach tests must consume only trailing scope grants, got {trailing_envelope:?}"
+            );
+        }
+
+        first_envelope
     }
 
     fn decrypt_first_packet(
         device_session: &mut E2eeSession,
         messages: Vec<JsonEnvelope>,
     ) -> ProtocolPacket<Value> {
-        let envelope = decrypt_first(device_session, messages);
-        assert_eq!(envelope.kind, MessageType::Packet);
-        decode_payload(envelope.payload).unwrap()
+        let packets = decrypt_packets(device_session, messages);
+        let mut iter = packets.into_iter();
+        let first = iter.next().expect("expected at least one packet");
+        assert!(
+            first.method.as_deref() != Some(METHOD_SESSION_SCOPE_TOKEN),
+            "packet tests must receive the business response before any scope token, got {first:?}"
+        );
+        for trailing in iter {
+            assert!(
+                trailing.kind == PacketKind::Event
+                    && trailing.method.as_deref() == Some(METHOD_SESSION_SCOPE_TOKEN),
+                "packet tests must not leave non-scope trailing packets unread, got {trailing:?}"
+            );
+        }
+        first
     }
 
     fn decrypt_packets(
@@ -20120,6 +20366,92 @@ mod tests {
     }
 
     #[test]
+    fn permission_only_attach_keeps_device_operator_until_last_same_device_connection_closes() {
+        let (mut protocol, backend) = protocol();
+        let (mut creator_connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = PublicKey(wire(signing_key.verifying_key().as_bytes()));
+        let (_, mut creator_device_session) =
+            open_e2ee(&mut protocol, &mut creator_connection, device_id);
+        pair_device(
+            &mut protocol,
+            &mut creator_connection,
+            &mut creator_device_session,
+            device_id,
+            public_key,
+        );
+        let session_id = create_test_session(
+            &mut protocol,
+            &mut creator_connection,
+            &mut creator_device_session,
+        );
+        creator_connection.close(&mut protocol);
+
+        let (mut rpc_connection, _) = protocol.start_connection();
+        let mut rpc_device_session = authenticate_paired_connection(
+            &mut protocol,
+            &mut rpc_connection,
+            device_id,
+            &signing_key,
+        );
+        let attached = send_encrypted(
+            &mut protocol,
+            &mut rpc_connection,
+            &mut rpc_device_session,
+            envelope_value(
+                MessageType::SessionAttach,
+                SessionAttachPayload {
+                    session_id,
+                    watch_updates: false,
+                    last_terminal_seq: None,
+                },
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            decrypt_first(&mut rpc_device_session, attached).kind,
+            MessageType::SessionAttached
+        );
+
+        // 中文注释：这里模拟同一设备的另一条短连接也曾 attach 同一 session。
+        // 关闭它时不能因为 runtime 是设备级 operator，就把仍在线的 permission-only
+        // WebSocket 连接权限一起撤掉。
+        let mut scoped_http = ProtocolConnection::authenticated_http(device_id);
+        protocol
+            .attach_session_permission(
+                &mut scoped_http,
+                SessionAttachPayload {
+                    session_id,
+                    watch_updates: false,
+                    last_terminal_seq: None,
+                },
+            )
+            .unwrap();
+        protocol.detach_connection(&mut scoped_http);
+
+        let write = send_encrypted(
+            &mut protocol,
+            &mut rpc_connection,
+            &mut rpc_device_session,
+            envelope_value(
+                MessageType::SessionData,
+                SessionDataPayload {
+                    session_id,
+                    data_base64: general_purpose::STANDARD.encode(b"rpc-still-attached\n"),
+                },
+            )
+            .unwrap(),
+        );
+
+        assert!(
+            write.is_empty(),
+            "permission-only WebSocket 连接仍 attached 时，session_data 不应返回错误"
+        );
+        assert_eq!(backend.writes(), vec![b"rpc-still-attached\n".to_vec()]);
+    }
+
+    #[test]
     fn watched_connection_close_drops_only_its_attachment_handle() {
         let (mut protocol, backend) = protocol();
         let (mut first_connection, _) = protocol.start_connection();
@@ -20445,6 +20777,250 @@ mod tests {
                 .is_none()
         );
         assert_eq!(second_connection.debug_snapshot().attached_sessions, 0);
+    }
+
+    #[test]
+    fn permission_attach_rolls_back_runtime_attach_when_history_write_fails() {
+        let (mut protocol, _backend) = protocol();
+        let (mut first_connection, _) = protocol.start_connection();
+        let first_device_id = DeviceId::new();
+        let first_signing_key = SigningKey::generate(&mut OsRng);
+        let first_public_key = PublicKey(wire(first_signing_key.verifying_key().as_bytes()));
+        let (_, mut first_device_session) =
+            open_e2ee(&mut protocol, &mut first_connection, first_device_id);
+        pair_device(
+            &mut protocol,
+            &mut first_connection,
+            &mut first_device_session,
+            first_device_id,
+            first_public_key,
+        );
+        let session_id = create_test_session(
+            &mut protocol,
+            &mut first_connection,
+            &mut first_device_session,
+        );
+        let internal_session_id = protocol.session_index.get(&session_id).cloned().unwrap();
+
+        let (mut second_connection, _) = protocol.start_connection();
+        let second_device_id = DeviceId::new();
+        let second_signing_key = SigningKey::generate(&mut OsRng);
+        let second_public_key = PublicKey(wire(second_signing_key.verifying_key().as_bytes()));
+        let (_, mut second_device_session) =
+            open_e2ee(&mut protocol, &mut second_connection, second_device_id);
+        pair_device(
+            &mut protocol,
+            &mut second_connection,
+            &mut second_device_session,
+            second_device_id,
+            second_public_key,
+        );
+
+        protocol
+            .client_history
+            .set_query_only_for_test(true)
+            .unwrap();
+        let responses = send_encrypted(
+            &mut protocol,
+            &mut second_connection,
+            &mut second_device_session,
+            envelope_value(
+                MessageType::SessionAttach,
+                SessionAttachPayload {
+                    session_id,
+                    watch_updates: false,
+                    last_terminal_seq: None,
+                },
+            )
+            .unwrap(),
+        );
+        let response = decrypt_first(&mut second_device_session, responses);
+        protocol
+            .client_history
+            .set_query_only_for_test(false)
+            .unwrap();
+
+        assert_eq!(response.kind, MessageType::Error);
+        assert!(
+            protocol
+                .runtime
+                .role(&internal_session_id, &device_key(second_device_id))
+                .unwrap()
+                .is_none(),
+            "permission attach 的后置历史写入失败不能泄漏 runtime operator 角色"
+        );
+        assert_eq!(second_connection.debug_snapshot().attached_sessions, 0);
+    }
+
+    #[test]
+    fn permission_attach_unknown_session_does_not_issue_scope_grant() {
+        let (mut protocol, _backend) = protocol();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = PublicKey(wire(signing_key.verifying_key().as_bytes()));
+        let (_, mut device_session) = open_e2ee(&mut protocol, &mut connection, device_id);
+        pair_device(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            device_id,
+            public_key,
+        );
+
+        let responses = send_encrypted(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            envelope_value(
+                MessageType::SessionAttach,
+                SessionAttachPayload {
+                    session_id: SessionId::new(),
+                    watch_updates: false,
+                    last_terminal_seq: None,
+                },
+            )
+            .unwrap(),
+        );
+        let response = decrypt_first(&mut device_session, responses);
+
+        assert_eq!(response.kind, MessageType::Error);
+        assert!(
+            format!("{:?}", protocol.session_scope_manager).contains("len: 0"),
+            "不存在的 session attach 失败时不应留下内部 scope token"
+        );
+    }
+
+    #[test]
+    fn terminal_attach_unknown_session_does_not_issue_scope_grant() {
+        let (mut protocol, _backend) = protocol();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = PublicKey(wire(signing_key.verifying_key().as_bytes()));
+        let (_, mut device_session) = open_e2ee(&mut protocol, &mut connection, device_id);
+        pair_device(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            device_id,
+            public_key,
+        );
+
+        let responses = send_encrypted(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            envelope_value(
+                MessageType::SessionAttach,
+                SessionAttachPayload {
+                    session_id: SessionId::new(),
+                    watch_updates: true,
+                    last_terminal_seq: None,
+                },
+            )
+            .unwrap(),
+        );
+        let response = decrypt_first(&mut device_session, responses);
+
+        assert_eq!(response.kind, MessageType::Error);
+        assert!(
+            format!("{:?}", protocol.session_scope_manager).contains("len: 0"),
+            "不存在的 terminal attach 失败时不应留下内部 scope token"
+        );
+    }
+
+    #[test]
+    fn session_create_scope_grant_failure_rolls_back_connection_attach_state() {
+        let (mut protocol, backend) = protocol();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = PublicKey(wire(signing_key.verifying_key().as_bytes()));
+        let (_, mut device_session) = open_e2ee(&mut protocol, &mut connection, device_id);
+        pair_device(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            device_id,
+            public_key,
+        );
+
+        // 中文注释：pairing 已完成后再把 TTL 置零，专门模拟 create 最后的 scope grant
+        // 签发失败；此时 runtime session 和 watched attachment 都已经创建过。
+        protocol.config.pairing_token_ttl_ms = 0;
+        let responses = send_encrypted(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            envelope_value(
+                MessageType::SessionCreate,
+                SessionCreatePayload {
+                    command: vec!["sh".to_owned()],
+                    size: TerminalSize::new(24, 80),
+                },
+            )
+            .unwrap(),
+        );
+        let response = decrypt_first(&mut device_session, responses);
+        let snapshot = connection.debug_snapshot();
+
+        assert_eq!(response.kind, MessageType::Error);
+        assert_eq!(snapshot.attached_sessions, 0);
+        assert_eq!(snapshot.watched_sessions, 0);
+        assert_eq!(backend.terminate_count(), 1);
+        assert_eq!(backend.attachment_drops().len(), 1);
+    }
+
+    #[test]
+    fn terminal_reattach_scope_grant_failure_keeps_previous_watched_attachment() {
+        let (mut protocol, backend) = protocol();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = PublicKey(wire(signing_key.verifying_key().as_bytes()));
+        let (_, mut device_session) = open_e2ee(&mut protocol, &mut connection, device_id);
+        pair_device(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            device_id,
+            public_key,
+        );
+        let session_id = create_test_session(&mut protocol, &mut connection, &mut device_session);
+        assert_eq!(backend.attachment_starts().len(), 1);
+        assert_eq!(connection.attached_output_signals(&protocol).len(), 1);
+
+        // 中文注释：同一连接再次 terminal attach 会先启动新 watcher。这里让最后的
+        // scope grant 签发失败，验证失败路径不能把旧 watcher 一起丢掉。
+        protocol.config.pairing_token_ttl_ms = 0;
+        let responses = send_encrypted(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            envelope_value(
+                MessageType::SessionAttach,
+                SessionAttachPayload {
+                    session_id,
+                    watch_updates: true,
+                    last_terminal_seq: None,
+                },
+            )
+            .unwrap(),
+        );
+        let response = decrypt_first(&mut device_session, responses);
+        let snapshot = connection.debug_snapshot();
+
+        assert_eq!(response.kind, MessageType::Error);
+        assert_eq!(backend.attachment_starts().len(), 2);
+        assert_eq!(
+            backend.attachment_drops().len(),
+            1,
+            "失败的新 watcher 应被释放，但旧 watcher 必须保留"
+        );
+        assert_eq!(snapshot.attached_sessions, 1);
+        assert_eq!(snapshot.watched_sessions, 1);
+        assert_eq!(connection.attached_output_signals(&protocol).len(), 1);
     }
 
     #[test]
