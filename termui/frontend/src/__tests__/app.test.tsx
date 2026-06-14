@@ -3842,6 +3842,47 @@ describe("termui web 工作台", () => {
     ).toHaveLength(0);
   });
 
+  it("terminal.create 的首屏输出必须等 TerminalPane reset 确认后才写入 xterm", async () => {
+    const user = userEvent.setup();
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [],
+      attachOutput: "create-reset-ready\n",
+    });
+    const resetConfirmations: Array<() => void> = [];
+    (globalThis as { __TERMD_TEST_DEFER_OUTPUT_RESET_APPLIED__?: (confirm: () => void) => void })
+      .__TERMD_TEST_DEFER_OUTPUT_RESET_APPLIED__ = (confirm) => {
+        resetConfirmations.push(confirm);
+      };
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession("No session");
+    await user.click(screen.getByRole("button", { name: "New session" }));
+    await waitFor(() => expect(visibleSessionNames()).toHaveLength(1));
+
+    // 中文注释：create 与普通 attach 一样会切换 xterm 实例。reset 未确认前不能消费
+    // create stream 的 snapshot，否则切换回来时可能把首屏写进旧实例或被下一次 reset 重放。
+    await act(async () => {
+      await new Promise((resolve) => window.setTimeout(resolve, 80));
+    });
+    expect(terminalText()).not.toContain("create-reset-ready");
+
+    expect(resetConfirmations.length).toBeGreaterThan(0);
+    for (const confirm of resetConfirmations.splice(0)) {
+      confirm();
+    }
+
+    await screen.findByText(/create-reset-ready/);
+    expect(
+      daemon.receivedPackets.filter((packet) => packet.kind === "stream_open" && packet.method === "terminal.create"),
+    ).toHaveLength(1);
+    expect(
+      daemon.receivedPackets.filter((packet) => packet.kind === "stream_open" && packet.method === "terminal.attach"),
+    ).toHaveLength(0);
+  });
+
   it("新建 session 进行中不会把空列表显示成 No sessions", async () => {
     const user = userEvent.setup();
     await daemon.stop();
@@ -5632,9 +5673,15 @@ describe("termui web 工作台", () => {
 
     await pairWithInvite(user, daemon);
     await waitForWorkspaceSession();
+    const requestCountBeforeInitialAttach = daemon.sessionFileRequests.length;
     await clickSessionCard(user);
 
     const panel = await screen.findByLabelText("session files");
+    await waitFor(() =>
+      expect(daemon.sessionFileRequests.slice(requestCountBeforeInitialAttach)).toContainEqual({
+        session_id: sessionId,
+      }),
+    );
     await waitFor(() => expect(within(panel).getByLabelText("Current directory")).toHaveValue("/home/me"));
     const followToggle = within(panel).getByLabelText("Follow terminal cwd") as HTMLInputElement;
     expect(followToggle).toBeChecked();
@@ -5657,7 +5704,13 @@ describe("termui web 工作台", () => {
     const requestCountAfterDisable = daemon.sessionFileRequests.length;
     daemon.setSessionFilePosition(sessionId, "/home/me");
     await new Promise((resolve) => window.setTimeout(resolve, 1200));
-    expect(daemon.sessionFileRequests).toHaveLength(requestCountAfterDisable);
+    // 中文注释：HTTP control 请求可能在关闭 Follow 前已经发出；这里验证更关键的不变量：
+    // 关闭后的迟到 cwd 结果不能再把文件面板从用户停留的目录覆盖回 terminal cwd。
+    expect(
+      daemon.sessionFileRequests
+        .slice(requestCountAfterDisable)
+        .filter((request) => request.path === undefined || request.path === null),
+    ).toHaveLength(0);
     expect(within(panel).getByLabelText("Current directory")).toHaveValue("/tmp/work");
   });
 
@@ -5826,7 +5879,95 @@ describe("termui web 工作台", () => {
     expect(within(panel).queryByText("beta.log")).toBeNull();
   });
 
-  it("重新 attach session 时恢复该 session 的文件树目录", async () => {
+  it("关闭 Follow 后忽略已在路上的静默 initial cwd 刷新", async () => {
+    const user = userEvent.setup();
+    const sessionId = "00000000-0000-0000-0000-000000000418";
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [
+        {
+          session_id: sessionId,
+          state: "running",
+          size: { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 },
+        },
+      ],
+      sessionFiles: {
+        [sessionId]: {
+          session_id: sessionId,
+          path: "/home/me",
+          entries: [
+            {
+              name: "home.log",
+              path: "/home/me/home.log",
+              kind: "file",
+              size_bytes: 4,
+              modified_at_ms: null,
+            },
+          ],
+        },
+        "/tmp/work": {
+          session_id: sessionId,
+          path: "/tmp/work",
+          entries: [
+            {
+              name: "late.log",
+              path: "/tmp/work/late.log",
+              kind: "file",
+              size_bytes: 4,
+              modified_at_ms: null,
+            },
+          ],
+        },
+      },
+    });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await clickSessionCard(user);
+
+    const panel = await screen.findByLabelText("session files");
+    await within(panel).findByText("home.log");
+    const followToggle = within(panel).getByLabelText("Follow terminal cwd") as HTMLInputElement;
+    expect(followToggle).toBeChecked();
+
+    daemon.queueSessionFilesResponse(
+      sessionId,
+      {
+        session_id: sessionId,
+        path: "/tmp/work",
+        entries: [
+          {
+            name: "late.log",
+            path: "/tmp/work/late.log",
+            kind: "file",
+            size_bytes: 4,
+            modified_at_ms: null,
+          },
+        ],
+      },
+      { path: undefined, delayMs: 80 },
+    );
+    const requestCountBeforeReconnectRefresh = daemon.sessionFileRequests.length;
+    daemon.dropConnections();
+    await waitFor(() =>
+      expect(daemon.sessionFileRequests.slice(requestCountBeforeReconnectRefresh)).toContainEqual({
+        session_id: sessionId,
+      }),
+      { timeout: 2200 },
+    );
+
+    await user.click(followToggle);
+    expect(followToggle).not.toBeChecked();
+    await new Promise((resolve) => window.setTimeout(resolve, 140));
+
+    expect(within(panel).getByLabelText("Current directory")).toHaveValue("/home/me");
+    expect(within(panel).queryByText("late.log")).toBeNull();
+    expect(within(panel).getByText("home.log")).toBeVisible();
+  });
+
+  it("关闭 Follow 后重新 attach session 时保留当前文件树目录", async () => {
     const user = userEvent.setup();
     const sessionId = "00000000-0000-0000-0000-000000000412";
     await daemon.stop();
@@ -5864,14 +6005,27 @@ describe("termui web 工作台", () => {
 
     await pairWithInvite(user, daemon);
     await waitForWorkspaceSession();
+    const requestCountBeforeInitialAttach = daemon.sessionFileRequests.length;
     await clickSessionCard(user);
 
     const panel = await screen.findByLabelText("session files");
+    await waitFor(() =>
+      expect(daemon.sessionFileRequests.slice(requestCountBeforeInitialAttach)).toContainEqual({
+        session_id: sessionId,
+      }),
+    );
     await waitFor(() => expect(within(panel).getByLabelText("Current directory")).toHaveValue("/home/me"));
 
     await user.clear(within(panel).getByLabelText("Current directory"));
     await user.type(within(panel).getByLabelText("Current directory"), "/tmp/work");
+    const requestCountBeforeManualGo = daemon.sessionFileRequests.length;
     await user.click(within(panel).getByRole("button", { name: "Go" }));
+    await waitFor(() =>
+      expect(daemon.sessionFileRequests.slice(requestCountBeforeManualGo)).toContainEqual({
+        session_id: sessionId,
+        path: "/tmp/work",
+      }),
+    );
     await within(panel).findByText("beta.log");
 
     await user.click(screen.getByRole("button", { name: "Daemons" }));
@@ -5885,9 +6039,14 @@ describe("termui web 工作台", () => {
     await waitFor(() =>
       expect(daemon.sessionFileRequests.slice(requestCountBeforeReattach)).toContainEqual({
         session_id: sessionId,
+        path: "/tmp/work",
       }),
     );
-    await within(panel).findByText("beta.log");
+    expect(daemon.sessionFileRequests.slice(requestCountBeforeReattach)).not.toContainEqual({
+      session_id: sessionId,
+    });
+    const currentPanel = await screen.findByLabelText("session files");
+    await within(currentPanel).findByText("beta.log");
   });
 
   it("接收 session_cwd_changed 后主动重拉并同步当前 session 的文件树位置", async () => {

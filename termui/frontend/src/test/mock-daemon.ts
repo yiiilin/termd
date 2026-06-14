@@ -2286,13 +2286,7 @@ export class MockDaemon {
         direction,
         kind: packet.kind,
         payload_type: packet.payload.type,
-        data_text: payload.type === "terminal_frame" && payload.frame.kind === "output"
-          ? decodeUtf8(payload.frame.data_bytes ?? new Uint8Array())
-          : payload.type === "attach_sync"
-            ? decodeUtf8(payload.snapshot.retained_output_bytes)
-            : payload.type === "input"
-              ? decodeUtf8(payload.data_bytes)
-            : undefined,
+        data_text: attachFrameDebugText(payload),
       });
       return;
     }
@@ -2440,16 +2434,14 @@ export class MockDaemon {
     const snapshotSize = response.size ?? { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 };
     const currentBaseSeq = this.nextMockTerminalSeqBase(response.session_id);
     let baseSeq = currentBaseSeq;
-    let retainedOutputBytes = snapshotBytes;
+    let retainedOutputBytes = new Uint8Array();
     let frames: SingleTerminalFramePayload[] = [];
 
     if (request.method === "terminal.create" && this.options.createOutputBeforeResponse) {
       // 中文注释：create response 前如果已经通过同一条 stream 推过首屏 output，
       // response 后的 attach_sync 只能作为“已追平”的确认，不能再回放同样的字节。
-      retainedOutputBytes = new Uint8Array();
       baseSeq = currentBaseSeq;
     } else if (requestedLastTerminalSeq !== undefined) {
-      retainedOutputBytes = new Uint8Array();
       if (requestedLastTerminalSeq >= currentBaseSeq) {
         // 中文注释：client 已经追平当前 terminal_seq 时，重连 bootstrap 只需要确认
         // base_seq，不应该再回放 retained_output，否则页面会把旧内容再渲染一遍。
@@ -2465,6 +2457,16 @@ export class MockDaemon {
           data_bytes: snapshotBytes,
         }];
       }
+    } else {
+      // 中文注释：生产 supervisor 的 terminal attach 首屏只通过 frames.snapshot 传输。
+      // MockDaemon 保持同样语义，避免测试继续固定旧的 retained_output 双播模型。
+      frames = [{
+        kind: "snapshot",
+        session_id: response.session_id,
+        base_seq: currentBaseSeq,
+        size: snapshotSize,
+        data_bytes: snapshotBytes,
+      }];
     }
     this.sendSupervisorTerminalFrame(connection, response.session_id, {
       type: "attach_sync",
@@ -2693,4 +2695,26 @@ function basenamePath(path: string): string {
   const trimmed = path.replace(/\/+$/, "");
   const index = trimmed.lastIndexOf("/");
   return index >= 0 ? trimmed.slice(index + 1) || trimmed : trimmed;
+}
+
+function attachFrameDebugText(payload: ReturnType<typeof decodeSupervisorTerminalServerFrame> | ReturnType<typeof decodeSupervisorTerminalClientFrame>): string | undefined {
+  if (payload.type === "input") {
+    return decodeUtf8(payload.data_bytes);
+  }
+  if (payload.type === "terminal_frame" && payload.frame.kind === "output") {
+    return decodeUtf8(payload.frame.data_bytes ?? new Uint8Array());
+  }
+  if (payload.type !== "attach_sync") {
+    return undefined;
+  }
+  const chunks: string[] = [];
+  if (payload.snapshot.retained_output_bytes.byteLength > 0) {
+    chunks.push(decodeUtf8(payload.snapshot.retained_output_bytes));
+  }
+  for (const frame of payload.frames) {
+    if (frame.kind === "snapshot" || frame.kind === "output") {
+      chunks.push(decodeUtf8(frame.data_bytes ?? new Uint8Array()));
+    }
+  }
+  return chunks.length > 0 ? chunks.join("") : undefined;
 }

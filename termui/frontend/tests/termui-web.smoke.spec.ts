@@ -546,6 +546,60 @@ test("direct Web 多个大输出 session 快速切换后仍贴底并能输入", 
   }
 });
 
+test("direct Web 新建 session 切走再切回后不会重复发送输入", async ({ page }, testInfo: TestInfo) => {
+  test.skip(testInfo.project.name === "mobile-chrome", "输入重复回归只需要桌面布局覆盖");
+  const existingSessionId = "00000000-0000-0000-0000-000000000541";
+  const daemon = await MockDaemon.start({
+    token: "secret-token",
+    sessions: [
+      {
+        session_id: existingSessionId,
+        name: "Switch Anchor",
+        state: "running",
+        size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+      },
+    ],
+    attachOutput: "switch-attach-ready\n",
+  });
+
+  try {
+    await page.goto("/");
+    await page.getByLabel("WS URL").fill(daemon.url);
+    await page.getByLabel("Pairing token").fill(pairingInviteCode(daemon));
+    await activateButton(page, "Pair");
+
+    const createdName = await createShellSession(page, ["Switch Anchor"]);
+    await expectTerminalLine(page, "switch-attach-ready", 8_000);
+    await openSession(page, "Switch Anchor");
+    await expect.poll(() => daemon.attachedSessions.at(-1)).toBe(existingSessionId);
+    await expectTerminalLine(page, "switch-attach-ready", 8_000);
+    await openSession(page, createdName);
+    await expect.poll(() => daemon.attachedSessions.at(-1)).not.toBe(existingSessionId);
+    await expectTerminalLine(page, "switch-attach-ready", 8_000);
+
+    const createdSessionId = "00000000-0000-0000-0000-000000000501";
+    daemon.pushSessionData(createdSessionId, "switch-back-output-once\n");
+    await expectTerminalLine(page, "switch-back-output-once", 8_000);
+    const terminalBuffer = await terminalDebugBufferText(page);
+    expect(countOccurrences(terminalBuffer, "switch-back-output-once")).toBe(1);
+
+    const inputBaselineLength = daemon.decryptedInputs.length;
+    await focusTerminalKeyboardSink(page);
+    await page.keyboard.type("switch-back-echo-once");
+    await page.keyboard.press("Enter");
+
+    await expect
+      .poll(() => daemon.decryptedInputs.slice(inputBaselineLength).join(""))
+      .toContain("switch-back-echo-once\r");
+    // 中文注释：用户报告的“多一个回显”首先要排除同一按键被多条 onData/attach
+    // 链路重复送到 supervisor；mock daemon 记录的是已解密的真实 stdin 片段。
+    const sentInput = daemon.decryptedInputs.slice(inputBaselineLength).join("");
+    expect(countOccurrences(sentInput, "switch-back-echo-once")).toBe(1);
+  } finally {
+    await daemon.stop();
+  }
+});
+
 test("terminal wheel 向上滚动会朝更旧的历史移动", async ({ page }, testInfo: TestInfo) => {
   test.skip(testInfo.project.name === "mobile-chrome", "滚轮方向回归只需要桌面布局覆盖");
   const sessionId = "00000000-0000-0000-0000-000000000531";
@@ -1326,6 +1380,50 @@ function pairingInviteCode(daemon: MockDaemon): string {
 
 async function openSession(page: Page, name: string): Promise<void> {
   await page.getByRole("button", { name: `Open ${name}` }).click();
+}
+
+async function createShellSession(page: Page, existingNames: string[]): Promise<string> {
+  await page.getByRole("button", { name: "New session" }).click();
+  await expect(page.getByRole("textbox", { name: "Terminal input" })).toBeAttached({ timeout: 8_000 });
+  await expect
+    .poll(async () => sessionNames(page), { timeout: 8_000 })
+    .toHaveLength(existingNames.length + 1);
+  const names = await sessionNames(page);
+  const created = names.find((name) => !existingNames.includes(name));
+  if (!created) {
+    throw new Error(`failed to detect created session from ${names.join(", ")}`);
+  }
+  return created;
+}
+
+async function sessionNames(page: Page): Promise<string[]> {
+  const openButtons = await page
+    .getByRole("region", { name: "sessions" })
+    .getByRole("button", { name: /^Open / })
+    .all();
+  const names: string[] = [];
+  for (const button of openButtons) {
+    const label = await button.getAttribute("aria-label");
+    const name = label?.replace(/^Open /u, "").replace(/, new output$/u, "").trim();
+    if (name) {
+      names.push(name);
+    }
+  }
+  return names;
+}
+
+function countOccurrences(input: string, needle: string): number {
+  let count = 0;
+  let index = 0;
+  while (index < input.length) {
+    const found = input.indexOf(needle, index);
+    if (found === -1) {
+      return count;
+    }
+    count += 1;
+    index = found + needle.length;
+  }
+  return count;
 }
 
 async function expectTerminalLine(page: Page, text: string, timeout: number): Promise<void> {

@@ -442,6 +442,310 @@ describe("useTerminalAttach snapshot reveal intent", () => {
 });
 
 describe("useTerminalReceiveLoop", () => {
+  it("旧 supervisor 同时返回 retained_output 和 snapshot frame 时只渲染 frames.snapshot", async () => {
+    const prompt = "root@xieyilin-dev:~# ";
+    const client = new FakeDirectClient([
+      {
+        type: "attach_frame",
+        payload: buildAttachFramePayload(
+          SESSION_ID,
+          encodeSupervisorTerminalServerFrame({
+            type: "attach_sync",
+            session_id: SESSION_ID,
+            base_seq: 7,
+            snapshot: {
+              size: DEFAULT_SIZE,
+              process_id: 7,
+              retained_output_bytes: new TextEncoder().encode(prompt),
+            },
+            frames: [
+              {
+                kind: "snapshot",
+                session_id: SESSION_ID,
+                base_seq: 7,
+                size: DEFAULT_SIZE,
+                data_bytes: new TextEncoder().encode(prompt),
+              },
+              {
+                kind: "output",
+                session_id: SESSION_ID,
+                terminal_seq: 7,
+                data_bytes: new TextEncoder().encode(prompt),
+              },
+            ],
+          }),
+        ),
+      },
+    ]);
+    const output: TerminalOutputItem[] = [];
+    const controller = renderHook(() => useTerminalAttach()).result.current;
+    const attachClientRef = { current: asDirectClient(client) };
+    const sessionFilesFollowTerminalCwdRef = { current: false };
+    const startReceiveLoop = renderHook(() =>
+      useTerminalReceiveLoop(controller, {
+        attachClientRef,
+        sessionFilesFollowTerminalCwdRef,
+        applyConfirmedSessionSize: vi.fn(),
+        enqueueTerminalOutput: (item) => output.push(item),
+        isIgnoredClosingSessionError: vi.fn(() => false),
+        markNewOutputIfBackground: vi.fn(),
+        setSafeError: vi.fn(),
+        setSessionFiles: vi.fn(),
+        setSessionFilesError: vi.fn(),
+        setSessionFilesLoading: vi.fn(),
+        setSessionGit: vi.fn(),
+        setSessionGitError: vi.fn(),
+        setSessionGitLoading: vi.fn(),
+      }),
+    ).result.current;
+
+    act(() => {
+      controller.attachedSessionRef.current = SESSION_ID;
+      startReceiveLoop(asDirectClient(client));
+    });
+
+    await waitFor(() => {
+      expect(output).toHaveLength(1);
+    });
+    expect(output[0]).toEqual(expect.objectContaining({ kind: "snapshot", baseSeq: 7 }));
+    expect(new TextDecoder().decode(output[0]?.kind === "snapshot" ? output[0].bytes : new Uint8Array())).toBe(prompt);
+  });
+
+  it("attach_sync 里 snapshot 已覆盖的 pre-sync output 不会再被补回", async () => {
+    const prompt = "root@xieyilin-dev:~# ";
+    const client = new FakeDirectClient([
+      {
+        type: "attach_frame",
+        payload: buildAttachFramePayload(
+          SESSION_ID,
+          encodeSupervisorTerminalServerFrame({
+            type: "attach_sync",
+            session_id: SESSION_ID,
+            base_seq: 7,
+            snapshot: {
+              size: DEFAULT_SIZE,
+              process_id: 7,
+              retained_output_bytes: new TextEncoder().encode(prompt),
+            },
+            frames: [
+              {
+                kind: "snapshot",
+                session_id: SESSION_ID,
+                base_seq: 7,
+                size: DEFAULT_SIZE,
+                data_bytes: new TextEncoder().encode(prompt),
+              },
+              {
+                kind: "output",
+                session_id: SESSION_ID,
+                terminal_seq: 7,
+                data_bytes: new TextEncoder().encode(prompt),
+              },
+              {
+                kind: "output",
+                session_id: SESSION_ID,
+                terminal_seq: 8,
+                data_bytes: new TextEncoder().encode("next-line\n"),
+              },
+            ],
+          }),
+        ),
+      },
+    ]);
+    const output: TerminalOutputItem[] = [];
+    const controller = renderHook(() => useTerminalAttach()).result.current;
+    const attachClientRef = { current: asDirectClient(client) };
+    const sessionFilesFollowTerminalCwdRef = { current: false };
+    const startReceiveLoop = renderHook(() =>
+      useTerminalReceiveLoop(controller, {
+        attachClientRef,
+        sessionFilesFollowTerminalCwdRef,
+        applyConfirmedSessionSize: vi.fn(),
+        enqueueTerminalOutput: (item) => output.push(item),
+        isIgnoredClosingSessionError: vi.fn(() => false),
+        markNewOutputIfBackground: vi.fn(),
+        setSafeError: vi.fn(),
+        setSessionFiles: vi.fn(),
+        setSessionFilesError: vi.fn(),
+        setSessionFilesLoading: vi.fn(),
+        setSessionGit: vi.fn(),
+        setSessionGitError: vi.fn(),
+        setSessionGitLoading: vi.fn(),
+      }),
+    ).result.current;
+
+    act(() => {
+      controller.attachedSessionRef.current = SESSION_ID;
+      startReceiveLoop(asDirectClient(client));
+    });
+
+    await waitFor(() => {
+      expect(output).toHaveLength(2);
+    });
+    expect(output[0]).toEqual(expect.objectContaining({ kind: "snapshot", baseSeq: 7 }));
+    expect(output[1]).toEqual(expect.objectContaining({ kind: "output", terminalSeq: 8 }));
+    expect(output.some((item) => item.kind === "output" && item.terminalSeq === 7)).toBe(false);
+    expect(new TextDecoder().decode(output[0]?.kind === "snapshot" ? output[0].bytes : new Uint8Array())).toBe(prompt);
+    expect(new TextDecoder().decode(output[1]?.kind === "output" ? output[1].bytes : new Uint8Array())).toBe("next-line\n");
+  });
+
+  it("先到的 terminal_frame 被后续 snapshot 覆盖时不会从 pre-sync buffer 补回", async () => {
+    const prompt = "root@xieyilin-dev:~# ";
+    const client = new FakeDirectClient([
+      {
+        type: "attach_frame",
+        payload: buildAttachFramePayload(
+          SESSION_ID,
+          encodeSupervisorTerminalServerFrame({
+            type: "terminal_frame",
+            session_id: SESSION_ID,
+            frame: {
+              kind: "output",
+              session_id: SESSION_ID,
+              terminal_seq: 7,
+              data_bytes: new TextEncoder().encode("buffered-duplicate\n"),
+            },
+          }),
+        ),
+      },
+      {
+        type: "attach_frame",
+        payload: buildAttachFramePayload(
+          SESSION_ID,
+          encodeSupervisorTerminalServerFrame({
+            type: "attach_sync",
+            session_id: SESSION_ID,
+            base_seq: 7,
+            snapshot: {
+              size: DEFAULT_SIZE,
+              process_id: 7,
+              retained_output_bytes: new Uint8Array(),
+            },
+            frames: [
+              {
+                kind: "snapshot",
+                session_id: SESSION_ID,
+                base_seq: 7,
+                size: DEFAULT_SIZE,
+                data_bytes: new TextEncoder().encode(prompt),
+              },
+              {
+                kind: "output",
+                session_id: SESSION_ID,
+                terminal_seq: 8,
+                data_bytes: new TextEncoder().encode("fresh-tail\n"),
+              },
+            ],
+          }),
+        ),
+      },
+    ]);
+    const output: TerminalOutputItem[] = [];
+    const controller = renderHook(() => useTerminalAttach()).result.current;
+    const attachClientRef = { current: asDirectClient(client) };
+    const sessionFilesFollowTerminalCwdRef = { current: false };
+    const startReceiveLoop = renderHook(() =>
+      useTerminalReceiveLoop(controller, {
+        attachClientRef,
+        sessionFilesFollowTerminalCwdRef,
+        applyConfirmedSessionSize: vi.fn(),
+        enqueueTerminalOutput: (item) => output.push(item),
+        isIgnoredClosingSessionError: vi.fn(() => false),
+        markNewOutputIfBackground: vi.fn(),
+        setSafeError: vi.fn(),
+        setSessionFiles: vi.fn(),
+        setSessionFilesError: vi.fn(),
+        setSessionFilesLoading: vi.fn(),
+        setSessionGit: vi.fn(),
+        setSessionGitError: vi.fn(),
+        setSessionGitLoading: vi.fn(),
+      }),
+    ).result.current;
+
+    act(() => {
+      controller.attachedSessionRef.current = SESSION_ID;
+      startReceiveLoop(asDirectClient(client));
+    });
+
+    await waitFor(() => {
+      expect(output).toHaveLength(2);
+    });
+    expect(output[0]).toEqual(expect.objectContaining({ kind: "snapshot", baseSeq: 7 }));
+    expect(output[1]).toEqual(expect.objectContaining({ kind: "output", terminalSeq: 8 }));
+    const renderedText = output
+      .map((item) =>
+        item.kind === "snapshot" || item.kind === "output"
+          ? new TextDecoder().decode(item.bytes)
+          : "",
+      )
+      .join("");
+    expect(renderedText).toBe(`${prompt}fresh-tail\n`);
+    expect(renderedText).not.toContain("buffered-duplicate");
+  });
+
+  it("tail-only attach_sync 首帧等于 base_seq 时从首帧前一位播种", async () => {
+    const client = new FakeDirectClient([
+      {
+        type: "attach_frame",
+        payload: buildAttachFramePayload(
+          SESSION_ID,
+          encodeSupervisorTerminalServerFrame({
+            type: "attach_sync",
+            session_id: SESSION_ID,
+            base_seq: 2,
+            snapshot: {
+              size: DEFAULT_SIZE,
+              process_id: 7,
+              retained_output_bytes: new Uint8Array(),
+            },
+            frames: [
+              {
+                kind: "output",
+                session_id: SESSION_ID,
+                terminal_seq: 2,
+                data_bytes: new TextEncoder().encode("beta\n"),
+              },
+            ],
+          }),
+        ),
+      },
+    ]);
+    const output: TerminalOutputItem[] = [];
+    const controller = renderHook(() => useTerminalAttach()).result.current;
+    const attachClientRef = { current: asDirectClient(client) };
+    const sessionFilesFollowTerminalCwdRef = { current: false };
+    const startReceiveLoop = renderHook(() =>
+      useTerminalReceiveLoop(controller, {
+        attachClientRef,
+        sessionFilesFollowTerminalCwdRef,
+        applyConfirmedSessionSize: vi.fn(),
+        enqueueTerminalOutput: (item) => output.push(item),
+        isIgnoredClosingSessionError: vi.fn(() => false),
+        markNewOutputIfBackground: vi.fn(),
+        setSafeError: vi.fn(),
+        setSessionFiles: vi.fn(),
+        setSessionFilesError: vi.fn(),
+        setSessionFilesLoading: vi.fn(),
+        setSessionGit: vi.fn(),
+        setSessionGitError: vi.fn(),
+        setSessionGitLoading: vi.fn(),
+      }),
+    ).result.current;
+
+    act(() => {
+      controller.attachedSessionRef.current = SESSION_ID;
+      controller.lastRenderedTerminalSeqRef.current.set(SESSION_ID, 1);
+      startReceiveLoop(asDirectClient(client));
+    });
+
+    await waitFor(() => {
+      expect(output).toHaveLength(2);
+    });
+    expect(output[0]).toEqual({ kind: "sync", baseSeq: 1 });
+    expect(output[1]).toEqual(expect.objectContaining({ kind: "output", terminalSeq: 2 }));
+    expect(new TextDecoder().decode(output[1]?.kind === "output" ? output[1].bytes : new Uint8Array())).toBe("beta\n");
+  });
+
   it("大 attach_sync 处理中途变 stale 时不会把尾部 output 写进下一代终端队列", async () => {
     const client = new FakeDirectClient([
       {

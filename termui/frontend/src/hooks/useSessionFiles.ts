@@ -84,6 +84,7 @@ export function useSessionFiles() {
   const sessionFilesFollowRefreshInFlightRef = useRef(false);
   const sessionFilesFollowRequestSeqRef = useRef(0);
   const sessionFilesFollowPendingSessionRef = useRef<UUID | undefined>(undefined);
+  const sessionFilesLastManualPathRef = useRef<string | undefined>(undefined);
 
   useEffect(() => {
     sessionFilesFollowTerminalCwdRef.current = sessionFilesFollowTerminalCwd;
@@ -206,6 +207,12 @@ export function useSessionFiles() {
 
   const handleSessionFilesFollowTerminalCwdChange = useCallback((follow: boolean) => {
     sessionFilesFollowTerminalCwdRef.current = follow;
+    if (!follow) {
+      // 中文注释：关闭跟随后，已经排队但尚未发出的 follow 刷新必须同步作废；
+      // 否则旧 interval callback 可能在 toggle 后继续打一发 session.files。
+      sessionFilesFollowRequestSeqRef.current += 1;
+      sessionFilesFollowPendingSessionRef.current = undefined;
+    }
     setSessionFilesFollowTerminalCwd(follow);
   }, []);
 
@@ -267,6 +274,7 @@ export function useSessionFiles() {
     sessionFilesFollowRefreshInFlightRef,
     sessionFilesFollowRequestSeqRef,
     sessionFilesFollowPendingSessionRef,
+    sessionFilesLastManualPathRef,
     visibleProgressForSession,
     nextFileTransferId,
     clearSessionFileUploadProgressTimer,
@@ -306,6 +314,7 @@ export function useSessionFileLoaders(
     sessionFilesFollowRefreshInFlightRef,
     sessionFilesFollowRequestSeqRef,
     sessionFilesFollowPendingSessionRef,
+    sessionFilesLastManualPathRef,
     sessionFilesFollowTerminalCwd,
     sessionFilesLoading,
     setSessionFiles,
@@ -333,12 +342,25 @@ export function useSessionFileLoaders(
     ) => {
       const silent = Boolean(requestOptions.silent);
       const source = requestOptions.source ?? (path === undefined ? "initial" : "manual");
+      const requiresFollowToReadTerminalCwd = source === "follow" || (source === "initial" && path === undefined);
+      if (source === "manual" && path !== undefined) {
+        // 中文注释：手动目录是用户明确选择的位置。即使后续切到 Daemons 导致 panel
+        // 临时清空，也要保留这个路径供 Follow-off reattach/refresh 使用。
+        sessionFilesLastManualPathRef.current = path;
+      }
+      if (requiresFollowToReadTerminalCwd && !sessionFilesFollowTerminalCwdRef.current) {
+        // 中文注释：不带 path 的自动 initial/follow refresh 实际会读取 daemon 端 terminal cwd。
+        // 用户关闭 Follow 后，这类自动刷新不能再发出；调用方如果想保留当前目录，应显式传入 path。
+        return;
+      }
       if (silent && sessionFilesLoadingRef.current) {
         return;
       }
-      const followRequestSeq =
-        source === "follow" ? sessionFilesFollowRequestSeqRef.current + 1 : sessionFilesFollowRequestSeqRef.current;
-      if (source === "follow") {
+      let followRequestSeq = sessionFilesFollowRequestSeqRef.current;
+      if (requiresFollowToReadTerminalCwd) {
+        followRequestSeq += 1;
+        // 中文注释：所有读取 terminal cwd 的请求都属于 follow 语义，包括首次 initial。
+        // 必须领取自己的序号，否则非 silent initial 会被下面的可见请求序号推进误判成过期。
         sessionFilesFollowRequestSeqRef.current = followRequestSeq;
       } else if (!silent) {
         // 中文注释：用户显式浏览目录后，任何仍在路上的 follow 静默刷新都必须整体作废；
@@ -357,14 +379,20 @@ export function useSessionFileLoaders(
       }
       try {
         const client = await authenticatedSessionClient(sessionId);
+        if (requiresFollowToReadTerminalCwd && !sessionFilesFollowTerminalCwdRef.current) {
+          return;
+        }
         // 文件树当前位置是 daemon 端 session 共享状态；不传 path 时由 daemon 返回当前共享目录。
         const files = await client.listSessionFiles(sessionId, path);
         const isCurrentRequest = requestSeq === sessionFilesRequestSeqRef.current;
         const isCurrentFollowRequest =
-          source !== "follow" || followRequestSeq === sessionFilesFollowRequestSeqRef.current;
-        const allowsFollowResult = source !== "follow" || sessionFilesFollowTerminalCwdRef.current;
+          !requiresFollowToReadTerminalCwd || followRequestSeq === sessionFilesFollowRequestSeqRef.current;
+        const allowsFollowResult = !requiresFollowToReadTerminalCwd || sessionFilesFollowTerminalCwdRef.current;
         if (!isCurrentRequest || !isCurrentFollowRequest || !allowsFollowResult) {
           return;
+        }
+        if (source !== "follow") {
+          sessionFilesLastManualPathRef.current = files.path;
         }
         setSessionFiles(files);
         setSessionFilesError(undefined);
@@ -383,6 +411,7 @@ export function useSessionFileLoaders(
     [
       authenticatedSessionClient,
       sessionFilesFollowTerminalCwdRef,
+      sessionFilesLastManualPathRef,
       sessionFilesFollowRequestSeqRef,
       sessionFilesLoadingRef,
       sessionFilesRequestSeqRef,
@@ -450,6 +479,12 @@ export function useSessionFileLoaders(
       if (!targetSessionId) {
         return;
       }
+      if (!sessionFilesFollowTerminalCwdRef.current) {
+        // 中文注释：关闭 Follow 后，旧 interval callback 仍可能已经排进事件队列。
+        // refresh 入口必须再次读取 ref，而不能只依赖 effect cleanup 取消后续 timer。
+        sessionFilesFollowPendingSessionRef.current = undefined;
+        return;
+      }
       if (sessionFilesLoadingRef.current) {
         // 中文注释：用户正在发起可见文件树请求时，follow 轻事件不能直接放弃；
         // 否则 cwd 变化会被整次吞掉，只能等下一轮 1s poll 才追上。
@@ -466,6 +501,10 @@ export function useSessionFileLoaders(
       try {
         let nextSessionId: UUID | undefined = targetSessionId;
         while (nextSessionId) {
+          if (!sessionFilesFollowTerminalCwdRef.current) {
+            sessionFilesFollowPendingSessionRef.current = undefined;
+            return;
+          }
           sessionFilesFollowPendingSessionRef.current = undefined;
           // 中文注释：follow 轻事件和定时 poll 共用同一把单飞锁，避免并发重拉同一个 cwd。
           await loadSessionFiles(nextSessionId, undefined, {
@@ -482,6 +521,7 @@ export function useSessionFileLoaders(
     [
       attachedSessionRef,
       loadSessionFiles,
+      sessionFilesFollowTerminalCwdRef,
       sessionFilesLoadingRef,
       sessionFilesFollowPendingSessionRef,
       sessionFilesFollowRefreshInFlightRef,
@@ -528,6 +568,9 @@ export function useSessionFileLoaders(
     }
 
     const refreshFromTerminalCwd = () => {
+      if (!sessionFilesFollowTerminalCwdRef.current) {
+        return;
+      }
       void requestFollowSessionFilesRefresh(attachedSessionRef.current);
     };
 
@@ -539,6 +582,7 @@ export function useSessionFileLoaders(
     connectionReady,
     followPollIntervalMs,
     requestFollowSessionFilesRefresh,
+    sessionFilesFollowTerminalCwdRef,
     sessionFilesFollowTerminalCwd,
     sessionFilesLoading,
   ]);
@@ -553,6 +597,7 @@ export function useSessionFileLoaders(
 
 interface UseSessionFilesPanelActionsOptions {
   sessionFilesPath?: string;
+  sessionFilesLastManualPathRef: MutableRefObject<string | undefined>;
   sessionFilesFollowTerminalCwd: boolean;
   setSessionFilesPanelTab: (tab: "files" | "git") => void;
   handleSessionFilesFollowTerminalCwdChange: (follow: boolean) => void;
@@ -574,6 +619,7 @@ export function useSessionFilesPanelActions(
     setSessionFilesPanelTab,
     handleSessionFilesFollowTerminalCwdChange,
     sessionFilesPath,
+    sessionFilesLastManualPathRef,
     attachedSessionRef,
     loadSessionFiles,
     loadSessionGit,
@@ -588,10 +634,11 @@ export function useSessionFilesPanelActions(
       }
       // 中文注释：用户开始手动浏览目录时，立即退出自动跟随；
       // 否则下一次 follow 轮询会把当前目录打回终端 cwd。
+      sessionFilesLastManualPathRef.current = path;
       handleSessionFilesFollowTerminalCwdChange(false);
       void loadSessionFiles(sessionId, path, { source: "manual" });
     },
-    [attachedSessionRef, handleSessionFilesFollowTerminalCwdChange, loadSessionFiles],
+    [attachedSessionRef, handleSessionFilesFollowTerminalCwdChange, loadSessionFiles, sessionFilesLastManualPathRef],
   );
 
   const handleGoToFilePath = useCallback(
@@ -601,14 +648,17 @@ export function useSessionFilesPanelActions(
         return;
       }
       // 中文注释：手动输入路径也属于显式浏览动作，必须和 follow 模式脱钩。
+      const nextPath = resolveDirectoryPath(sessionFilesPath ?? sessionFilesLastManualPathRef.current ?? "", path);
+      sessionFilesLastManualPathRef.current = nextPath;
       handleSessionFilesFollowTerminalCwdChange(false);
-      void loadSessionFiles(sessionId, resolveDirectoryPath(sessionFilesPath ?? "", path), { source: "manual" });
+      void loadSessionFiles(sessionId, nextPath, { source: "manual" });
     },
     [
       attachedSessionRef,
       handleSessionFilesFollowTerminalCwdChange,
       loadSessionFiles,
       resolveDirectoryPath,
+      sessionFilesLastManualPathRef,
       sessionFilesPath,
     ],
   );
@@ -618,14 +668,21 @@ export function useSessionFilesPanelActions(
     if (!sessionId) {
       return;
     }
+    const refreshPath = sessionFilesPath ?? sessionFilesLastManualPathRef.current;
+    if (!sessionFilesFollowTerminalCwd && refreshPath === undefined) {
+      // 中文注释：Follow 关闭时 Refresh 只能刷新用户当前目录；如果当前目录已被
+      // UI 清空且没有保留路径，就不要退化成 no-path terminal cwd 请求。
+      return;
+    }
     void loadSessionFiles(
       sessionId,
-      sessionFilesFollowTerminalCwd ? undefined : sessionFilesPath,
+      sessionFilesFollowTerminalCwd ? undefined : refreshPath,
       { source: "manual" },
     );
   }, [
     attachedSessionRef,
     loadSessionFiles,
+    sessionFilesLastManualPathRef,
     sessionFilesPath,
     sessionFilesFollowTerminalCwd,
   ]);

@@ -212,14 +212,29 @@ export function useTerminalReceiveLoop(
       pending.push(item);
       bufferedPreSyncFrames.set(sessionId, pending);
     };
-    const flushBufferedPreSyncFrames = (sessionId: UUID, options: { seedSequence?: boolean } = {}) => {
+    const flushBufferedPreSyncFrames = (
+      sessionId: UUID,
+      options: { seedSequence?: boolean; coveredTerminalSeq?: number } = {},
+    ) => {
       const pending = bufferedPreSyncFrames.get(sessionId);
       if (!pending || pending.length === 0) {
         return;
       }
       bufferedPreSyncFrames.delete(sessionId);
+      const filteredPending = pending.filter((item) => {
+        if (options.coveredTerminalSeq === undefined) {
+          return true;
+        }
+        if (item.kind !== "output" && item.kind !== "resize" && item.kind !== "exit") {
+          return true;
+        }
+        return item.terminalSeq > options.coveredTerminalSeq;
+      });
+      if (filteredPending.length === 0) {
+        return;
+      }
       if (options.seedSequence) {
-        const firstLiveFrame = pending.find((item) => item.kind === "output" || item.kind === "resize" || item.kind === "exit");
+        const firstLiveFrame = filteredPending.find((item) => item.kind === "output" || item.kind === "resize" || item.kind === "exit");
         if (firstLiveFrame && "terminalSeq" in firstLiveFrame) {
           enqueueTerminalOutputIfCurrent({
             kind: "sync",
@@ -227,7 +242,7 @@ export function useTerminalReceiveLoop(
           });
         }
       }
-      for (const item of pending) {
+      for (const item of filteredPending) {
         enqueueTerminalOutputIfCurrent(item);
       }
     };
@@ -258,15 +273,51 @@ export function useTerminalReceiveLoop(
               const previousRenderedSeq = lastRenderedTerminalSeqRef.current.get(frame.session_id);
               const fullSnapshotToken = terminalSnapshotClientFullSnapshotTokensRef.current.get(client);
               const snapshotToken = fullSnapshotToken?.sessionId === frame.session_id ? fullSnapshotToken.token : undefined;
+              const frameSnapshotBaseSeq = frame.frames.reduce<number | undefined>((current, terminalFrame) => {
+                if (terminalFrame.kind !== "snapshot") {
+                  return current;
+                }
+                return Math.max(current ?? 0, terminalFrame.base_seq);
+              }, undefined);
+              const hasFrameSnapshot = frameSnapshotBaseSeq !== undefined;
               const hasSnapshotSeed =
                 snapshotToken !== undefined ||
                 frame.snapshot.retained_output_bytes.byteLength > 0 ||
-                frame.frames.some((terminalFrame) => terminalFrame.kind === "snapshot");
+                hasFrameSnapshot;
+              const tailFramesCoverBaseSeq = (() => {
+                if (previousRenderedSeq === undefined || frame.base_seq <= previousRenderedSeq) {
+                  return true;
+                }
+                let expectedSeq = previousRenderedSeq + 1;
+                for (const terminalFrame of frame.frames) {
+                  if (terminalFrame.kind === "snapshot") {
+                    return true;
+                  }
+                  const terminalSeq = terminalFrame.kind === "output" || terminalFrame.kind === "resize" || terminalFrame.kind === "exit"
+                    ? terminalFrame.terminal_seq
+                    : undefined;
+                  if (terminalSeq === undefined) {
+                    continue;
+                  }
+                  if (terminalSeq < expectedSeq) {
+                    continue;
+                  }
+                  if (terminalSeq !== expectedSeq) {
+                    return false;
+                  }
+                  expectedSeq += 1;
+                  if (expectedSeq > frame.base_seq) {
+                    return true;
+                  }
+                }
+                return expectedSeq > frame.base_seq;
+              })();
               if (
                 !hasSnapshotSeed &&
                 snapshotToken === undefined &&
                 previousRenderedSeq !== undefined &&
-                frame.base_seq > previousRenderedSeq
+                frame.base_seq > previousRenderedSeq &&
+                !tailFramesCoverBaseSeq
               ) {
                 const gapError = new ProtocolClientError(
                   "terminal_resync",
@@ -291,8 +342,10 @@ export function useTerminalReceiveLoop(
               const revealToken = terminalSnapshotRevealHistoryTokensRef.current.get(frame.session_id);
               const revealHistory = snapshotToken !== undefined && revealToken === snapshotToken;
               let snapshotTokensConsumed = false;
+              let snapshotCoveredSeq: number | undefined = frameSnapshotBaseSeq;
               const enqueueSnapshotFrame = (input: { bytes: Uint8Array; baseSeq: number; size: TerminalSize }) => {
                 throwIfLoopStale();
+                snapshotCoveredSeq = Math.max(snapshotCoveredSeq ?? 0, input.baseSeq);
                 if (!snapshotTokensConsumed) {
                   if (revealHistory) {
                     terminalSnapshotRevealHistoryTokensRef.current.delete(frame.session_id);
@@ -318,18 +371,30 @@ export function useTerminalReceiveLoop(
               // 中文注释：带 `last_terminal_seq` 的 attach_sync 可能只表示“在现有本地屏幕上续传 tail”，
               // 此时 retained_output 会被刻意置空。不能再把它当成一次空 snapshot reset，
               // 否则重连或复用同一 session 会直接把现有 xterm 画面清掉。
-              if (snapshotToken !== undefined || frame.snapshot.retained_output_bytes.byteLength > 0) {
+              // 中文注释：新 supervisor 会把首屏放进 frames.snapshot；旧 supervisor 可能同时
+              // 带 retained_output 和 frames.snapshot。只要存在权威 snapshot frame，就忽略
+              // legacy retained_output，避免同一屏 prompt 被写入两次。
+              if (!hasFrameSnapshot && (snapshotToken !== undefined || frame.snapshot.retained_output_bytes.byteLength > 0)) {
                 enqueueSnapshotFrame({
                   bytes: frame.snapshot.retained_output_bytes,
                   baseSeq: frame.base_seq,
                   size: frame.snapshot.size,
                 });
               }
+              let tailOnlySyncSeed: number | undefined;
               if (!hasSnapshotSeed) {
-                // 中文注释：空白 attach_sync 也是合法 bootstrap，必须先推进 base_seq。
+                for (const terminalFrame of frame.frames) {
+                  if (terminalFrame.kind === "output" || terminalFrame.kind === "resize" || terminalFrame.kind === "exit") {
+                    tailOnlySyncSeed = Math.max(0, terminalFrame.terminal_seq - 1);
+                    break;
+                  }
+                }
+                // 中文注释：tail-only attach_sync 的 base_seq 表示“同步响应覆盖到的最新序号”，
+                // 不是 writer 下一帧前的游标。若首条 tail 本身就是 base_seq，必须播种到
+                // 首帧前一位；只有空 attach_sync 才推进到 base_seq，让 gap 检测升级 full snapshot。
                 enqueueTerminalOutputIfCurrent({
                   kind: "sync",
-                  baseSeq: frame.base_seq,
+                  baseSeq: tailOnlySyncSeed ?? frame.base_seq,
                 });
               }
               for (const terminalFrame of frame.frames) {
@@ -342,6 +407,9 @@ export function useTerminalReceiveLoop(
                     size: terminalFrame.size,
                   });
                 } else if (terminalFrame.kind === "output") {
+                  if (snapshotCoveredSeq !== undefined && terminalFrame.terminal_seq <= snapshotCoveredSeq) {
+                    continue;
+                  }
                   const bytes = terminalFrame.data_bytes ?? sessionDataFromBase64(terminalFrame.data_base64 ?? "");
                   enqueueTerminalOutputIfCurrent({
                     kind: "output",
@@ -350,19 +418,28 @@ export function useTerminalReceiveLoop(
                   });
                   processedBytes += bytes.byteLength;
                 } else if (terminalFrame.kind === "resize") {
+                  if (snapshotCoveredSeq !== undefined && terminalFrame.terminal_seq <= snapshotCoveredSeq) {
+                    continue;
+                  }
                   enqueueTerminalOutputIfCurrent({
                     kind: "resize",
                     terminalSeq: terminalFrame.terminal_seq,
                     size: terminalFrame.size,
                   });
                 } else if (terminalFrame.kind === "exit") {
+                  if (snapshotCoveredSeq !== undefined && terminalFrame.terminal_seq <= snapshotCoveredSeq) {
+                    continue;
+                  }
                   enqueueTerminalOutputIfCurrent({
                     kind: "exit",
                     terminalSeq: terminalFrame.terminal_seq,
                   });
                 }
               }
-              flushBufferedPreSyncFrames(frame.session_id, { seedSequence: !hasSnapshotSeed });
+              flushBufferedPreSyncFrames(frame.session_id, {
+                seedSequence: !hasSnapshotSeed,
+                coveredTerminalSeq: snapshotCoveredSeq,
+              });
             } else if (frame.type === "terminal_frame") {
               if (frame.frame.kind === "snapshot") {
                 markSessionPrimed(frame.session_id);
@@ -558,6 +635,7 @@ interface UseTerminalReconnectSchedulerOptions {
     path?: string,
     options?: { silent?: boolean; source?: "initial" | "manual" | "follow" },
   ) => Promise<void>;
+  sessionFilesAutoRefreshPath?: () => string | undefined;
   loadSessionGit: (sessionId: UUID, options?: { silent?: boolean }) => Promise<void>;
   refreshDaemonClients: () => Promise<void>;
   claimAttachClient: (client: DirectClient) => void;
@@ -868,7 +946,7 @@ export function useTerminalReconnectScheduler(
             snapshotToken,
           });
           options.startReceiveLoop(attachedClient);
-          void options.loadSessionFiles(sessionId, undefined, { silent: true, source: "initial" });
+          void options.loadSessionFiles(sessionId, options.sessionFilesAutoRefreshPath?.(), { silent: true, source: "initial" });
           void options.loadSessionGit(sessionId, { silent: true });
           void options.refreshDaemonClients();
         } catch (retryError) {

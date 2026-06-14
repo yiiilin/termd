@@ -323,6 +323,7 @@ export default function App() {
     diffViewer,
     setDiffViewer,
     sessionFilesFollowTerminalCwdRef,
+    sessionFilesLastManualPathRef,
     activeUploadTransferIdRef,
     activeDownloadTransferIdRef,
     visibleProgressForSession,
@@ -1355,6 +1356,7 @@ export default function App() {
     handleSessionFilesPanelTabChange,
   } = useSessionFilesPanelActions({
     sessionFilesPath: sessionFiles?.path,
+    sessionFilesLastManualPathRef,
     sessionFilesFollowTerminalCwd,
     setSessionFilesPanelTab,
     handleSessionFilesFollowTerminalCwdChange,
@@ -1374,9 +1376,19 @@ export default function App() {
   });
   const refreshVisibleDirectory = useCallback(
     async (sessionId: UUID) => {
-      await loadSessionFiles(sessionId, sessionFiles?.path, { source: "manual" });
+      await loadSessionFiles(sessionId, sessionFiles?.path ?? sessionFilesLastManualPathRef.current, { source: "manual" });
     },
-    [loadSessionFiles, sessionFiles?.path],
+    [loadSessionFiles, sessionFiles?.path, sessionFilesLastManualPathRef],
+  );
+  const sessionFilesAutoRefreshPath = useCallback(
+    () => {
+      // 中文注释：自动刷新只有在 Follow 开启时才允许无 path 读取 terminal cwd。
+      // Follow 关闭时返回当前文件面板路径，让 attach/reconnect 保留用户浏览位置。
+      return sessionFilesFollowTerminalCwdRef.current
+        ? undefined
+        : (sessionFiles?.path ?? sessionFilesLastManualPathRef.current);
+    },
+    [sessionFiles?.path, sessionFilesFollowTerminalCwdRef, sessionFilesLastManualPathRef],
   );
   const {
     handleOpenFile,
@@ -1847,6 +1859,7 @@ export default function App() {
     selectSession,
     startReceiveLoop,
     loadSessionFiles,
+    sessionFilesAutoRefreshPath,
     loadSessionGit,
     refreshDaemonClients,
     claimAttachClient,
@@ -2040,7 +2053,13 @@ export default function App() {
           return;
         }
         startReceiveLoop(attachedClient);
-        void loadSessionFiles(sessionId, undefined, { source: "initial" });
+        // 中文注释：Follow 关闭时，重新 attach 不能用 no-path initial refresh 读取 terminal cwd；
+        // 应保留用户当前浏览的文件面板路径，避免切回 workspace 后目录被打回 shell cwd。
+        void loadSessionFiles(
+          sessionId,
+          sessionFilesAutoRefreshPath(),
+          { source: "initial" },
+        );
         void loadSessionGit(sessionId);
         void refreshDaemonClients();
       } catch (caught) {
@@ -2085,6 +2104,7 @@ export default function App() {
       loadSessionGit,
       refreshDaemonClients,
       selectSession,
+      sessionFilesAutoRefreshPath,
       setSafeError,
       isMobileLayout,
       startReceiveLoop,
@@ -2213,7 +2233,7 @@ export default function App() {
     sessionCreateRequestIdRef.current = createRequestId;
     setError(undefined);
     disconnectAttach();
-    clearTerminalOutput();
+    const resetVersion = clearTerminalOutput();
     setStatus("creating");
     let outputClient: DirectClient | undefined;
     let attachAbortController: AbortController | undefined;
@@ -2270,9 +2290,24 @@ export default function App() {
       // 聚焦客户端会把自己的尺寸同步为 shared PTY 的权威尺寸。
       setTerminalFocusRequest((request) => request + 1);
       setStatus("attached");
+      // 中文注释：terminal.create 和 terminal.attach 一样会切换 xterm 实例。
+      // create stream 的 snapshot/output 可能已经在 DirectClient 队列里；必须等
+      // TerminalPane 确认旧实例清理、新实例 ready 后再启动 receive loop，否则首屏
+      // 可能写进旧实例或跨后续切换被重复回放，表现成切回时多一个 shell 回显。
+      await waitForTerminalOutputResetApplied(resetVersion);
+      if (!isCurrentCreateRequest() || userDetachedRef.current || attachClientRef.current !== attachedClient) {
+        attachedClient.detachSession(created.session_id);
+        return;
+      }
       startReceiveLoop(attachedClient);
       terminalCreateOwnsAttachRef.current = false;
-      void loadSessionFiles(created.session_id, undefined, { source: "initial" });
+      // 中文注释：新建 session 没有既有文件面板路径，只有 Follow 开启时才读取 terminal cwd。
+      // 关闭 Follow 时跳过自动 no-path 刷新，直到用户手动选择目录。
+      void loadSessionFiles(
+        created.session_id,
+        sessionFilesAutoRefreshPath(),
+        { source: "initial" },
+      );
       void refreshDaemonClients();
     } catch (caught) {
       if (sessionCreateRequestIdRef.current === createRequestId) {
@@ -2303,8 +2338,10 @@ export default function App() {
     loadSessionFiles,
     refreshDaemonClients,
     selectSession,
+    sessionFilesAutoRefreshPath,
     setSafeError,
     startReceiveLoop,
+    waitForTerminalOutputResetApplied,
   ]);
 
   const handleRetryConnection = useCallback(async () => {

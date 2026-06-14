@@ -9250,6 +9250,23 @@ mod tests {
             .unwrap_or_else(|| TerminalScreen::new(size.rows, size.cols).snapshot_bytes())
     }
 
+    fn fake_attachment_snapshot_frame(
+        state: &FakePtyState,
+        session_id: &str,
+        base_seq: u64,
+    ) -> PtyTerminalFrame {
+        let size = state
+            .terminal_size_by_session
+            .get(session_id)
+            .copied()
+            .unwrap_or_else(|| PtySize::new(24, 80));
+        PtyTerminalFrame::Snapshot {
+            base_seq,
+            size,
+            data: fake_terminal_snapshot_bytes(state, session_id, size),
+        }
+    }
+
     fn fake_attachment_attach_sync_frame(
         state: &FakePtyState,
         session_id: &str,
@@ -9260,7 +9277,6 @@ mod tests {
             .get(session_id)
             .copied()
             .unwrap_or_else(|| PtySize::new(24, 80));
-        let snapshot = fake_terminal_snapshot_bytes(state, session_id, size);
         let (base_seq, frames) =
             fake_attachment_tail_from_state(state, session_id, bootstrap.last_terminal_seq);
         encode_supervisor_terminal_server_frame(&SupervisorTerminalServerFrame::AttachSync {
@@ -9269,11 +9285,9 @@ mod tests {
             snapshot: crate::pty::supervisor::SupervisorSnapshotPayload {
                 size,
                 process_id: Some(7),
-                retained_output: if bootstrap.last_terminal_seq.is_some() {
-                    Vec::new()
-                } else {
-                    snapshot
-                },
+                // 中文注释：fake backend 必须模拟生产 supervisor：terminal attach 的
+                // 屏幕内容只通过 frames 传输，不能同时塞进 legacy retained_output。
+                retained_output: Vec::new(),
             },
             frames,
         })
@@ -9290,20 +9304,41 @@ mod tests {
             .copied()
             .unwrap_or(0);
         let Some(last_terminal_seq) = last_terminal_seq else {
-            return (current_seq, Vec::new());
+            return (
+                current_seq,
+                vec![fake_attachment_snapshot_frame(
+                    state,
+                    session_id,
+                    current_seq,
+                )],
+            );
         };
         if last_terminal_seq >= current_seq {
             return (current_seq, Vec::new());
         }
         let Some(journal) = state.terminal_journal_by_session.get(session_id) else {
-            return (current_seq, Vec::new());
+            return (
+                current_seq,
+                vec![fake_attachment_snapshot_frame(
+                    state,
+                    session_id,
+                    current_seq,
+                )],
+            );
         };
         let journal_base_seq = journal
             .first()
             .and_then(PtyTerminalFrame::terminal_seq)
             .unwrap_or(current_seq.saturating_add(1));
         if last_terminal_seq.saturating_add(1) < journal_base_seq {
-            return (current_seq, Vec::new());
+            return (
+                current_seq,
+                vec![fake_attachment_snapshot_frame(
+                    state,
+                    session_id,
+                    current_seq,
+                )],
+            );
         }
         let frames = journal
             .iter()
@@ -9318,9 +9353,16 @@ mod tests {
             .iter()
             .any(|frame| matches!(frame, PtyTerminalFrame::Resize { .. }))
         {
-            return (current_seq, Vec::new());
+            return (
+                current_seq,
+                vec![fake_attachment_snapshot_frame(
+                    state,
+                    session_id,
+                    current_seq,
+                )],
+            );
         }
-        (last_terminal_seq, frames)
+        (current_seq, frames)
     }
 
     fn broadcast_fake_attachment_frame(
@@ -10383,7 +10425,17 @@ mod tests {
                 assert_eq!(*base_seq, 0);
                 assert_eq!(snapshot.size, PtySize::new(24, 80));
                 assert!(snapshot.retained_output.is_empty());
-                assert!(frames.is_empty());
+                assert!(
+                    matches!(
+                        frames.as_slice(),
+                        [PtyTerminalFrame::Snapshot {
+                            base_seq: 0,
+                            size,
+                            data
+                        }] if *size == PtySize::new(24, 80) && data.is_empty()
+                    ),
+                    "full terminal.create attach must seed through a single snapshot frame"
+                );
             }
             other => panic!("expected attach_sync, got {other:?}"),
         }
@@ -10753,7 +10805,7 @@ mod tests {
                 frames,
             } => {
                 assert_eq!(session_id, &created.session_id.0.to_string());
-                assert_eq!(*base_seq, 1);
+                assert_eq!(*base_seq, 2);
                 assert!(snapshot.retained_output.is_empty());
                 assert_eq!(frames.len(), 1);
                 match &frames[0] {
@@ -10842,7 +10894,19 @@ mod tests {
                 assert_eq!(snapshot_session_id, &session_id.0.to_string());
                 assert_eq!(*base_seq, 3);
                 assert_eq!(snapshot.size, PtySize::new(40, 120));
-                assert!(frames.is_empty());
+                assert!(snapshot.retained_output.is_empty());
+                assert!(
+                    matches!(
+                        frames.as_slice(),
+                        [PtyTerminalFrame::Snapshot {
+                            base_seq: 3,
+                            size,
+                            data,
+                        }] if *size == PtySize::new(40, 120)
+                            && data.windows(b"after-resize".len()).any(|window| window == b"after-resize")
+                    ),
+                    "resize-crossing tail must seed through a snapshot frame"
+                );
             }
             other => {
                 panic!("resize-crossing tail must rebase to attach_sync snapshot, got {other:?}")
@@ -13206,7 +13270,13 @@ mod tests {
                 assert_eq!(session_id, &created.session_id.0.to_string());
                 assert_eq!(*base_seq, 2);
                 assert!(snapshot.retained_output.is_empty());
-                assert!(frames.is_empty());
+                assert!(
+                    matches!(
+                        frames.as_slice(),
+                        [PtyTerminalFrame::Snapshot { base_seq: 2, .. }]
+                    ),
+                    "tail gap fallback must return a snapshot frame, not retained_output"
+                );
             }
             other => panic!("expected fallback attach_sync snapshot, got {other:?}"),
         }

@@ -539,6 +539,20 @@ impl SupervisorPtySession {
             );
         }
 
+        self.drop_pending_terminal_frames_through(sync.base_seq);
+        if !sync.frames.is_empty() {
+            // 中文注释：`read()` 是 termctl/测试仍在使用的 legacy byte-stream 兼容面。
+            // 现在 attach 首屏只通过 sequenced frames 传输，因此 daemon 侧也要把
+            // attach_sync 的 snapshot/tail 注入本地 terminal frame 队列；否则重连后
+            // legacy reader 会看不到首屏输出。但不要恢复 retained_output，Web watched
+            // attach 仍以 frames 为唯一权威，避免同一屏内容双播。
+            self.pending_terminal_frames
+                .lock()
+                .expect("pending terminal frames mutex poisoned")
+                .extend(sync.frames);
+            let next = self.output_signal_tx.borrow().wrapping_add(1);
+            let _ = self.output_signal_tx.send(next);
+        }
         if !snapshot.retained_output.is_empty() {
             self.pending_output
                 .lock()
@@ -547,7 +561,6 @@ impl SupervisorPtySession {
             let next = self.output_signal_tx.borrow().wrapping_add(1);
             let _ = self.output_signal_tx.send(next);
         }
-        self.drop_pending_terminal_frames_through(sync.base_seq);
     }
 
     fn signal_pending_output(&self) {
@@ -957,7 +970,13 @@ impl SupervisorPtySession {
         self.pending_terminal_frames
             .lock()
             .expect("pending terminal frames mutex poisoned")
-            .retain(|frame| frame.terminal_seq().is_none_or(|seq| seq > base_seq));
+            .retain(|frame| {
+                // 中文注释：pending snapshot 是一张旧状态图，没有 terminal_seq。
+                // 新 attach_sync 已经给出更权威的 snapshot/tail 后，旧 snapshot 必须丢弃；
+                // 否则 legacy read 会把旧首屏和新首屏连续读出，形成重复回显。
+                !matches!(frame, PtyTerminalFrame::Snapshot { .. })
+                    && frame.terminal_seq().is_some_and(|seq| seq > base_seq)
+            });
     }
 }
 
@@ -1376,14 +1395,10 @@ impl SupervisorState {
         let snapshot = SupervisorSnapshotPayload {
             size: self.size(),
             process_id,
-            // 中文注释：last_terminal_seq 存在时，attach_sync 只表达“从哪个 session seq
-            // 开始继续同步”。旧屏幕内容必须由 tail/snapshot frame 决定，不能再把 retained
-            // output 整包回灌给 client，否则重连时会把已经渲染过的内容再播一遍。
-            retained_output: if last_terminal_seq.is_some() {
-                Vec::new()
-            } else {
-                self.snapshot_output()
-            },
+            // 中文注释：terminal attach 的屏幕内容只能走 sequenced frame。
+            // retained_output 是 legacy snapshot 字段；如果这里和 frames.snapshot 同时
+            // 携带首屏，Web 端会把同一份 prompt 重放两次。
+            retained_output: Vec::new(),
         };
         let (base_seq, frames) = self.terminal_snapshot_or_tail_with_base(last_terminal_seq);
         SupervisorAttachSyncPayload {
@@ -1987,11 +2002,9 @@ async fn handle_supervisor_terminal_attach_connection(
         let snapshot = SupervisorSnapshotPayload {
             size: state.size(),
             process_id,
-            retained_output: if last_terminal_seq.is_some() {
-                Vec::new()
-            } else {
-                state.snapshot_output()
-            },
+            // 中文注释：独立 terminal socket 也必须保持“首屏只走 frames”。
+            // 否则 direct/relay 两条 attach 路径会出现不同的重放行为。
+            retained_output: Vec::new(),
         };
         let (base_seq, frames) = state.terminal_snapshot_or_tail_with_base(last_terminal_seq);
         (
@@ -3067,6 +3080,10 @@ mod tests {
         let (_controller_id, sync) = state.attach_sync(controller_tx, Some(42), None);
 
         assert_eq!(sync.base_seq, 1);
+        assert!(
+            sync.snapshot.retained_output.is_empty(),
+            "terminal attach 首屏只能由 sequenced snapshot frame 承载，不能再走 retained_output"
+        );
         assert!(matches!(
             sync.frames.as_slice(),
             [PtyTerminalFrame::Snapshot { base_seq: 1, .. }]
@@ -3097,6 +3114,10 @@ mod tests {
         let (_controller_id, sync) = state.attach_sync(controller_tx, Some(42), Some(1));
 
         assert_eq!(sync.base_seq, 2);
+        assert!(
+            sync.snapshot.retained_output.is_empty(),
+            "tail attach 也不能混入 legacy retained_output"
+        );
         assert_eq!(
             sync.frames,
             vec![PtyTerminalFrame::Output {
@@ -3803,6 +3824,11 @@ mod tests {
         let (writer, _peer) = StdUnixStream::pair().expect("test unix stream pair should open");
         let (output_signal_tx, output_signal_rx) = watch::channel(OUTPUT_SIGNAL_INIT);
         let pending_terminal_frames = Arc::new(StdMutex::new(VecDeque::from([
+            PtyTerminalFrame::Snapshot {
+                base_seq: 0,
+                size: PtySize::new(24, 80),
+                data: b"old-snapshot".to_vec(),
+            },
             PtyTerminalFrame::Output {
                 terminal_seq: 1,
                 data: b"old-1".to_vec(),
@@ -3833,9 +3859,63 @@ mod tests {
         assert_eq!(
             pending
                 .iter()
-                .map(PtyTerminalFrame::terminal_seq)
+                .map(|frame| match frame {
+                    PtyTerminalFrame::Output { terminal_seq, .. } => Some(*terminal_seq),
+                    PtyTerminalFrame::Resize { terminal_seq, .. } => Some(*terminal_seq),
+                    PtyTerminalFrame::Exit { terminal_seq, .. } => Some(*terminal_seq),
+                    PtyTerminalFrame::Snapshot { .. } => None,
+                })
                 .collect::<Vec<_>>(),
             vec![Some(3)]
+        );
+    }
+
+    #[test]
+    fn supervisor_client_seed_attach_sync_drops_old_pending_snapshot_before_legacy_read() {
+        let (writer, _peer) = StdUnixStream::pair().expect("test unix stream pair should open");
+        let (output_signal_tx, output_signal_rx) = watch::channel(OUTPUT_SIGNAL_INIT);
+        let pending_terminal_frames = Arc::new(StdMutex::new(VecDeque::from([
+            PtyTerminalFrame::Snapshot {
+                base_seq: 0,
+                size: PtySize::new(24, 80),
+                data: b"old-screen".to_vec(),
+            },
+            PtyTerminalFrame::Output {
+                terminal_seq: 1,
+                data: b"old-tail".to_vec(),
+            },
+        ])));
+        let mut session = test_supervisor_client_with_queues(
+            writer,
+            Arc::new(StdMutex::new(VecDeque::new())),
+            Arc::clone(&pending_terminal_frames),
+            output_signal_tx,
+            output_signal_rx,
+        );
+
+        session.seed_attach_sync(SupervisorAttachSyncPayload {
+            controller_id: 7,
+            controller_connection_id: 8,
+            base_seq: 2,
+            snapshot: SupervisorSnapshotPayload {
+                size: PtySize::new(24, 80),
+                process_id: Some(42),
+                retained_output: Vec::new(),
+            },
+            frames: vec![PtyTerminalFrame::Snapshot {
+                base_seq: 2,
+                size: PtySize::new(24, 80),
+                data: b"new-screen".to_vec(),
+            }],
+        });
+
+        let mut buffer = vec![0_u8; 64];
+        let read = session.read(&mut buffer).expect("legacy read should not fail");
+
+        assert_eq!(&buffer[..read], b"new-screen");
+        assert!(
+            session.read(&mut buffer).expect("legacy read should drain") == 0,
+            "old pending snapshot/tail must not be replayed after attach_sync reseed"
         );
     }
 
