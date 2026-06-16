@@ -389,7 +389,7 @@ test("relay Web 在双客户端抖动低带宽链路下仍能恢复", async ({ p
     for (let index = 0; index < 2; index += 1) {
       const name = await createShellSession(page, createdNames);
       createdNames.push(name);
-      await runTerminalCommand(
+      await runTerminalPastedCommand(
         page,
         `for i in $(seq 1 2400); do printf '${marker(name)}-jitter-bulk-%04d\\n' "$i"; done; printf '${marker(name)}-jitter-ready\\n'`,
       );
@@ -584,7 +584,7 @@ test("relay Web 在 daemon relay 短暂冻结恢复后仍能输入", async ({ pa
     for (let index = 0; index < 2; index += 1) {
       const name = await createShellSession(page, createdNames);
       createdNames.push(name);
-      await runTerminalCommand(
+      await runTerminalPastedCommand(
         page,
         `for i in $(seq 1 1600); do printf '${marker(name)}-freeze-bulk-%04d\\n' "$i"; sleep 0.001; done; printf '${marker(name)}-freeze-ready\\n'`,
       );
@@ -1606,10 +1606,28 @@ async function openSession(page: Page, name: string): Promise<void> {
 
 async function runTerminalCommand(page: Page, command: string): Promise<void> {
   await focusTerminalForKeyboard(page);
-  // 中文注释：xterm 终端依赖真实 keydown/input 路径；insertText 只改活动
-  // contenteditable/textarea，聚焦到 renderer host 时不会稳定进入 PTY。
+  // 中文注释：默认继续走真实键盘路径，避免把所有 E2E 都改成非交互输入模型。
+  // 只有大段 shell 循环命令才需要专门的稳定注入 helper。
   await page.keyboard.type(command, { delay: 1 });
   await page.keyboard.press("Enter");
+}
+
+async function runTerminalPastedCommand(page: Page, command: string): Promise<void> {
+  await focusTerminalForKeyboard(page);
+  const terminalInput = page.locator('.terminal-host textarea[aria-label="Terminal input"]').first();
+  await terminalInput.evaluate((input, text) => {
+    // 中文注释：GitHub runner 上真实 relay 压测时，`keyboard.type()` 输入超长 shell 循环
+    // 命令会偶发漏字，bash 会掉进 `>` 续行提示。这里只给超长批量命令走 paste/beforeinput
+    // 注入，保留普通交互命令继续覆盖真实键盘链路。
+    input.dispatchEvent(
+      new InputEvent("beforeinput", {
+        bubbles: true,
+        cancelable: true,
+        inputType: "insertFromPaste",
+        data: `${text}\r`,
+      }),
+    );
+  }, command);
 }
 
 async function waitForStableTerminalSurface(page: Page): Promise<void> {
