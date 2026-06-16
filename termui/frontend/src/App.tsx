@@ -204,6 +204,17 @@ function isTerminalSidecarTimeout(caught: unknown): boolean {
   return toSafeError(caught).code === "response_timeout";
 }
 
+function isTerminalSidecarTransientError(caught: unknown): boolean {
+  const safeError = toSafeError(caught);
+  if (safeError.code === "response_timeout") {
+    return true;
+  }
+  // 中文注释：真实浏览器在 relay/HTTP 控制面瞬断时，fetch 往往只给 TypeError，
+  // `toSafeError()` 会把它归成 client_error。对于 resize/cursor 这类终端辅助 sidecar，
+  // 这种瞬时 transport 失败只能丢掉本次辅助 ack，不能升级成全局 Connection error。
+  return safeError.code === "client_error" && safeError.message === "Failed to fetch";
+}
+
 function isDocumentHidden(): boolean {
   return typeof document !== "undefined" && document.visibilityState === "hidden";
 }
@@ -1577,11 +1588,17 @@ export default function App() {
       }
       if (
         activeSurfaceRef.current === "workspace" &&
-        (attachedSessionRef.current || attachClientRef.current)
+        (
+          attachedSessionRef.current ||
+          attachClientRef.current ||
+          statusRef.current === "ready" ||
+          selectedSessionIdRef.current !== undefined ||
+          sessionsRef.current.length === 0
+        )
       ) {
-        // 中文注释：workspace 中已经有当前 session 的 WebSocket 时，session/list 只是旁路 segment。
-        // relay 恢复或后台唤醒导致的短超时不能卸载 xterm，也不能升级成全局连接错误；
-        // 真实终端断线由 attach receive loop 按长超时重连链路处理。
+        // 中文注释：一旦用户已经稳定停在 workspace，后续 session.list 就退化成旁路刷新，
+        // 即使当前是空工作台或只剩移动端的 session 面板刷新也是如此。relay/HTTP 控制面
+        // 的瞬时失败只能让这一次刷新作废，不能把页面切回 admin 或升级成全局断线。
         setStatus(resolveWorkspaceConnectionStatus());
         return;
       }
@@ -2785,10 +2802,10 @@ export default function App() {
       // 这里仅向 daemon 请求 resize，不乐观改本地 session size，也不等待这个调用读取回执。
       // 中文注释：resize 和输入都在 terminal segment；普通 RPC 是当前 session 连接里的非终端 segment。
       void client.requestSessionResize(sessionId, size).catch((caught) => {
-        if (isTerminalSidecarTimeout(caught)) {
-          // 中文注释：resize ack 和 stdout 共用当前 terminal WebSocket。持续输出时 ack
-          // 可能排在大量 terminal_frame 后面超时；这不表示终端流断开，不能升级成全局错误
-          // 或 attach reconnect。这里要在 retryable transport 分支之前先拦下来。
+        if (isTerminalSidecarTransientError(caught)) {
+          // 中文注释：resize ack 既可能被持续 stdout 挤到超时，也可能在 relay/HTTP
+          // 控制面瞬断时直接收到 fetch TypeError。这两类都只代表本次辅助 ack 失败，
+          // 不能升级成全局错误或 attach reconnect。这里要在 retryable transport 分支前拦下。
           if (pendingResizeKeyRef.current === nextResizeKey) {
             pendingResizeKeyRef.current = undefined;
           }
@@ -2827,9 +2844,9 @@ export default function App() {
       const focusChanged = lastCursorFocusedRef.current !== presence.focused;
       lastCursorFocusedRef.current = presence.focused;
       void client.sendSessionCursor(sessionId, presence).catch((caught) => {
-        if (isTerminalSidecarTimeout(caught)) {
-          // 中文注释：cursor 上报只是协作元数据；高输出场景下响应超时不能卸载 xterm，
-          // 也不能触发 attach reconnect。这里同样优先于 retryable transport 处理。
+        if (isTerminalSidecarTransientError(caught)) {
+          // 中文注释：cursor 上报只是协作元数据；高输出场景里的超时和 relay/HTTP
+          // 控制面瞬断导致的 fetch 失败都不能卸载 xterm，也不能触发 attach reconnect。
           recordTermdDiagnostic("app_terminal_sidecar_timeout_ignored", {
             kind: "cursor",
             sessionId,

@@ -3630,6 +3630,44 @@ describe("termui web 工作台", () => {
     expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
   }, 18_000);
 
+  it("移动端空 workspace 手动刷新时 session.list 瞬时失败不打回 admin", async () => {
+    setViewportWidth(390);
+    const user = userEvent.setup();
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [],
+    });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession("No session");
+    expect(screen.queryByLabelText("daemon admin")).toBeNull();
+    expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
+
+    await user.click(screen.getByRole("button", { name: "Open mobile workspace menu" }));
+    const menu = await screen.findByRole("navigation", { name: "mobile workspace menu" });
+    await user.click(within(menu).getByRole("button", { name: "Daemons" }));
+    const admin = await screen.findByLabelText("daemon admin");
+    await user.click(within(admin).getByRole("button", { name: "Open workspace" }));
+    await waitForWorkspaceSession("No session");
+
+    await user.click(screen.getByRole("button", { name: "Open mobile workspace menu" }));
+    const sessionsMenu = await screen.findByRole("navigation", { name: "mobile workspace menu" });
+    await user.click(within(sessionsMenu).getByRole("button", { name: "Sessions" }));
+    const sessionsPanel = await screen.findByLabelText("sessions panel");
+    daemon.closeNextSessionListRequests(1);
+    await user.click(within(sessionsPanel).getByRole("button", { name: "Refresh sessions" }));
+    await new Promise((resolve) => window.setTimeout(resolve, 120));
+
+    // 中文注释：移动端空工作台里的手动 Refresh 仍属于 workspace 内的旁路 session.list。
+    // relay/HTTP 控制面瞬断只能让这一次刷新失败，不能把页面切回 admin 或弹出全局断线。
+    expect(screen.queryByLabelText("daemon admin")).toBeNull();
+    expect(screen.getByRole("button", { name: "Open mobile workspace menu" })).toBeInTheDocument();
+    expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
+    expect(screen.getByText("No session")).toBeInTheDocument();
+  });
+
   it("relay 恢复慢握手时重新 attach 使用长超时并静默恢复", async () => {
     const user = userEvent.setup();
     render(<App />);
@@ -7453,6 +7491,99 @@ describe("termui web 工作台", () => {
     expect(screen.getByText(/cursor-timeout-ready/)).toBeInTheDocument();
     expect(document.querySelector('textarea[aria-label="Terminal input"]')).not.toBeNull();
   }, 15_000);
+
+  it("session.resize 的 HTTP control 瞬时失败不升级成全局断线", async () => {
+    const user = userEvent.setup();
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      attachOutput: "resize-http-closed-ready\n",
+      sessions: [
+        {
+          session_id: "00000000-0000-0000-0000-00000000040a",
+          state: "running",
+          size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+        },
+      ],
+    });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await screen.findByText(/resize-http-closed-ready/);
+    await clickSessionCard(user);
+
+    daemon.closeNextSessionResizeRequests(1);
+    const terminalInput = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
+    expect(terminalInput).not.toBeNull();
+    terminalInput!.focus();
+    (globalThis as { __TERMD_TEST_FIT_DIMENSIONS__?: { rows: number; cols: number } }).__TERMD_TEST_FIT_DIMENSIONS__ = {
+      rows: 32,
+      cols: 102,
+    };
+    fireEvent(window, new Event("resize"));
+
+    await waitFor(() =>
+      expect(daemon.sessionResizes).toContainEqual({
+        session_id: "00000000-0000-0000-0000-00000000040a",
+        size: { rows: 32, cols: 102, pixel_width: expect.any(Number), pixel_height: expect.any(Number) },
+      }),
+    );
+    await new Promise((resolve) => window.setTimeout(resolve, 80));
+
+    // 中文注释：relay/浏览器把 session.resize 这笔 HTTP control fetch 直接打断时，
+    // 只能丢掉本次辅助 ack，不能把整个 workspace 升级成 Connection error。
+    expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
+    expect(document.body.textContent).not.toContain("mock session resize closed");
+    terminalInput!.value = "after-resize-http-close";
+    fireEvent.input(terminalInput!);
+    await waitFor(() => expect(daemon.sessionDataMessages).toContain("after-resize-http-close"));
+  });
+
+  it("session.cursor 的 HTTP control 瞬时失败不升级成全局断线", async () => {
+    const user = userEvent.setup();
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      attachOutput: "cursor-http-closed-ready\n",
+      sessions: [
+        {
+          session_id: "00000000-0000-0000-0000-00000000040b",
+          state: "running",
+          size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+        },
+      ],
+    });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await screen.findByText(/cursor-http-closed-ready/);
+    await clickSessionCard(user);
+
+    daemon.closeNextSessionCursorRequests(1);
+    const terminalInput = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
+    expect(terminalInput).not.toBeNull();
+    terminalInput!.focus();
+
+    await waitFor(() =>
+      expect(daemon.sessionCursorUpdates).toContainEqual({
+        session_id: "00000000-0000-0000-0000-00000000040b",
+        row: expect.any(Number),
+        col: expect.any(Number),
+        focused: true,
+      }),
+    );
+    await new Promise((resolve) => window.setTimeout(resolve, 80));
+
+    // 中文注释：cursor presence 是共享协作元数据；HTTP control fetch 被瞬时断开后，
+    // 当前 terminal stream 和后续输入必须继续可用。
+    expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
+    expect(document.body.textContent).not.toContain("mock session cursor closed");
+    terminalInput!.value = "after-cursor-http-close";
+    fireEvent.input(terminalInput!);
+    await waitFor(() => expect(daemon.sessionDataMessages).toContain("after-cursor-http-close"));
+  });
 
   it("浏览器窗口 resize 引发的短暂 focusout/focusin 不会上报聚焦抖动", async () => {
     const user = userEvent.setup();

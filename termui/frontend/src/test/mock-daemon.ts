@@ -262,6 +262,9 @@ export class MockDaemon {
   private failWatchedTerminalAttachRequests = 0;
   private closeDaemonStatusRequests = 0;
   private closeDaemonClientsRequests = 0;
+  private closeSessionListRequests = 0;
+  private closeSessionResizeRequests = 0;
+  private closeSessionCursorRequests = 0;
   private nextRouteReadyGate: Promise<void> | undefined;
   private readonly queuedSessionListResponses: QueuedSessionListResponse[] = [];
   private readonly queuedSessionFilesResponses: QueuedSessionFilesResponse[] = [];
@@ -353,6 +356,23 @@ export class MockDaemon {
   closeNextDaemonClientsRequests(count = 1): void {
     // daemon.clients 是后台元数据请求；关闭它不能被前端升级成终端永久断线。
     this.closeDaemonClientsRequests = Math.max(0, Math.floor(count));
+  }
+
+  closeNextSessionListRequests(count = 1): void {
+    // 中文注释：真实 relay/浏览器里 workspace 的手动/后台 session.list 也可能瞬时断开。
+    // 这里用 transport close 覆盖“已有 workspace 时不能被升级成全局断线”的回归。
+    this.closeSessionListRequests = Math.max(0, Math.floor(count));
+  }
+
+  closeNextSessionResizeRequests(count = 1): void {
+    // 中文注释：真实 relay/浏览器里 session.resize 的 HTTP control fetch 可能瞬断失败。
+    // 这里显式只打断这一笔辅助 RPC，覆盖“不能升级成全局 Connection error”的回归。
+    this.closeSessionResizeRequests = Math.max(0, Math.floor(count));
+  }
+
+  closeNextSessionCursorRequests(count = 1): void {
+    // 中文注释：cursor 上报同样是 terminal sidecar HTTP control；网络瞬断只影响这一笔元数据。
+    this.closeSessionCursorRequests = Math.max(0, Math.floor(count));
   }
 
   expireSessionToken(token: string, expiresAtMs = 0): void {
@@ -1043,6 +1063,11 @@ export class MockDaemon {
   private async handleDirectPacketRequest(connection: MockConnection, packet: ProtocolPacket): Promise<boolean> {
     switch (packet.method) {
       case "session.list": {
+        if (this.closeSessionListRequests > 0) {
+          this.closeSessionListRequests -= 1;
+          this.throwIfHttpAborted(connection);
+          throw new TypeError("Failed to fetch");
+        }
         const queued = this.queuedSessionListResponses.shift();
         if (queued?.delayMs) {
           await new Promise((resolve) => setTimeout(resolve, queued.delayMs));
@@ -1610,6 +1635,14 @@ export class MockDaemon {
       }
       case "session_cursor": {
         this.sessionCursorUpdates.push(inner.payload as SessionCursorPayload);
+        if (this.closeSessionCursorRequests > 0) {
+          this.closeSessionCursorRequests -= 1;
+          if (connection.httpPackets) {
+            throw new TypeError("Failed to fetch");
+          }
+          connection.socket.close();
+          return;
+        }
         if (this.options.cursorAckDelayMs) {
           // 中文注释：cursor 走普通 request ack；测试用延迟模拟它被持续 stdout 挤到超时。
           await new Promise((resolve) => setTimeout(resolve, this.options.cursorAckDelayMs));
@@ -1622,6 +1655,14 @@ export class MockDaemon {
           return;
         }
         this.sessionResizes.push(payload);
+        if (this.closeSessionResizeRequests > 0) {
+          this.closeSessionResizeRequests -= 1;
+          if (connection.httpPackets) {
+            throw new TypeError("Failed to fetch");
+          }
+          connection.socket.close();
+          return;
+        }
         if (this.options.resizeAckDelayMs) {
           await new Promise((resolve) => setTimeout(resolve, this.options.resizeAckDelayMs));
         }

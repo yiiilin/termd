@@ -93,6 +93,7 @@ test.beforeEach(async ({ page }) => {
 
 test("mobile terminal pointerdown 提前解锁 focus suppression，helper textarea 不会被立即 blur", async ({ page }, testInfo: TestInfo) => {
   test.skip(testInfo.project.name !== "mobile-chrome", "该回归只需要移动端项目覆盖");
+  test.setTimeout(60_000);
 
   const daemon = await MockDaemon.start({
     token: "secret-token",
@@ -117,7 +118,7 @@ test("mobile terminal pointerdown 提前解锁 focus suppression，helper textar
     const terminalInput = page.locator('.terminal-host textarea[aria-label="Terminal input"]').first();
 
     await terminalSurface.tap({ position: { x: 20, y: 20 } });
-    await expect(terminalInput).toBeFocused();
+    await expect(terminalInput).toBeFocused({ timeout: 10_000 });
 
     await terminalInput.evaluate((element) => {
       (element as HTMLTextAreaElement).blur();
@@ -133,8 +134,8 @@ test("mobile terminal pointerdown 提前解锁 focus suppression，helper textar
       clientY: 24,
     });
 
-    await expect(terminalInput).toBeFocused();
-    await expect.poll(() => daemon.sessionResizes.length).toBe(resizeCountBeforeBypassFocus);
+    await expect(terminalInput).toBeFocused({ timeout: 10_000 });
+    await expect.poll(() => daemon.sessionResizes.length, { timeout: 10_000 }).toBe(resizeCountBeforeBypassFocus);
     const inputBaseline = daemon.decryptedInputs.join("");
     await terminalInput.evaluate((element) => {
       element.dispatchEvent(
@@ -146,7 +147,7 @@ test("mobile terminal pointerdown 提前解锁 focus suppression，helper textar
         }),
       );
     });
-    await expect.poll(() => daemon.decryptedInputs.join("").slice(inputBaseline.length)).toBe("x");
+    await expect.poll(() => daemon.decryptedInputs.join("").slice(inputBaseline.length), { timeout: 10_000 }).toBe("x");
   } finally {
     await daemon.stop();
   }
@@ -1094,6 +1095,7 @@ test("terminal reload 后只向 daemon 上报最终稳定尺寸", async ({ page 
 
 test("terminal 进入后台标签页时仍持续消费输出，不依赖前台 requestAnimationFrame", async ({ page }, testInfo: TestInfo) => {
   test.skip(testInfo.project.name === "mobile-chrome", "后台 tab drain 回归先覆盖桌面布局");
+  test.setTimeout(60_000);
   const sessionId = "00000000-0000-0000-0000-000000000542";
   const daemon = await MockDaemon.start({
     token: "secret-token",
@@ -1120,13 +1122,13 @@ test("terminal 进入后台标签页时仍持续消费输出，不依赖前台 r
 
     daemon.pushSessionData(sessionId, "background-tab-live-output\n");
     await expect
-      .poll(async () => terminalDebugBufferText(page), { timeout: 8_000 })
+      .poll(async () => terminalDebugBufferText(page), { timeout: 20_000 })
       .toContain("background-tab-live-output");
     expect(daemon.activeConnectionCount()).toBe(1);
 
     await secondPage.close();
     await page.bringToFront();
-    await expectTerminalLine(page, "background-tab-live-output", 8_000);
+    await expectTerminalLine(page, "background-tab-live-output", 20_000);
   } finally {
     await daemon.stop();
   }

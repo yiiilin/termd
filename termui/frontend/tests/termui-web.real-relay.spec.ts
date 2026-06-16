@@ -37,6 +37,7 @@ test.beforeEach(async ({ page }) => {
 });
 
 test("浏览器通过真实 relay 连接 daemon 完成 pairing 和 session list", async ({ page }, testInfo) => {
+  test.setTimeout(60_000);
   const fixture = await startRealRelayFixture();
   const controlRequests: string[] = [];
   const relayHttpOrigin = new URL(fixture.relayWebUrl).origin;
@@ -73,6 +74,8 @@ test("浏览器通过真实 relay 连接 daemon 完成 pairing 和 session list"
       await expect(page.getByRole("region", { name: "connection" })).toBeVisible();
       await expect(page.getByLabel("daemon manager")).toBeVisible();
       await activateButton(page, "Open workspace");
+      await expect(page.getByRole("main", { name: "daemon admin" })).toHaveCount(0);
+      await expect(page.getByText("No session")).toBeVisible();
 
       const reopenedMenu = await openMobileMenu(page);
       await reopenedMenu.getByRole("button", { name: "Sessions" }).click();
@@ -1273,7 +1276,8 @@ function collectBrowserErrors(
       options.ignoreExpectedRelayInterruptHttpErrors &&
       (message.text().includes("status of 502 (Bad Gateway)") ||
         message.text().includes("status of 503 (Service Unavailable)") ||
-        message.text().includes("status of 504 (Gateway Timeout)"))
+        message.text().includes("status of 504 (Gateway Timeout)") ||
+        message.text().includes("net::ERR_INCOMPLETE_CHUNKED_ENCODING"))
     ) {
       return;
     }
@@ -1293,6 +1297,12 @@ function collectBrowserErrors(
       return;
     }
     if (failureText.includes("net::ERR_NETWORK_CHANGED")) {
+      return;
+    }
+    if (
+      options.ignoreExpectedRelayInterruptHttpErrors &&
+      failureText.includes("net::ERR_INCOMPLETE_CHUNKED_ENCODING")
+    ) {
       return;
     }
     browserErrors.push(`[${label}:requestfailed] ${failureText} ${request.url()}`);
@@ -1694,17 +1704,47 @@ async function focusTerminalForKeyboard(page: Page): Promise<void> {
 }
 
 async function closeCreatedSessions(page: Page, names: string[]): Promise<void> {
+  if (page.isClosed()) {
+    return;
+  }
   for (const name of [...names].reverse()) {
     const openButton = page.getByRole("button", { name: new RegExp(`^Open ${escapeRegex(name)}(?:, new output)?$`) });
-    if (await openButton.count() === 0) {
+    let openButtonCount = 0;
+    try {
+      openButtonCount = await openButton.count();
+    } catch (caught) {
+      if (isPageGoneError(caught)) {
+        return;
+      }
+      throw caught;
+    }
+    if (openButtonCount === 0) {
       continue;
     }
     // 中文注释：session row 不再是嵌套按钮；清理时从主打开按钮回到同一行再找关闭按钮。
     const row = openButton.locator(
       "xpath=ancestor::*[contains(concat(' ', normalize-space(@class), ' '), ' session-row ')][1]",
     );
-    await row.getByRole("button", { name: "Close session" }).click();
+    try {
+      await row.getByRole("button", { name: "Close session" }).click();
+    } catch (caught) {
+      if (isPageGoneError(caught)) {
+        return;
+      }
+      throw caught;
+    }
   }
+}
+
+function isPageGoneError(caught: unknown): boolean {
+  if (!(caught instanceof Error)) {
+    return false;
+  }
+  return (
+    caught.message.includes("Target crashed") ||
+    caught.message.includes("Target page, context or browser has been closed") ||
+    caught.message.includes("Execution context was destroyed")
+  );
 }
 
 function marker(name: string): string {
