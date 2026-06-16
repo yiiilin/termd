@@ -206,6 +206,28 @@ async function requestBodyBytes(body: BodyInit | null | undefined): Promise<Uint
   return encodeUtf8(String(body));
 }
 
+function installHttpControlFailureOnceMock(
+  pathSuffix: string,
+  responseInit: { status: number; body?: string } = { status: 502, body: "bad gateway" },
+): () => void {
+  const originalFetch = globalThis.fetch;
+  let pending = true;
+  (globalThis as unknown as { fetch: typeof fetch }).fetch = (async (input, init) => {
+    const requestUrl = new URL(input instanceof Request ? input.url : String(input));
+    if (pending && requestUrl.pathname.endsWith(pathSuffix)) {
+      pending = false;
+      return new Response(responseInit.body ?? "bad gateway", {
+        status: responseInit.status,
+        headers: { "content-type": "text/plain" },
+      });
+    }
+    return originalFetch(input, init);
+  }) as typeof fetch;
+  return () => {
+    (globalThis as unknown as { fetch: typeof fetch }).fetch = originalFetch;
+  };
+}
+
 interface HttpUploadMockRecord {
   session_id: UUID;
   path: string;
@@ -7583,6 +7605,100 @@ describe("termui web 工作台", () => {
     terminalInput!.value = "after-cursor-http-close";
     fireEvent.input(terminalInput!);
     await waitFor(() => expect(daemon.sessionDataMessages).toContain("after-cursor-http-close"));
+  });
+
+  it("session.resize 的 HTTP control 返回 http_file_transfer_failed 时不升级成全局断线", async () => {
+    const user = userEvent.setup();
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      attachOutput: "resize-http-file-transfer-ready\n",
+      sessions: [
+        {
+          session_id: "00000000-0000-0000-0000-00000000040c",
+          state: "running",
+          size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+        },
+      ],
+    });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await screen.findByText(/resize-http-file-transfer-ready/);
+    await clickSessionCard(user);
+
+    const restoreFetch = installHttpControlFailureOnceMock("/api/control/session/00000000-0000-0000-0000-00000000040c/resize");
+    try {
+      const terminalInput = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
+      expect(terminalInput).not.toBeNull();
+      terminalInput!.focus();
+      (globalThis as { __TERMD_TEST_FIT_DIMENSIONS__?: { rows: number; cols: number } }).__TERMD_TEST_FIT_DIMENSIONS__ = {
+        rows: 34,
+        cols: 104,
+      };
+      fireEvent(window, new Event("resize"));
+      await new Promise((resolve) => window.setTimeout(resolve, 80));
+
+      // 中文注释：relay/浏览器把 sidecar HTTP control 返回成非协议 5xx/plain body 时，
+      // 前端会归一成 http_file_transfer_failed。这里仍只能丢掉本次辅助 ack。
+      expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
+      expect(document.body.textContent).not.toContain("http_file_transfer_failed");
+      terminalInput!.value = "after-resize-http-file-transfer-failed";
+      fireEvent.input(terminalInput!);
+      await waitFor(() => expect(daemon.sessionDataMessages).toContain("after-resize-http-file-transfer-failed"));
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  it("session.cursor 的 HTTP control 返回 http_file_transfer_failed 时不升级成全局断线", async () => {
+    const user = userEvent.setup();
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      attachOutput: "cursor-http-file-transfer-ready\n",
+      sessions: [
+        {
+          session_id: "00000000-0000-0000-0000-00000000040d",
+          state: "running",
+          size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+        },
+      ],
+    });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await screen.findByText(/cursor-http-file-transfer-ready/);
+    await clickSessionCard(user);
+
+    const restoreFetch = installHttpControlFailureOnceMock("/api/control/session/00000000-0000-0000-0000-00000000040d/cursor");
+    try {
+      const terminalInput = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
+      expect(terminalInput).not.toBeNull();
+      terminalInput!.focus();
+
+      await waitFor(() =>
+        expect(daemon.sessionCursorUpdates).toContainEqual({
+          session_id: "00000000-0000-0000-0000-00000000040d",
+          row: expect.any(Number),
+          col: expect.any(Number),
+          focused: true,
+        }),
+      );
+      await new Promise((resolve) => window.setTimeout(resolve, 80));
+
+      // 中文注释：cursor 的 HTTP control 若被归一成 http_file_transfer_failed，
+      // 也只是协作元数据失败，终端与后续输入仍必须保持可用。
+      expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
+      expect(document.body.textContent).not.toContain("http_file_transfer_failed");
+      terminalInput!.value = "after-cursor-http-file-transfer-failed";
+      fireEvent.input(terminalInput!);
+      await waitFor(() => expect(daemon.sessionDataMessages).toContain("after-cursor-http-file-transfer-failed"));
+    } finally {
+      restoreFetch();
+    }
   });
 
   it("浏览器窗口 resize 引发的短暂 focusout/focusin 不会上报聚焦抖动", async () => {

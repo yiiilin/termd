@@ -209,6 +209,12 @@ function isTerminalSidecarTransientError(caught: unknown): boolean {
   if (safeError.code === "response_timeout") {
     return true;
   }
+  if (safeError.code === "http_file_transfer_failed") {
+    // 中文注释：真实 relay/浏览器在 HTTP control 瞬断时，不一定抛 fetch TypeError；
+    // 旁路网关、半开连接或空响应也可能被 httpE2ee 层稳定归一成这个错误码。
+    // 对 resize/cursor 这类终端 sidecar，这仍只代表本次辅助 ack 失败，不能卸载当前 xterm。
+    return true;
+  }
   // 中文注释：真实浏览器在 relay/HTTP 控制面瞬断时，fetch 往往只给 TypeError，
   // `toSafeError()` 会把它归成 client_error。对于 resize/cursor 这类终端辅助 sidecar，
   // 这种瞬时 transport 失败只能丢掉本次辅助 ack，不能升级成全局 Connection error。
