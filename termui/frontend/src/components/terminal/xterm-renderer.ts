@@ -253,6 +253,10 @@ function installDebugBufferMirror(
       host.dataset.termdCols = String(terminal.cols);
       host.dataset.termdRows = String(terminal.rows);
     }
+    // 中文注释：termdCols/termdRows 在 snapshot redraw / resize stabilizing 期间会刻意保持
+    // 权威 snapshot 尺寸；E2E 鼠标命中测试仍需要知道当前 xterm 实例的真实网格。
+    host.dataset.termdActualCols = String(terminal.cols);
+    host.dataset.termdActualRows = String(terminal.rows);
     // 中文注释：E2E/调试视角沿用“距底部还差多少行”的口径，
     // 这样浏览器测试可以直接用 0 表示“已经贴底”。
     host.dataset.termdViewportYRaw = String(Math.max(0, activeBuffer.baseY - activeBuffer.viewportY));

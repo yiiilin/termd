@@ -393,7 +393,9 @@ section "termui-web" "npm run build"
 (cd termui/frontend && npm run build)
 
 section "termui-web" "npm run test:e2e"
-(cd termui/frontend && npm run test:e2e)
+# 中文注释：release QA 会同时拉起真实 termd/termrelay、浏览器和 Vite preview。
+# 在 CI 小机器上并发跑这些重型 E2E 容易触发本机端口/网络状态抖动，发布验收优先要稳定可复现。
+(cd termui/frontend && npm run test:e2e -- --workers=1)
 
 section "termui-web" "npm audit --audit-level=high"
 # `npm audit` 默认会请求 npm registry；release QA 不能把外网连通性当成发布前置条件。

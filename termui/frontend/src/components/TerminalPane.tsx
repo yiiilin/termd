@@ -1813,6 +1813,13 @@ export function TerminalPane(props: TerminalPaneProps) {
   };
 
   const sendTerminalControl = (data: string) => {
+    recordTermdDiagnostic("terminal_pane_send_terminal_control", {
+      chunkLength: data.length,
+      mobileInputMode: mobileInputModeRef.current,
+      passiveInputFocus: passiveInputFocusRef.current,
+      terminalInputHasDomFocus: terminalInputHasDomFocus(),
+      focused: focusedRef.current,
+    });
     onInputRef.current(data);
     queueCursorReport({ immediate: true });
     if (mobileInputModeRef.current) {
@@ -2136,6 +2143,26 @@ export function TerminalPane(props: TerminalPaneProps) {
     // 内部 resize/input 权限，不能反向 blur 输入 sink，否则键盘会“弹出后立刻收起”。
   };
 
+  const cancelMobilePointerDownGestureOnly = () => {
+    if (!mobilePointerDownInputFocusRef.current) {
+      clearPassiveFocusBypassTimer();
+      return;
+    }
+    clearPassiveFocusBypassTimer();
+    mobilePointerDownInputFocusRef.current = false;
+    if (!mobileInputModeRef.current) {
+      return;
+    }
+    // 中文注释：迟到的 contextmenu 是系统长按菜单/键盘链路的一部分，不代表用户要取消输入。
+    // 这里只收掉 pointerdown 的临时标记，保留 helper textarea 的 beforeinput 通道。
+    if (focusedRef.current) {
+      reportTerminalFocus(false);
+    }
+    passiveFocusBypassRef.current = false;
+    suppressPassiveFocusRef.current = true;
+    passiveInputFocusRef.current = terminalInputHasDomFocus();
+  };
+
   const handleMobileDirectionPointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
     if (!mobileInputModeRef.current || !props.attached || event.pointerType === "mouse") {
       return;
@@ -2262,7 +2289,7 @@ export function TerminalPane(props: TerminalPaneProps) {
   };
 
   const handleTerminalContextMenu = () => {
-    cancelMobilePointerDownInputFocus();
+    cancelMobilePointerDownGestureOnly();
     clearMobileDirectionGesture();
     clearPassiveFocusBypassIfInactive();
     clearTerminalSelectionDrag();
@@ -2836,6 +2863,14 @@ export function TerminalPane(props: TerminalPaneProps) {
       lastMobileCompositionEndAtRef.current = nowForThrottle();
     };
     const handleMobileBeforeInput = (event: InputEvent) => {
+      recordTermdDiagnostic("terminal_pane_beforeinput", {
+        inputType: event.inputType,
+        hasData: Boolean(event.data),
+        defaultPrevented: event.defaultPrevented,
+        mobileInputMode: mobileInputModeRef.current,
+        passiveInputFocus: passiveInputFocusRef.current,
+        terminalInputHasDomFocus: terminalInputHasDomFocus(),
+      });
       if (event.defaultPrevented || isMobileCompositionInput(event)) {
         return;
       }
@@ -3515,6 +3550,8 @@ export function TerminalPane(props: TerminalPaneProps) {
       delete host.dataset.termdBuffer;
       delete host.dataset.termdCols;
       delete host.dataset.termdRows;
+      delete host.dataset.termdActualCols;
+      delete host.dataset.termdActualRows;
       delete host.dataset.termdViewportYRaw;
       delete host.dataset.termdScrollbackLength;
       delete host.dataset.termdViewportText;

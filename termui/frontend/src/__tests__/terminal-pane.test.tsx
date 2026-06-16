@@ -549,8 +549,8 @@ describe("TerminalPane terminal sequence rendering", () => {
         clientX: 30,
         clientY: 30,
       });
-      fireEvent.contextMenu(frame);
       textarea!.focus();
+      fireEvent.contextMenu(frame);
       await act(async () => {
         await new Promise((resolve) => window.setTimeout(resolve, 0));
       });
@@ -6163,7 +6163,7 @@ describe("TerminalPane terminal sizing", () => {
   });
 
   it("移动端 rescue 窗口过后收到 contextmenu 也不能主动 blur helper textarea", async () => {
-    const { frame } = renderMobileTerminalPane();
+    const { frame, onInput, onResize } = renderMobileTerminalPane();
     const terminalInput = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
     expect(terminalInput).not.toBeNull();
     const blurSpy = vi.spyOn(terminalInput!, "blur");
@@ -6185,6 +6185,16 @@ describe("TerminalPane terminal sizing", () => {
       // 这类迟到事件不能反向 blur helper textarea，否则用户看到的就是键盘弹出后马上收起。
       expect(blurSpy).not.toHaveBeenCalled();
       expect(document.activeElement).toBe(terminalInput);
+      terminalInput!.dispatchEvent(
+        new InputEvent("beforeinput", {
+          bubbles: true,
+          cancelable: true,
+          inputType: "insertText",
+          data: "c",
+        }),
+      );
+      expect(onInput).toHaveBeenCalledWith("c");
+      expect(onResize).not.toHaveBeenCalled();
     } finally {
       blurSpy.mockRestore();
     }

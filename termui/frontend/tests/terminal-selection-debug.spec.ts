@@ -96,6 +96,7 @@ test("terminal lower-half drag selection returns the lower visible line", async 
         throw new Error("terminal surface is missing");
       }
       const rect = surface.getBoundingClientRect();
+      const viewportLines = (host.dataset.termdViewportText ?? "").split("\n");
       const bufferLineCount = (host.dataset.termdBuffer ?? "").split("\n").length;
       return {
         canvasLeft: rect.left,
@@ -107,19 +108,30 @@ test("terminal lower-half drag selection returns the lower visible line", async 
         bufferLineCount,
         rows: Number.parseInt(host.dataset.termdRows ?? "0", 10),
         cols: Number.parseInt(host.dataset.termdCols ?? "0", 10),
+        actualRows: Number.parseInt(host.dataset.termdActualRows ?? "0", 10),
+        actualCols: Number.parseInt(host.dataset.termdActualCols ?? "0", 10),
+        viewportLines,
       };
     });
 
-    const visibleRows = Math.max(1, metrics.rows || Math.floor(metrics.bufferLineCount - metrics.hostScrollbackLength));
+    // 中文注释：snapshot redraw / resize stabilizing 期间，debug mirror 会保留权威
+    // rows/cols 用于恢复协议断言；鼠标命中必须使用当前 xterm 实际网格和 viewport 文本。
+    const visibleRows = Math.max(
+      1,
+      metrics.actualRows ||
+        metrics.viewportLines.length ||
+        metrics.rows ||
+        Math.floor(metrics.bufferLineCount - metrics.hostScrollbackLength),
+    );
     const targetRow = Math.max(0, visibleRows - 5);
-    const expectedAbsoluteLine = metrics.hostScrollbackLength - metrics.viewportRaw + targetRow + 1;
-    const expectedToken = `line-${String(expectedAbsoluteLine).padStart(3, "0")}`;
+    const expectedToken = metrics.viewportLines[targetRow]?.trim();
+    expect(expectedToken).toMatch(/^line-\d{3}$/);
     const rowHeight = metrics.canvasHeight / visibleRows;
-    const cellWidth = metrics.canvasWidth / Math.max(1, metrics.cols || 80);
+    const cellWidth = metrics.canvasWidth / Math.max(1, metrics.actualCols || metrics.cols || 80);
     // 中文注释：目标 token 从第 0 列开始；如果从画布中间拖拽，真实 xterm 会选中
-    // 该行右侧空白并返回空字符串。这里仍在下半区测试，但横向命中实际文本列。
+    // 该行右侧空白并返回空字符串。终点多留几列，避免 CI 字体/DPR 把最后一个字符卡在边界。
     const startX = metrics.canvasLeft + cellWidth * 0.2;
-    const endX = metrics.canvasLeft + cellWidth * 8.2;
+    const endX = metrics.canvasLeft + cellWidth * 12.5;
     const y = metrics.canvasTop + rowHeight * (targetRow + 0.52);
     const hitTargets = await page.evaluate(
       ({ startX, endX, y }) => {

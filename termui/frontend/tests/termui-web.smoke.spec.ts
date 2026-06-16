@@ -154,6 +154,7 @@ test("mobile terminal pointerdown 提前解锁 focus suppression，helper textar
 
 test("mobile terminal 迟到 contextmenu 不会收起 helper textarea 焦点", async ({ page }, testInfo: TestInfo) => {
   test.skip(testInfo.project.name !== "mobile-chrome", "该回归只需要移动端项目覆盖");
+  await enableTermdDiagnostics(page);
 
   const daemon = await MockDaemon.start({
     token: "secret-token",
@@ -209,6 +210,7 @@ test("mobile terminal 迟到 contextmenu 不会收起 helper textarea 焦点", a
     });
     await expect.poll(() => daemon.decryptedInputs.join("").slice(inputBaseline.length)).toBe("c");
   } finally {
+    await attachTermdDiagnostics(testInfo, "mobile-contextmenu", page);
     await daemon.stop();
   }
 });
@@ -1637,6 +1639,30 @@ async function expectTerminalLine(page: Page, text: string, timeout: number): Pr
 
 async function terminalDebugBufferText(page: Page): Promise<string> {
   return page.locator(".terminal-host").evaluate((host) => (host as HTMLElement).dataset.termdBuffer ?? "");
+}
+
+async function enableTermdDiagnostics(page: Page): Promise<void> {
+  await page.addInitScript(() => {
+    // 中文注释：移动端输入焦点回归需要观察 beforeinput 到 App 输入发送之间的状态机事件。
+    (globalThis as { __TERMD_TRACE__?: boolean }).__TERMD_TRACE__ = true;
+  });
+}
+
+async function attachTermdDiagnostics(
+  testInfo: { attach: (name: string, options: { body: string; contentType: string }) => Promise<void> },
+  label: string,
+  page: Page,
+): Promise<void> {
+  const events = await page
+    .evaluate(() => (globalThis as { __TERMD_DIAG_EVENTS__?: unknown[] }).__TERMD_DIAG_EVENTS__ ?? [])
+    .catch(() => []);
+  if (events.length === 0) {
+    return;
+  }
+  await testInfo.attach(`termd-diagnostics-${label}.json`, {
+    body: JSON.stringify(events, null, 2),
+    contentType: "application/json",
+  });
 }
 
 async function terminalViewportText(page: Page): Promise<string> {
