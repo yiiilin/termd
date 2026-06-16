@@ -4013,7 +4013,9 @@ function useMobileTerminalInputMode(isMobileLayout: boolean): boolean {
     }
     const navigatorLike = window.navigator as Navigator & { maxTouchPoints?: number };
     const hasTouchPoints = (navigatorLike.maxTouchPoints ?? 0) > 0;
-    const hasTouchEvent = "ontouchstart" in window;
+    // 中文注释：测试和部分桌面运行时可能保留 `ontouchstart` 属性但值为 undefined；
+    // 这种占位属性不能当成触摸能力，否则桌面窗口 blur 会被误判成移动端软键盘抖动。
+    const hasTouchEvent = (window as Window & { ontouchstart?: unknown }).ontouchstart !== undefined;
     const hasCoarsePointer =
       typeof window.matchMedia === "function" &&
       window.matchMedia("(pointer: coarse)").matches;

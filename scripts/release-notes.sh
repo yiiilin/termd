@@ -12,6 +12,16 @@ version="${1:-}"
 }
 
 PLACEHOLDER_TEXT="请在 scripts/release-notes.sh 中补充此版本的功能、修复和兼容性说明。"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+RELEASE_NOTES_FILE="${ROOT_DIR}/docs/releases/${version}.md"
+
+# 中文注释：新版本的发版说明落在 docs/releases，脚本继续作为 tag message
+# 和 GitHub Release 的唯一入口，避免 CI、prepare-release 与文档内容漂移。
+if [[ -f "$RELEASE_NOTES_FILE" ]]; then
+  cat "$RELEASE_NOTES_FILE"
+  exit 0
+fi
 
 case "$version" in
   0.5.0)
