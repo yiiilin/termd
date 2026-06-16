@@ -9,10 +9,10 @@ use tokio::sync::{Notify, mpsc};
 use tracing::{debug, trace, warn};
 
 use super::{
-    ConnectionId, ConnectionRole, FrameSender, IDLE_DAEMON_DATA_PIPE_LIMIT, OpaqueFrame,
-    PENDING_CLIENTS_PER_ROOM_LIMIT, PRE_PAIR_CLIENT_BUFFER_MAX_BYTES,
-    PRE_PAIR_CLIENT_BUFFER_MAX_FRAMES, PRE_PAIR_ROOM_BUFFER_MAX_BYTES, RelayDataSendError,
-    RelayOutbound, RoutePrelude, relay_control_frame, relay_data_control_outbound,
+    ConnectionId, ConnectionRole, FrameSender, OpaqueFrame, PENDING_CLIENTS_PER_ROOM_LIMIT,
+    PRE_PAIR_CLIENT_BUFFER_MAX_BYTES, PRE_PAIR_CLIENT_BUFFER_MAX_FRAMES,
+    PRE_PAIR_ROOM_BUFFER_MAX_BYTES, RelayDataSendError, RelayOutbound, RoutePrelude,
+    relay_control_frame,
 };
 
 #[derive(Debug, Default)]
@@ -26,7 +26,6 @@ struct RelayRoom {
     daemon_control: Option<ConnectionEndpoint>,
     route_generation: Option<Nonce>,
     daemon_data: HashMap<ConnectionId, ConnectionEndpoint>,
-    idle_daemon_data: VecDeque<ConnectionId>,
     clients: HashMap<ConnectionId, ConnectionEndpoint>,
     pre_pair_client_bytes: usize,
 }
@@ -90,7 +89,6 @@ impl RelayRoom {
         for (_, daemon_data) in self.daemon_data.drain() {
             daemon_data.sender.request_close();
         }
-        self.idle_daemon_data.clear();
     }
 
     fn clear_daemon_control_and_dependents(&mut self) {
@@ -115,13 +113,10 @@ impl RelayRoom {
         self.release_client_pre_pair_bytes(&client);
         client.pair_signal.notify_waiters();
         if let Some(data_id) = client.paired_daemon_data_id {
-            self.idle_daemon_data.retain(|idle_id| *idle_id != data_id);
             if let Some(daemon_data) = self.daemon_data.remove(&data_id) {
-                // 中文注释：同一条 daemon data WebSocket 上 control/data 使用不同队列。
-                // client 断开时旧 data frame 可能已经排在 ClientDisconnected 后面；如果复用
-                // 这条 pipe，新 client 的 HTTP upload/terminal 输入会被旧 frame 污染。
-                // 因此 paired client 一断开就关闭对应 data pipe，让 daemon 建一条新的 idle
-                // pipe。WebSocket close 本身就是清理该 client 协议上下文的可靠信号。
+                // 中文注释：daemon data pipe 与 client 一对一绑定。client 断开时直接关闭
+                // 对应 data WebSocket，后续 client 必须重新走 control 线 OpenData 回连，
+                // 避免旧 client 的残留帧污染下一次 attach/upload。
                 outcome.notified_data_pipe = true;
                 daemon_data.sender.request_close();
             }
@@ -129,85 +124,6 @@ impl RelayRoom {
 
         client.sender.request_close();
         outcome
-    }
-
-    pub(super) fn mark_daemon_data_ready(&mut self, data_id: ConnectionId) -> bool {
-        let Some(daemon_data) = self.daemon_data.get(&data_id) else {
-            return false;
-        };
-        if daemon_data.paired_client_id.is_some() {
-            warn!(
-                daemon_data_connection_id = data_id,
-                paired_client_id = daemon_data.paired_client_id,
-                "relay ignored data_ready from still-paired daemon data pipe"
-            );
-            return false;
-        }
-        if !self
-            .idle_daemon_data
-            .iter()
-            .any(|idle_id| *idle_id == data_id)
-        {
-            self.idle_daemon_data.push_back(data_id);
-            self.enforce_idle_daemon_data_limit();
-        }
-        true
-    }
-
-    fn assign_idle_daemon_data_to_client(
-        &mut self,
-        client_id: ConnectionId,
-        data_token: Nonce,
-    ) -> Option<ConnectionId> {
-        while let Some(data_id) = self.idle_daemon_data.pop_front() {
-            let Some(daemon_data) = self.daemon_data.get(&data_id) else {
-                continue;
-            };
-            if daemon_data.paired_client_id.is_some() {
-                continue;
-            }
-
-            if !self.clients.contains_key(&client_id) {
-                return None;
-            }
-            let assign = RelayControlEnvelope::OpenData {
-                client_id: RelayClientId(client_id),
-                data_token: data_token.clone(),
-            };
-            // 中文注释：idle data pipe 的 OpenData 必须和随后 client 业务帧在同一条
-            // FIFO lane 里排队。writer 可能刚发过 data_ready pong，下一轮会优先 data lane；
-            // 如果 OpenData 放在 control lane，HTTP upload 的 request head/body 可能抢先到达
-            // daemon，daemon 还在等 assignment 时就会把业务二进制判成无效控制帧并断开。
-            let send_result = daemon_data
-                .sender
-                .try_send_data(relay_data_control_outbound(assign));
-            match send_result {
-                Ok(()) => {
-                    if let Some(daemon_data) = self.daemon_data.get_mut(&data_id) {
-                        daemon_data.paired_client_id = Some(client_id);
-                    }
-                    if let Some(client) = self.clients.get_mut(&client_id) {
-                        client.paired_daemon_data_id = Some(data_id);
-                        client.pair_signal.notify_waiters();
-                        return Some(data_id);
-                    }
-                    return None;
-                }
-                Err(error) => {
-                    warn!(
-                        client_connection_id = client_id,
-                        daemon_data_connection_id = data_id,
-                        ?error,
-                        "relay dropped unusable idle daemon data pipe"
-                    );
-                    if let Some(daemon_data) = self.daemon_data.remove(&data_id) {
-                        daemon_data.sender.request_close();
-                    }
-                }
-            }
-        }
-
-        None
     }
 
     pub(super) fn buffer_client_frame(
@@ -268,31 +184,6 @@ impl RelayRoom {
             .count()
     }
 
-    fn has_assignable_idle_daemon_data(&self) -> bool {
-        self.idle_daemon_data.iter().any(|data_id| {
-            self.daemon_data
-                .get(data_id)
-                .is_some_and(|daemon_data| daemon_data.paired_client_id.is_none())
-        })
-    }
-
-    fn enforce_idle_daemon_data_limit(&mut self) {
-        while self.idle_daemon_data.len() > IDLE_DAEMON_DATA_PIPE_LIMIT {
-            let Some(data_id) = self.idle_daemon_data.pop_front() else {
-                break;
-            };
-            let Some(daemon_data) = self.daemon_data.remove(&data_id) else {
-                continue;
-            };
-            warn!(
-                daemon_data_connection_id = data_id,
-                idle_data_pipe_limit = IDLE_DAEMON_DATA_PIPE_LIMIT,
-                "relay closing oldest idle daemon data pipe over room limit"
-            );
-            daemon_data.sender.request_close();
-        }
-    }
-
     fn release_client_pre_pair_bytes(&mut self, client: &ConnectionEndpoint) {
         self.pre_pair_client_bytes = self
             .pre_pair_client_bytes
@@ -346,19 +237,6 @@ impl ConnectionEndpoint {
             data_token: None,
             paired_daemon_data_id: None,
             paired_client_id: Some(client_id),
-            pre_pair_buffer: PrePairBuffer::default(),
-            pre_pair_flush_in_progress: false,
-            pair_signal: Arc::new(Notify::new()),
-        }
-    }
-
-    fn new_idle_daemon_data(id: ConnectionId, sender: FrameSender) -> Self {
-        Self {
-            id,
-            sender,
-            data_token: None,
-            paired_daemon_data_id: None,
-            paired_client_id: None,
             pre_pair_buffer: PrePairBuffer::default(),
             pre_pair_flush_in_progress: false,
             pair_signal: Arc::new(Notify::new()),
@@ -550,18 +428,6 @@ impl RelayRegistry {
                             "relay registered daemon data pipe"
                         );
                     }
-                    (None, None) => {
-                        room.daemon_data
-                            .insert(id, ConnectionEndpoint::new_idle_daemon_data(id, sender));
-                        room.idle_daemon_data.push_back(id);
-                        room.enforce_idle_daemon_data_limit();
-                        debug!(
-                            server_id = %server_id.0,
-                            connection_id = id,
-                            idle_data_pipes = room.idle_daemon_data.len(),
-                            "relay registered idle daemon data pipe"
-                        );
-                    }
                     _ => return Err(RelayError::DaemonDataRouteInvalid),
                 }
             }
@@ -569,9 +435,7 @@ impl RelayRegistry {
                 let room = rooms
                     .get_mut(&server_id)
                     .ok_or(RelayError::DaemonControlOffline)?;
-                if !room.has_assignable_idle_daemon_data()
-                    && room.pending_client_count() >= PENDING_CLIENTS_PER_ROOM_LIMIT
-                {
+                if room.pending_client_count() >= PENDING_CLIENTS_PER_ROOM_LIMIT {
                     return Err(RelayError::PendingClientLimitExceeded);
                 }
                 let data_token = Nonce(format!("relay-data-{}-{id}", uuid::Uuid::new_v4()));
@@ -589,29 +453,6 @@ impl RelayRegistry {
                 // 否则 control writer 足够快时，daemon data 可能早于 client 入表到达并被误拒。
                 room.clients
                     .insert(id, ConnectionEndpoint::new_client(id, sender, data_token));
-                let client_data_token = room
-                    .clients
-                    .get(&id)
-                    .and_then(|client| client.data_token.clone())
-                    .expect("刚插入的 client 必须带 data token");
-                if let Some(data_id) = room.assign_idle_daemon_data_to_client(id, client_data_token)
-                {
-                    debug!(
-                        server_id = %server_id.0,
-                        connection_id = id,
-                        daemon_data_connection_id = data_id,
-                        client_count = room.clients.len(),
-                        idle_data_pipes = room.idle_daemon_data.len(),
-                        "relay paired client with idle daemon data pipe"
-                    );
-                    return Ok(ConnectionRegistration {
-                        server_id,
-                        role,
-                        id,
-                        route_generation: room.route_generation.clone(),
-                        paired_client_id: None,
-                    });
-                }
                 if room.pending_client_count() > PENDING_CLIENTS_PER_ROOM_LIMIT {
                     room.close_client_transport(id);
                     return Err(RelayError::PendingClientLimitExceeded);
@@ -685,8 +526,6 @@ impl RelayRegistry {
             ConnectionRole::DaemonData => {
                 let removed_data = room.daemon_data.remove(&registration.id);
                 let removed = removed_data.is_some();
-                room.idle_daemon_data
-                    .retain(|data_id| *data_id != registration.id);
                 let paired_client_id = removed_data
                     .as_ref()
                     .and_then(|data| data.paired_client_id)
@@ -1224,133 +1063,6 @@ impl RelayRegistry {
                     delivered: 0,
                     dropped: 1,
                 }
-            }
-        }
-    }
-
-    fn handle_daemon_data_control(
-        &self,
-        registration: &ConnectionRegistration,
-        control: RelayControlEnvelope,
-    ) -> ForwardReport {
-        match control {
-            RelayControlEnvelope::DataReady => {
-                let Ok(mut rooms) = self.rooms.lock() else {
-                    warn!("relay registry mutex poisoned during daemon data ready");
-                    return ForwardReport {
-                        attempted: 1,
-                        delivered: 0,
-                        dropped: 1,
-                    };
-                };
-                let ready = rooms
-                    .get_mut(&registration.server_id)
-                    .is_some_and(|room| room.mark_daemon_data_ready(registration.id));
-                debug!(
-                    server_id = %registration.server_id.0,
-                    daemon_data_connection_id = registration.id,
-                    ready,
-                    "relay received daemon data ready"
-                );
-                ForwardReport {
-                    attempted: 1,
-                    delivered: if ready { 1 } else { 0 },
-                    dropped: if ready { 0 } else { 1 },
-                }
-            }
-            RelayControlEnvelope::OpenData { .. }
-            | RelayControlEnvelope::ClientDisconnected { .. } => {
-                warn!(
-                    server_id = %registration.server_id.0,
-                    daemon_data_connection_id = registration.id,
-                    ?control,
-                    "relay ignored unexpected daemon data control frame"
-                );
-                ForwardReport {
-                    attempted: 1,
-                    delivered: 0,
-                    dropped: 1,
-                }
-            }
-        }
-    }
-
-    pub(super) fn handle_daemon_data_control_ping(
-        &self,
-        registration: &ConnectionRegistration,
-        control: RelayControlEnvelope,
-        pong_payload: Vec<u8>,
-    ) -> RelayForwardOutcome {
-        if !matches!(control, RelayControlEnvelope::DataReady) {
-            return RelayForwardOutcome::continue_with(
-                self.handle_daemon_data_control(registration, control),
-            );
-        }
-
-        let Ok(mut rooms) = self.rooms.lock() else {
-            warn!("relay registry mutex poisoned during daemon data ready");
-            return RelayForwardOutcome::close_with(ForwardReport {
-                attempted: 1,
-                delivered: 0,
-                dropped: 1,
-            });
-        };
-        let Some(room) = rooms.get_mut(&registration.server_id) else {
-            return RelayForwardOutcome::continue_with(ForwardReport {
-                attempted: 1,
-                delivered: 0,
-                dropped: 1,
-            });
-        };
-        let ready = room.mark_daemon_data_ready(registration.id);
-        debug!(
-            server_id = %registration.server_id.0,
-            daemon_data_connection_id = registration.id,
-            ready,
-            "relay received daemon data ready"
-        );
-        if !ready {
-            return RelayForwardOutcome::continue_with(ForwardReport {
-                attempted: 1,
-                delivered: 0,
-                dropped: 1,
-            });
-        }
-        let Some(daemon_data) = room.daemon_data.get(&registration.id) else {
-            room.idle_daemon_data
-                .retain(|data_id| *data_id != registration.id);
-            return RelayForwardOutcome::continue_with(ForwardReport {
-                attempted: 1,
-                delivered: 0,
-                dropped: 1,
-            });
-        };
-        match daemon_data
-            .sender
-            .try_send_control(RelayOutbound::Pong(pong_payload))
-        {
-            Ok(()) => RelayForwardOutcome::continue_with(ForwardReport {
-                attempted: 1,
-                delivered: 1,
-                dropped: 0,
-            }),
-            Err(error) => {
-                warn!(
-                    server_id = %registration.server_id.0,
-                    daemon_data_connection_id = registration.id,
-                    %error,
-                    "relay failed to acknowledge daemon data ready"
-                );
-                room.idle_daemon_data
-                    .retain(|data_id| *data_id != registration.id);
-                if let Some(daemon_data) = room.daemon_data.remove(&registration.id) {
-                    daemon_data.sender.request_close();
-                }
-                RelayForwardOutcome::close_with(ForwardReport {
-                    attempted: 1,
-                    delivered: 0,
-                    dropped: 1,
-                })
             }
         }
     }

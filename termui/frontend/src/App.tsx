@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from "react";
 import {
   Cable,
   CircleAlert,
@@ -51,11 +51,7 @@ import {
   selectDefaultServer,
 } from "./state/browser-state";
 import { ConnectionPanel } from "./components/ConnectionPanel";
-import { DaemonClientsPanel } from "./components/DaemonClientsPanel";
-import { DaemonManagerPanel } from "./components/DaemonManagerPanel";
 import { SessionList } from "./components/SessionList";
-import { SessionFilesPanel } from "./components/SessionFilesPanel";
-import { FileEditorDialog } from "./components/FileEditorDialog";
 import { StatusBar } from "./components/StatusBar";
 import { TerminalPane } from "./components/TerminalPane";
 import type { TerminalOutputItem, TerminalResyncOptions } from "./components/terminal/types";
@@ -73,13 +69,31 @@ import {
   useSessionFilesPanelActions,
   useSessionGitDiffViewer,
 } from "./hooks/useSessionFiles";
-import { PairingQrScanner } from "./components/PairingQrScanner";
-import { SettingsDialog } from "./components/SettingsDialog";
 import { sessionDisplayName } from "./session-names";
 import { createTranslator, I18nProvider, resolveLocale, translateSafeErrorMessage, useI18n, type Translate } from "./i18n";
 import { resolveTheme } from "./theme";
 import type { BrowserPreferences } from "./protocol/types";
 import { recordTermdDiagnostic } from "./diagnostics";
+
+const DaemonClientsPanel = lazy(() => import("./components/DaemonClientsPanel").then((module) => ({ default: module.DaemonClientsPanel })));
+const DaemonManagerPanel = lazy(() => import("./components/DaemonManagerPanel").then((module) => ({ default: module.DaemonManagerPanel })));
+const SessionFilesPanel = lazy(() => import("./components/SessionFilesPanel").then((module) => ({ default: module.SessionFilesPanel })));
+const FileEditorDialog = lazy(() => import("./components/FileEditorDialog").then((module) => ({ default: module.FileEditorDialog })));
+const PairingQrScanner = lazy(() => import("./components/PairingQrScanner").then((module) => ({ default: module.PairingQrScanner })));
+const SettingsDialog = lazy(() => import("./components/SettingsDialog").then((module) => ({ default: module.SettingsDialog })));
+
+function LazyPanelFallback({ className = "panel" }: { className?: string }) {
+  // 中文注释：冷路径 chunk 加载通常很短；fallback 只占位，避免闪出无意义文案。
+  return <div className={className} aria-hidden="true" />;
+}
+
+function LazyModalFallback({ className }: { className: string }) {
+  return (
+    <div className="modal-backdrop" role="presentation" aria-hidden="true">
+      <div className={className} />
+    </div>
+  );
+}
 
 const FALLBACK_WS_URL = "ws://127.0.0.1:8765/ws";
 const DEFAULT_SESSION_SIZE: TerminalSize = { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 };
@@ -436,7 +450,8 @@ export default function App() {
   const lastNotificationAtRef = useRef(0);
   const fileEditorResetRef = useRef<() => void>(() => {});
   const isMobileLayout = useMobileLayout();
-  const visualViewportMetrics = useVisualViewportMetrics(isMobileLayout && activeSurface === "workspace");
+  const mobileTerminalInputMode = useMobileTerminalInputMode(isMobileLayout);
+  const visualViewportMetrics = useVisualViewportMetrics(mobileTerminalInputMode && activeSurface === "workspace");
   const systemTheme = useSystemTheme();
   const preferences = state.preferences ?? DEFAULT_BROWSER_PREFERENCES;
   const effectiveTheme = resolveTheme(preferences.theme, systemTheme);
@@ -690,11 +705,11 @@ export default function App() {
     !isMobileLayout && showDesktopFilesPanel
       ? { gridTemplateColumns: `minmax(0, 1fr) ${filesPanelWidth}px` }
       : undefined;
-  const mobileKeyboardOpen = isMobileLayout && activeSurface === "workspace" && visualViewportMetrics.keyboardOpen;
+  const mobileKeyboardOpen = mobileTerminalInputMode && activeSurface === "workspace" && visualViewportMetrics.keyboardOpen;
   const appShellStyle = isMobileLayout
     ? ({
-        "--termd-layout-viewport-height": `${window.innerHeight}px`,
-        "--termd-visual-viewport-height": `${mobileKeyboardOpen ? window.innerHeight : visualViewportMetrics.height}px`,
+        "--termd-layout-viewport-height": `${visualViewportMetrics.height}px`,
+        "--termd-visual-viewport-height": `${visualViewportMetrics.height}px`,
         "--termd-visual-viewport-offset-top": `${visualViewportMetrics.offsetTop}px`,
         "--termd-visual-viewport-keyboard-inset": `${visualViewportMetrics.keyboardInset}px`,
       } as CSSProperties)
@@ -3220,33 +3235,41 @@ export default function App() {
               onSaveUrl={handleSaveConnectionUrl}
               showUrlEditor={connectionEditorOpen || !activeServer}
             />
-            <DaemonManagerPanel
-              servers={pairedServerOptions}
-              activeServerId={activeServer?.server_id}
-              renamingServerId={renamingDaemonId}
-              renameDraft={daemonRenameDraft}
-              onSelect={(serverId) => void handleSelectServer(serverId)}
-              onStartRename={handleStartDaemonRename}
-              onRenameDraftChange={setDaemonRenameDraft}
-              onSaveRename={(serverId, nextName) => void handleSaveDaemonRename(serverId, nextName)}
-              onCancelRename={handleCancelDaemonRename}
-              onForget={(serverId) => void handleForgetDaemon(serverId)}
-            />
+            <Suspense fallback={<LazyPanelFallback />}>
+              <DaemonManagerPanel
+                servers={pairedServerOptions}
+                activeServerId={activeServer?.server_id}
+                renamingServerId={renamingDaemonId}
+                renameDraft={daemonRenameDraft}
+                onSelect={(serverId) => void handleSelectServer(serverId)}
+                onStartRename={handleStartDaemonRename}
+                onRenameDraftChange={setDaemonRenameDraft}
+                onSaveRename={(serverId, nextName) => void handleSaveDaemonRename(serverId, nextName)}
+                onCancelRename={handleCancelDaemonRename}
+                onForget={(serverId) => void handleForgetDaemon(serverId)}
+              />
+            </Suspense>
           </div>
           {qrScannerOpen ? (
-            <PairingQrScanner
-              onDetected={handleQrDetected}
-              onClose={() => setQrScannerOpen(false)}
-            />
+            <Suspense fallback={<LazyModalFallback className="qr-scanner-dialog" />}>
+              <PairingQrScanner
+                onDetected={handleQrDetected}
+                onClose={() => setQrScannerOpen(false)}
+              />
+            </Suspense>
           ) : null}
-          <SettingsDialog
-            open={settingsOpen}
-            preferences={preferences}
-            effectiveLocale={effectiveLocale}
-            effectiveTheme={effectiveTheme}
-            onPreferencesChange={handlePreferencesChange}
-            onClose={() => setSettingsOpen(false)}
-          />
+          {settingsOpen ? (
+            <Suspense fallback={<LazyModalFallback className="settings-dialog" />}>
+              <SettingsDialog
+                open={settingsOpen}
+                preferences={preferences}
+                effectiveLocale={effectiveLocale}
+                effectiveTheme={effectiveTheme}
+                onPreferencesChange={handlePreferencesChange}
+                onClose={() => setSettingsOpen(false)}
+              />
+            </Suspense>
+          ) : null}
         </main>
         <StatusBar status={status} error={error} sessionId={attachedSessionId ?? selectedSessionId} />
       </div>
@@ -3470,12 +3493,14 @@ export default function App() {
               </button>
               {clientsOpen ? (
                 <div className="clients-popover toolbar-clients-popover" id="daemon-clients-popover">
-                  <DaemonClientsPanel
-                    clients={daemonClients}
-                    currentDeviceId={state.device?.device_id}
-                    forgettingClientIds={forgettingClientIds}
-                    onForgetOfflineClient={handleForgetOfflineClient}
-                  />
+                  <Suspense fallback={<LazyPanelFallback className="daemon-clients" />}>
+                    <DaemonClientsPanel
+                      clients={daemonClients}
+                      currentDeviceId={state.device?.device_id}
+                      forgettingClientIds={forgettingClientIds}
+                      onForgetOfflineClient={handleForgetOfflineClient}
+                    />
+                  </Suspense>
                 </div>
               ) : null}
               <button type="button" className="toolbar-admin-button" onClick={() => handleOpenAdmin()}>
@@ -3516,10 +3541,11 @@ export default function App() {
                 attached={Boolean(attachedSessionId)}
                 sessionSize={attachedSession?.size}
                 focusRequest={terminalFocusRequest}
-                mobileInputMode={isMobileLayout}
+                mobileInputMode={mobileTerminalInputMode}
                 mobileKeyboardOpen={mobileKeyboardOpen}
-                mobileViewportHeight={isMobileLayout ? window.innerHeight : undefined}
-                mobileViewportOffsetTop={isMobileLayout ? visualViewportMetrics.offsetTop : undefined}
+                mobileViewportWidth={mobileTerminalInputMode ? visualViewportMetrics.width : undefined}
+                mobileViewportHeight={mobileTerminalInputMode ? visualViewportMetrics.height : undefined}
+                mobileViewportOffsetTop={mobileTerminalInputMode ? visualViewportMetrics.offsetTop : undefined}
                 theme={effectiveTheme}
                 outputResetVersion={terminalOutputResetVersion}
                 takeOutput={takeTerminalOutput}
@@ -3536,35 +3562,37 @@ export default function App() {
               />
               {showDesktopFilesPanel ? (
                 <>
-                  <SessionFilesPanel
-                    attachedSessionId={attachedSessionId}
-                    activeTab={sessionFilesPanelTab}
-                    files={sessionFiles}
-                    loading={sessionFilesLoading}
-                    error={sessionFilesError}
-                    uploadProgress={visibleFileTransferProgress.uploadProgress}
-                    downloadProgress={visibleFileTransferProgress.downloadProgress}
-                    git={sessionGit}
-                    gitLoading={sessionGitLoading}
-                    gitError={sessionGitError}
-                    followTerminalCwd={sessionFilesFollowTerminalCwd}
-                    onTabChange={handleSessionFilesPanelTabChange}
-                    onOpenDirectory={handleOpenDirectory}
-                    onOpenFile={handleOpenFile}
-                    onOpenGitFile={handleOpenGitFile}
-                    onOpenGitDiff={handleOpenGitDiff}
-                    onGitAction={handleSessionGitAction}
-                    onGoToPath={handleGoToFilePath}
-                    onRefresh={handleRefreshSessionFiles}
-                    onRefreshGit={handleRefreshSessionGit}
-                    onFollowTerminalCwdChange={handleSessionFilesFollowTerminalCwdChange}
-                    onUpload={handleUploadFile}
-                    onDownload={handleDownloadFile}
-                    onDelete={handleDeleteFile}
-                    onHide={handleHideFiles}
-                    onResizePointerDown={handleFilesPanelResizePointerDown}
-                    onResizeKeyDown={handleFilesPanelResizeKeyDown}
-                  />
+                  <Suspense fallback={<LazyPanelFallback className="files-panel" />}>
+                    <SessionFilesPanel
+                      attachedSessionId={attachedSessionId}
+                      activeTab={sessionFilesPanelTab}
+                      files={sessionFiles}
+                      loading={sessionFilesLoading}
+                      error={sessionFilesError}
+                      uploadProgress={visibleFileTransferProgress.uploadProgress}
+                      downloadProgress={visibleFileTransferProgress.downloadProgress}
+                      git={sessionGit}
+                      gitLoading={sessionGitLoading}
+                      gitError={sessionGitError}
+                      followTerminalCwd={sessionFilesFollowTerminalCwd}
+                      onTabChange={handleSessionFilesPanelTabChange}
+                      onOpenDirectory={handleOpenDirectory}
+                      onOpenFile={handleOpenFile}
+                      onOpenGitFile={handleOpenGitFile}
+                      onOpenGitDiff={handleOpenGitDiff}
+                      onGitAction={handleSessionGitAction}
+                      onGoToPath={handleGoToFilePath}
+                      onRefresh={handleRefreshSessionFiles}
+                      onRefreshGit={handleRefreshSessionGit}
+                      onFollowTerminalCwdChange={handleSessionFilesFollowTerminalCwdChange}
+                      onUpload={handleUploadFile}
+                      onDownload={handleDownloadFile}
+                      onDelete={handleDeleteFile}
+                      onHide={handleHideFiles}
+                      onResizePointerDown={handleFilesPanelResizePointerDown}
+                      onResizeKeyDown={handleFilesPanelResizeKeyDown}
+                    />
+                  </Suspense>
                 </>
               ) : !isMobileLayout ? (
                 <aside className="files-rail" aria-label={t("app.filesPanelCollapsed")}>
@@ -3650,69 +3678,83 @@ export default function App() {
         ) : null}
         {showMobileFilesPanel ? (
           <div className="mobile-panel mobile-files-panel">
-            <SessionFilesPanel
-              attachedSessionId={attachedSessionId}
-              activeTab={sessionFilesPanelTab}
-              files={sessionFiles}
-              loading={sessionFilesLoading}
-              error={sessionFilesError}
-              uploadProgress={visibleFileTransferProgress.uploadProgress}
-              downloadProgress={visibleFileTransferProgress.downloadProgress}
-              git={sessionGit}
-              gitLoading={sessionGitLoading}
-              gitError={sessionGitError}
-              followTerminalCwd={sessionFilesFollowTerminalCwd}
-              onTabChange={handleSessionFilesPanelTabChange}
-              onOpenDirectory={handleOpenDirectory}
-              onOpenFile={handleOpenFile}
-              onOpenGitFile={handleOpenGitFile}
-              onOpenGitDiff={handleOpenGitDiff}
-              onGitAction={handleSessionGitAction}
-              onGoToPath={handleGoToFilePath}
-              onRefresh={handleRefreshSessionFiles}
-              onRefreshGit={handleRefreshSessionGit}
-              onFollowTerminalCwdChange={handleSessionFilesFollowTerminalCwdChange}
-              onUpload={handleUploadFile}
-              onDownload={handleDownloadFile}
-              onDelete={handleDeleteFile}
-              onHide={handleHideFiles}
-            />
+            <Suspense fallback={<LazyPanelFallback className="files-panel" />}>
+              <SessionFilesPanel
+                attachedSessionId={attachedSessionId}
+                activeTab={sessionFilesPanelTab}
+                files={sessionFiles}
+                loading={sessionFilesLoading}
+                error={sessionFilesError}
+                uploadProgress={visibleFileTransferProgress.uploadProgress}
+                downloadProgress={visibleFileTransferProgress.downloadProgress}
+                git={sessionGit}
+                gitLoading={sessionGitLoading}
+                gitError={sessionGitError}
+                followTerminalCwd={sessionFilesFollowTerminalCwd}
+                onTabChange={handleSessionFilesPanelTabChange}
+                onOpenDirectory={handleOpenDirectory}
+                onOpenFile={handleOpenFile}
+                onOpenGitFile={handleOpenGitFile}
+                onOpenGitDiff={handleOpenGitDiff}
+                onGitAction={handleSessionGitAction}
+                onGoToPath={handleGoToFilePath}
+                onRefresh={handleRefreshSessionFiles}
+                onRefreshGit={handleRefreshSessionGit}
+                onFollowTerminalCwdChange={handleSessionFilesFollowTerminalCwdChange}
+                onUpload={handleUploadFile}
+                onDownload={handleDownloadFile}
+                onDelete={handleDeleteFile}
+                onHide={handleHideFiles}
+              />
+            </Suspense>
           </div>
         ) : null}
-        <FileEditorDialog
-          open={Boolean(fileEditor)}
-          path={fileEditor?.path ?? ""}
-          name={fileEditor?.name}
-          initialText={fileEditor?.text ?? ""}
-          loading={fileEditor?.loading}
-          saving={fileEditor?.saving}
-          error={fileEditor?.error}
-          language={languageForPath(fileEditor?.path ?? "")}
-          theme={effectiveTheme}
-          onSave={handleSaveOpenFile}
-          onClose={handleCloseFileEditor}
-        />
-        <FileEditorDialog
-          open={Boolean(diffViewer)}
-          path={diffViewer?.path ?? ""}
-          name={diffViewer?.name}
-          initialText={diffViewer?.text ?? ""}
-          loading={diffViewer?.loading}
-          error={diffViewer?.error}
-          language="diff"
-          theme={effectiveTheme}
-          readOnly
-          onSave={() => undefined}
-          onClose={handleCloseGitDiff}
-        />
-        <SettingsDialog
-          open={settingsOpen}
-          preferences={preferences}
-          effectiveLocale={effectiveLocale}
-          effectiveTheme={effectiveTheme}
-          onPreferencesChange={handlePreferencesChange}
-          onClose={() => setSettingsOpen(false)}
-        />
+        {fileEditor ? (
+          <Suspense fallback={<LazyModalFallback className="file-editor-dialog" />}>
+            <FileEditorDialog
+              open
+              path={fileEditor.path}
+              name={fileEditor.name}
+              initialText={fileEditor.text}
+              loading={fileEditor.loading}
+              saving={fileEditor.saving}
+              error={fileEditor.error}
+              language={languageForPath(fileEditor.path)}
+              theme={effectiveTheme}
+              onSave={handleSaveOpenFile}
+              onClose={handleCloseFileEditor}
+            />
+          </Suspense>
+        ) : null}
+        {diffViewer ? (
+          <Suspense fallback={<LazyModalFallback className="file-editor-dialog" />}>
+            <FileEditorDialog
+              open
+              path={diffViewer.path}
+              name={diffViewer.name}
+              initialText={diffViewer.text}
+              loading={diffViewer.loading}
+              error={diffViewer.error}
+              language="diff"
+              theme={effectiveTheme}
+              readOnly
+              onSave={() => undefined}
+              onClose={handleCloseGitDiff}
+            />
+          </Suspense>
+        ) : null}
+        {settingsOpen ? (
+          <Suspense fallback={<LazyModalFallback className="settings-dialog" />}>
+            <SettingsDialog
+              open={settingsOpen}
+              preferences={preferences}
+              effectiveLocale={effectiveLocale}
+              effectiveTheme={effectiveTheme}
+              onPreferencesChange={handlePreferencesChange}
+              onClose={() => setSettingsOpen(false)}
+            />
+          </Suspense>
+        ) : null}
         <DaemonStatusPanel
           status={daemonStatus}
           cpuHistory={daemonCpuHistory}
@@ -3961,6 +4003,67 @@ function useMobileLayout(): boolean {
   return isMobileLayout;
 }
 
+function useMobileTerminalInputMode(isMobileLayout: boolean): boolean {
+  const getSnapshot = () => {
+    if (isMobileLayout) {
+      return true;
+    }
+    if (typeof window === "undefined") {
+      return false;
+    }
+    const navigatorLike = window.navigator as Navigator & { maxTouchPoints?: number };
+    const hasTouchPoints = (navigatorLike.maxTouchPoints ?? 0) > 0;
+    const hasTouchEvent = "ontouchstart" in window;
+    const hasCoarsePointer =
+      typeof window.matchMedia === "function" &&
+      window.matchMedia("(pointer: coarse)").matches;
+    // 中文注释：布局是否进入移动版只看宽度；但软键盘输入保护应覆盖横屏手机、
+    // 折叠屏和平板这类宽屏触摸设备，否则 window.blur 会按桌面逻辑主动收起键盘。
+    return hasTouchPoints || hasTouchEvent || hasCoarsePointer;
+  };
+
+  const [mobileInputMode, setMobileInputMode] = useState(getSnapshot);
+
+  useEffect(() => {
+    if (isMobileLayout) {
+      setMobileInputMode(true);
+      return undefined;
+    }
+    if (typeof window === "undefined") {
+      setMobileInputMode(false);
+      return undefined;
+    }
+
+    const coarsePointerQuery =
+      typeof window.matchMedia === "function"
+        ? window.matchMedia("(pointer: coarse)")
+        : undefined;
+    const update = () => setMobileInputMode(getSnapshot());
+    update();
+    window.addEventListener("resize", update);
+    if (coarsePointerQuery) {
+      if (typeof coarsePointerQuery.addEventListener === "function") {
+        coarsePointerQuery.addEventListener("change", update);
+      } else {
+        coarsePointerQuery.addListener(update);
+      }
+    }
+    return () => {
+      window.removeEventListener("resize", update);
+      if (!coarsePointerQuery) {
+        return;
+      }
+      if (typeof coarsePointerQuery.removeEventListener === "function") {
+        coarsePointerQuery.removeEventListener("change", update);
+      } else {
+        coarsePointerQuery.removeListener(update);
+      }
+    };
+  }, [isMobileLayout]);
+
+  return mobileInputMode;
+}
+
 function useSystemTheme(): "dark" | "light" {
   const getSnapshot = () => {
     if (typeof window === "undefined" || typeof window.matchMedia !== "function") {
@@ -3989,17 +4092,18 @@ function useSystemTheme(): "dark" | "light" {
   return systemTheme;
 }
 
-function useVisualViewportMetrics(enabled: boolean): { height: number; offsetTop: number; keyboardInset: number; keyboardOpen: boolean } {
+function useVisualViewportMetrics(enabled: boolean): { width: number; height: number; offsetTop: number; keyboardInset: number; keyboardOpen: boolean } {
   const metricsFromWindow = () => {
     if (typeof window === "undefined") {
-      return { height: 0, offsetTop: 0, keyboardInset: 0, keyboardOpen: false };
+      return { width: 0, height: 0, offsetTop: 0, keyboardInset: 0, keyboardOpen: false };
     }
     const viewport = window.visualViewport;
+    const width = Math.round(viewport?.width ?? window.innerWidth);
     const height = Math.round(viewport?.height ?? window.innerHeight);
     const offsetTop = Math.round(viewport?.offsetTop ?? 0);
     const keyboardInset = Math.max(0, Math.round(window.innerHeight - height - offsetTop));
     // 地址栏收缩也会改变 visualViewport，高度差超过常见工具栏后才按软键盘处理。
-    return { height, offsetTop, keyboardInset, keyboardOpen: keyboardInset >= 80 };
+    return { width, height, offsetTop, keyboardInset, keyboardOpen: keyboardInset >= 80 };
   };
   const [metrics, setMetrics] = useState(metricsFromWindow);
 
@@ -4011,7 +4115,8 @@ function useVisualViewportMetrics(enabled: boolean): { height: number; offsetTop
     const updateMetrics = () =>
       setMetrics((current) => {
         const next = metricsFromWindow();
-        return current.height === next.height &&
+        return current.width === next.width &&
+          current.height === next.height &&
           current.offsetTop === next.offsetTop &&
           current.keyboardInset === next.keyboardInset &&
           current.keyboardOpen === next.keyboardOpen
@@ -4031,7 +4136,13 @@ function useVisualViewportMetrics(enabled: boolean): { height: number; offsetTop
 
   return metrics.height
     ? metrics
-    : { height: typeof window === "undefined" ? 0 : window.innerHeight, offsetTop: 0, keyboardInset: 0, keyboardOpen: false };
+    : {
+        width: typeof window === "undefined" ? 0 : window.innerWidth,
+        height: typeof window === "undefined" ? 0 : window.innerHeight,
+        offsetTop: 0,
+        keyboardInset: 0,
+        keyboardOpen: false,
+      };
 }
 
 function clampFilesPanelWidth(width: number, viewportWidth: number): number {

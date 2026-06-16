@@ -65,6 +65,7 @@ type MockTerminalControl = {
   viewportY: () => number;
   baseY: () => number;
   scrollToLine: (line: number) => void;
+  forceCursorPosition: (cursorY: number) => void;
   forceSelectionPosition: (position: TerminalSelectionPosition | undefined) => void;
 };
 
@@ -286,6 +287,15 @@ vi.mock("@xterm/xterm", () => {
         viewportY: () => this.buffer.active.viewportY,
         baseY: () => this.buffer.active.baseY,
         scrollToLine: (line) => this.scrollToLine(line),
+        forceCursorPosition: (cursorY) => {
+          this.absoluteCursorY = Math.max(
+            0,
+            Math.min(this.buffer.active.length - 1, this.buffer.active.baseY + cursorY),
+          );
+          this.syncCursorWindow();
+          this.cursorMoveListeners.forEach((listener) => listener());
+          this.scrollListeners.forEach((listener) => listener(this.buffer.active.viewportY));
+        },
         forceSelectionPosition: (position) => {
           this.selectionPosition = position
             ? {

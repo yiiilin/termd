@@ -5,22 +5,29 @@ interface InstallTerminalFocusResizeListenersOptions {
   host: HTMLElement;
   focusOutSettleMs: number;
   isPassiveInputTarget?: (target: EventTarget | null) => boolean;
+  isMobileInputMode?: () => boolean;
+  isMobileKeyboardOpen?: () => boolean;
   reportTerminalFocus: (focused: boolean) => void;
   queueCursorReport: (options?: { immediate?: boolean }) => void;
+  restoreTerminalInputFocus?: () => void;
   scheduleScrollToBottomIfPinned: () => void;
   resize: (source?: "layout" | "focus" | "session" | "snapshot" | "mobile-viewport") => void;
 }
 
+const MOBILE_INPUT_FOCUS_RESCUE_MS = 700;
+const MOBILE_INPUT_FOCUS_RESTORE_DELAYS_MS = [0, 16, 48, 120, 240] as const;
+
 export function useTerminalFocusResizeState() {
   const focusedRef = useRef(false);
   const clientSizeRef = useRef<TerminalSize | undefined>(undefined);
-  const mobileViewportResizeOwnerRef = useRef(false);
   const focusActivationArmedRef = useRef(false);
   const passiveFocusBypassRef = useRef(false);
   const passiveInputFocusRef = useRef(false);
   const suppressPassiveFocusRef = useRef(false);
   const windowActiveRef = useRef(true);
   const focusOutTimerRef = useRef<number | undefined>(undefined);
+  const mobileInputFocusRescueUntilRef = useRef(0);
+  const mobileInputFocusRestoreTimersRef = useRef<number[]>([]);
   const [focused, setFocused] = useState(false);
 
   const clearPendingFocusOut = useCallback(() => {
@@ -31,16 +38,148 @@ export function useTerminalFocusResizeState() {
     focusOutTimerRef.current = undefined;
   }, []);
 
+  const armMobileInputFocusRescue = useCallback(() => {
+    mobileInputFocusRescueUntilRef.current = Date.now() + MOBILE_INPUT_FOCUS_RESCUE_MS;
+  }, []);
+
+  const mobileInputFocusRescueActive = useCallback(() => (
+    Date.now() <= mobileInputFocusRescueUntilRef.current
+  ), []);
+
   const installTerminalFocusResizeListeners = useCallback((options: InstallTerminalFocusResizeListenersOptions) => {
+    const isMobileInputModeEnabled = () => Boolean(options.isMobileInputMode?.());
+    const isMobileKeyboardOpenFromProps = () => Boolean(options.isMobileKeyboardOpen?.());
+    const clearMobileInputFocusRescue = () => {
+      mobileInputFocusRescueUntilRef.current = 0;
+    };
+    const mobileInputFocusRescueActiveForListeners = () =>
+      isMobileInputModeEnabled() && mobileInputFocusRescueActive();
+    const clearScheduledMobileInputFocusRestore = () => {
+      for (const timer of mobileInputFocusRestoreTimersRef.current) {
+        window.clearTimeout(timer);
+      }
+      mobileInputFocusRestoreTimersRef.current = [];
+    };
     const blurActiveTerminalElement = () => {
       const activeElement = document.activeElement;
       if (activeElement instanceof HTMLElement && options.host.contains(activeElement)) {
         activeElement.blur();
       }
     };
-    const handleFocusIn = (event: FocusEvent) => {
+    const commitFocusOutIfStillOutsideHost = () => {
+      const activeElement = document.activeElement;
+      if (activeElement instanceof HTMLElement && options.host.contains(activeElement)) {
+        return;
+      }
+      if (shouldRestoreMobileInputFocus()) {
+        scheduleMobileInputFocusRestore();
+        return;
+      }
+      passiveFocusBypassRef.current = false;
+      passiveInputFocusRef.current = false;
+      focusActivationArmedRef.current = false;
+      windowActiveRef.current = false;
+      clearMobileInputFocusRescue();
+      options.reportTerminalFocus(false);
+      blurActiveTerminalElement();
+    };
+    const isProbablyMobileKeyboardOpen = () => {
+      const viewport = window.visualViewport;
+      if (!viewport) {
+        return false;
+      }
+      const viewportHeight = Math.round(viewport.height ?? window.innerHeight);
+      const viewportOffsetTop = Math.round(viewport.offsetTop ?? 0);
+      const keyboardInset = Math.max(0, Math.round(window.innerHeight - viewportHeight - viewportOffsetTop));
+      return keyboardInset >= 80;
+    };
+    const isMobileKeyboardLikelyOpen = () => isMobileKeyboardOpenFromProps() || isProbablyMobileKeyboardOpen();
+    const mobileInputOwnershipActive = () => (
+      focusedRef.current ||
+      focusOutTimerRef.current !== undefined ||
+      passiveInputFocusRef.current ||
+      focusActivationArmedRef.current ||
+      isMobileKeyboardLikelyOpen() ||
+      mobileInputFocusRescueActiveForListeners()
+    );
+    const isMobileTransientFocusTransition = () => {
+      if (!isMobileInputModeEnabled()) {
+        return false;
+      }
+      return mobileInputOwnershipActive();
+    };
+    const shouldRestoreMobileInputFocus = () => {
+      if (!isMobileInputModeEnabled()) {
+        return false;
+      }
+      if (document.visibilityState === "hidden") {
+        return false;
+      }
+      if (!mobileInputOwnershipActive()) {
+        return false;
+      }
+      const activeElement = document.activeElement;
+      if (!(activeElement instanceof HTMLElement)) {
+        return false;
+      }
+      if (options.isPassiveInputTarget?.(activeElement)) {
+        return false;
+      }
+      return (
+        activeElement === document.body ||
+        activeElement === document.documentElement ||
+        options.host.contains(activeElement)
+      );
+    };
+    const restoreMobileInputFocusIfNeeded = () => {
+      if (!shouldRestoreMobileInputFocus()) {
+        return false;
+      }
+      options.restoreTerminalInputFocus?.();
+      return true;
+    };
+    const scheduleMobileInputFocusRestore = () => {
+      if (!isMobileInputModeEnabled() || document.visibilityState === "hidden") {
+        return;
+      }
+      clearScheduledMobileInputFocusRestore();
+      for (const delay of MOBILE_INPUT_FOCUS_RESTORE_DELAYS_MS) {
+        const timer = window.setTimeout(() => {
+          mobileInputFocusRestoreTimersRef.current = mobileInputFocusRestoreTimersRef.current.filter((item) => item !== timer);
+          if (!restoreMobileInputFocusIfNeeded()) {
+            return;
+          }
+          const activeElement = document.activeElement;
+          if (activeElement instanceof HTMLElement && options.isPassiveInputTarget?.(activeElement)) {
+            clearScheduledMobileInputFocusRestore();
+          }
+        }, delay);
+        mobileInputFocusRestoreTimersRef.current.push(timer);
+      }
+    };
+    const scheduleFocusOutCommit = () => {
       clearPendingFocusOut();
+      focusOutTimerRef.current = window.setTimeout(() => {
+        focusOutTimerRef.current = undefined;
+        commitFocusOutIfStillOutsideHost();
+      }, options.focusOutSettleMs);
+    };
+    const handleFocusIn = (event: FocusEvent) => {
+      const passiveInputTargetFocused = options.isPassiveInputTarget?.(event.target) ?? false;
+      clearPendingFocusOut();
+      if (passiveInputTargetFocused) {
+        clearScheduledMobileInputFocusRestore();
+      }
       if (!windowActiveRef.current) {
+        if (isMobileInputModeEnabled()) {
+          windowActiveRef.current = true;
+          passiveFocusBypassRef.current = false;
+          suppressPassiveFocusRef.current = false;
+          if (focusedRef.current || passiveInputFocusRef.current) {
+            scheduleMobileInputFocusRestore();
+          }
+          return;
+        }
         passiveFocusBypassRef.current = false;
         passiveInputFocusRef.current = false;
         focusedRef.current = false;
@@ -50,7 +189,6 @@ export function useTerminalFocusResizeState() {
         return;
       }
       const allowPassiveFocusBypass = passiveFocusBypassRef.current;
-      const passiveInputTargetFocused = options.isPassiveInputTarget?.(event.target) ?? false;
       if (
         passiveInputFocusRef.current &&
         !focusActivationArmedRef.current &&
@@ -103,35 +241,79 @@ export function useTerminalFocusResizeState() {
         // 再次当成 suppression 违规处理，移动端输入法就接不住了。
         return;
       }
-      passiveFocusBypassRef.current = false;
-      passiveInputFocusRef.current = false;
-      focusActivationArmedRef.current = false;
+      if (shouldRestoreMobileInputFocus()) {
+        // 中文注释：移动端软键盘打开时，helper textarea 可能先被浏览器落到 body/html，
+        // 这里必须立刻把输入焦点拉回去，避免键盘因为“看起来失焦”被系统直接收回。
+        scheduleMobileInputFocusRestore();
+        return;
+      }
       if (!focusedRef.current || focusOutTimerRef.current !== undefined) {
         return;
       }
-      // 浏览器窗口 resize、移动端视觉视口变化和 xterm 内部重排都可能短暂触发
-      // focusout -> focusin。延迟确认失焦，避免把这种瞬时 DOM 抖动上报成
-      // operator 在 focused/blurred 之间来回切换。
-      focusOutTimerRef.current = window.setTimeout(() => {
-        focusOutTimerRef.current = undefined;
-        options.reportTerminalFocus(false);
-      }, options.focusOutSettleMs);
+      // 中文注释：移动端软键盘打开/收起时，浏览器可能先给出一次表面上的 focusout，
+      // 但 hidden textarea 还在接管输入中。这里先把失焦确认挂起，等 settle 窗口过后
+      // 再确认 activeElement 是否真的离开了终端。
+      scheduleFocusOutCommit();
     };
     const handleWindowBlur = () => {
-      windowActiveRef.current = false;
+      if (document.visibilityState === "hidden") {
+        clearPendingFocusOut();
+        clearScheduledMobileInputFocusRestore();
+        passiveFocusBypassRef.current = false;
+        passiveInputFocusRef.current = false;
+        focusActivationArmedRef.current = false;
+        windowActiveRef.current = false;
+        clearMobileInputFocusRescue();
+        // 真实浏览器切到另一个窗口后，旧窗口的 textarea 可能仍留着 DOM focus。
+        // 这里立即撤销 operator 聚焦态，避免旧窗口继续按自己的布局上报 PTY resize。
+        options.reportTerminalFocus(false);
+        blurActiveTerminalElement();
+        return;
+      }
+      if (isMobileInputModeEnabled()) {
+        if (shouldRestoreMobileInputFocus()) {
+          // 中文注释：移动端只要 helper textarea 还应该维持输入态，就不要把 window blur
+          // 当成真正失焦。部分浏览器在 window blur 事件栈里会忽略同步 focus，
+          // 因此这里短时间重试，等系统键盘/visualViewport 稳定后再把输入 sink 拉回。
+          scheduleMobileInputFocusRestore();
+          return;
+        }
+        // 中文注释：移动端 window.blur 很多时候只是软键盘弹出/收起的中间态，
+        // 这时不要立刻走桌面的“真失焦”路径，否则 helper textarea 会被我们自己
+        // 主动 blur 掉，系统键盘会立刻合上。
+        scheduleFocusOutCommit();
+        return;
+      }
+      if (isMobileTransientFocusTransition()) {
+        // 中文注释：移动端系统键盘打开时，浏览器可能短暂派发 window blur。
+        // 这类 blur 不能直接当成真实失焦，需要和 focusout 一样先做确认。
+        scheduleFocusOutCommit();
+        return;
+      }
+      clearPendingFocusOut();
       passiveFocusBypassRef.current = false;
       passiveInputFocusRef.current = false;
       focusActivationArmedRef.current = false;
-      mobileViewportResizeOwnerRef.current = false;
+      windowActiveRef.current = false;
       suppressPassiveFocusRef.current = true;
-      clearPendingFocusOut();
-      // 真实浏览器切到另一个窗口后，旧窗口的 textarea 可能仍留着 DOM focus。
-      // 这里立即撤销 operator 聚焦态，避免旧窗口继续按自己的布局上报 PTY resize。
+      clearMobileInputFocusRescue();
+      // 这里是桌面窗口切换或真正失焦，必须立即撤销 operator 聚焦态。
       options.reportTerminalFocus(false);
       blurActiveTerminalElement();
     };
     const handleWindowFocus = () => {
+      const recoveringFromTransientBlur = isMobileTransientFocusTransition();
       windowActiveRef.current = true;
+      clearPendingFocusOut();
+      if (recoveringFromTransientBlur) {
+        // 中文注释：这是移动端软键盘弹出过程中常见的短暂 window blur/focus 抖动，
+        // 不能把它当成真正失焦来重置 passive/helper 状态。
+        suppressPassiveFocusRef.current = false;
+        if (focusedRef.current || passiveInputFocusRef.current) {
+          scheduleMobileInputFocusRestore();
+        }
+        return;
+      }
       passiveFocusBypassRef.current = false;
       passiveInputFocusRef.current = false;
       focusActivationArmedRef.current = false;
@@ -154,6 +336,8 @@ export function useTerminalFocusResizeState() {
 
     return () => {
       clearPendingFocusOut();
+      clearScheduledMobileInputFocusRestore();
+      clearMobileInputFocusRescue();
       window.removeEventListener("blur", handleWindowBlur);
       window.removeEventListener("focus", handleWindowFocus);
       document.removeEventListener("visibilitychange", handleVisibilityChange);
@@ -167,7 +351,6 @@ export function useTerminalFocusResizeState() {
     setFocused,
     focusedRef,
     clientSizeRef,
-    mobileViewportResizeOwnerRef,
     focusActivationArmedRef,
     passiveFocusBypassRef,
     passiveInputFocusRef,
@@ -175,6 +358,8 @@ export function useTerminalFocusResizeState() {
     windowActiveRef,
     focusOutTimerRef,
     clearPendingFocusOut,
+    armMobileInputFocusRescue,
+    mobileInputFocusRescueActive,
     installTerminalFocusResizeListeners,
   };
 }

@@ -11,6 +11,10 @@ describe("mobile layout regressions", () => {
     expect(css).toContain("top: var(--termd-visual-viewport-offset-top, 0px);");
     expect(css).toContain(".app-shell.mobile-keyboard-open .workspace {\n    grid-template-rows: 42px minmax(0, 1fr);");
     expect(css).toContain(".app-shell.mobile-keyboard-open .daemon-status-strip {\n    display: none;");
+    expect(css).not.toContain(".app-shell.mobile-keyboard-open .terminal-pane {\n    grid-template-rows: minmax(0, 1fr) 42px;");
+    const mobileShortcutsBlock = css.match(/\.terminal-mobile-shortcuts \{[^}]+\}/)?.[0] ?? "";
+    expect(mobileShortcutsBlock).toContain("position: absolute;");
+    expect(mobileShortcutsBlock).toContain("bottom: 0;");
     expect(css).toContain(".terminal-host {\n    min-width: 0;\n    overflow: hidden;\n    max-width: 100%;");
     expect(css).toContain(".terminal-host .xterm,\n.terminal-host .xterm-screen,\n.terminal-host .xterm-viewport {\n  width: 100%;\n  height: 100%;");
     const terminalSurfaceBlock =

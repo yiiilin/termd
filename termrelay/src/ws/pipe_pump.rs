@@ -445,7 +445,6 @@ impl EndpointCloseReceiver {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum RelayOutbound {
     Frame(OpaqueFrame),
-    Ping(Vec<u8>),
     Pong(Vec<u8>),
     Close,
 }
@@ -454,7 +453,6 @@ impl RelayOutbound {
     pub(super) fn label(&self) -> &'static str {
         match self {
             Self::Frame(_) => "frame",
-            Self::Ping(_) => "ping",
             Self::Pong(_) => "pong",
             Self::Close => "close",
         }
@@ -463,7 +461,6 @@ impl RelayOutbound {
     pub(super) fn frame_kind(&self) -> &'static str {
         match self {
             Self::Frame(frame) => frame.kind(),
-            Self::Ping(_) => "ping",
             Self::Pong(_) => "pong",
             Self::Close => "close",
         }
@@ -472,7 +469,7 @@ impl RelayOutbound {
     pub(super) fn queued_data_bytes(&self) -> usize {
         match self {
             Self::Frame(frame) => frame.len(),
-            Self::Ping(_) | Self::Pong(_) | Self::Close => 0,
+            Self::Pong(_) | Self::Close => 0,
         }
     }
 }
@@ -480,7 +477,6 @@ impl RelayOutbound {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PreparedRelayOutbound {
     Frame(OpaqueFrame),
-    Ping(Vec<u8>),
     Pong(Vec<u8>),
     Close,
 }
@@ -503,18 +499,6 @@ async fn send_relay_outbound(
     match prepare_relay_outbound(outbound) {
         PreparedRelayOutbound::Frame(frame) => {
             send_relay_opaque_frame(sender, server_id, role, connection_id, frame, channel).await
-        }
-        PreparedRelayOutbound::Ping(payload) => {
-            match send_relay_established_message(
-                sender,
-                Message::Ping(payload),
-                "relay websocket ping",
-            )
-            .await
-            {
-                Ok(()) => RelayWriteResult::Sent,
-                Err(()) => RelayWriteResult::Failed,
-            }
         }
         PreparedRelayOutbound::Pong(payload) => {
             match send_relay_established_message(
@@ -544,7 +528,6 @@ async fn send_relay_outbound(
 fn prepare_relay_outbound(outbound: RelayOutbound) -> PreparedRelayOutbound {
     match outbound {
         RelayOutbound::Frame(frame) => PreparedRelayOutbound::Frame(frame),
-        RelayOutbound::Ping(payload) => PreparedRelayOutbound::Ping(payload),
         RelayOutbound::Pong(payload) => PreparedRelayOutbound::Pong(payload),
         RelayOutbound::Close => PreparedRelayOutbound::Close,
     }

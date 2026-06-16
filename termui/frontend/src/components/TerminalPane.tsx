@@ -37,6 +37,7 @@ const MOBILE_DIRECTION_CANCEL_PX = 10;
 const MOBILE_SCROLL_DEAD_ZONE_PX = 12;
 const MOBILE_SCROLL_STEP_DIVISOR = 1.2;
 const MOBILE_COMPOSITION_SETTLE_MS = 80;
+const MOBILE_KEYBOARD_RESIZE_SUPPRESS_MS = 700;
 const TERMINAL_BOTTOM_EPSILON = 1;
 const TERMINAL_SERVER_SCROLLBACK_RESYNC_MIN_BYTES = 8 * 1024;
 const TERMINAL_SERVER_SCROLLBACK_RESYNC_USER_MIN_BYTES = 1024;
@@ -64,9 +65,9 @@ type ResizeSource = "layout" | "focus" | "session" | "snapshot" | "mobile-viewpo
 const RESIZE_SOURCE_PRIORITY: Record<ResizeSource, number> = {
   snapshot: 0,
   session: 1,
+  "mobile-viewport": 1,
   layout: 2,
   focus: 3,
-  "mobile-viewport": 3,
 };
 type MobileDirection = "up" | "down" | "left" | "right";
 type MobileDirectionTier = 1 | 2 | 3;
@@ -120,6 +121,7 @@ interface TerminalPaneProps {
   focusRequest?: number;
   mobileInputMode?: boolean;
   mobileKeyboardOpen?: boolean;
+  mobileViewportWidth?: number;
   mobileViewportHeight?: number;
   mobileViewportOffsetTop?: number;
   theme?: EffectiveTheme;
@@ -135,6 +137,10 @@ interface TerminalPaneProps {
   onInput: (data: string) => void;
   onResize: (size: TerminalSize) => void;
   onCursorChange?: (presence: SessionCursorPresence) => void;
+}
+
+interface FocusTerminalInputSinkOptions {
+  force?: boolean;
 }
 
 export function TerminalPane(props: TerminalPaneProps) {
@@ -161,6 +167,7 @@ export function TerminalPane(props: TerminalPaneProps) {
   const confirmedSessionSizeRef = useRef(props.sessionSize);
   const mobileInputModeRef = useRef(Boolean(props.mobileInputMode));
   const mobileKeyboardOpenRef = useRef(Boolean(props.mobileKeyboardOpen));
+  const mobileCursorVisibleRowsRef = useRef<number | undefined>(undefined);
   const resizeRef = useRef<((source?: ResizeSource) => void) | undefined>(undefined);
   const stabilizeRef = useRef<((source?: ResizeSource) => void) | undefined>(undefined);
   const pendingResizeAfterSnapshotRef = useRef<ResizeSource | undefined>(undefined);
@@ -202,6 +209,8 @@ export function TerminalPane(props: TerminalPaneProps) {
     lastClientY: number;
     active: boolean;
   } | undefined>(undefined);
+  const mobilePointerDownInputFocusRef = useRef(false);
+  const mobileKeyboardResizeSuppressUntilRef = useRef(0);
   const passiveFocusBypassTimerRef = useRef<number | undefined>(undefined);
   const lastNativePasteRef = useRef<{ text: string; atMs: number } | undefined>(undefined);
   const pendingPasteShortcutRef = useRef<{
@@ -242,6 +251,16 @@ export function TerminalPane(props: TerminalPaneProps) {
   const terminalResizeReportPassesRef = useRef(0);
   const terminalResizeReportSizeRef = useRef<TerminalSize | undefined>(undefined);
   const terminalResizeReportSourceRef = useRef<ResizeSource | undefined>(undefined);
+  const mobileViewportLayoutSuppressRef = useRef(false);
+  const previousMobileViewportMetricsRef = useRef<
+    | {
+        keyboardOpen: boolean;
+        width?: number;
+        height?: number;
+        offsetTop?: number;
+      }
+    | undefined
+  >(undefined);
   const pendingSnapshotHistoryRepairRef = useRef<
     | {
         snapshotRows: number;
@@ -278,7 +297,6 @@ export function TerminalPane(props: TerminalPaneProps) {
     setFocused,
     focusedRef,
     clientSizeRef,
-    mobileViewportResizeOwnerRef,
     focusActivationArmedRef,
     passiveFocusBypassRef,
     passiveInputFocusRef,
@@ -286,6 +304,8 @@ export function TerminalPane(props: TerminalPaneProps) {
     windowActiveRef,
     focusOutTimerRef,
     clearPendingFocusOut,
+    armMobileInputFocusRescue,
+    mobileInputFocusRescueActive,
     installTerminalFocusResizeListeners,
   } = useTerminalFocusResizeState();
   const {
@@ -309,6 +329,92 @@ export function TerminalPane(props: TerminalPaneProps) {
   const deferredFrameIdRef = useRef(0);
   const deferredFrameHandlesByIdRef = useRef<Map<number, DeferredTerminalFrameHandle>>(new Map());
   const deferredFrameHandlesRef = useRef<Set<DeferredTerminalFrameHandle>>(new Set());
+
+  const readCurrentMobileViewportMetrics = (keyboardOpenFallback = mobileKeyboardOpenRef.current) => {
+    if (typeof window === "undefined") {
+      return undefined;
+    }
+    const viewport = window.visualViewport;
+    if (!viewport) {
+      return undefined;
+    }
+    const width = Math.round(viewport?.width ?? window.innerWidth);
+    const height = Math.round(viewport?.height ?? window.innerHeight);
+    const offsetTop = Math.round(viewport?.offsetTop ?? 0);
+    const keyboardInset = Math.max(0, Math.round(window.innerHeight - height - offsetTop));
+    return {
+      keyboardOpen: keyboardInset >= 80 || keyboardOpenFallback,
+      width,
+      height,
+      offsetTop,
+    };
+  };
+
+  const rememberMobileViewportMetrics = (
+    nextViewportMetrics: { keyboardOpen: boolean; width?: number; height?: number; offsetTop?: number },
+    options: { suppressLayout: boolean },
+  ) => {
+    const previousViewportMetrics = previousMobileViewportMetricsRef.current;
+    previousMobileViewportMetricsRef.current = nextViewportMetrics;
+    if (!options.suppressLayout || !previousViewportMetrics) {
+      return;
+    }
+    const widthChanged =
+      previousViewportMetrics.width !== undefined &&
+      nextViewportMetrics.width !== undefined &&
+      previousViewportMetrics.width !== nextViewportMetrics.width;
+    if (widthChanged) {
+      // 中文注释：横竖屏切换或真实移动端 layout 宽度变化必须继续上报 PTY resize。
+      // 这类变化也会伴随 visualViewport 事件，但不能被当成软键盘 height-only 变化吞掉。
+      mobileViewportLayoutSuppressRef.current = false;
+      return;
+    }
+    if (
+      previousViewportMetrics.keyboardOpen !== nextViewportMetrics.keyboardOpen ||
+      previousViewportMetrics.height !== nextViewportMetrics.height ||
+      previousViewportMetrics.offsetTop !== nextViewportMetrics.offsetTop
+    ) {
+      // 中文注释：真实移动浏览器常把同一次软键盘/visualViewport 变化同时派发成
+      // visualViewport resize、window resize 和 ResizeObserver。后一类事件会以
+      // "layout" 进入 resize；这里只 suppress 宽度不变的 height/offset/keyboard
+      // 变化，把它们并入纯前端 viewport 刷新。不能只用短时间窗，否则慢一拍的
+      // ResizeObserver 或 snapshot 收尾仍会把软键盘变化写回 shared PTY。
+      mobileViewportLayoutSuppressRef.current = true;
+    }
+  };
+
+  const refreshMobileViewportLayoutSuppressFromWindow = () => {
+    if (!mobileInputModeRef.current) {
+      return;
+    }
+    const nextViewportMetrics = readCurrentMobileViewportMetrics();
+    if (!nextViewportMetrics) {
+      return;
+    }
+    rememberMobileViewportMetrics(nextViewportMetrics, { suppressLayout: true });
+  };
+
+  const armMobileKeyboardResizeSuppress = () => {
+    mobileKeyboardResizeSuppressUntilRef.current = Date.now() + MOBILE_KEYBOARD_RESIZE_SUPPRESS_MS;
+  };
+
+  const clearMobileKeyboardResizeSuppress = () => {
+    mobileKeyboardResizeSuppressUntilRef.current = 0;
+  };
+
+  const mobileKeyboardResizeSuppressActive = () => (
+    Date.now() <= mobileKeyboardResizeSuppressUntilRef.current
+  );
+
+  const mouseEventCameFromTouch = (event: globalThis.MouseEvent | MouseEvent<HTMLDivElement>) => {
+    type TouchSourceMouseEvent = globalThis.MouseEvent & {
+      sourceCapabilities?: { firesTouchEvents?: boolean };
+    };
+    const sourceCapabilities = "nativeEvent" in event
+      ? (event.nativeEvent as TouchSourceMouseEvent).sourceCapabilities
+      : (event as TouchSourceMouseEvent).sourceCapabilities;
+    return Boolean(sourceCapabilities?.firesTouchEvents);
+  };
 
   const cancelDeferredTerminalFrame = (frameId: number | undefined) => {
     if (frameId === undefined) {
@@ -653,6 +759,119 @@ export function TerminalPane(props: TerminalPaneProps) {
       bottomScrollProgrammaticRef.current = false;
     }
   };
+  const resetMobileCursorViewportWindow = () => {
+    mobileCursorVisibleRowsRef.current = undefined;
+    const scrollport = scrollportRef.current;
+    if (scrollport) {
+      scrollport.scrollTop = 0;
+    }
+    canvasRef.current?.style.removeProperty("height");
+    canvasRef.current?.style.removeProperty("min-height");
+    frameRef.current?.style.removeProperty("height");
+    frameRef.current?.style.removeProperty("min-height");
+  };
+  const visibleRowsForMobileCursorCenter = (terminal: TerminalRendererTerminal) => {
+    const proposedRows = fitRef.current?.proposeDimensions?.()?.rows;
+    if (
+      proposedRows !== undefined &&
+      Number.isFinite(proposedRows) &&
+      proposedRows > 0 &&
+      proposedRows < terminal.rows
+    ) {
+      // 中文注释：移动端软键盘打开时，我们故意不 resize xterm/session rows，
+      // 但 fit proposal 仍能代表键盘上方真正可见的终端行数。光标居中应使用
+      // 这个本地可视高度，而不是仍用完整 PTY 网格高度。
+      const visibleRows = clampNumber(Math.floor(proposedRows), 1, Math.max(1, terminal.rows));
+      mobileCursorVisibleRowsRef.current = visibleRows;
+      return visibleRows;
+    }
+    if (mobileCursorVisibleRowsRef.current) {
+      return mobileCursorVisibleRowsRef.current;
+    }
+    const visibleRows =
+      proposedRows !== undefined && Number.isFinite(proposedRows) && proposedRows > 0
+        ? clampNumber(Math.floor(proposedRows), 1, Math.max(1, terminal.rows))
+        : Math.max(1, terminal.rows);
+    mobileCursorVisibleRowsRef.current = visibleRows;
+    return visibleRows;
+  };
+  const syncMobileCursorViewportWindow = (
+    terminal: TerminalRendererTerminal,
+    visibleRows: number,
+    cursorAbsoluteLine: number,
+  ) => {
+    const scrollport = scrollportRef.current;
+    const canvas = canvasRef.current;
+    const frame = frameRef.current;
+    const host = hostRef.current;
+    if (!scrollport || !canvas || !frame || !host || visibleRows <= 0 || terminal.rows <= 0) {
+      return;
+    }
+    const hostStyle = window.getComputedStyle(host);
+    const insetTop = Number.parseFloat(hostStyle.top || "0") || 0;
+    const insetBottom = Number.parseFloat(hostStyle.bottom || "0") || 0;
+    const visibleWindowHeight = Math.max(
+      0,
+      scrollport.clientHeight - insetTop - insetBottom,
+    );
+    const rowHeight = visibleWindowHeight > 0 ? visibleWindowHeight / visibleRows : 0;
+    if (!Number.isFinite(rowHeight) || rowHeight <= 0) {
+      return;
+    }
+    const fullGridHeight = Math.ceil(rowHeight * terminal.rows + insetTop + insetBottom);
+    const bottomSpacerHeight = Math.ceil(rowHeight * Math.floor(visibleRows / 2));
+    // 中文注释：底部光标已经处于 xterm scrollback 的最后一屏时，scrollToLine 无法再把
+    // 内容往上推。这里让外层 scrollport 承载“完整终端网格 + 底部留白”，从而只移动
+    // 本地显示窗口，不改变 PTY/session rows，也不触发 resize 上报。
+    frame.style.height = `${fullGridHeight}px`;
+    frame.style.minHeight = `${fullGridHeight}px`;
+    canvas.style.height = `${fullGridHeight + bottomSpacerHeight}px`;
+    canvas.style.minHeight = `${fullGridHeight + bottomSpacerHeight}px`;
+
+    const nextScrollState = rendererRef.current?.scrollState(terminal);
+    const viewportY = nextScrollState?.viewportY ?? terminal.buffer?.active?.viewportY ?? 0;
+    const cursorViewportRow = clampNumber(cursorAbsoluteLine - viewportY, 0, Math.max(0, terminal.rows - 1));
+    const targetScrollTop = Math.max(
+      0,
+      Math.round((cursorViewportRow - Math.floor(visibleRows / 2)) * rowHeight),
+    );
+    const maxScrollTop = Math.max(
+      targetScrollTop,
+      (scrollport.scrollHeight || (fullGridHeight + bottomSpacerHeight)) - scrollport.clientHeight,
+      0,
+    );
+    scrollport.scrollTop = Math.min(targetScrollTop, maxScrollTop);
+  };
+  const centerViewportOnCursor = (terminal = terminalRef.current) => {
+    if (!terminal || !mobileInputModeRef.current || !mobileKeyboardOpenRef.current) {
+      resetMobileCursorViewportWindow();
+      return false;
+    }
+    const scrollState = rendererRef.current?.scrollState(terminal);
+    const activeBuffer = terminal.buffer?.active;
+    if (!scrollState || !activeBuffer || terminal.rows <= 0) {
+      return false;
+    }
+    // 中文注释：cursorY 是当前 viewport 内的相对行号，不是 buffer 绝对行号。
+    // 要把视图居中到输入光标，必须先把它换算成 buffer 绝对行号，
+    // 再把这个绝对行号挪到屏幕中线附近。
+    const cursorRow = Math.max(0, activeBuffer.cursorY);
+    const cursorAbsoluteLine = activeBuffer.baseY + cursorRow;
+    const visibleRows = visibleRowsForMobileCursorCenter(terminal);
+    const targetViewportY = clampNumber(
+      cursorAbsoluteLine - Math.floor(visibleRows / 2),
+      0,
+      scrollState.baseY,
+    );
+    if (Math.abs(scrollState.viewportY - targetViewportY) < TERMINAL_BOTTOM_EPSILON) {
+      syncMobileCursorViewportWindow(terminal, visibleRows, cursorAbsoluteLine);
+      return false;
+    }
+    terminal.scrollToLine(targetViewportY);
+    syncTerminalInputAnchor(terminal, "scroll");
+    syncMobileCursorViewportWindow(terminal, visibleRows, cursorAbsoluteLine);
+    return true;
+  };
   const scheduleScrollToBottom = (generation: number, passes = 2) => {
     if (!isBottomScrollFollowActive(generation)) {
       return;
@@ -682,6 +901,10 @@ export function TerminalPane(props: TerminalPaneProps) {
   };
   const scheduleScrollToBottomIfPinned = (wasPinnedToBottom = isTerminalPinnedToBottom(), passes = 2) => {
     if (terminalRevealHistorySuppressBottomUntilRef.current > nowForThrottle()) {
+      return;
+    }
+    if (mobileInputModeRef.current && mobileKeyboardOpenRef.current) {
+      centerViewportOnCursor();
       return;
     }
     if (wasPinnedToBottom) {
@@ -1347,6 +1570,23 @@ export function TerminalPane(props: TerminalPaneProps) {
       mobileScrollGestureRef.current = undefined;
       return;
     }
+    if (passiveFocusBypassTimerRef.current !== undefined) {
+      window.clearTimeout(passiveFocusBypassTimerRef.current);
+      passiveFocusBypassTimerRef.current = undefined;
+    }
+    // 中文注释：真机软键盘可能在 pointerdown 后、click 前就触发 window blur/focusout。
+    // 这里先打开短暂的 helper textarea 救援窗口，避免这段早到失焦把刚弹出的键盘关掉。
+    windowActiveRef.current = true;
+    passiveFocusBypassRef.current = true;
+    armMobileInputFocusRescue();
+    armMobileKeyboardResizeSuppress();
+    // 中文注释：移动端软键盘只信任用户手势内的 focus。等到 click 或 rAF 再聚焦时，
+    // 部分浏览器会先弹键盘再立刻收起；这里同步把输入 sink 拉起，但仍保持 passive
+    // 状态，真正的 operator 接管和远端 resize 继续留给 click/focusRequest 路径。
+    focusTerminalInputSink(terminalRef.current, {
+      force: !mobileKeyboardOpenRef.current,
+    });
+    mobilePointerDownInputFocusRef.current = true;
     mobileScrollGestureRef.current = {
       pointerId: event.pointerId,
       startX: event.clientX,
@@ -1380,7 +1620,7 @@ export function TerminalPane(props: TerminalPaneProps) {
       // 中文注释：scroll 手势会在 capture 阶段消费后续 pointermove/pointerup，
       // bubble 阶段的方向手势清理不一定能跑到；这里必须主动收回 pointerdown 给
       // helper textarea 的临时 focus 许可，避免滚动后迟到 focus 被误放行。
-      clearPassiveInputFocus();
+      cancelMobilePointerDownInputFocus();
       clearMobileDirectionGesture();
       clearPassiveFocusBypassIfInactive();
     }
@@ -1441,23 +1681,26 @@ export function TerminalPane(props: TerminalPaneProps) {
 
   useEffect(() => props.registerOutputDrain(() => drainOutputRef.current()), [props.registerOutputDrain]);
 
-  useEffect(() => {
-    if (props.mobileInputMode) {
-      return;
-    }
-    mobileViewportResizeOwnerRef.current = false;
-  }, [props.mobileInputMode]);
-
   useLayoutEffect(() => {
+    resetMobileCursorViewportWindow();
     if (!props.mobileInputMode) {
       return;
     }
     // 移动端软键盘会改变 visual viewport；只看 keyboardOpen 布尔值不够，
     // 因为部分浏览器会让 innerHeight 跟着缩放，导致键盘开关前后布尔值都为 false。
     const wasPinnedToBottom = isTerminalPinnedToBottom();
-    stabilizeRef.current?.(hasActiveTerminalFocus() ? "focus" : "mobile-viewport");
+    rememberMobileViewportMetrics(
+      {
+        keyboardOpen: Boolean(props.mobileKeyboardOpen),
+        width: props.mobileViewportWidth,
+        height: props.mobileViewportHeight,
+        offsetTop: props.mobileViewportOffsetTop,
+      },
+      { suppressLayout: true },
+    );
+    stabilizeRef.current?.("mobile-viewport");
     scheduleScrollToBottomIfPinned(wasPinnedToBottom);
-  }, [props.mobileInputMode, props.mobileKeyboardOpen, props.mobileViewportHeight, props.mobileViewportOffsetTop]);
+  }, [props.mobileInputMode, props.mobileKeyboardOpen, props.mobileViewportWidth, props.mobileViewportHeight, props.mobileViewportOffsetTop]);
 
   useEffect(() => {
     if (terminalSelectionDragRef.current?.active || terminalSelectionFocusPendingRef.current) {
@@ -1504,6 +1747,7 @@ export function TerminalPane(props: TerminalPaneProps) {
         col: activeBuffer ? activeBuffer.cursorX + 1 : 1,
         focused: focusedRef.current,
       });
+      centerViewportOnCursor(terminal);
     });
   };
 
@@ -1572,7 +1816,11 @@ export function TerminalPane(props: TerminalPaneProps) {
     onInputRef.current(data);
     queueCursorReport({ immediate: true });
     if (mobileInputModeRef.current) {
-      focusTerminalInputSink();
+      // 中文注释：移动端 beforeinput / paste / 方向手势不一定运行在持有局部 terminal
+      // 变量的闭包里，因此这里必须从 ref 取当前实例，避免输入热路径抛 ReferenceError。
+      focusTerminalInputSink(terminalRef.current, {
+        force: !mobileKeyboardOpenRef.current,
+      });
     }
   };
 
@@ -1658,6 +1906,9 @@ export function TerminalPane(props: TerminalPaneProps) {
     event.stopPropagation();
     focusActivationArmedRef.current = true;
     suppressPassiveFocusRef.current = false;
+    if (mobileInputModeRef.current) {
+      armMobileInputFocusRescue();
+    }
     focusTerminalInputSink();
   };
 
@@ -1722,7 +1973,9 @@ export function TerminalPane(props: TerminalPaneProps) {
       }
     } catch {
       // 剪贴板读取可能被浏览器权限或非安全上下文拒绝；失败时只保持终端焦点。
-      focusTerminalInputSink();
+      focusTerminalInputSink(terminalRef.current, {
+        force: mobileInputModeRef.current && !mobileKeyboardOpenRef.current,
+      });
     } finally {
       if (shortcutId !== undefined && pendingPasteShortcutRef.current?.id === shortcutId) {
         pendingPasteShortcutRef.current = undefined;
@@ -1844,13 +2097,43 @@ export function TerminalPane(props: TerminalPaneProps) {
       clearPassiveFocusBypassIfInactive();
       return;
     }
-    const terminalHost = hostRef.current;
-    const activeElement = document.activeElement;
-    if (terminalHost && activeElement instanceof HTMLElement && terminalHost.contains(activeElement)) {
-      activeElement.blur();
-    }
+    // 中文注释：移动端软键盘刚打开或刚收起时，浏览器经常把 focusout / pointerup / resize
+    // 事件打成一串。这里如果主动把当前 activeElement blur 掉，很多浏览器会直接收回
+    // 系统键盘，造成“点开就自己关闭”的观感。收口时只清内部临时状态，不再反向 blur。
     passiveInputFocusRef.current = false;
     passiveFocusBypassRef.current = false;
+  };
+
+  const shouldPreserveMobileKeyboardFocus = () => (
+    mobileInputModeRef.current &&
+    (mobileKeyboardOpenRef.current || mobileInputFocusRescueActive())
+  );
+
+  const cancelMobilePointerDownInputFocus = () => {
+    if (!mobilePointerDownInputFocusRef.current) {
+      clearPassiveFocusBypassTimer();
+      return;
+    }
+    clearPassiveInputFocus();
+    mobilePointerDownInputFocusRef.current = false;
+    if (mobileInputModeRef.current) {
+      // 中文注释：取消/滚动手势后，helper textarea 可以继续保留 DOM focus 以稳定软键盘，
+      // 但这只是被动输入 sink，不能被 terminalDomHasActiveFocus 误当成 PTY resize 权限。
+      if (focusedRef.current) {
+        reportTerminalFocus(false);
+      }
+      passiveInputFocusRef.current = true;
+      passiveFocusBypassRef.current = false;
+      suppressPassiveFocusRef.current = true;
+    }
+    if (shouldPreserveMobileKeyboardFocus()) {
+      // 中文注释：软键盘弹出链路里可能收到 pointercancel / scroll 误判。
+      // rescue 窗口内绝不主动 blur helper textarea，否则系统键盘会刚弹出就收回。
+      return;
+    }
+    // 中文注释：移动端系统键盘由 helper textarea 的 DOM focus 维持。
+    // pointercancel、滚动和 contextmenu 在真机上可能晚于键盘动画到达；这里只能降级
+    // 内部 resize/input 权限，不能反向 blur 输入 sink，否则键盘会“弹出后立刻收起”。
   };
 
   const handleMobileDirectionPointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
@@ -1900,7 +2183,7 @@ export function TerminalPane(props: TerminalPaneProps) {
       const distance = Math.hypot(deltaX, deltaY);
       if (!gesture.ready) {
         if (distance > MOBILE_DIRECTION_CANCEL_PX) {
-          clearPassiveInputFocus();
+          cancelMobilePointerDownInputFocus();
           clearMobileDirectionGesture();
           clearPassiveFocusBypassIfInactive();
         }
@@ -1963,7 +2246,7 @@ export function TerminalPane(props: TerminalPaneProps) {
     // 中文注释：pointerdown 只允许 click 前的早到 focusin 通过。若整轮触摸结束都没有
     // 真正聚焦终端，就把这次临时放行收回，避免后续 layout/snapshot 误判本地已接管。
     if (event.type === "pointercancel") {
-      clearPassiveInputFocus();
+      cancelMobilePointerDownInputFocus();
       clearPassiveFocusBypassIfInactive();
     } else if (!terminalInputHasDomFocus() && !focusedRef.current && !passiveInputFocusRef.current) {
       clearPassiveFocusBypassTimer();
@@ -1979,7 +2262,7 @@ export function TerminalPane(props: TerminalPaneProps) {
   };
 
   const handleTerminalContextMenu = () => {
-    clearPassiveInputFocus();
+    cancelMobilePointerDownInputFocus();
     clearMobileDirectionGesture();
     clearPassiveFocusBypassIfInactive();
     clearTerminalSelectionDrag();
@@ -2129,9 +2412,6 @@ export function TerminalPane(props: TerminalPaneProps) {
     setFocused(nextFocused);
     if (nextFocused) {
       passiveInputFocusRef.current = false;
-      // 收起移动端软键盘时 textarea 可能先 blur，visualViewport 稍后才恢复。
-      // 只要窗口仍活跃，最后显式聚焦过终端的客户端仍负责把 PTY 尺寸恢复到当前可视高度。
-      mobileViewportResizeOwnerRef.current = true;
     }
     if (!nextFocused) {
       passiveInputFocusRef.current = false;
@@ -2148,18 +2428,29 @@ export function TerminalPane(props: TerminalPaneProps) {
     return rendererRef.current?.getInputElement(host);
   };
 
-  const focusTerminalInputSink = (terminal: TerminalRendererTerminal | null = terminalRef.current) => {
+  const focusTerminalInputSink = (
+    terminal: TerminalRendererTerminal | null = terminalRef.current,
+    options: FocusTerminalInputSinkOptions = {},
+  ) => {
     const input = resolveTerminalInputElement();
     if (!input) {
       terminal?.focus();
       return;
     }
-    if (document.activeElement === input) {
+    const forceRefocus = Boolean(options.force && mobileInputModeRef.current);
+    if (
+      mobileInputModeRef.current &&
+      (focusedRef.current || focusActivationArmedRef.current || mobileKeyboardOpenRef.current || forceRefocus)
+    ) {
+      armMobileInputFocusRescue();
+    }
+    if (document.activeElement === input && !forceRefocus) {
       return;
     }
     terminal?.focus();
     // 中文注释：桌面键盘/IME 输入最终要落到隐藏 textarea；
     // host 只保留给可访问性、selection 和 resize 状态，不作为桌面输入终点。
+    // 移动端重新激活软键盘时也只重复 focus；主动 blur 会让真机系统键盘弹出后立刻收起。
     try {
       input.focus({ preventScroll: true });
     } catch {
@@ -2178,6 +2469,8 @@ export function TerminalPane(props: TerminalPaneProps) {
     passiveInputFocusRef.current = false;
     focusActivationArmedRef.current = false;
     suppressPassiveFocusRef.current = false;
+    mobileViewportLayoutSuppressRef.current = false;
+    mobilePointerDownInputFocusRef.current = false;
     reportTerminalFocus(true);
     resizeRef.current?.(source);
     return true;
@@ -2209,12 +2502,28 @@ export function TerminalPane(props: TerminalPaneProps) {
     // 不会把外层 frame 点击稳定转成内部 textarea 的 focusin，因此这里先同步本地聚焦态。
     focusActivationArmedRef.current = false;
     suppressPassiveFocusRef.current = false;
+    mobileViewportLayoutSuppressRef.current = false;
+    if (mobileInputModeRef.current) {
+      armMobileInputFocusRescue();
+    }
     reportTerminalFocus(true);
-    focusTerminalInputSink();
+    mobilePointerDownInputFocusRef.current = false;
+    focusTerminalInputSink(terminalRef.current, {
+      force: mobileInputModeRef.current && !mobileKeyboardOpenRef.current,
+    });
     resizeRef.current?.("focus");
     // 当前客户端接管 PTY 尺寸时，只在用户本来就在底部时继续贴底。
     // 用户已经上滚查看历史时，点击空白处应该只聚焦终端，不能强行跳到最新输出。
     scheduleScrollToBottomIfPinned(wasPinnedToBottom);
+  };
+
+  const handleTerminalMouseDownCapture = (event: MouseEvent<HTMLDivElement>) => {
+    if (!mobileInputModeRef.current || mouseEventCameFromTouch(event)) {
+      return;
+    }
+    // 中文注释：桌面鼠标点击是明确接管终端的动作，可以结束移动端键盘防抖期。
+    // 真机触摸合成的 mouse 事件会带 sourceCapabilities.firesTouchEvents，不能在这里清掉。
+    clearMobileKeyboardResizeSuppress();
   };
 
   const applyTerminalFocusRequest = (requestId?: number) => {
@@ -2240,6 +2549,11 @@ export function TerminalPane(props: TerminalPaneProps) {
     }
     focusActivationArmedRef.current = true;
     suppressPassiveFocusRef.current = false;
+    mobileViewportLayoutSuppressRef.current = false;
+    clearMobileKeyboardResizeSuppress();
+    if (mobileInputModeRef.current) {
+      armMobileInputFocusRescue();
+    }
     if (promotePassiveInputFocusToActive("focus")) {
       focusTerminalInputSink();
       stabilizeRef.current?.("focus");
@@ -2302,7 +2616,18 @@ export function TerminalPane(props: TerminalPaneProps) {
           windowActiveRef.current = true;
           focusActivationArmedRef.current = true;
           suppressPassiveFocusRef.current = false;
+          if (mobileInputModeRef.current && !mouseEventCameFromTouch(event)) {
+            clearMobileKeyboardResizeSuppress();
+          }
           markTerminalClipboardSelectionOwner();
+          mobileViewportLayoutSuppressRef.current = false;
+          if (mobileInputModeRef.current) {
+            armMobileInputFocusRescue();
+            // 中文注释：移动浏览器要求输入框 focus 发生在触摸/鼠标兼容事件的用户激活链内。
+            // 下方自定义选区会拦截 xterm 默认 mousedown；因此这里先同步执行 xterm 原本
+            // 会做的 helper textarea 聚焦，避免等 click/rAF 时软键盘已经被系统收回。
+            focusTerminalInputSink(terminal);
+          }
           const started = startTerminalSelectionDrag(event.clientX, event.clientY);
           updateTerminalSelectionDebug({
             selectionNativeMouseDownStarted: String(started),
@@ -2332,6 +2657,7 @@ export function TerminalPane(props: TerminalPaneProps) {
           // 但 click 仍然落在终端内容上”的情况，需要在 capture 阶段直接补回焦点。
           // 同时清掉待选区状态，避免测试桩或极端浏览器时序里遗漏 mouseup 后遗留脏监听。
           clearTerminalSelectionDrag();
+          mobileViewportLayoutSuppressRef.current = false;
           focusTerminalInputSink(terminal);
           stabilizeRef.current?.("focus");
         };
@@ -2359,20 +2685,19 @@ export function TerminalPane(props: TerminalPaneProps) {
       // 这个短暂窗口被吞掉，否则共享 PTY 仍会维持旧 rows/cols，首屏就会按旧网格乱掉。
       return windowActiveRef.current && focusActivationArmedRef.current;
     };
+    const shouldSuppressMobileInputResize = () => (
+      mobileInputModeRef.current &&
+      (
+        mobileKeyboardOpenRef.current ||
+        mobileKeyboardResizeSuppressActive()
+      )
+    );
     const canReportLocalResizeForSource = (source: ResizeSource | undefined) => {
       if (!source || source === "session" || source === "snapshot" || snapshotRedrawInProgressRef.current) {
         return false;
       }
-      if (mobileInputModeRef.current && mobileKeyboardOpenRef.current) {
+      if (shouldSuppressMobileInputResize()) {
         return false;
-      }
-      if (source === "mobile-viewport") {
-        return (
-          mobileInputModeRef.current &&
-          windowActiveRef.current &&
-          mobileViewportResizeOwnerRef.current &&
-          !passiveInputFocusRef.current
-        );
       }
       return (
         hasActiveTerminalFocus() ||
@@ -2682,11 +3007,29 @@ export function TerminalPane(props: TerminalPaneProps) {
     // 本地终端只有在当前浏览器窗口聚焦终端时才把尺寸写回 shared PTY。
     // 未聚焦客户端按 daemon 确认的 session rows/cols 渲染，不再做本地等比缩放。
     const resize = (source: ResizeSource = "layout") => {
+      if (source === "layout") {
+        refreshMobileViewportLayoutSuppressFromWindow();
+      }
+      const isSuppressedMobileViewportLayout = (proposed?: { rows: number; cols: number }, referenceCols?: number) => {
+        if (source !== "layout" || !mobileInputModeRef.current || !mobileViewportLayoutSuppressRef.current) {
+          return false;
+        }
+        if (proposed && referenceCols !== undefined && proposed.cols !== referenceCols) {
+          // 中文注释：软键盘只改变高度；如果拟合列数已经变化，说明这是横竖屏、
+          // 分屏或真实容器宽度变化，必须让 focused 客户端继续上报 PTY resize。
+          mobileViewportLayoutSuppressRef.current = false;
+          return false;
+        }
+        return true;
+      };
       if (snapshotRedrawInProgressRef.current) {
+        const proposed = fit.proposeDimensions();
+        const referenceCols = sessionSizeRef.current?.cols ?? terminal.cols;
+        const layoutFromMobileViewport =
+          isSuppressedMobileViewportLayout(proposed, referenceCols);
         if (
           source === "focus" ||
-          source === "mobile-viewport" ||
-          (source === "layout" && hasActiveTerminalFocus())
+          (source === "layout" && hasActiveTerminalFocus() && !layoutFromMobileViewport)
         ) {
           // 中文注释：snapshot 字节写入期间不能改变终端尺寸；但用户主动聚焦/窗口变化
           // 不能丢，等 snapshot 渲染完成后再补一次真实 resize 上报。
@@ -2705,25 +3048,30 @@ export function TerminalPane(props: TerminalPaneProps) {
       const hostHeight = terminalHost.clientHeight;
       const remoteSize = sessionSizeRef.current;
       const terminalHasActiveFocus = hasActiveTerminalFocus();
+      const layoutFromMobileViewport =
+        isSuppressedMobileViewportLayout(proposed, remoteSize?.cols ?? terminal.cols);
+      if (source === "mobile-viewport" || layoutFromMobileViewport || shouldSuppressMobileInputResize()) {
+        // 中文注释：移动端软键盘只改变可视窗口，不代表 shared PTY 的 rows/cols
+        // 需要变化。这里也不做本地 fit，避免 helper textarea 在键盘动画期被
+        // xterm 重新锚定到新网格，导致移动浏览器认为输入目标失稳而收起键盘。
+        applyFontSize(terminal, currentTerminalFontSize());
+        terminal.refresh(0, Math.max(0, terminal.rows - 1));
+        centerViewportOnCursor(terminal);
+        syncTerminalInputAnchor(terminal, "refresh");
+        queueCursorReport({ immediate: true });
+        return;
+      }
       const armedFocusResizeAuthority = canUseArmedFocusResizeAuthority(source);
       const terminalCanReportActiveFocus =
         terminalHasActiveFocus ||
         (windowActiveRef.current && terminalDomHasActiveFocus()) ||
         armedFocusResizeAuthority;
-      const mobileKeyboardIsOpen =
-        mobileInputModeRef.current &&
-        mobileKeyboardOpenRef.current;
-      const hasMobileViewportResizeOwnership =
-        source === "mobile-viewport" &&
-        mobileInputModeRef.current &&
-        windowActiveRef.current &&
-        mobileViewportResizeOwnerRef.current &&
-        !passiveInputFocusRef.current;
+      const mobileKeyboardIsOpen = shouldSuppressMobileInputResize();
       const canReportLocalResize =
         source !== "session" &&
         source !== "snapshot" &&
         !mobileKeyboardIsOpen &&
-        (terminalCanReportActiveFocus || hasMobileViewportResizeOwnership);
+        terminalCanReportActiveFocus;
       const canFitLocalAfterSnapshot =
         source === "snapshot" &&
         !mobileKeyboardIsOpen &&
@@ -2963,8 +3311,16 @@ export function TerminalPane(props: TerminalPaneProps) {
           requestTrackedFrame(() => resizeRef.current?.(pendingResizeSource));
         };
         const preferredSize = measurePreferredClientSize();
+        const suppressSnapshotResizeForMobileViewport =
+          mobileInputModeRef.current &&
+          mobileViewportLayoutSuppressRef.current &&
+          (
+            preferredSize === undefined ||
+            preferredSize.cols === item.size.cols
+          );
         const shouldRepairSnapshotHistory =
           !revealHistory &&
+          !suppressSnapshotResizeForMobileViewport &&
           localTerminalWillOwnResizeAuthority() &&
           preferredSize !== undefined &&
           (preferredSize.rows !== item.size.rows || preferredSize.cols !== item.size.cols);
@@ -2984,6 +3340,10 @@ export function TerminalPane(props: TerminalPaneProps) {
         if (localTerminalOwnsResizeAuthority()) {
           refreshTerminal("snapshot");
           stabilizeTerminal("snapshot");
+          if (suppressSnapshotResizeForMobileViewport && !pendingResizeSource) {
+            revealHistoryAfterFit();
+            return;
+          }
           // 中文注释：reload/重连时 daemon snapshot 可能仍是旧的 80x24。若当前客户端
           // 已经重新聚焦终端，snapshot 重放完成后必须按 focus 路径把真实浏览器尺寸
           // 写回 daemon/supervisor；仅本地 fit 会让下一次 attach 继续拿到旧分辨率。
@@ -3001,8 +3361,11 @@ export function TerminalPane(props: TerminalPaneProps) {
       host,
       focusOutSettleMs: FOCUS_OUT_SETTLE_MS,
       isPassiveInputTarget: (target) => target === helperTextarea,
+      isMobileInputMode: () => mobileInputModeRef.current,
+      isMobileKeyboardOpen: () => mobileKeyboardOpenRef.current,
       reportTerminalFocus,
       queueCursorReport,
+      restoreTerminalInputFocus: () => focusTerminalInputSink(terminal),
       scheduleScrollToBottomIfPinned,
       resize,
     });
@@ -3081,6 +3444,8 @@ export function TerminalPane(props: TerminalPaneProps) {
         copyToastTimerRef.current = undefined;
       }
       clearPassiveFocusBypassTimer();
+      mobilePointerDownInputFocusRef.current = false;
+      clearMobileKeyboardResizeSuppress();
       if (terminalResizeStabilizationTimerRef.current !== undefined) {
         window.clearTimeout(terminalResizeStabilizationTimerRef.current);
         terminalResizeStabilizationTimerRef.current = undefined;
@@ -3102,6 +3467,7 @@ export function TerminalPane(props: TerminalPaneProps) {
       }
       clearTerminalServerScrollbackResyncIdleTimer();
       clearMobileDirectionGesture();
+      resetMobileCursorViewportWindow();
       lastTerminalScrollReportAtRef.current = 0;
       terminalLastServerScrollbackResyncAtRef.current = 0;
       terminalSelectionFocusPendingRef.current = false;
@@ -3179,6 +3545,8 @@ export function TerminalPane(props: TerminalPaneProps) {
       }
       terminalStabilizeFrameRef.current = undefined;
       terminalStabilizePassesRef.current = 0;
+      mobileViewportLayoutSuppressRef.current = false;
+      previousMobileViewportMetricsRef.current = undefined;
       terminalSelectionCopyGenerationRef.current += 1;
       pendingFocusRequestRef.current = undefined;
       drainOutputRef.current = () => undefined;
@@ -3188,7 +3556,6 @@ export function TerminalPane(props: TerminalPaneProps) {
       mobileCompositionActiveRef.current = false;
       lastMobileCompositionEndAtRef.current = 0;
       clientSizeRef.current = undefined;
-      mobileViewportResizeOwnerRef.current = false;
       focusActivationArmedRef.current = false;
       passiveFocusBypassRef.current = false;
       passiveInputFocusRef.current = false;
@@ -3304,6 +3671,7 @@ export function TerminalPane(props: TerminalPaneProps) {
           <div
             className="terminal-frame"
             ref={frameRef}
+            onMouseDownCapture={handleTerminalMouseDownCapture}
             onClickCapture={focusTerminalFromTerminalClick}
             onPointerDownCapture={handleMobileTerminalScrollPointerDown}
             onPointerMoveCapture={handleMobileTerminalScrollPointerMove}

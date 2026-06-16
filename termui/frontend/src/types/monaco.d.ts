@@ -7,6 +7,11 @@ declare module "*?worker" {
   export default WorkerFactory;
 }
 
+declare module "*?url" {
+  const url: string;
+  export default url;
+}
+
 declare global {
   var MonacoEnvironment:
     | {

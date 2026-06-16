@@ -17,6 +17,64 @@ async function openMobileMenu(page: Page) {
   return menu;
 }
 
+async function installMutableVisualViewport(
+  page: Page,
+  metrics: { layoutHeight: number; visualHeight: number; offsetTop: number },
+): Promise<void> {
+  await page.addInitScript(({ layoutHeight, visualHeight, offsetTop }) => {
+    const scope = globalThis as typeof globalThis & {
+      __TERMD_TEST_SET_VISUAL_VIEWPORT__?: (next: { layoutHeight: number; visualHeight: number; offsetTop: number }) => void;
+    };
+    const target = new EventTarget();
+    const state = {
+      layoutHeight,
+      visualHeight,
+      offsetTop,
+    };
+    Object.defineProperty(window, "innerHeight", {
+      configurable: true,
+      get: () => state.layoutHeight,
+    });
+    Object.defineProperty(window, "visualViewport", {
+      configurable: true,
+      value: {
+        get height() {
+          return state.visualHeight;
+        },
+        get width() {
+          return window.innerWidth;
+        },
+        get offsetTop() {
+          return state.offsetTop;
+        },
+        get offsetLeft() {
+          return 0;
+        },
+        get pageTop() {
+          return state.offsetTop;
+        },
+        get pageLeft() {
+          return 0;
+        },
+        get scale() {
+          return 1;
+        },
+        addEventListener: target.addEventListener.bind(target),
+        removeEventListener: target.removeEventListener.bind(target),
+        dispatchEvent: target.dispatchEvent.bind(target),
+      },
+      writable: true,
+    });
+    scope.__TERMD_TEST_SET_VISUAL_VIEWPORT__ = (next) => {
+      state.layoutHeight = next.layoutHeight;
+      state.visualHeight = next.visualHeight;
+      state.offsetTop = next.offsetTop;
+      target.dispatchEvent(new Event("resize"));
+      window.dispatchEvent(new Event("resize"));
+    };
+  }, metrics);
+}
+
 async function resetBrowserState(page: Page): Promise<void> {
   await page.addInitScript(() => {
     if (window.name === "__TERMD_TEST_STATE_RESET_DONE__") {
@@ -58,7 +116,7 @@ test("mobile terminal pointerdown 提前解锁 focus suppression，helper textar
     const terminalSurface = page.locator(".terminal-host .xterm-screen, .terminal-host canvas").first();
     const terminalInput = page.locator('.terminal-host textarea[aria-label="Terminal input"]').first();
 
-    await terminalSurface.click({ position: { x: 20, y: 20 } });
+    await terminalSurface.tap({ position: { x: 20, y: 20 } });
     await expect(terminalInput).toBeFocused();
 
     await terminalInput.evaluate((element) => {
@@ -73,9 +131,6 @@ test("mobile terminal pointerdown 提前解锁 focus suppression，helper textar
       button: 0,
       clientX: 24,
       clientY: 24,
-    });
-    await terminalInput.evaluate((element) => {
-      (element as HTMLTextAreaElement).focus();
     });
 
     await expect(terminalInput).toBeFocused();
@@ -92,6 +147,152 @@ test("mobile terminal pointerdown 提前解锁 focus suppression，helper textar
       );
     });
     await expect.poll(() => daemon.decryptedInputs.join("").slice(inputBaseline.length)).toBe("x");
+  } finally {
+    await daemon.stop();
+  }
+});
+
+test("mobile terminal 迟到 contextmenu 不会收起 helper textarea 焦点", async ({ page }, testInfo: TestInfo) => {
+  test.skip(testInfo.project.name !== "mobile-chrome", "该回归只需要移动端项目覆盖");
+
+  const daemon = await MockDaemon.start({
+    token: "secret-token",
+    sessions: [
+      {
+        session_id: "00000000-0000-0000-0000-0000000005f3",
+        state: "running",
+        size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+      },
+    ],
+    attachOutput: "mobile-contextmenu-ready\n",
+  });
+
+  try {
+    await page.goto("/");
+    await page.getByLabel("WS URL").fill(daemon.url);
+    await page.getByLabel("Pairing token").fill(pairingInviteCode(daemon));
+    await activateButton(page, "Pair");
+    await expectTerminalLine(page, "mobile-contextmenu-ready", 8_000);
+
+    const terminalSurface = page.locator(".terminal-host .xterm-screen, .terminal-host canvas").first();
+    const terminalInput = page.locator('.terminal-host textarea[aria-label="Terminal input"]').first();
+
+    await terminalSurface.dispatchEvent("pointerdown", {
+      pointerId: 92,
+      pointerType: "touch",
+      button: 0,
+      clientX: 24,
+      clientY: 24,
+    });
+    await expect(terminalInput).toBeFocused();
+
+    await page.waitForTimeout(800);
+    await terminalSurface.dispatchEvent("contextmenu", {
+      bubbles: true,
+      cancelable: true,
+      clientX: 24,
+      clientY: 24,
+    });
+    await expect(terminalInput).toBeFocused();
+
+    const inputBaseline = daemon.decryptedInputs.join("");
+    await terminalInput.evaluate((element) => {
+      // 中文注释：焦点还在 helper textarea 后，移动端 beforeinput 兜底仍应能把文本送进 PTY。
+      element.dispatchEvent(
+        new InputEvent("beforeinput", {
+          bubbles: true,
+          cancelable: true,
+          inputType: "insertText",
+          data: "c",
+        }),
+      );
+    });
+    await expect.poll(() => daemon.decryptedInputs.join("").slice(inputBaseline.length)).toBe("c");
+  } finally {
+    await daemon.stop();
+  }
+});
+
+test("mobile keyboard open 会重排 shell 高度且不写回 PTY", async ({ page }, testInfo: TestInfo) => {
+  test.skip(testInfo.project.name !== "mobile-chrome", "该回归只需要移动端项目覆盖");
+
+  await installMutableVisualViewport(page, { layoutHeight: 820, visualHeight: 820, offsetTop: 0 });
+  const sessionId = "00000000-0000-0000-0000-0000000005f2";
+  const daemon = await MockDaemon.start({
+    token: "secret-token",
+    sessions: [
+      {
+        session_id: sessionId,
+        state: "running",
+        size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+      },
+    ],
+    attachOutput: `${Array.from({ length: 48 }, (_, index) => `mobile-keyboard-line-${String(index + 1).padStart(2, "0")}`).join("\n")}\n`,
+  });
+
+  try {
+    await page.goto("/");
+    await page.getByLabel("WS URL").fill(daemon.url);
+    await page.getByLabel("Pairing token").fill(pairingInviteCode(daemon));
+    await activateButton(page, "Pair");
+    await expectTerminalLine(page, "mobile-keyboard-line-48", 8_000);
+
+    const shell = page.locator(".app-shell");
+    const terminalSurface = page.locator(".terminal-host .xterm-screen, .terminal-host canvas").first();
+    const terminalInput = page.locator('.terminal-host textarea[aria-label="Terminal input"]').first();
+    await terminalSurface.click({ position: { x: 20, y: 20 } });
+    await expect(terminalInput).toBeFocused();
+    const inputBaseline = daemon.decryptedInputs.join("");
+    await terminalInput.evaluate((element) => {
+      // 中文注释：真实移动浏览器打开软键盘时，visualViewport 变矮常常慢于
+      // focusout/window blur；这里先让 helper textarea 短暂掉到 body。
+      (element as HTMLTextAreaElement).blur();
+    });
+    await page.evaluate(() => window.dispatchEvent(new Event("blur")));
+    await expect(terminalInput).toBeFocused();
+    await terminalInput.evaluate((element) => {
+      element.dispatchEvent(
+        new InputEvent("beforeinput", {
+          bubbles: true,
+          cancelable: true,
+          inputType: "insertText",
+          data: "k",
+        }),
+      );
+    });
+    await expect.poll(() => daemon.decryptedInputs.join("").slice(inputBaseline.length)).toBe("k");
+
+    const resizeCountBeforeKeyboardOpen = daemon.sessionResizes.length;
+    await page.evaluate(() => {
+      (window as typeof window & {
+        __TERMD_TEST_SET_VISUAL_VIEWPORT__?: (next: { layoutHeight: number; visualHeight: number; offsetTop: number }) => void;
+      }).__TERMD_TEST_SET_VISUAL_VIEWPORT__?.({
+        layoutHeight: 820,
+        visualHeight: 460,
+        offsetTop: 20,
+      });
+    });
+
+    await expect(shell).toHaveClass(/mobile-keyboard-open/);
+    await expect.poll(async () =>
+      shell.evaluate((element) => (element as HTMLElement).style.getPropertyValue("--termd-layout-viewport-height")),
+    ).toBe("460px");
+    await expect.poll(async () =>
+      shell.evaluate((element) => (element as HTMLElement).style.getPropertyValue("--termd-visual-viewport-height")),
+    ).toBe("460px");
+    await expect(terminalInput).toBeFocused();
+    // 中文注释：TerminalPane 的 resize 上报有多帧稳定窗口；负向断言必须
+    // 等过这段窗口，避免测试在延迟 resize 发出前提前通过。
+    await page.waitForTimeout(900);
+    expect(daemon.sessionResizes.length).toBe(resizeCountBeforeKeyboardOpen);
+
+    daemon.pushSessionData(sessionId, "mobile-keyboard-cursor-anchor\n");
+    await expectTerminalLine(page, "mobile-keyboard-cursor-anchor", 8_000);
+    await expect
+      .poll(async () =>
+        page.locator(".terminal-scrollport").evaluate((element) => Math.round((element as HTMLElement).scrollTop)),
+      )
+      .toBeGreaterThan(0);
   } finally {
     await daemon.stop();
   }

@@ -65,6 +65,7 @@ export function FileEditorDialog({
   const [text, setText] = useState(initialText);
   const [MonacoEditor, setMonacoEditor] = useState<MonacoCodeEditor | null>(null);
   const [monacoChecked, setMonacoChecked] = useState(false);
+  const [monacoUnavailable, setMonacoUnavailable] = useState(false);
   const { t } = useI18n();
 
   useEffect(() => {
@@ -82,6 +83,7 @@ export function FileEditorDialog({
     }
 
     setMonacoChecked(false);
+    setMonacoUnavailable(false);
     void loadOptionalMonacoEditor().then((editor) => {
       if (active) {
         setMonacoEditor(() => editor);
@@ -168,7 +170,7 @@ export function FileEditorDialog({
               <Loader2 size={16} aria-hidden="true" />
               {t("editor.loading")}
             </div>
-          ) : MonacoEditor ? (
+          ) : MonacoEditor && !monacoUnavailable ? (
             <MonacoEditor
               className="file-editor-monaco"
               height="100%"
@@ -191,6 +193,7 @@ export function FileEditorDialog({
                   setText(value ?? "");
                 }
               }}
+              onUnavailable={() => setMonacoUnavailable(true)}
             />
           ) : (
             <FallbackCodeEditor

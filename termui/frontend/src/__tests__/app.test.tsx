@@ -102,6 +102,19 @@ function setViewportWidth(width: number): void {
   window.dispatchEvent(new Event("resize"));
 }
 
+function setTouchCapability(enabled: boolean): void {
+  Object.defineProperty(navigator, "maxTouchPoints", {
+    configurable: true,
+    value: enabled ? 5 : 0,
+    writable: true,
+  });
+  Object.defineProperty(window, "ontouchstart", {
+    configurable: true,
+    value: enabled ? () => undefined : undefined,
+    writable: true,
+  });
+}
+
 function setMobileVisualViewport(layoutHeight: number, visualHeight: number, offsetTop = 0): void {
   Object.defineProperty(window, "innerHeight", {
     configurable: true,
@@ -907,6 +920,7 @@ describe("termui web 工作台", () => {
     resetFileEditorDialogMonacoCacheForTests();
     await clearBrowserState();
     setViewportWidth(1366);
+    setTouchCapability(false);
     Object.defineProperty(window, "innerHeight", {
       configurable: true,
       value: 768,
@@ -1607,8 +1621,8 @@ describe("termui web 工作台", () => {
     render(<App />);
 
     await user.click(await screen.findByRole("button", { name: "Settings" }));
-    await user.click(screen.getByLabelText("Light"));
-    await user.click(screen.getByLabelText("中文"));
+    await user.click(await screen.findByLabelText("Light"));
+    await user.click(await screen.findByLabelText("中文"));
 
     await waitFor(() => expect(document.documentElement).toHaveAttribute("data-theme", "light"));
     expect(document.documentElement).toHaveAttribute("lang", "zh-CN");
@@ -1634,7 +1648,7 @@ describe("termui web 工作台", () => {
     const initialTheme = document.documentElement.dataset.theme === "light" ? "light" : "dark";
     const nextTheme = initialTheme === "light" ? "dark" : "light";
     await user.click(await screen.findByRole("button", { name: "Settings" }));
-    await user.click(screen.getByLabelText(nextTheme === "light" ? "Light" : "Dark"));
+    await user.click(await screen.findByLabelText(nextTheme === "light" ? "Light" : "Dark"));
 
     await waitFor(() => expect(document.documentElement).toHaveAttribute("data-theme", nextTheme));
     await waitFor(
@@ -1789,7 +1803,10 @@ describe("termui web 工作台", () => {
     expect(css).toContain(".daemon-status-strip .daemon-status-grid {\n    width: 100%;");
     expect(css).toContain("display: grid;\n    grid-template-columns:\n      minmax(58px, 0.6fr)");
     expect(css).toContain("minmax(124px, 1.25fr);");
-    expect(css).toContain(".terminal-mobile-shortcuts {\n    width: 100%;");
+    const mobileShortcutsBlock = css.match(/\.terminal-mobile-shortcuts \{[^}]+\}/)?.[0] ?? "";
+    expect(mobileShortcutsBlock).toContain("position: absolute;");
+    expect(mobileShortcutsBlock).toContain("bottom: 0;");
+    expect(mobileShortcutsBlock).toContain("width: 100%;");
     expect(css).toContain("overflow-x: auto;");
     expect(css).toContain("scrollbar-width: none;");
     expect(css).toContain("flex: 0 0 64px;");
@@ -2803,8 +2820,8 @@ describe("termui web 工作台", () => {
       expect(element).toHaveClass("mobile-keyboard-open");
       return element!;
     });
-    expect(shell.style.getPropertyValue("--termd-layout-viewport-height")).toBe("820px");
-    expect(shell.style.getPropertyValue("--termd-visual-viewport-height")).toBe("820px");
+    expect(shell.style.getPropertyValue("--termd-layout-viewport-height")).toBe("460px");
+    expect(shell.style.getPropertyValue("--termd-visual-viewport-height")).toBe("460px");
     expect(shell.style.getPropertyValue("--termd-visual-viewport-keyboard-inset")).toBe("340px");
     expect(shell.style.getPropertyValue("--termd-visual-viewport-offset-top")).toBe("20px");
     expect(screen.getByRole("contentinfo", { name: "daemon server status" })).toHaveClass(
@@ -2884,7 +2901,7 @@ describe("termui web 工作台", () => {
     expect(screen.queryByLabelText("mobile terminal shortcuts")).toBeNull();
   });
 
-  it("移动端收起键盘后通过 visualViewport 事件恢复终端尺寸", async () => {
+  it("移动端收起键盘后 visualViewport 事件不写回 PTY 尺寸", async () => {
     setViewportWidth(390);
     const viewport = installMutableMobileVisualViewport(820, 460, 20);
     (globalThis as { __TERMD_TEST_FIT_DIMENSIONS__?: { rows: number; cols: number } }).__TERMD_TEST_FIT_DIMENSIONS__ = {
@@ -2924,12 +2941,44 @@ describe("termui web 工作台", () => {
       viewport.setMetrics(820, 820, 0);
     });
 
-    await waitFor(() =>
-      expect(daemon.sessionResizes.slice(resizeCountAfterBlur)).toContainEqual({
-        session_id: DEFAULT_SESSION_ID,
-        size: { rows: 24, cols: 80, pixel_width: expect.any(Number), pixel_height: expect.any(Number) },
-      }),
-    );
+    await act(async () => {
+      await new Promise((resolve) => window.setTimeout(resolve, 64));
+    });
+
+    expect(daemon.sessionResizes.slice(resizeCountAfterBlur)).toEqual([]);
+  });
+
+  it("移动端 visualViewport 只改变高度时仍触发布局刷新但不写回 PTY", async () => {
+    setViewportWidth(390);
+    const viewport = installMutableMobileVisualViewport(820, 820, 0);
+    const user = userEvent.setup();
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await screen.findByText(/termd-e2e-ready/);
+
+    const terminalInput = await waitFor(() => {
+      const element = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
+      expect(element).not.toBeNull();
+      return element!;
+    });
+    terminalInput.focus();
+    await act(async () => {
+      await new Promise((resolve) => window.setTimeout(resolve, 64));
+    });
+    const resizeCountAfterFocus = daemon.sessionResizes.length;
+
+    await act(async () => {
+      viewport.setMetrics(820, 760, 0);
+    });
+    await act(async () => {
+      await new Promise((resolve) => window.setTimeout(resolve, 64));
+    });
+
+    // 中文注释：移动输入保护期内首轮 focus resize 可能被延后；该用例只要求
+    // visualViewport 高度变化不额外写回 PTY 尺寸。
+    expect(daemon.sessionResizes).toHaveLength(resizeCountAfterFocus);
   });
 
   it("未保存 daemon 时手动 token 不会猜测 server_id", async () => {
@@ -7084,6 +7133,7 @@ describe("termui web 工作台", () => {
   it("移动端键盘上方快捷按钮会发送常用控制字符", async () => {
     const user = userEvent.setup();
     setViewportWidth(390);
+    setTouchCapability(true);
     setMobileVisualViewport(820, 460, 20);
     render(<App />);
 
@@ -7098,6 +7148,23 @@ describe("termui web 工作台", () => {
     await user.click(screen.getByRole("button", { name: "Send Ctrl-Z" }));
 
     await waitFor(() => expect(daemon.sessionDataMessages).toEqual(["\t", "\x03", "\x1a"]));
+  });
+
+  it("宽屏触摸设备仍会启用终端移动输入保护，但不会切换成移动布局", async () => {
+    const user = userEvent.setup();
+    setViewportWidth(1180);
+    setTouchCapability(true);
+    setMobileVisualViewport(820, 820, 0);
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await screen.findByText(/termd-e2e-ready/);
+
+    const shell = document.querySelector<HTMLElement>(".app-shell");
+    expect(shell).not.toHaveClass("mobile-keyboard-open");
+    expect(document.querySelector('textarea[aria-label="Terminal input"]')).not.toBeNull();
+    expect(screen.queryByRole("button", { name: "Send Tab" })).toBeNull();
   });
 
   it("移动端长按终端一秒后拖动会发送方向键序列", async () => {

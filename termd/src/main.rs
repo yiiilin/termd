@@ -1263,8 +1263,8 @@ mod tests {
                         state.control_attempts.fetch_add(1, Ordering::SeqCst);
                     }
                     RouteRole::DaemonData => {
-                        // 新架构会预热 daemon data pipe。mock 必须接受 data 连接，否则测试会
-                        // 把预热线误判成 control 重连。
+                        // 中文注释：data 连接只能由 client 触发的 OpenData 按需创建；
+                        // 这个多 endpoint 稳定性测试没有模拟 client，因此计数应保持 0。
                         state.data_attempts.fetch_add(1, Ordering::SeqCst);
                     }
                     _ => return,
@@ -1392,9 +1392,10 @@ mod tests {
             1,
             "健康 relay supervisor 应只建立一条稳定 control 连接，不能被其他 endpoint 的重连牵连"
         );
-        assert!(
-            healthy_state.data_attempts.load(Ordering::SeqCst) <= 8,
-            "健康 relay 的 idle data 预热不能形成高速重连风暴"
+        assert_eq!(
+            healthy_state.data_attempts.load(Ordering::SeqCst),
+            0,
+            "没有 client 的健康 relay 不应主动预热 data 连接"
         );
         assert_eq!(
             flaky_state.early_closes.load(Ordering::SeqCst),

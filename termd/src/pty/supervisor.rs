@@ -3910,7 +3910,9 @@ mod tests {
         });
 
         let mut buffer = vec![0_u8; 64];
-        let read = session.read(&mut buffer).expect("legacy read should not fail");
+        let read = session
+            .read(&mut buffer)
+            .expect("legacy read should not fail");
 
         assert_eq!(&buffer[..read], b"new-screen");
         assert!(

@@ -3,6 +3,20 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FileEditorDialog, resetFileEditorDialogMonacoCacheForTests } from "./FileEditorDialog";
 
+vi.mock("./MonacoCodeEditor", async () => {
+  const React = await import("react");
+  return {
+    default: function MockMonacoCodeEditor(props: { onUnavailable?: () => void }) {
+      React.useEffect(() => {
+        // 中文注释：模拟 Monaco/CSS 在组件挂载后异步失败，覆盖真实懒加载失败路径。
+        const timer = window.setTimeout(() => props.onUnavailable?.(), 0);
+        return () => window.clearTimeout(timer);
+      }, [props.onUnavailable]);
+      return <div data-testid="mock-monaco-editor" />;
+    },
+  };
+});
+
 describe("FileEditorDialog", () => {
   beforeEach(() => {
     // 组件级测试覆盖 textarea fallback 的行为；生产环境会加载 Monaco。
@@ -143,5 +157,23 @@ describe("FileEditorDialog", () => {
     );
 
     expect(screen.getByLabelText("File text")).toHaveValue("two");
+  });
+
+  it("Monaco 渲染失败时回退到 textarea 编辑器", async () => {
+    delete (globalThis as { __TERMD_TEST_DISABLE_MONACO__?: boolean }).__TERMD_TEST_DISABLE_MONACO__;
+
+    render(
+      <FileEditorDialog
+        open
+        path="/tmp/fallback.txt"
+        initialText="fallback"
+        onSave={vi.fn()}
+        onClose={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByTestId("mock-monaco-editor")).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByLabelText("File text")).toHaveValue("fallback"));
+    expect(screen.queryByTestId("mock-monaco-editor")).not.toBeInTheDocument();
   });
 });

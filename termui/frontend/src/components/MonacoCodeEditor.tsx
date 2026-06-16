@@ -1,6 +1,6 @@
 import { useEffect, useRef, type ReactNode } from "react";
 import * as monaco from "monaco-editor/esm/vs/editor/edcore.main.js";
-import "monaco-editor/min/vs/editor/editor.main.css";
+import monacoEditorCssUrl from "monaco-editor/min/vs/editor/editor.main.css?url";
 import "monaco-editor/esm/vs/basic-languages/markdown/markdown.contribution";
 import "monaco-editor/esm/vs/basic-languages/python/python.contribution";
 import "monaco-editor/esm/vs/basic-languages/rust/rust.contribution";
@@ -25,9 +25,11 @@ export interface MonacoCodeEditorProps {
   loading?: ReactNode;
   options?: monaco.editor.IStandaloneEditorConstructionOptions;
   onChange?: (value?: string) => void;
+  onUnavailable?: () => void;
 }
 
 type WorkerFactory = new () => Worker;
+let monacoEditorCssPromise: Promise<void> | null = null;
 
 const workerByLabel = new Map<string, WorkerFactory>([
   ["json", jsonWorker],
@@ -49,6 +51,53 @@ const workerByLabel = new Map<string, WorkerFactory>([
   },
 };
 
+function ensureMonacoEditorCss(): Promise<void> {
+  if (typeof document === "undefined") {
+    return Promise.resolve();
+  }
+  if (monacoEditorCssPromise) {
+    return monacoEditorCssPromise;
+  }
+
+  monacoEditorCssPromise = new Promise<void>((resolve, reject) => {
+    const existing = document.querySelector<HTMLLinkElement>(`link[data-termd-monaco-css="${monacoEditorCssUrl}"]`);
+    if (existing) {
+      if (existing.dataset.termdMonacoCssStatus === "ready") {
+        resolve();
+        return;
+      }
+      if (existing.dataset.termdMonacoCssStatus === "error") {
+        existing.remove();
+      } else {
+        existing.addEventListener("load", () => resolve(), { once: true });
+        existing.addEventListener("error", () => reject(new Error("failed to load Monaco editor CSS")), { once: true });
+        return;
+      }
+    }
+
+    // 中文注释：Monaco 是文件编辑器冷路径；CSS 也按需注入，避免 Vite 把 300KB 样式放进首屏 HTML。
+    const link = document.createElement("link");
+    link.rel = "stylesheet";
+    link.href = monacoEditorCssUrl;
+    link.dataset.termdMonacoCss = monacoEditorCssUrl;
+    link.onload = () => {
+      link.dataset.termdMonacoCssStatus = "ready";
+      resolve();
+    };
+    link.onerror = () => {
+      link.dataset.termdMonacoCssStatus = "error";
+      link.remove();
+      reject(new Error("failed to load Monaco editor CSS"));
+    };
+    document.head.append(link);
+  }).catch((caught) => {
+    monacoEditorCssPromise = null;
+    throw caught;
+  });
+
+  return monacoEditorCssPromise;
+}
+
 export type MonacoCodeEditor = typeof MonacoCodeEditor;
 
 export default function MonacoCodeEditor({
@@ -59,6 +108,7 @@ export default function MonacoCodeEditor({
   className,
   options,
   onChange,
+  onUnavailable,
 }: MonacoCodeEditorProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const editorRef = useRef<monaco.editor.IStandaloneCodeEditor | null>(null);
@@ -76,26 +126,41 @@ export default function MonacoCodeEditor({
       return undefined;
     }
 
-    const editor = monaco.editor.create(container, {
-      value,
-      language,
-      theme,
-      automaticLayout: true,
-      ...options,
-    });
-    editorRef.current = editor;
-    changeListenerRef.current = editor.onDidChangeModelContent(() => {
-      if (!suppressChangeRef.current) {
-        onChangeRef.current?.(editor.getValue());
+    let cancelled = false;
+    let editor: monaco.editor.IStandaloneCodeEditor | undefined;
+    void ensureMonacoEditorCss().then(() => {
+      if (cancelled || !container.isConnected || editorRef.current) {
+        return;
+      }
+      editor = monaco.editor.create(container, {
+        value,
+        language,
+        theme,
+        automaticLayout: true,
+        ...options,
+      });
+      editorRef.current = editor;
+      changeListenerRef.current = editor.onDidChangeModelContent(() => {
+        if (!suppressChangeRef.current) {
+          onChangeRef.current?.(editor?.getValue());
+        }
+      });
+    }).catch(() => {
+      // 中文注释：样式加载失败时让父层回退到 textarea；编辑器冷路径失败不应打断整个工作台。
+      if (!cancelled) {
+        onUnavailable?.();
       }
     });
 
     return () => {
+      cancelled = true;
       changeListenerRef.current?.dispose();
       changeListenerRef.current = undefined;
-      editor.getModel()?.dispose();
-      editor.dispose();
-      editorRef.current = null;
+      editor?.getModel()?.dispose();
+      editor?.dispose();
+      if (editorRef.current === editor) {
+        editorRef.current = null;
+      }
     };
   }, []);
 

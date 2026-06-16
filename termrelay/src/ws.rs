@@ -5,10 +5,7 @@ use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::StreamExt;
-use termd_proto::{
-    MessageType, Nonce, RelayClientId, RelayControlEnvelope, RouteRole, ServerId,
-    decode_relay_data_control, encode_relay_data_control,
-};
+use termd_proto::{MessageType, Nonce, RelayClientId, RelayControlEnvelope, RouteRole, ServerId};
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -74,7 +71,6 @@ const PENDING_CLIENTS_PER_ROOM_LIMIT: usize = 64;
 const PRE_PAIR_CLIENT_BUFFER_MAX_FRAMES: usize = 256;
 const PRE_PAIR_CLIENT_BUFFER_MAX_BYTES: usize = 4 * 1024 * 1024;
 const PRE_PAIR_ROOM_BUFFER_MAX_BYTES: usize = PRE_PAIR_CLIENT_BUFFER_MAX_BYTES * 2;
-const IDLE_DAEMON_DATA_PIPE_LIMIT: usize = 8;
 const RELAY_AUTH_TOKEN_MIN_BYTES: usize = 8;
 // 中文注释：daemon_data 源 socket 需要一个本地短缓冲，把“读 daemon 输出”和“写浏览器”
 // 两条链路拆开，避免单个慢 client 直接把源读循环卡住。这里仍然保持有界缓存，预算耗尽后
@@ -395,16 +391,6 @@ impl RelayState {
         self.inner.flush_pre_pair_client_frames(registration).await;
     }
 
-    fn handle_daemon_data_control_ping(
-        &self,
-        registration: &ConnectionRegistration,
-        control: RelayControlEnvelope,
-        pong_payload: Vec<u8>,
-    ) -> RelayForwardOutcome {
-        self.inner
-            .handle_daemon_data_control_ping(registration, control, pong_payload)
-    }
-
     fn queue_pong_for_registration(
         &self,
         registration: &ConnectionRegistration,
@@ -629,15 +615,6 @@ fn relay_control_frame(envelope: RelayControlEnvelope) -> OpaqueFrame {
     )
 }
 
-fn relay_data_control_outbound(envelope: RelayControlEnvelope) -> RelayOutbound {
-    // 中文注释：data 线只允许业务 text/binary 原样透传；transport 生命周期控制放进
-    // WebSocket ping payload，避免和业务 JSON text 的 `type` 字段发生碰撞。
-    RelayOutbound::Ping(
-        encode_relay_data_control(&envelope)
-            .expect("relay data control payload must fit in websocket control frame"),
-    )
-}
-
 #[cfg(test)]
 fn relay_control_from_frame(frame: &OpaqueFrame) -> Option<RelayControlEnvelope> {
     let OpaqueFrame::Text(raw) = frame else {
@@ -828,14 +805,8 @@ async fn handle_inbound_message(
             }
         }
         Message::Ping(payload) => {
-            if registration.role == ConnectionRole::DaemonData
-                && let Some(control) = decode_relay_data_control(&payload)
-            {
-                // 中文注释：DataReady 的 pong 是 daemon 侧回收 idle data pipe 的确认点。
-                // 必须在同一个 room 锁内完成 ready 入池和 pong 入队，避免新 client 抢先
-                // 收到 OpenData，导致 daemon 还在等待 pong 时丢失 assignment。
-                return state.handle_daemon_data_control_ping(registration, control, payload);
-            }
+            // 中文注释：daemon data 线在一对一模式下不再承载 relay control payload。
+            // Ping 只按 WebSocket 保活处理，不能再把旧 DataReady 解释成 idle pipe 入池。
             queue_relay_pong_for_inbound_ping(state, registration, payload).await
         }
         Message::Pong(_) => RelayForwardOutcome::continue_with(ForwardReport {
@@ -1248,8 +1219,6 @@ mod tests {
     fn decode_control(outbound: RelayOutbound) -> RelayControlEnvelope {
         match outbound {
             RelayOutbound::Frame(OpaqueFrame::Text(raw)) => serde_json::from_str(&raw).unwrap(),
-            RelayOutbound::Ping(payload) => decode_relay_data_control(&payload)
-                .expect("expected relay data control ping payload"),
             other => panic!("expected relay control frame, got {other:?}"),
         }
     }
@@ -1924,7 +1893,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn room_closes_oldest_idle_daemon_data_pipe_over_room_limit() {
+    async fn daemon_data_without_client_assignment_is_rejected() {
         let state = RelayState::default();
         let server_id = server_id(83);
         let (control_tx, _control_rx) = channel();
@@ -1932,22 +1901,22 @@ mod tests {
             .register(server_id, ConnectionRole::DaemonControl, control_tx)
             .unwrap();
 
-        let (oldest_tx, _oldest_rx) = channel();
-        let mut oldest_close_rx = oldest_tx.subscribe_close();
-        state
-            .register(server_id, ConnectionRole::DaemonData, oldest_tx)
-            .unwrap();
+        let (data_tx, _data_rx) = channel();
+        let data = state.register_route(
+            &RoutePrelude {
+                server_id,
+                route_role: RouteRole::DaemonData,
+                connection_role: ConnectionRole::DaemonData,
+                route_generation: Some(test_route_generation(server_id)),
+                client_id: None,
+                data_token: None,
+            },
+            data_tx,
+        );
 
-        for _ in 0..8 {
-            let (data_tx, _data_rx) = channel();
-            state
-                .register(server_id, ConnectionRole::DaemonData, data_tx)
-                .unwrap();
-        }
-
-        timeout(Duration::from_millis(50), oldest_close_rx.closed())
-            .await
-            .expect("超过 idle data pipe 上限时应关闭最旧的空闲 data pipe");
+        // 中文注释：termd 到 relay 的 data pipe 必须由某个 client 的
+        // OpenData 明确触发，不能再注册成可被后续 client 复用的 idle pool。
+        assert_eq!(data, Err(RelayError::DaemonDataRouteInvalid));
     }
 
     #[test]
@@ -1985,15 +1954,17 @@ mod tests {
     }
 
     #[test]
-    fn stale_idle_daemon_data_from_previous_route_generation_is_rejected() {
+    fn daemon_data_from_previous_route_generation_is_rejected() {
         let state = RelayState::default();
         let server_id = server_id(86);
         let generation_a = Nonce("route-generation-a".to_owned());
         let generation_b = Nonce("route-generation-b".to_owned());
         let (control_a_tx, _control_a_rx) = channel();
         let (control_b_tx, _control_b_rx) = channel();
+        let (client_tx, _client_rx) = channel();
         let (stale_data_tx, _stale_data_rx) = channel();
         let (fresh_data_tx, _fresh_data_rx) = channel();
+        let mut control_b_rx = _control_b_rx;
 
         state
             .register_with_generation(
@@ -2011,6 +1982,8 @@ mod tests {
                 control_b_tx,
             )
             .unwrap();
+        let (_client, client_id, data_token) =
+            register_pending_client(&state, server_id, client_tx, &mut control_b_rx);
 
         let stale = state.register_route(
             &RoutePrelude {
@@ -2018,8 +1991,8 @@ mod tests {
                 route_role: RouteRole::DaemonData,
                 connection_role: ConnectionRole::DaemonData,
                 route_generation: Some(generation_a),
-                client_id: None,
-                data_token: None,
+                client_id: Some(client_id),
+                data_token: Some(data_token.clone()),
             },
             stale_data_tx,
         );
@@ -2031,14 +2004,14 @@ mod tests {
                 route_role: RouteRole::DaemonData,
                 connection_role: ConnectionRole::DaemonData,
                 route_generation: Some(generation_b),
-                client_id: None,
-                data_token: None,
+                client_id: Some(client_id),
+                data_token: Some(data_token),
             },
             fresh_data_tx,
         );
         assert!(
             fresh.is_ok(),
-            "current generation idle data pipe should register"
+            "current generation paired data pipe should register"
         );
     }
 
@@ -2080,14 +2053,18 @@ mod tests {
         .await;
         expect_route_ready(&mut control_b, server_id, RouteRole::DaemonControl).await;
 
+        let (mut client, _client_response) = connect_async(url.clone()).await.unwrap();
+        send_client_route_hello_only(&mut client, server_id).await;
+        let (client_id, data_token) = expect_open_data(&mut control_b).await;
+
         let (mut stale_data, _response) = connect_async(url.clone()).await.unwrap();
         send_route_hello_with_generation(
             &mut stale_data,
             server_id,
             RouteRole::DaemonData,
             Some(generation_a),
-            None,
-            None,
+            Some(client_id),
+            Some(data_token.clone()),
         )
         .await;
         let ClientMessage::Text(raw) = next_data_frame(&mut stale_data).await.unwrap() else {
@@ -2103,14 +2080,16 @@ mod tests {
             server_id,
             RouteRole::DaemonData,
             Some(generation_b),
-            None,
-            None,
+            Some(client_id),
+            Some(data_token),
         )
         .await;
         expect_route_ready(&mut fresh_data, server_id, RouteRole::DaemonData).await;
+        expect_route_ready(&mut client, server_id, RouteRole::Client).await;
 
         control_a.close(None).await.unwrap();
         control_b.close(None).await.unwrap();
+        client.close(None).await.unwrap();
         stale_data.close(None).await.unwrap();
         fresh_data.close(None).await.unwrap();
         server.abort();
@@ -2494,7 +2473,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn client_disconnect_does_not_requeue_closed_data_pipe() {
+    async fn client_disconnect_requires_new_control_open_data() {
         let state = RelayState::default();
         let server_id = server_id(1);
         let (control_tx, mut control_rx) = channel();
@@ -2504,23 +2483,23 @@ mod tests {
         state
             .register(server_id, ConnectionRole::DaemonControl, control_tx)
             .unwrap();
-        let daemon_data = state
-            .register(server_id, ConnectionRole::DaemonData, data_tx)
-            .unwrap();
 
         let (client_a_tx, _client_a_rx) = channel();
-        let client_a = state
-            .register(server_id, ConnectionRole::Client, client_a_tx)
+        let (client_a, client_a_id, token_a) =
+            register_pending_client(&state, server_id, client_a_tx, &mut control_rx);
+        let daemon_data = state
+            .register_route(
+                &RoutePrelude {
+                    server_id,
+                    route_role: RouteRole::DaemonData,
+                    connection_role: ConnectionRole::DaemonData,
+                    route_generation: Some(test_route_generation(server_id)),
+                    client_id: Some(client_a_id),
+                    data_token: Some(token_a),
+                },
+                data_tx,
+            )
             .unwrap();
-        let RelayControlEnvelope::OpenData {
-            client_id: client_a_id,
-            ..
-        } = decode_control(data_rx.try_recv().unwrap())
-        else {
-            panic!("expected idle daemon data assignment for first client");
-        };
-        assert_eq!(client_a_id, RelayClientId(client_a.id));
-        assert_eq!(control_rx.try_recv().unwrap_err(), TryRecvError::Empty);
 
         state.unregister(&client_a);
         timeout(Duration::from_millis(50), data_close_rx.closed())
@@ -2531,7 +2510,7 @@ mod tests {
             handle_inbound_message(
                 &state,
                 &daemon_data,
-                Message::Ping(encode_relay_data_control(&RelayControlEnvelope::DataReady).unwrap()),
+                Message::Ping(b"legacy-data-ready".to_vec()),
                 None,
             )
             .await
@@ -2562,22 +2541,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn idle_data_assignment_is_ordered_before_first_client_frame() {
+    async fn client_pre_pair_frame_flushes_after_matching_daemon_data_connects() {
         let state = RelayState::default();
         let server_id = server_id(1);
-        let (control_tx, _control_rx) = channel();
+        let (control_tx, mut control_rx) = channel();
         let (data_tx, mut data_rx) = channel();
         state
             .register(server_id, ConnectionRole::DaemonControl, control_tx)
             .unwrap();
-        state
-            .register(server_id, ConnectionRole::DaemonData, data_tx)
-            .unwrap();
 
         let (client_tx, _client_rx) = channel();
-        let client = state
-            .register(server_id, ConnectionRole::Client, client_tx)
-            .unwrap();
+        let (client, client_id, data_token) =
+            register_pending_client(&state, server_id, client_tx, &mut control_rx);
         let first_frame = OpaqueFrame::Binary(b"first-upload-request-head".to_vec());
         assert_eq!(
             state.forward_from(&client, first_frame.clone()).await,
@@ -2588,13 +2563,24 @@ mod tests {
             }
         );
 
-        // 中文注释：这个顺序是 HTTP upload 不再 0 速度/502 的关键不变量。
-        // daemon idle data connection 必须先收到 OpenData，再收到 request head/body。
-        let first = data_rx.data.recv().await.unwrap();
-        let RelayControlEnvelope::OpenData { client_id, .. } = decode_control(first) else {
-            panic!("expected open_data before first client frame");
-        };
-        assert_eq!(client_id, RelayClientId(client.id));
+        assert_eq!(data_rx.try_recv().unwrap_err(), TryRecvError::Empty);
+        let data_registration = state
+            .register_route(
+                &RoutePrelude {
+                    server_id,
+                    route_role: RouteRole::DaemonData,
+                    connection_role: ConnectionRole::DaemonData,
+                    route_generation: Some(test_route_generation(server_id)),
+                    client_id: Some(client_id),
+                    data_token: Some(data_token),
+                },
+                data_tx,
+            )
+            .unwrap();
+        state.flush_pre_pair_client_frames(&data_registration).await;
+
+        // 中文注释：client 早到帧只能在匹配的 daemon data 反连完成后进入 data 线；
+        // relay 不再把 OpenData 写进预热 data pipe。
         assert_eq!(
             data_rx.data.recv().await.unwrap(),
             RelayOutbound::Frame(first_frame)

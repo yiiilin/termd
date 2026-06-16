@@ -2900,11 +2900,6 @@ label {
     overflow: hidden;
   }
 
-  .app-shell.mobile-keyboard-open {
-    /* 软键盘弹出时保持 terminal rows/cols 不变，只把整个工作区抬到键盘上方。 */
-    transform: translate3d(0, calc(-1 * var(--termd-visual-viewport-keyboard-inset, 0px)), 0);
-  }
-
   .app-shell.connection-ready {
     grid-template-rows: minmax(0, 1fr);
   }
@@ -3156,10 +3151,6 @@ label {
     grid-template-rows: minmax(0, 1fr);
   }
 
-  .app-shell.mobile-keyboard-open .terminal-pane {
-    grid-template-rows: minmax(0, 1fr) 42px;
-  }
-
   .daemon-status-strip {
     width: 100%;
     max-width: 100%;
@@ -3220,10 +3211,13 @@ label {
   }
 
   .terminal-mobile-shortcuts {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 9;
     width: 100%;
     max-width: 100%;
-    position: relative;
-    z-index: 7;
     min-width: 0;
     border-top: 1px solid var(--color-border-subtle);
     background: var(--color-surface-alt);
@@ -3235,6 +3229,7 @@ label {
     padding: 5px 8px 6px;
     scrollbar-width: none;
     -webkit-overflow-scrolling: touch;
+    box-shadow: 0 -10px 24px var(--color-popover-shadow);
   }
 
   .terminal-mobile-shortcuts::-webkit-scrollbar {
