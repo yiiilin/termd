@@ -41,6 +41,7 @@ use self::policy::{
     WebSocketReceiveDebug, log_websocket_receive_failed, reject_oversized_frame,
     websocket_message_bytes, websocket_message_kind,
 };
+use self::registry::ClientPairLogContext;
 use self::registry::{
     ConnectionRegistration, ForwardReport, RelayError, RelayForwardOutcome, RelayRegistry,
 };
@@ -290,11 +291,22 @@ impl RelayState {
         let registration = registration.clone();
         tokio::spawn(async move {
             tokio::time::sleep(PENDING_CLIENT_PAIR_DEADLINE).await;
-            if state.close_pending_client_if_unpaired(&registration) {
+            if let Some(pair_context) = state.close_pending_client_if_unpaired(&registration) {
+                let summary = RelayClientPairSummary {
+                    pair_wait_ms: pair_context.wait_ms,
+                    paired: pair_context.paired,
+                    close_reason: RelayClientPairCloseReason::PairDeadlineExceeded,
+                    pre_pair_frames: pair_context.pre_pair_frames,
+                    pre_pair_bytes: pair_context.pre_pair_bytes,
+                };
                 warn!(
                     server_id = %registration.server_id.0,
                     client_connection_id = registration.id,
                     timeout_ms = PENDING_CLIENT_PAIR_DEADLINE.as_millis(),
+                    pair_wait_ms = summary.pair_wait_ms,
+                    paired = summary.paired,
+                    pre_pair_frames = summary.pre_pair_frames,
+                    pre_pair_bytes = summary.pre_pair_bytes,
                     "relay pending client data pair deadline exceeded"
                 );
             }
@@ -379,12 +391,19 @@ impl RelayState {
             .await
     }
 
-    fn close_pending_client_if_unpaired(&self, registration: &ConnectionRegistration) -> bool {
+    fn close_pending_client_if_unpaired(
+        &self,
+        registration: &ConnectionRegistration,
+    ) -> Option<ClientPairLogContext> {
         self.inner.close_pending_client_if_unpaired(registration)
     }
 
     async fn wait_client_data_pair(&self, registration: &ConnectionRegistration) -> bool {
         self.inner.wait_client_data_pair(registration).await
+    }
+
+    fn daemon_data_pair_wait_ms(&self, registration: &ConnectionRegistration) -> Option<u64> {
+        self.inner.daemon_data_pair_wait_ms(registration)
     }
 
     async fn flush_pre_pair_client_frames(&self, registration: &ConnectionRegistration) {
@@ -488,6 +507,49 @@ impl DaemonDataForwardStats {
             delivered: self.delivered.load(Ordering::Relaxed),
             dropped: self.dropped.load(Ordering::Relaxed),
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelayClientPairCloseReason {
+    PairDeadlineExceeded,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RelayClientPairSummary {
+    pair_wait_ms: u64,
+    paired: bool,
+    close_reason: RelayClientPairCloseReason,
+    pre_pair_frames: usize,
+    pre_pair_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RelayDaemonDataSummary {
+    pair_wait_ms: u64,
+    forwarded_attempted: usize,
+    forwarded_delivered: usize,
+    forwarded_dropped: usize,
+    drain_timed_out: bool,
+}
+
+impl RelayDaemonDataSummary {
+    fn from_forward_report(
+        pair_wait: Duration,
+        forward: ForwardReport,
+        drain_outcome: DaemonDataForwardDrainOutcome,
+    ) -> Self {
+        Self {
+            pair_wait_ms: pair_wait.as_millis().min(u128::from(u64::MAX)) as u64,
+            forwarded_attempted: forward.attempted,
+            forwarded_delivered: forward.delivered,
+            forwarded_dropped: forward.dropped,
+            drain_timed_out: drain_outcome == DaemonDataForwardDrainOutcome::TimedOut,
+        }
+    }
+
+    fn should_promote_to_warn(self) -> bool {
+        self.drain_timed_out || self.forwarded_dropped > 0
     }
 }
 
@@ -719,12 +781,43 @@ pub async fn handle_socket(mut socket: WebSocket, state: RelayState) {
     if let Some(forwarder) = daemon_data_forwarder {
         let (drain_outcome, forward_stats) = forwarder.shutdown().await;
         traffic.record_forward(forward_stats);
+        let pair_wait = state
+            .daemon_data_pair_wait_ms(&registration)
+            .map(Duration::from_millis)
+            .unwrap_or_default();
+        let summary =
+            RelayDaemonDataSummary::from_forward_report(pair_wait, forward_stats, drain_outcome);
         if drain_outcome == DaemonDataForwardDrainOutcome::TimedOut {
             warn!(
                 server_id = %server_id.0,
                 connection_id = registration.id,
                 timeout_ms = DAEMON_DATA_INGRESS_DRAIN_TIMEOUT.as_millis(),
                 "relay daemon data forward task drain timed out during socket shutdown"
+            );
+        }
+        if summary.should_promote_to_warn() {
+            warn!(
+                server_id = %server_id.0,
+                connection_id = registration.id,
+                paired_client_id = registration.paired_client_id,
+                pair_wait_ms = summary.pair_wait_ms,
+                forwarded_attempted = summary.forwarded_attempted,
+                forwarded_delivered = summary.forwarded_delivered,
+                forwarded_dropped = summary.forwarded_dropped,
+                drain_timed_out = summary.drain_timed_out,
+                "relay daemon data summary"
+            );
+        } else {
+            debug!(
+                server_id = %server_id.0,
+                connection_id = registration.id,
+                paired_client_id = registration.paired_client_id,
+                pair_wait_ms = summary.pair_wait_ms,
+                forwarded_attempted = summary.forwarded_attempted,
+                forwarded_delivered = summary.forwarded_delivered,
+                forwarded_dropped = summary.forwarded_dropped,
+                drain_timed_out = summary.drain_timed_out,
+                "relay daemon data summary"
             );
         }
     }
@@ -1625,6 +1718,37 @@ mod tests {
             websocket_outbound_frame_pressure_level(8 * 1024, Duration::from_millis(50)),
             OutboundFramePressureLevel::Info
         );
+    }
+
+    #[test]
+    fn relay_pair_summary_flags_unpaired_timeout_and_keeps_pair_metrics() {
+        let timed_out = RelayClientPairSummary {
+            pair_wait_ms: 5_000,
+            paired: false,
+            close_reason: RelayClientPairCloseReason::PairDeadlineExceeded,
+            pre_pair_frames: 3,
+            pre_pair_bytes: 128,
+        };
+        let dropped_forward = RelayDaemonDataSummary::from_forward_report(
+            Duration::from_millis(42),
+            ForwardReport {
+                attempted: 5,
+                delivered: 4,
+                dropped: 1,
+            },
+            DaemonDataForwardDrainOutcome::Drained,
+        );
+
+        assert_eq!(
+            timed_out.close_reason,
+            RelayClientPairCloseReason::PairDeadlineExceeded
+        );
+        assert!(!timed_out.paired);
+        assert_eq!(dropped_forward.pair_wait_ms, 42);
+        assert_eq!(dropped_forward.forwarded_attempted, 5);
+        assert_eq!(dropped_forward.forwarded_delivered, 4);
+        assert_eq!(dropped_forward.forwarded_dropped, 1);
+        assert!(dropped_forward.should_promote_to_warn());
     }
 
     #[test]

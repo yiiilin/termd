@@ -9,6 +9,24 @@ export interface TermdDiagnosticEvent {
   stack?: string;
 }
 
+export interface ProtocolTimeoutDiagnosticFields {
+  layer: "client" | "relay" | "termd" | "supervisor";
+  phase: string;
+  timeout_code: string;
+  timeout_ms: number;
+  elapsed_ms?: number;
+  transport?: string;
+  method?: string;
+  request_id?: string;
+  stream_id?: string;
+  session_id?: string;
+  server_id?: string;
+  device_id?: string;
+  path?: string;
+  role?: string;
+  [key: string]: unknown;
+}
+
 interface TermdDiagnosticGlobal {
   __TERMD_TRACE__?: boolean;
   __TERMD_DIAG_EVENTS__?: TermdDiagnosticEvent[];
@@ -61,4 +79,8 @@ export function recordTermdDiagnostic(
     // eslint-disable-next-line no-console
     console.debug("[termd-trace]", name, fields ?? {});
   }
+}
+
+export function recordProtocolTimeout(fields: ProtocolTimeoutDiagnosticFields): void {
+  recordTermdDiagnostic("protocol_timeout", fields);
 }

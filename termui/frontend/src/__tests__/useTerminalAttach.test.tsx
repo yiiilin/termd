@@ -1,6 +1,6 @@
 import { useRef } from "react";
 import { act, renderHook, waitFor } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   useTerminalAttach,
   useTerminalReceiveLoop,
@@ -19,6 +19,7 @@ import type {
   UUID,
 } from "../protocol/types";
 import type { TerminalOutputItem } from "../components/terminal/types";
+import type { TermdDiagnosticEvent } from "../diagnostics";
 
 const SESSION_ID = "00000000-0000-0000-0000-000000009901";
 const SERVER_ID = "00000000-0000-0000-0000-000000009902";
@@ -96,6 +97,15 @@ function deferred<T>() {
   });
   return { promise, resolve, reject };
 }
+
+function testDiagnostics(): { __TERMD_TRACE__?: boolean; __TERMD_DIAG_EVENTS__?: TermdDiagnosticEvent[] } {
+  return globalThis as { __TERMD_TRACE__?: boolean; __TERMD_DIAG_EVENTS__?: TermdDiagnosticEvent[] };
+}
+
+afterEach(() => {
+  delete testDiagnostics().__TERMD_TRACE__;
+  delete testDiagnostics().__TERMD_DIAG_EVENTS__;
+});
 
 function settleWithin<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
   return Promise.race([
@@ -429,6 +439,61 @@ describe("useTerminalAttach snapshot reveal intent", () => {
     expect(closeAttachForReconnect).toHaveBeenLastCalledWith(asDirectClient(staleClient));
     expect(result.current.controller.terminalSnapshotPendingFullSnapshotTokensRef.current.get(SESSION_ID)?.token).toBe(snapshotToken);
     expect(result.current.controller.terminalSnapshotRevealHistoryTokensRef.current.get(SESSION_ID)).toBe(snapshotToken);
+
+    act(() => {
+      if (result.current.controller.attachReconnectTimerRef.current !== undefined) {
+        window.clearTimeout(result.current.controller.attachReconnectTimerRef.current);
+        result.current.controller.attachReconnectTimerRef.current = undefined;
+      }
+    });
+    unmount();
+  });
+
+  it("当前 attach 触发 reconnect 时会记录 attach invalidation 诊断", () => {
+    testDiagnostics().__TERMD_TRACE__ = true;
+    testDiagnostics().__TERMD_DIAG_EVENTS__ = [];
+
+    const output: TerminalOutputItem[] = [];
+    const currentClient = new FakeDirectClient();
+    const { result, unmount } = renderHook(() =>
+      useReconnectHarness({
+        authenticatedClient: vi.fn(async () => asDirectClient(new FakeDirectClient())),
+        output,
+        reconnectDelaysMs: [60_000],
+      }),
+    );
+
+    act(() => {
+      result.current.controller.attachedSessionRef.current = SESSION_ID;
+      result.current.attachClientRef.current = asDirectClient(currentClient);
+      result.current.controller.receiveLoopActiveRef.current = true;
+      result.current.controller.receiveLoopGenerationRef.current = 7;
+    });
+
+    act(() => {
+      expect(result.current.scheduleReconnect(
+        asDirectClient(currentClient),
+        new ProtocolClientError("terminal_resync", "test resync"),
+        { forceFullSnapshot: true },
+      )).toBe(true);
+    });
+
+    expect(testDiagnostics().__TERMD_DIAG_EVENTS__).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          name: "reconnect_attach_invalidation",
+          fields: expect.objectContaining({
+            reconnectKey: `${SERVER_ID}:${SESSION_ID}`,
+            sessionId: SESSION_ID,
+            code: "terminal_resync",
+            forceFullSnapshot: true,
+            closingCurrentAttach: true,
+            receiveLoopGeneration: 7,
+            receiveLoopActive: true,
+          }),
+        }),
+      ]),
+    );
 
     act(() => {
       if (result.current.controller.attachReconnectTimerRef.current !== undefined) {
@@ -1072,5 +1137,62 @@ describe("useTerminalReceiveLoop", () => {
       result.current.controller.receiveLoopGenerationRef.current += 1;
     });
     unmount();
+  });
+
+  it("receive loop 连接错误时会记录结束摘要并标记已触发重连", async () => {
+    testDiagnostics().__TERMD_TRACE__ = true;
+    testDiagnostics().__TERMD_DIAG_EVENTS__ = [];
+
+    const errorClient = {
+      receiveInner: vi.fn(async () => {
+        throw new ProtocolClientError("connection_closed", "connection closed");
+      }),
+      sendSupervisorTerminalHeartbeatPong: vi.fn(),
+    } as unknown as DirectClient;
+    const controller = renderHook(() => useTerminalAttach()).result.current;
+    const attachClientRef = { current: errorClient };
+    const sessionFilesFollowTerminalCwdRef = { current: false };
+    const setSafeError = vi.fn();
+    controller.attachReconnectHandlerRef.current = vi.fn(() => true);
+    const startReceiveLoop = renderHook(() =>
+      useTerminalReceiveLoop(controller, {
+        attachClientRef,
+        sessionFilesFollowTerminalCwdRef,
+        applyConfirmedSessionSize: vi.fn(),
+        enqueueTerminalOutput: vi.fn(),
+        isIgnoredClosingSessionError: vi.fn(() => false),
+        markNewOutputIfBackground: vi.fn(),
+        setSafeError,
+        setSessionFiles: vi.fn(),
+        setSessionFilesError: vi.fn(),
+        setSessionFilesLoading: vi.fn(),
+        setSessionGit: vi.fn(),
+        setSessionGitError: vi.fn(),
+        setSessionGitLoading: vi.fn(),
+      }),
+    ).result.current;
+
+    act(() => {
+      controller.attachedSessionRef.current = SESSION_ID;
+      startReceiveLoop(errorClient);
+    });
+
+    await waitFor(() => {
+      expect(testDiagnostics().__TERMD_DIAG_EVENTS__).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            name: "receive_loop_end",
+            fields: expect.objectContaining({
+              loopGeneration: 1,
+              attachedSessionId: SESSION_ID,
+              reason: "error",
+              code: "connection_closed",
+              reconnectScheduled: true,
+            }),
+          }),
+        ]),
+      );
+    });
+    expect(setSafeError).not.toHaveBeenCalled();
   });
 });

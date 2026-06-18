@@ -15,6 +15,7 @@ import {
   withAbort,
   withTimeout,
 } from "./socket-transport";
+import { recordProtocolTimeout } from "../diagnostics";
 import { BINARY_PROTOCOL_VERSION, PROTOCOL_PACKET_VERSION } from "./types";
 import type {
   E2eeKeyExchangePayload,
@@ -69,6 +70,13 @@ export async function performDirectHandshake(
       hedgeDelayMs: options.socketOpenHedgeDelayMs,
       webSocketFactory: options.webSocketFactory,
       signal: abortSignal,
+      diagnostics: {
+        layer: "client",
+        phase: "connect",
+        transport: "websocket",
+        serverId: routeServerId,
+        deviceId,
+      },
     });
     inbox = options.createInbox(socket);
 
@@ -84,12 +92,27 @@ export async function performDirectHandshake(
         timestamp_ms: nowMs(),
       }),
     );
-    const routeReady = expectQueuedEnvelope(
-      await withAbort(
+    let routeReadyMessage;
+    try {
+      routeReadyMessage = await withAbort(
         withTimeout(inbox.read(), options.timeoutMs, "route_prelude_timeout"),
         abortSignal,
-      ),
-    );
+      );
+    } catch (error) {
+      if (error instanceof ProtocolClientError && error.code === "route_prelude_timeout") {
+        recordProtocolTimeout({
+          layer: "client",
+          phase: "route_prelude",
+          transport: "websocket",
+          timeout_code: error.code,
+          timeout_ms: options.timeoutMs,
+          server_id: routeServerId,
+          device_id: deviceId,
+        });
+      }
+      throw error;
+    }
+    const routeReady = expectQueuedEnvelope(routeReadyMessage);
     if (routeReady.type === "error") {
       throw protocolError(routeReady.payload as ErrorPayload);
     }
@@ -101,12 +124,27 @@ export async function performDirectHandshake(
       throw new ProtocolClientError("route_server_mismatch", "route prelude does not match requested daemon");
     }
 
-    const initial = (
-      await withAbort(
+    let initialMessages;
+    try {
+      initialMessages = await withAbort(
         withTimeout(Promise.all([inbox.read(), inbox.read()]), options.timeoutMs, "handshake_timeout"),
         abortSignal,
-      )
-    ).map(expectQueuedEnvelope);
+      );
+    } catch (error) {
+      if (error instanceof ProtocolClientError && error.code === "handshake_timeout") {
+        recordProtocolTimeout({
+          layer: "client",
+          phase: "handshake",
+          transport: "websocket",
+          timeout_code: error.code,
+          timeout_ms: options.timeoutMs,
+          server_id: routeServerId,
+          device_id: deviceId,
+        });
+      }
+      throw error;
+    }
+    const initial = initialMessages.map(expectQueuedEnvelope);
 
     const expectedDaemonPublicKey = options.expectedDaemonPublicKey;
     if (!expectedDaemonPublicKey) {

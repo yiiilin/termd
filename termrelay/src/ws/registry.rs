@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use termd_proto::{Nonce, RelayClientId, RelayControlEnvelope, ServerId};
 use thiserror::Error;
@@ -34,6 +34,7 @@ struct RelayRoom {
 struct ClientCloseOutcome {
     removed: bool,
     notified_data_pipe: bool,
+    pair_summary: Option<ClientPairLogContext>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -109,6 +110,7 @@ impl RelayRoom {
         let mut outcome = ClientCloseOutcome {
             removed: true,
             notified_data_pipe: false,
+            pair_summary: Some(client_pair_log_context(&client, Instant::now())),
         };
         self.release_client_pre_pair_bytes(&client);
         client.pair_signal.notify_waiters();
@@ -201,6 +203,29 @@ struct ConnectionEndpoint {
     pre_pair_buffer: PrePairBuffer,
     pre_pair_flush_in_progress: bool,
     pair_signal: Arc<Notify>,
+    created_at: Instant,
+    paired_at: Option<Instant>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ClientPairLogContext {
+    pub(super) wait_ms: u64,
+    pub(super) paired: bool,
+    pub(super) pre_pair_frames: usize,
+    pub(super) pre_pair_bytes: usize,
+}
+
+fn duration_ms_saturated(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn client_pair_log_context(client: &ConnectionEndpoint, now: Instant) -> ClientPairLogContext {
+    ClientPairLogContext {
+        wait_ms: duration_ms_saturated(now.saturating_duration_since(client.created_at)),
+        paired: client.paired_daemon_data_id.is_some(),
+        pre_pair_frames: client.pre_pair_buffer.frames.len(),
+        pre_pair_bytes: client.pre_pair_buffer.bytes(),
+    }
 }
 
 impl ConnectionEndpoint {
@@ -214,6 +239,8 @@ impl ConnectionEndpoint {
             pre_pair_buffer: PrePairBuffer::default(),
             pre_pair_flush_in_progress: false,
             pair_signal: Arc::new(Notify::new()),
+            created_at: Instant::now(),
+            paired_at: None,
         }
     }
 
@@ -227,6 +254,8 @@ impl ConnectionEndpoint {
             pre_pair_buffer: PrePairBuffer::default(),
             pre_pair_flush_in_progress: false,
             pair_signal: Arc::new(Notify::new()),
+            created_at: Instant::now(),
+            paired_at: None,
         }
     }
 
@@ -240,6 +269,8 @@ impl ConnectionEndpoint {
             pre_pair_buffer: PrePairBuffer::default(),
             pre_pair_flush_in_progress: false,
             pair_signal: Arc::new(Notify::new()),
+            created_at: Instant::now(),
+            paired_at: None,
         }
     }
 }
@@ -412,6 +443,13 @@ impl RelayRegistry {
                             return Err(RelayError::DaemonDataRouteRejected);
                         }
                         client.paired_daemon_data_id = Some(id);
+                        let paired_at = Instant::now();
+                        client.paired_at = Some(paired_at);
+                        let pair_wait_ms = duration_ms_saturated(
+                            paired_at.saturating_duration_since(client.created_at),
+                        );
+                        let pre_pair_frames = client.pre_pair_buffer.frames.len();
+                        let pre_pair_bytes = client.pre_pair_buffer.bytes();
                         // 中文注释：data pipe 已经完成身份配对，但配对前 client 可能已有
                         // 业务帧排在预缓冲里。flush 完成前，新来的帧仍必须继续进入同一
                         // 预缓冲队列，否则会越过旧帧直达 daemon data。
@@ -425,6 +463,9 @@ impl RelayRegistry {
                             server_id = %server_id.0,
                             connection_id = id,
                             client_connection_id = client_id,
+                            pair_wait_ms,
+                            pre_pair_frames,
+                            pre_pair_bytes,
                             "relay registered daemon data pipe"
                         );
                     }
@@ -548,13 +589,26 @@ impl RelayRegistry {
                 }
             }
             ConnectionRole::Client => {
-                debug!(
-                    server_id = %registration.server_id.0,
-                    connection_id = registration.id,
-                    remaining_clients = room.clients.len(),
-                    "relay unregistering client"
-                );
                 let close = room.close_client_transport(registration.id);
+                if let Some(summary) = close.pair_summary {
+                    debug!(
+                        server_id = %registration.server_id.0,
+                        connection_id = registration.id,
+                        remaining_clients = room.clients.len(),
+                        pair_wait_ms = summary.wait_ms,
+                        paired = summary.paired,
+                        pre_pair_frames = summary.pre_pair_frames,
+                        pre_pair_bytes = summary.pre_pair_bytes,
+                        "relay unregistering client"
+                    );
+                } else {
+                    debug!(
+                        server_id = %registration.server_id.0,
+                        connection_id = registration.id,
+                        remaining_clients = room.clients.len(),
+                        "relay unregistering client"
+                    );
+                }
                 // 中文注释：已配对 data pipe 直接收到 client_disconnected；尚未配对的
                 // pending client 只能通过 control 线通知 daemon 取消冷启动 data 任务。
                 if close.removed && !close.notified_data_pipe {
@@ -591,23 +645,23 @@ impl RelayRegistry {
     pub(super) fn close_pending_client_if_unpaired(
         &self,
         registration: &ConnectionRegistration,
-    ) -> bool {
+    ) -> Option<ClientPairLogContext> {
         if registration.role != ConnectionRole::Client {
-            return false;
+            return None;
         }
 
         let Ok(mut rooms) = self.rooms.lock() else {
             warn!("relay registry mutex poisoned during pending client deadline cleanup");
-            return false;
+            return None;
         };
         let Some(room) = rooms.get_mut(&registration.server_id) else {
-            return false;
+            return None;
         };
         let Some(client) = room.clients.get(&registration.id) else {
-            return false;
+            return None;
         };
         if client.paired_daemon_data_id.is_some() {
-            return false;
+            return None;
         }
 
         let close = room.close_client_transport(registration.id);
@@ -615,7 +669,11 @@ impl RelayRegistry {
             room.notify_client_disconnected_to_control(registration.id);
         }
         Self::remove_room_if_empty(&mut rooms, registration.server_id);
-        close.removed
+        if close.removed {
+            close.pair_summary
+        } else {
+            None
+        }
     }
 
     pub(super) async fn wait_client_data_pair(
@@ -649,6 +707,26 @@ impl RelayRegistry {
                 _ = tokio::time::sleep(Duration::from_millis(1)) => {}
             }
         }
+    }
+
+    pub(super) fn daemon_data_pair_wait_ms(
+        &self,
+        registration: &ConnectionRegistration,
+    ) -> Option<u64> {
+        if registration.role != ConnectionRole::DaemonData {
+            return None;
+        }
+        let client_id = registration.paired_client_id?;
+        let Ok(rooms) = self.rooms.lock() else {
+            warn!("relay registry mutex poisoned during daemon data pair wait lookup");
+            return None;
+        };
+        let room = rooms.get(&registration.server_id)?;
+        let client = room.clients.get(&client_id)?;
+        let paired_at = client.paired_at?;
+        Some(duration_ms_saturated(
+            paired_at.saturating_duration_since(client.created_at),
+        ))
     }
 
     pub(super) async fn forward_from(

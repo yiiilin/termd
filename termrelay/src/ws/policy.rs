@@ -155,6 +155,10 @@ where
         }
         Err(_) => {
             warn!(
+                layer = "relay",
+                phase = "websocket_send",
+                timeout_code = "websocket_send_timeout",
+                timeout_ms = deadline.as_millis() as u64,
                 ?deadline,
                 context = context,
                 "relay websocket send timed out"

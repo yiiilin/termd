@@ -344,6 +344,99 @@ impl RelayTrafficCounters {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelayDataPipeCloseReason {
+    SocketClosed,
+    ClientDisconnected,
+    ReceiveFailed,
+    SendFailed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RelayDataPipeSummary {
+    duration_ms: u64,
+    close_reason: RelayDataPipeCloseReason,
+    first_inbound_seen: bool,
+    first_output_seen: bool,
+    first_output_session_id: Option<SessionId>,
+    response_batches: u64,
+    response_bytes: u64,
+    push_output_batches: u64,
+    push_output_bytes: u64,
+}
+
+impl RelayDataPipeSummary {
+    fn should_promote_to_info(self) -> bool {
+        self.first_inbound_seen && !self.first_output_seen
+    }
+}
+
+#[derive(Debug)]
+struct RelayDataPipeSummaryState {
+    started_at: Instant,
+    first_inbound_seen: bool,
+    first_output_session_id: Option<SessionId>,
+    response_batches: u64,
+    response_bytes: u64,
+    push_output_batches: u64,
+    push_output_bytes: u64,
+}
+
+impl RelayDataPipeSummaryState {
+    fn new(now: Instant) -> Self {
+        Self {
+            started_at: now,
+            first_inbound_seen: false,
+            first_output_session_id: None,
+            response_batches: 0,
+            response_bytes: 0,
+            push_output_batches: 0,
+            push_output_bytes: 0,
+        }
+    }
+
+    fn mark_inbound(&mut self) {
+        self.first_inbound_seen = true;
+    }
+
+    fn record_response_batch(&mut self, response_count: usize, response_bytes: usize) {
+        if response_count == 0 && response_bytes == 0 {
+            return;
+        }
+        self.response_batches = self.response_batches.saturating_add(1);
+        self.response_bytes = self.response_bytes.saturating_add(response_bytes as u64);
+    }
+
+    fn record_push_output(&mut self, session_id: SessionId, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        if self.first_output_session_id.is_none() {
+            self.first_output_session_id = Some(session_id);
+        }
+        self.push_output_batches = self.push_output_batches.saturating_add(1);
+        self.push_output_bytes = self.push_output_bytes.saturating_add(bytes as u64);
+    }
+
+    fn snapshot(&self, close_reason: RelayDataPipeCloseReason) -> RelayDataPipeSummary {
+        RelayDataPipeSummary {
+            duration_ms: self
+                .started_at
+                .elapsed()
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64,
+            close_reason,
+            first_inbound_seen: self.first_inbound_seen,
+            first_output_seen: self.first_output_session_id.is_some(),
+            first_output_session_id: self.first_output_session_id,
+            response_batches: self.response_batches,
+            response_bytes: self.response_bytes,
+            push_output_batches: self.push_output_batches,
+            push_output_bytes: self.push_output_bytes,
+        }
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 struct RelayTransportDebugSnapshot {
@@ -827,6 +920,64 @@ pub enum RelayConnectorError {
     InvalidEnvelope,
     #[error("relay mux frame is invalid")]
     InvalidFrame,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelayRouteConnectPhase {
+    TcpConnect,
+    RouteHello,
+    RouteReady,
+}
+
+impl RelayRouteConnectPhase {
+    fn label(self) -> &'static str {
+        match self {
+            Self::TcpConnect => "tcp_connect",
+            Self::RouteHello => "route_hello",
+            Self::RouteReady => "route_ready",
+        }
+    }
+
+    fn timeout_ms(self, connect_timeout: Duration) -> u64 {
+        match self {
+            Self::TcpConnect => connect_timeout.as_millis() as u64,
+            Self::RouteHello => RELAY_SEND_DEADLINE.as_millis() as u64,
+            Self::RouteReady => RELAY_ROUTE_READY_TIMEOUT.as_millis() as u64,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RelayRouteConnectProgress {
+    phase: RelayRouteConnectPhase,
+}
+
+impl RelayRouteConnectProgress {
+    fn new() -> Self {
+        Self {
+            phase: RelayRouteConnectPhase::TcpConnect,
+        }
+    }
+
+    fn phase_label(self) -> &'static str {
+        self.phase.label()
+    }
+
+    fn timeout_ms(self, connect_timeout: Duration) -> u64 {
+        self.phase.timeout_ms(connect_timeout)
+    }
+
+    fn mark_tcp_connected(&mut self) {
+        self.phase = RelayRouteConnectPhase::RouteHello;
+    }
+
+    fn mark_route_hello_sent(&mut self) {
+        self.phase = RelayRouteConnectPhase::RouteReady;
+    }
+}
+
+fn relay_route_log_url(url: &str) -> &str {
+    url.split_once('?').map_or(url, |(base, _)| base)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1442,6 +1593,7 @@ async fn run_relay_established_data_connection(
     let mut watched_cwd_sessions = HashMap::<RelayClientId, HashSet<SessionId>>::new();
     let mut watched_resize_sessions = HashMap::<RelayClientId, HashSet<SessionId>>::new();
     let mut watcher_tasks = HashMap::<RelayClientId, Vec<JoinHandle<()>>>::new();
+    let mut summary = RelayDataPipeSummaryState::new(Instant::now());
 
     let result = loop {
         tokio::select! {
@@ -1463,6 +1615,7 @@ async fn run_relay_established_data_connection(
                         break Err(RelayConnectorError::ReceiveFailed);
                     }
                 };
+                summary.mark_inbound();
                 match message {
                     Message::Ping(payload) => {
                         let control = decode_relay_data_control(&payload);
@@ -1557,8 +1710,11 @@ async fn run_relay_established_data_connection(
                                 &mut pending_push_events,
                             );
                         }
-                        enqueue_relay_data_wire(&write_tx, RelayOutKind::Response, responses)
-                            .await?;
+                        let response_count = responses.len();
+                        let response_bytes =
+                            enqueue_relay_data_wire(&write_tx, RelayOutKind::Response, responses)
+                                .await?;
+                        summary.record_response_batch(response_count, response_bytes);
                         let initial_output_sessions = sync_relay_watchers_for_client(
                             Some(client_id),
                             &connections,
@@ -1584,6 +1740,7 @@ async fn run_relay_established_data_connection(
                             &mut pending_push_events,
                             &write_tx,
                             &mut push_drain_wake_pending,
+                            &mut summary,
                         )
                         .await?;
                     }
@@ -1609,6 +1766,7 @@ async fn run_relay_established_data_connection(
                     &mut pending_push_events,
                     &write_tx,
                     &mut push_drain_wake_pending,
+                    &mut summary,
                 )
                 .await?;
             }
@@ -1623,6 +1781,7 @@ async fn run_relay_established_data_connection(
                     &mut pending_push_events,
                     &write_tx,
                     &mut push_drain_wake_pending,
+                    &mut summary,
                 )
                 .await?;
             }
@@ -1642,6 +1801,49 @@ async fn run_relay_established_data_connection(
         &mut watcher_tasks,
     );
     abort_relay_watcher_tasks(watcher_tasks);
+    let close_reason = match &result {
+        Ok(RelayEstablishedDataEnd::ClientDisconnected) => {
+            RelayDataPipeCloseReason::ClientDisconnected
+        }
+        Ok(RelayEstablishedDataEnd::SocketClosed) => RelayDataPipeCloseReason::SocketClosed,
+        Err(RelayConnectorError::ReceiveFailed) => RelayDataPipeCloseReason::ReceiveFailed,
+        Err(RelayConnectorError::SendFailed) => RelayDataPipeCloseReason::SendFailed,
+        Err(_) => RelayDataPipeCloseReason::SocketClosed,
+    };
+    let summary_snapshot = summary.snapshot(close_reason);
+    if summary_snapshot.should_promote_to_info() {
+        info!(
+            relay = %relay_endpoint,
+            ?server_id,
+            client_id = client_id.0,
+            duration_ms = summary_snapshot.duration_ms,
+            close_reason = ?summary_snapshot.close_reason,
+            first_inbound_seen = summary_snapshot.first_inbound_seen,
+            first_output_seen = summary_snapshot.first_output_seen,
+            first_output_session_id = ?summary_snapshot.first_output_session_id,
+            response_batches = summary_snapshot.response_batches,
+            response_bytes = summary_snapshot.response_bytes,
+            push_output_batches = summary_snapshot.push_output_batches,
+            push_output_bytes = summary_snapshot.push_output_bytes,
+            "relay daemon data pipe summary"
+        );
+    } else {
+        debug!(
+            relay = %relay_endpoint,
+            ?server_id,
+            client_id = client_id.0,
+            duration_ms = summary_snapshot.duration_ms,
+            close_reason = ?summary_snapshot.close_reason,
+            first_inbound_seen = summary_snapshot.first_inbound_seen,
+            first_output_seen = summary_snapshot.first_output_seen,
+            first_output_session_id = ?summary_snapshot.first_output_session_id,
+            response_batches = summary_snapshot.response_batches,
+            response_bytes = summary_snapshot.response_bytes,
+            push_output_batches = summary_snapshot.push_output_batches,
+            push_output_bytes = summary_snapshot.push_output_bytes,
+            "relay daemon data pipe summary"
+        );
+    }
     match result {
         Ok(RelayEstablishedDataEnd::ClientDisconnected) => {
             // 中文注释：client 断开后不再复用当前 daemon data pipe。
@@ -2217,6 +2419,7 @@ async fn drain_relay_data_push_events(
     pending_push_events: &mut RelayPushEventQueue,
     write_tx: &mpsc::Sender<RelayDataWrite>,
     push_drain_wake_pending: &mut bool,
+    summary: &mut RelayDataPipeSummaryState,
 ) -> Result<(), RelayConnectorError> {
     let started_at = Instant::now();
     let mut drained_events = 0_usize;
@@ -2306,6 +2509,9 @@ async fn drain_relay_data_push_events(
             continue;
         }
         let bytes = enqueue_relay_data_wire_with_permit(push_permit, kind, responses);
+        if kind == RelayOutKind::PushOutput {
+            summary.record_push_output(session_id, bytes);
+        }
         drained_events = drained_events.saturating_add(1);
         sent_bytes = sent_bytes.saturating_add(bytes);
         trace!(
@@ -3138,9 +3344,43 @@ async fn connect_relay_route_socket_with_timeout(
     data_token: Option<ProtoNonce>,
     connect_timeout: Duration,
 ) -> Result<(RelaySender, RelayReceiver), RelayConnectorError> {
-    let (socket, _) = connect_relay_websocket(url, proxy, connect_timeout).await?;
+    let relay_log_url = relay_route_log_url(url);
+    let emit_phase_logs = matches!(role, ProtoRouteRole::DaemonData);
+    let mut progress = RelayRouteConnectProgress::new();
+
+    let (socket, _) = match connect_relay_websocket(url, proxy, connect_timeout).await {
+        Ok(socket) => socket,
+        Err(error) => {
+            if emit_phase_logs {
+                warn!(
+                    layer = "termd",
+                    relay = relay_log_url,
+                    server_id = %server_id.0,
+                    client_id = client_id.map(|id| id.0),
+                    role = ?role,
+                    phase = progress.phase_label(),
+                    timeout_ms = progress.timeout_ms(connect_timeout),
+                    %error,
+                    "relay route socket phase failed"
+                );
+            }
+            return Err(error);
+        }
+    };
+    if emit_phase_logs {
+        trace!(
+            relay = relay_log_url,
+            server_id = %server_id.0,
+            client_id = client_id.map(|id| id.0),
+            role = ?role,
+            phase = RelayRouteConnectPhase::TcpConnect.label(),
+            timeout_ms = RelayRouteConnectPhase::TcpConnect.timeout_ms(connect_timeout),
+            "relay route socket phase completed"
+        );
+    }
+    progress.mark_tcp_connected();
     let (mut sender, mut receiver) = socket.split();
-    send_route_hello(
+    if let Err(error) = send_route_hello(
         &mut sender,
         server_id,
         role,
@@ -3148,8 +3388,62 @@ async fn connect_relay_route_socket_with_timeout(
         client_id,
         data_token,
     )
-    .await?;
-    read_route_ready(&mut sender, &mut receiver, server_id, role).await?;
+    .await
+    {
+        if emit_phase_logs {
+            warn!(
+                layer = "termd",
+                relay = relay_log_url,
+                server_id = %server_id.0,
+                client_id = client_id.map(|id| id.0),
+                role = ?role,
+                phase = progress.phase_label(),
+                timeout_ms = progress.timeout_ms(connect_timeout),
+                %error,
+                "relay route socket phase failed"
+            );
+        }
+        return Err(error);
+    }
+    if emit_phase_logs {
+        trace!(
+            relay = relay_log_url,
+            server_id = %server_id.0,
+            client_id = client_id.map(|id| id.0),
+            role = ?role,
+            phase = RelayRouteConnectPhase::RouteHello.label(),
+            timeout_ms = RelayRouteConnectPhase::RouteHello.timeout_ms(connect_timeout),
+            "relay route socket phase completed"
+        );
+    }
+    progress.mark_route_hello_sent();
+    if let Err(error) = read_route_ready(&mut sender, &mut receiver, server_id, role).await {
+        if emit_phase_logs {
+            warn!(
+                layer = "termd",
+                relay = relay_log_url,
+                server_id = %server_id.0,
+                client_id = client_id.map(|id| id.0),
+                role = ?role,
+                phase = progress.phase_label(),
+                timeout_ms = progress.timeout_ms(connect_timeout),
+                %error,
+                "relay route socket phase failed"
+            );
+        }
+        return Err(error);
+    }
+    if emit_phase_logs {
+        debug!(
+            relay = relay_log_url,
+            server_id = %server_id.0,
+            client_id = client_id.map(|id| id.0),
+            role = ?role,
+            phase = RelayRouteConnectPhase::RouteReady.label(),
+            timeout_ms = RelayRouteConnectPhase::RouteReady.timeout_ms(connect_timeout),
+            "relay route socket phase completed"
+        );
+    }
     Ok((sender, receiver))
 }
 
@@ -3186,10 +3480,21 @@ async fn read_route_ready(
 ) -> Result<(), RelayConnectorError> {
     let route_deadline = Instant::now() + RELAY_ROUTE_READY_TIMEOUT;
     loop {
-        let Some(message) = tokio::time::timeout_at(route_deadline, receiver.next())
-            .await
-            .map_err(|_| RelayConnectorError::RouteReadyTimeout)?
-        else {
+        let Some(message) = (match tokio::time::timeout_at(route_deadline, receiver.next()).await {
+            Ok(message) => message,
+            Err(_) => {
+                warn!(
+                    layer = "termd",
+                    phase = "relay_route_ready",
+                    timeout_code = "relay_route_ready_timeout",
+                    timeout_ms = RELAY_ROUTE_READY_TIMEOUT.as_millis() as u64,
+                    server_id = %expected_server_id.0,
+                    role = ?expected_role,
+                    "relay route_ready timed out"
+                );
+                return Err(RelayConnectorError::RouteReadyTimeout);
+            }
+        }) else {
             return Err(RelayConnectorError::ReceiveFailed);
         };
         let message = message.map_err(|_| RelayConnectorError::ReceiveFailed)?;
@@ -3801,6 +4106,9 @@ async fn enqueue_relay_mux_envelopes(
             Ok(Err(_closed)) => Err(RelayConnectorError::SendFailed),
             Err(_elapsed) => {
                 warn!(
+                    layer = "termd",
+                    phase = "relay_control_write",
+                    timeout_code = "relay_control_write_timeout",
                     relay = relay_endpoint,
                     client_id = client_id.map(|id| id.0),
                     order,
@@ -5316,6 +5624,35 @@ mod tests {
         assert_eq!(queue.pop_front(), Some(event));
     }
 
+    #[test]
+    fn relay_data_pipe_summary_promotes_input_without_output() {
+        let suspicious = RelayDataPipeSummary {
+            duration_ms: 1200,
+            close_reason: RelayDataPipeCloseReason::SocketClosed,
+            first_inbound_seen: true,
+            first_output_seen: false,
+            first_output_session_id: None,
+            response_batches: 2,
+            response_bytes: 256,
+            push_output_batches: 0,
+            push_output_bytes: 0,
+        };
+        let healthy = RelayDataPipeSummary {
+            duration_ms: 1200,
+            close_reason: RelayDataPipeCloseReason::SocketClosed,
+            first_inbound_seen: true,
+            first_output_seen: true,
+            first_output_session_id: Some(SessionId::new()),
+            response_batches: 2,
+            response_bytes: 256,
+            push_output_batches: 3,
+            push_output_bytes: 1024,
+        };
+
+        assert!(suspicious.should_promote_to_info());
+        assert!(!healthy.should_promote_to_info());
+    }
+
     #[tokio::test]
     async fn relay_client_runtime_drop_clears_pending_watchers_and_aborts_tasks() {
         let client_id = RelayClientId(1);
@@ -5715,6 +6052,7 @@ mod tests {
             })
             .expect("test writer queue should start full");
         let mut push_drain_wake_pending = false;
+        let mut summary = RelayDataPipeSummaryState::new(Instant::now());
 
         // 中文注释：下行 writer 队列满时，terminal push 不能 await 队列腾挪；
         // data pipe 主循环必须回到 select 继续读 stdin/close，并靠定时 wakeup 重试输出。
@@ -5729,6 +6067,7 @@ mod tests {
                 &mut pending_push_events,
                 &write_tx,
                 &mut push_drain_wake_pending,
+                &mut summary,
             ),
         )
         .await;
@@ -6764,6 +7103,20 @@ mod tests {
             Err(RelayConnectorError::RouteReadyTimeout)
         ));
         server.abort();
+    }
+
+    #[test]
+    fn relay_data_connect_phase_labels_timeout_stage() {
+        let mut progress = RelayRouteConnectProgress::new();
+        assert_eq!(progress.phase_label(), "tcp_connect");
+
+        // 中文注释：TCP/TLS/WebSocket 已建好后，下一步应该卡在 route_hello。
+        progress.mark_tcp_connected();
+        assert_eq!(progress.phase_label(), "route_hello");
+
+        // 中文注释：route_hello 已发出后，剩余等待点就是 route_ready。
+        progress.mark_route_hello_sent();
+        assert_eq!(progress.phase_label(), "route_ready");
     }
 
     #[tokio::test(flavor = "multi_thread")]

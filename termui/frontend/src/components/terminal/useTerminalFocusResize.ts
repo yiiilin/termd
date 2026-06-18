@@ -42,6 +42,23 @@ export function useTerminalFocusResizeState() {
     mobileInputFocusRescueUntilRef.current = Date.now() + MOBILE_INPUT_FOCUS_RESCUE_MS;
   }, []);
 
+  const clearMobileInputFocusRescue = useCallback(() => {
+    mobileInputFocusRescueUntilRef.current = 0;
+  }, []);
+
+  const clearScheduledMobileInputFocusRestore = useCallback(() => {
+    for (const timer of mobileInputFocusRestoreTimersRef.current) {
+      window.clearTimeout(timer);
+    }
+    mobileInputFocusRestoreTimersRef.current = [];
+  }, []);
+
+  const cancelMobileInputFocusRecovery = useCallback(() => {
+    clearPendingFocusOut();
+    clearScheduledMobileInputFocusRestore();
+    clearMobileInputFocusRescue();
+  }, [clearMobileInputFocusRescue, clearPendingFocusOut, clearScheduledMobileInputFocusRestore]);
+
   const mobileInputFocusRescueActive = useCallback(() => (
     Date.now() <= mobileInputFocusRescueUntilRef.current
   ), []);
@@ -49,17 +66,8 @@ export function useTerminalFocusResizeState() {
   const installTerminalFocusResizeListeners = useCallback((options: InstallTerminalFocusResizeListenersOptions) => {
     const isMobileInputModeEnabled = () => Boolean(options.isMobileInputMode?.());
     const isMobileKeyboardOpenFromProps = () => Boolean(options.isMobileKeyboardOpen?.());
-    const clearMobileInputFocusRescue = () => {
-      mobileInputFocusRescueUntilRef.current = 0;
-    };
     const mobileInputFocusRescueActiveForListeners = () =>
       isMobileInputModeEnabled() && mobileInputFocusRescueActive();
-    const clearScheduledMobileInputFocusRestore = () => {
-      for (const timer of mobileInputFocusRestoreTimersRef.current) {
-        window.clearTimeout(timer);
-      }
-      mobileInputFocusRestoreTimersRef.current = [];
-    };
     const blurActiveTerminalElement = () => {
       const activeElement = document.activeElement;
       if (activeElement instanceof HTMLElement && options.host.contains(activeElement)) {
@@ -344,7 +352,7 @@ export function useTerminalFocusResizeState() {
       options.host.removeEventListener("focusin", handleFocusIn);
       options.host.removeEventListener("focusout", handleFocusOut);
     };
-  }, [clearPendingFocusOut]);
+  }, [clearMobileInputFocusRescue, clearPendingFocusOut, clearScheduledMobileInputFocusRestore, mobileInputFocusRescueActive]);
 
   return {
     focused,
@@ -359,6 +367,7 @@ export function useTerminalFocusResizeState() {
     focusOutTimerRef,
     clearPendingFocusOut,
     armMobileInputFocusRescue,
+    cancelMobileInputFocusRecovery,
     mobileInputFocusRescueActive,
     installTerminalFocusResizeListeners,
   };

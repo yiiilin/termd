@@ -179,13 +179,10 @@ test("mobile terminal 迟到 contextmenu 不会收起 helper textarea 焦点", a
     const terminalSurface = page.locator(".terminal-host .xterm-screen, .terminal-host canvas").first();
     const terminalInput = page.locator('.terminal-host textarea[aria-label="Terminal input"]').first();
 
-    await terminalSurface.dispatchEvent("pointerdown", {
-      pointerId: 92,
-      pointerType: "touch",
-      button: 0,
-      clientX: 24,
-      clientY: 24,
-    });
+    // 中文注释：当前移动端语义已经改成“明确 tap/click 才激活输入”，不能再用
+    // pointerdown 充当键盘唤起边界。这里先建立一次真实 tap，再验证迟到 contextmenu
+    // 不会把已经存在的 helper textarea 焦点收走。
+    await terminalSurface.tap({ position: { x: 24, y: 24 } });
     await expect(terminalInput).toBeFocused();
 
     await page.waitForTimeout(800);

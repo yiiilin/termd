@@ -1,4 +1,5 @@
 import { ProtocolClientError } from "./errors";
+import { recordProtocolTimeout } from "../diagnostics";
 import type { Envelope } from "./types";
 import { encodeUtf8 } from "./wire";
 
@@ -12,6 +13,13 @@ export interface OpenWebSocketOptions {
   hedgeDelayMs?: number;
   webSocketFactory?: (url: string) => WebSocket;
   signal?: AbortSignal;
+  diagnostics?: {
+    layer?: "client";
+    phase?: string;
+    transport?: string;
+    serverId?: string;
+    deviceId?: string;
+  };
 }
 
 export function queuedMessageBytes(message: QueuedMessage): number {
@@ -129,6 +137,17 @@ export function openWebSocket(url: string, options: OpenWebSocketOptions): Promi
           active -= 1;
           lastError = error instanceof Error ? error : new ProtocolClientError("connect_timeout", "operation timed out");
           if (!maybeStartAnother()) {
+            if (lastError instanceof ProtocolClientError && lastError.code === "connect_timeout") {
+              recordProtocolTimeout({
+                layer: options.diagnostics?.layer ?? "client",
+                phase: options.diagnostics?.phase ?? "connect",
+                transport: options.diagnostics?.transport ?? "websocket",
+                timeout_code: lastError.code,
+                timeout_ms: options.timeoutMs,
+                server_id: options.diagnostics?.serverId,
+                device_id: options.diagnostics?.deviceId,
+              });
+            }
             maybeReject();
           }
         },

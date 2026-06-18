@@ -21,6 +21,15 @@ import type {
 import { concatBytes, encodeUtf8 } from "../protocol/wire";
 import { MockDaemon } from "../test/mock-daemon";
 
+interface TestDiagnosticEvent {
+  name: string;
+  fields?: Record<string, unknown>;
+}
+
+function testDiagnostics(): { __TERMD_TRACE__?: boolean; __TERMD_DIAG_EVENTS__?: TestDiagnosticEvent[] } {
+  return globalThis as { __TERMD_TRACE__?: boolean; __TERMD_DIAG_EVENTS__?: TestDiagnosticEvent[] };
+}
+
 describe("DirectClient", () => {
   let daemon: MockDaemon;
   const missingSessionId = "00000000-0000-0000-0000-000000000399";
@@ -41,6 +50,8 @@ describe("DirectClient", () => {
   });
 
   afterEach(async () => {
+    delete testDiagnostics().__TERMD_TRACE__;
+    delete testDiagnostics().__TERMD_DIAG_EVENTS__;
     await daemon.stop();
   });
 
@@ -94,6 +105,11 @@ describe("DirectClient", () => {
       };
       tick();
     }), timeoutMs, label);
+  }
+
+  function enableTimeoutDiagnostics(): void {
+    testDiagnostics().__TERMD_TRACE__ = true;
+    testDiagnostics().__TERMD_DIAG_EVENTS__ = [];
   }
 
   async function receiveUntilType(client: DirectClient, expectedType: string): Promise<{ type: string; payload: unknown }> {
@@ -626,6 +642,7 @@ describe("DirectClient", () => {
   });
 
   it("连接认证长预算不会放大普通请求短超时", async () => {
+    enableTimeoutDiagnostics();
     const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000318");
     const pairClient = await connectDevice(device.device_id, 300);
     const accepted = await pairClient.pair("secret-token", device.device_public_key);
@@ -657,6 +674,21 @@ describe("DirectClient", () => {
       80,
     );
     await expect(client.listSessions()).rejects.toMatchObject({ code: "response_timeout" });
+    expect(testDiagnostics().__TERMD_DIAG_EVENTS__).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          name: "protocol_timeout",
+          fields: expect.objectContaining({
+            layer: "client",
+            phase: "http_request",
+            transport: "http",
+            path: "/api/control/session/list",
+            timeout_code: "response_timeout",
+            timeout_ms: 30,
+          }),
+        }),
+      ]),
+    );
 
     // 中文注释：普通 RPC timeout 是 UI deadline，不是连接失败。
     // 迟到的 session.list response 会被 request id 丢弃；同一 WebSocket 后续 RPC 仍可继续。
@@ -1381,6 +1413,44 @@ describe("DirectClient", () => {
       __directClientTestInternals.onReceivePumpYield = undefined;
       client.close();
     }
+  });
+
+  it("连接关闭时会记录 socket 与 receive pump 结束摘要", async () => {
+    enableTimeoutDiagnostics();
+    const { client } = await authenticatedClient("00000000-0000-0000-0000-000000000338");
+
+    daemon.dropConnections();
+
+    await expect(settleWithin(client.receiveInner(), 1000, "receiveInner close")).rejects.toMatchObject({
+      code: "connection_closed",
+    });
+    await waitUntil(
+      () =>
+        (testDiagnostics().__TERMD_DIAG_EVENTS__ ?? []).some((event) => event.name === "direct_receive_pump_end"),
+      "receive pump end diagnostic",
+      1000,
+    );
+
+    expect(testDiagnostics().__TERMD_DIAG_EVENTS__).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          name: "direct_socket_close",
+          fields: expect.objectContaining({
+            serverId: daemon.serverId,
+            deviceId: "00000000-0000-0000-0000-000000000338",
+          }),
+        }),
+        expect.objectContaining({
+          name: "direct_receive_pump_end",
+          fields: expect.objectContaining({
+            serverId: daemon.serverId,
+            deviceId: "00000000-0000-0000-0000-000000000338",
+            reason: "error",
+            code: "connection_closed",
+          }),
+        }),
+      ]),
+    );
   });
 
   it.each([
@@ -2290,6 +2360,7 @@ describe("DirectClient", () => {
   });
 
   it("HTTP 下载首个元数据响应帧使用短超时", async () => {
+    enableTimeoutDiagnostics();
     const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000321");
     const pairClient = await connectDevice(device.device_id);
     const accepted = await pairClient.pair("secret-token", device.device_public_key);
@@ -2315,6 +2386,21 @@ describe("DirectClient", () => {
       await expect(client.downloadSessionFile(sessionId, "/tmp/raw.bin", { timeoutMs: 20 })).rejects.toMatchObject({
         code: "response_timeout",
       });
+      expect(testDiagnostics().__TERMD_DIAG_EVENTS__).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            name: "protocol_timeout",
+            fields: expect.objectContaining({
+              layer: "client",
+              phase: "http_first_frame",
+              transport: "http",
+              path: "/api/files/download",
+              timeout_code: "response_timeout",
+              timeout_ms: 20,
+            }),
+          }),
+        ]),
+      );
     } finally {
       (globalThis as unknown as { fetch: typeof fetch }).fetch = originalFetch;
       client.close();

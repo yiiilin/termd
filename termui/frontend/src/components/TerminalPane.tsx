@@ -181,6 +181,7 @@ export function TerminalPane(props: TerminalPaneProps) {
   const terminalScrollTimerRef = useRef<number | undefined>(undefined);
   const lastTerminalScrollReportAtRef = useRef(0);
   const terminalRenderedOutputBytesSinceSnapshotRef = useRef(0);
+  const terminalObservedLiveOutputSinceSnapshotRef = useRef(false);
   const terminalOutputIdleRef = useRef(true);
   const terminalOutputIdleSinceRef = useRef<number | undefined>(undefined);
   const terminalServerScrollbackResyncPendingRef = useRef(false);
@@ -305,6 +306,7 @@ export function TerminalPane(props: TerminalPaneProps) {
     focusOutTimerRef,
     clearPendingFocusOut,
     armMobileInputFocusRescue,
+    cancelMobileInputFocusRecovery,
     mobileInputFocusRescueActive,
     installTerminalFocusResizeListeners,
   } = useTerminalFocusResizeState();
@@ -602,7 +604,7 @@ export function TerminalPane(props: TerminalPaneProps) {
       return;
     }
     const repairAgeMs = nowForThrottle() - pendingRepair.createdAtMs;
-    if (terminalRenderedOutputBytesSinceSnapshotRef.current > 0) {
+    if (terminalObservedLiveOutputSinceSnapshotRef.current) {
       recordTermdDiagnostic("terminal_snapshot_history_repair_abandoned", {
         snapshotRows: pendingRepair.snapshotRows,
         snapshotCols: pendingRepair.snapshotCols,
@@ -610,6 +612,7 @@ export function TerminalPane(props: TerminalPaneProps) {
         sessionCols: sessionSize.cols,
         repairAgeMs,
         renderedBytesSinceSnapshot: terminalRenderedOutputBytesSinceSnapshotRef.current,
+        liveOutputSinceSnapshot: terminalObservedLiveOutputSinceSnapshotRef.current,
       });
       // 中文注释：一旦旧尺寸 snapshot 之后已经开始渲染 live output，就不再自动发起
       // full snapshot repair。此时再重连重放会打断正在恢复的 relay/stdout 流，
@@ -632,6 +635,7 @@ export function TerminalPane(props: TerminalPaneProps) {
           sessionRows: sessionSize.rows,
           sessionCols: sessionSize.cols,
           renderedBytesSinceSnapshot: terminalRenderedOutputBytesSinceSnapshotRef.current,
+          liveOutputSinceSnapshot: terminalObservedLiveOutputSinceSnapshotRef.current,
         });
         pendingSnapshotHistoryRepairRef.current = undefined;
         onTerminalResyncRef.current?.(undefined);
@@ -671,6 +675,7 @@ export function TerminalPane(props: TerminalPaneProps) {
     setSearchResult(undefined);
     searchAddonRef.current?.clearDecorations();
     terminalRenderedOutputBytesSinceSnapshotRef.current = 0;
+    terminalObservedLiveOutputSinceSnapshotRef.current = false;
     terminalOutputIdleRef.current = true;
     terminalOutputIdleSinceRef.current = undefined;
     terminalServerScrollbackResyncPendingRef.current = false;
@@ -1388,6 +1393,7 @@ export function TerminalPane(props: TerminalPaneProps) {
     }
     if (item.kind === "snapshot") {
       terminalRenderedOutputBytesSinceSnapshotRef.current = 0;
+      terminalObservedLiveOutputSinceSnapshotRef.current = false;
       terminalOutputIdleRef.current = true;
       terminalOutputIdleSinceRef.current = undefined;
       terminalServerScrollbackResyncPendingRef.current = false;
@@ -1401,6 +1407,11 @@ export function TerminalPane(props: TerminalPaneProps) {
       terminalOutputIdleSinceRef.current = undefined;
       clearTerminalServerScrollbackResyncIdleTimer();
       clearPendingSnapshotHistoryRepairSchedule();
+      // 中文注释：history repair 只关心“这个 snapshot 之后是否已经见过 live output”，
+      // 不能再和 scrollback 预取共用同一个字节计数器；后者会在本地已有历史时被清零。
+      if (item.bytes.byteLength > 0) {
+        terminalObservedLiveOutputSinceSnapshotRef.current = true;
+      }
       terminalRenderedOutputBytesSinceSnapshotRef.current += serverScrollableOutputBytes(item.bytes);
     }
   };
@@ -1574,19 +1585,14 @@ export function TerminalPane(props: TerminalPaneProps) {
       window.clearTimeout(passiveFocusBypassTimerRef.current);
       passiveFocusBypassTimerRef.current = undefined;
     }
-    // 中文注释：真机软键盘可能在 pointerdown 后、click 前就触发 window blur/focusout。
-    // 这里先打开短暂的 helper textarea 救援窗口，避免这段早到失焦把刚弹出的键盘关掉。
+    cancelMobileInputFocusRecovery();
     windowActiveRef.current = true;
-    passiveFocusBypassRef.current = true;
-    armMobileInputFocusRescue();
-    armMobileKeyboardResizeSuppress();
-    // 中文注释：移动端软键盘只信任用户手势内的 focus。等到 click 或 rAF 再聚焦时，
-    // 部分浏览器会先弹键盘再立刻收起；这里同步把输入 sink 拉起，但仍保持 passive
-    // 状态，真正的 operator 接管和远端 resize 继续留给 click/focusRequest 路径。
-    focusTerminalInputSink(terminalRef.current, {
-      force: !mobileKeyboardOpenRef.current,
-    });
-    mobilePointerDownInputFocusRef.current = true;
+    suppressPassiveFocusRef.current = true;
+    // 中文注释：移动端触摸落下可能只是想滚动 scrollback，不能在 pointerdown 阶段
+    // 提前聚焦 helper textarea。否则软键盘会先于滚动手势弹起，用户几乎无法上下拖动。
+    // 真正允许键盘恢复的边界统一后移到明确的 tap/click 或显式 focusRequest 路径。
+    passiveFocusBypassRef.current = false;
+    mobilePointerDownInputFocusRef.current = false;
     mobileScrollGestureRef.current = {
       pointerId: event.pointerId,
       startX: event.clientX,
@@ -2169,11 +2175,12 @@ export function TerminalPane(props: TerminalPaneProps) {
     }
     clearMobileDirectionGesture();
     clearPassiveFocusBypassTimer();
-    // 中文注释：移动端点击终端时，浏览器或 xterm 可能在 click 之前的 pointerdown/mousedown
-    // 阶段就把 helper textarea 抢回焦点。这里只放行那次“早到的 focusin”，不提前
-    // 授予 resize authority；真正的 operator 接管仍以 focus/click 路径为准。
+    cancelMobileInputFocusRecovery();
     windowActiveRef.current = true;
-    passiveFocusBypassRef.current = true;
+    suppressPassiveFocusRef.current = true;
+    // 中文注释：方向手势同样始于触摸，不能在长按/拖动开始阶段就允许 helper textarea
+    // 提前拿到焦点。否则用户只是摸一下准备滚动/长按，软键盘也会被误触发。
+    passiveFocusBypassRef.current = false;
     const pointerId = event.pointerId;
     const startX = event.clientX;
     const startY = event.clientY;
@@ -2517,7 +2524,8 @@ export function TerminalPane(props: TerminalPaneProps) {
       return;
     }
     const clearedSelection = clearCurrentTerminalSelection();
-    if (hasActiveTerminalFocus() || terminalDomHasActiveFocus()) {
+    const shouldForceMobileKeyboardReactivate = mobileInputModeRef.current && !mobileKeyboardOpenRef.current;
+    if (!shouldForceMobileKeyboardReactivate && (hasActiveTerminalFocus() || terminalDomHasActiveFocus())) {
       // 中文注释：终端已经有焦点时，普通 click 只需要清掉旧选区，不需要再补一轮 focus。
       if (clearedSelection || hitSurface) {
         return;
@@ -2532,6 +2540,7 @@ export function TerminalPane(props: TerminalPaneProps) {
     mobileViewportLayoutSuppressRef.current = false;
     if (mobileInputModeRef.current) {
       armMobileInputFocusRescue();
+      armMobileKeyboardResizeSuppress();
     }
     reportTerminalFocus(true);
     mobilePointerDownInputFocusRef.current = false;

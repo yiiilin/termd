@@ -79,10 +79,14 @@ impl RelayState {
             != Some(true)
         {
             warn!(
+                layer = "relay",
+                phase = "http_tunnel_wait_data_pair",
+                timeout_code = "route_prelude_timeout",
                 server_id = %server_id.0,
                 client_connection_id = registration_guard.registration().id,
                 method = %method,
                 path = %path,
+                timeout_ms = ROUTE_PRELUDE_TIMEOUT.as_millis(),
                 "relay HTTP tunnel timed out waiting for data pair"
             );
             return Err(StatusCode::GATEWAY_TIMEOUT);

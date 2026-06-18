@@ -4852,6 +4852,10 @@ impl ProtocolConnection {
         std::mem::take(&mut self.debug_traffic)
     }
 
+    pub fn attached_sessions_snapshot(&self) -> Vec<SessionId> {
+        self.attached_sessions.clone()
+    }
+
     /// 取走需要在释放全局 daemon 锁后继续 flush 的 session。
     ///
     /// 中文注释：terminal 输出不再等待浏览器 render ACK / credit。这里的 wakeup 只用于

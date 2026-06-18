@@ -178,10 +178,33 @@ export function useTerminalReceiveLoop(
     const loopGeneration = receiveLoopGenerationRef.current + 1;
     receiveLoopGenerationRef.current = loopGeneration;
     receiveLoopActiveRef.current = true;
+    let processedMessages = 0;
+    let processedBytes = 0;
+    let attachFrames = 0;
+    let outputFrames = 0;
+    let outputBytes = 0;
     recordTermdDiagnostic("receive_loop_start", {
       loopGeneration,
       attachedSessionId: attachedSessionRef.current,
     });
+    const recordReceiveLoopEnd = (
+      reason: "stale_after_receive" | "stale_loop_abort" | "error",
+      fields: { code?: string; message?: string; reconnectScheduled?: boolean } = {},
+    ) => {
+      recordTermdDiagnostic("receive_loop_end", {
+        loopGeneration,
+        attachedSessionId: attachedSessionRef.current,
+        reason,
+        code: fields.code,
+        message: fields.message,
+        processedMessages,
+        processedBytes,
+        attachFrames,
+        outputFrames,
+        outputBytes,
+        reconnectScheduled: fields.reconnectScheduled ?? false,
+      });
+    };
     const isCurrentLoop = () =>
       receiveLoopActiveRef.current &&
       receiveLoopGenerationRef.current === loopGeneration &&
@@ -247,17 +270,17 @@ export function useTerminalReceiveLoop(
       }
     };
     const read = async () => {
-      let processedMessages = 0;
-      let processedBytes = 0;
       while (isCurrentLoop()) {
         try {
           const inner = await client.receiveInner();
           if (!isCurrentLoop()) {
+            recordReceiveLoopEnd("stale_after_receive");
             return;
           }
           processedMessages += 1;
           if (inner.type === "attach_frame") {
             const payload = inner.payload as AttachFramePayload;
+            attachFrames += 1;
             if (payload.session_id !== attachedSessionRef.current) {
               throwIfLoopStale();
               markNewOutputIfBackground(payload.session_id);
@@ -374,7 +397,7 @@ export function useTerminalReceiveLoop(
               // 中文注释：新 supervisor 会把首屏放进 frames.snapshot；旧 supervisor 可能同时
               // 带 retained_output 和 frames.snapshot。只要存在权威 snapshot frame，就忽略
               // legacy retained_output，避免同一屏 prompt 被写入两次。
-              if (!hasFrameSnapshot && (snapshotToken !== undefined || frame.snapshot.retained_output_bytes.byteLength > 0)) {
+                if (!hasFrameSnapshot && (snapshotToken !== undefined || frame.snapshot.retained_output_bytes.byteLength > 0)) {
                 enqueueSnapshotFrame({
                   bytes: frame.snapshot.retained_output_bytes,
                   baseSeq: frame.base_seq,
@@ -417,6 +440,8 @@ export function useTerminalReceiveLoop(
                     terminalSeq: terminalFrame.terminal_seq,
                   });
                   processedBytes += bytes.byteLength;
+                  outputFrames += 1;
+                  outputBytes += bytes.byteLength;
                 } else if (terminalFrame.kind === "resize") {
                   if (snapshotCoveredSeq !== undefined && terminalFrame.terminal_seq <= snapshotCoveredSeq) {
                     continue;
@@ -453,6 +478,8 @@ export function useTerminalReceiveLoop(
                   revealHistory: false,
                 });
                 processedBytes += bytes.byteLength;
+                outputFrames += 1;
+                outputBytes += bytes.byteLength;
               } else if (frame.frame.kind === "output") {
                 const bytes = frame.frame.data_bytes ?? sessionDataFromBase64(frame.frame.data_base64 ?? "");
                 const outputItem: TerminalOutputItem = {
@@ -468,6 +495,8 @@ export function useTerminalReceiveLoop(
                 } else {
                   enqueueTerminalOutputIfCurrent(outputItem);
                   processedBytes += bytes.byteLength;
+                  outputFrames += 1;
+                  outputBytes += bytes.byteLength;
                 }
               } else if (frame.frame.kind === "resize") {
                 const resizeItem: TerminalOutputItem = {
@@ -553,21 +582,33 @@ export function useTerminalReceiveLoop(
           }
         } catch (caught) {
           if (caught === STALE_RECEIVE_LOOP_ABORT) {
+            recordReceiveLoopEnd("stale_loop_abort");
             return;
           }
           // 旧 attach 关闭可能晚于新 attach 启动；只有当前 client 的错误才能切到错误态。
           if (isCurrentLoop()) {
             const sessionId = attachedSessionRef.current;
+            const safeError = toSafeError(caught);
             recordTermdDiagnostic("receive_loop_error", {
               loopGeneration,
               attachedSessionId: sessionId,
-              code: toSafeError(caught).code,
-              message: toSafeError(caught).message,
+              code: safeError.code,
+              message: safeError.message,
             });
             if (sessionId && isIgnoredClosingSessionError(sessionId, caught)) {
+              recordReceiveLoopEnd("error", {
+                code: safeError.code,
+                message: safeError.message,
+              });
               return;
             }
-            if (attachReconnectHandlerRef.current(client, caught)) {
+            const reconnectScheduled = attachReconnectHandlerRef.current(client, caught);
+            recordReceiveLoopEnd("error", {
+              code: safeError.code,
+              message: safeError.message,
+              reconnectScheduled,
+            });
+            if (reconnectScheduled) {
               return;
             }
             setSafeError(caught);
@@ -666,6 +707,8 @@ export function useTerminalReconnectScheduler(
     userDetachedRef,
     confirmedSessionSizesRef,
     lastRenderedTerminalSeqRef,
+    receiveLoopActiveRef,
+    receiveLoopGenerationRef,
     attachReconnectTimerRef,
     attachReconnectKeyRef,
     attachReconnectAttemptsRef,
@@ -708,6 +751,18 @@ export function useTerminalReconnectScheduler(
       ? undefined
       : reconnectOptions.lastTerminalSeq ?? lastRenderedTerminalSeqRef.current.get(sessionId);
     const isFullSnapshot = lastTerminalSeq === undefined;
+    const closingCurrentAttach =
+      options.attachClientRef.current === staleClient ||
+      options.pendingAttachClientRef.current === staleClient;
+    recordTermdDiagnostic("reconnect_attach_invalidation", {
+      reconnectKey,
+      sessionId,
+      code: safeCaught.code,
+      forceFullSnapshot: isFullSnapshot,
+      closingCurrentAttach,
+      receiveLoopGeneration: receiveLoopGenerationRef.current,
+      receiveLoopActive: receiveLoopActiveRef.current,
+    });
     if (reconnectOptions.skipCurrentClientClose) {
       // retry catch 已经只清理了本轮重连创建的 pending client；这里按 key 续排，
       // 不能再拿最初的 stale client 去判断“是否属于当前 attach”。

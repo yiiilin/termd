@@ -38,6 +38,9 @@ pub(super) async fn bind_socket_route(
         }
         Err(_) => {
             warn!(
+                layer = "relay",
+                phase = "route_bind",
+                timeout_code = "route_prelude_timeout",
                 timeout_ms = ROUTE_PRELUDE_TIMEOUT.as_millis(),
                 "relay route prelude timed out"
             );
@@ -84,8 +87,12 @@ pub(super) async fn bind_socket_route(
         }
         Err(_) => {
             warn!(
+                layer = "relay",
+                phase = "route_ready",
+                timeout_code = "relay_route_ready_timeout",
                 server_id = %server_id.0,
                 ?role,
+                connection_id = registration.id,
                 timeout_ms = WEBSOCKET_SEND_DEADLINE.as_millis(),
                 "relay websocket route_ready timed out"
             );

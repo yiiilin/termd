@@ -364,6 +364,85 @@ struct WebSocketWatcherCounts {
     resize: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WebSocketAttachSummary {
+    duration_ms: u64,
+    attached_sessions: Vec<SessionId>,
+    watched_sessions: usize,
+    client_payload_seen: bool,
+    push_output_seen: bool,
+    push_output_batches: u64,
+    push_output_bytes: u64,
+    send_errors: u64,
+}
+
+impl WebSocketAttachSummary {
+    fn should_promote_to_info(&self) -> bool {
+        self.client_payload_seen && !self.push_output_seen && !self.attached_sessions.is_empty()
+    }
+}
+
+#[derive(Debug)]
+struct WebSocketAttachSummaryState {
+    started_at: Instant,
+    client_payload_seen: bool,
+    push_output_seen: bool,
+    push_output_batches: u64,
+    push_output_bytes: u64,
+    send_errors: u64,
+}
+
+impl WebSocketAttachSummaryState {
+    fn new(now: Instant) -> Self {
+        Self {
+            started_at: now,
+            client_payload_seen: false,
+            push_output_seen: false,
+            push_output_batches: 0,
+            push_output_bytes: 0,
+            send_errors: 0,
+        }
+    }
+
+    fn mark_client_payload(&mut self) {
+        self.client_payload_seen = true;
+    }
+
+    fn record_push_output_batch(&mut self, batches: u64, bytes: u64) {
+        if batches == 0 && bytes == 0 {
+            return;
+        }
+        self.push_output_seen = true;
+        self.push_output_batches = self.push_output_batches.saturating_add(batches);
+        self.push_output_bytes = self.push_output_bytes.saturating_add(bytes);
+    }
+
+    fn record_send_error(&mut self) {
+        self.send_errors = self.send_errors.saturating_add(1);
+    }
+
+    fn snapshot(
+        &self,
+        connection: &ProtocolConnection,
+        watchers: WebSocketWatcherCounts,
+    ) -> WebSocketAttachSummary {
+        WebSocketAttachSummary {
+            duration_ms: self
+                .started_at
+                .elapsed()
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64,
+            attached_sessions: connection.attached_sessions_snapshot(),
+            watched_sessions: watchers.output,
+            client_payload_seen: self.client_payload_seen,
+            push_output_seen: self.push_output_seen,
+            push_output_batches: self.push_output_batches,
+            push_output_bytes: self.push_output_bytes,
+            send_errors: self.send_errors,
+        }
+    }
+}
+
 pub type DefaultDaemonProtocol = DaemonProtocol<SupervisorPtyBackend, Ed25519SignatureVerifier>;
 /// daemon 的协议核心仍是单线程语义，但等待这把锁必须让出 Tokio worker。
 ///
@@ -2238,6 +2317,7 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
     let mut push_drain_wake_pending = false;
     let mut traffic = WebSocketTrafficCounters::default();
     let mut last_traffic_log = Instant::now();
+    let mut attach_summary = WebSocketAttachSummaryState::new(Instant::now());
     let server_id = {
         let protocol = protocol.lock().await;
         protocol.server_id()
@@ -2267,6 +2347,15 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
             return;
         }
         Err(_) => {
+            warn!(
+                layer = "termd",
+                phase = "route_prelude",
+                timeout_code = "route_prelude_timeout",
+                peer_addr = %peer_addr,
+                timeout_ms = ROUTE_PRELUDE_TIMEOUT.as_millis() as u64,
+                server_id = %server_id.0,
+                "websocket route prelude timed out"
+            );
             let envelope = route_prelude_timeout_error();
             let messages = vec![ProtocolWireMessage::Json(envelope)];
             let bytes = websocket_wire_messages_wire_len(&messages);
@@ -2388,6 +2477,7 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
                         .await
                         .is_err() {
                             traffic.record_send_error();
+                            attach_summary.record_send_error();
                             break;
                         }
                         traffic.record_queued_raw(WebSocketOutKind::Pong, pong_bytes);
@@ -2425,6 +2515,7 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
                     }
                     Message::Close(_) => break,
                     other => {
+                        attach_summary.mark_client_payload();
                         let Some(wire_message) = (match message_to_wire_message(other) {
                             Ok(message) => message,
                             Err(error) => {
@@ -2441,6 +2532,7 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
                                 .is_err()
                                 {
                                     traffic.record_send_error();
+                                    attach_summary.record_send_error();
                                     break;
                                 }
                                 traffic.record_out(
@@ -2484,6 +2576,7 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
                         .is_err()
                         {
                             traffic.record_send_error();
+                            attach_summary.record_send_error();
                             break;
                         }
                         traffic.record_out(
@@ -2516,8 +2609,13 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
                         .await
                         {
                             traffic.record_send_error();
+                            attach_summary.record_send_error();
                             break;
                         }
+                        attach_summary.record_push_output_batch(
+                            traffic.out_push_output.calls,
+                            traffic.out_push_output.bytes,
+                        );
                         maybe_log_websocket_traffic(
                             peer_addr,
                             &mut traffic,
@@ -2537,6 +2635,7 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
             maybe_failed = writer_failed_rx.recv() => {
                 if maybe_failed.is_some() {
                     traffic.record_send_error();
+                    attach_summary.record_send_error();
                     warn!(
                         peer_addr = %peer_addr,
                         "websocket writer reported failure"
@@ -2571,6 +2670,7 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
                     .is_err()
                     {
                         traffic.record_send_error();
+                        attach_summary.record_send_error();
                         break;
                     }
                     traffic.record_queued_raw(WebSocketOutKind::Ping, ping_bytes);
@@ -2616,8 +2716,13 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
                 .await
                 {
                     traffic.record_send_error();
+                    attach_summary.record_send_error();
                     break;
                 }
+                attach_summary.record_push_output_batch(
+                    traffic.out_push_output.calls,
+                    traffic.out_push_output.bytes,
+                );
                 maybe_log_websocket_traffic(
                     peer_addr,
                     &mut traffic,
@@ -2648,6 +2753,43 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
         ),
         true,
     );
+
+    let attach_summary_snapshot = attach_summary.snapshot(
+        &connection,
+        current_websocket_watcher_counts(
+            &watched_output_sessions,
+            &watched_activity_sessions,
+            &watched_cwd_sessions,
+            &watched_resize_sessions,
+        ),
+    );
+    if attach_summary_snapshot.should_promote_to_info() {
+        info!(
+            peer_addr = %peer_addr,
+            duration_ms = attach_summary_snapshot.duration_ms,
+            attached_sessions = ?attach_summary_snapshot.attached_sessions,
+            watched_sessions = attach_summary_snapshot.watched_sessions,
+            client_payload_seen = attach_summary_snapshot.client_payload_seen,
+            push_output_seen = attach_summary_snapshot.push_output_seen,
+            push_output_batches = attach_summary_snapshot.push_output_batches,
+            push_output_bytes = attach_summary_snapshot.push_output_bytes,
+            send_errors = attach_summary_snapshot.send_errors,
+            "websocket attach summary"
+        );
+    } else {
+        debug!(
+            peer_addr = %peer_addr,
+            duration_ms = attach_summary_snapshot.duration_ms,
+            attached_sessions = ?attach_summary_snapshot.attached_sessions,
+            watched_sessions = attach_summary_snapshot.watched_sessions,
+            client_payload_seen = attach_summary_snapshot.client_payload_seen,
+            push_output_seen = attach_summary_snapshot.push_output_seen,
+            push_output_batches = attach_summary_snapshot.push_output_batches,
+            push_output_bytes = attach_summary_snapshot.push_output_bytes,
+            send_errors = attach_summary_snapshot.send_errors,
+            "websocket attach summary"
+        );
+    }
 
     for task in watcher_tasks {
         task.abort();
@@ -3274,7 +3416,15 @@ async fn send_message_with_deadline(
             Err(())
         }
         Err(_) => {
-            warn!(?deadline, context = context, "websocket send timed out");
+            warn!(
+                layer = "termd",
+                phase = "websocket_send",
+                timeout_code = "websocket_send_timeout",
+                timeout_ms = deadline.as_millis() as u64,
+                ?deadline,
+                context = context,
+                "websocket send timed out"
+            );
             Err(())
         }
     }
@@ -3456,6 +3606,34 @@ mod tests {
             .expect("binary websocket message should not be control frame");
 
         assert_eq!(decoded, ProtocolWireMessage::Binary(raw));
+    }
+
+    #[test]
+    fn websocket_attach_summary_tracks_sessions_and_missing_output() {
+        let session_id = SessionId::new();
+        let suspicious = WebSocketAttachSummary {
+            duration_ms: 1_000,
+            attached_sessions: vec![session_id],
+            watched_sessions: 1,
+            client_payload_seen: true,
+            push_output_seen: false,
+            push_output_batches: 0,
+            push_output_bytes: 0,
+            send_errors: 0,
+        };
+        let healthy = WebSocketAttachSummary {
+            duration_ms: 1_000,
+            attached_sessions: vec![session_id],
+            watched_sessions: 1,
+            client_payload_seen: true,
+            push_output_seen: true,
+            push_output_batches: 2,
+            push_output_bytes: 512,
+            send_errors: 0,
+        };
+
+        assert!(suspicious.should_promote_to_info());
+        assert!(!healthy.should_promote_to_info());
     }
 
     #[test]

@@ -394,6 +394,7 @@ impl SupervisorPtySession {
         request: SupervisorRequest,
     ) -> Result<SupervisorResponsePayload, SupervisorRequestFailure> {
         let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+        let request_kind = request.kind_label();
         let envelope = SupervisorRequestEnvelope {
             request_id,
             request,
@@ -426,6 +427,29 @@ impl SupervisorPtySession {
                     .lock()
                     .expect("supervisor pending request mutex poisoned")
                     .remove(&request_id);
+                let (socket_path, supervisor_pid) = match &self.restore_info {
+                    PtyRestoreInfo::UnixSocket {
+                        socket_path,
+                        supervisor_pid,
+                        ..
+                    } => (
+                        Some(socket_path.display().to_string()),
+                        Some(*supervisor_pid),
+                    ),
+                    PtyRestoreInfo::Tmux { .. } => (None, None),
+                };
+                tracing::warn!(
+                    layer = "supervisor",
+                    phase = "ipc_request",
+                    timeout_code = "supervisor_request_timeout",
+                    timeout_ms = REQUEST_TIMEOUT.as_millis() as u64,
+                    session_id = %self.session_id,
+                    request_id,
+                    request_kind,
+                    supervisor_pid,
+                    socket_path,
+                    "session supervisor request timed out"
+                );
                 Err(SupervisorRequestFailure::Transport(PtyError::Backend(
                     "session supervisor request timed out".to_owned(),
                 )))
@@ -2372,6 +2396,25 @@ enum SupervisorRequest {
     },
     Close,
     Ping,
+}
+
+impl SupervisorRequest {
+    fn kind_label(&self) -> &'static str {
+        match self {
+            Self::Attach { .. } => "attach",
+            Self::AttachSync { .. } => "attach_sync",
+            Self::ResetAttachedDevices => "reset_attached_devices",
+            Self::AttachDevice { .. } => "attach_device",
+            Self::DetachDevice { .. } => "detach_device",
+            Self::DeviceAttached { .. } => "device_attached",
+            Self::Input { .. } => "input",
+            Self::Resize { .. } => "resize",
+            Self::Snapshot => "snapshot",
+            Self::TerminalSnapshot { .. } => "terminal_snapshot",
+            Self::Close => "close",
+            Self::Ping => "ping",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

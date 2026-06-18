@@ -117,6 +117,7 @@ function installMutableVisualViewport(layoutHeight: number, visualHeight: number
 
 function renderMobileTerminalPane(onInput?: (data: string) => void): {
   frame: HTMLElement;
+  host: HTMLElement;
   onInput: (data: string) => void;
   onResize: (size: TerminalSize) => void;
 };
@@ -125,6 +126,7 @@ function renderMobileTerminalPane(options?: {
   onResize?: (size: TerminalSize) => void;
 }): {
   frame: HTMLElement;
+  host: HTMLElement;
   onInput: (data: string) => void;
   onResize: (size: TerminalSize) => void;
 };
@@ -158,8 +160,10 @@ function renderMobileTerminalPane(
       onCursorChange={vi.fn()}
     />,
   );
+  const pane = screen.getByTestId("terminal-pane");
   return {
-    frame: screen.getByTestId("terminal-pane").querySelector<HTMLElement>(".terminal-frame")!,
+    frame: pane.querySelector<HTMLElement>(".terminal-frame")!,
+    host: pane.querySelector<HTMLElement>(".terminal-host")!,
     onInput,
     onResize,
   };
@@ -345,103 +349,81 @@ describe("TerminalPane terminal sequence rendering", () => {
     expect(document.activeElement).not.toBe(terminalInput);
   });
 
-  it("移动端收起键盘后的首次 pointerdown 会先解锁被动聚焦抑制，避免 helper textarea 被立即 blur", async () => {
+  it("移动端 pointerdown 不会立即聚焦 helper textarea，避免触摸滚动时误弹键盘", () => {
     const onResize = vi.fn();
-    const { frame } = renderMobileTerminalPane({ onResize });
+    const { host } = renderMobileTerminalPane({ onResize });
     const textarea = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
     expect(textarea).not.toBeNull();
+    const focusSpy = vi.spyOn(textarea!, "focus");
 
-    textarea!.focus();
-    await waitFor(() => expect(document.activeElement).toBe(textarea));
-
-    textarea!.blur();
-    await act(async () => {
-      await new Promise((resolve) => window.setTimeout(resolve, 160));
-    });
-
-    fireTouchPointer(frame, "pointerdown", {
+    fireTouchPointer(host, "pointerdown", {
       pointerId: 1,
       clientX: 24,
       clientY: 24,
     });
 
-    // 中文注释：移动端软键盘只信任用户手势内的 focus。pointerdown 必须同步把
-    // helper textarea 拉回输入焦点，不能等 click/rAF 再补，否则真机可能弹出后立刻收起。
-    await waitFor(() => expect(document.activeElement).toBe(textarea));
+    // 中文注释：用户此时可能只是准备拖动查看 scrollback。触摸落下本身不应立即
+    // 再次拉起 helper textarea，否则软键盘会抢占滚动手势，表现成“点一下就没法滚”。
+    expect(focusSpy).not.toHaveBeenCalled();
     expect(onResize).not.toHaveBeenCalled();
+    focusSpy.mockRestore();
   });
 
-  it("移动端 pointerdown 后经由 host focus bridge 转交到 helper textarea 时，仍会保留输入焦点", async () => {
-    const { frame } = renderMobileTerminalPane();
-    const terminalInput = screen.getByRole("textbox", { name: "Terminal input" });
+  it("移动端明确 tap/click 终端后，经由 host focus bridge 仍会把焦点转交到 helper textarea", async () => {
+    const { host } = renderMobileTerminalPane();
     const textarea = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
     expect(textarea).not.toBeNull();
 
-    textarea!.focus();
-    await waitFor(() => expect(document.activeElement).toBe(textarea));
-    textarea!.blur();
-    await act(async () => {
-      await new Promise((resolve) => window.setTimeout(resolve, 160));
+    fireTouchPointer(host, "pointerdown", {
+      pointerId: 7,
+      clientX: 24,
+      clientY: 24,
     });
-
-    fireTouchPointer(frame, "pointerdown", {
+    fireTouchPointer(host, "pointerup", {
       pointerId: 7,
       clientX: 24,
       clientY: 24,
     });
 
-    // 中文注释：真实浏览器里常见时序是 surface 先让 host 拿到 focus，
-    // 再由 focus bridge 同步转交给 helper textarea。这里必须验证整条链路，
-    // 不能只手动 focus textarea，否则抓不到第一跳 host focus 提前消费 bypass 的回归。
-    act(() => {
-      terminalInput.focus();
-    });
+    fireEvent.click(host, { clientX: 24, clientY: 24, button: 0 });
 
+    // 中文注释：真实浏览器里常见时序是 click 先让 host 拿到 focus，
+    // 再由 focus bridge 同步转交给 helper textarea。这里仍要验证整条链路，
+    // 但触发边界应该是 tap/click，而不是 pointerdown。
     await waitFor(() => expect(document.activeElement).toBe(textarea));
   });
 
-  it("移动端 helper textarea 在 pointerup 后迟到 focus 仍会被放行，并可在 click 后恢复 active focus", async () => {
+  it("移动端 tap/click 终端后会恢复 helper textarea 焦点，并继续获得 active focus 的 resize 权限", async () => {
     const onResize = vi.fn();
     (globalThis as { __TERMD_TEST_FIT_DIMENSIONS__?: { rows: number; cols: number } }).__TERMD_TEST_FIT_DIMENSIONS__ = {
       rows: 31,
       cols: 101,
     };
-    const { frame } = renderMobileTerminalPane({ onResize });
+    const { host } = renderMobileTerminalPane({ onResize });
     const textarea = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
     expect(textarea).not.toBeNull();
 
-    textarea!.focus();
-    await waitFor(() => expect(document.activeElement).toBe(textarea));
-    textarea!.blur();
-    await act(async () => {
-      await new Promise((resolve) => window.setTimeout(resolve, 160));
-    });
-    onResize.mockClear();
-
-    fireTouchPointer(frame, "pointerdown", {
+    fireTouchPointer(host, "pointerdown", {
       pointerId: 11,
       clientX: 24,
       clientY: 24,
     });
-    fireTouchPointer(frame, "pointerup", {
+    fireTouchPointer(host, "pointerup", {
       pointerId: 11,
       clientX: 24,
       clientY: 24,
     });
-    await act(async () => {
-      await new Promise((resolve) => window.setTimeout(resolve, 40));
-    });
-
-    textarea!.focus();
+    fireEvent.click(host, { clientX: 24, clientY: 24, button: 0 });
     await waitFor(() => expect(document.activeElement).toBe(textarea));
     expect(onResize).not.toHaveBeenCalled();
-
-    fireEvent.mouseDown(frame, { clientX: 24, clientY: 24, button: 0 });
-    fireEvent.click(frame, { clientX: 24, clientY: 24, button: 0 });
     (globalThis as { __TERMD_TEST_FIT_DIMENSIONS__?: { rows: number; cols: number } }).__TERMD_TEST_FIT_DIMENSIONS__ = {
       rows: 32,
       cols: 102,
     };
+    fireEvent(window, new Event("resize"));
+    await act(async () => {
+      await new Promise((resolve) => window.setTimeout(resolve, 800));
+    });
     fireEvent(window, new Event("resize"));
     await waitFor(() =>
       expect(onResize).toHaveBeenCalledWith({
@@ -453,119 +435,62 @@ describe("TerminalPane terminal sequence rendering", () => {
     );
   });
 
-  it("移动端 pointercancel 且没有真实 focus 时，会收回临时 focus 放行", async () => {
-    const onResize = vi.fn();
-    const { frame } = renderMobileTerminalPane({ onResize });
-    const textarea = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
-    expect(textarea).not.toBeNull();
-    const blurSpy = vi.spyOn(textarea!, "blur");
-
+  it("移动端触摸拖动滚动终端时不会聚焦 helper textarea", async () => {
+    vi.useFakeTimers();
     try {
-      textarea!.focus();
-      await waitFor(() => expect(document.activeElement).toBe(textarea));
-      textarea!.blur();
-      await act(async () => {
-        await new Promise((resolve) => window.setTimeout(resolve, 160));
-      });
-      blurSpy.mockClear();
-      onResize.mockClear();
-
-      fireTouchPointer(frame, "pointerdown", {
-        pointerId: 2,
-        clientX: 28,
-        clientY: 28,
-      });
-      fireTouchPointer(frame, "pointercancel", {
-        pointerId: 2,
-        clientX: 28,
-        clientY: 28,
-      });
-
-      // 中文注释：这时没有真实 click/focus 完成，后续孤立 helper focus 不能获得
-      // resize authority；但也不能主动 blur，否则真机软键盘会刚弹出就收回。
-      textarea!.focus();
+      render(
+        <TerminalPane
+          attached
+          sessionSize={{ rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 }}
+          mobileInputMode
+          outputResetVersion={0}
+          takeOutput={vi.fn<() => TerminalOutputItem[]>(() => [
+            { kind: "snapshot", bytes: new Uint8Array(), baseSeq: 0, size: DEFAULT_TERMINAL_SIZE },
+            { kind: "output", bytes: new TextEncoder().encode(Array.from({ length: 80 }, (_, index) => `line-${index}\n`).join("")), terminalSeq: 1 },
+          ])}
+          registerOutputDrain={vi.fn((drain: () => void) => {
+            drain();
+            return () => undefined;
+          })}
+          onInput={vi.fn()}
+          onResize={vi.fn()}
+          onCursorChange={vi.fn()}
+        />,
+      );
 
       await act(async () => {
-        await new Promise((resolve) => window.setTimeout(resolve, 0));
+        await Promise.resolve();
+        await vi.advanceTimersByTimeAsync(animationFrameMs * 12);
       });
-      (globalThis as { __TERMD_TEST_FIT_DIMENSIONS__?: { rows: number; cols: number } }).__TERMD_TEST_FIT_DIMENSIONS__ = {
-        rows: 32,
-        cols: 102,
-      };
-      fireEvent(window, new Event("resize"));
+
+      const host = screen.getByTestId("terminal-pane").querySelector<HTMLElement>(".terminal-host");
+      const textarea = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
+      expect(host).not.toBeNull();
+      expect(textarea).not.toBeNull();
+      const focusSpy = vi.spyOn(textarea!, "focus");
+
+      fireTouchPointer(host!, "pointerdown", {
+        pointerId: 88,
+        clientX: 160,
+        clientY: 196,
+      });
+      expect(focusSpy).not.toHaveBeenCalled();
+
+      fireTouchPointer(host!, "pointermove", {
+        pointerId: 88,
+        clientX: 160,
+        clientY: 260,
+      });
+
       await act(async () => {
-        await new Promise((resolve) => window.setTimeout(resolve, animationFrameMs * 4));
+        await vi.advanceTimersByTimeAsync(animationFrameMs * 4);
       });
-      expect(blurSpy).not.toHaveBeenCalled();
-      expect(onResize).not.toHaveBeenCalled();
+
+      // 中文注释：明确进入纵向 scroll 手势后，helper textarea 仍不应被聚焦。
+      expect(focusSpy).not.toHaveBeenCalled();
+      focusSpy.mockRestore();
     } finally {
-      blurSpy.mockRestore();
-    }
-  });
-
-  it("移动端 pointermove 取消和 contextmenu 都会收回临时 focus 放行", async () => {
-    const onResize = vi.fn();
-    const { frame } = renderMobileTerminalPane({ onResize });
-    const textarea = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
-    expect(textarea).not.toBeNull();
-    const blurSpy = vi.spyOn(textarea!, "blur");
-
-    try {
-      textarea!.focus();
-      await waitFor(() => expect(document.activeElement).toBe(textarea));
-      textarea!.blur();
-      await act(async () => {
-        await new Promise((resolve) => window.setTimeout(resolve, 160));
-      });
-      blurSpy.mockClear();
-      onResize.mockClear();
-
-      fireTouchPointer(frame, "pointerdown", {
-        pointerId: 3,
-        clientX: 30,
-        clientY: 30,
-      });
-      fireTouchPointer(frame, "pointermove", {
-        pointerId: 3,
-        clientX: 44,
-        clientY: 30,
-      });
-      textarea!.focus();
-      await act(async () => {
-        await new Promise((resolve) => window.setTimeout(resolve, 0));
-      });
-      (globalThis as { __TERMD_TEST_FIT_DIMENSIONS__?: { rows: number; cols: number } }).__TERMD_TEST_FIT_DIMENSIONS__ = {
-        rows: 33,
-        cols: 103,
-      };
-      fireEvent(window, new Event("resize"));
-      await act(async () => {
-        await new Promise((resolve) => window.setTimeout(resolve, animationFrameMs * 4));
-      });
-      expect(onResize).not.toHaveBeenCalled();
-
-      fireTouchPointer(frame, "pointerdown", {
-        pointerId: 4,
-        clientX: 30,
-        clientY: 30,
-      });
-      textarea!.focus();
-      fireEvent.contextMenu(frame);
-      await act(async () => {
-        await new Promise((resolve) => window.setTimeout(resolve, 0));
-      });
-      (globalThis as { __TERMD_TEST_FIT_DIMENSIONS__?: { rows: number; cols: number } }).__TERMD_TEST_FIT_DIMENSIONS__ = {
-        rows: 34,
-        cols: 104,
-      };
-      fireEvent(window, new Event("resize"));
-      await act(async () => {
-        await new Promise((resolve) => window.setTimeout(resolve, animationFrameMs * 4));
-      });
-      expect(blurSpy).not.toHaveBeenCalled();
-      expect(onResize).not.toHaveBeenCalled();
-    } finally {
-      blurSpy.mockRestore();
+      vi.useRealTimers();
     }
   });
 
@@ -643,39 +568,6 @@ describe("TerminalPane terminal sequence rendering", () => {
     } finally {
       vi.useRealTimers();
     }
-  });
-
-  it("移动端 passive helper focus 在短暂 blur 后会恢复输入焦点", async () => {
-    const onResize = vi.fn();
-    const { frame } = renderMobileTerminalPane({ onResize });
-    const textarea = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
-    expect(textarea).not.toBeNull();
-
-    textarea!.focus();
-    await waitFor(() => expect(document.activeElement).toBe(textarea));
-    textarea!.blur();
-    await act(async () => {
-      await new Promise((resolve) => window.setTimeout(resolve, 160));
-    });
-
-    fireTouchPointer(frame, "pointerdown", {
-      pointerId: 8,
-      clientX: 24,
-      clientY: 24,
-    });
-    textarea!.focus();
-    await waitFor(() => expect(document.activeElement).toBe(textarea));
-
-    textarea!.blur();
-    await act(async () => {
-      await new Promise((resolve) => window.setTimeout(resolve, 0));
-    });
-
-    // 中文注释：移动端系统键盘弹出时可能短暂把 helper textarea blur 到 body；
-    // 这类 blur 不能清掉输入态，否则键盘会出现后立即收起。真正的滚动/取消路径
-    // 由前面的 pointercancel、pointermove 和 contextmenu 测试覆盖。
-    await waitFor(() => expect(document.activeElement).toBe(textarea));
-    expect(onResize).not.toHaveBeenCalled();
   });
 
   it("移动端 pointerup 后挂起的 bypass timer 会在 unmount 时清理", async () => {
@@ -760,7 +652,7 @@ describe("TerminalPane terminal sequence rendering", () => {
     expect(onResize).not.toHaveBeenCalled();
   });
 
-  it("移动端 passive helper focus 后，focusRequest 会恢复 active focus 与后续 layout resize authority", async () => {
+  it("移动端 focusRequest 会恢复 active focus 与后续 layout resize authority", async () => {
     const onResize = vi.fn();
     const takeOutput = vi.fn(() => []);
     const registerOutputDrain = vi.fn(() => () => undefined);
@@ -777,29 +669,6 @@ describe("TerminalPane terminal sequence rendering", () => {
         onCursorChange={vi.fn()}
       />,
     );
-    const frame = screen.getByTestId("terminal-pane").querySelector<HTMLElement>(".terminal-frame");
-    const terminalInput = screen.getByRole("textbox", { name: "Terminal input" });
-    const textarea = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
-    expect(frame).not.toBeNull();
-    expect(textarea).not.toBeNull();
-
-    textarea!.focus();
-    await waitFor(() => expect(document.activeElement).toBe(textarea));
-    textarea!.blur();
-    await act(async () => {
-      await new Promise((resolve) => window.setTimeout(resolve, 160));
-    });
-
-    fireTouchPointer(frame!, "pointerdown", {
-      pointerId: 13,
-      clientX: 24,
-      clientY: 24,
-    });
-    act(() => {
-      terminalInput.focus();
-    });
-    await waitFor(() => expect(document.activeElement).toBe(textarea));
-
     onResize.mockClear();
     (globalThis as { __TERMD_TEST_FIT_DIMENSIONS__?: { rows: number; cols: number } }).__TERMD_TEST_FIT_DIMENSIONS__ = {
       rows: 31,
@@ -4745,6 +4614,94 @@ describe("TerminalPane terminal sizing", () => {
     }
   });
 
+  it("旧尺寸 snapshot 之后若已经有 live output，即使 scrollback 计数被清零也不会再触发历史修复 full snapshot", async () => {
+    vi.useFakeTimers();
+    try {
+      const onResize = vi.fn();
+      const onTerminalResync = vi.fn();
+      const encoder = new TextEncoder();
+      let queue: TerminalOutputItem[] = [
+        {
+          kind: "snapshot",
+          bytes: encoder.encode("reload-old-size\n"),
+          baseSeq: 0,
+          size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+        },
+      ];
+      const takeOutput = vi.fn(() => queue.splice(0));
+      let drainOutput: (() => void) | undefined;
+      const registerOutputDrain = vi.fn((drain: () => void) => {
+        drainOutput = drain;
+        drain();
+        return () => undefined;
+      });
+      (globalThis as { __TERMD_TEST_FIT_DIMENSIONS__?: { rows: number; cols: number } }).__TERMD_TEST_FIT_DIMENSIONS__ = {
+        rows: 31,
+        cols: 101,
+      };
+      render(
+        <TerminalPane
+          attached
+          outputResetVersion={0}
+          takeOutput={takeOutput}
+          registerOutputDrain={registerOutputDrain}
+          sessionSize={{ rows: 31, cols: 101, pixel_width: 0, pixel_height: 0 }}
+          onInput={vi.fn()}
+          onResize={onResize}
+          onCursorChange={vi.fn()}
+          onTerminalResync={onTerminalResync}
+        />,
+      );
+
+      act(() => {
+        vi.advanceTimersByTime(animationFrameMs * 32);
+      });
+      expect(onTerminalResync).not.toHaveBeenCalled();
+
+      queue.push({
+        kind: "output",
+        // 中文注释：足够大的持续输出会让测试桩形成本地 scrollback，模拟真实 relay 长挂会话。
+        bytes: encoder.encode(Array.from({ length: 96 }, (_, index) => `live-output-${index + 1}\n`).join("")),
+        terminalSeq: 1,
+      });
+      act(() => {
+        drainOutput?.();
+        vi.advanceTimersByTime(animationFrameMs * 32);
+      });
+
+      const terminal = (globalThis as {
+        __TERMD_TEST_TERMINAL__?: { baseY: () => number; viewportY: () => number; scrollToLine: (line: number) => void };
+      }).__TERMD_TEST_TERMINAL__;
+      expect(terminal?.baseY()).toBeGreaterThan(0);
+      expect(terminal?.viewportY()).toBe(terminal?.baseY());
+
+      const frame = screen.getByTestId("terminal-pane").querySelector<HTMLElement>(".terminal-frame");
+      expect(frame).not.toBeNull();
+      fireEvent.wheel(frame!, { deltaY: -320 });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(animationFrameMs * 4);
+      });
+      expect(terminal?.viewportY()).toBeLessThan(terminal?.baseY() ?? 0);
+
+      const terminalInput = screen.getByRole("textbox", { name: "Terminal input" });
+      act(() => {
+        terminalInput.focus();
+        vi.advanceTimersByTime(animationFrameMs * 20);
+      });
+      expect(onResize.mock.calls.map(([size]) => `${size.cols}x${size.rows}`)).toContain("101x31");
+
+      act(() => {
+        vi.advanceTimersByTime(1000 + animationFrameMs * 8);
+      });
+
+      // 中文注释：这次 pending repair 来自旧 snapshot，但该 snapshot 之后已经见过 live output。
+      // 即使 scrollback 路径把统计计数清零，也不能再主动 full resync 打断当前 attach。
+      expect(onTerminalResync).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("snapshot 历史修复在 ack 后若立刻 detach，不会再触发过期 full snapshot", () => {
     vi.useFakeTimers();
     try {
@@ -6039,8 +5996,8 @@ describe("TerminalPane terminal sizing", () => {
     }
   });
 
-  it("移动端 helper textarea 已经获得 DOM focus 但键盘收起时，新的 touch pointerdown 仍会重新激活输入", async () => {
-    const { frame } = renderMobileTerminalPane();
+  it("移动端 helper textarea 已经获得 DOM focus 但键盘收起时，新的 touch click 才会重新激活输入", async () => {
+    const { host } = renderMobileTerminalPane();
     const terminalInput = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
     expect(terminalInput).not.toBeNull();
     const focusSpy = vi.spyOn(HTMLTextAreaElement.prototype, "focus");
@@ -6052,16 +6009,27 @@ describe("TerminalPane terminal sizing", () => {
       });
       await waitFor(() => expect(document.activeElement).toBe(terminalInput));
       focusSpy.mockClear();
+      act(() => {
+        terminalInput!.blur();
+      });
+      await act(async () => {
+        await new Promise((resolve) => window.setTimeout(resolve, 160));
+      });
       blurSpy.mockClear();
 
       // 中文注释：这里模拟的是“DOM 还在聚焦，但系统软键盘已经收起”的边界状态。
-      // 真实手机上这时再次点一下终端，应该在用户手势内重新 focus；但不能主动 blur，
-      // 否则真机软键盘会在弹出后又被应用代码关掉。
-      fireTouchPointer(frame, "pointerdown", {
+      // 新模型下只有明确 tap/click 才会重新激活输入；pointerdown 本身不应再主动 focus。
+      fireTouchPointer(host, "pointerdown", {
         pointerId: 99,
         clientX: 120,
         clientY: 120,
       });
+      fireTouchPointer(host, "pointerup", {
+        pointerId: 99,
+        clientX: 120,
+        clientY: 120,
+      });
+      fireEvent.click(host, { clientX: 120, clientY: 120, button: 0 });
 
       await waitFor(() => expect(document.activeElement).toBe(terminalInput));
       expect(focusSpy).toHaveBeenCalled();
@@ -6069,6 +6037,82 @@ describe("TerminalPane terminal sizing", () => {
     } finally {
       focusSpy.mockRestore();
       blurSpy.mockRestore();
+    }
+  });
+
+  it("移动端点击终端正文时也会重新激活 helper textarea", async () => {
+    const { frame, host } = renderMobileTerminalPane();
+    const terminalInput = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
+    expect(terminalInput).not.toBeNull();
+    const focusSpy = vi.spyOn(terminalInput!, "focus");
+
+    try {
+      act(() => {
+        terminalInput!.focus();
+      });
+      await waitFor(() => expect(document.activeElement).toBe(terminalInput));
+      focusSpy.mockClear();
+      act(() => {
+        terminalInput!.blur();
+      });
+      await act(async () => {
+        await new Promise((resolve) => window.setTimeout(resolve, 160));
+      });
+
+      // 中文注释：这里模拟用户点终端主页面正文，而不是点到滚动条或输入框。
+      // 这条路径必须和滚动条附近点击一样，重新把 helper textarea 激活起来。
+      fireTouchPointer(frame, "pointerdown", {
+        pointerId: 101,
+        clientX: 160,
+        clientY: 120,
+      });
+      fireTouchPointer(frame, "pointerup", {
+        pointerId: 101,
+        clientX: 160,
+        clientY: 120,
+      });
+      fireEvent.click(frame, { clientX: 160, clientY: 120, button: 0 });
+
+      await waitFor(() => expect(document.activeElement).toBe(terminalInput));
+      expect(focusSpy).toHaveBeenCalled();
+      expect(host).not.toBeNull();
+    } finally {
+      focusSpy.mockRestore();
+    }
+  });
+
+  it("移动端键盘已收起但 helper textarea 仍保留 DOM focus 时，点击终端正文会强制重新激活输入", async () => {
+    const { frame } = renderMobileTerminalPane();
+    const terminalInput = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
+    expect(terminalInput).not.toBeNull();
+    const focusSpy = vi.spyOn(terminalInput!, "focus");
+
+    try {
+      act(() => {
+        terminalInput!.focus();
+      });
+      await waitFor(() => expect(document.activeElement).toBe(terminalInput));
+      focusSpy.mockClear();
+
+      // 中文注释：这里模拟真实移动端常见边界：DOM 焦点还留在 helper textarea，
+      // 但系统软键盘已经收起。用户再次 tap 终端正文时，前端必须重新执行一次 focus，
+      // 让浏览器把这次 tap 当成新的输入激活，而不能误判成“已经有焦点了”。
+      fireTouchPointer(frame, "pointerdown", {
+        pointerId: 131,
+        clientX: 140,
+        clientY: 110,
+      });
+      fireTouchPointer(frame, "pointerup", {
+        pointerId: 131,
+        clientX: 140,
+        clientY: 110,
+      });
+      fireEvent.click(frame, { clientX: 140, clientY: 110, button: 0 });
+
+      await waitFor(() => expect(focusSpy).toHaveBeenCalled());
+      expect(document.activeElement).toBe(terminalInput);
+    } finally {
+      focusSpy.mockRestore();
     }
   });
 
@@ -6133,19 +6177,23 @@ describe("TerminalPane terminal sizing", () => {
     }
   });
 
-  it("移动端 soft keyboard rescue 窗口内 pointercancel 不会主动 blur helper textarea", async () => {
+  it("移动端未形成 click 前的 pointercancel 不会主动 blur helper textarea", async () => {
     const { frame } = renderMobileTerminalPane();
     const terminalInput = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
     expect(terminalInput).not.toBeNull();
     const blurSpy = vi.spyOn(terminalInput!, "blur");
 
     try {
+      act(() => {
+        terminalInput!.focus();
+      });
+      await waitFor(() => expect(document.activeElement).toBe(terminalInput));
+
       fireTouchPointer(frame, "pointerdown", {
         pointerId: 77,
         clientX: 120,
         clientY: 120,
       });
-      await waitFor(() => expect(document.activeElement).toBe(terminalInput));
 
       fireTouchPointer(frame, "pointercancel", {
         pointerId: 77,
@@ -6153,8 +6201,8 @@ describe("TerminalPane terminal sizing", () => {
         clientY: 120,
       });
 
-      // 中文注释：Android/iOS 在键盘弹出链路里可能派发 pointercancel。
-      // rescue 窗口内主动 blur 会直接关闭系统键盘，因此只允许清内部临时状态。
+      // 中文注释：即使这次 touch 没有形成 click，后续 pointercancel 也不能反向 blur
+      // 已经存在的 helper textarea DOM focus，否则真实软键盘会被应用代码主动关掉。
       expect(blurSpy).not.toHaveBeenCalled();
       expect(document.activeElement).toBe(terminalInput);
     } finally {
@@ -6162,27 +6210,31 @@ describe("TerminalPane terminal sizing", () => {
     }
   });
 
-  it("移动端 rescue 窗口过后收到 contextmenu 也不能主动 blur helper textarea", async () => {
+  it("移动端已有 helper textarea 焦点时，迟到 contextmenu 也不能主动 blur", async () => {
     const { frame, onInput, onResize } = renderMobileTerminalPane();
     const terminalInput = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
     expect(terminalInput).not.toBeNull();
     const blurSpy = vi.spyOn(terminalInput!, "blur");
 
     try {
+      act(() => {
+        terminalInput!.focus();
+      });
+      await waitFor(() => expect(document.activeElement).toBe(terminalInput));
+
       fireTouchPointer(frame, "pointerdown", {
         pointerId: 78,
         clientX: 120,
         clientY: 120,
       });
-      await waitFor(() => expect(document.activeElement).toBe(terminalInput));
 
       await act(async () => {
         await new Promise((resolve) => window.setTimeout(resolve, 800));
       });
       fireEvent.contextMenu(frame);
 
-      // 中文注释：真实移动浏览器可能在软键盘动画之后才补发 contextmenu。
-      // 这类迟到事件不能反向 blur helper textarea，否则用户看到的就是键盘弹出后马上收起。
+      // 中文注释：真实移动浏览器可能在长按链路末尾迟到补发 contextmenu。
+      // 这类事件不能把已经存在的 helper textarea 焦点反向 blur 掉。
       expect(blurSpy).not.toHaveBeenCalled();
       expect(document.activeElement).toBe(terminalInput);
       terminalInput!.dispatchEvent(
@@ -6200,7 +6252,7 @@ describe("TerminalPane terminal sizing", () => {
     }
   });
 
-  it("移动端首次触摸 rescue 窗口内 click/focus 不会把 xterm fit 到键盘后行数", async () => {
+  it("移动端首次 tap/click 激活输入时，不会把 xterm fit 到键盘后行数", async () => {
     const onResize = vi.fn();
     const { frame } = renderMobileTerminalPane({ onResize });
     const terminalInput = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
@@ -6218,18 +6270,18 @@ describe("TerminalPane terminal sizing", () => {
       clientX: 120,
       clientY: 120,
     });
-    await waitFor(() => expect(document.activeElement).toBe(terminalInput));
     fireTouchPointer(frame, "pointerup", {
       pointerId: 79,
       clientX: 120,
       clientY: 120,
     });
     fireEvent.click(frame, { clientX: 120, clientY: 120, button: 0 });
+    await waitFor(() => expect(document.activeElement).toBe(terminalInput));
     await act(async () => {
       await new Promise((resolve) => window.setTimeout(resolve, animationFrameMs * 16));
     });
 
-    // 中文注释：软键盘刚被触发但 visualViewport 还没稳定时，focus/click 不能先把
+    // 中文注释：软键盘刚被 click 激活但 visualViewport 还没稳定时，focus/click 不能先把
     // xterm fit 成键盘后的 12 行，否则 helper textarea 会被重锚，真机键盘容易立刻收起。
     expect((globalThis as {
       __TERMD_TEST_TERMINAL_STATS__?: { resizes: number };

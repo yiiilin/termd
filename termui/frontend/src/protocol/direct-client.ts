@@ -14,7 +14,8 @@ import {
   encodeBinaryProtocolPacket,
 } from "./binary-packet";
 import { type DirectClientInbox, performDirectHandshake } from "./direct-handshake";
-import { ProtocolClientError, protocolError } from "./errors";
+import { ProtocolClientError, protocolError, toSafeError } from "./errors";
+import { recordProtocolTimeout, recordTermdDiagnostic } from "../diagnostics";
 import {
   HttpFileTransferUnsupported,
   type HttpE2eeFetchOptions,
@@ -150,6 +151,11 @@ interface DirectClientOptions {
   expectedDaemonPublicKey?: PublicKeyWire;
   webSocketFactory?: (url: string) => WebSocket;
   signal?: AbortSignal;
+}
+
+interface DirectClientDiagnosticsContext {
+  serverId: UUID;
+  deviceId: UUID;
 }
 
 interface PendingRequest {
@@ -337,7 +343,7 @@ export class DirectClient {
       expectedDaemonPublicKey: options.expectedDaemonPublicKey,
       webSocketFactory: options.webSocketFactory,
       signal: options.signal,
-      createInbox: (socket) => new SocketInbox(socket),
+      createInbox: (socket) => new SocketInbox(socket, { serverId: routeServerId, deviceId }),
     });
     const client = new DirectClient(
       handshake.socket,
@@ -1201,6 +1207,8 @@ export class DirectClient {
     const controller = new AbortController();
     const collectFrames = options.collectFrames ?? true;
     let timedOut = false;
+    let timedOutPhase: "http_request" | "http_first_frame" = "http_request";
+    let timedOutMs = options.timeoutMs ?? 0;
     let externallyAborted = false;
     const abortForTimeout = () => {
       timedOut = true;
@@ -1219,7 +1227,11 @@ export class DirectClient {
     // 短请求由调用方显式传入 timeoutMs，长流则依赖连接背压和断开信号收敛。
     const timer = options.timeoutMs === undefined ? undefined : setTimeout(abortForTimeout, options.timeoutMs);
     let firstFrameTimer =
-      options.firstFrameTimeoutMs === undefined ? undefined : setTimeout(abortForTimeout, options.firstFrameTimeoutMs);
+      options.firstFrameTimeoutMs === undefined ? undefined : setTimeout(() => {
+        timedOutPhase = "http_first_frame";
+        timedOutMs = options.firstFrameTimeoutMs ?? options.timeoutMs ?? 0;
+        abortForTimeout();
+      }, options.firstFrameTimeoutMs);
     const clearFirstFrameTimer = () => {
       if (firstFrameTimer !== undefined) {
         clearTimeout(firstFrameTimer);
@@ -1269,6 +1281,14 @@ export class DirectClient {
       return collectFrames ? frames : [];
     } catch (error) {
       if (timedOut && isAbortError(error)) {
+        recordProtocolTimeout({
+          layer: "client",
+          phase: timedOutPhase,
+          transport: "http",
+          timeout_code: "response_timeout",
+          timeout_ms: timedOutMs,
+          path,
+        });
         throw new ProtocolClientError("response_timeout", "operation timed out");
       }
       if (externallyAborted && isAbortError(error)) {
@@ -1829,6 +1849,8 @@ export class DirectClient {
   private async runReceivePump(): Promise<void> {
     let processedMessages = 0;
     let processedBytes = 0;
+    let endReason: "closed" | "error" = "closed";
+    let endError: Error | undefined;
     while (!this.closed) {
       try {
         const message = await this.inbox.read();
@@ -1862,8 +1884,10 @@ export class DirectClient {
           await yieldToEventLoop();
         }
       } catch (caught) {
+        endReason = "error";
+        endError = caught instanceof Error ? caught : new ProtocolClientError("protocol_error", "protocol operation failed");
         if (!this.closed) {
-          const error = caught instanceof Error ? caught : new ProtocolClientError("protocol_error", "protocol operation failed");
+          const error = endError;
           // receive pump 已经证明这条 WebSocket 不再可信；标记关闭并主动 close，
           // 避免上层继续复用一个不会再消费入站消息的 DirectClient。
           this.closedError ??= error;
@@ -1875,9 +1899,33 @@ export class DirectClient {
           this.socket.close();
           this.inbox.rejectPending(error);
         }
-        return;
+        break;
       }
     }
+    this.recordReceivePumpEnd(endReason, processedMessages, processedBytes, endError);
+  }
+
+  private recordReceivePumpEnd(
+    reason: "closed" | "error",
+    processedMessages: number,
+    processedBytes: number,
+    error?: Error,
+  ): void {
+    const safeError = error ? toSafeError(error) : undefined;
+    recordTermdDiagnostic("direct_receive_pump_end", {
+      serverId: this.serverIdValue,
+      deviceId: this.deviceId,
+      phase: this.phase,
+      reason,
+      code: safeError?.code,
+      message: safeError?.message,
+      processedMessages,
+      processedBytes,
+      pendingInner: this.pendingInner.length,
+      pendingRequests: this.pendingRequests.size,
+      terminalStreams: this.terminalStreamsById.size,
+      fileStreams: this.fileStreamsById.size,
+    });
   }
 
   private dispatchInner(inner: Envelope): void {
@@ -2092,7 +2140,21 @@ export class DirectClient {
     const buffered: Envelope[] = [];
     try {
       while (true) {
-        const inner = await withTimeout(this.receiveInner(), timeoutMs, "response_timeout");
+        let inner;
+        try {
+          inner = await withTimeout(this.receiveInner(), timeoutMs, "response_timeout");
+        } catch (error) {
+          if (error instanceof ProtocolClientError && error.code === "response_timeout") {
+            recordProtocolTimeout({
+              layer: "client",
+              phase: "queued_payload",
+              transport: "websocket",
+              timeout_code: error.code,
+              timeout_ms: timeoutMs,
+            });
+          }
+          throw error;
+        }
         if (inner.type === expectedType) {
           return inner.payload as T;
         }
@@ -2264,6 +2326,15 @@ export class DirectClient {
     return withAbort(new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pendingRequests.delete(id);
+        recordProtocolTimeout({
+          layer: "client",
+          phase: "request",
+          transport: "websocket",
+          method,
+          request_id: id,
+          timeout_code: "response_timeout",
+          timeout_ms: timeoutMs,
+        });
         reject(new ProtocolClientError("response_timeout", "operation timed out"));
       }, timeoutMs);
       this.pendingRequests.set(id, {
@@ -2481,13 +2552,39 @@ class SocketInbox {
   private readonly errors: Array<(error: Error) => void> = [];
   private closedError: Error | undefined;
 
-  constructor(private readonly socket: WebSocket) {
+  constructor(
+    private readonly socket: WebSocket,
+    private readonly diagnostics?: DirectClientDiagnosticsContext,
+  ) {
     // 监听器必须在等待 open 前注册；route_ready 和后续 hello/E2EE 可能会连续到达。
     this.socket.addEventListener("message", (event) => {
       void this.enqueueMessage(event.data);
     });
-    this.socket.addEventListener("close", () => this.rejectPending(new ProtocolClientError("connection_closed", "connection closed")));
-    this.socket.addEventListener("error", () => this.rejectPending(new ProtocolClientError("connection_error", "connection error")));
+    this.socket.addEventListener("close", (event) => {
+      // 中文注释：这里记录的是浏览器 WebSocket transport 的结束摘要，
+      // 用来和后端 data pipe summary 对齐，判断是浏览器先断还是 receive pump 先报错。
+      recordTermdDiagnostic("direct_socket_close", {
+        serverId: this.diagnostics?.serverId,
+        deviceId: this.diagnostics?.deviceId,
+        readyState: this.socket.readyState,
+        code: event.code,
+        reason: event.reason,
+        wasClean: event.wasClean,
+        queuedMessages: this.queue.length,
+        waitingReaders: this.waiters.length,
+      });
+      this.rejectPending(new ProtocolClientError("connection_closed", "connection closed"));
+    });
+    this.socket.addEventListener("error", () => {
+      recordTermdDiagnostic("direct_socket_error", {
+        serverId: this.diagnostics?.serverId,
+        deviceId: this.diagnostics?.deviceId,
+        readyState: this.socket.readyState,
+        queuedMessages: this.queue.length,
+        waitingReaders: this.waiters.length,
+      });
+      this.rejectPending(new ProtocolClientError("connection_error", "connection error"));
+    });
   }
 
   read(): Promise<QueuedMessage> {
