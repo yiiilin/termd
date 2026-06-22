@@ -2789,6 +2789,46 @@ describe("TerminalPane terminal sequence rendering", () => {
     });
   });
 
+  it("同 session 的 outputResetVersion 变化不会替换桌面输入框或丢失焦点", async () => {
+    const takeOutput = vi.fn(() => []);
+    const registerOutputDrain = vi.fn(() => () => undefined);
+    const props = {
+      attached: true,
+      sessionSize: DEFAULT_TERMINAL_SIZE,
+      takeOutput,
+      registerOutputDrain,
+      onTerminalResync: vi.fn(),
+      onInput: vi.fn(),
+      onResize: vi.fn(),
+      onCursorChange: vi.fn(),
+    };
+
+    const { rerender } = render(<TerminalPane {...props} outputResetVersion={0} />);
+    let terminalTextarea: HTMLTextAreaElement | null = null;
+    await waitFor(() => {
+      terminalTextarea = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
+      expect(terminalTextarea).not.toBeNull();
+    });
+    const stableTextarea = terminalTextarea!;
+    const blurSpy = vi.spyOn(stableTextarea, "blur");
+
+    try {
+      stableTextarea.focus();
+      await waitFor(() => expect(document.activeElement).toBe(stableTextarea));
+
+      rerender(<TerminalPane {...props} outputResetVersion={1} />);
+
+      await waitFor(() => {
+        expect(document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]')).toBe(stableTextarea);
+        expect(stableTextarea.isConnected).toBe(true);
+        expect(document.activeElement).toBe(stableTextarea);
+      });
+      expect(blurSpy).not.toHaveBeenCalled();
+    } finally {
+      blurSpy.mockRestore();
+    }
+  });
+
   it("revealHistory snapshot 渲染后不会污染下一次普通 snapshot 贴底", async () => {
     vi.useFakeTimers();
     try {

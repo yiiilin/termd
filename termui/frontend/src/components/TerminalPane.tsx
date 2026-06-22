@@ -331,6 +331,19 @@ export function TerminalPane(props: TerminalPaneProps) {
   const deferredFrameIdRef = useRef(0);
   const deferredFrameHandlesByIdRef = useRef<Map<number, DeferredTerminalFrameHandle>>(new Map());
   const deferredFrameHandlesRef = useRef<Set<DeferredTerminalFrameHandle>>(new Set());
+  const confirmOutputResetApplied = (version: number) => {
+    const confirm = () => onOutputResetAppliedRef.current?.(version);
+    // 中文注释：测试桩需要精确卡住“reset 已完成但 receive loop 还不能继续”的窗口，
+    // 因此 reset ack 无论来自新实例挂载还是原地清屏，都统一走这一条延迟确认钩子。
+    const deferOutputResetApplied = (globalThis as {
+      __TERMD_TEST_DEFER_OUTPUT_RESET_APPLIED__?: (deferredConfirm: () => void) => void;
+    }).__TERMD_TEST_DEFER_OUTPUT_RESET_APPLIED__;
+    if (deferOutputResetApplied) {
+      deferOutputResetApplied(confirm);
+      return;
+    }
+    confirm();
+  };
 
   const readCurrentMobileViewportMetrics = (keyboardOpenFallback = mobileKeyboardOpenRef.current) => {
     if (typeof window === "undefined") {
@@ -3418,16 +3431,7 @@ export function TerminalPane(props: TerminalPaneProps) {
     searchAddonRef.current = searchAddon;
     rendererRef.current = renderer;
     outputResetVersionRef.current = props.outputResetVersion;
-    const confirmOutputReset = () => onOutputResetAppliedRef.current?.(props.outputResetVersion);
-    // 测试桩可以延迟 reset 确认，用来覆盖“新 snapshot 必须等 terminal reset 完成后才能消费”的竞态。
-    const deferOutputResetApplied = (globalThis as {
-      __TERMD_TEST_DEFER_OUTPUT_RESET_APPLIED__?: (confirm: () => void) => void;
-    }).__TERMD_TEST_DEFER_OUTPUT_RESET_APPLIED__;
-    if (deferOutputResetApplied) {
-      deferOutputResetApplied(confirmOutputReset);
-    } else {
-      confirmOutputReset();
-    }
+    confirmOutputResetApplied(props.outputResetVersion);
     markWriterNeedsRefreshAndScroll();
     // attach 输出可能早于终端初始化到达；创建实例时先取走待写队列，避免首屏输出丢失。
     drainOutputRef.current = drainOutput;
@@ -3462,7 +3466,7 @@ export function TerminalPane(props: TerminalPaneProps) {
 
       cleanupMountedRenderer = () => {
       recordTermdDiagnostic("terminal_pane_dispose", {
-        outputResetVersion: props.outputResetVersion,
+        outputResetVersion: outputResetVersionRef.current,
         attached: props.attached,
         rendererKind: renderer.kind,
       });
@@ -3648,7 +3652,7 @@ export function TerminalPane(props: TerminalPaneProps) {
       cleanupMountedRenderer?.();
       cleanupMountedRenderer = undefined;
     };
-  }, [props.attached, props.outputResetVersion]);
+  }, [props.attached]);
 
   useEffect(() => {
     const terminal = terminalRef.current;
@@ -3669,14 +3673,24 @@ export function TerminalPane(props: TerminalPaneProps) {
     if (outputResetVersionRef.current === props.outputResetVersion) {
       return;
     }
-    // session 切换时上面的 terminal effect 会按 outputResetVersion 重建终端实例。
-    // 这里仅保留防御式同步清屏：如果未来 effect 条件调整导致实例未重建，也不能残留旧 session 明文。
-    recordTermdDiagnostic("terminal_pane_defensive_reset", {
+    recordTermdDiagnostic("terminal_pane_output_reset", {
       previousResetVersion: outputResetVersionRef.current,
       outputResetVersion: props.outputResetVersion,
+      terminalHasDomFocus: terminalInputHasDomFocus(),
+      writerReset: true,
     });
+    // 中文注释：同一 session 的 full snapshot / resync 不能再销毁整棵 xterm DOM。
+    // 否则 helper textarea 会被替换，浏览器会把输入焦点直接打掉，表现成“闪一下再失焦”。
+    // 这里原地 reset，并推进 writer generation 让旧 write callback 全部失效。
+    resetWriterState();
     invalidateBottomScrollFollow();
+    resetMobileCursorViewportWindow();
     terminal.reset();
+    stabilizeRef.current?.(mobileInputModeRef.current ? "mobile-viewport" : "layout");
+    outputResetVersionRef.current = props.outputResetVersion;
+    confirmOutputResetApplied(props.outputResetVersion);
+    markWriterNeedsRefreshAndScroll();
+    drainOutputRef.current();
   }, [props.outputResetVersion]);
 
   useEffect(() => {
