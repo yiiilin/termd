@@ -36,10 +36,7 @@ not a tty
 
 # 本地 AI 协作计划/规格草稿，不作为仓库源码提交。
 .codex-plan-*.md
-docs/superpowers/plans/2026-06-17-*.md
-docs/superpowers/plans/2026-06-18-*.md
-docs/superpowers/specs/2026-06-17-*.md
-docs/superpowers/specs/2026-06-18-*.md
+docs/superpowers/
 
 # 系统 / 编辑器噪声。
 .DS_Store
