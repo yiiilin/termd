@@ -84,7 +84,7 @@ function fakeRenderer(label: string): TerminalRendererInstance {
 }
 
 describe("TerminalPane async renderer lifecycle", () => {
-  it("迟到的旧 async renderer 不会清空已经挂载的新 renderer DOM", async () => {
+  it("迟到的旧 attach async renderer 不会清空新 attach 已挂载的 renderer DOM", async () => {
     vi.resetModules();
     const firstRenderer = deferred<TerminalRendererInstance>();
     const secondRenderer = deferred<TerminalRendererInstance>();
@@ -104,7 +104,7 @@ describe("TerminalPane async renderer lifecycle", () => {
     const registerOutputDrain = vi.fn(() => () => undefined);
 
     const props = {
-      attached: true,
+      attached: false,
       sessionSize: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
       takeOutput,
       registerOutputDrain,
@@ -114,7 +114,12 @@ describe("TerminalPane async renderer lifecycle", () => {
     };
     const { rerender } = render(<TerminalPane {...props} outputResetVersion={0} />);
 
-    rerender(<TerminalPane {...props} outputResetVersion={1} />);
+    // 中文注释：当前实现里 outputResetVersion 只做原地 reset，不再重建第二个 renderer。
+    // 这里覆盖真实仍然存在的竞态：旧 attach 已经 detach 并发起新 attach 后，迟到返回的旧
+    // async renderer 不能把新 attach 已挂载的 DOM 清掉。
+    rerender(<TerminalPane {...props} attached outputResetVersion={0} />);
+    rerender(<TerminalPane {...props} attached={false} outputResetVersion={0} />);
+    rerender(<TerminalPane {...props} attached outputResetVersion={0} />);
 
     await act(async () => {
       secondRenderer.resolve(fakeRenderer("second-renderer"));
