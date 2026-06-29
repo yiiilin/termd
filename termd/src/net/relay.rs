@@ -32,7 +32,7 @@ use termd_proto::{
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, timeout};
 use tokio_tungstenite::{
@@ -131,6 +131,12 @@ enum RelayPushEvent {
         client_id: RelayClientId,
         session_id: SessionId,
     },
+    MetadataClients {
+        client_id: RelayClientId,
+    },
+    MetadataStatus {
+        client_id: RelayClientId,
+    },
 }
 
 impl RelayPushEvent {
@@ -140,6 +146,8 @@ impl RelayPushEvent {
             Self::Output { .. } => "output",
             Self::Cwd { .. } => "cwd",
             Self::Resize { .. } => "resize",
+            Self::MetadataClients { .. } => "metadata_clients",
+            Self::MetadataStatus { .. } => "metadata_status",
         }
     }
 
@@ -147,16 +155,19 @@ impl RelayPushEvent {
         match self {
             Self::Output { client_id, .. }
             | Self::Cwd { client_id, .. }
-            | Self::Resize { client_id, .. } => client_id,
+            | Self::Resize { client_id, .. }
+            | Self::MetadataClients { client_id }
+            | Self::MetadataStatus { client_id } => client_id,
         }
     }
 
     #[cfg(test)]
-    fn session_id(self) -> SessionId {
+    fn session_id(self) -> Option<SessionId> {
         match self {
             Self::Output { session_id, .. }
             | Self::Cwd { session_id, .. }
-            | Self::Resize { session_id, .. } => session_id,
+            | Self::Resize { session_id, .. } => Some(session_id),
+            Self::MetadataClients { .. } | Self::MetadataStatus { .. } => None,
         }
     }
 }
@@ -288,6 +299,8 @@ struct RelayTrafficCounters {
     out_push_output: RelayTrafficBucket,
     out_push_cwd: RelayTrafficBucket,
     out_push_resize: RelayTrafficBucket,
+    out_push_metadata_clients: RelayTrafficBucket,
+    out_push_metadata_status: RelayTrafficBucket,
     out_mux_keepalive: RelayTrafficBucket,
     out_idle_ping: RelayTrafficBucket,
     out_pong: RelayTrafficBucket,
@@ -317,6 +330,12 @@ impl RelayTrafficCounters {
             RelayOutKind::PushOutput => self.out_push_output.record(envelopes, bytes),
             RelayOutKind::PushCwd => self.out_push_cwd.record(envelopes, bytes),
             RelayOutKind::PushResize => self.out_push_resize.record(envelopes, bytes),
+            RelayOutKind::PushMetadataClients => {
+                self.out_push_metadata_clients.record(envelopes, bytes)
+            }
+            RelayOutKind::PushMetadataStatus => {
+                self.out_push_metadata_status.record(envelopes, bytes)
+            }
             RelayOutKind::MuxKeepalive => self.out_mux_keepalive.record(envelopes, bytes),
             RelayOutKind::IdlePing => self.out_idle_ping.record(envelopes, bytes),
             RelayOutKind::Pong => self.out_pong.record(envelopes, bytes),
@@ -338,6 +357,8 @@ impl RelayTrafficCounters {
             || !self.out_push_output.is_empty()
             || !self.out_push_cwd.is_empty()
             || !self.out_push_resize.is_empty()
+            || !self.out_push_metadata_clients.is_empty()
+            || !self.out_push_metadata_status.is_empty()
             || !self.out_mux_keepalive.is_empty()
             || !self.out_pong.is_empty()
             || self.send_errors > 0
@@ -503,6 +524,8 @@ enum RelayOutKind {
     PushOutput,
     PushCwd,
     PushResize,
+    PushMetadataClients,
+    PushMetadataStatus,
     #[cfg(test)]
     MuxKeepalive,
     #[cfg(test)]
@@ -519,7 +542,14 @@ impl RelayOutKind {
 
     #[cfg(test)]
     fn uses_data_lane(self) -> bool {
-        matches!(self, Self::PushOutput | Self::PushCwd | Self::PushResize)
+        matches!(
+            self,
+            Self::PushOutput
+                | Self::PushCwd
+                | Self::PushResize
+                | Self::PushMetadataClients
+                | Self::PushMetadataStatus
+        )
     }
 
     fn label(self) -> &'static str {
@@ -529,6 +559,8 @@ impl RelayOutKind {
             Self::PushOutput => "push_output",
             Self::PushCwd => "push_cwd",
             Self::PushResize => "push_resize",
+            Self::PushMetadataClients => "push_metadata_clients",
+            Self::PushMetadataStatus => "push_metadata_status",
             #[cfg(test)]
             Self::MuxKeepalive => "mux_keepalive",
             #[cfg(test)]
@@ -819,6 +851,8 @@ struct RelayWatcherCounts {
     output: usize,
     cwd: usize,
     resize: usize,
+    metadata_clients: usize,
+    metadata_status: usize,
 }
 
 #[cfg(test)]
@@ -1592,7 +1626,10 @@ async fn run_relay_established_data_connection(
     let mut watched_output_sessions = HashMap::<RelayClientId, HashSet<SessionId>>::new();
     let mut watched_cwd_sessions = HashMap::<RelayClientId, HashSet<SessionId>>::new();
     let mut watched_resize_sessions = HashMap::<RelayClientId, HashSet<SessionId>>::new();
+    let mut watched_metadata_clients = HashSet::<RelayClientId>::new();
+    let mut watched_metadata_status_intervals = HashMap::<RelayClientId, u64>::new();
     let mut watcher_tasks = HashMap::<RelayClientId, Vec<JoinHandle<()>>>::new();
+    let mut metadata_watcher_tasks = HashMap::<RelayClientId, Vec<JoinHandle<()>>>::new();
     let mut summary = RelayDataPipeSummaryState::new(Instant::now());
 
     let result = loop {
@@ -1726,6 +1763,16 @@ async fn run_relay_established_data_connection(
                             &mut watcher_tasks,
                         )
                         .await;
+                        sync_relay_metadata_watchers_for_client(
+                            Some(client_id),
+                            &connections,
+                            &protocol,
+                            &mut watched_metadata_clients,
+                            &mut watched_metadata_status_intervals,
+                            &push_event_tx,
+                            &mut metadata_watcher_tasks,
+                        )
+                        .await;
                         queue_relay_initial_output_events(
                             Some(client_id),
                             &initial_output_sessions,
@@ -1798,9 +1845,13 @@ async fn run_relay_established_data_connection(
         &mut watched_output_sessions,
         &mut watched_cwd_sessions,
         &mut watched_resize_sessions,
+        &mut watched_metadata_clients,
+        &mut watched_metadata_status_intervals,
         &mut watcher_tasks,
+        &mut metadata_watcher_tasks,
     );
     abort_relay_watcher_tasks(watcher_tasks);
+    abort_relay_watcher_tasks(metadata_watcher_tasks);
     let close_reason = match &result {
         Ok(RelayEstablishedDataEnd::ClientDisconnected) => {
             RelayDataPipeCloseReason::ClientDisconnected
@@ -2459,6 +2510,10 @@ async fn drain_relay_data_push_events(
         };
         let responses = match kind {
             RelayOutKind::PushOutput => {
+                let Some(session_id) = session_id else {
+                    drop(push_permit);
+                    continue;
+                };
                 let (lock_wait, messages) = {
                     let lock_started = Instant::now();
                     let mut protocol = protocol.lock().await;
@@ -2482,6 +2537,10 @@ async fn drain_relay_data_push_events(
                 connection.encrypt_collected_inner_messages_wire(messages)
             }
             RelayOutKind::PushCwd => {
+                let Some(session_id) = session_id else {
+                    drop(push_permit);
+                    continue;
+                };
                 let messages = {
                     let mut protocol = protocol.lock().await;
                     connection.read_session_cwd_update_messages(&mut protocol, session_id)
@@ -2489,10 +2548,25 @@ async fn drain_relay_data_push_events(
                 connection.encrypt_collected_inner_messages_wire(messages)
             }
             RelayOutKind::PushResize => {
+                let Some(session_id) = session_id else {
+                    drop(push_permit);
+                    continue;
+                };
                 let messages = {
                     let mut protocol = protocol.lock().await;
                     connection.read_session_resize_update_messages(&mut protocol, session_id)
                 };
+                connection.encrypt_collected_inner_messages_wire(messages)
+            }
+            RelayOutKind::PushMetadataClients => {
+                let messages = {
+                    let mut protocol = protocol.lock().await;
+                    connection.read_metadata_clients_snapshot_messages(&mut protocol)
+                };
+                connection.encrypt_collected_inner_messages_wire(messages)
+            }
+            RelayOutKind::PushMetadataStatus => {
+                let messages = connection.read_metadata_status_snapshot_messages();
                 connection.encrypt_collected_inner_messages_wire(messages)
             }
             RelayOutKind::Response | RelayOutKind::FileTunnelBody | RelayOutKind::Pong => {
@@ -2509,7 +2583,9 @@ async fn drain_relay_data_push_events(
             continue;
         }
         let bytes = enqueue_relay_data_wire_with_permit(push_permit, kind, responses);
-        if kind == RelayOutKind::PushOutput {
+        if kind == RelayOutKind::PushOutput
+            && let Some(session_id) = session_id
+        {
             summary.record_push_output(session_id, bytes);
         }
         drained_events = drained_events.saturating_add(1);
@@ -2588,7 +2664,10 @@ async fn connect_relay_mux_base_once(
     let mut watched_output_sessions = HashMap::<RelayClientId, HashSet<SessionId>>::new();
     let mut watched_cwd_sessions = HashMap::<RelayClientId, HashSet<SessionId>>::new();
     let mut watched_resize_sessions = HashMap::<RelayClientId, HashSet<SessionId>>::new();
+    let mut watched_metadata_clients = HashSet::<RelayClientId>::new();
+    let mut watched_metadata_status_intervals = HashMap::<RelayClientId, u64>::new();
     let mut watcher_tasks = HashMap::<RelayClientId, Vec<JoinHandle<()>>>::new();
+    let mut metadata_watcher_tasks = HashMap::<RelayClientId, Vec<JoinHandle<()>>>::new();
     let mut pending_push_events = RelayPushEventQueue::default();
     let mut idle_deadline = Instant::now() + RELAY_IDLE_TIMEOUT;
     let mut traffic = RelayTrafficCounters::default();
@@ -2675,10 +2754,12 @@ async fn connect_relay_mux_base_once(
                                     &mut last_traffic_log,
                                     &mut connections,
                                     relay_watcher_counts(
-                                        &watched_output_sessions,
-                                        &watched_cwd_sessions,
-                                        &watched_resize_sessions,
-                                    ),
+                                &watched_output_sessions,
+                                &watched_cwd_sessions,
+                                &watched_resize_sessions,
+                                &watched_metadata_clients,
+                                &watched_metadata_status_intervals,
+                            ),
                                     false,
                                 );
                                 continue;
@@ -2707,7 +2788,10 @@ async fn connect_relay_mux_base_once(
                                     &mut watched_output_sessions,
                                     &mut watched_cwd_sessions,
                                     &mut watched_resize_sessions,
+                                    &mut watched_metadata_clients,
+                                    &mut watched_metadata_status_intervals,
                                     &mut watcher_tasks,
+                                    &mut metadata_watcher_tasks,
                                 );
                             }
                         }
@@ -2747,6 +2831,16 @@ async fn connect_relay_mux_base_once(
                             &mut watcher_tasks,
                         )
                         .await;
+                        sync_relay_metadata_watchers_for_client(
+                            client_id,
+                            &connections,
+                            &protocol,
+                            &mut watched_metadata_clients,
+                            &mut watched_metadata_status_intervals,
+                            &push_event_tx,
+                            &mut metadata_watcher_tasks,
+                        )
+                        .await;
                         queue_relay_initial_output_events(
                             client_id,
                             &initial_output_sessions,
@@ -2765,6 +2859,8 @@ async fn connect_relay_mux_base_once(
                                 &watched_output_sessions,
                                 &watched_cwd_sessions,
                                 &watched_resize_sessions,
+                                &watched_metadata_clients,
+                                &watched_metadata_status_intervals,
                             ),
                             false,
                         );
@@ -2805,10 +2901,12 @@ async fn connect_relay_mux_base_once(
                                     &mut last_traffic_log,
                                     &mut connections,
                                     relay_watcher_counts(
-                                        &watched_output_sessions,
-                                        &watched_cwd_sessions,
-                                        &watched_resize_sessions,
-                                    ),
+                                &watched_output_sessions,
+                                &watched_cwd_sessions,
+                                &watched_resize_sessions,
+                                &watched_metadata_clients,
+                                &watched_metadata_status_intervals,
+                            ),
                                     false,
                                 );
                                 continue;
@@ -2837,7 +2935,10 @@ async fn connect_relay_mux_base_once(
                                     &mut watched_output_sessions,
                                     &mut watched_cwd_sessions,
                                     &mut watched_resize_sessions,
+                                    &mut watched_metadata_clients,
+                                    &mut watched_metadata_status_intervals,
                                     &mut watcher_tasks,
+                                    &mut metadata_watcher_tasks,
                                 );
                             }
                         }
@@ -2877,6 +2978,16 @@ async fn connect_relay_mux_base_once(
                             &mut watcher_tasks,
                         )
                         .await;
+                        sync_relay_metadata_watchers_for_client(
+                            client_id,
+                            &connections,
+                            &protocol,
+                            &mut watched_metadata_clients,
+                            &mut watched_metadata_status_intervals,
+                            &push_event_tx,
+                            &mut metadata_watcher_tasks,
+                        )
+                        .await;
                         queue_relay_initial_output_events(
                             client_id,
                             &initial_output_sessions,
@@ -2895,6 +3006,8 @@ async fn connect_relay_mux_base_once(
                                 &watched_output_sessions,
                                 &watched_cwd_sessions,
                                 &watched_resize_sessions,
+                                &watched_metadata_clients,
+                                &watched_metadata_status_intervals,
                             ),
                             false,
                         );
@@ -2924,6 +3037,8 @@ async fn connect_relay_mux_base_once(
                                 &watched_output_sessions,
                                 &watched_cwd_sessions,
                                 &watched_resize_sessions,
+                                &watched_metadata_clients,
+                                &watched_metadata_status_intervals,
                             ),
                             false,
                         );
@@ -2943,6 +3058,8 @@ async fn connect_relay_mux_base_once(
                                 &watched_output_sessions,
                                 &watched_cwd_sessions,
                                 &watched_resize_sessions,
+                                &watched_metadata_clients,
+                                &watched_metadata_status_intervals,
                             ),
                             false,
                         );
@@ -2995,10 +3112,12 @@ async fn connect_relay_mux_base_once(
                         &mut last_traffic_log,
                         &mut connections,
                         relay_watcher_counts(
-                            &watched_output_sessions,
-                                                &watched_cwd_sessions,
-                            &watched_resize_sessions,
-                        ),
+                                &watched_output_sessions,
+                                &watched_cwd_sessions,
+                                &watched_resize_sessions,
+                                &watched_metadata_clients,
+                                &watched_metadata_status_intervals,
+                            ),
                         false,
                     );
                 }
@@ -3045,10 +3164,12 @@ async fn connect_relay_mux_base_once(
                     &mut last_traffic_log,
                     &mut connections,
                     relay_watcher_counts(
-                        &watched_output_sessions,
-                        &watched_cwd_sessions,
-                        &watched_resize_sessions,
-                    ),
+                                &watched_output_sessions,
+                                &watched_cwd_sessions,
+                                &watched_resize_sessions,
+                                &watched_metadata_clients,
+                                &watched_metadata_status_intervals,
+                            ),
                     false,
                 );
             }
@@ -3099,10 +3220,12 @@ async fn connect_relay_mux_base_once(
                     &mut last_traffic_log,
                     &mut connections,
                     relay_watcher_counts(
-                        &watched_output_sessions,
-                        &watched_cwd_sessions,
-                        &watched_resize_sessions,
-                    ),
+                                &watched_output_sessions,
+                                &watched_cwd_sessions,
+                                &watched_resize_sessions,
+                                &watched_metadata_clients,
+                                &watched_metadata_status_intervals,
+                            ),
                     false,
                 );
             }
@@ -3118,6 +3241,8 @@ async fn connect_relay_mux_base_once(
             &watched_output_sessions,
             &watched_cwd_sessions,
             &watched_resize_sessions,
+            &watched_metadata_clients,
+            &watched_metadata_status_intervals,
         ),
         true,
     );
@@ -3134,11 +3259,15 @@ fn relay_watcher_counts(
     watched_output_sessions: &HashMap<RelayClientId, HashSet<SessionId>>,
     watched_cwd_sessions: &HashMap<RelayClientId, HashSet<SessionId>>,
     watched_resize_sessions: &HashMap<RelayClientId, HashSet<SessionId>>,
+    watched_metadata_clients: &HashSet<RelayClientId>,
+    watched_metadata_status_intervals: &HashMap<RelayClientId, u64>,
 ) -> RelayWatcherCounts {
     RelayWatcherCounts {
         output: watched_output_sessions.values().map(HashSet::len).sum(),
         cwd: watched_cwd_sessions.values().map(HashSet::len).sum(),
         resize: watched_resize_sessions.values().map(HashSet::len).sum(),
+        metadata_clients: watched_metadata_clients.len(),
+        metadata_status: watched_metadata_status_intervals.len(),
     }
 }
 
@@ -3250,6 +3379,8 @@ fn info_relay_traffic(
         watchers_output = watchers.output,
         watchers_cwd = watchers.cwd,
         watchers_resize = watchers.resize,
+        watchers_metadata_clients = watchers.metadata_clients,
+        watchers_metadata_status = watchers.metadata_status,
         flow_clients = flow.clients,
         flow_packet_mode_clients = flow.packet_mode_clients,
         flow_attached_sessions = flow.attached_sessions,
@@ -3278,6 +3409,8 @@ fn debug_relay_traffic(
         watchers_output = watchers.output,
         watchers_cwd = watchers.cwd,
         watchers_resize = watchers.resize,
+        watchers_metadata_clients = watchers.metadata_clients,
+        watchers_metadata_status = watchers.metadata_status,
         flow_clients = flow.clients,
         flow_packet_mode_clients = flow.packet_mode_clients,
         flow_attached_sessions = flow.attached_sessions,
@@ -3935,6 +4068,71 @@ async fn sync_relay_watchers_for_client(
     initial_output_sessions
 }
 
+async fn sync_relay_metadata_watchers_for_client(
+    client_id: Option<RelayClientId>,
+    connections: &HashMap<RelayClientId, ProtocolConnection>,
+    protocol: &SharedDaemonProtocol,
+    watched_metadata_clients: &mut HashSet<RelayClientId>,
+    watched_metadata_status_intervals: &mut HashMap<RelayClientId, u64>,
+    push_event_tx: &mpsc::Sender<RelayPushEvent>,
+    watcher_tasks: &mut HashMap<RelayClientId, Vec<JoinHandle<()>>>,
+) {
+    let Some(client_id) = client_id else {
+        return;
+    };
+    let Some(connection) = connections.get(&client_id) else {
+        remove_relay_metadata_watchers_for_client(
+            client_id,
+            watched_metadata_clients,
+            watched_metadata_status_intervals,
+            watcher_tasks,
+        );
+        return;
+    };
+
+    let (metadata_clients_signal, metadata_status_interval_ms) = {
+        let protocol = protocol.lock().await;
+        (
+            connection.metadata_clients_signal(&protocol),
+            connection.metadata_status_interval_ms(),
+        )
+    };
+
+    let desired_clients = metadata_clients_signal.is_some();
+    let current_clients = watched_metadata_clients.contains(&client_id);
+    let current_status_interval = watched_metadata_status_intervals.get(&client_id).copied();
+    if current_clients != desired_clients || current_status_interval != metadata_status_interval_ms
+    {
+        debug!(
+            client_id = client_id.0,
+            "rebuilding relay metadata watchers after subscription set changed"
+        );
+        remove_relay_metadata_watchers_for_client(
+            client_id,
+            watched_metadata_clients,
+            watched_metadata_status_intervals,
+            watcher_tasks,
+        );
+    }
+
+    if let Some(signal) = metadata_clients_signal
+        && watched_metadata_clients.insert(client_id)
+    {
+        spawn_relay_metadata_clients_push_watcher(client_id, signal, push_event_tx, watcher_tasks);
+    }
+
+    if let Some(interval_ms) = metadata_status_interval_ms
+        && watched_metadata_status_intervals.insert(client_id, interval_ms) != Some(interval_ms)
+    {
+        spawn_relay_metadata_status_push_watcher(
+            client_id,
+            interval_ms,
+            push_event_tx,
+            watcher_tasks,
+        );
+    }
+}
+
 fn queue_relay_initial_output_events(
     client_id: Option<RelayClientId>,
     initial_output_sessions: &[SessionId],
@@ -3986,7 +4184,10 @@ fn drop_relay_client_runtime(
     watched_output_sessions: &mut HashMap<RelayClientId, HashSet<SessionId>>,
     watched_cwd_sessions: &mut HashMap<RelayClientId, HashSet<SessionId>>,
     watched_resize_sessions: &mut HashMap<RelayClientId, HashSet<SessionId>>,
+    watched_metadata_clients: &mut HashSet<RelayClientId>,
+    watched_metadata_status_intervals: &mut HashMap<RelayClientId, u64>,
     watcher_tasks: &mut HashMap<RelayClientId, Vec<JoinHandle<()>>>,
+    metadata_watcher_tasks: &mut HashMap<RelayClientId, Vec<JoinHandle<()>>>,
 ) {
     // 中文注释：relay client 的 WebSocket 已经断开或协议层已关闭时，daemon 端必须
     // 一次性清理该 client 的所有 runtime：尚未发送的 push、watcher 订阅和后台 task。
@@ -3998,6 +4199,12 @@ fn drop_relay_client_runtime(
         watched_cwd_sessions,
         watched_resize_sessions,
         watcher_tasks,
+    );
+    remove_relay_metadata_watchers_for_client(
+        client_id,
+        watched_metadata_clients,
+        watched_metadata_status_intervals,
+        metadata_watcher_tasks,
     );
 }
 
@@ -4316,6 +4523,9 @@ async fn drain_relay_push_events(
         };
         let responses = match kind {
             RelayOutKind::PushOutput => {
+                let Some(session_id) = session_id else {
+                    continue;
+                };
                 let lock_started = Instant::now();
                 let collect_started = Instant::now();
                 let (lock_wait, messages) = {
@@ -4347,6 +4557,9 @@ async fn drain_relay_push_events(
                 connection.encrypt_collected_inner_messages_wire(messages)
             }
             RelayOutKind::PushCwd => {
+                let Some(session_id) = session_id else {
+                    continue;
+                };
                 let messages = {
                     let mut protocol = protocol.lock().await;
                     connection.read_session_cwd_update_messages(&mut protocol, session_id)
@@ -4354,10 +4567,24 @@ async fn drain_relay_push_events(
                 connection.encrypt_collected_inner_messages_wire(messages)
             }
             RelayOutKind::PushResize => {
+                let Some(session_id) = session_id else {
+                    continue;
+                };
                 let messages = {
                     let mut protocol = protocol.lock().await;
                     connection.read_session_resize_update_messages(&mut protocol, session_id)
                 };
+                connection.encrypt_collected_inner_messages_wire(messages)
+            }
+            RelayOutKind::PushMetadataClients => {
+                let messages = {
+                    let mut protocol = protocol.lock().await;
+                    connection.read_metadata_clients_snapshot_messages(&mut protocol)
+                };
+                connection.encrypt_collected_inner_messages_wire(messages)
+            }
+            RelayOutKind::PushMetadataStatus => {
+                let messages = connection.read_metadata_status_snapshot_messages();
                 connection.encrypt_collected_inner_messages_wire(messages)
             }
             RelayOutKind::Response
@@ -4517,20 +4744,28 @@ fn relay_mux_envelopes_wire_len(envelopes: &[RelayMuxEnvelope]) -> usize {
         .sum()
 }
 
-fn relay_push_event_parts(event: RelayPushEvent) -> (RelayClientId, SessionId, RelayOutKind) {
+fn relay_push_event_parts(
+    event: RelayPushEvent,
+) -> (RelayClientId, Option<SessionId>, RelayOutKind) {
     match event {
         RelayPushEvent::Output {
             client_id,
             session_id,
-        } => (client_id, session_id, RelayOutKind::PushOutput),
+        } => (client_id, Some(session_id), RelayOutKind::PushOutput),
         RelayPushEvent::Cwd {
             client_id,
             session_id,
-        } => (client_id, session_id, RelayOutKind::PushCwd),
+        } => (client_id, Some(session_id), RelayOutKind::PushCwd),
         RelayPushEvent::Resize {
             client_id,
             session_id,
-        } => (client_id, session_id, RelayOutKind::PushResize),
+        } => (client_id, Some(session_id), RelayOutKind::PushResize),
+        RelayPushEvent::MetadataClients { client_id } => {
+            (client_id, None, RelayOutKind::PushMetadataClients)
+        }
+        RelayPushEvent::MetadataStatus { client_id } => {
+            (client_id, None, RelayOutKind::PushMetadataStatus)
+        }
     }
 }
 
@@ -4538,7 +4773,9 @@ fn relay_push_event_client_id(event: RelayPushEvent) -> RelayClientId {
     match event {
         RelayPushEvent::Output { client_id, .. }
         | RelayPushEvent::Cwd { client_id, .. }
-        | RelayPushEvent::Resize { client_id, .. } => client_id,
+        | RelayPushEvent::Resize { client_id, .. }
+        | RelayPushEvent::MetadataClients { client_id }
+        | RelayPushEvent::MetadataStatus { client_id } => client_id,
     }
 }
 
@@ -4557,6 +4794,86 @@ fn remove_relay_watchers_for_client(
             task.abort();
         }
     }
+}
+
+fn remove_relay_metadata_watchers_for_client(
+    client_id: RelayClientId,
+    watched_metadata_clients: &mut HashSet<RelayClientId>,
+    watched_metadata_status_intervals: &mut HashMap<RelayClientId, u64>,
+    watcher_tasks: &mut HashMap<RelayClientId, Vec<JoinHandle<()>>>,
+) {
+    watched_metadata_clients.remove(&client_id);
+    watched_metadata_status_intervals.remove(&client_id);
+    if let Some(tasks) = watcher_tasks.remove(&client_id) {
+        for task in tasks {
+            task.abort();
+        }
+    }
+}
+
+fn spawn_relay_metadata_clients_push_watcher(
+    client_id: RelayClientId,
+    mut signal: watch::Receiver<u64>,
+    push_event_tx: &mpsc::Sender<RelayPushEvent>,
+    watcher_tasks: &mut HashMap<RelayClientId, Vec<JoinHandle<()>>>,
+) {
+    // 中文注释：subscribe 响应已经返回初始 metadata clients snapshot；watcher 只负责后续变化。
+    signal.borrow_and_update();
+
+    let push_event_tx = push_event_tx.clone();
+    watcher_tasks
+        .entry(client_id)
+        .or_default()
+        .push(tokio::spawn(async move {
+            loop {
+                if signal.changed().await.is_err() {
+                    break;
+                }
+                signal.borrow_and_update();
+                if push_event_tx
+                    .send(RelayPushEvent::MetadataClients { client_id })
+                    .await
+                    .is_err()
+                {
+                    debug!(
+                        client_id = client_id.0,
+                        event = "metadata_clients",
+                        "relay metadata clients watcher stopped because event queue closed"
+                    );
+                    break;
+                }
+            }
+        }));
+}
+
+fn spawn_relay_metadata_status_push_watcher(
+    client_id: RelayClientId,
+    interval_ms: u64,
+    push_event_tx: &mpsc::Sender<RelayPushEvent>,
+    watcher_tasks: &mut HashMap<RelayClientId, Vec<JoinHandle<()>>>,
+) {
+    let push_event_tx = push_event_tx.clone();
+    watcher_tasks
+        .entry(client_id)
+        .or_default()
+        .push(tokio::spawn(async move {
+            let interval = Duration::from_millis(interval_ms);
+            loop {
+                tokio::time::sleep(interval).await;
+                if push_event_tx
+                    .send(RelayPushEvent::MetadataStatus { client_id })
+                    .await
+                    .is_err()
+                {
+                    debug!(
+                        client_id = client_id.0,
+                        event = "metadata_status",
+                        "relay metadata status watcher stopped because event queue closed"
+                    );
+                    break;
+                }
+            }
+        }));
 }
 
 fn abort_relay_watcher_tasks(watcher_tasks: HashMap<RelayClientId, Vec<JoinHandle<()>>>) {
@@ -5486,8 +5803,9 @@ mod tests {
         task::{Context, Poll},
     };
     use termd_proto::{
-        Envelope, MessageType, PingPayload, ProtocolVersion, RouteHelloPayload, RouteReadyPayload,
-        RouteRole,
+        ClientHelloKind, ClientHelloPayload, DaemonStatusResultPayload, Envelope, MessageType,
+        MetadataSubscribePayload, PingPayload, ProtocolVersion, RouteHelloPayload,
+        RouteReadyPayload, RouteRole,
     };
     use tokio::sync::{Notify, mpsc, oneshot};
 
@@ -5673,6 +5991,7 @@ mod tests {
             client_id,
             session_id: client_session_id,
         });
+        pending_push_events.enqueue(RelayPushEvent::MetadataClients { client_id });
         pending_push_events.enqueue(other_event);
 
         let mut watched_output_sessions = HashMap::new();
@@ -5682,6 +6001,8 @@ mod tests {
         watched_cwd_sessions.insert(client_id, HashSet::from([client_session_id]));
         let mut watched_resize_sessions = HashMap::new();
         watched_resize_sessions.insert(client_id, HashSet::from([client_session_id]));
+        let mut watched_metadata_clients = HashSet::from([client_id]);
+        let mut watched_metadata_status_intervals = HashMap::from([(client_id, 1_000)]);
         let (drop_tx, drop_rx) = oneshot::channel();
         let task = tokio::spawn(async move {
             let _drop_notify = DropNotify(Some(drop_tx));
@@ -5689,6 +6010,7 @@ mod tests {
         });
         let mut watcher_tasks = HashMap::new();
         watcher_tasks.insert(client_id, vec![task]);
+        let mut metadata_watcher_tasks = HashMap::new();
         tokio::task::yield_now().await;
 
         drop_relay_client_runtime(
@@ -5697,7 +6019,10 @@ mod tests {
             &mut watched_output_sessions,
             &mut watched_cwd_sessions,
             &mut watched_resize_sessions,
+            &mut watched_metadata_clients,
+            &mut watched_metadata_status_intervals,
             &mut watcher_tasks,
+            &mut metadata_watcher_tasks,
         );
 
         assert_eq!(pending_push_events.pop_front(), Some(other_event));
@@ -5709,7 +6034,10 @@ mod tests {
         );
         assert!(!watched_cwd_sessions.contains_key(&client_id));
         assert!(!watched_resize_sessions.contains_key(&client_id));
+        assert!(!watched_metadata_clients.contains(&client_id));
+        assert!(!watched_metadata_status_intervals.contains_key(&client_id));
         assert!(!watcher_tasks.contains_key(&client_id));
+        assert!(!metadata_watcher_tasks.contains_key(&client_id));
         timeout(Duration::from_millis(50), drop_rx)
             .await
             .expect("client watcher task should be aborted")
@@ -6080,6 +6408,47 @@ mod tests {
         assert!(push_drain_wake_pending);
         assert_eq!(pending_push_events.pop_front(), Some(event));
         assert!(write_rx.try_recv().is_ok());
+        assert!(write_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn relay_data_push_drain_sends_metadata_snapshot_events() {
+        let protocol = test_protocol("relay-data-metadata-push");
+        let client_id = RelayClientId(915);
+        let (connection, mut device_e2ee) =
+            authenticated_relay_metadata_connection(protocol.clone(), true, Some(1_000)).await;
+        let mut connections = HashMap::from([(client_id, connection)]);
+        let mut pending_push_events = RelayPushEventQueue::default();
+        pending_push_events.enqueue(RelayPushEvent::MetadataClients { client_id });
+        pending_push_events.enqueue(RelayPushEvent::MetadataStatus { client_id });
+        let (write_tx, mut write_rx) = mpsc::channel::<RelayDataWrite>(4);
+        let mut push_drain_wake_pending = false;
+        let mut summary = RelayDataPipeSummaryState::new(Instant::now());
+
+        drain_relay_data_push_events(
+            "ws://relay-data-metadata-push/ws",
+            ServerId::new(),
+            client_id,
+            &protocol,
+            &mut connections,
+            &mut pending_push_events,
+            &write_tx,
+            &mut push_drain_wake_pending,
+            &mut summary,
+        )
+        .await
+        .unwrap();
+
+        let first = relay_data_write_messages(write_rx.try_recv().unwrap());
+        let first_inner = decrypt_relay_wire_messages(&mut device_e2ee, first);
+        assert_eq!(first_inner[0].kind, MessageType::DaemonClientsSnapshot);
+
+        let second = relay_data_write_messages(write_rx.try_recv().unwrap());
+        let second_inner = decrypt_relay_wire_messages(&mut device_e2ee, second);
+        assert_eq!(second_inner[0].kind, MessageType::DaemonStatusSnapshot);
+        let status: DaemonStatusResultPayload =
+            decode_payload(second_inner[0].payload.clone()).unwrap();
+        assert_eq!(status.load_avg.len(), 3);
         assert!(write_rx.try_recv().is_err());
     }
 
@@ -8422,6 +8791,151 @@ mod tests {
         let outer = daemon_frame_to_json(pair_responses[0].clone());
         let frame = encrypted_frame_from_envelope(outer).unwrap();
         device_e2ee.decrypt_json_payload(&frame).unwrap()
+    }
+
+    async fn authenticated_relay_metadata_connection(
+        protocol: SharedDaemonProtocol,
+        clients: bool,
+        status_interval_ms: Option<u64>,
+    ) -> (ProtocolConnection, E2eeSession) {
+        let mut protocol_guard = protocol.lock().await;
+        let (mut connection, _) = protocol_guard.start_connection();
+        let device_id = termd_proto::DeviceId::new();
+        let device_keypair = E2eeKeyPair::generate();
+        let server_e2ee_key = protocol_guard.e2ee_public_key();
+        let context = E2eeSessionContext::new(
+            protocol_guard.server_id(),
+            device_id,
+            server_e2ee_key,
+            device_keypair.public_key(),
+        );
+        let mut device_e2ee = E2eeSession::new(
+            E2eeSessionRole::Device,
+            &device_keypair,
+            server_e2ee_key,
+            context,
+        )
+        .unwrap();
+        let handshake = envelope_value(
+            MessageType::E2eeKeyExchange,
+            termd_proto::E2eeKeyExchangePayload::new(
+                protocol_guard.server_id(),
+                device_id,
+                device_keypair.public_key_wire(),
+                termd_proto::Nonce("relay-metadata-handshake".to_owned()),
+                current_unix_timestamp_millis(),
+            ),
+        )
+        .unwrap();
+        let handshake_responses = connection
+            .handle_wire_message(&mut protocol_guard, ProtocolWireMessage::Json(handshake));
+        assert!(handshake_responses.is_empty());
+
+        let pair_request = envelope_value(
+            MessageType::PairRequest,
+            termd_proto::PairRequestPayload {
+                device_id,
+                device_public_key: termd_proto::PublicKey(
+                    "ed25519-v1:relay-metadata-device".to_owned(),
+                ),
+                token: protocol_guard
+                    .issue_pairing_token(current_unix_timestamp_millis())
+                    .unwrap()
+                    .token()
+                    .clone(),
+                nonce: termd_proto::Nonce("relay-metadata-pair".to_owned()),
+                timestamp_ms: current_unix_timestamp_millis(),
+            },
+        )
+        .unwrap();
+        let pair_responses = connection.handle_wire_message(
+            &mut protocol_guard,
+            ProtocolWireMessage::Json(
+                envelope_value(
+                    MessageType::EncryptedFrame,
+                    device_e2ee.encrypt_json_payload(&pair_request).unwrap(),
+                )
+                .unwrap(),
+            ),
+        );
+        let pair_inner = decrypt_relay_wire_messages(&mut device_e2ee, pair_responses);
+        assert_eq!(pair_inner[0].kind, MessageType::PairAccept);
+
+        let hello = envelope_value(
+            MessageType::ClientHello,
+            ClientHelloPayload {
+                name: "Relay metadata sidecar".to_owned(),
+                kind: ClientHelloKind::Metadata,
+            },
+        )
+        .unwrap();
+        let hello_responses = connection.handle_wire_message(
+            &mut protocol_guard,
+            ProtocolWireMessage::Json(
+                envelope_value(
+                    MessageType::EncryptedFrame,
+                    device_e2ee.encrypt_json_payload(&hello).unwrap(),
+                )
+                .unwrap(),
+            ),
+        );
+        assert!(hello_responses.is_empty());
+
+        let subscribe = envelope_value(
+            MessageType::MetadataSubscribe,
+            MetadataSubscribePayload {
+                status_interval_ms,
+                clients,
+            },
+        )
+        .unwrap();
+        let subscribe_responses = connection.handle_wire_message(
+            &mut protocol_guard,
+            ProtocolWireMessage::Json(
+                envelope_value(
+                    MessageType::EncryptedFrame,
+                    device_e2ee.encrypt_json_payload(&subscribe).unwrap(),
+                )
+                .unwrap(),
+            ),
+        );
+        let subscribe_inner = decrypt_relay_wire_messages(&mut device_e2ee, subscribe_responses);
+        assert_eq!(subscribe_inner[0].kind, MessageType::MetadataSubscribe);
+        assert!(subscribe_inner.iter().skip(1).all(|envelope| {
+            matches!(
+                envelope.kind,
+                MessageType::DaemonClientsSnapshot | MessageType::DaemonStatusSnapshot
+            )
+        }));
+
+        (connection, device_e2ee)
+    }
+
+    fn relay_data_write_messages(write: RelayDataWrite) -> Vec<ProtocolWireMessage> {
+        match write {
+            RelayDataWrite::Wire { messages, .. } => messages,
+            RelayDataWrite::Raw { .. } => panic!("expected wire write"),
+        }
+    }
+
+    fn decrypt_relay_wire_messages(
+        device_e2ee: &mut E2eeSession,
+        messages: Vec<ProtocolWireMessage>,
+    ) -> Vec<JsonEnvelope> {
+        messages
+            .into_iter()
+            .map(|message| match message {
+                ProtocolWireMessage::Json(envelope) => {
+                    let frame = encrypted_frame_from_envelope(envelope).unwrap();
+                    device_e2ee.decrypt_json_payload(&frame).unwrap()
+                }
+                ProtocolWireMessage::Binary(raw) => {
+                    let frame = crate::net::decode_binary_encrypted_frame(&raw).unwrap();
+                    let plaintext = device_e2ee.decrypt_binary_payload(&frame).unwrap();
+                    serde_json::from_slice(&plaintext).unwrap()
+                }
+            })
+            .collect()
     }
 
     fn json_to_mux_text(envelope: JsonEnvelope) -> RelayOpaqueFrame {

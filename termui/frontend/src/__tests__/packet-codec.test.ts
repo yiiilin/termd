@@ -195,6 +195,7 @@ describe("protocol method registry", () => {
     expect(legacyEnvelopeTypeForProtocolMethod("terminal.attach")).toBe("session_attach");
     expect(legacyEnvelopeTypeForProtocolMethod("session.data")).toBe("session_data");
     expect(legacyEnvelopeTypeForProtocolMethod("session.file_download_chunk")).toBe("session_file_download_chunk");
+    expect(legacyEnvelopeTypeForProtocolMethod("metadata.subscribe")).toBe("metadata_subscribe");
     expect(legacyEnvelopeTypeForProtocolMethod("unknown.method")).toBeUndefined();
   });
 
@@ -204,6 +205,8 @@ describe("protocol method registry", () => {
     expect(envelopeTypeForProtocolEventMethod("session.cwd")).toBe("session_cwd_changed");
     expect(envelopeTypeForProtocolEventMethod("session.git")).toBe("session_git_result");
     expect(envelopeTypeForProtocolEventMethod("session.resized")).toBe("session_resized");
+    expect(envelopeTypeForProtocolEventMethod("daemon.clients_snapshot")).toBe("daemon_clients_snapshot");
+    expect(envelopeTypeForProtocolEventMethod("daemon.status_snapshot")).toBe("daemon_status_snapshot");
     expect(envelopeTypeForProtocolEventMethod("unknown.event")).toBeUndefined();
     expect(protocolEventMethodForLegacyEnvelopeType("session_files_result")).toBe("session.files");
     expect(protocolEventMethodForLegacyEnvelopeType("session_git_result")).toBe("session.git");

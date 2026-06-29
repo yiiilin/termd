@@ -1,5 +1,6 @@
 import { createServer, type IncomingMessage, type Server as HttpServer, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
+import type { Socket } from "node:net";
 import { Buffer } from "node:buffer";
 import { ed25519 } from "@noble/curves/ed25519";
 import { WebSocketServer, type RawData, type WebSocket } from "ws";
@@ -48,6 +49,7 @@ import type {
   EncryptedFramePayload,
   Envelope,
   ErrorPayload,
+  MetadataSubscribePayload,
   PacketErrorPayload,
   PacketStreamId,
   PairRequestPayload,
@@ -273,6 +275,7 @@ export class MockDaemon {
   private readonly sessionTokens = new Map<string, SessionTokenRecord>();
   private readonly sessionScopes = new Map<string, SessionScopeRecord>();
   private readonly connections = new Set<MockConnection>();
+  private readonly serverSockets = new Set<Socket>();
   private readonly sessionFilePositions = new Map<UUID, string>();
   private readonly sessionOutputSnapshots = new Map<UUID, string>();
   private readonly sessionTerminalNextSeq = new Map<UUID, number>();
@@ -292,6 +295,10 @@ export class MockDaemon {
     let daemon!: MockDaemon;
     const httpServer = createServer((request, response) => {
       void daemon.handleNodeHttpRequest(request, response);
+    });
+    httpServer.on("connection", (socket) => {
+      daemon.serverSockets.add(socket);
+      socket.on("close", () => daemon.serverSockets.delete(socket));
     });
     const wsServer = new WebSocketServer({ noServer: true });
     httpServer.on("upgrade", (request, socket, head) => {
@@ -522,7 +529,14 @@ export class MockDaemon {
       __TERMD_TEST_HTTP_DAEMONS__?: Map<string, MockDaemon>;
     };
     registry.__TERMD_TEST_HTTP_DAEMONS__?.delete(this.httpBaseUrl());
-    this.wsServer.clients.forEach((client) => client.close());
+    this.wsServer.clients.forEach((client) => client.terminate());
+    // 中文注释：metadata sidecar 接入后，同一测试里更容易残留 HTTP keep-alive 或 upgrade socket。
+    // 只调用 httpServer.close() 可能一直等到 Vitest hook timeout；这里显式强拆全部底层连接。
+    this.httpServer.closeIdleConnections?.();
+    this.httpServer.closeAllConnections?.();
+    for (const socket of this.serverSockets) {
+      socket.destroy();
+    }
     await new Promise<void>((resolve, reject) => {
       this.httpServer.close((error) => (error ? reject(error) : resolve()));
     });
@@ -1472,6 +1486,9 @@ export class MockDaemon {
       case "client_hello":
         this.handleClientHello(connection, inner.payload as { name: string });
         return;
+      case "metadata_subscribe":
+        this.handleMetadataSubscribe(connection, inner.payload as MetadataSubscribePayload);
+        return;
       case "session_list": {
         const queued = this.queuedSessionListResponses.shift();
         if (queued?.delayMs) {
@@ -1987,6 +2004,25 @@ export class MockDaemon {
     const client = this.options.daemonClients?.find((candidate) => candidate.device_id === connection.deviceId);
     if (client) {
       client.name = payload.name;
+    }
+  }
+
+  private handleMetadataSubscribe(connection: MockConnection, payload: MetadataSubscribePayload): void {
+    const activeRequest = connection.activeRequest;
+    if (activeRequest && !connection.respondedToActiveRequest) {
+      this.sendPacketResponse(connection, activeRequest, {});
+    }
+    if (payload.clients) {
+      this.sendPacketEvent(connection, "daemon.clients_snapshot", {
+        clients: this.options.daemonClients ?? [],
+      });
+    }
+    if (payload.status_interval_ms !== undefined && payload.status_interval_ms !== null) {
+      this.sendPacketEvent(
+        connection,
+        "daemon.status_snapshot",
+        this.options.daemonStatus ?? mockDaemonStatus(),
+      );
     }
   }
 

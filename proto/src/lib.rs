@@ -91,6 +91,9 @@ pub enum MessageType {
     DaemonClientForgot,
     DaemonStatus,
     DaemonStatusResult,
+    MetadataSubscribe,
+    DaemonClientsSnapshot,
+    DaemonStatusSnapshot,
     ControlRequest,
     ControlGrant,
     E2eeKeyExchange,
@@ -311,6 +314,9 @@ pub const METHOD_SESSION_LIST: &str = "session.list";
 pub const METHOD_DAEMON_CLIENTS: &str = "daemon.clients";
 pub const METHOD_DAEMON_CLIENT_FORGET: &str = "daemon.client_forget";
 pub const METHOD_DAEMON_STATUS: &str = "daemon.status";
+pub const METHOD_METADATA_SUBSCRIBE: &str = "metadata.subscribe";
+pub const METHOD_DAEMON_CLIENTS_SNAPSHOT: &str = "daemon.clients_snapshot";
+pub const METHOD_DAEMON_STATUS_SNAPSHOT: &str = "daemon.status_snapshot";
 pub const METHOD_CONTROL_REQUEST: &str = "control.request";
 pub const METHOD_PING: &str = "ping";
 
@@ -350,6 +356,7 @@ pub fn legacy_message_type_for_packet_method(method: &str) -> Option<MessageType
         METHOD_DAEMON_CLIENTS => Some(MessageType::DaemonClients),
         METHOD_DAEMON_CLIENT_FORGET => Some(MessageType::DaemonClientForget),
         METHOD_DAEMON_STATUS => Some(MessageType::DaemonStatus),
+        METHOD_METADATA_SUBSCRIBE => Some(MessageType::MetadataSubscribe),
         METHOD_PING => Some(MessageType::Ping),
         _ => None,
     }
@@ -366,6 +373,8 @@ pub fn packet_event_method_for_message(kind: MessageType) -> Option<&'static str
         MessageType::SessionGitResult => Some(METHOD_SESSION_GIT),
         MessageType::SessionResized => Some(METHOD_SESSION_RESIZED),
         MessageType::SessionData => Some(METHOD_TERMINAL_OUTPUT),
+        MessageType::DaemonClientsSnapshot => Some(METHOD_DAEMON_CLIENTS_SNAPSHOT),
+        MessageType::DaemonStatusSnapshot => Some(METHOD_DAEMON_STATUS_SNAPSHOT),
         _ => None,
     }
 }
@@ -1497,6 +1506,25 @@ pub struct DaemonClientsPayload {}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientHelloPayload {
     pub name: String,
+    /// 连接用途只影响 daemon 的展示/历史记录策略，不参与鉴权或控制权判断。
+    #[serde(default)]
+    pub kind: ClientHelloKind,
+}
+
+/// 已认证 WebSocket 的展示用途。
+///
+/// metadata sidecar 是同一设备的旁路状态通道，不应该在 operator 列表里显示成第二个客户端。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientHelloKind {
+    Interactive,
+    Metadata,
+}
+
+impl Default for ClientHelloKind {
+    fn default() -> Self {
+        Self::Interactive
+    }
 }
 
 /// daemon 下单个客户端的展示摘要。
@@ -1548,6 +1576,17 @@ pub struct DaemonClientForgotPayload {
 /// 该请求必须作为 E2EE 内层业务消息发送；relay 只能看到外层 encrypted_frame。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonStatusPayload {}
+
+/// 订阅 daemon 旁路 metadata 推送。
+///
+/// clients 为 false 时 daemon 只推 status；status_interval_ms 为空时不推周期状态。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetadataSubscribePayload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_interval_ms: Option<u64>,
+    #[serde(default)]
+    pub clients: bool,
+}
 
 /// daemon 所在服务器的只读状态快照。
 ///
@@ -2589,6 +2628,12 @@ mod tests {
             (MessageType::DaemonClientForgot, "daemon_client_forgot"),
             (MessageType::DaemonStatus, "daemon_status"),
             (MessageType::DaemonStatusResult, "daemon_status_result"),
+            (MessageType::MetadataSubscribe, "metadata_subscribe"),
+            (
+                MessageType::DaemonClientsSnapshot,
+                "daemon_clients_snapshot",
+            ),
+            (MessageType::DaemonStatusSnapshot, "daemon_status_snapshot"),
             (MessageType::ControlRequest, "control_request"),
             (MessageType::ControlGrant, "control_grant"),
             (MessageType::E2eeKeyExchange, "e2ee_key_exchange"),
@@ -3151,10 +3196,36 @@ mod tests {
             serde_json::to_value(MessageType::DaemonStatusResult).unwrap(),
             "daemon_status_result"
         );
+        assert_eq!(
+            serde_json::to_value(MessageType::MetadataSubscribe).unwrap(),
+            "metadata_subscribe"
+        );
+        assert_eq!(
+            serde_json::to_value(MessageType::DaemonClientsSnapshot).unwrap(),
+            "daemon_clients_snapshot"
+        );
+        assert_eq!(
+            serde_json::to_value(MessageType::DaemonStatusSnapshot).unwrap(),
+            "daemon_status_snapshot"
+        );
         assert_roundtrip(ClientHelloPayload {
             name: "Browser on Linux".to_owned(),
+            kind: ClientHelloKind::Interactive,
+        });
+        let legacy_hello: ClientHelloPayload = serde_json::from_value(serde_json::json!({
+            "name": "Legacy browser"
+        }))
+        .unwrap();
+        assert_eq!(legacy_hello.kind, ClientHelloKind::Interactive);
+        assert_roundtrip(ClientHelloPayload {
+            name: "Metadata sidecar".to_owned(),
+            kind: ClientHelloKind::Metadata,
         });
         assert_roundtrip(DaemonClientsPayload {});
+        assert_roundtrip(MetadataSubscribePayload {
+            status_interval_ms: Some(3_000),
+            clients: true,
+        });
         assert_roundtrip(DaemonClientsResultPayload {
             clients: vec![DaemonClientSummaryPayload {
                 client_id,

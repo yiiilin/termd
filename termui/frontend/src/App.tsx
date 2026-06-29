@@ -104,7 +104,10 @@ const CONNECTION_AUTO_RETRY_DELAY_MS = 1500;
 const CONNECTION_AUTO_RETRY_LIMIT = 3;
 const ATTACH_RECONNECT_DELAYS_MS = [250, 1000, 2500, 5000, 10000, 20000];
 const ATTACH_SWITCH_COALESCE_DELAY_MS = 80;
-const FILES_CWD_FOLLOW_POLL_INTERVAL_MS = 1000;
+const FILES_CWD_FOLLOW_POLL_INTERVAL_MS = 5000;
+const DAEMON_METADATA_STATUS_INTERVAL_MS = 3000;
+const DAEMON_METADATA_FALLBACK_POLL_INTERVAL_MS = 10_000;
+const DAEMON_METADATA_RETRY_DELAY_MS = 1500;
 const TEXT_FILE_EDITOR_MAX_BYTES = 1024 * 1024;
 const FILE_TRANSFER_MEMORY_FALLBACK_MAX_BYTES = 16 * 1024 * 1024;
 const MOBILE_LAYOUT_QUERY = "(max-width: 760px)";
@@ -294,6 +297,8 @@ export default function App() {
   const [daemonNetworkLatencyMs, setDaemonNetworkLatencyMs] = useState<number | undefined>();
   const [daemonStatusLoading, setDaemonStatusLoading] = useState(false);
   const [daemonStatusError, setDaemonStatusError] = useState<SafeError | undefined>();
+  const [metadataReady, setMetadataReady] = useState(false);
+  const [metadataRetryNonce, setMetadataRetryNonce] = useState(0);
   const [selectedSessionId, setSelectedSessionId] = useState<UUID | undefined>();
   const [attachedSessionId, setAttachedSessionId] = useState<UUID | undefined>();
   const [renamingSessionId, setRenamingSessionId] = useState<UUID | undefined>();
@@ -463,6 +468,10 @@ export default function App() {
   const retryConnectionHandlerRef = useRef<(() => Promise<void> | undefined) | undefined>(undefined);
   const daemonStatusRequestSeqRef = useRef(0);
   const daemonClientsRefreshInFlightRef = useRef(false);
+  const metadataClientRef = useRef<DirectClient | undefined>(undefined);
+  const metadataClientAbortControllerRef = useRef<AbortController | undefined>(undefined);
+  const metadataClientGenerationRef = useRef(0);
+  const metadataRetryTimerRef = useRef<number | undefined>(undefined);
   const retryConnectionTaskRef = useRef<Promise<void> | undefined>(undefined);
   const lastNotificationAtRef = useRef(0);
   const fileEditorResetRef = useRef<() => void>(() => {});
@@ -747,6 +756,45 @@ export default function App() {
     setError(toSafeError(caught));
     setStatus("error");
   }, []);
+
+  const closeMetadataClient = useCallback(() => {
+    metadataClientGenerationRef.current += 1;
+    if (metadataRetryTimerRef.current !== undefined) {
+      window.clearTimeout(metadataRetryTimerRef.current);
+      metadataRetryTimerRef.current = undefined;
+    }
+    metadataClientAbortControllerRef.current?.abort();
+    metadataClientAbortControllerRef.current = undefined;
+    const client = metadataClientRef.current;
+    metadataClientRef.current = undefined;
+    if (client) {
+      client.interruptReceiveWaiters();
+      client.close();
+    }
+    setMetadataReady(false);
+  }, []);
+
+  const applyDaemonClientsSnapshot = useCallback((clients: DaemonClientSummaryPayload[]) => {
+    setDaemonClients(clients);
+  }, []);
+
+  const applyDaemonStatusSnapshot = useCallback((status: DaemonStatusResultPayload, latencyMs?: number) => {
+    const nextNetworkSample = networkCounterSampleFromStatus(status, Date.now());
+    setDaemonNetworkRate(networkRateFromSamples(daemonNetworkSampleRef.current, nextNetworkSample));
+    daemonNetworkSampleRef.current = nextNetworkSample;
+    if (latencyMs !== undefined) {
+      setDaemonNetworkLatencyMs(latencyMs);
+    }
+    setDaemonStatus(status);
+    // CPU 历史只保留当前页面内缓存，避免把监控数据写入持久状态。
+    setDaemonCpuHistory((current) => appendCpuSample(current, status.cpu_percent));
+    setDaemonStatusLoading(false);
+    setDaemonStatusError(undefined);
+  }, []);
+
+  useEffect(() => {
+    return () => closeMetadataClient();
+  }, [closeMetadataClient]);
 
   const handlePreferencesChange = useCallback(
     (nextPreferences: BrowserPreferences) => {
@@ -1128,6 +1176,7 @@ export default function App() {
     closingSessionIdsRef.current.clear();
     closedSessionIdsRef.current.clear();
     clearTerminalSnapshotRevealHistory();
+    closeMetadataClient();
     closeWorkspaceClient();
     receiveLoopGenerationRef.current += 1;
     setSessionOrder([]);
@@ -1164,7 +1213,7 @@ export default function App() {
     clearTerminalOutput();
     clearSessionFiles();
     autoCheckedServerRef.current = undefined;
-  }, [cancelScheduledAttachSwitch, clearSessionFiles, clearTerminalOutput, clearTerminalSnapshotRevealHistory, closeWorkspaceClient, resolveTerminalOutputResetWaiters, selectSession]);
+  }, [cancelScheduledAttachSwitch, clearSessionFiles, clearTerminalOutput, clearTerminalSnapshotRevealHistory, closeMetadataClient, closeWorkspaceClient, resolveTerminalOutputResetWaiters, selectSession]);
 
   const handleStartDaemonRename = useCallback(
     (serverId: UUID) => {
@@ -1697,7 +1746,7 @@ export default function App() {
             selectSession(nextSelectedSessionId);
           }
           if (clientList) {
-            setDaemonClients(clientList.clients);
+            applyDaemonClientsSnapshot(clientList.clients);
           }
         } catch (caught) {
           throw caught;
@@ -1710,7 +1759,7 @@ export default function App() {
         daemonClientsRefreshInFlightRef.current = false;
       }
     },
-    [activeServer?.server_id, authenticatedWorkspaceClient, isTerminalRecoveryInProgress],
+    [activeServer?.server_id, applyDaemonClientsSnapshot, authenticatedWorkspaceClient, isTerminalRecoveryInProgress],
   );
 
   const loadDaemonStatus = useCallback(async () => {
@@ -1743,15 +1792,7 @@ export default function App() {
         if (!isCurrentRequest()) {
           return;
         }
-        const nextNetworkSample = networkCounterSampleFromStatus(status, Date.now());
-        setDaemonNetworkRate(networkRateFromSamples(daemonNetworkSampleRef.current, nextNetworkSample));
-        daemonNetworkSampleRef.current = nextNetworkSample;
-        if (latencyMs !== undefined) {
-          setDaemonNetworkLatencyMs(latencyMs);
-        }
-        setDaemonStatus(status);
-        // CPU 柱状图只做当前页面内缓存，避免把瞬时监控数据写入浏览器持久状态。
-        setDaemonCpuHistory((current) => appendCpuSample(current, status.cpu_percent));
+        applyDaemonStatusSnapshot(status, latencyMs);
       } catch (caught) {
         throw caught;
       }
@@ -1773,7 +1814,7 @@ export default function App() {
         setDaemonStatusLoading(false);
       }
     }
-  }, [activeServer?.server_id, authenticatedWorkspaceClient, isTerminalRecoveryInProgress]);
+  }, [activeServer?.server_id, applyDaemonStatusSnapshot, authenticatedWorkspaceClient, isTerminalRecoveryInProgress]);
 
   const clearNewOutputMark = useCallback((sessionId: UUID) => {
     // 新输出提示只属于本地 UI；用户打开该 session 后立即清除，不回写 daemon。
@@ -2460,6 +2501,9 @@ export default function App() {
       // 中文注释：后台恢复时 terminal WebSocket 重建和普通状态轮询是两条语义。
       // 即使恢复入口已经走了 attach 重建，也要补一轮状态刷新，避免后台期间超时的
       // status 请求把状态栏卡在旧采样上。
+      if (!metadataClientRef.current || metadataClientRef.current.isClosed) {
+        setMetadataRetryNonce((current) => current + 1);
+      }
       void loadDaemonStatus();
       void refreshDaemonClients();
     }, 0);
@@ -2472,6 +2516,7 @@ export default function App() {
       }
       // 中文注释：浏览器切 offline 时，WebSocket 不一定会立刻触发 close。
       // 主动丢弃旧 transport，避免恢复后继续向半开连接写 terminal.attach/input。
+      closeMetadataClient();
       closeWorkspaceClient();
     };
 
@@ -2496,6 +2541,9 @@ export default function App() {
         return;
       }
       if (connectionReady) {
+        if (!metadataClientRef.current || metadataClientRef.current.isClosed) {
+          setMetadataRetryNonce((current) => current + 1);
+        }
         void loadDaemonStatus();
         void refreshDaemonClients();
       }
@@ -2528,6 +2576,7 @@ export default function App() {
     activeServer,
     activeSurface,
     attachedSessionId,
+    closeMetadataClient,
     closeWorkspaceClient,
     connectionReady,
     error,
@@ -2877,25 +2926,129 @@ export default function App() {
   );
 
   useEffect(() => {
-    if (!attachedSessionId || !connectionReady) {
+    if (!connectionReady || !activeServer || !state.device || isPagePaused()) {
+      closeMetadataClient();
+      return undefined;
+    }
+
+    const requestServerId = activeServer.server_id;
+    const generation = metadataClientGenerationRef.current + 1;
+    metadataClientGenerationRef.current = generation;
+    const abortController = new AbortController();
+    metadataClientAbortControllerRef.current = abortController;
+
+    const isCurrentMetadataClient = () =>
+      metadataClientGenerationRef.current === generation &&
+      activeServerIdRef.current === requestServerId &&
+      !abortController.signal.aborted;
+
+    const scheduleMetadataRetry = () => {
+      if (metadataRetryTimerRef.current !== undefined || isPagePaused()) {
+        return;
+      }
+      metadataRetryTimerRef.current = window.setTimeout(() => {
+        metadataRetryTimerRef.current = undefined;
+        setMetadataRetryNonce((current) => current + 1);
+      }, DAEMON_METADATA_RETRY_DELAY_MS);
+    };
+
+    void (async () => {
+      let client: DirectClient | undefined;
+      try {
+        client = await authenticatedClient(APP_CONNECTION_TIMEOUT_MS, abortController.signal, {
+          clientKind: "metadata",
+        });
+        if (!isCurrentMetadataClient()) {
+          client.close();
+          return;
+        }
+        metadataClientRef.current = client;
+        await client.subscribeMetadata({
+          clients: true,
+          status_interval_ms: DAEMON_METADATA_STATUS_INTERVAL_MS,
+        }, APP_CONNECTION_TIMEOUT_MS);
+        if (!isCurrentMetadataClient()) {
+          client.close();
+          return;
+        }
+        setMetadataReady(true);
+        void client.measureLatency().then((latencyMs) => {
+          if (isCurrentMetadataClient()) {
+            setDaemonNetworkLatencyMs(latencyMs);
+          }
+        }).catch(() => undefined);
+
+        while (isCurrentMetadataClient() && !client.isClosed) {
+          const inner = await client.receiveInner();
+          if (!isCurrentMetadataClient()) {
+            break;
+          }
+          if (inner.type === "daemon_clients_snapshot") {
+            const payload = inner.payload as { clients?: DaemonClientSummaryPayload[] };
+            if (Array.isArray(payload.clients)) {
+              applyDaemonClientsSnapshot(payload.clients);
+            }
+          } else if (inner.type === "daemon_status_snapshot") {
+            applyDaemonStatusSnapshot(inner.payload as DaemonStatusResultPayload);
+          }
+        }
+      } catch (caught) {
+        if (!isCurrentMetadataClient()) {
+          return;
+        }
+        const safeError = toSafeError(caught);
+        if (safeError.code !== "receive_interrupted" && safeError.code !== "connection_closed") {
+          recordTermdDiagnostic("app_metadata_sidecar_closed", {
+            code: safeError.code,
+          });
+        }
+        setMetadataReady(false);
+        scheduleMetadataRetry();
+      } finally {
+        if (metadataClientAbortControllerRef.current === abortController) {
+          metadataClientAbortControllerRef.current = undefined;
+        }
+        if (metadataClientRef.current === client) {
+          metadataClientRef.current = undefined;
+        }
+        if (client && !client.isClosed) {
+          client.close();
+        }
+      }
+    })();
+
+    return () => closeMetadataClient();
+  }, [
+    activeServer?.server_id,
+    applyDaemonClientsSnapshot,
+    applyDaemonStatusSnapshot,
+    authenticatedClient,
+    closeMetadataClient,
+    connectionReady,
+    metadataRetryNonce,
+    state.device?.device_id,
+  ]);
+
+  useEffect(() => {
+    if (!connectionReady || metadataReady) {
       return undefined;
     }
     const refreshTimer = window.setInterval(() => {
       void refreshDaemonClients();
-    }, 2000);
+    }, DAEMON_METADATA_FALLBACK_POLL_INTERVAL_MS);
     return () => window.clearInterval(refreshTimer);
-  }, [attachedSessionId, connectionReady, refreshDaemonClients]);
+  }, [connectionReady, metadataReady, refreshDaemonClients]);
 
   useEffect(() => {
-    if (!connectionReady) {
+    if (!connectionReady || metadataReady) {
       return undefined;
     }
     void loadDaemonStatus();
     const timer = window.setInterval(() => {
       void loadDaemonStatus();
-    }, DAEMON_STATUS_POLL_INTERVAL_MS);
+    }, DAEMON_METADATA_FALLBACK_POLL_INTERVAL_MS);
     return () => window.clearInterval(timer);
-  }, [connectionReady, loadDaemonStatus]);
+  }, [connectionReady, loadDaemonStatus, metadataReady]);
 
   const handleTerminalSearch = useCallback(
     async (query: string): Promise<SessionSearchResultPayload> => {

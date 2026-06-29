@@ -55,6 +55,9 @@ export const ALL_MESSAGE_TYPES = [
   "daemon_client_forgot",
   "daemon_status",
   "daemon_status_result",
+  "metadata_subscribe",
+  "daemon_clients_snapshot",
+  "daemon_status_snapshot",
   "control_request",
   "control_grant",
   "e2ee_key_exchange",
@@ -243,6 +246,7 @@ export interface DaemonClientsPayload {}
 
 export interface ClientHelloPayload {
   name: string;
+  kind?: "interactive" | "metadata";
 }
 
 export interface DaemonClientSummaryPayload {
@@ -273,6 +277,11 @@ export interface DaemonClientForgotPayload {
 }
 
 export interface DaemonStatusPayload {}
+
+export interface MetadataSubscribePayload {
+  status_interval_ms?: number | null;
+  clients?: boolean;
+}
 
 export interface DaemonStatusResultPayload {
   host_name?: string | null;

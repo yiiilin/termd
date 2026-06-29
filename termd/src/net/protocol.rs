@@ -26,26 +26,26 @@ use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use termd_proto::{
     AttachFramePayload, AttachRole, AuthChallengePayload, AuthPayload, BINARY_PROTOCOL_VERSION,
-    ClientHelloPayload, ClientId, ControlGrantPayload, ControlRequestPayload,
+    ClientHelloKind, ClientHelloPayload, ClientId, ControlGrantPayload, ControlRequestPayload,
     DaemonClientForgetPayload, DaemonClientForgotPayload, DaemonClientSummaryPayload,
     DaemonClientsPayload, DaemonClientsResultPayload, DaemonStatusPayload,
     DaemonStatusResultPayload, DeviceId, E2eeKeyExchangePayload, EncryptedFramePayload, Envelope,
     ErrorPayload, HelloPayload, HttpE2eeAuthPayload, METHOD_AUTH, METHOD_AUTH_SESSION_TOKEN,
     METHOD_AUTH_VERIFY, METHOD_CLIENT_HELLO, METHOD_CONTROL_REQUEST, METHOD_DAEMON_CLIENT_FORGET,
-    METHOD_DAEMON_CLIENTS, METHOD_DAEMON_STATUS, METHOD_PAIR_REQUEST, METHOD_PING,
-    METHOD_SESSION_ATTACH, METHOD_SESSION_CLOSE, METHOD_SESSION_CREATE, METHOD_SESSION_CURSOR,
-    METHOD_SESSION_FILE_DELETE, METHOD_SESSION_FILE_DOWNLOAD_CHUNK,
+    METHOD_DAEMON_CLIENTS, METHOD_DAEMON_STATUS, METHOD_METADATA_SUBSCRIBE, METHOD_PAIR_REQUEST,
+    METHOD_PING, METHOD_SESSION_ATTACH, METHOD_SESSION_CLOSE, METHOD_SESSION_CREATE,
+    METHOD_SESSION_CURSOR, METHOD_SESSION_FILE_DELETE, METHOD_SESSION_FILE_DOWNLOAD_CHUNK,
     METHOD_SESSION_FILE_DOWNLOAD_PREPARE, METHOD_SESSION_FILE_DOWNLOAD_STREAM,
     METHOD_SESSION_FILE_READ, METHOD_SESSION_FILE_UPLOAD_STREAM, METHOD_SESSION_FILE_WRITE,
     METHOD_SESSION_FILES, METHOD_SESSION_GIT, METHOD_SESSION_GIT_ACTION, METHOD_SESSION_GIT_DIFF,
     METHOD_SESSION_LIST, METHOD_SESSION_RENAME, METHOD_SESSION_REORDER, METHOD_SESSION_RESIZE,
-    METHOD_SESSION_SEARCH, METHOD_TERMINAL_ATTACH, METHOD_TERMINAL_CREATE, MessageType, Nonce,
-    PROTOCOL_PACKET_VERSION, PacketErrorPayload, PacketKind, PacketRequestId, PacketStreamId,
-    PairRequestPayload, PingPayload, PongPayload, ProtocolPacket, ProtocolVersion, ServerId,
-    SessionActivityPayload, SessionAttachPayload, SessionAttachedPayload, SessionClosePayload,
-    SessionClosedPayload, SessionCreatePayload, SessionCreatedPayload, SessionCursorPayload,
-    SessionCwdChangedPayload, SessionDataPayload, SessionFileDeletePayload,
-    SessionFileDeletedPayload, SessionFileDownloadChunkPayload,
+    METHOD_SESSION_SEARCH, METHOD_TERMINAL_ATTACH, METHOD_TERMINAL_CREATE, MessageType,
+    MetadataSubscribePayload, Nonce, PROTOCOL_PACKET_VERSION, PacketErrorPayload, PacketKind,
+    PacketRequestId, PacketStreamId, PairRequestPayload, PingPayload, PongPayload, ProtocolPacket,
+    ProtocolVersion, ServerId, SessionActivityPayload, SessionAttachPayload,
+    SessionAttachedPayload, SessionClosePayload, SessionClosedPayload, SessionCreatePayload,
+    SessionCreatedPayload, SessionCursorPayload, SessionCwdChangedPayload, SessionDataPayload,
+    SessionFileDeletePayload, SessionFileDeletedPayload, SessionFileDownloadChunkPayload,
     SessionFileDownloadChunkResultPayload, SessionFileDownloadPreparePayload,
     SessionFileDownloadReadyPayload, SessionFileDownloadStreamPayload,
     SessionFileDownloadStreamReadyPayload, SessionFileEntryPayload, SessionFileHttpDownloadPayload,
@@ -124,6 +124,8 @@ const TERMINAL_STREAM_FRAME_TRANSPORT_OVERHEAD_BYTES: usize = 256;
 const TERMINAL_STREAM_METADATA_CREDIT_BYTES: usize = 1;
 #[cfg(test)]
 const SESSION_TERMINAL_CWD_PROBE_MIN_INTERVAL_MS: u64 = 1_000;
+const METADATA_STATUS_MIN_INTERVAL_MS: u64 = 1_000;
+const METADATA_STATUS_MAX_INTERVAL_MS: u64 = 60_000;
 const SESSION_FILE_DOWNLOAD_TOKEN_TTL_MS: u64 = 60_000;
 const SESSION_FILE_DOWNLOAD_GRANT_LIMIT: usize = 128;
 const SESSION_FILE_HTTP_UPLOAD_ACTIVE_IDLE_TTL_MS: u64 = 60 * 60 * 1000;
@@ -874,6 +876,7 @@ pub struct DaemonProtocol<B: PtyBackend, V> {
     client_history: ClientHistoryStore,
     #[cfg(test)]
     session_output_history: HashMap<SessionId, SessionOutputHistory>,
+    daemon_clients_signal: watch::Sender<u64>,
     session_cwd_signals: HashMap<SessionId, watch::Sender<u64>>,
     session_resize_signals: HashMap<SessionId, watch::Sender<TerminalSize>>,
 }
@@ -970,6 +973,7 @@ where
             AuthChallengeManager::new(),
             ReplayProtector::default(),
         );
+        let (daemon_clients_signal, _) = watch::channel(0);
         Ok(Self {
             config,
             daemon_identity,
@@ -992,6 +996,7 @@ where
             client_history,
             #[cfg(test)]
             session_output_history: HashMap::new(),
+            daemon_clients_signal,
             session_cwd_signals: HashMap::new(),
             session_resize_signals: HashMap::new(),
         })
@@ -1460,13 +1465,35 @@ where
 
     fn record_client_hello(
         &mut self,
-        connection: &ProtocolConnection,
+        connection: &mut ProtocolConnection,
         payload: ClientHelloPayload,
     ) -> Result<Vec<JsonEnvelope>, ProtocolError> {
         let device_id = connection.authenticated_device_id()?;
         let name = sanitize_client_name(payload.name)?;
         let now_ms = current_unix_timestamp_millis();
 
+        if payload.kind == ClientHelloKind::Metadata {
+            let only_this_connection = self
+                .daemon_clients
+                .get(&device_id)
+                .map(|record| {
+                    record.active_connections.len() == 1
+                        && record
+                            .active_connections
+                            .get(&connection.client_id)
+                            .is_some_and(HashSet::is_empty)
+                })
+                .unwrap_or(false);
+            self.mark_daemon_client_connection_offline(device_id, connection.client_id, now_ms);
+            if only_this_connection {
+                let _ = self.client_history.forget_offline_client(device_id);
+                self.daemon_clients.remove(&device_id);
+            }
+            connection.track_daemon_client_history = false;
+            return Ok(Vec::new());
+        }
+
+        self.record_daemon_client_connection(connection, device_id, Some(name.as_str()));
         if let Err(error) = self
             .client_history
             .record_client_name(device_id, &name, now_ms)
@@ -3182,18 +3209,42 @@ where
         connection.authenticated_device_id()?;
 
         // SQLite 是持久历史，内存里的活跃连接只负责补当前在线状态和活跃 attach。
-        let mut clients_by_device: HashMap<DeviceId, ClientHistoryRecord> =
-            match self.client_history.list_clients() {
-                Ok(records) => records
-                    .into_iter()
-                    .map(|record| (record.device_id, record))
-                    .collect(),
-                Err(error) => {
-                    tracing::warn!(%error, "failed to list daemon clients from sqlite history");
-                    HashMap::new()
-                }
-            };
+        let clients = self.daemon_clients_snapshot_payload();
 
+        Ok(vec![envelope_value(
+            MessageType::DaemonClientsResult,
+            clients,
+        )?])
+    }
+
+    fn daemon_clients_snapshot_payload(&mut self) -> DaemonClientsResultPayload {
+        let mut clients_by_device = self.daemon_clients_by_device();
+        self.merge_active_daemon_clients(&mut clients_by_device);
+        self.daemon_client_payloads_from_history(clients_by_device)
+    }
+
+    fn notify_daemon_clients_changed(&self) {
+        let current = *self.daemon_clients_signal.borrow();
+        let _ = self.daemon_clients_signal.send(current.saturating_add(1));
+    }
+
+    fn daemon_clients_by_device(&self) -> HashMap<DeviceId, ClientHistoryRecord> {
+        match self.client_history.list_clients() {
+            Ok(records) => records
+                .into_iter()
+                .map(|record| (record.device_id, record))
+                .collect(),
+            Err(error) => {
+                tracing::warn!(%error, "failed to list daemon clients from sqlite history");
+                HashMap::new()
+            }
+        }
+    }
+
+    fn merge_active_daemon_clients(
+        &self,
+        clients_by_device: &mut HashMap<DeviceId, ClientHistoryRecord>,
+    ) {
         for record in self.daemon_clients.values() {
             let entry = clients_by_device
                 .entry(record.device_id)
@@ -3238,10 +3289,15 @@ where
                 entry.attached_session_ids = active_session_ids;
             }
         }
+    }
 
+    fn daemon_client_payloads_from_history(
+        &self,
+        clients_by_device: HashMap<DeviceId, ClientHistoryRecord>,
+    ) -> DaemonClientsResultPayload {
         let mut clients: Vec<_> = clients_by_device
             .into_values()
-            .map(|record| daemon_client_to_payload_from_history(record))
+            .map(daemon_client_to_payload_from_history)
             .collect();
         for client in &mut clients {
             let Some(record) = self.daemon_clients.get(&client.device_id) else {
@@ -3260,10 +3316,7 @@ where
         }
         clients.sort_by_key(|client| client.connected_at_ms);
 
-        Ok(vec![envelope_value(
-            MessageType::DaemonClientsResult,
-            DaemonClientsResultPayload { clients },
-        )?])
+        DaemonClientsResultPayload { clients }
     }
 
     fn forget_daemon_client(
@@ -3320,6 +3373,37 @@ where
         )?])
     }
 
+    fn subscribe_metadata(
+        &mut self,
+        connection: &mut ProtocolConnection,
+        payload: MetadataSubscribePayload,
+    ) -> Result<Vec<JsonEnvelope>, ProtocolError> {
+        connection.authenticated_device_id()?;
+        connection.metadata_status_interval_ms = payload.status_interval_ms.map(|interval| {
+            interval.clamp(
+                METADATA_STATUS_MIN_INTERVAL_MS,
+                METADATA_STATUS_MAX_INTERVAL_MS,
+            )
+        });
+        connection.metadata_clients = payload.clients;
+
+        let mut responses = vec![envelope_value(
+            MessageType::MetadataSubscribe,
+            serde_json::json!({}),
+        )?];
+        if payload.clients {
+            let clients = self.daemon_clients_snapshot_payload();
+            responses.push(envelope_value(MessageType::DaemonClientsSnapshot, clients)?);
+        }
+        if connection.metadata_status_interval_ms.is_some() {
+            responses.push(envelope_value(
+                MessageType::DaemonStatusSnapshot,
+                collect_daemon_status(),
+            )?);
+        }
+        Ok(responses)
+    }
+
     fn record_daemon_client_connection(
         &mut self,
         connection: &ProtocolConnection,
@@ -3352,6 +3436,7 @@ where
                 .active_connections
                 .entry(connection.client_id)
                 .or_default();
+            self.notify_daemon_clients_changed();
             return;
         }
 
@@ -3374,6 +3459,7 @@ where
                 cursor_focused: None,
             },
         );
+        self.notify_daemon_clients_changed();
     }
 
     fn record_daemon_client_attach(
@@ -3386,6 +3472,13 @@ where
             return;
         }
         let now_ms = current_unix_timestamp_millis();
+        if !self.daemon_clients.get(&device_id).is_some_and(|record| {
+            record
+                .active_connections
+                .contains_key(&connection.client_id)
+        }) {
+            self.record_daemon_client_connection(connection, device_id, None);
+        }
         if let Err(error) =
             self.client_history
                 .record_attach(device_id, connection.client_id, session_id, now_ms)
@@ -3400,6 +3493,7 @@ where
                 .insert(session_id);
             record.last_seen_at_ms = now_ms;
             record.online = true;
+            self.notify_daemon_clients_changed();
             return;
         }
 
@@ -3422,6 +3516,7 @@ where
                 cursor_focused: None,
             },
         );
+        self.notify_daemon_clients_changed();
     }
 
     fn mark_daemon_client_connection_offline(
@@ -3461,6 +3556,7 @@ where
         if should_remove {
             self.daemon_clients.remove(&device_id);
         }
+        self.notify_daemon_clients_changed();
     }
 
     fn daemon_client_has_active_session(
@@ -4543,6 +4639,8 @@ pub struct ProtocolConnection {
     output_offsets: HashMap<SessionId, u64>,
     pending_outputs: HashMap<SessionId, VecDeque<Vec<u8>>>,
     deferred_output_wakeups: HashSet<SessionId>,
+    metadata_status_interval_ms: Option<u64>,
+    metadata_clients: bool,
     debug_traffic: ProtocolConnectionDebugTraffic,
 }
 
@@ -4806,6 +4904,8 @@ impl ProtocolConnection {
             output_offsets: HashMap::new(),
             pending_outputs: HashMap::new(),
             deferred_output_wakeups: HashSet::new(),
+            metadata_status_interval_ms: None,
+            metadata_clients: false,
             debug_traffic: ProtocolConnectionDebugTraffic::default(),
         }
     }
@@ -4830,6 +4930,26 @@ impl ProtocolConnection {
 
     pub fn is_authenticated(&self) -> bool {
         self.authenticated_device_id.is_some()
+    }
+
+    pub fn metadata_status_interval_ms(&self) -> Option<u64> {
+        self.metadata_status_interval_ms
+    }
+
+    pub fn metadata_clients_subscribed(&self) -> bool {
+        self.metadata_clients
+    }
+
+    pub fn metadata_clients_signal<B, V>(
+        &self,
+        protocol: &DaemonProtocol<B, V>,
+    ) -> Option<watch::Receiver<u64>>
+    where
+        B: PtyBackend,
+        V: SignatureVerifier,
+    {
+        self.metadata_clients
+            .then(|| protocol.daemon_clients_signal.subscribe())
     }
 
     pub fn debug_snapshot(&self) -> ProtocolConnectionDebugSnapshot {
@@ -5534,6 +5654,39 @@ impl ProtocolConnection {
         }
     }
 
+    pub fn read_metadata_clients_snapshot_messages<B, V>(
+        &mut self,
+        protocol: &mut DaemonProtocol<B, V>,
+    ) -> Result<Vec<JsonEnvelope>, ProtocolError>
+    where
+        B: PtyBackend,
+        V: SignatureVerifier,
+    {
+        self.authenticated_device_id()?;
+        if !self.metadata_clients {
+            return Ok(Vec::new());
+        }
+
+        Ok(vec![envelope_value(
+            MessageType::DaemonClientsSnapshot,
+            protocol.daemon_clients_snapshot_payload(),
+        )?])
+    }
+
+    pub fn read_metadata_status_snapshot_messages(
+        &mut self,
+    ) -> Result<Vec<JsonEnvelope>, ProtocolError> {
+        self.authenticated_device_id()?;
+        if self.metadata_status_interval_ms.is_none() {
+            return Ok(Vec::new());
+        }
+
+        Ok(vec![envelope_value(
+            MessageType::DaemonStatusSnapshot,
+            collect_daemon_status(),
+        )?])
+    }
+
     fn try_read_session_activity<B, V>(
         &mut self,
         protocol: &mut DaemonProtocol<B, V>,
@@ -5851,6 +6004,10 @@ impl ProtocolConnection {
                 let payload = decode_payload(envelope.payload)?;
                 protocol.daemon_status(self, payload)
             }
+            MessageType::MetadataSubscribe => {
+                let payload = decode_payload(envelope.payload)?;
+                protocol.subscribe_metadata(self, payload)
+            }
             MessageType::Ping => {
                 let payload: PingPayload = decode_payload(envelope.payload)?;
                 Ok(vec![envelope_value(
@@ -6039,6 +6196,10 @@ impl ProtocolConnection {
             METHOD_DAEMON_STATUS => {
                 let payload = decode_payload(payload)?;
                 protocol.daemon_status(self, payload)
+            }
+            METHOD_METADATA_SUBSCRIBE => {
+                let payload = decode_payload(payload)?;
+                protocol.subscribe_metadata(self, payload)
             }
             METHOD_PING => {
                 let payload: PingPayload = decode_payload(payload)?;
@@ -14525,6 +14686,96 @@ mod tests {
         assert!((0.0..=100.0).contains(&payload.cpu_percent));
         assert_eq!(payload.process_count, 0);
         let _network_bytes = (payload.network_rx_bytes, payload.network_tx_bytes);
+    }
+
+    #[test]
+    fn metadata_client_hello_is_not_listed_as_visible_daemon_client() {
+        let (mut protocol, _) = protocol();
+        let device_id = DeviceId::new();
+        let mut connection = ProtocolConnection::new(None);
+        connection.authenticated_device_id = Some(device_id);
+
+        protocol
+            .record_client_hello(
+                &mut connection,
+                ClientHelloPayload {
+                    name: "Metadata sidecar".to_owned(),
+                    kind: ClientHelloKind::Metadata,
+                },
+            )
+            .unwrap();
+
+        let response = protocol
+            .list_daemon_clients(&connection, DaemonClientsPayload {})
+            .unwrap();
+        let payload: DaemonClientsResultPayload =
+            decode_payload(response[0].payload.clone()).unwrap();
+
+        assert!(payload.clients.is_empty());
+    }
+
+    #[test]
+    fn metadata_subscribe_requires_auth_and_returns_initial_snapshots() {
+        let (mut protocol, _) = protocol();
+        let mut unauthenticated = ProtocolConnection::new(None);
+
+        assert!(matches!(
+            protocol.subscribe_metadata(
+                &mut unauthenticated,
+                MetadataSubscribePayload {
+                    status_interval_ms: Some(3_000),
+                    clients: true,
+                },
+            ),
+            Err(ProtocolError::Unauthenticated)
+        ));
+
+        let mut connection = ProtocolConnection::new(None);
+        connection.authenticated_device_id = Some(DeviceId::new());
+        let responses = protocol
+            .subscribe_metadata(
+                &mut connection,
+                MetadataSubscribePayload {
+                    status_interval_ms: Some(3_000),
+                    clients: true,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(responses.len(), 3);
+        assert_eq!(responses[0].kind, MessageType::MetadataSubscribe);
+        assert_eq!(responses[0].payload, serde_json::json!({}));
+        assert_eq!(responses[1].kind, MessageType::DaemonClientsSnapshot);
+        assert_eq!(responses[2].kind, MessageType::DaemonStatusSnapshot);
+        assert_eq!(connection.metadata_status_interval_ms(), Some(3_000));
+        assert!(connection.metadata_clients_subscribed());
+    }
+
+    #[test]
+    fn daemon_client_changes_wake_metadata_client_subscribers() {
+        let (mut protocol, _) = protocol();
+        let mut metadata = ProtocolConnection::new(None);
+        metadata.authenticated_device_id = Some(DeviceId::new());
+        protocol
+            .subscribe_metadata(
+                &mut metadata,
+                MetadataSubscribePayload {
+                    status_interval_ms: None,
+                    clients: true,
+                },
+            )
+            .unwrap();
+        let mut signal = metadata
+            .metadata_clients_signal(&protocol)
+            .expect("metadata clients subscription should expose a signal");
+        signal.borrow_and_update();
+
+        let device_id = DeviceId::new();
+        let mut interactive = ProtocolConnection::new(None);
+        interactive.authenticated_device_id = Some(device_id);
+        protocol.record_daemon_client_connection(&interactive, device_id, None);
+
+        assert!(signal.has_changed().unwrap());
     }
 
     #[test]

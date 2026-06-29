@@ -106,6 +106,8 @@ enum SessionPushEvent {
     Activity(SessionId),
     Cwd(SessionId),
     Resize(SessionId),
+    MetadataClients,
+    MetadataStatus,
 }
 
 impl SessionPushEvent {
@@ -115,15 +117,18 @@ impl SessionPushEvent {
             Self::Activity(_) => "activity",
             Self::Cwd(_) => "cwd",
             Self::Resize(_) => "resize",
+            Self::MetadataClients => "metadata_clients",
+            Self::MetadataStatus => "metadata_status",
         }
     }
 
-    fn session_id(self) -> SessionId {
+    fn session_id(self) -> Option<SessionId> {
         match self {
             Self::Output(session_id)
             | Self::Activity(session_id)
             | Self::Cwd(session_id)
-            | Self::Resize(session_id) => session_id,
+            | Self::Resize(session_id) => Some(session_id),
+            Self::MetadataClients | Self::MetadataStatus => None,
         }
     }
 
@@ -135,7 +140,9 @@ impl SessionPushEvent {
             SessionPushEvent::Activity(_) => Some(SESSION_ACTIVITY_PUSH_MIN_INTERVAL),
             SessionPushEvent::Output(_)
             | SessionPushEvent::Cwd(_)
-            | SessionPushEvent::Resize(_) => None,
+            | SessionPushEvent::Resize(_)
+            | SessionPushEvent::MetadataClients
+            | SessionPushEvent::MetadataStatus => None,
         }
     }
 
@@ -146,7 +153,9 @@ impl SessionPushEvent {
             SessionPushEvent::Output(_) => Some(TERMINAL_OUTPUT_PUSH_COALESCE_DELAY),
             SessionPushEvent::Activity(_)
             | SessionPushEvent::Cwd(_)
-            | SessionPushEvent::Resize(_) => None,
+            | SessionPushEvent::Resize(_)
+            | SessionPushEvent::MetadataClients
+            | SessionPushEvent::MetadataStatus => None,
         }
     }
 }
@@ -257,6 +266,8 @@ struct WebSocketTrafficCounters {
     out_push_activity: WebSocketTrafficBucket,
     out_push_cwd: WebSocketTrafficBucket,
     out_push_resize: WebSocketTrafficBucket,
+    out_push_metadata_clients: WebSocketTrafficBucket,
+    out_push_metadata_status: WebSocketTrafficBucket,
     out_plain_error: WebSocketTrafficBucket,
     out_ping: WebSocketTrafficBucket,
     out_pong: WebSocketTrafficBucket,
@@ -286,6 +297,12 @@ impl WebSocketTrafficCounters {
             WebSocketOutKind::PushActivity => self.out_push_activity.record(envelopes, bytes),
             WebSocketOutKind::PushCwd => self.out_push_cwd.record(envelopes, bytes),
             WebSocketOutKind::PushResize => self.out_push_resize.record(envelopes, bytes),
+            WebSocketOutKind::PushMetadataClients => {
+                self.out_push_metadata_clients.record(envelopes, bytes)
+            }
+            WebSocketOutKind::PushMetadataStatus => {
+                self.out_push_metadata_status.record(envelopes, bytes)
+            }
             WebSocketOutKind::PlainError => self.out_plain_error.record(envelopes, bytes),
             WebSocketOutKind::Ping => self.out_ping.record(envelopes, bytes),
             WebSocketOutKind::Pong => self.out_pong.record(envelopes, bytes),
@@ -313,6 +330,8 @@ impl WebSocketTrafficCounters {
             || !self.out_push_activity.is_empty()
             || !self.out_push_cwd.is_empty()
             || !self.out_push_resize.is_empty()
+            || !self.out_push_metadata_clients.is_empty()
+            || !self.out_push_metadata_status.is_empty()
             || !self.out_plain_error.is_empty()
             || !self.out_ping.is_empty()
             || !self.out_pong.is_empty()
@@ -329,6 +348,8 @@ enum WebSocketOutKind {
     PushActivity,
     PushCwd,
     PushResize,
+    PushMetadataClients,
+    PushMetadataStatus,
     PlainError,
     Ping,
     Pong,
@@ -349,6 +370,8 @@ impl WebSocketOutKind {
             Self::PushActivity => "push_activity",
             Self::PushCwd => "push_cwd",
             Self::PushResize => "push_resize",
+            Self::PushMetadataClients => "push_metadata_clients",
+            Self::PushMetadataStatus => "push_metadata_status",
             Self::PlainError => "plain_error",
             Self::Ping => "ping",
             Self::Pong => "pong",
@@ -2312,7 +2335,10 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
     let mut watched_activity_sessions = HashSet::new();
     let mut watched_cwd_sessions = HashSet::new();
     let mut watched_resize_sessions = HashSet::new();
+    let mut watched_metadata_clients = false;
+    let mut watched_metadata_status_interval_ms = None;
     let mut watcher_tasks: Vec<JoinHandle<()>> = Vec::new();
+    let mut metadata_watcher_tasks: Vec<JoinHandle<()>> = Vec::new();
     let mut push_event_queue = SessionPushEventQueue::default();
     let mut push_drain_wake_pending = false;
     let mut traffic = WebSocketTrafficCounters::default();
@@ -2596,6 +2622,15 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
                             &mut watcher_tasks,
                         )
                         .await;
+                        register_metadata_watchers(
+                            &connection,
+                            &protocol,
+                            &mut watched_metadata_clients,
+                            &mut watched_metadata_status_interval_ms,
+                            &push_event_tx,
+                            &mut metadata_watcher_tasks,
+                        )
+                        .await;
                         queue_initial_output_events(&initial_output_sessions, &mut push_event_queue);
                         if let Err(()) = drain_websocket_push_events(
                             &protocol,
@@ -2792,6 +2827,9 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
     }
 
     for task in watcher_tasks {
+        task.abort();
+    }
+    for task in metadata_watcher_tasks {
         task.abort();
     }
 
@@ -3038,6 +3076,23 @@ async fn collect_websocket_push_event(
                 connection.encrypt_collected_inner_messages_wire(messages),
             )
         }
+        SessionPushEvent::MetadataClients => {
+            let messages = {
+                let mut protocol = protocol.lock().await;
+                connection.read_metadata_clients_snapshot_messages(&mut protocol)
+            };
+            (
+                WebSocketOutKind::PushMetadataClients,
+                connection.encrypt_collected_inner_messages_wire(messages),
+            )
+        }
+        SessionPushEvent::MetadataStatus => {
+            let messages = connection.read_metadata_status_snapshot_messages();
+            (
+                WebSocketOutKind::PushMetadataStatus,
+                connection.encrypt_collected_inner_messages_wire(messages),
+            )
+        }
     }
 }
 
@@ -3158,6 +3213,50 @@ async fn register_session_watchers(
     initial_output_sessions
 }
 
+async fn register_metadata_watchers(
+    connection: &ProtocolConnection,
+    protocol: &SharedDaemonProtocol,
+    watched_metadata_clients: &mut bool,
+    watched_metadata_status_interval_ms: &mut Option<u64>,
+    push_event_tx: &mpsc::Sender<SessionPushEvent>,
+    metadata_watcher_tasks: &mut Vec<JoinHandle<()>>,
+) {
+    let (clients_signal, status_interval_ms) = {
+        let protocol = protocol.lock().await;
+        (
+            connection.metadata_clients_signal(&protocol),
+            connection.metadata_status_interval_ms(),
+        )
+    };
+    let desired_clients = clients_signal.is_some();
+    let desired_status_interval_ms = status_interval_ms;
+
+    if *watched_metadata_clients != desired_clients
+        || *watched_metadata_status_interval_ms != desired_status_interval_ms
+    {
+        debug!("rebuilding websocket metadata watchers after subscription set changed");
+        for task in metadata_watcher_tasks.drain(..) {
+            task.abort();
+        }
+        *watched_metadata_clients = false;
+        *watched_metadata_status_interval_ms = None;
+    }
+
+    if let Some(signal) = clients_signal {
+        if !*watched_metadata_clients {
+            *watched_metadata_clients = true;
+            spawn_metadata_clients_push_watcher(signal, push_event_tx, metadata_watcher_tasks);
+        }
+    }
+
+    if let Some(interval_ms) = desired_status_interval_ms {
+        if *watched_metadata_status_interval_ms != Some(interval_ms) {
+            *watched_metadata_status_interval_ms = Some(interval_ms);
+            spawn_metadata_status_push_watcher(interval_ms, push_event_tx, metadata_watcher_tasks);
+        }
+    }
+}
+
 fn queue_initial_output_events(
     initial_output_sessions: &[SessionId],
     push_event_queue: &mut SessionPushEventQueue,
@@ -3222,6 +3321,7 @@ fn spawn_session_push_watcher<T>(
                 SessionPushEvent::Activity(_) => SessionPushEvent::Activity(session_id),
                 SessionPushEvent::Cwd(_) => SessionPushEvent::Cwd(session_id),
                 SessionPushEvent::Resize(_) => SessionPushEvent::Resize(session_id),
+                SessionPushEvent::MetadataClients | SessionPushEvent::MetadataStatus => event,
             };
             if push_event_tx.send(next_event).await.is_err() {
                 debug!(
@@ -3239,6 +3339,58 @@ fn spawn_session_push_watcher<T>(
             if let Some(interval) = min_interval {
                 tokio::time::sleep(interval).await;
             }
+        }
+    }));
+}
+
+fn spawn_metadata_clients_push_watcher(
+    mut signal: watch::Receiver<u64>,
+    push_event_tx: &mpsc::Sender<SessionPushEvent>,
+    watcher_tasks: &mut Vec<JoinHandle<()>>,
+) {
+    // 中文注释：subscribe 响应已经携带初始 clients snapshot；这里跳过当前 watch 版本，
+    // 只在后续在线/attach/offline 变化时推送。
+    signal.borrow_and_update();
+
+    let push_event_tx = push_event_tx.clone();
+    watcher_tasks.push(tokio::spawn(async move {
+        loop {
+            if signal.changed().await.is_err() {
+                break;
+            }
+            signal.borrow_and_update();
+            if push_event_tx
+                .send(SessionPushEvent::MetadataClients)
+                .await
+                .is_err()
+            {
+                debug!("websocket metadata clients watcher stopped because event queue closed");
+                break;
+            }
+            debug!("websocket metadata clients watcher enqueued event");
+        }
+    }));
+}
+
+fn spawn_metadata_status_push_watcher(
+    interval_ms: u64,
+    push_event_tx: &mpsc::Sender<SessionPushEvent>,
+    watcher_tasks: &mut Vec<JoinHandle<()>>,
+) {
+    let push_event_tx = push_event_tx.clone();
+    watcher_tasks.push(tokio::spawn(async move {
+        let interval = Duration::from_millis(interval_ms);
+        loop {
+            tokio::time::sleep(interval).await;
+            if push_event_tx
+                .send(SessionPushEvent::MetadataStatus)
+                .await
+                .is_err()
+            {
+                debug!("websocket metadata status watcher stopped because event queue closed");
+                break;
+            }
+            debug!("websocket metadata status watcher enqueued event");
         }
     }));
 }
@@ -3552,12 +3704,14 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use termd_proto::{
-        DeviceId, E2eeKeyExchangePayload, Envelope, HttpE2eeAuthPayload, PairAcceptPayload,
-        PairRequestPayload, PublicKey, SessionCreatePayload, SessionCreatedPayload,
-        SessionCwdChangedPayload, SessionDataPayload, SessionFileDownloadStreamReadyPayload,
-        SessionFileHttpDownloadPayload, SessionFileHttpUploadReadyPayload,
-        SessionFileHttpUploadStreamPayload, SessionFileUploadPayload, SessionScopeGrantPayload,
-        Signature, TerminalSize, UnixTimestampMillis,
+        ClientHelloKind, ClientHelloPayload, DaemonClientsResultPayload, DaemonStatusResultPayload,
+        DeviceId, E2eeKeyExchangePayload, Envelope, HttpE2eeAuthPayload, MetadataSubscribePayload,
+        PairAcceptPayload, PairRequestPayload, PublicKey, SessionCreatePayload,
+        SessionCreatedPayload, SessionCwdChangedPayload, SessionDataPayload,
+        SessionFileDownloadStreamReadyPayload, SessionFileHttpDownloadPayload,
+        SessionFileHttpUploadReadyPayload, SessionFileHttpUploadStreamPayload,
+        SessionFileUploadPayload, SessionScopeGrantPayload, Signature, TerminalSize,
+        UnixTimestampMillis,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::time::{Duration, timeout};
@@ -3891,6 +4045,83 @@ mod tests {
             push_event_rx.try_recv(),
             Err(mpsc::error::TryRecvError::Empty)
         );
+    }
+
+    #[tokio::test]
+    async fn websocket_metadata_push_collector_encrypts_snapshot_events() {
+        let protocol = test_protocol("websocket-metadata-push-collector");
+        let (mut connection, mut device_session) =
+            authenticated_metadata_connection(protocol.clone(), true, Some(1_000)).await;
+        pair_extra_device_for_metadata_signal(protocol.clone()).await;
+
+        let (clients_kind, clients_wire) = collect_websocket_push_event(
+            &protocol,
+            &mut connection,
+            SessionPushEvent::MetadataClients,
+        )
+        .await;
+        assert_eq!(clients_kind, WebSocketOutKind::PushMetadataClients);
+        let clients = decrypt_wire_messages(&mut device_session, clients_wire);
+        assert_eq!(clients.len(), 1);
+        assert_eq!(clients[0].kind, MessageType::DaemonClientsSnapshot);
+        let clients_payload: DaemonClientsResultPayload =
+            decode_payload(clients[0].payload.clone()).unwrap();
+        assert!(!clients_payload.clients.is_empty());
+
+        let (status_kind, status_wire) = collect_websocket_push_event(
+            &protocol,
+            &mut connection,
+            SessionPushEvent::MetadataStatus,
+        )
+        .await;
+        assert_eq!(status_kind, WebSocketOutKind::PushMetadataStatus);
+        let status = decrypt_wire_messages(&mut device_session, status_wire);
+        assert_eq!(status.len(), 1);
+        assert_eq!(status[0].kind, MessageType::DaemonStatusSnapshot);
+        let status_payload: DaemonStatusResultPayload =
+            decode_payload(status[0].payload.clone()).unwrap();
+        assert_eq!(status_payload.load_avg.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn websocket_metadata_clients_watcher_wakes_on_client_changes() {
+        let protocol = test_protocol("websocket-metadata-clients-watcher");
+        let (connection, _device_session) =
+            authenticated_metadata_connection(protocol.clone(), true, None).await;
+        let (push_event_tx, mut push_event_rx) = mpsc::channel(8);
+        let mut watched_metadata_clients = false;
+        let mut watched_metadata_status_interval_ms = None;
+        let mut watcher_tasks = Vec::new();
+
+        register_metadata_watchers(
+            &connection,
+            &protocol,
+            &mut watched_metadata_clients,
+            &mut watched_metadata_status_interval_ms,
+            &push_event_tx,
+            &mut watcher_tasks,
+        )
+        .await;
+
+        // 中文注释：subscribe 响应已经带初始 snapshot，watcher 注册后不能立刻重复推送。
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), push_event_rx.recv())
+                .await
+                .is_err()
+        );
+
+        pair_extra_device_for_metadata_signal(protocol.clone()).await;
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(200), push_event_rx.recv())
+                .await
+                .unwrap(),
+            Some(SessionPushEvent::MetadataClients)
+        );
+
+        for task in watcher_tasks {
+            task.abort();
+        }
     }
 
     static TEST_CONFIG_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -6540,6 +6771,150 @@ zZZR5LzKVu9X7paftR7K8Q==
         );
         let payload: SessionCreatedPayload = decode_payload(created.payload).unwrap();
         (device_id, payload.session_id)
+    }
+
+    async fn authenticated_metadata_connection(
+        protocol: SharedDaemonProtocol,
+        clients: bool,
+        status_interval_ms: Option<u64>,
+    ) -> (ProtocolConnection, E2eeSession) {
+        let mut protocol_guard = protocol.lock().await;
+        let pairing_token = protocol_guard
+            .issue_pairing_token(current_unix_timestamp_millis())
+            .unwrap()
+            .token()
+            .clone();
+        let (mut connection, _) = protocol_guard.start_connection();
+        let device_id = DeviceId::new();
+        let device_keypair = E2eeKeyPair::generate();
+        let mut device_session = open_test_e2ee(
+            &mut protocol_guard,
+            &mut connection,
+            device_id,
+            &device_keypair,
+        );
+        let pair_request = envelope_value(
+            MessageType::PairRequest,
+            PairRequestPayload {
+                device_id,
+                device_public_key: PublicKey("ed25519-v1:metadata-device-key".to_owned()),
+                token: pairing_token,
+                nonce: termd_proto::Nonce("metadata-pair".to_owned()),
+                timestamp_ms: current_unix_timestamp_millis(),
+            },
+        )
+        .unwrap();
+        let pair_frame = device_session.encrypt_json_payload(&pair_request).unwrap();
+        let pair_responses = connection.handle_wire_envelope(
+            &mut protocol_guard,
+            envelope_value(MessageType::EncryptedFrame, pair_frame).unwrap(),
+        );
+        let pair_accept = decrypt_first_and_drain_scope_grants(&mut device_session, pair_responses);
+        assert_eq!(pair_accept.kind, MessageType::PairAccept);
+
+        let hello = envelope_value(
+            MessageType::ClientHello,
+            ClientHelloPayload {
+                name: "Metadata sidecar".to_owned(),
+                kind: ClientHelloKind::Metadata,
+            },
+        )
+        .unwrap();
+        let hello_frame = device_session.encrypt_json_payload(&hello).unwrap();
+        let hello_responses = connection.handle_wire_envelope(
+            &mut protocol_guard,
+            envelope_value(MessageType::EncryptedFrame, hello_frame).unwrap(),
+        );
+        assert!(hello_responses.is_empty());
+
+        let subscribe = envelope_value(
+            MessageType::MetadataSubscribe,
+            MetadataSubscribePayload {
+                status_interval_ms,
+                clients,
+            },
+        )
+        .unwrap();
+        let subscribe_frame = device_session.encrypt_json_payload(&subscribe).unwrap();
+        let subscribe_responses = connection.handle_wire_envelope(
+            &mut protocol_guard,
+            envelope_value(MessageType::EncryptedFrame, subscribe_frame).unwrap(),
+        );
+        let subscribe_inner = decrypt_encrypted_envelopes(&mut device_session, subscribe_responses);
+        assert_eq!(subscribe_inner[0].kind, MessageType::MetadataSubscribe);
+        assert!(subscribe_inner.iter().skip(1).all(|envelope| {
+            matches!(
+                envelope.kind,
+                MessageType::DaemonClientsSnapshot | MessageType::DaemonStatusSnapshot
+            )
+        }));
+
+        (connection, device_session)
+    }
+
+    async fn pair_extra_device_for_metadata_signal(protocol: SharedDaemonProtocol) -> DeviceId {
+        let mut protocol_guard = protocol.lock().await;
+        let pairing_token = protocol_guard
+            .issue_pairing_token(current_unix_timestamp_millis())
+            .unwrap()
+            .token()
+            .clone();
+        let (mut connection, _) = protocol_guard.start_connection();
+        let device_id = DeviceId::new();
+        let device_keypair = E2eeKeyPair::generate();
+        let mut device_session = open_test_e2ee(
+            &mut protocol_guard,
+            &mut connection,
+            device_id,
+            &device_keypair,
+        );
+        let pair_request = envelope_value(
+            MessageType::PairRequest,
+            PairRequestPayload {
+                device_id,
+                device_public_key: PublicKey("ed25519-v1:metadata-extra-device-key".to_owned()),
+                token: pairing_token,
+                nonce: termd_proto::Nonce("metadata-extra-pair".to_owned()),
+                timestamp_ms: current_unix_timestamp_millis(),
+            },
+        )
+        .unwrap();
+        let pair_frame = device_session.encrypt_json_payload(&pair_request).unwrap();
+        let pair_responses = connection.handle_wire_envelope(
+            &mut protocol_guard,
+            envelope_value(MessageType::EncryptedFrame, pair_frame).unwrap(),
+        );
+        let pair_accept = decrypt_first_and_drain_scope_grants(&mut device_session, pair_responses);
+        assert_eq!(pair_accept.kind, MessageType::PairAccept);
+        device_id
+    }
+
+    fn decrypt_wire_messages(
+        device_session: &mut E2eeSession,
+        messages: Vec<ProtocolWireMessage>,
+    ) -> Vec<JsonEnvelope> {
+        let mut decrypted = Vec::new();
+        for message in messages {
+            let ProtocolWireMessage::Json(envelope) = message else {
+                panic!("metadata push should use encrypted JSON wire message, got {message:?}");
+            };
+            let frame = encrypted_frame_from_envelope(envelope).unwrap();
+            decrypted.push(device_session.decrypt_json_payload(&frame).unwrap());
+        }
+        decrypted
+    }
+
+    fn decrypt_encrypted_envelopes(
+        device_session: &mut E2eeSession,
+        messages: Vec<JsonEnvelope>,
+    ) -> Vec<JsonEnvelope> {
+        messages
+            .into_iter()
+            .map(|envelope| {
+                let frame = encrypted_frame_from_envelope(envelope).unwrap();
+                device_session.decrypt_json_payload(&frame).unwrap()
+            })
+            .collect()
     }
 
     fn test_ed25519_wire(bytes: &[u8]) -> String {

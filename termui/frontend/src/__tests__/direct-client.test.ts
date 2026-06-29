@@ -11,7 +11,9 @@ import { decodeSupervisorTerminalServerFrame } from "../protocol/supervisor-term
 import { PROTOCOL_PACKET_VERSION } from "../protocol/types";
 import type {
   AttachFramePayload,
+  ClientHelloPayload,
   HttpE2eeAuthPayload,
+  MetadataSubscribePayload,
   PublicKeyWire,
   SessionFileDownloadStreamReadyPayload,
   SessionFileHttpUploadStreamPayload,
@@ -248,6 +250,28 @@ describe("DirectClient", () => {
       daemonPacketVersion: 2,
     });
     await expect(connectDevice(device.device_id)).rejects.toMatchObject({ code: "unsupported_protocol_version" });
+  });
+
+  it("metadata 侧边连接会发送 metadata client hello 并订阅 metadata", async () => {
+    const { device, server } = await pairedDevice("00000000-0000-0000-0000-000000000314");
+    const client = await connectDevice(device.device_id);
+
+    await client.authenticate(device, server, { clientKind: "metadata" });
+    await client.subscribeMetadata({
+      clients: true,
+      status_interval_ms: 3000,
+    } satisfies MetadataSubscribePayload);
+
+    const helloPacket = daemon.receivedPackets.find(
+      (packet) => packet.method === "client.hello",
+    );
+    expect(helloPacket?.payload).toMatchObject({
+      kind: "metadata",
+    } satisfies Partial<ClientHelloPayload>);
+    expect(
+      daemon.receivedPackets.some((packet) => packet.method === "metadata.subscribe"),
+    ).toBe(true);
+    client.close();
   });
 
   it("连接阶段超时会关闭半开 WebSocket，避免 relay 重试残留旧连接", async () => {

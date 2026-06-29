@@ -28,6 +28,10 @@ interface UseWorkspaceConnectionOptions {
   socketConnectRetryDelayMs: number;
 }
 
+interface AuthenticatedClientOptions {
+  clientKind?: "interactive" | "metadata";
+}
+
 function terminalTransportPausedError(): ProtocolClientError {
   return new ProtocolClientError("connection_closed", "connection paused while browser is offline");
 }
@@ -184,7 +188,11 @@ export function useWorkspaceConnection(options: UseWorkspaceConnectionOptions) {
     attachClientRef.current = client;
   }, [closeWorkspaceMetadataClient]);
 
-  const authenticatedClient = useCallback(async (timeoutMs = options.requestTimeoutMs, signal?: AbortSignal) => {
+  const authenticatedClient = useCallback(async (
+    timeoutMs = options.requestTimeoutMs,
+    signal?: AbortSignal,
+    clientOptions: AuthenticatedClientOptions = {},
+  ) => {
     const server = options.activeServer;
     const device = options.device;
     if (!server || !device) {
@@ -215,7 +223,12 @@ export function useWorkspaceConnection(options: UseWorkspaceConnectionOptions) {
               requestTimeoutMs: options.requestTimeoutMs,
               signal: abortSignal,
             });
-            await abortableConnectionStep(client.authenticate(device, { ...server, url: routeUrl }), abortSignal);
+            await abortableConnectionStep(
+              client.authenticate(device, { ...server, url: routeUrl }, {
+                clientKind: clientOptions.clientKind,
+              }),
+              abortSignal,
+            );
             return client;
           } catch (caught) {
             lastConnectError = caught;

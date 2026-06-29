@@ -75,6 +75,7 @@ import type {
   PairedServerState,
   PacketErrorPayload,
   PacketStreamId,
+  MetadataSubscribePayload,
   PongPayload,
   ProtocolPacket,
   PublicKeyWire,
@@ -156,6 +157,10 @@ interface DirectClientOptions {
 interface DirectClientDiagnosticsContext {
   serverId: UUID;
   deviceId: UUID;
+}
+
+interface DirectClientAuthenticateOptions {
+  clientKind?: ClientHelloPayload["kind"];
 }
 
 interface PendingRequest {
@@ -403,7 +408,11 @@ export class DirectClient {
     return accepted;
   }
 
-  async authenticate(device: DeviceState, server: PairedServerState): Promise<void> {
+  async authenticate(
+    device: DeviceState,
+    server: PairedServerState,
+    options: DirectClientAuthenticateOptions = {},
+  ): Promise<void> {
     this.requireE2eeReady();
     const challenge = await this.expectQueuedPayload<AuthChallengePayload>("auth_challenge", this.authTimeoutMs);
     const auth = await signAuthPayload(
@@ -414,10 +423,25 @@ export class DirectClient {
     );
     await this.request("auth.verify", auth, this.authTimeoutMs);
     this.phase = "authenticated";
-    await this.request("client.hello", { name: device.name?.trim() || "Web client" } satisfies ClientHelloPayload, this.authTimeoutMs);
+    await this.request(
+      "client.hello",
+      {
+        name: device.name?.trim() || "Web client",
+        ...(options.clientKind ? { kind: options.clientKind } : {}),
+      } satisfies ClientHelloPayload,
+      this.authTimeoutMs,
+    );
     this.authenticatedDevice = device;
     this.authenticatedServer = server;
     await this.refreshSessionToken(this.authTimeoutMs);
+  }
+
+  async subscribeMetadata(
+    payload: MetadataSubscribePayload,
+    timeoutMs = this.timeoutMs,
+  ): Promise<void> {
+    this.requireAuthenticated();
+    await this.request("metadata.subscribe", payload, timeoutMs);
   }
 
   async refreshSessionToken(timeoutMs = this.authTimeoutMs): Promise<SessionTokenGrantPayload> {

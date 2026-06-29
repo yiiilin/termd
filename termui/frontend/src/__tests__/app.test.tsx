@@ -628,6 +628,13 @@ async function waitForWorkspaceReady(): Promise<void> {
   await screen.findByTestId("terminal-pane");
 }
 
+function expectTerminalAndMetadataConnectionBudget(daemon: MockDaemon): void {
+  // 中文注释：metadata push 引入第二条 E2EE WebSocket；这些断言只关心 terminal
+  // 切换/超时后没有遗留旧 terminal transport，因此允许当前 terminal + metadata sidecar。
+  expect(daemon.activeConnectionCount()).toBeGreaterThan(0);
+  expect(daemon.activeConnectionCount()).toBeLessThanOrEqual(2);
+}
+
 async function clickSessionCard(
   user: ReturnType<typeof userEvent.setup>,
   name?: string,
@@ -1037,6 +1044,57 @@ describe("termui web 工作台", () => {
     expect(document.body.textContent).not.toContain("response_timeout");
   }, 15_000);
 
+  it("metadata WebSocket ready 后停止 daemon.status 高频轮询并订阅 clients push", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await screen.findByText(/termd-e2e-ready/);
+    await waitFor(() =>
+      expect(
+        daemon.receivedPackets.some(
+          (packet) =>
+            packet.method === "client.hello" &&
+            (packet.payload as { kind?: string }).kind === "metadata",
+        ),
+      ).toBe(true),
+    );
+    await waitFor(() =>
+      expect(
+        daemon.receivedPackets.some(
+          (packet) =>
+            packet.method === "metadata.subscribe" &&
+            (packet.payload as { clients?: boolean }).clients === true,
+        ),
+      ).toBe(true),
+    );
+    await waitFor(() =>
+      expect(
+        daemon.sentPackets.some(
+          (packet) => packet.kind === "event" && packet.method === "daemon.status_snapshot",
+        ),
+      ).toBe(true),
+    );
+
+    let statusRequestsAfterMetadataReady = daemon.daemonStatusRequests;
+    let stableSamples = 0;
+    for (let attempt = 0; attempt < 8 && stableSamples < 2; attempt += 1) {
+      await new Promise((resolve) => window.setTimeout(resolve, 250));
+      const nextStatusRequests = daemon.daemonStatusRequests;
+      if (nextStatusRequests === statusRequestsAfterMetadataReady) {
+        stableSamples += 1;
+      } else {
+        stableSamples = 0;
+        statusRequestsAfterMetadataReady = nextStatusRequests;
+      }
+    }
+
+    await new Promise((resolve) => window.setTimeout(resolve, DAEMON_STATUS_POLL_INTERVAL_MS * 2 + 500));
+
+    expect(daemon.daemonStatusRequests).toBe(statusRequestsAfterMetadataReady);
+  });
+
   it("daemon.status 旁路超时不污染已 attach 的终端", async () => {
     const user = userEvent.setup();
     await daemon.stop();
@@ -1304,7 +1362,7 @@ describe("termui web 工作台", () => {
     // 不能关闭承载 terminal stream 的当前 session WebSocket。
     expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
     expect(screen.getByTestId("terminal-pane")).toBeInTheDocument();
-    expect(daemon.activeConnectionCount()).toBe(1);
+    expectTerminalAndMetadataConnectionBudget(daemon);
 
     const hiddenRequestCount = daemon.daemonStatusRequests;
     setDocumentVisibility("visible");
@@ -1341,7 +1399,7 @@ describe("termui web 工作台", () => {
     // 普通 request timeout 只能标记该 RPC 失败，不能关闭承载 terminal stream 的当前 session 连接。
     expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
     expect(screen.getByTestId("terminal-pane")).toBeInTheDocument();
-    expect(daemon.activeConnectionCount()).toBe(1);
+    expectTerminalAndMetadataConnectionBudget(daemon);
   }, 15_000);
 
   it("已 attach 时旁路 RPC 关闭 socket 会走终端重连而不是卡在连接已关闭", async () => {
@@ -1379,7 +1437,7 @@ describe("termui web 工作台", () => {
     await waitFor(() => expect(daemon.sessionDataMessages).toContain("after-status-close-input"));
   });
 
-  it("daemon.status 轮询遇到 bearer 被直接拒绝时会自动刷新 session token 并继续 HTTP 控制面", async () => {
+  it("metadata ready 后 daemon.status bearer 过期不再制造状态轮询并保持终端可用", async () => {
     const user = userEvent.setup();
     render(<App />);
 
@@ -1387,21 +1445,21 @@ describe("termui web 工作台", () => {
     await waitForWorkspaceSession();
     await screen.findByText(/termd-e2e-ready/);
     await waitFor(() => expect(daemon.daemonStatusRequests).toBeGreaterThan(0));
+    await waitFor(() =>
+      expect(daemon.receivedPackets.some((packet) => packet.method === "metadata.subscribe")).toBe(true),
+    );
 
     const stateBeforeRefresh = await loadBrowserState();
     const deviceId = stateBeforeRefresh.device?.device_id;
     expect(deviceId).toBeTruthy();
     const issuedToken = `mock-session-token-${deviceId!}`;
-    const sessionTokenRequestsBeforeExpire = daemon.receivedPackets.filter((packet) => packet.method === "auth.session_token").length;
     const statusRequestsBeforeExpire = daemon.daemonStatusRequests;
 
     daemon.expireSessionToken(issuedToken, 0);
 
-    await waitFor(() =>
-      expect(daemon.receivedPackets.filter((packet) => packet.method === "auth.session_token").length).toBeGreaterThan(sessionTokenRequestsBeforeExpire),
-    );
-    await waitFor(() => expect(daemon.daemonStatusRequests).toBeGreaterThan(statusRequestsBeforeExpire));
-    expect(daemon.receivedHttpRequests.filter((request) => request.path === "/api/control/daemon/status").length).toBeGreaterThan(1);
+    await new Promise((resolve) => window.setTimeout(resolve, DAEMON_STATUS_POLL_INTERVAL_MS * 2 + 500));
+
+    expect(daemon.daemonStatusRequests).toBe(statusRequestsBeforeExpire);
     expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
     expect(screen.getByTestId("terminal-pane")).toBeInTheDocument();
 
@@ -1449,7 +1507,7 @@ describe("termui web 工作台", () => {
     expect(within(panel).getByText("unavailable")).toBeInTheDocument();
     expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
     expect(screen.getByTestId("terminal-pane")).toBeInTheDocument();
-    expect(daemon.activeConnectionCount()).toBe(1);
+    expectTerminalAndMetadataConnectionBudget(daemon);
   }, 15_000);
 
   it("切换 session 会关闭旧 WebSocket 并为新 session 重建连接", async () => {
@@ -1465,7 +1523,7 @@ describe("termui web 工作台", () => {
     await pairWithInvite(user, daemon);
     await waitForWorkspaceSession();
     await screen.findByText(/termd-e2e-ready/);
-    await waitFor(() => expect(daemon.activeConnectionCount()).toBe(1));
+    await waitFor(() => expectTerminalAndMetadataConnectionBudget(daemon));
     daemon.setSessions([
       {
         session_id: DEFAULT_SESSION_ID,
@@ -1484,7 +1542,7 @@ describe("termui web 工作台", () => {
     // route/E2EE/auth/terminal.attach，旧连接关闭后 relay/daemon 都能用 transport close
     // 明确清理旧 client context。
     expect(daemon.acceptedConnections).toBeGreaterThan(acceptedBeforeSwitch);
-    await waitFor(() => expect(daemon.activeConnectionCount()).toBe(1), {
+    await waitFor(() => expectTerminalAndMetadataConnectionBudget(daemon), {
       timeout: 3500,
     });
   });
@@ -1537,7 +1595,7 @@ describe("termui web 工作台", () => {
       await waitFor(() => expect(daemon.attachedSessions).toContain(gammaSession.session_id), {
         timeout: 1000,
       });
-      await waitFor(() => expect(daemon.activeConnectionCount()).toBe(1), {
+      await waitFor(() => expectTerminalAndMetadataConnectionBudget(daemon), {
         timeout: 1500,
       });
     } finally {
@@ -1593,7 +1651,7 @@ describe("termui web 工作台", () => {
     await waitFor(() => expect(daemon.attachedSessions).toContain(gammaSession.session_id), {
       timeout: 1500,
     });
-    await waitFor(() => expect(daemon.activeConnectionCount()).toBe(1), {
+    await waitFor(() => expectTerminalAndMetadataConnectionBudget(daemon), {
       timeout: 2000,
     });
     expect(selectedSessionName()).toBe("gamma");
@@ -1762,14 +1820,14 @@ describe("termui web 工作台", () => {
     expect(within(mobileStatus).queryByText(/atop/)).toBeNull();
   });
 
-  it("daemon 状态栏注册 1 秒自动轮询", async () => {
+  it("daemon 状态栏在 metadata 不可用时降级到低频轮询", async () => {
     const intervalSpy = vi.spyOn(window, "setInterval");
     const user = userEvent.setup();
     render(<App />);
 
     await pairWithInvite(user, daemon);
     await waitForWorkspaceSession();
-    expect(intervalSpy).toHaveBeenCalledWith(expect.any(Function), 1000);
+    expect(intervalSpy).toHaveBeenCalledWith(expect.any(Function), 10000);
     intervalSpy.mockRestore();
   });
 
@@ -5744,7 +5802,7 @@ describe("termui web 工作台", () => {
     expect(currentDiffText).not.toContain("mock unstaged diff for README.md");
   });
 
-  it("文件 panel 默认每秒跟随终端 cwd，并可关闭跟随", async () => {
+  it("文件 panel 默认每 5 秒跟随终端 cwd，并可关闭跟随", async () => {
     const user = userEvent.setup();
     const sessionId = "00000000-0000-0000-0000-000000000414";
     await daemon.stop();
@@ -5803,16 +5861,16 @@ describe("termui web 工作台", () => {
           session_id: sessionId,
         });
       },
-      { timeout: 2500 },
+      { timeout: 6500 },
     );
     await within(panel).findByText("beta.log");
-    expect(within(panel).getByLabelText("Current directory")).toHaveValue("/tmp/work");
+    await waitFor(() => expect(within(panel).getByLabelText("Current directory")).toHaveValue("/tmp/work"));
 
     await user.click(followToggle);
     expect(followToggle).not.toBeChecked();
     const requestCountAfterDisable = daemon.sessionFileRequests.length;
     daemon.setSessionFilePosition(sessionId, "/home/me");
-    await new Promise((resolve) => window.setTimeout(resolve, 1200));
+    await new Promise((resolve) => window.setTimeout(resolve, 5200));
     // 中文注释：HTTP control 请求可能在关闭 Follow 前已经发出；这里验证更关键的不变量：
     // 关闭后的迟到 cwd 结果不能再把文件面板从用户停留的目录覆盖回 terminal cwd。
     expect(

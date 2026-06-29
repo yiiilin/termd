@@ -19,6 +19,7 @@ export const PROTOCOL_METHOD_REGISTRY = {
   "daemon.clients": { legacyEnvelopeType: "daemon_clients" },
   "daemon.client_forget": { legacyEnvelopeType: "daemon_client_forget" },
   "daemon.status": { legacyEnvelopeType: "daemon_status" },
+  "metadata.subscribe": { legacyEnvelopeType: "metadata_subscribe", needsEmptyAck: true },
   "terminal.create": { legacyEnvelopeType: "session_create" },
   "session.attach": { legacyEnvelopeType: "session_attach" },
   "terminal.attach": { legacyEnvelopeType: "session_attach" },
@@ -56,6 +57,8 @@ export const PROTOCOL_EVENT_METHOD_REGISTRY = {
   "session.closed": "session_closed",
   "session.resized": "session_resized",
   "terminal.output": "session_data",
+  "daemon.clients_snapshot": "daemon_clients_snapshot",
+  "daemon.status_snapshot": "daemon_status_snapshot",
 } as const satisfies Record<string, Envelope["type"]>;
 
 export type ProtocolEventMethod = keyof typeof PROTOCOL_EVENT_METHOD_REGISTRY;
