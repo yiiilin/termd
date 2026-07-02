@@ -216,6 +216,7 @@ const enUS = {
 
   "terminal.mobileShortcuts": "mobile terminal shortcuts",
   "terminal.mobileDirection": "mobile direction gesture",
+  "terminal.copySelection": "Copy selection",
   "terminal.copied": "Copied",
   "terminal.sendTab": "Send Tab",
   "terminal.sendEscape": "Send Escape",
@@ -478,6 +479,7 @@ const zhCN: Record<TranslationKey, string> = {
 
   "terminal.mobileShortcuts": "移动端终端快捷键",
   "terminal.mobileDirection": "移动端方向手势",
+  "terminal.copySelection": "复制选区",
   "terminal.copied": "复制成功",
   "terminal.sendTab": "发送 Tab",
   "terminal.sendEscape": "发送 Escape",

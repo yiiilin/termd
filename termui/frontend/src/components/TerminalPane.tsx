@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState, type FormEvent, type MouseEvent, type PointerEvent as ReactPointerEvent } from "react";
-import { ChevronDown, ChevronUp, ClipboardPaste, Search, X } from "lucide-react";
+import { ChevronDown, ChevronUp, ClipboardPaste, Copy, Search, X } from "lucide-react";
 import type { BrowserMobileShortcut, EffectiveTheme, SessionCursorPresence, SessionSearchResultPayload, TerminalSize } from "../protocol/types";
 import { useI18n } from "../i18n";
 import { terminalTheme } from "../theme";
@@ -34,6 +34,7 @@ const MOBILE_DIRECTION_REPEAT_MS = 500;
 const MOBILE_DIRECTION_TIER_TWO_PX = 56;
 const MOBILE_DIRECTION_TIER_THREE_PX = 84;
 const MOBILE_DIRECTION_CANCEL_PX = 10;
+const MOBILE_SELECTION_LONG_PRESS_MS = 600;
 const MOBILE_SCROLL_DEAD_ZONE_PX = 12;
 const MOBILE_SCROLL_STEP_DIVISOR = 1.2;
 const MOBILE_COMPOSITION_SETTLE_MS = 80;
@@ -210,6 +211,16 @@ export function TerminalPane(props: TerminalPaneProps) {
     lastClientY: number;
     active: boolean;
   } | undefined>(undefined);
+  const mobileSelectionLongPressRef = useRef<{
+    pointerId: number;
+    startX: number;
+    startY: number;
+    timer?: number;
+    active: boolean;
+    moved: boolean;
+    startCell?: { col: number; row: number };
+    lastCell?: { col: number; row: number };
+  } | undefined>(undefined);
   const mobilePointerDownInputFocusRef = useRef(false);
   const mobileKeyboardResizeSuppressUntilRef = useRef(0);
   const passiveFocusBypassTimerRef = useRef<number | undefined>(undefined);
@@ -320,6 +331,7 @@ export function TerminalPane(props: TerminalPaneProps) {
     () => onTerminalResyncRef.current?.(undefined),
   );
   const [copyToastVisible, setCopyToastVisible] = useState(false);
+  const [terminalSelectionAvailable, setTerminalSelectionAvailable] = useState(false);
   const [mobileDirectionActive, setMobileDirectionActive] = useState(false);
   const [mobileDirection, setMobileDirection] = useState<MobileDirection | undefined>();
   const [searchOpen, setSearchOpen] = useState(false);
@@ -837,25 +849,27 @@ export function TerminalPane(props: TerminalPaneProps) {
       return;
     }
     const fullGridHeight = Math.ceil(rowHeight * terminal.rows + insetTop + insetBottom);
-    const bottomSpacerHeight = Math.ceil(rowHeight * Math.floor(visibleRows / 2));
-    // 中文注释：底部光标已经处于 xterm scrollback 的最后一屏时，scrollToLine 无法再把
-    // 内容往上推。这里让外层 scrollport 承载“完整终端网格 + 底部留白”，从而只移动
-    // 本地显示窗口，不改变 PTY/session rows，也不触发 resize 上报。
     frame.style.height = `${fullGridHeight}px`;
     frame.style.minHeight = `${fullGridHeight}px`;
-    canvas.style.height = `${fullGridHeight + bottomSpacerHeight}px`;
-    canvas.style.minHeight = `${fullGridHeight + bottomSpacerHeight}px`;
 
     const nextScrollState = rendererRef.current?.scrollState(terminal);
     const viewportY = nextScrollState?.viewportY ?? terminal.buffer?.active?.viewportY ?? 0;
     const cursorViewportRow = clampNumber(cursorAbsoluteLine - viewportY, 0, Math.max(0, terminal.rows - 1));
-    const targetScrollTop = Math.max(
-      0,
-      Math.round((cursorViewportRow - Math.floor(visibleRows / 2)) * rowHeight),
-    );
+    const cursorAtTerminalBottom = cursorViewportRow >= Math.max(0, terminal.rows - 1 - TERMINAL_BOTTOM_EPSILON);
+    const bottomSpacerHeight = cursorAtTerminalBottom
+      ? 0
+      : Math.ceil(rowHeight * Math.floor(visibleRows / 2));
+    const scrollableHeight = fullGridHeight + bottomSpacerHeight;
+    canvas.style.height = `${scrollableHeight}px`;
+    canvas.style.minHeight = `${scrollableHeight}px`;
+
+    // 中文注释：中间行继续使用居中策略；但光标已经在终端网格底部时，居中会制造
+    // 半屏底部空白。此时只把最后一屏裁剪到键盘上方，避免输入行被额外抬到中线。
+    const targetScrollTop = cursorAtTerminalBottom
+      ? Math.max(0, Math.round((cursorViewportRow + 1 - visibleRows) * rowHeight))
+      : Math.max(0, Math.round((cursorViewportRow - Math.floor(visibleRows / 2)) * rowHeight));
     const maxScrollTop = Math.max(
-      targetScrollTop,
-      (scrollport.scrollHeight || (fullGridHeight + bottomSpacerHeight)) - scrollport.clientHeight,
+      (Math.max(scrollport.scrollHeight, scrollableHeight) || scrollableHeight) - scrollport.clientHeight,
       0,
     );
     scrollport.scrollTop = Math.min(targetScrollTop, maxScrollTop);
@@ -1095,7 +1109,9 @@ export function TerminalPane(props: TerminalPaneProps) {
     if (!terminal) {
       return undefined;
     }
-    return terminal.selectViewportRange(start, end);
+    const selection = terminal.selectViewportRange(start, end);
+    setTerminalSelectionAvailable(Boolean(selection));
+    return selection;
   };
   const currentTerminalSelectionText = (terminal: TerminalRendererTerminal, selectionOverride?: string): string | undefined => {
     if (selectionOverride !== undefined) {
@@ -1128,9 +1144,24 @@ export function TerminalPane(props: TerminalPaneProps) {
     }
     terminalSelectionCopyGenerationRef.current += 1;
     terminal.deselect();
+    setTerminalSelectionAvailable(false);
     clearTerminalClipboardSelectionOwner();
     updateTerminalSelectionDebug({ selectionCopy: undefined });
     return true;
+  };
+  const copyVisibleTerminalSelection = () => {
+    const terminal = terminalRef.current;
+    if (!terminal) {
+      setTerminalSelectionAvailable(false);
+      return;
+    }
+    const selection = currentTerminalSelectionText(terminal);
+    if (!selection) {
+      setTerminalSelectionAvailable(false);
+      return;
+    }
+    markTerminalClipboardSelectionOwner();
+    copyCurrentTerminalSelection({ force: true, selectionOverride: selection });
   };
   const copyCurrentTerminalSelection = (
     options: {
@@ -1400,6 +1431,133 @@ export function TerminalPane(props: TerminalPaneProps) {
     }
     clearTerminalSelectionDrag();
   };
+  const clearMobileSelectionLongPress = () => {
+    const pending = mobileSelectionLongPressRef.current;
+    if (!pending) {
+      return;
+    }
+    if (pending.timer !== undefined) {
+      window.clearTimeout(pending.timer);
+    }
+    if (pending.active) {
+      // 中文注释：移动端长按选择结束后，浏览器通常会补发兼容 mouse/click。
+      // 这些事件仍属于同一轮选择手势，不能被当成新的输入点击而弹出软键盘。
+      terminalSelectionClickFocusSuppressUntilRef.current = nowForThrottle() + 900;
+    }
+    mobileSelectionLongPressRef.current = undefined;
+  };
+  const suppressMobileSelectionTrailingFocus = () => {
+    terminalSelectionClickFocusSuppressUntilRef.current = Math.max(
+      terminalSelectionClickFocusSuppressUntilRef.current,
+      nowForThrottle() + 900,
+    );
+  };
+  const startMobileSelectionRange = (pointerId: number, clientX: number, clientY: number) => {
+    const pending = mobileSelectionLongPressRef.current;
+    const terminal = terminalRef.current;
+    const cell = terminalCellFromClientPoint(clientX, clientY);
+    if (!pending || pending.pointerId !== pointerId || !terminal || !cell) {
+      return false;
+    }
+    if (!terminal.getViewportRangeText(cell, cell)) {
+      // 中文注释：只有按在实际终端字符上才进入选择；空白处继续留给旧的方向长按手势。
+      return false;
+    }
+    if (pending.timer !== undefined) {
+      window.clearTimeout(pending.timer);
+      pending.timer = undefined;
+    }
+    terminalSelectionCopyGenerationRef.current += 1;
+    terminal.deselect();
+    markTerminalClipboardSelectionOwner();
+    suppressMobileSelectionTrailingFocus();
+    clearMobileDirectionGesture();
+    cancelMobilePointerDownInputFocus();
+    clearPassiveFocusBypassIfInactive();
+    pending.active = true;
+    pending.moved = false;
+    pending.startCell = cell;
+    pending.lastCell = cell;
+    // 中文注释：长按只落下一个 cell 起点，让用户继续拖动扩展到几个字符或跨行；
+    // 不再整行选择，否则移动端无法做精细复制。
+    selectTerminalRange(cell, cell);
+    updateTerminalSelectionDebug({
+      selectionDragActive: "true",
+      selectionDragDragging: "false",
+      selectionDragStart: JSON.stringify(cell),
+      selectionDragLast: JSON.stringify(cell),
+    });
+    return true;
+  };
+  const updateMobileSelectionRange = (pointerId: number, clientX: number, clientY: number) => {
+    const pending = mobileSelectionLongPressRef.current;
+    if (!pending?.active || pending.pointerId !== pointerId || !pending.startCell) {
+      return false;
+    }
+    const cell = terminalCellFromClientPoint(clientX, clientY);
+    if (!cell) {
+      return true;
+    }
+    pending.moved =
+      pending.moved ||
+      cell.col !== pending.startCell.col ||
+      cell.row !== pending.startCell.row;
+    pending.lastCell = cell;
+    selectTerminalRange(pending.startCell, cell);
+    updateTerminalSelectionDebug({
+      selectionDragDragging: String(pending.moved),
+      selectionDragLast: JSON.stringify(cell),
+    });
+    return true;
+  };
+  const finishMobileSelectionRange = (pointerId: number, clientX: number, clientY: number) => {
+    const pending = mobileSelectionLongPressRef.current;
+    if (!pending || pending.pointerId !== pointerId) {
+      return false;
+    }
+    if (!pending.active) {
+      clearMobileSelectionLongPress();
+      return false;
+    }
+    updateMobileSelectionRange(pointerId, clientX, clientY);
+    suppressMobileSelectionTrailingFocus();
+    const terminal = terminalRef.current;
+    const selection = terminal ? currentTerminalSelectionText(terminal) : undefined;
+    if (selection) {
+      copyCurrentTerminalSelection({ selectionOverride: selection });
+    }
+    clearMobileDirectionGesture();
+    cancelMobilePointerDownInputFocus();
+    clearPassiveFocusBypassIfInactive();
+    mobileSelectionLongPressRef.current = undefined;
+    return true;
+  };
+  const scheduleMobileSelectionLongPress = (
+    pointerId: number,
+    clientX: number,
+    clientY: number,
+  ) => {
+    clearMobileSelectionLongPress();
+    const timer = window.setTimeout(() => {
+      const pending = mobileSelectionLongPressRef.current;
+      if (!pending || pending.pointerId !== pointerId) {
+        return;
+      }
+      // 中文注释：终端是 canvas/xterm 自绘文本，移动浏览器原生长按无法稳定产生 DOM 文本选区。
+      // 因此长按只进入 termd 自己的 cell range selection，后续拖动可以精确到字符并跨行。
+      if (!startMobileSelectionRange(pointerId, clientX, clientY)) {
+        mobileSelectionLongPressRef.current = undefined;
+      }
+    }, MOBILE_SELECTION_LONG_PRESS_MS);
+    mobileSelectionLongPressRef.current = {
+      pointerId,
+      startX: clientX,
+      startY: clientY,
+      timer,
+      active: false,
+      moved: false,
+    };
+  };
   const noteTerminalOutputRendered = (item: TerminalOutputItem) => {
     if (item.kind === "sync") {
       return;
@@ -1613,10 +1771,16 @@ export function TerminalPane(props: TerminalPaneProps) {
       lastClientY: event.clientY,
       active: false,
     };
+    scheduleMobileSelectionLongPress(event.pointerId, event.clientX, event.clientY);
   };
   const handleMobileTerminalScrollPointerMove = (event: ReactPointerEvent<HTMLDivElement>) => {
     const gesture = mobileScrollGestureRef.current;
     if (!gesture || gesture.pointerId !== event.pointerId) {
+      return;
+    }
+    if (updateMobileSelectionRange(event.pointerId, event.clientX, event.clientY)) {
+      event.preventDefault();
+      event.stopPropagation();
       return;
     }
     const directionGesture = mobileDirectionGestureRef.current;
@@ -1625,11 +1789,15 @@ export function TerminalPane(props: TerminalPaneProps) {
       directionGesture.pointerId === event.pointerId &&
       (directionGesture.ready || directionGesture.active)
     ) {
+      clearMobileSelectionLongPress();
       mobileScrollGestureRef.current = undefined;
       return;
     }
     const deltaX = event.clientX - gesture.startX;
     const deltaY = event.clientY - gesture.startY;
+    if (Math.hypot(deltaX, deltaY) > MOBILE_DIRECTION_CANCEL_PX) {
+      clearMobileSelectionLongPress();
+    }
     if (!gesture.active) {
       if (Math.abs(deltaY) < MOBILE_SCROLL_DEAD_ZONE_PX || Math.abs(deltaY) <= Math.abs(deltaX)) {
         return;
@@ -1665,10 +1833,28 @@ export function TerminalPane(props: TerminalPaneProps) {
     event.stopPropagation();
   };
   const handleMobileTerminalScrollPointerEnd = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (event.type === "pointercancel") {
+      const pendingSelection = mobileSelectionLongPressRef.current;
+      const cancelledActiveSelection =
+        Boolean(pendingSelection?.active && pendingSelection.pointerId === event.pointerId);
+      clearMobileSelectionLongPress();
+      if (cancelledActiveSelection) {
+        event.preventDefault();
+        event.stopPropagation();
+        mobileScrollGestureRef.current = undefined;
+        return;
+      }
+    } else if (finishMobileSelectionRange(event.pointerId, event.clientX, event.clientY)) {
+      event.preventDefault();
+      event.stopPropagation();
+      mobileScrollGestureRef.current = undefined;
+      return;
+    }
     const gesture = mobileScrollGestureRef.current;
     if (!gesture || gesture.pointerId !== event.pointerId) {
       return;
     }
+    clearMobileSelectionLongPress();
     const directionGesture = mobileDirectionGestureRef.current;
     if (
       gesture.active &&
@@ -2309,6 +2495,7 @@ export function TerminalPane(props: TerminalPaneProps) {
   };
 
   const handleTerminalContextMenu = () => {
+    clearMobileSelectionLongPress();
     cancelMobilePointerDownGestureOnly();
     clearMobileDirectionGesture();
     clearPassiveFocusBypassIfInactive();
@@ -2662,6 +2849,13 @@ export function TerminalPane(props: TerminalPaneProps) {
             });
             return;
           }
+          if (mobileInputModeRef.current && nowForThrottle() < terminalSelectionClickFocusSuppressUntilRef.current) {
+            // 中文注释：长按选择后的兼容 mousedown 不是输入激活动作；只允许下一次独立 tap 打开键盘。
+            event.preventDefault();
+            event.stopPropagation();
+            event.stopImmediatePropagation();
+            return;
+          }
           windowActiveRef.current = true;
           focusActivationArmedRef.current = true;
           suppressPassiveFocusRef.current = false;
@@ -2696,6 +2890,13 @@ export function TerminalPane(props: TerminalPaneProps) {
         const handleClick = (event: globalThis.MouseEvent) => {
           const target = event.target instanceof Element ? event.target : null;
           if (!hitTerminalSurfaceAtPoint(target, event.clientX, event.clientY)) {
+            return;
+          }
+          if (mobileInputModeRef.current && nowForThrottle() < terminalSelectionClickFocusSuppressUntilRef.current) {
+            // 中文注释：同一轮长按选择的 trailing click 不能抢回 helper textarea 焦点。
+            event.preventDefault();
+            event.stopPropagation();
+            event.stopImmediatePropagation();
             return;
           }
           const drag = terminalSelectionDragRef.current;
@@ -3044,6 +3245,7 @@ export function TerminalPane(props: TerminalPaneProps) {
     document.addEventListener("mousedown", handleTerminalClipboardContextMouseDown, true);
     document.addEventListener("focusin", handleTerminalClipboardContextFocusIn, true);
     const selectionSubscription = terminal.onSelectionChange(() => {
+      setTerminalSelectionAvailable(terminal.hasSelection() && Boolean(terminal.getSelection()));
       if (terminalSelectionDragRef.current?.active) {
         return;
       }
@@ -3514,6 +3716,7 @@ export function TerminalPane(props: TerminalPaneProps) {
         terminalScrollTimerRef.current = undefined;
       }
       clearTerminalServerScrollbackResyncIdleTimer();
+      clearMobileSelectionLongPress();
       clearMobileDirectionGesture();
       resetMobileCursorViewportWindow();
       lastTerminalScrollReportAtRef.current = 0;
@@ -3579,6 +3782,7 @@ export function TerminalPane(props: TerminalPaneProps) {
       fitRef.current = null;
       searchAddonRef.current = null;
       rendererRef.current = null;
+      setTerminalSelectionAvailable(false);
       resizeRef.current = undefined;
       stabilizeRef.current = undefined;
       pendingResizeAfterSnapshotRef.current = undefined;
@@ -3806,6 +4010,32 @@ export function TerminalPane(props: TerminalPaneProps) {
               {activeSearchMatch?.line_text ?? searchResult.query}
             </div>
           ) : null}
+        </div>
+      ) : null}
+      {props.attached && props.mobileInputMode && terminalSelectionAvailable ? (
+        <div
+          className={`terminal-mobile-selection-toolbar${props.mobileKeyboardOpen ? " keyboard-open" : ""}`}
+          onPointerDown={(event) => {
+            // 中文注释：复制选区不是输入激活动作；阻止 pointerdown 把焦点推进隐藏 textarea。
+            event.preventDefault();
+            event.stopPropagation();
+          }}
+          onClick={(event) => event.stopPropagation()}
+        >
+          <button
+            type="button"
+            className="terminal-mobile-selection-copy-button"
+            aria-label={t("terminal.copySelection")}
+            title={t("terminal.copySelection")}
+            onClick={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              copyVisibleTerminalSelection();
+            }}
+          >
+            <Copy size={14} aria-hidden="true" />
+            <span>{t("terminal.copySelection")}</span>
+          </button>
         </div>
       ) : null}
       {props.attached && props.mobileInputMode && props.mobileKeyboardOpen ? (

@@ -1686,6 +1686,7 @@ label {
 }
 
 .terminal-mobile-shortcuts,
+.terminal-mobile-selection-toolbar,
 .terminal-direction-pad {
   display: none;
 }
@@ -3208,6 +3209,46 @@ label {
 
   .terminal-scrollport {
     overflow: hidden;
+  }
+
+  .terminal-mobile-selection-toolbar {
+    position: absolute;
+    left: 12px;
+    bottom: 12px;
+    z-index: 10;
+    display: flex;
+    max-width: calc(100% - 24px);
+    pointer-events: auto;
+  }
+
+  .terminal-mobile-selection-toolbar.keyboard-open {
+    bottom: 48px;
+  }
+
+  .terminal-mobile-selection-copy-button {
+    min-height: 32px;
+    max-width: 100%;
+    padding: 0 10px;
+    border: 1px solid var(--color-border-mobile);
+    border-radius: 6px;
+    background: var(--color-toast-bg);
+    color: var(--color-terminal-fg);
+    box-shadow: 0 8px 20px var(--color-popover-shadow);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 5px;
+    font-family: var(--font-ui);
+    font-size: 12px;
+    font-weight: 700;
+    touch-action: manipulation;
+    user-select: none;
+  }
+
+  .terminal-mobile-selection-copy-button:active {
+    border-color: var(--color-accent);
+    background: var(--color-surface-selected);
+    color: var(--color-accent-soft);
   }
 
   .terminal-mobile-shortcuts {

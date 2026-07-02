@@ -1122,6 +1122,278 @@ describe("TerminalPane terminal sequence rendering", () => {
     }
   });
 
+  it("移动端长按拖动会选择局部字符范围并支持跨行", async () => {
+    vi.useFakeTimers();
+    const canvasRect = {
+      x: 0,
+      y: 0,
+      left: 0,
+      top: 0,
+      right: 800,
+      bottom: 240,
+      width: 800,
+      height: 240,
+      toJSON() {
+        return this;
+      },
+    } as DOMRect;
+    const rectSpy = vi.spyOn(HTMLCanvasElement.prototype, "getBoundingClientRect").mockReturnValue(canvasRect);
+    try {
+      const queue: TerminalOutputItem[] = [
+        { kind: "snapshot", bytes: new TextEncoder().encode("abcdefghi\nABCDEFGHI\n"), baseSeq: 0, size: DEFAULT_TERMINAL_SIZE },
+      ];
+      const takeOutput = vi.fn(() => queue.splice(0));
+      const registerOutputDrain = vi.fn((drain: () => void) => {
+        drain();
+        return () => undefined;
+      });
+      render(
+        <TerminalPane
+          attached
+          sessionSize={DEFAULT_TERMINAL_SIZE}
+          mobileInputMode
+          outputResetVersion={0}
+          takeOutput={takeOutput}
+          registerOutputDrain={registerOutputDrain}
+          onInput={vi.fn()}
+          onResize={vi.fn()}
+          onCursorChange={vi.fn()}
+        />,
+      );
+
+      act(() => {
+        vi.advanceTimersByTime(animationFrameMs * 12);
+      });
+      expect(terminalHost().dataset.buffer).toContain("ABCDEFGHI");
+      const canvas = screen.getByTestId("terminal-pane").querySelector<HTMLCanvasElement>("canvas");
+      expect(canvas).not.toBeNull();
+
+      fireTouchPointer(canvas!, "pointerdown", {
+        pointerId: 31,
+        clientX: 20,
+        clientY: 5,
+      });
+      act(() => {
+        vi.advanceTimersByTime(700);
+      });
+      fireTouchPointer(canvas!, "pointermove", {
+        pointerId: 31,
+        clientX: 65,
+        clientY: 15,
+      });
+      fireTouchPointer(canvas!, "pointerup", {
+        pointerId: 31,
+        clientX: 65,
+        clientY: 15,
+      });
+
+      expect(terminalHost().dataset.termdHasSelection).toBe("true");
+      // 中文注释：移动端长按只落下选区起点，后续拖动按 cell 扩展；不能再退回“选整行”。
+      expect(terminalHost().dataset.termdSelection).toBe("cdefghi\nABCDEFG");
+      expect(terminalHost().dataset.termdSelection).not.toContain("abcdefghi\nABCDEFGHI");
+    } finally {
+      rectSpy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("移动端长按选择不会弹出键盘，后续单独点击才聚焦输入", async () => {
+    vi.useFakeTimers();
+    const canvasRect = {
+      x: 0,
+      y: 0,
+      left: 0,
+      top: 0,
+      right: 800,
+      bottom: 240,
+      width: 800,
+      height: 240,
+      toJSON() {
+        return this;
+      },
+    } as DOMRect;
+    const rectSpy = vi.spyOn(HTMLCanvasElement.prototype, "getBoundingClientRect").mockReturnValue(canvasRect);
+    try {
+      const queue: TerminalOutputItem[] = [
+        { kind: "snapshot", bytes: new TextEncoder().encode("mobile-focus-select\n"), baseSeq: 0, size: DEFAULT_TERMINAL_SIZE },
+      ];
+      const takeOutput = vi.fn(() => queue.splice(0));
+      const registerOutputDrain = vi.fn((drain: () => void) => {
+        drain();
+        return () => undefined;
+      });
+      render(
+        <TerminalPane
+          attached
+          sessionSize={DEFAULT_TERMINAL_SIZE}
+          mobileInputMode
+          outputResetVersion={0}
+          takeOutput={takeOutput}
+          registerOutputDrain={registerOutputDrain}
+          onInput={vi.fn()}
+          onResize={vi.fn()}
+          onCursorChange={vi.fn()}
+        />,
+      );
+
+      act(() => {
+        vi.advanceTimersByTime(animationFrameMs * 12);
+      });
+      const canvas = screen.getByTestId("terminal-pane").querySelector<HTMLCanvasElement>("canvas");
+      const terminalInput = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
+      expect(canvas).not.toBeNull();
+      expect(terminalInput).not.toBeNull();
+      const focusSpy = vi.spyOn(terminalInput!, "focus");
+
+      try {
+        terminalInput!.blur();
+        focusSpy.mockClear();
+        fireTouchPointer(canvas!, "pointerdown", {
+          pointerId: 32,
+          clientX: 20,
+          clientY: 5,
+        });
+        act(() => {
+          vi.advanceTimersByTime(700);
+        });
+        fireTouchPointer(canvas!, "pointermove", {
+          pointerId: 32,
+          clientX: 55,
+          clientY: 5,
+        });
+        fireTouchPointer(canvas!, "pointerup", {
+          pointerId: 32,
+          clientX: 55,
+          clientY: 5,
+        });
+        // 中文注释：移动浏览器会在 touch 后补发 mouse/click；这仍属于同一轮长按选择，
+        // 不能被解释成“用户点击输入”而弹出软键盘。
+        fireEvent.mouseDown(canvas!, { clientX: 55, clientY: 5, button: 0 });
+        fireEvent.click(canvas!, { clientX: 55, clientY: 5, button: 0 });
+
+        expect(focusSpy).not.toHaveBeenCalled();
+        expect(document.activeElement).not.toBe(terminalInput);
+
+        act(() => {
+          vi.advanceTimersByTime(900);
+        });
+        fireTouchPointer(canvas!, "pointerdown", {
+          pointerId: 33,
+          clientX: 20,
+          clientY: 5,
+        });
+        fireTouchPointer(canvas!, "pointerup", {
+          pointerId: 33,
+          clientX: 20,
+          clientY: 5,
+        });
+        fireEvent.click(canvas!, { clientX: 20, clientY: 5, button: 0 });
+
+        expect(focusSpy).toHaveBeenCalled();
+        expect(document.activeElement).toBe(terminalInput);
+      } finally {
+        focusSpy.mockRestore();
+      }
+    } finally {
+      rectSpy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("移动端选区提供显式复制按钮且不会弹出键盘", async () => {
+    vi.useFakeTimers();
+    const canvasRect = {
+      x: 0,
+      y: 0,
+      left: 0,
+      top: 0,
+      right: 800,
+      bottom: 240,
+      width: 800,
+      height: 240,
+      toJSON() {
+        return this;
+      },
+    } as DOMRect;
+    const rectSpy = vi.spyOn(HTMLCanvasElement.prototype, "getBoundingClientRect").mockReturnValue(canvasRect);
+    try {
+      const queue: TerminalOutputItem[] = [
+        { kind: "snapshot", bytes: new TextEncoder().encode("abcdefghi\nABCDEFGHI\n"), baseSeq: 0, size: DEFAULT_TERMINAL_SIZE },
+      ];
+      const takeOutput = vi.fn(() => queue.splice(0));
+      const registerOutputDrain = vi.fn((drain: () => void) => {
+        drain();
+        return () => undefined;
+      });
+      render(
+        <TerminalPane
+          attached
+          sessionSize={DEFAULT_TERMINAL_SIZE}
+          mobileInputMode
+          outputResetVersion={0}
+          takeOutput={takeOutput}
+          registerOutputDrain={registerOutputDrain}
+          onInput={vi.fn()}
+          onResize={vi.fn()}
+          onCursorChange={vi.fn()}
+        />,
+      );
+
+      act(() => {
+        vi.advanceTimersByTime(animationFrameMs * 12);
+      });
+      const canvas = screen.getByTestId("terminal-pane").querySelector<HTMLCanvasElement>("canvas");
+      const terminalInput = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
+      expect(canvas).not.toBeNull();
+      expect(terminalInput).not.toBeNull();
+      const focusSpy = vi.spyOn(terminalInput!, "focus");
+      const clipboardWriteTextMock = navigator.clipboard.writeText as unknown as ReturnType<typeof vi.fn>;
+
+      try {
+        terminalInput!.blur();
+        focusSpy.mockClear();
+        clipboardWriteTextMock.mockClear();
+        fireTouchPointer(canvas!, "pointerdown", {
+          pointerId: 34,
+          clientX: 20,
+          clientY: 5,
+        });
+        act(() => {
+          vi.advanceTimersByTime(700);
+        });
+        fireTouchPointer(canvas!, "pointermove", {
+          pointerId: 34,
+          clientX: 65,
+          clientY: 15,
+        });
+        fireTouchPointer(canvas!, "pointerup", {
+          pointerId: 34,
+          clientX: 65,
+          clientY: 15,
+        });
+
+        expect(terminalHost().dataset.termdSelection).toBe("cdefghi\nABCDEFG");
+        const copySelectionButton = screen.getByRole("button", { name: "Copy selection" });
+        clipboardWriteTextMock.mockClear();
+
+        fireEvent.pointerDown(copySelectionButton);
+        fireEvent.click(copySelectionButton);
+        await act(async () => {
+          await Promise.resolve();
+        });
+
+        expect(clipboardWriteTextMock).toHaveBeenCalledWith("cdefghi\nABCDEFG");
+        expect(focusSpy).not.toHaveBeenCalled();
+        expect(document.activeElement).not.toBe(terminalInput);
+      } finally {
+        focusSpy.mockRestore();
+      }
+    } finally {
+      rectSpy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
   it("没有 canvas 时点击 host 仍会命中 xterm 可见表面并聚焦隐藏 textarea", async () => {
     const surfaceRect = {
       x: 0,
@@ -5051,7 +5323,7 @@ describe("TerminalPane terminal sizing", () => {
     }
   });
 
-  it("移动端已查看历史时打开键盘会按真实光标所在绝对行居中", () => {
+  it("移动端光标在终端底部时打开键盘不会为了居中制造底部留白", () => {
     vi.useFakeTimers();
     const viewport = installMutableVisualViewport(820, 820, 0);
     try {
@@ -5141,11 +5413,10 @@ describe("TerminalPane terminal sizing", () => {
       });
       expect(onResize).not.toHaveBeenCalled();
       expect(terminal?.baseY()).toBeGreaterThan(8);
-      // 中文注释：键盘打开不改变 terminal.rows，但居中位置要按键盘上方可见高度算。
+      // 中文注释：键盘打开不改变 terminal.rows；这里光标位于 buffer 最底部，
+      // 外层 scrollport 只需要裁剪出最后一屏，不能再追加半屏底部留白把光标抬到中线。
       expect(terminal?.viewportY()).toBe(57);
-      // 中文注释：光标在 buffer 最底部时，xterm 已经不能继续把 viewportY 往下推；
-      // 此时必须滚动外层 scrollport，把完整 24 行终端网格裁剪到键盘上方的 12 行窗口中线。
-      expect(scrollport?.scrollTop).toBeGreaterThan(0);
+      expect(scrollport?.scrollTop).toBe(12 * 16);
     } finally {
       viewport.restore();
       vi.useRealTimers();
