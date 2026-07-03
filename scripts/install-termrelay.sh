@@ -20,6 +20,10 @@ STATE_DIR="/var/lib/termrelay"
 INSTALL_SET_LISTEN=0
 INSTALL_SET_WEB=0
 INSTALL_SET_AUTH_TOKEN=0
+INSTALL_SET_AUTH_TOKEN_FILE=0
+INSTALL_SET_DAEMON_REGISTRY=0
+INSTALL_SET_ALLOW_OPEN_RELAY=0
+INSTALL_SET_HTTP_TUNNEL=0
 INSTALL_SET_TLS_CERT=0
 INSTALL_SET_TLS_KEY=0
 ACTION="install"
@@ -61,6 +65,10 @@ Options:
   --listen <HOST:PORT>        Set TERMRELAY_LISTEN, for example 0.0.0.0:8080.
   --public                    Alias for --listen 0.0.0.0:8080.
   --auth-token <TOKEN>        Set relay transport auth token.
+  --auth-token-file <PATH>    Read relay transport auth token from a file.
+  --daemon-registry <PATH>    Set trusted daemon registry JSON path.
+  --allow-open-relay          Explicitly allow legacy/open relay mode without daemon registry.
+  --http-tunnel               Enable compatibility HTTP file tunnel paths.
   --tls-cert <PATH>           Set TLS certificate path.
   --tls-key <PATH>            Set TLS private key path.
   --uninstall                 Stop service and remove termrelay program files.
@@ -107,6 +115,28 @@ parse_args() {
         TERMRELAY_AUTH_TOKEN="$2"
         INSTALL_SET_AUTH_TOKEN=1
         shift 2
+        ;;
+      --auth-token-file)
+        [[ $# -ge 2 && -n "$2" ]] || die "--auth-token-file requires a non-empty value"
+        TERMRELAY_AUTH_TOKEN_FILE="$2"
+        INSTALL_SET_AUTH_TOKEN_FILE=1
+        shift 2
+        ;;
+      --daemon-registry)
+        [[ $# -ge 2 && -n "$2" ]] || die "--daemon-registry requires a non-empty value"
+        TERMRELAY_DAEMON_REGISTRY="$2"
+        INSTALL_SET_DAEMON_REGISTRY=1
+        shift 2
+        ;;
+      --allow-open-relay)
+        TERMRELAY_ALLOW_OPEN_RELAY=1
+        INSTALL_SET_ALLOW_OPEN_RELAY=1
+        shift
+        ;;
+      --http-tunnel)
+        TERMRELAY_HTTP_TUNNEL=1
+        INSTALL_SET_HTTP_TUNNEL=1
+        shift
         ;;
       --tls-cert)
         [[ $# -ge 2 && -n "$2" ]] || die "--tls-cert requires a non-empty value"
@@ -268,6 +298,33 @@ upsert_env_var() {
   rm -f "$tmp"
 }
 
+unset_env_var() {
+  local key="$1"
+  local tmp
+
+  tmp="$(mktemp)"
+  awk -v key="$key" '
+    $0 ~ "^[[:space:]]*" key "=" { next }
+    { print }
+  ' "$ENV_FILE" >"$tmp"
+  cat "$tmp" >"$ENV_FILE"
+  rm -f "$tmp"
+}
+
+write_service_secret_file() {
+  local path="$1"
+  local value="$2"
+  local old_umask
+
+  install -d -m 0755 "$ENV_DIR"
+  old_umask="$(umask)"
+  umask 077
+  printf '%s\n' "$value" >"$path"
+  umask "$old_umask"
+  chown root:"$SERVICE_NAME" "$path"
+  chmod 0640 "$path"
+}
+
 apply_env_overrides() {
   # 命令行参数只覆盖用户显式传入的项，避免重装时意外抹掉已有 systemd 配置。
   if [[ "$INSTALL_SET_LISTEN" -eq 1 ]]; then
@@ -277,7 +334,24 @@ apply_env_overrides() {
     upsert_env_var "TERMRELAY_WEB_ENABLED" "$TERMRELAY_WEB_ENABLED"
   fi
   if [[ "$INSTALL_SET_AUTH_TOKEN" -eq 1 ]]; then
-    upsert_env_var "TERMRELAY_AUTH_TOKEN" "$TERMRELAY_AUTH_TOKEN"
+    write_service_secret_file "/etc/termd/termrelay_auth_token" "$TERMRELAY_AUTH_TOKEN"
+    upsert_env_var "TERMRELAY_AUTH_TOKEN_FILE" "/etc/termd/termrelay_auth_token"
+    unset_env_var "TERMRELAY_AUTH_TOKEN"
+  fi
+  if [[ "$INSTALL_SET_AUTH_TOKEN_FILE" -eq 1 ]]; then
+    upsert_env_var "TERMRELAY_AUTH_TOKEN_FILE" "$TERMRELAY_AUTH_TOKEN_FILE"
+    unset_env_var "TERMRELAY_AUTH_TOKEN"
+  fi
+  if [[ "$INSTALL_SET_DAEMON_REGISTRY" -eq 1 ]]; then
+    upsert_env_var "TERMRELAY_DAEMON_REGISTRY" "$TERMRELAY_DAEMON_REGISTRY"
+    unset_env_var "TERMRELAY_ALLOW_OPEN_RELAY"
+  fi
+  if [[ "$INSTALL_SET_ALLOW_OPEN_RELAY" -eq 1 ]]; then
+    upsert_env_var "TERMRELAY_ALLOW_OPEN_RELAY" "$TERMRELAY_ALLOW_OPEN_RELAY"
+    unset_env_var "TERMRELAY_DAEMON_REGISTRY"
+  fi
+  if [[ "$INSTALL_SET_HTTP_TUNNEL" -eq 1 ]]; then
+    upsert_env_var "TERMRELAY_HTTP_TUNNEL" "$TERMRELAY_HTTP_TUNNEL"
   fi
   if [[ "$INSTALL_SET_TLS_CERT" -eq 1 ]]; then
     upsert_env_var "TERMRELAY_TLS_CERT" "$TERMRELAY_TLS_CERT"
@@ -299,6 +373,12 @@ write_env_file() {
     return 0
   fi
 
+  if [[ "$INSTALL_SET_AUTH_TOKEN" -eq 1 ]]; then
+    write_service_secret_file "/etc/termd/termrelay_auth_token" "$TERMRELAY_AUTH_TOKEN"
+    TERMRELAY_AUTH_TOKEN_FILE="/etc/termd/termrelay_auth_token"
+    TERMRELAY_AUTH_TOKEN=""
+  fi
+
   {
     printf '# 这个文件由安装脚本创建，systemd wrapper 会读取它。\n'
     printf '# 需要自定义监听、TLS、Web 或 relay auth 时，取消注释并修改对应变量。\n'
@@ -308,6 +388,26 @@ write_env_file() {
       printf 'TERMRELAY_AUTH_TOKEN=%q\n' "$TERMRELAY_AUTH_TOKEN"
     else
       printf '# TERMRELAY_AUTH_TOKEN=replace-me\n'
+    fi
+    if [[ -n "${TERMRELAY_AUTH_TOKEN_FILE:-}" ]]; then
+      printf 'TERMRELAY_AUTH_TOKEN_FILE=%q\n' "$TERMRELAY_AUTH_TOKEN_FILE"
+    else
+      printf '# TERMRELAY_AUTH_TOKEN_FILE=/run/secrets/termrelay_auth_token\n'
+    fi
+    if [[ -n "${TERMRELAY_DAEMON_REGISTRY:-}" ]]; then
+      printf 'TERMRELAY_DAEMON_REGISTRY=%q\n' "$TERMRELAY_DAEMON_REGISTRY"
+    else
+      printf '# TERMRELAY_DAEMON_REGISTRY=/etc/termd/termrelay-daemons.json\n'
+    fi
+    if [[ -n "${TERMRELAY_ALLOW_OPEN_RELAY:-}" ]]; then
+      printf 'TERMRELAY_ALLOW_OPEN_RELAY=%q\n' "$TERMRELAY_ALLOW_OPEN_RELAY"
+    else
+      printf '# TERMRELAY_ALLOW_OPEN_RELAY=1\n'
+    fi
+    if [[ -n "${TERMRELAY_HTTP_TUNNEL:-}" ]]; then
+      printf 'TERMRELAY_HTTP_TUNNEL=%q\n' "$TERMRELAY_HTTP_TUNNEL"
+    else
+      printf '# TERMRELAY_HTTP_TUNNEL=1\n'
     fi
     if [[ -n "${TERMRELAY_TLS_CERT:-}" ]]; then
       printf 'TERMRELAY_TLS_CERT=%q\n' "$TERMRELAY_TLS_CERT"
@@ -342,8 +442,31 @@ fi
 
 args=(--listen "${TERMRELAY_LISTEN:-127.0.0.1:8080}")
 
+if [[ -n "${TERMRELAY_AUTH_TOKEN:-}" && "${TERMRELAY_ALLOW_INLINE_TOKEN:-0}" != "1" ]]; then
+  printf '[termrelay-install] TERMRELAY_AUTH_TOKEN 会泄漏到 argv；请改用 TERMRELAY_AUTH_TOKEN_FILE。\n' >&2
+  exit 1
+fi
+
 if [[ -n "${TERMRELAY_AUTH_TOKEN:-}" ]]; then
   args+=(--auth-token "$TERMRELAY_AUTH_TOKEN")
+fi
+
+if [[ -n "${TERMRELAY_AUTH_TOKEN_FILE:-}" ]]; then
+  if [[ -n "${TERMRELAY_AUTH_TOKEN:-}" ]]; then
+    printf '[termrelay-install] TERMRELAY_AUTH_TOKEN 和 TERMRELAY_AUTH_TOKEN_FILE 只能配置一个。\n' >&2
+    exit 1
+  fi
+  args+=(--auth-token-file "$TERMRELAY_AUTH_TOKEN_FILE")
+fi
+
+if [[ -n "${TERMRELAY_DAEMON_REGISTRY:-}" ]]; then
+  args+=(--daemon-registry "$TERMRELAY_DAEMON_REGISTRY")
+elif [[ "${TERMRELAY_ALLOW_OPEN_RELAY:-0}" == "1" ]]; then
+  args+=(--allow-open-relay)
+fi
+
+if [[ "${TERMRELAY_HTTP_TUNNEL:-0}" == "1" ]]; then
+  args+=(--http-tunnel)
 fi
 
 if [[ -n "${TERMRELAY_TLS_CERT:-}" || -n "${TERMRELAY_TLS_KEY:-}" ]]; then

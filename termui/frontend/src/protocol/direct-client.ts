@@ -2,13 +2,8 @@ import {
   authPayloadForChallenge,
   signAuthPayload,
   signHttpE2eeAuthPayload,
+  signRelayAdmissionPayload,
 } from "./auth";
-import {
-  E2eeSession,
-  decodeBinaryEncryptedFrame,
-  encodeBinaryEncryptedFrame,
-  generateE2eeKeyPair,
-} from "./e2ee";
 import {
   decodeBinaryProtocolPacket,
   encodeBinaryProtocolPacket,
@@ -65,8 +60,6 @@ import type {
   DaemonStatusPayload,
   DaemonStatusResultPayload,
   DeviceState,
-  E2eeKeyExchangePayload,
-  EncryptedFramePayload,
   Envelope,
   ErrorPayload,
   HelloPayload,
@@ -150,6 +143,8 @@ interface DirectClientOptions {
   socketOpenHedgeDelayMs?: number;
   requestTimeoutMs?: number;
   expectedDaemonPublicKey?: PublicKeyWire;
+  pairingToken?: string;
+  trustedDevice?: Pick<DeviceState, "device_id" | "device_signing_key_secret">;
   webSocketFactory?: (url: string) => WebSocket;
   signal?: AbortSignal;
 }
@@ -175,7 +170,7 @@ interface QueuedInnerWaiter {
   reject: (error: Error) => void;
 }
 
-type DirectClientPhase = "connecting" | "e2ee_ready" | "authenticated" | "terminal_stream_open" | "closed";
+type DirectClientPhase = "connecting" | "ready" | "authenticated" | "terminal_stream_open" | "closed";
 
 const E2EE_READY_PACKET_METHODS = new Set(["pair.request", "auth", "auth.verify"]);
 
@@ -294,12 +289,10 @@ export { ProtocolClientError };
 export class DirectClient {
   private readonly timeoutMs: number;
   private readonly authTimeoutMs: number;
-  private e2ee: E2eeSession;
   private closed = false;
   private closedError: Error | undefined;
   private phase: DirectClientPhase = "connecting";
   private receivePumpStarted = false;
-  private e2eeTranscriptSha256?: string;
   private readonly pendingRequests = new Map<UUID, PendingRequest>();
   private readonly pendingInner: Envelope[] = [];
   private readonly innerWaiters: QueuedInnerWaiter[] = [];
@@ -321,15 +314,12 @@ export class DirectClient {
     private readonly socketUrl: string,
     private readonly serverIdValue: UUID,
     private readonly deviceId: UUID,
-    private readonly daemonE2eePublicKeyWire: PublicKeyWire,
-    e2ee: E2eeSession,
     options: Required<Pick<DirectClientOptions, "timeoutMs" | "requestTimeoutMs">>,
     private readonly binaryMode: boolean,
   ) {
-    this.e2ee = e2ee;
     this.authTimeoutMs = options.timeoutMs;
     this.timeoutMs = options.requestTimeoutMs;
-    this.phase = "e2ee_ready";
+    this.phase = "ready";
   }
 
   static async connect(
@@ -341,11 +331,21 @@ export class DirectClient {
     const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     const socketOpenTimeoutMs = options.socketOpenTimeoutMs ?? timeoutMs;
     const requestTimeoutMs = options.requestTimeoutMs ?? timeoutMs;
+    const relayAdmission = options.pairingToken
+      ? { kind: "pair_ticket" as const, token: options.pairingToken }
+      : options.trustedDevice
+        ? await signRelayAdmissionPayload({
+          device_id: options.trustedDevice.device_id,
+          nonce: nonce(),
+          timestamp_ms: nowMs(),
+        }, routeServerId, options.trustedDevice.device_signing_key_secret)
+        : undefined;
     const handshake = await performDirectHandshake(url, routeServerId, deviceId, {
       timeoutMs,
       socketOpenTimeoutMs,
       socketOpenHedgeDelayMs: options.socketOpenHedgeDelayMs,
       expectedDaemonPublicKey: options.expectedDaemonPublicKey,
+      relayAdmission,
       webSocketFactory: options.webSocketFactory,
       signal: options.signal,
       createInbox: (socket) => new SocketInbox(socket, { serverId: routeServerId, deviceId }),
@@ -356,12 +356,9 @@ export class DirectClient {
       url,
       routeServerId,
       deviceId,
-      handshake.daemonE2eePublicKeyWire,
-      handshake.e2ee,
       { timeoutMs, requestTimeoutMs },
       handshake.binaryMode,
     );
-    client.e2eeTranscriptSha256 = handshake.e2eeTranscriptSha256;
     client.startReceivePump();
     return client;
   }
@@ -419,7 +416,6 @@ export class DirectClient {
       authPayloadForChallenge(device.device_id, challenge.challenge),
       server,
       device.device_signing_key_secret,
-      this.e2eeTranscriptSha256,
     );
     await this.request("auth.verify", auth, this.authTimeoutMs);
     this.phase = "authenticated";
@@ -1056,14 +1052,13 @@ export class DirectClient {
       size_bytes: file.size,
       offset_bytes: offset,
     } satisfies SessionFileHttpUploadStreamPayload));
-    const uploadBody = buildHttpUploadChunkBody(streamContext.e2ee, metaFrame, chunk);
+    const uploadBody = buildHttpUploadChunkBody(metaFrame, chunk);
     options.onSentProgress?.(end, file.size);
     const progressFrames = await this.httpE2eeFetch(
       "POST",
       "/api/files/upload",
       streamContext.headers,
       uploadBody,
-      streamContext.e2ee,
       { timeoutMs: options.timeoutMs, signal: options.signal },
     );
     return parseHttpJsonFrame<SessionFileUploadProgressPayload>(progressFrames[0]);
@@ -1086,8 +1081,7 @@ export class DirectClient {
       "POST",
       "/api/files/upload/abort",
       streamContext.headers,
-      bodyToArrayBuffer(encodeHttpE2eeFrames(streamContext.e2ee, [metaFrame])),
-      streamContext.e2ee,
+      bodyToArrayBuffer(encodeHttpE2eeFrames([metaFrame])),
       { collectFrames: true, timeoutMs: HTTP_UPLOAD_ABORT_TIMEOUT_MS },
     );
   }
@@ -1111,14 +1105,13 @@ export class DirectClient {
       "POST",
       "/api/files/download",
       context.headers,
-      bodyToArrayBuffer(encodeHttpE2eeFrames(context.e2ee, [
+      bodyToArrayBuffer(encodeHttpE2eeFrames([
         encodeUtf8(JSON.stringify({
           session_id: sessionId,
           path,
           offset_bytes: 0,
         } satisfies SessionFileHttpDownloadPayload)),
       ])),
-      context.e2ee,
       {
         // 中文注释：HTTP 下载的文件体可以很长，不能设置整体超时；
         // 但元数据首帧应快速返回，否则 UI 会一直停在“开始下载”状态。
@@ -1171,8 +1164,7 @@ export class DirectClient {
       method,
       path,
       context.headers,
-      bodyToArrayBuffer(encodeHttpE2eeFrames(context.e2ee, plaintextFrames)),
-      context.e2ee,
+      bodyToArrayBuffer(encodeHttpE2eeFrames(plaintextFrames)),
       { timeoutMs },
     );
   }
@@ -1180,24 +1172,17 @@ export class DirectClient {
   private async createHttpE2eeContext(
     method: "POST",
     path: string,
-  ): Promise<{ e2ee: E2eeSession; headers: Record<string, string> }> {
+  ): Promise<{ headers: Record<string, string> }> {
     const device = this.authenticatedDevice;
     const server = this.authenticatedServer;
     if (!device || !server) {
       throw new HttpFileTransferUnsupported();
     }
     const requestPath = this.httpRequestPath(path);
-    const keypair = generateE2eeKeyPair();
-    const e2ee = E2eeSession.device({
-      serverId: this.serverIdValue,
-      deviceId: this.deviceId,
-      localKeypair: keypair,
-      daemonPublicKeyWire: this.daemonE2eePublicKeyWire,
-    });
     const auth = await signHttpE2eeAuthPayload(
       {
         device_id: device.device_id,
-        e2ee_public_key: keypair.publicKeyWire,
+        e2ee_public_key: device.device_public_key,
         nonce: nonce(),
         timestamp_ms: nowMs(),
         method,
@@ -1206,8 +1191,12 @@ export class DirectClient {
       server,
       device.device_signing_key_secret,
     );
+    const relayAdmission = await signRelayAdmissionPayload({
+      device_id: device.device_id,
+      nonce: nonce(),
+      timestamp_ms: nowMs(),
+    }, this.serverIdValue, device.device_signing_key_secret);
     return {
-      e2ee,
       headers: {
         "content-type": "application/octet-stream",
         "x-termd-server-id": this.serverIdValue,
@@ -1216,6 +1205,7 @@ export class DirectClient {
         "x-termd-e2ee-nonce": auth.nonce,
         "x-termd-e2ee-timestamp-ms": String(auth.timestamp_ms),
         "x-termd-e2ee-signature": auth.signature,
+        "x-termd-relay-admission": JSON.stringify(relayAdmission),
       },
     };
   }
@@ -1225,7 +1215,6 @@ export class DirectClient {
     path: string,
     headers: Record<string, string>,
     body: BodyInit,
-    e2ee: E2eeSession,
     options: HttpE2eeFetchOptions = {},
   ): Promise<Uint8Array[]> {
     const controller = new AbortController();
@@ -1287,18 +1276,18 @@ export class DirectClient {
         throw new HttpFileTransferUnsupported();
       }
       if (!response.ok) {
-        const payload = await decodeHttpE2eeErrorResponse(response, e2ee);
+        const payload = await decodeHttpE2eeErrorResponse(response);
         throw protocolError(payload);
       }
       if (response.body) {
-        return await decodeHttpE2eeReadable(e2ee, response.body, onFrame, collectFrames, () => controller.abort());
+        return await decodeHttpE2eeReadable(response.body, onFrame, collectFrames, () => controller.abort());
       }
       if (!collectFrames) {
         // 中文注释：文件下载必须通过 ReadableStream 边解密边写入；没有 response.body 时
         // 退回 arrayBuffer 会把整个文件密文和明文都攒进内存。
         throw new HttpFileTransferUnsupported();
       }
-      const frames = decodeHttpE2eeFrames(e2ee, new Uint8Array(await response.arrayBuffer()));
+      const frames = decodeHttpE2eeFrames(new Uint8Array(await response.arrayBuffer()));
       for (const frame of frames) {
         await onFrame?.(frame);
       }
@@ -1545,8 +1534,7 @@ export class DirectClient {
           "POST",
           route.path,
           headers,
-          bodyToArrayBuffer(encodeHttpE2eeFrames(context.e2ee, [encodeUtf8(JSON.stringify(payload ?? {}))])),
-          context.e2ee,
+          bodyToArrayBuffer(encodeHttpE2eeFrames([encodeUtf8(JSON.stringify(payload ?? {}))])),
           { timeoutMs, signal },
         );
       } catch (error) {
@@ -1887,13 +1875,17 @@ export class DirectClient {
           this.dispatchBinaryWire(message.binary);
         } else {
           const outer = expectQueuedEnvelope(message);
-          if (outer.type === "encrypted_frame") {
-            const inner = this.e2ee.decryptJson(outer.payload as EncryptedFramePayload);
-            this.dispatchInner(inner);
+          if (outer.type === "packet") {
+            this.dispatchPacket(outer.payload as ProtocolPacket);
           } else if (outer.type === "error") {
             throw protocolError(outer.payload as ErrorPayload);
+          } else if (outer.type === "hello" || outer.type === "route_ready") {
+            // 中文注释：连接建立期消息由 handshake 消费；如果 race 进入 receive pump，忽略即可。
+            continue;
+          } else if (outer.type === "auth_challenge") {
+            this.dispatchInner(outer);
           } else {
-            throw new ProtocolClientError("unexpected_message", "unexpected outer message");
+            this.dispatchInner(outer);
           }
         }
         if (
@@ -2107,13 +2099,18 @@ export class DirectClient {
     }
 
     const payload = packet.payload as SessionFileTransferChunkPayload;
-    if (payload.session_id !== stream.sessionId || !(payload.data_bytes instanceof Uint8Array)) {
+    const payloadBytes = payload.data_bytes instanceof Uint8Array
+      ? payload.data_bytes
+      : "data_base64" in payload && typeof (payload as { data_base64?: unknown }).data_base64 === "string"
+        ? base64ToBytes((payload as { data_base64: string }).data_base64)
+        : undefined;
+    if (payload.session_id !== stream.sessionId || !(payloadBytes instanceof Uint8Array)) {
       throw new ProtocolClientError("invalid_file_transfer", "file download chunk is invalid");
     }
     const chunk: FileDownloadChunk = {
       session_id: payload.session_id,
       offset_bytes: payload.offset_bytes,
-      data_bytes: payload.data_bytes,
+      data_bytes: payloadBytes,
       size_bytes: payload.size_bytes,
       eof: payload.eof,
     };
@@ -2126,8 +2123,14 @@ export class DirectClient {
   }
 
   private enqueueAttachFrame(payload: AttachFramePayload, streamId: PacketStreamId, transportSeq: number): void {
+    // 中文注释：明文 JSON packet 会把 Uint8Array 序列化成普通对象；wire 里保留
+    // data_base64，入队前统一还原成真实 bytes，后续终端解码逻辑才不分传输模式。
+    const dataBytes = payload.data_bytes instanceof Uint8Array
+      ? payload.data_bytes
+      : base64ToBytes(payload.data_base64 ?? "");
     this.enqueueInner(envelope("attach_frame", {
       ...payload,
+      data_bytes: dataBytes,
       stream_id: streamId,
       transport_seq: transportSeq,
     } satisfies AttachFramePayload));
@@ -2302,7 +2305,7 @@ export class DirectClient {
 
   private requireE2eeReady(): void {
     this.requireOpen();
-    if (this.phase !== "e2ee_ready") {
+    if (this.phase !== "ready") {
       throw new ProtocolClientError("invalid_state", "client is not ready for pairing or authentication");
     }
   }
@@ -2535,18 +2538,14 @@ export class DirectClient {
   }
 
   private sendInner(inner: Envelope): void {
-    const frame = this.e2ee.encryptJson(inner);
-    this.sendOuter(envelope("encrypted_frame", frame));
+    this.sendOuter(inner);
   }
 
   private sendBinaryPacket(
     packet: ProtocolPacket,
     encodingOptions?: import("./packet-codec").ProtocolPacketBinaryEncodingOptions,
   ): void {
-    const frame = this.e2ee.encryptBinary(
-      encodeBinaryProtocolPacket(protocolPacketToBinary(packet, encodingOptions)),
-    );
-    this.sendBinaryOuter(encodeBinaryEncryptedFrame(frame));
+    this.sendBinaryOuter(encodeBinaryProtocolPacket(protocolPacketToBinary(packet, encodingOptions)));
   }
 
   private sendOuter(message: Envelope): void {
@@ -2564,8 +2563,7 @@ export class DirectClient {
   }
 
   private dispatchBinaryWire(bytes: Uint8Array): void {
-    const frame = decodeBinaryEncryptedFrame(bytes);
-    const packet = binaryPacketToProtocol(decodeBinaryProtocolPacket(this.e2ee.decryptBinary(frame)));
+    const packet = binaryPacketToProtocol(decodeBinaryProtocolPacket(bytes));
     this.dispatchPacket(packet);
   }
 }

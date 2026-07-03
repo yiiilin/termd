@@ -49,6 +49,7 @@ impl RelayProcess {
         let addr = unused_listen_addr();
         let mut command = Command::new(env!("CARGO_BIN_EXE_termrelay"));
         command.args(["--listen", &addr.to_string()]);
+        command.arg("--allow-open-relay");
         if let Some(auth_token) = auth_token {
             command.args(["--auth-token", auth_token]);
         }
@@ -838,6 +839,7 @@ async fn send_route_hello_with_data(
             role,
             protocol_version: ProtocolVersion::default(),
             nonce: Nonce(format!("route-nonce-{}", Uuid::new_v4())),
+            admission: None,
             route_generation,
             client_id,
             data_token,

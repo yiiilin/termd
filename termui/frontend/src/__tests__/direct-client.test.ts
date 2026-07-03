@@ -6,7 +6,6 @@ import {
   httpE2eeSigningInputBytes,
   verifyEd25519Signature,
 } from "../protocol/auth";
-import { E2eeSession, decodeBinaryEncryptedFrame, encodeBinaryEncryptedFrame, type E2eeKeyPair } from "../protocol/e2ee";
 import { decodeSupervisorTerminalServerFrame } from "../protocol/supervisor-terminal";
 import { PROTOCOL_PACKET_VERSION } from "../protocol/types";
 import type {
@@ -57,10 +56,16 @@ describe("DirectClient", () => {
     await daemon.stop();
   });
 
-  function connectDevice(deviceId: string, timeoutMs = 3000, url = daemon.url): Promise<DirectClient> {
+  function connectDevice(
+    deviceId: string,
+    timeoutMs = 3000,
+    url = daemon.url,
+    options: Partial<Parameters<typeof DirectClient.connect>[3]> = {},
+  ): Promise<DirectClient> {
     return DirectClient.connect(url, daemon.serverId, deviceId, {
       timeoutMs,
       expectedDaemonPublicKey: daemon.daemonPublicKey,
+      ...options,
     });
   }
 
@@ -123,41 +128,32 @@ describe("DirectClient", () => {
     }
   }
 
-  function httpE2eeSessionFromHeaders(headers: Headers): E2eeSession {
+  function httpPlainAuthFromHeaders(headers: Headers): void {
     const deviceId = headers.get("x-termd-device-id");
     const devicePublicKey = headers.get("x-termd-e2ee-public-key");
     if (!deviceId || !devicePublicKey) {
-      throw new Error("missing HTTP E2EE test headers");
+      throw new Error("missing HTTP auth test headers");
     }
-    const daemonKeypair = (daemon as unknown as { e2eeKeypair: E2eeKeyPair }).e2eeKeypair;
-    return E2eeSession.daemon({
-      serverId: daemon.serverId,
-      deviceId,
-      localKeypair: daemonKeypair,
-      devicePublicKeyWire: devicePublicKey as PublicKeyWire,
-    });
   }
 
-  function encodeHttpE2eeTestFrames(e2ee: E2eeSession, frames: Uint8Array[]): Uint8Array {
+  function encodeHttpPlainTestFrames(frames: Uint8Array[]): Uint8Array {
     return concatBytes(
       ...frames.map((frame) => {
-        const encrypted = encodeBinaryEncryptedFrame(e2ee.encryptBinary(frame));
-        const wire = new Uint8Array(4 + encrypted.byteLength);
-        new DataView(wire.buffer, wire.byteOffset, 4).setUint32(0, encrypted.byteLength, false);
-        wire.set(encrypted, 4);
+        const wire = new Uint8Array(4 + frame.byteLength);
+        new DataView(wire.buffer, wire.byteOffset, 4).setUint32(0, frame.byteLength, false);
+        wire.set(frame, 4);
         return wire;
       }),
     );
   }
 
-  function decodeHttpE2eeTestFrames(e2ee: E2eeSession, wire: Uint8Array): Uint8Array[] {
+  function decodeHttpPlainTestFrames(wire: Uint8Array): Uint8Array[] {
     const frames: Uint8Array[] = [];
     let offset = 0;
     while (offset < wire.byteLength) {
       const len = new DataView(wire.buffer, wire.byteOffset + offset, 4).getUint32(0, false);
       offset += 4;
-      const encrypted = decodeBinaryEncryptedFrame(wire.slice(offset, offset + len));
-      frames.push(e2ee.decryptBinary(encrypted));
+      frames.push(wire.slice(offset, offset + len));
       offset += len;
     }
     return frames;
@@ -212,7 +208,7 @@ describe("DirectClient", () => {
     return Math.floor(offsetBytes / (10 * 1024 * 1024));
   }
 
-  it("连接后第一帧发送 route_hello，然后才进入 hello/E2EE 握手", async () => {
+  it("连接后第一帧发送 route_hello，然后才进入 hello 握手", async () => {
     const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000306");
     const client = await connectDevice(device.device_id);
     client.close();
@@ -230,6 +226,49 @@ describe("DirectClient", () => {
       },
     });
     expect(firstOuter.payload.nonce).toMatch(/^nonce-/);
+  });
+
+  it("pairing 连接会在 route_hello 携带 pair_ticket admission", async () => {
+    const device = await generateDeviceIdentity("00000000-0000-0000-0000-0000000003a6");
+    const client = await connectDevice(device.device_id, 3000, daemon.url, {
+      pairingToken: "secret-token",
+    });
+    client.close();
+
+    const firstOuter = JSON.parse(daemon.outerWireLog[0]) as {
+      type: string;
+      payload: { admission?: { kind: string; token?: string } };
+    };
+    expect(firstOuter.payload.admission).toEqual({
+      kind: "pair_ticket",
+      token: "secret-token",
+    });
+  });
+
+  it("已配对连接会在 route_hello 携带 device admission", async () => {
+    const device = await generateDeviceIdentity("00000000-0000-0000-0000-0000000003a7");
+    const client = await connectDevice(device.device_id, 3000, daemon.url, {
+      trustedDevice: device,
+    });
+    client.close();
+
+    const firstOuter = JSON.parse(daemon.outerWireLog[0]) as {
+      payload: {
+        admission?: {
+          kind: string;
+          device_id?: string;
+          nonce?: string;
+          timestamp_ms?: number;
+          signature?: string;
+        };
+      };
+    };
+    expect(firstOuter.payload.admission).toMatchObject({
+      kind: "device",
+      device_id: device.device_id,
+    });
+    expect(firstOuter.payload.admission?.nonce).toMatch(/^nonce-/);
+    expect(firstOuter.payload.admission?.signature).toMatch(/^ed25519-v1:/);
   });
 
   it("连接阶段会校验 daemon E2EE key_exchange 的签名和 packet_version", async () => {
@@ -1671,7 +1710,7 @@ describe("DirectClient", () => {
     (globalThis as unknown as { fetch: typeof fetch }).fetch = (async (input, init) => {
       const url = new URL(input instanceof Request ? input.url : String(input));
       const headers = new Headers(init?.headers);
-      const e2ee = httpE2eeSessionFromHeaders(headers);
+      httpPlainAuthFromHeaders(headers);
       if (url.pathname.endsWith("/api/files/upload/init")) {
         const ready = {
           session_id: sessionId,
@@ -1680,7 +1719,7 @@ describe("DirectClient", () => {
           size_bytes: file.size,
           offset_bytes: 0,
         } satisfies SessionFileHttpUploadReadyPayload;
-        return new Response(responseBodyBytes(encodeHttpE2eeTestFrames(e2ee, [encodeUtf8(JSON.stringify(ready))])));
+        return new Response(responseBodyBytes(encodeHttpPlainTestFrames([encodeUtf8(JSON.stringify(ready))])));
       }
       if (url.pathname.endsWith("/api/files/upload")) {
         uploadBodyBytes = (await requestBodyBytes(init?.body)).byteLength;
@@ -1695,7 +1734,7 @@ describe("DirectClient", () => {
           eof: true,
           modified_at_ms: null,
         } satisfies SessionFileUploadProgressPayload;
-        return new Response(responseBodyBytes(encodeHttpE2eeTestFrames(e2ee, [encodeUtf8(JSON.stringify(committed))])));
+        return new Response(responseBodyBytes(encodeHttpPlainTestFrames([encodeUtf8(JSON.stringify(committed))])));
       }
       return new Response(JSON.stringify({ code: "not_found", message: "not found" }), { status: 404 });
     }) as typeof fetch;
@@ -1749,7 +1788,7 @@ describe("DirectClient", () => {
     (globalThis as unknown as { fetch: typeof fetch }).fetch = (async (input, init) => {
       const url = new URL(input instanceof Request ? input.url : String(input));
       const headers = new Headers(init?.headers);
-      const e2ee = httpE2eeSessionFromHeaders(headers);
+      httpPlainAuthFromHeaders(headers);
       if (url.pathname.endsWith("/api/files/upload/init")) {
         const ready = {
           session_id: sessionId,
@@ -1758,14 +1797,14 @@ describe("DirectClient", () => {
           size_bytes: fileSize,
           offset_bytes: 0,
         } satisfies SessionFileHttpUploadReadyPayload;
-        return new Response(responseBodyBytes(encodeHttpE2eeTestFrames(e2ee, [encodeUtf8(JSON.stringify(ready))])));
+        return new Response(responseBodyBytes(encodeHttpPlainTestFrames([encodeUtf8(JSON.stringify(ready))])));
       }
       if (url.pathname.endsWith("/api/files/upload")) {
         uploadCalls += 1;
         activeUploads += 1;
         maxActiveUploads = Math.max(maxActiveUploads, activeUploads);
         const wire = await requestBodyBytes(init?.body);
-        const frames = decodeHttpE2eeTestFrames(e2ee, wire);
+        const frames = decodeHttpPlainTestFrames(wire);
         const meta = JSON.parse(new TextDecoder().decode(frames[0])) as SessionFileHttpUploadStreamPayload;
         expect(meta).toMatchObject({
           session_id: sessionId,
@@ -1800,7 +1839,7 @@ describe("DirectClient", () => {
           eof: receivedBytes === fileSize,
           modified_at_ms: receivedBytes === fileSize ? null : undefined,
         } satisfies SessionFileUploadProgressPayload;
-        return new Response(responseBodyBytes(encodeHttpE2eeTestFrames(e2ee, [encodeUtf8(JSON.stringify(committed))])));
+        return new Response(responseBodyBytes(encodeHttpPlainTestFrames([encodeUtf8(JSON.stringify(committed))])));
       }
       return originalFetch(input, init);
     }) as typeof fetch;
@@ -1843,7 +1882,7 @@ describe("DirectClient", () => {
     (globalThis as unknown as { fetch: typeof fetch }).fetch = (async (input, init) => {
       const url = new URL(input instanceof Request ? input.url : String(input));
       const headers = new Headers(init?.headers);
-      const e2ee = httpE2eeSessionFromHeaders(headers);
+      httpPlainAuthFromHeaders(headers);
       if (url.pathname.endsWith("/api/files/upload/init")) {
         const ready = {
           session_id: sessionId,
@@ -1852,13 +1891,13 @@ describe("DirectClient", () => {
           size_bytes: file.size,
           offset_bytes: 0,
         } satisfies SessionFileHttpUploadReadyPayload;
-        return new Response(responseBodyBytes(encodeHttpE2eeTestFrames(e2ee, [encodeUtf8(JSON.stringify(ready))])));
+        return new Response(responseBodyBytes(encodeHttpPlainTestFrames([encodeUtf8(JSON.stringify(ready))])));
       }
       if (url.pathname.endsWith("/api/files/upload")) {
         const wire = await requestBodyBytes(init?.body);
         const lengths = httpE2eeRawFrameLengths(wire);
         expect(lengths.every((len) => len <= 2 * 1024 * 1024)).toBe(true);
-        const frames = decodeHttpE2eeTestFrames(e2ee, wire);
+        const frames = decodeHttpPlainTestFrames(wire);
         const uploaded = concatBytes(...frames.slice(1));
         expect(uploaded.byteLength).toBe(file.size);
         expect(uploaded[0]).toBe(7);
@@ -1872,7 +1911,7 @@ describe("DirectClient", () => {
           eof: true,
           modified_at_ms: null,
         } satisfies SessionFileUploadProgressPayload;
-        return new Response(responseBodyBytes(encodeHttpE2eeTestFrames(e2ee, [encodeUtf8(JSON.stringify(committed))])));
+        return new Response(responseBodyBytes(encodeHttpPlainTestFrames([encodeUtf8(JSON.stringify(committed))])));
       }
       return originalFetch(input, init);
     }) as typeof fetch;
@@ -1914,7 +1953,7 @@ describe("DirectClient", () => {
     (globalThis as unknown as { fetch: typeof fetch }).fetch = (async (input, init) => {
       const url = new URL(input instanceof Request ? input.url : String(input));
       const headers = new Headers(init?.headers);
-      const e2ee = httpE2eeSessionFromHeaders(headers);
+      httpPlainAuthFromHeaders(headers);
       if (url.pathname.endsWith("/api/files/upload/init")) {
         const ready = {
           session_id: sessionId,
@@ -1923,10 +1962,10 @@ describe("DirectClient", () => {
           size_bytes: fileSize,
           offset_bytes: 0,
         } satisfies SessionFileHttpUploadReadyPayload;
-        return new Response(responseBodyBytes(encodeHttpE2eeTestFrames(e2ee, [encodeUtf8(JSON.stringify(ready))])));
+        return new Response(responseBodyBytes(encodeHttpPlainTestFrames([encodeUtf8(JSON.stringify(ready))])));
       }
       if (url.pathname.endsWith("/api/files/upload")) {
-        const frames = decodeHttpE2eeTestFrames(e2ee, await requestBodyBytes(init?.body));
+        const frames = decodeHttpPlainTestFrames(await requestBodyBytes(init?.body));
         const meta = JSON.parse(new TextDecoder().decode(frames[0])) as SessionFileHttpUploadStreamPayload;
         if (meta.offset_bytes === 0) {
           await new Promise((resolve) => setTimeout(resolve, 40));
@@ -1939,7 +1978,7 @@ describe("DirectClient", () => {
           eof: meta.offset_bytes !== 0,
           modified_at_ms: meta.offset_bytes !== 0 ? null : undefined,
         } satisfies SessionFileUploadProgressPayload;
-        return new Response(responseBodyBytes(encodeHttpE2eeTestFrames(e2ee, [encodeUtf8(JSON.stringify(committed))])));
+        return new Response(responseBodyBytes(encodeHttpPlainTestFrames([encodeUtf8(JSON.stringify(committed))])));
       }
       return originalFetch(input, init);
     }) as typeof fetch;
@@ -1985,7 +2024,7 @@ describe("DirectClient", () => {
       const url = new URL(input instanceof Request ? input.url : String(input));
       paths.push(url.pathname);
       const headers = new Headers(init?.headers);
-      const e2ee = httpE2eeSessionFromHeaders(headers);
+      httpPlainAuthFromHeaders(headers);
       if (url.pathname.endsWith("/api/files/upload/init")) {
         const ready = {
           session_id: sessionId,
@@ -1994,10 +2033,10 @@ describe("DirectClient", () => {
           size_bytes: fileSize,
           offset_bytes: 0,
         } satisfies SessionFileHttpUploadReadyPayload;
-        return new Response(responseBodyBytes(encodeHttpE2eeTestFrames(e2ee, [encodeUtf8(JSON.stringify(ready))])));
+        return new Response(responseBodyBytes(encodeHttpPlainTestFrames([encodeUtf8(JSON.stringify(ready))])));
       }
       if (url.pathname.endsWith("/api/files/upload")) {
-        const frames = decodeHttpE2eeTestFrames(e2ee, await requestBodyBytes(init?.body));
+        const frames = decodeHttpPlainTestFrames(await requestBodyBytes(init?.body));
         const meta = JSON.parse(new TextDecoder().decode(frames[0])) as SessionFileHttpUploadStreamPayload;
         if (meta.offset_bytes === 0) {
           await new Promise((resolve) => setTimeout(resolve, 30));
@@ -2011,7 +2050,7 @@ describe("DirectClient", () => {
           eof: true,
           modified_at_ms: null,
         } satisfies SessionFileUploadProgressPayload;
-        return new Response(responseBodyBytes(encodeHttpE2eeTestFrames(e2ee, [encodeUtf8(JSON.stringify(committed))])));
+        return new Response(responseBodyBytes(encodeHttpPlainTestFrames([encodeUtf8(JSON.stringify(committed))])));
       }
       return originalFetch(input, init);
     }) as typeof fetch;
@@ -2051,7 +2090,7 @@ describe("DirectClient", () => {
       const url = new URL(input instanceof Request ? input.url : String(input));
       paths.push(url.pathname);
       const headers = new Headers(init?.headers);
-      const e2ee = httpE2eeSessionFromHeaders(headers);
+      httpPlainAuthFromHeaders(headers);
       if (url.pathname.endsWith("/api/files/upload/init")) {
         const ready = {
           session_id: sessionId,
@@ -2060,10 +2099,10 @@ describe("DirectClient", () => {
           size_bytes: file.size,
           offset_bytes: 0,
         } satisfies SessionFileHttpUploadReadyPayload;
-        return new Response(responseBodyBytes(encodeHttpE2eeTestFrames(e2ee, [encodeUtf8(JSON.stringify(ready))])));
+        return new Response(responseBodyBytes(encodeHttpPlainTestFrames([encodeUtf8(JSON.stringify(ready))])));
       }
       if (url.pathname.endsWith("/api/files/upload/abort")) {
-        return new Response(responseBodyBytes(encodeHttpE2eeTestFrames(e2ee, [encodeUtf8(JSON.stringify({ ok: true }))])));
+        return new Response(responseBodyBytes(encodeHttpPlainTestFrames([encodeUtf8(JSON.stringify({ ok: true }))])));
       }
       if (url.pathname.endsWith("/api/files/upload")) {
         const committed = {
@@ -2074,7 +2113,7 @@ describe("DirectClient", () => {
           eof: false,
           modified_at_ms: undefined,
         } satisfies SessionFileUploadProgressPayload;
-        return new Response(responseBodyBytes(encodeHttpE2eeTestFrames(e2ee, [encodeUtf8(JSON.stringify(committed))])));
+        return new Response(responseBodyBytes(encodeHttpPlainTestFrames([encodeUtf8(JSON.stringify(committed))])));
       }
       return originalFetch(input, init);
     }) as typeof fetch;
@@ -2116,7 +2155,7 @@ describe("DirectClient", () => {
       const url = new URL(input instanceof Request ? input.url : String(input));
       paths.push(url.pathname);
       const headers = new Headers(init?.headers);
-      const e2ee = httpE2eeSessionFromHeaders(headers);
+      httpPlainAuthFromHeaders(headers);
       if (url.pathname.endsWith("/api/files/upload/init")) {
         const ready = {
           session_id: sessionId,
@@ -2125,10 +2164,10 @@ describe("DirectClient", () => {
           size_bytes: file.size,
           offset_bytes: 0,
         } satisfies SessionFileHttpUploadReadyPayload;
-        return new Response(responseBodyBytes(encodeHttpE2eeTestFrames(e2ee, [encodeUtf8(JSON.stringify(ready))])));
+        return new Response(responseBodyBytes(encodeHttpPlainTestFrames([encodeUtf8(JSON.stringify(ready))])));
       }
       if (url.pathname.endsWith("/api/files/upload/abort")) {
-        return new Response(responseBodyBytes(encodeHttpE2eeTestFrames(e2ee, [encodeUtf8(JSON.stringify({ ok: true }))])));
+        return new Response(responseBodyBytes(encodeHttpPlainTestFrames([encodeUtf8(JSON.stringify({ ok: true }))])));
       }
       throw new TypeError("ReadableStream request body is not supported");
     }) as typeof fetch;
@@ -2315,7 +2354,7 @@ describe("DirectClient", () => {
     (globalThis as unknown as { fetch: typeof fetch }).fetch = (async (input, init) => {
       const url = new URL(input instanceof Request ? input.url : String(input));
       const headers = new Headers(init?.headers);
-      const e2ee = httpE2eeSessionFromHeaders(headers);
+      httpPlainAuthFromHeaders(headers);
       if (url.pathname.endsWith("/api/files/upload/init")) {
         const ready = {
           session_id: sessionId,
@@ -2324,7 +2363,7 @@ describe("DirectClient", () => {
           size_bytes: file.size,
           offset_bytes: 0,
         } satisfies SessionFileHttpUploadReadyPayload;
-        return new Response(responseBodyBytes(encodeHttpE2eeTestFrames(e2ee, [encodeUtf8(JSON.stringify(ready))])));
+        return new Response(responseBodyBytes(encodeHttpPlainTestFrames([encodeUtf8(JSON.stringify(ready))])));
       }
       throw new TypeError("Failed to fetch");
     }) as typeof fetch;
@@ -2359,7 +2398,7 @@ describe("DirectClient", () => {
     (globalThis as unknown as { fetch: typeof fetch }).fetch = (async (input, init) => {
       const url = new URL(input instanceof Request ? input.url : String(input));
       const headers = new Headers(init?.headers);
-      const e2ee = httpE2eeSessionFromHeaders(headers);
+      httpPlainAuthFromHeaders(headers);
       if (url.pathname.endsWith("/api/files/upload/init")) {
         const ready = {
           session_id: sessionId,
@@ -2368,7 +2407,7 @@ describe("DirectClient", () => {
           size_bytes: file.size,
           offset_bytes: 0,
         } satisfies SessionFileHttpUploadReadyPayload;
-        return new Response(responseBodyBytes(encodeHttpE2eeTestFrames(e2ee, [encodeUtf8(JSON.stringify(ready))])));
+        return new Response(responseBodyBytes(encodeHttpPlainTestFrames([encodeUtf8(JSON.stringify(ready))])));
       }
       return new Response(null, { status: 426 });
     }) as typeof fetch;
@@ -2492,8 +2531,8 @@ describe("DirectClient", () => {
     const setTimeoutDelays: number[] = [];
     (globalThis as unknown as { fetch: typeof fetch }).fetch = (async (_input, init) => {
       const headers = new Headers(init?.headers);
-      const e2ee = httpE2eeSessionFromHeaders(headers);
-      return new Response(responseBodyBytes(encodeHttpE2eeTestFrames(e2ee, [
+      httpPlainAuthFromHeaders(headers);
+      return new Response(responseBodyBytes(encodeHttpPlainTestFrames([
         encodeUtf8(JSON.stringify({ code: "invalid_file_transfer", message: "bad request" })),
       ])), {
         status: 400,
@@ -2573,7 +2612,7 @@ describe("DirectClient", () => {
     const arrayBuffer = vi.fn<() => Promise<ArrayBuffer>>();
     (globalThis as unknown as { fetch: typeof fetch }).fetch = (async (_input, init) => {
       const headers = new Headers(init?.headers);
-      const e2ee = httpE2eeSessionFromHeaders(headers);
+      httpPlainAuthFromHeaders(headers);
       const ready = {
         session_id: sessionId,
         path: "/tmp/raw.bin",
@@ -2581,7 +2620,7 @@ describe("DirectClient", () => {
         size_bytes: 3,
         modified_at_ms: null,
       } satisfies SessionFileDownloadStreamReadyPayload;
-      const encryptedBody = responseBodyBytes(encodeHttpE2eeTestFrames(e2ee, [encodeUtf8(JSON.stringify(ready))]));
+      const encryptedBody = responseBodyBytes(encodeHttpPlainTestFrames([encodeUtf8(JSON.stringify(ready))]));
       arrayBuffer.mockResolvedValue(encryptedBody);
       const response = new Response(null, { status: 200 });
       Object.defineProperty(response, "body", { value: null });
@@ -2648,7 +2687,7 @@ describe("DirectClient", () => {
         auth.signature,
       ));
 
-      const e2ee = httpE2eeSessionFromHeaders(headers);
+      httpPlainAuthFromHeaders(headers);
       const ready = {
         session_id: sessionId,
         path: "/tmp/raw.bin",
@@ -2656,7 +2695,7 @@ describe("DirectClient", () => {
         size_bytes: 3,
         modified_at_ms: null,
       } satisfies SessionFileDownloadStreamReadyPayload;
-      return new Response(responseBodyBytes(encodeHttpE2eeTestFrames(e2ee, [
+      return new Response(responseBodyBytes(encodeHttpPlainTestFrames([
         encodeUtf8(JSON.stringify(ready)),
         new Uint8Array([1, 2, 3]),
       ])));

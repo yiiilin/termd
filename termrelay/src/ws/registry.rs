@@ -327,6 +327,10 @@ pub(super) enum RelayError {
     DaemonDataRouteInvalid,
     #[error("daemon data route does not match a pending client")]
     DaemonDataRouteRejected,
+    #[error("relay admission is required")]
+    AdmissionRequired,
+    #[error("relay admission was rejected")]
+    AdmissionRejected,
     #[error("relay state mutex poisoned")]
     Poisoned,
 }
@@ -340,6 +344,8 @@ impl RelayError {
             Self::PendingClientLimitExceeded => "relay_pending_client_limit",
             Self::DaemonDataRouteInvalid => "relay_data_route_invalid",
             Self::DaemonDataRouteRejected => "relay_data_route_rejected",
+            Self::AdmissionRequired => "relay_admission_required",
+            Self::AdmissionRejected => "relay_admission_rejected",
             Self::Poisoned => "relay_state_unavailable",
         }
     }
@@ -358,6 +364,8 @@ impl RelayError {
             }
             Self::DaemonDataRouteInvalid => "relay daemon data route is invalid",
             Self::DaemonDataRouteRejected => "relay daemon data route was rejected",
+            Self::AdmissionRequired => "relay admission is required",
+            Self::AdmissionRejected => "relay admission was rejected",
             Self::Poisoned => "relay state is temporarily unavailable",
         }
     }

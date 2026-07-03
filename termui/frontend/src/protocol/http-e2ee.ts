@@ -1,8 +1,3 @@
-import {
-  decodeBinaryEncryptedFrame,
-  encodeBinaryEncryptedFrame,
-  type E2eeSession,
-} from "./e2ee";
 import { ProtocolClientError } from "./errors";
 import type { ErrorPayload } from "./types";
 import { decodeUtf8 } from "./wire";
@@ -44,19 +39,18 @@ export function isReadableStreamBody(body: BodyInit): boolean {
   return typeof ReadableStream !== "undefined" && body instanceof ReadableStream;
 }
 
-function encodeHttpE2eeFrame(e2ee: E2eeSession, plaintext: Uint8Array): Uint8Array {
-  const encrypted = encodeBinaryEncryptedFrame(e2ee.encryptBinary(plaintext));
-  if (encrypted.byteLength > HTTP_E2EE_MAX_FRAME_BYTES) {
-    throw new ProtocolClientError("invalid_file_transfer", "HTTP E2EE frame exceeds transport limit");
+function encodeHttpE2eeFrame(plaintext: Uint8Array): Uint8Array {
+  if (plaintext.byteLength > HTTP_E2EE_MAX_FRAME_BYTES) {
+    throw new ProtocolClientError("invalid_file_transfer", "HTTP frame exceeds transport limit");
   }
-  const frame = new Uint8Array(4 + encrypted.byteLength);
-  new DataView(frame.buffer, frame.byteOffset, 4).setUint32(0, encrypted.byteLength, false);
-  frame.set(encrypted, 4);
+  const frame = new Uint8Array(4 + plaintext.byteLength);
+  new DataView(frame.buffer, frame.byteOffset, 4).setUint32(0, plaintext.byteLength, false);
+  frame.set(plaintext, 4);
   return frame;
 }
 
-export function encodeHttpE2eeFrames(e2ee: E2eeSession, plaintextFrames: Uint8Array[]): Uint8Array {
-  return concatByteChunks(plaintextFrames.map((plaintext) => encodeHttpE2eeFrame(e2ee, plaintext)));
+export function encodeHttpE2eeFrames(plaintextFrames: Uint8Array[]): Uint8Array {
+  return concatByteChunks(plaintextFrames.map((plaintext) => encodeHttpE2eeFrame(plaintext)));
 }
 
 function bytesToBlobPart(bytes: Uint8Array): BlobPart {
@@ -65,7 +59,7 @@ function bytesToBlobPart(bytes: Uint8Array): BlobPart {
   return bytes as Uint8Array<ArrayBuffer>;
 }
 
-export function decodeHttpE2eeFrames(e2ee: E2eeSession, wire: Uint8Array): Uint8Array[] {
+export function decodeHttpE2eeFrames(wire: Uint8Array): Uint8Array[] {
   const frames: Uint8Array[] = [];
   let offset = 0;
   while (offset < wire.byteLength) {
@@ -77,15 +71,14 @@ export function decodeHttpE2eeFrames(e2ee: E2eeSession, wire: Uint8Array): Uint8
     if (len === 0 || len > HTTP_E2EE_MAX_FRAME_BYTES || wire.byteLength - offset < len) {
       throw new ProtocolClientError("invalid_file_transfer", "invalid HTTP E2EE frame body");
     }
-    const encrypted = decodeBinaryEncryptedFrame(wire.slice(offset, offset + len));
+    const plaintext = wire.slice(offset, offset + len);
     offset += len;
-    frames.push(e2ee.decryptBinary(encrypted));
+    frames.push(plaintext);
   }
   return frames;
 }
 
 export async function decodeHttpE2eeReadable(
-  e2ee: E2eeSession,
   body: ReadableStream<Uint8Array>,
   onFrame?: (frame: Uint8Array) => void | Promise<void>,
   collectFrames = true,
@@ -117,8 +110,7 @@ export async function decodeHttpE2eeReadable(
             if (pending.byteLength < 4 + len) {
               break;
             }
-            const encrypted = decodeBinaryEncryptedFrame(pending.slice(4, 4 + len));
-            const plaintext = e2ee.decryptBinary(encrypted);
+            const plaintext = pending.slice(4, 4 + len);
             if (collectFrames) {
               frames.push(plaintext);
             }
@@ -148,17 +140,15 @@ export async function decodeHttpE2eeReadable(
 }
 
 export function buildHttpUploadChunkBody(
-  e2ee: E2eeSession,
   metaFrame: Uint8Array,
   chunk?: Uint8Array,
 ): Blob {
-  const parts: BlobPart[] = [bytesToBlobPart(encodeHttpE2eeFrame(e2ee, metaFrame))];
+  const parts: BlobPart[] = [bytesToBlobPart(encodeHttpE2eeFrame(metaFrame))];
   if (chunk) {
     for (let offset = 0; offset < chunk.byteLength; offset += HTTP_UPLOAD_FRAME_PLAINTEXT_BYTES) {
       // 中文注释：业务分片保持 10MiB，密文帧按 1MiB 切开，避免触发 daemon 的
       // HTTP_E2EE_MAX_FRAME_BYTES 防护，同时让后端可边解密边 seek patch 目标文件。
       parts.push(bytesToBlobPart(encodeHttpE2eeFrame(
-        e2ee,
         chunk.slice(offset, Math.min(chunk.byteLength, offset + HTTP_UPLOAD_FRAME_PLAINTEXT_BYTES)),
       )));
     }
@@ -173,10 +163,7 @@ export function parseHttpJsonFrame<T>(frame: Uint8Array | undefined): T {
   return JSON.parse(decodeUtf8(frame)) as T;
 }
 
-export async function decodeHttpE2eeErrorResponse(
-  response: Response,
-  e2ee: E2eeSession,
-): Promise<ErrorPayload> {
+export async function decodeHttpE2eeErrorResponse(response: Response): Promise<ErrorPayload> {
   const fallback: ErrorPayload = {
     code: "http_file_transfer_failed",
     message: "HTTP file transfer failed",
@@ -188,9 +175,9 @@ export async function decodeHttpE2eeErrorResponse(
     return fallback;
   }
 
-  // 中文注释：post-auth HTTP 文件错误由 daemon 放在 E2EE frame 里返回；relay 仍只看密文。
+  // 中文注释：post-auth HTTP 文件错误由 daemon 放在明文 length-prefixed frame 里返回。
   try {
-    const frames = decodeHttpE2eeFrames(e2ee, body);
+    const frames = decodeHttpE2eeFrames(body);
     const payload = parseHttpJsonFrame<ErrorPayload>(frames[0]);
     if (isErrorPayload(payload)) {
       return payload;

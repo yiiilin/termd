@@ -7,7 +7,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
-use termd_proto::{HTTP_FILE_TUNNEL_PATHS, ServerId, is_http_tunnel_path_allowed};
+use termd_proto::{
+    HTTP_FILE_TUNNEL_PATHS, RelayAdmissionPayload, ServerId, is_http_tunnel_path_allowed,
+};
 use tower_http::cors::{Any, CorsLayer};
 use uuid::Uuid;
 
@@ -36,7 +38,7 @@ pub fn router(state: RelayState, web_enabled: bool, http_tunnel_enabled: bool) -
 fn http_api_tunnel_router(http_tunnel_enabled: bool) -> Router<RelayState> {
     let mut router = Router::new();
     // 中文注释：HTTP control plane 已是当前 Web/relay 主路径，必须默认可用；
-    // relay 只做透明转发，不参与 bearer/E2EE/session scope 业务判断。
+    // relay 只做 tunnel 转发，不参与 bearer/session scope 业务判断。
     router = router.route("/api/control/*path", post(relay_http_tunnel));
     for path in HTTP_FILE_TUNNEL_PATHS {
         router = if http_tunnel_enabled {
@@ -47,13 +49,13 @@ fn http_api_tunnel_router(http_tunnel_enabled: bool) -> Router<RelayState> {
         };
     }
 
-    // 中文注释：跨源预检只挂在 relay HTTP API tunnel 上；真正鉴权仍在 daemon bearer/E2EE。
+    // 中文注释：跨源预检只挂在 relay HTTP API tunnel 上；真正鉴权仍在 daemon bearer/scope token。
     router.route_layer(http_api_tunnel_cors_layer())
 }
 
 fn http_api_tunnel_cors_layer() -> CorsLayer {
     // 中文注释：relay 透明转发 HTTP control/file tunnel，不解密也不解析业务内容；
-    // 浏览器跨源访问时需要放开 control 与 file API 共用的认证/E2EE 头。
+    // 浏览器跨源访问时需要放开 control 与 file API 共用的认证头。
     CorsLayer::new()
         .allow_origin(Any)
         .allow_methods([Method::POST, Method::OPTIONS])
@@ -67,6 +69,7 @@ fn http_api_tunnel_cors_layer() -> CorsLayer {
             HeaderName::from_static("x-termd-e2ee-nonce"),
             HeaderName::from_static("x-termd-e2ee-timestamp-ms"),
             HeaderName::from_static("x-termd-e2ee-signature"),
+            HeaderName::from_static("x-termd-relay-admission"),
         ])
 }
 
@@ -109,12 +112,17 @@ async fn relay_http_tunnel(
             Some((name.as_str().to_owned(), value.to_str().ok()?.to_owned()))
         })
         .collect::<Vec<_>>();
+    let admission = match relay_admission_from_headers(&headers) {
+        Ok(admission) => admission,
+        Err(status) => return status.into_response(),
+    };
     match state
         .http_tunnel(
             server_id,
             method.as_str().to_owned(),
             uri.path().to_owned(),
             forwarded_headers,
+            admission,
             body.into_data_stream(),
         )
         .await
@@ -122,6 +130,19 @@ async fn relay_http_tunnel(
         Ok(response) => response,
         Err(status) => status.into_response(),
     }
+}
+
+fn relay_admission_from_headers(
+    headers: &HeaderMap,
+) -> Result<Option<RelayAdmissionPayload>, StatusCode> {
+    let Some(value) = headers.get("x-termd-relay-admission") else {
+        return Ok(None);
+    };
+    let raw = value.to_str().map_err(|_| StatusCode::BAD_REQUEST)?;
+    // 中文注释：relay 只解析 admission 外壳，业务 auth/session 仍由 daemon 最终校验。
+    serde_json::from_str(raw)
+        .map(Some)
+        .map_err(|_| StatusCode::BAD_REQUEST)
 }
 
 fn is_http_api_tunnel_path_allowed(method: &str, path: &str) -> bool {
@@ -134,12 +155,14 @@ fn is_http_api_tunnel_path_allowed(method: &str, path: &str) -> bool {
 struct HealthzPayload {
     status: &'static str,
     rooms: usize,
+    trusted_admission: bool,
 }
 
 async fn healthz(State(state): State<RelayState>) -> Json<HealthzPayload> {
     Json(HealthzPayload {
         status: "ok",
         rooms: state.room_count(),
+        trusted_admission: state.trusted_admission_enabled(),
     })
 }
 
@@ -291,7 +314,7 @@ mod tests {
             .expect("router should respond");
 
             // 中文注释：未知或畸形 control 路径必须在 relay token 认证前被路径层拒绝，避免
-            // untrusted relay 暴露更宽的 API 探测面，也让 direct/tunnel 的失败语义一致。
+            // trusted relay 暴露更宽的 API 探测面，也让 direct/tunnel 的失败语义一致。
             assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
         }
     }
@@ -655,6 +678,7 @@ mod tests {
                 role,
                 protocol_version: ProtocolVersion::default(),
                 nonce: Nonce("route-test-nonce".to_owned()),
+                admission: None,
                 route_generation,
                 client_id,
                 data_token,

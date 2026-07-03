@@ -1,6 +1,6 @@
 //! Axum HTTP/WebSocket 适配层。
 //!
-//! 这里只把 socket 字节流接到 `protocol` 状态机；pairing、auth、session 和 E2EE
+//! 这里只把 socket 字节流接到 `protocol` 状态机；pairing、auth 和 session
 //! 规则都由协议核心执行，避免网络框架层夹带业务判断。
 
 mod recovery;
@@ -53,7 +53,6 @@ use super::protocol::{
     envelope_value, session_file_http_upload_chunks_len, write_session_file_http_upload_files,
 };
 use super::signature::Ed25519SignatureVerifier;
-use super::{decode_binary_encrypted_frame, encode_binary_encrypted_frame};
 #[cfg(test)]
 pub(crate) use recovery::adopt_or_repair_runtime_sessions_from_supervisors;
 use recovery::warn_about_orphaned_supervisors;
@@ -66,7 +65,7 @@ const WEBSOCKET_PONG_DEADLINE: Duration = Duration::from_secs(10);
 const WEBSOCKET_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const WEBSOCKET_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 // direct WebSocket 与 relay 传输保持同量级限制；终端 snapshot 可能是数 MB 的
-// 单个 E2EE binary frame，过小的 frame limit 会把正常重连误判为异常大消息。
+// 单个 binary frame，过小的 frame limit 会把正常重连误判为异常大消息。
 const WEBSOCKET_MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 const WEBSOCKET_MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 const HTTP_E2EE_INIT_MAX_BYTES: usize = 1024 * 1024;
@@ -1895,19 +1894,14 @@ where
 }
 
 fn decrypt_http_e2ee_frames(
-    e2ee: &mut super::E2eeSession,
+    _e2ee: &mut super::E2eeSession,
     body: &Bytes,
 ) -> Result<Vec<Vec<u8>>, ProtocolError> {
     let mut offset = 0;
     let mut frames = Vec::new();
     while offset < body.len() {
         let frame = read_http_e2ee_frame(body, &mut offset)?;
-        let binary =
-            decode_binary_encrypted_frame(frame).map_err(|_| ProtocolError::InvalidEnvelope)?;
-        let plaintext = e2ee
-            .decrypt_binary_payload(&binary)
-            .map_err(|_| ProtocolError::InvalidEnvelope)?;
-        frames.push(plaintext);
+        frames.push(frame.to_vec());
     }
     Ok(frames)
 }
@@ -1931,16 +1925,11 @@ impl HttpE2eeBodyFrameStream {
 
     async fn next_plaintext(
         &mut self,
-        e2ee: &mut super::E2eeSession,
+        _e2ee: &mut super::E2eeSession,
     ) -> Result<Option<Vec<u8>>, ProtocolError> {
         loop {
             if let Some(frame) = self.try_pop_frame()? {
-                let binary = decode_binary_encrypted_frame(&frame)
-                    .map_err(|_| ProtocolError::InvalidEnvelope)?;
-                return e2ee
-                    .decrypt_binary_payload(&binary)
-                    .map(Some)
-                    .map_err(|_| ProtocolError::InvalidEnvelope);
+                return Ok(Some(frame));
             }
             if self.drain_buffered_body_bytes()? {
                 continue;
@@ -2033,16 +2022,11 @@ where
 }
 
 fn append_http_e2ee_binary_frame(
-    e2ee: &mut super::E2eeSession,
+    _e2ee: &mut super::E2eeSession,
     body: &mut Vec<u8>,
     plaintext: &[u8],
 ) -> Result<(), ProtocolError> {
-    let encrypted = e2ee
-        .encrypt_binary_payload(plaintext)
-        .map_err(|_| ProtocolError::InvalidEnvelope)?;
-    body.extend_from_slice(&write_http_e2ee_frame(&encode_binary_encrypted_frame(
-        &encrypted,
-    )));
+    body.extend_from_slice(&write_http_e2ee_frame(plaintext));
     Ok(())
 }
 
@@ -4556,7 +4540,7 @@ mod tests {
         let daemon_identity = protocol.lock().await.daemon_public_identity().clone();
         let daemon_e2ee_public = protocol.lock().await.e2ee_public_key();
         let http_keypair = E2eeKeyPair::generate();
-        let mut http_e2ee = E2eeSession::new(
+        let _http_e2ee = E2eeSession::new(
             E2eeSessionRole::Device,
             &http_keypair,
             daemon_e2ee_public,
@@ -4584,17 +4568,14 @@ mod tests {
                 .to_bytes(),
         ));
         let upload_path = format!("http-upload-{}.bin", session_id.0);
-        let encrypted = http_e2ee
-            .encrypt_binary_payload(
-                &serde_json::to_vec(&SessionFileUploadPayload {
-                    session_id,
-                    path: upload_path,
-                    size_bytes: 3,
-                })
-                .unwrap(),
-            )
-            .unwrap();
-        let request_body = write_http_e2ee_frame(&encode_binary_encrypted_frame(&encrypted));
+        let request_body = write_http_e2ee_frame(
+            &serde_json::to_vec(&SessionFileUploadPayload {
+                session_id,
+                path: upload_path,
+                size_bytes: 3,
+            })
+            .unwrap(),
+        );
         let response = router(protocol, false)
             .oneshot(
                 Request::builder()
@@ -4617,9 +4598,7 @@ mod tests {
             .unwrap();
         let mut offset = 0;
         let frame = read_http_e2ee_frame(&response_body, &mut offset).unwrap();
-        let encrypted = decode_binary_encrypted_frame(frame).unwrap();
-        let ready: SessionFileHttpUploadReadyPayload =
-            serde_json::from_slice(&http_e2ee.decrypt_binary_payload(&encrypted).unwrap()).unwrap();
+        let ready: SessionFileHttpUploadReadyPayload = serde_json::from_slice(frame).unwrap();
 
         assert_eq!(ready.session_id, session_id);
         assert_eq!(ready.size_bytes, 3);
@@ -4650,7 +4629,7 @@ mod tests {
         let daemon_identity = protocol.lock().await.daemon_public_identity().clone();
         let daemon_e2ee_public = protocol.lock().await.e2ee_public_key();
         let http_keypair = E2eeKeyPair::generate();
-        let mut http_e2ee = E2eeSession::new(
+        let _http_e2ee = E2eeSession::new(
             E2eeSessionRole::Device,
             &http_keypair,
             daemon_e2ee_public,
@@ -4677,17 +4656,14 @@ mod tests {
                 .sign(&HttpE2eeSigningInput::from_payload(&auth, &daemon_identity).to_bytes())
                 .to_bytes(),
         ));
-        let encrypted = http_e2ee
-            .encrypt_binary_payload(
-                &serde_json::to_vec(&SessionFileHttpDownloadPayload {
-                    session_id,
-                    path: "download.bin".to_owned(),
-                    offset_bytes: 0,
-                })
-                .unwrap(),
-            )
-            .unwrap();
-        let request_body = write_http_e2ee_frame(&encode_binary_encrypted_frame(&encrypted));
+        let request_body = write_http_e2ee_frame(
+            &serde_json::to_vec(&SessionFileHttpDownloadPayload {
+                session_id,
+                path: "download.bin".to_owned(),
+                offset_bytes: 0,
+            })
+            .unwrap(),
+        );
         let response = router(protocol, false)
             .oneshot(
                 Request::builder()
@@ -4719,16 +4695,12 @@ mod tests {
             .unwrap();
         let mut offset = 0;
         let ready_frame = read_http_e2ee_frame(&response_body, &mut offset).unwrap();
-        let ready_encrypted = decode_binary_encrypted_frame(ready_frame).unwrap();
         let ready: SessionFileDownloadStreamReadyPayload =
-            serde_json::from_slice(&http_e2ee.decrypt_binary_payload(&ready_encrypted).unwrap())
-                .unwrap();
+            serde_json::from_slice(ready_frame).unwrap();
         let data_frame = read_http_e2ee_frame(&response_body, &mut offset).unwrap();
-        let data_encrypted = decode_binary_encrypted_frame(data_frame).unwrap();
-        let bytes = http_e2ee.decrypt_binary_payload(&data_encrypted).unwrap();
 
         assert_eq!(ready.size_bytes, 3);
-        assert_eq!(bytes, b"abc");
+        assert_eq!(data_frame, b"abc");
         assert_eq!(offset, response_body.len());
     }
 
@@ -4748,7 +4720,7 @@ mod tests {
             PublicKey(test_ed25519_wire(signing_key.verifying_key().as_bytes()));
         let (device_id, session_id) =
             pair_real_device_and_create_session(protocol.clone(), device_public_key).await;
-        let (request, mut http_e2ee) = signed_http_e2ee_request(
+        let (request, _http_e2ee) = signed_http_e2ee_request(
             &protocol,
             &signing_key,
             device_id,
@@ -4780,9 +4752,7 @@ mod tests {
         );
         let mut offset = 0;
         let frame = read_http_e2ee_frame(&response_body, &mut offset).unwrap();
-        let encrypted = decode_binary_encrypted_frame(frame).unwrap();
-        let error: ErrorPayload =
-            serde_json::from_slice(&http_e2ee.decrypt_binary_payload(&encrypted).unwrap()).unwrap();
+        let error: ErrorPayload = serde_json::from_slice(frame).unwrap();
 
         assert!(
             !error.code.is_empty(),
@@ -4809,7 +4779,7 @@ mod tests {
             pair_real_device_and_create_session(protocol.clone(), public_key).await;
 
         let upload_init_path = "/api/files/upload/init";
-        let (request, mut upload_init_e2ee) = signed_http_e2ee_request(
+        let (request, _upload_init_e2ee) = signed_http_e2ee_request(
             &protocol,
             &signing_key,
             device_id,
@@ -4835,13 +4805,7 @@ mod tests {
             .unwrap();
         let mut offset = 0;
         let ready_frame = read_http_e2ee_frame(&response_body, &mut offset).unwrap();
-        let ready_encrypted = decode_binary_encrypted_frame(ready_frame).unwrap();
-        let ready: SessionFileHttpUploadReadyPayload = serde_json::from_slice(
-            &upload_init_e2ee
-                .decrypt_binary_payload(&ready_encrypted)
-                .unwrap(),
-        )
-        .unwrap();
+        let ready: SessionFileHttpUploadReadyPayload = serde_json::from_slice(ready_frame).unwrap();
 
         for (nonce, offset_bytes, frames) in [
             (
@@ -4905,7 +4869,7 @@ mod tests {
         let (device_id, session_id) =
             pair_real_device_and_create_session(protocol.clone(), public_key).await;
 
-        let (request, mut upload_init_e2ee) = signed_http_e2ee_request(
+        let (request, _upload_init_e2ee) = signed_http_e2ee_request(
             &protocol,
             &signing_key,
             device_id,
@@ -4931,13 +4895,7 @@ mod tests {
             .unwrap();
         let mut offset = 0;
         let ready_frame = read_http_e2ee_frame(&response_body, &mut offset).unwrap();
-        let ready_encrypted = decode_binary_encrypted_frame(ready_frame).unwrap();
-        let ready: SessionFileHttpUploadReadyPayload = serde_json::from_slice(
-            &upload_init_e2ee
-                .decrypt_binary_payload(&ready_encrypted)
-                .unwrap(),
-        )
-        .unwrap();
+        let ready: SessionFileHttpUploadReadyPayload = serde_json::from_slice(ready_frame).unwrap();
 
         for (nonce, offset_bytes, bytes, expected_status) in [
             (
@@ -5282,7 +5240,7 @@ mod tests {
         assert_http_device_detached(&protocol, session_id, http_device_id).await;
 
         let upload_init_path = "/api/files/upload/init";
-        let (request, mut upload_init_e2ee) = signed_http_e2ee_request(
+        let (request, _upload_init_e2ee) = signed_http_e2ee_request(
             &protocol,
             &http_signing_key,
             http_device_id,
@@ -5308,13 +5266,7 @@ mod tests {
             .unwrap();
         let mut offset = 0;
         let ready_frame = read_http_e2ee_frame(&response_body, &mut offset).unwrap();
-        let ready_encrypted = decode_binary_encrypted_frame(ready_frame).unwrap();
-        let ready: SessionFileHttpUploadReadyPayload = serde_json::from_slice(
-            &upload_init_e2ee
-                .decrypt_binary_payload(&ready_encrypted)
-                .unwrap(),
-        )
-        .unwrap();
+        let ready: SessionFileHttpUploadReadyPayload = serde_json::from_slice(ready_frame).unwrap();
         assert_http_device_detached(&protocol, session_id, http_device_id).await;
 
         let upload_path = "/api/files/upload";
@@ -6339,6 +6291,7 @@ mod tests {
                 role: RouteRole::Client,
                 protocol_version: ProtocolVersion(PROTOCOL_PACKET_VERSION),
                 nonce: termd_proto::Nonce("route-test-nonce".to_owned()),
+                admission: None,
                 route_generation: None,
                 client_id: None,
                 data_token: None,
@@ -6609,7 +6562,7 @@ zZZR5LzKVu9X7paftR7K8Q==
         drop(protocol_guard);
 
         let http_keypair = E2eeKeyPair::generate();
-        let mut http_e2ee = E2eeSession::new(
+        let http_e2ee = E2eeSession::new(
             E2eeSessionRole::Device,
             &http_keypair,
             daemon_e2ee_public,
@@ -6638,10 +6591,7 @@ zZZR5LzKVu9X7paftR7K8Q==
 
         let mut request_body = Vec::new();
         for plaintext in plaintext_frames {
-            let encrypted = http_e2ee.encrypt_binary_payload(&plaintext).unwrap();
-            request_body.extend(write_http_e2ee_frame(&encode_binary_encrypted_frame(
-                &encrypted,
-            )));
+            request_body.extend(write_http_e2ee_frame(&plaintext));
         }
 
         let request = Request::builder()

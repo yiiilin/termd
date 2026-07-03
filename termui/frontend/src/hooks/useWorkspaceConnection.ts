@@ -217,6 +217,7 @@ export function useWorkspaceConnection(options: UseWorkspaceConnectionOptions) {
           try {
             client = await DirectClient.connect(routeUrl, server.server_id, device.device_id, {
               expectedDaemonPublicKey: server.daemon_public_key,
+              trustedDevice: device,
               timeoutMs: connectTimeoutMs,
               socketOpenTimeoutMs: Math.min(connectTimeoutMs, options.socketOpenTimeoutMs),
               socketOpenHedgeDelayMs: options.socketOpenHedgeDelayMs,

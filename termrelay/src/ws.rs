@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -5,7 +6,10 @@ use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::StreamExt;
-use termd_proto::{MessageType, Nonce, RelayClientId, RelayControlEnvelope, RouteRole, ServerId};
+use termd_proto::{
+    MessageType, Nonce, RelayAdmissionPayload, RelayClientId, RelayControlEnvelope, RouteRole,
+    ServerId,
+};
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -49,7 +53,7 @@ use self::route_binder::bind_socket_route;
 #[cfg(test)]
 use self::route_binder::route_prelude_error_is_noisy_client_disconnect;
 
-// 中文注释：relay 是 dumb pipe，不能长期替慢浏览器缓存终端流。
+// 中文注释：relay 是 trusted routing 层，不能长期替慢浏览器缓存终端流。
 // 预算按 100ms 千兆链路的 BDP 量级设置；健康连接可以填满管道，
 // 慢 client 仍会在预算耗尽后关闭并让前端重连拿 snapshot。
 const DATA_CHANNEL_CAPACITY: usize = 32 * 1024;
@@ -60,7 +64,7 @@ const HTTP_TUNNEL_BODY_CHANNEL_CAPACITY: usize = 1;
 const HTTP_TUNNEL_SHORT_REQUEST_BODY_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(test)]
 const HTTP_TUNNEL_SHORT_REQUEST_BODY_TIMEOUT: Duration = Duration::from_millis(50);
-// 中文注释：route_ready 之后 client 可能先发少量 E2EE 数据，但 daemon data 必须及时接上；
+// 中文注释：route_ready 之后 client 可能先发少量业务数据，但 daemon data 必须及时接上；
 // 超时后只关闭 relay transport，daemon session 本身仍由 daemon 管理。
 #[cfg(not(test))]
 const PENDING_CLIENT_PAIR_DEADLINE: Duration = Duration::from_secs(5);
@@ -68,7 +72,7 @@ const PENDING_CLIENT_PAIR_DEADLINE: Duration = Duration::from_secs(5);
 const PENDING_CLIENT_PAIR_DEADLINE: Duration = Duration::from_millis(250);
 const PENDING_CLIENTS_PER_ROOM_LIMIT: usize = 64;
 // 中文注释：client route_ready 先于 daemon data 反连完成返回时，browser 可能立刻发送
-// E2EE hello/auth/attach。relay 只做短暂 opaque 缓冲，避免公网反连慢几百毫秒就让前端超时。
+// hello/auth/attach。relay 只做短暂 opaque 缓冲，避免公网反连慢几百毫秒就让前端超时。
 const PRE_PAIR_CLIENT_BUFFER_MAX_FRAMES: usize = 256;
 const PRE_PAIR_CLIENT_BUFFER_MAX_BYTES: usize = 4 * 1024 * 1024;
 const PRE_PAIR_ROOM_BUFFER_MAX_BYTES: usize = PRE_PAIR_CLIENT_BUFFER_MAX_BYTES * 2;
@@ -232,6 +236,19 @@ fn relay_auth_token_constant_time_eq(expected: &str, provided: &str) -> bool {
 pub struct RelayState {
     inner: Arc<RelayRegistry>,
     auth_token: Option<String>,
+    admission: Arc<RelayAdmissionState>,
+}
+
+#[derive(Debug, Default)]
+struct RelayAdmissionState {
+    trusted: bool,
+    daemon_tokens: HashMap<ServerId, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayDaemonCredential {
+    pub server_id: ServerId,
+    pub token: String,
 }
 
 impl fmt::Debug for RelayState {
@@ -240,6 +257,7 @@ impl fmt::Debug for RelayState {
         formatter
             .debug_struct("RelayState")
             .field("auth_token_configured", &self.auth_token.is_some())
+            .field("trusted_admission", &self.admission.trusted)
             .field("rooms", &self.room_count())
             .finish()
     }
@@ -264,7 +282,24 @@ impl RelayState {
         Self {
             inner: Arc::new(RelayRegistry::default()),
             auth_token,
+            admission: Arc::new(RelayAdmissionState::default()),
         }
+    }
+
+    pub fn new_trusted(
+        auth_token: Option<String>,
+        daemon_credentials: Vec<RelayDaemonCredential>,
+    ) -> Self {
+        let mut state = Self::new(auth_token);
+        let daemon_tokens = daemon_credentials
+            .into_iter()
+            .map(|credential| (credential.server_id, credential.token))
+            .collect();
+        state.admission = Arc::new(RelayAdmissionState {
+            trusted: true,
+            daemon_tokens,
+        });
+        state
     }
 
     pub fn authorizes(&self, token: Option<&str>) -> bool {
@@ -280,6 +315,42 @@ impl RelayState {
 
     pub fn room_count(&self) -> usize {
         self.inner.room_count()
+    }
+
+    pub fn trusted_admission_enabled(&self) -> bool {
+        self.admission.trusted
+    }
+
+    fn authorize_route_admission(&self, prelude: &RoutePrelude) -> Result<(), RelayError> {
+        if !self.admission.trusted {
+            return Ok(());
+        }
+
+        match prelude.connection_role {
+            ConnectionRole::DaemonControl | ConnectionRole::DaemonData => {
+                let Some(RelayAdmissionPayload::Daemon { token }) = prelude.admission.as_ref()
+                else {
+                    return Err(RelayError::AdmissionRequired);
+                };
+                let Some(expected) = self.admission.daemon_tokens.get(&prelude.server_id) else {
+                    return Err(RelayError::AdmissionRejected);
+                };
+                if relay_auth_token_has_safe_length(expected)
+                    && relay_auth_token_has_safe_length(token.as_str())
+                    && relay_auth_token_constant_time_eq(expected, token.as_str())
+                {
+                    Ok(())
+                } else {
+                    Err(RelayError::AdmissionRejected)
+                }
+            }
+            ConnectionRole::Client => match prelude.admission.as_ref() {
+                Some(RelayAdmissionPayload::PairTicket { .. })
+                | Some(RelayAdmissionPayload::Device { .. }) => Ok(()),
+                Some(RelayAdmissionPayload::Daemon { .. }) => Err(RelayError::AdmissionRejected),
+                None => Err(RelayError::AdmissionRequired),
+            },
+        }
     }
 
     fn start_pending_client_pair_deadline(&self, registration: &ConnectionRegistration) {
@@ -337,6 +408,7 @@ impl RelayState {
                 ConnectionRole::Client => RouteRole::Client,
             },
             connection_role: role,
+            admission: None,
             route_generation,
             client_id: None,
             data_token: None,
@@ -636,6 +708,7 @@ struct RoutePrelude {
     server_id: ServerId,
     route_role: RouteRole,
     connection_role: ConnectionRole,
+    admission: Option<RelayAdmissionPayload>,
     route_generation: Option<Nonce>,
     client_id: Option<RelayClientId>,
     data_token: Option<Nonce>,
@@ -699,7 +772,7 @@ pub async fn handle_socket(mut socket: WebSocket, state: RelayState) {
     let (sender, mut receiver) = socket.split();
     let mut receive_debug = WebSocketReceiveDebug::new(Instant::now());
     let mut traffic = RelayConnectionTraffic::default();
-    // 中文注释：relay 必须是 dumb pipe，但 transport 读写不能互相拖住。
+    // 中文注释：relay 只做 admission/routing，transport 读写不能互相拖住。
     // 每条 WebSocket 的写侧单独跑，主循环只负责持续读取输入并转发到目标队列；
     // writer 一旦写失败，会直接关闭 endpoint signal，主循环只认这个 signal 退出，
     // 不再依赖另一条 outcome 队列，避免持续入站时把 writer 失败饿住。
@@ -1081,6 +1154,7 @@ mod tests {
                 role,
                 protocol_version: ProtocolVersion(PROTOCOL_PACKET_VERSION),
                 nonce: Nonce("test-route".to_owned()),
+                admission: None,
                 route_generation,
                 client_id,
                 data_token,
@@ -1771,6 +1845,7 @@ mod tests {
             server_id,
             route_role: RouteRole::DaemonData,
             connection_role: ConnectionRole::DaemonData,
+            admission: None,
             route_generation: Some(test_route_generation(server_id)),
             client_id: Some(client_id),
             data_token: Some(data_token),
@@ -1907,6 +1982,7 @@ mod tests {
                     server_id,
                     route_role: RouteRole::DaemonData,
                     connection_role: ConnectionRole::DaemonData,
+                    admission: None,
                     route_generation: Some(test_route_generation(server_id)),
                     client_id: Some(client_id),
                     data_token: Some(data_token),
@@ -1982,6 +2058,7 @@ mod tests {
                     server_id,
                     route_role: RouteRole::DaemonData,
                     connection_role: ConnectionRole::DaemonData,
+                    admission: None,
                     route_generation: Some(test_route_generation(server_id)),
                     client_id: Some(client_id),
                     data_token: Some(data_token),
@@ -2031,6 +2108,7 @@ mod tests {
                 server_id,
                 route_role: RouteRole::DaemonData,
                 connection_role: ConnectionRole::DaemonData,
+                admission: None,
                 route_generation: Some(test_route_generation(server_id)),
                 client_id: None,
                 data_token: None,
@@ -2054,6 +2132,7 @@ mod tests {
                 server_id,
                 route_role: RouteRole::DaemonControl,
                 connection_role: ConnectionRole::DaemonControl,
+                admission: None,
                 route_generation: None,
                 client_id: None,
                 data_token: None,
@@ -2068,6 +2147,7 @@ mod tests {
                 server_id,
                 route_role: RouteRole::DaemonData,
                 connection_role: ConnectionRole::DaemonData,
+                admission: None,
                 route_generation: None,
                 client_id: None,
                 data_token: None,
@@ -2114,6 +2194,7 @@ mod tests {
                 server_id,
                 route_role: RouteRole::DaemonData,
                 connection_role: ConnectionRole::DaemonData,
+                admission: None,
                 route_generation: Some(generation_a),
                 client_id: Some(client_id),
                 data_token: Some(data_token.clone()),
@@ -2127,6 +2208,7 @@ mod tests {
                 server_id,
                 route_role: RouteRole::DaemonData,
                 connection_role: ConnectionRole::DaemonData,
+                admission: None,
                 route_generation: Some(generation_b),
                 client_id: Some(client_id),
                 data_token: Some(data_token),
@@ -2232,6 +2314,92 @@ mod tests {
         assert!(!long_state.authorizes(Some("relay-secret-2")));
     }
 
+    #[test]
+    fn trusted_relay_admission_requires_registered_daemon_token() {
+        let server_id = server_id(120);
+        let state = RelayState::new_trusted(
+            None,
+            vec![RelayDaemonCredential {
+                server_id,
+                token: "daemon-secret-1".to_owned(),
+            }],
+        );
+        let accepted = RoutePrelude {
+            server_id,
+            route_role: RouteRole::DaemonControl,
+            connection_role: ConnectionRole::DaemonControl,
+            admission: Some(RelayAdmissionPayload::Daemon {
+                token: "daemon-secret-1".to_owned(),
+            }),
+            route_generation: Some(Nonce("generation".to_owned())),
+            client_id: None,
+            data_token: None,
+        };
+        let rejected = RoutePrelude {
+            admission: Some(RelayAdmissionPayload::Daemon {
+                token: "wrong-token".to_owned(),
+            }),
+            ..accepted.clone()
+        };
+
+        assert!(state.authorize_route_admission(&accepted).is_ok());
+        assert_eq!(
+            state.authorize_route_admission(&rejected),
+            Err(RelayError::AdmissionRejected)
+        );
+    }
+
+    #[test]
+    fn trusted_relay_admission_rejects_client_without_ticket_or_device() {
+        let server_id = server_id(121);
+        let state = RelayState::new_trusted(
+            None,
+            vec![RelayDaemonCredential {
+                server_id,
+                token: "daemon-secret-1".to_owned(),
+            }],
+        );
+        let prelude = RoutePrelude {
+            server_id,
+            route_role: RouteRole::Client,
+            connection_role: ConnectionRole::Client,
+            admission: None,
+            route_generation: None,
+            client_id: None,
+            data_token: None,
+        };
+
+        assert_eq!(
+            state.authorize_route_admission(&prelude),
+            Err(RelayError::AdmissionRequired)
+        );
+    }
+
+    #[tokio::test]
+    async fn trusted_relay_http_tunnel_rejects_missing_admission() {
+        let server_id = server_id(122);
+        let state = RelayState::new_trusted(
+            None,
+            vec![RelayDaemonCredential {
+                server_id,
+                token: "daemon-secret-1".to_owned(),
+            }],
+        );
+
+        let result = state
+            .http_tunnel(
+                server_id,
+                "POST".to_owned(),
+                "/api/control/session/list".to_owned(),
+                Vec::new(),
+                None,
+                Body::empty().into_data_stream(),
+            )
+            .await;
+
+        assert_eq!(result.unwrap_err(), StatusCode::UNAUTHORIZED);
+    }
+
     #[tokio::test]
     async fn http_tunnel_uses_daemon_data_pipe_without_parsing_body() {
         let state = RelayState::default();
@@ -2249,6 +2417,7 @@ mod tests {
                     "POST".to_owned(),
                     "/api/files/upload/init".to_owned(),
                     vec![("x-termd-server-id".to_owned(), server_id.0.to_string())],
+                    None,
                     Body::from("opaque-e2ee-body").into_data_stream(),
                 )
                 .await
@@ -2272,6 +2441,7 @@ mod tests {
                     server_id,
                     route_role: RouteRole::DaemonData,
                     connection_role: ConnectionRole::DaemonData,
+                    admission: None,
                     route_generation: Some(test_route_generation(server_id)),
                     client_id: Some(client_id),
                     data_token: Some(data_token),
@@ -2368,6 +2538,7 @@ mod tests {
                     server_id,
                     route_role: RouteRole::DaemonData,
                     connection_role: ConnectionRole::DaemonData,
+                    admission: None,
                     route_generation: Some(test_route_generation(server_id)),
                     client_id: Some(client_id),
                     data_token: Some(data_token),
@@ -2444,6 +2615,7 @@ mod tests {
                     "POST".to_owned(),
                     "/api/files/download".to_owned(),
                     Vec::new(),
+                    None,
                     Body::empty().into_data_stream(),
                 )
                 .await
@@ -2467,6 +2639,7 @@ mod tests {
                     server_id,
                     route_role: RouteRole::DaemonData,
                     connection_role: ConnectionRole::DaemonData,
+                    admission: None,
                     route_generation: Some(test_route_generation(server_id)),
                     client_id: Some(client_id),
                     data_token: Some(data_token),
@@ -2532,6 +2705,7 @@ mod tests {
             server_id,
             route_role: RouteRole::DaemonData,
             connection_role: ConnectionRole::DaemonData,
+            admission: None,
             route_generation: Some(test_route_generation(server_id)),
             client_id: Some(client_id),
             data_token: Some(data_token),
@@ -2571,6 +2745,7 @@ mod tests {
             server_id,
             route_role: RouteRole::DaemonData,
             connection_role: ConnectionRole::DaemonData,
+            admission: None,
             route_generation: Some(test_route_generation(server_id)),
             client_id: Some(client_id),
             data_token: Some(data_token),
@@ -2617,6 +2792,7 @@ mod tests {
                     server_id,
                     route_role: RouteRole::DaemonData,
                     connection_role: ConnectionRole::DaemonData,
+                    admission: None,
                     route_generation: Some(test_route_generation(server_id)),
                     client_id: Some(client_a_id),
                     data_token: Some(token_a),
@@ -2694,6 +2870,7 @@ mod tests {
                     server_id,
                     route_role: RouteRole::DaemonData,
                     connection_role: ConnectionRole::DaemonData,
+                    admission: None,
                     route_generation: Some(test_route_generation(server_id)),
                     client_id: Some(client_id),
                     data_token: Some(data_token),
@@ -2730,6 +2907,7 @@ mod tests {
                     server_id,
                     route_role: RouteRole::DaemonData,
                     connection_role: ConnectionRole::DaemonData,
+                    admission: None,
                     route_generation: Some(test_route_generation(server_id)),
                     client_id: Some(client_id),
                     data_token: Some(data_token),
@@ -2778,6 +2956,7 @@ mod tests {
                     server_id,
                     route_role: RouteRole::DaemonData,
                     connection_role: ConnectionRole::DaemonData,
+                    admission: None,
                     route_generation: Some(test_route_generation(server_id)),
                     client_id: Some(client_a_id),
                     data_token: Some(token_a),
@@ -2797,6 +2976,7 @@ mod tests {
                     server_id,
                     route_role: RouteRole::DaemonData,
                     connection_role: ConnectionRole::DaemonData,
+                    admission: None,
                     route_generation: Some(test_route_generation(server_id)),
                     client_id: Some(client_b_id),
                     data_token: Some(token_b),
@@ -2841,6 +3021,7 @@ mod tests {
                     server_id,
                     route_role: RouteRole::DaemonData,
                     connection_role: ConnectionRole::DaemonData,
+                    admission: None,
                     route_generation: Some(test_route_generation(server_id)),
                     client_id: Some(client_id),
                     data_token: Some(data_token),
@@ -2930,6 +3111,7 @@ mod tests {
                     server_id,
                     route_role: RouteRole::DaemonData,
                     connection_role: ConnectionRole::DaemonData,
+                    admission: None,
                     route_generation: Some(test_route_generation(server_id)),
                     client_id: Some(client_id),
                     data_token: Some(data_token),
@@ -3028,6 +3210,7 @@ mod tests {
                     server_id,
                     route_role: RouteRole::DaemonData,
                     connection_role: ConnectionRole::DaemonData,
+                    admission: None,
                     route_generation: Some(test_route_generation(server_id)),
                     client_id: Some(client_id),
                     data_token: Some(data_token),

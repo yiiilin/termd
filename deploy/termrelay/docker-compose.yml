@@ -7,8 +7,11 @@ services:
       - 0.0.0.0:8080
       - --auth-token-file
       - /run/secrets/termrelay_auth_token
+      - --daemon-registry
+      - /run/secrets/termrelay_daemons
     secrets:
       - termrelay_auth_token
+      - termrelay_daemons
     expose:
       - "8080"
 
@@ -34,3 +37,5 @@ volumes:
 secrets:
   termrelay_auth_token:
     file: "${TERMRELAY_AUTH_TOKEN_FILE:?TERMRELAY_AUTH_TOKEN_FILE must point to a token file for public Caddy deployment}"
+  termrelay_daemons:
+    file: "${TERMRELAY_DAEMON_REGISTRY_FILE:?TERMRELAY_DAEMON_REGISTRY_FILE must point to trusted daemon registry JSON}"

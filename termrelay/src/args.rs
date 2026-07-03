@@ -5,6 +5,8 @@ use std::fs;
 use std::net::{AddrParseError, SocketAddr};
 use std::path::PathBuf;
 
+use serde::Deserialize;
+use termd_proto::ServerId;
 use thiserror::Error;
 
 /// 公网部署时通常只绑定内网或 loopback，再由反向代理对外提供 WSS。
@@ -18,10 +20,36 @@ pub struct Args {
     pub auth_token: Option<String>,
     pub tls_cert: Option<PathBuf>,
     pub tls_key: Option<PathBuf>,
+    /// trusted relay 的 daemon 注册表；生产入口缺失时默认拒绝启动。
+    pub daemon_registry: DaemonRegistryConfig,
+    /// 显式允许旧开放 relay 行为，仅用于本地测试或迁移窗口。
+    pub allow_open_relay: bool,
     /// 是否挂载内嵌 Web 静态资源；默认关闭，避免 relay 默认暴露 UI 面。
     pub web: bool,
     /// 是否启用 HTTP 文件 tunnel 兼容路径；默认关闭，避免 relay 默认暴露额外 HTTP 面。
     pub http_tunnel: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct DaemonRegistryConfig {
+    #[serde(default)]
+    pub daemons: Vec<DaemonRegistryEntry>,
+}
+
+#[derive(Clone, PartialEq, Eq, Deserialize)]
+pub struct DaemonRegistryEntry {
+    pub server_id: ServerId,
+    pub token: String,
+}
+
+impl fmt::Debug for DaemonRegistryEntry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DaemonRegistryEntry")
+            .field("server_id", &self.server_id)
+            .field("token_configured", &true)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +73,8 @@ impl fmt::Debug for Args {
             .field("auth_token_configured", &self.auth_token.is_some())
             .field("tls_cert", &self.tls_cert)
             .field("tls_key_configured", &self.tls_key.is_some())
+            .field("daemon_registry_count", &self.daemon_registry.daemons.len())
+            .field("allow_open_relay", &self.allow_open_relay)
             .field("web", &self.web)
             .field("http_tunnel", &self.http_tunnel)
             .finish()
@@ -92,6 +122,10 @@ pub enum ArgsError {
     EmptyValue(&'static str),
     #[error("failed to read auth token file")]
     ReadAuthTokenFile,
+    #[error("failed to read daemon registry file")]
+    ReadDaemonRegistryFile,
+    #[error("failed to parse daemon registry file")]
+    ParseDaemonRegistryFile,
     #[error("--auth-token and --auth-token-file cannot be used together")]
     ConflictingAuthTokenSources,
     #[error("invalid listen address")]
@@ -110,6 +144,8 @@ impl Args {
         let mut auth_token_source = None;
         let mut tls_cert = None;
         let mut tls_key = None;
+        let mut daemon_registry_file = None;
+        let mut allow_open_relay = false;
         let mut web = false;
         let mut http_tunnel = false;
         let mut args = args.into_iter().map(Into::into);
@@ -125,6 +161,10 @@ impl Args {
             }
             if let Some(value) = arg.strip_prefix("--auth-token-file=") {
                 set_auth_token_file(&mut auth_token_source, value.to_owned())?;
+                continue;
+            }
+            if let Some(value) = arg.strip_prefix("--daemon-registry=") {
+                daemon_registry_file = Some(non_empty_path("--daemon-registry", value)?);
                 continue;
             }
             match arg.as_str() {
@@ -148,6 +188,15 @@ impl Args {
                         value.to_string_lossy().into_owned(),
                     )?;
                 }
+                "--daemon-registry" => {
+                    let value = args
+                        .next()
+                        .ok_or(ArgsError::MissingValue("--daemon-registry"))?;
+                    daemon_registry_file = Some(non_empty_path(
+                        "--daemon-registry",
+                        value.to_string_lossy().as_ref(),
+                    )?);
+                }
                 "--tls-cert" => {
                     let value = args.next().ok_or(ArgsError::MissingValue("--tls-cert"))?;
                     let value = value.to_string_lossy().into_owned();
@@ -167,6 +216,9 @@ impl Args {
                 "--web" => {
                     web = true;
                 }
+                "--allow-open-relay" => {
+                    allow_open_relay = true;
+                }
                 "--http-tunnel" => {
                     http_tunnel = true;
                 }
@@ -179,16 +231,29 @@ impl Args {
         }
 
         let auth_token = resolve_auth_token_source(auth_token_source)?;
+        let daemon_registry = match daemon_registry_file {
+            Some(path) => read_daemon_registry_file(path)?,
+            None => DaemonRegistryConfig::default(),
+        };
 
         Ok(Self {
             listen,
             auth_token,
             tls_cert,
             tls_key,
+            daemon_registry,
+            allow_open_relay,
             web,
             http_tunnel,
         })
     }
+}
+
+fn non_empty_path(flag: &'static str, value: &str) -> Result<PathBuf, ArgsError> {
+    if value.is_empty() {
+        return Err(ArgsError::EmptyValue(flag));
+    }
+    Ok(PathBuf::from(value))
 }
 
 fn set_auth_token_source(
@@ -242,6 +307,11 @@ fn read_auth_token_file(path: PathBuf) -> Result<String, ArgsError> {
         return Err(ArgsError::EmptyValue("--auth-token-file"));
     }
     Ok(token)
+}
+
+fn read_daemon_registry_file(path: PathBuf) -> Result<DaemonRegistryConfig, ArgsError> {
+    let raw = fs::read_to_string(path).map_err(|_| ArgsError::ReadDaemonRegistryFile)?;
+    serde_json::from_str(&raw).map_err(|_| ArgsError::ParseDaemonRegistryFile)
 }
 
 fn trim_trailing_line_endings(mut value: String) -> String {
@@ -322,6 +392,28 @@ mod tests {
         assert!(!rendered.contains("relay-secret-from-equals-file"));
         assert!(!rendered.contains(&token_file_arg));
         let _ = fs::remove_file(token_file);
+    }
+
+    #[test]
+    fn parses_daemon_registry_file_without_debug_secret_leakage() {
+        let registry_file = write_temp_registry(
+            r#"{"daemons":[{"server_id":"00000000-0000-0000-0000-000000000123","token":"daemon-secret-1"}]}"#,
+        );
+        let registry_arg = registry_file.to_string_lossy().into_owned();
+
+        let args = Args::parse_from(["termrelay", "--daemon-registry", &registry_arg]).unwrap();
+
+        assert_eq!(args.daemon_registry.daemons.len(), 1);
+        assert_eq!(
+            args.daemon_registry.daemons[0].server_id.0.to_string(),
+            "00000000-0000-0000-0000-000000000123"
+        );
+        assert_eq!(args.daemon_registry.daemons[0].token, "daemon-secret-1");
+        let rendered = format!("{args:?}");
+        assert!(rendered.contains("daemon_registry_count"));
+        assert!(!rendered.contains("daemon-secret-1"));
+        assert!(!rendered.contains(&registry_arg));
+        let _ = fs::remove_file(registry_file);
     }
 
     #[test]
@@ -499,6 +591,19 @@ mod tests {
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
             "termrelay-auth-token-test-{}-{unique}.txt",
+            std::process::id()
+        ));
+        fs::write(&path, contents).unwrap();
+        path
+    }
+
+    fn write_temp_registry(contents: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "termrelay-daemon-registry-test-{}-{unique}.json",
             std::process::id()
         ));
         fs::write(&path, contents).unwrap();

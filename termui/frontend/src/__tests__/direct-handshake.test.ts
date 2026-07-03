@@ -2,9 +2,6 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 const openWebSocketMock = vi.hoisted(() => vi.fn());
 const sendOuterMessageMock = vi.hoisted(() => vi.fn());
-const verifyEd25519SignatureMock = vi.hoisted(() => vi.fn(async () => true));
-const generateE2eeKeyPairMock = vi.hoisted(() => vi.fn(() => ({ publicKeyWire: "device-e2ee-public-key" })));
-const e2eeSessionDeviceMock = vi.hoisted(() => vi.fn(() => ({ kind: "device-e2ee-session" })));
 
 vi.mock("../protocol/socket-transport", async () => {
   const actual = await vi.importActual<typeof import("../protocol/socket-transport")>("../protocol/socket-transport");
@@ -14,20 +11,6 @@ vi.mock("../protocol/socket-transport", async () => {
     sendOuterMessage: sendOuterMessageMock,
   };
 });
-
-vi.mock("../protocol/auth", () => ({
-  daemonE2eeSigningInputBytes: () => new Uint8Array([1, 2, 3]),
-  decodeEd25519PublicKey: () => new Uint8Array([4, 5, 6]),
-  e2eeAuthTranscriptDigestWire: () => "mock-transcript-digest",
-  verifyEd25519Signature: verifyEd25519SignatureMock,
-}));
-
-vi.mock("../protocol/e2ee", () => ({
-  E2eeSession: {
-    device: e2eeSessionDeviceMock,
-  },
-  generateE2eeKeyPair: generateE2eeKeyPairMock,
-}));
 
 import { performDirectHandshake } from "../protocol/direct-handshake";
 import type { TermdDiagnosticEvent } from "../diagnostics";
@@ -50,7 +33,7 @@ afterEach(() => {
 });
 
 describe("performDirectHandshake", () => {
-  it("客户端发出自己的 e2ee_key_exchange 前 socket 已关闭时，connect 失败而不是返回 dead client", async () => {
+  it("客户端发出自己的 hello 前 socket 已关闭时，connect 失败而不是返回 dead client", async () => {
     const socketState: { readyState: number } = { readyState: SOCKET_OPEN };
     const socket = {
       get readyState() {
@@ -69,22 +52,18 @@ describe("performDirectHandshake", () => {
             payload: { server_id: SERVER_ID, role: "client" },
           },
         })
-        .mockResolvedValueOnce({
-          envelope: {
-            type: "hello",
-            payload: { server_id: SERVER_ID },
-          },
-        })
         .mockImplementationOnce(async () => {
           socketState.readyState = SOCKET_CLOSED;
           return {
             envelope: {
-              type: "e2ee_key_exchange",
+              type: "hello",
               payload: {
                 server_id: SERVER_ID,
-                public_key: "daemon-e2ee-public-key",
-                packet_version: PROTOCOL_PACKET_VERSION,
-                signature: "mock-signature",
+                protocol_version: PROTOCOL_PACKET_VERSION,
+                daemon_public_key: "daemon-public-key",
+                binary_version: null,
+                nonce: "daemon-nonce",
+                timestamp_ms: 1710000000000,
               },
             },
           };
@@ -106,8 +85,6 @@ describe("performDirectHandshake", () => {
 
     expect(sendOuterMessageMock).toHaveBeenCalledTimes(1);
     expect(inbox.rejectPending).toHaveBeenCalledTimes(1);
-    expect(generateE2eeKeyPairMock).toHaveBeenCalledTimes(1);
-    expect(verifyEd25519SignatureMock).toHaveBeenCalledTimes(1);
   });
 
   it("握手 timeout 会记录结构化诊断事件", async () => {

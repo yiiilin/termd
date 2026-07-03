@@ -13,13 +13,11 @@ import App, {
   networkRateFromSamples,
   pairingWsUrlCandidates,
 } from "../App";
-import { E2eeSession, decodeBinaryEncryptedFrame, encodeBinaryEncryptedFrame, type E2eeKeyPair } from "../protocol/e2ee";
 import { connectPairingClient } from "../protocol/pairing-client";
 import { decodeSupervisorTerminalClientFrame } from "../protocol/supervisor-terminal";
 import type {
   AttachFramePayload,
   ProtocolPacket,
-  PublicKeyWire,
   SessionFileDownloadStreamReadyPayload,
   SessionFileHttpUploadStreamPayload,
   SessionFileHttpUploadReadyPayload,
@@ -134,41 +132,30 @@ function setMobileVisualViewport(layoutHeight: number, visualHeight: number, off
   window.dispatchEvent(new Event("resize"));
 }
 
-function httpE2eeSessionFromHeaders(daemon: MockDaemon, headers: Headers): E2eeSession {
-  const deviceId = headers.get("x-termd-device-id");
-  const devicePublicKey = headers.get("x-termd-e2ee-public-key");
-  if (!deviceId || !devicePublicKey) {
-    throw new Error("missing HTTP E2EE test headers");
-  }
-  const daemonKeypair = (daemon as unknown as { e2eeKeypair: E2eeKeyPair }).e2eeKeypair;
-  return E2eeSession.daemon({
-    serverId: daemon.serverId,
-    deviceId,
-    localKeypair: daemonKeypair,
-    devicePublicKeyWire: devicePublicKey as PublicKeyWire,
-  });
-}
-
-function encodeHttpE2eeTestFrames(e2ee: E2eeSession, frames: Uint8Array[]): Uint8Array {
+function encodeHttpE2eeTestFrames(frames: Uint8Array[]): Uint8Array {
   return concatBytes(
     ...frames.map((frame) => {
-      const encrypted = encodeBinaryEncryptedFrame(e2ee.encryptBinary(frame));
-      const wire = new Uint8Array(4 + encrypted.byteLength);
-      new DataView(wire.buffer, wire.byteOffset, 4).setUint32(0, encrypted.byteLength, false);
-      wire.set(encrypted, 4);
+      const wire = new Uint8Array(4 + frame.byteLength);
+      new DataView(wire.buffer, wire.byteOffset, 4).setUint32(0, frame.byteLength, false);
+      wire.set(frame, 4);
       return wire;
     }),
   );
 }
 
-function decodeHttpE2eeTestFrames(e2ee: E2eeSession, wire: Uint8Array): Uint8Array[] {
+function decodeHttpE2eeTestFrames(wire: Uint8Array): Uint8Array[] {
   const frames: Uint8Array[] = [];
   let offset = 0;
   while (offset < wire.byteLength) {
+    if (wire.byteLength - offset < 4) {
+      throw new Error("truncated HTTP test frame length");
+    }
     const len = new DataView(wire.buffer, wire.byteOffset + offset, 4).getUint32(0, false);
     offset += 4;
-    const encrypted = decodeBinaryEncryptedFrame(wire.slice(offset, offset + len));
-    frames.push(e2ee.decryptBinary(encrypted));
+    if (len === 0 || wire.byteLength - offset < len) {
+      throw new Error("invalid HTTP test frame body");
+    }
+    frames.push(wire.slice(offset, offset + len));
     offset += len;
   }
   return frames;
@@ -278,8 +265,6 @@ function installHttpUploadOnceMock(
   const uploads: HttpUploadMockRecord[] = [];
   (globalThis as unknown as { fetch: typeof fetch }).fetch = (async (input, init) => {
     const url = new URL(input instanceof Request ? input.url : String(input));
-    const headers = new Headers(init?.headers);
-    const e2ee = httpE2eeSessionFromHeaders(daemon, headers);
     if (url.pathname.endsWith("/api/files/upload/init")) {
       const ready = {
         session_id: sessionId,
@@ -288,10 +273,10 @@ function installHttpUploadOnceMock(
         size_bytes: file.size,
         offset_bytes: 0,
       } satisfies SessionFileHttpUploadReadyPayload;
-      return new Response(responseBodyBytes(encodeHttpE2eeTestFrames(e2ee, [encodeUtf8(JSON.stringify(ready))])));
+      return new Response(responseBodyBytes(encodeHttpE2eeTestFrames([encodeUtf8(JSON.stringify(ready))])));
     }
     if (url.pathname.endsWith("/api/files/upload")) {
-      const frames = decodeHttpE2eeTestFrames(e2ee, await requestBodyBytes(init?.body));
+      const frames = decodeHttpE2eeTestFrames(await requestBodyBytes(init?.body));
       const meta = JSON.parse(new TextDecoder().decode(frames[0])) as SessionFileHttpUploadStreamPayload;
       const bytes = concatBytes(...frames.slice(1));
       uploads.push({ session_id: meta.session_id, path: meta.path, bytes });
@@ -303,7 +288,7 @@ function installHttpUploadOnceMock(
         eof: bytes.byteLength === meta.size_bytes,
         modified_at_ms: null,
       } satisfies SessionFileUploadProgressPayload;
-      return new Response(responseBodyBytes(encodeHttpE2eeTestFrames(e2ee, [encodeUtf8(JSON.stringify(progress))])));
+      return new Response(responseBodyBytes(encodeHttpE2eeTestFrames([encodeUtf8(JSON.stringify(progress))])));
     }
     return originalFetch(input, init);
   }) as typeof fetch;
@@ -329,8 +314,6 @@ function installDelayedHttpUploadInitMock(
   });
   (globalThis as unknown as { fetch: typeof fetch }).fetch = (async (input, init) => {
     const url = new URL(input instanceof Request ? input.url : String(input));
-    const headers = new Headers(init?.headers);
-    const e2ee = httpE2eeSessionFromHeaders(daemon, headers);
     if (url.pathname.endsWith("/api/files/upload/init")) {
       await initReleased;
       const ready = {
@@ -340,10 +323,10 @@ function installDelayedHttpUploadInitMock(
         size_bytes: file.size,
         offset_bytes: 0,
       } satisfies SessionFileHttpUploadReadyPayload;
-      return new Response(responseBodyBytes(encodeHttpE2eeTestFrames(e2ee, [encodeUtf8(JSON.stringify(ready))])));
+      return new Response(responseBodyBytes(encodeHttpE2eeTestFrames([encodeUtf8(JSON.stringify(ready))])));
     }
     if (url.pathname.endsWith("/api/files/upload")) {
-      const frames = decodeHttpE2eeTestFrames(e2ee, await requestBodyBytes(init?.body));
+      const frames = decodeHttpE2eeTestFrames(await requestBodyBytes(init?.body));
       const meta = JSON.parse(new TextDecoder().decode(frames[0])) as SessionFileHttpUploadStreamPayload;
       const bytes = concatBytes(...frames.slice(1));
       uploads.push({ session_id: meta.session_id, path: meta.path, bytes });
@@ -355,7 +338,7 @@ function installDelayedHttpUploadInitMock(
         eof: bytes.byteLength === meta.size_bytes,
         modified_at_ms: null,
       } satisfies SessionFileUploadProgressPayload;
-      return new Response(responseBodyBytes(encodeHttpE2eeTestFrames(e2ee, [encodeUtf8(JSON.stringify(progress))])));
+      return new Response(responseBodyBytes(encodeHttpE2eeTestFrames([encodeUtf8(JSON.stringify(progress))])));
     }
     return originalFetch(input, init);
   }) as typeof fetch;
@@ -405,8 +388,6 @@ function installHttpDownloadMock(
       return originalFetch(input, init);
     }
     calls += 1;
-    const headers = new Headers(init?.headers);
-    const e2ee = httpE2eeSessionFromHeaders(daemon, headers);
     const ready = {
       session_id: sessionId,
       path: filePath,
@@ -414,7 +395,7 @@ function installHttpDownloadMock(
       size_bytes: bytes.byteLength,
       modified_at_ms: null,
     } satisfies SessionFileDownloadStreamReadyPayload;
-    return new Response(responseBodyBytes(encodeHttpE2eeTestFrames(e2ee, [
+    return new Response(responseBodyBytes(encodeHttpE2eeTestFrames([
       encodeUtf8(JSON.stringify(ready)),
       bytes,
     ])));
@@ -589,6 +570,32 @@ function pairingInviteCode(
     expires_at_ms: Date.now() + 60_000,
   });
   return `termd-pair:v1:${Buffer.from(payload, "utf8").toString("base64url")}`;
+}
+
+function expectPairingTokenOnlyInRelayAdmission(daemon: MockDaemon, token = "secret-token"): void {
+  const lines = daemon.outerWireText().split("\n").filter(Boolean);
+  let tokenLineCount = 0;
+  for (const line of lines) {
+    if (!line.includes(token)) {
+      continue;
+    }
+    tokenLineCount += 1;
+    const envelope = JSON.parse(line) as {
+      type?: string;
+      payload?: { admission?: { kind?: string; token?: string } };
+    };
+    expect(envelope).toMatchObject({
+      type: "route_hello",
+      payload: {
+        admission: {
+          kind: "pair_ticket",
+          token,
+        },
+      },
+    });
+  }
+  // trusted relay 能看到 pairing admission；配对完成后的 device admission 不能继续携带 token。
+  expect(tokenLineCount).toBe(1);
 }
 
 async function pairWithInvite(
@@ -1014,7 +1021,7 @@ describe("termui web 工作台", () => {
     );
     await new Promise((resolve) => window.setTimeout(resolve, 250));
     expect(daemon.pingMessages).toBeGreaterThan(0);
-    expect(daemon.outerWireText()).not.toContain("secret-token");
+    expectPairingTokenOnlyInRelayAdmission(daemon);
   });
 
   it("daemon.clients 超时不阻断 session list", async () => {
@@ -3283,6 +3290,7 @@ describe("termui web 工作台", () => {
         secondDaemon.serverId,
         "00000000-0000-0000-0000-000000000999",
         secondDaemon.daemonPublicKey,
+        "second-token",
         APP_CONNECTION_TIMEOUT_MS,
       );
 
@@ -6746,7 +6754,7 @@ describe("termui web 工作台", () => {
     expect(screen.queryByLabelText("WS URL")).toBeNull();
     await waitForWorkspaceSession();
     await expectDaemonUrlInAdmin(user, daemon.url);
-    expect(daemon.outerWireText()).not.toContain("secret-token");
+    expectPairingTokenOnlyInRelayAdmission(daemon);
   });
 
   it("粘贴 relay base URL 邀请码时使用统一 /ws URL", async () => {
@@ -6777,7 +6785,7 @@ describe("termui web 工作台", () => {
     await waitFor(() => expect(screen.queryByLabelText("Pairing token")).toBeNull());
     await waitForWorkspaceSession("No session");
     await expectDaemonUrlInAdmin(user, relayUrl);
-    expect(daemon.outerWireText()).not.toContain("secret-token");
+    expectPairingTokenOnlyInRelayAdmission(daemon);
   });
 
   it("direct Web 路径串联 supervisor-backed session 的 create/list/attach/input/resize/reconnect", async () => {
@@ -8408,7 +8416,7 @@ describe("termui web 工作台", () => {
     await waitForWorkspaceSession();
     await expectDaemonUrlInAdmin(user, daemon.url);
     expect(qrScannerMock.stop).toHaveBeenCalledTimes(1);
-    expect(daemon.outerWireText()).not.toContain("secret-token");
+    expectPairingTokenOnlyInRelayAdmission(daemon);
   });
 
   it("扫码无法识别时可在扫码弹窗粘贴 invite 完成配对", async () => {
@@ -8436,7 +8444,7 @@ describe("termui web 工作台", () => {
     await waitForWorkspaceSession();
     await expectDaemonUrlInAdmin(user, daemon.url);
     expect(qrScannerMock.stop).toHaveBeenCalledTimes(1);
-    expect(daemon.outerWireText()).not.toContain("secret-token");
+    expectPairingTokenOnlyInRelayAdmission(daemon);
   });
 
   it("扫码无法识别时可上传二维码图片解析 invite", async () => {
@@ -8466,7 +8474,7 @@ describe("termui web 工作台", () => {
     await waitForWorkspaceSession();
     await expectDaemonUrlInAdmin(user, daemon.url);
     expect(qrScannerMock.stop).toHaveBeenCalledTimes(1);
-    expect(daemon.outerWireText()).not.toContain("secret-token");
+    expectPairingTokenOnlyInRelayAdmission(daemon);
   });
 
   it("扫描 server_id 不匹配的邀请码时拒绝配对且不显示 token", async () => {
@@ -8493,6 +8501,6 @@ describe("termui web 工作台", () => {
     expect(alert).toHaveTextContent("pairing_payload_server_mismatch");
     expect(alert).toHaveTextContent("pairing payload does not match the connected daemon");
     expect(screen.getByLabelText("Pairing token")).toHaveValue("");
-    expect(daemon.outerWireText()).not.toContain("secret-token");
+    expectPairingTokenOnlyInRelayAdmission(daemon);
   });
 });

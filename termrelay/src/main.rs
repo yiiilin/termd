@@ -1,7 +1,7 @@
 //! termrelay 的 HTTP/WebSocket 入口。
 //!
-//! relay 只负责按 URL 中公开的 `server_id` 转发 WebSocket frame。它不解密、不解析
-//! 内层业务 envelope，也不参与 pairing/auth/session/control 控制权判断。
+//! relay 负责 trusted admission 和按 `server_id` 路由 WebSocket frame。
+//! pairing/auth/session/control 的最终业务判断仍只在 daemon 内执行。
 
 mod args;
 mod router;
@@ -18,7 +18,7 @@ use tracing_subscriber::EnvFilter;
 
 use crate::args::{ArgsError, RelayCommand};
 use crate::router::router;
-use crate::ws::RelayState;
+use crate::ws::{RelayDaemonCredential, RelayState};
 
 #[derive(Debug, Error)]
 enum MainError {
@@ -40,6 +40,10 @@ enum MainError {
     MissingTlsPrivateKey,
     #[error("relay TLS configuration is invalid")]
     TlsConfig,
+    #[error(
+        "daemon registry is required; pass --daemon-registry or explicit --allow-open-relay for legacy/open relay mode"
+    )]
+    MissingDaemonRegistry,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,17 +87,29 @@ async fn main() -> Result<(), MainError> {
         tls = tls.is_some(),
         web = args.web,
         http_tunnel = args.http_tunnel,
-        "starting termrelay dumb pipe"
+        allow_open_relay = args.allow_open_relay,
+        "starting trusted termrelay"
     );
 
-    serve_listener(
-        listener,
-        RelayState::new(args.auth_token),
-        tls,
-        args.web,
-        args.http_tunnel,
-    )
-    .await
+    let daemon_credentials = args
+        .daemon_registry
+        .daemons
+        .into_iter()
+        .map(|daemon| RelayDaemonCredential {
+            server_id: daemon.server_id,
+            token: daemon.token,
+        })
+        .collect::<Vec<_>>();
+    let state = if daemon_credentials.is_empty() {
+        if !args.allow_open_relay {
+            return Err(MainError::MissingDaemonRegistry);
+        }
+        RelayState::new(args.auth_token)
+    } else {
+        RelayState::new_trusted(args.auth_token, daemon_credentials)
+    };
+
+    serve_listener(listener, state, tls, args.web, args.http_tunnel).await
 }
 
 fn help_text() -> String {
@@ -106,6 +122,8 @@ fn help_text() -> String {
             "  --listen, -l <HOST:PORT>      Listen address, default 127.0.0.1:8080\n",
             "  --auth-token <TOKEN>          Transport auth token required from daemon/client relay sockets\n",
             "  --auth-token-file <PATH>      Read transport auth token from a file; conflicts with --auth-token\n",
+            "  --daemon-registry <PATH>      JSON daemon registry enabling trusted relay admission\n",
+            "  --allow-open-relay            Explicitly allow legacy/open relay mode without daemon registry\n",
             "  --tls-cert <CERT_PEM>         TLS certificate path\n",
             "  --tls-key <KEY_PEM>           TLS private key path; must be paired with --tls-cert\n",
             "  --web                         Serve embedded Web UI\n",
@@ -113,8 +131,8 @@ fn help_text() -> String {
             "  -h, --help                    Print help\n",
             "  -V, --version                 Print version\n\n",
             "EXAMPLES:\n",
-            "  termrelay --listen 127.0.0.1:8080\n",
-            "  termrelay --listen 0.0.0.0:8080 --auth-token-file /run/secrets/termrelay_auth_token\n"
+            "  termrelay --listen 127.0.0.1:8080 --allow-open-relay\n",
+            "  termrelay --listen 0.0.0.0:8080 --auth-token-file /run/secrets/termrelay_auth_token --daemon-registry /run/secrets/termrelay_daemons\n"
         ),
         env!("CARGO_PKG_VERSION")
     )

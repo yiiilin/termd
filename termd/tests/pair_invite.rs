@@ -61,7 +61,7 @@ fn pair_qr_prints_single_line_invite_code() {
     assert!(
         stdout
             .lines()
-            .any(|line| line.starts_with("termd-pair:v1:")),
+            .any(|line| line.starts_with("termd-pair:v2:")),
         "stdout={stdout}"
     );
     assert!(
@@ -127,7 +127,7 @@ fn pair_qr_svg_writes_real_svg_and_prints_invite_code() {
     assert!(
         stdout
             .lines()
-            .any(|line| line.starts_with("termd-pair:v1:")),
+            .any(|line| line.starts_with("termd-pair:v2:")),
         "stdout={stdout}"
     );
     let svg = fs::read_to_string(&svg_path).unwrap();

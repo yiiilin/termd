@@ -1,7 +1,7 @@
 //! termd 的共享协议类型。
 //!
 //! 这个 crate 只描述客户端、daemon 与 relay 都需要知道的稳定外壳。
-//! 具体业务规则仍由 daemon 执行，relay 只能基于外层路由字段转发密文。
+//! 具体业务规则仍由 daemon 执行，relay 只能基于公开路由/admission 字段做入口控制和转发。
 
 use base64::{
     Engine as _,
@@ -251,14 +251,14 @@ pub struct Challenge(pub String);
 #[serde(transparent)]
 pub struct Signature(pub String);
 
-/// pairing token 必须有过期时间；token 明文只允许出现在 E2EE 保护范围内。
+/// pairing token 必须有过期时间；token 明文只允许出现在 pairing invite 或已认证通道内。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct PairingToken(pub String);
 
 /// 设备完成认证后使用的短期会话凭证。
 ///
-/// 该 token 只负责认证后续 HTTP / terminal WS 请求，不替代 E2EE，也不表达控制权。
+/// 该 token 只负责认证后续 HTTP / terminal WS 请求，不表达控制权。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SessionToken(pub String);
@@ -274,7 +274,7 @@ fn is_zero_u64(value: &u64) -> bool {
 
 /// 0.2.0 的加密业务包版本；外层 WebSocket/relay 仍只承担 transport。
 pub const PROTOCOL_PACKET_VERSION: u16 = 3;
-/// 二进制数据面版本；双方都声明该版本时，E2EE 后的 packet 使用 WebSocket binary + Protobuf。
+/// 二进制数据面版本；双方都声明该版本时，业务 packet 使用 WebSocket binary + Protobuf。
 pub const BINARY_PROTOCOL_VERSION: u16 = 2;
 
 pub const METHOD_PAIR_REQUEST: &str = "pair.request";
@@ -1166,15 +1166,21 @@ pub struct RouteHelloPayload {
     pub role: RouteRole,
     pub protocol_version: ProtocolVersion,
     pub nonce: Nonce,
+    /// 可信 relay 在注册路由前使用的入场凭证。
+    ///
+    /// 中文注释：去掉 E2EE 后，relay 必须先确认连接是否允许进入对应 daemon 房间；
+    /// termd 后续仍会对 pair/auth 做最终校验。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission: Option<RelayAdmissionPayload>,
     /// daemon mux 的公开连接代际。
     ///
-    /// relay 只用它确认新 mux 是否替换旧 mux，不解析任何业务密文。
+    /// relay 只用它确认新 mux 是否替换旧 mux，不持有 daemon 业务状态。
     #[serde(default)]
     pub route_generation: Option<Nonce>,
     /// daemon data 连接要绑定的 relay client。
     ///
     /// browser client 和 daemon data 是一一配对的数据管道；relay 只用该字段做连接配对，
-    /// 不解析后续 E2EE 业务内容。该字段为空时表示 daemon 预先建立的 idle data pipe，
+    /// 不解析后续业务内容。该字段为空时表示 daemon 预先建立的 idle data pipe，
     /// relay 会在后续 client 接入时通过公开生命周期帧把它分配给具体 client。
     #[serde(default)]
     pub client_id: Option<RelayClientId>,
@@ -1186,6 +1192,24 @@ pub struct RouteHelloPayload {
     #[serde(default)]
     pub data_token: Option<Nonce>,
     pub timestamp_ms: UnixTimestampMillis,
+}
+
+/// relay 入场凭证只用于 admission，不表达终端业务权限。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RelayAdmissionPayload {
+    Daemon {
+        token: String,
+    },
+    PairTicket {
+        token: PairingToken,
+    },
+    Device {
+        device_id: DeviceId,
+        nonce: Nonce,
+        timestamp_ms: UnixTimestampMillis,
+        signature: Signature,
+    },
 }
 
 /// routing prelude 通过后返回的确认消息。
@@ -1202,6 +1226,10 @@ pub struct HelloPayload {
     pub nonce: Nonce,
     pub timestamp_ms: UnixTimestampMillis,
     pub server_id: Option<ServerId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_public_key: Option<PublicKey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary_version: Option<ProtocolVersion>,
     pub device_id: Option<DeviceId>,
 }
 
@@ -1297,8 +1325,9 @@ pub struct PairingQrPayload {
 
 impl PairingQrPayload {
     pub const PAYLOAD_TYPE: &'static str = "termd_pairing_qr";
-    pub const VERSION: u16 = 1;
-    const INVITE_PREFIX: &'static str = "termd-pair:v1:";
+    pub const VERSION: u16 = 2;
+    const INVITE_PREFIX: &'static str = "termd-pair:v2:";
+    const LEGACY_INVITE_PREFIX: &'static str = "termd-pair:v1:";
 
     pub fn new(
         token: PairingToken,
@@ -1322,7 +1351,7 @@ impl PairingQrPayload {
     }
 
     pub fn is_supported_version(&self) -> bool {
-        self.payload_type == Self::PAYLOAD_TYPE && self.version == Self::VERSION
+        self.payload_type == Self::PAYLOAD_TYPE && matches!(self.version, 1 | Self::VERSION)
     }
 
     /// 把 pairing payload 压成单行邀请码，便于复制粘贴和 QR 承载。
@@ -1338,7 +1367,10 @@ impl PairingQrPayload {
     /// 这里同时保留对旧 JSON 文本的兼容，便于平滑迁移已有复制流程。
     pub fn parse_invite_code(raw: &str) -> Option<Self> {
         let trimmed = raw.trim();
-        if let Some(encoded) = trimmed.strip_prefix(Self::INVITE_PREFIX) {
+        if let Some(encoded) = trimmed
+            .strip_prefix(Self::INVITE_PREFIX)
+            .or_else(|| trimmed.strip_prefix(Self::LEGACY_INVITE_PREFIX))
+        {
             let bytes = URL_SAFE_NO_PAD.decode(encoded).ok()?;
             let payload: Self = serde_json::from_slice(&bytes).ok()?;
             return payload.is_supported_version().then_some(payload);
@@ -2151,7 +2183,7 @@ pub struct RelayClientId(pub u64);
 /// relay transport 生命周期消息。
 ///
 /// 该消息只用于建立/关闭/分配 relay transport 数据管道，不包含 terminal、session、
-/// auth 或 E2EE 明文。真正的 browser-daemon 业务流仍只在配对后的 data 线上按原始
+/// auth 明文。真正的 browser-daemon 业务流仍只在配对后的 data 线上按原始
 /// WebSocket frame 透传。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -2725,6 +2757,7 @@ mod tests {
                 role: RouteRole::Client,
                 protocol_version: ProtocolVersion::default(),
                 nonce: Nonce("route-nonce".to_owned()),
+                admission: None,
                 route_generation: None,
                 client_id: None,
                 data_token: None,
@@ -2750,6 +2783,40 @@ mod tests {
     }
 
     #[test]
+    fn route_prelude_carries_trusted_relay_admission() {
+        let server_id = ServerId::new();
+        let device_id = DeviceId::new();
+        let route_hello = Envelope::new(
+            MessageType::RouteHello,
+            RouteHelloPayload {
+                server_id,
+                role: RouteRole::Client,
+                protocol_version: ProtocolVersion::default(),
+                nonce: Nonce("route-nonce".to_owned()),
+                admission: Some(RelayAdmissionPayload::Device {
+                    device_id,
+                    nonce: Nonce("device-nonce".to_owned()),
+                    timestamp_ms: UnixTimestampMillis(1_710_000_000_001),
+                    signature: Signature("device-signature".to_owned()),
+                }),
+                route_generation: None,
+                client_id: None,
+                data_token: None,
+                timestamp_ms: UnixTimestampMillis(1_710_000_000_000),
+            },
+        );
+
+        let json = serde_json::to_value(&route_hello).unwrap();
+
+        assert_eq!(json["payload"]["admission"]["kind"], "device");
+        assert_eq!(
+            json["payload"]["admission"]["device_id"],
+            device_id.0.to_string()
+        );
+        assert_roundtrip(route_hello);
+    }
+
+    #[test]
     fn mvp_auth_and_pairing_payloads_roundtrip() {
         let device_id = DeviceId::new();
         let server_id = ServerId::new();
@@ -2758,6 +2825,8 @@ mod tests {
             nonce: Nonce("hello-nonce".to_owned()),
             timestamp_ms: UnixTimestampMillis(1_710_000_000_000),
             server_id: Some(server_id),
+            daemon_public_key: Some(PublicKey("daemon-pub".to_owned())),
+            binary_version: Some(ProtocolVersion::default()),
             device_id: Some(device_id),
         };
         let auth = AuthPayload {
@@ -2894,8 +2963,39 @@ mod tests {
         );
         let invite = payload.to_invite_code();
 
-        assert!(invite.starts_with("termd-pair:v1:"));
+        assert!(invite.starts_with("termd-pair:v2:"));
         assert_eq!(PairingQrPayload::parse_invite_code(&invite), Some(payload));
+    }
+
+    #[test]
+    fn pairing_qr_payload_accepts_legacy_v1_invite_code() {
+        let payload = PairingQrPayload::new(
+            PairingToken("pair-token".to_owned()),
+            ServerId(Uuid::nil()),
+            UnixTimestampMillis(1_710_000_060_000),
+        )
+        .with_daemon_public_key(PublicKey("ed25519-v1:legacy-daemon".to_owned()));
+        let mut legacy = payload.clone();
+        legacy.version = 1;
+        let raw = serde_json::to_vec(&legacy).unwrap();
+        let invite = format!("termd-pair:v1:{}", URL_SAFE_NO_PAD.encode(raw));
+
+        assert_eq!(PairingQrPayload::parse_invite_code(&invite), Some(legacy));
+    }
+
+    #[test]
+    fn pairing_qr_payload_uses_plaintext_trusted_relay_version() {
+        let payload = PairingQrPayload::new(
+            PairingToken("pair-token".to_owned()),
+            ServerId(Uuid::nil()),
+            UnixTimestampMillis(1_710_000_060_000),
+        );
+        let invite = payload.to_invite_code();
+        let json = serde_json::to_value(&payload).unwrap();
+
+        assert_eq!(PairingQrPayload::VERSION, 2);
+        assert!(invite.starts_with("termd-pair:v2:"));
+        assert!(json.get("daemon_public_key").is_none());
     }
 
     #[test]
