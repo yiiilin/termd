@@ -67,6 +67,9 @@ const WEBSOCKET_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const WEBSOCKET_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const RELAY_REGISTRATION_TIMEOUT: Duration = Duration::from_secs(4);
 const RELAY_REGISTRATION_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const RELAY_PAIR_TICKET_REGISTRATION_ATTEMPTS: usize = 3;
+const RELAY_DEVICE_REGISTRATION_ATTEMPTS: usize = 2;
+const RELAY_REGISTRATION_RETRY_DELAY: Duration = Duration::from_millis(150);
 // direct WebSocket 与 relay 传输保持同量级限制；终端 snapshot 可能是数 MB 的
 // 单个 binary frame，过小的 frame limit 会把正常重连误判为异常大消息。
 const WEBSOCKET_MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
@@ -2197,21 +2200,39 @@ async fn register_relay_pair_ticket_from_config(
         .http1_only()
         .build()
         .map_err(|_| RelayRegistrationError::Client)?;
-    client
-        .post(endpoint)
-        .header("x-termd-relay-daemon-token", target.daemon_token)
-        .json(&payload)
-        .send()
-        .await
-        .map_err(relay_registration_request_error)
-        .and_then(|response| {
-            if response.status().is_success() {
-                Ok(())
-            } else {
-                Err(RelayRegistrationError::Status(response.status().as_u16()))
+    let mut last_error = None;
+    for attempt in 1..=RELAY_PAIR_TICKET_REGISTRATION_ATTEMPTS {
+        let result = client
+            .post(endpoint.as_str())
+            .header("x-termd-relay-daemon-token", target.daemon_token.as_str())
+            .json(&payload)
+            .send()
+            .await
+            .map_err(relay_registration_request_error)
+            .and_then(|response| {
+                if response.status().is_success() {
+                    Ok(())
+                } else {
+                    Err(RelayRegistrationError::Status(response.status().as_u16()))
+                }
+            });
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error @ RelayRegistrationError::Request(_))
+                if attempt < RELAY_PAIR_TICKET_REGISTRATION_ATTEMPTS =>
+            {
+                // 中文注释：公网 relay 的 HTTPS 建连偶发卡住；pair invite 是人工触发，
+                // 短重试比直接返回 503 更符合用户预期，同时不会吞掉 401/4xx 配置错误。
+                debug!(%error, attempt, "retrying relay pair-ticket registration");
+                last_error = Some(error);
+                tokio::time::sleep(RELAY_REGISTRATION_RETRY_DELAY).await;
             }
-        })?;
-    Ok(())
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        RelayRegistrationError::Request("relay pair-ticket registration exhausted".to_owned())
+    }))
 }
 
 pub(crate) fn register_relay_device_from_config(
@@ -2238,22 +2259,40 @@ pub(crate) fn register_relay_device_from_config(
         .http1_only()
         .build()
         .map_err(|_| RelayRegistrationError::Client)?;
-    client
-        .post(endpoint)
-        .header("x-termd-relay-daemon-token", target.daemon_token)
-        .json(&payload)
-        .send()
-        .map_err(relay_registration_request_error)
-        .and_then(|response| {
-            if response.status() == reqwest::StatusCode::BAD_REQUEST {
-                Err(RelayRegistrationError::InvalidDevicePublicKey)
-            } else if response.status().is_success() {
-                Ok(())
-            } else {
-                Err(RelayRegistrationError::Status(response.status().as_u16()))
+    let mut last_error = None;
+    for attempt in 1..=RELAY_DEVICE_REGISTRATION_ATTEMPTS {
+        let result = client
+            .post(endpoint.as_str())
+            .header("x-termd-relay-daemon-token", target.daemon_token.as_str())
+            .json(&payload)
+            .send()
+            .map_err(relay_registration_request_error)
+            .and_then(|response| {
+                if response.status() == reqwest::StatusCode::BAD_REQUEST {
+                    Err(RelayRegistrationError::InvalidDevicePublicKey)
+                } else if response.status().is_success() {
+                    Ok(())
+                } else {
+                    Err(RelayRegistrationError::Status(response.status().as_u16()))
+                }
+            });
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error @ RelayRegistrationError::Request(_))
+                if attempt < RELAY_DEVICE_REGISTRATION_ATTEMPTS =>
+            {
+                // 中文注释：device 注册处于 PairRequest 响应路径，重试次数必须保守，
+                // 保证最坏情况仍短于 termctl 的 response 等待窗口。
+                debug!(%error, attempt, "retrying relay device registration");
+                last_error = Some(error);
+                std::thread::sleep(RELAY_REGISTRATION_RETRY_DELAY);
             }
-        })?;
-    Ok(())
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        RelayRegistrationError::Request("relay device registration exhausted".to_owned())
+    }))
 }
 
 pub(crate) fn register_relay_device_from_config_background(
