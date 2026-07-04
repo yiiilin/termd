@@ -49,6 +49,8 @@ pub enum TermctlError {
     ConnectFailed,
     #[error("websocket connection closed")]
     ConnectionClosed,
+    #[error("daemon hello timed out after relay route was ready")]
+    DaemonHelloTimeout,
     #[error("failed to send websocket message")]
     SendFailed,
     #[error("failed to receive websocket message")]
@@ -90,6 +92,7 @@ impl TermctlError {
             Self::InvalidDeviceKey => "invalid_device_key",
             Self::ConnectFailed => "connect_failed",
             Self::ConnectionClosed => "connection_closed",
+            Self::DaemonHelloTimeout => "daemon_hello_timeout_after_route_ready",
             Self::SendFailed => "send_failed",
             Self::ReceiveFailed => "receive_failed",
             Self::InvalidEnvelope => "invalid_envelope",
@@ -127,6 +130,9 @@ impl TermctlError {
             Self::InvalidDeviceKey => "local device signing key is invalid",
             Self::ConnectFailed => "failed to connect websocket",
             Self::ConnectionClosed => "websocket connection closed",
+            Self::DaemonHelloTimeout => {
+                "relay route is ready, but daemon hello did not arrive in time"
+            }
             Self::SendFailed => "failed to send websocket message",
             Self::ReceiveFailed => "failed to receive websocket message",
             Self::InvalidEnvelope => "message envelope is invalid",
@@ -176,6 +182,7 @@ impl TermctlError {
             | Self::AuthChallengeTimeout => 5,
             Self::ConnectFailed
             | Self::ConnectionClosed
+            | Self::DaemonHelloTimeout
             | Self::SendFailed
             | Self::ReceiveFailed
             | Self::PendingPacketQueueFull
@@ -192,6 +199,7 @@ impl TermctlError {
             self,
             Self::ConnectFailed
                 | Self::ConnectionClosed
+                | Self::DaemonHelloTimeout
                 | Self::SendFailed
                 | Self::ReceiveFailed
                 | Self::PendingPacketQueueFull
@@ -227,5 +235,15 @@ mod tests {
             error.safe_message(),
             "pairing succeeded but local state could not be finalized"
         );
+    }
+
+    #[test]
+    fn daemon_hello_timeout_has_specific_public_error() {
+        set_json_output(false);
+        let error = TermctlError::DaemonHelloTimeout;
+
+        assert_eq!(error.code(), "daemon_hello_timeout_after_route_ready");
+        assert!(error.is_connection_error());
+        assert_eq!(error.exit_code(), 6);
     }
 }

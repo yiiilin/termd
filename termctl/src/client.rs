@@ -48,6 +48,9 @@ use crate::error::{Result, TermctlError};
 use crate::state::PairedServerState;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+// 中文注释：trusted relay 会先给 client route_ready，再等待 daemon data pipe 反连。
+// 这里要匹配 relay/daemon 的 20s 配对窗口，避免公网慢路径被误报为普通连接关闭。
+const DAEMON_HELLO_TIMEOUT: Duration = Duration::from_secs(20);
 // 公网 relay 偶发卡在 TCP/TLS/WebSocket open 阶段；一次性 CLI 不应让单次半开握手
 // 吃掉数秒。快速失败后重试，最后仍保留多次机会覆盖真实网络抖动。
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(1200);
@@ -233,9 +236,9 @@ impl DirectClient {
             public_key: expected_daemon_public_key,
         };
 
-        let envelope = timeout(HANDSHAKE_TIMEOUT, read_outer(&mut socket))
+        let envelope = timeout(DAEMON_HELLO_TIMEOUT, read_outer(&mut socket))
             .await
-            .map_err(|_| TermctlError::ConnectionClosed)??;
+            .map_err(|_| TermctlError::DaemonHelloTimeout)??;
         let hello: HelloPayload = match envelope.kind {
             MessageType::Hello => {
                 decode_payload(envelope.payload).map_err(|_| TermctlError::InvalidEnvelope)?

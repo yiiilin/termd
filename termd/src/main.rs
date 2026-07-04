@@ -77,6 +77,7 @@ const HELP_TEXT: &str = concat!(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    install_rustls_crypto_provider();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -133,6 +134,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn install_rustls_crypto_provider() {
+    // 中文注释：reqwest 与 tokio-rustls 可能让 rustls 同时编入多个 provider；
+    // 进程启动时显式选择 aws-lc，避免首次 HTTPS 注册 relay admission 时失败。
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+}
+
 async fn serve_daemon(
     listen: Option<ListenAddress>,
     relay_urls: Vec<String>,
@@ -156,8 +163,10 @@ async fn serve_daemon(
             .chain(relay_urls.into_iter()),
     )?;
     if let Some(first_relay_endpoint) = relay_endpoints.first() {
-        config.default_pairing_ws_url = RelayBaseUrl::parse(first_relay_endpoint)?
-            .client_url_template_with_auth(relay_auth_token.as_deref());
+        // 中文注释：relay auth token 是旧 transport 凭证，只给 daemon 连接使用；
+        // browser/termctl pairing 入口现在靠短期 PairTicket admission，不能携带长期 token。
+        config.default_pairing_ws_url =
+            RelayBaseUrl::parse(first_relay_endpoint)?.client_url_template();
     }
     let relay_proxy_url = resolve_relay_proxy_url(relay_proxy_url, &relay_endpoints, |name| {
         std::env::var(name).ok()
@@ -1960,6 +1969,15 @@ mod tests {
         );
         assert!(payload.ws_url.is_none());
         assert!(payload.is_supported_version());
+    }
+
+    #[test]
+    fn relay_pairing_url_does_not_include_legacy_transport_token() {
+        let relay_url = RelayBaseUrl::parse("wss://relay.example/ws").unwrap();
+
+        // 中文注释：trusted relay 的浏览器入口靠 PairTicket admission，
+        // pairing invite 不能再携带长期 relay transport token。
+        assert_eq!(relay_url.client_url_template(), "wss://relay.example/ws");
     }
 
     #[test]

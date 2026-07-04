@@ -1,6 +1,6 @@
 # 公网部署方案
 
-本文给出 termd / termrelay / termctl / Web MVP 的最小公网部署方式。核心原则只有一条：**relay 是可信 admission/routing 层，公开入口必须有 transport token 和 daemon registry，session/PTY 状态仍只在 daemon。**
+本文给出 termd / termrelay / termctl / Web MVP 的最小公网部署方式。核心原则只有一条：**relay 是可信 admission/routing 层，公开入口只接受已注册 daemon 和短期 client admission，session/PTY 状态仍只在 daemon。**
 
 ## 推荐拓扑
 
@@ -30,10 +30,10 @@ Reverse Proxy (TLS termination + access log control)
 公网 client 和 daemon outbound connector 使用同一个 WebSocket 入口：
 
 ```text
-wss://relay.example/ws?relay_token=...
+wss://relay.example/ws
 ```
 
-`server_id` 不再出现在 URL path 中，而是在连接建立后的 `route_hello` 明文前置握手里声明；`relay_token` 是 transport 凭证，不是设备身份，也不是 shared-control operator 状态。daemon 还会在 `route_hello.admission` 里提交 daemon token，relay 通过 daemon registry 决定是否允许该 daemon 进入对应 `server_id` 房间。
+`server_id` 不再出现在 URL path 中，而是在连接建立后的 `route_hello` 明文前置握手里声明。daemon 会在 `route_hello.admission` 里提交 daemon token，relay 通过 daemon registry 决定是否允许该 daemon 进入对应 `server_id` 房间。浏览器和 `termctl` 使用短期 PairTicket admission，不需要长期 `relay_token` query。
 
 ## TLS 与反向代理
 
@@ -83,6 +83,14 @@ server {
         proxy_send_timeout 3600s;
     }
 
+    # daemon 注册、pair ticket 注册和 device admission 注册使用该路径。
+    # 这些请求携带短期或长期 admission 材料，反向代理不要记录 headers/body。
+    location /api/relay/ {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+    }
+
     # 只有启用 termrelay --http-tunnel 后才需要这些文件传输兼容路径。
     location /api/files/ {
         proxy_pass http://127.0.0.1:8080;
@@ -96,19 +104,19 @@ server {
 
 要点：
 
-- access log 里不要记录 `$request_uri`，否则 `relay_token` 会出现在日志里。
+- 不要把 setup token、daemon token 或旧 `relay_token` 写进 URL、argv 或反向代理日志。
 - WebSocket upgrade 必须保留 `Upgrade` / `Connection` 头。
 - `/api/control/*` 是默认启用的 HTTP control tunnel；relay 仍只做 route admission 和转发，daemon 继续校验 bearer/session 权限。
-- 如果反向代理做了额外的 rewrite，最终仍必须把公开入口收敛到 relay 的 `/ws`，并保留 query string 中的 `relay_token`。
+- 如果反向代理做了额外的 rewrite，最终仍必须把公开入口收敛到 relay 的 `/ws`。
 
 ## token 与 pairing 边界
 
 - `termd /local/pairing-token` 只适合 loopback 或私网管理面，不要通过公网反代公开。
 - `termctl pair` 和 Web MVP 只消费 token，不负责签发 token。
-- 如果公网 relay 配置了 transport token（生产建议通过 `--auth-token-file` 注入），浏览器和 `termctl` 都需要把 `relay_token` 带在 relay URL query string 中。
+- relay setup token 是 daemon 注册凭证，安装 relay 时生成；只在 `termd` 注册到 relay 时使用，不持久化到浏览器或 pairing invite。
+- daemon token 由 `termd` 安装脚本自动生成并保存为 `/etc/termd/termd_daemon_token`；relay registry 只持久化它的 hash。
+- 旧 `--auth-token-file` / `relay_token` query 仍可用于迁移兼容；新 trusted relay 默认不要求浏览器或 `termctl` 携带长期 query token。
 - client 侧 `route_hello.admission` 只是在 trusted relay 上要求“带 admission 外壳”后才分配 daemon data pipe；pairing token、device signature、bearer 和 session scope 的最终校验仍全部在 daemon。
-- 由于浏览器 WebSocket 不能自由设置自定义 header，`relay_token` 的 query 形式是当前实现的 transport 约束，不应把它当作用户认证方案。
-- daemon registry 里的 token 是 daemon admission token，给 `termd --relay-daemon-token` 使用；它可以和 `relay_token` 不同，建议分开生成和轮换。
 
 daemon registry JSON 示例：
 
@@ -117,7 +125,7 @@ daemon registry JSON 示例：
   "daemons": [
     {
       "server_id": "00000000-0000-0000-0000-000000000001",
-      "token": "daemon-secret-from-openssl-rand-hex-32"
+      "token_hash": "sha256:..."
     }
   ]
 }
@@ -125,12 +133,15 @@ daemon registry JSON 示例：
 
 ## HTTP 文件 tunnel 兼容开关
 
-`termrelay` 默认挂载 `/healthz`、`/ws`、`/api/control/*` 和可选 Web fallback。`/api/files/upload/init`、`/api/files/upload`、`/api/files/upload/abort`、`/api/files/download` 默认返回非成功状态，并提示需要 `--http-tunnel`。
+`termrelay` 默认挂载 `/healthz`、`/ws`、`/api/control/*`、`/api/relay/*` 和可选 Web fallback。`/api/files/upload/init`、`/api/files/upload`、`/api/files/upload/abort`、`/api/files/download` 默认返回非成功状态，并提示需要 `--http-tunnel`。
 
 只有需要旧版浏览器文件上传/下载经 relay 中转时，才显式启用：
 
 ```bash
-cargo run -p termrelay -- --listen 127.0.0.1:8080 --auth-token-file /etc/termd/termrelay_auth_token --http-tunnel
+cargo run -p termrelay -- --listen 127.0.0.1:8080 \
+  --setup-token-file /etc/termd/termrelay_setup_token \
+  --daemon-registry /var/lib/termrelay/daemon-registry.json \
+  --http-tunnel
 ```
 
 启用后 relay 只把 HTTP request/response body 编码为 tunnel frame 转发给 daemon data pipe，不保存文件、不判断 session 权限；实际 bearer、scope token、pairing/auth 仍由 daemon 校验。
@@ -143,31 +154,18 @@ cargo run -p termrelay -- --listen 127.0.0.1:8080 --auth-token-file /etc/termd/t
 
 ## 最小部署命令
 
+推荐直接用安装脚本完成 relay setup token、daemon token 和 registry 注册，避免手工生成 `server_id` 映射：
+
 ```bash
-sudo install -d -m 0755 /etc/termd
-RELAY_TOKEN="$(openssl rand -hex 32)"
-DAEMON_TOKEN="$(openssl rand -hex 32)"
-SERVER_ID="$(curl -fsS http://127.0.0.1:8765/healthz | sed -n 's/.*"server_id":"\([^"]*\)".*/\1/p')"
-test -n "$SERVER_ID"
-printf '%s\n' "$RELAY_TOKEN" | sudo tee /etc/termd/termrelay_auth_token >/dev/null
-printf '%s\n' "$RELAY_TOKEN" | sudo tee /etc/termd/termd_relay_token >/dev/null
-printf '%s\n' "$DAEMON_TOKEN" | sudo tee /etc/termd/termd_daemon_token >/dev/null
-sudo tee /etc/termd/termrelay-daemons.json >/dev/null <<EOF
-{"daemons":[{"server_id":"$SERVER_ID","token":"$DAEMON_TOKEN"}]}
-EOF
-sudo chown "$(id -u):$(id -g)" /etc/termd/termrelay_auth_token
-sudo chown "$(id -u):$(id -g)" /etc/termd/termd_relay_token
-sudo chown "$(id -u):$(id -g)" /etc/termd/termd_daemon_token
-sudo chown "$(id -u):$(id -g)" /etc/termd/termrelay-daemons.json
-sudo chmod 400 /etc/termd/termrelay_auth_token
-sudo chmod 400 /etc/termd/termd_relay_token
-sudo chmod 400 /etc/termd/termd_daemon_token
-sudo chmod 400 /etc/termd/termrelay-daemons.json
-cargo run -p termrelay -- --listen 127.0.0.1:8080 --auth-token-file /etc/termd/termrelay_auth_token --daemon-registry /etc/termd/termrelay-daemons.json
-cargo run -p termd -- --relay wss://relay.example:443 --relay-auth-token-file /etc/termd/termd_relay_token --relay-daemon-token-file /etc/termd/termd_daemon_token
+curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termrelay.sh \
+  | sudo bash -s -- --web --listen 127.0.0.1:8080
+
+curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termd.sh \
+  | sudo bash -s -- --relay wss://relay.example:443 \
+      --relay-setup-token-file /etc/termd/termrelay_setup_token
 ```
 
-公网部署不要把 relay token 或 daemon token 放进 argv；内联 token 参数只保留给本机 smoke/dev。
+安装脚本会生成 relay setup token 和 daemon token，并调用 relay 注册 API 把 daemon token hash 写入 registry。公网部署不要把 setup token 或 daemon token 放进 argv；内联 token 参数只保留给本机 smoke/dev。
 
 生成一份可在 daemon Web 和 relay Web 里直接使用的单行邀请码。邀请码只包含 daemon 标识和短期 token；Web 默认使用当前页面的连接地址，普通使用者不需要查看或拼接 `server_id`：
 
@@ -178,7 +176,7 @@ PAIR_INVITE="$(cargo run -q -p termd -- pair --qr | tail -n1)"
 客户端通过同一个 relay 入口访问：
 
 ```bash
-cargo run -p termctl -- pair --payload "$PAIR_INVITE" --url "wss://relay.example/ws?relay_token=$RELAY_TOKEN"
+cargo run -p termctl -- pair --payload "$PAIR_INVITE" --url "wss://relay.example/ws"
 ```
 
 Web MVP 打开 daemon 页面或 relay 页面后都粘贴同一段 `termd-pair:v2:...` 邀请码。页面默认使用当前地址；需要其他地址时，使用 Web 的高级地址设置手动覆盖。relay 做入口 admission 和 daemon 路由；pairing token 仍由 daemon 最终验证。
@@ -187,7 +185,7 @@ Web MVP 打开 daemon 页面或 relay 页面后都粘贴同一段 `termd-pair:v2
 
 1. 确认 `relay.example:443` 返回 `healthz`。
 2. 确认 `termd` 只在内网/loopback 暴露 `8765`。
-3. 确认 `relay_token` 不出现在 access log、proxy error log 或监控事件里。
+3. 确认 setup token、daemon token 和旧 `relay_token` 不出现在 access log、proxy error log 或监控事件里。
 4. 确认 `/local/pairing-token` 不能从公网访问。
 5. 确认 `wss://relay.example/ws` 可以完成 pair / new / list，relay 通过 `route_hello.server_id` 和 daemon registry 选择 daemon。
 
@@ -278,31 +276,23 @@ cd deploy/termrelay
 cp .env.example .env
 ```
 
-`.env` 里至少要填写 `TERMRELAY_IMAGE`、`TERMRELAY_DOMAIN`、`TERMRELAY_AUTH_TOKEN_FILE` 和 `TERMRELAY_DAEMON_REGISTRY_FILE`。这个 compose 文件面向公网 Caddy 部署，启动时会要求 secret 文件路径非空；compose 通过 Caddy 终止 TLS，再反向代理到 `termrelay:8080`。
+`.env` 里至少要填写 `TERMRELAY_IMAGE`、`TERMRELAY_DOMAIN` 和 `TERMRELAY_SETUP_TOKEN_FILE`。这个 compose 文件面向公网 Caddy 部署，启动时会要求 setup token secret 文件路径非空；compose 通过 Caddy 终止 TLS，再反向代理到 `termrelay:8080`。
 
-先生成 relay transport token 和 daemon registry 两个 secret 文件，再把 `.env` 里的路径指向它们，最后启动 compose：
+先生成 relay setup token secret 文件，再把 `.env` 里的路径指向它，最后启动 compose。daemon registry 存在 compose 的 `termrelay_state` volume 内，由注册 API 维护：
 
 ```bash
 sudo install -d -m 0755 /etc/termd
-openssl rand -hex 32 | sudo tee /etc/termd/termrelay_auth_token >/dev/null
-DAEMON_TOKEN="$(openssl rand -hex 32)"
-SERVER_ID="$(curl -fsS http://127.0.0.1:8765/healthz | sed -n 's/.*"server_id":"\([^"]*\)".*/\1/p')"
-test -n "$SERVER_ID"
-sudo tee /etc/termd/termrelay-daemons.json >/dev/null <<EOF
-{"daemons":[{"server_id":"$SERVER_ID","token":"$DAEMON_TOKEN"}]}
-EOF
-sudo chown 10001:10001 /etc/termd/termrelay_auth_token
-sudo chown 10001:10001 /etc/termd/termrelay-daemons.json
-sudo chmod 400 /etc/termd/termrelay_auth_token
-sudo chmod 400 /etc/termd/termrelay-daemons.json
+openssl rand -hex 32 | sudo tee /etc/termd/termrelay_setup_token >/dev/null
+sudo chown 10001:10001 /etc/termd/termrelay_setup_token
+sudo chmod 400 /etc/termd/termrelay_setup_token
 docker compose up -d
 ```
 
-compose 会把 token 文件作为 Docker secret 挂载到 `/run/secrets/termrelay_auth_token`，把 daemon registry 挂载到 `/run/secrets/termrelay_daemons`；release 镜像以 UID/GID `10001` 运行，因此 host 上的 secret 文件需要对 `10001:10001` 可读，同时不能 world-readable。token 文件末尾换行会被忽略，空文件或全空白内容会导致启动失败。不要把真实 token 写进 `.env` 或 compose command，这样 `docker compose config` 和 Docker inspect metadata 只会包含 secret 文件路径，不会展开 token 明文。secret 文件不要放在仓库目录内，也不要提交到 git。
+compose 会把 setup token 文件作为 Docker secret 挂载到 `/run/secrets/termrelay_setup_token`；release 镜像以 UID/GID `10001` 运行，因此 host 上的 secret 文件需要对 `10001:10001` 可读，同时不能 world-readable。token 文件末尾换行会被忽略，空文件或全空白内容会导致启动失败。不要把真实 token 写进 `.env` 或 compose command，这样 `docker compose config` 和 Docker inspect metadata 只会包含 secret 文件路径，不会展开 token 明文。secret 文件不要放在仓库目录内，也不要提交到 git。
 
 该 compose 默认不传 `--http-tunnel`。如果必须保留旧版文件 HTTP tunnel，在 `termrelay.command` 里追加 `--http-tunnel`，同时确认反向代理只暴露预期路径。
 
-随 compose 提供的 Caddyfile 会在全局日志层把 `request.uri` 里的 `relay_token` 替换成 `REDACTED`，用于覆盖 upstream error、`reverse_proxy` 502 等错误日志路径。如果改用自定义 Caddyfile 或额外启用 access log，也必须同时对 error log 和 access log 做同等脱敏，避免 `/ws?relay_token=...` 进入 stdout、文件日志或集中日志系统。
+随 compose 提供的 Caddyfile 保留了旧 `relay_token` 日志脱敏，用于迁移兼容。如果改用自定义 Caddyfile 或额外启用 access log，也必须避免 setup token、daemon token 或旧 `relay_token` 进入 stdout、文件日志或集中日志系统。
 
 仅本机开发或一次性 smoke 才可以不启用 relay token，并且不要复用上面的公网 Caddy compose。可以直接在 loopback 上运行：
 

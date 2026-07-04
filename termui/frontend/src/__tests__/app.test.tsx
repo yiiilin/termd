@@ -6898,9 +6898,9 @@ describe("termui web 工作台", () => {
       expect(renderedText).not.toContain(sensitive);
     }
 
-    // outer wire 允许出现 encrypted_frame 的字段名，但不能出现 token 或终端/私钥明文值。
+    // 中文注释：trusted relay 的 route_hello 会携带 pair_ticket admission，所以 pairing token
+    // 可能出现在外层路由前置帧；这里仍要确保 daemon 错误、私钥和终端内容不会泄漏。
     for (const sensitive of [
-      "wrong-token",
       "secret-token",
       "server_private_key",
       "private-value",

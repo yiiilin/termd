@@ -296,34 +296,26 @@ run_relay_runtime_e2e() (
     exit 1
   fi
 
-  mapfile -t pairing_payload < <(TERMD_QA_DAEMON_PORT="$daemon_port" python3 - <<'PY'
+  pairing_output="$("$TERMD_BIN" pair --url "http://127.0.0.1:${daemon_port}" --qr)"
+  pairing_invite="$(printf '%s\n' "$pairing_output" | awk '/^termd-pair:v2:/{print; exit}')"
+  mapfile -t pairing_payload < <(TERMD_QA_PAIRING_INVITE="$pairing_invite" python3 - <<'PY'
 import base64
 import json
 import os
-import urllib.request
 
-# relay E2E 直接使用 daemon 本地 token 接口返回的 ws_url，验证使用者不需要手工拼 server_id。
-daemon_port = os.environ["TERMD_QA_DAEMON_PORT"]
-request = urllib.request.Request(f"http://127.0.0.1:{daemon_port}/local/pairing-token", method="POST")
-with urllib.request.urlopen(request, timeout=2) as response:
-    payload = json.load(response)
-invite_payload = json.dumps({
-    "type": "termd_pairing_qr",
-    "version": 1,
-    "token": payload["token"],
-    "server_id": payload["server_id"],
-    "daemon_public_key": payload["daemon_public_key"],
-    "expires_at_ms": payload["expires_at_ms"],
-    "ws_url": payload["ws_url"],
-}, separators=(",", ":"))
-invite_code = "termd-pair:v1:" + base64.urlsafe_b64encode(invite_payload.encode()).decode().rstrip("=")
+invite_code = os.environ.get("TERMD_QA_PAIRING_INVITE", "")
+if not invite_code:
+    raise SystemExit("missing v2 invite")
+raw = invite_code.split(":", 2)[2]
+raw += "=" * (-len(raw) % 4)
+payload = json.loads(base64.urlsafe_b64decode(raw.encode()).decode())
 print(invite_code)
 print(payload["ws_url"])
 PY
-)
+  )
   pairing_json="${pairing_payload[0]:-}"
   relay_client_url="${pairing_payload[1]:-}"
-  if [[ "$pairing_json" != termd-pair:v1:* ]]; then
+  if [[ "$pairing_json" != termd-pair:v2:* ]]; then
     printf '[termrelay] daemon 本地 pairing 响应未构造出预期 invite payload。\n' >&2
     exit 1
   fi

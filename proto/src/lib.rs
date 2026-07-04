@@ -1159,7 +1159,8 @@ pub enum RouteRole {
 
 /// WebSocket 第一帧路由前置握手。
 ///
-/// 该消息只携带公开的 server_id 和连接方向，不携带 pairing token、session 数据或认证签名。
+/// 该消息携带公开的 server_id、连接方向，以及 trusted relay 入场所需的最小 admission
+/// 凭证；不携带 session 数据。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RouteHelloPayload {
     pub server_id: ServerId,

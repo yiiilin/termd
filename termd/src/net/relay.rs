@@ -57,7 +57,7 @@ const MIN_RELAY_HEARTBEAT_INTERVAL_MS: u64 = 1;
 // relay mux transport 失败只会断开当前 relay 连接并触发重连，不关闭持久 session/supervisor。
 // 公网 relay 往往还隔着 TLS 和反向代理，2s 级 deadline 容易把短暂抖动误判成断线。
 const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
-const RELAY_DATA_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const RELAY_DATA_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const RELAY_ROUTE_READY_TIMEOUT: Duration = Duration::from_secs(5);
 const RELAY_SEND_DEADLINE: Duration = Duration::from_secs(10);
 #[cfg(test)]
@@ -955,6 +955,8 @@ pub enum RelayConnectorError {
     InvalidEnvelope,
     #[error("relay mux frame is invalid")]
     InvalidFrame,
+    #[error("trusted relay device registration failed")]
+    RelayRegistrationFailed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1078,6 +1080,15 @@ impl RelayBaseUrl {
         self.unified_ws_url_with_auth(auth_token)
     }
 
+    pub fn api_url(&self, api_path: &str) -> String {
+        let scheme = match self.scheme {
+            RelayUrlScheme::Ws => "http",
+            RelayUrlScheme::Wss => "https",
+        };
+        let prefix = self.base_path.api_prefix();
+        format!("{scheme}://{}{}{}", self.authority, prefix, api_path)
+    }
+
     fn unified_ws_url(&self) -> String {
         format!(
             "{}://{}{}",
@@ -1164,6 +1175,12 @@ impl RelayBasePath {
 
     fn endpoint_suffix(&self) -> &str {
         &self.endpoint_suffix
+    }
+
+    fn api_prefix(&self) -> &str {
+        self.canonical_suffix
+            .strip_suffix("/ws")
+            .unwrap_or(self.canonical_suffix.as_str())
     }
 }
 
@@ -1351,6 +1368,9 @@ async fn connect_relay_control_base_once(
         None,
     )
     .await?;
+    // 中文注释：不要在 daemon control 刚连上时批量重注册历史 devices。
+    // 线上旧状态里可能有大量迁移遗留 device，注册请求失败会制造长时间网络噪声；
+    // 新配对路径会在 pair 成功后单独注册当前 device。
     let mut heartbeat =
         tokio::time::interval_at(Instant::now() + heartbeat_interval, heartbeat_interval);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -8124,12 +8144,20 @@ mod tests {
         .await
         .unwrap();
         let hello = daemon_frame_to_json(initial[0].clone());
-        let key_exchange = daemon_frame_to_json(initial[1].clone());
         assert_eq!(hello.kind, MessageType::Hello);
-        assert_eq!(key_exchange.kind, MessageType::E2eeKeyExchange);
 
-        let server_key_exchange: termd_proto::E2eeKeyExchangePayload =
-            decode_payload(key_exchange.payload).unwrap();
+        let server_key_exchange = {
+            let protocol = protocol.lock().await;
+            // 中文注释：当前协议由 client 先发 E2EE key exchange；这个旧 mux 单测只需要
+            // daemon 的公开 E2EE 材料来构造测试 device 侧会话。
+            termd_proto::E2eeKeyExchangePayload::new(
+                protocol.server_id(),
+                termd_proto::DeviceId::new(),
+                protocol.e2ee_public_key().to_wire_public_key(),
+                termd_proto::Nonce("relay-test-daemon-e2ee".to_owned()),
+                current_unix_timestamp_millis(),
+            )
+        };
         let token = protocol
             .lock()
             .await
@@ -8267,9 +8295,18 @@ mod tests {
             MessageType::Hello
         );
 
-        let key_exchange = daemon_frame_to_json(initial[1].clone());
-        let server_key_exchange: termd_proto::E2eeKeyExchangePayload =
-            decode_payload(key_exchange.payload).unwrap();
+        let server_key_exchange = {
+            let protocol = protocol.lock().await;
+            // 中文注释：当前协议由 client 先发 E2EE key exchange；这里复用 daemon 公钥
+            // 作为测试 fixture，避免继续依赖旧的双初始帧假设。
+            termd_proto::E2eeKeyExchangePayload::new(
+                protocol.server_id(),
+                termd_proto::DeviceId::new(),
+                protocol.e2ee_public_key().to_wire_public_key(),
+                termd_proto::Nonce("relay-good-daemon-e2ee".to_owned()),
+                current_unix_timestamp_millis(),
+            )
+        };
         let token = protocol
             .lock()
             .await

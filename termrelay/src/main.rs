@@ -16,7 +16,7 @@ use tokio::net::TcpListener;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-use crate::args::{ArgsError, RelayCommand};
+use crate::args::{ArgsError, DaemonRegistryRuntimeCredential, RelayCommand};
 use crate::router::router;
 use crate::ws::{RelayDaemonCredential, RelayState};
 
@@ -44,6 +44,10 @@ enum MainError {
         "daemon registry is required; pass --daemon-registry or explicit --allow-open-relay for legacy/open relay mode"
     )]
     MissingDaemonRegistry,
+    #[error("relay setup token requires --daemon-registry so successful registrations can persist")]
+    SetupTokenWithoutRegistry,
+    #[error("failed to initialize relay daemon registry")]
+    RelayRegistry(#[from] crate::ws::RegisterDaemonError),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +58,7 @@ struct TlsPaths {
 
 #[tokio::main]
 async fn main() -> Result<(), MainError> {
+    install_rustls_crypto_provider();
     init_tracing();
 
     let args = match RelayCommand::from_env()? {
@@ -95,21 +100,45 @@ async fn main() -> Result<(), MainError> {
         .daemon_registry
         .daemons
         .into_iter()
-        .map(|daemon| RelayDaemonCredential {
-            server_id: daemon.server_id,
-            token: daemon.token,
+        .filter_map(|daemon| {
+            daemon
+                .runtime_credential()
+                .map(|credential| match credential {
+                    DaemonRegistryRuntimeCredential::PlainToken(token) => {
+                        RelayDaemonCredential::plain_token(daemon.server_id, token.to_owned())
+                    }
+                    DaemonRegistryRuntimeCredential::TokenHash(token_hash) => {
+                        RelayDaemonCredential::token_hash(daemon.server_id, token_hash.to_owned())
+                    }
+                })
         })
         .collect::<Vec<_>>();
-    let state = if daemon_credentials.is_empty() {
+    if args.setup_token.is_some() && args.daemon_registry_path.is_none() {
+        return Err(MainError::SetupTokenWithoutRegistry);
+    }
+
+    let state = if args.setup_token.is_some() || !daemon_credentials.is_empty() {
+        RelayState::new_trusted_with_registry(
+            args.auth_token,
+            daemon_credentials,
+            Vec::new(),
+            args.setup_token,
+            args.daemon_registry_path,
+        )?
+    } else {
         if !args.allow_open_relay {
             return Err(MainError::MissingDaemonRegistry);
         }
         RelayState::new(args.auth_token)
-    } else {
-        RelayState::new_trusted(args.auth_token, daemon_credentials)
     };
 
     serve_listener(listener, state, tls, args.web, args.http_tunnel).await
+}
+
+fn install_rustls_crypto_provider() {
+    // 中文注释：reqwest/tokio-rustls 可能同时启用 rustls 的 aws-lc 和 ring provider；
+    // 启动时显式选定 provider，避免 TLS listener 首次使用 rustls 时 panic。
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }
 
 fn help_text() -> String {
@@ -122,6 +151,7 @@ fn help_text() -> String {
             "  --listen, -l <HOST:PORT>      Listen address, default 127.0.0.1:8080\n",
             "  --auth-token <TOKEN>          Transport auth token required from daemon/client relay sockets\n",
             "  --auth-token-file <PATH>      Read transport auth token from a file; conflicts with --auth-token\n",
+            "  --setup-token-file <PATH>     Read daemon registration setup token from a file\n",
             "  --daemon-registry <PATH>      JSON daemon registry enabling trusted relay admission\n",
             "  --allow-open-relay            Explicitly allow legacy/open relay mode without daemon registry\n",
             "  --tls-cert <CERT_PEM>         TLS certificate path\n",
@@ -132,7 +162,7 @@ fn help_text() -> String {
             "  -V, --version                 Print version\n\n",
             "EXAMPLES:\n",
             "  termrelay --listen 127.0.0.1:8080 --allow-open-relay\n",
-            "  termrelay --listen 0.0.0.0:8080 --auth-token-file /run/secrets/termrelay_auth_token --daemon-registry /run/secrets/termrelay_daemons\n"
+            "  termrelay --listen 0.0.0.0:8080 --setup-token-file /etc/termd/termrelay_setup_token --daemon-registry /var/lib/termrelay/daemon-registry.json\n"
         ),
         env!("CARGO_PKG_VERSION")
     )
@@ -274,6 +304,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn tls_listener_serves_healthz() {
+        install_rustls_crypto_provider();
         let (cert_path, key_path) = write_test_tls_files("healthz");
         let tls_paths = TlsPaths {
             cert_path: cert_path.clone(),

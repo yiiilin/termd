@@ -52,6 +52,7 @@ use super::protocol::{
     SessionFileHttpUploadCommit, cleanup_persisted_session_file_http_uploads, decode_payload,
     envelope_value, session_file_http_upload_chunks_len, write_session_file_http_upload_files,
 };
+use super::relay::RelayBaseUrl;
 use super::signature::Ed25519SignatureVerifier;
 #[cfg(test)]
 pub(crate) use recovery::adopt_or_repair_runtime_sessions_from_supervisors;
@@ -64,6 +65,8 @@ const WEBSOCKET_SEND_DEADLINE: Duration = Duration::from_secs(10);
 const WEBSOCKET_PONG_DEADLINE: Duration = Duration::from_secs(10);
 const WEBSOCKET_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const WEBSOCKET_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+const RELAY_REGISTRATION_TIMEOUT: Duration = Duration::from_secs(4);
+const RELAY_REGISTRATION_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 // direct WebSocket 与 relay 传输保持同量级限制；终端 snapshot 可能是数 MB 的
 // 单个 binary frame，过小的 frame limit 会把正常重连误判为异常大消息。
 const WEBSOCKET_MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
@@ -885,6 +888,7 @@ async fn local_pairing_token(
     let server_id = protocol.server_id();
     let daemon_public_key = protocol.daemon_public_identity().public_key.clone();
     let ws_url = pairing_ws_url_from_config(protocol.config(), server_id);
+    let config = protocol.config().clone();
     let record = match protocol.issue_pairing_token(now_ms) {
         Ok(record) => record,
         Err(error) => {
@@ -900,12 +904,29 @@ async fn local_pairing_token(
                 .into_response();
         }
     };
+    let token = record.token().clone();
+    let expires_at_ms = record.expires_at_ms();
+    drop(protocol);
+    if let Err(error) =
+        register_relay_pair_ticket_from_config(&config, server_id, token.clone(), expires_at_ms)
+            .await
+    {
+        warn!(%error, "failed to register pairing ticket with relay");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorPayload {
+                code: "relay_pair_ticket_unavailable".to_owned(),
+                message: "pairing ticket could not be registered with relay".to_owned(),
+            }),
+        )
+            .into_response();
+    }
 
     (
         StatusCode::OK,
         Json(LocalPairingTokenPayload {
-            token: record.token().clone(),
-            expires_at_ms: record.expires_at_ms(),
+            token,
+            expires_at_ms,
             ttl_ms,
             server_id,
             daemon_public_key,
@@ -2088,6 +2109,167 @@ fn pairing_ws_url_from_config(config: &DaemonConfig, server_id: ServerId) -> Str
         .default_pairing_ws_url
         .trim()
         .replace("{server_id}", &server_id.0.to_string())
+}
+
+#[derive(Debug, Serialize)]
+struct RelayPairTicketRegistration<'a> {
+    server_id: ServerId,
+    token: &'a PairingToken,
+    expires_at_ms: UnixTimestampMillis,
+}
+
+#[derive(Debug, Serialize)]
+struct RelayDeviceRegistration<'a> {
+    server_id: ServerId,
+    device_id: termd_proto::DeviceId,
+    public_key: &'a PublicKey,
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum RelayRegistrationError {
+    #[error("trusted relay registration is not configured")]
+    MissingConfig,
+    #[error("trusted relay URL is invalid")]
+    InvalidRelayUrl,
+    #[error("trusted relay HTTP client could not be built")]
+    Client,
+    #[error("trusted relay rejected device public key")]
+    InvalidDevicePublicKey,
+    #[error("trusted relay registration returned HTTP {0}")]
+    Status(u16),
+    #[error("trusted relay registration request failed: {0}")]
+    Request(String),
+}
+
+fn relay_registration_request_error(error: reqwest::Error) -> RelayRegistrationError {
+    let mut parts = vec![error.to_string()];
+    let mut source = std::error::Error::source(&error);
+    while let Some(cause) = source {
+        parts.push(cause.to_string());
+        source = cause.source();
+    }
+    RelayRegistrationError::Request(parts.join(": "))
+}
+
+struct RelayRegistrationTarget {
+    daemon_token: String,
+    base: RelayBaseUrl,
+}
+
+fn relay_registration_target(
+    config: &DaemonConfig,
+) -> Result<Option<RelayRegistrationTarget>, RelayRegistrationError> {
+    let Some(daemon_token) = config
+        .relay_daemon_token
+        .as_ref()
+        .map(|token| token.expose_secret().to_owned())
+    else {
+        return Ok(None);
+    };
+    let relay_url = config
+        .relay_endpoints
+        .first()
+        .ok_or(RelayRegistrationError::MissingConfig)?;
+    let base =
+        RelayBaseUrl::parse(relay_url).map_err(|_| RelayRegistrationError::InvalidRelayUrl)?;
+    Ok(Some(RelayRegistrationTarget { daemon_token, base }))
+}
+
+async fn register_relay_pair_ticket_from_config(
+    config: &DaemonConfig,
+    server_id: ServerId,
+    token: PairingToken,
+    expires_at_ms: UnixTimestampMillis,
+) -> Result<(), RelayRegistrationError> {
+    let Some(target) = relay_registration_target(config)? else {
+        return Ok(());
+    };
+    let endpoint = target.base.api_url("/api/relay/pair-ticket/register");
+    let payload = RelayPairTicketRegistration {
+        server_id,
+        token: &token,
+        expires_at_ms,
+    };
+    let client = reqwest::Client::builder()
+        .timeout(RELAY_REGISTRATION_TIMEOUT)
+        .connect_timeout(RELAY_REGISTRATION_CONNECT_TIMEOUT)
+        .no_proxy()
+        .http1_only()
+        .build()
+        .map_err(|_| RelayRegistrationError::Client)?;
+    client
+        .post(endpoint)
+        .header("x-termd-relay-daemon-token", target.daemon_token)
+        .json(&payload)
+        .send()
+        .await
+        .map_err(relay_registration_request_error)
+        .and_then(|response| {
+            if response.status().is_success() {
+                Ok(())
+            } else {
+                Err(RelayRegistrationError::Status(response.status().as_u16()))
+            }
+        })?;
+    Ok(())
+}
+
+pub(crate) fn register_relay_device_from_config(
+    config: &DaemonConfig,
+    server_id: ServerId,
+    device_id: termd_proto::DeviceId,
+    public_key: PublicKey,
+) -> Result<(), RelayRegistrationError> {
+    let Some(target) = relay_registration_target(config)? else {
+        return Ok(());
+    };
+    // 中文注释：协议核心是同步状态机；pairing 成功路径必须在返回 PairAccept 前确认
+    // relay 已接收 device，否则用户会得到一个后续无法经 trusted relay 使用的假成功配对。
+    let endpoint = target.base.api_url("/api/relay/device/register");
+    let payload = RelayDeviceRegistration {
+        server_id,
+        device_id,
+        public_key: &public_key,
+    };
+    let client = reqwest::blocking::Client::builder()
+        .timeout(RELAY_REGISTRATION_TIMEOUT)
+        .connect_timeout(RELAY_REGISTRATION_CONNECT_TIMEOUT)
+        .no_proxy()
+        .http1_only()
+        .build()
+        .map_err(|_| RelayRegistrationError::Client)?;
+    client
+        .post(endpoint)
+        .header("x-termd-relay-daemon-token", target.daemon_token)
+        .json(&payload)
+        .send()
+        .map_err(relay_registration_request_error)
+        .and_then(|response| {
+            if response.status() == reqwest::StatusCode::BAD_REQUEST {
+                Err(RelayRegistrationError::InvalidDevicePublicKey)
+            } else if response.status().is_success() {
+                Ok(())
+            } else {
+                Err(RelayRegistrationError::Status(response.status().as_u16()))
+            }
+        })?;
+    Ok(())
+}
+
+pub(crate) fn register_relay_device_from_config_background(
+    config: &DaemonConfig,
+    server_id: ServerId,
+    device_id: termd_proto::DeviceId,
+    public_key: PublicKey,
+) {
+    let config = config.clone();
+    tokio::task::spawn_blocking(move || {
+        if let Err(error) =
+            register_relay_device_from_config(&config, server_id, device_id, public_key)
+        {
+            warn!(%error, "failed to register trusted device with relay");
+        }
+    });
 }
 
 fn is_loopback_peer(peer_addr: SocketAddr) -> bool {
@@ -3702,6 +3884,7 @@ mod tests {
     use tokio_tungstenite::tungstenite::Message as ClientWsMessage;
 
     use crate::auth::{HttpE2eeSigningInput, current_unix_timestamp_millis};
+    use crate::config::SecretString;
     use crate::net::protocol::{
         ProtocolConnection, decode_payload, encrypted_frame_from_envelope, envelope_value,
     };
@@ -5650,6 +5833,29 @@ mod tests {
         assert_eq!(response.status, 200);
         let payload: PairingTokenResponse = serde_json::from_str(&response.body).unwrap();
         assert_eq!(payload.ws_url, "wss://relay.example/ws");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn local_pairing_token_endpoint_fails_when_relay_ticket_registration_fails() {
+        let mut config = test_config("local-pairing-token-relay-ticket-failure");
+        config.relay_endpoints = vec!["ws://127.0.0.1:1/ws".to_owned()];
+        config.relay_daemon_token = Some(SecretString::new("test-relay-daemon-token"));
+        let protocol = default_protocol(config);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_protocol = protocol.clone();
+        let server = tokio::spawn(async move {
+            let _ = serve_listener(listener, server_protocol, false).await;
+        });
+        let response = tokio::task::spawn_blocking(move || post_pairing_token(addr))
+            .await
+            .unwrap();
+        server.abort();
+
+        assert_eq!(response.status, 503);
+        assert!(response.body.contains("relay_pair_ticket_unavailable"));
+        // 中文注释：relay 注册失败时不能把本地可消费 token 返回给调用方。
+        assert!(!response.body.contains("termd-pair-"));
     }
 
     #[tokio::test(flavor = "multi_thread")]

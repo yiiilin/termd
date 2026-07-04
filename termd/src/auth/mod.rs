@@ -922,6 +922,30 @@ pub struct PairingService {
     token_manager: PairingTokenManager,
 }
 
+/// 已通过 token 校验、但尚未写入本地 trust store 的 pairing 结果。
+///
+/// trusted relay 模式需要先确认 relay 已登记新设备，再把设备落成本地可信设备，
+/// 避免用户看到 PairAccept 后却无法经 relay 访问。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingPairing {
+    accepted: PairAcceptPayload,
+    device_identity: DeviceIdentity,
+}
+
+impl PendingPairing {
+    pub fn accepted(&self) -> &PairAcceptPayload {
+        &self.accepted
+    }
+
+    pub fn device_identity(&self) -> &DeviceIdentity {
+        &self.device_identity
+    }
+
+    pub fn into_accepted(self) -> PairAcceptPayload {
+        self.accepted
+    }
+}
+
 impl PairingService {
     /// 使用指定 token manager 创建 pairing 服务，便于后续替换为持久化实现。
     pub fn new(token_manager: PairingTokenManager) -> Self {
@@ -947,6 +971,49 @@ impl PairingService {
         self.token_manager.issue(now_ms, ttl_ms)
     }
 
+    /// 消费 pair_request token 并生成待确认 pairing，不立即写 trust store。
+    ///
+    /// 上层可在调用外部 relay 注册成功后，再调用 `trust_pending_pairing` 落成本地信任。
+    pub fn consume_pair_request(
+        &mut self,
+        request: PairRequestPayload,
+        now_ms: UnixTimestampMillis,
+        daemon_identity: &DaemonIdentity,
+    ) -> PairingResult<PendingPairing> {
+        let PairRequestPayload {
+            device_id,
+            device_public_key,
+            token,
+            nonce: _,
+            timestamp_ms: _,
+        } = request;
+
+        let token_record = self.token_manager.consume(&token, now_ms)?;
+        let device_identity = DeviceIdentity::new(device_id, device_public_key);
+        let public_identity = daemon_identity.public_identity();
+
+        Ok(PendingPairing {
+            accepted: PairAcceptPayload {
+                server_id: public_identity.server_id,
+                daemon_public_key: public_identity.public_key,
+                device_id,
+                expires_at_ms: token_record.expires_at_ms(),
+            },
+            device_identity,
+        })
+    }
+
+    /// 将已完成外部确认的 pairing 写入本地 trust store。
+    pub fn trust_pending_pairing<S>(
+        pending: &PendingPairing,
+        now_ms: UnixTimestampMillis,
+        trusted_store: &mut S,
+    ) where
+        S: TrustedDeviceStore,
+    {
+        trusted_store.trust_device(pending.device_identity.clone(), now_ms, None);
+    }
+
     /// 处理 pair_request 并返回 pair_accept payload。
     ///
     /// 本函数故意不校验 nonce/timestamp 的防重放语义；这些字段属于后续 challenge-response
@@ -961,26 +1028,9 @@ impl PairingService {
     where
         S: TrustedDeviceStore,
     {
-        let PairRequestPayload {
-            device_id,
-            device_public_key,
-            token,
-            nonce: _,
-            timestamp_ms: _,
-        } = request;
-
-        let token_record = self.token_manager.consume(&token, now_ms)?;
-        let device_identity = DeviceIdentity::new(device_id, device_public_key);
-
-        trusted_store.trust_device(device_identity, now_ms, None);
-
-        let public_identity = daemon_identity.public_identity();
-        Ok(PairAcceptPayload {
-            server_id: public_identity.server_id,
-            daemon_public_key: public_identity.public_key,
-            device_id,
-            expires_at_ms: token_record.expires_at_ms(),
-        })
+        let pending = self.consume_pair_request(request, now_ms, daemon_identity)?;
+        Self::trust_pending_pairing(&pending, now_ms, trusted_store);
+        Ok(pending.into_accepted())
     }
 }
 
@@ -3583,6 +3633,38 @@ mod tests {
         assert!(
             trusted_store.is_trusted_identity(&DeviceIdentity::new(device_id, device_public_key))
         );
+    }
+
+    #[test]
+    fn consume_pair_request_waits_for_caller_to_trust_device() {
+        let daemon_identity = DaemonIdentity::generate();
+        let device_id = DeviceId::new();
+        let device_public_key = public_key("device-pending-public");
+        let mut trusted_store = InMemoryTrustedDeviceStore::new();
+        let mut service = PairingService::new(PairingTokenManager::new());
+        let issued = service.issue_token(timestamp(1000), 500).unwrap();
+
+        let pending = service
+            .consume_pair_request(
+                termd_proto::PairRequestPayload {
+                    device_id,
+                    device_public_key: device_public_key.clone(),
+                    token: issued.token().clone(),
+                    nonce: termd_proto::Nonce("pair-pending-nonce".to_owned()),
+                    timestamp_ms: timestamp(1100),
+                },
+                timestamp(1100),
+                &daemon_identity,
+            )
+            .unwrap();
+
+        let identity = DeviceIdentity::new(device_id, device_public_key);
+        assert!(!trusted_store.is_trusted_identity(&identity));
+
+        PairingService::trust_pending_pairing(&pending, timestamp(1100), &mut trusted_store);
+
+        assert!(trusted_store.is_trusted_identity(&identity));
+        assert_eq!(pending.accepted().device_id, device_id);
     }
 
     #[test]

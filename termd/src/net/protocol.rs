@@ -1053,6 +1053,17 @@ where
         }
     }
 
+    pub fn register_trusted_devices_with_relay(&self) {
+        for trusted in self.trusted_store.trusted_devices() {
+            super::server::register_relay_device_from_config_background(
+                &self.config,
+                self.server_id(),
+                trusted.device_id(),
+                trusted.public_key().clone(),
+            );
+        }
+    }
+
     /// 将当前最小持久状态保存到配置指定的位置。
     pub fn persist_state(&self) -> Result<(), StateError> {
         StateStore::save(&self.config.state_path, &self.snapshot_state())
@@ -1456,16 +1467,23 @@ where
         if Some(payload.device_id) != connection.device_id {
             return Err(ProtocolError::InvalidEnvelope);
         }
-
-        let accepted = self
+        let now_ms = current_unix_timestamp_millis();
+        let pending = self
             .pairing_service
-            .accept_pair_request(
-                payload,
-                current_unix_timestamp_millis(),
-                &self.daemon_identity,
-                &mut self.trusted_store,
-            )
+            .consume_pair_request(payload, now_ms, &self.daemon_identity)
             .map_err(|_| ProtocolError::PairingFailed)?;
+        super::server::register_relay_device_from_config(
+            &self.config,
+            pending.accepted().server_id,
+            pending.accepted().device_id,
+            pending.device_identity().public_key().clone(),
+        )
+        .map_err(|error| {
+            tracing::warn!(%error, "failed to register paired device with relay");
+            ProtocolError::PairingFailed
+        })?;
+        PairingService::trust_pending_pairing(&pending, now_ms, &mut self.trusted_store);
+        let accepted = pending.into_accepted();
 
         self.persist_state()?;
         connection.authenticated_device_id = Some(accepted.device_id);
