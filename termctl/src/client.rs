@@ -1,8 +1,8 @@
 //! direct WebSocket termd 客户端。
 //!
-//! WebSocket 打开后先发送明文 `route_hello` 并等待 `route_ready`，随后才进入
-//! `hello`/`e2ee_key_exchange`/`encrypted_frame`。pair/auth/session/control 业务
-//! 统一封装为 E2EE 内的 `packet`。relay 因而只能看到 server_id、sequence 和密文。
+//! WebSocket 打开后先发送明文 `route_hello` 并等待 `route_ready`，随后通过
+//! `hello` 确认 daemon 身份和 binary packet 能力。pair/auth/session/control 业务
+//! 统一封装为已认证的明文 `packet`。
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -13,31 +13,31 @@ use futures_util::{SinkExt, StreamExt, stream::FuturesUnordered};
 use rustls::{ClientConfig, RootCertStore};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
-use termd::auth::{
-    AuthSigningInput, DaemonE2eeSigningInput, DaemonPublicIdentity, E2eeAuthTranscript,
-    SignatureVerifier,
-};
+use termd::auth::{AuthSigningInput, DaemonPublicIdentity};
+#[cfg(test)]
+use termd::auth::{DaemonE2eeSigningInput, SignatureVerifier};
 use termd::net::protocol::{JsonEnvelope, decode_payload, envelope_value};
+#[cfg(test)]
 use termd::net::signature::Ed25519SignatureVerifier;
-use termd::net::{
-    E2eeKeyPair, E2eePeerPublicKey, E2eeSession, E2eeSessionContext, E2eeSessionRole,
-    decode_binary_encrypted_frame, encode_binary_encrypted_frame,
-};
+#[cfg(test)]
+use termd::net::{E2eeSession, E2eeSessionRole};
 use termd_proto::{
     AuthChallengePayload, AuthPayload, BINARY_PROTOCOL_VERSION, ControlGrantPayload,
-    ControlRequestPayload, DeviceId, E2eeKeyExchangePayload, EncryptedFramePayload, ErrorPayload,
-    METHOD_AUTH, METHOD_AUTH_CHALLENGE, METHOD_CONTROL_REQUEST, METHOD_PAIR_REQUEST, METHOD_PING,
+    ControlRequestPayload, DeviceId, ErrorPayload, HelloPayload, METHOD_AUTH,
+    METHOD_AUTH_CHALLENGE, METHOD_CONTROL_REQUEST, METHOD_PAIR_REQUEST, METHOD_PING,
     METHOD_SESSION_CLOSE, METHOD_SESSION_CREATE, METHOD_SESSION_LIST, METHOD_SESSION_RESIZE,
     METHOD_TERMINAL_ATTACH, MessageType, PROTOCOL_PACKET_VERSION, PacketErrorPayload, PacketKind,
     PacketRequestId, PacketStreamId, PairAcceptPayload, PairRequestPayload, PairingToken,
-    PingPayload, PongPayload, ProtocolPacket, ProtocolVersion, PublicKey, RouteHelloPayload,
-    RouteReadyPayload, RouteRole, ServerId, SessionAttachPayload, SessionAttachedPayload,
-    SessionClosePayload, SessionClosedPayload, SessionCreatePayload, SessionCreatedPayload,
-    SessionDataPayload, SessionId, SessionListPayload, SessionListResultPayload,
-    SessionResizePayload, SessionResizedPayload, TerminalFramePayload, TerminalSize,
-    decode_binary_protocol_packet, encode_binary_protocol_packet, protocol_packet_from_binary,
-    protocol_packet_to_binary,
+    PingPayload, PongPayload, ProtocolPacket, ProtocolVersion, PublicKey, RelayAdmissionPayload,
+    RouteHelloPayload, RouteReadyPayload, RouteRole, ServerId, SessionAttachPayload,
+    SessionAttachedPayload, SessionClosePayload, SessionClosedPayload, SessionCreatePayload,
+    SessionCreatedPayload, SessionDataPayload, SessionId, SessionListPayload,
+    SessionListResultPayload, SessionResizePayload, SessionResizedPayload, TerminalFramePayload,
+    TerminalSize, decode_binary_protocol_packet, encode_binary_protocol_packet,
+    protocol_packet_from_binary, protocol_packet_to_binary,
 };
+#[cfg(test)]
+use termd_proto::{E2eeKeyExchangePayload, EncryptedFramePayload};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 use tokio_tungstenite::tungstenite::Message;
@@ -48,6 +48,9 @@ use crate::error::{Result, TermctlError};
 use crate::state::PairedServerState;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+// 中文注释：trusted relay 会先给 client route_ready，再等待 daemon data pipe 反连。
+// 这里要匹配 relay/daemon 的 20s 配对窗口，避免公网慢路径被误报为普通连接关闭。
+const DAEMON_HELLO_TIMEOUT: Duration = Duration::from_secs(20);
 // 公网 relay 偶发卡在 TCP/TLS/WebSocket open 阶段；一次性 CLI 不应让单次半开握手
 // 吃掉数秒。快速失败后重试，最后仍保留多次机会覆盖真实网络抖动。
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(1200);
@@ -148,14 +151,48 @@ pub struct TerminalAttachOptions {
 
 pub struct DirectClient {
     socket: WsStream,
-    e2ee: E2eeSession,
     device_id: DeviceId,
     daemon_identity: DaemonPublicIdentity,
-    e2ee_auth_transcript: E2eeAuthTranscript,
     binary_mode: bool,
     // 中文注释：同一 WebSocket 上会交错出现 request response 与 terminal stream chunk。
     // 等待某个 response 时读到的非目标 packet 不能丢弃，必须留给后续 attach 主循环处理。
     pending_packets: VecDeque<ProtocolPacket<Value>>,
+}
+
+pub fn signed_device_relay_admission(
+    server_id: ServerId,
+    device_id: DeviceId,
+    signing_key: &SigningKey,
+) -> RelayAdmissionPayload {
+    let nonce = crypto::nonce();
+    let timestamp_ms = crypto::now_ms();
+    let signing_input = relay_admission_signing_input(server_id, device_id, &nonce, timestamp_ms);
+    RelayAdmissionPayload::Device {
+        device_id,
+        nonce,
+        timestamp_ms,
+        signature: crypto::sign_to_wire(signing_key, &signing_input),
+    }
+}
+
+fn relay_admission_signing_input(
+    server_id: ServerId,
+    device_id: DeviceId,
+    nonce: &termd_proto::Nonce,
+    timestamp_ms: termd_proto::UnixTimestampMillis,
+) -> Vec<u8> {
+    // 中文注释：relay admission 只证明设备愿意进入该 daemon 房间；
+    // daemon 后续仍用 auth challenge 做最终认证。
+    let mut out = b"termd-relay-admission-v1\n".to_vec();
+    append_canonical_field(&mut out, "server_id", &server_id.0.to_string());
+    append_canonical_field(&mut out, "device_id", &device_id.0.to_string());
+    append_canonical_field(&mut out, "nonce", &nonce.0);
+    append_canonical_field(&mut out, "timestamp_ms", &timestamp_ms.0.to_string());
+    out
+}
+
+fn append_canonical_field(out: &mut Vec<u8>, name: &str, value: &str) {
+    out.extend_from_slice(format!("{name}:{}:{value}\n", value.as_bytes().len()).as_bytes());
 }
 
 impl DirectClient {
@@ -164,6 +201,7 @@ impl DirectClient {
         route_server_id: ServerId,
         device_id: DeviceId,
         expected_daemon_public_key: PublicKey,
+        admission: Option<RelayAdmissionPayload>,
     ) -> Result<Self> {
         let (mut socket, _) = connect_websocket(url)
             .await
@@ -178,6 +216,7 @@ impl DirectClient {
                     role: RouteRole::Client,
                     protocol_version: ProtocolVersion(PROTOCOL_PACKET_VERSION),
                     nonce: crypto::nonce(),
+                    admission,
                     route_generation: None,
                     client_id: None,
                     data_token: None,
@@ -196,87 +235,56 @@ impl DirectClient {
             server_id: route_server_id,
             public_key: expected_daemon_public_key,
         };
-        let mut server_e2ee_exchange = None;
 
-        // daemon 在连接建立后立即发送 hello 和 E2EE 公钥；顺序固定，但这里仍按类型收敛，
-        // 便于后续兼容额外的明文握手字段。
-        for _ in 0..2 {
-            let envelope = timeout(HANDSHAKE_TIMEOUT, read_outer(&mut socket))
-                .await
-                .map_err(|_| TermctlError::ConnectionClosed)??;
-
-            match envelope.kind {
-                MessageType::Hello => {
-                    let payload: termd_proto::HelloPayload = decode_payload(envelope.payload)
-                        .map_err(|_| TermctlError::InvalidEnvelope)?;
-                    if payload
-                        .server_id
-                        .is_some_and(|server_id| server_id != route_server_id)
-                    {
-                        return Err(TermctlError::RouteServerMismatch);
-                    }
-                }
-                MessageType::E2eeKeyExchange => {
-                    let payload: E2eeKeyExchangePayload = decode_payload(envelope.payload)
-                        .map_err(|_| TermctlError::InvalidEnvelope)?;
-                    if payload.server_id != route_server_id {
-                        return Err(TermctlError::RouteServerMismatch);
-                    }
-                    verify_daemon_e2ee_key_exchange(&payload, &daemon_identity)?;
-                    server_e2ee_exchange = Some(payload);
-                }
-                MessageType::Error => return Err(protocol_error(envelope.payload)),
-                _ => return Err(TermctlError::UnexpectedMessage),
+        let envelope = timeout(DAEMON_HELLO_TIMEOUT, read_outer(&mut socket))
+            .await
+            .map_err(|_| TermctlError::DaemonHelloTimeout)??;
+        let hello: HelloPayload = match envelope.kind {
+            MessageType::Hello => {
+                decode_payload(envelope.payload).map_err(|_| TermctlError::InvalidEnvelope)?
             }
+            MessageType::Error => return Err(protocol_error(envelope.payload)),
+            _ => return Err(TermctlError::UnexpectedMessage),
+        };
+        if hello
+            .server_id
+            .is_some_and(|server_id| server_id != route_server_id)
+        {
+            return Err(TermctlError::RouteServerMismatch);
         }
-
-        let server_e2ee_exchange = server_e2ee_exchange.ok_or(TermctlError::InvalidEnvelope)?;
-        let server_e2ee_key = E2eePeerPublicKey::try_from(&server_e2ee_exchange.public_key)
-            .map_err(|_| TermctlError::E2eeFailed)?;
-        let device_e2ee_keypair = E2eeKeyPair::generate();
-        let context = E2eeSessionContext::new(
-            route_server_id,
-            device_id,
-            server_e2ee_key,
-            device_e2ee_keypair.public_key(),
-        );
-        let e2ee = E2eeSession::new(
-            E2eeSessionRole::Device,
-            &device_e2ee_keypair,
-            server_e2ee_key,
-            context,
-        )
-        .map_err(|_| TermctlError::E2eeFailed)?;
-        let device_e2ee_exchange = E2eeKeyExchangePayload::new(
-            route_server_id,
-            device_id,
-            device_e2ee_keypair.public_key_wire(),
-            crypto::nonce(),
-            crypto::now_ms(),
-        )
-        .with_packet_version(ProtocolVersion(PROTOCOL_PACKET_VERSION))
-        .with_binary_version(ProtocolVersion(BINARY_PROTOCOL_VERSION));
-        let e2ee_auth_transcript = E2eeAuthTranscript::from_key_exchanges(
-            &server_e2ee_exchange,
-            &device_e2ee_exchange,
-            &daemon_identity,
-        );
+        if hello.protocol_version.0 != PROTOCOL_PACKET_VERSION {
+            return Err(TermctlError::InvalidEnvelope);
+        }
+        if hello.daemon_public_key.as_ref() != Some(&daemon_identity.public_key) {
+            return Err(TermctlError::RouteServerMismatch);
+        }
+        let binary_mode = hello
+            .binary_version
+            .is_some_and(|version| version.0 == BINARY_PROTOCOL_VERSION);
         let mut client = Self {
             socket,
-            e2ee,
             device_id,
             daemon_identity,
-            e2ee_auth_transcript,
-            binary_mode: server_e2ee_exchange
-                .binary_version
-                .is_some_and(|version| version.0 == BINARY_PROTOCOL_VERSION),
+            binary_mode,
             pending_packets: VecDeque::new(),
         };
 
         client
             .send_outer(envelope_value(
-                MessageType::E2eeKeyExchange,
-                device_e2ee_exchange,
+                MessageType::Hello,
+                HelloPayload {
+                    protocol_version: ProtocolVersion(PROTOCOL_PACKET_VERSION),
+                    nonce: crypto::nonce(),
+                    timestamp_ms: crypto::now_ms(),
+                    server_id: Some(route_server_id),
+                    daemon_public_key: None,
+                    binary_version: if binary_mode {
+                        Some(ProtocolVersion(BINARY_PROTOCOL_VERSION))
+                    } else {
+                        None
+                    },
+                    device_id: Some(device_id),
+                },
             )?)
             .await?;
 
@@ -326,12 +334,7 @@ impl DirectClient {
         {
             return Err(TermctlError::RouteServerMismatch);
         }
-        let signing_input = AuthSigningInput::from_payload_with_e2ee_transcript(
-            &auth,
-            &self.daemon_identity,
-            Some(&self.e2ee_auth_transcript),
-        )
-        .to_bytes();
+        let signing_input = AuthSigningInput::from_payload(&auth, &self.daemon_identity).to_bytes();
         auth.signature = crypto::sign_to_wire(signing_key, &signing_input);
 
         let _: Value = self.request_packet(METHOD_AUTH, auth).await?;
@@ -494,29 +497,12 @@ impl DirectClient {
 
         match message {
             OuterMessage::Json(envelope) => match envelope.kind {
-                MessageType::EncryptedFrame => {
-                    let frame: EncryptedFramePayload = decode_payload(envelope.payload)
-                        .map_err(|_| TermctlError::InvalidEnvelope)?;
-                    let inner: JsonEnvelope = self
-                        .e2ee
-                        .decrypt_json_payload(&frame)
-                        .map_err(|_| TermctlError::E2eeFailed)?;
-                    if inner.kind == MessageType::Error {
-                        return Err(protocol_error(inner.payload));
-                    }
-                    Ok(inner)
-                }
+                MessageType::Packet => Ok(envelope),
                 MessageType::Error => Err(protocol_error(envelope.payload)),
                 _ => Err(TermctlError::UnexpectedMessage),
             },
             OuterMessage::Binary(raw) => {
-                let frame = decode_binary_encrypted_frame(&raw)
-                    .map_err(|_| TermctlError::InvalidEnvelope)?;
-                let plaintext = self
-                    .e2ee
-                    .decrypt_binary_payload(&frame)
-                    .map_err(|_| TermctlError::E2eeFailed)?;
-                let binary_packet = decode_binary_protocol_packet(&plaintext)
+                let binary_packet = decode_binary_protocol_packet(&raw)
                     .map_err(|_| TermctlError::InvalidEnvelope)?;
                 let packet = protocol_packet_from_binary(binary_packet)
                     .map_err(|_| TermctlError::InvalidEnvelope)?;
@@ -594,37 +580,16 @@ impl DirectClient {
 
         let packet = match message {
             OuterMessage::Json(envelope) => match envelope.kind {
-                MessageType::EncryptedFrame => {
-                    let frame: EncryptedFramePayload = decode_payload(envelope.payload)
-                        .map_err(|_| TermctlError::InvalidEnvelope)?;
-                    let inner: JsonEnvelope = self
-                        .e2ee
-                        .decrypt_json_payload(&frame)
-                        .map_err(|_| TermctlError::E2eeFailed)?;
-                    if inner.kind == MessageType::Error {
-                        return Err(protocol_error(inner.payload));
-                    }
-                    if inner.kind != MessageType::Packet {
-                        return Err(TermctlError::UnexpectedMessage);
-                    }
-                    decode_payload(inner.payload).map_err(|_| TermctlError::InvalidEnvelope)?
+                MessageType::Packet => {
+                    decode_payload(envelope.payload).map_err(|_| TermctlError::InvalidEnvelope)?
                 }
                 MessageType::Error => return Err(protocol_error(envelope.payload)),
                 _ => return Err(TermctlError::UnexpectedMessage),
             },
-            OuterMessage::Binary(raw) => {
-                let frame = decode_binary_encrypted_frame(&raw)
-                    .map_err(|_| TermctlError::InvalidEnvelope)?;
-                let plaintext = self
-                    .e2ee
-                    .decrypt_binary_payload(&frame)
-                    .map_err(|_| TermctlError::E2eeFailed)?;
-                protocol_packet_from_binary(
-                    decode_binary_protocol_packet(&plaintext)
-                        .map_err(|_| TermctlError::InvalidEnvelope)?,
-                )
-                .map_err(|_| TermctlError::InvalidEnvelope)?
-            }
+            OuterMessage::Binary(raw) => protocol_packet_from_binary(
+                decode_binary_protocol_packet(&raw).map_err(|_| TermctlError::InvalidEnvelope)?,
+            )
+            .map_err(|_| TermctlError::InvalidEnvelope)?,
         };
 
         validate_packet_version(&packet)?;
@@ -695,13 +660,8 @@ impl DirectClient {
         if self.binary_mode {
             let binary_packet =
                 protocol_packet_to_binary(packet).map_err(|_| TermctlError::InvalidEnvelope)?;
-            let plaintext = encode_binary_protocol_packet(&binary_packet);
-            let frame = self
-                .e2ee
-                .encrypt_binary_payload(&plaintext)
-                .map_err(|_| TermctlError::E2eeFailed)?;
             return self
-                .send_binary_outer(encode_binary_encrypted_frame(&frame))
+                .send_binary_outer(encode_binary_protocol_packet(&binary_packet))
                 .await;
         }
 
@@ -709,12 +669,7 @@ impl DirectClient {
     }
 
     async fn send_inner(&mut self, inner: JsonEnvelope) -> Result<()> {
-        let frame = self
-            .e2ee
-            .encrypt_json_payload(&inner)
-            .map_err(|_| TermctlError::E2eeFailed)?;
-        self.send_outer(envelope_value(MessageType::EncryptedFrame, frame)?)
-            .await
+        self.send_outer(inner).await
     }
 
     async fn send_binary_outer(&mut self, raw: Vec<u8>) -> Result<()> {
@@ -908,6 +863,7 @@ fn protocol_error(payload: Value) -> TermctlError {
     }
 }
 
+#[cfg(test)]
 fn verify_daemon_e2ee_key_exchange(
     payload: &E2eeKeyExchangePayload,
     daemon_identity: &DaemonPublicIdentity,
@@ -1542,6 +1498,30 @@ mod tests {
     }
 
     #[test]
+    fn device_relay_admission_carries_signed_device_shape() {
+        let generated = crate::crypto::generate_device_identity();
+        let signing_key =
+            crate::crypto::decode_signing_key(&generated.device_signing_key_secret).unwrap();
+        let admission =
+            signed_device_relay_admission(ServerId::new(), generated.device_id, &signing_key);
+
+        match admission {
+            RelayAdmissionPayload::Device {
+                device_id,
+                nonce,
+                timestamp_ms,
+                signature,
+            } => {
+                assert_eq!(device_id, generated.device_id);
+                assert!(nonce.0.starts_with("nonce-"));
+                assert!(timestamp_ms.0 > 0);
+                assert!(signature.0.starts_with("ed25519-v1:"));
+            }
+            other => panic!("expected device admission, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn encrypted_business_envelope_hides_pairing_and_session_plaintext() {
         let server_id = ServerId::new();
         let device_id = DeviceId::new();
@@ -1760,13 +1740,6 @@ mod tests {
             daemon_keypair.public_key(),
             device_keypair.public_key(),
         );
-        let device_e2ee = E2eeSession::new(
-            E2eeSessionRole::Device,
-            &device_keypair,
-            daemon_keypair.public_key(),
-            context.clone(),
-        )
-        .expect("device E2EE should initialize");
         let daemon_e2ee = E2eeSession::new(
             E2eeSessionRole::Daemon,
             &daemon_keypair,
@@ -1774,37 +1747,11 @@ mod tests {
             context,
         )
         .expect("daemon E2EE should initialize");
-        let daemon_exchange = E2eeKeyExchangePayload::new(
-            server_id,
-            DeviceId::default(),
-            daemon_keypair.public_key_wire(),
-            crypto::nonce(),
-            crypto::now_ms(),
-        )
-        .with_packet_version(ProtocolVersion(PROTOCOL_PACKET_VERSION))
-        .with_binary_version(ProtocolVersion(BINARY_PROTOCOL_VERSION));
-        let device_exchange = E2eeKeyExchangePayload::new(
-            server_id,
-            device_id,
-            device_keypair.public_key_wire(),
-            crypto::nonce(),
-            crypto::now_ms(),
-        )
-        .with_packet_version(ProtocolVersion(PROTOCOL_PACKET_VERSION))
-        .with_binary_version(ProtocolVersion(BINARY_PROTOCOL_VERSION));
-        let e2ee_auth_transcript = E2eeAuthTranscript::from_key_exchanges(
-            &daemon_exchange,
-            &device_exchange,
-            &daemon_identity,
-        );
-
         (
             DirectClient {
                 socket: client_socket,
-                e2ee: device_e2ee,
                 device_id,
                 daemon_identity,
-                e2ee_auth_transcript,
                 binary_mode: false,
                 pending_packets: VecDeque::new(),
             },
@@ -1815,11 +1762,10 @@ mod tests {
 
     async fn send_daemon_packet_for_test(
         socket: &mut WebSocketStream<TcpStream>,
-        daemon_e2ee: &mut E2eeSession,
+        _daemon_e2ee: &mut E2eeSession,
         packet: ProtocolPacket<Value>,
     ) {
-        let outer = encrypted_envelope_for_test(daemon_e2ee, packet_envelope(packet).unwrap())
-            .expect("test packet should encrypt");
+        let outer = packet_envelope(packet).expect("test packet should encode");
         let raw = serde_json::to_string(&outer).expect("test packet should serialize");
         socket
             .send(Message::Text(raw.into()))
@@ -1829,7 +1775,7 @@ mod tests {
 
     async fn read_client_packet_for_test(
         socket: &mut WebSocketStream<TcpStream>,
-        daemon_e2ee: &mut E2eeSession,
+        _daemon_e2ee: &mut E2eeSession,
     ) -> ProtocolPacket<Value> {
         loop {
             let message = socket
@@ -1842,14 +1788,8 @@ mod tests {
             };
             let envelope: JsonEnvelope =
                 serde_json::from_str(&raw).expect("client envelope should decode");
-            assert_eq!(envelope.kind, MessageType::EncryptedFrame);
-            let frame: EncryptedFramePayload =
-                decode_payload(envelope.payload).expect("client frame should decode");
-            let inner: JsonEnvelope = daemon_e2ee
-                .decrypt_json_payload(&frame)
-                .expect("client frame should decrypt");
-            assert_eq!(inner.kind, MessageType::Packet);
-            return decode_payload(inner.payload).expect("client packet should decode");
+            assert_eq!(envelope.kind, MessageType::Packet);
+            return decode_payload(envelope.payload).expect("client packet should decode");
         }
     }
 }

@@ -327,6 +327,10 @@ pub(super) enum RelayError {
     DaemonDataRouteInvalid,
     #[error("daemon data route does not match a pending client")]
     DaemonDataRouteRejected,
+    #[error("relay admission is required")]
+    AdmissionRequired,
+    #[error("relay admission was rejected")]
+    AdmissionRejected,
     #[error("relay state mutex poisoned")]
     Poisoned,
 }
@@ -340,6 +344,8 @@ impl RelayError {
             Self::PendingClientLimitExceeded => "relay_pending_client_limit",
             Self::DaemonDataRouteInvalid => "relay_data_route_invalid",
             Self::DaemonDataRouteRejected => "relay_data_route_rejected",
+            Self::AdmissionRequired => "relay_admission_required",
+            Self::AdmissionRejected => "relay_admission_rejected",
             Self::Poisoned => "relay_state_unavailable",
         }
     }
@@ -358,6 +364,8 @@ impl RelayError {
             }
             Self::DaemonDataRouteInvalid => "relay daemon data route is invalid",
             Self::DaemonDataRouteRejected => "relay daemon data route was rejected",
+            Self::AdmissionRequired => "relay admission is required",
+            Self::AdmissionRejected => "relay admission was rejected",
             Self::Poisoned => "relay state is temporarily unavailable",
         }
     }
@@ -375,6 +383,17 @@ impl RelayRegistry {
             .lock()
             .expect("relay registry mutex poisoned")
             .len()
+    }
+
+    pub(super) fn close_server(&self, server_id: ServerId) -> Result<bool, RelayError> {
+        let mut rooms = self.rooms.lock().map_err(|_| RelayError::Poisoned)?;
+        let Some(mut room) = rooms.remove(&server_id) else {
+            return Ok(false);
+        };
+        // 中文注释：daemon token 被 setup token 替换后，旧 daemon 不能继续占着控制线；
+        // 关闭整个 room 让 daemon/client 按现有重连路径重新进入最新凭证。
+        room.clear_daemon_control_and_dependents();
+        Ok(true)
     }
 
     pub(super) fn register(

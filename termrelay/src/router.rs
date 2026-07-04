@@ -7,16 +7,27 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
-use termd_proto::{HTTP_FILE_TUNNEL_PATHS, ServerId, is_http_tunnel_path_allowed};
+use termd_proto::{
+    HTTP_FILE_TUNNEL_PATHS, RelayAdmissionPayload, ServerId, is_http_tunnel_path_allowed,
+};
 use tower_http::cors::{Any, CorsLayer};
 use uuid::Uuid;
 
-use crate::ws::{RelayState, WEBSOCKET_MAX_FRAME_SIZE, WEBSOCKET_MAX_MESSAGE_SIZE, handle_socket};
+use crate::ws::{
+    RegisterAdmissionError, RegisterDaemonError, RelayState, WEBSOCKET_MAX_FRAME_SIZE,
+    WEBSOCKET_MAX_MESSAGE_SIZE, handle_socket,
+};
 
 pub fn router(state: RelayState, web_enabled: bool, http_tunnel_enabled: bool) -> Router {
     let router = Router::new()
         .route("/healthz", get(healthz))
         .route("/ws", get(relay_ws))
+        .route("/api/relay/daemon/register", post(register_daemon))
+        .route(
+            "/api/relay/pair-ticket/register",
+            post(register_pair_ticket),
+        )
+        .route("/api/relay/device/register", post(register_device))
         .merge(http_api_tunnel_router(http_tunnel_enabled));
 
     // 中文注释：所有 API namespace 都要在 Web fallback 前截止，未知 API 不能返回 SPA index。
@@ -36,7 +47,7 @@ pub fn router(state: RelayState, web_enabled: bool, http_tunnel_enabled: bool) -
 fn http_api_tunnel_router(http_tunnel_enabled: bool) -> Router<RelayState> {
     let mut router = Router::new();
     // 中文注释：HTTP control plane 已是当前 Web/relay 主路径，必须默认可用；
-    // relay 只做透明转发，不参与 bearer/E2EE/session scope 业务判断。
+    // relay 只做 tunnel 转发，不参与 bearer/session scope 业务判断。
     router = router.route("/api/control/*path", post(relay_http_tunnel));
     for path in HTTP_FILE_TUNNEL_PATHS {
         router = if http_tunnel_enabled {
@@ -47,13 +58,13 @@ fn http_api_tunnel_router(http_tunnel_enabled: bool) -> Router<RelayState> {
         };
     }
 
-    // 中文注释：跨源预检只挂在 relay HTTP API tunnel 上；真正鉴权仍在 daemon bearer/E2EE。
+    // 中文注释：跨源预检只挂在 relay HTTP API tunnel 上；真正鉴权仍在 daemon bearer/scope token。
     router.route_layer(http_api_tunnel_cors_layer())
 }
 
 fn http_api_tunnel_cors_layer() -> CorsLayer {
     // 中文注释：relay 透明转发 HTTP control/file tunnel，不解密也不解析业务内容；
-    // 浏览器跨源访问时需要放开 control 与 file API 共用的认证/E2EE 头。
+    // 浏览器跨源访问时需要放开 control 与 file API 共用的认证头。
     CorsLayer::new()
         .allow_origin(Any)
         .allow_methods([Method::POST, Method::OPTIONS])
@@ -67,6 +78,7 @@ fn http_api_tunnel_cors_layer() -> CorsLayer {
             HeaderName::from_static("x-termd-e2ee-nonce"),
             HeaderName::from_static("x-termd-e2ee-timestamp-ms"),
             HeaderName::from_static("x-termd-e2ee-signature"),
+            HeaderName::from_static("x-termd-relay-admission"),
         ])
 }
 
@@ -92,7 +104,7 @@ async fn relay_http_tunnel(
     if !is_http_api_tunnel_path_allowed(method.as_str(), uri.path()) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    if !state.authorizes(auth.relay_token.as_deref()) {
+    if state.legacy_query_auth_required() && !state.authorizes(auth.relay_token.as_deref()) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     let Some(server_id) = headers
@@ -109,12 +121,17 @@ async fn relay_http_tunnel(
             Some((name.as_str().to_owned(), value.to_str().ok()?.to_owned()))
         })
         .collect::<Vec<_>>();
+    let admission = match relay_admission_from_headers(&headers) {
+        Ok(admission) => admission,
+        Err(status) => return status.into_response(),
+    };
     match state
         .http_tunnel(
             server_id,
             method.as_str().to_owned(),
             uri.path().to_owned(),
             forwarded_headers,
+            admission,
             body.into_data_stream(),
         )
         .await
@@ -122,6 +139,115 @@ async fn relay_http_tunnel(
         Ok(response) => response,
         Err(status) => status.into_response(),
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct RegisterDaemonRequest {
+    server_id: ServerId,
+    daemon_token: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RegisterPairTicketRequest {
+    server_id: ServerId,
+    token: termd_proto::PairingToken,
+    expires_at_ms: termd_proto::UnixTimestampMillis,
+}
+
+#[derive(Debug, Deserialize)]
+struct RegisterDeviceRequest {
+    server_id: ServerId,
+    device_id: termd_proto::DeviceId,
+    public_key: termd_proto::PublicKey,
+}
+
+async fn register_daemon(
+    State(state): State<RelayState>,
+    headers: HeaderMap,
+    Json(request): Json<RegisterDaemonRequest>,
+) -> Response {
+    let setup_token = headers
+        .get("x-termd-relay-setup-token")
+        .and_then(|value| value.to_str().ok());
+    match state.register_daemon(request.server_id, request.daemon_token, setup_token) {
+        Ok(outcome) => Json(outcome).into_response(),
+        Err(RegisterDaemonError::SetupTokenMissing | RegisterDaemonError::SetupTokenRejected) => {
+            StatusCode::UNAUTHORIZED.into_response()
+        }
+        Err(RegisterDaemonError::DaemonTokenTooShort) => StatusCode::BAD_REQUEST.into_response(),
+        Err(RegisterDaemonError::SetupTokenNotConfigured)
+        | Err(RegisterDaemonError::RegistryPathNotConfigured) => {
+            StatusCode::NOT_IMPLEMENTED.into_response()
+        }
+        Err(RegisterDaemonError::Poisoned) | Err(RegisterDaemonError::PersistRegistry) => {
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
+        }
+    }
+}
+
+async fn register_pair_ticket(
+    State(state): State<RelayState>,
+    headers: HeaderMap,
+    Json(request): Json<RegisterPairTicketRequest>,
+) -> Response {
+    let daemon_token = headers
+        .get("x-termd-relay-daemon-token")
+        .and_then(|value| value.to_str().ok());
+    match state.register_pair_ticket(
+        request.server_id,
+        request.token.0,
+        request.expires_at_ms,
+        daemon_token,
+    ) {
+        Ok(outcome) => Json(outcome).into_response(),
+        Err(RegisterAdmissionError::DaemonTokenMissing)
+        | Err(RegisterAdmissionError::DaemonTokenRejected) => {
+            StatusCode::UNAUTHORIZED.into_response()
+        }
+        Err(RegisterAdmissionError::InvalidDevicePublicKey)
+        | Err(RegisterAdmissionError::PairTicketTooShort)
+        | Err(RegisterAdmissionError::InvalidExpiration) => StatusCode::BAD_REQUEST.into_response(),
+        Err(RegisterAdmissionError::Poisoned) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+async fn register_device(
+    State(state): State<RelayState>,
+    headers: HeaderMap,
+    Json(request): Json<RegisterDeviceRequest>,
+) -> Response {
+    let daemon_token = headers
+        .get("x-termd-relay-daemon-token")
+        .and_then(|value| value.to_str().ok());
+    match state.register_device(
+        request.server_id,
+        request.device_id,
+        request.public_key,
+        daemon_token,
+    ) {
+        Ok(outcome) => Json(outcome).into_response(),
+        Err(RegisterAdmissionError::DaemonTokenMissing)
+        | Err(RegisterAdmissionError::DaemonTokenRejected) => {
+            StatusCode::UNAUTHORIZED.into_response()
+        }
+        Err(RegisterAdmissionError::InvalidDevicePublicKey)
+        | Err(RegisterAdmissionError::PairTicketTooShort)
+        | Err(RegisterAdmissionError::InvalidExpiration) => StatusCode::BAD_REQUEST.into_response(),
+        Err(RegisterAdmissionError::Poisoned) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+fn relay_admission_from_headers(
+    headers: &HeaderMap,
+) -> Result<Option<RelayAdmissionPayload>, StatusCode> {
+    let Some(value) = headers.get("x-termd-relay-admission") else {
+        return Ok(None);
+    };
+    let raw = value.to_str().map_err(|_| StatusCode::BAD_REQUEST)?;
+    // 中文注释：relay 只解析 admission 外壳，业务 auth/session 仍由 daemon 最终校验。
+    serde_json::from_str(raw)
+        .map(Some)
+        .map_err(|_| StatusCode::BAD_REQUEST)
 }
 
 fn is_http_api_tunnel_path_allowed(method: &str, path: &str) -> bool {
@@ -134,12 +260,14 @@ fn is_http_api_tunnel_path_allowed(method: &str, path: &str) -> bool {
 struct HealthzPayload {
     status: &'static str,
     rooms: usize,
+    trusted_admission: bool,
 }
 
 async fn healthz(State(state): State<RelayState>) -> Json<HealthzPayload> {
     Json(HealthzPayload {
         status: "ok",
         rooms: state.room_count(),
+        trusted_admission: state.trusted_admission_enabled(),
     })
 }
 
@@ -161,7 +289,7 @@ fn ws_response(
     auth: RelayAuthQuery,
     websocket: WebSocketUpgrade,
 ) -> axum::response::Response {
-    if !state.authorizes(auth.relay_token.as_deref()) {
+    if state.legacy_query_auth_required() && !state.authorizes(auth.relay_token.as_deref()) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -178,10 +306,13 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use futures_util::{SinkExt, StreamExt};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
     use termd_proto::{
-        Envelope, MessageType, Nonce, ProtocolVersion, RelayClientId, RelayControlEnvelope,
-        RouteHelloPayload, RouteReadyPayload, RouteRole, ServerId,
+        Envelope, MessageType, Nonce, ProtocolVersion, RelayAdmissionPayload, RelayClientId,
+        RelayControlEnvelope, RouteHelloPayload, RouteReadyPayload, RouteRole, ServerId,
     };
     use tokio::net::TcpListener;
     use tokio::time::timeout;
@@ -291,7 +422,7 @@ mod tests {
             .expect("router should respond");
 
             // 中文注释：未知或畸形 control 路径必须在 relay token 认证前被路径层拒绝，避免
-            // untrusted relay 暴露更宽的 API 探测面，也让 direct/tunnel 的失败语义一致。
+            // trusted relay 暴露更宽的 API 探测面，也让 direct/tunnel 的失败语义一致。
             assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
         }
     }
@@ -469,6 +600,203 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn register_daemon_api_persists_and_activates_daemon_admission() {
+        let server_id = ServerId::new();
+        let registry_path = temp_registry_path("register-daemon-api");
+        let state = RelayState::new_trusted_with_registry(
+            None,
+            Vec::new(),
+            Vec::new(),
+            Some("relay-setup-secret-1".to_owned()),
+            Some(registry_path.clone()),
+        )
+        .expect("trusted relay registry should initialize");
+        let response = router(state.clone(), false, false)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/relay/daemon/register")
+                    .header("content-type", "application/json")
+                    .header("x-termd-relay-setup-token", "relay-setup-secret-1")
+                    .body(Body::from(format!(
+                        r#"{{"server_id":"{}","daemon_token":"daemon-secret-1"}}"#,
+                        server_id.0
+                    )))
+                    .expect("registration request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = fs::read_to_string(&registry_path)
+            .expect("registration should persist daemon registry");
+        assert!(body.contains(&server_id.0.to_string()));
+        assert!(!body.contains("daemon-secret-1"));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_state = state.clone();
+        let _server = tokio::spawn(async move {
+            axum::serve(listener, router(server_state, false, false))
+                .await
+                .unwrap();
+        });
+        let url = format!("ws://{addr}/ws");
+        let (mut daemon_control, _response) = connect_async(url).await.unwrap();
+        register_route_with_admission(
+            &mut daemon_control,
+            server_id,
+            RouteRole::DaemonControl,
+            Some(RelayAdmissionPayload::Daemon {
+                token: "daemon-secret-1".to_owned(),
+            }),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn register_daemon_api_replaces_existing_token_with_setup_token() {
+        let server_id = ServerId::new();
+        let registry_path = temp_registry_path("replace-daemon-api");
+        let state = RelayState::new_trusted_with_registry(
+            None,
+            vec![crate::ws::RelayDaemonCredential::plain_token(
+                server_id,
+                "old-daemon-secret".to_owned(),
+            )],
+            Vec::new(),
+            Some("relay-setup-secret-1".to_owned()),
+            Some(registry_path),
+        )
+        .expect("trusted relay registry should initialize");
+
+        for token in ["new-daemon-secret", "new-daemon-secret"] {
+            let response = router(state.clone(), false, false)
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/api/relay/daemon/register")
+                        .header("content-type", "application/json")
+                        .header("x-termd-relay-setup-token", "relay-setup-secret-1")
+                        .body(Body::from(format!(
+                            r#"{{"server_id":"{}","daemon_token":"{}"}}"#,
+                            server_id.0, token
+                        )))
+                        .expect("registration request should build"),
+                )
+                .await
+                .expect("router should respond");
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        assert!(
+            state
+                .authorize_test_route(
+                    server_id,
+                    RouteRole::DaemonControl,
+                    RelayAdmissionPayload::Daemon {
+                        token: "new-daemon-secret".to_owned(),
+                    },
+                )
+                .is_ok()
+        );
+        assert!(
+            state
+                .authorize_test_route(
+                    server_id,
+                    RouteRole::DaemonControl,
+                    RelayAdmissionPayload::Daemon {
+                        token: "old-daemon-secret".to_owned(),
+                    },
+                )
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn trusted_relay_accepts_pair_ticket_client_without_query_token() {
+        let server_id = ServerId::new();
+        let state = RelayState::new_trusted(
+            None,
+            vec![crate::ws::RelayDaemonCredential::plain_token(
+                server_id,
+                "daemon-secret-1".to_owned(),
+            )],
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_state = state.clone();
+        let _server = tokio::spawn(async move {
+            axum::serve(listener, router(server_state, false, false))
+                .await
+                .unwrap();
+        });
+        let url = format!("ws://{addr}/ws");
+        let (mut daemon_control, _daemon_response) = connect_async(url.clone()).await.unwrap();
+        register_route_with_admission(
+            &mut daemon_control,
+            server_id,
+            RouteRole::DaemonControl,
+            Some(RelayAdmissionPayload::Daemon {
+                token: "daemon-secret-1".to_owned(),
+            }),
+        )
+        .await;
+        state
+            .register_pair_ticket(
+                server_id,
+                "termd-pair-test".to_owned(),
+                termd_proto::UnixTimestampMillis(u64::MAX),
+                Some("daemon-secret-1"),
+            )
+            .expect("test pair ticket should register");
+
+        let (mut client, _client_response) = connect_async(url).await.unwrap();
+        register_route_with_admission(
+            &mut client,
+            server_id,
+            RouteRole::Client,
+            Some(RelayAdmissionPayload::PairTicket {
+                token: termd_proto::PairingToken("termd-pair-test".to_owned()),
+            }),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn trusted_relay_ignores_legacy_query_token_for_client_admission() {
+        let server_id = ServerId::new();
+        let state = RelayState::new_trusted(
+            Some("legacy-relay-secret".to_owned()),
+            vec![crate::ws::RelayDaemonCredential::plain_token(
+                server_id,
+                "daemon-secret-1".to_owned(),
+            )],
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_state = state.clone();
+        let _server = tokio::spawn(async move {
+            axum::serve(listener, router(server_state, false, false))
+                .await
+                .unwrap();
+        });
+        let url = format!("ws://{addr}/ws?relay_token=legacy-relay-secret");
+        let (mut client, _client_response) = connect_async(url).await.unwrap();
+
+        let hello = route_hello(server_id, RouteRole::Client, None, None);
+        client
+            .send(ClientMessage::Text(serde_json::to_string(&hello).unwrap()))
+            .await
+            .unwrap();
+
+        let raw = next_text(&mut client).await;
+        let error: Envelope<termd_proto::ErrorPayload> = serde_json::from_str(&raw).unwrap();
+        assert_eq!(error.kind, MessageType::Error);
+        assert_eq!(error.payload.code, "relay_admission_required");
+    }
+
+    #[tokio::test]
     async fn old_path_based_websocket_routes_are_removed() {
         let server_id = ServerId::new();
 
@@ -581,7 +909,17 @@ mod tests {
     type TestSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
     async fn register_route(socket: &mut TestSocket, server_id: ServerId, role: RouteRole) {
-        let hello = route_hello(server_id, role, None, None);
+        register_route_with_admission(socket, server_id, role, None).await;
+    }
+
+    async fn register_route_with_admission(
+        socket: &mut TestSocket,
+        server_id: ServerId,
+        role: RouteRole,
+        admission: Option<RelayAdmissionPayload>,
+    ) {
+        let mut hello = route_hello(server_id, role, None, None);
+        hello.payload.admission = admission;
         socket
             .send(ClientMessage::Text(serde_json::to_string(&hello).unwrap()))
             .await
@@ -655,6 +993,7 @@ mod tests {
                 role,
                 protocol_version: ProtocolVersion::default(),
                 nonce: Nonce("route-test-nonce".to_owned()),
+                admission: None,
                 route_generation,
                 client_id,
                 data_token,
@@ -700,5 +1039,14 @@ mod tests {
                 frame => return Some(frame),
             }
         }
+    }
+
+    fn temp_registry_path(label: &str) -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let index = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "termd-termrelay-{label}-{}-{index}.json",
+            std::process::id()
+        ))
     }
 }

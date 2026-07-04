@@ -5,10 +5,14 @@ services:
     command:
       - --listen
       - 0.0.0.0:8080
-      - --auth-token-file
-      - /run/secrets/termrelay_auth_token
+      - --setup-token-file
+      - /run/secrets/termrelay_setup_token
+      - --daemon-registry
+      - /data/daemon-registry.json
     secrets:
-      - termrelay_auth_token
+      - termrelay_setup_token
+    volumes:
+      - termrelay_state:/data
     expose:
       - "8080"
 
@@ -30,7 +34,8 @@ services:
 volumes:
   caddy_data:
   caddy_config:
+  termrelay_state:
 
 secrets:
-  termrelay_auth_token:
-    file: "${TERMRELAY_AUTH_TOKEN_FILE:?TERMRELAY_AUTH_TOKEN_FILE must point to a token file for public Caddy deployment}"
+  termrelay_setup_token:
+    file: "${TERMRELAY_SETUP_TOKEN_FILE:?TERMRELAY_SETUP_TOKEN_FILE must point to the relay setup token file}"

@@ -1312,6 +1312,7 @@ export default function App() {
         routeServerId,
         device.device_id,
         daemonPublicKey,
+        token,
         PAIRING_CONNECTION_TIMEOUT_MS,
       );
       const accepted = await client.pair(token, device.device_public_key, device);
@@ -1370,6 +1371,7 @@ export default function App() {
     try {
       client = await DirectClient.connect(effectiveUrl, server.server_id, device.device_id, {
         expectedDaemonPublicKey: server.daemon_public_key,
+        trustedDevice: device,
       });
       await client.authenticate(device, { ...server, url: effectiveUrl });
       client.close();

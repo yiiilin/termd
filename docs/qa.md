@@ -9,7 +9,7 @@
 | shell 脚本语法 | `bash -n scripts/*.sh` |
 | Rust 格式 | `cargo fmt --all -- --check` |
 | Rust workspace | `cargo test --workspace --locked` |
-| pairing CLI E2E | 启动本地 `termd`，运行 `termd pair --qr` 获取 `termd-pair:v1` 邀请码，再运行 `termctl pair --payload` 完成设备配对 |
+| pairing CLI E2E | 启动本地 `termd`，运行 `termd pair --qr` 获取 `termd-pair:v2` 邀请码，再运行 `termctl pair --payload` 完成设备配对 |
 | termctl direct E2E | `cargo test -p termctl --test direct_daemon_e2e` |
 | termrelay E2E | `cargo test -p termrelay --test relay_e2e` |
 | relay runtime E2E | 启动本地 `termrelay` 和 `termd --relay`，通过统一 `/ws` relay URL 运行 `termctl pair/new/list` |
@@ -31,8 +31,8 @@ TERMD_QA_SKIP_NPM_CI=1 bash scripts/qa.sh
 
 ## 公网部署 smoke QA
 
-- 确认 `wss://relay.example/ws?relay_token=...` 可以完成 pair / new / list，`server_id` 只出现在连接后的 `route_hello` 中。
-- 确认反向代理保留 WebSocket upgrade，并且 `relay_token` 不出现在 access log 或 error log。
+- 确认 `wss://relay.example/ws` 可以完成 pair / new / list，`server_id` 只出现在连接后的 `route_hello` 中。
+- 确认反向代理保留 WebSocket upgrade，并且 setup token、daemon token 或旧 `relay_token` 不出现在 access log 或 error log。
 - 确认 `termrelay /healthz` 可从公网 health check 入口访问，而 `termd /healthz` 仍留在私网或 loopback。
 - 确认 `termd /local/pairing-token` 不能从公网入口访问。
 - 确认 `termctl` 与 Web 仍然只把 relay 当作 transport，不把 relay 当成可信业务层。

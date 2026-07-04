@@ -8,7 +8,7 @@
 
 构建一个：
 
-> **端到端加密的持久终端系统（terminal-as-a-service）**
+> **可信 relay 的持久终端系统（terminal-as-a-service）**
 
 核心能力：
 
@@ -37,10 +37,10 @@
 ## 2.2 信任模型
 
 ```text
-daemon public key = trust anchor
+daemon public key = identity anchor
 device key = identity
 pairing = trust establishment
-relay = untrusted
+relay = trusted admission/routing layer
 ```
 
 ---
@@ -64,17 +64,18 @@ relay = untrusted
 
 ## 2.4 relay 原则
 
-relay **必须是 dumb pipe**：
+relay **是可信 admission 和 routing 层**：
 
 禁止：
 
-* ❌ 解密数据
-* ❌ 解析 session 内容
-* ❌ 执行控制权判断
+* ❌ 持有 session/PTY 业务状态
+* ❌ 执行终端控制权判断
+* ❌ 保存设备私钥或 daemon 私钥
 
 只允许：
 
-* 转发 WebSocket 数据
+* 校验 relay transport token 和 daemon admission token
+* 转发明文 WebSocket/HTTP tunnel 数据
 * 路由 server_id
 * 管理连接
 
@@ -125,7 +126,8 @@ ping/pong
 
 * session_data 必须是二进制或 base64
 * 不允许混合协议格式
-* 所有敏感数据必须在 E2EE 内
+* pairing/auth/session 权限必须由 daemon 最终校验
+* relay secret 不能进入日志、URL access log 或错误事件
 
 ---
 
@@ -201,7 +203,7 @@ NONE → HELD(dev_x) → HELD(dev_y)
 ```text
 1. 只有已 attach 的连接可以操作 session
 2. 未配对设备不能连接
-3. relay 不可访问明文
+3. relay 只做可信 admission/routing，不持有 session/PTY 状态
 4. session 不因 client 断开而终止
 ```
 

@@ -1,11 +1,26 @@
+use std::collections::HashMap;
 use std::fmt;
+use std::fs;
+use std::io;
+use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket};
+use base64::{Engine as _, engine::general_purpose};
+use ed25519_dalek::{Signature as Ed25519Signature, Verifier, VerifyingKey};
 use futures_util::StreamExt;
-use termd_proto::{MessageType, Nonce, RelayClientId, RelayControlEnvelope, RouteRole, ServerId};
+use serde::Serialize;
+use sha2::{Digest, Sha256};
+use termd_proto::{
+    DeviceId, MessageType, Nonce, PublicKey, RelayAdmissionPayload, RelayClientId,
+    RelayControlEnvelope, RouteRole, ServerId, Signature, UnixTimestampMillis,
+};
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -49,7 +64,7 @@ use self::route_binder::bind_socket_route;
 #[cfg(test)]
 use self::route_binder::route_prelude_error_is_noisy_client_disconnect;
 
-// 中文注释：relay 是 dumb pipe，不能长期替慢浏览器缓存终端流。
+// 中文注释：relay 是 trusted routing 层，不能长期替慢浏览器缓存终端流。
 // 预算按 100ms 千兆链路的 BDP 量级设置；健康连接可以填满管道，
 // 慢 client 仍会在预算耗尽后关闭并让前端重连拿 snapshot。
 const DATA_CHANNEL_CAPACITY: usize = 32 * 1024;
@@ -60,19 +75,23 @@ const HTTP_TUNNEL_BODY_CHANNEL_CAPACITY: usize = 1;
 const HTTP_TUNNEL_SHORT_REQUEST_BODY_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(test)]
 const HTTP_TUNNEL_SHORT_REQUEST_BODY_TIMEOUT: Duration = Duration::from_millis(50);
-// 中文注释：route_ready 之后 client 可能先发少量 E2EE 数据，但 daemon data 必须及时接上；
+// 中文注释：route_ready 之后 client 可能先发少量业务数据，但 daemon data 必须及时接上；
 // 超时后只关闭 relay transport，daemon session 本身仍由 daemon 管理。
 #[cfg(not(test))]
-const PENDING_CLIENT_PAIR_DEADLINE: Duration = Duration::from_secs(5);
+const PENDING_CLIENT_PAIR_DEADLINE: Duration = Duration::from_secs(20);
 #[cfg(test)]
 const PENDING_CLIENT_PAIR_DEADLINE: Duration = Duration::from_millis(250);
 const PENDING_CLIENTS_PER_ROOM_LIMIT: usize = 64;
 // 中文注释：client route_ready 先于 daemon data 反连完成返回时，browser 可能立刻发送
-// E2EE hello/auth/attach。relay 只做短暂 opaque 缓冲，避免公网反连慢几百毫秒就让前端超时。
+// hello/auth/attach。relay 只做短暂 opaque 缓冲，避免公网反连慢几百毫秒就让前端超时。
 const PRE_PAIR_CLIENT_BUFFER_MAX_FRAMES: usize = 256;
 const PRE_PAIR_CLIENT_BUFFER_MAX_BYTES: usize = 4 * 1024 * 1024;
 const PRE_PAIR_ROOM_BUFFER_MAX_BYTES: usize = PRE_PAIR_CLIENT_BUFFER_MAX_BYTES * 2;
 const RELAY_AUTH_TOKEN_MIN_BYTES: usize = 8;
+const ED25519_WIRE_PREFIX: &str = "ed25519-v1:";
+const ED25519_PUBLIC_KEY_LEN: usize = 32;
+const ED25519_SIGNATURE_LEN: usize = 64;
+const DEVICE_ADMISSION_CLOCK_SKEW_MS: u64 = 2 * 60 * 1000;
 // 中文注释：daemon_data 源 socket 需要一个本地短缓冲，把“读 daemon 输出”和“写浏览器”
 // 两条链路拆开，避免单个慢 client 直接把源读循环卡住。这里仍然保持有界缓存，预算耗尽后
 // 就关闭当前 transport，让上层按既有 snapshot/reconnect 路径恢复。
@@ -83,6 +102,7 @@ const DAEMON_DATA_INGRESS_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 #[cfg(test)]
 const DAEMON_DATA_INGRESS_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
 type ConnectionId = u64;
+static ATOMIC_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct RelayTrafficBucket {
@@ -228,19 +248,275 @@ fn relay_auth_token_constant_time_eq(expected: &str, provided: &str) -> bool {
     diff == 0
 }
 
+fn relay_daemon_token_hash(token: &str) -> String {
+    let digest = Sha256::digest(token.as_bytes());
+    format!("sha256:{}", hex_lower(&digest))
+}
+
+fn relay_daemon_persisted_token_hash(value: &str) -> String {
+    if value.starts_with("sha256:") && value.len() == "sha256:".len() + 64 {
+        value.to_owned()
+    } else {
+        relay_daemon_token_hash(value)
+    }
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
+
+fn relay_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
+fn prune_expired_pair_tickets(admission: &mut RelayAdmissionState, now_ms: u64) {
+    admission
+        .pair_ticket_hashes
+        .retain(|_, expires_at_ms| expires_at_ms.0 > now_ms);
+}
+
+fn prune_expired_device_admission_nonces(admission: &mut RelayAdmissionState, now_ms: u64) {
+    admission
+        .device_admission_nonces
+        .retain(|_, expires_at_ms| expires_at_ms.0 > now_ms);
+}
+
+fn decode_ed25519_wire(value: &str, expected_len: usize) -> Result<Vec<u8>, ()> {
+    let encoded = value.strip_prefix(ED25519_WIRE_PREFIX).ok_or(())?;
+    let bytes = general_purpose::STANDARD.decode(encoded).map_err(|_| ())?;
+    if bytes.len() == expected_len {
+        Ok(bytes)
+    } else {
+        Err(())
+    }
+}
+
+fn relay_admission_signing_input(
+    server_id: ServerId,
+    device_id: DeviceId,
+    nonce: &Nonce,
+    timestamp_ms: UnixTimestampMillis,
+) -> Vec<u8> {
+    let mut out = b"termd-relay-admission-v1\n".to_vec();
+    append_canonical_field(&mut out, "server_id", &server_id.0.to_string());
+    append_canonical_field(&mut out, "device_id", &device_id.0.to_string());
+    append_canonical_field(&mut out, "nonce", nonce.0.as_str());
+    append_canonical_field(&mut out, "timestamp_ms", &timestamp_ms.0.to_string());
+    out
+}
+
+fn append_canonical_field(out: &mut Vec<u8>, name: &str, value: &str) {
+    out.extend_from_slice(name.as_bytes());
+    out.extend_from_slice(b":");
+    out.extend_from_slice(value.len().to_string().as_bytes());
+    out.extend_from_slice(b":");
+    out.extend_from_slice(value.as_bytes());
+    out.extend_from_slice(b"\n");
+}
+
+fn verify_device_relay_admission(
+    server_id: ServerId,
+    device_id: DeviceId,
+    nonce: &Nonce,
+    timestamp_ms: UnixTimestampMillis,
+    signature: &Signature,
+    public_key: &PublicKey,
+) -> bool {
+    let Ok(public_key_bytes) = decode_ed25519_wire(&public_key.0, ED25519_PUBLIC_KEY_LEN) else {
+        return false;
+    };
+    let Ok(signature_bytes) = decode_ed25519_wire(&signature.0, ED25519_SIGNATURE_LEN) else {
+        return false;
+    };
+    let public_key_bytes: [u8; ED25519_PUBLIC_KEY_LEN] =
+        match public_key_bytes.as_slice().try_into() {
+            Ok(bytes) => bytes,
+            Err(_) => return false,
+        };
+    let signature_bytes: [u8; ED25519_SIGNATURE_LEN] = match signature_bytes.as_slice().try_into() {
+        Ok(bytes) => bytes,
+        Err(_) => return false,
+    };
+    let Ok(verifying_key) = VerifyingKey::from_bytes(&public_key_bytes) else {
+        return false;
+    };
+    let signature = Ed25519Signature::from_bytes(&signature_bytes);
+    verifying_key
+        .verify(
+            &relay_admission_signing_input(server_id, device_id, nonce, timestamp_ms),
+            &signature,
+        )
+        .is_ok()
+}
+
+fn atomic_write(path: &PathBuf, contents: &[u8]) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("daemon-registry.json");
+    let tmp_path = path.with_file_name(format!(
+        "{file_name}.tmp-{}-{}",
+        std::process::id(),
+        ATOMIC_WRITE_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    // 中文注释：setup 注册会更新长期 registry，先写同目录临时文件再 rename，
+    // 避免进程中断时留下半截 JSON 让 relay 下次无法启动。
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        options.mode(0o640);
+    }
+    let mut file = options.open(&tmp_path)?;
+    file.write_all(contents)?;
+    file.sync_all()?;
+    fs::rename(&tmp_path, path)?;
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o640))?;
+    if let Some(parent) = path.parent() {
+        fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct RelayState {
     inner: Arc<RelayRegistry>,
     auth_token: Option<String>,
+    admission: Arc<RwLock<RelayAdmissionState>>,
+    setup_token: Option<String>,
+    registry_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Default)]
+struct RelayAdmissionState {
+    trusted: bool,
+    daemon_token_hashes: HashMap<ServerId, String>,
+    pair_ticket_hashes: HashMap<(ServerId, String), UnixTimestampMillis>,
+    device_public_keys: HashMap<(ServerId, DeviceId), PublicKey>,
+    device_admission_nonces: HashMap<(ServerId, DeviceId, String), UnixTimestampMillis>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayDaemonCredential {
+    pub server_id: ServerId,
+    pub token: String,
+    pub token_is_hash: bool,
+}
+
+impl RelayDaemonCredential {
+    pub fn plain_token(server_id: ServerId, token: String) -> Self {
+        Self {
+            server_id,
+            token,
+            token_is_hash: false,
+        }
+    }
+
+    pub fn token_hash(server_id: ServerId, token: String) -> Self {
+        Self {
+            server_id,
+            token,
+            token_is_hash: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct RegisterDaemonOutcome {
+    pub server_id: ServerId,
+    pub replaced: bool,
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum RegisterDaemonError {
+    #[error("relay setup token is not configured")]
+    SetupTokenNotConfigured,
+    #[error("relay setup token is missing")]
+    SetupTokenMissing,
+    #[error("relay setup token was rejected")]
+    SetupTokenRejected,
+    #[error("daemon token is too short")]
+    DaemonTokenTooShort,
+    #[error("daemon registry path is not configured")]
+    RegistryPathNotConfigured,
+    #[error("relay state is temporarily unavailable")]
+    Poisoned,
+    #[error("failed to persist daemon registry")]
+    PersistRegistry,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayDeviceCredential {
+    pub server_id: ServerId,
+    pub device_id: DeviceId,
+    pub public_key: PublicKey,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RegisterPairTicketOutcome {
+    pub server_id: ServerId,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RegisterDeviceOutcome {
+    pub server_id: ServerId,
+    pub device_id: DeviceId,
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum RegisterAdmissionError {
+    #[error("daemon token is missing")]
+    DaemonTokenMissing,
+    #[error("daemon token was rejected")]
+    DaemonTokenRejected,
+    #[error("device public key is invalid")]
+    InvalidDevicePublicKey,
+    #[error("pair ticket is too short")]
+    PairTicketTooShort,
+    #[error("invalid expiration")]
+    InvalidExpiration,
+    #[error("relay state is temporarily unavailable")]
+    Poisoned,
+}
+
+#[derive(Debug, Serialize)]
+struct PersistedDaemonRegistry<'a> {
+    daemons: Vec<PersistedDaemonRegistryEntry<'a>>,
+}
+
+#[derive(Debug, Serialize)]
+struct PersistedDaemonRegistryEntry<'a> {
+    server_id: ServerId,
+    token_hash: &'a str,
 }
 
 impl fmt::Debug for RelayState {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (trusted, rooms) = match self.admission.read() {
+            Ok(admission) => (admission.trusted, self.room_count()),
+            Err(_) => (false, self.room_count()),
+        };
         // relay auth token 是 transport 凭证，Debug 输出只能显示是否配置，不能泄漏明文。
         formatter
             .debug_struct("RelayState")
             .field("auth_token_configured", &self.auth_token.is_some())
-            .field("rooms", &self.room_count())
+            .field("trusted_admission", &trusted)
+            .field("setup_token_configured", &self.setup_token.is_some())
+            .field("registry_path_configured", &self.registry_path.is_some())
+            .field("rooms", &rooms)
             .finish()
     }
 }
@@ -264,7 +540,64 @@ impl RelayState {
         Self {
             inner: Arc::new(RelayRegistry::default()),
             auth_token,
+            admission: Arc::new(RwLock::new(RelayAdmissionState::default())),
+            setup_token: None,
+            registry_path: None,
         }
+    }
+
+    #[cfg(test)]
+    pub fn new_trusted(
+        auth_token: Option<String>,
+        daemon_credentials: Vec<RelayDaemonCredential>,
+    ) -> Self {
+        Self::new_trusted_with_registry(auth_token, daemon_credentials, Vec::new(), None, None)
+            .expect("in-memory trusted relay state should initialize")
+    }
+
+    pub fn new_trusted_with_registry(
+        auth_token: Option<String>,
+        daemon_credentials: Vec<RelayDaemonCredential>,
+        device_credentials: Vec<RelayDeviceCredential>,
+        setup_token: Option<String>,
+        registry_path: Option<PathBuf>,
+    ) -> Result<Self, RegisterDaemonError> {
+        let mut state = Self::new(auth_token);
+        let daemon_token_hashes = daemon_credentials
+            .into_iter()
+            .map(|credential| {
+                (
+                    credential.server_id,
+                    if credential.token_is_hash {
+                        relay_daemon_persisted_token_hash(&credential.token)
+                    } else {
+                        relay_daemon_token_hash(&credential.token)
+                    },
+                )
+            })
+            .collect();
+        let device_public_keys = device_credentials
+            .into_iter()
+            .map(|credential| {
+                (
+                    (credential.server_id, credential.device_id),
+                    credential.public_key,
+                )
+            })
+            .collect();
+        state.admission = Arc::new(RwLock::new(RelayAdmissionState {
+            trusted: true,
+            daemon_token_hashes,
+            pair_ticket_hashes: HashMap::new(),
+            device_public_keys,
+            device_admission_nonces: HashMap::new(),
+        }));
+        state.setup_token = setup_token;
+        state.registry_path = registry_path;
+        if state.registry_path.is_some() {
+            state.persist_daemon_registry()?;
+        }
+        Ok(state)
     }
 
     pub fn authorizes(&self, token: Option<&str>) -> bool {
@@ -280,6 +613,283 @@ impl RelayState {
 
     pub fn room_count(&self) -> usize {
         self.inner.room_count()
+    }
+
+    pub fn trusted_admission_enabled(&self) -> bool {
+        self.admission
+            .read()
+            .map(|admission| admission.trusted)
+            .unwrap_or(false)
+    }
+
+    pub fn legacy_query_auth_required(&self) -> bool {
+        self.auth_token.is_some() && !self.trusted_admission_enabled()
+    }
+
+    pub fn register_daemon(
+        &self,
+        server_id: ServerId,
+        daemon_token: String,
+        setup_token: Option<&str>,
+    ) -> Result<RegisterDaemonOutcome, RegisterDaemonError> {
+        let expected_setup_token = self
+            .setup_token
+            .as_deref()
+            .ok_or(RegisterDaemonError::SetupTokenNotConfigured)?;
+        let provided_setup_token = setup_token.ok_or(RegisterDaemonError::SetupTokenMissing)?;
+        if !relay_auth_token_has_safe_length(expected_setup_token)
+            || !relay_auth_token_has_safe_length(provided_setup_token)
+            || !relay_auth_token_constant_time_eq(expected_setup_token, provided_setup_token)
+        {
+            return Err(RegisterDaemonError::SetupTokenRejected);
+        }
+        if !relay_auth_token_has_safe_length(&daemon_token) {
+            return Err(RegisterDaemonError::DaemonTokenTooShort);
+        }
+        if self.registry_path.is_none() {
+            return Err(RegisterDaemonError::RegistryPathNotConfigured);
+        }
+
+        let token_hash = relay_daemon_token_hash(&daemon_token);
+        let mut admission = self
+            .admission
+            .write()
+            .map_err(|_| RegisterDaemonError::Poisoned)?;
+        let mut next_hashes = admission.daemon_token_hashes.clone();
+        let replaced = next_hashes.insert(server_id, token_hash).is_some();
+        // 中文注释：先写 registry，再替换内存 admission；如果落盘失败，新 token 不会
+        // 在当前进程临时生效，避免重启前后行为不一致。
+        self.persist_daemon_registry_hashes(&next_hashes)?;
+        admission.trusted = true;
+        admission.daemon_token_hashes = next_hashes;
+        drop(admission);
+        if replaced {
+            self.inner
+                .close_server(server_id)
+                .map_err(|_| RegisterDaemonError::Poisoned)?;
+        }
+        Ok(RegisterDaemonOutcome {
+            server_id,
+            replaced,
+        })
+    }
+
+    pub fn register_pair_ticket(
+        &self,
+        server_id: ServerId,
+        pair_ticket: String,
+        expires_at_ms: UnixTimestampMillis,
+        daemon_token: Option<&str>,
+    ) -> Result<RegisterPairTicketOutcome, RegisterAdmissionError> {
+        self.authorize_daemon_bearer(server_id, daemon_token)?;
+        if !relay_auth_token_has_safe_length(&pair_ticket) {
+            return Err(RegisterAdmissionError::PairTicketTooShort);
+        }
+        if expires_at_ms.0 <= relay_now_ms() {
+            return Err(RegisterAdmissionError::InvalidExpiration);
+        }
+        let mut admission = self
+            .admission
+            .write()
+            .map_err(|_| RegisterAdmissionError::Poisoned)?;
+        prune_expired_pair_tickets(&mut admission, relay_now_ms());
+        admission.pair_ticket_hashes.insert(
+            (server_id, relay_daemon_token_hash(&pair_ticket)),
+            expires_at_ms,
+        );
+        Ok(RegisterPairTicketOutcome { server_id })
+    }
+
+    pub fn register_device(
+        &self,
+        server_id: ServerId,
+        device_id: DeviceId,
+        public_key: PublicKey,
+        daemon_token: Option<&str>,
+    ) -> Result<RegisterDeviceOutcome, RegisterAdmissionError> {
+        self.authorize_daemon_bearer(server_id, daemon_token)?;
+        decode_ed25519_wire(&public_key.0, ED25519_PUBLIC_KEY_LEN)
+            .map_err(|_| RegisterAdmissionError::InvalidDevicePublicKey)?;
+        let mut admission = self
+            .admission
+            .write()
+            .map_err(|_| RegisterAdmissionError::Poisoned)?;
+        admission
+            .device_public_keys
+            .insert((server_id, device_id), public_key);
+        Ok(RegisterDeviceOutcome {
+            server_id,
+            device_id,
+        })
+    }
+
+    fn authorize_daemon_bearer(
+        &self,
+        server_id: ServerId,
+        daemon_token: Option<&str>,
+    ) -> Result<(), RegisterAdmissionError> {
+        let token = daemon_token.ok_or(RegisterAdmissionError::DaemonTokenMissing)?;
+        if !relay_auth_token_has_safe_length(token) {
+            return Err(RegisterAdmissionError::DaemonTokenRejected);
+        }
+        let admission = self
+            .admission
+            .read()
+            .map_err(|_| RegisterAdmissionError::Poisoned)?;
+        let Some(expected_hash) = admission.daemon_token_hashes.get(&server_id) else {
+            return Err(RegisterAdmissionError::DaemonTokenRejected);
+        };
+        let provided_hash = relay_daemon_token_hash(token);
+        if relay_auth_token_constant_time_eq(expected_hash, &provided_hash) {
+            Ok(())
+        } else {
+            Err(RegisterAdmissionError::DaemonTokenRejected)
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn authorize_test_route(
+        &self,
+        server_id: ServerId,
+        route_role: RouteRole,
+        admission: RelayAdmissionPayload,
+    ) -> Result<(), ()> {
+        let connection_role = match ConnectionRole::from_route_role(route_role) {
+            Ok(role) => role,
+            Err(_) => return Err(()),
+        };
+        self.authorize_route_admission(&RoutePrelude {
+            server_id,
+            route_role,
+            connection_role,
+            admission: Some(admission),
+            route_generation: Some(test_route_generation(server_id)),
+            client_id: None,
+            data_token: None,
+        })
+        .map_err(|_| ())
+    }
+
+    fn persist_daemon_registry(&self) -> Result<(), RegisterDaemonError> {
+        let admission = self
+            .admission
+            .read()
+            .map_err(|_| RegisterDaemonError::Poisoned)?;
+        self.persist_daemon_registry_hashes(&admission.daemon_token_hashes)
+    }
+
+    fn persist_daemon_registry_hashes(
+        &self,
+        daemon_token_hashes: &HashMap<ServerId, String>,
+    ) -> Result<(), RegisterDaemonError> {
+        let path = self
+            .registry_path
+            .as_ref()
+            .ok_or(RegisterDaemonError::RegistryPathNotConfigured)?;
+        let mut daemons = daemon_token_hashes
+            .iter()
+            .map(|(server_id, token_hash)| PersistedDaemonRegistryEntry {
+                server_id: *server_id,
+                token_hash: token_hash.as_str(),
+            })
+            .collect::<Vec<_>>();
+        daemons.sort_by_key(|entry| entry.server_id.0);
+        let payload = PersistedDaemonRegistry { daemons };
+        let raw = serde_json::to_vec_pretty(&payload)
+            .map_err(|_| RegisterDaemonError::PersistRegistry)?;
+        atomic_write(path, &raw).map_err(|_| RegisterDaemonError::PersistRegistry)
+    }
+
+    fn authorize_route_admission(&self, prelude: &RoutePrelude) -> Result<(), RelayError> {
+        let mut admission_state = self.admission.write().map_err(|_| RelayError::Poisoned)?;
+        if !admission_state.trusted {
+            return Ok(());
+        }
+        let now_ms = relay_now_ms();
+        prune_expired_pair_tickets(&mut admission_state, now_ms);
+        prune_expired_device_admission_nonces(&mut admission_state, now_ms);
+
+        match prelude.connection_role {
+            ConnectionRole::DaemonControl | ConnectionRole::DaemonData => {
+                let Some(RelayAdmissionPayload::Daemon { token }) = prelude.admission.as_ref()
+                else {
+                    return Err(RelayError::AdmissionRequired);
+                };
+                let Some(expected_hash) =
+                    admission_state.daemon_token_hashes.get(&prelude.server_id)
+                else {
+                    return Err(RelayError::AdmissionRejected);
+                };
+                let provided_hash = relay_daemon_token_hash(token.as_str());
+                if relay_auth_token_constant_time_eq(expected_hash, &provided_hash) {
+                    Ok(())
+                } else {
+                    Err(RelayError::AdmissionRejected)
+                }
+            }
+            ConnectionRole::Client => match prelude.admission.as_ref() {
+                Some(RelayAdmissionPayload::PairTicket { token }) => {
+                    let token_hash = relay_daemon_token_hash(&token.0);
+                    let Some(expires_at_ms) = admission_state
+                        .pair_ticket_hashes
+                        .get(&(prelude.server_id, token_hash))
+                    else {
+                        return Err(RelayError::AdmissionRejected);
+                    };
+                    if expires_at_ms.0 <= now_ms {
+                        return Err(RelayError::AdmissionRejected);
+                    }
+                    Ok(())
+                }
+                Some(RelayAdmissionPayload::Device {
+                    device_id,
+                    nonce,
+                    timestamp_ms,
+                    signature,
+                }) => {
+                    let lower_bound = now_ms.saturating_sub(DEVICE_ADMISSION_CLOCK_SKEW_MS);
+                    let upper_bound = now_ms.saturating_add(DEVICE_ADMISSION_CLOCK_SKEW_MS);
+                    if timestamp_ms.0 < lower_bound || timestamp_ms.0 > upper_bound {
+                        return Err(RelayError::AdmissionRejected);
+                    }
+                    let nonce_key = (prelude.server_id, *device_id, nonce.0.clone());
+                    if admission_state
+                        .device_admission_nonces
+                        .contains_key(&nonce_key)
+                    {
+                        return Err(RelayError::AdmissionRejected);
+                    }
+                    let Some(public_key) = admission_state
+                        .device_public_keys
+                        .get(&(prelude.server_id, *device_id))
+                    else {
+                        return Err(RelayError::AdmissionRejected);
+                    };
+                    if verify_device_relay_admission(
+                        prelude.server_id,
+                        *device_id,
+                        nonce,
+                        *timestamp_ms,
+                        signature,
+                        public_key,
+                    ) {
+                        admission_state.device_admission_nonces.insert(
+                            nonce_key,
+                            UnixTimestampMillis(
+                                timestamp_ms
+                                    .0
+                                    .saturating_add(DEVICE_ADMISSION_CLOCK_SKEW_MS),
+                            ),
+                        );
+                        Ok(())
+                    } else {
+                        Err(RelayError::AdmissionRejected)
+                    }
+                }
+                Some(RelayAdmissionPayload::Daemon { .. }) => Err(RelayError::AdmissionRejected),
+                None => Err(RelayError::AdmissionRequired),
+            },
+        }
     }
 
     fn start_pending_client_pair_deadline(&self, registration: &ConnectionRegistration) {
@@ -337,6 +947,7 @@ impl RelayState {
                 ConnectionRole::Client => RouteRole::Client,
             },
             connection_role: role,
+            admission: None,
             route_generation,
             client_id: None,
             data_token: None,
@@ -636,6 +1247,7 @@ struct RoutePrelude {
     server_id: ServerId,
     route_role: RouteRole,
     connection_role: ConnectionRole,
+    admission: Option<RelayAdmissionPayload>,
     route_generation: Option<Nonce>,
     client_id: Option<RelayClientId>,
     data_token: Option<Nonce>,
@@ -699,7 +1311,7 @@ pub async fn handle_socket(mut socket: WebSocket, state: RelayState) {
     let (sender, mut receiver) = socket.split();
     let mut receive_debug = WebSocketReceiveDebug::new(Instant::now());
     let mut traffic = RelayConnectionTraffic::default();
-    // 中文注释：relay 必须是 dumb pipe，但 transport 读写不能互相拖住。
+    // 中文注释：relay 只做 admission/routing，transport 读写不能互相拖住。
     // 每条 WebSocket 的写侧单独跑，主循环只负责持续读取输入并转发到目标队列；
     // writer 一旦写失败，会直接关闭 endpoint signal，主循环只认这个 signal 退出，
     // 不再依赖另一条 outcome 队列，避免持续入站时把 writer 失败饿住。
@@ -990,6 +1602,7 @@ mod tests {
     use crate::router::router;
     use axum::body::{Body, Bytes};
     use axum::http::StatusCode;
+    use ed25519_dalek::{Signer, SigningKey};
     use futures_util::{SinkExt, StreamExt};
     use termd_proto::{
         Envelope, ErrorPayload, Nonce, PROTOCOL_PACKET_VERSION, ProtocolVersion,
@@ -1004,6 +1617,37 @@ mod tests {
 
     fn server_id(value: u128) -> ServerId {
         ServerId(uuid::Uuid::from_u128(value))
+    }
+
+    fn test_device_admission(
+        server_id: ServerId,
+        device_id: DeviceId,
+        nonce: Nonce,
+        timestamp_ms: UnixTimestampMillis,
+    ) -> (PublicKey, RelayAdmissionPayload) {
+        let signing_key = SigningKey::from_bytes(&[7; 32]);
+        let public_key = PublicKey(format!(
+            "{ED25519_WIRE_PREFIX}{}",
+            general_purpose::STANDARD.encode(signing_key.verifying_key().as_bytes())
+        ));
+        let signature = signing_key.sign(&relay_admission_signing_input(
+            server_id,
+            device_id,
+            &nonce,
+            timestamp_ms,
+        ));
+        (
+            public_key,
+            RelayAdmissionPayload::Device {
+                device_id,
+                nonce,
+                timestamp_ms,
+                signature: Signature(format!(
+                    "{ED25519_WIRE_PREFIX}{}",
+                    general_purpose::STANDARD.encode(signature.to_bytes())
+                )),
+            },
+        )
     }
 
     struct TestReceiver {
@@ -1081,6 +1725,7 @@ mod tests {
                 role,
                 protocol_version: ProtocolVersion(PROTOCOL_PACKET_VERSION),
                 nonce: Nonce("test-route".to_owned()),
+                admission: None,
                 route_generation,
                 client_id,
                 data_token,
@@ -1771,6 +2416,7 @@ mod tests {
             server_id,
             route_role: RouteRole::DaemonData,
             connection_role: ConnectionRole::DaemonData,
+            admission: None,
             route_generation: Some(test_route_generation(server_id)),
             client_id: Some(client_id),
             data_token: Some(data_token),
@@ -1907,6 +2553,7 @@ mod tests {
                     server_id,
                     route_role: RouteRole::DaemonData,
                     connection_role: ConnectionRole::DaemonData,
+                    admission: None,
                     route_generation: Some(test_route_generation(server_id)),
                     client_id: Some(client_id),
                     data_token: Some(data_token),
@@ -1982,6 +2629,7 @@ mod tests {
                     server_id,
                     route_role: RouteRole::DaemonData,
                     connection_role: ConnectionRole::DaemonData,
+                    admission: None,
                     route_generation: Some(test_route_generation(server_id)),
                     client_id: Some(client_id),
                     data_token: Some(data_token),
@@ -2031,6 +2679,7 @@ mod tests {
                 server_id,
                 route_role: RouteRole::DaemonData,
                 connection_role: ConnectionRole::DaemonData,
+                admission: None,
                 route_generation: Some(test_route_generation(server_id)),
                 client_id: None,
                 data_token: None,
@@ -2054,6 +2703,7 @@ mod tests {
                 server_id,
                 route_role: RouteRole::DaemonControl,
                 connection_role: ConnectionRole::DaemonControl,
+                admission: None,
                 route_generation: None,
                 client_id: None,
                 data_token: None,
@@ -2068,6 +2718,7 @@ mod tests {
                 server_id,
                 route_role: RouteRole::DaemonData,
                 connection_role: ConnectionRole::DaemonData,
+                admission: None,
                 route_generation: None,
                 client_id: None,
                 data_token: None,
@@ -2114,6 +2765,7 @@ mod tests {
                 server_id,
                 route_role: RouteRole::DaemonData,
                 connection_role: ConnectionRole::DaemonData,
+                admission: None,
                 route_generation: Some(generation_a),
                 client_id: Some(client_id),
                 data_token: Some(data_token.clone()),
@@ -2127,6 +2779,7 @@ mod tests {
                 server_id,
                 route_role: RouteRole::DaemonData,
                 connection_role: ConnectionRole::DaemonData,
+                admission: None,
                 route_generation: Some(generation_b),
                 client_id: Some(client_id),
                 data_token: Some(data_token),
@@ -2232,6 +2885,171 @@ mod tests {
         assert!(!long_state.authorizes(Some("relay-secret-2")));
     }
 
+    #[test]
+    fn trusted_relay_admission_requires_registered_daemon_token() {
+        let server_id = server_id(120);
+        let state = RelayState::new_trusted(
+            None,
+            vec![RelayDaemonCredential::plain_token(
+                server_id,
+                "daemon-secret-1".to_owned(),
+            )],
+        );
+        let accepted = RoutePrelude {
+            server_id,
+            route_role: RouteRole::DaemonControl,
+            connection_role: ConnectionRole::DaemonControl,
+            admission: Some(RelayAdmissionPayload::Daemon {
+                token: "daemon-secret-1".to_owned(),
+            }),
+            route_generation: Some(Nonce("generation".to_owned())),
+            client_id: None,
+            data_token: None,
+        };
+        let rejected = RoutePrelude {
+            admission: Some(RelayAdmissionPayload::Daemon {
+                token: "wrong-token".to_owned(),
+            }),
+            ..accepted.clone()
+        };
+
+        assert!(state.authorize_route_admission(&accepted).is_ok());
+        assert_eq!(
+            state.authorize_route_admission(&rejected),
+            Err(RelayError::AdmissionRejected)
+        );
+    }
+
+    #[test]
+    fn trusted_relay_admission_rejects_persisted_token_hash_as_bearer() {
+        let server_id = server_id(123);
+        let token_hash = relay_daemon_token_hash("daemon-secret-1");
+        let state = RelayState::new_trusted(
+            None,
+            vec![RelayDaemonCredential::token_hash(
+                server_id,
+                token_hash.clone(),
+            )],
+        );
+        let prelude = RoutePrelude {
+            server_id,
+            route_role: RouteRole::DaemonControl,
+            connection_role: ConnectionRole::DaemonControl,
+            admission: Some(RelayAdmissionPayload::Daemon { token: token_hash }),
+            route_generation: Some(Nonce("generation".to_owned())),
+            client_id: None,
+            data_token: None,
+        };
+
+        assert_eq!(
+            state.authorize_route_admission(&prelude),
+            Err(RelayError::AdmissionRejected)
+        );
+    }
+
+    #[test]
+    fn trusted_relay_admission_rejects_client_without_ticket_or_device() {
+        let server_id = server_id(121);
+        let state = RelayState::new_trusted(
+            None,
+            vec![RelayDaemonCredential::plain_token(
+                server_id,
+                "daemon-secret-1".to_owned(),
+            )],
+        );
+        let prelude = RoutePrelude {
+            server_id,
+            route_role: RouteRole::Client,
+            connection_role: ConnectionRole::Client,
+            admission: None,
+            route_generation: None,
+            client_id: None,
+            data_token: None,
+        };
+
+        assert_eq!(
+            state.authorize_route_admission(&prelude),
+            Err(RelayError::AdmissionRequired)
+        );
+    }
+
+    #[test]
+    fn trusted_relay_device_admission_rejects_replay_and_stale_timestamp() {
+        let server_id = server_id(124);
+        let device_id = DeviceId::new();
+        let state = RelayState::new_trusted(
+            None,
+            vec![RelayDaemonCredential::plain_token(
+                server_id,
+                "daemon-secret-1".to_owned(),
+            )],
+        );
+        let now_ms = relay_now_ms();
+        let (public_key, admission) = test_device_admission(
+            server_id,
+            device_id,
+            Nonce("device-admission-nonce-1".to_owned()),
+            UnixTimestampMillis(now_ms),
+        );
+        state
+            .register_device(server_id, device_id, public_key, Some("daemon-secret-1"))
+            .expect("device registration should succeed");
+        let prelude = RoutePrelude {
+            server_id,
+            route_role: RouteRole::Client,
+            connection_role: ConnectionRole::Client,
+            admission: Some(admission.clone()),
+            route_generation: None,
+            client_id: None,
+            data_token: None,
+        };
+
+        assert!(state.authorize_route_admission(&prelude).is_ok());
+        assert_eq!(
+            state.authorize_route_admission(&prelude),
+            Err(RelayError::AdmissionRejected)
+        );
+
+        let (_public_key, stale_admission) = test_device_admission(
+            server_id,
+            device_id,
+            Nonce("device-admission-nonce-2".to_owned()),
+            UnixTimestampMillis(now_ms.saturating_sub(DEVICE_ADMISSION_CLOCK_SKEW_MS + 1)),
+        );
+        assert_eq!(
+            state.authorize_route_admission(&RoutePrelude {
+                admission: Some(stale_admission),
+                ..prelude
+            }),
+            Err(RelayError::AdmissionRejected)
+        );
+    }
+
+    #[tokio::test]
+    async fn trusted_relay_http_tunnel_rejects_missing_admission() {
+        let server_id = server_id(122);
+        let state = RelayState::new_trusted(
+            None,
+            vec![RelayDaemonCredential::plain_token(
+                server_id,
+                "daemon-secret-1".to_owned(),
+            )],
+        );
+
+        let result = state
+            .http_tunnel(
+                server_id,
+                "POST".to_owned(),
+                "/api/control/session/list".to_owned(),
+                Vec::new(),
+                None,
+                Body::empty().into_data_stream(),
+            )
+            .await;
+
+        assert_eq!(result.unwrap_err(), StatusCode::UNAUTHORIZED);
+    }
+
     #[tokio::test]
     async fn http_tunnel_uses_daemon_data_pipe_without_parsing_body() {
         let state = RelayState::default();
@@ -2249,6 +3067,7 @@ mod tests {
                     "POST".to_owned(),
                     "/api/files/upload/init".to_owned(),
                     vec![("x-termd-server-id".to_owned(), server_id.0.to_string())],
+                    None,
                     Body::from("opaque-e2ee-body").into_data_stream(),
                 )
                 .await
@@ -2272,6 +3091,7 @@ mod tests {
                     server_id,
                     route_role: RouteRole::DaemonData,
                     connection_role: ConnectionRole::DaemonData,
+                    admission: None,
                     route_generation: Some(test_route_generation(server_id)),
                     client_id: Some(client_id),
                     data_token: Some(data_token),
@@ -2368,6 +3188,7 @@ mod tests {
                     server_id,
                     route_role: RouteRole::DaemonData,
                     connection_role: ConnectionRole::DaemonData,
+                    admission: None,
                     route_generation: Some(test_route_generation(server_id)),
                     client_id: Some(client_id),
                     data_token: Some(data_token),
@@ -2444,6 +3265,7 @@ mod tests {
                     "POST".to_owned(),
                     "/api/files/download".to_owned(),
                     Vec::new(),
+                    None,
                     Body::empty().into_data_stream(),
                 )
                 .await
@@ -2467,6 +3289,7 @@ mod tests {
                     server_id,
                     route_role: RouteRole::DaemonData,
                     connection_role: ConnectionRole::DaemonData,
+                    admission: None,
                     route_generation: Some(test_route_generation(server_id)),
                     client_id: Some(client_id),
                     data_token: Some(data_token),
@@ -2532,6 +3355,7 @@ mod tests {
             server_id,
             route_role: RouteRole::DaemonData,
             connection_role: ConnectionRole::DaemonData,
+            admission: None,
             route_generation: Some(test_route_generation(server_id)),
             client_id: Some(client_id),
             data_token: Some(data_token),
@@ -2571,6 +3395,7 @@ mod tests {
             server_id,
             route_role: RouteRole::DaemonData,
             connection_role: ConnectionRole::DaemonData,
+            admission: None,
             route_generation: Some(test_route_generation(server_id)),
             client_id: Some(client_id),
             data_token: Some(data_token),
@@ -2617,6 +3442,7 @@ mod tests {
                     server_id,
                     route_role: RouteRole::DaemonData,
                     connection_role: ConnectionRole::DaemonData,
+                    admission: None,
                     route_generation: Some(test_route_generation(server_id)),
                     client_id: Some(client_a_id),
                     data_token: Some(token_a),
@@ -2694,6 +3520,7 @@ mod tests {
                     server_id,
                     route_role: RouteRole::DaemonData,
                     connection_role: ConnectionRole::DaemonData,
+                    admission: None,
                     route_generation: Some(test_route_generation(server_id)),
                     client_id: Some(client_id),
                     data_token: Some(data_token),
@@ -2730,6 +3557,7 @@ mod tests {
                     server_id,
                     route_role: RouteRole::DaemonData,
                     connection_role: ConnectionRole::DaemonData,
+                    admission: None,
                     route_generation: Some(test_route_generation(server_id)),
                     client_id: Some(client_id),
                     data_token: Some(data_token),
@@ -2778,6 +3606,7 @@ mod tests {
                     server_id,
                     route_role: RouteRole::DaemonData,
                     connection_role: ConnectionRole::DaemonData,
+                    admission: None,
                     route_generation: Some(test_route_generation(server_id)),
                     client_id: Some(client_a_id),
                     data_token: Some(token_a),
@@ -2797,6 +3626,7 @@ mod tests {
                     server_id,
                     route_role: RouteRole::DaemonData,
                     connection_role: ConnectionRole::DaemonData,
+                    admission: None,
                     route_generation: Some(test_route_generation(server_id)),
                     client_id: Some(client_b_id),
                     data_token: Some(token_b),
@@ -2841,6 +3671,7 @@ mod tests {
                     server_id,
                     route_role: RouteRole::DaemonData,
                     connection_role: ConnectionRole::DaemonData,
+                    admission: None,
                     route_generation: Some(test_route_generation(server_id)),
                     client_id: Some(client_id),
                     data_token: Some(data_token),
@@ -2930,6 +3761,7 @@ mod tests {
                     server_id,
                     route_role: RouteRole::DaemonData,
                     connection_role: ConnectionRole::DaemonData,
+                    admission: None,
                     route_generation: Some(test_route_generation(server_id)),
                     client_id: Some(client_id),
                     data_token: Some(data_token),
@@ -3028,6 +3860,7 @@ mod tests {
                     server_id,
                     route_role: RouteRole::DaemonData,
                     connection_role: ConnectionRole::DaemonData,
+                    admission: None,
                     route_generation: Some(test_route_generation(server_id)),
                     client_id: Some(client_id),
                     data_token: Some(data_token),

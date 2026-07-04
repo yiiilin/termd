@@ -17,8 +17,9 @@ use futures_util::{Sink, SinkExt, StreamExt};
 use rustls::{ClientConfig, RootCertStore};
 use termd_proto::{
     Envelope as ProtoEnvelope, MessageType as ProtoMessageType, Nonce as ProtoNonce,
-    PROTOCOL_PACKET_VERSION, ProtocolVersion as ProtoProtocolVersion, RelayClientId,
-    RelayControlEnvelope, RelayHttpTunnelFrame, RouteHelloPayload as ProtoRouteHelloPayload,
+    PROTOCOL_PACKET_VERSION, ProtocolVersion as ProtoProtocolVersion,
+    RelayAdmissionPayload as ProtoRelayAdmissionPayload, RelayClientId, RelayControlEnvelope,
+    RelayHttpTunnelFrame, RouteHelloPayload as ProtoRouteHelloPayload,
     RouteReadyPayload as ProtoRouteReadyPayload, RouteRole as ProtoRouteRole, ServerId, SessionId,
     decode_relay_data_control, decode_relay_http_tunnel_frame,
     encode_relay_http_tunnel_response_body, encode_relay_http_tunnel_response_end,
@@ -56,7 +57,7 @@ const MIN_RELAY_HEARTBEAT_INTERVAL_MS: u64 = 1;
 // relay mux transport 失败只会断开当前 relay 连接并触发重连，不关闭持久 session/supervisor。
 // 公网 relay 往往还隔着 TLS 和反向代理，2s 级 deadline 容易把短暂抖动误判成断线。
 const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
-const RELAY_DATA_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const RELAY_DATA_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const RELAY_ROUTE_READY_TIMEOUT: Duration = Duration::from_secs(5);
 const RELAY_SEND_DEADLINE: Duration = Duration::from_secs(10);
 #[cfg(test)]
@@ -70,7 +71,7 @@ const RELAY_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 #[cfg(test)]
 const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const RELAY_RECONNECT_STABLE_RESET_AFTER: Duration = Duration::from_secs(60);
-// relay 是加密 dumb pipe，daemon 侧不能依赖 relay 解析业务分片。
+// relay 是 trusted routing 层，但 daemon 侧仍不能依赖 relay 解析终端业务分片。
 // 允许 MB 级 terminal snapshot 通过，同时保留明确的单帧/单消息内存上限。
 const RELAY_MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 const RELAY_MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
@@ -192,7 +193,7 @@ impl RelayPushEventQueue {
             return;
         }
         // 中文注释：writer 承压时不能先读取并加密 terminal cache。
-        // 将事件放回队首，下一轮仍按原顺序继续推送，不消耗 E2EE sequence。
+        // 将事件放回队首，下一轮仍按原顺序继续推送，不消耗 packet sequence。
         self.pending_set.insert(event);
         self.pending.push_front(event);
     }
@@ -954,6 +955,8 @@ pub enum RelayConnectorError {
     InvalidEnvelope,
     #[error("relay mux frame is invalid")]
     InvalidFrame,
+    #[error("trusted relay device registration failed")]
+    RelayRegistrationFailed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1077,6 +1080,15 @@ impl RelayBaseUrl {
         self.unified_ws_url_with_auth(auth_token)
     }
 
+    pub fn api_url(&self, api_path: &str) -> String {
+        let scheme = match self.scheme {
+            RelayUrlScheme::Ws => "http",
+            RelayUrlScheme::Wss => "https",
+        };
+        let prefix = self.base_path.api_prefix();
+        format!("{scheme}://{}{}{}", self.authority, prefix, api_path)
+    }
+
     fn unified_ws_url(&self) -> String {
         format!(
             "{}://{}{}",
@@ -1164,6 +1176,12 @@ impl RelayBasePath {
     fn endpoint_suffix(&self) -> &str {
         &self.endpoint_suffix
     }
+
+    fn api_prefix(&self) -> &str {
+        self.canonical_suffix
+            .strip_suffix("/ws")
+            .unwrap_or(self.canonical_suffix.as_str())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1230,26 +1248,29 @@ pub async fn connect_relay_mux(
     relay_url: &str,
     protocol: SharedDaemonProtocol,
 ) -> Result<(), RelayConnectorError> {
-    connect_relay_mux_with_auth(relay_url, None, protocol).await
+    connect_relay_mux_with_auth(relay_url, None, None, protocol).await
 }
 
 pub async fn connect_relay_mux_with_auth(
     relay_url: &str,
     auth_token: Option<&str>,
+    daemon_admission_token: Option<&str>,
     protocol: SharedDaemonProtocol,
 ) -> Result<(), RelayConnectorError> {
     let base = RelayBaseUrl::parse(relay_url)?;
-    connect_relay_mux_base(base, auth_token, protocol).await
+    connect_relay_mux_base(base, auth_token, daemon_admission_token, protocol).await
 }
 
 pub async fn connect_relay_mux_base(
     base: RelayBaseUrl,
     auth_token: Option<&str>,
+    daemon_admission_token: Option<&str>,
     protocol: SharedDaemonProtocol,
 ) -> Result<(), RelayConnectorError> {
     connect_relay_control_base_once(
         base,
         auth_token,
+        daemon_admission_token,
         None,
         protocol,
         RelayReconnectPolicy::default().heartbeat_interval(),
@@ -1260,17 +1281,27 @@ pub async fn connect_relay_mux_base(
 pub async fn run_relay_mux_with_reconnect(
     relay_url: &str,
     auth_token: Option<&str>,
+    daemon_admission_token: Option<&str>,
     proxy: Option<RelayProxyUrl>,
     policy: RelayReconnectPolicy,
     protocol: SharedDaemonProtocol,
 ) -> Result<(), RelayConnectorError> {
     let base = RelayBaseUrl::parse(relay_url)?;
-    run_relay_mux_with_reconnect_base(base, auth_token, proxy, policy, protocol).await
+    run_relay_mux_with_reconnect_base(
+        base,
+        auth_token,
+        daemon_admission_token,
+        proxy,
+        policy,
+        protocol,
+    )
+    .await
 }
 
 pub async fn run_relay_mux_with_reconnect_base(
     base: RelayBaseUrl,
     auth_token: Option<&str>,
+    daemon_admission_token: Option<&str>,
     proxy: Option<RelayProxyUrl>,
     policy: RelayReconnectPolicy,
     protocol: SharedDaemonProtocol,
@@ -1282,6 +1313,7 @@ pub async fn run_relay_mux_with_reconnect_base(
         let result = connect_relay_control_base_once(
             base.clone(),
             auth_token,
+            daemon_admission_token,
             proxy.clone(),
             protocol.clone(),
             policy.heartbeat_interval(),
@@ -1314,6 +1346,7 @@ pub async fn run_relay_mux_with_reconnect_base(
 async fn connect_relay_control_base_once(
     base: RelayBaseUrl,
     auth_token: Option<&str>,
+    daemon_admission_token: Option<&str>,
     proxy: Option<RelayProxyUrl>,
     protocol: SharedDaemonProtocol,
     heartbeat_interval: Duration,
@@ -1329,11 +1362,15 @@ async fn connect_relay_control_base_once(
         proxy.as_ref(),
         server_id,
         ProtoRouteRole::DaemonControl,
+        daemon_admission_token,
         Some(route_generation.clone()),
         None,
         None,
     )
     .await?;
+    // 中文注释：不要在 daemon control 刚连上时批量重注册历史 devices。
+    // 线上旧状态里可能有大量迁移遗留 device，注册请求失败会制造长时间网络噪声；
+    // 新配对路径会在 pair 成功后单独注册当前 device。
     let mut heartbeat =
         tokio::time::interval_at(Instant::now() + heartbeat_interval, heartbeat_interval);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1374,6 +1411,7 @@ async fn connect_relay_control_base_once(
                             envelope,
                             base.clone(),
                             auth_token.map(str::to_owned),
+                            daemon_admission_token.map(str::to_owned),
                             proxy.clone(),
                             protocol.clone(),
                             server_id,
@@ -1395,6 +1433,7 @@ async fn connect_relay_control_base_once(
                             envelope,
                             base.clone(),
                             auth_token.map(str::to_owned),
+                            daemon_admission_token.map(str::to_owned),
                             proxy.clone(),
                             protocol.clone(),
                             server_id,
@@ -1466,6 +1505,7 @@ async fn handle_relay_control_envelope(
     envelope: RelayControlEnvelope,
     base: RelayBaseUrl,
     auth_token: Option<String>,
+    daemon_admission_token: Option<String>,
     proxy: Option<RelayProxyUrl>,
     protocol: SharedDaemonProtocol,
     server_id: ServerId,
@@ -1492,6 +1532,7 @@ async fn handle_relay_control_envelope(
                 if let Err(error) = run_relay_data_connection(
                     base,
                     auth_token,
+                    daemon_admission_token,
                     proxy,
                     protocol,
                     server_id,
@@ -1555,6 +1596,7 @@ fn abort_all_relay_data_tasks(data_tasks: &mut RelayDataTaskMap) -> usize {
 async fn run_relay_data_connection(
     base: RelayBaseUrl,
     auth_token: Option<String>,
+    daemon_admission_token: Option<String>,
     proxy: Option<RelayProxyUrl>,
     protocol: SharedDaemonProtocol,
     server_id: ServerId,
@@ -1569,6 +1611,7 @@ async fn run_relay_data_connection(
         proxy.as_ref(),
         server_id,
         ProtoRouteRole::DaemonData,
+        daemon_admission_token.as_deref(),
         Some(route_generation),
         Some(client_id),
         Some(data_token),
@@ -3437,6 +3480,7 @@ async fn connect_relay_mux_socket(
         proxy,
         server_id,
         role,
+        None,
         Some(route_generation),
         None,
         None,
@@ -3449,6 +3493,7 @@ async fn connect_relay_route_socket(
     proxy: Option<&RelayProxyUrl>,
     server_id: ServerId,
     role: ProtoRouteRole,
+    auth_token: Option<&str>,
     route_generation: Option<ProtoNonce>,
     client_id: Option<RelayClientId>,
     data_token: Option<ProtoNonce>,
@@ -3458,6 +3503,7 @@ async fn connect_relay_route_socket(
         proxy,
         server_id,
         role,
+        auth_token,
         route_generation,
         client_id,
         data_token,
@@ -3472,6 +3518,7 @@ async fn connect_relay_route_socket_with_timeout(
     proxy: Option<&RelayProxyUrl>,
     server_id: ServerId,
     role: ProtoRouteRole,
+    auth_token: Option<&str>,
     route_generation: Option<ProtoNonce>,
     client_id: Option<RelayClientId>,
     data_token: Option<ProtoNonce>,
@@ -3517,6 +3564,7 @@ async fn connect_relay_route_socket_with_timeout(
         &mut sender,
         server_id,
         role,
+        auth_token,
         route_generation,
         client_id,
         data_token,
@@ -3584,6 +3632,7 @@ async fn send_route_hello(
     sender: &mut RelaySender,
     server_id: ServerId,
     role: ProtoRouteRole,
+    auth_token: Option<&str>,
     route_generation: Option<ProtoNonce>,
     client_id: Option<RelayClientId>,
     data_token: Option<ProtoNonce>,
@@ -3595,6 +3644,11 @@ async fn send_route_hello(
             role,
             protocol_version: ProtoProtocolVersion(PROTOCOL_PACKET_VERSION),
             nonce: relay_route_nonce(),
+            // 中文注释：relay 已变为可信入口，daemon route 必须显式提交入场 token；
+            // query 参数只保留给旧入口/日志分层使用，不能替代 route prelude 鉴权。
+            admission: auth_token.map(|token| ProtoRelayAdmissionPayload::Daemon {
+                token: token.to_owned(),
+            }),
             route_generation,
             client_id,
             data_token,
@@ -5804,8 +5858,8 @@ mod tests {
     };
     use termd_proto::{
         ClientHelloKind, ClientHelloPayload, DaemonStatusResultPayload, Envelope, MessageType,
-        MetadataSubscribePayload, PingPayload, ProtocolVersion, RouteHelloPayload,
-        RouteReadyPayload, RouteRole,
+        MetadataSubscribePayload, PingPayload, ProtocolVersion, RelayAdmissionPayload,
+        RouteHelloPayload, RouteReadyPayload, RouteRole,
     };
     use tokio::sync::{Notify, mpsc, oneshot};
 
@@ -7101,7 +7155,7 @@ mod tests {
         });
         let protocol = test_protocol("reconnect-supervisor");
         let connector = tokio::spawn(run_relay_mux_with_reconnect_base(
-            base, None, None, policy, protocol,
+            base, None, None, None, policy, protocol,
         ));
 
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -7138,12 +7192,19 @@ mod tests {
         let server_id = protocol.lock().await.server_id();
         let client_id = RelayClientId(77);
         let data_token = ProtoNonce("test-data-token".to_owned());
+        let relay_auth_token = "relay-transport-secret";
+        let daemon_admission_token = "relay-daemon-secret";
 
         let server = tokio::spawn(async move {
             let (control_tcp, _) = listener.accept().await.unwrap();
             let mut control_socket = tokio_tungstenite::accept_async(control_tcp).await.unwrap();
-            complete_relay_route_prelude(&mut control_socket, server_id, RouteRole::DaemonControl)
-                .await;
+            let control_hello = complete_relay_route_prelude(
+                &mut control_socket,
+                server_id,
+                RouteRole::DaemonControl,
+            )
+            .await;
+            assert_daemon_route_admission(&control_hello, daemon_admission_token);
             let open_data = RelayControlEnvelope::OpenData {
                 client_id,
                 data_token: data_token.clone(),
@@ -7160,6 +7221,7 @@ mod tests {
             let route_hello = read_route_hello_from_connector(&mut data_socket).await;
             assert_eq!(route_hello.server_id, server_id);
             assert_eq!(route_hello.role, RouteRole::DaemonData);
+            assert_daemon_route_admission(&route_hello, daemon_admission_token);
             assert!(
                 route_hello.route_generation.is_some(),
                 "daemon data route should inherit mux route_generation"
@@ -7196,7 +7258,12 @@ mod tests {
         let base = RelayBaseUrl::parse(&format!("ws://{addr}")).unwrap();
         let connector = tokio::time::timeout(
             Duration::from_secs(4),
-            connect_relay_mux_base(base, None, protocol),
+            connect_relay_mux_base(
+                base,
+                Some(relay_auth_token),
+                Some(daemon_admission_token),
+                protocol,
+            ),
         )
         .await
         .expect("relay connector should finish after mock relay closes control");
@@ -7257,6 +7324,7 @@ mod tests {
         let base = RelayBaseUrl::parse(&format!("ws://{addr}")).unwrap();
         let task = tokio::spawn(run_relay_data_connection(
             base,
+            None,
             None,
             None,
             protocol,
@@ -7324,6 +7392,7 @@ mod tests {
         let base = RelayBaseUrl::parse(&format!("ws://{addr}")).unwrap();
         let task = tokio::spawn(run_relay_data_connection(
             base,
+            None,
             None,
             None,
             protocol,
@@ -7405,7 +7474,7 @@ mod tests {
         let base = RelayBaseUrl::parse(&format!("ws://{addr}")).unwrap();
         let connector = tokio::time::timeout(
             Duration::from_secs(4),
-            connect_relay_mux_base(base, None, protocol),
+            connect_relay_mux_base(base, None, None, protocol),
         )
         .await
         .expect("relay connector should finish after mock relay closes control");
@@ -7429,6 +7498,7 @@ mod tests {
         handle_relay_control_envelope(
             RelayControlEnvelope::ClientDisconnected { client_id },
             RelayBaseUrl::parse("ws://127.0.0.1:1").unwrap(),
+            None,
             None,
             None,
             test_protocol("relay-control-client-disconnect-aborts-data-task"),
@@ -8074,12 +8144,20 @@ mod tests {
         .await
         .unwrap();
         let hello = daemon_frame_to_json(initial[0].clone());
-        let key_exchange = daemon_frame_to_json(initial[1].clone());
         assert_eq!(hello.kind, MessageType::Hello);
-        assert_eq!(key_exchange.kind, MessageType::E2eeKeyExchange);
 
-        let server_key_exchange: termd_proto::E2eeKeyExchangePayload =
-            decode_payload(key_exchange.payload).unwrap();
+        let server_key_exchange = {
+            let protocol = protocol.lock().await;
+            // 中文注释：当前协议由 client 先发 E2EE key exchange；这个旧 mux 单测只需要
+            // daemon 的公开 E2EE 材料来构造测试 device 侧会话。
+            termd_proto::E2eeKeyExchangePayload::new(
+                protocol.server_id(),
+                termd_proto::DeviceId::new(),
+                protocol.e2ee_public_key().to_wire_public_key(),
+                termd_proto::Nonce("relay-test-daemon-e2ee".to_owned()),
+                current_unix_timestamp_millis(),
+            )
+        };
         let token = protocol
             .lock()
             .await
@@ -8217,9 +8295,18 @@ mod tests {
             MessageType::Hello
         );
 
-        let key_exchange = daemon_frame_to_json(initial[1].clone());
-        let server_key_exchange: termd_proto::E2eeKeyExchangePayload =
-            decode_payload(key_exchange.payload).unwrap();
+        let server_key_exchange = {
+            let protocol = protocol.lock().await;
+            // 中文注释：当前协议由 client 先发 E2EE key exchange；这里复用 daemon 公钥
+            // 作为测试 fixture，避免继续依赖旧的双初始帧假设。
+            termd_proto::E2eeKeyExchangePayload::new(
+                protocol.server_id(),
+                termd_proto::DeviceId::new(),
+                protocol.e2ee_public_key().to_wire_public_key(),
+                termd_proto::Nonce("relay-good-daemon-e2ee".to_owned()),
+                current_unix_timestamp_millis(),
+            )
+        };
         let token = protocol
             .lock()
             .await
@@ -8971,7 +9058,7 @@ mod tests {
         socket: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
         expected_server_id: ServerId,
         expected_role: RouteRole,
-    ) {
+    ) -> RouteHelloPayload {
         let route_hello = tokio::time::timeout(
             Duration::from_secs(1),
             read_route_hello_from_connector(socket),
@@ -8998,6 +9085,16 @@ mod tests {
             ))
             .await
             .unwrap();
+        route_hello
+    }
+
+    fn assert_daemon_route_admission(route_hello: &RouteHelloPayload, expected_token: &str) {
+        assert_eq!(
+            route_hello.admission,
+            Some(RelayAdmissionPayload::Daemon {
+                token: expected_token.to_owned()
+            })
+        );
     }
 
     async fn send_route_ready_to_connector(

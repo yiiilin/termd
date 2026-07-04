@@ -1,10 +1,3 @@
-import {
-  daemonE2eeSigningInputBytes,
-  decodeEd25519PublicKey,
-  e2eeAuthTranscriptDigestWire,
-  verifyEd25519Signature,
-} from "./auth";
-import { E2eeSession, generateE2eeKeyPair } from "./e2ee";
 import { ProtocolClientError, protocolError } from "./errors";
 import {
   expectQueuedEnvelope,
@@ -18,10 +11,10 @@ import {
 import { recordProtocolTimeout } from "../diagnostics";
 import { BINARY_PROTOCOL_VERSION, PROTOCOL_PACKET_VERSION } from "./types";
 import type {
-  E2eeKeyExchangePayload,
   ErrorPayload,
   HelloPayload,
   PublicKeyWire,
+  RelayAdmissionPayload,
   RouteReadyPayload,
   UUID,
 } from "./types";
@@ -37,6 +30,7 @@ export interface DirectHandshakeOptions {
   socketOpenTimeoutMs: number;
   socketOpenHedgeDelayMs?: number;
   expectedDaemonPublicKey?: PublicKeyWire;
+  relayAdmission?: RelayAdmissionPayload;
   webSocketFactory?: (url: string) => WebSocket;
   signal?: AbortSignal;
   createInbox: (socket: WebSocket) => DirectClientInbox;
@@ -45,10 +39,7 @@ export interface DirectHandshakeOptions {
 export interface DirectHandshakeResult {
   socket: WebSocket;
   inbox: DirectClientInbox;
-  daemonE2eePublicKeyWire: PublicKeyWire;
-  e2ee: E2eeSession;
   binaryMode: boolean;
-  e2eeTranscriptSha256: string;
 }
 
 export async function performDirectHandshake(
@@ -81,7 +72,7 @@ export async function performDirectHandshake(
     inbox = options.createInbox(socket);
 
     // 中文注释：route_hello 是统一 /ws 入口的第一帧；只有 route 被接受后，
-    // 才能继续原有 daemon hello / E2EE 握手。
+    // 才能继续 daemon/client 明文 hello。
     sendOuterMessage(
       socket,
       envelope("route_hello", {
@@ -89,6 +80,7 @@ export async function performDirectHandshake(
         role: "client",
         protocol_version: PROTOCOL_PACKET_VERSION,
         nonce: nonce(),
+        admission: options.relayAdmission,
         timestamp_ms: nowMs(),
       }),
     );
@@ -124,10 +116,10 @@ export async function performDirectHandshake(
       throw new ProtocolClientError("route_server_mismatch", "route prelude does not match requested daemon");
     }
 
-    let initialMessages;
+    let initialMessage;
     try {
-      initialMessages = await withAbort(
-        withTimeout(Promise.all([inbox.read(), inbox.read()]), options.timeoutMs, "handshake_timeout"),
+      initialMessage = await withAbort(
+        withTimeout(inbox.read(), options.timeoutMs, "handshake_timeout"),
         abortSignal,
       );
     } catch (error) {
@@ -144,90 +136,43 @@ export async function performDirectHandshake(
       }
       throw error;
     }
-    const initial = initialMessages.map(expectQueuedEnvelope);
-
-    const expectedDaemonPublicKey = options.expectedDaemonPublicKey;
-    if (!expectedDaemonPublicKey) {
-      throw new ProtocolClientError("daemon_identity_required", "daemon public key is required");
+    const initial = expectQueuedEnvelope(initialMessage);
+    if (initial.type === "error") {
+      throw protocolError(initial.payload as ErrorPayload);
     }
-
-    let daemonKeyExchange: E2eeKeyExchangePayload | undefined;
-    for (const message of initial) {
-      if (message.type === "hello") {
-        const payload = message.payload as HelloPayload;
-        if (payload.server_id && payload.server_id !== routeServerId) {
-          throw new ProtocolClientError("route_server_mismatch", "daemon hello does not match requested route");
-        }
-      } else if (message.type === "e2ee_key_exchange") {
-        const payload = message.payload as E2eeKeyExchangePayload;
-        if (payload.server_id !== routeServerId) {
-          throw new ProtocolClientError("route_server_mismatch", "daemon key exchange does not match requested route");
-        }
-        if (payload.packet_version !== PROTOCOL_PACKET_VERSION) {
-          throw new ProtocolClientError("unsupported_protocol_version", "daemon key exchange does not support packet v3");
-        }
-        if (!payload.signature) {
-          throw new ProtocolClientError("invalid_handshake", "daemon key exchange is unsigned");
-        }
-        const verified = await verifyEd25519Signature(
-          decodeEd25519PublicKey(expectedDaemonPublicKey),
-          daemonE2eeSigningInputBytes(payload, {
-            server_id: routeServerId,
-            daemon_public_key: expectedDaemonPublicKey,
-          }),
-          payload.signature,
-        );
-        if (!verified) {
-          throw new ProtocolClientError("daemon_identity_mismatch", "daemon key exchange signature is invalid");
-        }
-        daemonKeyExchange = payload;
-      } else if (message.type === "error") {
-        throw protocolError(message.payload as ErrorPayload);
-      } else {
-        throw new ProtocolClientError("unexpected_message", "unexpected handshake message");
-      }
+    if (initial.type !== "hello") {
+      throw new ProtocolClientError("unexpected_message", "unexpected handshake message");
     }
-
-    if (!daemonKeyExchange) {
-      throw new ProtocolClientError("invalid_handshake", "daemon handshake was incomplete");
+    const hello = initial.payload as HelloPayload;
+    if (hello.server_id && hello.server_id !== routeServerId) {
+      throw new ProtocolClientError("route_server_mismatch", "daemon hello does not match requested route");
     }
-
-    const keypair = generateE2eeKeyPair();
-    const e2ee = E2eeSession.device({
-      serverId: routeServerId,
-      deviceId,
-      localKeypair: keypair,
-      daemonPublicKeyWire: daemonKeyExchange.public_key,
-    });
-    const binaryMode = daemonKeyExchange.binary_version === BINARY_PROTOCOL_VERSION;
-    const deviceKeyExchange: E2eeKeyExchangePayload = {
-      server_id: routeServerId,
-      device_id: deviceId,
-      public_key: keypair.publicKeyWire,
-      nonce: nonce(),
-      timestamp_ms: nowMs(),
-      packet_version: PROTOCOL_PACKET_VERSION,
-      ...(binaryMode ? { binary_version: BINARY_PROTOCOL_VERSION } : {}),
-    };
+    if (hello.protocol_version !== PROTOCOL_PACKET_VERSION) {
+      throw new ProtocolClientError("unsupported_protocol_version", "daemon hello does not support packet v3");
+    }
+    if (
+      options.expectedDaemonPublicKey &&
+      hello.daemon_public_key !== options.expectedDaemonPublicKey
+    ) {
+      throw new ProtocolClientError("daemon_identity_mismatch", "daemon hello public key does not match expected identity");
+    }
+    const binaryMode = hello.binary_version === BINARY_PROTOCOL_VERSION;
     if (socket.readyState !== WebSocket.OPEN) {
       throw new ProtocolClientError("connection_closed", "connection closed");
     }
-    sendOuterMessage(socket, envelope("e2ee_key_exchange", deviceKeyExchange));
+    sendOuterMessage(socket, envelope("hello", {
+      protocol_version: PROTOCOL_PACKET_VERSION,
+      binary_version: binaryMode ? BINARY_PROTOCOL_VERSION : null,
+      nonce: nonce(),
+      timestamp_ms: nowMs(),
+      server_id: routeServerId,
+      device_id: deviceId,
+    }));
 
     return {
       socket,
       inbox,
-      daemonE2eePublicKeyWire: daemonKeyExchange.public_key,
-      e2ee,
       binaryMode,
-      e2eeTranscriptSha256: e2eeAuthTranscriptDigestWire(
-        daemonKeyExchange,
-        deviceKeyExchange,
-        {
-          server_id: routeServerId,
-          daemon_public_key: expectedDaemonPublicKey,
-        },
-      ),
     };
   } catch (error) {
     // 中文注释：连接建立阶段一旦超时、握手失败或被取消，必须关闭半开 socket，

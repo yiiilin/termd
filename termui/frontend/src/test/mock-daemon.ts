@@ -44,6 +44,7 @@ import type {
   AttachFramePayload,
   DaemonClientSummaryPayload,
   DaemonStatusResultPayload,
+  HelloPayload,
   HttpE2eeAuthPayload,
   E2eeKeyExchangePayload,
   EncryptedFramePayload,
@@ -434,7 +435,7 @@ export class MockDaemon {
       [files.session_id]: files,
     };
     for (const connection of this.connections) {
-      if (connection.e2ee && connection.watchedSessionIds.has(files.session_id)) {
+      if (connection.routed && connection.watchedSessionIds.has(files.session_id)) {
         this.sendInner(connection, envelope("session_files_result", files));
       }
     }
@@ -443,16 +444,16 @@ export class MockDaemon {
   pushSessionCwdChanged(sessionId: UUID, cwd: string): void {
     this.sessionFilePositions.set(sessionId, cwd);
     for (const connection of this.connections) {
-      if (connection.e2ee && connection.watchedSessionIds.has(sessionId)) {
+      if (connection.routed && connection.watchedSessionIds.has(sessionId)) {
         this.sendInner(connection, envelope("session_cwd_changed", { session_id: sessionId, cwd }));
       }
     }
   }
 
   sendUnownedPacketError(code: string, message: string): void {
-    const connection = [...this.connections].find((candidate) => candidate.e2ee);
+    const connection = [...this.connections].find((candidate) => candidate.routed);
     if (!connection) {
-      throw new Error("no E2EE connection is available");
+      throw new Error("no routed connection is available");
     }
     this.sendPacket(connection, {
       version: PROTOCOL_PACKET_VERSION,
@@ -463,7 +464,7 @@ export class MockDaemon {
 
   sendSessionClosed(sessionId: UUID): void {
     for (const connection of this.connections) {
-      if (connection.e2ee) {
+      if (connection.routed) {
         this.sendInner(connection, envelope("session_closed", { session_id: sessionId }));
       }
     }
@@ -478,7 +479,7 @@ export class MockDaemon {
   pushSessionData(sessionId: UUID, text: string): void {
     this.appendSessionOutput(sessionId, text);
     for (const connection of this.connections) {
-      if (connection.e2ee && connection.watchedSessionIds.has(sessionId)) {
+      if (connection.routed && connection.watchedSessionIds.has(sessionId)) {
         const terminalSeq = this.claimNextMockTerminalSeq(sessionId);
         this.sendSupervisorTerminalFrame(
           connection,
@@ -500,7 +501,7 @@ export class MockDaemon {
 
   pushTerminalFrameBatch(sessionId: UUID, frames: unknown[]): void {
     for (const connection of this.connections) {
-      if (connection.e2ee && connection.watchedSessionIds.has(sessionId)) {
+      if (connection.routed && connection.watchedSessionIds.has(sessionId)) {
         this.sendTerminalStreamBatch(connection, sessionId, frames);
       }
     }
@@ -508,7 +509,7 @@ export class MockDaemon {
 
   pushTerminalFrame(sessionId: UUID, frame: unknown): void {
     for (const connection of this.connections) {
-      if (connection.e2ee && connection.watchedSessionIds.has(sessionId)) {
+      if (connection.routed && connection.watchedSessionIds.has(sessionId)) {
         this.sendTerminalStreamFrame(connection, sessionId, frame);
       }
     }
@@ -517,7 +518,7 @@ export class MockDaemon {
   pushSessionDataToAll(sessionId: UUID, text: string): void {
     // 后台 session 只发 activity 标记，不把未打开 session 的输出内容灌进当前 xterm。
     for (const connection of this.connections) {
-      if (connection.e2ee && connection.watchedSessionIds.size > 0) {
+      if (connection.routed && connection.watchedSessionIds.size > 0) {
         void text;
         this.sendInner(connection, envelope("session_activity", { session_id: sessionId, timestamp_ms: nowMs() }));
       }
@@ -698,30 +699,14 @@ export class MockDaemon {
       return;
     }
 
-    if (outer.type === "e2ee_key_exchange") {
-      const payload = outer.payload as E2eeKeyExchangePayload;
-      if (payload.packet_version !== PROTOCOL_PACKET_VERSION || !connection.daemonE2eeExchange) {
+    if (outer.type === "hello") {
+      const payload = outer.payload as HelloPayload;
+      if (payload.protocol_version !== PROTOCOL_PACKET_VERSION || payload.server_id !== this.serverId || !payload.device_id) {
         this.sendError(connection, "unsupported_protocol_version", "unsupported protocol version");
         return;
       }
       connection.deviceId = payload.device_id;
-      connection.e2ee = E2eeSession.daemon({
-        serverId: this.serverId,
-        deviceId: payload.device_id,
-        localKeypair: this.e2eeKeypair,
-        devicePublicKeyWire: payload.public_key,
-      });
-      connection.e2eeAuthTranscriptSha256 = e2eeAuthTranscriptDigestWire(
-        connection.daemonE2eeExchange,
-        payload,
-        {
-          server_id: this.serverId,
-          daemon_public_key: this.daemonPublicKey,
-        },
-      );
-      connection.binaryMode =
-        connection.daemonE2eeExchange.binary_version === BINARY_PROTOCOL_VERSION &&
-        payload.binary_version === BINARY_PROTOCOL_VERSION;
+      connection.binaryMode = payload.binary_version === BINARY_PROTOCOL_VERSION;
 
       if (this.trustedDevices.has(payload.device_id) && !this.options.dropAuthChallenge) {
         this.sendPacket(
@@ -741,23 +726,21 @@ export class MockDaemon {
       return;
     }
 
-    if (outer.type !== "encrypted_frame" || !connection.e2ee) {
-      this.sendError(connection, "invalid_state", "invalid protocol state");
+    if (outer.type === "packet") {
+      await this.handlePacket(connection, outer.payload as ProtocolPacket);
       return;
     }
 
-    const inner = connection.e2ee.decryptJson(outer.payload as EncryptedFramePayload);
-    await this.handleInner(connection, inner);
+    this.sendError(connection, "invalid_state", "invalid protocol state");
   }
 
   private async handleOuterBinary(connection: MockConnection, raw: Uint8Array): Promise<void> {
     this.binaryWireFrames.push({ direction: "in", byteLength: raw.byteLength });
-    if (!connection.e2ee || !connection.binaryMode) {
+    if (!connection.binaryMode) {
       this.sendError(connection, "invalid_state", "invalid protocol state");
       return;
     }
-    const plaintext = connection.e2ee.decryptBinary(decodeBinaryEncryptedFrame(raw));
-    const binaryPacket = decodeBinaryProtocolPacket(plaintext);
+    const binaryPacket = decodeBinaryProtocolPacket(raw);
     this.recordBinaryPacket("in", binaryPacket);
     await this.handlePacket(connection, binaryPacketToProtocol(binaryPacket));
   }
@@ -782,8 +765,6 @@ export class MockDaemon {
 
     connection.routed = true;
     const sendPrelude = () => {
-      const daemonE2eeExchange = this.signedDaemonE2eeExchange();
-      connection.daemonE2eeExchange = daemonE2eeExchange;
       this.sendOuter(
         connection.socket,
         envelope("route_ready", {
@@ -793,17 +774,15 @@ export class MockDaemon {
       );
       this.sendOuter(
         connection.socket,
-        envelope("hello", {
-          protocol_version: PROTOCOL_PACKET_VERSION,
-          nonce: nonce(),
-          timestamp_ms: nowMs(),
-          server_id: this.serverId,
-          device_id: null,
-        }),
-      );
-      this.sendOuter(
-        connection.socket,
-        envelope("e2ee_key_exchange", daemonE2eeExchange),
+	        envelope("hello", {
+	          protocol_version: this.options.daemonPacketVersion ?? PROTOCOL_PACKET_VERSION,
+	          nonce: nonce(),
+	          timestamp_ms: nowMs(),
+	          server_id: this.serverId,
+	          daemon_public_key: this.daemonPublicKey,
+	          binary_version: this.options.daemonBinaryVersion ?? BINARY_PROTOCOL_VERSION,
+	          device_id: null,
+	        }),
       );
     };
     const routeReadyDelayMs = this.options.routeReadyDelayOnceMs ?? this.options.routeReadyDelayMs;
@@ -1204,14 +1183,17 @@ export class MockDaemon {
       return this.jsonError(401, "auth_failed", "auth failed");
     }
     const deviceId = tokenRecord.deviceId;
-    let httpE2ee: E2eeSession;
+    let verifiedDeviceId: UUID;
     try {
-      httpE2ee = await this.httpE2eeSessionFromHeaders(headers, url.pathname, requestInit?.method ?? "POST");
+      verifiedDeviceId = await this.verifyHttpAuthHeaders(headers, url.pathname, requestInit?.method ?? "POST");
     } catch {
       return this.jsonError(400, "invalid_envelope", "message envelope is invalid");
     }
+    if (verifiedDeviceId !== deviceId) {
+      return this.jsonError(401, "auth_failed", "auth failed");
+    }
     const body = await this.requestBodyBytes(requestInit?.body);
-    const frames = this.decodeHttpE2eeFrames(httpE2ee, body);
+    const frames = this.decodeHttpPlainFrames(body);
     const payload = frames[0] ? JSON.parse(decodeUtf8(frames[0])) : {};
     // 中文注释：HTTP 控制面要把“请求已送达 daemon”与“最终是否成功返回”分开记录，
     // 这样 timeout/断链测试才能断言真实到达过的请求。
@@ -1225,7 +1207,7 @@ export class MockDaemon {
       }, { once: true });
     }
     const response = await this.dispatchHttpControl(connection, url.pathname, payload);
-    const encoded = this.encodeHttpE2eeFrames(httpE2ee, response.frames.map((frame) => encodeUtf8(JSON.stringify(frame))));
+    const encoded = this.encodeHttpPlainFrames(response.frames.map((frame) => encodeUtf8(JSON.stringify(frame))));
     const bodyBytes = encoded.slice();
     return new Response(bodyBytes, {
       status: response.status,
@@ -1361,7 +1343,7 @@ export class MockDaemon {
     return { kind: "global", method: segments.join(".") };
   }
 
-  private async httpE2eeSessionFromHeaders(headers: Headers, path: string, method: string): Promise<E2eeSession> {
+  private async verifyHttpAuthHeaders(headers: Headers, path: string, method: string): Promise<UUID> {
     const deviceId = headers.get("x-termd-device-id");
     const devicePublicKey = headers.get("x-termd-e2ee-public-key");
     const nonceValue = headers.get("x-termd-e2ee-nonce");
@@ -1394,33 +1376,26 @@ export class MockDaemon {
     if (!ok) {
       throw new Error("invalid HTTP E2EE signature");
     }
-    return E2eeSession.daemon({
-      serverId: this.serverId,
-      deviceId,
-      localKeypair: this.e2eeKeypair,
-      devicePublicKeyWire: devicePublicKey,
-    });
+    return deviceId;
   }
 
-  private decodeHttpE2eeFrames(e2ee: E2eeSession, wire: Uint8Array): Uint8Array[] {
+  private decodeHttpPlainFrames(wire: Uint8Array): Uint8Array[] {
     const frames: Uint8Array[] = [];
     let offset = 0;
     while (offset < wire.byteLength) {
       const len = new DataView(wire.buffer, wire.byteOffset + offset, 4).getUint32(0, false);
       offset += 4;
-      const encrypted = decodeBinaryEncryptedFrame(wire.slice(offset, offset + len));
-      frames.push(e2ee.decryptBinary(encrypted));
+      frames.push(wire.slice(offset, offset + len));
       offset += len;
     }
     return frames;
   }
 
-  private encodeHttpE2eeFrames(e2ee: E2eeSession, frames: Uint8Array[]): Uint8Array {
+  private encodeHttpPlainFrames(frames: Uint8Array[]): Uint8Array {
     const parts = frames.map((frame) => {
-      const encrypted = encodeBinaryEncryptedFrame(e2ee.encryptBinary(frame));
-      const wire = new Uint8Array(4 + encrypted.byteLength);
-      new DataView(wire.buffer, wire.byteOffset, 4).setUint32(0, encrypted.byteLength, false);
-      wire.set(encrypted, 4);
+      const wire = new Uint8Array(4 + frame.byteLength);
+      new DataView(wire.buffer, wire.byteOffset, 4).setUint32(0, frame.byteLength, false);
+      wire.set(frame, 4);
       return wire;
     });
     const total = parts.reduce((sum, part) => sum + part.byteLength, 0);
@@ -2160,7 +2135,7 @@ export class MockDaemon {
       if (sourceConnection && connection === sourceConnection) {
         continue;
       }
-      if (connection.e2ee && connection.watchedSessionIds.has(sessionId)) {
+      if (connection.routed && connection.watchedSessionIds.has(sessionId)) {
         this.sendInner(
           connection,
           envelope("session_resized", {
@@ -2206,7 +2181,7 @@ export class MockDaemon {
       authSigningInputBytes(authPayload, {
         server_id: this.serverId,
         daemon_public_key: this.daemonPublicKey,
-      }, connection.e2eeAuthTranscriptSha256),
+      }),
       String(payload.signature),
     );
     if (!ok) {
@@ -2224,10 +2199,6 @@ export class MockDaemon {
       this.sendPacketEvent(connection, this.legacyEventMethod(inner.type), inner.payload);
       return;
     }
-    if (!connection.e2ee) {
-      this.sendError(connection, "invalid_state", "invalid protocol state");
-      return;
-    }
     const activeRequest = connection.activeRequest;
     if (activeRequest && !connection.respondedToActiveRequest) {
       this.sendPacketResponse(connection, activeRequest, inner.payload);
@@ -2242,7 +2213,7 @@ export class MockDaemon {
       this.sendPacketError(connection, connection.activeRequest, code, message);
       return;
     }
-    if (connection.e2ee) {
+    if (connection.activeRequest) {
       this.sendPacketError(connection, connection.activeRequest, code, message);
       return;
     }
@@ -2299,10 +2270,6 @@ export class MockDaemon {
       connection.httpPackets.push(packet);
       return;
     }
-    if (!connection.e2ee) {
-      this.sendOuter(connection.socket, envelope("error", { code: "invalid_state", message: "invalid protocol state" } satisfies ErrorPayload));
-      return;
-    }
     this.sentPackets.push(packet);
     this.sentPacketLog.push({ connection_id: connection.id, packet });
     if (connection.binaryMode) {
@@ -2311,13 +2278,12 @@ export class MockDaemon {
         this.binaryEncodingOptionsForPacket(connection, packet),
       );
       this.recordBinaryPacket("out", binaryPacket);
-      const frame = connection.e2ee.encryptBinary(encodeBinaryProtocolPacket(binaryPacket));
-      const wire = encodeBinaryEncryptedFrame(frame);
+      const wire = encodeBinaryProtocolPacket(binaryPacket);
       this.binaryWireFrames.push({ direction: "out", byteLength: wire.byteLength });
       connection.socket.send(wire);
       return;
     }
-    this.sendOuter(connection.socket, envelope("encrypted_frame", connection.e2ee.encryptJson(envelope("packet", packet))));
+    this.sendOuter(connection.socket, envelope("packet", packet));
   }
 
   private binaryEncodingOptionsForPacket(

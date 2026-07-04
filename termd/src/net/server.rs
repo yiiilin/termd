@@ -1,6 +1,6 @@
 //! Axum HTTP/WebSocket 适配层。
 //!
-//! 这里只把 socket 字节流接到 `protocol` 状态机；pairing、auth、session 和 E2EE
+//! 这里只把 socket 字节流接到 `protocol` 状态机；pairing、auth 和 session
 //! 规则都由协议核心执行，避免网络框架层夹带业务判断。
 
 mod recovery;
@@ -52,8 +52,8 @@ use super::protocol::{
     SessionFileHttpUploadCommit, cleanup_persisted_session_file_http_uploads, decode_payload,
     envelope_value, session_file_http_upload_chunks_len, write_session_file_http_upload_files,
 };
+use super::relay::RelayBaseUrl;
 use super::signature::Ed25519SignatureVerifier;
-use super::{decode_binary_encrypted_frame, encode_binary_encrypted_frame};
 #[cfg(test)]
 pub(crate) use recovery::adopt_or_repair_runtime_sessions_from_supervisors;
 use recovery::warn_about_orphaned_supervisors;
@@ -65,8 +65,13 @@ const WEBSOCKET_SEND_DEADLINE: Duration = Duration::from_secs(10);
 const WEBSOCKET_PONG_DEADLINE: Duration = Duration::from_secs(10);
 const WEBSOCKET_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const WEBSOCKET_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+const RELAY_REGISTRATION_TIMEOUT: Duration = Duration::from_secs(4);
+const RELAY_REGISTRATION_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const RELAY_PAIR_TICKET_REGISTRATION_ATTEMPTS: usize = 3;
+const RELAY_DEVICE_REGISTRATION_ATTEMPTS: usize = 2;
+const RELAY_REGISTRATION_RETRY_DELAY: Duration = Duration::from_millis(150);
 // direct WebSocket 与 relay 传输保持同量级限制；终端 snapshot 可能是数 MB 的
-// 单个 E2EE binary frame，过小的 frame limit 会把正常重连误判为异常大消息。
+// 单个 binary frame，过小的 frame limit 会把正常重连误判为异常大消息。
 const WEBSOCKET_MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 const WEBSOCKET_MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 const HTTP_E2EE_INIT_MAX_BYTES: usize = 1024 * 1024;
@@ -886,6 +891,7 @@ async fn local_pairing_token(
     let server_id = protocol.server_id();
     let daemon_public_key = protocol.daemon_public_identity().public_key.clone();
     let ws_url = pairing_ws_url_from_config(protocol.config(), server_id);
+    let config = protocol.config().clone();
     let record = match protocol.issue_pairing_token(now_ms) {
         Ok(record) => record,
         Err(error) => {
@@ -901,12 +907,29 @@ async fn local_pairing_token(
                 .into_response();
         }
     };
+    let token = record.token().clone();
+    let expires_at_ms = record.expires_at_ms();
+    drop(protocol);
+    if let Err(error) =
+        register_relay_pair_ticket_from_config(&config, server_id, token.clone(), expires_at_ms)
+            .await
+    {
+        warn!(%error, "failed to register pairing ticket with relay");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorPayload {
+                code: "relay_pair_ticket_unavailable".to_owned(),
+                message: "pairing ticket could not be registered with relay".to_owned(),
+            }),
+        )
+            .into_response();
+    }
 
     (
         StatusCode::OK,
         Json(LocalPairingTokenPayload {
-            token: record.token().clone(),
-            expires_at_ms: record.expires_at_ms(),
+            token,
+            expires_at_ms,
             ttl_ms,
             server_id,
             daemon_public_key,
@@ -1895,19 +1918,14 @@ where
 }
 
 fn decrypt_http_e2ee_frames(
-    e2ee: &mut super::E2eeSession,
+    _e2ee: &mut super::E2eeSession,
     body: &Bytes,
 ) -> Result<Vec<Vec<u8>>, ProtocolError> {
     let mut offset = 0;
     let mut frames = Vec::new();
     while offset < body.len() {
         let frame = read_http_e2ee_frame(body, &mut offset)?;
-        let binary =
-            decode_binary_encrypted_frame(frame).map_err(|_| ProtocolError::InvalidEnvelope)?;
-        let plaintext = e2ee
-            .decrypt_binary_payload(&binary)
-            .map_err(|_| ProtocolError::InvalidEnvelope)?;
-        frames.push(plaintext);
+        frames.push(frame.to_vec());
     }
     Ok(frames)
 }
@@ -1931,16 +1949,11 @@ impl HttpE2eeBodyFrameStream {
 
     async fn next_plaintext(
         &mut self,
-        e2ee: &mut super::E2eeSession,
+        _e2ee: &mut super::E2eeSession,
     ) -> Result<Option<Vec<u8>>, ProtocolError> {
         loop {
             if let Some(frame) = self.try_pop_frame()? {
-                let binary = decode_binary_encrypted_frame(&frame)
-                    .map_err(|_| ProtocolError::InvalidEnvelope)?;
-                return e2ee
-                    .decrypt_binary_payload(&binary)
-                    .map(Some)
-                    .map_err(|_| ProtocolError::InvalidEnvelope);
+                return Ok(Some(frame));
             }
             if self.drain_buffered_body_bytes()? {
                 continue;
@@ -2033,16 +2046,11 @@ where
 }
 
 fn append_http_e2ee_binary_frame(
-    e2ee: &mut super::E2eeSession,
+    _e2ee: &mut super::E2eeSession,
     body: &mut Vec<u8>,
     plaintext: &[u8],
 ) -> Result<(), ProtocolError> {
-    let encrypted = e2ee
-        .encrypt_binary_payload(plaintext)
-        .map_err(|_| ProtocolError::InvalidEnvelope)?;
-    body.extend_from_slice(&write_http_e2ee_frame(&encode_binary_encrypted_frame(
-        &encrypted,
-    )));
+    body.extend_from_slice(&write_http_e2ee_frame(plaintext));
     Ok(())
 }
 
@@ -2104,6 +2112,203 @@ fn pairing_ws_url_from_config(config: &DaemonConfig, server_id: ServerId) -> Str
         .default_pairing_ws_url
         .trim()
         .replace("{server_id}", &server_id.0.to_string())
+}
+
+#[derive(Debug, Serialize)]
+struct RelayPairTicketRegistration<'a> {
+    server_id: ServerId,
+    token: &'a PairingToken,
+    expires_at_ms: UnixTimestampMillis,
+}
+
+#[derive(Debug, Serialize)]
+struct RelayDeviceRegistration<'a> {
+    server_id: ServerId,
+    device_id: termd_proto::DeviceId,
+    public_key: &'a PublicKey,
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum RelayRegistrationError {
+    #[error("trusted relay registration is not configured")]
+    MissingConfig,
+    #[error("trusted relay URL is invalid")]
+    InvalidRelayUrl,
+    #[error("trusted relay HTTP client could not be built")]
+    Client,
+    #[error("trusted relay rejected device public key")]
+    InvalidDevicePublicKey,
+    #[error("trusted relay registration returned HTTP {0}")]
+    Status(u16),
+    #[error("trusted relay registration request failed: {0}")]
+    Request(String),
+}
+
+fn relay_registration_request_error(error: reqwest::Error) -> RelayRegistrationError {
+    let mut parts = vec![error.to_string()];
+    let mut source = std::error::Error::source(&error);
+    while let Some(cause) = source {
+        parts.push(cause.to_string());
+        source = cause.source();
+    }
+    RelayRegistrationError::Request(parts.join(": "))
+}
+
+struct RelayRegistrationTarget {
+    daemon_token: String,
+    base: RelayBaseUrl,
+}
+
+fn relay_registration_target(
+    config: &DaemonConfig,
+) -> Result<Option<RelayRegistrationTarget>, RelayRegistrationError> {
+    let Some(daemon_token) = config
+        .relay_daemon_token
+        .as_ref()
+        .map(|token| token.expose_secret().to_owned())
+    else {
+        return Ok(None);
+    };
+    let relay_url = config
+        .relay_endpoints
+        .first()
+        .ok_or(RelayRegistrationError::MissingConfig)?;
+    let base =
+        RelayBaseUrl::parse(relay_url).map_err(|_| RelayRegistrationError::InvalidRelayUrl)?;
+    Ok(Some(RelayRegistrationTarget { daemon_token, base }))
+}
+
+async fn register_relay_pair_ticket_from_config(
+    config: &DaemonConfig,
+    server_id: ServerId,
+    token: PairingToken,
+    expires_at_ms: UnixTimestampMillis,
+) -> Result<(), RelayRegistrationError> {
+    let Some(target) = relay_registration_target(config)? else {
+        return Ok(());
+    };
+    let endpoint = target.base.api_url("/api/relay/pair-ticket/register");
+    let payload = RelayPairTicketRegistration {
+        server_id,
+        token: &token,
+        expires_at_ms,
+    };
+    let client = reqwest::Client::builder()
+        .timeout(RELAY_REGISTRATION_TIMEOUT)
+        .connect_timeout(RELAY_REGISTRATION_CONNECT_TIMEOUT)
+        .no_proxy()
+        .http1_only()
+        .build()
+        .map_err(|_| RelayRegistrationError::Client)?;
+    let mut last_error = None;
+    for attempt in 1..=RELAY_PAIR_TICKET_REGISTRATION_ATTEMPTS {
+        let result = client
+            .post(endpoint.as_str())
+            .header("x-termd-relay-daemon-token", target.daemon_token.as_str())
+            .json(&payload)
+            .send()
+            .await
+            .map_err(relay_registration_request_error)
+            .and_then(|response| {
+                if response.status().is_success() {
+                    Ok(())
+                } else {
+                    Err(RelayRegistrationError::Status(response.status().as_u16()))
+                }
+            });
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error @ RelayRegistrationError::Request(_))
+                if attempt < RELAY_PAIR_TICKET_REGISTRATION_ATTEMPTS =>
+            {
+                // 中文注释：公网 relay 的 HTTPS 建连偶发卡住；pair invite 是人工触发，
+                // 短重试比直接返回 503 更符合用户预期，同时不会吞掉 401/4xx 配置错误。
+                debug!(%error, attempt, "retrying relay pair-ticket registration");
+                last_error = Some(error);
+                tokio::time::sleep(RELAY_REGISTRATION_RETRY_DELAY).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        RelayRegistrationError::Request("relay pair-ticket registration exhausted".to_owned())
+    }))
+}
+
+pub(crate) fn register_relay_device_from_config(
+    config: &DaemonConfig,
+    server_id: ServerId,
+    device_id: termd_proto::DeviceId,
+    public_key: PublicKey,
+) -> Result<(), RelayRegistrationError> {
+    let Some(target) = relay_registration_target(config)? else {
+        return Ok(());
+    };
+    // 中文注释：协议核心是同步状态机；pairing 成功路径必须在返回 PairAccept 前确认
+    // relay 已接收 device，否则用户会得到一个后续无法经 trusted relay 使用的假成功配对。
+    let endpoint = target.base.api_url("/api/relay/device/register");
+    let payload = RelayDeviceRegistration {
+        server_id,
+        device_id,
+        public_key: &public_key,
+    };
+    let client = reqwest::blocking::Client::builder()
+        .timeout(RELAY_REGISTRATION_TIMEOUT)
+        .connect_timeout(RELAY_REGISTRATION_CONNECT_TIMEOUT)
+        .no_proxy()
+        .http1_only()
+        .build()
+        .map_err(|_| RelayRegistrationError::Client)?;
+    let mut last_error = None;
+    for attempt in 1..=RELAY_DEVICE_REGISTRATION_ATTEMPTS {
+        let result = client
+            .post(endpoint.as_str())
+            .header("x-termd-relay-daemon-token", target.daemon_token.as_str())
+            .json(&payload)
+            .send()
+            .map_err(relay_registration_request_error)
+            .and_then(|response| {
+                if response.status() == reqwest::StatusCode::BAD_REQUEST {
+                    Err(RelayRegistrationError::InvalidDevicePublicKey)
+                } else if response.status().is_success() {
+                    Ok(())
+                } else {
+                    Err(RelayRegistrationError::Status(response.status().as_u16()))
+                }
+            });
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error @ RelayRegistrationError::Request(_))
+                if attempt < RELAY_DEVICE_REGISTRATION_ATTEMPTS =>
+            {
+                // 中文注释：device 注册处于 PairRequest 响应路径，重试次数必须保守，
+                // 保证最坏情况仍短于 termctl 的 response 等待窗口。
+                debug!(%error, attempt, "retrying relay device registration");
+                last_error = Some(error);
+                std::thread::sleep(RELAY_REGISTRATION_RETRY_DELAY);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        RelayRegistrationError::Request("relay device registration exhausted".to_owned())
+    }))
+}
+
+pub(crate) fn register_relay_device_from_config_background(
+    config: &DaemonConfig,
+    server_id: ServerId,
+    device_id: termd_proto::DeviceId,
+    public_key: PublicKey,
+) {
+    let config = config.clone();
+    tokio::task::spawn_blocking(move || {
+        if let Err(error) =
+            register_relay_device_from_config(&config, server_id, device_id, public_key)
+        {
+            warn!(%error, "failed to register trusted device with relay");
+        }
+    });
 }
 
 fn is_loopback_peer(peer_addr: SocketAddr) -> bool {
@@ -3718,6 +3923,7 @@ mod tests {
     use tokio_tungstenite::tungstenite::Message as ClientWsMessage;
 
     use crate::auth::{HttpE2eeSigningInput, current_unix_timestamp_millis};
+    use crate::config::SecretString;
     use crate::net::protocol::{
         ProtocolConnection, decode_payload, encrypted_frame_from_envelope, envelope_value,
     };
@@ -4556,7 +4762,7 @@ mod tests {
         let daemon_identity = protocol.lock().await.daemon_public_identity().clone();
         let daemon_e2ee_public = protocol.lock().await.e2ee_public_key();
         let http_keypair = E2eeKeyPair::generate();
-        let mut http_e2ee = E2eeSession::new(
+        let _http_e2ee = E2eeSession::new(
             E2eeSessionRole::Device,
             &http_keypair,
             daemon_e2ee_public,
@@ -4584,17 +4790,14 @@ mod tests {
                 .to_bytes(),
         ));
         let upload_path = format!("http-upload-{}.bin", session_id.0);
-        let encrypted = http_e2ee
-            .encrypt_binary_payload(
-                &serde_json::to_vec(&SessionFileUploadPayload {
-                    session_id,
-                    path: upload_path,
-                    size_bytes: 3,
-                })
-                .unwrap(),
-            )
-            .unwrap();
-        let request_body = write_http_e2ee_frame(&encode_binary_encrypted_frame(&encrypted));
+        let request_body = write_http_e2ee_frame(
+            &serde_json::to_vec(&SessionFileUploadPayload {
+                session_id,
+                path: upload_path,
+                size_bytes: 3,
+            })
+            .unwrap(),
+        );
         let response = router(protocol, false)
             .oneshot(
                 Request::builder()
@@ -4617,9 +4820,7 @@ mod tests {
             .unwrap();
         let mut offset = 0;
         let frame = read_http_e2ee_frame(&response_body, &mut offset).unwrap();
-        let encrypted = decode_binary_encrypted_frame(frame).unwrap();
-        let ready: SessionFileHttpUploadReadyPayload =
-            serde_json::from_slice(&http_e2ee.decrypt_binary_payload(&encrypted).unwrap()).unwrap();
+        let ready: SessionFileHttpUploadReadyPayload = serde_json::from_slice(frame).unwrap();
 
         assert_eq!(ready.session_id, session_id);
         assert_eq!(ready.size_bytes, 3);
@@ -4650,7 +4851,7 @@ mod tests {
         let daemon_identity = protocol.lock().await.daemon_public_identity().clone();
         let daemon_e2ee_public = protocol.lock().await.e2ee_public_key();
         let http_keypair = E2eeKeyPair::generate();
-        let mut http_e2ee = E2eeSession::new(
+        let _http_e2ee = E2eeSession::new(
             E2eeSessionRole::Device,
             &http_keypair,
             daemon_e2ee_public,
@@ -4677,17 +4878,14 @@ mod tests {
                 .sign(&HttpE2eeSigningInput::from_payload(&auth, &daemon_identity).to_bytes())
                 .to_bytes(),
         ));
-        let encrypted = http_e2ee
-            .encrypt_binary_payload(
-                &serde_json::to_vec(&SessionFileHttpDownloadPayload {
-                    session_id,
-                    path: "download.bin".to_owned(),
-                    offset_bytes: 0,
-                })
-                .unwrap(),
-            )
-            .unwrap();
-        let request_body = write_http_e2ee_frame(&encode_binary_encrypted_frame(&encrypted));
+        let request_body = write_http_e2ee_frame(
+            &serde_json::to_vec(&SessionFileHttpDownloadPayload {
+                session_id,
+                path: "download.bin".to_owned(),
+                offset_bytes: 0,
+            })
+            .unwrap(),
+        );
         let response = router(protocol, false)
             .oneshot(
                 Request::builder()
@@ -4719,16 +4917,12 @@ mod tests {
             .unwrap();
         let mut offset = 0;
         let ready_frame = read_http_e2ee_frame(&response_body, &mut offset).unwrap();
-        let ready_encrypted = decode_binary_encrypted_frame(ready_frame).unwrap();
         let ready: SessionFileDownloadStreamReadyPayload =
-            serde_json::from_slice(&http_e2ee.decrypt_binary_payload(&ready_encrypted).unwrap())
-                .unwrap();
+            serde_json::from_slice(ready_frame).unwrap();
         let data_frame = read_http_e2ee_frame(&response_body, &mut offset).unwrap();
-        let data_encrypted = decode_binary_encrypted_frame(data_frame).unwrap();
-        let bytes = http_e2ee.decrypt_binary_payload(&data_encrypted).unwrap();
 
         assert_eq!(ready.size_bytes, 3);
-        assert_eq!(bytes, b"abc");
+        assert_eq!(data_frame, b"abc");
         assert_eq!(offset, response_body.len());
     }
 
@@ -4748,7 +4942,7 @@ mod tests {
             PublicKey(test_ed25519_wire(signing_key.verifying_key().as_bytes()));
         let (device_id, session_id) =
             pair_real_device_and_create_session(protocol.clone(), device_public_key).await;
-        let (request, mut http_e2ee) = signed_http_e2ee_request(
+        let (request, _http_e2ee) = signed_http_e2ee_request(
             &protocol,
             &signing_key,
             device_id,
@@ -4780,9 +4974,7 @@ mod tests {
         );
         let mut offset = 0;
         let frame = read_http_e2ee_frame(&response_body, &mut offset).unwrap();
-        let encrypted = decode_binary_encrypted_frame(frame).unwrap();
-        let error: ErrorPayload =
-            serde_json::from_slice(&http_e2ee.decrypt_binary_payload(&encrypted).unwrap()).unwrap();
+        let error: ErrorPayload = serde_json::from_slice(frame).unwrap();
 
         assert!(
             !error.code.is_empty(),
@@ -4809,7 +5001,7 @@ mod tests {
             pair_real_device_and_create_session(protocol.clone(), public_key).await;
 
         let upload_init_path = "/api/files/upload/init";
-        let (request, mut upload_init_e2ee) = signed_http_e2ee_request(
+        let (request, _upload_init_e2ee) = signed_http_e2ee_request(
             &protocol,
             &signing_key,
             device_id,
@@ -4835,13 +5027,7 @@ mod tests {
             .unwrap();
         let mut offset = 0;
         let ready_frame = read_http_e2ee_frame(&response_body, &mut offset).unwrap();
-        let ready_encrypted = decode_binary_encrypted_frame(ready_frame).unwrap();
-        let ready: SessionFileHttpUploadReadyPayload = serde_json::from_slice(
-            &upload_init_e2ee
-                .decrypt_binary_payload(&ready_encrypted)
-                .unwrap(),
-        )
-        .unwrap();
+        let ready: SessionFileHttpUploadReadyPayload = serde_json::from_slice(ready_frame).unwrap();
 
         for (nonce, offset_bytes, frames) in [
             (
@@ -4905,7 +5091,7 @@ mod tests {
         let (device_id, session_id) =
             pair_real_device_and_create_session(protocol.clone(), public_key).await;
 
-        let (request, mut upload_init_e2ee) = signed_http_e2ee_request(
+        let (request, _upload_init_e2ee) = signed_http_e2ee_request(
             &protocol,
             &signing_key,
             device_id,
@@ -4931,13 +5117,7 @@ mod tests {
             .unwrap();
         let mut offset = 0;
         let ready_frame = read_http_e2ee_frame(&response_body, &mut offset).unwrap();
-        let ready_encrypted = decode_binary_encrypted_frame(ready_frame).unwrap();
-        let ready: SessionFileHttpUploadReadyPayload = serde_json::from_slice(
-            &upload_init_e2ee
-                .decrypt_binary_payload(&ready_encrypted)
-                .unwrap(),
-        )
-        .unwrap();
+        let ready: SessionFileHttpUploadReadyPayload = serde_json::from_slice(ready_frame).unwrap();
 
         for (nonce, offset_bytes, bytes, expected_status) in [
             (
@@ -5282,7 +5462,7 @@ mod tests {
         assert_http_device_detached(&protocol, session_id, http_device_id).await;
 
         let upload_init_path = "/api/files/upload/init";
-        let (request, mut upload_init_e2ee) = signed_http_e2ee_request(
+        let (request, _upload_init_e2ee) = signed_http_e2ee_request(
             &protocol,
             &http_signing_key,
             http_device_id,
@@ -5308,13 +5488,7 @@ mod tests {
             .unwrap();
         let mut offset = 0;
         let ready_frame = read_http_e2ee_frame(&response_body, &mut offset).unwrap();
-        let ready_encrypted = decode_binary_encrypted_frame(ready_frame).unwrap();
-        let ready: SessionFileHttpUploadReadyPayload = serde_json::from_slice(
-            &upload_init_e2ee
-                .decrypt_binary_payload(&ready_encrypted)
-                .unwrap(),
-        )
-        .unwrap();
+        let ready: SessionFileHttpUploadReadyPayload = serde_json::from_slice(ready_frame).unwrap();
         assert_http_device_detached(&protocol, session_id, http_device_id).await;
 
         let upload_path = "/api/files/upload";
@@ -5698,6 +5872,29 @@ mod tests {
         assert_eq!(response.status, 200);
         let payload: PairingTokenResponse = serde_json::from_str(&response.body).unwrap();
         assert_eq!(payload.ws_url, "wss://relay.example/ws");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn local_pairing_token_endpoint_fails_when_relay_ticket_registration_fails() {
+        let mut config = test_config("local-pairing-token-relay-ticket-failure");
+        config.relay_endpoints = vec!["ws://127.0.0.1:1/ws".to_owned()];
+        config.relay_daemon_token = Some(SecretString::new("test-relay-daemon-token"));
+        let protocol = default_protocol(config);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_protocol = protocol.clone();
+        let server = tokio::spawn(async move {
+            let _ = serve_listener(listener, server_protocol, false).await;
+        });
+        let response = tokio::task::spawn_blocking(move || post_pairing_token(addr))
+            .await
+            .unwrap();
+        server.abort();
+
+        assert_eq!(response.status, 503);
+        assert!(response.body.contains("relay_pair_ticket_unavailable"));
+        // 中文注释：relay 注册失败时不能把本地可消费 token 返回给调用方。
+        assert!(!response.body.contains("termd-pair-"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -6339,6 +6536,7 @@ mod tests {
                 role: RouteRole::Client,
                 protocol_version: ProtocolVersion(PROTOCOL_PACKET_VERSION),
                 nonce: termd_proto::Nonce("route-test-nonce".to_owned()),
+                admission: None,
                 route_generation: None,
                 client_id: None,
                 data_token: None,
@@ -6609,7 +6807,7 @@ zZZR5LzKVu9X7paftR7K8Q==
         drop(protocol_guard);
 
         let http_keypair = E2eeKeyPair::generate();
-        let mut http_e2ee = E2eeSession::new(
+        let http_e2ee = E2eeSession::new(
             E2eeSessionRole::Device,
             &http_keypair,
             daemon_e2ee_public,
@@ -6638,10 +6836,7 @@ zZZR5LzKVu9X7paftR7K8Q==
 
         let mut request_body = Vec::new();
         for plaintext in plaintext_frames {
-            let encrypted = http_e2ee.encrypt_binary_payload(&plaintext).unwrap();
-            request_body.extend(write_http_e2ee_frame(&encode_binary_encrypted_frame(
-                &encrypted,
-            )));
+            request_body.extend(write_http_e2ee_frame(&plaintext));
         }
 
         let request = Request::builder()

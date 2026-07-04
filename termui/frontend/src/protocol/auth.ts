@@ -1,6 +1,6 @@
 import { ed25519 } from "@noble/curves/ed25519";
 import { sha256 } from "@noble/hashes/sha2";
-import type { AuthPayload, DeviceState, E2eeKeyExchangePayload, HttpE2eeAuthPayload, PairedServerState, PublicKeyWire, UUID } from "./types";
+import type { AuthPayload, DeviceState, E2eeKeyExchangePayload, HttpE2eeAuthPayload, PairedServerState, PublicKeyWire, RelayAdmissionPayload, UUID } from "./types";
 import { base64ToBytes, bytesToBase64, concatBytes, encodeUtf8, nonce, nowMs, randomUuid } from "./wire";
 
 const ED25519_WIRE_PREFIX = "ed25519-v1:";
@@ -82,6 +82,31 @@ export async function signHttpE2eeAuthPayload(
   const signature = ed25519.sign(httpE2eeSigningInputBytes(unsigned, daemon), secretKey);
 
   return { ...payload, signature: encodeEd25519Wire(signature) };
+}
+
+export function relayAdmissionSigningInputBytes(
+  payload: Omit<Extract<RelayAdmissionPayload, { kind: "device" }>, "kind" | "signature">,
+  serverId: UUID,
+): Uint8Array {
+  // 中文注释：relay admission 只证明“这个设备愿意进入这个 daemon 房间”；
+  // daemon 后续仍用 auth challenge 做最终认证。
+  return concatBytes(
+    encodeUtf8("termd-relay-admission-v1\n"),
+    canonicalField("server_id", serverId),
+    canonicalField("device_id", payload.device_id),
+    canonicalField("nonce", payload.nonce),
+    canonicalField("timestamp_ms", String(payload.timestamp_ms)),
+  );
+}
+
+export async function signRelayAdmissionPayload(
+  payload: Omit<Extract<RelayAdmissionPayload, { kind: "device" }>, "kind" | "signature">,
+  serverId: UUID,
+  deviceSigningKeySecret: string,
+): Promise<Extract<RelayAdmissionPayload, { kind: "device" }>> {
+  const secretKey = decodeEd25519SecretKey(deviceSigningKeySecret);
+  const signature = ed25519.sign(relayAdmissionSigningInputBytes(payload, serverId), secretKey);
+  return { kind: "device", ...payload, signature: encodeEd25519Wire(signature) };
 }
 
 export function daemonE2eeSigningInputBytes(

@@ -123,9 +123,20 @@ export interface RouteHelloPayload {
   role: RouteRole;
   protocol_version: number;
   nonce: Nonce;
+  admission?: RelayAdmissionPayload;
   route_generation?: Nonce;
   timestamp_ms: UnixTimestampMillis;
 }
+
+export type RelayAdmissionPayload =
+  | { kind: "pair_ticket"; token: string }
+  | {
+      kind: "device";
+      device_id: UUID;
+      nonce: Nonce;
+      timestamp_ms: UnixTimestampMillis;
+      signature: string;
+    };
 
 export interface RouteReadyPayload {
   server_id: UUID;
@@ -137,6 +148,8 @@ export interface HelloPayload {
   nonce: Nonce;
   timestamp_ms: UnixTimestampMillis;
   server_id: UUID | null;
+  daemon_public_key?: PublicKeyWire | null;
+  binary_version?: number | null;
   device_id: UUID | null;
 }
 
@@ -174,7 +187,7 @@ export interface PairAcceptPayload {
 
 export interface PairingQrPayload {
   type: "termd_pairing_qr";
-  version: 1;
+  version: 1 | 2;
   ws_url?: string;
   token: string;
   server_id: UUID;

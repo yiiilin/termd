@@ -16,13 +16,16 @@ use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::time::sleep;
 use uuid::Uuid;
 
-use crate::client::{DirectClient, TerminalAttachOptions, TerminalStream, TerminalStreamEvent};
+use crate::client::{
+    DirectClient, TerminalAttachOptions, TerminalStream, TerminalStreamEvent,
+    signed_device_relay_admission,
+};
 use crate::crypto;
 use crate::error::{Result, TermctlError};
 use crate::state::{TermctlState, normalize_ws_url, resolve_state_path};
 use termd_proto::{
-    AttachRole, PairingQrPayload, PublicKey, ServerId, SessionId, SessionState,
-    SessionSummaryPayload, TerminalSize,
+    AttachRole, PairingQrPayload, PublicKey, RelayAdmissionPayload, ServerId, SessionId,
+    SessionState, SessionSummaryPayload, TerminalSize,
 };
 
 pub const DEFAULT_URL: &str = "ws://127.0.0.1:8765/ws";
@@ -138,6 +141,9 @@ async fn pair(args: PairArgs, state_path: PathBuf, output: OutputMode) -> Result
         input.route_server_id,
         device.device_id,
         input.daemon_public_key.clone(),
+        Some(RelayAdmissionPayload::PairTicket {
+            token: termd_proto::PairingToken(input.token.clone()),
+        }),
     )
     .await?;
     let accepted = client
@@ -491,6 +497,11 @@ async fn connect_authenticated(
         target.server.server_id,
         device.device_id,
         target.server.daemon_public_key.clone(),
+        Some(signed_device_relay_admission(
+            target.server.server_id,
+            device.device_id,
+            &signing_key,
+        )),
     )
     .await?;
 
@@ -1011,14 +1022,14 @@ mod tests {
 
     fn pairing_payload_json(extra_fields: &str) -> String {
         format!(
-            "{{\"type\":\"termd_pairing_qr\",\"version\":1,\"token\":\"pair-token\",\"server_id\":\"00000000-0000-0000-0000-000000000001\",\"daemon_public_key\":\"{}\",\"expires_at_ms\":{FUTURE_PAIRING_EXPIRES_AT_MS}{extra_fields}}}",
+            "{{\"type\":\"termd_pairing_qr\",\"version\":2,\"token\":\"pair-token\",\"server_id\":\"00000000-0000-0000-0000-000000000001\",\"daemon_public_key\":\"{}\",\"expires_at_ms\":{FUTURE_PAIRING_EXPIRES_AT_MS}{extra_fields}}}",
             daemon_public_key().0,
         )
     }
 
     fn invite_from_json(payload: &str) -> String {
         format!(
-            "termd-pair:v1:{}",
+            "termd-pair:v2:{}",
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload)
         )
     }
@@ -1162,7 +1173,7 @@ mod tests {
         let server_id =
             ServerId(uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap());
         let payload = format!(
-            "{{\"type\":\"termd_pairing_qr\",\"version\":1,\"token\":\"pair-token\",\"server_id\":\"00000000-0000-0000-0000-000000000001\",\"expires_at_ms\":{FUTURE_PAIRING_EXPIRES_AT_MS}}}"
+            "{{\"type\":\"termd_pairing_qr\",\"version\":2,\"token\":\"pair-token\",\"server_id\":\"00000000-0000-0000-0000-000000000001\",\"expires_at_ms\":{FUTURE_PAIRING_EXPIRES_AT_MS}}}"
         );
         let args = PairArgs {
             invite_or_token: None,
@@ -1281,7 +1292,7 @@ mod tests {
 
     #[test]
     fn expired_pair_invite_has_specific_error() {
-        let expired_payload = "{\"type\":\"termd_pairing_qr\",\"version\":1,\"token\":\"pair-token\",\"server_id\":\"00000000-0000-0000-0000-000000000001\",\"daemon_public_key\":\"ed25519-v1:daemon-public\",\"expires_at_ms\":1}";
+        let expired_payload = "{\"type\":\"termd_pairing_qr\",\"version\":2,\"token\":\"pair-token\",\"server_id\":\"00000000-0000-0000-0000-000000000001\",\"daemon_public_key\":\"ed25519-v1:daemon-public\",\"expires_at_ms\":1}";
         let args = PairArgs {
             invite_or_token: Some(invite_from_json(expired_payload)),
             token: None,

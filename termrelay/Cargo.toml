@@ -9,12 +9,14 @@ repository.workspace = true
 axum = { version = "0.7", features = ["ws", "json"] }
 axum-core = "0.4"
 base64 = "0.22"
+ed25519-dalek = "2.1"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 hyper = "1"
 hyper-util = { version = "0.1", features = ["server-auto", "service", "tokio"] }
 rustls = "0.23"
 serde.workspace = true
 serde_json.workspace = true
+sha2 = "0.10"
 termd-proto = { path = "../proto" }
 termweb = { path = "../termweb" }
 thiserror.workspace = true

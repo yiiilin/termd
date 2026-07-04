@@ -23,7 +23,7 @@ use crate::pty::{PtyRestoreInfo, PtySupervisorStatus};
 pub mod client_history;
 
 /// 当前 daemon 状态文件的 schema 版本。
-pub const STATE_SCHEMA_VERSION: u32 = 2;
+pub const STATE_SCHEMA_VERSION: u32 = 3;
 
 const META_STATE_SCHEMA_VERSION: &str = "state_schema_version";
 const META_SERVER_ID: &str = "server_id";
@@ -401,8 +401,7 @@ fn load_legacy_json_state(
     match fs::read_to_string(path) {
         Ok(raw) => {
             let state: DaemonState = parse_json(path, &raw)?;
-            ensure_state_version(path, state.version)?;
-            Ok(Some(state))
+            migrate_legacy_state(path, state).map(Some)
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(source) => Err(StateError::Read {
@@ -437,6 +436,10 @@ fn ensure_sqlite_state_version(conn: &Connection, path: &Path) -> Result<(), Sta
                 path: path.to_path_buf(),
                 source: rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(source)),
             })?;
+            if found == 2 {
+                migrate_sqlite_v2_to_current(conn, path)?;
+                return Ok(());
+            }
             ensure_state_version(path, found)
         }
         None if sqlite_state_has_content(conn, path)? => Err(StateError::IncompatibleVersion {
@@ -446,6 +449,27 @@ fn ensure_sqlite_state_version(conn: &Connection, path: &Path) -> Result<(), Sta
         }),
         None => Ok(()),
     }
+}
+
+fn migrate_legacy_state(path: &Path, mut state: DaemonState) -> Result<DaemonState, StateError> {
+    match state.version {
+        STATE_SCHEMA_VERSION => Ok(state),
+        2 => {
+            // 中文注释：v3 只调整 relay 信任边界，设备公钥认证格式没有变化；
+            // 静默清空 trusted_devices 会让远程/headless daemon 失去所有控制端。
+            state.version = STATE_SCHEMA_VERSION;
+            Ok(state)
+        }
+        other => Err(StateError::IncompatibleVersion {
+            path: path.to_path_buf(),
+            found: Some(other),
+            expected: STATE_SCHEMA_VERSION,
+        }),
+    }
+}
+
+fn migrate_sqlite_v2_to_current(conn: &Connection, path: &Path) -> Result<(), StateError> {
+    write_sqlite_state_version(conn, path)
 }
 
 fn sqlite_state_has_content(conn: &Connection, path: &Path) -> Result<bool, StateError> {
@@ -1320,6 +1344,27 @@ mod tests {
                 ..
             }
         ));
+        cleanup_state_paths(&state_path);
+    }
+
+    #[test]
+    fn v2_legacy_json_migration_keeps_trusted_devices_and_sessions() {
+        let state_path = temp_path("v2-legacy-state.json");
+        let mut legacy_state = sample_state();
+        legacy_state.version = 2;
+
+        fs::write(
+            &state_path,
+            serde_json::to_string_pretty(&legacy_state).unwrap(),
+        )
+        .unwrap();
+
+        let migrated = StateStore::load(&state_path).unwrap();
+
+        assert_eq!(migrated.version, STATE_SCHEMA_VERSION);
+        assert_eq!(migrated.daemon_identity, legacy_state.daemon_identity);
+        assert_eq!(migrated.trusted_devices, legacy_state.trusted_devices);
+        assert_eq!(migrated.sessions, legacy_state.sessions);
         cleanup_state_paths(&state_path);
     }
 

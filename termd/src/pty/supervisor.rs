@@ -2895,10 +2895,12 @@ mod tests {
         let runtime_dir = supervisor_runtime_dir(Path::new("daemon-state.json"));
 
         assert_eq!(runtime_dir.parent(), Some(current_dir.as_path()));
-        assert_eq!(
+        // 中文注释：长 worktree 路径下 runtime dir 会降级成 `ts` 以满足 Unix socket
+        // 路径长度限制；这个测试只关心相对 state path 仍共享当前目录作为基准。
+        assert!(matches!(
             runtime_dir.file_name(),
-            Some(OsStr::new("termd-supervisors"))
-        );
+            Some(name) if name == OsStr::new("termd-supervisors") || name == OsStr::new("ts")
+        ));
     }
 
     #[test]

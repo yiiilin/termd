@@ -2,7 +2,7 @@ import type { PairingQrPayload } from "./types";
 import { base64ToBytes, decodeUtf8 } from "./wire";
 
 const PAIRING_QR_TYPE = "termd_pairing_qr";
-const PAIRING_INVITE_PREFIX = "termd-pair:v1:";
+const PAIRING_INVITE_PREFIXES = ["termd-pair:v2:", "termd-pair:v1:"];
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -17,29 +17,35 @@ export function parsePairingQrPayload(raw: string): PairingQrPayload | undefined
     const parsed = JSON.parse(payloadText) as Partial<PairingQrPayload> & { type?: string };
     if (
       parsed.type !== PAIRING_QR_TYPE ||
-      parsed.version !== 1 ||
+      (parsed.version !== 1 && parsed.version !== 2) ||
       typeof parsed.token !== "string" ||
       parsed.token.trim().length === 0 ||
       typeof parsed.server_id !== "string" ||
       !UUID_PATTERN.test(parsed.server_id) ||
-      typeof parsed.daemon_public_key !== "string" ||
-      !parsed.daemon_public_key.startsWith("ed25519-v1:") ||
+      (parsed.daemon_public_key !== undefined &&
+        (typeof parsed.daemon_public_key !== "string" ||
+          !parsed.daemon_public_key.startsWith("ed25519-v1:"))) ||
       typeof parsed.expires_at_ms !== "number" ||
       (parsed.ws_url !== undefined &&
         (typeof parsed.ws_url !== "string" || !isSupportedWsUrl(parsed.ws_url)))
     ) {
       return undefined;
     }
+    if (parsed.version === 1 && !parsed.daemon_public_key) {
+      return undefined;
+    }
 
     const payload: PairingQrPayload = {
       type: PAIRING_QR_TYPE,
-      version: 1,
+      version: parsed.version,
       token: parsed.token,
       server_id: parsed.server_id,
-      daemon_public_key: parsed.daemon_public_key,
       expires_at_ms: parsed.expires_at_ms,
     };
 
+    if (parsed.daemon_public_key) {
+      payload.daemon_public_key = parsed.daemon_public_key;
+    }
     if (parsed.ws_url) {
       // ws_url 仅兼容旧邀请码；真正连接入口由调用方结合 server_id 规范化到统一 /ws。
       payload.ws_url = parsed.ws_url;
@@ -52,8 +58,10 @@ export function parsePairingQrPayload(raw: string): PairingQrPayload | undefined
 }
 
 function decodePastedPairingPayload(trimmed: string): string | undefined {
-  if (trimmed.startsWith(PAIRING_INVITE_PREFIX)) {
-    return decodeInviteCode(trimmed.slice(PAIRING_INVITE_PREFIX.length));
+  for (const prefix of PAIRING_INVITE_PREFIXES) {
+    if (trimmed.startsWith(prefix)) {
+      return decodeInviteCode(trimmed.slice(prefix.length));
+    }
   }
 
   // 兼容旧版 termd pair --qr 输出的明文 JSON；新版本默认会输出单行邀请码。

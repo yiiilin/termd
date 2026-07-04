@@ -65,6 +65,7 @@ fn decode_route_prelude(
         route_generation: envelope.payload.route_generation,
         client_id: envelope.payload.client_id,
         data_token: envelope.payload.data_token,
+        admission: envelope.payload.admission,
     })
 }
 

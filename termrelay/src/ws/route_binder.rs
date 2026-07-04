@@ -50,6 +50,16 @@ pub(super) async fn bind_socket_route(
 
     let server_id = prelude.server_id;
     let role = prelude.connection_role;
+    if let Err(error) = state.authorize_route_admission(&prelude) {
+        warn!(server_id = %server_id.0, ?role, %error, "rejecting relay websocket admission");
+        let _ = send_route_error(
+            socket,
+            error.route_error_code(),
+            error.route_error_message(),
+        )
+        .await;
+        return None;
+    }
     let registration = match state.register_route(&prelude, sender) {
         Ok(registration) => registration,
         Err(error) => {

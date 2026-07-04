@@ -6,6 +6,7 @@ export async function connectPairingClient(
   routeServerId: UUID,
   deviceId: UUID,
   daemonPublicKey: string,
+  pairingToken: string,
   timeoutMs: number,
 ): Promise<{ client: DirectClient; effectiveUrl: string }> {
   if (!routeServerId) {
@@ -16,6 +17,7 @@ export async function connectPairingClient(
     try {
       const client = await DirectClient.connect(candidateUrl, routeServerId, deviceId, {
         expectedDaemonPublicKey: daemonPublicKey,
+        pairingToken,
         timeoutMs,
       });
       if (client.serverId !== routeServerId) {

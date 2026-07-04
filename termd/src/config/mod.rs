@@ -209,6 +209,9 @@ pub struct DaemonConfig {
     /// relay 访问凭证；它只认证 relay transport，不表达 session 控制权。
     #[serde(default)]
     pub relay_auth_token: Option<SecretString>,
+    /// trusted relay daemon admission 凭证；只放进 route prelude，不写入浏览器 URL。
+    #[serde(default)]
+    pub relay_daemon_token: Option<SecretString>,
     /// relay 自动重连和心跳策略。
     #[serde(default)]
     pub relay_reconnect: RelayReconnectConfig,
@@ -238,6 +241,7 @@ impl DaemonConfig {
             pairing_token_ttl_ms: DEFAULT_PAIRING_TOKEN_TTL_MS,
             relay_endpoints: Vec::new(),
             relay_auth_token: None,
+            relay_daemon_token: None,
             relay_reconnect: RelayReconnectConfig::default(),
             relay_proxy_url: None,
             default_pairing_ws_url: default_pairing_ws_url(),
@@ -611,6 +615,7 @@ mod tests {
         config.pairing_token_ttl_ms = 42_000;
         config.relay_endpoints = vec!["ws://127.0.0.1:8080".to_owned()];
         config.relay_auth_token = Some(SecretString::new("relay-secret-1"));
+        config.relay_daemon_token = Some(SecretString::new("daemon-secret-1"));
         config.relay_reconnect = RelayReconnectConfig {
             initial_delay_ms: 250,
             max_delay_ms: 10_000,
@@ -625,7 +630,9 @@ mod tests {
         assert_eq!(loaded, config);
         let raw = fs::read_to_string(&config_path).unwrap();
         assert!(raw.contains("relay-secret-1"));
+        assert!(raw.contains("daemon-secret-1"));
         assert!(!format!("{config:?}").contains("relay-secret-1"));
+        assert!(!format!("{config:?}").contains("daemon-secret-1"));
         fs::remove_file(config_path).ok();
     }
 
