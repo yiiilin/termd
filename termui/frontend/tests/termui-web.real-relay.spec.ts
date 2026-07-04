@@ -874,23 +874,21 @@ test("relay Web 上传文件时有发送进度并写入当前会话目录", asyn
     throw new Error(`REAL_RELAY_UPLOAD_BYTES must be ${requiredLargeUploadBytes} for the 300MB relay upload check`);
   }
   test.setTimeout(largeUploadBytes > 0 ? 300_000 : 90_000);
-  let uploadTargetDir: string | undefined;
-  if (largeUploadBytes > 0) {
-    // 中文注释：300MB 浏览器验收必须落在 /tmp 下，但不能直接列 /tmp 根目录；
-    // 测试机 /tmp 可能有大量临时文件，会把文件树响应放大到数 MB 并干扰终端链路。
-    uploadTargetDir = await mkdtemp(path.join(tmpdir(), "termd-relay-upload-target-"));
-    const resolvedTmpDir = path.resolve(tmpdir());
-    const resolvedUploadTargetDir = path.resolve(uploadTargetDir);
-    if (resolvedTmpDir !== "/tmp" || !resolvedUploadTargetDir.startsWith(`${resolvedTmpDir}${path.sep}`)) {
-      throw new Error(`300MB relay upload target must be under /tmp, got ${resolvedUploadTargetDir}`);
-    }
+  // 中文注释：文件上传验收必须落在专用 /tmp 子目录。这样既避免列 /tmp 或 /root 时
+  // 被测试机已有文件干扰，也让小文件 WebSocket fallback 和 300MB HTTP tunnel 共用同一目标语义。
+  const uploadTargetDir = await mkdtemp(path.join(tmpdir(), "termd-relay-upload-target-"));
+  const resolvedTmpDir = path.resolve(tmpdir());
+  const resolvedUploadTargetDir = path.resolve(uploadTargetDir);
+  if (resolvedTmpDir !== "/tmp" || !resolvedUploadTargetDir.startsWith(`${resolvedTmpDir}${path.sep}`)) {
+    throw new Error(`relay upload target must be under /tmp, got ${resolvedUploadTargetDir}`);
   }
   const fixture = await startRealRelayFixture(largeUploadBytes > 0
     ? {
       enableHttpTunnel: true,
-      daemonEnv: { TERMD_DEFAULT_WORKING_DIRECTORY: uploadTargetDir ?? "/tmp" },
+      daemonEnv: { TERMD_DEFAULT_WORKING_DIRECTORY: uploadTargetDir },
     }
     : {
+      daemonEnv: { TERMD_DEFAULT_WORKING_DIRECTORY: uploadTargetDir },
       daemonToRelayLatencyMs: 100,
       relayToDaemonLatencyMs: 100,
       daemonToRelayBytesPerSecond: 64 * 1024,
@@ -914,7 +912,7 @@ test("relay Web 上传文件时有发送进度并写入当前会话目录", asyn
     const fileTail = "termd-large-upload-tail";
     const content = `${fileHead}\n`.repeat(16384);
     const expectedBytes = largeUploadBytes > 0 ? largeUploadBytes : Buffer.byteLength(content, "utf8");
-    const uploadTargetPath = largeUploadBytes > 0 ? `${uploadTargetDir}/${fileName}` : fileName;
+    const uploadTargetPath = `${uploadTargetDir}/${fileName}`;
     const uploadDirMarker = `termd-upload-dir-${Date.now()}`;
     const largeUploadMarkers = largeUploadBytes > 0
       ? largeUploadMarkerSpecs(largeUploadBytes, fileHead, fileTail)
@@ -922,21 +920,17 @@ test("relay Web 上传文件时有发送进度并写入当前会话目录", asyn
 
     const name = await createShellSession(page, createdNames);
     createdNames.push(name);
-    const prepareUploadCommand = largeUploadBytes > 0
-      ? `cd ${uploadTargetDir} && rm -f ${fileName} ${uploadDirMarker}; : > ${uploadDirMarker}; printf '${marker(name)}-upload-ready\\n'`
-      : `rm -f ${fileName}; printf '${marker(name)}-upload-ready\\n'`;
+    const prepareUploadCommand = `cd ${uploadTargetDir} && rm -f ${fileName} ${uploadDirMarker}; : > ${uploadDirMarker}; printf '${marker(name)}-upload-ready\\n'`;
     await runTerminalCommand(page, prepareUploadCommand);
     await expectTerminalLine(page, `${marker(name)}-upload-ready`, 8_000);
 
     const filesPanel = page.getByLabel("session files");
     await expect(filesPanel).toBeVisible();
-    if (largeUploadBytes > 0) {
-      // 中文注释：300MB 验收要求目标目录在 /tmp 下；fixture 通过 daemon 专用环境变量
-      // 把新 session 默认 cwd 固定到 /tmp 临时目录，再用 marker 确认文件面板状态确实切到目标目录。
-      await expect(filesPanel.getByLabel("Current directory")).toHaveValue(uploadTargetDir ?? "", { timeout: 10_000 });
-      await filesPanel.getByRole("button", { name: "Refresh files", exact: true }).click();
-      await expect.poll(async () => sessionFileNames(filesPanel), { timeout: 20_000 }).toContain(uploadDirMarker);
-    }
+    // 中文注释：fixture 通过 daemon 专用环境变量把新 session 默认 cwd 固定到目标目录；
+    // marker 确认文件面板确实跟随到该目录，后续上传目标才不会落到根目录或用户家目录。
+    await expect(filesPanel.getByLabel("Current directory")).toHaveValue(uploadTargetDir, { timeout: 10_000 });
+    await filesPanel.getByRole("button", { name: "Refresh files", exact: true }).click();
+    await expect.poll(async () => sessionFileNames(filesPanel), { timeout: 20_000 }).toContain(uploadDirMarker);
     if (largeUploadBytes > 0) {
       uploadTempDir = await mkdtemp(path.join(tmpdir(), "termd-large-upload-"));
       const filePath = path.join(uploadTempDir, fileName);
@@ -964,7 +958,7 @@ test("relay Web 上传文件时有发送进度并写入当前会话目录", asyn
 
     const verifyCommand = largeUploadBytes > 0
       ? `bytes=$(wc -c < ${uploadTargetPath}); printf '${marker(name)}-upload-size:%s\\n' "$bytes"; printf '${marker(name)}-upload-head:'; head -c 26 ${uploadTargetPath}; printf '\\n'; printf '${marker(name)}-upload-tail:'; tail -c ${Buffer.byteLength(fileTail, "utf8")} ${uploadTargetPath}; printf '\\n'; printf '${marker(name)}-upload-markers:%s\\n' '${largeUploadMarkers.length}'; rm -f ${uploadTargetPath} ${uploadTargetDir}/${uploadDirMarker}`
-      : `bytes=$(wc -c < ${uploadTargetPath}); printf '${marker(name)}-upload-size:%s\\n' "$bytes"; printf '${marker(name)}-upload-head:'; head -c 26 ${uploadTargetPath}; printf '\\n'; rm -f ${uploadTargetPath}`;
+      : `bytes=$(wc -c < ${uploadTargetPath}); printf '${marker(name)}-upload-size:%s\\n' "$bytes"; printf '${marker(name)}-upload-head:'; head -c 26 ${uploadTargetPath}; printf '\\n'; rm -f ${uploadTargetPath} ${uploadTargetDir}/${uploadDirMarker}`;
     await runTerminalCommand(page, verifyCommand);
     await expectTerminalLine(page, `${marker(name)}-upload-size:${expectedBytes}`, largeUploadBytes > 0 ? 60_000 : 20_000);
     await expectTerminalLine(page, `${marker(name)}-upload-head:${fileHead}`, 20_000);
@@ -1247,14 +1241,14 @@ test("relay Web 后台空闲超过保活间隔后恢复仍能继续输入", asyn
 function pairingInviteCode(fixture: { relayClientUrl: string; serverId: string; token: string; daemonPublicKey: string }): string {
   const payload = JSON.stringify({
     type: "termd_pairing_qr",
-    version: 1,
+    version: 2,
     ws_url: fixture.relayClientUrl,
     token: fixture.token,
     server_id: fixture.serverId,
     daemon_public_key: fixture.daemonPublicKey,
     expires_at_ms: Date.now() + 60_000,
   });
-  return `termd-pair:v1:${Buffer.from(payload, "utf8").toString("base64url")}`;
+  return `termd-pair:v2:${Buffer.from(payload, "utf8").toString("base64url")}`;
 }
 
 function terminalPane(page: Page): Locator {

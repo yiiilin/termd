@@ -8353,11 +8353,8 @@ mod tests {
         .await;
         let hello = read_daemon_frame_from_connector(&mut relay_socket, client_id).await;
         assert_eq!(hello.kind, MessageType::Hello);
-        let key_exchange = read_daemon_frame_from_connector(&mut relay_socket, client_id).await;
-        assert_eq!(key_exchange.kind, MessageType::E2eeKeyExchange);
-
-        let server_key_exchange: termd_proto::E2eeKeyExchangePayload =
-            decode_payload(key_exchange.payload).unwrap();
+        let server_key_exchange =
+            mux_test_daemon_key_exchange(&protocol, "relay-push-daemon-e2ee").await;
         let token = protocol
             .lock()
             .await
@@ -8510,11 +8507,8 @@ mod tests {
         .await;
         let slow_hello = read_daemon_frame_from_connector(&mut relay_socket, slow_client_id).await;
         assert_eq!(slow_hello.kind, MessageType::Hello);
-        let slow_key_exchange =
-            read_daemon_frame_from_connector(&mut relay_socket, slow_client_id).await;
-        assert_eq!(slow_key_exchange.kind, MessageType::E2eeKeyExchange);
-        let server_key_exchange: termd_proto::E2eeKeyExchangePayload =
-            decode_payload(slow_key_exchange.payload).unwrap();
+        let server_key_exchange =
+            mux_test_daemon_key_exchange(&protocol, "relay-backpressure-daemon-e2ee").await;
         let token = protocol
             .lock()
             .await
@@ -8617,11 +8611,8 @@ mod tests {
         .await
         .expect("新 client 的 hello 不能被旧 client 的 terminal output 卡住");
         assert_eq!(fresh_hello.kind, MessageType::Hello);
-        let fresh_key_exchange =
-            read_daemon_frame_for_connector(&mut relay_socket, fresh_client_id).await;
-        assert_eq!(fresh_key_exchange.kind, MessageType::E2eeKeyExchange);
-        let fresh_server_key_exchange: termd_proto::E2eeKeyExchangePayload =
-            decode_payload(fresh_key_exchange.payload).unwrap();
+        let fresh_server_key_exchange =
+            mux_test_daemon_key_exchange(&protocol, "relay-backpressure-fresh-daemon-e2ee").await;
         let mut fresh_e2ee = open_mux_e2ee_for_device(
             &mut relay_socket,
             fresh_client_id,
@@ -8682,11 +8673,8 @@ mod tests {
         .await;
         let hello = read_daemon_frame_from_connector(&mut relay_socket, client_id).await;
         assert_eq!(hello.kind, MessageType::Hello);
-        let key_exchange = read_daemon_frame_from_connector(&mut relay_socket, client_id).await;
-        assert_eq!(key_exchange.kind, MessageType::E2eeKeyExchange);
-
-        let server_key_exchange: termd_proto::E2eeKeyExchangePayload =
-            decode_payload(key_exchange.payload).unwrap();
+        let server_key_exchange =
+            mux_test_daemon_key_exchange(&protocol, "relay-cwd-push-daemon-e2ee").await;
         let token = protocol
             .lock()
             .await
@@ -8878,6 +8866,22 @@ mod tests {
         let outer = daemon_frame_to_json(pair_responses[0].clone());
         let frame = encrypted_frame_from_envelope(outer).unwrap();
         device_e2ee.decrypt_json_payload(&frame).unwrap()
+    }
+
+    async fn mux_test_daemon_key_exchange(
+        protocol: &SharedDaemonProtocol,
+        nonce: &str,
+    ) -> termd_proto::E2eeKeyExchangePayload {
+        let protocol = protocol.lock().await;
+        // 中文注释：当前协议由 client 先发 E2EE key exchange；daemon 初始帧只发送 hello。
+        // socket 级 mux 测试仍需要 daemon 公钥来构造加密会话，因此从测试 protocol fixture 取。
+        termd_proto::E2eeKeyExchangePayload::new(
+            protocol.server_id(),
+            termd_proto::DeviceId::new(),
+            protocol.e2ee_public_key().to_wire_public_key(),
+            termd_proto::Nonce(nonce.to_owned()),
+            current_unix_timestamp_millis(),
+        )
     }
 
     async fn authenticated_relay_metadata_connection(
@@ -9255,7 +9259,11 @@ mod tests {
         socket: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
     ) -> RelayMuxEnvelope {
         loop {
-            let message = socket.next().await.unwrap().unwrap();
+            let message = tokio::time::timeout(Duration::from_secs(5), socket.next())
+                .await
+                .expect("测试等待 daemon mux frame 超时")
+                .unwrap()
+                .unwrap();
             match message {
                 Message::Text(raw) => return serde_json::from_str(raw.as_str()).unwrap(),
                 Message::Binary(raw) => return decode_binary_relay_mux_envelope(&raw).unwrap(),

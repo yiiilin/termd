@@ -23,6 +23,15 @@ Termd 让一台机器上的 shell session 由 session supervisor 持久托管，
 
 Release 由 tag 驱动；固定版本时把 URL 里的 `latest` 换成对应 tag。
 
+### 0.6.0 破坏性升级
+
+0.6.0 把 relay 信任模型从“不可信 relay + 运行时 E2EE”切换为“可信 relay + daemon 注册”。升级时请同步升级 `termd`、`termrelay`、Web UI 和 `termctl`，不要混跑 0.5.x daemon 和 0.6.x relay。
+
+- relay 安装后会生成 setup token；daemon 使用 setup token 首次注册，并自动生成自己的 daemon token。
+- trusted relay 不再把旧 `relay_token` query 当作浏览器/termctl 的主要 admission；浏览器和 `termctl` 使用 `termd pair --qr` 生成的短期 pairing invite。
+- relay registry 会保存 daemon token hash；请备份 `/var/lib/termrelay/daemon-registry.json` 和 `/etc/termd/termrelay_setup_token`。
+- daemon 本地状态和已有 session supervisor 不需要因为 0.6.0 自动清空；如果 relay 入口无法识别旧设备，重新执行一次 `termd pair --qr` 配对即可。
+
 ### daemon + Web
 
 个人机器推荐指定运行用户，这样 Web 新建 session 会使用该用户的 HOME 和 login shell：
@@ -76,7 +85,7 @@ curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-ter
 curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termd.sh | sudo bash -s -- --relay wss://relay.example --relay-setup-token-file /etc/termd/termrelay_setup_token
 ```
 
-`termd` 安装脚本会自动生成 `/etc/termd/termd_daemon_token`，用 relay setup token 把 `server_id -> daemon token hash` 注册到 relay。浏览器和 `termctl` 只需要短期 pairing invite；旧 `relay_token` query 仍保留给迁移兼容。
+`termd` 安装脚本会自动生成 `/etc/termd/termd_daemon_token`，用 relay setup token 把 `server_id -> daemon token hash` 注册到 relay。浏览器和 `termctl` 只需要短期 pairing invite；旧 `relay_token` query 不再作为 trusted relay 的浏览器 admission。
 
 同一份 `termd pair --qr` 邀请码可用于 daemon Web 和 relay Web。relay 做 admission 和路由，pairing/auth/session 权限仍由 daemon 最终校验。Docker Compose 部署见 [docs/deployment.md](docs/deployment.md)。
 

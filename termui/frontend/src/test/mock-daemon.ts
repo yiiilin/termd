@@ -559,7 +559,7 @@ export class MockDaemon {
       response.setHeader("access-control-allow-methods", "POST, OPTIONS");
       response.setHeader(
         "access-control-allow-headers",
-        "authorization, content-type, x-termd-server-id, x-termd-device-id, x-termd-e2ee-public-key, x-termd-e2ee-nonce, x-termd-e2ee-timestamp-ms, x-termd-e2ee-signature, x-termd-session-scope",
+        "authorization, content-type, x-termd-server-id, x-termd-device-id, x-termd-relay-admission, x-termd-e2ee-public-key, x-termd-e2ee-nonce, x-termd-e2ee-timestamp-ms, x-termd-e2ee-signature, x-termd-session-scope",
       );
       response.setHeader("access-control-max-age", "600");
     };

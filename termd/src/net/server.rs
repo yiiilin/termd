@@ -644,6 +644,7 @@ fn http_control_api_cors_layer() -> CorsLayer {
             HeaderName::from_static("x-termd-server-id"),
             HeaderName::from_static("x-termd-device-id"),
             HeaderName::from_static("x-termd-session-scope"),
+            HeaderName::from_static("x-termd-relay-admission"),
             HeaderName::from_static("x-termd-e2ee-public-key"),
             HeaderName::from_static("x-termd-e2ee-nonce"),
             HeaderName::from_static("x-termd-e2ee-timestamp-ms"),
@@ -662,6 +663,7 @@ fn http_file_api_cors_layer() -> CorsLayer {
             CONTENT_TYPE,
             HeaderName::from_static("x-termd-server-id"),
             HeaderName::from_static("x-termd-device-id"),
+            HeaderName::from_static("x-termd-relay-admission"),
             HeaderName::from_static("x-termd-e2ee-public-key"),
             HeaderName::from_static("x-termd-e2ee-nonce"),
             HeaderName::from_static("x-termd-e2ee-timestamp-ms"),
@@ -779,6 +781,9 @@ fn is_http_tunnel_allowed(method: &str, path: &str) -> bool {
 }
 
 fn load_rustls_server_config(tls_paths: &TlsPaths) -> Result<rustls::ServerConfig, ServerError> {
+    // 中文注释：库测试和嵌入式调用不会经过 `termd` binary 的 main；
+    // TLS server config 自己也要选定 provider，避免 aws-lc/ring 同时存在时 panic。
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let certs = rustls::pki_types::CertificateDer::pem_file_iter(&tls_paths.cert_path)
         .map_err(io_error_for_tls_cert)?
         .collect::<Result<Vec<_>, _>>()
@@ -2244,9 +2249,31 @@ pub(crate) fn register_relay_device_from_config(
     let Some(target) = relay_registration_target(config)? else {
         return Ok(());
     };
+    let endpoint = target.base.api_url("/api/relay/device/register");
+    // 中文注释：PairRequest 处理路径仍是同步状态机，但不能在 Tokio worker 中直接
+    // 创建/drop reqwest blocking runtime；独立 OS 线程可以安全承载这次短 HTTP 注册。
+    std::thread::spawn(move || {
+        register_relay_device_request(
+            endpoint,
+            target.daemon_token,
+            server_id,
+            device_id,
+            public_key,
+        )
+    })
+    .join()
+    .map_err(|_| RelayRegistrationError::Request("relay device registration panicked".to_owned()))?
+}
+
+fn register_relay_device_request(
+    endpoint: String,
+    daemon_token: String,
+    server_id: ServerId,
+    device_id: termd_proto::DeviceId,
+    public_key: PublicKey,
+) -> Result<(), RelayRegistrationError> {
     // 中文注释：协议核心是同步状态机；pairing 成功路径必须在返回 PairAccept 前确认
     // relay 已接收 device，否则用户会得到一个后续无法经 trusted relay 使用的假成功配对。
-    let endpoint = target.base.api_url("/api/relay/device/register");
     let payload = RelayDeviceRegistration {
         server_id,
         device_id,
@@ -2263,7 +2290,7 @@ pub(crate) fn register_relay_device_from_config(
     for attempt in 1..=RELAY_DEVICE_REGISTRATION_ATTEMPTS {
         let result = client
             .post(endpoint.as_str())
-            .header("x-termd-relay-daemon-token", target.daemon_token.as_str())
+            .header("x-termd-relay-daemon-token", daemon_token.as_str())
             .json(&payload)
             .send()
             .map_err(relay_registration_request_error)
@@ -6110,9 +6137,8 @@ mod tests {
         send_ws_route_hello(&mut socket, server_id).await;
         let hello = read_ws_envelope(&mut socket).await;
         assert_eq!(hello.kind, MessageType::Hello);
-        let key_exchange = read_ws_envelope(&mut socket).await;
-        assert_eq!(key_exchange.kind, MessageType::E2eeKeyExchange);
-        let daemon_exchange: E2eeKeyExchangePayload = decode_payload(key_exchange.payload).unwrap();
+        let daemon_exchange =
+            websocket_test_daemon_key_exchange(&protocol, "push-test-daemon-e2ee").await;
         let device_id = DeviceId::new();
         let mut device_session = open_client_e2ee(&mut socket, daemon_exchange, device_id).await;
 
@@ -6234,9 +6260,8 @@ mod tests {
         send_ws_route_hello(&mut socket, server_id).await;
         let hello = read_ws_envelope(&mut socket).await;
         assert_eq!(hello.kind, MessageType::Hello);
-        let key_exchange = read_ws_envelope(&mut socket).await;
-        assert_eq!(key_exchange.kind, MessageType::E2eeKeyExchange);
-        let daemon_exchange: E2eeKeyExchangePayload = decode_payload(key_exchange.payload).unwrap();
+        let daemon_exchange =
+            websocket_test_daemon_key_exchange(&protocol, "cwd-push-test-daemon-e2ee").await;
         let device_id = DeviceId::new();
         let mut device_session = open_client_e2ee(&mut socket, daemon_exchange, device_id).await;
 
@@ -6514,7 +6539,11 @@ mod tests {
 
     async fn read_ws_envelope(socket: &mut TestWs) -> JsonEnvelope {
         loop {
-            let message = socket.next().await.unwrap().unwrap();
+            let message = timeout(Duration::from_secs(5), socket.next())
+                .await
+                .expect("测试等待 WebSocket envelope 超时")
+                .unwrap()
+                .unwrap();
             match message {
                 ClientWsMessage::Text(raw) => return serde_json::from_str(&raw).unwrap(),
                 ClientWsMessage::Binary(raw) => return serde_json::from_slice(&raw).unwrap(),
@@ -6526,6 +6555,22 @@ mod tests {
                 ClientWsMessage::Frame(_) => continue,
             }
         }
+    }
+
+    async fn websocket_test_daemon_key_exchange(
+        protocol: &SharedDaemonProtocol,
+        nonce: &str,
+    ) -> E2eeKeyExchangePayload {
+        let protocol = protocol.lock().await;
+        // 中文注释：当前直连 WebSocket 也是 client-first E2EE 握手；daemon 初始帧只发送 hello。
+        // 测试仍需要 daemon 公钥来构造客户端加密会话，因此从 protocol fixture 读取。
+        E2eeKeyExchangePayload::new(
+            protocol.server_id(),
+            DeviceId::new(),
+            protocol.e2ee_public_key().to_wire_public_key(),
+            termd_proto::Nonce(nonce.to_owned()),
+            current_unix_timestamp_millis(),
+        )
     }
 
     async fn send_ws_route_hello(socket: &mut TestWs, server_id: ServerId) {

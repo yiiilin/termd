@@ -1,5 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -69,9 +69,28 @@ export async function startRealRelayFixture(options: RealRelayFixtureOptions = {
   // Unix domain socket 路径有 SUN_LEN 限制；termd 会从 cwd 派生 supervisor socket 目录。
   // 真实 relay 测试必须使用短 cwd，否则创建 PTY 时会因为 socket path 过长失败。
   const tempDir = await mkdtemp(path.join(tmpdir(), "td-"));
+  const setupToken = testSecret("relay-setup", relayPort);
+  const daemonToken = testSecret("daemon", termdPort);
+  const setupTokenFile = path.join(tempDir, "relay-setup-token");
+  const daemonRegistryFile = path.join(tempDir, "daemon-registry.json");
+  await writeFile(setupTokenFile, `${setupToken}\n`, { mode: 0o600 });
+  await chmod(setupTokenFile, 0o600);
 
   const relayArgs = [
-    "run", "-q", "--manifest-path", CARGO_MANIFEST, "-p", "termrelay", "--", "--listen", relayAddr, "--web",
+    "run",
+    "-q",
+    "--manifest-path",
+    CARGO_MANIFEST,
+    "-p",
+    "termrelay",
+    "--",
+    "--listen",
+    relayAddr,
+    "--web",
+    "--setup-token-file",
+    setupTokenFile,
+    "--daemon-registry",
+    daemonRegistryFile,
   ];
   if (options.enableHttpTunnel) {
     relayArgs.push("--http-tunnel");
@@ -127,14 +146,17 @@ export async function startRealRelayFixture(options: RealRelayFixtureOptions = {
     `127.0.0.1:${termdPort}`,
     "--relay",
     `ws://${relayForDaemon}`,
+    "--relay-daemon-token",
+    daemonToken,
   ];
   let daemon = spawnCargo(daemonArgs, "termd", tempDir, options.daemonEnv, daemonLogs);
   await waitForPort(termdPort, daemon, "termd");
 
   const serverId = await serverIdFromHealthz(termdHttp);
   const relayClientUrl = `ws://${relayAddr}/ws`;
-  await waitForRelayDaemonMux(relayClientUrl, serverId, [relay, daemon]);
+  await registerDaemonWithRelay(`http://${relayAddr}`, serverId, daemonToken, setupToken);
   const pairing = await issuePairingToken(termdHttp);
+  await waitForRelayDaemonMux(relayClientUrl, serverId, pairing.token, [relay, daemon]);
 
   return {
     token: pairing.token,
@@ -173,9 +195,10 @@ export async function startRealRelayFixture(options: RealRelayFixtureOptions = {
       if (restartedServerId !== serverId) {
         throw new Error(`daemon restart changed server_id: expected ${serverId}, got ${restartedServerId}`);
       }
-      await waitForRelayDaemonMux(relayClientUrl, serverId, [relay, daemon]);
+      await registerDaemonWithRelay(`http://${relayAddr}`, serverId, daemonToken, setupToken);
+      await waitForRelayDaemonMux(relayClientUrl, serverId, pairing.token, [relay, daemon]);
     },
-    waitForRelayReady: () => waitForRelayDaemonMux(relayClientUrl, serverId, [relay, daemon]),
+    waitForRelayReady: () => waitForRelayDaemonMux(relayClientUrl, serverId, pairing.token, [relay, daemon]),
     stop: async () => {
       await stopProcess(daemon, "termd");
       await latencyProxy?.stop();
@@ -188,6 +211,7 @@ export async function startRealRelayFixture(options: RealRelayFixtureOptions = {
 async function waitForRelayDaemonMux(
   relayClientUrl: string,
   serverId: string,
+  pairTicket: string,
   processes: StartedProcess[],
 ): Promise<void> {
   const deadline = Date.now() + 30_000;
@@ -199,7 +223,7 @@ async function waitForRelayDaemonMux(
       }
     }
     try {
-      await probeRelayDaemonMux(relayClientUrl, serverId, Math.min(3_000, Math.max(1, deadline - Date.now())));
+      await probeRelayDaemonMux(relayClientUrl, serverId, pairTicket, Math.min(3_000, Math.max(1, deadline - Date.now())));
       return;
     } catch (caught) {
       lastError = caught instanceof Error ? caught.message : String(caught);
@@ -209,7 +233,7 @@ async function waitForRelayDaemonMux(
   throw new Error(`relay daemon mux did not become ready: ${lastError}\n${processes.map((process) => process.log.join("")).join("\n")}`);
 }
 
-function probeRelayDaemonMux(relayClientUrl: string, serverId: string, timeoutMs: number): Promise<void> {
+function probeRelayDaemonMux(relayClientUrl: string, serverId: string, pairTicket: string, timeoutMs: number): Promise<void> {
   return new Promise((resolve, reject) => {
     const socket = new WebSocket(relayClientUrl);
     let settled = false;
@@ -237,6 +261,7 @@ function probeRelayDaemonMux(relayClientUrl: string, serverId: string, timeoutMs
           server_id: serverId,
           role: "client",
           protocol_version: 3,
+          admission: { kind: "pair_ticket", token: pairTicket },
           nonce: `relay-mux-probe-${Date.now()}-${Math.random().toString(16).slice(2)}`,
           timestamp_ms: Date.now(),
         },
@@ -471,15 +496,36 @@ async function issuePairingToken(termdHttp: string): Promise<{ token: string; da
   return { token: parsed.token, daemonPublicKey: parsed.daemon_public_key };
 }
 
+async function registerDaemonWithRelay(
+  relayHttp: string,
+  serverId: string,
+  daemonToken: string,
+  setupToken: string,
+): Promise<void> {
+  // 中文注释：0.6.0 的 relay 是可信准入层，测试里的 daemon 也必须先用 setup token
+  // 注册 daemon admission token；否则 relay 会拒绝 daemon control/data 路由。
+  await httpRequest(`${relayHttp}/api/relay/daemon/register`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-termd-relay-setup-token": setupToken,
+    },
+    body: JSON.stringify({ server_id: serverId, daemon_token: daemonToken }),
+  });
+}
+
 async function serverIdFromHealthz(termdHttp: string): Promise<string> {
   const body = await httpRequest(`${termdHttp}/healthz`, { method: "GET" });
   const parsed = JSON.parse(body) as { server_id: string };
   return parsed.server_id;
 }
 
-function httpRequest(url: string, options: { method: "GET" | "POST" }): Promise<string> {
+function httpRequest(
+  url: string,
+  options: { method: "GET" | "POST"; headers?: Record<string, string>; body?: string },
+): Promise<string> {
   return new Promise((resolve, reject) => {
-    const req = request(url, { method: options.method }, (res) => {
+    const req = request(url, { method: options.method, headers: options.headers }, (res) => {
       let body = "";
       res.setEncoding("utf8");
       res.on("data", (chunk) => {
@@ -494,8 +540,15 @@ function httpRequest(url: string, options: { method: "GET" | "POST" }): Promise<
       });
     });
     req.on("error", reject);
+    if (options.body) {
+      req.write(options.body);
+    }
     req.end();
   });
+}
+
+function testSecret(prefix: string, port: number): string {
+  return `termd-playwright-${prefix}-${process.pid}-${port}-${Date.now().toString(36)}`;
 }
 
 function spawnCargo(

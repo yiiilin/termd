@@ -13,13 +13,13 @@ async function activateButton(page: Page, name: string): Promise<void> {
 function pairingInviteCode(daemon: MockDaemon): string {
   const payload = JSON.stringify({
     type: "termd_pairing_qr",
-    version: 1,
+    version: 2,
     token: "secret-token",
     server_id: daemon.serverId,
     daemon_public_key: daemon.daemonPublicKey,
     expires_at_ms: Date.now() + 60_000,
   });
-  return `termd-pair:v1:${Buffer.from(payload, "utf8").toString("base64url")}`;
+  return `termd-pair:v2:${Buffer.from(payload, "utf8").toString("base64url")}`;
 }
 
 async function resetBrowserState(page: Page): Promise<void> {

@@ -321,7 +321,7 @@ test("pair、list、attach 的浏览器 smoke", async ({ page }, testInfo: TestI
 
     await page.getByLabel("WS URL").fill(daemon.url);
     await page.getByLabel("Pairing token").fill(pairingInviteCode(daemon));
-    await expect(page.getByLabel("Pairing token")).toHaveValue(/termd-pair:v1:/);
+    await expect(page.getByLabel("Pairing token")).toHaveValue(/termd-pair:v2:/);
     await activateButton(page, "Pair");
 
     await expect(page.getByLabel("Pairing token")).toBeHidden();
@@ -489,7 +489,7 @@ test("pair、list、attach 的浏览器 smoke", async ({ page }, testInfo: TestI
       .poll(() => daemon.decryptedInputs.join(""))
       .toContain("terminal-secret");
     expect(daemon.outerWireText()).not.toContain("terminal-secret");
-    expect(daemon.outerWireText()).not.toContain("secret-token");
+    expectPairingTokenOnlyInRelayAdmission(daemon);
 
     if (testInfo.project.name === "mobile-chrome") {
       await page.evaluate(() => {
@@ -570,7 +570,9 @@ test("direct Web 慢普通 RPC 超时后终端仍可输入", async ({ page }, te
     await page.keyboard.type("direct-after-timeout");
     await page.keyboard.press("Enter");
     await expect.poll(() => daemon.decryptedInputs.join("")).toContain("direct-after-timeout");
-    expect(daemon.activeConnectionCount()).toBe(1);
+    // 中文注释：0.6.0 起 metadata/control 可以和 terminal attach 分离，慢 RPC 超时后
+    // 最多保留一条终端连接加一条 metadata/control 连接即可，不能继续堆积。
+    expect(daemon.activeConnectionCount()).toBeLessThanOrEqual(2);
   } finally {
     await daemon.stop();
   }
@@ -1121,7 +1123,8 @@ test("terminal 进入后台标签页时仍持续消费输出，不依赖前台 r
     await expect
       .poll(async () => terminalDebugBufferText(page), { timeout: 20_000 })
       .toContain("background-tab-live-output");
-    expect(daemon.activeConnectionCount()).toBe(1);
+    // 中文注释：后台 tab 仍允许 metadata/control 连接存在；这里约束没有反复重连泄漏。
+    expect(daemon.activeConnectionCount()).toBeLessThanOrEqual(2);
 
     await secondPage.close();
     await page.bringToFront();
@@ -1571,13 +1574,40 @@ test("terminal 从后台标签页回到前台并重新聚焦时 rows/cols 保持
 function pairingInviteCode(daemon: MockDaemon): string {
   const payload = JSON.stringify({
     type: "termd_pairing_qr",
-    version: 1,
+    version: 2,
     token: "secret-token",
     server_id: daemon.serverId,
     daemon_public_key: daemon.daemonPublicKey,
     expires_at_ms: Date.now() + 60_000,
   });
-  return `termd-pair:v1:${Buffer.from(payload, "utf8").toString("base64url")}`;
+  return `termd-pair:v2:${Buffer.from(payload, "utf8").toString("base64url")}`;
+}
+
+function expectPairingTokenOnlyInRelayAdmission(daemon: MockDaemon, token = "secret-token"): void {
+  const lines = daemon.outerWireText().split("\n").filter(Boolean);
+  let tokenLineCount = 0;
+  for (const line of lines) {
+    if (!line.includes(token)) {
+      continue;
+    }
+    tokenLineCount += 1;
+    const envelope = JSON.parse(line) as {
+      type?: string;
+      payload?: { admission?: { kind?: string; token?: string } };
+    };
+    expect(envelope).toMatchObject({
+      type: "route_hello",
+      payload: {
+        admission: {
+          kind: "pair_ticket",
+          token,
+        },
+      },
+    });
+  }
+  // 中文注释：可信 relay 能看到一次性 pair ticket；配对后的 device admission
+  // 和业务 E2EE packet 不能继续携带原始 pairing token。
+  expect(tokenLineCount).toBe(1);
 }
 
 async function openSession(page: Page, name: string): Promise<void> {
