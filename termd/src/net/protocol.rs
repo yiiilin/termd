@@ -1054,12 +1054,16 @@ where
     }
 
     pub fn register_trusted_devices_with_relay(&self) {
-        for trusted in self.trusted_store.trusted_devices() {
-            super::server::register_relay_device_from_config_background(
+        let devices = self
+            .trusted_store
+            .trusted_devices()
+            .map(|trusted| (trusted.device_id(), trusted.public_key().clone()))
+            .collect::<Vec<_>>();
+        if !devices.is_empty() {
+            super::server::register_relay_devices_from_config_background(
                 &self.config,
                 self.server_id(),
-                trusted.device_id(),
-                trusted.public_key().clone(),
+                devices,
             );
         }
     }

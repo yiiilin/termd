@@ -7204,21 +7204,32 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
 
-        let device_id = termd_proto::DeviceId::new();
-        let public_key = termd_proto::PublicKey("ed25519-v1:restored-device".to_owned());
+        let first_device_id = termd_proto::DeviceId::new();
+        let second_device_id = termd_proto::DeviceId::new();
+        let first_public_key = termd_proto::PublicKey("ed25519-v1:restored-device-1".to_owned());
+        let second_public_key = termd_proto::PublicKey("ed25519-v1:restored-device-2".to_owned());
         let state_path = temp_state_path("relay-reregister-trusted-device");
         StateStore::save(
             &state_path,
             &DaemonState {
                 version: crate::state::STATE_SCHEMA_VERSION,
                 daemon_identity: None,
-                trusted_devices: vec![TrustedDeviceState {
-                    device_id,
-                    public_key: public_key.clone(),
-                    trusted_at_ms: termd_proto::UnixTimestampMillis(1000),
-                    last_seen_at_ms: Some(termd_proto::UnixTimestampMillis(2000)),
-                    label: Some("restored web".to_owned()),
-                }],
+                trusted_devices: vec![
+                    TrustedDeviceState {
+                        device_id: first_device_id,
+                        public_key: first_public_key.clone(),
+                        trusted_at_ms: termd_proto::UnixTimestampMillis(1000),
+                        last_seen_at_ms: Some(termd_proto::UnixTimestampMillis(2000)),
+                        label: Some("restored web 1".to_owned()),
+                    },
+                    TrustedDeviceState {
+                        device_id: second_device_id,
+                        public_key: second_public_key.clone(),
+                        trusted_at_ms: termd_proto::UnixTimestampMillis(1001),
+                        last_seen_at_ms: Some(termd_proto::UnixTimestampMillis(2001)),
+                        label: Some("restored web 2".to_owned()),
+                    },
+                ],
                 sessions: Vec::new(),
             },
         )
@@ -7238,15 +7249,32 @@ mod tests {
             protocol,
             RELAY_HEARTBEAT_INTERVAL,
         ));
-        let registration =
-            tokio::time::timeout(Duration::from_secs(2), received_registrations.recv())
-                .await
-                .expect("daemon control connect should re-register restored trusted device")
-                .expect("mock relay should receive one device registration");
+        let mut registrations = Vec::new();
+        for _ in 0..2 {
+            registrations.push(
+                tokio::time::timeout(Duration::from_secs(2), received_registrations.recv())
+                    .await
+                    .expect("daemon control connect should re-register restored trusted devices")
+                    .expect("mock relay should receive device registrations"),
+            );
+        }
 
-        assert_eq!(registration.server_id, server_id);
-        assert_eq!(registration.device_id, device_id);
-        assert_eq!(registration.public_key, public_key);
+        registrations.sort_by_key(|registration| registration.device_id.0);
+        let mut expected = vec![
+            (first_device_id, first_public_key),
+            (second_device_id, second_public_key),
+        ];
+        expected.sort_by_key(|(device_id, _)| device_id.0);
+        assert_eq!(
+            registrations
+                .into_iter()
+                .map(|registration| {
+                    assert_eq!(registration.server_id, server_id);
+                    (registration.device_id, registration.public_key)
+                })
+                .collect::<Vec<_>>(),
+            expected
+        );
 
         connector.abort();
         server.abort();

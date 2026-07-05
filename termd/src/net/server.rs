@@ -2322,18 +2322,65 @@ fn register_relay_device_request(
     }))
 }
 
-pub(crate) fn register_relay_device_from_config_background(
+pub(crate) fn register_relay_devices_from_config_background(
     config: &DaemonConfig,
     server_id: ServerId,
-    device_id: termd_proto::DeviceId,
-    public_key: PublicKey,
+    devices: Vec<(termd_proto::DeviceId, PublicKey)>,
 ) {
+    if devices.is_empty() {
+        return;
+    }
     let config = config.clone();
     tokio::task::spawn_blocking(move || {
-        if let Err(error) =
-            register_relay_device_from_config(&config, server_id, device_id, public_key)
-        {
-            warn!(%error, "failed to register trusted device with relay");
+        let Some(target) = (match relay_registration_target(&config) {
+            Ok(target) => target,
+            Err(error) => {
+                warn!(%error, "failed to prepare trusted device relay re-registration");
+                return;
+            }
+        }) else {
+            return;
+        };
+        let endpoint = target.base.api_url("/api/relay/device/register");
+        let total = devices.len();
+        let mut registered = 0_usize;
+        let mut failed = 0_usize;
+        let mut last_error = None;
+
+        // 中文注释：relay 重启后的恢复注册必须限流。旧状态里可能积累较多 device，
+        // 这里用单个后台任务顺序补注册，避免一次 control 重连打开大量 HTTP client/socket。
+        for (device_id, public_key) in devices {
+            match register_relay_device_request(
+                endpoint.clone(),
+                target.daemon_token.clone(),
+                server_id,
+                device_id,
+                public_key,
+            ) {
+                Ok(()) => registered = registered.saturating_add(1),
+                Err(error) => {
+                    failed = failed.saturating_add(1);
+                    last_error = Some(error);
+                }
+            }
+        }
+
+        if failed > 0 {
+            let error = last_error
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| "unknown error".to_owned());
+            warn!(
+                total,
+                registered,
+                failed,
+                %error,
+                "trusted device relay re-registration completed with failures"
+            );
+        } else {
+            debug!(
+                total,
+                registered, "trusted device relay re-registration completed"
+            );
         }
     });
 }
