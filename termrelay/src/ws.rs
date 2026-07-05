@@ -3025,6 +3025,61 @@ mod tests {
         );
     }
 
+    #[test]
+    fn trusted_relay_device_admission_recovers_after_daemon_reregistration() {
+        let server_id = server_id(125);
+        let device_id = DeviceId::new();
+        let daemon_credentials = || {
+            vec![RelayDaemonCredential::plain_token(
+                server_id,
+                "daemon-secret-1".to_owned(),
+            )]
+        };
+        let restarted_state = RelayState::new_trusted(None, daemon_credentials());
+        let now_ms = relay_now_ms();
+        let (public_key, rejected_admission) = test_device_admission(
+            server_id,
+            device_id,
+            Nonce("device-admission-before-reregister".to_owned()),
+            UnixTimestampMillis(now_ms),
+        );
+        let prelude = RoutePrelude {
+            server_id,
+            route_role: RouteRole::Client,
+            connection_role: ConnectionRole::Client,
+            admission: Some(rejected_admission),
+            route_generation: None,
+            client_id: None,
+            data_token: None,
+        };
+
+        assert_eq!(
+            restarted_state.authorize_route_admission(&prelude),
+            Err(RelayError::AdmissionRejected),
+            "relay 重启后没有 device 公钥缓存时，旧 device admission 仍必须先被拒绝"
+        );
+
+        restarted_state
+            .register_device(server_id, device_id, public_key, Some("daemon-secret-1"))
+            .expect("daemon token should allow device re-registration");
+        let (_public_key, accepted_admission) = test_device_admission(
+            server_id,
+            device_id,
+            Nonce("device-admission-after-reregister".to_owned()),
+            UnixTimestampMillis(now_ms),
+        );
+
+        assert!(
+            restarted_state
+                .authorize_route_admission(&RoutePrelude {
+                    admission: Some(accepted_admission),
+                    ..prelude
+                })
+                .is_ok(),
+            "daemon 重注册本地 trusted device 后，旧 Web 设备应能重新通过 relay admission"
+        );
+    }
+
     #[tokio::test]
     async fn trusted_relay_http_tunnel_rejects_missing_admission() {
         let server_id = server_id(122);

@@ -1368,9 +1368,10 @@ async fn connect_relay_control_base_once(
         None,
     )
     .await?;
-    // 中文注释：不要在 daemon control 刚连上时批量重注册历史 devices。
-    // 线上旧状态里可能有大量迁移遗留 device，注册请求失败会制造长时间网络噪声；
-    // 新配对路径会在 pair 成功后单独注册当前 device。
+    // 中文注释：trusted relay 的 device admission 表是 relay 进程内缓存；
+    // relay 升级/重启后必须由 daemon 用本地持久 trusted devices 重新声明，
+    // 否则已配对 Web 页面重连时会因为 relay 不认识 device 公钥而被拒绝。
+    protocol.lock().await.register_trusted_devices_with_relay();
     let mut heartbeat =
         tokio::time::interval_at(Instant::now() + heartbeat_interval, heartbeat_interval);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -5836,14 +5837,17 @@ impl From<ProtocolError> for RelayConnectorError {
 mod tests {
     use super::*;
     use crate::auth::current_unix_timestamp_millis;
-    use crate::config::{DaemonConfig, RelayReconnectConfig};
+    use crate::config::{DaemonConfig, RelayReconnectConfig, SecretString};
     use crate::net::protocol::{decode_payload, encrypted_frame_from_envelope, envelope_value};
     use crate::net::server::default_protocol;
     use crate::net::{E2eeKeyPair, E2eeSession, E2eeSessionContext, E2eeSessionRole};
+    use crate::state::{DaemonState, StateStore, TrustedDeviceState};
+    use axum::Json;
     use axum::extract::State;
     use axum::extract::ws::{Message as AxumMessage, WebSocketUpgrade};
+    use axum::http::{HeaderMap, StatusCode};
     use axum::response::IntoResponse;
-    use axum::routing::get;
+    use axum::routing::{get, post};
     use futures_util::StreamExt;
     use std::fs;
     use std::path::PathBuf;
@@ -7185,6 +7189,70 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn relay_control_reregisters_restored_trusted_devices_after_connect() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (registrations, mut received_registrations) = mpsc::unbounded_channel();
+        let app = axum::Router::new()
+            .route("/ws", get(mock_stable_daemon_control_ws))
+            .route(
+                "/api/relay/device/register",
+                post(mock_trusted_relay_device_register),
+            )
+            .with_state(MockTrustedRelayState { registrations });
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let device_id = termd_proto::DeviceId::new();
+        let public_key = termd_proto::PublicKey("ed25519-v1:restored-device".to_owned());
+        let state_path = temp_state_path("relay-reregister-trusted-device");
+        StateStore::save(
+            &state_path,
+            &DaemonState {
+                version: crate::state::STATE_SCHEMA_VERSION,
+                daemon_identity: None,
+                trusted_devices: vec![TrustedDeviceState {
+                    device_id,
+                    public_key: public_key.clone(),
+                    trusted_at_ms: termd_proto::UnixTimestampMillis(1000),
+                    last_seen_at_ms: Some(termd_proto::UnixTimestampMillis(2000)),
+                    label: Some("restored web".to_owned()),
+                }],
+                sessions: Vec::new(),
+            },
+        )
+        .unwrap();
+        let mut config = DaemonConfig::default_for_state_path(&state_path);
+        config.relay_endpoints = vec![format!("ws://{addr}")];
+        config.relay_daemon_token = Some(SecretString::new("daemon-secret-for-reregister"));
+        let protocol = default_protocol(config);
+        let server_id = protocol.lock().await.server_id();
+        let base = RelayBaseUrl::parse(&format!("ws://{addr}")).unwrap();
+
+        let connector = tokio::spawn(connect_relay_control_base_once(
+            base,
+            None,
+            Some("daemon-secret-for-reregister"),
+            None,
+            protocol,
+            RELAY_HEARTBEAT_INTERVAL,
+        ));
+        let registration =
+            tokio::time::timeout(Duration::from_secs(2), received_registrations.recv())
+                .await
+                .expect("daemon control connect should re-register restored trusted device")
+                .expect("mock relay should receive one device registration");
+
+        assert_eq!(registration.server_id, server_id);
+        assert_eq!(registration.device_id, device_id);
+        assert_eq!(registration.public_key, public_key);
+
+        connector.abort();
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn relay_control_open_data_creates_raw_daemon_data_pipe() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -7685,6 +7753,18 @@ mod tests {
         idle_pings: Arc<AtomicUsize>,
     }
 
+    #[derive(Clone)]
+    struct MockTrustedRelayState {
+        registrations: mpsc::UnboundedSender<TestRelayDeviceRegistration>,
+    }
+
+    #[derive(Debug, Clone, serde::Deserialize)]
+    struct TestRelayDeviceRegistration {
+        server_id: ServerId,
+        device_id: termd_proto::DeviceId,
+        public_key: termd_proto::PublicKey,
+    }
+
     async fn mock_route_ready_timeout_ws(websocket: WebSocketUpgrade) -> impl IntoResponse {
         websocket.on_upgrade(move |mut socket| async move {
             let _ = read_axum_route_hello(&mut socket).await;
@@ -7742,6 +7822,55 @@ mod tests {
                 }
             }
         })
+    }
+
+    async fn mock_stable_daemon_control_ws(websocket: WebSocketUpgrade) -> impl IntoResponse {
+        websocket.on_upgrade(move |mut socket| async move {
+            let Some(route_hello) = read_axum_route_hello(&mut socket).await else {
+                return;
+            };
+            if !matches!(route_hello.role, RouteRole::DaemonControl) {
+                return;
+            }
+            let route_ready = Envelope::new(
+                MessageType::RouteReady,
+                RouteReadyPayload {
+                    server_id: route_hello.server_id,
+                    role: route_hello.role,
+                },
+            );
+            let raw = serde_json::to_string(&route_ready).unwrap();
+            if socket.send(AxumMessage::Text(raw.into())).await.is_err() {
+                return;
+            }
+
+            while let Some(message) = socket.next().await {
+                match message {
+                    Ok(AxumMessage::Ping(payload)) => {
+                        let _ = socket.send(AxumMessage::Pong(payload)).await;
+                    }
+                    Ok(AxumMessage::Close(_)) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        })
+    }
+
+    async fn mock_trusted_relay_device_register(
+        State(state): State<MockTrustedRelayState>,
+        headers: HeaderMap,
+        Json(request): Json<TestRelayDeviceRegistration>,
+    ) -> StatusCode {
+        let daemon_token = headers
+            .get("x-termd-relay-daemon-token")
+            .and_then(|value| value.to_str().ok());
+        if daemon_token != Some("daemon-secret-for-reregister") {
+            return StatusCode::UNAUTHORIZED;
+        }
+        if state.registrations.send(request).is_err() {
+            return StatusCode::INTERNAL_SERVER_ERROR;
+        }
+        StatusCode::OK
     }
 
     async fn handle_raw_daemon_mux_ignores_ping_then_closes_after_pings(
