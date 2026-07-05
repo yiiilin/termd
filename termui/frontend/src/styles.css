@@ -2855,6 +2855,19 @@ label {
 }
 
 @media (max-width: 760px) {
+  /* 中文注释：移动端终端应占满当前 visual viewport，避免地址栏/软键盘/页面缩放后
+     body 留出可滚动空白，导致 workspace 看起来没有铺满屏幕。 */
+  html,
+  body,
+  #root {
+    width: 100vw;
+    height: 100dvh;
+    min-width: 0;
+    overflow: hidden;
+    overscroll-behavior: none;
+    touch-action: manipulation;
+  }
+
   .admin-shell {
     height: 100dvh;
     grid-template-rows: 48px minmax(0, 1fr) 30px;
@@ -2891,10 +2904,11 @@ label {
   }
 
   .app-shell {
-    position: relative;
+    position: fixed;
+    left: var(--termd-visual-viewport-offset-left, 0px);
     top: var(--termd-visual-viewport-offset-top, 0px);
-    width: min(100vw, 100dvw);
-    max-width: min(100vw, 100dvw);
+    width: var(--termd-layout-viewport-width, var(--termd-visual-viewport-width, 100dvw));
+    max-width: none;
     height: var(--termd-layout-viewport-height, var(--termd-visual-viewport-height, 100dvh));
     grid-template-columns: 1fr;
     grid-template-rows: auto minmax(0, 1fr);

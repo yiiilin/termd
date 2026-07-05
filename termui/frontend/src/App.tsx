@@ -734,8 +734,11 @@ export default function App() {
   const mobileKeyboardOpen = mobileTerminalInputMode && activeSurface === "workspace" && visualViewportMetrics.keyboardOpen;
   const appShellStyle = isMobileLayout
     ? ({
+        "--termd-layout-viewport-width": `${visualViewportMetrics.width}px`,
+        "--termd-visual-viewport-width": `${visualViewportMetrics.width}px`,
         "--termd-layout-viewport-height": `${visualViewportMetrics.height}px`,
         "--termd-visual-viewport-height": `${visualViewportMetrics.height}px`,
+        "--termd-visual-viewport-offset-left": `${visualViewportMetrics.offsetLeft}px`,
         "--termd-visual-viewport-offset-top": `${visualViewportMetrics.offsetTop}px`,
         "--termd-visual-viewport-keyboard-inset": `${visualViewportMetrics.keyboardInset}px`,
       } as CSSProperties)
@@ -1512,6 +1515,7 @@ export default function App() {
     const requestServerId = activeServer?.server_id;
     setError(undefined);
     setStatus("listing");
+    const isBootstrapRefresh = Boolean(options.bootstrap);
     const requestOrderGeneration = sessionOrderGenerationRef.current;
     const requestCreateGeneration = sessionCreateRequestIdRef.current;
     let sessionListApplied = false;
@@ -1650,12 +1654,13 @@ export default function App() {
           attachClientRef.current ||
           statusRef.current === "ready" ||
           selectedSessionIdRef.current !== undefined ||
-          sessionsRef.current.length === 0
+          (!isBootstrapRefresh && sessionsRef.current.length === 0)
         )
       ) {
         // 中文注释：一旦用户已经稳定停在 workspace，后续 session.list 就退化成旁路刷新，
-        // 即使当前是空工作台或只剩移动端的 session 面板刷新也是如此。relay/HTTP 控制面
+        // 即使当前是空工作台或只剩移动端的 session 面板刷新也是如此。relay/control 链路
         // 的瞬时失败只能让这一次刷新作废，不能把页面切回 admin 或升级成全局断线。
+        // 但 bootstrap 的首个列表请求不是旁路刷新；失败时必须暴露错误，避免假空列表。
         setStatus(resolveWorkspaceConnectionStatus());
         return;
       }
@@ -2144,6 +2149,11 @@ export default function App() {
         void loadSessionGit(sessionId);
         void refreshDaemonClients();
       } catch (caught) {
+        if (isIgnoredClosingSessionError(sessionId, caught)) {
+          // 中文注释：用户可能在自动 attach 尚未完成时关闭同一个 session；
+          // daemon 若先删掉它，晚到的 attach session_not_found 只说明关闭已经生效。
+          return;
+        }
         if (
           attachRequestIdRef.current === attachRequestId &&
           attachingSessionIdRef.current === sessionId
@@ -2181,6 +2191,7 @@ export default function App() {
       claimAttachClient,
       disconnectAttach,
       flushPendingTerminalInput,
+      isIgnoredClosingSessionError,
       loadSessionFiles,
       loadSessionGit,
       refreshDaemonClients,
@@ -2644,29 +2655,7 @@ export default function App() {
       const wasAttached = attachedSessionRef.current === sessionId;
       const wasSelected = selectedSessionId === sessionId;
       let sessionClient: { client: DirectClient; ownsClient: boolean } | undefined;
-      try {
-        // 中文注释：关闭当前 attach session 时先声明“这是一次有意断开”。
-        // 这样旧 terminal WebSocket 若在 daemon close 收尾期间报 connection_closed，
-        // receive loop / reconnect 都会把它当作预期行为，而不是重新 attach 回已删除 session。
-        if (wasAttached) {
-          userDetachedRef.current = true;
-        }
-        cancelScheduledAttachSwitch();
-        if (attachingSessionIdRef.current === sessionId) {
-          attachRequestIdRef.current += 1;
-          attachingSessionIdRef.current = undefined;
-        }
-        if (pendingTerminalAttachSessionRef.current === sessionId) {
-          pendingTerminalAttachSessionRef.current = undefined;
-        }
-        sessionClient = await resolveSessionScopedClient(sessionId);
-        try {
-          await sessionClient.client.closeSession(sessionId);
-        } catch (caught) {
-          if (!isIgnoredClosingSessionError(sessionId, caught)) {
-            throw caught;
-          }
-        }
+      const confirmClosedLocally = () => {
         if (wasAttached) {
           // 先让 daemon 删除 session，再收口本地 attach，避免旧 cursor / resize 继续往已删除 session 发送。
           disconnectAttach();
@@ -2698,7 +2687,36 @@ export default function App() {
         setMobileMenuOpen(false);
         closedSessionIdsRef.current.add(sessionId);
         void refreshDaemonClients();
+      };
+      try {
+        // 中文注释：关闭当前 attach session 时先声明“这是一次有意断开”。
+        // 这样旧 terminal WebSocket 若在 daemon close 收尾期间报 connection_closed，
+        // receive loop / reconnect 都会把它当作预期行为，而不是重新 attach 回已删除 session。
+        if (wasAttached) {
+          userDetachedRef.current = true;
+        }
+        cancelScheduledAttachSwitch();
+        if (attachingSessionIdRef.current === sessionId) {
+          attachRequestIdRef.current += 1;
+          attachingSessionIdRef.current = undefined;
+        }
+        if (pendingTerminalAttachSessionRef.current === sessionId) {
+          pendingTerminalAttachSessionRef.current = undefined;
+        }
+        sessionClient = await resolveSessionScopedClient(sessionId);
+        try {
+          await sessionClient.client.closeSession(sessionId);
+        } catch (caught) {
+          if (!isIgnoredClosingSessionError(sessionId, caught)) {
+            throw caught;
+          }
+        }
+        confirmClosedLocally();
       } catch (caught) {
+        if (isIgnoredClosingSessionError(sessionId, caught)) {
+          confirmClosedLocally();
+          return;
+        }
         if (wasAttached) {
           userDetachedRef.current = false;
         }
@@ -4272,18 +4290,19 @@ function useSystemTheme(): "dark" | "light" {
   return systemTheme;
 }
 
-function useVisualViewportMetrics(enabled: boolean): { width: number; height: number; offsetTop: number; keyboardInset: number; keyboardOpen: boolean } {
+function useVisualViewportMetrics(enabled: boolean): { width: number; height: number; offsetLeft: number; offsetTop: number; keyboardInset: number; keyboardOpen: boolean } {
   const metricsFromWindow = () => {
     if (typeof window === "undefined") {
-      return { width: 0, height: 0, offsetTop: 0, keyboardInset: 0, keyboardOpen: false };
+      return { width: 0, height: 0, offsetLeft: 0, offsetTop: 0, keyboardInset: 0, keyboardOpen: false };
     }
     const viewport = window.visualViewport;
     const width = Math.round(viewport?.width ?? window.innerWidth);
     const height = Math.round(viewport?.height ?? window.innerHeight);
+    const offsetLeft = Math.round(viewport?.offsetLeft ?? 0);
     const offsetTop = Math.round(viewport?.offsetTop ?? 0);
     const keyboardInset = Math.max(0, Math.round(window.innerHeight - height - offsetTop));
     // 地址栏收缩也会改变 visualViewport，高度差超过常见工具栏后才按软键盘处理。
-    return { width, height, offsetTop, keyboardInset, keyboardOpen: keyboardInset >= 80 };
+    return { width, height, offsetLeft, offsetTop, keyboardInset, keyboardOpen: keyboardInset >= 80 };
   };
   const [metrics, setMetrics] = useState(metricsFromWindow);
 
@@ -4297,6 +4316,7 @@ function useVisualViewportMetrics(enabled: boolean): { width: number; height: nu
         const next = metricsFromWindow();
         return current.width === next.width &&
           current.height === next.height &&
+          current.offsetLeft === next.offsetLeft &&
           current.offsetTop === next.offsetTop &&
           current.keyboardInset === next.keyboardInset &&
           current.keyboardOpen === next.keyboardOpen
@@ -4319,6 +4339,7 @@ function useVisualViewportMetrics(enabled: boolean): { width: number; height: nu
     : {
         width: typeof window === "undefined" ? 0 : window.innerWidth,
         height: typeof window === "undefined" ? 0 : window.innerHeight,
+        offsetLeft: 0,
         offsetTop: 0,
         keyboardInset: 0,
         keyboardOpen: false,
@@ -4414,6 +4435,21 @@ function shouldPreferPageWsUrl(
     // 页面来源和保存地址是不同主机时，通常表示用户从新的 relay Web 入口打开了旧状态。
     if (!isLoopbackHost(parsed.hostname) && parsed.hostname !== page.hostname) {
       return true;
+    }
+    if (
+      page.protocol === "https:" &&
+      !isLoopbackHost(parsed.hostname) &&
+      parsed.hostname === page.hostname
+    ) {
+      const pageWsUrl = new URL(defaultWsUrlFromPage({
+        protocol: page.protocol,
+        host: page.host,
+        pathname: page.pathname,
+      }));
+      // 中文注释：HTTPS relay Web 是用户当前真实入口。同 hostname 但端口或公开 path
+      // 已变化时，继续优先 IndexedDB 里的旧 URL 会让重新配对后仍连到旧 relay。
+      return parsed.host !== pageWsUrl.host ||
+        parsed.pathname.replace(/\/+$/, "") !== pageWsUrl.pathname.replace(/\/+$/, "");
     }
     return false;
   } catch {

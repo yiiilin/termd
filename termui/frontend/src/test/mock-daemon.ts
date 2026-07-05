@@ -368,7 +368,7 @@ export class MockDaemon {
 
   closeNextSessionListRequests(count = 1): void {
     // 中文注释：真实 relay/浏览器里 workspace 的手动/后台 session.list 也可能瞬时断开。
-    // 这里用 transport close 覆盖“已有 workspace 时不能被升级成全局断线”的回归。
+    // HTTP control 走 fetch abort；WebSocket request 走 packet error，避免测试里产生未处理异常。
     this.closeSessionListRequests = Math.max(0, Math.floor(count));
   }
 
@@ -1058,8 +1058,12 @@ export class MockDaemon {
       case "session.list": {
         if (this.closeSessionListRequests > 0) {
           this.closeSessionListRequests -= 1;
-          this.throwIfHttpAborted(connection);
-          throw new TypeError("Failed to fetch");
+          if (connection.httpPackets) {
+            this.throwIfHttpAborted(connection);
+            throw new TypeError("Failed to fetch");
+          }
+          this.sendPacketError(connection, packet, "connection_closed", "mock session list closed");
+          return true;
         }
         const queued = this.queuedSessionListResponses.shift();
         if (queued?.delayMs) {

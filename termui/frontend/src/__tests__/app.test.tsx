@@ -618,17 +618,17 @@ async function expectDaemonUrlInAdmin(user: ReturnType<typeof userEvent.setup>, 
   await waitFor(() => expect(within(admin).getAllByText(url).length).toBeGreaterThan(0));
 }
 
-async function waitForWorkspaceSession(name?: string): Promise<void> {
+async function waitForWorkspaceSession(name?: string, options: { timeout?: number } = {}): Promise<void> {
   await waitForWorkspaceReady();
   if (name) {
-    await waitFor(() => expect(screen.queryAllByText(name).length).toBeGreaterThan(0));
+    await waitFor(() => expect(screen.queryAllByText(name).length).toBeGreaterThan(0), options);
     return;
   }
   await waitFor(() => {
     const sessionRows = document.querySelectorAll(".session-row").length;
     const toolbarName = document.querySelector<HTMLElement>(".toolbar-title span")?.textContent?.trim();
     expect(sessionRows > 0 || Boolean(toolbarName && toolbarName !== "No session")).toBe(true);
-  });
+  }, options);
 }
 
 async function waitForWorkspaceReady(): Promise<void> {
@@ -674,7 +674,7 @@ async function exerciseSupervisorBackedWebLifecycle(
   },
 ): Promise<void> {
   const sessionListRequests = () =>
-    daemon.receivedHttpRequests.filter((request) => request.path === "/api/control/session/list");
+    daemon.receivedPackets.filter((packet) => packet.kind === "request" && packet.method === "session.list");
   const terminalCreateStreams = () =>
     daemon.receivedPackets.filter((packet) => packet.kind === "stream_open" && packet.method === "terminal.create");
   const terminalAttachStreams = () =>
@@ -1163,13 +1163,13 @@ describe("termui web 工作台", () => {
           entry.packet.method === method,
       );
     // 中文注释：attach 完成后，terminal 继续走当前 terminal WebSocket；
-    // 普通 metadata / session RPC 已迁到 HTTP 控制面，不应再落回 terminal packet request。
+    // session.list 在已 attach 状态复用 terminal 连接，daemon.status/files/git 继续走 HTTP 控制面。
     expect(requestOnTerminalConnection("daemon.status")).toBe(false);
-    expect(requestOnTerminalConnection("session.list")).toBe(false);
+    expect(requestOnTerminalConnection("session.list")).toBe(true);
     expect(requestOnTerminalConnection("session.files")).toBe(false);
     expect(requestOnTerminalConnection("session.git")).toBe(false);
     expect(daemon.receivedHttpRequests.some((request) => request.path === "/api/control/daemon/status")).toBe(true);
-    expect(daemon.receivedHttpRequests.some((request) => request.path === "/api/control/session/list")).toBe(true);
+    expect(daemon.receivedPackets.some((packet) => packet.kind === "request" && packet.method === "session.list")).toBe(true);
     await waitFor(() => expect(daemon.activeConnectionCount()).toBeGreaterThan(0));
     expect(daemon.pingMessages).toBeGreaterThan(0);
   });
@@ -1884,8 +1884,10 @@ describe("termui web 工作台", () => {
   it("移动端状态栏和快捷输入栏固定占满父容器，避免内容变化带动宽度", () => {
     const css = readFileSync(resolve(process.cwd(), "src/styles.css"), "utf8");
 
-    expect(css).toContain("width: min(100vw, 100dvw);");
-    expect(css).toContain("max-width: min(100vw, 100dvw);");
+    expect(css).toContain("position: fixed;\n    left: var(--termd-visual-viewport-offset-left, 0px);");
+    expect(css).toContain("width: var(--termd-layout-viewport-width, var(--termd-visual-viewport-width, 100dvw));");
+    expect(css).toContain("height: var(--termd-layout-viewport-height, var(--termd-visual-viewport-height, 100dvh));");
+    expect(css).toContain("max-width: none;");
     expect(css).toContain(".daemon-status-strip {\n    width: 100%;");
     expect(css).toContain(".daemon-status-strip .daemon-status-grid {\n    width: 100%;");
     expect(css).toContain("display: grid;\n    grid-template-columns:\n      minmax(58px, 0.6fr)");
@@ -2878,7 +2880,7 @@ describe("termui web 工作台", () => {
     await screen.findByText(/termd-e2e-ready/);
 
     const sessionListRequests = () =>
-      daemon.receivedHttpRequests.filter((request) => request.path === "/api/control/session/list").length;
+      daemon.receivedPackets.filter((packet) => packet.kind === "request" && packet.method === "session.list").length;
     await new Promise((resolve) => window.setTimeout(resolve, 150));
     const beforePull = sessionListRequests();
     const title = screen.getByRole("button", { name: "Open session list from title" });
@@ -2935,7 +2937,7 @@ describe("termui web 工作台", () => {
       render(<App />);
 
       await pairWithInvite(user, daemon);
-      await waitForWorkspaceSession();
+      await waitForWorkspaceSession(DEFAULT_SESSION_NAME, { timeout: 5000 });
       await screen.findByText(/termd-e2e-ready/);
 
       const terminalInput = await waitFor(() => {
@@ -3186,7 +3188,7 @@ describe("termui web 工作台", () => {
 
     try {
       await pairWithInvite(user, daemon);
-      await waitForWorkspaceSession();
+      await waitForWorkspaceSession(DEFAULT_SESSION_NAME, { timeout: 5000 });
 
       await user.click(screen.getByRole("button", { name: "Daemons" }));
       await setConnectionUrl(user, secondDaemon.url);
@@ -3194,7 +3196,7 @@ describe("termui web 工作台", () => {
         target: { value: pairingInviteCode(secondDaemon, "second-token") },
       });
       await user.click(screen.getByRole("button", { name: "Pair" }));
-      await waitForWorkspaceSession("No session");
+      await waitForWorkspaceSession("No session", { timeout: 5000 });
 
       await user.click(screen.getByRole("button", { name: "Daemons" }));
       const manager = await screen.findByLabelText("daemon manager");
@@ -3245,14 +3247,14 @@ describe("termui web 工作台", () => {
         target: { value: pairingInviteCode(secondDaemon, "second-token") },
       });
       await user.click(screen.getByRole("button", { name: "Pair" }));
-      await waitForWorkspaceSession("No session");
+      await waitForWorkspaceSession("No session", { timeout: 5000 });
 
       await user.click(screen.getByRole("button", { name: "Daemons" }));
       const initialManager = await screen.findByLabelText("daemon manager");
       await user.click(within(initialManager).getByRole("button", { name: /Use daemon Daemon 1/ }));
       await waitFor(() => expect(screen.getByLabelText("selected daemon")).toHaveTextContent(daemon.url));
       await user.click(screen.getByRole("button", { name: "Open workspace" }));
-      await waitForWorkspaceSession();
+      await waitForWorkspaceSession(DEFAULT_SESSION_NAME, { timeout: 5000 });
 
       await secondDaemon.stop();
       secondStopped = true;
@@ -3269,8 +3271,9 @@ describe("termui web 工作台", () => {
       await user.click(within(recoveredManager).getByRole("button", { name: /Use daemon Daemon 1/ }));
       await waitFor(() => expect(screen.getByLabelText("selected daemon")).toHaveTextContent(daemon.url));
       await user.click(screen.getByRole("button", { name: "Open workspace" }));
-      await waitForWorkspaceSession();
-      await waitForWorkspaceSession();
+      // 中文注释：full Vitest 下旧 daemon 的失败探测和可用 daemon 的 bootstrap
+      // 可能交错；这里等待具体 session 名，避免把切回后的短暂空列表当成最终状态。
+      await waitForWorkspaceSession(DEFAULT_SESSION_NAME, { timeout: 5000 });
     } finally {
       if (!secondStopped) {
         await secondDaemon.stop();
@@ -3671,7 +3674,10 @@ describe("termui web 工作台", () => {
     // session 连接建立阶段不能继续使用普通 RPC 预算，否则 relay 正常但 Web 会自己关闭半开连接。
     daemon.delayNextRouteReady(APP_CONNECTION_TIMEOUT_MS + 500);
     await waitFor(
-      () => expect(daemon.receivedHttpRequests.filter((request) => request.path === "/api/control/session/list").length).toBeGreaterThan(0),
+      () =>
+        expect(
+          daemon.receivedPackets.filter((packet) => packet.kind === "request" && packet.method === "session.list").length,
+        ).toBeGreaterThan(0),
       { timeout: APP_CONNECTION_TIMEOUT_MS + 4000 },
     );
     expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
@@ -4094,14 +4100,14 @@ describe("termui web 工作台", () => {
     await waitFor(() => expect(visibleSessionNames()).toHaveLength(1));
     const createdName = visibleSessionNames()[0];
     const sessionListRequestsBeforeStaleRefresh =
-      daemon.receivedHttpRequests.filter((request) => request.path === "/api/control/session/list").length;
+      daemon.receivedPackets.filter((packet) => packet.kind === "request" && packet.method === "session.list").length;
 
     daemon.queueSessionListResponse([], 0);
     // 中文注释：桌面侧栏没有手动刷新按钮；这里用真实的后台轮询触发一次旧空列表响应。
     await waitFor(
       () =>
         expect(
-          daemon.receivedHttpRequests.filter((request) => request.path === "/api/control/session/list").length,
+          daemon.receivedPackets.filter((packet) => packet.kind === "request" && packet.method === "session.list").length,
         ).toBeGreaterThan(sessionListRequestsBeforeStaleRefresh),
       { timeout: 2600 },
     );
@@ -8231,6 +8237,27 @@ describe("termui web 工作台", () => {
     ).toEqual([
       "wss://termd.yiln.de/ws?relay_token=abc",
       "wss://old-relay.example/ws?relay_token=abc",
+    ]);
+  });
+
+  it("HTTPS relay 页面同 hostname 但端口或路径变化时优先使用当前页面 /ws", () => {
+    const serverId = "00000000-0000-0000-0000-000000000123";
+    const relayPage = {
+      protocol: "https:",
+      host: "termd.yiln.de",
+      hostname: "termd.yiln.de",
+      pathname: "/relay/",
+    };
+
+    expect(
+      knownServerWsUrlCandidates(
+        "wss://termd.yiln.de:9443/ws/00000000-0000-0000-0000-000000000123/client?relay_token=abc",
+        serverId,
+        relayPage,
+      ),
+    ).toEqual([
+      "wss://termd.yiln.de/relay/ws?relay_token=abc",
+      "wss://termd.yiln.de:9443/ws?relay_token=abc",
     ]);
   });
 

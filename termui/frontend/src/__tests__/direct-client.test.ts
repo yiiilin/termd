@@ -378,7 +378,7 @@ describe("DirectClient", () => {
     expect(attached.session_id).toBe(list.sessions[0].session_id);
   });
 
-  it("pairing 成功并提供完整 device 后，同一连接的 session.list 走 HTTP 控制面", async () => {
+  it("pairing 成功并提供完整 device 后，同一连接的 session.list 继续走 WebSocket", async () => {
     const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000344");
     const client = await connectDevice(device.device_id);
 
@@ -386,8 +386,8 @@ describe("DirectClient", () => {
     const list = await client.listSessions();
 
     expect(list.sessions).toHaveLength(1);
-    expect(daemon.receivedHttpRequests.some((request) => request.path === "/api/control/session/list")).toBe(true);
-    expect(daemon.receivedPackets.some((packet) => packet.method === "session.list")).toBe(false);
+    expect(daemon.receivedHttpRequests.some((request) => request.path === "/api/control/session/list")).toBe(false);
+    expect(daemon.receivedPackets.some((packet) => packet.method === "session.list")).toBe(true);
     client.close();
   });
 
@@ -461,7 +461,7 @@ describe("DirectClient", () => {
 
     const tokenState = client.getSessionToken() as { token: string; expires_at_ms: number };
     tokenState.expires_at_ms = 0;
-    await client.listSessions();
+    await client.getDaemonStatus();
 
     const sessionTokenRequests = daemon.receivedPackets.filter((packet) => packet.method === "auth.session_token");
     expect(sessionTokenRequests).toHaveLength(initialSessionTokenRequests + 1);
@@ -473,12 +473,12 @@ describe("DirectClient", () => {
     const issuedToken = client.getSessionToken() as { token: string; expires_at_ms: number };
     daemon.expireSessionToken(issuedToken.token, 0);
 
-    const list = await client.listSessions();
+    const status = await client.getDaemonStatus();
 
-    expect(list.sessions).toHaveLength(1);
+    expect(status.host_name).toBe("mock-daemon");
     const sessionTokenRequests = daemon.receivedPackets.filter((packet) => packet.method === "auth.session_token");
     expect(sessionTokenRequests.length).toBeGreaterThanOrEqual(2);
-    expect(daemon.receivedHttpRequests.some((request) => request.path === "/api/control/session/list")).toBe(true);
+    expect(daemon.receivedHttpRequests.some((request) => request.path === "/api/control/daemon/status")).toBe(true);
     client.close();
   });
 
@@ -516,7 +516,7 @@ describe("DirectClient", () => {
     client.close();
   });
 
-  it("session.list 和 daemon.status 认证后走 HTTP 控制面", async () => {
+  it("session.list 走 WebSocket，daemon.status 认证后走 HTTP 控制面", async () => {
     const { client } = await authenticatedClient("00000000-0000-0000-0000-000000000338");
 
     const list = await client.listSessions();
@@ -525,10 +525,9 @@ describe("DirectClient", () => {
     expect(list.sessions).toHaveLength(1);
     expect(status.host_name).toBe("mock-daemon");
     expect(daemon.receivedHttpRequests.map((request) => request.path)).toEqual([
-      "/api/control/session/list",
       "/api/control/daemon/status",
     ]);
-    expect(daemon.receivedPackets.some((packet) => packet.method === "session.list")).toBe(false);
+    expect(daemon.receivedPackets.some((packet) => packet.method === "session.list")).toBe(true);
     expect(daemon.receivedPackets.some((packet) => packet.method === "daemon.status")).toBe(false);
     client.close();
   });
@@ -743,9 +742,9 @@ describe("DirectClient", () => {
           name: "protocol_timeout",
           fields: expect.objectContaining({
             layer: "client",
-            phase: "http_request",
-            transport: "http",
-            path: "/api/control/session/list",
+            phase: "request",
+            transport: "websocket",
+            method: "session.list",
             timeout_code: "response_timeout",
             timeout_ms: 30,
           }),

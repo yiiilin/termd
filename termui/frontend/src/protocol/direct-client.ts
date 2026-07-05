@@ -246,7 +246,6 @@ const FILE_TRANSFER_WEBSOCKET_COMPAT_MAX_BYTES = 16 * 1024 * 1024;
 // 大文件必须走 HTTP E2EE 或 binary stream，不能再整包 base64 进入 RPC。
 const SESSION_FILE_RPC_MAX_BYTES = 1024 * 1024;
 const HTTP_CONTROL_METHODS = new Set([
-  "session.list",
   "daemon.clients",
   "daemon.client_forget",
   "daemon.status",
@@ -459,9 +458,9 @@ export class DirectClient {
   }
 
   async listSessions(timeoutMs = this.timeoutMs): Promise<SessionListResultPayload> {
-    // 中文注释：session.list 在 relay bootstrap/recovery 路径里经常和 route/E2EE/auth、
-    // daemon mux/data pipe 配对同处一条用户可见关键路径。调用方可按场景显式放宽预算，
-    // 但普通短请求默认值仍保持不变。
+    // 中文注释：session.list 是移动端/relay 首屏关键元数据，必须复用已认证 WebSocket。
+    // 如果走 HTTP tunnel，它会和 daemon.status、文件面板等并发请求争抢 relay data pipe，
+    // data pipe 配对超时后 UI 容易退化成“空列表但无报错”的假空态。
     return this.request<SessionListResultPayload>("session.list", {}, timeoutMs);
   }
 

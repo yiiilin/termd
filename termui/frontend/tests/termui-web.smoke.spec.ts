@@ -331,7 +331,7 @@ test("pair、list、attach 的浏览器 smoke", async ({ page }, testInfo: TestI
     if (testInfo.project.name === "mobile-chrome") {
       await expect(page.getByRole("navigation", { name: "mobile workspace actions" })).toHaveCount(0);
       const sessionListRequests = () =>
-        daemon.receivedHttpRequests.filter((request) => request.path === "/api/control/session/list").length;
+        daemon.receivedPackets.filter((packet) => packet.kind === "request" && packet.method === "session.list").length;
       const beforeTitlePull = sessionListRequests();
       const titleButton = page.getByRole("button", { name: "Open session list from title" });
       // 中文注释：移动端标题栏下拉刷新复用 session.list，不打开 session 面板。

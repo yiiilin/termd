@@ -39,16 +39,8 @@ test.beforeEach(async ({ page }) => {
 test("浏览器通过真实 relay 连接 daemon 完成 pairing 和 session list", async ({ page }, testInfo) => {
   test.setTimeout(60_000);
   const fixture = await startRealRelayFixture();
-  const controlRequests: string[] = [];
-  const relayHttpOrigin = new URL(fixture.relayWebUrl).origin;
 
   try {
-    page.on("request", (request) => {
-      const url = request.url();
-      if (url.includes("/api/control/")) {
-        controlRequests.push(url);
-      }
-    });
     await page.goto("/");
     await page.getByLabel("WS URL").fill(fixture.relayClientUrl);
     await page.getByLabel("Pairing token").fill(pairingInviteCode(fixture));
@@ -92,12 +84,6 @@ test("浏览器通过真实 relay 连接 daemon 完成 pairing 和 session list"
     }
 
     await expect(page.getByLabel("sessions").getByText("No sessions")).toBeVisible();
-    await expect
-      .poll(() => controlRequests.some((url) => {
-        const parsed = new URL(url);
-        return parsed.origin === relayHttpOrigin && parsed.pathname === "/api/control/session/list";
-      }))
-      .toBe(true);
 
     const localStorageText = await page.evaluate(() => JSON.stringify(window.localStorage));
     expect(localStorageText).not.toContain(fixture.token);
