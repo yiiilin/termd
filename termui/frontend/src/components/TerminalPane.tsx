@@ -800,7 +800,7 @@ export function TerminalPane(props: TerminalPaneProps) {
     frameRef.current?.style.removeProperty("height");
     frameRef.current?.style.removeProperty("min-height");
   };
-  const visibleRowsForMobileCursorCenter = (terminal: TerminalRendererTerminal) => {
+  const visibleRowsForMobileViewport = (terminal: TerminalRendererTerminal) => {
     const proposedRows = fitRef.current?.proposeDimensions?.()?.rows;
     if (
       proposedRows !== undefined &&
@@ -809,8 +809,8 @@ export function TerminalPane(props: TerminalPaneProps) {
       proposedRows < terminal.rows
     ) {
       // 中文注释：移动端软键盘打开时，我们故意不 resize xterm/session rows，
-      // 但 fit proposal 仍能代表键盘上方真正可见的终端行数。光标居中应使用
-      // 这个本地可视高度，而不是仍用完整 PTY 网格高度。
+      // 但 fit proposal 仍能代表键盘上方真正可见的终端行数。本地滚动窗口应使用
+      // 这个可视高度，而不是仍用完整 PTY 网格高度。
       const visibleRows = clampNumber(Math.floor(proposedRows), 1, Math.max(1, terminal.rows));
       mobileCursorVisibleRowsRef.current = visibleRows;
       return visibleRows;
@@ -825,11 +825,7 @@ export function TerminalPane(props: TerminalPaneProps) {
     mobileCursorVisibleRowsRef.current = visibleRows;
     return visibleRows;
   };
-  const syncMobileCursorViewportWindow = (
-    terminal: TerminalRendererTerminal,
-    visibleRows: number,
-    cursorAbsoluteLine: number,
-  ) => {
+  const syncMobileBottomViewportWindow = (terminal: TerminalRendererTerminal, visibleRows: number) => {
     const scrollport = scrollportRef.current;
     const canvas = canvasRef.current;
     const frame = frameRef.current;
@@ -852,56 +848,38 @@ export function TerminalPane(props: TerminalPaneProps) {
     frame.style.height = `${fullGridHeight}px`;
     frame.style.minHeight = `${fullGridHeight}px`;
 
-    const nextScrollState = rendererRef.current?.scrollState(terminal);
-    const viewportY = nextScrollState?.viewportY ?? terminal.buffer?.active?.viewportY ?? 0;
-    const cursorViewportRow = clampNumber(cursorAbsoluteLine - viewportY, 0, Math.max(0, terminal.rows - 1));
-    const cursorAtTerminalBottom = cursorViewportRow >= Math.max(0, terminal.rows - 1 - TERMINAL_BOTTOM_EPSILON);
-    const bottomSpacerHeight = cursorAtTerminalBottom
-      ? 0
-      : Math.ceil(rowHeight * Math.floor(visibleRows / 2));
-    const scrollableHeight = fullGridHeight + bottomSpacerHeight;
-    canvas.style.height = `${scrollableHeight}px`;
-    canvas.style.minHeight = `${scrollableHeight}px`;
+    canvas.style.height = `${fullGridHeight}px`;
+    canvas.style.minHeight = `${fullGridHeight}px`;
 
-    // 中文注释：中间行继续使用居中策略；但光标已经在终端网格底部时，居中会制造
-    // 半屏底部空白。此时只把最后一屏裁剪到键盘上方，避免输入行被额外抬到中线。
-    const targetScrollTop = cursorAtTerminalBottom
-      ? Math.max(0, Math.round((cursorViewportRow + 1 - visibleRows) * rowHeight))
-      : Math.max(0, Math.round((cursorViewportRow - Math.floor(visibleRows / 2)) * rowHeight));
+    // 中文注释：快捷键栏贴在可视 viewport 底部；这里始终把完整 PTY 网格的底边贴到
+    // 快捷键栏上方，不再追加半屏 spacer 把输入点抬到键盘上方中线。
     const maxScrollTop = Math.max(
-      (Math.max(scrollport.scrollHeight, scrollableHeight) || scrollableHeight) - scrollport.clientHeight,
+      (Math.max(scrollport.scrollHeight, fullGridHeight) || fullGridHeight) - scrollport.clientHeight,
       0,
     );
-    scrollport.scrollTop = Math.min(targetScrollTop, maxScrollTop);
+    scrollport.scrollTop = maxScrollTop;
   };
-  const centerViewportOnCursor = (terminal = terminalRef.current) => {
+  const alignMobileViewportToTerminalBottom = (terminal = terminalRef.current) => {
     if (!terminal || !mobileInputModeRef.current || !mobileKeyboardOpenRef.current) {
       resetMobileCursorViewportWindow();
       return false;
     }
     const scrollState = rendererRef.current?.scrollState(terminal);
-    const activeBuffer = terminal.buffer?.active;
-    if (!scrollState || !activeBuffer || terminal.rows <= 0) {
+    if (!scrollState || terminal.rows <= 0) {
       return false;
     }
-    // 中文注释：cursorY 是当前 viewport 内的相对行号，不是 buffer 绝对行号。
-    // 要把视图居中到输入光标，必须先把它换算成 buffer 绝对行号，
-    // 再把这个绝对行号挪到屏幕中线附近。
-    const cursorRow = Math.max(0, activeBuffer.cursorY);
-    const cursorAbsoluteLine = activeBuffer.baseY + cursorRow;
-    const visibleRows = visibleRowsForMobileCursorCenter(terminal);
-    const targetViewportY = clampNumber(
-      cursorAbsoluteLine - Math.floor(visibleRows / 2),
-      0,
-      scrollState.baseY,
-    );
+    // 中文注释：键盘打开后目标是“终端底部贴住快捷键上方”，不是追随隐藏
+    // textarea/输入光标。内部 xterm viewport 保持在 buffer 底部，外层 scrollport
+    // 再裁出最后一屏，避免输入焦点被推到键盘上方中线。
+    const visibleRows = visibleRowsForMobileViewport(terminal);
+    const targetViewportY = scrollState.baseY;
     if (Math.abs(scrollState.viewportY - targetViewportY) < TERMINAL_BOTTOM_EPSILON) {
-      syncMobileCursorViewportWindow(terminal, visibleRows, cursorAbsoluteLine);
+      syncMobileBottomViewportWindow(terminal, visibleRows);
       return false;
     }
     terminal.scrollToLine(targetViewportY);
     syncTerminalInputAnchor(terminal, "scroll");
-    syncMobileCursorViewportWindow(terminal, visibleRows, cursorAbsoluteLine);
+    syncMobileBottomViewportWindow(terminal, visibleRows);
     return true;
   };
   const scheduleScrollToBottom = (generation: number, passes = 2) => {
@@ -936,7 +914,7 @@ export function TerminalPane(props: TerminalPaneProps) {
       return;
     }
     if (mobileInputModeRef.current && mobileKeyboardOpenRef.current) {
-      centerViewportOnCursor();
+      alignMobileViewportToTerminalBottom();
       return;
     }
     if (wasPinnedToBottom) {
@@ -1952,7 +1930,7 @@ export function TerminalPane(props: TerminalPaneProps) {
         col: activeBuffer ? activeBuffer.cursorX + 1 : 1,
         focused: focusedRef.current,
       });
-      centerViewportOnCursor(terminal);
+      alignMobileViewportToTerminalBottom(terminal);
     });
   };
 
@@ -3315,7 +3293,7 @@ export function TerminalPane(props: TerminalPaneProps) {
         // xterm 重新锚定到新网格，导致移动浏览器认为输入目标失稳而收起键盘。
         applyFontSize(terminal, currentTerminalFontSize());
         terminal.refresh(0, Math.max(0, terminal.rows - 1));
-        centerViewportOnCursor(terminal);
+        alignMobileViewportToTerminalBottom(terminal);
         syncTerminalInputAnchor(terminal, "refresh");
         queueCursorReport({ immediate: true });
         return;
@@ -3506,6 +3484,8 @@ export function TerminalPane(props: TerminalPaneProps) {
       onTerminalOutputRendered: noteTerminalOutputRendered,
       onTerminalOutputIdle: noteTerminalOutputIdle,
       onSnapshotRedrawBegin: beginSnapshotRedrawMask,
+      hasTerminalInputFocus: terminalInputHasDomFocus,
+      restoreTerminalInputFocus: () => focusTerminalInputSink(terminal),
       shouldScrollSnapshotToBottom: (item) => !(item.revealHistory || terminalRevealHistoryAfterSnapshotRef.current),
       // 中文注释：snapshot 会先按 daemon 生成时的尺寸重放历史屏幕；重放完成后必须
       // 再按当前浏览器容器 fit 一次，否则后续输出会沿旧 24 行滚动，最终悬在上半截。
@@ -3886,10 +3866,16 @@ export function TerminalPane(props: TerminalPaneProps) {
     // 中文注释：同一 session 的 full snapshot / resync 不能再销毁整棵 xterm DOM。
     // 否则 helper textarea 会被替换，浏览器会把输入焦点直接打掉，表现成“闪一下再失焦”。
     // 这里原地 reset，并推进 writer generation 让旧 write callback 全部失效。
+    const shouldRestoreTerminalFocusAfterReset = terminalInputHasDomFocus();
     resetWriterState();
     invalidateBottomScrollFollow();
     resetMobileCursorViewportWindow();
     terminal.reset();
+    if (shouldRestoreTerminalFocusAfterReset) {
+      // 中文注释：部分浏览器/renderer reset 会让同一个 helper textarea 短暂掉到 body；
+      // 只有 reset 前焦点就在终端内时才恢复，避免抢走工具栏、文件面板或表单焦点。
+      focusTerminalInputSink(terminal);
+    }
     stabilizeRef.current?.(mobileInputModeRef.current ? "mobile-viewport" : "layout");
     outputResetVersionRef.current = props.outputResetVersion;
     confirmOutputResetApplied(props.outputResetVersion);

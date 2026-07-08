@@ -87,6 +87,7 @@
   --color-accent-shadow: rgba(167, 192, 128, 0.12);
   --color-accent-shadow-strong: rgba(167, 192, 128, 0.35);
   --terminal-frame-padding: 12px;
+  --terminal-mobile-shortcuts-height: 42px;
   --daemon-status-cpu-width: 148px;
   --daemon-status-memory-width: 188px;
   /* RTT 已移到 session 标题栏，状态栏网络列只需要容纳上下行速率。 */
@@ -3025,6 +3026,11 @@ label {
 
   .app-shell.mobile-keyboard-open .daemon-status-strip {
     display: none;
+  }
+
+  .app-shell.mobile-keyboard-open .terminal-scrollport {
+    /* 中文注释：快捷键栏是 overlay，键盘打开时终端可视底边要停在快捷键栏上方。 */
+    margin-bottom: var(--terminal-mobile-shortcuts-height);
   }
 
   .workspace-body {

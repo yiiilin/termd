@@ -25,6 +25,7 @@ export function useTerminalFocusResizeState() {
   const passiveInputFocusRef = useRef(false);
   const suppressPassiveFocusRef = useRef(false);
   const windowActiveRef = useRef(true);
+  const terminalOwnedFocusBeforeWindowBlurRef = useRef(false);
   const focusOutTimerRef = useRef<number | undefined>(undefined);
   const mobileInputFocusRescueUntilRef = useRef(0);
   const mobileInputFocusRestoreTimersRef = useRef<number[]>([]);
@@ -74,6 +75,10 @@ export function useTerminalFocusResizeState() {
         activeElement.blur();
       }
     };
+    const terminalHasDomFocus = () => {
+      const activeElement = document.activeElement;
+      return activeElement instanceof HTMLElement && options.host.contains(activeElement);
+    };
     const commitFocusOutIfStillOutsideHost = () => {
       const activeElement = document.activeElement;
       if (activeElement instanceof HTMLElement && options.host.contains(activeElement)) {
@@ -83,6 +88,7 @@ export function useTerminalFocusResizeState() {
         scheduleMobileInputFocusRestore();
         return;
       }
+      terminalOwnedFocusBeforeWindowBlurRef.current = false;
       passiveFocusBypassRef.current = false;
       passiveInputFocusRef.current = false;
       focusActivationArmedRef.current = false;
@@ -212,6 +218,22 @@ export function useTerminalFocusResizeState() {
         !focusActivationArmedRef.current &&
         !allowPassiveFocusBypass
       ) {
+        if (
+          terminalOwnedFocusBeforeWindowBlurRef.current &&
+          passiveInputTargetFocused &&
+          windowActiveRef.current
+        ) {
+          // 中文注释：桌面窗口切走再回来时，浏览器可能自动把焦点恢复到原 helper textarea。
+          // 只有失焦前终端本来持有焦点时才接受这次恢复，避免普通窗口 focus 抢走外部控件。
+          terminalOwnedFocusBeforeWindowBlurRef.current = false;
+          passiveInputFocusRef.current = false;
+          suppressPassiveFocusRef.current = false;
+          options.reportTerminalFocus(true);
+          options.resize("focus");
+          options.scheduleScrollToBottomIfPinned();
+          return;
+        }
+        terminalOwnedFocusBeforeWindowBlurRef.current = false;
         passiveInputFocusRef.current = false;
         focusedRef.current = false;
         setFocused(false);
@@ -264,7 +286,10 @@ export function useTerminalFocusResizeState() {
       scheduleFocusOutCommit();
     };
     const handleWindowBlur = () => {
+      terminalOwnedFocusBeforeWindowBlurRef.current =
+        focusedRef.current || focusActivationArmedRef.current || terminalHasDomFocus();
       if (document.visibilityState === "hidden") {
+        terminalOwnedFocusBeforeWindowBlurRef.current = false;
         clearPendingFocusOut();
         clearScheduledMobileInputFocusRestore();
         passiveFocusBypassRef.current = false;

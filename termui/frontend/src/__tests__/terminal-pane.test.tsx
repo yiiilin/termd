@@ -3101,6 +3101,150 @@ describe("TerminalPane terminal sequence rendering", () => {
     }
   });
 
+  it("同 session reset 期间浏览器短暂丢焦后会恢复桌面输入焦点", async () => {
+    const takeOutput = vi.fn(() => []);
+    const registerOutputDrain = vi.fn(() => () => undefined);
+    const props = {
+      attached: true,
+      sessionSize: DEFAULT_TERMINAL_SIZE,
+      takeOutput,
+      registerOutputDrain,
+      onTerminalResync: vi.fn(),
+      onInput: vi.fn(),
+      onResize: vi.fn(),
+      onCursorChange: vi.fn(),
+    };
+
+    const { rerender } = render(<TerminalPane {...props} outputResetVersion={0} />);
+    let terminalTextarea: HTMLTextAreaElement | null = null;
+    await waitFor(() => {
+      terminalTextarea = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
+      expect(terminalTextarea).not.toBeNull();
+    });
+    const stableTextarea = terminalTextarea!;
+
+    try {
+      stableTextarea.focus();
+      await waitFor(() => expect(document.activeElement).toBe(stableTextarea));
+      (globalThis as { __TERMD_TEST_TERMINAL_BLUR_ON_RESET__?: boolean }).__TERMD_TEST_TERMINAL_BLUR_ON_RESET__ = true;
+
+      rerender(<TerminalPane {...props} outputResetVersion={1} />);
+
+      await waitFor(() => {
+        expect(document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]')).toBe(stableTextarea);
+        expect(document.activeElement).toBe(stableTextarea);
+      });
+    } finally {
+      delete (globalThis as { __TERMD_TEST_TERMINAL_BLUR_ON_RESET__?: boolean }).__TERMD_TEST_TERMINAL_BLUR_ON_RESET__;
+    }
+  });
+
+  it("桌面窗口恢复时浏览器自动回到 helper textarea 不会被当成被动焦点打掉", async () => {
+    const takeOutput = vi.fn(() => []);
+    const registerOutputDrain = vi.fn(() => () => undefined);
+    render(
+      <TerminalPane
+        attached
+        sessionSize={DEFAULT_TERMINAL_SIZE}
+        outputResetVersion={0}
+        takeOutput={takeOutput}
+        registerOutputDrain={registerOutputDrain}
+        onInput={vi.fn()}
+        onResize={vi.fn()}
+        onCursorChange={vi.fn()}
+      />,
+    );
+    const terminalTextarea = await waitFor(() => {
+      const element = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
+      expect(element).not.toBeNull();
+      return element!;
+    });
+    const blurSpy = vi.spyOn(terminalTextarea, "blur");
+
+    try {
+      terminalTextarea.focus();
+      await waitFor(() => expect(document.activeElement).toBe(terminalTextarea));
+
+      window.dispatchEvent(new Event("blur"));
+      await waitFor(() => expect(document.activeElement).not.toBe(terminalTextarea));
+      blurSpy.mockClear();
+
+      window.dispatchEvent(new Event("focus"));
+      terminalTextarea.focus();
+
+      await waitFor(() => expect(document.activeElement).toBe(terminalTextarea));
+      expect(blurSpy).not.toHaveBeenCalled();
+    } finally {
+      blurSpy.mockRestore();
+    }
+  });
+
+  it("首个 snapshot reset 短暂丢焦后会恢复桌面输入焦点", async () => {
+    const encoder = new TextEncoder();
+    const queue: TerminalOutputItem[] = [];
+    const takeOutput = vi.fn(() => queue.splice(0));
+    let drainOutput: (() => void) | undefined;
+    const registerOutputDrain = vi.fn((drain: () => void) => {
+      drainOutput = drain;
+      drain();
+      return () => undefined;
+    });
+    const onInput = vi.fn();
+
+    render(
+      <TerminalPane
+        attached
+        sessionSize={DEFAULT_TERMINAL_SIZE}
+        focusRequest={1}
+        outputResetVersion={0}
+        takeOutput={takeOutput}
+        registerOutputDrain={registerOutputDrain}
+        onInput={onInput}
+        onResize={vi.fn()}
+        onCursorChange={vi.fn()}
+      />,
+    );
+    let terminalTextarea: HTMLTextAreaElement | null = null;
+    await waitFor(() => {
+      terminalTextarea = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
+      expect(terminalTextarea).not.toBeNull();
+      expect(document.activeElement).toBe(terminalTextarea);
+    });
+    const stableTextarea = terminalTextarea!;
+
+    try {
+      (globalThis as { __TERMD_TEST_TERMINAL_BLUR_ON_RESET__?: boolean }).__TERMD_TEST_TERMINAL_BLUR_ON_RESET__ = true;
+      queue.push({
+        kind: "snapshot",
+        bytes: encoder.encode("snapshot-ready\n"),
+        baseSeq: 1,
+        size: DEFAULT_TERMINAL_SIZE,
+      });
+
+      act(() => {
+        drainOutput?.();
+      });
+
+      await waitFor(() => {
+        const operations = (globalThis as {
+          __TERMD_TEST_TERMINAL_STATS__?: {
+            operations: Array<{ op: string; text?: string }>;
+          };
+        }).__TERMD_TEST_TERMINAL_STATS__?.operations ?? [];
+        expect(operations.some((operation) => operation.op === "reset")).toBe(true);
+        expect(operations.some((operation) => operation.op === "write" && operation.text === "snapshot-ready\n")).toBe(true);
+        expect(document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]')).toBe(stableTextarea);
+        expect(document.activeElement).toBe(stableTextarea);
+      });
+
+      stableTextarea.value = "after-snapshot-reset";
+      fireEvent.input(stableTextarea);
+      expect(onInput).toHaveBeenCalledWith("after-snapshot-reset");
+    } finally {
+      delete (globalThis as { __TERMD_TEST_TERMINAL_BLUR_ON_RESET__?: boolean }).__TERMD_TEST_TERMINAL_BLUR_ON_RESET__;
+    }
+  });
+
   it("revealHistory snapshot 渲染后不会污染下一次普通 snapshot 贴底", async () => {
     vi.useFakeTimers();
     try {
@@ -5214,7 +5358,7 @@ describe("TerminalPane terminal sizing", () => {
     expect(onTerminalResync).not.toHaveBeenCalled();
   });
 
-  it("移动端键盘打开后会按当前光标居中本地视图", () => {
+  it("移动端键盘打开后会把终端底边贴住快捷键上方", () => {
     vi.useFakeTimers();
     const viewport = installMutableVisualViewport(820, 820, 0);
     try {
@@ -5224,7 +5368,7 @@ describe("TerminalPane terminal sizing", () => {
       const queue: TerminalOutputItem[] = [
         {
           kind: "snapshot",
-          bytes: encoder.encode(Array.from({ length: 40 }, (_, index) => `cursor-center-${index + 1}\n`).join("")),
+          bytes: encoder.encode(Array.from({ length: 40 }, (_, index) => `bottom-align-${index + 1}\n`).join("")),
           baseSeq: 0,
           size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
         },
@@ -5272,6 +5416,17 @@ describe("TerminalPane terminal sizing", () => {
         };
       }).__TERMD_TEST_TERMINAL__;
       expect(terminal).toBeDefined();
+      const pane = screen.getByTestId("terminal-pane");
+      const scrollport = pane.querySelector<HTMLElement>(".terminal-scrollport");
+      const frame = pane.querySelector<HTMLElement>(".terminal-frame");
+      const canvas = pane.querySelector<HTMLElement>(".terminal-canvas");
+      expect(scrollport).not.toBeNull();
+      expect(frame).not.toBeNull();
+      expect(canvas).not.toBeNull();
+      Object.defineProperty(scrollport!, "clientHeight", {
+        configurable: true,
+        get: () => 12 * 16,
+      });
 
       onResize.mockClear();
       (globalThis as { __TERMD_TEST_FIT_DIMENSIONS__?: { rows: number; cols: number } }).__TERMD_TEST_FIT_DIMENSIONS__ = {
@@ -5313,17 +5468,21 @@ describe("TerminalPane terminal sizing", () => {
       });
 
       expect(onResize).not.toHaveBeenCalled();
-      expect(terminal?.baseY()).toBeGreaterThan(8);
-      // 中文注释：同样保持 24 行 session 网格；但软键盘只剩 12 行可见高度，
-      // 光标居中要按键盘上方的真实可见行数算，不能继续按 24 行 session 网格算。
-      expect(terminal?.viewportY()).toBe(15);
+      const baseYAfterKeyboardOpen = terminal?.baseY() ?? 0;
+      expect(baseYAfterKeyboardOpen).toBeGreaterThan(8);
+      // 中文注释：软键盘打开后仍保持 24 行 session 网格；外层 scrollport 裁剪出底部
+      // 12 行，让终端底边贴住快捷键上方，而不是把 xterm viewport 滚到输入焦点附近。
+      expect(terminal?.viewportY()).toBe(baseYAfterKeyboardOpen);
+      expect(frame!.style.height).toBe(`${24 * 16}px`);
+      expect(canvas!.style.height).toBe(`${24 * 16}px`);
+      expect(scrollport!.scrollTop).toBe(12 * 16);
     } finally {
       viewport.restore();
       vi.useRealTimers();
     }
   });
 
-  it("移动端光标在终端底部时打开键盘不会为了居中制造底部留白", () => {
+  it("移动端光标在终端底部时打开键盘不会制造底部留白", () => {
     vi.useFakeTimers();
     const viewport = installMutableVisualViewport(820, 820, 0);
     try {
@@ -5332,7 +5491,7 @@ describe("TerminalPane terminal sizing", () => {
       const queue: TerminalOutputItem[] = [
         {
           kind: "snapshot",
-          bytes: encoder.encode(Array.from({ length: 80 }, (_, index) => `history-center-${index + 1}\n`).join("")),
+          bytes: encoder.encode(Array.from({ length: 80 }, (_, index) => `history-bottom-${index + 1}\n`).join("")),
           baseSeq: 0,
           size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
         },
@@ -5423,7 +5582,7 @@ describe("TerminalPane terminal sizing", () => {
     }
   });
 
-  it("移动端键盘打开后重复居中不会让终端窗口高度继续膨胀", () => {
+  it("移动端键盘打开后重复贴底不会让终端窗口高度继续膨胀", () => {
     vi.useFakeTimers();
     const viewport = installMutableVisualViewport(820, 820, 0);
     try {
@@ -5431,7 +5590,7 @@ describe("TerminalPane terminal sizing", () => {
       const queue: TerminalOutputItem[] = [
         {
           kind: "snapshot",
-          bytes: encoder.encode(Array.from({ length: 80 }, (_, index) => `stable-center-${index + 1}\n`).join("")),
+          bytes: encoder.encode(Array.from({ length: 80 }, (_, index) => `stable-bottom-${index + 1}\n`).join("")),
           baseSeq: 0,
           size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
         },

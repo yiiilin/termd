@@ -554,6 +554,10 @@ vi.mock("@xterm/xterm", () => {
 
     reset() {
       terminalStats().operations.push({ op: "reset" });
+      const shouldBlurOnReset = Boolean(
+        (globalThis as { __TERMD_TEST_TERMINAL_BLUR_ON_RESET__?: boolean })
+          .__TERMD_TEST_TERMINAL_BLUR_ON_RESET__,
+      );
       this.pendingRender = "";
       this.pendingRenderReady = false;
       this.selection = "";
@@ -573,6 +577,11 @@ vi.mock("@xterm/xterm", () => {
             node.remove();
           }
         }
+      }
+      if (shouldBlurOnReset && document.activeElement === this.textarea) {
+        // 中文注释：真实 renderer/browser 在 reset/reflow 期间可能短暂丢掉 helper textarea 焦点；
+        // 测试用这个开关稳定复现打开终端后“闪一下导致失焦”的时序。
+        this.textarea.blur();
       }
     }
 

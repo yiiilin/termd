@@ -48,6 +48,8 @@ interface CreateTerminalOutputDrainOptions {
   onTerminalOutputRendered?: (item: TerminalOutputItem) => void;
   onTerminalOutputIdle?: () => void;
   onSnapshotRedrawBegin?: (size: TerminalSize) => void;
+  hasTerminalInputFocus?: () => boolean;
+  restoreTerminalInputFocus?: () => void;
   shouldScrollSnapshotToBottom?: (item: Extract<TerminalOutputItem, { kind: "snapshot" }>) => boolean;
   onSnapshotRendered?: (item: Extract<TerminalOutputItem, { kind: "snapshot" }>) => void;
 }
@@ -355,10 +357,16 @@ export function useTerminalOutputWriter(
         // 中文注释：snapshot 必须临时按 daemon 生成时的 rows/cols 解析历史。
         // 这一步如果直接展示给用户，会在 reload 时看到 80x24 -> 本地尺寸的闪烁。
         options.onSnapshotRedrawBegin?.(item.size);
+        const shouldRestoreTerminalInputFocus = options.hasTerminalInputFocus?.() ?? false;
         if (!options.sameTerminalDimensions(options.terminal, item.size)) {
           options.terminal.resize(item.size.cols, item.size.rows);
         }
         options.terminal.reset();
+        if (shouldRestoreTerminalInputFocus) {
+          // 中文注释：首个 attach snapshot 也会 reset xterm；若 reset 前输入焦点已经在终端内，
+          // 需要立即恢复同一个 helper textarea，避免首屏闪一下后留在失焦状态。
+          options.restoreTerminalInputFocus?.();
+        }
         needsPostWriteRefreshRef.current = true;
         // 中文注释：普通 attach/reload 的 snapshot 写入可能晚于初期 resize/stabilize，
         // 写完后必须再贴底；但用户主动向上滚触发的历史 snapshot 不能贴底，
