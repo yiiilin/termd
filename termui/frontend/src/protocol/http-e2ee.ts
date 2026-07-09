@@ -213,8 +213,9 @@ export function httpUrlFromSocketUrl(socketUrl: string, path: string): string {
   const prefix = socketPath.endsWith("/ws") ? socketPath.slice(0, -"/ws".length) : socketPath;
   const apiPath = path.startsWith("/") ? path : `/${path}`;
   // 中文注释：relay/daemon 可能部署在 `/termd/ws` 这类子路径下；HTTP API 要复用
-  // 同一个前缀和 query，否则会绕到站点根路径或丢失 relay token。
+  // 同一个前缀；query 可能携带 relay_token，不能落到 HTTP URL 或 access log。
   url.pathname = `${prefix}${apiPath}` || "/";
+  url.search = "";
   url.hash = "";
   return url.toString();
 }

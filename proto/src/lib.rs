@@ -298,6 +298,7 @@ pub const METHOD_SESSION_RESIZED: &str = "session.resized";
 pub const METHOD_SESSION_RENAME: &str = "session.rename";
 pub const METHOD_SESSION_REORDER: &str = "session.reorder";
 pub const METHOD_SESSION_CLOSE: &str = "session.close";
+pub const METHOD_SESSION_CLOSED: &str = "session.closed";
 pub const METHOD_SESSION_SEARCH: &str = "session.search";
 pub const METHOD_SESSION_FILES: &str = "session.files";
 pub const METHOD_SESSION_GIT: &str = "session.git";
@@ -371,6 +372,7 @@ pub fn packet_event_method_for_message(kind: MessageType) -> Option<&'static str
         MessageType::SessionCwdChanged => Some(METHOD_SESSION_CWD),
         MessageType::SessionFilesResult => Some(METHOD_SESSION_FILES),
         MessageType::SessionGitResult => Some(METHOD_SESSION_GIT),
+        MessageType::SessionClosed => Some(METHOD_SESSION_CLOSED),
         MessageType::SessionResized => Some(METHOD_SESSION_RESIZED),
         MessageType::SessionData => Some(METHOD_TERMINAL_OUTPUT),
         MessageType::DaemonClientsSnapshot => Some(METHOD_DAEMON_CLIENTS_SNAPSHOT),
@@ -1547,17 +1549,12 @@ pub struct ClientHelloPayload {
 /// 已认证 WebSocket 的展示用途。
 ///
 /// metadata sidecar 是同一设备的旁路状态通道，不应该在 operator 列表里显示成第二个客户端。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClientHelloKind {
+    #[default]
     Interactive,
     Metadata,
-}
-
-impl Default for ClientHelloKind {
-    fn default() -> Self {
-        Self::Interactive
-    }
 }
 
 /// daemon 下单个客户端的展示摘要。
@@ -3716,6 +3713,7 @@ mod tests {
             (MessageType::SessionCwdChanged, METHOD_SESSION_CWD),
             (MessageType::SessionFilesResult, METHOD_SESSION_FILES),
             (MessageType::SessionGitResult, METHOD_SESSION_GIT),
+            (MessageType::SessionClosed, METHOD_SESSION_CLOSED),
             (MessageType::SessionResized, METHOD_SESSION_RESIZED),
             (MessageType::SessionData, METHOD_TERMINAL_OUTPUT),
         ];

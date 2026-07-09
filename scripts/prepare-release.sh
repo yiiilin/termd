@@ -63,6 +63,7 @@ cd "$ROOT_DIR"
 
 [[ -d .git ]] || die "must run inside a git checkout"
 [[ "$(git branch --show-current)" == "main" ]] || die "release must be prepared from main"
+git fetch --tags --quiet
 git rev-parse --verify "refs/tags/${version}" >/dev/null 2>&1 && die "tag ${version} already exists"
 
 if [[ "$ALLOW_DIRTY" -eq 0 ]] && [[ -n "$(git status --porcelain=v1 --untracked-files=all)" ]]; then

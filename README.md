@@ -11,7 +11,7 @@ Termd 让一台机器上的 shell session 由 session supervisor 持久托管，
 ## Features
 
 - supervisor-owned 持久 session：每个 session 由独立 supervisor 托管真实 PTY、terminal journal、attach heartbeat 和超时关闭；daemon 只维护 session catalog、workspace/file/git API 和 attach proxy。
-- Web UI：内嵌终端、session 管理、文件面板、daemon 管理和 PWA；终端渲染只使用 `ghostty-web`。
+- Web UI：内嵌终端、session 管理、文件面板、daemon 管理和 PWA；终端渲染使用 `xterm.js` 单一路径。
 - 多客户端 shared-control：已配对设备都是 operator，可同时 attach 同一个 session。
 - 设备级 pairing/auth：短期 pairing token、device key、challenge-response、timestamp/nonce replay protection。
 - 明文业务协议：去掉运行时 E2EE 后，pairing/auth/session/file 仍由 `termd` 校验和持有，线上路径更短。

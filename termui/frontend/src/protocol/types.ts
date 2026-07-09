@@ -116,7 +116,7 @@ export interface ProtocolPacket<P = unknown> {
   payload: P;
 }
 
-export type RouteRole = "client" | "daemon_mux";
+export type RouteRole = "client" | "daemon_control" | "daemon_data" | "daemon_mux";
 
 export interface RouteHelloPayload {
   server_id: UUID;
@@ -125,10 +125,13 @@ export interface RouteHelloPayload {
   nonce: Nonce;
   admission?: RelayAdmissionPayload;
   route_generation?: Nonce;
+  client_id?: number;
+  data_token?: Nonce;
   timestamp_ms: UnixTimestampMillis;
 }
 
 export type RelayAdmissionPayload =
+  | { kind: "daemon"; token: string }
   | { kind: "pair_ticket"; token: string }
   | {
       kind: "device";

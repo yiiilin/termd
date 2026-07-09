@@ -130,6 +130,11 @@ install_from_release() {
 
   arch="$(detect_arch)"
   [[ -n "$arch" ]] || return 1
+  if [[ "$arch" != "amd64" ]]; then
+    # 当前 release workflow 只发布 linux-amd64；arm64 明确走源码 fallback。
+    log "当前 release 只发布 linux-amd64；linux-${arch} 将从源码构建"
+    return 1
+  fi
 
   tmp_dir="$(mktemp -d)"
   archive_name="${BIN_NAME}-${VERSION}-linux-${arch}.tar.gz"

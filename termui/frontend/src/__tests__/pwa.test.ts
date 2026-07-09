@@ -26,7 +26,7 @@ describe("PWA 外壳", () => {
     registerTermdServiceWorker();
     await vi.waitFor(() => expect(unregister).toHaveBeenCalledTimes(1));
 
-    expect(register).toHaveBeenCalledWith("/service-worker.js");
+    expect(register).toHaveBeenCalledWith("./service-worker.js");
     expect(update).not.toHaveBeenCalled();
     expect(getRegistrations).toHaveBeenCalledTimes(1);
     expect(deleteCache).toHaveBeenCalledWith("termd-web-shell-v1");
@@ -58,14 +58,16 @@ describe("PWA 外壳", () => {
       short_name?: string;
       start_url?: string;
       display?: string;
+      scope?: string;
       icons?: Array<{ src: string; purpose?: string }>;
     };
 
     expect(manifest.name).toBe("Termd");
     expect(manifest.short_name).toBe("Termd");
-    expect(manifest.start_url).toBe("/");
+    expect(manifest.start_url).toBe("./");
+    expect(manifest.scope).toBe("./");
     expect(manifest.display).toBe("standalone");
-    expect(manifest.icons?.some((icon) => icon.src === "/icons/termd.svg" && icon.purpose?.includes("maskable"))).toBe(true);
+    expect(manifest.icons?.some((icon) => icon.src === "./icons/termd.svg" && icon.purpose?.includes("maskable"))).toBe(true);
   });
 
   it("service worker 只负责清理历史缓存，不再拦截前端资源", async () => {

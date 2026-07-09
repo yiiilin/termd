@@ -410,7 +410,7 @@ impl SupervisorPtySession {
                 .writer
                 .lock()
                 .expect("supervisor writer mutex poisoned");
-            write_frame_sync(&mut *writer, &envelope)
+            write_frame_sync(&mut writer, &envelope)
         };
         if let Err(error) = write_result {
             self.pending_requests
@@ -1245,10 +1245,10 @@ fn orphaned_supervisor_pids(
 }
 
 fn discover_termd_binary_path() -> PathBuf {
-    if let Some(path) = std::env::var_os("CARGO_BIN_EXE_termd").map(PathBuf::from) {
-        if path.exists() {
-            return path;
-        }
+    if let Some(path) = std::env::var_os("CARGO_BIN_EXE_termd").map(PathBuf::from)
+        && path.exists()
+    {
+        return path;
     }
 
     #[cfg(test)]
@@ -1261,10 +1261,9 @@ fn discover_termd_binary_path() -> PathBuf {
             .parent()
             .and_then(|deps_dir| deps_dir.parent())
             .map(|target_dir| target_dir.join("termd"))
+            && candidate.exists()
         {
-            if candidate.exists() {
-                return candidate;
-            }
+            return candidate;
         }
         return current_exe;
     }
@@ -3501,9 +3500,9 @@ mod tests {
             .expect("supervisor frame should read");
             match frame {
                 SupervisorFrame::Response {
-                    request_id,
+                    request_id: 2,
                     response,
-                } if request_id == 2 => {
+                } => {
                     response
                         .into_result()
                         .expect("ping response should be ok")

@@ -4,6 +4,9 @@
 			request>uri query {
 				replace relay_token REDACTED
 			}
+			request>headers>X-Termd-Relay-Setup-Token delete
+			request>headers>X-Termd-Relay-Daemon-Token delete
+			request>headers>X-Termd-Relay-Admission delete
 		}
 	}
 }

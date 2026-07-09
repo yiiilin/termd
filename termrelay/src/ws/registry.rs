@@ -114,14 +114,14 @@ impl RelayRoom {
         };
         self.release_client_pre_pair_bytes(&client);
         client.pair_signal.notify_waiters();
-        if let Some(data_id) = client.paired_daemon_data_id {
-            if let Some(daemon_data) = self.daemon_data.remove(&data_id) {
-                // 中文注释：daemon data pipe 与 client 一对一绑定。client 断开时直接关闭
-                // 对应 data WebSocket，后续 client 必须重新走 control 线 OpenData 回连，
-                // 避免旧 client 的残留帧污染下一次 attach/upload。
-                outcome.notified_data_pipe = true;
-                daemon_data.sender.request_close();
-            }
+        if let Some(data_id) = client.paired_daemon_data_id
+            && let Some(daemon_data) = self.daemon_data.remove(&data_id)
+        {
+            // 中文注释：daemon data pipe 与 client 一对一绑定。client 断开时直接关闭
+            // 对应 data WebSocket，后续 client 必须重新走 control 线 OpenData 回连，
+            // 避免旧 client 的残留帧污染下一次 attach/upload。
+            outcome.notified_data_pipe = true;
+            daemon_data.sender.request_close();
         }
 
         client.sender.request_close();
@@ -383,6 +383,19 @@ impl RelayRegistry {
             .lock()
             .expect("relay registry mutex poisoned")
             .len()
+    }
+
+    pub(super) fn daemon_control_stats(&self) -> (usize, ConnectionId) {
+        let rooms = self.rooms.lock().expect("relay registry mutex poisoned");
+        let mut count = 0;
+        let mut latest_connection_id = 0;
+        for room in rooms.values() {
+            if let Some(daemon_control) = room.daemon_control.as_ref() {
+                count += 1;
+                latest_connection_id = latest_connection_id.max(daemon_control.id);
+            }
+        }
+        (count, latest_connection_id)
     }
 
     pub(super) fn close_server(&self, server_id: ServerId) -> Result<bool, RelayError> {
@@ -673,12 +686,8 @@ impl RelayRegistry {
             warn!("relay registry mutex poisoned during pending client deadline cleanup");
             return None;
         };
-        let Some(room) = rooms.get_mut(&registration.server_id) else {
-            return None;
-        };
-        let Some(client) = room.clients.get(&registration.id) else {
-            return None;
-        };
+        let room = rooms.get_mut(&registration.server_id)?;
+        let client = room.clients.get(&registration.id)?;
         if client.paired_daemon_data_id.is_some() {
             return None;
         }

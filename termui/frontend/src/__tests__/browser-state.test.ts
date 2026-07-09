@@ -83,12 +83,12 @@ describe("浏览器本地状态", () => {
     expect(second).toEqual(first);
   });
 
-  it("允许把已配对 daemon 的连接地址切换到 relay URL", async () => {
+  it("允许把已配对 daemon 的连接地址切换到 relay URL，但不持久化 secret query", async () => {
     const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000026");
     const serverId = "00000000-0000-0000-0000-000000000027";
     const directUrl = "ws://127.0.0.1:8765/ws";
-    const legacyRelayUrl = `wss://relay.example/ws/${serverId}/client?relay_token=relay-secret`;
-    const relayUrl = "wss://relay.example/ws?relay_token=relay-secret";
+    const legacyRelayUrl = `wss://relay.example/ws/${serverId}/client?relay_token=relay-secret#debug`;
+    const relayUrl = "wss://relay.example/ws";
 
     await saveBrowserState({ device, pairedServers: [] });
     await recordPairing(
@@ -103,10 +103,13 @@ describe("浏览器本地状态", () => {
 
     const next = await recordServerUrl(serverId, legacyRelayUrl);
     const loaded = await loadBrowserState();
+    const raw = JSON.stringify(loaded);
 
     expect(next.defaultUrl).toBe(relayUrl);
     expect(defaultServerUrl(next)).toBe(relayUrl);
     expect(defaultServerUrl(loaded)).toBe(relayUrl);
+    expect(raw).not.toContain("relay-secret");
+    expect(raw).not.toContain("relay_token");
   });
 
   it("会把旧的裸 websocket 主机地址归一到 /ws", async () => {

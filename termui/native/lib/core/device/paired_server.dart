@@ -4,6 +4,8 @@ import '../errors/native_error.dart';
 import '../storage/secure_storage.dart';
 import '../storage/secure_storage_keys.dart';
 
+const _ed25519WirePrefix = 'ed25519-v1:';
+
 final class PairedServer {
   const PairedServer({
     required this.serverId,
@@ -34,11 +36,11 @@ final class PairedServer {
     try {
       return PairedServer(
         serverId: _readServerString(json, 'server_id'),
-        daemonPublicKey: _readServerString(json, 'daemon_public_key'),
+        daemonPublicKey: _readServerPublicKey(json, 'daemon_public_key'),
         url: normalizePairedServerUrl(_readServerString(json, 'url')),
         pairedAtMs: _readServerInt(json, 'paired_at_ms'),
         deviceId: _readServerString(json, 'device_id'),
-        devicePublicKey: _readServerString(json, 'device_public_key'),
+        devicePublicKey: _readServerPublicKey(json, 'device_public_key'),
       );
     } on NativeValidationError {
       throw const NativeStateCorrupted();
@@ -124,19 +126,18 @@ String normalizePairedServerUrl(String rawUrl) {
   if (parsed == null ||
       (scheme != 'ws' && scheme != 'wss') ||
       parsed.host.isEmpty ||
-      parsed.userInfo.isNotEmpty ||
-      parsed.hasFragment) {
+      parsed.userInfo.isNotEmpty) {
     throw NativeValidationError('daemon URL 必须是 ws 或 wss，并且包含 host。');
   }
 
-  // URL 只保存连接定位信息；query 允许携带 relay_token，userInfo/fragment 不可持久化。
+  // Native 只保存连接定位信息；为避免 relay_token 等 secret query/fragment 落盘或回显，
+  // 这里统一剥离 query 与 fragment。
   final normalized = parsed.normalizePath();
   return Uri(
     scheme: normalized.scheme.toLowerCase(),
     host: normalized.host.toLowerCase(),
     port: normalized.hasPort ? normalized.port : null,
     path: normalized.path,
-    query: normalized.hasQuery ? normalized.query : null,
   ).toString();
 }
 
@@ -174,6 +175,14 @@ String _readServerString(Map<String, Object?> json, String key) {
   return value;
 }
 
+String _readServerPublicKey(Map<String, Object?> json, String key) {
+  final value = _readServerString(json, key);
+  if (!value.startsWith(_ed25519WirePrefix)) {
+    throw const NativeStateCorrupted();
+  }
+  return value;
+}
+
 int _readServerInt(Map<String, Object?> json, String key) {
   final value = json[key];
   if (value is! int) {
@@ -184,9 +193,9 @@ int _readServerInt(Map<String, Object?> json, String key) {
 
 PairedServer _validateServerForWrite(PairedServer server) {
   _requireNonEmptyServerField(server.serverId);
-  _requireNonEmptyServerField(server.daemonPublicKey);
   _requireNonEmptyServerField(server.deviceId);
-  _requireNonEmptyServerField(server.devicePublicKey);
+  _requireEd25519WireField(server.daemonPublicKey, 'daemon_public_key');
+  _requireEd25519WireField(server.devicePublicKey, 'device_public_key');
   return PairedServer(
     serverId: server.serverId,
     daemonPublicKey: server.daemonPublicKey,
@@ -200,5 +209,11 @@ PairedServer _validateServerForWrite(PairedServer server) {
 void _requireNonEmptyServerField(String value) {
   if (value.isEmpty) {
     throw NativeValidationError('配对 daemon 状态字段不能为空。');
+  }
+}
+
+void _requireEd25519WireField(String value, String fieldName) {
+  if (!value.startsWith(_ed25519WirePrefix)) {
+    throw NativeValidationError('$fieldName 必须使用 ed25519-v1: 前缀。');
   }
 }

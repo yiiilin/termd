@@ -3,8 +3,9 @@
 //! 状态只保存设备身份、设备签名私钥 secret 和已配对 daemon 的公开身份。pairing token、
 //! daemon/server private key 和终端明文输出都不属于客户端持久化范围。
 
+use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -13,14 +14,14 @@ use termd_proto::{DeviceId, PairAcceptPayload, PublicKey, ServerId, UnixTimestam
 use crate::crypto;
 use crate::error::{Result, TermctlError};
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DeviceState {
     pub device_id: DeviceId,
     pub device_public_key: PublicKey,
     pub device_signing_key_secret: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PairedServerState {
     pub server_id: ServerId,
     pub daemon_public_key: PublicKey,
@@ -28,13 +29,13 @@ pub struct PairedServerState {
     pub paired_at_ms: UnixTimestampMillis,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SelectedServerTarget {
     pub server: PairedServerState,
     pub url: String,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TermctlState {
     #[serde(default)]
     pub device: Option<DeviceState>,
@@ -46,11 +47,15 @@ pub struct TermctlState {
 
 impl TermctlState {
     pub fn load(path: &Path) -> Result<Self> {
-        if !path.exists() {
-            return Ok(Self::default());
+        match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default());
+            }
+            Err(_) => return Err(TermctlError::StateRead),
+            Ok(_) => {}
         }
 
-        let raw = fs::read_to_string(path).map_err(|_| TermctlError::StateRead)?;
+        let raw = load_state_file(path)?;
         serde_json::from_str(&raw).map_err(|_| TermctlError::StateRead)
     }
 
@@ -118,7 +123,8 @@ impl TermctlState {
     }
 
     pub fn record_pairing(&mut self, accepted: PairAcceptPayload, url: String) {
-        let url = normalize_ws_url(&url).unwrap_or(url);
+        let url =
+            normalize_persisted_ws_url(&url).unwrap_or_else(|| strip_sensitive_query_params(&url));
         let server = PairedServerState {
             server_id: accepted.server_id,
             daemon_public_key: accepted.daemon_public_key,
@@ -189,28 +195,29 @@ impl TermctlState {
         let requested_url = requested_url
             .map(|url| normalize_ws_url(url).ok_or(TermctlError::InvalidWsUrl))
             .transpose()?;
+        let requested_match_key = requested_url.as_deref().and_then(normalized_url_match_key);
 
         // 如果 URL 与已保存 daemon 完全匹配，就用对应 server_id；这是读取本地状态，
         // 不是从 URL 结构中反推 server_id。
         if let Some(url) = requested_url.as_deref() {
-            if let Some(default_server_id) = self.default_server_id {
-                if let Some(server) = self.paired_server(default_server_id) {
-                    if normalize_ws_url(&server.url)
-                        .as_deref()
-                        .is_some_and(|saved_url| saved_url == url)
-                    {
-                        return Ok(SelectedServerTarget {
-                            server,
-                            url: url.to_owned(),
-                        });
-                    }
-                }
+            if let Some(default_server_id) = self.default_server_id
+                && let Some(server) = self.paired_server(default_server_id)
+                && normalized_url_match_key(&server.url)
+                    .as_deref()
+                    .zip(requested_match_key.as_deref())
+                    .is_some_and(|(saved_url, requested_url)| saved_url == requested_url)
+            {
+                return Ok(SelectedServerTarget {
+                    server,
+                    url: url.to_owned(),
+                });
             }
 
             if let Some(server) = self.paired_servers.iter().find(|server| {
-                normalize_ws_url(&server.url)
+                normalized_url_match_key(&server.url)
                     .as_deref()
-                    .is_some_and(|saved_url| saved_url == url)
+                    .zip(requested_match_key.as_deref())
+                    .is_some_and(|(saved_url, requested_url)| saved_url == requested_url)
             }) {
                 return Ok(SelectedServerTarget {
                     server: server.clone(),
@@ -234,6 +241,54 @@ impl TermctlState {
     }
 }
 
+impl fmt::Debug for DeviceState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DeviceState")
+            .field("device_id", &self.device_id)
+            .field("device_public_key", &self.device_public_key)
+            .field("device_signing_key_secret", &"<redacted>")
+            .finish()
+    }
+}
+
+impl fmt::Debug for PairedServerState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let url = redact_url_for_debug(&self.url);
+        formatter
+            .debug_struct("PairedServerState")
+            .field("server_id", &self.server_id)
+            .field("daemon_public_key", &self.daemon_public_key)
+            .field("url", &url)
+            .field("paired_at_ms", &self.paired_at_ms)
+            .finish()
+    }
+}
+
+impl fmt::Debug for SelectedServerTarget {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let url = redact_url_for_debug(&self.url);
+        formatter
+            .debug_struct("SelectedServerTarget")
+            .field("server", &self.server)
+            .field("url", &url)
+            .finish()
+    }
+}
+
+impl fmt::Debug for TermctlState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let default_url = self.default_url.as_deref().map(redact_url_for_debug);
+        formatter
+            .debug_struct("TermctlState")
+            .field("device", &self.device)
+            .field("paired_servers", &self.paired_servers)
+            .field("default_server_id", &self.default_server_id)
+            .field("default_url", &default_url)
+            .finish()
+    }
+}
+
 fn unique_temp_state_path(parent: &Path, final_path: &Path) -> PathBuf {
     let file_name = final_path
         .file_name()
@@ -254,6 +309,30 @@ fn unique_temp_state_path(parent: &Path, final_path: &Path) -> PathBuf {
     }
 
     parent.join(format!(".{file_name}.{}.fallback.tmp", std::process::id()))
+}
+
+#[cfg(unix)]
+fn load_state_file(path: &Path) -> Result<String> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let mut options = OpenOptions::new();
+    options.read(true).custom_flags(libc::O_NOFOLLOW);
+    let mut file = options.open(path).map_err(|_| TermctlError::StateRead)?;
+    let metadata = file.metadata().map_err(|_| TermctlError::StateRead)?;
+
+    if !metadata.file_type().is_file() || metadata.permissions().mode() & 0o077 != 0 {
+        return Err(TermctlError::StateRead);
+    }
+
+    let mut raw = String::new();
+    file.read_to_string(&mut raw)
+        .map_err(|_| TermctlError::StateRead)?;
+    Ok(raw)
+}
+
+#[cfg(not(unix))]
+fn load_state_file(path: &Path) -> Result<String> {
+    fs::read_to_string(path).map_err(|_| TermctlError::StateRead)
 }
 
 fn fsync_parent_dir(path: &Path) -> Result<()> {
@@ -281,6 +360,95 @@ fn secure_state_file_open_options_platform(options: &mut OpenOptions) {
 
 #[cfg(not(unix))]
 fn secure_state_file_open_options_platform(_options: &mut OpenOptions) {}
+
+fn normalize_persisted_ws_url(value: &str) -> Option<String> {
+    normalize_ws_url(value).map(|url| strip_sensitive_query_params(&url))
+}
+
+fn normalized_url_match_key(value: &str) -> Option<String> {
+    normalize_ws_url(value).map(|url| strip_sensitive_query_params(&url))
+}
+
+fn strip_sensitive_query_params(value: &str) -> String {
+    let (base, query, _) = split_url_parts(value);
+    let Some(query) = query else {
+        return base.to_owned();
+    };
+
+    let kept = query
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .filter(|pair| {
+            let key = pair.split_once('=').map(|(key, _)| key).unwrap_or(pair);
+            !is_sensitive_query_key(key)
+        })
+        .collect::<Vec<_>>();
+
+    rebuild_url_with_query(base, &kept)
+}
+
+fn redact_url_for_debug(value: &str) -> String {
+    let (base, query, fragment) = split_url_parts(value);
+    let mut redacted_pairs = Vec::new();
+
+    if let Some(query) = query {
+        for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+            let key = pair.split_once('=').map(|(key, _)| key).unwrap_or(pair);
+            if is_sensitive_query_key(key) {
+                redacted_pairs.push(format!("{key}=<redacted>"));
+            } else {
+                redacted_pairs.push(pair.to_owned());
+            }
+        }
+    }
+
+    let mut debug_url = rebuild_url_with_query(base, &redacted_pairs);
+    if fragment.is_some() {
+        debug_url.push_str("#<redacted>");
+    }
+    debug_url
+}
+
+fn split_url_parts(value: &str) -> (&str, Option<&str>, Option<&str>) {
+    let (without_fragment, fragment) = match value.split_once('#') {
+        Some((without_fragment, fragment)) => (without_fragment, Some(fragment)),
+        None => (value, None),
+    };
+    let (base, query) = match without_fragment.split_once('?') {
+        Some((base, query)) => (base, Some(query)),
+        None => (without_fragment, None),
+    };
+    (base, query, fragment)
+}
+
+fn rebuild_url_with_query(base: &str, query_pairs: &[impl AsRef<str>]) -> String {
+    if query_pairs.is_empty() {
+        return base.to_owned();
+    }
+
+    let query = query_pairs
+        .iter()
+        .map(AsRef::as_ref)
+        .collect::<Vec<_>>()
+        .join("&");
+    format!("{base}?{query}")
+}
+
+fn is_sensitive_query_key(key: &str) -> bool {
+    let normalized = key.trim().to_ascii_lowercase().replace('-', "_");
+    matches!(
+        normalized.as_str(),
+        "relay_token"
+            | "token"
+            | "access_token"
+            | "refresh_token"
+            | "session_token"
+            | "data_token"
+            | "authorization"
+            | "auth"
+            | "bearer"
+    )
+}
 
 pub fn normalize_ws_url(value: &str) -> Option<String> {
     let trimmed = value.trim();
@@ -485,6 +653,44 @@ mod tests {
         assert_eq!(TermctlState::load(&path).unwrap(), TermctlState::default());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn load_rejects_symlink_non_regular_and_loose_permission_state_files() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let dir = tempfile::tempdir().unwrap();
+
+        let target = dir.path().join("target.json");
+        fs::write(&target, "{}").unwrap();
+        let symlink_path = dir.path().join("state-symlink.json");
+        symlink(&target, &symlink_path).unwrap();
+        assert!(matches!(
+            TermctlState::load(&symlink_path),
+            Err(TermctlError::StateRead)
+        ));
+
+        assert!(matches!(
+            TermctlState::load(dir.path()),
+            Err(TermctlError::StateRead)
+        ));
+
+        let world_readable = dir.path().join("world-readable.json");
+        fs::write(&world_readable, "{}").unwrap();
+        fs::set_permissions(&world_readable, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(
+            TermctlState::load(&world_readable),
+            Err(TermctlError::StateRead)
+        ));
+
+        let group_writable = dir.path().join("group-writable.json");
+        fs::write(&group_writable, "{}").unwrap();
+        fs::set_permissions(&group_writable, fs::Permissions::from_mode(0o620)).unwrap();
+        assert!(matches!(
+            TermctlState::load(&group_writable),
+            Err(TermctlError::StateRead)
+        ));
+    }
+
     #[test]
     fn normalizes_legacy_relay_client_urls_to_unified_ws_endpoint() {
         assert_eq!(
@@ -500,6 +706,90 @@ mod tests {
         );
         assert!(normalize_ws_url("https://relay.example/ws").is_none());
         assert!(normalize_ws_url("wss://relay.example/ws#fragment").is_none());
+    }
+
+    #[test]
+    fn record_pairing_strips_sensitive_query_params_but_keeps_regular_query() {
+        let mut state = TermctlState::default();
+        let device = state.ensure_device();
+
+        state.record_pairing(
+            PairAcceptPayload {
+                server_id: ServerId::new(),
+                daemon_public_key: PublicKey("daemon-public".to_owned()),
+                device_id: device.device_id,
+                expires_at_ms: UnixTimestampMillis(2_000),
+            },
+            "wss://relay.example/ws?relay_token=secret&region=cn&token=drop-me".to_owned(),
+        );
+
+        assert_eq!(
+            state.paired_servers[0].url,
+            "wss://relay.example/ws?region=cn"
+        );
+        assert_eq!(
+            state.default_url.as_deref(),
+            Some("wss://relay.example/ws?region=cn")
+        );
+    }
+
+    #[test]
+    fn selected_paired_target_matches_runtime_url_after_stripping_secret_query() {
+        let server_id = ServerId::new();
+        let state = TermctlState {
+            paired_servers: vec![PairedServerState {
+                server_id,
+                daemon_public_key: PublicKey("daemon-public".to_owned()),
+                url: "wss://relay.example/ws?region=cn".to_owned(),
+                paired_at_ms: UnixTimestampMillis(1),
+            }],
+            default_server_id: Some(server_id),
+            default_url: Some("wss://relay.example/ws?region=cn".to_owned()),
+            ..TermctlState::default()
+        };
+
+        let target = state
+            .selected_paired_target(Some("wss://relay.example/ws?relay_token=secret&region=cn"))
+            .unwrap();
+
+        assert_eq!(target.server.server_id, server_id);
+        assert_eq!(
+            target.url,
+            "wss://relay.example/ws?relay_token=secret&region=cn"
+        );
+    }
+
+    #[test]
+    fn debug_redacts_state_secret_and_url_secret_fields() {
+        let server_id = ServerId::new();
+        let state = TermctlState {
+            device: Some(DeviceState {
+                device_id: DeviceId::new(),
+                device_public_key: PublicKey("device-public".to_owned()),
+                device_signing_key_secret: "super-secret-signing-key".to_owned(),
+            }),
+            paired_servers: vec![PairedServerState {
+                server_id,
+                daemon_public_key: PublicKey("daemon-public".to_owned()),
+                url: "wss://relay.example/ws?relay_token=secret&region=cn#fragment-secret"
+                    .to_owned(),
+                paired_at_ms: UnixTimestampMillis(1),
+            }],
+            default_server_id: Some(server_id),
+            default_url: Some(
+                "wss://relay.example/ws?relay_token=secret&region=cn#fragment-secret".to_owned(),
+            ),
+        };
+
+        let debug = format!("{state:?}");
+
+        assert!(!debug.contains("super-secret-signing-key"));
+        assert!(!debug.contains("fragment-secret"));
+        assert!(!debug.contains("relay_token=secret"));
+        assert!(debug.contains("device_signing_key_secret"));
+        assert!(debug.contains("relay_token=<redacted>"));
+        assert!(debug.contains("region=cn"));
+        assert!(debug.contains("#<redacted>"));
     }
 
     #[test]

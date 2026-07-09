@@ -30,16 +30,21 @@ void main() {
     );
   });
 
-  test('preparePairing accepts only websocket URLs and returns normalized URL', () async {
+  test('preparePairing returns a sanitized URL and explicit placeholder status', () async {
     final storage = FakeSecureStorage();
     final service = _serviceWithStorage(storage);
 
     final preparation = await service.preparePairing(
-      url: '  WSS://Example.COM:443/shell/../ws  ',
+      url:
+          '  WSS://Example.COM:443/shell/../ws?relay_token=relay-secret#pair-fragment  ',
       oneTimePairingCode: 'PAIR-CODE-SHOULD-STAY-IN-MEMORY',
     );
 
     expect(preparation.url, 'wss://example.com:443/ws');
+    expect(preparation.statusMessage, contains('尚未接入真实配对'));
+    expect(preparation.statusMessage, contains('wss://example.com:443/ws'));
+    expect(preparation.statusMessage, isNot(contains('relay_token')));
+    expect(preparation.statusMessage, isNot(contains('pair-fragment')));
     expect(
       storage.values.values.join('\n'),
       isNot(contains('PAIR-CODE-SHOULD-STAY-IN-MEMORY')),
@@ -64,6 +69,18 @@ void main() {
         throwsA(isA<NativeValidationError>()),
       );
     }
+  });
+
+  test('preparePairing rejects blank one-time pairing codes', () async {
+    final service = _serviceWithStorage(FakeSecureStorage());
+
+    await expectLater(
+      service.preparePairing(
+        url: 'ws://127.0.0.1:8765/ws',
+        oneTimePairingCode: '   ',
+      ),
+      throwsA(isA<NativeValidationError>()),
+    );
   });
 }
 

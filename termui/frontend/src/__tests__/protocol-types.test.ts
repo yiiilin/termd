@@ -9,6 +9,7 @@ import {
   type MessageType,
   PROTOCOL_PACKET_VERSION,
   type ProtocolPacket,
+  type RelayAdmissionPayload,
   type RouteHelloPayload,
   type RouteReadyPayload,
   type RouteRole,
@@ -111,26 +112,33 @@ describe("协议类型", () => {
   it("状态枚举只表达个人 shared-control 语义", () => {
     const states: SessionState[] = ["created", "running", "closed"];
     const roles: AttachRole[] = ["operator"];
-    const routeRoles: RouteRole[] = ["client", "daemon_mux"];
+    const routeRoles: RouteRole[] = ["client", "daemon_control", "daemon_data", "daemon_mux"];
     const forbidden = ["admin", "owner", "member", "tenant"];
 
     expect(states).toEqual(["created", "running", "closed"]);
     expect(roles).toEqual(["operator"]);
-    expect(routeRoles).toEqual(["client", "daemon_mux"]);
+    expect(routeRoles).toEqual(["client", "daemon_control", "daemon_data", "daemon_mux"]);
     expect(JSON.stringify({ states, roles }).toLowerCase()).not.toContain(forbidden.join("|"));
   });
 
-  it("route prelude payload 只携带公开路由字段", () => {
+  it("route prelude payload 与 Rust proto 公开路由字段对齐", () => {
     const routeHello: RouteHelloPayload = {
       server_id: "00000000-0000-0000-0000-000000000001",
-      role: "client",
+      role: "daemon_data",
       protocol_version: PROTOCOL_PACKET_VERSION,
       nonce: "route-nonce",
+      route_generation: "route-generation",
+      client_id: 7,
+      data_token: "data-token",
       timestamp_ms: 1_710_000_000_000,
     };
     const routeReady: RouteReadyPayload = {
       server_id: routeHello.server_id,
-      role: "client",
+      role: "daemon_data",
+    };
+    const daemonAdmission: RelayAdmissionPayload = {
+      kind: "daemon",
+      token: "relay-daemon-admission-token",
     };
 
     expect(envelope("route_hello", routeHello)).toEqual({
@@ -141,7 +149,15 @@ describe("协议类型", () => {
       type: "route_ready",
       payload: routeReady,
     });
-    expect(JSON.stringify(routeHello)).not.toContain("token");
+    expect(JSON.parse(JSON.stringify(routeHello))).toMatchObject({
+      role: "daemon_data",
+      client_id: 7,
+      data_token: "data-token",
+    });
+    expect(daemonAdmission).toEqual({
+      kind: "daemon",
+      token: "relay-daemon-admission-token",
+    });
   });
 
   it("TypeScript wire shape 和 JSON envelope 可序列化", () => {

@@ -1,6 +1,7 @@
 import { Check, Pencil, Trash2, X } from "lucide-react";
 import { flushSync } from "react-dom";
 import type { PairedServerState, UUID } from "../protocol/types";
+import { displayUrlWithoutQueryOrFragment } from "../protocol/url";
 import { useI18n } from "../i18n";
 
 export interface DaemonManagerOption {
@@ -63,7 +64,7 @@ export function DaemonManagerPanel(props: DaemonManagerPanelProps) {
             ) : (
               <div className="daemon-manager-main">
                 <strong>{label}</strong>
-                <span>{item.server.url}</span>
+                <span>{displayUrlWithoutQueryOrFragment(item.server.url)}</span>
               </div>
             )}
             <div className="daemon-manager-actions">

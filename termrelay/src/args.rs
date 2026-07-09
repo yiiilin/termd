@@ -509,13 +509,10 @@ mod tests {
         let args = Args::parse_from(["termrelay", "--daemon-registry", &registry_arg]).unwrap();
 
         assert_eq!(args.daemon_registry.daemons.len(), 1);
-        assert_eq!(
-            matches!(
-                args.daemon_registry.daemons[0].runtime_credential(),
-                Some(DaemonRegistryRuntimeCredential::TokenHash("sha256:abc123"))
-            ),
-            true
-        );
+        assert!(matches!(
+            args.daemon_registry.daemons[0].runtime_credential(),
+            Some(DaemonRegistryRuntimeCredential::TokenHash("sha256:abc123"))
+        ));
         assert!(!format!("{args:?}").contains("sha256:abc123"));
         let _ = fs::remove_file(registry_file);
     }

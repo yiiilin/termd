@@ -135,7 +135,7 @@ const SESSION_FILE_HTTP_UPLOAD_IDENTITY_UNKNOWN: u64 = u64::MAX;
 const SESSION_FILE_RPC_MAX_BYTES: usize = 1024 * 1024;
 const SESSION_FILE_READ_MAX_BYTES: u64 = SESSION_FILE_RPC_MAX_BYTES as u64;
 const SESSION_FILE_WRITE_MAX_BYTES: usize = SESSION_FILE_RPC_MAX_BYTES;
-const SESSION_FILE_WRITE_MAX_BASE64_BYTES: usize = ((SESSION_FILE_WRITE_MAX_BYTES + 2) / 3) * 4;
+const SESSION_FILE_WRITE_MAX_BASE64_BYTES: usize = SESSION_FILE_WRITE_MAX_BYTES.div_ceil(3) * 4;
 const SESSION_FILE_DOWNLOAD_CHUNK_MAX_BYTES: u32 = 256 * 1024;
 const SESSION_FILE_TRANSFER_CHUNK_MAX_BYTES: u32 = 256 * 1024;
 
@@ -379,10 +379,10 @@ impl SessionFileHttpUploadState {
                 return Err(ProtocolError::InvalidEnvelope);
             }
         }
-        if let Some((&next_start, _)) = self.written_ranges.range(start..).next() {
-            if next_start < end {
-                return Err(ProtocolError::InvalidEnvelope);
-            }
+        if let Some((&next_start, _)) = self.written_ranges.range(start..).next()
+            && next_start < end
+        {
+            return Err(ProtocolError::InvalidEnvelope);
         }
         self.written_ranges.insert(start, len);
         Ok(())
@@ -524,7 +524,7 @@ impl SessionFileHttpUploadFileIdentity {
     fn is_same_filesystem_object(self, other: Self) -> bool {
         #[cfg(unix)]
         {
-            return self.dev == other.dev && self.ino == other.ino;
+            self.dev == other.dev && self.ino == other.ino
         }
         #[cfg(windows)]
         {
@@ -2019,10 +2019,10 @@ where
             )
             .map_err(map_runtime_error)?;
         #[cfg(test)]
-        if !connection.packet_mode {
-            if let Some(history) = self.session_output_history.get_mut(&payload.session_id) {
-                history.resize(payload.size);
-            }
+        if !connection.packet_mode
+            && let Some(history) = self.session_output_history.get_mut(&payload.session_id)
+        {
+            history.resize(payload.size);
         }
         self.notify_session_resized(payload.session_id, payload.size);
         self.client_history.record_session_resized(
@@ -2178,10 +2178,10 @@ where
         ) {
             tracing::warn!(%error, "failed to mark closed runtime session tombstone");
         }
-        if close_result.is_ok() {
-            if let Err(error) = self.prune_closed_session(payload.session_id) {
-                tracing::warn!(%error, "failed to prune closed session records after close");
-            }
+        if close_result.is_ok()
+            && let Err(error) = self.prune_closed_session(payload.session_id)
+        {
+            tracing::warn!(%error, "failed to prune closed session records after close");
         }
 
         Ok(vec![envelope_value(
@@ -2240,7 +2240,7 @@ where
         #[cfg(not(test))]
         {
             let _ = attached;
-            return Err(ProtocolError::InvalidState);
+            Err(ProtocolError::InvalidState)
         }
 
         #[cfg(test)]
@@ -4362,7 +4362,7 @@ fn read_host_name() -> Option<String> {
     // Linux 优先走 /proc，非 Linux 或容器裁剪环境下回退到 HOSTNAME 环境变量。
     fs::read_to_string("/proc/sys/kernel/hostname")
         .ok()
-        .and_then(|value| non_empty_trimmed(value))
+        .and_then(non_empty_trimmed)
         .or_else(|| env::var("HOSTNAME").ok().and_then(non_empty_trimmed))
 }
 
@@ -4533,8 +4533,8 @@ fn read_root_disk_status() -> (u64, u64) {
     let stats = unsafe { stats.assume_init() };
     let block_size = stats.f_frsize.max(stats.f_bsize);
     (
-        (stats.f_blocks as u64).saturating_mul(block_size as u64),
-        (stats.f_bavail as u64).saturating_mul(block_size as u64),
+        stats.f_blocks.saturating_mul(block_size),
+        stats.f_bavail.saturating_mul(block_size),
     )
 }
 
@@ -5580,11 +5580,7 @@ impl ProtocolConnection {
 
             return Ok(frames);
         }
-        let max_packet_chunks = if self.packet_mode {
-            RAW_OUTPUT_BATCH_MAX_CHUNKS
-        } else {
-            RAW_OUTPUT_BATCH_MAX_CHUNKS
-        };
+        let max_packet_chunks = RAW_OUTPUT_BATCH_MAX_CHUNKS;
 
         let mut chunks = Vec::new();
         if let Some(pending) = self.pending_outputs.get_mut(&session_id) {
@@ -5839,7 +5835,6 @@ impl ProtocolConnection {
                 max_chunks,
                 chunks,
             );
-            return;
         }
 
         #[cfg(test)]
@@ -6548,10 +6543,10 @@ impl ProtocolConnection {
         {
             return Ok(Vec::new());
         }
-        if let Some(stream) = self.packet_terminal_streams.get_mut(&stream_id) {
-            if packet.seq == stream.next_input_seq {
-                stream.next_input_seq = stream.next_input_seq.saturating_add(1);
-            }
+        if let Some(stream) = self.packet_terminal_streams.get_mut(&stream_id)
+            && packet.seq == stream.next_input_seq
+        {
+            stream.next_input_seq = stream.next_input_seq.saturating_add(1);
         }
         if let Some((session_id, attachment_id)) = self.remove_packet_terminal_stream(stream_id) {
             protocol.release_watched_attachment(session_id, attachment_id);
@@ -6726,12 +6721,11 @@ impl ProtocolConnection {
         )
         .expect("error payload should serialize");
 
-        if self.e2ee.is_some() {
-            if let Ok(mut encrypted) = self.encrypt_inner_messages(vec![error_envelope.clone()]) {
-                if let Some(message) = encrypted.pop() {
-                    return message;
-                }
-            }
+        if self.e2ee.is_some()
+            && let Ok(mut encrypted) = self.encrypt_inner_messages(vec![error_envelope.clone()])
+            && let Some(message) = encrypted.pop()
+        {
+            return message;
         }
 
         error_envelope
@@ -6747,14 +6741,12 @@ impl ProtocolConnection {
         )
         .expect("error payload should serialize");
 
-        if self.e2ee.is_some() {
-            if let Ok(mut encrypted) =
+        if self.e2ee.is_some()
+            && let Ok(mut encrypted) =
                 self.encrypt_inner_messages_wire(vec![error_envelope.clone()])
-            {
-                if let Some(message) = encrypted.pop() {
-                    return message;
-                }
-            }
+            && let Some(message) = encrypted.pop()
+        {
+            return message;
         }
 
         ProtocolWireMessage::Json(error_envelope)
@@ -6805,6 +6797,7 @@ impl ProtocolConnection {
             .insert(stream_id, PacketTerminalStream::new(session_id));
     }
 
+    #[allow(clippy::type_complexity)]
     fn replace_packet_terminal_streams_with_rollback(
         &mut self,
         replace: impl FnOnce(&mut Self) -> Result<Vec<JsonEnvelope>, ProtocolError>,
@@ -6897,10 +6890,7 @@ impl ProtocolConnection {
         self.watched_attachment_ids
             .iter()
             .filter(|(session_id, attachment_id)| {
-                snapshot
-                    .watched_attachment_ids
-                    .get(session_id)
-                    .map_or(true, |snapshot_id| snapshot_id != *attachment_id)
+                snapshot.watched_attachment_ids.get(session_id) != Some(*attachment_id)
             })
             .map(|(session_id, attachment_id)| (*session_id, attachment_id.clone()))
             .collect()
@@ -6932,9 +6922,7 @@ impl ProtocolConnection {
         &mut self,
         stream_id: PacketStreamId,
     ) -> Option<(SessionId, String)> {
-        let Some(stream) = self.packet_terminal_streams.remove(&stream_id) else {
-            return None;
-        };
+        let stream = self.packet_terminal_streams.remove(&stream_id)?;
         self.packet_terminal_streams_by_session
             .remove(&stream.session_id);
         self.pending_attach_frames.remove(&stream.session_id);
@@ -7901,10 +7889,10 @@ fn parse_git_worktrees(output: &str) -> Vec<GitWorktreeInfo> {
             if let Some(worktree) = current.as_mut() {
                 worktree.head = Some(short_git_hash(head));
             }
-        } else if let Some(branch) = line.strip_prefix("branch ") {
-            if let Some(worktree) = current.as_mut() {
-                worktree.branch = Some(short_branch_name(branch));
-            }
+        } else if let Some(branch) = line.strip_prefix("branch ")
+            && let Some(worktree) = current.as_mut()
+        {
+            worktree.branch = Some(short_branch_name(branch));
         }
     }
     if let Some(worktree) = current {
@@ -8567,7 +8555,7 @@ fn ensure_session_file_http_upload_target_identity(
 fn session_file_http_upload_target_has_external_links(metadata: &fs::Metadata) -> bool {
     #[cfg(unix)]
     {
-        return metadata.nlink() > 1;
+        metadata.nlink() > 1
     }
     #[cfg(windows)]
     {
@@ -8606,7 +8594,7 @@ fn session_file_http_upload_open_file_has_remaining_links(
     }
     #[cfg(unix)]
     {
-        return metadata.nlink() > 0;
+        metadata.nlink() > 0
     }
     #[cfg(windows)]
     {
@@ -9200,12 +9188,11 @@ mod tests {
             if let Some(message) = state.read_error.clone() {
                 return Err(PtyError::Backend(message));
             }
-            if let Some(session_id) = &self.session_id {
-                if let Some(outputs) = state.outputs_by_session.get_mut(session_id) {
-                    if let Some(read) = read_fake_output_queue(outputs, buffer) {
-                        return Ok(read);
-                    }
-                }
+            if let Some(session_id) = &self.session_id
+                && let Some(outputs) = state.outputs_by_session.get_mut(session_id)
+                && let Some(read) = read_fake_output_queue(outputs, buffer)
+            {
+                return Ok(read);
             }
 
             // 没有关联到具体 session 的旧测试仍走全局输出队列。
@@ -9321,23 +9308,23 @@ mod tests {
         fn read_terminal_frame(&mut self) -> PtyResult<Option<PtyTerminalFrame>> {
             let mut state = self.state.lock().unwrap();
             if let Some(session_id) = &self.session_id {
-                if let Some(frames) = state.terminal_frames_by_session.get_mut(session_id) {
-                    if let Some(frame) = frames.pop_front() {
-                        return Ok(Some(frame));
-                    }
+                if let Some(frames) = state.terminal_frames_by_session.get_mut(session_id)
+                    && let Some(frame) = frames.pop_front()
+                {
+                    return Ok(Some(frame));
                 }
 
-                if let Some(outputs) = state.outputs_by_session.get_mut(session_id) {
-                    if let Some(data) = pop_fake_output_queue(outputs, 16 * 1024) {
-                        let seq = next_fake_terminal_seq(&mut state, session_id);
-                        let frame = PtyTerminalFrame::Output {
-                            terminal_seq: seq,
-                            data,
-                        };
-                        push_fake_terminal_journal(&mut state, session_id, frame.clone());
-                        apply_fake_terminal_frame_to_screen(&mut state, session_id, &frame);
-                        return Ok(Some(frame));
-                    }
+                if let Some(outputs) = state.outputs_by_session.get_mut(session_id)
+                    && let Some(data) = pop_fake_output_queue(outputs, 16 * 1024)
+                {
+                    let seq = next_fake_terminal_seq(&mut state, session_id);
+                    let frame = PtyTerminalFrame::Output {
+                        terminal_seq: seq,
+                        data,
+                    };
+                    push_fake_terminal_journal(&mut state, session_id, frame.clone());
+                    apply_fake_terminal_frame_to_screen(&mut state, session_id, &frame);
+                    return Ok(Some(frame));
                 }
             }
 
@@ -9390,9 +9377,7 @@ mod tests {
     }
 
     fn read_fake_output_queue(outputs: &mut VecDeque<Vec<u8>>, buffer: &mut [u8]) -> Option<usize> {
-        let Some(output) = outputs.pop_front() else {
-            return None;
-        };
+        let output = outputs.pop_front()?;
         let read = output.len().min(buffer.len());
         buffer[..read].copy_from_slice(&output[..read]);
 
@@ -9405,9 +9390,7 @@ mod tests {
     }
 
     fn pop_fake_output_queue(outputs: &mut VecDeque<Vec<u8>>, max_bytes: usize) -> Option<Vec<u8>> {
-        let Some(output) = outputs.pop_front() else {
-            return None;
-        };
+        let output = outputs.pop_front()?;
         let read = output.len().min(max_bytes);
         if read < output.len() {
             outputs.push_front(output[read..].to_vec());
@@ -9767,6 +9750,15 @@ mod tests {
 
     fn wire(bytes: &[u8]) -> String {
         format!("ed25519-v1:{}", general_purpose::STANDARD.encode(bytes))
+    }
+
+    fn test_device_public_key_with_seed(seed: u8) -> PublicKey {
+        let signing_key = SigningKey::from_bytes(&[seed; 32]);
+        PublicKey(wire(signing_key.verifying_key().as_bytes()))
+    }
+
+    fn test_device_public_key() -> PublicKey {
+        test_device_public_key_with_seed(7)
     }
 
     fn open_e2ee(
@@ -10540,7 +10532,7 @@ mod tests {
                 METHOD_PAIR_REQUEST,
                 serde_json::to_value(PairRequestPayload {
                     device_id,
-                    device_public_key: PublicKey("device-public-key".to_owned()),
+                    device_public_key: test_device_public_key(),
                     token,
                     nonce: nonce(),
                     timestamp_ms: current_unix_timestamp_millis(),
@@ -10624,7 +10616,7 @@ mod tests {
                 METHOD_PAIR_REQUEST,
                 serde_json::to_value(PairRequestPayload {
                     device_id,
-                    device_public_key: PublicKey("device-public-key".to_owned()),
+                    device_public_key: test_device_public_key(),
                     token,
                     nonce: nonce(),
                     timestamp_ms: current_unix_timestamp_millis(),
@@ -10751,7 +10743,7 @@ mod tests {
                 METHOD_PAIR_REQUEST,
                 serde_json::to_value(PairRequestPayload {
                     device_id,
-                    device_public_key: PublicKey("device-public-key".to_owned()),
+                    device_public_key: test_device_public_key(),
                     token,
                     nonce: nonce(),
                     timestamp_ms: current_unix_timestamp_millis(),
@@ -10874,7 +10866,7 @@ mod tests {
                 METHOD_PAIR_REQUEST,
                 serde_json::to_value(PairRequestPayload {
                     device_id,
-                    device_public_key: PublicKey("device-public-key".to_owned()),
+                    device_public_key: test_device_public_key(),
                     token,
                     nonce: nonce(),
                     timestamp_ms: current_unix_timestamp_millis(),
@@ -11113,7 +11105,7 @@ mod tests {
                 METHOD_PAIR_REQUEST,
                 serde_json::to_value(PairRequestPayload {
                     device_id,
-                    device_public_key: PublicKey("device-public-key".to_owned()),
+                    device_public_key: test_device_public_key(),
                     token,
                     nonce: nonce(),
                     timestamp_ms: current_unix_timestamp_millis(),
@@ -11218,7 +11210,7 @@ mod tests {
             &mut connection,
             &mut device_session,
             device_id,
-            PublicKey("device-public-key".to_owned()),
+            test_device_public_key(),
         );
         let session_id =
             create_test_packet_session(&mut protocol, &mut connection, &mut device_session);
@@ -11313,7 +11305,7 @@ mod tests {
             &mut connection,
             &mut device_session,
             device_id,
-            PublicKey("device-public-key".to_owned()),
+            test_device_public_key(),
         );
         let session_id =
             create_test_packet_session(&mut protocol, &mut connection, &mut device_session);
@@ -11399,7 +11391,7 @@ mod tests {
             &mut connection,
             &mut device_session,
             device_id,
-            PublicKey("device-public-key".to_owned()),
+            test_device_public_key(),
         );
         let session_id =
             create_test_packet_session(&mut protocol, &mut connection, &mut device_session);
@@ -11481,7 +11473,7 @@ mod tests {
             &mut connection,
             &mut device_session,
             device_id,
-            PublicKey("device-public-key".to_owned()),
+            test_device_public_key(),
         );
         let session_id =
             create_test_packet_session(&mut protocol, &mut connection, &mut device_session);
@@ -11549,7 +11541,7 @@ mod tests {
             &mut first_connection,
             &mut first_device_session,
             device_id,
-            PublicKey("device-public-key".to_owned()),
+            test_device_public_key(),
         );
         let session_id = create_test_packet_session(
             &mut protocol,
@@ -11592,7 +11584,7 @@ mod tests {
             &mut second_connection,
             &mut second_device_session,
             second_device_id,
-            PublicKey("second-device-public-key".to_owned()),
+            test_device_public_key_with_seed(9),
         );
         let second_attach = send_encrypted_packet(
             &mut protocol,
@@ -11643,7 +11635,7 @@ mod tests {
             &mut first_connection,
             &mut first_device_session,
             device_id,
-            PublicKey("device-public-key".to_owned()),
+            test_device_public_key(),
         );
         let session_id = create_test_packet_session(
             &mut protocol,
@@ -11697,7 +11689,7 @@ mod tests {
             &mut second_connection,
             &mut second_device_session,
             second_device_id,
-            PublicKey("second-device-public-key".to_owned()),
+            test_device_public_key_with_seed(9),
         );
         let second_attach = send_encrypted_packet(
             &mut protocol,
@@ -11738,7 +11730,7 @@ mod tests {
             &mut first_connection,
             &mut first_device_session,
             device_id,
-            PublicKey("device-public-key".to_owned()),
+            test_device_public_key(),
         );
         let session_id = create_test_packet_session(
             &mut protocol,
@@ -11786,7 +11778,7 @@ mod tests {
             &mut second_connection,
             &mut second_device_session,
             second_device_id,
-            PublicKey("second-device-public-key".to_owned()),
+            test_device_public_key_with_seed(9),
         );
         let second_attach = send_encrypted_packet(
             &mut protocol,
@@ -11836,7 +11828,7 @@ mod tests {
             &mut first_connection,
             &mut first_device_session,
             device_id,
-            PublicKey("device-public-key".to_owned()),
+            test_device_public_key(),
         );
         let session_id = create_test_packet_session(
             &mut protocol,
@@ -11899,7 +11891,7 @@ mod tests {
             &mut second_connection,
             &mut second_device_session,
             second_device_id,
-            PublicKey("second-device-public-key".to_owned()),
+            test_device_public_key_with_seed(9),
         );
         let second_attach = send_encrypted_packet(
             &mut protocol,
@@ -11959,7 +11951,7 @@ mod tests {
             &mut first_connection,
             &mut first_device_session,
             device_id,
-            PublicKey("device-public-key".to_owned()),
+            test_device_public_key(),
         );
         let session_id = create_test_packet_session(
             &mut protocol,
@@ -12023,7 +12015,7 @@ mod tests {
             &mut second_connection,
             &mut second_device_session,
             second_device_id,
-            PublicKey("second-device-public-key".to_owned()),
+            test_device_public_key_with_seed(9),
         );
         let second_attach = send_encrypted_packet(
             &mut protocol,
@@ -12074,7 +12066,7 @@ mod tests {
             &mut first_connection,
             &mut first_device_session,
             device_id,
-            PublicKey("device-public-key".to_owned()),
+            test_device_public_key(),
         );
         let session_id = create_test_packet_session(
             &mut protocol,
@@ -12123,7 +12115,7 @@ mod tests {
             &mut second_connection,
             &mut second_device_session,
             second_device_id,
-            PublicKey("second-device-public-key".to_owned()),
+            test_device_public_key_with_seed(9),
         );
         let second_stream = PacketStreamId::new();
         let second_attach = send_encrypted_packet(
@@ -12181,7 +12173,7 @@ mod tests {
                 METHOD_PAIR_REQUEST,
                 serde_json::to_value(PairRequestPayload {
                     device_id,
-                    device_public_key: PublicKey("device-public-key".to_owned()),
+                    device_public_key: test_device_public_key(),
                     token,
                     nonce: nonce(),
                     timestamp_ms: current_unix_timestamp_millis(),
@@ -12294,7 +12286,7 @@ mod tests {
             &mut connection,
             &mut device_session,
             device_id,
-            PublicKey("device-public-key".to_owned()),
+            test_device_public_key(),
         );
         let session_id =
             create_test_packet_session(&mut protocol, &mut connection, &mut device_session);
@@ -12357,7 +12349,7 @@ mod tests {
             &mut connection,
             &mut device_session,
             device_id,
-            PublicKey("device-public-key".to_owned()),
+            test_device_public_key(),
         );
         let session_id =
             create_test_packet_session(&mut protocol, &mut connection, &mut device_session);
@@ -12424,7 +12416,7 @@ mod tests {
             &mut connection,
             &mut device_session,
             device_id,
-            PublicKey("device-public-key".to_owned()),
+            test_device_public_key(),
         );
         let session_id =
             create_test_packet_session(&mut protocol, &mut connection, &mut device_session);
@@ -12499,7 +12491,7 @@ mod tests {
                 METHOD_PAIR_REQUEST,
                 serde_json::to_value(PairRequestPayload {
                     device_id,
-                    device_public_key: PublicKey("device-public-key".to_owned()),
+                    device_public_key: test_device_public_key(),
                     token,
                     nonce: nonce(),
                     timestamp_ms: current_unix_timestamp_millis(),
@@ -12620,7 +12612,7 @@ mod tests {
                 METHOD_PAIR_REQUEST,
                 serde_json::to_value(PairRequestPayload {
                     device_id,
-                    device_public_key: PublicKey("device-public-key".to_owned()),
+                    device_public_key: test_device_public_key(),
                     token,
                     nonce: nonce(),
                     timestamp_ms: current_unix_timestamp_millis(),
@@ -12734,7 +12726,7 @@ mod tests {
             &mut connection,
             &mut device_session,
             device_id,
-            PublicKey("device-public-key".to_owned()),
+            test_device_public_key(),
         );
 
         let first_session =
@@ -12846,7 +12838,7 @@ mod tests {
             &mut connection,
             &mut device_session,
             device_id,
-            PublicKey("device-public-key".to_owned()),
+            test_device_public_key(),
         );
 
         let session_id =
@@ -12945,7 +12937,7 @@ mod tests {
             &mut connection,
             &mut device_session,
             device_id,
-            PublicKey("device-public-key".to_owned()),
+            test_device_public_key(),
         );
 
         let session_id =
@@ -13059,7 +13051,7 @@ mod tests {
             &mut connection,
             &mut device_session,
             device_id,
-            PublicKey("device-public-key".to_owned()),
+            test_device_public_key(),
         );
 
         let session_id =
@@ -13187,7 +13179,7 @@ mod tests {
             &mut first_connection,
             &mut first_device_session,
             first_device_id,
-            PublicKey("first-device-public-key".to_owned()),
+            test_device_public_key_with_seed(8),
         );
         let session_id = create_test_packet_session(
             &mut protocol,
@@ -13204,7 +13196,7 @@ mod tests {
             &mut second_connection,
             &mut second_device_session,
             second_device_id,
-            PublicKey("second-device-public-key".to_owned()),
+            test_device_public_key_with_seed(9),
         );
 
         let first_stream = PacketStreamId::new();
@@ -13324,7 +13316,7 @@ mod tests {
             &mut connection,
             &mut device_session,
             device_id,
-            PublicKey("device-public-key".to_owned()),
+            test_device_public_key(),
         );
         let session_id =
             create_test_packet_session(&mut protocol, &mut connection, &mut device_session);
@@ -13456,7 +13448,7 @@ mod tests {
                 METHOD_PAIR_REQUEST,
                 serde_json::to_value(PairRequestPayload {
                     device_id,
-                    device_public_key: PublicKey("device-public-key".to_owned()),
+                    device_public_key: test_device_public_key(),
                     token,
                     nonce: nonce(),
                     timestamp_ms: current_unix_timestamp_millis(),
@@ -13583,7 +13575,7 @@ mod tests {
                 METHOD_PAIR_REQUEST,
                 serde_json::to_value(PairRequestPayload {
                     device_id,
-                    device_public_key: PublicKey("device-public-key".to_owned()),
+                    device_public_key: test_device_public_key(),
                     token,
                     nonce: nonce(),
                     timestamp_ms: current_unix_timestamp_millis(),
@@ -15212,10 +15204,7 @@ mod tests {
             controller_client.client_id,
             list_payload.clients[0].client_id
         );
-        assert_eq!(
-            controller_client.last_seen_at_ms.0 >= list_payload.clients[0].connected_at_ms.0,
-            true
-        );
+        assert!(controller_client.last_seen_at_ms.0 >= list_payload.clients[0].connected_at_ms.0);
         assert!(!controller_client.online);
         assert!(controller_client.attached_session_ids.is_empty());
     }

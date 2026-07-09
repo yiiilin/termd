@@ -95,6 +95,70 @@ void main() {
     expect(manager.loadDevice(), throwsA(isA<DeviceIdentityCorrupted>()));
   });
 
+  test('corrupted versioned identity with malformed wire prefixes fails closed', () async {
+    for (final rawRecord in <Map<String, Object?>>[
+      <String, Object?>{
+        'version': 1,
+        'device_id': 'device-test-1',
+        'device_public_key': 'device-public-key-without-prefix',
+        'device_signing_key_secret': 'ed25519-v1:device-signing-secret-1',
+      },
+      <String, Object?>{
+        'version': 1,
+        'device_id': 'device-test-1',
+        'device_public_key': 'ed25519-v1:device-public-1',
+        'device_signing_key_secret': 'device-signing-secret-without-prefix',
+      },
+    ]) {
+      final storage = FakeSecureStorage(<String, String>{
+        SecureStorageKeys.deviceId: jsonEncode(rawRecord),
+      });
+      final manager = DeviceKeyManager(
+        storage: storage,
+        generator: const FakeDeviceIdentityGenerator(),
+        signer: FakeDeviceAuthSigner(),
+      );
+
+      await expectLater(
+        manager.loadDevice(),
+        throwsA(isA<DeviceIdentityCorrupted>()),
+      );
+    }
+  });
+
+  test('corrupted legacy identity components with malformed wire prefixes fail closed', () async {
+    final storage = FakeSecureStorage()
+      ..values[SecureStorageKeys.deviceId] = 'device-test-1'
+      ..values[SecureStorageKeys.devicePublicKey] = 'device-public-key-without-prefix'
+      ..values[SecureStorageKeys.deviceSigningKeySecret] =
+          'ed25519-v1:device-signing-secret-1';
+    final manager = DeviceKeyManager(
+      storage: storage,
+      generator: const FakeDeviceIdentityGenerator(),
+      signer: FakeDeviceAuthSigner(),
+    );
+
+    await expectLater(
+      manager.loadDevice(),
+      throwsA(isA<DeviceIdentityCorrupted>()),
+    );
+  });
+
+  test('loadOrCreateDevice rejects generated malformed signing material', () async {
+    final storage = FakeSecureStorage();
+    final manager = DeviceKeyManager(
+      storage: storage,
+      generator: const _MalformedDeviceIdentityGenerator(),
+      signer: FakeDeviceAuthSigner(),
+    );
+
+    await expectLater(
+      manager.loadOrCreateDevice(),
+      throwsA(isA<DeviceIdentityCorrupted>()),
+    );
+    expect(storage.values[SecureStorageKeys.deviceId], isNull);
+  });
+
   test('signAuthInput does not return raw signing material', () async {
     final storage = FakeSecureStorage();
     _seedVersionedDeviceIdentity(storage);
@@ -154,5 +218,20 @@ final class FakeDeviceAuthSigner implements DeviceAuthSigner {
   }) async {
     observedSecret = signingKeySecret;
     return DeviceSignature('ed25519-v1:test-signature-${canonicalInput.length}');
+  }
+}
+
+final class _MalformedDeviceIdentityGenerator implements DeviceIdentityGenerator {
+  const _MalformedDeviceIdentityGenerator();
+
+  @override
+  Future<GeneratedDeviceKeyMaterial> generate() async {
+    return const GeneratedDeviceKeyMaterial(
+      publicIdentity: DevicePublicIdentity(
+        deviceId: 'device-test-1',
+        devicePublicKey: 'device-public-key-without-prefix',
+      ),
+      signingKeySecret: 'device-signing-secret-without-prefix',
+    );
   }
 }

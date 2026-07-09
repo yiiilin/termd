@@ -105,9 +105,9 @@ impl fmt::Display for RelayEndpointError {
         match self {
             Self::Empty => write!(f, "relay endpoint cannot be empty"),
             Self::TooMany => write!(f, "daemon can connect to only one relay endpoint"),
-            Self::Invalid { endpoint } => write!(
+            Self::Invalid { endpoint: _ } => write!(
                 f,
-                "invalid relay endpoint `{endpoint}`; expected ws://host:port or wss://host:port"
+                "invalid relay endpoint; expected ws://host:port or wss://host:port"
             ),
         }
     }
@@ -126,9 +126,9 @@ impl fmt::Display for RelayProxyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Empty => write!(f, "relay proxy URL cannot be empty"),
-            Self::Invalid { proxy_url } => write!(
+            Self::Invalid { proxy_url: _ } => write!(
                 f,
-                "invalid relay proxy URL `{proxy_url}`; expected http://host:port or socks5://host:port"
+                "invalid relay proxy URL; expected http://host:port or socks5://host:port"
             ),
         }
     }
@@ -600,6 +600,24 @@ mod tests {
             normalize_relay_proxy_url("https://proxy.example:443").unwrap_err(),
             RelayProxyError::Invalid { proxy_url } if proxy_url == "https://proxy.example:443"
         ));
+    }
+
+    #[test]
+    fn relay_url_errors_do_not_echo_sensitive_input() {
+        let endpoint_error = RelayEndpointError::Invalid {
+            endpoint: "wss://user:secret@relay.example/ws?token=secret".to_owned(),
+        };
+        let proxy_error = RelayProxyError::Invalid {
+            proxy_url: "http://user:secret@proxy.example:3128/?token=secret".to_owned(),
+        };
+
+        let endpoint_rendered = endpoint_error.to_string();
+        let proxy_rendered = proxy_error.to_string();
+
+        assert!(!endpoint_rendered.contains("secret"));
+        assert!(!proxy_rendered.contains("secret"));
+        assert!(!endpoint_rendered.contains("user:"));
+        assert!(!proxy_rendered.contains("user:"));
     }
 
     #[test]

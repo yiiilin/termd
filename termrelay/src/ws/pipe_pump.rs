@@ -533,6 +533,7 @@ fn prepare_relay_outbound(outbound: RelayOutbound) -> PreparedRelayOutbound {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn run_relay_websocket_writer(
     mut sender: futures_util::stream::SplitSink<WebSocket, Message>,
     server_id: ServerId,

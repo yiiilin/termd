@@ -5,7 +5,6 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { request } from "node:http";
 import { connect, createServer, type Socket } from "node:net";
-import WebSocket from "ws";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, "../../..");
@@ -154,9 +153,13 @@ export async function startRealRelayFixture(options: RealRelayFixtureOptions = {
 
   const serverId = await serverIdFromHealthz(termdHttp);
   const relayClientUrl = `ws://${relayAddr}/ws`;
+  const relayHttp = `http://${relayAddr}`;
   await registerDaemonWithRelay(`http://${relayAddr}`, serverId, daemonToken, setupToken);
   const pairing = await issuePairingToken(termdHttp);
-  await waitForRelayDaemonMux(relayClientUrl, serverId, pairing.token, [relay, daemon]);
+  let latestRelayDaemonControlConnectionId = await waitForRelayDaemonMux(
+    relayHttp,
+    [relay, daemon],
+  );
 
   return {
     token: pairing.token,
@@ -196,9 +199,19 @@ export async function startRealRelayFixture(options: RealRelayFixtureOptions = {
         throw new Error(`daemon restart changed server_id: expected ${serverId}, got ${restartedServerId}`);
       }
       await registerDaemonWithRelay(`http://${relayAddr}`, serverId, daemonToken, setupToken);
-      await waitForRelayDaemonMux(relayClientUrl, serverId, pairing.token, [relay, daemon]);
+      latestRelayDaemonControlConnectionId = await waitForRelayDaemonMux(
+        relayHttp,
+        [relay, daemon],
+        latestRelayDaemonControlConnectionId,
+      );
     },
-    waitForRelayReady: () => waitForRelayDaemonMux(relayClientUrl, serverId, pairing.token, [relay, daemon]),
+    waitForRelayReady: async () => {
+      latestRelayDaemonControlConnectionId = await waitForRelayDaemonMux(
+        relayHttp,
+        [relay, daemon],
+        latestRelayDaemonControlConnectionId,
+      );
+    },
     stop: async () => {
       await stopProcess(daemon, "termd");
       await latencyProxy?.stop();
@@ -209,11 +222,10 @@ export async function startRealRelayFixture(options: RealRelayFixtureOptions = {
 }
 
 async function waitForRelayDaemonMux(
-  relayClientUrl: string,
-  serverId: string,
-  pairTicket: string,
+  relayHttp: string,
   processes: StartedProcess[],
-): Promise<void> {
+  afterConnectionId = 0,
+): Promise<number> {
   const deadline = Date.now() + 30_000;
   let lastError = "not probed";
   while (Date.now() < deadline) {
@@ -223,69 +235,40 @@ async function waitForRelayDaemonMux(
       }
     }
     try {
-      await probeRelayDaemonMux(relayClientUrl, serverId, pairTicket, Math.min(3_000, Math.max(1, deadline - Date.now())));
-      return;
+      const health = await relayHealthz(relayHttp);
+      // 中文注释：不能用真实 client route 做 readiness probe；pair ticket 是一次性凭证，
+      // 探测会提前消费 token，并且会无意义触发 daemon data 反连。
+      if (
+        health.daemon_controls > 0 &&
+        health.latest_daemon_control_connection_id > afterConnectionId
+      ) {
+        return health.latest_daemon_control_connection_id;
+      }
+      lastError =
+        `daemon_controls=${health.daemon_controls}, ` +
+        `latest_daemon_control_connection_id=${health.latest_daemon_control_connection_id}, ` +
+        `expected_newer_than=${afterConnectionId}`;
     } catch (caught) {
       lastError = caught instanceof Error ? caught.message : String(caught);
-      await sleep(150);
     }
+    await sleep(150);
   }
   throw new Error(`relay daemon mux did not become ready: ${lastError}\n${processes.map((process) => process.log.join("")).join("\n")}`);
 }
 
-function probeRelayDaemonMux(relayClientUrl: string, serverId: string, pairTicket: string, timeoutMs: number): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const socket = new WebSocket(relayClientUrl);
-    let settled = false;
-    const finish = (error?: Error) => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      clearTimeout(timer);
-      socket.close();
-      if (error) {
-        reject(error);
-      } else {
-        resolve();
-      }
-    };
-    const timer = setTimeout(() => finish(new Error("relay daemon mux probe timed out")), timeoutMs);
-
-    socket.once("open", () => {
-      // 中文注释：这里不做业务握手，只用 relay 的公开 route prelude 探测 daemon mux 是否已注册。
-      // route_ready 表示 relay 已能把 client 路由到该 daemon，避免 pairing 抢在 mux 注册前误报 offline。
-      socket.send(JSON.stringify({
-        type: "route_hello",
-        payload: {
-          server_id: serverId,
-          role: "client",
-          protocol_version: 3,
-          admission: { kind: "pair_ticket", token: pairTicket },
-          nonce: `relay-mux-probe-${Date.now()}-${Math.random().toString(16).slice(2)}`,
-          timestamp_ms: Date.now(),
-        },
-      }));
-    });
-    socket.once("message", (data) => {
-      let envelope: { type?: string; payload?: { code?: string; message?: string } };
-      try {
-        envelope = JSON.parse(data.toString()) as { type?: string; payload?: { code?: string; message?: string } };
-      } catch (error) {
-        finish(error instanceof Error ? error : new Error("invalid relay probe response"));
-        return;
-      }
-      if (envelope.type === "route_ready") {
-        finish();
-        return;
-      }
-      const code = envelope.payload?.code ?? envelope.type ?? "unexpected_response";
-      const message = envelope.payload?.message ?? "relay daemon mux probe returned non-ready response";
-      finish(new Error(`${code}: ${message}`));
-    });
-    socket.once("error", (error) => finish(error instanceof Error ? error : new Error("relay daemon mux probe failed")));
-    socket.once("close", () => finish(new Error("relay daemon mux probe closed before route_ready")));
-  });
+async function relayHealthz(relayHttp: string): Promise<{
+  daemon_controls: number;
+  latest_daemon_control_connection_id: number;
+}> {
+  const body = await httpRequest(`${relayHttp}/healthz`, { method: "GET" });
+  const parsed = JSON.parse(body) as {
+    daemon_controls?: number;
+    latest_daemon_control_connection_id?: number;
+  };
+  return {
+    daemon_controls: parsed.daemon_controls ?? 0,
+    latest_daemon_control_connection_id: parsed.latest_daemon_control_connection_id ?? 0,
+  };
 }
 
 async function startRelayLatencyProxy(

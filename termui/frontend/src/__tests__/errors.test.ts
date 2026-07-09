@@ -21,4 +21,14 @@ describe("SafeError 脱敏", () => {
       message: "protocol operation failed",
     });
   });
+
+  it("authorization 和 bearer 错误也会脱敏", () => {
+    const error = protocolError({
+      code: "authorization_bearer_rejected",
+      message: "Authorization: Bearer abc.def.ghi was rejected",
+    });
+
+    expect(error.code).toBe("protocol_error");
+    expect(error.message).toBe("protocol operation failed");
+  });
 });

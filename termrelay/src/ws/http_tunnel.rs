@@ -18,8 +18,9 @@ use tracing::{debug, warn};
 use super::policy::ROUTE_PRELUDE_TIMEOUT;
 use super::{
     ConnectionRegistration, ConnectionRole, DATA_CHANNEL_CAPACITY,
-    HTTP_TUNNEL_BODY_CHANNEL_CAPACITY, HTTP_TUNNEL_SHORT_REQUEST_BODY_TIMEOUT, OpaqueFrame,
-    PipePump, PumpDataReceiver, RelayError, RelayOutbound, RelayState, RoutePrelude,
+    HTTP_TUNNEL_BODY_CHANNEL_CAPACITY, HTTP_TUNNEL_RESPONSE_HEAD_TIMEOUT,
+    HTTP_TUNNEL_SHORT_REQUEST_BODY_TIMEOUT, OpaqueFrame, PipePump, PumpDataReceiver, RelayError,
+    RelayOutbound, RelayState, RoutePrelude,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -152,10 +153,23 @@ impl RelayState {
         registration_guard.set_request_task(request_task);
 
         let mut request_done = false;
+        let response_head_timeout = tokio::time::sleep(HTTP_TUNNEL_RESPONSE_HEAD_TIMEOUT);
+        tokio::pin!(response_head_timeout);
         loop {
             tokio::select! {
                 biased;
 
+                _ = &mut response_head_timeout => {
+                    warn!(
+                        server_id = %server_id.0,
+                        client_connection_id = registration_guard.registration().id,
+                        method = %method,
+                        path = %path,
+                        timeout_ms = HTTP_TUNNEL_RESPONSE_HEAD_TIMEOUT.as_millis(),
+                        "relay HTTP tunnel timed out waiting for response head"
+                    );
+                    return Err(StatusCode::GATEWAY_TIMEOUT);
+                }
                 request_result = &mut request_result_rx, if !request_done => {
                     request_done = true;
                     match request_result {

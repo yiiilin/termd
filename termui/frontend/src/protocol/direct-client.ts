@@ -1177,7 +1177,6 @@ export class DirectClient {
     if (!device || !server) {
       throw new HttpFileTransferUnsupported();
     }
-    const requestPath = this.httpRequestPath(path);
     const auth = await signHttpE2eeAuthPayload(
       {
         device_id: device.device_id,
@@ -1185,7 +1184,7 @@ export class DirectClient {
         nonce: nonce(),
         timestamp_ms: nowMs(),
         method,
-        path: requestPath,
+        path: this.httpSigningPath(path),
       },
       server,
       device.device_signing_key_secret,
@@ -1769,8 +1768,8 @@ export class DirectClient {
     return new URL(httpUrlFromSocketUrl(this.socketUrl, path));
   }
 
-  private httpRequestPath(path: string): string {
-    return this.httpRequestUrl(path).pathname;
+  private httpSigningPath(path: string): string {
+    return path.startsWith("/") ? path : `/${path}`;
   }
 
   async receiveInner(): Promise<Envelope> {

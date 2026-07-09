@@ -5,6 +5,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
+use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -68,7 +69,7 @@ const HELP_TEXT: &str = concat!(
     "  NO_PROXY and no_proxy bypass common proxy variables for matching relay hosts\n\n",
     "EXAMPLES:\n",
     "  termd --listen 0.0.0.0:8765 --web\n",
-    "  termd --relay wss://relay.example:443 --relay-auth-token-file /etc/termd/relay_token --relay-daemon-token-file /etc/termd/daemon_token\n",
+    "  termd --relay wss://relay.example:443 --relay-auth-token-file /etc/termd/relay_token --relay-daemon-token-file /etc/termd/termd_daemon_token\n",
     "  HTTP_PROXY=http://127.0.0.1:3128 termd --relay wss://relay.example/ws\n",
     "  ALL_PROXY=socks5://127.0.0.1:1080 termd --relay wss://relay.example/ws\n",
     "  termd pair --url http://127.0.0.1:8765\n",
@@ -76,7 +77,16 @@ const HELP_TEXT: &str = concat!(
 );
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn main() -> ExitCode {
+    if let Err(error) = run().await {
+        eprintln!("{error}");
+        return ExitCode::FAILURE;
+    }
+
+    ExitCode::SUCCESS
+}
+
+async fn run() -> Result<(), Box<dyn Error>> {
     install_rustls_crypto_provider();
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -349,13 +359,13 @@ fn no_proxy_entry_matches(entry: &str, relay_host: &str, relay_port: u16) -> boo
 }
 
 fn split_no_proxy_entry(entry: &str) -> (&str, Option<u16>) {
-    if let Some(after_bracket) = entry.strip_prefix('[') {
-        if let Some((host, suffix)) = after_bracket.split_once(']') {
-            return match suffix.strip_prefix(':') {
-                Some(port) => (host, port.parse::<u16>().ok()),
-                None => (host, None),
-            };
-        }
+    if let Some(after_bracket) = entry.strip_prefix('[')
+        && let Some((host, suffix)) = after_bracket.split_once(']')
+    {
+        return match suffix.strip_prefix(':') {
+            Some(port) => (host, port.parse::<u16>().ok()),
+            None => (host, None),
+        };
     }
 
     match entry.rsplit_once(':') {
@@ -1040,11 +1050,11 @@ impl CliError {
 impl fmt::Display for CliError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::UnknownCommand(command) => {
-                write!(f, "unknown termd command `{command}`\n{}", Self::usage())
+            Self::UnknownCommand(_command) => {
+                write!(f, "unknown termd command\n{}", Self::usage())
             }
-            Self::UnexpectedArgument(argument) => {
-                write!(f, "unexpected argument `{argument}`\n{}", Self::usage())
+            Self::UnexpectedArgument(_argument) => {
+                write!(f, "unexpected argument\n{}", Self::usage())
             }
             Self::MissingListenValue => write!(f, "`--listen` requires a value\n{}", Self::usage()),
             Self::MissingUrlValue => write!(f, "`--url` requires a value\n{}", Self::usage()),
@@ -1151,20 +1161,20 @@ impl fmt::Display for CliError {
                     Self::usage()
                 )
             }
-            Self::UnsupportedUrl(url) => write!(
+            Self::UnsupportedUrl(_url) => write!(
                 f,
-                "unsupported daemon URL `{url}`; expected http://host:port or https://host:port"
+                "unsupported daemon URL; expected http://host:port or https://host:port"
             ),
-            Self::UnsupportedRelayUrl(url) => {
+            Self::UnsupportedRelayUrl(_url) => {
                 write!(
                     f,
-                    "unsupported relay URL `{url}`; expected ws://host:port or wss://host:port"
+                    "unsupported relay URL; expected ws://host:port or wss://host:port"
                 )
             }
-            Self::UnsupportedRelayProxy(url) => {
+            Self::UnsupportedRelayProxy(_url) => {
                 write!(
                     f,
-                    "unsupported relay proxy `{url}`; expected http://host:port or socks5://host:port"
+                    "unsupported relay proxy; expected http://host:port or socks5://host:port"
                 )
             }
             Self::InvalidListenAddress(address) => {
@@ -1173,10 +1183,10 @@ impl fmt::Display for CliError {
                     "invalid listen address `{address}`; expected host:port such as 127.0.0.1:8765"
                 )
             }
-            Self::InvalidUrl(url) => {
+            Self::InvalidUrl(_url) => {
                 write!(
                     f,
-                    "invalid daemon URL `{url}`; expected http://host:port or https://host:port"
+                    "invalid daemon URL; expected http://host:port or https://host:port"
                 )
             }
             Self::ConnectFailed => write!(f, "failed to connect to the running termd daemon"),
@@ -1434,7 +1444,7 @@ mod tests {
                     },
                 );
                 let raw = serde_json::to_string(&route_ready).unwrap();
-                if socket.send(AxumMessage::Text(raw.into())).await.is_err() {
+                if socket.send(AxumMessage::Text(raw)).await.is_err() {
                     return;
                 }
                 state.route_ready_sent.fetch_add(1, Ordering::SeqCst);
@@ -1994,6 +2004,36 @@ mod tests {
             .unwrap_err(),
             CliError::UnsupportedRelayUrl(url) if url == "http://127.0.0.1:8080"
         ));
+    }
+
+    #[test]
+    fn help_text_uses_updated_trusted_relay_daemon_token_example() {
+        assert!(HELP_TEXT.contains("/etc/termd/termd_daemon_token"));
+        assert!(!HELP_TEXT.contains("/etc/termd/daemon_token"));
+    }
+
+    #[test]
+    fn cli_error_display_redacts_secret_like_arguments_and_urls() {
+        let cases = [
+            CliError::UnexpectedArgument(
+                "--relay=https://user:secret@example.invalid/ws?token=secret".to_owned(),
+            ),
+            CliError::UnsupportedUrl("https://user:secret@example.invalid?token=secret".to_owned()),
+            CliError::UnsupportedRelayUrl(
+                "wss://user:secret@relay.example/ws?token=secret".to_owned(),
+            ),
+            CliError::UnsupportedRelayProxy(
+                "http://user:secret@proxy.example:3128/?token=secret".to_owned(),
+            ),
+            CliError::InvalidUrl("https://user:secret@example.invalid?token=secret".to_owned()),
+        ];
+
+        for error in cases {
+            let rendered = error.to_string();
+            assert!(!rendered.contains("secret"));
+            assert!(!rendered.contains("user:"));
+            assert!(!rendered.contains("?token="));
+        }
     }
 
     #[test]

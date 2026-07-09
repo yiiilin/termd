@@ -3,7 +3,8 @@ typedef JsonMap = Map<String, Object?>;
 const ed25519WirePrefix = 'ed25519-v1:';
 const x25519WirePrefix = 'x25519-v1:';
 
-/// Dart 端只镜像 Rust proto 现有 message type；不得在 UI 层新增或分叉协议。
+/// Dart 端这里只声明 Native 当前消费的低风险协议子集；wire 名称必须与 Rust 对齐，
+/// 但这里不声称完整覆盖 Rust proto。
 enum ProtocolMessageType {
   hello('hello'),
   auth('auth'),
@@ -57,8 +58,7 @@ enum SessionState {
 }
 
 enum AttachRole {
-  controller('controller'),
-  viewer('viewer');
+  sharedControlOperator('operator');
 
   const AttachRole(this.wireName);
 
@@ -113,11 +113,17 @@ final class EncryptedFramePayload {
 final class RemoteSessionSummary {
   const RemoteSessionSummary({
     required this.sessionId,
+    this.name,
     required this.state,
     required this.size,
+    this.filesPath,
+    this.createdAtMs,
   });
 
   final String sessionId;
+  final String? name;
   final SessionState state;
   final TerminalSize size;
+  final String? filesPath;
+  final int? createdAtMs;
 }

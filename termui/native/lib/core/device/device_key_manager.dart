@@ -6,6 +6,8 @@ import '../storage/secure_storage.dart';
 import '../storage/secure_storage_keys.dart';
 import 'device_identity.dart';
 
+const _ed25519WirePrefix = 'ed25519-v1:';
+
 abstract interface class DeviceIdentityGenerator {
   Future<GeneratedDeviceKeyMaterial> generate();
 }
@@ -163,6 +165,7 @@ final class DeviceKeyManager {
   }
 
   Future<void> _writeIdentityRecord(_DeviceIdentityRecord record) {
+    _validateIdentityRecord(record);
     return _storage.write(
       SecureStorageKeys.deviceId,
       jsonEncode(record.toJson()),
@@ -202,9 +205,9 @@ final class _DeviceIdentityRecord {
     return _DeviceIdentityRecord(
       publicIdentity: DevicePublicIdentity(
         deviceId: _readIdentityString(json, 'device_id'),
-        devicePublicKey: _readIdentityString(json, 'device_public_key'),
+        devicePublicKey: _readIdentityWireString(json, 'device_public_key'),
       ),
-      signingKeySecret: _readIdentityString(
+      signingKeySecret: _readIdentityWireString(
         json,
         'device_signing_key_secret',
       ),
@@ -243,4 +246,19 @@ String _readIdentityString(Map<String, Object?> json, String key) {
     throw const DeviceIdentityCorrupted();
   }
   return value;
+}
+
+String _readIdentityWireString(Map<String, Object?> json, String key) {
+  final value = _readIdentityString(json, key);
+  if (!value.startsWith(_ed25519WirePrefix)) {
+    throw const DeviceIdentityCorrupted();
+  }
+  return value;
+}
+
+void _validateIdentityRecord(_DeviceIdentityRecord record) {
+  if (!record.publicIdentity.devicePublicKey.startsWith(_ed25519WirePrefix) ||
+      !record.signingKeySecret.startsWith(_ed25519WirePrefix)) {
+    throw const DeviceIdentityCorrupted();
+  }
 }

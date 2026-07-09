@@ -535,13 +535,10 @@ impl TerminalScreen {
     }
 
     fn snapshot_line_bounds(&self) -> Option<(usize, usize)> {
-        let Some(first_visible) = self
+        let first_visible = self
             .lines
             .iter()
-            .position(|line| line.touched || !line.is_blank())
-        else {
-            return None;
-        };
+            .position(|line| line.touched || !line.is_blank())?;
         let last_visible = self
             .lines
             .iter()
@@ -948,9 +945,7 @@ impl TerminalScreen {
     }
 
     fn line_feed(&mut self) {
-        if self.cursor_row + 1 == self.scroll_bottom {
-            self.scroll_up_region(1);
-        } else if self.cursor_row + 1 >= self.rows {
+        if self.cursor_row + 1 == self.scroll_bottom || self.cursor_row + 1 >= self.rows {
             self.scroll_up_region(1);
         } else {
             self.cursor_row += 1;
@@ -1259,6 +1254,7 @@ fn one_based_param(params: &[Option<u16>], index: usize) -> usize {
     param_or(params, index, 1).saturating_sub(1)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn snapshot_state_bytes(
     lines: &VecDeque<TerminalLine>,
     rows: usize,

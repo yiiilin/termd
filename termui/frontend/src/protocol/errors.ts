@@ -1,6 +1,6 @@
 import type { ErrorPayload, SafeError } from "./types";
 
-const SECRET_PATTERNS = [/token/i, /secret/i, /private/i, /signature/i, /ciphertext/i];
+const SECRET_PATTERNS = [/token/i, /secret/i, /private/i, /signature/i, /ciphertext/i, /authorization/i, /bearer/i];
 const FALLBACK_ERROR_CODE = "protocol_error";
 const FALLBACK_ERROR_MESSAGE = "protocol operation failed";
 

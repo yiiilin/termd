@@ -41,7 +41,7 @@ Options:
 
 Environment overrides:
   TERMD_SERVICE_NAME, TERMD_BIN_PATH, TERMD_STATE_DIR, TERMD_STATE_DB, TERMD_HEALTH_URL,
-  TERMD_SUPERVISOR_VERSION_FILE
+  TERMD_SUPERVISOR_VERSION_FILE, TERMD_UPDATE_SKIP_WEB_BUILD=1
 EOF
 }
 
@@ -732,6 +732,31 @@ run_verification() {
   fi
 }
 
+ensure_frontend_dist_for_embedding() {
+  local frontend_dir="${ROOT_DIR}/termui/frontend"
+
+  if [[ "${TERMD_UPDATE_SKIP_WEB_BUILD:-0}" == "1" ]]; then
+    log "skipping Web UI dist build because TERMD_UPDATE_SKIP_WEB_BUILD=1"
+    return 0
+  fi
+  if [[ "$SKIP_BUILD" -eq 1 ]]; then
+    log "skipping Web UI dist build because --skip-build reuses target/release/termd"
+    return 0
+  fi
+  [[ -f "${frontend_dir}/package.json" ]] || return 0
+
+  require_cmd npm
+  log "building termui/frontend/dist before cargo release build"
+  (
+    cd "$frontend_dir"
+    if [[ ! -d node_modules ]]; then
+      npm ci
+    fi
+    npm run build
+  )
+  [[ -s "${frontend_dir}/dist/index.html" ]] || die "frontend build did not produce termui/frontend/dist/index.html"
+}
+
 build_release_binary() {
   if [[ "$SKIP_BUILD" -eq 1 ]]; then
     [[ -x "${ROOT_DIR}/target/release/termd" ]] || die "target/release/termd does not exist or is not executable"
@@ -773,6 +798,7 @@ main() {
   assert_service_can_restart_without_killing_supervisors
   resolve_local_supervisor_version
   run_verification
+  ensure_frontend_dist_for_embedding
   build_release_binary
 
   local tmp_dir before_pids after_pids before_session_ids after_session_ids before_counts after_counts before_count

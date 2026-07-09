@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { KeyRound, Save, ScanQrCode, Server, Settings, Wifi } from "lucide-react";
 import type { PairedServerState, UUID } from "../protocol/types";
+import { displayUrlWithoutQueryOrFragment } from "../protocol/url";
 import { useI18n, type Translate } from "../i18n";
 
 interface ConnectionPanelProps {
@@ -43,7 +44,7 @@ export function ConnectionPanel(props: ConnectionPanelProps) {
         <div className="connection-address-summary">
           <div>
             <span>{t("connection.address")}</span>
-            <code>{props.url}</code>
+            <code>{displayUrlWithoutQueryOrFragment(props.url)}</code>
           </div>
           <button type="button" className="icon-button" aria-label={t("connection.editAddress")} onClick={() => setUrlEditorOpen(true)}>
             <Settings size={15} aria-hidden="true" />
@@ -54,6 +55,7 @@ export function ConnectionPanel(props: ConnectionPanelProps) {
         <span>{t("connection.pairingToken")}</span>
         <input
           aria-label={t("connection.pairingToken")}
+          type="password"
           value={props.token}
           onChange={(event) => props.onTokenChange(event.target.value)}
           spellCheck={false}
@@ -136,7 +138,7 @@ export function ConnectionStatusPanel(props: ConnectionStatusPanelProps) {
           </select>
         </label>
       ) : null}
-      <div className="server-url">{props.url}</div>
+      <div className="server-url">{displayUrlWithoutQueryOrFragment(props.url)}</div>
     </section>
   );
 }

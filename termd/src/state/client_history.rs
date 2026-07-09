@@ -573,6 +573,7 @@ impl ClientHistoryStore {
     /// runtime_sessions 是 supervisor 是否可恢复的事实来源；如果 daemon_sessions 行缺失或仍是
     /// closed，这里用保守默认值补齐 Web/CLI 列表需要的 root、name 和 files_path。已有用户命名
     /// 和文件树位置不会被默认值覆盖。
+    #[allow(clippy::too_many_arguments)]
     pub fn record_session_restored(
         &mut self,
         session_id: SessionId,

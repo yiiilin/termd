@@ -22,10 +22,12 @@ final class PairingPreparation {
   const PairingPreparation({
     required this.device,
     required this.url,
+    required this.statusMessage,
   });
 
   final DevicePublicIdentity device;
   final String url;
+  final String statusMessage;
 }
 
 final class TermuiNativeService {
@@ -81,9 +83,15 @@ final class TermuiNativeService {
       throw NativeValidationError('需要一次性配对码。');
     }
 
-    // 配对码只在本方法栈上短暂停留，当前骨架不记录、不缓存、不写 secure storage。
+    // 配对码只在本方法栈上短暂停留；在真实 wire 协议接入前，这里只做本机预检查，
+    // 不伪造 pair accept/paired 成功。
     final device = await _deviceKeyManager.loadOrCreateDevice();
-    return PairingPreparation(device: device, url: normalizedUrl);
+    return PairingPreparation(
+      device: device,
+      url: normalizedUrl,
+      statusMessage:
+          '设备 ${device.deviceId} 已完成本机预检查；当前版本尚未接入真实配对，安全 URL：$normalizedUrl',
+    );
   }
 
   Future<void> recordPairedServer(PairedServer server) {

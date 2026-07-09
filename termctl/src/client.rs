@@ -192,7 +192,7 @@ fn relay_admission_signing_input(
 }
 
 fn append_canonical_field(out: &mut Vec<u8>, name: &str, value: &str) {
-    out.extend_from_slice(format!("{name}:{}:{value}\n", value.as_bytes().len()).as_bytes());
+    out.extend_from_slice(format!("{name}:{}:{value}\n", value.len()).as_bytes());
 }
 
 impl DirectClient {
@@ -673,7 +673,7 @@ impl DirectClient {
     }
 
     async fn send_binary_outer(&mut self, raw: Vec<u8>) -> Result<()> {
-        timeout(SEND_TIMEOUT, self.socket.send(Message::Binary(raw.into())))
+        timeout(SEND_TIMEOUT, self.socket.send(Message::Binary(raw)))
             .await
             .map_err(|_| TermctlError::SendFailed)?
             .map_err(|_| TermctlError::SendFailed)
@@ -681,7 +681,7 @@ impl DirectClient {
 
     async fn send_outer(&mut self, envelope: JsonEnvelope) -> Result<()> {
         let raw = serde_json::to_string(&envelope).map_err(|_| TermctlError::InvalidEnvelope)?;
-        timeout(SEND_TIMEOUT, self.socket.send(Message::Text(raw.into())))
+        timeout(SEND_TIMEOUT, self.socket.send(Message::Text(raw)))
             .await
             .map_err(|_| TermctlError::SendFailed)?
             .map_err(|_| TermctlError::SendFailed)
@@ -806,7 +806,7 @@ where
 
 async fn send_outer_on_socket(socket: &mut WsStream, envelope: JsonEnvelope) -> Result<()> {
     let raw = serde_json::to_string(&envelope).map_err(|_| TermctlError::InvalidEnvelope)?;
-    timeout(SEND_TIMEOUT, socket.send(Message::Text(raw.into())))
+    timeout(SEND_TIMEOUT, socket.send(Message::Text(raw)))
         .await
         .map_err(|_| TermctlError::SendFailed)?
         .map_err(|_| TermctlError::SendFailed)
@@ -1768,7 +1768,7 @@ mod tests {
         let outer = packet_envelope(packet).expect("test packet should encode");
         let raw = serde_json::to_string(&outer).expect("test packet should serialize");
         socket
-            .send(Message::Text(raw.into()))
+            .send(Message::Text(raw))
             .await
             .expect("test daemon packet should send");
     }

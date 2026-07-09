@@ -74,6 +74,7 @@ import { createTranslator, I18nProvider, resolveLocale, translateSafeErrorMessag
 import { resolveTheme } from "./theme";
 import type { BrowserPreferences } from "./protocol/types";
 import { recordTermdDiagnostic } from "./diagnostics";
+import { displayUrlWithoutQueryOrFragment } from "./protocol/url";
 
 const DaemonClientsPanel = lazy(() => import("./components/DaemonClientsPanel").then((module) => ({ default: module.DaemonClientsPanel })));
 const DaemonManagerPanel = lazy(() => import("./components/DaemonManagerPanel").then((module) => ({ default: module.DaemonManagerPanel })));
@@ -256,13 +257,6 @@ function terminalOutputFlushFrameTestHook(): DeferredTerminalFrameTestHook | und
   return (globalThis as {
     __TERMD_TEST_HOLD_TERMINAL_OUTPUT_FLUSH_RAF__?: DeferredTerminalFrameTestHook;
   }).__TERMD_TEST_HOLD_TERMINAL_OUTPUT_FLUSH_RAF__;
-}
-
-function summarizeTerminalInputForDiagnostics(data: string): string {
-  return data
-    .replaceAll("\r", "\\r")
-    .replaceAll("\n", "\\n")
-    .slice(0, 64);
 }
 
 export interface DaemonNetworkCounterSample {
@@ -904,7 +898,6 @@ export default function App() {
       sessionId,
       chunkLength: data.length,
       bufferedLength: pendingTerminalInputDataRef.current.length,
-      preview: summarizeTerminalInputForDiagnostics(data),
     });
   }, []);
 
@@ -917,7 +910,6 @@ export default function App() {
     recordTermdDiagnostic("app_terminal_input_flushed", {
       sessionId,
       bufferedLength: bufferedInput.length,
-      preview: summarizeTerminalInputForDiagnostics(bufferedInput),
     });
     await client.sendSessionData(sessionId, new TextEncoder().encode(bufferedInput));
   }, [clearPendingTerminalInput]);
@@ -2812,12 +2804,10 @@ export default function App() {
         hasClient: Boolean(client),
         clientClosed: client?.isClosed ?? false,
         chunkLength: data.length,
-        preview: summarizeTerminalInputForDiagnostics(data),
       });
       if (!sessionId) {
         recordTermdDiagnostic("app_terminal_input_drop_no_session", {
           chunkLength: data.length,
-          preview: summarizeTerminalInputForDiagnostics(data),
         });
         return;
       }
@@ -2834,13 +2824,11 @@ export default function App() {
         recordTermdDiagnostic("app_terminal_input_sent", {
           sessionId,
           chunkLength: data.length,
-          preview: summarizeTerminalInputForDiagnostics(data),
         });
       } catch (caught) {
         recordTermdDiagnostic("app_terminal_input_send_error", {
           sessionId,
           chunkLength: data.length,
-          preview: summarizeTerminalInputForDiagnostics(data),
           error: toSafeError(caught),
         });
         queuePendingTerminalInput(sessionId, data);
@@ -3404,7 +3392,7 @@ export default function App() {
             <div className="admin-summary-main">
               <span>{t("app.selectedDaemon")}</span>
               <strong>{activeDaemonLabel}</strong>
-              <code>{activeServer?.url ?? t("app.unpaired")}</code>
+              <code>{activeServer ? displayUrlWithoutQueryOrFragment(activeServer.url) : t("app.unpaired")}</code>
             </div>
             <button type="button" onClick={handleOpenWorkspace} disabled={!canOpenWorkspace}>
               <MonitorUp size={16} aria-hidden="true" />

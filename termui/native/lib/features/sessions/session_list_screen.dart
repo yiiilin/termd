@@ -77,7 +77,7 @@ class _SessionListScreenState extends State<SessionListScreen> {
                     for (final session in sessions)
                       ListTile(
                         leading: const Icon(Icons.terminal_rounded),
-                        title: Text(session.sessionId),
+                        title: Text(session.name ?? session.sessionId),
                         subtitle: Text(session.state.wireName),
                       ),
                   ],

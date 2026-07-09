@@ -64,10 +64,11 @@ export function recordTermdDiagnostic(
   const target = traceGlobal();
   const events = target.__TERMD_DIAG_EVENTS__ ?? [];
   target.__TERMD_DIAG_EVENTS__ = events;
+  const safeFields = fields ? sanitizeDiagnosticFields(fields) : undefined;
   const event: TermdDiagnosticEvent = {
     t: typeof performance === "undefined" ? Date.now() : performance.now(),
     name,
-    ...(fields ? { fields } : {}),
+    ...(safeFields ? { fields: safeFields } : {}),
     ...(options.stack ? { stack: new Error(name).stack } : {}),
   };
   events.push(event);
@@ -77,10 +78,21 @@ export function recordTermdDiagnostic(
   if (traceConsoleEnabled()) {
     // 中文注释：诊断日志默认只保存在内存数组里；显式开启 console 开关时才打印。
     // eslint-disable-next-line no-console
-    console.debug("[termd-trace]", name, fields ?? {});
+    console.debug("[termd-trace]", name, safeFields ?? {});
   }
 }
 
 export function recordProtocolTimeout(fields: ProtocolTimeoutDiagnosticFields): void {
   recordTermdDiagnostic("protocol_timeout", fields);
+}
+
+function sanitizeDiagnosticFields(fields: Record<string, unknown>): Record<string, unknown> | undefined {
+  const safeFields: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(fields)) {
+    if (key.toLowerCase().includes("preview")) {
+      continue;
+    }
+    safeFields[key] = value;
+  }
+  return Object.keys(safeFields).length ? safeFields : undefined;
 }

@@ -1502,6 +1502,7 @@ async fn connect_relay_control_base_once(
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_relay_control_envelope(
     envelope: RelayControlEnvelope,
     base: RelayBaseUrl,
@@ -1594,6 +1595,7 @@ fn abort_all_relay_data_tasks(data_tasks: &mut RelayDataTaskMap) -> usize {
     aborted
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_relay_data_connection(
     base: RelayBaseUrl,
     auth_token: Option<String>,
@@ -1749,9 +1751,7 @@ async fn run_relay_established_data_connection(
                         let Some(inbound) = relay_data_message_to_inbound(other)? else {
                             break Ok(RelayEstablishedDataEnd::SocketClosed);
                         };
-                        let wire_message = match inbound {
-                            RelayDataInbound::Wire(wire_message) => wire_message,
-                        };
+                        let RelayDataInbound::Wire(wire_message) = inbound;
                         if let ProtocolWireMessage::Binary(raw) = &wire_message
                             && let Some(RelayHttpTunnelFrame::RequestHead { method, path, headers }) =
                                 decode_relay_http_tunnel_frame(raw)
@@ -1964,6 +1964,7 @@ async fn run_relay_established_data_connection(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_relay_http_tunnel_stream(
     relay_endpoint: &str,
     protocol: SharedDaemonProtocol,
@@ -2453,12 +2454,8 @@ where
                 let raw = serde_json::to_string(&envelope)
                     .map_err(|_| RelayConnectorError::InvalidEnvelope)?;
                 bytes = bytes.saturating_add(raw.len());
-                send_relay_message_with_deadline(
-                    sender,
-                    Message::Text(raw.into()),
-                    RELAY_SEND_DEADLINE,
-                )
-                .await?;
+                send_relay_message_with_deadline(sender, Message::Text(raw), RELAY_SEND_DEADLINE)
+                    .await?;
             }
             ProtocolWireMessage::Binary(raw) => {
                 let len = raw.len();
@@ -2505,6 +2502,7 @@ fn relay_data_message_to_inbound(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn drain_relay_data_push_events(
     relay_endpoint: &str,
     server_id: ServerId,
@@ -3489,6 +3487,7 @@ async fn connect_relay_mux_socket(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn connect_relay_route_socket(
     url: &str,
     proxy: Option<&RelayProxyUrl>,
@@ -3657,7 +3656,7 @@ async fn send_route_hello(
         },
     );
     let raw = serde_json::to_string(&envelope).map_err(|_| RelayConnectorError::InvalidEnvelope)?;
-    send_relay_message_with_deadline(sender, Message::Text(raw.into()), RELAY_SEND_DEADLINE).await
+    send_relay_message_with_deadline(sender, Message::Text(raw), RELAY_SEND_DEADLINE).await
 }
 
 async fn read_route_ready(
@@ -3909,6 +3908,7 @@ fn relay_envelope_client_id(envelope: &RelayMuxEnvelope) -> Option<RelayClientId
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn sync_relay_watchers_for_client(
     client_id: Option<RelayClientId>,
     connections: &HashMap<RelayClientId, ProtocolConnection>,
@@ -4233,6 +4233,7 @@ fn queue_relay_deferred_output_wakeups(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn drop_relay_client_runtime(
     client_id: RelayClientId,
     pending_push_events: &mut RelayPushEventQueue,
@@ -4515,6 +4516,7 @@ async fn enqueue_relay_control_message(
 }
 
 #[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 async fn drain_relay_push_events(
     relay_endpoint: &str,
     server_id: ServerId,
@@ -5190,26 +5192,26 @@ async fn handle_relay_mux_writer_write(
         raw = snapshot.raw,
         "relay mux writer dequeued frame"
     );
-    if let Some(client_id) = snapshot.client_id {
-        if !relay_client_is_active(active_clients, client_id) {
-            // 中文注释：client 断开可能发生在输出批次入队之后、真正写 socket 之前。
-            // 这里再查一次生命周期，避免旧 client 的大输出继续占用 daemon->relay 主干。
-            debug!(
-                relay = %relay_endpoint,
-                lane,
-                client_id = client_id.0,
-                order = snapshot.order,
-                kind = snapshot.kind.label(),
-                envelopes = snapshot.envelopes,
-                bytes = snapshot.bytes,
-                "relay mux writer dropped queued frame for inactive client"
-            );
-            if let Some(order) = snapshot.order {
-                relay_mux_finish_order(ordering, active_clients, client_id, order);
-            }
-            relay_mux_complete_write(completion, Ok(()));
-            return true;
+    if let Some(client_id) = snapshot.client_id
+        && !relay_client_is_active(active_clients, client_id)
+    {
+        // 中文注释：client 断开可能发生在输出批次入队之后、真正写 socket 之前。
+        // 这里再查一次生命周期，避免旧 client 的大输出继续占用 daemon->relay 主干。
+        debug!(
+            relay = %relay_endpoint,
+            lane,
+            client_id = client_id.0,
+            order = snapshot.order,
+            kind = snapshot.kind.label(),
+            envelopes = snapshot.envelopes,
+            bytes = snapshot.bytes,
+            "relay mux writer dropped queued frame for inactive client"
+        );
+        if let Some(order) = snapshot.order {
+            relay_mux_finish_order(ordering, active_clients, client_id, order);
         }
+        relay_mux_complete_write(completion, Ok(()));
+        return true;
     }
     let sent = send_relay_mux_write(relay_endpoint, sender, active_clients, write).await;
     if sent && let (Some(client_id), Some(order)) = (snapshot.client_id, snapshot.order) {
@@ -5312,8 +5314,7 @@ async fn send_mux_envelopes_logged(
         let frame_bytes = raw.len();
         let frame_started_at = Instant::now();
         bytes = bytes.saturating_add(raw.len());
-        send_relay_message_with_deadline(sender, Message::Binary(raw.into()), RELAY_SEND_DEADLINE)
-            .await?;
+        send_relay_message_with_deadline(sender, Message::Binary(raw), RELAY_SEND_DEADLINE).await?;
         let frame_elapsed = frame_started_at.elapsed();
         if frame_elapsed >= RELAY_SEND_SLOW_LOG_THRESHOLD
             || frame_bytes >= RELAY_SEND_INFO_BATCH_BYTES
@@ -5462,8 +5463,7 @@ async fn connect_relay_websocket(
         .map_err(|_| RelayConnectorError::ConnectFailed);
     };
 
-    let target =
-        relay_target_from_ws_url(url).ok_or_else(|| RelayConnectorError::UnsupportedUrl)?;
+    let target = relay_target_from_ws_url(url).ok_or(RelayConnectorError::UnsupportedUrl)?;
     let stream = timeout(connect_timeout, connect_proxy_tunnel(proxy, &target))
         .await
         .map_err(|_| RelayConnectorError::ConnectTimeout)?
@@ -5848,6 +5848,7 @@ mod tests {
     use axum::http::{HeaderMap, StatusCode};
     use axum::response::IntoResponse;
     use axum::routing::{get, post};
+    use ed25519_dalek::SigningKey;
     use futures_util::StreamExt;
     use std::fs;
     use std::path::PathBuf;
@@ -5875,6 +5876,15 @@ mod tests {
 
     fn test_active_clients() -> RelayActiveClients {
         Arc::new(Mutex::new(HashSet::new()))
+    }
+
+    fn test_device_public_key(seed: u8) -> termd_proto::PublicKey {
+        let signing_key = SigningKey::from_bytes(&[seed; 32]);
+        termd_proto::PublicKey(format!(
+            "ed25519-v1:{}",
+            base64::engine::general_purpose::STANDARD
+                .encode(signing_key.verifying_key().as_bytes())
+        ))
     }
 
     struct PendingSink {
@@ -6116,8 +6126,10 @@ mod tests {
     fn relay_push_drain_budget_limits_hot_loop() {
         // 中文注释：relay 主干按高速字节流处理，预算必须是 MB 级；
         // 否则 16KB/64KB 小批量会把千兆链路拆成大量小事务。
-        assert!(OUTPUT_FLUSH_MAX_BYTES_PER_SESSION >= 512 * 1024);
-        assert!(RELAY_PUSH_DRAIN_MAX_TRANSPORTED_BYTES_PER_TICK >= 8 * 1024 * 1024);
+        let output_flush_max_bytes_per_session = OUTPUT_FLUSH_MAX_BYTES_PER_SESSION;
+        let transported_bytes_per_tick = RELAY_PUSH_DRAIN_MAX_TRANSPORTED_BYTES_PER_TICK;
+        assert!(output_flush_max_bytes_per_session >= 512 * 1024);
+        assert!(transported_bytes_per_tick >= 8 * 1024 * 1024);
         assert!(!relay_push_drain_budget_exhausted(1, 1024, Instant::now()));
         assert!(relay_push_drain_budget_exhausted(
             RELAY_PUSH_DRAIN_MAX_EVENTS_PER_TICK,
@@ -6240,7 +6252,7 @@ mod tests {
             enqueue_relay_control_message(
                 &writer_queues,
                 RelayOutKind::Response,
-                Message::Text(raw.into()),
+                Message::Text(raw),
             )
             .await
             .unwrap();
@@ -6284,19 +6296,19 @@ mod tests {
                 match message {
                     Message::Binary(raw) => {
                         let envelope = decode_binary_relay_mux_envelope(&raw).unwrap();
-                        if let RelayMuxEnvelope::DaemonFrame { client_id, .. } = envelope {
-                            if seen_tx.send(client_id).await.is_err() {
-                                break;
-                            }
+                        if let RelayMuxEnvelope::DaemonFrame { client_id, .. } = envelope
+                            && seen_tx.send(client_id).await.is_err()
+                        {
+                            break;
                         }
                     }
                     Message::Text(raw) => {
                         let envelope: RelayMuxEnvelope =
                             serde_json::from_str(raw.as_str()).unwrap();
-                        if let RelayMuxEnvelope::DaemonFrame { client_id, .. } = envelope {
-                            if seen_tx.send(client_id).await.is_err() {
-                                break;
-                            }
+                        if let RelayMuxEnvelope::DaemonFrame { client_id, .. } = envelope
+                            && seen_tx.send(client_id).await.is_err()
+                        {
+                            break;
                         }
                     }
                     Message::Ping(payload) => {
@@ -6527,10 +6539,10 @@ mod tests {
                 match message {
                     Message::Binary(raw) => {
                         let envelope = decode_binary_relay_mux_envelope(&raw).unwrap();
-                        if let RelayMuxEnvelope::DaemonFrame { client_id, .. } = envelope {
-                            if seen_tx.send(client_id).await.is_err() {
-                                break;
-                            }
+                        if let RelayMuxEnvelope::DaemonFrame { client_id, .. } = envelope
+                            && seen_tx.send(client_id).await.is_err()
+                        {
+                            break;
                         }
                     }
                     Message::Ping(payload) => {
@@ -6832,7 +6844,7 @@ mod tests {
                 .control
                 .try_send(RelayMuxWrite::Raw {
                     kind: RelayOutKind::Pong,
-                    message: Message::Pong(Vec::new().into()),
+                    message: Message::Pong(Vec::new()),
                 })
                 .expect("test should fill control queue exactly");
         }
@@ -7083,10 +7095,12 @@ mod tests {
     #[test]
     fn relay_websocket_config_sets_transport_size_limits() {
         let config = relay_websocket_config();
+        let max_frame_size = RELAY_MAX_FRAME_SIZE;
+        let max_message_size = RELAY_MAX_MESSAGE_SIZE;
 
-        assert_eq!(config.max_frame_size, Some(RELAY_MAX_FRAME_SIZE));
-        assert_eq!(config.max_message_size, Some(RELAY_MAX_MESSAGE_SIZE));
-        assert!(RELAY_MAX_FRAME_SIZE <= RELAY_MAX_MESSAGE_SIZE);
+        assert_eq!(config.max_frame_size, Some(max_frame_size));
+        assert_eq!(config.max_message_size, Some(max_message_size));
+        assert!(max_frame_size <= max_message_size);
     }
 
     #[test]
@@ -7206,8 +7220,8 @@ mod tests {
 
         let first_device_id = termd_proto::DeviceId::new();
         let second_device_id = termd_proto::DeviceId::new();
-        let first_public_key = termd_proto::PublicKey("ed25519-v1:restored-device-1".to_owned());
-        let second_public_key = termd_proto::PublicKey("ed25519-v1:restored-device-2".to_owned());
+        let first_public_key = test_device_public_key(1);
+        let second_public_key = test_device_public_key(2);
         let state_path = temp_state_path("relay-reregister-trusted-device");
         StateStore::save(
             &state_path,
@@ -7306,9 +7320,7 @@ mod tests {
                 data_token: data_token.clone(),
             };
             control_socket
-                .send(Message::Text(
-                    serde_json::to_string(&open_data).unwrap().into(),
-                ))
+                .send(Message::Text(serde_json::to_string(&open_data).unwrap()))
                 .await
                 .unwrap();
 
@@ -7528,9 +7540,7 @@ mod tests {
                     data_token,
                 };
                 control_socket
-                    .send(Message::Text(
-                        serde_json::to_string(&open_data).unwrap().into(),
-                    ))
+                    .send(Message::Text(serde_json::to_string(&open_data).unwrap()))
                     .await
                     .unwrap();
             }
@@ -7824,7 +7834,7 @@ mod tests {
                 },
             );
             let raw = serde_json::to_string(&route_ready).unwrap();
-            if socket.send(AxumMessage::Text(raw.into())).await.is_err() {
+            if socket.send(AxumMessage::Text(raw)).await.is_err() {
                 return;
             }
 
@@ -7836,7 +7846,7 @@ mod tests {
                         {
                             let ack = RelayMuxEnvelope::KeepaliveAck { nonce };
                             let raw = encode_binary_relay_mux_envelope(&ack).unwrap();
-                            if socket.send(AxumMessage::Binary(raw.into())).await.is_err() {
+                            if socket.send(AxumMessage::Binary(raw)).await.is_err() {
                                 return;
                             }
                         }
@@ -7868,7 +7878,7 @@ mod tests {
                 },
             );
             let raw = serde_json::to_string(&route_ready).unwrap();
-            if socket.send(AxumMessage::Text(raw.into())).await.is_err() {
+            if socket.send(AxumMessage::Text(raw)).await.is_err() {
                 return;
             }
 
@@ -7971,10 +7981,10 @@ mod tests {
                         decode_binary_relay_mux_envelope(&payload)
                     {
                         let ack = RelayMuxEnvelope::KeepaliveAck { nonce };
-                        if let Ok(raw) = encode_binary_relay_mux_envelope(&ack) {
-                            if write_raw_ws_frame(&mut stream, 0x2, &raw).await.is_err() {
-                                return;
-                            }
+                        if let Ok(raw) = encode_binary_relay_mux_envelope(&ack)
+                            && write_raw_ws_frame(&mut stream, 0x2, &raw).await.is_err()
+                        {
+                            return;
                         }
                     }
                 }
@@ -8067,11 +8077,10 @@ mod tests {
                                 decode_binary_relay_mux_envelope(&payload)
                             {
                                 let ack = RelayMuxEnvelope::KeepaliveAck { nonce };
-                                if let Ok(raw) = encode_binary_relay_mux_envelope(&ack) {
-                                    if write_raw_ws_frame(&mut stream, 0x2, &raw).await.is_err() {
+                                if let Ok(raw) = encode_binary_relay_mux_envelope(&ack)
+                                    && write_raw_ws_frame(&mut stream, 0x2, &raw).await.is_err() {
                                         return;
                                     }
-                                }
                             }
                         }
                         0x8 => return,
@@ -8369,7 +8378,7 @@ mod tests {
             MessageType::PairRequest,
             termd_proto::PairRequestPayload {
                 device_id,
-                device_public_key: termd_proto::PublicKey("ed25519-v1:test-device".to_owned()),
+                device_public_key: test_device_public_key(3),
                 token: termd_proto::PairingToken(token),
                 nonce: termd_proto::Nonce("relay-pair-nonce".to_owned()),
                 timestamp_ms: current_unix_timestamp_millis(),
@@ -8562,9 +8571,7 @@ mod tests {
                 MessageType::PairRequest,
                 termd_proto::PairRequestPayload {
                     device_id,
-                    device_public_key: termd_proto::PublicKey(
-                        "ed25519-v1:relay-push-test-device".to_owned(),
-                    ),
+                    device_public_key: test_device_public_key(4),
                     token: termd_proto::PairingToken(token),
                     nonce: termd_proto::Nonce("relay-push-pair-nonce".to_owned()),
                     timestamp_ms: current_unix_timestamp_millis(),
@@ -8689,9 +8696,7 @@ mod tests {
                 MessageType::PairRequest,
                 termd_proto::PairRequestPayload {
                     device_id: slow_device_id,
-                    device_public_key: termd_proto::PublicKey(
-                        "ed25519-v1:relay-backpressure-device".to_owned(),
-                    ),
+                    device_public_key: test_device_public_key(5),
                     token: termd_proto::PairingToken(token),
                     nonce: termd_proto::Nonce("relay-backpressure-pair-nonce".to_owned()),
                     timestamp_ms: current_unix_timestamp_millis(),
@@ -8856,9 +8861,7 @@ mod tests {
                 MessageType::PairRequest,
                 termd_proto::PairRequestPayload {
                     device_id,
-                    device_public_key: termd_proto::PublicKey(
-                        "ed25519-v1:relay-cwd-push-test-device".to_owned(),
-                    ),
+                    device_public_key: test_device_public_key(6),
                     token: termd_proto::PairingToken(token),
                     nonce: termd_proto::Nonce("relay-cwd-push-pair-nonce".to_owned()),
                     timestamp_ms: current_unix_timestamp_millis(),
@@ -8996,7 +8999,7 @@ mod tests {
             MessageType::PairRequest,
             termd_proto::PairRequestPayload {
                 device_id,
-                device_public_key: termd_proto::PublicKey("ed25519-v1:test-device".to_owned()),
+                device_public_key: test_device_public_key(3),
                 token: termd_proto::PairingToken(token),
                 nonce: termd_proto::Nonce("relay-pair-nonce".to_owned()),
                 timestamp_ms: current_unix_timestamp_millis(),
@@ -9083,9 +9086,7 @@ mod tests {
             MessageType::PairRequest,
             termd_proto::PairRequestPayload {
                 device_id,
-                device_public_key: termd_proto::PublicKey(
-                    "ed25519-v1:relay-metadata-device".to_owned(),
-                ),
+                device_public_key: test_device_public_key(7),
                 token: protocol_guard
                     .issue_pairing_token(current_unix_timestamp_millis())
                     .unwrap()
@@ -9197,7 +9198,7 @@ mod tests {
         envelope: RelayMuxEnvelope,
     ) {
         let raw = serde_json::to_string(&envelope).unwrap();
-        socket.send(Message::Text(raw.into())).await.unwrap();
+        socket.send(Message::Text(raw)).await.unwrap();
     }
 
     async fn accept_relay_mux_pair(
@@ -9241,9 +9242,7 @@ mod tests {
             },
         );
         socket
-            .send(Message::Text(
-                serde_json::to_string(&route_ready).unwrap().into(),
-            ))
+            .send(Message::Text(serde_json::to_string(&route_ready).unwrap()))
             .await
             .unwrap();
         route_hello
@@ -9268,9 +9267,7 @@ mod tests {
             RouteReadyPayload { server_id, role },
         );
         socket
-            .send(Message::Text(
-                serde_json::to_string(&route_ready).unwrap().into(),
-            ))
+            .send(Message::Text(serde_json::to_string(&route_ready).unwrap()))
             .await
             .unwrap();
     }

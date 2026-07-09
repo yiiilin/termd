@@ -44,16 +44,16 @@ pub enum RuntimeError {
 
 impl PartialEq for RuntimeError {
     fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
+        matches!(
+            (self, other),
             (Self::SessionAlreadyExists, Self::SessionAlreadyExists)
-            | (Self::SessionNotFound, Self::SessionNotFound)
-            | (Self::SessionClosed, Self::SessionClosed)
-            | (Self::DeviceNotAttached, Self::DeviceNotAttached)
-            | (Self::InvalidSize, Self::InvalidSize)
-            | (Self::NotReconnectable, Self::NotReconnectable) => true,
-            (Self::Pty(_), Self::Pty(_)) => true,
-            _ => false,
-        }
+                | (Self::SessionNotFound, Self::SessionNotFound)
+                | (Self::SessionClosed, Self::SessionClosed)
+                | (Self::DeviceNotAttached, Self::DeviceNotAttached)
+                | (Self::InvalidSize, Self::InvalidSize)
+                | (Self::NotReconnectable, Self::NotReconnectable)
+                | (Self::Pty(_), Self::Pty(_))
+        )
     }
 }
 
@@ -471,10 +471,10 @@ impl<B: PtyBackend> SessionRuntime<B> {
 
     /// 查询设备在 session 中的角色。
     pub fn role(&mut self, session_id: &str, device_id: &str) -> RuntimeResult<Option<AttachRole>> {
-        if self.runtime_sessions.contains_key(session_id) {
-            if let Some(attached) = self.session_authority_has_device(session_id, device_id)? {
-                return Ok(attached.then_some(AttachRole::Operator));
-            }
+        if self.runtime_sessions.contains_key(session_id)
+            && let Some(attached) = self.session_authority_has_device(session_id, device_id)?
+        {
+            return Ok(attached.then_some(AttachRole::Operator));
         }
         Ok(self.sessions.role(session_id, device_id)?)
     }

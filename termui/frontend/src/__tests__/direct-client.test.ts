@@ -2713,7 +2713,7 @@ describe("DirectClient", () => {
     expect(tamperedPathRejected).toBe(true);
   });
 
-  it("HTTP 文件传输保留 WebSocket 子路径前缀和 query", async () => {
+  it("HTTP 文件传输保留 WebSocket 子路径前缀，fetch URL 不携带 secret query 且签名绑定原始 API path", async () => {
     const prefixedUrl = daemon.url.replace("/ws", "/termd/ws?relay_token=abc");
     const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000319");
     const pairClient = await connectDevice(device.device_id, 3000, prefixedUrl);
@@ -2729,12 +2729,38 @@ describe("DirectClient", () => {
     });
     const list = await client.listSessions();
     const sessionId = list.sessions[0].session_id;
-    await client.attachSessionPermission(sessionId);
 
     const originalFetch = globalThis.fetch;
     let requestedUrl = "";
-    (globalThis as unknown as { fetch: typeof fetch }).fetch = (async (input) => {
+    let verifiedUnprefixedPath = false;
+    let prefixedPathRejected = false;
+    (globalThis as unknown as { fetch: typeof fetch }).fetch = (async (input, init) => {
       requestedUrl = input instanceof Request ? input.url : String(input);
+      const headers = new Headers(init?.headers);
+      const auth: HttpE2eeAuthPayload = {
+        device_id: headers.get("x-termd-device-id") ?? "",
+        e2ee_public_key: headers.get("x-termd-e2ee-public-key") ?? "",
+        nonce: headers.get("x-termd-e2ee-nonce") ?? "",
+        timestamp_ms: Number(headers.get("x-termd-e2ee-timestamp-ms") ?? "0"),
+        method: "POST",
+        path: "/api/files/download",
+        signature: headers.get("x-termd-e2ee-signature") ?? "",
+      };
+      const publicKey = decodeEd25519PublicKey(device.device_public_key);
+      const daemonIdentity = {
+        server_id: daemon.serverId,
+        daemon_public_key: daemon.daemonPublicKey,
+      };
+      verifiedUnprefixedPath = await verifyEd25519Signature(
+        publicKey,
+        httpE2eeSigningInputBytes(auth, daemonIdentity),
+        auth.signature,
+      );
+      prefixedPathRejected = !(await verifyEd25519Signature(
+        publicKey,
+        httpE2eeSigningInputBytes({ ...auth, path: "/termd/api/files/download" }, daemonIdentity),
+        auth.signature,
+      ));
       return new Response(JSON.stringify({ code: "invalid_file_transfer", message: "bad request" }), {
         status: 400,
         headers: { "content-type": "application/json" },
@@ -2751,7 +2777,9 @@ describe("DirectClient", () => {
 
     const url = new URL(requestedUrl);
     expect(url.pathname).toBe("/termd/api/files/download");
-    expect(url.searchParams.get("relay_token")).toBe("abc");
+    expect(url.search).toBe("");
+    expect(verifiedUnprefixedPath).toBe(true);
+    expect(prefixedPathRejected).toBe(true);
   });
 
   it("terminal attach 会把已渲染的 session terminal_seq 作为 last_terminal_seq 发送", async () => {

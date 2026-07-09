@@ -76,7 +76,7 @@ class _PairingScreenState extends State<PairingScreen> {
         return;
       }
       setState(() {
-        _status = '设备 ${preview.device.deviceId} 已准备连接 ${preview.url}';
+        _status = preview.statusMessage;
       });
     } on NativeError catch (error) {
       if (!mounted) {

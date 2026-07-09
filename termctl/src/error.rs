@@ -3,7 +3,10 @@
 //! CLI 只向用户输出稳定 code 和安全 message，不把 token、签名、私钥、终端明文或
 //! Rust backtrace 泄漏到 stderr。内部 source 在 MVP 中刻意不透传到 Display。
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::{
+    borrow::Cow,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use thiserror::Error;
 
@@ -106,60 +109,67 @@ impl TermctlError {
         }
     }
 
-    pub fn safe_message(&self) -> &str {
+    pub fn safe_message(&self) -> Cow<'_, str> {
         match self {
-            Self::InvalidSessionId => "session id must be a UUID",
-            Self::InvalidSize => "rows and cols must be positive",
-            Self::MissingPairing => "run termctl pair before session commands",
-            Self::InvalidWsUrl => "websocket URL must be ws:// or wss:// and end at /ws",
-            Self::InvalidPairingInvite => "pairing invite is invalid",
-            Self::ExpiredPairingInvite => "pairing invite has expired",
-            Self::MissingPairingUrl => "pairing invite does not include a URL; pass --url",
-            Self::TokenRequiresKnownDaemon => {
-                "token-only pairing requires an already known daemon; use an invite for first pairing"
+            Self::InvalidSessionId => Cow::Borrowed("session id must be a UUID"),
+            Self::InvalidSize => Cow::Borrowed("rows and cols must be positive"),
+            Self::MissingPairing => Cow::Borrowed("run termctl pair before session commands"),
+            Self::InvalidWsUrl => {
+                Cow::Borrowed("websocket URL must be ws:// or wss:// and end at /ws")
             }
+            Self::InvalidPairingInvite => Cow::Borrowed("pairing invite is invalid"),
+            Self::ExpiredPairingInvite => Cow::Borrowed("pairing invite has expired"),
+            Self::MissingPairingUrl => {
+                Cow::Borrowed("pairing invite does not include a URL; pass --url")
+            }
+            Self::TokenRequiresKnownDaemon => Cow::Borrowed(
+                "token-only pairing requires an already known daemon; use an invite for first pairing",
+            ),
             Self::PairingPayloadServerMismatch => {
-                "pairing payload does not match the connected daemon"
+                Cow::Borrowed("pairing payload does not match the connected daemon")
             }
-            Self::RouteServerMismatch => "route prelude does not match the connected daemon",
-            Self::StateRead => "failed to read local state",
-            Self::StateWrite => "failed to write local state",
+            Self::RouteServerMismatch => {
+                Cow::Borrowed("route prelude does not match the connected daemon")
+            }
+            Self::StateRead => Cow::Borrowed("failed to read local state"),
+            Self::StateWrite => Cow::Borrowed("failed to write local state"),
             Self::PairingStateFinalizeFailed => {
-                "pairing succeeded but local state could not be finalized"
+                Cow::Borrowed("pairing succeeded but local state could not be finalized")
             }
-            Self::InvalidDeviceKey => "local device signing key is invalid",
-            Self::ConnectFailed => "failed to connect websocket",
-            Self::ConnectionClosed => "websocket connection closed",
+            Self::InvalidDeviceKey => Cow::Borrowed("local device signing key is invalid"),
+            Self::ConnectFailed => Cow::Borrowed("failed to connect websocket"),
+            Self::ConnectionClosed => Cow::Borrowed("websocket connection closed"),
             Self::DaemonHelloTimeout => {
-                "relay route is ready, but daemon hello did not arrive in time"
+                Cow::Borrowed("relay route is ready, but daemon hello did not arrive in time")
             }
-            Self::SendFailed => "failed to send websocket message",
-            Self::ReceiveFailed => "failed to receive websocket message",
-            Self::InvalidEnvelope => "message envelope is invalid",
-            Self::UnexpectedMessage => "unexpected protocol message",
-            Self::E2eeFailed => "E2EE frame processing failed",
-            Self::AuthChallengeTimeout => "daemon did not return an auth challenge",
-            Self::Protocol { message, .. } => message.as_str(),
+            Self::SendFailed => Cow::Borrowed("failed to send websocket message"),
+            Self::ReceiveFailed => Cow::Borrowed("failed to receive websocket message"),
+            Self::InvalidEnvelope => Cow::Borrowed("message envelope is invalid"),
+            Self::UnexpectedMessage => Cow::Borrowed("unexpected protocol message"),
+            Self::E2eeFailed => Cow::Borrowed("E2EE frame processing failed"),
+            Self::AuthChallengeTimeout => Cow::Borrowed("daemon did not return an auth challenge"),
+            Self::Protocol { message, .. } => Cow::Owned(sanitize_remote_message(message)),
             Self::PendingPacketQueueFull => {
-                "too many terminal packets arrived while waiting for a response"
+                Cow::Borrowed("too many terminal packets arrived while waiting for a response")
             }
-            Self::ReconnectExhausted => "terminal reconnect attempts exhausted",
-            Self::LocalIo => "local stdin/stdout failed",
+            Self::ReconnectExhausted => Cow::Borrowed("terminal reconnect attempts exhausted"),
+            Self::LocalIo => Cow::Borrowed("local stdin/stdout failed"),
         }
     }
 
     pub fn user_message(&self) -> String {
+        let message = self.safe_message();
         if JSON_OUTPUT.load(Ordering::Relaxed) {
             return serde_json::json!({
                 "error": {
                     "code": self.code(),
-                    "message": self.safe_message(),
+                    "message": message.as_ref(),
                 }
             })
             .to_string();
         }
 
-        format!("termctl error {}: {}", self.code(), self.safe_message())
+        format!("termctl error {}: {}", self.code(), message)
     }
 
     pub fn exit_code(&self) -> i32 {
@@ -207,6 +217,135 @@ impl TermctlError {
     }
 }
 
+fn sanitize_remote_message(message: &str) -> String {
+    let normalized = normalize_remote_message_whitespace(message);
+    if normalized.is_empty() {
+        return "remote protocol error".to_owned();
+    }
+
+    let mut parts = normalized
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+
+    for index in 0..parts.len() {
+        let current = parts[index].clone();
+        if let Some((key, separator, value)) = split_secret_pair(&current)
+            && is_sensitive_remote_keyword(key)
+        {
+            if value.is_empty() {
+                if parts
+                    .get(index + 1)
+                    .is_some_and(|next| !is_bearer_keyword(next))
+                {
+                    parts[index + 1] = "<redacted>".to_owned();
+                }
+            } else if is_bearer_keyword(value) {
+                if let Some(next) = parts.get_mut(index + 1) {
+                    *next = "<redacted>".to_owned();
+                }
+            } else {
+                parts[index] = format!("{key}{separator}<redacted>");
+            }
+            continue;
+        }
+
+        if is_bearer_keyword(&current) {
+            if let Some(next) = parts.get_mut(index + 1) {
+                *next = "<redacted>".to_owned();
+            }
+            continue;
+        }
+
+        if is_plain_token_keyword(&current)
+            && parts
+                .get(index + 1)
+                .is_some_and(|next| looks_like_secret_value(next))
+        {
+            parts[index + 1] = "<redacted>".to_owned();
+        }
+    }
+
+    let sanitized = parts.join(" ");
+    if sanitized.is_empty() {
+        "remote protocol error".to_owned()
+    } else {
+        sanitized
+    }
+}
+
+fn normalize_remote_message_whitespace(message: &str) -> String {
+    let mut normalized = String::with_capacity(message.len());
+    let mut last_was_space = false;
+
+    for ch in message.chars() {
+        let safe = if ch.is_control() { ' ' } else { ch };
+        if safe == ' ' {
+            if !last_was_space {
+                normalized.push(' ');
+            }
+            last_was_space = true;
+        } else {
+            normalized.push(safe);
+            last_was_space = false;
+        }
+    }
+
+    normalized.trim().to_owned()
+}
+
+fn split_secret_pair(value: &str) -> Option<(&str, char, &str)> {
+    for separator in [':', '='] {
+        if let Some((key, secret)) = value.split_once(separator) {
+            return Some((key, separator, secret));
+        }
+    }
+    None
+}
+
+fn is_plain_token_keyword(value: &str) -> bool {
+    matches!(
+        normalize_remote_keyword(value).as_str(),
+        "token" | "authorization" | "bearer"
+    )
+}
+
+fn is_bearer_keyword(value: &str) -> bool {
+    normalize_remote_keyword(value) == "bearer"
+}
+
+fn is_sensitive_remote_keyword(value: &str) -> bool {
+    let normalized = normalize_remote_keyword(value);
+    matches!(
+        normalized.as_str(),
+        "token"
+            | "relay_token"
+            | "access_token"
+            | "refresh_token"
+            | "session_token"
+            | "data_token"
+            | "authorization"
+            | "auth"
+            | "bearer"
+    )
+}
+
+fn normalize_remote_keyword(value: &str) -> String {
+    value
+        .trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_' && ch != '-')
+        .to_ascii_lowercase()
+        .replace('-', "_")
+}
+
+fn looks_like_secret_value(value: &str) -> bool {
+    let trimmed =
+        value.trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_' && ch != '-');
+    trimmed.len() >= 8
+        && trimmed
+            .chars()
+            .any(|ch| ch.is_ascii_digit() || ch == '-' || ch == '_')
+}
+
 impl From<termd::net::protocol::ProtocolError> for TermctlError {
     fn from(error: termd::net::protocol::ProtocolError) -> Self {
         match error {
@@ -245,5 +384,37 @@ mod tests {
         assert_eq!(error.code(), "daemon_hello_timeout_after_route_ready");
         assert!(error.is_connection_error());
         assert_eq!(error.exit_code(), 6);
+    }
+
+    #[test]
+    fn protocol_error_message_redacts_secrets_and_control_characters() {
+        set_json_output(false);
+        let error = TermctlError::Protocol {
+            code: "pairing_failed".to_owned(),
+            message: "authorization: Bearer secret-token\trelay_token=abc12345\nbad\x1bmessage"
+                .to_owned(),
+        };
+
+        let safe = error.safe_message();
+        let user = error.user_message();
+
+        assert!(!safe.contains("secret-token"));
+        assert!(!safe.contains("abc12345"));
+        assert!(!safe.chars().any(char::is_control));
+        assert!(safe.contains("Bearer <redacted>"));
+        assert!(safe.contains("relay_token=<redacted>"));
+        assert!(user.contains("pairing_failed"));
+        assert_eq!(error.exit_code(), 5);
+    }
+
+    #[test]
+    fn auth_failed_protocol_code_keeps_existing_exit_code_mapping() {
+        let error = TermctlError::Protocol {
+            code: "auth_failed".to_owned(),
+            message: "authorization=Bearer secret-token".to_owned(),
+        };
+
+        assert_eq!(error.exit_code(), 4);
+        assert!(error.safe_message().contains("<redacted>"));
     }
 }

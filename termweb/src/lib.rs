@@ -27,34 +27,37 @@ pub fn embedded_web_response(method: &Method, path: &str) -> Response<Body> {
         return asset_response(asset, &normalized, method == Method::HEAD);
     }
 
-    if let Some(asset_path) = strip_static_asset_prefix(&normalized) {
-        if let Some(asset) = embedded_asset(asset_path) {
-            return asset_response(asset, asset_path, method == Method::HEAD);
-        }
+    if let Some(asset_path) = strip_static_asset_prefix(&normalized)
+        && let Some(asset) = embedded_asset(asset_path)
+    {
+        return asset_response(asset, asset_path, method == Method::HEAD);
     }
 
-    if should_fallback_to_index(&normalized) {
-        if let Some(index) = embedded_asset("index.html") {
-            return asset_response(index, "index.html", method == Method::HEAD);
-        }
+    if should_fallback_to_index(&normalized)
+        && let Some(index) = embedded_asset("index.html")
+    {
+        return asset_response(index, "index.html", method == Method::HEAD);
     }
 
     StatusCode::NOT_FOUND.into_response()
 }
 
 fn strip_static_asset_prefix(path: &str) -> Option<&str> {
-    if path.ends_with("/index.html") {
-        return Some("index.html");
+    let (_mount_prefix, asset_path) = path.split_once('/')?;
+    if is_static_asset_path(asset_path) {
+        Some(asset_path)
+    } else {
+        None
     }
-    if path.ends_with("/manifest.webmanifest") {
-        return Some("manifest.webmanifest");
-    }
-    for marker in ["assets/", "icons/"] {
-        if let Some(index) = path.find(marker) {
-            return Some(&path[index..]);
-        }
-    }
-    None
+}
+
+fn is_static_asset_path(path: &str) -> bool {
+    path == "index.html"
+        || path == "manifest.webmanifest"
+        || path == "service-worker.js"
+        || path.starts_with("assets/")
+        || path.starts_with("fonts/")
+        || path.starts_with("icons/")
 }
 
 fn normalize_path(path: &str) -> String {
@@ -68,6 +71,8 @@ fn normalize_path(path: &str) -> String {
 
 fn should_fallback_to_index(path: &str) -> bool {
     if path.starts_with("assets/")
+        || path == "api"
+        || path.starts_with("api/")
         || path.starts_with("ws")
         || path.starts_with("healthz")
         || path.starts_with("local/")
@@ -84,14 +89,11 @@ fn should_fallback_to_index(path: &str) -> bool {
 }
 
 fn asset_response(asset: &'static [u8], path: &str, head_only: bool) -> Response<Body> {
-    let content_type = mime_guess::from_path(path)
-        .first_or_octet_stream()
-        .to_string();
     let cache_control = cache_control_for(path);
 
     Response::builder()
         .status(StatusCode::OK)
-        .header(CONTENT_TYPE, content_type)
+        .header(CONTENT_TYPE, content_type_for(path))
         .header(CACHE_CONTROL, cache_control)
         .header(X_CONTENT_TYPE_OPTIONS, "nosniff")
         .body(if head_only {
@@ -100,6 +102,21 @@ fn asset_response(asset: &'static [u8], path: &str, head_only: bool) -> Response
             Body::from(asset)
         })
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+fn content_type_for(path: &str) -> &'static str {
+    match path.rsplit('.').next().unwrap_or_default() {
+        "css" => "text/css; charset=utf-8",
+        "html" => "text/html; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "json" | "webmanifest" => "application/manifest+json; charset=utf-8",
+        "svg" => "image/svg+xml",
+        "ttf" => "font/ttf",
+        "wasm" => "application/wasm",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        _ => "application/octet-stream",
+    }
 }
 
 fn cache_control_for(_path: &str) -> &'static str {
@@ -151,6 +168,18 @@ mod tests {
             StatusCode::NOT_FOUND
         );
         assert_eq!(
+            embedded_web_response(&Method::GET, "/api").status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            embedded_web_response(&Method::GET, "/api/").status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            embedded_web_response(&Method::GET, "/api/control/session/list").status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
             embedded_web_response(&Method::GET, "/local/pairing-token").status(),
             StatusCode::NOT_FOUND
         );
@@ -171,6 +200,14 @@ mod tests {
             StatusCode::OK
         );
         assert_eq!(
+            strip_static_asset_prefix("termd/service-worker.js"),
+            Some("service-worker.js")
+        );
+        assert_eq!(
+            strip_static_asset_prefix("termd/fonts/HarmonyOS_Sans_SC_Regular.ttf"),
+            Some("fonts/HarmonyOS_Sans_SC_Regular.ttf")
+        );
+        assert_eq!(
             strip_static_asset_prefix("termd/assets/index.js"),
             Some("assets/index.js")
         );
@@ -181,6 +218,10 @@ mod tests {
         assert_eq!(
             strip_static_asset_prefix("termd/manifest.webmanifest"),
             Some("manifest.webmanifest")
+        );
+        assert_eq!(
+            strip_static_asset_prefix("nested/termd/assets/index.js"),
+            None
         );
     }
 }

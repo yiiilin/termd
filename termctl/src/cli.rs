@@ -894,9 +894,9 @@ impl TerminalRawModeGuard {
 fn local_terminal_size() -> Option<TerminalSize> {
     #[cfg(unix)]
     {
-        return [libc::STDOUT_FILENO, libc::STDIN_FILENO, libc::STDERR_FILENO]
+        [libc::STDOUT_FILENO, libc::STDIN_FILENO, libc::STDERR_FILENO]
             .into_iter()
-            .find_map(terminal_size_from_fd);
+            .find_map(terminal_size_from_fd)
     }
 
     #[cfg(not(unix))]
@@ -1432,7 +1432,8 @@ mod tests {
 
     #[test]
     fn reconnect_attempt_budget_is_finite() {
-        assert!(RECONNECT_MAX_ATTEMPTS > 0);
-        assert!(RECONNECT_MAX_ATTEMPTS <= 60);
+        let reconnect_max_attempts = RECONNECT_MAX_ATTEMPTS;
+        assert!(reconnect_max_attempts > 0);
+        assert!(reconnect_max_attempts <= 60);
     }
 }

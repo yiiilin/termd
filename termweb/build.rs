@@ -56,6 +56,7 @@ fn resolve_source_dir() -> Result<Option<PathBuf>, Box<dyn Error>> {
         } else {
             env::current_dir()?.join(path)
         };
+        emit_rerun_for_candidate(&resolved);
         if has_index_html(&resolved) {
             return Ok(Some(resolved));
         }
@@ -63,11 +64,21 @@ fn resolve_source_dir() -> Result<Option<PathBuf>, Box<dyn Error>> {
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
     let workspace_dist = manifest_dir.join("../termui/frontend/dist");
+    emit_rerun_for_candidate(&workspace_dist);
     if has_index_html(&workspace_dist) {
         return Ok(Some(workspace_dist));
     }
 
     Ok(None)
+}
+
+fn emit_rerun_for_candidate(path: &Path) {
+    // dist 可能在第一次 Rust 构建后才由前端构建产出；监听目录和 index，避免占位页长期留在 OUT_DIR。
+    println!("cargo:rerun-if-changed={}", path.display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        path.join("index.html").display()
+    );
 }
 
 fn has_index_html(path: &Path) -> bool {

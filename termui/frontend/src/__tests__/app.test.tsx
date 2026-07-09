@@ -28,6 +28,7 @@ import type {
 } from "../protocol/types";
 import { concatBytes, encodeUtf8, sessionDataFromBase64 } from "../protocol/wire";
 import { DirectClient } from "../protocol/direct-client";
+import { displayUrlWithoutQueryOrFragment } from "../protocol/url";
 import { clearBrowserState, loadBrowserState } from "../state/browser-state";
 import { MockDaemon } from "../test/mock-daemon";
 import { fallbackSessionDisplayName } from "../session-names";
@@ -615,7 +616,8 @@ async function expectDaemonUrlInAdmin(user: ReturnType<typeof userEvent.setup>, 
     await user.click(screen.getByRole("button", { name: "Daemons" }));
   }
   const admin = await screen.findByLabelText("daemon admin");
-  await waitFor(() => expect(within(admin).getAllByText(url).length).toBeGreaterThan(0));
+  const displayUrl = displayUrlWithoutQueryOrFragment(url);
+  await waitFor(() => expect(within(admin).getAllByText(displayUrl).length).toBeGreaterThan(0));
 }
 
 async function waitForWorkspaceSession(name?: string, options: { timeout?: number } = {}): Promise<void> {

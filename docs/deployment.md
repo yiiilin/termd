@@ -198,11 +198,11 @@ release 资产和 GHCR 镜像都由同一个 tag 驱动。发布流水线会把 
 ### `termctl`
 
 ```bash
-curl -fsSL https://github.com/OWNER/REPO/releases/latest/download/install-termctl.sh | sudo bash
+curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termctl.sh | sudo bash
 ```
 
 ```bash
-wget -qO- https://github.com/OWNER/REPO/releases/latest/download/install-termctl.sh | sudo bash
+wget -qO- https://github.com/yiiilin/termd/releases/latest/download/install-termctl.sh | sudo bash
 ```
 
 `termctl` 的脚本只安装二进制到 `/usr/local/bin/termctl`，不注册 systemd 服务。
@@ -210,11 +210,11 @@ wget -qO- https://github.com/OWNER/REPO/releases/latest/download/install-termctl
 ### `termd`
 
 ```bash
-curl -fsSL https://github.com/OWNER/REPO/releases/latest/download/install-termd.sh | sudo bash
+curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termd.sh | sudo bash
 ```
 
 ```bash
-wget -qO- https://github.com/OWNER/REPO/releases/latest/download/install-termd.sh | sudo bash
+wget -qO- https://github.com/yiiilin/termd/releases/latest/download/install-termd.sh | sudo bash
 ```
 
 `termd` 脚本会安装二进制、创建 `termd.service`、写入 `/etc/termd/termd.env`（如不存在）并启用服务。默认只监听 `127.0.0.1:8765`，relay 和 TLS 通过 env 文件可选配置。服务启动后，脚本会在当前终端打印一份短期一次性 `termd-pair:v2` 邀请码和 `termctl pair --payload` 示例；邀请材料不会写入配置文件，过期或用过后可在 daemon 主机上运行 `termd pair --qr` 重新签发。
@@ -226,11 +226,11 @@ wget -qO- https://github.com/OWNER/REPO/releases/latest/download/install-termd.s
 ### `termrelay`
 
 ```bash
-curl -fsSL https://github.com/OWNER/REPO/releases/latest/download/install-termrelay.sh | sudo bash
+curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termrelay.sh | sudo bash
 ```
 
 ```bash
-wget -qO- https://github.com/OWNER/REPO/releases/latest/download/install-termrelay.sh | sudo bash
+wget -qO- https://github.com/yiiilin/termd/releases/latest/download/install-termrelay.sh | sudo bash
 ```
 
 `termrelay` 脚本会安装二进制、创建 `termrelay.service`、写入 `/etc/termd/termrelay.env`（如不存在）并启用服务。默认只监听 `127.0.0.1:8080`，公开入口仍建议走反向代理。可信 relay 生产部署还应在 env 或 systemd override 中配置 daemon registry 文件。
@@ -263,6 +263,7 @@ wget -qO- https://github.com/OWNER/REPO/releases/latest/download/install-termrel
 - tag 推送后，GitHub Actions 会：
   - 运行 workspace 测试，确认 release tag 与 `Cargo.toml` 版本一致。
   - 构建 `termd`、`termrelay`、`termctl` 的 Linux amd64 release tarball。二进制使用 `x86_64-unknown-linux-musl` 静态链接，并在打包前先构建 `termui/frontend` 的静态资源，确保 `termd` 和 `termrelay` 的内嵌 Web 可用。
+  - 当前不发布 Linux arm64 tarball；arm64 安装脚本会跳过 release asset 并从源码构建，不承诺不存在的 arm64 资产。
   - 生成 `checksums.txt` 和带默认仓库/版本的安装脚本，并上传到 GitHub Release。
   - 推送 `ghcr.io/<owner>/termd:<tag>`、`ghcr.io/<owner>/termrelay:<tag>`、`ghcr.io/<owner>/termctl:<tag>` 镜像。
   - 这些镜像使用 `scratch` 运行层；`termd` 和 `termrelay` 同样会内嵌 Web 静态资源。
@@ -303,5 +304,5 @@ cargo run -p termrelay -- --listen 127.0.0.1:8080 --allow-open-relay
 如果使用容器做本机无认证检查，也应只绑定到 loopback：
 
 ```bash
-docker run --rm -p 127.0.0.1:8080:8080 ghcr.io/OWNER/termrelay:0.3.11 --listen 0.0.0.0:8080 --allow-open-relay
+docker run --rm -p 127.0.0.1:8080:8080 ghcr.io/yiiilin/termrelay:0.6.4 --listen 0.0.0.0:8080 --allow-open-relay
 ```

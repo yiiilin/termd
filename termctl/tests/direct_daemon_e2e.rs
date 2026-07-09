@@ -342,6 +342,7 @@ fn run_resize_until_success(
 }
 
 fn run_termctl_success(state_path: &Path, args: &[&str]) -> Output {
+    let redacted_args = redacted_termctl_args(args);
     let output = run_termctl_raw(
         state_path,
         args,
@@ -352,7 +353,7 @@ fn run_termctl_success(state_path: &Path, args: &[&str]) -> Output {
     assert!(
         output.status.success(),
         "termctl {:?} failed\nstdout:\n{}\nstderr:\n{}",
-        args,
+        redacted_args,
         stdout_string(&output),
         stderr_string(&output)
     );
@@ -360,6 +361,7 @@ fn run_termctl_success(state_path: &Path, args: &[&str]) -> Output {
 }
 
 fn run_termctl_failure(state_path: &Path, args: &[&str]) -> Output {
+    let redacted_args = redacted_termctl_args(args);
     let output = run_termctl_raw(
         state_path,
         args,
@@ -370,7 +372,7 @@ fn run_termctl_failure(state_path: &Path, args: &[&str]) -> Output {
     assert!(
         !output.status.success(),
         "termctl {:?} unexpectedly succeeded\nstdout:\n{}\nstderr:\n{}",
-        args,
+        redacted_args,
         stdout_string(&output),
         stderr_string(&output)
     );
@@ -399,6 +401,50 @@ fn base_termctl_command(state_path: &Path) -> Command {
     command
 }
 
+fn redacted_termctl_args(args: &[&str]) -> Vec<String> {
+    let mut redacted = Vec::with_capacity(args.len());
+    let mut index = 0;
+
+    while index < args.len() {
+        let arg = args[index];
+        match arg {
+            "pair" => {
+                redacted.push(arg.to_owned());
+                if let Some(invite) = args.get(index + 1)
+                    && !invite.starts_with('-')
+                {
+                    redacted.push("<pairing-invite>".to_owned());
+                    index += 2;
+                    continue;
+                }
+            }
+            "--token" | "--payload" => {
+                redacted.push(arg.to_owned());
+                if args.get(index + 1).is_some() {
+                    redacted.push("<redacted>".to_owned());
+                    index += 2;
+                    continue;
+                }
+            }
+            _ if looks_like_pairing_invite(arg) => {
+                redacted.push("<pairing-invite>".to_owned());
+                index += 1;
+                continue;
+            }
+            _ => {}
+        }
+
+        redacted.push(arg.to_owned());
+        index += 1;
+    }
+
+    redacted
+}
+
+fn looks_like_pairing_invite(value: &str) -> bool {
+    value.starts_with("termd-pair:")
+}
+
 fn parse_session_id(stdout: &str) -> String {
     stdout
         .split_whitespace()
@@ -413,4 +459,26 @@ fn stdout_string(output: &Output) -> String {
 
 fn stderr_string(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+#[test]
+fn helper_redacts_pairing_invite_and_secret_flag_values() {
+    let redacted = redacted_termctl_args(&[
+        "pair",
+        "termd-pair:invite-secret",
+        "--token",
+        "token-secret",
+        "--payload",
+        "payload-secret",
+        "--url",
+        "ws://127.0.0.1:8765/ws",
+    ]);
+
+    let joined = redacted.join(" ");
+
+    assert!(!joined.contains("invite-secret"));
+    assert!(!joined.contains("token-secret"));
+    assert!(!joined.contains("payload-secret"));
+    assert!(joined.contains("<pairing-invite>"));
+    assert_eq!(joined.matches("<redacted>").count(), 2);
 }

@@ -273,7 +273,7 @@ jobs:
 
   images:
     name: build and push images
-    needs: validate
+    needs: [validate, package]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false

@@ -2,14 +2,14 @@
   "name": "Termd",
   "short_name": "Termd",
   "description": "Personal persistent terminal workspace",
-  "start_url": "/",
-  "scope": "/",
+  "start_url": "./",
+  "scope": "./",
   "display": "standalone",
   "background_color": "#0c1210",
   "theme_color": "#0c1210",
   "icons": [
     {
-      "src": "/icons/termd.svg",
+      "src": "./icons/termd.svg",
       "sizes": "any",
       "type": "image/svg+xml",
       "purpose": "any maskable"

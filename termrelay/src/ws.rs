@@ -75,6 +75,10 @@ const HTTP_TUNNEL_BODY_CHANNEL_CAPACITY: usize = 1;
 const HTTP_TUNNEL_SHORT_REQUEST_BODY_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(test)]
 const HTTP_TUNNEL_SHORT_REQUEST_BODY_TIMEOUT: Duration = Duration::from_millis(50);
+#[cfg(not(test))]
+const HTTP_TUNNEL_RESPONSE_HEAD_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const HTTP_TUNNEL_RESPONSE_HEAD_TIMEOUT: Duration = Duration::from_millis(100);
 // 中文注释：route_ready 之后 client 可能先发少量业务数据，但 daemon data 必须及时接上；
 // 超时后只关闭 relay transport，daemon session 本身仍由 daemon 管理。
 #[cfg(not(test))]
@@ -229,7 +233,7 @@ impl From<OpaqueFrame> for Message {
 }
 
 fn relay_auth_token_has_safe_length(token: &str) -> bool {
-    token.as_bytes().len() >= RELAY_AUTH_TOKEN_MIN_BYTES
+    token.len() >= RELAY_AUTH_TOKEN_MIN_BYTES
 }
 
 fn relay_auth_token_constant_time_eq(expected: &str, provided: &str) -> bool {
@@ -287,7 +291,7 @@ fn prune_expired_pair_tickets(admission: &mut RelayAdmissionState, now_ms: u64) 
 fn prune_expired_device_admission_nonces(admission: &mut RelayAdmissionState, now_ms: u64) {
     admission
         .device_admission_nonces
-        .retain(|_, expires_at_ms| expires_at_ms.0 > now_ms);
+        .retain(|_, expires_at_ms| expires_at_ms.0 >= now_ms);
 }
 
 fn decode_ed25519_wire(value: &str, expected_len: usize) -> Result<Vec<u8>, ()> {
@@ -615,6 +619,10 @@ impl RelayState {
         self.inner.room_count()
     }
 
+    pub fn daemon_control_stats(&self) -> (usize, ConnectionId) {
+        self.inner.daemon_control_stats()
+    }
+
     pub fn trusted_admission_enabled(&self) -> bool {
         self.admission
             .read()
@@ -830,9 +838,9 @@ impl RelayState {
             ConnectionRole::Client => match prelude.admission.as_ref() {
                 Some(RelayAdmissionPayload::PairTicket { token }) => {
                     let token_hash = relay_daemon_token_hash(&token.0);
-                    let Some(expires_at_ms) = admission_state
-                        .pair_ticket_hashes
-                        .get(&(prelude.server_id, token_hash))
+                    let ticket_key = (prelude.server_id, token_hash);
+                    let Some(expires_at_ms) =
+                        admission_state.pair_ticket_hashes.remove(&ticket_key)
                     else {
                         return Err(RelayError::AdmissionRejected);
                     };
@@ -1605,7 +1613,7 @@ mod tests {
     use ed25519_dalek::{Signer, SigningKey};
     use futures_util::{SinkExt, StreamExt};
     use termd_proto::{
-        Envelope, ErrorPayload, Nonce, PROTOCOL_PACKET_VERSION, ProtocolVersion,
+        Envelope, ErrorPayload, Nonce, PROTOCOL_PACKET_VERSION, PairingToken, ProtocolVersion,
         RelayHttpTunnelFrame, RouteHelloPayload, RouteReadyPayload, UnixTimestampMillis,
         decode_relay_http_tunnel_frame, encode_relay_http_tunnel_request_body,
     };
@@ -2273,8 +2281,10 @@ mod tests {
     fn relay_data_channel_capacity_does_not_limit_small_terminal_frames_before_byte_budget() {
         // 中文注释：浏览器离线或慢消费时，小 terminal frame 应主要受字节预算保护。
         // 100ms 千兆链路的 BDP 约为 12.5MB；预算低于这个量级会人为填不满管道。
-        assert!(DATA_CHANNEL_BYTE_BUDGET >= 12 * 1024 * 1024);
-        assert!(DATA_CHANNEL_CAPACITY >= DATA_CHANNEL_BYTE_BUDGET / 512);
+        let byte_budget = DATA_CHANNEL_BYTE_BUDGET;
+        let capacity = DATA_CHANNEL_CAPACITY;
+        assert!(byte_budget >= 12 * 1024 * 1024);
+        assert!(capacity >= byte_budget / 512);
     }
 
     #[test]
@@ -2974,6 +2984,45 @@ mod tests {
     }
 
     #[test]
+    fn trusted_relay_pair_ticket_admission_consumes_ticket_once() {
+        let server_id = server_id(126);
+        let state = RelayState::new_trusted(
+            None,
+            vec![RelayDaemonCredential::plain_token(
+                server_id,
+                "daemon-secret-1".to_owned(),
+            )],
+        );
+        let pair_ticket = "pair-ticket-secret-1".to_owned();
+        state
+            .register_pair_ticket(
+                server_id,
+                pair_ticket.clone(),
+                UnixTimestampMillis(relay_now_ms().saturating_add(60_000)),
+                Some("daemon-secret-1"),
+            )
+            .expect("daemon should be able to register a short-lived pair ticket");
+        let prelude = RoutePrelude {
+            server_id,
+            route_role: RouteRole::Client,
+            connection_role: ConnectionRole::Client,
+            admission: Some(RelayAdmissionPayload::PairTicket {
+                token: PairingToken(pair_ticket),
+            }),
+            route_generation: None,
+            client_id: None,
+            data_token: None,
+        };
+
+        assert!(state.authorize_route_admission(&prelude).is_ok());
+        assert_eq!(
+            state.authorize_route_admission(&prelude),
+            Err(RelayError::AdmissionRejected),
+            "pair ticket 一旦成功消费，就不能在 TTL 内再次入场"
+        );
+    }
+
+    #[test]
     fn trusted_relay_device_admission_rejects_replay_and_stale_timestamp() {
         let server_id = server_id(124);
         let device_id = DeviceId::new();
@@ -3022,6 +3071,29 @@ mod tests {
                 ..prelude
             }),
             Err(RelayError::AdmissionRejected)
+        );
+    }
+
+    #[test]
+    fn trusted_relay_device_admission_nonce_prune_keeps_exact_expiry_boundary() {
+        let server_id = server_id(127);
+        let device_id = DeviceId::new();
+        let nonce_key = (server_id, device_id, "boundary-nonce".to_owned());
+        let mut admission = RelayAdmissionState::default();
+        admission
+            .device_admission_nonces
+            .insert(nonce_key.clone(), UnixTimestampMillis(10_000));
+
+        prune_expired_device_admission_nonces(&mut admission, 10_000);
+        assert!(
+            admission.device_admission_nonces.contains_key(&nonce_key),
+            "timestamp + skew == now 时 nonce 仍应保留，用来挡住同毫秒 replay"
+        );
+
+        prune_expired_device_admission_nonces(&mut admission, 10_001);
+        assert!(
+            !admission.device_admission_nonces.contains_key(&nonce_key),
+            "超过边界后 nonce 才能被清理"
         );
     }
 
@@ -3301,6 +3373,98 @@ mod tests {
             panic!("expected HTTP tunnel request body");
         };
         assert_eq!(body, b"large-upload-fragment");
+    }
+
+    #[tokio::test]
+    async fn http_tunnel_response_head_timeout_unregisters_client_and_data_pipe() {
+        let state = RelayState::default();
+        let server_id = server_id(94);
+        let (control_tx, mut control_rx) = channel();
+        state
+            .register(server_id, ConnectionRole::DaemonControl, control_tx)
+            .unwrap();
+
+        let tunnel_state = state.clone();
+        let tunnel = tokio::spawn(async move {
+            tunnel_state
+                .http_tunnel(
+                    server_id,
+                    "GET".to_owned(),
+                    "/api/control/session/list".to_owned(),
+                    Vec::new(),
+                    None,
+                    Body::empty().into_data_stream(),
+                )
+                .await
+        });
+
+        let RelayOutbound::Frame(open_frame) = control_rx.control.recv().await.unwrap() else {
+            panic!("daemon control should receive open_data");
+        };
+        let RelayControlEnvelope::OpenData {
+            client_id,
+            data_token,
+        } = relay_control_from_frame(&open_frame).unwrap()
+        else {
+            panic!("expected open_data");
+        };
+        let (data_tx, mut data_rx) = channel();
+        let data_registration = state
+            .register_route(
+                &RoutePrelude {
+                    server_id,
+                    route_role: RouteRole::DaemonData,
+                    connection_role: ConnectionRole::DaemonData,
+                    admission: None,
+                    route_generation: Some(test_route_generation(server_id)),
+                    client_id: Some(client_id),
+                    data_token: Some(data_token),
+                },
+                data_tx,
+            )
+            .unwrap();
+        state.flush_pre_pair_client_frames(&data_registration).await;
+
+        let mut saw_request_head = false;
+        let mut saw_request_end = false;
+        for _ in 0..2 {
+            let RelayOutbound::Frame(OpaqueFrame::Binary(request_wire)) =
+                data_rx.data.recv().await.unwrap()
+            else {
+                panic!("daemon data should receive HTTP tunnel request frames");
+            };
+            match decode_relay_http_tunnel_frame(&request_wire).unwrap() {
+                RelayHttpTunnelFrame::RequestHead { .. } => saw_request_head = true,
+                RelayHttpTunnelFrame::RequestEnd => saw_request_end = true,
+                other => panic!("unexpected HTTP tunnel request frame: {other:?}"),
+            }
+        }
+        assert!(saw_request_head);
+        assert!(saw_request_end);
+
+        let result = timeout(Duration::from_secs(1), tunnel)
+            .await
+            .expect("relay should time out waiting for response head")
+            .expect("HTTP tunnel task should not panic");
+        match result {
+            Err(status) => assert_eq!(status, StatusCode::GATEWAY_TIMEOUT),
+            Ok(response) => panic!("expected response head timeout, got {}", response.status()),
+        }
+
+        timeout(Duration::from_millis(100), async {
+            loop {
+                match data_rx.data.recv().await {
+                    Some(RelayOutbound::Close) | None => break,
+                    Some(_) => {}
+                }
+            }
+        })
+        .await
+        .expect("response head timeout should close paired data pipe");
+        assert!(
+            !state.has_client(server_id, client_id),
+            "response head timeout should unregister synthetic client"
+        );
     }
 
     #[tokio::test]

@@ -9,7 +9,7 @@
 //! 可以实现 `TrustedDeviceStore`，并复用同一组查询边界来拒绝未配对设备。
 
 use base64::{Engine as _, engine::general_purpose};
-use ed25519_dalek::{Signer, SigningKey};
+use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use rand_core::OsRng;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -32,6 +32,7 @@ pub type SessionTokenResult<T> = Result<T, SessionTokenError>;
 
 const ED25519_WIRE_PREFIX: &str = "ed25519-v1:";
 const ED25519_PRIVATE_KEY_LEN: usize = 32;
+const ED25519_PUBLIC_KEY_LEN: usize = 32;
 
 /// 设备信任查询的错误。
 ///
@@ -73,6 +74,8 @@ pub enum PairingError {
     AlreadyUsedToken,
     /// token 已被 daemon 主动撤销。
     RevokedToken,
+    /// pairing 阶段收到的设备公钥不符合 Ed25519 wire 编码约定。
+    InvalidDevicePublicKey,
     /// ttl 必须为正数，并且不能让过期时间发生整数溢出。
     InvalidTtl { ttl_ms: u64 },
 }
@@ -111,6 +114,7 @@ impl fmt::Display for PairingError {
             Self::ExpiredToken { .. } => write!(f, "pairing token is expired"),
             Self::AlreadyUsedToken => write!(f, "pairing token was already used"),
             Self::RevokedToken => write!(f, "pairing token was revoked"),
+            Self::InvalidDevicePublicKey => write!(f, "device public key wire format is invalid"),
             Self::InvalidTtl { .. } => write!(f, "pairing token ttl is invalid"),
         }
     }
@@ -988,6 +992,9 @@ impl PairingService {
             timestamp_ms: _,
         } = request;
 
+        // 中文注释：pairing 阶段就收紧设备公钥 wire 形状，避免 direct 模式先返回成功，
+        // 后续 auth 再因为坏 key 失败，或把坏 key 写进本地 trust store。
+        validate_device_public_key_wire(&device_public_key)?;
         let token_record = self.token_manager.consume(&token, now_ms)?;
         let device_identity = DeviceIdentity::new(device_id, device_public_key);
         let public_identity = daemon_identity.public_identity();
@@ -2425,6 +2432,22 @@ fn daemon_wire_prefixed(bytes: &[u8]) -> String {
     )
 }
 
+fn validate_device_public_key_wire(public_key: &PublicKey) -> PairingResult<()> {
+    let encoded = public_key
+        .0
+        .strip_prefix(ED25519_WIRE_PREFIX)
+        .ok_or(PairingError::InvalidDevicePublicKey)?;
+    let bytes = general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|_| PairingError::InvalidDevicePublicKey)?;
+    let public_key_bytes: [u8; ED25519_PUBLIC_KEY_LEN] = bytes
+        .try_into()
+        .map_err(|_| PairingError::InvalidDevicePublicKey)?;
+    VerifyingKey::from_bytes(&public_key_bytes)
+        .map_err(|_| PairingError::InvalidDevicePublicKey)?;
+    Ok(())
+}
+
 fn decode_daemon_signing_key(private_key: &str) -> Result<SigningKey, DaemonIdentityError> {
     let encoded = private_key
         .strip_prefix(ED25519_WIRE_PREFIX)
@@ -2468,6 +2491,11 @@ mod tests {
 
     fn signature(value: &str) -> termd_proto::Signature {
         termd_proto::Signature(value.to_owned())
+    }
+
+    fn ed25519_public_key_wire(seed: u8) -> PublicKey {
+        let signing_key = SigningKey::from_bytes(&[seed; ED25519_PRIVATE_KEY_LEN]);
+        PublicKey(daemon_wire_prefixed(signing_key.verifying_key().as_bytes()))
     }
 
     fn decode_test_wire_bytes(value: &str, expected_len: usize) -> Vec<u8> {
@@ -3606,7 +3634,7 @@ mod tests {
         let daemon_identity = DaemonIdentity::generate();
         let daemon_public_identity = daemon_identity.public_identity();
         let device_id = DeviceId::new();
-        let device_public_key = public_key("device-a-public");
+        let device_public_key = ed25519_public_key_wire(7);
         let mut trusted_store = InMemoryTrustedDeviceStore::new();
         let mut service = PairingService::new(PairingTokenManager::new());
         let issued = service.issue_token(timestamp(1000), 500).unwrap();
@@ -3639,7 +3667,7 @@ mod tests {
     fn consume_pair_request_waits_for_caller_to_trust_device() {
         let daemon_identity = DaemonIdentity::generate();
         let device_id = DeviceId::new();
-        let device_public_key = public_key("device-pending-public");
+        let device_public_key = ed25519_public_key_wire(8);
         let mut trusted_store = InMemoryTrustedDeviceStore::new();
         let mut service = PairingService::new(PairingTokenManager::new());
         let issued = service.issue_token(timestamp(1000), 500).unwrap();
@@ -3671,7 +3699,7 @@ mod tests {
     fn pair_request_with_invalid_token_does_not_trust_device() {
         let daemon_identity = DaemonIdentity::generate();
         let device_id = DeviceId::new();
-        let device_public_key = public_key("device-a-public");
+        let device_public_key = ed25519_public_key_wire(9);
         let mut trusted_store = InMemoryTrustedDeviceStore::new();
         let mut service = PairingService::new(PairingTokenManager::new());
 
@@ -3696,7 +3724,7 @@ mod tests {
     fn pair_request_with_expired_token_does_not_trust_device() {
         let daemon_identity = DaemonIdentity::generate();
         let device_id = DeviceId::new();
-        let device_public_key = public_key("device-a-public");
+        let device_public_key = ed25519_public_key_wire(10);
         let mut trusted_store = InMemoryTrustedDeviceStore::new();
         let mut service = PairingService::new(PairingTokenManager::new());
         let issued = service.issue_token(timestamp(1000), 500).unwrap();
@@ -3722,5 +3750,54 @@ mod tests {
             }
         );
         assert!(!trusted_store.is_trusted(&device_id));
+    }
+
+    #[test]
+    fn pair_request_with_invalid_device_public_key_is_rejected_without_consuming_token() {
+        let daemon_identity = DaemonIdentity::generate();
+        let device_id = DeviceId::new();
+        let valid_device_public_key = ed25519_public_key_wire(11);
+        let mut trusted_store = InMemoryTrustedDeviceStore::new();
+        let mut service = PairingService::new(PairingTokenManager::new());
+        let issued = service.issue_token(timestamp(1000), 500).unwrap();
+
+        let error = service
+            .accept_pair_request(
+                termd_proto::PairRequestPayload {
+                    device_id,
+                    device_public_key: public_key("ed25519-v1:not-base64"),
+                    token: issued.token().clone(),
+                    nonce: termd_proto::Nonce("pair-nonce".to_owned()),
+                    timestamp_ms: timestamp(1100),
+                },
+                timestamp(1100),
+                &daemon_identity,
+                &mut trusted_store,
+            )
+            .unwrap_err();
+
+        assert_eq!(error, PairingError::InvalidDevicePublicKey);
+        assert!(!trusted_store.is_trusted(&device_id));
+
+        let accept = service
+            .accept_pair_request(
+                termd_proto::PairRequestPayload {
+                    device_id,
+                    device_public_key: valid_device_public_key.clone(),
+                    token: issued.token().clone(),
+                    nonce: termd_proto::Nonce("pair-nonce-2".to_owned()),
+                    timestamp_ms: timestamp(1101),
+                },
+                timestamp(1101),
+                &daemon_identity,
+                &mut trusted_store,
+            )
+            .unwrap();
+
+        assert_eq!(accept.device_id, device_id);
+        assert!(
+            trusted_store
+                .is_trusted_identity(&DeviceIdentity::new(device_id, valid_device_public_key,))
+        );
     }
 }

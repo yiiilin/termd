@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use axum::body::{Body, Bytes, to_bytes};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{ConnectInfo, Path, State};
+use axum::extract::{ConnectInfo, OriginalUri, Path, State};
 use axum::http::header::{CONTENT_TYPE, HeaderName};
 use axum::http::{HeaderMap, Method, Request, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
@@ -610,10 +610,22 @@ pub fn router(protocol: SharedDaemonProtocol, web_enabled: bool) -> Router {
         .with_state(protocol);
 
     if web_enabled {
-        router.fallback(termweb::embedded_web_handler)
+        router.fallback(web_or_api_fallback)
     } else {
         router
     }
+}
+
+async fn web_or_api_fallback(method: Method, uri: OriginalUri) -> Response {
+    if is_api_fallback_path(uri.0.path()) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    termweb::embedded_web_handler(method, uri).await
+}
+
+fn is_api_fallback_path(path: &str) -> bool {
+    path == "/api" || path.starts_with("/api/")
 }
 
 fn http_control_api_router() -> Router<SharedDaemonProtocol> {
@@ -1026,11 +1038,12 @@ fn parse_http_control_path(path: &str) -> Result<(String, Option<SessionId>), Pr
     if segments.is_empty() {
         return Err(ProtocolError::InvalidEnvelope);
     }
-    if segments.len() >= 3 && segments[0] == "session" {
-        if let Ok(session_uuid) = segments[1].parse() {
-            let method = format!("session.{}", segments[2..].join("."));
-            return Ok((method, Some(SessionId(session_uuid))));
-        }
+    if segments.len() >= 3
+        && segments[0] == "session"
+        && let Ok(session_uuid) = segments[1].parse()
+    {
+        let method = format!("session.{}", segments[2..].join("."));
+        return Ok((method, Some(SessionId(session_uuid))));
     }
     Ok((segments.join("."), None))
 }
@@ -1744,6 +1757,7 @@ async fn http_file_download(
     (StatusCode::OK, Body::from_stream(stream)).into_response()
 }
 
+#[allow(clippy::result_large_err)]
 fn http_e2ee_auth_from_headers(
     headers: &HeaderMap,
     method: &Method,
@@ -1772,6 +1786,7 @@ fn http_e2ee_auth_from_headers(
     })
 }
 
+#[allow(clippy::result_large_err)]
 fn http_e2ee_auth_from_control_headers(
     headers: &HeaderMap,
     method: &Method,
@@ -1808,6 +1823,7 @@ struct HttpControlAuth {
     session_scope_token: Option<SessionToken>,
 }
 
+#[allow(clippy::result_large_err)]
 fn http_bearer_control_auth_from_headers(headers: &HeaderMap) -> Result<HttpControlAuth, Response> {
     let authorization = http_control_header(headers, "authorization")?;
     let bearer = authorization
@@ -1836,6 +1852,7 @@ fn http_bearer_control_auth_from_headers(headers: &HeaderMap) -> Result<HttpCont
     })
 }
 
+#[allow(clippy::result_large_err)]
 fn http_control_header<'a>(headers: &'a HeaderMap, name: &str) -> Result<&'a str, Response> {
     headers
         .get(name)
@@ -1844,6 +1861,7 @@ fn http_control_header<'a>(headers: &'a HeaderMap, name: &str) -> Result<&'a str
         .ok_or_else(|| http_e2ee_error(StatusCode::UNAUTHORIZED, ProtocolError::AuthFailed))
 }
 
+#[allow(clippy::result_large_err)]
 fn http_required_header<'a>(headers: &'a HeaderMap, name: &str) -> Result<&'a str, Response> {
     headers
         .get(name)
@@ -1863,6 +1881,7 @@ fn encode_http_control_packet_responses(
     Ok(Body::from(body))
 }
 
+#[allow(clippy::result_large_err)]
 fn http_header<'a>(headers: &'a HeaderMap, name: &str) -> Result<&'a str, Response> {
     headers
         .get(name)
@@ -3375,6 +3394,7 @@ async fn collect_websocket_push_event(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn register_session_watchers(
     connection: &ProtocolConnection,
     protocol: &SharedDaemonProtocol,
@@ -3521,18 +3541,18 @@ async fn register_metadata_watchers(
         *watched_metadata_status_interval_ms = None;
     }
 
-    if let Some(signal) = clients_signal {
-        if !*watched_metadata_clients {
-            *watched_metadata_clients = true;
-            spawn_metadata_clients_push_watcher(signal, push_event_tx, metadata_watcher_tasks);
-        }
+    if let Some(signal) = clients_signal
+        && !*watched_metadata_clients
+    {
+        *watched_metadata_clients = true;
+        spawn_metadata_clients_push_watcher(signal, push_event_tx, metadata_watcher_tasks);
     }
 
-    if let Some(interval_ms) = desired_status_interval_ms {
-        if *watched_metadata_status_interval_ms != Some(interval_ms) {
-            *watched_metadata_status_interval_ms = Some(interval_ms);
-            spawn_metadata_status_push_watcher(interval_ms, push_event_tx, metadata_watcher_tasks);
-        }
+    if let Some(interval_ms) = desired_status_interval_ms
+        && *watched_metadata_status_interval_ms != Some(interval_ms)
+    {
+        *watched_metadata_status_interval_ms = Some(interval_ms);
+        spawn_metadata_status_push_watcher(interval_ms, push_event_tx, metadata_watcher_tasks);
     }
 }
 
@@ -4035,7 +4055,7 @@ mod tests {
     #[test]
     fn websocket_binary_message_stays_opaque_for_protocol_layer() {
         let raw = b"TD2E-binary-frame".to_vec();
-        let decoded = message_to_wire_message(Message::Binary(raw.clone().into()))
+        let decoded = message_to_wire_message(Message::Binary(raw.clone()))
             .expect("binary websocket message should be accepted")
             .expect("binary websocket message should not be control frame");
 
@@ -4249,8 +4269,10 @@ mod tests {
     fn websocket_push_drain_budget_limits_hot_loop() {
         // 中文注释：direct WebSocket 和 relay 一样走高速 terminal 字节流；
         // 小 batch 只适合低频交互输出，大量输出必须保留 MB 级 in-flight 空间。
-        assert!(OUTPUT_FLUSH_MAX_BYTES_PER_SESSION >= 512 * 1024);
-        assert!(WEBSOCKET_PUSH_DRAIN_MAX_ENQUEUED_BYTES_PER_TICK >= 8 * 1024 * 1024);
+        let output_flush_max_bytes_per_session = OUTPUT_FLUSH_MAX_BYTES_PER_SESSION;
+        let enqueued_bytes_per_tick = WEBSOCKET_PUSH_DRAIN_MAX_ENQUEUED_BYTES_PER_TICK;
+        assert!(output_flush_max_bytes_per_session >= 512 * 1024);
+        assert!(enqueued_bytes_per_tick >= 8 * 1024 * 1024);
         assert!(!websocket_push_drain_budget_exhausted(
             1,
             1024,
@@ -4518,6 +4540,24 @@ mod tests {
             .await
             .expect("router should respond");
         assert_eq!(enabled_response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn web_fallback_does_not_handle_api_paths() {
+        for path in ["/api", "/api/", "/api/unknown"] {
+            let protocol = test_protocol("web-fallback-api");
+            let response = router(protocol, true)
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .body(Body::empty())
+                        .expect("test request should build"),
+                )
+                .await
+                .expect("router should respond");
+
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        }
     }
 
     #[tokio::test]
@@ -6028,7 +6068,7 @@ mod tests {
 
         // 中文注释：route prelude 发生在认证和 initial 之前，也必须复用同一条 writer queue。
         // 这个断言防止后续重新引入握手阶段的旁路直写。
-        assert_eq!(message, ClientWsMessage::Pong(vec![4, 2].into()));
+        assert_eq!(message, ClientWsMessage::Pong(vec![4, 2]));
 
         server.abort();
     }
@@ -6196,7 +6236,7 @@ mod tests {
                 MessageType::PairRequest,
                 PairRequestPayload {
                     device_id,
-                    device_public_key: PublicKey("ed25519-v1:test-device-key".to_owned()),
+                    device_public_key: test_device_public_key(1),
                     token: pairing_token,
                     nonce: termd_proto::Nonce("push-test-pairing-nonce".to_owned()),
                     timestamp_ms: current_unix_timestamp_millis(),
@@ -6319,7 +6359,7 @@ mod tests {
                 MessageType::PairRequest,
                 PairRequestPayload {
                     device_id,
-                    device_public_key: PublicKey("ed25519-v1:test-device-key".to_owned()),
+                    device_public_key: test_device_public_key(1),
                     token: pairing_token,
                     nonce: termd_proto::Nonce("cwd-push-test-pairing-nonce".to_owned()),
                     timestamp_ms: current_unix_timestamp_millis(),
@@ -6498,9 +6538,11 @@ mod tests {
 
     #[test]
     fn websocket_transport_limits_keep_frames_smaller_than_messages() {
-        assert_eq!(WEBSOCKET_MAX_FRAME_SIZE, 16 * 1024 * 1024);
-        assert_eq!(WEBSOCKET_MAX_MESSAGE_SIZE, 16 * 1024 * 1024);
-        assert!(WEBSOCKET_MAX_FRAME_SIZE <= WEBSOCKET_MAX_MESSAGE_SIZE);
+        let max_frame_size = WEBSOCKET_MAX_FRAME_SIZE;
+        let max_message_size = WEBSOCKET_MAX_MESSAGE_SIZE;
+        assert_eq!(max_frame_size, 16 * 1024 * 1024);
+        assert_eq!(max_message_size, 16 * 1024 * 1024);
+        assert!(max_frame_size <= max_message_size);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -6860,7 +6902,7 @@ zZZR5LzKVu9X7paftR7K8Q==
             MessageType::PairRequest,
             PairRequestPayload {
                 device_id,
-                device_public_key: PublicKey("ed25519-v1:test-device-key".to_owned()),
+                device_public_key: test_device_public_key(1),
                 token: termd_proto::PairingToken(token),
                 nonce: termd_proto::Nonce("nonce-from-http-token-test".to_owned()),
                 timestamp_ms: current_unix_timestamp_millis(),
@@ -7084,7 +7126,7 @@ zZZR5LzKVu9X7paftR7K8Q==
             MessageType::PairRequest,
             PairRequestPayload {
                 device_id,
-                device_public_key: PublicKey("ed25519-v1:metadata-device-key".to_owned()),
+                device_public_key: test_device_public_key(2),
                 token: pairing_token,
                 nonce: termd_proto::Nonce("metadata-pair".to_owned()),
                 timestamp_ms: current_unix_timestamp_millis(),
@@ -7159,7 +7201,7 @@ zZZR5LzKVu9X7paftR7K8Q==
             MessageType::PairRequest,
             PairRequestPayload {
                 device_id,
-                device_public_key: PublicKey("ed25519-v1:metadata-extra-device-key".to_owned()),
+                device_public_key: test_device_public_key(3),
                 token: pairing_token,
                 nonce: termd_proto::Nonce("metadata-extra-pair".to_owned()),
                 timestamp_ms: current_unix_timestamp_millis(),
@@ -7209,6 +7251,11 @@ zZZR5LzKVu9X7paftR7K8Q==
             "ed25519-v1:{}",
             base64::engine::general_purpose::STANDARD.encode(bytes)
         )
+    }
+
+    fn test_device_public_key(seed: u8) -> PublicKey {
+        let signing_key = SigningKey::from_bytes(&[seed; 32]);
+        PublicKey(test_ed25519_wire(signing_key.verifying_key().as_bytes()))
     }
 
     fn open_test_e2ee(

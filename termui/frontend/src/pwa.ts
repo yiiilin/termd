@@ -13,7 +13,7 @@ async function cleanupTermdServiceWorkers(): Promise<void> {
 
   // 中文注释：register() 本身会安装/更新这份清理型 SW；这里随后就要注销历史注册，
   // 不能再强制 update()，否则 Chromium 可能在 update/unregister 竞态中抛 pageerror。
-  const registration = await serviceWorker.register("/service-worker.js").catch(() => undefined);
+  const registration = await serviceWorker.register("./service-worker.js").catch(() => undefined);
 
   const registrations = await serviceWorker.getRegistrations?.().catch(() => undefined);
   const candidates = registrations ?? (registration ? [registration] : []);

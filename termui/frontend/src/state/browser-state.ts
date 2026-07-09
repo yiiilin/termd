@@ -8,11 +8,16 @@ import type {
   PairAcceptPayload,
   PairedServerState,
 } from "../protocol/types";
+import { stripSensitiveUrlParts } from "../protocol/url";
 
 const DB_NAME = "termd-termui-web";
 const DB_VERSION = 1;
 const STORE_NAME = "state";
 const STATE_KEY = "current";
+
+interface NormalizeRouteWsUrlOptions {
+  stripSensitiveQuery?: boolean;
+}
 
 export const DEFAULT_BROWSER_PREFERENCES: BrowserPreferences = {
   language: "auto",
@@ -56,7 +61,7 @@ export async function ensureDevice(): Promise<DeviceState> {
 
 export async function recordPairing(accepted: PairAcceptPayload, url: string): Promise<BrowserState> {
   const state = await loadBrowserState();
-  const normalizedUrl = normalizeRouteWsUrl(url, accepted.server_id);
+  const normalizedUrl = normalizeRouteWsUrl(url, accepted.server_id, { stripSensitiveQuery: true });
   const existing = state.pairedServers.find((server) => server.server_id === accepted.server_id);
   const server: PairedServerState = {
     server_id: accepted.server_id,
@@ -113,7 +118,7 @@ export async function forgetDaemon(serverId: string): Promise<BrowserState> {
 }
 
 export async function recordServerUrl(serverId: string, url: string): Promise<BrowserState> {
-  const cleanUrl = normalizeRouteWsUrl(url, serverId);
+  const cleanUrl = normalizeRouteWsUrl(url, serverId, { stripSensitiveQuery: true });
   const state = await loadBrowserState();
   const next = normalizeState({
     ...state,
@@ -174,14 +179,14 @@ function normalizeState(state: BrowserState): BrowserState {
     return {
       server_id: server.server_id,
       daemon_public_key: server.daemon_public_key,
-      url: normalizeRouteWsUrl(server.url, server.server_id),
+      url: normalizeRouteWsUrl(server.url, server.server_id, { stripSensitiveQuery: true }),
       paired_at_ms: server.paired_at_ms,
       ...(name ? { name } : {}),
     };
   });
   const defaultUrlServerId = state.defaultServerId ?? pairedServers.at(0)?.server_id;
   const defaultUrl = state.defaultUrl
-    ? normalizeRouteWsUrl(state.defaultUrl, defaultUrlServerId)
+    ? normalizeRouteWsUrl(state.defaultUrl, defaultUrlServerId, { stripSensitiveQuery: true })
     : state.defaultUrl;
 
   return {
@@ -261,8 +266,12 @@ function isObjectRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
-export function normalizeRouteWsUrl(rawUrl: string, serverId?: string): string {
-  const cleanUrl = rawUrl.trim();
+export function normalizeRouteWsUrl(
+  rawUrl: string,
+  serverId?: string,
+  options: NormalizeRouteWsUrlOptions = {},
+): string {
+  const cleanUrl = options.stripSensitiveQuery ? stripSensitiveUrlParts(rawUrl) : rawUrl.trim();
   try {
     const parsed = new URL(cleanUrl);
     if (parsed.protocol !== "ws:" && parsed.protocol !== "wss:") {

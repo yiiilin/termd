@@ -260,13 +260,18 @@ fn is_http_api_tunnel_path_allowed(method: &str, path: &str) -> bool {
 struct HealthzPayload {
     status: &'static str,
     rooms: usize,
+    daemon_controls: usize,
+    latest_daemon_control_connection_id: u64,
     trusted_admission: bool,
 }
 
 async fn healthz(State(state): State<RelayState>) -> Json<HealthzPayload> {
+    let (daemon_controls, latest_daemon_control_connection_id) = state.daemon_control_stats();
     Json(HealthzPayload {
         status: "ok",
         rooms: state.room_count(),
+        daemon_controls,
+        latest_daemon_control_connection_id,
         trusted_admission: state.trusted_admission_enabled(),
     })
 }
@@ -324,6 +329,36 @@ mod tests {
     #[test]
     fn router_can_be_constructed() {
         let _router = router(RelayState::default(), false, false);
+    }
+
+    #[tokio::test]
+    async fn healthz_reports_daemon_control_readiness() {
+        let server_id = ServerId::new();
+        let state = RelayState::default();
+        let before = relay_healthz_value(state.clone()).await;
+        assert_eq!(before["daemon_controls"], 0);
+        assert_eq!(before["latest_daemon_control_connection_id"], 0);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_state = state.clone();
+        let _server = tokio::spawn(async move {
+            axum::serve(listener, router(server_state, false, false))
+                .await
+                .unwrap();
+        });
+        let (mut daemon_control, _response) =
+            connect_async(format!("ws://{addr}/ws")).await.unwrap();
+        register_route(&mut daemon_control, server_id, RouteRole::DaemonControl).await;
+
+        let after = relay_healthz_value(state).await;
+        // 中文注释：fixture 只读轮询这个字段，不再用真实 client route 消耗一次性配对票据。
+        assert_eq!(after["daemon_controls"], 1);
+        assert!(
+            after["latest_daemon_control_connection_id"]
+                .as_u64()
+                .is_some_and(|id| id > 0)
+        );
     }
 
     #[tokio::test]
@@ -907,6 +942,24 @@ mod tests {
     }
 
     type TestSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+
+    async fn relay_healthz_value(state: RelayState) -> serde_json::Value {
+        let response = router(state, false, false)
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .expect("healthz request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .expect("healthz body should be readable");
+        serde_json::from_slice(&body).expect("healthz body should be JSON")
+    }
 
     async fn register_route(socket: &mut TestSocket, server_id: ServerId, role: RouteRole) {
         register_route_with_admission(socket, server_id, role, None).await;
