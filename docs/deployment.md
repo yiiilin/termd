@@ -1,6 +1,6 @@
 # 公网部署方案
 
-本文给出 termd / termrelay / termctl / Web MVP 的最小公网部署方式。核心原则只有一条：**relay 是可信 admission/routing 层，公开入口只接受已注册 daemon 和短期 client admission，session/PTY 状态仍只在 daemon。**
+本文给出 termd / termrelay / termctl / Web MVP 的最小公网部署方式。核心原则只有一条：**relay 是可信 admission/routing 层，公开入口只接受已注册 daemon 和短期 client admission，session/PTY 状态仍只在 daemon。** TLS 在反向代理终止后，relay 可以看到并转发明文 WebSocket/HTTP tunnel 应用流量；当前 Web WebSocket 不发送 `e2ee_key_exchange` 或 `encrypted_frame`。pairing、auth 和 session 权限仍由 daemon 最终校验。
 
 ## 推荐拓扑
 
@@ -16,6 +16,7 @@ Reverse Proxy (TLS termination + access log control)
 ```
 
 - `termrelay` 可以是公网边缘服务，但它只做 admission、转发和路由，不持有 session/PTY 状态。
+- trusted relay 不是 WebSocket 应用流量的保密边界；应按可接触终端与控制面明文的可信组件部署和审计。
 - `termd` 仍建议只监听 loopback 或私网管理网段，`/local/pairing-token` 不应直接暴露到公网。
 - 浏览器和 `termctl` 连接 relay 时，使用同一条 `/ws` URL；daemon 路由由连接后的 `route_hello.server_id` 决定。
 
@@ -144,7 +145,7 @@ cargo run -p termrelay -- --listen 127.0.0.1:8080 \
   --http-tunnel
 ```
 
-启用后 relay 只把 HTTP request/response body 编码为 tunnel frame 转发给 daemon data pipe，不保存文件、不判断 session 权限；实际 bearer、scope token、pairing/auth 仍由 daemon 校验。
+启用后 relay 把 HTTP request/response body 编码为 tunnel frame 转发给 daemon data pipe，不保存文件、不判断 session 权限；实际 bearer、scope token、pairing/auth 仍由 daemon 校验。现有 HTTP E2EE 兼容路径仍保留；这不改变普通 WebSocket 和 HTTP tunnel 流量经过 trusted relay 时可见的 0.6 默认边界。
 
 ## Health check
 
@@ -221,6 +222,15 @@ wget -qO- https://github.com/yiiilin/termd/releases/latest/download/install-term
 
 `termd.service` 使用 `KillMode=process`，这样 `systemctl restart termd` 只会重启 daemon 主进程，不会把每个 session 的 supervisor 子进程一起清掉；显式 close 仍然由 daemon 协议路径负责。
 
+回滚到不认识私有 `session_ownership` ledger 的旧 daemon 前，必须确认没有 create 或 cleanup 正在持久收敛。installer 会在替换二进制前执行同等的只读检查；手工回滚可先运行：
+
+```bash
+sudo sqlite3 -readonly /var/lib/termd/daemon-state.sqlite \
+  "SELECT phase, COUNT(*) FROM session_ownership WHERE phase IN ('preparing','cleaning') GROUP BY phase;"
+```
+
+查询无结果才允许停止当前 daemon 并回滚。数据库没有 `session_ownership` 表表示尚未使用该 ledger，也满足 precheck；查询返回任何行时应保持当前 daemon 运行并等待收敛，不能删除 ledger 行、socket 或 supervisor 进程来绕过检查。
+
 如果要把内嵌 Web 也一起打开，把 `/etc/termd/termd.env` 里的 `TERMD_WEB_ENABLED=1` 打开即可；脚本会自动追加 `--web`。
 
 ### `termrelay`
@@ -258,8 +268,23 @@ wget -qO- https://github.com/yiiilin/termd/releases/latest/download/install-term
   `__session-supervisor` 进程。
 - 常规发版仍使用 `scripts/prepare-release.sh <version>`。发版脚本会同步版本号、
   生成 release notes、运行安装脚本回归、Rust/workspace 验证、Web typecheck/test/build
-  和 release 编译，然后创建带用户可见说明的 annotated tag；传 `--push` 才会推送并触发
-  GitHub Actions。
+  和 release 编译，然后在隔离 worktree 中创建 release commit 和带用户可见说明的
+  annotated tag。无论是否传 `--push` 或 `--allow-dirty`，脚本返回时都不会推进本地
+  `main`，也不会修改 caller 的 index/worktree；传 `--push` 只会用精确 commit/tag OID
+  原子更新远端 `main` 和 tag，并触发 GitHub Actions。
+- 脚本输出会先提示处理无关 caller 改动，再给出经过回归测试的本地完成命令；命令使用
+  精确 release notes 路径和 release commit OID：
+
+  ```bash
+  git add -- 'docs/releases/<version>.md'
+  git merge --ff-only <release-commit-oid>
+  ```
+
+  第一条命令只暂存该版本的 release notes，不会纳入其他文件；第二条命令只有在当前
+  `main` 仍可快进到精确 release commit 时才成功。clean caller 回归会原样执行这两条
+  输出命令，并确认完成后本地 `main` 指向 release commit、status 为空且 index 没有残留
+  staged diff。使用 `--allow-dirty` 时，应先处理脚本原样保留的其他 caller 改动，再执行
+  输出中的同一流程。
 - tag 推送后，GitHub Actions 会：
   - 运行 workspace 测试，确认 release tag 与 `Cargo.toml` 版本一致。
   - 构建 `termd`、`termrelay`、`termctl` 的 Linux amd64 release tarball。二进制使用 `x86_64-unknown-linux-musl` 静态链接，并在打包前先构建 `termui/frontend` 的静态资源，确保 `termd` 和 `termrelay` 的内嵌 Web 可用。

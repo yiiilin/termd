@@ -10,7 +10,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, "../../..");
 const CARGO_MANIFEST = path.join(REPO_ROOT, "Cargo.toml");
 
-interface StartedProcess {
+export interface StartedProcess {
   child: ChildProcessWithoutNullStreams;
   log: string[];
 }
@@ -546,6 +546,7 @@ function spawnCargo(
   const rustLog = process.env.REAL_RELAY_RUST_LOG ?? "termd=info,termrelay=info";
   const child = spawn("cargo", args, {
     cwd,
+    detached: true,
     env: { ...process.env, ...extraEnv, RUST_LOG: rustLog },
   });
 
@@ -603,41 +604,43 @@ async function pickFreePort(): Promise<number> {
   });
 }
 
-async function stopProcess(process: StartedProcess, label: string): Promise<void> {
-  if (process.child.exitCode !== null) {
+export async function stopProcess(startedProcess: StartedProcess, label: string): Promise<void> {
+  const processGroupId = startedProcess.child.pid;
+  if (processGroupId === undefined || !isProcessGroupAlive(processGroupId)) {
     return;
   }
-  process.child.kill();
-  if (await waitForProcessExit(process.child, 5_000)) {
+  process.kill(-processGroupId, "SIGTERM");
+  if (await waitForProcessGroupExit(processGroupId, 5_000)) {
     return;
   }
-  process.child.kill("SIGKILL");
-  if (await waitForProcessExit(process.child, 5_000)) {
+  process.kill(-processGroupId, "SIGKILL");
+  if (await waitForProcessGroupExit(processGroupId, 5_000)) {
     return;
   }
   throw new Error(`${label} did not exit after SIGTERM/SIGKILL`);
 }
 
-function waitForProcessExit(process: ChildProcessWithoutNullStreams, timeoutMs: number): Promise<boolean> {
-  return new Promise((resolve) => {
-    if (process.exitCode !== null) {
-      resolve(true);
-      return;
+function isProcessGroupAlive(processGroupId: number): boolean {
+  try {
+    process.kill(-processGroupId, 0);
+    return true;
+  } catch (caught) {
+    if (caught instanceof Error && "code" in caught && caught.code === "ESRCH") {
+      return false;
     }
-    const timer = setTimeout(() => {
-      cleanup();
-      resolve(false);
-    }, timeoutMs);
-    const cleanup = () => {
-      clearTimeout(timer);
-      process.off("exit", handleExit);
-    };
-    const handleExit = () => {
-      cleanup();
-      resolve(true);
-    };
-    process.once("exit", handleExit);
-  });
+    throw caught;
+  }
+}
+
+async function waitForProcessGroupExit(processGroupId: number, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!isProcessGroupAlive(processGroupId)) {
+      return true;
+    }
+    await sleep(50);
+  }
+  return !isProcessGroupAlive(processGroupId);
 }
 
 function sleep(ms: number): Promise<void> {

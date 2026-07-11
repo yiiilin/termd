@@ -109,3 +109,5 @@ curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-ter
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+See [Third-Party Notices](THIRD_PARTY_NOTICES.md) for bundled components.

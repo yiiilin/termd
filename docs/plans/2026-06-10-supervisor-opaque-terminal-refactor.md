@@ -1,5 +1,7 @@
 # Supervisor Opaque Terminal Refactor Plan
 
+> 历史状态提示：本文记录当时的计划/实现状态，不代表当前 0.6 协议契约；现行边界以 `TECH.md` 和 `docs/deployment.md` 为准。
+
 > **For agentic workers:** REQUIRED: Use subagent-driven execution where available. Every functional task must pass two review stages before it can be marked complete: spec compliance review first, code quality review second.
 
 **Goal:** 彻底重构终端链路。attach 成功后，`supervisor` 成为唯一终端事实与业务心跳所有者；`termd` 与 `relay` 只负责 pairing、auth、route、workspace/file API 和 opaque frame 转发。此次改造不保留旧终端协议兼容层，不保留 daemon-side terminal replay/heartbeat 语义，不保留 tmux 生产路径。

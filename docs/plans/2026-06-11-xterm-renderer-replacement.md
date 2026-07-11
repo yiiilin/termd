@@ -1,5 +1,7 @@
 # Xterm Renderer Replacement Plan
 
+> 历史状态提示：本文记录当时的计划/实现状态，不代表当前 0.6 协议契约；现行边界以 `TECH.md` 和 `docs/deployment.md` 为准。
+
 > **For agentic workers:** REQUIRED: Use subagent-driven execution where available. Every functional task must pass two review stages before it can be marked complete: spec compliance review first, code quality review second.
 
 **Goal:** 彻底将 `termui/frontend` 的 Web 终端 renderer 从 `ghostty-web` 重构为 `xterm.js`，删除生产路径中的 Ghostty 专有依赖、补丁与测试假设，并把终端交互恢复到稳定、可维护的 xterm.js 语义。

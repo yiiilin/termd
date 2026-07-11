@@ -78,6 +78,24 @@ where
 
     pub(super) fn restore_runtime_sessions(&mut self, sessions: Vec<SessionStateRecord>) {
         let persisted_by_id = self.visible_session_metadata_by_id();
+        let active_ids = sessions
+            .iter()
+            .map(|session| session.session_id)
+            .collect::<std::collections::HashSet<_>>();
+        if let Ok(visible) = self.client_history.list_sessions() {
+            for record in visible {
+                if active_ids.contains(&record.session_id) {
+                    continue;
+                }
+                let now_ms = current_unix_timestamp_millis();
+                let _ = self
+                    .client_history
+                    .record_session_closed(record.session_id, now_ms);
+                let _ = self
+                    .client_history
+                    .remove_session_attachments(record.session_id);
+            }
+        }
 
         for session in sessions {
             let wire_session_id = session.session_id;
@@ -91,24 +109,9 @@ where
                 continue;
             }
 
-            match self.runtime.reconnect_session(&session) {
-                Ok(()) => {
-                    let metadata = self
-                        .restored_session_metadata(&session, persisted_by_id.get(&wire_session_id));
-                    self.register_restored_runtime_session(&session, metadata);
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        %error,
-                        session_id = %wire_session_id.0,
-                        "failed to reconnect persisted session supervisor; marking session closed"
-                    );
-                    // 中文注释：session 的运行事实只能来自 live supervisor。启动恢复已经给
-                    // stale socket 一次重连机会；失败后必须关闭并移除可见状态，不能再把
-                    // 它保留成 running，也不能让 session.list/attach 同步重试旧 socket。
-                    self.mark_persisted_session_closed(wire_session_id);
-                }
-            }
+            let metadata =
+                self.restored_session_metadata(&session, persisted_by_id.get(&wire_session_id));
+            self.register_restored_runtime_session(&session, metadata);
         }
         if let Err(error) = self.persist_state() {
             tracing::warn!(%error, "failed to persist recovered session supervisor state");

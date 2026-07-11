@@ -4,13 +4,24 @@
 //! session 元数据，以及 SQLite client history 存储入口。这里刻意不保存 PTY 明文输出、
 //! terminal 历史或文件传输内容，也不引入账号体系。
 
+use rusqlite::OpenFlags;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, types::Type};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::HashSet;
 use std::error::Error;
+#[cfg(unix)]
+use std::ffi::{CString, OsStr};
 use std::fmt;
 use std::fs;
 use std::io;
+#[cfg(unix)]
+use std::os::unix::{
+    ffi::OsStrExt,
+    fs::{MetadataExt, OpenOptionsExt},
+    io::{AsRawFd, FromRawFd},
+};
+#[cfg(unix)]
+use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use termd_proto::{
@@ -29,6 +40,10 @@ const META_STATE_SCHEMA_VERSION: &str = "state_schema_version";
 const META_SERVER_ID: &str = "server_id";
 const META_DAEMON_PUBLIC_KEY: &str = "daemon_public_key";
 const META_DAEMON_PRIVATE_KEY: &str = "daemon_private_key";
+#[cfg(unix)]
+const SQLITE_PRIVATE_FILE_MODE: u32 = 0o600;
+#[cfg(unix)]
+const SQLITE_PRIVATE_DIRECTORY_MODE: u32 = 0o700;
 
 /// daemon 身份的本地持久快照。
 ///
@@ -72,7 +87,7 @@ pub struct SessionStateRecord {
 
 /// 未完成 HTTP upload 的恢复清理记录。
 ///
-/// 这里只保存最终目标路径和创建时的文件 identity；daemon 重启后只用它做安全 cleanup，
+/// 这里只保存同目录隐藏临时对象路径和创建时的文件 identity；daemon 重启后只用它做安全 cleanup，
 /// 不保存任何文件内容或 E2EE 明文。Unix/Windows 下 `dev/ino` 是原生文件对象 ID；
 /// Windows 缺失 file id 时用协议层 sentinel 表示；其他平台没有稳定 file id，cleanup
 /// 会安全失败，不静默删除未知对象。
@@ -122,8 +137,7 @@ impl StateStore {
     pub fn ensure_compatible(path: impl AsRef<Path>) -> Result<(), StateError> {
         let sqlite_path = sqlite_state_path_for_state_path(path.as_ref());
         let conn = open_state_connection(&sqlite_path)?;
-        initialize_daemon_state_schema(&conn, &sqlite_path)?;
-        ensure_sqlite_state_version(&conn, &sqlite_path)
+        ensure_compatible_connection(&conn, &sqlite_path)
     }
 
     /// 从 SQLite 状态库读取 `DaemonState`。
@@ -132,20 +146,30 @@ impl StateStore {
     /// 后续启动都以 SQLite 为准，避免 stale JSON 覆盖新信任数据。
     pub fn load(path: impl AsRef<Path>) -> Result<DaemonState, StateError> {
         let path = path.as_ref();
-        let sqlite_path = sqlite_state_path_for_state_path(path);
-        let conn = open_state_connection(&sqlite_path)?;
-        initialize_daemon_state_schema(&conn, &sqlite_path)?;
-        ensure_sqlite_state_version(&conn, &sqlite_path)?;
-        let state = load_sqlite_state(&conn, &sqlite_path)?;
-
-        if state.daemon_identity.is_some()
-            || !state.trusted_devices.is_empty()
-            || !state.sessions.is_empty()
+        #[cfg(not(unix))]
         {
-            return Ok(state);
+            Err(StateError::UnsupportedPlatform {
+                path: sqlite_state_path_for_state_path(path),
+            })
         }
+        #[cfg(unix)]
+        {
+            let path = absolute_state_path(path)?;
+            let sqlite_path = sqlite_state_path_for_state_path(&path);
+            let conn = open_state_connection(&sqlite_path)?;
+            initialize_daemon_state_schema(&conn, &sqlite_path)?;
+            ensure_sqlite_state_version(&conn, &sqlite_path)?;
+            let state = load_sqlite_state(&conn, &sqlite_path)?;
 
-        load_legacy_json_state(path, &sqlite_path).map(|legacy| legacy.unwrap_or(state))
+            if state.daemon_identity.is_some()
+                || !state.trusted_devices.is_empty()
+                || !state.sessions.is_empty()
+            {
+                return Ok(state);
+            }
+
+            load_legacy_json_state(&path, &sqlite_path).map(|legacy| legacy.unwrap_or(state))
+        }
     }
 
     /// 将 daemon 状态保存到 SQLite 状态库。
@@ -191,28 +215,50 @@ impl StateStore {
         now_ms: UnixTimestampMillis,
     ) -> Result<bool, StateError> {
         let sqlite_path = sqlite_state_path_for_state_path(path.as_ref());
-        let conn = open_state_connection(&sqlite_path)?;
+        let mut conn = open_state_connection(&sqlite_path)?;
         initialize_daemon_state_schema(&conn, &sqlite_path)?;
         ensure_sqlite_state_version(&conn, &sqlite_path)?;
-        let updated = conn
-            .execute(
-                r#"
-                UPDATE runtime_sessions
-                SET state = ?1,
-                    updated_at_ms = ?2,
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&sqlite_path, source))?;
+        upsert_meta_value(
+            &tx,
+            &sqlite_path,
+            META_STATE_SCHEMA_VERSION,
+            &STATE_SCHEMA_VERSION.to_string(),
+            now_ms.0 as i64,
+        )?;
+        tx.execute(
+            r#"
+                INSERT INTO runtime_sessions (
+                    session_id,
+                    state,
+                    rows,
+                    cols,
+                    pixel_width,
+                    pixel_height,
+                    created_at_ms,
+                    updated_at_ms,
+                    restore_kind,
+                    restore_value
+                )
+                VALUES (?1, ?2, 1, 1, 0, 0, ?3, ?3, NULL, NULL)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    state = excluded.state,
+                    updated_at_ms = excluded.updated_at_ms,
                     restore_kind = NULL,
                     restore_value = NULL
-                WHERE session_id = ?3
                 "#,
-                params![
-                    session_state_text(SessionState::Closed),
-                    now_ms.0 as i64,
-                    session_id.0.to_string(),
-                ],
-            )
-            .map_err(|source| sqlite_error(&sqlite_path, source))?
-            > 0;
-        Ok(updated)
+            params![
+                session_id.0.to_string(),
+                session_state_text(SessionState::Closed),
+                now_ms.0 as i64,
+            ],
+        )
+        .map_err(|source| sqlite_error(&sqlite_path, source))?;
+        tx.commit()
+            .map_err(|source| sqlite_error(&sqlite_path, source))?;
+        Ok(true)
     }
 
     /// 清理已经不可恢复的 closed runtime 行；仍有 live supervisor 的 id 必须保留。
@@ -312,7 +358,28 @@ pub enum StateError {
         path: PathBuf,
         source: rusqlite::Error,
     },
+    UnsafeSqlitePath {
+        path: PathBuf,
+        kind: UnsafeSqlitePathKind,
+    },
+    RestrictSqlitePermissions {
+        path: PathBuf,
+        source: io::Error,
+    },
+    ResolveRelativeSqlitePath {
+        path: PathBuf,
+        source: io::Error,
+    },
+    UnsupportedPlatform {
+        path: PathBuf,
+    },
     InvalidDaemonIdentity {
+        source: String,
+    },
+    InvalidSupervisorCleanupCapability {
+        session_id: SessionId,
+    },
+    InvalidOwnershipState {
         source: String,
     },
     IncompatibleVersion {
@@ -320,6 +387,16 @@ pub enum StateError {
         found: Option<u32>,
         expected: u32,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnsafeSqlitePathKind {
+    Symlink,
+    NonRegular,
+    NonDirectory,
+    WrongOwner,
+    InsecurePermissions,
+    Replaced,
 }
 
 impl fmt::Display for StateError {
@@ -341,7 +418,57 @@ impl fmt::Display for StateError {
             Self::Sqlite { path, .. } => {
                 write!(f, "failed to access sqlite store at {}", path.display())
             }
+            Self::UnsafeSqlitePath { path, kind } => match kind {
+                UnsafeSqlitePathKind::Symlink => {
+                    write!(f, "refusing to open sqlite symlink at {}", path.display())
+                }
+                UnsafeSqlitePathKind::NonRegular => write!(
+                    f,
+                    "refusing to open non-regular sqlite path at {}",
+                    path.display()
+                ),
+                UnsafeSqlitePathKind::NonDirectory => write!(
+                    f,
+                    "refusing to use non-directory sqlite parent at {}",
+                    path.display()
+                ),
+                UnsafeSqlitePathKind::WrongOwner => write!(
+                    f,
+                    "refusing to use sqlite path not owned by the current user at {}",
+                    path.display()
+                ),
+                UnsafeSqlitePathKind::InsecurePermissions => write!(
+                    f,
+                    "refusing to use non-private sqlite parent at {}",
+                    path.display()
+                ),
+                UnsafeSqlitePathKind::Replaced => {
+                    write!(f, "refusing replaced sqlite path at {}", path.display())
+                }
+            },
+            Self::RestrictSqlitePermissions { path, .. } => write!(
+                f,
+                "failed to restrict sqlite file permissions at {}",
+                path.display()
+            ),
+            Self::ResolveRelativeSqlitePath { path, .. } => write!(
+                f,
+                "failed to resolve relative sqlite store path {} against the current directory",
+                path.display()
+            ),
+            Self::UnsupportedPlatform { path } => write!(
+                f,
+                "SQLite state storage is unsupported on this platform at {}",
+                path.display()
+            ),
             Self::InvalidDaemonIdentity { .. } => write!(f, "failed to restore daemon identity"),
+            Self::InvalidSupervisorCleanupCapability { session_id } => write!(
+                f,
+                "session {session_id:?} has no valid supervisor cleanup capability"
+            ),
+            Self::InvalidOwnershipState { .. } => {
+                write!(f, "failed to open durable session ownership state")
+            }
             Self::IncompatibleVersion {
                 path,
                 found,
@@ -366,9 +493,17 @@ impl Error for StateError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Parse { source, .. } => Some(source),
-            Self::Read { source, .. } | Self::CreateDirectory { source, .. } => Some(source),
+            Self::Read { source, .. }
+            | Self::CreateDirectory { source, .. }
+            | Self::RestrictSqlitePermissions { source, .. }
+            | Self::ResolveRelativeSqlitePath { source, .. } => Some(source),
             Self::Sqlite { source, .. } => Some(source),
-            Self::InvalidDaemonIdentity { .. } | Self::IncompatibleVersion { .. } => None,
+            Self::InvalidOwnershipState { .. }
+            | Self::UnsafeSqlitePath { .. }
+            | Self::UnsupportedPlatform { .. }
+            | Self::InvalidDaemonIdentity { .. }
+            | Self::InvalidSupervisorCleanupCapability { .. }
+            | Self::IncompatibleVersion { .. } => None,
         }
     }
 }
@@ -412,8 +547,432 @@ fn load_legacy_json_state(
 }
 
 fn open_state_connection(sqlite_path: &Path) -> Result<Connection, StateError> {
-    ensure_parent_directory(sqlite_path)?;
-    Connection::open(sqlite_path).map_err(|source| sqlite_error(sqlite_path, source))
+    #[cfg(not(unix))]
+    {
+        Err(StateError::UnsupportedPlatform {
+            path: sqlite_path.to_path_buf(),
+        })
+    }
+    #[cfg(unix)]
+    {
+        let sqlite_path = absolute_state_path(sqlite_path)?;
+        let secure_open = prepare_secure_sqlite_file_for_open(&sqlite_path)?;
+        #[cfg(test)]
+        change_current_dir_after_secure_prepare_for_test();
+        let conn = open_sqlite_connection(&sqlite_path)?;
+        verify_secure_sqlite_open(&sqlite_path, &secure_open)?;
+
+        // SQLite 管理 WAL/SHM 的内部创建与替换；私有且不可被其他 UID 写入的父目录
+        // 是 sidecar 的边界。这里不声称抵御同 UID 或 root 进程，也不增加自定义 VFS。
+        Ok(conn)
+    }
+}
+
+pub(crate) fn open_private_state_connection(sqlite_path: &Path) -> Result<Connection, StateError> {
+    open_state_connection(sqlite_path)
+}
+
+#[cfg(unix)]
+fn absolute_state_path(path: &Path) -> Result<PathBuf, StateError> {
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    let current_dir =
+        std::env::current_dir().map_err(|source| StateError::ResolveRelativeSqlitePath {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    Ok(current_dir.join(path))
+}
+
+#[cfg(all(test, unix))]
+fn change_current_dir_after_secure_prepare_for_test() {
+    if let Some(path) = std::env::var_os("TERMD_TEST_CWD_AFTER_SQLITE_PREPARE") {
+        std::env::set_current_dir(path).expect("test hook must change the child process cwd");
+    }
+}
+
+#[cfg(unix)]
+fn open_sqlite_connection(sqlite_path: &Path) -> Result<Connection, StateError> {
+    Connection::open_with_flags(sqlite_path, sqlite_open_flags())
+        .map_err(|source| sqlite_error(sqlite_path, source))
+}
+
+fn sqlite_open_flags() -> OpenFlags {
+    // 中文注释：预检查按普通 Path 校验，不能让 SQLite 再把 `file:` 解释成 URI。
+    OpenFlags::SQLITE_OPEN_READ_WRITE
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX
+        | OpenFlags::SQLITE_OPEN_NOFOLLOW
+}
+
+#[cfg(unix)]
+struct SecureSqliteOpen {
+    database: fs::File,
+    parent: fs::File,
+    parent_path: PathBuf,
+}
+
+#[cfg(unix)]
+fn prepare_secure_sqlite_file_for_open(sqlite_path: &Path) -> Result<SecureSqliteOpen, StateError> {
+    let (parent_path, parent) = open_private_sqlite_parent(sqlite_path)?;
+    let file = match create_secure_sqlite_file(&parent, sqlite_path) {
+        Ok(file) => file,
+        Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
+            open_sqlite_file_nofollow(&parent, sqlite_path)?
+        }
+        Err(source) => return Err(sqlite_file_open_error(sqlite_path, source)),
+    };
+    secure_opened_sqlite_file(sqlite_path, &file)?;
+    secure_existing_sqlite_sidecars(sqlite_path, &parent)?;
+    verify_path_identity(&parent_path, &parent, true)?;
+    Ok(SecureSqliteOpen {
+        database: file,
+        parent,
+        parent_path,
+    })
+}
+
+#[cfg(unix)]
+fn open_private_sqlite_parent(sqlite_path: &Path) -> Result<(PathBuf, fs::File), StateError> {
+    let parent_path = sqlite_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    let parent = open_or_create_directory_path_nofollow(&parent_path)?;
+
+    let metadata = parent
+        .metadata()
+        .map_err(|source| sqlite_file_open_error(&parent_path, source))?;
+    if !metadata.is_dir() {
+        return Err(StateError::UnsafeSqlitePath {
+            path: parent_path,
+            kind: UnsafeSqlitePathKind::NonDirectory,
+        });
+    }
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        return Err(StateError::UnsafeSqlitePath {
+            path: parent_path,
+            kind: UnsafeSqlitePathKind::WrongOwner,
+        });
+    }
+    let mode = parent
+        .metadata()
+        .map_err(|source| sqlite_file_open_error(&parent_path, source))?
+        .mode();
+    if mode & 0o022 != 0 {
+        return Err(StateError::UnsafeSqlitePath {
+            path: parent_path,
+            kind: UnsafeSqlitePathKind::InsecurePermissions,
+        });
+    }
+    verify_path_identity(&parent_path, &parent, true)?;
+    Ok((parent_path, parent))
+}
+
+#[cfg(unix)]
+fn open_or_create_directory_path_nofollow(path: &Path) -> Result<fs::File, StateError> {
+    let components = path.components().collect::<Vec<_>>();
+    let (mut current, mut current_path) = if path.is_absolute() {
+        (
+            open_directory_nofollow(Path::new("/"))
+                .map_err(|source| sqlite_file_open_error(Path::new("/"), source))?,
+            PathBuf::from("/"),
+        )
+    } else {
+        (
+            open_directory_nofollow(Path::new("."))
+                .map_err(|source| sqlite_file_open_error(Path::new("."), source))?,
+            PathBuf::from("."),
+        )
+    };
+    validate_sqlite_ancestor(&current_path, &current)?;
+
+    for (index, component) in components.iter().enumerate() {
+        let name = match component {
+            Component::RootDir | Component::CurDir => continue,
+            Component::ParentDir => OsStr::new(".."),
+            Component::Normal(name) => name,
+            Component::Prefix(_) => unreachable!("Unix paths do not have prefixes"),
+        };
+        let component_path = current_path.join(name);
+        let is_final = components[index + 1..]
+            .iter()
+            .all(|component| matches!(component, Component::RootDir | Component::CurDir));
+        let (next, created) = match open_directory_at_nofollow(&current, name) {
+            Ok(next) => (next, false),
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                let created = match mkdirat_private(&current, name) {
+                    Ok(()) => true,
+                    Err(source) if source.kind() == io::ErrorKind::AlreadyExists => false,
+                    Err(source) => {
+                        return Err(StateError::CreateDirectory {
+                            path: component_path,
+                            source,
+                        });
+                    }
+                };
+                (
+                    open_directory_at_nofollow(&current, name)
+                        .map_err(|source| sqlite_file_open_error(&component_path, source))?,
+                    created,
+                )
+            }
+            Err(source) => return Err(sqlite_file_open_error(&component_path, source)),
+        };
+        if created {
+            fchmod_opened_path(&component_path, &next, SQLITE_PRIVATE_DIRECTORY_MODE)?;
+        }
+        if !is_final {
+            validate_sqlite_ancestor(&component_path, &next)?;
+        }
+        current = next;
+        current_path = component_path;
+    }
+    Ok(current)
+}
+
+#[cfg(unix)]
+fn validate_sqlite_ancestor(path: &Path, directory: &fs::File) -> Result<(), StateError> {
+    let metadata = directory
+        .metadata()
+        .map_err(|source| sqlite_file_open_error(path, source))?;
+    if !metadata.is_dir() {
+        return Err(StateError::UnsafeSqlitePath {
+            path: path.to_path_buf(),
+            kind: UnsafeSqlitePathKind::NonDirectory,
+        });
+    }
+    let mode = metadata.mode();
+    let uid = metadata.uid();
+    let current_uid = unsafe { libc::geteuid() };
+    let owner_is_trusted = uid == current_uid || uid == 0;
+    let foreign_writable = mode & 0o022 != 0;
+    let sticky = mode & 0o1000 != 0;
+    if !owner_is_trusted || (foreign_writable && !sticky) {
+        return Err(StateError::UnsafeSqlitePath {
+            path: path.to_path_buf(),
+            kind: UnsafeSqlitePathKind::InsecurePermissions,
+        });
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_directory_nofollow(path: &Path) -> io::Result<fs::File> {
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+}
+
+#[cfg(unix)]
+fn open_directory_at_nofollow(parent: &fs::File, name: &OsStr) -> io::Result<fs::File> {
+    openat_file(
+        parent,
+        name,
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        0,
+    )
+}
+
+#[cfg(unix)]
+fn mkdirat_private(parent: &fs::File, name: &OsStr) -> io::Result<()> {
+    let name = path_component_cstring(name)?;
+    // SAFETY: `parent` and `name` stay alive for the duration of mkdirat.
+    let result = unsafe {
+        libc::mkdirat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            SQLITE_PRIVATE_DIRECTORY_MODE as libc::mode_t,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(unix)]
+fn create_secure_sqlite_file(parent: &fs::File, path: &Path) -> io::Result<fs::File> {
+    openat_file(
+        parent,
+        sqlite_file_name(path)?,
+        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        SQLITE_PRIVATE_FILE_MODE,
+    )
+}
+
+#[cfg(unix)]
+fn open_sqlite_file_nofollow(parent: &fs::File, path: &Path) -> Result<fs::File, StateError> {
+    openat_file(
+        parent,
+        sqlite_file_name(path).map_err(|source| sqlite_file_open_error(path, source))?,
+        libc::O_RDWR | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        0,
+    )
+    .map_err(|source| sqlite_file_open_error(path, source))
+}
+
+#[cfg(unix)]
+fn openat_file(parent: &fs::File, name: &OsStr, flags: i32, mode: u32) -> io::Result<fs::File> {
+    let name = path_component_cstring(name)?;
+    // SAFETY: `parent` and `name` stay alive for openat; a successful call returns an owned FD.
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            flags,
+            mode as libc::mode_t,
+        )
+    };
+    if fd < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        // SAFETY: openat returned a new owned file descriptor.
+        Ok(unsafe { fs::File::from_raw_fd(fd) })
+    }
+}
+
+#[cfg(unix)]
+fn path_component_cstring(name: &OsStr) -> io::Result<CString> {
+    CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))
+}
+
+#[cfg(unix)]
+fn sqlite_file_name(path: &Path) -> io::Result<&OsStr> {
+    path.file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "sqlite path has no file name"))
+}
+
+#[cfg(unix)]
+fn secure_existing_sqlite_sidecars(
+    sqlite_path: &Path,
+    parent: &fs::File,
+) -> Result<(), StateError> {
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar = sqlite_path.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        let sidecar = PathBuf::from(sidecar);
+        let file = match open_sqlite_file_nofollow(parent, &sidecar) {
+            Ok(file) => file,
+            Err(StateError::RestrictSqlitePermissions { source, .. })
+                if source.kind() == io::ErrorKind::NotFound =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        secure_opened_sqlite_file(&sidecar, &file)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sqlite_file_open_error(path: &Path, source: io::Error) -> StateError {
+    let is_symlink = source.raw_os_error() == Some(libc::ELOOP)
+        || fs::symlink_metadata(path)
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(false);
+    if is_symlink {
+        StateError::UnsafeSqlitePath {
+            path: path.to_path_buf(),
+            kind: UnsafeSqlitePathKind::Symlink,
+        }
+    } else if source.kind() == io::ErrorKind::IsADirectory {
+        StateError::UnsafeSqlitePath {
+            path: path.to_path_buf(),
+            kind: UnsafeSqlitePathKind::NonRegular,
+        }
+    } else {
+        StateError::RestrictSqlitePermissions {
+            path: path.to_path_buf(),
+            source,
+        }
+    }
+}
+
+#[cfg(unix)]
+fn secure_opened_sqlite_file(path: &Path, file: &fs::File) -> Result<(), StateError> {
+    // 中文注释：fstat 和 fchmod 都针对同一个 FD，路径在此期间被替换也不会触及外部目标。
+    let metadata = file
+        .metadata()
+        .map_err(|source| StateError::RestrictSqlitePermissions {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let file_type = metadata.file_type();
+    if !file_type.is_file() {
+        return Err(StateError::UnsafeSqlitePath {
+            path: path.to_path_buf(),
+            kind: UnsafeSqlitePathKind::NonRegular,
+        });
+    }
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        return Err(StateError::UnsafeSqlitePath {
+            path: path.to_path_buf(),
+            kind: UnsafeSqlitePathKind::WrongOwner,
+        });
+    }
+
+    fchmod_opened_path(path, file, SQLITE_PRIVATE_FILE_MODE)
+}
+
+#[cfg(unix)]
+fn fchmod_opened_path(path: &Path, file: &fs::File, mode: u32) -> Result<(), StateError> {
+    // SAFETY: `file` 在调用期间保持存活，传入的 FD 仅供 fchmod 使用。
+    let result = unsafe { libc::fchmod(file.as_raw_fd(), mode as libc::mode_t) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(StateError::RestrictSqlitePermissions {
+            path: path.to_path_buf(),
+            source: io::Error::last_os_error(),
+        })
+    }
+}
+
+#[cfg(unix)]
+fn verify_secure_sqlite_open(
+    sqlite_path: &Path,
+    secure_open: &SecureSqliteOpen,
+) -> Result<(), StateError> {
+    verify_path_identity(sqlite_path, &secure_open.database, false)?;
+    verify_path_identity(&secure_open.parent_path, &secure_open.parent, true)
+}
+
+#[cfg(unix)]
+fn verify_path_identity(path: &Path, opened: &fs::File, directory: bool) -> Result<(), StateError> {
+    let expected = opened
+        .metadata()
+        .map_err(|source| sqlite_file_open_error(path, source))?;
+    let actual =
+        fs::symlink_metadata(path).map_err(|source| sqlite_file_open_error(path, source))?;
+    if actual.file_type().is_symlink() {
+        return Err(StateError::UnsafeSqlitePath {
+            path: path.to_path_buf(),
+            kind: UnsafeSqlitePathKind::Symlink,
+        });
+    }
+    let expected_type_matches = if directory {
+        expected.is_dir() && actual.is_dir()
+    } else {
+        expected.is_file() && actual.is_file()
+    };
+    if !expected_type_matches || expected.dev() != actual.dev() || expected.ino() != actual.ino() {
+        return Err(StateError::UnsafeSqlitePath {
+            path: path.to_path_buf(),
+            kind: UnsafeSqlitePathKind::Replaced,
+        });
+    }
+    Ok(())
+}
+
+fn ensure_compatible_connection(conn: &Connection, path: &Path) -> Result<(), StateError> {
+    initialize_daemon_state_schema(conn, path)?;
+    ensure_sqlite_state_version(conn, path)
 }
 
 fn ensure_state_version(path: &Path, found: u32) -> Result<(), StateError> {
@@ -611,7 +1170,7 @@ fn list_http_uploads(
                 ino: ino_raw.parse::<u64>().map_err(|source| {
                     rusqlite::Error::FromSqlConversionFailure(4, Type::Text, Box::new(source))
                 })?,
-                updated_at_ms: UnixTimestampMillis(row.get::<_, i64>(5)? as u64),
+                updated_at_ms: integer_to_timestamp(row.get::<_, i64>(5)?, 5)?,
             })
         })
         .map_err(|source| sqlite_error(path, source))?;
@@ -649,10 +1208,11 @@ fn load_sqlite_state(conn: &Connection, path: &Path) -> Result<DaemonState, Stat
         .query_map([], |row| {
             let device_id = parse_device_id(row.get::<_, String>(0)?)?;
             let public_key = PublicKey(row.get::<_, String>(1)?);
-            let trusted_at_ms = UnixTimestampMillis(row.get::<_, i64>(2)? as u64);
+            let trusted_at_ms = integer_to_timestamp(row.get::<_, i64>(2)?, 2)?;
             let last_seen_at_ms = row
                 .get::<_, Option<i64>>(3)?
-                .map(|value| UnixTimestampMillis(value as u64));
+                .map(|value| integer_to_timestamp(value, 3))
+                .transpose()?;
             let label = row.get::<_, Option<String>>(4)?;
 
             Ok(TrustedDeviceState {
@@ -699,21 +1259,20 @@ fn load_sqlite_state(conn: &Connection, path: &Path) -> Result<DaemonState, Stat
                 })?;
             let state = parse_session_state(row.get::<_, String>(1)?)?;
             let size = TerminalSize {
-                rows: row.get::<_, i64>(2)? as u16,
-                cols: row.get::<_, i64>(3)? as u16,
-                pixel_width: row.get::<_, i64>(4)? as u16,
-                pixel_height: row.get::<_, i64>(5)? as u16,
+                rows: integer_to_u16(row.get::<_, i64>(2)?, 2)?,
+                cols: integer_to_u16(row.get::<_, i64>(3)?, 3)?,
+                pixel_width: integer_to_u16(row.get::<_, i64>(4)?, 4)?,
+                pixel_height: integer_to_u16(row.get::<_, i64>(5)?, 5)?,
             };
             let restore_kind = row.get::<_, Option<String>>(8)?;
             let restore_value = row.get::<_, Option<String>>(9)?;
             let restore_info = parse_restore_info(restore_kind, restore_value)?;
-
             Ok(SessionStateRecord {
                 session_id,
                 state,
                 size,
-                created_at_ms: UnixTimestampMillis(row.get::<_, i64>(6)? as u64),
-                updated_at_ms: UnixTimestampMillis(row.get::<_, i64>(7)? as u64),
+                created_at_ms: integer_to_timestamp(row.get::<_, i64>(6)?, 6)?,
+                updated_at_ms: integer_to_timestamp(row.get::<_, i64>(7)?, 7)?,
                 restore_info,
             })
         })
@@ -836,7 +1395,11 @@ fn save_sqlite_state(
     // 显式关闭或恢复失败必须调用 `record_runtime_session_closed` 写 tombstone。
 
     for session in &state.sessions {
-        let (restore_kind, restore_value) = serialize_restore_info(session.restore_info.as_ref());
+        let (restore_kind, restore_value) = if session.state == SessionState::Closed {
+            (None, None)
+        } else {
+            serialize_restore_info(session.restore_info.as_ref())
+        };
         tx.execute(
             r#"
             INSERT INTO runtime_sessions (
@@ -853,15 +1416,24 @@ fn save_sqlite_state(
             )
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
             ON CONFLICT(session_id) DO UPDATE SET
-                state = excluded.state,
+                state = CASE
+                    WHEN runtime_sessions.state = ?11 OR excluded.state = ?11 THEN ?11
+                    ELSE excluded.state
+                END,
                 rows = excluded.rows,
                 cols = excluded.cols,
                 pixel_width = excluded.pixel_width,
                 pixel_height = excluded.pixel_height,
                 created_at_ms = excluded.created_at_ms,
                 updated_at_ms = excluded.updated_at_ms,
-                restore_kind = excluded.restore_kind,
-                restore_value = excluded.restore_value
+                restore_kind = CASE
+                    WHEN runtime_sessions.state = ?11 OR excluded.state = ?11 THEN NULL
+                    ELSE excluded.restore_kind
+                END,
+                restore_value = CASE
+                    WHEN runtime_sessions.state = ?11 OR excluded.state = ?11 THEN NULL
+                    ELSE excluded.restore_value
+                END
             "#,
             params![
                 session.session_id.0.to_string(),
@@ -874,6 +1446,7 @@ fn save_sqlite_state(
                 session.updated_at_ms.0 as i64,
                 restore_kind,
                 restore_value,
+                session_state_text(SessionState::Closed),
             ],
         )
         .map_err(|source| sqlite_error(path, source))?;
@@ -952,20 +1525,6 @@ fn upsert_meta_value(
     Ok(())
 }
 
-fn ensure_parent_directory(path: &Path) -> Result<(), StateError> {
-    let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    else {
-        return Ok(());
-    };
-
-    fs::create_dir_all(parent).map_err(|source| StateError::CreateDirectory {
-        path: parent.to_path_buf(),
-        source,
-    })
-}
-
 fn sqlite_error(path: &Path, source: rusqlite::Error) -> StateError {
     StateError::Sqlite {
         path: path.to_path_buf(),
@@ -1001,6 +1560,20 @@ fn parse_session_state(raw: String) -> rusqlite::Result<SessionState> {
     }
 }
 
+fn integer_to_u16(value: i64, column: usize) -> rusqlite::Result<u16> {
+    u16::try_from(value).map_err(|source| {
+        rusqlite::Error::FromSqlConversionFailure(column, Type::Integer, Box::new(source))
+    })
+}
+
+fn integer_to_timestamp(value: i64, column: usize) -> rusqlite::Result<UnixTimestampMillis> {
+    u64::try_from(value)
+        .map(UnixTimestampMillis)
+        .map_err(|source| {
+            rusqlite::Error::FromSqlConversionFailure(column, Type::Integer, Box::new(source))
+        })
+}
+
 fn session_state_text(state: SessionState) -> &'static str {
     match state {
         SessionState::Created => "created",
@@ -1009,7 +1582,7 @@ fn session_state_text(state: SessionState) -> &'static str {
     }
 }
 
-fn serialize_restore_info(
+pub(crate) fn serialize_restore_info(
     restore_info: Option<&PtyRestoreInfo>,
 ) -> (Option<&'static str>, Option<String>) {
     match restore_info {
@@ -1121,7 +1694,11 @@ fn current_unix_timestamp_millis() -> UnixTimestampMillis {
 mod tests {
     use super::*;
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::{PermissionsExt, symlink};
     use std::path::{Path, PathBuf};
+    #[cfg(unix)]
+    use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
     use termd_proto::{
         DeviceId, PublicKey, ServerId, SessionId, SessionState, TerminalSize, UnixTimestampMillis,
@@ -1132,11 +1709,15 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!(
+        let directory = std::env::temp_dir().join(format!(
             "termd-state-test-{}-{}-{name}",
             std::process::id(),
             nanos
-        ))
+        ));
+        fs::create_dir(&directory).unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        directory.join(name)
     }
 
     #[test]
@@ -1182,6 +1763,423 @@ mod tests {
         cleanup_state_paths(&state_path);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn state_store_creates_sqlite_database_with_private_permissions() {
+        let state_path = temp_path("private-new-state.json");
+        let sqlite_path = sqlite_state_path_for_state_path(&state_path);
+
+        let loaded = StateStore::load(&state_path).unwrap();
+
+        assert_eq!(loaded, DaemonState::default());
+        assert_eq!(unix_mode(&sqlite_path), 0o600);
+        cleanup_state_paths(&state_path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_store_accepts_readable_existing_parent_directories_without_chmod() {
+        for mode in [0o750, 0o755] {
+            let state_path = temp_path(&format!("readable-parent-{mode:o}.json"));
+            let parent = state_path.parent().unwrap();
+            fs::set_permissions(parent, fs::Permissions::from_mode(mode)).unwrap();
+
+            StateStore::load(&state_path).unwrap();
+
+            assert_eq!(unix_mode(parent), mode);
+            cleanup_state_paths(&state_path);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_store_rejects_writable_existing_parent_directories_without_chmod() {
+        for mode in [0o770, 0o702] {
+            let state_path = temp_path(&format!("writable-parent-{mode:o}.json"));
+            let parent = state_path.parent().unwrap();
+            fs::set_permissions(parent, fs::Permissions::from_mode(mode)).unwrap();
+
+            let error = StateStore::load(&state_path).unwrap_err();
+
+            assert!(matches!(error, StateError::UnsafeSqlitePath { .. }));
+            assert_eq!(unix_mode(parent), mode);
+            assert!(!sqlite_state_path_for_state_path(&state_path).exists());
+            let _ = fs::remove_dir(parent);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_store_allows_sticky_world_writable_ancestor() {
+        let root_state_path = temp_path("sticky-ancestor-root");
+        let root = root_state_path.parent().unwrap().to_path_buf();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o1777)).unwrap();
+        let private_parent = root.join("private");
+        fs::create_dir(&private_parent).unwrap();
+        fs::set_permissions(&private_parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let state_path = private_parent.join("daemon-state.json");
+
+        StateStore::load(&state_path).unwrap();
+
+        cleanup_state_paths(&state_path);
+        let _ = fs::remove_dir(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_store_rejects_non_sticky_world_writable_ancestor() {
+        let root_state_path = temp_path("writable-ancestor-root");
+        let root = root_state_path.parent().unwrap().to_path_buf();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o777)).unwrap();
+        let private_parent = root.join("private");
+        fs::create_dir(&private_parent).unwrap();
+        fs::set_permissions(&private_parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let state_path = private_parent.join("daemon-state.json");
+
+        let error = StateStore::load(&state_path).unwrap_err();
+
+        assert!(matches!(error, StateError::UnsafeSqlitePath { .. }));
+        assert_eq!(unix_mode(&root), 0o777);
+        assert!(!sqlite_state_path_for_state_path(&state_path).exists());
+        let _ = fs::remove_dir(private_parent);
+        let _ = fs::remove_dir(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_store_rejects_foreign_owned_ancestor_regardless_of_mode() {
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+
+        for mode in [0o555, 0o1555] {
+            let root_state_path = temp_path(&format!("foreign-ancestor-{mode:o}-root"));
+            let root = root_state_path.parent().unwrap().to_path_buf();
+            let foreign_ancestor = root.join("foreign");
+            let private_parent = foreign_ancestor.join("private");
+            fs::create_dir(&foreign_ancestor).unwrap();
+            fs::create_dir(&private_parent).unwrap();
+            fs::set_permissions(&private_parent, fs::Permissions::from_mode(0o700)).unwrap();
+            chown_path(&foreign_ancestor, 65_534, 65_534);
+            fs::set_permissions(&foreign_ancestor, fs::Permissions::from_mode(mode)).unwrap();
+            let state_path = private_parent.join("daemon-state.json");
+
+            let error = StateStore::load(&state_path).unwrap_err();
+
+            assert!(matches!(error, StateError::UnsafeSqlitePath { .. }));
+            assert!(!sqlite_state_path_for_state_path(&state_path).exists());
+            chown_path(&foreign_ancestor, unsafe { libc::geteuid() }, unsafe {
+                libc::getegid()
+            });
+            fs::set_permissions(&foreign_ancestor, fs::Permissions::from_mode(0o700)).unwrap();
+            let _ = fs::remove_dir(private_parent);
+            let _ = fs::remove_dir(foreign_ancestor);
+            let _ = fs::remove_dir(root);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_store_securely_creates_multiple_missing_parent_components() {
+        let root_state_path = temp_path("multi-level-missing-root");
+        let root = root_state_path.parent().unwrap().to_path_buf();
+        let first = root.join("missing");
+        let second = first.join("a");
+        let parent = second.join("state");
+        let state_path = parent.join("daemon-state.json");
+
+        let loaded = StateStore::load(&state_path).unwrap();
+
+        assert_eq!(loaded, DaemonState::default());
+        for directory in [&first, &second, &parent] {
+            assert_eq!(unix_mode(directory), 0o700);
+        }
+        cleanup_state_paths(&state_path);
+        let _ = fs::remove_dir(second);
+        let _ = fs::remove_dir(first);
+        let _ = fs::remove_dir(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_store_anchors_relative_path_before_cwd_changes() {
+        const TEST_NAME: &str =
+            "state::tests::state_store_anchors_relative_path_before_cwd_changes";
+        const CHILD_CWD_ENV: &str = "TERMD_TEST_CWD_AFTER_SQLITE_PREPARE";
+
+        if std::env::var_os(CHILD_CWD_ENV).is_some() {
+            let loaded = StateStore::load("state/../state/daemon-state.json").unwrap();
+            assert_eq!(
+                loaded.trusted_devices[0].label.as_deref(),
+                Some("initial-cwd")
+            );
+            return;
+        }
+
+        let root_state_path = temp_path("relative-cwd-anchor-root");
+        let root = root_state_path.parent().unwrap().to_path_buf();
+        let state_parent = root.join("state");
+        let alternate_cwd = root.join("alternate");
+        fs::create_dir(&state_parent).unwrap();
+        fs::create_dir(&alternate_cwd).unwrap();
+        fs::create_dir(alternate_cwd.join("state")).unwrap();
+        for directory in [&state_parent, &alternate_cwd, &alternate_cwd.join("state")] {
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let expected_state_path = state_parent.join("daemon-state.json");
+        let alternate_state_path = alternate_cwd.join("state/daemon-state.json");
+        let mut initial_state = sample_state();
+        initial_state.trusted_devices[0].label = Some("initial-cwd".to_owned());
+        let mut alternate_state = sample_state();
+        alternate_state.trusted_devices[0].label = Some("alternate-cwd".to_owned());
+        fs::write(
+            &expected_state_path,
+            serde_json::to_string_pretty(&initial_state).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            &alternate_state_path,
+            serde_json::to_string_pretty(&alternate_state).unwrap(),
+        )
+        .unwrap();
+
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST_NAME, "--nocapture"])
+            .current_dir(&root)
+            .env(CHILD_CWD_ENV, &alternate_cwd)
+            .output()
+            .unwrap();
+        let unexpected_sqlite_path = alternate_cwd.join("state/daemon-state.sqlite");
+        let expected_sqlite_exists =
+            sqlite_state_path_for_state_path(&expected_state_path).exists();
+        let unexpected_sqlite_exists = unexpected_sqlite_path.exists();
+
+        cleanup_state_paths(&expected_state_path);
+        cleanup_state_paths(&alternate_state_path);
+        let _ = fs::remove_dir(&alternate_cwd);
+        let _ = fs::remove_dir(&root);
+
+        assert!(
+            output.status.success(),
+            "child test failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(expected_sqlite_exists);
+        assert!(!unexpected_sqlite_exists);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_store_rejects_symlink_ancestor_directory() {
+        let target_state_path = temp_path("ancestor-target");
+        let target_root = target_state_path.parent().unwrap().to_path_buf();
+        let private_parent = target_root.join("private");
+        fs::create_dir(&private_parent).unwrap();
+        fs::set_permissions(&private_parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let link_state_path = temp_path("ancestor-link-root");
+        let link_root = link_state_path.parent().unwrap().to_path_buf();
+        let linked_ancestor = link_root.join("linked");
+        symlink(&target_root, &linked_ancestor).unwrap();
+        let state_path = linked_ancestor.join("private/daemon-state.json");
+
+        let error = StateStore::load(&state_path).unwrap_err();
+
+        assert!(matches!(error, StateError::UnsafeSqlitePath { .. }));
+        assert!(!private_parent.join("daemon-state.sqlite").exists());
+        let _ = fs::remove_file(linked_ancestor);
+        let _ = fs::remove_dir(link_root);
+        let _ = fs::remove_dir(private_parent);
+        let _ = fs::remove_dir(target_root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_store_rejects_symlink_parent_directory() {
+        let target_state_path = temp_path("parent-target-state.json");
+        let target_parent = target_state_path.parent().unwrap().to_path_buf();
+        let link_root = temp_path("parent-link-root");
+        let link_root_parent = link_root.parent().unwrap().to_path_buf();
+        let linked_parent = link_root_parent.join("linked-parent");
+        symlink(&target_parent, &linked_parent).unwrap();
+        let state_path = linked_parent.join("daemon-state.json");
+
+        let error = StateStore::load(&state_path).unwrap_err();
+
+        assert!(matches!(error, StateError::UnsafeSqlitePath { .. }));
+        assert!(!target_parent.join("daemon-state.sqlite").exists());
+        let _ = fs::remove_file(linked_parent);
+        let _ = fs::remove_dir(link_root_parent);
+        let _ = fs::remove_dir(target_parent);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_store_database_and_generated_sidecars_have_private_permissions() {
+        let state_path = temp_path("private-existing-state.json");
+        let sqlite_path = sqlite_state_path_for_state_path(&state_path);
+        let sidecars = sqlite_sidecar_paths(&sqlite_path);
+        let state = sample_state();
+
+        StateStore::save(&state_path, &state).unwrap();
+        let keeper = force_wal_sidecars(&sqlite_path);
+
+        assert_eq!(unix_mode(&sqlite_path), 0o600);
+        assert_eq!(unix_mode(&sidecars[0]), 0o600);
+        assert_eq!(unix_mode(&sidecars[1]), 0o600);
+        assert_eq!(unix_mode(state_path.parent().unwrap()), 0o700);
+        drop(keeper);
+        cleanup_state_paths(&state_path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_store_restricts_existing_nonempty_sidecars_before_reopen() {
+        let state_path = temp_path("existing-sidecar-permissions.json");
+        let sqlite_path = sqlite_state_path_for_state_path(&state_path);
+        let sidecars = sqlite_sidecar_paths(&sqlite_path);
+        StateStore::save(&state_path, &sample_state()).unwrap();
+        let keeper = force_wal_sidecars(&sqlite_path);
+        for sidecar in &sidecars {
+            assert!(fs::metadata(sidecar).unwrap().len() > 0);
+            set_unix_mode(sidecar, 0o644);
+        }
+
+        StateStore::load(&state_path).unwrap();
+
+        assert_eq!(unix_mode(&sidecars[0]), 0o600);
+        assert_eq!(unix_mode(&sidecars[1]), 0o600);
+        drop(keeper);
+        cleanup_state_paths(&state_path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_store_rejects_sqlite_symlink_without_touching_target() {
+        let state_path = temp_path("symlink-state.json");
+        let sqlite_path = sqlite_state_path_for_state_path(&state_path);
+        let target_path = temp_path("symlink-target.sqlite");
+
+        fs::write(&target_path, "").unwrap();
+        set_unix_mode(&target_path, 0o644);
+        symlink(&target_path, &sqlite_path).unwrap();
+
+        let error = StateStore::load(&state_path).unwrap_err();
+
+        assert_unsafe_sqlite_path(error, &sqlite_path, UnsafeSqlitePathKind::Symlink);
+        assert_eq!(unix_mode(&target_path), 0o644);
+        cleanup_state_paths(&state_path);
+        cleanup_temp_file(&target_path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_store_rejects_non_regular_sqlite_path() {
+        let state_path = temp_path("directory-state.json");
+        let sqlite_path = sqlite_state_path_for_state_path(&state_path);
+
+        fs::create_dir_all(&sqlite_path).unwrap();
+
+        let error = StateStore::load(&state_path).unwrap_err();
+
+        assert_unsafe_sqlite_path(error, &sqlite_path, UnsafeSqlitePathKind::NonRegular);
+        let _ = fs::remove_dir(&sqlite_path);
+        cleanup_state_paths(&state_path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_store_rejects_sqlite_sidecar_symlink_without_touching_target() {
+        let state_path = temp_path("sidecar-symlink-state.json");
+        let sqlite_path = sqlite_state_path_for_state_path(&state_path);
+        let sidecars = sqlite_sidecar_paths(&sqlite_path);
+        let target_path = temp_path("sidecar-target.sqlite-wal");
+
+        StateStore::save(&state_path, &sample_state()).unwrap();
+        for sidecar_path in &sidecars {
+            let _ = fs::remove_file(sidecar_path);
+        }
+        fs::write(&target_path, "").unwrap();
+        set_unix_mode(&target_path, 0o644);
+        symlink(&target_path, &sidecars[0]).unwrap();
+
+        let error = StateStore::load(&state_path).unwrap_err();
+
+        assert_unsafe_sqlite_path(error, &sidecars[0], UnsafeSqlitePathKind::Symlink);
+        assert_eq!(unix_mode(&target_path), 0o644);
+        cleanup_state_paths(&state_path);
+        cleanup_temp_file(&target_path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sqlite_file_permission_and_identity_checks_use_opened_fd() {
+        let state_path = temp_path("fd-permission-state.json");
+        let sqlite_path = sqlite_state_path_for_state_path(&state_path);
+        let detached_path = state_path.with_file_name("fd-permission-detached.sqlite");
+        let target_path = state_path.with_file_name("fd-permission-target.sqlite");
+        fs::write(&sqlite_path, "").unwrap();
+        fs::write(&target_path, "").unwrap();
+        set_unix_mode(&sqlite_path, 0o644);
+        set_unix_mode(&target_path, 0o644);
+
+        let parent = open_directory_nofollow(sqlite_path.parent().unwrap()).unwrap();
+        let file = open_sqlite_file_nofollow(&parent, &sqlite_path).unwrap();
+        fs::rename(&sqlite_path, &detached_path).unwrap();
+        symlink(&target_path, &sqlite_path).unwrap();
+
+        secure_opened_sqlite_file(&sqlite_path, &file).unwrap();
+
+        assert_eq!(unix_mode(&detached_path), 0o600);
+        assert_eq!(unix_mode(&target_path), 0o644);
+        assert!(matches!(
+            verify_path_identity(&sqlite_path, &file, false),
+            Err(StateError::UnsafeSqlitePath {
+                kind: UnsafeSqlitePathKind::Symlink,
+                ..
+            })
+        ));
+        drop(file);
+        let _ = fs::remove_file(detached_path);
+        let _ = fs::remove_file(target_path);
+
+        cleanup_state_paths(&state_path);
+    }
+
+    #[test]
+    fn sqlite_open_flags_do_not_enable_create_or_uri_parsing() {
+        // 中文注释：路径安全检查按普通 Path 完成，SQLite 打开层不能重新启用 URI 语义。
+        assert!(
+            !sqlite_open_flags().contains(OpenFlags::SQLITE_OPEN_URI),
+            "SQLite 状态库打开不能包含 SQLITE_OPEN_URI"
+        );
+        assert!(
+            !sqlite_open_flags().contains(OpenFlags::SQLITE_OPEN_CREATE),
+            "SQLite 状态库必须先安全创建，再以不含 SQLITE_OPEN_CREATE 的 flags 打开"
+        );
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn state_store_rejects_unsupported_platform_without_creating_paths() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let state_path = std::env::temp_dir()
+            .join(format!("termd-unsupported-{}-{nanos}", std::process::id()))
+            .join("missing/daemon-state.json");
+        let sqlite_path = sqlite_state_path_for_state_path(&state_path);
+
+        let error = StateStore::load(&state_path).unwrap_err();
+
+        assert!(matches!(
+            error,
+            StateError::UnsupportedPlatform { path } if path == sqlite_path
+        ));
+        assert!(!state_path.parent().unwrap().exists());
+    }
+
     #[test]
     fn missing_state_load_returns_empty_default_state() {
         let state_path = temp_path("missing-state.json");
@@ -1189,6 +2187,7 @@ mod tests {
         let loaded = StateStore::load(&state_path).unwrap();
 
         assert_eq!(loaded, DaemonState::default());
+        cleanup_state_paths(&state_path);
     }
 
     #[test]
@@ -1211,6 +2210,35 @@ mod tests {
 
         assert!(!state_path.exists());
         assert!(sqlite_state_path_for_state_path(&state_path).exists());
+        cleanup_state_paths(&state_path);
+    }
+
+    #[test]
+    fn state_load_rejects_oversized_terminal_size_from_sqlite() {
+        let state_path = temp_path("oversized-runtime-session-size.json");
+        let sqlite_path = sqlite_state_path_for_state_path(&state_path);
+        StateStore::save(&state_path, &sample_state()).unwrap();
+        let conn = Connection::open(&sqlite_path).unwrap();
+        conn.execute(
+            "UPDATE runtime_sessions SET cols = ?1",
+            params![i64::from(u16::MAX) + 1],
+        )
+        .unwrap();
+        drop(conn);
+
+        let error = StateStore::load(&state_path).unwrap_err();
+
+        assert!(matches!(
+            error,
+            StateError::Sqlite {
+                source: rusqlite::Error::FromSqlConversionFailure(
+                    3,
+                    rusqlite::types::Type::Integer,
+                    _
+                ),
+                ..
+            }
+        ));
         cleanup_state_paths(&state_path);
     }
 
@@ -1244,6 +2272,59 @@ mod tests {
         assert_eq!(closed.sessions[0].session_id, session_id);
         assert_eq!(closed.sessions[0].state, SessionState::Closed);
         assert!(closed.sessions[0].restore_info.is_none());
+        cleanup_state_paths(&state_path);
+    }
+
+    #[test]
+    fn closed_tombstone_upserts_when_runtime_row_was_never_persisted() {
+        let state_path = temp_path("closed-runtime-session-missing-row.json");
+        let session_id = SessionId::new();
+        StateStore::save(&state_path, &DaemonState::default()).unwrap();
+
+        assert!(
+            StateStore::record_runtime_session_closed(
+                &state_path,
+                session_id,
+                UnixTimestampMillis(3_000),
+            )
+            .unwrap()
+        );
+
+        let loaded = StateStore::load(&state_path).unwrap();
+        assert_eq!(loaded.sessions.len(), 1);
+        assert_eq!(loaded.sessions[0].session_id, session_id);
+        assert_eq!(loaded.sessions[0].state, SessionState::Closed);
+        assert!(loaded.sessions[0].restore_info.is_none());
+        cleanup_state_paths(&state_path);
+    }
+
+    #[test]
+    fn stale_running_snapshot_cannot_reopen_closed_runtime_session() {
+        let state_path = temp_path("closed-runtime-session-stale-snapshot.json");
+        let running_state = sample_state();
+        let session_id = running_state.sessions[0].session_id;
+
+        StateStore::save(&state_path, &running_state).unwrap();
+        assert!(
+            StateStore::record_runtime_session_closed(
+                &state_path,
+                session_id,
+                UnixTimestampMillis(3_000),
+            )
+            .unwrap()
+        );
+
+        let mut stale_snapshot = running_state;
+        stale_snapshot.sessions[0].size = TerminalSize::new(40, 120);
+        stale_snapshot.sessions[0].updated_at_ms = UnixTimestampMillis(4_000);
+        StateStore::save(&state_path, &stale_snapshot).unwrap();
+
+        let loaded = StateStore::load(&state_path).unwrap();
+        assert_eq!(loaded.sessions.len(), 1);
+        assert_eq!(loaded.sessions[0].session_id, session_id);
+        assert_eq!(loaded.sessions[0].state, SessionState::Closed);
+        assert_eq!(loaded.sessions[0].size, TerminalSize::new(40, 120));
+        assert!(loaded.sessions[0].restore_info.is_none());
         cleanup_state_paths(&state_path);
     }
 
@@ -1493,8 +2574,89 @@ mod tests {
     fn cleanup_state_paths(state_path: &Path) {
         let sqlite_path = sqlite_state_path_for_state_path(state_path);
         let _ = fs::remove_file(state_path);
+        for sidecar_path in sqlite_sidecar_paths(&sqlite_path) {
+            let _ = fs::remove_file(sidecar_path);
+        }
         let _ = fs::remove_file(&sqlite_path);
-        let _ = fs::remove_file(sqlite_path.with_extension("sqlite-wal"));
-        let _ = fs::remove_file(sqlite_path.with_extension("sqlite-shm"));
+        let _ = fs::remove_dir(&sqlite_path);
+        if let Some(parent) = state_path.parent() {
+            let _ = fs::remove_dir(parent);
+        }
+    }
+
+    fn cleanup_temp_file(path: &Path) {
+        let _ = fs::remove_file(path);
+        if let Some(parent) = path.parent() {
+            let _ = fs::remove_dir(parent);
+        }
+    }
+
+    fn sqlite_sidecar_paths(sqlite_path: &Path) -> [PathBuf; 2] {
+        [
+            sqlite_sidecar_path(sqlite_path, "-wal"),
+            sqlite_sidecar_path(sqlite_path, "-shm"),
+        ]
+    }
+
+    fn sqlite_sidecar_path(sqlite_path: &Path, suffix: &str) -> PathBuf {
+        let mut path = sqlite_path.as_os_str().to_os_string();
+        path.push(suffix);
+        PathBuf::from(path)
+    }
+
+    #[cfg(unix)]
+    fn force_wal_sidecars(sqlite_path: &Path) -> Connection {
+        let conn = Connection::open(sqlite_path).unwrap();
+        conn.execute_batch(
+            r#"
+            PRAGMA journal_mode = WAL;
+            PRAGMA wal_autocheckpoint = 0;
+            CREATE TABLE IF NOT EXISTS permission_probe (
+                id INTEGER PRIMARY KEY
+            );
+            INSERT INTO permission_probe DEFAULT VALUES;
+            "#,
+        )
+        .unwrap();
+        for sidecar_path in sqlite_sidecar_paths(sqlite_path) {
+            assert!(
+                sidecar_path.exists(),
+                "missing sidecar {}",
+                sidecar_path.display()
+            );
+        }
+        conn
+    }
+
+    #[cfg(unix)]
+    fn unix_mode(path: &Path) -> u32 {
+        fs::symlink_metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    fn set_unix_mode(path: &Path, mode: u32) {
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn chown_path(path: &Path, uid: u32, gid: u32) {
+        let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        let result = unsafe { libc::chown(path.as_ptr(), uid, gid) };
+        assert_eq!(result, 0, "chown failed: {}", io::Error::last_os_error());
+    }
+
+    #[cfg(unix)]
+    fn assert_unsafe_sqlite_path(
+        error: StateError,
+        expected_path: &Path,
+        expected_kind: UnsafeSqlitePathKind,
+    ) {
+        match error {
+            StateError::UnsafeSqlitePath { path, kind } => {
+                assert_eq!(path, expected_path);
+                assert_eq!(kind, expected_kind);
+            }
+            other => panic!("expected UnsafeSqlitePath, got {other:?}"),
+        }
     }
 }

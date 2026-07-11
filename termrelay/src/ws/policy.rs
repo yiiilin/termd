@@ -8,7 +8,7 @@ use tracing::{debug, warn};
 
 use super::{ConnectionId, ConnectionRole};
 
-// relay 只关闭当前 WebSocket transport；不会解释或终止 E2EE 内部的 daemon session。
+// relay 只关闭当前 WebSocket transport；不会解释或终止 daemon 管理的 session。
 pub(super) const ROUTE_PRELUDE_TIMEOUT: Duration = Duration::from_secs(5);
 pub(super) const WEBSOCKET_SEND_DEADLINE: Duration = Duration::from_secs(10);
 pub(super) const WEBSOCKET_PONG_DEADLINE: Duration = Duration::from_secs(10);
@@ -19,7 +19,7 @@ pub(super) const WEBSOCKET_OUTBOUND_FRAME_PRESSURE_DEBUG_BYTES: usize = 128 * 10
 pub(super) const WEBSOCKET_IDLE_PING_INTERVAL: Duration = Duration::from_secs(10);
 #[cfg(test)]
 pub(super) const WEBSOCKET_IDLE_PING_INTERVAL: Duration = Duration::from_millis(50);
-// 终端 snapshot 是 E2EE 后的 opaque binary frame，relay 不能拆包或解析。
+// 当前终端 snapshot 是 relay 可见但不做业务解析的 binary frame。
 // 这里的上限必须能容纳 1000 行 scrollback 的完整重绘，同时仍保留传输层内存保护。
 pub(crate) const WEBSOCKET_MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 pub(crate) const WEBSOCKET_MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;

@@ -1,5 +1,7 @@
 # Termd Relay Web One-Shot Refactor Status Review
 
+> 历史状态提示：本文记录当时的计划/实现状态，不代表当前 0.6 协议契约；现行边界以 `TECH.md` 和 `docs/deployment.md` 为准。
+
 > 对照对象：
 > [2026-06-03-termd-relay-web-one-shot-refactor.md](./2026-06-03-termd-relay-web-one-shot-refactor.md)
 >

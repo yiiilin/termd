@@ -36,6 +36,24 @@ test.beforeEach(async ({ page }) => {
   await resetBrowserState(page);
 });
 
+test("真实键盘输入 helper 会等待终端 snapshot/resize 稳定", async ({ page }) => {
+  await page.setContent(`
+    <div class="terminal-host" data-termd-resize-stabilizing="true">
+      <div class="xterm-screen" style="width: 320px; height: 180px"></div>
+      <textarea aria-label="Terminal input"></textarea>
+    </div>
+  `);
+  await page.locator(".terminal-host").evaluate((host) => {
+    window.setTimeout(() => {
+      (host as HTMLElement).dataset.termdResizeStabilizing = "false";
+    }, 150);
+  });
+
+  await focusTerminalForKeyboard(page);
+
+  expect(await page.locator(".terminal-host").getAttribute("data-termd-resize-stabilizing")).toBe("false");
+});
+
 test("浏览器通过真实 relay 连接 daemon 完成 pairing 和 session list", async ({ page }, testInfo) => {
   test.setTimeout(60_000);
   const fixture = await startRealRelayFixture();
@@ -1695,7 +1713,12 @@ async function focusTerminalForKeyboard(page: Page): Promise<void> {
       // 这里等待一个小的 settle window，只有稳定留在 activeElement 才允许继续键入。
       input.focus();
       await new Promise((resolve) => window.setTimeout(resolve, 32));
-      return document.hasFocus() && document.activeElement === input;
+      return (
+        document.hasFocus() &&
+        document.activeElement === input &&
+        host.dataset.termdResizeStabilizing !== "true" &&
+        host.dataset.termdSnapshotRedraw !== "true"
+      );
     });
     if (inputReady) {
       return;
@@ -1710,30 +1733,34 @@ async function closeCreatedSessions(page: Page, names: string[]): Promise<void> 
     return;
   }
   for (const name of [...names].reverse()) {
-    const openButton = page.getByRole("button", { name: new RegExp(`^Open ${escapeRegex(name)}(?:, new output)?$`) });
-    let openButtonCount = 0;
-    try {
-      openButtonCount = await openButton.count();
-    } catch (caught) {
-      if (isPageGoneError(caught)) {
-        return;
+    const deadline = Date.now() + 8_000;
+    let lastError: unknown;
+    while (Date.now() < deadline) {
+      const openButton = page.getByRole("button", {
+        name: new RegExp(`^Open ${escapeRegex(name)}(?:, new output)?$`),
+      });
+      try {
+        if ((await openButton.count()) === 0) {
+          break;
+        }
+        // 中文注释：关闭一个 session 会重绘整个列表；每次短重试都从当前 DOM 重新定位 row。
+        const row = openButton.locator(
+          "xpath=ancestor::*[contains(concat(' ', normalize-space(@class), ' '), ' session-row ')][1]",
+        );
+        await row.getByRole("button", { name: "Close session" }).click({ timeout: 500 });
+      } catch (caught) {
+        if (isPageGoneError(caught)) {
+          return;
+        }
+        lastError = caught;
+        await page.waitForTimeout(50);
       }
-      throw caught;
     }
-    if (openButtonCount === 0) {
-      continue;
-    }
-    // 中文注释：session row 不再是嵌套按钮；清理时从主打开按钮回到同一行再找关闭按钮。
-    const row = openButton.locator(
-      "xpath=ancestor::*[contains(concat(' ', normalize-space(@class), ' '), ' session-row ')][1]",
-    );
-    try {
-      await row.getByRole("button", { name: "Close session" }).click();
-    } catch (caught) {
-      if (isPageGoneError(caught)) {
-        return;
-      }
-      throw caught;
+    const remaining = page.getByRole("button", {
+      name: new RegExp(`^Open ${escapeRegex(name)}(?:, new output)?$`),
+    });
+    if ((await remaining.count()) > 0) {
+      throw new Error(`failed to close session ${name}`, { cause: lastError });
     }
   }
 }

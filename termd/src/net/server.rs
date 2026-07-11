@@ -40,17 +40,18 @@ use tower::ServiceExt as _;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{debug, info, warn};
 
-use crate::auth::current_unix_timestamp_millis;
+use crate::auth::{PendingPairing, current_unix_timestamp_millis};
 use crate::config::DaemonConfig;
 use crate::pty::PtyRestoreInfo;
 use crate::pty::supervisor::SupervisorPtyBackend;
 use crate::state::{StateError, StateStore};
 
 use super::protocol::{
-    DaemonProtocol, JsonEnvelope, ProtocolConnection, ProtocolConnectionDebugSnapshot,
-    ProtocolConnectionDebugTraffic, ProtocolError, ProtocolWireMessage, SessionFileHttpUploadBegin,
-    SessionFileHttpUploadCommit, cleanup_persisted_session_file_http_uploads, decode_payload,
-    envelope_value, session_file_http_upload_chunks_len, write_session_file_http_upload_files,
+    DaemonProtocol, JsonEnvelope, PreparedProtocolWireMessage, ProtocolConnection,
+    ProtocolConnectionDebugSnapshot, ProtocolConnectionDebugTraffic, ProtocolError,
+    ProtocolWireMessage, SessionFileHttpUploadBegin, SessionFileHttpUploadCommit,
+    cleanup_persisted_session_file_http_uploads, decode_payload, envelope_value,
+    session_file_http_upload_chunks_len, write_session_file_http_upload_files,
 };
 use super::relay::RelayBaseUrl;
 use super::signature::Ed25519SignatureVerifier;
@@ -616,12 +617,12 @@ pub fn router(protocol: SharedDaemonProtocol, web_enabled: bool) -> Router {
     }
 }
 
-async fn web_or_api_fallback(method: Method, uri: OriginalUri) -> Response {
+async fn web_or_api_fallback(method: Method, uri: OriginalUri, headers: HeaderMap) -> Response {
     if is_api_fallback_path(uri.0.path()) {
         return StatusCode::NOT_FOUND.into_response();
     }
 
-    termweb::embedded_web_handler(method, uri).await
+    termweb::embedded_web_handler_with_headers(method, uri, headers).await
 }
 
 fn is_api_fallback_path(path: &str) -> bool {
@@ -787,8 +788,8 @@ pub(crate) async fn handle_http_tunnel_stream_request(
 }
 
 fn is_http_tunnel_allowed(method: &str, path: &str) -> bool {
-    // 中文注释：relay 是不可信 dumb pipe；daemon 侧必须再次校验 tunnel 入口。
-    // 路由白名单来自 proto 共享函数，避免 daemon/relay 各自维护一份字符串后漂移。
+    // 中文注释：trusted relay 负责 admission/routing，daemon 仍最终校验 tunnel 路径和
+    // 后续 auth/session 权限。路由白名单来自 proto 共享函数，避免两侧字符串漂移。
     is_http_tunnel_path_allowed(method, path)
 }
 
@@ -2284,6 +2285,19 @@ pub(crate) fn register_relay_device_from_config(
     .map_err(|_| RelayRegistrationError::Request("relay device registration panicked".to_owned()))?
 }
 
+async fn register_relay_device_from_config_async(
+    config: DaemonConfig,
+    server_id: ServerId,
+    device_id: termd_proto::DeviceId,
+    public_key: PublicKey,
+) -> Result<(), RelayRegistrationError> {
+    tokio::task::spawn_blocking(move || {
+        register_relay_device_from_config(&config, server_id, device_id, public_key)
+    })
+    .await
+    .map_err(|_| RelayRegistrationError::Request("relay device registration panicked".to_owned()))?
+}
+
 fn register_relay_device_request(
     endpoint: String,
     daemon_token: String,
@@ -2613,6 +2627,93 @@ fn debug_websocket_traffic(
     );
 }
 
+struct PairingReservationGuard {
+    protocol: SharedDaemonProtocol,
+    pending: Option<PendingPairing>,
+}
+
+impl PairingReservationGuard {
+    fn new(protocol: SharedDaemonProtocol, pending: PendingPairing) -> Self {
+        Self {
+            protocol,
+            pending: Some(pending),
+        }
+    }
+
+    fn take(&mut self) -> PendingPairing {
+        self.pending
+            .take()
+            .expect("pairing reservation should exist")
+    }
+}
+
+impl Drop for PairingReservationGuard {
+    fn drop(&mut self) {
+        let Some(pending) = self.pending.take() else {
+            return;
+        };
+        let protocol = self.protocol.clone();
+        tokio::spawn(async move {
+            protocol.lock().await.release_pair_request(&pending);
+        });
+    }
+}
+
+pub(crate) async fn handle_prepared_server_wire_message(
+    protocol: SharedDaemonProtocol,
+    connection: &mut ProtocolConnection,
+    prepared: PreparedProtocolWireMessage,
+) -> Vec<ProtocolWireMessage> {
+    let pair_request = match prepared.pair_request() {
+        Ok(request) => request,
+        Err(error) => return connection.finish_prepared_pairing(prepared, Err(error)),
+    };
+    let Some(pair_request) = pair_request else {
+        let mut protocol = protocol.lock().await;
+        return connection.handle_prepared_wire_message(&mut protocol, prepared);
+    };
+
+    let reserved = {
+        let mut protocol = protocol.lock().await;
+        let config = protocol.config().clone();
+        match protocol.reserve_pair_request(connection, pair_request) {
+            Ok(pending) => Ok((config, pending)),
+            Err(error) => Err(error),
+        }
+    };
+    let (config, pending) = match reserved {
+        Ok(reserved) => reserved,
+        Err(error) => return connection.finish_prepared_pairing(prepared, Err(error)),
+    };
+    let mut reservation = PairingReservationGuard::new(protocol.clone(), pending);
+    let registration = register_relay_device_from_config_async(
+        config,
+        reservation.pending.as_ref().unwrap().accepted().server_id,
+        reservation.pending.as_ref().unwrap().accepted().device_id,
+        reservation
+            .pending
+            .as_ref()
+            .unwrap()
+            .device_identity()
+            .public_key()
+            .clone(),
+    )
+    .await;
+    if let Err(error) = registration {
+        warn!(%error, "failed to register paired device with relay");
+        let pending = reservation.take();
+        protocol.lock().await.release_pair_request(&pending);
+        return connection.finish_prepared_pairing(prepared, Err(ProtocolError::PairingFailed));
+    }
+
+    let pending = reservation.take();
+    let result = {
+        let mut protocol = protocol.lock().await;
+        protocol.commit_pair_request(connection, pending)
+    };
+    connection.finish_prepared_pairing(prepared, result)
+}
+
 async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_addr: SocketAddr) {
     let (sender, mut receiver) = socket.split();
     let (write_wire_tx, write_wire_rx) =
@@ -2883,9 +2984,16 @@ async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_a
                             break;
                         };
 
-                        let responses = {
-                            let mut protocol = protocol.lock().await;
-                            connection.handle_wire_message(&mut protocol, wire_message)
+                        let responses = match connection.prepare_wire_message(wire_message) {
+                            Ok(prepared) => {
+                                handle_prepared_server_wire_message(
+                                    protocol.clone(),
+                                    &mut connection,
+                                    prepared,
+                                )
+                                .await
+                            }
+                            Err(error) => vec![connection.wire_error_response(error)],
                         };
                         queue_deferred_output_wakeups(&mut connection, &mut push_event_queue);
                         let response_count = responses.len();
@@ -4000,6 +4108,7 @@ mod tests {
     use serde::Deserialize;
     use std::fs;
     use std::io::{Read, Write};
+    use std::ops::{Deref, DerefMut};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use termd_proto::{
@@ -4024,6 +4133,7 @@ mod tests {
     use crate::net::{
         E2eeKeyPair, E2eePeerPublicKey, E2eeSession, E2eeSessionContext, E2eeSessionRole,
     };
+    use crate::runtime::SessionRuntime;
     use crate::state::{
         DaemonState, SessionStateRecord, StateStore, client_history::ClientHistoryStore,
     };
@@ -4428,7 +4538,92 @@ mod tests {
 
     static TEST_CONFIG_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    fn test_config(name: &str) -> DaemonConfig {
+    struct TestStateDir {
+        state_dir: PathBuf,
+        state_path: PathBuf,
+    }
+
+    impl Drop for TestStateDir {
+        fn drop(&mut self) {
+            match StateStore::load(&self.state_path) {
+                Ok(state) => {
+                    let backend = SupervisorPtyBackend::for_state_path(&self.state_path);
+                    let mut runtime = SessionRuntime::new(backend);
+                    for session in state
+                        .sessions
+                        .iter()
+                        .filter(|session| session.state == SessionState::Running)
+                    {
+                        let session_id = session.session_id.0.to_string();
+                        if let Err(error) = runtime
+                            .reconnect_session(session)
+                            .and_then(|()| runtime.close(&session_id))
+                        {
+                            eprintln!(
+                                "failed to clean up server test session {session_id} in {}: {error}",
+                                self.state_dir.display()
+                            );
+                        }
+                    }
+                }
+                Err(error) => eprintln!(
+                    "failed to load server test state {} during cleanup: {error}",
+                    self.state_path.display()
+                ),
+            }
+
+            if let Err(error) = fs::remove_dir_all(&self.state_dir) {
+                eprintln!(
+                    "failed to remove server test state directory {}: {error}",
+                    self.state_dir.display()
+                );
+            }
+        }
+    }
+
+    struct TestConfigFixture {
+        config: DaemonConfig,
+        state_dir: TestStateDir,
+    }
+
+    impl TestConfigFixture {
+        fn into_protocol(self) -> TestProtocolFixture {
+            TestProtocolFixture {
+                protocol: default_protocol(self.config),
+                _state_dir: self.state_dir,
+            }
+        }
+    }
+
+    impl Deref for TestConfigFixture {
+        type Target = DaemonConfig;
+
+        fn deref(&self) -> &Self::Target {
+            &self.config
+        }
+    }
+
+    impl DerefMut for TestConfigFixture {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.config
+        }
+    }
+
+    // Fields drop in declaration order: release the protocol before reconnecting for cleanup.
+    struct TestProtocolFixture {
+        protocol: SharedDaemonProtocol,
+        _state_dir: TestStateDir,
+    }
+
+    impl Deref for TestProtocolFixture {
+        type Target = SharedDaemonProtocol;
+
+        fn deref(&self) -> &Self::Target {
+            &self.protocol
+        }
+    }
+
+    fn test_config(name: &str) -> TestConfigFixture {
         let unique = TEST_CONFIG_COUNTER.fetch_add(1, Ordering::Relaxed);
         let state_dir = std::env::temp_dir().join(format!(
             "termd-server-test-{}-{}-{unique}-{name}",
@@ -4438,11 +4633,18 @@ mod tests {
         // 中文注释：server 单测仍使用独立目录，避免并发测试或遗留 supervisor socket
         // 影响同一组 daemon 状态。
         fs::create_dir_all(&state_dir).unwrap();
-        DaemonConfig::default_for_state_path(state_dir.join("daemon-state.json"))
+        let state_path = state_dir.join("daemon-state.json");
+        TestConfigFixture {
+            config: DaemonConfig::default_for_state_path(&state_path),
+            state_dir: TestStateDir {
+                state_dir,
+                state_path,
+            },
+        }
     }
 
-    fn test_protocol(name: &str) -> SharedDaemonProtocol {
-        default_protocol(test_config(name))
+    fn test_protocol(name: &str) -> TestProtocolFixture {
+        test_config(name).into_protocol()
     }
 
     #[test]
@@ -4511,9 +4713,38 @@ mod tests {
     }
 
     #[test]
+    fn startup_remains_available_with_quarantined_http_upload_record() {
+        let fixture = test_config("startup-http-upload-quarantine");
+        let state_path = fixture.state_dir.state_path.clone();
+        StateStore::record_http_upload(
+            &state_path,
+            &crate::state::HttpUploadRecoveryRecord {
+                upload_id: "startup-missing-upload".to_owned(),
+                target_path: fixture.state_dir.state_dir.join("missing-upload.part"),
+                size_bytes: 4,
+                dev: 1,
+                ino: 1,
+                updated_at_ms: current_unix_timestamp_millis(),
+            },
+        )
+        .unwrap();
+
+        let protocol = fixture.into_protocol();
+
+        let protocol = protocol
+            .protocol
+            .try_lock()
+            .expect("startup must return a usable protocol");
+        assert_eq!(
+            protocol.server_id(),
+            protocol.daemon_public_identity().server_id
+        );
+    }
+
+    #[test]
     fn router_exposes_healthz_and_ws_routes() {
         let protocol = test_protocol("router");
-        let _router = router(protocol, false);
+        let _router = router(protocol.clone(), false);
     }
 
     #[tokio::test]
@@ -4530,7 +4761,7 @@ mod tests {
             .expect("router should respond");
         assert_eq!(disabled_response.status(), StatusCode::NOT_FOUND);
 
-        let enabled_response = router(protocol, true)
+        let enabled_response = router(protocol.clone(), true)
             .oneshot(
                 Request::builder()
                     .uri("/")
@@ -4546,7 +4777,7 @@ mod tests {
     async fn web_fallback_does_not_handle_api_paths() {
         for path in ["/api", "/api/", "/api/unknown"] {
             let protocol = test_protocol("web-fallback-api");
-            let response = router(protocol, true)
+            let response = router(protocol.clone(), true)
                 .oneshot(
                     Request::builder()
                         .uri(path)
@@ -4561,9 +4792,208 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn web_fallback_forwards_conditional_and_compression_headers() {
+        use axum::http::header::{
+            ACCEPT_ENCODING, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, ETAG,
+            IF_NONE_MATCH, VARY,
+        };
+
+        let protocol = test_protocol("web-fallback-headers");
+        let app = router(protocol.clone(), true);
+
+        let initial = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .body(Body::empty())
+                    .expect("test request should build"),
+            )
+            .await
+            .expect("router should respond");
+        let etag = initial.headers().get(ETAG).cloned().expect("ETag");
+        assert_eq!(initial.status(), StatusCode::OK);
+        let initial_len = to_bytes(initial.into_body(), usize::MAX)
+            .await
+            .expect("initial body should be readable")
+            .len();
+        assert!(initial_len > 0);
+        let repeated_len = to_bytes(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/")
+                        .body(Body::empty())
+                        .expect("test request should build"),
+                )
+                .await
+                .expect("router should respond")
+                .into_body(),
+            usize::MAX,
+        )
+        .await
+        .expect("repeated body should be readable")
+        .len();
+
+        let not_modified = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header(IF_NONE_MATCH, etag.clone())
+                    .body(Body::empty())
+                    .expect("test request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(not_modified.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(not_modified.headers().get(ETAG), Some(&etag));
+        assert_eq!(
+            not_modified.headers().get(CACHE_CONTROL).unwrap(),
+            "no-cache"
+        );
+        assert_eq!(not_modified.headers().get(VARY).unwrap(), "accept-encoding");
+        assert!(not_modified.headers().contains_key(CONTENT_TYPE));
+        assert_eq!(
+            not_modified
+                .headers()
+                .get("x-content-type-options")
+                .unwrap(),
+            "nosniff"
+        );
+        let not_modified_len = to_bytes(not_modified.into_body(), usize::MAX)
+            .await
+            .expect("304 body should be readable")
+            .len();
+        assert_eq!(not_modified_len, 0);
+        println!(
+            "termd transfer identity: unconditional={} revalidated={} first={} second_304={}",
+            initial_len + repeated_len,
+            initial_len + not_modified_len,
+            initial_len,
+            not_modified_len
+        );
+
+        for encoding in ["gzip", "br"] {
+            let encoded = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/")
+                        .header(ACCEPT_ENCODING, encoding)
+                        .body(Body::empty())
+                        .expect("test request should build"),
+                )
+                .await
+                .expect("router should respond");
+            assert_eq!(encoded.headers().get(CONTENT_ENCODING).unwrap(), encoding);
+            let encoded_etag = encoded.headers().get(ETAG).cloned().expect("ETag");
+            let encoded_len = to_bytes(encoded.into_body(), usize::MAX)
+                .await
+                .expect("encoded body should be readable")
+                .len();
+            assert!(encoded_len > 0);
+            let repeated_encoded_len = to_bytes(
+                app.clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri("/")
+                            .header(ACCEPT_ENCODING, encoding)
+                            .body(Body::empty())
+                            .expect("test request should build"),
+                    )
+                    .await
+                    .expect("router should respond")
+                    .into_body(),
+                usize::MAX,
+            )
+            .await
+            .expect("repeated encoded body should be readable")
+            .len();
+
+            let encoded_not_modified = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/")
+                        .header(ACCEPT_ENCODING, encoding)
+                        .header(IF_NONE_MATCH, encoded_etag)
+                        .body(Body::empty())
+                        .expect("test request should build"),
+                )
+                .await
+                .expect("router should respond");
+            assert_eq!(encoded_not_modified.status(), StatusCode::NOT_MODIFIED);
+            let encoded_not_modified_len = to_bytes(encoded_not_modified.into_body(), usize::MAX)
+                .await
+                .expect("encoded 304 body should be readable")
+                .len();
+            assert_eq!(encoded_not_modified_len, 0);
+            println!(
+                "termd transfer {encoding}: unconditional={} revalidated={} first={} second_304={}",
+                encoded_len + repeated_encoded_len,
+                encoded_len + encoded_not_modified_len,
+                encoded_len,
+                encoded_not_modified_len
+            );
+
+            let head = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::HEAD)
+                        .uri("/")
+                        .header(ACCEPT_ENCODING, encoding)
+                        .body(Body::empty())
+                        .expect("test request should build"),
+                )
+                .await
+                .expect("router should respond");
+            assert_eq!(head.headers().get(CONTENT_ENCODING).unwrap(), encoding);
+            assert!(head.headers().contains_key(CONTENT_LENGTH));
+            assert!(head.headers().contains_key(ETAG));
+            assert_eq!(head.headers().get(VARY).unwrap(), "accept-encoding");
+            assert!(
+                to_bytes(head.into_body(), usize::MAX)
+                    .await
+                    .expect("HEAD body should be readable")
+                    .is_empty()
+            );
+        }
+
+        let api_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/control/session/list")
+                    .header(ACCEPT_ENCODING, "br")
+                    .body(Body::empty())
+                    .expect("test request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(api_response.status(), StatusCode::UNAUTHORIZED);
+        assert!(api_response.headers().get(CONTENT_ENCODING).is_none());
+
+        let ws_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/ws")
+                    .header(ACCEPT_ENCODING, "br")
+                    .body(Body::empty())
+                    .expect("test request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_ne!(ws_response.status(), StatusCode::OK);
+        assert!(ws_response.headers().get(CONTENT_ENCODING).is_none());
+    }
+
+    #[tokio::test]
     async fn http_file_upload_init_requires_e2ee_headers() {
         let protocol = test_protocol("http-file-upload-init-requires-e2ee");
-        let response = router(protocol, false)
+        let response = router(protocol.clone(), false)
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -4580,7 +5010,7 @@ mod tests {
     #[tokio::test]
     async fn http_control_routes_require_bearer_session_token() {
         let protocol = test_protocol("http-control-requires-bearer");
-        let response = router(protocol, false)
+        let response = router(protocol.clone(), false)
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -4602,7 +5032,7 @@ mod tests {
             "/api/control/session/not-a-uuid/files",
         ] {
             let protocol = test_protocol("http-control-reject-unknown-direct");
-            let response = router(protocol, false)
+            let response = router(protocol.clone(), false)
                 .oneshot(
                     Request::builder()
                         .method("POST")
@@ -4635,7 +5065,7 @@ mod tests {
             (server_id, device_id, token)
         };
 
-        let response = router(protocol, false)
+        let response = router(protocol.clone(), false)
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -4779,7 +5209,7 @@ mod tests {
     #[tokio::test]
     async fn http_file_routes_answer_cors_preflight() {
         let protocol = test_protocol("http-file-cors-preflight");
-        let response = router(protocol, false)
+        let response = router(protocol.clone(), false)
             .oneshot(
                 Request::builder()
                     .method(Method::OPTIONS)
@@ -4810,7 +5240,7 @@ mod tests {
     async fn http_tunnel_rejects_non_api_routes_before_router_dispatch() {
         let protocol = test_protocol("http-file-tunnel-allowlist");
         let response = handle_http_tunnel_stream_request(
-            protocol,
+            protocol.clone(),
             "GET".to_owned(),
             "/healthz".to_owned(),
             Vec::new(),
@@ -4830,7 +5260,7 @@ mod tests {
         ] {
             let protocol = test_protocol("http-control-tunnel-allowlist");
             let response = handle_http_tunnel_stream_request(
-                protocol,
+                protocol.clone(),
                 "POST".to_owned(),
                 path.to_owned(),
                 Vec::new(),
@@ -4851,7 +5281,7 @@ mod tests {
         ] {
             let protocol = test_protocol("http-control-tunnel-reject-unknown");
             let response = handle_http_tunnel_stream_request(
-                protocol,
+                protocol.clone(),
                 "POST".to_owned(),
                 path.to_owned(),
                 Vec::new(),
@@ -4912,7 +5342,7 @@ mod tests {
             })
             .unwrap(),
         );
-        let response = router(protocol, false)
+        let response = router(protocol.clone(), false)
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -4955,7 +5385,7 @@ mod tests {
         fs::write(&file_path, b"abc").unwrap();
         let mut config = test_config("http-file-download-exact-size");
         config.default_working_directory = Some(root.clone());
-        let protocol = default_protocol(config);
+        let protocol = config.into_protocol();
         let signing_key = SigningKey::generate(&mut OsRng);
         let device_public_key =
             PublicKey(test_ed25519_wire(signing_key.verifying_key().as_bytes()));
@@ -5000,7 +5430,7 @@ mod tests {
             })
             .unwrap(),
         );
-        let response = router(protocol, false)
+        let response = router(protocol.clone(), false)
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -5050,7 +5480,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let mut config = test_config("http-file-download-encrypted-error");
         config.default_working_directory = Some(root.clone());
-        let protocol = default_protocol(config);
+        let protocol = config.into_protocol();
         let signing_key = SigningKey::generate(&mut OsRng);
         let device_public_key =
             PublicKey(test_ed25519_wire(signing_key.verifying_key().as_bytes()));
@@ -5073,7 +5503,7 @@ mod tests {
         )
         .await;
 
-        let response = router(protocol, false)
+        let response = router(protocol.clone(), false)
             .oneshot(request)
             .await
             .expect("router should respond");
@@ -5108,7 +5538,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let mut config = test_config("http-file-upload-split");
         config.default_working_directory = Some(root.clone());
-        let protocol = default_protocol(config);
+        let protocol = config.into_protocol();
         let signing_key = SigningKey::generate(&mut OsRng);
         let public_key = PublicKey(test_ed25519_wire(signing_key.verifying_key().as_bytes()));
         let (device_id, session_id) =
@@ -5199,7 +5629,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let mut config = test_config("http-file-upload-stale-error");
         config.default_working_directory = Some(root.clone());
-        let protocol = default_protocol(config);
+        let protocol = config.into_protocol();
         let signing_key = SigningKey::generate(&mut OsRng);
         let public_key = PublicKey(test_ed25519_wire(signing_key.verifying_key().as_bytes()));
         let (device_id, session_id) =
@@ -5296,7 +5726,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let mut config = test_config("http-file-upload-cancel-guard");
         config.default_working_directory = Some(root.clone());
-        let protocol = default_protocol(config);
+        let protocol = config.into_protocol();
         let creator_signing_key = SigningKey::generate(&mut OsRng);
         let creator_public_key = PublicKey(test_ed25519_wire(
             creator_signing_key.verifying_key().as_bytes(),
@@ -5387,7 +5817,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let mut config = test_config("http-file-upload-drop-commit");
         config.default_working_directory = Some(root.clone());
-        let protocol = default_protocol(config);
+        let protocol = config.into_protocol();
         let creator_signing_key = SigningKey::generate(&mut OsRng);
         let creator_public_key = PublicKey(test_ed25519_wire(
             creator_signing_key.verifying_key().as_bytes(),
@@ -5479,7 +5909,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let mut config = test_config("http-file-upload-connection-drop");
         config.default_working_directory = Some(root.clone());
-        let protocol = default_protocol(config);
+        let protocol = config.into_protocol();
         let creator_signing_key = SigningKey::generate(&mut OsRng);
         let creator_public_key = PublicKey(test_ed25519_wire(
             creator_signing_key.verifying_key().as_bytes(),
@@ -5522,7 +5952,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let mut config = test_config("http-control-connection-close-now");
         config.default_working_directory = Some(root.clone());
-        let protocol = default_protocol(config);
+        let protocol = config.into_protocol();
         let creator_signing_key = SigningKey::generate(&mut OsRng);
         let creator_public_key = PublicKey(test_ed25519_wire(
             creator_signing_key.verifying_key().as_bytes(),
@@ -5561,7 +5991,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let mut config = test_config("http-file-detach");
         config.default_working_directory = Some(root);
-        let protocol = default_protocol(config);
+        let protocol = config.into_protocol();
         let creator_signing_key = SigningKey::generate(&mut OsRng);
         let creator_public_key = PublicKey(test_ed25519_wire(
             creator_signing_key.verifying_key().as_bytes(),
@@ -5673,7 +6103,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let mut config = test_config("http-file-history");
         config.default_working_directory = Some(root);
-        let protocol = default_protocol(config);
+        let protocol = config.into_protocol();
         let signing_key = SigningKey::generate(&mut OsRng);
         let public_key = PublicKey(test_ed25519_wire(signing_key.verifying_key().as_bytes()));
 
@@ -5933,7 +6363,7 @@ mod tests {
         assert!(!response.body.contains("server_private_key"));
         assert!(!response.body.contains("terminal sentinel"));
 
-        let pair_accept = pair_device_with_http_token(protocol, payload.token).await;
+        let pair_accept = pair_device_with_http_token(protocol.clone(), payload.token).await;
         assert_eq!(pair_accept.server_id, server_id);
     }
 
@@ -5971,7 +6401,7 @@ mod tests {
         let mut config = test_config("local-pairing-token-relay-url");
         config.relay_endpoints = vec!["wss://relay.example/ws".to_owned()];
         config.default_pairing_ws_url = "wss://relay.example/ws".to_owned();
-        let protocol = default_protocol(config);
+        let protocol = config.into_protocol();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server_protocol = protocol.clone();
@@ -5993,7 +6423,7 @@ mod tests {
         let mut config = test_config("local-pairing-token-relay-ticket-failure");
         config.relay_endpoints = vec!["ws://127.0.0.1:1/ws".to_owned()];
         config.relay_daemon_token = Some(SecretString::new("test-relay-daemon-token"));
-        let protocol = default_protocol(config);
+        let protocol = config.into_protocol();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server_protocol = protocol.clone();
@@ -6009,6 +6439,151 @@ mod tests {
         assert!(response.body.contains("relay_pair_ticket_unavailable"));
         // 中文注释：relay 注册失败时不能把本地可消费 token 返回给调用方。
         assert!(!response.body.contains("termd-pair-"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn slow_relay_device_registration_does_not_hold_protocol_mutex() {
+        let relay_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay_listener.local_addr().unwrap();
+        let request_seen = Arc::new(tokio::sync::Notify::new());
+        let release_response = Arc::new(tokio::sync::Notify::new());
+        let relay_task = {
+            let request_seen = request_seen.clone();
+            let release_response = release_response.clone();
+            tokio::spawn(async move {
+                let (mut socket, _) = relay_listener.accept().await.unwrap();
+                let mut request = vec![0_u8; 4096];
+                let read = socket.read(&mut request).await.unwrap();
+                assert!(read > 0);
+                request_seen.notify_one();
+                release_response.notified().await;
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await
+                    .unwrap();
+            })
+        };
+
+        let mut config = test_config("slow-relay-pairing-mutex");
+        config.relay_endpoints = vec![format!("ws://{relay_addr}/ws")];
+        config.relay_daemon_token = Some(SecretString::new("slow-relay-token"));
+        let protocol = config.into_protocol();
+        let device_id = DeviceId::new();
+        let device_keypair = E2eeKeyPair::generate();
+        let (mut connection, token, mut device_session) = {
+            let mut protocol_guard = protocol.lock().await;
+            let token = protocol_guard
+                .issue_pairing_token(current_unix_timestamp_millis())
+                .unwrap()
+                .token()
+                .clone();
+            let (mut connection, _) = protocol_guard.start_connection();
+            let device_session = open_test_e2ee(
+                &mut protocol_guard,
+                &mut connection,
+                device_id,
+                &device_keypair,
+            );
+            (connection, token, device_session)
+        };
+        let pair_request = envelope_value(
+            MessageType::PairRequest,
+            PairRequestPayload {
+                device_id,
+                device_public_key: test_device_public_key(23),
+                token,
+                nonce: termd_proto::Nonce("slow-relay-pairing".to_owned()),
+                timestamp_ms: current_unix_timestamp_millis(),
+            },
+        )
+        .unwrap();
+        let encrypted = device_session.encrypt_json_payload(&pair_request).unwrap();
+        let prepared = connection
+            .prepare_wire_message(ProtocolWireMessage::Json(
+                envelope_value(MessageType::EncryptedFrame, encrypted).unwrap(),
+            ))
+            .unwrap();
+        let pairing_task = {
+            let protocol = protocol.clone();
+            tokio::spawn(async move {
+                handle_prepared_server_wire_message(protocol, &mut connection, prepared).await
+            })
+        };
+
+        timeout(Duration::from_secs(2), request_seen.notified())
+            .await
+            .expect("relay registration request should arrive");
+        let protocol_guard = timeout(Duration::from_millis(100), protocol.lock())
+            .await
+            .expect("slow relay registration must not hold protocol mutex");
+        assert_eq!(
+            protocol_guard.server_id(),
+            protocol_guard.daemon_public_identity().server_id
+        );
+        drop(protocol_guard);
+
+        release_response.notify_one();
+        let responses = timeout(Duration::from_secs(2), pairing_task)
+            .await
+            .unwrap()
+            .unwrap();
+        let frame = match responses.into_iter().next().unwrap() {
+            ProtocolWireMessage::Json(envelope) => encrypted_frame_from_envelope(envelope).unwrap(),
+            ProtocolWireMessage::Binary(_) => panic!("legacy pairing response should be JSON"),
+        };
+        let accepted: JsonEnvelope = device_session.decrypt_json_payload(&frame).unwrap();
+        assert_eq!(accepted.kind, MessageType::PairAccept);
+        relay_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_pairing_releases_token_reservation() {
+        let protocol = test_protocol("cancelled-pairing-reservation");
+        let device_id = DeviceId::new();
+        let device_keypair = E2eeKeyPair::generate();
+        let (connection, request, pending) = {
+            let mut protocol_guard = protocol.lock().await;
+            let token = protocol_guard
+                .issue_pairing_token(current_unix_timestamp_millis())
+                .unwrap()
+                .token()
+                .clone();
+            let (mut connection, _) = protocol_guard.start_connection();
+            let _device_session = open_test_e2ee(
+                &mut protocol_guard,
+                &mut connection,
+                device_id,
+                &device_keypair,
+            );
+            let request = PairRequestPayload {
+                device_id,
+                device_public_key: test_device_public_key(24),
+                token,
+                nonce: termd_proto::Nonce("cancelled-pairing".to_owned()),
+                timestamp_ms: current_unix_timestamp_millis(),
+            };
+            let pending = protocol_guard
+                .reserve_pair_request(&connection, request.clone())
+                .unwrap();
+            (connection, request, pending)
+        };
+
+        drop(PairingReservationGuard::new(protocol.clone(), pending));
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let retry = {
+                    let mut protocol_guard = protocol.lock().await;
+                    protocol_guard.reserve_pair_request(&connection, request.clone())
+                };
+                if let Ok(pending) = retry {
+                    protocol.lock().await.release_pair_request(&pending);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancellation must release reservation promptly");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -6323,7 +6898,7 @@ mod tests {
 
         let mut config = test_config("websocket-cwd-push");
         config.default_working_directory = Some(workspace_root.clone());
-        let protocol = default_protocol(config);
+        let protocol = config.into_protocol();
         let server_id = protocol.lock().await.server_id();
         let pairing_token = {
             protocol
@@ -6381,7 +6956,7 @@ mod tests {
                         "sh".to_owned(),
                         "-lc".to_owned(),
                         format!(
-                            "sleep 0.15; cd {}; printf cwd-moved; sleep 2",
+                            "read watcher_ready; cd {}; printf cwd-moved; sleep 2",
                             file_root.to_string_lossy()
                         ),
                     ],
@@ -6416,6 +6991,22 @@ mod tests {
         .await;
         let initial_files = read_encrypted_ws(&mut socket, &mut device_session).await;
         assert_eq!(initial_files.kind, MessageType::SessionFilesResult);
+
+        // SessionFiles 的响应返回后，同一 connection loop 会先完成 cwd watcher 注册，
+        // 再处理这条输入。shell 因此只会在 watcher 已可观测后执行 cd。
+        send_encrypted_ws(
+            &mut socket,
+            &mut device_session,
+            envelope_value(
+                MessageType::SessionData,
+                SessionDataPayload {
+                    session_id: created_payload.session_id,
+                    data_base64: base64::engine::general_purpose::STANDARD.encode(b"ready\n"),
+                },
+            )
+            .unwrap(),
+        )
+        .await;
 
         let push_deadline = Instant::now() + Duration::from_secs(8);
         loop {
@@ -6651,8 +7242,8 @@ mod tests {
         nonce: &str,
     ) -> E2eeKeyExchangePayload {
         let protocol = protocol.lock().await;
-        // 中文注释：当前直连 WebSocket 也是 client-first E2EE 握手；daemon 初始帧只发送 hello。
-        // 测试仍需要 daemon 公钥来构造客户端加密会话，因此从 protocol fixture 读取。
+        // 中文注释：这是旧 WebSocket `encrypted_frame` 兼容测试的 E2EE fixture；当前 Web
+        // WebSocket 只做 route/hello handshake，并直接发送明文 packet。
         E2eeKeyExchangePayload::new(
             protocol.server_id(),
             DeviceId::new(),

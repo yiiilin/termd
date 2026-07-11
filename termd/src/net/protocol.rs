@@ -1,7 +1,7 @@
 //! termd daemon 的 WebSocket 协议状态机核心。
 //!
-//! 本模块不依赖真实 socket，便于单元测试直接驱动 hello、E2EE、pair/auth 和 session
-//! 操作。Axum 只负责把网络帧转成这里的统一 envelope。
+//! 本模块不依赖真实 socket，便于单元测试直接驱动 hello、当前明文 packet、legacy E2EE、
+//! pair/auth 和 session 操作。Axum 只负责把网络帧转成这里的统一 envelope。
 
 mod recovery;
 
@@ -10,12 +10,20 @@ use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
+use std::os::fd::AsRawFd;
+#[cfg(target_os = "linux")]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 #[cfg(windows)]
 use std::os::windows::fs::{FileExt as WindowsFileExt, MetadataExt as WindowsMetadataExt};
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
-use std::time::UNIX_EPOCH;
+use std::process::{Child, Command, ExitStatus, Stdio};
+#[cfg(unix)]
+use std::process::{ChildStderr, ChildStdout};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use base64::{
     Engine as _,
@@ -77,18 +85,23 @@ use uuid::Uuid;
 use crate::auth::{
     AuthChallengeManager, ChallengeResponseService, DaemonIdentity, DaemonPublicIdentity,
     DeviceIdentity, E2eeAuthTranscript, HttpE2eeSigningInput, InMemoryTrustedDeviceStore,
-    PairingService, PairingTokenManager, ReplayProtector, SessionScopeManager, SessionTokenManager,
-    SignatureVerifier, TrustedDevice, TrustedDeviceStore, current_unix_timestamp_millis,
+    PairingService, PairingTokenManager, PendingPairing, ReplayProtector, SessionScopeManager,
+    SessionTokenManager, SignatureVerifier, TrustedDevice, TrustedDeviceStore,
+    current_unix_timestamp_millis,
 };
 use crate::config::DaemonConfig;
+use crate::pty::supervisor::{
+    MAX_SUPERVISOR_FRAME_BYTES, validate_length_prefixed_supervisor_frame,
+};
 use crate::pty::{
-    CommandSpec, PtyAttachmentBootstrap, PtyBackend, PtyRestoreInfo, PtySupervisorStatus,
+    CommandSpec, PtyAttachmentBootstrap, PtyBackend, PtyRestoreInfo, PtySize, PtySupervisorStatus,
 };
 use crate::runtime::{RuntimeError, SessionRuntime};
 use crate::session::{
     AttachRole as RuntimeAttachRole, SessionState as RuntimeSessionState,
     TerminalSize as RuntimeTerminalSize,
 };
+use crate::session_ownership::SessionOwnership;
 use crate::state::{
     DaemonIdentitySnapshot, DaemonState, HttpUploadRecoveryRecord, SessionStateRecord, StateError,
     StateStore, TrustedDeviceState,
@@ -138,15 +151,76 @@ const SESSION_FILE_WRITE_MAX_BYTES: usize = SESSION_FILE_RPC_MAX_BYTES;
 const SESSION_FILE_WRITE_MAX_BASE64_BYTES: usize = SESSION_FILE_WRITE_MAX_BYTES.div_ceil(3) * 4;
 const SESSION_FILE_DOWNLOAD_CHUNK_MAX_BYTES: u32 = 256 * 1024;
 const SESSION_FILE_TRANSFER_CHUNK_MAX_BYTES: u32 = 256 * 1024;
+const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+const GIT_COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const GIT_COMMAND_DRAIN_MAX_READS: usize = 16;
+const GIT_COMMAND_STDOUT_MAX_BYTES: usize = 1024 * 1024;
+const GIT_COMMAND_STDERR_MAX_BYTES: usize = 64 * 1024;
+const GIT_OUTPUT_TRUNCATED_MESSAGE: &str = "git output exceeded internal limit";
+const GIT_COMMAND_FAILED_MESSAGE: &str = "git command failed";
+const GIT_GRAPH_TRUNCATED_MESSAGE: &str = "* [termd: git graph output truncated]";
+
+#[cfg(test)]
+fn http_upload_test_crash_checkpoint(point: &str) {
+    let Some(expected) = std::env::var_os("TERMD_TEST_HTTP_UPLOAD_CHECKPOINT") else {
+        return;
+    };
+    if expected != point {
+        return;
+    }
+    let checkpoint_dir = PathBuf::from(
+        std::env::var_os("TERMD_TEST_HTTP_UPLOAD_CHECKPOINT_DIR")
+            .expect("HTTP upload crash checkpoint directory must be configured"),
+    );
+    fs::create_dir_all(&checkpoint_dir).unwrap();
+    let marker = checkpoint_dir.join(format!("{point}.reached"));
+    let release = checkpoint_dir.join(format!("{point}.continue"));
+    fs::write(&marker, b"reached").unwrap();
+    while !release.exists() {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(not(test))]
+fn http_upload_test_crash_checkpoint(_point: &str) {}
 
 /// 协议层统一使用的 JSON envelope。
 pub type JsonEnvelope = Envelope<Value>;
 
-/// WebSocket 上的真实传输帧。握手继续是 JSON；E2EE 后的 packet 可切到 binary。
+/// WebSocket 上的真实传输帧。当前 handshake/packet 使用明文 JSON 或 binary；
+/// legacy `encrypted_frame` 兼容路径仍使用 JSON envelope。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProtocolWireMessage {
     Json(JsonEnvelope),
     Binary(Vec<u8>),
+}
+
+pub(crate) enum PreparedProtocolWireMessage {
+    Original(ProtocolWireMessage),
+    LegacyEnvelope(JsonEnvelope),
+    Packet(ProtocolPacket<Value>),
+}
+
+impl PreparedProtocolWireMessage {
+    pub(crate) fn pair_request(&self) -> Result<Option<PairRequestPayload>, ProtocolError> {
+        match self {
+            Self::Original(ProtocolWireMessage::Json(envelope))
+                if envelope.kind == MessageType::PairRequest =>
+            {
+                decode_payload(envelope.payload.clone()).map(Some)
+            }
+            Self::LegacyEnvelope(envelope) if envelope.kind == MessageType::PairRequest => {
+                decode_payload(envelope.payload.clone()).map(Some)
+            }
+            Self::Packet(packet)
+                if packet.kind == PacketKind::Request
+                    && packet.method.as_deref() == Some(METHOD_PAIR_REQUEST) =>
+            {
+                decode_payload(packet.payload.clone()).map(Some)
+            }
+            _ => Ok(None),
+        }
+    }
 }
 
 /// 单个已配对客户端在当前 daemon 上的可见状态。
@@ -170,7 +244,7 @@ struct DaemonClientRecord {
 
 /// 0.2.0 packet terminal stream 的连接内状态。
 ///
-/// stream id 只在单条 E2EE 连接内有效；它把 terminal attach 的 request/response、后续
+/// stream id 只在单条 WebSocket 连接内有效；它把 terminal attach 的 request/response、后续
 /// input/output chunk 和 cancel 都绑定到同一个 session。旧协议里的 flow/credit 字段仍会被
 /// 解码和统计，但不再作为 terminal 输出闸门；连接级背压交给 WebSocket/TCP 和外层 bounded queue。
 #[derive(Debug, Clone)]
@@ -263,6 +337,7 @@ enum SessionFileHttpUploadCleanupIdentityMatch {
 struct SessionFileHttpUploadState {
     session_id: SessionId,
     target: PathBuf,
+    temp_path: PathBuf,
     file: fs::File,
     upload_id: String,
     size_bytes: u64,
@@ -271,6 +346,7 @@ struct SessionFileHttpUploadState {
     written_ranges: BTreeMap<u64, u64>,
     inflight_ranges: BTreeMap<u64, u64>,
     modified_at_ms: Option<UnixTimestampMillis>,
+    published: bool,
     updated_at_ms: u64,
 }
 
@@ -283,6 +359,7 @@ struct ActiveSessionFileHttpUploadTarget {
 #[derive(Debug)]
 pub(crate) struct SessionFileHttpUploadWritePlan {
     pub(crate) target: PathBuf,
+    storage_path: PathBuf,
     file: fs::File,
     pub(crate) size_bytes: u64,
     pub(crate) offset_bytes: u64,
@@ -595,8 +672,8 @@ fn session_file_http_upload_cleanup_identity_match(
 
 /// HTTP 文件下载的一次性授权。
 ///
-/// token 只存在 daemon 内存中，必须先通过 E2EE WebSocket 申请；HTTP 层只消费 token
-/// 并流式读取文件，不接收任意路径参数，避免把文件权限逻辑散落到 Axum handler。
+/// token 只存在 daemon 内存中，必须先通过当前已认证的明文 WebSocket packet 申请；HTTP 层
+/// 只消费 token 并流式读取文件，不接收任意路径参数。legacy `encrypted_frame` 客户端仍兼容。
 #[derive(Debug, Clone)]
 pub struct SessionFileDownloadGrant {
     pub path: PathBuf,
@@ -862,6 +939,7 @@ pub struct DaemonProtocol<B: PtyBackend, V> {
     session_scope_manager: SessionScopeManager,
     trusted_store: InMemoryTrustedDeviceStore,
     runtime: SessionRuntime<B>,
+    ownership: SessionOwnership<B>,
     verifier: V,
     session_index: HashMap<SessionId, String>,
     session_names: HashMap<SessionId, String>,
@@ -877,6 +955,12 @@ pub struct DaemonProtocol<B: PtyBackend, V> {
     daemon_clients_signal: watch::Sender<u64>,
     session_cwd_signals: HashMap<SessionId, watch::Sender<u64>>,
     session_resize_signals: HashMap<SessionId, watch::Sender<TerminalSize>>,
+}
+
+impl<B: PtyBackend, V> Drop for DaemonProtocol<B, V> {
+    fn drop(&mut self) {
+        self.ownership.shutdown();
+    }
 }
 
 /// session 作用域 handler 共用的已认证、已 attach 上下文。
@@ -905,15 +989,19 @@ where
     V: SignatureVerifier,
 {
     /// 创建可测试的协议服务，调用方显式注入 PTY backend 和签名 verifier。
-    pub fn new(config: DaemonConfig, backend: B, verifier: V) -> Result<Self, StateError> {
+    pub fn new(config: DaemonConfig, backend: B, verifier: V) -> Result<Self, StateError>
+    where
+        B: 'static,
+    {
         let daemon_identity = DaemonIdentity::generate();
-        Self::from_identity_and_store(
+        let protocol = Self::from_identity_and_store(
             config,
             backend,
             verifier,
             daemon_identity,
             InMemoryTrustedDeviceStore::new(),
-        )
+        )?;
+        Ok(protocol)
     }
 
     /// 基于本地状态文件快照创建协议服务。
@@ -925,7 +1013,10 @@ where
         backend: B,
         verifier: V,
         state: DaemonState,
-    ) -> Result<Self, StateError> {
+    ) -> Result<Self, StateError>
+    where
+        B: 'static,
+    {
         let persisted_sessions = state.sessions.clone();
         let daemon_identity = match state.daemon_identity {
             Some(identity) => match identity.private_key {
@@ -954,6 +1045,12 @@ where
             daemon_identity,
             trusted_store,
         )?;
+        let persisted_sessions = protocol
+            .ownership
+            .recover(&mut protocol.runtime, persisted_sessions)
+            .map_err(|error| StateError::InvalidOwnershipState {
+                source: error.to_string(),
+            })?;
         protocol.restore_runtime_sessions(persisted_sessions);
         Ok(protocol)
     }
@@ -964,7 +1061,10 @@ where
         verifier: V,
         daemon_identity: DaemonIdentity,
         trusted_store: InMemoryTrustedDeviceStore,
-    ) -> Result<Self, StateError> {
+    ) -> Result<Self, StateError>
+    where
+        B: 'static,
+    {
         let client_history = ClientHistoryStore::open(&config.state_path)?;
         let auth_service = ChallengeResponseService::new(
             daemon_identity.public_identity(),
@@ -972,6 +1072,11 @@ where
             ReplayProtector::default(),
         );
         let (daemon_clients_signal, _) = watch::channel(0);
+        let runtime = SessionRuntime::new(backend);
+        let ownership = SessionOwnership::open(&config.state_path, runtime.backend_handle())
+            .map_err(|error| StateError::InvalidOwnershipState {
+                source: error.to_string(),
+            })?;
         Ok(Self {
             config,
             daemon_identity,
@@ -981,7 +1086,8 @@ where
             session_token_manager: SessionTokenManager::new(),
             session_scope_manager: SessionScopeManager::new(),
             trusted_store,
-            runtime: SessionRuntime::new(backend),
+            runtime,
+            ownership,
             verifier,
             session_index: HashMap::new(),
             session_names: HashMap::new(),
@@ -1071,13 +1177,6 @@ where
     /// 将当前最小持久状态保存到配置指定的位置。
     pub fn persist_state(&self) -> Result<(), StateError> {
         StateStore::save(&self.config.state_path, &self.snapshot_state())
-    }
-
-    /// 清理单个已确认关闭的 session 记录。只在 PTY terminate 成功后使用。
-    fn prune_closed_session(&mut self, session_id: SessionId) -> Result<(), StateError> {
-        self.client_history.prune_closed_session(session_id)?;
-        StateStore::prune_closed_session(&self.config.state_path, session_id)?;
-        Ok(())
     }
 
     /// 清理不可恢复的 closed session；仍有 live supervisor 的 session id 不允许删除。
@@ -1471,21 +1570,53 @@ where
         if Some(payload.device_id) != connection.device_id {
             return Err(ProtocolError::InvalidEnvelope);
         }
-        let now_ms = current_unix_timestamp_millis();
-        let pending = self
-            .pairing_service
-            .consume_pair_request(payload, now_ms, &self.daemon_identity)
-            .map_err(|_| ProtocolError::PairingFailed)?;
-        super::server::register_relay_device_from_config(
+        let pending = self.reserve_pair_request(connection, payload)?;
+        if let Err(error) = super::server::register_relay_device_from_config(
             &self.config,
             pending.accepted().server_id,
             pending.accepted().device_id,
             pending.device_identity().public_key().clone(),
-        )
-        .map_err(|error| {
+        ) {
             tracing::warn!(%error, "failed to register paired device with relay");
-            ProtocolError::PairingFailed
-        })?;
+            self.pairing_service.release_pairing_reservation(&pending);
+            return Err(ProtocolError::PairingFailed);
+        }
+        self.commit_pair_request(connection, pending)
+    }
+
+    pub(crate) fn reserve_pair_request(
+        &mut self,
+        connection: &ProtocolConnection,
+        payload: PairRequestPayload,
+    ) -> Result<PendingPairing, ProtocolError> {
+        if connection.state != ProtocolConnectionState::Auth {
+            return Err(ProtocolError::InvalidState);
+        }
+        if Some(payload.device_id) != connection.device_id {
+            return Err(ProtocolError::InvalidEnvelope);
+        }
+        self.pairing_service
+            .reserve_pair_request(
+                payload,
+                current_unix_timestamp_millis(),
+                &self.daemon_identity,
+            )
+            .map_err(|_| ProtocolError::PairingFailed)
+    }
+
+    pub(crate) fn release_pair_request(&mut self, pending: &PendingPairing) {
+        self.pairing_service.release_pairing_reservation(pending);
+    }
+
+    pub(crate) fn commit_pair_request(
+        &mut self,
+        connection: &mut ProtocolConnection,
+        pending: PendingPairing,
+    ) -> Result<Vec<JsonEnvelope>, ProtocolError> {
+        let now_ms = current_unix_timestamp_millis();
+        self.pairing_service
+            .commit_pairing_reservation(&pending, now_ms)
+            .map_err(|_| ProtocolError::PairingFailed)?;
         PairingService::trust_pending_pairing(&pending, now_ms, &mut self.trusted_store);
         let accepted = pending.into_accepted();
 
@@ -1617,104 +1748,95 @@ where
         let session_root = session_root_from_command(&command)?;
         let runtime_size = proto_size_to_runtime(payload.size);
         let wire_session_id = SessionId::new();
-        self.runtime
-            .create_session_with_id(&wire_session_id.0.to_string(), command, runtime_size)
-            .map_err(map_runtime_error)?;
         let internal_session_id = wire_session_id.0.to_string();
-        let create_result = (|| -> Result<Vec<JsonEnvelope>, ProtocolError> {
-            let session_name = self.default_created_session_name(wire_session_id);
-
-            self.session_index
-                .insert(wire_session_id, internal_session_id.clone());
-            self.session_names
-                .insert(wire_session_id, session_name.clone());
-            self.session_roots
-                .insert(wire_session_id, session_root.clone());
-            #[cfg(test)]
-            if !connection.packet_mode {
-                self.session_output_history_mut(wire_session_id, payload.size);
+        let pty_size = PtySize::with_pixels(
+            runtime_size.rows,
+            runtime_size.cols,
+            runtime_size.pixel_width,
+            runtime_size.pixel_height,
+        );
+        let session_name = self.default_created_session_name(wire_session_id);
+        let now_ms = current_unix_timestamp_millis();
+        let scope_grant = envelope_value(
+            MessageType::SessionScopeGrant,
+            self.issue_session_scope_grant(device_id, wire_session_id)?,
+        )?;
+        let attachment_id = connection.allocate_watched_attachment_id(wire_session_id);
+        let response_name = session_name.clone();
+        let client_history = &mut self.client_history;
+        let prepared = self.ownership.create(
+            &mut self.runtime,
+            &internal_session_id,
+            command,
+            pty_size,
+            |runtime| {
+                let role = runtime.attach(&internal_session_id, device_key(device_id))?;
+                runtime.start_watched_attachment(
+                    &internal_session_id,
+                    &attachment_id,
+                    runtime_size,
+                    PtyAttachmentBootstrap::default(),
+                )?;
+                let response = envelope_value(
+                    MessageType::SessionCreated,
+                    SessionCreatedPayload {
+                        session_id: wire_session_id,
+                        name: Some(response_name),
+                        role: runtime_role_to_proto(role),
+                        state: SessionState::Running,
+                        size: payload.size,
+                        resize_owner: true,
+                    },
+                )
+                .map_err(|_| crate::session_ownership::OwnershipError::Preparation)?;
+                client_history.record_session_created(
+                    wire_session_id,
+                    SessionState::Running,
+                    payload.size,
+                    Some(session_name.as_str()),
+                    &session_root,
+                    now_ms,
+                )?;
+                client_history.record_session_runtime_state(
+                    wire_session_id,
+                    SessionState::Running,
+                    payload.size,
+                    now_ms,
+                )?;
+                Ok((response, attachment_id))
+            },
+        );
+        let (response_envelope, attachment_id) = match prepared {
+            Ok(prepared) => prepared,
+            Err(_) => {
+                let _ = self
+                    .client_history
+                    .record_session_closed(wire_session_id, current_unix_timestamp_millis());
+                let _ = self.client_history.prune_closed_session(wire_session_id);
+                return Err(ProtocolError::StateFailed);
             }
-            let (cwd_signal, _) = watch::channel(0);
-            self.session_cwd_signals.insert(wire_session_id, cwd_signal);
-            let (resize_signal, _) = watch::channel(payload.size);
-            self.session_resize_signals
-                .insert(wire_session_id, resize_signal);
-            self.client_history.record_session_created(
-                wire_session_id,
-                self.runtime_state_proto(&internal_session_id)?,
-                self.runtime_size_proto(&internal_session_id)?,
-                Some(session_name.as_str()),
-                &session_root,
-                current_unix_timestamp_millis(),
-            )?;
+        };
 
-            let role = self
-                .runtime
-                .attach(&internal_session_id, device_key(device_id))
-                .map_err(map_runtime_error)?;
-            let wire_role = runtime_role_to_proto(role);
-            let response_size = self.runtime_size_proto(&internal_session_id)?;
-            let (output_offset, initial_output) = if connection.packet_mode {
-                if enqueue_terminal_snapshot {
-                    // 中文注释：opaque attach path 由 watched attachment 在 bootstrap 阶段
-                    // 直接向 supervisor 请求首屏 snapshot/tail，这里不再维护 daemon 侧
-                    // terminal drain cursor。
-                }
-                (0, Vec::new())
-            } else {
-                #[cfg(test)]
-                {
-                    self.drain_runtime_output_to_history_until_empty(
-                        wire_session_id,
-                        &internal_session_id,
-                        16 * 1024,
-                    )?;
-                    self.output_history_attach_snapshot(wire_session_id, response_size)
-                }
-                #[cfg(not(test))]
-                {
-                    (0, Vec::new())
-                }
-            };
-            let response_state = self.runtime_state_proto(&internal_session_id)?;
-            let response = SessionCreatedPayload {
-                session_id: wire_session_id,
-                name: Some(session_name),
-                role: wire_role,
-                state: response_state,
-                size: response_size,
-                resize_owner: true,
-            };
-            self.client_history.record_session_runtime_state(
-                wire_session_id,
-                response_state,
-                response_size,
-                current_unix_timestamp_millis(),
-            )?;
-
-            self.persist_state()?;
-            let response_envelope = envelope_value(MessageType::SessionCreated, response)?;
-            let pending_watched_attachment = self.start_watched_attachment(
-                connection,
-                wire_session_id,
-                &internal_session_id,
-                response_size,
-                PtyAttachmentBootstrap::default(),
-            )?;
-            let scope_grant = envelope_value(
-                MessageType::SessionScopeGrant,
-                self.issue_session_scope_grant(device_id, wire_session_id)?,
-            )?;
-            connection.attach(wire_session_id, output_offset, initial_output, true);
-            self.commit_watched_attachment_start(connection, pending_watched_attachment);
-            self.record_daemon_client_attach(wire_session_id, connection, device_id);
-            connection.state = ProtocolConnectionState::Attached;
-            Ok(vec![response_envelope, scope_grant])
-        })();
-        if create_result.is_err() {
-            self.rollback_created_session(wire_session_id, &internal_session_id);
+        self.session_index
+            .insert(wire_session_id, internal_session_id.clone());
+        self.session_names.insert(wire_session_id, session_name);
+        self.session_roots.insert(wire_session_id, session_root);
+        #[cfg(test)]
+        if !connection.packet_mode {
+            self.session_output_history_mut(wire_session_id, payload.size);
         }
-        create_result
+        let (cwd_signal, _) = watch::channel(0);
+        self.session_cwd_signals.insert(wire_session_id, cwd_signal);
+        let (resize_signal, _) = watch::channel(payload.size);
+        self.session_resize_signals
+            .insert(wire_session_id, resize_signal);
+        let _ = enqueue_terminal_snapshot;
+        connection.attach(wire_session_id, 0, Vec::new(), true);
+        connection.remember_watched_attachment(wire_session_id, attachment_id);
+        self.record_daemon_client_attach(wire_session_id, connection, device_id);
+        connection.state = ProtocolConnectionState::Attached;
+        crate::session_ownership::test_crash_checkpoint("before_create_response");
+        Ok(vec![response_envelope, scope_grant])
     }
 
     pub(crate) fn attach_session_permission(
@@ -1722,6 +1844,7 @@ where
         connection: &mut ProtocolConnection,
         payload: SessionAttachPayload,
     ) -> Result<Vec<JsonEnvelope>, ProtocolError> {
+        self.reconcile_persisted_closed_sessions()?;
         let device_id = connection.authenticated_device_id()?;
         let internal_session_id = self
             .session_index
@@ -1806,6 +1929,7 @@ where
         connection: &mut ProtocolConnection,
         payload: SessionAttachPayload,
     ) -> Result<Vec<JsonEnvelope>, ProtocolError> {
+        self.reconcile_persisted_closed_sessions()?;
         let device_id = connection.authenticated_device_id()?;
         let internal_session_id = self
             .session_index
@@ -1989,6 +2113,7 @@ where
         connection: &ProtocolConnection,
         payload: SessionDataPayload,
     ) -> Result<Vec<JsonEnvelope>, ProtocolError> {
+        self.reconcile_persisted_closed_sessions()?;
         let attached = self.require_existing_attached_session(connection, payload.session_id)?;
         let bytes = general_purpose::STANDARD
             .decode(payload.data_base64)
@@ -2146,43 +2271,19 @@ where
         connection: &ProtocolConnection,
         payload: SessionClosePayload,
     ) -> Result<Vec<JsonEnvelope>, ProtocolError> {
-        let attached = self.require_attached_session(connection, payload.session_id)?;
-
-        let close_result = self.runtime.close(&attached.internal_session_id);
-        if let Err(error) = &close_result {
-            tracing::warn!(
-                %error,
-                session_id = %payload.session_id.0,
-                "failed to terminate runtime session during explicit close"
-            );
-            let _ = self.runtime.discard(&attached.internal_session_id);
-        }
+        let _attached = self.require_attached_session(connection, payload.session_id)?;
+        self.ownership
+            .close(&mut self.runtime, &payload.session_id.0.to_string())
+            .map_err(|_| ProtocolError::StateFailed)?;
         self.close_visible_session_state(payload.session_id);
-        if let Err(error) = self
+        let now_ms = current_unix_timestamp_millis();
+        let _ = self
             .client_history
-            .record_session_closed(payload.session_id, current_unix_timestamp_millis())
-        {
-            tracing::warn!(%error, "failed to mark closed session in sqlite history");
-        }
-        if let Err(error) = self
+            .record_session_closed(payload.session_id, now_ms);
+        let _ = self
             .client_history
-            .remove_session_attachments(payload.session_id)
-        {
-            tracing::warn!(%error, "failed to remove closed session attachments from sqlite history");
-        }
-        self.persist_state()?;
-        if let Err(error) = StateStore::record_runtime_session_closed(
-            &self.config.state_path,
-            payload.session_id,
-            current_unix_timestamp_millis(),
-        ) {
-            tracing::warn!(%error, "failed to mark closed runtime session tombstone");
-        }
-        if close_result.is_ok()
-            && let Err(error) = self.prune_closed_session(payload.session_id)
-        {
-            tracing::warn!(%error, "failed to prune closed session records after close");
-        }
+            .remove_session_attachments(payload.session_id);
+        let _ = self.client_history.prune_closed_session(payload.session_id);
 
         Ok(vec![envelope_value(
             MessageType::SessionClosed,
@@ -2190,6 +2291,29 @@ where
                 session_id: payload.session_id,
             },
         )?])
+    }
+
+    fn reconcile_persisted_closed_sessions(&mut self) -> Result<(), ProtocolError> {
+        let active = StateStore::load(&self.config.state_path)?
+            .sessions
+            .into_iter()
+            .filter(|record| record.state == SessionState::Running)
+            .map(|record| record.session_id)
+            .collect::<HashSet<_>>();
+        let closed = self
+            .session_index
+            .keys()
+            .filter(|session_id| !active.contains(session_id))
+            .copied()
+            .collect::<Vec<_>>();
+        for session_id in closed {
+            self.close_visible_session_state(session_id);
+            let _ = self
+                .client_history
+                .record_session_closed(session_id, current_unix_timestamp_millis());
+            let _ = self.client_history.remove_session_attachments(session_id);
+        }
+        Ok(())
     }
 
     fn close_visible_session_state(&mut self, session_id: SessionId) {
@@ -2208,22 +2332,6 @@ where
                 sessions.remove(&session_id);
             }
         }
-    }
-
-    fn rollback_created_session(&mut self, session_id: SessionId, internal_session_id: &str) {
-        // 中文注释：create 失败后客户端不会持有这个 session，daemon 也不能留下
-        // hidden runtime。先尽力关闭 host；如果 terminate 失败，也要丢弃 runtime 句柄。
-        if self.runtime.close(internal_session_id).is_err() {
-            let _ = self.runtime.discard(internal_session_id);
-        }
-        self.close_visible_session_state(session_id);
-        let now_ms = current_unix_timestamp_millis();
-        let _ = self
-            .client_history
-            .record_session_closed(session_id, now_ms);
-        let _ = self.client_history.remove_session_attachments(session_id);
-        let _ =
-            StateStore::record_runtime_session_closed(&self.config.state_path, session_id, now_ms);
     }
 
     fn search_session_output(
@@ -2544,22 +2652,37 @@ where
             return Err(ProtocolError::InvalidEnvelope);
         }
         let upload_id = session_file_http_upload_id();
+        if fs::symlink_metadata(&target).is_ok() {
+            return Err(ProtocolError::InvalidEnvelope);
+        }
+        let temp_path = session_file_http_upload_temp_path(&target, &upload_id)?;
+        let mut recovery = HttpUploadRecoveryRecord {
+            upload_id: upload_id.clone(),
+            target_path: temp_path.clone(),
+            size_bytes: payload.size_bytes,
+            dev: 0,
+            ino: 0,
+            updated_at_ms: current_unix_timestamp_millis(),
+        };
+        StateStore::record_http_upload(&self.config.state_path, &recovery)
+            .map_err(|_| ProtocolError::StateFailed)?;
+        http_upload_test_crash_checkpoint("after_intent");
         let (file, file_identity) =
-            create_session_file_http_upload_target(&target, payload.size_bytes)?;
-        if let Err(error) = StateStore::record_http_upload(
-            &self.config.state_path,
-            &HttpUploadRecoveryRecord {
-                upload_id: upload_id.clone(),
-                target_path: target.clone(),
-                size_bytes: payload.size_bytes,
-                dev: file_identity.dev(),
-                ino: file_identity.ino(),
-                updated_at_ms: current_unix_timestamp_millis(),
-            },
-        ) {
+            match create_session_file_http_upload_target(&temp_path, payload.size_bytes) {
+                Ok(created) => created,
+                Err(error) => {
+                    let _ = StateStore::remove_http_upload(&self.config.state_path, &upload_id);
+                    return Err(error);
+                }
+            };
+        http_upload_test_crash_checkpoint("after_temp_create");
+        recovery.dev = file_identity.dev();
+        recovery.ino = file_identity.ino();
+        recovery.updated_at_ms = current_unix_timestamp_millis();
+        if let Err(error) = StateStore::record_http_upload(&self.config.state_path, &recovery) {
             tracing::debug!(%error, "failed to persist HTTP upload recovery record detail");
             tracing::warn!("failed to persist HTTP upload recovery record");
-            let cleanup = remove_session_file_http_upload_target(&target, file_identity);
+            let cleanup = remove_session_file_http_upload_target(&temp_path, file_identity);
             let keep_guard = match cleanup {
                 Ok(SessionFileHttpUploadCleanupOutcome::Removed) => false,
                 Ok(
@@ -2569,7 +2692,7 @@ where
                 Err(cleanup_error) => {
                     tracing::debug!(
                         %cleanup_error,
-                        target = %target.display(),
+                        target = %temp_path.display(),
                         "failed to cleanup HTTP upload target after recovery persist failure detail"
                     );
                     true
@@ -2584,6 +2707,7 @@ where
                     SessionFileHttpUploadState {
                         session_id: payload.session_id,
                         target: target.clone(),
+                        temp_path: temp_path.clone(),
                         file,
                         upload_id: upload_id.clone(),
                         size_bytes: payload.size_bytes,
@@ -2592,20 +2716,22 @@ where
                         written_ranges: BTreeMap::new(),
                         inflight_ranges: BTreeMap::new(),
                         modified_at_ms: None,
+                        published: false,
                         updated_at_ms: now_ms,
                     },
                 );
             }
             return Err(ProtocolError::StateFailed);
         }
+        http_upload_test_crash_checkpoint("after_temp_identity");
         let now_ms = current_unix_timestamp_millis().0;
-        // 中文注释：HTTP upload 的 init 就是文件创建事务：直接在最终目标路径创建新文件，
-        // 并把长度设置为声明大小。后续 POST 只按 offset seek 写目标文件，不再生成 .part/.chunk。
+        // 中文注释：最终路径在完整上传并 fsync 前始终不存在；所有分片只写同目录私有临时对象。
         self.session_file_http_uploads.insert(
             upload_id.clone(),
             SessionFileHttpUploadState {
                 session_id: payload.session_id,
                 target: target.clone(),
+                temp_path,
                 file,
                 upload_id: upload_id.clone(),
                 size_bytes: payload.size_bytes,
@@ -2614,6 +2740,7 @@ where
                 written_ranges: BTreeMap::new(),
                 inflight_ranges: BTreeMap::new(),
                 modified_at_ms: None,
+                published: false,
                 updated_at_ms: now_ms,
             },
         );
@@ -2657,7 +2784,13 @@ where
             if state.status == SessionFileHttpUploadStatus::Active {
                 // 中文注释：Active idle 超时代表浏览器在 init 后中断；这里删除本 upload_id
                 // 预分配的新目标文件，避免半截文件永久留在文件列表。
-                match remove_session_file_http_upload_target(&state.target, state.file_identity) {
+                if state.published {
+                    state.updated_at_ms = now_ms;
+                    self.session_file_http_uploads.insert(upload_id, state);
+                    continue;
+                }
+                match remove_session_file_http_upload_target(&state.temp_path, state.file_identity)
+                {
                     Ok(
                         SessionFileHttpUploadCleanupOutcome::AlreadyGone
                         | SessionFileHttpUploadCleanupOutcome::TargetReplaced,
@@ -2686,7 +2819,7 @@ where
                         tracing::debug!(
                             %error,
                             upload_id = %upload_id,
-                            target = %state.target.display(),
+                        target = %state.target.display(),
                             "failed to prune stale HTTP upload target detail"
                         );
                         tracing::warn!(
@@ -2737,6 +2870,11 @@ where
                 Ok(SessionFileHttpUploadBegin::Write(
                     SessionFileHttpUploadWritePlan {
                         target,
+                        storage_path: if state.published {
+                            state.target.clone()
+                        } else {
+                            state.temp_path.clone()
+                        },
                         file,
                         size_bytes: payload.size_bytes,
                         offset_bytes: payload.offset_bytes,
@@ -2794,14 +2932,26 @@ where
         };
 
         if let Some(progress) = complete_progress {
-            // 中文注释：recovery record 是“未完成 upload”的持久化事实；必须先删除它，
-            // 再把内存状态切到 Complete，避免崩溃恢复误删已经完整写入的目标文件。
-            StateStore::remove_http_upload(&self.config.state_path, &payload.upload_id)
-                .map_err(|_| ProtocolError::StateFailed)?;
             let Some(state) = self.session_file_http_uploads.get_mut(&payload.upload_id) else {
                 return Err(ProtocolError::InvalidEnvelope);
             };
+            state.file.sync_all().map_err(map_file_path_error)?;
+            http_upload_test_crash_checkpoint("after_file_sync");
+            if !state.published {
+                ensure_session_file_http_upload_target_identity(
+                    &state.temp_path,
+                    state.file_identity,
+                )?;
+                publish_session_file_http_upload_noreplace(&state.temp_path, &state.target)?;
+                state.published = true;
+                http_upload_test_crash_checkpoint("after_rename");
+            }
+            sync_session_file_http_upload_parent(&state.target)?;
+            http_upload_test_crash_checkpoint("after_dir_sync");
+            StateStore::remove_http_upload(&self.config.state_path, &payload.upload_id)
+                .map_err(|_| ProtocolError::StateFailed)?;
             state.status = SessionFileHttpUploadStatus::Complete;
+            http_upload_test_crash_checkpoint("after_finalize");
             return Ok(SessionFileHttpUploadCommit::Complete(progress));
         }
         Err(ProtocolError::InvalidState)
@@ -2856,8 +3006,7 @@ where
         payload: &SessionFileHttpUploadStreamPayload,
     ) -> Result<(), ProtocolError> {
         let attached = self.require_attached_session_root(connection, payload.session_id)?;
-        // 中文注释：HTTP upload 直接写目标文件；abort 只能删除本 upload_id 创建的
-        // 未完成目标。完成后的 tombstone 不能删除用户已经上传成功的文件。
+        // 中文注释：abort 只删除本 upload_id 的隐藏临时对象；一旦已经原子发布就不能回滚。
         if !session_file_http_upload_id_is_safe(&payload.upload_id) {
             return Err(ProtocolError::InvalidEnvelope);
         }
@@ -2874,8 +3023,12 @@ where
         if state.status == SessionFileHttpUploadStatus::Complete {
             return Ok(());
         }
+        if state.published {
+            return Err(ProtocolError::InvalidState);
+        }
         state.inflight_ranges.clear();
-        let cleanup_outcome = remove_session_file_http_upload_target(&target, state.file_identity)?;
+        let cleanup_outcome =
+            remove_session_file_http_upload_target(&state.temp_path, state.file_identity)?;
         if matches!(
             cleanup_outcome,
             SessionFileHttpUploadCleanupOutcome::AlreadyGone
@@ -3208,6 +3361,7 @@ where
         _payload: SessionListPayload,
     ) -> Result<Vec<JsonEnvelope>, ProtocolError> {
         connection.authenticated_device_id()?;
+        self.reconcile_persisted_closed_sessions()?;
         self.repair_visible_session_metadata();
 
         let sessions_by_id: HashMap<SessionId, _> = match self.client_history.list_sessions() {
@@ -3427,7 +3581,8 @@ where
         connection: &ProtocolConnection,
         _payload: DaemonStatusPayload,
     ) -> Result<Vec<JsonEnvelope>, ProtocolError> {
-        // daemon 状态暴露主机资源信息，只允许已认证设备在 E2EE 内层读取。
+        // daemon 状态暴露主机资源信息；当前明文 packet 和 legacy `encrypted_frame` 路径
+        // 都必须先由 daemon 完成设备认证，trusted relay admission 不能替代该权限校验。
         connection.authenticated_device_id()?;
 
         Ok(vec![envelope_value(
@@ -3862,7 +4017,7 @@ where
         refreshed_cwd: Option<String>,
     ) -> Result<SessionFilesResultPayload, ProtocolError> {
         // 中文注释：文件列表是 active upload 目标可见性的入口；进入列表前先清理
-        // 已超时的 upload 状态，避免断开的旧上传把预分配目标永久隐藏。
+        // 已超时的 upload 状态，避免断开的旧上传把同目录隐藏临时对象永久遗留。
         self.prune_session_file_http_uploads();
         let requested_path = if requested_path.is_some() {
             requested_path
@@ -3885,8 +4040,8 @@ where
         let mut entries = read_session_file_entries(&root, &target)?;
         let active_upload_targets = self.active_session_file_http_upload_targets(session_id);
         if !active_upload_targets.is_empty() {
-            // 中文注释：HTTP upload 的 init 会直接创建最终目标并 set_len；在 commit 前
-            // 这个文件还不是用户可用文件，文件列表必须隐藏它，避免前端提前判定上传完成。
+            // 中文注释：HTTP upload 的 init 会创建同目录隐藏临时对象；文件 API 既不能
+            // 枚举该对象，也不能在 commit 前暴露最终目标名。
             entries.retain(|entry| {
                 !path_matches_active_session_file_http_upload_target(
                     Path::new(&entry.path),
@@ -3918,9 +4073,13 @@ where
                 // 保护，不能只按所属 session 过滤，否则另一个 session 能读写同一未完成目标。
                 state.status == SessionFileHttpUploadStatus::Active
             })
-            .map(|state| ActiveSessionFileHttpUploadTarget {
-                target: state.target.clone(),
-                file_identity: state.file_identity,
+            .flat_map(|state| {
+                [state.target.clone(), state.temp_path.clone()].map(|target| {
+                    ActiveSessionFileHttpUploadTarget {
+                        target,
+                        file_identity: state.file_identity,
+                    }
+                })
             })
             .collect()
     }
@@ -3930,8 +4089,8 @@ where
         session_id: SessionId,
         target: &Path,
     ) -> Result<(), ProtocolError> {
-        // 中文注释：Git 面板也能操作文件。HTTP upload commit 前的预分配目标不能被
-        // git add/clean/restore/diff 读取或删除，否则 stream 侧会在后续分片提交时失去目标。
+        // 中文注释：Git 面板也能操作文件。HTTP upload commit 前的隐藏临时对象和
+        // 最终目标名不能被 git add/clean/restore/diff 绕过文件 API guard 操作。
         self.prune_session_file_http_uploads();
         let active_targets = self.active_session_file_http_upload_targets(session_id);
         if path_matches_active_session_file_http_upload_target(target, &active_targets) {
@@ -3967,7 +4126,7 @@ where
                 worktree,
                 file_path,
                 &active_targets,
-            )
+            )?
         {
             return Err(ProtocolError::InvalidState);
         }
@@ -4017,13 +4176,15 @@ where
             Ok(resolved) => resolved,
             Err(_) => resolve_session_file_target(&root, None)?,
         };
-        let repo_root = current_git_repository_root(&cwd).ok_or(ProtocolError::InvalidEnvelope)?;
-        let current_root = current_git_repository_root(&cwd).unwrap_or_else(|| repo_root.clone());
+        let repo_root = current_git_repository_root(&cwd)
+            .map_err(|_| ProtocolError::RuntimeFailed)?
+            .ok_or(ProtocolError::InvalidEnvelope)?;
         let requested = Path::new(requested_worktree)
             .canonicalize()
             .map_err(map_file_path_error)?;
 
-        read_git_worktrees(&repo_root, &current_root)
+        read_git_worktrees(&repo_root)
+            .map_err(|_| ProtocolError::RuntimeFailed)?
             .into_iter()
             .map(|worktree| worktree.path)
             .find(|worktree| same_path(worktree, &requested))
@@ -4659,7 +4820,8 @@ fn session_name_seed(session_id: SessionId) -> usize {
         })
 }
 
-/// 单条 WebSocket 连接的状态。E2EE session 只属于当前连接。
+/// 单条 WebSocket 连接的状态。E2EE 字段只服务 legacy `encrypted_frame` 兼容路径，
+/// 并且仅属于当前连接；当前 Web packet 路径是明文 JSON/binary。
 pub struct ProtocolConnection {
     client_id: ClientId,
     peer_ip: Option<String>,
@@ -5035,6 +5197,10 @@ impl ProtocolConnection {
         std::mem::take(&mut self.debug_traffic)
     }
 
+    pub(crate) fn wire_error_response(&mut self, error: ProtocolError) -> ProtocolWireMessage {
+        self.error_response_wire(error)
+    }
+
     pub fn attached_sessions_snapshot(&self) -> Vec<SessionId> {
         self.attached_sessions.clone()
     }
@@ -5063,7 +5229,8 @@ impl ProtocolConnection {
         }
     }
 
-    /// 处理真实 WebSocket wire frame。binary 模式只影响 E2EE 后的 packet，明文握手仍是 JSON。
+    /// 处理真实 WebSocket wire frame。当前 packet 可使用明文 JSON 或 binary；
+    /// legacy `encrypted_frame` 兼容路径仍使用 JSON envelope。
     pub fn handle_wire_message<B, V>(
         &mut self,
         protocol: &mut DaemonProtocol<B, V>,
@@ -5079,10 +5246,116 @@ impl ProtocolConnection {
         }
     }
 
-    /// 从当前连接已 attach 的 runtime session 读取 PTY 输出，并按本连接 E2EE 会话加密。
+    pub(crate) fn prepare_wire_message(
+        &mut self,
+        message: ProtocolWireMessage,
+    ) -> Result<PreparedProtocolWireMessage, ProtocolError> {
+        match message {
+            ProtocolWireMessage::Json(envelope) if envelope.kind == MessageType::EncryptedFrame => {
+                let frame = decode_payload(envelope.payload)?;
+                let inner: JsonEnvelope = self.e2ee_mut()?.decrypt_json_payload(&frame)?;
+                if inner.kind == MessageType::Packet {
+                    Ok(PreparedProtocolWireMessage::Packet(decode_payload(
+                        inner.payload,
+                    )?))
+                } else {
+                    Ok(PreparedProtocolWireMessage::LegacyEnvelope(inner))
+                }
+            }
+            ProtocolWireMessage::Json(envelope) if envelope.kind == MessageType::Packet => Ok(
+                PreparedProtocolWireMessage::Packet(decode_payload(envelope.payload)?),
+            ),
+            ProtocolWireMessage::Binary(raw) => {
+                if !self.binary_mode {
+                    return Err(ProtocolError::InvalidState);
+                }
+                let binary_packet = decode_binary_protocol_packet(&raw)
+                    .map_err(|_| ProtocolError::InvalidEnvelope)?;
+                let packet = protocol_packet_from_binary(binary_packet)
+                    .map_err(|_| ProtocolError::InvalidEnvelope)?;
+                Ok(PreparedProtocolWireMessage::Packet(packet))
+            }
+            message => Ok(PreparedProtocolWireMessage::Original(message)),
+        }
+    }
+
+    pub(crate) fn handle_prepared_wire_message<B, V>(
+        &mut self,
+        protocol: &mut DaemonProtocol<B, V>,
+        prepared: PreparedProtocolWireMessage,
+    ) -> Vec<ProtocolWireMessage>
+    where
+        B: PtyBackend,
+        V: SignatureVerifier,
+    {
+        let result = match prepared {
+            PreparedProtocolWireMessage::Original(message) => {
+                return self.handle_wire_message(protocol, message);
+            }
+            PreparedProtocolWireMessage::LegacyEnvelope(inner) => {
+                self.debug_traffic
+                    .record_inbound_legacy_envelope(inner.kind);
+                self.handle_inner_envelope(protocol, inner)
+                    .and_then(|messages| self.encrypt_inner_messages_wire(messages))
+            }
+            PreparedProtocolWireMessage::Packet(packet) => self
+                .handle_inner_packet(protocol, packet)
+                .and_then(|packets| self.encrypt_packets_wire(packets)),
+        };
+        result.unwrap_or_else(|error| vec![self.error_response_wire(error)])
+    }
+
+    pub(crate) fn finish_prepared_pairing(
+        &mut self,
+        prepared: PreparedProtocolWireMessage,
+        result: Result<Vec<JsonEnvelope>, ProtocolError>,
+    ) -> Vec<ProtocolWireMessage> {
+        match prepared {
+            PreparedProtocolWireMessage::Packet(packet) => {
+                let id = match packet.id {
+                    Some(id) => id,
+                    None => return vec![self.error_response_wire(ProtocolError::InvalidEnvelope)],
+                };
+                let packets = match result {
+                    Ok(envelopes) => {
+                        packetize_handler_responses(id, METHOD_PAIR_REQUEST, envelopes)
+                    }
+                    Err(error) => packet_request_error(id, error).map(|packet| vec![packet]),
+                };
+                match packets.and_then(|packets| self.encrypt_packets_wire(packets)) {
+                    Ok(messages) => messages,
+                    Err(error) => vec![self.error_response_wire(error)],
+                }
+            }
+            PreparedProtocolWireMessage::LegacyEnvelope(_) => {
+                match result.and_then(|messages| self.encrypt_inner_messages_wire(messages)) {
+                    Ok(messages) => messages,
+                    Err(error) => vec![self.error_response_wire(error)],
+                }
+            }
+            PreparedProtocolWireMessage::Original(_) => match result {
+                Ok(messages) => messages
+                    .into_iter()
+                    .map(ProtocolWireMessage::Json)
+                    .collect(),
+                Err(error) => vec![ProtocolWireMessage::Json(
+                    envelope_value(
+                        MessageType::Error,
+                        ErrorPayload {
+                            code: error.code().to_owned(),
+                            message: error.safe_message().to_owned(),
+                        },
+                    )
+                    .expect("error payload should serialize"),
+                )],
+            },
+        }
+    }
+
+    /// 从当前连接已 attach 的 runtime session 读取 PTY 输出。
     ///
-    /// 这里是 daemon -> client 的核心输出路径：PTY 明文只在 daemon 内部 buffer 中短暂停留，
-    /// 发送前会先封装为内层 `session_data` envelope，再加密成外层 `encrypted_frame`。
+    /// 当前 packet mode 输出明文 `ProtocolPacket`；legacy WebSocket 兼容模式才把
+    /// `session_data` 包进 `encrypted_frame`。
     pub fn read_session_output<B, V>(
         &mut self,
         protocol: &mut DaemonProtocol<B, V>,
@@ -5115,11 +5388,11 @@ impl ProtocolConnection {
         }
     }
 
-    /// 只从 daemon runtime 收集待发送输出，不做 E2EE/二进制编码。
+    /// 只从 daemon runtime 收集待发送输出，不做 WebSocket wire 编码。
     ///
     /// server/relay 层会先短暂持有全局 daemon protocol 锁调用这里，然后释放锁再调用
-    /// `encrypt_collected_inner_messages_wire`。这样大 snapshot 或大 terminal batch 的加密与
-    /// protobuf/JSON 编码不会阻塞其它 direct/relay 连接的控制请求。
+    /// `encrypt_collected_inner_messages_wire`。当前路径编码明文 JSON/binary packet；legacy
+    /// 兼容路径才做 E2EE。大 snapshot 编码不会阻塞其它 direct/relay 连接的控制请求。
     pub fn drain_session_output_messages_for_push<B, V>(
         &mut self,
         protocol: &mut DaemonProtocol<B, V>,
@@ -5133,7 +5406,8 @@ impl ProtocolConnection {
         self.try_drain_session_output_messages_for_push(protocol, session_id, max_bytes)
     }
 
-    /// 对已经离开 daemon 全局锁的内层消息做 E2EE 封包。
+    /// 对已经离开 daemon 全局锁的消息做 wire 封包：当前路径输出明文 JSON/binary packet，
+    /// legacy WebSocket 路径输出 `encrypted_frame`。
     pub fn encrypt_collected_inner_messages_wire(
         &mut self,
         messages: Result<Vec<JsonEnvelope>, ProtocolError>,
@@ -5181,7 +5455,7 @@ impl ProtocolConnection {
         }
     }
 
-    /// 只读取当前 session 的 cwd 变化事件，不做 E2EE 封包。
+    /// 只读取当前 session 的 cwd 变化事件，不做 WebSocket wire 封包。
     pub fn read_session_cwd_update_messages<B, V>(
         &mut self,
         protocol: &mut DaemonProtocol<B, V>,
@@ -5228,7 +5502,7 @@ impl ProtocolConnection {
         }
     }
 
-    /// 只读取当前 session resize 状态，不做 E2EE 封包；用途同文件树推送收集方法。
+    /// 只读取当前 session resize 状态，不做 WebSocket wire 封包；用途同文件树推送收集方法。
     pub fn read_session_resize_update_messages<B, V>(
         &mut self,
         protocol: &mut DaemonProtocol<B, V>,
@@ -5590,7 +5864,7 @@ impl ProtocolConnection {
                 };
                 if chunk.len() > max_bytes {
                     // 中文注释：attach snapshot 会作为 pending raw chunk 入队，可能远大于
-                    // 单次输出预算。这里按 max_bytes 切开，避免 writer 一次发送超大 E2EE 帧，
+                    // 单次输出预算。这里按 max_bytes 切开，避免 writer 一次发送超大 WebSocket 帧，
                     // 让控制帧、输入和新 attach 能在 snapshot 回放期间插队。
                     let remainder = chunk[max_bytes..].to_vec();
                     chunks.push(chunk[..max_bytes].to_vec());
@@ -6443,13 +6717,10 @@ impl ProtocolConnection {
                 ProtocolError::InvalidState,
             )?]);
         };
-        let bytes = match general_purpose::STANDARD.decode(&payload.data_base64) {
+        let bytes = match decode_supervisor_attach_frame(&payload.data_base64) {
             Ok(bytes) => bytes,
-            Err(_) => {
-                return Ok(vec![packet_stream_error(
-                    stream_id,
-                    ProtocolError::InvalidEnvelope,
-                )?]);
+            Err(error) => {
+                return Ok(vec![packet_stream_error(stream_id, error)?]);
             }
         };
 
@@ -7033,6 +7304,47 @@ fn base64_payload_decoded_len(data_base64: &str) -> usize {
     trimmed.len().saturating_mul(3) / 4
 }
 
+fn decode_supervisor_attach_frame(data_base64: &str) -> Result<Vec<u8>, ProtocolError> {
+    let max_encoded_len = MAX_SUPERVISOR_FRAME_BYTES.div_ceil(3).saturating_mul(4);
+    if data_base64.len() > max_encoded_len
+        || standard_base64_decoded_len_upper_bound(data_base64)
+            .is_none_or(|decoded_len| decoded_len > MAX_SUPERVISOR_FRAME_BYTES)
+    {
+        return Err(ProtocolError::InvalidEnvelope);
+    }
+    let bytes = general_purpose::STANDARD
+        .decode(data_base64)
+        .map_err(|_| ProtocolError::InvalidEnvelope)?;
+    if bytes.len() > MAX_SUPERVISOR_FRAME_BYTES
+        || validate_length_prefixed_supervisor_frame(&bytes).is_err()
+    {
+        return Err(ProtocolError::InvalidEnvelope);
+    }
+    Ok(bytes)
+}
+
+fn standard_base64_decoded_len_upper_bound(data_base64: &str) -> Option<usize> {
+    let bytes = data_base64.as_bytes();
+    if !bytes.len().is_multiple_of(4) {
+        return None;
+    }
+    let padding = if bytes.ends_with(b"==") {
+        2
+    } else if bytes.ends_with(b"=") {
+        1
+    } else {
+        0
+    };
+    if bytes[..bytes.len().saturating_sub(padding)].contains(&b'=') {
+        return None;
+    }
+    bytes
+        .len()
+        .checked_div(4)?
+        .checked_mul(3)?
+        .checked_sub(padding)
+}
+
 #[cfg(test)]
 #[allow(dead_code)]
 fn terminal_frame_payload_bytes(frame: &TerminalFramePayload) -> usize {
@@ -7528,7 +7840,7 @@ fn git_scope_contains_active_session_file_http_upload_alias(
     worktree: &Path,
     file_path: Option<&str>,
     active_targets: &[ActiveSessionFileHttpUploadTarget],
-) -> bool {
+) -> Result<bool, ProtocolError> {
     // 中文注释：不要自己递归扫描 worktree。Git action/diff 只会影响 Git 认为有变化
     // 的 pathspec，直接用 `git status -z -- <scope>` 找候选路径，再按 inode 识别 alias。
     let output = if let Some(path) = file_path {
@@ -7549,20 +7861,18 @@ fn git_scope_contains_active_session_file_http_upload_alias(
             &["status", "--porcelain=v1", "--untracked-files=all", "-z"],
         )
     };
-    let Ok(output) = output else {
-        return false;
-    };
-    if !output.success {
-        return false;
+    let output = output.map_err(|_| ProtocolError::RuntimeFailed)?;
+    if output.truncated() || !output.success {
+        return Err(ProtocolError::RuntimeFailed);
     }
-    parse_git_status_entries(&output.stdout)
+    Ok(parse_git_status_entries(&output.stdout)
         .into_iter()
         .any(|change| {
             path_matches_active_session_file_http_upload_target(
                 &worktree.join(change.path),
                 active_targets,
             )
-        })
+        }))
 }
 
 fn validate_git_relative_file_path(path: &str) -> Result<(), ProtocolError> {
@@ -7650,8 +7960,53 @@ fn read_session_file_entries(
 #[derive(Debug, Clone)]
 struct GitCommandResult {
     success: bool,
+    exit_code: Option<i32>,
     stdout: String,
     stderr: String,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GitCommandLimits {
+    timeout: Duration,
+    stdout_max_bytes: usize,
+    stderr_max_bytes: usize,
+}
+
+#[derive(Debug)]
+struct BoundedGitOutput {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+impl BoundedGitOutput {
+    fn with_capacity(max_bytes: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(max_bytes.min(8 * 1024)),
+            truncated: false,
+        }
+    }
+
+    fn extend_from_slice(&mut self, bytes: &[u8], max_bytes: usize) {
+        let retained = bytes.len().min(max_bytes.saturating_sub(self.bytes.len()));
+        self.bytes.extend_from_slice(&bytes[..retained]);
+        if retained < bytes.len() {
+            self.truncated = true;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GitSnapshotError {
+    Command,
+    Truncated,
+}
+
+impl GitCommandResult {
+    fn truncated(&self) -> bool {
+        self.stdout_truncated || self.stderr_truncated
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -7673,6 +8028,9 @@ fn read_session_git_snapshot(
             return session_git_error(session_id, cwd_text, format!("git unavailable: {error}"));
         }
     };
+    if repo_output.truncated() {
+        return session_git_error(session_id, cwd_text, GIT_OUTPUT_TRUNCATED_MESSAGE);
+    }
     if !repo_output.success {
         return session_git_error(
             session_id,
@@ -7687,37 +8045,57 @@ fn read_session_git_snapshot(
     let canonical_repo_root = repo_root.canonicalize().unwrap_or(repo_root);
     let repository_root_text = absolute_path_string(&canonical_repo_root);
 
-    let current_root_output =
-        run_git_command(cwd, &["rev-parse", "--show-toplevel"]).unwrap_or(repo_output);
-    let current_root = first_non_empty_line(&current_root_output.stdout)
-        .map(PathBuf::from)
-        .and_then(|path| path.canonicalize().ok())
-        .unwrap_or_else(|| canonical_repo_root.clone());
-    let worktree_infos = read_git_worktrees(&canonical_repo_root, &current_root);
-    let worktrees = worktree_infos
-        .into_iter()
-        .map(|worktree| {
-            let (staged, unstaged) =
-                read_git_worktree_changes(&worktree.path, active_upload_targets);
-            let is_current = same_path(&worktree.path, &current_root);
-            SessionGitWorktreePayload {
-                path: absolute_path_string(&worktree.path),
-                branch: worktree.branch,
-                head: worktree.head,
-                is_current,
-                staged,
-                unstaged,
-            }
-        })
-        .collect();
+    let current_root = canonical_repo_root.clone();
+    let worktree_infos = match read_git_worktrees(&canonical_repo_root) {
+        Ok(worktree_infos) => worktree_infos,
+        Err(error) => {
+            return session_git_error(session_id, cwd_text, session_git_snapshot_error(error));
+        }
+    };
+    let mut worktrees = Vec::new();
+    for worktree in worktree_infos {
+        let (staged, unstaged) =
+            match read_git_worktree_changes(&worktree.path, active_upload_targets) {
+                Ok(changes) => changes,
+                Err(error) => {
+                    return session_git_error(
+                        session_id,
+                        cwd_text,
+                        session_git_snapshot_error(error),
+                    );
+                }
+            };
+        let is_current = same_path(&worktree.path, &current_root);
+        worktrees.push(SessionGitWorktreePayload {
+            path: absolute_path_string(&worktree.path),
+            branch: worktree.branch,
+            head: worktree.head,
+            is_current,
+            staged,
+            unstaged,
+        });
+    }
+    let graph = match read_git_graph(&canonical_repo_root) {
+        Ok(graph) => graph,
+        Err(error) => {
+            return session_git_error(session_id, cwd_text, session_git_snapshot_error(error));
+        }
+    };
 
     SessionGitResultPayload {
         session_id,
         cwd: cwd_text,
         repository_root: Some(repository_root_text),
         worktrees,
-        graph: read_git_graph(&canonical_repo_root),
+        graph,
         error: None,
+    }
+}
+
+fn session_git_snapshot_error(error: GitSnapshotError) -> &'static str {
+    match error {
+        GitSnapshotError::Command => GIT_COMMAND_FAILED_MESSAGE,
+        GitSnapshotError::Truncated => GIT_OUTPUT_TRUNCATED_MESSAGE,
     }
 }
 
@@ -7738,22 +8116,330 @@ fn session_git_error(
 
 fn run_git_command(cwd: &Path, args: &[&str]) -> Result<GitCommandResult, std::io::Error> {
     // Git 信息只通过本机 git CLI 读取，避免 daemon 为侧栏展示引入额外持久状态。
-    let output = Command::new("git").arg("-C").arg(cwd).args(args).output()?;
+    run_git_command_with_limits(
+        Path::new("git"),
+        cwd,
+        args,
+        GitCommandLimits {
+            timeout: GIT_COMMAND_TIMEOUT,
+            stdout_max_bytes: GIT_COMMAND_STDOUT_MAX_BYTES,
+            stderr_max_bytes: GIT_COMMAND_STDERR_MAX_BYTES,
+        },
+    )
+}
+
+fn run_git_command_with_limits(
+    program: &Path,
+    cwd: &Path,
+    args: &[&str],
+    limits: GitCommandLimits,
+) -> Result<GitCommandResult, std::io::Error> {
+    let mut command = Command::new(program);
+    command
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("LC_ALL", "C")
+        .stdin(Stdio::null());
+
+    #[cfg(unix)]
+    let (status, stdout, stderr) = {
+        command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0);
+        let mut child = command.spawn()?;
+        let stdout = child.stdout.take().expect("git stdout must be piped");
+        let stderr = child.stderr.take().expect("git stderr must be piped");
+        wait_for_git_child_and_output(&mut child, stdout, stderr, limits)?
+    };
+
+    #[cfg(not(unix))]
+    let (status, stdout, stderr) = {
+        let mut cleanup = GitCommandTempOutputCleanup::default();
+        let mut stdout_file = open_git_command_temp_output_file("stdout")?;
+        cleanup.track(stdout_file.path.clone());
+        let mut stderr_file = open_git_command_temp_output_file("stderr")?;
+        cleanup.track(stderr_file.path.clone());
+        command
+            .stdout(Stdio::from(stdout_file.file.try_clone()?))
+            .stderr(Stdio::from(stderr_file.file.try_clone()?));
+        let mut child = command.spawn()?;
+        let status = wait_for_git_child_status(&mut child, limits.timeout)?;
+        let stdout =
+            read_bounded_git_output_from_file(&mut stdout_file.file, limits.stdout_max_bytes)?;
+        let stderr =
+            read_bounded_git_output_from_file(&mut stderr_file.file, limits.stderr_max_bytes)?;
+        (status, stdout, stderr)
+    };
+
     Ok(GitCommandResult {
-        success: output.status.success(),
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        success: status.success(),
+        exit_code: status.code(),
+        stdout: String::from_utf8_lossy(&stdout.bytes).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr.bytes).into_owned(),
+        stdout_truncated: stdout.truncated,
+        stderr_truncated: stderr.truncated,
     })
 }
 
-fn current_git_repository_root(cwd: &Path) -> Option<PathBuf> {
-    let output = run_git_command(cwd, &["rev-parse", "--show-toplevel"]).ok()?;
-    if !output.success {
-        return None;
+#[cfg(unix)]
+fn wait_for_git_child_and_output(
+    child: &mut Child,
+    mut stdout: ChildStdout,
+    mut stderr: ChildStderr,
+    limits: GitCommandLimits,
+) -> Result<(ExitStatus, BoundedGitOutput, BoundedGitOutput), std::io::Error> {
+    if let Err(error) =
+        set_fd_nonblocking(stdout.as_raw_fd()).and_then(|_| set_fd_nonblocking(stderr.as_raw_fd()))
+    {
+        let _ = terminate_git_child(child);
+        return Err(error);
     }
-    first_non_empty_line(&output.stdout)
+
+    let started_at = Instant::now();
+    let mut stdout_output = BoundedGitOutput::with_capacity(limits.stdout_max_bytes);
+    let mut stderr_output = BoundedGitOutput::with_capacity(limits.stderr_max_bytes);
+    let mut stdout_closed = false;
+    let mut stderr_closed = false;
+    loop {
+        if !stdout_closed {
+            stdout_closed = match read_available_git_output(
+                &mut stdout,
+                &mut stdout_output,
+                limits.stdout_max_bytes,
+            ) {
+                Ok(closed) => closed,
+                Err(error) => {
+                    let _ = terminate_git_child(child);
+                    return Err(error);
+                }
+            };
+        }
+        if !stderr_closed {
+            stderr_closed = match read_available_git_output(
+                &mut stderr,
+                &mut stderr_output,
+                limits.stderr_max_bytes,
+            ) {
+                Ok(closed) => closed,
+                Err(error) => {
+                    let _ = terminate_git_child(child);
+                    return Err(error);
+                }
+            };
+        }
+        if stdout_closed && stderr_closed {
+            match child.try_wait() {
+                Ok(Some(status)) => return Ok((status, stdout_output, stderr_output)),
+                Ok(None) => {}
+                Err(error) => {
+                    let _ = terminate_git_child(child);
+                    return Err(error);
+                }
+            }
+        }
+        if started_at.elapsed() >= limits.timeout {
+            // 中文注释：总 deadline 覆盖 child 和 pipe drain；后代脱离进程组继续持管道时也不能阻塞 API。
+            terminate_git_child(child)?;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "git command timed out after {} ms",
+                    limits.timeout.as_millis()
+                ),
+            ));
+        }
+        let remaining = limits.timeout.saturating_sub(started_at.elapsed());
+        std::thread::sleep(GIT_COMMAND_POLL_INTERVAL.min(remaining));
+    }
+}
+
+#[cfg(unix)]
+fn set_fd_nonblocking(fd: std::os::fd::RawFd) -> Result<(), std::io::Error> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn read_available_git_output(
+    reader: &mut impl Read,
+    output: &mut BoundedGitOutput,
+    max_bytes: usize,
+) -> Result<bool, std::io::Error> {
+    let mut buffer = [0_u8; 8 * 1024];
+    for _ in 0..GIT_COMMAND_DRAIN_MAX_READS {
+        let read = match reader.read(&mut buffer) {
+            Ok(0) => return Ok(true),
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        output.extend_from_slice(&buffer[..read], max_bytes);
+    }
+    Ok(false)
+}
+
+#[cfg(not(unix))]
+struct GitCommandTempOutputFile {
+    path: PathBuf,
+    file: fs::File,
+}
+
+#[cfg(not(unix))]
+#[derive(Default)]
+struct GitCommandTempOutputCleanup {
+    paths: Vec<PathBuf>,
+}
+
+#[cfg(not(unix))]
+impl GitCommandTempOutputCleanup {
+    fn track(&mut self, path: PathBuf) {
+        self.paths.push(path);
+    }
+}
+
+#[cfg(not(unix))]
+impl Drop for GitCommandTempOutputCleanup {
+    fn drop(&mut self) {
+        for path in &self.paths {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn open_git_command_temp_output_file(
+    kind: &str,
+) -> Result<GitCommandTempOutputFile, std::io::Error> {
+    let path = env::temp_dir().join(format!(
+        "termd-git-{}-{}-{kind}.tmp",
+        std::process::id(),
+        ServerId::new().0
+    ));
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    Ok(GitCommandTempOutputFile { path, file })
+}
+
+#[cfg(not(unix))]
+fn wait_for_git_child_status(
+    child: &mut Child,
+    timeout: Duration,
+) -> Result<ExitStatus, std::io::Error> {
+    let started_at = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => {}
+            Err(error) => {
+                let _ = terminate_git_child(child);
+                return Err(error);
+            }
+        }
+        if started_at.elapsed() >= timeout {
+            terminate_git_child(child)?;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("git command timed out after {} ms", timeout.as_millis()),
+            ));
+        }
+        let remaining = timeout.saturating_sub(started_at.elapsed());
+        std::thread::sleep(GIT_COMMAND_POLL_INTERVAL.min(remaining));
+    }
+}
+
+fn terminate_git_child(child: &mut Child) -> Result<(), std::io::Error> {
+    #[cfg(unix)]
+    {
+        let process_group = i32::try_from(child.id()).map_err(|source| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("git process id is out of range: {source}"),
+            )
+        })?;
+        // Git hook/credential 子进程可能继承 stdout/stderr；只杀直系进程会让 drain 线程永久等待。
+        if unsafe { libc::kill(-process_group, libc::SIGKILL) } == -1 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+            if child.try_wait()?.is_none() {
+                child.kill()?;
+            }
+        }
+        child.wait()?;
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    {
+        child.kill()?;
+        child.wait()?;
+        Ok(())
+    }
+}
+
+#[cfg(not(unix))]
+fn read_bounded_git_output(
+    mut reader: impl Read,
+    max_bytes: usize,
+) -> Result<BoundedGitOutput, std::io::Error> {
+    let mut output = BoundedGitOutput::with_capacity(max_bytes);
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        let read = match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        output.extend_from_slice(&buffer[..read], max_bytes);
+    }
+    Ok(output)
+}
+
+#[cfg(not(unix))]
+fn read_bounded_git_output_from_file(
+    file: &mut fs::File,
+    max_bytes: usize,
+) -> Result<BoundedGitOutput, std::io::Error> {
+    file.seek(SeekFrom::Start(0))?;
+    read_bounded_git_output(file, max_bytes)
+}
+
+fn current_git_repository_root(cwd: &Path) -> Result<Option<PathBuf>, GitSnapshotError> {
+    let output = run_git_command(cwd, &["rev-parse", "--show-toplevel"])
+        .map_err(|_| GitSnapshotError::Command)?;
+    if output.truncated() {
+        return Err(GitSnapshotError::Truncated);
+    }
+    if !output.success {
+        return if git_command_reports_no_worktree(&output) {
+            Ok(None)
+        } else {
+            Err(GitSnapshotError::Command)
+        };
+    }
+    let path = first_non_empty_line(&output.stdout)
         .map(PathBuf::from)
-        .and_then(|path| path.canonicalize().ok())
+        .ok_or(GitSnapshotError::Command)?;
+    path.canonicalize()
+        .map(Some)
+        .map_err(|_| GitSnapshotError::Command)
 }
 
 fn apply_git_file_action(
@@ -7816,6 +8502,9 @@ fn discard_git_file_change(worktree: &Path, file_path: &str) -> Result<(), Proto
         ],
     )
     .map_err(|_| ProtocolError::RuntimeFailed)?;
+    if status.truncated() {
+        return Err(ProtocolError::RuntimeFailed);
+    }
     if !status.success {
         tracing::debug!(stderr = %status.stderr, "git status for discard failed detail");
         tracing::warn!("git status for discard failed");
@@ -7841,7 +8530,7 @@ fn discard_git_file_change(worktree: &Path, file_path: &str) -> Result<(), Proto
 
 fn run_git_checked(cwd: &Path, args: &[&str]) -> Result<(), ProtocolError> {
     let output = run_git_command(cwd, args).map_err(|_| ProtocolError::RuntimeFailed)?;
-    if output.success {
+    if output.success && !output.truncated() {
         return Ok(());
     }
 
@@ -7850,21 +8539,21 @@ fn run_git_checked(cwd: &Path, args: &[&str]) -> Result<(), ProtocolError> {
     Err(ProtocolError::RuntimeFailed)
 }
 
-fn read_git_worktrees(repo_root: &Path, current_root: &Path) -> Vec<GitWorktreeInfo> {
-    let mut worktrees = run_git_command(repo_root, &["worktree", "list", "--porcelain"])
-        .ok()
-        .filter(|output| output.success)
-        .map(|output| parse_git_worktrees(&output.stdout))
-        .unwrap_or_default();
+fn read_git_worktrees(repo_root: &Path) -> Result<Vec<GitWorktreeInfo>, GitSnapshotError> {
+    let output = run_git_command(repo_root, &["worktree", "list", "--porcelain"])
+        .map_err(|_| GitSnapshotError::Command)?;
+    if output.truncated() {
+        return Err(GitSnapshotError::Truncated);
+    }
+    if !output.success {
+        return Err(GitSnapshotError::Command);
+    }
+    let worktrees = parse_git_worktrees(&output.stdout);
     if worktrees.is_empty() {
-        worktrees.push(GitWorktreeInfo {
-            path: current_root.to_path_buf(),
-            branch: read_git_branch(current_root),
-            head: read_git_head(current_root),
-        });
+        return Err(GitSnapshotError::Command);
     }
 
-    worktrees
+    Ok(worktrees)
 }
 
 fn parse_git_worktrees(output: &str) -> Vec<GitWorktreeInfo> {
@@ -7886,7 +8575,9 @@ fn parse_git_worktrees(output: &str) -> Vec<GitWorktreeInfo> {
                 worktrees.push(normalize_git_worktree(worktree));
             }
         } else if let Some(head) = line.strip_prefix("HEAD ") {
-            if let Some(worktree) = current.as_mut() {
+            if let Some(worktree) = current.as_mut()
+                && head.bytes().any(|byte| byte != b'0')
+            {
                 worktree.head = Some(short_git_hash(head));
             }
         } else if let Some(branch) = line.strip_prefix("branch ")
@@ -7909,43 +8600,27 @@ fn normalize_git_worktree(mut worktree: GitWorktreeInfo) -> GitWorktreeInfo {
     worktree
 }
 
-fn read_git_branch(worktree: &Path) -> Option<String> {
-    let output = run_git_command(worktree, &["rev-parse", "--abbrev-ref", "HEAD"]).ok()?;
-    if !output.success {
-        return None;
-    }
-    let branch = first_non_empty_line(&output.stdout)?;
-    if branch == "HEAD" {
-        None
-    } else {
-        Some(branch.to_owned())
-    }
-}
-
-fn read_git_head(worktree: &Path) -> Option<String> {
-    let output = run_git_command(worktree, &["rev-parse", "--short", "HEAD"]).ok()?;
-    if output.success {
-        first_non_empty_line(&output.stdout).map(ToOwned::to_owned)
-    } else {
-        None
-    }
-}
-
 fn read_git_worktree_changes(
     worktree: &Path,
     active_upload_targets: &[ActiveSessionFileHttpUploadTarget],
-) -> (
-    Vec<SessionGitFileChangePayload>,
-    Vec<SessionGitFileChangePayload>,
-) {
-    let Some(output) = run_git_command(
+) -> Result<
+    (
+        Vec<SessionGitFileChangePayload>,
+        Vec<SessionGitFileChangePayload>,
+    ),
+    GitSnapshotError,
+> {
+    let output = run_git_command(
         worktree,
         &["status", "--porcelain=v1", "--untracked-files=all", "-z"],
     )
-    .ok()
-    .filter(|output| output.success) else {
-        return (Vec::new(), Vec::new());
-    };
+    .map_err(|_| GitSnapshotError::Command)?;
+    if output.truncated() {
+        return Err(GitSnapshotError::Truncated);
+    }
+    if !output.success {
+        return Err(GitSnapshotError::Command);
+    }
     let mut staged = Vec::new();
     let mut unstaged = Vec::new();
     for change in parse_git_status_entries(&output.stdout) {
@@ -7971,7 +8646,7 @@ fn read_git_worktree_changes(
         }
     }
 
-    (staged, unstaged)
+    Ok((staged, unstaged))
 }
 
 fn parse_git_status_entries(output: &str) -> Vec<GitStatusLine> {
@@ -8019,8 +8694,8 @@ fn parse_git_status_line(line: &str) -> Option<GitStatusLine> {
     })
 }
 
-fn read_git_graph(repo_root: &Path) -> Vec<String> {
-    run_git_command(
+fn read_git_graph(repo_root: &Path) -> Result<Vec<String>, GitSnapshotError> {
+    let output = run_git_command(
         repo_root,
         &[
             "log",
@@ -8031,18 +8706,21 @@ fn read_git_graph(repo_root: &Path) -> Vec<String> {
             "--all",
         ],
     )
-    .ok()
-    .filter(|output| output.success)
-    .map(|output| {
-        output
-            .stdout
-            .lines()
-            .map(str::trim_end)
-            .filter(|line| !line.is_empty())
-            .map(ToOwned::to_owned)
-            .collect()
-    })
-    .unwrap_or_default()
+    .map_err(|_| GitSnapshotError::Command)?;
+    if !output.success {
+        return Err(GitSnapshotError::Command);
+    }
+    let mut graph: Vec<String> = output
+        .stdout
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+    if output.truncated() {
+        graph.push(GIT_GRAPH_TRUNCATED_MESSAGE.to_owned());
+    }
+    Ok(graph)
 }
 
 fn git_error_message(output: &GitCommandResult, fallback: &'static str) -> String {
@@ -8050,6 +8728,15 @@ fn git_error_message(output: &GitCommandResult, fallback: &'static str) -> Strin
         .or_else(|| first_non_empty_line(&output.stdout))
         .unwrap_or(fallback)
         .to_owned()
+}
+
+fn git_command_reports_no_worktree(output: &GitCommandResult) -> bool {
+    output.exit_code == Some(128)
+        && output.stderr.lines().any(|line| {
+            let line = line.trim_start();
+            line.starts_with("fatal: not a git repository")
+                || line.starts_with("fatal: this operation must be run in a work tree")
+        })
 }
 
 fn first_non_empty_line(text: &str) -> Option<&str> {
@@ -8134,28 +8821,33 @@ pub(crate) fn cleanup_persisted_session_file_http_uploads(
     state_path: &Path,
 ) -> Result<(), StateError> {
     for record in StateStore::list_http_uploads(state_path)? {
-        // 中文注释：存在 recovery record 就表示 upload 尚未完成 commit；启动恢复时
-        // 只删除与 record identity 匹配的预分配目标。如果用户已经替换了该路径，保留新文件。
+        if record.dev == 0 && record.ino == 0 {
+            tracing::warn!(
+                upload_id = %record.upload_id,
+                "quarantined HTTP upload intent without durable object identity"
+            );
+            continue;
+        }
         let expected_identity = session_file_http_upload_identity_from_recovery_record(&record);
         let cleanup = remove_persisted_session_file_http_upload_target(
             &record.target_path,
             expected_identity,
         );
-        if let Err(error) = &cleanup {
-            tracing::debug!(
-                %error,
-                upload_id = %record.upload_id,
-                target = %record.target_path.display(),
-                "failed to cleanup stale HTTP upload recovery target detail"
-            );
+        if !matches!(cleanup, Ok(SessionFileHttpUploadCleanupOutcome::Removed)) {
+            if let Err(error) = &cleanup {
+                tracing::debug!(
+                    %error,
+                    upload_id = %record.upload_id,
+                    target = %record.target_path.display(),
+                    "quarantined stale HTTP upload recovery target detail"
+                );
+            }
             tracing::warn!(
                 upload_id = %record.upload_id,
-                "failed to cleanup stale HTTP upload recovery target"
+                outcome = ?cleanup.as_ref().ok(),
+                "quarantined stale HTTP upload recovery target"
             );
-            return Err(StateError::Read {
-                path: record.target_path,
-                source: std::io::Error::other("failed to cleanup stale HTTP upload target"),
-            });
+            continue;
         }
         StateStore::remove_http_upload(state_path, &record.upload_id)?;
         tracing::debug!(
@@ -8269,6 +8961,7 @@ pub(crate) fn write_session_file_http_upload_files(
         }
         current_offset = next_offset;
     }
+    http_upload_test_crash_checkpoint("after_write");
     if !saw_chunk && current_offset != plan.size_bytes {
         tracing::debug!(
             target = %plan.target.display(),
@@ -8283,7 +8976,7 @@ pub(crate) fn write_session_file_http_upload_files(
         );
         return Err(ProtocolError::InvalidEnvelope);
     }
-    ensure_session_file_http_upload_target_identity(&plan.target, plan.file_identity)?;
+    ensure_session_file_http_upload_target_identity(&plan.storage_path, plan.file_identity)?;
     let metadata = file.metadata().map_err(map_file_path_error)?;
     if metadata.len() != plan.size_bytes {
         tracing::debug!(
@@ -8473,6 +9166,80 @@ fn write_session_file_all_at(
     file.write_all(bytes).map_err(map_file_path_error)
 }
 
+fn session_file_http_upload_temp_path(
+    target: &Path,
+    upload_id: &str,
+) -> Result<PathBuf, ProtocolError> {
+    let parent = target.parent().ok_or(ProtocolError::InvalidEnvelope)?;
+    let file_name = target.file_name().ok_or(ProtocolError::InvalidEnvelope)?;
+    Ok(parent.join(format!(
+        ".{}.termd-http-upload-{}.part",
+        file_name.to_string_lossy(),
+        upload_id
+    )))
+}
+
+#[cfg(target_os = "linux")]
+fn publish_session_file_http_upload_noreplace(
+    temp_path: &Path,
+    target: &Path,
+) -> Result<(), ProtocolError> {
+    let temp = std::ffi::CString::new(temp_path.as_os_str().as_bytes())
+        .map_err(|_| ProtocolError::InvalidEnvelope)?;
+    let target = std::ffi::CString::new(target.as_os_str().as_bytes())
+        .map_err(|_| ProtocolError::InvalidEnvelope)?;
+    // SAFETY: both C strings remain alive for the duration of renameat2.
+    let result = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            temp.as_ptr(),
+            libc::AT_FDCWD,
+            target.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            Err(ProtocolError::InvalidState)
+        } else {
+            Err(map_file_path_error(error))
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn publish_session_file_http_upload_noreplace(
+    temp_path: &Path,
+    target: &Path,
+) -> Result<(), ProtocolError> {
+    fs::hard_link(temp_path, target).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            ProtocolError::InvalidState
+        } else {
+            map_file_path_error(error)
+        }
+    })?;
+    fs::remove_file(temp_path).map_err(map_file_path_error)
+}
+
+fn sync_session_file_http_upload_parent(target: &Path) -> Result<(), ProtocolError> {
+    let parent = target.parent().ok_or(ProtocolError::InvalidEnvelope)?;
+    #[cfg(unix)]
+    {
+        fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(map_file_path_error)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = parent;
+        Ok(())
+    }
+}
+
 fn create_session_file_http_upload_target(
     target: &Path,
     size_bytes: u64,
@@ -8491,9 +9258,9 @@ fn create_session_file_http_upload_target_with_set_len(
     options.write(true).read(true).create_new(true);
     #[cfg(unix)]
     {
-        options.custom_flags(libc::O_NOFOLLOW);
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
-    // 中文注释：init 在最终路径创建新文件并设置声明大小；后续请求只 seek 写这个文件。
+    // 中文注释：调用方只传同目录随机隐藏路径；create_new 保证不会接管已有对象。
     let file = match options.open(target) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -8504,8 +9271,7 @@ fn create_session_file_http_upload_target_with_set_len(
     let created_metadata = file.metadata().map_err(map_file_path_error)?;
     let created_identity = SessionFileHttpUploadFileIdentity::from_metadata(&created_metadata);
     if let Err(error) = set_len(&file, size_bytes) {
-        // 中文注释：state 尚未登记时 set_len 失败，必须清理刚创建的最终目标文件；
-        // 否则下一次 init 会被 create_new 的 AlreadyExists 卡住。
+        // 中文注释：set_len 失败时只清理本次 create_new 返回的同一个临时对象。
         let _ = remove_session_file_http_upload_target(target, created_identity);
         return Err(map_file_path_error(error));
     }
@@ -8811,6 +9577,14 @@ fn nonce() -> Nonce {
 mod tests {
     use std::collections::VecDeque;
     use std::fs;
+    #[cfg(unix)]
+    use std::ops::Deref;
+    #[cfg(unix)]
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    #[cfg(target_os = "linux")]
+    use std::os::unix::process::ExitStatusExt;
+    #[cfg(target_os = "linux")]
+    use std::process::{Command as ProcessCommand, Stdio};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -8844,6 +9618,631 @@ mod tests {
     use tokio::sync::watch;
 
     static TEST_STATE_COUNTER: AtomicU64 = AtomicU64::new(0);
+    #[cfg(unix)]
+    static FAKE_GIT_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[cfg(unix)]
+    fn lock_fake_git_test() -> std::sync::MutexGuard<'static, ()> {
+        FAKE_GIT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[cfg(unix)]
+    struct FakeGitExecutable {
+        root: PathBuf,
+        path: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl FakeGitExecutable {
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    #[cfg(unix)]
+    impl Deref for FakeGitExecutable {
+        type Target = Path;
+
+        fn deref(&self) -> &Self::Target {
+            self.path()
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for FakeGitExecutable {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.root).ok();
+        }
+    }
+
+    #[cfg(unix)]
+    fn write_fake_git(script: &str) -> FakeGitExecutable {
+        let root = std::env::temp_dir().join(format!("termd-fake-git-{}", Uuid::new_v4()));
+        let mut directory = fs::DirBuilder::new();
+        directory.mode(0o700).create(&root).unwrap();
+        let path = root.join("git");
+        let contents = format!("#!/bin/sh\nset -eu\n{script}\n");
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(contents.as_bytes()).unwrap();
+        file.flush().unwrap();
+        drop(file);
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&path, permissions).unwrap();
+        FakeGitExecutable { root, path }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fake_git_executables_use_private_directories() {
+        let fixtures = (0..16)
+            .map(|index| write_fake_git(&format!("printf '{index}'")))
+            .collect::<Vec<_>>();
+        let paths = fixtures
+            .iter()
+            .map(|fixture| fixture.path().to_owned())
+            .collect::<Vec<_>>();
+
+        let private_directories = paths
+            .iter()
+            .map(|path| path.parent().unwrap())
+            .collect::<HashSet<_>>();
+        assert_eq!(private_directories.len(), fixtures.len());
+
+        std::thread::scope(|scope| {
+            for (index, fixture) in fixtures.iter().enumerate() {
+                scope.spawn(move || {
+                    let output = Command::new(fixture.path()).output().unwrap();
+                    assert!(output.status.success());
+                    assert_eq!(output.stdout, index.to_string().as_bytes());
+                });
+            }
+        });
+
+        drop(fixtures);
+        assert!(paths.iter().all(|path| !path.exists()));
+    }
+
+    #[cfg(unix)]
+    fn wait_for_process_to_exit(pid: libc::pid_t, timeout: std::time::Duration) -> bool {
+        let started_at = std::time::Instant::now();
+        loop {
+            if unsafe { libc::kill(pid, 0) } == -1
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            {
+                return true;
+            }
+            if started_at.elapsed() >= timeout {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn kill_process_group_best_effort(pid: libc::pid_t) {
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+            libc::kill(pid, libc::SIGKILL);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn read_pid_file(path: &Path) -> Option<libc::pid_t> {
+        fs::read_to_string(path).ok()?.parse().ok()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn wait_for_pid_file(path: &Path, timeout: std::time::Duration) -> Option<libc::pid_t> {
+        let started_at = std::time::Instant::now();
+        loop {
+            if let Some(pid) = read_pid_file(path) {
+                return Some(pid);
+            }
+            if started_at.elapsed() >= timeout {
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn process_state(pid: libc::pid_t) -> Option<char> {
+        fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| stat.rsplit_once(')').map(|(_, fields)| fields.to_owned()))
+            .and_then(|fields| fields.split_whitespace().next()?.chars().next())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_command_timeout_is_checked_while_output_is_continuous() {
+        let _guard = lock_fake_git_test();
+        let pid_path = temp_state_path("fake-git-continuous-output.pid");
+        let fake_git = write_fake_git(
+            r#"printf '%s' "$$" > "$4"
+i=0
+while [ "$i" -lt 32 ]; do
+  yes stdout &
+  i=$((i + 1))
+done
+wait"#,
+        );
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let thread_fake_git = fake_git.path().to_owned();
+        let thread_pid_path = pid_path.clone();
+        let worker = std::thread::spawn(move || {
+            let result = run_git_command_with_limits(
+                &thread_fake_git,
+                Path::new("."),
+                &["continuous-output", thread_pid_path.to_str().unwrap()],
+                GitCommandLimits {
+                    timeout: std::time::Duration::from_millis(150),
+                    stdout_max_bytes: 1024,
+                    stderr_max_bytes: 1024,
+                },
+            );
+            let _ = sender.send(result);
+        });
+
+        let result = match receiver.recv_timeout(std::time::Duration::from_secs(2)) {
+            Ok(result) => result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if let Some(pid) = wait_for_pid_file(&pid_path, std::time::Duration::from_secs(1)) {
+                    unsafe {
+                        libc::kill(-pid, libc::SIGKILL);
+                    }
+                }
+                let _ = worker.join();
+                panic!("continuous git output prevented the timeout deadline check");
+            }
+            Err(error) => panic!("git command worker disappeared: {error}"),
+        };
+        worker.join().unwrap();
+
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        fs::remove_file(pid_path).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_output_drain_yields_when_reader_never_would_block() {
+        struct InfiniteReader;
+
+        impl Read for InfiniteReader {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                buffer.fill(b'x');
+                Ok(buffer.len())
+            }
+        }
+
+        let mut reader = InfiniteReader;
+        let mut output = BoundedGitOutput::with_capacity(1024);
+
+        let closed = read_available_git_output(&mut reader, &mut output, 1024).unwrap();
+
+        assert!(!closed);
+        assert_eq!(output.bytes.len(), 1024);
+        assert!(output.truncated);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn git_command_keeps_exited_leader_unreaped_until_group_cleanup() {
+        let _guard = lock_fake_git_test();
+        let pid_path = temp_state_path("fake-git-unreaped-leader.pid");
+        let descendant_pid_path = temp_state_path("fake-git-unreaped-descendant.pid");
+        let fake_git = write_fake_git(
+            r#"printf '%s' "$$" > "$4"
+sleep 10 &
+printf '%s' "$!" > "$5"
+exit 0"#,
+        );
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let thread_fake_git = fake_git.path().to_owned();
+        let thread_pid_path = pid_path.clone();
+        let thread_descendant_pid_path = descendant_pid_path.clone();
+        let worker = std::thread::spawn(move || {
+            let result = run_git_command_with_limits(
+                &thread_fake_git,
+                Path::new("."),
+                &[
+                    "unreaped-leader",
+                    thread_pid_path.to_str().unwrap(),
+                    thread_descendant_pid_path.to_str().unwrap(),
+                ],
+                GitCommandLimits {
+                    timeout: std::time::Duration::from_millis(600),
+                    stdout_max_bytes: 1024,
+                    stderr_max_bytes: 1024,
+                },
+            );
+            let _ = sender.send(result);
+        });
+
+        let pid = wait_for_pid_file(&pid_path, std::time::Duration::from_secs(1)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let leader_remained_waitable = process_state(pid) == Some('Z');
+        let result = receiver
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("git command must enforce its deadline");
+        worker.join().unwrap();
+
+        assert!(
+            leader_remained_waitable,
+            "leader was reaped while inherited output pipes still required group cleanup"
+        );
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        assert!(wait_for_process_to_exit(
+            pid,
+            std::time::Duration::from_secs(1)
+        ));
+        fs::remove_file(pid_path).ok();
+        fs::remove_file(descendant_pid_path).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_command_timeout_covers_background_descendant_holding_output_pipe() {
+        let _guard = lock_fake_git_test();
+        let pid_path = temp_state_path("fake-git-exited-parent.pid");
+        let descendant_pid_path = temp_state_path("fake-git-pipe-descendant.pid");
+        let fake_git = write_fake_git(
+            r#"printf '%s' "$$" > "$4"
+(
+  while :; do sleep 10; done
+) &
+printf '%s' "$!" > "$5"
+exit 0"#,
+        );
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let thread_fake_git = fake_git.path().to_owned();
+        let thread_pid_path = pid_path.clone();
+        let thread_descendant_pid_path = descendant_pid_path.clone();
+        let started_at = std::time::Instant::now();
+        let worker = std::thread::spawn(move || {
+            let result = run_git_command_with_limits(
+                &thread_fake_git,
+                Path::new("."),
+                &[
+                    "pipe-holder",
+                    thread_pid_path.to_str().unwrap(),
+                    thread_descendant_pid_path.to_str().unwrap(),
+                ],
+                GitCommandLimits {
+                    timeout: std::time::Duration::from_millis(150),
+                    stdout_max_bytes: 1024,
+                    stderr_max_bytes: 1024,
+                },
+            );
+            let _ = sender.send(result);
+        });
+
+        let result = match receiver.recv_timeout(std::time::Duration::from_secs(2)) {
+            Ok(result) => result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // 中文注释：旧实现会卡在 reader join；这里清理进程组后让测试明确 RED。
+                if let Ok(pid) = fs::read_to_string(&pid_path)
+                    .unwrap()
+                    .parse::<libc::pid_t>()
+                {
+                    unsafe {
+                        libc::kill(-pid, libc::SIGKILL);
+                    }
+                }
+                let _ = worker.join();
+                panic!("git command did not enforce timeout while reader was still open");
+            }
+            Err(error) => panic!("git command worker disappeared: {error}"),
+        };
+        worker.join().unwrap();
+        let error = result.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started_at.elapsed() < std::time::Duration::from_secs(2));
+
+        let descendant_pid = fs::read_to_string(&descendant_pid_path)
+            .unwrap()
+            .parse::<libc::pid_t>()
+            .unwrap();
+        assert!(wait_for_process_to_exit(
+            descendant_pid,
+            std::time::Duration::from_secs(1)
+        ));
+
+        let healthy_git = write_fake_git("printf 'ok'");
+        let output = run_git_command_with_limits(
+            &healthy_git,
+            Path::new("."),
+            &["healthy"],
+            GitCommandLimits {
+                timeout: std::time::Duration::from_secs(1),
+                stdout_max_bytes: 1024,
+                stderr_max_bytes: 1024,
+            },
+        )
+        .unwrap();
+        assert!(output.success);
+        assert_eq!(output.stdout, "ok");
+
+        fs::remove_file(pid_path).ok();
+        fs::remove_file(descendant_pid_path).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn git_command_timeout_covers_detached_descendant_holding_output_pipe() {
+        let _guard = lock_fake_git_test();
+        let pid_path = temp_state_path("fake-git-detached-parent.pid");
+        let descendant_pid_path = temp_state_path("fake-git-detached-descendant.pid");
+        let fake_git = write_fake_git(
+            r#"printf '%s' "$$" > "$4"
+setsid sh -c 'while :; do sleep 10; done' &
+printf '%s' "$!" > "$5"
+exit 0"#,
+        );
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let thread_fake_git = fake_git.path().to_owned();
+        let thread_pid_path = pid_path.clone();
+        let thread_descendant_pid_path = descendant_pid_path.clone();
+        let started_at = std::time::Instant::now();
+        let worker = std::thread::spawn(move || {
+            let result = run_git_command_with_limits(
+                &thread_fake_git,
+                Path::new("."),
+                &[
+                    "detached-pipe-holder",
+                    thread_pid_path.to_str().unwrap(),
+                    thread_descendant_pid_path.to_str().unwrap(),
+                ],
+                GitCommandLimits {
+                    timeout: std::time::Duration::from_millis(150),
+                    stdout_max_bytes: 1024,
+                    stderr_max_bytes: 1024,
+                },
+            );
+            let _ = sender.send(result);
+        });
+
+        let result = match receiver.recv_timeout(std::time::Duration::from_secs(2)) {
+            Ok(result) => result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if let Some(pid) = wait_for_pid_file(&pid_path, std::time::Duration::from_secs(1)) {
+                    kill_process_group_best_effort(pid);
+                }
+                if let Some(pid) =
+                    wait_for_pid_file(&descendant_pid_path, std::time::Duration::from_secs(1))
+                {
+                    kill_process_group_best_effort(pid);
+                }
+                let _ = worker.join();
+                panic!("git command joined a reader after the deadline expired");
+            }
+            Err(error) => panic!("git command worker disappeared: {error}"),
+        };
+        if let Some(pid) = read_pid_file(&descendant_pid_path) {
+            kill_process_group_best_effort(pid);
+            let _ = wait_for_process_to_exit(pid, std::time::Duration::from_secs(1));
+        }
+        worker.join().unwrap();
+        let error = result.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started_at.elapsed() < std::time::Duration::from_secs(2));
+
+        let healthy_git = write_fake_git("printf 'ok'");
+        let output = run_git_command_with_limits(
+            &healthy_git,
+            Path::new("."),
+            &["healthy"],
+            GitCommandLimits {
+                timeout: std::time::Duration::from_secs(1),
+                stdout_max_bytes: 1024,
+                stderr_max_bytes: 1024,
+            },
+        )
+        .unwrap();
+        assert!(output.success);
+        assert_eq!(output.stdout, "ok");
+
+        fs::remove_file(pid_path).ok();
+        fs::remove_file(descendant_pid_path).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_command_timeout_terminates_process_group_and_reaps_hung_git() {
+        let _guard = lock_fake_git_test();
+        let pid_path = temp_state_path("fake-git-hung.pid");
+        let child_pid_path = temp_state_path("fake-git-hung-child.pid");
+        let fake_git = write_fake_git(
+            r#"printf '%s' "$$" > "$4"
+(
+  printf '%s' "$$" > "$5"
+  while :; do :; done
+) &
+while [ ! -s "$5" ]; do :; done
+while :; do :; done"#,
+        );
+        let started_at = std::time::Instant::now();
+
+        let error = run_git_command_with_limits(
+            &fake_git,
+            Path::new("."),
+            &[
+                "hang",
+                pid_path.to_str().unwrap(),
+                child_pid_path.to_str().unwrap(),
+            ],
+            GitCommandLimits {
+                timeout: std::time::Duration::from_millis(100),
+                stdout_max_bytes: 1024,
+                stderr_max_bytes: 1024,
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started_at.elapsed() < std::time::Duration::from_secs(2));
+        assert!(!fs::read_to_string(&child_pid_path).unwrap().is_empty());
+        let pid = fs::read_to_string(&pid_path)
+            .unwrap()
+            .parse::<libc::pid_t>()
+            .unwrap();
+        // kill(pid, 0) 不发送信号，只用于确认超时路径已经 wait 回收直系子进程。
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+
+        fs::remove_file(pid_path).ok();
+        fs::remove_file(child_pid_path).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_command_disables_terminal_prompts() {
+        let _guard = lock_fake_git_test();
+        let fake_git = write_fake_git(r#"printf '%s' "${GIT_TERMINAL_PROMPT-unset}""#);
+
+        let output = run_git_command_with_limits(
+            &fake_git,
+            Path::new("."),
+            &["show-prompt-setting"],
+            GitCommandLimits {
+                timeout: std::time::Duration::from_secs(1),
+                stdout_max_bytes: 1024,
+                stderr_max_bytes: 1024,
+            },
+        )
+        .unwrap();
+
+        assert!(output.success);
+        assert_eq!(output.stdout, "0");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_command_bounds_and_drains_stdout_and_stderr() {
+        let _guard = lock_fake_git_test();
+        let fake_git = write_fake_git(
+            r#"dd if=/dev/zero bs=131072 count=1 2>/dev/null
+dd if=/dev/zero bs=131072 count=1 1>&2 2>/dev/null"#,
+        );
+
+        let output = run_git_command_with_limits(
+            &fake_git,
+            Path::new("."),
+            &["large-output"],
+            GitCommandLimits {
+                timeout: std::time::Duration::from_secs(2),
+                stdout_max_bytes: 1024,
+                stderr_max_bytes: 2048,
+            },
+        )
+        .unwrap();
+
+        assert!(output.success);
+        assert_eq!(output.stdout.len(), 1024);
+        assert_eq!(output.stderr.len(), 2048);
+        assert!(output.stdout_truncated);
+        assert!(output.stderr_truncated);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_command_preserves_nonzero_exit_as_result() {
+        let _guard = lock_fake_git_test();
+        let fake_git = write_fake_git("printf 'expected failure' >&2\nexit 23");
+
+        let output = run_git_command_with_limits(
+            &fake_git,
+            Path::new("."),
+            &["fail"],
+            GitCommandLimits {
+                timeout: std::time::Duration::from_secs(1),
+                stdout_max_bytes: 1024,
+                stderr_max_bytes: 1024,
+            },
+        )
+        .unwrap();
+
+        assert!(!output.success);
+        assert_eq!(output.stderr, "expected failure");
+        assert!(!output.stdout_truncated);
+        assert!(!output.stderr_truncated);
+    }
+
+    #[test]
+    fn current_git_repository_root_distinguishes_absence_from_failure() {
+        let base = temp_state_path("git-root-semantics-base");
+        let root = base.join("project");
+        let outside = base.join("outside");
+        let missing = base.join("missing");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        run_test_git(&root, &["init", "-b", "main"]);
+
+        assert_eq!(
+            current_git_repository_root(&root).unwrap(),
+            Some(root.canonicalize().unwrap())
+        );
+        assert_eq!(current_git_repository_root(&outside).unwrap(), None);
+        assert_eq!(
+            current_git_repository_root(&missing),
+            Err(GitSnapshotError::Command)
+        );
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn session_git_snapshot_preserves_unborn_and_detached_refs() {
+        let base = temp_state_path("git-snapshot-ref-semantics-base");
+        let root = base.join("project");
+        fs::create_dir_all(&root).unwrap();
+        run_test_git(&root, &["init", "-b", "main"]);
+
+        let unborn =
+            read_session_git_snapshot(SessionId::new(), &root, absolute_path_string(&root), &[]);
+        assert_eq!(unborn.error, None);
+        assert_eq!(unborn.worktrees.len(), 1);
+        assert_eq!(unborn.worktrees[0].branch.as_deref(), Some("main"));
+        assert_eq!(unborn.worktrees[0].head, None);
+
+        run_test_git(&root, &["config", "user.email", "test@example.com"]);
+        run_test_git(&root, &["config", "user.name", "Termd Test"]);
+        fs::write(root.join("README.md"), b"initial\n").unwrap();
+        run_test_git(&root, &["add", "README.md"]);
+        run_test_git(&root, &["commit", "-m", "initial"]);
+        run_test_git(&root, &["checkout", "--detach"]);
+
+        let detached =
+            read_session_git_snapshot(SessionId::new(), &root, absolute_path_string(&root), &[]);
+        assert_eq!(detached.error, None);
+        assert_eq!(detached.worktrees.len(), 1);
+        assert_eq!(detached.worktrees[0].branch, None);
+        assert!(detached.worktrees[0].head.is_some());
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn session_git_snapshot_preserves_non_repository_semantics() {
+        let root = temp_state_path("git-snapshot-non-repository");
+        fs::create_dir_all(&root).unwrap();
+
+        let snapshot =
+            read_session_git_snapshot(SessionId::new(), &root, absolute_path_string(&root), &[]);
+
+        assert!(snapshot.repository_root.is_none());
+        assert!(snapshot.worktrees.is_empty());
+        assert!(snapshot.error.is_some());
+        fs::remove_dir_all(root).ok();
+    }
 
     #[test]
     fn terminal_output_batch_allows_megabyte_scale_aggregation() {
@@ -8893,7 +10292,6 @@ mod tests {
         reconnect_sizes: Vec<PtySize>,
         read_error: Option<String>,
         reconnect_error: Option<String>,
-        terminate_error: Option<String>,
         terminate_count: usize,
     }
 
@@ -9017,10 +10415,6 @@ mod tests {
         fn allow_reconnects(&self) {
             self.state.lock().unwrap().reconnect_error = None;
         }
-
-        fn fail_terminate(&self, message: impl Into<String>) {
-            self.state.lock().unwrap().terminate_error = Some(message.into());
-        }
     }
 
     impl PtyBackend for FakePtyBackend {
@@ -9067,6 +10461,37 @@ mod tests {
                 session_id: Some(session_id.to_owned()),
                 restore_info: Some(restore_info.clone()),
             }))
+        }
+
+        fn reconcile_owned_cleanup(
+            &self,
+            _session_id: &str,
+            _restore_info: &PtyRestoreInfo,
+            _capability: &[u8],
+            _operation_id: u64,
+        ) -> PtyResult<bool> {
+            let mut state = self.state.lock().unwrap();
+            state.terminate_count += 1;
+            Ok(true)
+        }
+
+        fn install_legacy_cleanup_capability(
+            &self,
+            _session_id: &str,
+            _restore_info: &PtyRestoreInfo,
+            _capability: &[u8],
+        ) -> PtyResult<bool> {
+            Ok(true)
+        }
+
+        fn reconcile_legacy_owned_cleanup(
+            &self,
+            _session_id: &str,
+            _restore_info: &PtyRestoreInfo,
+        ) -> PtyResult<bool> {
+            let mut state = self.state.lock().unwrap();
+            state.terminate_count += 1;
+            Ok(true)
         }
 
         fn attach_client(
@@ -9345,16 +10770,27 @@ mod tests {
         }
 
         fn terminate(&mut self) -> PtyResult<()> {
-            let mut state = self.state.lock().unwrap();
-            state.terminate_count += 1;
-            if let Some(message) = state.terminate_error.clone() {
-                return Err(PtyError::Backend(message));
+            if let Some(PtyRestoreInfo::UnixSocket {
+                socket_path,
+                supervisor_pid,
+                ..
+            }) = self.restore_info.as_ref()
+            {
+                self.restore_info = Some(PtyRestoreInfo::UnixSocket {
+                    socket_path: socket_path.clone(),
+                    supervisor_pid: *supervisor_pid,
+                    supervisor_status: PtySupervisorStatus::Closing,
+                });
+            }
+            {
+                let mut state = self.state.lock().unwrap();
+                state.terminate_count += 1;
             }
             Ok(())
         }
 
         fn try_wait(&mut self) -> PtyResult<Option<PtyExitStatus>> {
-            Ok(None)
+            Ok(Some(PtyExitStatus::exited(0)))
         }
 
         fn wait(&mut self) -> PtyResult<PtyExitStatus> {
@@ -9516,6 +10952,7 @@ mod tests {
             snapshot: crate::pty::supervisor::SupervisorSnapshotPayload {
                 size,
                 process_id: Some(7),
+                exited: false,
                 // 中文注释：fake backend 必须模拟生产 supervisor：terminal attach 的
                 // 屏幕内容只通过 frames 传输，不能同时塞进 legacy retained_output。
                 retained_output: Vec::new(),
@@ -9667,6 +11104,8 @@ mod tests {
             .arg("-C")
             .arg(cwd)
             .args(args)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdin(Stdio::null())
             .output()
             .unwrap_or_else(|error| panic!("failed to run git {args:?}: {error}"));
         assert!(
@@ -9682,6 +11121,8 @@ mod tests {
             .arg("-C")
             .arg(cwd)
             .args(args)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdin(Stdio::null())
             .output()
             .unwrap_or_else(|error| panic!("failed to run git {args:?}: {error}"));
         assert!(
@@ -10974,6 +12415,136 @@ mod tests {
             }
             other => panic!("expected binary attach frame payload, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn oversized_authenticated_attach_frame_errors_without_terminating_session() {
+        let (mut protocol, backend) = protocol();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let (_, mut device_session, _) =
+            open_binary_packet_e2ee(&mut protocol, &mut connection, device_id);
+        let token = protocol
+            .issue_pairing_token(current_unix_timestamp_millis())
+            .unwrap()
+            .token()
+            .clone();
+        let pair_responses = send_binary_packet(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            ProtocolPacket::request(
+                PacketRequestId::new(),
+                METHOD_PAIR_REQUEST,
+                serde_json::to_value(PairRequestPayload {
+                    device_id,
+                    device_public_key: test_device_public_key(),
+                    token,
+                    nonce: nonce(),
+                    timestamp_ms: current_unix_timestamp_millis(),
+                })
+                .unwrap(),
+            ),
+        );
+        let _ = decrypt_binary_packets(&mut device_session, pair_responses);
+
+        let stream_id = PacketStreamId::new();
+        let created_responses = send_binary_packet(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            ProtocolPacket::stream_open(
+                PacketRequestId::new(),
+                stream_id,
+                METHOD_TERMINAL_CREATE,
+                128 * 1024,
+                serde_json::to_value(SessionCreatePayload {
+                    command: vec!["sh".to_owned()],
+                    size: TerminalSize::new(24, 80),
+                })
+                .unwrap(),
+            ),
+        );
+        let created_packets = decrypt_binary_packets(&mut device_session, created_responses);
+        let created: SessionCreatedPayload =
+            decode_payload(created_packets[0].1.payload.clone()).unwrap();
+
+        let malformed = ProtocolPacket::stream_chunk(
+            stream_id,
+            1,
+            attach_frame_payload_value(AttachFramePayload {
+                session_id: created.session_id,
+                data_base64: general_purpose::STANDARD.encode(u32::MAX.to_le_bytes()),
+            })
+            .unwrap(),
+        );
+        let malformed_responses = send_binary_packet(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            malformed,
+        );
+        let malformed_responses = decrypt_binary_packets(&mut device_session, malformed_responses);
+
+        assert_eq!(malformed_responses.len(), 1);
+        assert_eq!(malformed_responses[0].1.kind, PacketKind::Error);
+        let error: PacketErrorPayload =
+            decode_payload(malformed_responses[0].1.payload.clone()).unwrap();
+        assert_eq!(error.code, "invalid_envelope");
+        assert_eq!(backend.terminate_count(), 0);
+
+        let attachment_writes_before_oversized = backend
+            .attachment_writes_for_session(created.session_id)
+            .len();
+        let oversized = ProtocolPacket::stream_chunk(
+            stream_id,
+            1,
+            attach_frame_payload_value(AttachFramePayload {
+                session_id: created.session_id,
+                data_base64: general_purpose::STANDARD.encode(vec![0_u8; 8 * 1024 * 1024 + 1]),
+            })
+            .unwrap(),
+        );
+        let oversized_responses = send_binary_packet(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            oversized,
+        );
+        let oversized_responses = decrypt_binary_packets(&mut device_session, oversized_responses);
+        assert_eq!(oversized_responses.len(), 1);
+        let oversized_error: PacketErrorPayload =
+            decode_payload(oversized_responses[0].1.payload.clone()).unwrap();
+        assert_eq!(oversized_error.code, "invalid_envelope");
+        assert_eq!(
+            backend
+                .attachment_writes_for_session(created.session_id)
+                .len(),
+            attachment_writes_before_oversized,
+            "oversized base64 attach input must be rejected before decode/backend dispatch"
+        );
+        assert_eq!(backend.terminate_count(), 0);
+
+        let valid_frame =
+            encode_supervisor_terminal_client_frame(&SupervisorTerminalClientFrame::Input {
+                data: b"after-malformed".to_vec(),
+            })
+            .unwrap();
+        let valid = ProtocolPacket::stream_chunk(
+            stream_id,
+            1,
+            attach_frame_payload_value(AttachFramePayload {
+                session_id: created.session_id,
+                data_base64: general_purpose::STANDARD.encode(valid_frame),
+            })
+            .unwrap(),
+        );
+        let valid_responses =
+            send_binary_packet(&mut protocol, &mut connection, &mut device_session, valid);
+
+        assert!(valid_responses.is_empty());
+        assert_eq!(backend.writes(), vec![b"after-malformed".to_vec()]);
+        assert_eq!(backend.terminate_count(), 0);
     }
 
     #[test]
@@ -14690,7 +16261,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_closes_stale_running_restore_records() {
+    fn startup_quarantines_stale_records_without_publishing_running_state() {
         let backend = FakePtyBackend::default();
         backend.fail_reconnects("stale supervisor socket");
         let state_path = temp_state_path("restore-stale-session.json");
@@ -14798,13 +16369,15 @@ mod tests {
             "启动时已判定不可恢复的 session 不应在后续 list 中复活"
         );
 
-        let reloaded_state = StateStore::load(&config.state_path).unwrap();
-        assert!(
-            reloaded_state.sessions.iter().all(|session| {
-                session.state == SessionState::Closed || session.restore_info.is_none()
-            }),
-            "持久状态不能继续保存 running + restore_info 的死 supervisor"
-        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !StateStore::load(&config.state_path)
+            .unwrap()
+            .sessions
+            .is_empty()
+        {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]
@@ -15112,9 +16685,17 @@ mod tests {
         assert!(protocol.snapshot_state().sessions.is_empty());
 
         let reloaded_state = StateStore::load(&config.state_path).unwrap();
-        assert_eq!(reloaded_state.sessions.len(), 1);
-        assert_eq!(reloaded_state.sessions[0].state, SessionState::Closed);
-        assert!(reloaded_state.sessions[0].restore_info.is_none());
+        assert!(reloaded_state.sessions.is_empty());
+        let sqlite_path = crate::state::sqlite_state_path_for_state_path(&config.state_path);
+        let ownership_phase: String = rusqlite::Connection::open(sqlite_path)
+            .unwrap()
+            .query_row(
+                "SELECT phase FROM session_ownership WHERE session_id = ?1",
+                [created_session_id.0.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ownership_phase, "quarantined");
         assert!(backend.reconnects().is_empty());
     }
 
@@ -16293,6 +17874,120 @@ mod tests {
     }
 
     #[test]
+    fn session_git_returns_generic_error_when_status_output_is_truncated() {
+        let base = temp_state_path("git-status-truncated-base");
+        let root = base.join("secret-status-project");
+        fs::create_dir_all(&root).unwrap();
+        run_test_git(&root, &["init", "-b", "main"]);
+        run_test_git(&root, &["config", "user.email", "test@example.com"]);
+        run_test_git(&root, &["config", "user.name", "Termd Test"]);
+        fs::write(root.join("README.md"), b"initial\n").unwrap();
+        run_test_git(&root, &["add", "README.md"]);
+        run_test_git(&root, &["commit", "-m", "initial"]);
+
+        let secret_file_fragment = "secret-file-fragment";
+        let long_tail = "x".repeat(200);
+        for index in 0..4_700 {
+            fs::File::create(root.join(format!(
+                "untracked-{index:04}-{secret_file_fragment}-{long_tail}.txt"
+            )))
+            .unwrap();
+        }
+
+        let backend = FakePtyBackend::default();
+        let mut config =
+            DaemonConfig::default_for_state_path(temp_state_path("git-truncated-state.json"));
+        config.default_command = vec!["sh".to_owned()];
+        config.default_working_directory = Some(root.clone());
+        let mut protocol =
+            DaemonProtocol::new(config, backend.clone(), Ed25519SignatureVerifier).unwrap();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = PublicKey(wire(signing_key.verifying_key().as_bytes()));
+        let (_, mut device_session) = open_e2ee(&mut protocol, &mut connection, device_id);
+        pair_device(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            device_id,
+            public_key,
+        );
+        let session_id = create_test_session(&mut protocol, &mut connection, &mut device_session);
+        backend.set_cwd_for_session(session_id, root.clone());
+
+        let payload = protocol.session_git_result(session_id).unwrap();
+        let error = payload.error.as_deref().expect("truncation must surface");
+
+        assert_eq!(error, "git output exceeded internal limit");
+        assert!(payload.repository_root.is_none());
+        assert!(payload.worktrees.is_empty());
+        assert!(payload.graph.is_empty());
+        assert!(!error.contains(root.to_string_lossy().as_ref()));
+        assert!(!error.contains(secret_file_fragment));
+
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn session_git_snapshot_helpers_do_not_mask_git_command_failures_as_clean() {
+        let missing = temp_state_path("git-helper-missing-worktree");
+
+        assert!(read_git_worktrees(&missing).is_err());
+        assert!(read_git_worktree_changes(&missing, &[]).is_err());
+    }
+
+    #[test]
+    fn active_upload_alias_guard_fails_closed_when_git_status_errors() {
+        let base = temp_state_path("git-active-upload-guard-error-base");
+        let worktree = base.join("not-a-git-worktree");
+        fs::create_dir_all(&worktree).unwrap();
+        let target = worktree.join("upload.bin");
+        fs::write(&target, b"reserved").unwrap();
+        let metadata = fs::metadata(&target).unwrap();
+        let active_targets = vec![ActiveSessionFileHttpUploadTarget {
+            target,
+            file_identity: SessionFileHttpUploadFileIdentity::from_metadata(&metadata),
+        }];
+
+        let result = git_scope_contains_active_session_file_http_upload_alias(
+            &worktree,
+            None,
+            &active_targets,
+        );
+
+        assert!(matches!(result, Err(ProtocolError::RuntimeFailed)));
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn read_git_graph_marks_truncated_output() {
+        let base = temp_state_path("git-graph-truncated-base");
+        let root = base.join("project");
+        fs::create_dir_all(&root).unwrap();
+        run_test_git(&root, &["init", "-b", "main"]);
+        run_test_git(&root, &["config", "user.email", "test@example.com"]);
+        run_test_git(&root, &["config", "user.name", "Termd Test"]);
+        let long_subject_tail = "x".repeat(48 * 1024);
+        for index in 0..26 {
+            fs::write(root.join("README.md"), format!("commit {index}\n")).unwrap();
+            run_test_git(&root, &["add", "README.md"]);
+            let message = format!("graph-truncation-{index}-{long_subject_tail}");
+            run_test_git(&root, &["commit", "-m", &message]);
+        }
+
+        let graph = read_git_graph(&root).unwrap();
+
+        assert!(
+            graph
+                .iter()
+                .any(|line| line == "* [termd: git graph output truncated]"),
+            "graph truncation must be explicit instead of returning a silent partial graph"
+        );
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
     fn session_git_hides_active_http_upload_targets_and_rejects_actions() {
         let base = temp_state_path("git-active-upload-base");
         let root = base.join("project");
@@ -16345,13 +18040,17 @@ mod tests {
             offset_bytes: 0,
         };
         let target = root.join("partial.bin");
-        assert!(target.exists(), "init 必须先预分配最终目标文件");
-        fs::hard_link(&target, root.join("hardlink.bin")).unwrap();
+        let temp_path = protocol.session_file_http_uploads[&ready.upload_id]
+            .temp_path
+            .clone();
+        assert!(!target.exists(), "init 不能发布最终目标文件");
+        fs::hard_link(&temp_path, root.join("hardlink.bin")).unwrap();
         fs::create_dir_all(root.join("aliases")).unwrap();
-        fs::hard_link(&target, root.join("aliases").join("hardlink.bin")).unwrap();
+        fs::hard_link(&temp_path, root.join("aliases").join("hardlink.bin")).unwrap();
         #[cfg(unix)]
         {
-            std::os::unix::fs::symlink("partial.bin", root.join("alias.bin")).unwrap();
+            std::os::unix::fs::symlink(temp_path.file_name().unwrap(), root.join("alias.bin"))
+                .unwrap();
         }
 
         let root_files = protocol
@@ -16363,7 +18062,8 @@ mod tests {
                 .iter()
                 .all(|entry| entry.name != "partial.bin"
                     && entry.name != "hardlink.bin"
-                    && entry.name != "alias.bin"),
+                    && entry.name != "alias.bin"
+                    && entry.name != temp_path.file_name().unwrap().to_string_lossy()),
             "文件列表不应暴露 active HTTP upload 目标及其 alias"
         );
         let alias_files = protocol
@@ -16401,7 +18101,7 @@ mod tests {
             &connection,
             SessionFileReadPayload {
                 session_id: other_session_id,
-                path: "partial.bin".to_owned(),
+                path: temp_path.file_name().unwrap().to_string_lossy().to_string(),
                 max_bytes: Some(8),
             },
         );
@@ -16436,7 +18136,7 @@ mod tests {
         );
         assert!(matches!(discard, Err(ProtocolError::InvalidState)));
         assert!(
-            target.exists(),
+            temp_path.exists(),
             "Git discard 不能删除 active HTTP upload 目标"
         );
 
@@ -16564,8 +18264,8 @@ mod tests {
             Err(ProtocolError::InvalidState)
         ));
         assert!(
-            nested_target.exists(),
-            "Git 目录级 discard 不能删除目录内的 active HTTP upload 目标"
+            !nested_target.exists(),
+            "Git 目录级 discard 不能意外发布 active HTTP upload 目标"
         );
         let nested_dir_diff = protocol.read_session_git_diff(
             &connection,
@@ -16598,7 +18298,7 @@ mod tests {
                 max_bytes: Some(8),
             },
         );
-        assert!(matches!(read, Err(ProtocolError::InvalidState)));
+        assert!(read.is_err(), "未发布最终路径不能被读取");
 
         let write = protocol.write_session_file(
             &connection,
@@ -16622,7 +18322,7 @@ mod tests {
 
         OpenOptions::new()
             .write(true)
-            .open(&target)
+            .open(&temp_path)
             .unwrap()
             .set_len(16)
             .unwrap();
@@ -16661,7 +18361,7 @@ mod tests {
         );
         assert!(matches!(delete, Err(ProtocolError::InvalidState)));
         assert!(
-            target.exists(),
+            temp_path.exists(),
             "普通 file RPC 不能删除 active HTTP upload 目标"
         );
 
@@ -16673,7 +18373,7 @@ mod tests {
                 offset_bytes: 0,
             },
         );
-        assert!(matches!(http_download, Err(ProtocolError::InvalidState)));
+        assert!(http_download.is_err());
 
         let stream_download = protocol.prepare_session_file_download_stream(
             &connection,
@@ -16682,7 +18382,7 @@ mod tests {
                 path: "partial.bin".to_owned(),
             },
         );
-        assert!(matches!(stream_download, Err(ProtocolError::InvalidState)));
+        assert!(stream_download.is_err());
 
         let token_download = protocol.prepare_session_file_download(
             &connection,
@@ -16691,7 +18391,7 @@ mod tests {
                 path: "partial.bin".to_owned(),
             },
         );
-        assert!(matches!(token_download, Err(ProtocolError::InvalidState)));
+        assert!(token_download.is_err());
 
         let chunk_download = protocol.read_session_file_download_chunk(
             &connection,
@@ -16702,7 +18402,7 @@ mod tests {
                 max_bytes: 8,
             },
         );
-        assert!(matches!(chunk_download, Err(ProtocolError::InvalidState)));
+        assert!(chunk_download.is_err());
 
         let legacy_prepare = protocol.prepare_session_file_upload_stream(
             &connection,
@@ -17858,8 +19558,7 @@ mod tests {
     }
 
     fn http_upload_temp_names(parent: &Path) -> Vec<String> {
-        // 中文注释：HTTP upload 新模型必须直接 patch 目标文件；测试用这个 helper
-        // 拦住旧的 .chunk/.part 临时文件路径回流。
+        // 中文注释：HTTP upload 在最终发布前只能存在同目录隐藏临时对象。
         let mut names: Vec<String> = fs::read_dir(parent)
             .unwrap()
             .filter_map(Result::ok)
@@ -17974,15 +19673,14 @@ mod tests {
             offset_bytes: 0,
         };
         let target = root.join("partial.bin");
-        assert!(target.exists(), "init 必须直接创建最终目标文件");
+        assert!(!target.exists(), "init 后最终文件名不能对 shell 可见");
+        let temp_names = http_upload_temp_names(&root);
+        assert_eq!(temp_names.len(), 1, "init 应只创建一个同目录隐藏临时对象");
+        assert!(temp_names[0].starts_with('.'));
         assert_eq!(
-            fs::metadata(&target).unwrap().len(),
+            fs::metadata(root.join(&temp_names[0])).unwrap().len(),
             8,
-            "init 必须把最终目标文件长度设置为声明大小"
-        );
-        assert!(
-            http_upload_temp_names(&root).is_empty(),
-            "HTTP upload 不应再产生临时分片文件"
+            "隐藏临时对象必须按声明大小预分配"
         );
         let active_files = protocol
             .session_files_result(
@@ -17998,6 +19696,13 @@ mod tests {
                 .all(|entry| entry.name != "partial.bin"),
             "active HTTP upload 目标文件在 commit 前不应出现在文件列表里"
         );
+        assert!(
+            active_files
+                .entries
+                .iter()
+                .all(|entry| !entry.name.contains(".termd-http-upload-")),
+            "隐藏临时对象也不能通过文件 API 枚举"
+        );
 
         protocol
             .write_session_file_http_upload(
@@ -18007,11 +19712,8 @@ mod tests {
                 vec![b"part".to_vec()],
             )
             .unwrap();
-        assert_eq!(&fs::read(&target).unwrap()[..4], b"part");
-        assert!(
-            http_upload_temp_names(&root).is_empty(),
-            "分片写入也只能 patch 目标文件，不能创建临时文件"
-        );
+        assert!(!target.exists(), "分片写入后最终文件名仍不能可见");
+        assert_eq!(&fs::read(root.join(&temp_names[0])).unwrap()[..4], b"part");
         let partial_files = protocol
             .session_files_result(
                 created_payload.session_id,
@@ -18101,12 +19803,11 @@ mod tests {
             offset_bytes: 5,
         };
         let target = root.join("joined.bin");
-        assert!(target.exists(), "init 后目标文件应立即存在");
-        assert_eq!(fs::metadata(&target).unwrap().len(), 10);
-        assert!(
-            http_upload_temp_names(&root).is_empty(),
-            "init 不应生成 .part/.chunk"
-        );
+        let temp_path = protocol.session_file_http_uploads[&ready.upload_id]
+            .temp_path
+            .clone();
+        assert!(!target.exists());
+        assert_eq!(fs::metadata(&temp_path).unwrap().len(), 10);
 
         let progress = protocol
             .write_session_file_http_upload(
@@ -18118,11 +19819,7 @@ mod tests {
             .unwrap();
         assert_eq!(progress.offset_bytes, 5);
         assert!(!progress.eof);
-        assert_eq!(&fs::read(&target).unwrap()[5..], b"world");
-        assert!(
-            http_upload_temp_names(&root).is_empty(),
-            "乱序分片也不应落临时文件"
-        );
+        assert_eq!(&fs::read(&temp_path).unwrap()[5..], b"world");
 
         let first_half = SessionFileHttpUploadStreamPayload {
             session_id: created_payload.session_id,
@@ -18405,10 +20102,10 @@ mod tests {
 
         assert_eq!(retry.offset_bytes, 5);
         assert!(!retry.eof);
-        assert_eq!(
-            &fs::read(root.join("adjacent-retry.bin")).unwrap()[..5],
-            b"hello"
-        );
+        let temp_path = protocol.session_file_http_uploads[&ready.upload_id]
+            .temp_path
+            .clone();
+        assert_eq!(&fs::read(temp_path).unwrap()[..5], b"hello");
         fs::remove_dir_all(base).ok();
     }
 
@@ -18490,10 +20187,10 @@ mod tests {
             overwrite.is_err(),
             "未完成上传的已写区间不能被不同内容的旧请求覆盖"
         );
-        assert_eq!(
-            &fs::read(root.join("partial-duplicate.bin")).unwrap()[..5],
-            b"hello"
-        );
+        let temp_path = protocol.session_file_http_uploads[&ready.upload_id]
+            .temp_path
+            .clone();
+        assert_eq!(&fs::read(temp_path).unwrap()[..5], b"hello");
         fs::remove_dir_all(base).ok();
     }
 
@@ -18653,7 +20350,7 @@ mod tests {
         config.default_command = vec!["sh".to_owned()];
         config.default_working_directory = Some(root.clone());
         let target = root.join("stale-after-restart.bin");
-        let upload_id = {
+        let (upload_id, temp_path) = {
             let mut protocol =
                 DaemonProtocol::new(config, backend.clone(), Ed25519SignatureVerifier).unwrap();
             let (mut connection, _) = protocol.start_connection();
@@ -18681,17 +20378,17 @@ mod tests {
                     device_id,
                 )
                 .unwrap();
-            assert!(target.exists());
-            assert_eq!(StateStore::list_http_uploads(&state_path).unwrap().len(), 1);
-            ready.upload_id
+            let records = StateStore::list_http_uploads(&state_path).unwrap();
+            assert!(!target.exists());
+            assert_eq!(records.len(), 1);
+            assert!(records[0].target_path.exists());
+            (ready.upload_id, records[0].target_path.clone())
         };
 
         cleanup_persisted_session_file_http_uploads(&state_path).unwrap();
 
-        assert!(
-            !target.exists(),
-            "daemon 重启后 recovery record 仍存在，说明 upload 未 commit，必须删除预分配目标"
-        );
+        assert!(!target.exists(), "startup cleanup 不能发布未完成目标");
+        assert!(!temp_path.exists(), "matching-owned temp 必须被清理");
         assert!(
             StateStore::list_http_uploads(&state_path)
                 .unwrap()
@@ -18700,6 +20397,346 @@ mod tests {
         );
         fs::remove_dir_all(base).ok();
         fs::remove_file(state_path.with_extension("sqlite")).ok();
+    }
+
+    #[test]
+    fn session_file_http_upload_startup_quarantines_intent_before_temp_create() {
+        let base = temp_state_path("http-upload-intent-only-base");
+        let state_path = temp_state_path("http-upload-intent-only-state.json");
+        fs::create_dir_all(&base).unwrap();
+        let upload_id = session_file_http_upload_id();
+        let temp_path = base.join(format!(".file.termd-http-upload-{upload_id}.part"));
+        StateStore::record_http_upload(
+            &state_path,
+            &HttpUploadRecoveryRecord {
+                upload_id: upload_id.clone(),
+                target_path: temp_path.clone(),
+                size_bytes: 8,
+                dev: 0,
+                ino: 0,
+                updated_at_ms: current_unix_timestamp_millis(),
+            },
+        )
+        .unwrap();
+
+        cleanup_persisted_session_file_http_uploads(&state_path).unwrap();
+
+        assert!(!temp_path.exists());
+        assert!(
+            StateStore::list_http_uploads(&state_path)
+                .unwrap()
+                .into_iter()
+                .any(|record| record.upload_id == upload_id),
+            "identity 尚未持久化的 intent 必须 quarantine"
+        );
+        fs::remove_dir_all(base).ok();
+        fs::remove_file(state_path.with_extension("sqlite")).ok();
+    }
+
+    #[test]
+    fn session_file_http_upload_startup_quarantines_after_atomic_publish() {
+        let base = temp_state_path("http-upload-renamed-crash-base");
+        let state_path = temp_state_path("http-upload-renamed-crash-state.json");
+        fs::create_dir_all(&base).unwrap();
+        let upload_id = session_file_http_upload_id();
+        let target = base.join("published.bin");
+        let temp_path = session_file_http_upload_temp_path(&target, &upload_id).unwrap();
+        let (mut file, identity) = create_session_file_http_upload_target(&temp_path, 4).unwrap();
+        file.write_all(b"done").unwrap();
+        file.sync_all().unwrap();
+        StateStore::record_http_upload(
+            &state_path,
+            &HttpUploadRecoveryRecord {
+                upload_id: upload_id.clone(),
+                target_path: temp_path.clone(),
+                size_bytes: 4,
+                dev: identity.dev(),
+                ino: identity.ino(),
+                updated_at_ms: current_unix_timestamp_millis(),
+            },
+        )
+        .unwrap();
+        publish_session_file_http_upload_noreplace(&temp_path, &target).unwrap();
+
+        cleanup_persisted_session_file_http_uploads(&state_path).unwrap();
+
+        assert_eq!(fs::read(&target).unwrap(), b"done");
+        assert!(
+            StateStore::list_http_uploads(&state_path)
+                .unwrap()
+                .into_iter()
+                .any(|record| record.upload_id == upload_id),
+            "rename 后 response/finalization 丢失时不能误删已发布目标"
+        );
+        fs::remove_dir_all(base).ok();
+        fs::remove_file(state_path.with_extension("sqlite")).ok();
+    }
+
+    #[test]
+    #[ignore = "spawned only by session_file_http_upload_sigkill_crash_matrix"]
+    #[cfg(target_os = "linux")]
+    fn session_file_http_upload_sigkill_crash_child() {
+        let fixture = PathBuf::from(std::env::var_os("TERMD_TEST_HTTP_UPLOAD_FIXTURE").unwrap());
+        let state_path = fixture.join("daemon-state.json");
+        let root = fixture.join("project");
+        fs::create_dir_all(&root).unwrap();
+        let backend = FakePtyBackend::default();
+        let mut config = DaemonConfig::default_for_state_path(&state_path);
+        config.default_command = vec!["sh".to_owned()];
+        config.default_working_directory = Some(root);
+        let mut protocol = DaemonProtocol::new(config, backend, Ed25519SignatureVerifier).unwrap();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = PublicKey(wire(signing_key.verifying_key().as_bytes()));
+        let (_, mut device_session) = open_e2ee(&mut protocol, &mut connection, device_id);
+        pair_device(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            device_id,
+            public_key,
+        );
+        let session_id = create_test_session(&mut protocol, &mut connection, &mut device_session);
+        let ready = protocol
+            .prepare_session_file_http_upload(
+                &connection,
+                SessionFileUploadPayload {
+                    session_id,
+                    path: "crash.bin".to_owned(),
+                    size_bytes: 4,
+                },
+                device_id,
+            )
+            .unwrap();
+        protocol
+            .write_session_file_http_upload(
+                &connection,
+                SessionFileHttpUploadStreamPayload {
+                    session_id,
+                    path: ready.path,
+                    upload_id: ready.upload_id,
+                    size_bytes: 4,
+                    offset_bytes: 0,
+                },
+                device_id,
+                vec![b"done".to_vec()],
+            )
+            .unwrap();
+    }
+
+    #[derive(Clone, Copy)]
+    #[cfg(target_os = "linux")]
+    struct HttpUploadCrashCase {
+        point: &'static str,
+        final_visible: bool,
+        recovery_record_remains: bool,
+        temp_remains: bool,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    #[cfg(target_os = "linux")]
+    enum HttpUploadCrashMutation {
+        None,
+        CompetingTarget,
+        ReplaceTemp,
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn session_file_http_upload_sigkill_crash_matrix() {
+        let cases = [
+            HttpUploadCrashCase {
+                point: "after_intent",
+                final_visible: false,
+                recovery_record_remains: true,
+                temp_remains: false,
+            },
+            HttpUploadCrashCase {
+                point: "after_temp_create",
+                final_visible: false,
+                recovery_record_remains: true,
+                temp_remains: true,
+            },
+            HttpUploadCrashCase {
+                point: "after_temp_identity",
+                final_visible: false,
+                recovery_record_remains: false,
+                temp_remains: false,
+            },
+            HttpUploadCrashCase {
+                point: "after_write",
+                final_visible: false,
+                recovery_record_remains: false,
+                temp_remains: false,
+            },
+            HttpUploadCrashCase {
+                point: "after_file_sync",
+                final_visible: false,
+                recovery_record_remains: false,
+                temp_remains: false,
+            },
+            HttpUploadCrashCase {
+                point: "after_rename",
+                final_visible: true,
+                recovery_record_remains: true,
+                temp_remains: false,
+            },
+            HttpUploadCrashCase {
+                point: "after_dir_sync",
+                final_visible: true,
+                recovery_record_remains: true,
+                temp_remains: false,
+            },
+            HttpUploadCrashCase {
+                point: "after_finalize",
+                final_visible: true,
+                recovery_record_remains: false,
+                temp_remains: false,
+            },
+        ];
+
+        for case in cases {
+            run_http_upload_crash_case(case, HttpUploadCrashMutation::None);
+        }
+        run_http_upload_crash_case(
+            HttpUploadCrashCase {
+                point: "after_file_sync",
+                final_visible: false,
+                recovery_record_remains: false,
+                temp_remains: false,
+            },
+            HttpUploadCrashMutation::CompetingTarget,
+        );
+        run_http_upload_crash_case(
+            HttpUploadCrashCase {
+                point: "after_temp_identity",
+                final_visible: false,
+                recovery_record_remains: false,
+                temp_remains: false,
+            },
+            HttpUploadCrashMutation::ReplaceTemp,
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn run_http_upload_crash_case(case: HttpUploadCrashCase, mutation: HttpUploadCrashMutation) {
+        let fixture = temp_state_path(&format!(
+            "http-upload-crash-{}-{}",
+            case.point,
+            match mutation {
+                HttpUploadCrashMutation::None => "normal",
+                HttpUploadCrashMutation::CompetingTarget => "competing",
+                HttpUploadCrashMutation::ReplaceTemp => "replaced-temp",
+            }
+        ));
+        let checkpoint_dir = fixture.join("checkpoints");
+        let root = fixture.join("project");
+        let state_path = fixture.join("daemon-state.json");
+        let target = root.join("crash.bin");
+        fs::create_dir_all(&checkpoint_dir).unwrap();
+        let marker = checkpoint_dir.join(format!("{}.reached", case.point));
+        let mut child = ProcessCommand::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "net::protocol::tests::session_file_http_upload_sigkill_crash_child",
+                "--nocapture",
+            ])
+            .env("TERMD_TEST_HTTP_UPLOAD_FIXTURE", &fixture)
+            .env("TERMD_TEST_HTTP_UPLOAD_CHECKPOINT_DIR", &checkpoint_dir)
+            .env("TERMD_TEST_HTTP_UPLOAD_CHECKPOINT", case.point)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !marker.exists() {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "upload crash child exited before checkpoint {}",
+                case.point
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "upload checkpoint {} timed out",
+                case.point
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(
+            target.exists(),
+            case.final_visible,
+            "final filename visibility at checkpoint {}",
+            case.point
+        );
+        let records = StateStore::list_http_uploads(&state_path).unwrap();
+        let temp_path = records.first().map(|record| record.target_path.clone());
+        if !case.final_visible {
+            assert!(
+                !target.exists(),
+                "final filename must stay hidden before publish at {}",
+                case.point
+            );
+        }
+        match mutation {
+            HttpUploadCrashMutation::None => {}
+            HttpUploadCrashMutation::CompetingTarget => {
+                fs::write(&target, b"competitor").unwrap();
+            }
+            HttpUploadCrashMutation::ReplaceTemp => {
+                let temp_path = temp_path
+                    .as_ref()
+                    .expect("identity checkpoint must have a recovery temp path");
+                fs::remove_file(temp_path).unwrap();
+                fs::write(temp_path, b"replacement").unwrap();
+            }
+        }
+
+        unsafe {
+            libc::kill(child.id() as libc::pid_t, libc::SIGKILL);
+        }
+        assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGKILL));
+
+        let mut restart_config = DaemonConfig::default_for_state_path(&state_path);
+        restart_config.default_working_directory = Some(root.clone());
+        let restarted = crate::net::server::try_default_protocol(restart_config)
+            .expect("upload recovery must not prevent daemon startup");
+        drop(restarted);
+
+        match mutation {
+            HttpUploadCrashMutation::CompetingTarget => {
+                assert_eq!(fs::read(&target).unwrap(), b"competitor");
+            }
+            HttpUploadCrashMutation::ReplaceTemp => {
+                assert!(!target.exists());
+                assert_eq!(
+                    fs::read(temp_path.as_ref().unwrap()).unwrap(),
+                    b"replacement"
+                );
+            }
+            HttpUploadCrashMutation::None if case.final_visible => {
+                assert_eq!(fs::read(&target).unwrap(), b"done");
+            }
+            HttpUploadCrashMutation::None => assert!(!target.exists()),
+        }
+        let records_after = StateStore::list_http_uploads(&state_path).unwrap();
+        assert_eq!(
+            !records_after.is_empty(),
+            case.recovery_record_remains || mutation == HttpUploadCrashMutation::ReplaceTemp,
+            "recovery quarantine state after {}",
+            case.point
+        );
+        if let Some(temp_path) = temp_path {
+            assert_eq!(
+                temp_path.exists(),
+                case.temp_remains || mutation == HttpUploadCrashMutation::ReplaceTemp,
+                "temp recovery result after {}",
+                case.point
+            );
+        }
+        fs::remove_dir_all(fixture).ok();
     }
 
     #[cfg(unix)]
@@ -18759,8 +20796,8 @@ mod tests {
         let cleanup = cleanup_persisted_session_file_http_uploads(&state_path);
 
         assert!(
-            cleanup.is_err(),
-            "启动 recovery 没有 open file handle，same inode 但长度变化必须安全失败"
+            cleanup.is_ok(),
+            "模糊对象必须 quarantine，但不能阻止 daemon 启动"
         );
         assert!(target.exists());
         assert!(
@@ -18803,8 +20840,8 @@ mod tests {
         let cleanup = cleanup_persisted_session_file_http_uploads(&state_path);
 
         assert!(
-            cleanup.is_err(),
-            "启动 recovery 没有 open file handle，target missing 也必须安全失败"
+            cleanup.is_ok(),
+            "缺失对象必须 quarantine，但不能阻止 daemon 启动"
         );
         assert!(alias.exists());
         assert!(
@@ -18888,7 +20925,7 @@ mod tests {
         config.default_command = vec!["sh".to_owned()];
         config.default_working_directory = Some(root.clone());
         let target = root.join("startup-replacement.bin");
-        let upload_id = {
+        let (upload_id, temp_path) = {
             let mut protocol =
                 DaemonProtocol::new(config, backend.clone(), Ed25519SignatureVerifier).unwrap();
             let (mut connection, _) = protocol.start_connection();
@@ -18916,20 +20953,23 @@ mod tests {
                     device_id,
                 )
                 .unwrap();
-            assert_eq!(StateStore::list_http_uploads(&state_path).unwrap().len(), 1);
-            ready.upload_id
+            let records = StateStore::list_http_uploads(&state_path).unwrap();
+            assert_eq!(records.len(), 1);
+            (ready.upload_id, records[0].target_path.clone())
         };
         let replacement = root.join("startup-replacement-source.bin");
         fs::write(&replacement, b"user-file").unwrap();
-        fs::rename(&replacement, &target).unwrap();
+        fs::remove_file(&temp_path).unwrap();
+        fs::rename(&replacement, &temp_path).unwrap();
 
         let cleanup = cleanup_persisted_session_file_http_uploads(&state_path);
 
         assert!(
-            cleanup.is_err(),
-            "启动 recovery 遇到 replacement 时没有原文件句柄，必须保留 record 并安全失败"
+            cleanup.is_ok(),
+            "replacement 必须 quarantine，但不能阻止 daemon 启动"
         );
-        assert_eq!(fs::read(&target).unwrap(), b"user-file");
+        assert!(!target.exists());
+        assert_eq!(fs::read(&temp_path).unwrap(), b"user-file");
         assert!(
             StateStore::list_http_uploads(&state_path)
                 .unwrap()
@@ -18943,7 +20983,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn session_file_http_upload_abort_does_not_delete_replaced_target() {
+    fn session_file_http_upload_publish_does_not_replace_competing_target_and_can_retry() {
         let base = temp_state_path("http-upload-replaced-target-base");
         let root = base.join("project");
         let state_path = temp_state_path("http-upload-replaced-target-state.json");
@@ -18979,7 +21019,6 @@ mod tests {
             )
             .unwrap();
         let target = root.join("replacement.bin");
-        fs::remove_file(&target).unwrap();
         fs::write(&target, b"user-file").unwrap();
         let upload_id = ready.upload_id.clone();
         let meta = SessionFileHttpUploadStreamPayload {
@@ -18989,20 +21028,33 @@ mod tests {
             size_bytes: ready.size_bytes,
             offset_bytes: 0,
         };
-        let abort = protocol.abort_session_file_http_upload(&connection, &meta);
-
-        assert!(
-            matches!(abort, Err(ProtocolError::InvalidState)),
-            "旧 upload_id 不能删除 init 后被外部替换的同名目标文件"
+        let publish = protocol.write_session_file_http_upload(
+            &connection,
+            meta.clone(),
+            device_id,
+            vec![b"uploaded".to_vec()],
         );
+
+        assert!(matches!(publish, Err(ProtocolError::InvalidState)));
         assert_eq!(fs::read(&target).unwrap(), b"user-file");
         assert!(
             StateStore::list_http_uploads(&state_path)
                 .unwrap()
                 .into_iter()
-                .all(|record| record.upload_id != upload_id),
-            "replacement abort 后旧 recovery record 必须收敛删除"
+                .any(|record| record.upload_id == upload_id),
+            "发布竞争失败后 recovery intent 必须保留"
         );
+        fs::remove_file(&target).unwrap();
+        let retry = protocol
+            .write_session_file_http_upload(
+                &connection,
+                meta,
+                device_id,
+                vec![b"uploaded".to_vec()],
+            )
+            .unwrap();
+        assert!(retry.eof);
+        assert_eq!(fs::read(&target).unwrap(), b"uploaded");
         fs::remove_dir_all(base).ok();
         fs::remove_file(state_path.with_extension("sqlite")).ok();
     }
@@ -19046,8 +21098,10 @@ mod tests {
             .unwrap();
         let target = root.join("replacement-with-alias.bin");
         let alias = root.join("replacement-with-alias-hardlink.bin");
-        fs::hard_link(&target, &alias).unwrap();
-        fs::remove_file(&target).unwrap();
+        let temp_path = protocol.session_file_http_uploads[&ready.upload_id]
+            .temp_path
+            .clone();
+        fs::hard_link(&temp_path, &alias).unwrap();
         fs::write(&target, b"user-file").unwrap();
         let upload_id = ready.upload_id.clone();
         let meta = SessionFileHttpUploadStreamPayload {
@@ -19115,10 +21169,11 @@ mod tests {
                 device_id,
             )
             .unwrap();
-        let target = root.join("missing-with-alias.bin");
         let alias = root.join("missing-with-alias-hardlink.bin");
-        fs::hard_link(&target, &alias).unwrap();
-        fs::remove_file(&target).unwrap();
+        let temp_path = protocol.session_file_http_uploads[&ready.upload_id]
+            .temp_path
+            .clone();
+        fs::hard_link(&temp_path, &alias).unwrap();
         let upload_id = ready.upload_id.clone();
         let meta = SessionFileHttpUploadStreamPayload {
             session_id,
@@ -19185,8 +21240,11 @@ mod tests {
             )
             .unwrap();
         let target = root.join("prune-replacement.bin");
-        fs::remove_file(&target).unwrap();
-        fs::write(&target, b"user-file").unwrap();
+        let temp_path = protocol.session_file_http_uploads[&ready.upload_id]
+            .temp_path
+            .clone();
+        fs::remove_file(&temp_path).unwrap();
+        fs::write(&temp_path, b"user-file").unwrap();
         protocol
             .session_file_http_uploads
             .get_mut(&ready.upload_id)
@@ -19195,7 +21253,8 @@ mod tests {
 
         protocol.prune_session_file_http_uploads();
 
-        assert_eq!(fs::read(&target).unwrap(), b"user-file");
+        assert!(!target.exists());
+        assert_eq!(fs::read(&temp_path).unwrap(), b"user-file");
         assert!(
             !protocol
                 .session_file_http_uploads
@@ -19273,7 +21332,7 @@ mod tests {
 
         assert!(
             !target.exists(),
-            "idle Active upload 需要清理预分配目标文件"
+            "idle Active upload 需要清理同目录隐藏临时对象"
         );
         assert!(
             !protocol
@@ -19697,7 +21756,8 @@ mod tests {
         let created = decrypt_first(&mut device_session, create_responses);
         let created_payload: SessionCreatedPayload = decode_payload(created.payload).unwrap();
 
-        // token 仅用于兼容旧前端的准备信号；新下载路径走 E2EE chunk，避免 HTTP 明文。
+        // token 仅用于兼容旧前端的准备信号；当前 WebSocket 下载走明文 packet chunk。
+        // 本测试使用 legacy `encrypted_frame` fixture，不代表当前 packet 的传输边界。
         let prepare_responses = send_encrypted(
             &mut protocol,
             &mut connection,
@@ -21466,8 +23526,9 @@ mod tests {
     }
 
     #[test]
-    fn session_create_scope_grant_failure_rolls_back_connection_attach_state() {
+    fn session_create_scope_grant_failure_happens_before_ownership_intent() {
         let (mut protocol, backend) = protocol();
+        let state_path = protocol.config.state_path.clone();
         let (mut connection, _) = protocol.start_connection();
         let device_id = DeviceId::new();
         let signing_key = SigningKey::generate(&mut OsRng);
@@ -21503,8 +23564,11 @@ mod tests {
         assert_eq!(response.kind, MessageType::Error);
         assert_eq!(snapshot.attached_sessions, 0);
         assert_eq!(snapshot.watched_sessions, 0);
-        assert_eq!(backend.terminate_count(), 1);
-        assert_eq!(backend.attachment_drops().len(), 1);
+        assert_eq!(backend.terminate_count(), 0);
+        assert_eq!(backend.attachment_drops().len(), 0);
+        assert!(protocol.session_index.is_empty());
+        let persisted = StateStore::load(&state_path).unwrap();
+        assert!(persisted.sessions.is_empty());
     }
 
     #[test]
@@ -22799,6 +24863,81 @@ mod tests {
     }
 
     #[test]
+    fn explicit_close_does_not_terminate_before_pending_close_journal_is_durable() {
+        let backend = FakePtyBackend::default();
+        let state_path = temp_state_path("explicit-close-journal-order.json");
+        let config = DaemonConfig::default_for_state_path(&state_path);
+        let mut protocol =
+            DaemonProtocol::new(config, backend.clone(), Ed25519SignatureVerifier).unwrap();
+        let (mut connection, _) = protocol.start_connection();
+        let device_id = DeviceId::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let (_, mut device_session) = open_e2ee(&mut protocol, &mut connection, device_id);
+        pair_device(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            device_id,
+            PublicKey(wire(signing_key.verifying_key().as_bytes())),
+        );
+        let created = send_encrypted(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            envelope_value(
+                MessageType::SessionCreate,
+                SessionCreatePayload {
+                    command: vec!["sh".to_owned()],
+                    size: TerminalSize::new(24, 80),
+                },
+            )
+            .unwrap(),
+        );
+        let created: SessionCreatedPayload =
+            decode_payload(decrypt_first(&mut device_session, created).payload).unwrap();
+
+        let sqlite_path = crate::state::sqlite_state_path_for_state_path(&state_path);
+        let state_lock = rusqlite::Connection::open(sqlite_path).unwrap();
+        state_lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let failed = send_encrypted(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            envelope_value(
+                MessageType::SessionClose,
+                SessionClosePayload {
+                    session_id: created.session_id,
+                },
+            )
+            .unwrap(),
+        );
+        let failed: ErrorPayload =
+            decode_payload(decrypt_first(&mut device_session, failed).payload).unwrap();
+        assert_eq!(failed.code, "state_failed");
+        assert_eq!(backend.terminate_count(), 0);
+
+        state_lock.execute_batch("ROLLBACK").unwrap();
+        let closed = send_encrypted(
+            &mut protocol,
+            &mut connection,
+            &mut device_session,
+            envelope_value(
+                MessageType::SessionClose,
+                SessionClosePayload {
+                    session_id: created.session_id,
+                },
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            decrypt_first(&mut device_session, closed).kind,
+            MessageType::SessionClosed
+        );
+        assert_eq!(backend.terminate_count(), 1);
+        assert!(StateStore::load(&state_path).unwrap().sessions.is_empty());
+    }
+
+    #[test]
     fn explicit_close_prunes_successfully_closed_session_rows() {
         let backend = FakePtyBackend::default();
         let state_path = temp_state_path("explicit-close-prunes-closed-rows.json");
@@ -22857,64 +24996,6 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-    }
-
-    #[test]
-    fn explicit_close_recovers_state_even_when_pty_terminate_fails() {
-        let backend = FakePtyBackend::default();
-        backend.fail_terminate("stale supervisor socket");
-        let state_path = temp_state_path("explicit-close-terminate-failure.json");
-        let config = DaemonConfig::default_for_state_path(&state_path);
-        let mut protocol =
-            DaemonProtocol::new(config.clone(), backend.clone(), Ed25519SignatureVerifier).unwrap();
-        let (mut connection, _) = protocol.start_connection();
-        let device_id = DeviceId::new();
-        let signing_key = SigningKey::generate(&mut OsRng);
-        let (_, mut device_session) = open_e2ee(&mut protocol, &mut connection, device_id);
-        pair_device(
-            &mut protocol,
-            &mut connection,
-            &mut device_session,
-            device_id,
-            PublicKey(wire(signing_key.verifying_key().as_bytes())),
-        );
-        let created_responses = send_encrypted(
-            &mut protocol,
-            &mut connection,
-            &mut device_session,
-            envelope_value(
-                MessageType::SessionCreate,
-                SessionCreatePayload {
-                    command: vec!["sh".to_owned()],
-                    size: TerminalSize::new(24, 80),
-                },
-            )
-            .unwrap(),
-        );
-        let created = decrypt_first(&mut device_session, created_responses);
-        let created_payload: SessionCreatedPayload = decode_payload(created.payload).unwrap();
-
-        let close_responses = send_encrypted(
-            &mut protocol,
-            &mut connection,
-            &mut device_session,
-            envelope_value(
-                MessageType::SessionClose,
-                SessionClosePayload {
-                    session_id: created_payload.session_id,
-                },
-            )
-            .unwrap(),
-        );
-        let closed = decrypt_first(&mut device_session, close_responses);
-        assert_eq!(closed.kind, MessageType::SessionClosed);
-        assert_eq!(backend.terminate_count(), 1);
-        assert!(protocol.session_index.is_empty());
-
-        let closed_state = StateStore::load(&state_path).unwrap();
-        assert_eq!(closed_state.sessions.len(), 1);
-        assert_eq!(closed_state.sessions[0].state, SessionState::Closed);
-        assert!(closed_state.sessions[0].restore_info.is_none());
     }
 
     #[test]

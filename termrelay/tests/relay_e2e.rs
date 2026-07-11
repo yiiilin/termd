@@ -49,6 +49,8 @@ impl RelayProcess {
         let addr = unused_listen_addr();
         let mut command = Command::new(env!("CARGO_BIN_EXE_termrelay"));
         command.args(["--listen", &addr.to_string()]);
+        // 本文件验证 binary 的 open-relay transport 行为；trusted admission policy 在
+        // termrelay/src/ws.rs 单测和 scripts/qa.sh 的真实 runtime 路径覆盖。
         command.arg("--allow-open-relay");
         if let Some(auth_token) = auth_token {
             command.args(["--auth-token", auth_token]);
@@ -148,7 +150,7 @@ async fn relay_http_file_tunnel_flag_reaches_binary_router() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn relay_pairs_control_and_data_connections_as_raw_dumb_pipe() {
+async fn open_relay_pairs_control_and_data_connections_and_forwards_frames() {
     let relay = RelayProcess::spawn().await;
     let server_id = ServerId::new();
     let mut daemon_control =
@@ -389,7 +391,8 @@ async fn relay_forwards_business_type_envelopes_without_interpreting_them() {
         .await
         .expect("client should receive route_ready");
 
-    // 中文注释：这些看起来像业务 envelope，但 route prelude 之后都只是 opaque WebSocket frame。
+    // 中文注释：open-relay 用例验证业务形状的明文 frame 原样转发；relay 看得到内容，
+    // 但不在 data pipe 上执行 daemon 的 auth/session 权限判断。
     let business_frames = [
         r#"{"type":"auth","payload":{"device_id":"dev-a","signature":"sig"}}"#,
         r#"{"type":"session_data","payload":{"session_id":"session-a","data_base64":"aWQ="}}"#,
@@ -447,8 +450,8 @@ async fn relay_forwards_large_terminal_snapshot_sized_binary_frame() {
         .await
         .expect("client should receive route_ready after data pair");
 
-    // 真实终端 snapshot 是 E2EE 后的单个 opaque binary WebSocket frame。
-    // relay 不能解析后分片，因此传输层必须允许 MB 级重绘帧原样通过。
+    // 当前终端 snapshot 是 trusted relay 可见的单个 binary WebSocket frame。
+    // relay 不做业务分片，因此传输层必须允许 MB 级重绘帧原样通过。
     let snapshot_sized_frame = vec![0x5a; 6 * 1024 * 1024];
     daemon_data
         .send(Message::Binary(snapshot_sized_frame.clone()))
@@ -458,7 +461,7 @@ async fn relay_forwards_large_terminal_snapshot_sized_binary_frame() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn relay_forwards_real_encrypted_frame_without_plaintext_or_rewrite() {
+async fn open_relay_forwards_legacy_encrypted_frame_without_rewrite() {
     let relay = RelayProcess::spawn().await;
     let server_id = ServerId::new();
     let mut daemon_control =
@@ -522,7 +525,7 @@ async fn relay_forwards_real_encrypted_frame_without_plaintext_or_rewrite() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn relay_isolates_encrypted_frames_by_server_id() {
+async fn open_relay_isolates_legacy_encrypted_frames_by_server_id() {
     let relay = RelayProcess::spawn().await;
     let server_a = ServerId::new();
     let server_b = ServerId::new();
@@ -705,7 +708,7 @@ async fn relay_auth_rejects_missing_and_wrong_transport_token() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn relay_auth_allows_dumb_pipe_forwarding_with_correct_token() {
+async fn relay_transport_auth_allows_forwarding_with_correct_token() {
     let relay = RelayProcess::spawn_auth_required(RELAY_AUTH_TOKEN).await;
     let server_id = ServerId::new();
     let mut daemon_control = connect_registered_socket(

@@ -38,7 +38,7 @@ pub fn router(state: RelayState, web_enabled: bool, http_tunnel_enabled: bool) -
         .with_state(state);
 
     if web_enabled {
-        router.fallback(termweb::embedded_web_handler)
+        router.fallback(termweb::embedded_web_handler_with_headers)
     } else {
         router
     }
@@ -623,6 +623,205 @@ mod tests {
             .await
             .expect("router should respond");
         assert_eq!(enabled_response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn web_fallback_forwards_conditional_and_compression_headers() {
+        use axum::http::header::{
+            ACCEPT_ENCODING, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, ETAG,
+            IF_NONE_MATCH, VARY,
+        };
+
+        let app = router(RelayState::default(), true, false);
+        let initial = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .body(Body::empty())
+                    .expect("test request should build"),
+            )
+            .await
+            .expect("router should respond");
+        let etag = initial.headers().get(ETAG).cloned().expect("ETag");
+        assert_eq!(initial.status(), StatusCode::OK);
+        let initial_len = axum::body::to_bytes(initial.into_body(), usize::MAX)
+            .await
+            .expect("initial body should be readable")
+            .len();
+        assert!(initial_len > 0);
+        let repeated_len = axum::body::to_bytes(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/")
+                        .body(Body::empty())
+                        .expect("test request should build"),
+                )
+                .await
+                .expect("router should respond")
+                .into_body(),
+            usize::MAX,
+        )
+        .await
+        .expect("repeated body should be readable")
+        .len();
+
+        let not_modified = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header(IF_NONE_MATCH, etag.clone())
+                    .body(Body::empty())
+                    .expect("test request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(not_modified.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(not_modified.headers().get(ETAG), Some(&etag));
+        assert_eq!(
+            not_modified.headers().get(CACHE_CONTROL).unwrap(),
+            "no-cache"
+        );
+        assert_eq!(not_modified.headers().get(VARY).unwrap(), "accept-encoding");
+        assert!(not_modified.headers().contains_key(CONTENT_TYPE));
+        assert_eq!(
+            not_modified
+                .headers()
+                .get("x-content-type-options")
+                .unwrap(),
+            "nosniff"
+        );
+        let not_modified_len = axum::body::to_bytes(not_modified.into_body(), usize::MAX)
+            .await
+            .expect("304 body should be readable")
+            .len();
+        assert_eq!(not_modified_len, 0);
+        println!(
+            "termrelay transfer identity: unconditional={} revalidated={} first={} second_304={}",
+            initial_len + repeated_len,
+            initial_len + not_modified_len,
+            initial_len,
+            not_modified_len
+        );
+
+        for encoding in ["gzip", "br"] {
+            let encoded = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/")
+                        .header(ACCEPT_ENCODING, encoding)
+                        .body(Body::empty())
+                        .expect("test request should build"),
+                )
+                .await
+                .expect("router should respond");
+            assert_eq!(encoded.headers().get(CONTENT_ENCODING).unwrap(), encoding);
+            let encoded_etag = encoded.headers().get(ETAG).cloned().expect("ETag");
+            let encoded_len = axum::body::to_bytes(encoded.into_body(), usize::MAX)
+                .await
+                .expect("encoded body should be readable")
+                .len();
+            assert!(encoded_len > 0);
+            let repeated_encoded_len = axum::body::to_bytes(
+                app.clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri("/")
+                            .header(ACCEPT_ENCODING, encoding)
+                            .body(Body::empty())
+                            .expect("test request should build"),
+                    )
+                    .await
+                    .expect("router should respond")
+                    .into_body(),
+                usize::MAX,
+            )
+            .await
+            .expect("repeated encoded body should be readable")
+            .len();
+
+            let encoded_not_modified = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/")
+                        .header(ACCEPT_ENCODING, encoding)
+                        .header(IF_NONE_MATCH, encoded_etag)
+                        .body(Body::empty())
+                        .expect("test request should build"),
+                )
+                .await
+                .expect("router should respond");
+            assert_eq!(encoded_not_modified.status(), StatusCode::NOT_MODIFIED);
+            let encoded_not_modified_len =
+                axum::body::to_bytes(encoded_not_modified.into_body(), usize::MAX)
+                    .await
+                    .expect("encoded 304 body should be readable")
+                    .len();
+            assert_eq!(encoded_not_modified_len, 0);
+            println!(
+                "termrelay transfer {encoding}: unconditional={} revalidated={} first={} second_304={}",
+                encoded_len + repeated_encoded_len,
+                encoded_len + encoded_not_modified_len,
+                encoded_len,
+                encoded_not_modified_len
+            );
+
+            let head = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::HEAD)
+                        .uri("/")
+                        .header(ACCEPT_ENCODING, encoding)
+                        .body(Body::empty())
+                        .expect("test request should build"),
+                )
+                .await
+                .expect("router should respond");
+            assert_eq!(head.headers().get(CONTENT_ENCODING).unwrap(), encoding);
+            assert!(head.headers().contains_key(CONTENT_LENGTH));
+            assert!(head.headers().contains_key(ETAG));
+            assert_eq!(head.headers().get(VARY).unwrap(), "accept-encoding");
+            assert!(
+                axum::body::to_bytes(head.into_body(), usize::MAX)
+                    .await
+                    .expect("HEAD body should be readable")
+                    .is_empty()
+            );
+        }
+
+        let api_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/control/session/list")
+                    .header("x-termd-server-id", ServerId::new().0.to_string())
+                    .header(ACCEPT_ENCODING, "br")
+                    .body(Body::empty())
+                    .expect("test request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(api_response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(api_response.headers().get(CONTENT_ENCODING).is_none());
+
+        let ws_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/ws")
+                    .header(ACCEPT_ENCODING, "br")
+                    .body(Body::empty())
+                    .expect("test request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_ne!(ws_response.status(), StatusCode::OK);
+        assert!(ws_response.headers().get(CONTENT_ENCODING).is_none());
     }
 
     #[test]

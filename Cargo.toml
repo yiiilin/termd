@@ -6,7 +6,7 @@ resolver = "3"
 version = "0.6.4"
 edition = "2024"
 license = "MIT"
-repository = "https://example.invalid/termd"
+repository = "https://github.com/yiiilin/termd"
 
 [workspace.dependencies]
 prost = "0.13"

@@ -155,11 +155,12 @@ impl RelayState {
         let mut request_done = false;
         let response_head_timeout = tokio::time::sleep(HTTP_TUNNEL_RESPONSE_HEAD_TIMEOUT);
         tokio::pin!(response_head_timeout);
+        let mut response_head_timeout_started = false;
         loop {
             tokio::select! {
                 biased;
 
-                _ = &mut response_head_timeout => {
+                _ = &mut response_head_timeout, if response_head_timeout_started => {
                     warn!(
                         server_id = %server_id.0,
                         client_connection_id = registration_guard.registration().id,
@@ -173,7 +174,12 @@ impl RelayState {
                 request_result = &mut request_result_rx, if !request_done => {
                     request_done = true;
                     match request_result {
-                        Ok(Ok(())) => {}
+                        Ok(Ok(())) => {
+                            response_head_timeout.as_mut().reset(
+                                tokio::time::Instant::now() + HTTP_TUNNEL_RESPONSE_HEAD_TIMEOUT,
+                            );
+                            response_head_timeout_started = true;
+                        }
                         Ok(Err(status)) => {
                             return Err(status);
                         }

@@ -1,5 +1,7 @@
 # Termd Relay Web One-Shot Refactor Plan
 
+> 历史状态提示：本文记录当时的计划/实现状态，不代表当前 0.6 协议契约；现行边界以 `TECH.md` 和 `docs/deployment.md` 为准。
+
 > Source session log:
 > `/root/.codex/sessions/2026/06/01/rollout-2026-06-01T07-07-14-019e8202-142e-7a81-bb1a-a09594e24698.jsonl:18900`
 >

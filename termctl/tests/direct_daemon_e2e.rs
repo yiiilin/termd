@@ -1,7 +1,7 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -9,7 +9,11 @@ use tempfile::TempDir;
 use termd::auth::current_unix_timestamp_millis;
 use termd::config::DaemonConfig;
 use termd::net::server::{SharedDaemonProtocol, serve_listener};
-use termd_proto::{PairingQrPayload, ServerId};
+use termd::pty::PtyRestoreInfo;
+use termd::pty::supervisor::SupervisorPtyBackend;
+use termd::runtime::SessionRuntime;
+use termd::state::StateStore;
+use termd_proto::{PairingQrPayload, ServerId, SessionState};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
@@ -17,16 +21,19 @@ const TERMD_READY_SENTINEL: &str = "termd-e2e-ready";
 
 struct TestDaemon {
     url: String,
-    protocol: SharedDaemonProtocol,
-    _state_dir: TempDir,
-    task: JoinHandle<()>,
+    protocol: Option<SharedDaemonProtocol>,
+    state_path: PathBuf,
+    supervisor_guards: Vec<DirectE2eSupervisorGuard>,
+    state_dir: TempDir,
+    task: Option<JoinHandle<()>>,
+    task_finished: mpsc::Receiver<()>,
 }
 
 impl TestDaemon {
     async fn spawn() -> Self {
         let state_dir = tempfile::tempdir().expect("daemon state tempdir should be created");
-        let mut config =
-            DaemonConfig::default_for_state_path(state_dir.path().join("daemon-state.json"));
+        let state_path = state_dir.path().join("daemon-state.json");
+        let mut config = DaemonConfig::default_for_state_path(&state_path);
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("daemon test listener should bind");
@@ -39,7 +46,15 @@ impl TestDaemon {
 
         let protocol = termd::net::server::default_protocol(config);
         let server_protocol = Arc::clone(&protocol);
+        let (task_finished_tx, task_finished) = mpsc::channel();
         let task = tokio::spawn(async move {
+            struct Finished(mpsc::Sender<()>);
+            impl Drop for Finished {
+                fn drop(&mut self) {
+                    let _ = self.0.send(());
+                }
+            }
+            let _finished = Finished(task_finished_tx);
             serve_listener(listener, server_protocol, false)
                 .await
                 .expect("in-process daemon should keep serving");
@@ -47,14 +62,50 @@ impl TestDaemon {
 
         Self {
             url: format!("ws://{addr}/ws"),
-            protocol,
-            _state_dir: state_dir,
-            task,
+            protocol: Some(protocol),
+            state_path,
+            supervisor_guards: Vec::new(),
+            state_dir,
+            task: Some(task),
+            task_finished,
         }
     }
 
+    fn protocol(&self) -> &SharedDaemonProtocol {
+        self.protocol
+            .as_ref()
+            .expect("test daemon protocol should be available")
+    }
+
+    fn track_session_supervisor(&mut self, session_id: &str) {
+        let state = StateStore::load(&self.state_path).expect("daemon state should load");
+        let session = state
+            .sessions
+            .iter()
+            .find(|session| session.session_id.0.to_string() == session_id)
+            .expect("created session should be durable before termctl new returns");
+        let Some(PtyRestoreInfo::UnixSocket {
+            socket_path,
+            supervisor_pid,
+            ..
+        }) = session.restore_info.as_ref()
+        else {
+            panic!("direct daemon E2E requires Unix supervisor restore info");
+        };
+        let mut guard = DirectE2eSupervisorGuard::new(
+            *supervisor_pid,
+            socket_path.clone(),
+            self.state_dir.path().to_path_buf(),
+        );
+        assert!(
+            guard.confirm_ownership(),
+            "created supervisor PID/socket must belong to this fixture"
+        );
+        self.supervisor_guards.push(guard);
+    }
+
     async fn issue_pairing_invite(&self) -> String {
-        let mut protocol = self.protocol.lock().await;
+        let mut protocol = self.protocol().lock().await;
         let server_id = protocol.server_id();
         let daemon_public_key = protocol.daemon_public_identity().public_key.clone();
         let record = protocol
@@ -67,7 +118,7 @@ impl TestDaemon {
     }
 
     async fn issue_pairing_invite_for_server(&self, server_id: ServerId) -> String {
-        let mut protocol = self.protocol.lock().await;
+        let mut protocol = self.protocol().lock().await;
         let daemon_public_key = protocol.daemon_public_identity().public_key.clone();
         let record = protocol
             .issue_pairing_token(current_unix_timestamp_millis())
@@ -79,7 +130,7 @@ impl TestDaemon {
     }
 
     async fn issue_pairing_token(&self) -> String {
-        let mut protocol = self.protocol.lock().await;
+        let mut protocol = self.protocol().lock().await;
         protocol
             .issue_pairing_token(current_unix_timestamp_millis())
             .expect("pairing token should be issued")
@@ -91,7 +142,158 @@ impl TestDaemon {
 
 impl Drop for TestDaemon {
     fn drop(&mut self) {
-        self.task.abort();
+        let state = StateStore::load(&self.state_path).ok();
+        if let Some(state) = &state {
+            for session in &state.sessions {
+                let Some(PtyRestoreInfo::UnixSocket {
+                    socket_path,
+                    supervisor_pid,
+                    ..
+                }) = session.restore_info.as_ref()
+                else {
+                    continue;
+                };
+                if self
+                    .supervisor_guards
+                    .iter()
+                    .any(|guard| guard.pid == *supervisor_pid && guard.socket_path == *socket_path)
+                {
+                    continue;
+                }
+                let mut guard = DirectE2eSupervisorGuard::new(
+                    *supervisor_pid,
+                    socket_path.clone(),
+                    self.state_dir.path().to_path_buf(),
+                );
+                if guard.confirm_ownership() {
+                    self.supervisor_guards.push(guard);
+                }
+            }
+        }
+        if let Some(task) = self.task.take() {
+            task.abort();
+            let _ = self.task_finished.recv();
+        }
+        self.protocol.take();
+
+        let Some(state) = state else {
+            self.supervisor_guards.clear();
+            return;
+        };
+        let backend = SupervisorPtyBackend::for_state_path(&self.state_path);
+        let mut runtime = SessionRuntime::new(backend);
+        for session in state
+            .sessions
+            .iter()
+            .filter(|session| session.state == SessionState::Running)
+        {
+            let Some(PtyRestoreInfo::UnixSocket {
+                socket_path,
+                supervisor_pid,
+                ..
+            }) = session.restore_info.as_ref()
+            else {
+                continue;
+            };
+            if !self
+                .supervisor_guards
+                .iter()
+                .any(|guard| guard.pid == *supervisor_pid && guard.socket_path == *socket_path)
+            {
+                continue;
+            }
+            let session_id = session.session_id.0.to_string();
+            let _ = runtime
+                .reconnect_session(session)
+                .and_then(|()| runtime.close(&session_id));
+        }
+        self.supervisor_guards.clear();
+    }
+}
+
+struct DirectE2eSupervisorGuard {
+    pid: u32,
+    socket_path: PathBuf,
+    state_dir: PathBuf,
+    ownership_confirmed: bool,
+}
+
+impl DirectE2eSupervisorGuard {
+    fn new(pid: u32, socket_path: PathBuf, state_dir: PathBuf) -> Self {
+        Self {
+            pid,
+            socket_path,
+            state_dir,
+            ownership_confirmed: false,
+        }
+    }
+
+    fn confirm_ownership(&mut self) -> bool {
+        self.ownership_confirmed = self.owns_live_process();
+        self.ownership_confirmed
+    }
+
+    fn owns_live_process(&self) -> bool {
+        if !self.socket_path.starts_with(&self.state_dir) {
+            return false;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::ffi::OsStrExt;
+
+            let Ok(cmdline) = fs::read(format!("/proc/{}/cmdline", self.pid)) else {
+                return false;
+            };
+            let arguments: Vec<&[u8]> = cmdline
+                .split(|byte| *byte == 0)
+                .filter(|argument| !argument.is_empty())
+                .collect();
+            arguments
+                .iter()
+                .any(|argument| *argument == b"__session-supervisor")
+                && arguments.windows(2).any(|pair| {
+                    pair[0] == b"--socket-path"
+                        && pair[1] == self.socket_path.as_os_str().as_bytes()
+                })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.socket_path.exists()
+        }
+    }
+}
+
+impl Drop for DirectE2eSupervisorGuard {
+    fn drop(&mut self) {
+        if !self.ownership_confirmed {
+            return;
+        }
+        if self.owns_live_process() {
+            unsafe {
+                libc::kill(self.pid as libc::pid_t, libc::SIGKILL);
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            #[cfg(target_os = "linux")]
+            {
+                let mut status = 0;
+                let waited =
+                    unsafe { libc::waitpid(self.pid as libc::pid_t, &mut status, libc::WNOHANG) };
+                if waited == self.pid as libc::pid_t
+                    || !Path::new(&format!("/proc/{}", self.pid)).exists()
+                {
+                    break;
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            if !self.socket_path.exists() {
+                break;
+            }
+            thread::yield_now();
+        }
+        let _ = fs::remove_file(&self.socket_path);
+        let _ = fs::remove_file(self.socket_path.with_extension("attach.sock"));
     }
 }
 
@@ -124,7 +326,7 @@ impl Drop for AttachGuard {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn direct_termctl_binary_covers_session_flow_and_invariants() {
-    let daemon = TestDaemon::spawn().await;
+    let mut daemon = TestDaemon::spawn().await;
     let temp = tempfile::tempdir().expect("termctl state tempdir should be created");
     let paired_state = temp.path().join("paired-state.json");
     let unpaired_state = temp.path().join("unpaired-state.json");
@@ -205,6 +407,7 @@ async fn direct_termctl_binary_covers_session_flow_and_invariants() {
         ],
     );
     let session_id = parse_session_id(&stdout_string(&new_session));
+    daemon.track_session_supervisor(&session_id);
 
     let list_after_new = run_termctl_success(&paired_state, &["list", "--url", &daemon.url]);
     let list_stdout = stdout_string(&list_after_new);

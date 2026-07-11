@@ -111,6 +111,8 @@ const DAEMON_METADATA_FALLBACK_POLL_INTERVAL_MS = 10_000;
 const DAEMON_METADATA_RETRY_DELAY_MS = 1500;
 const TEXT_FILE_EDITOR_MAX_BYTES = 1024 * 1024;
 const FILE_TRANSFER_MEMORY_FALLBACK_MAX_BYTES = 16 * 1024 * 1024;
+const TERMINAL_INPUT_BUFFER_MAX_BYTES = 1024 * 1024;
+const TERMINAL_INPUT_CHUNK_MAX_BYTES = 64 * 1024;
 const MOBILE_LAYOUT_QUERY = "(max-width: 760px)";
 const MOBILE_LAYOUT_BREAKPOINT = 760;
 const MOBILE_TITLE_PULL_START_PX = 8;
@@ -125,7 +127,7 @@ export const DAEMON_STATUS_POLL_INTERVAL_MS = 1000;
 // 5 秒给公网 relay 和浏览器调度留出缓冲，避免把短暂排队误报成“操作超时”。
 export const APP_CONNECTION_TIMEOUT_MS = 5000;
 // WebSocket 新建连接偶发卡住时，不能把整个 session attach 挂到 15 秒。
-// terminal snapshot 仍有自己的 attach timeout；这里只约束 route/E2EE 建连阶段。
+// terminal snapshot 仍有自己的 attach timeout；这里只约束 socket/route/hello 建连阶段。
 const APP_SOCKET_CONNECT_TIMEOUT_MS = 3000;
 // 中文注释：真实故障里慢点出现在 socket open 的 TCP/TLS/WebSocket 阶段。
 // 该阶段单独快速失败并重试，避免一次半卡住的 TLS 握手拖慢整个 relay attach。
@@ -147,6 +149,68 @@ interface MobileTitlePullGesture {
   startX: number;
   startY: number;
   dragging: boolean;
+}
+
+interface PendingTerminalInputChunk {
+  data: string;
+  byteLength: number;
+}
+
+interface PendingTerminalInputQueue {
+  sessionId: UUID;
+  chunks: PendingTerminalInputChunk[];
+  byteLength: number;
+  flushPromise?: Promise<void>;
+}
+
+function utf8CodePointByteLength(value: string): number {
+  const codePoint = value.codePointAt(0) ?? 0;
+  if (codePoint <= 0x7f) {
+    return 1;
+  }
+  if (codePoint <= 0x7ff) {
+    return 2;
+  }
+  if (codePoint <= 0xffff) {
+    return 3;
+  }
+  return 4;
+}
+
+function boundedTerminalInputChunks(data: string, maxBytes: number): {
+  chunks: PendingTerminalInputChunk[];
+  byteLength: number;
+  overflowed: boolean;
+} {
+  const chunks: PendingTerminalInputChunk[] = [];
+  let currentCharacters: string[] = [];
+  let currentBytes = 0;
+  let acceptedBytes = 0;
+  let overflowed = false;
+  const flushCurrent = () => {
+    if (currentCharacters.length === 0) {
+      return;
+    }
+    chunks.push({ data: currentCharacters.join(""), byteLength: currentBytes });
+    currentCharacters = [];
+    currentBytes = 0;
+  };
+
+  for (const character of data) {
+    const characterBytes = utf8CodePointByteLength(character);
+    if (acceptedBytes + characterBytes > maxBytes) {
+      overflowed = true;
+      break;
+    }
+    if (currentBytes + characterBytes > TERMINAL_INPUT_CHUNK_MAX_BYTES) {
+      flushCurrent();
+    }
+    currentCharacters.push(character);
+    currentBytes += characterBytes;
+    acceptedBytes += characterBytes;
+  }
+  flushCurrent();
+  return { chunks, byteLength: acceptedBytes, overflowed };
 }
 
 const RETRYABLE_CONNECTION_ERROR_CODES = new Set([
@@ -384,7 +448,7 @@ export default function App() {
   const [status, setStatus] = useState("idle");
   const [error, setError] = useState<SafeError | undefined>();
   // 中文注释：当前打开的 session 只绑定一条可靠 WebSocket；terminal 与普通 RPC 都在
-  // 这条连接的 E2EE 内层 ProtocolPacket segment 中分类。切换 session 或重连时必须
+  // 这条连接的明文 ProtocolPacket segment 中分类。切换 session 或重连时必须
   // 关闭旧连接并重建，保证 relay/daemon 都能用 transport close 明确清理旧 client。
   const {
     attachClientRef,
@@ -457,8 +521,7 @@ export default function App() {
   const statusRef = useRef(status);
   const daemonNetworkSampleRef = useRef<DaemonNetworkCounterSample | undefined>(undefined);
   const daemonStatusRefreshInFlightRef = useRef(false);
-  const pendingTerminalInputSessionRef = useRef<UUID | undefined>(undefined);
-  const pendingTerminalInputDataRef = useRef("");
+  const pendingTerminalInputQueueRef = useRef<PendingTerminalInputQueue | undefined>(undefined);
   const retryConnectionHandlerRef = useRef<(() => Promise<void> | undefined) | undefined>(undefined);
   const daemonStatusRequestSeqRef = useRef(0);
   const daemonClientsRefreshInFlightRef = useRef(false);
@@ -881,38 +944,83 @@ export default function App() {
   }, []);
 
   const clearPendingTerminalInput = useCallback((sessionId?: UUID) => {
-    if (sessionId !== undefined && pendingTerminalInputSessionRef.current !== sessionId) {
+    if (sessionId !== undefined && pendingTerminalInputQueueRef.current?.sessionId !== sessionId) {
       return;
     }
-    pendingTerminalInputSessionRef.current = undefined;
-    pendingTerminalInputDataRef.current = "";
+    pendingTerminalInputQueueRef.current = undefined;
   }, []);
 
   const queuePendingTerminalInput = useCallback((sessionId: UUID, data: string) => {
-    if (pendingTerminalInputSessionRef.current !== sessionId) {
-      pendingTerminalInputSessionRef.current = sessionId;
-      pendingTerminalInputDataRef.current = "";
+    let queue = pendingTerminalInputQueueRef.current;
+    if (queue?.sessionId !== sessionId) {
+      queue = { sessionId, chunks: [], byteLength: 0 };
+      pendingTerminalInputQueueRef.current = queue;
     }
-    pendingTerminalInputDataRef.current += data;
+    const availableBytes = TERMINAL_INPUT_BUFFER_MAX_BYTES - queue.byteLength;
+    const encoded = boundedTerminalInputChunks(data, availableBytes);
+    const firstChunk = encoded.chunks[0];
+    const lastQueuedChunk = queue.chunks.at(-1);
+    if (
+      firstChunk &&
+      lastQueuedChunk &&
+      !queue.flushPromise &&
+      lastQueuedChunk.byteLength + firstChunk.byteLength <= TERMINAL_INPUT_CHUNK_MAX_BYTES
+    ) {
+      lastQueuedChunk.data += firstChunk.data;
+      lastQueuedChunk.byteLength += firstChunk.byteLength;
+      queue.chunks.push(...encoded.chunks.slice(1));
+    } else {
+      queue.chunks.push(...encoded.chunks);
+    }
+    queue.byteLength += encoded.byteLength;
     recordTermdDiagnostic("app_terminal_input_queued", {
       sessionId,
-      chunkLength: data.length,
-      bufferedLength: pendingTerminalInputDataRef.current.length,
+      acceptedBytes: encoded.byteLength,
+      bufferedBytes: queue.byteLength,
+      overflowed: encoded.overflowed,
     });
+    if (encoded.overflowed) {
+      setError({
+        code: "terminal_input_overflow",
+        message: `terminal input buffer is limited to ${TERMINAL_INPUT_BUFFER_MAX_BYTES} bytes; excess input was not queued`,
+      });
+    }
   }, []);
 
   const flushPendingTerminalInput = useCallback(async (client: DirectClient, sessionId: UUID) => {
-    if (pendingTerminalInputSessionRef.current !== sessionId || !pendingTerminalInputDataRef.current) {
+    const queue = pendingTerminalInputQueueRef.current;
+    if (queue?.sessionId !== sessionId || queue.chunks.length === 0) {
       return;
     }
-    const bufferedInput = pendingTerminalInputDataRef.current;
-    clearPendingTerminalInput(sessionId);
-    recordTermdDiagnostic("app_terminal_input_flushed", {
-      sessionId,
-      bufferedLength: bufferedInput.length,
-    });
-    await client.sendSessionData(sessionId, new TextEncoder().encode(bufferedInput));
-  }, [clearPendingTerminalInput]);
+    if (queue.flushPromise) {
+      await queue.flushPromise;
+      return;
+    }
+    const flushPromise = (async () => {
+      while (pendingTerminalInputQueueRef.current === queue && queue.chunks.length > 0) {
+        const chunk = queue.chunks[0];
+        await client.sendSessionData(sessionId, new TextEncoder().encode(chunk.data));
+        queue.chunks.shift();
+        queue.byteLength -= chunk.byteLength;
+        recordTermdDiagnostic("app_terminal_input_chunk_flushed", {
+          sessionId,
+          chunkBytes: chunk.byteLength,
+          bufferedBytes: queue.byteLength,
+        });
+      }
+      if (pendingTerminalInputQueueRef.current === queue && queue.chunks.length === 0) {
+        pendingTerminalInputQueueRef.current = undefined;
+      }
+    })();
+    queue.flushPromise = flushPromise;
+    try {
+      await flushPromise;
+    } finally {
+      if (queue.flushPromise === flushPromise) {
+        queue.flushPromise = undefined;
+      }
+    }
+  }, []);
 
   const resolveTerminalInputSessionId = useCallback(() => {
     // 中文注释：恢复窗口里 transport 可能已经被断开并清掉 attachedSessionRef，
@@ -1398,11 +1506,13 @@ export default function App() {
       // 中文注释：这里先同步推进逻辑上的 active daemon。旧 daemon 的 in-flight
       // session.list 可能晚于 IndexedDB/React 状态更新返回，必须立刻让请求守卫失效。
       activeServerIdRef.current = target.server_id;
-      resetWorkspaceState();
       setMobilePanel(undefined);
       setMobileMenuOpen(false);
       autoCheckedServerRef.current = undefined;
       const nextState = await selectDefaultServer(target.server_id);
+      // IndexedDB 等待期间 admin detach effect 仍可能提交旧 session 的 reattach/status。
+      // 发布新 daemon 前统一清空，避免新 server 与旧 session 状态组合后误 attach。
+      resetWorkspaceState();
       setState(nextState);
       setUrl(browserReachableWsUrl(target.url));
       setConnectionEditorOpen(false);
@@ -1877,6 +1987,7 @@ export default function App() {
 
   useEffect(() => {
     if (
+      activeSurface !== "workspace" ||
       !activeServer ||
       !state.device ||
       status !== "idle" ||
@@ -1888,7 +1999,7 @@ export default function App() {
     autoCheckedServerRef.current = activeServer.server_id;
     setStatus("connecting");
     void handleRefresh({ bootstrap: true });
-  }, [activeServer, handleRefresh, state.device, status]);
+  }, [activeServer, activeSurface, handleRefresh, state.device, status]);
 
   const startReceiveLoop = useTerminalReceiveLoop(terminalAttachController, {
     attachClientRef,
@@ -2017,8 +2128,8 @@ export default function App() {
         return;
       }
       if (
-        pendingTerminalInputSessionRef.current !== undefined &&
-        pendingTerminalInputSessionRef.current !== sessionId
+        pendingTerminalInputQueueRef.current !== undefined &&
+        pendingTerminalInputQueueRef.current.sessionId !== sessionId
       ) {
         clearPendingTerminalInput();
       }
@@ -2067,7 +2178,7 @@ export default function App() {
         reattachCurrentSessionOnOpenRef.current = false;
         disconnectAttach({
           closeMobilePanel: shouldCloseMobilePanel,
-          preservePendingInput: pendingTerminalInputSessionRef.current === sessionId,
+          preservePendingInput: pendingTerminalInputQueueRef.current?.sessionId === sessionId,
         });
         const resetVersion = clearTerminalOutput();
         attachAbortController = new AbortController();
@@ -2272,13 +2383,11 @@ export default function App() {
     setConnectionEditorOpen(false);
     setMobilePanel(undefined);
     setMobileMenuOpen(false);
-    if (status === "error" || status === "idle" || sessions.length === 0) {
-      // 从后台重新进入工作台时允许对当前 daemon 再做一次连通性探测；
-      // daemon 切换中的旧刷新结果可能把 session 列表临时置空，打开工作台时要重新确认。
-      autoCheckedServerRef.current = undefined;
-      setStatus("idle");
-    }
-  }, [activeServer, sessions.length, state.device, status]);
+    // 从后台进入工作台必须以当前 daemon 的权威列表重新开始。daemon 切换期间旧 attach
+    // 可能留下 ready/attached 和非空 sessions，不能让这些状态跳过新 daemon 的 bootstrap。
+    autoCheckedServerRef.current = undefined;
+    setStatus("idle");
+  }, [activeServer, state.device]);
 
   useEffect(() => {
     const sessionId = selectedSessionId;
@@ -2819,8 +2928,9 @@ export default function App() {
         void retryConnectionHandlerRef.current?.();
         return;
       }
+      queuePendingTerminalInput(sessionId, data);
       try {
-        await client.sendSessionData(sessionId, new TextEncoder().encode(data));
+        await flushPendingTerminalInput(client, sessionId);
         recordTermdDiagnostic("app_terminal_input_sent", {
           sessionId,
           chunkLength: data.length,
@@ -2831,17 +2941,15 @@ export default function App() {
           chunkLength: data.length,
           error: toSafeError(caught),
         });
-        queuePendingTerminalInput(sessionId, data);
         if (isRetryableConnectionError(caught) && attachReconnectHandlerRef.current(client, caught)) {
           return;
         }
-        clearPendingTerminalInput(sessionId);
         if (!isIgnoredClosingSessionError(sessionId, caught)) {
           setSafeError(caught);
         }
       }
     },
-    [attachClientRef, attachReconnectHandlerRef, attachedSessionRef, attachingSessionIdRef, clearPendingTerminalInput, isIgnoredClosingSessionError, queuePendingTerminalInput, resolveTerminalInputSessionId, selectedSessionId, setSafeError],
+    [attachClientRef, attachReconnectHandlerRef, attachedSessionRef, attachingSessionIdRef, flushPendingTerminalInput, isIgnoredClosingSessionError, queuePendingTerminalInput, resolveTerminalInputSessionId, selectedSessionId, setSafeError],
   );
 
   const handleResize = useCallback(

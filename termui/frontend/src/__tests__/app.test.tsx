@@ -27,7 +27,7 @@ import type {
   UUID,
 } from "../protocol/types";
 import { concatBytes, encodeUtf8, sessionDataFromBase64 } from "../protocol/wire";
-import { DirectClient } from "../protocol/direct-client";
+import { DirectClient, ProtocolClientError } from "../protocol/direct-client";
 import { displayUrlWithoutQueryOrFragment } from "../protocol/url";
 import { clearBrowserState, loadBrowserState } from "../state/browser-state";
 import { MockDaemon } from "../test/mock-daemon";
@@ -622,14 +622,31 @@ async function expectDaemonUrlInAdmin(user: ReturnType<typeof userEvent.setup>, 
 
 async function waitForWorkspaceSession(name?: string, options: { timeout?: number } = {}): Promise<void> {
   await waitForWorkspaceReady();
+  const mobileTitle = document.querySelector<HTMLButtonElement>("button.toolbar-title-button");
+  if (mobileTitle) {
+    if (name === "No session") {
+      await waitFor(() => expect(mobileTitle).toHaveTextContent("No session"), options);
+      return;
+    }
+    if (name) {
+      await waitFor(() => expect(mobileTitle).toHaveTextContent(name), options);
+      return;
+    }
+    await waitFor(() => expect(mobileTitle).not.toHaveTextContent("No session"), options);
+    return;
+  }
+
+  const sessionList = screen.getByRole("region", { name: "sessions" });
   if (name) {
-    await waitFor(() => expect(screen.queryAllByText(name).length).toBeGreaterThan(0), options);
+    if (name === "No session") {
+      await waitFor(() => expect(within(sessionList).getByText("No sessions")).toBeVisible(), options);
+      return;
+    }
+    await waitFor(() => expect(within(sessionList).queryAllByText(name).length).toBeGreaterThan(0), options);
     return;
   }
   await waitFor(() => {
-    const sessionRows = document.querySelectorAll(".session-row").length;
-    const toolbarName = document.querySelector<HTMLElement>(".toolbar-title span")?.textContent?.trim();
-    expect(sessionRows > 0 || Boolean(toolbarName && toolbarName !== "No session")).toBe(true);
+    expect(within(sessionList).queryAllByRole("button", { name: /^Open / }).length).toBeGreaterThan(0);
   }, options);
 }
 
@@ -1548,7 +1565,7 @@ describe("termui web 工作台", () => {
 
     await waitFor(() => expect(daemon.attachedSessions).toContain(nextSession.session_id));
     // 中文注释：终端会话切换以 WebSocket 生命周期为边界。新 session 必须重新走
-    // route/E2EE/auth/terminal.attach，旧连接关闭后 relay/daemon 都能用 transport close
+    // route/hello/auth/terminal.attach，旧连接关闭后 relay/daemon 都能用 transport close
     // 明确清理旧 client context。
     expect(daemon.acceptedConnections).toBeGreaterThan(acceptedBeforeSwitch);
     await waitFor(() => expectTerminalAndMetadataConnectionBudget(daemon), {
@@ -3171,10 +3188,16 @@ describe("termui web 工作台", () => {
 
       await user.click(screen.getByRole("button", { name: "Daemons" }));
       const refreshedManager = await screen.findByLabelText("daemon manager");
+      const sessionListRequestsBeforeSwitch = daemon.receivedPackets.filter(
+        (packet) => packet.kind === "request" && packet.method === "session.list",
+      ).length;
       await user.click(within(refreshedManager).getByRole("button", { name: /Use daemon Daemon 1/ }));
       await waitFor(() => expect(screen.getByLabelText("selected daemon")).toHaveTextContent(daemon.url));
       await user.click(screen.getByRole("button", { name: "Open workspace" }));
-      await waitForWorkspaceSession();
+      await waitFor(() => expect(
+        daemon.receivedPackets.filter((packet) => packet.kind === "request" && packet.method === "session.list").length,
+      ).toBeGreaterThan(sessionListRequestsBeforeSwitch));
+      await waitForWorkspaceSession(DEFAULT_SESSION_NAME, { timeout: 5000 });
     } finally {
       await secondDaemon.stop();
     }
@@ -3272,9 +3295,13 @@ describe("termui web 工作台", () => {
 
       await user.click(within(recoveredManager).getByRole("button", { name: /Use daemon Daemon 1/ }));
       await waitFor(() => expect(screen.getByLabelText("selected daemon")).toHaveTextContent(daemon.url));
+      const sessionListRequestsBeforeRecovery = daemon.receivedPackets.filter(
+        (packet) => packet.kind === "request" && packet.method === "session.list",
+      ).length;
       await user.click(screen.getByRole("button", { name: "Open workspace" }));
-      // 中文注释：full Vitest 下旧 daemon 的失败探测和可用 daemon 的 bootstrap
-      // 可能交错；这里等待具体 session 名，避免把切回后的短暂空列表当成最终状态。
+      await waitFor(() => expect(
+        daemon.receivedPackets.filter((packet) => packet.kind === "request" && packet.method === "session.list").length,
+      ).toBeGreaterThan(sessionListRequestsBeforeRecovery));
       await waitForWorkspaceSession(DEFAULT_SESSION_NAME, { timeout: 5000 });
     } finally {
       if (!secondStopped) {
@@ -3597,6 +3624,173 @@ describe("termui web 工作台", () => {
       { timeout: 2800 },
     );
     await waitFor(() => expect(daemon.sessionDataMessages).toContain("queued-after-online-reconnect"));
+  });
+
+  it("大段 UTF-8 输入按安全帧大小切块且不拆分 emoji", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await waitFor(() => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID]));
+
+    const terminalInput = await waitFor(() => {
+      const inputElement = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
+      expect(inputElement).not.toBeNull();
+      return inputElement!;
+    });
+    const input = `${"a".repeat(64 * 1024 - 1)}🙂${"界".repeat(4096)}`;
+    terminalInput.value = input;
+    fireEvent.input(terminalInput);
+
+    await waitFor(() => expect(daemon.sessionDataMessages.join("")).toBe(input));
+    expect(daemon.sessionDataMessages.length).toBeGreaterThan(1);
+    for (const chunk of daemon.sessionDataMessages) {
+      expect(new TextEncoder().encode(chunk).byteLength).toBeLessThanOrEqual(64 * 1024);
+    }
+  });
+
+  it.each([
+    { label: "首块", failedCall: 1 },
+    { label: "中间块", failedCall: 2 },
+  ])("终端输入在$label发送失败后保留未发送尾部并在重连后续传", async ({ failedCall }) => {
+    const originalSendSessionData = DirectClient.prototype.sendSessionData;
+    let sendCalls = 0;
+    const sendSpy = vi.spyOn(DirectClient.prototype, "sendSessionData").mockImplementation(async function (
+      this: DirectClient,
+      sessionId,
+      bytes,
+    ) {
+      sendCalls += 1;
+      if (sendCalls === failedCall) {
+        throw new ProtocolClientError("connection_closed", "injected terminal send failure");
+      }
+      await originalSendSessionData.call(this, sessionId, bytes);
+    });
+    const user = userEvent.setup();
+    try {
+      render(<App />);
+
+      await pairWithInvite(user, daemon);
+      await waitForWorkspaceSession();
+      await waitFor(() => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID]));
+
+      const terminalInput = await waitFor(() => {
+        const input = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
+        expect(input).not.toBeNull();
+        return input!;
+      });
+      const input = `${"first-".repeat(12_000)}🙂${"tail-".repeat(5_000)}`;
+      terminalInput!.value = input;
+      fireEvent.input(terminalInput!);
+
+      await waitFor(
+        () => expect(daemon.sessionDataMessages.join("")).toBe(input),
+        { timeout: 4000 },
+      );
+      expect(sendCalls).toBeGreaterThan(failedCall);
+      expect(daemon.attachedSessions.length).toBeGreaterThanOrEqual(2);
+    } finally {
+      sendSpy.mockRestore();
+    }
+  });
+
+  it("输入超过离线队列字节预算时丢弃最新溢出并显示安全错误", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await waitFor(() => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID]));
+
+    const terminalInput = await waitFor(() => {
+      const inputElement = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
+      expect(inputElement).not.toBeNull();
+      return inputElement!;
+    });
+    const overflowMarker = "must-not-be-queued";
+    terminalInput.value = `${"界".repeat(400_000)}${overflowMarker}`;
+    fireEvent.input(terminalInput);
+
+    const alert = await screen.findByRole("alert", { name: "Connection error" });
+    expect(alert).toHaveTextContent("terminal_input_overflow");
+    expect(alert).not.toHaveTextContent(overflowMarker);
+
+    await waitFor(() => expect(daemon.sessionDataMessages.length).toBeGreaterThan(0));
+    const received = daemon.sessionDataMessages.join("");
+    expect(new TextEncoder().encode(received).byteLength).toBeLessThanOrEqual(1024 * 1024);
+    expect(received).not.toContain(overflowMarker);
+  });
+
+  it("session 切换会丢弃旧 session 的离线输入且不会串写到新 session", async () => {
+    const originalSendSessionData = DirectClient.prototype.sendSessionData;
+    let failAlphaInput = true;
+    const sendSpy = vi.spyOn(DirectClient.prototype, "sendSessionData").mockImplementation(async function (
+      this: DirectClient,
+      sessionId,
+      bytes,
+    ) {
+      if (failAlphaInput && sessionId === DEFAULT_SESSION_ID) {
+        failAlphaInput = false;
+        throw new ProtocolClientError("connection_closed", "injected alpha transport failure");
+      }
+      await originalSendSessionData.call(this, sessionId, bytes);
+    });
+    const user = userEvent.setup();
+    const betaSession = {
+      session_id: "00000000-0000-0000-0000-000000000499",
+      name: "beta-buffer-target",
+      state: "running",
+      size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+    } as const;
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [
+        {
+          session_id: DEFAULT_SESSION_ID,
+          name: "alpha-buffer-source",
+          state: "running",
+          size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+        },
+        betaSession,
+      ],
+      attachOutput: "session-ready\n",
+    });
+    try {
+      render(<App />);
+
+      await pairWithInvite(user, daemon);
+      await waitForWorkspaceSession("alpha-buffer-source");
+      const terminalInput = await waitFor(() => {
+        const input = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
+        expect(input).not.toBeNull();
+        return input!;
+      });
+      terminalInput.value = "alpha-offline-secret";
+      fireEvent.input(terminalInput);
+      await waitFor(() => expect(failAlphaInput).toBe(false));
+
+      fireEvent.click(screen.getByRole("button", { name: "Open beta-buffer-target" }));
+      await waitFor(() => expect(selectedSessionName()).toBe("beta-buffer-target"));
+      await waitFor(
+        () => expect(daemon.attachedSessions).toContain(betaSession.session_id),
+        { timeout: 3000 },
+      );
+
+      expect(daemon.sessionDataMessages).not.toContain("alpha-offline-secret");
+      const betaInput = await waitFor(() => {
+        const input = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
+        expect(input).not.toBeNull();
+        return input!;
+      });
+      betaInput.value = "beta-after-reconnect";
+      fireEvent.input(betaInput);
+      await waitFor(() => expect(daemon.sessionDataMessages).toContain("beta-after-reconnect"));
+      expect(daemon.sessionDataMessages).not.toContain("alpha-offline-secret");
+    } finally {
+      sendSpy.mockRestore();
+    }
   });
 
   it("focus 和 online 恢复重叠时不会重复 attach 当前 session", async () => {

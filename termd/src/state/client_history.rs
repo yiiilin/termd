@@ -4,14 +4,16 @@
 //! 大得多，所以单独放进 SQLite，并且把连接开闭、attach/detach 做成事务。
 
 use std::collections::{HashMap, HashSet};
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, types::Type};
 use termd_proto::{ClientId, DeviceId, SessionId, SessionState, TerminalSize, UnixTimestampMillis};
 use uuid::Uuid;
 
-use super::{StateError, StateStore, sqlite_state_path_for_state_path, write_sqlite_state_version};
+use super::{
+    StateError, ensure_compatible_connection, open_state_connection,
+    sqlite_state_path_for_state_path, write_sqlite_state_version,
+};
 
 /// 客户端列表返回给协议层的持久化摘要。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,11 +57,10 @@ pub struct ClientHistoryStore {
 impl ClientHistoryStore {
     /// 打开或创建 SQLite store，并把运行态字段重置为离线。
     pub fn open(state_path: impl AsRef<Path>) -> Result<Self, StateError> {
-        StateStore::ensure_compatible(state_path.as_ref())?;
         let path = sqlite_state_path_for_state_path(state_path.as_ref());
-        ensure_parent_directory(&path)?;
 
-        let conn = Connection::open(&path).map_err(|source| sqlite_error(&path, source))?;
+        let conn = open_state_connection(&path)?;
+        ensure_compatible_connection(&conn, &path)?;
         let mut store = Self { path, conn };
         store.initialize()?;
         write_sqlite_state_version(&store.conn, &store.path)?;
@@ -129,71 +130,69 @@ impl ClientHistoryStore {
             )
             .map_err(|source| sqlite_error(&self.path, source))?;
 
-        self.ensure_daemon_clients_name_column()?;
-        self.ensure_daemon_sessions_display_order_column()?;
-        self.ensure_daemon_sessions_display_order_index()?;
+        self.ensure_daemon_history_schema()?;
         self.reset_runtime_state()?;
         Ok(())
     }
 
-    fn ensure_daemon_clients_name_column(&self) -> Result<(), StateError> {
-        if self.column_exists("daemon_clients", "name")? {
-            return Ok(());
-        }
-
-        // 旧版 SQLite 没有客户端展示名列；在线历史保留，后续连接会自动补充 name。
-        self.conn
-            .execute("ALTER TABLE daemon_clients ADD COLUMN name TEXT", [])
+    fn ensure_daemon_history_schema(&mut self) -> Result<(), StateError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|source| sqlite_error(&self.path, source))?;
-        Ok(())
-    }
 
-    fn ensure_daemon_sessions_display_order_column(&self) -> Result<(), StateError> {
-        if self.column_exists("daemon_sessions", "display_order")? {
-            return Ok(());
+        // 拿到写锁后重检两个旧 schema，保证并发 opener 只迁移一次且一起回滚。
+        if !column_exists(&tx, &self.path, "daemon_clients", "name")? {
+            tx.execute("ALTER TABLE daemon_clients ADD COLUMN name TEXT", [])
+                .map_err(|source| sqlite_error(&self.path, source))?;
         }
 
+        let added_display_order =
+            !column_exists(&tx, &self.path, "daemon_sessions", "display_order")?;
         // 旧版只按 created_at 排序；迁移时把现有行固化成 display_order，
         // 后续拖拽排序就有 daemon 端权威状态，不再依赖某个浏览器的内存数组。
-        self.conn
-            .execute(
+        if added_display_order {
+            tx.execute(
                 "ALTER TABLE daemon_sessions ADD COLUMN display_order INTEGER NOT NULL DEFAULT 0",
                 [],
             )
             .map_err(|source| sqlite_error(&self.path, source))?;
-        let mut stmt = self
-            .conn
-            .prepare(
-                r#"
-                SELECT session_id
-                FROM daemon_sessions
-                ORDER BY created_at_ms DESC, session_id DESC
-                "#,
-            )
-            .map_err(|source| sqlite_error(&self.path, source))?;
-        let rows = stmt
-            .query_map([], |row| row.get::<_, String>(0))
-            .map_err(|source| sqlite_error(&self.path, source))?;
-        let mut session_ids = Vec::new();
-        for row in rows {
-            session_ids.push(row.map_err(|source| sqlite_error(&self.path, source))?);
-        }
-        drop(stmt);
-        for (index, session_id) in session_ids.into_iter().enumerate() {
-            self.conn
-                .execute(
+            let mut stmt = tx
+                .prepare(
+                    r#"
+                    SELECT session_id
+                    FROM daemon_sessions
+                    ORDER BY created_at_ms DESC, session_id DESC
+                    "#,
+                )
+                .map_err(|source| sqlite_error(&self.path, source))?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|source| sqlite_error(&self.path, source))?;
+            let mut session_ids = Vec::new();
+            for row in rows {
+                session_ids.push(row.map_err(|source| sqlite_error(&self.path, source))?);
+            }
+            drop(stmt);
+            for (index, session_id) in session_ids.into_iter().enumerate() {
+                tx.execute(
                     "UPDATE daemon_sessions SET display_order = ?1 WHERE session_id = ?2",
                     params![index as i64, session_id],
                 )
                 .map_err(|source| sqlite_error(&self.path, source))?;
+            }
         }
-        Ok(())
-    }
 
-    fn ensure_daemon_sessions_display_order_index(&self) -> Result<(), StateError> {
-        // display_order 是后加列；旧库初始化时必须先完成列迁移，再重建依赖该列的索引。
-        self.conn
-            .execute_batch(
+        let expected_index_columns = ["state", "display_order", "created_at_ms", "session_id"];
+        let index_is_current = index_columns(&tx, &self.path, "idx_daemon_sessions_state")?
+            .is_some_and(|columns| {
+                columns
+                    .iter()
+                    .map(String::as_str)
+                    .eq(expected_index_columns)
+            });
+        if !index_is_current {
+            tx.execute_batch(
                 r#"
                 DROP INDEX IF EXISTS idx_daemon_sessions_state;
                 CREATE INDEX idx_daemon_sessions_state
@@ -201,24 +200,10 @@ impl ClientHistoryStore {
                 "#,
             )
             .map_err(|source| sqlite_error(&self.path, source))?;
-        Ok(())
-    }
-
-    fn column_exists(&self, table: &str, column: &str) -> Result<bool, StateError> {
-        let mut stmt = self
-            .conn
-            .prepare(&format!("PRAGMA table_info({table})"))
-            .map_err(|source| sqlite_error(&self.path, source))?;
-        let rows = stmt
-            .query_map([], |row| row.get::<_, String>(1))
-            .map_err(|source| sqlite_error(&self.path, source))?;
-
-        for row in rows {
-            if row.map_err(|source| sqlite_error(&self.path, source))? == column {
-                return Ok(true);
-            }
         }
-        Ok(false)
+        tx.commit()
+            .map_err(|source| sqlite_error(&self.path, source))?;
+        Ok(())
     }
 
     /// 启动时把活跃连接状态清成空，这样重启后不会把旧进程残留的在线状态误认为真实在线。
@@ -966,7 +951,7 @@ impl ClientHistoryStore {
             let rows = stmt
                 .query_map([], |row| {
                     let device_id = parse_device_id(row.get::<_, String>(0)?)?;
-                    let session_id = parse_session_id(row.get::<_, String>(1)?)?;
+                    let session_id = parse_session_id(row.get::<_, String>(1)?, 1)?;
                     Ok((device_id, session_id))
                 })
                 .map_err(|source| sqlite_error(&self.path, source))?;
@@ -997,8 +982,8 @@ impl ClientHistoryStore {
                 let device_id = parse_device_id(row.get::<_, String>(0)?)?;
                 let name = row.get::<_, Option<String>>(1)?;
                 let peer_ip = row.get::<_, Option<String>>(2)?;
-                let connected_at_ms = UnixTimestampMillis(row.get::<_, i64>(3)? as u64);
-                let last_seen_at_ms = UnixTimestampMillis(row.get::<_, i64>(4)? as u64);
+                let connected_at_ms = integer_to_timestamp(row.get::<_, i64>(3)?, 3)?;
+                let last_seen_at_ms = integer_to_timestamp(row.get::<_, i64>(4)?, 4)?;
                 let active_connection_count = row.get::<_, i64>(5)?;
 
                 Ok(ClientHistoryRow {
@@ -1066,9 +1051,9 @@ struct ClientHistoryRow {
 fn session_history_record_from_row(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<SessionHistoryRecord> {
-    let session_id = parse_session_id(row.get::<_, String>(0)?)?;
+    let session_id = parse_session_id(row.get::<_, String>(0)?, 0)?;
     let name = row.get::<_, Option<String>>(1)?;
-    let state = parse_session_state(row.get::<_, String>(2)?)?;
+    let state = parse_session_state(row.get::<_, String>(2)?, 2)?;
     let rows = integer_to_u16(row.get::<_, i64>(3)?, 3)?;
     let cols = integer_to_u16(row.get::<_, i64>(4)?, 4)?;
     let pixel_width = integer_to_u16(row.get::<_, i64>(5)?, 5)?;
@@ -1076,8 +1061,8 @@ fn session_history_record_from_row(
     let root_path = row.get::<_, String>(7)?;
     let files_path = row.get::<_, Option<String>>(8)?;
     let display_order = row.get::<_, i64>(9)?;
-    let created_at_ms = UnixTimestampMillis(row.get::<_, i64>(10)? as u64);
-    let updated_at_ms = UnixTimestampMillis(row.get::<_, i64>(11)? as u64);
+    let created_at_ms = integer_to_timestamp(row.get::<_, i64>(10)?, 10)?;
+    let updated_at_ms = integer_to_timestamp(row.get::<_, i64>(11)?, 11)?;
 
     Ok(SessionHistoryRecord {
         session_id,
@@ -1094,20 +1079,6 @@ fn session_history_record_from_row(
         display_order,
         created_at_ms,
         updated_at_ms,
-    })
-}
-
-fn ensure_parent_directory(path: &Path) -> Result<(), StateError> {
-    let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    else {
-        return Ok(());
-    };
-
-    fs::create_dir_all(parent).map_err(|source| StateError::CreateDirectory {
-        path: parent.to_path_buf(),
-        source,
     })
 }
 
@@ -1144,22 +1115,62 @@ fn parse_device_id(raw: String) -> rusqlite::Result<DeviceId> {
     })
 }
 
-fn parse_session_id(raw: String) -> rusqlite::Result<SessionId> {
+fn parse_session_id(raw: String, column: usize) -> rusqlite::Result<SessionId> {
     Uuid::parse_str(&raw).map(SessionId).map_err(|source| {
-        rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(source))
+        rusqlite::Error::FromSqlConversionFailure(column, Type::Text, Box::new(source))
     })
 }
 
-fn parse_session_state(raw: String) -> rusqlite::Result<SessionState> {
+fn parse_session_state(raw: String, column: usize) -> rusqlite::Result<SessionState> {
     match raw.as_str() {
         "created" => Ok(SessionState::Created),
         "running" => Ok(SessionState::Running),
         "closed" => Ok(SessionState::Closed),
         _ => Err(rusqlite::Error::FromSqlConversionFailure(
-            0,
+            column,
             Type::Text,
             format!("unknown session state: {raw}").into(),
         )),
+    }
+}
+
+fn column_exists(
+    conn: &Connection,
+    path: &Path,
+    table: &str,
+    column: &str,
+) -> Result<bool, StateError> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|source| sqlite_error(path, source))?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|source| sqlite_error(path, source))?;
+    for row in rows {
+        if row.map_err(|source| sqlite_error(path, source))? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn index_columns(
+    conn: &Connection,
+    path: &Path,
+    index: &str,
+) -> Result<Option<Vec<String>>, StateError> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA index_info({index})"))
+        .map_err(|source| sqlite_error(path, source))?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(2))
+        .map_err(|source| sqlite_error(path, source))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|source| sqlite_error(path, source))?;
+    if columns.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(columns))
     }
 }
 
@@ -1169,15 +1180,25 @@ fn integer_to_u16(value: i64, column: usize) -> rusqlite::Result<u16> {
     })
 }
 
+fn integer_to_timestamp(value: i64, column: usize) -> rusqlite::Result<UnixTimestampMillis> {
+    u64::try_from(value)
+        .map(UnixTimestampMillis)
+        .map_err(|source| {
+            rusqlite::Error::FromSqlConversionFailure(column, Type::Integer, Box::new(source))
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::sync::{Arc, Barrier};
 
     #[test]
     fn store_tracks_current_connections_and_resets_runtime_state_on_open() {
-        let state_path =
-            std::env::temp_dir().join(format!("termd-client-history-{}.json", std::process::id()));
-        let _ = fs::remove_file(sqlite_state_path_for_state_path(&state_path));
+        let state_path = temp_state_path("termd-client-history");
 
         let device_id = DeviceId::new();
         let session_id = SessionId::new();
@@ -1213,15 +1234,54 @@ mod tests {
             assert!(clients[0].attached_session_ids.is_empty());
         }
 
-        let _ = fs::remove_file(sqlite_state_path_for_state_path(&state_path));
-        let _ = fs::remove_file(state_path);
+        cleanup_state_paths(&state_path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn store_database_and_generated_sidecars_have_private_permissions() {
+        let state_path = temp_state_path("termd-client-history-private-existing");
+        let sqlite_path = sqlite_state_path_for_state_path(&state_path);
+        let sidecars = sqlite_sidecar_paths(&sqlite_path);
+
+        let store = ClientHistoryStore::open(&state_path).unwrap();
+
+        assert_eq!(unix_mode(&sqlite_path), 0o600);
+        assert_eq!(unix_mode(&sidecars[0]), 0o600);
+        assert_eq!(unix_mode(&sidecars[1]), 0o600);
+        assert_eq!(unix_mode(state_path.parent().unwrap()), 0o700);
+        drop(store);
+        cleanup_state_paths(&state_path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn store_rejects_sqlite_symlink_without_touching_target() {
+        let state_path = temp_state_path("termd-client-history-symlink");
+        let sqlite_path = sqlite_state_path_for_state_path(&state_path);
+        let target_path =
+            temp_state_path("termd-client-history-symlink-target").with_extension("sqlite");
+
+        fs::write(&target_path, "").unwrap();
+        set_unix_mode(&target_path, 0o644);
+        symlink(&target_path, &sqlite_path).unwrap();
+
+        let error = ClientHistoryStore::open(&state_path).unwrap_err();
+
+        assert_unsafe_sqlite_path(
+            error,
+            &sqlite_path,
+            super::super::UnsafeSqlitePathKind::Symlink,
+        );
+        assert_eq!(unix_mode(&target_path), 0o644);
+        cleanup_state_paths(&state_path);
+        let _ = fs::remove_file(&target_path);
+        let _ = fs::remove_dir(target_path.parent().unwrap());
     }
 
     #[test]
     fn store_persists_session_metadata_and_file_tree_path() {
-        let state_path =
-            std::env::temp_dir().join(format!("termd-session-store-{}.json", std::process::id()));
-        let _ = fs::remove_file(sqlite_state_path_for_state_path(&state_path));
+        let state_path = temp_state_path("termd-session-store");
 
         let session_id = SessionId::new();
         let now_ms = UnixTimestampMillis(1_710_000_000_000);
@@ -1269,17 +1329,12 @@ mod tests {
             );
         }
 
-        let _ = fs::remove_file(sqlite_state_path_for_state_path(&state_path));
-        let _ = fs::remove_file(state_path);
+        cleanup_state_paths(&state_path);
     }
 
     #[test]
     fn record_session_runtime_state_promotes_created_metadata_without_reopening_closed_rows() {
-        let state_path = std::env::temp_dir().join(format!(
-            "termd-session-runtime-state-store-{}.json",
-            std::process::id()
-        ));
-        let _ = fs::remove_file(sqlite_state_path_for_state_path(&state_path));
+        let state_path = temp_state_path("termd-session-runtime-state-store");
         let session_id = SessionId::new();
 
         {
@@ -1330,17 +1385,12 @@ mod tests {
             assert_eq!(closed.size, TerminalSize::new(30, 100));
         }
 
-        let _ = fs::remove_file(sqlite_state_path_for_state_path(&state_path));
-        let _ = fs::remove_file(state_path);
+        cleanup_state_paths(&state_path);
     }
 
     #[test]
     fn store_persists_session_display_order_across_reopen() {
-        let state_path = std::env::temp_dir().join(format!(
-            "termd-session-order-store-{}.json",
-            std::process::id()
-        ));
-        let _ = fs::remove_file(sqlite_state_path_for_state_path(&state_path));
+        let state_path = temp_state_path("termd-session-order-store");
         let first_session_id = SessionId::new();
         let second_session_id = SessionId::new();
         let third_session_id = SessionId::new();
@@ -1399,18 +1449,13 @@ mod tests {
             );
         }
 
-        let _ = fs::remove_file(sqlite_state_path_for_state_path(&state_path));
-        let _ = fs::remove_file(state_path);
+        cleanup_state_paths(&state_path);
     }
 
     #[test]
     fn store_rejects_legacy_session_rows_without_state_schema_version() {
-        let state_path = std::env::temp_dir().join(format!(
-            "termd-session-order-legacy-reject-{}.json",
-            std::process::id()
-        ));
+        let state_path = temp_state_path("termd-session-order-legacy-reject");
         let sqlite_path = sqlite_state_path_for_state_path(&state_path);
-        let _ = fs::remove_file(&sqlite_path);
         let old_session_id = SessionId::new();
         let new_session_id = SessionId::new();
 
@@ -1469,18 +1514,13 @@ mod tests {
             }
         ));
 
-        let _ = fs::remove_file(sqlite_state_path_for_state_path(&state_path));
-        let _ = fs::remove_file(state_path);
+        cleanup_state_paths(&state_path);
     }
 
     #[test]
     fn store_patches_v2_session_rows_into_stable_display_order() {
-        let state_path = std::env::temp_dir().join(format!(
-            "termd-session-order-v2-patch-{}.json",
-            std::process::id()
-        ));
+        let state_path = temp_state_path("termd-session-order-v2-patch");
         let sqlite_path = sqlite_state_path_for_state_path(&state_path);
-        let _ = fs::remove_file(&sqlite_path);
         let old_session_id = SessionId::new();
         let new_session_id = SessionId::new();
 
@@ -1534,29 +1574,314 @@ mod tests {
             .unwrap();
         }
 
+        for _ in 0..2 {
+            let store = ClientHistoryStore::open(&state_path).unwrap();
+
+            assert_eq!(
+                store
+                    .list_sessions()
+                    .unwrap()
+                    .into_iter()
+                    .map(|record| (record.session_id, record.display_order))
+                    .collect::<Vec<_>>(),
+                vec![(new_session_id, 0), (old_session_id, 1)]
+            );
+        }
+
+        cleanup_state_paths(&state_path);
+    }
+
+    #[test]
+    fn store_rolls_back_display_order_column_when_backfill_fails() {
+        let state_path = temp_state_path("termd-session-order-atomic-migration");
+        let sqlite_path = sqlite_state_path_for_state_path(&state_path);
+
+        {
+            let conn = Connection::open(&sqlite_path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE daemon_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at_ms INTEGER NOT NULL
+                );
+                CREATE TABLE daemon_sessions (
+                    session_id TEXT PRIMARY KEY,
+                    name TEXT,
+                    state TEXT NOT NULL,
+                    rows INTEGER NOT NULL,
+                    cols INTEGER NOT NULL,
+                    pixel_width INTEGER NOT NULL,
+                    pixel_height INTEGER NOT NULL,
+                    root_path TEXT NOT NULL,
+                    files_path TEXT,
+                    created_at_ms INTEGER NOT NULL,
+                    updated_at_ms INTEGER NOT NULL
+                );
+                CREATE TABLE daemon_clients (
+                    device_id TEXT PRIMARY KEY,
+                    peer_ip TEXT,
+                    connected_at_ms INTEGER NOT NULL,
+                    last_seen_at_ms INTEGER NOT NULL,
+                    active_connection_count INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TRIGGER fail_display_order_backfill
+                BEFORE UPDATE OF display_order ON daemon_sessions
+                BEGIN
+                    SELECT RAISE(ABORT, 'forced display_order backfill failure');
+                END;
+                "#,
+            )
+            .unwrap();
+            write_sqlite_state_version(&conn, &sqlite_path).unwrap();
+            conn.execute(
+                r#"
+                INSERT INTO daemon_sessions (
+                    session_id, name, state, rows, cols, pixel_width, pixel_height,
+                    root_path, files_path, created_at_ms, updated_at_ms
+                )
+                VALUES (?1, 'shell', 'running', 24, 80, 0, 0, '/home/me', NULL, 1000, 1000)
+                "#,
+                params![session_id_text(SessionId::new())],
+            )
+            .unwrap();
+        }
+
+        ClientHistoryStore::open(&state_path).unwrap_err();
+
+        let conn = Connection::open(&sqlite_path).unwrap();
+        let mut stmt = conn.prepare("PRAGMA table_info(daemon_sessions)").unwrap();
+        let columns = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(!columns.iter().any(|column| column == "display_order"));
+        drop(stmt);
+        let mut stmt = conn.prepare("PRAGMA table_info(daemon_clients)").unwrap();
+        let columns = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(!columns.iter().any(|column| column == "name"));
+        drop(stmt);
+        drop(conn);
+        cleanup_state_paths(&state_path);
+    }
+
+    #[test]
+    fn concurrent_openers_migrate_display_order_once() {
+        let state_path = temp_state_path("termd-session-order-concurrent-migration");
+        let sqlite_path = sqlite_state_path_for_state_path(&state_path);
+
+        {
+            let conn = Connection::open(&sqlite_path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE daemon_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at_ms INTEGER NOT NULL
+                );
+                CREATE TABLE daemon_sessions (
+                    session_id TEXT PRIMARY KEY,
+                    name TEXT,
+                    state TEXT NOT NULL,
+                    rows INTEGER NOT NULL,
+                    cols INTEGER NOT NULL,
+                    pixel_width INTEGER NOT NULL,
+                    pixel_height INTEGER NOT NULL,
+                    root_path TEXT NOT NULL,
+                    files_path TEXT,
+                    created_at_ms INTEGER NOT NULL,
+                    updated_at_ms INTEGER NOT NULL
+                );
+                CREATE TABLE daemon_clients (
+                    device_id TEXT PRIMARY KEY,
+                    peer_ip TEXT,
+                    connected_at_ms INTEGER NOT NULL,
+                    last_seen_at_ms INTEGER NOT NULL,
+                    active_connection_count INTEGER NOT NULL DEFAULT 0
+                );
+                "#,
+            )
+            .unwrap();
+            write_sqlite_state_version(&conn, &sqlite_path).unwrap();
+            for index in 0..200 {
+                conn.execute(
+                    r#"
+                    INSERT INTO daemon_sessions (
+                        session_id, name, state, rows, cols, pixel_width, pixel_height,
+                        root_path, files_path, created_at_ms, updated_at_ms
+                    )
+                    VALUES (?1, NULL, 'running', 24, 80, 0, 0, '/', NULL, ?2, ?2)
+                    "#,
+                    params![session_id_text(SessionId::new()), index],
+                )
+                .unwrap();
+            }
+        }
+        super::super::StateStore::ensure_compatible(&state_path).unwrap();
+
+        let barrier = Arc::new(Barrier::new(3));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let state_path = state_path.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    ClientHistoryStore::open(state_path)
+                })
+            })
+            .collect();
+        barrier.wait();
+
+        for handle in handles {
+            let store = handle.join().unwrap().unwrap();
+            assert_eq!(store.list_sessions().unwrap().len(), 200);
+        }
+        cleanup_state_paths(&state_path);
+    }
+
+    #[test]
+    fn current_schema_open_does_not_rebuild_session_order_index() {
+        let state_path = temp_state_path("termd-current-schema-index-stable");
+        let first = ClientHistoryStore::open(&state_path).unwrap();
+        let first_schema_version = first
+            .conn
+            .query_row("PRAGMA schema_version", [], |row| row.get::<_, i64>(0))
+            .unwrap();
+        drop(first);
+
+        let second = ClientHistoryStore::open(&state_path).unwrap();
+        let second_schema_version = second
+            .conn
+            .query_row("PRAGMA schema_version", [], |row| row.get::<_, i64>(0))
+            .unwrap();
+
+        assert_eq!(second_schema_version, first_schema_version);
+        drop(second);
+        cleanup_state_paths(&state_path);
+    }
+
+    #[test]
+    fn corrupt_session_state_reports_selected_column() {
+        let state_path = temp_state_path("termd-session-corrupt-state-column");
         let store = ClientHistoryStore::open(&state_path).unwrap();
+        store
+            .conn
+            .execute(
+                r#"
+                INSERT INTO daemon_sessions (
+                    session_id, name, state, rows, cols, pixel_width, pixel_height,
+                    root_path, files_path, display_order, created_at_ms, updated_at_ms
+                )
+                VALUES (?1, NULL, 'corrupt', 24, 80, 0, 0, '/', NULL, 0, 0, 0)
+                "#,
+                params![session_id_text(SessionId::new())],
+            )
+            .unwrap();
 
-        assert_eq!(
-            store
-                .list_sessions()
-                .unwrap()
-                .into_iter()
-                .map(|record| (record.session_id, record.display_order))
-                .collect::<Vec<_>>(),
-            vec![(new_session_id, 0), (old_session_id, 1)]
-        );
+        let error = store.list_sessions().unwrap_err();
 
-        let _ = fs::remove_file(sqlite_state_path_for_state_path(&state_path));
-        let _ = fs::remove_file(state_path);
+        assert!(matches!(
+            error,
+            StateError::Sqlite {
+                source: rusqlite::Error::FromSqlConversionFailure(2, Type::Text, _),
+                ..
+            }
+        ));
+        drop(store);
+        cleanup_state_paths(&state_path);
+    }
+
+    #[test]
+    fn corrupt_attached_session_id_reports_selected_column() {
+        let state_path = temp_state_path("termd-attached-session-corrupt-id-column");
+        let store = ClientHistoryStore::open(&state_path).unwrap();
+        let device_id = DeviceId::new();
+        store
+            .conn
+            .execute(
+                r#"
+                INSERT INTO daemon_clients (
+                    device_id, name, peer_ip, connected_at_ms, last_seen_at_ms,
+                    active_connection_count
+                )
+                VALUES (?1, NULL, NULL, 0, 0, 0)
+                "#,
+                params![device_id_text(device_id)],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                r#"
+                INSERT INTO daemon_client_attached_sessions (
+                    device_id, connection_id, session_id
+                )
+                VALUES (?1, ?2, 'corrupt')
+                "#,
+                params![
+                    device_id_text(device_id),
+                    connection_id_text(ClientId::new())
+                ],
+            )
+            .unwrap();
+
+        let error = store.list_clients().unwrap_err();
+
+        assert!(matches!(
+            error,
+            StateError::Sqlite {
+                source: rusqlite::Error::FromSqlConversionFailure(1, Type::Text, _),
+                ..
+            }
+        ));
+        drop(store);
+        cleanup_state_paths(&state_path);
+    }
+
+    #[test]
+    fn store_rejects_negative_client_timestamp_from_sqlite() {
+        let state_path = temp_state_path("termd-client-history-negative-timestamp");
+        cleanup_state_paths(&state_path);
+        let store = ClientHistoryStore::open(&state_path).unwrap();
+        store
+            .conn
+            .execute(
+                r#"
+                INSERT INTO daemon_clients (
+                    device_id, name, peer_ip, connected_at_ms, last_seen_at_ms,
+                    active_connection_count
+                )
+                VALUES (?1, NULL, NULL, -1, 0, 0)
+                "#,
+                params![device_id_text(DeviceId::new())],
+            )
+            .unwrap();
+
+        let error = store.list_clients().unwrap_err();
+
+        assert!(matches!(
+            error,
+            StateError::Sqlite {
+                source: rusqlite::Error::FromSqlConversionFailure(
+                    3,
+                    rusqlite::types::Type::Integer,
+                    _
+                ),
+                ..
+            }
+        ));
+        drop(store);
+        cleanup_state_paths(&state_path);
     }
 
     #[test]
     fn store_repairs_restored_session_metadata_without_overwriting_user_values() {
-        let state_path = std::env::temp_dir().join(format!(
-            "termd-session-restore-store-{}.json",
-            std::process::id()
-        ));
-        let _ = fs::remove_file(sqlite_state_path_for_state_path(&state_path));
+        let state_path = temp_state_path("termd-session-restore-store");
         let missing_session_id = SessionId::new();
         let existing_session_id = SessionId::new();
 
@@ -1623,7 +1948,69 @@ mod tests {
             assert_eq!(existing.size, TerminalSize::new(40, 120));
         }
 
-        let _ = fs::remove_file(sqlite_state_path_for_state_path(&state_path));
+        cleanup_state_paths(&state_path);
+    }
+
+    fn temp_state_path(name: &str) -> PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "{}-{}-{}",
+            name,
+            std::process::id(),
+            crate::state::current_unix_timestamp_millis().0
+        ));
+        fs::create_dir(&directory).unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        directory.join("daemon-state.json")
+    }
+
+    fn cleanup_state_paths(state_path: &Path) {
+        let sqlite_path = sqlite_state_path_for_state_path(state_path);
         let _ = fs::remove_file(state_path);
+        for sidecar_path in sqlite_sidecar_paths(&sqlite_path) {
+            let _ = fs::remove_file(sidecar_path);
+        }
+        let _ = fs::remove_file(&sqlite_path);
+        if let Some(parent) = state_path.parent() {
+            let _ = fs::remove_dir(parent);
+        }
+    }
+
+    fn sqlite_sidecar_paths(sqlite_path: &Path) -> [PathBuf; 2] {
+        [
+            sqlite_sidecar_path(sqlite_path, "-wal"),
+            sqlite_sidecar_path(sqlite_path, "-shm"),
+        ]
+    }
+
+    fn sqlite_sidecar_path(sqlite_path: &Path, suffix: &str) -> PathBuf {
+        let mut path = sqlite_path.as_os_str().to_os_string();
+        path.push(suffix);
+        PathBuf::from(path)
+    }
+
+    #[cfg(unix)]
+    fn unix_mode(path: &Path) -> u32 {
+        fs::symlink_metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    fn set_unix_mode(path: &Path, mode: u32) {
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn assert_unsafe_sqlite_path(
+        error: StateError,
+        expected_path: &Path,
+        expected_kind: super::super::UnsafeSqlitePathKind,
+    ) {
+        match error {
+            StateError::UnsafeSqlitePath { path, kind } => {
+                assert_eq!(path, expected_path);
+                assert_eq!(kind, expected_kind);
+            }
+            other => panic!("expected UnsafeSqlitePath, got {other:?}"),
+        }
     }
 }

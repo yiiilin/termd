@@ -11,8 +11,8 @@
 | Rust workspace | `cargo test --workspace --locked` |
 | pairing CLI E2E | 启动本地 `termd`，运行 `termd pair --qr` 获取 `termd-pair:v2` 邀请码，再运行 `termctl pair --payload` 完成设备配对 |
 | termctl direct E2E | `cargo test -p termctl --test direct_daemon_e2e` |
-| termrelay E2E | `cargo test -p termrelay --test relay_e2e` |
-| relay runtime E2E | 启动本地 `termrelay` 和 `termd --relay`，通过统一 `/ws` relay URL 运行 `termctl pair/new/list` |
+| termrelay open-relay E2E | `cargo test -p termrelay --test relay_e2e`；binary 使用 `--allow-open-relay`，覆盖路由、明文/二进制 frame 转发、旧 WebSocket `encrypted_frame` 兼容和 `server_id` 隔离，不覆盖 trusted admission |
+| trusted relay admission | `termrelay/src/ws.rs` 单元测试覆盖 daemon token、pair ticket、device admission 与 replay；`scripts/qa.sh` 启动真实 `termrelay` 和 `termd --relay` 覆盖真实 trusted admission/routing |
 | 安装脚本 smoke | `bash scripts/test-installers.sh`，检查三个安装脚本的帮助和 systemd 语义 |
 | termui Web | `npm ci`、`npm run typecheck`、`npm run test -- --run`、`npm run build`、`npm run test:e2e`、`npm audit --audit-level=high`；Playwright 覆盖 mock daemon 和真实 relay daemon |
 | termui Native | 有 Flutter/Dart 时运行 `flutter pub get`、`flutter analyze`、`flutter test`；缺失时运行结构和敏感字符串 fallback 检查。 |
@@ -35,7 +35,7 @@ TERMD_QA_SKIP_NPM_CI=1 bash scripts/qa.sh
 - 确认反向代理保留 WebSocket upgrade，并且 setup token、daemon token 或旧 `relay_token` 不出现在 access log 或 error log。
 - 确认 `termrelay /healthz` 可从公网 health check 入口访问，而 `termd /healthz` 仍留在私网或 loopback。
 - 确认 `termd /local/pairing-token` 不能从公网入口访问。
-- 确认 `termctl` 与 Web 仍然只把 relay 当作 transport，不把 relay 当成可信业务层。
+- 确认 relay 按可信 admission/routing 层部署：TLS 终止后可见明文 WebSocket/HTTP tunnel 应用流量，但 pairing、auth 和 session 权限仍由 daemon 最终校验。
 
 ## 已知非阻断项
 

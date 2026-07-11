@@ -247,7 +247,7 @@ export function useWorkspaceConnection(options: UseWorkspaceConnectionOptions) {
       }
       throw lastConnectError ?? new ProtocolClientError("connection_error", "connection error");
     } catch (caught) {
-      // 中文注释：E2EE/auth 失败时必须回收半开 socket，避免 relay 上堆积认证未完成 client。
+      // 中文注释：route/hello/auth 失败时必须回收半开 socket，避免 relay 上堆积未完成 client。
       client?.close();
       throw caught;
     } finally {

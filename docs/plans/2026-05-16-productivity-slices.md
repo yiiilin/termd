@@ -1,5 +1,7 @@
 # Termd Productivity Slices Implementation Plan
 
+> 历史状态提示：本文记录当时的计划/实现状态，不代表当前 0.6 协议契约；现行边界以 `TECH.md` 和 `docs/deployment.md` 为准。
+
 > **For agentic workers:** REQUIRED: keep this file as the source of truth. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 实施终端搜索、Git diff 查看、移动端输入增强和通知能力，并保留安全的文件编辑/删除能力。

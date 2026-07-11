@@ -87,7 +87,8 @@ const PENDING_CLIENT_PAIR_DEADLINE: Duration = Duration::from_secs(20);
 const PENDING_CLIENT_PAIR_DEADLINE: Duration = Duration::from_millis(250);
 const PENDING_CLIENTS_PER_ROOM_LIMIT: usize = 64;
 // 中文注释：client route_ready 先于 daemon data 反连完成返回时，browser 可能立刻发送
-// hello/auth/attach。relay 只做短暂 opaque 缓冲，避免公网反连慢几百毫秒就让前端超时。
+// hello/auth/attach。relay 只做短暂的不透明转发缓冲；这里的“不透明”表示不解释业务语义，
+// 不表示内容对 trusted relay 保密。
 const PRE_PAIR_CLIENT_BUFFER_MAX_FRAMES: usize = 256;
 const PRE_PAIR_CLIENT_BUFFER_MAX_BYTES: usize = 4 * 1024 * 1024;
 const PRE_PAIR_ROOM_BUFFER_MAX_BYTES: usize = PRE_PAIR_CLIENT_BUFFER_MAX_BYTES * 2;
@@ -400,8 +401,26 @@ pub struct RelayState {
     inner: Arc<RelayRegistry>,
     auth_token: Option<String>,
     admission: Arc<RwLock<RelayAdmissionState>>,
+    #[cfg(test)]
+    admission_mutation_test_hook: Arc<RwLock<Option<Arc<AdmissionMutationTestHook>>>>,
     setup_token: Option<String>,
     registry_path: Option<PathBuf>,
+}
+
+#[cfg(test)]
+struct AdmissionMutationTestHook {
+    reached: std::sync::Barrier,
+    resume: std::sync::Barrier,
+}
+
+#[cfg(test)]
+impl AdmissionMutationTestHook {
+    fn new() -> Self {
+        Self {
+            reached: std::sync::Barrier::new(2),
+            resume: std::sync::Barrier::new(2),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -545,6 +564,8 @@ impl RelayState {
             inner: Arc::new(RelayRegistry::default()),
             auth_token,
             admission: Arc::new(RwLock::new(RelayAdmissionState::default())),
+            #[cfg(test)]
+            admission_mutation_test_hook: Arc::new(RwLock::new(None)),
             setup_token: None,
             registry_path: None,
         }
@@ -689,22 +710,24 @@ impl RelayState {
         expires_at_ms: UnixTimestampMillis,
         daemon_token: Option<&str>,
     ) -> Result<RegisterPairTicketOutcome, RegisterAdmissionError> {
-        self.authorize_daemon_bearer(server_id, daemon_token)?;
-        if !relay_auth_token_has_safe_length(&pair_ticket) {
-            return Err(RegisterAdmissionError::PairTicketTooShort);
-        }
-        if expires_at_ms.0 <= relay_now_ms() {
-            return Err(RegisterAdmissionError::InvalidExpiration);
-        }
-        let mut admission = self
-            .admission
-            .write()
-            .map_err(|_| RegisterAdmissionError::Poisoned)?;
-        prune_expired_pair_tickets(&mut admission, relay_now_ms());
-        admission.pair_ticket_hashes.insert(
-            (server_id, relay_daemon_token_hash(&pair_ticket)),
-            expires_at_ms,
-        );
+        let pair_ticket_has_safe_length = relay_auth_token_has_safe_length(&pair_ticket);
+        let expiration_is_valid = expires_at_ms.0 > relay_now_ms();
+        let pair_ticket_hash = relay_daemon_token_hash(&pair_ticket);
+        #[cfg(test)]
+        self.wait_before_admission_mutation();
+        self.mutate_daemon_admission(server_id, daemon_token, |admission| {
+            if !pair_ticket_has_safe_length {
+                return Err(RegisterAdmissionError::PairTicketTooShort);
+            }
+            if !expiration_is_valid {
+                return Err(RegisterAdmissionError::InvalidExpiration);
+            }
+            prune_expired_pair_tickets(admission, relay_now_ms());
+            admission
+                .pair_ticket_hashes
+                .insert((server_id, pair_ticket_hash), expires_at_ms);
+            Ok(())
+        })?;
         Ok(RegisterPairTicketOutcome { server_id })
     }
 
@@ -715,43 +738,67 @@ impl RelayState {
         public_key: PublicKey,
         daemon_token: Option<&str>,
     ) -> Result<RegisterDeviceOutcome, RegisterAdmissionError> {
-        self.authorize_daemon_bearer(server_id, daemon_token)?;
-        decode_ed25519_wire(&public_key.0, ED25519_PUBLIC_KEY_LEN)
-            .map_err(|_| RegisterAdmissionError::InvalidDevicePublicKey)?;
-        let mut admission = self
-            .admission
-            .write()
-            .map_err(|_| RegisterAdmissionError::Poisoned)?;
-        admission
-            .device_public_keys
-            .insert((server_id, device_id), public_key);
+        let public_key_is_valid =
+            decode_ed25519_wire(&public_key.0, ED25519_PUBLIC_KEY_LEN).is_ok();
+        #[cfg(test)]
+        self.wait_before_admission_mutation();
+        self.mutate_daemon_admission(server_id, daemon_token, |admission| {
+            if !public_key_is_valid {
+                return Err(RegisterAdmissionError::InvalidDevicePublicKey);
+            }
+            admission
+                .device_public_keys
+                .insert((server_id, device_id), public_key);
+            Ok(())
+        })?;
         Ok(RegisterDeviceOutcome {
             server_id,
             device_id,
         })
     }
 
-    fn authorize_daemon_bearer(
+    fn mutate_daemon_admission<T>(
         &self,
         server_id: ServerId,
         daemon_token: Option<&str>,
-    ) -> Result<(), RegisterAdmissionError> {
+        mutation: impl FnOnce(&mut RelayAdmissionState) -> Result<T, RegisterAdmissionError>,
+    ) -> Result<T, RegisterAdmissionError> {
         let token = daemon_token.ok_or(RegisterAdmissionError::DaemonTokenMissing)?;
         if !relay_auth_token_has_safe_length(token) {
             return Err(RegisterAdmissionError::DaemonTokenRejected);
         }
-        let admission = self
+        let provided_hash = relay_daemon_token_hash(token);
+        let mut admission = self
             .admission
-            .read()
+            .write()
             .map_err(|_| RegisterAdmissionError::Poisoned)?;
         let Some(expected_hash) = admission.daemon_token_hashes.get(&server_id) else {
             return Err(RegisterAdmissionError::DaemonTokenRejected);
         };
-        let provided_hash = relay_daemon_token_hash(token);
-        if relay_auth_token_constant_time_eq(expected_hash, &provided_hash) {
-            Ok(())
-        } else {
-            Err(RegisterAdmissionError::DaemonTokenRejected)
+        if !relay_auth_token_constant_time_eq(expected_hash, &provided_hash) {
+            return Err(RegisterAdmissionError::DaemonTokenRejected);
+        }
+        mutation(&mut admission)
+    }
+
+    #[cfg(test)]
+    fn set_admission_mutation_test_hook(&self, hook: Option<Arc<AdmissionMutationTestHook>>) {
+        *self
+            .admission_mutation_test_hook
+            .write()
+            .expect("admission mutation test hook lock should remain available") = hook;
+    }
+
+    #[cfg(test)]
+    fn wait_before_admission_mutation(&self) {
+        let hook = self
+            .admission_mutation_test_hook
+            .read()
+            .expect("admission mutation test hook lock should remain available")
+            .clone();
+        if let Some(hook) = hook {
+            hook.reached.wait();
+            hook.resume.wait();
         }
     }
 
@@ -1290,7 +1337,7 @@ fn test_route_generation(server_id: ServerId) -> Nonce {
 }
 
 fn relay_control_frame(envelope: RelayControlEnvelope) -> OpaqueFrame {
-    // 中文注释：control 线只承载 relay transport 生命周期消息，不进入 E2EE 业务协议。
+    // 中文注释：control 线只承载 relay transport 生命周期消息，不进入 daemon 业务协议。
     OpaqueFrame::Text(
         serde_json::to_string(&envelope)
             .expect("relay control envelope should encode as JSON text"),
@@ -1633,7 +1680,17 @@ mod tests {
         nonce: Nonce,
         timestamp_ms: UnixTimestampMillis,
     ) -> (PublicKey, RelayAdmissionPayload) {
-        let signing_key = SigningKey::from_bytes(&[7; 32]);
+        test_device_admission_with_signing_key(server_id, device_id, nonce, timestamp_ms, [7; 32])
+    }
+
+    fn test_device_admission_with_signing_key(
+        server_id: ServerId,
+        device_id: DeviceId,
+        nonce: Nonce,
+        timestamp_ms: UnixTimestampMillis,
+        signing_key_bytes: [u8; 32],
+    ) -> (PublicKey, RelayAdmissionPayload) {
+        let signing_key = SigningKey::from_bytes(&signing_key_bytes);
         let public_key = PublicKey(format!(
             "{ED25519_WIRE_PREFIX}{}",
             general_purpose::STANDARD.encode(signing_key.verifying_key().as_bytes())
@@ -1656,6 +1713,30 @@ mod tests {
                 )),
             },
         )
+    }
+
+    fn trusted_relay_state_for_token_rotation(
+        server_id: ServerId,
+        daemon_token: &str,
+        device_credentials: Vec<RelayDeviceCredential>,
+    ) -> (RelayState, PathBuf) {
+        let registry_path = std::env::temp_dir().join(format!(
+            "termd-relay-admission-race-{}-{}.json",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let state = RelayState::new_trusted_with_registry(
+            None,
+            vec![RelayDaemonCredential::plain_token(
+                server_id,
+                daemon_token.to_owned(),
+            )],
+            device_credentials,
+            Some("relay-setup-secret".to_owned()),
+            Some(registry_path.clone()),
+        )
+        .expect("trusted relay state should persist its daemon registry");
+        (state, registry_path)
     }
 
     struct TestReceiver {
@@ -2342,8 +2423,8 @@ mod tests {
 
     #[test]
     fn relay_established_transport_uses_only_websocket_idle_ping() {
-        // 中文注释：完成 route prelude 后，relay 仍只作为 dumb pipe 转发业务。
-        // idle ping 是 WebSocket 控制帧，只保活代理/NAT，不进入 E2EE 业务协议。
+        // 中文注释：完成 route prelude 和 admission 后，relay 不解释转发帧的业务语义，
+        // 但作为 trusted relay 可以看到当前明文应用流量。idle ping 只保活代理/NAT。
         assert_eq!(WEBSOCKET_SEND_DEADLINE, Duration::from_secs(10));
         assert_eq!(WEBSOCKET_PONG_DEADLINE, Duration::from_secs(10));
         assert_eq!(WEBSOCKET_IDLE_PING_INTERVAL, Duration::from_millis(50));
@@ -3023,6 +3104,90 @@ mod tests {
     }
 
     #[test]
+    fn daemon_token_rotation_revokes_in_flight_old_token_pair_ticket_mutation() {
+        let server_id = server_id(128);
+        let old_token = "daemon-secret-old";
+        let new_token = "daemon-secret-new";
+        let raced_ticket = "pair-ticket-raced";
+        let (state, registry_path) =
+            trusted_relay_state_for_token_rotation(server_id, old_token, Vec::new());
+        let hook = Arc::new(AdmissionMutationTestHook::new());
+        state.set_admission_mutation_test_hook(Some(hook.clone()));
+
+        let raced_state = state.clone();
+        let raced_registration = std::thread::spawn(move || {
+            raced_state.register_pair_ticket(
+                server_id,
+                raced_ticket.to_owned(),
+                UnixTimestampMillis(relay_now_ms().saturating_add(60_000)),
+                Some(old_token),
+            )
+        });
+        hook.reached.wait();
+        state
+            .register_daemon(server_id, new_token.to_owned(), Some("relay-setup-secret"))
+            .expect("daemon token rotation should complete while old mutation is paused");
+        hook.resume.wait();
+        assert!(
+            matches!(
+                raced_registration
+                    .join()
+                    .expect("registration thread should join"),
+                Err(RegisterAdmissionError::DaemonTokenRejected)
+            ),
+            "old token must not create a pair ticket after rotation returns"
+        );
+        state.set_admission_mutation_test_hook(None);
+
+        let raced_prelude = RoutePrelude {
+            server_id,
+            route_role: RouteRole::Client,
+            connection_role: ConnectionRole::Client,
+            admission: Some(RelayAdmissionPayload::PairTicket {
+                token: PairingToken(raced_ticket.to_owned()),
+            }),
+            route_generation: None,
+            client_id: None,
+            data_token: None,
+        };
+        assert_eq!(
+            state.authorize_route_admission(&raced_prelude),
+            Err(RelayError::AdmissionRejected)
+        );
+        assert!(matches!(
+            state.register_pair_ticket(
+                server_id,
+                "pair-ticket-wrong".to_owned(),
+                UnixTimestampMillis(relay_now_ms().saturating_add(60_000)),
+                Some("daemon-secret-wrong"),
+            ),
+            Err(RegisterAdmissionError::DaemonTokenRejected)
+        ));
+
+        let fresh_ticket = "pair-ticket-fresh";
+        state
+            .register_pair_ticket(
+                server_id,
+                fresh_ticket.to_owned(),
+                UnixTimestampMillis(relay_now_ms().saturating_add(60_000)),
+                Some(new_token),
+            )
+            .expect("current daemon token should register a pair ticket");
+        assert!(
+            state
+                .authorize_route_admission(&RoutePrelude {
+                    admission: Some(RelayAdmissionPayload::PairTicket {
+                        token: PairingToken(fresh_ticket.to_owned()),
+                    }),
+                    ..raced_prelude
+                })
+                .is_ok()
+        );
+
+        let _ = fs::remove_file(registry_path);
+    }
+
+    #[test]
     fn trusted_relay_device_admission_rejects_replay_and_stale_timestamp() {
         let server_id = server_id(124);
         let device_id = DeviceId::new();
@@ -3072,6 +3237,111 @@ mod tests {
             }),
             Err(RelayError::AdmissionRejected)
         );
+    }
+
+    #[test]
+    fn daemon_token_rotation_revokes_in_flight_old_token_device_mutation() {
+        let server_id = server_id(129);
+        let device_id = DeviceId::new();
+        let old_token = "daemon-secret-old";
+        let new_token = "daemon-secret-new";
+        let now_ms = relay_now_ms();
+        let (original_key, original_admission) = test_device_admission_with_signing_key(
+            server_id,
+            device_id,
+            Nonce("device-original-key".to_owned()),
+            UnixTimestampMillis(now_ms),
+            [7; 32],
+        );
+        let (replacement_key, replacement_admission) = test_device_admission_with_signing_key(
+            server_id,
+            device_id,
+            Nonce("device-raced-replacement-key".to_owned()),
+            UnixTimestampMillis(now_ms),
+            [8; 32],
+        );
+        let (state, registry_path) = trusted_relay_state_for_token_rotation(
+            server_id,
+            old_token,
+            vec![RelayDeviceCredential {
+                server_id,
+                device_id,
+                public_key: original_key,
+            }],
+        );
+        let hook = Arc::new(AdmissionMutationTestHook::new());
+        state.set_admission_mutation_test_hook(Some(hook.clone()));
+
+        let raced_state = state.clone();
+        let raced_registration = std::thread::spawn(move || {
+            raced_state.register_device(server_id, device_id, replacement_key, Some(old_token))
+        });
+        hook.reached.wait();
+        state
+            .register_daemon(server_id, new_token.to_owned(), Some("relay-setup-secret"))
+            .expect("daemon token rotation should complete while old mutation is paused");
+        hook.resume.wait();
+        assert!(
+            matches!(
+                raced_registration
+                    .join()
+                    .expect("registration thread should join"),
+                Err(RegisterAdmissionError::DaemonTokenRejected)
+            ),
+            "old token must not replace a device key after rotation returns"
+        );
+        state.set_admission_mutation_test_hook(None);
+
+        let client_prelude = |admission| RoutePrelude {
+            server_id,
+            route_role: RouteRole::Client,
+            connection_role: ConnectionRole::Client,
+            admission: Some(admission),
+            route_generation: None,
+            client_id: None,
+            data_token: None,
+        };
+        assert_eq!(
+            state.authorize_route_admission(&client_prelude(replacement_admission)),
+            Err(RelayError::AdmissionRejected),
+            "raced replacement key must not become trusted"
+        );
+        assert!(
+            state
+                .authorize_route_admission(&client_prelude(original_admission))
+                .is_ok(),
+            "the previously registered device key must remain trusted"
+        );
+
+        let (wrong_key, _) = test_device_admission_with_signing_key(
+            server_id,
+            device_id,
+            Nonce("device-wrong-token".to_owned()),
+            UnixTimestampMillis(now_ms),
+            [9; 32],
+        );
+        assert!(matches!(
+            state.register_device(server_id, device_id, wrong_key, Some("daemon-secret-wrong"),),
+            Err(RegisterAdmissionError::DaemonTokenRejected)
+        ));
+
+        let (fresh_key, fresh_admission) = test_device_admission_with_signing_key(
+            server_id,
+            device_id,
+            Nonce("device-current-token".to_owned()),
+            UnixTimestampMillis(now_ms),
+            [10; 32],
+        );
+        state
+            .register_device(server_id, device_id, fresh_key, Some(new_token))
+            .expect("current daemon token should replace the device key");
+        assert!(
+            state
+                .authorize_route_admission(&client_prelude(fresh_admission))
+                .is_ok()
+        );
+
+        let _ = fs::remove_file(registry_path);
     }
 
     #[test]
@@ -3298,6 +3568,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_tunnel_response_head_timeout_starts_after_request_end() {
+        let state = RelayState::default();
+        let server_id = server_id(96);
+        let (control_tx, mut control_rx) = channel();
+        state
+            .register(server_id, ConnectionRole::DaemonControl, control_tx)
+            .unwrap();
+        let (body_tx, body_rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(1);
+        body_tx
+            .send(Ok(Bytes::from_static(b"slow-upload")))
+            .await
+            .unwrap();
+        let body = Body::from_stream(futures_util::stream::unfold(
+            body_rx,
+            |mut body_rx| async move { body_rx.recv().await.map(|item| (item, body_rx)) },
+        ));
+
+        let tunnel_state = state.clone();
+        let tunnel = tokio::spawn(async move {
+            tunnel_state
+                .http_tunnel(
+                    server_id,
+                    "POST".to_owned(),
+                    "/api/files/upload/chunk".to_owned(),
+                    Vec::new(),
+                    None,
+                    body.into_data_stream(),
+                )
+                .await
+        });
+
+        let RelayOutbound::Frame(open_frame) = control_rx.control.recv().await.unwrap() else {
+            panic!("daemon control should receive open_data");
+        };
+        let RelayControlEnvelope::OpenData {
+            client_id,
+            data_token,
+        } = relay_control_from_frame(&open_frame).unwrap()
+        else {
+            panic!("expected open_data");
+        };
+        let (data_tx, mut data_rx) = channel();
+        let data_registration = state
+            .register_route(
+                &RoutePrelude {
+                    server_id,
+                    route_role: RouteRole::DaemonData,
+                    connection_role: ConnectionRole::DaemonData,
+                    admission: None,
+                    route_generation: Some(test_route_generation(server_id)),
+                    client_id: Some(client_id),
+                    data_token: Some(data_token),
+                },
+                data_tx,
+            )
+            .unwrap();
+        state.flush_pre_pair_client_frames(&data_registration).await;
+
+        for expected in ["request head", "request body"] {
+            let RelayOutbound::Frame(OpaqueFrame::Binary(_)) = data_rx.data.recv().await.unwrap()
+            else {
+                panic!("daemon data should receive {expected}");
+            };
+        }
+        tokio::time::sleep(HTTP_TUNNEL_RESPONSE_HEAD_TIMEOUT + Duration::from_millis(50)).await;
+        assert!(
+            !tunnel.is_finished(),
+            "active request upload must not consume the response-head timeout"
+        );
+
+        drop(body_tx);
+        let RelayOutbound::Frame(OpaqueFrame::Binary(request_wire)) =
+            data_rx.data.recv().await.unwrap()
+        else {
+            panic!("daemon data should receive request end");
+        };
+        assert_eq!(
+            decode_relay_http_tunnel_frame(&request_wire),
+            Some(RelayHttpTunnelFrame::RequestEnd)
+        );
+        state
+            .forward_from(
+                &data_registration,
+                OpaqueFrame::Binary(termd_proto::encode_relay_http_tunnel_response_head(200)),
+            )
+            .await;
+        state
+            .forward_from(
+                &data_registration,
+                OpaqueFrame::Binary(termd_proto::encode_relay_http_tunnel_response_end()),
+            )
+            .await;
+
+        let response = tunnel
+            .await
+            .expect("HTTP tunnel task should not panic")
+            .expect("slow active upload should receive daemon response");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn http_tunnel_request_body_waits_for_daemon_data_backpressure() {
         let state = RelayState::default();
         let server_id = server_id(93);
@@ -3464,6 +3835,87 @@ mod tests {
         assert!(
             !state.has_client(server_id, client_id),
             "response head timeout should unregister synthetic client"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_tunnel_cancel_during_request_upload_unregisters_client_and_data_pipe() {
+        let state = RelayState::default();
+        let server_id = server_id(97);
+        let (control_tx, mut control_rx) = channel();
+        state
+            .register(server_id, ConnectionRole::DaemonControl, control_tx)
+            .unwrap();
+        let (body_tx, body_rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(1);
+        body_tx
+            .send(Ok(Bytes::from_static(b"partial-upload")))
+            .await
+            .unwrap();
+        let body = Body::from_stream(futures_util::stream::unfold(
+            body_rx,
+            |mut body_rx| async move { body_rx.recv().await.map(|item| (item, body_rx)) },
+        ));
+
+        let tunnel_state = state.clone();
+        let tunnel = tokio::spawn(async move {
+            tunnel_state
+                .http_tunnel(
+                    server_id,
+                    "POST".to_owned(),
+                    "/api/files/upload/chunk".to_owned(),
+                    Vec::new(),
+                    None,
+                    body.into_data_stream(),
+                )
+                .await
+        });
+
+        let RelayOutbound::Frame(open_frame) = control_rx.control.recv().await.unwrap() else {
+            panic!("daemon control should receive open_data");
+        };
+        let RelayControlEnvelope::OpenData {
+            client_id,
+            data_token,
+        } = relay_control_from_frame(&open_frame).unwrap()
+        else {
+            panic!("expected open_data");
+        };
+        let (data_tx, mut data_rx) = channel();
+        let data_registration = state
+            .register_route(
+                &RoutePrelude {
+                    server_id,
+                    route_role: RouteRole::DaemonData,
+                    connection_role: ConnectionRole::DaemonData,
+                    admission: None,
+                    route_generation: Some(test_route_generation(server_id)),
+                    client_id: Some(client_id),
+                    data_token: Some(data_token),
+                },
+                data_tx,
+            )
+            .unwrap();
+        state.flush_pre_pair_client_frames(&data_registration).await;
+        for expected in ["request head", "request body"] {
+            let RelayOutbound::Frame(OpaqueFrame::Binary(_)) = data_rx.data.recv().await.unwrap()
+            else {
+                panic!("daemon data should receive {expected}");
+            };
+        }
+
+        tunnel.abort();
+        assert!(tunnel.await.unwrap_err().is_cancelled());
+        assert!(
+            matches!(data_rx.data.recv().await, Some(RelayOutbound::Close) | None),
+            "cancelling HTTP handler should close paired data pipe"
+        );
+        assert!(!state.has_client(server_id, client_id));
+        assert!(
+            body_tx
+                .send(Ok(Bytes::from_static(b"late-upload")))
+                .await
+                .is_err(),
+            "cancelling HTTP handler should abort request body forwarding"
         );
     }
 

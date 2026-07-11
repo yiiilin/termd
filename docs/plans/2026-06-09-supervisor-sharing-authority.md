@@ -1,5 +1,7 @@
 # Supervisor Sharing Authority Refactor Plan
 
+> 历史状态提示：本文记录当时的计划/实现状态，不代表当前 0.6 协议契约；现行边界以 `TECH.md` 和 `docs/deployment.md` 为准。
+
 > **For agentic workers:** REQUIRED: Use superpowers:subagent-driven-development (if subagents available) or superpowers:executing-plans to implement this plan. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 保留 Ghostty Web 前端与现有外部协议，移除生产路径中的 tmux，把每个 session 的 supervisor 提升为权威 terminal truth 与 shared-control authority，daemon 收缩为 auth/pairing/E2EE/relay/session catalog 路由层。

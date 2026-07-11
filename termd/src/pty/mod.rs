@@ -247,6 +247,30 @@ pub enum PtyRestoreInfo {
     },
 }
 
+/// supervisor 启动管道中的一次性 grant；只在 daemon 内部 lifecycle seam 上传递。
+#[doc(hidden)]
+pub struct PtyStartupGrant {
+    create_operation_id: [u8; 16],
+    capability: [u8; 32],
+}
+
+impl PtyStartupGrant {
+    pub(crate) const fn new(create_operation_id: [u8; 16], capability: [u8; 32]) -> Self {
+        Self {
+            create_operation_id,
+            capability,
+        }
+    }
+
+    pub(crate) fn capability(&self) -> &[u8] {
+        &self.capability
+    }
+
+    pub(crate) fn create_operation_id(&self) -> &[u8] {
+        &self.create_operation_id
+    }
+}
+
 /// supervisor 快照。
 ///
 /// `retained_output` 是 daemon 重启后用于恢复终端显示的内存快照，不会被写入本地持久状态。
@@ -361,6 +385,64 @@ pub trait PtyBackend: Send + Sync {
         size: PtySize,
     ) -> PtyResult<Box<dyn PtySession>> {
         self.spawn(command, size)
+    }
+
+    /// 返回 gated supervisor spawn 将使用的稳定 socket 路径。
+    fn expected_socket_path(&self, _session_id: &str) -> PtyResult<Option<PathBuf>> {
+        Ok(None)
+    }
+
+    /// 启动 supervisor，并在发送 startup grant 前让 ownership ledger 提交 PID/socket evidence。
+    /// 非持久 backend 没有独立 supervisor，可继续使用普通 spawn。
+    fn spawn_named_gated(
+        &self,
+        session_id: &str,
+        command: &CommandSpec,
+        size: PtySize,
+        _grant: &PtyStartupGrant,
+        _evidence_committed: &mut dyn FnMut(&PtyRestoreInfo) -> PtyResult<()>,
+    ) -> PtyResult<Box<dyn PtySession>> {
+        let session = self.spawn_named(session_id, command, size)?;
+        if let Some(restore_info) = session.restore_info() {
+            _evidence_committed(&restore_info)?;
+        }
+        Ok(session)
+    }
+
+    /// 对与 durable ownership evidence 完全匹配的 supervisor 执行幂等 cleanup。
+    fn reconcile_owned_cleanup(
+        &self,
+        _session_id: &str,
+        _restore_info: &PtyRestoreInfo,
+        _capability: &[u8],
+        _operation_id: u64,
+    ) -> PtyResult<bool> {
+        Err(PtyError::Backend(
+            "PTY backend does not support durable ownership cleanup".to_owned(),
+        ))
+    }
+
+    fn owned_natural_exit_status(&self, _restore_info: &PtyRestoreInfo) -> PtyResult<bool> {
+        Ok(false)
+    }
+
+    fn install_legacy_cleanup_capability(
+        &self,
+        _session_id: &str,
+        _restore_info: &PtyRestoreInfo,
+        _capability: &[u8],
+    ) -> PtyResult<bool> {
+        Ok(false)
+    }
+
+    fn reconcile_legacy_owned_cleanup(
+        &self,
+        _session_id: &str,
+        _restore_info: &PtyRestoreInfo,
+    ) -> PtyResult<bool> {
+        Err(PtyError::Backend(
+            "PTY backend does not support legacy owned cleanup".to_owned(),
+        ))
     }
 
     /// 基于持久化的恢复信息重新连回一个仍存活的 session supervisor。

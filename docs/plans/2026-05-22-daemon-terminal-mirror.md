@@ -1,5 +1,7 @@
 # Daemon Terminal Mirror Implementation Plan
 
+> 历史状态提示：本文记录当时的计划/实现状态，不代表当前 0.6 协议契约；现行边界以 `TECH.md` 和 `docs/deployment.md` 为准。
+
 > **For agentic workers:** REQUIRED: Use superpowers:subagent-driven-development (if subagents available) or superpowers:executing-plans to implement this plan. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 让 daemon 为每个 supervisor session 维护可 attach 的终端镜像缓存，浏览器加入时优先从 daemon cache 发送 snapshot/tail，live raw bytes 先更新 mirror 再进入 room fanout。

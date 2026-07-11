@@ -1,11 +1,22 @@
 use std::fs;
+#[cfg(unix)]
+use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
+use std::os::unix::net::UnixStream as StdUnixStream;
+#[cfg(unix)]
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::{Engine as _, engine::general_purpose};
 use ed25519_dalek::SigningKey;
 use rand_core::OsRng;
+use sha2::{Digest, Sha256};
 use termd::auth::current_unix_timestamp_millis;
 use termd::config::DaemonConfig;
 use termd::net::protocol::{
@@ -17,8 +28,8 @@ use termd::net::signature::Ed25519SignatureVerifier;
 use termd::net::{E2eeKeyPair, E2eeSession, E2eeSessionContext, E2eeSessionRole};
 use termd::pty::supervisor::SupervisorPtyBackend;
 use termd::pty::{
-    CommandSpec, PtyBackend, PtyRestoreInfo, PtySession, PtySize, PtySupervisorStatus,
-    PtyTerminalFrame,
+    CommandSpec, PtyBackend, PtyError, PtyRestoreInfo, PtyResult, PtySession, PtySize,
+    PtySupervisorStatus, PtyTerminalFrame,
 };
 use termd::runtime::SessionRuntime;
 use termd::session::TerminalSize;
@@ -26,7 +37,8 @@ use termd::state::{DaemonIdentitySnapshot, DaemonState, SessionStateRecord, Stat
 use termd_proto::{
     DeviceId, E2eeKeyExchangePayload, MessageType, Nonce, PairAcceptPayload, PairRequestPayload,
     PublicKey, ServerId, SessionAttachPayload, SessionClosePayload, SessionClosedPayload,
-    SessionId, SessionListPayload, SessionListResultPayload, SessionState, UnixTimestampMillis,
+    SessionCreatePayload, SessionDataPayload, SessionId, SessionListPayload,
+    SessionListResultPayload, SessionState, UnixTimestampMillis,
 };
 
 fn temp_state_path(name: &str) -> PathBuf {
@@ -39,6 +51,104 @@ fn temp_state_path(name: &str) -> PathBuf {
         std::process::id(),
         nanos
     ))
+}
+
+#[derive(Clone)]
+struct FailFirstReconnectBackend {
+    inner: SupervisorPtyBackend,
+    reconnect_attempts: Arc<AtomicUsize>,
+}
+
+impl FailFirstReconnectBackend {
+    fn new(inner: SupervisorPtyBackend) -> Self {
+        Self {
+            inner,
+            reconnect_attempts: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn reconnect_attempts(&self) -> usize {
+        self.reconnect_attempts.load(Ordering::SeqCst)
+    }
+}
+
+impl PtyBackend for FailFirstReconnectBackend {
+    fn spawn(&self, command: &CommandSpec, size: PtySize) -> PtyResult<Box<dyn PtySession>> {
+        self.inner.spawn(command, size)
+    }
+
+    fn spawn_named(
+        &self,
+        session_id: &str,
+        command: &CommandSpec,
+        size: PtySize,
+    ) -> PtyResult<Box<dyn PtySession>> {
+        self.inner.spawn_named(session_id, command, size)
+    }
+
+    fn expected_socket_path(&self, session_id: &str) -> PtyResult<Option<PathBuf>> {
+        self.inner.expected_socket_path(session_id)
+    }
+
+    fn spawn_named_gated(
+        &self,
+        session_id: &str,
+        command: &CommandSpec,
+        size: PtySize,
+        grant: &termd::pty::PtyStartupGrant,
+        evidence_committed: &mut dyn FnMut(&PtyRestoreInfo) -> PtyResult<()>,
+    ) -> PtyResult<Box<dyn PtySession>> {
+        self.inner
+            .spawn_named_gated(session_id, command, size, grant, evidence_committed)
+    }
+
+    fn reconcile_owned_cleanup(
+        &self,
+        session_id: &str,
+        restore_info: &PtyRestoreInfo,
+        capability: &[u8],
+        operation_id: u64,
+    ) -> PtyResult<bool> {
+        self.inner
+            .reconcile_owned_cleanup(session_id, restore_info, capability, operation_id)
+    }
+
+    fn owned_natural_exit_status(&self, restore_info: &PtyRestoreInfo) -> PtyResult<bool> {
+        self.inner.owned_natural_exit_status(restore_info)
+    }
+
+    fn install_legacy_cleanup_capability(
+        &self,
+        session_id: &str,
+        restore_info: &PtyRestoreInfo,
+        capability: &[u8],
+    ) -> PtyResult<bool> {
+        self.inner
+            .install_legacy_cleanup_capability(session_id, restore_info, capability)
+    }
+
+    fn reconcile_legacy_owned_cleanup(
+        &self,
+        session_id: &str,
+        restore_info: &PtyRestoreInfo,
+    ) -> PtyResult<bool> {
+        self.inner
+            .reconcile_legacy_owned_cleanup(session_id, restore_info)
+    }
+
+    fn reconnect(
+        &self,
+        session_id: &str,
+        restore_info: &PtyRestoreInfo,
+        size: PtySize,
+    ) -> PtyResult<Box<dyn PtySession>> {
+        if self.reconnect_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Err(PtyError::Backend(
+                "injected transient supervisor reconnect failure".to_owned(),
+            ));
+        }
+        self.inner.reconnect(session_id, restore_info, size)
+    }
 }
 
 fn read_until_contains(
@@ -103,6 +213,32 @@ fn snapshot_base_seq_containing(frames: &[PtyTerminalFrame], needle: &[u8]) -> u
                 String::from_utf8_lossy(needle)
             )
         })
+}
+
+fn terminal_snapshot_until_contains(
+    runtime: &mut SessionRuntime<SupervisorPtyBackend>,
+    session_id: &str,
+    last_terminal_seq: Option<u64>,
+    needle: &[u8],
+) -> Vec<PtyTerminalFrame> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut last_frames = Vec::new();
+
+    while Instant::now() < deadline {
+        let frames = runtime
+            .terminal_snapshot(session_id, last_terminal_seq)
+            .expect("AttachSync should return terminal frames");
+        if frames.iter().any(|frame| frame_contains(frame, needle)) {
+            return frames;
+        }
+        last_frames = frames;
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    panic!(
+        "timed out waiting for terminal snapshot containing {:?}; last frames: {last_frames:?}",
+        String::from_utf8_lossy(needle)
+    );
 }
 
 fn read_with<E>(needle: &[u8], mut read_once: impl FnMut(&mut [u8]) -> Result<usize, E>) -> Vec<u8>
@@ -288,6 +424,280 @@ fn wait_until_linux_process_is_reaped(pid: u32) {
     panic!("timed out waiting for supervisor pid {pid} to exit after close");
 }
 
+#[cfg(target_os = "linux")]
+struct TestSupervisorGuard {
+    pid: u32,
+    socket_path: PathBuf,
+    ownership_confirmed: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl TestSupervisorGuard {
+    fn new(pid: u32, socket_path: PathBuf) -> Self {
+        let mut guard = Self {
+            pid,
+            socket_path,
+            ownership_confirmed: false,
+        };
+        guard.ownership_confirmed = guard.owns_live_process();
+        guard
+    }
+
+    fn owns_live_process(&self) -> bool {
+        let Ok(relative) = self.socket_path.strip_prefix(std::env::temp_dir()) else {
+            return false;
+        };
+        let Some(first) = relative.components().next() else {
+            return false;
+        };
+        let std::path::Component::Normal(first) = first else {
+            return false;
+        };
+        if !first
+            .to_str()
+            .is_some_and(|name| name.starts_with("termd-session-supervisor-test-"))
+        {
+            return false;
+        }
+        let Ok(cmdline) = fs::read(format!("/proc/{}/cmdline", self.pid)) else {
+            return false;
+        };
+        let arguments: Vec<&[u8]> = cmdline
+            .split(|byte| *byte == 0)
+            .filter(|argument| !argument.is_empty())
+            .collect();
+        arguments
+            .iter()
+            .any(|argument| *argument == b"__session-supervisor")
+            && arguments.windows(2).any(|pair| {
+                pair[0] == b"--socket-path" && pair[1] == self.socket_path.as_os_str().as_bytes()
+            })
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for TestSupervisorGuard {
+    fn drop(&mut self) {
+        if !self.ownership_confirmed {
+            return;
+        }
+        if self.owns_live_process() {
+            unsafe {
+                libc::kill(self.pid as libc::pid_t, libc::SIGKILL);
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let mut status = 0;
+            let waited =
+                unsafe { libc::waitpid(self.pid as libc::pid_t, &mut status, libc::WNOHANG) };
+            if waited == self.pid as libc::pid_t || linux_process_state(self.pid).is_none() {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        if linux_process_state(self.pid).is_none() {
+            let _ = fs::remove_file(&self.socket_path);
+            let _ = fs::remove_file(self.socket_path.with_extension("attach.sock"));
+        }
+    }
+}
+
+struct TestStateDirectory {
+    path: PathBuf,
+}
+
+impl TestStateDirectory {
+    fn new(name: &str) -> Self {
+        let path = temp_state_path(name);
+        fs::create_dir(&path).unwrap();
+        Self { path }
+    }
+
+    fn join(&self, name: &str) -> PathBuf {
+        self.path.join(name)
+    }
+}
+
+impl Drop for TestStateDirectory {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+#[cfg(unix)]
+fn write_raw_supervisor_request(stream: &mut StdUnixStream, request: serde_json::Value) {
+    let payload = serde_json::to_vec(&request).unwrap();
+    stream
+        .write_all(&(payload.len() as u32).to_le_bytes())
+        .unwrap();
+    stream.write_all(&payload).unwrap();
+    stream.flush().unwrap();
+}
+
+#[cfg(unix)]
+fn read_raw_supervisor_response(stream: &mut StdUnixStream) -> serde_json::Value {
+    let mut length = [0_u8; 4];
+    stream.read_exact(&mut length).unwrap();
+    let mut payload = vec![0_u8; u32::from_le_bytes(length) as usize];
+    stream.read_exact(&mut payload).unwrap();
+    serde_json::from_slice(&payload).unwrap()
+}
+
+#[cfg(unix)]
+fn connect_raw_supervisor(socket_path: &Path) -> StdUnixStream {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match StdUnixStream::connect(socket_path) {
+            Ok(stream) => return stream,
+            Err(error) if Instant::now() < deadline => {
+                let _ = error;
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => panic!("failed to connect supervisor socket: {error}"),
+        }
+    }
+}
+
+fn test_cleanup_capability_base64() -> String {
+    general_purpose::STANDARD.encode([0x5a_u8; 32])
+}
+
+fn test_cleanup_auth_proof(
+    session_id: &str,
+    client_nonce: &[u8; 32],
+    server_nonce: &[u8; 32],
+) -> [u8; 32] {
+    let capability = [0x5a_u8; 32];
+    let mut inner_key = [0x36_u8; 64];
+    let mut outer_key = [0x5c_u8; 64];
+    for (index, byte) in capability.iter().enumerate() {
+        inner_key[index] ^= byte;
+        outer_key[index] ^= byte;
+    }
+    let mut inner = Sha256::new();
+    inner.update(inner_key);
+    inner.update(b"termd-supervisor-cleanup-v1\0");
+    inner.update(session_id.as_bytes());
+    inner.update([0]);
+    inner.update(client_nonce);
+    inner.update(server_nonce);
+    let mut outer = Sha256::new();
+    outer.update(outer_key);
+    outer.update(inner.finalize());
+    outer.finalize().into()
+}
+
+fn authenticate_raw_cleanup(stream: &mut StdUnixStream, session_id: &str, request_id: u64) {
+    let client_nonce = [0x31_u8; 32];
+    write_raw_supervisor_request(
+        stream,
+        serde_json::json!({
+            "request_id": request_id,
+            "request": {
+                "type": "cleanup_auth_challenge",
+                "session_id": session_id,
+                "client_nonce_base64": general_purpose::STANDARD.encode(client_nonce)
+            }
+        }),
+    );
+    let challenge = read_raw_supervisor_response(stream);
+    let server_nonce = general_purpose::STANDARD
+        .decode(
+            challenge["response"]["payload"]["server_nonce_base64"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let server_proof = general_purpose::STANDARD
+        .decode(
+            challenge["response"]["payload"]["server_proof_base64"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        server_proof,
+        test_cleanup_auth_proof(session_id, &client_nonce, &server_nonce)
+    );
+    write_raw_supervisor_request(
+        stream,
+        serde_json::json!({
+            "request_id": request_id + 1,
+            "request": {
+                "type": "cleanup_authenticate",
+                "session_id": session_id,
+                "client_nonce_base64": general_purpose::STANDARD.encode(client_nonce),
+                "server_nonce_base64": general_purpose::STANDARD.encode(server_nonce),
+                "capability_base64": test_cleanup_capability_base64()
+            }
+        }),
+    );
+    assert_eq!(
+        read_raw_supervisor_response(stream)["response"]["status"],
+        "ok"
+    );
+}
+
+fn persist_test_ownership(
+    state_path: &Path,
+    session_id: SessionId,
+    restore_info: &PtyRestoreInfo,
+    phase: &str,
+    close_operation_id: Option<u64>,
+) {
+    let PtyRestoreInfo::UnixSocket {
+        socket_path,
+        supervisor_pid,
+        ..
+    } = restore_info
+    else {
+        panic!("test ownership fixture requires Unix supervisor evidence");
+    };
+    let sqlite_path = state_path.with_extension("sqlite");
+    let state_db = rusqlite::Connection::open(sqlite_path).unwrap();
+    state_db
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS session_ownership (
+                session_id TEXT PRIMARY KEY NOT NULL,
+                phase TEXT NOT NULL,
+                create_operation_id BLOB NOT NULL,
+                close_operation_id TEXT,
+                capability BLOB NOT NULL,
+                expected_socket TEXT,
+                supervisor_pid INTEGER,
+                socket_path TEXT,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                diagnostic TEXT,
+                legacy_protocol INTEGER NOT NULL DEFAULT 0,
+                owner_generation BLOB
+            ) STRICT;",
+        )
+        .unwrap();
+    let now_ms = current_unix_timestamp_millis().0 as i64;
+    state_db
+        .execute(
+            "INSERT INTO session_ownership (
+                session_id, phase, create_operation_id, close_operation_id, capability,
+                expected_socket, supervisor_pid, socket_path, created_at_ms, updated_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?6, ?8, ?8)",
+            rusqlite::params![
+                session_id.0.to_string(),
+                phase,
+                [7_u8; 16].as_slice(),
+                close_operation_id.map(|value| value.to_string()),
+                [0x5a_u8; 32].as_slice(),
+                socket_path.to_string_lossy(),
+                i64::from(*supervisor_pid),
+                now_ms,
+            ],
+        )
+        .unwrap();
+}
+
 fn spawn_supervisor_from_short_lived_parent(
     binary_path: &Path,
     session_id: &str,
@@ -296,24 +706,530 @@ fn spawn_supervisor_from_short_lived_parent(
     size: PtySize,
     pid_file: &Path,
 ) -> u32 {
+    spawn_supervisor_from_short_lived_parent_with_capability(
+        binary_path,
+        session_id,
+        socket_path,
+        command,
+        size,
+        pid_file,
+        Some(test_cleanup_capability_base64()),
+    )
+}
+
+fn spawn_legacy_supervisor_from_short_lived_parent(
+    _binary_path: &Path,
+    session_id: &str,
+    socket_path: &Path,
+    command: &CommandSpec,
+    size: PtySize,
+    pid_file: &Path,
+) -> u32 {
+    spawn_supervisor_from_short_lived_parent_with_capability(
+        real_064_supervisor_binary(),
+        session_id,
+        socket_path,
+        command,
+        size,
+        pid_file,
+        None,
+    )
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn test_supervisor_guard_reaps_owned_real_064_supervisor_on_early_exit() {
+    let state_path = temp_state_path("guard-real-064.sock");
+    let socket_path = state_path.with_extension("sock");
+    let pid_file = state_path.with_extension("pid");
+    let session_id = SessionId::new().0.to_string();
+    let supervisor_pid = spawn_legacy_supervisor_from_short_lived_parent(
+        Path::new("unused"),
+        &session_id,
+        &socket_path,
+        &CommandSpec::new("sh").args(["-c", "cat"]),
+        PtySize::new(24, 80),
+        &pid_file,
+    );
+
+    let guard = TestSupervisorGuard::new(supervisor_pid, socket_path.clone());
+    drop(guard);
+
+    wait_until_linux_process_is_reaped(supervisor_pid);
+    assert!(!socket_path.exists());
+    assert!(!socket_path.with_extension("attach.sock").exists());
+    let _ = fs::remove_file(pid_file);
+}
+
+#[test]
+#[ignore = "spawned only by ownership_sigkill_crash_matrix"]
+#[cfg(target_os = "linux")]
+fn ownership_sigkill_crash_child() {
+    let state_path = PathBuf::from(std::env::var_os("TERMD_TEST_CRASH_STATE").unwrap());
+    let binary_path = PathBuf::from(env!("CARGO_BIN_EXE_termd"));
+    let mut protocol = DaemonProtocol::from_state(
+        DaemonConfig::default_for_state_path(&state_path),
+        SupervisorPtyBackend::with_binary_and_state_path(&binary_path, &state_path),
+        Ed25519SignatureVerifier,
+        StateStore::load(&state_path).unwrap(),
+    )
+    .unwrap();
+    let (mut connection, _) = protocol.start_connection();
+    let device_id = DeviceId::new();
+    let mut device_session = open_e2ee(&mut protocol, &mut connection, device_id);
+    pair_connection(
+        &mut protocol,
+        &mut connection,
+        &mut device_session,
+        device_id,
+    );
+    let _ = send_encrypted(
+        &mut protocol,
+        &mut connection,
+        &mut device_session,
+        envelope_value(
+            MessageType::SessionCreate,
+            SessionCreatePayload {
+                command: vec!["sh".to_owned(), "-c".to_owned(), "cat".to_owned()],
+                size: termd_proto::TerminalSize::new(24, 80),
+            },
+        )
+        .unwrap(),
+    );
+}
+
+#[derive(Clone, Copy)]
+struct OwnershipCrashCase {
+    point: &'static str,
+    durable_phase: Option<&'static str>,
+    public: bool,
+    durable_evidence: bool,
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn ownership_sigkill_crash_matrix() {
+    let cases = [
+        OwnershipCrashCase {
+            point: "before_preparing_commit",
+            durable_phase: None,
+            public: false,
+            durable_evidence: false,
+        },
+        OwnershipCrashCase {
+            point: "after_preparing_commit",
+            durable_phase: Some("preparing"),
+            public: false,
+            durable_evidence: false,
+        },
+        OwnershipCrashCase {
+            point: "after_spawn_before_evidence",
+            durable_phase: Some("preparing"),
+            public: false,
+            durable_evidence: false,
+        },
+        OwnershipCrashCase {
+            point: "after_evidence_before_grant",
+            durable_phase: Some("prepared"),
+            public: false,
+            durable_evidence: true,
+        },
+        OwnershipCrashCase {
+            point: "after_grant_before_pty",
+            durable_phase: Some("prepared"),
+            public: false,
+            durable_evidence: true,
+        },
+        OwnershipCrashCase {
+            point: "after_pty_start",
+            durable_phase: Some("prepared"),
+            public: false,
+            durable_evidence: true,
+        },
+        OwnershipCrashCase {
+            point: "before_active_commit",
+            durable_phase: Some("prepared"),
+            public: false,
+            durable_evidence: true,
+        },
+        OwnershipCrashCase {
+            point: "after_active_commit",
+            durable_phase: Some("active"),
+            public: true,
+            durable_evidence: true,
+        },
+        OwnershipCrashCase {
+            point: "before_create_response",
+            durable_phase: Some("active"),
+            public: true,
+            durable_evidence: true,
+        },
+    ];
+
+    for case in cases {
+        run_ownership_crash_case(case);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn run_ownership_crash_case(case: OwnershipCrashCase) {
+    let state_dir = std::env::temp_dir().join(format!(
+        "termd-session-supervisor-test-{}-{:x}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos()
+    ));
+    fs::create_dir_all(&state_dir).unwrap();
+    let state_path = state_dir.join("daemon-state.json");
+    let checkpoint_dir = temp_state_path(&format!("crash-{}-checkpoints", case.point));
+    fs::create_dir_all(&checkpoint_dir).unwrap();
+    let marker = checkpoint_dir.join(format!("{}.reached", case.point));
+    let release = checkpoint_dir.join(format!("{}.continue", case.point));
+    let mut child = ProcessCommand::new(std::env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "ownership_sigkill_crash_child",
+            "--nocapture",
+        ])
+        .env("TERMD_TEST_CRASH_STATE", &state_path)
+        .env("TERMD_TEST_OWNERSHIP_CHECKPOINT_DIR", &checkpoint_dir)
+        .env("TERMD_TEST_OWNERSHIP_CHECKPOINT", case.point)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !marker.exists() {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "crash child exited before checkpoint {}",
+            case.point
+        );
+        assert!(
+            Instant::now() < deadline,
+            "checkpoint {} timed out",
+            case.point
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let sqlite_path = state_path.with_extension("sqlite");
+    let durable = rusqlite::Connection::open(&sqlite_path)
+        .unwrap()
+        .query_row(
+            "SELECT session_id, phase, supervisor_pid, socket_path, expected_socket
+             FROM session_ownership LIMIT 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<u32>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            },
+        )
+        .ok();
+    assert_eq!(
+        durable.as_ref().map(|row| row.1.as_str()),
+        case.durable_phase
+    );
+    if let Some((_, _, pid, socket, _)) = &durable {
+        assert_eq!(pid.is_some() && socket.is_some(), case.durable_evidence);
+    }
+    let observed = durable
+        .as_ref()
+        .and_then(|row| row.4.as_deref())
+        .and_then(find_supervisor_pid_for_socket);
+    assert_eq!(
+        observed.is_some(),
+        matches!(
+            case.point,
+            "after_spawn_before_evidence"
+                | "after_evidence_before_grant"
+                | "after_grant_before_pty"
+                | "after_pty_start"
+                | "before_active_commit"
+                | "after_active_commit"
+                | "before_create_response"
+        ),
+        "point={}",
+        case.point
+    );
+    if case.durable_evidence {
+        assert_eq!(observed, durable.as_ref().and_then(|row| row.2));
+    }
+    let _supervisor_guard = observed
+        .zip(
+            durable
+                .as_ref()
+                .and_then(|row| row.4.as_ref())
+                .map(PathBuf::from),
+        )
+        .map(|(pid, socket)| TestSupervisorGuard::new(pid, socket));
+
+    unsafe {
+        libc::kill(child.id() as libc::pid_t, libc::SIGKILL);
+    }
+    let status = child.wait().unwrap();
+    assert_eq!(status.signal(), Some(libc::SIGKILL));
+    fs::write(&release, b"continue").unwrap();
+
+    let binary_path = PathBuf::from(env!("CARGO_BIN_EXE_termd"));
+    let mut restarted = DaemonProtocol::from_state(
+        DaemonConfig::default_for_state_path(&state_path),
+        SupervisorPtyBackend::with_binary_and_state_path(&binary_path, &state_path),
+        Ed25519SignatureVerifier,
+        StateStore::load(&state_path).unwrap(),
+    )
+    .unwrap();
+    let (mut connection, _) = restarted.start_connection();
+    let device_id = DeviceId::new();
+    let mut device_session = open_e2ee(&mut restarted, &mut connection, device_id);
+    pair_connection(
+        &mut restarted,
+        &mut connection,
+        &mut device_session,
+        device_id,
+    );
+    let listed = send_encrypted(
+        &mut restarted,
+        &mut connection,
+        &mut device_session,
+        envelope_value(MessageType::SessionList, SessionListPayload {}).unwrap(),
+    );
+    let listed: SessionListResultPayload =
+        decode_payload(decrypt_first(&mut device_session, listed).payload).unwrap();
+    assert_eq!(
+        listed.sessions.len(),
+        usize::from(case.public),
+        "point={}",
+        case.point
+    );
+
+    if case.public {
+        let session_id = listed.sessions[0].session_id;
+        let attached = send_encrypted(
+            &mut restarted,
+            &mut connection,
+            &mut device_session,
+            envelope_value(
+                MessageType::SessionAttach,
+                SessionAttachPayload {
+                    session_id,
+                    watch_updates: false,
+                    last_terminal_seq: None,
+                },
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            decrypt_first(&mut device_session, attached).kind,
+            MessageType::SessionAttached
+        );
+        let pid = durable.as_ref().and_then(|row| row.2).unwrap();
+        let closed = send_encrypted(
+            &mut restarted,
+            &mut connection,
+            &mut device_session,
+            envelope_value(
+                MessageType::SessionClose,
+                SessionClosePayload { session_id },
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            decrypt_first(&mut device_session, closed).kind,
+            MessageType::SessionClosed
+        );
+        wait_until_linux_process_is_reaped(pid);
+    } else {
+        if let Some((session_id, ..)) = durable.as_ref() {
+            let attached = send_encrypted(
+                &mut restarted,
+                &mut connection,
+                &mut device_session,
+                envelope_value(
+                    MessageType::SessionAttach,
+                    SessionAttachPayload {
+                        session_id: SessionId(uuid::Uuid::parse_str(session_id).unwrap()),
+                        watch_updates: false,
+                        last_terminal_seq: None,
+                    },
+                )
+                .unwrap(),
+            );
+            assert_ne!(
+                decrypt_first(&mut device_session, attached).kind,
+                MessageType::SessionAttached,
+                "pre-active session attached at {}",
+                case.point
+            );
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let rows: i64 = rusqlite::Connection::open(&sqlite_path)
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM session_ownership", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            if rows == 0 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "cleanup timed out at {}",
+                case.point
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if let Some(pid) = observed {
+            wait_until_linux_process_is_reaped(pid);
+        }
+        if let Some((_, _, _, _, Some(socket))) = durable {
+            assert!(!Path::new(&socket).exists());
+        }
+    }
+    drop(restarted);
+    fs::remove_dir_all(checkpoint_dir).unwrap();
+    fs::remove_dir_all(state_dir).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+fn find_supervisor_pid_for_socket(socket_path: &str) -> Option<u32> {
+    for entry in fs::read_dir("/proc").ok()?.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|value| value.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(cmdline) = fs::read(entry.path().join("cmdline")) else {
+            continue;
+        };
+        let arguments: Vec<&[u8]> = cmdline
+            .split(|byte| *byte == 0)
+            .filter(|argument| !argument.is_empty())
+            .collect();
+        if arguments
+            .iter()
+            .any(|argument| *argument == b"__session-supervisor")
+            && arguments
+                .windows(2)
+                .any(|pair| pair[0] == b"--socket-path" && pair[1] == socket_path.as_bytes())
+        {
+            return Some(pid);
+        }
+    }
+    None
+}
+
+fn real_064_supervisor_binary() -> &'static Path {
+    static BINARY: OnceLock<PathBuf> = OnceLock::new();
+    BINARY.get_or_init(|| {
+        let root = std::env::temp_dir().join("termd-real-0ccd03f-build");
+        let binary = root.join("target/debug/termd");
+        if binary.is_file() {
+            return binary;
+        }
+        fs::create_dir_all(&root).unwrap();
+        let archive = root.join("source.tar");
+        let repository = ProcessCommand::new("git")
+            .args(["rev-parse", "--show-toplevel"])
+            .output()
+            .expect("git rev-parse should run");
+        assert!(repository.status.success());
+        let repository = PathBuf::from(String::from_utf8(repository.stdout).unwrap().trim());
+        let status = ProcessCommand::new("git")
+            .args(["archive", "--format=tar", "-o"])
+            .arg(&archive)
+            .arg("0ccd03f")
+            .current_dir(repository)
+            .status()
+            .expect("git archive should run");
+        assert!(status.success(), "git archive 0ccd03f failed");
+        let status = ProcessCommand::new("tar")
+            .arg("-xf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&root)
+            .status()
+            .expect("tar should extract baseline");
+        assert!(status.success(), "baseline archive extraction failed");
+        let status = ProcessCommand::new("cargo")
+            .args([
+                "build",
+                "--offline",
+                "--locked",
+                "-p",
+                "termd",
+                "--bin",
+                "termd",
+            ])
+            .current_dir(&root)
+            .status()
+            .expect("baseline cargo build should run");
+        assert!(status.success(), "real 0ccd03f termd build failed");
+        binary
+    })
+}
+
+fn startup_grant_frame(
+    session_id: &str,
+    socket_path: &Path,
+    supervisor_pid: u32,
+    cleanup_capability: &str,
+) -> Vec<u8> {
+    let capability = general_purpose::STANDARD
+        .decode(cleanup_capability)
+        .expect("test cleanup capability is base64");
+    assert_eq!(capability.len(), 32);
+    let mut frame = Vec::with_capacity(124);
+    frame.extend_from_slice(b"TMDGRT01");
+    frame.extend_from_slice(&[7_u8; 16]);
+    frame.extend_from_slice(&capability);
+    frame.extend_from_slice(&Sha256::digest(session_id.as_bytes()));
+    frame.extend_from_slice(&Sha256::digest(socket_path.as_os_str().as_bytes()));
+    frame.extend_from_slice(&supervisor_pid.to_be_bytes());
+    frame
+}
+
+fn spawn_supervisor_from_short_lived_parent_with_capability(
+    binary_path: &Path,
+    session_id: &str,
+    socket_path: &Path,
+    command: &CommandSpec,
+    size: PtySize,
+    pid_file: &Path,
+    cleanup_capability: Option<String>,
+) -> u32 {
+    let secret_probe = cleanup_capability.clone();
     let command_base64 =
         general_purpose::STANDARD.encode(serde_json::to_vec(command).expect("command serializes"));
     let size_base64 =
         general_purpose::STANDARD.encode(serde_json::to_vec(&size).expect("size serializes"));
     let script = r#"
-trap '' HUP
-nohup "$TERMD_BIN" __session-supervisor \
+	trap '' HUP
+	exec 3<&0
+	nohup "$TERMD_BIN" __session-supervisor \
   --session-id "$SESSION_ID" \
   --socket-path "$SOCKET_PATH" \
   --command-base64 "$COMMAND_BASE64" \
   --size-base64 "$SIZE_BASE64" \
-  >/dev/null 2>&1 &
+  <&3 >/dev/null 2>&1 &
 echo "$!" > "$PID_FILE"
 "#;
 
     // 用短生命周期 shell 启动 supervisor，shell 退出后测试进程只持有 restore_info，
     // 不持有 Child 句柄，从而覆盖真实父进程退出后的重连路径。
-    let mut helper = ProcessCommand::new("sh")
+    let mut helper_command = ProcessCommand::new("sh");
+    helper_command
         .arg("-c")
         .arg(script)
         .env("TERMD_BIN", binary_path)
@@ -322,19 +1238,55 @@ echo "$!" > "$PID_FILE"
         .env("COMMAND_BASE64", command_base64)
         .env("SIZE_BASE64", size_base64)
         .env("PID_FILE", pid_file)
+        .stdin(Stdio::piped())
+        .env_remove("TERMD_SUPERVISOR_CLEANUP_CAPABILITY");
+    let mut helper = helper_command
         .spawn()
         .expect("short-lived supervisor launcher should spawn");
     let helper_pid = helper.id();
-    let status = helper
-        .wait()
-        .expect("short-lived supervisor launcher should exit");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let supervisor_pid = loop {
+        if let Ok(pid) = fs::read_to_string(pid_file)
+            && let Ok(pid) = pid.trim().parse::<u32>()
+        {
+            break pid;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "short-lived launcher should write supervisor pid"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    if let Some(cleanup_capability) = cleanup_capability {
+        helper
+            .stdin
+            .take()
+            .expect("launcher startup pipe exists")
+            .write_all(&startup_grant_frame(
+                session_id,
+                socket_path,
+                supervisor_pid,
+                &cleanup_capability,
+            ))
+            .unwrap();
+    } else {
+        drop(helper.stdin.take());
+    }
+    let status = helper.wait().expect("short-lived launcher should exit");
     assert!(status.success(), "short-lived launcher failed: {status}");
 
-    let supervisor_pid = fs::read_to_string(pid_file)
-        .expect("short-lived launcher should write supervisor pid")
-        .trim()
-        .parse::<u32>()
-        .expect("supervisor pid should be numeric");
+    #[cfg(target_os = "linux")]
+    if let Some(secret) = secret_probe {
+        for proc_file in ["cmdline", "environ"] {
+            let bytes = fs::read(format!("/proc/{supervisor_pid}/{proc_file}")).unwrap();
+            assert!(
+                !bytes
+                    .windows(secret.len())
+                    .any(|window| window == secret.as_bytes()),
+                "startup capability leaked through supervisor {proc_file}"
+            );
+        }
+    }
 
     #[cfg(target_os = "linux")]
     assert_ne!(
@@ -599,9 +1551,8 @@ fn supervisor_attach_sync_returns_tail_from_journal_without_snapshot() {
         .unwrap();
     runtime.attach(session_id, "dev-a").unwrap();
 
-    let first_snapshot = runtime
-        .terminal_snapshot(session_id, None)
-        .expect("initial AttachSync should return snapshot");
+    let first_snapshot =
+        terminal_snapshot_until_contains(&mut runtime, session_id, None, b"first-sync");
     let first_seq = snapshot_base_seq_containing(&first_snapshot, b"first-sync");
     runtime
         .write_input(session_id, "dev-a", b"second-sync\n")
@@ -653,9 +1604,12 @@ fn supervisor_reconnect_attach_sync_does_not_replay_rendered_terminal_frame() {
         )
         .unwrap();
     runtime.attach(session_id, "dev-a").unwrap();
-    let rendered_snapshot = runtime
-        .terminal_snapshot(session_id, None)
-        .expect("initial AttachSync should return snapshot");
+    let rendered_snapshot = terminal_snapshot_until_contains(
+        &mut runtime,
+        session_id,
+        None,
+        b"rendered-before-reconnect",
+    );
     let rendered_seq =
         snapshot_base_seq_containing(&rendered_snapshot, b"rendered-before-reconnect");
     let persisted = runtime.persisted_sessions();
@@ -843,6 +1797,783 @@ fn daemon_session_list_shows_restored_supervisor_without_client_history_metadata
 }
 
 #[test]
+fn daemon_reconciles_natural_exit_without_post_exit_request() {
+    let state_path = temp_state_path("background-natural-exit.json");
+    let binary_path = PathBuf::from(env!("CARGO_BIN_EXE_termd"));
+    let session_id = SessionId::new();
+    let session_id_text = session_id.0.to_string();
+    let backend = SupervisorPtyBackend::with_binary_and_state_path(&binary_path, &state_path);
+    let mut initial = SessionRuntime::new(backend.clone());
+    initial
+        .create_session_with_id(
+            &session_id_text,
+            CommandSpec::new("sh").args(["-c", "sleep 1; exit 9"]),
+            TerminalSize::cells(24, 80),
+        )
+        .unwrap();
+    initial
+        .attach(&session_id_text, "bootstrap-device")
+        .unwrap();
+    StateStore::save(
+        &state_path,
+        &DaemonState {
+            version: termd::state::STATE_SCHEMA_VERSION,
+            daemon_identity: None,
+            trusted_devices: Vec::new(),
+            sessions: initial.persisted_sessions(),
+        },
+    )
+    .unwrap();
+    drop(initial);
+
+    let state = StateStore::load(&state_path).unwrap();
+    let mut protocol = DaemonProtocol::from_state(
+        DaemonConfig::default_for_state_path(&state_path),
+        backend.clone(),
+        Ed25519SignatureVerifier,
+        state,
+    )
+    .unwrap();
+    let (mut connection, _) = protocol.start_connection();
+    let device_id = DeviceId::new();
+    let mut device_session = open_e2ee(&mut protocol, &mut connection, device_id);
+    pair_connection(
+        &mut protocol,
+        &mut connection,
+        &mut device_session,
+        device_id,
+    );
+    let attached = send_encrypted(
+        &mut protocol,
+        &mut connection,
+        &mut device_session,
+        envelope_value(
+            MessageType::SessionAttach,
+            SessionAttachPayload {
+                session_id,
+                watch_updates: false,
+                last_terminal_seq: None,
+            },
+        )
+        .unwrap(),
+    );
+    let attached = decrypt_first(&mut device_session, attached);
+    assert_eq!(attached.kind, MessageType::SessionAttached, "{attached:?}");
+
+    let deadline = Instant::now() + Duration::from_secs(12);
+    loop {
+        let state = StateStore::load(&state_path).unwrap();
+        if state
+            .sessions
+            .iter()
+            .all(|record| record.session_id != session_id)
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "background reconciliation did not close and prune the exited session"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let rejected_input = send_encrypted(
+        &mut protocol,
+        &mut connection,
+        &mut device_session,
+        envelope_value(
+            MessageType::SessionData,
+            SessionDataPayload {
+                session_id,
+                data_base64: general_purpose::STANDARD.encode(b"rejected-after-exit"),
+            },
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        decrypt_first(&mut device_session, rejected_input).kind,
+        MessageType::Error
+    );
+
+    let rejected = send_encrypted(
+        &mut protocol,
+        &mut connection,
+        &mut device_session,
+        envelope_value(
+            MessageType::SessionAttach,
+            SessionAttachPayload {
+                session_id,
+                watch_updates: false,
+                last_terminal_seq: None,
+            },
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        decrypt_first(&mut device_session, rejected).kind,
+        MessageType::Error
+    );
+
+    drop(backend);
+}
+
+#[test]
+#[cfg(unix)]
+fn closing_restore_fast_path_never_creates_a_regular_controller() {
+    let state_path = temp_state_path("closing-reconnect-retry.json");
+    let binary_path = PathBuf::from(env!("CARGO_BIN_EXE_termd"));
+    let backend = SupervisorPtyBackend::with_binary_and_state_path(&binary_path, &state_path);
+    let session_id = SessionId::new();
+    let session_id_text = session_id.0.to_string();
+    let socket_path = state_path.with_extension("sock");
+    let pid_file = state_path.with_extension("pid");
+    let supervisor_pid = spawn_supervisor_from_short_lived_parent(
+        &binary_path,
+        &session_id_text,
+        &socket_path,
+        &CommandSpec::new("sh").args(["-c", "cat"]),
+        PtySize::new(24, 80),
+        &pid_file,
+    );
+    let socket_deadline = Instant::now() + Duration::from_secs(5);
+    while !socket_path.exists() {
+        assert!(
+            Instant::now() < socket_deadline,
+            "supervisor socket was not created"
+        );
+        std::thread::yield_now();
+    }
+    let now_ms = current_unix_timestamp_millis();
+    let record = SessionStateRecord {
+        session_id,
+        state: SessionState::Running,
+        size: termd_proto::TerminalSize::new(24, 80),
+        created_at_ms: now_ms,
+        updated_at_ms: now_ms,
+        restore_info: Some(PtyRestoreInfo::UnixSocket {
+            socket_path: socket_path.clone(),
+            supervisor_pid,
+            supervisor_status: PtySupervisorStatus::Closing,
+        }),
+    };
+    StateStore::save(
+        &state_path,
+        &DaemonState {
+            version: termd::state::STATE_SCHEMA_VERSION,
+            daemon_identity: None,
+            trusted_devices: Vec::new(),
+            sessions: vec![record.clone()],
+        },
+    )
+    .unwrap();
+    persist_test_ownership(
+        &state_path,
+        session_id,
+        record.restore_info.as_ref().unwrap(),
+        "cleaning",
+        None,
+    );
+
+    let retry_backend = FailFirstReconnectBackend::new(backend.clone());
+    let state = StateStore::load(&state_path).unwrap();
+    let protocol = DaemonProtocol::from_state(
+        DaemonConfig::default_for_state_path(&state_path),
+        retry_backend.clone(),
+        Ed25519SignatureVerifier,
+        state,
+    )
+    .unwrap();
+    let mut protocol = Some(protocol);
+    assert_eq!(retry_backend.reconnect_attempts(), 0);
+    assert!(linux_process_state(supervisor_pid).is_some());
+    assert_eq!(StateStore::load(&state_path).unwrap().sessions.len(), 1);
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !StateStore::load(&state_path).unwrap().sessions.is_empty() {
+        if Instant::now() >= deadline {
+            drop(protocol.take());
+            let reconnect_info = PtyRestoreInfo::UnixSocket {
+                socket_path: socket_path.clone(),
+                supervisor_pid,
+                supervisor_status: PtySupervisorStatus::Running,
+            };
+            if let Ok(mut cleanup) =
+                backend.reconnect(&session_id_text, &reconnect_info, PtySize::new(24, 80))
+            {
+                let _ = cleanup.terminate();
+            }
+            panic!("background cleanup did not retry the transient reconnect failure");
+        }
+        std::thread::yield_now();
+    }
+
+    assert_eq!(retry_backend.reconnect_attempts(), 0);
+    drop(protocol.take());
+    wait_until_linux_process_is_reaped(supervisor_pid);
+    let _ = fs::remove_file(pid_file);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn real_064_running_session_reconnects_accepts_input_restarts_and_closes() {
+    run_real_064_running_migration(false);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn real_064_running_with_residual_controller_is_taken_over_without_extra_authority() {
+    run_real_064_running_migration(true);
+}
+
+#[cfg(target_os = "linux")]
+fn run_real_064_running_migration(keep_residual_controller: bool) {
+    let state_path = temp_state_path(if keep_residual_controller {
+        "legacy-running-residual-controller.json"
+    } else {
+        "legacy-running-capability.json"
+    });
+    let socket_path = state_path.with_extension("sock");
+    let pid_file = state_path.with_extension("pid");
+    let sqlite_path = state_path.with_extension("sqlite");
+    let binary_path = PathBuf::from(env!("CARGO_BIN_EXE_termd"));
+    let session_id = SessionId::new();
+    let session_id_text = session_id.0.to_string();
+    let supervisor_pid = spawn_legacy_supervisor_from_short_lived_parent(
+        &binary_path,
+        &session_id_text,
+        &socket_path,
+        &CommandSpec::new("sh").args(["-c", "cat"]),
+        PtySize::new(24, 80),
+        &pid_file,
+    );
+    let _supervisor_guard = TestSupervisorGuard::new(supervisor_pid, socket_path.clone());
+    let now_ms = current_unix_timestamp_millis();
+    let record = SessionStateRecord {
+        session_id,
+        state: SessionState::Running,
+        size: termd_proto::TerminalSize::new(24, 80),
+        created_at_ms: now_ms,
+        updated_at_ms: now_ms,
+        restore_info: Some(PtyRestoreInfo::UnixSocket {
+            socket_path,
+            supervisor_pid,
+            supervisor_status: PtySupervisorStatus::Running,
+        }),
+    };
+    StateStore::save(
+        &state_path,
+        &DaemonState {
+            version: termd::state::STATE_SCHEMA_VERSION,
+            daemon_identity: None,
+            trusted_devices: Vec::new(),
+            sessions: vec![record.clone()],
+        },
+    )
+    .unwrap();
+
+    let mut legacy_runtime = Some(SessionRuntime::new(
+        SupervisorPtyBackend::with_binary_and_state_path(&binary_path, &state_path),
+    ));
+    legacy_runtime
+        .as_mut()
+        .unwrap()
+        .reconnect_session(&record)
+        .unwrap();
+    legacy_runtime
+        .as_mut()
+        .unwrap()
+        .attach(&session_id_text, "legacy-input-device")
+        .unwrap();
+    legacy_runtime
+        .as_mut()
+        .unwrap()
+        .write_input(&session_id_text, "legacy-input-device", b"legacy-ok\n")
+        .unwrap();
+    if !keep_residual_controller {
+        drop(legacy_runtime.take());
+    }
+
+    let mut protocol = DaemonProtocol::from_state(
+        DaemonConfig::default_for_state_path(&state_path),
+        SupervisorPtyBackend::with_binary_and_state_path(&binary_path, &state_path),
+        Ed25519SignatureVerifier,
+        StateStore::load(&state_path).unwrap(),
+    )
+    .unwrap();
+    let (mut connection, _) = protocol.start_connection();
+    let device_id = DeviceId::new();
+    let mut device_session = open_e2ee(&mut protocol, &mut connection, device_id);
+    pair_connection(
+        &mut protocol,
+        &mut connection,
+        &mut device_session,
+        device_id,
+    );
+    let listed = send_encrypted(
+        &mut protocol,
+        &mut connection,
+        &mut device_session,
+        envelope_value(MessageType::SessionList, SessionListPayload {}).unwrap(),
+    );
+    let listed: SessionListResultPayload =
+        decode_payload(decrypt_first(&mut device_session, listed).payload).unwrap();
+    assert_eq!(listed.sessions.len(), 1);
+    assert_eq!(listed.sessions[0].session_id, session_id);
+    let attached = send_encrypted(
+        &mut protocol,
+        &mut connection,
+        &mut device_session,
+        envelope_value(
+            MessageType::SessionAttach,
+            SessionAttachPayload {
+                session_id,
+                watch_updates: false,
+                last_terminal_seq: None,
+            },
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        decrypt_first(&mut device_session, attached).kind,
+        MessageType::SessionAttached
+    );
+    drop(protocol);
+
+    let state_db = rusqlite::Connection::open(&sqlite_path).unwrap();
+    let (phase, legacy_protocol, capability): (String, i64, Vec<u8>) = state_db
+        .query_row(
+            "SELECT phase, legacy_protocol, capability
+             FROM session_ownership WHERE session_id = ?1",
+            [&session_id_text],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(phase, "active");
+    assert_eq!(legacy_protocol, 1);
+    assert_eq!(capability.len(), 32);
+    drop(state_db);
+
+    if legacy_runtime.is_some() {
+        assert!(
+            legacy_runtime
+                .as_mut()
+                .unwrap()
+                .write_input(
+                    &session_id_text,
+                    "legacy-input-device",
+                    b"stale-controller\n"
+                )
+                .is_err(),
+            "the residual 0.6.4 controller must lose authority after takeover"
+        );
+        drop(legacy_runtime.take());
+    }
+
+    let mut restarted = DaemonProtocol::from_state(
+        DaemonConfig::default_for_state_path(&state_path),
+        SupervisorPtyBackend::with_binary_and_state_path(&binary_path, &state_path),
+        Ed25519SignatureVerifier,
+        StateStore::load(&state_path).unwrap(),
+    )
+    .unwrap();
+    let (mut restarted_connection, _) = restarted.start_connection();
+    let restarted_device = DeviceId::new();
+    let mut restarted_session =
+        open_e2ee(&mut restarted, &mut restarted_connection, restarted_device);
+    pair_connection(
+        &mut restarted,
+        &mut restarted_connection,
+        &mut restarted_session,
+        restarted_device,
+    );
+    let attached = send_encrypted(
+        &mut restarted,
+        &mut restarted_connection,
+        &mut restarted_session,
+        envelope_value(
+            MessageType::SessionAttach,
+            SessionAttachPayload {
+                session_id,
+                watch_updates: false,
+                last_terminal_seq: None,
+            },
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        decrypt_first(&mut restarted_session, attached).kind,
+        MessageType::SessionAttached
+    );
+    let state_db = rusqlite::Connection::open(&sqlite_path).unwrap();
+    let (ownership_rows, restarted_capability): (i64, Vec<u8>) = state_db
+        .query_row(
+            "SELECT COUNT(*), capability FROM session_ownership WHERE session_id = ?1",
+            [&session_id_text],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(ownership_rows, 1);
+    assert_eq!(restarted_capability, capability);
+    drop(state_db);
+    let closed = send_encrypted(
+        &mut restarted,
+        &mut restarted_connection,
+        &mut restarted_session,
+        envelope_value(
+            MessageType::SessionClose,
+            SessionClosePayload { session_id },
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        decrypt_first(&mut restarted_session, closed).kind,
+        MessageType::SessionClosed
+    );
+    wait_until_linux_process_is_reaped(supervisor_pid);
+    let _ = fs::remove_file(pid_file);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn legacy_closing_double_null_restore_atomically_installs_cleanup_journal_and_cleans_up() {
+    run_legacy_closing_migration(false);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn legacy_closing_with_residual_controller_converges_without_expanding_authority() {
+    run_legacy_closing_migration(true);
+}
+
+#[cfg(target_os = "linux")]
+fn run_legacy_closing_migration(keep_residual_controller: bool) {
+    let state_path = temp_state_path(if keep_residual_controller {
+        "legacy-closing-residual-controller.json"
+    } else {
+        "legacy-closing-capability.json"
+    });
+    let socket_path = state_path.with_extension("sock");
+    let pid_file = state_path.with_extension("pid");
+    let sqlite_path = state_path.with_extension("sqlite");
+    let binary_path = PathBuf::from(env!("CARGO_BIN_EXE_termd"));
+    let session_id = SessionId::new();
+    let session_id_text = session_id.0.to_string();
+    let supervisor_pid = spawn_legacy_supervisor_from_short_lived_parent(
+        &binary_path,
+        &session_id_text,
+        &socket_path,
+        &CommandSpec::new("sh").args(["-c", "cat"]),
+        PtySize::new(24, 80),
+        &pid_file,
+    );
+    let _supervisor_guard = TestSupervisorGuard::new(supervisor_pid, socket_path.clone());
+    let now_ms = current_unix_timestamp_millis();
+    let record = SessionStateRecord {
+        session_id,
+        state: SessionState::Running,
+        size: termd_proto::TerminalSize::new(24, 80),
+        created_at_ms: now_ms,
+        updated_at_ms: now_ms,
+        restore_info: Some(PtyRestoreInfo::UnixSocket {
+            socket_path: socket_path.clone(),
+            supervisor_pid,
+            supervisor_status: PtySupervisorStatus::Closing,
+        }),
+    };
+    StateStore::save(
+        &state_path,
+        &DaemonState {
+            version: termd::state::STATE_SCHEMA_VERSION,
+            daemon_identity: None,
+            trusted_devices: Vec::new(),
+            sessions: vec![record.clone()],
+        },
+    )
+    .unwrap();
+    let state_db = rusqlite::Connection::open(&sqlite_path).unwrap();
+    let columns = {
+        let mut statement = state_db
+            .prepare("PRAGMA table_info(runtime_sessions)")
+            .unwrap();
+        statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    assert!(
+        !columns.iter().any(|column| {
+            matches!(column.as_str(), "close_operation_id" | "cleanup_capability")
+        })
+    );
+    drop(state_db);
+
+    let mut residual_runtime = if keep_residual_controller {
+        let mut running_record = record;
+        running_record.restore_info = Some(PtyRestoreInfo::UnixSocket {
+            socket_path: socket_path.clone(),
+            supervisor_pid,
+            supervisor_status: PtySupervisorStatus::Running,
+        });
+        let mut runtime = SessionRuntime::new(SupervisorPtyBackend::with_binary_and_state_path(
+            &binary_path,
+            &state_path,
+        ));
+        runtime.reconnect_session(&running_record).unwrap();
+        runtime
+            .attach(&session_id_text, "legacy-closing-residual")
+            .unwrap();
+        Some(runtime)
+    } else {
+        None
+    };
+
+    let backend = SupervisorPtyBackend::with_binary_and_state_path(&binary_path, &state_path);
+    let state = StateStore::load(&state_path).unwrap();
+    let protocol = DaemonProtocol::from_state(
+        DaemonConfig::default_for_state_path(&state_path),
+        backend,
+        Ed25519SignatureVerifier,
+        state,
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !StateStore::load(&state_path).unwrap().sessions.is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "legacy Closing cleanup timed out"
+        );
+        std::thread::yield_now();
+    }
+    if let Some(runtime) = residual_runtime.as_mut() {
+        assert!(
+            runtime
+                .write_input(
+                    &session_id_text,
+                    "legacy-closing-residual",
+                    b"must-not-write\n"
+                )
+                .is_err()
+        );
+    }
+    drop(protocol);
+    wait_until_linux_process_is_reaped(supervisor_pid);
+    let _ = fs::remove_file(pid_file);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn real_064_closing_lost_close_response_converges_after_restart() {
+    let state_path = temp_state_path("legacy-closing-lost-close-response.json");
+    let socket_path = state_path.with_extension("sock");
+    let pid_file = state_path.with_extension("pid");
+    let binary_path = PathBuf::from(env!("CARGO_BIN_EXE_termd"));
+    let session_id = SessionId::new();
+    let session_id_text = session_id.0.to_string();
+    let supervisor_pid = spawn_legacy_supervisor_from_short_lived_parent(
+        &binary_path,
+        &session_id_text,
+        &socket_path,
+        &CommandSpec::new("sh").args(["-c", "cat"]),
+        PtySize::new(24, 80),
+        &pid_file,
+    );
+    let _supervisor_guard = TestSupervisorGuard::new(supervisor_pid, socket_path.clone());
+    let now_ms = current_unix_timestamp_millis();
+    StateStore::save(
+        &state_path,
+        &DaemonState {
+            version: termd::state::STATE_SCHEMA_VERSION,
+            daemon_identity: None,
+            trusted_devices: Vec::new(),
+            sessions: vec![SessionStateRecord {
+                session_id,
+                state: SessionState::Running,
+                size: termd_proto::TerminalSize::new(24, 80),
+                created_at_ms: now_ms,
+                updated_at_ms: now_ms,
+                restore_info: Some(PtyRestoreInfo::UnixSocket {
+                    socket_path: socket_path.clone(),
+                    supervisor_pid,
+                    supervisor_status: PtySupervisorStatus::Closing,
+                }),
+            }],
+        },
+    )
+    .unwrap();
+
+    let mut controller = connect_raw_supervisor(&socket_path);
+    write_raw_supervisor_request(
+        &mut controller,
+        serde_json::json!({
+            "request_id": 1,
+            "request": {
+                "type": "attach_sync",
+                "session_id": session_id_text,
+                "last_terminal_seq": null,
+                "resume_controller_id": null
+            }
+        }),
+    );
+    assert_eq!(
+        read_raw_supervisor_response(&mut controller)["response"]["status"],
+        "ok"
+    );
+    write_raw_supervisor_request(
+        &mut controller,
+        serde_json::json!({"request_id": 2, "request": {"type": "close"}}),
+    );
+    drop(controller);
+    wait_until_linux_process_is_reaped(supervisor_pid);
+
+    let protocol = DaemonProtocol::from_state(
+        DaemonConfig::default_for_state_path(&state_path),
+        SupervisorPtyBackend::with_binary_and_state_path(&binary_path, &state_path),
+        Ed25519SignatureVerifier,
+        StateStore::load(&state_path).unwrap(),
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !StateStore::load(&state_path).unwrap().sessions.is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "lost legacy Close response did not converge"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    drop(protocol);
+    let _ = fs::remove_file(pid_file);
+}
+
+#[test]
+#[ignore = "spawned only by real_064_closing_repeated_migration_after_install_response_loss"]
+#[cfg(target_os = "linux")]
+fn legacy_closing_migration_crash_child() {
+    let state_path = PathBuf::from(std::env::var_os("TERMD_TEST_CRASH_STATE").unwrap());
+    let binary_path = PathBuf::from(env!("CARGO_BIN_EXE_termd"));
+    let _protocol = DaemonProtocol::from_state(
+        DaemonConfig::default_for_state_path(&state_path),
+        SupervisorPtyBackend::with_binary_and_state_path(&binary_path, &state_path),
+        Ed25519SignatureVerifier,
+        StateStore::load(&state_path).unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn real_064_closing_repeated_migration_after_install_response_loss() {
+    let state_path = temp_state_path("legacy-closing-repeat-migration.json");
+    let socket_path = state_path.with_extension("sock");
+    let pid_file = state_path.with_extension("pid");
+    let sqlite_path = state_path.with_extension("sqlite");
+    let binary_path = PathBuf::from(env!("CARGO_BIN_EXE_termd"));
+    let session_id = SessionId::new();
+    let session_id_text = session_id.0.to_string();
+    let supervisor_pid = spawn_legacy_supervisor_from_short_lived_parent(
+        &binary_path,
+        &session_id_text,
+        &socket_path,
+        &CommandSpec::new("sh").args(["-c", "cat"]),
+        PtySize::new(24, 80),
+        &pid_file,
+    );
+    let _supervisor_guard = TestSupervisorGuard::new(supervisor_pid, socket_path.clone());
+    let now_ms = current_unix_timestamp_millis();
+    StateStore::save(
+        &state_path,
+        &DaemonState {
+            version: termd::state::STATE_SCHEMA_VERSION,
+            daemon_identity: None,
+            trusted_devices: Vec::new(),
+            sessions: vec![SessionStateRecord {
+                session_id,
+                state: SessionState::Running,
+                size: termd_proto::TerminalSize::new(24, 80),
+                created_at_ms: now_ms,
+                updated_at_ms: now_ms,
+                restore_info: Some(PtyRestoreInfo::UnixSocket {
+                    socket_path,
+                    supervisor_pid,
+                    supervisor_status: PtySupervisorStatus::Closing,
+                }),
+            }],
+        },
+    )
+    .unwrap();
+    let checkpoint_dir = temp_state_path("legacy-closing-repeat-checkpoints");
+    fs::create_dir_all(&checkpoint_dir).unwrap();
+    let marker = checkpoint_dir.join("after_legacy_cleaning_commit.reached");
+    let mut child = ProcessCommand::new(std::env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "legacy_closing_migration_crash_child",
+            "--nocapture",
+        ])
+        .env("TERMD_TEST_CRASH_STATE", &state_path)
+        .env("TERMD_TEST_OWNERSHIP_CHECKPOINT_DIR", &checkpoint_dir)
+        .env(
+            "TERMD_TEST_OWNERSHIP_CHECKPOINT",
+            "after_legacy_cleaning_commit",
+        )
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !marker.exists() {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "legacy migration child exited before cleaning checkpoint"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "legacy cleaning checkpoint timed out"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let connection = rusqlite::Connection::open(&sqlite_path).unwrap();
+    let (rows, phase, operation_id, legacy_protocol): (i64, String, String, i64) = connection
+        .query_row(
+            "SELECT COUNT(*), phase, close_operation_id, legacy_protocol
+             FROM session_ownership WHERE session_id = ?1",
+            [&session_id_text],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(rows, 1);
+    assert_eq!(phase, "cleaning");
+    assert!(!operation_id.is_empty());
+    assert_eq!(legacy_protocol, 1);
+    drop(connection);
+    unsafe {
+        libc::kill(child.id() as libc::pid_t, libc::SIGKILL);
+    }
+    assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGKILL));
+
+    let protocol = DaemonProtocol::from_state(
+        DaemonConfig::default_for_state_path(&state_path),
+        SupervisorPtyBackend::with_binary_and_state_path(&binary_path, &state_path),
+        Ed25519SignatureVerifier,
+        StateStore::load(&state_path).unwrap(),
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !StateStore::load(&state_path).unwrap().sessions.is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "repeated legacy migration did not converge"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    drop(protocol);
+    wait_until_linux_process_is_reaped(supervisor_pid);
+    fs::remove_dir_all(checkpoint_dir).unwrap();
+    let _ = fs::remove_file(pid_file);
+}
+
+#[test]
 #[cfg(target_os = "linux")]
 fn daemon_startup_warns_but_does_not_adopt_unrecorded_live_supervisor() {
     let state_dir = std::env::temp_dir().join(format!(
@@ -880,30 +2611,51 @@ fn daemon_startup_warns_but_does_not_adopt_unrecorded_live_supervisor() {
             "--size-base64",
             &size_base64,
         ])
-        .stdin(Stdio::null())
+        .env_remove("TERMD_SUPERVISOR_CLEANUP_CAPABILITY")
+        .stdin(Stdio::piped())
         .stdout(Stdio::from(stdout_log))
         .stderr(Stdio::from(stderr_log))
         .spawn()
         .expect("test supervisor should spawn");
     let supervisor_pid = supervisor.id();
+    supervisor
+        .stdin
+        .take()
+        .expect("test supervisor startup pipe should exist")
+        .write_all(&startup_grant_frame(
+            session_id,
+            &socket_path,
+            supervisor_pid,
+            &test_cleanup_capability_base64(),
+        ))
+        .expect("test supervisor startup grant should write");
     assert!(
         linux_process_state(supervisor_pid).is_some(),
         "test supervisor should be alive before daemon startup"
     );
     let backend = SupervisorPtyBackend::with_binary_and_state_path(&binary_path, &state_path);
-    let mut candidates = Vec::new();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        // 子进程刚 exec 时 `/proc` 扫描可能短暂看不到完整 argv，测试侧等待到可发现为止。
-        candidates = backend.live_supervisor_restore_candidates().unwrap();
-        if candidates
-            .iter()
-            .any(|candidate| candidate.session_id == session_id)
-        {
-            break;
+    let wait_for_target = |supervisor: &mut std::process::Child| {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut candidates = Vec::new();
+        while Instant::now() < deadline {
+            candidates = backend.live_supervisor_restore_candidates().unwrap();
+            if candidates.iter().any(|candidate| {
+                candidate.supervisor_pid == supervisor_pid && candidate.session_id == session_id
+            }) {
+                return candidates;
+            }
+            std::thread::sleep(Duration::from_millis(20));
         }
-        std::thread::sleep(Duration::from_millis(20));
-    }
+        let cmdline = fs::read(format!("/proc/{supervisor_pid}/cmdline"))
+            .map(|bytes| String::from_utf8_lossy(&bytes).replace('\0', " "))
+            .unwrap_or_else(|error| format!("cmdline read failed: {error}"));
+        panic!(
+            "target supervisor was not discovered: pid={supervisor_pid} candidates={candidates:?} state={:?} status={:?} cmdline={cmdline}",
+            linux_process_state(supervisor_pid),
+            supervisor.try_wait().unwrap(),
+        );
+    };
+    let candidates = wait_for_target(&mut supervisor);
     let debug_cmdline = fs::read(format!("/proc/{supervisor_pid}/cmdline"))
         .map(|bytes| String::from_utf8_lossy(&bytes).replace('\0', " "))
         .unwrap_or_else(|error| format!("cmdline read failed: {error}"));
@@ -916,13 +2668,9 @@ fn daemon_startup_warns_but_does_not_adopt_unrecorded_live_supervisor() {
         "live supervisor should be discoverable before daemon startup: candidates={candidates:?} state={:?} status={supervisor_status:?} cmdline={debug_cmdline} log={supervisor_log}",
         linux_process_state(supervisor_pid),
     );
-    assert_eq!(
-        backend
-            .orphaned_supervisor_count(std::iter::empty::<&str>())
-            .unwrap(),
-        1,
-        "unrecorded live supervisor should be classified as an orphan warning candidate"
-    );
+    assert!(candidates.iter().any(|candidate| {
+        candidate.supervisor_pid == supervisor_pid && candidate.session_id == session_id
+    }));
 
     let config = DaemonConfig::default_for_state_path(&state_path);
     let protocol = try_default_protocol(config).unwrap();
@@ -932,13 +2680,10 @@ fn daemon_startup_warns_but_does_not_adopt_unrecorded_live_supervisor() {
         reloaded.sessions.is_empty(),
         "startup must not silently adopt old supervisor runtime rows after the tmux schema bump"
     );
-    assert_eq!(
-        backend
-            .orphaned_supervisor_count(std::iter::empty::<&str>())
-            .unwrap(),
-        1,
-        "startup should only warn about unrecorded live supervisors, not adopt or reap them"
-    );
+    let candidates_after_startup = wait_for_target(&mut supervisor);
+    assert!(candidates_after_startup.iter().any(|candidate| {
+        candidate.supervisor_pid == supervisor_pid && candidate.session_id == session_id
+    }));
     assert!(
         linux_process_state(supervisor_pid).is_some(),
         "startup must leave unrecorded live supervisor running for manual reset/cleanup"
@@ -985,6 +2730,416 @@ fn close_reaps_spawned_supervisor_child_process() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
+fn lost_close_response_is_finalized_on_new_connection_and_pid_disappears() {
+    let state_path = temp_state_path("close-response-loss-reaps.json");
+    let socket_path = state_path.with_extension("sock");
+    let pid_file = state_path.with_extension("pid");
+    let binary_path = PathBuf::from(env!("CARGO_BIN_EXE_termd"));
+    let session_id = "00000000-0000-0000-0000-000000000446";
+    let supervisor_pid = spawn_supervisor_from_short_lived_parent(
+        &binary_path,
+        session_id,
+        &socket_path,
+        &CommandSpec::new("sh").args(["-c", "cat"]),
+        PtySize::new(24, 80),
+        &pid_file,
+    );
+    let operation_id = 91_u64;
+
+    let mut first = connect_raw_supervisor(&socket_path);
+    write_raw_supervisor_request(
+        &mut first,
+        serde_json::json!({
+            "request_id": 1,
+            "request": {
+                "type": "attach_sync",
+                "session_id": session_id,
+                "last_terminal_seq": null,
+                "resume_controller_id": null
+            }
+        }),
+    );
+    let _ = read_raw_supervisor_response(&mut first);
+    write_raw_supervisor_request(
+        &mut first,
+        serde_json::json!({
+            "request_id": 2,
+            "request": { "type": "close_idempotent", "operation_id": operation_id }
+        }),
+    );
+    drop(first);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut recovery = connect_raw_supervisor(&socket_path);
+        authenticate_raw_cleanup(&mut recovery, session_id, 3);
+        write_raw_supervisor_request(
+            &mut recovery,
+            serde_json::json!({
+                "request_id": 5,
+                "request": { "type": "close_status", "operation_id": operation_id }
+            }),
+        );
+        let status = read_raw_supervisor_response(&mut recovery);
+        if status["response"]["payload"]["confirmed_dead"] == true {
+            write_raw_supervisor_request(
+                &mut recovery,
+                serde_json::json!({
+                    "request_id": 6,
+                    "request": { "type": "finalize_close", "operation_id": operation_id }
+                }),
+            );
+            assert_eq!(
+                read_raw_supervisor_response(&mut recovery)["response"]["status"],
+                "ok"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "close status was never confirmed"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    wait_until_linux_process_is_reaped(supervisor_pid);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn restart_between_close_and_finalize_reuses_durable_operation_id() {
+    let state_path = temp_state_path("restart-between-close-finalize.json");
+    let socket_path = state_path.with_extension("sock");
+    let pid_file = state_path.with_extension("pid");
+    let sqlite_path = state_path.with_extension("sqlite");
+    let binary_path = PathBuf::from(env!("CARGO_BIN_EXE_termd"));
+    let session_id = SessionId::new();
+    let session_id_text = session_id.0.to_string();
+    let supervisor_pid = spawn_supervisor_from_short_lived_parent(
+        &binary_path,
+        &session_id_text,
+        &socket_path,
+        &CommandSpec::new("sh").args(["-c", "cat"]),
+        PtySize::new(24, 80),
+        &pid_file,
+    );
+    let operation_id = u64::MAX - 73;
+    let now_ms = current_unix_timestamp_millis();
+    StateStore::save(
+        &state_path,
+        &DaemonState {
+            version: termd::state::STATE_SCHEMA_VERSION,
+            daemon_identity: None,
+            trusted_devices: Vec::new(),
+            sessions: vec![SessionStateRecord {
+                session_id,
+                state: SessionState::Running,
+                size: termd_proto::TerminalSize::new(24, 80),
+                created_at_ms: now_ms,
+                updated_at_ms: now_ms,
+                restore_info: Some(PtyRestoreInfo::UnixSocket {
+                    socket_path: socket_path.clone(),
+                    supervisor_pid,
+                    supervisor_status: PtySupervisorStatus::Closing,
+                }),
+            }],
+        },
+    )
+    .unwrap();
+    let restore_info = StateStore::load(&state_path).unwrap().sessions[0]
+        .restore_info
+        .clone()
+        .unwrap();
+    persist_test_ownership(
+        &state_path,
+        session_id,
+        &restore_info,
+        "cleaning",
+        Some(operation_id),
+    );
+
+    let mut first = connect_raw_supervisor(&socket_path);
+    write_raw_supervisor_request(
+        &mut first,
+        serde_json::json!({
+            "request_id": 1,
+            "request": {
+                "type": "attach_sync",
+                "session_id": session_id_text,
+                "last_terminal_seq": null,
+                "resume_controller_id": null
+            }
+        }),
+    );
+    let _ = read_raw_supervisor_response(&mut first);
+    write_raw_supervisor_request(
+        &mut first,
+        serde_json::json!({
+            "request_id": 2,
+            "request": { "type": "close_idempotent", "operation_id": operation_id }
+        }),
+    );
+    let close = read_raw_supervisor_response(&mut first);
+    assert_eq!(close["response"]["status"], "ok");
+    assert_eq!(close["response"]["payload"]["confirmed_dead"], true);
+    drop(first);
+
+    let exited_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut status = connect_raw_supervisor(&socket_path);
+        write_raw_supervisor_request(
+            &mut status,
+            serde_json::json!({
+                "request_id": 3,
+                "request": { "type": "natural_exit_status" }
+            }),
+        );
+        let status = read_raw_supervisor_response(&mut status);
+        if status["response"]["payload"]["confirmed_dead"] == true {
+            break;
+        }
+        assert!(
+            Instant::now() < exited_deadline,
+            "supervisor exit watcher did not publish exited state"
+        );
+        std::thread::yield_now();
+    }
+
+    let mut rejected_attach = connect_raw_supervisor(&socket_path);
+    write_raw_supervisor_request(
+        &mut rejected_attach,
+        serde_json::json!({
+            "request_id": 4,
+            "request": {
+                "type": "attach_sync",
+                "session_id": session_id_text,
+                "last_terminal_seq": null,
+                "resume_controller_id": null
+            }
+        }),
+    );
+    assert_eq!(
+        read_raw_supervisor_response(&mut rejected_attach)["response"]["status"],
+        "err"
+    );
+    drop(rejected_attach);
+
+    let backend = SupervisorPtyBackend::with_binary_and_state_path(&binary_path, &state_path);
+    let state = StateStore::load(&state_path).unwrap();
+    let protocol = DaemonProtocol::from_state(
+        DaemonConfig::default_for_state_path(&state_path),
+        backend,
+        Ed25519SignatureVerifier,
+        state,
+    )
+    .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let state_db = rusqlite::Connection::open(&sqlite_path).unwrap();
+        let remaining: i64 = state_db
+            .query_row("SELECT COUNT(*) FROM runtime_sessions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        if remaining == 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "restart did not finalize the durable close operation"
+        );
+        std::thread::yield_now();
+    }
+
+    drop(protocol);
+    wait_until_linux_process_is_reaped(supervisor_pid);
+    let _ = fs::remove_file(pid_file);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn lost_finalize_response_converges_from_durable_closing_record() {
+    let state_path = temp_state_path("lost-finalize-response.json");
+    let socket_path = state_path.with_extension("sock");
+    let pid_file = state_path.with_extension("pid");
+    let binary_path = PathBuf::from(env!("CARGO_BIN_EXE_termd"));
+    let session_id = SessionId::new();
+    let session_id_text = session_id.0.to_string();
+    let supervisor_pid = spawn_supervisor_from_short_lived_parent(
+        &binary_path,
+        &session_id_text,
+        &socket_path,
+        &CommandSpec::new("sh").args(["-c", "cat"]),
+        PtySize::new(24, 80),
+        &pid_file,
+    );
+    let operation_id = u64::MAX - 79;
+    let now_ms = current_unix_timestamp_millis();
+    StateStore::save(
+        &state_path,
+        &DaemonState {
+            version: termd::state::STATE_SCHEMA_VERSION,
+            daemon_identity: None,
+            trusted_devices: Vec::new(),
+            sessions: vec![SessionStateRecord {
+                session_id,
+                state: SessionState::Running,
+                size: termd_proto::TerminalSize::new(24, 80),
+                created_at_ms: now_ms,
+                updated_at_ms: now_ms,
+                restore_info: Some(PtyRestoreInfo::UnixSocket {
+                    socket_path: socket_path.clone(),
+                    supervisor_pid,
+                    supervisor_status: PtySupervisorStatus::Closing,
+                }),
+            }],
+        },
+    )
+    .unwrap();
+    let restore_info = StateStore::load(&state_path).unwrap().sessions[0]
+        .restore_info
+        .clone()
+        .unwrap();
+    persist_test_ownership(
+        &state_path,
+        session_id,
+        &restore_info,
+        "cleaning",
+        Some(operation_id),
+    );
+
+    let mut controller = connect_raw_supervisor(&socket_path);
+    write_raw_supervisor_request(
+        &mut controller,
+        serde_json::json!({
+            "request_id": 1,
+            "request": {
+                "type": "attach_sync",
+                "session_id": session_id_text,
+                "last_terminal_seq": null,
+                "resume_controller_id": null
+            }
+        }),
+    );
+    let _ = read_raw_supervisor_response(&mut controller);
+    write_raw_supervisor_request(
+        &mut controller,
+        serde_json::json!({
+            "request_id": 2,
+            "request": { "type": "close_idempotent", "operation_id": operation_id }
+        }),
+    );
+    assert_eq!(
+        read_raw_supervisor_response(&mut controller)["response"]["payload"]["confirmed_dead"],
+        true
+    );
+    drop(controller);
+
+    let mut finalize = connect_raw_supervisor(&socket_path);
+    authenticate_raw_cleanup(&mut finalize, &session_id_text, 3);
+    write_raw_supervisor_request(
+        &mut finalize,
+        serde_json::json!({
+            "request_id": 5,
+            "request": { "type": "finalize_close", "operation_id": operation_id }
+        }),
+    );
+    drop(finalize);
+    wait_until_linux_process_is_reaped(supervisor_pid);
+
+    let backend = SupervisorPtyBackend::with_binary_and_state_path(&binary_path, &state_path);
+    let retry_backend = FailFirstReconnectBackend::new(backend);
+    let state = StateStore::load(&state_path).unwrap();
+    let protocol = DaemonProtocol::from_state(
+        DaemonConfig::default_for_state_path(&state_path),
+        retry_backend.clone(),
+        Ed25519SignatureVerifier,
+        state,
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !StateStore::load(&state_path).unwrap().sessions.is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "lost FinalizeClose response did not converge from durable state"
+        );
+        std::thread::yield_now();
+    }
+    assert_eq!(retry_backend.reconnect_attempts(), 0);
+    drop(protocol);
+    let _ = fs::remove_file(pid_file);
+}
+
+#[test]
+fn naturally_exited_supervisor_is_closed_and_not_reconnectable() {
+    let state_dir = TestStateDirectory::new("natural-exit");
+    let state_path = state_dir.join("daemon-state.json");
+    let binary_path = PathBuf::from(env!("CARGO_BIN_EXE_termd"));
+    let session_id = "00000000-0000-0000-0000-000000000445";
+    let backend = SupervisorPtyBackend::with_binary_and_state_path(&binary_path, &state_path);
+    let mut runtime = SessionRuntime::new(backend.clone());
+    runtime
+        .create_session_with_id(
+            session_id,
+            CommandSpec::new("sh").args(["-c", "exit 7"]),
+            TerminalSize::cells(24, 80),
+        )
+        .unwrap();
+    #[cfg(target_os = "linux")]
+    let _supervisor_guard = {
+        let restore_info = runtime.restore_info(session_id).unwrap().unwrap();
+        let PtyRestoreInfo::UnixSocket {
+            socket_path,
+            supervisor_pid,
+            ..
+        } = restore_info
+        else {
+            panic!("natural exit test requires Unix supervisor restore info");
+        };
+        TestSupervisorGuard::new(supervisor_pid, socket_path)
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        runtime.snapshot(session_id).unwrap();
+        let frames = runtime.terminal_snapshot(session_id, Some(0)).unwrap();
+        if frames
+            .iter()
+            .any(|frame| matches!(frame, PtyTerminalFrame::Exit { code: Some(7), .. }))
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for natural exit"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    assert_eq!(
+        runtime.attach(session_id, "dev-after-exit").unwrap_err(),
+        termd::runtime::RuntimeError::SessionClosed
+    );
+    assert_eq!(
+        runtime
+            .write_input(session_id, "dev-after-exit", b"rejected")
+            .unwrap_err(),
+        termd::runtime::RuntimeError::SessionClosed
+    );
+    let persisted = runtime.persisted_sessions();
+    assert_eq!(persisted.len(), 1);
+    assert_eq!(persisted[0].state, SessionState::Closed);
+
+    let mut restarted = SessionRuntime::new(backend);
+    assert_eq!(
+        restarted.reconnect_session(&persisted[0]).unwrap_err(),
+        termd::runtime::RuntimeError::SessionClosed
+    );
+}
+
+#[test]
 fn reconnects_to_supervisor_after_launcher_parent_process_exits() {
     let state_path = temp_state_path("parent-exit.json");
     let socket_path = state_path.with_extension("sock");
@@ -1009,6 +3164,26 @@ fn reconnects_to_supervisor_after_launcher_parent_process_exits() {
         supervisor_pid,
         supervisor_status: PtySupervisorStatus::Running,
     };
+    let restored_session_id = SessionId(uuid::Uuid::parse_str(session_id).unwrap());
+    let now_ms = current_unix_timestamp_millis();
+    StateStore::save(
+        &state_path,
+        &DaemonState {
+            version: termd::state::STATE_SCHEMA_VERSION,
+            daemon_identity: None,
+            trusted_devices: Vec::new(),
+            sessions: vec![SessionStateRecord {
+                session_id: restored_session_id,
+                state: SessionState::Running,
+                size: termd_proto::TerminalSize::new(24, 80),
+                created_at_ms: now_ms,
+                updated_at_ms: now_ms,
+                restore_info: Some(restore_info.clone()),
+            }],
+        },
+    )
+    .unwrap();
+    StateStore::load(&state_path).unwrap();
     let mut session = backend
         .reconnect(session_id, &restore_info, PtySize::new(24, 80))
         .unwrap();

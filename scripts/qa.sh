@@ -446,9 +446,8 @@ section "termui-web" "npm run test:e2e"
 (cd termui/frontend && npm run test:e2e -- --workers=1)
 
 section "termui-web" "npm audit --audit-level=high"
-# `npm audit` 默认会请求 npm registry；release QA 不能把外网连通性当成发布前置条件。
-# 使用离线模式后，audit 仍会基于本地 lockfile/缓存数据检查已知漏洞，但不会因为网络抖动直接失败。
-(cd termui/frontend && npm audit --offline --audit-level=high)
+# npm audit 需要 registry advisory 数据；空缓存下的 --offline 会无条件漏报。
+(cd termui/frontend && npm audit --audit-level=high)
 
 if command -v flutter >/dev/null 2>&1 && command -v dart >/dev/null 2>&1; then
   section "termui-native" "Flutter/Dart 已存在，运行真实 Native analyze/test"

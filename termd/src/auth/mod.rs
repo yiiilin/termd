@@ -72,6 +72,8 @@ pub enum PairingError {
     },
     /// token 已经成功用于 pairing，不能重复消费。
     AlreadyUsedToken,
+    /// token 正在由另一个 pairing 请求等待外部 admission 确认。
+    ReservedToken,
     /// token 已被 daemon 主动撤销。
     RevokedToken,
     /// pairing 阶段收到的设备公钥不符合 Ed25519 wire 编码约定。
@@ -113,6 +115,7 @@ impl fmt::Display for PairingError {
             Self::InvalidToken => write!(f, "pairing token is invalid"),
             Self::ExpiredToken { .. } => write!(f, "pairing token is expired"),
             Self::AlreadyUsedToken => write!(f, "pairing token was already used"),
+            Self::ReservedToken => write!(f, "pairing token is already reserved"),
             Self::RevokedToken => write!(f, "pairing token was revoked"),
             Self::InvalidDevicePublicKey => write!(f, "device public key wire format is invalid"),
             Self::InvalidTtl { .. } => write!(f, "pairing token ttl is invalid"),
@@ -367,6 +370,7 @@ impl From<SignatureError> for ChallengeAuthError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PairingTokenState {
     Active,
+    Reserved,
     Consumed,
     Revoked,
 }
@@ -382,6 +386,7 @@ pub struct PairingTokenRecord {
     expires_at_ms: UnixTimestampMillis,
     state: PairingTokenState,
     consumed_at_ms: Option<UnixTimestampMillis>,
+    reservation_id: Option<String>,
 }
 
 impl PairingTokenRecord {
@@ -396,6 +401,7 @@ impl PairingTokenRecord {
             expires_at_ms,
             state: PairingTokenState::Active,
             consumed_at_ms: None,
+            reservation_id: None,
         }
     }
 
@@ -438,6 +444,10 @@ impl fmt::Debug for PairingTokenRecord {
             .field("expires_at_ms", &self.expires_at_ms)
             .field("state", &self.state)
             .field("consumed_at_ms", &self.consumed_at_ms)
+            .field(
+                "reservation_id",
+                &self.reservation_id.as_ref().map(|_| "<redacted>"),
+            )
             .finish()
     }
 }
@@ -845,6 +855,7 @@ impl PairingTokenManager {
 
         match record.state {
             PairingTokenState::Active => {}
+            PairingTokenState::Reserved => return Err(PairingError::ReservedToken),
             PairingTokenState::Consumed => return Err(PairingError::AlreadyUsedToken),
             PairingTokenState::Revoked => return Err(PairingError::RevokedToken),
         }
@@ -872,11 +883,15 @@ impl PairingTokenManager {
             return false;
         };
 
-        if record.state != PairingTokenState::Active {
+        if matches!(
+            record.state,
+            PairingTokenState::Consumed | PairingTokenState::Revoked
+        ) {
             return false;
         }
 
         record.state = PairingTokenState::Revoked;
+        record.reservation_id = None;
         true
     }
 
@@ -934,6 +949,8 @@ pub struct PairingService {
 pub struct PendingPairing {
     accepted: PairAcceptPayload,
     device_identity: DeviceIdentity,
+    token_key: String,
+    reservation_id: String,
 }
 
 impl PendingPairing {
@@ -984,6 +1001,17 @@ impl PairingService {
         now_ms: UnixTimestampMillis,
         daemon_identity: &DaemonIdentity,
     ) -> PairingResult<PendingPairing> {
+        let pending = self.reserve_pair_request(request, now_ms, daemon_identity)?;
+        self.commit_pairing_reservation(&pending, now_ms)?;
+        Ok(pending)
+    }
+
+    pub fn reserve_pair_request(
+        &mut self,
+        request: PairRequestPayload,
+        now_ms: UnixTimestampMillis,
+        daemon_identity: &DaemonIdentity,
+    ) -> PairingResult<PendingPairing> {
         let PairRequestPayload {
             device_id,
             device_public_key,
@@ -995,7 +1023,31 @@ impl PairingService {
         // 中文注释：pairing 阶段就收紧设备公钥 wire 形状，避免 direct 模式先返回成功，
         // 后续 auth 再因为坏 key 失败，或把坏 key 写进本地 trust store。
         validate_device_public_key_wire(&device_public_key)?;
-        let token_record = self.token_manager.consume(&token, now_ms)?;
+        let token_key = pairing_token_key(&token).to_owned();
+        self.token_manager
+            .prune_expired_except(now_ms, Some(token_key.as_str()));
+        let token_record = self
+            .token_manager
+            .tokens
+            .get_mut(&token_key)
+            .ok_or(PairingError::InvalidToken)?;
+        match token_record.state {
+            PairingTokenState::Active => {}
+            PairingTokenState::Reserved => return Err(PairingError::ReservedToken),
+            PairingTokenState::Consumed => return Err(PairingError::AlreadyUsedToken),
+            PairingTokenState::Revoked => return Err(PairingError::RevokedToken),
+        }
+        if token_record.is_expired(now_ms) {
+            let error = PairingError::ExpiredToken {
+                expires_at_ms: token_record.expires_at_ms,
+                now_ms,
+            };
+            self.token_manager.tokens.remove(&token_key);
+            return Err(error);
+        }
+        let reservation_id = generate_pairing_token().0;
+        token_record.state = PairingTokenState::Reserved;
+        token_record.reservation_id = Some(reservation_id.clone());
         let device_identity = DeviceIdentity::new(device_id, device_public_key);
         let public_identity = daemon_identity.public_identity();
 
@@ -1004,10 +1056,58 @@ impl PairingService {
                 server_id: public_identity.server_id,
                 daemon_public_key: public_identity.public_key,
                 device_id,
-                expires_at_ms: token_record.expires_at_ms(),
+                expires_at_ms: token_record.expires_at_ms,
             },
             device_identity,
+            token_key,
+            reservation_id,
         })
+    }
+
+    pub fn release_pairing_reservation(&mut self, pending: &PendingPairing) -> bool {
+        let Some(record) = self.token_manager.tokens.get_mut(&pending.token_key) else {
+            return false;
+        };
+        if record.state != PairingTokenState::Reserved
+            || record.reservation_id.as_deref() != Some(pending.reservation_id.as_str())
+        {
+            return false;
+        }
+        record.state = PairingTokenState::Active;
+        record.reservation_id = None;
+        true
+    }
+
+    pub fn commit_pairing_reservation(
+        &mut self,
+        pending: &PendingPairing,
+        now_ms: UnixTimestampMillis,
+    ) -> PairingResult<PairingTokenRecord> {
+        let record = self
+            .token_manager
+            .tokens
+            .get_mut(&pending.token_key)
+            .ok_or(PairingError::InvalidToken)?;
+        match record.state {
+            PairingTokenState::Reserved
+                if record.reservation_id.as_deref() == Some(pending.reservation_id.as_str()) => {}
+            PairingTokenState::Reserved => return Err(PairingError::ReservedToken),
+            PairingTokenState::Active => return Err(PairingError::InvalidToken),
+            PairingTokenState::Consumed => return Err(PairingError::AlreadyUsedToken),
+            PairingTokenState::Revoked => return Err(PairingError::RevokedToken),
+        }
+        if record.is_expired(now_ms) {
+            record.state = PairingTokenState::Active;
+            record.reservation_id = None;
+            return Err(PairingError::ExpiredToken {
+                expires_at_ms: record.expires_at_ms,
+                now_ms,
+            });
+        }
+        record.state = PairingTokenState::Consumed;
+        record.reservation_id = None;
+        record.consumed_at_ms = Some(now_ms);
+        Ok(record.clone())
     }
 
     /// 将已完成外部确认的 pairing 写入本地 trust store。
@@ -3693,6 +3793,78 @@ mod tests {
 
         assert!(trusted_store.is_trusted_identity(&identity));
         assert_eq!(pending.accepted().device_id, device_id);
+    }
+
+    #[test]
+    fn pairing_reservation_can_be_released_and_retried_before_expiry() {
+        let daemon_identity = DaemonIdentity::generate();
+        let device_id = DeviceId::new();
+        let device_public_key = ed25519_public_key_wire(18);
+        let mut service = PairingService::new(PairingTokenManager::new());
+        let issued = service.issue_token(timestamp(1000), 500).unwrap();
+        let request = termd_proto::PairRequestPayload {
+            device_id,
+            device_public_key,
+            token: issued.token().clone(),
+            nonce: termd_proto::Nonce("pair-reservation".to_owned()),
+            timestamp_ms: timestamp(1100),
+        };
+
+        let first = service
+            .reserve_pair_request(request.clone(), timestamp(1100), &daemon_identity)
+            .unwrap();
+        assert_eq!(
+            service
+                .reserve_pair_request(request.clone(), timestamp(1101), &daemon_identity)
+                .unwrap_err(),
+            PairingError::ReservedToken
+        );
+        assert!(service.release_pairing_reservation(&first));
+        let second = service
+            .reserve_pair_request(request, timestamp(1102), &daemon_identity)
+            .unwrap();
+        service
+            .commit_pairing_reservation(&second, timestamp(1103))
+            .unwrap();
+        assert_eq!(
+            service
+                .token_manager()
+                .record(issued.token())
+                .unwrap()
+                .state(),
+            PairingTokenState::Consumed
+        );
+    }
+
+    #[test]
+    fn pairing_reservation_cannot_commit_after_expiry() {
+        let daemon_identity = DaemonIdentity::generate();
+        let device_id = DeviceId::new();
+        let mut service = PairingService::new(PairingTokenManager::new());
+        let issued = service.issue_token(timestamp(1000), 100).unwrap();
+        let pending = service
+            .reserve_pair_request(
+                termd_proto::PairRequestPayload {
+                    device_id,
+                    device_public_key: ed25519_public_key_wire(19),
+                    token: issued.token().clone(),
+                    nonce: termd_proto::Nonce("pair-expiry".to_owned()),
+                    timestamp_ms: timestamp(1050),
+                },
+                timestamp(1050),
+                &daemon_identity,
+            )
+            .unwrap();
+
+        assert_eq!(
+            service
+                .commit_pairing_reservation(&pending, timestamp(1100))
+                .unwrap_err(),
+            PairingError::ExpiredToken {
+                expires_at_ms: timestamp(1100),
+                now_ms: timestamp(1100),
+            }
+        );
     }
 
     #[test]

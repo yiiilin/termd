@@ -1,6 +1,6 @@
 # termui Native
 
-`termui/native` 是 termd 的 Flutter Native 客户端骨架。当前 item 只固定 Native UI、service、secure storage 和 device key 管理边界，不实现真实 WebSocket、E2EE、auth 或 terminal renderer。
+`termui/native` 是 termd 的 Flutter Native 客户端骨架。当前 item 只固定 Native UI、service、secure storage 和 device key 管理边界，不实现真实 WebSocket、auth 或 terminal renderer。0.6 WebSocket 契约是经 trusted relay 传输明文应用协议，不执行 `e2ee_key_exchange` / `encrypted_frame`；HTTP E2EE 兼容路径仍保留。
 
 ## 当前边界
 
@@ -21,4 +21,4 @@ flutter analyze
 flutter test
 ```
 
-后续实现真实 Native client 前，应先用 Dart/Rust 兼容测试锁定 auth canonical input、wire prefix、E2EE sequence/AAD 和 base64 行为。
+后续实现真实 Native client 前，应先用 Dart/Rust 兼容测试锁定 auth canonical input、wire prefix 和 base64 行为；若接入现有 HTTP E2EE 兼容路径，再额外锁定其 sequence/AAD 行为。

@@ -227,7 +227,7 @@ pub struct ProtocolVersion(pub u16);
 
 impl Default for ProtocolVersion {
     fn default() -> Self {
-        Self(2)
+        Self(PROTOCOL_PACKET_VERSION)
     }
 }
 
@@ -1603,7 +1603,8 @@ pub struct DaemonClientForgotPayload {
 
 /// 查询 daemon 所在服务器的轻量运行状态。
 ///
-/// 该请求必须作为 E2EE 内层业务消息发送；relay 只能看到外层 encrypted_frame。
+/// 当前 WebSocket 路径把该请求作为明文 packet 发送，trusted relay 可以看到应用流量；
+/// 旧客户端兼容路径仍可把它放入 `encrypted_frame`。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonStatusPayload {}
 
@@ -2584,6 +2585,11 @@ mod tests {
     use super::*;
 
     #[test]
+    fn protocol_version_default_tracks_current_packet_version() {
+        assert_eq!(ProtocolVersion::default().0, PROTOCOL_PACKET_VERSION);
+    }
+
+    #[test]
     fn all_message_types_use_snake_case_wire_names() {
         let cases = [
             (MessageType::RouteHello, "route_hello"),
@@ -2824,7 +2830,7 @@ mod tests {
             timestamp_ms: UnixTimestampMillis(1_710_000_000_000),
             server_id: Some(server_id),
             daemon_public_key: Some(PublicKey("daemon-pub".to_owned())),
-            binary_version: Some(ProtocolVersion::default()),
+            binary_version: Some(ProtocolVersion(BINARY_PROTOCOL_VERSION)),
             device_id: Some(device_id),
         };
         let auth = AuthPayload {
@@ -2869,6 +2875,14 @@ mod tests {
             UnixTimestampMillis(1_710_000_060_000),
         );
 
+        assert_eq!(
+            hello.protocol_version,
+            ProtocolVersion(PROTOCOL_PACKET_VERSION)
+        );
+        assert_eq!(
+            hello.binary_version,
+            Some(ProtocolVersion(BINARY_PROTOCOL_VERSION))
+        );
         assert_roundtrip(hello);
         assert_roundtrip(auth);
         assert_roundtrip(auth_challenge);

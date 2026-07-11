@@ -1,5 +1,7 @@
 # Binary Protobuf Data Plane Implementation Plan
 
+> 历史状态提示：本文记录当时的计划/实现状态，不代表当前 0.6 协议契约；现行边界以 `TECH.md` 和 `docs/deployment.md` 为准。
+
 > **For agentic workers:** REQUIRED: Use superpowers:subagent-driven-development (if subagents available) or superpowers:executing-plans to implement this plan. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Implement a binary E2EE data plane for termd so encrypted WebSocket business traffic and relay mux traffic no longer wrap terminal bytes in base64 JSON.

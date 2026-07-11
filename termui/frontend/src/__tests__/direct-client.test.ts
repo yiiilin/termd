@@ -19,7 +19,7 @@ import type {
   SessionFileHttpUploadReadyPayload,
   SessionFileUploadProgressPayload,
 } from "../protocol/types";
-import { concatBytes, encodeUtf8 } from "../protocol/wire";
+import { concatBytes, encodeUtf8, envelope } from "../protocol/wire";
 import { MockDaemon } from "../test/mock-daemon";
 
 interface TestDiagnosticEvent {
@@ -126,6 +126,116 @@ describe("DirectClient", () => {
         return envelope as { type: string; payload: unknown };
       }
     }
+  }
+
+  function inboundQueueLimit(name: "SOCKET_INBOX_MAX_MESSAGES" | "SOCKET_INBOX_MAX_BYTES" | "PENDING_INNER_MAX_MESSAGES" | "PENDING_INNER_MAX_BYTES"): number {
+    const internals = __directClientTestInternals as unknown as Record<string, number | undefined>;
+    // 中文注释：RED 阶段旧实现没有导出预算，fallback 让测试先证明队列无上限。
+    return internals[name] ?? (name.endsWith("_BYTES") ? 1024 * 1024 : 64);
+  }
+
+  function createMockWebSocket(): WebSocket & { close: ReturnType<typeof vi.fn> } {
+    const socket = new EventTarget() as WebSocket & { close: ReturnType<typeof vi.fn> };
+    let readyState: number = WebSocket.OPEN;
+    Object.defineProperty(socket, "readyState", {
+      get: () => readyState,
+      configurable: true,
+    });
+    Object.defineProperty(socket, "binaryType", {
+      value: "arraybuffer",
+      writable: true,
+      configurable: true,
+    });
+    Object.defineProperty(socket, "send", {
+      value: vi.fn(),
+      configurable: true,
+    });
+    Object.defineProperty(socket, "close", {
+      value: vi.fn(() => {
+        if (readyState === WebSocket.CLOSED) {
+          return;
+        }
+        readyState = WebSocket.CLOSED;
+        socket.dispatchEvent(new Event("close"));
+      }),
+      configurable: true,
+    });
+    return socket;
+  }
+
+  function emitSocketMessage(socket: WebSocket, data: unknown): void {
+    socket.dispatchEvent(new MessageEvent("message", { data }));
+  }
+
+  function socketInboxQueueLength(inbox: unknown): number {
+    return ((inbox as { queue?: unknown[] }).queue ?? []).length;
+  }
+
+  function directClientQueueState(client: DirectClient): {
+    enqueueInner(inner: unknown): void;
+    discardQueuedTerminalOutputByStream(streamId: string): void;
+    expectQueuedPayload<T>(expectedType: string, timeoutMs?: number): Promise<T>;
+    inbox: { rejectPending: ReturnType<typeof vi.fn> };
+    innerWaiters: unknown[];
+    pendingInner: unknown[];
+    pendingInnerBytes: number;
+    pendingInnerReservedMessages: number;
+    receiveInner: () => Promise<unknown>;
+    socket: { close: ReturnType<typeof vi.fn> };
+  } {
+    return client as unknown as {
+      enqueueInner(inner: unknown): void;
+      discardQueuedTerminalOutputByStream(streamId: string): void;
+      expectQueuedPayload<T>(expectedType: string, timeoutMs?: number): Promise<T>;
+      inbox: { rejectPending: ReturnType<typeof vi.fn> };
+      innerWaiters: unknown[];
+      pendingInner: unknown[];
+      pendingInnerBytes: number;
+      pendingInnerReservedMessages: number;
+      receiveInner: () => Promise<unknown>;
+      socket: { close: ReturnType<typeof vi.fn> };
+    };
+  }
+
+  function makeDirectClientQueueHarness(): DirectClient {
+    const socket = createMockWebSocket();
+    const inbox = {
+      read: vi.fn(),
+      rejectPending: vi.fn(),
+    };
+    const client = Object.create(DirectClient.prototype) as DirectClient & Record<string, unknown>;
+    Object.assign(client, {
+      socket,
+      inbox,
+      socketUrl: "ws://mock.local/ws",
+      serverIdValue: "00000000-0000-0000-0000-000000000301",
+      deviceId: "00000000-0000-0000-0000-000000000302",
+      binaryMode: true,
+      timeoutMs: 3000,
+      authTimeoutMs: 3000,
+      closed: false,
+      closedError: undefined,
+      phase: "ready",
+      receivePumpStarted: false,
+      pendingRequests: new Map(),
+      pendingInner: [],
+      pendingInnerSizes: [],
+      pendingInnerBytes: 0,
+      pendingInnerReservedMessages: 0,
+      innerWaiters: [],
+      terminalStreamsBySession: new Map(),
+      terminalStreamsById: new Map(),
+      pendingTerminalStreamIds: new Set(),
+      pendingTerminalStreamLastOutputSeq: new Map(),
+      fileStreamsById: new Map(),
+      sessionScopes: new Map(),
+      webSocketSessionPermissions: new Set(),
+      authenticatedDevice: undefined,
+      authenticatedServer: undefined,
+      sessionToken: undefined,
+      httpControlAvailable: true,
+    });
+    return client as DirectClient;
   }
 
   function httpPlainAuthFromHeaders(headers: Headers): void {
@@ -271,7 +381,7 @@ describe("DirectClient", () => {
     expect(firstOuter.payload.admission?.signature).toMatch(/^ed25519-v1:/);
   });
 
-  it("连接阶段会校验 daemon E2EE key_exchange 的签名和 packet_version", async () => {
+  it("连接阶段会校验 daemon hello 身份和 packet_version", async () => {
     const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000312");
     const wrongIdentity = await generateDeviceIdentity("00000000-0000-0000-0000-000000000313");
 
@@ -352,7 +462,7 @@ describe("DirectClient", () => {
     expect(daemon.activeConnectionCount()).toBe(0);
   });
 
-  it("完成 E2EE 内层 pairing，并且 outer wire 不包含 token", async () => {
+  it("完成当前 WebSocket pairing，binary packet wire 不直接包含 token 字符串", async () => {
     const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000302");
     const client = await connectDevice(device.device_id);
 
@@ -617,7 +727,7 @@ describe("DirectClient", () => {
     expect(secondAccepted.device_id).toBe(device.device_id);
   });
 
-  it("已配对设备可 auth、list、attach、shared-control noop，并隐藏终端输入明文", async () => {
+  it("已配对设备可 auth、list、attach、shared-control noop，并使用 binary packet wire", async () => {
     const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000303");
     const pairClient = await connectDevice(device.device_id);
     const accepted = await pairClient.pair("secret-token", device.device_public_key);
@@ -723,7 +833,7 @@ describe("DirectClient", () => {
       paired_at_ms: 1710000000000,
     });
 
-    // 中文注释：relay route/E2EE/auth 可以比普通 RPC 慢；但连接成功后，
+    // 中文注释：relay route/hello/auth 可以比普通 RPC 慢；但连接成功后，
     // session.list 仍要按 UI 的短请求预算失败，不能被长握手预算拖住。
     daemon.queueSessionListResponse(
       [
@@ -1396,6 +1506,525 @@ describe("DirectClient", () => {
     // close 必须被记住，并且不能抢掉已经进入队列的消息。
     await expect(inbox.read()).resolves.toMatchObject({ envelope: { type: "hello" } });
     await expect(inbox.read()).rejects.toMatchObject({ code: "connection_closed" });
+  });
+
+  it("SocketInbox 边界内积压消息会按序消费", async () => {
+    const socket = createMockWebSocket();
+    const inbox = new __directClientTestInternals.SocketInbox(socket);
+    const maxMessages = inboundQueueLimit("SOCKET_INBOX_MAX_MESSAGES");
+    const messages = Math.min(8, maxMessages);
+
+    for (let index = 0; index < messages; index += 1) {
+      emitSocketMessage(socket, JSON.stringify(envelope("hello", { protocol_version: PROTOCOL_PACKET_VERSION, order: index })));
+    }
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    for (let index = 0; index < messages; index += 1) {
+      await expect(inbox.read()).resolves.toMatchObject({
+        envelope: {
+          type: "hello",
+          payload: { order: index },
+        },
+      });
+    }
+    expect(socket.close).not.toHaveBeenCalled();
+  });
+
+  it("SocketInbox 超过消息数上限会关闭 transport 且队列不再增长", async () => {
+    const socket = createMockWebSocket();
+    const inbox = new __directClientTestInternals.SocketInbox(socket);
+    const maxMessages = inboundQueueLimit("SOCKET_INBOX_MAX_MESSAGES");
+
+    for (let index = 0; index < maxMessages + 4; index += 1) {
+      emitSocketMessage(socket, JSON.stringify(envelope("hello", { protocol_version: PROTOCOL_PACKET_VERSION, order: index })));
+    }
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const lengthAfterClose = socketInboxQueueLength(inbox);
+    emitSocketMessage(socket, JSON.stringify(envelope("hello", { protocol_version: PROTOCOL_PACKET_VERSION, order: "late" })));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(socket.close).toHaveBeenCalled();
+    expect(lengthAfterClose).toBeLessThanOrEqual(maxMessages);
+    expect(socketInboxQueueLength(inbox)).toBe(lengthAfterClose);
+  });
+
+  it("SocketInbox 超限后会先排空既有消息再读出 connection_error", async () => {
+    const socket = createMockWebSocket();
+    const inbox = new __directClientTestInternals.SocketInbox(socket);
+    const maxMessages = inboundQueueLimit("SOCKET_INBOX_MAX_MESSAGES");
+
+    for (let index = 0; index < maxMessages + 1; index += 1) {
+      emitSocketMessage(socket, JSON.stringify(envelope("hello", { protocol_version: PROTOCOL_PACKET_VERSION, order: index })));
+    }
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(socket.close).toHaveBeenCalled();
+    for (let index = 0; index < maxMessages; index += 1) {
+      await expect(inbox.read()).resolves.toMatchObject({
+        envelope: {
+          type: "hello",
+          payload: { order: index },
+        },
+      });
+    }
+    await expect(inbox.read()).rejects.toMatchObject({ code: "connection_error" });
+  });
+
+  it("SocketInbox 超过字节上限会关闭 transport 且队列不再增长", async () => {
+    const socket = createMockWebSocket();
+    const inbox = new __directClientTestInternals.SocketInbox(socket);
+    const maxBytes = inboundQueueLimit("SOCKET_INBOX_MAX_BYTES");
+    const chunk = new Uint8Array(Math.floor(maxBytes / 2) + 1);
+
+    emitSocketMessage(socket, chunk);
+    emitSocketMessage(socket, chunk);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const lengthAfterClose = socketInboxQueueLength(inbox);
+    emitSocketMessage(socket, new Uint8Array(1));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(socket.close).toHaveBeenCalled();
+    expect(lengthAfterClose).toBeLessThanOrEqual(1);
+    expect(socketInboxQueueLength(inbox)).toBe(lengthAfterClose);
+  });
+
+  it("SocketInbox shift 会释放字节预算供后续消息使用", async () => {
+    const socket = createMockWebSocket();
+    const inbox = new __directClientTestInternals.SocketInbox(socket);
+    const maxBytes = inboundQueueLimit("SOCKET_INBOX_MAX_BYTES");
+    const chunk = new Uint8Array(Math.floor(maxBytes / 2) + 1);
+
+    emitSocketMessage(socket, chunk);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const first = await inbox.read();
+    expect(first.binary?.byteLength).toBe(chunk.byteLength);
+    emitSocketMessage(socket, chunk);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(socket.close).not.toHaveBeenCalled();
+    const second = await inbox.read();
+    expect(second.binary?.byteLength).toBe(chunk.byteLength);
+  });
+
+  it("SocketInbox close 后不会让异步 Blob 转换结果迟到入队", async () => {
+    const socket = createMockWebSocket();
+    const inbox = new __directClientTestInternals.SocketInbox(socket);
+    const blob = new Blob([new Uint8Array([1, 2, 3])]);
+    let resolveArrayBuffer!: (value: ArrayBuffer) => void;
+    Object.defineProperty(blob, "arrayBuffer", {
+      value: vi.fn(() => new Promise<ArrayBuffer>((resolve) => {
+        resolveArrayBuffer = resolve;
+      })),
+      configurable: true,
+    });
+
+    emitSocketMessage(socket, blob);
+    socket.close();
+    resolveArrayBuffer(new Uint8Array([1, 2, 3]).buffer.slice(0) as ArrayBuffer);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(socketInboxQueueLength(inbox)).toBe(0);
+    await expect(inbox.read()).rejects.toMatchObject({ code: "connection_closed" });
+  });
+
+  it("DirectClient pendingInner 边界内积压消息会按序消费", async () => {
+    const client = makeDirectClientQueueHarness();
+    const maxMessages = inboundQueueLimit("PENDING_INNER_MAX_MESSAGES");
+    const messages = Math.min(8, maxMessages);
+
+    for (let index = 0; index < messages; index += 1) {
+      (client as unknown as { enqueueInner(inner: unknown): void }).enqueueInner(envelope("session_resized", {
+        session_id: `00000000-0000-0000-0000-${String(index).padStart(12, "0")}`,
+        resize_owner: true,
+      }));
+    }
+
+    for (let index = 0; index < messages; index += 1) {
+      await expect(client.receiveInner()).resolves.toMatchObject({
+        type: "session_resized",
+        payload: {
+          session_id: `00000000-0000-0000-0000-${String(index).padStart(12, "0")}`,
+        },
+      });
+    }
+    expect((client as unknown as { socket: { close: ReturnType<typeof vi.fn> } }).socket.close).not.toHaveBeenCalled();
+  });
+
+  it("DirectClient pendingInner 超过消息数上限会关闭 transport 且队列不再增长", async () => {
+    const client = makeDirectClientQueueHarness();
+    const socket = (client as unknown as { socket: { close: ReturnType<typeof vi.fn> } }).socket;
+    const maxMessages = inboundQueueLimit("PENDING_INNER_MAX_MESSAGES");
+
+    for (let index = 0; index < maxMessages + 4; index += 1) {
+      (client as unknown as { enqueueInner(inner: unknown): void }).enqueueInner(envelope("session_resized", {
+        session_id: `00000000-0000-0000-0000-${String(index).padStart(12, "0")}`,
+        resize_owner: true,
+      }));
+    }
+    const lengthAfterClose = (client as unknown as { pendingInner: unknown[] }).pendingInner.length;
+    (client as unknown as { enqueueInner(inner: unknown): void }).enqueueInner(envelope("session_resized", {
+      session_id: "00000000-0000-0000-0000-999999999999",
+      resize_owner: true,
+    }));
+
+    expect(socket.close).toHaveBeenCalled();
+    expect(lengthAfterClose).toBeLessThanOrEqual(maxMessages);
+    expect((client as unknown as { pendingInner: unknown[] }).pendingInner).toHaveLength(lengthAfterClose);
+    for (let index = 0; index < lengthAfterClose; index += 1) {
+      await expect(client.receiveInner()).resolves.toMatchObject({ type: "session_resized" });
+    }
+    await expect(client.receiveInner()).rejects.toMatchObject({ code: "connection_error" });
+  });
+
+  it("DirectClient pendingInner 超过字节上限会关闭 transport 且队列不再增长", async () => {
+    const client = makeDirectClientQueueHarness();
+    const socket = (client as unknown as { socket: { close: ReturnType<typeof vi.fn> } }).socket;
+    const maxBytes = inboundQueueLimit("PENDING_INNER_MAX_BYTES");
+    const payload = "x".repeat(Math.floor(maxBytes / 2) + 1);
+
+    (client as unknown as { enqueueInner(inner: unknown): void }).enqueueInner(envelope("session_resized", {
+      session_id: "00000000-0000-0000-0000-000000000001",
+      resize_owner: true,
+      payload,
+    }));
+    (client as unknown as { enqueueInner(inner: unknown): void }).enqueueInner(envelope("session_resized", {
+      session_id: "00000000-0000-0000-0000-000000000002",
+      resize_owner: true,
+      payload,
+    }));
+    const lengthAfterClose = (client as unknown as { pendingInner: unknown[] }).pendingInner.length;
+    (client as unknown as { enqueueInner(inner: unknown): void }).enqueueInner(envelope("session_resized", {
+      session_id: "00000000-0000-0000-0000-000000000003",
+      resize_owner: true,
+    }));
+
+    expect(socket.close).toHaveBeenCalled();
+    expect(lengthAfterClose).toBeLessThanOrEqual(1);
+    expect((client as unknown as { pendingInner: unknown[] }).pendingInner).toHaveLength(lengthAfterClose);
+    for (let index = 0; index < lengthAfterClose; index += 1) {
+      await expect(client.receiveInner()).resolves.toMatchObject({ type: "session_resized" });
+    }
+    await expect(client.receiveInner()).rejects.toMatchObject({ code: "connection_error" });
+  });
+
+  it("DirectClient receiveInner shift 会释放 pendingInner 字节预算", async () => {
+    const client = makeDirectClientQueueHarness();
+    const state = directClientQueueState(client);
+    const maxBytes = inboundQueueLimit("PENDING_INNER_MAX_BYTES");
+    const dataBytes = new Uint8Array(Math.floor(maxBytes / 2) + 1);
+
+    state.enqueueInner(envelope("session_resized", {
+      session_id: "00000000-0000-0000-0000-000000000011",
+      resize_owner: true,
+      data_bytes: dataBytes,
+    }));
+    await expect(client.receiveInner()).resolves.toMatchObject({ type: "session_resized" });
+    state.enqueueInner(envelope("session_resized", {
+      session_id: "00000000-0000-0000-0000-000000000012",
+      resize_owner: true,
+      data_bytes: dataBytes,
+    }));
+
+    expect(state.socket.close).not.toHaveBeenCalled();
+    await expect(client.receiveInner()).resolves.toMatchObject({
+      payload: { session_id: "00000000-0000-0000-0000-000000000012" },
+    });
+  });
+
+  it("DirectClient terminal discard 会重算 pendingInner 字节预算", async () => {
+    const client = makeDirectClientQueueHarness();
+    const state = directClientQueueState(client);
+    const maxBytes = inboundQueueLimit("PENDING_INNER_MAX_BYTES");
+    const streamId = "00000000-0000-0000-0000-000000000061";
+    const dataBytes = new Uint8Array(Math.floor(maxBytes / 2) + 1);
+
+    state.enqueueInner(envelope("attach_frame", {
+      session_id: "00000000-0000-0000-0000-000000000062",
+      stream_id: streamId,
+      data_bytes: dataBytes,
+    }));
+    expect(state.pendingInnerBytes).toBeGreaterThan(0);
+    state.discardQueuedTerminalOutputByStream(streamId);
+    expect(state.pendingInner).toHaveLength(0);
+    expect(state.pendingInnerBytes).toBe(0);
+
+    state.enqueueInner(envelope("session_resized", {
+      session_id: "00000000-0000-0000-0000-000000000063",
+      resize_owner: true,
+      data_bytes: dataBytes,
+    }));
+
+    expect(state.socket.close).not.toHaveBeenCalled();
+    await expect(client.receiveInner()).resolves.toMatchObject({ type: "session_resized" });
+  });
+
+  it("expectQueuedPayload 会保留真实 pendingInner 与 waiter 的 FIFO 顺序", async () => {
+    const client = makeDirectClientQueueHarness();
+    const state = directClientQueueState(client);
+    state.enqueueInner(envelope("session_resized", { order: "first" }));
+
+    const expected = state.expectQueuedPayload<{ challenge: string }>("auth_challenge", 1000);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(state.innerWaiters).toHaveLength(1);
+
+    state.enqueueInner(envelope("session_resized", { order: "second" }));
+    state.enqueueInner(envelope("auth_challenge", { challenge: "ready" }));
+    state.enqueueInner(envelope("session_resized", { order: "late" }));
+
+    await expect(expected).resolves.toEqual({ challenge: "ready" });
+    await expect(client.receiveInner()).resolves.toMatchObject({ payload: { order: "first" } });
+    await expect(client.receiveInner()).resolves.toMatchObject({ payload: { order: "second" } });
+    await expect(client.receiveInner()).resolves.toMatchObject({ payload: { order: "late" } });
+  });
+
+  it("expectQueuedPayload 的真实缓冲占用对所有 producer 可见且超限帧不丢失", async () => {
+    const client = makeDirectClientQueueHarness();
+    const state = directClientQueueState(client);
+    const maxMessages = inboundQueueLimit("PENDING_INNER_MAX_MESSAGES");
+    for (let index = 0; index < maxMessages; index += 1) {
+      state.enqueueInner(envelope("session_resized", { order: index }));
+    }
+
+    const expected = state.expectQueuedPayload("auth_challenge", 1000);
+    await waitUntil(
+      () => state.pendingInner.length === 0 && state.innerWaiters.length === 1,
+      "expectQueuedPayload waiter",
+    );
+    state.enqueueInner(envelope("session_resized", { order: "overflow" }));
+
+    await expect(expected).rejects.toMatchObject({ code: "connection_error" });
+    expect(state.socket.close).toHaveBeenCalled();
+    expect(state.inbox.rejectPending).toHaveBeenCalledWith(expect.objectContaining({ code: "connection_error" }));
+    expect(state.pendingInner).toHaveLength(maxMessages);
+    expect(state.pendingInner[0]).toMatchObject({ payload: { order: 0 } });
+    expect(state.pendingInner[maxMessages - 1]).toMatchObject({ payload: { order: maxMessages - 1 } });
+    await expect(client.receiveInner()).resolves.toMatchObject({ payload: { order: 0 } });
+  });
+
+  it("expectQueuedPayload 使用单一绝对截止时间", async () => {
+    vi.useFakeTimers();
+    try {
+      const client = makeDirectClientQueueHarness();
+      const state = directClientQueueState(client);
+      let outcome: unknown;
+      const expected = state.expectQueuedPayload("auth_challenge", 100).catch((error: unknown) => {
+        outcome = error;
+        throw error;
+      });
+      void expected.catch(() => {});
+
+      await vi.advanceTimersByTimeAsync(60);
+      state.enqueueInner(envelope("session_resized", { order: "before-deadline" }));
+      await vi.advanceTimersByTimeAsync(41);
+
+      expect(outcome).toMatchObject({ code: "response_timeout" });
+      await expect(expected).rejects.toMatchObject({ code: "response_timeout" });
+    } finally {
+      await vi.runOnlyPendingTimersAsync();
+      vi.useRealTimers();
+    }
+  });
+
+  it("expectQueuedPayload 超时会移除 waiter 且迟到帧仍可消费", async () => {
+    vi.useFakeTimers();
+    try {
+      const client = makeDirectClientQueueHarness();
+      const state = directClientQueueState(client);
+      const expected = state.expectQueuedPayload("auth_challenge", 50);
+      void expected.catch(() => {});
+      await vi.advanceTimersByTimeAsync(51);
+      await expect(expected).rejects.toMatchObject({ code: "response_timeout" });
+      expect(state.innerWaiters).toHaveLength(0);
+
+      state.enqueueInner(envelope("session_resized", { order: "late" }));
+      expect(state.pendingInner).toHaveLength(1);
+      await expect(client.receiveInner()).resolves.toMatchObject({ payload: { order: "late" } });
+    } finally {
+      await vi.runOnlyPendingTimersAsync();
+      vi.useRealTimers();
+    }
+  });
+
+  it("expectQueuedPayload 投递时会拒绝已过绝对截止时间的 waiter 且不丢失同一帧", async () => {
+    vi.useFakeTimers();
+    try {
+      const client = makeDirectClientQueueHarness();
+      const state = directClientQueueState(client);
+      const startedAt = Date.now();
+      const expected = state.expectQueuedPayload("auth_challenge", 50);
+      void expected.catch(() => {});
+      expect(state.innerWaiters).toHaveLength(1);
+
+      // 中文注释：只推进墙上时钟，不执行已到期的 timer，稳定复现投递与 timer callback 的竞态窗口。
+      vi.setSystemTime(startedAt + 51);
+      state.enqueueInner(envelope("auth_challenge", { challenge: "late" }));
+
+      await expect(expected).rejects.toMatchObject({ code: "response_timeout" });
+      expect(state.innerWaiters).toHaveLength(0);
+      expect(state.pendingInner).toHaveLength(1);
+      await expect(client.receiveInner()).resolves.toMatchObject({
+        type: "auth_challenge",
+        payload: { challenge: "late" },
+      });
+    } finally {
+      await vi.runOnlyPendingTimersAsync();
+      vi.useRealTimers();
+    }
+  });
+
+  it("pendingInner 字节估算遇到循环对象和 BigInt 不会抛错", async () => {
+    const client = makeDirectClientQueueHarness();
+    const state = directClientQueueState(client);
+    const cyclic: Record<string, unknown> = { marker: "cycle" };
+    cyclic.self = cyclic;
+
+    expect(() => state.enqueueInner(envelope("session_resized", {
+      session_id: "00000000-0000-0000-0000-000000000071",
+      resize_owner: true,
+      cyclic,
+      bigint: 1n,
+    }))).not.toThrow();
+    expect(state.socket.close).not.toHaveBeenCalled();
+    await expect(client.receiveInner()).resolves.toMatchObject({
+      payload: { session_id: "00000000-0000-0000-0000-000000000071" },
+    });
+  });
+
+  it("pendingInner 字节估算会按 Blob 和 ArrayBuffer 实际驻留关闭超限连接", async () => {
+    const maxBytes = inboundQueueLimit("PENDING_INNER_MAX_BYTES");
+    const blobClient = makeDirectClientQueueHarness();
+    const blobState = directClientQueueState(blobClient);
+    blobState.enqueueInner(envelope("session_resized", {
+      session_id: "00000000-0000-0000-0000-000000000081",
+      resize_owner: true,
+      blob: new Blob([new Uint8Array(maxBytes + 1)]),
+    }));
+    expect(blobState.socket.close).toHaveBeenCalled();
+    await expect(blobClient.receiveInner()).rejects.toMatchObject({ code: "connection_error" });
+
+    const bufferClient = makeDirectClientQueueHarness();
+    const bufferState = directClientQueueState(bufferClient);
+    bufferState.enqueueInner(envelope("session_resized", {
+      session_id: "00000000-0000-0000-0000-000000000082",
+      resize_owner: true,
+      data_buffer: new ArrayBuffer(maxBytes + 1),
+    }));
+    expect(bufferState.socket.close).toHaveBeenCalled();
+    await expect(bufferClient.receiveInner()).rejects.toMatchObject({ code: "connection_error" });
+  });
+
+  it("pendingInner 会按 ArrayBuffer view 保留的完整 backing buffer 计费", async () => {
+    const client = makeDirectClientQueueHarness();
+    const state = directClientQueueState(client);
+    const maxBytes = inboundQueueLimit("PENDING_INNER_MAX_BYTES");
+    const retained = new ArrayBuffer(maxBytes + 1);
+
+    state.enqueueInner(envelope("session_resized", {
+      session_id: "00000000-0000-0000-0000-000000000083",
+      resize_owner: true,
+      data_view: new Uint8Array(retained, 0, 1),
+    }));
+
+    expect(state.socket.close).toHaveBeenCalled();
+    await expect(client.receiveInner()).rejects.toMatchObject({ code: "connection_error" });
+  });
+
+  it.each([
+    {
+      trap: "instanceof",
+      value: () => new Proxy({}, {
+        getPrototypeOf: () => {
+          throw new Error("getPrototypeOf trap");
+        },
+      }),
+    },
+    {
+      trap: "toString",
+      value: () => new Proxy({}, {
+        get: (target, property, receiver) => {
+          if (property === Symbol.toStringTag) {
+            throw new Error("toStringTag trap");
+          }
+          return Reflect.get(target, property, receiver);
+        },
+      }),
+    },
+    {
+      trap: "Object.entries",
+      value: () => new Proxy({}, {
+        ownKeys: () => {
+          throw new Error("ownKeys trap");
+        },
+      }),
+    },
+    {
+      trap: "property getter",
+      value: () => Object.defineProperty({}, "retained", {
+        enumerable: true,
+        get: () => {
+          throw new Error("property getter trap");
+        },
+      }),
+    },
+  ])("pendingInner 字节估算遇到 $trap trap 时使用非抛错保守值", async ({ value }) => {
+    const client = makeDirectClientQueueHarness();
+    const state = directClientQueueState(client);
+
+    expect(() => state.enqueueInner(envelope("session_resized", {
+      session_id: "00000000-0000-0000-0000-000000000084",
+      resize_owner: true,
+      hostile: value(),
+    }))).not.toThrow();
+    expect(state.socket.close).toHaveBeenCalled();
+    await expect(client.receiveInner()).rejects.toMatchObject({ code: "connection_error" });
+  });
+
+  it.each([
+    { label: "负数", byteLength: -1 },
+    { label: "负无穷", byteLength: Number.NEGATIVE_INFINITY },
+    { label: "NaN", byteLength: Number.NaN },
+  ])("pendingInner 会拒绝伪造 ArrayBuffer tag 的 $label byteLength", async ({ byteLength }) => {
+    const client = makeDirectClientQueueHarness();
+    const state = directClientQueueState(client);
+    const forgedArrayBuffer = new Proxy({}, {
+      get: (target, property, receiver) => {
+        if (property === Symbol.toStringTag) {
+          return "ArrayBuffer";
+        }
+        if (property === "byteLength") {
+          return byteLength;
+        }
+        return Reflect.get(target, property, receiver);
+      },
+    });
+
+    expect(() => state.enqueueInner(envelope("session_resized", {
+      session_id: "00000000-0000-0000-0000-000000000085",
+      resize_owner: true,
+      forged_array_buffer: forgedArrayBuffer,
+    }))).not.toThrow();
+    expect(state.socket.close).toHaveBeenCalled();
+    expect(Number.isFinite(state.pendingInnerBytes)).toBe(true);
+    expect(state.pendingInnerBytes).toBeGreaterThanOrEqual(0);
+    await expect(client.receiveInner()).rejects.toMatchObject({ code: "connection_error" });
+  });
+
+  it("pendingInner 同时保留 base64 字符串和 data_bytes 时不会低估驻留字节", async () => {
+    const client = makeDirectClientQueueHarness();
+    const state = directClientQueueState(client);
+    const maxBytes = inboundQueueLimit("PENDING_INNER_MAX_BYTES");
+    const rawBytes = Math.floor(maxBytes * 0.44);
+
+    state.enqueueInner(envelope("attach_frame", {
+      session_id: "00000000-0000-0000-0000-000000000091",
+      stream_id: "00000000-0000-0000-0000-000000000092",
+      data_bytes: new Uint8Array(rawBytes),
+      data_base64: Buffer.alloc(rawBytes).toString("base64"),
+    }));
+
+    expect(state.socket.close).toHaveBeenCalled();
+    await expect(client.receiveInner()).rejects.toMatchObject({ code: "connection_error" });
   });
 
   it.each([

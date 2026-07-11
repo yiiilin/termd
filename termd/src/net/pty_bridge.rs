@@ -6,7 +6,7 @@
 
 use std::collections::VecDeque;
 use std::io::{Read, Write};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::thread::{self, JoinHandle};
 
 use portable_pty::{Child, MasterPty, native_pty_system};
@@ -19,6 +19,8 @@ use crate::pty::{
 const READER_CHUNK_BYTES: usize = 16 * 1024;
 const READY_OUTPUT_DRAIN_MAX_CHUNKS: usize = 64;
 const READY_OUTPUT_DRAIN_MAX_BYTES: usize = 1024 * 1024;
+const OUTPUT_QUEUE_MAX_MESSAGES: usize = 128;
+const OUTPUT_QUEUE_MAX_BYTES: usize = 8 * 1024 * 1024;
 
 /// 生产 daemon 使用的 PTY backend。
 ///
@@ -48,7 +50,7 @@ impl PtyBackend for NonBlockingPortablePtyBackend {
 
         let reader = master.try_clone_reader().map_err(PtyError::backend)?;
         let writer = master.take_writer().map_err(PtyError::backend)?;
-        let (output_tx, output_rx) = mpsc::channel();
+        let (output_tx, output_rx) = mpsc::sync_channel(OUTPUT_QUEUE_MAX_MESSAGES);
         let (output_signal_tx, output_signal_rx) = watch::channel(0_u64);
 
         // 真实 PTY read 会阻塞，所以只能在专门线程中执行。WebSocket 线程只读 channel 缓存。
@@ -66,6 +68,8 @@ impl PtyBackend for NonBlockingPortablePtyBackend {
             output_signal_tx: output_signal_tx.clone(),
             output_signal_rx,
             pending_output: VecDeque::new(),
+            pending_output_bytes: 0,
+            pending_error: None,
             _reader_thread: reader_thread,
             size,
         }))
@@ -76,7 +80,7 @@ type OutputMessage = PtyResult<Vec<u8>>;
 
 fn read_pty_output(
     mut reader: Box<dyn Read + Send>,
-    output_tx: mpsc::Sender<OutputMessage>,
+    output_tx: SyncSender<OutputMessage>,
     output_signal_tx: watch::Sender<u64>,
 ) {
     let mut buffer = vec![0_u8; READER_CHUNK_BYTES];
@@ -90,7 +94,8 @@ fn read_pty_output(
                     break;
                 }
                 sequence = sequence.wrapping_add(1);
-                // 信号只表示“有输出可读”，不携带终端明文；明文仍只经 E2EE session_data 发送。
+                // 信号只表示“有输出可读”，不携带终端内容。上层当前通过明文 packet/attach
+                // frame 发送 PTY 数据；旧客户端仍可走 `session_data`/`encrypted_frame` 兼容路径。
                 let _ = output_signal_tx.send(sequence);
             }
             Err(error) => {
@@ -112,12 +117,17 @@ struct NonBlockingPortablePtySession {
     output_signal_tx: watch::Sender<u64>,
     output_signal_rx: watch::Receiver<u64>,
     pending_output: VecDeque<Vec<u8>>,
+    pending_output_bytes: usize,
+    pending_error: Option<PtyError>,
     _reader_thread: JoinHandle<()>,
     size: PtySize,
 }
 
 impl NonBlockingPortablePtySession {
     fn drain_ready_output(&mut self) -> PtyResult<()> {
+        if self.pending_error.is_some() {
+            return Ok(());
+        }
         let mut chunks = 0_usize;
         let mut bytes = 0_usize;
         loop {
@@ -126,14 +136,24 @@ impl NonBlockingPortablePtySession {
                 // mpsc backlog 一次搬空，否则 input/resize/snapshot 会等这个同步函数。
                 return Ok(());
             }
+            if self.pending_output.len() >= OUTPUT_QUEUE_MAX_MESSAGES
+                || self.pending_output_bytes > OUTPUT_QUEUE_MAX_BYTES - READER_CHUNK_BYTES
+            {
+                return Ok(());
+            }
             match self.output_rx.try_recv() {
                 Ok(Ok(chunk)) if !chunk.is_empty() => {
                     bytes = bytes.saturating_add(chunk.len());
                     chunks = chunks.saturating_add(1);
+                    self.pending_output_bytes =
+                        self.pending_output_bytes.saturating_add(chunk.len());
                     self.pending_output.push_back(chunk);
                 }
                 Ok(Ok(_)) => continue,
-                Ok(Err(error)) => return Err(error),
+                Ok(Err(error)) => {
+                    self.pending_error = Some(error);
+                    return Ok(());
+                }
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => return Ok(()),
             }
         }
@@ -156,17 +176,22 @@ impl PtySession for NonBlockingPortablePtySession {
         self.drain_ready_output()?;
 
         let Some(mut chunk) = self.pending_output.pop_front() else {
-            return Ok(0);
+            return match self.pending_error.take() {
+                Some(error) => Err(error),
+                None => Ok(0),
+            };
         };
+        self.pending_output_bytes = self.pending_output_bytes.saturating_sub(chunk.len());
         let read = chunk.len().min(buffer.len());
         buffer[..read].copy_from_slice(&chunk[..read]);
 
         if read < chunk.len() {
             let remaining = chunk.split_off(read);
+            self.pending_output_bytes = self.pending_output_bytes.saturating_add(remaining.len());
             self.pending_output.push_front(remaining);
         }
 
-        if !self.pending_output.is_empty() {
+        if !self.pending_output.is_empty() || self.pending_error.is_some() {
             // watch 信号可能把多个 PTY read 合并成一次唤醒；如果本次 read 后仍有缓存，
             // 主动再唤醒一次 WebSocket 推送路径，避免画面停住直到下一次用户输入。
             self.signal_pending_output();
@@ -193,6 +218,11 @@ impl PtySession for NonBlockingPortablePtySession {
 
     fn snapshot(&mut self) -> PtyResult<PtySnapshot> {
         self.drain_ready_output()?;
+        if self.pending_output.is_empty()
+            && let Some(error) = self.pending_error.take()
+        {
+            return Err(error);
+        }
         let retained_output = self.pending_output.iter().flatten().copied().collect();
 
         Ok(PtySnapshot {
@@ -285,6 +315,64 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn queued_output_is_read_before_deferred_reader_error() {
+        let size = PtySize::new(24, 80);
+        let pair = native_pty_system()
+            .openpty(size.into())
+            .expect("test PTY should open");
+        let portable_pty::PtyPair { master, slave } = pair;
+        let child = slave
+            .spawn_command(
+                CommandSpec::new("sh")
+                    .args(["-c", "sleep 1"])
+                    .to_portable_command()
+                    .expect("test command should convert"),
+            )
+            .expect("test child should spawn");
+        drop(slave);
+        let writer = master.take_writer().expect("test writer should open");
+        let (output_tx, output_rx) = mpsc::sync_channel(OUTPUT_QUEUE_MAX_MESSAGES);
+        output_tx
+            .send(Ok(b"before-error".to_vec()))
+            .expect("test chunk should queue");
+        output_tx
+            .send(Err(PtyError::from(std::io::Error::other(
+                "test reader failure",
+            ))))
+            .expect("test error should queue");
+        drop(output_tx);
+        let (output_signal_tx, output_signal_rx) = watch::channel(0_u64);
+        let reader_thread = thread::spawn(|| {});
+        let mut session = NonBlockingPortablePtySession {
+            master,
+            child,
+            writer,
+            output_rx,
+            output_signal_tx,
+            output_signal_rx,
+            pending_output: VecDeque::new(),
+            pending_output_bytes: 0,
+            pending_error: None,
+            _reader_thread: reader_thread,
+            size,
+        };
+        let mut buffer = [0_u8; 64];
+
+        let read = session
+            .read(&mut buffer)
+            .expect("queued output must be returned before the terminal reader error");
+
+        assert_eq!(&buffer[..read], b"before-error");
+        let error = session
+            .read(&mut buffer)
+            .expect_err("reader error should surface after queued output is drained");
+        assert!(error.to_string().contains("test reader failure"));
+        assert_eq!(session.pending_output_bytes, 0);
+        let _ = session.terminate();
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn read_rearms_output_signal_when_cached_output_remains() {
         let backend = NonBlockingPortablePtyBackend::new();
         let mut session = backend
@@ -320,6 +408,37 @@ mod tests {
             "remaining cached output should rearm the watcher"
         );
 
+        let _ = session.terminate();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn slow_consumer_retained_output_stays_within_message_and_byte_budget() {
+        const TEST_OUTPUT_QUEUE_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+        let backend = NonBlockingPortablePtyBackend::new();
+        let mut session = backend
+            .spawn(
+                &CommandSpec::new("sh").args(["-c", "head -c 20971520 /dev/zero | tr '\\000' x"]),
+                PtySize::new(24, 80),
+            )
+            .expect("test PTY should spawn");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut largest_retained = 0_usize;
+
+        loop {
+            let snapshot = session.snapshot().expect("snapshot should not fail");
+            largest_retained = largest_retained.max(snapshot.retained_output.len());
+            if largest_retained > TEST_OUTPUT_QUEUE_MAX_BYTES || Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(
+            largest_retained <= TEST_OUTPUT_QUEUE_MAX_BYTES,
+            "slow consumer retained {largest_retained} bytes"
+        );
         let _ = session.terminate();
     }
 }

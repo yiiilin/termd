@@ -1,20 +1,21 @@
 //! termd daemon 内核 runtime glue。
 //!
 //! runtime 只把 `SessionManager` 的 attach 状态和 `PtyBackend` 的进程句柄接起来，
-//! 负责 daemon 本地的持久会话生命周期与 I/O 桥接。认证、配对、E2EE、WebSocket
-//! 和 relay 路由都必须留在更外层，避免这里变成协议层或控制权系统。
+//! 负责 daemon 本地的持久会话生命周期与 I/O 桥接。认证、配对、当前明文 WebSocket
+//! packet、legacy E2EE 和 relay 路由都留在更外层，避免这里变成协议层或控制权系统。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::sync::watch;
 
 use crate::pty::{
     CommandSpec, PtyAttachment, PtyAttachmentBootstrap, PtyBackend, PtyError, PtyRestoreInfo,
-    PtySession, PtySize, PtySnapshot, PtyTerminalFrame,
+    PtySession, PtySize, PtySnapshot, PtySupervisorStatus, PtyTerminalFrame,
 };
 use crate::session::{AttachRole, SessionError, SessionManager, SessionState, TerminalSize};
 use crate::state::SessionStateRecord;
@@ -108,8 +109,31 @@ impl From<PtyError> for RuntimeError {
 struct RuntimeSession {
     pty: Box<dyn PtySession>,
     watched_attachments: HashMap<String, Box<dyn PtyAttachment>>,
+    attached_devices: HashSet<String>,
     created_at_ms: UnixTimestampMillis,
     updated_at_ms: UnixTimestampMillis,
+    termination_confirmed: bool,
+}
+
+pub(crate) struct RuntimeCleanup {
+    _pty: Box<dyn PtySession>,
+}
+
+fn cleanup_supervisor_finalize_is_pending(pty: &dyn PtySession) -> bool {
+    matches!(
+        pty.restore_info(),
+        Some(PtyRestoreInfo::UnixSocket {
+            supervisor_status: PtySupervisorStatus::Closing,
+            ..
+        })
+    )
+}
+
+#[derive(Debug)]
+enum BackendTerminationOutcome {
+    ConfirmedDead,
+    StillRunning(PtyError),
+    ProbeFailed(PtyError),
 }
 
 /// daemon 内核 runtime。
@@ -117,7 +141,7 @@ struct RuntimeSession {
 /// `SessionRuntime` 接收的 device id 默认已经由 auth 层验证；本类型只执行
 /// shared-control 对应的本地 I/O 规则，不判断设备是否配对，也不解析网络消息。
 pub struct SessionRuntime<B: PtyBackend> {
-    backend: B,
+    backend: Arc<B>,
     sessions: SessionManager,
     runtime_sessions: HashMap<String, RuntimeSession>,
     next_session_number: u64,
@@ -128,12 +152,47 @@ impl<B: PtyBackend> SessionRuntime<B> {
     ///
     /// 测试可以传入 fake backend；生产 daemon 默认注入 supervisor backend。
     pub fn new(backend: B) -> Self {
+        Self::from_shared_backend(Arc::new(backend))
+    }
+
+    pub(crate) fn from_shared_backend(backend: Arc<B>) -> Self {
         Self {
             backend,
             sessions: SessionManager::default(),
             runtime_sessions: HashMap::new(),
             next_session_number: 1,
         }
+    }
+
+    pub(crate) fn backend_handle(&self) -> Arc<B> {
+        Arc::clone(&self.backend)
+    }
+
+    pub(crate) fn publish_owned_session(
+        &mut self,
+        session_id: &str,
+        pty: Box<dyn PtySession>,
+        size: TerminalSize,
+    ) {
+        assert!(!self.runtime_sessions.contains_key(session_id));
+        self.sessions
+            .create_session(session_id.to_owned())
+            .expect("ownership create prevalidated a unique runtime session");
+        self.sessions
+            .resize(session_id, size)
+            .expect("ownership create prevalidated terminal size");
+        let now_ms = current_unix_timestamp_millis();
+        self.runtime_sessions.insert(
+            session_id.to_owned(),
+            RuntimeSession {
+                pty,
+                watched_attachments: HashMap::new(),
+                attached_devices: HashSet::new(),
+                created_at_ms: now_ms,
+                updated_at_ms: now_ms,
+                termination_confirmed: false,
+            },
+        );
     }
 
     /// 创建一个持久 runtime session，并启动对应 PTY 进程。
@@ -174,8 +233,10 @@ impl<B: PtyBackend> SessionRuntime<B> {
             RuntimeSession {
                 pty,
                 watched_attachments: HashMap::new(),
+                attached_devices: HashSet::new(),
                 created_at_ms: now_ms,
                 updated_at_ms: now_ms,
+                termination_confirmed: false,
             },
         );
 
@@ -217,8 +278,10 @@ impl<B: PtyBackend> SessionRuntime<B> {
             RuntimeSession {
                 pty,
                 watched_attachments: HashMap::new(),
+                attached_devices: HashSet::new(),
                 created_at_ms: record.created_at_ms,
                 updated_at_ms: record.updated_at_ms,
+                termination_confirmed: false,
             },
         );
         Ok(())
@@ -236,9 +299,18 @@ impl<B: PtyBackend> SessionRuntime<B> {
         let device_id = device_id.into();
         {
             let runtime_session = self.runtime_session_mut(session_id)?;
-            let _ = runtime_session.pty.authority_attach_device(&device_id)?;
+            if let Err(error) = runtime_session.pty.authority_attach_device(&device_id) {
+                if self.observe_natural_exit(session_id)? {
+                    return Err(RuntimeError::SessionClosed);
+                }
+                return Err(error.into());
+            }
         }
-        Ok(self.sessions.attach(session_id, device_id)?)
+        let role = self.sessions.attach(session_id, device_id.clone())?;
+        self.runtime_session_mut(session_id)?
+            .attached_devices
+            .insert(device_id);
+        Ok(role)
     }
 
     /// 为一个 watched terminal 连接创建连接级终端 attach handle。
@@ -307,8 +379,8 @@ impl<B: PtyBackend> SessionRuntime<B> {
 
     /// 任意已 attach 设备的输入都会写入 PTY；未 attach 设备会被拒绝。
     ///
-    /// 这是 runtime 的核心 I/O 桥接点。网络层应在 E2EE 解包后调用本方法，
-    /// 但这里不识别 WebSocket frame、设备密钥或 relay 信息。
+    /// 这是 runtime 的核心 I/O 桥接点。当前明文 WebSocket packet 经 daemon 权限校验后调用
+    /// 本方法；legacy `encrypted_frame` 路径则先解密再调用。这里不识别 wire frame 或 relay 信息。
     pub fn write_input(
         &mut self,
         session_id: &str,
@@ -325,7 +397,12 @@ impl<B: PtyBackend> SessionRuntime<B> {
 
         match role {
             Some(AttachRole::Operator) => {
-                self.runtime_session_mut(session_id)?.pty.write_all(bytes)?;
+                if let Err(error) = self.runtime_session_mut(session_id)?.pty.write_all(bytes) {
+                    if self.observe_natural_exit(session_id)? {
+                        return Err(RuntimeError::SessionClosed);
+                    }
+                    return Err(error.into());
+                }
                 Ok(())
             }
             None => Err(RuntimeError::DeviceNotAttached),
@@ -417,7 +494,12 @@ impl<B: PtyBackend> SessionRuntime<B> {
                 // daemon 本地镜像。这样才能覆盖 “host 已删 / local 仍脏” 的反向漂移，
                 // 让重复 detach 收敛成真正的幂等语义。
                 return match self.sessions.detach(session_id, device_id) {
-                    Ok(()) => Ok(()),
+                    Ok(()) => {
+                        self.runtime_session_mut(session_id)?
+                            .attached_devices
+                            .remove(device_id);
+                        Ok(())
+                    }
                     Err(SessionError::DeviceNotAttached) => Err(RuntimeError::DeviceNotAttached),
                     Err(error) => Err(error.into()),
                 };
@@ -429,8 +511,18 @@ impl<B: PtyBackend> SessionRuntime<B> {
                 .is_some();
         }
         match self.sessions.detach(session_id, device_id) {
-            Ok(()) => Ok(()),
-            Err(SessionError::DeviceNotAttached) if detached_by_authority => Ok(()),
+            Ok(()) => {
+                self.runtime_session_mut(session_id)?
+                    .attached_devices
+                    .remove(device_id);
+                Ok(())
+            }
+            Err(SessionError::DeviceNotAttached) if detached_by_authority => {
+                self.runtime_session_mut(session_id)?
+                    .attached_devices
+                    .remove(device_id);
+                Ok(())
+            }
             Err(error) => Err(error.into()),
         }
     }
@@ -439,21 +531,77 @@ impl<B: PtyBackend> SessionRuntime<B> {
     ///
     /// PTY 生命周期只由 close 管理；普通 detach 不会调用 terminate。
     pub fn close(&mut self, session_id: &str) -> RuntimeResult<()> {
+        self.confirm_close(session_id)?;
+        self.finalize_close(session_id)
+    }
+
+    pub(crate) fn confirm_close(&mut self, session_id: &str) -> RuntimeResult<()> {
         self.ensure_open_session(session_id)?;
+        if self.runtime_session(session_id)?.termination_confirmed {
+            return Ok(());
+        }
+        let outcome = {
+            let pty = &mut self.runtime_session_mut(session_id)?.pty;
+            match pty.terminate() {
+                Ok(()) => BackendTerminationOutcome::ConfirmedDead,
+                Err(terminate_error) => match pty.try_wait() {
+                    Ok(Some(_)) if cleanup_supervisor_finalize_is_pending(pty.as_ref()) => {
+                        BackendTerminationOutcome::StillRunning(terminate_error)
+                    }
+                    Ok(Some(_)) => BackendTerminationOutcome::ConfirmedDead,
+                    Ok(None) => BackendTerminationOutcome::StillRunning(terminate_error),
+                    Err(probe_error) => BackendTerminationOutcome::ProbeFailed(probe_error),
+                },
+            }
+        };
+        match outcome {
+            BackendTerminationOutcome::ConfirmedDead => {
+                self.runtime_session_mut(session_id)?.termination_confirmed = true;
+                Ok(())
+            }
+            BackendTerminationOutcome::StillRunning(error)
+            | BackendTerminationOutcome::ProbeFailed(error) => Err(error.into()),
+        }
+    }
+
+    pub(crate) fn finalize_close(&mut self, session_id: &str) -> RuntimeResult<()> {
+        if !self.runtime_session(session_id)?.termination_confirmed {
+            return Err(
+                PtyError::Backend("PTY termination has not been confirmed".to_owned()).into(),
+            );
+        }
         {
             let runtime_session = self.runtime_session_mut(session_id)?;
             Self::detach_all_watched_attachments(runtime_session);
-            runtime_session.pty.terminate()?;
         }
         self.runtime_sessions.remove(session_id);
         self.sessions.close(session_id)?;
         Ok(())
     }
 
+    pub(crate) fn observe_natural_exit(&mut self, session_id: &str) -> RuntimeResult<bool> {
+        if self.sessions.state(session_id)? == SessionState::Closed {
+            return Ok(true);
+        }
+        let exited = self
+            .runtime_session_mut(session_id)?
+            .pty
+            .try_wait()?
+            .is_some();
+        if !exited {
+            return Ok(false);
+        }
+        let runtime_session = self.runtime_session_mut(session_id)?;
+        runtime_session.termination_confirmed = true;
+        Self::detach_all_watched_attachments(runtime_session);
+        self.sessions.close(session_id)?;
+        Ok(true)
+    }
+
     /// 丢弃 runtime session 的本地句柄，但不再尝试终止 PTY。
     ///
-    /// 这个兜底路径只在显式 close 的终止步骤失败时使用，用来确保 daemon 不再保留
-    /// 不可见的 runtime 句柄；真正的 PTY 终止仍然优先走 `close`。
+    /// 这个兜底路径只用于尚未返回给客户端的 session create 回滚；显式 close 失败
+    /// 必须保留 runtime handle，不能走这里。
     pub fn discard(&mut self, session_id: &str) -> RuntimeResult<()> {
         let Some(mut runtime_session) = self.runtime_sessions.remove(session_id) else {
             return Err(RuntimeError::SessionNotFound);
@@ -462,6 +610,17 @@ impl<B: PtyBackend> SessionRuntime<B> {
 
         self.sessions.close(session_id)?;
         Ok(())
+    }
+
+    pub(crate) fn take_for_cleanup(&mut self, session_id: &str) -> RuntimeResult<RuntimeCleanup> {
+        let Some(mut runtime_session) = self.runtime_sessions.remove(session_id) else {
+            return Err(RuntimeError::SessionNotFound);
+        };
+        Self::detach_all_watched_attachments(&mut runtime_session);
+        self.sessions.close(session_id)?;
+        Ok(RuntimeCleanup {
+            _pty: runtime_session.pty,
+        })
     }
 
     /// 查询 session 当前状态，便于上层做只读展示或测试断言。
@@ -691,8 +850,8 @@ mod tests {
         PtySession, PtySize, PtySnapshot,
     };
     use crate::session::{AttachRole, TerminalSize};
-    use std::collections::HashSet;
-    use std::sync::{Arc, Mutex};
+    use std::collections::{HashSet, VecDeque};
+    use std::sync::{Arc, Condvar, Mutex};
 
     #[derive(Clone, Default)]
     struct FakePtyBackend {
@@ -706,9 +865,21 @@ mod tests {
         attachment_drops: Vec<String>,
         writes: Vec<Vec<u8>>,
         resizes: Vec<PtySize>,
+        terminate_error: Option<String>,
         terminate_count: usize,
+        try_wait_results: VecDeque<FakeTryWaitResult>,
+        try_wait_count: usize,
+        terminate_gate: Option<Arc<(Mutex<bool>, Condvar)>>,
         authority_enabled: bool,
         attached_devices: HashSet<String>,
+        restore_info: Option<PtyRestoreInfo>,
+    }
+
+    #[derive(Debug)]
+    enum FakeTryWaitResult {
+        Running,
+        Exited,
+        Error(String),
     }
 
     impl FakePtyBackend {
@@ -730,12 +901,46 @@ mod tests {
             self.state.lock().unwrap().terminate_count
         }
 
+        fn fail_terminate(&self, message: impl Into<String>) {
+            self.state.lock().unwrap().terminate_error = Some(message.into());
+        }
+
+        fn allow_terminate(&self) {
+            self.state.lock().unwrap().terminate_error = None;
+        }
+
+        fn try_wait_count(&self) -> usize {
+            self.state.lock().unwrap().try_wait_count
+        }
+
         fn attachment_starts(&self) -> Vec<String> {
             self.state.lock().unwrap().attachment_starts.clone()
         }
 
         fn attachment_drops(&self) -> Vec<String> {
             self.state.lock().unwrap().attachment_drops.clone()
+        }
+
+        fn report_running_once(&self) {
+            self.state
+                .lock()
+                .unwrap()
+                .try_wait_results
+                .push_back(FakeTryWaitResult::Running);
+        }
+
+        fn fail_try_wait_once(&self, message: impl Into<String>) {
+            self.state
+                .lock()
+                .unwrap()
+                .try_wait_results
+                .push_back(FakeTryWaitResult::Error(message.into()));
+        }
+
+        fn gate_terminate(&self) -> Arc<(Mutex<bool>, Condvar)> {
+            let gate = Arc::new((Mutex::new(false), Condvar::new()));
+            self.state.lock().unwrap().terminate_gate = Some(Arc::clone(&gate));
+            gate
         }
 
         fn replace_attached_devices<I, S>(&self, devices: I)
@@ -756,8 +961,22 @@ mod tests {
                 .spawns
                 .push((command.clone(), size));
 
+            let restore_info = self.state.lock().unwrap().restore_info.clone();
             Ok(Box::new(FakePtySession {
                 state: Arc::clone(&self.state),
+                restore_info,
+            }))
+        }
+
+        fn reconnect(
+            &self,
+            _session_id: &str,
+            restore_info: &PtyRestoreInfo,
+            _size: PtySize,
+        ) -> PtyResult<Box<dyn PtySession>> {
+            Ok(Box::new(FakePtySession {
+                state: Arc::clone(&self.state),
+                restore_info: Some(restore_info.clone()),
             }))
         }
 
@@ -800,6 +1019,7 @@ mod tests {
 
     struct FakePtySession {
         state: Arc<Mutex<FakePtyState>>,
+        restore_info: Option<PtyRestoreInfo>,
     }
 
     impl PtySession for FakePtySession {
@@ -858,13 +1078,53 @@ mod tests {
             })
         }
 
+        fn restore_info(&self) -> Option<PtyRestoreInfo> {
+            self.restore_info.clone()
+        }
+
         fn terminate(&mut self) -> PtyResult<()> {
-            self.state.lock().unwrap().terminate_count += 1;
+            if let Some(PtyRestoreInfo::UnixSocket {
+                socket_path,
+                supervisor_pid,
+                ..
+            }) = self.restore_info.as_ref()
+            {
+                self.restore_info = Some(PtyRestoreInfo::UnixSocket {
+                    socket_path: socket_path.clone(),
+                    supervisor_pid: *supervisor_pid,
+                    supervisor_status: crate::pty::PtySupervisorStatus::Closing,
+                });
+            }
+            let (terminate_error, terminate_gate) = {
+                let mut state = self.state.lock().unwrap();
+                state.terminate_count += 1;
+                (state.terminate_error.clone(), state.terminate_gate.clone())
+            };
+            if let Some(gate) = terminate_gate {
+                let (released, wake) = &*gate;
+                let mut released = released.lock().unwrap();
+                while !*released {
+                    released = wake.wait(released).unwrap();
+                }
+            }
+            if let Some(message) = terminate_error {
+                return Err(PtyError::Backend(message));
+            }
             Ok(())
         }
 
         fn try_wait(&mut self) -> PtyResult<Option<PtyExitStatus>> {
-            Ok(None)
+            let mut state = self.state.lock().unwrap();
+            state.try_wait_count += 1;
+            match state
+                .try_wait_results
+                .pop_front()
+                .unwrap_or(FakeTryWaitResult::Exited)
+            {
+                FakeTryWaitResult::Running => Ok(None),
+                FakeTryWaitResult::Exited => Ok(Some(PtyExitStatus::exited(0))),
+                FakeTryWaitResult::Error(message) => Err(PtyError::Backend(message)),
+            }
         }
 
         fn wait(&mut self) -> PtyResult<PtyExitStatus> {
@@ -1059,12 +1319,187 @@ mod tests {
             .create_session(CommandSpec::new("sh"), TerminalSize::cells(24, 80))
             .unwrap();
         runtime.attach(&session_id, "dev-a").unwrap();
+        backend
+            .state
+            .lock()
+            .unwrap()
+            .try_wait_results
+            .push_back(FakeTryWaitResult::Exited);
 
         runtime.close(&session_id).unwrap();
 
         assert_eq!(backend.terminate_count(), 1);
+        assert_eq!(backend.try_wait_count(), 0);
         let error = runtime.attach(&session_id, "dev-b").unwrap_err();
         assert_eq!(error, RuntimeError::SessionClosed);
+    }
+
+    #[test]
+    fn successful_synchronous_terminate_confirms_exit_without_a_platform_probe() {
+        let backend = FakePtyBackend::default();
+        backend.report_running_once();
+        let mut runtime = SessionRuntime::new(backend.clone());
+        let session_id = runtime
+            .create_session(CommandSpec::new("sh"), TerminalSize::cells(24, 80))
+            .unwrap();
+        runtime.attach(&session_id, "dev-a").unwrap();
+
+        runtime.close(&session_id).unwrap();
+        assert_eq!(backend.terminate_count(), 1);
+        assert_eq!(backend.try_wait_count(), 0);
+        assert_eq!(runtime.state(&session_id).unwrap(), SessionState::Closed);
+    }
+
+    #[test]
+    fn terminate_error_with_exited_pty_keeps_closing_supervisor_retryable() {
+        let backend = FakePtyBackend::default();
+        backend.state.lock().unwrap().restore_info = Some(PtyRestoreInfo::UnixSocket {
+            socket_path: PathBuf::from("/tmp/runtime-finalize-gate.sock"),
+            supervisor_pid: 42,
+            supervisor_status: crate::pty::PtySupervisorStatus::Running,
+        });
+        backend.fail_terminate("terminate response was lost");
+        let mut runtime = SessionRuntime::new(backend.clone());
+        let session_id = runtime
+            .create_session(CommandSpec::new("sh"), TerminalSize::cells(24, 80))
+            .unwrap();
+        runtime.attach(&session_id, "dev-a").unwrap();
+
+        assert!(runtime.close(&session_id).is_err());
+
+        assert_eq!(backend.terminate_count(), 1);
+        assert_eq!(backend.try_wait_count(), 1);
+        assert_eq!(runtime.state(&session_id).unwrap(), SessionState::Running);
+
+        backend.allow_terminate();
+        runtime.close(&session_id).unwrap();
+
+        assert_eq!(backend.terminate_count(), 2);
+        assert_eq!(runtime.state(&session_id).unwrap(), SessionState::Closed);
+    }
+
+    #[test]
+    fn concurrent_close_calls_serialize_and_consume_the_runtime_handle_once() {
+        let backend = FakePtyBackend::default();
+        let terminate_gate = backend.gate_terminate();
+        let runtime = Arc::new(Mutex::new(SessionRuntime::new(backend.clone())));
+        let session_id = {
+            let mut runtime = runtime.lock().unwrap();
+            let session_id = runtime
+                .create_session(CommandSpec::new("sh"), TerminalSize::cells(24, 80))
+                .unwrap();
+            runtime.attach(&session_id, "dev-a").unwrap();
+            session_id
+        };
+        let (first_started_tx, first_started_rx) = std::sync::mpsc::channel();
+        let first_runtime = Arc::clone(&runtime);
+        let first_session_id = session_id.clone();
+        let first = std::thread::spawn(move || {
+            first_started_tx.send(()).unwrap();
+            first_runtime.lock().unwrap().close(&first_session_id)
+        });
+        first_started_rx.recv().unwrap();
+        while backend.terminate_count() == 0 {
+            std::thread::yield_now();
+        }
+
+        let (second_done_tx, second_done_rx) = std::sync::mpsc::channel();
+        let second_runtime = Arc::clone(&runtime);
+        let second_session_id = session_id.clone();
+        let second = std::thread::spawn(move || {
+            let result = second_runtime.lock().unwrap().close(&second_session_id);
+            second_done_tx.send(()).unwrap();
+            result
+        });
+        assert!(
+            second_done_rx
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err(),
+            "second close must overlap while the first owns the shared runtime lock"
+        );
+
+        let (released, wake) = &*terminate_gate;
+        *released.lock().unwrap() = true;
+        wake.notify_all();
+
+        assert_eq!(first.join().unwrap(), Ok(()));
+        assert_eq!(second.join().unwrap(), Err(RuntimeError::SessionClosed));
+        assert_eq!(backend.terminate_count(), 1);
+        assert_eq!(backend.try_wait_count(), 0);
+    }
+
+    #[test]
+    fn close_keeps_runtime_and_watched_attachment_until_exit_is_confirmed() {
+        let backend = FakePtyBackend::default();
+        backend.fail_terminate("terminate failed");
+        backend.report_running_once();
+        let mut runtime = SessionRuntime::new(backend.clone());
+        let session_id = runtime
+            .create_session(CommandSpec::new("sh"), TerminalSize::cells(24, 80))
+            .unwrap();
+        runtime.attach(&session_id, "dev-a").unwrap();
+        runtime
+            .start_watched_attachment(
+                &session_id,
+                "conn-a-watch",
+                TerminalSize::cells(24, 80),
+                PtyAttachmentBootstrap::default(),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            runtime.close(&session_id),
+            Err(RuntimeError::Pty(_))
+        ));
+        assert_eq!(runtime.state(&session_id).unwrap(), SessionState::Running);
+        assert!(backend.attachment_drops().is_empty());
+        runtime
+            .write_input(&session_id, "dev-a", b"after-failed-close")
+            .unwrap();
+        assert_eq!(backend.writes(), vec![b"after-failed-close".to_vec()]);
+
+        backend.allow_terminate();
+        runtime.close(&session_id).unwrap();
+        assert_eq!(backend.terminate_count(), 2);
+        assert_eq!(backend.try_wait_count(), 1);
+        assert_eq!(backend.attachment_drops(), vec!["conn-a-watch".to_owned()]);
+        assert_eq!(runtime.state(&session_id).unwrap(), SessionState::Closed);
+    }
+
+    #[test]
+    fn close_keeps_runtime_when_exit_probe_fails() {
+        let backend = FakePtyBackend::default();
+        backend.fail_terminate("terminate failed");
+        backend.fail_try_wait_once("probe unavailable");
+        let mut runtime = SessionRuntime::new(backend.clone());
+        let session_id = runtime
+            .create_session(CommandSpec::new("sh"), TerminalSize::cells(24, 80))
+            .unwrap();
+        runtime.attach(&session_id, "dev-a").unwrap();
+        runtime
+            .start_watched_attachment(
+                &session_id,
+                "conn-a-watch",
+                TerminalSize::cells(24, 80),
+                PtyAttachmentBootstrap::default(),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            runtime.close(&session_id),
+            Err(RuntimeError::Pty(_))
+        ));
+        assert_eq!(runtime.state(&session_id).unwrap(), SessionState::Running);
+        assert!(backend.attachment_drops().is_empty());
+        runtime
+            .write_input(&session_id, "dev-a", b"after-probe-failure")
+            .unwrap();
+
+        backend.allow_terminate();
+        runtime.close(&session_id).unwrap();
+        assert_eq!(backend.terminate_count(), 2);
+        assert_eq!(backend.try_wait_count(), 1);
+        assert_eq!(backend.attachment_drops(), vec!["conn-a-watch".to_owned()]);
     }
 
     #[test]

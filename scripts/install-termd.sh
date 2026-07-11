@@ -50,6 +50,11 @@ LOG_EMITTED=0
 SUPERVISOR_VERSION_NEEDS_RUNTIME_CLEAR=0
 SUPERVISOR_VERSION_EXPLICIT=0
 SUPERVISOR_VERSION_REQUIRED=0
+INSTALL_STAGING_DIR=""
+INSTALL_SERVICE_WAS_ACTIVE=0
+INSTALL_SERVICE_WAS_ENABLED=0
+INSTALL_ROLLBACK_DIR=""
+INSTALL_BINARY_COMMITTED=0
 
 # 只有用户显式传入 TERMD_SUPERVISOR_VERSION 或 --supervisor-version 时，
 # supervisor 版本才表示兼容性切换请求；release 脚本中的默认值不能触发清 session。
@@ -77,6 +82,66 @@ die() {
 
 require_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
+}
+
+is_enabled() {
+  case "${1:-}" in
+    1|true|TRUE|yes|YES|on|ON) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+web_ui_requested() {
+  local requested
+
+  if [[ "$INSTALL_SET_WEB" -eq 1 ]]; then
+    is_enabled "${TERMD_WEB_ENABLED:-0}"
+    return
+  fi
+
+  if [[ -r "$ENV_FILE" ]]; then
+    if ! requested="$(
+      # shellcheck source=/dev/null
+      source "$ENV_FILE" || exit 1
+      printf '%s' "${TERMD_WEB_ENABLED:-0}"
+    )"; then
+      die "failed to read existing env file at ${ENV_FILE}; installed binary was not changed"
+    fi
+    is_enabled "$requested"
+    return
+  fi
+
+  is_enabled "${TERMD_WEB_ENABLED:-0}"
+}
+
+frontend_build_required() {
+  local frontend_dir="$1"
+  local index_file="${frontend_dir}/dist/index.html"
+  local newer_source
+
+  [[ -f "$index_file" ]] || return 0
+  newer_source="$(find "$frontend_dir" \
+    \( -path "${frontend_dir}/dist" -o -path "${frontend_dir}/node_modules" \) -prune -o \
+    -type f -newer "$index_file" -print -quit)"
+  [[ -n "$newer_source" ]]
+}
+
+build_frontend_for_source() {
+  local repo_dir="$1"
+  local frontend_dir="${repo_dir}/termui/frontend"
+
+  if ! frontend_build_required "$frontend_dir"; then
+    return 0
+  fi
+
+  log "building Web UI from ${REPO}@${VERSION}"
+  (
+    cd "$frontend_dir" &&
+      npm ci &&
+      npm run build
+  ) || return 1
+
+  [[ -f "${frontend_dir}/dist/index.html" ]] || return 1
 }
 
 require_root() {
@@ -462,6 +527,7 @@ verify_release_archive() {
 }
 
 install_from_release() {
+  local destination="${1:-${INSTALL_PREFIX}/bin/${BIN_NAME}}"
   local arch archive_name archive_url checksums_url tmp_dir archive_path checksums_path
 
   arch="$(detect_arch)"
@@ -495,7 +561,7 @@ install_from_release() {
   fi
 
   tar -xzf "$archive_path" -C "$tmp_dir"
-  install -Dm0755 "$tmp_dir/$BIN_NAME" "${INSTALL_PREFIX}/bin/${BIN_NAME}"
+  install -Dm0755 "$tmp_dir/$BIN_NAME" "$destination"
   rm -rf "$tmp_dir"
   return 0
 }
@@ -504,16 +570,32 @@ install_from_source() {
   require_cmd cargo
   require_cmd git
 
-  local src_dir
+  local destination="${1:-${INSTALL_PREFIX}/bin/${BIN_NAME}}"
+  local src_dir build_web_ui=0
+  if web_ui_requested; then
+    require_cmd node
+    require_cmd npm
+    build_web_ui=1
+  fi
   src_dir="$(mktemp -d)"
 
   log "falling back to source build from ${REPO}@${VERSION}"
-  git clone --depth 1 --branch "$VERSION" "https://github.com/${REPO}.git" "$src_dir/repo"
-  (
+  if ! git clone --depth 1 --branch "$VERSION" "https://github.com/${REPO}.git" "$src_dir/repo"; then
+    rm -rf "$src_dir"
+    die "failed to clone ${REPO}@${VERSION}; installed binary was not changed"
+  fi
+  if [[ "$build_web_ui" -eq 1 ]] && ! build_frontend_for_source "$src_dir/repo"; then
+    rm -rf "$src_dir"
+    die "failed to build Web UI from ${REPO}@${VERSION}; installed binary was not changed"
+  fi
+  if ! (
     cd "$src_dir/repo"
     cargo build --release --locked -p "$COMPONENT" --bin "$BIN_NAME"
-  )
-  install -Dm0755 "$src_dir/repo/target/release/$BIN_NAME" "${INSTALL_PREFIX}/bin/${BIN_NAME}"
+  ); then
+    rm -rf "$src_dir"
+    die "failed to build ${BIN_NAME} from source; installed binary was not changed"
+  fi
+  install -Dm0755 "$src_dir/repo/target/release/$BIN_NAME" "$destination"
   rm -rf "$src_dir"
 }
 
@@ -938,6 +1020,219 @@ resolve_supervisor_version() {
 
   SUPERVISOR_VERSION="$desired_supervisor_version"
   INSTALL_SET_SUPERVISOR_VERSION=1
+}
+
+assert_session_ownership_quiescent() {
+  local sqlite_path="${STATE_DIR}/daemon-state.sqlite"
+  [[ -f "$sqlite_path" ]] || return 0
+
+  local pending
+  if ! pending="$(python3 - "$sqlite_path" <<'PY'
+import sqlite3
+import sys
+from pathlib import Path
+from urllib.parse import quote
+
+path = Path(sys.argv[1]).resolve()
+conn = sqlite3.connect(f"file:{quote(str(path))}?mode=ro", uri=True)
+try:
+    table = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'session_ownership'"
+    ).fetchone()
+    if table is None:
+        print(0)
+    else:
+        print(conn.execute(
+            "SELECT COUNT(*) FROM session_ownership WHERE phase IN ('preparing', 'cleaning')"
+        ).fetchone()[0])
+finally:
+    conn.close()
+PY
+  )"; then
+    die "failed to run the read-only session ownership rollback precheck for ${sqlite_path}; installed binary was not changed"
+  fi
+  [[ "$pending" =~ ^[0-9]+$ ]] || die "invalid session ownership rollback precheck result; installed binary was not changed"
+  if [[ "$pending" -ne 0 ]]; then
+    die "cannot replace termd while ${pending} session ownership operation(s) are preparing or cleaning; leave the current daemon running until they converge, then retry"
+  fi
+}
+
+restore_service_after_failed_binary_commit() {
+  if [[ "$INSTALL_SERVICE_WAS_ACTIVE" -eq 1 ]]; then
+    systemctl start "$SERVICE_NAME" || die "failed to restore ${SERVICE_NAME}.service after install was blocked"
+  fi
+}
+
+commit_staged_binary() {
+  local candidate="$1"
+  local target_dir="${INSTALL_PREFIX}/bin"
+  local target="${target_dir}/${BIN_NAME}"
+  local staged_target
+
+  [[ -f "$candidate" ]] || return 1
+  INSTALL_SERVICE_WAS_ACTIVE=0
+  if systemctl is-active --quiet "$SERVICE_NAME"; then
+    INSTALL_SERVICE_WAS_ACTIVE=1
+    if ! systemctl stop "$SERVICE_NAME"; then
+      return 1
+    fi
+  fi
+
+  # 停止 daemon 后重新读取 ledger，关闭初检与 binary commit 之间的写入窗口。
+  if ! (assert_session_ownership_quiescent); then
+    restore_service_after_failed_binary_commit
+    return 1
+  fi
+
+  install -d -m0755 "$target_dir" || {
+    restore_service_after_failed_binary_commit
+    return 1
+  }
+  staged_target="$(mktemp "${target_dir}/.${BIN_NAME}.install.XXXXXX")" || {
+    restore_service_after_failed_binary_commit
+    return 1
+  }
+  if ! install -m0755 "$candidate" "$staged_target"; then
+    rm -f "$staged_target"
+    restore_service_after_failed_binary_commit
+    return 1
+  fi
+  if ! mv -f "$staged_target" "$target"; then
+    rm -f "$staged_target"
+    restore_service_after_failed_binary_commit
+    return 1
+  fi
+  return 0
+}
+
+snapshot_install_file() {
+  local key="$1"
+  local path="$2"
+
+  if [[ -e "$path" || -L "$path" ]]; then
+    printf 'present\n' >"${INSTALL_ROLLBACK_DIR}/${key}.state"
+    cp -a -- "$path" "${INSTALL_ROLLBACK_DIR}/${key}"
+  else
+    printf 'absent\n' >"${INSTALL_ROLLBACK_DIR}/${key}.state"
+  fi
+}
+
+restore_install_file() {
+  local key="$1"
+  local path="$2"
+  local state
+
+  state="$(cat "${INSTALL_ROLLBACK_DIR}/${key}.state")" || return 1
+  rm -f -- "$path" || return 1
+  if [[ "$state" == "present" ]]; then
+    install -d -m0755 "$(dirname "$path")" || return 1
+    cp -a -- "${INSTALL_ROLLBACK_DIR}/${key}" "$path" || return 1
+  fi
+}
+
+prepare_install_rollback() {
+  INSTALL_ROLLBACK_DIR="${INSTALL_STAGING_DIR}/rollback"
+  rm -rf -- "$INSTALL_ROLLBACK_DIR" || return 1
+  install -d -m0700 "$INSTALL_ROLLBACK_DIR" || return 1
+  snapshot_install_file binary "${INSTALL_PREFIX}/bin/${BIN_NAME}" || return 1
+  snapshot_install_file env "$ENV_FILE" || return 1
+  snapshot_install_file wrapper "$WRAPPER_FILE" || return 1
+  snapshot_install_file unit "$UNIT_FILE" || return 1
+  INSTALL_SERVICE_WAS_ENABLED=0
+  if systemctl is-enabled --quiet "$SERVICE_NAME"; then
+    INSTALL_SERVICE_WAS_ENABLED=1
+  fi
+}
+
+rollback_failed_install() {
+  local rollback_failed=0
+
+  restore_install_file binary "${INSTALL_PREFIX}/bin/${BIN_NAME}" || rollback_failed=1
+  restore_install_file env "$ENV_FILE" || rollback_failed=1
+  restore_install_file wrapper "$WRAPPER_FILE" || rollback_failed=1
+  restore_install_file unit "$UNIT_FILE" || rollback_failed=1
+  if [[ "$INSTALL_BINARY_COMMITTED" -eq 0 ]]; then
+    [[ "$rollback_failed" -eq 0 ]]
+    return
+  fi
+  systemctl daemon-reload || rollback_failed=1
+  if [[ "$INSTALL_SERVICE_WAS_ENABLED" -eq 1 ]]; then
+    systemctl enable "$SERVICE_NAME" || rollback_failed=1
+  else
+    systemctl disable "$SERVICE_NAME" || rollback_failed=1
+  fi
+  if [[ "$INSTALL_SERVICE_WAS_ACTIVE" -eq 1 ]]; then
+    systemctl start "$SERVICE_NAME" || rollback_failed=1
+  else
+    systemctl stop "$SERVICE_NAME" || rollback_failed=1
+  fi
+  if [[ "$rollback_failed" -ne 0 ]]; then
+    printf '[%s-install] rollback after installation failure was incomplete; inspect binary, unit, env, and service state\n' "$COMPONENT" >&2
+    return 1
+  fi
+  return 0
+}
+
+prepare_install_before_binary_commit() {
+  ensure_system_user || return $?
+  chown_state_dir || return $?
+  write_env_file || return $?
+  # 重新读取最终 env，保证后续 wrapper 和初始 pairing token 都使用同一组监听/TLS 配置。
+  # shellcheck source=/dev/null
+  source "$ENV_FILE" || return $?
+  write_wrapper || return $?
+  write_unit || return $?
+}
+
+complete_install_after_binary_commit() {
+  stop_service_before_supervisor_runtime_clear || return $?
+  clear_session_state_after_state_dir_change || return $?
+  persist_supervisor_version || return $?
+  # installer 可能首次创建 SQLite 元数据文件；写入 supervisor_version 后要重新归属给服务用户。
+  chown_state_dir || return $?
+  systemctl daemon-reload || return $?
+  systemctl enable "$SERVICE_NAME" || return $?
+  systemctl restart "$SERVICE_NAME" || return $?
+}
+
+install_staged_candidate() {
+  local candidate="$1"
+  local status
+
+  INSTALL_BINARY_COMMITTED=0
+  prepare_install_rollback || return $?
+  if prepare_install_before_binary_commit; then
+    status=0
+  else
+    status=$?
+    rollback_failed_install || true
+    return "$status"
+  fi
+  if ! commit_staged_binary "$candidate"; then
+    rollback_failed_install || true
+    return 1
+  fi
+  INSTALL_BINARY_COMMITTED=1
+
+  if complete_install_after_binary_commit; then
+    status=0
+  else
+    status=$?
+  fi
+  if [[ "$status" -ne 0 ]]; then
+    rollback_failed_install || true
+    return "$status"
+  fi
+  rm -rf -- "$INSTALL_ROLLBACK_DIR"
+  INSTALL_ROLLBACK_DIR=""
+  return 0
+}
+
+cleanup_install_staging() {
+  if [[ -n "$INSTALL_STAGING_DIR" ]]; then
+    rm -rf "$INSTALL_STAGING_DIR"
+    INSTALL_STAGING_DIR=""
+  fi
 }
 
 persist_supervisor_version() {
@@ -1569,29 +1864,20 @@ main() {
   resolve_version
   resolve_service_identity
   resolve_supervisor_version
+  assert_session_ownership_quiescent
   log "installing ${BIN_NAME} ${VERSION}"
 
-  if ! install_from_release; then
-    install_from_source
+  INSTALL_STAGING_DIR="$(mktemp -d)"
+  trap cleanup_install_staging EXIT
+  local candidate_binary="${INSTALL_STAGING_DIR}/${BIN_NAME}"
+  if ! install_from_release "$candidate_binary"; then
+    install_from_source "$candidate_binary"
   fi
-
-  ensure_system_user
-  stop_service_before_supervisor_runtime_clear
-  clear_session_state_after_state_dir_change
-  chown_state_dir
-  persist_supervisor_version
-  # installer 可能首次创建 SQLite 元数据文件；写入 supervisor_version 后要重新归属给服务用户。
-  chown_state_dir
-  write_env_file
-  # 重新读取最终 env，保证后续 wrapper 和初始 pairing token 都使用同一组监听/TLS 配置。
-  # shellcheck source=/dev/null
-  source "$ENV_FILE"
-  write_wrapper
-  write_unit
-
-  systemctl daemon-reload
-  systemctl enable "$SERVICE_NAME"
-  systemctl restart "$SERVICE_NAME"
+  if ! install_staged_candidate "$candidate_binary"; then
+    die "installation failed; the installer attempted to restore the previous binary, configuration, and service state"
+  fi
+  cleanup_install_staging
+  trap - EXIT
 
   log "installed ${BIN_NAME} ${VERSION} and started ${SERVICE_NAME}.service"
   print_initial_pairing_token

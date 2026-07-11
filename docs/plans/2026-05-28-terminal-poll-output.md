@@ -1,5 +1,7 @@
 # Terminal Poll Output Implementation Plan
 
+> 历史状态提示：本文记录当时的计划/实现状态，不代表当前 0.6 协议契约；现行边界以 `TECH.md` 和 `docs/deployment.md` 为准。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 在不改变前端 terminal stream 逻辑的前提下，将 daemon 输出读取收敛成 `terminal.poll` 语义：daemon 从权威 terminal cache/tail 按 cursor 取 batch，cursor 丢失或 resize 跨越时返回 snapshot rebase。

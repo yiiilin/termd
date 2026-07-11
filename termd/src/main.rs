@@ -24,6 +24,8 @@ use termd::pty::{CommandSpec, PtySize};
 use termd_proto::{PairingQrPayload, PairingToken, PublicKey, ServerId, UnixTimestampMillis};
 use tokio::task::JoinHandle;
 
+mod process_lock;
+
 const DEFAULT_PAIRING_URL: &str = "http://127.0.0.1:8765";
 const LOCAL_PAIRING_TOKEN_PATH: &str = "/local/pairing-token";
 const LOCAL_PAIRING_HTTP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -161,6 +163,8 @@ async fn serve_daemon(
 ) -> Result<(), Box<dyn Error>> {
     // MVP 默认只监听 127.0.0.1:8765；更复杂的配置文件/后台守护留给后续任务。
     let mut config = DaemonConfig::default();
+    config.state_path = process_lock::anchor_state_path(&config.state_path)?;
+    let _state_lock = process_lock::DaemonStateLock::acquire(&config.state_path)?;
     if let Some(listen) = listen {
         config.listen_host = listen.host;
         config.listen_port = listen.port;

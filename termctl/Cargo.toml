@@ -20,6 +20,7 @@ termd-proto = { path = "../proto" }
 thiserror.workspace = true
 tokio = { version = "1", features = ["io-std", "io-util", "macros", "rt-multi-thread", "signal", "time"] }
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+url = "2.5"
 uuid.workspace = true
 webpki-roots = "1"
 

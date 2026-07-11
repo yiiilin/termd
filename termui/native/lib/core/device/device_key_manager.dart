@@ -106,8 +106,57 @@ final class DeviceKeyManager {
   }
 
   Future<DevicePublicIdentity> rotateDevice() async {
-    await deleteDevice();
-    return loadOrCreateDevice();
+    final previousRecord = await _storage.read(SecureStorageKeys.deviceId);
+    final generated = await _generator.generate();
+    final nextRecord = _DeviceIdentityRecord(
+      publicIdentity: generated.publicIdentity,
+      signingKeySecret: generated.signingKeySecret,
+    );
+    _validateIdentityRecord(nextRecord);
+
+    try {
+      await _storage.write(
+        SecureStorageKeys.deviceId,
+        jsonEncode(nextRecord.toJson()),
+      );
+    } on Object catch (writeFailure, writeStackTrace) {
+      await _restorePreviousIdentityRecord(
+        previousRecord,
+        writeFailure,
+        writeStackTrace,
+      );
+      Error.throwWithStackTrace(writeFailure, writeStackTrace);
+    }
+
+    await _deleteLegacyComponentKeysBestEffort();
+
+    return generated.publicIdentity;
+  }
+
+  Future<void> _restorePreviousIdentityRecord(
+    String? previousRecord,
+    Object writeFailure,
+    StackTrace writeStackTrace,
+  ) async {
+    try {
+      final currentRecord = await _storage.read(SecureStorageKeys.deviceId);
+      if (currentRecord == previousRecord) {
+        return;
+      }
+
+      if (previousRecord == null) {
+        await _storage.delete(SecureStorageKeys.deviceId);
+      } else {
+        await _storage.write(SecureStorageKeys.deviceId, previousRecord);
+      }
+    } on Object catch (rollbackFailure, rollbackStackTrace) {
+      throw DeviceIdentityRotationUnrecoverable(
+        writeFailure: writeFailure,
+        writeStackTrace: writeStackTrace,
+        rollbackFailure: rollbackFailure,
+        rollbackStackTrace: rollbackStackTrace,
+      );
+    }
   }
 
   Future<DeviceSignature> signAuthInput(Uint8List canonicalInput) async {
@@ -130,7 +179,7 @@ final class DeviceKeyManager {
       final record = _DeviceIdentityRecord.fromJson(
         _decodeIdentityRecordJson(rawRecord),
       );
-      await _deleteLegacyComponentKeys();
+      await _deleteLegacyComponentKeysBestEffort();
       return record;
     }
 
@@ -176,6 +225,33 @@ final class DeviceKeyManager {
     await _storage.delete(SecureStorageKeys.devicePublicKey);
     await _storage.delete(SecureStorageKeys.deviceSigningKeySecret);
   }
+
+  Future<void> _deleteLegacyComponentKeysBestEffort() async {
+    // 有效版本化记录是权威身份；公开 API 无 warning 返回通道，遗留键清理失败
+    // 留待后续读取重试，不能阻断已提交身份的读取或报告轮换失败。
+    try {
+      await _deleteLegacyComponentKeys();
+    } on Object {
+      // Best-effort cleanup; the versioned record remains the identity source.
+    }
+  }
+}
+
+final class DeviceIdentityRotationUnrecoverable implements Exception {
+  const DeviceIdentityRotationUnrecoverable({
+    required this.writeFailure,
+    required this.writeStackTrace,
+    required this.rollbackFailure,
+    required this.rollbackStackTrace,
+  });
+
+  final Object writeFailure;
+  final StackTrace writeStackTrace;
+  final Object rollbackFailure;
+  final StackTrace rollbackStackTrace;
+
+  @override
+  String toString() => 'Device identity rotation could not be recovered.';
 }
 
 const _deviceIdentityRecordVersion = 1;

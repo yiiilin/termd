@@ -5,7 +5,7 @@ import { afterEach, vi } from "vitest";
 import WebSocket from "ws";
 
 // 单元测试在 Node/jsdom 中运行，使用 ws 提供真实 WebSocket，确保 DirectClient
-// 测试仍经过完整 E2EE wire 流程，而不是绕过协议状态机。
+// 测试经过当前明文 WebSocket wire 和协议状态机；HTTP E2EE 兼容路径另行测试。
 Object.assign(globalThis, { WebSocket });
 
 const nativeFetch = globalThis.fetch?.bind(globalThis);

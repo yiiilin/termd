@@ -1,5 +1,7 @@
 # Termui i18n and Theme Preferences
 
+> 历史状态提示：本文记录当时的计划/实现状态，不代表当前 0.6 协议契约；现行边界以 `TECH.md` 和 `docs/deployment.md` 为准。
+
 ## Goal
 
 实现 Web 客户端本地偏好设置：

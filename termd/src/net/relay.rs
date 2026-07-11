@@ -48,8 +48,9 @@ use crate::config::RelayReconnectConfig;
 #[cfg(test)]
 use super::protocol::ProtocolConnectionDebugTraffic;
 use super::protocol::{JsonEnvelope, ProtocolConnection, ProtocolError, ProtocolWireMessage};
-use super::server::SharedDaemonProtocol;
-use super::server::handle_http_tunnel_stream_request;
+use super::server::{
+    SharedDaemonProtocol, handle_http_tunnel_stream_request, handle_prepared_server_wire_message,
+};
 
 const OUTPUT_FLUSH_MAX_BYTES_PER_SESSION: usize = 512 * 1024;
 const MIN_RELAY_RETRY_DELAY_MS: u64 = 1;
@@ -1781,8 +1782,17 @@ async fn run_relay_established_data_connection(
                             let Some(connection) = connections.get_mut(&client_id) else {
                                 break Ok(RelayEstablishedDataEnd::SocketClosed);
                             };
-                            let mut protocol = protocol.lock().await;
-                            connection.handle_wire_message(&mut protocol, wire_message)
+                            match connection.prepare_wire_message(wire_message) {
+                                Ok(prepared) => {
+                                    handle_prepared_server_wire_message(
+                                        protocol.clone(),
+                                        connection,
+                                        prepared,
+                                    )
+                                    .await
+                                }
+                                Err(error) => vec![connection.wire_error_response(error)],
+                            }
                         };
                         if let Some(connection) = connections.get_mut(&client_id) {
                             queue_relay_deferred_output_wakeups(
@@ -3843,8 +3853,13 @@ async fn handle_mux_envelope(
                 let connection = connections
                     .get_mut(&client_id)
                     .expect("connection existence checked before frame parsing");
-                let mut protocol = protocol.lock().await;
-                connection.handle_wire_message(&mut protocol, frame)
+                match connection.prepare_wire_message(frame) {
+                    Ok(prepared) => {
+                        handle_prepared_server_wire_message(protocol.clone(), connection, prepared)
+                            .await
+                    }
+                    Err(error) => vec![connection.wire_error_response(error)],
+                }
             };
             trace!(
                 client_id = client_id.0,
@@ -4309,7 +4324,7 @@ async fn enqueue_relay_mux_envelopes(
     );
     let writer_queue = writer_queues.sender_for_kind(kind);
     if !kind.uses_data_lane() {
-        // 中文注释：control lane 承载 hello/e2ee/auth 等前置握手。relay 已经给 browser
+        // 中文注释：control lane 承载 route/hello/auth 等前置握手。relay 已经给 browser
         // 回了 route_ready，若这里继续 await 满队列，前端只会挂到 handshake timeout。
         // 队列满说明 daemon->relay mux 本地 writer 已不健康，快速失败后由外层重建 mux。
         // 入队成功也不能直接算握手成功：如果 writer 卡在旧输出里，browser 只会在
@@ -5841,6 +5856,8 @@ mod tests {
     use crate::net::protocol::{decode_payload, encrypted_frame_from_envelope, envelope_value};
     use crate::net::server::default_protocol;
     use crate::net::{E2eeKeyPair, E2eeSession, E2eeSessionContext, E2eeSessionRole};
+    use crate::pty::supervisor::SupervisorPtyBackend;
+    use crate::runtime::SessionRuntime;
     use crate::state::{DaemonState, StateStore, TrustedDeviceState};
     use axum::Json;
     use axum::extract::State;
@@ -5851,10 +5868,12 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use futures_util::StreamExt;
     use std::fs;
-    use std::path::PathBuf;
+    use std::future::Future;
+    use std::path::{Path, PathBuf};
     use std::sync::{
         Arc, Mutex,
         atomic::{AtomicU64, AtomicUsize, Ordering},
+        mpsc as std_mpsc,
     };
     use std::time::Duration;
     use std::{
@@ -5866,6 +5885,7 @@ mod tests {
         MetadataSubscribePayload, PingPayload, ProtocolVersion, RelayAdmissionPayload,
         RouteHelloPayload, RouteReadyPayload, RouteRole,
     };
+    use tokio::net::TcpListener;
     use tokio::sync::{Notify, mpsc, oneshot};
 
     static TEST_STATE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -6850,7 +6870,7 @@ mod tests {
         }
 
         // 中文注释：relay 已经给 browser 回了 route_ready；daemon 侧如果因为旧输出把
-        // hello/e2ee 卡在 control 队列里，前端只能等到握手超时。这里必须快速失败并重建 mux。
+        // route/hello/auth 卡在 control 队列里，前端只能等到握手超时。这里必须快速失败并重建 mux。
         let result = tokio::time::timeout(
             Duration::from_millis(100),
             enqueue_relay_mux_envelopes(
@@ -6909,12 +6929,116 @@ mod tests {
     }
 
     fn temp_state_path(name: &str) -> PathBuf {
-        let counter = TEST_STATE_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let state_dir = std::env::temp_dir().join(format!("tr-{}-{counter}", std::process::id()));
-        // supervisor runtime 目录由 state parent 推导；并行测试必须隔离 parent，避免互相清理 orphan。
-        // Unix socket 有较短路径长度限制，因此测试目录名必须保持紧凑。
-        fs::create_dir_all(&state_dir).unwrap();
-        state_dir.join(format!("{name}.json"))
+        loop {
+            let counter = TEST_STATE_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let state_dir =
+                std::env::temp_dir().join(format!("tr-{}-{counter}", std::process::id()));
+            // supervisor runtime 目录由 state parent 推导；并行测试必须隔离 parent，避免互相清理 orphan。
+            // create_dir 同时证明本进程新建并独占该路径，Drop cleanup 不会认领遗留目录。
+            match fs::create_dir(&state_dir) {
+                Ok(()) => return state_dir.join(format!("{name}.json")),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("failed to create relay test state directory: {error}"),
+            }
+        }
+    }
+
+    struct RelaySessionCleanup {
+        state_dir: PathBuf,
+        state_path: PathBuf,
+    }
+
+    impl RelaySessionCleanup {
+        fn new(name: &str) -> Self {
+            let state_path = temp_state_path(name);
+            let state_dir = state_path
+                .parent()
+                .expect("relay test state path should have a parent")
+                .to_path_buf();
+            Self {
+                state_dir,
+                state_path,
+            }
+        }
+
+        fn state_path(&self) -> &Path {
+            &self.state_path
+        }
+    }
+
+    impl Drop for RelaySessionCleanup {
+        fn drop(&mut self) {
+            if let Ok(state) = StateStore::load(&self.state_path) {
+                let backend = SupervisorPtyBackend::for_state_path(&self.state_path);
+                let mut runtime = SessionRuntime::new(backend);
+                for session in state
+                    .sessions
+                    .iter()
+                    .filter(|session| session.state == termd_proto::SessionState::Running)
+                {
+                    let session_id = session.session_id.0.to_string();
+                    if let Err(error) = runtime
+                        .reconnect_session(session)
+                        .and_then(|()| runtime.close(&session_id))
+                    {
+                        eprintln!(
+                            "failed to clean up relay test session {session_id} in {}: {error}",
+                            self.state_dir.display()
+                        );
+                    }
+                }
+            }
+            if let Err(error) = fs::remove_dir_all(&self.state_dir) {
+                eprintln!(
+                    "failed to remove relay test state directory {}: {error}",
+                    self.state_dir.display()
+                );
+            }
+        }
+    }
+
+    struct RelayConnectorGuard {
+        task: Option<tokio::task::JoinHandle<Result<(), RelayConnectorError>>>,
+        finished: std_mpsc::Receiver<()>,
+    }
+
+    impl RelayConnectorGuard {
+        fn spawn(
+            future: impl Future<Output = Result<(), RelayConnectorError>> + Send + 'static,
+        ) -> Self {
+            let (finished_tx, finished) = std_mpsc::channel();
+            let task = tokio::spawn(async move {
+                struct Finished(std_mpsc::Sender<()>);
+                impl Drop for Finished {
+                    fn drop(&mut self) {
+                        let _ = self.0.send(());
+                    }
+                }
+
+                let _finished = Finished(finished_tx);
+                future.await
+            });
+            Self {
+                task: Some(task),
+                finished,
+            }
+        }
+
+        async fn abort_and_wait(mut self) {
+            if let Some(task) = self.task.take() {
+                task.abort();
+                let _ = task.await;
+            }
+        }
+    }
+
+    impl Drop for RelayConnectorGuard {
+        fn drop(&mut self) {
+            if let Some(task) = self.task.take() {
+                task.abort();
+                let _ = self.finished.recv();
+            }
+        }
     }
 
     #[test]
@@ -8314,8 +8438,8 @@ mod tests {
 
         let server_key_exchange = {
             let protocol = protocol.lock().await;
-            // 中文注释：当前协议由 client 先发 E2EE key exchange；这个旧 mux 单测只需要
-            // daemon 的公开 E2EE 材料来构造测试 device 侧会话。
+            // 中文注释：这个旧 mux 单测覆盖 legacy WebSocket `encrypted_frame` 兼容路径，
+            // 因此仍用 daemon 的公开 E2EE 材料构造测试 device 侧会话。
             termd_proto::E2eeKeyExchangePayload::new(
                 protocol.server_id(),
                 termd_proto::DeviceId::new(),
@@ -8412,6 +8536,341 @@ mod tests {
         assert_eq!(accepted.server_id, server_key_exchange.server_id);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn slow_relay_pairing_via_mux_does_not_hold_protocol_mutex() {
+        let relay_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay_listener.local_addr().unwrap();
+        let request_seen = Arc::new(Notify::new());
+        let release_response = Arc::new(Notify::new());
+        let relay_task = {
+            let request_seen = request_seen.clone();
+            let release_response = release_response.clone();
+            tokio::spawn(async move {
+                let (mut socket, _) = relay_listener.accept().await.unwrap();
+                let mut request = vec![0_u8; 4096];
+                let read = socket.read(&mut request).await.unwrap();
+                assert!(read > 0);
+                request_seen.notify_one();
+                release_response.notified().await;
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await
+                    .unwrap();
+            })
+        };
+
+        let mut config = DaemonConfig::default_for_state_path(temp_state_path("mux-slow-pair"));
+        config.relay_endpoints = vec![format!("ws://{relay_addr}/ws")];
+        config.relay_daemon_token = Some(SecretString::new("mux-slow-relay-token"));
+        let protocol = default_protocol(config);
+        let client_id = RelayClientId(43);
+        let mut connections = HashMap::new();
+        let active_clients = test_active_clients();
+        handle_mux_envelope(
+            RelayMuxEnvelope::ClientConnected { client_id },
+            &protocol,
+            &mut connections,
+            &active_clients,
+        )
+        .await
+        .unwrap();
+
+        let (server_key_exchange, token) = {
+            let mut protocol = protocol.lock().await;
+            let server_key_exchange = termd_proto::E2eeKeyExchangePayload::new(
+                protocol.server_id(),
+                termd_proto::DeviceId::new(),
+                protocol.e2ee_public_key().to_wire_public_key(),
+                termd_proto::Nonce("mux-slow-daemon-e2ee".to_owned()),
+                current_unix_timestamp_millis(),
+            );
+            let token = protocol
+                .issue_pairing_token(current_unix_timestamp_millis())
+                .unwrap()
+                .token()
+                .clone();
+            (server_key_exchange, token)
+        };
+        let device_id = termd_proto::DeviceId::new();
+        let device_keypair = E2eeKeyPair::generate();
+        let server_e2ee_key =
+            crate::net::E2eePeerPublicKey::try_from(&server_key_exchange.public_key).unwrap();
+        let context = E2eeSessionContext::new(
+            server_key_exchange.server_id,
+            device_id,
+            server_e2ee_key,
+            device_keypair.public_key(),
+        );
+        let mut device_e2ee = E2eeSession::new(
+            E2eeSessionRole::Device,
+            &device_keypair,
+            server_e2ee_key,
+            context,
+        )
+        .unwrap();
+        let device_key_exchange = envelope_value(
+            MessageType::E2eeKeyExchange,
+            termd_proto::E2eeKeyExchangePayload::new(
+                server_key_exchange.server_id,
+                device_id,
+                device_keypair.public_key_wire(),
+                termd_proto::Nonce("mux-slow-device-e2ee".to_owned()),
+                current_unix_timestamp_millis(),
+            ),
+        )
+        .unwrap();
+        handle_mux_envelope(
+            RelayMuxEnvelope::ClientFrame {
+                client_id,
+                frame: json_to_mux_text(device_key_exchange),
+            },
+            &protocol,
+            &mut connections,
+            &active_clients,
+        )
+        .await
+        .unwrap();
+        let pair_request = envelope_value(
+            MessageType::PairRequest,
+            termd_proto::PairRequestPayload {
+                device_id,
+                device_public_key: test_device_public_key(31),
+                token: token.clone(),
+                nonce: termd_proto::Nonce("mux-slow-pairing".to_owned()),
+                timestamp_ms: current_unix_timestamp_millis(),
+            },
+        )
+        .unwrap();
+        let encrypted = envelope_value(
+            MessageType::EncryptedFrame,
+            device_e2ee.encrypt_json_payload(&pair_request).unwrap(),
+        )
+        .unwrap();
+        let pairing_task = {
+            let protocol = protocol.clone();
+            let active_clients = active_clients.clone();
+            tokio::spawn(async move {
+                let responses = handle_mux_envelope(
+                    RelayMuxEnvelope::ClientFrame {
+                        client_id,
+                        frame: json_to_mux_text(encrypted),
+                    },
+                    &protocol,
+                    &mut connections,
+                    &active_clients,
+                )
+                .await;
+                (responses, connections)
+            })
+        };
+
+        timeout(Duration::from_secs(2), request_seen.notified())
+            .await
+            .expect("relay registration request should arrive");
+        let mut protocol_guard = timeout(Duration::from_millis(100), protocol.lock())
+            .await
+            .expect("slow relay registration must not hold protocol mutex");
+        assert_eq!(
+            protocol_guard.server_id(),
+            protocol_guard.daemon_public_identity().server_id
+        );
+        let concurrent_device_id = termd_proto::DeviceId::new();
+        let concurrent_keypair = E2eeKeyPair::generate();
+        let (mut concurrent_connection, _) = protocol_guard.start_connection();
+        let handshake = envelope_value(
+            MessageType::E2eeKeyExchange,
+            termd_proto::E2eeKeyExchangePayload::new(
+                protocol_guard.server_id(),
+                concurrent_device_id,
+                concurrent_keypair.public_key_wire(),
+                termd_proto::Nonce("mux-concurrent-device-e2ee".to_owned()),
+                current_unix_timestamp_millis(),
+            ),
+        )
+        .unwrap();
+        assert!(
+            concurrent_connection
+                .handle_wire_message(&mut protocol_guard, ProtocolWireMessage::Json(handshake),)
+                .is_empty()
+        );
+        let concurrent_request = termd_proto::PairRequestPayload {
+            device_id: concurrent_device_id,
+            device_public_key: test_device_public_key(32),
+            token,
+            nonce: termd_proto::Nonce("mux-concurrent-pairing".to_owned()),
+            timestamp_ms: current_unix_timestamp_millis(),
+        };
+        assert!(
+            protocol_guard
+                .reserve_pair_request(&concurrent_connection, concurrent_request.clone())
+                .is_err(),
+            "the same token must not be concurrently double-reserved"
+        );
+        drop(protocol_guard);
+
+        pairing_task.abort();
+        match pairing_task.await {
+            Err(error) => assert!(error.is_cancelled()),
+            Ok(_) => panic!("mux pairing task should be cancelled"),
+        }
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let retry = {
+                    let mut protocol_guard = protocol.lock().await;
+                    protocol_guard
+                        .reserve_pair_request(&concurrent_connection, concurrent_request.clone())
+                };
+                if let Ok(pending) = retry {
+                    protocol.lock().await.release_pair_request(&pending);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("mux cancellation must release the token reservation");
+        release_response.notify_one();
+        relay_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_relay_pairing_via_mux_releases_token_for_retry() {
+        let relay_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay_listener.local_addr().unwrap();
+        let relay_task = tokio::spawn(async move {
+            for status in ["500 Internal Server Error", "200 OK"] {
+                let (mut socket, _) = relay_listener.accept().await.unwrap();
+                let mut request = vec![0_u8; 4096];
+                assert!(socket.read(&mut request).await.unwrap() > 0);
+                socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        let mut config = DaemonConfig::default_for_state_path(temp_state_path("mux-pair-retry"));
+        config.relay_endpoints = vec![format!("ws://{relay_addr}/ws")];
+        config.relay_daemon_token = Some(SecretString::new("mux-pair-retry-token"));
+        let protocol = default_protocol(config);
+        let active_clients = test_active_clients();
+        let token = protocol
+            .lock()
+            .await
+            .issue_pairing_token(current_unix_timestamp_millis())
+            .unwrap()
+            .token()
+            .0
+            .clone();
+        let server_key_exchange =
+            mux_test_daemon_key_exchange(&protocol, "mux-pair-retry-daemon").await;
+
+        let first_client = RelayClientId(44);
+        let mut first_connections = HashMap::new();
+        handle_mux_envelope(
+            RelayMuxEnvelope::ClientConnected {
+                client_id: first_client,
+            },
+            &protocol,
+            &mut first_connections,
+            &active_clients,
+        )
+        .await
+        .unwrap();
+        let failed = complete_pairing_via_mux(
+            &protocol,
+            &mut first_connections,
+            first_client,
+            server_key_exchange.clone(),
+            token.clone(),
+            &active_clients,
+        )
+        .await;
+        assert_eq!(failed.kind, MessageType::Error);
+
+        let retry_client = RelayClientId(45);
+        let mut retry_connections = HashMap::new();
+        handle_mux_envelope(
+            RelayMuxEnvelope::ClientConnected {
+                client_id: retry_client,
+            },
+            &protocol,
+            &mut retry_connections,
+            &active_clients,
+        )
+        .await
+        .unwrap();
+        let accepted = complete_pairing_via_mux(
+            &protocol,
+            &mut retry_connections,
+            retry_client,
+            server_key_exchange,
+            token,
+            &active_clients,
+        )
+        .await;
+        assert_eq!(accepted.kind, MessageType::PairAccept);
+        relay_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn relay_pairing_via_mux_cannot_commit_after_reservation_expires() {
+        let relay_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay_listener.local_addr().unwrap();
+        let relay_task = tokio::spawn(async move {
+            let (mut socket, _) = relay_listener.accept().await.unwrap();
+            let mut request = vec![0_u8; 4096];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let mut config = DaemonConfig::default_for_state_path(temp_state_path("mux-pair-expiry"));
+        config.relay_endpoints = vec![format!("ws://{relay_addr}/ws")];
+        config.relay_daemon_token = Some(SecretString::new("mux-pair-expiry-token"));
+        config.pairing_token_ttl_ms = 20;
+        let protocol = default_protocol(config);
+        let active_clients = test_active_clients();
+        let token = protocol
+            .lock()
+            .await
+            .issue_pairing_token(current_unix_timestamp_millis())
+            .unwrap()
+            .token()
+            .0
+            .clone();
+        let server_key_exchange =
+            mux_test_daemon_key_exchange(&protocol, "mux-pair-expiry-daemon").await;
+        let client_id = RelayClientId(46);
+        let mut connections = HashMap::new();
+        handle_mux_envelope(
+            RelayMuxEnvelope::ClientConnected { client_id },
+            &protocol,
+            &mut connections,
+            &active_clients,
+        )
+        .await
+        .unwrap();
+
+        let response = complete_pairing_via_mux(
+            &protocol,
+            &mut connections,
+            client_id,
+            server_key_exchange,
+            token,
+            &active_clients,
+        )
+        .await;
+        assert_eq!(response.kind, MessageType::Error);
+        relay_task.await.unwrap();
+    }
+
     #[tokio::test]
     async fn invalid_mux_client_frame_closes_only_that_client_connection() {
         let protocol = test_protocol("invalid-mux-frame");
@@ -8463,8 +8922,8 @@ mod tests {
 
         let server_key_exchange = {
             let protocol = protocol.lock().await;
-            // 中文注释：当前协议由 client 先发 E2EE key exchange；这里复用 daemon 公钥
-            // 作为测试 fixture，避免继续依赖旧的双初始帧假设。
+            // 中文注释：这里为 legacy WebSocket `encrypted_frame` 兼容测试复用 daemon 公钥，
+            // 不表示当前 Web WebSocket runtime 会执行 E2EE key exchange。
             termd_proto::E2eeKeyExchangePayload::new(
                 protocol.server_id(),
                 termd_proto::DeviceId::new(),
@@ -8497,11 +8956,12 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn relay_mux_pushes_session_output_without_client_pull_frame() {
-        let protocol = test_protocol("mux-output-push");
+        let cleanup = RelaySessionCleanup::new("mux-output-push");
+        let protocol = default_protocol(DaemonConfig::default_for_state_path(cleanup.state_path()));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let base = RelayBaseUrl::parse(&format!("ws://{addr}")).unwrap();
-        let connector = tokio::spawn(connect_relay_mux_base_once(
+        let connector = RelayConnectorGuard::spawn(connect_relay_mux_base_once(
             base,
             None,
             None,
@@ -8594,7 +9054,7 @@ mod tests {
                     command: vec![
                         "sh".to_owned(),
                         "-lc".to_owned(),
-                        "sleep 0.15; printf relay-pushed-output".to_owned(),
+                        "read watcher_ready; printf relay-pushed-output; cat".to_owned(),
                     ],
                     size: termd_proto::TerminalSize::default(),
                 },
@@ -8602,6 +9062,7 @@ mod tests {
             .unwrap(),
         )
         .await;
+
         let created =
             read_encrypted_daemon_frame(&mut relay_socket, client_id, &mut device_e2ee).await;
         assert_eq!(created.kind, MessageType::SessionCreated);
@@ -8612,6 +9073,21 @@ mod tests {
             client_id,
             &mut device_e2ee,
             created_payload.session_id,
+        )
+        .await;
+
+        send_encrypted_mux_client_json(
+            &mut relay_socket,
+            client_id,
+            &mut device_e2ee,
+            envelope_value(
+                MessageType::SessionData,
+                termd_proto::SessionDataPayload {
+                    session_id: created_payload.session_id,
+                    data_base64: general_purpose::STANDARD.encode(b"ready\n"),
+                },
+            )
+            .unwrap(),
         )
         .await;
 
@@ -8641,16 +9117,17 @@ mod tests {
             );
         }
 
-        connector.abort();
+        connector.abort_and_wait().await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn relay_mux_processes_new_client_while_output_writer_is_backpressured() {
-        let protocol = test_protocol("mux-backpressure-new-client");
+        let cleanup = RelaySessionCleanup::new("mux-backpressure-new-client");
+        let protocol = default_protocol(DaemonConfig::default_for_state_path(cleanup.state_path()));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let base = RelayBaseUrl::parse(&format!("ws://{addr}")).unwrap();
-        let connector = tokio::spawn(connect_relay_mux_base_once(
+        let connector = RelayConnectorGuard::spawn(connect_relay_mux_base_once(
             base,
             None,
             None,
@@ -8719,7 +9196,7 @@ mod tests {
                     command: vec![
                         "sh".to_owned(),
                         "-lc".to_owned(),
-                        "for i in $(seq 1 4096); do printf 'relay-backpressure-%04d-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\\n' \"$i\"; done".to_owned(),
+                        "read watcher_ready; for i in $(seq 1 4096); do printf 'relay-backpressure-%04d-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\\n' \"$i\"; done; cat".to_owned(),
                     ],
                     size: termd_proto::TerminalSize::default(),
                 },
@@ -8737,6 +9214,23 @@ mod tests {
             slow_client_id,
             &mut slow_e2ee,
             created_payload.session_id,
+        )
+        .await;
+
+        // create/scope grant 已返回后，同一 mux client 的下一条输入只会在 output watcher
+        // 注册完成后被处理，用可观测协议顺序启动输出，避免依赖 shell 启动速度。
+        send_encrypted_mux_client_json(
+            &mut relay_socket,
+            slow_client_id,
+            &mut slow_e2ee,
+            envelope_value(
+                MessageType::SessionData,
+                termd_proto::SessionDataPayload {
+                    session_id: created_payload.session_id,
+                    data_base64: general_purpose::STANDARD.encode(b"ready\n"),
+                },
+            )
+            .unwrap(),
         )
         .await;
 
@@ -8795,7 +9289,7 @@ mod tests {
         .expect("新 client 的 auth.challenge 不能被旧 client 的 terminal output 卡住");
         assert_eq!(auth_challenge.kind, MessageType::AuthChallenge);
 
-        connector.abort();
+        connector.abort_and_wait().await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -8809,15 +9303,15 @@ mod tests {
         fs::create_dir_all(&file_root).unwrap();
         fs::write(file_root.join("alpha.txt"), b"alpha\n").unwrap();
 
-        let mut config =
-            DaemonConfig::default_for_state_path(temp_state_path("mux-cwd-push-state"));
+        let cleanup = RelaySessionCleanup::new("mux-cwd-push-state");
+        let mut config = DaemonConfig::default_for_state_path(cleanup.state_path());
         // cwd 变化推送测试不能读取共享 `/tmp`，否则会和并行测试清理临时文件产生竞态。
         config.default_working_directory = Some(workspace_root.clone());
         let protocol = default_protocol(config);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let base = RelayBaseUrl::parse(&format!("ws://{addr}")).unwrap();
-        let connector = tokio::spawn(connect_relay_mux_base_once(
+        let connector = RelayConnectorGuard::spawn(connect_relay_mux_base_once(
             base,
             None,
             None,
@@ -8885,7 +9379,7 @@ mod tests {
                         "sh".to_owned(),
                         "-lc".to_owned(),
                         format!(
-                            "sleep 0.15; cd {}; printf cwd-moved; sleep 2",
+                            "read watcher_ready; cd {}; printf cwd-moved; cat",
                             file_root.to_string_lossy()
                         ),
                     ],
@@ -8926,6 +9420,21 @@ mod tests {
             read_encrypted_daemon_frame(&mut relay_socket, client_id, &mut device_e2ee).await;
         assert_eq!(initial_files.kind, MessageType::SessionFilesResult);
 
+        send_encrypted_mux_client_json(
+            &mut relay_socket,
+            client_id,
+            &mut device_e2ee,
+            envelope_value(
+                MessageType::SessionData,
+                termd_proto::SessionDataPayload {
+                    session_id: created_payload.session_id,
+                    data_base64: general_purpose::STANDARD.encode(b"ready\n"),
+                },
+            )
+            .unwrap(),
+        )
+        .await;
+
         // 中文注释：新模型下 relay 只会收到 cwd 变化轻事件；真正文件树内容要由
         // client 收到事件后主动再拉一次 `session.files`。
         let pushed = tokio::time::timeout(
@@ -8943,7 +9452,7 @@ mod tests {
 
         fs::remove_dir_all(workspace_root).ok();
 
-        connector.abort();
+        connector.abort_and_wait().await;
     }
 
     async fn complete_pairing_via_mux(
@@ -9033,8 +9542,8 @@ mod tests {
         nonce: &str,
     ) -> termd_proto::E2eeKeyExchangePayload {
         let protocol = protocol.lock().await;
-        // 中文注释：当前协议由 client 先发 E2EE key exchange；daemon 初始帧只发送 hello。
-        // socket 级 mux 测试仍需要 daemon 公钥来构造加密会话，因此从测试 protocol fixture 取。
+        // 中文注释：socket 级旧 mux 测试覆盖 legacy WebSocket `encrypted_frame` 兼容路径，
+        // 因此仍从 protocol fixture 取 daemon 公钥来构造加密会话。
         termd_proto::E2eeKeyExchangePayload::new(
             protocol.server_id(),
             termd_proto::DeviceId::new(),

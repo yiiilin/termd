@@ -1,5 +1,7 @@
 # Supervisor Final Cleanup Plan
 
+> 历史状态提示：本文记录当时的计划/实现状态，不代表当前 0.6 协议契约；现行边界以 `TECH.md` 和 `docs/deployment.md` 为准。
+
 **Goal:** 清理 supervisor-only 重构后仍残留的 tmux / xterm / 旧终端语义口径，让当前代码库的生产路径、测试命名和对外技术文档重新对齐到 “supervisor 是唯一终端事实源，Ghostty 是唯一 Web terminal renderer，relay/termd 只做 workspace 和 opaque forwarding”。
 
 **Scope boundary:**

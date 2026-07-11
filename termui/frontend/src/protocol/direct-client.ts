@@ -166,13 +166,21 @@ interface PendingRequest {
 }
 
 interface QueuedInnerWaiter {
-  resolve: (envelope: Envelope) => void;
+  retainReservation: boolean;
+  deadlineMs?: number;
+  resolve: (inner: QueuedInner) => void;
   reject: (error: Error) => void;
+}
+
+interface QueuedInner {
+  envelope: Envelope;
+  bytes: number;
 }
 
 type DirectClientPhase = "connecting" | "ready" | "authenticated" | "terminal_stream_open" | "closed";
 
-const E2EE_READY_PACKET_METHODS = new Set(["pair.request", "auth", "auth.verify"]);
+// `ready` 表示当前明文 WebSocket packet 的 route/hello handshake 已完成，不表示 E2EE。
+const HANDSHAKE_READY_PACKET_METHODS = new Set(["pair.request", "auth", "auth.verify"]);
 
 interface TerminalStreamState {
   sessionId: UUID;
@@ -282,6 +290,10 @@ const HTTP_CONTROL_METHODS_REQUIRING_SESSION_SCOPE = new Set([
   "session.file_download_prepare",
   "session.file_download_chunk",
 ]);
+const SOCKET_INBOX_MAX_MESSAGES = 256;
+const SOCKET_INBOX_MAX_BYTES = 4 * 1024 * 1024;
+const PENDING_INNER_MAX_MESSAGES = 1024;
+const PENDING_INNER_MAX_BYTES = 16 * 1024 * 1024;
 
 export { ProtocolClientError };
 
@@ -294,6 +306,9 @@ export class DirectClient {
   private receivePumpStarted = false;
   private readonly pendingRequests = new Map<UUID, PendingRequest>();
   private readonly pendingInner: Envelope[] = [];
+  private readonly pendingInnerSizes: number[] = [];
+  private pendingInnerReservedMessages = 0;
+  private pendingInnerBytes = 0;
   private readonly innerWaiters: QueuedInnerWaiter[] = [];
   private readonly terminalStreamsBySession = new Map<UUID, TerminalStreamState>();
   private readonly terminalStreamsById = new Map<PacketStreamId, TerminalStreamState>();
@@ -375,7 +390,7 @@ export class DirectClient {
     devicePublicKey: PublicKeyWire,
     device?: Pick<DeviceState, "device_id" | "device_public_key" | "device_signing_key_secret" | "name">,
   ): Promise<PairAcceptPayload> {
-    this.requireE2eeReady();
+    this.requireHandshakeReady();
     const accepted = await this.request<PairAcceptPayload>("pair.request", {
       device_id: this.deviceId,
       device_public_key: devicePublicKey,
@@ -409,7 +424,7 @@ export class DirectClient {
     server: PairedServerState,
     options: DirectClientAuthenticateOptions = {},
   ): Promise<void> {
-    this.requireE2eeReady();
+    this.requireHandshakeReady();
     const challenge = await this.expectQueuedPayload<AuthChallengePayload>("auth_challenge", this.authTimeoutMs);
     const auth = await signAuthPayload(
       authPayloadForChallenge(device.device_id, challenge.challenge),
@@ -1462,8 +1477,8 @@ export class DirectClient {
     timeoutMs = this.timeoutMs,
     signal?: AbortSignal,
   ): Promise<T> {
-    if (E2EE_READY_PACKET_METHODS.has(method)) {
-      this.requireE2eeReady();
+    if (HANDSHAKE_READY_PACKET_METHODS.has(method)) {
+      this.requireHandshakeReady();
     } else {
       this.requireAuthenticated();
     }
@@ -1773,12 +1788,26 @@ export class DirectClient {
   }
 
   async receiveInner(): Promise<Envelope> {
+    return (await this.receiveQueuedInner(false)).envelope;
+  }
+
+  private async receiveQueuedInner(retainReservation: boolean, deadlineMs?: number): Promise<QueuedInner> {
+    if (deadlineMs !== undefined && nowMs() >= deadlineMs) {
+      throw new ProtocolClientError("response_timeout", "operation timed out");
+    }
     const pending = this.pendingInner.shift();
     if (pending) {
+      const bytes = this.pendingInnerSizes.shift() ?? estimateEnvelopeBytes(pending);
+      if (!retainReservation) {
+        this.releasePendingInnerReservation(1, bytes);
+      }
       if (pending.type === "error") {
+        if (retainReservation) {
+          this.releasePendingInnerReservation(1, bytes);
+        }
         throw protocolError(pending.payload as ErrorPayload);
       }
-      return pending;
+      return { envelope: pending, bytes };
     }
     if (this.closed || this.phase === "closed") {
       // 中文注释：receive pump 可能在 UI 消费 backlog 期间已经关闭连接；
@@ -1786,18 +1815,61 @@ export class DirectClient {
       throw this.connectionClosedError();
     }
 
-    return new Promise((resolve, reject) => {
-      this.innerWaiters.push({
+    const queued = await new Promise<QueuedInner>((resolve, reject) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const waiter: QueuedInnerWaiter = {
+        retainReservation,
+        deadlineMs,
         resolve: (inner) => {
-          if (inner.type === "error") {
-            reject(protocolError(inner.payload as ErrorPayload));
-            return;
+          if (timer !== undefined) {
+            clearTimeout(timer);
           }
           resolve(inner);
         },
-        reject,
-      });
+        reject: (error) => {
+          if (timer !== undefined) {
+            clearTimeout(timer);
+          }
+          reject(error);
+        },
+      };
+      this.innerWaiters.push(waiter);
+      if (deadlineMs !== undefined) {
+        timer = setTimeout(() => {
+          const index = this.innerWaiters.indexOf(waiter);
+          if (index < 0) {
+            return;
+          }
+          this.innerWaiters.splice(index, 1);
+          waiter.reject(new ProtocolClientError("response_timeout", "operation timed out"));
+        }, Math.max(0, deadlineMs - nowMs()));
+      }
     });
+    if (queued.envelope.type === "error") {
+      if (retainReservation) {
+        this.releasePendingInnerReservation(1, queued.bytes);
+      }
+      throw protocolError(queued.envelope.payload as ErrorPayload);
+    }
+    return queued;
+  }
+
+  private releasePendingInnerReservation(messages: number, bytes: number): void {
+    this.pendingInnerReservedMessages = Math.max(0, this.pendingInnerReservedMessages - messages);
+    this.pendingInnerBytes = subtractEstimatedBytes(this.pendingInnerBytes, bytes);
+  }
+
+  private reservePendingInner(bytes: number): void {
+    this.pendingInnerReservedMessages += 1;
+    this.pendingInnerBytes = addEstimatedBytes(this.pendingInnerBytes, bytes);
+  }
+
+  private restoreBufferedInner(buffered: QueuedInner[]): void {
+    if (buffered.length === 0) {
+      return;
+    }
+    this.pendingInner.unshift(...buffered.map((inner) => inner.envelope));
+    this.pendingInnerSizes.unshift(...buffered.map((inner) => inner.bytes));
   }
 
   detachSession(sessionId: UUID, reason = "client_detached"): void {
@@ -1936,6 +2008,7 @@ export class DirectClient {
       processedMessages,
       processedBytes,
       pendingInner: this.pendingInner.length,
+      pendingInnerBytes: this.pendingInnerBytes,
       pendingRequests: this.pendingRequests.size,
       terminalStreams: this.terminalStreamsById.size,
       fileStreams: this.fileStreamsById.size,
@@ -2162,33 +2235,30 @@ export class DirectClient {
   }
 
   private async expectQueuedPayload<T>(expectedType: Envelope["type"], timeoutMs = this.timeoutMs): Promise<T> {
-    const buffered: Envelope[] = [];
+    const buffered: QueuedInner[] = [];
+    const deadlineMs = nowMs() + timeoutMs;
     try {
       while (true) {
-        let inner;
-        try {
-          inner = await withTimeout(this.receiveInner(), timeoutMs, "response_timeout");
-        } catch (error) {
-          if (error instanceof ProtocolClientError && error.code === "response_timeout") {
-            recordProtocolTimeout({
-              layer: "client",
-              phase: "queued_payload",
-              transport: "websocket",
-              timeout_code: error.code,
-              timeout_ms: timeoutMs,
-            });
-          }
-          throw error;
+        const queued = await this.receiveQueuedInner(true, deadlineMs);
+        if (queued.envelope.type === expectedType) {
+          this.releasePendingInnerReservation(1, queued.bytes);
+          return queued.envelope.payload as T;
         }
-        if (inner.type === expectedType) {
-          return inner.payload as T;
-        }
-        buffered.push(inner);
+        buffered.push(queued);
       }
+    } catch (error) {
+      if (error instanceof ProtocolClientError && error.code === "response_timeout") {
+        recordProtocolTimeout({
+          layer: "client",
+          phase: "queued_payload",
+          transport: "websocket",
+          timeout_code: error.code,
+          timeout_ms: timeoutMs,
+        });
+      }
+      throw error;
     } finally {
-      for (const inner of buffered) {
-        this.enqueueInner(inner);
-      }
+      this.restoreBufferedInner(buffered);
     }
   }
 
@@ -2301,7 +2371,7 @@ export class DirectClient {
     }
   }
 
-  private requireE2eeReady(): void {
+  private requireHandshakeReady(): void {
     this.requireOpen();
     if (this.phase !== "ready") {
       throw new ProtocolClientError("invalid_state", "client is not ready for pairing or authentication");
@@ -2409,40 +2479,105 @@ export class DirectClient {
   }
 
   private enqueueInner(inner: Envelope): void {
-    const waiter = this.innerWaiters.shift();
+    if (this.closed || this.phase === "closed") {
+      return;
+    }
+    let waiter = this.innerWaiters[0];
+    while (waiter?.deadlineMs !== undefined && nowMs() >= waiter.deadlineMs) {
+      this.innerWaiters.shift();
+      waiter.reject(new ProtocolClientError("response_timeout", "operation timed out"));
+      waiter = this.innerWaiters[0];
+    }
     if (waiter) {
-      waiter.resolve(inner);
+      if (waiter.retainReservation) {
+        const bytes = estimateEnvelopeBytes(inner);
+        if (!this.hasPendingInnerBudget(1, bytes)) {
+          this.closeForInboundQueueOverflow();
+          return;
+        }
+        this.reservePendingInner(bytes);
+        this.innerWaiters.shift();
+        waiter.resolve({ envelope: inner, bytes });
+      } else {
+        this.innerWaiters.shift();
+        waiter.resolve({ envelope: inner, bytes: 0 });
+      }
+      return;
+    }
+    const bytes = estimateEnvelopeBytes(inner);
+    if (!this.hasPendingInnerBudget(1, bytes)) {
+      this.closeForInboundQueueOverflow();
       return;
     }
     this.pendingInner.push(inner);
+    this.pendingInnerSizes.push(bytes);
+    this.reservePendingInner(bytes);
+  }
+
+  private hasPendingInnerBudget(additionalMessages: number, additionalBytes: number): boolean {
+    const safeAdditionalBytes = normalizeEstimatedBytes(additionalBytes);
+    return (
+      Number.isFinite(this.pendingInnerBytes) &&
+      this.pendingInnerBytes >= 0 &&
+      this.pendingInnerReservedMessages + additionalMessages <= PENDING_INNER_MAX_MESSAGES &&
+      addEstimatedBytes(this.pendingInnerBytes, safeAdditionalBytes) <= PENDING_INNER_MAX_BYTES
+    );
   }
 
   private discardQueuedTerminalOutput(streamId: PacketStreamId, sessionId: UUID): void {
     if (this.pendingInner.length === 0) {
       return;
     }
-    const retained = this.pendingInner.filter((inner) => !this.isTerminalOutputForStream(inner, streamId, sessionId));
-    if (retained.length === this.pendingInner.length) {
-      return;
-    }
-    this.pendingInner.splice(0, this.pendingInner.length, ...retained);
+    this.discardPendingInner((inner) => this.isTerminalOutputForStream(inner, streamId, sessionId));
   }
 
   private discardQueuedTerminalOutputByStream(streamId: PacketStreamId): void {
     if (this.pendingInner.length === 0) {
       return;
     }
-    const retained = this.pendingInner.filter((inner) => {
+    this.discardPendingInner((inner) => {
       if (inner.type !== "attach_frame") {
-        return true;
+        return false;
       }
       const payload = inner.payload as { stream_id?: unknown };
-      return payload.stream_id !== streamId;
+      return payload.stream_id === streamId;
     });
-    if (retained.length === this.pendingInner.length) {
+  }
+
+  private discardPendingInner(shouldDiscard: (inner: Envelope) => boolean): void {
+    const retainedInner: Envelope[] = [];
+    const retainedSizes: number[] = [];
+    let discardedMessages = 0;
+    let discardedBytes = 0;
+    for (let index = 0; index < this.pendingInner.length; index += 1) {
+      const inner = this.pendingInner[index];
+      const bytes = this.pendingInnerSizes[index] ?? estimateEnvelopeBytes(inner);
+      if (shouldDiscard(inner)) {
+        discardedMessages += 1;
+        discardedBytes += bytes;
+      } else {
+        retainedInner.push(inner);
+        retainedSizes.push(bytes);
+      }
+    }
+    if (discardedMessages === 0) {
       return;
     }
-    this.pendingInner.splice(0, this.pendingInner.length, ...retained);
+    this.pendingInner.splice(0, this.pendingInner.length, ...retainedInner);
+    this.pendingInnerSizes.splice(0, this.pendingInnerSizes.length, ...retainedSizes);
+    this.releasePendingInnerReservation(discardedMessages, discardedBytes);
+  }
+
+  private closeForInboundQueueOverflow(): void {
+    const error = new ProtocolClientError("connection_error", "inbound message queue overflow");
+    this.closedError ??= error;
+    this.closed = true;
+    this.phase = "closed";
+    this.rejectPendingRequests(error);
+    this.rejectInnerWaiters(error);
+    this.rejectFileStreams(error);
+    this.socket.close();
+    this.inbox.rejectPending(error);
   }
 
   private isTerminalOutputForStream(inner: Envelope, streamId: PacketStreamId, sessionId: UUID): boolean {
@@ -2566,17 +2701,166 @@ export class DirectClient {
   }
 }
 
+function estimateQueuedMessageBytes(message: QueuedMessage): number {
+  try {
+    if (message.binary) {
+      return normalizeEstimatedBytes(message.binary.byteLength);
+    }
+    if (message.envelope) {
+      return estimateEnvelopeBytes(message.envelope);
+    }
+    return 0;
+  } catch {
+    return ESTIMATE_FAILURE_BYTES;
+  }
+}
+
+function estimateEnvelopeBytes(inner: Envelope): number {
+  try {
+    return normalizeEstimatedBytes(estimateUnknownBytes(inner));
+  } catch {
+    return ESTIMATE_FAILURE_BYTES;
+  }
+}
+
+const ESTIMATE_FAILURE_BYTES = PENDING_INNER_MAX_BYTES + 1;
+const ARRAY_BUFFER_BYTE_LENGTH_GETTER = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, "byteLength")?.get;
+const SHARED_ARRAY_BUFFER_BYTE_LENGTH_GETTER = typeof SharedArrayBuffer === "undefined"
+  ? undefined
+  : Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, "byteLength")?.get;
+
+function normalizeEstimatedBytes(bytes: unknown): number {
+  if (typeof bytes !== "number" || !Number.isFinite(bytes) || bytes < 0) {
+    return ESTIMATE_FAILURE_BYTES;
+  }
+  return Math.min(bytes, ESTIMATE_FAILURE_BYTES);
+}
+
+function addEstimatedBytes(left: number, right: number): number {
+  const safeLeft = normalizeEstimatedBytes(left);
+  const safeRight = normalizeEstimatedBytes(right);
+  if (safeLeft >= ESTIMATE_FAILURE_BYTES || safeRight >= ESTIMATE_FAILURE_BYTES) {
+    return ESTIMATE_FAILURE_BYTES;
+  }
+  return normalizeEstimatedBytes(safeLeft + safeRight);
+}
+
+function subtractEstimatedBytes(total: number, released: number): number {
+  const safeTotal = normalizeEstimatedBytes(total);
+  const safeReleased = normalizeEstimatedBytes(released);
+  if (safeTotal >= ESTIMATE_FAILURE_BYTES || safeReleased >= ESTIMATE_FAILURE_BYTES) {
+    return ESTIMATE_FAILURE_BYTES;
+  }
+  return Math.max(0, safeTotal - safeReleased);
+}
+
+function estimateUnknownBytes(value: unknown, seen: WeakSet<object> = new WeakSet()): number {
+  try {
+    if (typeof value === "string") {
+      return estimateStringBytes(value);
+    }
+    if (typeof value === "bigint") {
+      return estimateStringBytes(value.toString());
+    }
+    if (value === null || value === undefined) {
+      return estimateStringBytes(String(value));
+    }
+    if (typeof value === "number" || typeof value === "boolean" || typeof value === "symbol" || typeof value === "function") {
+      return estimateStringBytes(String(value));
+    }
+    if (typeof Blob !== "undefined" && value instanceof Blob) {
+      return normalizeEstimatedBytes(value.size);
+    }
+    if (ArrayBuffer.isView(value)) {
+      return estimateArrayBufferBytes(value.buffer) ?? ESTIMATE_FAILURE_BYTES;
+    }
+    const arrayBufferBytes = estimateArrayBufferBytes(value);
+    if (arrayBufferBytes !== undefined) {
+      return arrayBufferBytes;
+    }
+    if (!value || typeof value !== "object") {
+      return 0;
+    }
+    if (seen.has(value)) {
+      return estimateStringBytes("[Circular]");
+    }
+    seen.add(value);
+    if (Array.isArray(value)) {
+      let bytes = 2;
+      for (const item of value) {
+        bytes = addEstimatedBytes(bytes, estimateUnknownBytes(item, seen));
+        bytes = addEstimatedBytes(bytes, 1);
+      }
+      return bytes;
+    }
+    return estimateObjectBytes(value as Record<string, unknown>, seen);
+  } catch {
+    return ESTIMATE_FAILURE_BYTES;
+  }
+}
+
+function estimateStringBytes(value: string): number {
+  try {
+    return normalizeEstimatedBytes(Math.max(encodeUtf8(value).byteLength, value.length * 2));
+  } catch {
+    return ESTIMATE_FAILURE_BYTES;
+  }
+}
+
+function estimateArrayBufferBytes(value: unknown): number | undefined {
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
+  if (ARRAY_BUFFER_BYTE_LENGTH_GETTER) {
+    try {
+      return normalizeEstimatedBytes(ARRAY_BUFFER_BYTE_LENGTH_GETTER.call(value));
+    } catch {
+      // 继续尝试 SharedArrayBuffer 的内部槽 getter。
+    }
+  }
+  if (SHARED_ARRAY_BUFFER_BYTE_LENGTH_GETTER) {
+    try {
+      return normalizeEstimatedBytes(SHARED_ARRAY_BUFFER_BYTE_LENGTH_GETTER.call(value));
+    } catch {
+      // 伪造 tag 的普通对象在下面按保守失败值处理。
+    }
+  }
+  try {
+    const tag = Object.prototype.toString.call(value);
+    return tag === "[object ArrayBuffer]" || tag === "[object SharedArrayBuffer]"
+      ? ESTIMATE_FAILURE_BYTES
+      : undefined;
+  } catch {
+    return ESTIMATE_FAILURE_BYTES;
+  }
+}
+
+function estimateObjectBytes(value: Record<string, unknown>, seen: WeakSet<object>): number {
+  try {
+    let bytes = 2;
+    for (const [key, child] of Object.entries(value)) {
+      bytes = addEstimatedBytes(bytes, estimateStringBytes(key));
+      bytes = addEstimatedBytes(bytes, estimateUnknownBytes(child, seen));
+      bytes = addEstimatedBytes(bytes, 4);
+    }
+    return bytes;
+  } catch {
+    return ESTIMATE_FAILURE_BYTES;
+  }
+}
+
 class SocketInbox {
   private readonly queue: QueuedMessage[] = [];
   private readonly waiters: Array<(message: QueuedMessage) => void> = [];
   private readonly errors: Array<(error: Error) => void> = [];
+  private queuedBytes = 0;
   private closedError: Error | undefined;
 
   constructor(
     private readonly socket: WebSocket,
     private readonly diagnostics?: DirectClientDiagnosticsContext,
   ) {
-    // 监听器必须在等待 open 前注册；route_ready 和后续 hello/E2EE 可能会连续到达。
+    // 监听器必须在等待 open 前注册；route_ready 和后续 hello 可能会连续到达。
     this.socket.addEventListener("message", (event) => {
       void this.enqueueMessage(event.data);
     });
@@ -2609,7 +2893,9 @@ class SocketInbox {
 
   read(): Promise<QueuedMessage> {
     if (this.queue.length > 0) {
-      return Promise.resolve(this.queue.shift()!);
+      const message = this.queue.shift()!;
+      this.queuedBytes = Math.max(0, this.queuedBytes - estimateQueuedMessageBytes(message));
+      return Promise.resolve(message);
     }
     if (this.closedError) {
       return this.rejectedRead(this.closedError);
@@ -2645,20 +2931,40 @@ class SocketInbox {
   }
 
   private async enqueueMessage(data: unknown): Promise<void> {
+    if (this.closedError) {
+      return;
+    }
     try {
       const message = typeof data === "string"
         ? { envelope: parseEnvelope(await messageDataToText(data)) }
         : { binary: await messageDataToBytes(data) };
+      if (this.closedError) {
+        return;
+      }
       const waiter = this.waiters.shift();
       this.errors.shift();
       if (waiter) {
         waiter(message);
       } else {
+        const bytes = estimateQueuedMessageBytes(message);
+        if (
+          this.queue.length + 1 > SOCKET_INBOX_MAX_MESSAGES ||
+          this.queuedBytes + bytes > SOCKET_INBOX_MAX_BYTES
+        ) {
+          this.closeForInboundQueueOverflow();
+          return;
+        }
         this.queue.push(message);
+        this.queuedBytes += bytes;
       }
     } catch (error) {
       this.rejectPending(error instanceof Error ? error : new Error("invalid_envelope"));
     }
+  }
+
+  private closeForInboundQueueOverflow(): void {
+    this.rejectPending(new ProtocolClientError("connection_error", "inbound message queue overflow"));
+    this.socket.close();
   }
 
   private rejectedRead(error: Error): Promise<QueuedMessage> {
@@ -2673,5 +2979,9 @@ class SocketInbox {
 // 中文注释：只给 Vitest 覆盖传输层边界条件使用；业务代码不应依赖这些内部类型。
 export const __directClientTestInternals = {
   SocketInbox,
+  SOCKET_INBOX_MAX_MESSAGES,
+  SOCKET_INBOX_MAX_BYTES,
+  PENDING_INNER_MAX_MESSAGES,
+  PENDING_INNER_MAX_BYTES,
   onReceivePumpYield: undefined as undefined | (() => void),
 };

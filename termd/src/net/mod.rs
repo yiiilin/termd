@@ -1,7 +1,9 @@
-//! termd 的端到端加密传输边界。
+//! termd 的 E2EE 兼容实现。
 //!
-//! 本模块只负责已认证 daemon 与设备之间的会话密钥派生、帧加密、帧解密和序号防重放。
-//! 它不做 pairing、challenge-response、operator 决策，也不让 relay 接触明文业务内容。
+//! 本模块负责旧 WebSocket `encrypted_frame` 和现有 HTTP E2EE 兼容路径所需的会话密钥派生、
+//! 帧加解密与序号防重放。当前 Web WebSocket runtime 不发送 `e2ee_key_exchange` 或
+//! `encrypted_frame`；trusted relay 可以看到 TLS 终止后的明文应用流量。pairing、
+//! challenge-response、operator 和 session 权限仍由 daemon 的上层协议逻辑校验。
 
 pub mod protocol;
 pub mod pty_bridge;
