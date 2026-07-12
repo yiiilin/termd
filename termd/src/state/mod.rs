@@ -17,7 +17,7 @@ use std::io;
 #[cfg(unix)]
 use std::os::unix::{
     ffi::OsStrExt,
-    fs::{MetadataExt, OpenOptionsExt},
+    fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     io::{AsRawFd, FromRawFd},
 };
 #[cfg(unix)]
@@ -44,6 +44,9 @@ const META_DAEMON_PRIVATE_KEY: &str = "daemon_private_key";
 const SQLITE_PRIVATE_FILE_MODE: u32 = 0o600;
 #[cfg(unix)]
 const SQLITE_PRIVATE_DIRECTORY_MODE: u32 = 0o700;
+#[cfg(all(test, unix))]
+static SQLITE_PATH_DELETE_AFTER_METADATA_FOR_TEST: std::sync::Mutex<Option<PathBuf>> =
+    std::sync::Mutex::new(None);
 
 /// daemon 身份的本地持久快照。
 ///
@@ -557,10 +560,11 @@ fn open_state_connection(sqlite_path: &Path) -> Result<Connection, StateError> {
     {
         let sqlite_path = absolute_state_path(sqlite_path)?;
         let secure_open = prepare_secure_sqlite_file_for_open(&sqlite_path)?;
+        verify_secure_sqlite_open(&sqlite_path, &secure_open)?;
+        drop(secure_open);
         #[cfg(test)]
         change_current_dir_after_secure_prepare_for_test();
         let conn = open_sqlite_connection(&sqlite_path)?;
-        verify_secure_sqlite_open(&sqlite_path, &secure_open)?;
 
         // SQLite 管理 WAL/SHM 的内部创建与替换；私有且不可被其他 UID 写入的父目录
         // 是 sidecar 的边界。这里不声称抵御同 UID 或 root 进程，也不增加自定义 VFS。
@@ -607,7 +611,8 @@ fn sqlite_open_flags() -> OpenFlags {
 
 #[cfg(unix)]
 struct SecureSqliteOpen {
-    database: fs::File,
+    database_dev: u64,
+    database_ino: u64,
     parent: fs::File,
     parent_path: PathBuf,
 }
@@ -615,18 +620,25 @@ struct SecureSqliteOpen {
 #[cfg(unix)]
 fn prepare_secure_sqlite_file_for_open(sqlite_path: &Path) -> Result<SecureSqliteOpen, StateError> {
     let (parent_path, parent) = open_private_sqlite_parent(sqlite_path)?;
-    let file = match create_secure_sqlite_file(&parent, sqlite_path) {
-        Ok(file) => file,
+    let (database_dev, database_ino) = match create_secure_sqlite_file(&parent, sqlite_path) {
+        Ok(file) => {
+            secure_opened_sqlite_file(sqlite_path, &file)?;
+            verify_path_identity(sqlite_path, &file, false)?;
+            let metadata = file
+                .metadata()
+                .map_err(|source| sqlite_file_open_error(sqlite_path, source))?;
+            (metadata.dev(), metadata.ino())
+        }
         Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
-            open_sqlite_file_nofollow(&parent, sqlite_path)?
+            secure_existing_sqlite_path(sqlite_path)?
         }
         Err(source) => return Err(sqlite_file_open_error(sqlite_path, source)),
     };
-    secure_opened_sqlite_file(sqlite_path, &file)?;
-    secure_existing_sqlite_sidecars(sqlite_path, &parent)?;
+    secure_existing_sqlite_sidecars(sqlite_path)?;
     verify_path_identity(&parent_path, &parent, true)?;
     Ok(SecureSqliteOpen {
-        database: file,
+        database_dev,
+        database_ino,
         parent,
         parent_path,
     })
@@ -804,7 +816,7 @@ fn create_secure_sqlite_file(parent: &fs::File, path: &Path) -> io::Result<fs::F
     )
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 fn open_sqlite_file_nofollow(parent: &fs::File, path: &Path) -> Result<fs::File, StateError> {
     openat_file(
         parent,
@@ -848,26 +860,87 @@ fn sqlite_file_name(path: &Path) -> io::Result<&OsStr> {
 }
 
 #[cfg(unix)]
-fn secure_existing_sqlite_sidecars(
-    sqlite_path: &Path,
-    parent: &fs::File,
-) -> Result<(), StateError> {
+fn secure_existing_sqlite_sidecars(sqlite_path: &Path) -> Result<(), StateError> {
     for suffix in ["-wal", "-shm"] {
         let mut sidecar = sqlite_path.as_os_str().to_os_string();
         sidecar.push(suffix);
         let sidecar = PathBuf::from(sidecar);
-        let file = match open_sqlite_file_nofollow(parent, &sidecar) {
-            Ok(file) => file,
-            Err(StateError::RestrictSqlitePermissions { source, .. })
-                if source.kind() == io::ErrorKind::NotFound =>
-            {
-                continue;
-            }
-            Err(error) => return Err(error),
-        };
-        secure_opened_sqlite_file(&sidecar, &file)?;
+        match fs::symlink_metadata(&sidecar) {
+            Ok(_) => match secure_existing_sqlite_path(&sidecar) {
+                Ok(_) => {}
+                Err(StateError::RestrictSqlitePermissions { source, .. })
+                    if source.kind() == io::ErrorKind::NotFound =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            },
+            Err(source) if source.kind() == io::ErrorKind::NotFound => continue,
+            Err(source) => return Err(sqlite_file_open_error(&sidecar, source)),
+        }
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn secure_existing_sqlite_path(path: &Path) -> Result<(u64, u64), StateError> {
+    let metadata =
+        fs::symlink_metadata(path).map_err(|source| sqlite_file_open_error(path, source))?;
+    if metadata.file_type().is_symlink() {
+        return Err(StateError::UnsafeSqlitePath {
+            path: path.to_path_buf(),
+            kind: UnsafeSqlitePathKind::Symlink,
+        });
+    }
+    if !metadata.is_file() {
+        return Err(StateError::UnsafeSqlitePath {
+            path: path.to_path_buf(),
+            kind: UnsafeSqlitePathKind::NonRegular,
+        });
+    }
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        return Err(StateError::UnsafeSqlitePath {
+            path: path.to_path_buf(),
+            kind: UnsafeSqlitePathKind::WrongOwner,
+        });
+    }
+
+    #[cfg(test)]
+    delete_sqlite_path_after_metadata_for_test(path);
+
+    // 私有父目录排除了其他 UID 的路径替换；同 UID/root 竞争不在这里声明的威胁模型内。
+    if metadata.mode() & 0o777 != SQLITE_PRIVATE_FILE_MODE {
+        fs::set_permissions(path, fs::Permissions::from_mode(SQLITE_PRIVATE_FILE_MODE)).map_err(
+            |source| StateError::RestrictSqlitePermissions {
+                path: path.to_path_buf(),
+                source,
+            },
+        )?;
+    }
+    let secured =
+        fs::symlink_metadata(path).map_err(|source| sqlite_file_open_error(path, source))?;
+    if secured.file_type().is_symlink() {
+        return Err(StateError::UnsafeSqlitePath {
+            path: path.to_path_buf(),
+            kind: UnsafeSqlitePathKind::Symlink,
+        });
+    }
+    if !secured.is_file() || secured.dev() != metadata.dev() || secured.ino() != metadata.ino() {
+        return Err(StateError::UnsafeSqlitePath {
+            path: path.to_path_buf(),
+            kind: UnsafeSqlitePathKind::Replaced,
+        });
+    }
+    Ok((secured.dev(), secured.ino()))
+}
+
+#[cfg(all(test, unix))]
+fn delete_sqlite_path_after_metadata_for_test(path: &Path) {
+    let mut target = SQLITE_PATH_DELETE_AFTER_METADATA_FOR_TEST.lock().unwrap();
+    if target.as_deref() == Some(path) {
+        fs::remove_file(path).unwrap();
+        *target = None;
+    }
 }
 
 #[cfg(unix)]
@@ -939,7 +1012,12 @@ fn verify_secure_sqlite_open(
     sqlite_path: &Path,
     secure_open: &SecureSqliteOpen,
 ) -> Result<(), StateError> {
-    verify_path_identity(sqlite_path, &secure_open.database, false)?;
+    verify_path_identity_values(
+        sqlite_path,
+        secure_open.database_dev,
+        secure_open.database_ino,
+        false,
+    )?;
     verify_path_identity(&secure_open.parent_path, &secure_open.parent, true)
 }
 
@@ -948,6 +1026,31 @@ fn verify_path_identity(path: &Path, opened: &fs::File, directory: bool) -> Resu
     let expected = opened
         .metadata()
         .map_err(|source| sqlite_file_open_error(path, source))?;
+    let expected_type_matches = if directory {
+        expected.is_dir()
+    } else {
+        expected.is_file()
+    };
+    if !expected_type_matches {
+        return Err(StateError::UnsafeSqlitePath {
+            path: path.to_path_buf(),
+            kind: if directory {
+                UnsafeSqlitePathKind::NonDirectory
+            } else {
+                UnsafeSqlitePathKind::NonRegular
+            },
+        });
+    }
+    verify_path_identity_values(path, expected.dev(), expected.ino(), directory)
+}
+
+#[cfg(unix)]
+fn verify_path_identity_values(
+    path: &Path,
+    expected_dev: u64,
+    expected_ino: u64,
+    directory: bool,
+) -> Result<(), StateError> {
     let actual =
         fs::symlink_metadata(path).map_err(|source| sqlite_file_open_error(path, source))?;
     if actual.file_type().is_symlink() {
@@ -956,12 +1059,12 @@ fn verify_path_identity(path: &Path, opened: &fs::File, directory: bool) -> Resu
             kind: UnsafeSqlitePathKind::Symlink,
         });
     }
-    let expected_type_matches = if directory {
-        expected.is_dir() && actual.is_dir()
+    let actual_type_matches = if directory {
+        actual.is_dir()
     } else {
-        expected.is_file() && actual.is_file()
+        actual.is_file()
     };
-    if !expected_type_matches || expected.dev() != actual.dev() || expected.ino() != actual.ino() {
+    if !actual_type_matches || expected_dev != actual.dev() || expected_ino != actual.ino() {
         return Err(StateError::UnsafeSqlitePath {
             path: path.to_path_buf(),
             kind: UnsafeSqlitePathKind::Replaced,
@@ -2049,6 +2152,65 @@ mod tests {
 
         assert_eq!(unix_mode(&sidecars[0]), 0o600);
         assert_eq!(unix_mode(&sidecars[1]), 0o600);
+        drop(keeper);
+        cleanup_state_paths(&state_path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sidecar_precheck_allows_file_to_disappear_after_metadata() {
+        let state_path = temp_path("disappearing-sidecar.json");
+        let sqlite_path = sqlite_state_path_for_state_path(&state_path);
+        let sidecars = sqlite_sidecar_paths(&sqlite_path);
+        StateStore::save(&state_path, &sample_state()).unwrap();
+        let keeper = force_wal_sidecars(&sqlite_path);
+        assert_eq!(unix_mode(&sidecars[1]), SQLITE_PRIVATE_FILE_MODE);
+        *SQLITE_PATH_DELETE_AFTER_METADATA_FOR_TEST.lock().unwrap() = Some(sidecars[1].clone());
+
+        secure_existing_sqlite_sidecars(&sqlite_path).unwrap();
+
+        assert!(!sidecars[1].exists());
+        drop(keeper);
+        cleanup_state_paths(&state_path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secure_reopen_preserves_active_wal_transaction_locks() {
+        const TEST_NAME: &str =
+            "state::tests::secure_reopen_preserves_active_wal_transaction_locks";
+        const CHILD_DB_ENV: &str = "TERMD_TEST_LOCKED_WAL_DB";
+
+        if let Some(sqlite_path) = std::env::var_os(CHILD_DB_ENV) {
+            let conn = Connection::open(Path::new(&sqlite_path)).unwrap();
+            let locked = matches!(
+                conn.execute_batch("PRAGMA busy_timeout = 0; BEGIN IMMEDIATE; ROLLBACK;"),
+                Err(rusqlite::Error::SqliteFailure(error, _))
+                    if error.code == rusqlite::ErrorCode::DatabaseBusy
+            );
+            std::process::exit(if locked { 23 } else { 0 });
+        }
+
+        let state_path = temp_path("active-wal-locks.json");
+        let sqlite_path = sqlite_state_path_for_state_path(&state_path);
+        StateStore::save(&state_path, &sample_state()).unwrap();
+        let keeper = force_wal_sidecars(&sqlite_path);
+        keeper.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let reopened = open_state_connection(&sqlite_path).unwrap();
+        let contender = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST_NAME, "--nocapture"])
+            .env(CHILD_DB_ENV, &sqlite_path)
+            .status()
+            .unwrap();
+
+        assert_eq!(
+            contender.code(),
+            Some(23),
+            "external writer was not locked out"
+        );
+        keeper.execute_batch("ROLLBACK").unwrap();
+        drop(reopened);
         drop(keeper);
         cleanup_state_paths(&state_path);
     }
