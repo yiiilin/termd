@@ -4160,6 +4160,89 @@ describe("TerminalPane terminal sizing", () => {
     }
   });
 
+  it("新 session 的 focusRequest 首轮成功后若下一帧暂态掉到 body，会在稳定帧恢复输入焦点", () => {
+    vi.useFakeTimers();
+    const previousBodyTabIndex = document.body.getAttribute("tabindex");
+    try {
+      render(
+        <TerminalPane
+          attached
+          sessionSize={DEFAULT_TERMINAL_SIZE}
+          focusRequest={1}
+          outputResetVersion={0}
+          takeOutput={vi.fn(() => [])}
+          registerOutputDrain={vi.fn(() => () => undefined)}
+          onInput={vi.fn()}
+          onResize={vi.fn()}
+          onCursorChange={vi.fn()}
+        />,
+      );
+      const terminalInput = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
+      expect(terminalInput).not.toBeNull();
+
+      act(() => vi.advanceTimersByTime(animationFrameMs));
+      expect(document.activeElement).toBe(terminalInput);
+
+      document.body.tabIndex = -1;
+      act(() => document.body.focus());
+      expect(document.activeElement).toBe(document.body);
+
+      act(() => vi.advanceTimersByTime(animationFrameMs * 3));
+      expect(document.activeElement).toBe(terminalInput);
+    } finally {
+      if (previousBodyTabIndex === null) {
+        document.body.removeAttribute("tabindex");
+      } else {
+        document.body.setAttribute("tabindex", previousBodyTabIndex);
+      }
+      vi.useRealTimers();
+    }
+  });
+
+  it.each(["toolbar", "input", "select", "contenteditable"] as const)(
+    "focusRequest 稳定帧不会从外部 %s 控件抢回焦点",
+    (controlKind) => {
+      vi.useFakeTimers();
+      try {
+        const externalControl = controlKind === "toolbar"
+          ? <div className="toolbar"><button type="button" data-testid="external-focus-control">tool</button></div>
+          : controlKind === "input"
+            ? <input data-testid="external-focus-control" />
+            : controlKind === "select"
+              ? <select data-testid="external-focus-control"><option>choice</option></select>
+              : <div contentEditable suppressContentEditableWarning tabIndex={0} data-testid="external-focus-control">editor</div>;
+        render(
+          <>
+            <TerminalPane
+              attached
+              sessionSize={DEFAULT_TERMINAL_SIZE}
+              focusRequest={1}
+              outputResetVersion={0}
+              takeOutput={vi.fn(() => [])}
+              registerOutputDrain={vi.fn(() => () => undefined)}
+              onInput={vi.fn()}
+              onResize={vi.fn()}
+              onCursorChange={vi.fn()}
+            />
+            {externalControl}
+          </>,
+        );
+        const terminalInput = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
+        const external = screen.getByTestId("external-focus-control") as HTMLElement;
+        act(() => vi.advanceTimersByTime(animationFrameMs));
+        expect(document.activeElement).toBe(terminalInput);
+
+        act(() => external.focus());
+        expect(document.activeElement).toBe(external);
+        act(() => vi.advanceTimersByTime(animationFrameMs * 4));
+
+        expect(document.activeElement).toBe(external);
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
   it("刷新和聚焦期间经过临时行列尺寸时只上报最终尺寸", () => {
     vi.useFakeTimers();
     try {

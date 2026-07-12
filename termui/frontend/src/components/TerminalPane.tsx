@@ -26,6 +26,7 @@ const MIN_FOCUSED_RESIZE_COLS = 20;
 const CURSOR_REPORT_INTERVAL_MS = 120;
 const TERMINAL_SCROLL_REPORT_INTERVAL_MS = 120;
 const FOCUS_OUT_SETTLE_MS = 120;
+const FOCUS_REQUEST_STABILITY_FRAMES = 3;
 const MOBILE_PASSIVE_FOCUS_BYPASS_SETTLE_MS = 180;
 const MOBILE_DIRECTION_HOLD_MS = 1000;
 const MOBILE_DIRECTION_DEAD_ZONE_PX = 24;
@@ -191,6 +192,8 @@ export function TerminalPane(props: TerminalPaneProps) {
   const terminalRevealHistoryAfterSnapshotRef = useRef(false);
   const terminalRevealHistorySuppressBottomUntilRef = useRef(0);
   const pendingFocusRequestRef = useRef<number | undefined>(undefined);
+  const focusRequestStabilityFrameRef = useRef<number | undefined>(undefined);
+  const focusRequestStabilityGenerationRef = useRef(0);
   const mobileDirectionGestureRef = useRef<{
     pointerId: number;
     startX: number;
@@ -2721,6 +2724,74 @@ export function TerminalPane(props: TerminalPaneProps) {
     scheduleScrollToBottomIfPinned(wasPinnedToBottom);
   };
 
+  const externalInteractiveElementHasFocus = (terminalHost: HTMLElement | null) => {
+    const activeElement = document.activeElement;
+    const declaredContentEditable = activeElement instanceof HTMLElement
+      ? activeElement.closest("[contenteditable]")
+      : null;
+    return Boolean(
+      activeElement instanceof HTMLElement &&
+      terminalHost &&
+      !terminalHost.contains(activeElement) &&
+      (Boolean(activeElement.closest(".toolbar, .mobile-menu-popover, .mobile-panel, .files-panel")) ||
+        activeElement.isContentEditable ||
+        (declaredContentEditable !== null && declaredContentEditable.getAttribute("contenteditable") !== "false") ||
+        activeElement instanceof HTMLInputElement ||
+        activeElement instanceof HTMLTextAreaElement ||
+        activeElement instanceof HTMLSelectElement),
+    );
+  };
+
+  const cancelTerminalFocusRequestStability = () => {
+    focusRequestStabilityGenerationRef.current += 1;
+    if (focusRequestStabilityFrameRef.current !== undefined) {
+      cancelDeferredTerminalFrame(focusRequestStabilityFrameRef.current);
+      focusRequestStabilityFrameRef.current = undefined;
+    }
+  };
+
+  const finishTerminalFocusRequest = (requestId: number) => {
+    cancelTerminalFocusRequestStability();
+    if (pendingFocusRequestRef.current === requestId) {
+      pendingFocusRequestRef.current = undefined;
+    }
+  };
+
+  const stabilizeTerminalFocusRequest = (requestId: number) => {
+    cancelTerminalFocusRequestStability();
+    const generation = focusRequestStabilityGenerationRef.current;
+    let remainingFrames = FOCUS_REQUEST_STABILITY_FRAMES;
+    const verifyFocus = () => {
+      focusRequestStabilityFrameRef.current = undefined;
+      if (
+        focusRequestStabilityGenerationRef.current !== generation ||
+        pendingFocusRequestRef.current !== requestId
+      ) {
+        return;
+      }
+      const terminalHost = hostRef.current;
+      const input = resolveTerminalInputElement(terminalHost);
+      if (!terminalHost || !input?.isConnected || !terminalHost.contains(input)) {
+        finishTerminalFocusRequest(requestId);
+        return;
+      }
+      if (externalInteractiveElementHasFocus(terminalHost)) {
+        finishTerminalFocusRequest(requestId);
+        return;
+      }
+      if (document.activeElement !== input) {
+        focusTerminalInputSink();
+      }
+      remainingFrames -= 1;
+      if (remainingFrames <= 0) {
+        finishTerminalFocusRequest(requestId);
+        return;
+      }
+      focusRequestStabilityFrameRef.current = scheduleDeferredTerminalFrame(verifyFocus);
+    };
+    focusRequestStabilityFrameRef.current = scheduleDeferredTerminalFrame(verifyFocus);
+  };
+
   const handleTerminalMouseDownCapture = (event: MouseEvent<HTMLDivElement>) => {
     if (!mobileInputModeRef.current || mouseEventCameFromTouch(event)) {
       return;
@@ -2731,23 +2802,16 @@ export function TerminalPane(props: TerminalPaneProps) {
   };
 
   const applyTerminalFocusRequest = (requestId?: number) => {
-    const activeElement = document.activeElement;
     const terminalHost = hostRef.current;
-    if (
-      activeElement instanceof HTMLElement &&
-      terminalHost &&
-      !terminalHost.contains(activeElement) &&
-      (Boolean(activeElement.closest(".toolbar, .mobile-menu-popover, .mobile-panel, .files-panel")) ||
-        activeElement.isContentEditable ||
-        activeElement instanceof HTMLInputElement ||
-        activeElement instanceof HTMLTextAreaElement ||
-        activeElement instanceof HTMLSelectElement)
-    ) {
+    if (requestId !== undefined && pendingFocusRequestRef.current !== requestId) {
+      return;
+    }
+    if (externalInteractiveElementHasFocus(terminalHost)) {
       // 延迟 focusRequest 不能抢走用户刚聚焦的工作台工具栏、菜单、文件面板等控件；
       // session/daemon 重命名、路径输入、连接表单也属于显式文本编辑，同样不能被终端抢焦点。
       // 否则移动端键盘常驻会破坏顶部工具按钮的键盘/辅助技术操作。
-      if (requestId !== undefined && pendingFocusRequestRef.current === requestId) {
-        pendingFocusRequestRef.current = undefined;
+      if (requestId !== undefined) {
+        finishTerminalFocusRequest(requestId);
       }
       return;
     }
@@ -2761,15 +2825,15 @@ export function TerminalPane(props: TerminalPaneProps) {
     if (promotePassiveInputFocusToActive("focus")) {
       focusTerminalInputSink();
       stabilizeRef.current?.("focus");
-      if (requestId !== undefined && pendingFocusRequestRef.current === requestId) {
-        pendingFocusRequestRef.current = undefined;
+      if (requestId !== undefined) {
+        stabilizeTerminalFocusRequest(requestId);
       }
       return;
     }
     focusTerminalInputSink();
     stabilizeRef.current?.("focus");
-    if (requestId !== undefined && pendingFocusRequestRef.current === requestId) {
-      pendingFocusRequestRef.current = undefined;
+    if (requestId !== undefined) {
+      stabilizeTerminalFocusRequest(requestId);
     }
   };
 
@@ -3768,6 +3832,7 @@ export function TerminalPane(props: TerminalPaneProps) {
       mobileViewportLayoutSuppressRef.current = false;
       previousMobileViewportMetricsRef.current = undefined;
       terminalSelectionCopyGenerationRef.current += 1;
+      cancelTerminalFocusRequestStability();
       pendingFocusRequestRef.current = undefined;
       drainOutputRef.current = () => undefined;
       resetWriterState();
@@ -3883,7 +3948,10 @@ export function TerminalPane(props: TerminalPaneProps) {
     const frame = scheduleDeferredTerminalFrame(() => {
       applyTerminalFocusRequest(props.focusRequest);
     });
-    return () => cancelDeferredTerminalFrame(frame);
+    return () => {
+      cancelDeferredTerminalFrame(frame);
+      cancelTerminalFocusRequestStability();
+    };
   }, [props.attached, props.focusRequest]);
 
   useEffect(() => {
