@@ -1666,9 +1666,9 @@ label {
 
 .terminal-host[data-termd-snapshot-redraw="true"] .xterm-screen,
 .terminal-host[data-termd-resize-stabilizing="true"] .xterm-screen {
-  /* 中文注释：snapshot 会先按 daemon 旧尺寸重放历史；刷新期间先隐藏终端可见表面，
-     等 xterm 按本地容器重新 fit 后再显示，避免 80x24 中间态闪屏。 */
-  visibility: hidden;
+  /* 中文注释：snapshot 会先按 daemon 旧尺寸重放历史；刷新期间先透明化终端可见表面，
+     等 xterm 按本地容器重新 fit 后再显示，避免 80x24 中间态闪屏，同时保持 helper textarea 可聚焦。 */
+  opacity: 0;
 }
 
 .terminal-host textarea[aria-label="Terminal input"] {

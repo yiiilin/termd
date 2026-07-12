@@ -27,7 +27,8 @@ describe("mobile layout regressions", () => {
     expect(terminalCanvasBlock).toContain("background: var(--color-terminal-bg);");
     const redrawMaskBlock =
       css.match(/\.terminal-host\[data-termd-snapshot-redraw="true"\] \.xterm-screen,\n\.terminal-host\[data-termd-resize-stabilizing="true"\] \.xterm-screen \{[^}]+\}/)?.[0] ?? "";
-    expect(redrawMaskBlock).toContain("visibility: hidden;");
+    expect(redrawMaskBlock).toContain("opacity: 0;");
+    expect(redrawMaskBlock).not.toContain("visibility: hidden;");
     expect(css).not.toContain(".terminal-host,\n  .terminal-host canvas");
     expect(css).toContain('.terminal-host textarea[aria-label="Terminal input"]');
     expect(css).toContain(".daemon-cpu-bar-chart {\n    display: none;");
