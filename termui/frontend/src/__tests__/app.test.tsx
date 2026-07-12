@@ -4164,6 +4164,33 @@ describe("termui web 工作台", () => {
     ).toHaveLength(0);
   });
 
+  it("空工作台新建 session 会复用已认证的 workspace WebSocket", async () => {
+    const user = userEvent.setup();
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [],
+      attachOutput: "workspace-reuse-ready\n",
+    });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession("No session");
+    await waitFor(() =>
+      expect(
+        daemon.receivedPackets.some(
+          (packet) => packet.kind === "request" && packet.method === "metadata.subscribe",
+        ),
+      ).toBe(true),
+    );
+    const acceptedConnectionsBeforeCreate = daemon.acceptedConnections;
+
+    await user.click(screen.getByRole("button", { name: "New session" }));
+
+    await screen.findByText(/workspace-reuse-ready/);
+    expect(daemon.acceptedConnections).toBe(acceptedConnectionsBeforeCreate);
+  });
+
   it("新建 session 将 terminal.create 作为终端级请求处理", async () => {
     const user = userEvent.setup();
     await daemon.stop();

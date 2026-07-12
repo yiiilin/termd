@@ -189,6 +189,20 @@ describe("useWorkspaceConnection", () => {
     expect(connectSpy).toHaveBeenCalledTimes(1);
   });
 
+  it("将同一条 workspace client 提升为 terminal attach 时不关闭 transport", async () => {
+    const workspaceClient = makeClient();
+    vi.spyOn(DirectClient, "connect").mockResolvedValue(workspaceClient);
+    const { result } = renderWorkspaceConnection();
+
+    await expect(result.current.authenticatedWorkspaceClient()).resolves.toBe(workspaceClient);
+    result.current.claimAttachClient(workspaceClient);
+
+    expect(workspaceClient.interruptReceiveWaiters).not.toHaveBeenCalled();
+    expect(workspaceClient.close).not.toHaveBeenCalled();
+    expect(result.current.workspaceClientRef.current).toBeUndefined();
+    expect(result.current.attachClientRef.current).toBe(workspaceClient);
+  });
+
   it("metadata 建连未完成时若 terminal 先 attach，迟到 metadata client 会被作废", async () => {
     const authGate = deferred<void>();
     const metadataClient = makeClient({

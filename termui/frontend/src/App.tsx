@@ -609,16 +609,13 @@ export default function App() {
   }, [clearFileTransferProgressTimers, closeWorkspaceClient]);
 
   useEffect(() => {
-    if (!workspaceClientRef.current || activeSurface !== "workspace") {
+    if (!workspaceClientRef.current || activeSurface === "workspace") {
       return;
     }
-    if (status === "creating" || status === "attaching") {
-      return;
-    }
-    // 中文注释：metadata 连接只服务工作台旁路信息。离开 workspace 或进入 attach/create
-    // 主链路时及时回收，避免保留无用 socket 和权限缓存。
+    // 中文注释：空工作台保留已认证 WebSocket，New session 可直接提升它为 terminal
+    // transport，避免 relay 再做一次 route/hello/auth。离开 workspace 时才回收。
     closeWorkspaceMetadataClient();
-  }, [activeSurface, closeWorkspaceMetadataClient, status, workspaceClientRef]);
+  }, [activeSurface, closeWorkspaceMetadataClient, workspaceClientRef]);
 
   useEffect(() => {
     renamingSessionIdRef.current = renamingSessionId;
@@ -2434,7 +2431,7 @@ export default function App() {
       const isCurrentCreateRequest = () => sessionCreateRequestIdRef.current === createRequestId;
       attachAbortController = new AbortController();
       pendingTerminalAttachAbortControllerRef.current = attachAbortController;
-      outputClient = await authenticatedClient(ATTACH_CONNECTION_TIMEOUT_MS, attachAbortController.signal);
+      outputClient = await authenticatedWorkspaceClient(ATTACH_CONNECTION_TIMEOUT_MS);
       if (!isCurrentCreateRequest()) {
         if (outputClient !== attachClientRef.current) {
           outputClient.close();
@@ -2526,6 +2523,7 @@ export default function App() {
   }, [
     clearNewOutputMark,
     clearTerminalOutput,
+    authenticatedWorkspaceClient,
     claimAttachClient,
     disconnectAttach,
     loadSessionFiles,

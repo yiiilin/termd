@@ -184,6 +184,18 @@ export function useWorkspaceConnection(options: UseWorkspaceConnectionOptions) {
     // 中文注释：terminal attach/create/reconnect 一旦成功，这条 WebSocket 就成为当前
     // session 的唯一主连接。任何旧 metadata sidecar（包括尚未落地的 pending connect）
     // 都必须立刻作废，避免迟到 promise 再把孤儿连接写回 workspaceClientRef。
+    if (workspaceClientRef.current === client) {
+      // 中文注释：空工作台创建 session 时，复用的已认证连接会从 workspace 提升为
+      // terminal transport。此处只能移交引用，不能关闭同一条 socket。
+      workspaceClientGenerationRef.current += 1;
+      workspaceClientAbortControllerRef.current?.abort();
+      workspaceClientAbortControllerRef.current = undefined;
+      workspaceClientPromiseRef.current = undefined;
+      workspaceSessionPermissionIdsRef.current.clear();
+      workspaceClientRef.current = undefined;
+      attachClientRef.current = client;
+      return;
+    }
     closeWorkspaceMetadataClient();
     attachClientRef.current = client;
   }, [closeWorkspaceMetadataClient]);
