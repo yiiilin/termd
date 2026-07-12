@@ -1,74 +1,4 @@
-export const ALL_MESSAGE_TYPES = [
-  "route_hello",
-  "route_ready",
-  "hello",
-  "auth",
-  "auth_challenge",
-  "session_token_grant",
-  "session_scope_grant",
-  "pair_request",
-  "pair_accept",
-  "session_create",
-  "session_created",
-  "session_attach",
-  "session_attached",
-  "session_data",
-  "terminal_frame",
-  "attach_frame",
-  "session_activity",
-  "session_cwd_changed",
-  "session_cursor",
-  "session_resize",
-  "session_resized",
-  "session_rename",
-  "session_renamed",
-  "session_reorder",
-  "session_reordered",
-  "session_close",
-  "session_closed",
-  "session_search",
-  "session_search_result",
-  "session_files",
-  "session_files_result",
-  "session_git",
-  "session_git_result",
-  "session_git_action",
-  "session_git_action_result",
-  "session_git_diff",
-  "session_git_diff_result",
-  "session_file_read",
-  "session_file_read_result",
-  "session_file_write",
-  "session_file_written",
-  "session_file_delete",
-  "session_file_deleted",
-  "session_file_download_prepare",
-  "session_file_download_ready",
-  "session_file_download_chunk",
-  "session_file_download_chunk_result",
-  "session_list",
-  "session_list_result",
-  "client_hello",
-  "daemon_clients",
-  "daemon_clients_result",
-  "daemon_client_forget",
-  "daemon_client_forgot",
-  "daemon_status",
-  "daemon_status_result",
-  "metadata_subscribe",
-  "daemon_clients_snapshot",
-  "daemon_status_snapshot",
-  "control_request",
-  "control_grant",
-  "e2ee_key_exchange",
-  "encrypted_frame",
-  "packet",
-  "error",
-  "ping",
-  "pong",
-] as const;
-
-export type MessageType = (typeof ALL_MESSAGE_TYPES)[number];
+export type MessageType = string;
 
 export type UUID = string;
 export type PublicKeyWire = string;
@@ -76,43 +6,9 @@ export type Nonce = string;
 export type Challenge = string;
 export type SignatureWire = string;
 export type UnixTimestampMillis = number;
-export type PacketRequestId = UUID;
-export type PacketStreamId = UUID;
 
 export interface Envelope<P = unknown> {
   type: MessageType;
-  payload: P;
-}
-
-export const PROTOCOL_PACKET_VERSION = 3;
-export const BINARY_PROTOCOL_VERSION = 2;
-
-export type PacketKind =
-  | "request"
-  | "response"
-  | "event"
-  | "stream_open"
-  | "stream_chunk"
-  | "stream_end"
-  | "cancel"
-  | "flow"
-  | "error";
-
-export interface PacketErrorPayload {
-  code: string;
-  message: string;
-  retryable: boolean;
-}
-
-export interface ProtocolPacket<P = unknown> {
-  version: number;
-  kind: PacketKind;
-  id?: PacketRequestId;
-  stream_id?: PacketStreamId;
-  method?: string;
-  seq?: number;
-  ack?: number;
-  credit?: number;
   payload: P;
 }
 
@@ -156,23 +52,6 @@ export interface HelloPayload {
   device_id: UUID | null;
 }
 
-export interface E2eeKeyExchangePayload {
-  server_id: UUID;
-  device_id: UUID;
-  public_key: PublicKeyWire;
-  nonce: Nonce;
-  timestamp_ms: UnixTimestampMillis;
-  packet_version?: number | null;
-  binary_version?: number | null;
-  signature?: SignatureWire | null;
-}
-
-export interface EncryptedFramePayload {
-  server_id: UUID;
-  sequence: number;
-  ciphertext_base64: string;
-}
-
 export interface PairRequestPayload {
   device_id: UUID;
   device_public_key: PublicKeyWire;
@@ -186,6 +65,7 @@ export interface PairAcceptPayload {
   daemon_public_key: PublicKeyWire;
   device_id: UUID;
   expires_at_ms: UnixTimestampMillis;
+  device_certificate?: string;
 }
 
 export interface PairingQrPayload {
@@ -210,29 +90,6 @@ export interface AuthPayload {
   nonce: Nonce;
   timestamp_ms: UnixTimestampMillis;
   signature: SignatureWire;
-}
-
-export interface HttpE2eeAuthPayload {
-  device_id: UUID;
-  e2ee_public_key: PublicKeyWire;
-  nonce: Nonce;
-  timestamp_ms: UnixTimestampMillis;
-  method: string;
-  path: string;
-  signature: SignatureWire;
-}
-
-export interface SessionTokenGrantPayload {
-  server_id: UUID;
-  device_id: UUID;
-  token: string;
-  expires_at_ms: UnixTimestampMillis;
-}
-
-export interface SessionScopeGrantPayload {
-  session_id: UUID;
-  token: string;
-  expires_at_ms: UnixTimestampMillis;
 }
 
 export interface TerminalSize {
@@ -293,11 +150,6 @@ export interface DaemonClientForgotPayload {
 }
 
 export interface DaemonStatusPayload {}
-
-export interface MetadataSubscribePayload {
-  status_interval_ms?: number | null;
-  clients?: boolean;
-}
 
 export interface DaemonStatusResultPayload {
   host_name?: string | null;
@@ -610,18 +462,12 @@ export interface SessionDataPayload {
   session_id: UUID;
   data_base64?: string;
   data_bytes?: Uint8Array;
-  /** 前端内部字段：packet stream 承载时用于调试和测试 stream 归属，不参与流控。 */
-  stream_id?: PacketStreamId;
-  transport_seq?: number;
 }
 
 export interface AttachFramePayload {
   session_id: UUID;
   data_base64?: string;
   data_bytes?: Uint8Array;
-  /** 前端内部字段：packet stream 承载时用于调试和测试 stream 归属，不参与流控。 */
-  stream_id?: PacketStreamId;
-  transport_seq?: number;
 }
 
 export type TerminalFrameKind = "snapshot" | "output" | "resize" | "exit" | "batch";
@@ -662,13 +508,6 @@ export type TerminalFramePayload =
 
 export type SingleTerminalFramePayload = Exclude<TerminalFramePayload, { kind: "batch" }>;
 
-export type RenderableTerminalFramePayload = SingleTerminalFramePayload & {
-  /** 前端内部字段：连接内 stream seq，用于调试和测试 stream 归属，不参与流控。 */
-  transport_seq: number;
-  /** 前端内部字段：当前 packet stream id，方便调试。 */
-  stream_id: PacketStreamId;
-};
-
 export interface SessionActivityPayload {
   session_id: UUID;
   timestamp_ms: UnixTimestampMillis;
@@ -678,15 +517,6 @@ export interface SessionCwdChangedPayload {
   session_id: UUID;
   cwd: string;
 }
-
-export interface SessionCursorPayload {
-  session_id: UUID;
-  row: number;
-  col: number;
-  focused: boolean;
-}
-
-export type SessionCursorPresence = Pick<SessionCursorPayload, "row" | "col" | "focused">;
 
 export interface SessionResizePayload {
   session_id: UUID;
@@ -731,6 +561,7 @@ export interface PairedServerState {
   daemon_public_key: PublicKeyWire;
   url: string;
   paired_at_ms: UnixTimestampMillis;
+  device_certificate?: string;
   name?: string | null;
 }
 

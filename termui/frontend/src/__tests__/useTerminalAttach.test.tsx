@@ -8,7 +8,7 @@ import {
   type AttachReconnectOptions,
 } from "../hooks/useTerminalAttach";
 import { ProtocolClientError } from "../protocol/errors";
-import type { DirectClient } from "../protocol/direct-client";
+import type { V070Client } from "../protocol/v070-client";
 import { buildAttachFramePayload, encodeSupervisorTerminalServerFrame } from "../protocol/supervisor-terminal";
 import type {
   Envelope,
@@ -84,8 +84,8 @@ function terminalSnapshot(text: string): Envelope {
   };
 }
 
-function asDirectClient(client: FakeDirectClient): DirectClient {
-  return client as unknown as DirectClient;
+function asDirectClient(client: FakeDirectClient): V070Client {
+  return client as unknown as V070Client;
 }
 
 function deferred<T>() {
@@ -117,16 +117,15 @@ function settleWithin<T>(promise: Promise<T>, timeoutMs: number, label: string):
 }
 
 function useReconnectHarness(input: {
-  authenticatedClient: (timeoutMs: number, signal?: AbortSignal) => Promise<DirectClient>;
+  authenticatedClient: (timeoutMs: number, signal?: AbortSignal) => Promise<V070Client>;
   output: TerminalOutputItem[];
   reconnectDelaysMs?: number[];
-  closeAttachForReconnect?: (client?: DirectClient) => boolean;
+  closeAttachForReconnect?: (client?: V070Client) => boolean;
   waitForTerminalOutputResetApplied?: (version: number) => Promise<void>;
 }) {
   const controller = useTerminalAttach();
-  const attachClientRef = useRef<DirectClient | undefined>(undefined);
-  const pendingAttachClientRef = useRef<DirectClient | undefined>(undefined);
-  const sessionPermissionIdsRef = useRef<Set<UUID>>(new Set());
+  const attachClientRef = useRef<V070Client | undefined>(undefined);
+  const pendingAttachClientRef = useRef<V070Client | undefined>(undefined);
   const sessionOrderRef = useRef<UUID[]>([SESSION_ID]);
   const sessionFilesFollowTerminalCwdRef = useRef(false);
   const startReceiveLoop = useTerminalReceiveLoop(controller, {
@@ -155,7 +154,7 @@ function useReconnectHarness(input: {
     reconnectDelaysMs: input.reconnectDelaysMs ?? [0],
     isRetryableConnectionError: () => true,
     isTerminalTransportPaused: () => false,
-    closeAttachForReconnect: input.closeAttachForReconnect ?? ((client?: DirectClient) => {
+    closeAttachForReconnect: input.closeAttachForReconnect ?? ((client?: V070Client) => {
       const belongsToCurrentAttach =
         !client ||
         attachClientRef.current === client ||
@@ -184,7 +183,6 @@ function useReconnectHarness(input: {
     setAttachedSessionId: vi.fn(),
     setSessions: vi.fn(),
     sessionOrderRef,
-    sessionPermissionIdsRef,
     clearNewOutputMark: vi.fn(),
     clearTerminalOutput: vi.fn(() => 1),
     clearTerminalSnapshotRevealHistory: (sessionId?: UUID, snapshotToken?: number) => {
@@ -207,7 +205,6 @@ function useReconnectHarness(input: {
     startReceiveLoop,
     loadSessionFiles: vi.fn(async () => undefined),
     loadSessionGit: vi.fn(async () => undefined),
-    refreshDaemonClients: vi.fn(async () => undefined),
     claimAttachClient: (client) => {
       attachClientRef.current = client;
     },
@@ -400,7 +397,7 @@ describe("useTerminalAttach snapshot reveal intent", () => {
     const output: TerminalOutputItem[] = [];
     const currentClient = new FakeDirectClient();
     const staleClient = new FakeDirectClient();
-    const closeAttachForReconnect = vi.fn((client?: DirectClient) => client === asDirectClient(currentClient));
+    const closeAttachForReconnect = vi.fn((client?: V070Client) => client === asDirectClient(currentClient));
     const { result, unmount } = renderHook(() =>
       useReconnectHarness({
         authenticatedClient: vi.fn(async () => asDirectClient(new FakeDirectClient())),
@@ -893,7 +890,7 @@ describe("useTerminalReceiveLoop", () => {
     expect(output.some((item) => item.kind === "output")).toBe(false);
   });
 
-  it("tail reconnect 遇到空 attach_sync 且 base_seq 前跳时会升级成 full snapshot", async () => {
+  it("terminal reconnect 始终请求完整 snapshot，gap 后继续完整 resync", async () => {
     const output: TerminalOutputItem[] = [];
     const initialClient = new FakeDirectClient();
     const gapReconnectClient = new FakeDirectClient([
@@ -942,7 +939,7 @@ describe("useTerminalReceiveLoop", () => {
 
     await waitFor(() => expect(gapReconnectClient.attachCalls).toHaveLength(1));
     await waitFor(() => expect(fullSnapshotReconnectClient.attachCalls).toHaveLength(1));
-    expect(gapReconnectClient.attachCalls[0]?.options.lastTerminalSeq).toBe(5);
+    expect(gapReconnectClient.attachCalls[0]?.options.lastTerminalSeq).toBeUndefined();
     expect(fullSnapshotReconnectClient.attachCalls[0]?.options.lastTerminalSeq).toBeUndefined();
     await waitFor(() => {
       expect(output).toEqual([
@@ -1148,7 +1145,7 @@ describe("useTerminalReceiveLoop", () => {
         throw new ProtocolClientError("connection_closed", "connection closed");
       }),
       sendSupervisorTerminalHeartbeatPong: vi.fn(),
-    } as unknown as DirectClient;
+    } as unknown as V070Client;
     const controller = renderHook(() => useTerminalAttach()).result.current;
     const attachClientRef = { current: errorClient };
     const sessionFilesFollowTerminalCwdRef = { current: false };

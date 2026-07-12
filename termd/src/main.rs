@@ -51,8 +51,6 @@ const HELP_TEXT: &str = concat!(
     "  --listen <HOST:PORT>           Listen address, default 127.0.0.1:8765\n",
     "  --relay <WS_URL>               Connect to one relay\n",
     "  --relay-url <WS_URL>           Alias for --relay\n",
-    "  --relay-auth-token <TOKEN>     Transport auth token for relay connections\n",
-    "  --relay-auth-token-file <PATH> Read relay transport auth token from a file\n",
     "  --relay-daemon-token <TOKEN>   Daemon admission token registered on trusted relay\n",
     "  --relay-daemon-token-file <PATH> Read trusted relay daemon admission token from a file\n",
     "  --relay-proxy <PROXY_URL>      Relay outbound proxy, http://host:port or socks5://host:port\n",
@@ -71,7 +69,7 @@ const HELP_TEXT: &str = concat!(
     "  NO_PROXY and no_proxy bypass common proxy variables for matching relay hosts\n\n",
     "EXAMPLES:\n",
     "  termd --listen 0.0.0.0:8765 --web\n",
-    "  termd --relay wss://relay.example:443 --relay-auth-token-file /etc/termd/relay_token --relay-daemon-token-file /etc/termd/termd_daemon_token\n",
+    "  termd --relay wss://relay.example:443 --relay-daemon-token-file /etc/termd/termd_daemon_token\n",
     "  HTTP_PROXY=http://127.0.0.1:3128 termd --relay wss://relay.example/ws\n",
     "  ALL_PROXY=socks5://127.0.0.1:1080 termd --relay wss://relay.example/ws\n",
     "  termd pair --url http://127.0.0.1:8765\n",
@@ -107,7 +105,6 @@ async fn run() -> Result<(), Box<dyn Error>> {
         CliCommand::Serve {
             listen,
             relay_urls,
-            relay_auth_token,
             relay_daemon_token,
             relay_proxy_url,
             tls,
@@ -116,7 +113,6 @@ async fn run() -> Result<(), Box<dyn Error>> {
             serve_daemon(
                 listen,
                 relay_urls,
-                relay_auth_token,
                 relay_daemon_token,
                 relay_proxy_url,
                 tls,
@@ -155,7 +151,6 @@ fn install_rustls_crypto_provider() {
 async fn serve_daemon(
     listen: Option<ListenAddress>,
     relay_urls: Vec<String>,
-    relay_auth_token: Option<String>,
     relay_daemon_token: Option<String>,
     relay_proxy_url: Option<String>,
     tls: Option<TlsPaths>,
@@ -177,15 +172,12 @@ async fn serve_daemon(
             .chain(relay_urls.into_iter()),
     )?;
     if let Some(first_relay_endpoint) = relay_endpoints.first() {
-        // 中文注释：relay auth token 是旧 transport 凭证，只给 daemon 连接使用；
-        // browser/termctl pairing 入口现在靠短期 PairTicket admission，不能携带长期 token。
         config.default_pairing_ws_url =
             RelayBaseUrl::parse(first_relay_endpoint)?.client_url_template();
     }
     let relay_proxy_url = resolve_relay_proxy_url(relay_proxy_url, &relay_endpoints, |name| {
         std::env::var(name).ok()
     })?;
-    config.relay_auth_token = relay_auth_token.clone().map(SecretString::new);
     config.relay_daemon_token = relay_daemon_token.clone().map(SecretString::new);
     config.relay_endpoints = relay_endpoints.clone();
     config.relay_proxy_url = relay_proxy_url.clone();
@@ -202,7 +194,6 @@ async fn serve_daemon(
         let reconnect_policy = RelayReconnectPolicy::from_config(config.relay_reconnect);
         let _relay_tasks = spawn_relay_reconnect_supervisors(
             relay_endpoints,
-            relay_auth_token,
             relay_daemon_token,
             relay_proxy_url,
             reconnect_policy,
@@ -384,7 +375,6 @@ fn normalize_no_proxy_host(host: &str) -> String {
 
 fn spawn_relay_reconnect_supervisors(
     relay_endpoints: Vec<String>,
-    relay_auth_token: Option<String>,
     relay_daemon_token: Option<String>,
     relay_proxy_url: Option<String>,
     reconnect_policy: RelayReconnectPolicy,
@@ -397,14 +387,12 @@ fn spawn_relay_reconnect_supervisors(
         .into_iter()
         .map(|relay_url| {
             let relay_protocol = protocol.clone();
-            let relay_auth_token = relay_auth_token.clone();
             let relay_daemon_token = relay_daemon_token.clone();
             let relay_proxy = relay_proxy.clone();
             tokio::spawn(async move {
                 // 目前 daemon 只允许配置一个 relay；保留 supervisor 边界，便于独立处理重连和心跳。
                 if let Err(error) = run_relay_mux_with_reconnect(
                     &relay_url,
-                    relay_auth_token.as_deref(),
                     relay_daemon_token.as_deref(),
                     relay_proxy,
                     reconnect_policy,
@@ -438,7 +426,6 @@ enum CliCommand {
     Serve {
         listen: Option<ListenAddress>,
         relay_urls: Vec<String>,
-        relay_auth_token: Option<String>,
         relay_daemon_token: Option<String>,
         relay_proxy_url: Option<String>,
         tls: Option<TlsPaths>,
@@ -460,28 +447,22 @@ impl fmt::Debug for CliCommand {
             Self::Serve {
                 listen,
                 relay_urls,
-                relay_auth_token,
                 relay_daemon_token,
                 relay_proxy_url,
                 tls,
                 web,
-            } => {
-                // relay auth token 是 transport 凭证，命令解析测试需要保留真实值用于行为断言，
-                // 但 Debug 输出只能暴露是否配置，避免后续错误日志中误带明文 token。
-                formatter
-                    .debug_struct("Serve")
-                    .field("listen", listen)
-                    .field("relay_urls", relay_urls)
-                    .field("relay_auth_token_configured", &relay_auth_token.is_some())
-                    .field(
-                        "relay_daemon_token_configured",
-                        &relay_daemon_token.is_some(),
-                    )
-                    .field("relay_proxy_url", relay_proxy_url)
-                    .field("tls", tls)
-                    .field("web", web)
-                    .finish()
-            }
+            } => formatter
+                .debug_struct("Serve")
+                .field("listen", listen)
+                .field("relay_urls", relay_urls)
+                .field(
+                    "relay_daemon_token_configured",
+                    &relay_daemon_token.is_some(),
+                )
+                .field("relay_proxy_url", relay_proxy_url)
+                .field("tls", tls)
+                .field("web", web)
+                .finish(),
             Self::Pair { url, qr, qr_svg } => formatter
                 .debug_struct("Pair")
                 .field("url", url)
@@ -503,7 +484,6 @@ impl CliCommand {
             return Ok(Self::Serve {
                 listen: None,
                 relay_urls: Vec::new(),
-                relay_auth_token: None,
                 relay_daemon_token: None,
                 relay_proxy_url: None,
                 tls: None,
@@ -519,8 +499,6 @@ impl CliCommand {
             "--listen"
             | "--relay"
             | "--relay-url"
-            | "--relay-auth-token"
-            | "--relay-auth-token-file"
             | "--relay-daemon-token"
             | "--relay-daemon-token-file"
             | "--relay-proxy"
@@ -535,7 +513,6 @@ impl CliCommand {
 fn parse_serve_args(args: impl IntoIterator<Item = String>) -> Result<CliCommand, CliError> {
     let mut listen = None;
     let mut relay_urls = Vec::new();
-    let mut relay_auth_token = None;
     let mut relay_daemon_token = None;
     let mut relay_proxy_url = None;
     let mut tls_cert = None;
@@ -559,29 +536,6 @@ fn parse_serve_args(args: impl IntoIterator<Item = String>) -> Result<CliCommand
                     return Err(CliError::TooManyRelayUrls);
                 }
                 relay_urls.push(value);
-            }
-            "--relay-auth-token" => {
-                if relay_auth_token.is_some() {
-                    return Err(CliError::ConflictingRelayAuthTokenSources);
-                }
-                let value = args.next().ok_or(CliError::MissingRelayAuthTokenValue)?;
-                if value.is_empty() {
-                    return Err(CliError::EmptyRelayAuthTokenValue);
-                }
-                relay_auth_token = Some(value);
-            }
-            "--relay-auth-token-file" => {
-                if relay_auth_token.is_some() {
-                    return Err(CliError::ConflictingRelayAuthTokenSources);
-                }
-                let value = args
-                    .next()
-                    .ok_or(CliError::MissingRelayAuthTokenFileValue)?;
-                relay_auth_token = Some(read_secret_file(
-                    "--relay-auth-token-file",
-                    &value,
-                    CliError::ReadRelayAuthTokenFile,
-                )?);
             }
             "--relay-daemon-token" => {
                 if relay_daemon_token.is_some() {
@@ -642,7 +596,6 @@ fn parse_serve_args(args: impl IntoIterator<Item = String>) -> Result<CliCommand
     Ok(CliCommand::Serve {
         listen,
         relay_urls,
-        relay_auth_token,
         relay_daemon_token,
         relay_proxy_url,
         tls,
@@ -1004,20 +957,15 @@ enum CliError {
     MissingUrlValue,
     MissingQrSvgPath,
     MissingRelayUrlValue,
-    MissingRelayAuthTokenValue,
-    MissingRelayAuthTokenFileValue,
     MissingRelayDaemonTokenValue,
     MissingRelayDaemonTokenFileValue,
     MissingRelayProxyValue,
     MissingTlsCertValue,
     MissingTlsKeyValue,
-    EmptyRelayAuthTokenValue,
     EmptyRelayDaemonTokenValue,
     EmptySecretFilePath(&'static str),
     EmptySecretFile(&'static str),
-    ReadRelayAuthTokenFile,
     ReadRelayDaemonTokenFile,
-    ConflictingRelayAuthTokenSources,
     ConflictingRelayDaemonTokenSources,
     EmptyTlsCertValue,
     EmptyTlsKeyValue,
@@ -1047,7 +995,7 @@ enum CliError {
 
 impl CliError {
     fn usage() -> &'static str {
-        "usage: termd [--listen 127.0.0.1:8765] [--relay ws://host:port] [--relay-auth-token <token>|--relay-auth-token-file <path>] [--relay-daemon-token <token>|--relay-daemon-token-file <path>] [--relay-proxy http://host:port|socks5://host:port] [--tls-cert <cert.pem> --tls-key <key.pem>] [--web] [pair [--url http://127.0.0.1:8765|https://127.0.0.1:8765] [--qr] [--qr-svg <path>]]\ntry `termd --help` for full help"
+        "usage: termd [--listen 127.0.0.1:8765] [--relay ws://host:port] [--relay-daemon-token <token>|--relay-daemon-token-file <path>] [--relay-proxy http://host:port|socks5://host:port] [--tls-cert <cert.pem> --tls-key <key.pem>] [--web] [pair [--url http://127.0.0.1:8765|https://127.0.0.1:8765] [--qr] [--qr-svg <path>]]\ntry `termd --help` for full help"
     }
 }
 
@@ -1065,20 +1013,6 @@ impl fmt::Display for CliError {
             Self::MissingQrSvgPath => write!(f, "`--qr-svg` requires a path\n{}", Self::usage()),
             Self::MissingRelayUrlValue => {
                 write!(f, "`--relay` requires a value\n{}", Self::usage())
-            }
-            Self::MissingRelayAuthTokenValue => {
-                write!(
-                    f,
-                    "`--relay-auth-token` requires a value\n{}",
-                    Self::usage()
-                )
-            }
-            Self::MissingRelayAuthTokenFileValue => {
-                write!(
-                    f,
-                    "`--relay-auth-token-file` requires a value\n{}",
-                    Self::usage()
-                )
             }
             Self::MissingRelayDaemonTokenValue => {
                 write!(
@@ -1103,13 +1037,6 @@ impl fmt::Display for CliError {
             Self::MissingTlsKeyValue => {
                 write!(f, "`--tls-key` requires a value\n{}", Self::usage())
             }
-            Self::EmptyRelayAuthTokenValue => {
-                write!(
-                    f,
-                    "`--relay-auth-token` requires a non-empty value\n{}",
-                    Self::usage()
-                )
-            }
             Self::EmptyRelayDaemonTokenValue => {
                 write!(
                     f,
@@ -1121,17 +1048,9 @@ impl fmt::Display for CliError {
                 write!(f, "`{flag}` requires a non-empty path\n{}", Self::usage())
             }
             Self::EmptySecretFile(flag) => write!(f, "`{flag}` points to an empty secret file"),
-            Self::ReadRelayAuthTokenFile => {
-                write!(f, "failed to read relay auth token file")
-            }
             Self::ReadRelayDaemonTokenFile => {
                 write!(f, "failed to read relay daemon token file")
             }
-            Self::ConflictingRelayAuthTokenSources => write!(
-                f,
-                "`--relay-auth-token` and `--relay-auth-token-file` cannot be used together\n{}",
-                Self::usage()
-            ),
             Self::ConflictingRelayDaemonTokenSources => write!(
                 f,
                 "`--relay-daemon-token` and `--relay-daemon-token-file` cannot be used together\n{}",
@@ -1232,7 +1151,6 @@ mod tests {
             CliCommand::Serve {
                 listen: None,
                 relay_urls: Vec::new(),
-                relay_auth_token: None,
                 relay_daemon_token: None,
                 relay_proxy_url: None,
                 tls: None,
@@ -1262,6 +1180,25 @@ mod tests {
     }
 
     #[test]
+    fn help_and_parser_do_not_expose_legacy_relay_auth_flags() {
+        assert!(!HELP_TEXT.contains("--relay-auth-token"));
+        assert!(!CliError::usage().contains("--relay-auth-token"));
+
+        for flag in ["--relay-auth-token", "--relay-auth-token-file"] {
+            assert!(matches!(
+                CliCommand::parse([
+                    "--relay".to_owned(),
+                    "ws://127.0.0.1:8080".to_owned(),
+                    flag.to_owned(),
+                    "legacy-secret".to_owned(),
+                ])
+                .unwrap_err(),
+                CliError::UnexpectedArgument(argument) if argument == flag
+            ));
+        }
+    }
+
+    #[test]
     fn parses_listen_address_for_serve() {
         assert_eq!(
             CliCommand::parse(["--listen".to_owned(), "0.0.0.0:8765".to_owned()]).unwrap(),
@@ -1271,7 +1208,6 @@ mod tests {
                     port: 8765,
                 }),
                 relay_urls: Vec::new(),
-                relay_auth_token: None,
                 relay_daemon_token: None,
                 relay_proxy_url: None,
                 tls: None,
@@ -1290,7 +1226,6 @@ mod tests {
                     port: 8765,
                 }),
                 relay_urls: Vec::new(),
-                relay_auth_token: None,
                 relay_daemon_token: None,
                 relay_proxy_url: None,
                 tls: None,
@@ -1306,7 +1241,6 @@ mod tests {
             CliCommand::Serve {
                 listen: None,
                 relay_urls: vec!["ws://127.0.0.1:8080/".to_owned()],
-                relay_auth_token: None,
                 relay_daemon_token: None,
                 relay_proxy_url: None,
                 tls: None,
@@ -1319,7 +1253,6 @@ mod tests {
             CliCommand::Serve {
                 listen: None,
                 relay_urls: vec!["ws://127.0.0.1:8080".to_owned()],
-                relay_auth_token: None,
                 relay_daemon_token: None,
                 relay_proxy_url: None,
                 tls: None,
@@ -1335,7 +1268,6 @@ mod tests {
             CliCommand::Serve {
                 listen: None,
                 relay_urls: vec!["wss://termd.yiln.de/ws".to_owned()],
-                relay_auth_token: None,
                 relay_daemon_token: None,
                 relay_proxy_url: None,
                 tls: None,
@@ -1359,28 +1291,12 @@ mod tests {
     }
 
     #[test]
-    fn debug_output_does_not_leak_relay_auth_token() {
-        let command = CliCommand::parse([
-            "--relay".to_owned(),
-            "ws://127.0.0.1:8080".to_owned(),
-            "--relay-auth-token".to_owned(),
-            "relay-secret-1".to_owned(),
-        ])
-        .unwrap();
-
-        let rendered = format!("{command:?}");
-        assert!(rendered.contains("ws://127.0.0.1:8080"));
-        assert!(!rendered.contains("relay-secret-1"));
-    }
-
-    #[test]
     fn parses_web_flag_for_serve() {
         assert_eq!(
             CliCommand::parse(["--web".to_owned()]).unwrap(),
             CliCommand::Serve {
                 listen: None,
                 relay_urls: Vec::new(),
-                relay_auth_token: None,
                 relay_daemon_token: None,
                 relay_proxy_url: None,
                 tls: None,
@@ -1536,7 +1452,6 @@ mod tests {
             vec![format!("ws://{flaky_addr}"), format!("ws://{healthy_addr}")],
             None,
             None,
-            None,
             reconnect_policy,
             protocol,
         );
@@ -1602,7 +1517,6 @@ mod tests {
             CliCommand::Serve {
                 listen: None,
                 relay_urls: Vec::new(),
-                relay_auth_token: None,
                 relay_daemon_token: None,
                 relay_proxy_url: None,
                 tls: Some(TlsPaths::new(
@@ -1616,59 +1530,27 @@ mod tests {
     }
 
     #[test]
-    fn parses_relay_auth_token_for_serve_without_debug_leakage() {
-        let command = CliCommand::parse([
-            "--relay".to_owned(),
-            "ws://127.0.0.1:8080".to_owned(),
-            "--relay-auth-token".to_owned(),
-            "relay-secret-1".to_owned(),
-        ])
-        .unwrap();
-
-        assert_eq!(
-            command,
-            CliCommand::Serve {
-                listen: None,
-                relay_urls: vec!["ws://127.0.0.1:8080".to_owned()],
-                relay_auth_token: Some("relay-secret-1".to_owned()),
-                relay_daemon_token: None,
-                relay_proxy_url: None,
-                tls: None,
-                web: false,
-            }
-        );
-        assert!(!format!("{command:?}").contains("relay-secret-1"));
-    }
-
-    #[test]
-    fn parses_relay_token_files_for_serve_without_debug_leakage() {
-        let auth_path =
-            std::env::temp_dir().join(format!("termd-relay-auth-token-{}.txt", std::process::id()));
+    fn parses_relay_daemon_token_file_for_serve_without_debug_leakage() {
         let daemon_path = std::env::temp_dir().join(format!(
             "termd-relay-daemon-token-{}.txt",
             std::process::id()
         ));
-        std::fs::write(&auth_path, "relay-secret-from-file\n").unwrap();
         std::fs::write(&daemon_path, "daemon-secret-from-file\n").unwrap();
 
         let command = CliCommand::parse([
             "--relay".to_owned(),
             "ws://127.0.0.1:8080".to_owned(),
-            "--relay-auth-token-file".to_owned(),
-            auth_path.to_string_lossy().into_owned(),
             "--relay-daemon-token-file".to_owned(),
             daemon_path.to_string_lossy().into_owned(),
         ])
         .unwrap();
 
-        std::fs::remove_file(&auth_path).ok();
         std::fs::remove_file(&daemon_path).ok();
         assert_eq!(
             command,
             CliCommand::Serve {
                 listen: None,
                 relay_urls: vec!["ws://127.0.0.1:8080".to_owned()],
-                relay_auth_token: Some("relay-secret-from-file".to_owned()),
                 relay_daemon_token: Some("daemon-secret-from-file".to_owned()),
                 relay_proxy_url: None,
                 tls: None,
@@ -1676,7 +1558,6 @@ mod tests {
             }
         );
         let rendered = format!("{command:?}");
-        assert!(!rendered.contains("relay-secret-from-file"));
         assert!(!rendered.contains("daemon-secret-from-file"));
     }
 
@@ -1693,7 +1574,6 @@ mod tests {
             CliCommand::Serve {
                 listen: None,
                 relay_urls: vec!["wss://relay.example/ws".to_owned()],
-                relay_auth_token: None,
                 relay_daemon_token: None,
                 relay_proxy_url: Some("http://127.0.0.1:3128".to_owned()),
                 tls: None,
@@ -1712,7 +1592,6 @@ mod tests {
             CliCommand::Serve {
                 listen: None,
                 relay_urls: vec!["ws://127.0.0.1:8080".to_owned()],
-                relay_auth_token: None,
                 relay_daemon_token: None,
                 relay_proxy_url: Some("socks5://127.0.0.1:1080".to_owned()),
                 tls: None,
@@ -1848,20 +1727,6 @@ mod tests {
             )
             .unwrap_err(),
             CliError::UnsupportedRelayProxy(url) if url == "https://proxy.example:443"
-        ));
-    }
-
-    #[test]
-    fn rejects_empty_relay_auth_token_for_serve() {
-        assert!(matches!(
-            CliCommand::parse([
-                "--relay".to_owned(),
-                "ws://127.0.0.1:8080".to_owned(),
-                "--relay-auth-token".to_owned(),
-                String::new(),
-            ])
-            .unwrap_err(),
-            CliError::EmptyRelayAuthTokenValue
         ));
     }
 

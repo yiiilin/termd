@@ -4,8 +4,8 @@ set -euo pipefail
 
 # 这个脚本安装 termd 二进制并注册 systemd 服务。
 # 服务默认只监听 loopback，relay 和 TLS 通过 /etc/termd/termd.env 进行可选配置。
-# supervisor 兼容版本默认跟随源码树里的 `SUPERVISOR_VERSION` 文件，格式采用
-# yyyy-mm-dd 或 yyyy-mm-dd.N；release 资产会通过 REQUIRED_SUPERVISOR_VERSION 注入。
+# supervisor 兼容版本默认跟随源码树里的 `SUPERVISOR_VERSION` 文件；release 资产会
+# 通过 REQUIRED_SUPERVISOR_VERSION 注入。版本是 opaque compatibility id，不按日期解析。
 
 COMPONENT="termd"
 BIN_NAME="termd"
@@ -33,11 +33,7 @@ PREVIOUS_STATE_DIR=""
 INSTALL_SET_LISTEN=0
 INSTALL_SET_WEB=0
 INSTALL_SET_RELAY_URLS=0
-INSTALL_SET_RELAY_AUTH_TOKEN=0
-INSTALL_SET_RELAY_AUTH_TOKEN_FILE=0
-INSTALL_SET_RELAY_DAEMON_TOKEN=0
 INSTALL_SET_RELAY_DAEMON_TOKEN_FILE=0
-INSTALL_SET_RELAY_SETUP_TOKEN=0
 INSTALL_SET_RELAY_SETUP_TOKEN_FILE=0
 INSTALL_SET_TLS_CERT=0
 INSTALL_SET_TLS_KEY=0
@@ -162,11 +158,7 @@ Options:
   --listen <HOST:PORT>          Set TERMD_LISTEN, for example 0.0.0.0:8765.
   --public                      Alias for --listen 0.0.0.0:8765.
   --relay <WS_URL>              Set the relay URL.
-  --relay-auth-token <TOKEN>    Set relay transport auth token.
-  --relay-auth-token-file <PATH> Read relay transport auth token from a file.
-  --relay-daemon-token <TOKEN>  Set trusted relay daemon admission token.
   --relay-daemon-token-file <PATH> Read trusted relay daemon admission token from a file.
-  --relay-setup-token <TOKEN>   Use relay setup token once to register this daemon.
   --relay-setup-token-file <PATH> Read relay setup token once from a file.
   --proxy <URL>                 Set relay outbound proxy; http://host:port or socks5://host:port.
                                 Also supports HTTP_PROXY, HTTPS_PROXY, ALL_PROXY and NO_PROXY in /etc/termd/termd.env.
@@ -233,34 +225,10 @@ parse_args() {
         INSTALL_SET_RELAY_URLS=1
         shift 2
         ;;
-      --relay-auth-token)
-        [[ $# -ge 2 && -n "$2" ]] || die "--relay-auth-token requires a non-empty value"
-        TERMD_RELAY_AUTH_TOKEN="$2"
-        INSTALL_SET_RELAY_AUTH_TOKEN=1
-        shift 2
-        ;;
-      --relay-auth-token-file)
-        [[ $# -ge 2 && -n "$2" ]] || die "--relay-auth-token-file requires a non-empty value"
-        TERMD_RELAY_AUTH_TOKEN_FILE="$2"
-        INSTALL_SET_RELAY_AUTH_TOKEN_FILE=1
-        shift 2
-        ;;
-      --relay-daemon-token)
-        [[ $# -ge 2 && -n "$2" ]] || die "--relay-daemon-token requires a non-empty value"
-        TERMD_RELAY_DAEMON_TOKEN="$2"
-        INSTALL_SET_RELAY_DAEMON_TOKEN=1
-        shift 2
-        ;;
       --relay-daemon-token-file)
         [[ $# -ge 2 && -n "$2" ]] || die "--relay-daemon-token-file requires a non-empty value"
         TERMD_RELAY_DAEMON_TOKEN_FILE="$2"
         INSTALL_SET_RELAY_DAEMON_TOKEN_FILE=1
-        shift 2
-        ;;
-      --relay-setup-token)
-        [[ $# -ge 2 && -n "$2" ]] || die "--relay-setup-token requires a non-empty value"
-        TERMD_RELAY_SETUP_TOKEN="$2"
-        INSTALL_SET_RELAY_SETUP_TOKEN=1
         shift 2
         ;;
       --relay-setup-token-file)
@@ -688,6 +656,9 @@ read_default_supervisor_version() {
 
 apply_env_overrides() {
   # 命令行参数只覆盖用户显式传入的项，避免重装时意外抹掉已有 systemd 配置。
+  # 0.7 只使用 daemon admission token；升级时移除已废弃的 relay transport token 配置。
+  unset_env_var "TERMD_RELAY_AUTH_TOKEN"
+  unset_env_var "TERMD_RELAY_AUTH_TOKEN_FILE"
   if [[ "$INSTALL_SET_LISTEN" -eq 1 ]]; then
     upsert_env_var "TERMD_LISTEN" "$TERMD_LISTEN"
   fi
@@ -697,25 +668,10 @@ apply_env_overrides() {
   if [[ "$INSTALL_SET_RELAY_URLS" -eq 1 ]]; then
     upsert_env_var "TERMD_RELAY_URLS" "$TERMD_RELAY_URLS"
   fi
-  if [[ "$INSTALL_SET_RELAY_AUTH_TOKEN" -eq 1 ]]; then
-    write_service_secret_file "/etc/termd/termd_relay_token" "$TERMD_RELAY_AUTH_TOKEN"
-    upsert_env_var "TERMD_RELAY_AUTH_TOKEN_FILE" "/etc/termd/termd_relay_token"
-    unset_env_var "TERMD_RELAY_AUTH_TOKEN"
-  fi
-  if [[ "$INSTALL_SET_RELAY_AUTH_TOKEN_FILE" -eq 1 ]]; then
-    upsert_env_var "TERMD_RELAY_AUTH_TOKEN_FILE" "$TERMD_RELAY_AUTH_TOKEN_FILE"
-    unset_env_var "TERMD_RELAY_AUTH_TOKEN"
-  fi
-  if [[ "$INSTALL_SET_RELAY_DAEMON_TOKEN" -eq 1 ]]; then
-    write_service_secret_file "/etc/termd/termd_daemon_token" "$TERMD_RELAY_DAEMON_TOKEN"
-    upsert_env_var "TERMD_RELAY_DAEMON_TOKEN_FILE" "/etc/termd/termd_daemon_token"
-    unset_env_var "TERMD_RELAY_DAEMON_TOKEN"
-  fi
   if [[ "$INSTALL_SET_RELAY_DAEMON_TOKEN_FILE" -eq 1 ]]; then
     upsert_env_var "TERMD_RELAY_DAEMON_TOKEN_FILE" "$TERMD_RELAY_DAEMON_TOKEN_FILE"
-    unset_env_var "TERMD_RELAY_DAEMON_TOKEN"
   fi
-  if [[ -n "${TERMD_RELAY_URLS:-}" && "$INSTALL_SET_RELAY_DAEMON_TOKEN" -eq 0 && "$INSTALL_SET_RELAY_DAEMON_TOKEN_FILE" -eq 0 ]]; then
+  if [[ -n "${TERMD_RELAY_URLS:-}" && "$INSTALL_SET_RELAY_DAEMON_TOKEN_FILE" -eq 0 ]]; then
     TERMD_RELAY_DAEMON_TOKEN_FILE="/etc/termd/termd_daemon_token"
     if [[ ! -s "$TERMD_RELAY_DAEMON_TOKEN_FILE" ]]; then
       write_service_secret_file "$TERMD_RELAY_DAEMON_TOKEN_FILE" "$(generate_secret_token)"
@@ -1311,17 +1267,7 @@ write_env_file() {
     return 0
   fi
 
-  if [[ "$INSTALL_SET_RELAY_AUTH_TOKEN" -eq 1 ]]; then
-    write_service_secret_file "/etc/termd/termd_relay_token" "$TERMD_RELAY_AUTH_TOKEN"
-    TERMD_RELAY_AUTH_TOKEN_FILE="/etc/termd/termd_relay_token"
-    TERMD_RELAY_AUTH_TOKEN=""
-  fi
-  if [[ "$INSTALL_SET_RELAY_DAEMON_TOKEN" -eq 1 ]]; then
-    write_service_secret_file "/etc/termd/termd_daemon_token" "$TERMD_RELAY_DAEMON_TOKEN"
-    TERMD_RELAY_DAEMON_TOKEN_FILE="/etc/termd/termd_daemon_token"
-    TERMD_RELAY_DAEMON_TOKEN=""
-  fi
-  if [[ -n "${TERMD_RELAY_URLS:-}" && "$INSTALL_SET_RELAY_DAEMON_TOKEN" -eq 0 && "$INSTALL_SET_RELAY_DAEMON_TOKEN_FILE" -eq 0 ]]; then
+  if [[ -n "${TERMD_RELAY_URLS:-}" && "$INSTALL_SET_RELAY_DAEMON_TOKEN_FILE" -eq 0 ]]; then
     TERMD_RELAY_DAEMON_TOKEN_FILE="/etc/termd/termd_daemon_token"
     if [[ ! -s "$TERMD_RELAY_DAEMON_TOKEN_FILE" ]]; then
       write_service_secret_file "$TERMD_RELAY_DAEMON_TOKEN_FILE" "$(generate_secret_token)"
@@ -1340,21 +1286,6 @@ write_env_file() {
       printf 'TERMD_RELAY_URLS=%q\n' "$TERMD_RELAY_URLS"
     else
       printf '# TERMD_RELAY_URLS="wss://relay.example:443"\n'
-    fi
-    if [[ -n "${TERMD_RELAY_AUTH_TOKEN:-}" ]]; then
-      printf 'TERMD_RELAY_AUTH_TOKEN=%q\n' "$TERMD_RELAY_AUTH_TOKEN"
-    else
-      printf '# TERMD_RELAY_AUTH_TOKEN=replace-me\n'
-    fi
-    if [[ -n "${TERMD_RELAY_AUTH_TOKEN_FILE:-}" ]]; then
-      printf 'TERMD_RELAY_AUTH_TOKEN_FILE=%q\n' "$TERMD_RELAY_AUTH_TOKEN_FILE"
-    else
-      printf '# TERMD_RELAY_AUTH_TOKEN_FILE=/etc/termd/termd_relay_token\n'
-    fi
-    if [[ -n "${TERMD_RELAY_DAEMON_TOKEN:-}" ]]; then
-      printf 'TERMD_RELAY_DAEMON_TOKEN=%q\n' "$TERMD_RELAY_DAEMON_TOKEN"
-    else
-      printf '# TERMD_RELAY_DAEMON_TOKEN=replace-me\n'
     fi
     if [[ -n "${TERMD_RELAY_DAEMON_TOKEN_FILE:-}" ]]; then
       printf 'TERMD_RELAY_DAEMON_TOKEN_FILE=%q\n' "$TERMD_RELAY_DAEMON_TOKEN_FILE"
@@ -1422,37 +1353,7 @@ EOF
 args=()
 args+=(--listen "${TERMD_LISTEN:-127.0.0.1:8765}")
 
-if [[ -n "${TERMD_RELAY_AUTH_TOKEN:-}" && "${TERMD_ALLOW_INLINE_TOKENS:-0}" != "1" ]]; then
-  printf '[termd-install] TERMD_RELAY_AUTH_TOKEN 会泄漏到 argv；请改用 TERMD_RELAY_AUTH_TOKEN_FILE。\n' >&2
-  exit 1
-fi
-
-if [[ -n "${TERMD_RELAY_AUTH_TOKEN:-}" ]]; then
-  args+=(--relay-auth-token "$TERMD_RELAY_AUTH_TOKEN")
-fi
-
-if [[ -n "${TERMD_RELAY_AUTH_TOKEN_FILE:-}" ]]; then
-  if [[ -n "${TERMD_RELAY_AUTH_TOKEN:-}" ]]; then
-    printf '[termd-install] TERMD_RELAY_AUTH_TOKEN 和 TERMD_RELAY_AUTH_TOKEN_FILE 只能配置一个。\n' >&2
-    exit 1
-  fi
-  args+=(--relay-auth-token-file "$TERMD_RELAY_AUTH_TOKEN_FILE")
-fi
-
-if [[ -n "${TERMD_RELAY_DAEMON_TOKEN:-}" && "${TERMD_ALLOW_INLINE_TOKENS:-0}" != "1" ]]; then
-  printf '[termd-install] TERMD_RELAY_DAEMON_TOKEN 会泄漏到 argv；请改用 TERMD_RELAY_DAEMON_TOKEN_FILE。\n' >&2
-  exit 1
-fi
-
-if [[ -n "${TERMD_RELAY_DAEMON_TOKEN:-}" ]]; then
-  args+=(--relay-daemon-token "$TERMD_RELAY_DAEMON_TOKEN")
-fi
-
 if [[ -n "${TERMD_RELAY_DAEMON_TOKEN_FILE:-}" ]]; then
-  if [[ -n "${TERMD_RELAY_DAEMON_TOKEN:-}" ]]; then
-    printf '[termd-install] TERMD_RELAY_DAEMON_TOKEN 和 TERMD_RELAY_DAEMON_TOKEN_FILE 只能配置一个。\n' >&2
-    exit 1
-  fi
   args+=(--relay-daemon-token-file "$TERMD_RELAY_DAEMON_TOKEN_FILE")
 fi
 
@@ -1626,18 +1527,17 @@ PY
 
 warn_missing_relay_registration_token() {
   [[ -n "${TERMD_RELAY_URLS:-}" ]] || return 0
-  [[ -z "${TERMD_RELAY_SETUP_TOKEN:-}" && -z "${TERMD_RELAY_SETUP_TOKEN_FILE:-}" ]] || return 0
-  [[ -z "${TERMD_RELAY_AUTH_TOKEN:-}" && -z "${TERMD_RELAY_AUTH_TOKEN_FILE:-}" ]] || return 0
+  [[ -z "${TERMD_RELAY_SETUP_TOKEN_FILE:-}" ]] || return 0
 
   log "relay is configured, but no relay setup token was provided; trusted relay registration was not attempted"
 }
 
 register_daemon_with_relay() {
-  local pairing_response="$1"
-  local server_id relay_url register_url setup_token tmp_dir curl_config payload_file
+  local health_response="$1"
+  local server_id daemon_public_key relay_url register_url setup_token tmp_dir curl_config payload_file
 
   [[ -n "${TERMD_RELAY_URLS:-}" ]] || return 0
-  if [[ -z "${TERMD_RELAY_SETUP_TOKEN:-}" && -z "${TERMD_RELAY_SETUP_TOKEN_FILE:-}" ]]; then
+  if [[ -z "${TERMD_RELAY_SETUP_TOKEN_FILE:-}" ]]; then
     warn_missing_relay_registration_token
     return 0
   fi
@@ -1645,15 +1545,11 @@ register_daemon_with_relay() {
     log "relay setup token was provided, but daemon token file is missing"
     return 1
   }
-  if [[ -n "${TERMD_RELAY_SETUP_TOKEN_FILE:-}" ]]; then
-    setup_token="$(read_first_line "$TERMD_RELAY_SETUP_TOKEN_FILE")"
-  else
-    setup_token="$TERMD_RELAY_SETUP_TOKEN"
-  fi
+  setup_token="$(read_first_line "$TERMD_RELAY_SETUP_TOKEN_FILE")"
 
-  # 中文注释：复用已签发的初始 pairing 响应取 server_id，避免为了注册 relay 额外生成
-  # 一个用户看不到、但 5 分钟内仍有效的 pairing token。
-  server_id="$(printf '%s' "$pairing_response" | python3 -c 'import json,sys; print(json.load(sys.stdin)["server_id"])')" || return 1
+  # daemon registry 只接收稳定身份材料，不注册或同步 pair/device/access credential。
+  server_id="$(printf '%s' "$health_response" | python3 -c 'import json,sys; print(json.load(sys.stdin)["server_id"])')" || return 1
+  daemon_public_key="$(printf '%s' "$health_response" | python3 -c 'import json,sys; print(json.load(sys.stdin)["daemon_public_key"])')" || return 1
   read -r -a relay_urls <<<"${TERMD_RELAY_URLS}"
   relay_url="${relay_urls[0]:-}"
   [[ -n "$relay_url" ]] || return 0
@@ -1671,14 +1567,15 @@ register_daemon_with_relay() {
   curl_config="${tmp_dir}/curl.conf"
   payload_file="${tmp_dir}/register.json"
   chmod 0700 "$tmp_dir"
-  if ! python3 - "$server_id" "$TERMD_RELAY_DAEMON_TOKEN_FILE" >"$payload_file" <<'PY'
+  if ! python3 - "$server_id" "$daemon_public_key" "$TERMD_RELAY_DAEMON_TOKEN_FILE" >"$payload_file" <<'PY'
 import json
 import sys
 
 server_id = sys.argv[1]
-with open(sys.argv[2], "r", encoding="utf-8") as token_file:
+daemon_public_key = sys.argv[2]
+with open(sys.argv[3], "r", encoding="utf-8") as token_file:
     daemon_token = token_file.readline().strip()
-print(json.dumps({"server_id": server_id, "daemon_token": daemon_token}, separators=(",", ":")))
+print(json.dumps({"server_id": server_id, "daemon_token": daemon_token, "daemon_public_key": daemon_public_key}, separators=(",", ":")))
 PY
   then
     rm -rf "$tmp_dir"
@@ -1738,6 +1635,7 @@ import json
 import os
 import shlex
 import sys
+from urllib.parse import urlsplit, urlunsplit
 
 payload = json.load(sys.stdin)
 base_url = os.environ["PAIRING_BASE_URL"]
@@ -1747,8 +1645,14 @@ server_id = payload.get("server_id", "")
 expires_at_ms = int(payload.get("expires_at_ms", 0))
 daemon_public_key = payload.get("daemon_public_key", "")
 relay_urls = os.environ.get("TERMD_RELAY_URLS", "").split()
-direct_ws_url = base_url.replace("https://", "wss://", 1).replace("http://", "ws://", 1) + "/ws"
-pair_ws_url = relay_urls[0] if relay_urls else direct_ws_url
+pair_url = relay_urls[0] if relay_urls else base_url
+if relay_urls:
+    parsed = urlsplit(pair_url)
+    scheme = "https" if parsed.scheme == "wss" else "http" if parsed.scheme == "ws" else parsed.scheme
+    path = parsed.path.rstrip("/")
+    if path.endswith("/ws"):
+        path = path[:-3]
+    pair_url = urlunsplit((scheme, parsed.netloc, path, "", ""))
 
 def invite_code():
     # 邀请码只是单行 URL-safe 包装，不是长期密钥；真正认证仍由 daemon 的 pairing/auth 完成。
@@ -1765,12 +1669,10 @@ def invite_code():
 
 web_invite = invite_code()
 print(f"[termd-install] initial pairing invite, expires in {ttl_ms // 1000}s:")
-print("[termd-install] raw token:")
-print(token)
-print("[termd-install] pair with:")
-print(f"termctl pair --payload {shlex.quote(web_invite)} --url {shlex.quote(pair_ws_url)}")
-print("[termd-install] web invite code:")
+print("[termd-install] sensitive one-time invite; do not put it in argv, URLs, or logs:")
 print(web_invite)
+print("[termd-install] for CLI, store the invite in a mode-0600 file, then run:")
+print(f"termctl pair --payload-file /path/to/termd-pair-invite --url {shlex.quote(pair_url)}")
 print("[termd-install] open the Web page you plan to use and paste or scan this invite code.")
 ')"; then
         printf '\n%s\n' "$summary"

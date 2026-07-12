@@ -91,7 +91,6 @@ async fn main() -> Result<(), MainError> {
         listen = %args.listen,
         tls = tls.is_some(),
         web = args.web,
-        http_tunnel = args.http_tunnel,
         allow_open_relay = args.allow_open_relay,
         "starting trusted termrelay"
     );
@@ -111,6 +110,7 @@ async fn main() -> Result<(), MainError> {
                         RelayDaemonCredential::token_hash(daemon.server_id, token_hash.to_owned())
                     }
                 })
+                .map(|credential| credential.with_public_key(daemon.daemon_public_key.clone()))
         })
         .collect::<Vec<_>>();
     if args.setup_token.is_some() && args.daemon_registry_path.is_none() {
@@ -119,9 +119,7 @@ async fn main() -> Result<(), MainError> {
 
     let state = if args.setup_token.is_some() || !daemon_credentials.is_empty() {
         RelayState::new_trusted_with_registry(
-            args.auth_token,
             daemon_credentials,
-            Vec::new(),
             args.setup_token,
             args.daemon_registry_path,
         )?
@@ -129,10 +127,10 @@ async fn main() -> Result<(), MainError> {
         if !args.allow_open_relay {
             return Err(MainError::MissingDaemonRegistry);
         }
-        RelayState::new(args.auth_token)
+        RelayState::new()
     };
 
-    serve_listener(listener, state, tls, args.web, args.http_tunnel).await
+    serve_listener(listener, state, tls, args.web).await
 }
 
 fn install_rustls_crypto_provider() {
@@ -149,15 +147,12 @@ fn help_text() -> String {
             "  termrelay [OPTIONS]\n\n",
             "OPTIONS:\n",
             "  --listen, -l <HOST:PORT>      Listen address, default 127.0.0.1:8080\n",
-            "  --auth-token <TOKEN>          Transport auth token required from daemon/client relay sockets\n",
-            "  --auth-token-file <PATH>      Read transport auth token from a file; conflicts with --auth-token\n",
             "  --setup-token-file <PATH>     Read daemon registration setup token from a file\n",
             "  --daemon-registry <PATH>      JSON daemon registry enabling trusted relay admission\n",
             "  --allow-open-relay            Explicitly allow legacy/open relay mode without daemon registry\n",
             "  --tls-cert <CERT_PEM>         TLS certificate path\n",
             "  --tls-key <KEY_PEM>           TLS private key path; must be paired with --tls-cert\n",
             "  --web                         Serve embedded Web UI\n",
-            "  --http-tunnel                 Enable compatibility HTTP file tunnel paths\n",
             "  -h, --help                    Print help\n",
             "  -V, --version                 Print version\n\n",
             "EXAMPLES:\n",
@@ -190,13 +185,10 @@ async fn serve_listener(
     state: RelayState,
     tls: Option<TlsPaths>,
     web_enabled: bool,
-    http_tunnel_enabled: bool,
 ) -> Result<(), MainError> {
     match tls {
-        Some(paths) => {
-            serve_tls_listener(listener, state, paths, web_enabled, http_tunnel_enabled).await
-        }
-        None => axum::serve(listener, router(state, web_enabled, http_tunnel_enabled))
+        Some(paths) => serve_tls_listener(listener, state, paths, web_enabled).await,
+        None => axum::serve(listener, router(state, web_enabled))
             .with_graceful_shutdown(shutdown_signal())
             .await
             .map_err(MainError::Serve),
@@ -208,15 +200,9 @@ async fn serve_tls_listener(
     state: RelayState,
     tls_paths: TlsPaths,
     web_enabled: bool,
-    http_tunnel_enabled: bool,
 ) -> Result<(), MainError> {
     let tls_config = load_rustls_server_config(&tls_paths)?;
-    serve_rustls_listener(
-        listener,
-        router(state, web_enabled, http_tunnel_enabled),
-        tls_config,
-    )
-    .await
+    serve_rustls_listener(listener, router(state, web_enabled), tls_config).await
 }
 
 fn load_rustls_server_config(tls_paths: &TlsPaths) -> Result<rustls::ServerConfig, MainError> {
@@ -313,8 +299,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            let _ =
-                serve_tls_listener(listener, RelayState::default(), tls_paths, false, false).await;
+            let _ = serve_tls_listener(listener, RelayState::default(), tls_paths, false).await;
         });
 
         let response = tls_healthz_request(addr, &cert_path).await;

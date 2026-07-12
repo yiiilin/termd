@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, type Dispatch, type MutableRefObject, type SetStateAction } from "react";
-import type { DirectClient } from "../protocol/direct-client";
+import type { V070Client } from "../protocol/v070-client";
 import type {
   AttachFramePayload,
   SessionActivityPayload,
@@ -66,12 +66,12 @@ export function useTerminalAttach() {
   const terminalSnapshotTokenSeqRef = useRef(0);
   const terminalSnapshotRevealHistoryTokensRef = useRef<Map<UUID, number>>(new Map());
   const terminalSnapshotPendingFullSnapshotTokensRef = useRef<Map<UUID, PendingFullSnapshotToken>>(new Map());
-  const terminalSnapshotClientFullSnapshotTokensRef = useRef<WeakMap<DirectClient, { sessionId: UUID; token: number }>>(new WeakMap());
+  const terminalSnapshotClientFullSnapshotTokensRef = useRef<WeakMap<V070Client, { sessionId: UUID; token: number }>>(new WeakMap());
   const attachReconnectTimerRef = useRef<number | undefined>(undefined);
   const attachReconnectKeyRef = useRef<string | undefined>(undefined);
   const attachReconnectAttemptsRef = useRef(0);
   const attachReconnectLastErrorRef = useRef<unknown>(undefined);
-  const attachReconnectHandlerRef = useRef<(client: DirectClient, caught: unknown, options?: AttachReconnectOptions) => boolean>(() => false);
+  const attachReconnectHandlerRef = useRef<(client: V070Client, caught: unknown, options?: AttachReconnectOptions) => boolean>(() => false);
 
   return {
     pendingTerminalAttachSessionRef,
@@ -118,7 +118,7 @@ function yieldToEventLoop(): Promise<void> {
 }
 
 interface UseTerminalReceiveLoopOptions {
-  attachClientRef: MutableRefObject<DirectClient | undefined>;
+  attachClientRef: MutableRefObject<V070Client | undefined>;
   sessionFilesFollowTerminalCwdRef: MutableRefObject<boolean>;
   applyConfirmedSessionSize: (sessionId: UUID, size: TerminalSize) => void;
   enqueueTerminalOutput: (item: TerminalOutputItem) => void;
@@ -174,7 +174,7 @@ export function useTerminalReceiveLoop(
   } = controller;
   const terminalOutputTraceCountRef = useRef(0);
 
-  return useCallback((client: DirectClient) => {
+  return useCallback((client: V070Client) => {
     const loopGeneration = receiveLoopGenerationRef.current + 1;
     receiveLoopGenerationRef.current = loopGeneration;
     receiveLoopActiveRef.current = true;
@@ -645,17 +645,17 @@ export function useTerminalReceiveLoop(
 }
 
 interface UseTerminalReconnectSchedulerOptions {
-  attachClientRef: MutableRefObject<DirectClient | undefined>;
-  pendingAttachClientRef: MutableRefObject<DirectClient | undefined>;
+  attachClientRef: MutableRefObject<V070Client | undefined>;
+  pendingAttachClientRef: MutableRefObject<V070Client | undefined>;
   activeServerId?: UUID;
   attachedSessionId?: UUID;
   selectedSessionId?: UUID;
-  authenticatedClient: (timeoutMs: number, signal?: AbortSignal) => Promise<DirectClient>;
+  authenticatedClient: (timeoutMs: number, signal?: AbortSignal) => Promise<V070Client>;
   attachConnectionTimeoutMs: number;
   reconnectDelaysMs: number[];
   isRetryableConnectionError: (caught: unknown) => boolean;
   isTerminalTransportPaused: () => boolean;
-  closeAttachForReconnect: (client?: DirectClient) => boolean;
+  closeAttachForReconnect: (client?: V070Client) => boolean;
   discardPendingTerminalOutput: () => void;
   resetAttachReconnectState: () => void;
   setError: (error: SafeError | undefined) => void;
@@ -664,13 +664,12 @@ interface UseTerminalReconnectSchedulerOptions {
   setAttachedSessionId: (sessionId: UUID | undefined) => void;
   setSessions: Dispatch<SetStateAction<SessionSummaryPayload[]>>;
   sessionOrderRef: MutableRefObject<UUID[]>;
-  sessionPermissionIdsRef: MutableRefObject<Set<UUID>>;
   clearNewOutputMark: (sessionId: UUID) => void;
   clearTerminalOutput: () => number;
   clearTerminalSnapshotRevealHistory: (sessionId?: UUID, snapshotToken?: number) => void;
   waitForTerminalOutputResetApplied: (version: number) => Promise<void>;
   selectSession: (sessionId: UUID | undefined) => void;
-  startReceiveLoop: (client: DirectClient) => void;
+  startReceiveLoop: (client: V070Client) => void;
   loadSessionFiles: (
     sessionId: UUID,
     path?: string,
@@ -678,9 +677,8 @@ interface UseTerminalReconnectSchedulerOptions {
   ) => Promise<void>;
   sessionFilesAutoRefreshPath?: () => string | undefined;
   loadSessionGit: (sessionId: UUID, options?: { silent?: boolean }) => Promise<void>;
-  refreshDaemonClients: () => Promise<void>;
-  claimAttachClient: (client: DirectClient) => void;
-  onAttachTransportReady?: (client: DirectClient, sessionId: UUID) => Promise<void> | void;
+  claimAttachClient: (client: V070Client) => void;
+  onAttachTransportReady?: (client: V070Client, sessionId: UUID) => Promise<void> | void;
   upsertAttachedSession: (
     current: SessionSummaryPayload[],
     attached: SessionAttachedPayload,
@@ -719,7 +717,7 @@ export function useTerminalReconnectScheduler(
     terminalSnapshotClientFullSnapshotTokensRef,
   } = controller;
 
-  return useCallback((staleClient: DirectClient, caught: unknown, reconnectOptions: AttachReconnectOptions = {}) => {
+  return useCallback((staleClient: V070Client, caught: unknown, reconnectOptions: AttachReconnectOptions = {}) => {
     const options = optionsRef.current;
     const safeCaught = toSafeError(caught);
     recordTermdDiagnostic("reconnect_requested", {
@@ -866,7 +864,7 @@ export function useTerminalReconnectScheduler(
     attachReconnectTimerRef.current = window.setTimeout(() => {
       attachReconnectTimerRef.current = undefined;
       void (async () => {
-        let client: DirectClient | undefined;
+        let client: V070Client | undefined;
         let attachAbortController: AbortController | undefined;
         try {
           recordTermdDiagnostic("reconnect_timer_fired", {
@@ -912,14 +910,7 @@ export function useTerminalReconnectScheduler(
           }
           options.pendingAttachClientRef.current = client;
           pendingTerminalAttachSessionRef.current = sessionId;
-          const attached = await client.attachSession(
-            sessionId,
-            {
-              ...(lastTerminalSeq !== undefined ? { lastTerminalSeq } : {}),
-              timeoutMs: options.attachConnectionTimeoutMs,
-              signal: attachAbortController.signal,
-            },
-          );
+          const attached = await client.attachSession(sessionId);
           recordTermdDiagnostic("reconnect_attach_ack", {
             reconnectKey,
             sessionId,
@@ -929,7 +920,7 @@ export function useTerminalReconnectScheduler(
           });
           if (!isCurrentReconnect()) {
             clearCurrentSnapshotIntent();
-            client.detachSession(sessionId, "stale_reconnect");
+            client.detachSession(sessionId);
             closePendingReconnectClient();
             return;
           }
@@ -964,7 +955,6 @@ export function useTerminalReconnectScheduler(
             terminalSnapshotClientFullSnapshotTokensRef.current.set(attachedClient, { sessionId, token: snapshotToken });
           }
           attachedSessionRef.current = sessionId;
-          options.sessionPermissionIdsRef.current.add(sessionId);
           confirmedSessionSizesRef.current.set(attached.session_id, attached.size);
           options.selectSession(sessionId);
           options.setAttachedSessionId(sessionId);
@@ -1003,7 +993,6 @@ export function useTerminalReconnectScheduler(
           options.startReceiveLoop(attachedClient);
           void options.loadSessionFiles(sessionId, options.sessionFilesAutoRefreshPath?.(), { silent: true, source: "initial" });
           void options.loadSessionGit(sessionId, { silent: true });
-          void options.refreshDaemonClients();
         } catch (retryError) {
           if (
             attachAbortController &&

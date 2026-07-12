@@ -15,9 +15,9 @@ import {
   UsersRound,
   X,
 } from "lucide-react";
-import { DirectClient, ProtocolClientError } from "./protocol/direct-client";
-import { toSafeError } from "./protocol/errors";
-import { connectPairingClient } from "./protocol/pairing-client";
+import { V070Client } from "./protocol/v070-client";
+import { ProtocolClientError, toSafeError } from "./protocol/errors";
+import { migrateDeviceCertificate, pairDeviceOverHttp } from "./protocol/pairing-client";
 import { parsePairingQrPayload } from "./protocol/pairing-payload";
 import type {
   BrowserState,
@@ -27,7 +27,6 @@ import type {
   PairedServerState,
   SafeError,
   SessionCreatedPayload,
-  SessionCursorPresence,
   SessionAttachedPayload,
   SessionFileEntryPayload,
   SessionGitFileChangePayload,
@@ -45,6 +44,7 @@ import {
   normalizeRouteWsUrl,
   forgetDaemon,
   recordPairing,
+  recordDeviceCertificate,
   recordServerUrl,
   renameDaemon,
   saveBrowserPreferences,
@@ -74,7 +74,7 @@ import { createTranslator, I18nProvider, resolveLocale, translateSafeErrorMessag
 import { resolveTheme } from "./theme";
 import type { BrowserPreferences } from "./protocol/types";
 import { recordTermdDiagnostic } from "./diagnostics";
-import { displayUrlWithoutQueryOrFragment } from "./protocol/url";
+import { displayUrlWithoutQueryOrFragment, stripSensitiveUrlParts } from "./protocol/url";
 
 const DaemonClientsPanel = lazy(() => import("./components/DaemonClientsPanel").then((module) => ({ default: module.DaemonClientsPanel })));
 const DaemonManagerPanel = lazy(() => import("./components/DaemonManagerPanel").then((module) => ({ default: module.DaemonManagerPanel })));
@@ -105,9 +105,7 @@ const CONNECTION_AUTO_RETRY_DELAY_MS = 1500;
 const CONNECTION_AUTO_RETRY_LIMIT = 3;
 const ATTACH_RECONNECT_DELAYS_MS = [250, 1000, 2500, 5000, 10000, 20000];
 const ATTACH_SWITCH_COALESCE_DELAY_MS = 80;
-const FILES_CWD_FOLLOW_POLL_INTERVAL_MS = 5000;
 const DAEMON_METADATA_STATUS_INTERVAL_MS = 3000;
-const DAEMON_METADATA_FALLBACK_POLL_INTERVAL_MS = 10_000;
 const DAEMON_METADATA_RETRY_DELAY_MS = 1500;
 const TEXT_FILE_EDITOR_MAX_BYTES = 1024 * 1024;
 const FILE_TRANSFER_MEMORY_FALLBACK_MAX_BYTES = 16 * 1024 * 1024;
@@ -279,7 +277,7 @@ function isTerminalSidecarTransientError(caught: unknown): boolean {
   }
   if (safeError.code === "http_file_transfer_failed") {
     // 中文注释：真实 relay/浏览器在 HTTP control 瞬断时，不一定抛 fetch TypeError；
-    // 旁路网关、半开连接或空响应也可能被 httpE2ee 层稳定归一成这个错误码。
+    // 旁路网关、半开连接或空响应也可能被传输层稳定归一成这个错误码。
     // 对 resize/cursor 这类终端 sidecar，这仍只代表本次辅助 ack 失败，不能卸载当前 xterm。
     return true;
   }
@@ -372,9 +370,16 @@ export default function App() {
     [],
   );
   const handleBrokenAttachedClient = useCallback(
-    (client: DirectClient, caught: unknown) => terminalAttachController.attachReconnectHandlerRef.current(client, caught),
+    (client: V070Client, caught: unknown) => terminalAttachController.attachReconnectHandlerRef.current(client, caught),
     [terminalAttachController.attachReconnectHandlerRef],
   );
+  const handleDeviceCertificateMigrated = useCallback(async (
+    serverId: UUID,
+    deviceCertificate: string,
+  ) => {
+    const nextState = await recordDeviceCertificate(serverId, deviceCertificate);
+    setState(nextState);
+  }, []);
   const workspaceConnection = useWorkspaceConnection({
     activeServer,
     device: state.device,
@@ -386,6 +391,7 @@ export default function App() {
     isRetryableConnectionError,
     resolveServerRouteUrls: resolveWorkspaceRouteUrls,
     onBrokenAttachedClient: handleBrokenAttachedClient,
+    onDeviceCertificateMigrated: handleDeviceCertificateMigrated,
     requestTimeoutMs: APP_CONNECTION_TIMEOUT_MS,
     defaultWorkspaceTimeoutMs: ATTACH_CONNECTION_TIMEOUT_MS,
     socketConnectTimeoutMs: APP_SOCKET_CONNECT_TIMEOUT_MS,
@@ -447,15 +453,13 @@ export default function App() {
   const [activeSurface, setActiveSurface] = useState<AppSurface>("admin");
   const [status, setStatus] = useState("idle");
   const [error, setError] = useState<SafeError | undefined>();
-  // 中文注释：当前打开的 session 只绑定一条可靠 WebSocket；terminal 与普通 RPC 都在
-  // 这条连接的明文 ProtocolPacket segment 中分类。切换 session 或重连时必须
-  // 关闭旧连接并重建，保证 relay/daemon 都能用 transport close 明确清理旧 client。
+  // 每个 workspace 固定复用一条 metadata WebSocket；当前 session 的 PTY 数据只走
+  // 另一条 terminal WebSocket。HTTP 控制请求复用同一个 Access Token。
   const {
     attachClientRef,
     pendingAttachClientRef,
     workspaceClientPromiseRef,
     workspaceClientRef,
-    sessionPermissionIdsRef,
     claimAttachClient,
     connectionAutoRetryTimerRef,
     closeAttachClient,
@@ -464,7 +468,7 @@ export default function App() {
     authenticatedClient,
     authenticatedWorkspaceClient,
     authenticatedSessionClient,
-    resolveSessionScopedClient,
+    resolveSessionClient,
     openSessionOperationClient,
   } = workspaceConnection;
   const {
@@ -513,9 +517,6 @@ export default function App() {
   } | null>(null);
   const urlTouchedRef = useRef(false);
   const autoCheckedServerRef = useRef<UUID | undefined>(undefined);
-  const lastCursorReportRef = useRef("");
-  const lastCursorFocusedRef = useRef<boolean | undefined>(undefined);
-  const cursorRefreshTimerRef = useRef<number | undefined>(undefined);
   const selectedSessionIdRef = useRef<UUID | undefined>(undefined);
   const activeSurfaceRef = useRef<AppSurface>(activeSurface);
   const statusRef = useRef(status);
@@ -524,8 +525,7 @@ export default function App() {
   const pendingTerminalInputQueueRef = useRef<PendingTerminalInputQueue | undefined>(undefined);
   const retryConnectionHandlerRef = useRef<(() => Promise<void> | undefined) | undefined>(undefined);
   const daemonStatusRequestSeqRef = useRef(0);
-  const daemonClientsRefreshInFlightRef = useRef(false);
-  const metadataClientRef = useRef<DirectClient | undefined>(undefined);
+  const metadataClientRef = useRef<V070Client | undefined>(undefined);
   const metadataClientAbortControllerRef = useRef<AbortController | undefined>(undefined);
   const metadataClientGenerationRef = useRef(0);
   const metadataRetryTimerRef = useRef<number | undefined>(undefined);
@@ -755,8 +755,7 @@ export default function App() {
       return;
     }
 
-    // 浏览器标题只使用 daemon 地址和当前 session 名称；URL query/fragment 可能包含 relay token，
-    // 不能放进窗口标题或系统任务切换器。
+    // 浏览器标题只使用 daemon 地址和当前 session 名称，不复制 URL query/fragment。
     document.title = `Termd - ${daemonAddressForTitle(activeServer.url)} - ${sessionDisplayName(toolbarSession)}`;
   }, [activeServer?.url, toolbarSession]);
 
@@ -824,8 +823,7 @@ export default function App() {
     metadataClientAbortControllerRef.current = undefined;
     const client = metadataClientRef.current;
     metadataClientRef.current = undefined;
-    if (client) {
-      client.interruptReceiveWaiters();
+    if (client && workspaceClientRef.current !== client && attachClientRef.current !== client) {
       client.close();
     }
     setMetadataReady(false);
@@ -984,7 +982,7 @@ export default function App() {
     }
   }, []);
 
-  const flushPendingTerminalInput = useCallback(async (client: DirectClient, sessionId: UUID) => {
+  const flushPendingTerminalInput = useCallback(async (client: V070Client, sessionId: UUID) => {
     const queue = pendingTerminalInputQueueRef.current;
     if (queue?.sessionId !== sessionId || queue.chunks.length === 0) {
       return;
@@ -1062,7 +1060,7 @@ export default function App() {
     }
   }, []);
 
-  const closeAttachForReconnect = useCallback((client?: DirectClient) => {
+  const closeAttachForReconnect = useCallback((client?: V070Client) => {
     const belongsToCurrentAttach =
       !client ||
       attachClientRef.current === client ||
@@ -1084,12 +1082,6 @@ export default function App() {
     cancelScheduledAttachSwitch();
     closeAttachClient();
     pendingResizeKeyRef.current = undefined;
-    lastCursorReportRef.current = "";
-    lastCursorFocusedRef.current = undefined;
-    if (cursorRefreshTimerRef.current !== undefined) {
-      window.clearTimeout(cursorRefreshTimerRef.current);
-      cursorRefreshTimerRef.current = undefined;
-    }
     return true;
   }, [cancelScheduledAttachSwitch, closeAttachClient, pendingTerminalAttachAbortControllerRef]);
 
@@ -1226,7 +1218,7 @@ export default function App() {
     receiveLoopActiveRef.current = false;
     receiveLoopGenerationRef.current += 1;
     // 中文注释：切换 session、主动断开、恢复重连都以 WebSocket 生命周期作为边界。
-    // DirectClient.close 会先尽力 cancel 已知 terminal stream，再关闭 transport；即使 cancel
+    // V070Client.close 会先尽力 cancel 已知 terminal stream，再关闭 transport；即使 cancel
     // 没送达，daemon/relay 也能通过 WebSocket close 清掉旧 client context。
     pendingTerminalAttachAbortControllerRef.current?.abort();
     pendingTerminalAttachAbortControllerRef.current = undefined;
@@ -1242,12 +1234,6 @@ export default function App() {
     pendingResizeKeyRef.current = undefined;
     confirmedSessionSizesRef.current.clear();
     setAttachedSessionId(undefined);
-    lastCursorReportRef.current = "";
-    lastCursorFocusedRef.current = undefined;
-    if (cursorRefreshTimerRef.current !== undefined) {
-      window.clearTimeout(cursorRefreshTimerRef.current);
-      cursorRefreshTimerRef.current = undefined;
-    }
     clearTerminalOutput();
     clearSessionFiles();
     if (shouldCloseMobilePanel) {
@@ -1296,7 +1282,6 @@ export default function App() {
     pendingAttachClientRef.current = undefined;
     pendingTerminalAttachSessionRef.current = undefined;
     pendingResizeKeyRef.current = undefined;
-    sessionPermissionIdsRef.current.clear();
     setAttachedSessionId(undefined);
     setDaemonClients([]);
     setDaemonStatus(undefined);
@@ -1407,16 +1392,13 @@ export default function App() {
       const rawCandidateUrl = payload?.ws_url ?? (url.trim() || activeServer?.url || defaultWsUrlFromPage());
       const candidateUrls = pairingWsUrlCandidates(rawCandidateUrl, routeServerId);
       const token = payload?.token ?? pairingInput.trim();
-      const { client, effectiveUrl } = await connectPairingClient(
+      const { accepted, effectiveUrl } = await pairDeviceOverHttp(
         candidateUrls,
         routeServerId,
-        device.device_id,
         daemonPublicKey,
         token,
-        PAIRING_CONNECTION_TIMEOUT_MS,
+        device,
       );
-      const accepted = await client.pair(token, device.device_public_key, device);
-      client.close();
       const nextState = await recordPairing(accepted, effectiveUrl);
       activeServerIdRef.current = accepted.server_id;
       setState(nextState);
@@ -1467,13 +1449,16 @@ export default function App() {
 
     setError(undefined);
     setStatus("saving_url");
-    let client: DirectClient | undefined;
+    let client: V070Client | undefined;
     try {
-      client = await DirectClient.connect(effectiveUrl, server.server_id, device.device_id, {
-        expectedDaemonPublicKey: server.daemon_public_key,
-        trustedDevice: device,
-      });
-      await client.authenticate(device, { ...server, url: effectiveUrl });
+      let effectiveServer = { ...server, url: effectiveUrl };
+      if (!effectiveServer.device_certificate) {
+        const deviceCertificate = await migrateDeviceCertificate(effectiveServer, device);
+        effectiveServer = { ...effectiveServer, device_certificate: deviceCertificate };
+        setState(await recordDeviceCertificate(server.server_id, deviceCertificate));
+      }
+      client = await V070Client.connect(effectiveServer, device);
+      await client.authenticate();
       client.close();
       client = undefined;
       const nextState = await recordServerUrl(server.server_id, effectiveUrl);
@@ -1531,7 +1516,6 @@ export default function App() {
     attachedSessionRef,
     attachedSessionId,
     connectionReady,
-    followPollIntervalMs: FILES_CWD_FOLLOW_POLL_INTERVAL_MS,
   });
   const {
     handleOpenDirectory,
@@ -1554,7 +1538,7 @@ export default function App() {
     attachedSessionId,
     attachedSessionRef,
     setDiffViewer,
-    resolveSessionScopedClient,
+    resolveSessionClient,
     basenamePath: basenameRemotePath,
     gitGraphLabel: t("git.graph"),
     translateError: (caught) => translateSafeErrorMessage(toSafeError(caught), t),
@@ -1586,7 +1570,7 @@ export default function App() {
     fileEditor,
     setFileEditor,
     setSessionFilesError,
-    resolveSessionScopedClient,
+    resolveSessionClient,
     refreshVisibleDirectory,
     translateError: (caught) => translateSafeErrorMessage(toSafeError(caught), t),
     textFileMaxBytes: TEXT_FILE_EDITOR_MAX_BYTES,
@@ -1603,7 +1587,7 @@ export default function App() {
     setSessionGitError,
     setSessionFilesLoading,
     setSessionFilesError,
-    resolveSessionScopedClient,
+    resolveSessionClient,
   });
   fileEditorResetRef.current = resetFileEditor;
 
@@ -1629,7 +1613,7 @@ export default function App() {
       // 中文注释：只要当前 workspace 里还没有 attach 中的终端流，session.list 就仍是
       // 用户可见主路径，应该沿用 terminal 级长预算。已经 attach 之后，手动刷新和后台
       // 元数据刷新继续保持普通 5s 请求预算，避免非关键刷新拖太久。
-      const list = await client.listSessions(sessionListTimeoutMs);
+      const list = await client.listSessions();
       if (
         activeServerIdRef.current !== requestServerId ||
         requestCreateGeneration !== sessionCreateRequestIdRef.current
@@ -1768,105 +1752,6 @@ export default function App() {
     } finally {
     }
   }, [activeServer?.server_id, authenticatedWorkspaceClient, clearSessionFiles, resolveWorkspaceConnectionStatus, selectSession, setSafeError]);
-
-  const refreshDaemonClients = useCallback(
-    async () => {
-      if (isPagePaused()) {
-        return;
-      }
-      if (statusRef.current === "creating" || isTerminalRecoveryInProgress()) {
-        // 中文注释：terminal.create/attach 是当前工作台的主链路。
-        // 后台 session/client 刷新不能在慢 relay 上和终端建连竞争同一条 WebSocket。
-        return;
-      }
-      if (daemonClientsRefreshInFlightRef.current) {
-        return;
-      }
-      daemonClientsRefreshInFlightRef.current = true;
-      const requestServerId = activeServer?.server_id;
-      const requestOrderGeneration = sessionOrderGenerationRef.current;
-      try {
-        const client = await authenticatedWorkspaceClient();
-        try {
-          const sessionListTimeoutMs =
-            !attachedSessionRef.current && !attachClientRef.current && !attachingSessionIdRef.current
-              ? ATTACH_CONNECTION_TIMEOUT_MS
-              : APP_CONNECTION_TIMEOUT_MS;
-          // 中文注释：状态和客户端列表复用当前 session 的 WebSocket，只在内层 segment 分类。
-          // ready 且当前还没有 attach 时，这条刷新实际上仍在承担“把用户带回可打开 session 的
-          // 工作台”职责，慢 relay 下继续给它 bootstrap 级预算，避免恢复可见后列表长期陈旧。
-          const sessionList = await client.listSessions(sessionListTimeoutMs);
-          const clientList = await client.listDaemonClients().catch(() => undefined);
-          if (activeServerIdRef.current !== requestServerId) {
-            return;
-          }
-          const canApplyDaemonOrder =
-            !pendingSessionReorderRef.current &&
-            requestOrderGeneration === sessionOrderGenerationRef.current;
-          const nextOrder = canApplyDaemonOrder
-            ? sessionOrderFromDaemonList(sessionList.sessions)
-            : sessionOrderRef.current;
-          if (canApplyDaemonOrder) {
-            sessionOrderRef.current = nextOrder;
-            setSessionOrder(nextOrder);
-          }
-          clearConfirmedPendingResizeFromSessions(
-            sessionList.sessions,
-            attachedSessionRef.current,
-            pendingResizeKeyRef.current,
-            pendingResizeKeyRef,
-            confirmedSessionSizesRef.current,
-          );
-          confirmedSessionSizesRef.current = new Map(sessionList.sessions.map((session) => [session.session_id, session.size]));
-          const visibleSessions = sessionList.sessions.filter((session) => !closedSessionIdsRef.current.has(session.session_id));
-          const localKnownSessionIds = new Set([
-            ...sessionsRef.current.map((session) => session.session_id),
-            ...sessionOrderRef.current,
-          ]);
-          const stickySessionId =
-            attachingSessionIdRef.current ??
-            pendingTerminalAttachSessionRef.current ??
-            selectedSessionIdRef.current ??
-            attachedSessionRef.current;
-          setSessions((current) =>
-            // 中文注释：后台刷新不能把刚创建、刚选中或正在 attach 的本地 session 行刷成空列表。
-            mergeSessionRefresh(visibleSessions, current, [
-              renamingSessionIdRef.current,
-              pendingTerminalAttachSessionRef.current,
-              attachingSessionIdRef.current,
-              selectedSessionIdRef.current,
-              attachedSessionRef.current,
-            ], nextOrder, closedSessionIdsRef.current),
-          );
-          const nextSelectedSessionId = resolveVisibleSelectedSessionId({
-            userDetached: userDetachedRef.current,
-            stickySessionId,
-            renamingSessionId: renamingSessionIdRef.current,
-            attachedSessionId: attachedSessionRef.current,
-            visibleSessions,
-            sessionOrder: nextOrder,
-            localKnownSessionIds,
-            closedSessionIds: closedSessionIdsRef.current,
-          });
-          if (nextSelectedSessionId !== selectedSessionIdRef.current) {
-            selectSession(nextSelectedSessionId);
-          }
-          if (clientList) {
-            applyDaemonClientsSnapshot(clientList.clients);
-          }
-        } catch (caught) {
-          throw caught;
-        }
-      } catch (caught) {
-        // 后台 client/session 刷新失败不能把正在使用的 xterm 切到错误态；
-        // 主 attach 连接有自己的重连路径，手动 Refresh 仍会显示错误。
-        void caught;
-      } finally {
-        daemonClientsRefreshInFlightRef.current = false;
-      }
-    },
-    [activeServer?.server_id, applyDaemonClientsSnapshot, authenticatedWorkspaceClient, isTerminalRecoveryInProgress],
-  );
 
   const loadDaemonStatus = useCallback(async () => {
     if (isPagePaused()) {
@@ -2037,7 +1922,6 @@ export default function App() {
     setAttachedSessionId,
     setSessions,
     sessionOrderRef,
-    sessionPermissionIdsRef,
     clearNewOutputMark,
     clearTerminalOutput,
     clearTerminalSnapshotRevealHistory,
@@ -2047,7 +1931,6 @@ export default function App() {
     loadSessionFiles,
     sessionFilesAutoRefreshPath,
     loadSessionGit,
-    refreshDaemonClients,
     claimAttachClient,
     onAttachTransportReady: flushPendingTerminalInput,
     upsertAttachedSession,
@@ -2137,7 +2020,7 @@ export default function App() {
     const attachRequestId = attachRequestIdRef.current + 1;
     attachRequestIdRef.current = attachRequestId;
     attachingSessionIdRef.current = sessionId;
-    let outputClient: DirectClient | undefined;
+    let outputClient: V070Client | undefined;
     let attachAbortController: AbortController | undefined;
     try {
         const isCurrentAttachRequest = () =>
@@ -2180,19 +2063,16 @@ export default function App() {
         const resetVersion = clearTerminalOutput();
         attachAbortController = new AbortController();
         pendingTerminalAttachAbortControllerRef.current = attachAbortController;
-        outputClient = await authenticatedClient(ATTACH_CONNECTION_TIMEOUT_MS, attachAbortController.signal);
+        outputClient = await authenticatedWorkspaceClient(ATTACH_CONNECTION_TIMEOUT_MS);
         if (!isCurrentAttachRequest()) {
           closePendingAttachClients();
           return;
         }
         pendingAttachClientRef.current = outputClient;
         pendingTerminalAttachSessionRef.current = sessionId;
-        const attached = await outputClient.attachSession(sessionId, {
-          timeoutMs: ATTACH_CONNECTION_TIMEOUT_MS,
-          signal: attachAbortController.signal,
-        });
+        const attached = await outputClient.attachSession(sessionId);
         if (!isCurrentAttachRequest()) {
-          outputClient.detachSession(sessionId, "stale_attach");
+          outputClient.detachSession(sessionId);
           closePendingAttachClients();
           return;
         }
@@ -2214,7 +2094,6 @@ export default function App() {
         claimAttachClient(attachedClient);
         await flushPendingTerminalInput(attachedClient, sessionId);
         attachedSessionRef.current = sessionId;
-        sessionPermissionIdsRef.current.add(sessionId);
         confirmedSessionSizesRef.current.set(attached.session_id, attached.size);
         selectSession(sessionId);
         setAttachedSessionId(sessionId);
@@ -2225,9 +2104,9 @@ export default function App() {
         // 打开历史 session 后主动请求 xterm focus。桌面端用它补发真实容器尺寸；
         // 移动端也靠它让软键盘保持在终端下方。TerminalPane 会保护 toolbar/files 焦点。
         setTerminalFocusRequest((request) => request + 1);
-        // 中文注释：DirectClient 的 WebSocket pump 会在 attach response 前后持续收包，
+        // 中文注释：V070Client 的 WebSocket pump 会在 attach response 前后持续收包，
         // 但 App 的 receive loop 只有在这里启动。快速切换多个大输出 session 时，必须先
-        // 等 TerminalPane 确认旧 xterm 已经清屏/重建，再把新 snapshot 从 DirectClient
+        // 等 TerminalPane 确认旧 xterm 已经清屏/重建，再把新 snapshot 从 V070Client
         // 队列排进 xterm；否则新 snapshot 可能先写入旧实例。
         await waitForTerminalOutputResetApplied(resetVersion);
         if (!isCurrentAttachRequest() || userDetachedRef.current) {
@@ -2247,7 +2126,6 @@ export default function App() {
           { source: "initial" },
         );
         void loadSessionGit(sessionId);
-        void refreshDaemonClients();
       } catch (caught) {
         if (isIgnoredClosingSessionError(sessionId, caught)) {
           // 中文注释：用户可能在自动 attach 尚未完成时关闭同一个 session；
@@ -2290,11 +2168,13 @@ export default function App() {
       clearTerminalOutput,
       claimAttachClient,
       disconnectAttach,
+      activeServer?.device_certificate,
+      authenticatedClient,
+      authenticatedWorkspaceClient,
       flushPendingTerminalInput,
       isIgnoredClosingSessionError,
       loadSessionFiles,
       loadSessionGit,
-      refreshDaemonClients,
       selectSession,
       sessionFilesAutoRefreshPath,
       setSafeError,
@@ -2425,7 +2305,7 @@ export default function App() {
     disconnectAttach();
     const resetVersion = clearTerminalOutput();
     setStatus("creating");
-    let outputClient: DirectClient | undefined;
+    let outputClient: V070Client | undefined;
     let attachAbortController: AbortController | undefined;
     try {
       const isCurrentCreateRequest = () => sessionCreateRequestIdRef.current === createRequestId;
@@ -2441,11 +2321,7 @@ export default function App() {
       }
       pendingAttachClientRef.current = outputClient;
       // Web 只创建完整的默认 shell 会话，避免把 session 误导成一次性命令执行。
-      const created = await outputClient.createSession([], DEFAULT_SESSION_SIZE, {
-        // 中文注释：terminal.create 会同时建立新的 terminal stream，属于终端 attach 生命周期。
-        // relay 低带宽抖动时不能套用普通 5s RPC 超时，否则响应晚到会被前端丢弃。
-        timeoutMs: ATTACH_CONNECTION_TIMEOUT_MS,
-      });
+      const created = await outputClient.createSession([], DEFAULT_SESSION_SIZE);
       if (!isCurrentCreateRequest()) {
         outputClient.detachSession(created.session_id);
         outputClient = undefined;
@@ -2465,7 +2341,6 @@ export default function App() {
       }
       claimAttachClient(attachedClient);
       attachedSessionRef.current = created.session_id;
-      sessionPermissionIdsRef.current.add(created.session_id);
       confirmedSessionSizesRef.current.set(created.session_id, created.size);
       selectSession(created.session_id);
       setAttachedSessionId(created.session_id);
@@ -2481,7 +2356,7 @@ export default function App() {
       setTerminalFocusRequest((request) => request + 1);
       setStatus("attached");
       // 中文注释：terminal.create 和 terminal.attach 一样会切换 xterm 实例。
-      // create stream 的 snapshot/output 可能已经在 DirectClient 队列里；必须等
+      // create stream 的 snapshot/output 可能已经在 V070Client 队列里；必须等
       // TerminalPane 确认旧实例清理、新实例 ready 后再启动 receive loop，否则首屏
       // 可能写进旧实例或跨后续切换被重复回放，表现成切回时多一个 shell 回显。
       await waitForTerminalOutputResetApplied(resetVersion);
@@ -2498,7 +2373,6 @@ export default function App() {
         sessionFilesAutoRefreshPath(),
         { source: "initial" },
       );
-      void refreshDaemonClients();
     } catch (caught) {
       if (sessionCreateRequestIdRef.current === createRequestId) {
         setSafeError(caught);
@@ -2527,7 +2401,6 @@ export default function App() {
     claimAttachClient,
     disconnectAttach,
     loadSessionFiles,
-    refreshDaemonClients,
     selectSession,
     sessionFilesAutoRefreshPath,
     setSafeError,
@@ -2617,9 +2490,8 @@ export default function App() {
         setMetadataRetryNonce((current) => current + 1);
       }
       void loadDaemonStatus();
-      void refreshDaemonClients();
     }, 0);
-  }, [loadDaemonStatus, refreshDaemonClients]);
+  }, [loadDaemonStatus]);
 
   useEffect(() => {
     const pauseOfflineConnection = () => {
@@ -2657,7 +2529,6 @@ export default function App() {
           setMetadataRetryNonce((current) => current + 1);
         }
         void loadDaemonStatus();
-        void refreshDaemonClients();
       }
     };
 
@@ -2695,7 +2566,6 @@ export default function App() {
     handleRefresh,
     handleRetryConnection,
     loadDaemonStatus,
-    refreshDaemonClients,
     rescuePendingTerminalOutputFlush,
     scheduleResumeMetadataRefresh,
     selectedSessionId,
@@ -2726,9 +2596,9 @@ export default function App() {
         return;
       }
       setError(undefined);
-      let sessionClient: { client: DirectClient; ownsClient: boolean } | undefined;
+      let sessionClient: { client: V070Client; ownsClient: boolean } | undefined;
       try {
-        sessionClient = await resolveSessionScopedClient(sessionId);
+        sessionClient = await resolveSessionClient(sessionId);
         const renamed = await sessionClient.client.renameSession(sessionId, nextName);
         setSessions((current) =>
           current.map((session) =>
@@ -2744,7 +2614,7 @@ export default function App() {
         }
       }
     },
-    [handleCancelRename, renameDraft, renameOriginalName, resolveSessionScopedClient, setSafeError],
+    [handleCancelRename, renameDraft, renameOriginalName, resolveSessionClient, setSafeError],
   );
 
   const handleCloseSession = useCallback(
@@ -2753,16 +2623,12 @@ export default function App() {
       closingSessionIdsRef.current.add(sessionId);
       const wasAttached = attachedSessionRef.current === sessionId;
       const wasSelected = selectedSessionId === sessionId;
-      let sessionClient: { client: DirectClient; ownsClient: boolean } | undefined;
-      const confirmClosedLocally = () => {
-        if (wasAttached) {
-          // 先让 daemon 删除 session，再收口本地 attach，避免旧 cursor / resize 继续往已删除 session 发送。
-          disconnectAttach();
-          clearTerminalOutput();
-        }
+      const previousSessions = sessionsRef.current;
+      const previousSessionOrder = sessionOrderRef.current;
+      const removeClosedLocally = () => {
         clearTerminalSnapshotRevealHistory(sessionId);
-        const nextSessionOrder = sessionOrderRef.current.filter((candidate) => candidate !== sessionId);
-        const remainingSessions = sessionsRef.current.filter((session) => session.session_id !== sessionId);
+        const nextSessionOrder = previousSessionOrder.filter((candidate) => candidate !== sessionId);
+        const remainingSessions = previousSessions.filter((session) => session.session_id !== sessionId);
         setSessions((current) => current.filter((session) => session.session_id !== sessionId));
         confirmedSessionSizesRef.current.delete(sessionId);
         sessionOrderRef.current = nextSessionOrder;
@@ -2785,7 +2651,6 @@ export default function App() {
         setMobilePanel(undefined);
         setMobileMenuOpen(false);
         closedSessionIdsRef.current.add(sessionId);
-        void refreshDaemonClients();
       };
       try {
         // 中文注释：关闭当前 attach session 时先声明“这是一次有意断开”。
@@ -2793,6 +2658,8 @@ export default function App() {
         // receive loop / reconnect 都会把它当作预期行为，而不是重新 attach 回已删除 session。
         if (wasAttached) {
           userDetachedRef.current = true;
+          disconnectAttach();
+          clearTerminalOutput();
         }
         cancelScheduledAttachSwitch();
         if (attachingSessionIdRef.current === sessionId) {
@@ -2802,28 +2669,29 @@ export default function App() {
         if (pendingTerminalAttachSessionRef.current === sessionId) {
           pendingTerminalAttachSessionRef.current = undefined;
         }
-        sessionClient = await resolveSessionScopedClient(sessionId);
+        removeClosedLocally();
+        const client = await authenticatedWorkspaceClient();
         try {
-          await sessionClient.client.closeSession(sessionId);
+          await client.closeSession(sessionId);
         } catch (caught) {
           if (!isIgnoredClosingSessionError(sessionId, caught)) {
             throw caught;
           }
         }
-        confirmClosedLocally();
       } catch (caught) {
         if (isIgnoredClosingSessionError(sessionId, caught)) {
-          confirmClosedLocally();
           return;
         }
+        closedSessionIdsRef.current.delete(sessionId);
+        sessionOrderRef.current = previousSessionOrder;
+        setSessionOrder(previousSessionOrder);
+        setSessions(previousSessions);
+        if (wasSelected) selectSession(sessionId);
         if (wasAttached) {
           userDetachedRef.current = false;
         }
         setSafeError(caught);
       } finally {
-        if (sessionClient?.ownsClient) {
-          sessionClient.client.close();
-        }
         closingSessionIdsRef.current.delete(sessionId);
       }
     },
@@ -2835,10 +2703,9 @@ export default function App() {
       clearNewOutputMark,
       isIgnoredClosingSessionError,
       cancelScheduledAttachSwitch,
-      refreshDaemonClients,
       selectedSessionId,
       selectSession,
-      resolveSessionScopedClient,
+      authenticatedWorkspaceClient,
       setSafeError,
     ],
   );
@@ -2998,47 +2865,6 @@ export default function App() {
     [isIgnoredClosingSessionError, sessions, setSafeError],
   );
 
-  const handleCursorChange = useCallback(
-    (presence: SessionCursorPresence) => {
-      const client = attachClientRef.current;
-      const sessionId = attachedSessionRef.current;
-      if (!client || !sessionId) {
-        return;
-      }
-      const nextCursor = `${sessionId}:${presence.row}:${presence.col}:${presence.focused}`;
-      if (lastCursorReportRef.current === nextCursor) {
-        return;
-      }
-      lastCursorReportRef.current = nextCursor;
-      const focusChanged = lastCursorFocusedRef.current !== presence.focused;
-      lastCursorFocusedRef.current = presence.focused;
-      void client.sendSessionCursor(sessionId, presence).catch((caught) => {
-        if (isTerminalSidecarTransientError(caught)) {
-          // 中文注释：cursor 上报只是协作元数据；高输出场景里的超时和 relay/HTTP
-          // 控制面瞬断导致的 fetch 失败都不能卸载 xterm，也不能触发 attach reconnect。
-          recordTermdDiagnostic("app_terminal_sidecar_timeout_ignored", {
-            kind: "cursor",
-            sessionId,
-          });
-          return;
-        }
-        if (isRetryableConnectionError(caught) && attachReconnectHandlerRef.current(client, caught)) {
-          return;
-        }
-        if (!isIgnoredClosingSessionError(sessionId, caught)) {
-          setSafeError(caught);
-        }
-      });
-      if (focusChanged && cursorRefreshTimerRef.current === undefined) {
-        cursorRefreshTimerRef.current = window.setTimeout(() => {
-          cursorRefreshTimerRef.current = undefined;
-          void refreshDaemonClients();
-        }, 500);
-      }
-    },
-    [isIgnoredClosingSessionError, refreshDaemonClients, setSafeError],
-  );
-
   useEffect(() => {
     if (!connectionReady || !activeServer || !state.device || isPagePaused()) {
       closeMetadataClient();
@@ -3067,45 +2893,57 @@ export default function App() {
     };
 
     void (async () => {
-      let client: DirectClient | undefined;
+      let client: V070Client | undefined;
       try {
-        client = await authenticatedClient(APP_CONNECTION_TIMEOUT_MS, abortController.signal, {
-          clientKind: "metadata",
-        });
+        client = await authenticatedWorkspaceClient(APP_CONNECTION_TIMEOUT_MS);
         if (!isCurrentMetadataClient()) {
           client.close();
           return;
         }
         metadataClientRef.current = client;
-        await client.subscribeMetadata({
-          clients: true,
-          status_interval_ms: DAEMON_METADATA_STATUS_INTERVAL_MS,
-        }, APP_CONNECTION_TIMEOUT_MS);
+        await client.subscribeMetadata();
         if (!isCurrentMetadataClient()) {
           client.close();
           return;
         }
         setMetadataReady(true);
-        void client.measureLatency().then((latencyMs) => {
-          if (isCurrentMetadataClient()) {
-            setDaemonNetworkLatencyMs(latencyMs);
+        const unsubscribe = client.watchMetadata((_revision: number, metadata: any) => {
+          if (!isCurrentMetadataClient()) return;
+          if (Array.isArray(metadata.clients)) {
+            applyDaemonClientsSnapshot(metadata.clients as DaemonClientSummaryPayload[]);
           }
-        }).catch(() => undefined);
-
-        while (isCurrentMetadataClient() && !client.isClosed) {
-          const inner = await client.receiveInner();
-          if (!isCurrentMetadataClient()) {
-            break;
+          if (metadata.daemon && typeof metadata.daemon === "object") {
+            applyDaemonStatusSnapshot(metadata.daemon as DaemonStatusResultPayload);
           }
-          if (inner.type === "daemon_clients_snapshot") {
-            const payload = inner.payload as { clients?: DaemonClientSummaryPayload[] };
-            if (Array.isArray(payload.clients)) {
-              applyDaemonClientsSnapshot(payload.clients);
+          if (Array.isArray(metadata.sessions)) {
+            const visibleSessions = (metadata.sessions as SessionSummaryPayload[])
+              .filter((session) => !closedSessionIdsRef.current.has(session.session_id));
+            const currentAttachedSession = visibleSessions.find(
+              (session) => session.session_id === attachedSessionRef.current,
+            );
+            const previousAttachedSession = sessionsRef.current.find(
+              (session) => session.session_id === attachedSessionRef.current,
+            );
+            if (currentAttachedSession?.files_path !== previousAttachedSession?.files_path) {
+              void requestFollowSessionFilesRefresh(currentAttachedSession?.session_id);
             }
-          } else if (inner.type === "daemon_status_snapshot") {
-            applyDaemonStatusSnapshot(inner.payload as DaemonStatusResultPayload);
+            const nextOrder = sessionOrderFromDaemonList(visibleSessions);
+            sessionOrderRef.current = nextOrder;
+            setSessionOrder(nextOrder);
+            setSessions(orderSessions(sortSessionsNewestFirst(visibleSessions), nextOrder));
           }
-        }
+          if (typeof metadata.rtt_ms === "number") {
+            setDaemonNetworkLatencyMs(metadata.rtt_ms);
+          }
+        });
+        await new Promise<void>((resolve) => {
+          if (abortController.signal.aborted) {
+            resolve();
+            return;
+          }
+          abortController.signal.addEventListener("abort", () => resolve(), { once: true });
+        });
+        unsubscribe();
       } catch (caught) {
         if (!isCurrentMetadataClient()) {
           return;
@@ -3125,9 +2963,6 @@ export default function App() {
         if (metadataClientRef.current === client) {
           metadataClientRef.current = undefined;
         }
-        if (client && !client.isClosed) {
-          client.close();
-        }
       }
     })();
 
@@ -3137,32 +2972,13 @@ export default function App() {
     applyDaemonClientsSnapshot,
     applyDaemonStatusSnapshot,
     authenticatedClient,
+    authenticatedWorkspaceClient,
     closeMetadataClient,
     connectionReady,
     metadataRetryNonce,
+    requestFollowSessionFilesRefresh,
     state.device?.device_id,
   ]);
-
-  useEffect(() => {
-    if (!connectionReady || metadataReady) {
-      return undefined;
-    }
-    const refreshTimer = window.setInterval(() => {
-      void refreshDaemonClients();
-    }, DAEMON_METADATA_FALLBACK_POLL_INTERVAL_MS);
-    return () => window.clearInterval(refreshTimer);
-  }, [connectionReady, metadataReady, refreshDaemonClients]);
-
-  useEffect(() => {
-    if (!connectionReady || metadataReady) {
-      return undefined;
-    }
-    void loadDaemonStatus();
-    const timer = window.setInterval(() => {
-      void loadDaemonStatus();
-    }, DAEMON_METADATA_FALLBACK_POLL_INTERVAL_MS);
-    return () => window.clearInterval(timer);
-  }, [connectionReady, loadDaemonStatus, metadataReady]);
 
   const handleTerminalSearch = useCallback(
     async (query: string): Promise<SessionSearchResultPayload> => {
@@ -3201,7 +3017,7 @@ export default function App() {
       });
       setSessionFilesLoading(true);
       setSessionFilesError(undefined);
-      let sessionClient: { client: DirectClient; ownsClient: boolean } | undefined;
+      let sessionClient: { client: V070Client; ownsClient: boolean } | undefined;
       try {
         sessionClient = await openSessionOperationClient(sessionId);
         await sessionClient.client.uploadSessionFile(sessionId, uploadPath, file, {
@@ -3285,7 +3101,7 @@ export default function App() {
         completed: false,
       });
       setSessionFilesError(undefined);
-      let sessionClient: { client: DirectClient; ownsClient: boolean } | undefined;
+      let sessionClient: { client: V070Client; ownsClient: boolean } | undefined;
       try {
         sessionClient = await openSessionOperationClient(sessionId);
         await downloadSessionFile(sessionClient.client, sessionId, entry.name, entry.path, (receivedBytes, sizeBytes, completed) => {
@@ -3848,7 +3664,6 @@ export default function App() {
                 onSearch={handleTerminalSearch}
                 onInput={handleTerminalInput}
                 onResize={handleResize}
-                onCursorChange={handleCursorChange}
               />
               {showDesktopFilesPanel ? (
                 <>
@@ -4491,18 +4306,17 @@ export function knownServerWsUrlCandidates(
     | undefined = globalThis.location,
 ): string[] {
   const candidates: string[] = [];
-  const savedUrl = rawUrl.trim();
+  const savedUrl = stripSensitiveUrlParts(rawUrl);
   const pageUrl = defaultWsUrlFromPage(page);
-  const relayToken = relayTokenFromUrl(savedUrl);
   const savedCandidate = routeWsUrlForKnownServer(browserReachableWsUrl(savedUrl, page), serverId);
   const pageCandidate =
     page?.hostname && !isLoopbackHost(page.hostname)
-      ? routeWsUrlForKnownServer(withRelayToken(pageUrl, relayToken), serverId)
+      ? routeWsUrlForKnownServer(pageUrl, serverId)
       : undefined;
 
   if (shouldPreferPageWsUrl(savedUrl, page)) {
     // 从 relay Web 页面打开时优先使用当前 origin，避免旧 IndexedDB 里的历史 relay host
-    // 让用户刷新后继续连到过期地址；query token 会被保留以兼容带 transport token 的 relay。
+    // 让用户刷新后继续连到过期地址。
     addCandidate(candidates, pageCandidate);
     addCandidate(candidates, savedCandidate);
   } else {
@@ -4582,30 +4396,6 @@ function websocketPathForPage(pathname: string | undefined): string {
         .join("/");
   // Web 被反向代理到 `/prefix/` 时，WS 也应使用同一个公开前缀：`/prefix/ws`。
   return `${basePath || ""}/ws`;
-}
-
-function relayTokenFromUrl(rawUrl: string): string | undefined {
-  try {
-    const token = new URL(rawUrl).searchParams.get("relay_token")?.trim();
-    return token || undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-function withRelayToken(rawUrl: string, relayToken: string | undefined): string {
-  if (!relayToken) {
-    return rawUrl;
-  }
-  try {
-    const parsed = new URL(rawUrl);
-    if (!parsed.searchParams.has("relay_token")) {
-      parsed.searchParams.set("relay_token", relayToken);
-    }
-    return parsed.toString();
-  } catch {
-    return rawUrl;
-  }
 }
 
 function addCandidate(candidates: string[], candidate: string | undefined): void {
@@ -5037,17 +4827,17 @@ function remoteParentPath(path: string): string {
 }
 
 async function getSessionFileEntry(
-  client: DirectClient,
+  client: V070Client,
   sessionId: UUID,
   path: string,
 ): Promise<SessionFileEntryPayload | undefined> {
   const normalized = normalizeRemotePath(path);
   const files = await client.listSessionFiles(sessionId, remoteParentPath(normalized));
-  return files.entries.find((entry) => entry.path === normalized);
+  return files.entries.find((entry: SessionFileEntryPayload) => entry.path === normalized);
 }
 
 async function downloadSessionFile(
-  client: DirectClient,
+  client: V070Client,
   sessionId: UUID,
   name: string,
   path: string,

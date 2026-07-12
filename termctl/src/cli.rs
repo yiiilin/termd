@@ -1,8 +1,10 @@
 //! termctl 命令分发。
 //!
 //! CLI 默认面向人类输出：session/control/list 结果写 stdout，attach 的状态提示写 stderr，
-//! 这样不会污染终端业务字节流。所有敏感输入只进入 E2EE 内层 packet。
+//! 这样不会污染终端业务字节流。敏感 credential 不进入 Debug、日志或 URL。
 
+use std::fmt;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -17,15 +19,14 @@ use tokio::time::sleep;
 use uuid::Uuid;
 
 use crate::client::{
-    DirectClient, TerminalAttachOptions, TerminalStream, TerminalStreamEvent,
-    signed_device_relay_admission,
+    DirectClient, TerminalAttachOptions, TerminalStream, TerminalStreamEvent, pair_device,
 };
 use crate::crypto;
 use crate::error::{Result, TermctlError};
 use crate::state::{TermctlState, normalize_ws_url, resolve_state_path};
 use termd_proto::{
-    AttachRole, PairingQrPayload, PublicKey, RelayAdmissionPayload, ServerId, SessionId,
-    SessionState, SessionSummaryPayload, TerminalSize,
+    AttachRole, PairingQrPayload, PublicKey, ServerId, SessionId, SessionState,
+    SessionSummaryPayload, TerminalSize,
 };
 
 pub const DEFAULT_URL: &str = "ws://127.0.0.1:8765/ws";
@@ -67,16 +68,39 @@ pub enum Command {
     List(UrlArgs),
 }
 
-#[derive(Debug, Args)]
+#[derive(Args)]
 pub struct PairArgs {
-    #[arg(value_name = "invite_or_token", conflicts_with_all = ["token", "payload"])]
+    #[arg(value_name = "invite_or_token", conflicts_with_all = ["token", "payload", "payload_file"])]
     pub invite_or_token: Option<String>,
-    #[arg(long, conflicts_with_all = ["invite_or_token", "payload"])]
+    #[arg(long, conflicts_with_all = ["invite_or_token", "payload", "payload_file"])]
     pub token: Option<String>,
-    #[arg(long, help = "Pairing invite code or legacy JSON payload", conflicts_with_all = ["invite_or_token", "token"])]
+    #[arg(long, help = "Pairing invite code or legacy JSON payload", conflicts_with_all = ["invite_or_token", "token", "payload_file"])]
     pub payload: Option<String>,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Read the pairing invite from PATH, or from stdin when PATH is -",
+        conflicts_with_all = ["invite_or_token", "token", "payload"]
+    )]
+    pub payload_file: Option<PathBuf>,
     #[arg(long)]
     pub url: Option<String>,
+}
+
+impl fmt::Debug for PairArgs {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PairArgs")
+            .field(
+                "invite_or_token_configured",
+                &self.invite_or_token.is_some(),
+            )
+            .field("token_configured", &self.token.is_some())
+            .field("payload_configured", &self.payload.is_some())
+            .field("payload_file", &self.payload_file)
+            .field("url_configured", &self.url.is_some())
+            .finish()
+    }
 }
 
 #[derive(Debug, Args)]
@@ -136,27 +160,26 @@ async fn pair(args: PairArgs, state_path: PathBuf, output: OutputMode) -> Result
     let mut state = TermctlState::load(&state_path)?;
     let input = PairingInput::from_args(args, &state)?;
     let device = ensure_pairing_device_persisted(&mut state, &state_path)?;
-    let mut client = DirectClient::connect(
+    let paired = pair_device(
         &input.url,
         input.route_server_id,
-        device.device_id,
         input.daemon_public_key.clone(),
-        Some(RelayAdmissionPayload::PairTicket {
-            token: termd_proto::PairingToken(input.token.clone()),
-        }),
+        &device,
+        input.token,
     )
     .await?;
-    let accepted = client
-        .pair(device.device_public_key.clone(), input.token)
-        .await?;
+    let accepted = paired.accepted;
     if accepted.server_id != input.route_server_id
         || accepted.daemon_public_key != input.daemon_public_key
     {
-        drop(client);
         return Err(TermctlError::PairingPayloadServerMismatch);
     }
 
-    state.record_pairing(accepted.clone(), input.url);
+    state.record_pairing_with_certificate(
+        accepted.clone(),
+        input.url,
+        Some(paired.device_certificate),
+    );
     state
         .save(&state_path)
         .map_err(|_| TermctlError::PairingStateFinalizeFailed)?;
@@ -177,7 +200,6 @@ fn ensure_pairing_device_persisted(
     Ok(device)
 }
 
-#[derive(Debug)]
 struct PairingInput {
     token: String,
     url: String,
@@ -185,14 +207,40 @@ struct PairingInput {
     daemon_public_key: PublicKey,
 }
 
+impl fmt::Debug for PairingInput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PairingInput")
+            .field("token_configured", &!self.token.is_empty())
+            .field("url_configured", &!self.url.is_empty())
+            .field("route_server_id", &self.route_server_id)
+            .field("daemon_public_key", &self.daemon_public_key)
+            .finish()
+    }
+}
+
 impl PairingInput {
     fn from_args(args: PairArgs, state: &TermctlState) -> Result<Self> {
+        let stdin = std::io::stdin();
+        Self::from_args_with_stdin(args, state, &mut stdin.lock())
+    }
+
+    fn from_args_with_stdin(
+        args: PairArgs,
+        state: &TermctlState,
+        stdin: &mut impl Read,
+    ) -> Result<Self> {
         let PairArgs {
             invite_or_token,
             token,
             payload,
+            payload_file,
             url,
         } = args;
+        let payload = match payload_file {
+            Some(path) => Some(read_pairing_payload_file(&path, stdin)?),
+            None => payload,
+        };
 
         if let Some(raw_invite) = payload.or_else(|| {
             invite_or_token
@@ -238,6 +286,18 @@ impl PairingInput {
             daemon_public_key: pairing_payload_daemon_public_key(&payload, state)?,
         })
     }
+}
+
+fn read_pairing_payload_file(path: &Path, stdin: &mut impl Read) -> Result<String> {
+    let mut payload = String::new();
+    if path == Path::new("-") {
+        stdin
+            .read_to_string(&mut payload)
+            .map_err(|_| TermctlError::PairingPayloadRead)?;
+    } else {
+        payload = std::fs::read_to_string(path).map_err(|_| TermctlError::PairingPayloadRead)?;
+    }
+    Ok(payload.trim().to_owned())
 }
 
 fn parse_pairing_payload(raw_payload: &str) -> Result<PairingQrPayload> {
@@ -287,7 +347,7 @@ fn pairing_payload_daemon_public_key(
     }
 
     // 旧 invite 没有 daemon 公钥时，只允许借用本地已配对状态中的 trust anchor。
-    // 未知 daemon 的首次配对必须携带 daemon_public_key，否则无法验证 E2EE 握手签名。
+    // 未知 daemon 的首次配对必须携带 daemon_public_key，否则无法验证签名 credential。
     state
         .paired_server(payload.server_id)
         .map(|server| server.daemon_public_key)
@@ -371,9 +431,7 @@ async fn control(args: SessionUrlArgs, state_path: PathBuf, output: OutputMode) 
     let session_id = parse_session_id(&args.session_id)?;
     let mut client = connect_authenticated(&state_path, args.url.as_deref()).await?;
 
-    let stream = attach_for_session_operation(&mut client, session_id).await?;
     let granted = client.request_control(session_id).await?;
-    let _ = client.cancel_terminal_stream(&stream).await;
 
     if output.json {
         println!(
@@ -397,11 +455,7 @@ async fn control(args: SessionUrlArgs, state_path: PathBuf, output: OutputMode) 
 async fn close(args: SessionUrlArgs, state_path: PathBuf, output: OutputMode) -> Result<()> {
     let session_id = parse_session_id(&args.session_id)?;
     let mut client = connect_authenticated(&state_path, args.url.as_deref()).await?;
-    // daemon 把 close 也视为 session 级操作，短命令需要先建立当前连接的临时 attach。
-    let stream = attach_for_session_operation(&mut client, session_id).await?;
-    let closed_result = client.close_session(session_id).await;
-    let _ = client.cancel_terminal_stream(&stream).await;
-    let closed = closed_result?;
+    let closed = client.close_session(session_id).await?;
     if output.json {
         println!(
             "{}",
@@ -426,7 +480,22 @@ async fn resize(args: ResizeArgs, state_path: PathBuf, output: OutputMode) -> Re
     let mut client = connect_authenticated(&state_path, args.url.as_deref()).await?;
     let size = TerminalSize::new(args.rows, args.cols);
 
-    let stream = attach_for_session_operation(&mut client, session_id).await?;
+    let (attached, stream) = client
+        .attach_terminal_stream_with_options(
+            session_id,
+            TerminalAttachOptions {
+                watch_updates: false,
+                last_terminal_seq: None,
+            },
+        )
+        .await?;
+    if !attached.resize_owner {
+        let _ = client.cancel_terminal_stream(&stream).await;
+        return Err(TermctlError::Protocol {
+            code: "resize_not_owner".to_owned(),
+            message: "another terminal attachment owns resize".to_owned(),
+        });
+    }
     client.resize_session(session_id, size).await?;
     let _ = client.cancel_terminal_stream(&stream).await;
     if output.json {
@@ -492,21 +561,7 @@ async fn connect_authenticated(
     let device = state.require_device()?;
     let target = state.selected_paired_target(requested_url)?;
     let signing_key = crypto::decode_signing_key(&device.device_signing_key_secret)?;
-    let mut client = DirectClient::connect(
-        &target.url,
-        target.server.server_id,
-        device.device_id,
-        target.server.daemon_public_key.clone(),
-        Some(signed_device_relay_admission(
-            target.server.server_id,
-            device.device_id,
-            &signing_key,
-        )),
-    )
-    .await?;
-
-    client.authenticate(&signing_key, &target.server).await?;
-    Ok(client)
+    DirectClient::connect_authenticated(&target.url, &device, &target.server, &signing_key).await
 }
 
 struct AttachedTerminal {
@@ -539,24 +594,6 @@ async fn connect_attach_for_terminal(
         stream,
         attached,
     })
-}
-
-async fn attach_for_session_operation(
-    client: &mut DirectClient,
-    session_id: SessionId,
-) -> Result<crate::client::TerminalStream> {
-    // daemon 现在把 session 作用域能力绑定到“当前 WebSocket 连接”。
-    // resize owner 只会授予 watch/terminal stream attach；短命令用临时 stream，用完后 cancel。
-    let (_attached, stream) = client
-        .attach_terminal_stream_with_options(
-            session_id,
-            TerminalAttachOptions {
-                watch_updates: false,
-                last_terminal_seq: None,
-            },
-        )
-        .await?;
-    Ok(stream)
 }
 
 async fn attach_loop(
@@ -1074,6 +1111,99 @@ mod tests {
     }
 
     #[test]
+    fn parses_pair_command_with_payload_file_and_http_base_url() {
+        let cli = Cli::try_parse_from([
+            "termctl",
+            "pair",
+            "--payload-file",
+            "/tmp/termd-pair-invite",
+            "--url",
+            "https://relay.example",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Command::Pair(args) => {
+                assert_eq!(
+                    args.payload_file.as_deref(),
+                    Some(Path::new("/tmp/termd-pair-invite"))
+                );
+                assert_eq!(args.url.as_deref(), Some("https://relay.example"));
+            }
+            _ => panic!("expected pair command"),
+        }
+    }
+
+    #[test]
+    fn payload_file_conflicts_with_inline_payload() {
+        let error = Cli::try_parse_from([
+            "termctl",
+            "pair",
+            "--payload-file",
+            "/tmp/termd-pair-invite",
+            "--payload",
+            "secret-inline-invite",
+        ])
+        .unwrap_err();
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn pairing_input_reads_invite_from_payload_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload_path = dir.path().join("pairing-invite");
+        std::fs::write(&payload_path, invite_from_json(&pairing_payload_json(""))).unwrap();
+        let args = PairArgs {
+            invite_or_token: None,
+            token: None,
+            payload: None,
+            payload_file: Some(payload_path),
+            url: Some("https://relay.example".to_owned()),
+        };
+
+        let input = PairingInput::from_args(args, &TermctlState::default()).unwrap();
+
+        assert_eq!(input.token, "pair-token");
+        assert_eq!(input.url, "https://relay.example/ws");
+    }
+
+    #[test]
+    fn pairing_input_reads_invite_from_stdin_for_dash_payload_file() {
+        let invite = format!("{}\n", invite_from_json(&pairing_payload_json("")));
+        let mut stdin = std::io::Cursor::new(invite.into_bytes());
+        let args = PairArgs {
+            invite_or_token: None,
+            token: None,
+            payload: None,
+            payload_file: Some(PathBuf::from("-")),
+            url: Some(DEFAULT_URL.to_owned()),
+        };
+
+        let input =
+            PairingInput::from_args_with_stdin(args, &TermctlState::default(), &mut stdin).unwrap();
+
+        assert_eq!(input.token, "pair-token");
+    }
+
+    #[test]
+    fn pairing_input_debug_does_not_expose_payload_secret() {
+        let args = PairArgs {
+            invite_or_token: None,
+            token: None,
+            payload: Some(invite_from_json(&pairing_payload_json(""))),
+            payload_file: None,
+            url: Some(DEFAULT_URL.to_owned()),
+        };
+        let input = PairingInput::from_args(args, &TermctlState::default()).unwrap();
+
+        let debug = format!("{input:?}");
+
+        assert!(!debug.contains("pair-token"));
+        assert!(debug.contains("token_configured"));
+    }
+
+    #[test]
     fn parses_pair_command_with_positional_invite() {
         let payload = invite_from_json(&pairing_payload_json(""));
         let cli = Cli::try_parse_from(["termctl", "pair", &payload]).unwrap();
@@ -1119,6 +1249,7 @@ mod tests {
             invite_or_token: None,
             token: None,
             payload: Some(payload),
+            payload_file: None,
             url: Some("ws://127.0.0.1:8765/ws".to_owned()),
         };
         let state = TermctlState::default();
@@ -1138,16 +1269,14 @@ mod tests {
             invite_or_token: None,
             token: None,
             payload: Some(payload),
+            payload_file: None,
             url: None,
         };
         let state = TermctlState::default();
 
         let input = PairingInput::from_args(args, &state).unwrap();
 
-        assert_eq!(
-            input.url,
-            "wss://relay.example/termd/ws?relay_token=redacted"
-        );
+        assert_eq!(input.url, "wss://relay.example/termd/ws");
     }
 
     #[test]
@@ -1159,6 +1288,7 @@ mod tests {
             invite_or_token: None,
             token: None,
             payload: Some(payload),
+            payload_file: None,
             url: Some("wss://relay.example/ws".to_owned()),
         };
         let state = TermctlState::default();
@@ -1179,6 +1309,7 @@ mod tests {
             invite_or_token: None,
             token: None,
             payload: Some(invite_from_json(&payload)),
+            payload_file: None,
             url: None,
         };
         let empty_state = TermctlState::default();
@@ -1192,6 +1323,7 @@ mod tests {
             invite_or_token: None,
             token: None,
             payload: Some(invite_from_json(&payload)),
+            payload_file: None,
             url: Some(DEFAULT_URL.to_owned()),
         };
         let state = TermctlState {
@@ -1200,6 +1332,7 @@ mod tests {
                 daemon_public_key: daemon_public_key(),
                 url: DEFAULT_URL.to_owned(),
                 paired_at_ms: UnixTimestampMillis(1),
+                device_certificate: None,
             }],
             ..TermctlState::default()
         };
@@ -1214,6 +1347,7 @@ mod tests {
             invite_or_token: None,
             token: Some("pair-token".to_owned()),
             payload: None,
+            payload_file: None,
             url: None,
         };
         let state = TermctlState::default();
@@ -1231,6 +1365,7 @@ mod tests {
             invite_or_token: None,
             token: Some("pair-token".to_owned()),
             payload: None,
+            payload_file: None,
             url: None,
         };
         let state = TermctlState {
@@ -1241,6 +1376,7 @@ mod tests {
                 daemon_public_key: daemon_public_key(),
                 url: "ws://127.0.0.1:8765/ws".to_owned(),
                 paired_at_ms: UnixTimestampMillis(1),
+                device_certificate: None,
             }],
             ..TermctlState::default()
         };
@@ -1263,6 +1399,7 @@ mod tests {
             invite_or_token: Some(payload),
             token: None,
             payload: None,
+            payload_file: None,
             url: None,
         };
         let state = TermctlState::default();
@@ -1280,6 +1417,7 @@ mod tests {
             invite_or_token: Some("termd-pair:v1:not-base64".to_owned()),
             token: None,
             payload: None,
+            payload_file: None,
             url: None,
         };
         let state = TermctlState::default();
@@ -1297,6 +1435,7 @@ mod tests {
             invite_or_token: Some(invite_from_json(expired_payload)),
             token: None,
             payload: None,
+            payload_file: None,
             url: Some(DEFAULT_URL.to_owned()),
         };
         let state = TermctlState::default();
@@ -1313,6 +1452,7 @@ mod tests {
             invite_or_token: Some(invite_from_json(&pairing_payload_json(""))),
             token: None,
             payload: None,
+            payload_file: None,
             url: None,
         };
         let state = TermctlState::default();

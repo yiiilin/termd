@@ -1,8 +1,8 @@
 //! termd daemon 内核 runtime glue。
 //!
 //! runtime 只把 `SessionManager` 的 attach 状态和 `PtyBackend` 的进程句柄接起来，
-//! 负责 daemon 本地的持久会话生命周期与 I/O 桥接。认证、配对、当前明文 WebSocket
-//! packet、legacy E2EE 和 relay 路由都留在更外层，避免这里变成协议层或控制权系统。
+//! 负责 daemon 本地的持久会话生命周期与 I/O 桥接。认证、配对、WebSocket transport
+//! 和 relay 路由都留在更外层，避免这里变成协议层或控制权系统。
 
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
@@ -379,8 +379,8 @@ impl<B: PtyBackend> SessionRuntime<B> {
 
     /// 任意已 attach 设备的输入都会写入 PTY；未 attach 设备会被拒绝。
     ///
-    /// 这是 runtime 的核心 I/O 桥接点。当前明文 WebSocket packet 经 daemon 权限校验后调用
-    /// 本方法；legacy `encrypted_frame` 路径则先解密再调用。这里不识别 wire frame 或 relay 信息。
+    /// 这是 runtime 的核心 I/O 桥接点。terminal WebSocket 经 daemon 权限校验后调用
+    /// 本方法；这里不识别 wire frame 或 relay 信息。
     pub fn write_input(
         &mut self,
         session_id: &str,
@@ -467,6 +467,21 @@ impl<B: PtyBackend> SessionRuntime<B> {
             .get_mut(attachment_id)
             .ok_or(RuntimeError::SessionNotFound)?;
         attachment.write_frame(bytes)?;
+        Ok(())
+    }
+
+    /// Record a resize already applied by a watched supervisor attachment.
+    ///
+    /// The attachment owns the PTY operation, so this path only synchronizes
+    /// daemon metadata and must not resize the PTY a second time.
+    pub fn record_watched_attachment_resize(
+        &mut self,
+        session_id: &str,
+        size: TerminalSize,
+    ) -> RuntimeResult<()> {
+        self.ensure_open_session(session_id)?;
+        self.sessions.resize(session_id, size)?;
+        self.runtime_session_mut(session_id)?.updated_at_ms = current_unix_timestamp_millis();
         Ok(())
     }
 

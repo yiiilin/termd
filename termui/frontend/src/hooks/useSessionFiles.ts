@@ -298,7 +298,6 @@ interface UseSessionFileLoadersOptions {
   attachedSessionRef: MutableRefObject<UUID | undefined>;
   attachedSessionId?: UUID;
   connectionReady: boolean;
-  followPollIntervalMs: number;
 }
 
 export function useSessionFileLoaders(
@@ -331,7 +330,6 @@ export function useSessionFileLoaders(
     attachedSessionRef,
     attachedSessionId,
     connectionReady,
-    followPollIntervalMs,
   } = options;
 
   const loadSessionFiles = useCallback(
@@ -557,36 +555,6 @@ export function useSessionFileLoaders(
     [requestFollowSessionFilesRefresh, sessionFilesFollowTerminalCwdRef],
   );
 
-  useEffect(() => {
-    if (
-      !attachedSessionId ||
-      !connectionReady ||
-      !sessionFilesFollowTerminalCwd ||
-      sessionFilesLoading
-    ) {
-      return undefined;
-    }
-
-    const refreshFromTerminalCwd = () => {
-      if (!sessionFilesFollowTerminalCwdRef.current) {
-        return;
-      }
-      void requestFollowSessionFilesRefresh(attachedSessionRef.current);
-    };
-
-    const timer = window.setInterval(refreshFromTerminalCwd, followPollIntervalMs);
-    return () => window.clearInterval(timer);
-  }, [
-    attachedSessionId,
-    attachedSessionRef,
-    connectionReady,
-    followPollIntervalMs,
-    requestFollowSessionFilesRefresh,
-    sessionFilesFollowTerminalCwdRef,
-    sessionFilesFollowTerminalCwd,
-    sessionFilesLoading,
-  ]);
-
   return {
     loadSessionFiles,
     loadSessionGit,
@@ -721,7 +689,7 @@ interface UseSessionFileEditorOptions {
   fileEditor: FileEditorState | undefined;
   setFileEditor: Dispatch<SetStateAction<FileEditorState | undefined>>;
   setSessionFilesError: Dispatch<SetStateAction<SafeError | undefined>>;
-  resolveSessionScopedClient: (
+  resolveSessionClient: (
     sessionId: UUID,
   ) => Promise<{ client: SessionFileEditorClient; ownsClient: boolean }>;
   refreshVisibleDirectory: (sessionId: UUID) => Promise<void>;
@@ -742,7 +710,7 @@ export function useSessionFileEditor(options: UseSessionFileEditorOptions) {
     fileEditor,
     setFileEditor,
     setSessionFilesError,
-    resolveSessionScopedClient,
+    resolveSessionClient,
     refreshVisibleDirectory,
     translateError,
     textFileMaxBytes,
@@ -845,7 +813,7 @@ export function useSessionFileEditor(options: UseSessionFileEditorOptions) {
       });
       let sessionClient: { client: SessionFileEditorClient; ownsClient: boolean } | undefined;
       try {
-        sessionClient = await resolveSessionScopedClient(sessionId);
+        sessionClient = await resolveSessionClient(sessionId);
         const payload = await readEditableSessionFile(sessionClient.client, sessionId, path, textFileMaxBytes);
         if (!isActiveFileOpenRequest(request)) {
           return;
@@ -879,7 +847,7 @@ export function useSessionFileEditor(options: UseSessionFileEditorOptions) {
       attachedSessionRef,
       beginFileOpenRequest,
       isActiveFileOpenRequest,
-      resolveSessionScopedClient,
+      resolveSessionClient,
       setFileEditor,
       setSessionFilesError,
       textFileMaxBytes,
@@ -912,7 +880,7 @@ export function useSessionFileEditor(options: UseSessionFileEditorOptions) {
       setFileEditor({ ...editor, text, saving: true, error: undefined });
       let sessionClient: { client: SessionFileEditorClient; ownsClient: boolean } | undefined;
       try {
-        sessionClient = await resolveSessionScopedClient(sessionId);
+        sessionClient = await resolveSessionClient(sessionId);
         const written: SessionFileWrittenPayload = await sessionClient.client.writeSessionFile(
           sessionId,
           editor.path,
@@ -954,7 +922,7 @@ export function useSessionFileEditor(options: UseSessionFileEditorOptions) {
       fileEditor,
       isActiveFileSaveRequest,
       refreshVisibleDirectory,
-      resolveSessionScopedClient,
+      resolveSessionClient,
       setFileEditor,
       translateError,
     ],
@@ -981,7 +949,7 @@ interface UseSessionMutationActionsOptions {
   setSessionGitError: Dispatch<SetStateAction<SafeError | undefined>>;
   setSessionFilesLoading: Dispatch<SetStateAction<boolean>>;
   setSessionFilesError: Dispatch<SetStateAction<SafeError | undefined>>;
-  resolveSessionScopedClient: (
+  resolveSessionClient: (
     sessionId: UUID,
   ) => Promise<{ client: SessionMutationClient; ownsClient: boolean }>;
 }
@@ -996,7 +964,7 @@ export function useSessionMutationActions(options: UseSessionMutationActionsOpti
     setSessionGitError,
     setSessionFilesLoading,
     setSessionFilesError,
-    resolveSessionScopedClient,
+    resolveSessionClient,
   } = options;
 
   const handleSessionGitAction = useCallback(
@@ -1013,7 +981,7 @@ export function useSessionMutationActions(options: UseSessionMutationActionsOpti
       setSessionGitError(undefined);
       let sessionClient: { client: SessionMutationClient; ownsClient: boolean } | undefined;
       try {
-        sessionClient = await resolveSessionScopedClient(sessionId);
+        sessionClient = await resolveSessionClient(sessionId);
         await sessionClient.client.applySessionGitAction(sessionId, worktree.path, change.path, action);
         if (attachedSessionRef.current === sessionId) {
           await loadSessionGit(sessionId);
@@ -1032,7 +1000,7 @@ export function useSessionMutationActions(options: UseSessionMutationActionsOpti
     [
       attachedSessionRef,
       loadSessionGit,
-      resolveSessionScopedClient,
+      resolveSessionClient,
       setSessionGitError,
       setSessionGitLoading,
     ],
@@ -1048,7 +1016,7 @@ export function useSessionMutationActions(options: UseSessionMutationActionsOpti
       setSessionFilesError(undefined);
       let sessionClient: { client: SessionMutationClient; ownsClient: boolean } | undefined;
       try {
-        sessionClient = await resolveSessionScopedClient(sessionId);
+        sessionClient = await resolveSessionClient(sessionId);
         await sessionClient.client.deleteSessionFile(sessionId, entry.path);
         if (attachedSessionRef.current === sessionId) {
           await loadSessionFiles(sessionId, sessionFilesPath, { source: "manual" });
@@ -1069,7 +1037,7 @@ export function useSessionMutationActions(options: UseSessionMutationActionsOpti
     [
       attachedSessionRef,
       loadSessionFiles,
-      resolveSessionScopedClient,
+      resolveSessionClient,
       sessionFilesPath,
       setSessionFilesError,
       setSessionFilesLoading,
@@ -1086,7 +1054,7 @@ interface UseSessionGitDiffViewerOptions {
   attachedSessionId?: UUID;
   attachedSessionRef: MutableRefObject<UUID | undefined>;
   setDiffViewer: Dispatch<SetStateAction<DiffViewerState | undefined>>;
-  resolveSessionScopedClient: (
+  resolveSessionClient: (
     sessionId: UUID,
   ) => Promise<{ client: SessionGitDiffClient; ownsClient: boolean }>;
   basenamePath: (path: string) => string;
@@ -1099,7 +1067,7 @@ export function useSessionGitDiffViewer(options: UseSessionGitDiffViewerOptions)
     attachedSessionId,
     attachedSessionRef,
     setDiffViewer,
-    resolveSessionScopedClient,
+    resolveSessionClient,
     basenamePath,
     gitGraphLabel,
     translateError,
@@ -1175,7 +1143,7 @@ export function useSessionGitDiffViewer(options: UseSessionGitDiffViewerOptions)
       });
       let sessionClient: { client: SessionGitDiffClient; ownsClient: boolean } | undefined;
       try {
-        sessionClient = await resolveSessionScopedClient(sessionId);
+        sessionClient = await resolveSessionClient(sessionId);
         const diff: SessionGitDiffResultPayload = await sessionClient.client.getSessionGitDiff(
           sessionId,
           worktree.path,
@@ -1214,7 +1182,7 @@ export function useSessionGitDiffViewer(options: UseSessionGitDiffViewerOptions)
       beginGitDiffOpenRequest,
       gitGraphLabel,
       isActiveGitDiffOpenRequest,
-      resolveSessionScopedClient,
+      resolveSessionClient,
       setDiffViewer,
       translateError,
     ],

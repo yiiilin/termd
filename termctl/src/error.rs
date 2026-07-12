@@ -26,10 +26,12 @@ pub enum TermctlError {
     InvalidSize,
     #[error("device is not paired")]
     MissingPairing,
-    #[error("websocket URL is invalid")]
+    #[error("server URL is invalid")]
     InvalidWsUrl,
     #[error("pairing invite is invalid")]
     InvalidPairingInvite,
+    #[error("failed to read pairing invite")]
+    PairingPayloadRead,
     #[error("pairing invite has expired")]
     ExpiredPairingInvite,
     #[error("pairing invite is missing websocket URL")]
@@ -38,8 +40,6 @@ pub enum TermctlError {
     TokenRequiresKnownDaemon,
     #[error("pairing payload server_id does not match daemon")]
     PairingPayloadServerMismatch,
-    #[error("route server_id does not match daemon")]
-    RouteServerMismatch,
     #[error("failed to read local state")]
     StateRead,
     #[error("failed to write local state")]
@@ -52,8 +52,6 @@ pub enum TermctlError {
     ConnectFailed,
     #[error("websocket connection closed")]
     ConnectionClosed,
-    #[error("daemon hello timed out after relay route was ready")]
-    DaemonHelloTimeout,
     #[error("failed to send websocket message")]
     SendFailed,
     #[error("failed to receive websocket message")]
@@ -62,14 +60,10 @@ pub enum TermctlError {
     InvalidEnvelope,
     #[error("unexpected protocol message")]
     UnexpectedMessage,
-    #[error("E2EE frame processing failed")]
-    E2eeFailed,
     #[error("auth challenge timed out")]
     AuthChallengeTimeout,
     #[error("daemon returned protocol error")]
     Protocol { code: String, message: String },
-    #[error("too many interleaved protocol packets")]
-    PendingPacketQueueFull,
     #[error("terminal reconnect attempts exhausted")]
     ReconnectExhausted,
     #[error("local stdin/stdout failed")]
@@ -84,26 +78,23 @@ impl TermctlError {
             Self::MissingPairing => "missing_pairing",
             Self::InvalidWsUrl => "invalid_ws_url",
             Self::InvalidPairingInvite => "invalid_pairing_invite",
+            Self::PairingPayloadRead => "pairing_payload_read_failed",
             Self::ExpiredPairingInvite => "expired_pairing_invite",
             Self::MissingPairingUrl => "missing_pairing_url",
             Self::TokenRequiresKnownDaemon => "token_requires_known_daemon",
             Self::PairingPayloadServerMismatch => "pairing_payload_server_mismatch",
-            Self::RouteServerMismatch => "route_server_mismatch",
             Self::StateRead => "state_read_failed",
             Self::StateWrite => "state_write_failed",
             Self::PairingStateFinalizeFailed => "pairing_state_finalize_failed",
             Self::InvalidDeviceKey => "invalid_device_key",
             Self::ConnectFailed => "connect_failed",
             Self::ConnectionClosed => "connection_closed",
-            Self::DaemonHelloTimeout => "daemon_hello_timeout_after_route_ready",
             Self::SendFailed => "send_failed",
             Self::ReceiveFailed => "receive_failed",
             Self::InvalidEnvelope => "invalid_envelope",
             Self::UnexpectedMessage => "unexpected_message",
-            Self::E2eeFailed => "e2ee_failed",
             Self::AuthChallengeTimeout => "auth_challenge_timeout",
             Self::Protocol { code, .. } => code.as_str(),
-            Self::PendingPacketQueueFull => "pending_packet_queue_full",
             Self::ReconnectExhausted => "reconnect_exhausted",
             Self::LocalIo => "local_io_failed",
         }
@@ -114,10 +105,11 @@ impl TermctlError {
             Self::InvalidSessionId => Cow::Borrowed("session id must be a UUID"),
             Self::InvalidSize => Cow::Borrowed("rows and cols must be positive"),
             Self::MissingPairing => Cow::Borrowed("run termctl pair before session commands"),
-            Self::InvalidWsUrl => {
-                Cow::Borrowed("websocket URL must be ws:// or wss:// and end at /ws")
-            }
+            Self::InvalidWsUrl => Cow::Borrowed(
+                "server URL must use http://, https://, ws://, or wss:// and end at /ws",
+            ),
             Self::InvalidPairingInvite => Cow::Borrowed("pairing invite is invalid"),
+            Self::PairingPayloadRead => Cow::Borrowed("failed to read pairing invite"),
             Self::ExpiredPairingInvite => Cow::Borrowed("pairing invite has expired"),
             Self::MissingPairingUrl => {
                 Cow::Borrowed("pairing invite does not include a URL; pass --url")
@@ -128,9 +120,6 @@ impl TermctlError {
             Self::PairingPayloadServerMismatch => {
                 Cow::Borrowed("pairing payload does not match the connected daemon")
             }
-            Self::RouteServerMismatch => {
-                Cow::Borrowed("route prelude does not match the connected daemon")
-            }
             Self::StateRead => Cow::Borrowed("failed to read local state"),
             Self::StateWrite => Cow::Borrowed("failed to write local state"),
             Self::PairingStateFinalizeFailed => {
@@ -139,19 +128,12 @@ impl TermctlError {
             Self::InvalidDeviceKey => Cow::Borrowed("local device signing key is invalid"),
             Self::ConnectFailed => Cow::Borrowed("failed to connect websocket"),
             Self::ConnectionClosed => Cow::Borrowed("websocket connection closed"),
-            Self::DaemonHelloTimeout => {
-                Cow::Borrowed("relay route is ready, but daemon hello did not arrive in time")
-            }
             Self::SendFailed => Cow::Borrowed("failed to send websocket message"),
             Self::ReceiveFailed => Cow::Borrowed("failed to receive websocket message"),
             Self::InvalidEnvelope => Cow::Borrowed("message envelope is invalid"),
             Self::UnexpectedMessage => Cow::Borrowed("unexpected protocol message"),
-            Self::E2eeFailed => Cow::Borrowed("E2EE frame processing failed"),
             Self::AuthChallengeTimeout => Cow::Borrowed("daemon did not return an auth challenge"),
             Self::Protocol { message, .. } => Cow::Owned(sanitize_remote_message(message)),
-            Self::PendingPacketQueueFull => {
-                Cow::Borrowed("too many terminal packets arrived while waiting for a response")
-            }
             Self::ReconnectExhausted => Cow::Borrowed("terminal reconnect attempts exhausted"),
             Self::LocalIo => Cow::Borrowed("local stdin/stdout failed"),
         }
@@ -187,18 +169,15 @@ impl TermctlError {
             Self::Protocol { .. }
             | Self::InvalidEnvelope
             | Self::UnexpectedMessage
-            | Self::RouteServerMismatch
-            | Self::E2eeFailed
             | Self::AuthChallengeTimeout => 5,
             Self::ConnectFailed
             | Self::ConnectionClosed
-            | Self::DaemonHelloTimeout
             | Self::SendFailed
             | Self::ReceiveFailed
-            | Self::PendingPacketQueueFull
             | Self::ReconnectExhausted => 6,
             Self::StateRead
             | Self::StateWrite
+            | Self::PairingPayloadRead
             | Self::PairingStateFinalizeFailed
             | Self::LocalIo => 7,
         }
@@ -207,12 +186,7 @@ impl TermctlError {
     pub fn is_connection_error(&self) -> bool {
         matches!(
             self,
-            Self::ConnectFailed
-                | Self::ConnectionClosed
-                | Self::DaemonHelloTimeout
-                | Self::SendFailed
-                | Self::ReceiveFailed
-                | Self::PendingPacketQueueFull
+            Self::ConnectFailed | Self::ConnectionClosed | Self::SendFailed | Self::ReceiveFailed
         )
     }
 }
@@ -350,7 +324,6 @@ impl From<termd::net::protocol::ProtocolError> for TermctlError {
     fn from(error: termd::net::protocol::ProtocolError) -> Self {
         match error {
             termd::net::protocol::ProtocolError::InvalidEnvelope => Self::InvalidEnvelope,
-            termd::net::protocol::ProtocolError::E2eeFailed => Self::E2eeFailed,
             termd::net::protocol::ProtocolError::InvalidState => Self::UnexpectedMessage,
             other => Self::Protocol {
                 code: other.code().to_owned(),
@@ -374,16 +347,6 @@ mod tests {
             error.safe_message(),
             "pairing succeeded but local state could not be finalized"
         );
-    }
-
-    #[test]
-    fn daemon_hello_timeout_has_specific_public_error() {
-        set_json_output(false);
-        let error = TermctlError::DaemonHelloTimeout;
-
-        assert_eq!(error.code(), "daemon_hello_timeout_after_route_ready");
-        assert!(error.is_connection_error());
-        assert_eq!(error.exit_code(), 6);
     }
 
     #[test]

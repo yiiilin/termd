@@ -181,7 +181,7 @@ impl SupervisorTerminalCache {
 
         // 中文注释：客户端 last_terminal_seq 很旧但仍落在 journal 内时，逐事件 tail
         // 可能比当前 screen snapshot 大很多。此时返回权威 snapshot 更符合 attach 语义，
-        // 也避免几千个小 output frame 在 WebSocket/E2EE 层膨胀成数百 KB 的单次发送。
+        // 也避免几千个小 output frame 在 WebSocket 层膨胀成数百 KB 的单次发送。
         let snapshot_bytes = self.snapshot_output().len();
         tail_bytes <= snapshot_bytes.saturating_mul(TERMINAL_ATTACH_TAIL_SNAPSHOT_RATIO)
     }

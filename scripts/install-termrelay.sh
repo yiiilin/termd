@@ -19,12 +19,9 @@ UNIT_FILE="/etc/systemd/system/termrelay.service"
 STATE_DIR="/var/lib/termrelay"
 INSTALL_SET_LISTEN=0
 INSTALL_SET_WEB=0
-INSTALL_SET_AUTH_TOKEN=0
-INSTALL_SET_AUTH_TOKEN_FILE=0
 INSTALL_SET_SETUP_TOKEN_FILE=0
 INSTALL_SET_DAEMON_REGISTRY=0
 INSTALL_SET_ALLOW_OPEN_RELAY=0
-INSTALL_SET_HTTP_TUNNEL=0
 INSTALL_SET_TLS_CERT=0
 INSTALL_SET_TLS_KEY=0
 ACTION="install"
@@ -36,7 +33,6 @@ INSTALL_STAGING_ONLY=0
 INSTALL_ANY_FILE_COMMITTED=0
 INSTALL_SERVICE_WAS_ACTIVE=0
 INSTALL_SERVICE_WAS_ENABLED=0
-INSTALL_AUTH_TOKEN_VALUE=""
 
 log() {
   if [[ "$LOG_EMITTED" -eq 1 ]]; then
@@ -132,12 +128,9 @@ Options:
   --no-web                    Disable embedded Web UI in systemd.
   --listen <HOST:PORT>        Set TERMRELAY_LISTEN, for example 0.0.0.0:8080.
   --public                    Alias for --listen 0.0.0.0:8080.
-  --auth-token <TOKEN>        Set relay transport auth token.
-  --auth-token-file <PATH>    Read relay transport auth token from a file.
   --setup-token-file <PATH>   Read relay daemon registration setup token from a file.
   --daemon-registry <PATH>    Set trusted daemon registry JSON path.
   --allow-open-relay          Explicitly allow legacy/open relay mode without daemon registry.
-  --http-tunnel               Enable compatibility HTTP file tunnel paths.
   --tls-cert <PATH>           Set TLS certificate path.
   --tls-key <PATH>            Set TLS private key path.
   --uninstall                 Stop service and remove termrelay program files.
@@ -146,7 +139,7 @@ Options:
 
 Examples:
   curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termrelay.sh | sudo bash -s -- --web
-  curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termrelay.sh | sudo bash -s -- --listen 0.0.0.0:8080 --auth-token replace-me
+  curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termrelay.sh | sudo bash -s -- --listen 0.0.0.0:8080
   curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termrelay.sh | sudo bash -s -- --uninstall
 EOF
 }
@@ -179,18 +172,6 @@ parse_args() {
         INSTALL_SET_LISTEN=1
         shift
         ;;
-      --auth-token)
-        [[ $# -ge 2 && -n "$2" ]] || die "--auth-token requires a non-empty value"
-        TERMRELAY_AUTH_TOKEN="$2"
-        INSTALL_SET_AUTH_TOKEN=1
-        shift 2
-        ;;
-      --auth-token-file)
-        [[ $# -ge 2 && -n "$2" ]] || die "--auth-token-file requires a non-empty value"
-        TERMRELAY_AUTH_TOKEN_FILE="$2"
-        INSTALL_SET_AUTH_TOKEN_FILE=1
-        shift 2
-        ;;
       --setup-token-file)
         [[ $# -ge 2 && -n "$2" ]] || die "--setup-token-file requires a non-empty value"
         TERMRELAY_SETUP_TOKEN_FILE="$2"
@@ -206,11 +187,6 @@ parse_args() {
       --allow-open-relay)
         TERMRELAY_ALLOW_OPEN_RELAY=1
         INSTALL_SET_ALLOW_OPEN_RELAY=1
-        shift
-        ;;
-      --http-tunnel)
-        TERMRELAY_HTTP_TUNNEL=1
-        INSTALL_SET_HTTP_TUNNEL=1
         shift
         ;;
       --tls-cert)
@@ -476,17 +452,6 @@ apply_env_overrides() {
   if [[ "$INSTALL_SET_WEB" -eq 1 ]]; then
     upsert_env_var "TERMRELAY_WEB_ENABLED" "$TERMRELAY_WEB_ENABLED"
   fi
-  if [[ "$INSTALL_SET_AUTH_TOKEN" -eq 1 ]]; then
-    if [[ "$INSTALL_STAGING_ONLY" -eq 0 ]]; then
-      write_service_secret_file "/etc/termd/termrelay_auth_token" "$TERMRELAY_AUTH_TOKEN"
-    fi
-    upsert_env_var "TERMRELAY_AUTH_TOKEN_FILE" "/etc/termd/termrelay_auth_token"
-    unset_env_var "TERMRELAY_AUTH_TOKEN"
-  fi
-  if [[ "$INSTALL_SET_AUTH_TOKEN_FILE" -eq 1 ]]; then
-    upsert_env_var "TERMRELAY_AUTH_TOKEN_FILE" "$TERMRELAY_AUTH_TOKEN_FILE"
-    unset_env_var "TERMRELAY_AUTH_TOKEN"
-  fi
   if [[ "$INSTALL_SET_SETUP_TOKEN_FILE" -eq 1 ]]; then
     upsert_env_var "TERMRELAY_SETUP_TOKEN_FILE" "$TERMRELAY_SETUP_TOKEN_FILE"
   fi
@@ -498,9 +463,6 @@ apply_env_overrides() {
     upsert_env_var "TERMRELAY_ALLOW_OPEN_RELAY" "$TERMRELAY_ALLOW_OPEN_RELAY"
     unset_env_var "TERMRELAY_DAEMON_REGISTRY"
     unset_env_var "TERMRELAY_SETUP_TOKEN_FILE"
-  fi
-  if [[ "$INSTALL_SET_HTTP_TUNNEL" -eq 1 ]]; then
-    upsert_env_var "TERMRELAY_HTTP_TUNNEL" "$TERMRELAY_HTTP_TUNNEL"
   fi
   if [[ "$INSTALL_SET_TLS_CERT" -eq 1 ]]; then
     upsert_env_var "TERMRELAY_TLS_CERT" "$TERMRELAY_TLS_CERT"
@@ -521,6 +483,9 @@ write_env_file() {
   if [[ -e "$ENV_FILE" ]]; then
     log "keeping existing env file at ${ENV_FILE}"
     apply_env_overrides
+    unset_env_var "TERMRELAY_AUTH_TOKEN"
+    unset_env_var "TERMRELAY_AUTH_TOKEN_FILE"
+    unset_env_var "TERMRELAY_HTTP_TUNNEL"
     if trusted_registry_defaults_enabled; then
       upsert_env_var "TERMRELAY_DAEMON_REGISTRY" "$TERMRELAY_DAEMON_REGISTRY"
       upsert_env_var "TERMRELAY_SETUP_TOKEN_FILE" "$TERMRELAY_SETUP_TOKEN_FILE"
@@ -530,29 +495,11 @@ write_env_file() {
     return 0
   fi
 
-  if [[ "$INSTALL_SET_AUTH_TOKEN" -eq 1 ]]; then
-    if [[ "$INSTALL_STAGING_ONLY" -eq 0 ]]; then
-      write_service_secret_file "/etc/termd/termrelay_auth_token" "$TERMRELAY_AUTH_TOKEN"
-    fi
-    TERMRELAY_AUTH_TOKEN_FILE="/etc/termd/termrelay_auth_token"
-    TERMRELAY_AUTH_TOKEN=""
-  fi
-
   {
     printf '# 这个文件由安装脚本创建，systemd wrapper 会读取它。\n'
-    printf '# 需要自定义监听、TLS、Web 或 relay auth 时，取消注释并修改对应变量。\n'
+    printf '# 需要自定义监听、TLS 或 Web 时，取消注释并修改对应变量。\n'
     printf 'TERMRELAY_LISTEN=%q\n' "${TERMRELAY_LISTEN:-127.0.0.1:8080}"
     printf 'TERMRELAY_WEB_ENABLED=%q\n' "${TERMRELAY_WEB_ENABLED:-0}"
-    if [[ -n "${TERMRELAY_AUTH_TOKEN:-}" ]]; then
-      printf 'TERMRELAY_AUTH_TOKEN=%q\n' "$TERMRELAY_AUTH_TOKEN"
-    else
-      printf '# TERMRELAY_AUTH_TOKEN=replace-me\n'
-    fi
-    if [[ -n "${TERMRELAY_AUTH_TOKEN_FILE:-}" ]]; then
-      printf 'TERMRELAY_AUTH_TOKEN_FILE=%q\n' "$TERMRELAY_AUTH_TOKEN_FILE"
-    else
-      printf '# TERMRELAY_AUTH_TOKEN_FILE=/run/secrets/termrelay_auth_token\n'
-    fi
     if trusted_registry_defaults_enabled; then
       printf 'TERMRELAY_SETUP_TOKEN_FILE=%q\n' "$TERMRELAY_SETUP_TOKEN_FILE"
       printf 'TERMRELAY_DAEMON_REGISTRY=%q\n' "$TERMRELAY_DAEMON_REGISTRY"
@@ -564,11 +511,6 @@ write_env_file() {
       printf 'TERMRELAY_ALLOW_OPEN_RELAY=%q\n' "$TERMRELAY_ALLOW_OPEN_RELAY"
     else
       printf '# TERMRELAY_ALLOW_OPEN_RELAY=1\n'
-    fi
-    if [[ -n "${TERMRELAY_HTTP_TUNNEL:-}" ]]; then
-      printf 'TERMRELAY_HTTP_TUNNEL=%q\n' "$TERMRELAY_HTTP_TUNNEL"
-    else
-      printf '# TERMRELAY_HTTP_TUNNEL=1\n'
     fi
     if [[ -n "${TERMRELAY_TLS_CERT:-}" ]]; then
       printf 'TERMRELAY_TLS_CERT=%q\n' "$TERMRELAY_TLS_CERT"
@@ -596,7 +538,7 @@ write_wrapper() {
 
 set -euo pipefail
 
-# 这个 wrapper 在 systemd 下组装 termrelay 的启动参数，便于通过 env 文件配置监听、TLS 和 auth token。
+# 这个 wrapper 在 systemd 下组装 termrelay 的启动参数，便于通过 env 文件配置监听、TLS 和 registry。
 
 EOF
     printf 'ENV_FILE=%q\n\n' "$runtime_env_file"
@@ -611,23 +553,6 @@ EOF
     cat <<'EOF'
 args=(--listen "${TERMRELAY_LISTEN:-127.0.0.1:8080}")
 
-if [[ -n "${TERMRELAY_AUTH_TOKEN:-}" && "${TERMRELAY_ALLOW_INLINE_TOKEN:-0}" != "1" ]]; then
-  printf '[termrelay-install] TERMRELAY_AUTH_TOKEN 会泄漏到 argv；请改用 TERMRELAY_AUTH_TOKEN_FILE。\n' >&2
-  exit 1
-fi
-
-if [[ -n "${TERMRELAY_AUTH_TOKEN:-}" ]]; then
-  args+=(--auth-token "$TERMRELAY_AUTH_TOKEN")
-fi
-
-if [[ -n "${TERMRELAY_AUTH_TOKEN_FILE:-}" ]]; then
-  if [[ -n "${TERMRELAY_AUTH_TOKEN:-}" ]]; then
-    printf '[termrelay-install] TERMRELAY_AUTH_TOKEN 和 TERMRELAY_AUTH_TOKEN_FILE 只能配置一个。\n' >&2
-    exit 1
-  fi
-  args+=(--auth-token-file "$TERMRELAY_AUTH_TOKEN_FILE")
-fi
-
 if [[ -n "${TERMRELAY_DAEMON_REGISTRY:-}" ]]; then
   args+=(--daemon-registry "$TERMRELAY_DAEMON_REGISTRY")
 elif [[ "${TERMRELAY_ALLOW_OPEN_RELAY:-0}" == "1" ]]; then
@@ -636,10 +561,6 @@ fi
 
 if [[ -n "${TERMRELAY_SETUP_TOKEN_FILE:-}" ]]; then
   args+=(--setup-token-file "$TERMRELAY_SETUP_TOKEN_FILE")
-fi
-
-if [[ "${TERMRELAY_HTTP_TUNNEL:-0}" == "1" ]]; then
-  args+=(--http-tunnel)
 fi
 
 if [[ -n "${TERMRELAY_TLS_CERT:-}" || -n "${TERMRELAY_TLS_KEY:-}" ]]; then
@@ -719,9 +640,6 @@ build_install_candidates() {
     cp --dereference --preserve=mode,ownership,timestamps -- "$final_env" "$candidate_env" || return $?
   fi
 
-  if [[ "$INSTALL_SET_AUTH_TOKEN" -eq 1 ]]; then
-    INSTALL_AUTH_TOKEN_VALUE="$TERMRELAY_AUTH_TOKEN"
-  fi
   INSTALL_STAGING_ONLY=1
   ENV_FILE="$candidate_env"
   if write_env_file; then
@@ -836,9 +754,6 @@ prepare_runtime_support_files() {
   if trusted_registry_defaults_enabled; then
     ensure_default_registry_file || return $?
     ensure_setup_token_file || return $?
-  fi
-  if [[ "$INSTALL_SET_AUTH_TOKEN" -eq 1 ]]; then
-    write_service_secret_file "/etc/termd/termrelay_auth_token" "$INSTALL_AUTH_TOKEN_VALUE" || return $?
   fi
 }
 

@@ -68,6 +68,7 @@ export async function recordPairing(accepted: PairAcceptPayload, url: string): P
     daemon_public_key: accepted.daemon_public_key,
     url: normalizedUrl,
     paired_at_ms: Date.now(),
+    ...(accepted.device_certificate ? { device_certificate: accepted.device_certificate } : {}),
     ...(existing?.name ? { name: existing.name } : {}),
   };
   const pairedServers = [
@@ -132,6 +133,23 @@ export async function recordServerUrl(serverId: string, url: string): Promise<Br
   return next;
 }
 
+export async function recordDeviceCertificate(
+  serverId: string,
+  deviceCertificate: string,
+): Promise<BrowserState> {
+  const state = await loadBrowserState();
+  const next = normalizeState({
+    ...state,
+    pairedServers: state.pairedServers.map((server) =>
+      server.server_id === serverId
+        ? { ...server, device_certificate: deviceCertificate }
+        : server,
+    ),
+  });
+  await saveBrowserState(next);
+  return next;
+}
+
 export async function saveBrowserPreferences(preferences: BrowserPreferences): Promise<BrowserState> {
   const state = await loadBrowserState();
   const next = normalizeState({
@@ -181,6 +199,7 @@ function normalizeState(state: BrowserState): BrowserState {
       daemon_public_key: server.daemon_public_key,
       url: normalizeRouteWsUrl(server.url, server.server_id, { stripSensitiveQuery: true }),
       paired_at_ms: server.paired_at_ms,
+      ...(server.device_certificate ? { device_certificate: server.device_certificate } : {}),
       ...(name ? { name } : {}),
     };
   });

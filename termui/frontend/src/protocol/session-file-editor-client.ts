@@ -1,4 +1,4 @@
-import { ProtocolClientError } from "./direct-client";
+import { ProtocolClientError } from "./errors";
 import type {
   SessionFileReadResultPayload,
   SessionFileWrittenPayload,

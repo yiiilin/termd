@@ -19,6 +19,18 @@ assert_help_contains() {
   fi
 }
 
+assert_help_excludes() {
+  local script="$1"
+  local forbidden="$2"
+  local output
+
+  output="$(bash "${ROOT_DIR}/${script}" --help)"
+  if [[ "$output" == *"$forbidden"* ]]; then
+    printf 'expected %s --help to exclude %q\n' "$script" "$forbidden" >&2
+    exit 1
+  fi
+}
+
 for script in \
   scripts/install-termd.sh \
   scripts/install-termctl.sh \
@@ -38,12 +50,18 @@ assert_help_contains scripts/install-termd.sh "--proxy <URL>"
 assert_help_contains scripts/install-termd.sh "--supervisor-version <VER>"
 assert_help_contains scripts/install-termd.sh "--user <USER>"
 assert_help_contains scripts/install-termd.sh "--purge"
+assert_help_excludes scripts/install-termd.sh "--relay-auth-token"
+assert_help_excludes scripts/install-termd.sh "--relay-auth-token-file"
+assert_help_excludes scripts/install-termd.sh "--relay-daemon-token <TOKEN>"
+assert_help_excludes scripts/install-termd.sh "--relay-setup-token <TOKEN>"
 assert_help_contains scripts/update-local-termd.sh "--workspace-tests"
 assert_help_contains scripts/update-local-termd.sh "--health-url <URL>"
 
 assert_help_contains scripts/install-termrelay.sh "--web"
 assert_help_contains scripts/install-termrelay.sh "--listen <HOST:PORT>"
-assert_help_contains scripts/install-termrelay.sh "--auth-token <TOKEN>"
+assert_help_excludes scripts/install-termrelay.sh "--auth-token"
+assert_help_excludes scripts/install-termrelay.sh "--auth-token-file"
+assert_help_excludes scripts/install-termrelay.sh "--http-tunnel"
 assert_help_contains scripts/install-termrelay.sh "--purge"
 
 grep -q "KillMode=process" "${ROOT_DIR}/scripts/install-termd.sh"
@@ -52,13 +70,26 @@ grep -q "KillMode" "${ROOT_DIR}/scripts/update-local-termd.sh"
 grep -q "__session-supervisor" "${ROOT_DIR}/scripts/update-local-termd.sh"
 grep -q "cargo build --release -p termd --bin termd --locked" "${ROOT_DIR}/scripts/update-local-termd.sh"
 grep -q "systemctl restart" "${ROOT_DIR}/scripts/update-local-termd.sh"
-grep -q "termctl pair --payload" "${ROOT_DIR}/scripts/install-termd.sh"
+grep -q "termctl pair --payload-file /path/to/termd-pair-invite" "${ROOT_DIR}/scripts/install-termd.sh"
+! grep -q "termctl pair --payload " "${ROOT_DIR}/scripts/install-termd.sh"
+! grep -q '\[termd-install\] raw token:' "${ROOT_DIR}/scripts/install-termd.sh"
+grep -q 'json.load(sys.stdin)\["daemon_public_key"\]' "${ROOT_DIR}/scripts/install-termd.sh"
+grep -q '"daemon_public_key": daemon_public_key' "${ROOT_DIR}/scripts/install-termd.sh"
+grep -q 'pair_url = relay_urls\[0\] if relay_urls else base_url' "${ROOT_DIR}/scripts/install-termd.sh"
+! grep -q 'direct_ws_url = .* + "/ws"' "${ROOT_DIR}/scripts/install-termd.sh"
 ! grep -q "termctl pair --token" "${ROOT_DIR}/scripts/install-termd.sh"
+[[ "$(grep -c 'unset_env_var "TERMD_RELAY_AUTH_TOKEN' "${ROOT_DIR}/scripts/install-termd.sh")" -eq 2 ]]
+[[ "$(grep -c 'TERMRELAY_AUTH_TOKEN' "${ROOT_DIR}/scripts/install-termrelay.sh")" -eq 2 ]]
+[[ "$(grep -c 'TERMRELAY_HTTP_TUNNEL' "${ROOT_DIR}/scripts/install-termrelay.sh")" -eq 1 ]]
 grep -q 'SUPERVISOR_VERSION="${TERMD_SUPERVISOR_VERSION:-}"' "${ROOT_DIR}/scripts/install-termd.sh"
 grep -q 'REQUIRED_SUPERVISOR_VERSION="${TERMD_REQUIRED_SUPERVISOR_VERSION:-}"' "${ROOT_DIR}/scripts/install-termd.sh"
 grep -q 'TERMD_REQUIRED_SUPERVISOR_VERSION:-' "${ROOT_DIR}/.github/workflows/release.yml"
 ! grep -q 'TERMD_SUPERVISOR_VERSION:-.*supervisor_version' "${ROOT_DIR}/.github/workflows/release.yml"
 test -s "${ROOT_DIR}/SUPERVISOR_VERSION"
+grep -q '^version = "0.7.0"$' "${ROOT_DIR}/Cargo.toml"
+grep -q '^  "version": "0.7.0",$' "${ROOT_DIR}/termui/frontend/package.json"
+grep -q '^  "version": "0.7.0",$' "${ROOT_DIR}/termui/frontend/package-lock.json"
+[[ "$(tr -d '\n' <"${ROOT_DIR}/SUPERVISOR_VERSION")" == "2026-07-12-dual-ws" ]]
 
 _load_termd_installer_functions_source() {
   # shellcheck source=/dev/null
@@ -102,21 +133,51 @@ assert_file_contains() {
   fi
 }
 
-previous_supervisor_version_from_file() {
-  local version_file="$1"
+test_termd_relay_registration_uses_only_daemon_token_and_public_key() (
+  load_termd_installer_functions
 
-  python3 - "$version_file" <<'PY'
-from datetime import date, timedelta
-from pathlib import Path
+  local tmp_dir daemon_token_file setup_token_file
+  tmp_dir="$(mktemp -d)"
+  trap 'rm -rf "$tmp_dir"' EXIT
+  daemon_token_file="$tmp_dir/daemon-token"
+  setup_token_file="$tmp_dir/setup-token"
+  printf 'daemon-secret\n' >"$daemon_token_file"
+  printf 'setup-secret\n' >"$setup_token_file"
+  chmod 0600 "$daemon_token_file" "$setup_token_file"
+
+  TERMD_RELAY_URLS="wss://relay.example/ws"
+  TERMD_RELAY_DAEMON_TOKEN_FILE="$daemon_token_file"
+  TERMD_RELAY_SETUP_TOKEN_FILE="$setup_token_file"
+
+  curl() {
+    [[ "$#" -eq 2 && "$1" == "--config" ]]
+    local payload_file
+    payload_file="$(sed -n 's/^data-binary = "@\(.*\)"$/\1/p' "$2")"
+    python3 - "$payload_file" <<'PY'
+import json
 import sys
 
-repo_version = Path(sys.argv[1]).read_text().strip()
-base_version, _, suffix = repo_version.partition('.')
-legacy_version = (date.fromisoformat(base_version) - timedelta(days=1)).isoformat()
-if suffix:
-    legacy_version = f"{legacy_version}.{suffix}"
-print(legacy_version)
+with open(sys.argv[1], "r", encoding="utf-8") as payload_file:
+    payload = json.load(payload_file)
+assert payload == {
+    "server_id": "server-v070",
+    "daemon_token": "daemon-secret",
+    "daemon_public_key": "ed25519-v1:daemon-public",
+}, payload
 PY
+  }
+
+  register_daemon_with_relay \
+    '{"server_id":"server-v070","daemon_public_key":"ed25519-v1:daemon-public","pair_ticket":"must-not-register","device_certificate":"must-not-register","access_token":"must-not-register"}' \
+    >/dev/null
+)
+
+previous_supervisor_version_from_file() {
+  local version_file="$1"
+  local repo_version
+
+  repo_version="$(tr -d '\n' <"$version_file")"
+  printf '%s-previous\n' "$repo_version"
 }
 
 install_fake_termd_system_commands() {
@@ -2520,6 +2581,7 @@ run_test() {
 }
 
 run_test test_termd_default_install_uses_managed_user
+run_test test_termd_relay_registration_uses_only_daemon_token_and_public_key
 run_test test_termd_upgrade_inherits_existing_user_without_user_arg
 run_test test_termd_upgrade_uses_fixed_state_dir_when_existing_unit_has_no_working_directory
 run_test test_termd_explicit_user_overrides_existing_service_user

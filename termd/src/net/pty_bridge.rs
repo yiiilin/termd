@@ -24,7 +24,7 @@ const OUTPUT_QUEUE_MAX_BYTES: usize = 8 * 1024 * 1024;
 
 /// 生产 daemon 使用的 PTY backend。
 ///
-/// 它仍然只实现 `PtyBackend`，所以不会把 WebSocket、auth 或 E2EE 逻辑下沉到 PTY 层；
+/// 它仍然只实现 `PtyBackend`，所以不会把 WebSocket 或 auth 逻辑下沉到 PTY 层；
 /// 唯一差异是输出读取由后台线程转成非阻塞缓存读取。
 #[derive(Debug, Default)]
 pub struct NonBlockingPortablePtyBackend;
@@ -94,8 +94,8 @@ fn read_pty_output(
                     break;
                 }
                 sequence = sequence.wrapping_add(1);
-                // 信号只表示“有输出可读”，不携带终端内容。上层当前通过明文 packet/attach
-                // frame 发送 PTY 数据；旧客户端仍可走 `session_data`/`encrypted_frame` 兼容路径。
+                // 信号只表示“有输出可读”，不携带终端内容。上层通过 terminal WebSocket
+                // frame 发送 PTY 数据。
                 let _ = output_signal_tx.send(sequence);
             }
             Err(error) => {

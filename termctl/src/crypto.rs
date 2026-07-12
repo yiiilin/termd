@@ -46,16 +46,6 @@ pub fn sign_to_wire(signing_key: &SigningKey, signing_input: &[u8]) -> Signature
     Signature(wire_prefixed(&signature.to_bytes()))
 }
 
-pub fn encode_session_data(bytes: &[u8]) -> String {
-    general_purpose::STANDARD.encode(bytes)
-}
-
-pub fn decode_session_data(data_base64: &str) -> Result<Vec<u8>> {
-    general_purpose::STANDARD
-        .decode(data_base64)
-        .map_err(|_| TermctlError::InvalidEnvelope)
-}
-
 pub fn now_ms() -> UnixTimestampMillis {
     current_unix_timestamp_millis()
 }
@@ -120,14 +110,5 @@ mod tests {
                 &payload.signature,
             )
             .unwrap();
-    }
-
-    #[test]
-    fn session_data_base64_roundtrips_binary_bytes() {
-        let bytes = b"\x00terminal bytes\n\xff";
-        let encoded = encode_session_data(bytes);
-        let decoded = decode_session_data(&encoded).unwrap();
-
-        assert_eq!(decoded, bytes);
     }
 }

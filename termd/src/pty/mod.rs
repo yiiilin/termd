@@ -1,7 +1,7 @@
 //! termd 的 PTY 抽象层。
 //!
 //! 这个模块只负责“如何启动并驱动一个伪终端进程”。认证、控制权、relay 路由、
-//! WebSocket 协议和 E2EE 都在更外层处理，避免 PTY 后端意外承担控制权逻辑。
+//! WebSocket 协议都在更外层处理，避免 PTY 后端意外承担控制权逻辑。
 
 pub mod portable;
 pub mod supervisor;
@@ -294,7 +294,7 @@ pub struct PtyAttachmentBootstrap {
 /// supervisor 暴露给 daemon 的 session 级终端帧。
 ///
 /// 中文注释：`terminal_seq` 是 session 级终端事件序号，用于 snapshot 后补 tail；
-/// 它和 `ProtocolPacket.seq` 的连接内传输序号不是同一个东西，不能混用。
+/// 它不等同于 metadata revision，也不能用于 metadata 事件补偿。
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PtyTerminalFrame {

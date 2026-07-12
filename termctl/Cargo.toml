@@ -12,6 +12,7 @@ ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 libc = "0.2"
 rand_core = { version = "0.6", features = ["getrandom"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde.workspace = true
 serde_json.workspace = true
 rustls = "0.23"

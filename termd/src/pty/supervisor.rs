@@ -5569,7 +5569,6 @@ pub(crate) fn encode_supervisor_terminal_client_frame(
     encode_length_prefixed_json(frame).map_err(PtyError::from)
 }
 
-#[cfg(test)]
 pub(crate) fn decode_supervisor_terminal_client_frame(
     bytes: &[u8],
 ) -> PtyResult<SupervisorTerminalClientFrame> {
@@ -5610,7 +5609,6 @@ where
     Ok(frame)
 }
 
-#[cfg(test)]
 fn decode_length_prefixed_json<T>(bytes: &[u8]) -> io::Result<T>
 where
     T: DeserializeOwned,

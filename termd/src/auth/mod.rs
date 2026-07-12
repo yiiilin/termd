@@ -4,23 +4,23 @@
 //! 平台级策略或 relay 业务判断；上层只需要先确认设备已配对并可信，再把
 //! device id 交给 session/control 模块处理 shared-control operator 规则。
 //!
-//! 当前实现是 MVP 内存模型：pairing token、challenge-response 与 replay protection 都只在
-//! daemon 内核中做生命周期管理；Noise/X25519 或 E2EE 会在后续协议层接入。后续持久化
-//! 可以实现 `TrustedDeviceStore`，并复用同一组查询边界来拒绝未配对设备。
+//! 当前实现是 MVP 模型：pairing、challenge-response 与 replay protection 都在 daemon
+//! 内核中做生命周期管理。持久化通过 `TrustedDeviceStore` 复用同一组查询边界来拒绝未配对设备。
 
 use base64::{Engine as _, engine::general_purpose};
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use rand_core::OsRng;
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod credentials;
+pub use credentials::*;
+
 pub use termd_proto::{
-    AuthPayload, Challenge, DeviceId, E2eeKeyExchangePayload, HttpE2eeAuthPayload, Nonce,
-    PairAcceptPayload, PairRequestPayload, PairingToken, PublicKey, ServerId, SessionToken,
-    Signature, UnixTimestampMillis,
+    AuthPayload, Challenge, DeviceId, Nonce, PairAcceptPayload, PairRequestPayload, PairingToken,
+    PublicKey, ServerId, Signature, UnixTimestampMillis,
 };
 
 /// auth 模块统一使用的 Result 类型。
@@ -28,7 +28,6 @@ pub type AuthResult<T> = Result<T, AuthError>;
 
 /// pairing token 生命周期使用的 Result 类型。
 pub type PairingResult<T> = Result<T, PairingError>;
-pub type SessionTokenResult<T> = Result<T, SessionTokenError>;
 
 const ED25519_WIRE_PREFIX: &str = "ed25519-v1:";
 const ED25519_PRIVATE_KEY_LEN: usize = 32;
@@ -81,33 +80,6 @@ pub enum PairingError {
     /// ttl 必须为正数，并且不能让过期时间发生整数溢出。
     InvalidTtl { ttl_ms: u64 },
 }
-
-/// session token 生命周期的拒绝原因。
-///
-/// session token 只负责认证后续控制面/终端连接，不替代 E2EE，也不绑定 session 控制权。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SessionTokenError {
-    InvalidToken,
-    ExpiredToken {
-        expires_at_ms: UnixTimestampMillis,
-        now_ms: UnixTimestampMillis,
-    },
-    InvalidTtl {
-        ttl_ms: u64,
-    },
-}
-
-impl fmt::Display for SessionTokenError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidToken => write!(f, "session token is invalid"),
-            Self::ExpiredToken { .. } => write!(f, "session token is expired"),
-            Self::InvalidTtl { .. } => write!(f, "session token ttl is invalid"),
-        }
-    }
-}
-
-impl Error for SessionTokenError {}
 
 impl fmt::Display for PairingError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -454,342 +426,11 @@ impl fmt::Debug for PairingTokenRecord {
 
 /// pairing token 的内存生命周期管理器。
 ///
-/// 该类型只负责签发、查询、一次性消费、撤销和清理过期 token；不实现扫码、CLI、WebSocket、
-/// E2EE 或持久化。后续持久化层可以围绕同一状态语义扩展，不应把账号体系混入这里。
+/// 该类型只负责签发、查询、一次性消费、撤销和清理过期 token；不实现扫码、CLI、网络传输
+/// 或持久化。后续持久化层可以围绕同一状态语义扩展，不应把账号体系混入这里。
 #[derive(Default)]
 pub struct PairingTokenManager {
     tokens: HashMap<String, PairingTokenRecord>,
-}
-
-/// daemon 内部保存的短期 session token 记录。
-#[derive(Clone, PartialEq, Eq)]
-pub struct SessionTokenRecord {
-    token: SessionToken,
-    server_id: ServerId,
-    device_id: DeviceId,
-    issued_at_ms: UnixTimestampMillis,
-    expires_at_ms: UnixTimestampMillis,
-}
-
-/// daemon 内部保存的短期 session scope token 记录。
-#[derive(Clone, PartialEq, Eq)]
-pub struct SessionScopeRecord {
-    token: SessionToken,
-    server_id: ServerId,
-    device_id: DeviceId,
-    session_id: termd_proto::SessionId,
-    issued_at_ms: UnixTimestampMillis,
-    expires_at_ms: UnixTimestampMillis,
-}
-
-impl SessionScopeRecord {
-    fn new(
-        token: SessionToken,
-        server_id: ServerId,
-        device_id: DeviceId,
-        session_id: termd_proto::SessionId,
-        issued_at_ms: UnixTimestampMillis,
-        expires_at_ms: UnixTimestampMillis,
-    ) -> Self {
-        Self {
-            token,
-            server_id,
-            device_id,
-            session_id,
-            issued_at_ms,
-            expires_at_ms,
-        }
-    }
-
-    pub fn token(&self) -> &SessionToken {
-        &self.token
-    }
-
-    pub fn server_id(&self) -> ServerId {
-        self.server_id
-    }
-
-    pub fn device_id(&self) -> DeviceId {
-        self.device_id
-    }
-
-    pub fn session_id(&self) -> termd_proto::SessionId {
-        self.session_id
-    }
-
-    pub fn issued_at_ms(&self) -> UnixTimestampMillis {
-        self.issued_at_ms
-    }
-
-    pub fn expires_at_ms(&self) -> UnixTimestampMillis {
-        self.expires_at_ms
-    }
-
-    fn is_expired(&self, now_ms: UnixTimestampMillis) -> bool {
-        now_ms >= self.expires_at_ms
-    }
-}
-
-impl fmt::Debug for SessionScopeRecord {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SessionScopeRecord")
-            .field("token", &"<redacted>")
-            .field("server_id", &self.server_id)
-            .field("device_id", &self.device_id)
-            .field("session_id", &self.session_id)
-            .field("issued_at_ms", &self.issued_at_ms)
-            .field("expires_at_ms", &self.expires_at_ms)
-            .finish()
-    }
-}
-
-impl SessionTokenRecord {
-    fn new(
-        token: SessionToken,
-        server_id: ServerId,
-        device_id: DeviceId,
-        issued_at_ms: UnixTimestampMillis,
-        expires_at_ms: UnixTimestampMillis,
-    ) -> Self {
-        Self {
-            token,
-            server_id,
-            device_id,
-            issued_at_ms,
-            expires_at_ms,
-        }
-    }
-
-    pub fn token(&self) -> &SessionToken {
-        &self.token
-    }
-
-    pub fn server_id(&self) -> ServerId {
-        self.server_id
-    }
-
-    pub fn device_id(&self) -> DeviceId {
-        self.device_id
-    }
-
-    pub fn issued_at_ms(&self) -> UnixTimestampMillis {
-        self.issued_at_ms
-    }
-
-    pub fn expires_at_ms(&self) -> UnixTimestampMillis {
-        self.expires_at_ms
-    }
-
-    fn is_expired(&self, now_ms: UnixTimestampMillis) -> bool {
-        now_ms >= self.expires_at_ms
-    }
-}
-
-impl fmt::Debug for SessionTokenRecord {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SessionTokenRecord")
-            .field("token", &"<redacted>")
-            .field("server_id", &self.server_id)
-            .field("device_id", &self.device_id)
-            .field("issued_at_ms", &self.issued_at_ms)
-            .field("expires_at_ms", &self.expires_at_ms)
-            .finish()
-    }
-}
-
-/// session token 的内存生命周期管理器。
-#[derive(Default, Clone)]
-pub struct SessionTokenManager {
-    tokens: HashMap<String, SessionTokenRecord>,
-}
-
-/// session scope token 的内存生命周期管理器。
-#[derive(Default, Clone)]
-pub struct SessionScopeManager {
-    tokens: HashMap<String, SessionScopeRecord>,
-}
-
-impl SessionTokenManager {
-    pub fn new() -> Self {
-        Self {
-            tokens: HashMap::new(),
-        }
-    }
-
-    pub fn issue(
-        &mut self,
-        server_id: ServerId,
-        device_id: DeviceId,
-        now_ms: UnixTimestampMillis,
-        ttl_ms: u64,
-    ) -> SessionTokenResult<SessionTokenRecord> {
-        if ttl_ms == 0 {
-            return Err(SessionTokenError::InvalidTtl { ttl_ms });
-        }
-        let expires_at_ms = UnixTimestampMillis(
-            now_ms
-                .0
-                .checked_add(ttl_ms)
-                .ok_or(SessionTokenError::InvalidTtl { ttl_ms })?,
-        );
-        self.prune_expired(now_ms);
-        loop {
-            let token = generate_session_token();
-            let key = session_token_key(&token).to_owned();
-            if self.tokens.contains_key(&key) {
-                continue;
-            }
-            let record =
-                SessionTokenRecord::new(token, server_id, device_id, now_ms, expires_at_ms);
-            self.tokens.insert(key, record.clone());
-            return Ok(record);
-        }
-    }
-
-    pub fn record(&self, token: &SessionToken) -> Option<&SessionTokenRecord> {
-        self.tokens.get(session_token_key(token))
-    }
-
-    pub fn verify(
-        &mut self,
-        token: &SessionToken,
-        now_ms: UnixTimestampMillis,
-    ) -> SessionTokenResult<SessionTokenRecord> {
-        let token_key = session_token_key(token).to_owned();
-        self.prune_expired_except(now_ms, Some(token_key.as_str()));
-        let Some(record) = self.tokens.get(&token_key) else {
-            return Err(SessionTokenError::InvalidToken);
-        };
-        if record.is_expired(now_ms) {
-            let expires_at_ms = record.expires_at_ms();
-            self.tokens.remove(&token_key);
-            return Err(SessionTokenError::ExpiredToken {
-                expires_at_ms,
-                now_ms,
-            });
-        }
-        Ok(record.clone())
-    }
-
-    pub fn prune_expired(&mut self, now_ms: UnixTimestampMillis) -> usize {
-        self.prune_expired_except(now_ms, None)
-    }
-
-    fn prune_expired_except(
-        &mut self,
-        now_ms: UnixTimestampMillis,
-        keep_key: Option<&str>,
-    ) -> usize {
-        let before = self.tokens.len();
-        self.tokens.retain(|key, record| {
-            if keep_key.is_some_and(|keep| keep == key) {
-                return true;
-            }
-            !record.is_expired(now_ms)
-        });
-        before - self.tokens.len()
-    }
-}
-
-impl SessionScopeManager {
-    pub fn new() -> Self {
-        Self {
-            tokens: HashMap::new(),
-        }
-    }
-
-    pub fn issue(
-        &mut self,
-        server_id: ServerId,
-        device_id: DeviceId,
-        session_id: termd_proto::SessionId,
-        now_ms: UnixTimestampMillis,
-        ttl_ms: u64,
-    ) -> SessionTokenResult<SessionScopeRecord> {
-        if ttl_ms == 0 {
-            return Err(SessionTokenError::InvalidTtl { ttl_ms });
-        }
-        let expires_at_ms = UnixTimestampMillis(
-            now_ms
-                .0
-                .checked_add(ttl_ms)
-                .ok_or(SessionTokenError::InvalidTtl { ttl_ms })?,
-        );
-        self.prune_expired(now_ms);
-        loop {
-            let token = generate_session_token();
-            let key = session_token_key(&token).to_owned();
-            if self.tokens.contains_key(&key) {
-                continue;
-            }
-            let record = SessionScopeRecord::new(
-                token,
-                server_id,
-                device_id,
-                session_id,
-                now_ms,
-                expires_at_ms,
-            );
-            self.tokens.insert(key, record.clone());
-            return Ok(record);
-        }
-    }
-
-    pub fn verify(
-        &mut self,
-        token: &SessionToken,
-        now_ms: UnixTimestampMillis,
-    ) -> SessionTokenResult<SessionScopeRecord> {
-        let token_key = session_token_key(token).to_owned();
-        self.prune_expired_except(now_ms, Some(token_key.as_str()));
-        let Some(record) = self.tokens.get(&token_key) else {
-            return Err(SessionTokenError::InvalidToken);
-        };
-        if record.is_expired(now_ms) {
-            let expires_at_ms = record.expires_at_ms();
-            self.tokens.remove(&token_key);
-            return Err(SessionTokenError::ExpiredToken {
-                expires_at_ms,
-                now_ms,
-            });
-        }
-        Ok(record.clone())
-    }
-
-    pub fn prune_expired(&mut self, now_ms: UnixTimestampMillis) -> usize {
-        self.prune_expired_except(now_ms, None)
-    }
-
-    fn prune_expired_except(
-        &mut self,
-        now_ms: UnixTimestampMillis,
-        keep_key: Option<&str>,
-    ) -> usize {
-        let before = self.tokens.len();
-        self.tokens.retain(|key, record| {
-            if keep_key.is_some_and(|keep| keep == key) {
-                return true;
-            }
-            !record.is_expired(now_ms)
-        });
-        before - self.tokens.len()
-    }
-}
-
-impl fmt::Debug for SessionScopeManager {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SessionScopeManager")
-            .field("len", &self.tokens.len())
-            .finish()
-    }
-}
-
-impl fmt::Debug for SessionTokenManager {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SessionTokenManager")
-            .field("len", &self.tokens.len())
-            .finish()
-    }
 }
 
 impl PairingTokenManager {
@@ -1233,8 +874,8 @@ impl fmt::Debug for AuthChallengeRecord {
 
 /// auth challenge 的内存生命周期管理器。
 ///
-/// 管理器只签发、查询、一次性消费、撤销和清理 challenge；不做 WebSocket 握手、不做
-/// E2EE，也不决定 operator 状态。auth 成功后才由上层继续 attach session。
+/// 管理器只签发、查询、一次性消费、撤销和清理 challenge；不做网络握手，也不决定
+/// operator 状态。auth 成功后才由上层继续 attach session。
 #[derive(Default)]
 pub struct AuthChallengeManager {
     challenges: HashMap<String, AuthChallengeRecord>,
@@ -1460,7 +1101,7 @@ impl ReplayProtector {
 
     /// 检查 timestamp 与 nonce，但不记录 nonce。
     ///
-    /// HTTP E2EE 与 WebSocket auth 这类需要先验证签名的路径先做 replay 预检，
+    /// device-certificate challenge 这类需要先验证签名的路径先做 replay 预检，
     /// 签名通过后再记录 nonce，避免坏签名请求消耗合法 nonce。
     pub fn check(
         &mut self,
@@ -1588,7 +1229,6 @@ pub struct AuthSigningInput {
     challenge: Challenge,
     nonce: Nonce,
     timestamp_ms: UnixTimestampMillis,
-    e2ee_transcript_sha256: Option<String>,
 }
 
 impl AuthSigningInput {
@@ -1601,22 +1241,7 @@ impl AuthSigningInput {
             challenge: payload.challenge.clone(),
             nonce: payload.nonce.clone(),
             timestamp_ms: payload.timestamp_ms,
-            e2ee_transcript_sha256: None,
         }
-    }
-
-    /// 从 auth payload 构造绑定当前 E2EE transcript 的签名输入。
-    ///
-    /// 0.2.0 的客户端必须使用这个路径：设备签名不只证明 challenge，还证明自己看到的是
-    /// 当前 daemon 身份签过的 X25519 握手材料，避免 relay 把 challenge 跨连接转发。
-    pub fn from_payload_with_e2ee_transcript(
-        payload: &AuthPayload,
-        daemon_identity: &DaemonPublicIdentity,
-        transcript: Option<&E2eeAuthTranscript>,
-    ) -> Self {
-        let mut input = Self::from_payload(payload, daemon_identity);
-        input.e2ee_transcript_sha256 = transcript.map(E2eeAuthTranscript::digest_wire);
-        input
     }
 
     /// 输出稳定字节序列，供具体签名算法验签。
@@ -1633,261 +1258,6 @@ impl AuthSigningInput {
         append_canonical_field(&mut bytes, "challenge", self.challenge.0.as_str());
         append_canonical_field(&mut bytes, "nonce", self.nonce.0.as_str());
         append_canonical_field(&mut bytes, "timestamp_ms", &self.timestamp_ms.0.to_string());
-        if let Some(transcript) = &self.e2ee_transcript_sha256 {
-            append_canonical_field(&mut bytes, "e2ee_transcript_sha256", transcript);
-        }
-        bytes
-    }
-}
-
-/// daemon 对自己发出的 E2EE server hello 做身份签名的规范化输入。
-///
-/// 这个签名把长期 Ed25519 trust anchor 绑定到短期 X25519 公钥。客户端在建立 E2EE session
-/// 前先验证它，relay 因而不能替换 X25519 公钥后继续冒充 daemon。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DaemonE2eeSigningInput {
-    server_id: ServerId,
-    daemon_public_key: PublicKey,
-    device_id: DeviceId,
-    e2ee_public_key: PublicKey,
-    nonce: Nonce,
-    timestamp_ms: UnixTimestampMillis,
-    packet_version: u16,
-    binary_version: u16,
-}
-
-impl DaemonE2eeSigningInput {
-    pub fn from_payload(
-        payload: &E2eeKeyExchangePayload,
-        daemon_identity: &DaemonPublicIdentity,
-    ) -> Self {
-        Self {
-            server_id: daemon_identity.server_id,
-            daemon_public_key: daemon_identity.public_key.clone(),
-            device_id: payload.device_id,
-            e2ee_public_key: payload.public_key.clone(),
-            nonce: payload.nonce.clone(),
-            timestamp_ms: payload.timestamp_ms,
-            packet_version: payload
-                .packet_version
-                .unwrap_or(termd_proto::ProtocolVersion(0))
-                .0,
-            binary_version: payload
-                .binary_version
-                .unwrap_or(termd_proto::ProtocolVersion(0))
-                .0,
-        }
-    }
-
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(b"termd-daemon-e2ee-key-exchange-v1\n");
-        append_canonical_field(&mut bytes, "server_id", &self.server_id.0.to_string());
-        append_canonical_field(
-            &mut bytes,
-            "daemon_public_key",
-            self.daemon_public_key.0.as_str(),
-        );
-        append_canonical_field(&mut bytes, "device_id", &self.device_id.0.to_string());
-        append_canonical_field(
-            &mut bytes,
-            "e2ee_public_key",
-            self.e2ee_public_key.0.as_str(),
-        );
-        append_canonical_field(&mut bytes, "nonce", self.nonce.0.as_str());
-        append_canonical_field(&mut bytes, "timestamp_ms", &self.timestamp_ms.0.to_string());
-        append_canonical_field(
-            &mut bytes,
-            "packet_version",
-            &self.packet_version.to_string(),
-        );
-        append_canonical_field(
-            &mut bytes,
-            "binary_version",
-            &self.binary_version.to_string(),
-        );
-        bytes
-    }
-}
-
-/// HTTP E2EE 短期通道的规范化待签名字节。
-///
-/// 和 WebSocket auth 不同，这里没有服务端 challenge；安全边界来自已配对 device key、
-/// nonce/timestamp replay protection，以及 method/path 绑定。这样每次 HTTP transfer 都能
-/// 独立认证，不依赖某条 WebSocket 连接的状态。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HttpE2eeSigningInput {
-    server_id: ServerId,
-    daemon_public_key: PublicKey,
-    device_id: DeviceId,
-    e2ee_public_key: PublicKey,
-    nonce: Nonce,
-    timestamp_ms: UnixTimestampMillis,
-    method: String,
-    path: String,
-}
-
-impl HttpE2eeSigningInput {
-    pub fn from_payload(
-        payload: &HttpE2eeAuthPayload,
-        daemon_identity: &DaemonPublicIdentity,
-    ) -> Self {
-        Self {
-            server_id: daemon_identity.server_id,
-            daemon_public_key: daemon_identity.public_key.clone(),
-            device_id: payload.device_id,
-            e2ee_public_key: payload.e2ee_public_key.clone(),
-            nonce: payload.nonce.clone(),
-            timestamp_ms: payload.timestamp_ms,
-            method: payload.method.clone(),
-            path: payload.path.clone(),
-        }
-    }
-
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(b"termd-http-e2ee-v1\n");
-        append_canonical_field(&mut bytes, "server_id", &self.server_id.0.to_string());
-        append_canonical_field(
-            &mut bytes,
-            "daemon_public_key",
-            self.daemon_public_key.0.as_str(),
-        );
-        append_canonical_field(&mut bytes, "device_id", &self.device_id.0.to_string());
-        append_canonical_field(
-            &mut bytes,
-            "e2ee_public_key",
-            self.e2ee_public_key.0.as_str(),
-        );
-        append_canonical_field(&mut bytes, "nonce", self.nonce.0.as_str());
-        append_canonical_field(&mut bytes, "timestamp_ms", &self.timestamp_ms.0.to_string());
-        append_canonical_field(&mut bytes, "method", self.method.as_str());
-        append_canonical_field(&mut bytes, "path", self.path.as_str());
-        bytes
-    }
-}
-
-/// auth 签名需要绑定的 E2EE transcript 摘要。
-///
-/// 摘要覆盖 daemon 身份、daemon/server E2EE hello、device E2EE hello 和 packet 版本。
-/// wire payload 不额外携带这个摘要，客户端与 daemon 各自从握手材料计算同一个值。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct E2eeAuthTranscript {
-    server_id: ServerId,
-    daemon_public_key: PublicKey,
-    daemon_e2ee_public_key: PublicKey,
-    daemon_nonce: Nonce,
-    daemon_timestamp_ms: UnixTimestampMillis,
-    daemon_packet_version: u16,
-    daemon_binary_version: u16,
-    daemon_signature: Option<Signature>,
-    device_id: DeviceId,
-    device_e2ee_public_key: PublicKey,
-    device_nonce: Nonce,
-    device_timestamp_ms: UnixTimestampMillis,
-    device_packet_version: u16,
-    device_binary_version: u16,
-}
-
-impl E2eeAuthTranscript {
-    pub fn from_key_exchanges(
-        daemon_exchange: &E2eeKeyExchangePayload,
-        device_exchange: &E2eeKeyExchangePayload,
-        daemon_identity: &DaemonPublicIdentity,
-    ) -> Self {
-        Self {
-            server_id: daemon_identity.server_id,
-            daemon_public_key: daemon_identity.public_key.clone(),
-            daemon_e2ee_public_key: daemon_exchange.public_key.clone(),
-            daemon_nonce: daemon_exchange.nonce.clone(),
-            daemon_timestamp_ms: daemon_exchange.timestamp_ms,
-            daemon_packet_version: daemon_exchange
-                .packet_version
-                .unwrap_or(termd_proto::ProtocolVersion(0))
-                .0,
-            daemon_binary_version: daemon_exchange
-                .binary_version
-                .unwrap_or(termd_proto::ProtocolVersion(0))
-                .0,
-            daemon_signature: daemon_exchange.signature.clone(),
-            device_id: device_exchange.device_id,
-            device_e2ee_public_key: device_exchange.public_key.clone(),
-            device_nonce: device_exchange.nonce.clone(),
-            device_timestamp_ms: device_exchange.timestamp_ms,
-            device_packet_version: device_exchange
-                .packet_version
-                .unwrap_or(termd_proto::ProtocolVersion(0))
-                .0,
-            device_binary_version: device_exchange
-                .binary_version
-                .unwrap_or(termd_proto::ProtocolVersion(0))
-                .0,
-        }
-    }
-
-    pub fn digest_wire(&self) -> String {
-        let digest = Sha256::digest(self.to_bytes());
-        format!(
-            "sha256-v1:{}",
-            general_purpose::STANDARD.encode(digest.as_slice())
-        )
-    }
-
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(b"termd-e2ee-auth-transcript-v1\n");
-        append_canonical_field(&mut bytes, "server_id", &self.server_id.0.to_string());
-        append_canonical_field(
-            &mut bytes,
-            "daemon_public_key",
-            self.daemon_public_key.0.as_str(),
-        );
-        append_canonical_field(
-            &mut bytes,
-            "daemon_e2ee_public_key",
-            self.daemon_e2ee_public_key.0.as_str(),
-        );
-        append_canonical_field(&mut bytes, "daemon_nonce", self.daemon_nonce.0.as_str());
-        append_canonical_field(
-            &mut bytes,
-            "daemon_timestamp_ms",
-            &self.daemon_timestamp_ms.0.to_string(),
-        );
-        append_canonical_field(
-            &mut bytes,
-            "daemon_packet_version",
-            &self.daemon_packet_version.to_string(),
-        );
-        append_canonical_field(
-            &mut bytes,
-            "daemon_binary_version",
-            &self.daemon_binary_version.to_string(),
-        );
-        if let Some(signature) = &self.daemon_signature {
-            append_canonical_field(&mut bytes, "daemon_signature", signature.0.as_str());
-        }
-        append_canonical_field(&mut bytes, "device_id", &self.device_id.0.to_string());
-        append_canonical_field(
-            &mut bytes,
-            "device_e2ee_public_key",
-            self.device_e2ee_public_key.0.as_str(),
-        );
-        append_canonical_field(&mut bytes, "device_nonce", self.device_nonce.0.as_str());
-        append_canonical_field(
-            &mut bytes,
-            "device_timestamp_ms",
-            &self.device_timestamp_ms.0.to_string(),
-        );
-        append_canonical_field(
-            &mut bytes,
-            "device_packet_version",
-            &self.device_packet_version.to_string(),
-        );
-        append_canonical_field(
-            &mut bytes,
-            "device_binary_version",
-            &self.device_binary_version.to_string(),
-        );
         bytes
     }
 }
@@ -1976,25 +1346,6 @@ impl ChallengeResponseService {
         S: TrustedDeviceStore,
         V: SignatureVerifier,
     {
-        self.authenticate_with_transcript(payload, now_ms, trusted_store, verifier, None)
-    }
-
-    /// 校验 auth payload，并可选绑定当前 E2EE transcript。
-    ///
-    /// 这条路径是 0.2.0 新握手所用：relay 即使拿到 challenge，也不能把签名搬到另一条
-    /// E2EE 连接上，因为签名输入里会包含本次握手 transcript 的摘要。
-    pub fn authenticate_with_transcript<S, V>(
-        &mut self,
-        payload: AuthPayload,
-        now_ms: UnixTimestampMillis,
-        trusted_store: &mut S,
-        verifier: &V,
-        transcript: Option<&E2eeAuthTranscript>,
-    ) -> Result<AuthenticatedDevice, ChallengeAuthError>
-    where
-        S: TrustedDeviceStore,
-        V: SignatureVerifier,
-    {
         let device_public_key = trusted_store
             .require_trusted(&payload.device_id)
             .map_err(ChallengeAuthError::from)?
@@ -2017,12 +1368,8 @@ impl ChallengeResponseService {
             )
             .map_err(ChallengeAuthError::from)?;
 
-        let signing_input = AuthSigningInput::from_payload_with_e2ee_transcript(
-            &payload,
-            &self.daemon_identity,
-            transcript,
-        )
-        .to_bytes();
+        let signing_input =
+            AuthSigningInput::from_payload(&payload, &self.daemon_identity).to_bytes();
         verifier
             .verify(&device_public_key, &signing_input, &payload.signature)
             .map_err(ChallengeAuthError::from)?;
@@ -2497,18 +1844,6 @@ fn pairing_token_key(token: &PairingToken) -> &str {
     token.0.as_str()
 }
 
-fn generate_session_token() -> SessionToken {
-    let token_id = ServerId::new();
-
-    // session token 只表示“这个设备刚刚在这个 daemon 上完成认证”，
-    // 不编码 session id、权限角色或任何可推断的明文业务信息。
-    SessionToken(format!("termd-session-{}", token_id.0))
-}
-
-fn session_token_key(token: &SessionToken) -> &str {
-    token.0.as_str()
-}
-
 fn generate_auth_challenge() -> Challenge {
     let challenge_id = ServerId::new();
 
@@ -2532,7 +1867,7 @@ fn daemon_wire_prefixed(bytes: &[u8]) -> String {
     )
 }
 
-fn validate_device_public_key_wire(public_key: &PublicKey) -> PairingResult<()> {
+pub fn validate_device_public_key_wire(public_key: &PublicKey) -> PairingResult<()> {
     let encoded = public_key
         .0
         .strip_prefix(ED25519_WIRE_PREFIX)
@@ -2575,7 +1910,6 @@ fn append_canonical_field(bytes: &mut Vec<u8>, name: &str, value: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ed25519_dalek::{Signature as Ed25519Signature, Verifier, VerifyingKey};
 
     fn public_key(value: &str) -> PublicKey {
         PublicKey(value.to_owned())
@@ -2861,56 +2195,6 @@ mod tests {
             manager.issue(timestamp(1000), 0).unwrap_err(),
             PairingError::InvalidTtl { ttl_ms: 0 }
         );
-    }
-
-    #[test]
-    fn session_token_issue_records_expiration_time() {
-        let mut manager = SessionTokenManager::new();
-        let device_id = DeviceId::new();
-        let server_id = ServerId::new();
-
-        let record = manager
-            .issue(server_id, device_id, timestamp(1000), 60_000)
-            .unwrap();
-
-        assert_eq!(record.server_id(), server_id);
-        assert_eq!(record.device_id(), device_id);
-        assert_eq!(record.issued_at_ms(), timestamp(1000));
-        assert_eq!(record.expires_at_ms(), timestamp(61_000));
-        assert!(!record.token().0.is_empty());
-        assert!(manager.record(record.token()).is_some());
-    }
-
-    #[test]
-    fn session_token_rejects_expired_token() {
-        let mut manager = SessionTokenManager::new();
-        let issued = manager
-            .issue(ServerId::new(), DeviceId::new(), timestamp(1000), 500)
-            .unwrap();
-        let token = issued.token().clone();
-
-        assert_eq!(
-            manager.verify(&token, timestamp(1500)).unwrap_err(),
-            SessionTokenError::ExpiredToken {
-                expires_at_ms: timestamp(1500),
-                now_ms: timestamp(1500),
-            }
-        );
-        assert!(manager.record(&token).is_none());
-    }
-
-    #[test]
-    fn session_token_verifies_server_and_device_binding() {
-        let mut manager = SessionTokenManager::new();
-        let server_id = ServerId::new();
-        let device_id = DeviceId::new();
-        let record = manager
-            .issue(server_id, device_id, timestamp(1000), 500)
-            .unwrap();
-
-        let verified = manager.verify(record.token(), timestamp(1200)).unwrap();
-        assert_eq!(verified.server_id(), server_id);
-        assert_eq!(verified.device_id(), device_id);
     }
 
     #[test]
@@ -3516,73 +2800,6 @@ mod tests {
         assert!(device_pos < challenge_pos);
         assert!(challenge_pos < nonce_pos);
         assert!(nonce_pos < timestamp_pos);
-    }
-
-    #[test]
-    fn daemon_identity_signs_e2ee_key_exchange_material() {
-        let identity = DaemonIdentity::generate();
-        let public_identity = identity.public_identity();
-        let payload = E2eeKeyExchangePayload::new(
-            public_identity.server_id,
-            DeviceId::default(),
-            public_key("x25519-v1:daemon-e2ee-public"),
-            nonce("daemon-e2ee-nonce"),
-            timestamp(1234),
-        );
-        let signing_input =
-            DaemonE2eeSigningInput::from_payload(&payload, &public_identity).to_bytes();
-        let signature = identity.sign_to_wire(&signing_input).unwrap();
-
-        let public_key_bytes = decode_test_wire_bytes(&public_identity.public_key.0, 32);
-        let signature_bytes = decode_test_wire_bytes(&signature.0, 64);
-        let verifying_key =
-            VerifyingKey::from_bytes(&public_key_bytes.try_into().unwrap()).unwrap();
-        let signature = Ed25519Signature::from_slice(&signature_bytes).unwrap();
-
-        verifying_key.verify(&signing_input, &signature).unwrap();
-    }
-
-    #[test]
-    fn auth_signing_input_can_bind_current_e2ee_transcript() {
-        let identity = DaemonIdentity::generate();
-        let daemon = identity.public_identity();
-        let server_exchange = E2eeKeyExchangePayload::new(
-            daemon.server_id,
-            DeviceId::default(),
-            public_key("x25519-v1:daemon-session-key"),
-            nonce("server-nonce"),
-            timestamp(1000),
-        )
-        .with_signature(signature("ed25519-v1:server-signature"));
-        let device_id = DeviceId::new();
-        let device_exchange = E2eeKeyExchangePayload::new(
-            daemon.server_id,
-            device_id,
-            public_key("x25519-v1:device-session-key"),
-            nonce("device-nonce"),
-            timestamp(1001),
-        );
-        let transcript =
-            E2eeAuthTranscript::from_key_exchanges(&server_exchange, &device_exchange, &daemon);
-        let payload = termd_proto::AuthPayload {
-            device_id,
-            challenge: termd_proto::Challenge("challenge-a".to_owned()),
-            nonce: nonce("auth-nonce"),
-            timestamp_ms: timestamp(1100),
-            signature: signature("sig"),
-        };
-
-        let unbound = AuthSigningInput::from_payload(&payload, &daemon).to_bytes();
-        let bound = AuthSigningInput::from_payload_with_e2ee_transcript(
-            &payload,
-            &daemon,
-            Some(&transcript),
-        )
-        .to_bytes();
-        let bound_text = String::from_utf8(bound.clone()).unwrap();
-
-        assert_ne!(unbound, bound);
-        assert!(bound_text.contains("e2ee_transcript_sha256:"));
     }
 
     #[test]

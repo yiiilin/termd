@@ -91,7 +91,7 @@ pub struct SessionStateRecord {
 /// 未完成 HTTP upload 的恢复清理记录。
 ///
 /// 这里只保存同目录隐藏临时对象路径和创建时的文件 identity；daemon 重启后只用它做安全 cleanup，
-/// 不保存任何文件内容或 E2EE 明文。Unix/Windows 下 `dev/ino` 是原生文件对象 ID；
+/// 不保存任何文件内容或 terminal 明文。Unix/Windows 下 `dev/ino` 是原生文件对象 ID；
 /// Windows 缺失 file id 时用协议层 sentinel 表示；其他平台没有稳定 file id，cleanup
 /// 会安全失败，不静默删除未知对象。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

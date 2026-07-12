@@ -13,11 +13,9 @@ import App, {
   networkRateFromSamples,
   pairingWsUrlCandidates,
 } from "../App";
-import { connectPairingClient } from "../protocol/pairing-client";
 import { decodeSupervisorTerminalClientFrame } from "../protocol/supervisor-terminal";
 import type {
   AttachFramePayload,
-  ProtocolPacket,
   SessionFileDownloadStreamReadyPayload,
   SessionFileHttpUploadStreamPayload,
   SessionFileHttpUploadReadyPayload,
@@ -26,8 +24,10 @@ import type {
   SessionGitResultPayload,
   UUID,
 } from "../protocol/types";
+import type { ProtocolPacket } from "../test/legacy-protocol-stubs";
 import { concatBytes, encodeUtf8, sessionDataFromBase64 } from "../protocol/wire";
-import { DirectClient, ProtocolClientError } from "../protocol/direct-client";
+import { ProtocolClientError } from "../protocol/errors";
+import { V070Client } from "../protocol/v070-client";
 import { displayUrlWithoutQueryOrFragment } from "../protocol/url";
 import { clearBrowserState, loadBrowserState } from "../state/browser-state";
 import { MockDaemon } from "../test/mock-daemon";
@@ -1157,8 +1157,8 @@ describe("termui web 工作台", () => {
 
     await pairWithInvite(user, daemon);
     await waitForWorkspaceSession();
-    await screen.findByText(/termd-e2e-ready/);
     await waitFor(() => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID]));
+    await screen.findByText(/termd-e2e-ready/);
     const attachOpenLog = daemon.receivedPacketLog.find(
       (entry) => entry.packet.kind === "stream_open" && entry.packet.method === "terminal.attach",
     );
@@ -3310,30 +3310,6 @@ describe("termui web 工作台", () => {
     }
   }, 20_000);
 
-  it("配对候选 URL 会跳过 server_id 不匹配的 daemon", async () => {
-    const secondDaemon = await MockDaemon.start({
-      token: "second-token",
-      sessions: [],
-    });
-
-    try {
-      const { client, effectiveUrl } = await connectPairingClient(
-        [daemon.url, secondDaemon.url],
-        secondDaemon.serverId,
-        "00000000-0000-0000-0000-000000000999",
-        secondDaemon.daemonPublicKey,
-        "second-token",
-        APP_CONNECTION_TIMEOUT_MS,
-      );
-
-      expect(effectiveUrl).toBe(secondDaemon.url);
-      expect(client.serverId).toBe(secondDaemon.serverId);
-      client.close();
-    } finally {
-      await secondDaemon.stop();
-    }
-  });
-
   it("点击 session 卡片直接进入 shared-control operator", async () => {
     const user = userEvent.setup();
     render(<App />);
@@ -3654,10 +3630,10 @@ describe("termui web 工作台", () => {
     { label: "首块", failedCall: 1 },
     { label: "中间块", failedCall: 2 },
   ])("终端输入在$label发送失败后保留未发送尾部并在重连后续传", async ({ failedCall }) => {
-    const originalSendSessionData = DirectClient.prototype.sendSessionData;
+    const originalSendSessionData = V070Client.prototype.sendSessionData;
     let sendCalls = 0;
-    const sendSpy = vi.spyOn(DirectClient.prototype, "sendSessionData").mockImplementation(async function (
-      this: DirectClient,
+    const sendSpy = vi.spyOn(V070Client.prototype, "sendSessionData").mockImplementation(async function (
+      this: V070Client,
       sessionId,
       bytes,
     ) {
@@ -3723,10 +3699,10 @@ describe("termui web 工作台", () => {
   });
 
   it("session 切换会丢弃旧 session 的离线输入且不会串写到新 session", async () => {
-    const originalSendSessionData = DirectClient.prototype.sendSessionData;
+    const originalSendSessionData = V070Client.prototype.sendSessionData;
     let failAlphaInput = true;
-    const sendSpy = vi.spyOn(DirectClient.prototype, "sendSessionData").mockImplementation(async function (
-      this: DirectClient,
+    const sendSpy = vi.spyOn(V070Client.prototype, "sendSessionData").mockImplementation(async function (
+      this: V070Client,
       sessionId,
       bytes,
     ) {
@@ -4199,7 +4175,7 @@ describe("termui web 工作台", () => {
       sessions: [],
       attachOutput: "slow-create-ready\n",
     });
-    const createSpy = vi.spyOn(DirectClient.prototype, "createSession");
+    const createSpy = vi.spyOn(V070Client.prototype, "createSession");
     render(<App />);
 
     try {
@@ -4208,12 +4184,7 @@ describe("termui web 工作台", () => {
       await user.click(screen.getByRole("button", { name: "New session" }));
 
       await waitFor(() => expect(createSpy).toHaveBeenCalled());
-      // 中文注释：新建 shell 会建立 terminal stream，不能套用普通 5s RPC 预算。
-      // App 必须显式传入终端级超时；DirectClient 自身仍保留默认短超时供普通请求使用。
-      expect(createSpy.mock.calls.at(-1)?.[2]).toMatchObject({
-        timeoutMs: expect.any(Number),
-      });
-      expect(createSpy.mock.calls.at(-1)?.[2]?.timeoutMs).toBeGreaterThan(APP_CONNECTION_TIMEOUT_MS);
+      expect(createSpy.mock.calls.at(-1)).toHaveLength(2);
       await waitFor(() => expect(visibleSessionNames()).toHaveLength(1));
       await waitFor(() => expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull());
       await screen.findByText(/slow-create-ready/);
@@ -7187,6 +7158,50 @@ describe("termui web 工作台", () => {
     expect(daemon.closedSessions).toEqual(["00000000-0000-0000-0000-000000000401"]);
   });
 
+  it("关闭当前 session 会立即移除界面且只发一次 close、不重新 attach", async () => {
+    const user = userEvent.setup();
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [{
+        session_id: DEFAULT_SESSION_ID,
+        name: DEFAULT_SESSION_NAME,
+        state: "running",
+        size: { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 },
+      }],
+      attachOutput: "termd-e2e-ready\n",
+      sessionCloseDelayMs: 150,
+    });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await waitFor(() => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID]));
+    expect(daemon.v070TerminalBinaryFramesSent).toBe(1);
+    expect(daemon.v070MetadataConnections).toBe(1);
+    expect(daemon.v070TerminalConnections).toBe(1);
+    await screen.findByText(/termd-e2e-ready/);
+    const httpRequestIndex = daemon.receivedHttpRequests.length;
+    const attachCount = daemon.attachRequests.length;
+
+    await user.click(screen.getByRole("button", { name: "Close session" }));
+
+    expect(screen.queryByText(DEFAULT_SESSION_NAME)).toBeNull();
+    expect(daemon.attachRequests).toHaveLength(attachCount);
+    await waitFor(() => expect(daemon.closedSessions).toEqual([DEFAULT_SESSION_ID]));
+    expect(
+      daemon.receivedHttpRequests
+        .slice(httpRequestIndex)
+        .filter((request) => request.path === `/api/control/session/${DEFAULT_SESSION_ID}/close`),
+    ).toHaveLength(1);
+    expect(
+      daemon.receivedHttpRequests
+        .slice(httpRequestIndex)
+        .filter((request) => /\/(?:attach|list|clients)(?:\/|$)/u.test(request.path)),
+    ).toHaveLength(0);
+    expect(daemon.attachRequests).toHaveLength(attachCount);
+  });
+
   it("旧 session.list 响应不会把刚关闭的 session 合并回列表", async () => {
     const user = userEvent.setup();
     render(<App />);
@@ -8435,7 +8450,7 @@ describe("termui web 工作台", () => {
       "wss://relay.example/termd/ws",
     ]);
     expect(pairingWsUrlCandidates("wss://relay.example/termd/ws?relay_token=abc", serverId, relayPage)).toEqual([
-      "wss://relay.example/termd/ws?relay_token=abc",
+      "wss://relay.example/termd/ws",
     ]);
     expect(pairingWsUrlCandidates("wss://relay.example/termd/ws/00000000-0000-0000-0000-000000000123/client", serverId, relayPage)).toEqual([
       "wss://relay.example/termd/ws",
@@ -8458,8 +8473,8 @@ describe("termui web 工作台", () => {
         relayPage,
       ),
     ).toEqual([
-      "wss://termd.yiln.de/ws?relay_token=abc",
-      "wss://old-relay.example/ws?relay_token=abc",
+      "wss://termd.yiln.de/ws",
+      "wss://old-relay.example/ws",
     ]);
   });
 
@@ -8479,8 +8494,8 @@ describe("termui web 工作台", () => {
         relayPage,
       ),
     ).toEqual([
-      "wss://termd.yiln.de/relay/ws?relay_token=abc",
-      "wss://termd.yiln.de:9443/ws?relay_token=abc",
+      "wss://termd.yiln.de/relay/ws",
+      "wss://termd.yiln.de:9443/ws",
     ]);
   });
 
@@ -8532,8 +8547,8 @@ describe("termui web 工作台", () => {
         pathname: "/termd/",
       },
     )).toEqual([
-      "ws://192.168.55.155:8765/termd/ws?relay_token=abc",
-      "wss://relay.example/ws?relay_token=abc",
+      "ws://192.168.55.155:8765/termd/ws",
+      "wss://relay.example/ws",
     ]);
   });
 

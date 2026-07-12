@@ -12,7 +12,7 @@ export function stripSensitiveUrlParts(rawUrl: string): string {
   const cleanUrl = rawUrl.trim();
   try {
     const parsed = new URL(cleanUrl);
-    // 中文注释：relay_token 等 admission secret 允许作为临时连接材料，但不能进入 IndexedDB。
+    // 历史 URL 可能带有旧 transport 凭据；只保留可公开持久化的地址部分。
     for (const key of [...parsed.searchParams.keys()]) {
       if (isSensitiveQueryParam(key)) {
         parsed.searchParams.delete(key);

@@ -1,6 +1,7 @@
 import { renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { DirectClient } from "../protocol/direct-client";
+import { V070Client } from "../protocol/v070-client";
+import { generateDeviceIdentity } from "../protocol/auth";
 import { useWorkspaceConnection } from "../hooks/useWorkspaceConnection";
 import type { DeviceState, PairedServerState, UUID } from "../protocol/types";
 
@@ -30,6 +31,7 @@ function makeServer(): PairedServerState {
     daemon_public_key: "daemon-public-key",
     url: "ws://127.0.0.1:8765/ws",
     paired_at_ms: Date.now(),
+    device_certificate: "device.certificate.signature",
   };
 }
 
@@ -42,28 +44,28 @@ function makeDevice(): DeviceState {
   };
 }
 
-function makeClient(overrides: Partial<Record<string, unknown>> = {}): DirectClient {
+function makeClient(overrides: Partial<Record<string, unknown>> = {}): V070Client {
   const client = {
     isClosed: false,
     authenticate: vi.fn(async () => undefined),
-    attachSessionPermission: vi.fn(async (_sessionId: UUID) => undefined),
+    detachSession: vi.fn(),
     close: vi.fn(() => {
       client.isClosed = true;
     }),
     interruptReceiveWaiters: vi.fn(),
     ...overrides,
   };
-  return client as unknown as DirectClient;
+  return client as unknown as V070Client;
 }
 
-function renderWorkspaceConnection() {
+function renderWorkspaceConnection(server = makeServer()) {
   const attachedSessionRef = { current: undefined as UUID | undefined };
   const pendingTerminalAttachSessionRef = { current: undefined as UUID | undefined };
   const receiveLoopActiveRef = { current: false };
   const receiveLoopGenerationRef = { current: 0 };
   const result = renderHook(() =>
     useWorkspaceConnection({
-      activeServer: makeServer(),
+      activeServer: server,
       device: makeDevice(),
       attachedSessionRef,
       pendingTerminalAttachSessionRef,
@@ -96,9 +98,148 @@ afterEach(() => {
 });
 
 describe("useWorkspaceConnection", () => {
+  it("v0.7 attach 保留 metadata client，detach 只关闭 terminal transport", async () => {
+    const transport = {
+      onMetadata: undefined as ((data: unknown) => void) | undefined,
+      onTerminal: undefined as ((data: unknown) => void) | undefined,
+      connectMetadata: vi.fn(async () => undefined),
+      reconnectMetadata: vi.fn(async () => undefined),
+      openTerminal: vi.fn(async () => undefined),
+      closeTerminal: vi.fn(),
+      close: vi.fn(),
+      sendTerminal: vi.fn(),
+    };
+    const server = { ...makeServer(), device_certificate: "device.certificate.signature" };
+    const device = await generateDeviceIdentity(DEVICE_ID);
+    const client = new V070Client(server, device, transport);
+    transport.onTerminal?.(JSON.stringify({
+      type: "terminal.attached",
+      payload: { session_id: SESSION_ID },
+    }));
+    const { attachedSessionRef, result } = renderWorkspaceConnection(server);
+    result.current.workspaceClientRef.current = client as unknown as V070Client;
+
+    result.current.claimAttachClient(client as unknown as V070Client);
+
+    expect(result.current.workspaceClientRef.current).toBe(client);
+    expect(result.current.attachClientRef.current).toBe(client);
+    attachedSessionRef.current = SESSION_ID;
+    result.current.closeAttachClient();
+    expect(transport.closeTerminal).toHaveBeenCalledTimes(1);
+    expect(transport.close).not.toHaveBeenCalled();
+    expect(result.current.workspaceClientRef.current).toBe(client);
+  });
+
+  it("device certificate 存在时使用 v0.7 workspace transport", async () => {
+    const server = { ...makeServer(), device_certificate: "device.certificate.signature" };
+    const client = makeClient();
+    const v070Connect = vi.spyOn(V070Client, "connect").mockResolvedValue(client as unknown as V070Client);
+    const { result } = renderWorkspaceConnection(server);
+
+    await expect(result.current.authenticatedWorkspaceClient()).resolves.toBe(client);
+
+    expect(v070Connect).toHaveBeenCalledWith(server, expect.objectContaining({ device_id: DEVICE_ID }));
+  });
+
+  it("旧 BrowserState 先迁移并持久化 device certificate 再创建 v0.7 client", async () => {
+    const server = { ...makeServer(), device_certificate: undefined };
+    const device = await generateDeviceIdentity(DEVICE_ID);
+    const client = makeClient();
+    const migrated = vi.fn(async () => undefined);
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ challenge: "migration-challenge" }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ device_certificate: "migrated.certificate" }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const connect = vi.spyOn(V070Client, "connect").mockResolvedValue(client);
+    const attachedSessionRef = { current: undefined as UUID | undefined };
+    const pendingTerminalAttachSessionRef = { current: undefined as UUID | undefined };
+    const { result } = renderHook(() => useWorkspaceConnection({
+      activeServer: server,
+      device,
+      attachedSessionRef,
+      pendingTerminalAttachSessionRef,
+      receiveLoopActiveRef: { current: false },
+      receiveLoopGenerationRef: { current: 0 },
+      isTerminalTransportPaused: () => false,
+      isRetryableConnectionError: () => true,
+      resolveServerRouteUrls: (candidate) => [candidate.url],
+      onBrokenAttachedClient: () => false,
+      onDeviceCertificateMigrated: migrated,
+      requestTimeoutMs: 5000,
+      defaultWorkspaceTimeoutMs: 15000,
+      socketConnectTimeoutMs: 3000,
+      socketOpenTimeoutMs: 1200,
+      socketOpenHedgeDelayMs: 300,
+      socketConnectAttempts: 4,
+      socketConnectRetryDelayMs: 80,
+    }));
+
+    await expect(result.current.authenticatedWorkspaceClient()).resolves.toBe(client);
+
+    expect(migrated).toHaveBeenCalledWith(SERVER_ID, "migrated.certificate");
+    expect(connect).toHaveBeenCalledWith(
+      expect.objectContaining({ device_certificate: "migrated.certificate" }),
+      expect.objectContaining({ device_id: DEVICE_ID }),
+    );
+  });
+
+  it("v0.7 文件操作复用唯一 workspace client 和 metadata socket", async () => {
+    const server = { ...makeServer(), device_certificate: "device.certificate.signature" };
+    let metadataSocketCount = 0;
+    let terminalSocketCount = 0;
+    const clients: V070Client[] = [];
+    vi.spyOn(V070Client, "connect").mockImplementation(async (_server, device) => {
+      let metadataOpen = false;
+      const transport = {
+        onMetadata: undefined as ((data: unknown) => void) | undefined,
+        onTerminal: undefined as ((data: unknown) => void) | undefined,
+        connectMetadata: vi.fn(async () => {
+          if (!metadataOpen) {
+            metadataOpen = true;
+            metadataSocketCount += 1;
+            queueMicrotask(() => transport.onMetadata?.(JSON.stringify({
+              type: "metadata.snapshot",
+              payload: {
+                revision: 1,
+                state: { sessions: [{ session_id: SESSION_ID, state: "running" }] },
+              },
+            })));
+          }
+        }),
+        reconnectMetadata: vi.fn(async () => undefined),
+        openTerminal: vi.fn(async () => {
+          terminalSocketCount += 1;
+          queueMicrotask(() => transport.onTerminal?.(JSON.stringify({
+            type: "terminal.attached",
+            payload: { session_id: SESSION_ID },
+          })));
+        }),
+        closeTerminal: vi.fn(),
+        close: vi.fn(),
+        sendTerminal: vi.fn(),
+      };
+      const client = new V070Client(server, device, transport);
+      clients.push(client);
+      return client;
+    });
+    const { attachedSessionRef, result } = renderWorkspaceConnection(server);
+    const workspaceClient = await result.current.authenticatedWorkspaceClient();
+    await (workspaceClient as unknown as V070Client).subscribeMetadata();
+    await workspaceClient.attachSession(SESSION_ID);
+    result.current.claimAttachClient(workspaceClient);
+    attachedSessionRef.current = SESSION_ID;
+
+    const operation = await result.current.openSessionOperationClient(SESSION_ID);
+
+    expect(operation).toEqual({ client: workspaceClient, ownsClient: false });
+    expect(clients).toHaveLength(1);
+    expect(metadataSocketCount).toBe(1);
+    expect(terminalSocketCount).toBe(1);
+  });
+
   it("并发获取 workspace client 只建立一条连接", async () => {
     const client = makeClient();
-    const connectSpy = vi.spyOn(DirectClient, "connect").mockResolvedValue(client);
+    const connectSpy = vi.spyOn(V070Client, "connect").mockResolvedValue(client);
     const { result } = renderWorkspaceConnection();
 
     const first = result.current.authenticatedWorkspaceClient();
@@ -114,7 +255,7 @@ describe("useWorkspaceConnection", () => {
     const client = makeClient({
       authenticate: vi.fn(() => authGate.promise),
     });
-    vi.spyOn(DirectClient, "connect").mockResolvedValue(client);
+    vi.spyOn(V070Client, "connect").mockResolvedValue(client);
     const { result } = renderWorkspaceConnection();
 
     const pending = result.current.authenticatedWorkspaceClient();
@@ -139,41 +280,38 @@ describe("useWorkspaceConnection", () => {
 
     result.current.attachClientRef.current = activeClient;
     result.current.pendingAttachClientRef.current = pendingClient;
-    result.current.sessionPermissionIdsRef.current.add(SESSION_ID);
     pendingTerminalAttachSessionRef.current = SESSION_ID;
     receiveLoopActiveRef.current = true;
     receiveLoopGenerationRef.current = 7;
 
     result.current.closeWorkspaceClient();
 
-    expect(activeClient.interruptReceiveWaiters).toHaveBeenCalledTimes(1);
+    expect(activeClient.interruptReceiveWaiters).not.toHaveBeenCalled();
     expect(activeClient.close).toHaveBeenCalledTimes(1);
-    expect(pendingClient.interruptReceiveWaiters).toHaveBeenCalledTimes(1);
+    expect(pendingClient.interruptReceiveWaiters).not.toHaveBeenCalled();
     expect(pendingClient.close).toHaveBeenCalledTimes(1);
     expect(result.current.attachClientRef.current).toBeUndefined();
     expect(result.current.pendingAttachClientRef.current).toBeUndefined();
-    expect(result.current.sessionPermissionIdsRef.current.size).toBe(0);
     expect(pendingTerminalAttachSessionRef.current).toBeUndefined();
     expect(receiveLoopActiveRef.current).toBe(false);
     expect(receiveLoopGenerationRef.current).toBe(8);
   });
 
-  it("同一 session 的权限 attach 只补一次", async () => {
+  it("会话控制直接复用 Access Token client，不发送 permission attach", async () => {
     const client = makeClient();
-    vi.spyOn(DirectClient, "connect").mockResolvedValue(client);
+    vi.spyOn(V070Client, "connect").mockResolvedValue(client);
     const { result } = renderWorkspaceConnection();
 
     await expect(result.current.authenticatedSessionClient(SESSION_ID)).resolves.toBe(client);
     await expect(result.current.authenticatedSessionClient(SESSION_ID)).resolves.toBe(client);
 
-    expect(client.attachSessionPermission).toHaveBeenCalledTimes(1);
-    expect(client.attachSessionPermission).toHaveBeenCalledWith(SESSION_ID);
+    expect(client).not.toHaveProperty("attachSessionPermission");
   });
 
   it("已 attach 后 workspace metadata 会回到当前 terminal client 并关闭旧 metadata 连接", async () => {
     const metadataClient = makeClient();
     const attachClient = makeClient();
-    const connectSpy = vi.spyOn(DirectClient, "connect").mockResolvedValue(metadataClient);
+    const connectSpy = vi.spyOn(V070Client, "connect").mockResolvedValue(metadataClient);
     const { attachedSessionRef, result } = renderWorkspaceConnection();
 
     await expect(result.current.authenticatedWorkspaceClient()).resolves.toBe(metadataClient);
@@ -185,13 +323,13 @@ describe("useWorkspaceConnection", () => {
 
     expect(metadataClient.interruptReceiveWaiters).toHaveBeenCalledTimes(1);
     expect(metadataClient.close).toHaveBeenCalledTimes(1);
-    expect(result.current.workspaceClientRef.current).toBeUndefined();
+    expect(result.current.workspaceClientRef.current).toBe(attachClient);
     expect(connectSpy).toHaveBeenCalledTimes(1);
   });
 
   it("将同一条 workspace client 提升为 terminal attach 时不关闭 transport", async () => {
     const workspaceClient = makeClient();
-    vi.spyOn(DirectClient, "connect").mockResolvedValue(workspaceClient);
+    vi.spyOn(V070Client, "connect").mockResolvedValue(workspaceClient);
     const { result } = renderWorkspaceConnection();
 
     await expect(result.current.authenticatedWorkspaceClient()).resolves.toBe(workspaceClient);
@@ -199,43 +337,38 @@ describe("useWorkspaceConnection", () => {
 
     expect(workspaceClient.interruptReceiveWaiters).not.toHaveBeenCalled();
     expect(workspaceClient.close).not.toHaveBeenCalled();
-    expect(result.current.workspaceClientRef.current).toBeUndefined();
+    expect(result.current.workspaceClientRef.current).toBe(workspaceClient);
     expect(result.current.attachClientRef.current).toBe(workspaceClient);
   });
 
   it("metadata 建连未完成时若 terminal 先 attach，迟到 metadata client 会被作废", async () => {
-    const authGate = deferred<void>();
-    const metadataClient = makeClient({
-      authenticate: vi.fn(() => authGate.promise),
-    });
+    const connectGate = deferred<V070Client>();
+    const metadataClient = makeClient();
     const attachClient = makeClient();
-    vi.spyOn(DirectClient, "connect").mockResolvedValue(metadataClient);
+    vi.spyOn(V070Client, "connect").mockReturnValue(connectGate.promise);
     const { attachedSessionRef, result } = renderWorkspaceConnection();
 
     const pendingMetadata = result.current.authenticatedWorkspaceClient();
     result.current.claimAttachClient(attachClient);
     attachedSessionRef.current = SESSION_ID;
-    authGate.resolve();
+    connectGate.resolve(metadataClient);
 
-    await expect(pendingMetadata).rejects.toMatchObject({
-      code: "connection_closed",
-    });
+    await expect(pendingMetadata).rejects.toMatchObject({ code: "stale_connection" });
     expect(metadataClient.close).toHaveBeenCalledTimes(1);
-    expect(result.current.workspaceClientRef.current).toBeUndefined();
+    expect(result.current.workspaceClientRef.current).toBe(attachClient);
     expect(result.current.workspaceClientPromiseRef.current).toBeUndefined();
     await expect(result.current.authenticatedWorkspaceClient()).resolves.toBe(attachClient);
   });
 
-  it("独立 operation client 权限补齐失败时会关闭短连接", async () => {
-    const client = makeClient({
-      attachSessionPermission: vi.fn(async () => {
-        throw new Error("permission failed");
-      }),
-    });
-    vi.spyOn(DirectClient, "connect").mockResolvedValue(client);
+  it("operation client 复用唯一 workspace client", async () => {
+    const client = makeClient();
+    vi.spyOn(V070Client, "connect").mockResolvedValue(client);
     const { result } = renderWorkspaceConnection();
 
-    await expect(result.current.openSessionOperationClient(SESSION_ID)).rejects.toThrow("permission failed");
-    expect(client.close).toHaveBeenCalledTimes(1);
+    await expect(result.current.openSessionOperationClient(SESSION_ID)).resolves.toEqual({
+      client,
+      ownsClient: false,
+    });
+    expect(client.close).not.toHaveBeenCalled();
   });
 });

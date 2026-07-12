@@ -127,8 +127,6 @@ where
         let internal_session_id = wire_session_id.0.to_string();
         self.session_index
             .insert(wire_session_id, internal_session_id);
-        #[cfg(test)]
-        self.session_output_history_mut(wire_session_id, session.size);
         self.session_cwd_signals
             .insert(wire_session_id, tokio::sync::watch::channel(0).0);
         self.session_resize_signals

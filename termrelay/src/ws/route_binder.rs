@@ -50,6 +50,15 @@ pub(super) async fn bind_socket_route(
 
     let server_id = prelude.server_id;
     let role = prelude.connection_role;
+    if role == ConnectionRole::Client {
+        let _ = send_route_error(
+            socket,
+            "relay_role_not_supported",
+            "legacy client routes are not supported; use /ws/metadata or /ws/terminal",
+        )
+        .await;
+        return None;
+    }
     if let Err(error) = state.authorize_route_admission(&prelude) {
         warn!(server_id = %server_id.0, ?role, %error, "rejecting relay websocket admission");
         let _ = send_route_error(

@@ -6,31 +6,32 @@ import { ed25519 } from "@noble/curves/ed25519";
 import { WebSocketServer, type RawData, type WebSocket } from "ws";
 import {
   authSigningInputBytes,
-  daemonE2eeSigningInputBytes,
   decodeEd25519PublicKey,
-  httpE2eeSigningInputBytes,
-  e2eeAuthTranscriptDigestWire,
   encodeEd25519Wire,
   verifyEd25519Signature,
 } from "../protocol/auth";
 import {
-  E2eeSession,
-  decodeBinaryEncryptedFrame,
-  encodeBinaryEncryptedFrame,
-  generateE2eeKeyPair,
-  type E2eeKeyPair,
-} from "../protocol/e2ee";
-import {
   type BinaryProtocolPacket,
   decodeBinaryProtocolPacket,
   encodeBinaryProtocolPacket,
-} from "../protocol/binary-packet";
-import {
   legacyEnvelopeTypeForProtocolMethod,
   protocolEventMethodForLegacyEnvelopeType,
   protocolMethodNeedsEmptyAck,
-} from "../protocol/methods";
-import { binaryPacketToProtocol, protocolPacketToBinary } from "../protocol/packet-codec";
+  binaryPacketToProtocol,
+  protocolPacketToBinary,
+  httpE2eeSigningInputBytes,
+  BINARY_PROTOCOL_VERSION,
+  PROTOCOL_PACKET_VERSION,
+  type HttpE2eeAuthPayload,
+  type E2eeKeyExchangePayload,
+  type EncryptedFramePayload,
+  type MetadataSubscribePayload,
+  type PacketErrorPayload,
+  type PacketStreamId,
+  type ProtocolPacket,
+  type SessionCursorPayload,
+  type SessionScopeGrantPayload,
+} from "./legacy-protocol-stubs";
 import {
   buildAttachFramePayload,
   decodeSupervisorTerminalClientFrame,
@@ -39,29 +40,19 @@ import {
   type SupervisorTerminalServerFrame,
 } from "../protocol/supervisor-terminal";
 import { fallbackSessionDisplayName } from "../session-names";
-import { BINARY_PROTOCOL_VERSION, PROTOCOL_PACKET_VERSION } from "../protocol/types";
 import type {
   AttachFramePayload,
   DaemonClientSummaryPayload,
   DaemonStatusResultPayload,
   HelloPayload,
-  HttpE2eeAuthPayload,
-  E2eeKeyExchangePayload,
-  EncryptedFramePayload,
   Envelope,
   ErrorPayload,
-  MetadataSubscribePayload,
-  PacketErrorPayload,
-  PacketStreamId,
   PairRequestPayload,
-  ProtocolPacket,
   RouteHelloPayload,
   SessionCreatePayload,
   SessionCreatedPayload,
-  SessionCursorPayload,
   SessionFileReadResultPayload,
   SessionFileTransferChunkPayload,
-  SessionScopeGrantPayload,
   SessionFileUploadProgressPayload,
   SessionFileUploadReadyPayload,
   SessionFileWrittenPayload,
@@ -126,6 +117,7 @@ interface MockDaemonOptions {
   fileUploadProgressOverrides?: Record<string, Partial<SessionFileUploadProgressPayload>>;
   fileUploadProgressDelayMs?: number;
   relayClientPathOnly?: boolean;
+  sessionCloseDelayMs?: number;
   closeSessionUnownedError?: ErrorPayload;
   pingDelayMs?: number;
   sessionTokenExpiresAtMs?: number;
@@ -191,7 +183,6 @@ interface MockConnection {
   routed: boolean;
   httpPackets?: ProtocolPacket[];
   deviceId?: UUID;
-  e2ee?: E2eeSession;
   attachedSessionIds: Set<UUID>;
   watchedSessionIds: Set<UUID>;
   pendingCanceledTerminalStreamIds: Set<PacketStreamId>;
@@ -200,7 +191,6 @@ interface MockConnection {
   fileUploadsById: Map<PacketStreamId, MockFileUploadStream>;
   fileDownloadsById: Map<PacketStreamId, MockFileDownloadStream>;
   daemonE2eeExchange?: E2eeKeyExchangePayload;
-  e2eeAuthTranscriptSha256?: string;
   activeRequest?: ProtocolPacket;
   activeStreamId?: PacketStreamId;
   respondedToActiveRequest?: boolean;
@@ -256,6 +246,9 @@ export class MockDaemon {
   public daemonStatusRequests = 0;
   public pingMessages = 0;
   public acceptedConnections = 0;
+  public v070MetadataConnections = 0;
+  public v070TerminalConnections = 0;
+  public v070TerminalBinaryFramesSent = 0;
   private nextConnectionId = 1;
   public failedTerminalAttachRequests = 0;
   public readonly decryptedInputs: string[] = [];
@@ -271,9 +264,9 @@ export class MockDaemon {
   private nextRouteReadyGate: Promise<void> | undefined;
   private readonly queuedSessionListResponses: QueuedSessionListResponse[] = [];
   private readonly queuedSessionFilesResponses: QueuedSessionFilesResponse[] = [];
-  private readonly e2eeKeypair: E2eeKeyPair;
   private readonly trustedDevices = new Map<UUID, TrustedDevice>();
   private readonly sessionTokens = new Map<string, SessionTokenRecord>();
+  private readonly accessTokens = new Map<string, UUID>();
   private readonly sessionScopes = new Map<string, SessionScopeRecord>();
   private readonly connections = new Set<MockConnection>();
   private readonly serverSockets = new Set<Socket>();
@@ -289,7 +282,6 @@ export class MockDaemon {
     private readonly options: MockDaemonOptions,
   ) {
     this.serverId = randomUuid();
-    this.e2eeKeypair = generateE2eeKeyPair();
   }
 
   static async start(options: MockDaemonOptions): Promise<MockDaemon> {
@@ -304,12 +296,18 @@ export class MockDaemon {
     const wsServer = new WebSocketServer({ noServer: true });
     httpServer.on("upgrade", (request, socket, head) => {
       const requestUrl = new URL(request.url ?? "/", "http://127.0.0.1");
-      if (!/\/ws$/u.test(requestUrl.pathname)) {
+      if (!["/ws", "/ws/metadata", "/ws/terminal"].includes(requestUrl.pathname)) {
         socket.destroy();
         return;
       }
       wsServer.handleUpgrade(request, socket, head, (websocket) => {
-        daemon.accept(websocket, request.url ?? "");
+        if (requestUrl.pathname === "/ws/metadata") {
+          daemon.acceptV070Metadata(websocket);
+        } else if (requestUrl.pathname === "/ws/terminal") {
+          daemon.acceptV070Terminal(websocket);
+        } else {
+          daemon.accept(websocket, request.url ?? "");
+        }
       });
     });
     await new Promise<void>((resolve) => httpServer.listen(0, "127.0.0.1", resolve));
@@ -556,10 +554,10 @@ export class MockDaemon {
     const url = new URL(request.url ?? "/", this.httpBaseUrl());
     const setCorsHeaders = () => {
       response.setHeader("access-control-allow-origin", "*");
-      response.setHeader("access-control-allow-methods", "POST, OPTIONS");
+      response.setHeader("access-control-allow-methods", "GET, POST, PUT, OPTIONS");
       response.setHeader(
         "access-control-allow-headers",
-        "authorization, content-type, x-termd-server-id, x-termd-device-id, x-termd-relay-admission, x-termd-e2ee-public-key, x-termd-e2ee-nonce, x-termd-e2ee-timestamp-ms, x-termd-e2ee-signature, x-termd-session-scope",
+        "authorization, content-type, content-range, x-termd-server-id, x-termd-relay-admission",
       );
       response.setHeader("access-control-max-age", "600");
     };
@@ -568,11 +566,6 @@ export class MockDaemon {
       // 中文注释：浏览器 direct 模式访问不同端口的 daemon 时，HTTP control 会先走
       // CORS preflight；测试桩必须显式放行，才能覆盖真实跨源直连路径。
       response.statusCode = 204;
-      response.end();
-      return;
-    }
-    if (!/^\/api\/control\//u.test(url.pathname)) {
-      response.statusCode = 404;
       response.end();
       return;
     }
@@ -588,10 +581,87 @@ export class MockDaemon {
       chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
     }
     try {
+      const rawBody = chunks.length > 0 ? Buffer.concat(chunks) : Buffer.from("{}");
+      if (request.method === "POST" && url.pathname === "/api/auth/pair") {
+        const authorization = request.headers.authorization;
+        const payload = JSON.parse(rawBody.toString("utf8")) as { device_id: UUID; device_public_key: string };
+        if (authorization !== `TermdPair ${this.options.token}`) {
+          this.writeJson(response, 401, { error: { code: "pairing_failed", message: "pairing failed", retryable: false } });
+          return;
+        }
+        this.trustedDevices.set(payload.device_id, {
+          deviceId: payload.device_id,
+          devicePublicKey: payload.device_public_key,
+        });
+        this.writeJson(response, 200, {
+          server_id: this.serverId,
+          device_id: payload.device_id,
+          device_certificate: `mock-device-certificate.${payload.device_id}`,
+        });
+        return;
+      }
+      if (request.method === "POST" && url.pathname === "/api/auth/challenge") {
+        const payload = JSON.parse(rawBody.toString("utf8")) as { device_id: UUID };
+        if (!this.trustedDevices.has(payload.device_id)) {
+          this.writeJson(response, 401, { error: { code: "device_certificate_invalid", message: "device certificate is invalid", retryable: false } });
+          return;
+        }
+        this.writeJson(response, 200, {
+          device_id: payload.device_id,
+          challenge: `challenge-${payload.device_id}`,
+          expires_at_ms: nowMs() + 60_000,
+        });
+        return;
+      }
+      if (request.method === "POST" && url.pathname === "/api/auth/access-token") {
+        const payload = JSON.parse(rawBody.toString("utf8")) as { device_id: UUID };
+        if (!this.trustedDevices.has(payload.device_id)) {
+          this.writeJson(response, 401, { error: { code: "access_token_failed", message: "access token failed", retryable: false } });
+          return;
+        }
+        const token = `mock.${Buffer.from(payload.device_id).toString("base64url")}.signature`;
+        this.accessTokens.set(token, payload.device_id);
+        const expiresAtMs = nowMs() + 5 * 60_000;
+        this.writeJson(response, 200, {
+          access_token: token,
+          expires_at_ms: expiresAtMs,
+          refresh_at_ms: expiresAtMs - 60_000,
+        });
+        return;
+      }
+      if (!/^\/api\/control\//u.test(url.pathname)) {
+        this.writeJson(response, 404, { error: { code: "not_found", message: "application route was not found", retryable: false } });
+        return;
+      }
+      const authorization = request.headers.authorization;
+      const accessToken = authorization?.startsWith("Bearer ")
+        ? authorization.slice("Bearer ".length)
+        : undefined;
+      const accessDeviceId = accessToken ? this.accessTokens.get(accessToken) : undefined;
+      if (accessDeviceId) {
+        const payload = JSON.parse(rawBody.toString("utf8")) as Record<string, unknown>;
+        const method = this.httpControlMethod(url.pathname);
+        const connection = this.httpConnection(accessDeviceId);
+        if (method.kind === "session" && method.sessionId) {
+          connection.attachedSessionIds.add(method.sessionId);
+          payload.session_id = method.sessionId;
+        }
+        this.receivedHttpRequests.push({ path: url.pathname, method: request.method ?? "POST", payload });
+        const result = await this.dispatchHttpControl(connection, url.pathname, payload);
+        const packet = result.frames[0] as ProtocolPacket | undefined;
+        if (packet?.kind === "response") {
+          this.writeJson(response, 200, packet.payload);
+        } else {
+          this.writeJson(response, result.status >= 400 ? result.status : 400, {
+            error: packet?.payload ?? { code: "invalid_state", message: "invalid protocol state", retryable: false },
+          });
+        }
+        return;
+      }
       const result = await this.handleHttpControlRequest(url.toString(), {
         method: request.method,
         headers: request.headers as HeadersInit,
-        body: chunks.length > 0 ? Buffer.concat(chunks) : undefined,
+        body: rawBody,
         signal: abortController.signal,
       });
       response.statusCode = result.status;
@@ -606,6 +676,12 @@ export class MockDaemon {
       response.statusCode = 500;
       response.end(String(error instanceof Error ? error.message : error));
     }
+  }
+
+  private writeJson(response: ServerResponse, status: number, payload: unknown): void {
+    response.statusCode = status;
+    response.setHeader("content-type", "application/json");
+    response.end(JSON.stringify(payload));
   }
 
   setDropAuthChallenge(drop: boolean): void {
@@ -629,6 +705,125 @@ export class MockDaemon {
     return () => {
       releaseGate();
     };
+  }
+
+  private acceptV070Metadata(socket: WebSocket): void {
+    this.acceptedConnections += 1;
+    this.v070MetadataConnections += 1;
+    const sendSnapshot = () => {
+      if (socket.readyState !== socket.OPEN) return;
+      socket.send(JSON.stringify({
+        type: "metadata.snapshot",
+        payload: {
+          revision: 1,
+          state: {
+            sessions: this.options.sessions,
+            clients: this.options.daemonClients ?? [],
+            daemon: this.options.daemonStatus ?? mockDaemonStatus(),
+            cwd: {},
+            rtt_ms: 0,
+          },
+        },
+      }));
+    };
+    queueMicrotask(sendSnapshot);
+    socket.on("message", (raw, isBinary) => {
+      if (isBinary) return;
+      const message = JSON.parse(raw.toString()) as { type?: string };
+      if (message.type === "metadata.ping") {
+        socket.send(JSON.stringify({
+          type: "metadata.pong",
+          payload: { server_time_ms: nowMs() },
+        }));
+      }
+    });
+  }
+
+  private acceptV070Terminal(socket: WebSocket): void {
+    this.acceptedConnections += 1;
+    this.v070TerminalConnections += 1;
+    let sessionId: UUID | undefined;
+    socket.on("message", (raw, isBinary) => {
+      if (!isBinary) {
+        const command = JSON.parse(raw.toString()) as {
+          type?: "terminal.create" | "terminal.attach";
+          payload?: { session_id?: UUID; command?: string[]; size?: TerminalSize };
+        };
+        const size = command.payload?.size ?? { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 };
+        if (command.type === "terminal.create") {
+          sessionId = randomUuid();
+          const created: SessionCreatedPayload = {
+            session_id: sessionId,
+            state: "running",
+            size,
+            role: "operator",
+          };
+          this.options.sessions.unshift(created);
+          this.createdCommands.push(command.payload?.command ?? []);
+          socket.send(JSON.stringify({ type: "terminal.created", payload: created }));
+        } else if (command.type === "terminal.attach" && command.payload?.session_id) {
+          sessionId = command.payload.session_id;
+          const session = this.options.sessions.find((candidate) => candidate.session_id === sessionId);
+          if (!session) {
+            socket.send(JSON.stringify({
+              type: "error",
+              payload: { code: "session_not_found", message: "session was not found", retryable: false },
+            }));
+            return;
+          }
+          this.attachRequests.push({ session_id: sessionId, watch_updates: true });
+          this.attachedSessions.push(sessionId);
+          socket.send(JSON.stringify({
+            type: "terminal.attached",
+            payload: {
+              session_id: sessionId,
+              role: "operator",
+              state: session.state,
+              size: session.size,
+              resize_owner: true,
+            },
+          }));
+        } else {
+          return;
+        }
+        const attachedSessionId = sessionId;
+        const session = this.options.sessions.find((candidate) => candidate.session_id === attachedSessionId);
+        if (!attachedSessionId || !session) return;
+        queueMicrotask(() => {
+          if (socket.readyState !== socket.OPEN) return;
+          if (this.options.attachOutput && !this.sessionOutputSnapshots.has(attachedSessionId)) {
+            this.appendSessionOutput(attachedSessionId, this.options.attachOutput);
+          }
+          const snapshotBytes = encodeUtf8(this.sessionOutputSnapshots.get(attachedSessionId) ?? "");
+          socket.send(JSON.stringify({
+            type: "terminal.snapshot",
+            payload: { session_id: attachedSessionId, size: session.size, cursor: { row: 1, col: 1 } },
+          }));
+          socket.send(encodeSupervisorTerminalServerFrame({
+            type: "attach_sync",
+            session_id: attachedSessionId,
+            base_seq: 0,
+            snapshot: {
+              size: session.size,
+              process_id: 7,
+              retained_output_bytes: snapshotBytes,
+            },
+            frames: [],
+          }));
+          this.v070TerminalBinaryFramesSent += 1;
+        });
+        return;
+      }
+      if (!sessionId) return;
+      const frame = decodeSupervisorTerminalClientFrame(bytesFromWsMessage(raw));
+      if (frame.type === "input") {
+        const text = decodeUtf8(frame.data_bytes);
+        this.decryptedInputs.push(text);
+        this.sessionDataMessages.push(text);
+      } else if (frame.type === "resize") {
+        this.sessionResizes.push({ session_id: sessionId, size: frame.size });
+      }
+    });
   }
 
   private accept(socket: WebSocket, requestPath: string): void {
@@ -670,25 +865,6 @@ export class MockDaemon {
     });
   }
 
-  private signedDaemonE2eeExchange(): E2eeKeyExchangePayload {
-    const payload: E2eeKeyExchangePayload = {
-      server_id: this.serverId,
-      device_id: "00000000-0000-0000-0000-000000000000",
-      public_key: this.e2eeKeypair.publicKeyWire,
-      nonce: nonce(),
-      timestamp_ms: nowMs(),
-      packet_version: this.options.daemonPacketVersion ?? PROTOCOL_PACKET_VERSION,
-      binary_version: this.options.daemonBinaryVersion ?? BINARY_PROTOCOL_VERSION,
-    };
-    const signature = ed25519.sign(
-      daemonE2eeSigningInputBytes(payload, {
-        server_id: this.serverId,
-        daemon_public_key: this.daemonPublicKey,
-      }),
-      this.daemonSigningSecretKey,
-    );
-    return { ...payload, signature: encodeEd25519Wire(signature) };
-  }
 
   private async handleOuter(connection: MockConnection, raw: string): Promise<void> {
     this.outerWireLog.push(raw);
@@ -1075,6 +1251,9 @@ export class MockDaemon {
       }
       case "session.close": {
         const payload = packet.payload as { session_id: UUID };
+        if (this.options.sessionCloseDelayMs) {
+          await new Promise((resolve) => setTimeout(resolve, this.options.sessionCloseDelayMs));
+        }
         const sessionExists = this.options.sessions.some((session) => session.session_id === payload.session_id);
         if (!sessionExists) {
           this.sendPacketError(connection, packet, "session_not_found", "session was not found");
@@ -1181,6 +1360,30 @@ export class MockDaemon {
     const bearer = authorization?.startsWith("Bearer ") ? authorization.slice("Bearer ".length) : undefined;
     if (!bearer) {
       return this.jsonError(401, "auth_failed", "auth failed");
+    }
+    const accessDeviceId = this.accessTokens.get(bearer);
+    if (accessDeviceId) {
+      const body = await this.requestBodyBytes(requestInit?.body);
+      const payload = body.byteLength > 0
+        ? JSON.parse(decodeUtf8(body)) as Record<string, unknown>
+        : {};
+      const method = this.httpControlMethod(url.pathname);
+      const connection = this.httpConnection(accessDeviceId);
+      if (method.kind === "session" && method.sessionId) {
+        connection.attachedSessionIds.add(method.sessionId);
+        payload.session_id = method.sessionId;
+      }
+      this.receivedHttpRequests.push({ path: url.pathname, method: requestInit?.method ?? "POST", payload });
+      const result = await this.dispatchHttpControl(connection, url.pathname, payload);
+      const packet = result.frames[0] as ProtocolPacket | undefined;
+      if (packet?.kind === "response") {
+        return Response.json(packet.payload, { status: 200 });
+      }
+      return this.jsonError(
+        result.status >= 400 ? result.status : 400,
+        String((packet?.payload as { code?: unknown } | undefined)?.code ?? "invalid_state"),
+        String((packet?.payload as { message?: unknown } | undefined)?.message ?? "invalid protocol state"),
+      );
     }
     const tokenRecord = this.sessionTokens.get(bearer);
     if (!tokenRecord || tokenRecord.expiresAtMs < nowMs()) {
@@ -1706,6 +1909,9 @@ export class MockDaemon {
       }
       case "session_close": {
         const payload = inner.payload as { session_id: UUID };
+        if (this.options.sessionCloseDelayMs) {
+          await new Promise((resolve) => setTimeout(resolve, this.options.sessionCloseDelayMs));
+        }
         const sessionExists = this.options.sessions.some((session) => session.session_id === payload.session_id);
         if (!sessionExists) {
           this.sendError(connection, "session_not_found", "session was not found");
@@ -2293,7 +2499,7 @@ export class MockDaemon {
   private binaryEncodingOptionsForPacket(
     connection: MockConnection,
     packet: ProtocolPacket,
-  ): import("../protocol/packet-codec").ProtocolPacketBinaryEncodingOptions | undefined {
+  ): import("./legacy-protocol-stubs").ProtocolPacketBinaryEncodingOptions | undefined {
     if (packet.kind !== "stream_chunk" || !packet.stream_id) {
       return undefined;
     }

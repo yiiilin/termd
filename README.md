@@ -13,9 +13,10 @@ Termd 让一台机器上的 shell session 由 session supervisor 持久托管，
 - supervisor-owned 持久 session：每个 session 由独立 supervisor 托管真实 PTY、terminal journal、attach heartbeat 和超时关闭；daemon 只维护 session catalog、workspace/file/git API 和 attach proxy。
 - Web UI：内嵌终端、session 管理、文件面板、daemon 管理和 PWA；终端渲染使用 `xterm.js` 单一路径。
 - 多客户端 shared-control：已配对设备都是 operator，可同时 attach 同一个 session。
-- 设备级 pairing/auth：短期 pairing token、device key、challenge-response、timestamp/nonce replay protection。
+- 设备级 pairing/auth：短期 pair ticket 建立信任，持久 device certificate 绑定设备 key，后续 challenge-response 换取 5 分钟 access token。
+- 双 WebSocket workspace：每个工作台固定一条 metadata socket 和一条 terminal socket；session、client、状态和 CWD 由 metadata 推送，终端 snapshot/PTY stream 独占 terminal socket。
 - 明文业务协议：去掉运行时 E2EE 后，pairing/auth/session/file 仍由 `termd` 校验和持有，线上路径更短。
-- 可信 Relay：`termrelay` 用 setup token 注册 daemon，并用 daemon registry 做入口控制，一个 relay 可服务多个已注册 daemon。
+- 可信 Relay：`termrelay` 用 setup token 注册 daemon token 与 Ed25519 public key，随后离线校验 daemon 签名的凭据并路由明文流量；不保存 pair ticket、device certificate、access token 或 PTY 状态。
 - Web-first client：Web 是正式交互客户端；`termctl` 保留为配对/调试工具。
 - 一键安装：`termd`、`termrelay` 支持 curl/wget；`termd` 和 `termrelay` 支持 systemd。
 
@@ -23,12 +24,29 @@ Termd 让一台机器上的 shell session 由 session supervisor 持久托管，
 
 Release 由 tag 驱动；固定版本时把 URL 里的 `latest` 换成对应 tag。
 
-### 0.6.0 破坏性升级
+### 0.7.0 破坏性升级
+
+0.7.0 把 Web workspace 收敛为双 WebSocket + JSON HTTP control，并把 supervisor 兼容版本切换到 `2026-07-12-dual-ws`。daemon、relay、Web UI 和 CLI 必须同步升级；0.6.x client/daemon 不与 0.7.0 协议混跑。
+
+升级顺序固定为 relay 在前、termd 在后。先更新公网 `termrelay` 并确认 `/healthz`；再把 relay setup token 通过安全通道放到 daemon 主机的 root-only 临时文件，用它让新版 termd 重新注册 daemon public key。installer 检测到 supervisor compatibility 变化时会明确提示旧 session 将被清理，只有确认后才继续：
+
+```bash
+curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termrelay.sh | sudo bash
+sudo install -m 0600 /secure/source/termrelay_setup_token /run/termd-relay-setup-token
+curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termd.sh \
+  | sudo bash -s -- --web --relay wss://relay.example \
+      --relay-setup-token-file /run/termd-relay-setup-token
+sudo rm -f /run/termd-relay-setup-token
+```
+
+升级不会删除 daemon identity、已配对设备或普通配置；既有设备通过受限 migration endpoint 换取 device certificate。旧 session supervisor 与新的 terminal attach 协议不兼容，因此不能保留。完整协议见 [docs/protocols/v0.7-workspace.md](docs/protocols/v0.7-workspace.md)，公网升级步骤见 [docs/deployment.md](docs/deployment.md)。
+
+### 0.6.0 历史升级说明
 
 0.6.0 把 relay 信任模型从“不可信 relay + 运行时 E2EE”切换为“可信 relay + daemon 注册”。升级时请同步升级 `termd`、`termrelay`、Web UI 和 `termctl`，不要混跑 0.5.x daemon 和 0.6.x relay。
 
 - relay 安装后会生成 setup token；daemon 使用 setup token 首次注册，并自动生成自己的 daemon token。
-- trusted relay 不再把旧 `relay_token` query 当作浏览器/termctl 的主要 admission；浏览器和 `termctl` 使用 `termd pair --qr` 生成的短期 pairing invite。
+- 0.6 开始迁移旧 `relay_token` query；该迁移兼容已在 0.7 完全结束，0.7 relay 不接受任何 query credential。浏览器和 `termctl` 使用 `termd pair --qr` 生成的短期 pairing invite。
 - relay registry 会保存 daemon token hash；请备份 `/var/lib/termrelay/daemon-registry.json` 和 `/etc/termd/termrelay_setup_token`。
 - daemon 本地状态和已有 session supervisor 不需要因为 0.6.0 自动清空；如果 relay 入口无法识别旧设备，重新执行一次 `termd pair --qr` 配对即可。
 
@@ -79,15 +97,19 @@ curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-ter
 
 安装脚本会创建 `/var/lib/termrelay/daemon-registry.json` 和 `/etc/termd/termrelay_setup_token`，并打印 setup token 文件路径。setup token 只给 daemon 注册使用，不放进浏览器 URL。
 
-让 daemon 连接 relay：
+把 setup token 通过安全通道放到 daemon 主机的 root-only 临时文件，再让 daemon 连接 relay：
 
 ```bash
-curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termd.sh | sudo bash -s -- --relay wss://relay.example --relay-setup-token-file /etc/termd/termrelay_setup_token
+sudo install -m 0600 /secure/source/termrelay_setup_token /run/termd-relay-setup-token
+curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termd.sh \
+  | sudo bash -s -- --relay wss://relay.example \
+      --relay-setup-token-file /run/termd-relay-setup-token
+sudo rm -f /run/termd-relay-setup-token
 ```
 
-`termd` 安装脚本会自动生成 `/etc/termd/termd_daemon_token`，用 relay setup token 把 `server_id -> daemon token hash` 注册到 relay。浏览器和 `termctl` 只需要短期 pairing invite；旧 `relay_token` query 不再作为 trusted relay 的浏览器 admission。
+`/secure/source/termrelay_setup_token` 表示已经安全传到 daemon 主机的文件，不是公开下载地址。`termd` 安装脚本会自动生成 `/etc/termd/termd_daemon_token`，用 relay setup token 把 `server_id -> (daemon token hash, daemon public key)` 注册到 relay。setup token 必须通过 root-only 文件提供，不放进命令参数、URL 或日志；relay 不接收 pair ticket、device certificate 或 access token 的同步注册。
 
-同一份 `termd pair --qr` 邀请码可用于 daemon Web 和 relay Web。relay 做 admission 和路由，pairing/auth/session 权限仍由 daemon 最终校验。Docker Compose 部署见 [docs/deployment.md](docs/deployment.md)。
+同一份 `termd pair --qr` 邀请码可用于 daemon Web 和 relay Web。首次配对通过 `POST /api/auth/pair` 获取持久 device certificate；后续由设备私钥完成 challenge-response，换取 5 分钟 access token，并提前 60 秒刷新。每个 Web workspace 固定打开 `/ws/metadata` 和 `/ws/terminal` 两条连接；其余 control API 使用 JSON，只有上传 chunk request 和下载 byte body 是原始字节。relay 做可信 admission 和路由，最终 pairing/auth/session 权限仍由 daemon 校验。Docker Compose 部署见 [docs/deployment.md](docs/deployment.md)。
 
 没有 curl 时，把上面的 `curl -fsSL URL | sudo bash -s -- ...` 换成 `wget -qO- URL | sudo bash -s -- ...`。
 

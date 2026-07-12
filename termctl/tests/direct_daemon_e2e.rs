@@ -105,38 +105,36 @@ impl TestDaemon {
     }
 
     async fn issue_pairing_invite(&self) -> String {
-        let mut protocol = self.protocol().lock().await;
+        let protocol = self.protocol().lock().await;
         let server_id = protocol.server_id();
         let daemon_public_key = protocol.daemon_public_identity().public_key.clone();
-        let record = protocol
-            .issue_pairing_token(current_unix_timestamp_millis())
-            .expect("pairing token should be issued");
+        let (ticket, expires_at_ms) = protocol
+            .issue_pair_ticket_credential(current_unix_timestamp_millis())
+            .expect("pair ticket should be issued");
 
-        PairingQrPayload::new(record.token().clone(), server_id, record.expires_at_ms())
+        PairingQrPayload::new(termd_proto::PairingToken(ticket), server_id, expires_at_ms)
             .with_daemon_public_key(daemon_public_key)
             .to_invite_code()
     }
 
     async fn issue_pairing_invite_for_server(&self, server_id: ServerId) -> String {
-        let mut protocol = self.protocol().lock().await;
+        let protocol = self.protocol().lock().await;
         let daemon_public_key = protocol.daemon_public_identity().public_key.clone();
-        let record = protocol
-            .issue_pairing_token(current_unix_timestamp_millis())
-            .expect("pairing token should be issued");
+        let (ticket, expires_at_ms) = protocol
+            .issue_pair_ticket_credential(current_unix_timestamp_millis())
+            .expect("pair ticket should be issued");
 
-        PairingQrPayload::new(record.token().clone(), server_id, record.expires_at_ms())
+        PairingQrPayload::new(termd_proto::PairingToken(ticket), server_id, expires_at_ms)
             .with_daemon_public_key(daemon_public_key)
             .to_invite_code()
     }
 
     async fn issue_pairing_token(&self) -> String {
-        let mut protocol = self.protocol().lock().await;
+        let protocol = self.protocol().lock().await;
         protocol
-            .issue_pairing_token(current_unix_timestamp_millis())
-            .expect("pairing token should be issued")
-            .token()
+            .issue_pair_ticket_credential(current_unix_timestamp_millis())
+            .expect("pair ticket should be issued")
             .0
-            .clone()
     }
 }
 
@@ -353,7 +351,10 @@ async fn direct_termctl_binary_covers_session_flow_and_invariants() {
         ],
     );
     let wrong_route_stderr = stderr_string(&wrong_route_pair);
-    assert!(wrong_route_stderr.contains("invalid_envelope"));
+    assert!(
+        wrong_route_stderr.contains("pairing_payload_server_mismatch"),
+        "stderr was: {wrong_route_stderr}"
+    );
     assert!(!wrong_route_stderr.contains("termd-pair"));
 
     let invite = daemon.issue_pairing_invite().await;
@@ -372,7 +373,7 @@ async fn direct_termctl_binary_covers_session_flow_and_invariants() {
     );
     let bad_known_pair_stderr = stderr_string(&bad_known_pair);
     assert!(
-        bad_known_pair_stderr.contains("pairing_failed"),
+        bad_known_pair_stderr.contains("pair_ticket_invalid"),
         "stderr was: {bad_known_pair_stderr}"
     );
     assert!(!bad_known_pair_stderr.contains("wrong-token"));
@@ -452,7 +453,7 @@ async fn direct_termctl_binary_covers_session_flow_and_invariants() {
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn direct_termctl_close_attaches_before_closing_session() {
+async fn direct_termctl_close_uses_http_without_attaching_session() {
     let daemon = TestDaemon::spawn().await;
     let temp = tempfile::tempdir().expect("termctl state tempdir should be created");
     let paired_state = temp.path().join("paired-state.json");
@@ -478,7 +479,7 @@ async fn direct_termctl_close_attaches_before_closing_session() {
     );
     let session_id = parse_session_id(&stdout_string(&new_session));
 
-    // daemon 要求 session 级操作绑定到当前连接；CLI close 必须自己建立临时 attach。
+    // v0.7 close is one bearer-authenticated JSON request and does not attach first.
     let close = run_termctl_success(&paired_state, &["close", &session_id, "--url", &daemon.url]);
     let close_stdout = stdout_string(&close);
     assert!(close_stdout.contains("closed session="));

@@ -206,9 +206,6 @@ pub struct DaemonConfig {
     /// daemon 主动连接的 relay endpoint；为空时不自动连接 relay。
     #[serde(default)]
     pub relay_endpoints: Vec<String>,
-    /// relay 访问凭证；它只认证 relay transport，不表达 session 控制权。
-    #[serde(default)]
-    pub relay_auth_token: Option<SecretString>,
     /// trusted relay daemon admission 凭证；只放进 route prelude，不写入浏览器 URL。
     #[serde(default)]
     pub relay_daemon_token: Option<SecretString>,
@@ -240,7 +237,6 @@ impl DaemonConfig {
             default_working_directory: default_working_directory(),
             pairing_token_ttl_ms: DEFAULT_PAIRING_TOKEN_TTL_MS,
             relay_endpoints: Vec::new(),
-            relay_auth_token: None,
             relay_daemon_token: None,
             relay_reconnect: RelayReconnectConfig::default(),
             relay_proxy_url: None,
@@ -537,7 +533,6 @@ mod tests {
         );
         assert!(config.pairing_token_ttl_ms > 0);
         assert!(config.relay_endpoints.is_empty());
-        assert!(config.relay_auth_token.is_none());
         assert!(config.relay_proxy_url.is_none());
         assert_eq!(config.default_pairing_ws_url, "ws://127.0.0.1:8765/ws");
         assert!(config.relay_reconnect.initial_delay_ms > 0);
@@ -632,7 +627,6 @@ mod tests {
         config.default_working_directory = Some(PathBuf::from("/home/termd"));
         config.pairing_token_ttl_ms = 42_000;
         config.relay_endpoints = vec!["ws://127.0.0.1:8080".to_owned()];
-        config.relay_auth_token = Some(SecretString::new("relay-secret-1"));
         config.relay_daemon_token = Some(SecretString::new("daemon-secret-1"));
         config.relay_reconnect = RelayReconnectConfig {
             initial_delay_ms: 250,
@@ -647,9 +641,7 @@ mod tests {
         let loaded = ConfigStore::load(&config_path).unwrap();
         assert_eq!(loaded, config);
         let raw = fs::read_to_string(&config_path).unwrap();
-        assert!(raw.contains("relay-secret-1"));
         assert!(raw.contains("daemon-secret-1"));
-        assert!(!format!("{config:?}").contains("relay-secret-1"));
         assert!(!format!("{config:?}").contains("daemon-secret-1"));
         fs::remove_file(config_path).ok();
     }

@@ -6,7 +6,7 @@ use std::net::{AddrParseError, SocketAddr};
 use std::path::PathBuf;
 
 use serde::Deserialize;
-use termd_proto::ServerId;
+use termd_proto::{PublicKey, ServerId};
 use thiserror::Error;
 
 /// 公网部署时通常只绑定内网或 loopback，再由反向代理对外提供 WSS。
@@ -16,8 +16,6 @@ const DEFAULT_LISTEN: &str = "127.0.0.1:8080";
 pub struct Args {
     /// relay 的内部监听地址；公网入口通常交给反向代理，不直接暴露这里的端口。
     pub listen: SocketAddr,
-    /// relay transport 凭证；部署时通常由 secret manager 注入，不应进入日志。
-    pub auth_token: Option<String>,
     /// daemon 自注册用的长期 setup token；只在安装/注册时由管理员使用。
     pub setup_token: Option<String>,
     pub tls_cert: Option<PathBuf>,
@@ -30,8 +28,6 @@ pub struct Args {
     pub allow_open_relay: bool,
     /// 是否挂载内嵌 Web 静态资源；默认关闭，避免 relay 默认暴露 UI 面。
     pub web: bool,
-    /// 是否启用 HTTP 文件 tunnel 兼容路径；默认关闭，避免 relay 默认暴露额外 HTTP 面。
-    pub http_tunnel: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -47,6 +43,8 @@ pub struct DaemonRegistryEntry {
     pub token: String,
     #[serde(default)]
     pub token_hash: String,
+    #[serde(default)]
+    pub daemon_public_key: Option<PublicKey>,
 }
 
 impl DaemonRegistryEntry {
@@ -76,6 +74,10 @@ impl fmt::Debug for DaemonRegistryEntry {
             .debug_struct("DaemonRegistryEntry")
             .field("server_id", &self.server_id)
             .field("token_configured", &self.runtime_credential().is_some())
+            .field(
+                "daemon_public_key_configured",
+                &self.daemon_public_key.is_some(),
+            )
             .finish()
     }
 }
@@ -87,25 +89,17 @@ pub enum RelayCommand {
     Version,
 }
 
-enum AuthTokenSource {
-    Argument(String),
-    File(PathBuf),
-}
-
 impl fmt::Debug for Args {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // relay auth token 是 transport 凭证，Debug 输出只能显示是否配置，不能泄漏值。
         formatter
             .debug_struct("Args")
             .field("listen", &self.listen)
-            .field("auth_token_configured", &self.auth_token.is_some())
             .field("setup_token_configured", &self.setup_token.is_some())
             .field("tls_cert", &self.tls_cert)
             .field("tls_key_configured", &self.tls_key.is_some())
             .field("daemon_registry_count", &self.daemon_registry.daemons.len())
             .field("allow_open_relay", &self.allow_open_relay)
             .field("web", &self.web)
-            .field("http_tunnel", &self.http_tunnel)
             .finish()
     }
 }
@@ -149,16 +143,12 @@ pub enum ArgsError {
     MissingValue(&'static str),
     #[error("{0} requires a non-empty value")]
     EmptyValue(&'static str),
-    #[error("failed to read auth token file")]
-    ReadAuthTokenFile,
     #[error("failed to read setup token file")]
     ReadSetupTokenFile,
     #[error("failed to read daemon registry file")]
     ReadDaemonRegistryFile,
     #[error("failed to parse daemon registry file")]
     ParseDaemonRegistryFile,
-    #[error("--auth-token and --auth-token-file cannot be used together")]
-    ConflictingAuthTokenSources,
     #[error("invalid listen address")]
     InvalidListenAddress(#[from] AddrParseError),
     #[error("TLS cert and key must be configured together")]
@@ -172,14 +162,12 @@ impl Args {
         S: Into<OsString>,
     {
         let mut listen = DEFAULT_LISTEN.parse()?;
-        let mut auth_token_source = None;
         let mut setup_token_file = None;
         let mut tls_cert = None;
         let mut tls_key = None;
         let mut daemon_registry_file = None;
         let mut allow_open_relay = false;
         let mut web = false;
-        let mut http_tunnel = false;
         let mut args = args.into_iter().map(Into::into);
 
         // 第一个参数是程序名；不要求存在，方便单元测试直接传空迭代器。
@@ -187,14 +175,6 @@ impl Args {
 
         while let Some(arg) = args.next() {
             let arg = arg.to_string_lossy().into_owned();
-            if let Some(value) = arg.strip_prefix("--auth-token=") {
-                set_auth_token_argument(&mut auth_token_source, value.to_owned())?;
-                continue;
-            }
-            if let Some(value) = arg.strip_prefix("--auth-token-file=") {
-                set_auth_token_file(&mut auth_token_source, value.to_owned())?;
-                continue;
-            }
             if let Some(value) = arg.strip_prefix("--setup-token-file=") {
                 setup_token_file = Some(non_empty_path("--setup-token-file", value)?);
                 continue;
@@ -207,22 +187,6 @@ impl Args {
                 "--listen" | "-l" => {
                     let value = args.next().ok_or(ArgsError::MissingValue("--listen"))?;
                     listen = value.to_string_lossy().parse()?;
-                }
-                "--auth-token" => {
-                    let value = args.next().ok_or(ArgsError::MissingValue("--auth-token"))?;
-                    set_auth_token_argument(
-                        &mut auth_token_source,
-                        value.to_string_lossy().into_owned(),
-                    )?;
-                }
-                "--auth-token-file" => {
-                    let value = args
-                        .next()
-                        .ok_or(ArgsError::MissingValue("--auth-token-file"))?;
-                    set_auth_token_file(
-                        &mut auth_token_source,
-                        value.to_string_lossy().into_owned(),
-                    )?;
                 }
                 "--setup-token-file" => {
                     let value = args
@@ -264,9 +228,6 @@ impl Args {
                 "--allow-open-relay" => {
                     allow_open_relay = true;
                 }
-                "--http-tunnel" => {
-                    http_tunnel = true;
-                }
                 other => return Err(ArgsError::UnknownArgument(other.to_owned())),
             }
         }
@@ -275,7 +236,6 @@ impl Args {
             return Err(ArgsError::IncompleteTlsConfig);
         }
 
-        let auth_token = resolve_auth_token_source(auth_token_source)?;
         let setup_token = match setup_token_file {
             Some(path) => read_setup_token_file(path).map(Some)?,
             None => None,
@@ -288,7 +248,6 @@ impl Args {
 
         Ok(Self {
             listen,
-            auth_token,
             setup_token,
             tls_cert,
             tls_key,
@@ -296,7 +255,6 @@ impl Args {
             daemon_registry_path,
             allow_open_relay,
             web,
-            http_tunnel,
         })
     }
 }
@@ -306,59 +264,6 @@ fn non_empty_path(flag: &'static str, value: &str) -> Result<PathBuf, ArgsError>
         return Err(ArgsError::EmptyValue(flag));
     }
     Ok(PathBuf::from(value))
-}
-
-fn set_auth_token_source(
-    current: &mut Option<AuthTokenSource>,
-    next: AuthTokenSource,
-) -> Result<(), ArgsError> {
-    if matches!(
-        (current.as_ref(), &next),
-        (Some(AuthTokenSource::Argument(_)), AuthTokenSource::File(_))
-            | (Some(AuthTokenSource::File(_)), AuthTokenSource::Argument(_))
-    ) {
-        return Err(ArgsError::ConflictingAuthTokenSources);
-    }
-
-    *current = Some(next);
-    Ok(())
-}
-
-fn set_auth_token_argument(
-    current: &mut Option<AuthTokenSource>,
-    value: String,
-) -> Result<(), ArgsError> {
-    if value.is_empty() {
-        return Err(ArgsError::EmptyValue("--auth-token"));
-    }
-    set_auth_token_source(current, AuthTokenSource::Argument(value))
-}
-
-fn set_auth_token_file(
-    current: &mut Option<AuthTokenSource>,
-    value: String,
-) -> Result<(), ArgsError> {
-    if value.is_empty() {
-        return Err(ArgsError::EmptyValue("--auth-token-file"));
-    }
-    set_auth_token_source(current, AuthTokenSource::File(PathBuf::from(value)))
-}
-
-fn resolve_auth_token_source(source: Option<AuthTokenSource>) -> Result<Option<String>, ArgsError> {
-    match source {
-        Some(AuthTokenSource::Argument(token)) => Ok(Some(token)),
-        Some(AuthTokenSource::File(path)) => read_auth_token_file(path).map(Some),
-        None => Ok(None),
-    }
-}
-
-fn read_auth_token_file(path: PathBuf) -> Result<String, ArgsError> {
-    let token = fs::read_to_string(path).map_err(|_| ArgsError::ReadAuthTokenFile)?;
-    let token = trim_trailing_line_endings(token);
-    if token.trim().is_empty() {
-        return Err(ArgsError::EmptyValue("--auth-token-file"));
-    }
-    Ok(token)
 }
 
 fn read_setup_token_file(path: PathBuf) -> Result<String, ArgsError> {
@@ -401,11 +306,9 @@ mod tests {
         let args = Args::parse_from(["termrelay"]).unwrap();
 
         assert_eq!(args.listen, "127.0.0.1:8080".parse().unwrap());
-        assert_eq!(args.auth_token, None);
         assert_eq!(args.tls_cert, None);
         assert_eq!(args.tls_key, None);
         assert!(!args.web);
-        assert!(!args.http_tunnel);
     }
 
     #[test]
@@ -416,6 +319,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any())]
     fn parses_auth_token_without_debug_leakage() {
         let args = Args::parse_from(["termrelay", "--auth-token", "relay-secret-1"]).unwrap();
 
@@ -424,6 +328,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any())]
     fn parses_equals_auth_token_without_debug_leakage() {
         let args = Args::parse_from(["termrelay", "--auth-token=relay-secret-equals"]).unwrap();
 
@@ -432,6 +337,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any())]
     fn parses_auth_token_file_without_debug_path_or_token_leakage() {
         let token_file = write_temp_auth_token("relay-secret-from-file\n\n");
         let token_file_arg = token_file.to_string_lossy().into_owned();
@@ -446,6 +352,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any())]
     fn parses_equals_auth_token_file_without_debug_path_or_token_leakage() {
         let token_file = write_temp_auth_token("relay-secret-from-equals-file\n");
         let token_file_arg = token_file.to_string_lossy().into_owned();
@@ -518,6 +425,28 @@ mod tests {
     }
 
     #[test]
+    fn v070_parses_daemon_public_key_from_registry() {
+        let registry_file = write_temp_registry(
+            r#"{"daemons":[{"server_id":"00000000-0000-0000-0000-000000000070","token_hash":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","daemon_public_key":"ed25519-v1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}]}"#,
+        );
+        let args = Args::parse_from([
+            "termrelay",
+            "--daemon-registry",
+            registry_file.to_str().unwrap(),
+        ])
+        .unwrap();
+        assert_eq!(
+            args.daemon_registry.daemons[0]
+                .daemon_public_key
+                .as_ref()
+                .unwrap()
+                .0,
+            "ed25519-v1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+        );
+        let _ = fs::remove_file(registry_file);
+    }
+
+    #[test]
     fn parses_missing_daemon_registry_as_empty_writable_registry_path() {
         let registry_file = std::env::temp_dir().join(format!(
             "termrelay-missing-daemon-registry-{}-{}.json",
@@ -537,6 +466,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any())]
     fn rejects_blank_auth_token_file() {
         let token_file = write_temp_auth_token("  \n");
         let token_file_arg = token_file.to_string_lossy().into_owned();
@@ -549,6 +479,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any())]
     fn rejects_conflicting_auth_token_sources() {
         let token_file = write_temp_auth_token("relay-secret-from-file\n");
         let token_file_arg = token_file.to_string_lossy().into_owned();
@@ -571,6 +502,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any())]
     fn rejects_file_first_auth_token_conflict_before_reading_file() {
         let missing_token_file =
             std::env::temp_dir().join("termrelay-auth-token-test-missing-conflict.txt");
@@ -589,6 +521,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any())]
     fn rejects_equals_file_first_auth_token_conflict_before_reading_file() {
         let missing_token_file =
             std::env::temp_dir().join("termrelay-auth-token-test-missing-equals-conflict.txt");
@@ -635,13 +568,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_http_tunnel_flag() {
-        let args = Args::parse_from(["termrelay", "--http-tunnel"]).unwrap();
-
-        assert!(args.http_tunnel);
-    }
-
-    #[test]
     fn parses_help_and_version_without_requiring_server_start() {
         assert_eq!(
             RelayCommand::parse_from(["termrelay", "--help"]).unwrap(),
@@ -669,6 +595,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any())]
     fn rejects_missing_auth_token_value() {
         let error = Args::parse_from(["termrelay", "--auth-token"]).unwrap_err();
 
@@ -676,6 +603,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any())]
     fn rejects_empty_auth_token_value() {
         let error = Args::parse_from(["termrelay", "--auth-token", ""]).unwrap_err();
 
@@ -683,6 +611,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any())]
     fn rejects_missing_auth_token_file_value() {
         let error = Args::parse_from(["termrelay", "--auth-token-file"]).unwrap_err();
 

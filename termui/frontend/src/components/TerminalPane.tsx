@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState, type FormEvent, type MouseEvent, type PointerEvent as ReactPointerEvent } from "react";
 import { ChevronDown, ChevronUp, ClipboardPaste, Copy, Search, X } from "lucide-react";
-import type { BrowserMobileShortcut, EffectiveTheme, SessionCursorPresence, SessionSearchResultPayload, TerminalSize } from "../protocol/types";
+import type { BrowserMobileShortcut, EffectiveTheme, SessionSearchResultPayload, TerminalSize } from "../protocol/types";
 import { useI18n } from "../i18n";
 import { terminalTheme } from "../theme";
 import type { TerminalOutputItem, TerminalResyncOptions } from "./terminal/types";
@@ -137,7 +137,8 @@ interface TerminalPaneProps {
   onSearch?: (query: string) => Promise<SessionSearchResultPayload>;
   onInput: (data: string) => void;
   onResize: (size: TerminalSize) => void;
-  onCursorChange?: (presence: SessionCursorPresence) => void;
+  /** @deprecated Cursor is derived locally from snapshot and PTY output. */
+  onCursorChange?: (presence: { row: number; col: number; focused: boolean }) => void;
 }
 
 interface FocusTerminalInputSinkOptions {
@@ -159,7 +160,6 @@ export function TerminalPane(props: TerminalPaneProps) {
   const attachedRef = useRef(props.attached);
   const onInputRef = useRef(props.onInput);
   const onResizeRef = useRef(props.onResize);
-  const onCursorChangeRef = useRef(props.onCursorChange);
   const onTerminalResyncRef = useRef(props.onTerminalResync);
   const onTerminalSeqRenderedRef = useRef(props.onTerminalSeqRendered);
   const onTerminalSizeRenderedRef = useRef(props.onTerminalSizeRendered);
@@ -1851,7 +1851,6 @@ export function TerminalPane(props: TerminalPaneProps) {
     attachedRef.current = props.attached;
     onInputRef.current = props.onInput;
     onResizeRef.current = props.onResize;
-    onCursorChangeRef.current = props.onCursorChange;
     onTerminalResyncRef.current = props.onTerminalResync;
     onTerminalSeqRenderedRef.current = props.onTerminalSeqRendered;
     onTerminalSizeRenderedRef.current = props.onTerminalSizeRendered;
@@ -1860,7 +1859,7 @@ export function TerminalPane(props: TerminalPaneProps) {
     confirmedSessionSizeRef.current = props.sessionSize;
     mobileInputModeRef.current = Boolean(props.mobileInputMode);
     mobileKeyboardOpenRef.current = Boolean(props.mobileKeyboardOpen);
-  }, [props.attached, props.mobileInputMode, props.mobileKeyboardOpen, props.onCursorChange, props.onInput, props.onOutputResetApplied, props.onResize, props.onTerminalResync, props.onTerminalSeqRendered, props.onTerminalSizeRendered, props.sessionSize, props.takeOutput]);
+  }, [props.attached, props.mobileInputMode, props.mobileKeyboardOpen, props.onInput, props.onOutputResetApplied, props.onResize, props.onTerminalResync, props.onTerminalSeqRendered, props.onTerminalSizeRendered, props.sessionSize, props.takeOutput]);
 
   useEffect(() => props.registerOutputDrain(() => drainOutputRef.current()), [props.registerOutputDrain]);
 
@@ -1917,19 +1916,10 @@ export function TerminalPane(props: TerminalPaneProps) {
     cursorFrameRef.current = scheduleDeferredTerminalFrame(() => {
       cursorFrameRef.current = undefined;
       const terminal = terminalRef.current;
-      if (!terminal || !onCursorChangeRef.current) {
+      if (!terminal) {
         return;
       }
       lastCursorReportAtRef.current = nowForThrottle();
-
-      // xterm 内部 cursorX/cursorY 是 0-based；协议用 1-based，便于顶部状态条直接展示。
-      // jsdom 测试环境不会完整实现终端 buffer，缺失时用 1:1 兜底，不影响浏览器真实值。
-      const activeBuffer = terminal.buffer?.active;
-      onCursorChangeRef.current({
-        row: activeBuffer ? activeBuffer.cursorY + 1 : 1,
-        col: activeBuffer ? activeBuffer.cursorX + 1 : 1,
-        focused: focusedRef.current,
-      });
       alignMobileViewportToTerminalBottom(terminal);
     });
   };

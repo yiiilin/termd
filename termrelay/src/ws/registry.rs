@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use termd_proto::{Nonce, RelayClientId, RelayControlEnvelope, ServerId};
+use termd_proto::{Nonce, RelayClientId, RelayControlEnvelope, RelayRouteKind, ServerId};
 use thiserror::Error;
 use tokio::sync::{Notify, mpsc};
 use tracing::{debug, trace, warn};
@@ -414,6 +414,39 @@ impl RelayRegistry {
         prelude: &RoutePrelude,
         sender: FrameSender,
     ) -> Result<ConnectionRegistration, RelayError> {
+        self.register_transport(prelude, sender, RelayRouteKind::Legacy, None)
+    }
+
+    pub(super) fn register_workspace(
+        &self,
+        server_id: ServerId,
+        sender: FrameSender,
+        route_kind: RelayRouteKind,
+        access_token: String,
+    ) -> Result<ConnectionRegistration, RelayError> {
+        self.register_transport(
+            &RoutePrelude {
+                server_id,
+                route_role: termd_proto::RouteRole::Client,
+                connection_role: ConnectionRole::Client,
+                admission: None,
+                route_generation: None,
+                client_id: None,
+                data_token: None,
+            },
+            sender,
+            route_kind,
+            Some(access_token),
+        )
+    }
+
+    fn register_transport(
+        &self,
+        prelude: &RoutePrelude,
+        sender: FrameSender,
+        route_kind: RelayRouteKind,
+        access_token: Option<String>,
+    ) -> Result<ConnectionRegistration, RelayError> {
         let server_id = prelude.server_id;
         let role = prelude.connection_role;
         let id = self.next_connection_id.fetch_add(1, Ordering::Relaxed) + 1;
@@ -521,6 +554,8 @@ impl RelayRegistry {
                 let open_data = RelayControlEnvelope::OpenData {
                     client_id: RelayClientId(id),
                     data_token: data_token.clone(),
+                    route_kind,
+                    access_token,
                 };
                 // 中文注释：必须先把 pending client 放进 room，再通知 daemon 反连 data。
                 // 否则 control writer 足够快时，daemon data 可能早于 client 入表到达并被误拒。

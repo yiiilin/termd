@@ -5,472 +5,55 @@
 
 mod recovery;
 
-use std::collections::{HashSet, VecDeque};
-use std::io::{self, Read, Seek, SeekFrom};
+use std::collections::HashSet;
+use std::fs;
+use std::io::{self, Read};
 use std::net::{AddrParseError, IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::{Body, Bytes, to_bytes};
+use axum::extract::rejection::JsonRejection;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, OriginalUri, Path, State};
 use axum::http::header::{CONTENT_TYPE, HeaderName};
 use axum::http::{HeaderMap, Method, Request, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, options, post, put};
 use axum::{Json, Router};
+#[cfg(test)]
 use futures_util::{SinkExt, StreamExt};
 use rustls::pki_types::pem::PemObject;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use termd_proto::{
-    ErrorPayload, HttpE2eeAuthPayload, MessageType, PROTOCOL_PACKET_VERSION, PacketKind,
-    PacketRequestId, PairingToken, ProtocolPacket, ProtocolVersion, PublicKey, RouteHelloPayload,
-    RouteReadyPayload, RouteRole, ServerId, SessionAttachPayload, SessionFileHttpDownloadPayload,
-    SessionFileHttpUploadStreamPayload, SessionFileUploadPayload, SessionId, SessionState,
-    SessionToken, Signature, UnixTimestampMillis, is_http_control_tunnel_path_allowed,
-    is_http_tunnel_path_allowed,
+    DeviceId, ErrorPayload, PROTOCOL_PACKET_VERSION, ProtocolVersion, ServerId,
+    SessionFileDownloadPreparePayload, SessionFileUploadPayload, SessionId, SessionState,
+    UnixTimestampMillis, is_http_control_tunnel_path_allowed, is_http_tunnel_path_allowed,
 };
 use thiserror::Error;
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex, mpsc, watch};
-use tokio::task::JoinHandle;
-use tokio::time::{Instant, timeout};
+use tokio::sync::Mutex;
 use tower::ServiceExt as _;
 use tower_http::cors::{Any, CorsLayer};
-use tracing::{debug, info, warn};
+use tracing::warn;
 
-use crate::auth::{PendingPairing, current_unix_timestamp_millis};
+use crate::auth::current_unix_timestamp_millis;
 use crate::config::DaemonConfig;
 use crate::pty::PtyRestoreInfo;
 use crate::pty::supervisor::SupervisorPtyBackend;
 use crate::state::{StateError, StateStore};
 
 use super::protocol::{
-    DaemonProtocol, JsonEnvelope, PreparedProtocolWireMessage, ProtocolConnection,
-    ProtocolConnectionDebugSnapshot, ProtocolConnectionDebugTraffic, ProtocolError,
-    ProtocolWireMessage, SessionFileHttpUploadBegin, SessionFileHttpUploadCommit,
-    cleanup_persisted_session_file_http_uploads, decode_payload, envelope_value,
-    session_file_http_upload_chunks_len, write_session_file_http_upload_files,
+    DaemonProtocol, ProtocolConnection, ProtocolError, V070TerminalOpen,
+    cleanup_persisted_session_file_http_uploads,
 };
-use super::relay::RelayBaseUrl;
 use super::signature::Ed25519SignatureVerifier;
-#[cfg(test)]
-pub(crate) use recovery::adopt_or_repair_runtime_sessions_from_supervisors;
 use recovery::warn_about_orphaned_supervisors;
 
-const OUTPUT_FLUSH_MAX_BYTES_PER_SESSION: usize = 512 * 1024;
-// transport 超时只关闭当前 WebSocket 连接；session/supervisor 仍由协议和 PTY 层保持持久。
-const ROUTE_PRELUDE_TIMEOUT: Duration = Duration::from_secs(5);
-const WEBSOCKET_SEND_DEADLINE: Duration = Duration::from_secs(10);
-const WEBSOCKET_PONG_DEADLINE: Duration = Duration::from_secs(10);
-const WEBSOCKET_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
-const WEBSOCKET_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
-const RELAY_REGISTRATION_TIMEOUT: Duration = Duration::from_secs(4);
-const RELAY_REGISTRATION_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
-const RELAY_PAIR_TICKET_REGISTRATION_ATTEMPTS: usize = 3;
-const RELAY_DEVICE_REGISTRATION_ATTEMPTS: usize = 2;
-const RELAY_REGISTRATION_RETRY_DELAY: Duration = Duration::from_millis(150);
-// direct WebSocket 与 relay 传输保持同量级限制；终端 snapshot 可能是数 MB 的
-// 单个 binary frame，过小的 frame limit 会把正常重连误判为异常大消息。
-const WEBSOCKET_MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
-const WEBSOCKET_MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
-const HTTP_E2EE_INIT_MAX_BYTES: usize = 1024 * 1024;
-#[cfg(not(test))]
-const HTTP_E2EE_SHORT_BODY_TIMEOUT: Duration = Duration::from_secs(5);
-#[cfg(test)]
-const HTTP_E2EE_SHORT_BODY_TIMEOUT: Duration = Duration::from_millis(50);
-const HTTP_E2EE_FRAME_LEN_BYTES: usize = 4;
-const HTTP_E2EE_MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
-// 中文注释：HTTP body 是流式输入，必须在追加到 pending 前限制未解析数据大小，
-// 否则一个异常大的底层 body chunk 会先占用内存，再等帧解析时报错。
-const HTTP_E2EE_MAX_PENDING_BYTES: usize = HTTP_E2EE_FRAME_LEN_BYTES + HTTP_E2EE_MAX_FRAME_BYTES;
-const SESSION_ACTIVITY_PUSH_MIN_INTERVAL: Duration = Duration::from_millis(250);
-const WEBSOCKET_TRAFFIC_LOG_INTERVAL: Duration = Duration::from_secs(1);
-const WEBSOCKET_SEND_SLOW_LOG_THRESHOLD: Duration = Duration::from_millis(50);
-const WEBSOCKET_SEND_DEBUG_LOG_THRESHOLD: Duration = Duration::from_millis(10);
-const WEBSOCKET_SEND_DEBUG_BATCH_ENVELOPES: usize = 8;
-const WEBSOCKET_SEND_DEBUG_BATCH_BYTES: usize = 512 * 1024;
-const WEBSOCKET_SEND_INFO_BATCH_ENVELOPES: usize = 64;
-const WEBSOCKET_SEND_INFO_BATCH_BYTES: usize = 8 * 1024 * 1024;
-const WEBSOCKET_WIRE_QUEUE_CAPACITY: usize = 256;
-const WEBSOCKET_PUSH_EVENT_QUEUE_CAPACITY: usize = 1024;
-const WEBSOCKET_PUSH_DRAIN_MAX_EVENTS_PER_TICK: usize = 64;
-const WEBSOCKET_PUSH_DRAIN_MAX_ENQUEUED_BYTES_PER_TICK: usize = 16 * 1024 * 1024;
-const WEBSOCKET_PUSH_DRAIN_MAX_ELAPSED_PER_TICK: Duration = Duration::from_millis(4);
-const TERMINAL_OUTPUT_PUSH_COALESCE_DELAY: Duration = Duration::from_millis(10);
-
-fn websocket_idle_timeout_enabled() -> bool {
-    // 浏览器页面打开时，WebSocket 的生命周期应由真实 close/error 决定。
-    // 后台标签页、移动端挂起或终端长时间静默都不能因为 daemon 侧固定 idle timer 被关闭。
-    false
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum SessionPushEvent {
-    Output(SessionId),
-    Activity(SessionId),
-    Cwd(SessionId),
-    Resize(SessionId),
-    MetadataClients,
-    MetadataStatus,
-}
-
-impl SessionPushEvent {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Output(_) => "output",
-            Self::Activity(_) => "activity",
-            Self::Cwd(_) => "cwd",
-            Self::Resize(_) => "resize",
-            Self::MetadataClients => "metadata_clients",
-            Self::MetadataStatus => "metadata_status",
-        }
-    }
-
-    fn session_id(self) -> Option<SessionId> {
-        match self {
-            Self::Output(session_id)
-            | Self::Activity(session_id)
-            | Self::Cwd(session_id)
-            | Self::Resize(session_id) => Some(session_id),
-            Self::MetadataClients | Self::MetadataStatus => None,
-        }
-    }
-
-    fn min_interval(self) -> Option<Duration> {
-        match self {
-            // Activity 只是前端列表里的“后台有新输出”提示；不需要按 PTY 输出频率逐包推送。
-            // 多窗口 attach 时，如果后台 session 高频输出，未限速的小加密包会按窗口数放大，
-            // 造成浏览器 WebSocket 队列和 daemon 事件循环都被固定长度小包拖慢。
-            SessionPushEvent::Activity(_) => Some(SESSION_ACTIVITY_PUSH_MIN_INTERVAL),
-            SessionPushEvent::Output(_)
-            | SessionPushEvent::Cwd(_)
-            | SessionPushEvent::Resize(_)
-            | SessionPushEvent::MetadataClients
-            | SessionPushEvent::MetadataStatus => None,
-        }
-    }
-
-    fn coalesce_delay(self) -> Option<Duration> {
-        match self {
-            // 中文注释：终端输出是高频数据面。等待一个很短窗口可以把“一行一个 signal”
-            // 合并为一次 drain，仍保持交互延迟在用户无感范围内。
-            SessionPushEvent::Output(_) => Some(TERMINAL_OUTPUT_PUSH_COALESCE_DELAY),
-            SessionPushEvent::Activity(_)
-            | SessionPushEvent::Cwd(_)
-            | SessionPushEvent::Resize(_)
-            | SessionPushEvent::MetadataClients
-            | SessionPushEvent::MetadataStatus => None,
-        }
-    }
-}
-
-#[derive(Debug, Default)]
-struct SessionPushEventQueue {
-    pending: VecDeque<SessionPushEvent>,
-    pending_set: HashSet<SessionPushEvent>,
-}
-
-impl SessionPushEventQueue {
-    fn enqueue(&mut self, event: SessionPushEvent) {
-        if self.pending_set.contains(&event) {
-            return;
-        }
-        self.pending_set.insert(event);
-        self.pending.push_back(event);
-    }
-
-    fn has_pending(&self) -> bool {
-        !self.pending.is_empty()
-    }
-
-    fn len(&self) -> usize {
-        self.pending.len()
-    }
-
-    fn peek_front(&self) -> Option<SessionPushEvent> {
-        self.pending.front().copied()
-    }
-
-    fn pop_front_after_queue_accept(&mut self) -> Option<SessionPushEvent> {
-        let event = self.pending.pop_front()?;
-        self.pending_set.remove(&event);
-        Some(event)
-    }
-}
-
-#[derive(Debug)]
-enum WebSocketWrite {
-    Wire {
-        kind: WebSocketOutKind,
-        messages: Vec<ProtocolWireMessage>,
-    },
-    Raw {
-        kind: WebSocketOutKind,
-        message: Message,
-    },
-}
-
-#[derive(Debug, Clone, Copy)]
-struct WebSocketWriteDebug {
-    kind: WebSocketOutKind,
-    messages: usize,
-    bytes: usize,
-    raw: bool,
-}
-
-impl WebSocketWrite {
-    fn debug_snapshot(&self) -> WebSocketWriteDebug {
-        match self {
-            Self::Wire { kind, messages } => WebSocketWriteDebug {
-                kind: *kind,
-                messages: messages.len(),
-                bytes: websocket_wire_messages_wire_len(messages),
-                raw: false,
-            },
-            Self::Raw { kind, message } => WebSocketWriteDebug {
-                kind: *kind,
-                messages: 1,
-                bytes: websocket_message_bytes(message),
-                raw: true,
-            },
-        }
-    }
-}
-
-#[derive(Debug, Default, Clone, Copy)]
-struct WebSocketTrafficBucket {
-    calls: u64,
-    envelopes: u64,
-    bytes: u64,
-}
-
-impl WebSocketTrafficBucket {
-    fn record(&mut self, envelopes: usize, bytes: usize) {
-        self.calls = self.calls.saturating_add(1);
-        self.envelopes = self.envelopes.saturating_add(envelopes as u64);
-        self.bytes = self.bytes.saturating_add(bytes as u64);
-    }
-
-    fn is_empty(self) -> bool {
-        self.calls == 0 && self.envelopes == 0 && self.bytes == 0
-    }
-}
-
-#[derive(Debug, Default)]
-struct WebSocketTrafficCounters {
-    in_text: WebSocketTrafficBucket,
-    in_binary: WebSocketTrafficBucket,
-    in_ping: WebSocketTrafficBucket,
-    in_pong: WebSocketTrafficBucket,
-    in_close: WebSocketTrafficBucket,
-    out_route_ready: WebSocketTrafficBucket,
-    out_initial: WebSocketTrafficBucket,
-    out_response: WebSocketTrafficBucket,
-    out_push_output: WebSocketTrafficBucket,
-    out_push_activity: WebSocketTrafficBucket,
-    out_push_cwd: WebSocketTrafficBucket,
-    out_push_resize: WebSocketTrafficBucket,
-    out_push_metadata_clients: WebSocketTrafficBucket,
-    out_push_metadata_status: WebSocketTrafficBucket,
-    out_plain_error: WebSocketTrafficBucket,
-    out_ping: WebSocketTrafficBucket,
-    out_pong: WebSocketTrafficBucket,
-    send_errors: u64,
-}
-
-impl WebSocketTrafficCounters {
-    fn record_in(&mut self, message: &Message) {
-        match message {
-            Message::Text(raw) => self.in_text.record(1, raw.len()),
-            Message::Binary(raw) => self.in_binary.record(1, raw.len()),
-            Message::Ping(payload) => self.in_ping.record(0, payload.len()),
-            Message::Pong(payload) => self.in_pong.record(0, payload.len()),
-            Message::Close(_) => self.in_close.record(0, 0),
-        }
-    }
-
-    fn record_out(&mut self, kind: WebSocketOutKind, envelopes: usize, bytes: usize) {
-        if kind.is_payload_batch() && envelopes == 0 && bytes == 0 {
-            return;
-        }
-        match kind {
-            WebSocketOutKind::RouteReady => self.out_route_ready.record(envelopes, bytes),
-            WebSocketOutKind::Initial => self.out_initial.record(envelopes, bytes),
-            WebSocketOutKind::Response => self.out_response.record(envelopes, bytes),
-            WebSocketOutKind::PushOutput => self.out_push_output.record(envelopes, bytes),
-            WebSocketOutKind::PushActivity => self.out_push_activity.record(envelopes, bytes),
-            WebSocketOutKind::PushCwd => self.out_push_cwd.record(envelopes, bytes),
-            WebSocketOutKind::PushResize => self.out_push_resize.record(envelopes, bytes),
-            WebSocketOutKind::PushMetadataClients => {
-                self.out_push_metadata_clients.record(envelopes, bytes)
-            }
-            WebSocketOutKind::PushMetadataStatus => {
-                self.out_push_metadata_status.record(envelopes, bytes)
-            }
-            WebSocketOutKind::PlainError => self.out_plain_error.record(envelopes, bytes),
-            WebSocketOutKind::Ping => self.out_ping.record(envelopes, bytes),
-            WebSocketOutKind::Pong => self.out_pong.record(envelopes, bytes),
-        }
-    }
-
-    fn record_send_error(&mut self) {
-        self.send_errors = self.send_errors.saturating_add(1);
-    }
-
-    fn record_queued_raw(&mut self, kind: WebSocketOutKind, bytes: usize) {
-        self.record_out(kind, 0, bytes);
-    }
-
-    fn has_activity(&self) -> bool {
-        !self.in_text.is_empty()
-            || !self.in_binary.is_empty()
-            || !self.in_ping.is_empty()
-            || !self.in_pong.is_empty()
-            || !self.in_close.is_empty()
-            || !self.out_route_ready.is_empty()
-            || !self.out_initial.is_empty()
-            || !self.out_response.is_empty()
-            || !self.out_push_output.is_empty()
-            || !self.out_push_activity.is_empty()
-            || !self.out_push_cwd.is_empty()
-            || !self.out_push_resize.is_empty()
-            || !self.out_push_metadata_clients.is_empty()
-            || !self.out_push_metadata_status.is_empty()
-            || !self.out_plain_error.is_empty()
-            || !self.out_ping.is_empty()
-            || !self.out_pong.is_empty()
-            || self.send_errors > 0
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WebSocketOutKind {
-    RouteReady,
-    Initial,
-    Response,
-    PushOutput,
-    PushActivity,
-    PushCwd,
-    PushResize,
-    PushMetadataClients,
-    PushMetadataStatus,
-    PlainError,
-    Ping,
-    Pong,
-}
-
-impl WebSocketOutKind {
-    fn is_payload_batch(self) -> bool {
-        // control frame 发送本身就是事件；业务 batch 如果没有 envelope，就不要污染空转诊断。
-        !matches!(self, Self::Ping | Self::Pong)
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::RouteReady => "route_ready",
-            Self::Initial => "initial",
-            Self::Response => "response",
-            Self::PushOutput => "push_output",
-            Self::PushActivity => "push_activity",
-            Self::PushCwd => "push_cwd",
-            Self::PushResize => "push_resize",
-            Self::PushMetadataClients => "push_metadata_clients",
-            Self::PushMetadataStatus => "push_metadata_status",
-            Self::PlainError => "plain_error",
-            Self::Ping => "ping",
-            Self::Pong => "pong",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct WebSocketWatcherCounts {
-    output: usize,
-    activity: usize,
-    cwd: usize,
-    resize: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct WebSocketAttachSummary {
-    duration_ms: u64,
-    attached_sessions: Vec<SessionId>,
-    watched_sessions: usize,
-    client_payload_seen: bool,
-    push_output_seen: bool,
-    push_output_batches: u64,
-    push_output_bytes: u64,
-    send_errors: u64,
-}
-
-impl WebSocketAttachSummary {
-    fn should_promote_to_info(&self) -> bool {
-        self.client_payload_seen && !self.push_output_seen && !self.attached_sessions.is_empty()
-    }
-}
-
-#[derive(Debug)]
-struct WebSocketAttachSummaryState {
-    started_at: Instant,
-    client_payload_seen: bool,
-    push_output_seen: bool,
-    push_output_batches: u64,
-    push_output_bytes: u64,
-    send_errors: u64,
-}
-
-impl WebSocketAttachSummaryState {
-    fn new(now: Instant) -> Self {
-        Self {
-            started_at: now,
-            client_payload_seen: false,
-            push_output_seen: false,
-            push_output_batches: 0,
-            push_output_bytes: 0,
-            send_errors: 0,
-        }
-    }
-
-    fn mark_client_payload(&mut self) {
-        self.client_payload_seen = true;
-    }
-
-    fn record_push_output_batch(&mut self, batches: u64, bytes: u64) {
-        if batches == 0 && bytes == 0 {
-            return;
-        }
-        self.push_output_seen = true;
-        self.push_output_batches = self.push_output_batches.saturating_add(batches);
-        self.push_output_bytes = self.push_output_bytes.saturating_add(bytes);
-    }
-
-    fn record_send_error(&mut self) {
-        self.send_errors = self.send_errors.saturating_add(1);
-    }
-
-    fn snapshot(
-        &self,
-        connection: &ProtocolConnection,
-        watchers: WebSocketWatcherCounts,
-    ) -> WebSocketAttachSummary {
-        WebSocketAttachSummary {
-            duration_ms: self
-                .started_at
-                .elapsed()
-                .as_millis()
-                .min(u128::from(u64::MAX)) as u64,
-            attached_sessions: connection.attached_sessions_snapshot(),
-            watched_sessions: watchers.output,
-            client_payload_seen: self.client_payload_seen,
-            push_output_seen: self.push_output_seen,
-            push_output_batches: self.push_output_batches,
-            push_output_bytes: self.push_output_bytes,
-            send_errors: self.send_errors,
-        }
-    }
-}
+const HTTP_JSON_MAX_BYTES: usize = 1024 * 1024;
+const V070_FILE_CHUNK_MAX_BYTES: usize = 2 * 1024 * 1024;
 
 pub type DefaultDaemonProtocol = DaemonProtocol<SupervisorPtyBackend, Ed25519SignatureVerifier>;
 /// daemon 的协议核心仍是单线程语义，但等待这把锁必须让出 Tokio worker。
@@ -531,11 +114,12 @@ struct HealthzPayload {
     status: &'static str,
     protocol_version: ProtocolVersion,
     server_id: ServerId,
+    daemon_public_key: termd_proto::PublicKey,
 }
 
 #[derive(Debug, Serialize)]
 struct LocalPairingTokenPayload {
-    token: PairingToken,
+    token: String,
     expires_at_ms: UnixTimestampMillis,
     ttl_ms: u64,
     server_id: ServerId,
@@ -605,24 +189,614 @@ pub fn router(protocol: SharedDaemonProtocol, web_enabled: bool) -> Router {
     let router = Router::new()
         .route("/healthz", get(healthz))
         .route("/local/pairing-token", post(local_pairing_token))
+        .merge(auth_api_router())
         .merge(http_control_api_router())
         .merge(http_file_api_router())
-        .route("/ws", get(ws_handler))
+        .route("/ws/metadata", get(metadata_ws_handler))
+        .route("/ws/terminal", get(terminal_ws_handler))
+        .method_not_allowed_fallback(api_method_not_allowed)
         .with_state(protocol);
 
     if web_enabled {
         router.fallback(web_or_api_fallback)
     } else {
-        router
+        router.fallback(api_or_plain_not_found)
     }
+}
+
+async fn api_or_plain_not_found(uri: OriginalUri) -> Response {
+    if is_api_fallback_path(uri.0.path()) {
+        return api_error(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "application route was not found",
+            false,
+        );
+    }
+    StatusCode::NOT_FOUND.into_response()
 }
 
 async fn web_or_api_fallback(method: Method, uri: OriginalUri, headers: HeaderMap) -> Response {
     if is_api_fallback_path(uri.0.path()) {
-        return StatusCode::NOT_FOUND.into_response();
+        return api_error(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "application route was not found",
+            false,
+        );
     }
 
     termweb::embedded_web_handler_with_headers(method, uri, headers).await
+}
+
+#[derive(Debug, Serialize)]
+struct ApplicationErrorBody {
+    error: ApplicationError,
+}
+
+#[derive(Debug, Serialize)]
+struct ApplicationError {
+    code: &'static str,
+    message: &'static str,
+    retryable: bool,
+}
+
+fn api_error(
+    status: StatusCode,
+    code: &'static str,
+    message: &'static str,
+    retryable: bool,
+) -> Response {
+    (
+        status,
+        Json(ApplicationErrorBody {
+            error: ApplicationError {
+                code,
+                message,
+                retryable,
+            },
+        }),
+    )
+        .into_response()
+}
+
+async fn api_method_not_allowed() -> Response {
+    api_error(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "method_not_allowed",
+        "HTTP method is not allowed for this route",
+        false,
+    )
+}
+
+fn auth_api_router() -> Router<SharedDaemonProtocol> {
+    Router::new()
+        .route("/api/auth/pair", post(auth_pair))
+        .route("/api/auth/challenge", post(auth_challenge))
+        .route("/api/auth/access-token", post(auth_access_token))
+        .route(
+            "/api/auth/device-certificate/migrate",
+            post(auth_device_certificate_migrate),
+        )
+        .route(
+            "/api/auth/device-certificate/migrate/challenge",
+            post(auth_device_certificate_migration_challenge),
+        )
+}
+
+#[derive(Debug, Deserialize)]
+struct PairDeviceRequest {
+    device_id: DeviceId,
+    device_public_key: termd_proto::PublicKey,
+}
+
+#[derive(Debug, Serialize)]
+struct PairDeviceResponse {
+    server_id: ServerId,
+    device_id: DeviceId,
+    device_certificate: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeviceChallengeRequest {
+    device_id: DeviceId,
+}
+
+#[derive(Debug, Serialize)]
+struct AccessTokenResponse {
+    access_token: String,
+    token_type: &'static str,
+    issued_at_ms: UnixTimestampMillis,
+    expires_at_ms: UnixTimestampMillis,
+    refresh_at_ms: UnixTimestampMillis,
+}
+
+#[derive(Debug, Serialize)]
+struct DeviceCertificateResponse {
+    device_certificate: String,
+}
+
+fn authorization_credential<'a>(
+    headers: &'a HeaderMap,
+    expected_scheme: &str,
+) -> Result<&'a str, Response> {
+    let raw = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::UNAUTHORIZED,
+                "authorization_required",
+                "valid authorization credentials are required",
+                false,
+            )
+        })?;
+    let (scheme, credential) = raw.split_once(' ').ok_or_else(|| {
+        api_error(
+            StatusCode::UNAUTHORIZED,
+            "authorization_invalid",
+            "authorization credentials are invalid",
+            false,
+        )
+    })?;
+    if scheme != expected_scheme
+        || credential.is_empty()
+        || credential.contains(char::is_whitespace)
+    {
+        return Err(api_error(
+            StatusCode::UNAUTHORIZED,
+            "authorization_invalid",
+            "authorization credentials are invalid",
+            false,
+        ));
+    }
+    Ok(credential)
+}
+
+async fn auth_pair(
+    State(protocol): State<SharedDaemonProtocol>,
+    headers: HeaderMap,
+    request: Result<Json<PairDeviceRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match request {
+        Ok(request) => request,
+        Err(_) => return invalid_json_error(),
+    };
+    let ticket = match authorization_credential(&headers, "TermdPair") {
+        Ok(ticket) => ticket,
+        Err(response) => return response,
+    };
+    let now_ms = current_unix_timestamp_millis();
+    let mut protocol = protocol.lock().await;
+    match protocol.pair_device_certificate(
+        ticket,
+        request.device_id,
+        request.device_public_key,
+        now_ms,
+    ) {
+        Ok(device_certificate) => (
+            StatusCode::OK,
+            Json(PairDeviceResponse {
+                server_id: protocol.server_id(),
+                device_id: request.device_id,
+                device_certificate,
+            }),
+        )
+            .into_response(),
+        Err(_) => api_error(
+            StatusCode::UNAUTHORIZED,
+            "pair_ticket_invalid",
+            "pair ticket is invalid or expired",
+            false,
+        ),
+    }
+}
+
+async fn auth_challenge(
+    State(protocol): State<SharedDaemonProtocol>,
+    headers: HeaderMap,
+    request: Result<Json<DeviceChallengeRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match request {
+        Ok(request) => request,
+        Err(_) => return invalid_json_error(),
+    };
+    let certificate = match authorization_credential(&headers, "TermdDevice") {
+        Ok(certificate) => certificate,
+        Err(response) => return response,
+    };
+    let mut protocol = protocol.lock().await;
+    match protocol.issue_access_token_challenge(
+        certificate,
+        request.device_id,
+        current_unix_timestamp_millis(),
+    ) {
+        Ok(challenge) => (StatusCode::OK, Json(challenge)).into_response(),
+        Err(_) => api_error(
+            StatusCode::UNAUTHORIZED,
+            "device_certificate_invalid",
+            "device certificate is invalid or revoked",
+            false,
+        ),
+    }
+}
+
+async fn auth_access_token(
+    State(protocol): State<SharedDaemonProtocol>,
+    headers: HeaderMap,
+    payload: Result<Json<termd_proto::AuthPayload>, JsonRejection>,
+) -> Response {
+    let Json(payload) = match payload {
+        Ok(payload) => payload,
+        Err(_) => return invalid_json_error(),
+    };
+    let certificate = match authorization_credential(&headers, "TermdDevice") {
+        Ok(certificate) => certificate,
+        Err(response) => return response,
+    };
+    let now_ms = current_unix_timestamp_millis();
+    let mut protocol = protocol.lock().await;
+    match protocol.exchange_access_token(certificate, payload, now_ms) {
+        Ok((access_token, expires_at_ms)) => (
+            StatusCode::OK,
+            Json(AccessTokenResponse {
+                access_token,
+                token_type: "Bearer",
+                issued_at_ms: now_ms,
+                expires_at_ms,
+                refresh_at_ms: UnixTimestampMillis(expires_at_ms.0.saturating_sub(60_000)),
+            }),
+        )
+            .into_response(),
+        Err(_) => api_error(
+            StatusCode::UNAUTHORIZED,
+            "device_proof_invalid",
+            "device private-key proof is invalid",
+            false,
+        ),
+    }
+}
+
+async fn auth_device_certificate_migrate(
+    State(protocol): State<SharedDaemonProtocol>,
+    payload: Result<Json<termd_proto::AuthPayload>, JsonRejection>,
+) -> Response {
+    let Json(payload) = match payload {
+        Ok(payload) => payload,
+        Err(_) => return invalid_json_error(),
+    };
+    let mut protocol = protocol.lock().await;
+    match protocol.migrate_device_certificate(payload, current_unix_timestamp_millis()) {
+        Ok(device_certificate) => (
+            StatusCode::OK,
+            Json(DeviceCertificateResponse { device_certificate }),
+        )
+            .into_response(),
+        Err(_) => api_error(
+            StatusCode::UNAUTHORIZED,
+            "device_migration_proof_invalid",
+            "device migration proof is invalid or expired",
+            false,
+        ),
+    }
+}
+
+async fn auth_device_certificate_migration_challenge(
+    State(protocol): State<SharedDaemonProtocol>,
+    request: Result<Json<DeviceChallengeRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match request {
+        Ok(request) => request,
+        Err(_) => return invalid_json_error(),
+    };
+    let mut protocol = protocol.lock().await;
+    match protocol.issue_device_certificate_migration_challenge(
+        request.device_id,
+        current_unix_timestamp_millis(),
+    ) {
+        Ok(challenge) => (StatusCode::OK, Json(challenge)).into_response(),
+        Err(_) => api_error(
+            StatusCode::UNAUTHORIZED,
+            "device_migration_not_allowed",
+            "device is not eligible for credential migration",
+            false,
+        ),
+    }
+}
+
+fn invalid_json_error() -> Response {
+    api_error(
+        StatusCode::BAD_REQUEST,
+        "invalid_json",
+        "request body must be valid JSON",
+        false,
+    )
+}
+
+fn websocket_access_token(headers: &HeaderMap) -> Option<&str> {
+    let mut protocols = headers
+        .get("sec-websocket-protocol")?
+        .to_str()
+        .ok()?
+        .split(',')
+        .map(str::trim);
+    if protocols.next()? != "termd.v0.7" {
+        return None;
+    }
+    protocols
+        .next()
+        .filter(|token| token.split('.').count() == 3 && !token.contains(char::is_whitespace))
+}
+
+async fn authorize_workspace_websocket(
+    protocol: &SharedDaemonProtocol,
+    headers: &HeaderMap,
+) -> Result<DeviceId, Response> {
+    let token = websocket_access_token(headers).ok_or_else(|| {
+        api_error(
+            StatusCode::UNAUTHORIZED,
+            "access_token_required",
+            "a valid access token is required",
+            false,
+        )
+    })?;
+    protocol
+        .lock()
+        .await
+        .verify_access_token_credential(token, current_unix_timestamp_millis())
+        .map_err(|_| {
+            api_error(
+                StatusCode::UNAUTHORIZED,
+                "access_token_invalid",
+                "access token is invalid or expired",
+                false,
+            )
+        })
+}
+
+async fn metadata_ws_handler(
+    State(protocol): State<SharedDaemonProtocol>,
+    headers: HeaderMap,
+    websocket: WebSocketUpgrade,
+) -> Response {
+    let device_id = match authorize_workspace_websocket(&protocol, &headers).await {
+        Ok(device_id) => device_id,
+        Err(response) => return response,
+    };
+    websocket
+        .protocols(["termd.v0.7"])
+        .on_upgrade(move |socket| run_metadata_websocket(socket, protocol, device_id))
+        .into_response()
+}
+
+async fn run_metadata_websocket(
+    mut socket: WebSocket,
+    protocol: SharedDaemonProtocol,
+    device_id: DeviceId,
+) {
+    let mut revision = 1_u64;
+    let (mut changes, mut previous) = {
+        let mut guard = protocol.lock().await;
+        let changes = guard.v070_metadata_signal();
+        let payload = match guard.v070_metadata_payload(device_id) {
+            Ok(payload) => payload,
+            Err(_) => return,
+        };
+        (changes, payload)
+    };
+    if send_v070_json(
+        &mut socket,
+        "metadata.snapshot",
+        serde_json::json!({"revision": revision, "state": previous}),
+    )
+    .await
+    .is_err()
+    {
+        return;
+    }
+    loop {
+        tokio::select! {
+            incoming = socket.recv() => match incoming {
+                Some(Ok(Message::Text(raw))) => {
+                    if serde_json::from_str::<Value>(&raw).ok()
+                        .and_then(|value| value.get("type").and_then(Value::as_str).map(str::to_owned))
+                        .as_deref() == Some("metadata.ping")
+                    {
+                        let _ = send_v070_json(&mut socket, "metadata.pong", serde_json::json!({
+                            "server_time_ms": current_unix_timestamp_millis()
+                        })).await;
+                    }
+                }
+                Some(Ok(Message::Ping(bytes))) => {
+                    if socket.send(Message::Pong(bytes)).await.is_err() { break; }
+                }
+                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                _ => {}
+            },
+            changed = changes.changed() => {
+                if changed.is_err() { break; }
+                let current = match protocol.lock().await.v070_metadata_payload(device_id) {
+                    Ok(payload) => payload,
+                    Err(_) => break,
+                };
+                if current != previous {
+                    revision = revision.saturating_add(1);
+                    previous = current.clone();
+                    if send_v070_json(
+                        &mut socket,
+                        "metadata.update",
+                        serde_json::json!({"revision": revision, "state": current}),
+                    ).await.is_err() { break; }
+                }
+            }
+        }
+    }
+}
+
+async fn terminal_ws_handler(
+    State(protocol): State<SharedDaemonProtocol>,
+    headers: HeaderMap,
+    websocket: WebSocketUpgrade,
+) -> Response {
+    let device_id = match authorize_workspace_websocket(&protocol, &headers).await {
+        Ok(device_id) => device_id,
+        Err(response) => return response,
+    };
+    websocket
+        .protocols(["termd.v0.7"])
+        .on_upgrade(move |socket| run_terminal_websocket(socket, protocol, device_id))
+        .into_response()
+}
+
+async fn run_terminal_websocket(
+    mut socket: WebSocket,
+    protocol: SharedDaemonProtocol,
+    device_id: DeviceId,
+) {
+    let first = match tokio::time::timeout(Duration::from_secs(30), socket.recv()).await {
+        Ok(Some(Ok(Message::Text(raw)))) => raw,
+        _ => return,
+    };
+    let command: Value = match serde_json::from_str(&first) {
+        Ok(command) => command,
+        Err(_) => return,
+    };
+    let payload = command.get("payload").cloned().unwrap_or(Value::Null);
+    let open: Result<V070TerminalOpen, ()> = match command.get("type").and_then(Value::as_str) {
+        Some("terminal.create") => serde_json::from_value(payload)
+            .map(V070TerminalOpen::Create)
+            .map_err(|_| ()),
+        Some("terminal.attach") => serde_json::from_value(payload)
+            .map(V070TerminalOpen::Attach)
+            .map_err(|_| ()),
+        _ => Err(()),
+    };
+    let Ok(open) = open else {
+        let _ = send_v070_socket_error(
+            &mut socket,
+            "invalid_terminal_open",
+            "terminal open command is invalid",
+        )
+        .await;
+        return;
+    };
+    let mut connection = ProtocolConnection::authenticated_v070_terminal(device_id);
+    let opened = {
+        let mut guard = protocol.lock().await;
+        match guard.open_v070_terminal(&mut connection, open) {
+            Ok(opened) => opened,
+            Err(error) => {
+                drop(guard);
+                let _ =
+                    send_v070_socket_error(&mut socket, error.code(), error.safe_message()).await;
+                return;
+            }
+        }
+    };
+    let session_id = opened.snapshot.session_id;
+    let send_open = if let Some(created) = opened.created {
+        send_v070_json(&mut socket, "terminal.created", created).await
+    } else if let Some(attached) = opened.attached {
+        send_v070_json(&mut socket, "terminal.attached", attached).await
+    } else {
+        return;
+    };
+    if send_open.is_err()
+        || send_v070_json(&mut socket, "terminal.snapshot", opened.snapshot)
+            .await
+            .is_err()
+        || flush_v070_terminal_frames(&mut socket, &protocol, &mut connection, session_id)
+            .await
+            .is_err()
+    {
+        close_v070_terminal_connection(&protocol, &mut connection).await;
+        return;
+    }
+    let mut output = tokio::time::interval(Duration::from_millis(16));
+    output.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            incoming = socket.recv() => match incoming {
+                Some(Ok(Message::Binary(bytes))) => {
+                    let result = {
+                        let mut guard = protocol.lock().await;
+                        connection.write_v070_terminal_frame(&mut *guard, session_id, &bytes)
+                    };
+                    if result.is_err() { break; }
+                }
+                Some(Ok(Message::Ping(bytes))) => {
+                    if socket.send(Message::Pong(bytes)).await.is_err() { break; }
+                }
+                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                Some(Ok(Message::Text(_))) => {
+                    let _ = send_v070_socket_error(&mut socket, "terminal_binary_required", "terminal stream commands must use binary supervisor frames").await;
+                }
+                _ => {}
+            },
+            _ = output.tick() => {
+                if flush_v070_terminal_frames(&mut socket, &protocol, &mut connection, session_id).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+    close_v070_terminal_connection(&protocol, &mut connection).await;
+}
+
+async fn flush_v070_terminal_frames(
+    socket: &mut WebSocket,
+    protocol: &SharedDaemonProtocol,
+    connection: &mut ProtocolConnection,
+    session_id: SessionId,
+) -> Result<(), ()> {
+    let frames = {
+        let mut guard = protocol.lock().await;
+        connection
+            .drain_v070_terminal_frames(&mut *guard, session_id)
+            .map_err(|_| ())?
+    };
+    for frame in frames {
+        socket.send(Message::Binary(frame)).await.map_err(|_| ())?;
+    }
+    Ok(())
+}
+
+async fn close_v070_terminal_connection(
+    protocol: &SharedDaemonProtocol,
+    connection: &mut ProtocolConnection,
+) {
+    let mut guard = protocol.lock().await;
+    connection.close(&mut *guard);
+}
+
+async fn send_v070_json<T: Serialize>(
+    socket: &mut WebSocket,
+    kind: &'static str,
+    payload: T,
+) -> Result<(), axum::Error> {
+    socket
+        .send(Message::Text(
+            serde_json::to_string(&serde_json::json!({"type": kind, "payload": payload}))
+                .map_err(axum::Error::new)?,
+        ))
+        .await
+}
+
+async fn send_v070_socket_error(
+    socket: &mut WebSocket,
+    code: &'static str,
+    message: &'static str,
+) -> Result<(), axum::Error> {
+    send_v070_json(
+        socket,
+        "error",
+        serde_json::json!({
+            "code": code,
+            "message": message,
+            "retryable": false,
+        }),
+    )
+    .await
 }
 
 fn is_api_fallback_path(path: &str) -> bool {
@@ -637,50 +811,433 @@ fn http_control_api_router() -> Router<SharedDaemonProtocol> {
 
 fn http_file_api_router() -> Router<SharedDaemonProtocol> {
     Router::new()
-        .route("/api/files/upload/init", post(http_file_upload_init))
-        .route("/api/files/upload", post(http_file_upload_stream))
-        .route("/api/files/upload/abort", post(http_file_upload_abort))
-        .route("/api/files/download", post(http_file_download))
-        // 中文注释：CORS 只允许挂在文件 HTTP 通道上，不能把本地配对等管理端点一起暴露出去。
+        .route(
+            "/api/files/uploads",
+            post(v070_file_upload_create).merge(options(v070_preflight)),
+        )
+        .route(
+            "/api/files/uploads/:id/chunks",
+            put(v070_file_upload_chunk).merge(options(v070_preflight)),
+        )
+        .route(
+            "/api/files/uploads/:id/commit",
+            post(v070_file_upload_commit).merge(options(v070_preflight)),
+        )
+        .route(
+            "/api/files/uploads/:id/abort",
+            post(v070_file_upload_abort).merge(options(v070_preflight)),
+        )
+        .route(
+            "/api/files/downloads",
+            post(v070_file_download_create).merge(options(v070_preflight)),
+        )
+        .route(
+            "/api/files/downloads/:id",
+            get(v070_file_download_read).merge(options(v070_preflight)),
+        )
         .route_layer(http_file_api_cors_layer())
 }
 
+async fn v070_preflight() -> StatusCode {
+    StatusCode::NO_CONTENT
+}
+
+async fn authorize_v070_http_device(
+    protocol: &SharedDaemonProtocol,
+    headers: &HeaderMap,
+) -> Result<DeviceId, Response> {
+    let access_token = authorization_credential(headers, "Bearer")?;
+    protocol
+        .lock()
+        .await
+        .verify_access_token_credential(access_token, current_unix_timestamp_millis())
+        .map_err(|_| {
+            api_error(
+                StatusCode::UNAUTHORIZED,
+                "access_token_invalid",
+                "access token is invalid or expired",
+                false,
+            )
+        })
+}
+
+async fn v070_file_upload_create(
+    State(protocol): State<SharedDaemonProtocol>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let device_id = match authorize_v070_http_device(&protocol, &headers).await {
+        Ok(device_id) => device_id,
+        Err(response) => return response,
+    };
+    let payload: SessionFileUploadPayload = match read_v070_json_body(body).await {
+        Ok(payload) => payload,
+        Err(response) => return response,
+    };
+    let mut guard = protocol.lock().await;
+    let mut connection = ProtocolConnection::authenticated_http(device_id);
+    if let Err(error) = guard.restore_http_control_scope(&mut connection, payload.session_id) {
+        return v070_protocol_error(error);
+    }
+    let response = guard.prepare_session_file_http_upload(&connection, payload, device_id);
+    connection.close(&mut guard);
+    match response {
+        Ok(ready) => (StatusCode::CREATED, Json(ready)).into_response(),
+        Err(error) => v070_protocol_error(error),
+    }
+}
+
+async fn v070_file_upload_chunk(
+    State(protocol): State<SharedDaemonProtocol>,
+    Path(upload_id): Path<String>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let device_id = match authorize_v070_http_device(&protocol, &headers).await {
+        Ok(device_id) => device_id,
+        Err(response) => return response,
+    };
+    let bytes = match to_bytes(body, V070_FILE_CHUNK_MAX_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return api_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "payload_too_large",
+                "file chunk is too large",
+                false,
+            );
+        }
+    };
+    let (offset_bytes, size_bytes) = match v070_content_range(&headers, bytes.len()) {
+        Ok(range) => range,
+        Err(response) => return response,
+    };
+    let mut guard = protocol.lock().await;
+    let mut connection = ProtocolConnection::authenticated_http(device_id);
+    let payload =
+        match guard.v070_session_file_http_upload_payload(&connection, &upload_id, offset_bytes) {
+            Ok(payload) if payload.size_bytes == size_bytes => payload,
+            Ok(_) => {
+                return api_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_content_range",
+                    "content range does not match upload size",
+                    false,
+                );
+            }
+            Err(error) => return v070_protocol_error(error),
+        };
+    if let Err(error) = guard.restore_http_control_scope(&mut connection, payload.session_id) {
+        return v070_protocol_error(error);
+    }
+    let response = guard.write_session_file_http_upload(
+        &connection,
+        payload,
+        device_id,
+        if bytes.is_empty() {
+            Vec::new()
+        } else {
+            vec![bytes.to_vec()]
+        },
+    );
+    connection.close(&mut guard);
+    match response {
+        Ok(progress) => (StatusCode::OK, Json(progress)).into_response(),
+        Err(error) => v070_protocol_error(error),
+    }
+}
+
+async fn v070_file_upload_commit(
+    State(protocol): State<SharedDaemonProtocol>,
+    Path(upload_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let device_id = match authorize_v070_http_device(&protocol, &headers).await {
+        Ok(device_id) => device_id,
+        Err(response) => return response,
+    };
+    let mut guard = protocol.lock().await;
+    let mut connection = ProtocolConnection::authenticated_http(device_id);
+    let payload = match guard.v070_session_file_http_upload_payload(&connection, &upload_id, 0) {
+        Ok(payload) => payload,
+        Err(error) => return v070_protocol_error(error),
+    };
+    if let Err(error) = guard.restore_http_control_scope(&mut connection, payload.session_id) {
+        return v070_protocol_error(error);
+    }
+    if payload.size_bytes == 0
+        && let Err(error) = guard.write_session_file_http_upload(
+            &connection,
+            payload,
+            device_id,
+            Vec::<Vec<u8>>::new(),
+        )
+    {
+        return v070_protocol_error(error);
+    }
+    let response = guard.v070_session_file_http_upload_progress(&connection, &upload_id);
+    connection.close(&mut guard);
+    match response {
+        Ok(progress) => (StatusCode::OK, Json(progress)).into_response(),
+        Err(error) => v070_protocol_error(error),
+    }
+}
+
+async fn v070_file_upload_abort(
+    State(protocol): State<SharedDaemonProtocol>,
+    Path(upload_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let device_id = match authorize_v070_http_device(&protocol, &headers).await {
+        Ok(device_id) => device_id,
+        Err(response) => return response,
+    };
+    let mut guard = protocol.lock().await;
+    let mut connection = ProtocolConnection::authenticated_http(device_id);
+    let payload = match guard.v070_session_file_http_upload_payload(&connection, &upload_id, 0) {
+        Ok(payload) => payload,
+        Err(error) => return v070_protocol_error(error),
+    };
+    if let Err(error) = guard.restore_http_control_scope(&mut connection, payload.session_id) {
+        return v070_protocol_error(error);
+    }
+    let response = guard.v070_abort_session_file_http_upload(&connection, &upload_id);
+    connection.close(&mut guard);
+    match response {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "upload_id": upload_id, "aborted": true })),
+        )
+            .into_response(),
+        Err(error) => v070_protocol_error(error),
+    }
+}
+
+async fn v070_file_download_create(
+    State(protocol): State<SharedDaemonProtocol>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let device_id = match authorize_v070_http_device(&protocol, &headers).await {
+        Ok(device_id) => device_id,
+        Err(response) => return response,
+    };
+    let payload: SessionFileDownloadPreparePayload = match read_v070_json_body(body).await {
+        Ok(payload) => payload,
+        Err(response) => return response,
+    };
+    let mut guard = protocol.lock().await;
+    let mut connection = ProtocolConnection::authenticated_http(device_id);
+    if let Err(error) = guard.restore_http_control_scope(&mut connection, payload.session_id) {
+        return v070_protocol_error(error);
+    }
+    let response = guard.prepare_v070_session_file_download(&connection, payload);
+    connection.close(&mut guard);
+    match response {
+        Ok(ready) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({
+                "download_id": ready.token,
+                "session_id": ready.session_id,
+                "path": ready.path,
+                "size_bytes": ready.size_bytes,
+                "modified_at_ms": ready.modified_at_ms,
+                "expires_at_ms": ready.expires_at_ms,
+            })),
+        )
+            .into_response(),
+        Err(error) => v070_protocol_error(error),
+    }
+}
+
+async fn v070_file_download_read(
+    State(protocol): State<SharedDaemonProtocol>,
+    Path(download_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = authorize_v070_http_device(&protocol, &headers).await {
+        return response;
+    }
+    let grant = match protocol
+        .lock()
+        .await
+        .consume_session_file_download(&download_id, current_unix_timestamp_millis())
+    {
+        Ok(grant) => grant,
+        Err(error) => return v070_protocol_error(error),
+    };
+    let file = match fs::File::open(&grant.path) {
+        Ok(file) => file,
+        Err(_) => {
+            return api_error(
+                StatusCode::NOT_FOUND,
+                "file_not_found",
+                "file was not found",
+                false,
+            );
+        }
+    };
+    let stream = futures_util::stream::unfold(
+        (file, grant.size_bytes),
+        |(mut file, mut remaining)| async move {
+            if remaining == 0 {
+                return None;
+            }
+            let mut chunk = vec![0_u8; (remaining as usize).min(256 * 1024)];
+            match file.read(&mut chunk) {
+                Ok(0) => Some((
+                    Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "file ended early",
+                    )),
+                    (file, 0),
+                )),
+                Ok(read) => {
+                    chunk.truncate(read);
+                    remaining = remaining.saturating_sub(read as u64);
+                    Some((
+                        Ok::<Bytes, io::Error>(Bytes::from(chunk)),
+                        (file, remaining),
+                    ))
+                }
+                Err(error) => Some((Err(error), (file, 0))),
+            }
+        },
+    );
+    (
+        StatusCode::OK,
+        [(CONTENT_TYPE, "application/octet-stream")],
+        Body::from_stream(stream),
+    )
+        .into_response()
+}
+
+async fn read_v070_json_body<T: for<'de> Deserialize<'de>>(body: Body) -> Result<T, Response> {
+    let bytes = to_bytes(body, HTTP_JSON_MAX_BYTES).await.map_err(|_| {
+        api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "payload_too_large",
+            "JSON request body is too large",
+            false,
+        )
+    })?;
+    serde_json::from_slice(&bytes).map_err(|_| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_json",
+            "request body is invalid JSON",
+            false,
+        )
+    })
+}
+
+fn v070_content_range(headers: &HeaderMap, body_len: usize) -> Result<(u64, u64), Response> {
+    let value = headers
+        .get("content-range")
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "content_range_required",
+                "Content-Range is required",
+                false,
+            )
+        })?;
+    let value = value.strip_prefix("bytes ").ok_or_else(|| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_content_range",
+            "Content-Range is invalid",
+            false,
+        )
+    })?;
+    if value == "*/0" && body_len == 0 {
+        return Ok((0, 0));
+    }
+    let (range, total) = value.split_once('/').ok_or_else(|| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_content_range",
+            "Content-Range is invalid",
+            false,
+        )
+    })?;
+    let (start, end) = range.split_once('-').ok_or_else(|| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_content_range",
+            "Content-Range is invalid",
+            false,
+        )
+    })?;
+    let start = start.parse::<u64>().map_err(|_| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_content_range",
+            "Content-Range is invalid",
+            false,
+        )
+    })?;
+    let end = end.parse::<u64>().map_err(|_| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_content_range",
+            "Content-Range is invalid",
+            false,
+        )
+    })?;
+    let total = total.parse::<u64>().map_err(|_| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_content_range",
+            "Content-Range is invalid",
+            false,
+        )
+    })?;
+    if end < start || end.saturating_sub(start).saturating_add(1) != body_len as u64 || end >= total
+    {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_content_range",
+            "Content-Range is invalid",
+            false,
+        ));
+    }
+    Ok((start, total))
+}
+
+fn v070_protocol_error(error: ProtocolError) -> Response {
+    api_error(
+        StatusCode::BAD_REQUEST,
+        error.code(),
+        error.safe_message(),
+        false,
+    )
+}
+
 fn http_control_api_cors_layer() -> CorsLayer {
-    // 中文注释：control plane 允许跨源 Web 前端携带 bearer token 和 session scope 头。
-    // 真正的认证仍由 session token、scope token 与 HTTP E2EE 完成。
+    // v0.7 control plane 只允许 bearer JSON 请求和 relay 路由所需的 server id。
     CorsLayer::new()
         .allow_origin(Any)
-        .allow_methods([Method::POST, Method::OPTIONS])
+        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::OPTIONS])
         .allow_headers([
+            HeaderName::from_static("content-range"),
             CONTENT_TYPE,
             HeaderName::from_static("authorization"),
             HeaderName::from_static("x-termd-server-id"),
-            HeaderName::from_static("x-termd-device-id"),
-            HeaderName::from_static("x-termd-session-scope"),
-            HeaderName::from_static("x-termd-relay-admission"),
-            HeaderName::from_static("x-termd-e2ee-public-key"),
-            HeaderName::from_static("x-termd-e2ee-nonce"),
-            HeaderName::from_static("x-termd-e2ee-timestamp-ms"),
-            HeaderName::from_static("x-termd-e2ee-signature"),
         ])
 }
 
 fn http_file_api_cors_layer() -> CorsLayer {
-    // 中文注释：文件上传/下载的 HTTP E2EE 通道会带自定义签名头，浏览器在跨源预览或
-    // 分离部署时一定会先发 OPTIONS 预检。这里仅放开文件 API 所需的 method/header；
-    // 真正的访问控制仍由设备签名、nonce 和 session attach 校验负责。
+    // 文件上传/下载允许 bearer、JSON、range 和 relay 路由所需的 server id。
     CorsLayer::new()
         .allow_origin(Any)
-        .allow_methods([Method::POST, Method::OPTIONS])
+        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::OPTIONS])
         .allow_headers([
+            HeaderName::from_static("authorization"),
+            HeaderName::from_static("content-range"),
             CONTENT_TYPE,
             HeaderName::from_static("x-termd-server-id"),
-            HeaderName::from_static("x-termd-device-id"),
-            HeaderName::from_static("x-termd-relay-admission"),
-            HeaderName::from_static("x-termd-e2ee-public-key"),
-            HeaderName::from_static("x-termd-e2ee-nonce"),
-            HeaderName::from_static("x-termd-e2ee-timestamp-ms"),
-            HeaderName::from_static("x-termd-e2ee-signature"),
         ])
 }
 
@@ -715,7 +1272,7 @@ fn listen_addr_from_config(config: &DaemonConfig) -> Result<SocketAddr, ServerEr
 
 /// 使用调用方已经绑定好的 listener 启动 daemon HTTP 服务。
 ///
-/// 该函数只服务网络启动边界，方便集成测试使用随机端口；auth、session 和 E2EE 语义仍全部
+/// 该函数只服务网络启动边界，方便集成测试使用随机端口；auth 和 session 语义仍全部
 /// 留在 `DaemonProtocol` 中，避免为了测试放宽生产协议。
 pub async fn serve_listener(
     listener: TcpListener,
@@ -738,7 +1295,7 @@ pub async fn serve_tls_listener(
 ) -> Result<(), ServerError> {
     let tls_config = load_rustls_server_config(&tls_paths)?;
 
-    // TLS 只替换 transport accept 层；router 和协议状态机保持同一套路径与 E2EE 规则。
+    // TLS 只替换 transport accept 层；router 和协议状态机保持同一套认证与 session 规则。
     serve_rustls_listener(listener, router(protocol, web_enabled), tls_config).await
 }
 
@@ -884,7 +1441,15 @@ async fn healthz(State(protocol): State<SharedDaemonProtocol>) -> Json<HealthzPa
         status: "ok",
         protocol_version: ProtocolVersion(PROTOCOL_PACKET_VERSION),
         server_id: protocol.server_id(),
+        daemon_public_key: protocol.daemon_public_identity().public_key.clone(),
     })
+}
+
+fn pairing_ws_url_from_config(config: &DaemonConfig, server_id: ServerId) -> String {
+    config
+        .default_pairing_ws_url
+        .trim()
+        .replace("{server_id}", &server_id.0.to_string())
 }
 
 async fn local_pairing_token(
@@ -904,13 +1469,12 @@ async fn local_pairing_token(
     }
 
     let now_ms = current_unix_timestamp_millis();
-    let mut protocol = protocol.lock().await;
+    let protocol = protocol.lock().await;
     let ttl_ms = protocol.config().pairing_token_ttl_ms;
     let server_id = protocol.server_id();
     let daemon_public_key = protocol.daemon_public_identity().public_key.clone();
     let ws_url = pairing_ws_url_from_config(protocol.config(), server_id);
-    let config = protocol.config().clone();
-    let record = match protocol.issue_pairing_token(now_ms) {
+    let (token, expires_at_ms) = match protocol.issue_pair_ticket_credential(now_ms) {
         Ok(record) => record,
         Err(error) => {
             // PairingError 不包含 token 明文；日志仍只记录脱敏失败原因。
@@ -925,23 +1489,7 @@ async fn local_pairing_token(
                 .into_response();
         }
     };
-    let token = record.token().clone();
-    let expires_at_ms = record.expires_at_ms();
     drop(protocol);
-    if let Err(error) =
-        register_relay_pair_ticket_from_config(&config, server_id, token.clone(), expires_at_ms)
-            .await
-    {
-        warn!(%error, "failed to register pairing ticket with relay");
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorPayload {
-                code: "relay_pair_ticket_unavailable".to_owned(),
-                message: "pairing ticket could not be registered with relay".to_owned(),
-            }),
-        )
-            .into_response();
-    }
 
     (
         StatusCode::OK,
@@ -957,78 +1505,126 @@ async fn local_pairing_token(
         .into_response()
 }
 
-async fn http_file_upload_init(
-    State(protocol): State<SharedDaemonProtocol>,
-    method: Method,
-    uri: Uri,
-    headers: HeaderMap,
-    body: Body,
-) -> Response {
-    let auth = match http_e2ee_auth_from_headers(&headers, &method, uri.path()) {
-        Ok(auth) => auth,
-        Err(response) => return response,
-    };
-    let body = match read_http_e2ee_short_body(body).await {
-        Ok(body) => body,
-        Err(error) => return http_e2ee_error(StatusCode::BAD_REQUEST, error),
-    };
-    let mut protocol = protocol.lock().await;
-    let (device_id, mut e2ee) = match protocol.open_http_e2ee_session(auth) {
-        Ok(result) => result,
-        Err(error) => return http_e2ee_error(StatusCode::UNAUTHORIZED, error),
-    };
-    let payload: SessionFileUploadPayload = match decrypt_single_http_e2ee_json(&mut e2ee, &body) {
-        Ok(payload) => payload,
-        Err(error) => return http_e2ee_error(StatusCode::BAD_REQUEST, error),
-    };
-    let mut connection = ProtocolConnection::authenticated_http(device_id);
-    if let Err(error) = protocol.attach_session(
-        &mut connection,
-        SessionAttachPayload {
-            session_id: payload.session_id,
-            watch_updates: false,
-            last_terminal_seq: None,
-        },
-    ) {
-        return http_e2ee_encrypted_error(&mut e2ee, StatusCode::BAD_REQUEST, error);
-    }
-    let response = match protocol.prepare_session_file_http_upload(&connection, payload, device_id)
-    {
-        Ok(ready) => match encrypt_single_http_e2ee_json(&mut e2ee, &ready) {
-            Ok(body) => (StatusCode::OK, body).into_response(),
-            Err(error) => http_e2ee_error(StatusCode::INTERNAL_SERVER_ERROR, error),
-        },
-        Err(error) => http_e2ee_encrypted_error(&mut e2ee, StatusCode::BAD_REQUEST, error),
-    };
-    connection.close(&mut protocol);
-    response
-}
-
 async fn http_control_request(
     State(protocol): State<SharedDaemonProtocol>,
     Path(path): Path<String>,
-    http_method: Method,
+    _http_method: Method,
     uri: Uri,
     headers: HeaderMap,
     body: Body,
 ) -> Response {
+    if is_removed_v070_http_control_path(uri.path()) {
+        return api_error(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "application route was not found",
+            false,
+        );
+    }
     if !is_http_control_tunnel_path_allowed(uri.path()) {
-        return StatusCode::NOT_FOUND.into_response();
+        return api_error(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "application route was not found",
+            false,
+        );
     }
     let (method, session_scope_session_id) = match parse_http_control_path(&path) {
         Ok(parsed) => parsed,
-        Err(error) => return http_e2ee_error(StatusCode::BAD_REQUEST, error),
+        Err(error) => return v070_protocol_error(error),
     };
-    handle_http_control_request(
-        protocol,
-        method,
-        session_scope_session_id,
-        http_method,
-        uri,
-        headers,
-        body,
-    )
-    .await
+    handle_v070_json_control_request(protocol, method, session_scope_session_id, headers, body)
+        .await
+}
+
+async fn handle_v070_json_control_request(
+    protocol: SharedDaemonProtocol,
+    method: String,
+    session_id: Option<SessionId>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let access_token = match authorization_credential(&headers, "Bearer") {
+        Ok(token) => token,
+        Err(response) => return response,
+    };
+    let body = match to_bytes(body, HTTP_JSON_MAX_BYTES).await {
+        Ok(body) => body,
+        Err(_) => {
+            return api_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "payload_too_large",
+                "JSON request body is too large",
+                false,
+            );
+        }
+    };
+    let mut payload: Value = match serde_json::from_slice(&body) {
+        Ok(payload @ Value::Object(_)) => payload,
+        _ => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_json",
+                "request body must be a JSON object",
+                false,
+            );
+        }
+    };
+
+    let mut protocol_guard = protocol.lock().await;
+    let device_id = match protocol_guard
+        .verify_access_token_credential(access_token, current_unix_timestamp_millis())
+    {
+        Ok(device_id) => device_id,
+        Err(_) => {
+            return api_error(
+                StatusCode::UNAUTHORIZED,
+                "access_token_invalid",
+                "access token is invalid or expired",
+                false,
+            );
+        }
+    };
+    if let Some(session_id) = session_id {
+        payload
+            .as_object_mut()
+            .expect("validated JSON object")
+            .insert("session_id".to_owned(), serde_json::json!(session_id));
+    }
+
+    let mut connection = ProtocolConnection::authenticated_http(device_id);
+    if let Some(session_id) = session_id
+        && let Err(error) = protocol_guard.restore_http_control_scope(&mut connection, session_id)
+    {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            error.code(),
+            error.safe_message(),
+            false,
+        );
+    }
+    let response = connection.dispatch_v070_http_control(&mut protocol_guard, &method, payload);
+    connection.close(&mut protocol_guard);
+    match response {
+        Ok(payload) => (StatusCode::OK, Json(payload)).into_response(),
+        Err(error) => api_error(
+            StatusCode::BAD_REQUEST,
+            error.code(),
+            error.safe_message(),
+            false,
+        ),
+    }
+}
+
+fn is_removed_v070_http_control_path(path: &str) -> bool {
+    path == "/api/control/session/list"
+        || path == "/api/control/daemon/clients"
+        || path == "/api/control/daemon/status"
+        || path.ends_with("/attach")
+        || path.ends_with("/cursor")
+        || path.ends_with("/resize")
+        || path.ends_with("/file_download_prepare")
+        || path.ends_with("/file_download_chunk")
 }
 
 fn parse_http_control_path(path: &str) -> Result<(String, Option<SessionId>), ProtocolError> {
@@ -1043,3060 +1639,19 @@ fn parse_http_control_path(path: &str) -> Result<(String, Option<SessionId>), Pr
         && segments[0] == "session"
         && let Ok(session_uuid) = segments[1].parse()
     {
-        let method = format!("session.{}", segments[2..].join("."));
+        let action = segments[2..].join(".");
+        let method = if action == "control" {
+            termd_proto::METHOD_CONTROL_REQUEST.to_owned()
+        } else {
+            format!("session.{action}")
+        };
         return Ok((method, Some(SessionId(session_uuid))));
     }
     Ok((segments.join("."), None))
 }
 
-async fn http_file_upload_stream(
-    State(protocol): State<SharedDaemonProtocol>,
-    method: Method,
-    uri: Uri,
-    headers: HeaderMap,
-    body: Body,
-) -> Response {
-    let auth = match http_e2ee_auth_from_headers(&headers, &method, uri.path()) {
-        Ok(auth) => auth,
-        Err(response) => return response,
-    };
-    let mut protocol_guard = protocol.lock().await;
-    let (device_id, mut e2ee) = match protocol_guard.open_http_e2ee_session(auth) {
-        Ok(result) => result,
-        Err(error) => return http_e2ee_error(StatusCode::UNAUTHORIZED, error),
-    };
-    drop(protocol_guard);
-    let mut stream = HttpE2eeBodyFrameStream::new(body);
-    let meta_frame = match read_http_e2ee_metadata_frame(&mut stream, &mut e2ee).await {
-        Ok(frame) => frame,
-        Err(error) => {
-            warn!(
-                code = error.code(),
-                "HTTP upload stream rejected metadata frame"
-            );
-            return http_e2ee_error(StatusCode::BAD_REQUEST, error);
-        }
-    };
-    let mut meta: SessionFileHttpUploadStreamPayload = match serde_json::from_slice(&meta_frame) {
-        Ok(meta) => meta,
-        Err(_) => {
-            return http_e2ee_encrypted_error(
-                &mut e2ee,
-                StatusCode::BAD_REQUEST,
-                ProtocolError::InvalidEnvelope,
-            );
-        }
-    };
-    let mut connection = ProtocolConnection::authenticated_http(device_id);
-    {
-        let mut protocol_guard = protocol.lock().await;
-        if let Err(error) = protocol_guard.attach_session(
-            &mut connection,
-            SessionAttachPayload {
-                session_id: meta.session_id,
-                watch_updates: false,
-                last_terminal_seq: None,
-            },
-        ) {
-            return http_e2ee_encrypted_error(&mut e2ee, StatusCode::BAD_REQUEST, error);
-        }
-    }
-    let mut connection_guard = HttpConnectionCloseGuard::new(protocol.clone(), connection);
-    let mut progress = None;
-    let mut saw_chunk = false;
-    loop {
-        let chunk = match stream.next_plaintext(&mut e2ee).await {
-            Ok(Some(chunk)) => chunk,
-            Ok(None) => break,
-            Err(error) => {
-                debug!(
-                    session_id = %meta.session_id.0,
-                    path = %meta.path,
-                    upload_id = %meta.upload_id,
-                    offset_bytes = meta.offset_bytes,
-                    code = error.code(),
-                    "HTTP upload stream rejected data frame detail"
-                );
-                warn!(
-                    session_id = %meta.session_id.0,
-                    upload_id = %meta.upload_id,
-                    offset_bytes = meta.offset_bytes,
-                    code = error.code(),
-                    "HTTP upload stream rejected data frame"
-                );
-                connection_guard.close_now().await;
-                return http_e2ee_encrypted_error(&mut e2ee, StatusCode::BAD_REQUEST, error);
-            }
-        };
-        saw_chunk = true;
-        let chunk_len = chunk.len() as u64;
-        match write_http_file_upload_chunks_without_protocol_io_lock(
-            protocol.clone(),
-            connection_guard.connection(),
-            meta.clone(),
-            device_id,
-            vec![chunk],
-        )
-        .await
-        {
-            Ok(update) => {
-                // 中文注释：update.offset_bytes 表示整个 upload_id 当前已收到多少字节；
-                // 2 并发乱序上传时它不是本 POST 的下一个 offset。当前请求内多个
-                // E2EE frame 必须只按本请求已消费的明文长度递增。
-                meta.offset_bytes = meta
-                    .offset_bytes
-                    .checked_add(chunk_len)
-                    .unwrap_or(meta.size_bytes);
-                progress = Some(update);
-            }
-            Err(error) => {
-                debug!(
-                    session_id = %meta.session_id.0,
-                    path = %meta.path,
-                    upload_id = %meta.upload_id,
-                    offset_bytes = meta.offset_bytes,
-                    chunk_len,
-                    code = error.code(),
-                    "HTTP upload stream write failed detail"
-                );
-                warn!(
-                    session_id = %meta.session_id.0,
-                    upload_id = %meta.upload_id,
-                    offset_bytes = meta.offset_bytes,
-                    chunk_len,
-                    code = error.code(),
-                    "HTTP upload stream write failed"
-                );
-                connection_guard.close_now().await;
-                return http_e2ee_encrypted_error(&mut e2ee, StatusCode::BAD_REQUEST, error);
-            }
-        }
-    }
-    if !saw_chunk && meta.offset_bytes == meta.size_bytes {
-        match write_http_file_upload_chunks_without_protocol_io_lock(
-            protocol.clone(),
-            connection_guard.connection(),
-            meta.clone(),
-            device_id,
-            Vec::new(),
-        )
-        .await
-        {
-            Ok(update) => progress = Some(update),
-            Err(error) => {
-                debug!(
-                    session_id = %meta.session_id.0,
-                    path = %meta.path,
-                    upload_id = %meta.upload_id,
-                    offset_bytes = meta.offset_bytes,
-                    code = error.code(),
-                    "HTTP empty upload stream write failed detail"
-                );
-                warn!(
-                    session_id = %meta.session_id.0,
-                    upload_id = %meta.upload_id,
-                    offset_bytes = meta.offset_bytes,
-                    code = error.code(),
-                    "HTTP empty upload stream write failed"
-                );
-                connection_guard.close_now().await;
-                return http_e2ee_encrypted_error(&mut e2ee, StatusCode::BAD_REQUEST, error);
-            }
-        }
-    }
-    let Some(progress) = progress else {
-        debug!(
-            session_id = %meta.session_id.0,
-            path = %meta.path,
-            upload_id = %meta.upload_id,
-            offset_bytes = meta.offset_bytes,
-            "HTTP upload stream ended without payload progress detail"
-        );
-        warn!(
-            session_id = %meta.session_id.0,
-            upload_id = %meta.upload_id,
-            offset_bytes = meta.offset_bytes,
-            "HTTP upload stream ended without payload progress"
-        );
-        connection_guard.close_now().await;
-        return http_e2ee_encrypted_error(
-            &mut e2ee,
-            StatusCode::BAD_REQUEST,
-            ProtocolError::InvalidEnvelope,
-        );
-    };
-    // 中文注释：HTTP 上传现在允许一个 upload_id 被多个分片 POST 顺序或并发提交；
-    // 非 eof 进度表示本次分片已落盘，不能再按旧单请求模型 abort。
-    connection_guard.close_now().await;
-    match encrypt_single_http_e2ee_json(&mut e2ee, &progress) {
-        Ok(body) => (StatusCode::OK, body).into_response(),
-        Err(error) => http_e2ee_error(StatusCode::INTERNAL_SERVER_ERROR, error),
-    }
-}
-
-async fn http_file_upload_abort(
-    State(protocol): State<SharedDaemonProtocol>,
-    method: Method,
-    uri: Uri,
-    headers: HeaderMap,
-    body: Body,
-) -> Response {
-    let auth = match http_e2ee_auth_from_headers(&headers, &method, uri.path()) {
-        Ok(auth) => auth,
-        Err(response) => return response,
-    };
-    let body = match read_http_e2ee_short_body(body).await {
-        Ok(body) => body,
-        Err(error) => return http_e2ee_error(StatusCode::BAD_REQUEST, error),
-    };
-    let mut protocol_guard = protocol.lock().await;
-    let (device_id, mut e2ee) = match protocol_guard.open_http_e2ee_session(auth) {
-        Ok(result) => result,
-        Err(error) => return http_e2ee_error(StatusCode::UNAUTHORIZED, error),
-    };
-    let payload: SessionFileHttpUploadStreamPayload =
-        match decrypt_single_http_e2ee_json(&mut e2ee, &body) {
-            Ok(payload) => payload,
-            Err(error) => return http_e2ee_error(StatusCode::BAD_REQUEST, error),
-        };
-    let mut connection = ProtocolConnection::authenticated_http(device_id);
-    if let Err(error) = protocol_guard.attach_session(
-        &mut connection,
-        SessionAttachPayload {
-            session_id: payload.session_id,
-            watch_updates: false,
-            last_terminal_seq: None,
-        },
-    ) {
-        return http_e2ee_encrypted_error(&mut e2ee, StatusCode::BAD_REQUEST, error);
-    }
-    let response = match protocol_guard.abort_session_file_http_upload(&connection, &payload) {
-        Ok(()) => match encrypt_single_http_e2ee_json(&mut e2ee, &payload) {
-            Ok(body) => (StatusCode::OK, body).into_response(),
-            Err(error) => http_e2ee_error(StatusCode::INTERNAL_SERVER_ERROR, error),
-        },
-        Err(error) => http_e2ee_encrypted_error(&mut e2ee, StatusCode::BAD_REQUEST, error),
-    };
-    connection.close(&mut protocol_guard);
-    response
-}
-
-async fn handle_http_control_request(
-    protocol: SharedDaemonProtocol,
-    method: String,
-    session_scope_session_id: Option<SessionId>,
-    http_method: Method,
-    uri: Uri,
-    headers: HeaderMap,
-    body: Body,
-) -> Response {
-    let auth = match http_bearer_control_auth_from_headers(&headers) {
-        Ok(auth) => auth,
-        Err(response) => return response,
-    };
-    let http_e2ee_auth =
-        match http_e2ee_auth_from_control_headers(&headers, &http_method, uri.path()) {
-            Ok(auth) => auth,
-            Err(response) => return response,
-        };
-    let body = match read_http_e2ee_short_body(body).await {
-        Ok(body) => body,
-        Err(error) => return http_e2ee_error(StatusCode::BAD_REQUEST, error),
-    };
-
-    let mut protocol_guard = protocol.lock().await;
-    let now_ms = current_unix_timestamp_millis();
-    let session_token = match protocol_guard.verify_session_token(&auth.session_token, now_ms) {
-        Ok(token) => token,
-        Err(_) => return http_e2ee_error(StatusCode::UNAUTHORIZED, ProtocolError::AuthFailed),
-    };
-    if session_token.server_id() != auth.server_id || session_token.device_id() != auth.device_id {
-        return http_e2ee_error(StatusCode::UNAUTHORIZED, ProtocolError::AuthFailed);
-    }
-    if auth.device_id != http_e2ee_auth.device_id {
-        return http_e2ee_error(StatusCode::UNAUTHORIZED, ProtocolError::AuthFailed);
-    }
-    let (device_id, mut e2ee) = match protocol_guard.open_http_e2ee_session(http_e2ee_auth) {
-        Ok(result) => result,
-        Err(error) => return http_e2ee_error(StatusCode::UNAUTHORIZED, error),
-    };
-    if device_id != auth.device_id {
-        return http_e2ee_error(StatusCode::UNAUTHORIZED, ProtocolError::AuthFailed);
-    }
-
-    let payload = match decrypt_single_http_e2ee_json::<serde_json::Value>(&mut e2ee, &body) {
-        Ok(payload) => payload,
-        Err(error) => return http_e2ee_error(StatusCode::BAD_REQUEST, error),
-    };
-
-    let mut connection = ProtocolConnection::authenticated_http(device_id);
-    if let Some(session_id) = session_scope_session_id {
-        let Some(scope_token) = auth.session_scope_token.as_ref() else {
-            return http_e2ee_encrypted_error(
-                &mut e2ee,
-                StatusCode::UNAUTHORIZED,
-                ProtocolError::AuthFailed,
-            );
-        };
-        let scope = match protocol_guard.verify_session_scope_token(scope_token, now_ms) {
-            Ok(scope) => scope,
-            Err(_) => {
-                return http_e2ee_encrypted_error(
-                    &mut e2ee,
-                    StatusCode::UNAUTHORIZED,
-                    ProtocolError::AuthFailed,
-                );
-            }
-        };
-        if scope.server_id() != auth.server_id
-            || scope.device_id() != auth.device_id
-            || scope.session_id() != session_id
-        {
-            return http_e2ee_encrypted_error(
-                &mut e2ee,
-                StatusCode::UNAUTHORIZED,
-                ProtocolError::AuthFailed,
-            );
-        }
-        if let Err(error) = protocol_guard.restore_http_control_scope(&mut connection, session_id) {
-            return http_e2ee_encrypted_error(&mut e2ee, StatusCode::BAD_REQUEST, error);
-        }
-    }
-
-    let mut connection_guard = HttpConnectionCloseGuard::new(protocol.clone(), connection);
-    let packet = ProtocolPacket::<serde_json::Value> {
-        version: PROTOCOL_PACKET_VERSION,
-        kind: PacketKind::Request,
-        id: Some(PacketRequestId::new()),
-        stream_id: None,
-        method: Some(method.clone()),
-        seq: 0,
-        ack: None,
-        credit: None,
-        payload,
-    };
-    let responses = match connection_guard
-        .connection_mut()
-        .dispatch_http_control_packet(&mut protocol_guard, packet)
-    {
-        Ok(responses) => responses,
-        Err(error) => {
-            drop(protocol_guard);
-            connection_guard.close_now().await;
-            return http_e2ee_encrypted_error(&mut e2ee, StatusCode::BAD_REQUEST, error);
-        }
-    };
-
-    let response = match encode_http_control_packet_responses(&mut e2ee, responses) {
-        Ok(body) => (StatusCode::OK, body).into_response(),
-        Err(error) => http_e2ee_error(StatusCode::INTERNAL_SERVER_ERROR, error),
-    };
-    drop(protocol_guard);
-    connection_guard.close_now().await;
-    response
-}
-
-struct HttpConnectionCloseGuard {
-    protocol: SharedDaemonProtocol,
-    connection: Option<ProtocolConnection>,
-}
-
-impl HttpConnectionCloseGuard {
-    fn new(protocol: SharedDaemonProtocol, connection: ProtocolConnection) -> Self {
-        Self {
-            protocol,
-            connection: Some(connection),
-        }
-    }
-
-    fn connection(&self) -> &ProtocolConnection {
-        self.connection
-            .as_ref()
-            .expect("HTTP connection guard should still own connection")
-    }
-
-    fn connection_mut(&mut self) -> &mut ProtocolConnection {
-        self.connection
-            .as_mut()
-            .expect("HTTP connection guard should still own connection")
-    }
-
-    async fn close_now(&mut self) {
-        if let Some(connection) = self.connection.as_mut() {
-            let mut protocol = self.protocol.lock().await;
-            connection.close(&mut protocol);
-        }
-        self.connection = None;
-    }
-}
-
-impl Drop for HttpConnectionCloseGuard {
-    fn drop(&mut self) {
-        let Some(mut connection) = self.connection.take() else {
-            return;
-        };
-        let protocol = self.protocol.clone();
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            return;
-        };
-        // 中文注释：HTTP upload stream 会临时 attach 到 session；handler 被浏览器取消时
-        // 正常 close 路径不会执行，Drop 必须补一次 detach，避免 operator/runtime 计数泄漏。
-        handle.spawn(async move {
-            let mut protocol = protocol.lock().await;
-            connection.close(&mut protocol);
-        });
-    }
-}
-
-struct HttpUploadInflightGuard {
-    protocol: SharedDaemonProtocol,
-    meta: SessionFileHttpUploadStreamPayload,
-    reserved_range: Option<(u64, u64)>,
-    file_result: Option<super::protocol::SessionFileHttpUploadFileWriteResult>,
-    armed: bool,
-}
-
-impl HttpUploadInflightGuard {
-    fn new(
-        protocol: SharedDaemonProtocol,
-        meta: SessionFileHttpUploadStreamPayload,
-        reserved_range: Option<(u64, u64)>,
-    ) -> Self {
-        Self {
-            protocol,
-            meta,
-            reserved_range,
-            file_result: None,
-            armed: true,
-        }
-    }
-
-    fn mark_written(&mut self, file_result: super::protocol::SessionFileHttpUploadFileWriteResult) {
-        self.file_result = Some(file_result);
-    }
-
-    async fn cancel_now(&mut self) {
-        if !self.armed {
-            return;
-        }
-        let mut protocol = self.protocol.lock().await;
-        protocol.cancel_session_file_http_upload_write(&self.meta, self.reserved_range);
-        drop(protocol);
-        self.disarm();
-    }
-
-    async fn commit_now(&mut self) -> Result<SessionFileHttpUploadCommit, ProtocolError> {
-        let file_result = self
-            .file_result
-            .as_ref()
-            .ok_or(ProtocolError::InvalidState)?;
-        let mut protocol = self.protocol.lock().await;
-        let commit = protocol.commit_session_file_http_upload_write(&self.meta, file_result);
-        drop(protocol);
-        if commit.is_ok() {
-            self.disarm();
-        }
-        commit
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-        self.file_result = None;
-    }
-}
-
-impl Drop for HttpUploadInflightGuard {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        let protocol = self.protocol.clone();
-        let meta = self.meta.clone();
-        let reserved_range = self.reserved_range;
-        let file_result = self.file_result.take();
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            return;
-        };
-        // 中文注释：reserve 后文件写入过程本身不再 await；因此 Drop 只会发生在写入前后。
-        // 写入前取消就释放 in-flight；写入后取消必须提交结果，不能让 retry 覆盖已落盘数据。
-        handle.spawn(async move {
-            let mut protocol = protocol.lock().await;
-            if let Some(file_result) = file_result {
-                if let Err(error) =
-                    protocol.commit_session_file_http_upload_write(&meta, &file_result)
-                {
-                    warn!(%error, "failed to commit HTTP upload write after handler drop");
-                }
-            } else {
-                protocol.cancel_session_file_http_upload_write(&meta, reserved_range);
-            }
-        });
-    }
-}
-
-async fn write_http_file_upload_chunks_without_protocol_io_lock(
-    protocol: SharedDaemonProtocol,
-    connection: &ProtocolConnection,
-    meta: SessionFileHttpUploadStreamPayload,
-    device_id: termd_proto::DeviceId,
-    chunks: Vec<Vec<u8>>,
-) -> Result<termd_proto::SessionFileUploadProgressPayload, ProtocolError> {
-    let write_len = session_file_http_upload_chunks_len(&chunks)?;
-    let begin = {
-        let mut protocol = protocol.lock().await;
-        protocol.begin_session_file_http_upload_write(
-            connection,
-            meta.clone(),
-            device_id,
-            write_len,
-        )
-    };
-    let begin = match begin {
-        Ok(begin) => begin,
-        Err(error) => {
-            debug!(
-                session_id = %meta.session_id.0,
-                path = %meta.path,
-                upload_id = %meta.upload_id,
-                offset_bytes = meta.offset_bytes,
-                write_len,
-                code = error.code(),
-                "HTTP upload begin write failed detail"
-            );
-            warn!(
-                session_id = %meta.session_id.0,
-                upload_id = %meta.upload_id,
-                offset_bytes = meta.offset_bytes,
-                write_len,
-                code = error.code(),
-                "HTTP upload begin write failed"
-            );
-            return Err(error);
-        }
-    };
-    let plan = match begin {
-        SessionFileHttpUploadBegin::Write(plan) => plan,
-        SessionFileHttpUploadBegin::Complete(progress) => return Ok(progress),
-    };
-    let reserved_range = plan.reserved_range;
-    let mut inflight_guard =
-        HttpUploadInflightGuard::new(protocol.clone(), meta.clone(), reserved_range);
-    let file_result = match write_session_file_http_upload_files(plan, chunks) {
-        Ok(result) => result,
-        Err(error) => {
-            debug!(
-                session_id = %meta.session_id.0,
-                path = %meta.path,
-                upload_id = %meta.upload_id,
-                offset_bytes = meta.offset_bytes,
-                write_len,
-                code = error.code(),
-                "HTTP upload positional file write failed detail"
-            );
-            warn!(
-                session_id = %meta.session_id.0,
-                upload_id = %meta.upload_id,
-                offset_bytes = meta.offset_bytes,
-                write_len,
-                code = error.code(),
-                "HTTP upload positional file write failed"
-            );
-            inflight_guard.cancel_now().await;
-            return Err(error);
-        }
-    };
-    inflight_guard.mark_written(file_result);
-    let commit = match inflight_guard.commit_now().await {
-        Ok(commit) => commit,
-        Err(error) => {
-            debug!(
-                session_id = %meta.session_id.0,
-                path = %meta.path,
-                upload_id = %meta.upload_id,
-                offset_bytes = meta.offset_bytes,
-                write_len,
-                code = error.code(),
-                "HTTP upload commit failed detail"
-            );
-            warn!(
-                session_id = %meta.session_id.0,
-                upload_id = %meta.upload_id,
-                offset_bytes = meta.offset_bytes,
-                write_len,
-                code = error.code(),
-                "HTTP upload commit failed"
-            );
-            return Err(error);
-        }
-    };
-    match commit {
-        SessionFileHttpUploadCommit::Progress(progress) => Ok(progress),
-        SessionFileHttpUploadCommit::Complete(progress) => Ok(progress),
-    }
-}
-
-async fn http_file_download(
-    State(protocol): State<SharedDaemonProtocol>,
-    method: Method,
-    uri: Uri,
-    headers: HeaderMap,
-    body: Body,
-) -> Response {
-    let auth = match http_e2ee_auth_from_headers(&headers, &method, uri.path()) {
-        Ok(auth) => auth,
-        Err(response) => return response,
-    };
-    let body = match read_http_e2ee_short_body(body).await {
-        Ok(body) => body,
-        Err(error) => return http_e2ee_error(StatusCode::BAD_REQUEST, error),
-    };
-    let mut protocol = protocol.lock().await;
-    let (device_id, mut e2ee) = match protocol.open_http_e2ee_session(auth) {
-        Ok(result) => result,
-        Err(error) => return http_e2ee_error(StatusCode::UNAUTHORIZED, error),
-    };
-    let payload: SessionFileHttpDownloadPayload =
-        match decrypt_single_http_e2ee_json(&mut e2ee, &body) {
-            Ok(payload) => payload,
-            Err(error) => return http_e2ee_error(StatusCode::BAD_REQUEST, error),
-        };
-    let mut connection = ProtocolConnection::authenticated_http(device_id);
-    if let Err(error) = protocol.attach_session(
-        &mut connection,
-        SessionAttachPayload {
-            session_id: payload.session_id,
-            watch_updates: false,
-            last_terminal_seq: None,
-        },
-    ) {
-        return http_e2ee_encrypted_error(&mut e2ee, StatusCode::BAD_REQUEST, error);
-    }
-    let (ready, mut file, offset) =
-        match protocol.prepare_session_file_http_download(&connection, payload) {
-            Ok(result) => result,
-            Err(error) => {
-                connection.close(&mut protocol);
-                return http_e2ee_encrypted_error(&mut e2ee, StatusCode::BAD_REQUEST, error);
-            }
-        };
-    connection.close(&mut protocol);
-    drop(protocol);
-
-    if file.seek(SeekFrom::Start(offset)).is_err() {
-        return http_e2ee_encrypted_error(
-            &mut e2ee,
-            StatusCode::BAD_REQUEST,
-            ProtocolError::InvalidEnvelope,
-        );
-    }
-    let remaining = ready
-        .size_bytes
-        .checked_sub(offset)
-        .ok_or(ProtocolError::InvalidEnvelope)
-        .map_err(|error| http_e2ee_encrypted_error(&mut e2ee, StatusCode::BAD_REQUEST, error));
-    let remaining = match remaining {
-        Ok(remaining) => remaining,
-        Err(response) => return response,
-    };
-    // 中文注释：只有文件已经可读并完成 seek 后才加密 ready 帧。否则错误响应会
-    // 使用“跳过 ready 帧后”的 E2EE 序号，客户端收到第一帧错误时无法解密。
-    let mut ready_body = Vec::new();
-    if let Err(error) = append_http_e2ee_json_frame(&mut e2ee, &mut ready_body, &ready) {
-        return http_e2ee_error(StatusCode::INTERNAL_SERVER_ERROR, error);
-    }
-    let stream = futures_util::stream::unfold(
-        (
-            Some(ready_body),
-            file,
-            e2ee,
-            vec![0_u8; 256 * 1024],
-            remaining,
-        ),
-        |(mut ready_body, mut file, mut e2ee, mut chunk, mut remaining)| async move {
-            if let Some(body) = ready_body.take() {
-                return Some((
-                    Ok::<Bytes, io::Error>(Bytes::from(body)),
-                    (ready_body, file, e2ee, chunk, remaining),
-                ));
-            }
-            if remaining == 0 {
-                return None;
-            }
-            let max_read = chunk.len().min(remaining as usize);
-            let read = match file.read(&mut chunk[..max_read]) {
-                Ok(read) => read,
-                Err(error) => {
-                    return Some((Err(error), (ready_body, file, e2ee, chunk, remaining)));
-                }
-            };
-            if read == 0 {
-                return Some((
-                    Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "file ended before advertised download size",
-                    )),
-                    (ready_body, file, e2ee, chunk, remaining),
-                ));
-            }
-            let mut body = Vec::new();
-            if append_http_e2ee_binary_frame(&mut e2ee, &mut body, &chunk[..read]).is_err() {
-                return Some((
-                    Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "failed to encrypt HTTP E2EE download frame",
-                    )),
-                    (ready_body, file, e2ee, chunk, remaining),
-                ));
-            }
-            remaining = remaining.saturating_sub(read as u64);
-            Some((
-                Ok::<Bytes, io::Error>(Bytes::from(body)),
-                (ready_body, file, e2ee, chunk, remaining),
-            ))
-        },
-    );
-    (StatusCode::OK, Body::from_stream(stream)).into_response()
-}
-
-#[allow(clippy::result_large_err)]
-fn http_e2ee_auth_from_headers(
-    headers: &HeaderMap,
-    method: &Method,
-    path: &str,
-) -> Result<HttpE2eeAuthPayload, Response> {
-    let device_id = http_header(headers, "x-termd-device-id")?
-        .parse()
-        .map(termd_proto::DeviceId)
-        .map_err(|_| http_e2ee_error(StatusCode::UNAUTHORIZED, ProtocolError::AuthFailed))?;
-    let e2ee_public_key = PublicKey(http_header(headers, "x-termd-e2ee-public-key")?.to_owned());
-    let nonce = termd_proto::Nonce(http_header(headers, "x-termd-e2ee-nonce")?.to_owned());
-    let timestamp_ms = http_header(headers, "x-termd-e2ee-timestamp-ms")?
-        .parse()
-        .map(UnixTimestampMillis)
-        .map_err(|_| http_e2ee_error(StatusCode::UNAUTHORIZED, ProtocolError::AuthFailed))?;
-    let signature = Signature(http_header(headers, "x-termd-e2ee-signature")?.to_owned());
-
-    Ok(HttpE2eeAuthPayload {
-        device_id,
-        e2ee_public_key,
-        nonce,
-        timestamp_ms,
-        method: method.as_str().to_owned(),
-        path: path.to_owned(),
-        signature,
-    })
-}
-
-#[allow(clippy::result_large_err)]
-fn http_e2ee_auth_from_control_headers(
-    headers: &HeaderMap,
-    method: &Method,
-    path: &str,
-) -> Result<HttpE2eeAuthPayload, Response> {
-    let device_id = http_required_header(headers, "x-termd-device-id")?
-        .parse()
-        .map(termd_proto::DeviceId)
-        .map_err(|_| http_e2ee_error(StatusCode::BAD_REQUEST, ProtocolError::InvalidEnvelope))?;
-    let e2ee_public_key =
-        PublicKey(http_required_header(headers, "x-termd-e2ee-public-key")?.to_owned());
-    let nonce = termd_proto::Nonce(http_required_header(headers, "x-termd-e2ee-nonce")?.to_owned());
-    let timestamp_ms = http_required_header(headers, "x-termd-e2ee-timestamp-ms")?
-        .parse()
-        .map(UnixTimestampMillis)
-        .map_err(|_| http_e2ee_error(StatusCode::BAD_REQUEST, ProtocolError::InvalidEnvelope))?;
-    let signature = Signature(http_required_header(headers, "x-termd-e2ee-signature")?.to_owned());
-
-    Ok(HttpE2eeAuthPayload {
-        device_id,
-        e2ee_public_key,
-        nonce,
-        timestamp_ms,
-        method: method.as_str().to_owned(),
-        path: path.to_owned(),
-        signature,
-    })
-}
-
-struct HttpControlAuth {
-    server_id: ServerId,
-    device_id: termd_proto::DeviceId,
-    session_token: SessionToken,
-    session_scope_token: Option<SessionToken>,
-}
-
-#[allow(clippy::result_large_err)]
-fn http_bearer_control_auth_from_headers(headers: &HeaderMap) -> Result<HttpControlAuth, Response> {
-    let authorization = http_control_header(headers, "authorization")?;
-    let bearer = authorization
-        .strip_prefix("Bearer ")
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| http_e2ee_error(StatusCode::UNAUTHORIZED, ProtocolError::AuthFailed))?;
-    let server_id = http_control_header(headers, "x-termd-server-id")?
-        .parse()
-        .map(ServerId)
-        .map_err(|_| http_e2ee_error(StatusCode::UNAUTHORIZED, ProtocolError::AuthFailed))?;
-    let device_id = http_control_header(headers, "x-termd-device-id")?
-        .parse()
-        .map(termd_proto::DeviceId)
-        .map_err(|_| http_e2ee_error(StatusCode::UNAUTHORIZED, ProtocolError::AuthFailed))?;
-    let session_scope_token = headers
-        .get("x-termd-session-scope")
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| SessionToken(value.to_owned()));
-    Ok(HttpControlAuth {
-        server_id,
-        device_id,
-        session_token: SessionToken(bearer.to_owned()),
-        session_scope_token,
-    })
-}
-
-#[allow(clippy::result_large_err)]
-fn http_control_header<'a>(headers: &'a HeaderMap, name: &str) -> Result<&'a str, Response> {
-    headers
-        .get(name)
-        .and_then(|value| value.to_str().ok())
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| http_e2ee_error(StatusCode::UNAUTHORIZED, ProtocolError::AuthFailed))
-}
-
-#[allow(clippy::result_large_err)]
-fn http_required_header<'a>(headers: &'a HeaderMap, name: &str) -> Result<&'a str, Response> {
-    headers
-        .get(name)
-        .and_then(|value| value.to_str().ok())
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| http_e2ee_error(StatusCode::BAD_REQUEST, ProtocolError::InvalidEnvelope))
-}
-
-fn encode_http_control_packet_responses(
-    e2ee: &mut super::E2eeSession,
-    responses: Vec<ProtocolPacket<serde_json::Value>>,
-) -> Result<Body, ProtocolError> {
-    let mut body = Vec::new();
-    for packet in responses {
-        append_http_e2ee_json_frame(e2ee, &mut body, &packet)?;
-    }
-    Ok(Body::from(body))
-}
-
-#[allow(clippy::result_large_err)]
-fn http_header<'a>(headers: &'a HeaderMap, name: &str) -> Result<&'a str, Response> {
-    headers
-        .get(name)
-        .and_then(|value| value.to_str().ok())
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
-            (
-                StatusCode::UNAUTHORIZED,
-                Json(ErrorPayload {
-                    code: "http_e2ee_required".to_owned(),
-                    message: "HTTP E2EE headers are required".to_owned(),
-                }),
-            )
-                .into_response()
-        })
-}
-
-async fn read_http_e2ee_short_body(body: Body) -> Result<Bytes, ProtocolError> {
-    // 中文注释：upload init 和 download metadata 都是短请求；不能让慢客户端无限占住
-    // daemon handler。真正的大文件 upload body 不走这里，仍由连接背压自然推进。
-    match timeout(
-        HTTP_E2EE_SHORT_BODY_TIMEOUT,
-        to_bytes(body, HTTP_E2EE_INIT_MAX_BYTES),
-    )
-    .await
-    {
-        Ok(Ok(body)) => Ok(body),
-        Ok(Err(_)) | Err(_) => Err(ProtocolError::InvalidEnvelope),
-    }
-}
-
-async fn read_http_e2ee_metadata_frame(
-    stream: &mut HttpE2eeBodyFrameStream,
-    e2ee: &mut super::E2eeSession,
-) -> Result<Vec<u8>, ProtocolError> {
-    // 中文注释：upload 长流只有首个 metadata frame 是短控制信息；它必须快速到达。
-    // 后续文件内容不设置整体耗时上限，避免弱网大文件上传被误杀。
-    match timeout(HTTP_E2EE_SHORT_BODY_TIMEOUT, stream.next_plaintext(e2ee)).await {
-        Ok(Ok(Some(frame))) => Ok(frame),
-        Ok(Ok(None)) => Err(ProtocolError::InvalidEnvelope),
-        Ok(Err(error)) => Err(error),
-        Err(_) => Err(ProtocolError::InvalidEnvelope),
-    }
-}
-
-fn decrypt_single_http_e2ee_json<T>(
-    e2ee: &mut super::E2eeSession,
-    body: &Bytes,
-) -> Result<T, ProtocolError>
-where
-    T: serde::de::DeserializeOwned,
-{
-    let mut frames = decrypt_http_e2ee_frames(e2ee, body)?;
-    if frames.len() != 1 {
-        return Err(ProtocolError::InvalidEnvelope);
-    }
-    serde_json::from_slice(&frames.remove(0)).map_err(|_| ProtocolError::InvalidEnvelope)
-}
-
-fn decrypt_http_e2ee_frames(
-    _e2ee: &mut super::E2eeSession,
-    body: &Bytes,
-) -> Result<Vec<Vec<u8>>, ProtocolError> {
-    let mut offset = 0;
-    let mut frames = Vec::new();
-    while offset < body.len() {
-        let frame = read_http_e2ee_frame(body, &mut offset)?;
-        frames.push(frame.to_vec());
-    }
-    Ok(frames)
-}
-
-struct HttpE2eeBodyFrameStream {
-    stream: axum::body::BodyDataStream,
-    pending: Vec<u8>,
-    buffered: Option<Bytes>,
-    buffered_offset: usize,
-}
-
-impl HttpE2eeBodyFrameStream {
-    fn new(body: Body) -> Self {
-        Self {
-            stream: body.into_data_stream(),
-            pending: Vec::new(),
-            buffered: None,
-            buffered_offset: 0,
-        }
-    }
-
-    async fn next_plaintext(
-        &mut self,
-        _e2ee: &mut super::E2eeSession,
-    ) -> Result<Option<Vec<u8>>, ProtocolError> {
-        loop {
-            if let Some(frame) = self.try_pop_frame()? {
-                return Ok(Some(frame));
-            }
-            if self.drain_buffered_body_bytes()? {
-                continue;
-            }
-            match self.stream.next().await {
-                Some(Ok(bytes)) if bytes.is_empty() => {}
-                Some(Ok(bytes)) => {
-                    self.buffered = Some(bytes);
-                    self.buffered_offset = 0;
-                }
-                Some(Err(_)) => return Err(ProtocolError::InvalidEnvelope),
-                None if self.pending.is_empty() => return Ok(None),
-                None => return Err(ProtocolError::InvalidEnvelope),
-            }
-        }
-    }
-
-    fn drain_buffered_body_bytes(&mut self) -> Result<bool, ProtocolError> {
-        let Some(bytes) = self.buffered.as_ref() else {
-            return Ok(false);
-        };
-        if self.buffered_offset >= bytes.len() {
-            self.buffered = None;
-            self.buffered_offset = 0;
-            return Ok(false);
-        }
-        let capacity = HTTP_E2EE_MAX_PENDING_BYTES.saturating_sub(self.pending.len());
-        if capacity == 0 {
-            return Err(ProtocolError::InvalidEnvelope);
-        }
-        // 中文注释：底层 HTTP body chunk 可能合并多个合法 E2EE frame；分段搬入
-        // pending，既保留 append 前内存上限，也允许大 coalesced chunk 被逐帧消费。
-        let remaining = bytes.len().saturating_sub(self.buffered_offset);
-        let take = capacity.min(remaining);
-        let end = self.buffered_offset.saturating_add(take);
-        self.pending
-            .extend_from_slice(&bytes[self.buffered_offset..end]);
-        self.buffered_offset = end;
-        if self.buffered_offset >= bytes.len() {
-            self.buffered = None;
-            self.buffered_offset = 0;
-        }
-        Ok(true)
-    }
-
-    fn try_pop_frame(&mut self) -> Result<Option<Vec<u8>>, ProtocolError> {
-        if self.pending.len() < HTTP_E2EE_FRAME_LEN_BYTES {
-            return Ok(None);
-        }
-        let len = u32::from_be_bytes(
-            self.pending[0..HTTP_E2EE_FRAME_LEN_BYTES]
-                .try_into()
-                .map_err(|_| ProtocolError::InvalidEnvelope)?,
-        ) as usize;
-        if len == 0 || len > HTTP_E2EE_MAX_FRAME_BYTES {
-            return Err(ProtocolError::InvalidEnvelope);
-        }
-        let frame_end = HTTP_E2EE_FRAME_LEN_BYTES.saturating_add(len);
-        if self.pending.len() < frame_end {
-            return Ok(None);
-        }
-        let frame = self.pending[HTTP_E2EE_FRAME_LEN_BYTES..frame_end].to_vec();
-        self.pending.drain(0..frame_end);
-        Ok(Some(frame))
-    }
-}
-
-fn encrypt_single_http_e2ee_json<T>(
-    e2ee: &mut super::E2eeSession,
-    payload: &T,
-) -> Result<Body, ProtocolError>
-where
-    T: serde::Serialize,
-{
-    let mut body = Vec::new();
-    append_http_e2ee_json_frame(e2ee, &mut body, payload)?;
-    Ok(Body::from(body))
-}
-
-fn append_http_e2ee_json_frame<T>(
-    e2ee: &mut super::E2eeSession,
-    body: &mut Vec<u8>,
-    payload: &T,
-) -> Result<(), ProtocolError>
-where
-    T: serde::Serialize,
-{
-    let plaintext = serde_json::to_vec(payload).map_err(|_| ProtocolError::InvalidEnvelope)?;
-    append_http_e2ee_binary_frame(e2ee, body, &plaintext)
-}
-
-fn append_http_e2ee_binary_frame(
-    _e2ee: &mut super::E2eeSession,
-    body: &mut Vec<u8>,
-    plaintext: &[u8],
-) -> Result<(), ProtocolError> {
-    body.extend_from_slice(&write_http_e2ee_frame(plaintext));
-    Ok(())
-}
-
-fn read_http_e2ee_frame<'a>(body: &'a [u8], offset: &mut usize) -> Result<&'a [u8], ProtocolError> {
-    if body.len().saturating_sub(*offset) < HTTP_E2EE_FRAME_LEN_BYTES {
-        return Err(ProtocolError::InvalidEnvelope);
-    }
-    let len = u32::from_be_bytes(
-        body[*offset..*offset + HTTP_E2EE_FRAME_LEN_BYTES]
-            .try_into()
-            .map_err(|_| ProtocolError::InvalidEnvelope)?,
-    ) as usize;
-    *offset += HTTP_E2EE_FRAME_LEN_BYTES;
-    if len == 0 || len > HTTP_E2EE_MAX_FRAME_BYTES || body.len().saturating_sub(*offset) < len {
-        return Err(ProtocolError::InvalidEnvelope);
-    }
-    let frame = &body[*offset..*offset + len];
-    *offset += len;
-    Ok(frame)
-}
-
-fn write_http_e2ee_frame(frame: &[u8]) -> Vec<u8> {
-    let len = u32::try_from(frame.len()).expect("HTTP E2EE frame length should fit u32");
-    let mut out = Vec::with_capacity(HTTP_E2EE_FRAME_LEN_BYTES + frame.len());
-    out.extend_from_slice(&len.to_be_bytes());
-    out.extend_from_slice(frame);
-    out
-}
-
-fn http_e2ee_error(status: StatusCode, error: ProtocolError) -> Response {
-    (
-        status,
-        Json(ErrorPayload {
-            code: error.code().to_owned(),
-            message: error.safe_message().to_owned(),
-        }),
-    )
-        .into_response()
-}
-
-fn http_e2ee_encrypted_error(
-    e2ee: &mut super::E2eeSession,
-    status: StatusCode,
-    error: ProtocolError,
-) -> Response {
-    let payload = ErrorPayload {
-        code: error.code().to_owned(),
-        message: error.safe_message().to_owned(),
-    };
-    match encrypt_single_http_e2ee_json(e2ee, &payload) {
-        Ok(body) => (status, body).into_response(),
-        Err(error) => http_e2ee_error(StatusCode::INTERNAL_SERVER_ERROR, error),
-    }
-}
-
-fn pairing_ws_url_from_config(config: &DaemonConfig, server_id: ServerId) -> String {
-    // 配置里保存的是模板；本地 token 接口返回实际可用的 URL，CLI 生成二维码时无需用户拼 server_id。
-    config
-        .default_pairing_ws_url
-        .trim()
-        .replace("{server_id}", &server_id.0.to_string())
-}
-
-#[derive(Debug, Serialize)]
-struct RelayPairTicketRegistration<'a> {
-    server_id: ServerId,
-    token: &'a PairingToken,
-    expires_at_ms: UnixTimestampMillis,
-}
-
-#[derive(Debug, Serialize)]
-struct RelayDeviceRegistration<'a> {
-    server_id: ServerId,
-    device_id: termd_proto::DeviceId,
-    public_key: &'a PublicKey,
-}
-
-#[derive(Debug, Error)]
-pub(crate) enum RelayRegistrationError {
-    #[error("trusted relay registration is not configured")]
-    MissingConfig,
-    #[error("trusted relay URL is invalid")]
-    InvalidRelayUrl,
-    #[error("trusted relay HTTP client could not be built")]
-    Client,
-    #[error("trusted relay rejected device public key")]
-    InvalidDevicePublicKey,
-    #[error("trusted relay registration returned HTTP {0}")]
-    Status(u16),
-    #[error("trusted relay registration request failed: {0}")]
-    Request(String),
-}
-
-fn relay_registration_request_error(error: reqwest::Error) -> RelayRegistrationError {
-    let mut parts = vec![error.to_string()];
-    let mut source = std::error::Error::source(&error);
-    while let Some(cause) = source {
-        parts.push(cause.to_string());
-        source = cause.source();
-    }
-    RelayRegistrationError::Request(parts.join(": "))
-}
-
-struct RelayRegistrationTarget {
-    daemon_token: String,
-    base: RelayBaseUrl,
-}
-
-fn relay_registration_target(
-    config: &DaemonConfig,
-) -> Result<Option<RelayRegistrationTarget>, RelayRegistrationError> {
-    let Some(daemon_token) = config
-        .relay_daemon_token
-        .as_ref()
-        .map(|token| token.expose_secret().to_owned())
-    else {
-        return Ok(None);
-    };
-    let relay_url = config
-        .relay_endpoints
-        .first()
-        .ok_or(RelayRegistrationError::MissingConfig)?;
-    let base =
-        RelayBaseUrl::parse(relay_url).map_err(|_| RelayRegistrationError::InvalidRelayUrl)?;
-    Ok(Some(RelayRegistrationTarget { daemon_token, base }))
-}
-
-async fn register_relay_pair_ticket_from_config(
-    config: &DaemonConfig,
-    server_id: ServerId,
-    token: PairingToken,
-    expires_at_ms: UnixTimestampMillis,
-) -> Result<(), RelayRegistrationError> {
-    let Some(target) = relay_registration_target(config)? else {
-        return Ok(());
-    };
-    let endpoint = target.base.api_url("/api/relay/pair-ticket/register");
-    let payload = RelayPairTicketRegistration {
-        server_id,
-        token: &token,
-        expires_at_ms,
-    };
-    let client = reqwest::Client::builder()
-        .timeout(RELAY_REGISTRATION_TIMEOUT)
-        .connect_timeout(RELAY_REGISTRATION_CONNECT_TIMEOUT)
-        .no_proxy()
-        .http1_only()
-        .build()
-        .map_err(|_| RelayRegistrationError::Client)?;
-    let mut last_error = None;
-    for attempt in 1..=RELAY_PAIR_TICKET_REGISTRATION_ATTEMPTS {
-        let result = client
-            .post(endpoint.as_str())
-            .header("x-termd-relay-daemon-token", target.daemon_token.as_str())
-            .json(&payload)
-            .send()
-            .await
-            .map_err(relay_registration_request_error)
-            .and_then(|response| {
-                if response.status().is_success() {
-                    Ok(())
-                } else {
-                    Err(RelayRegistrationError::Status(response.status().as_u16()))
-                }
-            });
-        match result {
-            Ok(()) => return Ok(()),
-            Err(error @ RelayRegistrationError::Request(_))
-                if attempt < RELAY_PAIR_TICKET_REGISTRATION_ATTEMPTS =>
-            {
-                // 中文注释：公网 relay 的 HTTPS 建连偶发卡住；pair invite 是人工触发，
-                // 短重试比直接返回 503 更符合用户预期，同时不会吞掉 401/4xx 配置错误。
-                debug!(%error, attempt, "retrying relay pair-ticket registration");
-                last_error = Some(error);
-                tokio::time::sleep(RELAY_REGISTRATION_RETRY_DELAY).await;
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    Err(last_error.unwrap_or_else(|| {
-        RelayRegistrationError::Request("relay pair-ticket registration exhausted".to_owned())
-    }))
-}
-
-pub(crate) fn register_relay_device_from_config(
-    config: &DaemonConfig,
-    server_id: ServerId,
-    device_id: termd_proto::DeviceId,
-    public_key: PublicKey,
-) -> Result<(), RelayRegistrationError> {
-    let Some(target) = relay_registration_target(config)? else {
-        return Ok(());
-    };
-    let endpoint = target.base.api_url("/api/relay/device/register");
-    // 中文注释：PairRequest 处理路径仍是同步状态机，但不能在 Tokio worker 中直接
-    // 创建/drop reqwest blocking runtime；独立 OS 线程可以安全承载这次短 HTTP 注册。
-    std::thread::spawn(move || {
-        register_relay_device_request(
-            endpoint,
-            target.daemon_token,
-            server_id,
-            device_id,
-            public_key,
-        )
-    })
-    .join()
-    .map_err(|_| RelayRegistrationError::Request("relay device registration panicked".to_owned()))?
-}
-
-async fn register_relay_device_from_config_async(
-    config: DaemonConfig,
-    server_id: ServerId,
-    device_id: termd_proto::DeviceId,
-    public_key: PublicKey,
-) -> Result<(), RelayRegistrationError> {
-    tokio::task::spawn_blocking(move || {
-        register_relay_device_from_config(&config, server_id, device_id, public_key)
-    })
-    .await
-    .map_err(|_| RelayRegistrationError::Request("relay device registration panicked".to_owned()))?
-}
-
-fn register_relay_device_request(
-    endpoint: String,
-    daemon_token: String,
-    server_id: ServerId,
-    device_id: termd_proto::DeviceId,
-    public_key: PublicKey,
-) -> Result<(), RelayRegistrationError> {
-    // 中文注释：协议核心是同步状态机；pairing 成功路径必须在返回 PairAccept 前确认
-    // relay 已接收 device，否则用户会得到一个后续无法经 trusted relay 使用的假成功配对。
-    let payload = RelayDeviceRegistration {
-        server_id,
-        device_id,
-        public_key: &public_key,
-    };
-    let client = reqwest::blocking::Client::builder()
-        .timeout(RELAY_REGISTRATION_TIMEOUT)
-        .connect_timeout(RELAY_REGISTRATION_CONNECT_TIMEOUT)
-        .no_proxy()
-        .http1_only()
-        .build()
-        .map_err(|_| RelayRegistrationError::Client)?;
-    let mut last_error = None;
-    for attempt in 1..=RELAY_DEVICE_REGISTRATION_ATTEMPTS {
-        let result = client
-            .post(endpoint.as_str())
-            .header("x-termd-relay-daemon-token", daemon_token.as_str())
-            .json(&payload)
-            .send()
-            .map_err(relay_registration_request_error)
-            .and_then(|response| {
-                if response.status() == reqwest::StatusCode::BAD_REQUEST {
-                    Err(RelayRegistrationError::InvalidDevicePublicKey)
-                } else if response.status().is_success() {
-                    Ok(())
-                } else {
-                    Err(RelayRegistrationError::Status(response.status().as_u16()))
-                }
-            });
-        match result {
-            Ok(()) => return Ok(()),
-            Err(error @ RelayRegistrationError::Request(_))
-                if attempt < RELAY_DEVICE_REGISTRATION_ATTEMPTS =>
-            {
-                // 中文注释：device 注册处于 PairRequest 响应路径，重试次数必须保守，
-                // 保证最坏情况仍短于 termctl 的 response 等待窗口。
-                debug!(%error, attempt, "retrying relay device registration");
-                last_error = Some(error);
-                std::thread::sleep(RELAY_REGISTRATION_RETRY_DELAY);
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    Err(last_error.unwrap_or_else(|| {
-        RelayRegistrationError::Request("relay device registration exhausted".to_owned())
-    }))
-}
-
-pub(crate) fn register_relay_devices_from_config_background(
-    config: &DaemonConfig,
-    server_id: ServerId,
-    devices: Vec<(termd_proto::DeviceId, PublicKey)>,
-) {
-    if devices.is_empty() {
-        return;
-    }
-    let config = config.clone();
-    tokio::task::spawn_blocking(move || {
-        let Some(target) = (match relay_registration_target(&config) {
-            Ok(target) => target,
-            Err(error) => {
-                warn!(%error, "failed to prepare trusted device relay re-registration");
-                return;
-            }
-        }) else {
-            return;
-        };
-        let endpoint = target.base.api_url("/api/relay/device/register");
-        let total = devices.len();
-        let mut registered = 0_usize;
-        let mut failed = 0_usize;
-        let mut last_error = None;
-
-        // 中文注释：relay 重启后的恢复注册必须限流。旧状态里可能积累较多 device，
-        // 这里用单个后台任务顺序补注册，避免一次 control 重连打开大量 HTTP client/socket。
-        for (device_id, public_key) in devices {
-            match register_relay_device_request(
-                endpoint.clone(),
-                target.daemon_token.clone(),
-                server_id,
-                device_id,
-                public_key,
-            ) {
-                Ok(()) => registered = registered.saturating_add(1),
-                Err(error) => {
-                    failed = failed.saturating_add(1);
-                    last_error = Some(error);
-                }
-            }
-        }
-
-        if failed > 0 {
-            let error = last_error
-                .map(|error| error.to_string())
-                .unwrap_or_else(|| "unknown error".to_owned());
-            warn!(
-                total,
-                registered,
-                failed,
-                %error,
-                "trusted device relay re-registration completed with failures"
-            );
-        } else {
-            debug!(
-                total,
-                registered, "trusted device relay re-registration completed"
-            );
-        }
-    });
-}
-
 fn is_loopback_peer(peer_addr: SocketAddr) -> bool {
     peer_addr.ip().is_loopback()
-}
-
-async fn ws_handler(
-    websocket: WebSocketUpgrade,
-    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
-    State(protocol): State<SharedDaemonProtocol>,
-) -> impl IntoResponse {
-    websocket
-        .max_frame_size(WEBSOCKET_MAX_FRAME_SIZE)
-        .max_message_size(WEBSOCKET_MAX_MESSAGE_SIZE)
-        .on_upgrade(move |socket| handle_socket(socket, protocol, peer_addr))
-}
-
-async fn read_route_hello(
-    write_wire_tx: &mpsc::Sender<WebSocketWrite>,
-    receiver: &mut futures_util::stream::SplitStream<WebSocket>,
-    expected_server_id: ServerId,
-) -> Result<RouteHelloPayload, ProtocolError> {
-    loop {
-        let Some(message) = receiver.next().await else {
-            return Err(ProtocolError::InvalidEnvelope);
-        };
-        let message = message.map_err(|error| {
-            warn!(%error, "websocket receive failed while waiting for route prelude");
-            ProtocolError::InvalidEnvelope
-        })?;
-
-        match message {
-            Message::Ping(payload) => {
-                if enqueue_websocket_control_raw(
-                    write_wire_tx,
-                    WebSocketOutKind::Pong,
-                    Message::Pong(payload),
-                )
-                .await
-                .is_err()
-                {
-                    return Err(ProtocolError::InvalidEnvelope);
-                }
-            }
-            Message::Pong(_) => continue,
-            Message::Close(_) => return Err(ProtocolError::InvalidEnvelope),
-            other => {
-                let Some(envelope) = message_to_envelope(other)? else {
-                    return Err(ProtocolError::InvalidEnvelope);
-                };
-                if envelope.kind != MessageType::RouteHello {
-                    return Err(ProtocolError::InvalidEnvelope);
-                }
-
-                let payload: RouteHelloPayload = decode_payload(envelope.payload)?;
-                if payload.protocol_version != ProtocolVersion(PROTOCOL_PACKET_VERSION) {
-                    return Err(ProtocolError::InvalidEnvelope);
-                }
-                if payload.server_id != expected_server_id {
-                    return Err(ProtocolError::InvalidEnvelope);
-                }
-                if payload.role != RouteRole::Client {
-                    return Err(ProtocolError::InvalidEnvelope);
-                }
-
-                return Ok(payload);
-            }
-        }
-    }
-}
-
-fn route_ready_envelope(server_id: ServerId, role: RouteRole) -> JsonEnvelope {
-    envelope_value(
-        MessageType::RouteReady,
-        RouteReadyPayload { server_id, role },
-    )
-    .expect("route_ready payload should serialize")
-}
-
-fn current_websocket_watcher_counts(
-    watched_output_sessions: &HashSet<SessionId>,
-    watched_activity_sessions: &HashSet<SessionId>,
-    _watched_cwd_sessions: &HashSet<SessionId>,
-    watched_resize_sessions: &HashSet<SessionId>,
-) -> WebSocketWatcherCounts {
-    WebSocketWatcherCounts {
-        output: watched_output_sessions.len(),
-        activity: watched_activity_sessions.len(),
-        cwd: _watched_cwd_sessions.len(),
-        resize: watched_resize_sessions.len(),
-    }
-}
-
-fn websocket_message_kind(message: &Message) -> &'static str {
-    match message {
-        Message::Text(_) => "text",
-        Message::Binary(_) => "binary",
-        Message::Ping(_) => "ping",
-        Message::Pong(_) => "pong",
-        Message::Close(_) => "close",
-    }
-}
-
-fn websocket_message_bytes(message: &Message) -> usize {
-    match message {
-        Message::Text(raw) => raw.len(),
-        Message::Binary(raw) => raw.len(),
-        Message::Ping(payload) | Message::Pong(payload) => payload.len(),
-        Message::Close(_) => 0,
-    }
-}
-
-fn maybe_log_websocket_traffic(
-    peer_addr: SocketAddr,
-    traffic: &mut WebSocketTrafficCounters,
-    last_logged_at: &mut Instant,
-    connection: &mut ProtocolConnection,
-    watchers: WebSocketWatcherCounts,
-    force: bool,
-) {
-    if !traffic.has_activity() {
-        return;
-    }
-    if !force && last_logged_at.elapsed() < WEBSOCKET_TRAFFIC_LOG_INTERVAL {
-        return;
-    }
-
-    let flow = connection.debug_snapshot();
-    let protocol_traffic = connection.take_debug_traffic();
-    if websocket_traffic_should_promote_to_info(traffic, &protocol_traffic) {
-        info_websocket_traffic(peer_addr, traffic, &protocol_traffic, watchers, flow);
-    } else {
-        debug_websocket_traffic(peer_addr, traffic, &protocol_traffic, watchers, flow);
-    }
-    *traffic = WebSocketTrafficCounters::default();
-    *last_logged_at = Instant::now();
-}
-
-fn websocket_traffic_should_promote_to_info(
-    traffic: &WebSocketTrafficCounters,
-    protocol_traffic: &ProtocolConnectionDebugTraffic,
-) -> bool {
-    // 正常心跳、RPC 和 activity 计数只进 debug；只有疑似空转/背压/断连时提升到 info，
-    // 这样线上默认日志能抓到异常，又不会长期刷屏。
-    traffic.send_errors > 0
-        || traffic.out_push_output.calls > 1_000
-        || traffic.out_response.calls > 20
-        || traffic.out_response.envelopes > 20
-        || traffic.out_push_activity.calls > 100
-        || protocol_traffic.inbound_flow_packets > 200
-        || protocol_traffic.method_count_exceeds(20)
-        || protocol_traffic.inbound_stream_chunks > 100
-        || protocol_traffic.outbound_stream_chunks > 100
-}
-
-fn info_websocket_traffic(
-    peer_addr: SocketAddr,
-    traffic: &WebSocketTrafficCounters,
-    protocol_traffic: &ProtocolConnectionDebugTraffic,
-    watchers: WebSocketWatcherCounts,
-    flow: ProtocolConnectionDebugSnapshot,
-) {
-    info!(
-        peer_addr = %peer_addr,
-        ?traffic,
-        ?protocol_traffic,
-        watchers_output = watchers.output,
-        watchers_activity = watchers.activity,
-        watchers_cwd = watchers.cwd,
-        watchers_resize = watchers.resize,
-        flow_packet_mode = flow.packet_mode,
-        flow_binary_mode = flow.binary_mode,
-        flow_attached_sessions = flow.attached_sessions,
-        flow_watched_sessions = flow.watched_sessions,
-        flow_terminal_streams = flow.terminal_streams,
-        flow_zero_credit_terminal_streams = flow.zero_credit_terminal_streams,
-        flow_total_output_credit = flow.total_output_credit,
-        flow_pending_raw_chunks = flow.pending_raw_chunks,
-        flow_pending_terminal_frames = flow.pending_terminal_frames,
-        "websocket traffic counters"
-    );
-}
-
-fn debug_websocket_traffic(
-    peer_addr: SocketAddr,
-    traffic: &WebSocketTrafficCounters,
-    protocol_traffic: &ProtocolConnectionDebugTraffic,
-    watchers: WebSocketWatcherCounts,
-    flow: ProtocolConnectionDebugSnapshot,
-) {
-    debug!(
-        peer_addr = %peer_addr,
-        ?traffic,
-        ?protocol_traffic,
-        watchers_output = watchers.output,
-        watchers_activity = watchers.activity,
-        watchers_cwd = watchers.cwd,
-        watchers_resize = watchers.resize,
-        flow_packet_mode = flow.packet_mode,
-        flow_binary_mode = flow.binary_mode,
-        flow_attached_sessions = flow.attached_sessions,
-        flow_watched_sessions = flow.watched_sessions,
-        flow_terminal_streams = flow.terminal_streams,
-        flow_zero_credit_terminal_streams = flow.zero_credit_terminal_streams,
-        flow_total_output_credit = flow.total_output_credit,
-        flow_pending_raw_chunks = flow.pending_raw_chunks,
-        flow_pending_terminal_frames = flow.pending_terminal_frames,
-        "websocket traffic counters"
-    );
-}
-
-struct PairingReservationGuard {
-    protocol: SharedDaemonProtocol,
-    pending: Option<PendingPairing>,
-}
-
-impl PairingReservationGuard {
-    fn new(protocol: SharedDaemonProtocol, pending: PendingPairing) -> Self {
-        Self {
-            protocol,
-            pending: Some(pending),
-        }
-    }
-
-    fn take(&mut self) -> PendingPairing {
-        self.pending
-            .take()
-            .expect("pairing reservation should exist")
-    }
-}
-
-impl Drop for PairingReservationGuard {
-    fn drop(&mut self) {
-        let Some(pending) = self.pending.take() else {
-            return;
-        };
-        let protocol = self.protocol.clone();
-        tokio::spawn(async move {
-            protocol.lock().await.release_pair_request(&pending);
-        });
-    }
-}
-
-pub(crate) async fn handle_prepared_server_wire_message(
-    protocol: SharedDaemonProtocol,
-    connection: &mut ProtocolConnection,
-    prepared: PreparedProtocolWireMessage,
-) -> Vec<ProtocolWireMessage> {
-    let pair_request = match prepared.pair_request() {
-        Ok(request) => request,
-        Err(error) => return connection.finish_prepared_pairing(prepared, Err(error)),
-    };
-    let Some(pair_request) = pair_request else {
-        let mut protocol = protocol.lock().await;
-        return connection.handle_prepared_wire_message(&mut protocol, prepared);
-    };
-
-    let reserved = {
-        let mut protocol = protocol.lock().await;
-        let config = protocol.config().clone();
-        match protocol.reserve_pair_request(connection, pair_request) {
-            Ok(pending) => Ok((config, pending)),
-            Err(error) => Err(error),
-        }
-    };
-    let (config, pending) = match reserved {
-        Ok(reserved) => reserved,
-        Err(error) => return connection.finish_prepared_pairing(prepared, Err(error)),
-    };
-    let mut reservation = PairingReservationGuard::new(protocol.clone(), pending);
-    let registration = register_relay_device_from_config_async(
-        config,
-        reservation.pending.as_ref().unwrap().accepted().server_id,
-        reservation.pending.as_ref().unwrap().accepted().device_id,
-        reservation
-            .pending
-            .as_ref()
-            .unwrap()
-            .device_identity()
-            .public_key()
-            .clone(),
-    )
-    .await;
-    if let Err(error) = registration {
-        warn!(%error, "failed to register paired device with relay");
-        let pending = reservation.take();
-        protocol.lock().await.release_pair_request(&pending);
-        return connection.finish_prepared_pairing(prepared, Err(ProtocolError::PairingFailed));
-    }
-
-    let pending = reservation.take();
-    let result = {
-        let mut protocol = protocol.lock().await;
-        protocol.commit_pair_request(connection, pending)
-    };
-    connection.finish_prepared_pairing(prepared, result)
-}
-
-async fn handle_socket(socket: WebSocket, protocol: SharedDaemonProtocol, peer_addr: SocketAddr) {
-    let (sender, mut receiver) = socket.split();
-    let (write_wire_tx, write_wire_rx) =
-        mpsc::channel::<WebSocketWrite>(WEBSOCKET_WIRE_QUEUE_CAPACITY);
-    let (writer_failed_tx, mut writer_failed_rx) = mpsc::channel::<()>(1);
-    // 中文注释：直连从 route prelude 开始就只保留一条有界 writer queue。
-    // 入队成功即代表当前连接的输出责任已经交给 transport；真实 socket 失败
-    // 只通过 writer_failed_rx 传播回来，关闭当前连接。
-    let writer_task = tokio::spawn(run_websocket_writer(
-        peer_addr,
-        write_wire_rx,
-        writer_failed_tx,
-        sender,
-    ));
-    let (push_event_tx, mut push_event_rx) =
-        mpsc::channel::<SessionPushEvent>(WEBSOCKET_PUSH_EVENT_QUEUE_CAPACITY);
-    let mut watched_output_sessions = HashSet::new();
-    let mut watched_activity_sessions = HashSet::new();
-    let mut watched_cwd_sessions = HashSet::new();
-    let mut watched_resize_sessions = HashSet::new();
-    let mut watched_metadata_clients = false;
-    let mut watched_metadata_status_interval_ms = None;
-    let mut watcher_tasks: Vec<JoinHandle<()>> = Vec::new();
-    let mut metadata_watcher_tasks: Vec<JoinHandle<()>> = Vec::new();
-    let mut push_event_queue = SessionPushEventQueue::default();
-    let mut push_drain_wake_pending = false;
-    let mut traffic = WebSocketTrafficCounters::default();
-    let mut last_traffic_log = Instant::now();
-    let mut attach_summary = WebSocketAttachSummaryState::new(Instant::now());
-    let server_id = {
-        let protocol = protocol.lock().await;
-        protocol.server_id()
-    };
-
-    let route_hello = match timeout(
-        ROUTE_PRELUDE_TIMEOUT,
-        read_route_hello(&write_wire_tx, &mut receiver, server_id),
-    )
-    .await
-    {
-        Ok(Ok(route_hello)) => route_hello,
-        Ok(Err(error)) => {
-            let envelope = plaintext_error(error);
-            let messages = vec![ProtocolWireMessage::Json(envelope)];
-            let bytes = websocket_wire_messages_wire_len(&messages);
-            if enqueue_websocket_wire(&write_wire_tx, WebSocketOutKind::PlainError, messages)
-                .await
-                .is_ok()
-            {
-                traffic.record_out(WebSocketOutKind::PlainError, 1, bytes);
-                finish_websocket_writer(write_wire_tx, writer_task).await;
-            } else {
-                traffic.record_send_error();
-                writer_task.abort();
-            }
-            return;
-        }
-        Err(_) => {
-            warn!(
-                layer = "termd",
-                phase = "route_prelude",
-                timeout_code = "route_prelude_timeout",
-                peer_addr = %peer_addr,
-                timeout_ms = ROUTE_PRELUDE_TIMEOUT.as_millis() as u64,
-                server_id = %server_id.0,
-                "websocket route prelude timed out"
-            );
-            let envelope = route_prelude_timeout_error();
-            let messages = vec![ProtocolWireMessage::Json(envelope)];
-            let bytes = websocket_wire_messages_wire_len(&messages);
-            if enqueue_websocket_wire(&write_wire_tx, WebSocketOutKind::PlainError, messages)
-                .await
-                .is_ok()
-            {
-                traffic.record_out(WebSocketOutKind::PlainError, 1, bytes);
-                finish_websocket_writer(write_wire_tx, writer_task).await;
-            } else {
-                traffic.record_send_error();
-                writer_task.abort();
-            }
-            return;
-        }
-    };
-    let route_ready = route_ready_envelope(route_hello.server_id, route_hello.role);
-    let route_ready_bytes =
-        websocket_wire_messages_wire_len(&[ProtocolWireMessage::Json(route_ready.clone())]);
-    if enqueue_websocket_wire(
-        &write_wire_tx,
-        WebSocketOutKind::RouteReady,
-        vec![ProtocolWireMessage::Json(route_ready)],
-    )
-    .await
-    .is_err()
-    {
-        traffic.record_send_error();
-        writer_task.abort();
-        return;
-    }
-    traffic.record_out(WebSocketOutKind::RouteReady, 1, route_ready_bytes);
-
-    let (mut connection, initial_messages) = {
-        let protocol = protocol.lock().await;
-        protocol.start_connection_for_peer(Some(peer_addr.ip().to_string()))
-    };
-
-    let initial_count = initial_messages.len();
-    let initial_wire_messages = initial_messages
-        .into_iter()
-        .map(ProtocolWireMessage::Json)
-        .collect::<Vec<_>>();
-    let initial_bytes = websocket_wire_messages_wire_len(&initial_wire_messages);
-    if enqueue_websocket_wire(
-        &write_wire_tx,
-        WebSocketOutKind::Initial,
-        initial_wire_messages,
-    )
-    .await
-    .is_err()
-    {
-        traffic.record_send_error();
-        writer_task.abort();
-        return;
-    }
-    traffic.record_out(WebSocketOutKind::Initial, initial_count, initial_bytes);
-
-    let mut idle_deadline = Instant::now() + WEBSOCKET_IDLE_TIMEOUT;
-    let mut heartbeat = tokio::time::interval_at(
-        Instant::now() + WEBSOCKET_HEARTBEAT_INTERVAL,
-        WEBSOCKET_HEARTBEAT_INTERVAL,
-    );
-    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut pending_pong_deadline: Option<Instant> = None;
-    let mut last_activity = Instant::now();
-    loop {
-        let pending_pong_deadline_snapshot = pending_pong_deadline;
-        // 控制和 client close 必须先于输出队列处理；快速切换时旧 attach 才能及时取消。
-        // 中文注释：push drain 只在主循环内按预算推进，writer 成功发送不再产生回调。
-        // 队列容量就是背压边界，避免高频发送回执反过来饿住输入、close 和 pong。
-        tokio::select! {
-            biased;
-
-            _ = tokio::time::sleep_until(idle_deadline), if websocket_idle_timeout_enabled() => {
-                warn!(peer_addr = %peer_addr, "websocket idle timeout");
-                break;
-            }
-            _ = async move {
-                if let Some(deadline) = pending_pong_deadline_snapshot {
-                    tokio::time::sleep_until(deadline).await;
-                } else {
-                    std::future::pending::<()>().await;
-                }
-            } => {
-                warn!(peer_addr = %peer_addr, "websocket pong timed out");
-                break;
-            }
-            maybe_message = receiver.next() => {
-                let Some(message) = maybe_message else {
-                    break;
-                };
-                let message = match message {
-                    Ok(message) => message,
-                    Err(error) => {
-                        warn!(%error, "websocket receive failed");
-                        break;
-                    }
-                };
-                let now = Instant::now();
-                idle_deadline = now + WEBSOCKET_IDLE_TIMEOUT;
-                last_activity = now;
-                traffic.record_in(&message);
-                debug!(
-                    peer_addr = %peer_addr,
-                    message_kind = websocket_message_kind(&message),
-                    message_bytes = websocket_message_bytes(&message),
-                    "websocket inbound frame received"
-                );
-
-                match message {
-                    Message::Ping(payload) => {
-                        let pong_bytes = payload.len();
-                        if enqueue_websocket_control_raw(
-                            &write_wire_tx,
-                            WebSocketOutKind::Pong,
-                            Message::Pong(payload),
-                        )
-                        .await
-                        .is_err() {
-                            traffic.record_send_error();
-                            attach_summary.record_send_error();
-                            break;
-                        }
-                        traffic.record_queued_raw(WebSocketOutKind::Pong, pong_bytes);
-                        maybe_log_websocket_traffic(
-                            peer_addr,
-                            &mut traffic,
-                            &mut last_traffic_log,
-                            &mut connection,
-                            current_websocket_watcher_counts(
-                                &watched_output_sessions,
-                                &watched_activity_sessions,
-                                &watched_cwd_sessions,
-                                &watched_resize_sessions,
-                            ),
-                            false,
-                        );
-                        continue;
-                    }
-                    Message::Pong(_) => {
-                        pending_pong_deadline = None;
-                        maybe_log_websocket_traffic(
-                            peer_addr,
-                            &mut traffic,
-                            &mut last_traffic_log,
-                            &mut connection,
-                            current_websocket_watcher_counts(
-                                &watched_output_sessions,
-                                &watched_activity_sessions,
-                                &watched_cwd_sessions,
-                                &watched_resize_sessions,
-                            ),
-                            false,
-                        );
-                        continue;
-                    }
-                    Message::Close(_) => break,
-                    other => {
-                        attach_summary.mark_client_payload();
-                        let Some(wire_message) = (match message_to_wire_message(other) {
-                            Ok(message) => message,
-                            Err(error) => {
-                                let responses =
-                                    vec![ProtocolWireMessage::Json(plaintext_error(error))];
-                                let response_count = responses.len();
-                                let response_bytes = websocket_wire_messages_wire_len(&responses);
-                                if enqueue_websocket_wire(
-                                    &write_wire_tx,
-                                    WebSocketOutKind::PlainError,
-                                    responses,
-                                )
-                                .await
-                                .is_err()
-                                {
-                                    traffic.record_send_error();
-                                    attach_summary.record_send_error();
-                                    break;
-                                }
-                                traffic.record_out(
-                                    WebSocketOutKind::PlainError,
-                                    response_count,
-                                    response_bytes,
-                                );
-                                maybe_log_websocket_traffic(
-                                    peer_addr,
-                                    &mut traffic,
-                                    &mut last_traffic_log,
-                                    &mut connection,
-                                    current_websocket_watcher_counts(
-                                        &watched_output_sessions,
-                                        &watched_activity_sessions,
-                                        &watched_cwd_sessions,
-                                        &watched_resize_sessions,
-                                    ),
-                                    false,
-                                );
-                                continue;
-                            }
-                        }) else {
-                            break;
-                        };
-
-                        let responses = match connection.prepare_wire_message(wire_message) {
-                            Ok(prepared) => {
-                                handle_prepared_server_wire_message(
-                                    protocol.clone(),
-                                    &mut connection,
-                                    prepared,
-                                )
-                                .await
-                            }
-                            Err(error) => vec![connection.wire_error_response(error)],
-                        };
-                        queue_deferred_output_wakeups(&mut connection, &mut push_event_queue);
-                        let response_count = responses.len();
-                        let response_bytes = websocket_wire_messages_wire_len(&responses);
-
-                        if enqueue_websocket_wire(
-                            &write_wire_tx,
-                            WebSocketOutKind::Response,
-                            responses,
-                        )
-                        .await
-                        .is_err()
-                        {
-                            traffic.record_send_error();
-                            attach_summary.record_send_error();
-                            break;
-                        }
-                        traffic.record_out(
-                            WebSocketOutKind::Response,
-                            response_count,
-                            response_bytes,
-                        );
-
-                        let initial_output_sessions = register_session_watchers(
-                            &connection,
-                            &protocol,
-                            &mut watched_output_sessions,
-                            &mut watched_activity_sessions,
-                            &mut watched_cwd_sessions,
-                            &mut watched_resize_sessions,
-                            &push_event_tx,
-                            &mut watcher_tasks,
-                        )
-                        .await;
-                        register_metadata_watchers(
-                            &connection,
-                            &protocol,
-                            &mut watched_metadata_clients,
-                            &mut watched_metadata_status_interval_ms,
-                            &push_event_tx,
-                            &mut metadata_watcher_tasks,
-                        )
-                        .await;
-                        queue_initial_output_events(&initial_output_sessions, &mut push_event_queue);
-                        if let Err(()) = drain_websocket_push_events(
-                            &protocol,
-                            &mut connection,
-                            &mut push_event_queue,
-                            &write_wire_tx,
-                            &mut traffic,
-                            &push_event_tx,
-                            &mut push_drain_wake_pending,
-                        )
-                        .await
-                        {
-                            traffic.record_send_error();
-                            attach_summary.record_send_error();
-                            break;
-                        }
-                        attach_summary.record_push_output_batch(
-                            traffic.out_push_output.calls,
-                            traffic.out_push_output.bytes,
-                        );
-                        maybe_log_websocket_traffic(
-                            peer_addr,
-                            &mut traffic,
-                            &mut last_traffic_log,
-                            &mut connection,
-                            current_websocket_watcher_counts(
-                                &watched_output_sessions,
-                                &watched_activity_sessions,
-                                &watched_cwd_sessions,
-                                &watched_resize_sessions,
-                            ),
-                            false,
-                        );
-                    }
-                };
-            }
-            maybe_failed = writer_failed_rx.recv() => {
-                if maybe_failed.is_some() {
-                    traffic.record_send_error();
-                    attach_summary.record_send_error();
-                    warn!(
-                        peer_addr = %peer_addr,
-                        "websocket writer reported failure"
-                    );
-                }
-                maybe_log_websocket_traffic(
-                    peer_addr,
-                    &mut traffic,
-                    &mut last_traffic_log,
-                    &mut connection,
-                    current_websocket_watcher_counts(
-                        &watched_output_sessions,
-                        &watched_activity_sessions,
-                        &watched_cwd_sessions,
-                        &watched_resize_sessions,
-                    ),
-                    false,
-                );
-                break;
-            }
-            _ = heartbeat.tick() => {
-                if pending_pong_deadline.is_none()
-                    && last_activity.elapsed() >= WEBSOCKET_HEARTBEAT_INTERVAL
-                {
-                    let ping_bytes = 0;
-                    if enqueue_websocket_control_raw(
-                        &write_wire_tx,
-                        WebSocketOutKind::Ping,
-                        Message::Ping(Vec::new()),
-                    )
-                    .await
-                    .is_err()
-                    {
-                        traffic.record_send_error();
-                        attach_summary.record_send_error();
-                        break;
-                    }
-                    traffic.record_queued_raw(WebSocketOutKind::Ping, ping_bytes);
-                    maybe_log_websocket_traffic(
-                        peer_addr,
-                        &mut traffic,
-                        &mut last_traffic_log,
-                        &mut connection,
-                        current_websocket_watcher_counts(
-                            &watched_output_sessions,
-                            &watched_activity_sessions,
-                            &watched_cwd_sessions,
-                            &watched_resize_sessions,
-                        ),
-                        false,
-                    );
-                    pending_pong_deadline = Some(Instant::now() + WEBSOCKET_PONG_DEADLINE);
-                }
-            }
-            maybe_event = push_event_rx.recv() => {
-                let Some(event) = maybe_event else {
-                    break;
-                };
-                idle_deadline = Instant::now() + WEBSOCKET_IDLE_TIMEOUT;
-                push_drain_wake_pending = false;
-                debug!(
-                    peer_addr = %peer_addr,
-                    event = event.label(),
-                    session_id = ?event.session_id(),
-                    queue_pending_before = push_event_queue.len(),
-                    "websocket push event received from watcher"
-                );
-                push_event_queue.enqueue(event);
-                if let Err(()) = drain_websocket_push_events(
-                    &protocol,
-                    &mut connection,
-                    &mut push_event_queue,
-                    &write_wire_tx,
-                    &mut traffic,
-                    &push_event_tx,
-                    &mut push_drain_wake_pending,
-                )
-                .await
-                {
-                    traffic.record_send_error();
-                    attach_summary.record_send_error();
-                    break;
-                }
-                attach_summary.record_push_output_batch(
-                    traffic.out_push_output.calls,
-                    traffic.out_push_output.bytes,
-                );
-                maybe_log_websocket_traffic(
-                    peer_addr,
-                    &mut traffic,
-                    &mut last_traffic_log,
-                    &mut connection,
-                            current_websocket_watcher_counts(
-                        &watched_output_sessions,
-                        &watched_activity_sessions,
-                        &watched_cwd_sessions,
-                        &watched_resize_sessions,
-                    ),
-                    false,
-                );
-            }
-        }
-    }
-
-    maybe_log_websocket_traffic(
-        peer_addr,
-        &mut traffic,
-        &mut last_traffic_log,
-        &mut connection,
-        current_websocket_watcher_counts(
-            &watched_output_sessions,
-            &watched_activity_sessions,
-            &watched_cwd_sessions,
-            &watched_resize_sessions,
-        ),
-        true,
-    );
-
-    let attach_summary_snapshot = attach_summary.snapshot(
-        &connection,
-        current_websocket_watcher_counts(
-            &watched_output_sessions,
-            &watched_activity_sessions,
-            &watched_cwd_sessions,
-            &watched_resize_sessions,
-        ),
-    );
-    if attach_summary_snapshot.should_promote_to_info() {
-        info!(
-            peer_addr = %peer_addr,
-            duration_ms = attach_summary_snapshot.duration_ms,
-            attached_sessions = ?attach_summary_snapshot.attached_sessions,
-            watched_sessions = attach_summary_snapshot.watched_sessions,
-            client_payload_seen = attach_summary_snapshot.client_payload_seen,
-            push_output_seen = attach_summary_snapshot.push_output_seen,
-            push_output_batches = attach_summary_snapshot.push_output_batches,
-            push_output_bytes = attach_summary_snapshot.push_output_bytes,
-            send_errors = attach_summary_snapshot.send_errors,
-            "websocket attach summary"
-        );
-    } else {
-        debug!(
-            peer_addr = %peer_addr,
-            duration_ms = attach_summary_snapshot.duration_ms,
-            attached_sessions = ?attach_summary_snapshot.attached_sessions,
-            watched_sessions = attach_summary_snapshot.watched_sessions,
-            client_payload_seen = attach_summary_snapshot.client_payload_seen,
-            push_output_seen = attach_summary_snapshot.push_output_seen,
-            push_output_batches = attach_summary_snapshot.push_output_batches,
-            push_output_bytes = attach_summary_snapshot.push_output_bytes,
-            send_errors = attach_summary_snapshot.send_errors,
-            "websocket attach summary"
-        );
-    }
-
-    for task in watcher_tasks {
-        task.abort();
-    }
-    for task in metadata_watcher_tasks {
-        task.abort();
-    }
-
-    let mut protocol = protocol.lock().await;
-    connection.close(&mut protocol);
-    drop(protocol);
-    // 中文注释：进入业务态后，WebSocket 断开就是当前 client context 的生命周期结束。
-    // 此时不能继续 drain 已入队的 terminal/file push，否则旧连接关闭后还会尝试写 socket，
-    // 既浪费带宽，也会刷出 misleading 的 "Sending after closing" 日志。
-    drop(write_wire_tx);
-    writer_task.abort();
-    let _ = writer_task.await;
-    debug!("websocket connection closed and detached");
-}
-
-fn queue_websocket_push_drain_wakeup(
-    queue: &SessionPushEventQueue,
-    push_event_tx: &mpsc::Sender<SessionPushEvent>,
-    push_drain_wake_pending: &mut bool,
-) {
-    if *push_drain_wake_pending {
-        return;
-    }
-    let Some(event) = queue.peek_front() else {
-        return;
-    };
-    // 中文注释：唤醒只把 pending 事件交回主循环，不能在当前调用栈继续递归 drain。
-    // 大输出需要按预算让出调度权，避免压住输入、close 和 pong。
-    if push_event_tx.try_send(event).is_ok() {
-        *push_drain_wake_pending = true;
-        debug!(
-            event = event.label(),
-            session_id = ?event.session_id(),
-            queue_pending = queue.len(),
-            "websocket push drain wakeup queued"
-        );
-    } else {
-        warn!(
-            event = event.label(),
-            session_id = ?event.session_id(),
-            queue_pending = queue.len(),
-            "websocket push drain wakeup queue full"
-        );
-    }
-}
-
-fn websocket_push_drain_budget_exhausted(
-    drained_events: usize,
-    enqueued_bytes: usize,
-    started_at: Instant,
-) -> bool {
-    let elapsed_budget_exhausted =
-        drained_events > 0 && started_at.elapsed() >= WEBSOCKET_PUSH_DRAIN_MAX_ELAPSED_PER_TICK;
-    drained_events >= WEBSOCKET_PUSH_DRAIN_MAX_EVENTS_PER_TICK
-        || enqueued_bytes >= WEBSOCKET_PUSH_DRAIN_MAX_ENQUEUED_BYTES_PER_TICK
-        || elapsed_budget_exhausted
-}
-
-fn websocket_wire_messages_wire_len(messages: &[ProtocolWireMessage]) -> usize {
-    messages
-        .iter()
-        .map(|message| match message {
-            ProtocolWireMessage::Json(envelope) => match serde_json::to_vec(envelope) {
-                Ok(raw) => raw.len(),
-                Err(_) => 0,
-            },
-            ProtocolWireMessage::Binary(raw) => raw.len(),
-        })
-        .sum()
-}
-
-async fn drain_websocket_push_events(
-    protocol: &SharedDaemonProtocol,
-    connection: &mut ProtocolConnection,
-    queue: &mut SessionPushEventQueue,
-    write_wire_tx: &mpsc::Sender<WebSocketWrite>,
-    traffic: &mut WebSocketTrafficCounters,
-    push_event_tx: &mpsc::Sender<SessionPushEvent>,
-    push_drain_wake_pending: &mut bool,
-) -> Result<(), ()> {
-    let started_at = Instant::now();
-    let mut drained_events = 0_usize;
-    let mut enqueued_bytes = 0_usize;
-    while queue.has_pending() {
-        debug!(
-            queue_pending = queue.len(),
-            drained_events, enqueued_bytes, "websocket push drain reserving writer queue"
-        );
-        let permit = match write_wire_tx.reserve().await {
-            Ok(permit) => permit,
-            Err(_) => {
-                warn!(
-                    queue_pending = queue.len(),
-                    drained_events,
-                    enqueued_bytes,
-                    "websocket writer queue closed while reserving push output"
-                );
-                return Err(());
-            }
-        };
-        let Some(event) = queue.pop_front_after_queue_accept() else {
-            break;
-        };
-        debug!(
-            event = event.label(),
-            session_id = ?event.session_id(),
-            queue_pending_after_pop = queue.len(),
-            "websocket push event dequeued"
-        );
-        let (kind, responses) = collect_websocket_push_event(protocol, connection, event).await;
-        queue_deferred_output_wakeups(connection, queue);
-        if responses.is_empty() {
-            drained_events = drained_events.saturating_add(1);
-            if websocket_push_drain_budget_exhausted(drained_events, enqueued_bytes, started_at) {
-                log_websocket_push_drain_reschedule(
-                    kind,
-                    drained_events,
-                    enqueued_bytes,
-                    queue.len(),
-                    started_at.elapsed(),
-                );
-                queue_websocket_push_drain_wakeup(queue, push_event_tx, push_drain_wake_pending);
-                break;
-            }
-            continue;
-        }
-        let response_count = responses.len();
-        let batch_bytes = websocket_wire_messages_wire_len(&responses);
-        permit.send(WebSocketWrite::Wire {
-            kind,
-            messages: responses,
-        });
-        debug!(
-            kind = kind.label(),
-            response_count,
-            batch_bytes,
-            queue_pending = queue.len(),
-            "websocket push batch accepted by writer queue"
-        );
-        traffic.record_out(kind, response_count, batch_bytes);
-        drained_events = drained_events.saturating_add(1);
-        enqueued_bytes = enqueued_bytes.saturating_add(batch_bytes);
-        // 中文注释：统计记录 queue accepted，而不是 socket send completed。
-        // 成功入队就是这条连接的背压边界；失败只在 writer 层关闭连接。
-        if websocket_push_drain_budget_exhausted(drained_events, enqueued_bytes, started_at) {
-            // 中文注释：直连 WebSocket 和 relay 使用同一类输出调度预算。
-            // 一轮输出入队后主动回到 select!，让输入、cancel、close、pong 和新 attach
-            // 有机会插队处理，避免多个大输出窗口一起占住 daemon 协议状态。
-            log_websocket_push_drain_reschedule(
-                kind,
-                drained_events,
-                enqueued_bytes,
-                queue.len(),
-                started_at.elapsed(),
-            );
-            queue_websocket_push_drain_wakeup(queue, push_event_tx, push_drain_wake_pending);
-            break;
-        }
-    }
-    Ok(())
-}
-
-fn log_websocket_push_drain_reschedule(
-    kind: WebSocketOutKind,
-    drained_events: usize,
-    enqueued_bytes: usize,
-    pending_events: usize,
-    elapsed: Duration,
-) {
-    if pending_events == 0 {
-        return;
-    }
-    debug!(
-        kind = kind.label(),
-        drained_events,
-        enqueued_bytes,
-        pending_events,
-        elapsed_ms = elapsed.as_millis(),
-        "websocket push drain rescheduled"
-    );
-}
-
-async fn collect_websocket_push_event(
-    protocol: &SharedDaemonProtocol,
-    connection: &mut ProtocolConnection,
-    event: SessionPushEvent,
-) -> (WebSocketOutKind, Vec<ProtocolWireMessage>) {
-    match event {
-        SessionPushEvent::Output(session_id) => {
-            let lock_started = Instant::now();
-            let collect_started = Instant::now();
-            let (lock_wait, messages) = {
-                let mut protocol = protocol.lock().await;
-                let lock_wait = lock_started.elapsed();
-                // 中文注释：protocol lock 只覆盖 PTY/runtime 读取；E2EE 加密在锁外完成。
-                // 这能避免某个直连 WebSocket 的大输出阻塞 relay mux 或其它直连输入。
-                let messages = connection.drain_session_output_messages_for_push(
-                    &mut protocol,
-                    session_id,
-                    OUTPUT_FLUSH_MAX_BYTES_PER_SESSION,
-                );
-                (lock_wait, messages)
-            };
-            let collect_elapsed = collect_started.elapsed();
-            if lock_wait >= WEBSOCKET_SEND_DEBUG_LOG_THRESHOLD
-                || collect_elapsed >= WEBSOCKET_SEND_DEBUG_LOG_THRESHOLD
-            {
-                debug!(
-                    session_id = ?session_id,
-                    lock_wait_ms = lock_wait.as_millis(),
-                    collect_ms = collect_elapsed.as_millis(),
-                    "websocket output collection latency"
-                );
-            }
-            (
-                WebSocketOutKind::PushOutput,
-                connection.encrypt_collected_inner_messages_wire(messages),
-            )
-        }
-        SessionPushEvent::Activity(session_id) => {
-            let mut protocol = protocol.lock().await;
-            (
-                WebSocketOutKind::PushActivity,
-                connection.read_session_activity_wire(&mut protocol, session_id),
-            )
-        }
-        SessionPushEvent::Cwd(session_id) => {
-            let messages = {
-                let mut protocol = protocol.lock().await;
-                connection.read_session_cwd_update_messages(&mut protocol, session_id)
-            };
-            (
-                WebSocketOutKind::PushCwd,
-                connection.encrypt_collected_inner_messages_wire(messages),
-            )
-        }
-        SessionPushEvent::Resize(session_id) => {
-            let messages = {
-                let mut protocol = protocol.lock().await;
-                connection.read_session_resize_update_messages(&mut protocol, session_id)
-            };
-            (
-                WebSocketOutKind::PushResize,
-                connection.encrypt_collected_inner_messages_wire(messages),
-            )
-        }
-        SessionPushEvent::MetadataClients => {
-            let messages = {
-                let mut protocol = protocol.lock().await;
-                connection.read_metadata_clients_snapshot_messages(&mut protocol)
-            };
-            (
-                WebSocketOutKind::PushMetadataClients,
-                connection.encrypt_collected_inner_messages_wire(messages),
-            )
-        }
-        SessionPushEvent::MetadataStatus => {
-            let messages = connection.read_metadata_status_snapshot_messages();
-            (
-                WebSocketOutKind::PushMetadataStatus,
-                connection.encrypt_collected_inner_messages_wire(messages),
-            )
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn register_session_watchers(
-    connection: &ProtocolConnection,
-    protocol: &SharedDaemonProtocol,
-    watched_output_sessions: &mut HashSet<SessionId>,
-    watched_activity_sessions: &mut HashSet<SessionId>,
-    watched_cwd_sessions: &mut HashSet<SessionId>,
-    watched_resize_sessions: &mut HashSet<SessionId>,
-    push_event_tx: &mpsc::Sender<SessionPushEvent>,
-    watcher_tasks: &mut Vec<JoinHandle<()>>,
-) -> Vec<SessionId> {
-    let mut initial_output_sessions = Vec::new();
-    let (output_signals, activity_signals, cwd_signals, resize_signals) = {
-        let protocol = protocol.lock().await;
-        (
-            connection.attached_output_signals(&protocol),
-            connection.session_activity_signals(&protocol),
-            connection.attached_cwd_signals(&protocol),
-            connection.attached_resize_signals(&protocol),
-        )
-    };
-    let desired_output_sessions: HashSet<_> = output_signals
-        .iter()
-        .map(|(session_id, _)| *session_id)
-        .collect();
-    let desired_activity_sessions: HashSet<_> = activity_signals
-        .iter()
-        .map(|(session_id, _)| *session_id)
-        .collect();
-    let desired_cwd_sessions: HashSet<_> = cwd_signals
-        .iter()
-        .map(|(session_id, _)| *session_id)
-        .collect();
-    let desired_resize_sessions: HashSet<_> = resize_signals
-        .iter()
-        .map(|(session_id, _)| *session_id)
-        .collect();
-
-    if !watched_output_sessions.is_subset(&desired_output_sessions)
-        || !watched_activity_sessions.is_subset(&desired_activity_sessions)
-        || !watched_cwd_sessions.is_subset(&desired_cwd_sessions)
-        || !watched_resize_sessions.is_subset(&desired_resize_sessions)
-    {
-        // 中文注释：切换 terminal stream 后旧 session 不应继续产生 push。
-        // 一旦发现当前 watcher 集合不再是 desired 集合的子集，就整体重建本连接 watcher。
-        debug!("rebuilding websocket watchers after subscription set changed");
-        for task in watcher_tasks.drain(..) {
-            task.abort();
-        }
-        watched_output_sessions.clear();
-        watched_activity_sessions.clear();
-        watched_cwd_sessions.clear();
-        watched_resize_sessions.clear();
-    }
-
-    for (session_id, signal) in output_signals {
-        if !watched_output_sessions.insert(session_id) {
-            continue;
-        }
-        initial_output_sessions.push(session_id);
-
-        spawn_session_push_watcher(
-            session_id,
-            signal,
-            SessionPushEvent::Output(session_id),
-            push_event_tx,
-            watcher_tasks,
-        );
-    }
-
-    for (session_id, signal) in activity_signals {
-        if !watched_activity_sessions.insert(session_id) {
-            continue;
-        }
-        if watched_output_sessions.contains(&session_id) {
-            continue;
-        }
-
-        spawn_session_push_watcher(
-            session_id,
-            signal,
-            SessionPushEvent::Activity(session_id),
-            push_event_tx,
-            watcher_tasks,
-        );
-    }
-
-    for (session_id, signal) in cwd_signals {
-        if !watched_cwd_sessions.insert(session_id) {
-            continue;
-        }
-
-        spawn_session_push_watcher(
-            session_id,
-            signal,
-            SessionPushEvent::Cwd(session_id),
-            push_event_tx,
-            watcher_tasks,
-        );
-    }
-
-    for (session_id, signal) in resize_signals {
-        if !watched_resize_sessions.insert(session_id) {
-            continue;
-        }
-
-        spawn_session_push_watcher(
-            session_id,
-            signal,
-            SessionPushEvent::Resize(session_id),
-            push_event_tx,
-            watcher_tasks,
-        );
-    }
-
-    initial_output_sessions
-}
-
-async fn register_metadata_watchers(
-    connection: &ProtocolConnection,
-    protocol: &SharedDaemonProtocol,
-    watched_metadata_clients: &mut bool,
-    watched_metadata_status_interval_ms: &mut Option<u64>,
-    push_event_tx: &mpsc::Sender<SessionPushEvent>,
-    metadata_watcher_tasks: &mut Vec<JoinHandle<()>>,
-) {
-    let (clients_signal, status_interval_ms) = {
-        let protocol = protocol.lock().await;
-        (
-            connection.metadata_clients_signal(&protocol),
-            connection.metadata_status_interval_ms(),
-        )
-    };
-    let desired_clients = clients_signal.is_some();
-    let desired_status_interval_ms = status_interval_ms;
-
-    if *watched_metadata_clients != desired_clients
-        || *watched_metadata_status_interval_ms != desired_status_interval_ms
-    {
-        debug!("rebuilding websocket metadata watchers after subscription set changed");
-        for task in metadata_watcher_tasks.drain(..) {
-            task.abort();
-        }
-        *watched_metadata_clients = false;
-        *watched_metadata_status_interval_ms = None;
-    }
-
-    if let Some(signal) = clients_signal
-        && !*watched_metadata_clients
-    {
-        *watched_metadata_clients = true;
-        spawn_metadata_clients_push_watcher(signal, push_event_tx, metadata_watcher_tasks);
-    }
-
-    if let Some(interval_ms) = desired_status_interval_ms
-        && *watched_metadata_status_interval_ms != Some(interval_ms)
-    {
-        *watched_metadata_status_interval_ms = Some(interval_ms);
-        spawn_metadata_status_push_watcher(interval_ms, push_event_tx, metadata_watcher_tasks);
-    }
-}
-
-fn queue_initial_output_events(
-    initial_output_sessions: &[SessionId],
-    push_event_queue: &mut SessionPushEventQueue,
-) {
-    for session_id in initial_output_sessions {
-        // attach/create 刚完成时 watcher 会忽略当前 watch 值；显式排一次输出读取，
-        // 但让它走 push 队列，给 close、cancel、pong 等控制事件抢先处理的机会。
-        push_event_queue.enqueue(SessionPushEvent::Output(*session_id));
-        debug!(
-            session_id = ?session_id,
-            queue_pending = push_event_queue.len(),
-            "websocket initial output event queued"
-        );
-    }
-}
-
-fn queue_deferred_output_wakeups(
-    connection: &mut ProtocolConnection,
-    push_event_queue: &mut SessionPushEventQueue,
-) {
-    for session_id in connection.take_deferred_output_wakeups() {
-        // 中文注释：terminal 输出不再等待 flow credit；这里只处理 batch/transport 上限
-        // 造成的后续 drain，让 input/cancel/pong 可以先被 select 处理。
-        push_event_queue.enqueue(SessionPushEvent::Output(session_id));
-        debug!(
-            session_id = ?session_id,
-            queue_pending = push_event_queue.len(),
-            "websocket deferred output event queued"
-        );
-    }
-}
-
-fn spawn_session_push_watcher<T>(
-    session_id: SessionId,
-    mut signal: watch::Receiver<T>,
-    event: SessionPushEvent,
-    push_event_tx: &mpsc::Sender<SessionPushEvent>,
-    watcher_tasks: &mut Vec<JoinHandle<()>>,
-) where
-    T: Clone + Send + Sync + 'static,
-{
-    // watch 新订阅者可能把当前版本视为“未读”；先标记已读，避免 attach 时把历史输出
-    // 误推成 session_activity，导致前端一直显示 new output。
-    signal.borrow_and_update();
-
-    let push_event_tx = push_event_tx.clone();
-    let min_interval = event.min_interval();
-    let coalesce_delay = event.coalesce_delay();
-    watcher_tasks.push(tokio::spawn(async move {
-        loop {
-            if signal.changed().await.is_err() {
-                break;
-            }
-            if let Some(delay) = coalesce_delay {
-                tokio::time::sleep(delay).await;
-                // 中文注释：coalesce 窗口内发生的多次 watch 更新只需要一个 push 事件；
-                // 真正读取时会从 daemon terminal log 一次 drain 已累计的 frames。
-                signal.borrow_and_update();
-            }
-            let next_event = match event {
-                SessionPushEvent::Output(_) => SessionPushEvent::Output(session_id),
-                SessionPushEvent::Activity(_) => SessionPushEvent::Activity(session_id),
-                SessionPushEvent::Cwd(_) => SessionPushEvent::Cwd(session_id),
-                SessionPushEvent::Resize(_) => SessionPushEvent::Resize(session_id),
-                SessionPushEvent::MetadataClients | SessionPushEvent::MetadataStatus => event,
-            };
-            if push_event_tx.send(next_event).await.is_err() {
-                debug!(
-                    event = next_event.label(),
-                    session_id = ?session_id,
-                    "websocket push watcher stopped because event queue closed"
-                );
-                break;
-            }
-            debug!(
-                event = next_event.label(),
-                session_id = ?session_id,
-                "websocket push watcher enqueued event"
-            );
-            if let Some(interval) = min_interval {
-                tokio::time::sleep(interval).await;
-            }
-        }
-    }));
-}
-
-fn spawn_metadata_clients_push_watcher(
-    mut signal: watch::Receiver<u64>,
-    push_event_tx: &mpsc::Sender<SessionPushEvent>,
-    watcher_tasks: &mut Vec<JoinHandle<()>>,
-) {
-    // 中文注释：subscribe 响应已经携带初始 clients snapshot；这里跳过当前 watch 版本，
-    // 只在后续在线/attach/offline 变化时推送。
-    signal.borrow_and_update();
-
-    let push_event_tx = push_event_tx.clone();
-    watcher_tasks.push(tokio::spawn(async move {
-        loop {
-            if signal.changed().await.is_err() {
-                break;
-            }
-            signal.borrow_and_update();
-            if push_event_tx
-                .send(SessionPushEvent::MetadataClients)
-                .await
-                .is_err()
-            {
-                debug!("websocket metadata clients watcher stopped because event queue closed");
-                break;
-            }
-            debug!("websocket metadata clients watcher enqueued event");
-        }
-    }));
-}
-
-fn spawn_metadata_status_push_watcher(
-    interval_ms: u64,
-    push_event_tx: &mpsc::Sender<SessionPushEvent>,
-    watcher_tasks: &mut Vec<JoinHandle<()>>,
-) {
-    let push_event_tx = push_event_tx.clone();
-    watcher_tasks.push(tokio::spawn(async move {
-        let interval = Duration::from_millis(interval_ms);
-        loop {
-            tokio::time::sleep(interval).await;
-            if push_event_tx
-                .send(SessionPushEvent::MetadataStatus)
-                .await
-                .is_err()
-            {
-                debug!("websocket metadata status watcher stopped because event queue closed");
-                break;
-            }
-            debug!("websocket metadata status watcher enqueued event");
-        }
-    }));
-}
-
-fn message_to_envelope(message: Message) -> Result<Option<JsonEnvelope>, ProtocolError> {
-    match message {
-        Message::Text(raw) => serde_json::from_str(&raw)
-            .map(Some)
-            .map_err(|_| ProtocolError::InvalidEnvelope),
-        Message::Binary(raw) => serde_json::from_slice(&raw)
-            .map(Some)
-            .map_err(|_| ProtocolError::InvalidEnvelope),
-        Message::Close(_) | Message::Ping(_) | Message::Pong(_) => Ok(None),
-    }
-}
-
-fn message_to_wire_message(message: Message) -> Result<Option<ProtocolWireMessage>, ProtocolError> {
-    match message {
-        Message::Text(raw) => serde_json::from_str(&raw)
-            .map(|envelope| Some(ProtocolWireMessage::Json(envelope)))
-            .map_err(|_| ProtocolError::InvalidEnvelope),
-        Message::Binary(raw) => Ok(Some(ProtocolWireMessage::Binary(raw.to_vec()))),
-        Message::Close(_) | Message::Ping(_) | Message::Pong(_) => Ok(None),
-    }
-}
-
-fn plaintext_error(error: ProtocolError) -> JsonEnvelope {
-    envelope_value(
-        MessageType::Error,
-        ErrorPayload {
-            code: error.code().to_owned(),
-            message: error.safe_message().to_owned(),
-        },
-    )
-    .expect("error payload should serialize")
-}
-
-fn route_prelude_timeout_error() -> JsonEnvelope {
-    envelope_value(
-        MessageType::Error,
-        ErrorPayload {
-            code: "route_prelude_timeout".to_owned(),
-            message: "route prelude timed out".to_owned(),
-        },
-    )
-    .expect("route prelude timeout payload should serialize")
-}
-
-async fn enqueue_websocket_wire(
-    tx: &mpsc::Sender<WebSocketWrite>,
-    kind: WebSocketOutKind,
-    messages: Vec<ProtocolWireMessage>,
-) -> Result<(), ()> {
-    // 中文注释：所有已经完成 E2EE 的业务帧都必须进入同一个 FIFO。
-    // 这样 response、push_output、error 的相对顺序就和加密顺序一致，不会把 seq 打乱。
-    if messages.is_empty() {
-        return Ok(());
-    }
-    let message_count = messages.len();
-    let bytes = websocket_wire_messages_wire_len(&messages);
-    tx.send(WebSocketWrite::Wire { kind, messages })
-        .await
-        .map(|()| {
-            debug!(
-                kind = kind.label(),
-                messages = message_count,
-                bytes,
-                "websocket writer queue accepted wire batch"
-            );
-        })
-        .map_err(|_| {
-            warn!(
-                kind = kind.label(),
-                messages = message_count,
-                bytes,
-                "websocket writer queue closed while enqueueing wire batch"
-            );
-        })
-}
-
-async fn enqueue_websocket_control_raw(
-    tx: &mpsc::Sender<WebSocketWrite>,
-    kind: WebSocketOutKind,
-    message: Message,
-) -> Result<(), ()> {
-    // 中文注释：WebSocket 控制帧也走同一条 writer queue。队列满时等待容量，
-    // 让当前连接整体承压，而不是再维护一条旁路控制队列。
-    let message_kind = websocket_message_kind(&message);
-    let bytes = websocket_message_bytes(&message);
-    tx.send(WebSocketWrite::Raw { kind, message })
-        .await
-        .map(|()| {
-            debug!(
-                kind = kind.label(),
-                message_kind, bytes, "websocket writer queue accepted raw frame"
-            );
-        })
-        .map_err(|_| {
-            warn!(
-                kind = kind.label(),
-                message_kind, bytes, "websocket writer queue closed while enqueueing raw frame"
-            );
-        })
-}
-
-async fn run_websocket_writer(
-    peer_addr: SocketAddr,
-    mut wire_rx: mpsc::Receiver<WebSocketWrite>,
-    writer_failed_tx: mpsc::Sender<()>,
-    mut sender: futures_util::stream::SplitSink<WebSocket, Message>,
-) {
-    // 中文注释：writer 只负责把有界队列里的内容顺序写入 WebSocket。
-    // 成功写入不再回报；queue accepted 已经是本连接的背压边界。
-    while let Some(write) = wire_rx.recv().await {
-        let snapshot = write.debug_snapshot();
-        debug!(
-            peer_addr = %peer_addr,
-            kind = snapshot.kind.label(),
-            messages = snapshot.messages,
-            bytes = snapshot.bytes,
-            raw = snapshot.raw,
-            "websocket writer dequeued frame"
-        );
-        if !send_websocket_write(peer_addr, &mut sender, write).await {
-            let _ = writer_failed_tx.try_send(());
-            break;
-        }
-    }
-    debug!(peer_addr = %peer_addr, "websocket writer stopped");
-}
-
-async fn finish_websocket_writer(
-    write_wire_tx: mpsc::Sender<WebSocketWrite>,
-    writer_task: JoinHandle<()>,
-) {
-    // 中文注释：关闭所有 producer 后让 writer 自然 drain 已接受的队列内容。
-    // queue accepted 是输出责任边界；正常收尾不能再 abort 掉已入队帧。
-    drop(write_wire_tx);
-    let _ = writer_task.await;
-}
-
-async fn send_websocket_write(
-    peer_addr: SocketAddr,
-    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
-    write: WebSocketWrite,
-) -> bool {
-    match write {
-        WebSocketWrite::Wire { kind, messages } => {
-            send_wire_messages_logged(peer_addr, sender, messages, kind.label())
-                .await
-                .is_ok()
-        }
-        WebSocketWrite::Raw { kind, message } => {
-            let deadline = match kind {
-                WebSocketOutKind::Pong => WEBSOCKET_PONG_DEADLINE,
-                _ => WEBSOCKET_SEND_DEADLINE,
-            };
-            send_message_with_deadline(sender, message, deadline, "websocket control frame")
-                .await
-                .is_ok()
-        }
-    }
-}
-
-async fn send_message_with_deadline(
-    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
-    message: Message,
-    deadline: Duration,
-    context: &'static str,
-) -> Result<(), ()> {
-    match timeout(deadline, sender.send(message)).await {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(error)) => {
-            warn!(%error, context = context, "websocket send failed");
-            Err(())
-        }
-        Err(_) => {
-            warn!(
-                layer = "termd",
-                phase = "websocket_send",
-                timeout_code = "websocket_send_timeout",
-                timeout_ms = deadline.as_millis() as u64,
-                ?deadline,
-                context = context,
-                "websocket send timed out"
-            );
-            Err(())
-        }
-    }
-}
-
-async fn send_envelope_logged(
-    peer_addr: SocketAddr,
-    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
-    envelope: JsonEnvelope,
-    label: &'static str,
-    log_send: bool,
-) -> Result<usize, ()> {
-    let raw = serde_json::to_string(&envelope).map_err(|error| {
-        warn!(%error, "failed to serialize websocket envelope");
-    })?;
-    let bytes = raw.len();
-    let started_at = Instant::now();
-
-    send_message_with_deadline(
-        sender,
-        Message::Text(raw),
-        WEBSOCKET_SEND_DEADLINE,
-        "websocket envelope",
-    )
-    .await?;
-    if log_send {
-        log_websocket_send(
-            peer_addr,
-            label,
-            1,
-            bytes,
-            started_at.elapsed(),
-            "websocket send batch",
-        );
-    }
-    Ok(bytes)
-}
-
-async fn send_wire_messages_logged(
-    peer_addr: SocketAddr,
-    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
-    messages: Vec<ProtocolWireMessage>,
-    label: &'static str,
-) -> Result<usize, ()> {
-    let message_count = messages.len();
-    let mut bytes = 0_usize;
-    let started_at = Instant::now();
-    for message in messages {
-        match message {
-            ProtocolWireMessage::Json(envelope) => {
-                bytes = bytes.saturating_add(
-                    send_envelope_logged(peer_addr, sender, envelope, label, false).await?,
-                );
-            }
-            ProtocolWireMessage::Binary(raw) => {
-                let len = raw.len();
-                send_message_with_deadline(
-                    sender,
-                    Message::Binary(raw),
-                    WEBSOCKET_SEND_DEADLINE,
-                    "websocket binary packet",
-                )
-                .await?;
-                bytes = bytes.saturating_add(len);
-            }
-        }
-    }
-    log_websocket_send(
-        peer_addr,
-        label,
-        message_count,
-        bytes,
-        started_at.elapsed(),
-        "websocket send batch",
-    );
-    Ok(bytes)
-}
-
-fn log_websocket_send(
-    peer_addr: SocketAddr,
-    label: &str,
-    envelopes: usize,
-    bytes: usize,
-    elapsed: Duration,
-    event: &'static str,
-) {
-    let elapsed_ms = elapsed.as_millis();
-    let promote_to_info = elapsed >= WEBSOCKET_SEND_SLOW_LOG_THRESHOLD
-        || envelopes >= WEBSOCKET_SEND_INFO_BATCH_ENVELOPES
-        || bytes >= WEBSOCKET_SEND_INFO_BATCH_BYTES;
-    let emit_debug = elapsed >= WEBSOCKET_SEND_DEBUG_LOG_THRESHOLD
-        || envelopes >= WEBSOCKET_SEND_DEBUG_BATCH_ENVELOPES
-        || bytes >= WEBSOCKET_SEND_DEBUG_BATCH_BYTES;
-
-    if promote_to_info {
-        info!(
-            peer_addr = %peer_addr,
-            label,
-            envelopes,
-            bytes,
-            elapsed_ms,
-            "{event}"
-        );
-    } else if emit_debug {
-        debug!(
-            peer_addr = %peer_addr,
-            label,
-            envelopes,
-            bytes,
-            elapsed_ms,
-            "{event}"
-        );
-    }
 }
 
 #[cfg(test)]
@@ -4112,27 +1667,16 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use termd_proto::{
-        ClientHelloKind, ClientHelloPayload, DaemonClientsResultPayload, DaemonStatusResultPayload,
-        DeviceId, E2eeKeyExchangePayload, Envelope, HttpE2eeAuthPayload, MetadataSubscribePayload,
-        PairAcceptPayload, PairRequestPayload, PublicKey, SessionCreatePayload,
-        SessionCreatedPayload, SessionCwdChangedPayload, SessionDataPayload,
-        SessionFileDownloadStreamReadyPayload, SessionFileHttpDownloadPayload,
-        SessionFileHttpUploadReadyPayload, SessionFileHttpUploadStreamPayload,
-        SessionFileUploadPayload, SessionScopeGrantPayload, Signature, TerminalSize,
+        DeviceId, Nonce, PublicKey, SessionCreatePayload, Signature, TerminalSize,
         UnixTimestampMillis,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::time::{Duration, timeout};
+    use tokio::time::Duration;
     use tokio_tungstenite::tungstenite::Message as ClientWsMessage;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-    use crate::auth::{HttpE2eeSigningInput, current_unix_timestamp_millis};
-    use crate::config::SecretString;
-    use crate::net::protocol::{
-        ProtocolConnection, decode_payload, encrypted_frame_from_envelope, envelope_value,
-    };
-    use crate::net::{
-        E2eeKeyPair, E2eePeerPublicKey, E2eeSession, E2eeSessionContext, E2eeSessionRole,
-    };
+    use crate::auth::{AccessTokenProofInput, current_unix_timestamp_millis};
+    use crate::net::protocol::ProtocolConnection;
     use crate::runtime::SessionRuntime;
     use crate::state::{
         DaemonState, SessionStateRecord, StateStore, client_history::ClientHistoryStore,
@@ -4152,389 +1696,6 @@ mod tests {
     type TestWs = tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >;
-
-    #[test]
-    fn websocket_traffic_ignores_empty_output_pushes() {
-        let mut traffic = WebSocketTrafficCounters::default();
-
-        traffic.record_out(WebSocketOutKind::PushOutput, 0, 0);
-
-        assert!(!traffic.has_activity());
-    }
-
-    #[test]
-    fn websocket_binary_message_stays_opaque_for_protocol_layer() {
-        let raw = b"TD2E-binary-frame".to_vec();
-        let decoded = message_to_wire_message(Message::Binary(raw.clone()))
-            .expect("binary websocket message should be accepted")
-            .expect("binary websocket message should not be control frame");
-
-        assert_eq!(decoded, ProtocolWireMessage::Binary(raw));
-    }
-
-    #[test]
-    fn websocket_attach_summary_tracks_sessions_and_missing_output() {
-        let session_id = SessionId::new();
-        let suspicious = WebSocketAttachSummary {
-            duration_ms: 1_000,
-            attached_sessions: vec![session_id],
-            watched_sessions: 1,
-            client_payload_seen: true,
-            push_output_seen: false,
-            push_output_batches: 0,
-            push_output_bytes: 0,
-            send_errors: 0,
-        };
-        let healthy = WebSocketAttachSummary {
-            duration_ms: 1_000,
-            attached_sessions: vec![session_id],
-            watched_sessions: 1,
-            client_payload_seen: true,
-            push_output_seen: true,
-            push_output_batches: 2,
-            push_output_bytes: 512,
-            send_errors: 0,
-        };
-
-        assert!(suspicious.should_promote_to_info());
-        assert!(!healthy.should_promote_to_info());
-    }
-
-    #[test]
-    fn websocket_push_queue_coalesces_duplicate_pending_events() {
-        let session_id = SessionId::new();
-        let mut queue = SessionPushEventQueue::default();
-
-        queue.enqueue(SessionPushEvent::Output(session_id));
-        queue.enqueue(SessionPushEvent::Output(session_id));
-
-        assert_eq!(
-            queue.pop_front_after_queue_accept(),
-            Some(SessionPushEvent::Output(session_id))
-        );
-        assert_eq!(queue.pop_front_after_queue_accept(), None);
-    }
-
-    #[test]
-    fn websocket_push_wakeup_peeks_pending_event_without_draining() {
-        let session_id = SessionId::new();
-        let event = SessionPushEvent::Output(session_id);
-        let mut queue = SessionPushEventQueue::default();
-        let (tx, mut rx) = mpsc::channel(1);
-        let mut wake_pending = false;
-
-        queue.enqueue(event);
-        queue_websocket_push_drain_wakeup(&queue, &tx, &mut wake_pending);
-        queue_websocket_push_drain_wakeup(&queue, &tx, &mut wake_pending);
-
-        // 中文注释：唤醒只是把 pending 事件交回主循环调度，不能同步 drain。
-        // writer queue accepted 才是输出责任边界，不再等待 socket 成功发送回执。
-        assert_eq!(queue.peek_front(), Some(event));
-        assert_eq!(rx.try_recv(), Ok(event));
-        assert_eq!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty));
-        assert!(wake_pending);
-    }
-
-    #[tokio::test]
-    async fn websocket_output_watcher_coalesces_bursty_terminal_signals() {
-        let session_id = SessionId::new();
-        let (signal_tx, signal_rx) = watch::channel(0_u64);
-        let (push_event_tx, mut push_event_rx) = mpsc::channel(8);
-        let mut watcher_tasks = Vec::new();
-
-        spawn_session_push_watcher(
-            session_id,
-            signal_rx,
-            SessionPushEvent::Output(session_id),
-            &push_event_tx,
-            &mut watcher_tasks,
-        );
-
-        signal_tx.send(1).unwrap();
-        signal_tx.send(2).unwrap();
-        signal_tx.send(3).unwrap();
-
-        // 中文注释：高频 PTY 输出不能一变更就立刻形成一个 WebSocket 小包；
-        // watcher 应该等待一个很短 coalesce 窗口，让 daemon 一次 drain 已累计的 frames。
-        assert!(
-            tokio::time::timeout(Duration::from_millis(5), push_event_rx.recv())
-                .await
-                .is_err(),
-            "output watcher should not push immediately for bursty terminal output"
-        );
-        assert_eq!(
-            tokio::time::timeout(Duration::from_millis(100), push_event_rx.recv())
-                .await
-                .unwrap(),
-            Some(SessionPushEvent::Output(session_id))
-        );
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), push_event_rx.recv())
-                .await
-                .is_err(),
-            "coalesced watch changes should produce one output event"
-        );
-
-        for task in watcher_tasks {
-            task.abort();
-        }
-    }
-
-    #[tokio::test]
-    async fn websocket_wire_queue_preserves_e2ee_sequence_order_across_kinds() {
-        let (wire_tx, mut wire_rx) = mpsc::channel(4);
-
-        enqueue_websocket_wire(
-            &wire_tx,
-            WebSocketOutKind::PushOutput,
-            vec![ProtocolWireMessage::Binary(vec![3])],
-        )
-        .await
-        .unwrap();
-        enqueue_websocket_wire(
-            &wire_tx,
-            WebSocketOutKind::Response,
-            vec![ProtocolWireMessage::Binary(vec![4])],
-        )
-        .await
-        .unwrap();
-
-        // 中文注释：PushOutput 和 Response 都是 E2EE 业务帧，不能再分队列插队。
-        // 这里用 3/4 模拟已加密 sequence，保证 writer 看到的顺序就是加密顺序。
-        let first = wire_rx.try_recv().unwrap();
-        let second = wire_rx.try_recv().unwrap();
-        match first {
-            WebSocketWrite::Wire { kind, messages } => {
-                assert_eq!(kind, WebSocketOutKind::PushOutput);
-                assert_eq!(messages, vec![ProtocolWireMessage::Binary(vec![3])]);
-            }
-            other => panic!("expected first wire write, got {other:?}"),
-        }
-        match second {
-            WebSocketWrite::Wire { kind, messages } => {
-                assert_eq!(kind, WebSocketOutKind::Response);
-                assert_eq!(messages, vec![ProtocolWireMessage::Binary(vec![4])]);
-            }
-            other => panic!("expected second wire write, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn websocket_push_drain_requeues_when_data_queue_is_full() {
-        let protocol = test_protocol("websocket-data-queue-full");
-        let (mut connection, _) = {
-            let protocol = protocol.lock().await;
-            protocol.start_connection()
-        };
-        let (write_wire_tx, mut _write_wire_rx) = mpsc::channel(1);
-        let event = SessionPushEvent::Output(SessionId::new());
-        let mut queue = SessionPushEventQueue::default();
-        queue.enqueue(event);
-        write_wire_tx
-            .try_send(WebSocketWrite::Wire {
-                kind: WebSocketOutKind::PushOutput,
-                messages: Vec::new(),
-            })
-            .unwrap();
-
-        let (push_event_tx, _push_event_rx) = mpsc::channel(1);
-        let mut wake_pending = false;
-        let mut traffic = WebSocketTrafficCounters::default();
-        let mut drain = Box::pin(drain_websocket_push_events(
-            &protocol,
-            &mut connection,
-            &mut queue,
-            &write_wire_tx,
-            &mut traffic,
-            &push_event_tx,
-            &mut wake_pending,
-        ));
-
-        tokio::select! {
-            result = &mut drain => panic!("drain should wait for writer queue capacity, got {result:?}"),
-            _ = tokio::time::sleep(Duration::from_millis(20)) => {}
-        }
-        drop(drain);
-        assert_eq!(queue.peek_front(), Some(event));
-
-        let _queued = _write_wire_rx.try_recv().unwrap();
-        drain_websocket_push_events(
-            &protocol,
-            &mut connection,
-            &mut queue,
-            &write_wire_tx,
-            &mut traffic,
-            &push_event_tx,
-            &mut wake_pending,
-        )
-        .await
-        .unwrap();
-
-        // 中文注释：queue accepted 是输出责任边界。容量释放后事件才会被弹出，
-        // 避免 writer queue 满时提前消费 daemon terminal cache。
-        assert_eq!(queue.peek_front(), None);
-    }
-
-    #[test]
-    fn websocket_push_drain_budget_limits_hot_loop() {
-        // 中文注释：direct WebSocket 和 relay 一样走高速 terminal 字节流；
-        // 小 batch 只适合低频交互输出，大量输出必须保留 MB 级 in-flight 空间。
-        let output_flush_max_bytes_per_session = OUTPUT_FLUSH_MAX_BYTES_PER_SESSION;
-        let enqueued_bytes_per_tick = WEBSOCKET_PUSH_DRAIN_MAX_ENQUEUED_BYTES_PER_TICK;
-        assert!(output_flush_max_bytes_per_session >= 512 * 1024);
-        assert!(enqueued_bytes_per_tick >= 8 * 1024 * 1024);
-        assert!(!websocket_push_drain_budget_exhausted(
-            1,
-            1024,
-            Instant::now()
-        ));
-        assert!(websocket_push_drain_budget_exhausted(
-            WEBSOCKET_PUSH_DRAIN_MAX_EVENTS_PER_TICK,
-            0,
-            Instant::now()
-        ));
-        assert!(websocket_push_drain_budget_exhausted(
-            1,
-            WEBSOCKET_PUSH_DRAIN_MAX_ENQUEUED_BYTES_PER_TICK,
-            Instant::now()
-        ));
-        assert!(websocket_push_drain_budget_exhausted(
-            1,
-            0,
-            Instant::now() - Duration::from_secs(60)
-        ));
-    }
-
-    #[test]
-    fn websocket_push_drain_budget_stops_after_elapsed_window() {
-        let started_at = Instant::now() - WEBSOCKET_PUSH_DRAIN_MAX_ELAPSED_PER_TICK;
-
-        // 中文注释：时间预算只在至少 drain 过一个事件后生效，避免空 tick 自旋。
-        assert!(websocket_push_drain_budget_exhausted(1, 1024, started_at));
-        assert!(!websocket_push_drain_budget_exhausted(0, 1024, started_at));
-    }
-
-    #[tokio::test]
-    async fn websocket_push_drain_stops_after_event_budget_and_wakes_once() {
-        let protocol = test_protocol("websocket-drain-budget");
-        let (mut connection, _) = {
-            let protocol = protocol.lock().await;
-            protocol.start_connection()
-        };
-        let (write_wire_tx, _write_wire_rx) = mpsc::channel(WEBSOCKET_WIRE_QUEUE_CAPACITY);
-        let (push_event_tx, mut push_event_rx) = mpsc::channel(8);
-        let mut queue = SessionPushEventQueue::default();
-        let mut wake_pending = false;
-        let mut traffic = WebSocketTrafficCounters::default();
-        let events: Vec<_> = (0..WEBSOCKET_PUSH_DRAIN_MAX_EVENTS_PER_TICK + 2)
-            .map(|_| SessionPushEvent::Output(SessionId::new()))
-            .collect();
-        for event in &events {
-            queue.enqueue(*event);
-        }
-
-        drain_websocket_push_events(
-            &protocol,
-            &mut connection,
-            &mut queue,
-            &write_wire_tx,
-            &mut traffic,
-            &push_event_tx,
-            &mut wake_pending,
-        )
-        .await
-        .unwrap();
-
-        // 中文注释：即使当前事件没有真实输出，direct drain 也必须按事件预算让出调度权。
-        // 否则多窗口快速切换时，一个连接能在同一轮 select 里清完大量 session 事件。
-        assert!(wake_pending);
-        assert!(queue.has_pending());
-        assert_eq!(
-            push_event_rx.try_recv(),
-            Ok(events[WEBSOCKET_PUSH_DRAIN_MAX_EVENTS_PER_TICK])
-        );
-        assert_eq!(
-            push_event_rx.try_recv(),
-            Err(mpsc::error::TryRecvError::Empty)
-        );
-    }
-
-    #[tokio::test]
-    async fn websocket_metadata_push_collector_encrypts_snapshot_events() {
-        let protocol = test_protocol("websocket-metadata-push-collector");
-        let (mut connection, mut device_session) =
-            authenticated_metadata_connection(protocol.clone(), true, Some(1_000)).await;
-        pair_extra_device_for_metadata_signal(protocol.clone()).await;
-
-        let (clients_kind, clients_wire) = collect_websocket_push_event(
-            &protocol,
-            &mut connection,
-            SessionPushEvent::MetadataClients,
-        )
-        .await;
-        assert_eq!(clients_kind, WebSocketOutKind::PushMetadataClients);
-        let clients = decrypt_wire_messages(&mut device_session, clients_wire);
-        assert_eq!(clients.len(), 1);
-        assert_eq!(clients[0].kind, MessageType::DaemonClientsSnapshot);
-        let clients_payload: DaemonClientsResultPayload =
-            decode_payload(clients[0].payload.clone()).unwrap();
-        assert!(!clients_payload.clients.is_empty());
-
-        let (status_kind, status_wire) = collect_websocket_push_event(
-            &protocol,
-            &mut connection,
-            SessionPushEvent::MetadataStatus,
-        )
-        .await;
-        assert_eq!(status_kind, WebSocketOutKind::PushMetadataStatus);
-        let status = decrypt_wire_messages(&mut device_session, status_wire);
-        assert_eq!(status.len(), 1);
-        assert_eq!(status[0].kind, MessageType::DaemonStatusSnapshot);
-        let status_payload: DaemonStatusResultPayload =
-            decode_payload(status[0].payload.clone()).unwrap();
-        assert_eq!(status_payload.load_avg.len(), 3);
-    }
-
-    #[tokio::test]
-    async fn websocket_metadata_clients_watcher_wakes_on_client_changes() {
-        let protocol = test_protocol("websocket-metadata-clients-watcher");
-        let (connection, _device_session) =
-            authenticated_metadata_connection(protocol.clone(), true, None).await;
-        let (push_event_tx, mut push_event_rx) = mpsc::channel(8);
-        let mut watched_metadata_clients = false;
-        let mut watched_metadata_status_interval_ms = None;
-        let mut watcher_tasks = Vec::new();
-
-        register_metadata_watchers(
-            &connection,
-            &protocol,
-            &mut watched_metadata_clients,
-            &mut watched_metadata_status_interval_ms,
-            &push_event_tx,
-            &mut watcher_tasks,
-        )
-        .await;
-
-        // 中文注释：subscribe 响应已经带初始 snapshot，watcher 注册后不能立刻重复推送。
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), push_event_rx.recv())
-                .await
-                .is_err()
-        );
-
-        pair_extra_device_for_metadata_signal(protocol.clone()).await;
-
-        assert_eq!(
-            tokio::time::timeout(Duration::from_millis(200), push_event_rx.recv())
-                .await
-                .unwrap(),
-            Some(SessionPushEvent::MetadataClients)
-        );
-
-        for task in watcher_tasks {
-            task.abort();
-        }
-    }
 
     static TEST_CONFIG_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -4745,6 +1906,739 @@ mod tests {
     fn router_exposes_healthz_and_ws_routes() {
         let protocol = test_protocol("router");
         let _router = router(protocol.clone(), false);
+    }
+
+    #[tokio::test]
+    async fn v070_router_exposes_dual_workspace_websockets() {
+        let app = router(
+            test_protocol("dual-workspace-websockets").protocol.clone(),
+            false,
+        );
+        for path in ["/ws/metadata", "/ws/terminal"] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_ne!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn v070_router_does_not_expose_legacy_runtime_websocket() {
+        let response = router(
+            test_protocol("legacy-runtime-ws-removed").protocol.clone(),
+            false,
+        )
+        .oneshot(Request::builder().uri("/ws").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn v070_application_http_failures_are_json() {
+        let app = router(test_protocol("json-errors").protocol.clone(), true);
+        for request in [
+            Request::builder()
+                .uri("/api/unknown")
+                .body(Body::empty())
+                .unwrap(),
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/auth/challenge")
+                .body(Body::empty())
+                .unwrap(),
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/auth/challenge")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        ] {
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert!(response.status().is_client_error());
+            assert_eq!(
+                response
+                    .headers()
+                    .get(CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("application/json")
+            );
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert!(value["error"]["code"].is_string(), "{value}");
+            assert!(value["error"]["message"].is_string(), "{value}");
+            assert!(value["error"]["retryable"].is_boolean(), "{value}");
+        }
+    }
+
+    #[tokio::test]
+    async fn v070_file_transfer_routes_replace_legacy_http_e2ee_paths() {
+        let app = router(test_protocol("v070-file-routes").protocol.clone(), false);
+        for (method, path) in [
+            (Method::POST, "/api/files/uploads"),
+            (Method::PUT, "/api/files/uploads/upload-id/chunks"),
+            (Method::POST, "/api/files/uploads/upload-id/commit"),
+            (Method::POST, "/api/files/uploads/upload-id/abort"),
+            (Method::POST, "/api/files/downloads"),
+            (Method::GET, "/api/files/downloads/download-id"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"]["code"], "authorization_required", "{path}");
+        }
+        for path in [
+            "/api/files/upload/init",
+            "/api/files/upload",
+            "/api/files/upload/abort",
+            "/api/files/download",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"]["code"], "not_found", "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn v070_file_transfer_cors_allows_chunk_upload_and_download() {
+        let app = router(test_protocol("v070-file-cors").protocol.clone(), false);
+        for (method, path, headers) in [
+            (
+                "PUT",
+                "/api/files/uploads/upload-id/chunks",
+                "authorization,content-range,x-termd-server-id",
+            ),
+            (
+                "GET",
+                "/api/files/downloads/download-id",
+                "authorization,x-termd-server-id",
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::OPTIONS)
+                        .uri(path)
+                        .header("origin", "http://127.0.0.1:4173")
+                        .header("access-control-request-method", method)
+                        .header("access-control-request-headers", headers)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(
+                response.status().is_success(),
+                "{method} {path}: {}",
+                response.status(),
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get("access-control-allow-origin")
+                    .and_then(|value| value.to_str().ok()),
+                Some("*"),
+                "{method} {path}",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn v070_file_transfer_uploads_chunks_commits_and_downloads_raw_bytes() {
+        let fixture = test_protocol("v070-file-transfer-state-machine");
+        let (device_id, access_token) = v070_access_token_for_test(&fixture.protocol).await;
+        let session_id = {
+            let mut protocol = fixture.protocol.lock().await;
+            let mut connection = ProtocolConnection::authenticated_v070_terminal(device_id);
+            let opened = protocol
+                .open_v070_terminal(
+                    &mut connection,
+                    V070TerminalOpen::Create(SessionCreatePayload {
+                        command: vec!["sh".into()],
+                        size: TerminalSize::new(24, 80),
+                    }),
+                )
+                .unwrap();
+            let session_id = opened.created.unwrap().session_id;
+            connection.close(&mut protocol);
+            session_id
+        };
+        let name = format!(".termd-v070-file-test-{}", SessionId::new().0);
+        let target = std::env::current_dir().unwrap().join(&name);
+        let app = router(fixture.protocol.clone(), false);
+        let authorization = format!("Bearer {access_token}");
+
+        let created = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/files/uploads")
+                    .header("authorization", &authorization)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "session_id": session_id,
+                            "path": name,
+                            "size_bytes": 6,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let created: serde_json::Value =
+            serde_json::from_slice(&to_bytes(created.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let upload_id = created["upload_id"].as_str().unwrap();
+
+        let chunk = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri(format!("/api/files/uploads/{upload_id}/chunks"))
+                    .header("authorization", &authorization)
+                    .header("content-range", "bytes 0-5/6")
+                    .body(Body::from("abcdef"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(chunk.status(), StatusCode::OK);
+
+        let committed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/files/uploads/{upload_id}/commit"))
+                    .header("authorization", &authorization)
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(committed.status(), StatusCode::OK);
+
+        let download = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/files/downloads")
+                    .header("authorization", &authorization)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "session_id": session_id,
+                            "path": name,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(download.status(), StatusCode::CREATED);
+        let download: serde_json::Value =
+            serde_json::from_slice(&to_bytes(download.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let download_id = download["download_id"].as_str().unwrap();
+
+        let bytes = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/api/files/downloads/{download_id}"))
+                    .header("authorization", &authorization)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bytes.status(), StatusCode::OK);
+        assert_eq!(
+            &to_bytes(bytes.into_body(), usize::MAX).await.unwrap()[..],
+            b"abcdef",
+        );
+        fs::remove_file(target).ok();
+    }
+
+    #[tokio::test]
+    async fn v070_removed_http_session_polling_routes_are_not_mounted() {
+        let app = router(test_protocol("removed-http-routes").protocol.clone(), false);
+        for path in [
+            "/api/control/session/list",
+            "/api/control/session/00000000-0000-0000-0000-000000000000/attach",
+            "/api/control/session/00000000-0000-0000-0000-000000000000/cursor",
+            "/api/control/session/00000000-0000-0000-0000-000000000000/resize",
+            "/api/control/daemon/clients",
+            "/api/control/daemon/status",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn v070_pair_certificate_challenge_and_access_token_chain() {
+        let fixture = test_protocol("credential-chain");
+        let app = router(fixture.protocol.clone(), false);
+        let local = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/local/pairing-token")
+                    .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 12345))))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(local.status(), StatusCode::OK);
+        let local: serde_json::Value =
+            serde_json::from_slice(&to_bytes(local.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let pair_ticket = local["token"].as_str().unwrap();
+        assert_eq!(pair_ticket.split('.').count(), 3);
+
+        let device_key = SigningKey::generate(&mut OsRng);
+        let device_id = DeviceId::new();
+        let device_public_key = format!(
+            "ed25519-v1:{}",
+            base64::engine::general_purpose::STANDARD.encode(device_key.verifying_key().as_bytes())
+        );
+        let pair = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/auth/pair")
+                    .header("authorization", format!("TermdPair {pair_ticket}"))
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "device_id": device_id,
+                            "device_public_key": device_public_key,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(pair.status(), StatusCode::OK);
+        let pair: serde_json::Value =
+            serde_json::from_slice(&to_bytes(pair.into_body(), usize::MAX).await.unwrap()).unwrap();
+        let certificate = pair["device_certificate"].as_str().unwrap();
+
+        let migration_challenge = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/auth/device-certificate/migrate/challenge")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"device_id": device_id}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(migration_challenge.status(), StatusCode::OK);
+        let migration_challenge: serde_json::Value = serde_json::from_slice(
+            &to_bytes(migration_challenge.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let migration_challenge_value = migration_challenge["challenge"].as_str().unwrap();
+        let migration_nonce = "device-migration-proof-nonce";
+        let migration_timestamp_ms = current_unix_timestamp_millis().0;
+        let server_id = local["server_id"].as_str().unwrap();
+        let migration_signing_input = format!(
+            "termd-access-token-v1\nserver_id={server_id}\ndevice_id={}\nchallenge={migration_challenge_value}\nnonce={migration_nonce}\ntimestamp_ms={migration_timestamp_ms}\n",
+            device_id.0,
+        );
+        let migration_signature = format!(
+            "ed25519-v1:{}",
+            base64::engine::general_purpose::STANDARD.encode(
+                device_key
+                    .sign(migration_signing_input.as_bytes())
+                    .to_bytes()
+            )
+        );
+        let migration = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/auth/device-certificate/migrate")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "device_id": device_id,
+                            "challenge": migration_challenge_value,
+                            "nonce": migration_nonce,
+                            "timestamp_ms": migration_timestamp_ms,
+                            "signature": migration_signature,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(migration.status(), StatusCode::OK);
+        let migration: serde_json::Value =
+            serde_json::from_slice(&to_bytes(migration.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            migration["device_certificate"]
+                .as_str()
+                .unwrap()
+                .split('.')
+                .count(),
+            3
+        );
+
+        let challenge = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/auth/challenge")
+                    .header("authorization", format!("TermdDevice {certificate}"))
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"device_id": device_id}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(challenge.status(), StatusCode::OK);
+        let challenge: serde_json::Value =
+            serde_json::from_slice(&to_bytes(challenge.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let challenge_value = challenge["challenge"].as_str().unwrap();
+        let nonce = "access-proof-nonce";
+        let timestamp_ms = current_unix_timestamp_millis().0;
+        let server_id = local["server_id"].as_str().unwrap();
+        let signing_input = format!(
+            "termd-access-token-v1\nserver_id={server_id}\ndevice_id={}\nchallenge={challenge_value}\nnonce={nonce}\ntimestamp_ms={timestamp_ms}\n",
+            device_id.0,
+        );
+        let signature = format!(
+            "ed25519-v1:{}",
+            base64::engine::general_purpose::STANDARD
+                .encode(device_key.sign(signing_input.as_bytes()).to_bytes())
+        );
+        let access = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/auth/access-token")
+                    .header("authorization", format!("TermdDevice {certificate}"))
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "device_id": device_id,
+                            "challenge": challenge_value,
+                            "nonce": nonce,
+                            "timestamp_ms": timestamp_ms,
+                            "signature": signature,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(access.status(), StatusCode::OK);
+        let access: serde_json::Value =
+            serde_json::from_slice(&to_bytes(access.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            access["access_token"].as_str().unwrap().split('.').count(),
+            3
+        );
+        assert_eq!(
+            access["expires_at_ms"].as_u64().unwrap() - access["issued_at_ms"].as_u64().unwrap(),
+            300_000
+        );
+    }
+
+    async fn v070_access_token_for_test(protocol: &SharedDaemonProtocol) -> (DeviceId, String) {
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let device_id = DeviceId::new();
+        let public_key = PublicKey(format!(
+            "ed25519-v1:{}",
+            base64::engine::general_purpose::STANDARD
+                .encode(signing_key.verifying_key().as_bytes())
+        ));
+        let now_ms = current_unix_timestamp_millis();
+        let mut guard = protocol.lock().await;
+        let (ticket, _) = guard.issue_pair_ticket_credential(now_ms).unwrap();
+        let certificate = guard
+            .pair_device_certificate(&ticket, device_id, public_key, now_ms)
+            .unwrap();
+        let challenge = guard
+            .issue_access_token_challenge(&certificate, device_id, now_ms)
+            .unwrap();
+        let mut payload = termd_proto::AuthPayload {
+            device_id,
+            challenge: challenge.challenge,
+            nonce: Nonce(format!("v070-ws-test-{}", ServerId::new().0)),
+            timestamp_ms: now_ms,
+            signature: Signature(String::new()),
+        };
+        payload.signature = Signature(format!(
+            "ed25519-v1:{}",
+            base64::engine::general_purpose::STANDARD.encode(
+                signing_key
+                    .sign(
+                        &AccessTokenProofInput {
+                            server_id: guard.server_id(),
+                            payload: &payload,
+                        }
+                        .to_bytes(),
+                    )
+                    .to_bytes(),
+            )
+        ));
+        let (token, _) = guard
+            .exchange_access_token(&certificate, payload, now_ms)
+            .unwrap();
+        (device_id, token)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn v070_workspace_websockets_authenticate_and_stream_snapshots() {
+        let fixture = test_protocol("workspace-websocket-upgrade");
+        let (_, access_token) = v070_access_token_for_test(&fixture.protocol).await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_protocol = fixture.protocol.clone();
+        let server = tokio::spawn(async move {
+            let _ = serve_listener(listener, server_protocol, false).await;
+        });
+
+        let mut metadata_request = format!("ws://{addr}/ws/metadata")
+            .into_client_request()
+            .unwrap();
+        metadata_request.headers_mut().insert(
+            "sec-websocket-protocol",
+            format!("termd.v0.7, {access_token}").parse().unwrap(),
+        );
+        let (mut metadata, response) = tokio_tungstenite::connect_async(metadata_request)
+            .await
+            .expect("metadata websocket should upgrade");
+        assert_eq!(
+            response
+                .headers()
+                .get("sec-websocket-protocol")
+                .and_then(|value| value.to_str().ok()),
+            Some("termd.v0.7")
+        );
+        let metadata_snapshot = metadata.next().await.unwrap().unwrap().into_text().unwrap();
+        let metadata_snapshot: serde_json::Value =
+            serde_json::from_str(&metadata_snapshot).unwrap();
+        assert_eq!(metadata_snapshot["type"], "metadata.snapshot");
+        assert_eq!(metadata_snapshot["payload"]["revision"], 1);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut terminal_request = format!("ws://{addr}/ws/terminal")
+            .into_client_request()
+            .unwrap();
+        terminal_request.headers_mut().insert(
+            "sec-websocket-protocol",
+            format!("termd.v0.7, {access_token}").parse().unwrap(),
+        );
+        let (mut terminal, _) = tokio_tungstenite::connect_async(terminal_request)
+            .await
+            .expect("terminal websocket should upgrade");
+        terminal
+            .send(ClientWsMessage::Text(
+                serde_json::json!({
+                    "type": "terminal.create",
+                    "payload": {
+                        "command": ["sh"],
+                        "size": TerminalSize::new(24, 80),
+                    },
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        let created: serde_json::Value =
+            serde_json::from_str(&terminal.next().await.unwrap().unwrap().into_text().unwrap())
+                .unwrap();
+        assert_eq!(created["type"], "terminal.created");
+        let snapshot: serde_json::Value =
+            serde_json::from_str(&terminal.next().await.unwrap().unwrap().into_text().unwrap())
+                .unwrap();
+        assert_eq!(snapshot["type"], "terminal.snapshot");
+        assert!(snapshot["payload"]["cursor"]["row"].as_u64().unwrap() >= 1);
+        assert!(snapshot["payload"]["cursor"]["col"].as_u64().unwrap() >= 1);
+
+        let metadata_update = tokio::time::timeout(Duration::from_millis(250), metadata.next())
+            .await
+            .expect("session creation should push metadata without a polling delay")
+            .unwrap()
+            .unwrap()
+            .into_text()
+            .unwrap();
+        let metadata_update: serde_json::Value = serde_json::from_str(&metadata_update).unwrap();
+        assert_eq!(metadata_update["type"], "metadata.update");
+        assert_eq!(metadata_update["payload"]["revision"], 2);
+        assert_eq!(
+            metadata_update["payload"]["state"]["sessions"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let _ = terminal.close(None).await;
+        let _ = metadata.close(None).await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn v070_close_session_uses_one_bearer_authenticated_json_request() {
+        let fixture = test_protocol("v070-json-close");
+        let (device_id, access_token) = v070_access_token_for_test(&fixture.protocol).await;
+        let session_id = {
+            let mut protocol = fixture.protocol.lock().await;
+            let mut connection = ProtocolConnection::authenticated_v070_terminal(device_id);
+            let opened = protocol
+                .open_v070_terminal(
+                    &mut connection,
+                    V070TerminalOpen::Create(SessionCreatePayload {
+                        command: vec!["sh".into()],
+                        size: TerminalSize::new(24, 80),
+                    }),
+                )
+                .unwrap();
+            let session_id = opened.created.unwrap().session_id;
+            connection.close(&mut protocol);
+            session_id
+        };
+
+        let response = router(fixture.protocol.clone(), false)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/control/session/{}/close", session_id.0))
+                    .header("authorization", format!("Bearer {access_token}"))
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["session_id"], session_id.0.to_string());
+    }
+
+    #[tokio::test]
+    async fn v070_control_rejects_legacy_session_token_and_e2ee_headers_as_json() {
+        let fixture = test_protocol("v070-reject-legacy-http-control");
+        let response = router(fixture.protocol.clone(), false)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/control/session/00000000-0000-0000-0000-000000000401/close")
+                    .header("authorization", "Bearer legacy-session-token")
+                    .header("x-termd-server-id", ServerId::new().0.to_string())
+                    .header("x-termd-device-id", DeviceId::new().0.to_string())
+                    .header("x-termd-session-scope", "legacy-scope-token")
+                    .header("x-termd-e2ee-public-key", "legacy-e2ee-key")
+                    .header("x-termd-e2ee-nonce", "legacy-nonce")
+                    .header("x-termd-e2ee-timestamp-ms", "1")
+                    .header("x-termd-e2ee-signature", "legacy-signature")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["error"]["code"], "access_token_invalid");
+    }
+
+    #[test]
+    fn v070_terminal_create_starts_attached_stream_with_one_based_cursor() {
+        let fixture = test_protocol("terminal-create-snapshot");
+        let mut protocol = fixture.protocol.blocking_lock();
+        let device_id = DeviceId::new();
+        let mut connection = ProtocolConnection::authenticated_v070_terminal(device_id);
+        let opened = protocol
+            .open_v070_terminal(
+                &mut connection,
+                V070TerminalOpen::Create(SessionCreatePayload {
+                    command: vec!["sh".into()],
+                    size: TerminalSize::new(24, 80),
+                }),
+            )
+            .unwrap();
+
+        assert!(opened.created.is_some());
+        assert!((1..=opened.snapshot.size.rows).contains(&opened.snapshot.cursor.row));
+        assert!((1..=opened.snapshot.size.cols).contains(&opened.snapshot.cursor.col));
+        connection.close(&mut protocol);
     }
 
     #[tokio::test]
@@ -4990,1347 +2884,6 @@ mod tests {
         assert!(ws_response.headers().get(CONTENT_ENCODING).is_none());
     }
 
-    #[tokio::test]
-    async fn http_file_upload_init_requires_e2ee_headers() {
-        let protocol = test_protocol("http-file-upload-init-requires-e2ee");
-        let response = router(protocol.clone(), false)
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/files/upload/init")
-                    .body(Body::empty())
-                    .expect("test request should build"),
-            )
-            .await
-            .expect("router should respond");
-
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn http_control_routes_require_bearer_session_token() {
-        let protocol = test_protocol("http-control-requires-bearer");
-        let response = router(protocol.clone(), false)
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/control/session/list")
-                    .body(Body::empty())
-                    .expect("test request should build"),
-            )
-            .await
-            .expect("router should respond");
-
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn http_control_routes_reject_unknown_paths_before_auth() {
-        for path in [
-            "/api/control/auth/verify",
-            "/api/control/auth/session_token",
-            "/api/control/session/not-a-uuid/files",
-        ] {
-            let protocol = test_protocol("http-control-reject-unknown-direct");
-            let response = router(protocol.clone(), false)
-                .oneshot(
-                    Request::builder()
-                        .method("POST")
-                        .uri(path)
-                        .body(Body::empty())
-                        .expect("test request should build"),
-                )
-                .await
-                .expect("router should respond");
-
-            // 中文注释：直连 daemon 与 relay/tunnel 使用同一份 control allowlist；
-            // 未放行的 control 路径必须在认证和协议分发前截止。
-            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
-        }
-    }
-
-    #[tokio::test]
-    async fn http_control_routes_accept_valid_bearer_session_token() {
-        let protocol = test_protocol("http-control-accepts-bearer");
-        let (server_id, device_id, token) = {
-            let mut guard = protocol.lock().await;
-            let server_id = guard.server_id();
-            let device_id = DeviceId::new();
-            let token = guard
-                .issue_session_token(device_id, current_unix_timestamp_millis())
-                .expect("session token should be issued")
-                .token()
-                .0
-                .clone();
-            (server_id, device_id, token)
-        };
-
-        let response = router(protocol.clone(), false)
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/control/session/list")
-                    .header("authorization", format!("Bearer {token}"))
-                    .header("x-termd-server-id", server_id.0.to_string())
-                    .header("x-termd-device-id", device_id.0.to_string())
-                    .body(Body::from("{}"))
-                    .expect("test request should build"),
-            )
-            .await
-            .expect("router should respond");
-
-        assert_ne!(response.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn http_control_session_list_accepts_bearer_and_e2ee_payload() {
-        let protocol = test_protocol("http-control-session-list-e2ee");
-        let signing_key = SigningKey::generate(&mut OsRng);
-        let device_public_key =
-            PublicKey(test_ed25519_wire(signing_key.verifying_key().as_bytes()));
-        let device_id = pair_real_device(protocol.clone(), device_public_key).await;
-        let bearer = {
-            let mut guard = protocol.lock().await;
-            guard
-                .issue_session_token(device_id, current_unix_timestamp_millis())
-                .unwrap()
-                .token()
-                .0
-                .clone()
-        };
-        let (mut request, mut e2ee) = signed_http_e2ee_request(
-            &protocol,
-            &signing_key,
-            device_id,
-            "/api/control/session/list",
-            "http-control-session-list",
-            vec![serde_json::to_vec(&serde_json::json!({})).unwrap()],
-        )
-        .await;
-        let protocol_guard = protocol.lock().await;
-        request
-            .headers_mut()
-            .insert("authorization", format!("Bearer {bearer}").parse().unwrap());
-        request.headers_mut().insert(
-            "x-termd-server-id",
-            protocol_guard.server_id().0.to_string().parse().unwrap(),
-        );
-        request.headers_mut().insert(
-            "x-termd-device-id",
-            device_id.0.to_string().parse().unwrap(),
-        );
-        drop(protocol_guard);
-
-        let response = router(protocol.clone(), false)
-            .oneshot(request)
-            .await
-            .expect("router should respond");
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let response_body = to_bytes(response.into_body(), HTTP_E2EE_INIT_MAX_BYTES)
-            .await
-            .unwrap();
-        let frames = decrypt_http_e2ee_frames(&mut e2ee, &response_body).unwrap();
-        assert!(!frames.is_empty());
-        let packet: ProtocolPacket<serde_json::Value> = serde_json::from_slice(&frames[0]).unwrap();
-        assert_eq!(packet.kind, PacketKind::Response);
-        let payload: termd_proto::SessionListResultPayload =
-            serde_json::from_value(packet.payload).unwrap();
-        assert!(payload.sessions.is_empty());
-    }
-
-    #[tokio::test]
-    async fn http_control_session_files_restores_scope_from_session_scope_token() {
-        let protocol = test_protocol("http-control-session-files-scope");
-        let signing_key = SigningKey::generate(&mut OsRng);
-        let device_public_key =
-            PublicKey(test_ed25519_wire(signing_key.verifying_key().as_bytes()));
-        let (device_id, session_id) =
-            pair_real_device_and_create_session(protocol.clone(), device_public_key).await;
-        let (bearer, scope) = {
-            let mut guard = protocol.lock().await;
-            let bearer = guard
-                .issue_session_token(device_id, current_unix_timestamp_millis())
-                .unwrap()
-                .token()
-                .0
-                .clone();
-            let scope = guard
-                .issue_session_scope_token(device_id, session_id, current_unix_timestamp_millis())
-                .unwrap()
-                .token()
-                .0
-                .clone();
-            (bearer, scope)
-        };
-        let (mut request, mut e2ee) = signed_http_e2ee_request(
-            &protocol,
-            &signing_key,
-            device_id,
-            &format!("/api/control/session/{}/files", session_id.0),
-            "http-control-session-files",
-            vec![serde_json::to_vec(&serde_json::json!({ "session_id": session_id })).unwrap()],
-        )
-        .await;
-        let protocol_guard = protocol.lock().await;
-        request
-            .headers_mut()
-            .insert("authorization", format!("Bearer {bearer}").parse().unwrap());
-        request.headers_mut().insert(
-            "x-termd-server-id",
-            protocol_guard.server_id().0.to_string().parse().unwrap(),
-        );
-        request.headers_mut().insert(
-            "x-termd-device-id",
-            device_id.0.to_string().parse().unwrap(),
-        );
-        request
-            .headers_mut()
-            .insert("x-termd-session-scope", scope.parse().unwrap());
-        drop(protocol_guard);
-
-        let response = router(protocol.clone(), false)
-            .oneshot(request)
-            .await
-            .expect("router should respond");
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let response_body = to_bytes(response.into_body(), HTTP_E2EE_INIT_MAX_BYTES)
-            .await
-            .unwrap();
-        let frames = decrypt_http_e2ee_frames(&mut e2ee, &response_body).unwrap();
-        let packet: ProtocolPacket<serde_json::Value> = serde_json::from_slice(&frames[0]).unwrap();
-        assert_eq!(packet.kind, PacketKind::Response);
-        let payload: termd_proto::SessionFilesResultPayload =
-            serde_json::from_value(packet.payload).unwrap();
-        assert_eq!(payload.session_id, session_id);
-    }
-
-    #[tokio::test]
-    async fn http_file_routes_answer_cors_preflight() {
-        let protocol = test_protocol("http-file-cors-preflight");
-        let response = router(protocol.clone(), false)
-            .oneshot(
-                Request::builder()
-                    .method(Method::OPTIONS)
-                    .uri("/api/files/upload/init")
-                    .header("origin", "http://127.0.0.1:4173")
-                    .header("access-control-request-method", "POST")
-                    .header(
-                        "access-control-request-headers",
-                        "content-type,x-termd-server-id,x-termd-device-id,x-termd-e2ee-public-key,x-termd-e2ee-nonce,x-termd-e2ee-timestamp-ms,x-termd-e2ee-signature",
-                    )
-                    .body(Body::empty())
-                    .expect("test request should build"),
-            )
-            .await
-            .expect("router should respond");
-
-        assert!(response.status().is_success());
-        assert_eq!(
-            response
-                .headers()
-                .get("access-control-allow-origin")
-                .and_then(|value| value.to_str().ok()),
-            Some("*")
-        );
-    }
-
-    #[tokio::test]
-    async fn http_tunnel_rejects_non_api_routes_before_router_dispatch() {
-        let protocol = test_protocol("http-file-tunnel-allowlist");
-        let response = handle_http_tunnel_stream_request(
-            protocol.clone(),
-            "GET".to_owned(),
-            "/healthz".to_owned(),
-            Vec::new(),
-            Body::empty(),
-        )
-        .await;
-
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn http_tunnel_accepts_control_routes_for_router_dispatch() {
-        for path in [
-            "/api/control/session/list",
-            "/api/control/session/reorder",
-            "/api/control/daemon/client_forget",
-        ] {
-            let protocol = test_protocol("http-control-tunnel-allowlist");
-            let response = handle_http_tunnel_stream_request(
-                protocol.clone(),
-                "POST".to_owned(),
-                path.to_owned(),
-                Vec::new(),
-                Body::empty(),
-            )
-            .await;
-
-            // 中文注释：allowlist 只负责放行到 daemon router；没有 bearer 时后续 router 会返回 401。
-            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
-        }
-    }
-
-    #[tokio::test]
-    async fn http_tunnel_rejects_unknown_control_routes_before_router_dispatch() {
-        for path in [
-            "/api/control/auth/verify",
-            "/api/control/session/not-a-uuid/files",
-        ] {
-            let protocol = test_protocol("http-control-tunnel-reject-unknown");
-            let response = handle_http_tunnel_stream_request(
-                protocol.clone(),
-                "POST".to_owned(),
-                path.to_owned(),
-                Vec::new(),
-                Body::empty(),
-            )
-            .await;
-
-            // 中文注释：畸形 session id 不能被当作普通 method 名进入认证层。
-            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
-        }
-    }
-
-    #[tokio::test]
-    async fn http_file_upload_init_accepts_signed_e2ee_body() {
-        let protocol = test_protocol("http-file-upload-init-e2ee");
-        let signing_key = SigningKey::generate(&mut OsRng);
-        let device_public_key =
-            PublicKey(test_ed25519_wire(signing_key.verifying_key().as_bytes()));
-        let (device_id, session_id) =
-            pair_real_device_and_create_session(protocol.clone(), device_public_key.clone()).await;
-        let server_id = protocol.lock().await.server_id();
-        let daemon_identity = protocol.lock().await.daemon_public_identity().clone();
-        let daemon_e2ee_public = protocol.lock().await.e2ee_public_key();
-        let http_keypair = E2eeKeyPair::generate();
-        let _http_e2ee = E2eeSession::new(
-            E2eeSessionRole::Device,
-            &http_keypair,
-            daemon_e2ee_public,
-            E2eeSessionContext::new(
-                server_id,
-                device_id,
-                daemon_e2ee_public,
-                http_keypair.public_key(),
-            ),
-        )
-        .unwrap();
-        let path = "/api/files/upload/init";
-        let mut auth = HttpE2eeAuthPayload {
-            device_id,
-            e2ee_public_key: http_keypair.public_key_wire(),
-            nonce: termd_proto::Nonce("http-upload-init-nonce".to_owned()),
-            timestamp_ms: current_unix_timestamp_millis(),
-            method: "POST".to_owned(),
-            path: path.to_owned(),
-            signature: Signature("ed25519-v1:placeholder".to_owned()),
-        };
-        auth.signature = Signature(test_ed25519_wire(
-            &signing_key
-                .sign(&HttpE2eeSigningInput::from_payload(&auth, &daemon_identity).to_bytes())
-                .to_bytes(),
-        ));
-        let upload_path = format!("http-upload-{}.bin", session_id.0);
-        let request_body = write_http_e2ee_frame(
-            &serde_json::to_vec(&SessionFileUploadPayload {
-                session_id,
-                path: upload_path,
-                size_bytes: 3,
-            })
-            .unwrap(),
-        );
-        let response = router(protocol.clone(), false)
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(path)
-                    .header("x-termd-device-id", device_id.0.to_string())
-                    .header("x-termd-e2ee-public-key", auth.e2ee_public_key.0)
-                    .header("x-termd-e2ee-nonce", auth.nonce.0)
-                    .header("x-termd-e2ee-timestamp-ms", auth.timestamp_ms.0.to_string())
-                    .header("x-termd-e2ee-signature", auth.signature.0)
-                    .body(Body::from(request_body))
-                    .expect("test request should build"),
-            )
-            .await
-            .expect("router should respond");
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let response_body = to_bytes(response.into_body(), HTTP_E2EE_INIT_MAX_BYTES)
-            .await
-            .unwrap();
-        let mut offset = 0;
-        let frame = read_http_e2ee_frame(&response_body, &mut offset).unwrap();
-        let ready: SessionFileHttpUploadReadyPayload = serde_json::from_slice(frame).unwrap();
-
-        assert_eq!(ready.session_id, session_id);
-        assert_eq!(ready.size_bytes, 3);
-        assert_eq!(ready.offset_bytes, 0);
-        assert!(!ready.upload_id.is_empty());
-        fs::remove_file(&ready.path).ok();
-    }
-
-    #[tokio::test]
-    async fn http_file_download_stream_stops_at_advertised_size() {
-        let root = std::env::temp_dir().join(format!(
-            "termd-http-download-exact-{}-{}",
-            std::process::id(),
-            current_unix_timestamp_millis().0
-        ));
-        fs::create_dir_all(&root).unwrap();
-        let file_path = root.join("download.bin");
-        fs::write(&file_path, b"abc").unwrap();
-        let mut config = test_config("http-file-download-exact-size");
-        config.default_working_directory = Some(root.clone());
-        let protocol = config.into_protocol();
-        let signing_key = SigningKey::generate(&mut OsRng);
-        let device_public_key =
-            PublicKey(test_ed25519_wire(signing_key.verifying_key().as_bytes()));
-        let (device_id, session_id) =
-            pair_real_device_and_create_session(protocol.clone(), device_public_key).await;
-        let server_id = protocol.lock().await.server_id();
-        let daemon_identity = protocol.lock().await.daemon_public_identity().clone();
-        let daemon_e2ee_public = protocol.lock().await.e2ee_public_key();
-        let http_keypair = E2eeKeyPair::generate();
-        let _http_e2ee = E2eeSession::new(
-            E2eeSessionRole::Device,
-            &http_keypair,
-            daemon_e2ee_public,
-            E2eeSessionContext::new(
-                server_id,
-                device_id,
-                daemon_e2ee_public,
-                http_keypair.public_key(),
-            ),
-        )
-        .unwrap();
-        let path = "/api/files/download";
-        let mut auth = HttpE2eeAuthPayload {
-            device_id,
-            e2ee_public_key: http_keypair.public_key_wire(),
-            nonce: termd_proto::Nonce("http-download-exact-nonce".to_owned()),
-            timestamp_ms: current_unix_timestamp_millis(),
-            method: "POST".to_owned(),
-            path: path.to_owned(),
-            signature: Signature("ed25519-v1:placeholder".to_owned()),
-        };
-        auth.signature = Signature(test_ed25519_wire(
-            &signing_key
-                .sign(&HttpE2eeSigningInput::from_payload(&auth, &daemon_identity).to_bytes())
-                .to_bytes(),
-        ));
-        let request_body = write_http_e2ee_frame(
-            &serde_json::to_vec(&SessionFileHttpDownloadPayload {
-                session_id,
-                path: "download.bin".to_owned(),
-                offset_bytes: 0,
-            })
-            .unwrap(),
-        );
-        let response = router(protocol.clone(), false)
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(path)
-                    .header("x-termd-device-id", device_id.0.to_string())
-                    .header("x-termd-e2ee-public-key", auth.e2ee_public_key.0)
-                    .header("x-termd-e2ee-nonce", auth.nonce.0)
-                    .header("x-termd-e2ee-timestamp-ms", auth.timestamp_ms.0.to_string())
-                    .header("x-termd-e2ee-signature", auth.signature.0)
-                    .body(Body::from(request_body))
-                    .expect("test request should build"),
-            )
-            .await
-            .expect("router should respond");
-
-        assert_eq!(response.status(), StatusCode::OK);
-        // 中文注释：handler 签发 ready 后文件继续增长时，本次 HTTP 响应仍只能发送
-        // ready 中声明的大小，不能把后续新增字节混入当前下载。
-        let mut appended = fs::OpenOptions::new()
-            .append(true)
-            .open(&file_path)
-            .unwrap();
-        appended.write_all(b"extra").unwrap();
-        drop(appended);
-
-        let response_body = to_bytes(response.into_body(), HTTP_E2EE_INIT_MAX_BYTES)
-            .await
-            .unwrap();
-        let mut offset = 0;
-        let ready_frame = read_http_e2ee_frame(&response_body, &mut offset).unwrap();
-        let ready: SessionFileDownloadStreamReadyPayload =
-            serde_json::from_slice(ready_frame).unwrap();
-        let data_frame = read_http_e2ee_frame(&response_body, &mut offset).unwrap();
-
-        assert_eq!(ready.size_bytes, 3);
-        assert_eq!(data_frame, b"abc");
-        assert_eq!(offset, response_body.len());
-    }
-
-    #[tokio::test]
-    async fn http_file_download_business_error_is_e2ee_encrypted() {
-        let root = std::env::temp_dir().join(format!(
-            "termd-http-download-encrypted-error-{}-{}",
-            std::process::id(),
-            current_unix_timestamp_millis().0
-        ));
-        fs::create_dir_all(&root).unwrap();
-        let mut config = test_config("http-file-download-encrypted-error");
-        config.default_working_directory = Some(root.clone());
-        let protocol = config.into_protocol();
-        let signing_key = SigningKey::generate(&mut OsRng);
-        let device_public_key =
-            PublicKey(test_ed25519_wire(signing_key.verifying_key().as_bytes()));
-        let (device_id, session_id) =
-            pair_real_device_and_create_session(protocol.clone(), device_public_key).await;
-        let (request, _http_e2ee) = signed_http_e2ee_request(
-            &protocol,
-            &signing_key,
-            device_id,
-            "/api/files/download",
-            "http-download-encrypted-business-error",
-            vec![
-                serde_json::to_vec(&SessionFileHttpDownloadPayload {
-                    session_id,
-                    path: "missing.bin".to_owned(),
-                    offset_bytes: 0,
-                })
-                .unwrap(),
-            ],
-        )
-        .await;
-
-        let response = router(protocol.clone(), false)
-            .oneshot(request)
-            .await
-            .expect("router should respond");
-
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let response_body = to_bytes(response.into_body(), HTTP_E2EE_INIT_MAX_BYTES)
-            .await
-            .unwrap();
-        assert!(
-            serde_json::from_slice::<ErrorPayload>(&response_body).is_err(),
-            "post-auth HTTP E2EE business errors must not be plaintext JSON"
-        );
-        let mut offset = 0;
-        let frame = read_http_e2ee_frame(&response_body, &mut offset).unwrap();
-        let error: ErrorPayload = serde_json::from_slice(frame).unwrap();
-
-        assert!(
-            !error.code.is_empty(),
-            "客户端应能解开业务错误，具体错误码由协议层按失败原因决定"
-        );
-        assert_eq!(offset, response_body.len());
-        fs::remove_dir_all(root).ok();
-    }
-
-    #[tokio::test]
-    async fn http_file_upload_stream_accepts_split_frames_after_out_of_order_chunk() {
-        let root = std::env::temp_dir().join(format!(
-            "termd-http-upload-split-{}-{}",
-            std::process::id(),
-            current_unix_timestamp_millis().0
-        ));
-        fs::create_dir_all(&root).unwrap();
-        let mut config = test_config("http-file-upload-split");
-        config.default_working_directory = Some(root.clone());
-        let protocol = config.into_protocol();
-        let signing_key = SigningKey::generate(&mut OsRng);
-        let public_key = PublicKey(test_ed25519_wire(signing_key.verifying_key().as_bytes()));
-        let (device_id, session_id) =
-            pair_real_device_and_create_session(protocol.clone(), public_key).await;
-
-        let upload_init_path = "/api/files/upload/init";
-        let (request, _upload_init_e2ee) = signed_http_e2ee_request(
-            &protocol,
-            &signing_key,
-            device_id,
-            upload_init_path,
-            "http-upload-split-init",
-            vec![
-                serde_json::to_vec(&SessionFileUploadPayload {
-                    session_id,
-                    path: "split.bin".to_owned(),
-                    size_bytes: 6,
-                })
-                .unwrap(),
-            ],
-        )
-        .await;
-        let response = router(protocol.clone(), false)
-            .oneshot(request)
-            .await
-            .expect("router should respond");
-        assert_eq!(response.status(), StatusCode::OK);
-        let response_body = to_bytes(response.into_body(), HTTP_E2EE_INIT_MAX_BYTES)
-            .await
-            .unwrap();
-        let mut offset = 0;
-        let ready_frame = read_http_e2ee_frame(&response_body, &mut offset).unwrap();
-        let ready: SessionFileHttpUploadReadyPayload = serde_json::from_slice(ready_frame).unwrap();
-
-        for (nonce, offset_bytes, frames) in [
-            (
-                "http-upload-split-tail",
-                3_u64,
-                vec![b"d".to_vec(), b"ef".to_vec()],
-            ),
-            (
-                "http-upload-split-head",
-                0_u64,
-                vec![b"a".to_vec(), b"bc".to_vec()],
-            ),
-        ] {
-            let mut plaintext_frames = vec![
-                serde_json::to_vec(&SessionFileHttpUploadStreamPayload {
-                    session_id,
-                    path: "split.bin".to_owned(),
-                    upload_id: ready.upload_id.clone(),
-                    size_bytes: 6,
-                    offset_bytes,
-                })
-                .unwrap(),
-            ];
-            plaintext_frames.extend(frames);
-            let (request, _upload_e2ee) = signed_http_e2ee_request(
-                &protocol,
-                &signing_key,
-                device_id,
-                "/api/files/upload",
-                nonce,
-                plaintext_frames,
-            )
-            .await;
-            let response = router(protocol.clone(), false)
-                .oneshot(request)
-                .await
-                .expect("router should respond");
-            assert_eq!(response.status(), StatusCode::OK);
-            let _ = to_bytes(response.into_body(), HTTP_E2EE_INIT_MAX_BYTES)
-                .await
-                .unwrap();
-        }
-
-        assert_eq!(fs::read(root.join("split.bin")).unwrap(), b"abcdef");
-        fs::remove_dir_all(root).ok();
-    }
-
-    #[tokio::test]
-    async fn http_file_upload_stream_error_does_not_abort_active_upload() {
-        let root = std::env::temp_dir().join(format!(
-            "termd-http-upload-stale-error-{}-{}",
-            std::process::id(),
-            current_unix_timestamp_millis().0
-        ));
-        fs::create_dir_all(&root).unwrap();
-        let mut config = test_config("http-file-upload-stale-error");
-        config.default_working_directory = Some(root.clone());
-        let protocol = config.into_protocol();
-        let signing_key = SigningKey::generate(&mut OsRng);
-        let public_key = PublicKey(test_ed25519_wire(signing_key.verifying_key().as_bytes()));
-        let (device_id, session_id) =
-            pair_real_device_and_create_session(protocol.clone(), public_key).await;
-
-        let (request, _upload_init_e2ee) = signed_http_e2ee_request(
-            &protocol,
-            &signing_key,
-            device_id,
-            "/api/files/upload/init",
-            "http-upload-stale-error-init",
-            vec![
-                serde_json::to_vec(&SessionFileUploadPayload {
-                    session_id,
-                    path: "stale-error.bin".to_owned(),
-                    size_bytes: 6,
-                })
-                .unwrap(),
-            ],
-        )
-        .await;
-        let response = router(protocol.clone(), false)
-            .oneshot(request)
-            .await
-            .expect("router should respond");
-        assert_eq!(response.status(), StatusCode::OK);
-        let response_body = to_bytes(response.into_body(), HTTP_E2EE_INIT_MAX_BYTES)
-            .await
-            .unwrap();
-        let mut offset = 0;
-        let ready_frame = read_http_e2ee_frame(&response_body, &mut offset).unwrap();
-        let ready: SessionFileHttpUploadReadyPayload = serde_json::from_slice(ready_frame).unwrap();
-
-        for (nonce, offset_bytes, bytes, expected_status) in [
-            (
-                "http-upload-stale-error-head",
-                0_u64,
-                b"abc".to_vec(),
-                StatusCode::OK,
-            ),
-            (
-                "http-upload-stale-error-duplicate",
-                0_u64,
-                b"xxx".to_vec(),
-                StatusCode::BAD_REQUEST,
-            ),
-            (
-                "http-upload-stale-error-tail",
-                3_u64,
-                b"def".to_vec(),
-                StatusCode::OK,
-            ),
-        ] {
-            let (request, _upload_e2ee) = signed_http_e2ee_request(
-                &protocol,
-                &signing_key,
-                device_id,
-                "/api/files/upload",
-                nonce,
-                vec![
-                    serde_json::to_vec(&SessionFileHttpUploadStreamPayload {
-                        session_id,
-                        path: "stale-error.bin".to_owned(),
-                        upload_id: ready.upload_id.clone(),
-                        size_bytes: 6,
-                        offset_bytes,
-                    })
-                    .unwrap(),
-                    bytes,
-                ],
-            )
-            .await;
-            let response = router(protocol.clone(), false)
-                .oneshot(request)
-                .await
-                .expect("router should respond");
-            assert_eq!(response.status(), expected_status);
-            let _ = to_bytes(response.into_body(), HTTP_E2EE_INIT_MAX_BYTES)
-                .await
-                .unwrap();
-        }
-
-        assert_eq!(fs::read(root.join("stale-error.bin")).unwrap(), b"abcdef");
-        fs::remove_dir_all(root).ok();
-    }
-
-    #[tokio::test]
-    async fn http_file_upload_cancel_guard_releases_reserved_range() {
-        let root = std::env::temp_dir().join(format!(
-            "termd-http-upload-cancel-guard-{}-{}",
-            std::process::id(),
-            current_unix_timestamp_millis().0
-        ));
-        fs::create_dir_all(&root).unwrap();
-        let mut config = test_config("http-file-upload-cancel-guard");
-        config.default_working_directory = Some(root.clone());
-        let protocol = config.into_protocol();
-        let creator_signing_key = SigningKey::generate(&mut OsRng);
-        let creator_public_key = PublicKey(test_ed25519_wire(
-            creator_signing_key.verifying_key().as_bytes(),
-        ));
-        let (_, session_id) =
-            pair_real_device_and_create_session(protocol.clone(), creator_public_key).await;
-        let http_signing_key = SigningKey::generate(&mut OsRng);
-        let http_public_key = PublicKey(test_ed25519_wire(
-            http_signing_key.verifying_key().as_bytes(),
-        ));
-        let http_device_id = pair_real_device(protocol.clone(), http_public_key).await;
-        let mut connection = ProtocolConnection::authenticated_http(http_device_id);
-        let ready = {
-            let mut protocol_guard = protocol.lock().await;
-            protocol_guard
-                .attach_session(
-                    &mut connection,
-                    SessionAttachPayload {
-                        session_id,
-                        watch_updates: false,
-                        last_terminal_seq: None,
-                    },
-                )
-                .unwrap();
-            protocol_guard
-                .prepare_session_file_http_upload(
-                    &connection,
-                    SessionFileUploadPayload {
-                        session_id,
-                        path: "cancel-guard.bin".to_owned(),
-                        size_bytes: 3,
-                    },
-                    http_device_id,
-                )
-                .unwrap()
-        };
-        let meta = SessionFileHttpUploadStreamPayload {
-            session_id,
-            path: "cancel-guard.bin".to_owned(),
-            upload_id: ready.upload_id,
-            size_bytes: ready.size_bytes,
-            offset_bytes: 0,
-        };
-        let reserved_range = {
-            let mut protocol_guard = protocol.lock().await;
-            match protocol_guard
-                .begin_session_file_http_upload_write(&connection, meta.clone(), http_device_id, 3)
-                .unwrap()
-            {
-                SessionFileHttpUploadBegin::Write(plan) => plan.reserved_range,
-                SessionFileHttpUploadBegin::Complete(_) => {
-                    panic!("upload should still be active")
-                }
-            }
-        };
-
-        drop(HttpUploadInflightGuard::new(
-            protocol.clone(),
-            meta.clone(),
-            reserved_range,
-        ));
-        // 中文注释：Drop 里的释放任务是异步执行的；等它拿到 protocol lock 后，
-        // 同 offset 的重试才能重新预约并完成写入。
-        tokio::time::sleep(Duration::from_millis(25)).await;
-
-        let progress = write_http_file_upload_chunks_without_protocol_io_lock(
-            protocol.clone(),
-            &connection,
-            meta,
-            http_device_id,
-            vec![b"abc".to_vec()],
-        )
-        .await
-        .unwrap();
-
-        assert!(progress.eof);
-        assert_eq!(fs::read(root.join("cancel-guard.bin")).unwrap(), b"abc");
-        fs::remove_dir_all(root).ok();
-    }
-
-    #[tokio::test]
-    async fn http_file_upload_drop_after_file_write_commits_before_retry() {
-        let root = std::env::temp_dir().join(format!(
-            "termd-http-upload-drop-commit-{}-{}",
-            std::process::id(),
-            current_unix_timestamp_millis().0
-        ));
-        fs::create_dir_all(&root).unwrap();
-        let mut config = test_config("http-file-upload-drop-commit");
-        config.default_working_directory = Some(root.clone());
-        let protocol = config.into_protocol();
-        let creator_signing_key = SigningKey::generate(&mut OsRng);
-        let creator_public_key = PublicKey(test_ed25519_wire(
-            creator_signing_key.verifying_key().as_bytes(),
-        ));
-        let (_, session_id) =
-            pair_real_device_and_create_session(protocol.clone(), creator_public_key).await;
-        let http_signing_key = SigningKey::generate(&mut OsRng);
-        let http_public_key = PublicKey(test_ed25519_wire(
-            http_signing_key.verifying_key().as_bytes(),
-        ));
-        let http_device_id = pair_real_device(protocol.clone(), http_public_key).await;
-        let mut connection = ProtocolConnection::authenticated_http(http_device_id);
-        let ready = {
-            let mut protocol_guard = protocol.lock().await;
-            protocol_guard
-                .attach_session(
-                    &mut connection,
-                    SessionAttachPayload {
-                        session_id,
-                        watch_updates: false,
-                        last_terminal_seq: None,
-                    },
-                )
-                .unwrap();
-            protocol_guard
-                .prepare_session_file_http_upload(
-                    &connection,
-                    SessionFileUploadPayload {
-                        session_id,
-                        path: "drop-commit.bin".to_owned(),
-                        size_bytes: 3,
-                    },
-                    http_device_id,
-                )
-                .unwrap()
-        };
-        let meta = SessionFileHttpUploadStreamPayload {
-            session_id,
-            path: "drop-commit.bin".to_owned(),
-            upload_id: ready.upload_id,
-            size_bytes: ready.size_bytes,
-            offset_bytes: 0,
-        };
-        let (reserved_range, file_result) = {
-            let mut protocol_guard = protocol.lock().await;
-            let plan = match protocol_guard
-                .begin_session_file_http_upload_write(&connection, meta.clone(), http_device_id, 3)
-                .unwrap()
-            {
-                SessionFileHttpUploadBegin::Write(plan) => plan,
-                SessionFileHttpUploadBegin::Complete(_) => panic!("upload should still be active"),
-            };
-            let reserved_range = plan.reserved_range;
-            drop(protocol_guard);
-            let file_result = write_session_file_http_upload_files(plan, vec![b"abc".to_vec()])
-                .expect("file write should succeed before handler drop");
-            (reserved_range, file_result)
-        };
-        let mut inflight_guard =
-            HttpUploadInflightGuard::new(protocol.clone(), meta.clone(), reserved_range);
-        inflight_guard.mark_written(file_result);
-        drop(inflight_guard);
-        // 中文注释：模拟 handler 在文件已经落盘、commit response 前被取消；
-        // Drop 必须补 commit，后续 retry 不能用不同内容覆盖同一区间。
-        tokio::time::sleep(Duration::from_millis(25)).await;
-
-        let retry = write_http_file_upload_chunks_without_protocol_io_lock(
-            protocol.clone(),
-            &connection,
-            meta,
-            http_device_id,
-            vec![b"xxx".to_vec()],
-        )
-        .await
-        .unwrap();
-
-        assert!(retry.eof);
-        assert_eq!(fs::read(root.join("drop-commit.bin")).unwrap(), b"abc");
-        fs::remove_dir_all(root).ok();
-    }
-
-    #[tokio::test]
-    async fn http_file_upload_connection_guard_detaches_on_drop() {
-        let root = std::env::temp_dir().join(format!(
-            "termd-http-upload-connection-drop-{}-{}",
-            std::process::id(),
-            current_unix_timestamp_millis().0
-        ));
-        fs::create_dir_all(&root).unwrap();
-        let mut config = test_config("http-file-upload-connection-drop");
-        config.default_working_directory = Some(root.clone());
-        let protocol = config.into_protocol();
-        let creator_signing_key = SigningKey::generate(&mut OsRng);
-        let creator_public_key = PublicKey(test_ed25519_wire(
-            creator_signing_key.verifying_key().as_bytes(),
-        ));
-        let (_, session_id) =
-            pair_real_device_and_create_session(protocol.clone(), creator_public_key).await;
-        let http_signing_key = SigningKey::generate(&mut OsRng);
-        let http_public_key = PublicKey(test_ed25519_wire(
-            http_signing_key.verifying_key().as_bytes(),
-        ));
-        let http_device_id = pair_real_device(protocol.clone(), http_public_key).await;
-        let mut connection = ProtocolConnection::authenticated_http(http_device_id);
-        {
-            let mut protocol_guard = protocol.lock().await;
-            protocol_guard
-                .attach_session(
-                    &mut connection,
-                    SessionAttachPayload {
-                        session_id,
-                        watch_updates: false,
-                        last_terminal_seq: None,
-                    },
-                )
-                .unwrap();
-        }
-        drop(HttpConnectionCloseGuard::new(protocol.clone(), connection));
-        tokio::time::sleep(Duration::from_millis(25)).await;
-
-        assert_http_device_detached(&protocol, session_id, http_device_id).await;
-        fs::remove_dir_all(root).ok();
-    }
-
-    #[tokio::test]
-    async fn http_connection_guard_close_now_detaches_before_error_response() {
-        let root = std::env::temp_dir().join(format!(
-            "termd-http-control-connection-close-now-{}-{}",
-            std::process::id(),
-            current_unix_timestamp_millis().0
-        ));
-        fs::create_dir_all(&root).unwrap();
-        let mut config = test_config("http-control-connection-close-now");
-        config.default_working_directory = Some(root.clone());
-        let protocol = config.into_protocol();
-        let creator_signing_key = SigningKey::generate(&mut OsRng);
-        let creator_public_key = PublicKey(test_ed25519_wire(
-            creator_signing_key.verifying_key().as_bytes(),
-        ));
-        let (_, session_id) =
-            pair_real_device_and_create_session(protocol.clone(), creator_public_key).await;
-        let http_signing_key = SigningKey::generate(&mut OsRng);
-        let http_public_key = PublicKey(test_ed25519_wire(
-            http_signing_key.verifying_key().as_bytes(),
-        ));
-        let http_device_id = pair_real_device(protocol.clone(), http_public_key).await;
-        let mut connection = ProtocolConnection::authenticated_http(http_device_id);
-        {
-            let mut protocol_guard = protocol.lock().await;
-            protocol_guard
-                .restore_http_control_scope(&mut connection, session_id)
-                .unwrap();
-        }
-        let mut connection_guard = HttpConnectionCloseGuard::new(protocol.clone(), connection);
-
-        // 中文注释：HTTP control handler 在 scope 恢复后若要提前返回错误，必须先 close guard，
-        // 否则短连接会把设备级 attach 留在 runtime 里，后续同设备误以为仍有 operator。
-        connection_guard.close_now().await;
-
-        assert_http_device_detached(&protocol, session_id, http_device_id).await;
-        fs::remove_dir_all(root).ok();
-    }
-
-    #[tokio::test]
-    async fn http_file_handlers_detach_temporary_runtime_connection() {
-        let root = std::env::temp_dir().join(format!(
-            "termd-http-file-detach-{}-{}",
-            std::process::id(),
-            current_unix_timestamp_millis().0
-        ));
-        fs::create_dir_all(&root).unwrap();
-        let mut config = test_config("http-file-detach");
-        config.default_working_directory = Some(root);
-        let protocol = config.into_protocol();
-        let creator_signing_key = SigningKey::generate(&mut OsRng);
-        let creator_public_key = PublicKey(test_ed25519_wire(
-            creator_signing_key.verifying_key().as_bytes(),
-        ));
-        let (_, session_id) =
-            pair_real_device_and_create_session(protocol.clone(), creator_public_key).await;
-        let http_signing_key = SigningKey::generate(&mut OsRng);
-        let http_public_key = PublicKey(test_ed25519_wire(
-            http_signing_key.verifying_key().as_bytes(),
-        ));
-        let http_device_id = pair_real_device(protocol.clone(), http_public_key).await;
-        assert_http_device_detached(&protocol, session_id, http_device_id).await;
-
-        let upload_init_path = "/api/files/upload/init";
-        let (request, _upload_init_e2ee) = signed_http_e2ee_request(
-            &protocol,
-            &http_signing_key,
-            http_device_id,
-            upload_init_path,
-            "http-file-detach-upload-init",
-            vec![
-                serde_json::to_vec(&SessionFileUploadPayload {
-                    session_id,
-                    path: "detach.bin".to_owned(),
-                    size_bytes: 3,
-                })
-                .unwrap(),
-            ],
-        )
-        .await;
-        let response = router(protocol.clone(), false)
-            .oneshot(request)
-            .await
-            .expect("router should respond");
-        assert_eq!(response.status(), StatusCode::OK);
-        let response_body = to_bytes(response.into_body(), HTTP_E2EE_INIT_MAX_BYTES)
-            .await
-            .unwrap();
-        let mut offset = 0;
-        let ready_frame = read_http_e2ee_frame(&response_body, &mut offset).unwrap();
-        let ready: SessionFileHttpUploadReadyPayload = serde_json::from_slice(ready_frame).unwrap();
-        assert_http_device_detached(&protocol, session_id, http_device_id).await;
-
-        let upload_path = "/api/files/upload";
-        let (request, _upload_e2ee) = signed_http_e2ee_request(
-            &protocol,
-            &http_signing_key,
-            http_device_id,
-            upload_path,
-            "http-file-detach-upload-stream",
-            vec![
-                serde_json::to_vec(&SessionFileHttpUploadStreamPayload {
-                    session_id,
-                    path: "detach.bin".to_owned(),
-                    upload_id: ready.upload_id,
-                    size_bytes: 3,
-                    offset_bytes: 0,
-                })
-                .unwrap(),
-                b"abc".to_vec(),
-            ],
-        )
-        .await;
-        let response = router(protocol.clone(), false)
-            .oneshot(request)
-            .await
-            .expect("router should respond");
-        assert_eq!(response.status(), StatusCode::OK);
-        let _ = to_bytes(response.into_body(), HTTP_E2EE_INIT_MAX_BYTES)
-            .await
-            .unwrap();
-        assert_http_device_detached(&protocol, session_id, http_device_id).await;
-
-        let download_path = "/api/files/download";
-        let (request, _download_e2ee) = signed_http_e2ee_request(
-            &protocol,
-            &http_signing_key,
-            http_device_id,
-            download_path,
-            "http-file-detach-download",
-            vec![
-                serde_json::to_vec(&SessionFileHttpDownloadPayload {
-                    session_id,
-                    path: "detach.bin".to_owned(),
-                    offset_bytes: 0,
-                })
-                .unwrap(),
-            ],
-        )
-        .await;
-        let response = router(protocol.clone(), false)
-            .oneshot(request)
-            .await
-            .expect("router should respond");
-        assert_eq!(response.status(), StatusCode::OK);
-        let _ = to_bytes(response.into_body(), HTTP_E2EE_INIT_MAX_BYTES)
-            .await
-            .unwrap();
-        assert_http_device_detached(&protocol, session_id, http_device_id).await;
-    }
-
-    #[tokio::test]
-    async fn http_file_handlers_do_not_decrement_active_client_history_counts() {
-        let root = std::env::temp_dir().join(format!(
-            "termd-http-file-history-{}-{}",
-            std::process::id(),
-            current_unix_timestamp_millis().0
-        ));
-        fs::create_dir_all(&root).unwrap();
-        let mut config = test_config("http-file-history");
-        config.default_working_directory = Some(root);
-        let protocol = config.into_protocol();
-        let signing_key = SigningKey::generate(&mut OsRng);
-        let public_key = PublicKey(test_ed25519_wire(signing_key.verifying_key().as_bytes()));
-
-        let (device_id, session_id, mut live_connection, live_device_session) = {
-            let mut protocol_guard = protocol.lock().await;
-            let (mut connection, _) = protocol_guard.start_connection();
-            let device_id = DeviceId::new();
-            let device_keypair = E2eeKeyPair::generate();
-            let mut device_session = open_test_e2ee(
-                &mut protocol_guard,
-                &mut connection,
-                device_id,
-                &device_keypair,
-            );
-            let pair_request = envelope_value(
-                MessageType::PairRequest,
-                PairRequestPayload {
-                    device_id,
-                    device_public_key: public_key.clone(),
-                    token: protocol_guard
-                        .issue_pairing_token(current_unix_timestamp_millis())
-                        .unwrap()
-                        .token()
-                        .clone(),
-                    nonce: termd_proto::Nonce("http-file-history-pair".to_owned()),
-                    timestamp_ms: current_unix_timestamp_millis(),
-                },
-            )
-            .unwrap();
-            let frame = device_session.encrypt_json_payload(&pair_request).unwrap();
-            let pair_responses = connection.handle_wire_envelope(
-                &mut protocol_guard,
-                envelope_value(MessageType::EncryptedFrame, frame).unwrap(),
-            );
-            let response_frame =
-                encrypted_frame_from_envelope(pair_responses.into_iter().next().unwrap()).unwrap();
-            let pair_accept = device_session
-                .decrypt_json_payload::<JsonEnvelope>(&response_frame)
-                .unwrap();
-            assert_eq!(pair_accept.kind, MessageType::PairAccept);
-
-            let create_request = envelope_value(
-                MessageType::SessionCreate,
-                SessionCreatePayload {
-                    command: vec!["sh".to_owned()],
-                    size: TerminalSize::default(),
-                },
-            )
-            .unwrap();
-            let create_frame = device_session
-                .encrypt_json_payload(&create_request)
-                .unwrap();
-            let create_responses = connection.handle_wire_envelope(
-                &mut protocol_guard,
-                envelope_value(MessageType::EncryptedFrame, create_frame).unwrap(),
-            );
-            let created_envelope =
-                decrypt_first_and_drain_scope_grants(&mut device_session, create_responses);
-            let created_payload: SessionCreatedPayload =
-                decode_payload(created_envelope.payload).unwrap();
-            let session_id = created_payload.session_id;
-            assert_eq!(
-                protocol_guard
-                    .client_history_active_connection_count_for_test(device_id)
-                    .unwrap(),
-                Some(1)
-            );
-            (device_id, session_id, connection, device_session)
-        };
-
-        let upload_init_path = "/api/files/upload/init";
-        let (request, _http_e2ee) = signed_http_e2ee_request(
-            &protocol,
-            &signing_key,
-            device_id,
-            upload_init_path,
-            "http-file-history-upload-init",
-            vec![
-                serde_json::to_vec(&SessionFileUploadPayload {
-                    session_id,
-                    path: "history.bin".to_owned(),
-                    size_bytes: 0,
-                })
-                .unwrap(),
-            ],
-        )
-        .await;
-        let response = router(protocol.clone(), false)
-            .oneshot(request)
-            .await
-            .expect("router should respond");
-        assert_eq!(response.status(), StatusCode::OK);
-        let _ = to_bytes(response.into_body(), HTTP_E2EE_INIT_MAX_BYTES)
-            .await
-            .unwrap();
-
-        let protocol_guard = protocol.lock().await;
-        assert_eq!(
-            protocol_guard
-                .client_history_active_connection_count_for_test(device_id)
-                .unwrap(),
-            Some(1)
-        );
-        drop(protocol_guard);
-        drop(live_device_session);
-        let mut protocol_guard = protocol.lock().await;
-        live_connection.close(&mut protocol_guard);
-    }
-
-    #[tokio::test]
-    async fn http_e2ee_short_body_read_times_out() {
-        let body =
-            Body::from_stream(futures_util::stream::pending::<Result<Bytes, std::io::Error>>());
-
-        assert!(matches!(
-            read_http_e2ee_short_body(body).await,
-            Err(ProtocolError::InvalidEnvelope)
-        ));
-    }
-
-    #[tokio::test]
-    async fn http_e2ee_upload_metadata_frame_read_times_out() {
-        let daemon_keypair = E2eeKeyPair::generate();
-        let device_keypair = E2eeKeyPair::generate();
-        let mut e2ee = E2eeSession::new(
-            E2eeSessionRole::Daemon,
-            &daemon_keypair,
-            device_keypair.public_key(),
-            E2eeSessionContext::new(
-                ServerId::new(),
-                DeviceId::new(),
-                daemon_keypair.public_key(),
-                device_keypair.public_key(),
-            ),
-        )
-        .unwrap();
-        let body =
-            Body::from_stream(futures_util::stream::pending::<Result<Bytes, std::io::Error>>());
-        let mut stream = HttpE2eeBodyFrameStream::new(body);
-
-        assert!(matches!(
-            read_http_e2ee_metadata_frame(&mut stream, &mut e2ee).await,
-            Err(ProtocolError::InvalidEnvelope)
-        ));
-    }
-
-    #[tokio::test]
-    async fn http_e2ee_body_stream_rejects_oversized_pending_before_buffering() {
-        let daemon_keypair = E2eeKeyPair::generate();
-        let device_keypair = E2eeKeyPair::generate();
-        let mut e2ee = E2eeSession::new(
-            E2eeSessionRole::Daemon,
-            &daemon_keypair,
-            device_keypair.public_key(),
-            E2eeSessionContext::new(
-                ServerId::new(),
-                DeviceId::new(),
-                daemon_keypair.public_key(),
-                device_keypair.public_key(),
-            ),
-        )
-        .unwrap();
-        let raw = vec![0_u8; HTTP_E2EE_MAX_PENDING_BYTES + 1];
-        let mut stream = HttpE2eeBodyFrameStream::new(Body::from(raw));
-
-        assert!(matches!(
-            stream.next_plaintext(&mut e2ee).await,
-            Err(ProtocolError::InvalidEnvelope)
-        ));
-    }
-
-    #[tokio::test]
-    async fn http_e2ee_body_stream_accepts_coalesced_valid_frames() {
-        let daemon_keypair = E2eeKeyPair::generate();
-        let device_keypair = E2eeKeyPair::generate();
-        let server_id = ServerId::new();
-        let device_id = DeviceId::new();
-        let mut daemon_e2ee = E2eeSession::new(
-            E2eeSessionRole::Daemon,
-            &daemon_keypair,
-            device_keypair.public_key(),
-            E2eeSessionContext::new(
-                server_id,
-                device_id,
-                daemon_keypair.public_key(),
-                device_keypair.public_key(),
-            ),
-        )
-        .unwrap();
-        let mut device_e2ee = E2eeSession::new(
-            E2eeSessionRole::Device,
-            &device_keypair,
-            daemon_keypair.public_key(),
-            E2eeSessionContext::new(
-                server_id,
-                device_id,
-                daemon_keypair.public_key(),
-                device_keypair.public_key(),
-            ),
-        )
-        .unwrap();
-        let mut raw = Vec::new();
-        let frame_count = 10_u8;
-        for value in 0..frame_count {
-            append_http_e2ee_binary_frame(&mut device_e2ee, &mut raw, &vec![value; 256 * 1024])
-                .unwrap();
-        }
-        assert!(raw.len() > HTTP_E2EE_MAX_PENDING_BYTES);
-        let mut stream = HttpE2eeBodyFrameStream::new(Body::from(raw));
-
-        for value in 0..frame_count {
-            let plaintext = stream
-                .next_plaintext(&mut daemon_e2ee)
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(plaintext, vec![value; 256 * 1024]);
-        }
-        assert!(
-            stream
-                .next_plaintext(&mut daemon_e2ee)
-                .await
-                .unwrap()
-                .is_none()
-        );
-    }
-
     struct RawHttpResponse {
         status: u16,
         headers: String,
@@ -6362,9 +2915,6 @@ mod tests {
         assert_eq!(payload.ws_url, "ws://127.0.0.1:8765/ws");
         assert!(!response.body.contains("server_private_key"));
         assert!(!response.body.contains("terminal sentinel"));
-
-        let pair_accept = pair_device_with_http_token(protocol.clone(), payload.token).await;
-        assert_eq!(pair_accept.server_id, server_id);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -6418,702 +2968,6 @@ mod tests {
         assert_eq!(payload.ws_url, "wss://relay.example/ws");
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn local_pairing_token_endpoint_fails_when_relay_ticket_registration_fails() {
-        let mut config = test_config("local-pairing-token-relay-ticket-failure");
-        config.relay_endpoints = vec!["ws://127.0.0.1:1/ws".to_owned()];
-        config.relay_daemon_token = Some(SecretString::new("test-relay-daemon-token"));
-        let protocol = config.into_protocol();
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server_protocol = protocol.clone();
-        let server = tokio::spawn(async move {
-            let _ = serve_listener(listener, server_protocol, false).await;
-        });
-        let response = tokio::task::spawn_blocking(move || post_pairing_token(addr))
-            .await
-            .unwrap();
-        server.abort();
-
-        assert_eq!(response.status, 503);
-        assert!(response.body.contains("relay_pair_ticket_unavailable"));
-        // 中文注释：relay 注册失败时不能把本地可消费 token 返回给调用方。
-        assert!(!response.body.contains("termd-pair-"));
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn slow_relay_device_registration_does_not_hold_protocol_mutex() {
-        let relay_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let relay_addr = relay_listener.local_addr().unwrap();
-        let request_seen = Arc::new(tokio::sync::Notify::new());
-        let release_response = Arc::new(tokio::sync::Notify::new());
-        let relay_task = {
-            let request_seen = request_seen.clone();
-            let release_response = release_response.clone();
-            tokio::spawn(async move {
-                let (mut socket, _) = relay_listener.accept().await.unwrap();
-                let mut request = vec![0_u8; 4096];
-                let read = socket.read(&mut request).await.unwrap();
-                assert!(read > 0);
-                request_seen.notify_one();
-                release_response.notified().await;
-                socket
-                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                    .await
-                    .unwrap();
-            })
-        };
-
-        let mut config = test_config("slow-relay-pairing-mutex");
-        config.relay_endpoints = vec![format!("ws://{relay_addr}/ws")];
-        config.relay_daemon_token = Some(SecretString::new("slow-relay-token"));
-        let protocol = config.into_protocol();
-        let device_id = DeviceId::new();
-        let device_keypair = E2eeKeyPair::generate();
-        let (mut connection, token, mut device_session) = {
-            let mut protocol_guard = protocol.lock().await;
-            let token = protocol_guard
-                .issue_pairing_token(current_unix_timestamp_millis())
-                .unwrap()
-                .token()
-                .clone();
-            let (mut connection, _) = protocol_guard.start_connection();
-            let device_session = open_test_e2ee(
-                &mut protocol_guard,
-                &mut connection,
-                device_id,
-                &device_keypair,
-            );
-            (connection, token, device_session)
-        };
-        let pair_request = envelope_value(
-            MessageType::PairRequest,
-            PairRequestPayload {
-                device_id,
-                device_public_key: test_device_public_key(23),
-                token,
-                nonce: termd_proto::Nonce("slow-relay-pairing".to_owned()),
-                timestamp_ms: current_unix_timestamp_millis(),
-            },
-        )
-        .unwrap();
-        let encrypted = device_session.encrypt_json_payload(&pair_request).unwrap();
-        let prepared = connection
-            .prepare_wire_message(ProtocolWireMessage::Json(
-                envelope_value(MessageType::EncryptedFrame, encrypted).unwrap(),
-            ))
-            .unwrap();
-        let pairing_task = {
-            let protocol = protocol.clone();
-            tokio::spawn(async move {
-                handle_prepared_server_wire_message(protocol, &mut connection, prepared).await
-            })
-        };
-
-        timeout(Duration::from_secs(2), request_seen.notified())
-            .await
-            .expect("relay registration request should arrive");
-        let protocol_guard = timeout(Duration::from_millis(100), protocol.lock())
-            .await
-            .expect("slow relay registration must not hold protocol mutex");
-        assert_eq!(
-            protocol_guard.server_id(),
-            protocol_guard.daemon_public_identity().server_id
-        );
-        drop(protocol_guard);
-
-        release_response.notify_one();
-        let responses = timeout(Duration::from_secs(2), pairing_task)
-            .await
-            .unwrap()
-            .unwrap();
-        let frame = match responses.into_iter().next().unwrap() {
-            ProtocolWireMessage::Json(envelope) => encrypted_frame_from_envelope(envelope).unwrap(),
-            ProtocolWireMessage::Binary(_) => panic!("legacy pairing response should be JSON"),
-        };
-        let accepted: JsonEnvelope = device_session.decrypt_json_payload(&frame).unwrap();
-        assert_eq!(accepted.kind, MessageType::PairAccept);
-        relay_task.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn cancelled_pairing_releases_token_reservation() {
-        let protocol = test_protocol("cancelled-pairing-reservation");
-        let device_id = DeviceId::new();
-        let device_keypair = E2eeKeyPair::generate();
-        let (connection, request, pending) = {
-            let mut protocol_guard = protocol.lock().await;
-            let token = protocol_guard
-                .issue_pairing_token(current_unix_timestamp_millis())
-                .unwrap()
-                .token()
-                .clone();
-            let (mut connection, _) = protocol_guard.start_connection();
-            let _device_session = open_test_e2ee(
-                &mut protocol_guard,
-                &mut connection,
-                device_id,
-                &device_keypair,
-            );
-            let request = PairRequestPayload {
-                device_id,
-                device_public_key: test_device_public_key(24),
-                token,
-                nonce: termd_proto::Nonce("cancelled-pairing".to_owned()),
-                timestamp_ms: current_unix_timestamp_millis(),
-            };
-            let pending = protocol_guard
-                .reserve_pair_request(&connection, request.clone())
-                .unwrap();
-            (connection, request, pending)
-        };
-
-        drop(PairingReservationGuard::new(protocol.clone(), pending));
-        timeout(Duration::from_secs(1), async {
-            loop {
-                let retry = {
-                    let mut protocol_guard = protocol.lock().await;
-                    protocol_guard.reserve_pair_request(&connection, request.clone())
-                };
-                if let Ok(pending) = retry {
-                    protocol.lock().await.release_pair_request(&pending);
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("cancellation must release reservation promptly");
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn websocket_route_prelude_times_out_before_first_message() {
-        let protocol = test_protocol("websocket-route-prelude-timeout");
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server_protocol = protocol.clone();
-        let server = tokio::spawn(async move {
-            let _ = serve_listener(listener, server_protocol, false).await;
-        });
-
-        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
-            .await
-            .unwrap();
-        let message = timeout(
-            ROUTE_PRELUDE_TIMEOUT + Duration::from_secs(2),
-            socket.next(),
-        )
-        .await
-        .expect("daemon should reject missing route_hello before the outer test timeout")
-        .expect("daemon should send a route prelude error")
-        .expect("route prelude error should be a websocket message");
-        let ClientWsMessage::Text(raw) = message else {
-            panic!("expected plaintext route prelude error, got {message:?}");
-        };
-        let envelope: JsonEnvelope = serde_json::from_str(&raw).unwrap();
-        assert_eq!(envelope.kind, MessageType::Error);
-        let error: ErrorPayload = decode_payload(envelope.payload).unwrap();
-        assert_eq!(error.code, "route_prelude_timeout");
-
-        server.abort();
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn websocket_route_prelude_ping_is_written_through_writer_queue() {
-        let protocol = test_protocol("websocket-route-prelude-ping");
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server_protocol = protocol.clone();
-        let server = tokio::spawn(async move {
-            let _ = serve_listener(listener, server_protocol, false).await;
-        });
-
-        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
-            .await
-            .unwrap();
-        socket
-            .send(ClientWsMessage::Ping(vec![4, 2]))
-            .await
-            .unwrap();
-        let message = timeout(Duration::from_secs(1), socket.next())
-            .await
-            .expect("route prelude ping should be answered by the writer queue")
-            .expect("websocket should remain open")
-            .expect("pong frame should be readable");
-
-        // 中文注释：route prelude 发生在认证和 initial 之前，也必须复用同一条 writer queue。
-        // 这个断言防止后续重新引入握手阶段的旁路直写。
-        assert_eq!(message, ClientWsMessage::Pong(vec![4, 2]));
-
-        server.abort();
-    }
-
-    #[test]
-    fn websocket_timeout_policy_matches_browser_lifecycle() {
-        assert_eq!(ROUTE_PRELUDE_TIMEOUT, Duration::from_secs(5));
-        assert_eq!(WEBSOCKET_HEARTBEAT_INTERVAL, Duration::from_secs(10));
-        assert!(!websocket_idle_timeout_enabled());
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn websocket_writer_streams_frames_without_send_ack() {
-        let expected_frames = 300_usize;
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let app = Router::new().route(
-            "/ws",
-            get(move |websocket: WebSocketUpgrade| async move {
-                websocket.on_upgrade(move |socket| async move {
-                    let peer_addr = SocketAddr::from(([127, 0, 0, 1], 0));
-                    let (sender, mut receiver) = socket.split();
-                    let reader_task = tokio::spawn(async move {
-                        while let Some(message) = receiver.next().await {
-                            if message.is_err() {
-                                break;
-                            }
-                        }
-                    });
-                    let (wire_tx, wire_rx) = mpsc::channel(WEBSOCKET_WIRE_QUEUE_CAPACITY);
-                    let (failure_tx, mut failure_rx) = mpsc::channel(1);
-                    let writer_task =
-                        tokio::spawn(run_websocket_writer(peer_addr, wire_rx, failure_tx, sender));
-
-                    for index in 0..expected_frames {
-                        wire_tx
-                            .send(WebSocketWrite::Wire {
-                                kind: WebSocketOutKind::Initial,
-                                messages: vec![ProtocolWireMessage::Binary(
-                                    format!("frame-{index}").into_bytes(),
-                                )],
-                            })
-                            .await
-                            .unwrap();
-                    }
-
-                    drop(wire_tx);
-                    let _ = writer_task.await;
-                    assert!(failure_rx.try_recv().is_err());
-                    // 中文注释：测试只验证 writer 不再依赖成功发送回执。
-                    // 保持连接短暂存活，让客户端把已经写入 socket 的帧读完，避免 drop
-                    // websocket 时的关闭握手噪声污染断言。
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                    reader_task.abort();
-                })
-            }),
-        );
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app.into_make_service())
-                .await
-                .unwrap();
-        });
-        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
-            .await
-            .unwrap();
-
-        // 中文注释：writer 成功发送没有任何回执消费者。
-        // 真实 WebSocket 字节流不能被诊断/记账通道反向限制。
-        let reached = timeout(Duration::from_secs(2), async {
-            let mut seen = 0_usize;
-            while let Some(message) = socket.next().await {
-                let Ok(message) = message else {
-                    break;
-                };
-                match message {
-                    ClientWsMessage::Text(_) | ClientWsMessage::Binary(_) => {
-                        seen = seen.saturating_add(1);
-                        if seen >= expected_frames {
-                            return seen;
-                        }
-                    }
-                    ClientWsMessage::Ping(payload) => {
-                        socket.send(ClientWsMessage::Pong(payload)).await.unwrap();
-                    }
-                    ClientWsMessage::Pong(_) | ClientWsMessage::Frame(_) => {}
-                    ClientWsMessage::Close(_) => break,
-                }
-            }
-            seen
-        })
-        .await
-        .expect("websocket writer should keep writing without send ack");
-        assert_eq!(reached, expected_frames);
-
-        server.abort();
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn websocket_writer_is_aborted_when_client_context_closes() {
-        let protocol = test_protocol("websocket-writer-abort-on-close");
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server_protocol = protocol.clone();
-        let server = tokio::spawn(async move {
-            let _ = serve_listener(listener, server_protocol, false).await;
-        });
-
-        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
-            .await
-            .unwrap();
-        let server_id = protocol.lock().await.server_id();
-        send_ws_route_hello(&mut socket, server_id).await;
-        let _hello = timeout(Duration::from_secs(1), socket.next())
-            .await
-            .expect("hello should arrive")
-            .expect("websocket should stay open")
-            .expect("hello frame should decode");
-
-        socket.close(None).await.unwrap();
-
-        // 中文注释：客户端关闭后 daemon 必须取消该 client 的 writer context。
-        // 如果继续 drain 旧队列，连接清理会卡在 socket write 上并产生 Sending-after-closing 日志。
-        timeout(Duration::from_secs(1), socket.next())
-            .await
-            .expect("server should finish websocket promptly after client close");
-
-        server.abort();
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn websocket_pushes_session_output_without_client_pull_frame() {
-        let protocol = test_protocol("websocket-push");
-        let server_id = protocol.lock().await.server_id();
-        let pairing_token = {
-            protocol
-                .lock()
-                .await
-                .issue_pairing_token(current_unix_timestamp_millis())
-                .unwrap()
-                .token()
-                .clone()
-        };
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server_protocol = protocol.clone();
-        let server = tokio::spawn(async move {
-            let _ = serve_listener(listener, server_protocol, false).await;
-        });
-
-        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
-            .await
-            .unwrap();
-        send_ws_route_hello(&mut socket, server_id).await;
-        let hello = read_ws_envelope(&mut socket).await;
-        assert_eq!(hello.kind, MessageType::Hello);
-        let daemon_exchange =
-            websocket_test_daemon_key_exchange(&protocol, "push-test-daemon-e2ee").await;
-        let device_id = DeviceId::new();
-        let mut device_session = open_client_e2ee(&mut socket, daemon_exchange, device_id).await;
-
-        send_encrypted_ws(
-            &mut socket,
-            &mut device_session,
-            envelope_value(
-                MessageType::PairRequest,
-                PairRequestPayload {
-                    device_id,
-                    device_public_key: test_device_public_key(1),
-                    token: pairing_token,
-                    nonce: termd_proto::Nonce("push-test-pairing-nonce".to_owned()),
-                    timestamp_ms: current_unix_timestamp_millis(),
-                },
-            )
-            .unwrap(),
-        )
-        .await;
-        let pair_accept = read_encrypted_ws(&mut socket, &mut device_session).await;
-        assert_eq!(pair_accept.kind, MessageType::PairAccept);
-
-        send_encrypted_ws(
-            &mut socket,
-            &mut device_session,
-            envelope_value(
-                MessageType::SessionCreate,
-                SessionCreatePayload {
-                    command: vec![
-                        "sh".to_owned(),
-                        "-lc".to_owned(),
-                        "sleep 0.15; printf pushed-output".to_owned(),
-                    ],
-                    size: TerminalSize::default(),
-                },
-            )
-            .unwrap(),
-        )
-        .await;
-        let created = read_encrypted_ws(&mut socket, &mut device_session).await;
-        assert_eq!(
-            created.kind,
-            MessageType::SessionCreated,
-            "unexpected session create response: {created:?}"
-        );
-        let created_payload: SessionCreatedPayload = decode_payload(created.payload).unwrap();
-        read_expected_session_scope_grant(
-            &mut socket,
-            &mut device_session,
-            created_payload.session_id,
-        )
-        .await;
-
-        // 这里不再向 WebSocket 发送 ping 或任意业务帧；PTY 后续输出必须由 daemon 主动推送。
-        // 等待窗口需要覆盖 CI 或本地 workspace 并发测试时的 PTY 进程启动抖动，
-        // 这个值不是产品 WebSocket 的超时语义。
-        let mut pushed_output = Vec::new();
-        let push_deadline = Instant::now() + Duration::from_secs(8);
-        while !pushed_output
-            .windows(b"pushed-output".len())
-            .any(|window| window == b"pushed-output")
-        {
-            let remaining = push_deadline.saturating_duration_since(Instant::now());
-            let pushed = timeout(
-                remaining,
-                read_encrypted_ws(&mut socket, &mut device_session),
-            )
-            .await
-            .expect("daemon should push PTY output without client pull frames");
-            if pushed.kind != MessageType::SessionData {
-                continue;
-            }
-            let payload: SessionDataPayload = decode_payload(pushed.payload).unwrap();
-            assert_eq!(payload.session_id, created_payload.session_id);
-            pushed_output.extend(
-                base64::engine::general_purpose::STANDARD
-                    .decode(payload.data_base64)
-                    .unwrap(),
-            );
-        }
-
-        server.abort();
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn websocket_pushes_cwd_updates_without_client_pull_frame() {
-        let workspace_root = std::env::temp_dir().join(format!(
-            "termd-websocket-cwd-root-{}-{}",
-            std::process::id(),
-            current_unix_timestamp_millis().0
-        ));
-        let file_root = workspace_root.join("project");
-        fs::create_dir_all(&file_root).unwrap();
-        fs::write(file_root.join("alpha.txt"), b"alpha\n").unwrap();
-
-        let mut config = test_config("websocket-cwd-push");
-        config.default_working_directory = Some(workspace_root.clone());
-        let protocol = config.into_protocol();
-        let server_id = protocol.lock().await.server_id();
-        let pairing_token = {
-            protocol
-                .lock()
-                .await
-                .issue_pairing_token(current_unix_timestamp_millis())
-                .unwrap()
-                .token()
-                .clone()
-        };
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server_protocol = protocol.clone();
-        let server = tokio::spawn(async move {
-            let _ = serve_listener(listener, server_protocol, false).await;
-        });
-
-        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
-            .await
-            .unwrap();
-        send_ws_route_hello(&mut socket, server_id).await;
-        let hello = read_ws_envelope(&mut socket).await;
-        assert_eq!(hello.kind, MessageType::Hello);
-        let daemon_exchange =
-            websocket_test_daemon_key_exchange(&protocol, "cwd-push-test-daemon-e2ee").await;
-        let device_id = DeviceId::new();
-        let mut device_session = open_client_e2ee(&mut socket, daemon_exchange, device_id).await;
-
-        send_encrypted_ws(
-            &mut socket,
-            &mut device_session,
-            envelope_value(
-                MessageType::PairRequest,
-                PairRequestPayload {
-                    device_id,
-                    device_public_key: test_device_public_key(1),
-                    token: pairing_token,
-                    nonce: termd_proto::Nonce("cwd-push-test-pairing-nonce".to_owned()),
-                    timestamp_ms: current_unix_timestamp_millis(),
-                },
-            )
-            .unwrap(),
-        )
-        .await;
-        let pair_accept = read_encrypted_ws(&mut socket, &mut device_session).await;
-        assert_eq!(pair_accept.kind, MessageType::PairAccept);
-
-        send_encrypted_ws(
-            &mut socket,
-            &mut device_session,
-            envelope_value(
-                MessageType::SessionCreate,
-                SessionCreatePayload {
-                    command: vec![
-                        "sh".to_owned(),
-                        "-lc".to_owned(),
-                        format!(
-                            "read watcher_ready; cd {}; printf cwd-moved; sleep 2",
-                            file_root.to_string_lossy()
-                        ),
-                    ],
-                    size: TerminalSize::default(),
-                },
-            )
-            .unwrap(),
-        )
-        .await;
-        let created = read_encrypted_ws(&mut socket, &mut device_session).await;
-        assert_eq!(created.kind, MessageType::SessionCreated);
-        let created_payload: SessionCreatedPayload = decode_payload(created.payload).unwrap();
-        read_expected_session_scope_grant(
-            &mut socket,
-            &mut device_session,
-            created_payload.session_id,
-        )
-        .await;
-
-        send_encrypted_ws(
-            &mut socket,
-            &mut device_session,
-            envelope_value(
-                MessageType::SessionFiles,
-                termd_proto::SessionFilesPayload {
-                    session_id: created_payload.session_id,
-                    path: None,
-                },
-            )
-            .unwrap(),
-        )
-        .await;
-        let initial_files = read_encrypted_ws(&mut socket, &mut device_session).await;
-        assert_eq!(initial_files.kind, MessageType::SessionFilesResult);
-
-        // SessionFiles 的响应返回后，同一 connection loop 会先完成 cwd watcher 注册，
-        // 再处理这条输入。shell 因此只会在 watcher 已可观测后执行 cd。
-        send_encrypted_ws(
-            &mut socket,
-            &mut device_session,
-            envelope_value(
-                MessageType::SessionData,
-                SessionDataPayload {
-                    session_id: created_payload.session_id,
-                    data_base64: base64::engine::general_purpose::STANDARD.encode(b"ready\n"),
-                },
-            )
-            .unwrap(),
-        )
-        .await;
-
-        let push_deadline = Instant::now() + Duration::from_secs(8);
-        loop {
-            let remaining = push_deadline.saturating_duration_since(Instant::now());
-            let pushed = timeout(
-                remaining,
-                read_encrypted_ws(&mut socket, &mut device_session),
-            )
-            .await
-            .expect("daemon should push cwd updates without client pull frames");
-            if pushed.kind != MessageType::SessionCwdChanged {
-                continue;
-            }
-            let payload: SessionCwdChangedPayload = decode_payload(pushed.payload).unwrap();
-            if payload.cwd == file_root.to_string_lossy() {
-                assert_eq!(payload.session_id, created_payload.session_id);
-                break;
-            }
-        }
-
-        fs::remove_dir_all(workspace_root).ok();
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn session_push_watcher_ignores_initial_watch_value() {
-        let session_id = SessionId::new();
-        let (signal_tx, signal_rx) = watch::channel(41_u64);
-        let (event_tx, mut event_rx) = mpsc::channel(2);
-        let mut watcher_tasks = Vec::new();
-
-        spawn_session_push_watcher(
-            session_id,
-            signal_rx,
-            SessionPushEvent::Activity(session_id),
-            &event_tx,
-            &mut watcher_tasks,
-        );
-
-        // 新建 watcher 时的当前值只是历史状态，不应立刻变成前端的 new output。
-        assert!(
-            timeout(Duration::from_millis(80), event_rx.recv())
-                .await
-                .is_err()
-        );
-
-        signal_tx.send(42).unwrap();
-        let pushed = timeout(Duration::from_secs(1), event_rx.recv())
-            .await
-            .expect("watcher should push after a real signal change")
-            .expect("push channel should remain open");
-        assert_eq!(pushed, SessionPushEvent::Activity(session_id));
-
-        for task in watcher_tasks {
-            task.abort();
-        }
-    }
-
-    #[tokio::test]
-    async fn session_activity_push_watcher_coalesces_frequent_output_signals() {
-        let session_id = SessionId::new();
-        let (signal_tx, signal_rx) = watch::channel(1_u64);
-        let (event_tx, mut event_rx) = mpsc::channel(2);
-        let mut watcher_tasks = Vec::new();
-
-        spawn_session_push_watcher(
-            session_id,
-            signal_rx,
-            SessionPushEvent::Activity(session_id),
-            &event_tx,
-            &mut watcher_tasks,
-        );
-
-        signal_tx.send(2).unwrap();
-        let first = timeout(Duration::from_secs(1), event_rx.recv())
-            .await
-            .expect("first activity should be pushed immediately")
-            .expect("push channel should remain open");
-        assert_eq!(first, SessionPushEvent::Activity(session_id));
-
-        signal_tx.send(3).unwrap();
-        signal_tx.send(4).unwrap();
-        signal_tx.send(5).unwrap();
-
-        // 高频后台输出只需要一个“有新输出”提示；250ms 合并窗口内不能继续刷固定小包。
-        assert!(
-            timeout(SESSION_ACTIVITY_PUSH_MIN_INTERVAL / 2, event_rx.recv())
-                .await
-                .is_err()
-        );
-
-        let second = timeout(SESSION_ACTIVITY_PUSH_MIN_INTERVAL * 2, event_rx.recv())
-            .await
-            .expect("coalesced activity should be pushed after the throttle window")
-            .expect("push channel should remain open");
-        assert_eq!(second, SessionPushEvent::Activity(session_id));
-        assert!(
-            timeout(Duration::from_millis(80), event_rx.recv())
-                .await
-                .is_err()
-        );
-
-        for task in watcher_tasks {
-            task.abort();
-        }
-    }
-
     #[test]
     fn local_pairing_token_peer_check_rejects_non_loopback_peer() {
         assert!(is_loopback_peer(SocketAddr::from(([127, 0, 0, 1], 34_567))));
@@ -7125,15 +2979,6 @@ mod tests {
             [192, 0, 2, 10],
             34_567
         ))));
-    }
-
-    #[test]
-    fn websocket_transport_limits_keep_frames_smaller_than_messages() {
-        let max_frame_size = WEBSOCKET_MAX_FRAME_SIZE;
-        let max_message_size = WEBSOCKET_MAX_MESSAGE_SIZE;
-        assert_eq!(max_frame_size, 16 * 1024 * 1024);
-        assert_eq!(max_message_size, 16 * 1024 * 1024);
-        assert!(max_frame_size <= max_message_size);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -7157,6 +3002,7 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         assert!(response.contains("\"status\":\"ok\""));
         assert!(response.contains(&server_id.0.to_string()));
+        assert!(response.contains("\"daemon_public_key\":\"ed25519-v1:"));
     }
 
     #[test]
@@ -7215,174 +3061,6 @@ mod tests {
             headers: head.to_owned(),
             body: body.to_owned(),
         }
-    }
-
-    async fn read_ws_envelope(socket: &mut TestWs) -> JsonEnvelope {
-        loop {
-            let message = timeout(Duration::from_secs(5), socket.next())
-                .await
-                .expect("测试等待 WebSocket envelope 超时")
-                .unwrap()
-                .unwrap();
-            match message {
-                ClientWsMessage::Text(raw) => return serde_json::from_str(&raw).unwrap(),
-                ClientWsMessage::Binary(raw) => return serde_json::from_slice(&raw).unwrap(),
-                ClientWsMessage::Ping(payload) => {
-                    socket.send(ClientWsMessage::Pong(payload)).await.unwrap();
-                }
-                ClientWsMessage::Pong(_) => continue,
-                ClientWsMessage::Close(frame) => panic!("websocket closed unexpectedly: {frame:?}"),
-                ClientWsMessage::Frame(_) => continue,
-            }
-        }
-    }
-
-    async fn websocket_test_daemon_key_exchange(
-        protocol: &SharedDaemonProtocol,
-        nonce: &str,
-    ) -> E2eeKeyExchangePayload {
-        let protocol = protocol.lock().await;
-        // 中文注释：这是旧 WebSocket `encrypted_frame` 兼容测试的 E2EE fixture；当前 Web
-        // WebSocket 只做 route/hello handshake，并直接发送明文 packet。
-        E2eeKeyExchangePayload::new(
-            protocol.server_id(),
-            DeviceId::new(),
-            protocol.e2ee_public_key().to_wire_public_key(),
-            termd_proto::Nonce(nonce.to_owned()),
-            current_unix_timestamp_millis(),
-        )
-    }
-
-    async fn send_ws_route_hello(socket: &mut TestWs, server_id: ServerId) {
-        let envelope = Envelope::new(
-            MessageType::RouteHello,
-            RouteHelloPayload {
-                server_id,
-                role: RouteRole::Client,
-                protocol_version: ProtocolVersion(PROTOCOL_PACKET_VERSION),
-                nonce: termd_proto::Nonce("route-test-nonce".to_owned()),
-                admission: None,
-                route_generation: None,
-                client_id: None,
-                data_token: None,
-                timestamp_ms: current_unix_timestamp_millis(),
-            },
-        );
-        let raw = serde_json::to_string(&envelope).unwrap();
-        socket.send(ClientWsMessage::Text(raw)).await.unwrap();
-
-        let ready = read_ws_envelope(socket).await;
-        assert_eq!(ready.kind, MessageType::RouteReady);
-        let payload: RouteReadyPayload = decode_payload(ready.payload).unwrap();
-        assert_eq!(payload.server_id, server_id);
-        assert_eq!(payload.role, RouteRole::Client);
-    }
-
-    async fn send_ws_envelope(socket: &mut TestWs, envelope: JsonEnvelope) {
-        let raw = serde_json::to_string(&envelope).unwrap();
-        socket.send(ClientWsMessage::Text(raw)).await.unwrap();
-    }
-
-    async fn open_client_e2ee(
-        socket: &mut TestWs,
-        daemon_exchange: E2eeKeyExchangePayload,
-        device_id: DeviceId,
-    ) -> E2eeSession {
-        let daemon_public_key = E2eePeerPublicKey::try_from(&daemon_exchange.public_key).unwrap();
-        let device_keypair = E2eeKeyPair::generate();
-        let context = E2eeSessionContext::new(
-            daemon_exchange.server_id,
-            device_id,
-            daemon_public_key,
-            device_keypair.public_key(),
-        );
-        let device_session = E2eeSession::new(
-            E2eeSessionRole::Device,
-            &device_keypair,
-            daemon_public_key,
-            context,
-        )
-        .unwrap();
-        send_ws_envelope(
-            socket,
-            envelope_value(
-                MessageType::E2eeKeyExchange,
-                E2eeKeyExchangePayload::new(
-                    daemon_exchange.server_id,
-                    device_id,
-                    device_keypair.public_key_wire(),
-                    termd_proto::Nonce("push-test-e2ee-nonce".to_owned()),
-                    UnixTimestampMillis(1_000),
-                ),
-            )
-            .unwrap(),
-        )
-        .await;
-        device_session
-    }
-
-    async fn send_encrypted_ws(
-        socket: &mut TestWs,
-        device_session: &mut E2eeSession,
-        inner: JsonEnvelope,
-    ) {
-        let frame = device_session.encrypt_json_payload(&inner).unwrap();
-        send_ws_envelope(
-            socket,
-            envelope_value(MessageType::EncryptedFrame, frame).unwrap(),
-        )
-        .await;
-    }
-
-    fn decrypt_first_and_drain_scope_grants(
-        device_session: &mut E2eeSession,
-        messages: Vec<JsonEnvelope>,
-    ) -> JsonEnvelope {
-        let mut iter = messages.into_iter();
-        let first = iter
-            .next()
-            .expect("expected at least one encrypted response");
-        let first_frame = encrypted_frame_from_envelope(first).unwrap();
-        let first_inner = device_session.decrypt_json_payload(&first_frame).unwrap();
-
-        for trailing in iter {
-            let trailing_frame = encrypted_frame_from_envelope(trailing).unwrap();
-            let trailing_inner: JsonEnvelope = device_session
-                .decrypt_json_payload(&trailing_frame)
-                .unwrap();
-            assert_eq!(
-                trailing_inner.kind,
-                MessageType::SessionScopeGrant,
-                "server tests must consume only trailing scope grants, got {trailing_inner:?}"
-            );
-        }
-
-        first_inner
-    }
-
-    async fn read_encrypted_ws(
-        socket: &mut TestWs,
-        device_session: &mut E2eeSession,
-    ) -> JsonEnvelope {
-        let outer = read_ws_envelope(socket).await;
-        let frame = encrypted_frame_from_envelope(outer).unwrap();
-        device_session.decrypt_json_payload(&frame).unwrap()
-    }
-
-    async fn read_expected_session_scope_grant(
-        socket: &mut TestWs,
-        device_session: &mut E2eeSession,
-        expected_session_id: SessionId,
-    ) -> SessionScopeGrantPayload {
-        let inner = read_encrypted_ws(socket, device_session).await;
-        assert_eq!(
-            inner.kind,
-            MessageType::SessionScopeGrant,
-            "session.create/attach must be followed by exactly one scope grant"
-        );
-        let payload: SessionScopeGrantPayload = decode_payload(inner.payload).unwrap();
-        assert_eq!(payload.session_id, expected_session_id);
-        payload
     }
 
     async fn tls_healthz_request(addr: SocketAddr, cert_path: &PathBuf) -> String {
@@ -7478,410 +3156,4 @@ sgXsvuCGXOsirGEqT9iy3RBlvFNvSZkOG3fdQPz0u+6AHNs66QGoWxqk3+bHK9MZ
 joi6qSEnJBpLL35fFZfHkF1jBOfv8otRgWJuJwyit3B7LR89GAw2VgZWu03QugPN
 zZZR5LzKVu9X7paftR7K8Q==
 -----END PRIVATE KEY-----"#;
-
-    async fn pair_device_with_http_token(
-        protocol: SharedDaemonProtocol,
-        token: String,
-    ) -> PairAcceptPayload {
-        let mut protocol = protocol.lock().await;
-        let (mut connection, _) = protocol.start_connection();
-        let device_id = DeviceId::new();
-        let device_keypair = E2eeKeyPair::generate();
-        let mut device_session =
-            open_test_e2ee(&mut protocol, &mut connection, device_id, &device_keypair);
-        let pair_request = envelope_value(
-            MessageType::PairRequest,
-            PairRequestPayload {
-                device_id,
-                device_public_key: test_device_public_key(1),
-                token: termd_proto::PairingToken(token),
-                nonce: termd_proto::Nonce("nonce-from-http-token-test".to_owned()),
-                timestamp_ms: current_unix_timestamp_millis(),
-            },
-        )
-        .unwrap();
-        let frame = device_session.encrypt_json_payload(&pair_request).unwrap();
-        let responses = connection.handle_wire_envelope(
-            &mut protocol,
-            envelope_value(MessageType::EncryptedFrame, frame).unwrap(),
-        );
-
-        let response_frame =
-            encrypted_frame_from_envelope(responses.into_iter().next().unwrap()).unwrap();
-        let response = device_session
-            .decrypt_json_payload::<JsonEnvelope>(&response_frame)
-            .unwrap();
-
-        assert_eq!(response.kind, MessageType::PairAccept);
-        assert!(connection.is_authenticated());
-        decode_payload(response.payload).unwrap()
-    }
-
-    async fn signed_http_e2ee_request(
-        protocol: &SharedDaemonProtocol,
-        signing_key: &SigningKey,
-        device_id: DeviceId,
-        path: &str,
-        nonce: &str,
-        plaintext_frames: Vec<Vec<u8>>,
-    ) -> (Request<Body>, E2eeSession) {
-        let protocol_guard = protocol.lock().await;
-        let server_id = protocol_guard.server_id();
-        let daemon_identity = protocol_guard.daemon_public_identity().clone();
-        let daemon_e2ee_public = protocol_guard.e2ee_public_key();
-        drop(protocol_guard);
-
-        let http_keypair = E2eeKeyPair::generate();
-        let http_e2ee = E2eeSession::new(
-            E2eeSessionRole::Device,
-            &http_keypair,
-            daemon_e2ee_public,
-            E2eeSessionContext::new(
-                server_id,
-                device_id,
-                daemon_e2ee_public,
-                http_keypair.public_key(),
-            ),
-        )
-        .unwrap();
-        let mut auth = HttpE2eeAuthPayload {
-            device_id,
-            e2ee_public_key: http_keypair.public_key_wire(),
-            nonce: termd_proto::Nonce(nonce.to_owned()),
-            timestamp_ms: current_unix_timestamp_millis(),
-            method: "POST".to_owned(),
-            path: path.to_owned(),
-            signature: Signature("ed25519-v1:placeholder".to_owned()),
-        };
-        auth.signature = Signature(test_ed25519_wire(
-            &signing_key
-                .sign(&HttpE2eeSigningInput::from_payload(&auth, &daemon_identity).to_bytes())
-                .to_bytes(),
-        ));
-
-        let mut request_body = Vec::new();
-        for plaintext in plaintext_frames {
-            request_body.extend(write_http_e2ee_frame(&plaintext));
-        }
-
-        let request = Request::builder()
-            .method("POST")
-            .uri(path)
-            .header("content-type", "application/octet-stream")
-            .header("x-termd-device-id", device_id.0.to_string())
-            .header("x-termd-e2ee-public-key", auth.e2ee_public_key.0)
-            .header("x-termd-e2ee-nonce", auth.nonce.0)
-            .header("x-termd-e2ee-timestamp-ms", auth.timestamp_ms.0.to_string())
-            .header("x-termd-e2ee-signature", auth.signature.0)
-            .body(Body::from(request_body))
-            .expect("test request should build");
-
-        (request, http_e2ee)
-    }
-
-    async fn assert_http_device_detached(
-        protocol: &SharedDaemonProtocol,
-        session_id: SessionId,
-        device_id: DeviceId,
-    ) {
-        let mut protocol = protocol.lock().await;
-        assert!(matches!(
-            protocol.runtime_write_input_as_device_for_test(session_id, device_id, b""),
-            Err(ProtocolError::RuntimeFailed)
-        ));
-    }
-
-    async fn pair_real_device(
-        protocol: SharedDaemonProtocol,
-        device_public_key: PublicKey,
-    ) -> DeviceId {
-        let mut protocol = protocol.lock().await;
-        let pairing_token = protocol
-            .issue_pairing_token(current_unix_timestamp_millis())
-            .unwrap()
-            .token()
-            .clone();
-        let (mut connection, _) = protocol.start_connection();
-        let device_id = DeviceId::new();
-        let device_keypair = E2eeKeyPair::generate();
-        let mut device_session =
-            open_test_e2ee(&mut protocol, &mut connection, device_id, &device_keypair);
-        let pair_request = envelope_value(
-            MessageType::PairRequest,
-            PairRequestPayload {
-                device_id,
-                device_public_key,
-                token: pairing_token,
-                nonce: termd_proto::Nonce("http-real-device-pair-only".to_owned()),
-                timestamp_ms: current_unix_timestamp_millis(),
-            },
-        )
-        .unwrap();
-        let frame = device_session.encrypt_json_payload(&pair_request).unwrap();
-        let pair_responses = connection.handle_wire_envelope(
-            &mut protocol,
-            envelope_value(MessageType::EncryptedFrame, frame).unwrap(),
-        );
-        let response_frame =
-            encrypted_frame_from_envelope(pair_responses.into_iter().next().unwrap()).unwrap();
-        let pair_accept = device_session
-            .decrypt_json_payload::<JsonEnvelope>(&response_frame)
-            .unwrap();
-        assert_eq!(pair_accept.kind, MessageType::PairAccept);
-        connection.close(&mut protocol);
-        device_id
-    }
-
-    async fn pair_real_device_and_create_session(
-        protocol: SharedDaemonProtocol,
-        device_public_key: PublicKey,
-    ) -> (DeviceId, SessionId) {
-        let mut protocol = protocol.lock().await;
-        let pairing_token = protocol
-            .issue_pairing_token(current_unix_timestamp_millis())
-            .unwrap()
-            .token()
-            .clone();
-        let (mut connection, _) = protocol.start_connection();
-        let device_id = DeviceId::new();
-        let device_keypair = E2eeKeyPair::generate();
-        let mut device_session =
-            open_test_e2ee(&mut protocol, &mut connection, device_id, &device_keypair);
-        let pair_request = envelope_value(
-            MessageType::PairRequest,
-            PairRequestPayload {
-                device_id,
-                device_public_key,
-                token: pairing_token,
-                nonce: termd_proto::Nonce("http-real-device-pair".to_owned()),
-                timestamp_ms: current_unix_timestamp_millis(),
-            },
-        )
-        .unwrap();
-        let frame = device_session.encrypt_json_payload(&pair_request).unwrap();
-        let pair_responses = connection.handle_wire_envelope(
-            &mut protocol,
-            envelope_value(MessageType::EncryptedFrame, frame).unwrap(),
-        );
-        let response_frame =
-            encrypted_frame_from_envelope(pair_responses.into_iter().next().unwrap()).unwrap();
-        let pair_accept = device_session
-            .decrypt_json_payload::<JsonEnvelope>(&response_frame)
-            .unwrap();
-        assert_eq!(pair_accept.kind, MessageType::PairAccept);
-
-        let create = envelope_value(
-            MessageType::SessionCreate,
-            SessionCreatePayload {
-                command: vec!["sh".to_owned(), "-lc".to_owned(), "cat".to_owned()],
-                size: TerminalSize::default(),
-            },
-        )
-        .unwrap();
-        let frame = device_session.encrypt_json_payload(&create).unwrap();
-        let create_responses = connection.handle_wire_envelope(
-            &mut protocol,
-            envelope_value(MessageType::EncryptedFrame, frame).unwrap(),
-        );
-        let created = decrypt_first_and_drain_scope_grants(&mut device_session, create_responses);
-        assert_eq!(
-            created.kind,
-            MessageType::SessionCreated,
-            "unexpected session create response: {created:?}"
-        );
-        let payload: SessionCreatedPayload = decode_payload(created.payload).unwrap();
-        (device_id, payload.session_id)
-    }
-
-    async fn authenticated_metadata_connection(
-        protocol: SharedDaemonProtocol,
-        clients: bool,
-        status_interval_ms: Option<u64>,
-    ) -> (ProtocolConnection, E2eeSession) {
-        let mut protocol_guard = protocol.lock().await;
-        let pairing_token = protocol_guard
-            .issue_pairing_token(current_unix_timestamp_millis())
-            .unwrap()
-            .token()
-            .clone();
-        let (mut connection, _) = protocol_guard.start_connection();
-        let device_id = DeviceId::new();
-        let device_keypair = E2eeKeyPair::generate();
-        let mut device_session = open_test_e2ee(
-            &mut protocol_guard,
-            &mut connection,
-            device_id,
-            &device_keypair,
-        );
-        let pair_request = envelope_value(
-            MessageType::PairRequest,
-            PairRequestPayload {
-                device_id,
-                device_public_key: test_device_public_key(2),
-                token: pairing_token,
-                nonce: termd_proto::Nonce("metadata-pair".to_owned()),
-                timestamp_ms: current_unix_timestamp_millis(),
-            },
-        )
-        .unwrap();
-        let pair_frame = device_session.encrypt_json_payload(&pair_request).unwrap();
-        let pair_responses = connection.handle_wire_envelope(
-            &mut protocol_guard,
-            envelope_value(MessageType::EncryptedFrame, pair_frame).unwrap(),
-        );
-        let pair_accept = decrypt_first_and_drain_scope_grants(&mut device_session, pair_responses);
-        assert_eq!(pair_accept.kind, MessageType::PairAccept);
-
-        let hello = envelope_value(
-            MessageType::ClientHello,
-            ClientHelloPayload {
-                name: "Metadata sidecar".to_owned(),
-                kind: ClientHelloKind::Metadata,
-            },
-        )
-        .unwrap();
-        let hello_frame = device_session.encrypt_json_payload(&hello).unwrap();
-        let hello_responses = connection.handle_wire_envelope(
-            &mut protocol_guard,
-            envelope_value(MessageType::EncryptedFrame, hello_frame).unwrap(),
-        );
-        assert!(hello_responses.is_empty());
-
-        let subscribe = envelope_value(
-            MessageType::MetadataSubscribe,
-            MetadataSubscribePayload {
-                status_interval_ms,
-                clients,
-            },
-        )
-        .unwrap();
-        let subscribe_frame = device_session.encrypt_json_payload(&subscribe).unwrap();
-        let subscribe_responses = connection.handle_wire_envelope(
-            &mut protocol_guard,
-            envelope_value(MessageType::EncryptedFrame, subscribe_frame).unwrap(),
-        );
-        let subscribe_inner = decrypt_encrypted_envelopes(&mut device_session, subscribe_responses);
-        assert_eq!(subscribe_inner[0].kind, MessageType::MetadataSubscribe);
-        assert!(subscribe_inner.iter().skip(1).all(|envelope| {
-            matches!(
-                envelope.kind,
-                MessageType::DaemonClientsSnapshot | MessageType::DaemonStatusSnapshot
-            )
-        }));
-
-        (connection, device_session)
-    }
-
-    async fn pair_extra_device_for_metadata_signal(protocol: SharedDaemonProtocol) -> DeviceId {
-        let mut protocol_guard = protocol.lock().await;
-        let pairing_token = protocol_guard
-            .issue_pairing_token(current_unix_timestamp_millis())
-            .unwrap()
-            .token()
-            .clone();
-        let (mut connection, _) = protocol_guard.start_connection();
-        let device_id = DeviceId::new();
-        let device_keypair = E2eeKeyPair::generate();
-        let mut device_session = open_test_e2ee(
-            &mut protocol_guard,
-            &mut connection,
-            device_id,
-            &device_keypair,
-        );
-        let pair_request = envelope_value(
-            MessageType::PairRequest,
-            PairRequestPayload {
-                device_id,
-                device_public_key: test_device_public_key(3),
-                token: pairing_token,
-                nonce: termd_proto::Nonce("metadata-extra-pair".to_owned()),
-                timestamp_ms: current_unix_timestamp_millis(),
-            },
-        )
-        .unwrap();
-        let pair_frame = device_session.encrypt_json_payload(&pair_request).unwrap();
-        let pair_responses = connection.handle_wire_envelope(
-            &mut protocol_guard,
-            envelope_value(MessageType::EncryptedFrame, pair_frame).unwrap(),
-        );
-        let pair_accept = decrypt_first_and_drain_scope_grants(&mut device_session, pair_responses);
-        assert_eq!(pair_accept.kind, MessageType::PairAccept);
-        device_id
-    }
-
-    fn decrypt_wire_messages(
-        device_session: &mut E2eeSession,
-        messages: Vec<ProtocolWireMessage>,
-    ) -> Vec<JsonEnvelope> {
-        let mut decrypted = Vec::new();
-        for message in messages {
-            let ProtocolWireMessage::Json(envelope) = message else {
-                panic!("metadata push should use encrypted JSON wire message, got {message:?}");
-            };
-            let frame = encrypted_frame_from_envelope(envelope).unwrap();
-            decrypted.push(device_session.decrypt_json_payload(&frame).unwrap());
-        }
-        decrypted
-    }
-
-    fn decrypt_encrypted_envelopes(
-        device_session: &mut E2eeSession,
-        messages: Vec<JsonEnvelope>,
-    ) -> Vec<JsonEnvelope> {
-        messages
-            .into_iter()
-            .map(|envelope| {
-                let frame = encrypted_frame_from_envelope(envelope).unwrap();
-                device_session.decrypt_json_payload(&frame).unwrap()
-            })
-            .collect()
-    }
-
-    fn test_ed25519_wire(bytes: &[u8]) -> String {
-        format!(
-            "ed25519-v1:{}",
-            base64::engine::general_purpose::STANDARD.encode(bytes)
-        )
-    }
-
-    fn test_device_public_key(seed: u8) -> PublicKey {
-        let signing_key = SigningKey::from_bytes(&[seed; 32]);
-        PublicKey(test_ed25519_wire(signing_key.verifying_key().as_bytes()))
-    }
-
-    fn open_test_e2ee(
-        protocol: &mut DefaultDaemonProtocol,
-        connection: &mut ProtocolConnection,
-        device_id: DeviceId,
-        device_keypair: &E2eeKeyPair,
-    ) -> E2eeSession {
-        let context = E2eeSessionContext::new(
-            protocol.server_id(),
-            device_id,
-            protocol.e2ee_public_key(),
-            device_keypair.public_key(),
-        );
-        let device_session = E2eeSession::new(
-            E2eeSessionRole::Device,
-            device_keypair,
-            protocol.e2ee_public_key(),
-            context,
-        )
-        .unwrap();
-        let handshake = envelope_value(
-            MessageType::E2eeKeyExchange,
-            E2eeKeyExchangePayload::new(
-                protocol.server_id(),
-                device_id,
-                device_keypair.public_key_wire(),
-                termd_proto::Nonce("nonce-e2ee-test".to_owned()),
-                UnixTimestampMillis(1_000),
-            ),
-        )
-        .unwrap();
-
-        let responses = connection.handle_wire_envelope(protocol, handshake);
-        assert!(responses.is_empty());
-        device_session
-    }
 }

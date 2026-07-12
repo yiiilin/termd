@@ -29,6 +29,8 @@ pub struct PairedServerState {
     pub daemon_public_key: PublicKey,
     pub url: String,
     pub paired_at_ms: UnixTimestampMillis,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_certificate: Option<String>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -82,7 +84,17 @@ impl TermctlState {
         self.device.clone().ok_or(TermctlError::MissingPairing)
     }
 
+    #[cfg(test)]
     pub fn record_pairing(&mut self, accepted: PairAcceptPayload, url: String) {
+        self.record_pairing_with_certificate(accepted, url, None);
+    }
+
+    pub fn record_pairing_with_certificate(
+        &mut self,
+        accepted: PairAcceptPayload,
+        url: String,
+        device_certificate: Option<String>,
+    ) {
         let url =
             normalize_persisted_ws_url(&url).unwrap_or_else(|| strip_sensitive_query_params(&url));
         let server = PairedServerState {
@@ -90,6 +102,7 @@ impl TermctlState {
             daemon_public_key: accepted.daemon_public_key,
             url: url.clone(),
             paired_at_ms: crypto::now_ms(),
+            device_certificate,
         };
 
         if let Some(existing) = self
@@ -230,6 +243,10 @@ impl fmt::Debug for PairedServerState {
             .field("daemon_public_key", &self.daemon_public_key)
             .field("url", &url)
             .field("paired_at_ms", &self.paired_at_ms)
+            .field(
+                "device_certificate",
+                &self.device_certificate.as_ref().map(|_| "<redacted>"),
+            )
             .finish()
     }
 }
@@ -940,6 +957,10 @@ pub fn normalize_ws_url(value: &str) -> Option<String> {
         ("ws", rest)
     } else if let Some(rest) = trimmed.strip_prefix("wss://") {
         ("wss", rest)
+    } else if let Some(rest) = trimmed.strip_prefix("http://") {
+        ("http", rest)
+    } else if let Some(rest) = trimmed.strip_prefix("https://") {
+        ("https", rest)
     } else {
         return None;
     };
@@ -986,7 +1007,7 @@ pub fn normalize_ws_url(value: &str) -> Option<String> {
         normalized.push('?');
         normalized.push_str(query);
     }
-    Some(normalized)
+    Some(strip_sensitive_query_params(&normalized))
 }
 
 pub fn resolve_state_path(override_path: Option<PathBuf>) -> PathBuf {
@@ -1656,19 +1677,26 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_legacy_relay_client_urls_to_unified_ws_endpoint() {
+    fn normalizes_application_base_urls_to_unified_ws_endpoint() {
         assert_eq!(
             normalize_ws_url(
                 "wss://relay.example/termd/ws/00000000-0000-0000-0000-000000000001/client?relay_token=redacted"
             )
             .unwrap(),
-            "wss://relay.example/termd/ws?relay_token=redacted"
+            "wss://relay.example/termd/ws"
         );
         assert_eq!(
             normalize_ws_url("ws://127.0.0.1:8765").unwrap(),
             "ws://127.0.0.1:8765/ws"
         );
-        assert!(normalize_ws_url("https://relay.example/ws").is_none());
+        assert_eq!(
+            normalize_ws_url("https://relay.example").unwrap(),
+            "https://relay.example/ws"
+        );
+        assert_eq!(
+            normalize_ws_url("http://127.0.0.1:8765").unwrap(),
+            "http://127.0.0.1:8765/ws"
+        );
         assert!(normalize_ws_url("wss://relay.example/ws#fragment").is_none());
     }
 
@@ -1751,12 +1779,14 @@ mod tests {
                     daemon_public_key: PublicKey("daemon-first".to_owned()),
                     url: "wss://relay.example/ws?region=cn&relay%5Ftoken=secret-a&filter=a%2Bb+z&relay_token_hint=keep".to_owned(),
                     paired_at_ms: UnixTimestampMillis(1),
+                    device_certificate: None,
                 },
                 PairedServerState {
                     server_id: second_server_id,
                     daemon_public_key: PublicKey("daemon-second".to_owned()),
                     url: "wss://relay.example/ws?%72%65%6c%61%79%5f%74%6f%6b%65%6e=secret-b&region=us&x=1%202".to_owned(),
                     paired_at_ms: UnixTimestampMillis(2),
+                    device_certificate: None,
                 },
             ],
             default_server_id: Some(first_server_id),
@@ -1808,6 +1838,7 @@ mod tests {
                 daemon_public_key: PublicKey("daemon".to_owned()),
                 url: "wss://relay.example/ws?region=cn&relay%5Ftoken=secret&x=a%2Bb".to_owned(),
                 paired_at_ms: UnixTimestampMillis(1),
+                device_certificate: None,
             }],
             ..TermctlState::default()
         };
@@ -1829,6 +1860,7 @@ mod tests {
                 daemon_public_key: PublicKey("daemon-public".to_owned()),
                 url: "wss://relay.example/ws?region=cn".to_owned(),
                 paired_at_ms: UnixTimestampMillis(1),
+                device_certificate: None,
             }],
             default_server_id: Some(server_id),
             default_url: Some("wss://relay.example/ws?region=cn".to_owned()),
@@ -1840,10 +1872,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(target.server.server_id, server_id);
-        assert_eq!(
-            target.url,
-            "wss://relay.example/ws?relay_token=secret&region=cn"
-        );
+        assert_eq!(target.url, "wss://relay.example/ws?region=cn");
     }
 
     #[test]
@@ -1857,12 +1886,14 @@ mod tests {
                     daemon_public_key: PublicKey("daemon-public-default".to_owned()),
                     url: "wss://relay.example/ws?region=us".to_owned(),
                     paired_at_ms: UnixTimestampMillis(1),
+                    device_certificate: None,
                 },
                 PairedServerState {
                     server_id: matched_server_id,
                     daemon_public_key: PublicKey("daemon-public-matched".to_owned()),
                     url: "wss://relay.example/ws?region=cn".to_owned(),
                     paired_at_ms: UnixTimestampMillis(2),
+                    device_certificate: None,
                 },
             ],
             default_server_id: Some(default_server_id),
@@ -1879,7 +1910,7 @@ mod tests {
             let target = state.selected_paired_target(Some(&runtime_url)).unwrap();
 
             assert_eq!(target.server.server_id, matched_server_id);
-            assert_eq!(target.url, runtime_url);
+            assert_eq!(target.url, "wss://relay.example/ws?region=cn");
         }
     }
 
@@ -1898,6 +1929,7 @@ mod tests {
                 url: "wss://relay.example/ws?relay_token=secret&region=cn#fragment-secret"
                     .to_owned(),
                 paired_at_ms: UnixTimestampMillis(1),
+                device_certificate: Some("device-certificate-secret".to_owned()),
             }],
             default_server_id: Some(server_id),
             default_url: Some(
@@ -1925,6 +1957,7 @@ mod tests {
                 daemon_public_key: PublicKey("daemon-public".to_owned()),
                 url: "wss://relay.example/ws?relay%5Ftoken=secret-a&relay%5ftoken=secret-b&%72%65%6c%61%79%5f%74%6f%6b%65%6e=secret-c&region=cn".to_owned(),
                 paired_at_ms: UnixTimestampMillis(1),
+                device_certificate: None,
             }],
             default_server_id: Some(server_id),
             default_url: Some(
@@ -1951,12 +1984,14 @@ mod tests {
             daemon_public_key: PublicKey("daemon-public-1".to_owned()),
             url: "wss://relay.example/first/ws".to_owned(),
             paired_at_ms: UnixTimestampMillis(1),
+            device_certificate: None,
         };
         let second = PairedServerState {
             server_id: second_server_id,
             daemon_public_key: PublicKey("daemon-public-2".to_owned()),
             url: "wss://relay.example/second/ws".to_owned(),
             paired_at_ms: UnixTimestampMillis(2),
+            device_certificate: None,
         };
         let state = TermctlState {
             paired_servers: vec![first.clone(), second],
@@ -1982,12 +2017,14 @@ mod tests {
             daemon_public_key: PublicKey("daemon-public-1".to_owned()),
             url: shared_url.clone(),
             paired_at_ms: UnixTimestampMillis(1),
+            device_certificate: None,
         };
         let second = PairedServerState {
             server_id: second_server_id,
             daemon_public_key: PublicKey("daemon-public-2".to_owned()),
             url: shared_url.clone(),
             paired_at_ms: UnixTimestampMillis(2),
+            device_certificate: None,
         };
         let state = TermctlState {
             paired_servers: vec![first, second.clone()],
@@ -1999,6 +2036,7 @@ mod tests {
         let target = state.selected_paired_target(Some(&shared_url)).unwrap();
 
         assert_eq!(target.server.server_id, second_server_id);
-        assert_eq!(target.url, shared_url);
+        assert_eq!(target.url, "wss://relay.example/shared/ws");
+        assert!(!target.url.contains("relay_token="));
     }
 }

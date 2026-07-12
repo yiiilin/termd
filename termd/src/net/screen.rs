@@ -476,6 +476,13 @@ impl TerminalScreen {
         output
     }
 
+    pub(crate) fn cursor_position(&self) -> (u16, u16) {
+        (
+            self.cursor_row.saturating_add(1).min(u16::MAX as usize) as u16,
+            self.cursor_col.saturating_add(1).min(u16::MAX as usize) as u16,
+        )
+    }
+
     #[allow(dead_code)]
     pub(crate) fn snapshot_plain_lines(&self) -> Vec<String> {
         self.snapshot_lines()
@@ -1429,6 +1436,14 @@ mod tests {
         screen.apply(b"alpha\nbeta\ngamma\x1b[2;1Hbravo\x1b[K");
 
         assert_eq!(screen.visible_lines(), vec!["alpha", "bravo", "gamma"]);
+    }
+
+    #[test]
+    fn cursor_position_is_reported_as_one_based_snapshot_metadata() {
+        let mut screen = TerminalScreen::new(24, 80);
+        screen.apply(b"\x1b[7;13H");
+
+        assert_eq!(screen.cursor_position(), (7, 13));
     }
 
     #[test]

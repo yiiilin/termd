@@ -772,7 +772,7 @@ async fn write_relay_idle_ping_and_report(
 ) -> bool {
     *idle_ping_nonce = idle_ping_nonce.wrapping_add(1);
     let payload = idle_ping_nonce.to_be_bytes().to_vec();
-    // 中文注释：这是 WebSocket 控制帧保活，不进入 E2EE 业务协议。
+    // 中文注释：这是 WebSocket 控制帧保活，不进入应用消息协议。
     // relay 不等待业务 ACK，也不解析终端内容；ping 只用于让代理/NAT 看见连接活动。
     // 是否离线只能由底层 WebSocket read/write close/error 暴露，不能由 relay 自己计数裁定。
     match send_message_with_deadline(

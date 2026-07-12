@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type MutableRefObject } from "react";
-import { DirectClient, ProtocolClientError } from "../protocol/direct-client";
+import { ProtocolClientError } from "../protocol/errors";
+import { V070Client } from "../protocol/v070-client";
+import { migrateDeviceCertificate } from "../protocol/pairing-client";
 import type { DeviceState, PairedServerState, UUID } from "../protocol/types";
 
 export interface WorkspaceAutoRetryStatus {
@@ -18,7 +20,8 @@ interface UseWorkspaceConnectionOptions {
   isTerminalTransportPaused: () => boolean;
   isRetryableConnectionError: (caught: unknown) => boolean;
   resolveServerRouteUrls: (server: PairedServerState) => string[];
-  onBrokenAttachedClient: (client: DirectClient, caught: unknown) => boolean;
+  onBrokenAttachedClient: (client: V070Client, caught: unknown) => boolean;
+  onDeviceCertificateMigrated?: (serverId: UUID, deviceCertificate: string) => Promise<void> | void;
   requestTimeoutMs: number;
   defaultWorkspaceTimeoutMs: number;
   socketConnectTimeoutMs: number;
@@ -36,54 +39,6 @@ function terminalTransportPausedError(): ProtocolClientError {
   return new ProtocolClientError("connection_closed", "connection paused while browser is offline");
 }
 
-function createTransportAbortController(
-  isTerminalTransportPaused: () => boolean,
-): { controller: AbortController; dispose: () => void } | undefined {
-  if (typeof window === "undefined") {
-    return undefined;
-  }
-  const controller = new AbortController();
-  const abortWhenOffline = () => {
-    if (isTerminalTransportPaused()) {
-      controller.abort();
-    }
-  };
-  window.addEventListener("offline", abortWhenOffline);
-  abortWhenOffline();
-  return {
-    controller,
-    dispose: () => {
-      window.removeEventListener("offline", abortWhenOffline);
-    },
-  };
-}
-
-function createLinkedAbortController(
-  ...signals: Array<AbortSignal | undefined>
-): { controller: AbortController; dispose: () => void } | undefined {
-  const activeSignals = signals.filter((signal): signal is AbortSignal => Boolean(signal));
-  if (activeSignals.length === 0) {
-    return undefined;
-  }
-  const controller = new AbortController();
-  const abortLinked = () => controller.abort();
-  for (const signal of activeSignals) {
-    if (signal.aborted) {
-      controller.abort();
-      continue;
-    }
-    signal.addEventListener("abort", abortLinked, { once: true });
-  }
-  return {
-    controller,
-    dispose: () => {
-      for (const signal of activeSignals) {
-        signal.removeEventListener("abort", abortLinked);
-      }
-    },
-  };
-}
-
 function connectionAbortedError(): ProtocolClientError {
   return new ProtocolClientError("connection_closed", "connection closed");
 }
@@ -94,45 +49,13 @@ function throwIfConnectionAborted(signal?: AbortSignal): void {
   }
 }
 
-function abortableConnectionStep<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
-  if (!signal) {
-    return promise;
-  }
-  throwIfConnectionAborted(signal);
-  return new Promise((resolve, reject) => {
-    const abort = () => reject(connectionAbortedError());
-    signal.addEventListener("abort", abort, { once: true });
-    promise.then(
-      (value) => {
-        signal.removeEventListener("abort", abort);
-        resolve(value);
-      },
-      (error) => {
-        signal.removeEventListener("abort", abort);
-        reject(error);
-      },
-    );
-  });
-}
-
-function waitForConnectionRetryDelay(delayMs: number, signal?: AbortSignal): Promise<void> {
-  return abortableConnectionStep(
-    new Promise((resolve) => {
-      globalThis.setTimeout(resolve, delayMs);
-    }),
-    signal,
-  );
-}
-
 export function useWorkspaceConnection(options: UseWorkspaceConnectionOptions) {
-  const attachClientRef = useRef<DirectClient | undefined>(undefined);
-  const pendingAttachClientRef = useRef<DirectClient | undefined>(undefined);
-  const workspaceClientRef = useRef<DirectClient | undefined>(undefined);
-  const workspaceClientPromiseRef = useRef<Promise<DirectClient> | undefined>(undefined);
+  const attachClientRef = useRef<V070Client | undefined>(undefined);
+  const pendingAttachClientRef = useRef<V070Client | undefined>(undefined);
+  const workspaceClientRef = useRef<V070Client | undefined>(undefined);
+  const workspaceClientPromiseRef = useRef<Promise<V070Client> | undefined>(undefined);
   const workspaceClientAbortControllerRef = useRef<AbortController | undefined>(undefined);
   const workspaceClientGenerationRef = useRef(0);
-  const sessionPermissionIdsRef = useRef<Set<UUID>>(new Set());
-  const workspaceSessionPermissionIdsRef = useRef<Set<UUID>>(new Set());
   const connectionAutoRetryTimerRef = useRef<number | undefined>(undefined);
   const connectionAutoRetryKeyRef = useRef<string | undefined>(undefined);
   const connectionAutoRetryAttemptsRef = useRef(0);
@@ -142,7 +65,6 @@ export function useWorkspaceConnection(options: UseWorkspaceConnectionOptions) {
     workspaceClientAbortControllerRef.current?.abort();
     workspaceClientAbortControllerRef.current = undefined;
     workspaceClientPromiseRef.current = undefined;
-    workspaceSessionPermissionIdsRef.current.clear();
     const workspaceClient = workspaceClientRef.current;
     workspaceClientRef.current = undefined;
     if (workspaceClient) {
@@ -154,7 +76,7 @@ export function useWorkspaceConnection(options: UseWorkspaceConnectionOptions) {
   const closeAttachClient = useCallback(() => {
     options.receiveLoopActiveRef.current = false;
     options.receiveLoopGenerationRef.current += 1;
-    const clients = new Set<DirectClient>();
+    const clients = new Set<V070Client>();
     if (pendingAttachClientRef.current) {
       clients.add(pendingAttachClientRef.current);
     }
@@ -162,48 +84,56 @@ export function useWorkspaceConnection(options: UseWorkspaceConnectionOptions) {
       clients.add(attachClientRef.current);
     }
     for (const client of clients) {
-      client.interruptReceiveWaiters();
-      client.close();
+      const sessionId = options.attachedSessionRef.current
+        ?? options.pendingTerminalAttachSessionRef.current;
+      if (sessionId) client.detachSession(sessionId);
+      if (!workspaceClientRef.current && !client.isClosed) workspaceClientRef.current = client;
     }
     pendingAttachClientRef.current = undefined;
     attachClientRef.current = undefined;
     options.pendingTerminalAttachSessionRef.current = undefined;
-    sessionPermissionIdsRef.current.clear();
   }, [
+    options.attachedSessionRef,
     options.pendingTerminalAttachSessionRef,
     options.receiveLoopActiveRef,
     options.receiveLoopGenerationRef,
   ]);
 
   const closeWorkspaceClient = useCallback(() => {
+    const clients = new Set([
+      workspaceClientRef.current,
+      pendingAttachClientRef.current,
+      attachClientRef.current,
+    ].filter((client): client is V070Client => Boolean(client)));
     closeWorkspaceMetadataClient();
-    closeAttachClient();
-  }, [closeAttachClient, closeWorkspaceMetadataClient]);
+    options.receiveLoopActiveRef.current = false;
+    options.receiveLoopGenerationRef.current += 1;
+    pendingAttachClientRef.current = undefined;
+    attachClientRef.current = undefined;
+    options.pendingTerminalAttachSessionRef.current = undefined;
+    for (const client of clients) client.close();
+  }, [
+    closeWorkspaceMetadataClient,
+    options.pendingTerminalAttachSessionRef,
+    options.receiveLoopActiveRef,
+    options.receiveLoopGenerationRef,
+  ]);
 
-  const claimAttachClient = useCallback((client: DirectClient) => {
-    // 中文注释：terminal attach/create/reconnect 一旦成功，这条 WebSocket 就成为当前
-    // session 的唯一主连接。任何旧 metadata sidecar（包括尚未落地的 pending connect）
-    // 都必须立刻作废，避免迟到 promise 再把孤儿连接写回 workspaceClientRef。
-    if (workspaceClientRef.current === client) {
-      // 中文注释：空工作台创建 session 时，复用的已认证连接会从 workspace 提升为
-      // terminal transport。此处只能移交引用，不能关闭同一条 socket。
+  const claimAttachClient = useCallback((client: V070Client) => {
+    if (workspaceClientPromiseRef.current && workspaceClientRef.current !== client) {
       workspaceClientGenerationRef.current += 1;
       workspaceClientAbortControllerRef.current?.abort();
       workspaceClientAbortControllerRef.current = undefined;
       workspaceClientPromiseRef.current = undefined;
-      workspaceSessionPermissionIdsRef.current.clear();
-      workspaceClientRef.current = undefined;
-      attachClientRef.current = client;
-      return;
     }
-    closeWorkspaceMetadataClient();
+    workspaceClientRef.current = client;
     attachClientRef.current = client;
-  }, [closeWorkspaceMetadataClient]);
+  }, []);
 
   const authenticatedClient = useCallback(async (
-    timeoutMs = options.requestTimeoutMs,
+    _timeoutMs = options.requestTimeoutMs,
     signal?: AbortSignal,
-    clientOptions: AuthenticatedClientOptions = {},
+    _clientOptions: AuthenticatedClientOptions = {},
   ) => {
     const server = options.activeServer;
     const device = options.device;
@@ -213,64 +143,21 @@ export function useWorkspaceConnection(options: UseWorkspaceConnectionOptions) {
     if (options.isTerminalTransportPaused()) {
       throw terminalTransportPausedError();
     }
-    // 中文注释：document hidden 不会中断 terminal WebSocket；这里只有浏览器明确 offline
-    // 才快速取消建连，避免后台恢复后必须整条 terminal stream 重建。
-    const transportAbort = createTransportAbortController(options.isTerminalTransportPaused);
-    const linkedAbort = createLinkedAbortController(signal, transportAbort?.controller.signal);
-    const abortSignal = linkedAbort?.controller.signal;
-    let client: DirectClient | undefined;
-    const routeUrls = options.resolveServerRouteUrls(server);
-    try {
-      throwIfConnectionAborted(abortSignal);
-      let lastConnectError: unknown;
-      const connectTimeoutMs = Math.min(timeoutMs, options.socketConnectTimeoutMs);
-      for (let attempt = 1; attempt <= options.socketConnectAttempts; attempt += 1) {
-        for (const routeUrl of routeUrls) {
-          try {
-            client = await DirectClient.connect(routeUrl, server.server_id, device.device_id, {
-              expectedDaemonPublicKey: server.daemon_public_key,
-              trustedDevice: device,
-              timeoutMs: connectTimeoutMs,
-              socketOpenTimeoutMs: Math.min(connectTimeoutMs, options.socketOpenTimeoutMs),
-              socketOpenHedgeDelayMs: options.socketOpenHedgeDelayMs,
-              requestTimeoutMs: options.requestTimeoutMs,
-              signal: abortSignal,
-            });
-            await abortableConnectionStep(
-              client.authenticate(device, { ...server, url: routeUrl }, {
-                clientKind: clientOptions.clientKind,
-              }),
-              abortSignal,
-            );
-            return client;
-          } catch (caught) {
-            lastConnectError = caught;
-            client?.close();
-            client = undefined;
-            if (abortSignal?.aborted || options.isTerminalTransportPaused()) {
-              throw caught;
-            }
-          }
-        }
-        if (attempt >= options.socketConnectAttempts || !options.isRetryableConnectionError(lastConnectError)) {
-          throw lastConnectError ?? new ProtocolClientError("connection_error", "connection error");
-        }
-        await waitForConnectionRetryDelay(options.socketConnectRetryDelayMs, abortSignal);
-      }
-      throw lastConnectError ?? new ProtocolClientError("connection_error", "connection error");
-    } catch (caught) {
-      // 中文注释：route/hello/auth 失败时必须回收半开 socket，避免 relay 上堆积未完成 client。
-      client?.close();
-      throw caught;
-    } finally {
-      linkedAbort?.dispose();
-      transportAbort?.dispose();
+    throwIfConnectionAborted(signal);
+    let effectiveServer = server;
+    if (!server.device_certificate) {
+      const deviceCertificate = await migrateDeviceCertificate(server, device);
+      effectiveServer = { ...server, device_certificate: deviceCertificate };
+      await options.onDeviceCertificateMigrated?.(server.server_id, deviceCertificate);
     }
+    throwIfConnectionAborted(signal);
+    return V070Client.connect(effectiveServer, device) as unknown as V070Client;
   }, [
     options.activeServer,
     options.device,
     options.isRetryableConnectionError,
     options.isTerminalTransportPaused,
+    options.onDeviceCertificateMigrated,
     options.requestTimeoutMs,
     options.resolveServerRouteUrls,
     options.socketConnectAttempts,
@@ -292,6 +179,7 @@ export function useWorkspaceConnection(options: UseWorkspaceConnectionOptions) {
       ) {
         closeWorkspaceMetadataClient();
       }
+      workspaceClientRef.current = attachedClient;
       return attachedClient;
     }
     if (attachedClient?.isClosed) {
@@ -305,7 +193,6 @@ export function useWorkspaceConnection(options: UseWorkspaceConnectionOptions) {
         }
       }
       attachClientRef.current = undefined;
-      sessionPermissionIdsRef.current.clear();
     }
     if (options.attachedSessionRef.current) {
       throw new ProtocolClientError("connection_closed", "terminal connection is reconnecting");
@@ -316,7 +203,6 @@ export function useWorkspaceConnection(options: UseWorkspaceConnectionOptions) {
     }
     if (existing?.isClosed) {
       workspaceClientRef.current = undefined;
-      workspaceSessionPermissionIdsRef.current.clear();
     }
     if (workspaceClientPromiseRef.current) {
       return workspaceClientPromiseRef.current;
@@ -329,7 +215,7 @@ export function useWorkspaceConnection(options: UseWorkspaceConnectionOptions) {
         workspaceClientAbortControllerRef.current = undefined;
       }
     };
-    let promise: Promise<DirectClient>;
+    let promise: Promise<V070Client>;
     promise = authenticatedClient(timeoutMs, abortController.signal)
       .then((client) => {
         clearAbortController();
@@ -362,42 +248,22 @@ export function useWorkspaceConnection(options: UseWorkspaceConnectionOptions) {
   ]);
 
   const authenticatedSessionClient = useCallback(
-    async (sessionId: UUID) => {
-      const client = await authenticatedWorkspaceClient();
-      const permissionIds =
-        client === attachClientRef.current
-          ? sessionPermissionIdsRef.current
-          : workspaceSessionPermissionIdsRef.current;
-      if (!permissionIds.has(sessionId)) {
-        await client.attachSessionPermission(sessionId);
-        permissionIds.add(sessionId);
-      }
-      return client;
-    },
+    async (_sessionId: UUID) => authenticatedWorkspaceClient(),
     [authenticatedWorkspaceClient],
   );
 
-  const resolveSessionScopedClient = useCallback(
-    async (sessionId: UUID): Promise<{ client: DirectClient; ownsClient: boolean }> => {
+  const resolveSessionClient = useCallback(
+    async (sessionId: UUID): Promise<{ client: V070Client; ownsClient: boolean }> => {
       return { client: await authenticatedSessionClient(sessionId), ownsClient: false };
     },
     [authenticatedSessionClient],
   );
 
   const openSessionOperationClient = useCallback(
-    async (sessionId: UUID): Promise<{ client: DirectClient; ownsClient: true }> => {
-      const client = await authenticatedClient(options.requestTimeoutMs);
-      try {
-        // 中文注释：文件上传/下载不应排在 terminal snapshot 后面；这里显式只拿 session 权限，
-        // 不订阅 stdout。
-        await client.attachSessionPermission(sessionId);
-        return { client, ownsClient: true };
-      } catch (caught) {
-        client.close();
-        throw caught;
-      }
+    async (sessionId: UUID): Promise<{ client: V070Client; ownsClient: boolean }> => {
+      return { client: await authenticatedSessionClient(sessionId), ownsClient: false };
     },
-    [authenticatedClient, options.requestTimeoutMs],
+    [authenticatedSessionClient],
   );
 
   return {
@@ -407,8 +273,6 @@ export function useWorkspaceConnection(options: UseWorkspaceConnectionOptions) {
     workspaceClientAbortControllerRef,
     workspaceClientGenerationRef,
     workspaceClientRef,
-    sessionPermissionIdsRef,
-    workspaceSessionPermissionIdsRef,
     claimAttachClient,
     closeAttachClient,
     closeWorkspaceMetadataClient,
@@ -419,7 +283,7 @@ export function useWorkspaceConnection(options: UseWorkspaceConnectionOptions) {
     authenticatedClient,
     authenticatedWorkspaceClient,
     authenticatedSessionClient,
-    resolveSessionScopedClient,
+    resolveSessionClient,
     openSessionOperationClient,
   };
 }

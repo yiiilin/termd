@@ -160,12 +160,11 @@ start_process_in_dir() {
 run_pairing_cli_e2e() (
   set -euo pipefail
 
-  local temp_dir daemon_pid daemon_port invite_code pair_stdout daemon_url daemon_ws_url
+  local temp_dir daemon_pid daemon_port invite_code invite_file pair_stdout daemon_url
   temp_dir="$(mktemp -d)"
   daemon_pid=""
   daemon_port="$(pick_free_port)"
   daemon_url="http://127.0.0.1:${daemon_port}"
-  daemon_ws_url="ws://127.0.0.1:${daemon_port}/ws"
 
   cleanup() {
     if [[ -n "$daemon_pid" ]]; then
@@ -217,10 +216,13 @@ run_pairing_cli_e2e() (
       exit 1
       ;;
   esac
+  invite_file="$temp_dir/pair-invite"
+  printf '%s\n' "$invite_code" >"$invite_file"
+  chmod 0600 "$invite_file"
 
   if ! pair_stdout="$(
     TERMD_CTL_STATE="$temp_dir/termctl-state.json" \
-      cargo run -q -p termctl -- pair --payload "$invite_code" --url "$daemon_ws_url" \
+      cargo run -q -p termctl -- pair --payload-file "$invite_file" --url "$daemon_url" \
         2>"$temp_dir/termctl-pair.err"
   )"; then
     printf '[termctl] termctl pair 消费 invite 失败：\n' >&2
@@ -239,11 +241,12 @@ run_pairing_cli_e2e() (
 run_relay_runtime_e2e() (
   set -euo pipefail
 
-  local relay_port relay_addr daemon_port temp_dir relay_pid daemon_pid relay_client_url state_path new_stdout list_stdout
-  local setup_token setup_token_file daemon_token registry_file server_id register_payload
-  local pairing_payload pairing_json pair_succeeded
+  local relay_port relay_addr relay_url daemon_port temp_dir relay_pid daemon_pid state_path new_stdout list_stdout
+  local setup_token setup_token_file daemon_token daemon_token_file registry_file server_id daemon_public_key register_payload register_curl_config
+  local pairing_invite pairing_invite_file pairing_output pair_succeeded
   relay_port="$(pick_free_port)"
   relay_addr="127.0.0.1:${relay_port}"
+  relay_url="http://${relay_addr}"
   daemon_port="$(pick_free_port)"
   temp_dir="$(mktemp -d)"
   relay_pid=""
@@ -274,9 +277,11 @@ run_relay_runtime_e2e() (
   setup_token="termd-qa-relay-setup-token-$(date +%s)-$(printf '%s' "$relay_port" | sha256sum | cut -c1-16)"
   daemon_token="termd-qa-daemon-token-$(date +%s)-$(printf '%s' "$daemon_port" | sha256sum | cut -c1-16)"
   setup_token_file="$temp_dir/relay-setup-token"
+  daemon_token_file="$temp_dir/daemon-token"
   registry_file="$temp_dir/daemon-registry.json"
   printf '%s\n' "$setup_token" >"$setup_token_file"
-  chmod 0600 "$setup_token_file"
+  printf '%s\n' "$daemon_token" >"$daemon_token_file"
+  chmod 0600 "$setup_token_file" "$daemon_token_file"
 
   relay_pid="$(start_process_in_dir "$temp_dir" "$temp_dir/termrelay.log" "$(debug_binary_path termrelay)" --listen "$relay_addr" --setup-token-file "$setup_token_file" --daemon-registry "$registry_file")"
   if ! wait_for_port "$relay_port" "termrelay"; then
@@ -285,7 +290,7 @@ run_relay_runtime_e2e() (
   fi
 
   # relay runtime E2E 同样需要隔离 daemon 状态，避免旧 session 恢复影响本轮监听启动。
-  daemon_pid="$(start_process_in_dir "$temp_dir" "$temp_dir/termd-relay.log" "$(debug_binary_path termd)" --listen "127.0.0.1:${daemon_port}" --relay "ws://${relay_addr}" --relay-daemon-token "$daemon_token")"
+  daemon_pid="$(start_process_in_dir "$temp_dir" "$temp_dir/termd-relay.log" "$(debug_binary_path termd)" --listen "127.0.0.1:${daemon_port}" --relay "ws://${relay_addr}" --relay-daemon-token-file "$daemon_token_file")"
 
   for _ in $(seq 1 200); do
     if ! kill -0 "$daemon_pid" 2>/dev/null; then
@@ -317,54 +322,66 @@ print(row[0])
 PY
   )"
   register_payload="$temp_dir/register-daemon.json"
-  python3 - "$server_id" "$daemon_token" >"$register_payload" <<'PY'
+  daemon_public_key="$(curl -fsS "http://127.0.0.1:${daemon_port}/healthz" | python3 -c 'import json,sys; print(json.load(sys.stdin)["daemon_public_key"])')"
+  python3 - "$server_id" "$daemon_public_key" "$daemon_token_file" >"$register_payload" <<'PY'
 import json
 import sys
 
-print(json.dumps({"server_id": sys.argv[1], "daemon_token": sys.argv[2]}, separators=(",", ":")))
+with open(sys.argv[3], "r", encoding="utf-8") as token_file:
+    daemon_token = token_file.readline().strip()
+print(json.dumps({"server_id": sys.argv[1], "daemon_token": daemon_token, "daemon_public_key": sys.argv[2]}, separators=(",", ":")))
 PY
-  # 中文注释：0.6 trusted relay 默认拒绝未注册 daemon；runtime QA 必须显式走
-  # setup-token 注册路径，避免退回旧的 open relay 模式。
-  if ! curl -fsS \
-    -H 'content-type: application/json' \
-    -H "x-termd-relay-setup-token: ${setup_token}" \
-    --data-binary "@${register_payload}" \
-    "http://${relay_addr}/api/relay/daemon/register" >/dev/null; then
+  chmod 0600 "$register_payload"
+  # 0.7 registry 只注册 daemon token 与 public key；setup token 通过 curl config
+  # 传递，避免真实凭据出现在进程 argv、URL 或日志。
+  register_curl_config="$temp_dir/register-daemon.curl"
+  {
+    printf 'url = "%s/api/relay/daemon/register"\n' "$relay_url"
+    printf 'request = "POST"\n'
+    printf 'fail\n'
+    printf 'silent\n'
+    printf 'show-error\n'
+    printf 'header = "content-type: application/json"\n'
+    printf 'header = "x-termd-relay-setup-token: %s"\n' "$setup_token"
+    printf 'data-binary = "@%s"\n' "$register_payload"
+  } >"$register_curl_config"
+  chmod 0600 "$register_curl_config"
+  if ! curl --config "$register_curl_config" >/dev/null; then
     printf '[termrelay] trusted relay daemon 注册失败。\n' >&2
     cat "$temp_dir/termrelay.log" >&2
     exit 1
   fi
 
   state_path="$temp_dir/termctl-state.json"
-  relay_client_url="ws://${relay_addr}/ws"
   pair_succeeded=0
   for _ in $(seq 1 80); do
     pairing_output="$("$(debug_binary_path termd)" pair --url "http://127.0.0.1:${daemon_port}" --qr)"
     pairing_invite="$(printf '%s\n' "$pairing_output" | awk '/^termd-pair:v2:/{print; exit}')"
-    mapfile -t pairing_payload < <(TERMD_QA_PAIRING_INVITE="$pairing_invite" python3 - <<'PY'
+    pairing_invite_file="$temp_dir/relay-pair-invite"
+    printf '%s\n' "$pairing_invite" >"$pairing_invite_file"
+    chmod 0600 "$pairing_invite_file"
+    python3 - "$pairing_invite_file" <<'PY'
 import base64
 import json
-import os
+import sys
 
-invite_code = os.environ.get("TERMD_QA_PAIRING_INVITE", "")
+with open(sys.argv[1], "r", encoding="utf-8") as invite_file:
+    invite_code = invite_file.readline().strip()
 if not invite_code:
     raise SystemExit("missing v2 invite")
 raw = invite_code.split(":", 2)[2]
 raw += "=" * (-len(raw) % 4)
 payload = json.loads(base64.urlsafe_b64decode(raw.encode()).decode())
-print(invite_code)
 if payload.get("version") != 2:
     raise SystemExit("unexpected invite version")
 PY
-    )
-    pairing_json="${pairing_payload[0]:-}"
-    if [[ "$pairing_json" != termd-pair:v2:* ]]; then
+    if [[ "$pairing_invite" != termd-pair:v2:* ]]; then
       printf '[termrelay] daemon 本地 pairing 响应未构造出预期 invite payload。\n' >&2
       exit 1
     fi
 
     rm -f "$state_path"
-    if cargo run -q -p termctl -- --state "$state_path" pair --payload "$pairing_json" --url "$relay_client_url" >"$temp_dir/termctl-pair.out" 2>"$temp_dir/termctl-pair.err" \
+    if cargo run -q -p termctl -- --state "$state_path" pair --payload-file "$pairing_invite_file" --url "$relay_url" >"$temp_dir/termctl-pair.out" 2>"$temp_dir/termctl-pair.err" \
       && [[ "$(cat "$temp_dir/termctl-pair.out")" == paired\ server=* ]]; then
       pair_succeeded=1
       break
@@ -377,12 +394,12 @@ PY
     cat "$temp_dir/termctl-pair.err" >&2
     exit 1
   fi
-  if ! new_stdout="$(cargo run -q -p termctl -- --state "$state_path" new --url "$relay_client_url" -- /bin/sh -lc 'printf relay-e2e-ready; sleep 1' 2>"$temp_dir/termctl-new.err")"; then
+  if ! new_stdout="$(cargo run -q -p termctl -- --state "$state_path" new --url "$relay_url" -- /bin/sh -lc 'printf relay-e2e-ready; sleep 1' 2>"$temp_dir/termctl-new.err")"; then
     printf '[termrelay] termctl new 未通过 trusted relay 完成。\n' >&2
     cat "$temp_dir/termctl-new.err" >&2
     exit 1
   fi
-  if ! list_stdout="$(cargo run -q -p termctl -- --state "$state_path" list --url "$relay_client_url" 2>"$temp_dir/termctl-list.err")"; then
+  if ! list_stdout="$(cargo run -q -p termctl -- --state "$state_path" list --url "$relay_url" 2>"$temp_dir/termctl-list.err")"; then
     printf '[termrelay] termctl list 未通过 trusted relay 完成。\n' >&2
     cat "$temp_dir/termctl-list.err" >&2
     exit 1
