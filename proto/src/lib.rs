@@ -1584,6 +1584,13 @@ struct RelayHttpTunnelHead {
     headers: Vec<(String, String)>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct RelayHttpTunnelResponseHead {
+    status: u16,
+    #[serde(default)]
+    headers: Vec<(String, String)>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RelayHttpTunnelFrame {
     RequestHead {
@@ -1597,6 +1604,7 @@ pub enum RelayHttpTunnelFrame {
     RequestEnd,
     ResponseHead {
         status: u16,
+        headers: Vec<(String, String)>,
     },
     ResponseBody {
         body: Vec<u8>,
@@ -1632,6 +1640,17 @@ pub fn encode_relay_http_tunnel_response_head(status: u16) -> Vec<u8> {
     encode_relay_http_tunnel_stream_frame(RELAY_HTTP_TUNNEL_RESPONSE_HEAD, &status.to_be_bytes())
 }
 
+pub fn encode_relay_http_tunnel_response_head_with_headers(
+    status: u16,
+    headers: Vec<(String, String)>,
+) -> Result<Vec<u8>, serde_json::Error> {
+    let head = serde_json::to_vec(&RelayHttpTunnelResponseHead { status, headers })?;
+    Ok(encode_relay_http_tunnel_stream_frame(
+        RELAY_HTTP_TUNNEL_RESPONSE_HEAD,
+        &head,
+    ))
+}
+
 pub fn encode_relay_http_tunnel_response_body(body: Vec<u8>) -> Vec<u8> {
     encode_relay_http_tunnel_stream_frame(RELAY_HTTP_TUNNEL_RESPONSE_BODY, &body)
 }
@@ -1664,6 +1683,14 @@ pub fn decode_relay_http_tunnel_frame(raw: &[u8]) -> Option<RelayHttpTunnelFrame
         RELAY_HTTP_TUNNEL_RESPONSE_HEAD if payload.len() == 2 => {
             Some(RelayHttpTunnelFrame::ResponseHead {
                 status: u16::from_be_bytes(payload.try_into().ok()?),
+                headers: Vec::new(),
+            })
+        }
+        RELAY_HTTP_TUNNEL_RESPONSE_HEAD => {
+            let head: RelayHttpTunnelResponseHead = serde_json::from_slice(payload).ok()?;
+            Some(RelayHttpTunnelFrame::ResponseHead {
+                status: head.status,
+                headers: head.headers,
             })
         }
         RELAY_HTTP_TUNNEL_RESPONSE_BODY => Some(RelayHttpTunnelFrame::ResponseBody {
@@ -1715,6 +1742,40 @@ fn binary_relay_mux_kind(kind: u8) -> Result<BinaryRelayMuxKind, BinaryRelayMuxF
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relay_http_response_head_roundtrips_headers_and_decodes_legacy_status() {
+        let encoded = encode_relay_http_tunnel_response_head_with_headers(
+            201,
+            vec![
+                ("content-type".to_owned(), "application/json".to_owned()),
+                ("x-request-id".to_owned(), "request-7".to_owned()),
+            ],
+        )
+        .expect("response head should encode");
+        assert_eq!(
+            decode_relay_http_tunnel_frame(&encoded),
+            Some(RelayHttpTunnelFrame::ResponseHead {
+                status: 201,
+                headers: vec![
+                    ("content-type".to_owned(), "application/json".to_owned()),
+                    ("x-request-id".to_owned(), "request-7".to_owned()),
+                ],
+            })
+        );
+
+        let legacy = encode_relay_http_tunnel_stream_frame(
+            RELAY_HTTP_TUNNEL_RESPONSE_HEAD,
+            &201_u16.to_be_bytes(),
+        );
+        assert_eq!(
+            decode_relay_http_tunnel_frame(&legacy),
+            Some(RelayHttpTunnelFrame::ResponseHead {
+                status: 201,
+                headers: Vec::new(),
+            })
+        );
+    }
 
     #[test]
     fn v070_relay_open_data_carries_workspace_route_and_access_token() {

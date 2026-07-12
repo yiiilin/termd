@@ -35,8 +35,8 @@ mod route_prelude;
 
 #[cfg(test)]
 use self::http_tunnel::{
-    RelayHttpTunnelRequestBodyDeadline, relay_http_tunnel_forward_request_body,
-    relay_http_tunnel_request_body_deadline,
+    RelayHttpTunnelRequestBodyDeadline, relay_http_response_headers,
+    relay_http_tunnel_forward_request_body, relay_http_tunnel_request_body_deadline,
 };
 use self::pipe_pump::{
     DataQueueByteBudget, FrameSender, PipePump, PumpDataReceiver, RelayDataSendError, RelayOutbound,
@@ -2333,6 +2333,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn relay_http_response_headers_are_strict_and_exclude_hop_by_hop_fields() {
+        let headers = relay_http_response_headers(vec![
+            ("content-type".to_owned(), "application/json".to_owned()),
+            ("connection".to_owned(), "x-private".to_owned()),
+            ("x-private".to_owned(), "must-not-forward".to_owned()),
+            ("transfer-encoding".to_owned(), "chunked".to_owned()),
+        ])
+        .expect("valid response headers should parse");
+        assert_eq!(
+            headers
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json")
+        );
+        assert!(!headers.contains_key("connection"));
+        assert!(!headers.contains_key("x-private"));
+        assert!(!headers.contains_key("transfer-encoding"));
+
+        assert!(
+            relay_http_response_headers(vec![(
+                "x-response".to_owned(),
+                "safe\r\nx-injected: value".to_owned(),
+            )])
+            .is_err()
+        );
+        assert!(
+            relay_http_response_headers(vec![(
+                "invalid header name".to_owned(),
+                "value".to_owned(),
+            )])
+            .is_err()
+        );
+    }
+
     #[tokio::test]
     async fn relay_http_upload_first_chunk_deadline_times_out() {
         let body =
@@ -3503,7 +3538,13 @@ mod tests {
         state
             .forward_from(
                 &data_registration,
-                OpaqueFrame::Binary(termd_proto::encode_relay_http_tunnel_response_head(201)),
+                OpaqueFrame::Binary(
+                    termd_proto::encode_relay_http_tunnel_response_head_with_headers(
+                        201,
+                        vec![("content-type".to_owned(), "application/json".to_owned())],
+                    )
+                    .unwrap(),
+                ),
             )
             .await;
         state
@@ -3522,6 +3563,13 @@ mod tests {
             .await;
         let response = tunnel.await.unwrap();
         assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json")
+        );
         let body = axum::body::to_bytes(response.into_body(), 1024)
             .await
             .unwrap();

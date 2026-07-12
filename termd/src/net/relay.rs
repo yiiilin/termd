@@ -3,12 +3,13 @@
 //! relay 只负责把 client frame 包进 `RelayMuxEnvelope` 并按 `client_id` 转发；这里才把
 //! 每个 relay client 映射成独立的 daemon `ProtocolConnection`。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::{Body, Bytes};
+use axum::http::{HeaderMap, HeaderName};
 use futures_util::{Sink, SinkExt, StreamExt};
 use rustls::{ClientConfig, RootCertStore};
 use termd_proto::{
@@ -19,7 +20,7 @@ use termd_proto::{
     RouteReadyPayload as ProtoRouteReadyPayload, RouteRole as ProtoRouteRole, ServerId, SessionId,
     decode_relay_data_control, decode_relay_http_tunnel_frame,
     encode_relay_http_tunnel_response_body, encode_relay_http_tunnel_response_end,
-    encode_relay_http_tunnel_response_head,
+    encode_relay_http_tunnel_response_head_with_headers,
 };
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1554,11 +1555,14 @@ async fn send_relay_http_tunnel_response(
     );
     let response = handle_http_tunnel_stream_request(protocol, method, path, headers, body).await;
     let status = response.status().as_u16();
+    let headers = relay_http_end_to_end_response_headers(response.headers());
+    let response_head = encode_relay_http_tunnel_response_head_with_headers(status, headers)
+        .map_err(|_| RelayConnectorError::InvalidEnvelope)?;
     debug!(status, "relay daemon HTTP tunnel handler returned response");
     enqueue_relay_data_raw(
         &write_tx,
         RelayOutKind::Response,
-        Message::Binary(encode_relay_http_tunnel_response_head(status)),
+        Message::Binary(response_head),
     )
     .await?;
     debug!(status, "relay daemon HTTP tunnel response head queued");
@@ -1591,6 +1595,46 @@ async fn send_relay_http_tunnel_response(
         chunks, bytes, "relay daemon HTTP tunnel response body queued"
     );
     Ok(())
+}
+
+fn relay_http_end_to_end_response_headers(headers: &HeaderMap) -> Vec<(String, String)> {
+    let mut connection_named = HashSet::new();
+    for value in headers.get_all("connection").iter() {
+        let Ok(value) = value.to_str() else {
+            return Vec::new();
+        };
+        for token in value.split(',') {
+            let token = token.trim();
+            let Ok(name) = HeaderName::from_bytes(token.as_bytes()) else {
+                return Vec::new();
+            };
+            connection_named.insert(name);
+        }
+    }
+
+    headers
+        .iter()
+        .filter_map(|(name, value)| {
+            if relay_http_header_is_hop_by_hop(name) || connection_named.contains(name) {
+                return None;
+            }
+            Some((name.as_str().to_owned(), value.to_str().ok()?.to_owned()))
+        })
+        .collect()
+}
+
+fn relay_http_header_is_hop_by_hop(name: &HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+    )
 }
 
 async fn enqueue_relay_data_raw(
@@ -2344,6 +2388,59 @@ fn authority_contains_credentials(authority: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::{HeaderMap, HeaderValue};
+
+    #[test]
+    fn relay_http_response_headers_include_only_end_to_end_fields() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+        headers.append("set-cookie", HeaderValue::from_static("a=1"));
+        headers.append("set-cookie", HeaderValue::from_static("b=2"));
+        headers.insert(
+            "connection",
+            HeaderValue::from_static("X-Private, x-another"),
+        );
+        headers.insert("x-private", HeaderValue::from_static("private"));
+        headers.insert("x-another", HeaderValue::from_static("private"));
+        for name in [
+            "keep-alive",
+            "proxy-authenticate",
+            "proxy-authorization",
+            "te",
+            "trailer",
+            "transfer-encoding",
+            "upgrade",
+        ] {
+            headers.insert(name, HeaderValue::from_static("filtered"));
+        }
+
+        let forwarded = relay_http_end_to_end_response_headers(&headers);
+        assert!(forwarded.contains(&("content-type".to_owned(), "application/json".to_owned())));
+        assert_eq!(
+            forwarded
+                .iter()
+                .filter(|(name, _)| name == "set-cookie")
+                .count(),
+            2
+        );
+        for blocked in [
+            "connection",
+            "keep-alive",
+            "proxy-authenticate",
+            "proxy-authorization",
+            "te",
+            "trailer",
+            "transfer-encoding",
+            "upgrade",
+            "x-private",
+            "x-another",
+        ] {
+            assert!(
+                forwarded.iter().all(|(name, _)| name != blocked),
+                "{blocked} must not enter the relay response frame"
+            );
+        }
+    }
 
     #[test]
     fn daemon_connector_url_never_contains_transport_token_query() {

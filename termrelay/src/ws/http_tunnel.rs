@@ -1,8 +1,9 @@
+use std::collections::HashSet;
 use std::io;
 use std::time::Duration;
 
 use axum::body::{Body, BodyDataStream, Bytes};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures_util::StreamExt as _;
 use termd_proto::{
@@ -26,6 +27,49 @@ use super::{
 pub(super) enum RelayHttpTunnelRequestBodyDeadline {
     None,
     FirstChunk(Duration),
+}
+
+pub(super) fn relay_http_response_headers(headers: Vec<(String, String)>) -> Result<HeaderMap, ()> {
+    let mut parsed = Vec::with_capacity(headers.len());
+    let mut connection_named = HashSet::new();
+    for (name, value) in headers {
+        let name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| ())?;
+        let value = HeaderValue::from_bytes(value.as_bytes()).map_err(|_| ())?;
+        if name.as_str() == "connection" {
+            let value = value.to_str().map_err(|_| ())?;
+            for token in value.split(',') {
+                let token = token.trim();
+                if token.is_empty() {
+                    return Err(());
+                }
+                connection_named.insert(HeaderName::from_bytes(token.as_bytes()).map_err(|_| ())?);
+            }
+        }
+        parsed.push((name, value));
+    }
+
+    let mut filtered = HeaderMap::with_capacity(parsed.len());
+    for (name, value) in parsed {
+        if relay_http_header_is_hop_by_hop(&name) || connection_named.contains(&name) {
+            continue;
+        }
+        filtered.append(name, value);
+    }
+    Ok(filtered)
+}
+
+fn relay_http_header_is_hop_by_hop(name: &HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+    )
 }
 
 impl RelayState {
@@ -200,10 +244,12 @@ impl RelayState {
                         break;
                     };
                     if let RelayOutbound::Frame(OpaqueFrame::Binary(raw)) = outbound
-                        && let Some(RelayHttpTunnelFrame::ResponseHead { status }) =
+                        && let Some(RelayHttpTunnelFrame::ResponseHead { status, headers }) =
                             decode_relay_http_tunnel_frame(&raw)
                     {
                         let status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+                        let headers = relay_http_response_headers(headers)
+                            .map_err(|_| StatusCode::BAD_GATEWAY)?;
                         debug!(
                             server_id = %server_id.0,
                             client_connection_id = registration_guard.registration().id,
@@ -230,7 +276,10 @@ impl RelayState {
                         let body_stream = futures_util::stream::unfold(body_rx, |mut body_rx| async move {
                             body_rx.recv().await.map(|item| (item, body_rx))
                         });
-                        return Ok((status, Body::from_stream(body_stream)).into_response());
+                        let mut response = Body::from_stream(body_stream).into_response();
+                        *response.status_mut() = status;
+                        *response.headers_mut() = headers;
+                        return Ok(response);
                     }
                 }
             }
