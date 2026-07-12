@@ -808,6 +808,14 @@ impl RelayState {
         self.inner.register(prelude, sender)
     }
 
+    fn register_http_route(
+        &self,
+        prelude: &RoutePrelude,
+        sender: FrameSender,
+    ) -> Result<ConnectionRegistration, RelayError> {
+        self.inner.register_http(prelude, sender)
+    }
+
     fn register_workspace(
         &self,
         server_id: ServerId,
@@ -1986,12 +1994,15 @@ mod tests {
         let RelayControlEnvelope::OpenData {
             client_id,
             data_token,
-            ..
+            route_kind,
+            access_token,
         } = decode_control(control_rx.try_recv().unwrap())
         else {
             panic!("expected open_data after client registration");
         };
         assert_eq!(client_id, RelayClientId(client.id));
+        assert_eq!(route_kind, RelayRouteKind::Legacy);
+        assert_eq!(access_token, None);
         (client, client_id, data_token)
     }
 
@@ -3423,11 +3434,14 @@ mod tests {
         let RelayControlEnvelope::OpenData {
             client_id,
             data_token,
-            ..
+            route_kind,
+            access_token,
         } = relay_control_from_frame(&open_frame).unwrap()
         else {
             panic!("expected open_data");
         };
+        assert_eq!(route_kind, RelayRouteKind::Http);
+        assert_eq!(access_token, None);
         let (data_tx, mut data_rx) = channel();
         let data_registration = state
             .register_route(

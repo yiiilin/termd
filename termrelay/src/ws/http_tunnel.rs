@@ -52,15 +52,15 @@ impl RelayState {
             client_id: None,
             data_token: None,
         };
-        let registration = self
-            .register_route(&prelude, sender)
-            .map_err(|error| match error {
-                RelayError::DaemonControlOffline => StatusCode::SERVICE_UNAVAILABLE,
-                RelayError::DaemonControlBusy | RelayError::PendingClientLimitExceeded => {
-                    StatusCode::TOO_MANY_REQUESTS
-                }
-                _ => StatusCode::BAD_GATEWAY,
-            })?;
+        let registration =
+            self.register_http_route(&prelude, sender)
+                .map_err(|error| match error {
+                    RelayError::DaemonControlOffline => StatusCode::SERVICE_UNAVAILABLE,
+                    RelayError::DaemonControlBusy | RelayError::PendingClientLimitExceeded => {
+                        StatusCode::TOO_MANY_REQUESTS
+                    }
+                    _ => StatusCode::BAD_GATEWAY,
+                })?;
         self.start_pending_client_pair_deadline(&registration);
         debug!(
             server_id = %server_id.0,

@@ -417,6 +417,14 @@ impl RelayRegistry {
         self.register_transport(prelude, sender, RelayRouteKind::Legacy, None)
     }
 
+    pub(super) fn register_http(
+        &self,
+        prelude: &RoutePrelude,
+        sender: FrameSender,
+    ) -> Result<ConnectionRegistration, RelayError> {
+        self.register_transport(prelude, sender, RelayRouteKind::Http, None)
+    }
+
     pub(super) fn register_workspace(
         &self,
         server_id: ServerId,
