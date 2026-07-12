@@ -3441,6 +3441,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_tunnel_unpaired_client_uses_pending_client_pair_deadline() {
+        let state = RelayState::default();
+        let server_id = server_id(123);
+        let (control_tx, _control_rx) = channel();
+        state
+            .register(server_id, ConnectionRole::DaemonControl, control_tx)
+            .unwrap();
+
+        let result = timeout(
+            PENDING_CLIENT_PAIR_DEADLINE + Duration::from_millis(500),
+            state.http_tunnel(
+                server_id,
+                "GET".to_owned(),
+                "/api/control/session/list".to_owned(),
+                Vec::new(),
+                Body::empty().into_data_stream(),
+            ),
+        )
+        .await
+        .expect("HTTP tunnel should be released by the pending client pair deadline");
+
+        assert_eq!(result.unwrap_err(), StatusCode::GATEWAY_TIMEOUT);
+        assert!(!include_str!("ws/http_tunnel.rs").contains("ROUTE_PRELUDE_TIMEOUT"));
+    }
+
+    #[tokio::test]
     async fn http_tunnel_uses_daemon_data_pipe_without_parsing_body() {
         let state = RelayState::default();
         let server_id = server_id(91);

@@ -15,12 +15,11 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tracing::{debug, warn};
 
-use super::policy::ROUTE_PRELUDE_TIMEOUT;
 use super::{
     ConnectionRegistration, ConnectionRole, DATA_CHANNEL_CAPACITY,
     HTTP_TUNNEL_BODY_CHANNEL_CAPACITY, HTTP_TUNNEL_RESPONSE_HEAD_TIMEOUT,
-    HTTP_TUNNEL_SHORT_REQUEST_BODY_TIMEOUT, OpaqueFrame, PipePump, PumpDataReceiver, RelayError,
-    RelayOutbound, RelayState, RoutePrelude,
+    HTTP_TUNNEL_SHORT_REQUEST_BODY_TIMEOUT, OpaqueFrame, PENDING_CLIENT_PAIR_DEADLINE, PipePump,
+    PumpDataReceiver, RelayError, RelayOutbound, RelayState, RoutePrelude,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,23 +115,19 @@ impl RelayState {
         let mut data_rx = pipe_pump.into_data_receiver();
         let mut registration_guard =
             RelayHttpTunnelRegistrationGuard::new(self.clone(), registration);
-        if timeout(
-            ROUTE_PRELUDE_TIMEOUT,
-            self.wait_client_data_pair(registration_guard.registration()),
-        )
-        .await
-        .ok()
-            != Some(true)
+        if !self
+            .wait_client_data_pair(registration_guard.registration())
+            .await
         {
             warn!(
                 layer = "relay",
                 phase = "http_tunnel_wait_data_pair",
-                timeout_code = "route_prelude_timeout",
+                timeout_code = "pending_client_pair_deadline",
                 server_id = %server_id.0,
                 client_connection_id = registration_guard.registration().id,
                 method = %method,
                 path = %path,
-                timeout_ms = ROUTE_PRELUDE_TIMEOUT.as_millis(),
+                timeout_ms = PENDING_CLIENT_PAIR_DEADLINE.as_millis(),
                 "relay HTTP tunnel timed out waiting for data pair"
             );
             return Err(StatusCode::GATEWAY_TIMEOUT);
