@@ -13,8 +13,8 @@ use tower_http::cors::{Any, CorsLayer};
 use uuid::Uuid;
 
 use crate::ws::{
-    RegisterDaemonError, RelayState, WEBSOCKET_MAX_FRAME_SIZE, WEBSOCKET_MAX_MESSAGE_SIZE,
-    handle_socket, handle_workspace_socket,
+    RegisterDaemonError, RelaySignedCredentialKind, RelayState, WEBSOCKET_MAX_FRAME_SIZE,
+    WEBSOCKET_MAX_MESSAGE_SIZE, handle_socket, handle_workspace_socket,
 };
 
 pub fn router(state: RelayState, web_enabled: bool) -> Router {
@@ -179,6 +179,9 @@ async fn relay_http_tunnel(
             "x-termd-server-id must contain a valid server id",
         );
     };
+    if let Err(response) = authorize_relay_http_request(&state, server_id, uri.path(), &headers) {
+        return response;
+    }
     let forwarded_headers = headers
         .iter()
         .filter_map(|(name, value)| {
@@ -191,7 +194,6 @@ async fn relay_http_tunnel(
             method.as_str().to_owned(),
             uri.path().to_owned(),
             forwarded_headers,
-            None,
             body.into_data_stream(),
         )
         .await
@@ -202,6 +204,120 @@ async fn relay_http_tunnel(
             "relay_tunnel_failed",
             "relay could not forward the application request",
         ),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RelayHttpAdmissionRequirement {
+    Bootstrap,
+    Signed {
+        scheme: &'static str,
+        kind: RelaySignedCredentialKind,
+    },
+}
+
+fn authorize_relay_http_request(
+    state: &RelayState,
+    server_id: ServerId,
+    path: &str,
+    headers: &HeaderMap,
+) -> Result<(), Response> {
+    if !state.trusted_admission_enabled() {
+        return Ok(());
+    }
+    let Some(requirement) = relay_http_admission_requirement(path) else {
+        return Err(relay_json_error(
+            StatusCode::FORBIDDEN,
+            "relay_admission_policy_missing",
+            "relay admission policy does not allow this application route",
+        ));
+    };
+    let RelayHttpAdmissionRequirement::Signed {
+        scheme: required_scheme,
+        kind,
+    } = requirement
+    else {
+        // Existing-device migration is a bootstrap path: the daemon verifies its
+        // challenge proof because no v0.7 signed credential exists yet.
+        return Ok(());
+    };
+    let mut authorization_values = headers.get_all("authorization").iter();
+    let Some(authorization) = authorization_values.next() else {
+        return Err(relay_json_error(
+            StatusCode::UNAUTHORIZED,
+            "authorization_required",
+            "an authorization credential is required",
+        ));
+    };
+    if authorization_values.next().is_some() {
+        return Err(relay_json_error(
+            StatusCode::UNAUTHORIZED,
+            "authorization_invalid",
+            "authorization credentials are invalid",
+        ));
+    }
+    let Some((scheme, credential)) = authorization
+        .to_str()
+        .ok()
+        .and_then(|value| value.split_once(' '))
+    else {
+        return Err(relay_json_error(
+            StatusCode::UNAUTHORIZED,
+            "authorization_invalid",
+            "authorization credentials are invalid",
+        ));
+    };
+    if scheme != required_scheme
+        || credential.is_empty()
+        || credential.contains(char::is_whitespace)
+    {
+        return Err(relay_json_error(
+            StatusCode::UNAUTHORIZED,
+            "authorization_invalid",
+            "authorization credentials are invalid",
+        ));
+    }
+    if state.daemon_public_key(server_id).is_none() {
+        return Err(relay_json_error(
+            StatusCode::FORBIDDEN,
+            "daemon_identity_untrusted",
+            "the requested daemon identity is not trusted by this relay",
+        ));
+    }
+    state
+        .verify_signed_credential(server_id, credential, kind)
+        .map_err(|_| {
+            relay_json_error(
+                StatusCode::UNAUTHORIZED,
+                "credential_invalid",
+                "authorization credential is invalid or expired",
+            )
+        })
+}
+
+fn relay_http_admission_requirement(path: &str) -> Option<RelayHttpAdmissionRequirement> {
+    match path {
+        "/api/auth/pair" => Some(RelayHttpAdmissionRequirement::Signed {
+            scheme: "TermdPair",
+            kind: RelaySignedCredentialKind::PairTicket,
+        }),
+        "/api/auth/challenge" | "/api/auth/access-token" => {
+            Some(RelayHttpAdmissionRequirement::Signed {
+                scheme: "TermdDevice",
+                kind: RelaySignedCredentialKind::DeviceCertificate,
+            })
+        }
+        "/api/auth/device-certificate/migrate"
+        | "/api/auth/device-certificate/migrate/challenge" => {
+            Some(RelayHttpAdmissionRequirement::Bootstrap)
+        }
+        path if path.starts_with("/api/control/") || path.starts_with("/api/files/") => {
+            Some(RelayHttpAdmissionRequirement::Signed {
+                scheme: "Bearer",
+                kind: RelaySignedCredentialKind::AccessToken,
+            })
+        }
+        _ => None,
     }
 }
 
@@ -323,14 +439,16 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
-    use termd::auth::{AccessTokenProofInput, current_unix_timestamp_millis};
+    use termd::auth::{
+        AccessTokenProofInput, CredentialService, DaemonIdentity, current_unix_timestamp_millis,
+    };
     use termd::config::DaemonConfig;
     use termd::net::relay::{RelayReconnectPolicy, run_relay_mux_with_reconnect};
     use termd::net::server::default_protocol;
     use termd_proto::{
-        AuthPayload, Envelope, MessageType, Nonce, ProtocolVersion, PublicKey,
+        AuthPayload, DeviceId, Envelope, MessageType, Nonce, ProtocolVersion, PublicKey,
         RelayAdmissionPayload, RelayClientId, RelayControlEnvelope, RouteHelloPayload,
-        RouteReadyPayload, RouteRole, ServerId, Signature,
+        RouteReadyPayload, RouteRole, ServerId, Signature, UnixTimestampMillis,
     };
     use tokio::net::TcpListener;
     use tokio::time::timeout;
@@ -341,6 +459,90 @@ mod tests {
     use tower::ServiceExt as _;
 
     type TestWs = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+
+    struct RelayHttpCredentialFixture {
+        state: RelayState,
+        identity: DaemonIdentity,
+        pair_ticket: String,
+        device_certificate: String,
+        access_token: String,
+        now: UnixTimestampMillis,
+    }
+
+    fn relay_http_credential_fixture() -> RelayHttpCredentialFixture {
+        let identity = DaemonIdentity::generate();
+        let now = current_unix_timestamp_millis();
+        let service = CredentialService::new(identity.clone());
+        let device_id = DeviceId::new();
+        let device_key = SigningKey::from_bytes(&[41; 32]);
+        let device_public_key = PublicKey(format!(
+            "ed25519-v1:{}",
+            base64::engine::general_purpose::STANDARD.encode(device_key.verifying_key().as_bytes()),
+        ));
+        let pair_ticket = service
+            .issue_pair_ticket(now, UnixTimestampMillis(now.0.saturating_add(60_000)))
+            .expect("test pair ticket should be signed");
+        let device_certificate = service
+            .issue_device_certificate(device_id, device_public_key, now)
+            .expect("test device certificate should be signed");
+        let access_token = service
+            .issue_access_token(
+                device_id,
+                now,
+                UnixTimestampMillis(now.0.saturating_add(300_000)),
+            )
+            .expect("test access token should be signed");
+        let state = RelayState::new_trusted(vec![
+            crate::ws::RelayDaemonCredential::plain_token(
+                identity.server_id(),
+                "daemon-secret-1".to_owned(),
+            )
+            .with_public_key(Some(identity.public_key().clone())),
+        ]);
+        RelayHttpCredentialFixture {
+            state,
+            identity,
+            pair_ticket,
+            device_certificate,
+            access_token,
+            now,
+        }
+    }
+
+    async fn relay_http_request(
+        state: RelayState,
+        server_id: ServerId,
+        path: &str,
+        authorization: Option<&str>,
+    ) -> Response {
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri(path)
+            .header("x-termd-server-id", server_id.0.to_string());
+        if let Some(authorization) = authorization {
+            request = request.header("authorization", authorization);
+        }
+        router(state, false)
+            .oneshot(
+                request
+                    .body(Body::empty())
+                    .expect("test request should build"),
+            )
+            .await
+            .expect("router should respond")
+    }
+
+    async fn relay_error_code(response: Response) -> String {
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .expect("relay error body should be readable");
+        let body: serde_json::Value =
+            serde_json::from_slice(&body).expect("relay error body should be JSON");
+        body["error"]["code"]
+            .as_str()
+            .expect("relay error should have a code")
+            .to_owned()
+    }
 
     #[test]
     fn router_can_be_constructed() {
@@ -592,6 +794,160 @@ mod tests {
             after["latest_daemon_control_connection_id"]
                 .as_u64()
                 .is_some_and(|id| id > 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn trusted_relay_forwards_valid_pair_ticket_to_http_tunnel() {
+        let fixture = relay_http_credential_fixture();
+        let authorization = format!("TermdPair {}", fixture.pair_ticket);
+        let response = relay_http_request(
+            fixture.state,
+            fixture.identity.server_id(),
+            "/api/auth/pair",
+            Some(&authorization),
+        )
+        .await;
+
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "valid pair admission should reach the offline daemon tunnel boundary"
+        );
+    }
+
+    #[tokio::test]
+    async fn trusted_relay_http_routes_accept_only_their_signed_credential_kind() {
+        let fixture = relay_http_credential_fixture();
+        let server_id = fixture.identity.server_id();
+        let cases = [
+            (
+                "/api/auth/pair",
+                Some(format!("TermdPair {}", fixture.pair_ticket)),
+            ),
+            (
+                "/api/auth/challenge",
+                Some(format!("TermdDevice {}", fixture.device_certificate)),
+            ),
+            (
+                "/api/auth/access-token",
+                Some(format!("TermdDevice {}", fixture.device_certificate)),
+            ),
+            (
+                "/api/control/session/reorder",
+                Some(format!("Bearer {}", fixture.access_token)),
+            ),
+            (
+                "/api/files/uploads",
+                Some(format!("Bearer {}", fixture.access_token)),
+            ),
+            ("/api/auth/device-certificate/migrate/challenge", None),
+            ("/api/auth/device-certificate/migrate", None),
+        ];
+
+        for (path, authorization) in cases {
+            let response = relay_http_request(
+                fixture.state.clone(),
+                server_id,
+                path,
+                authorization.as_deref(),
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "valid admission for {path} should reach the offline daemon boundary"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn trusted_relay_http_routes_reject_missing_mismatched_and_invalid_credentials() {
+        let fixture = relay_http_credential_fixture();
+        let server_id = fixture.identity.server_id();
+        let wrong_signature =
+            CredentialService::new(DaemonIdentity::generate_for_server_id(server_id))
+                .issue_pair_ticket(
+                    fixture.now,
+                    UnixTimestampMillis(fixture.now.0.saturating_add(60_000)),
+                )
+                .unwrap();
+        let wrong_issuer = CredentialService::new(DaemonIdentity::generate())
+            .issue_pair_ticket(
+                fixture.now,
+                UnixTimestampMillis(fixture.now.0.saturating_add(60_000)),
+            )
+            .unwrap();
+        let expired = CredentialService::new(fixture.identity.clone())
+            .issue_pair_ticket(
+                UnixTimestampMillis(fixture.now.0.saturating_sub(2_000)),
+                UnixTimestampMillis(fixture.now.0.saturating_sub(1_000)),
+            )
+            .unwrap();
+        let cases = [
+            ("/api/auth/pair", None, "authorization_required"),
+            (
+                "/api/auth/pair?relay_token=query-only",
+                None,
+                "authorization_required",
+            ),
+            (
+                "/api/auth/pair",
+                Some(format!("Bearer {}", fixture.pair_ticket)),
+                "authorization_invalid",
+            ),
+            (
+                "/api/auth/challenge",
+                Some(format!("TermdDevice {}", fixture.pair_ticket)),
+                "credential_invalid",
+            ),
+            (
+                "/api/control/session/reorder",
+                Some(format!("Bearer {}", fixture.device_certificate)),
+                "credential_invalid",
+            ),
+            (
+                "/api/auth/pair",
+                Some(format!("TermdPair {wrong_signature}")),
+                "credential_invalid",
+            ),
+            (
+                "/api/auth/pair",
+                Some(format!("TermdPair {wrong_issuer}")),
+                "credential_invalid",
+            ),
+            (
+                "/api/auth/pair",
+                Some(format!("TermdPair {expired}")),
+                "credential_invalid",
+            ),
+        ];
+
+        for (path, authorization, expected_code) in cases {
+            let response = relay_http_request(
+                fixture.state.clone(),
+                server_id,
+                path,
+                authorization.as_deref(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+            assert_eq!(relay_error_code(response).await, expected_code, "{path}");
+        }
+
+        let unknown_server = ServerId::new();
+        let authorization = format!("TermdPair {}", fixture.pair_ticket);
+        let response = relay_http_request(
+            fixture.state,
+            unknown_server,
+            "/api/auth/pair",
+            Some(&authorization),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            relay_error_code(response).await,
+            "daemon_identity_untrusted"
         );
     }
 

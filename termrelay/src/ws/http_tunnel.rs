@@ -6,9 +6,8 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use futures_util::StreamExt as _;
 use termd_proto::{
-    RelayAdmissionPayload, RelayHttpTunnelFrame, decode_relay_http_tunnel_frame,
-    encode_relay_http_tunnel_request_body, encode_relay_http_tunnel_request_end,
-    encode_relay_http_tunnel_request_head,
+    RelayHttpTunnelFrame, decode_relay_http_tunnel_frame, encode_relay_http_tunnel_request_body,
+    encode_relay_http_tunnel_request_end, encode_relay_http_tunnel_request_head,
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -36,7 +35,6 @@ impl RelayState {
         method: String,
         path: String,
         headers: Vec<(String, String)>,
-        admission: Option<RelayAdmissionPayload>,
         body: BodyDataStream,
     ) -> Result<Response, StatusCode> {
         let request_body_deadline = relay_http_tunnel_request_body_deadline(&method);
@@ -49,17 +47,11 @@ impl RelayState {
             server_id,
             route_role: termd_proto::RouteRole::Client,
             connection_role: ConnectionRole::Client,
-            admission,
+            admission: None,
             route_generation: None,
             client_id: None,
             data_token: None,
         };
-        self.authorize_route_admission(&prelude)
-            .map_err(|error| match error {
-                RelayError::AdmissionRequired => StatusCode::UNAUTHORIZED,
-                RelayError::AdmissionRejected => StatusCode::FORBIDDEN,
-                _ => StatusCode::BAD_GATEWAY,
-            })?;
         let registration = self
             .register_route(&prelude, sender)
             .map_err(|error| match error {

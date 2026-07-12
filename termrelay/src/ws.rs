@@ -349,8 +349,8 @@ pub struct RelayDaemonCredential {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RelaySignedCredentialKind {
-    #[allow(dead_code)]
     PairTicket,
+    DeviceCertificate,
     AccessToken,
 }
 
@@ -358,6 +358,7 @@ impl RelaySignedCredentialKind {
     fn wire_name(self) -> &'static str {
         match self {
             Self::PairTicket => "pair_ticket",
+            Self::DeviceCertificate => "device_certificate",
             Self::AccessToken => "access_token",
         }
     }
@@ -3373,7 +3374,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn trusted_relay_http_tunnel_rejects_missing_admission() {
+    async fn trusted_relay_http_tunnel_skips_legacy_client_admission() {
         let server_id = server_id(122);
         let state = RelayState::new_trusted(vec![RelayDaemonCredential::plain_token(
             server_id,
@@ -3386,12 +3387,11 @@ mod tests {
                 "POST".to_owned(),
                 "/api/control/session/list".to_owned(),
                 Vec::new(),
-                None,
                 Body::empty().into_data_stream(),
             )
             .await;
 
-        assert_eq!(result.unwrap_err(), StatusCode::UNAUTHORIZED);
+        assert_eq!(result.unwrap_err(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
@@ -3411,7 +3411,6 @@ mod tests {
                     "POST".to_owned(),
                     "/api/files/upload/init".to_owned(),
                     vec![("x-termd-server-id".to_owned(), server_id.0.to_string())],
-                    None,
                     Body::from("opaque-e2ee-body").into_data_stream(),
                 )
                 .await
@@ -3541,7 +3540,6 @@ mod tests {
                     "POST".to_owned(),
                     "/api/files/upload/chunk".to_owned(),
                     Vec::new(),
-                    None,
                     body.into_data_stream(),
                 )
                 .await
@@ -3712,7 +3710,6 @@ mod tests {
                     "GET".to_owned(),
                     "/api/control/session/list".to_owned(),
                     Vec::new(),
-                    None,
                     Body::empty().into_data_stream(),
                 )
                 .await
@@ -3814,7 +3811,6 @@ mod tests {
                     "POST".to_owned(),
                     "/api/files/upload/chunk".to_owned(),
                     Vec::new(),
-                    None,
                     body.into_data_stream(),
                 )
                 .await
@@ -3887,7 +3883,6 @@ mod tests {
                     "POST".to_owned(),
                     "/api/files/download".to_owned(),
                     Vec::new(),
-                    None,
                     Body::empty().into_data_stream(),
                 )
                 .await

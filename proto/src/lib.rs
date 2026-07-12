@@ -309,6 +309,7 @@ pub fn is_http_tunnel_path_allowed(method: &str, path: &str) -> bool {
             | "/api/auth/challenge"
             | "/api/auth/access-token"
             | "/api/auth/device-certificate/migrate"
+            | "/api/auth/device-certificate/migrate/challenge"
     );
     (method.eq_ignore_ascii_case("POST") && auth_path)
         || (method.eq_ignore_ascii_case("POST") && is_http_control_tunnel_path_allowed(path))
@@ -2086,6 +2087,17 @@ mod tests {
             "POST",
             "/api/files/uploads/upload-id/chunks"
         ));
+    }
+
+    #[test]
+    fn http_tunnel_allowlist_includes_device_migration_bootstrap_routes() {
+        for path in [
+            "/api/auth/device-certificate/migrate/challenge",
+            "/api/auth/device-certificate/migrate",
+        ] {
+            assert!(is_http_tunnel_path_allowed("POST", path), "{path}");
+            assert!(!is_http_tunnel_path_allowed("GET", path), "{path}");
+        }
     }
 
     #[test]
