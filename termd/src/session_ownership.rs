@@ -1017,7 +1017,10 @@ fn ensure_owner_generation_column(conn: &Connection) -> Result<(), rusqlite::Err
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::ops::Deref;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -1028,6 +1031,49 @@ mod tests {
         CommandSpec, PtyBackend, PtyError, PtyExitStatus, PtyRestoreInfo, PtyResult, PtySession,
         PtySize, PtySnapshot, PtyStartupGrant,
     };
+
+    struct TestStatePath {
+        path: PathBuf,
+    }
+
+    impl TestStatePath {
+        fn new(label: &str) -> Self {
+            let directory = std::env::temp_dir().join(format!(
+                "termd-ownership-{label}-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir(&directory).unwrap();
+            #[cfg(unix)]
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+            Self {
+                path: directory.join("state.json"),
+            }
+        }
+    }
+
+    impl AsRef<Path> for TestStatePath {
+        fn as_ref(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Deref for TestStatePath {
+        type Target = Path;
+
+        fn deref(&self) -> &Self::Target {
+            &self.path
+        }
+    }
+
+    impl Drop for TestStatePath {
+        fn drop(&mut self) {
+            std::thread::sleep(Duration::from_millis(300));
+            if let Some(directory) = self.path.parent() {
+                let _ = std::fs::remove_dir_all(directory);
+            }
+        }
+    }
 
     struct CountingBackend {
         spawns: Arc<AtomicUsize>,
@@ -1278,11 +1324,7 @@ mod tests {
 
     #[test]
     fn create_does_not_spawn_when_preparing_intent_cannot_commit() {
-        let state_path = std::env::temp_dir().join(format!(
-            "termd-ownership-intent-{}-{}.json",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
+        let state_path = TestStatePath::new("intent");
         crate::state::StateStore::load(&state_path).unwrap();
         let sqlite_path = state_path.with_extension("sqlite");
         let spawns = Arc::new(AtomicUsize::new(0));
@@ -1309,11 +1351,7 @@ mod tests {
 
     #[test]
     fn create_commits_pid_evidence_before_startup_grant() {
-        let state_path = std::env::temp_dir().join(format!(
-            "termd-ownership-grant-{}-{}.json",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
+        let state_path = TestStatePath::new("grant");
         crate::state::StateStore::load(&state_path).unwrap();
         let sqlite_path = state_path.with_extension("sqlite");
         let socket_path = state_path.with_extension("sock");
@@ -1341,11 +1379,7 @@ mod tests {
 
     #[test]
     fn successful_create_atomically_publishes_active_runtime_projection() {
-        let state_path = std::env::temp_dir().join(format!(
-            "termd-ownership-active-{}-{}.json",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
+        let state_path = TestStatePath::new("active");
         let sqlite_path = state_path.with_extension("sqlite");
         let backend = Arc::new(SuccessfulGatedBackend {
             socket_path: state_path.with_extension("sock"),
@@ -1391,11 +1425,7 @@ mod tests {
 
     #[test]
     fn reconciler_never_claims_current_generation_prepared_create() {
-        let state_path = std::env::temp_dir().join(format!(
-            "termd-ownership-generation-{}-{}.json",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
+        let state_path = TestStatePath::new("generation");
         let sqlite_path = state_path.with_extension("sqlite");
         let backend = Arc::new(SlowPreparedBackend {
             socket_path: state_path.with_extension("sock"),
@@ -1427,11 +1457,7 @@ mod tests {
 
     #[test]
     fn previous_generation_prepared_create_is_hidden_and_reconciled() {
-        let state_path = std::env::temp_dir().join(format!(
-            "termd-ownership-interrupted-{}-{}.json",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
+        let state_path = TestStatePath::new("interrupted");
         let sqlite_path = state_path.with_extension("sqlite");
         let backend = Arc::new(ReconcilingBackend::default());
         let ownership = super::SessionOwnership::open(&state_path, Arc::clone(&backend)).unwrap();
@@ -1482,11 +1508,7 @@ mod tests {
 
     #[test]
     fn active_projection_with_mismatched_evidence_is_quarantined() {
-        let state_path = std::env::temp_dir().join(format!(
-            "termd-ownership-quarantine-{}-{}.json",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
+        let state_path = TestStatePath::new("quarantine");
         let sqlite_path = state_path.with_extension("sqlite");
         let session_id = "00000000-0000-0000-0000-000000000006";
         let backend = Arc::new(SuccessfulGatedBackend {
@@ -1534,11 +1556,7 @@ mod tests {
 
     #[test]
     fn active_recovery_retries_one_transient_pty_reconnect_failure() {
-        let state_path = std::env::temp_dir().join(format!(
-            "termd-ownership-transient-reconnect-{}-{}.json",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
+        let state_path = TestStatePath::new("transient-reconnect");
         let sqlite_path = state_path.with_extension("sqlite");
         let session_id = "00000000-0000-0000-0000-000000000009";
         let backend = Arc::new(TransientReconnectBackend {
@@ -1587,11 +1605,7 @@ mod tests {
 
     #[test]
     fn active_commit_survives_lost_response_and_recovers_after_restart() {
-        let state_path = std::env::temp_dir().join(format!(
-            "termd-ownership-response-loss-{}-{}.json",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
+        let state_path = TestStatePath::new("response-loss");
         let session_id = "00000000-0000-0000-0000-000000000007";
         let backend = Arc::new(SuccessfulGatedBackend {
             socket_path: state_path.with_extension("sock"),
@@ -1632,11 +1646,7 @@ mod tests {
 
     #[test]
     fn locked_drop_and_failed_restart_keep_durable_cleanup_for_next_open() {
-        let state_path = std::env::temp_dir().join(format!(
-            "termd-ownership-locked-drop-{}-{}.json",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
+        let state_path = TestStatePath::new("locked-drop");
         let sqlite_path = state_path.with_extension("sqlite");
         let backend = Arc::new(ReconcilingBackend::default());
         let ownership = super::SessionOwnership::open(&state_path, Arc::clone(&backend)).unwrap();
