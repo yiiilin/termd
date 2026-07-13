@@ -86,9 +86,28 @@ grep -q 'REQUIRED_SUPERVISOR_VERSION="${TERMD_REQUIRED_SUPERVISOR_VERSION:-}"' "
 grep -q 'TERMD_REQUIRED_SUPERVISOR_VERSION:-' "${ROOT_DIR}/.github/workflows/release.yml"
 ! grep -q 'TERMD_SUPERVISOR_VERSION:-.*supervisor_version' "${ROOT_DIR}/.github/workflows/release.yml"
 test -s "${ROOT_DIR}/SUPERVISOR_VERSION"
-grep -q '^version = "0.7.0"$' "${ROOT_DIR}/Cargo.toml"
-grep -q '^  "version": "0.7.0",$' "${ROOT_DIR}/termui/frontend/package.json"
-grep -q '^  "version": "0.7.0",$' "${ROOT_DIR}/termui/frontend/package-lock.json"
+python3 - "${ROOT_DIR}" <<'PY'
+import json
+import pathlib
+import re
+import sys
+import tomllib
+
+root = pathlib.Path(sys.argv[1])
+workspace_version = tomllib.loads((root / "Cargo.toml").read_text())["workspace"]["package"]["version"]
+package = json.loads((root / "termui/frontend/package.json").read_text())
+package_lock = json.loads((root / "termui/frontend/package-lock.json").read_text())
+versions = {
+    "Cargo.toml": workspace_version,
+    "package.json": package["version"],
+    "package-lock.json": package_lock["version"],
+    "package-lock.json root package": package_lock["packages"][""]["version"],
+}
+if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", workspace_version):
+    raise SystemExit(f"workspace version is not plain semver: {workspace_version!r}")
+if any(version != workspace_version for version in versions.values()):
+    raise SystemExit(f"release version mismatch: {versions}")
+PY
 [[ "$(tr -d '\n' <"${ROOT_DIR}/SUPERVISOR_VERSION")" == "2026-07-12-dual-ws" ]]
 
 _load_termd_installer_functions_source() {
