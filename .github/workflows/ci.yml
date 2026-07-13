@@ -21,7 +21,7 @@ jobs:
         run: bash -n scripts/*.sh
 
       - name: Test installers
-        run: sudo bash scripts/test-installers.sh
+        run: bash scripts/test-installers.sh
 
   rust:
     name: rust

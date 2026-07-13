@@ -219,6 +219,7 @@ const RETRYABLE_CONNECTION_ERROR_CODES = new Set([
   "route_prelude_timeout",
   "relay_daemon_offline",
   "relay_state_unavailable",
+  "relay_tunnel_failed",
   "handshake_timeout",
   "terminal_resync",
 ]);

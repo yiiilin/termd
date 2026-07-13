@@ -5520,9 +5520,10 @@ fn publish_session_file_http_upload_noreplace(
         .map_err(|_| ProtocolError::InvalidEnvelope)?;
     let target = std::ffi::CString::new(target.as_os_str().as_bytes())
         .map_err(|_| ProtocolError::InvalidEnvelope)?;
-    // SAFETY: both C strings remain alive for the duration of renameat2.
+    // SAFETY: both C strings remain alive for the duration of the system call.
     let result = unsafe {
-        libc::renameat2(
+        libc::syscall(
+            libc::SYS_renameat2,
             libc::AT_FDCWD,
             temp.as_ptr(),
             libc::AT_FDCWD,

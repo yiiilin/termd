@@ -1,6 +1,6 @@
 import { expect, test } from "@playwright/test";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { stopProcess } from "./real-relay-fixture";
+import { stopProcess, stopRuntimeProcessPreservingGroup } from "./real-relay-fixture";
 
 test("fixture process cleanup terminates its detached process group", async () => {
   const parent = spawn(
@@ -32,6 +32,68 @@ test("fixture process cleanup terminates its detached process group", async () =
   }
 });
 
+test("fixture daemon restart preserves supervisors until final process-group cleanup", async () => {
+  const parent = spawn(
+    process.execPath,
+    [
+      "-e",
+      [
+        "const { spawn } = require('node:child_process');",
+        "const runtime = spawn('/bin/sleep', ['60'], { stdio: 'ignore' });",
+        "const supervisor = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)', '__session-supervisor'], { stdio: 'ignore' });",
+        "process.stdout.write(`${runtime.pid} ${supervisor.pid}\\n`);",
+        "setInterval(() => {}, 1000);",
+      ].join(" "),
+    ],
+    { detached: true },
+  );
+  const parentPid = requiredPid(parent);
+  const [runtimePid, supervisorPid] = await readChildPids(parent);
+
+  try {
+    await stopRuntimeProcessPreservingGroup({ child: parent, log: [] }, "sleep");
+
+    await expect.poll(() => isProcessAlive(parentPid), { timeout: 5_000 }).toBe(false);
+    await expect.poll(() => isProcessAlive(runtimePid), { timeout: 5_000 }).toBe(false);
+    expect(isProcessAlive(supervisorPid)).toBe(true);
+
+    await stopProcess({ child: parent, log: [] }, "controlled supervisor group");
+    await expect.poll(() => isProcessAlive(supervisorPid), { timeout: 5_000 }).toBe(false);
+  } finally {
+    killProcessGroup(parentPid);
+  }
+});
+
+test("fixture daemon restart finds an exec-replaced runtime at the process-group leader", async () => {
+  const runtime = spawn(
+    "/bin/bash",
+    [
+      "-c",
+      [
+        `"${process.execPath}" -e 'setInterval(() => {}, 1000)' __session-supervisor &`,
+        "supervisor_pid=$!;",
+        "printf '%s\\n' \"$supervisor_pid\";",
+        "exec -a termd /bin/sleep 60",
+      ].join(" "),
+    ],
+    { detached: true },
+  );
+  const runtimePid = requiredPid(runtime);
+  const supervisorPid = await readChildPid(runtime);
+
+  try {
+    await stopRuntimeProcessPreservingGroup({ child: runtime, log: [] }, "termd");
+
+    await expect.poll(() => isProcessAlive(runtimePid), { timeout: 5_000 }).toBe(false);
+    expect(isProcessAlive(supervisorPid)).toBe(true);
+
+    await stopProcess({ child: runtime, log: [] }, "controlled supervisor group");
+    await expect.poll(() => isProcessAlive(supervisorPid), { timeout: 5_000 }).toBe(false);
+  } finally {
+    killProcessGroup(runtimePid);
+  }
+});
+
 function requiredPid(child: ChildProcessWithoutNullStreams): number {
   if (child.pid === undefined) {
     throw new Error("controlled process did not receive a pid");
@@ -43,6 +105,16 @@ async function readChildPid(parent: ChildProcessWithoutNullStreams): Promise<num
   return new Promise((resolve, reject) => {
     parent.once("error", reject);
     parent.stdout.once("data", (chunk) => resolve(Number.parseInt(chunk.toString().trim(), 10)));
+  });
+}
+
+async function readChildPids(parent: ChildProcessWithoutNullStreams): Promise<[number, number]> {
+  return new Promise((resolve, reject) => {
+    parent.once("error", reject);
+    parent.stdout.once("data", (chunk) => {
+      const pids = chunk.toString().trim().split(/\s+/).map((value: string) => Number.parseInt(value, 10));
+      resolve([pids[0], pids[1]]);
+    });
   });
 }
 

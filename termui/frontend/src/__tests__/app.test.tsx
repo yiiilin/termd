@@ -3434,6 +3434,42 @@ describe("termui web 工作台", () => {
     expect(screen.getByTestId("terminal-pane")).toBeInTheDocument();
   });
 
+  it("daemon 重启窗口的 relay tunnel 503 会继续重试当前 session", async () => {
+    const originalAttachSession = V070Client.prototype.attachSession;
+    let failNextAttach = false;
+    const attachSpy = vi.spyOn(V070Client.prototype, "attachSession").mockImplementation(async function (
+      this: V070Client,
+      sessionId,
+    ) {
+      if (failNextAttach) {
+        failNextAttach = false;
+        throw new ProtocolClientError("relay_tunnel_failed", "relay could not forward the application request");
+      }
+      return originalAttachSession.call(this, sessionId);
+    });
+    const user = userEvent.setup();
+    try {
+      render(<App />);
+
+      await pairWithInvite(user, daemon);
+      await waitForWorkspaceSession();
+      await screen.findByText(/termd-e2e-ready/);
+      await waitFor(() => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID]));
+
+      failNextAttach = true;
+      daemon.dropConnections();
+
+      await waitFor(
+        () => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID, DEFAULT_SESSION_ID]),
+        { timeout: 3500 },
+      );
+      expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
+      expect(screen.getByTestId("terminal-pane")).toBeInTheDocument();
+    } finally {
+      attachSpy.mockRestore();
+    }
+  });
+
   it("浏览器 offline 后 online 会丢弃半开 WebSocket 并重连当前 session", async () => {
     const user = userEvent.setup();
     render(<App />);

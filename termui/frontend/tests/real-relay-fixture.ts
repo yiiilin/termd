@@ -1,5 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -149,11 +149,17 @@ export async function startRealRelayFixture(options: RealRelayFixtureOptions = {
     daemonToken,
   ];
   let daemon = spawnCargo(daemonArgs, "termd", tempDir, options.daemonEnv, daemonLogs);
+  const retiredDaemonProcessGroups = new Set<number>();
   await waitForPort(termdPort, daemon, "termd");
 
   const cleanupStartedFixture = async () => {
+    const daemonProcessGroups = new Set(retiredDaemonProcessGroups);
+    if (daemon.child.pid !== undefined) {
+      daemonProcessGroups.add(daemon.child.pid);
+    }
     const results = await Promise.allSettled([
-      stopProcess(daemon, "termd"),
+      ...[...daemonProcessGroups].map((processGroupId) =>
+        stopProcessGroup(processGroupId, "termd")),
       latencyProxy?.stop() ?? Promise.resolve(),
       stopProcess(relay, "termrelay"),
     ]);
@@ -215,7 +221,8 @@ export async function startRealRelayFixture(options: RealRelayFixtureOptions = {
       restartDaemon: async () => {
         // 中文注释：真实 relay 恢复验收需要保留同一个 state 目录，
         // 这样 daemon 重启后才能从 supervisor/socket restore 已持久化 session。
-        await stopProcess(daemon, "termd");
+        const retiredProcessGroup = await stopRuntimeProcessPreservingGroup(daemon, "termd");
+        retiredDaemonProcessGroups.add(retiredProcessGroup);
         daemon = spawnCargo(daemonArgs, "termd", tempDir, options.daemonEnv, daemonLogs);
         await waitForPort(termdPort, daemon, "termd");
         const restartedIdentity = await daemonIdentityFromHealthz(termdHttp);
@@ -650,7 +657,72 @@ async function pickFreePort(): Promise<number> {
 
 export async function stopProcess(startedProcess: StartedProcess, label: string): Promise<void> {
   const processGroupId = startedProcess.child.pid;
-  if (processGroupId === undefined || !isProcessGroupAlive(processGroupId)) {
+  if (processGroupId === undefined) {
+    return;
+  }
+  await stopProcessGroup(processGroupId, label);
+}
+
+export async function stopRuntimeProcessPreservingGroup(
+  startedProcess: StartedProcess,
+  runtimeName: string,
+): Promise<number> {
+  const processGroupId = startedProcess.child.pid;
+  if (processGroupId === undefined) {
+    throw new Error(`${runtimeName} launcher did not receive a pid`);
+  }
+  const runtimePid = await findRuntimeProcessInGroup(processGroupId, runtimeName);
+  await stopProcessId(runtimePid, runtimeName);
+  if (runtimePid !== processGroupId) {
+    await stopProcessId(processGroupId, `${runtimeName} launcher`);
+  }
+  return processGroupId;
+}
+
+async function findRuntimeProcessInGroup(processGroupId: number, runtimeName: string): Promise<number> {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    const children = await readFile(
+      `/proc/${processGroupId}/task/${processGroupId}/children`,
+      "utf8",
+    ).catch(() => "");
+    const candidatePids = [
+      processGroupId,
+      ...children.trim().split(/\s+/).filter(Boolean).map((value) => Number.parseInt(value, 10)),
+    ];
+    for (const pid of candidatePids) {
+      const commandLine = await readFile(`/proc/${pid}/cmdline`).catch(() => undefined);
+      if (!commandLine) continue;
+      const args = commandLine.toString("utf8").split("\0").filter(Boolean);
+      if (
+        path.basename(args[0] ?? "") === runtimeName &&
+        !args.includes("__session-supervisor")
+      ) {
+        return pid;
+      }
+    }
+    await sleep(25);
+  }
+  throw new Error(`${runtimeName} process was not found in process group ${processGroupId}`);
+}
+
+async function stopProcessId(pid: number, label: string): Promise<void> {
+  if (!isProcessAlive(pid)) {
+    return;
+  }
+  process.kill(pid, "SIGTERM");
+  if (await waitForProcessExit(pid, 5_000)) {
+    return;
+  }
+  process.kill(pid, "SIGKILL");
+  if (await waitForProcessExit(pid, 5_000)) {
+    return;
+  }
+  throw new Error(`${label} did not exit after SIGTERM/SIGKILL`);
+}
+
+async function stopProcessGroup(processGroupId: number, label: string): Promise<void> {
+  if (!isProcessGroupAlive(processGroupId)) {
     return;
   }
   process.kill(-processGroupId, "SIGTERM");
@@ -662,6 +734,18 @@ export async function stopProcess(startedProcess: StartedProcess, label: string)
     return;
   }
   throw new Error(`${label} did not exit after SIGTERM/SIGKILL`);
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (caught) {
+    if (caught instanceof Error && "code" in caught && caught.code === "ESRCH") {
+      return false;
+    }
+    throw caught;
+  }
 }
 
 function isProcessGroupAlive(processGroupId: number): boolean {
@@ -685,6 +769,17 @@ async function waitForProcessGroupExit(processGroupId: number, timeoutMs: number
     await sleep(50);
   }
   return !isProcessGroupAlive(processGroupId);
+}
+
+async function waitForProcessExit(pid: number, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!isProcessAlive(pid)) {
+      return true;
+    }
+    await sleep(50);
+  }
+  return !isProcessAlive(pid);
 }
 
 function sleep(ms: number): Promise<void> {

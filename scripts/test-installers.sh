@@ -185,6 +185,13 @@ install_fake_termd_system_commands() {
   INSTALL_EVENTS=()
   TERMD_FAKE_SERVICE_ACTIVE=1
 
+  eval "$(declare -f persist_supervisor_version | sed '1s/persist_supervisor_version/real_persist_supervisor_version/')"
+  persist_supervisor_version() {
+    # Default-path fixtures verify generated configuration and must not write host service state.
+    [[ "$STATE_DIR" == "/var/lib/termd" ]] && return 0
+    real_persist_supervisor_version
+  }
+
   # 用假的系统账号数据库覆盖 id/getent，测试即可稳定覆盖 alice/bob/termd 三种路径。
   id() {
     case "${1:-}" in
@@ -1103,6 +1110,7 @@ run_source_installer_fixture() (
 run_source_installer_main_fixture() (
   local component="$1"
   local install_mode="$2"
+  local test_owner test_group
   shift 2
 
   case "$component" in
@@ -1130,6 +1138,13 @@ run_source_installer_main_fixture() (
   REPO="fixture/termd"
   VERSION="fixture-version"
   PATH="${SOURCE_INSTALLER_FIXTURE_BIN}:/usr/sbin:/usr/bin:/bin"
+  test_owner="$(id -u)"
+  test_group="$(id -g)"
+
+  eval "$(declare -f commit_install_file | sed '1s/commit_install_file/real_commit_install_file/')"
+  commit_install_file() {
+    real_commit_install_file "$1" "$2" "$3" "$4" "$test_owner" "$test_group"
+  }
 
   require_root() { :; }
   inherit_existing_service_identity() { :; }

@@ -466,6 +466,8 @@ mod tests {
     use ed25519_dalek::{Signer, SigningKey};
     use futures_util::{SinkExt, StreamExt};
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::DirBuilderExt;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
@@ -603,7 +605,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn v070_relay_runtime_forwards_metadata_and_terminal_create_attach_streams() {
-        let state_path = temp_registry_path("v070-runtime-state").with_extension("sqlite");
+        let state_dir = PrivateTestStateDir::new("v070-runtime-state");
+        let state_path = state_dir.path().join("daemon-state.sqlite");
         let protocol = default_protocol(DaemonConfig::default_for_state_path(&state_path));
         let now = current_unix_timestamp_millis();
         let device_id = termd_proto::DeviceId::new();
@@ -756,9 +759,6 @@ mod tests {
         connector.abort();
         relay_server.abort();
         drop(protocol);
-        let _ = fs::remove_file(&state_path);
-        let _ = fs::remove_file(state_path.with_extension("sqlite-wal"));
-        let _ = fs::remove_file(state_path.with_extension("sqlite-shm"));
     }
 
     async fn next_workspace_text(socket: &mut TestWs) -> String {
@@ -2001,5 +2001,32 @@ mod tests {
             "termd-termrelay-{label}-{}-{index}.json",
             std::process::id()
         ))
+    }
+
+    struct PrivateTestStateDir {
+        path: PathBuf,
+    }
+
+    impl PrivateTestStateDir {
+        fn new(label: &str) -> Self {
+            let path = temp_registry_path(label).with_extension("state");
+            let mut builder = fs::DirBuilder::new();
+            #[cfg(unix)]
+            builder.mode(0o700);
+            builder
+                .create(&path)
+                .expect("private test state directory should be created");
+            Self { path }
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.path
+        }
+    }
+
+    impl Drop for PrivateTestStateDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
     }
 }
