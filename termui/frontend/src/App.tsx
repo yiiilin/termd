@@ -2667,26 +2667,21 @@ export default function App() {
       closingSessionIdsRef.current.add(sessionId);
       const wasAttached = attachedSessionRef.current === sessionId;
       const wasSelected = selectedSessionId === sessionId;
+      const previousUserDetached = userDetachedRef.current;
       const previousSessions = sessionsRef.current;
       const previousSessionOrder = sessionOrderRef.current;
       const removeClosedLocally = () => {
         clearTerminalSnapshotRevealHistory(sessionId);
         const nextSessionOrder = previousSessionOrder.filter((candidate) => candidate !== sessionId);
-        const remainingSessions = previousSessions.filter((session) => session.session_id !== sessionId);
         setSessions((current) => current.filter((session) => session.session_id !== sessionId));
         confirmedSessionSizesRef.current.delete(sessionId);
         sessionOrderRef.current = nextSessionOrder;
         setSessionOrder(nextSessionOrder);
         clearNewOutputMark(sessionId);
         if (wasSelected) {
-          // 中文注释：关闭当前选中 session 后，侧栏选中态应该立即落到剩余的下一项，
-          // 不能先清成 undefined 再等待下一轮 session.list 补选，否则旧刷新结果和本地
-          // close 之间会出现“列表还有行但没有任何选中项”的短空窗。
-          const nextSelectedSessionId = orderSessions(
-            sortSessionsNewestFirst(remainingSessions),
-            nextSessionOrder,
-          ).at(0)?.session_id;
-          selectSession(nextSelectedSessionId);
+          // 关闭当前 session 是显式离开终端；其余 session 只保留在列表中，
+          // 必须等用户再次点击后才 attach，不能自动打开第一项。
+          selectSession(undefined);
           clearSessionFiles();
         }
         if (wasAttached || wasSelected) {
@@ -2700,12 +2695,16 @@ export default function App() {
         // 中文注释：关闭当前 attach session 时先声明“这是一次有意断开”。
         // 这样旧 terminal WebSocket 若在 daemon close 收尾期间报 connection_closed，
         // receive loop / reconnect 都会把它当作预期行为，而不是重新 attach 回已删除 session。
-        if (wasAttached) {
+        if (wasAttached || wasSelected) {
           userDetachedRef.current = true;
+        }
+        if (wasAttached) {
           disconnectAttach();
           clearTerminalOutput();
         }
-        cancelScheduledAttachSwitch();
+        if (wasSelected) {
+          cancelScheduledAttachSwitch();
+        }
         if (attachingSessionIdRef.current === sessionId) {
           attachRequestIdRef.current += 1;
           attachingSessionIdRef.current = undefined;
@@ -2731,8 +2730,8 @@ export default function App() {
         setSessionOrder(previousSessionOrder);
         setSessions(previousSessions);
         if (wasSelected) selectSession(sessionId);
-        if (wasAttached) {
-          userDetachedRef.current = false;
+        if (wasAttached || wasSelected) {
+          userDetachedRef.current = previousUserDetached;
         }
         setSafeError(caught);
       } finally {

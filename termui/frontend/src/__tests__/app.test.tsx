@@ -7130,6 +7130,179 @@ describe("termui web 工作台", () => {
     expect(daemon.attachRequests).toHaveLength(attachCount);
   });
 
+  it("关闭当前 session 后保留其他列表项但进入无会话状态", async () => {
+    const user = userEvent.setup();
+    const alphaSession = {
+      session_id: "00000000-0000-0000-0000-000000000481",
+      name: "alpha",
+      state: "running",
+      size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+      created_at_ms: 3000,
+    } as const;
+    const betaSession = {
+      session_id: "00000000-0000-0000-0000-000000000482",
+      name: "beta",
+      state: "running",
+      size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+      created_at_ms: 2000,
+    } as const;
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [alphaSession, betaSession],
+      attachOutput: "attached-ready\n",
+    });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession("alpha");
+    await waitFor(() => expect(selectedSessionName()).toBe("alpha"));
+    const attachCount = daemon.attachRequests.length;
+    const alphaRow = (await screen.findByRole("button", { name: "Open alpha" })).closest(".session-row");
+    expect(alphaRow).not.toBeNull();
+
+    await user.click(within(alphaRow as HTMLElement).getByRole("button", { name: "Close session" }));
+
+    await waitFor(() => expect(visibleSessionNames()).toEqual(["beta"]));
+    expect(selectedSessionName()).toBeUndefined();
+    await waitFor(() => expect(document.querySelector('textarea[aria-label="Terminal input"]')).toBeNull());
+    expect(terminalText()).toBe("");
+    expect(document.querySelector(".terminal-placeholder")).toHaveTextContent("detached");
+    expect(daemon.hasActiveTerminalSession(alphaSession.session_id)).toBe(false);
+    expect(daemon.attachRequests).toHaveLength(attachCount);
+  });
+
+  it("关闭其他 session 后保留当前 session 的操作者", async () => {
+    const user = userEvent.setup();
+    const alphaSession = {
+      session_id: "00000000-0000-0000-0000-000000000491",
+      name: "alpha",
+      state: "running",
+      size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+      created_at_ms: 3000,
+    } as const;
+    const betaSession = {
+      session_id: "00000000-0000-0000-0000-000000000492",
+      name: "beta",
+      state: "running",
+      size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+      created_at_ms: 2000,
+    } as const;
+    const operatorClient = {
+      client_id: "00000000-0000-0000-0000-000000000791",
+      device_id: "00000000-0000-0000-0000-000000000891",
+      peer_ip: "192.0.2.91",
+      online: true,
+      connected_at_ms: 1_710_000_000_000,
+      last_seen_at_ms: 1_710_000_000_000,
+      attached_session_ids: [betaSession.session_id],
+      cursor_session_id: betaSession.session_id,
+      cursor_row: 4,
+      cursor_col: 9,
+      cursor_focused: true,
+    };
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [alphaSession, betaSession],
+      attachOutput: "attached-ready\n",
+      daemonClients: [operatorClient],
+    });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession("alpha");
+    await clickSessionCard(user, "beta");
+    await waitFor(() => expect(selectedSessionName()).toBe("beta"));
+    await waitFor(() => expect(daemon.hasActiveTerminalSession(betaSession.session_id)).toBe(true));
+    const operators = await screen.findByLabelText("session operators");
+    await within(operators).findByText("192.0.2.91");
+    const attachCount = daemon.attachRequests.length;
+    const alphaRow = (await screen.findByRole("button", { name: "Open alpha" })).closest(".session-row");
+    expect(alphaRow).not.toBeNull();
+
+    await user.click(within(alphaRow as HTMLElement).getByRole("button", { name: "Close session" }));
+
+    await waitFor(() => expect(visibleSessionNames()).toEqual(["beta"]));
+    await waitFor(() => expect(daemon.closedSessions).toEqual([alphaSession.session_id]));
+    daemon.setSessions([betaSession]);
+    await new Promise((resolve) => window.setTimeout(resolve, 50));
+    const terminalStillAttached = daemon.hasActiveTerminalSession(betaSession.session_id);
+    daemon.setDaemonClients([{
+      ...operatorClient,
+      attached_session_ids: terminalStillAttached ? [betaSession.session_id] : [],
+      cursor_session_id: terminalStillAttached ? betaSession.session_id : undefined,
+    }]);
+    expect(selectedSessionName()).toBe("beta");
+    await within(screen.getByLabelText("session operators")).findByText("192.0.2.91");
+    expect(terminalHost()).not.toBeNull();
+    expect(terminalStillAttached).toBe(true);
+    expect(daemon.attachRequests).toHaveLength(attachCount);
+  });
+
+  it("切换 session 的合并窗口内关闭旧 session 不会取消新 attach", async () => {
+    const alphaSession = {
+      session_id: "00000000-0000-0000-0000-000000000493",
+      name: "alpha",
+      state: "running",
+      size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+      created_at_ms: 3000,
+    } as const;
+    const betaSession = {
+      session_id: "00000000-0000-0000-0000-000000000494",
+      name: "beta",
+      state: "running",
+      size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+      created_at_ms: 2000,
+    } as const;
+    const operatorClient = {
+      client_id: "00000000-0000-0000-0000-000000000793",
+      device_id: "00000000-0000-0000-0000-000000000893",
+      peer_ip: "192.0.2.93",
+      online: true,
+      connected_at_ms: 1_710_000_000_000,
+      last_seen_at_ms: 1_710_000_000_000,
+      attached_session_ids: [betaSession.session_id],
+      cursor_session_id: betaSession.session_id,
+      cursor_row: 4,
+      cursor_col: 9,
+      cursor_focused: true,
+    };
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [alphaSession, betaSession],
+      attachOutput: "attached-ready\n",
+      daemonClients: [operatorClient],
+    });
+    render(<App />);
+
+    const user = userEvent.setup();
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession("alpha");
+    await waitFor(() => expect(daemon.hasActiveTerminalSession(alphaSession.session_id)).toBe(true));
+    const betaOpenButton = await screen.findByRole("button", { name: "Open beta" });
+    const alphaRow = (await screen.findByRole("button", { name: "Open alpha" })).closest(".session-row");
+    expect(alphaRow).not.toBeNull();
+    const alphaCloseButton = within(alphaRow as HTMLElement).getByRole("button", { name: "Close session" });
+
+    vi.useFakeTimers();
+    try {
+      fireEvent.click(betaOpenButton);
+      expect(selectedSessionName()).toBe("beta");
+      fireEvent.click(alphaCloseButton);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(100);
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+
+    await waitFor(() => expect(daemon.hasActiveTerminalSession(betaSession.session_id)).toBe(true));
+    expect(selectedSessionName()).toBe("beta");
+    await within(screen.getByLabelText("session operators")).findByText("192.0.2.93");
+  });
+
   it("旧 session.list 响应不会把刚关闭的 session 合并回列表", async () => {
     const user = userEvent.setup();
     render(<App />);
@@ -7189,14 +7362,12 @@ describe("termui web 工作台", () => {
     expect(betaRow).not.toBeNull();
     await user.click(within(betaRow as HTMLElement).getByRole("button", { name: "Close session" }));
 
-    await waitFor(() => {
-      expect(visibleSessionNames()).toEqual(["alpha"]);
-      expect(selectedSessionName()).toBe("alpha");
-    });
+    await waitFor(() => expect(visibleSessionNames()).toEqual(["alpha"]));
+    expect(selectedSessionName()).toBeUndefined();
     await new Promise((resolve) => window.setTimeout(resolve, 140));
 
     expect(visibleSessionNames()).toEqual(["alpha"]);
-    expect(selectedSessionName()).toBe("alpha");
+    expect(selectedSessionName()).toBeUndefined();
   });
 
   it("关闭已被 daemon 移除的 session 时按幂等删除处理", async () => {

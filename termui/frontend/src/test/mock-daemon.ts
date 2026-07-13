@@ -335,6 +335,12 @@ export class MockDaemon {
     ).length;
   }
 
+  hasActiveTerminalSession(sessionId: UUID): boolean {
+    return [...this.v070TerminalSockets].some(
+      ([socket, attachedSessionId]) => attachedSessionId === sessionId && socket.readyState === socket.OPEN,
+    );
+  }
+
   outerWireText(): string {
     return this.outerWireLog.join("\n");
   }
@@ -346,6 +352,11 @@ export class MockDaemon {
   setSessions(sessions: SessionSummaryPayload[]): void {
     // 测试另一个客户端已经改变 daemon 端权威列表时，当前浏览器下一次刷新必须服从 daemon 顺序。
     this.options.sessions = sessions;
+    this.broadcastV070Metadata();
+  }
+
+  setDaemonClients(clients: DaemonClientSummaryPayload[]): void {
+    this.options.daemonClients = clients;
     this.broadcastV070Metadata();
   }
 

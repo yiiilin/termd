@@ -10,7 +10,7 @@ afterEach(() => {
 });
 
 describe("V070Client", () => {
-  it("uses pushed metadata and closes a session with one JSON request", async () => {
+  it("closes only the terminal socket attached to the session being closed", async () => {
     const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000071");
     const transport = {
       onMetadata: undefined as ((data: unknown) => void) | undefined,
@@ -22,7 +22,7 @@ describe("V070Client", () => {
       close: vi.fn(),
       sendTerminal: vi.fn(),
     };
-    const request = vi.fn(async () => ({ session_id: "session-a", state: "closed" }));
+    const request = vi.fn(async (path: string) => ({ session_id: path.includes("session-a") ? "session-a" : "session-b" }));
     const client = new V070Client(
       {
         server_id: "00000000-0000-0000-0000-000000000070",
@@ -41,10 +41,27 @@ describe("V070Client", () => {
       payload: { revision: 1, state: { sessions: [{ session_id: "session-a" }], clients: [], daemon: {} } },
     }));
     await expect(pending).resolves.toMatchObject({ sessions: [{ session_id: "session-a" }] });
+    const attached = client.attachSession("session-a");
+    transport.onTerminal?.(JSON.stringify({
+      type: "terminal.attached",
+      payload: {
+        session_id: "session-a",
+        role: "operator",
+        state: "running",
+        size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+      },
+    }));
+    await attached;
+
+    await client.closeSession("session-b");
+    expect(transport.closeTerminal).not.toHaveBeenCalled();
+    await client.sendSessionData("session-a", new TextEncoder().encode("still-attached"));
+
     await client.closeSession("session-a");
     expect(transport.closeTerminal).toHaveBeenCalledTimes(1);
-    expect(request).toHaveBeenCalledTimes(1);
-    expect(request).toHaveBeenCalledWith("/api/control/session/session-a/close", {});
+    expect(request).toHaveBeenCalledTimes(2);
+    expect(request).toHaveBeenNthCalledWith(1, "/api/control/session/session-b/close", {});
+    expect(request).toHaveBeenNthCalledWith(2, "/api/control/session/session-a/close", {});
   });
 
   it("uploads raw chunks and downloads raw bytes through v0.7 file routes", async () => {

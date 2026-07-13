@@ -181,8 +181,10 @@ export class V070Client {
   }
 
   async closeSession(sessionId: UUID): Promise<SessionClosedPayload> {
-    this.resetTerminalState(new ProtocolClientError("connection_closed", "terminal connection closed"));
-    this.transport.closeTerminal();
+    if (this.terminalSessionId === sessionId || this.terminalOpen?.sessionId === sessionId) {
+      this.resetTerminalState(new ProtocolClientError("connection_closed", "terminal connection closed"));
+      this.transport.closeTerminal();
+    }
     return this.jsonRequest(`/api/control/session/${sessionId}/close`, {});
   }
 
