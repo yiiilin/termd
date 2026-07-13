@@ -1442,11 +1442,19 @@ mod tests {
             max_delay_ms: 20,
             heartbeat_interval_ms: 10,
         });
+        let state_dir = std::env::temp_dir().join(format!(
+            "termd-main-test-{}-{}-relay-state",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&state_dir).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         let protocol = termd::net::server::default_protocol(DaemonConfig::default_for_state_path(
-            std::env::temp_dir().join(format!(
-                "termd-main-test-{}-relay-state.json",
-                std::process::id()
-            )),
+            state_dir.join("state.json"),
         ));
         let relay_tasks = spawn_relay_reconnect_supervisors(
             vec![format!("ws://{flaky_addr}"), format!("ws://{healthy_addr}")],
@@ -1497,9 +1505,14 @@ mod tests {
 
         for handle in relay_tasks {
             handle.abort();
+            let _ = handle.await;
         }
         flaky_server.abort();
         healthy_server.abort();
+        let _ = flaky_server.await;
+        let _ = healthy_server.await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        std::fs::remove_dir_all(state_dir).unwrap();
     }
 
     #[test]
