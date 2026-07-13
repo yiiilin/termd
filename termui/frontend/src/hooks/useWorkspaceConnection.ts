@@ -84,6 +84,9 @@ export function useWorkspaceConnection(options: UseWorkspaceConnectionOptions) {
       clients.add(attachClientRef.current);
     }
     for (const client of clients) {
+      // session 切换会复用同一 V070Client；先中断旧 loop 的 pending receive，
+      // 避免它抢走下一条 terminal socket 的 attach_sync 后再按 stale generation 丢弃。
+      client.interruptReceiveWaiters();
       const sessionId = options.attachedSessionRef.current
         ?? options.pendingTerminalAttachSessionRef.current;
       if (sessionId) client.detachSession(sessionId);

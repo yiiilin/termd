@@ -2,12 +2,14 @@ import { renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { V070Client } from "../protocol/v070-client";
 import { generateDeviceIdentity } from "../protocol/auth";
+import { decodeSupervisorTerminalServerFrame, encodeSupervisorTerminalServerFrame } from "../protocol/supervisor-terminal";
 import { useWorkspaceConnection } from "../hooks/useWorkspaceConnection";
 import type { DeviceState, PairedServerState, UUID } from "../protocol/types";
 
 const SERVER_ID = "00000000-0000-0000-0000-000000000101";
 const DEVICE_ID = "00000000-0000-0000-0000-000000000201";
 const SESSION_ID = "00000000-0000-0000-0000-000000000301";
+const NEXT_SESSION_ID = "00000000-0000-0000-0000-000000000302";
 
 interface Deferred<T> {
   promise: Promise<T>;
@@ -128,6 +130,81 @@ describe("useWorkspaceConnection", () => {
     expect(transport.closeTerminal).toHaveBeenCalledTimes(1);
     expect(transport.close).not.toHaveBeenCalled();
     expect(result.current.workspaceClientRef.current).toBe(client);
+  });
+
+  it("切换 session 时中断旧 receive waiter，让复用 client 的新 loop 消费 attach_sync", async () => {
+    const transport = {
+      onMetadata: undefined as ((data: unknown) => void) | undefined,
+      onTerminal: undefined as ((data: unknown) => void) | undefined,
+      connectMetadata: vi.fn(async () => undefined),
+      reconnectMetadata: vi.fn(async () => undefined),
+      openTerminal: vi.fn(async () => undefined),
+      closeTerminal: vi.fn(),
+      close: vi.fn(),
+      sendTerminal: vi.fn(),
+    };
+    const server = { ...makeServer(), device_certificate: "device.certificate.signature" };
+    const client = new V070Client(server, await generateDeviceIdentity(DEVICE_ID), transport);
+    const {
+      attachedSessionRef,
+      pendingTerminalAttachSessionRef,
+      result,
+    } = renderWorkspaceConnection(server);
+    result.current.workspaceClientRef.current = client;
+
+    const firstAttach = client.attachSession(SESSION_ID);
+    transport.onTerminal?.(JSON.stringify({
+      type: "terminal.attached",
+      payload: { session_id: SESSION_ID },
+    }));
+    await firstAttach;
+    result.current.claimAttachClient(client);
+    attachedSessionRef.current = SESSION_ID;
+    const staleReceive = client.receiveInner().then(
+      (envelope) => ({ outcome: "resolved" as const, envelope }),
+      (error) => ({ outcome: "rejected" as const, error }),
+    );
+
+    result.current.closeAttachClient();
+    attachedSessionRef.current = undefined;
+
+    const reusedClient = await result.current.authenticatedWorkspaceClient();
+    expect(reusedClient).toBe(client);
+    const secondAttach = reusedClient.attachSession(NEXT_SESSION_ID);
+    pendingTerminalAttachSessionRef.current = NEXT_SESSION_ID;
+    transport.onTerminal?.(JSON.stringify({
+      type: "terminal.attached",
+      payload: { session_id: NEXT_SESSION_ID },
+    }));
+    await secondAttach;
+    result.current.claimAttachClient(reusedClient);
+    attachedSessionRef.current = NEXT_SESSION_ID;
+    pendingTerminalAttachSessionRef.current = undefined;
+    const nextReceive = reusedClient.receiveInner();
+    transport.onTerminal?.(encodeSupervisorTerminalServerFrame({
+      type: "attach_sync",
+      session_id: NEXT_SESSION_ID,
+      base_seq: 0,
+      snapshot: {
+        size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+        process_id: 7,
+        retained_output_bytes: new TextEncoder().encode("session-b-ready\n"),
+      },
+      frames: [],
+    }));
+
+    await expect(staleReceive).resolves.toMatchObject({
+      outcome: "rejected",
+      error: { code: "connection_closed" },
+    });
+    const nextEnvelope = await nextReceive;
+    const nextFrame = decodeSupervisorTerminalServerFrame((nextEnvelope.payload as any).data_bytes);
+    expect(nextFrame).toMatchObject({
+      type: "attach_sync",
+      session_id: NEXT_SESSION_ID,
+    });
+    expect(transport.closeTerminal).toHaveBeenCalledTimes(1);
+    expect(transport.close).not.toHaveBeenCalled();
   });
 
   it("device certificate 存在时使用 v0.7 workspace transport", async () => {
