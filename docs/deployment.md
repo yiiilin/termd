@@ -313,6 +313,9 @@ wget -qO- https://github.com/yiiilin/termd/releases/latest/download/install-term
   annotated tag。无论是否传 `--push` 或 `--allow-dirty`，脚本返回时都不会推进本地
   `main`，也不会修改 caller 的 index/worktree；传 `--push` 只会用精确 commit/tag OID
   原子更新远端 `main` 和 tag，并触发 GitHub Actions。
+- Rust 锁文件只定向更新现有 `Cargo.lock` 中的 workspace package 版本；如果锁文件
+  出现任何第三方依赖、checksum、source 或依赖关系变化，发版会立即失败。依赖升级必须
+  作为独立改动先行提交和验证，不能隐式混入补丁发版。
 - 脚本输出会先提示处理无关 caller 改动，再给出经过回归测试的本地完成命令；命令使用
   精确 release notes 路径和 release commit OID：
 

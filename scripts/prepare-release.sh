@@ -411,10 +411,80 @@ for package_json in (pathlib.Path("termui/frontend/package.json"), pathlib.Path(
     package_json.write_text(json.dumps(data, indent=2) + "\n")
 PY
 
-  cargo generate-lockfile
+  # 直接从现有 lockfile 定向改 workspace package 版本。generate-lockfile/cargo update
+  # 都会重新解析兼容依赖，可能把无关的传递依赖升级混入补丁发版。
+  lockfile_before="${TEMP_ROOT}/Cargo.lock.before"
+  verified_lockfile="${TEMP_ROOT}/Cargo.lock.release"
+  cp Cargo.lock "$lockfile_before"
+  python3 - "$lockfile_before" "$verified_lockfile" "$version" <<'PY'
+import pathlib
+import re
+import sys
+import tomllib
+
+before_path = pathlib.Path(sys.argv[1])
+verified_path = pathlib.Path(sys.argv[2])
+release_version = sys.argv[3]
+root_manifest = tomllib.loads(pathlib.Path("Cargo.toml").read_text())
+
+workspace_names = set()
+root_package = root_manifest.get("package")
+if root_package and root_package.get("version", {}).get("workspace") is True:
+    workspace_names.add(root_package["name"])
+workspace = root_manifest.get("workspace", {})
+for member_pattern in workspace.get("members", []):
+    for member_path in pathlib.Path(".").glob(member_pattern):
+        manifest_path = member_path / "Cargo.toml"
+        if not manifest_path.is_file():
+            continue
+        member_manifest = tomllib.loads(manifest_path.read_text())
+        package = member_manifest.get("package", {})
+        if package.get("version", {}).get("workspace") is True:
+            workspace_names.add(package["name"])
+if not workspace_names:
+    raise SystemExit("failed to identify workspace packages for Cargo.lock validation")
+
+lock_text = before_path.read_text()
+seen = set()
+
+def update_package(match):
+    block = match.group(0)
+    package = tomllib.loads(block)["package"][0]
+    name = package.get("name")
+    if name not in workspace_names or "source" in package:
+        return block
+    if name in seen:
+        raise SystemExit(f"duplicate workspace package in Cargo.lock: {name}")
+    seen.add(name)
+    updated, count = re.subn(
+        r'(?m)^version = "[^"]+"$',
+        f'version = "{release_version}"',
+        block,
+        count=1,
+    )
+    if count != 1:
+        raise SystemExit(f"failed to update Cargo.lock package version: {name}")
+    return updated
+
+verified = re.sub(
+    r'(?ms)^\[\[package\]\]\n.*?(?=^\[\[package\]\]\n|\Z)',
+    update_package,
+    lock_text,
+)
+if seen != workspace_names:
+    raise SystemExit(
+        "Cargo.lock workspace package set mismatch: "
+        f"missing={sorted(workspace_names - seen)}"
+    )
+verified_path.write_text(verified)
+PY
+  cp "$verified_lockfile" Cargo.lock
   if [[ "$SKIP_VERIFY" -eq 0 ]]; then
     bash scripts/qa.sh
     cargo build --release --locked -p termd --bin termd
+  fi
+  if ! cmp -s "$verified_lockfile" Cargo.lock; then
+    die "Cargo.lock changed outside workspace package version updates; dependency updates must be committed separately"
   fi
 
   git add -- "${RELEASE_PATHS[@]}"
