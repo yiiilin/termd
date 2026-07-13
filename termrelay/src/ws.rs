@@ -84,7 +84,7 @@ const HTTP_TUNNEL_RESPONSE_HEAD_TIMEOUT: Duration = Duration::from_millis(100);
 #[cfg(not(test))]
 const PENDING_CLIENT_PAIR_DEADLINE: Duration = Duration::from_secs(20);
 #[cfg(test)]
-const PENDING_CLIENT_PAIR_DEADLINE: Duration = Duration::from_millis(250);
+const PENDING_CLIENT_PAIR_DEADLINE: Duration = Duration::from_secs(2);
 const PENDING_CLIENTS_PER_ROOM_LIMIT: usize = 64;
 // 中文注释：client route_ready 先于 daemon data 反连完成返回时，browser 可能立刻发送
 // hello/auth/attach。relay 只做短暂的不透明转发缓冲；这里的“不透明”表示不解释业务语义，
@@ -1222,6 +1222,7 @@ pub async fn handle_workspace_socket(
             return;
         }
     };
+    state.start_pending_client_pair_deadline(&registration);
     run_registered_socket(
         socket,
         state,
@@ -1537,7 +1538,7 @@ mod tests {
     use super::*;
     use crate::router::router;
     use axum::body::{Body, Bytes};
-    use axum::http::StatusCode;
+    use axum::http::{HeaderValue, StatusCode};
     use futures_util::{SinkExt, StreamExt};
     use termd_proto::{
         DeviceId, Envelope, ErrorPayload, Nonce, PROTOCOL_PACKET_VERSION, ProtocolVersion,
@@ -1549,9 +1550,41 @@ mod tests {
     use tokio::time::{Duration, timeout};
     use tokio_tungstenite::connect_async;
     use tokio_tungstenite::tungstenite::Message as ClientMessage;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
     fn server_id(value: u128) -> ServerId {
         ServerId(uuid::Uuid::from_u128(value))
+    }
+
+    const TEST_DAEMON_TOKEN: &str = "termrelay-workspace-test-daemon-token";
+
+    struct WorkspaceFixture {
+        state: RelayState,
+        server_id: ServerId,
+        access_token: String,
+    }
+
+    type TestSocket = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    fn workspace_fixture() -> WorkspaceFixture {
+        let identity = termd::auth::DaemonIdentity::generate();
+        let now = UnixTimestampMillis(relay_now_ms());
+        let service = termd::auth::CredentialService::new(identity.clone());
+        let access_token = service
+            .issue_access_token(DeviceId::new(), now, UnixTimestampMillis(now.0 + 300_000))
+            .unwrap();
+        let server_id = identity.server_id();
+        let state = RelayState::new_trusted(vec![
+            RelayDaemonCredential::plain_token(server_id, TEST_DAEMON_TOKEN.to_owned())
+                .with_public_key(Some(identity.public_key().clone())),
+        ]);
+        WorkspaceFixture {
+            state,
+            server_id,
+            access_token,
+        }
     }
 
     #[test]
@@ -1769,17 +1802,6 @@ mod tests {
         route_hello_with_generation(server_id, role, route_generation, client_id, data_token)
     }
 
-    async fn register_test_route(
-        socket: &mut tokio_tungstenite::WebSocketStream<
-            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-        >,
-        server_id: ServerId,
-        role: RouteRole,
-    ) {
-        send_route_hello_with_data(socket, server_id, role, None, None).await;
-        expect_route_ready(socket, server_id, role).await;
-    }
-
     async fn send_route_hello_with_data(
         socket: &mut tokio_tungstenite::WebSocketStream<
             tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
@@ -1803,34 +1825,77 @@ mod tests {
         client_id: Option<RelayClientId>,
         data_token: Option<Nonce>,
     ) {
+        send_route_hello_with_generation_and_admission(
+            socket,
+            server_id,
+            role,
+            route_generation,
+            client_id,
+            data_token,
+            None,
+        )
+        .await;
+    }
+
+    async fn send_route_hello_with_generation_and_admission(
+        socket: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        server_id: ServerId,
+        role: RouteRole,
+        route_generation: Option<Nonce>,
+        client_id: Option<RelayClientId>,
+        data_token: Option<Nonce>,
+        admission: Option<RelayAdmissionPayload>,
+    ) {
         let route_generation = route_generation.or_else(|| match role {
             RouteRole::DaemonControl | RouteRole::DaemonData => {
                 Some(test_route_generation(server_id))
             }
             RouteRole::Client | RouteRole::DaemonMux => None,
         });
+        let mut hello =
+            route_hello_with_generation(server_id, role, route_generation, client_id, data_token);
+        hello.payload.admission = admission;
         socket
-            .send(ClientMessage::Text(
-                serde_json::to_string(&route_hello_with_generation(
-                    server_id,
-                    role,
-                    route_generation,
-                    client_id,
-                    data_token,
-                ))
-                .unwrap(),
-            ))
+            .send(ClientMessage::Text(serde_json::to_string(&hello).unwrap()))
             .await
             .unwrap();
     }
 
-    async fn send_client_route_hello_only(
-        socket: &mut tokio_tungstenite::WebSocketStream<
-            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-        >,
-        server_id: ServerId,
+    async fn connect_workspace_client(base_url: &str, access_token: &str) -> TestSocket {
+        let mut request = format!("{base_url}/ws/terminal")
+            .into_client_request()
+            .unwrap();
+        request.headers_mut().insert(
+            "sec-websocket-protocol",
+            HeaderValue::from_str(&format!("termd.v0.7, {access_token}")).unwrap(),
+        );
+        timeout(Duration::from_secs(2), connect_async(request))
+            .await
+            .expect("workspace websocket should connect")
+            .expect("workspace websocket handshake should succeed")
+            .0
+    }
+
+    async fn register_workspace_daemon_control(
+        socket: &mut TestSocket,
+        fixture: &WorkspaceFixture,
+        route_generation: Option<Nonce>,
     ) {
-        send_route_hello_with_data(socket, server_id, RouteRole::Client, None, None).await;
+        send_route_hello_with_generation_and_admission(
+            socket,
+            fixture.server_id,
+            RouteRole::DaemonControl,
+            route_generation,
+            None,
+            None,
+            Some(RelayAdmissionPayload::Daemon {
+                token: TEST_DAEMON_TOKEN.to_owned(),
+            }),
+        )
+        .await;
+        expect_route_ready(socket, fixture.server_id, RouteRole::DaemonControl).await;
     }
 
     async fn expect_open_data(
@@ -1942,8 +2007,8 @@ mod tests {
     }
 
     async fn pair_client_with_daemon_data(
-        url: &str,
-        server_id: ServerId,
+        base_url: &str,
+        fixture: &WorkspaceFixture,
         daemon_control: &mut tokio_tungstenite::WebSocketStream<
             tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
         >,
@@ -1956,21 +2021,24 @@ mod tests {
         >,
         RelayClientId,
     ) {
-        let (mut client, _client_response) = connect_async(url).await.unwrap();
-        send_client_route_hello_only(&mut client, server_id).await;
+        let client = connect_workspace_client(base_url, &fixture.access_token).await;
         let (client_id, data_token) = expect_open_data(daemon_control).await;
 
-        let (mut daemon_data, _data_response) = connect_async(url).await.unwrap();
-        send_route_hello_with_data(
+        let (mut daemon_data, _data_response) =
+            connect_async(format!("{base_url}/ws")).await.unwrap();
+        send_route_hello_with_generation_and_admission(
             &mut daemon_data,
-            server_id,
+            fixture.server_id,
             RouteRole::DaemonData,
+            None,
             Some(client_id),
             Some(data_token),
+            Some(RelayAdmissionPayload::Daemon {
+                token: TEST_DAEMON_TOKEN.to_owned(),
+            }),
         )
         .await;
-        expect_route_ready(&mut daemon_data, server_id, RouteRole::DaemonData).await;
-        expect_route_ready(&mut client, server_id, RouteRole::Client).await;
+        expect_route_ready(&mut daemon_data, fixture.server_id, RouteRole::DaemonData).await;
 
         (client, daemon_data, client_id)
     }
@@ -2008,38 +2076,43 @@ mod tests {
 
     #[tokio::test]
     async fn client_route_ready_does_not_wait_for_daemon_data_and_early_frames_are_piped() {
+        let fixture = workspace_fixture();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let relay_state = fixture.state.clone();
         let server = tokio::spawn(async move {
-            axum::serve(listener, router(RelayState::default(), false))
+            axum::serve(listener, router(relay_state, false))
                 .await
                 .unwrap();
         });
-        let server_id = server_id(95);
-        let url = format!("ws://{addr}/ws");
-        let (mut daemon_control, _daemon_response) = connect_async(url.clone()).await.unwrap();
-        register_test_route(&mut daemon_control, server_id, RouteRole::DaemonControl).await;
+        let base_url = format!("ws://{addr}");
+        let (mut daemon_control, _daemon_response) =
+            connect_async(format!("{base_url}/ws")).await.unwrap();
+        register_workspace_daemon_control(&mut daemon_control, &fixture, None).await;
 
-        let (mut client, _client_response) = connect_async(url.clone()).await.unwrap();
-        send_client_route_hello_only(&mut client, server_id).await;
+        let mut client = connect_workspace_client(&base_url, &fixture.access_token).await;
 
         let (client_id, data_token) = expect_open_data(&mut daemon_control).await;
-        expect_route_ready(&mut client, server_id, RouteRole::Client).await;
         client
             .send(ClientMessage::Text("early-client-to-daemon".to_owned()))
             .await
             .unwrap();
 
-        let (mut daemon_data, _data_response) = connect_async(url).await.unwrap();
-        send_route_hello_with_data(
+        let (mut daemon_data, _data_response) =
+            connect_async(format!("{base_url}/ws")).await.unwrap();
+        send_route_hello_with_generation_and_admission(
             &mut daemon_data,
-            server_id,
+            fixture.server_id,
             RouteRole::DaemonData,
+            None,
             Some(client_id),
             Some(data_token),
+            Some(RelayAdmissionPayload::Daemon {
+                token: TEST_DAEMON_TOKEN.to_owned(),
+            }),
         )
         .await;
-        expect_route_ready(&mut daemon_data, server_id, RouteRole::DaemonData).await;
+        expect_route_ready(&mut daemon_data, fixture.server_id, RouteRole::DaemonData).await;
 
         assert_eq!(
             next_data_frame(&mut daemon_data).await.unwrap(),
@@ -2072,20 +2145,21 @@ mod tests {
 
     #[tokio::test]
     async fn client_disconnect_while_waiting_for_data_pair_notifies_daemon_immediately() {
+        let fixture = workspace_fixture();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let relay_state = fixture.state.clone();
         let server = tokio::spawn(async move {
-            axum::serve(listener, router(RelayState::default(), false))
+            axum::serve(listener, router(relay_state, false))
                 .await
                 .unwrap();
         });
-        let server_id = server_id(94);
-        let url = format!("ws://{addr}/ws");
-        let (mut daemon_control, _daemon_response) = connect_async(url.clone()).await.unwrap();
-        register_test_route(&mut daemon_control, server_id, RouteRole::DaemonControl).await;
+        let base_url = format!("ws://{addr}");
+        let (mut daemon_control, _daemon_response) =
+            connect_async(format!("{base_url}/ws")).await.unwrap();
+        register_workspace_daemon_control(&mut daemon_control, &fixture, None).await;
 
-        let (mut client, _client_response) = connect_async(url).await.unwrap();
-        send_client_route_hello_only(&mut client, server_id).await;
+        let mut client = connect_workspace_client(&base_url, &fixture.access_token).await;
         let (client_id, _data_token) = expect_open_data(&mut daemon_control).await;
 
         // 中文注释：浏览器快速切会话时，旧 client 会在 daemon data 线接入前关闭。
@@ -2101,29 +2175,32 @@ mod tests {
 
     #[tokio::test]
     async fn pending_client_pair_deadline_closes_unpaired_client_and_notifies_daemon() {
+        let fixture = workspace_fixture();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let relay_state = fixture.state.clone();
         let server = tokio::spawn(async move {
-            axum::serve(listener, router(RelayState::default(), false))
+            axum::serve(listener, router(relay_state, false))
                 .await
                 .unwrap();
         });
-        let server_id = server_id(97);
-        let url = format!("ws://{addr}/ws");
-        let (mut daemon_control, _daemon_response) = connect_async(url.clone()).await.unwrap();
-        register_test_route(&mut daemon_control, server_id, RouteRole::DaemonControl).await;
+        let base_url = format!("ws://{addr}");
+        let (mut daemon_control, _daemon_response) =
+            connect_async(format!("{base_url}/ws")).await.unwrap();
+        register_workspace_daemon_control(&mut daemon_control, &fixture, None).await;
 
-        let (mut client, _client_response) = connect_async(url).await.unwrap();
-        send_client_route_hello_only(&mut client, server_id).await;
+        let mut client = connect_workspace_client(&base_url, &fixture.access_token).await;
         let (client_id, _data_token) = expect_open_data(&mut daemon_control).await;
-        expect_route_ready(&mut client, server_id, RouteRole::Client).await;
 
         // 中文注释：daemon data 一直不反连时，relay 必须自己回收 pending client，
         // 不能让公网连接和预配对缓冲无限占用 room 资源。
-        let disconnected =
-            expect_client_disconnected(&mut daemon_control, Duration::from_millis(500)).await;
+        let disconnected = expect_client_disconnected(
+            &mut daemon_control,
+            PENDING_CLIENT_PAIR_DEADLINE + Duration::from_secs(1),
+        )
+        .await;
         assert_eq!(disconnected, client_id);
-        timeout(Duration::from_millis(500), async {
+        timeout(Duration::from_secs(1), async {
             loop {
                 match client.next().await {
                     None | Some(Err(_)) | Some(Ok(ClientMessage::Close(_))) => break,
@@ -2170,19 +2247,21 @@ mod tests {
 
     #[tokio::test]
     async fn relay_client_socket_receives_transport_idle_ping() {
+        let fixture = workspace_fixture();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let relay_state = fixture.state.clone();
         let server = tokio::spawn(async move {
-            axum::serve(listener, router(RelayState::default(), false))
+            axum::serve(listener, router(relay_state, false))
                 .await
                 .unwrap();
         });
-        let server_id = server_id(91);
-        let url = format!("ws://{addr}/ws");
-        let (mut daemon_control, _daemon_response) = connect_async(url.clone()).await.unwrap();
-        register_test_route(&mut daemon_control, server_id, RouteRole::DaemonControl).await;
+        let base_url = format!("ws://{addr}");
+        let (mut daemon_control, _daemon_response) =
+            connect_async(format!("{base_url}/ws")).await.unwrap();
+        register_workspace_daemon_control(&mut daemon_control, &fixture, None).await;
         let (mut client, mut daemon_data, _) =
-            pair_client_with_daemon_data(&url, server_id, &mut daemon_control).await;
+            pair_client_with_daemon_data(&base_url, &fixture, &mut daemon_control).await;
 
         match timeout(Duration::from_secs(1), client.next()).await {
             Ok(Some(Ok(ClientMessage::Ping(payload)))) => {
@@ -2279,7 +2358,7 @@ mod tests {
         let envelope: Envelope<ErrorPayload> = serde_json::from_str(&raw).unwrap();
 
         assert_eq!(envelope.kind, MessageType::Error);
-        assert_eq!(envelope.payload.code, "relay_daemon_offline");
+        assert_eq!(envelope.payload.code, "relay_role_not_supported");
         server.abort();
     }
 
@@ -2889,54 +2968,41 @@ mod tests {
 
     #[tokio::test]
     async fn stale_daemon_data_socket_from_previous_route_generation_is_rejected() {
+        let fixture = workspace_fixture();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let relay_state = fixture.state.clone();
         let server = tokio::spawn(async move {
-            axum::serve(listener, router(RelayState::default(), false))
+            axum::serve(listener, router(relay_state, false))
                 .await
                 .unwrap();
         });
-        let server_id = server_id(87);
-        let url = format!("ws://{addr}/ws");
+        let base_url = format!("ws://{addr}");
         let generation_a = Nonce("socket-route-generation-a".to_owned());
         let generation_b = Nonce("socket-route-generation-b".to_owned());
 
-        let (mut control_a, _response) = connect_async(url.clone()).await.unwrap();
-        send_route_hello_with_generation(
-            &mut control_a,
-            server_id,
-            RouteRole::DaemonControl,
-            Some(generation_a.clone()),
-            None,
-            None,
-        )
-        .await;
-        expect_route_ready(&mut control_a, server_id, RouteRole::DaemonControl).await;
+        let (mut control_a, _response) = connect_async(format!("{base_url}/ws")).await.unwrap();
+        register_workspace_daemon_control(&mut control_a, &fixture, Some(generation_a.clone()))
+            .await;
 
-        let (mut control_b, _response) = connect_async(url.clone()).await.unwrap();
-        send_route_hello_with_generation(
-            &mut control_b,
-            server_id,
-            RouteRole::DaemonControl,
-            Some(generation_b.clone()),
-            None,
-            None,
-        )
-        .await;
-        expect_route_ready(&mut control_b, server_id, RouteRole::DaemonControl).await;
+        let (mut control_b, _response) = connect_async(format!("{base_url}/ws")).await.unwrap();
+        register_workspace_daemon_control(&mut control_b, &fixture, Some(generation_b.clone()))
+            .await;
 
-        let (mut client, _client_response) = connect_async(url.clone()).await.unwrap();
-        send_client_route_hello_only(&mut client, server_id).await;
+        let mut client = connect_workspace_client(&base_url, &fixture.access_token).await;
         let (client_id, data_token) = expect_open_data(&mut control_b).await;
 
-        let (mut stale_data, _response) = connect_async(url.clone()).await.unwrap();
-        send_route_hello_with_generation(
+        let (mut stale_data, _response) = connect_async(format!("{base_url}/ws")).await.unwrap();
+        send_route_hello_with_generation_and_admission(
             &mut stale_data,
-            server_id,
+            fixture.server_id,
             RouteRole::DaemonData,
             Some(generation_a),
             Some(client_id),
             Some(data_token.clone()),
+            Some(RelayAdmissionPayload::Daemon {
+                token: TEST_DAEMON_TOKEN.to_owned(),
+            }),
         )
         .await;
         let ClientMessage::Text(raw) = next_data_frame(&mut stale_data).await.unwrap() else {
@@ -2946,18 +3012,20 @@ mod tests {
         assert_eq!(error.kind, MessageType::Error);
         assert_eq!(error.payload.code, "relay_data_route_rejected");
 
-        let (mut fresh_data, _response) = connect_async(url.clone()).await.unwrap();
-        send_route_hello_with_generation(
+        let (mut fresh_data, _response) = connect_async(format!("{base_url}/ws")).await.unwrap();
+        send_route_hello_with_generation_and_admission(
             &mut fresh_data,
-            server_id,
+            fixture.server_id,
             RouteRole::DaemonData,
             Some(generation_b),
             Some(client_id),
             Some(data_token),
+            Some(RelayAdmissionPayload::Daemon {
+                token: TEST_DAEMON_TOKEN.to_owned(),
+            }),
         )
         .await;
-        expect_route_ready(&mut fresh_data, server_id, RouteRole::DaemonData).await;
-        expect_route_ready(&mut client, server_id, RouteRole::Client).await;
+        expect_route_ready(&mut fresh_data, fixture.server_id, RouteRole::DaemonData).await;
 
         control_a.close(None).await.unwrap();
         control_b.close(None).await.unwrap();

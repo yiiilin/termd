@@ -1675,7 +1675,9 @@ mod tests {
     use tokio_tungstenite::tungstenite::Message as ClientWsMessage;
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-    use crate::auth::{AccessTokenProofInput, current_unix_timestamp_millis};
+    use crate::auth::{
+        AccessTokenProofInput, CredentialKind, current_unix_timestamp_millis, verify_credential,
+    };
     use crate::net::protocol::ProtocolConnection;
     use crate::runtime::SessionRuntime;
     use crate::state::{
@@ -2867,7 +2869,7 @@ mod tests {
             )
             .await
             .expect("router should respond");
-        assert_eq!(api_response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(api_response.status(), StatusCode::NOT_FOUND);
         assert!(api_response.headers().get(CONTENT_ENCODING).is_none());
 
         let ws_response = app
@@ -2908,7 +2910,21 @@ mod tests {
         assert_eq!(response.status, 200);
         let payload: PairingTokenResponse = serde_json::from_str(&response.body).unwrap();
 
-        assert!(payload.token.starts_with("termd-pair-"));
+        let daemon_public_key = protocol
+            .lock()
+            .await
+            .daemon_public_identity()
+            .public_key
+            .clone();
+        let claims = verify_credential(
+            &payload.token,
+            &daemon_public_key,
+            payload.server_id,
+            current_unix_timestamp_millis(),
+            CredentialKind::PairTicket,
+        )
+        .expect("local pairing endpoint should return a signed pair ticket");
+        assert_eq!(claims.expires_at_ms, payload.expires_at_ms);
         assert_eq!(payload.ttl_ms, DaemonConfig::default().pairing_token_ttl_ms);
         assert!(payload.expires_at_ms.0 > current_unix_timestamp_millis().0);
         assert_eq!(payload.server_id, server_id);
@@ -2943,7 +2959,15 @@ mod tests {
                 .contains("access-control-allow-origin")
         );
         let payload: PairingTokenResponse = serde_json::from_str(&response.body).unwrap();
-        assert!(payload.token.starts_with("termd-pair-"));
+        let protocol = protocol.lock().await;
+        verify_credential(
+            &payload.token,
+            &protocol.daemon_public_identity().public_key,
+            payload.server_id,
+            current_unix_timestamp_millis(),
+            CredentialKind::PairTicket,
+        )
+        .expect("local pairing endpoint should return a signed pair ticket");
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -111,17 +111,45 @@ fn relay_json_error(status: StatusCode, code: &'static str, message: &'static st
 fn http_api_tunnel_router() -> Router<RelayState> {
     // 中文注释：relay 只做 tunnel 转发，不参与 bearer 业务判断。
     let router = Router::new()
-        .route("/api/control/*path", post(relay_http_tunnel))
-        .route("/api/auth/*path", post(relay_http_tunnel))
-        .route("/api/files/uploads", post(relay_http_tunnel))
-        .route("/api/files/uploads/:id/chunks", put(relay_http_tunnel))
-        .route("/api/files/uploads/:id/commit", post(relay_http_tunnel))
-        .route("/api/files/uploads/:id/abort", post(relay_http_tunnel))
-        .route("/api/files/downloads", post(relay_http_tunnel))
-        .route("/api/files/downloads/:id", get(relay_http_tunnel));
+        .route(
+            "/api/control/*path",
+            post(relay_http_tunnel).options(relay_http_tunnel_preflight),
+        )
+        .route(
+            "/api/auth/*path",
+            post(relay_http_tunnel).options(relay_http_tunnel_preflight),
+        )
+        .route(
+            "/api/files/uploads",
+            post(relay_http_tunnel).options(relay_http_tunnel_preflight),
+        )
+        .route(
+            "/api/files/uploads/:id/chunks",
+            put(relay_http_tunnel).options(relay_http_tunnel_preflight),
+        )
+        .route(
+            "/api/files/uploads/:id/commit",
+            post(relay_http_tunnel).options(relay_http_tunnel_preflight),
+        )
+        .route(
+            "/api/files/uploads/:id/abort",
+            post(relay_http_tunnel).options(relay_http_tunnel_preflight),
+        )
+        .route(
+            "/api/files/downloads",
+            post(relay_http_tunnel).options(relay_http_tunnel_preflight),
+        )
+        .route(
+            "/api/files/downloads/:id",
+            get(relay_http_tunnel).options(relay_http_tunnel_preflight),
+        );
 
     // 中文注释：跨源预检只挂在 relay HTTP API tunnel 上；真正鉴权仍在 daemon access token。
     router.route_layer(http_api_tunnel_cors_layer())
+}
+
+async fn relay_http_tunnel_preflight() -> StatusCode {
+    StatusCode::NO_CONTENT
 }
 
 fn http_api_tunnel_cors_layer() -> CorsLayer {
@@ -1388,7 +1416,7 @@ mod tests {
             )
             .await
             .expect("router should respond");
-        assert_eq!(api_response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(api_response.status(), StatusCode::NOT_FOUND);
         assert!(api_response.headers().get(CONTENT_ENCODING).is_none());
 
         let ws_response = app
@@ -1666,19 +1694,36 @@ mod tests {
 
     #[tokio::test]
     async fn websocket_route_prelude_forwards_non_json_text_and_binary_raw() {
+        let fixture = relay_http_credential_fixture();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let relay_state = fixture.state.clone();
         let _server = tokio::spawn(async move {
-            axum::serve(listener, router(RelayState::default(), false))
+            axum::serve(listener, router(relay_state, false))
                 .await
                 .unwrap();
         });
-        let server_id = ServerId::new();
-        let url = format!("ws://{addr}/ws");
-        let (mut daemon_control, _daemon_response) = connect_async(url.clone()).await.unwrap();
-        register_route(&mut daemon_control, server_id, RouteRole::DaemonControl).await;
-        let (mut client, mut daemon_data, _) =
-            register_client_data_pipe(&url, server_id, &mut daemon_control).await;
+        let server_id = fixture.identity.server_id();
+        let base_url = format!("ws://{addr}");
+        let (mut daemon_control, _daemon_response) =
+            connect_async(format!("{base_url}/ws")).await.unwrap();
+        register_route_with_admission(
+            &mut daemon_control,
+            server_id,
+            RouteRole::DaemonControl,
+            Some(RelayAdmissionPayload::Daemon {
+                token: "daemon-secret-1".to_owned(),
+            }),
+        )
+        .await;
+        let (mut client, mut daemon_data, _) = register_client_data_pipe(
+            &base_url,
+            server_id,
+            &fixture.access_token,
+            "daemon-secret-1",
+            &mut daemon_control,
+        )
+        .await;
 
         // 中文注释：prelude 之后的帧必须保持 opaque，即使它不是 JSON，也不能被 relay 解析。
         client
@@ -1702,21 +1747,44 @@ mod tests {
 
     #[tokio::test]
     async fn independent_data_pipes_keep_forwarding_when_another_client_backpressures() {
+        let fixture = relay_http_credential_fixture();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let relay_state = fixture.state.clone();
         let _server = tokio::spawn(async move {
-            axum::serve(listener, router(RelayState::default(), false))
+            axum::serve(listener, router(relay_state, false))
                 .await
                 .unwrap();
         });
-        let server_id = ServerId::new();
-        let url = format!("ws://{addr}/ws");
-        let (mut daemon_control, _daemon_response) = connect_async(url.clone()).await.unwrap();
-        register_route(&mut daemon_control, server_id, RouteRole::DaemonControl).await;
-        let (mut target_client, mut target_data, _) =
-            register_client_data_pipe(&url, server_id, &mut daemon_control).await;
-        let (mut flood_client, _flood_data, _) =
-            register_client_data_pipe(&url, server_id, &mut daemon_control).await;
+        let server_id = fixture.identity.server_id();
+        let base_url = format!("ws://{addr}");
+        let (mut daemon_control, _daemon_response) =
+            connect_async(format!("{base_url}/ws")).await.unwrap();
+        register_route_with_admission(
+            &mut daemon_control,
+            server_id,
+            RouteRole::DaemonControl,
+            Some(RelayAdmissionPayload::Daemon {
+                token: "daemon-secret-1".to_owned(),
+            }),
+        )
+        .await;
+        let (mut target_client, mut target_data, _) = register_client_data_pipe(
+            &base_url,
+            server_id,
+            &fixture.access_token,
+            "daemon-secret-1",
+            &mut daemon_control,
+        )
+        .await;
+        let (mut flood_client, _flood_data, _) = register_client_data_pipe(
+            &base_url,
+            server_id,
+            &fixture.access_token,
+            "daemon-secret-1",
+            &mut daemon_control,
+        )
+        .await;
 
         let flood_payload = vec![b'x'; 900 * 1024];
         for _ in 0..16 {
@@ -1796,27 +1864,33 @@ mod tests {
     }
 
     async fn register_client_data_pipe(
-        url: &str,
+        base_url: &str,
         server_id: ServerId,
+        access_token: &str,
+        daemon_token: &str,
         daemon_control: &mut TestSocket,
     ) -> (TestSocket, TestSocket, RelayClientId) {
-        let (mut client, _client_response) = connect_async(url).await.unwrap();
-        client
-            .send(ClientMessage::Text(
-                serde_json::to_string(&route_hello(server_id, RouteRole::Client, None, None))
-                    .unwrap(),
-            ))
-            .await
+        let mut request = format!("{base_url}/ws/terminal")
+            .into_client_request()
             .unwrap();
+        request.headers_mut().insert(
+            "sec-websocket-protocol",
+            HeaderValue::from_str(&format!("termd.v0.7, {access_token}")).unwrap(),
+        );
+        let (client, _client_response) = connect_async(request).await.unwrap();
         let (client_id, data_token) = expect_open_data(daemon_control).await;
 
-        let (mut daemon_data, _data_response) = connect_async(url).await.unwrap();
-        let data_hello = route_hello(
+        let (mut daemon_data, _data_response) =
+            connect_async(format!("{base_url}/ws")).await.unwrap();
+        let mut data_hello = route_hello(
             server_id,
             RouteRole::DaemonData,
             Some(client_id),
             Some(data_token),
         );
+        data_hello.payload.admission = Some(RelayAdmissionPayload::Daemon {
+            token: daemon_token.to_owned(),
+        });
         daemon_data
             .send(ClientMessage::Text(
                 serde_json::to_string(&data_hello).unwrap(),
@@ -1828,10 +1902,6 @@ mod tests {
             serde_json::from_str(&next_text(&mut daemon_data).await).unwrap();
         assert_eq!(data_ready.kind, MessageType::RouteReady);
         assert_eq!(data_ready.payload.role, RouteRole::DaemonData);
-        let client_ready: Envelope<RouteReadyPayload> =
-            serde_json::from_str(&next_text(&mut client).await).unwrap();
-        assert_eq!(client_ready.kind, MessageType::RouteReady);
-        assert_eq!(client_ready.payload.role, RouteRole::Client);
 
         (client, daemon_data, client_id)
     }
@@ -1867,7 +1937,12 @@ mod tests {
 
     async fn expect_open_data(socket: &mut TestSocket) -> (RelayClientId, Nonce) {
         loop {
-            match socket.next().await.unwrap().unwrap() {
+            match timeout(Duration::from_secs(2), socket.next())
+                .await
+                .expect("daemon control should receive open_data")
+                .expect("daemon control websocket should stay open")
+                .expect("daemon control frame should be valid")
+            {
                 ClientMessage::Text(text) => {
                     match serde_json::from_str::<RelayControlEnvelope>(&text)
                         .expect("relay control envelope should decode")
@@ -1888,7 +1963,12 @@ mod tests {
 
     async fn next_text(socket: &mut TestSocket) -> String {
         loop {
-            match socket.next().await.unwrap().unwrap() {
+            match timeout(Duration::from_secs(2), socket.next())
+                .await
+                .expect("relay should send a text frame")
+                .expect("relay websocket should stay open")
+                .expect("relay frame should be valid")
+            {
                 ClientMessage::Text(text) => return text,
                 ClientMessage::Ping(_) | ClientMessage::Pong(_) => continue,
                 other => panic!("expected text frame, got {other:?}"),
@@ -1897,8 +1977,15 @@ mod tests {
     }
 
     async fn next_data_frame(socket: &mut TestSocket) -> Option<ClientMessage> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         loop {
-            match socket.next().await?.unwrap() {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(!remaining.is_zero(), "relay should send a data frame");
+            match timeout(remaining, socket.next())
+                .await
+                .expect("relay should send a data frame")?
+                .expect("relay frame should be valid")
+            {
                 ClientMessage::Ping(_) | ClientMessage::Pong(_) => continue,
                 frame => return Some(frame),
             }
