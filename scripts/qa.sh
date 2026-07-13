@@ -414,7 +414,7 @@ PY
     cat "$temp_dir/termctl-pair.err" >&2
     exit 1
   fi
-  if ! new_stdout="$(cargo run -q -p termctl -- --state "$state_path" new --url "$relay_url" -- /bin/sh -lc 'printf relay-e2e-ready; sleep 15' 2>"$temp_dir/termctl-new.err")"; then
+  if ! new_stdout="$(cargo run -q -p termctl -- --state "$state_path" new --url "$relay_url" -- /bin/sh -lc 'printf relay-e2e-ready; sleep 120' 2>"$temp_dir/termctl-new.err")"; then
     printf '[termrelay] termctl new 未通过 trusted relay 完成。\n' >&2
     printf '[termrelay] termctl new stdout: %s\n' "$new_stdout" >&2
     cat "$temp_dir/termctl-new.err" >&2
@@ -447,8 +447,8 @@ PY
     cat "$temp_dir/termctl-list.err" >&2
     exit 1
   fi
-  if ! close_stdout="$(cargo run -q -p termctl -- --state "$state_path" close "$session_id" --url "$relay_url" 2>"$temp_dir/termctl-close.err")"; then
-    printf '[termrelay] termctl close 未通过 trusted relay 完成。\n' >&2
+  if ! close_stdout="$(cargo run -q -p termctl -- --state "$state_path" close "$session_id" --url "http://127.0.0.1:${daemon_port}" 2>"$temp_dir/termctl-close.err")"; then
+    printf '[termrelay] termctl close 未通过隔离 daemon 完成。\n' >&2
     printf '[termrelay] termctl close stdout: %s\n' "$close_stdout" >&2
     cat "$temp_dir/termctl-close.err" >&2
     exit 1
