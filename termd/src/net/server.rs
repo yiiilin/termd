@@ -316,6 +316,8 @@ struct DeviceCertificateResponse {
     device_certificate: String,
 }
 
+// Returning a complete rejection response keeps parsing errors at this HTTP boundary.
+#[allow(clippy::result_large_err)]
 fn authorization_credential<'a>(
     headers: &'a HeaderMap,
     expected_scheme: &str,
@@ -1131,6 +1133,7 @@ async fn read_v070_json_body<T: for<'de> Deserialize<'de>>(body: Body) -> Result
     })
 }
 
+#[allow(clippy::result_large_err)]
 fn v070_content_range(headers: &HeaderMap, body_len: usize) -> Result<(u64, u64), Response> {
     let value = headers
         .get("content-range")
@@ -1694,10 +1697,6 @@ mod tests {
         server_id: ServerId,
         ws_url: String,
     }
-
-    type TestWs = tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >;
 
     static TEST_CONFIG_COUNTER: AtomicU64 = AtomicU64::new(0);
 

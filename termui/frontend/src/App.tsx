@@ -2033,13 +2033,23 @@ export default function App() {
         const closePendingAttachClients = () => {
           // 快速点击 session 时，旧连接可能刚完成握手才回到这里；只能关闭自己持有的 client，
           // 不能清掉更新一轮点击已经写入的 pending ref。
-          if (outputClient && pendingAttachClientRef.current === outputClient) {
+          const ownsPendingAttach = Boolean(
+            outputClient &&
+            pendingAttachClientRef.current === outputClient &&
+            pendingTerminalAttachSessionRef.current === sessionId,
+          );
+          if (ownsPendingAttach) {
             pendingAttachClientRef.current = undefined;
           }
           if (pendingTerminalAttachSessionRef.current === sessionId) {
             pendingTerminalAttachSessionRef.current = undefined;
           }
-          if (outputClient && outputClient !== attachClientRef.current) {
+          if (
+            outputClient &&
+            outputClient !== attachClientRef.current &&
+            outputClient !== workspaceClientRef.current &&
+            outputClient !== pendingAttachClientRef.current
+          ) {
             outputClient.close();
           }
           outputClient = undefined;
@@ -2149,13 +2159,23 @@ export default function App() {
         ) {
           pendingTerminalAttachAbortControllerRef.current = undefined;
         }
-        if (outputClient && pendingAttachClientRef.current === outputClient) {
+        const ownsPendingAttach = Boolean(
+          outputClient &&
+          pendingAttachClientRef.current === outputClient &&
+          pendingTerminalAttachSessionRef.current === sessionId,
+        );
+        if (ownsPendingAttach) {
           pendingAttachClientRef.current = undefined;
         }
         if (pendingTerminalAttachSessionRef.current === sessionId) {
           pendingTerminalAttachSessionRef.current = undefined;
         }
-        if (outputClient && outputClient !== attachClientRef.current) {
+        if (
+          outputClient &&
+          outputClient !== attachClientRef.current &&
+          outputClient !== workspaceClientRef.current &&
+          outputClient !== pendingAttachClientRef.current
+        ) {
           outputClient.close();
         }
         if (

@@ -164,13 +164,8 @@ async fn serve_daemon(
         config.listen_host = listen.host;
         config.listen_port = listen.port;
     }
-    let relay_endpoints = normalize_relay_endpoints(
-        config
-            .relay_endpoints
-            .clone()
-            .into_iter()
-            .chain(relay_urls.into_iter()),
-    )?;
+    let relay_endpoints =
+        normalize_relay_endpoints(config.relay_endpoints.clone().into_iter().chain(relay_urls))?;
     if let Some(first_relay_endpoint) = relay_endpoints.first() {
         config.default_pairing_ws_url =
             RelayBaseUrl::parse(first_relay_endpoint)?.client_url_template();
@@ -281,10 +276,9 @@ fn relay_proxy_bypassed_by_no_proxy(
 fn relay_host_port_for_proxy_env(relay_endpoint: &str) -> Option<(String, u16)> {
     let (default_port, rest) = if let Some(rest) = relay_endpoint.strip_prefix("ws://") {
         (80, rest)
-    } else if let Some(rest) = relay_endpoint.strip_prefix("wss://") {
-        (443, rest)
     } else {
-        return None;
+        let rest = relay_endpoint.strip_prefix("wss://")?;
+        (443, rest)
     };
     let authority = rest
         .split_once('/')

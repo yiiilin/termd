@@ -244,6 +244,8 @@ enum RelayHttpAdmissionRequirement {
     },
 }
 
+// Returning a complete rejection response keeps admission handling at this HTTP boundary.
+#[allow(clippy::result_large_err)]
 fn authorize_relay_http_request(
     state: &RelayState,
     server_id: ServerId,

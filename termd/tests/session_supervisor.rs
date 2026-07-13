@@ -687,35 +687,6 @@ fn test_supervisor_guard_reaps_owned_real_064_supervisor_on_early_exit() {
     let _ = fs::remove_file(pid_file);
 }
 
-fn find_supervisor_pid_for_socket(socket_path: &str) -> Option<u32> {
-    for entry in fs::read_dir("/proc").ok()?.flatten() {
-        let Some(pid) = entry
-            .file_name()
-            .to_str()
-            .and_then(|value| value.parse::<u32>().ok())
-        else {
-            continue;
-        };
-        let Ok(cmdline) = fs::read(entry.path().join("cmdline")) else {
-            continue;
-        };
-        let arguments: Vec<&[u8]> = cmdline
-            .split(|byte| *byte == 0)
-            .filter(|argument| !argument.is_empty())
-            .collect();
-        if arguments
-            .iter()
-            .any(|argument| *argument == b"__session-supervisor")
-            && arguments
-                .windows(2)
-                .any(|pair| pair[0] == b"--socket-path" && pair[1] == socket_path.as_bytes())
-        {
-            return Some(pid);
-        }
-    }
-    None
-}
-
 fn real_064_supervisor_binary() -> &'static Path {
     static BINARY: OnceLock<PathBuf> = OnceLock::new();
     BINARY.get_or_init(|| {
@@ -748,6 +719,12 @@ fn real_064_supervisor_binary() -> &'static Path {
             .status()
             .expect("tar should extract baseline");
         assert!(status.success(), "baseline archive extraction failed");
+        let status = ProcessCommand::new("cargo")
+            .args(["fetch", "--locked"])
+            .current_dir(&root)
+            .status()
+            .expect("baseline cargo fetch should run");
+        assert!(status.success(), "real 0ccd03f dependency fetch failed");
         let status = ProcessCommand::new("cargo")
             .args([
                 "build",

@@ -114,10 +114,12 @@ describe("useWorkspaceConnection", () => {
     const server = { ...makeServer(), device_certificate: "device.certificate.signature" };
     const device = await generateDeviceIdentity(DEVICE_ID);
     const client = new V070Client(server, device, transport);
+    const attach = client.attachSession(SESSION_ID);
     transport.onTerminal?.(JSON.stringify({
       type: "terminal.attached",
       payload: { session_id: SESSION_ID },
     }));
+    await attach;
     const { attachedSessionRef, result } = renderWorkspaceConnection(server);
     result.current.workspaceClientRef.current = client as unknown as V070Client;
 

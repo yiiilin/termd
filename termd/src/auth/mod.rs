@@ -1932,13 +1932,6 @@ mod tests {
         PublicKey(daemon_wire_prefixed(signing_key.verifying_key().as_bytes()))
     }
 
-    fn decode_test_wire_bytes(value: &str, expected_len: usize) -> Vec<u8> {
-        let encoded = value.strip_prefix(ED25519_WIRE_PREFIX).unwrap();
-        let bytes = general_purpose::STANDARD.decode(encoded).unwrap();
-        assert_eq!(bytes.len(), expected_len);
-        bytes
-    }
-
     #[test]
     fn daemon_identity_generates_real_static_ed25519_keypair() {
         let identity = DaemonIdentity::generate();

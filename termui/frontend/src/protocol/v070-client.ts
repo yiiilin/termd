@@ -34,6 +34,7 @@ interface TransportLike {
 type JsonRequest = (path: string, payload: unknown) => Promise<any>;
 type HttpRequest = (path: string, init?: RequestInit) => Promise<Response>;
 interface PendingTerminalOpen {
+  sessionId?: UUID;
   promise: Promise<any>;
   resolve: (payload: any) => void;
   reject: (error: unknown) => void;
@@ -71,6 +72,7 @@ export class V070Client {
   private metadataState?: any;
   private metadataRevision?: number;
   private metadataConnected = false;
+  private metadataFailure?: ProtocolClientError;
   private metadataResync?: Promise<void>;
   private metadataConnectionGeneration = 0;
   private metadataReconnectAttempt = 0;
@@ -173,10 +175,9 @@ export class V070Client {
   }
 
   detachSession(sessionId: UUID): void {
-    if (this.terminalSessionId === sessionId) {
-      this.resetTerminalState();
-      this.transport.closeTerminal();
-    }
+    if (this.terminalSessionId !== sessionId && this.terminalOpen?.sessionId !== sessionId) return;
+    this.resetTerminalState(new ProtocolClientError("connection_closed", "terminal connection closed"));
+    this.transport.closeTerminal();
   }
 
   async closeSession(sessionId: UUID): Promise<SessionClosedPayload> {
@@ -377,6 +378,7 @@ export class V070Client {
     if (generation !== this.metadataConnectionGeneration) {
       throw new ProtocolClientError("stale_connection", "metadata connection was superseded");
     }
+    if (this.metadataFailure) throw this.metadataFailure;
     this.metadataConnected = true;
     if (this.metadataState !== undefined) return;
     await new Promise<void>((resolve, reject) => this.metadataWaiters.push({ resolve, reject }));
@@ -393,7 +395,14 @@ export class V070Client {
       resolve = resolvePending;
       reject = rejectPending;
     });
-    const pending: PendingTerminalOpen = { promise, resolve, reject };
+    const pending: PendingTerminalOpen = {
+      sessionId: command.type === "terminal.attach"
+        ? (command.payload as { session_id: UUID }).session_id
+        : undefined,
+      promise,
+      resolve,
+      reject,
+    };
     this.terminalOpen = pending;
     try {
       void this.transport.openTerminal(command).catch((caught) => {
@@ -441,6 +450,7 @@ export class V070Client {
         message.payload?.code ?? "metadata_error",
         message.payload?.message ?? "metadata error",
       );
+      this.metadataFailure = error;
       this.rejectMetadataWaiters(error);
       return;
     }
@@ -460,6 +470,7 @@ export class V070Client {
     }
     this.metadataRevision = revision;
     this.metadataState = message.payload?.state ?? {};
+    this.metadataFailure = undefined;
     this.metadataConnected = true;
     this.metadataReconnectAttempt = 0;
     this.metadataReconnectNeeded = false;
@@ -522,7 +533,9 @@ export class V070Client {
     this.metadataConnected = false;
     this.metadataState = undefined;
     this.metadataRevision = undefined;
-    this.rejectMetadataWaiters(new ProtocolClientError("connection_closed", "metadata connection closed"));
+    this.rejectMetadataWaiters(
+      this.metadataFailure ?? new ProtocolClientError("connection_closed", "metadata connection closed"),
+    );
     this.requestMetadataReconnect();
   }
 

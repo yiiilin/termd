@@ -1417,13 +1417,13 @@ describe("termui web 工作台", () => {
     await waitForWorkspaceSession();
     await screen.findByText(/termd-e2e-ready/);
     await waitFor(() => expect(daemon.sessionFileRequests.length).toBeGreaterThan(0));
-    await waitFor(() => expect(within(screen.getByLabelText("session files")).getByText("empty directory")).toBeInTheDocument(), {
+    await waitFor(() => expect(within(screen.getByLabelText("session files")).getByText("unavailable")).toBeInTheDocument(), {
       timeout: APP_CONNECTION_TIMEOUT_MS + 1500,
     });
 
     // 慢文件请求只更新右侧 panel，不影响独立的 terminal WebSocket。
     const panel = await screen.findByLabelText("session files");
-    expect(within(panel).getByText("empty directory")).toBeInTheDocument();
+    expect(within(panel).getByText("unavailable")).toBeInTheDocument();
     expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
     expect(screen.getByTestId("terminal-pane")).toBeInTheDocument();
     expectTerminalAndMetadataConnectionBudget(daemon);

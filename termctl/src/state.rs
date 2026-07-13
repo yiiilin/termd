@@ -959,10 +959,9 @@ pub fn normalize_ws_url(value: &str) -> Option<String> {
         ("wss", rest)
     } else if let Some(rest) = trimmed.strip_prefix("http://") {
         ("http", rest)
-    } else if let Some(rest) = trimmed.strip_prefix("https://") {
-        ("https", rest)
     } else {
-        return None;
+        let rest = trimmed.strip_prefix("https://")?;
+        ("https", rest)
     };
 
     let (without_query, query) = match rest.split_once('?') {

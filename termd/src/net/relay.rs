@@ -47,27 +47,15 @@ const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const RELAY_DATA_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const RELAY_ROUTE_READY_TIMEOUT: Duration = Duration::from_secs(5);
 const RELAY_SEND_DEADLINE: Duration = Duration::from_secs(10);
-#[cfg(test)]
-const RELAY_CONTROL_WRITE_COMPLETION_DEADLINE: Duration = Duration::from_millis(50);
 #[cfg(not(test))]
 const RELAY_PONG_DEADLINE: Duration = Duration::from_secs(10);
 #[cfg(test)]
 const RELAY_PONG_DEADLINE: Duration = Duration::from_millis(50);
-#[cfg(test)]
-const RELAY_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
-#[cfg(test)]
-const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const RELAY_RECONNECT_STABLE_RESET_AFTER: Duration = Duration::from_secs(60);
 // relay 是 trusted routing 层，但 daemon 侧仍不能依赖 relay 解析终端业务分片。
 // 允许 MB 级 terminal snapshot 通过，同时保留明确的单帧/单消息内存上限。
 const RELAY_MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 const RELAY_MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
-#[cfg(test)]
-const RELAY_TRAFFIC_LOG_INTERVAL: Duration = Duration::from_secs(1);
-#[cfg(test)]
-const RELAY_MUX_CONTROL_QUEUE_CAPACITY: usize = 256;
-#[cfg(test)]
-const RELAY_MUX_DATA_QUEUE_CAPACITY: usize = 32;
 // 中文注释：daemon->relay data writer 只保留一个待写批次，让 WebSocket 写速率成为真实背压。
 // HTTP tunnel 下载不能在 daemon 侧按 256KiB * 2048 继续堆积。
 const RELAY_DATA_WIRE_QUEUE_CAPACITY: usize = 1;
@@ -134,10 +122,6 @@ impl RelayDataWrite {
         match self {
             Self::Raw { kind, message } => RelayMuxWriteDebugSnapshot {
                 kind: *kind,
-                #[cfg(test)]
-                client_id: None,
-                #[cfg(test)]
-                order: None,
                 envelopes: 0,
                 bytes: relay_message_bytes(message),
                 raw: true,
@@ -149,25 +133,9 @@ impl RelayDataWrite {
 #[derive(Debug, Clone, Copy)]
 struct RelayMuxWriteDebugSnapshot {
     kind: RelayOutKind,
-    #[cfg(test)]
-    client_id: Option<RelayClientId>,
-    #[cfg(test)]
-    order: Option<u64>,
     envelopes: usize,
     bytes: usize,
     raw: bool,
-}
-
-#[cfg(test)]
-fn relay_message_kind(message: &Message) -> &'static str {
-    match message {
-        Message::Text(_) => "text",
-        Message::Binary(_) => "binary",
-        Message::Ping(_) => "ping",
-        Message::Pong(_) => "pong",
-        Message::Close(_) => "close",
-        Message::Frame(_) => "frame",
-    }
 }
 
 fn relay_message_bytes(message: &Message) -> usize {
@@ -180,14 +148,6 @@ fn relay_message_bytes(message: &Message) -> usize {
     }
 }
 
-#[cfg(test)]
-fn relay_daemon_mux_idle_ping_enabled() -> bool {
-    // daemon 是 relay mux 主干连接的 owner；空闲时由 daemon 主动发标准 WebSocket Ping。
-    // 中文注释：Ping 只用于让代理/NAT 看见连接活动。不能把 Pong 当业务 ACK，也不能
-    // 因为 Pong 被慢链路或旧 client 输出排队延迟，就主动判 relay 主干不可用。
-    true
-}
-
 fn relay_idle_ping_due(
     now: Instant,
     last_activity: Instant,
@@ -198,38 +158,6 @@ fn relay_idle_ping_due(
     // 任何 control/data 写出都算 activity，必须重新等待完整 heartbeat interval。
     now.duration_since(last_activity) >= heartbeat_interval
         && now.duration_since(last_idle_ping_sent_at) >= heartbeat_interval
-}
-
-#[cfg(test)]
-fn relay_daemon_mux_inbound_idle_timeout_enabled() -> bool {
-    // daemon->relay 是一条长期主干连接：空闲时可能只有 daemon 发出的 WebSocket Ping，
-    // relay/Pong 不进入业务数据流。这里不能因为“没有业务入站帧”主动断开，否则会让健康
-    // 主干每 120s 自杀一次，并在 Web 侧表现成 relay 离线或操作超时。
-    false
-}
-
-#[cfg(test)]
-#[derive(Debug, Default, Clone, Copy)]
-struct RelayWatcherCounts {
-    output: usize,
-    cwd: usize,
-    resize: usize,
-    metadata_clients: usize,
-    metadata_status: usize,
-}
-
-#[cfg(test)]
-#[derive(Debug, Default, Clone, Copy)]
-struct RelayMuxDebugSnapshot {
-    clients: usize,
-    packet_mode_clients: usize,
-    attached_sessions: usize,
-    watched_sessions: usize,
-    terminal_streams: usize,
-    zero_credit_terminal_streams: usize,
-    total_output_credit: u64,
-    pending_raw_chunks: usize,
-    pending_terminal_frames: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2119,10 +2047,9 @@ struct RelayConnectTarget {
 fn relay_target_from_ws_url(url: &str) -> Option<RelayConnectTarget> {
     let (scheme, rest) = if let Some(rest) = url.strip_prefix("ws://") {
         ("ws", rest)
-    } else if let Some(rest) = url.strip_prefix("wss://") {
-        ("wss", rest)
     } else {
-        return None;
+        let rest = url.strip_prefix("wss://")?;
+        ("wss", rest)
     };
     let authority = rest
         .split_once('/')

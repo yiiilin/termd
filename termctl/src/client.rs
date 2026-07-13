@@ -436,7 +436,7 @@ impl DirectClient {
         self.terminal
             .as_mut()
             .ok_or(TermctlError::ConnectionClosed)?
-            .send(Message::Text(raw.into()))
+            .send(Message::Text(raw))
             .await
             .map_err(|_| TermctlError::SendFailed)
     }
@@ -485,7 +485,7 @@ impl DirectClient {
         self.terminal
             .as_mut()
             .ok_or(TermctlError::ConnectionClosed)?
-            .send(Message::Binary(frame.into()))
+            .send(Message::Binary(frame))
             .await
             .map_err(|_| TermctlError::SendFailed)
     }

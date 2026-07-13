@@ -5562,51 +5562,10 @@ pub(crate) enum SupervisorTerminalServerFrame {
     },
 }
 
-#[cfg(test)]
-pub(crate) fn encode_supervisor_terminal_client_frame(
-    frame: &SupervisorTerminalClientFrame,
-) -> PtyResult<Vec<u8>> {
-    encode_length_prefixed_json(frame).map_err(PtyError::from)
-}
-
 pub(crate) fn decode_supervisor_terminal_client_frame(
     bytes: &[u8],
 ) -> PtyResult<SupervisorTerminalClientFrame> {
     decode_length_prefixed_json(bytes).map_err(PtyError::from)
-}
-
-#[cfg(test)]
-pub(crate) fn encode_supervisor_terminal_server_frame(
-    frame: &SupervisorTerminalServerFrame,
-) -> PtyResult<Vec<u8>> {
-    encode_length_prefixed_json(frame).map_err(PtyError::from)
-}
-
-#[cfg(test)]
-pub(crate) fn decode_supervisor_terminal_server_frame(
-    bytes: &[u8],
-) -> PtyResult<SupervisorTerminalServerFrame> {
-    decode_length_prefixed_json(bytes).map_err(PtyError::from)
-}
-
-#[cfg(test)]
-fn encode_length_prefixed_json<T>(value: &T) -> io::Result<Vec<u8>>
-where
-    T: Serialize,
-{
-    let payload_len = supervisor_json_payload_len(value)?;
-    let length = supervisor_payload_length_prefix(payload_len)?;
-    let mut payload = Vec::with_capacity(payload_len);
-    let written = write_supervisor_json_payload(&mut payload, value)?;
-    if written != payload_len {
-        return Err(invalid_data(
-            "session supervisor serialized frame length changed during write",
-        ));
-    }
-    let mut frame = Vec::with_capacity(4 + payload_len);
-    frame.extend_from_slice(&length);
-    frame.extend_from_slice(&payload);
-    Ok(frame)
 }
 
 fn decode_length_prefixed_json<T>(bytes: &[u8]) -> io::Result<T>

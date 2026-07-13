@@ -95,8 +95,6 @@ const LIVE_OUTPUT_BYTES_PER_CELL: usize = 8;
 const LIVE_OUTPUT_DRAIN_MAX_CHUNKS: usize = 512;
 const TERMINAL_STREAM_BATCH_MAX_BYTES: usize = 512 * 1024;
 #[cfg(test)]
-const TERMINAL_STREAM_BATCH_MAX_TRANSPORT_BYTES: usize = 768 * 1024;
-#[cfg(test)]
 #[allow(dead_code)]
 const TERMINAL_STREAM_BATCH_TRANSPORT_OVERHEAD_BYTES: usize = 128;
 #[cfg(test)]
@@ -3057,22 +3055,6 @@ where
         Ok(Some(cwd))
     }
 
-    #[cfg(test)]
-    fn session_files_result(
-        &mut self,
-        session_id: SessionId,
-        requested_path: Option<String>,
-        fallback_to_root: bool,
-    ) -> Result<SessionFilesResultPayload, ProtocolError> {
-        let refreshed_cwd = self.refresh_session_terminal_cwd(session_id)?;
-        self.session_files_result_after_refresh(
-            session_id,
-            requested_path,
-            fallback_to_root,
-            refreshed_cwd,
-        )
-    }
-
     fn session_files_result_after_refresh(
         &mut self,
         session_id: SessionId,
@@ -3253,46 +3235,6 @@ where
             .map(|worktree| worktree.path)
             .find(|worktree| same_path(worktree, &requested))
             .ok_or(ProtocolError::InvalidEnvelope)
-    }
-
-    #[cfg(test)]
-    fn maybe_notify_terminal_cwd_probe(&mut self, session_id: SessionId) {
-        let cwd_receivers = self
-            .session_cwd_signals
-            .get(&session_id)
-            .map(watch::Sender::receiver_count)
-            .unwrap_or(0);
-        if cwd_receivers == 0 {
-            return;
-        }
-
-        let now_ms = current_unix_timestamp_millis().0;
-        if self
-            .session_terminal_cwd_probe_notified_at_ms
-            .get(&session_id)
-            .is_some_and(|last_ms| {
-                now_ms.saturating_sub(*last_ms) < SESSION_TERMINAL_CWD_PROBE_MIN_INTERVAL_MS
-            })
-        {
-            return;
-        }
-
-        // 中文注释：daemon 侧仍保留低频输出探测，但这里现在只负责唤醒 cwd watcher。
-        // 共享文件树是 termd 的重资源读取面，client 收到 cwd 轻事件后必须显式再拉
-        // `session.files`，这样 direct websocket 和 relay 的语义才能完全一致。
-        self.session_terminal_cwd_probe_notified_at_ms
-            .insert(session_id, now_ms);
-        self.notify_session_cwd_changed(session_id);
-    }
-
-    #[cfg(test)]
-    fn notify_session_cwd_changed(&self, session_id: SessionId) {
-        let Some(signal) = self.session_cwd_signals.get(&session_id) else {
-            return;
-        };
-        let next_version = signal.borrow().saturating_add(1);
-        // cwd 变化只是轻量提示，没有 watcher 时也可以直接忽略。
-        let _ = signal.send(next_version);
     }
 
     fn notify_session_resized(&self, session_id: SessionId, size: TerminalSize) {
