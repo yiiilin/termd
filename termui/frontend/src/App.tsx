@@ -149,6 +149,20 @@ interface MobileTitlePullGesture {
   dragging: boolean;
 }
 
+export function isExclusiveMetadataClient(
+  client: V070Client | undefined,
+  currentMetadataClient: V070Client | undefined,
+  workspaceClient: V070Client | undefined,
+  attachClient: V070Client | undefined,
+): client is V070Client {
+  return Boolean(
+    client &&
+    currentMetadataClient === client &&
+    workspaceClient !== client &&
+    attachClient !== client
+  );
+}
+
 interface PendingTerminalInputChunk {
   data: string;
   byteLength: number;
@@ -823,10 +837,15 @@ export default function App() {
     metadataClientAbortControllerRef.current?.abort();
     metadataClientAbortControllerRef.current = undefined;
     const client = metadataClientRef.current;
-    metadataClientRef.current = undefined;
-    if (client && workspaceClientRef.current !== client && attachClientRef.current !== client) {
+    if (isExclusiveMetadataClient(
+      client,
+      metadataClientRef.current,
+      workspaceClientRef.current,
+      attachClientRef.current,
+    )) {
       client.close();
     }
+    metadataClientRef.current = undefined;
     setMetadataReady(false);
   }, []);
 
@@ -2922,13 +2941,11 @@ export default function App() {
       try {
         client = await authenticatedWorkspaceClient(APP_CONNECTION_TIMEOUT_MS);
         if (!isCurrentMetadataClient()) {
-          client.close();
           return;
         }
         metadataClientRef.current = client;
         await client.subscribeMetadata();
         if (!isCurrentMetadataClient()) {
-          client.close();
           return;
         }
         setMetadataReady(true);

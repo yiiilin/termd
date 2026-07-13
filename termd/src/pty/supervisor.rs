@@ -4935,10 +4935,12 @@ async fn drain_supervisor_output_until_idle(shared: &SupervisorShared) {
 async fn drain_supervisor_output(shared: &SupervisorShared) -> bool {
     let mut chunks = 0_usize;
     let mut bytes = 0_usize;
+    let mut batch = Vec::with_capacity(SUPERVISOR_OUTPUT_PUMP_CHUNK_BYTES);
     loop {
         if chunks >= SUPERVISOR_OUTPUT_PUMP_MAX_CHUNKS_PER_TICK
             || bytes >= SUPERVISOR_OUTPUT_PUMP_MAX_BYTES_PER_TICK
         {
+            publish_supervisor_output_batch(shared, &mut batch).await;
             return true;
         }
 
@@ -4946,21 +4948,37 @@ async fn drain_supervisor_output(shared: &SupervisorShared) -> bool {
         let read = match shared.session.lock().await.read(&mut buffer) {
             Ok(read) => read,
             Err(error) => {
+                publish_supervisor_output_batch(shared, &mut batch).await;
                 tracing::warn!(%error, "session supervisor failed to read PTY output");
                 return false;
             }
         };
         if read == 0 {
+            publish_supervisor_output_batch(shared, &mut batch).await;
             return false;
         }
 
         buffer.truncate(read);
         chunks = chunks.saturating_add(1);
         bytes = bytes.saturating_add(read);
-        let mut state = shared.state.lock().await;
-        let frame = state.record_output(&buffer);
-        state.broadcast_terminal_frame(shared.session_id.as_str(), frame);
+        if batch.len().saturating_add(buffer.len()) > SUPERVISOR_OUTPUT_PUMP_CHUNK_BYTES {
+            publish_supervisor_output_batch(shared, &mut batch).await;
+        }
+        batch.extend_from_slice(&buffer);
+        if batch.len() >= SUPERVISOR_OUTPUT_PUMP_CHUNK_BYTES {
+            publish_supervisor_output_batch(shared, &mut batch).await;
+        }
     }
+}
+
+async fn publish_supervisor_output_batch(shared: &SupervisorShared, batch: &mut Vec<u8>) {
+    if batch.is_empty() {
+        return;
+    }
+    let mut state = shared.state.lock().await;
+    let frame = state.record_output(batch);
+    state.broadcast_terminal_frame(shared.session_id.as_str(), frame);
+    batch.clear();
 }
 
 async fn supervisor_exit_watcher(shared: SupervisorShared) {
@@ -7877,8 +7895,56 @@ mod tests {
         let state = shared.state.lock().await;
         assert_eq!(
             state.terminal.journal_len(),
-            SUPERVISOR_OUTPUT_PUMP_MAX_CHUNKS_PER_TICK,
-            "单次 drain 不应把无界 backlog 一次读空"
+            1,
+            "同一 drain tick 的小 read 应聚合，但不能越过调度预算"
+        );
+    }
+
+    #[tokio::test]
+    async fn supervisor_output_burst_does_not_overflow_healthy_terminal_attach() {
+        const BURST_CHUNKS: usize = 900;
+        let session_id = "burst-session".to_owned();
+        let (shutdown_tx, _shutdown_rx) = watch::channel(false);
+        let mut state = SupervisorState::new(PtySize::new(24, 80));
+        let (attach_tx, mut attach_rx) = test_bounded_output_channel();
+        let attach_id = state.register_terminal_attach(attach_tx);
+        let shared = SupervisorShared {
+            session_id: Arc::new(session_id),
+            session: Arc::new(Mutex::new(Box::new(BurstPtySession {
+                remaining_chunks: BURST_CHUNKS,
+            }))),
+            state: Arc::new(Mutex::new(state)),
+            shutdown_tx,
+        };
+
+        drain_supervisor_output_until_idle(&shared).await;
+
+        assert!(
+            shared
+                .state
+                .lock()
+                .await
+                .terminal_attaches
+                .contains_key(&attach_id),
+            "producer-side small reads must not be mistaken for a slow terminal consumer"
+        );
+        let mut frame_count = 0_usize;
+        let mut output_bytes = 0_usize;
+        while let Ok(frame) = attach_rx.try_recv() {
+            if let SupervisorTerminalServerFrame::TerminalFrame {
+                frame: PtyTerminalFrame::Output { data, .. },
+                ..
+            } = frame
+            {
+                frame_count = frame_count.saturating_add(1);
+                output_bytes = output_bytes.saturating_add(data.len());
+            }
+        }
+        assert_eq!(output_bytes, BURST_CHUNKS * 4);
+        assert_eq!(
+            frame_count,
+            BURST_CHUNKS.div_ceil(SUPERVISOR_OUTPUT_PUMP_MAX_CHUNKS_PER_TICK),
+            "each scheduled drain tick should publish one bounded aggregate frame"
         );
     }
 

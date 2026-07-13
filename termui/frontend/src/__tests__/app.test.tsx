@@ -6,6 +6,7 @@ import userEvent from "@testing-library/user-event";
 import App, {
   APP_CONNECTION_TIMEOUT_MS,
   browserReachableWsUrl,
+  isExclusiveMetadataClient,
   DAEMON_STATUS_POLL_INTERVAL_MS,
   defaultWsUrlFromPage,
   knownServerWsUrlCandidates,
@@ -37,6 +38,18 @@ import { SessionFilesPanel } from "../components/SessionFilesPanel";
 
 const DEFAULT_SESSION_ID = "00000000-0000-0000-0000-000000000401";
 const DEFAULT_SESSION_NAME = fallbackSessionDisplayName(DEFAULT_SESSION_ID);
+
+describe("metadata effect client ownership", () => {
+  it("only treats the current unshared metadata client as effect-owned", () => {
+    const client = { close: vi.fn() } as unknown as V070Client;
+    const replacement = { close: vi.fn() } as unknown as V070Client;
+
+    expect(isExclusiveMetadataClient(client, client, undefined, undefined)).toBe(true);
+    expect(isExclusiveMetadataClient(client, replacement, undefined, undefined)).toBe(false);
+    expect(isExclusiveMetadataClient(client, client, client, undefined)).toBe(false);
+    expect(isExclusiveMetadataClient(client, client, undefined, client)).toBe(false);
+  });
+});
 
 const qrScannerMock = vi.hoisted(() => ({
   destroy: vi.fn(),

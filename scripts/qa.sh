@@ -241,7 +241,7 @@ run_pairing_cli_e2e() (
 run_relay_runtime_e2e() (
   set -euo pipefail
 
-  local relay_port relay_addr relay_url daemon_port temp_dir relay_pid daemon_pid state_path new_stdout list_stdout
+  local relay_port relay_addr relay_url daemon_port temp_dir relay_pid daemon_pid state_path new_stdout list_stdout close_stdout session_id
   local setup_token setup_token_file daemon_token daemon_token_file registry_file server_id daemon_public_key register_payload register_curl_config
   local pairing_invite pairing_invite_file pairing_output pair_succeeded
   relay_port="$(pick_free_port)"
@@ -253,15 +253,35 @@ run_relay_runtime_e2e() (
   daemon_pid=""
 
   cleanup() {
-    if [[ -n "$daemon_pid" ]]; then
+    local exit_status=$?
+    local cleanup_list="" cleanup_session="" cleanup_termctl=""
+    set +e
+
+    cleanup_termctl="$(debug_binary_path termctl)"
+    if [[ -n "${daemon_pid:-}" ]] \
+      && kill -0 "$daemon_pid" 2>/dev/null \
+      && [[ -n "${state_path:-}" && "$state_path" == "${temp_dir:-}/"* && -f "$state_path" ]] \
+      && [[ -x "$cleanup_termctl" ]]; then
+      cleanup_list="$(timeout 5s "$cleanup_termctl" --state "$state_path" list --url "http://127.0.0.1:${daemon_port}" 2>/dev/null)"
+      while read -r cleanup_session _; do
+        if [[ "$cleanup_session" =~ ^session=([[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12})$ ]]; then
+          timeout 5s "$cleanup_termctl" --state "$state_path" close "${BASH_REMATCH[1]}" --url "http://127.0.0.1:${daemon_port}" >/dev/null 2>&1 || true
+        fi
+      done <<<"$cleanup_list"
+    fi
+
+    if [[ -n "${daemon_pid:-}" ]]; then
       kill "$daemon_pid" 2>/dev/null || true
       wait "$daemon_pid" 2>/dev/null || true
     fi
-    if [[ -n "$relay_pid" ]]; then
+    if [[ -n "${relay_pid:-}" ]]; then
       kill "$relay_pid" 2>/dev/null || true
       wait "$relay_pid" 2>/dev/null || true
     fi
-    rm -rf "$temp_dir"
+    if [[ -n "${temp_dir:-}" ]]; then
+      rm -rf "$temp_dir"
+    fi
+    return "$exit_status"
   }
   trap cleanup EXIT
 
@@ -394,23 +414,49 @@ PY
     cat "$temp_dir/termctl-pair.err" >&2
     exit 1
   fi
-  if ! new_stdout="$(cargo run -q -p termctl -- --state "$state_path" new --url "$relay_url" -- /bin/sh -lc 'printf relay-e2e-ready; sleep 1' 2>"$temp_dir/termctl-new.err")"; then
+  if ! new_stdout="$(cargo run -q -p termctl -- --state "$state_path" new --url "$relay_url" -- /bin/sh -lc 'printf relay-e2e-ready; sleep 15' 2>"$temp_dir/termctl-new.err")"; then
     printf '[termrelay] termctl new 未通过 trusted relay 完成。\n' >&2
+    printf '[termrelay] termctl new stdout: %s\n' "$new_stdout" >&2
     cat "$temp_dir/termctl-new.err" >&2
+    exit 1
+  fi
+  if [[ "$new_stdout" != session=* ]]; then
+    printf '[termrelay] termctl new 未通过 relay 返回 session。\n' >&2
+    printf '[termrelay] termctl new stdout: %s\n' "$new_stdout" >&2
+    cat "$temp_dir/termctl-new.err" >&2
+    exit 1
+  fi
+  session_id="${new_stdout#session=}"
+  session_id="${session_id%% *}"
+  if [[ -z "$session_id" ]]; then
+    printf '[termrelay] 无法从 termctl new 输出解析 session ID。\n' >&2
+    printf '[termrelay] termctl new stdout: %s\n' "$new_stdout" >&2
     exit 1
   fi
   if ! list_stdout="$(cargo run -q -p termctl -- --state "$state_path" list --url "$relay_url" 2>"$temp_dir/termctl-list.err")"; then
     printf '[termrelay] termctl list 未通过 trusted relay 完成。\n' >&2
+    printf '[termrelay] termctl list stdout: %s\n' "$list_stdout" >&2
     cat "$temp_dir/termctl-list.err" >&2
     exit 1
   fi
 
-  if [[ "$new_stdout" != session=* ]]; then
-    printf '[termrelay] termctl new 未通过 relay 返回 session。\n' >&2
+  if ! printf '%s\n' "$list_stdout" | awk -v expected="session=$session_id" '$1 == expected { found = 1 } END { exit found ? 0 : 1 }'; then
+    printf '[termrelay] termctl list 未通过 relay 返回新建 session。\n' >&2
+    printf '[termrelay] termctl new stdout: %s\n' "$new_stdout" >&2
+    printf '[termrelay] termctl list stdout: %s\n' "$list_stdout" >&2
+    cat "$temp_dir/termctl-list.err" >&2
     exit 1
   fi
-  if [[ "$list_stdout" != session=* ]]; then
-    printf '[termrelay] termctl list 未通过 relay 返回 session。\n' >&2
+  if ! close_stdout="$(cargo run -q -p termctl -- --state "$state_path" close "$session_id" --url "$relay_url" 2>"$temp_dir/termctl-close.err")"; then
+    printf '[termrelay] termctl close 未通过 trusted relay 完成。\n' >&2
+    printf '[termrelay] termctl close stdout: %s\n' "$close_stdout" >&2
+    cat "$temp_dir/termctl-close.err" >&2
+    exit 1
+  fi
+  if [[ "$close_stdout" != "closed session=$session_id" ]]; then
+    printf '[termrelay] termctl close 未确认新建 session 已关闭。\n' >&2
+    printf '[termrelay] termctl close stdout: %s\n' "$close_stdout" >&2
+    cat "$temp_dir/termctl-close.err" >&2
     exit 1
   fi
 
