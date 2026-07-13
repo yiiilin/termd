@@ -77,6 +77,15 @@ async fn embedded_web_response_with_headers(
     let Some((asset, asset_path)) = resolve_asset(method, path) else {
         return fallback_status(method);
     };
+    asset_response_with_headers(asset, &asset_path, method, headers)
+}
+
+fn asset_response_with_headers(
+    asset: EmbeddedAsset,
+    asset_path: &str,
+    method: &Method,
+    headers: &HeaderMap,
+) -> Response<Body> {
     let available = AvailableEncodings {
         brotli: asset.brotli.is_some(),
         gzip: asset.gzip.is_some(),
@@ -86,7 +95,7 @@ async fn embedded_web_response_with_headers(
     };
 
     let not_modified = if_none_match_matches(headers.get_all(IF_NONE_MATCH).iter(), asset.etag);
-    asset_response(asset, &asset_path, encoding, method, not_modified)
+    asset_response(asset, asset_path, encoding, method, not_modified)
 }
 
 fn resolve_asset(method: &Method, path: &str) -> Option<(EmbeddedAsset, String)> {
@@ -448,6 +457,14 @@ mod tests {
     use std::time::{Duration, Instant};
 
     const BODY_LIMIT: usize = 32 * 1024 * 1024;
+    const LARGE_TEST_ASSET_LEN: usize = 7_000_001;
+    static LARGE_TEST_ASSET_IDENTITY: [u8; LARGE_TEST_ASSET_LEN] = [b'x'; LARGE_TEST_ASSET_LEN];
+    const LARGE_TEST_ASSET: EmbeddedAsset = EmbeddedAsset {
+        identity: &LARGE_TEST_ASSET_IDENTITY,
+        gzip: Some(b"precompressed-gzip-fixture"),
+        brotli: Some(b"precompressed-brotli-fixture"),
+        etag: "W/\"large-test-asset\"",
+    };
 
     fn headers(entries: &[(&'static str, &'static str)]) -> HeaderMap {
         let mut headers = HeaderMap::new();
@@ -942,14 +959,14 @@ mod tests {
 
     #[tokio::test]
     async fn large_asset_head_and_304_use_static_representations_without_runtime_work() {
-        const LARGE_ASSET: &str = "/assets/ts.worker-BH9nVgjN.js";
-        let identity = embedded_web_response_with_headers(
+        const LARGE_ASSET_PATH: &str = "assets/large-test-BH9nVgjN.js";
+        let identity = asset_response_with_headers(
+            LARGE_TEST_ASSET,
+            LARGE_ASSET_PATH,
             &Method::GET,
-            LARGE_ASSET,
             &headers(&[(ACCEPT_ENCODING.as_str(), "identity")]),
-        )
-        .await;
-        assert!(
+        );
+        assert_eq!(
             identity
                 .headers()
                 .get(CONTENT_LENGTH)
@@ -957,23 +974,26 @@ mod tests {
                 .to_str()
                 .unwrap()
                 .parse::<usize>()
-                .unwrap()
-                > 7_000_000
+                .unwrap(),
+            LARGE_TEST_ASSET_LEN
         );
         let etag = identity.headers().get(ETAG).cloned().unwrap();
 
         let started = Instant::now();
-        let head = embedded_web_response_with_headers(
+        let head = asset_response_with_headers(
+            LARGE_TEST_ASSET,
+            LARGE_ASSET_PATH,
             &Method::HEAD,
-            LARGE_ASSET,
             &headers(&[(ACCEPT_ENCODING.as_str(), "gzip")]),
-        )
-        .await;
+        );
         let mut not_modified_headers = headers(&[(ACCEPT_ENCODING.as_str(), "br")]);
         not_modified_headers.insert(IF_NONE_MATCH, etag);
-        let not_modified =
-            embedded_web_response_with_headers(&Method::GET, LARGE_ASSET, &not_modified_headers)
-                .await;
+        let not_modified = asset_response_with_headers(
+            LARGE_TEST_ASSET,
+            LARGE_ASSET_PATH,
+            &Method::GET,
+            &not_modified_headers,
+        );
 
         assert_eq!(head.status(), StatusCode::OK);
         assert_eq!(head.headers().get(CONTENT_ENCODING).unwrap(), "gzip");
