@@ -222,6 +222,7 @@ export class MockDaemon {
   public readonly sentPackets: ProtocolPacket[] = [];
   public readonly receivedPacketLog: Array<{ connection_id: number; packet: ProtocolPacket }> = [];
   public readonly receivedHttpRequests: Array<{ path: string; method: string; payload: unknown }> = [];
+  public readonly pairingTokens: string[] = [];
   public readonly sentPacketLog: Array<{ connection_id: number; packet: ProtocolPacket }> = [];
   public readonly createdCommands: string[][] = [];
   public readonly sessionDataMessages: string[] = [];
@@ -269,6 +270,9 @@ export class MockDaemon {
   private readonly accessTokens = new Map<string, UUID>();
   private readonly sessionScopes = new Map<string, SessionScopeRecord>();
   private readonly connections = new Set<MockConnection>();
+  private readonly v070MetadataSockets = new Map<WebSocket, number>();
+  private readonly v070TerminalSockets = new Map<WebSocket, UUID>();
+  private readonly v070TerminalStreamIds = new Map<WebSocket, PacketStreamId>();
   private readonly serverSockets = new Set<Socket>();
   private readonly sessionFilePositions = new Map<UUID, string>();
   private readonly sessionOutputSnapshots = new Map<UUID, string>();
@@ -326,7 +330,9 @@ export class MockDaemon {
   }
 
   activeConnectionCount(): number {
-    return this.connections.size;
+    return [...this.wsServer.clients].filter(
+      (client) => client.readyState === client.CONNECTING || client.readyState === client.OPEN,
+    ).length;
   }
 
   outerWireText(): string {
@@ -340,6 +346,7 @@ export class MockDaemon {
   setSessions(sessions: SessionSummaryPayload[]): void {
     // 测试另一个客户端已经改变 daemon 端权威列表时，当前浏览器下一次刷新必须服从 daemon 顺序。
     this.options.sessions = sessions;
+    this.broadcastV070Metadata();
   }
 
   failNextTerminalAttaches(count = 1): void {
@@ -437,18 +444,29 @@ export class MockDaemon {
         this.sendInner(connection, envelope("session_files_result", files));
       }
     }
+    this.broadcastV070Metadata();
   }
 
   pushSessionCwdChanged(sessionId: UUID, cwd: string): void {
     this.sessionFilePositions.set(sessionId, cwd);
+    const session = this.options.sessions.find((candidate) => candidate.session_id === sessionId);
+    if (session) {
+      session.files_path = cwd;
+    }
     for (const connection of this.connections) {
       if (connection.routed && connection.watchedSessionIds.has(sessionId)) {
         this.sendInner(connection, envelope("session_cwd_changed", { session_id: sessionId, cwd }));
       }
     }
+    this.broadcastV070Metadata();
   }
 
   sendUnownedPacketError(code: string, message: string): void {
+    const v070Socket = [...this.v070TerminalSockets.keys()].find((socket) => socket.readyState === socket.OPEN);
+    if (v070Socket) {
+      v070Socket.send(JSON.stringify({ type: "error", payload: { code, message, retryable: false } }));
+      return;
+    }
     const connection = [...this.connections].find((candidate) => candidate.routed);
     if (!connection) {
       throw new Error("no routed connection is available");
@@ -466,7 +484,18 @@ export class MockDaemon {
         this.sendInner(connection, envelope("session_closed", { session_id: sessionId }));
       }
     }
+    for (const [socket, attachedSessionId] of this.v070TerminalSockets) {
+      if (attachedSessionId === sessionId && socket.readyState === socket.OPEN) {
+        socket.send(encodeSupervisorTerminalServerFrame({
+          type: "close",
+          reason: "session_closed",
+        }));
+        socket.close();
+      }
+    }
     this.cleanupClosedSession(sessionId);
+    this.options.sessions = this.options.sessions.filter((session) => session.session_id !== sessionId);
+    this.broadcastV070Metadata();
   }
 
   setSessionFilePosition(sessionId: UUID, path: string): void {
@@ -495,6 +524,13 @@ export class MockDaemon {
         );
       }
     }
+    const terminalSeq = this.claimNextMockTerminalSeq(sessionId);
+    this.sendV070TerminalFrame(sessionId, {
+      kind: "output",
+      session_id: sessionId,
+      terminal_seq: terminalSeq,
+      data_bytes: new TextEncoder().encode(text),
+    });
   }
 
   pushTerminalFrameBatch(sessionId: UUID, frames: unknown[]): void {
@@ -502,6 +538,9 @@ export class MockDaemon {
       if (connection.routed && connection.watchedSessionIds.has(sessionId)) {
         this.sendTerminalStreamBatch(connection, sessionId, frames);
       }
+    }
+    for (const frame of frames) {
+      this.sendV070TerminalFrame(sessionId, frame as SingleTerminalFramePayload);
     }
   }
 
@@ -511,6 +550,7 @@ export class MockDaemon {
         this.sendTerminalStreamFrame(connection, sessionId, frame);
       }
     }
+    this.sendV070TerminalFrame(sessionId, frame as SingleTerminalFramePayload);
   }
 
   pushSessionDataToAll(sessionId: UUID, text: string): void {
@@ -586,9 +626,11 @@ export class MockDaemon {
         const authorization = request.headers.authorization;
         const payload = JSON.parse(rawBody.toString("utf8")) as { device_id: UUID; device_public_key: string };
         if (authorization !== `TermdPair ${this.options.token}`) {
-          this.writeJson(response, 401, { error: { code: "pairing_failed", message: "pairing failed", retryable: false } });
+          const failure = this.options.pairFailure ?? { code: "pairing_failed", message: "pairing failed" };
+          this.writeJson(response, 401, { error: { ...failure, retryable: false } });
           return;
         }
+        this.pairingTokens.push(this.options.token);
         this.trustedDevices.set(payload.device_id, {
           deviceId: payload.device_id,
           devicePublicKey: payload.device_public_key,
@@ -710,23 +752,40 @@ export class MockDaemon {
   private acceptV070Metadata(socket: WebSocket): void {
     this.acceptedConnections += 1;
     this.v070MetadataConnections += 1;
-    const sendSnapshot = () => {
-      if (socket.readyState !== socket.OPEN) return;
-      socket.send(JSON.stringify({
-        type: "metadata.snapshot",
-        payload: {
-          revision: 1,
-          state: {
-            sessions: this.options.sessions,
-            clients: this.options.daemonClients ?? [],
-            daemon: this.options.daemonStatus ?? mockDaemonStatus(),
-            cwd: {},
-            rtt_ms: 0,
-          },
-        },
-      }));
-    };
-    queueMicrotask(sendSnapshot);
+    this.v070MetadataSockets.set(socket, 0);
+    if (this.options.routePreludeError) {
+      queueMicrotask(() => {
+        if (socket.readyState !== socket.OPEN) return;
+        socket.send(JSON.stringify({
+          type: "error",
+          payload: { ...this.options.routePreludeError, retryable: false },
+        }));
+        socket.close();
+      });
+      return;
+    }
+    this.receivedPackets.push(
+      {
+        version: PROTOCOL_PACKET_VERSION,
+        kind: "request",
+        method: "client.hello",
+        payload: { kind: "metadata" },
+      },
+      {
+        version: PROTOCOL_PACKET_VERSION,
+        kind: "request",
+        method: "metadata.subscribe",
+        payload: { sessions: true, clients: true, daemon: true, cwd: true },
+      },
+      {
+        version: PROTOCOL_PACKET_VERSION,
+        kind: "request",
+        method: "session.list",
+        payload: {},
+      },
+    );
+    socket.on("close", () => this.v070MetadataSockets.delete(socket));
+    queueMicrotask(() => this.sendV070Metadata(socket));
     socket.on("message", (raw, isBinary) => {
       if (isBinary) return;
       const message = JSON.parse(raw.toString()) as { type?: string };
@@ -742,27 +801,82 @@ export class MockDaemon {
   private acceptV070Terminal(socket: WebSocket): void {
     this.acceptedConnections += 1;
     this.v070TerminalConnections += 1;
-    let sessionId: UUID | undefined;
+    const connectionId = this.nextConnectionId++;
+    let requestChain = Promise.resolve();
+    socket.on("close", () => {
+      this.v070TerminalSockets.delete(socket);
+      const streamId = this.v070TerminalStreamIds.get(socket);
+      this.v070TerminalStreamIds.delete(socket);
+      if (streamId) {
+        this.receivedPackets.push({
+          version: PROTOCOL_PACKET_VERSION,
+          kind: "cancel",
+          stream_id: streamId,
+          payload: {},
+        });
+      }
+    });
     socket.on("message", (raw, isBinary) => {
-      if (!isBinary) {
+      const run = async () => {
+        let sessionId = this.v070TerminalSockets.get(socket);
+        if (!isBinary) {
         const command = JSON.parse(raw.toString()) as {
           type?: "terminal.create" | "terminal.attach";
           payload?: { session_id?: UUID; command?: string[]; size?: TerminalSize };
         };
+        const streamId = `v070-terminal-${connectionId}` as PacketStreamId;
+        this.v070TerminalStreamIds.set(socket, streamId);
+        this.receivedPackets.push({
+          version: PROTOCOL_PACKET_VERSION,
+          kind: "stream_open",
+          stream_id: streamId,
+          method: command.type,
+          payload: command.type === "terminal.attach"
+            ? { ...command.payload, watch_updates: true }
+            : command.payload ?? {},
+        });
+        await this.waitForV070TerminalRoute();
+        if (socket.readyState !== socket.OPEN) return;
         const size = command.payload?.size ?? { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 };
         if (command.type === "terminal.create") {
-          sessionId = randomUuid();
+          if (this.options.sessionCreateDelayMs) {
+            await new Promise((resolve) => setTimeout(resolve, this.options.sessionCreateDelayMs));
+          }
+          if (socket.readyState !== socket.OPEN) return;
+          this.createdSessionCounter += 1;
+          sessionId = `00000000-0000-0000-0000-${String(500 + this.createdSessionCounter).padStart(12, "0")}`;
           const created: SessionCreatedPayload = {
             session_id: sessionId,
+            name: fallbackSessionDisplayName(sessionId),
             state: "running",
             size,
             role: "operator",
           };
           this.options.sessions.unshift(created);
           this.createdCommands.push(command.payload?.command ?? []);
+          this.v070TerminalSockets.set(socket, sessionId);
+          if (this.options.createOutputBeforeResponse) {
+            this.appendSessionOutput(sessionId, this.options.createOutputBeforeResponse);
+            this.sendV070AttachSync(socket, sessionId, size);
+          }
           socket.send(JSON.stringify({ type: "terminal.created", payload: created }));
         } else if (command.type === "terminal.attach" && command.payload?.session_id) {
           sessionId = command.payload.session_id;
+          if (this.failTerminalAttachRequests > 0 || this.failWatchedTerminalAttachRequests > 0) {
+            if (this.failTerminalAttachRequests > 0) this.failTerminalAttachRequests -= 1;
+            else this.failWatchedTerminalAttachRequests -= 1;
+            this.failedTerminalAttachRequests += 1;
+            socket.send(JSON.stringify({
+              type: "error",
+              payload: { code: "connection_closed", message: "mock terminal attach closed", retryable: true },
+            }));
+            socket.close();
+            return;
+          }
+          if (this.options.attachDelayMs) {
+            await new Promise((resolve) => setTimeout(resolve, this.options.attachDelayMs));
+          }
+          if (socket.readyState !== socket.OPEN) return;
           const session = this.options.sessions.find((candidate) => candidate.session_id === sessionId);
           if (!session) {
             socket.send(JSON.stringify({
@@ -773,6 +887,7 @@ export class MockDaemon {
           }
           this.attachRequests.push({ session_id: sessionId, watch_updates: true });
           this.attachedSessions.push(sessionId);
+          this.v070TerminalSockets.set(socket, sessionId);
           socket.send(JSON.stringify({
             type: "terminal.attached",
             payload: {
@@ -791,39 +906,144 @@ export class MockDaemon {
         if (!attachedSessionId || !session) return;
         queueMicrotask(() => {
           if (socket.readyState !== socket.OPEN) return;
-          if (this.options.attachOutput && !this.sessionOutputSnapshots.has(attachedSessionId)) {
+          if (!this.sessionOutputSnapshots.has(attachedSessionId) && this.options.attachOutput) {
             this.appendSessionOutput(attachedSessionId, this.options.attachOutput);
           }
-          const snapshotBytes = encodeUtf8(this.sessionOutputSnapshots.get(attachedSessionId) ?? "");
           socket.send(JSON.stringify({
             type: "terminal.snapshot",
             payload: { session_id: attachedSessionId, size: session.size, cursor: { row: 1, col: 1 } },
           }));
-          socket.send(encodeSupervisorTerminalServerFrame({
-            type: "attach_sync",
-            session_id: attachedSessionId,
-            base_seq: 0,
-            snapshot: {
-              size: session.size,
-              process_id: 7,
-              retained_output_bytes: snapshotBytes,
-            },
-            frames: [],
-          }));
-          this.v070TerminalBinaryFramesSent += 1;
+          if (!this.options.createOutputBeforeResponse || command.type !== "terminal.create") {
+            this.sendV070AttachSync(socket, attachedSessionId, session.size);
+          }
         });
+        this.broadcastV070Metadata();
         return;
       }
       if (!sessionId) return;
-      const frame = decodeSupervisorTerminalClientFrame(bytesFromWsMessage(raw));
+      const rawBytes = bytesFromWsMessage(raw);
+      const streamId = this.v070TerminalStreamIds.get(socket);
+      if (streamId) {
+        this.receivedPackets.push({
+          version: PROTOCOL_PACKET_VERSION,
+          kind: "stream_chunk",
+          stream_id: streamId,
+          payload: buildAttachFramePayload(sessionId, rawBytes),
+        });
+      }
+      const frame = decodeSupervisorTerminalClientFrame(rawBytes);
       if (frame.type === "input") {
         const text = decodeUtf8(frame.data_bytes);
         this.decryptedInputs.push(text);
         this.sessionDataMessages.push(text);
+        if (this.options.sessionDataError) {
+          socket.send(encodeSupervisorTerminalServerFrame({
+            type: "close",
+            reason: this.options.sessionDataError.code,
+            message: this.options.sessionDataError.message,
+          }));
+          socket.close();
+        }
       } else if (frame.type === "resize") {
         this.sessionResizes.push({ session_id: sessionId, size: frame.size });
+        const session = this.options.sessions.find((candidate) => candidate.session_id === sessionId);
+        if (session) session.size = frame.size;
+        if (this.options.resizeAckDelayMs) {
+          await new Promise((resolve) => setTimeout(resolve, this.options.resizeAckDelayMs));
+        }
+        this.sendV070TerminalFrame(sessionId, {
+          kind: "resize",
+          session_id: sessionId,
+          terminal_seq: this.claimNextMockTerminalSeq(sessionId),
+          size: frame.size,
+        });
+        this.broadcastV070Metadata();
       }
+      };
+      requestChain = requestChain.catch(() => undefined).then(run);
     });
+  }
+
+  private v070MetadataState(): Record<string, unknown> {
+    return {
+      sessions: this.options.sessions,
+      clients: this.options.daemonClients ?? [],
+      daemon: this.options.daemonStatus ?? mockDaemonStatus(),
+      cwd: Object.fromEntries(this.sessionFilePositions),
+      rtt_ms: 0,
+    };
+  }
+
+  private sendV070Metadata(socket: WebSocket): void {
+    if (socket.readyState !== socket.OPEN) return;
+    const previousRevision = this.v070MetadataSockets.get(socket);
+    if (previousRevision === undefined) return;
+    const revision = previousRevision + 1;
+    this.v070MetadataSockets.set(socket, revision);
+    this.daemonStatusRequests += 1;
+    const state = this.v070MetadataState();
+    const statusPacket = {
+      version: PROTOCOL_PACKET_VERSION,
+      kind: "event",
+      method: "daemon.status_snapshot",
+      payload: state.daemon,
+    } satisfies ProtocolPacket;
+    this.sentPackets.push(statusPacket);
+    socket.send(JSON.stringify({
+      type: previousRevision === 0 ? "metadata.snapshot" : "metadata.update",
+      payload: { revision, state },
+    }));
+  }
+
+  private broadcastV070Metadata(): void {
+    for (const socket of this.v070MetadataSockets.keys()) {
+      this.sendV070Metadata(socket);
+    }
+  }
+
+  private sendV070AttachSync(socket: WebSocket, sessionId: UUID, size: TerminalSize): void {
+    if (socket.readyState !== socket.OPEN) return;
+    const frame = encodeSupervisorTerminalServerFrame({
+      type: "attach_sync",
+      session_id: sessionId,
+      base_seq: 0,
+      snapshot: {
+        size,
+        process_id: 7,
+        retained_output_bytes: encodeUtf8(this.sessionOutputSnapshots.get(sessionId) ?? ""),
+      },
+      frames: [],
+    });
+    socket.send(frame);
+    const streamId = this.v070TerminalStreamIds.get(socket);
+    if (streamId) {
+      const packet = {
+        version: PROTOCOL_PACKET_VERSION,
+        kind: "stream_chunk",
+        stream_id: streamId,
+        payload: buildAttachFramePayload(sessionId, frame),
+      } satisfies ProtocolPacket;
+      this.sentPackets.push(packet);
+      this.sentPacketLog.push({ connection_id: 0, packet });
+    }
+    this.v070TerminalBinaryFramesSent += 1;
+  }
+
+  private sendV070TerminalFrame(sessionId: UUID, frame: SingleTerminalFramePayload): void {
+    for (const [socket, attachedSessionId] of this.v070TerminalSockets) {
+      if (attachedSessionId !== sessionId || socket.readyState !== socket.OPEN) continue;
+      socket.send(encodeSupervisorTerminalServerFrame({ type: "terminal_frame", session_id: sessionId, frame }));
+      this.v070TerminalBinaryFramesSent += 1;
+    }
+  }
+
+  private async waitForV070TerminalRoute(): Promise<void> {
+    const gate = this.nextRouteReadyGate;
+    this.nextRouteReadyGate = undefined;
+    if (gate) await gate;
+    const delayMs = this.options.routeReadyDelayOnceMs ?? this.options.routeReadyDelayMs;
+    this.options.routeReadyDelayOnceMs = undefined;
+    if (delayMs) await new Promise((resolve) => setTimeout(resolve, delayMs));
   }
 
   private accept(socket: WebSocket, requestPath: string): void {
@@ -1638,7 +1858,7 @@ export class MockDaemon {
   }
 
   private jsonError(status: number, code: string, message: string): Response {
-    return new Response(JSON.stringify({ code, message }), {
+    return new Response(JSON.stringify({ error: { code, message, retryable: false } }), {
       status,
       headers: { "content-type": "application/json" },
     });

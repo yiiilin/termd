@@ -16,10 +16,13 @@ import type {
   UUID,
 } from "./types";
 import { WorkspaceTransport, type WorkspaceCommand } from "./workspace-transport";
+import { bytesToBase64 } from "./wire";
 
 interface TransportLike {
   onMetadata?: (data: unknown) => void;
   onTerminal?: (data: unknown) => void;
+  onMetadataClose?: () => void;
+  onTerminalClose?: () => void;
   connectMetadata(): Promise<unknown>;
   reconnectMetadata(): Promise<unknown>;
   openTerminal(command: WorkspaceCommand): Promise<unknown>;
@@ -30,7 +33,36 @@ interface TransportLike {
 
 type JsonRequest = (path: string, payload: unknown) => Promise<any>;
 type HttpRequest = (path: string, init?: RequestInit) => Promise<Response>;
+interface PendingTerminalOpen {
+  promise: Promise<any>;
+  resolve: (payload: any) => void;
+  reject: (error: unknown) => void;
+}
 const FILE_CHUNK_BYTES = 2 * 1024 * 1024;
+const DEFAULT_REQUEST_TIMEOUT_MS = 5_000;
+const METADATA_RECONNECT_BASE_DELAY_MS = 100;
+const METADATA_RECONNECT_MAX_DELAY_MS = 2_000;
+
+function isRawFileTransferRequest(path: string, method?: string): boolean {
+  const normalizedMethod = (method ?? "GET").toUpperCase();
+  return (
+    normalizedMethod === "PUT" && /^\/api\/files\/uploads\/[^/]+\/chunks$/.test(path)
+  ) || (
+    normalizedMethod === "GET" && /^\/api\/files\/downloads\/[^/]+$/.test(path)
+  );
+}
+
+async function readBlobArrayBuffer(blob: Blob): Promise<ArrayBuffer> {
+  if (typeof blob.arrayBuffer === "function") {
+    return blob.arrayBuffer();
+  }
+  return new Promise<ArrayBuffer>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(reader.error ?? new Error("failed to read upload blob"));
+    reader.onload = () => resolve(reader.result as ArrayBuffer);
+    reader.readAsArrayBuffer(blob);
+  });
+}
 
 export class V070Client {
   readonly serverId: UUID;
@@ -40,10 +72,16 @@ export class V070Client {
   private metadataRevision?: number;
   private metadataConnected = false;
   private metadataResync?: Promise<void>;
-  private metadataWaiters: Array<() => void> = [];
+  private metadataConnectionGeneration = 0;
+  private metadataReconnectAttempt = 0;
+  private metadataReconnectNeeded = false;
+  private metadataReconnectTimer?: ReturnType<typeof globalThis.setTimeout>;
+  private metadataWaiters: Array<{ resolve: () => void; reject: (error: unknown) => void }> = [];
   private metadataListeners = new Set<(revision: number, state: any) => void>();
   private terminalSessionId?: UUID;
-  private terminalOpen?: { resolve: (payload: any) => void; reject: (error: unknown) => void };
+  private terminalOpen?: PendingTerminalOpen;
+  private terminalGeneration = 0;
+  private pendingTerminalFrames: Uint8Array[] = [];
   private terminalBlobDecode = Promise.resolve();
   private receiveQueue: Envelope[] = [];
   private receiveWaiters: Array<{ resolve: (value: Envelope) => void; reject: (error: unknown) => void }> = [];
@@ -58,6 +96,7 @@ export class V070Client {
     transport?: TransportLike,
     request?: JsonRequest,
     httpRequest?: HttpRequest,
+    private readonly requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
   ) {
     this.serverId = server.server_id;
     this.deviceId = device.device_id;
@@ -67,6 +106,8 @@ export class V070Client {
     this.httpRequest = httpRequest ?? ((path, init) => this.requestAuthorized(path, init));
     this.transport.onMetadata = (data) => this.handleMetadata(data);
     this.transport.onTerminal = (data) => this.handleTerminal(data);
+    this.transport.onMetadataClose = () => this.handleMetadataClose();
+    this.transport.onTerminalClose = () => this.handleTerminalClose();
     this.tokens.onRefresh(() => this.reconnectWithRefreshedToken());
   }
 
@@ -133,14 +174,14 @@ export class V070Client {
 
   detachSession(sessionId: UUID): void {
     if (this.terminalSessionId === sessionId) {
+      this.resetTerminalState();
       this.transport.closeTerminal();
-      this.terminalSessionId = undefined;
     }
   }
 
   async closeSession(sessionId: UUID): Promise<SessionClosedPayload> {
+    this.resetTerminalState(new ProtocolClientError("connection_closed", "terminal connection closed"));
     this.transport.closeTerminal();
-    if (this.terminalSessionId === sessionId) this.terminalSessionId = undefined;
     return this.jsonRequest(`/api/control/session/${sessionId}/close`, {});
   }
 
@@ -177,7 +218,10 @@ export class V070Client {
   }
 
   async writeSessionFile(sessionId: UUID, path: string, data: Uint8Array): Promise<any> {
-    return this.jsonRequest(`/api/control/session/${sessionId}/file_write`, { path, data: Array.from(data) });
+    return this.jsonRequest(`/api/control/session/${sessionId}/file_write`, {
+      path,
+      data_base64: bytesToBase64(data),
+    });
   }
 
   async deleteSessionFile(sessionId: UUID, path: string): Promise<any> {
@@ -198,12 +242,14 @@ export class V070Client {
     options: {
       onProgress?: (progress: any) => void;
       onSentProgress?: (sentBytes: number, sizeBytes: number) => void;
+      signal?: AbortSignal;
     } = {},
   ): Promise<any> {
     const ready = await this.fileJson("/api/files/uploads", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ session_id: sessionId, path, size_bytes: file.size }),
+      signal: options.signal,
     });
     try {
       if (file.size === 0) {
@@ -211,17 +257,19 @@ export class V070Client {
           method: "PUT",
           headers: { "content-range": "bytes */0" },
           body: new Uint8Array(),
+          signal: options.signal,
         });
         options.onProgress?.(progress);
       } else {
         for (let offset = 0; offset < file.size; offset += FILE_CHUNK_BYTES) {
           const end = Math.min(file.size, offset + FILE_CHUNK_BYTES);
-          const bytes = await new Response(file.slice(offset, end)).arrayBuffer();
+          const bytes = await readBlobArrayBuffer(file.slice(offset, end));
           options.onSentProgress?.(end, file.size);
           const progress = await this.fileJson(`/api/files/uploads/${ready.upload_id}/chunks`, {
             method: "PUT",
             headers: { "content-range": `bytes ${offset}-${end - 1}/${file.size}` },
             body: bytes,
+            signal: options.signal,
           });
           options.onProgress?.(progress);
         }
@@ -230,12 +278,14 @@ export class V070Client {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: "{}",
+        signal: options.signal,
       });
     } catch (error) {
       await this.fileJson(`/api/files/uploads/${ready.upload_id}/abort`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: "{}",
+        signal: options.signal,
       }).catch(() => undefined);
       throw error;
     }
@@ -248,14 +298,19 @@ export class V070Client {
       onProgress?: (receivedBytes: number, sizeBytes: number) => void;
       onChunk?: (bytes: Uint8Array, receivedBytes: number, sizeBytes: number) => void | Promise<void>;
       collectBytes?: boolean;
+      signal?: AbortSignal;
     } = {},
   ): Promise<any> {
     const ready = await this.fileJson("/api/files/downloads", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ session_id: sessionId, path }),
+      signal: options.signal,
     });
-    const response = await this.httpRequest(`/api/files/downloads/${ready.download_id}`, { method: "GET" });
+    const response = await this.httpRequest(`/api/files/downloads/${ready.download_id}`, {
+      method: "GET",
+      signal: options.signal,
+    });
     if (!response.ok) throw await this.responseError(response);
     const chunks: Uint8Array[] = [];
     let received = 0;
@@ -304,28 +359,55 @@ export class V070Client {
     if (this.isClosed) return;
     this.isClosed = true;
     this.tokens.dispose();
+    this.metadataConnectionGeneration += 1;
+    this.metadataConnected = false;
+    this.metadataReconnectNeeded = false;
+    this.clearMetadataReconnectTimer();
+    this.rejectMetadataWaiters(new ProtocolClientError("connection_closed", "connection closed"));
+    this.resetTerminalState(new ProtocolClientError("connection_closed", "connection closed"));
     this.transport.close();
     this.interruptReceiveWaiters();
   }
 
   private async ensureMetadata(): Promise<void> {
     if (this.isClosed) throw new ProtocolClientError("connection_closed", "connection closed");
+    const generation = this.metadataConnectionGeneration;
     await this.transport.connectMetadata();
+    if (this.isClosed) throw new ProtocolClientError("connection_closed", "connection closed");
+    if (generation !== this.metadataConnectionGeneration) {
+      throw new ProtocolClientError("stale_connection", "metadata connection was superseded");
+    }
     this.metadataConnected = true;
-    if (this.metadataState) return;
-    await new Promise<void>((resolve) => this.metadataWaiters.push(resolve));
+    if (this.metadataState !== undefined) return;
+    await new Promise<void>((resolve, reject) => this.metadataWaiters.push({ resolve, reject }));
   }
 
-  private async openTerminal(command: WorkspaceCommand): Promise<any> {
-    const result = new Promise<any>((resolve, reject) => { this.terminalOpen = { resolve, reject }; });
-    try {
-      await this.transport.openTerminal(command);
-    } catch (caught) {
-      this.terminalOpen?.reject(caught);
-      this.terminalOpen = undefined;
-      throw caught;
+  private openTerminal(command: WorkspaceCommand): Promise<any> {
+    if (this.isClosed) {
+      return Promise.reject(new ProtocolClientError("connection_closed", "connection closed"));
     }
-    return result;
+    this.resetTerminalState(new ProtocolClientError("stale_connection", "terminal connection was superseded"));
+    let resolve!: (payload: any) => void;
+    let reject!: (error: unknown) => void;
+    const promise = new Promise<any>((resolvePending, rejectPending) => {
+      resolve = resolvePending;
+      reject = rejectPending;
+    });
+    const pending: PendingTerminalOpen = { promise, resolve, reject };
+    this.terminalOpen = pending;
+    try {
+      void this.transport.openTerminal(command).catch((caught) => {
+        if (this.terminalOpen === pending) {
+          this.terminalOpen = undefined;
+          this.pendingTerminalFrames = [];
+        }
+        pending.reject(caught);
+      });
+    } catch (caught) {
+      this.terminalOpen = undefined;
+      pending.reject(caught);
+    }
+    return promise;
   }
 
   private reconnectWithRefreshedToken(): void {
@@ -334,7 +416,8 @@ export class V070Client {
     if (this.metadataConnected) {
       this.metadataState = undefined;
       this.metadataRevision = undefined;
-      reconnects.push(this.transport.reconnectMetadata());
+      this.metadataConnected = false;
+      this.requestMetadataReconnect();
     }
     if (this.terminalSessionId) {
       reconnects.push(this.openTerminal({
@@ -353,6 +436,14 @@ export class V070Client {
     } catch {
       return;
     }
+    if (message.type === "error") {
+      const error = new ProtocolClientError(
+        message.payload?.code ?? "metadata_error",
+        message.payload?.message ?? "metadata error",
+      );
+      this.rejectMetadataWaiters(error);
+      return;
+    }
     const revision = message.payload?.revision;
     if (!Number.isSafeInteger(revision) || revision < 0) return;
     if (message.type === "metadata.update") {
@@ -360,7 +451,8 @@ export class V070Client {
       if (this.metadataRevision === undefined || revision !== this.metadataRevision + 1) {
         this.metadataState = undefined;
         this.metadataRevision = undefined;
-        void this.resyncMetadata();
+        this.metadataConnected = false;
+        this.requestMetadataReconnect();
         return;
       }
     } else if (message.type !== "metadata.snapshot") {
@@ -368,45 +460,151 @@ export class V070Client {
     }
     this.metadataRevision = revision;
     this.metadataState = message.payload?.state ?? {};
-    for (const resolve of this.metadataWaiters.splice(0)) resolve();
+    this.metadataConnected = true;
+    this.metadataReconnectAttempt = 0;
+    this.metadataReconnectNeeded = false;
+    this.clearMetadataReconnectTimer();
+    for (const waiter of this.metadataWaiters.splice(0)) waiter.resolve();
     for (const listener of this.metadataListeners) listener(revision, this.metadataState);
-  }
-
-  private async resyncMetadata(): Promise<void> {
-    if (!this.metadataResync) {
-      this.metadataResync = this.transport.reconnectMetadata()
-        .then(() => undefined)
-        .finally(() => { this.metadataResync = undefined; });
-    }
-    await this.metadataResync;
   }
 
   private handleTerminal(data: unknown): void {
     if (typeof data === "string") {
       const message = JSON.parse(data) as any;
       if (message.type === "terminal.created" || message.type === "terminal.attached") {
+        const pending = this.terminalOpen;
+        if (!pending || this.isClosed) return;
         this.terminalSessionId = message.payload.session_id;
-        this.terminalOpen?.resolve(message.payload);
         this.terminalOpen = undefined;
+        pending.resolve(message.payload);
+        for (const bytes of this.pendingTerminalFrames.splice(0)) {
+          this.enqueue({ type: "attach_frame", payload: buildAttachFramePayload(this.terminalSessionId!, bytes) });
+        }
       } else if (message.type === "error") {
-        this.terminalOpen?.reject(new ProtocolClientError(message.payload?.code ?? "terminal_error", message.payload?.message ?? "terminal error"));
-        this.terminalOpen = undefined;
+        const error = new ProtocolClientError(
+          message.payload?.code ?? "terminal_error",
+          message.payload?.message ?? "terminal error",
+        );
+        if (this.terminalOpen) {
+          const pending = this.terminalOpen;
+          this.terminalOpen = undefined;
+          this.pendingTerminalFrames = [];
+          pending.reject(error);
+        } else {
+          this.enqueue({ type: "error", payload: { code: error.code, message: error.message } });
+        }
       }
       return;
     }
     if (data instanceof Blob) {
+      const generation = this.terminalGeneration;
       this.terminalBlobDecode = this.terminalBlobDecode
         .then(() => new Response(data).arrayBuffer())
         .then((buffer) => {
-          if (!this.isClosed) this.handleTerminal(buffer);
+          if (!this.isClosed && generation === this.terminalGeneration) this.handleTerminal(buffer);
         });
       return;
     }
     const bytes = data instanceof ArrayBuffer || Object.prototype.toString.call(data) === "[object ArrayBuffer]"
       ? new Uint8Array(data as ArrayBuffer)
       : ArrayBuffer.isView(data) ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength) : undefined;
-    if (!bytes || !this.terminalSessionId) return;
+    if (!bytes) return;
+    if (!this.terminalSessionId) {
+      if (this.terminalOpen) this.pendingTerminalFrames.push(bytes.slice());
+      return;
+    }
     this.enqueue({ type: "attach_frame", payload: buildAttachFramePayload(this.terminalSessionId, bytes) });
+  }
+
+  private handleMetadataClose(): void {
+    if (this.isClosed) return;
+    this.metadataConnectionGeneration += 1;
+    this.metadataConnected = false;
+    this.metadataState = undefined;
+    this.metadataRevision = undefined;
+    this.rejectMetadataWaiters(new ProtocolClientError("connection_closed", "metadata connection closed"));
+    this.requestMetadataReconnect();
+  }
+
+  private requestMetadataReconnect(): void {
+    if (this.isClosed) return;
+    this.metadataReconnectNeeded = true;
+    if (this.metadataResync || this.metadataReconnectTimer !== undefined) return;
+    this.metadataReconnectNeeded = false;
+    const generation = ++this.metadataConnectionGeneration;
+    let opening: Promise<unknown>;
+    try {
+      opening = this.transport.reconnectMetadata();
+    } catch (caught) {
+      opening = Promise.reject(caught);
+    }
+    const reconnect = opening.then(
+      () => {
+        if (this.isClosed || generation !== this.metadataConnectionGeneration) return;
+        this.metadataConnected = true;
+        if (this.metadataState === undefined) {
+          this.metadataReconnectNeeded = true;
+          this.scheduleMetadataReconnect();
+        }
+      },
+      () => {
+        if (this.isClosed || generation !== this.metadataConnectionGeneration) return;
+        if (this.metadataState !== undefined) return;
+        this.metadataConnected = false;
+        this.metadataReconnectNeeded = true;
+        this.scheduleMetadataReconnect();
+      },
+    ).then(() => undefined);
+    this.metadataResync = reconnect;
+    void reconnect.then(() => {
+      if (this.metadataResync !== reconnect) return;
+      this.metadataResync = undefined;
+      if (this.metadataReconnectNeeded && this.metadataReconnectTimer === undefined) {
+        this.requestMetadataReconnect();
+      }
+    });
+  }
+
+  private scheduleMetadataReconnect(): void {
+    if (this.isClosed || this.metadataReconnectTimer !== undefined) return;
+    const exponent = Math.min(this.metadataReconnectAttempt, 5);
+    const delay = Math.min(
+      METADATA_RECONNECT_BASE_DELAY_MS * (2 ** exponent),
+      METADATA_RECONNECT_MAX_DELAY_MS,
+    );
+    this.metadataReconnectAttempt += 1;
+    this.metadataReconnectTimer = globalThis.setTimeout(() => {
+      this.metadataReconnectTimer = undefined;
+      this.requestMetadataReconnect();
+    }, delay);
+  }
+
+  private clearMetadataReconnectTimer(): void {
+    if (this.metadataReconnectTimer === undefined) return;
+    globalThis.clearTimeout(this.metadataReconnectTimer);
+    this.metadataReconnectTimer = undefined;
+  }
+
+  private rejectMetadataWaiters(error: ProtocolClientError): void {
+    for (const waiter of this.metadataWaiters.splice(0)) waiter.reject(error);
+  }
+
+  private handleTerminalClose(): void {
+    if (this.isClosed) return;
+    const hadTerminal = this.terminalSessionId !== undefined || this.terminalOpen !== undefined;
+    this.resetTerminalState(new ProtocolClientError("connection_closed", "terminal connection closed"));
+    if (!hadTerminal) return;
+    this.interruptReceiveWaiters();
+  }
+
+  private resetTerminalState(error?: ProtocolClientError): void {
+    this.terminalGeneration += 1;
+    this.terminalSessionId = undefined;
+    this.pendingTerminalFrames = [];
+    if (!error || !this.terminalOpen) return;
+    const pending = this.terminalOpen;
+    this.terminalOpen = undefined;
+    pending.reject(error);
   }
 
   private enqueue(envelope: Envelope): void {
@@ -420,7 +618,7 @@ export class V070Client {
 
   private async requestJson(path: string, payload: unknown): Promise<any> {
     const token = await this.tokens.get();
-    const response = await fetch(applicationHttpUrl(this.server.url, path), {
+    const response = await this.fetchWithTimeout(applicationHttpUrl(this.server.url, path), {
       method: "POST",
       headers: { authorization: `Bearer ${token}`, "content-type": "application/json", "x-termd-server-id": this.server.server_id },
       body: JSON.stringify(payload),
@@ -435,7 +633,39 @@ export class V070Client {
     const headers = new Headers(init.headers);
     headers.set("authorization", `Bearer ${token}`);
     headers.set("x-termd-server-id", this.server.server_id);
-    return fetch(applicationHttpUrl(this.server.url, path), { ...init, headers });
+    const input = applicationHttpUrl(this.server.url, path);
+    const request = { ...init, headers };
+    if (isRawFileTransferRequest(path, init.method)) {
+      return fetch(input, request);
+    }
+    return this.fetchWithTimeout(input, request);
+  }
+
+  private async fetchWithTimeout(input: string, init: RequestInit): Promise<Response> {
+    const controller = new AbortController();
+    const callerSignal = init.signal;
+    let timedOut = false;
+    const abortFromCaller = () => controller.abort(callerSignal?.reason);
+    if (callerSignal?.aborted) {
+      abortFromCaller();
+    } else {
+      callerSignal?.addEventListener("abort", abortFromCaller, { once: true });
+    }
+    const timeout = globalThis.setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, Math.max(1, this.requestTimeoutMs));
+    try {
+      return await fetch(input, { ...init, signal: controller.signal });
+    } catch (caught) {
+      if (timedOut) {
+        throw new ProtocolClientError("response_timeout", "request timed out");
+      }
+      throw caught;
+    } finally {
+      globalThis.clearTimeout(timeout);
+      callerSignal?.removeEventListener("abort", abortFromCaller);
+    }
   }
 
   private async fileJson(path: string, init: RequestInit): Promise<any> {

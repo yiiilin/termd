@@ -333,9 +333,10 @@ test("pair、list、attach 的浏览器 smoke", async ({ page }, testInfo: TestI
       const sessionListRequests = () =>
         daemon.receivedPackets.filter((packet) => packet.kind === "request" && packet.method === "session.list").length;
       const beforeTitlePull = sessionListRequests();
+      const beforeMetadataConnections = daemon.v070MetadataConnections;
       const titleButton = page.getByRole("button", { name: "Open session list from title" });
-      // 中文注释：移动端标题栏下拉刷新复用 session.list，不打开 session 面板。
-      // 这里使用 touch pointer 事件覆盖真实浏览器的手势分支。
+      // 中文注释：0.7 session list 由固定 metadata WebSocket 实时推送；移动端
+      // 标题下拉只重读已有 snapshot，不能额外创建连接或发起旧 session.list RPC。
       await titleButton.dispatchEvent("pointerdown", {
         pointerId: 31,
         pointerType: "touch",
@@ -357,7 +358,9 @@ test("pair、list、attach 的浏览器 smoke", async ({ page }, testInfo: TestI
         clientX: 182,
         clientY: 82,
       });
-      await expect.poll(sessionListRequests).toBeGreaterThan(beforeTitlePull);
+      await page.waitForTimeout(250);
+      expect(sessionListRequests()).toBe(beforeTitlePull);
+      expect(daemon.v070MetadataConnections).toBe(beforeMetadataConnections);
       await expect(page.getByRole("region", { name: "sessions panel" })).toBeHidden();
 
       const menu = await openMobileMenu(page);
@@ -1513,11 +1516,12 @@ test("terminal 从后台标签页回到前台并重新聚焦时 rows/cols 保持
     await focusTerminalKeyboardSink(page);
 
     await expect
-      .poll(async () => terminalHostSize(page), { timeout: 8_000 })
-      .toMatchObject({ cols: expect.any(Number), rows: expect.any(Number) });
+      .poll(async () => {
+        const size = await terminalHostSize(page);
+        return size.cols > 80 && size.rows > 24;
+      }, { timeout: 8_000 })
+      .toBe(true);
     const stableSize = await terminalHostSize(page);
-    expect(stableSize.cols).toBeGreaterThan(80);
-    expect(stableSize.rows).toBeGreaterThan(24);
 
     await page.evaluate(() => {
       const scope = window as typeof window & { __termdFocusReturnSizes?: string[] };
@@ -1584,30 +1588,10 @@ function pairingInviteCode(daemon: MockDaemon): string {
 }
 
 function expectPairingTokenOnlyInRelayAdmission(daemon: MockDaemon, token = "secret-token"): void {
-  const lines = daemon.outerWireText().split("\n").filter(Boolean);
-  let tokenLineCount = 0;
-  for (const line of lines) {
-    if (!line.includes(token)) {
-      continue;
-    }
-    tokenLineCount += 1;
-    const envelope = JSON.parse(line) as {
-      type?: string;
-      payload?: { admission?: { kind?: string; token?: string } };
-    };
-    expect(envelope).toMatchObject({
-      type: "route_hello",
-      payload: {
-        admission: {
-          kind: "pair_ticket",
-          token,
-        },
-      },
-    });
-  }
-  // 中文注释：可信 relay 能看到一次性 pair ticket；配对后的 device admission
-  // 和业务 E2EE packet 不能继续携带原始 pairing token。
-  expect(tokenLineCount).toBe(1);
+  // 中文注释：0.7 pairing 走一次标准 HTTP 请求；pair ticket 只出现在该请求的
+  // Authorization 中，metadata/terminal WebSocket 和后续业务帧都不能携带它。
+  expect(daemon.pairingTokens).toEqual([token]);
+  expect(daemon.outerWireText()).not.toContain(token);
 }
 
 async function openSession(page: Page, name: string): Promise<void> {

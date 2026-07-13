@@ -151,74 +151,108 @@ export async function startRealRelayFixture(options: RealRelayFixtureOptions = {
   let daemon = spawnCargo(daemonArgs, "termd", tempDir, options.daemonEnv, daemonLogs);
   await waitForPort(termdPort, daemon, "termd");
 
-  const serverId = await serverIdFromHealthz(termdHttp);
-  const relayClientUrl = `ws://${relayAddr}/ws`;
-  const relayHttp = `http://${relayAddr}`;
-  await registerDaemonWithRelay(`http://${relayAddr}`, serverId, daemonToken, setupToken);
-  const pairing = await issuePairingToken(termdHttp);
-  let latestRelayDaemonControlConnectionId = await waitForRelayDaemonMux(
-    relayHttp,
-    [relay, daemon],
-  );
-
-  return {
-    token: pairing.token,
-    relayClientUrl,
-    relayWebUrl: `http://${relayAddr}/`,
-    serverId,
-    daemonPublicKey: pairing.daemonPublicKey,
-    diagnostics: () => [
-      `daemon_http=${termdHttp}`,
-      `relay_ws=${relayClientUrl}`,
-      `relay_web=http://${relayAddr}/`,
-      `daemon_relay_ws=ws://${relayForDaemon}`,
-      latencyProxy?.diagnostics() ?? "",
-      `server_id=${serverId}`,
-      relay.log.join(""),
-      daemon.log.join(""),
-    ].join("\n"),
-    issuePairingToken: async () => {
-      // 中文注释：多客户端测试需要不同设备身份，所以必须让 daemon 再签发一个独立的一次性 token。
-      const nextPairing = await issuePairingToken(termdHttp);
-      return nextPairing.token;
-    },
-    interruptRelayMux: async () => {
-      if (!latencyProxy) {
-        throw new Error("relay mux interrupt requires fixture network proxy");
-      }
-      await latencyProxy.interruptConnections();
-    },
-    restartDaemon: async () => {
-      // 中文注释：真实 relay 恢复验收需要保留同一个 state 目录，
-      // 这样 daemon 重启后才能从 supervisor/socket restore 已持久化 session。
-      await stopProcess(daemon, "termd");
-      daemon = spawnCargo(daemonArgs, "termd", tempDir, options.daemonEnv, daemonLogs);
-      await waitForPort(termdPort, daemon, "termd");
-      const restartedServerId = await serverIdFromHealthz(termdHttp);
-      if (restartedServerId !== serverId) {
-        throw new Error(`daemon restart changed server_id: expected ${serverId}, got ${restartedServerId}`);
-      }
-      await registerDaemonWithRelay(`http://${relayAddr}`, serverId, daemonToken, setupToken);
-      latestRelayDaemonControlConnectionId = await waitForRelayDaemonMux(
-        relayHttp,
-        [relay, daemon],
-        latestRelayDaemonControlConnectionId,
-      );
-    },
-    waitForRelayReady: async () => {
-      latestRelayDaemonControlConnectionId = await waitForRelayDaemonMux(
-        relayHttp,
-        [relay, daemon],
-        latestRelayDaemonControlConnectionId,
-      );
-    },
-    stop: async () => {
-      await stopProcess(daemon, "termd");
-      await latencyProxy?.stop();
-      await stopProcess(relay, "termrelay");
-      await rm(tempDir, { recursive: true, force: true });
-    },
+  const cleanupStartedFixture = async () => {
+    const results = await Promise.allSettled([
+      stopProcess(daemon, "termd"),
+      latencyProxy?.stop() ?? Promise.resolve(),
+      stopProcess(relay, "termrelay"),
+    ]);
+    await rm(tempDir, { recursive: true, force: true });
+    const rejected = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
+    if (rejected) {
+      throw rejected.reason;
+    }
   };
+
+  try {
+    const daemonIdentity = await daemonIdentityFromHealthz(termdHttp);
+    const serverId = daemonIdentity.serverId;
+    const relayClientUrl = `ws://${relayAddr}/ws`;
+    const relayHttp = `http://${relayAddr}`;
+    await registerDaemonWithRelay(
+      `http://${relayAddr}`,
+      serverId,
+      daemonToken,
+      daemonIdentity.daemonPublicKey,
+      setupToken,
+    );
+    const pairing = await issuePairingToken(termdHttp);
+    if (pairing.daemonPublicKey !== daemonIdentity.daemonPublicKey) {
+      throw new Error("termd pairing token response changed daemon public identity");
+    }
+    let latestRelayDaemonControlConnectionId = await waitForRelayDaemonMux(
+      relayHttp,
+      [relay, daemon],
+    );
+
+    return {
+      token: pairing.token,
+      relayClientUrl,
+      relayWebUrl: `http://${relayAddr}/`,
+      serverId,
+      daemonPublicKey: pairing.daemonPublicKey,
+      diagnostics: () => [
+        `daemon_http=${termdHttp}`,
+        `relay_ws=${relayClientUrl}`,
+        `relay_web=http://${relayAddr}/`,
+        `daemon_relay_ws=ws://${relayForDaemon}`,
+        latencyProxy?.diagnostics() ?? "",
+        `server_id=${serverId}`,
+        relay.log.join(""),
+        daemon.log.join(""),
+      ].join("\n"),
+      issuePairingToken: async () => {
+        // 中文注释：多客户端测试需要不同设备身份，所以必须让 daemon 再签发一个独立的一次性 token。
+        const nextPairing = await issuePairingToken(termdHttp);
+        return nextPairing.token;
+      },
+      interruptRelayMux: async () => {
+        if (!latencyProxy) {
+          throw new Error("relay mux interrupt requires fixture network proxy");
+        }
+        await latencyProxy.interruptConnections();
+      },
+      restartDaemon: async () => {
+        // 中文注释：真实 relay 恢复验收需要保留同一个 state 目录，
+        // 这样 daemon 重启后才能从 supervisor/socket restore 已持久化 session。
+        await stopProcess(daemon, "termd");
+        daemon = spawnCargo(daemonArgs, "termd", tempDir, options.daemonEnv, daemonLogs);
+        await waitForPort(termdPort, daemon, "termd");
+        const restartedIdentity = await daemonIdentityFromHealthz(termdHttp);
+        if (restartedIdentity.serverId !== serverId) {
+          throw new Error(`daemon restart changed server_id: expected ${serverId}, got ${restartedIdentity.serverId}`);
+        }
+        if (restartedIdentity.daemonPublicKey !== daemonIdentity.daemonPublicKey) {
+          throw new Error("daemon restart changed public identity");
+        }
+        await registerDaemonWithRelay(
+          `http://${relayAddr}`,
+          serverId,
+          daemonToken,
+          daemonIdentity.daemonPublicKey,
+          setupToken,
+        );
+        latestRelayDaemonControlConnectionId = await waitForRelayDaemonMux(
+          relayHttp,
+          [relay, daemon],
+          latestRelayDaemonControlConnectionId,
+        );
+      },
+      waitForRelayReady: async () => {
+        latestRelayDaemonControlConnectionId = await waitForRelayDaemonMux(
+          relayHttp,
+          [relay, daemon],
+          latestRelayDaemonControlConnectionId,
+        );
+      },
+      stop: async () => {
+        await cleanupStartedFixture();
+      },
+    };
+  } catch (caught) {
+    await cleanupStartedFixture().catch(() => undefined);
+    throw caught;
+  }
 }
 
 async function waitForRelayDaemonMux(
@@ -470,7 +504,7 @@ function applyBlackout(dueAt: number, rules: LinkRules, connectionStartedAt: num
 async function issuePairingToken(termdHttp: string): Promise<{ token: string; daemonPublicKey: string }> {
   const body = await httpRequest(`${termdHttp}/local/pairing-token`, { method: "POST" });
   const parsed = JSON.parse(body) as { token: string; daemon_public_key: string };
-  if (!parsed.token.startsWith("termd-pair-")) {
+  if (typeof parsed.token !== "string" || parsed.token.split(".").length !== 3) {
     throw new Error("termd pair token had unexpected shape");
   }
   if (!parsed.daemon_public_key.startsWith("ed25519-v1:")) {
@@ -483,24 +517,34 @@ async function registerDaemonWithRelay(
   relayHttp: string,
   serverId: string,
   daemonToken: string,
+  daemonPublicKey: string,
   setupToken: string,
 ): Promise<void> {
-  // 中文注释：0.6.0 的 relay 是可信准入层，测试里的 daemon 也必须先用 setup token
-  // 注册 daemon admission token；否则 relay 会拒绝 daemon control/data 路由。
+  // 中文注释：0.7 relay 必须同时持有 daemon public key，才能离线校验 daemon
+  // 签发的 pair ticket、device certificate 和 access token。
   await httpRequest(`${relayHttp}/api/relay/daemon/register`, {
     method: "POST",
     headers: {
       "content-type": "application/json",
       "x-termd-relay-setup-token": setupToken,
     },
-    body: JSON.stringify({ server_id: serverId, daemon_token: daemonToken }),
+    body: JSON.stringify({
+      server_id: serverId,
+      daemon_token: daemonToken,
+      daemon_public_key: daemonPublicKey,
+    }),
   });
 }
 
-async function serverIdFromHealthz(termdHttp: string): Promise<string> {
+async function daemonIdentityFromHealthz(
+  termdHttp: string,
+): Promise<{ serverId: string; daemonPublicKey: string }> {
   const body = await httpRequest(`${termdHttp}/healthz`, { method: "GET" });
-  const parsed = JSON.parse(body) as { server_id: string };
-  return parsed.server_id;
+  const parsed = JSON.parse(body) as { server_id?: string; daemon_public_key?: string };
+  if (!parsed.server_id || !parsed.daemon_public_key?.startsWith("ed25519-v1:")) {
+    throw new Error("termd healthz had unexpected daemon identity");
+  }
+  return { serverId: parsed.server_id, daemonPublicKey: parsed.daemon_public_key };
 }
 
 function httpRequest(

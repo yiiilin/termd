@@ -1,3 +1,5 @@
+import { ProtocolClientError } from "./errors";
+
 function workspaceWebSocketUrl(serverUrl: string, kind: "metadata" | "terminal"): string {
   const parsed = new URL(serverUrl, globalThis.location?.href);
   parsed.protocol = parsed.protocol === "https:" ? "wss:" : parsed.protocol === "http:" ? "ws:" : parsed.protocol;
@@ -21,8 +23,12 @@ export class WorkspaceTransport {
   private metadataOpen?: Promise<WebSocket>;
   private metadataGeneration = 0;
   private terminal?: WebSocket;
+  private terminalOpening?: WebSocket;
+  private terminalGeneration = 0;
   onMetadata?: (data: unknown) => void;
   onTerminal?: (data: unknown) => void;
+  onMetadataClose?: () => void;
+  onTerminalClose?: () => void;
 
   constructor(
     private readonly serverUrl: string,
@@ -44,6 +50,11 @@ export class WorkspaceTransport {
           throw new Error("metadata websocket was superseded");
         }
         this.metadata = socket;
+        socket.onclose = () => {
+          if (this.metadata !== socket) return;
+          this.metadata = undefined;
+          this.onMetadataClose?.();
+        };
         return socket;
       })
       .finally(() => {
@@ -57,49 +68,96 @@ export class WorkspaceTransport {
 
   async reconnectMetadata(): Promise<WebSocket> {
     this.metadataGeneration += 1;
-    this.metadata?.close();
+    const socket = this.metadata;
     this.metadata = undefined;
     this.metadataOpen = undefined;
+    socket?.close();
     return this.connectMetadata();
   }
 
   async openTerminal(command: WorkspaceCommand): Promise<WebSocket> {
-    this.terminal?.close();
-    const socket = await this.open("terminal", (data) => this.onTerminal?.(data));
+    this.closeTerminal();
+    const generation = this.terminalGeneration;
+    let socket: WebSocket;
+    try {
+      socket = await this.open(
+        "terminal",
+        (data, source) => {
+          if (generation !== this.terminalGeneration) return;
+          if (this.terminal !== source && this.terminalOpening !== source) return;
+          this.onTerminal?.(data);
+        },
+        (opening) => {
+          if (generation !== this.terminalGeneration) {
+            opening.close();
+            return;
+          }
+          this.terminalOpening = opening;
+        },
+      );
+    } catch (caught) {
+      if (generation !== this.terminalGeneration) {
+        throw new ProtocolClientError("stale_connection", "terminal websocket was superseded");
+      }
+      this.terminalOpening = undefined;
+      throw caught;
+    }
+    if (this.terminalOpening === socket) this.terminalOpening = undefined;
+    if (generation !== this.terminalGeneration) {
+      socket.close();
+      throw new ProtocolClientError("stale_connection", "terminal websocket was superseded");
+    }
     this.terminal = socket;
+    socket.onclose = () => {
+      if (generation !== this.terminalGeneration || this.terminal !== socket) return;
+      this.terminal = undefined;
+      this.onTerminalClose?.();
+    };
     socket.send(JSON.stringify(command));
     return socket;
   }
 
   sendTerminal(data: string | ArrayBufferLike | Blob | ArrayBufferView): void {
     if (!this.terminal || this.terminal.readyState !== 1) {
-      throw new Error("terminal websocket is not open");
+      throw new ProtocolClientError("connection_closed", "terminal websocket is not open");
     }
     this.terminal.send(data);
   }
 
   closeTerminal(): void {
-    this.terminal?.close();
+    this.terminalGeneration += 1;
+    const socket = this.terminal;
+    const opening = this.terminalOpening;
     this.terminal = undefined;
+    this.terminalOpening = undefined;
+    opening?.close();
+    if (socket === opening) return;
+    socket?.close();
   }
 
   close(): void {
     this.closeTerminal();
     this.metadataGeneration += 1;
-    this.metadata?.close();
+    const socket = this.metadata;
     this.metadata = undefined;
     this.metadataOpen = undefined;
+    socket?.close();
   }
 
-  private async open(kind: "metadata" | "terminal", receive: (data: unknown) => void): Promise<WebSocket> {
+  private async open(
+    kind: "metadata" | "terminal",
+    receive: (data: unknown, socket: WebSocket) => void,
+    onCreated?: (socket: WebSocket) => void,
+  ): Promise<WebSocket> {
     const token = await this.tokens.get();
     const socket = new WebSocket(workspaceWebSocketUrl(this.serverUrl, kind), ["termd.v0.7", token]);
     socket.binaryType = "arraybuffer";
-    socket.onmessage = (event) => receive(event.data);
+    socket.onmessage = (event) => receive(event.data, socket);
     await new Promise<void>((resolve, reject) => {
       socket.onopen = () => resolve();
       socket.onerror = () => reject(new Error(`${kind} websocket failed to open`));
       socket.onclose = () => reject(new Error(`${kind} websocket closed while opening`));
+      onCreated?.(socket);
     });
     socket.onclose = null;
     return socket;

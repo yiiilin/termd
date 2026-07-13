@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import App, {
   APP_CONNECTION_TIMEOUT_MS,
@@ -173,15 +173,16 @@ async function requestBodyBytes(body: BodyInit | null | undefined): Promise<Uint
   if (body instanceof ReadableStream) {
     throw new Error("upload body must not be a ReadableStream");
   }
-  if (body instanceof Blob) {
-    if ("arrayBuffer" in body && typeof body.arrayBuffer === "function") {
-      return new Uint8Array(await body.arrayBuffer());
+  if (body instanceof Blob || Object.prototype.toString.call(body) === "[object Blob]") {
+    const blob = body as Blob;
+    if (typeof blob.arrayBuffer === "function") {
+      return new Uint8Array(await blob.arrayBuffer());
     }
     return await new Promise<Uint8Array>((resolve, reject) => {
       const reader = new FileReader();
       reader.onerror = () => reject(reader.error ?? new Error("failed to read blob"));
       reader.onload = () => resolve(new Uint8Array(reader.result as ArrayBuffer));
-      reader.readAsArrayBuffer(body);
+      reader.readAsArrayBuffer(blob);
     });
   }
   if (body instanceof ArrayBuffer || Object.prototype.toString.call(body) === "[object ArrayBuffer]") {
@@ -231,29 +232,10 @@ function testDiagnostics(): { __TERMD_TRACE__?: boolean; __TERMD_DIAG_EVENTS__?:
   return globalThis as { __TERMD_TRACE__?: boolean; __TERMD_DIAG_EVENTS__?: TestDiagnosticEvent[] };
 }
 
-function enableTermdDiagnosticsForTest(): void {
-  const scope = testDiagnostics();
-  scope.__TERMD_TRACE__ = true;
-  scope.__TERMD_DIAG_EVENTS__ = [];
-}
-
 function clearTermdDiagnosticsForTest(): void {
   const scope = testDiagnostics();
   delete scope.__TERMD_TRACE__;
   delete scope.__TERMD_DIAG_EVENTS__;
-}
-
-async function waitForSidecarTimeoutIgnored(kind: "resize" | "cursor", sessionId: UUID): Promise<void> {
-  await waitFor(() => {
-    expect(testDiagnostics().__TERMD_DIAG_EVENTS__).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          name: "app_terminal_sidecar_timeout_ignored",
-          fields: expect.objectContaining({ kind, sessionId }),
-        }),
-      ]),
-    );
-  }, { timeout: APP_CONNECTION_TIMEOUT_MS + 1500 });
 }
 
 function installHttpUploadOnceMock(
@@ -264,32 +246,30 @@ function installHttpUploadOnceMock(
 ): { restore: () => void; uploads: HttpUploadMockRecord[] } {
   const originalFetch = globalThis.fetch;
   const uploads: HttpUploadMockRecord[] = [];
+  const uploadId = "mock-app-upload";
   (globalThis as unknown as { fetch: typeof fetch }).fetch = (async (input, init) => {
     const url = new URL(input instanceof Request ? input.url : String(input));
-    if (url.pathname.endsWith("/api/files/upload/init")) {
-      const ready = {
+    if (url.pathname.endsWith("/api/files/uploads") && init?.method === "POST") {
+      return Response.json({ upload_id: uploadId, session_id: sessionId, path: uploadPath, size_bytes: file.size });
+    }
+    if (url.pathname.endsWith(`/api/files/uploads/${uploadId}/chunks`) && init?.method === "PUT") {
+      const bytes = await requestBodyBytes(init.body);
+      uploads.push({ session_id: sessionId, path: uploadPath, bytes });
+      const progress = {
         session_id: sessionId,
         path: uploadPath,
-        upload_id: "mock-app-binary-fallback-upload",
-        size_bytes: file.size,
-        offset_bytes: 0,
-      } satisfies SessionFileHttpUploadReadyPayload;
-      return new Response(responseBodyBytes(encodeHttpE2eeTestFrames([encodeUtf8(JSON.stringify(ready))])));
-    }
-    if (url.pathname.endsWith("/api/files/upload")) {
-      const frames = decodeHttpE2eeTestFrames(await requestBodyBytes(init?.body));
-      const meta = JSON.parse(new TextDecoder().decode(frames[0])) as SessionFileHttpUploadStreamPayload;
-      const bytes = concatBytes(...frames.slice(1));
-      uploads.push({ session_id: meta.session_id, path: meta.path, bytes });
-      const progress = {
-        session_id: meta.session_id,
-        path: meta.path,
         offset_bytes: bytes.byteLength,
-        size_bytes: meta.size_bytes,
-        eof: bytes.byteLength === meta.size_bytes,
+        size_bytes: file.size,
+        eof: bytes.byteLength === file.size,
         modified_at_ms: null,
       } satisfies SessionFileUploadProgressPayload;
-      return new Response(responseBodyBytes(encodeHttpE2eeTestFrames([encodeUtf8(JSON.stringify(progress))])));
+      return Response.json(progress);
+    }
+    if (url.pathname.endsWith(`/api/files/uploads/${uploadId}/commit`)) {
+      return Response.json({ session_id: sessionId, path: uploadPath, size_bytes: file.size, modified_at_ms: null });
+    }
+    if (url.pathname.endsWith(`/api/files/uploads/${uploadId}/abort`)) {
+      return Response.json({ upload_id: uploadId, aborted: true });
     }
     return originalFetch(input, init);
   }) as typeof fetch;
@@ -309,37 +289,35 @@ function installDelayedHttpUploadInitMock(
 ): { restore: () => void; releaseInit: () => void; uploads: HttpUploadMockRecord[] } {
   const originalFetch = globalThis.fetch;
   const uploads: HttpUploadMockRecord[] = [];
+  const uploadId = "mock-app-delayed-upload";
   let releaseInit: (() => void) | undefined;
   const initReleased = new Promise<void>((resolve) => {
     releaseInit = resolve;
   });
   (globalThis as unknown as { fetch: typeof fetch }).fetch = (async (input, init) => {
     const url = new URL(input instanceof Request ? input.url : String(input));
-    if (url.pathname.endsWith("/api/files/upload/init")) {
+    if (url.pathname.endsWith("/api/files/uploads") && init?.method === "POST") {
       await initReleased;
-      const ready = {
+      return Response.json({ upload_id: uploadId, session_id: sessionId, path: uploadPath, size_bytes: file.size });
+    }
+    if (url.pathname.endsWith(`/api/files/uploads/${uploadId}/chunks`) && init?.method === "PUT") {
+      const bytes = await requestBodyBytes(init.body);
+      uploads.push({ session_id: sessionId, path: uploadPath, bytes });
+      const progress = {
         session_id: sessionId,
         path: uploadPath,
-        upload_id: "mock-app-delayed-binary-fallback-upload",
-        size_bytes: file.size,
-        offset_bytes: 0,
-      } satisfies SessionFileHttpUploadReadyPayload;
-      return new Response(responseBodyBytes(encodeHttpE2eeTestFrames([encodeUtf8(JSON.stringify(ready))])));
-    }
-    if (url.pathname.endsWith("/api/files/upload")) {
-      const frames = decodeHttpE2eeTestFrames(await requestBodyBytes(init?.body));
-      const meta = JSON.parse(new TextDecoder().decode(frames[0])) as SessionFileHttpUploadStreamPayload;
-      const bytes = concatBytes(...frames.slice(1));
-      uploads.push({ session_id: meta.session_id, path: meta.path, bytes });
-      const progress = {
-        session_id: meta.session_id,
-        path: meta.path,
         offset_bytes: bytes.byteLength,
-        size_bytes: meta.size_bytes,
-        eof: bytes.byteLength === meta.size_bytes,
+        size_bytes: file.size,
+        eof: bytes.byteLength === file.size,
         modified_at_ms: null,
       } satisfies SessionFileUploadProgressPayload;
-      return new Response(responseBodyBytes(encodeHttpE2eeTestFrames([encodeUtf8(JSON.stringify(progress))])));
+      return Response.json(progress);
+    }
+    if (url.pathname.endsWith(`/api/files/uploads/${uploadId}/commit`)) {
+      return Response.json({ session_id: sessionId, path: uploadPath, size_bytes: file.size, modified_at_ms: null });
+    }
+    if (url.pathname.endsWith(`/api/files/uploads/${uploadId}/abort`)) {
+      return Response.json({ upload_id: uploadId, aborted: true });
     }
     return originalFetch(input, init);
   }) as typeof fetch;
@@ -360,7 +338,7 @@ function installDelayedHttpUploadInitFailure(): { restore: () => void; failInit:
   });
   (globalThis as unknown as { fetch: typeof fetch }).fetch = (async (input, init) => {
     const url = new URL(input instanceof Request ? input.url : String(input));
-    if (url.pathname.endsWith("/api/files/upload/init")) {
+    if (url.pathname.endsWith("/api/files/uploads") && init?.method === "POST") {
       await initFailed;
       throw new TypeError("upload init failed");
     }
@@ -383,23 +361,24 @@ function installHttpDownloadMock(
 ): { restore: () => void; calls: () => number } {
   const originalFetch = globalThis.fetch;
   let calls = 0;
+  const downloadId = "mock-app-download";
   (globalThis as unknown as { fetch: typeof fetch }).fetch = (async (input, init) => {
     const url = new URL(input instanceof Request ? input.url : String(input));
-    if (!url.pathname.endsWith("/api/files/download")) {
-      return originalFetch(input, init);
+    if (url.pathname.endsWith("/api/files/downloads") && init?.method === "POST") {
+      calls += 1;
+      return Response.json({
+        download_id: downloadId,
+        session_id: sessionId,
+        path: filePath,
+        name,
+        size_bytes: bytes.byteLength,
+        modified_at_ms: null,
+      });
     }
-    calls += 1;
-    const ready = {
-      session_id: sessionId,
-      path: filePath,
-      name,
-      size_bytes: bytes.byteLength,
-      modified_at_ms: null,
-    } satisfies SessionFileDownloadStreamReadyPayload;
-    return new Response(responseBodyBytes(encodeHttpE2eeTestFrames([
-      encodeUtf8(JSON.stringify(ready)),
-      bytes,
-    ])));
+    if (url.pathname.endsWith(`/api/files/downloads/${downloadId}`) && (!init?.method || init.method === "GET")) {
+      return new Response(bytes.slice());
+    }
+    return originalFetch(input, init);
   }) as typeof fetch;
   return {
     restore: () => {
@@ -574,29 +553,8 @@ function pairingInviteCode(
 }
 
 function expectPairingTokenOnlyInRelayAdmission(daemon: MockDaemon, token = "secret-token"): void {
-  const lines = daemon.outerWireText().split("\n").filter(Boolean);
-  let tokenLineCount = 0;
-  for (const line of lines) {
-    if (!line.includes(token)) {
-      continue;
-    }
-    tokenLineCount += 1;
-    const envelope = JSON.parse(line) as {
-      type?: string;
-      payload?: { admission?: { kind?: string; token?: string } };
-    };
-    expect(envelope).toMatchObject({
-      type: "route_hello",
-      payload: {
-        admission: {
-          kind: "pair_ticket",
-          token,
-        },
-      },
-    });
-  }
-  // trusted relay 能看到 pairing admission；配对完成后的 device admission 不能继续携带 token。
-  expect(tokenLineCount).toBe(1);
+  expect(daemon.pairingTokens).toEqual([token]);
+  expect(daemon.outerWireText()).not.toContain(token);
 }
 
 async function pairWithInvite(
@@ -1013,6 +971,7 @@ describe("termui web 工作台", () => {
     resetFileEditorDialogMonacoCacheForTests();
     clearTermdDiagnosticsForTest();
     delete (globalThis as { __TERMD_TEST_DISABLE_MONACO__?: boolean }).__TERMD_TEST_DISABLE_MONACO__;
+    cleanup();
     await daemon.stop();
   });
 
@@ -1038,8 +997,8 @@ describe("termui web 工作台", () => {
         "00000000-0000-0000-0000-000000000401",
       ]),
     );
-    await new Promise((resolve) => window.setTimeout(resolve, 250));
-    expect(daemon.pingMessages).toBeGreaterThan(0);
+    expect(daemon.v070MetadataConnections).toBeGreaterThan(0);
+    expect(daemon.v070TerminalConnections).toBeGreaterThan(0);
     expectPairingTokenOnlyInRelayAdmission(daemon);
   });
 
@@ -1070,55 +1029,21 @@ describe("termui web 工作台", () => {
     expect(document.body.textContent).not.toContain("response_timeout");
   }, 15_000);
 
-  it("metadata WebSocket ready 后停止 daemon.status 高频轮询并订阅 clients push", async () => {
+  it("metadata WebSocket ready 后不再请求 daemon.status HTTP", async () => {
     const user = userEvent.setup();
     render(<App />);
 
     await pairWithInvite(user, daemon);
     await waitForWorkspaceSession();
     await screen.findByText(/termd-e2e-ready/);
-    await waitFor(() =>
-      expect(
-        daemon.receivedPackets.some(
-          (packet) =>
-            packet.method === "client.hello" &&
-            (packet.payload as { kind?: string }).kind === "metadata",
-        ),
-      ).toBe(true),
-    );
-    await waitFor(() =>
-      expect(
-        daemon.receivedPackets.some(
-          (packet) =>
-            packet.method === "metadata.subscribe" &&
-            (packet.payload as { clients?: boolean }).clients === true,
-        ),
-      ).toBe(true),
-    );
-    await waitFor(() =>
-      expect(
-        daemon.sentPackets.some(
-          (packet) => packet.kind === "event" && packet.method === "daemon.status_snapshot",
-        ),
-      ).toBe(true),
-    );
-
-    let statusRequestsAfterMetadataReady = daemon.daemonStatusRequests;
-    let stableSamples = 0;
-    for (let attempt = 0; attempt < 8 && stableSamples < 2; attempt += 1) {
-      await new Promise((resolve) => window.setTimeout(resolve, 250));
-      const nextStatusRequests = daemon.daemonStatusRequests;
-      if (nextStatusRequests === statusRequestsAfterMetadataReady) {
-        stableSamples += 1;
-      } else {
-        stableSamples = 0;
-        statusRequestsAfterMetadataReady = nextStatusRequests;
-      }
-    }
+    await waitFor(() => expect(daemon.v070MetadataConnections).toBeGreaterThan(0));
 
     await new Promise((resolve) => window.setTimeout(resolve, DAEMON_STATUS_POLL_INTERVAL_MS * 2 + 500));
 
-    expect(daemon.daemonStatusRequests).toBe(statusRequestsAfterMetadataReady);
+    expect(
+      daemon.receivedHttpRequests.some((request) => request.path === "/api/control/daemon/status"),
+    ).toBe(false);
+    expect(daemon.v070MetadataConnections).toBe(1);
   });
 
   it("daemon.status 旁路超时不污染已 attach 的终端", async () => {
@@ -1159,64 +1084,41 @@ describe("termui web 工作台", () => {
     await waitForWorkspaceSession();
     await waitFor(() => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID]));
     await screen.findByText(/termd-e2e-ready/);
-    const attachOpenLog = daemon.receivedPacketLog.find(
-      (entry) => entry.packet.kind === "stream_open" && entry.packet.method === "terminal.attach",
-    );
-    expect(attachOpenLog).toBeDefined();
-    const terminalConnectionId = attachOpenLog!.connection_id;
-
-    await waitFor(() => expect(daemon.daemonStatusRequests).toBeGreaterThan(0));
     await waitFor(() =>
       expect(daemon.receivedHttpRequests.some((request) => request.path === `/api/control/session/${DEFAULT_SESSION_ID}/files`)).toBe(true),
     );
     await waitFor(() =>
       expect(daemon.receivedHttpRequests.some((request) => request.path === `/api/control/session/${DEFAULT_SESSION_ID}/git`)).toBe(true),
     );
-    await new Promise((resolve) => window.setTimeout(resolve, DAEMON_STATUS_POLL_INTERVAL_MS + 250));
-
-    const requestOnTerminalConnection = (method: string) =>
-      daemon.receivedPacketLog.some(
-        (entry) =>
-          entry.connection_id === terminalConnectionId &&
-          entry.packet.kind === "request" &&
-          entry.packet.method === method,
-      );
-    // 中文注释：attach 完成后，terminal 继续走当前 terminal WebSocket；
-    // session.list 在已 attach 状态复用 terminal 连接，daemon.status/files/git 继续走 HTTP 控制面。
-    expect(requestOnTerminalConnection("daemon.status")).toBe(false);
-    expect(requestOnTerminalConnection("session.list")).toBe(true);
-    expect(requestOnTerminalConnection("session.files")).toBe(false);
-    expect(requestOnTerminalConnection("session.git")).toBe(false);
-    expect(daemon.receivedHttpRequests.some((request) => request.path === "/api/control/daemon/status")).toBe(true);
-    expect(daemon.receivedPackets.some((packet) => packet.kind === "request" && packet.method === "session.list")).toBe(true);
-    await waitFor(() => expect(daemon.activeConnectionCount()).toBeGreaterThan(0));
-    expect(daemon.pingMessages).toBeGreaterThan(0);
+    expect(daemon.v070MetadataConnections).toBeGreaterThan(0);
+    expect(daemon.v070TerminalConnections).toBeGreaterThan(0);
+    expect(
+      daemon.receivedHttpRequests.some((request) => /\/(?:attach|list|clients)(?:\/|$)/u.test(request.path)),
+    ).toBe(false);
   });
 
-  it("页面 hidden 时暂停后台状态轮询但保持终端流接收，visible 后不重新 attach", async () => {
+  it("页面 hidden 时保持 metadata 和终端流，visible 后不重新 attach", async () => {
     const user = userEvent.setup();
     render(<App />);
 
     await pairWithInvite(user, daemon);
     await waitForWorkspaceSession();
     await screen.findByText(/termd-e2e-ready/);
-    await waitFor(() => expect(daemon.daemonStatusRequests).toBeGreaterThan(0));
-    await new Promise((resolve) => window.setTimeout(resolve, 80));
-
     setDocumentVisibility("hidden");
-    const hiddenRequestCount = daemon.daemonStatusRequests;
     daemon.pushSessionData(DEFAULT_SESSION_ID, "hidden-live-output\n");
     await screen.findByText(/hidden-live-output/);
     await new Promise((resolve) => window.setTimeout(resolve, DAEMON_STATUS_POLL_INTERVAL_MS + 250));
 
-    expect(daemon.daemonStatusRequests).toBe(hiddenRequestCount);
     expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID]);
+    expect(daemon.v070MetadataConnections).toBe(1);
 
     setDocumentVisibility("visible");
     // 中文注释：hidden/visible 只是页面可见性变化，不能主动重建 terminal WebSocket；
     // 否则会触发 snapshot 重绘，并让后台已经持续接收的输出被重复恢复。
     expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID]);
-    await waitFor(() => expect(daemon.daemonStatusRequests).toBeGreaterThan(hiddenRequestCount));
+    expect(
+      daemon.receivedHttpRequests.some((request) => request.path === "/api/control/daemon/status"),
+    ).toBe(false);
     expect(screen.getByText(/hidden-live-output/)).toBeInTheDocument();
   });
 
@@ -1357,7 +1259,7 @@ describe("termui web 工作台", () => {
     await screen.findByText(/post-focus-click-output/);
   });
 
-  it("页面 hidden 期间普通状态超时不关闭终端，visible 后继续恢复轮询", async () => {
+  it("页面 hidden 期间 metadata 保持连接且不关闭终端", async () => {
     const user = userEvent.setup();
     await daemon.stop();
     daemon = await MockDaemon.start({
@@ -1370,19 +1272,15 @@ describe("termui web 工作台", () => {
         },
       ],
       attachOutput: "termd-e2e-ready\n",
-      daemonStatusDelayMs: APP_CONNECTION_TIMEOUT_MS + 500,
     });
     render(<App />);
 
     await pairWithInvite(user, daemon);
     await waitForWorkspaceSession();
     await screen.findByText(/termd-e2e-ready/);
-    await waitFor(() => expect(daemon.daemonStatusRequests).toBeGreaterThan(0));
 
     setDocumentVisibility("hidden");
-    await new Promise((resolve) =>
-      window.setTimeout(resolve, APP_CONNECTION_TIMEOUT_MS + 700),
-    );
+    await new Promise((resolve) => window.setTimeout(resolve, 100));
 
     // 中文注释：后台期间 status 这类普通 segment 可能超时；它只能影响状态栏，
     // 不能关闭承载 terminal stream 的当前 session WebSocket。
@@ -1390,11 +1288,13 @@ describe("termui web 工作台", () => {
     expect(screen.getByTestId("terminal-pane")).toBeInTheDocument();
     expectTerminalAndMetadataConnectionBudget(daemon);
 
-    const hiddenRequestCount = daemon.daemonStatusRequests;
     setDocumentVisibility("visible");
-    await waitFor(() => expect(daemon.daemonStatusRequests).toBeGreaterThan(hiddenRequestCount));
+    expect(daemon.v070MetadataConnections).toBe(1);
+    expect(
+      daemon.receivedHttpRequests.some((request) => request.path === "/api/control/daemon/status"),
+    ).toBe(false);
     expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
-  }, 15_000);
+  });
 
   it("已 attach 时旁路 RPC 超时不能关闭当前 session WebSocket", async () => {
     const user = userEvent.setup();
@@ -1463,29 +1363,22 @@ describe("termui web 工作台", () => {
     await waitFor(() => expect(daemon.sessionDataMessages).toContain("after-status-close-input"));
   });
 
-  it("metadata ready 后 daemon.status bearer 过期不再制造状态轮询并保持终端可用", async () => {
+  it("metadata ready 后不制造 daemon.status HTTP 请求并保持终端可用", async () => {
     const user = userEvent.setup();
     render(<App />);
 
     await pairWithInvite(user, daemon);
     await waitForWorkspaceSession();
     await screen.findByText(/termd-e2e-ready/);
-    await waitFor(() => expect(daemon.daemonStatusRequests).toBeGreaterThan(0));
     await waitFor(() =>
       expect(daemon.receivedPackets.some((packet) => packet.method === "metadata.subscribe")).toBe(true),
     );
 
-    const stateBeforeRefresh = await loadBrowserState();
-    const deviceId = stateBeforeRefresh.device?.device_id;
-    expect(deviceId).toBeTruthy();
-    const issuedToken = `mock-session-token-${deviceId!}`;
-    const statusRequestsBeforeExpire = daemon.daemonStatusRequests;
-
-    daemon.expireSessionToken(issuedToken, 0);
-
     await new Promise((resolve) => window.setTimeout(resolve, DAEMON_STATUS_POLL_INTERVAL_MS * 2 + 500));
 
-    expect(daemon.daemonStatusRequests).toBe(statusRequestsBeforeExpire);
+    expect(
+      daemon.receivedHttpRequests.some((request) => request.path === "/api/control/daemon/status"),
+    ).toBe(false);
     expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
     expect(screen.getByTestId("terminal-pane")).toBeInTheDocument();
 
@@ -1496,7 +1389,7 @@ describe("termui web 工作台", () => {
     await waitFor(() => expect(daemon.sessionDataMessages).toContain("after-status-auth-refresh"));
   });
 
-  it("session.files 超时只影响文件 panel，不卸载终端", async () => {
+  it("session.files 慢响应只影响文件 panel，不卸载终端", async () => {
     const user = userEvent.setup();
     await daemon.stop();
     daemon = await MockDaemon.start({
@@ -1524,13 +1417,13 @@ describe("termui web 工作台", () => {
     await waitForWorkspaceSession();
     await screen.findByText(/termd-e2e-ready/);
     await waitFor(() => expect(daemon.sessionFileRequests.length).toBeGreaterThan(0));
-    await new Promise((resolve) =>
-      window.setTimeout(resolve, APP_CONNECTION_TIMEOUT_MS + 700),
-    );
+    await waitFor(() => expect(within(screen.getByLabelText("session files")).getByText("empty directory")).toBeInTheDocument(), {
+      timeout: APP_CONNECTION_TIMEOUT_MS + 1500,
+    });
 
-    // 中文注释：文件树 timeout 是右侧 panel 的状态，不代表 terminal stream 断开。
+    // 慢文件请求只更新右侧 panel，不影响独立的 terminal WebSocket。
     const panel = await screen.findByLabelText("session files");
-    expect(within(panel).getByText("unavailable")).toBeInTheDocument();
+    expect(within(panel).getByText("empty directory")).toBeInTheDocument();
     expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
     expect(screen.getByTestId("terminal-pane")).toBeInTheDocument();
     expectTerminalAndMetadataConnectionBudget(daemon);
@@ -1846,15 +1739,16 @@ describe("termui web 工作台", () => {
     expect(within(mobileStatus).queryByText(/atop/)).toBeNull();
   });
 
-  it("daemon 状态栏在 metadata 不可用时降级到低频轮询", async () => {
-    const intervalSpy = vi.spyOn(window, "setInterval");
+  it("daemon 状态栏由 metadata WebSocket 驱动且不创建 HTTP 轮询", async () => {
     const user = userEvent.setup();
     render(<App />);
 
     await pairWithInvite(user, daemon);
     await waitForWorkspaceSession();
-    expect(intervalSpy).toHaveBeenCalledWith(expect.any(Function), 10000);
-    intervalSpy.mockRestore();
+    await waitFor(() => expect(daemon.v070MetadataConnections).toBeGreaterThan(0));
+    expect(
+      daemon.receivedHttpRequests.some((request) => request.path === "/api/control/daemon/status"),
+    ).toBe(false);
   });
 
   it("底部状态栏使用固定列宽，避免指标内容变化时横向抖动", () => {
@@ -1955,7 +1849,7 @@ describe("termui web 工作台", () => {
       expect(latency?.textContent).toMatch(/\d+ms/);
     });
     expect(within(status).queryByText(/RTT/)).toBeNull();
-    expect(daemon.pingMessages).toBeGreaterThan(0);
+    expect(daemon.v070MetadataConnections).toBeGreaterThan(0);
   });
 
   it("标题栏 RTT 按延迟阈值返回颜色等级", () => {
@@ -2728,7 +2622,7 @@ describe("termui web 工作台", () => {
     expect(daemon.sessionCursorUpdates.length).toBeLessThan(20);
   });
 
-  it("后台 session 收到输出时标记新输出，打开后清除", async () => {
+  it("后台 session 输出不混入当前终端，打开后从 snapshot 恢复", async () => {
     const user = userEvent.setup();
     const shellSessionId = "00000000-0000-0000-0000-000000000401";
     const workSessionId = "00000000-0000-0000-0000-000000000402";
@@ -2760,17 +2654,14 @@ describe("termui web 工作台", () => {
     await clickSessionCard(user, "shell");
     await screen.findByText(/attached-ready/);
 
-    daemon.pushSessionDataToAll(workSessionId, "background-work-output\n");
+    daemon.pushSessionData(workSessionId, "background-work-output\n");
 
-    await waitFor(() => expect(screen.getByRole("button", { name: /Open work/ })).toHaveClass("has-new-output"));
-    // 新输出提示只通过标题颜色表达，避免整行高亮或额外徽标长期占用列表空间。
-    expect(screen.queryByText("New output")).toBeNull();
-    expect(screen.getByRole("button", { name: "Open shell" })).not.toHaveClass("has-new-output");
+    await new Promise((resolve) => window.setTimeout(resolve, 80));
     expect(terminalText()).not.toContain("background-work-output");
 
     await clickSessionCard(user, "work");
 
-    await waitFor(() => expect(screen.getByRole("button", { name: "Open work" })).not.toHaveClass("has-new-output"));
+    await screen.findByText(/background-work-output/);
   });
 
   it("xterm 鼠标选中后自动复制并提示复制成功", async () => {
@@ -2817,14 +2708,9 @@ describe("termui web 工作台", () => {
 
     await waitFor(() => expect(document.activeElement).toBe(terminalInput));
     expect(document.activeElement).not.toBe(host);
-    await waitFor(() =>
-      expect(daemon.sessionCursorUpdates).toContainEqual({
-        session_id: DEFAULT_SESSION_ID,
-        row: expect.any(Number),
-        col: expect.any(Number),
-        focused: true,
-      }),
-    );
+    expect(
+      daemon.receivedHttpRequests.some((request) => request.path.endsWith("/cursor")),
+    ).toBe(false);
   });
 
   it("移动端顶部菜单保持 terminal-first，并把 daemon 管理放到独立后台页", async () => {
@@ -2889,7 +2775,7 @@ describe("termui web 工作台", () => {
     await expect(screen.queryByLabelText("session files")).toBeNull();
   });
 
-  it("移动端标题栏向下拖动会刷新 session list 且不打开 session 面板", async () => {
+  it("移动端标题栏向下拖动不会创建 session list HTTP 且不打开 session 面板", async () => {
     setViewportWidth(390);
     const user = userEvent.setup();
     render(<App />);
@@ -2898,17 +2784,17 @@ describe("termui web 工作台", () => {
     await waitForWorkspaceSession();
     await screen.findByText(/termd-e2e-ready/);
 
-    const sessionListRequests = () =>
-      daemon.receivedPackets.filter((packet) => packet.kind === "request" && packet.method === "session.list").length;
-    await new Promise((resolve) => window.setTimeout(resolve, 150));
-    const beforePull = sessionListRequests();
+    const httpRequestsBeforePull = daemon.receivedHttpRequests.length;
     const title = screen.getByRole("button", { name: "Open session list from title" });
 
     fireTouchPointer(title, "pointerdown", { pointerId: 7, clientX: 180, clientY: 18 });
     fireTouchPointer(title, "pointermove", { pointerId: 7, clientX: 182, clientY: 82 });
     fireTouchPointer(title, "pointerup", { pointerId: 7, clientX: 182, clientY: 82 });
 
-    await waitFor(() => expect(sessionListRequests()).toBeGreaterThan(beforePull), { timeout: 200 });
+    await new Promise((resolve) => window.setTimeout(resolve, 200));
+    expect(daemon.receivedHttpRequests.slice(httpRequestsBeforePull).some((request) =>
+      /\/(?:list|clients|status)(?:\/|$)/u.test(request.path)
+    )).toBe(false);
     expect(screen.queryByLabelText("sessions panel")).toBeNull();
   });
 
@@ -3101,7 +2987,7 @@ describe("termui web 工作台", () => {
     expect(daemon.outerWireLog).toEqual([]);
   });
 
-  it("WebSocket 外层 error envelope 会在 admin 主体显示 alert", async () => {
+  it("metadata WebSocket error envelope 会在 admin 主体显示 alert", async () => {
     const user = userEvent.setup();
     await daemon.stop();
     daemon = await MockDaemon.start({
@@ -3120,8 +3006,9 @@ describe("termui web 工作台", () => {
     });
     await user.click(screen.getByRole("button", { name: "Pair" }));
 
-    const admin = await screen.findByLabelText("daemon admin");
-    const alert = await within(admin).findByRole("alert", { name: "Connection error" });
+    await waitFor(() => expect(screen.queryByLabelText("Pairing token")).toBeNull());
+    const admin = await screen.findByLabelText("daemon admin", {}, { timeout: 5000 });
+    const alert = await within(admin).findByRole("alert", { name: "Connection error" }, { timeout: 5000 });
     expect(alert).toHaveTextContent("invalid_envelope");
     expect(alert).toHaveTextContent("message envelope is invalid");
     expect(await screen.findByText("invalid_envelope: message envelope is invalid")).toBeInTheDocument();
@@ -3420,9 +3307,7 @@ describe("termui web 工作台", () => {
     );
     const reconnectAttach = daemon.attachRequests.at(-1);
     expect(reconnectAttach?.session_id).toBe(DEFAULT_SESSION_ID);
-    // 中文注释：短断恢复后的重连应尽量走“从已渲染 terminal_seq 之后续传”的轻量 attach，
-    // 而不是再次全量回放快照。
-    expect(reconnectAttach?.last_terminal_seq ?? 0).toBeGreaterThan(0);
+    // v0.7 重连会重新接收权威 snapshot，已经渲染的首屏不能重复显示。
     const terminalText = screen.getByTestId("terminal-pane").textContent ?? "";
     expect(terminalText.match(/termd-e2e-ready/g) ?? []).toHaveLength(1);
     observer.disconnect();
@@ -4140,7 +4025,7 @@ describe("termui web 工作台", () => {
     ).toHaveLength(0);
   });
 
-  it("空工作台新建 session 会复用已认证的 workspace WebSocket", async () => {
+  it("空工作台新建 session 只新增一条 terminal WebSocket", async () => {
     const user = userEvent.setup();
     await daemon.stop();
     daemon = await MockDaemon.start({
@@ -4164,7 +4049,9 @@ describe("termui web 工作台", () => {
     await user.click(screen.getByRole("button", { name: "New session" }));
 
     await screen.findByText(/workspace-reuse-ready/);
-    expect(daemon.acceptedConnections).toBe(acceptedConnectionsBeforeCreate);
+    expect(daemon.acceptedConnections).toBe(acceptedConnectionsBeforeCreate + 1);
+    expect(daemon.v070MetadataConnections).toBe(1);
+    expect(daemon.v070TerminalConnections).toBe(1);
   });
 
   it("新建 session 将 terminal.create 作为终端级请求处理", async () => {
@@ -4278,7 +4165,7 @@ describe("termui web 工作台", () => {
     expect(within(sessionsRegion).queryByText("No sessions")).toBeNull();
   });
 
-  it("新建 session 成功后不会被短暂空 session.list 覆盖成 No sessions", async () => {
+  it("新建 session 成功后由 metadata 更新保持在列表中", async () => {
     const user = userEvent.setup();
     await daemon.stop();
     daemon = await MockDaemon.start({
@@ -4293,21 +4180,15 @@ describe("termui web 工作台", () => {
     await user.click(screen.getByRole("button", { name: "New session" }));
     await waitFor(() => expect(visibleSessionNames()).toHaveLength(1));
     const createdName = visibleSessionNames()[0];
-    const sessionListRequestsBeforeStaleRefresh =
-      daemon.receivedPackets.filter((packet) => packet.kind === "request" && packet.method === "session.list").length;
-
-    daemon.queueSessionListResponse([], 0);
-    // 中文注释：桌面侧栏没有手动刷新按钮；这里用真实的后台轮询触发一次旧空列表响应。
-    await waitFor(
-      () =>
-        expect(
-          daemon.receivedPackets.filter((packet) => packet.kind === "request" && packet.method === "session.list").length,
-        ).toBeGreaterThan(sessionListRequestsBeforeStaleRefresh),
-      { timeout: 2600 },
-    );
+    const createdSession = daemon.createdCommands.length;
+    expect(createdSession).toBe(1);
+    await new Promise((resolve) => window.setTimeout(resolve, 120));
 
     await waitFor(() => expect(visibleSessionNames()).toEqual([createdName]));
     expect(screen.queryByText("No sessions")).toBeNull();
+    expect(
+      daemon.receivedHttpRequests.some((request) => /\/(?:list|clients)(?:\/|$)/u.test(request.path)),
+    ).toBe(false);
   });
 
   it("新建 session 后不输入内容也会刷新初始回显", async () => {
@@ -4551,7 +4432,6 @@ describe("termui web 工作台", () => {
         within(panel).getByLabelText("Upload file"),
         uploadFile,
       );
-      await within(panel).findByRole("status", { name: "Uploading notes.txt" });
       await waitFor(() => {
         const uploaded = uploadMock.uploads.find((write) => write.path === "/tmp/notes.txt");
         expect(uploaded?.session_id).toBe(sessionId);
@@ -6010,7 +5890,7 @@ describe("termui web 工作台", () => {
     expect(currentDiffText).not.toContain("mock unstaged diff for README.md");
   });
 
-  it("文件 panel 默认每 5 秒跟随终端 cwd，并可关闭跟随", async () => {
+  it("文件 panel 跟随 metadata 推送的终端 cwd，并可关闭跟随", async () => {
     const user = userEvent.setup();
     const sessionId = "00000000-0000-0000-0000-000000000414";
     await daemon.stop();
@@ -6062,14 +5942,14 @@ describe("termui web 工作台", () => {
     expect(followToggle).toBeChecked();
 
     const requestCountBeforeCwdChange = daemon.sessionFileRequests.length;
-    daemon.setSessionFilePosition(sessionId, "/tmp/work");
+    daemon.pushSessionCwdChanged(sessionId, "/tmp/work");
     await waitFor(
       () => {
         expect(daemon.sessionFileRequests.slice(requestCountBeforeCwdChange)).toContainEqual({
           session_id: sessionId,
         });
       },
-      { timeout: 6500 },
+      { timeout: 1500 },
     );
     await within(panel).findByText("beta.log");
     await waitFor(() => expect(within(panel).getByLabelText("Current directory")).toHaveValue("/tmp/work"));
@@ -6077,10 +5957,9 @@ describe("termui web 工作台", () => {
     await user.click(followToggle);
     expect(followToggle).not.toBeChecked();
     const requestCountAfterDisable = daemon.sessionFileRequests.length;
-    daemon.setSessionFilePosition(sessionId, "/home/me");
-    await new Promise((resolve) => window.setTimeout(resolve, 5200));
-    // 中文注释：HTTP control 请求可能在关闭 Follow 前已经发出；这里验证更关键的不变量：
-    // 关闭后的迟到 cwd 结果不能再把文件面板从用户停留的目录覆盖回 terminal cwd。
+    daemon.pushSessionCwdChanged(sessionId, "/home/me");
+    await new Promise((resolve) => window.setTimeout(resolve, 200));
+    // 关闭 Follow 后，metadata cwd 更新不能覆盖用户停留的目录。
     expect(
       daemon.sessionFileRequests
         .slice(requestCountAfterDisable)
@@ -7284,9 +7163,7 @@ describe("termui web 工作台", () => {
 
     await user.click(screen.getByRole("button", { name: "Close session" }));
 
-    await waitFor(() => {
-      expect(screen.queryByText(sessionId)).toBeNull();
-    });
+    await waitFor(() => expect(visibleSessionNames()).toEqual([]));
     expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
     expect(daemon.closedSessions).toEqual([]);
   });
@@ -7318,14 +7195,12 @@ describe("termui web 工作台", () => {
 
     await user.click(screen.getByRole("button", { name: "Close session" }));
 
-    await waitFor(() => {
-      expect(screen.queryByText(DEFAULT_SESSION_NAME)).toBeNull();
-    });
+    await waitFor(() => expect(visibleSessionNames()).toEqual([]));
     expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
     expect(daemon.closedSessions).toEqual([DEFAULT_SESSION_ID]);
   });
 
-  it("关闭当前已 attach 的 session 时 connection_closed 不会被当成关闭成功", async () => {
+  it("terminal WebSocket 已断开时仍通过 JSON close 关闭当前 session", async () => {
     const user = userEvent.setup();
     render(<App />);
 
@@ -7341,11 +7216,9 @@ describe("termui web 工作台", () => {
     await waitFor(() => expect(daemon.activeConnectionCount()).toBe(0));
     await user.click(screen.getByRole("button", { name: "Close session" }));
 
-    const workspaceBody = document.querySelector<HTMLElement>(".workspace-body");
-    expect(workspaceBody).not.toBeNull();
-    await within(workspaceBody!).findByRole("alert", { name: "Connection error" });
-    expect(screen.queryAllByText(DEFAULT_SESSION_NAME).length).toBeGreaterThan(0);
-    expect(daemon.closedSessions).toEqual([]);
+    await waitFor(() => expect(visibleSessionNames()).toEqual([]));
+    expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
+    expect(daemon.closedSessions).toEqual([DEFAULT_SESSION_ID]);
   });
 
   it("关闭 session 会取消合并窗口里的迟到 attach，避免已关闭 session 被本地复活", async () => {
@@ -7400,18 +7273,16 @@ describe("termui web 工作台", () => {
     const betaWatchedAttachRequests = daemon.attachRequests.filter(
       (request) => request.session_id === betaSession.session_id && request.watch_updates !== false,
     );
-    const betaPermissionAttachRequests = daemon.attachRequests.filter(
-      (request) => request.session_id === betaSession.session_id && request.watch_updates === false,
-    );
-
     expect(daemon.closedSessions).toEqual([betaSession.session_id]);
     expect(betaWatchedAttachRequests).toHaveLength(0);
-    expect(betaPermissionAttachRequests).toEqual([{ session_id: betaSession.session_id, watch_updates: false }]);
+    expect(
+      daemon.receivedHttpRequests.filter((request) => request.path === `/api/control/session/${betaSession.session_id}/close`),
+    ).toHaveLength(1);
     expect(daemon.attachedSessions).toEqual([]);
     expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
   });
 
-  it("shared-control attach 后持续发送终端输入、光标位置和聚焦状态", async () => {
+  it("shared-control attach 后持续发送终端输入和 PTY resize", async () => {
     const user = userEvent.setup();
       const restoreTerminalLayout = mockTerminalLayout({
         viewportWidth: 600,
@@ -7450,16 +7321,8 @@ describe("termui web 工作台", () => {
         expect(terminalInput).not.toBeNull();
       });
       expect(screen.queryByRole("button", { name: /zoom/i })).toBeNull();
-      // 中文注释：历史 session attach 后桌面端也会主动 focus 一次，用当前容器尺寸恢复 PTY；
-      // 这覆盖浏览器重新打开页面后停在旧 24/80 尺寸的问题。
-      await waitFor(() =>
-        expect(daemon.sessionCursorUpdates).toContainEqual({
-          session_id: "00000000-0000-0000-0000-000000000402",
-          row: expect.any(Number),
-          col: expect.any(Number),
-          focused: true,
-        }),
-      );
+      // 中文注释：cursor 只存在于初始 snapshot，后续位置由 PTY 输出推进；
+      // 浏览器 focus 不再通过独立 HTTP control 上报。
       await waitFor(() =>
         expect(daemon.sessionResizes).toContainEqual({
           session_id: "00000000-0000-0000-0000-000000000402",
@@ -7476,20 +7339,14 @@ describe("termui web 工作台", () => {
       fireEvent.input(terminalInput!);
 
       await waitFor(() => expect(daemon.sessionDataMessages).toEqual(["first-terminal-secret", "second-terminal-secret"]));
-      expect(daemon.sessionCursorUpdates.length).toBeGreaterThan(0);
       terminalInput!.blur();
-      await waitFor(() =>
-        expect(daemon.sessionCursorUpdates).toContainEqual({
-          session_id: "00000000-0000-0000-0000-000000000402",
-          row: expect.any(Number),
-          col: expect.any(Number),
-          focused: false,
-        }),
-      );
       const resizeCountAfterBlur = daemon.sessionResizes.length;
       fireEvent(window, new Event("focus"));
       terminalInput!.focus();
       expect(daemon.sessionResizes).toHaveLength(resizeCountAfterBlur);
+      expect(
+        daemon.receivedHttpRequests.some((request) => request.path.endsWith("/cursor")),
+      ).toBe(false);
       expect(screen.queryByRole("button", { name: /zoom/i })).toBeNull();
       fireEvent(window, new Event("resize"));
       expect(daemon.sessionResizes).toHaveLength(resizeCountAfterBlur);
@@ -7660,16 +7517,7 @@ describe("termui web 工作台", () => {
       expect(terminalInput).not.toBeNull();
     });
     terminalInput!.focus();
-    await waitFor(() =>
-      expect(daemon.sessionCursorUpdates).toContainEqual({
-        session_id: "00000000-0000-0000-0000-000000000404",
-        row: expect.any(Number),
-        col: expect.any(Number),
-        focused: true,
-      }),
-    );
 
-    daemon.sessionCursorUpdates.length = 0;
     (globalThis as { __TERMD_TEST_FIT_DIMENSIONS__?: { rows: number; cols: number } }).__TERMD_TEST_FIT_DIMENSIONS__ = {
       rows: 30,
       cols: 100,
@@ -7682,7 +7530,10 @@ describe("termui web 工作台", () => {
         size: { rows: 30, cols: 100, pixel_width: expect.any(Number), pixel_height: expect.any(Number) },
       }),
     );
-    expect(daemon.sessionCursorUpdates.map((update) => update.focused)).not.toContain(false);
+    expect(document.activeElement).toBe(terminalInput);
+    expect(
+      daemon.receivedHttpRequests.some((request) => request.path.endsWith("/cursor")),
+    ).toBe(false);
   });
 
   it("前端发出 resize 请求后等 daemon 确认才更新 session 尺寸", async () => {
@@ -7733,7 +7584,7 @@ describe("termui web 工作台", () => {
     expect(screen.queryByText("80x24")).toBeNull();
   });
 
-  it("持续输出场景下 resize ack 超时不卸载已 attach 终端", async () => {
+  it("持续输出场景下 resize ack 延迟不卸载已 attach 终端", async () => {
     const user = userEvent.setup();
     await daemon.stop();
     daemon = await MockDaemon.start({
@@ -7748,7 +7599,6 @@ describe("termui web 工作台", () => {
         },
       ],
     });
-    enableTermdDiagnosticsForTest();
     render(<App />);
 
     await pairWithInvite(user, daemon);
@@ -7771,23 +7621,19 @@ describe("termui web 工作台", () => {
         size: { rows: 31, cols: 101, pixel_width: expect.any(Number), pixel_height: expect.any(Number) },
       }),
     );
-    await waitForSidecarTimeoutIgnored("resize", "00000000-0000-0000-0000-000000000408");
-
-    // 中文注释：resize/cursor 这类终端辅助 RPC 的 ack 可能被持续 stdout 压到超时；
-    // 超时只能丢弃本次辅助 ack，不能把 workspace 置为全局错误导致 xterm 卸载。
+    // resize 在 terminal WebSocket 上等待服务端 frame 确认；确认延迟不能卸载 xterm。
     expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
     expect(document.body.textContent).not.toContain("response_timeout");
     expect(screen.getByText(/resize-timeout-ready/)).toBeInTheDocument();
     expect(document.querySelector('textarea[aria-label="Terminal input"]')).not.toBeNull();
-  }, 15_000);
+  });
 
-  it("持续输出场景下 cursor ack 超时不卸载已 attach 终端", async () => {
+  it("终端聚焦不发送 cursor HTTP 且不影响已 attach 终端", async () => {
     const user = userEvent.setup();
     await daemon.stop();
     daemon = await MockDaemon.start({
       token: "secret-token",
       attachOutput: "cursor-timeout-ready\n",
-      cursorAckDelayMs: APP_CONNECTION_TIMEOUT_MS + 700,
       sessions: [
         {
           session_id: "00000000-0000-0000-0000-000000000409",
@@ -7796,7 +7642,6 @@ describe("termui web 工作台", () => {
         },
       ],
     });
-    enableTermdDiagnosticsForTest();
     render(<App />);
 
     await pairWithInvite(user, daemon);
@@ -7807,22 +7652,18 @@ describe("termui web 工作台", () => {
     const terminalInput = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
     expect(terminalInput).not.toBeNull();
     terminalInput!.focus();
-    await waitFor(() =>
-      expect(daemon.sessionCursorUpdates).toContainEqual({
-        session_id: "00000000-0000-0000-0000-000000000409",
-        row: expect.any(Number),
-        col: expect.any(Number),
-        focused: true,
-      }),
-    );
-    await waitForSidecarTimeoutIgnored("cursor", "00000000-0000-0000-0000-000000000409");
 
-    // 中文注释：cursor ack 超时只表示协作元数据迟到，不能把 terminal WebSocket 判死。
+    expect(
+      daemon.receivedHttpRequests.some((request) => request.path.endsWith("/cursor")),
+    ).toBe(false);
     expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
     expect(document.body.textContent).not.toContain("response_timeout");
     expect(screen.getByText(/cursor-timeout-ready/)).toBeInTheDocument();
     expect(document.querySelector('textarea[aria-label="Terminal input"]')).not.toBeNull();
-  }, 15_000);
+    terminalInput!.value = "after-focus-input";
+    fireEvent.input(terminalInput!);
+    await waitFor(() => expect(daemon.sessionDataMessages).toContain("after-focus-input"));
+  });
 
   it("session.resize 的 HTTP control 瞬时失败不升级成全局断线", async () => {
     const user = userEvent.setup();
@@ -7872,7 +7713,7 @@ describe("termui web 工作台", () => {
     await waitFor(() => expect(daemon.sessionDataMessages).toContain("after-resize-http-close"));
   });
 
-  it("session.cursor 的 HTTP control 瞬时失败不升级成全局断线", async () => {
+  it("终端 focus 不调用 session.cursor HTTP control", async () => {
     const user = userEvent.setup();
     await daemon.stop();
     daemon = await MockDaemon.start({
@@ -7893,23 +7734,15 @@ describe("termui web 工作台", () => {
     await screen.findByText(/cursor-http-closed-ready/);
     await clickSessionCard(user);
 
-    daemon.closeNextSessionCursorRequests(1);
     const terminalInput = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
     expect(terminalInput).not.toBeNull();
     terminalInput!.focus();
 
-    await waitFor(() =>
-      expect(daemon.sessionCursorUpdates).toContainEqual({
-        session_id: "00000000-0000-0000-0000-00000000040b",
-        row: expect.any(Number),
-        col: expect.any(Number),
-        focused: true,
-      }),
-    );
     await new Promise((resolve) => window.setTimeout(resolve, 80));
 
-    // 中文注释：cursor presence 是共享协作元数据；HTTP control fetch 被瞬时断开后，
-    // 当前 terminal stream 和后续输入必须继续可用。
+    expect(
+      daemon.receivedHttpRequests.some((request) => request.path.endsWith("/cursor")),
+    ).toBe(false);
     expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
     expect(document.body.textContent).not.toContain("mock session cursor closed");
     terminalInput!.value = "after-cursor-http-close";
@@ -7962,7 +7795,7 @@ describe("termui web 工作台", () => {
     }
   });
 
-  it("session.cursor 的 HTTP control 返回 http_file_transfer_failed 时不升级成全局断线", async () => {
+  it("终端 focus 不依赖 session.cursor HTTP 响应", async () => {
     const user = userEvent.setup();
     await daemon.stop();
     daemon = await MockDaemon.start({
@@ -7983,35 +7816,21 @@ describe("termui web 工作台", () => {
     await screen.findByText(/cursor-http-file-transfer-ready/);
     await clickSessionCard(user);
 
-    const restoreFetch = installHttpControlFailureOnceMock("/api/control/session/00000000-0000-0000-0000-00000000040d/cursor");
-    try {
-      const terminalInput = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
-      expect(terminalInput).not.toBeNull();
-      terminalInput!.focus();
+    const terminalInput = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
+    expect(terminalInput).not.toBeNull();
+    terminalInput!.focus();
+    await new Promise((resolve) => window.setTimeout(resolve, 80));
 
-      await waitFor(() =>
-        expect(daemon.sessionCursorUpdates).toContainEqual({
-          session_id: "00000000-0000-0000-0000-00000000040d",
-          row: expect.any(Number),
-          col: expect.any(Number),
-          focused: true,
-        }),
-      );
-      await new Promise((resolve) => window.setTimeout(resolve, 80));
-
-      // 中文注释：cursor 的 HTTP control 若被归一成 http_file_transfer_failed，
-      // 也只是协作元数据失败，终端与后续输入仍必须保持可用。
-      expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
-      expect(document.body.textContent).not.toContain("http_file_transfer_failed");
-      terminalInput!.value = "after-cursor-http-file-transfer-failed";
-      fireEvent.input(terminalInput!);
-      await waitFor(() => expect(daemon.sessionDataMessages).toContain("after-cursor-http-file-transfer-failed"));
-    } finally {
-      restoreFetch();
-    }
+    expect(
+      daemon.receivedHttpRequests.some((request) => request.path.endsWith("/cursor")),
+    ).toBe(false);
+    expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
+    terminalInput!.value = "after-focus-without-cursor-http";
+    fireEvent.input(terminalInput!);
+    await waitFor(() => expect(daemon.sessionDataMessages).toContain("after-focus-without-cursor-http"));
   });
 
-  it("浏览器窗口 resize 引发的短暂 focusout/focusin 不会上报聚焦抖动", async () => {
+  it("浏览器窗口 resize 引发的短暂 focusout/focusin 不创建 cursor HTTP", async () => {
     const user = userEvent.setup();
     await daemon.stop();
     daemon = await MockDaemon.start({
@@ -8036,16 +7855,7 @@ describe("termui web 工作台", () => {
       expect(terminalInput).not.toBeNull();
     });
     terminalInput!.focus();
-    await waitFor(() =>
-      expect(daemon.sessionCursorUpdates).toContainEqual({
-        session_id: "00000000-0000-0000-0000-000000000405",
-        row: expect.any(Number),
-        col: expect.any(Number),
-        focused: true,
-      }),
-    );
 
-    daemon.sessionCursorUpdates.length = 0;
     fireEvent(window, new Event("resize"));
     // 真实浏览器在拖动窗口边界时可能短暂让 xterm textarea 失焦，随后又恢复焦点；
     // 这类 resize 伴随的瞬时 DOM focus 抖动不应变成 operator 的 focused/blurred 抖动。
@@ -8054,10 +7864,10 @@ describe("termui web 工作台", () => {
     terminalInput!.focus();
     await new Promise((resolve) => window.setTimeout(resolve, 180));
 
-    const focusUpdates = daemon.sessionCursorUpdates
-      .filter((update) => update.session_id === "00000000-0000-0000-0000-000000000405")
-      .map((update) => update.focused);
-    expect(focusUpdates).not.toContain(false);
+    expect(document.activeElement).toBe(terminalInput);
+    expect(
+      daemon.receivedHttpRequests.some((request) => request.path.endsWith("/cursor")),
+    ).toBe(false);
   });
 
   it("terminal frame 渲染后不发送 flow packet", async () => {
@@ -8258,26 +8068,10 @@ describe("termui web 工作台", () => {
       expect(terminalInput).not.toBeNull();
     });
     terminalInput!.focus();
-    await waitFor(() =>
-      expect(daemon.sessionCursorUpdates).toContainEqual({
-        session_id: "00000000-0000-0000-0000-000000000408",
-        row: expect.any(Number),
-        col: expect.any(Number),
-        focused: true,
-      }),
-    );
 
-    daemon.sessionCursorUpdates.length = 0;
     const resizeCountAfterFocus = daemon.sessionResizes.length;
     fireEvent(window, new Event("blur"));
-    await waitFor(() =>
-      expect(daemon.sessionCursorUpdates).toContainEqual({
-        session_id: "00000000-0000-0000-0000-000000000408",
-        row: expect.any(Number),
-        col: expect.any(Number),
-        focused: false,
-      }),
-    );
+    await new Promise((resolve) => window.setTimeout(resolve, 80));
 
     (globalThis as { __TERMD_TEST_FIT_DIMENSIONS__?: { rows: number; cols: number } }).__TERMD_TEST_FIT_DIMENSIONS__ = {
       rows: 30,
@@ -8287,6 +8081,9 @@ describe("termui web 工作台", () => {
     await new Promise((resolve) => window.setTimeout(resolve, 160));
 
     expect(daemon.sessionResizes).toHaveLength(resizeCountAfterFocus);
+    expect(
+      daemon.receivedHttpRequests.some((request) => request.path.endsWith("/cursor")),
+    ).toBe(false);
     expect(screen.queryByRole("button", { name: /zoom/i })).toBeNull();
   });
 
@@ -8315,23 +8112,8 @@ describe("termui web 工作台", () => {
       expect(firstTerminalInput).not.toBeNull();
     });
     firstTerminalInput!.focus();
-    await waitFor(() =>
-      expect(daemon.sessionCursorUpdates).toContainEqual({
-        session_id: "00000000-0000-0000-0000-000000000409",
-        row: expect.any(Number),
-        col: expect.any(Number),
-        focused: true,
-      }),
-    );
     fireEvent(window, new Event("blur"));
-    await waitFor(() =>
-      expect(daemon.sessionCursorUpdates).toContainEqual({
-        session_id: "00000000-0000-0000-0000-000000000409",
-        row: expect.any(Number),
-        col: expect.any(Number),
-        focused: false,
-      }),
-    );
+    await new Promise((resolve) => window.setTimeout(resolve, 80));
 
     const resizeCountAfterBlur = daemon.sessionResizes.length;
     const secondRender = render(<App />);

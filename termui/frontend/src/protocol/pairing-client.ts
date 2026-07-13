@@ -28,8 +28,17 @@ export async function pairDeviceOverHttp(
         device_certificate?: string;
         error?: { code?: string; message?: string };
       };
-      if (!response.ok || body.server_id !== routeServerId || !body.device_certificate) {
+      if (!response.ok) {
         throw new ProtocolClientError(body.error?.code ?? "pairing_failed", body.error?.message ?? "pairing failed");
+      }
+      if (body.server_id !== routeServerId) {
+        throw new ProtocolClientError(
+          "pairing_payload_server_mismatch",
+          "pairing payload does not match the connected daemon",
+        );
+      }
+      if (!body.device_certificate) {
+        throw new ProtocolClientError("pairing_failed", "pairing failed");
       }
       return {
         accepted: {

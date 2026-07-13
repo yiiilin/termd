@@ -1060,6 +1060,10 @@ export default function App() {
     }
   }, []);
 
+  useEffect(() => {
+    return () => cancelScheduledAttachSwitch();
+  }, [cancelScheduledAttachSwitch]);
+
   const closeAttachForReconnect = useCallback((client?: V070Client) => {
     const belongsToCurrentAttach =
       !client ||

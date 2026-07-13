@@ -4,6 +4,8 @@ use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
+use std::os::unix::fs::DirBuilderExt;
+#[cfg(unix)]
 use std::os::unix::net::UnixStream as StdUnixStream;
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
@@ -30,16 +32,66 @@ use termd::session::TerminalSize;
 use termd::state::{DaemonIdentitySnapshot, DaemonState, SessionStateRecord, StateStore};
 use termd_proto::{PublicKey, ServerId, SessionId, SessionState, UnixTimestampMillis};
 
-fn temp_state_path(name: &str) -> PathBuf {
+struct TestStatePath {
+    root: PathBuf,
+    path: PathBuf,
+}
+
+fn create_test_root(_name: &str) -> PathBuf {
+    static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+
+    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!(
+        "termd-session-supervisor-test-{}-{id}",
+        std::process::id()
+    ));
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    builder.mode(0o700);
+    builder.create(&root).unwrap();
+    root
+}
+
+impl TestStatePath {
+    fn new(name: &str) -> Self {
+        let root = create_test_root(name);
+        let path = root.join(name);
+        Self { root, path }
+    }
+}
+
+impl std::ops::Deref for TestStatePath {
+    type Target = Path;
+
+    fn deref(&self) -> &Self::Target {
+        &self.path
+    }
+}
+
+impl AsRef<Path> for TestStatePath {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl AsRef<std::ffi::OsStr> for TestStatePath {
+    fn as_ref(&self) -> &std::ffi::OsStr {
+        self.path.as_os_str()
+    }
+}
+
+impl Drop for TestStatePath {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+fn temp_state_path(name: &str) -> TestStatePath {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    std::env::temp_dir().join(format!(
-        "termd-session-supervisor-test-{}-{}-{name}",
-        std::process::id(),
-        nanos
-    ))
+    TestStatePath::new(&format!("{nanos}-{name}"))
 }
 
 #[derive(Clone)]
@@ -384,8 +436,7 @@ struct TestStateDirectory {
 
 impl TestStateDirectory {
     fn new(name: &str) -> Self {
-        let path = temp_state_path(name);
-        fs::create_dir(&path).unwrap();
+        let path = create_test_root(name);
         Self { path }
     }
 
@@ -1587,8 +1638,7 @@ fn real_064_closing_repeated_migration_after_install_response_loss() {
         },
     )
     .unwrap();
-    let checkpoint_dir = temp_state_path("legacy-closing-repeat-checkpoints");
-    fs::create_dir_all(&checkpoint_dir).unwrap();
+    let checkpoint_dir = TestStateDirectory::new("legacy-closing-repeat-checkpoints");
     let marker = checkpoint_dir.join("after_legacy_cleaning_commit.reached");
     let mut child = ProcessCommand::new(std::env::current_exe().unwrap())
         .args([
@@ -1598,21 +1648,36 @@ fn real_064_closing_repeated_migration_after_install_response_loss() {
             "--nocapture",
         ])
         .env("TERMD_TEST_CRASH_STATE", &state_path)
-        .env("TERMD_TEST_OWNERSHIP_CHECKPOINT_DIR", &checkpoint_dir)
+        .env("TERMD_TEST_OWNERSHIP_CHECKPOINT_DIR", &checkpoint_dir.path)
         .env(
             "TERMD_TEST_OWNERSHIP_CHECKPOINT",
             "after_legacy_cleaning_commit",
         )
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     while !marker.exists() {
-        assert!(
-            child.try_wait().unwrap().is_none(),
-            "legacy migration child exited before cleaning checkpoint"
-        );
+        if let Some(status) = child.try_wait().unwrap() {
+            let mut stdout = String::new();
+            child
+                .stdout
+                .take()
+                .unwrap()
+                .read_to_string(&mut stdout)
+                .unwrap();
+            let mut stderr = String::new();
+            child
+                .stderr
+                .take()
+                .unwrap()
+                .read_to_string(&mut stderr)
+                .unwrap();
+            panic!(
+                "legacy migration child exited before cleaning checkpoint: {status}: stdout={stdout:?} stderr={stderr:?}"
+            );
+        }
         assert!(
             Instant::now() < deadline,
             "legacy cleaning checkpoint timed out"
@@ -1655,7 +1720,6 @@ fn real_064_closing_repeated_migration_after_install_response_loss() {
     }
     drop(protocol);
     wait_until_linux_process_is_reaped(supervisor_pid);
-    fs::remove_dir_all(checkpoint_dir).unwrap();
     let _ = fs::remove_file(pid_file);
 }
 
