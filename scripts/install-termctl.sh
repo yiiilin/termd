@@ -30,6 +30,31 @@ require_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
 }
 
+normalize_proxy_pair() {
+  local lower_name="$1"
+  local upper_name="$2"
+  local value
+
+  if [[ -v "$lower_name" ]]; then
+    value="${!lower_name}"
+  elif [[ -v "$upper_name" ]]; then
+    value="${!upper_name}"
+  else
+    return 0
+  fi
+
+  printf -v "$lower_name" '%s' "$value"
+  printf -v "$upper_name" '%s' "$value"
+  export "$lower_name" "$upper_name"
+}
+
+normalize_proxy_environment() {
+  normalize_proxy_pair http_proxy HTTP_PROXY
+  normalize_proxy_pair https_proxy HTTPS_PROXY
+  normalize_proxy_pair all_proxy ALL_PROXY
+  normalize_proxy_pair no_proxy NO_PROXY
+}
+
 require_root() {
   if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
     die "please run this installer with sudo/root so it can write to ${INSTALL_PREFIX}/bin"
@@ -45,6 +70,9 @@ Install termctl CLI.
 Options:
   --uninstall                 Remove the termctl binary.
   -h, --help                  Print this help.
+
+Installer network access honors http_proxy, https_proxy, all_proxy and no_proxy,
+plus their uppercase variants. Lowercase values take precedence when both are set.
 
 Examples:
   curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termctl.sh | sudo bash
@@ -188,6 +216,7 @@ uninstall_component() {
 
 main() {
   parse_args "$@"
+  normalize_proxy_environment
   require_root
   if [[ "$ACTION" == "uninstall" ]]; then
     uninstall_component

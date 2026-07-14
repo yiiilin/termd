@@ -12,7 +12,12 @@ BIN_NAME="termd"
 SERVICE_NAME="termd"
 INSTALL_PREFIX="${TERMD_INSTALL_PREFIX:-/usr/local}"
 if [[ -z "${ROOT_DIR:-}" ]]; then
-  ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+  if [[ -n "${BASH_SOURCE[0]:-}" ]]; then
+    ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+  else
+    # Release installers are commonly piped to `bash -s`, where BASH_SOURCE has no entry.
+    ROOT_DIR="$PWD"
+  fi
 fi
 REPO="${TERMD_GITHUB_REPO:-${GITHUB_REPOSITORY:-}}"
 VERSION="${TERMD_VERSION:-}"
@@ -51,6 +56,7 @@ INSTALL_SERVICE_WAS_ACTIVE=0
 INSTALL_SERVICE_WAS_ENABLED=0
 INSTALL_ROLLBACK_DIR=""
 INSTALL_BINARY_COMMITTED=0
+SUPERVISOR_VERSION_PERSIST_DEFERRED=0
 
 # 只有用户显式传入 TERMD_SUPERVISOR_VERSION 或 --supervisor-version 时，
 # supervisor 版本才表示兼容性切换请求；release 脚本中的默认值不能触发清 session。
@@ -78,6 +84,31 @@ die() {
 
 require_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
+}
+
+normalize_proxy_pair() {
+  local lower_name="$1"
+  local upper_name="$2"
+  local value
+
+  if [[ -v "$lower_name" ]]; then
+    value="${!lower_name}"
+  elif [[ -v "$upper_name" ]]; then
+    value="${!upper_name}"
+  else
+    return 0
+  fi
+
+  printf -v "$lower_name" '%s' "$value"
+  printf -v "$upper_name" '%s' "$value"
+  export "$lower_name" "$upper_name"
+}
+
+normalize_proxy_environment() {
+  normalize_proxy_pair http_proxy HTTP_PROXY
+  normalize_proxy_pair https_proxy HTTPS_PROXY
+  normalize_proxy_pair all_proxy ALL_PROXY
+  normalize_proxy_pair no_proxy NO_PROXY
 }
 
 is_enabled() {
@@ -170,6 +201,9 @@ Options:
   --purge                       Implies --uninstall; also remove /var/lib/termd and system user.
   -h, --help                    Print this help.
 
+Installer network access honors http_proxy, https_proxy, all_proxy and no_proxy,
+plus their uppercase variants. Lowercase values take precedence when both are set.
+
 Examples:
   curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termd.sh | sudo bash -s -- --web
   curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termd.sh | sudo bash -s -- --web --user alice
@@ -239,6 +273,8 @@ parse_args() {
         ;;
       --proxy|--relay-proxy)
         [[ $# -ge 2 && -n "$2" ]] || die "$1 requires a non-empty value"
+        http_proxy="$2"
+        https_proxy="$2"
         HTTP_PROXY="$2"
         HTTPS_PROXY="$2"
         INSTALL_SET_PROXY=1
@@ -398,6 +434,75 @@ try:
     conn.commit()
 finally:
     conn.close()
+PY
+}
+
+repair_installer_poisoned_state_db() {
+  local sqlite_path="$1"
+  local supervisor_dir="$2"
+
+  [[ -f "$sqlite_path" ]] || return 1
+  python3 - "$sqlite_path" "$supervisor_dir" <<'PY'
+import sqlite3
+import stat
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1]).resolve()
+supervisor_dir = Path(sys.argv[2]).resolve()
+allowed_tables = {
+    "daemon_meta",
+    "trusted_devices",
+    "runtime_sessions",
+    "http_uploads",
+    "daemon_clients",
+    "daemon_client_attached_sessions",
+    "daemon_sessions",
+    "session_ownership",
+}
+
+
+def has_supervisor_socket() -> bool:
+    try:
+        return any(
+            stat.S_ISSOCK(entry.stat(follow_symlinks=False).st_mode)
+            for entry in supervisor_dir.iterdir()
+        )
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+
+
+try:
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+            )
+        }
+        if "daemon_meta" not in tables or not tables.issubset(allowed_tables):
+            raise RuntimeError("unexpected state tables")
+        meta_keys = {row[0] for row in conn.execute("SELECT key FROM daemon_meta")}
+        if meta_keys != {"supervisor_version"}:
+            raise RuntimeError("unexpected daemon metadata")
+        for table in sorted(tables - {"daemon_meta"}):
+            if conn.execute(f'SELECT 1 FROM "{table}" LIMIT 1').fetchone() is not None:
+                raise RuntimeError("state database contains user data")
+        if has_supervisor_socket():
+            raise RuntimeError("live supervisor socket exists")
+        conn.execute("DELETE FROM daemon_meta WHERE key = 'supervisor_version'")
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+except (OSError, RuntimeError, sqlite3.Error):
+    raise SystemExit(1)
 PY
 }
 
@@ -1149,6 +1254,7 @@ complete_install_after_binary_commit() {
   systemctl daemon-reload || return $?
   systemctl enable "$SERVICE_NAME" || return $?
   systemctl restart "$SERVICE_NAME" || return $?
+  persist_deferred_supervisor_version || return $?
 }
 
 install_staged_candidate() {
@@ -1192,22 +1298,60 @@ cleanup_install_staging() {
 }
 
 persist_supervisor_version() {
-  local sqlite_path
+  local sqlite_path schema_version
   sqlite_path="${STATE_DIR}/daemon-state.sqlite"
 
   if [[ "$SUPERVISOR_VERSION_NEEDS_RUNTIME_CLEAR" -eq 1 ]]; then
     clear_runtime_session_state_for_supervisor_upgrade "$sqlite_path" "${STATE_DIR}/termd-supervisors"
   fi
 
-  # 首次安装或被测试桩替换掉系统用户创建逻辑时，state 目录未必已经存在。
-  # 这种情况下不应因为 SQLite baseline 写入失败直接中断安装；daemon 启动后会按需补齐。
-  if [[ ! -d "$STATE_DIR" ]]; then
+  if [[ "$INSTALL_SET_SUPERVISOR_VERSION" -ne 1 ]]; then
     return 0
   fi
 
-  if [[ "$INSTALL_SET_SUPERVISOR_VERSION" -eq 1 ]]; then
-    upsert_sqlite_meta_value "$sqlite_path" "supervisor_version" "$SUPERVISOR_VERSION"
+  # The daemon owns initial schema creation. Writing daemon_meta into a missing database here
+  # makes the daemon treat fresh state as an incompatible legacy database.
+  if [[ ! -f "$sqlite_path" ]]; then
+    SUPERVISOR_VERSION_PERSIST_DEFERRED=1
+    return 0
   fi
+
+  schema_version="$(read_sqlite_meta_value "$sqlite_path" "state_schema_version")"
+  if [[ -z "$schema_version" ]]; then
+    if ! repair_installer_poisoned_state_db "$sqlite_path" "${STATE_DIR}/termd-supervisors"; then
+      log "state database has no state_schema_version and is not an empty installer-created database; leaving it unchanged"
+      return 1
+    fi
+    log "recovered incomplete supervisor metadata left by an earlier fresh installation"
+    SUPERVISOR_VERSION_PERSIST_DEFERRED=1
+    return 0
+  fi
+
+  upsert_sqlite_meta_value "$sqlite_path" "supervisor_version" "$SUPERVISOR_VERSION"
+}
+
+persist_deferred_supervisor_version() {
+  local sqlite_path schema_version
+
+  if [[ "$SUPERVISOR_VERSION_PERSIST_DEFERRED" -ne 1 ]]; then
+    return 0
+  fi
+
+  sqlite_path="${STATE_DIR}/daemon-state.sqlite"
+  for _ in {1..40}; do
+    schema_version="$(read_sqlite_meta_value "$sqlite_path" "state_schema_version")"
+    if [[ -n "$schema_version" ]]; then
+      upsert_sqlite_meta_value "$sqlite_path" "supervisor_version" "$SUPERVISOR_VERSION" || return $?
+      # The root-run SQLite writer may create or replace WAL/SHM sidecars.
+      chown_state_dir || return $?
+      SUPERVISOR_VERSION_PERSIST_DEFERRED=0
+      return 0
+    fi
+    sleep 0.25
+  done
+
+  log "daemon state schema was not initialized after ${SERVICE_NAME}.service started"
+  return 1
 }
 
 stop_service_before_supervisor_runtime_clear() {
@@ -1747,6 +1891,7 @@ uninstall_component() {
 
 main() {
   parse_args "$@"
+  normalize_proxy_environment
   require_root
   inherit_existing_service_identity
   if [[ "$ACTION" == "uninstall" ]]; then

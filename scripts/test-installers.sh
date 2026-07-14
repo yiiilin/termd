@@ -141,6 +141,186 @@ load_update_local_functions() {
   source <(sed '/^main "\$@"/,$d' "${ROOT_DIR}/scripts/update-local-termd.sh")
 }
 
+test_installers_normalize_standard_proxy_environment() (
+  local script
+
+  for script in install-termd.sh install-termrelay.sh install-termctl.sh; do
+    (
+      unset http_proxy HTTP_PROXY https_proxy HTTPS_PROXY all_proxy ALL_PROXY no_proxy NO_PROXY
+      http_proxy="http://lower-proxy.example:3128"
+      HTTP_PROXY="http://upper-proxy.example:3128"
+      https_proxy="http://secure-proxy.example:3128"
+      ALL_PROXY="socks5h://socks-proxy.example:1080"
+      no_proxy="127.0.0.1,localhost"
+      export http_proxy HTTP_PROXY https_proxy ALL_PROXY no_proxy
+
+      # shellcheck source=/dev/null
+      source <(sed '/^main "\$@"/,$d' "${ROOT_DIR}/scripts/${script}")
+      normalize_proxy_environment
+
+      [[ "$http_proxy" == "http://lower-proxy.example:3128" ]]
+      [[ "$HTTP_PROXY" == "$http_proxy" ]]
+      [[ "$HTTPS_PROXY" == "$https_proxy" ]]
+      [[ "$all_proxy" == "$ALL_PROXY" ]]
+      [[ "$NO_PROXY" == "$no_proxy" ]]
+      bash -c '[[ "$HTTP_PROXY" == "$http_proxy" && "$HTTPS_PROXY" == "$https_proxy" && "$ALL_PROXY" == "$all_proxy" && "$NO_PROXY" == "$no_proxy" ]]'
+    )
+  done
+)
+
+test_termd_installer_supports_stdin_pipe_execution() (
+  local output
+
+  output="$(cat "${ROOT_DIR}/scripts/install-termd.sh" | bash -s -- --help 2>&1)"
+  [[ "$output" == *"usage: install-termd.sh"* ]]
+  if [[ "$output" == *"BASH_SOURCE"* || "$output" == *"unbound variable"* ]]; then
+    printf 'termd installer emitted an error when executed from stdin:\n%s\n' "$output" >&2
+    return 1
+  fi
+)
+
+test_termd_fresh_install_initializes_schema_before_supervisor_baseline() (
+  load_termd_installer_functions
+
+  local tmp_dir sqlite_path
+  tmp_dir="$(mktemp -d)"
+  trap 'rm -rf "$tmp_dir"' EXIT
+  STATE_DIR="${tmp_dir}/state"
+  sqlite_path="${STATE_DIR}/daemon-state.sqlite"
+  mkdir -p "$STATE_DIR"
+  INSTALL_SET_SUPERVISOR_VERSION=1
+  SUPERVISOR_VERSION="test-supervisor-version"
+  SUPERVISOR_VERSION_NEEDS_RUNTIME_CLEAR=0
+  chown_state_dir() { :; }
+
+  persist_supervisor_version
+  [[ "$SUPERVISOR_VERSION_PERSIST_DEFERRED" -eq 1 && ! -e "$sqlite_path" ]]
+  initialize_fake_daemon_schema "$sqlite_path"
+  persist_deferred_supervisor_version
+
+  [[ "$(read_sqlite_meta_value "$sqlite_path" state_schema_version)" == 3 ]]
+  [[ "$(read_sqlite_meta_value "$sqlite_path" supervisor_version)" == test-supervisor-version ]]
+)
+
+test_termd_reinstall_recovers_installer_poisoned_state() (
+  load_termd_installer_functions
+
+  local tmp_dir sqlite_path
+  tmp_dir="$(mktemp -d)"
+  trap 'rm -rf "$tmp_dir"' EXIT
+  STATE_DIR="${tmp_dir}/state"
+  sqlite_path="${STATE_DIR}/daemon-state.sqlite"
+  seed_installer_poisoned_state_db "$sqlite_path"
+  INSTALL_SET_SUPERVISOR_VERSION=1
+  SUPERVISOR_VERSION="test-supervisor-version"
+  SUPERVISOR_VERSION_NEEDS_RUNTIME_CLEAR=0
+  chown_state_dir() { :; }
+
+  persist_supervisor_version
+  [[ "$SUPERVISOR_VERSION_PERSIST_DEFERRED" -eq 1 && -e "$sqlite_path" ]]
+  [[ -z "$(read_sqlite_meta_value "$sqlite_path" supervisor_version)" ]]
+  initialize_fake_daemon_schema "$sqlite_path"
+  persist_deferred_supervisor_version
+
+  [[ "$(read_sqlite_meta_value "$sqlite_path" state_schema_version)" == 3 ]]
+  [[ "$(read_sqlite_meta_value "$sqlite_path" supervisor_version)" == test-supervisor-version ]]
+)
+
+test_termd_poisoned_state_repair_never_modifies_user_state() (
+  load_termd_installer_functions
+
+  local tmp_dir variant sqlite_path before after socket_path
+  tmp_dir="$(mktemp -d)"
+  trap 'rm -rf "$tmp_dir"' EXIT
+
+  for variant in \
+    extra-meta trusted_devices runtime_sessions http_uploads daemon_clients \
+    daemon_client_attached_sessions daemon_sessions session_ownership unknown-table socket
+  do
+    STATE_DIR="${tmp_dir}/${variant}"
+    sqlite_path="${STATE_DIR}/daemon-state.sqlite"
+    mkdir -p "${STATE_DIR}/termd-supervisors"
+    seed_installer_poisoned_state_db "$sqlite_path"
+    python3 - "$sqlite_path" "$variant" <<'PY'
+import sqlite3
+import sys
+
+path, variant = sys.argv[1:]
+conn = sqlite3.connect(path)
+try:
+    if variant == "extra-meta":
+        conn.execute("INSERT INTO daemon_meta VALUES ('server_id', 'keep-me', 2)")
+    elif variant == "unknown-table":
+        conn.execute("CREATE TABLE user_notes (marker TEXT)")
+        conn.execute("INSERT INTO user_notes VALUES ('keep-me')")
+    elif variant != "socket":
+        conn.execute(f'INSERT INTO "{variant}" VALUES (\'keep-me\')')
+    conn.commit()
+finally:
+    conn.close()
+PY
+    if [[ "$variant" == "socket" ]]; then
+      socket_path="${STATE_DIR}/termd-supervisors/keep.sock"
+      python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.close()' "$socket_path"
+    fi
+
+    before="$(sha256sum "$sqlite_path")"
+    if repair_installer_poisoned_state_db "$sqlite_path" "${STATE_DIR}/termd-supervisors"; then
+      printf 'unexpectedly repaired state containing %s\n' "$variant" >&2
+      return 1
+    fi
+    after="$(sha256sum "$sqlite_path")"
+    [[ "$after" == "$before" ]]
+    if [[ "$variant" == "socket" ]]; then
+      [[ -S "$socket_path" ]]
+    fi
+  done
+)
+
+seed_installer_poisoned_state_db() {
+  local sqlite_path="$1"
+
+  mkdir -p "$(dirname "$sqlite_path")"
+  python3 - "$sqlite_path" <<'PY'
+import sqlite3
+import sys
+
+conn = sqlite3.connect(sys.argv[1])
+conn.executescript(
+    """
+    CREATE TABLE daemon_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at_ms INTEGER NOT NULL);
+    INSERT INTO daemon_meta VALUES ('supervisor_version', 'old-installer-value', 7);
+    CREATE TABLE trusted_devices (marker TEXT);
+    CREATE TABLE runtime_sessions (marker TEXT);
+    CREATE TABLE http_uploads (marker TEXT);
+    CREATE TABLE daemon_clients (marker TEXT);
+    CREATE TABLE daemon_client_attached_sessions (marker TEXT);
+    CREATE TABLE daemon_sessions (marker TEXT);
+    CREATE TABLE session_ownership (phase TEXT);
+    """
+)
+conn.commit()
+conn.close()
+PY
+}
+
+initialize_fake_daemon_schema() {
+  local sqlite_path="$1"
+
+  python3 - "$sqlite_path" <<'PY'
+import sqlite3
+import sys
+
+conn = sqlite3.connect(sys.argv[1])
+conn.execute("CREATE TABLE IF NOT EXISTS daemon_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at_ms INTEGER NOT NULL)")
+values = dict(conn.execute("SELECT key, value FROM daemon_meta"))
+assert values == {}, values
+conn.execute("INSERT INTO daemon_meta VALUES ('state_schema_version', '3', 8)")
+conn.commit()
+conn.close()
+PY
+}
+
 assert_file_contains() {
   local file="$1"
   local expected="$2"
@@ -271,6 +451,35 @@ install_fake_termd_system_commands() {
         ;;
       start|restart)
         TERMD_FAKE_SERVICE_ACTIVE=1
+        if [[ "${SUPERVISOR_VERSION_PERSIST_DEFERRED:-0}" -eq 1 && "$STATE_DIR" != "/var/lib/termd" ]]; then
+          mkdir -p "$STATE_DIR"
+          python3 - "${STATE_DIR}/daemon-state.sqlite" <<'PY'
+import sqlite3
+import sys
+
+conn = sqlite3.connect(sys.argv[1])
+try:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS daemon_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at_ms INTEGER NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO daemon_meta (key, value, updated_at_ms)
+        VALUES ('state_schema_version', '3', 1)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        """
+    )
+    conn.commit()
+finally:
+    conn.close()
+PY
+        fi
         ;;
       *)
         :
@@ -325,6 +534,7 @@ CREATE TABLE runtime_sessions (
 );
 """)
 conn.execute("INSERT INTO daemon_meta VALUES ('server_id', 'server', 1)")
+conn.execute("INSERT INTO daemon_meta VALUES ('state_schema_version', '3', 1)")
 conn.execute("INSERT INTO daemon_meta VALUES ('supervisor_version', ?, 1)", (supervisor_version,))
 conn.execute("INSERT INTO trusted_devices VALUES ('device', 'public', 1)")
 conn.execute("INSERT INTO daemon_clients VALUES ('device')")
@@ -367,6 +577,7 @@ CREATE TABLE runtime_sessions (
   restore_value TEXT
 );
 INSERT INTO daemon_meta VALUES ('server_id', 'server', 1);
+INSERT INTO daemon_meta VALUES ('state_schema_version', '3', 1);
 INSERT INTO trusted_devices VALUES ('device', 'public', 1);
 INSERT INTO daemon_clients VALUES ('device');
 INSERT INTO daemon_client_attached_sessions VALUES ('device', 'connection', 'session');
@@ -537,6 +748,8 @@ test_termd_proxy_arg_writes_common_proxy_env_vars() (
 
   run_fake_termd_install "$unit_file" --proxy http://127.0.0.1:3128
 
+  [[ "$http_proxy" == "http://127.0.0.1:3128" ]]
+  [[ "$https_proxy" == "http://127.0.0.1:3128" ]]
   assert_file_contains "${tmp_dir}/termd.env" "HTTP_PROXY=http://127.0.0.1:3128"
   assert_file_contains "${tmp_dir}/termd.env" "HTTPS_PROXY=http://127.0.0.1:3128"
   assert_file_contains "${unit_file%.service}-run" "set -a"
@@ -861,7 +1074,7 @@ try:
         "SELECT value FROM daemon_meta WHERE key = 'supervisor_version'"
     ).fetchone()[0]
     assert version == "v-new", version
-    assert conn.execute("SELECT COUNT(*) FROM daemon_meta").fetchone()[0] == 2
+    assert conn.execute("SELECT COUNT(*) FROM daemon_meta").fetchone()[0] == 3
     assert conn.execute("SELECT COUNT(*) FROM trusted_devices").fetchone()[0] == 1
     assert conn.execute("SELECT COUNT(*) FROM daemon_clients").fetchone()[0] == 1
 finally:
@@ -2700,6 +2913,11 @@ run_test() {
   "$test_name"
 }
 
+run_test test_termd_installer_supports_stdin_pipe_execution
+run_test test_installers_normalize_standard_proxy_environment
+run_test test_termd_fresh_install_initializes_schema_before_supervisor_baseline
+run_test test_termd_reinstall_recovers_installer_poisoned_state
+run_test test_termd_poisoned_state_repair_never_modifies_user_state
 run_test test_termd_default_install_uses_managed_user
 run_test test_termd_relay_registration_uses_only_daemon_token_and_public_key
 run_test test_termd_upgrade_inherits_existing_user_without_user_arg
