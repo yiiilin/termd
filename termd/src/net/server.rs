@@ -54,6 +54,7 @@ use recovery::warn_about_orphaned_supervisors;
 
 const HTTP_JSON_MAX_BYTES: usize = 1024 * 1024;
 const V070_FILE_CHUNK_MAX_BYTES: usize = 2 * 1024 * 1024;
+const MAX_METADATA_TIMESTAMP_MS: u64 = 9_007_199_254_740_991;
 
 pub type DefaultDaemonProtocol = DaemonProtocol<SupervisorPtyBackend, Ed25519SignatureVerifier>;
 /// daemon 的协议核心仍是单线程语义，但等待这把锁必须让出 Tokio worker。
@@ -600,12 +601,13 @@ async fn run_metadata_websocket(
         tokio::select! {
             incoming = socket.recv() => match incoming {
                 Some(Ok(Message::Text(raw))) => {
-                    if serde_json::from_str::<Value>(&raw).ok()
-                        .and_then(|value| value.get("type").and_then(Value::as_str).map(str::to_owned))
-                        .as_deref() == Some("metadata.ping")
-                    {
+                    let timestamp_ms = serde_json::from_str::<Value>(&raw).ok()
+                        .filter(|value| value.get("type").and_then(Value::as_str) == Some("metadata.ping"))
+                        .and_then(|value| value.get("payload")?.get("timestamp_ms")?.as_u64())
+                        .filter(|timestamp_ms| *timestamp_ms <= MAX_METADATA_TIMESTAMP_MS);
+                    if let Some(timestamp_ms) = timestamp_ms {
                         let _ = send_v070_json(&mut socket, "metadata.pong", serde_json::json!({
-                            "server_time_ms": current_unix_timestamp_millis()
+                            "timestamp_ms": timestamp_ms
                         })).await;
                     }
                 }
@@ -2455,6 +2457,61 @@ mod tests {
             .exchange_access_token(&certificate, payload, now_ms)
             .unwrap();
         (device_id, token)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn v070_direct_metadata_pong_echoes_client_timestamp() {
+        let fixture = test_protocol("direct-metadata-pong");
+        let (_, access_token) = v070_access_token_for_test(&fixture.protocol).await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_protocol = fixture.protocol.clone();
+        let server = tokio::spawn(async move {
+            let _ = serve_listener(listener, server_protocol, false).await;
+        });
+
+        let mut metadata_request = format!("ws://{addr}/ws/metadata")
+            .into_client_request()
+            .unwrap();
+        metadata_request.headers_mut().insert(
+            "sec-websocket-protocol",
+            format!("termd.v0.7, {access_token}").parse().unwrap(),
+        );
+        let (mut metadata, _) = tokio_tungstenite::connect_async(metadata_request)
+            .await
+            .expect("metadata websocket should upgrade");
+        let snapshot = metadata.next().await.unwrap().unwrap().into_text().unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&snapshot).unwrap()["type"],
+            "metadata.snapshot"
+        );
+
+        let timestamp_ms = 1_710_000_000_123_u64;
+        metadata
+            .send(ClientWsMessage::Text(
+                serde_json::json!({
+                    "type": "metadata.ping",
+                    "payload": { "timestamp_ms": timestamp_ms }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let pong = tokio::time::timeout(Duration::from_millis(250), metadata.next())
+            .await
+            .expect("metadata pong should arrive without polling")
+            .unwrap()
+            .unwrap()
+            .into_text()
+            .unwrap();
+        let pong: serde_json::Value = serde_json::from_str(&pong).unwrap();
+        assert_eq!(pong["type"], "metadata.pong");
+        let echoed_timestamp_ms = pong["payload"]["timestamp_ms"].as_u64();
+
+        drop(metadata);
+        server.abort();
+        assert_eq!(echoed_timestamp_ms, Some(timestamp_ms));
     }
 
     #[tokio::test(flavor = "multi_thread")]

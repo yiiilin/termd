@@ -601,6 +601,14 @@ export class MockDaemon {
     this.wsServer.clients.forEach((client) => client.close());
   }
 
+  suspendTerminalConnectionsWithoutClose(): void {
+    // 模拟移动端进程被冻结后留下的半开 socket：客户端仍看到 OPEN，daemon 端却不再
+    // 处理任何 terminal frame，也不会发送 close。恢复逻辑不能依赖一次用户输入来发现它。
+    for (const socket of this.v070TerminalSockets.keys()) {
+      socket.removeAllListeners("message");
+    }
+  }
+
   private async handleNodeHttpRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const url = new URL(request.url ?? "/", this.httpBaseUrl());
     const setCorsHeaders = () => {
@@ -799,11 +807,14 @@ export class MockDaemon {
     queueMicrotask(() => this.sendV070Metadata(socket));
     socket.on("message", (raw, isBinary) => {
       if (isBinary) return;
-      const message = JSON.parse(raw.toString()) as { type?: string };
+      const message = JSON.parse(raw.toString()) as {
+        type?: string;
+        payload?: { timestamp_ms?: unknown };
+      };
       if (message.type === "metadata.ping") {
         socket.send(JSON.stringify({
           type: "metadata.pong",
-          payload: { server_time_ms: nowMs() },
+          payload: { timestamp_ms: message.payload?.timestamp_ms },
         }));
       }
     });

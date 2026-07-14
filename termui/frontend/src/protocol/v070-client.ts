@@ -26,6 +26,7 @@ interface TransportLike {
   onTerminalClose?: () => void;
   connectMetadata(): Promise<unknown>;
   reconnectMetadata(): Promise<unknown>;
+  sendMetadata?: (data: string) => void;
   openTerminal(command: WorkspaceCommand): Promise<unknown>;
   sendTerminal(data: string | ArrayBufferLike | Blob | ArrayBufferView): void;
   closeTerminal(): void;
@@ -38,6 +39,19 @@ interface PendingTerminalOpen {
   sessionId?: UUID;
   promise: Promise<any>;
   resolve: (payload: any) => void;
+  reject: (error: unknown) => void;
+}
+interface PendingMetadataPing {
+  promise: Promise<number>;
+  timeout: ReturnType<typeof globalThis.setTimeout>;
+  resolve: (rttMs: number) => void;
+  reject: (error: unknown) => void;
+}
+interface PendingTerminalActivity {
+  sessionId: UUID;
+  promise: Promise<void>;
+  timeout: ReturnType<typeof globalThis.setTimeout>;
+  resolve: () => void;
   reject: (error: unknown) => void;
 }
 const FILE_CHUNK_BYTES = 2 * 1024 * 1024;
@@ -80,10 +94,12 @@ export class V070Client {
   private metadataReconnectNeeded = false;
   private metadataReconnectTimer?: ReturnType<typeof globalThis.setTimeout>;
   private metadataWaiters: Array<{ resolve: () => void; reject: (error: unknown) => void }> = [];
+  private metadataPingWaiters = new Map<number, PendingMetadataPing>();
   private metadataListeners = new Set<(revision: number, state: WorkspaceMetadataState) => void>();
   private terminalSessionId?: UUID;
   private terminalOpen?: PendingTerminalOpen;
   private terminalGeneration = 0;
+  private terminalActivityProbe?: PendingTerminalActivity;
   private pendingTerminalFrames: Uint8Array[] = [];
   private terminalBlobDecode = Promise.resolve();
   private receiveQueue: Envelope[] = [];
@@ -145,7 +161,43 @@ export class V070Client {
     return this.metadataState?.daemon ?? ({} as DaemonStatusResultPayload);
   }
 
-  async measureLatency(): Promise<number> { await this.ensureMetadata(); return this.metadataState?.rtt_ms ?? 0; }
+  async measureLatency(): Promise<number> {
+    await this.ensureMetadata();
+    const timestampMs = Date.now();
+    if (!Number.isSafeInteger(timestampMs) || timestampMs < 0) {
+      throw new ProtocolClientError("invalid_state", "local timestamp is invalid");
+    }
+    const inFlight = this.metadataPingWaiters.get(timestampMs);
+    if (inFlight) return inFlight.promise;
+    let resolve!: (rttMs: number) => void;
+    let reject!: (error: unknown) => void;
+    const promise = new Promise<number>((resolvePending, rejectPending) => {
+      resolve = resolvePending;
+      reject = rejectPending;
+    });
+    let waiter!: PendingMetadataPing;
+    const timeout = globalThis.setTimeout(() => {
+      if (!this.removeMetadataPingWaiter(timestampMs, waiter)) return;
+      reject(new ProtocolClientError("response_timeout", "metadata ping timed out"));
+    }, Math.max(1, this.requestTimeoutMs));
+    waiter = { promise, timeout, resolve, reject };
+    this.metadataPingWaiters.set(timestampMs, waiter);
+    try {
+      if (!this.transport.sendMetadata) {
+        throw new ProtocolClientError("connection_closed", "metadata websocket cannot send");
+      }
+      this.transport.sendMetadata(JSON.stringify({
+        type: "metadata.ping",
+        payload: { timestamp_ms: timestampMs },
+      }));
+    } catch (caught) {
+      if (this.removeMetadataPingWaiter(timestampMs, waiter)) {
+        globalThis.clearTimeout(timeout);
+        reject(caught);
+      }
+    }
+    return promise;
+  }
 
   async createSession(command: string[], size: TerminalSize): Promise<SessionCreatedPayload> {
     return this.openTerminal({ type: "terminal.create", payload: { command, size } });
@@ -163,6 +215,30 @@ export class V070Client {
   async requestSessionResize(sessionId: UUID, size: TerminalSize): Promise<void> {
     this.requireTerminal(sessionId);
     this.transport.sendTerminal(encodeSupervisorTerminalClientFrame({ type: "resize", size }));
+  }
+
+  probeTerminalLiveness(sessionId: UUID, size: TerminalSize, timeoutMs: number): Promise<void> {
+    this.requireTerminal(sessionId);
+    const inFlight = this.terminalActivityProbe;
+    if (inFlight?.sessionId === sessionId) return inFlight.promise;
+    let resolve!: () => void;
+    let reject!: (error: unknown) => void;
+    const promise = new Promise<void>((resolvePending, rejectPending) => {
+      resolve = resolvePending;
+      reject = rejectPending;
+    });
+    let probe!: PendingTerminalActivity;
+    const timeout = globalThis.setTimeout(() => {
+      if (this.terminalActivityProbe !== probe) return;
+      this.terminalActivityProbe = undefined;
+      reject(new ProtocolClientError("response_timeout", "terminal liveness probe timed out"));
+    }, Math.max(1, timeoutMs));
+    probe = { sessionId, promise, timeout, resolve, reject };
+    this.terminalActivityProbe = probe;
+    void this.requestSessionResize(sessionId, size).catch((caught) => {
+      this.rejectTerminalActivityProbe(caught, probe);
+    });
+    return promise;
   }
 
   async resizeSession(sessionId: UUID, size: TerminalSize): Promise<SessionResizedPayload> {
@@ -367,7 +443,9 @@ export class V070Client {
     this.metadataConnected = false;
     this.metadataReconnectNeeded = false;
     this.clearMetadataReconnectTimer();
-    this.rejectMetadataWaiters(new ProtocolClientError("connection_closed", "connection closed"));
+    const error = new ProtocolClientError("connection_closed", "connection closed");
+    this.rejectMetadataWaiters(error);
+    this.rejectMetadataPingWaiters(error);
     this.resetTerminalState(new ProtocolClientError("connection_closed", "connection closed"));
     this.transport.close();
     this.interruptReceiveWaiters();
@@ -455,6 +533,16 @@ export class V070Client {
       );
       this.metadataFailure = error;
       this.rejectMetadataWaiters(error);
+      this.rejectMetadataPingWaiters(error);
+      return;
+    }
+    if (message.type === "metadata.pong") {
+      const timestampMs = message.payload?.timestamp_ms;
+      if (!Number.isSafeInteger(timestampMs) || timestampMs < 0) return;
+      const waiter = this.takeMetadataPingWaiter(timestampMs);
+      if (!waiter) return;
+      globalThis.clearTimeout(waiter.timeout);
+      waiter.resolve(Math.max(0, Date.now() - timestampMs));
       return;
     }
     const revision = message.payload?.revision;
@@ -487,6 +575,7 @@ export class V070Client {
     if (typeof data === "string") {
       const message = JSON.parse(data) as any;
       if (message.type === "terminal.created" || message.type === "terminal.attached") {
+        this.resolveTerminalActivityProbe();
         const pending = this.terminalOpen;
         if (!pending || this.isClosed) return;
         this.terminalSessionId = message.payload.session_id;
@@ -496,6 +585,7 @@ export class V070Client {
           this.enqueue({ type: "attach_frame", payload: buildAttachFramePayload(this.terminalSessionId!, bytes) });
         }
       } else if (message.type === "error") {
+        this.resolveTerminalActivityProbe();
         const error = new ProtocolClientError(
           message.payload?.code ?? "terminal_error",
           message.payload?.message ?? "terminal error",
@@ -524,6 +614,7 @@ export class V070Client {
       ? new Uint8Array(data as ArrayBuffer)
       : ArrayBuffer.isView(data) ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength) : undefined;
     if (!bytes) return;
+    this.resolveTerminalActivityProbe();
     if (!this.terminalSessionId) {
       if (this.terminalOpen) this.pendingTerminalFrames.push(bytes.slice());
       return;
@@ -537,14 +628,18 @@ export class V070Client {
     this.metadataConnected = false;
     this.metadataState = undefined;
     this.metadataRevision = undefined;
-    this.rejectMetadataWaiters(
-      this.metadataFailure ?? new ProtocolClientError("connection_closed", "metadata connection closed"),
-    );
+    const error = this.metadataFailure
+      ?? new ProtocolClientError("connection_closed", "metadata connection closed");
+    this.rejectMetadataWaiters(error);
+    this.rejectMetadataPingWaiters(error);
     this.requestMetadataReconnect();
   }
 
   private requestMetadataReconnect(): void {
     if (this.isClosed) return;
+    this.rejectMetadataPingWaiters(
+      new ProtocolClientError("stale_connection", "metadata connection was superseded"),
+    );
     this.metadataReconnectNeeded = true;
     if (this.metadataResync || this.metadataReconnectTimer !== undefined) return;
     this.metadataReconnectNeeded = false;
@@ -606,6 +701,27 @@ export class V070Client {
     for (const waiter of this.metadataWaiters.splice(0)) waiter.reject(error);
   }
 
+  private takeMetadataPingWaiter(timestampMs: number): PendingMetadataPing | undefined {
+    const waiter = this.metadataPingWaiters.get(timestampMs);
+    if (waiter) this.metadataPingWaiters.delete(timestampMs);
+    return waiter;
+  }
+
+  private removeMetadataPingWaiter(timestampMs: number, waiter: PendingMetadataPing): boolean {
+    if (this.metadataPingWaiters.get(timestampMs) !== waiter) return false;
+    this.metadataPingWaiters.delete(timestampMs);
+    return true;
+  }
+
+  private rejectMetadataPingWaiters(error: ProtocolClientError): void {
+    const waiters = [...this.metadataPingWaiters.values()];
+    this.metadataPingWaiters.clear();
+    for (const waiter of waiters) {
+      globalThis.clearTimeout(waiter.timeout);
+      waiter.reject(error);
+    }
+  }
+
   private handleTerminalClose(): void {
     if (this.isClosed) return;
     const hadTerminal = this.terminalSessionId !== undefined || this.terminalOpen !== undefined;
@@ -616,12 +732,29 @@ export class V070Client {
 
   private resetTerminalState(error?: ProtocolClientError): void {
     this.terminalGeneration += 1;
+    if (error) this.rejectTerminalActivityProbe(error);
     this.terminalSessionId = undefined;
     this.pendingTerminalFrames = [];
     if (!error || !this.terminalOpen) return;
     const pending = this.terminalOpen;
     this.terminalOpen = undefined;
     pending.reject(error);
+  }
+
+  private resolveTerminalActivityProbe(): void {
+    const probe = this.terminalActivityProbe;
+    if (!probe || probe.sessionId !== this.terminalSessionId) return;
+    this.terminalActivityProbe = undefined;
+    globalThis.clearTimeout(probe.timeout);
+    probe.resolve();
+  }
+
+  private rejectTerminalActivityProbe(error: unknown, expected?: PendingTerminalActivity): void {
+    const probe = this.terminalActivityProbe;
+    if (!probe || (expected && probe !== expected)) return;
+    this.terminalActivityProbe = undefined;
+    globalThis.clearTimeout(probe.timeout);
+    probe.reject(error);
   }
 
   private enqueue(envelope: Envelope): void {

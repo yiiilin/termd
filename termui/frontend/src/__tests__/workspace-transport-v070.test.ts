@@ -47,6 +47,26 @@ describe("WorkspaceTransport v0.7", () => {
     expect(FakeSocket.instances.at(-1)?.protocols).toEqual(["termd.v0.7", "header.claims.signature"]);
   });
 
+  it("sends metadata ping frames over the metadata WebSocket", async () => {
+    FakeSocket.instances = [];
+    FakeSocket.autoOpen = true;
+    vi.stubGlobal("WebSocket", FakeSocket);
+    const transport = new WorkspaceTransport(
+      "wss://relay.example/ws?server_id=server-a",
+      { get: vi.fn(async () => "header.claims.signature") },
+    );
+    await transport.connectMetadata();
+
+    const ping = JSON.stringify({
+      type: "metadata.ping",
+      payload: { timestamp_ms: 1_710_000_000_000 },
+    });
+    (transport as WorkspaceTransport & { sendMetadata(data: string): void }).sendMetadata(ping);
+
+    expect(FakeSocket.instances).toHaveLength(1);
+    expect(FakeSocket.instances[0].sent).toEqual([ping]);
+  });
+
   it("keeps a late terminal open from replacing the newer terminal", async () => {
     FakeSocket.instances = [];
     FakeSocket.autoOpen = false;

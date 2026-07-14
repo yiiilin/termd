@@ -135,6 +135,7 @@ const APP_SOCKET_OPEN_TIMEOUT_MS = 1200;
 const APP_SOCKET_OPEN_HEDGE_DELAY_MS = 300;
 const APP_SOCKET_CONNECT_ATTEMPTS = 4;
 const APP_SOCKET_CONNECT_RETRY_DELAY_MS = 80;
+const TERMINAL_LIVENESS_TIMEOUT_MS = 1200;
 const PAIRING_CONNECTION_TIMEOUT_MS = 5000;
 const ATTACH_CONNECTION_TIMEOUT_MS = 15000;
 type AppSurface = "admin" | "workspace";
@@ -547,6 +548,11 @@ export default function App() {
   const metadataClientGenerationRef = useRef(0);
   const metadataRetryTimerRef = useRef<number | undefined>(undefined);
   const retryConnectionTaskRef = useRef<Promise<void> | undefined>(undefined);
+  const terminalTransportFrozenRef = useRef(false);
+  const terminalWasHiddenRef = useRef(false);
+  const terminalResumePendingRef = useRef(false);
+  const terminalResumeTaskRef = useRef<Promise<void> | undefined>(undefined);
+  const terminalResumeMountedRef = useRef(false);
   const lastNotificationAtRef = useRef(0);
   const fileEditorResetRef = useRef<() => void>(() => {});
   const isMobileLayout = useMobileLayout();
@@ -596,6 +602,14 @@ export default function App() {
       effectiveTheme === "light" ? "#e5dfc5" : "#293136",
     );
   }, [effectiveLocale, effectiveTheme]);
+
+  useEffect(() => {
+    terminalResumeMountedRef.current = true;
+    return () => {
+      terminalResumeMountedRef.current = false;
+      terminalResumePendingRef.current = false;
+    };
+  }, []);
 
   useEffect(() => {
     return () => {
@@ -2550,36 +2564,112 @@ export default function App() {
       closeWorkspaceClient();
     };
 
+    const invalidateFrozenTerminalConnection = () => {
+      if (
+        activeSurfaceRef.current !== "workspace" ||
+        !attachedSessionRef.current ||
+        !attachClientRef.current ||
+        attachClientRef.current.isClosed
+      ) {
+        return;
+      }
+      terminalTransportFrozenRef.current = true;
+      rescuePendingTerminalOutputFlush(true);
+      closeWorkspaceClient();
+    };
+
     const resumeVisibleConnection = () => {
-      if (isPagePaused() || activeSurface !== "workspace") {
+      if (isPagePaused() || activeSurfaceRef.current !== "workspace") {
         return;
       }
-      // 中文注释：hidden/blur 不能再作为 terminal WebSocket 的断开依据。
-      // 如果连接还在，就继续让后台收到的 stdout 留在同一条流里；恢复可见时只补旁路元数据。
-      if (error) {
-        void handleRetryConnection().finally(scheduleResumeMetadataRefresh);
-        return;
-      }
-      if ((attachedSessionId || selectedSessionId) && (!attachClientRef.current || attachClientRef.current.isClosed)) {
-        void handleRetryConnection().finally(scheduleResumeMetadataRefresh);
-        return;
-      }
-      if (activeServer && state.device && (status === "idle" || status === "connecting")) {
-        autoCheckedServerRef.current = undefined;
-        setStatus("idle");
-        void handleRefresh({ bootstrap: true });
-        return;
-      }
-      if (connectionReady) {
-        if (!metadataClientRef.current || metadataClientRef.current.isClosed) {
-          setMetadataRetryNonce((current) => current + 1);
+      terminalResumePendingRef.current = true;
+      if (terminalResumeTaskRef.current) return;
+      const runResumePass = async () => {
+        const wasFrozen = terminalTransportFrozenRef.current;
+        const shouldProbeTerminal = terminalWasHiddenRef.current;
+        terminalTransportFrozenRef.current = false;
+        terminalWasHiddenRef.current = false;
+        if (wasFrozen) {
+          if (attachedSessionRef.current ?? attachedSessionId ?? selectedSessionId) {
+            await handleRetryConnection();
+          }
+          if (!terminalResumeMountedRef.current) return;
+          scheduleResumeMetadataRefresh();
+          return;
         }
-        void loadDaemonStatus();
-      }
+        const probeClient = attachClientRef.current;
+        const probeSessionId = attachedSessionRef.current;
+        if (shouldProbeTerminal && probeClient && probeSessionId && !probeClient.isClosed) {
+          const probeSize = confirmedSessionSizesRef.current.get(probeSessionId)
+            ?? sessionsRef.current.find((session) => session.session_id === probeSessionId)?.size
+            ?? DEFAULT_SESSION_SIZE;
+          try {
+            await probeClient.probeTerminalLiveness(
+              probeSessionId,
+              probeSize,
+              TERMINAL_LIVENESS_TIMEOUT_MS,
+            );
+          } catch {
+            if (!terminalResumeMountedRef.current) return;
+            if (
+              attachClientRef.current === probeClient &&
+              attachedSessionRef.current === probeSessionId
+            ) {
+              closeWorkspaceClient();
+              await handleRetryConnection();
+            }
+            scheduleResumeMetadataRefresh();
+            return;
+          }
+        }
+        if (!terminalResumeMountedRef.current) return;
+        if (error) {
+          await handleRetryConnection();
+          if (!terminalResumeMountedRef.current) return;
+          scheduleResumeMetadataRefresh();
+          return;
+        }
+        if ((attachedSessionId || selectedSessionId) && (!attachClientRef.current || attachClientRef.current.isClosed)) {
+          await handleRetryConnection();
+          if (!terminalResumeMountedRef.current) return;
+          scheduleResumeMetadataRefresh();
+          return;
+        }
+        if (activeServer && state.device && (status === "idle" || status === "connecting")) {
+          autoCheckedServerRef.current = undefined;
+          setStatus("idle");
+          await handleRefresh({ bootstrap: true });
+          return;
+        }
+        if (connectionReady) {
+          if (!metadataClientRef.current || metadataClientRef.current.isClosed) {
+            setMetadataRetryNonce((current) => current + 1);
+          }
+          await loadDaemonStatus();
+        }
+      };
+      const task = (async () => {
+        try {
+          while (terminalResumeMountedRef.current && terminalResumePendingRef.current) {
+            terminalResumePendingRef.current = false;
+            if (isPagePaused() || activeSurfaceRef.current !== "workspace") return;
+            try {
+              await runResumePass();
+            } catch {
+              if (!terminalResumeMountedRef.current) return;
+            }
+          }
+        } finally {
+          terminalResumeTaskRef.current = undefined;
+        }
+      })();
+      terminalResumeTaskRef.current = task;
+      void task.catch(() => undefined);
     };
 
     const handleVisibilityChange = () => {
       if (document.visibilityState === "hidden") {
+        terminalWasHiddenRef.current = true;
         rescuePendingTerminalOutputFlush(true);
         return;
       }
@@ -2587,17 +2677,23 @@ export default function App() {
     };
 
     document.addEventListener("visibilitychange", handleVisibilityChange);
+    document.addEventListener("freeze", invalidateFrozenTerminalConnection);
     const handleWindowBlur = () => {
       rescuePendingTerminalOutputFlush(true);
     };
     window.addEventListener("blur", handleWindowBlur);
     window.addEventListener("focus", resumeVisibleConnection);
+    window.addEventListener("pagehide", invalidateFrozenTerminalConnection);
+    window.addEventListener("pageshow", resumeVisibleConnection);
     window.addEventListener("offline", pauseOfflineConnection);
     window.addEventListener("online", resumeVisibleConnection);
     return () => {
       document.removeEventListener("visibilitychange", handleVisibilityChange);
+      document.removeEventListener("freeze", invalidateFrozenTerminalConnection);
       window.removeEventListener("blur", handleWindowBlur);
       window.removeEventListener("focus", resumeVisibleConnection);
+      window.removeEventListener("pagehide", invalidateFrozenTerminalConnection);
+      window.removeEventListener("pageshow", resumeVisibleConnection);
       window.removeEventListener("offline", pauseOfflineConnection);
       window.removeEventListener("online", resumeVisibleConnection);
     };
@@ -2975,10 +3071,12 @@ export default function App() {
             setSessionOrder(nextOrder);
             setSessions(orderSessions(sortSessionsNewestFirst(visibleSessions), nextOrder));
           }
-          if (typeof metadata.rtt_ms === "number") {
-            setDaemonNetworkLatencyMs(metadata.rtt_ms);
-          }
         });
+        void client.measureLatency().then((latencyMs) => {
+          if (isCurrentMetadataClient()) {
+            setDaemonNetworkLatencyMs(latencyMs);
+          }
+        }).catch(() => undefined);
         await new Promise<void>((resolve) => {
           if (abortController.signal.aborted) {
             resolve();
@@ -3614,7 +3712,6 @@ export default function App() {
             <SessionOperatorsBar
               operators={sessionOperators}
               currentDeviceId={state.device?.device_id}
-              sessionId={attachedSessionId}
             />
           ) : null}
           {connectionReady && !isMobileLayout ? (
@@ -3942,7 +4039,6 @@ function ProtocolErrorAlert(props: {
 function SessionOperatorsBar(props: {
   operators: DaemonClientSummaryPayload[];
   currentDeviceId?: UUID;
-  sessionId: UUID;
 }) {
   const { t } = useI18n();
   return (
@@ -3957,23 +4053,11 @@ function SessionOperatorsBar(props: {
         props.operators.map((client) => {
           const isCurrentDevice = client.device_id === props.currentDeviceId;
           const label = client.name?.trim() || client.peer_ip || t("operators.client");
-          const cursor =
-            client.cursor_session_id === props.sessionId && client.cursor_row && client.cursor_col
-              ? `${client.cursor_row}:${client.cursor_col}`
-              : t("operators.cursorUnknown");
-          const focus =
-            client.cursor_session_id === props.sessionId && client.cursor_focused !== undefined && client.cursor_focused !== null
-              ? client.cursor_focused
-                ? t("operators.focused")
-                : t("operators.blurred")
-              : undefined;
           return (
             <span className="session-operator" key={client.client_id} title={label}>
               <span className="status-dot online" aria-hidden="true" />
               <span>{label}</span>
               {isCurrentDevice ? <span>{t("operators.you")}</span> : null}
-              <span className="session-operator-cursor">{cursor}</span>
-              {focus ? <span className={client.cursor_focused ? "focus-chip focused" : "focus-chip"}>{focus}</span> : null}
             </span>
           );
         })

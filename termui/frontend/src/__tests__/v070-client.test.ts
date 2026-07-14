@@ -2,7 +2,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { V070Client } from "../protocol/v070-client";
 import { generateDeviceIdentity } from "../protocol/auth";
 import { ProtocolClientError } from "../protocol/errors";
-import { decodeSupervisorTerminalServerFrame, encodeSupervisorTerminalServerFrame } from "../protocol/supervisor-terminal";
+import {
+  decodeSupervisorTerminalClientFrame,
+  decodeSupervisorTerminalServerFrame,
+  encodeSupervisorTerminalServerFrame,
+} from "../protocol/supervisor-terminal";
 
 afterEach(() => {
   vi.useRealTimers();
@@ -261,6 +265,277 @@ describe("V070Client", () => {
       },
       { revision: 8, state: expect.objectContaining({ clients: [{ device_id: "device-b" }] }) },
     ]);
+  });
+
+  it("measures RTT from an echoed metadata ping timestamp instead of snapshot rtt_ms", async () => {
+    const sentAtMs = 1_710_000_000_000;
+    const nowSpy = vi.spyOn(Date, "now").mockReturnValue(sentAtMs);
+    const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000071");
+    const transport = {
+      onMetadata: undefined as ((data: unknown) => void) | undefined,
+      onTerminal: undefined as ((data: unknown) => void) | undefined,
+      connectMetadata: vi.fn(async () => undefined),
+      reconnectMetadata: vi.fn(async () => undefined),
+      openTerminal: vi.fn(async () => undefined),
+      sendMetadata: vi.fn(),
+      sendTerminal: vi.fn(),
+      closeTerminal: vi.fn(),
+      close: vi.fn(),
+    };
+    const client = new V070Client(
+      {
+        server_id: "00000000-0000-0000-0000-000000000070",
+        daemon_public_key: "ed25519-v1:daemon",
+        url: "wss://relay.example/ws",
+        paired_at_ms: 1,
+        device_certificate: "device.certificate.signature",
+      },
+      device,
+      transport,
+    );
+    const metadataReady = client.subscribeMetadata();
+    transport.onMetadata?.(JSON.stringify({
+      type: "metadata.snapshot",
+      payload: { revision: 1, state: { sessions: [], clients: [], daemon: {}, rtt_ms: 1 } },
+    }));
+    await metadataReady;
+
+    const measured = client.measureLatency();
+    const concurrentMeasured = client.measureLatency();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(transport.sendMetadata).toHaveBeenCalledTimes(1);
+    expect(transport.sendMetadata).toHaveBeenCalledWith(JSON.stringify({
+      type: "metadata.ping",
+      payload: { timestamp_ms: sentAtMs },
+    }));
+
+    let measuredSettled = false;
+    void measured.finally(() => { measuredSettled = true; });
+    transport.onMetadata?.(JSON.stringify({
+      type: "metadata.pong",
+      payload: { timestamp_ms: sentAtMs - 1 },
+    }));
+    await Promise.resolve();
+    expect(measuredSettled).toBe(false);
+
+    nowSpy.mockReturnValue(sentAtMs + 42);
+    transport.onMetadata?.(JSON.stringify({
+      type: "metadata.pong",
+      payload: { timestamp_ms: sentAtMs },
+    }));
+    await expect(measured).resolves.toBe(42);
+    await expect(concurrentMeasured).resolves.toBe(42);
+    client.close();
+  });
+
+  it("uses terminal activity as a liveness acknowledgement without consuming the frame", async () => {
+    const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000071");
+    const transport = {
+      onMetadata: undefined as ((data: unknown) => void) | undefined,
+      onTerminal: undefined as ((data: unknown) => void) | undefined,
+      connectMetadata: vi.fn(async () => undefined),
+      reconnectMetadata: vi.fn(async () => undefined),
+      openTerminal: vi.fn(async () => undefined),
+      sendTerminal: vi.fn(),
+      closeTerminal: vi.fn(),
+      close: vi.fn(),
+    };
+    const client = new V070Client(
+      {
+        server_id: "00000000-0000-0000-0000-000000000070",
+        daemon_public_key: "ed25519-v1:daemon",
+        url: "wss://relay.example/ws",
+        paired_at_ms: 1,
+        device_certificate: "device.certificate.signature",
+      },
+      device,
+      transport,
+    );
+    const attached = client.attachSession("session-a");
+    transport.onTerminal?.(JSON.stringify({
+      type: "terminal.attached",
+      payload: {
+        session_id: "session-a",
+        role: "operator",
+        state: "running",
+        size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+      },
+    }));
+    await attached;
+
+    const liveness = client.probeTerminalLiveness(
+      "session-a",
+      { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+      100,
+    );
+    await Promise.resolve();
+    expect(transport.sendTerminal).toHaveBeenCalledTimes(1);
+    const sentFrame = decodeSupervisorTerminalClientFrame(
+      transport.sendTerminal.mock.calls[0]?.[0] as Uint8Array,
+    );
+    expect(sentFrame).toMatchObject({
+      type: "resize",
+      size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+    });
+
+    const outputFrame = encodeSupervisorTerminalServerFrame({
+      type: "terminal_frame",
+      session_id: "session-a",
+      frame: {
+        kind: "output",
+        session_id: "session-a",
+        terminal_seq: 1,
+        data_bytes: new TextEncoder().encode("probe-alive"),
+      },
+    });
+    transport.onTerminal?.(outputFrame.buffer.slice(
+      outputFrame.byteOffset,
+      outputFrame.byteOffset + outputFrame.byteLength,
+    ));
+    await expect(liveness).resolves.toBeUndefined();
+
+    const received = await client.receiveInner();
+    expect(received.type).toBe("attach_frame");
+    const receivedFrame = decodeSupervisorTerminalServerFrame(
+      (received.payload as { data_bytes: Uint8Array }).data_bytes,
+    );
+    expect(receivedFrame).toMatchObject({
+      type: "terminal_frame",
+      session_id: "session-a",
+      frame: { kind: "output", terminal_seq: 1 },
+    });
+    client.close();
+  });
+
+  it("rejects a terminal liveness probe on timeout and close", async () => {
+    vi.useFakeTimers();
+    const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000071");
+    const makeAttachedClient = async () => {
+      const transport = {
+        onMetadata: undefined as ((data: unknown) => void) | undefined,
+        onTerminal: undefined as ((data: unknown) => void) | undefined,
+        connectMetadata: vi.fn(async () => undefined),
+        reconnectMetadata: vi.fn(async () => undefined),
+        openTerminal: vi.fn(async () => undefined),
+        sendTerminal: vi.fn(),
+        closeTerminal: vi.fn(),
+        close: vi.fn(),
+      };
+      const client = new V070Client(
+        {
+          server_id: "00000000-0000-0000-0000-000000000070",
+          daemon_public_key: "ed25519-v1:daemon",
+          url: "wss://relay.example/ws",
+          paired_at_ms: 1,
+          device_certificate: "device.certificate.signature",
+        },
+        device,
+        transport,
+      );
+      const attached = client.attachSession("session-a");
+      transport.onTerminal?.(JSON.stringify({
+        type: "terminal.attached",
+        payload: {
+          session_id: "session-a",
+          role: "operator",
+          state: "running",
+          size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+        },
+      }));
+      await attached;
+      return { client, transport };
+    };
+
+    const timedOut = await makeAttachedClient();
+    const timeoutProbe = timedOut.client.probeTerminalLiveness(
+      "session-a",
+      { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+      5,
+    );
+    const timeoutOutcome = timeoutProbe.catch((error) => error);
+    await vi.advanceTimersByTimeAsync(5);
+    expect(await timeoutOutcome).toMatchObject({ code: "response_timeout" });
+    timedOut.client.close();
+
+    const closed = await makeAttachedClient();
+    const closeProbe = closed.client.probeTerminalLiveness(
+      "session-a",
+      { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+      50,
+    );
+    const closeOutcome = closeProbe.catch((error) => error);
+    closed.client.close();
+    expect(await closeOutcome).toMatchObject({ code: "connection_closed" });
+  });
+
+  it("cleans pending RTT measurements on timeout, close, metadata close, and reconnect", async () => {
+    vi.useFakeTimers();
+    const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000071");
+    const openMeasurement = async () => {
+      const transport = {
+        onMetadata: undefined as ((data: unknown) => void) | undefined,
+        onTerminal: undefined as ((data: unknown) => void) | undefined,
+        onMetadataClose: undefined as (() => void) | undefined,
+        onTerminalClose: undefined as (() => void) | undefined,
+        connectMetadata: vi.fn(async () => undefined),
+        reconnectMetadata: vi.fn(async () => undefined),
+        openTerminal: vi.fn(async () => undefined),
+        sendMetadata: vi.fn(),
+        sendTerminal: vi.fn(),
+        closeTerminal: vi.fn(),
+        close: vi.fn(),
+      };
+      const client = new V070Client(
+        {
+          server_id: "00000000-0000-0000-0000-000000000070",
+          daemon_public_key: "ed25519-v1:daemon",
+          url: "wss://relay.example/ws",
+          paired_at_ms: 1,
+          device_certificate: "device.certificate.signature",
+        },
+        device,
+        transport,
+        undefined,
+        undefined,
+        5,
+      );
+      const metadataReady = client.subscribeMetadata();
+      transport.onMetadata?.(JSON.stringify({
+        type: "metadata.snapshot",
+        payload: { revision: 1, state: { sessions: [], clients: [], daemon: {} } },
+      }));
+      await metadataReady;
+      const measured = client.measureLatency();
+      await Promise.resolve();
+      return { client, measured, transport };
+    };
+
+    const timedOut = await openMeasurement();
+    const timeoutOutcome = timedOut.measured.catch((error) => error);
+    await vi.advanceTimersByTimeAsync(5);
+    expect(await timeoutOutcome).toMatchObject({ code: "response_timeout" });
+    timedOut.client.close();
+
+    const closed = await openMeasurement();
+    const closeOutcome = closed.measured.catch((error) => error);
+    closed.client.close();
+    expect(await closeOutcome).toMatchObject({ code: "connection_closed" });
+
+    const metadataClosed = await openMeasurement();
+    const metadataCloseOutcome = metadataClosed.measured.catch((error) => error);
+    metadataClosed.transport.onMetadataClose?.();
+    expect(await metadataCloseOutcome).toMatchObject({ code: "connection_closed" });
+    metadataClosed.client.close();
+
+    const reconnecting = await openMeasurement();
+    const reconnectOutcome = reconnecting.measured.catch((error) => error);
+    reconnecting.transport.onMetadata?.(JSON.stringify({
+      type: "metadata.update",
+      payload: { revision: 3, state: { sessions: [], clients: [], daemon: {} } },
+    }));
+    expect(await reconnectOutcome).toMatchObject({ code: "stale_connection" });
+    reconnecting.client.close();
   });
 
   it("queues supervisor binary snapshots received after terminal attach", async () => {

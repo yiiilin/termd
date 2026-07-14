@@ -1125,6 +1125,7 @@ describe("termui web 工作台", () => {
   });
 
   it("页面 hidden 时保持 metadata 和终端流，visible 后不重新 attach", async () => {
+    setViewportWidth(390);
     const user = userEvent.setup();
     render(<App />);
 
@@ -1139,7 +1140,9 @@ describe("termui web 工作台", () => {
     expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID]);
     expect(daemon.v070MetadataConnections).toBe(1);
 
+    const resizeCountBeforeResume = daemon.sessionResizes.length;
     setDocumentVisibility("visible");
+    await waitFor(() => expect(daemon.sessionResizes.length).toBeGreaterThan(resizeCountBeforeResume));
     // 中文注释：hidden/visible 只是页面可见性变化，不能主动重建 terminal WebSocket；
     // 否则会触发 snapshot 重绘，并让后台已经持续接收的输出被重复恢复。
     expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID]);
@@ -1147,6 +1150,79 @@ describe("termui web 工作台", () => {
       daemon.receivedHttpRequests.some((request) => request.path === "/api/control/daemon/status"),
     ).toBe(false);
     expect(screen.getByText(/hidden-live-output/)).toBeInTheDocument();
+  });
+
+  it("移动端仅靠 visibility 恢复也会探测半开 terminal WebSocket 且 focus 不重复 attach", async () => {
+    setViewportWidth(390);
+    const user = userEvent.setup();
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await screen.findByText(/termd-e2e-ready/);
+    await waitFor(() => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID]));
+
+    setDocumentVisibility("hidden");
+    daemon.suspendTerminalConnectionsWithoutClose();
+    setDocumentVisibility("visible");
+    fireEvent.focus(window);
+
+    await waitFor(
+      () => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID, DEFAULT_SESSION_ID]),
+      { timeout: 2800 },
+    );
+    await new Promise((resolve) => window.setTimeout(resolve, 300));
+    expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID, DEFAULT_SESSION_ID]);
+    expect(daemon.sessionDataMessages).toEqual([]);
+    expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
+    expect(screen.getByTestId("terminal-pane")).toBeInTheDocument();
+  });
+
+  it("pagehide 会立即失效 terminal WebSocket 并在 pageshow 恢复当前 session", async () => {
+    setViewportWidth(390);
+    const user = userEvent.setup();
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await screen.findByText(/termd-e2e-ready/);
+    await waitFor(() => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID]));
+
+    fireEvent(window, new Event("pagehide"));
+    fireEvent(window, new Event("pageshow"));
+
+    await waitFor(
+      () => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID, DEFAULT_SESSION_ID]),
+      { timeout: 2800 },
+    );
+    expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
+    expect(screen.getByTestId("terminal-pane")).toBeInTheDocument();
+  });
+
+  it("visibility probe 在途时发生 pagehide 和 pageshow 也不会丢失恢复事件", async () => {
+    setViewportWidth(390);
+    const probeSpy = vi.spyOn(V070Client.prototype, "probeTerminalLiveness");
+    const user = userEvent.setup();
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await screen.findByText(/termd-e2e-ready/);
+    await waitFor(() => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID]));
+
+    setDocumentVisibility("hidden");
+    setDocumentVisibility("visible");
+    expect(probeSpy).toHaveBeenCalledTimes(1);
+    fireEvent(window, new Event("pagehide"));
+    fireEvent(window, new Event("pageshow"));
+
+    await waitFor(
+      () => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID, DEFAULT_SESSION_ID]),
+      { timeout: 2800 },
+    );
+    await new Promise((resolve) => window.setTimeout(resolve, 300));
+    expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID, DEFAULT_SESSION_ID]);
+    expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
   });
 
   it("终端输出在 visible 路径排进 rAF 后切到 hidden 仍会补 timer flush", async () => {
@@ -6691,7 +6767,7 @@ describe("termui web 工作台", () => {
     expect(within(panel).queryByText("stale.log")).toBeNull();
   });
 
-  it("显示 daemon 级客户端在线、离线和 attach 状态", async () => {
+  it("显示 daemon 级客户端和 operator 身份，但不显示客户端光标位置或焦点", async () => {
     const user = userEvent.setup();
     await daemon.stop();
     daemon = await MockDaemon.start({
@@ -6736,8 +6812,10 @@ describe("termui web 工作台", () => {
 
     const operators = await screen.findByLabelText("session operators");
     await within(operators).findByText("192.0.2.41");
-    await within(operators).findByText("12:8");
-    await within(operators).findByText("focused");
+    expect(within(operators).queryByText("12:8")).toBeNull();
+    expect(within(operators).queryByText("cursor ?")).toBeNull();
+    expect(within(operators).queryByText("focused")).toBeNull();
+    expect(within(operators).queryByText("blurred")).toBeNull();
     expect(within(operators).queryByText(/selecting/)).toBeNull();
 
     expect(screen.queryByLabelText("daemon clients")).toBeNull();

@@ -41,6 +41,7 @@ use crate::config::RelayReconnectConfig;
 
 const MIN_RELAY_RETRY_DELAY_MS: u64 = 1;
 const MIN_RELAY_HEARTBEAT_INTERVAL_MS: u64 = 1;
+const MAX_METADATA_TIMESTAMP_MS: u64 = 9_007_199_254_740_991;
 // relay mux transport 失败只会断开当前 relay 连接并触发重连，不关闭持久 session/supervisor。
 // 公网 relay 往往还隔着 TLS 和反向代理，2s 级 deadline 容易把短暂抖动误判成断线。
 const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
@@ -1047,11 +1048,13 @@ async fn run_relay_v070_metadata(
         tokio::select! {
             inbound = receiver.next() => match inbound {
                 Some(Ok(Message::Text(raw))) => {
-                    if serde_json::from_str::<serde_json::Value>(&raw).ok()
-                        .and_then(|value| value.get("type").and_then(serde_json::Value::as_str).map(str::to_owned))
-                        .as_deref() == Some("metadata.ping") {
+                    let timestamp_ms = serde_json::from_str::<serde_json::Value>(&raw).ok()
+                        .filter(|value| value.get("type").and_then(serde_json::Value::as_str) == Some("metadata.ping"))
+                        .and_then(|value| value.get("payload")?.get("timestamp_ms")?.as_u64())
+                        .filter(|timestamp_ms| *timestamp_ms <= MAX_METADATA_TIMESTAMP_MS);
+                    if let Some(timestamp_ms) = timestamp_ms {
                         enqueue_v070_json(write_tx, "metadata.pong", serde_json::json!({
-                            "server_time_ms": current_unix_timestamp_millis()
+                            "timestamp_ms": timestamp_ms
                         })).await?;
                     }
                 }
@@ -2316,6 +2319,81 @@ fn authority_contains_credentials(authority: &str) -> bool {
 mod tests {
     use super::*;
     use axum::http::{HeaderMap, HeaderValue};
+
+    #[tokio::test]
+    async fn relay_metadata_pong_echoes_client_timestamp() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "termd-relay-metadata-pong-{}-{}",
+            std::process::id(),
+            ServerId::new().0
+        ));
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let state_path = state_dir.join("daemon-state.json");
+        let protocol = crate::net::server::default_protocol(
+            crate::config::DaemonConfig::default_for_state_path(&state_path),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let timestamp_ms = 1_710_000_000_456_u64;
+        let relay_peer = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            socket
+                .send(Message::Text(
+                    serde_json::json!({
+                        "type": "metadata.ping",
+                        "payload": { "timestamp_ms": timestamp_ms }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            std::future::pending::<()>().await;
+        });
+        let (socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .unwrap();
+        let (_relay_sender, mut receiver) = socket.split();
+        let (write_tx, mut write_rx) = mpsc::channel(4);
+        let (_writer_failed_tx, mut writer_failed_rx) = mpsc::channel(1);
+        let relay_protocol = protocol.clone();
+        let relay_task = tokio::spawn(async move {
+            run_relay_v070_metadata(
+                relay_protocol,
+                termd_proto::DeviceId::new(),
+                &mut receiver,
+                &write_tx,
+                &mut writer_failed_rx,
+            )
+            .await
+        });
+
+        let snapshot = write_rx
+            .recv()
+            .await
+            .expect("metadata snapshot should be queued");
+        let RelayDataWrite::Raw { message, .. } = snapshot;
+        let snapshot: serde_json::Value =
+            serde_json::from_str(&message.into_text().unwrap()).unwrap();
+        assert_eq!(snapshot["type"], "metadata.snapshot");
+
+        let pong = tokio::time::timeout(Duration::from_millis(250), write_rx.recv())
+            .await
+            .expect("metadata pong should be queued without polling")
+            .expect("metadata writer should remain open");
+        let RelayDataWrite::Raw { message, .. } = pong;
+        let pong: serde_json::Value = serde_json::from_str(&message.into_text().unwrap()).unwrap();
+        assert_eq!(pong["type"], "metadata.pong");
+        let echoed_timestamp_ms = pong["payload"]["timestamp_ms"].as_u64();
+
+        relay_task.abort();
+        relay_peer.abort();
+        drop(protocol);
+        std::fs::remove_dir_all(state_dir).unwrap();
+        assert_eq!(echoed_timestamp_ms, Some(timestamp_ms));
+    }
 
     #[test]
     fn relay_http_response_headers_include_only_end_to_end_fields() {

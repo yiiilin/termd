@@ -75,6 +75,13 @@ export class WorkspaceTransport {
     return this.connectMetadata();
   }
 
+  sendMetadata(data: string): void {
+    if (!this.metadata || this.metadata.readyState !== 1) {
+      throw new ProtocolClientError("connection_closed", "metadata websocket is not open");
+    }
+    this.metadata.send(data);
+  }
+
   async openTerminal(command: WorkspaceCommand): Promise<WebSocket> {
     this.closeTerminal();
     const generation = this.terminalGeneration;

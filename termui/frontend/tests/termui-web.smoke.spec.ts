@@ -91,6 +91,69 @@ test.beforeEach(async ({ page }) => {
   await resetBrowserState(page);
 });
 
+test("mobile visibility resume replaces a half-open terminal connection once", async ({ page }, testInfo: TestInfo) => {
+  test.skip(testInfo.project.name !== "mobile-chrome", "该回归只需要移动端项目覆盖");
+  test.setTimeout(60_000);
+  const sessionId = "00000000-0000-0000-0000-0000000005f0";
+  const daemon = await MockDaemon.start({
+    token: "secret-token",
+    sessions: [
+      {
+        session_id: sessionId,
+        state: "running",
+        size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+      },
+    ],
+    attachOutput: "mobile-resume-ready\n",
+  });
+
+  try {
+    await page.goto("/");
+    await page.getByLabel("WS URL").fill(daemon.url);
+    await page.getByLabel("Pairing token").fill(pairingInviteCode(daemon));
+    await activateButton(page, "Pair");
+    await expectTerminalLine(page, "mobile-resume-ready", 8_000);
+    await expect.poll(() => daemon.attachedSessions).toEqual([sessionId]);
+
+    await page.evaluate(() => {
+      Object.defineProperty(document, "visibilityState", {
+        configurable: true,
+        get: () => "hidden",
+      });
+      Object.defineProperty(document, "hidden", {
+        configurable: true,
+        get: () => true,
+      });
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+    daemon.suspendTerminalConnectionsWithoutClose();
+    await page.evaluate(() => {
+      Object.defineProperty(document, "visibilityState", {
+        configurable: true,
+        get: () => "visible",
+      });
+      Object.defineProperty(document, "hidden", {
+        configurable: true,
+        get: () => false,
+      });
+      document.dispatchEvent(new Event("visibilitychange"));
+      window.dispatchEvent(new Event("focus"));
+    });
+
+    await expect.poll(() => daemon.attachedSessions, { timeout: 8_000 }).toEqual([sessionId, sessionId]);
+    await page.waitForTimeout(300);
+    expect(daemon.attachedSessions).toEqual([sessionId, sessionId]);
+    daemon.pushSessionData(sessionId, "mobile-resume-output\n");
+    await expectTerminalLine(page, "mobile-resume-output", 8_000);
+  } finally {
+    await page.evaluate(() => {
+      Reflect.deleteProperty(document, "visibilityState");
+      Reflect.deleteProperty(document, "hidden");
+    }).catch(() => undefined);
+    await daemon.stop();
+  }
+});
+
 test("mobile terminal pointerdown 提前解锁 focus suppression，helper textarea 不会被立即 blur", async ({ page }, testInfo: TestInfo) => {
   test.skip(testInfo.project.name !== "mobile-chrome", "该回归只需要移动端项目覆盖");
   test.setTimeout(60_000);
