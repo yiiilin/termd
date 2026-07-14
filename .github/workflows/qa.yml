@@ -1,0 +1,42 @@
+name: full QA
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  qa:
+    name: run complete repository QA
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: termui/frontend/package-lock.json
+
+      - name: Install QA dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ripgrep
+          cd termui/frontend
+          npm ci
+          npx playwright install --with-deps chromium
+
+      - name: Run full QA
+        env:
+          TERMD_QA_SKIP_NPM_CI: 1
+        run: bash scripts/qa.sh

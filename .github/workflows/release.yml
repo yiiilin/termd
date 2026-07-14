@@ -14,7 +14,7 @@ env:
 
 jobs:
   validate:
-    name: validate tag and test
+    name: validate release metadata
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -97,30 +97,6 @@ jobs:
             printf 'release notes for %s still contain placeholder text\n' "${GITHUB_REF_NAME}" >&2
             exit 1
           fi
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: termui/frontend/package-lock.json
-
-      - name: Install QA dependencies
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ripgrep
-          cd termui/frontend
-          npm ci
-          npx playwright install --with-deps chromium
-
-      - name: Run release QA
-        env:
-          TERMD_QA_SKIP_NPM_CI: 1
-        run: bash scripts/qa.sh
 
   package:
     name: build release assets

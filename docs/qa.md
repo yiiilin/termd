@@ -1,6 +1,8 @@
 # QA 矩阵
 
-`bash scripts/qa.sh` 是当前 MVP 的统一本地 QA 入口。脚本不依赖旧 controller/viewer 模式，不安装系统依赖，也不写 checklist。
+`bash scripts/qa.sh` 是当前 MVP 的统一完整 QA 入口。脚本不依赖旧 controller/viewer 模式，不安装系统依赖，也不写 checklist。
+
+GitHub Actions 中的 `full QA` workflow 只能通过 `workflow_dispatch` 手动触发，并且始终运行同一个完整脚本，不提供裁剪选项。tag 触发的 `release` workflow 只校验版本、tag 和发布说明，再构建并校验发布产物；它不会自动运行完整 QA。
 
 ## 覆盖范围
 
@@ -19,7 +21,7 @@
 
 ## 前端依赖安装
 
-`scripts/qa.sh` 默认每次都会在 `termui/frontend` 运行 `npm ci`，保证本地 QA、PR CI 和发版验证使用 `package-lock.json` 固定的依赖树。
+`scripts/qa.sh` 默认每次都会在 `termui/frontend` 运行 `npm ci`，保证本地 QA 和手动完整 QA 使用 `package-lock.json` 固定的依赖树。
 
 只有在明确知道当前 `node_modules/` 已由同一个 lockfile 安装、且需要离线或加速复跑时，才可以显式跳过：
 
