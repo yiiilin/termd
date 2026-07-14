@@ -1931,6 +1931,7 @@ fn restore_info_with_status(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn supervisor_reader_loop(
     mut reader: StdUnixStream,
     pending_requests: Arc<StdMutex<HashMap<u64, mpsc::Sender<SupervisorRequestCompletion>>>>,

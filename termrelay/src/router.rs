@@ -1538,7 +1538,7 @@ mod tests {
             persisted["daemons"][0]["daemon_public_key"],
             identity.public_key().0
         );
-        assert!(persisted.to_string().find("device").is_none());
+        assert!(!persisted.to_string().contains("device"));
         let _ = fs::remove_file(registry_path);
     }
 
