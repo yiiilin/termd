@@ -2345,8 +2345,7 @@ mod tests {
                         "type": "metadata.ping",
                         "payload": { "timestamp_ms": timestamp_ms }
                     })
-                    .to_string()
-                    .into(),
+                    .to_string(),
                 ))
                 .await
                 .unwrap();
