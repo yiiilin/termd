@@ -1,4 +1,5 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from "react";
+import packageMetadata from "../package.json";
 import {
   Cable,
   CircleAlert,
@@ -120,6 +121,7 @@ const CPU_HISTORY_LIMIT = 48;
 const CPU_BAR_CHART_WIDTH = 56;
 const CPU_BAR_CHART_HEIGHT = 18;
 const CPU_BAR_CHART_COUNT = 18;
+export const APP_VERSION = packageMetadata.version;
 export const DAEMON_STATUS_POLL_INTERVAL_MS = 1000;
 // 普通前端操作走同一条可靠 WebSocket；relay 下终端输出可能排在 RPC 响应前面。
 // 5 秒给公网 relay 和浏览器调度留出缓冲，避免把短暂排队误报成“操作超时”。
@@ -3339,6 +3341,7 @@ export default function App() {
           <div className="admin-brand">
             <Cable size={18} aria-hidden="true" />
             <span>{t("app.adminTitle")}</span>
+            <span className="app-version">v{APP_VERSION}</span>
           </div>
           <div className="admin-topbar-actions">
             <button type="button" className="icon-button" aria-label={t("app.settings")} onClick={() => setSettingsOpen(true)}>
@@ -3509,6 +3512,7 @@ export default function App() {
                 <div className="brand-title">
                   <Cable size={18} aria-hidden="true" />
                   <span>{t("app.termd")}</span>
+                  <span className="app-version">v{APP_VERSION}</span>
                 </div>
                 <button
                   type="button"

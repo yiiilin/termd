@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import App, {
+  APP_VERSION,
   APP_CONNECTION_TIMEOUT_MS,
   browserReachableWsUrl,
   isExclusiveMetadataClient,
@@ -1013,6 +1014,19 @@ describe("termui web 工作台", () => {
     expect(daemon.v070MetadataConnections).toBeGreaterThan(0);
     expect(daemon.v070TerminalConnections).toBeGreaterThan(0);
     expectPairingTokenOnlyInRelayAdmission(daemon);
+  });
+
+  it("在工作台和守护进程管理页显示当前构建版本", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+
+    expect(screen.getByText(`v${APP_VERSION}`)).toHaveClass("app-version");
+    await user.click(screen.getByRole("button", { name: "Daemons" }));
+    await screen.findByLabelText("daemon admin");
+    expect(screen.getByText(`v${APP_VERSION}`)).toHaveClass("app-version");
   });
 
   it("daemon.clients 超时不阻断 session list", async () => {
