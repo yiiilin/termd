@@ -102,6 +102,16 @@ export interface TerminalSize {
 export type SessionState = "created" | "running" | "closed";
 export type AttachRole = "operator";
 
+export type SessionAiActivityState = "idle" | "running" | "attention" | "completed";
+export type SessionAiActivityAgent = "codex" | "claude_code" | "opencode" | "zcode";
+
+export interface SessionAiActivityPayload {
+  kind: "ai";
+  agent: SessionAiActivityAgent;
+  state: SessionAiActivityState;
+  changed_at_ms: UnixTimestampMillis;
+}
+
 export interface SessionSummaryPayload {
   session_id: UUID;
   name?: string | null;
@@ -109,10 +119,19 @@ export interface SessionSummaryPayload {
   size: TerminalSize;
   files_path?: string | null;
   created_at_ms?: UnixTimestampMillis | null;
+  activity?: SessionAiActivityPayload | null;
 }
 
 export interface SessionListResultPayload {
   sessions: SessionSummaryPayload[];
+}
+
+export interface WorkspaceMetadataState {
+  sessions?: SessionSummaryPayload[];
+  clients?: DaemonClientSummaryPayload[];
+  daemon?: DaemonStatusResultPayload;
+  cwd?: Record<UUID, string>;
+  rtt_ms?: number | null;
 }
 
 export interface DaemonClientsPayload {}

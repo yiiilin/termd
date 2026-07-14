@@ -1,4 +1,4 @@
-import { Check, GripVertical, Pencil, Trash2, X } from "lucide-react";
+import { Bot, Check, CheckCircle2, CircleAlert, GripVertical, MonitorUp, Pencil, Trash2, X } from "lucide-react";
 import {
   useEffect,
   useRef,
@@ -7,9 +7,77 @@ import {
   type PointerEvent as ReactPointerEvent,
 } from "react";
 import { flushSync } from "react-dom";
-import type { SessionSummaryPayload, UUID } from "../protocol/types";
+import type { SessionAiActivityPayload, SessionSummaryPayload, UUID } from "../protocol/types";
 import { sessionDisplayName } from "../session-names";
-import { useI18n } from "../i18n";
+import { useI18n, type Translate } from "../i18n";
+
+export function sessionActivityClassName(activity?: SessionAiActivityPayload | null): string {
+  return activity ? `activity-${activity.state}` : "";
+}
+
+function sessionActivityLabel(t: Translate, activity?: SessionAiActivityPayload | null): string | undefined {
+  if (!activity) return undefined;
+  const agent = t(`sessions.activity.agent.${activity.agent}`);
+  return t(`sessions.activity.${activity.state}`, { agent });
+}
+
+function SessionActivityIndicator(props: {
+  activity?: SessionAiActivityPayload | null;
+  compact?: boolean;
+}) {
+  const { t } = useI18n();
+  const activity = props.activity;
+  if (!activity) return null;
+  const label = sessionActivityLabel(t, activity);
+  const icon = activity.state === "completed"
+    ? <CheckCircle2 size={props.compact ? 11 : 13} aria-hidden="true" />
+    : activity.state === "attention"
+      ? <CircleAlert size={props.compact ? 11 : 13} aria-hidden="true" />
+      : <Bot size={props.compact ? 11 : 13} aria-hidden="true" />;
+  return (
+    <span
+      className={["session-activity-indicator", props.compact ? "compact" : "", sessionActivityClassName(activity)]
+        .filter(Boolean)
+        .join(" ")}
+      aria-hidden="true"
+      title={label}
+    >
+      {icon}
+    </span>
+  );
+}
+
+export function CollapsedSessionButton(props: {
+  session: SessionSummaryPayload;
+  selected: boolean;
+  hasNewOutput: boolean;
+  onAttach: (sessionId: UUID) => void;
+}) {
+  const { t } = useI18n();
+  const displayName = sessionDisplayName(props.session);
+  const selectLabel = props.hasNewOutput
+    ? t("sessions.selectNewOutput", { name: displayName })
+    : t("sessions.select", { name: displayName });
+  const activityLabel = sessionActivityLabel(t, props.session.activity);
+  return (
+    <button
+      type="button"
+      className={[
+        "icon-button",
+        props.selected ? "selected-session-dot" : "",
+        props.hasNewOutput ? "has-new-output" : "",
+        sessionActivityClassName(props.session.activity),
+      ]
+        .filter(Boolean)
+        .join(" ")}
+      aria-label={activityLabel ? `${selectLabel}, ${activityLabel}` : selectLabel}
+      onClick={() => props.onAttach(props.session.session_id)}
+    >
+      <MonitorUp size={15} aria-hidden="true" />
+      <SessionActivityIndicator activity={props.session.activity} compact />
+    </button>
+  );
+}
 
 interface SessionListProps {
   sessions: SessionSummaryPayload[];
@@ -158,6 +226,10 @@ export function SessionList(props: SessionListProps) {
         const displayName = sessionDisplayName(session);
         const isRenaming = props.renamingSessionId === session.session_id;
         const hasNewOutput = props.newOutputSessionIds?.has(session.session_id) ?? false;
+        const openLabel = hasNewOutput
+          ? t("sessions.openNewOutput", { name: displayName })
+          : t("sessions.open", { name: displayName });
+        const activityLabel = sessionActivityLabel(t, session.activity);
         const isDragTarget =
           Boolean(draggingSessionId) &&
           draggingSessionId !== session.session_id &&
@@ -168,6 +240,7 @@ export function SessionList(props: SessionListProps) {
               "session-row",
               session.session_id === props.selectedSessionId ? "selected" : "",
               hasNewOutput ? "has-new-output" : "",
+              sessionActivityClassName(session.activity),
               draggingSessionId === session.session_id ? "dragging" : "",
               isDragTarget ? "drag-target" : "",
             ]
@@ -306,10 +379,11 @@ export function SessionList(props: SessionListProps) {
                   <button
                     type="button"
                     className={["session-open-button", hasNewOutput ? "has-new-output" : ""].filter(Boolean).join(" ")}
-                    aria-label={hasNewOutput ? t("sessions.openNewOutput", { name: displayName }) : t("sessions.open", { name: displayName })}
+                    aria-label={activityLabel ? `${openLabel}, ${activityLabel}` : openLabel}
                     onClick={() => props.onAttach(session.session_id)}
                   >
                     <strong>{displayName}</strong>
+                    <SessionActivityIndicator activity={session.activity} />
                   </button>
                 )}
               </div>

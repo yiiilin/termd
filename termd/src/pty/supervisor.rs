@@ -38,6 +38,7 @@ use crate::net::pty_bridge::NonBlockingPortablePtyBackend;
 use self::terminal_journal::{SupervisorTerminalCache, SupervisorTerminalMirror};
 #[cfg(test)]
 use self::terminal_journal::{TERMINAL_ATTACH_TAIL_MAX_BYTES, TERMINAL_JOURNAL_MAX_EVENTS};
+use super::activity::{SessionActivityDetector, foreground_process_for_shell};
 use super::{
     CommandSpec, PtyAttachment, PtyAttachmentBootstrap, PtyBackend, PtyError, PtyRestoreInfo,
     PtyResult, PtySession, PtySize, PtySnapshot, PtyStartupGrant, PtySupervisorStatus,
@@ -613,7 +614,9 @@ struct SupervisorPtySession {
     next_request_id: AtomicU64,
     controller_identity: StdMutex<Option<ControllerIdentity>>,
     cached_size: StdMutex<PtySize>,
-    cached_process_id: StdMutex<Option<u32>>,
+    cached_process_id: Arc<StdMutex<Option<u32>>>,
+    activity_detector: Arc<StdMutex<SessionActivityDetector>>,
+    activity_change_signal: Arc<StdMutex<Option<watch::Sender<u64>>>>,
     close_operation_id: StdMutex<Option<u64>>,
     cleanup_capability: Option<[u8; CLEANUP_CAPABILITY_BYTES]>,
     exited: Arc<AtomicBool>,
@@ -652,6 +655,9 @@ impl SupervisorPtySession {
             PtySize::default(),
         )));
         let bootstrap_terminal_frames = Arc::new(StdMutex::new(Some(VecDeque::new())));
+        let cached_process_id = Arc::new(StdMutex::new(None));
+        let activity_detector = Arc::new(StdMutex::new(SessionActivityDetector::default()));
+        let activity_change_signal = Arc::new(StdMutex::new(None));
         let exited = Arc::new(AtomicBool::new(false));
         let (output_signal_tx, output_signal_rx) = watch::channel(OUTPUT_SIGNAL_INIT);
         spawn_supervisor_reader_thread(
@@ -662,6 +668,9 @@ impl SupervisorPtySession {
                 pending_terminal_frames: Arc::clone(&pending_terminal_frames),
                 terminal_mirror: Arc::clone(&terminal_mirror),
                 bootstrap_terminal_frames: Arc::clone(&bootstrap_terminal_frames),
+                cached_process_id: Arc::clone(&cached_process_id),
+                activity_detector: Arc::clone(&activity_detector),
+                activity_change_signal: Arc::clone(&activity_change_signal),
                 exited: Arc::clone(&exited),
             },
             output_signal_tx.clone(),
@@ -687,7 +696,9 @@ impl SupervisorPtySession {
             next_request_id: AtomicU64::new(1),
             controller_identity: StdMutex::new(None),
             cached_size: StdMutex::new(PtySize::default()),
-            cached_process_id: StdMutex::new(None),
+            cached_process_id,
+            activity_detector,
+            activity_change_signal,
             close_operation_id: StdMutex::new(None),
             cleanup_capability,
             exited,
@@ -872,6 +883,9 @@ impl SupervisorPtySession {
                         pending_terminal_frames: Arc::clone(&self.pending_terminal_frames),
                         terminal_mirror: Arc::clone(&self.terminal_mirror),
                         bootstrap_terminal_frames: Arc::clone(&self.bootstrap_terminal_frames),
+                        cached_process_id: Arc::clone(&self.cached_process_id),
+                        activity_detector: Arc::clone(&self.activity_detector),
+                        activity_change_signal: Arc::clone(&self.activity_change_signal),
                         exited: Arc::clone(&self.exited),
                     },
                     self.output_signal_tx.clone(),
@@ -988,6 +1002,9 @@ impl SupervisorPtySession {
             published |= apply_and_enqueue_daemon_terminal_frame(
                 &self.pending_terminal_frames,
                 &self.terminal_mirror,
+                &self.cached_process_id,
+                &self.activity_detector,
+                &self.activity_change_signal,
                 frame,
             );
         }
@@ -998,6 +1015,9 @@ impl SupervisorPtySession {
             published |= apply_and_enqueue_daemon_terminal_frame(
                 &self.pending_terminal_frames,
                 &self.terminal_mirror,
+                &self.cached_process_id,
+                &self.activity_detector,
+                &self.activity_change_signal,
                 frame,
             );
         }
@@ -1481,6 +1501,9 @@ struct SupervisorReaderShared {
     pending_terminal_frames: Arc<StdMutex<VecDeque<PtyTerminalFrame>>>,
     terminal_mirror: Arc<StdMutex<SupervisorTerminalMirror>>,
     bootstrap_terminal_frames: Arc<StdMutex<Option<VecDeque<PtyTerminalFrame>>>>,
+    cached_process_id: Arc<StdMutex<Option<u32>>>,
+    activity_detector: Arc<StdMutex<SessionActivityDetector>>,
+    activity_change_signal: Arc<StdMutex<Option<watch::Sender<u64>>>>,
     exited: Arc<AtomicBool>,
 }
 
@@ -1519,6 +1542,9 @@ fn prepare_supervisor_reader_thread(
                     shared.pending_terminal_frames,
                     shared.terminal_mirror,
                     shared.bootstrap_terminal_frames,
+                    shared.cached_process_id,
+                    shared.activity_detector,
+                    shared.activity_change_signal,
                     output_signal_tx,
                     shared.exited,
                 );
@@ -1680,6 +1706,20 @@ impl PtySession for SupervisorPtySession {
 
     fn output_signal(&self) -> Option<watch::Receiver<u64>> {
         Some(self.output_signal_rx.clone())
+    }
+
+    fn session_activity(&self) -> Option<termd_proto::SessionAiActivityPayload> {
+        self.activity_detector
+            .lock()
+            .expect("session activity detector mutex poisoned")
+            .activity()
+    }
+
+    fn set_activity_change_signal(&mut self, signal: watch::Sender<u64>) {
+        *self
+            .activity_change_signal
+            .lock()
+            .expect("session activity change signal mutex poisoned") = Some(signal);
     }
 
     fn write_all(&mut self, bytes: &[u8]) -> PtyResult<()> {
@@ -1897,6 +1937,9 @@ fn supervisor_reader_loop(
     pending_terminal_frames: Arc<StdMutex<VecDeque<PtyTerminalFrame>>>,
     terminal_mirror: Arc<StdMutex<SupervisorTerminalMirror>>,
     bootstrap_terminal_frames: Arc<StdMutex<Option<VecDeque<PtyTerminalFrame>>>>,
+    cached_process_id: Arc<StdMutex<Option<u32>>>,
+    activity_detector: Arc<StdMutex<SessionActivityDetector>>,
+    activity_change_signal: Arc<StdMutex<Option<watch::Sender<u64>>>>,
     output_signal_tx: watch::Sender<u64>,
     exited: Arc<AtomicBool>,
 ) {
@@ -1955,6 +1998,9 @@ fn supervisor_reader_loop(
                 if apply_and_enqueue_daemon_terminal_frame(
                     &pending_terminal_frames,
                     &terminal_mirror,
+                    &cached_process_id,
+                    &activity_detector,
+                    &activity_change_signal,
                     frame,
                 ) {
                     let next = output_signal_tx.borrow().wrapping_add(1);
@@ -1988,6 +2034,9 @@ fn terminal_frame_retained_bytes(frame: &PtyTerminalFrame) -> usize {
 fn apply_and_enqueue_daemon_terminal_frame(
     pending_terminal_frames: &Arc<StdMutex<VecDeque<PtyTerminalFrame>>>,
     terminal_mirror: &Arc<StdMutex<SupervisorTerminalMirror>>,
+    cached_process_id: &Arc<StdMutex<Option<u32>>>,
+    activity_detector: &Arc<StdMutex<SessionActivityDetector>>,
+    activity_change_signal: &Arc<StdMutex<Option<watch::Sender<u64>>>>,
     frame: PtyTerminalFrame,
 ) -> bool {
     let applied = terminal_mirror
@@ -1995,9 +2044,34 @@ fn apply_and_enqueue_daemon_terminal_frame(
         .expect("terminal mirror mutex poisoned")
         .apply_frame(&frame);
     if applied {
+        if let PtyTerminalFrame::Output { data, .. } = &frame {
+            let shell_pid = *cached_process_id.lock().expect("cached pid mutex poisoned");
+            let activity_changed = activity_detector
+                .lock()
+                .expect("session activity detector mutex poisoned")
+                .observe_output(
+                    data,
+                    u64::try_from(current_unix_timestamp_millis()).unwrap_or(u64::MAX),
+                    || foreground_process_for_shell(shell_pid),
+                );
+            if activity_changed {
+                notify_activity_changed(activity_change_signal);
+            }
+        }
         enqueue_daemon_terminal_frame(pending_terminal_frames, terminal_mirror, frame);
     }
     applied
+}
+
+fn notify_activity_changed(activity_change_signal: &Arc<StdMutex<Option<watch::Sender<u64>>>>) {
+    let signal = activity_change_signal
+        .lock()
+        .expect("session activity change signal mutex poisoned")
+        .clone();
+    if let Some(signal) = signal {
+        let next = signal.borrow().saturating_add(1);
+        signal.send_replace(next);
+    }
 }
 
 fn enqueue_daemon_terminal_frame(
@@ -5875,7 +5949,9 @@ mod tests {
             next_request_id: AtomicU64::new(1),
             controller_identity: StdMutex::new(None),
             cached_size: StdMutex::new(PtySize::new(24, 80)),
-            cached_process_id: StdMutex::new(Some(42)),
+            cached_process_id: Arc::new(StdMutex::new(Some(42))),
+            activity_detector: Arc::new(StdMutex::new(SessionActivityDetector::default())),
+            activity_change_signal: Arc::new(StdMutex::new(None)),
             close_operation_id: StdMutex::new(None),
             cleanup_capability: None,
             exited: Arc::new(AtomicBool::new(false)),
@@ -6157,6 +6233,9 @@ mod tests {
                 reader_pending_frames,
                 reader_terminal_mirror,
                 reader_bootstrap_terminal_frames,
+                Arc::new(StdMutex::new(Some(42))),
+                Arc::new(StdMutex::new(SessionActivityDetector::default())),
+                Arc::new(StdMutex::new(None)),
                 reader_signal,
                 Arc::new(AtomicBool::new(false)),
             );
@@ -6225,7 +6304,9 @@ mod tests {
             next_request_id: AtomicU64::new(8),
             controller_identity: StdMutex::new(None),
             cached_size: StdMutex::new(PtySize::new(4, 40)),
-            cached_process_id: StdMutex::new(Some(42)),
+            cached_process_id: Arc::new(StdMutex::new(Some(42))),
+            activity_detector: Arc::new(StdMutex::new(SessionActivityDetector::default())),
+            activity_change_signal: Arc::new(StdMutex::new(None)),
             close_operation_id: StdMutex::new(None),
             cleanup_capability: None,
             exited: Arc::new(AtomicBool::new(false)),
@@ -6258,6 +6339,9 @@ mod tests {
                 pending_requests,
                 reader_pending_frames,
                 terminal_mirror,
+                Arc::new(StdMutex::new(None)),
+                Arc::new(StdMutex::new(Some(42))),
+                Arc::new(StdMutex::new(SessionActivityDetector::default())),
                 Arc::new(StdMutex::new(None)),
                 output_signal_tx,
                 Arc::new(AtomicBool::new(false)),
@@ -8548,7 +8632,9 @@ mod tests {
             next_request_id: AtomicU64::new(1),
             controller_identity: StdMutex::new(None),
             cached_size: StdMutex::new(PtySize::new(24, 80)),
-            cached_process_id: StdMutex::new(Some(42)),
+            cached_process_id: Arc::new(StdMutex::new(Some(42))),
+            activity_detector: Arc::new(StdMutex::new(SessionActivityDetector::default())),
+            activity_change_signal: Arc::new(StdMutex::new(None)),
             close_operation_id: StdMutex::new(None),
             cleanup_capability: None,
             exited: Arc::new(AtomicBool::new(false)),

@@ -20,8 +20,8 @@ use crate::pty::{
 use crate::session::{AttachRole, SessionError, SessionManager, SessionState, TerminalSize};
 use crate::state::SessionStateRecord;
 use termd_proto::{
-    SessionId, SessionState as ProtoSessionState, TerminalSize as ProtoTerminalSize,
-    UnixTimestampMillis,
+    SessionAiActivityPayload, SessionId, SessionState as ProtoSessionState,
+    TerminalSize as ProtoTerminalSize, UnixTimestampMillis,
 };
 use uuid::Uuid;
 
@@ -145,6 +145,7 @@ pub struct SessionRuntime<B: PtyBackend> {
     sessions: SessionManager,
     runtime_sessions: HashMap<String, RuntimeSession>,
     next_session_number: u64,
+    activity_change_signal: Option<watch::Sender<u64>>,
 }
 
 impl<B: PtyBackend> SessionRuntime<B> {
@@ -155,12 +156,22 @@ impl<B: PtyBackend> SessionRuntime<B> {
         Self::from_shared_backend(Arc::new(backend))
     }
 
+    pub(crate) fn new_with_activity_change_signal(
+        backend: B,
+        activity_change_signal: watch::Sender<u64>,
+    ) -> Self {
+        let mut runtime = Self::from_shared_backend(Arc::new(backend));
+        runtime.activity_change_signal = Some(activity_change_signal);
+        runtime
+    }
+
     pub(crate) fn from_shared_backend(backend: Arc<B>) -> Self {
         Self {
             backend,
             sessions: SessionManager::default(),
             runtime_sessions: HashMap::new(),
             next_session_number: 1,
+            activity_change_signal: None,
         }
     }
 
@@ -171,7 +182,7 @@ impl<B: PtyBackend> SessionRuntime<B> {
     pub(crate) fn publish_owned_session(
         &mut self,
         session_id: &str,
-        pty: Box<dyn PtySession>,
+        mut pty: Box<dyn PtySession>,
         size: TerminalSize,
     ) {
         assert!(!self.runtime_sessions.contains_key(session_id));
@@ -182,6 +193,7 @@ impl<B: PtyBackend> SessionRuntime<B> {
             .resize(session_id, size)
             .expect("ownership create prevalidated terminal size");
         let now_ms = current_unix_timestamp_millis();
+        self.configure_activity_signal(&mut *pty);
         self.runtime_sessions.insert(
             session_id.to_owned(),
             RuntimeSession {
@@ -224,10 +236,11 @@ impl<B: PtyBackend> SessionRuntime<B> {
         }
 
         // 先启动 PTY，只有成功后才写入 SessionManager，避免留下没有进程句柄的半成品 session。
-        let pty = self.backend.spawn_named(session_id, &command, pty_size)?;
+        let mut pty = self.backend.spawn_named(session_id, &command, pty_size)?;
         self.sessions.create_session(session_id.to_owned())?;
         self.sessions.resize(session_id, size)?;
         let now_ms = current_unix_timestamp_millis();
+        self.configure_activity_signal(&mut *pty);
         self.runtime_sessions.insert(
             session_id.to_owned(),
             RuntimeSession {
@@ -261,7 +274,7 @@ impl<B: PtyBackend> SessionRuntime<B> {
         let session_id = record.session_id.0.to_string();
         let size = proto_size_to_runtime(record.size);
         let pty_size = terminal_size_to_pty_size(size)?;
-        let pty = self
+        let mut pty = self
             .backend
             .reconnect(&session_id, restore_info, pty_size)?;
 
@@ -273,6 +286,7 @@ impl<B: PtyBackend> SessionRuntime<B> {
             let _ = self.sessions.attach(&session_id, recovery_device.clone())?;
             let _ = self.sessions.detach(&session_id, &recovery_device);
         }
+        self.configure_activity_signal(&mut *pty);
         self.runtime_sessions.insert(
             session_id,
             RuntimeSession {
@@ -663,6 +677,14 @@ impl<B: PtyBackend> SessionRuntime<B> {
         Ok(self.runtime_session(session_id)?.pty.process_id())
     }
 
+    pub fn session_activity(
+        &self,
+        session_id: &str,
+    ) -> RuntimeResult<Option<SessionAiActivityPayload>> {
+        self.ensure_open_session(session_id)?;
+        Ok(self.runtime_session(session_id)?.pty.session_activity())
+    }
+
     /// 查询底层交互进程当前工作目录；平台不支持时返回 `None`。
     pub fn current_working_directory(&self, session_id: &str) -> RuntimeResult<Option<PathBuf>> {
         self.ensure_open_session(session_id)?;
@@ -785,6 +807,12 @@ impl<B: PtyBackend> SessionRuntime<B> {
             .ok_or(RuntimeError::SessionNotFound)
     }
 
+    fn configure_activity_signal(&self, pty: &mut dyn PtySession) {
+        if let Some(signal) = &self.activity_change_signal {
+            pty.set_activity_change_signal(signal.clone());
+        }
+    }
+
     fn detach_all_watched_attachments(runtime_session: &mut RuntimeSession) {
         // 中文注释：session close/discard 已经在收尾阶段，attachment detach 失败不应阻止
         // host 终止或 runtime 丢弃；具体 backend 的 Drop 仍会做 best-effort 兜底。
@@ -888,6 +916,8 @@ mod tests {
         authority_enabled: bool,
         attached_devices: HashSet<String>,
         restore_info: Option<PtyRestoreInfo>,
+        activity: Option<SessionAiActivityPayload>,
+        activity_change_signal: Option<watch::Sender<u64>>,
     }
 
     #[derive(Debug)]
@@ -966,6 +996,18 @@ mod tests {
             self.state.lock().unwrap().attached_devices =
                 devices.into_iter().map(Into::into).collect();
         }
+
+        fn report_activity(&self, activity: SessionAiActivityPayload) {
+            let signal = {
+                let mut state = self.state.lock().unwrap();
+                state.activity = Some(activity);
+                state.activity_change_signal.clone()
+            };
+            if let Some(signal) = signal {
+                let next = signal.borrow().saturating_add(1);
+                signal.send_replace(next);
+            }
+        }
     }
 
     impl PtyBackend for FakePtyBackend {
@@ -1040,6 +1082,14 @@ mod tests {
     impl PtySession for FakePtySession {
         fn read(&mut self, _buffer: &mut [u8]) -> PtyResult<usize> {
             Ok(0)
+        }
+
+        fn session_activity(&self) -> Option<SessionAiActivityPayload> {
+            self.state.lock().unwrap().activity
+        }
+
+        fn set_activity_change_signal(&mut self, signal: watch::Sender<u64>) {
+            self.state.lock().unwrap().activity_change_signal = Some(signal);
         }
 
         fn write_all(&mut self, bytes: &[u8]) -> PtyResult<()> {
@@ -1165,6 +1215,30 @@ mod tests {
         let role = runtime.attach(&session_id, "dev-a").unwrap();
 
         assert_eq!(role, AttachRole::Operator);
+    }
+
+    #[test]
+    fn session_activity_is_read_from_pty_and_forwards_change_signal() {
+        let backend = FakePtyBackend::default();
+        let (signal, changes) = watch::channel(0_u64);
+        let mut runtime = SessionRuntime::new_with_activity_change_signal(backend.clone(), signal);
+        let session_id = runtime
+            .create_session(CommandSpec::new("sh"), TerminalSize::cells(24, 80))
+            .unwrap();
+        let activity = SessionAiActivityPayload {
+            kind: termd_proto::SessionActivityKind::Ai,
+            agent: termd_proto::SessionActivityAgent::Codex,
+            state: termd_proto::SessionActivityState::Running,
+            changed_at_ms: UnixTimestampMillis(123),
+        };
+
+        backend.report_activity(activity);
+
+        assert!(changes.has_changed().unwrap());
+        assert_eq!(
+            runtime.session_activity(&session_id).unwrap(),
+            Some(activity)
+        );
     }
 
     #[test]

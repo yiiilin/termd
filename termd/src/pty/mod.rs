@@ -3,6 +3,7 @@
 //! 这个模块只负责“如何启动并驱动一个伪终端进程”。认证、控制权、relay 路由、
 //! WebSocket 协议都在更外层处理，避免 PTY 后端意外承担控制权逻辑。
 
+mod activity;
 pub mod portable;
 pub mod supervisor;
 
@@ -12,6 +13,7 @@ use std::error::Error;
 use std::fmt::{self, Display};
 use std::io;
 use std::path::{Path, PathBuf};
+use termd_proto::SessionAiActivityPayload;
 use tokio::sync::watch;
 
 /// PTY 模块统一使用的 Result 类型。
@@ -521,6 +523,14 @@ pub trait PtySession: Send {
     fn output_signal(&self) -> Option<watch::Receiver<u64>> {
         None
     }
+
+    /// daemon-only, best-effort session activity inferred from this PTY.
+    fn session_activity(&self) -> Option<SessionAiActivityPayload> {
+        None
+    }
+
+    /// Installs a low-frequency notification target for semantic activity changes.
+    fn set_activity_change_signal(&mut self, _signal: watch::Sender<u64>) {}
 
     /// 写入用户输入或控制序列。调用前应由 session 层确认当前设备具备控制权。
     fn write_all(&mut self, bytes: &[u8]) -> PtyResult<()>;

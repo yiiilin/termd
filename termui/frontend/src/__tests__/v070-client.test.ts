@@ -198,7 +198,31 @@ describe("V070Client", () => {
 
     transport.onMetadata?.(JSON.stringify({
       type: "metadata.snapshot",
-      payload: { revision: 7, state: { sessions: [], clients: [{ device_id: "device-a" }], daemon: { cpu_percent: 1 } } },
+      payload: {
+        revision: 7,
+        state: {
+          sessions: [
+            {
+              session_id: "session-codex",
+              activity: { kind: "ai", agent: "codex", state: "running", changed_at_ms: 123 },
+            },
+            {
+              session_id: "session-claude",
+              activity: { kind: "ai", agent: "claude_code", state: "attention", changed_at_ms: 124 },
+            },
+            {
+              session_id: "session-opencode",
+              activity: { kind: "ai", agent: "opencode", state: "completed", changed_at_ms: 125 },
+            },
+            {
+              session_id: "session-zcode",
+              activity: { kind: "ai", agent: "zcode", state: "idle", changed_at_ms: 126 },
+            },
+          ],
+          clients: [{ device_id: "device-a" }],
+          daemon: { cpu_percent: 1 },
+        },
+      },
     }));
     transport.onMetadata?.(JSON.stringify({
       type: "metadata.update",
@@ -211,7 +235,30 @@ describe("V070Client", () => {
     }));
 
     expect(states).toEqual([
-      { revision: 7, state: expect.objectContaining({ clients: [{ device_id: "device-a" }] }) },
+      {
+        revision: 7,
+        state: expect.objectContaining({
+          clients: [{ device_id: "device-a" }],
+          sessions: [
+            {
+              session_id: "session-codex",
+              activity: { kind: "ai", agent: "codex", state: "running", changed_at_ms: 123 },
+            },
+            {
+              session_id: "session-claude",
+              activity: { kind: "ai", agent: "claude_code", state: "attention", changed_at_ms: 124 },
+            },
+            {
+              session_id: "session-opencode",
+              activity: { kind: "ai", agent: "opencode", state: "completed", changed_at_ms: 125 },
+            },
+            {
+              session_id: "session-zcode",
+              activity: { kind: "ai", agent: "zcode", state: "idle", changed_at_ms: 126 },
+            },
+          ],
+        }),
+      },
       { revision: 8, state: expect.objectContaining({ clients: [{ device_id: "device-b" }] }) },
     ]);
   });

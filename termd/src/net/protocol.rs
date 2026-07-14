@@ -862,7 +862,8 @@ where
         );
         let (daemon_clients_signal, _) = watch::channel(0);
         let (v070_metadata_signal, _) = watch::channel(0);
-        let runtime = SessionRuntime::new(backend);
+        let runtime =
+            SessionRuntime::new_with_activity_change_signal(backend, v070_metadata_signal.clone());
         let ownership = SessionOwnership::open(&config.state_path, runtime.backend_handle())
             .map_err(|error| StateError::InvalidOwnershipState {
                 source: error.to_string(),
@@ -2611,6 +2612,7 @@ where
                     size: runtime_size_to_proto(size),
                     files_path: persisted.and_then(|session| session.files_path.clone()),
                     created_at_ms: persisted.map(|session| session.created_at_ms),
+                    activity: self.runtime.session_activity(internal_id).ok().flatten(),
                 })
             })
             .collect();

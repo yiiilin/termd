@@ -52,7 +52,7 @@ import {
   selectDefaultServer,
 } from "./state/browser-state";
 import { ConnectionPanel } from "./components/ConnectionPanel";
-import { SessionList } from "./components/SessionList";
+import { CollapsedSessionButton, SessionList } from "./components/SessionList";
 import { StatusBar } from "./components/StatusBar";
 import { TerminalPane } from "./components/TerminalPane";
 import type { TerminalOutputItem, TerminalResyncOptions } from "./components/terminal/types";
@@ -3481,25 +3481,13 @@ export default function App() {
                 </div>
                 <section className="collapsed-session-list" aria-label={t("app.collapsedSessions")}>
                   {orderedSessions.map((session) => (
-                    <button
-                      type="button"
+                    <CollapsedSessionButton
                       key={session.session_id}
-                      className={[
-                        "icon-button",
-                        session.session_id === selectedSessionId ? "selected-session-dot" : "",
-                        newOutputSessionIds.has(session.session_id) ? "has-new-output" : "",
-                      ]
-                        .filter(Boolean)
-                        .join(" ")}
-                      aria-label={
-                        newOutputSessionIds.has(session.session_id)
-                          ? t("sessions.selectNewOutput", { name: sessionDisplayName(session) })
-                          : t("sessions.select", { name: sessionDisplayName(session) })
-                      }
-                      onClick={() => void handleAttach(session.session_id)}
-                    >
-                      <MonitorUp size={15} aria-hidden="true" />
-                    </button>
+                      session={session}
+                      selected={session.session_id === selectedSessionId}
+                      hasNewOutput={newOutputSessionIds.has(session.session_id)}
+                      onAttach={(sessionId) => void handleAttach(sessionId)}
+                    />
                   ))}
                 </section>
               </>

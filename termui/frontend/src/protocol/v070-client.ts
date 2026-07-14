@@ -14,6 +14,7 @@ import type {
   SessionResizedPayload,
   TerminalSize,
   UUID,
+  WorkspaceMetadataState,
 } from "./types";
 import { WorkspaceTransport, type WorkspaceCommand } from "./workspace-transport";
 import { bytesToBase64 } from "./wire";
@@ -69,7 +70,7 @@ export class V070Client {
   readonly serverId: UUID;
   readonly deviceId: UUID;
   isClosed = false;
-  private metadataState?: any;
+  private metadataState?: WorkspaceMetadataState;
   private metadataRevision?: number;
   private metadataConnected = false;
   private metadataFailure?: ProtocolClientError;
@@ -79,7 +80,7 @@ export class V070Client {
   private metadataReconnectNeeded = false;
   private metadataReconnectTimer?: ReturnType<typeof globalThis.setTimeout>;
   private metadataWaiters: Array<{ resolve: () => void; reject: (error: unknown) => void }> = [];
-  private metadataListeners = new Set<(revision: number, state: any) => void>();
+  private metadataListeners = new Set<(revision: number, state: WorkspaceMetadataState) => void>();
   private terminalSessionId?: UUID;
   private terminalOpen?: PendingTerminalOpen;
   private terminalGeneration = 0;
@@ -121,7 +122,7 @@ export class V070Client {
 
   async subscribeMetadata(): Promise<void> { await this.ensureMetadata(); }
 
-  watchMetadata(listener: (revision: number, state: any) => void): () => void {
+  watchMetadata(listener: (revision: number, state: WorkspaceMetadataState) => void): () => void {
     this.metadataListeners.add(listener);
     if (this.metadataRevision !== undefined && this.metadataState !== undefined) {
       listener(this.metadataRevision, this.metadataState);
@@ -141,7 +142,7 @@ export class V070Client {
 
   async getDaemonStatus(): Promise<DaemonStatusResultPayload> {
     await this.ensureMetadata();
-    return this.metadataState?.daemon ?? {};
+    return this.metadataState?.daemon ?? ({} as DaemonStatusResultPayload);
   }
 
   async measureLatency(): Promise<number> { await this.ensureMetadata(); return this.metadataState?.rtt_ms ?? 0; }
@@ -470,15 +471,16 @@ export class V070Client {
     } else if (message.type !== "metadata.snapshot") {
       return;
     }
+    const metadataState = (message.payload?.state ?? {}) as WorkspaceMetadataState;
     this.metadataRevision = revision;
-    this.metadataState = message.payload?.state ?? {};
+    this.metadataState = metadataState;
     this.metadataFailure = undefined;
     this.metadataConnected = true;
     this.metadataReconnectAttempt = 0;
     this.metadataReconnectNeeded = false;
     this.clearMetadataReconnectTimer();
     for (const waiter of this.metadataWaiters.splice(0)) waiter.resolve();
-    for (const listener of this.metadataListeners) listener(revision, this.metadataState);
+    for (const listener of this.metadataListeners) listener(revision, metadataState);
   }
 
   private handleTerminal(data: unknown): void {

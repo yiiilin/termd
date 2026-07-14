@@ -641,6 +641,43 @@ pub struct SessionAttachedPayload {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct SessionListPayload {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionActivityKind {
+    Ai,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionActivityAgent {
+    Codex,
+    ClaudeCode,
+    #[serde(rename = "opencode")]
+    OpenCode,
+    #[serde(rename = "zcode")]
+    ZCode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionActivityState {
+    Idle,
+    Running,
+    Attention,
+    Completed,
+}
+
+/// daemon 从 session 自身 PTY 活动推导出的可选展示状态。
+///
+/// 该字段不是认证或控制依据；未知 agent 必须省略整个 activity，保持旧客户端兼容。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionAiActivityPayload {
+    pub kind: SessionActivityKind,
+    pub agent: SessionActivityAgent,
+    pub state: SessionActivityState,
+    pub changed_at_ms: UnixTimestampMillis,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionSummaryPayload {
     pub session_id: SessionId,
@@ -654,6 +691,9 @@ pub struct SessionSummaryPayload {
     /// 创建时间只用于客户端排序和人类可读展示，不参与权限或路由判断。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at_ms: Option<UnixTimestampMillis>,
+    /// 可选的 AI 终端活动提示；旧 daemon/客户端可以完全忽略该字段。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<SessionAiActivityPayload>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2459,6 +2499,7 @@ mod tests {
                 size,
                 files_path: Some("/home/me/project".to_owned()),
                 created_at_ms: Some(UnixTimestampMillis(1_710_000_000_000)),
+                activity: None,
             }],
         });
         assert_roundtrip(ControlRequestPayload {
@@ -2499,6 +2540,51 @@ mod tests {
         assert!(!created.resize_owner);
         assert!(!attached.resize_owner);
         assert!(!resized.resize_owner);
+    }
+
+    #[test]
+    fn session_summary_activity_is_optional_and_uses_stable_wire_values() {
+        let session_id = SessionId::new();
+        let without_activity: SessionSummaryPayload = serde_json::from_value(serde_json::json!({
+            "session_id": session_id,
+            "state": "running",
+            "size": TerminalSize::new(24, 80)
+        }))
+        .unwrap();
+        assert_eq!(without_activity.activity, None);
+        let encoded_without = serde_json::to_value(&without_activity).unwrap();
+        assert!(encoded_without.get("activity").is_none());
+
+        for (agent, wire_agent) in [
+            (SessionActivityAgent::Codex, "codex"),
+            (SessionActivityAgent::ClaudeCode, "claude_code"),
+            (SessionActivityAgent::OpenCode, "opencode"),
+            (SessionActivityAgent::ZCode, "zcode"),
+        ] {
+            let with_activity = SessionSummaryPayload {
+                activity: Some(SessionAiActivityPayload {
+                    kind: SessionActivityKind::Ai,
+                    agent,
+                    state: SessionActivityState::Running,
+                    changed_at_ms: UnixTimestampMillis(1_710_000_000_123),
+                }),
+                ..without_activity.clone()
+            };
+            let encoded = serde_json::to_value(&with_activity).unwrap();
+            assert_eq!(
+                encoded["activity"],
+                serde_json::json!({
+                    "kind": "ai",
+                    "agent": wire_agent,
+                    "state": "running",
+                    "changed_at_ms": 1_710_000_000_123_u64
+                })
+            );
+            assert_eq!(
+                serde_json::from_value::<SessionSummaryPayload>(encoded).unwrap(),
+                with_activity
+            );
+        }
     }
 
     #[test]
