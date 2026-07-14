@@ -634,7 +634,8 @@ test_termd_supervisor_version_match_keeps_runtime_state() (
   local tmp_dir unit_file sqlite_file socket_file supervisor_version
   tmp_dir="$(mktemp -d)"
   trap 'rm -rf "$tmp_dir"' EXIT
-  TERMD_STATE_DIR="${tmp_dir}/termd"
+  unit_file="${tmp_dir}/termd.service"
+  TERMD_STATE_DIR="${unit_file%.service}-state"
   export TERMD_STATE_DIR
   STATE_DIR="${TERMD_STATE_DIR}"
   mkdir -p "${STATE_DIR}/termd-supervisors"
@@ -645,7 +646,6 @@ test_termd_supervisor_version_match_keeps_runtime_state() (
   create_stale_supervisor_socket "$socket_file"
 
   SUPERVISOR_VERSION="$supervisor_version"
-  unit_file="${tmp_dir}/termd.service"
   run_fake_termd_install "$unit_file" >/dev/null
   unset SUPERVISOR_VERSION
 
@@ -693,7 +693,8 @@ test_termd_baked_supervisor_default_keeps_runtime_state() (
   local tmp_dir unit_file sqlite_file socket_file baked_supervisor_version
   tmp_dir="$(mktemp -d)"
   trap 'rm -rf "$tmp_dir"' EXIT
-  TERMD_STATE_DIR="${tmp_dir}/termd"
+  unit_file="${tmp_dir}/termd.service"
+  TERMD_STATE_DIR="${unit_file%.service}-state"
   export TERMD_STATE_DIR
   STATE_DIR="${TERMD_STATE_DIR}"
   mkdir -p "${STATE_DIR}/termd-supervisors"
@@ -707,7 +708,6 @@ test_termd_baked_supervisor_default_keeps_runtime_state() (
   baked_supervisor_version="$(previous_supervisor_version_from_file "${ROOT_DIR}/SUPERVISOR_VERSION")"
   SUPERVISOR_VERSION="$baked_supervisor_version"
   export TERMD_INSTALL_CONFIRM_FD=0
-  unit_file="${tmp_dir}/termd.service"
   run_fake_termd_install "$unit_file" <<<"y" >/dev/null
   unset SUPERVISOR_VERSION TERMD_INSTALL_CONFIRM_FD
 
@@ -739,7 +739,8 @@ test_termd_required_supervisor_version_mismatch_prompts_and_clears_runtime_state
   local tmp_dir unit_file sqlite_file socket_file
   tmp_dir="$(mktemp -d)"
   trap 'rm -rf "$tmp_dir"' EXIT
-  TERMD_STATE_DIR="${tmp_dir}/termd"
+  unit_file="${tmp_dir}/termd.service"
+  TERMD_STATE_DIR="${unit_file%.service}-state"
   export TERMD_STATE_DIR
   STATE_DIR="${TERMD_STATE_DIR}"
   mkdir -p "${STATE_DIR}/termd-supervisors"
@@ -749,7 +750,6 @@ test_termd_required_supervisor_version_mismatch_prompts_and_clears_runtime_state
   create_stale_supervisor_socket "$socket_file"
 
   export TERMD_INSTALL_CONFIRM_FD=0
-  unit_file="${tmp_dir}/termd.service"
   run_fake_termd_install "$unit_file" <<<"y" >/dev/null
   unset TERMD_INSTALL_CONFIRM_FD
 
@@ -785,7 +785,8 @@ test_termd_missing_supervisor_meta_keeps_runtime_state_on_default_update() (
   local tmp_dir unit_file sqlite_file socket_file supervisor_version
   tmp_dir="$(mktemp -d)"
   trap 'rm -rf "$tmp_dir"' EXIT
-  TERMD_STATE_DIR="${tmp_dir}/termd"
+  unit_file="${tmp_dir}/termd.service"
+  TERMD_STATE_DIR="${unit_file%.service}-state"
   export TERMD_STATE_DIR
   STATE_DIR="${TERMD_STATE_DIR}"
   mkdir -p "${STATE_DIR}/termd-supervisors"
@@ -798,7 +799,6 @@ test_termd_missing_supervisor_meta_keeps_runtime_state_on_default_update() (
   # 不能把已有 session 当成需要清理的旧 runtime。
   supervisor_version="$(tr -d '\n' <"${ROOT_DIR}/SUPERVISOR_VERSION")"
   export TERMD_INSTALL_CONFIRM_FD=0
-  unit_file="${tmp_dir}/termd.service"
   run_fake_termd_install "$unit_file" <<<"y" >/dev/null
   unset TERMD_INSTALL_CONFIRM_FD
 
@@ -830,7 +830,8 @@ test_termd_supervisor_version_mismatch_prompts_and_clears_runtime_state() (
   local tmp_dir unit_file sqlite_file socket_file
   tmp_dir="$(mktemp -d)"
   trap 'rm -rf "$tmp_dir"' EXIT
-  TERMD_STATE_DIR="${tmp_dir}/termd"
+  unit_file="${tmp_dir}/termd.service"
+  TERMD_STATE_DIR="${unit_file%.service}-state"
   export TERMD_STATE_DIR
   STATE_DIR="${TERMD_STATE_DIR}"
   mkdir -p "${STATE_DIR}/termd-supervisors"
@@ -840,7 +841,6 @@ test_termd_supervisor_version_mismatch_prompts_and_clears_runtime_state() (
   create_stale_supervisor_socket "$socket_file"
 
   export TERMD_INSTALL_CONFIRM_FD=0
-  unit_file="${tmp_dir}/termd.service"
   run_fake_termd_install "$unit_file" --supervisor-version v-new <<<"y" >/dev/null
   unset TERMD_INSTALL_CONFIRM_FD
 
@@ -892,7 +892,8 @@ test_termd_supervisor_version_mismatch_decline_preserves_runtime_state() (
   local tmp_dir unit_file sqlite_file socket_file status
   tmp_dir="$(mktemp -d)"
   trap 'rm -rf "$tmp_dir"' EXIT
-  TERMD_STATE_DIR="${tmp_dir}/termd"
+  unit_file="${tmp_dir}/termd.service"
+  TERMD_STATE_DIR="${unit_file%.service}-state"
   export TERMD_STATE_DIR
   STATE_DIR="${TERMD_STATE_DIR}"
   mkdir -p "${STATE_DIR}/termd-supervisors"
@@ -902,7 +903,6 @@ test_termd_supervisor_version_mismatch_decline_preserves_runtime_state() (
   create_stale_supervisor_socket "$socket_file"
 
   export TERMD_INSTALL_CONFIRM_FD=0
-  unit_file="${tmp_dir}/termd.service"
   set +e
   (run_fake_termd_install "$unit_file" --supervisor-version v-new <<<"n" >/dev/null 2>/dev/null)
   status=$?
@@ -938,7 +938,8 @@ test_termd_required_supervisor_version_mismatch_decline_preserves_runtime_state(
   local tmp_dir unit_file sqlite_file socket_file status
   tmp_dir="$(mktemp -d)"
   trap 'rm -rf "$tmp_dir"' EXIT
-  TERMD_STATE_DIR="${tmp_dir}/termd"
+  unit_file="${tmp_dir}/termd.service"
+  TERMD_STATE_DIR="${unit_file%.service}-state"
   export TERMD_STATE_DIR
   STATE_DIR="${TERMD_STATE_DIR}"
   mkdir -p "${STATE_DIR}/termd-supervisors"
@@ -948,7 +949,6 @@ test_termd_required_supervisor_version_mismatch_decline_preserves_runtime_state(
   create_stale_supervisor_socket "$socket_file"
 
   export TERMD_INSTALL_CONFIRM_FD=0
-  unit_file="${tmp_dir}/termd.service"
   set +e
   (run_fake_termd_install "$unit_file" <<<"n" >/dev/null 2>/dev/null)
   status=$?
