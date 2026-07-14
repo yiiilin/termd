@@ -21,7 +21,12 @@ export default defineConfig({
     },
   ],
   webServer: {
-    command: "VITE_TERMD_E2E_DEBUG_BUFFER=1 npm run build && npm run preview",
+    // 中文注释：真实 relay fixture 会在测试内执行 cargo run。先在 WebServer 启动阶段
+    // 构建嵌入最新 dist 的二进制，避免 CI 冷增量编译占用单测 60 秒超时。
+    command:
+      "VITE_TERMD_E2E_DEBUG_BUFFER=1 npm run build && " +
+      "cargo build --locked --manifest-path ../../Cargo.toml -p termd -p termrelay && " +
+      "npm run preview",
     url: "http://127.0.0.1:4173",
     reuseExistingServer: false,
     // 中文注释：当前生产构建包含 Monaco worker 与 xterm 资源，冷构建可能超过 2 分钟。
