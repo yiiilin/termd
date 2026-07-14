@@ -14,6 +14,8 @@ use clap::Parser;
 
 #[tokio::main]
 async fn main() {
+    install_rustls_crypto_provider();
+
     let cli = match cli::Cli::try_parse() {
         Ok(cli) => cli,
         Err(error) => {
@@ -33,6 +35,10 @@ async fn main() {
         eprintln!("{}", error.user_message());
         std::process::exit(error.exit_code());
     }
+}
+
+fn install_rustls_crypto_provider() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }
 
 fn args_request_json<I, S>(args: I) -> bool
