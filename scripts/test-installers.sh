@@ -82,6 +82,7 @@ grep -q 'pair_url = relay_urls\[0\] if relay_urls else base_url' "${ROOT_DIR}/sc
 [[ "$(grep -c 'TERMRELAY_AUTH_TOKEN' "${ROOT_DIR}/scripts/install-termrelay.sh")" -eq 2 ]]
 [[ "$(grep -c 'TERMRELAY_HTTP_TUNNEL' "${ROOT_DIR}/scripts/install-termrelay.sh")" -eq 1 ]]
 grep -q 'SUPERVISOR_VERSION="${TERMD_SUPERVISOR_VERSION:-}"' "${ROOT_DIR}/scripts/install-termd.sh"
+grep -Fq 'STATE_DIR="${TERMD_STATE_DIR:-/var/lib/termd}"' "${ROOT_DIR}/scripts/install-termd.sh"
 grep -q 'REQUIRED_SUPERVISOR_VERSION="${TERMD_REQUIRED_SUPERVISOR_VERSION:-}"' "${ROOT_DIR}/scripts/install-termd.sh"
 grep -q 'TERMD_REQUIRED_SUPERVISOR_VERSION:-' "${ROOT_DIR}/.github/workflows/release.yml"
 ! grep -q 'TERMD_SUPERVISOR_VERSION:-.*supervisor_version' "${ROOT_DIR}/.github/workflows/release.yml"
@@ -391,8 +392,25 @@ PY
 
 run_fake_termd_install() {
   local unit_file="$1"
+  local fixture_state_dir="${unit_file%.service}-state"
+  local canonical_state_dir canonical_default_state_dir
   shift
 
+  if ! canonical_state_dir="$(realpath -m -- "$fixture_state_dir")" ||
+    ! canonical_default_state_dir="$(realpath -m -- /var/lib/termd)" ||
+    [[ -z "$canonical_state_dir" || -z "$canonical_default_state_dir" ]]; then
+    printf 'failed to validate fake termd state path\n' >&2
+    return 1
+  fi
+  case "${canonical_state_dir}/" in
+    "${canonical_default_state_dir}/"*)
+      printf 'refusing fake termd state path under %s\n' "$canonical_default_state_dir" >&2
+      return 1
+      ;;
+  esac
+
+  local TERMD_STATE_DIR="$fixture_state_dir"
+  export TERMD_STATE_DIR
   REPO="example/termd"
   VERSION=""
   UNIT_FILE="$unit_file"
@@ -401,7 +419,7 @@ run_fake_termd_install() {
   WRAPPER_FILE="${unit_file%.service}-run"
   WRAPPER_DIR="$(dirname "$WRAPPER_FILE")"
   INSTALL_PREFIX="${unit_file%.service}-prefix"
-  STATE_DIR="${unit_file%.service}-state"
+  STATE_DIR="$TERMD_STATE_DIR"
   main "$@" >/dev/null
 }
 
@@ -418,7 +436,7 @@ test_termd_default_install_uses_managed_user() (
 
   assert_file_contains "$unit_file" "User=termd"
   assert_file_contains "$unit_file" "Group=termd"
-  assert_file_contains "$unit_file" "WorkingDirectory=/var/lib/termd"
+  assert_file_contains "$unit_file" "WorkingDirectory=${unit_file%.service}-state"
   assert_file_contains "$unit_file" "EnvironmentFile=-${tmp_dir}/termd.env"
   assert_file_contains "$unit_file" "StateDirectory=termd"
 
@@ -444,11 +462,14 @@ Group=deploy
 WorkingDirectory=/old/state
 EOF
 
+  TERMD_STATE_DIR="/var/lib/termd/"
+  export TERMD_STATE_DIR
   run_fake_termd_install "$unit_file"
+  unset TERMD_STATE_DIR
 
   assert_file_contains "$unit_file" "User=alice"
   assert_file_contains "$unit_file" "Group=deploy"
-  assert_file_contains "$unit_file" "WorkingDirectory=/var/lib/termd"
+  assert_file_contains "$unit_file" "WorkingDirectory=${unit_file%.service}-state"
   assert_file_contains "$unit_file" "EnvironmentFile=-${tmp_dir}/termd.env"
   assert_file_contains "${tmp_dir}/termd.env" "HOME=/home/alice"
   assert_file_contains "${tmp_dir}/termd.env" "SHELL=/bin/zsh"
@@ -475,7 +496,7 @@ EOF
 
   assert_file_contains "$unit_file" "User=alice"
   assert_file_contains "$unit_file" "Group=deploy"
-  assert_file_contains "$unit_file" "WorkingDirectory=/var/lib/termd"
+  assert_file_contains "$unit_file" "WorkingDirectory=${unit_file%.service}-state"
   assert_file_contains "$unit_file" "EnvironmentFile=-${tmp_dir}/termd.env"
   assert_file_contains "${tmp_dir}/termd.env" "HOME=/home/alice"
   assert_file_contains "${tmp_dir}/termd.env" "SHELL=/bin/zsh"
@@ -499,7 +520,7 @@ EOF
 
   assert_file_contains "$unit_file" "User=bob"
   assert_file_contains "$unit_file" "Group=bob-primary"
-  assert_file_contains "$unit_file" "WorkingDirectory=/var/lib/termd"
+  assert_file_contains "$unit_file" "WorkingDirectory=${unit_file%.service}-state"
   assert_file_contains "$unit_file" "EnvironmentFile=-${tmp_dir}/termd.env"
   assert_file_contains "${tmp_dir}/termd.env" "HOME=/srv/bob"
   assert_file_contains "${tmp_dir}/termd.env" "SHELL=/bin/sh"
