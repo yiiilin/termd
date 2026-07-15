@@ -203,7 +203,7 @@ sudo systemctl is-active termrelay
 curl -fsS http://127.0.0.1:8080/healthz | python3 -m json.tool
 ```
 
-安装器创建 `/etc/termd/termrelay_setup_token` 和 `/var/lib/termrelay/daemon-registry.json`，并在成功结尾直接打印当前 setup token（新装和升级都一样）。输出会明确标记为敏感值；只通过 SSH 终端、密码管理器等受控通道传给 daemon 主机，不要放进 URL、聊天或普通日志。使用 `--allow-open-relay` 时没有 setup token，安装器会明确说明不适用。
+安装器创建或保留 `/etc/termd/termrelay_setup_token` 和 `/var/lib/termrelay/daemon-registry.json`，并在成功结尾直接打印当前 setup token（新装和升级都一样）。输出会明确标记为敏感值；只通过 SSH 终端、密码管理器等受控通道传给 daemon 主机，不要放进 URL、聊天或普通日志。旧版无鉴权配置在升级时会自动迁移到这一 trusted 配置，不会继续保留无鉴权入口。
 
 按[公网部署方案](deployment.md#tls-与反向代理)配置 `relay.example.com:443` 的 TLS 反向代理，再验证：
 
@@ -238,7 +238,6 @@ dry-run 不读取 token，只会说明正式安装将询问。正式安装确认
 
 - `--relay-token <TOKEN>`：直接参数，适合受控自动化，但会短暂出现在调用进程 argv，且可能进入 shell history。
 - `--relay-setup-token-file <PATH>`：推荐的自动化方式；文件应归 root 所有且权限为 `0600`。
-- `--allow-open-relay`：仅当 relay 也明确使用 open 模式时与 `--relay` 同时传入；该模式不提示 setup token，也不能与两种 token 参数并用。
 
 token 文件方式示例：
 
@@ -257,7 +256,7 @@ sudo rm -f /run/termd-relay-setup-token
 
 ### 4. 端到端验证与配对
 
-注册完成后，安装器读取本机 `/healthz` 的 `server_id`，再向 relay 查询这个 id 的 control 连接；不会用其他 daemon 在线或全局连接数冒充。trusted relay 的查询仍需 setup token；显式 open relay 查询不带 token。成功时打印 `SUCCESS: daemon ... is connected to relay ...`；超时则打印 `FAILED`。随后安装器实际执行 `termd pair --qr --url <LOCAL_URL>`，直接输出二维码和 `termd-pair:v2:...` 邀请码。
+注册完成后，安装器读取本机 `/healthz` 的 `server_id`，再携带 setup token 向 relay 查询这个 id 的 control 连接；不会用其他 daemon 在线或全局连接数冒充。成功时打印 `SUCCESS: daemon ... is connected to relay ...`；超时则打印 `FAILED`。随后安装器实际执行 `termd pair --qr --url <LOCAL_URL>`，直接输出二维码和 `termd-pair:v2:...` 邀请码。
 
 本机 health、relay control 或 pairing 任一失败时，安装命令以非零状态结束，并打印 `local service installed but post-install verification/pairing failed`。这表示二进制和 systemd service 已落盘，不会伪装成回滚成功；按紧随其后的 `retry with:`/`then run:` 命令修复并重试。
 
@@ -302,6 +301,17 @@ curl -fsS http://127.0.0.1:8765/healthz | python3 -m json.tool
 installer 默认保留 daemon identity、已配对设备、配置和 `/var/lib/termd`。supervisor compatibility 相同时，daemon 重启不会终止已有 supervisor；兼容性确实改变时，installer 会说明 session 丢失范围并要求交互确认。不要通过删除数据库、socket 或 supervisor 进程绕过确认。
 
 ### 公网 relay
+
+从仍支持 open relay 的旧版本升级属于 breaking 迁移：`--allow-open-relay` 已删除，当前
+binary 和 installer 都会把它作为 unknown argument 拒绝。只有 managed installer 会自动
+移除旧 `TERMRELAY_ALLOW_OPEN_RELAY` 环境项，并创建或保留 setup token file 与 daemon
+registry。手工维护 binary、systemd unit 或 container 的部署，必须在启动新版本前配置
+可读且非空的 setup token file 和 registry path；不能继续沿用无鉴权启动参数。
+
+managed installer 完成迁移后会打印 setup token。既有 daemon 必须使用该 token 重新执行
+原安装命令并显式指定 relay，例如
+`sudo termd install --relay wss://relay.example.com`，完成注册并看到 `SUCCESS` 后，才能认为
+relay 升级完成。
 
 顺序固定为：
 

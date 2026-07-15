@@ -241,7 +241,7 @@ bash scripts/qa.sh
 当前关键 E2E 覆盖：
 
 * `termctl/tests/direct_daemon_e2e.rs`：旧 CLI 调试路径，覆盖 pair/new/list/attach/control/resize/close 的兼容行为。
-* `termrelay/tests/relay_e2e.rs`：binary 使用 `--allow-open-relay`，覆盖明文/二进制 frame 转发和 `server_id` 隔离，不覆盖 trusted admission；其中 `encrypted_frame` 用例只验证旧客户端兼容，不代表当前 Web WebSocket runtime E2EE。
+* `termrelay/tests/relay_e2e.rs`：binary 使用 setup token 文件与 daemon registry 启动，验证 trusted runtime 和已注册 `server_id` 的 HTTP tunnel 鉴权边界。
 * `termrelay/src/ws.rs` 单元测试：覆盖 daemon token、pair ticket、device admission 和 replay 等 trusted admission policy。
 * `scripts/qa.sh` runtime relay E2E：启动真实 `termrelay` 和 `termd --relay`，覆盖真实 trusted admission/routing 和客户端路由。
 * `termui/frontend/tests/termui-web.smoke.spec.ts`：浏览器直连 direct 路径的 pairing/list/attach 和终端恢复交互。

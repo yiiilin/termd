@@ -74,7 +74,7 @@ termd pair --qr
 
 ### 公网 relay 快速安装
 
-在 relay 主机运行 `sudo termrelay install --web --listen 127.0.0.1:8080`。trusted 模式安装完成后会直接打印当前 setup token，并标记为敏感值；`--allow-open-relay` 模式没有此 token。配置好 relay 的 TLS 域名后，在 daemon 主机运行：
+在 relay 主机运行 `sudo termrelay install --web --listen 127.0.0.1:8080`。安装器会创建或保留 daemon registry 和 setup token，并在完成后直接打印当前 setup token，标记为敏感值。配置好 relay 的 TLS 域名后，在 daemon 主机运行：
 
 ```bash
 ./termd-linux-amd64 install --dry-run --web --user "$(id -un)" \
@@ -83,7 +83,7 @@ sudo ./termd-linux-amd64 install --web --user "$(id -un)" \
   --relay wss://relay.example.com
 ```
 
-dry-run 只说明正式安装会询问 token，不读取输入；正式安装会隐藏输入内容。非交互 trusted 安装必须使用 `--relay-token <TOKEN>` 或更安全的 `--relay-setup-token-file <PATH>`。若 relay 明确以 `--allow-open-relay` 安装，daemon 端必须同时传 `--allow-open-relay`，且不能传 setup token。安装器会按本机 `server_id` 验证 relay control 连接，明确打印 `SUCCESS`/`FAILED`，然后运行真实的 `termd pair --qr` 流程输出二维码和邀请码。任一 post-install 检查失败时命令非零退出，并说明本地 service 已安装及精确重试命令。完整两主机步骤及安全说明见[安装指南](docs/installation.md#公网-trusted-relay两主机流程)。
+dry-run 只说明正式安装会询问 token，不读取输入；正式安装会隐藏输入内容。非交互安装必须使用 `--relay-token <TOKEN>` 或更安全的 `--relay-setup-token-file <PATH>`。安装器会按本机 `server_id` 验证 relay control 连接，明确打印 `SUCCESS`/`FAILED`，然后运行真实的 `termd pair --qr` 流程输出二维码和邀请码。任一 post-install 检查失败时命令非零退出，并说明本地 service 已安装及精确重试命令。完整两主机步骤及安全说明见[安装指南](docs/installation.md#公网-trusted-relay两主机流程)。
 
 SSH tunnel 示例中的 `alice@terminal-host` 必须替换成真实 SSH 目标，不能原样执行：
 

@@ -456,6 +456,7 @@ impl fmt::Debug for RelayState {
     }
 }
 
+#[cfg(test)]
 impl Default for RelayState {
     fn default() -> Self {
         Self::new()
@@ -463,6 +464,7 @@ impl Default for RelayState {
 }
 
 impl RelayState {
+    #[cfg(test)]
     pub fn new() -> Self {
         Self {
             inner: Arc::new(RelayRegistry::default()),
@@ -483,7 +485,6 @@ impl RelayState {
         setup_token: Option<String>,
         registry_path: Option<PathBuf>,
     ) -> Result<Self, RegisterDaemonError> {
-        let mut state = Self::new();
         let daemon_public_keys = daemon_credentials
             .iter()
             .filter_map(|credential| Some((credential.server_id, credential.public_key.clone()?)))
@@ -501,13 +502,16 @@ impl RelayState {
                 )
             })
             .collect();
-        state.admission = Arc::new(RwLock::new(RelayAdmissionState {
-            trusted: true,
-            daemon_token_hashes,
-            daemon_public_keys,
-        }));
-        state.setup_token = setup_token;
-        state.registry_path = registry_path;
+        let state = Self {
+            inner: Arc::new(RelayRegistry::default()),
+            admission: Arc::new(RwLock::new(RelayAdmissionState {
+                trusted: true,
+                daemon_token_hashes,
+                daemon_public_keys,
+            })),
+            setup_token,
+            registry_path,
+        };
         if state.registry_path.is_some() {
             state.persist_daemon_registry()?;
         }
@@ -530,6 +534,13 @@ impl RelayState {
         self.admission
             .read()
             .map(|admission| admission.trusted)
+            .map_err(|_| RegisterDaemonError::Poisoned)
+    }
+
+    pub fn ensure_admission_available(&self) -> Result<(), RegisterDaemonError> {
+        self.admission
+            .read()
+            .map(|_| ())
             .map_err(|_| RegisterDaemonError::Poisoned)
     }
 
@@ -767,6 +778,7 @@ impl RelayState {
 
     fn authorize_route_admission(&self, prelude: &RoutePrelude) -> Result<(), RelayError> {
         let admission_state = self.admission.read().map_err(|_| RelayError::Poisoned)?;
+        #[cfg(test)]
         if !admission_state.trusted {
             return Ok(());
         }

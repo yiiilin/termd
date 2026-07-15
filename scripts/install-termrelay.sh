@@ -21,7 +21,6 @@ INSTALL_SET_LISTEN=0
 INSTALL_SET_WEB=0
 INSTALL_SET_SETUP_TOKEN_FILE=0
 INSTALL_SET_DAEMON_REGISTRY=0
-INSTALL_SET_ALLOW_OPEN_RELAY=0
 INSTALL_SET_TLS_CERT=0
 INSTALL_SET_TLS_KEY=0
 ACTION="install"
@@ -225,7 +224,6 @@ Options:
   --public                    Alias for --listen 0.0.0.0:8080.
   --setup-token-file <PATH>   Read relay daemon registration setup token from a file.
   --daemon-registry <PATH>    Set trusted daemon registry JSON path.
-  --allow-open-relay          Explicitly allow legacy/open relay mode without daemon registry.
   --tls-cert <PATH>           Set TLS certificate path.
   --tls-key <PATH>            Set TLS private key path.
   --uninstall                 Stop service and remove termrelay program files.
@@ -281,11 +279,6 @@ parse_args() {
         TERMRELAY_DAEMON_REGISTRY="$2"
         INSTALL_SET_DAEMON_REGISTRY=1
         shift 2
-        ;;
-      --allow-open-relay)
-        TERMRELAY_ALLOW_OPEN_RELAY=1
-        INSTALL_SET_ALLOW_OPEN_RELAY=1
-        shift
         ;;
       --tls-cert)
         [[ $# -ge 2 && -n "$2" ]] || die "--tls-cert requires a non-empty value"
@@ -519,7 +512,7 @@ ensure_default_registry_file() {
   fi
 
   install -d -m 0750 -o "$SERVICE_NAME" -g "$SERVICE_NAME" "$(dirname "$registry_path")"
-  if [[ ! -e "$registry_path" ]]; then
+  if [[ ! -s "$registry_path" ]] || ! LC_ALL=C grep -q '[^[:space:]]' -- "$registry_path"; then
     printf '{"daemons":[]}\n' >"$registry_path"
   fi
   chown "$SERVICE_NAME:$SERVICE_NAME" "$registry_path"
@@ -536,16 +529,12 @@ ensure_setup_token_file() {
   fi
 
   install -d -m 0755 "$ENV_DIR"
-  if [[ ! -s "$token_file" ]]; then
+  if [[ ! -s "$token_file" ]] || ! LC_ALL=C grep -q '[^[:space:]]' -- "$token_file"; then
     write_service_secret_file "$token_file" "$(generate_secret_token)"
     log "created relay setup token at ${token_file}"
     log "use this token file value when registering termd with this relay"
   fi
   TERMRELAY_SETUP_TOKEN_FILE="$token_file"
-}
-
-trusted_registry_defaults_enabled() {
-  [[ "${TERMRELAY_ALLOW_OPEN_RELAY:-0}" != "1" || "$INSTALL_SET_DAEMON_REGISTRY" -eq 1 || "$INSTALL_SET_SETUP_TOKEN_FILE" -eq 1 ]]
 }
 
 apply_env_overrides() {
@@ -561,13 +550,9 @@ apply_env_overrides() {
   fi
   if [[ "$INSTALL_SET_DAEMON_REGISTRY" -eq 1 ]]; then
     upsert_env_var "TERMRELAY_DAEMON_REGISTRY" "$TERMRELAY_DAEMON_REGISTRY"
-    unset_env_var "TERMRELAY_ALLOW_OPEN_RELAY"
   fi
-  if [[ "$INSTALL_SET_ALLOW_OPEN_RELAY" -eq 1 ]]; then
-    upsert_env_var "TERMRELAY_ALLOW_OPEN_RELAY" "$TERMRELAY_ALLOW_OPEN_RELAY"
-    unset_env_var "TERMRELAY_DAEMON_REGISTRY"
-    unset_env_var "TERMRELAY_SETUP_TOKEN_FILE"
-  fi
+  unset_env_var "TERMRELAY_ALLOW_OPEN_RELAY"
+  unset TERMRELAY_ALLOW_OPEN_RELAY
   if [[ "$INSTALL_SET_TLS_CERT" -eq 1 ]]; then
     upsert_env_var "TERMRELAY_TLS_CERT" "$TERMRELAY_TLS_CERT"
   fi
@@ -576,13 +561,38 @@ apply_env_overrides() {
   fi
 }
 
+read_existing_env_var() (
+  local key="$1"
+  local value
+
+  unset "$key"
+  # shellcheck source=/dev/null
+  source "$ENV_FILE" >/dev/null || return 1
+  value="${!key:-}"
+  printf '%s' "$value"
+)
+
 write_env_file() {
+  local existing_value
+
   # systemd 服务会以 termrelay 用户运行 wrapper；env 文件需要允许 termrelay 组读取。
   install -d -m 0755 "$(dirname "$ENV_FILE")"
-  if trusted_registry_defaults_enabled; then
-    ensure_default_registry_file
-    ensure_setup_token_file
+  if [[ -e "$ENV_FILE" ]]; then
+    if [[ "$INSTALL_SET_SETUP_TOKEN_FILE" -eq 0 ]]; then
+      existing_value="$(read_existing_env_var TERMRELAY_SETUP_TOKEN_FILE)" || return 1
+      if [[ -n "$existing_value" ]]; then
+        TERMRELAY_SETUP_TOKEN_FILE="$existing_value"
+      fi
+    fi
+    if [[ "$INSTALL_SET_DAEMON_REGISTRY" -eq 0 ]]; then
+      existing_value="$(read_existing_env_var TERMRELAY_DAEMON_REGISTRY)" || return 1
+      if [[ -n "$existing_value" ]]; then
+        TERMRELAY_DAEMON_REGISTRY="$existing_value"
+      fi
+    fi
   fi
+  ensure_default_registry_file
+  ensure_setup_token_file
 
   if [[ -e "$ENV_FILE" ]]; then
     log "keeping existing env file at ${ENV_FILE}"
@@ -590,10 +600,8 @@ write_env_file() {
     unset_env_var "TERMRELAY_AUTH_TOKEN"
     unset_env_var "TERMRELAY_AUTH_TOKEN_FILE"
     unset_env_var "TERMRELAY_HTTP_TUNNEL"
-    if trusted_registry_defaults_enabled; then
-      upsert_env_var "TERMRELAY_DAEMON_REGISTRY" "$TERMRELAY_DAEMON_REGISTRY"
-      upsert_env_var "TERMRELAY_SETUP_TOKEN_FILE" "$TERMRELAY_SETUP_TOKEN_FILE"
-    fi
+    upsert_env_var "TERMRELAY_DAEMON_REGISTRY" "$TERMRELAY_DAEMON_REGISTRY"
+    upsert_env_var "TERMRELAY_SETUP_TOKEN_FILE" "$TERMRELAY_SETUP_TOKEN_FILE"
     chown root:"$SERVICE_NAME" "$ENV_FILE"
     chmod 0640 "$ENV_FILE"
     return 0
@@ -604,18 +612,8 @@ write_env_file() {
     printf '# 需要自定义监听、TLS 或 Web 时，取消注释并修改对应变量。\n'
     printf 'TERMRELAY_LISTEN=%q\n' "${TERMRELAY_LISTEN:-127.0.0.1:8080}"
     printf 'TERMRELAY_WEB_ENABLED=%q\n' "${TERMRELAY_WEB_ENABLED:-0}"
-    if trusted_registry_defaults_enabled; then
-      printf 'TERMRELAY_SETUP_TOKEN_FILE=%q\n' "$TERMRELAY_SETUP_TOKEN_FILE"
-      printf 'TERMRELAY_DAEMON_REGISTRY=%q\n' "$TERMRELAY_DAEMON_REGISTRY"
-    else
-      printf '# TERMRELAY_SETUP_TOKEN_FILE=/etc/termd/termrelay_setup_token\n'
-      printf '# TERMRELAY_DAEMON_REGISTRY=/var/lib/termrelay/daemon-registry.json\n'
-    fi
-    if [[ -n "${TERMRELAY_ALLOW_OPEN_RELAY:-}" ]]; then
-      printf 'TERMRELAY_ALLOW_OPEN_RELAY=%q\n' "$TERMRELAY_ALLOW_OPEN_RELAY"
-    else
-      printf '# TERMRELAY_ALLOW_OPEN_RELAY=1\n'
-    fi
+    printf 'TERMRELAY_SETUP_TOKEN_FILE=%q\n' "$TERMRELAY_SETUP_TOKEN_FILE"
+    printf 'TERMRELAY_DAEMON_REGISTRY=%q\n' "$TERMRELAY_DAEMON_REGISTRY"
     if [[ -n "${TERMRELAY_TLS_CERT:-}" ]]; then
       printf 'TERMRELAY_TLS_CERT=%q\n' "$TERMRELAY_TLS_CERT"
     else
@@ -657,15 +655,17 @@ EOF
     cat <<'EOF'
 args=(--listen "${TERMRELAY_LISTEN:-127.0.0.1:8080}")
 
-if [[ -n "${TERMRELAY_DAEMON_REGISTRY:-}" ]]; then
-  args+=(--daemon-registry "$TERMRELAY_DAEMON_REGISTRY")
-elif [[ "${TERMRELAY_ALLOW_OPEN_RELAY:-0}" == "1" ]]; then
-  args+=(--allow-open-relay)
+if [[ -z "${TERMRELAY_DAEMON_REGISTRY:-}" ]]; then
+  printf '[termrelay-install] TERMRELAY_DAEMON_REGISTRY is required.\n' >&2
+  exit 1
 fi
+args+=(--daemon-registry "$TERMRELAY_DAEMON_REGISTRY")
 
-if [[ -n "${TERMRELAY_SETUP_TOKEN_FILE:-}" ]]; then
-  args+=(--setup-token-file "$TERMRELAY_SETUP_TOKEN_FILE")
+if [[ -z "${TERMRELAY_SETUP_TOKEN_FILE:-}" ]]; then
+  printf '[termrelay-install] TERMRELAY_SETUP_TOKEN_FILE is required.\n' >&2
+  exit 1
 fi
+args+=(--setup-token-file "$TERMRELAY_SETUP_TOKEN_FILE")
 
 if [[ -n "${TERMRELAY_TLS_CERT:-}" || -n "${TERMRELAY_TLS_KEY:-}" ]]; then
   if [[ -z "${TERMRELAY_TLS_CERT:-}" || -z "${TERMRELAY_TLS_KEY:-}" ]]; then
@@ -855,10 +855,8 @@ commit_install_file() {
 }
 
 prepare_runtime_support_files() {
-  if trusted_registry_defaults_enabled; then
-    ensure_default_registry_file || return $?
-    ensure_setup_token_file || return $?
-  fi
+  ensure_default_registry_file || return $?
+  ensure_setup_token_file || return $?
 }
 
 verify_service_healthy() {
@@ -976,10 +974,6 @@ uninstall_component() {
 print_relay_setup_token() {
   local token
 
-  if ! trusted_registry_defaults_enabled; then
-    log "open relay mode is enabled; no trusted relay setup token applies"
-    return 0
-  fi
   if [[ -z "${TERMRELAY_SETUP_TOKEN_FILE:-}" || ! -r "$TERMRELAY_SETUP_TOKEN_FILE" ]]; then
     log "trusted relay is installed, but its setup token file is unreadable"
     return 1

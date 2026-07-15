@@ -163,7 +163,6 @@ pub enum Error {
     UnknownArgument(String),
     DuplicateArgument(&'static str),
     ConflictingArguments(&'static str, &'static str),
-    ArgumentRequires(&'static str, &'static str),
     MissingValue(&'static str),
     EmptyValue(&'static str),
     PurgeUnsupported,
@@ -192,9 +191,6 @@ impl fmt::Display for Error {
             }
             Self::ConflictingArguments(first, second) => {
                 write!(formatter, "{first} conflicts with {second}; do not use them together")
-            }
-            Self::ArgumentRequires(argument, required) => {
-                write!(formatter, "{argument} requires {required}")
             }
             Self::MissingValue(flag) => write!(formatter, "{flag} requires a value"),
             Self::EmptyValue(flag) => write!(formatter, "{flag} requires a non-empty value"),
@@ -259,7 +255,6 @@ struct ParsedOptions {
     help: bool,
     purge: bool,
     allow_session_loss: bool,
-    allow_open_relay: bool,
     relay_explicit: bool,
     prompt_relay_token: bool,
     script_args: Vec<OsString>,
@@ -287,7 +282,6 @@ impl ParsedOptions {
             help: false,
             purge: false,
             allow_session_loss: false,
-            allow_open_relay: false,
             relay_explicit: false,
             prompt_relay_token: false,
             script_args: Vec::new(),
@@ -383,11 +377,6 @@ impl ParsedOptions {
                         if inline_value.is_some() {
                             return Err(Error::UnknownArgument(safe_unknown_argument(flag)));
                         }
-                        if component == Component::Termd
-                            && specification.flag == "--allow-open-relay"
-                        {
-                            parsed.allow_open_relay = true;
-                        }
                         parsed.script_args.push(OsString::from(specification.flag));
                         parsed
                             .summary
@@ -411,24 +400,7 @@ impl ParsedOptions {
                 "--relay-setup-token-file",
             ));
         }
-        if parsed.allow_open_relay && !parsed.relay_explicit {
-            return Err(Error::ArgumentRequires("--allow-open-relay", "--relay"));
-        }
-        if parsed.allow_open_relay && (has_direct_relay_token || has_relay_token_file) {
-            return Err(Error::ConflictingArguments(
-                "--allow-open-relay",
-                if has_direct_relay_token {
-                    "--relay-token"
-                } else {
-                    "--relay-setup-token-file"
-                },
-            ));
-        }
-        if parsed.relay_explicit
-            && !parsed.allow_open_relay
-            && !has_direct_relay_token
-            && !has_relay_token_file
-        {
+        if parsed.relay_explicit && !has_direct_relay_token && !has_relay_token_file {
             parsed.prompt_relay_token = true;
             parsed
                 .summary
@@ -482,10 +454,6 @@ fn install_flag(component: Component, flag: &str) -> Option<FlagSpecification> {
             Some(boolean_flag("--no-web", "embedded Web UI disabled"))
         }
         (Component::Termd, "--public") => Some(boolean_flag("--public", "public listen alias")),
-        (Component::Termd, "--allow-open-relay") => Some(boolean_flag(
-            "--allow-open-relay",
-            "allow explicit open relay mode",
-        )),
         (Component::Termd, "--listen") => Some(value_flag("--listen", "listen address", None)),
         (Component::Termd, "--relay") | (Component::Termd, "--relay-url") => Some(value_flag(
             "--relay",
@@ -529,9 +497,6 @@ fn install_flag(component: Component, flag: &str) -> Option<FlagSpecification> {
             Some(boolean_flag("--no-web", "embedded Web UI disabled"))
         }
         (Component::Termrelay, "--public") => Some(boolean_flag("--public", "public listen alias")),
-        (Component::Termrelay, "--allow-open-relay") => {
-            Some(boolean_flag("--allow-open-relay", "open relay mode"))
-        }
         (Component::Termrelay, "--listen") => Some(value_flag("--listen", "listen address", None)),
         (Component::Termrelay, "--setup-token-file") => Some(value_flag(
             "--setup-token-file",
@@ -870,10 +835,10 @@ fn help_text(component: Component, action: Action) -> String {
     }
     match component {
         Component::Termd => output.push_str(
-            "\ntermd options:\n  --web | --no-web\n  --listen <HOST:PORT> | --public\n  --relay <WS_URL>\n  --relay-token <TOKEN>\n  --relay-daemon-token-file <PATH>\n  --relay-setup-token-file <PATH>\n  --allow-open-relay  Explicitly connect without trusted relay registration\n  --proxy <URL>\n  --tls-cert <PATH> --tls-key <PATH>\n  --user <USER>\n  --supervisor-version <VERSION>\n  --allow-session-loss  Permit an incompatible supervisor upgrade to remove sessions\n",
+            "\ntermd options:\n  --web | --no-web\n  --listen <HOST:PORT> | --public\n  --relay <WS_URL>\n  --relay-token <TOKEN>\n  --relay-daemon-token-file <PATH>\n  --relay-setup-token-file <PATH>\n  --proxy <URL>\n  --tls-cert <PATH> --tls-key <PATH>\n  --user <USER>\n  --supervisor-version <VERSION>\n  --allow-session-loss  Permit an incompatible supervisor upgrade to remove sessions\n",
         ),
         Component::Termrelay => output.push_str(
-            "\ntermrelay options:\n  --web | --no-web\n  --listen <HOST:PORT> | --public\n  --setup-token-file <PATH>\n  --daemon-registry <PATH>\n  --allow-open-relay\n  --tls-cert <PATH> --tls-key <PATH>\n",
+            "\ntermrelay options:\n  --web | --no-web\n  --listen <HOST:PORT> | --public\n  --setup-token-file <PATH>\n  --daemon-registry <PATH>\n  --tls-cert <PATH> --tls-key <PATH>\n",
         ),
         Component::Termctl => {}
     }
@@ -1212,69 +1177,16 @@ mod tests {
     }
 
     #[test]
-    fn explicit_open_relay_skips_setup_token_in_noninteractive_install() {
-        let options = Options::Install(InstallOptions::new(
-            "1.2.3",
-            None,
-            [
-                "--relay",
-                "ws://relay.example",
-                "--allow-open-relay",
-                "--yes",
-            ],
-        ));
-        let mut runtime = FakeRuntime {
-            tty: false,
-            ..FakeRuntime::default()
-        };
-
-        run_with(Component::Termd, options, &mut runtime).unwrap();
-
-        assert_eq!(runtime.secret_reads, 0);
-        assert_eq!(runtime.execute_calls, 1);
-        assert!(
-            runtime
-                .invocation_args
-                .contains(&OsString::from("--allow-open-relay"))
-        );
-        assert!(!runtime.invocation_env.iter().any(|(name, _)| {
-            matches!(
-                *name,
-                "TERMD_INSTALL_ARG_RELAY_SETUP_TOKEN" | "TERMD_INSTALL_ARG_RELAY_SETUP_TOKEN_FILE"
-            )
-        }));
-    }
-
-    #[test]
-    fn open_relay_flag_requires_relay_and_rejects_setup_token() {
-        let without_relay =
-            Options::Install(InstallOptions::new("1.2.3", None, ["--allow-open-relay"]));
-        assert!(matches!(
-            ParsedOptions::parse(Component::Termd, without_relay),
-            Err(Error::ArgumentRequires("--allow-open-relay", "--relay"))
-        ));
-
-        let with_token = Options::Install(InstallOptions::new(
-            "1.2.3",
-            None,
-            [
-                "--relay",
-                "ws://relay.example",
-                "--allow-open-relay",
-                "--relay-token",
-                "must-not-leak",
-            ],
-        ));
-        let error = match ParsedOptions::parse(Component::Termd, with_token) {
-            Ok(_) => panic!("open relay accepted a setup token"),
-            Err(error) => error,
-        };
-        let rendered = format!("{error:?}\n{error}");
-        assert!(matches!(
-            error,
-            Error::ConflictingArguments("--allow-open-relay", "--relay-token")
-        ));
-        assert!(!rendered.contains("must-not-leak"));
+    fn removed_open_relay_flag_is_unknown_for_self_installers() {
+        for component in [Component::Termd, Component::Termrelay] {
+            let options =
+                Options::Install(InstallOptions::new("1.2.3", None, ["--allow-open-relay"]));
+            assert!(matches!(
+                ParsedOptions::parse(component, options),
+                Err(Error::UnknownArgument(argument)) if argument == "--allow-open-relay"
+            ));
+            assert!(!help_text(component, Action::Install).contains("--allow-open-relay"));
+        }
     }
 
     #[test]

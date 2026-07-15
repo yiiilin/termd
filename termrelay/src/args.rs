@@ -24,8 +24,6 @@ pub struct Args {
     pub daemon_registry: DaemonRegistryConfig,
     /// daemon 注册表路径；注册 API 成功后会原子写回这个文件。
     pub daemon_registry_path: Option<PathBuf>,
-    /// 显式允许旧开放 relay 行为，仅用于本地测试或迁移窗口。
-    pub allow_open_relay: bool,
     /// 是否挂载内嵌 Web 静态资源；默认关闭，避免 relay 默认暴露 UI 面。
     pub web: bool,
 }
@@ -98,7 +96,6 @@ impl fmt::Debug for Args {
             .field("tls_cert", &self.tls_cert)
             .field("tls_key_configured", &self.tls_key.is_some())
             .field("daemon_registry_count", &self.daemon_registry.daemons.len())
-            .field("allow_open_relay", &self.allow_open_relay)
             .field("web", &self.web)
             .finish()
     }
@@ -166,7 +163,6 @@ impl Args {
         let mut tls_cert = None;
         let mut tls_key = None;
         let mut daemon_registry_file = None;
-        let mut allow_open_relay = false;
         let mut web = false;
         let mut args = args.into_iter().map(Into::into);
 
@@ -225,9 +221,6 @@ impl Args {
                 "--web" => {
                     web = true;
                 }
-                "--allow-open-relay" => {
-                    allow_open_relay = true;
-                }
                 other => return Err(ArgsError::UnknownArgument(other.to_owned())),
             }
         }
@@ -253,7 +246,6 @@ impl Args {
             tls_key,
             daemon_registry,
             daemon_registry_path,
-            allow_open_relay,
             web,
         })
     }
@@ -285,6 +277,9 @@ fn read_daemon_registry_file(path: PathBuf) -> Result<DaemonRegistryConfig, Args
         }
         Err(_) => return Err(ArgsError::ReadDaemonRegistryFile),
     };
+    if raw.trim().is_empty() {
+        return Ok(DaemonRegistryConfig::default());
+    }
     serde_json::from_str(&raw).map_err(|_| ArgsError::ParseDaemonRegistryFile)
 }
 
@@ -631,6 +626,16 @@ mod tests {
         let error = Args::parse_from(["termrelay", "--auth"]).unwrap_err();
 
         assert_eq!(error, ArgsError::UnknownArgument("--auth".to_owned()));
+    }
+
+    #[test]
+    fn rejects_removed_open_relay_argument() {
+        let error = Args::parse_from(["termrelay", "--allow-open-relay"]).unwrap_err();
+
+        assert_eq!(
+            error,
+            ArgsError::UnknownArgument("--allow-open-relay".to_owned())
+        );
     }
 
     fn write_temp_auth_token(contents: &str) -> PathBuf {

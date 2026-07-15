@@ -47,7 +47,8 @@ assert_help_contains scripts/install-termrelay.sh "--uninstall"
 assert_help_contains scripts/install-termd.sh "--web"
 assert_help_contains scripts/install-termd.sh "--listen <HOST:PORT>"
 assert_help_contains scripts/install-termd.sh "--proxy <URL>"
-assert_help_contains scripts/install-termd.sh "--allow-open-relay"
+assert_help_excludes scripts/install-termd.sh "--allow-open-relay"
+assert_help_excludes scripts/install-termrelay.sh "--allow-open-relay"
 assert_help_contains scripts/install-termd.sh "--supervisor-version <VER>"
 assert_help_contains scripts/install-termd.sh "--user <USER>"
 assert_help_contains scripts/install-termd.sh "--purge"
@@ -413,6 +414,18 @@ test_termd_installer_supports_stdin_pipe_execution() (
   fi
 )
 
+test_installers_reject_removed_open_relay_flag() (
+  local script output
+
+  for script in install-termd.sh install-termrelay.sh; do
+    if output="$(bash "${ROOT_DIR}/scripts/${script}" --allow-open-relay 2>&1)"; then
+      printf '%s unexpectedly accepted --allow-open-relay\n' "$script" >&2
+      return 1
+    fi
+    [[ "$output" == *"unknown installer argument: --allow-open-relay"* ]]
+  done
+)
+
 test_termd_initial_pairing_uses_real_qr_command() (
   load_termd_installer_functions
 
@@ -443,18 +456,16 @@ EOF
   [[ "$(<"$args_file")" == "pair --qr --url http://127.0.0.1:9876" ]]
 )
 
-test_termrelay_install_reports_sensitive_setup_token_and_open_mode() (
+test_termrelay_install_reports_sensitive_setup_token() (
   load_termrelay_installer_functions
 
-  local tmp_dir token_file token trusted_output open_output
+  local tmp_dir token_file token trusted_output
   tmp_dir="$(mktemp -d)"
   trap 'rm -rf "$tmp_dir"' EXIT
   token_file="${tmp_dir}/relay-setup-token"
   token="relay-setup-secret-for-installer-test"
   printf '%s\n' "$token" >"$token_file"
   TERMRELAY_SETUP_TOKEN_FILE="$token_file"
-  TERMRELAY_ALLOW_OPEN_RELAY=0
-  INSTALL_SET_ALLOW_OPEN_RELAY=0
   INSTALL_SET_DAEMON_REGISTRY=0
   INSTALL_SET_SETUP_TOKEN_FILE=0
 
@@ -463,12 +474,56 @@ test_termrelay_install_reports_sensitive_setup_token_and_open_mode() (
   [[ "$trusted_output" == *"$token"* ]]
   [[ "$trusted_output" == *"termd install --relay <WS_URL>"* ]]
   [[ "$trusted_output" == *"--relay-token <TOKEN>"* ]]
+)
 
-  TERMRELAY_ALLOW_OPEN_RELAY=1
-  INSTALL_SET_ALLOW_OPEN_RELAY=1
-  open_output="$(print_relay_setup_token)"
-  [[ "$open_output" == *"open relay mode is enabled"* ]]
-  [[ "$open_output" != *"$token"* ]]
+test_termrelay_old_open_env_migrates_to_trusted_files() (
+  load_termrelay_installer_functions
+
+  local root output token token_file registry_before
+  root="$(mktemp -d)"
+  trap 'rm -rf "$root"' EXIT
+  ENV_DIR="${root}/etc"
+  ENV_FILE="${ENV_DIR}/termrelay.env"
+  STATE_DIR="${root}/state"
+  WRAPPER_FILE="${root}/lib/termrelay-run"
+  TERMRELAY_SETUP_TOKEN_FILE="${ENV_DIR}/termrelay_setup_token"
+  TERMRELAY_DAEMON_REGISTRY="${STATE_DIR}/daemon-registry.json"
+  INSTALL_SET_SETUP_TOKEN_FILE=0
+  INSTALL_SET_DAEMON_REGISTRY=0
+  INSTALL_STAGING_ONLY=0
+  mkdir -p "$ENV_DIR" "$STATE_DIR"
+  printf 'TERMRELAY_LISTEN=127.0.0.1:9000\nTERMRELAY_ALLOW_OPEN_RELAY=1\n' >"$ENV_FILE"
+  token_file="$TERMRELAY_SETUP_TOKEN_FILE"
+  printf ' \n\t\n' >"$token_file"
+  printf ' \n\t\n' >"$TERMRELAY_DAEMON_REGISTRY"
+  install() {
+    if [[ "${1:-}" == "-d" ]]; then
+      mkdir -p "${@: -1}"
+      return 0
+    fi
+    command install "$@"
+  }
+  chown() { :; }
+
+  write_env_file
+
+  [[ "$TERMRELAY_SETUP_TOKEN_FILE" == "$token_file" ]]
+  [[ -s "$TERMRELAY_SETUP_TOKEN_FILE" ]]
+  LC_ALL=C grep -q '[^[:space:]]' -- "$TERMRELAY_SETUP_TOKEN_FILE"
+  [[ -s "$TERMRELAY_DAEMON_REGISTRY" ]]
+  [[ "$(<"$TERMRELAY_DAEMON_REGISTRY")" == '{"daemons":[]}' ]]
+  ! grep -Fq 'TERMRELAY_ALLOW_OPEN_RELAY' "$ENV_FILE"
+  grep -Fq "TERMRELAY_SETUP_TOKEN_FILE=${TERMRELAY_SETUP_TOKEN_FILE}" "$ENV_FILE"
+  grep -Fq "TERMRELAY_DAEMON_REGISTRY=${TERMRELAY_DAEMON_REGISTRY}" "$ENV_FILE"
+  token="$(<"$TERMRELAY_SETUP_TOKEN_FILE")"
+  registry_before="$(sha256sum "$TERMRELAY_DAEMON_REGISTRY")"
+  output="$(print_relay_setup_token)"
+  [[ "$output" == *"$token"* ]]
+
+  unset TERMRELAY_SETUP_TOKEN_FILE TERMRELAY_DAEMON_REGISTRY
+  write_env_file
+  [[ "$(<"$TERMRELAY_SETUP_TOKEN_FILE")" == "$token" ]]
+  [[ "$(sha256sum "$TERMRELAY_DAEMON_REGISTRY")" == "$registry_before" ]]
 )
 
 test_termd_relay_verification_requires_matching_server_id() (
@@ -501,24 +556,27 @@ test_termd_relay_verification_requires_matching_server_id() (
   [[ "$success_output" == *"SUCCESS: daemon 00000000-0000-0000-0000-000000000001"* ]]
 )
 
-test_termd_open_relay_verification_omits_setup_token() (
+test_termd_relay_verification_requires_setup_token() (
   load_termd_installer_functions
 
-  local health_response output
+  local health_response output curl_marker
   health_response='{"server_id":"00000000-0000-0000-0000-000000000003"}'
   TERMD_RELAY_URLS="ws://relay.example/ws"
   INSTALL_SET_RELAY_URLS=1
-  INSTALL_ALLOW_OPEN_RELAY=1
   unset TERMD_RELAY_SETUP_TOKEN TERMD_RELAY_SETUP_TOKEN_FILE
+  curl_marker="$(mktemp)"
+  rm -f "$curl_marker"
   curl() {
-    [[ "$#" -eq 3 && "$1" == "--disable" && "$2" == "--config" ]]
-    ! grep -Fq 'x-termd-relay-setup-token' "$3"
-    printf '{"server_id":"00000000-0000-0000-0000-000000000003","connected":true}'
+    : >"$curl_marker"
+    return 0
   }
 
-  validate_relay_install_mode
-  output="$(verify_daemon_relay_connected "$health_response")"
-  [[ "$output" == *"SUCCESS: daemon 00000000-0000-0000-0000-000000000003"* ]]
+  if output="$(verify_daemon_relay_connected "$health_response")"; then
+    printf 'relay verification unexpectedly accepted a missing setup token\n' >&2
+    return 1
+  fi
+  [[ "$output" == *"FAILED: relay setup token is empty or unreadable"* ]]
+  [[ ! -e "$curl_marker" ]]
 )
 
 test_termd_upgrade_skips_inherited_relay_verification_without_explicit_options() (
@@ -542,7 +600,6 @@ EOF
   INSTALL_SET_RELAY_DAEMON_TOKEN_FILE=0
   INSTALL_SET_RELAY_SETUP_TOKEN_FILE=0
   INSTALL_SET_RELAY_SETUP_TOKEN=0
-  INSTALL_ALLOW_OPEN_RELAY=0
   unset TERMD_RELAY_SETUP_TOKEN TERMD_RELAY_SETUP_TOKEN_FILE
   register_marker="${tmp_dir}/register-called"
   status_marker="${tmp_dir}/status-called"
@@ -608,7 +665,6 @@ test_termd_invalid_pairing_url_retries_full_relay_install() (
   TERMD_RELAY_SETUP_TOKEN="relay-setup-secret"
   INSTALL_SET_RELAY_URLS=1
   INSTALL_SET_RELAY_SETUP_TOKEN=1
-  INSTALL_ALLOW_OPEN_RELAY=0
 
   if output="$(print_initial_pairing_token)"; then
     printf 'invalid pairing listen unexpectedly succeeded\n' >&2
@@ -617,16 +673,6 @@ test_termd_invalid_pairing_url_retries_full_relay_install() (
   [[ "$output" == *"the trusted relay setup token will be requested again"* ]]
   [[ "$output" == *"retry with: sudo /usr/local/bin/termd install --listen 127.0.0.1:8765 --relay wss://relay.example/ws"* ]]
   [[ "$output" != *"relay-setup-secret"* ]]
-
-  unset TERMD_RELAY_SETUP_TOKEN
-  INSTALL_SET_RELAY_SETUP_TOKEN=0
-  INSTALL_ALLOW_OPEN_RELAY=1
-  if output="$(print_initial_pairing_token)"; then
-    printf 'invalid pairing listen unexpectedly succeeded in open relay mode\n' >&2
-    return 1
-  fi
-  [[ "$output" == *"retry with: sudo /usr/local/bin/termd install --listen 127.0.0.1:8765 --relay wss://relay.example/ws --allow-open-relay"* ]]
-  [[ "$output" != *"trusted relay setup token"* ]]
 )
 
 test_termd_postinstall_pair_failure_is_failure() (
@@ -3229,8 +3275,6 @@ test_termrelay_builds_all_install_candidates_in_isolated_staging() (
   STATE_DIR="${root}/state"
   INSTALL_STAGING_DIR="${root}/staging"
   SERVICE_NAME=root
-  TERMRELAY_ALLOW_OPEN_RELAY=1
-  INSTALL_SET_ALLOW_OPEN_RELAY=1
   mkdir -p "$ENV_DIR" "$WRAPPER_DIR" "$(dirname "$UNIT_FILE")" "$INSTALL_STAGING_DIR"
   printf 'TERMRELAY_LISTEN=127.0.0.1:9000\nTERMRELAY_ALLOW_OPEN_RELAY=1\n' >"$ENV_FILE"
   printf 'old-wrapper\n' >"$WRAPPER_FILE"
@@ -3255,6 +3299,10 @@ test_termrelay_builds_all_install_candidates_in_isolated_staging() (
   bash -n "${INSTALL_STAGING_DIR}/termrelay-run"
   grep -Fq "ENV_FILE=${ENV_FILE}" "${INSTALL_STAGING_DIR}/termrelay-run"
   grep -Fq "ExecStart=${WRAPPER_FILE}" "${INSTALL_STAGING_DIR}/termrelay.service"
+  ! grep -Fq 'TERMRELAY_ALLOW_OPEN_RELAY' "${INSTALL_STAGING_DIR}/termrelay.env"
+  grep -Fq 'TERMRELAY_SETUP_TOKEN_FILE=' "${INSTALL_STAGING_DIR}/termrelay.env"
+  grep -Fq 'TERMRELAY_DAEMON_REGISTRY=' "${INSTALL_STAGING_DIR}/termrelay.env"
+  ! grep -Fq -- '--allow-open-relay' "${INSTALL_STAGING_DIR}/termrelay-run"
 )
 
 test_termrelay_install_transaction_rolls_back_every_failure_boundary() (
@@ -3460,10 +3508,12 @@ run_test() {
 }
 
 run_test test_termd_installer_supports_stdin_pipe_execution
+run_test test_installers_reject_removed_open_relay_flag
 run_test test_termd_initial_pairing_uses_real_qr_command
-run_test test_termrelay_install_reports_sensitive_setup_token_and_open_mode
+run_test test_termrelay_install_reports_sensitive_setup_token
+run_test test_termrelay_old_open_env_migrates_to_trusted_files
 run_test test_termd_relay_verification_requires_matching_server_id
-run_test test_termd_open_relay_verification_omits_setup_token
+run_test test_termd_relay_verification_requires_setup_token
 run_test test_termd_upgrade_skips_inherited_relay_verification_without_explicit_options
 run_test test_termd_postinstall_health_timeout_is_failure
 run_test test_termd_invalid_pairing_url_retries_full_relay_install

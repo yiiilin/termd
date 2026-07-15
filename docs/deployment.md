@@ -327,10 +327,17 @@ compose 会把 setup token 文件作为 Docker secret 挂载到 `/run/secrets/te
 
 当前协议不使用 `--http-tunnel` 开关；compose 必须代理 `/ws`、`/ws/metadata`、`/ws/terminal`、`/api/auth/*`、`/api/control/*` 和 `/api/files/*`。如果改用自定义 Caddyfile 或额外启用 access log，必须避免 setup token、daemon token、pair ticket、device certificate 和 access token 进入 stdout、文件日志或集中日志系统。
 
-仅本机开发或一次性 smoke 才可以跳过 trusted daemon admission，并且不要复用上面的公网 Caddy compose。可以直接在 loopback 上运行：
+仅本机开发或一次性 smoke 也必须配置 trusted daemon admission。可以用独立临时目录在 loopback 上运行：
 
 ```bash
-cargo run -p termrelay -- --listen 127.0.0.1:8080 --allow-open-relay
+tmp_dir="$(mktemp -d)"
+printf 'development-setup-token-change-me\n' >"$tmp_dir/setup-token"
+printf '{"daemons":[]}\n' >"$tmp_dir/daemon-registry.json"
+chmod 600 "$tmp_dir/setup-token" "$tmp_dir/daemon-registry.json"
+cargo run -p termrelay -- \
+  --listen 127.0.0.1:8080 \
+  --setup-token-file "$tmp_dir/setup-token" \
+  --daemon-registry "$tmp_dir/daemon-registry.json"
 ```
 
-使用 release 容器做本机无认证检查时也只能绑定 loopback，并且镜像 tag 必须显式选择当前 release；不要从本文复制一个历史固定 tag 用于公网部署。
+使用 release 容器做本机检查时也只能绑定 loopback，并且镜像 tag 必须显式选择当前 release；不要从本文复制一个历史固定 tag 用于公网部署。测试结束后删除临时目录。

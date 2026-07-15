@@ -13,7 +13,7 @@ GitHub Actions 中的 `full QA` workflow 只能通过 `workflow_dispatch` 手动
 | Rust workspace | `cargo test --workspace --locked` |
 | pairing CLI E2E | 启动本地 `termd`，运行 `termd pair --qr` 获取 `termd-pair:v2` 邀请码，写入 mode-0600 临时文件，再运行 `termctl pair --payload-file` 完成设备配对 |
 | termctl direct E2E | `cargo test -p termctl --test direct_daemon_e2e` |
-| termrelay open-relay E2E | `cargo test -p termrelay --test relay_e2e`；binary 使用 `--allow-open-relay`，覆盖 daemon connector、metadata/terminal route 转发和 `server_id` 隔离，不覆盖 trusted admission |
+| termrelay trusted E2E | `cargo test -p termrelay --test relay_e2e`；binary 使用 setup token 文件和含已注册 daemon credential 的 registry 启动，验证 trusted runtime 与 HTTP tunnel 鉴权边界 |
 | trusted relay admission | relay 单元测试覆盖 daemon token/public key registry 和 access-token 离线验签；`scripts/qa.sh` 启动真实 `termrelay` 和 `termd --relay`，只注册 daemon token/public key，再通过 HTTP auth 与双 WebSocket 覆盖 trusted admission/routing |
 | 安装脚本 smoke | `bash scripts/test-installers.sh`，检查三个安装脚本的帮助和 systemd 语义 |
 | termui Web | `npm ci`、`npm run typecheck`、`npm run test -- --run`、`npm run build`、`npm run test:e2e`、`npm audit --audit-level=high`；Playwright 覆盖 mock daemon 和真实 relay daemon |

@@ -64,7 +64,6 @@ SELF_INSTALL_ENABLED=0
 SELF_INSTALL_MODE=""
 SELF_INSTALL_BINARY=""
 INSTALL_ALLOW_SESSION_LOSS=0
-INSTALL_ALLOW_OPEN_RELAY=0
 INTERNAL_INSTALL_ARGUMENT_INVALID=0
 INTERNAL_INSTALL_ARGUMENTS_PRESENT=0
 INTERNAL_ARG_RELAY_URL=""
@@ -319,7 +318,6 @@ Options:
   --relay <WS_URL>              Set the relay URL.
   --relay-daemon-token-file <PATH> Read trusted relay daemon admission token from a file.
   --relay-setup-token-file <PATH> Read relay setup token once from a file.
-  --allow-open-relay             Explicitly connect to a relay running with --allow-open-relay.
   --proxy <URL>                 Set relay outbound proxy; http://host:port or socks5://host:port.
                                 Also supports HTTP_PROXY, HTTPS_PROXY, ALL_PROXY and NO_PROXY in /etc/termd/termd.env.
   --tls-cert <PATH>             Set TLS certificate path.
@@ -400,10 +398,6 @@ parse_args() {
         TERMD_RELAY_SETUP_TOKEN_FILE="$2"
         INSTALL_SET_RELAY_SETUP_TOKEN_FILE=1
         shift 2
-        ;;
-      --allow-open-relay)
-        INSTALL_ALLOW_OPEN_RELAY=1
-        shift
         ;;
       --proxy|--relay-proxy)
         [[ $# -ge 2 && -n "$2" ]] || die "$1 requires a non-empty value"
@@ -920,7 +914,7 @@ apply_env_overrides() {
   if [[ "$INSTALL_SET_RELAY_DAEMON_TOKEN_FILE" -eq 1 ]]; then
     upsert_env_var "TERMD_RELAY_DAEMON_TOKEN_FILE" "$TERMD_RELAY_DAEMON_TOKEN_FILE"
   fi
-  if [[ -n "${TERMD_RELAY_URLS:-}" && "$INSTALL_SET_RELAY_DAEMON_TOKEN_FILE" -eq 0 && "$INSTALL_ALLOW_OPEN_RELAY" -eq 0 ]]; then
+  if [[ -n "${TERMD_RELAY_URLS:-}" && "$INSTALL_SET_RELAY_DAEMON_TOKEN_FILE" -eq 0 ]]; then
     TERMD_RELAY_DAEMON_TOKEN_FILE="/etc/termd/termd_daemon_token"
     if [[ ! -s "$TERMD_RELAY_DAEMON_TOKEN_FILE" ]]; then
       write_service_secret_file "$TERMD_RELAY_DAEMON_TOKEN_FILE" "$(generate_secret_token)"
@@ -1559,7 +1553,7 @@ write_env_file() {
     return 0
   fi
 
-  if [[ -n "${TERMD_RELAY_URLS:-}" && "$INSTALL_SET_RELAY_DAEMON_TOKEN_FILE" -eq 0 && "$INSTALL_ALLOW_OPEN_RELAY" -eq 0 ]]; then
+  if [[ -n "${TERMD_RELAY_URLS:-}" && "$INSTALL_SET_RELAY_DAEMON_TOKEN_FILE" -eq 0 ]]; then
     TERMD_RELAY_DAEMON_TOKEN_FILE="/etc/termd/termd_daemon_token"
     if [[ ! -s "$TERMD_RELAY_DAEMON_TOKEN_FILE" ]]; then
       write_service_secret_file "$TERMD_RELAY_DAEMON_TOKEN_FILE" "$(generate_secret_token)"
@@ -1824,13 +1818,6 @@ read_relay_setup_token() {
 }
 
 validate_relay_install_mode() {
-  if [[ "$INSTALL_ALLOW_OPEN_RELAY" -eq 1 ]]; then
-    [[ "$INSTALL_SET_RELAY_URLS" -eq 1 ]] || die "--allow-open-relay requires an explicit --relay <WS_URL>"
-    if [[ -n "${TERMD_RELAY_SETUP_TOKEN:-}" || -n "${TERMD_RELAY_SETUP_TOKEN_FILE:-}" ]]; then
-      die "--allow-open-relay conflicts with relay setup token options"
-    fi
-    return 0
-  fi
   if [[ "$INSTALL_SET_RELAY_URLS" -eq 1 && -z "${TERMD_RELAY_SETUP_TOKEN:-}" && -z "${TERMD_RELAY_SETUP_TOKEN_FILE:-}" ]]; then
     die "trusted relay setup token is required; use --relay-token or --relay-setup-token-file with the termd install command"
   fi
@@ -1839,8 +1826,7 @@ validate_relay_install_mode() {
 relay_connection_verification_requested() {
   [[ "$INSTALL_SET_RELAY_URLS" -eq 1 || \
     "$INSTALL_SET_RELAY_SETUP_TOKEN" -eq 1 || \
-    "$INSTALL_SET_RELAY_SETUP_TOKEN_FILE" -eq 1 || \
-    "$INSTALL_ALLOW_OPEN_RELAY" -eq 1 ]]
+    "$INSTALL_SET_RELAY_SETUP_TOKEN_FILE" -eq 1 ]]
 }
 
 register_daemon_with_relay() (
@@ -1855,7 +1841,6 @@ register_daemon_with_relay() (
   trap 'exit 143' TERM
 
   [[ -n "${TERMD_RELAY_URLS:-}" ]] || return 0
-  [[ "$INSTALL_ALLOW_OPEN_RELAY" -eq 0 ]] || return 0
   if [[ -z "${TERMD_RELAY_SETUP_TOKEN:-}" && -z "${TERMD_RELAY_SETUP_TOKEN_FILE:-}" ]]; then
     warn_missing_relay_registration_token
     return 0
@@ -1959,11 +1944,9 @@ verify_daemon_relay_connected() (
     return 1
   fi
   setup_token=""
-  if [[ "$INSTALL_ALLOW_OPEN_RELAY" -eq 0 ]]; then
-    if ! setup_token="$(read_relay_setup_token)" || [[ -z "$setup_token" ]]; then
-      log "FAILED: relay setup token is empty or unreadable"
-      return 1
-    fi
+  if ! setup_token="$(read_relay_setup_token)" || [[ -z "$setup_token" ]]; then
+    log "FAILED: relay setup token is empty or unreadable"
+    return 1
   fi
   if ! command -v curl >/dev/null 2>&1; then
     log "FAILED: curl is required to verify the relay connection"
@@ -2036,11 +2019,7 @@ print_relay_install_retry() {
   done
   printf -v quoted_arg '%q' "$relay_url"
   retry_command+=" --relay ${quoted_arg}"
-  if [[ "$INSTALL_ALLOW_OPEN_RELAY" -eq 1 ]]; then
-    retry_command+=" --allow-open-relay"
-  else
-    log "the trusted relay setup token will be requested again"
-  fi
+  log "the trusted relay setup token will be requested again"
   log "retry with: ${retry_command}"
 }
 

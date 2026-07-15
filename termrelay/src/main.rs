@@ -17,7 +17,7 @@ use tokio::net::TcpListener;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-use crate::args::{ArgsError, DaemonRegistryRuntimeCredential, RelayCommand};
+use crate::args::{Args, ArgsError, DaemonRegistryRuntimeCredential, RelayCommand};
 use crate::router::router;
 use crate::ws::{RelayDaemonCredential, RelayState};
 
@@ -43,12 +43,10 @@ enum MainError {
     MissingTlsPrivateKey,
     #[error("relay TLS configuration is invalid")]
     TlsConfig,
-    #[error(
-        "daemon registry is required; pass --daemon-registry or explicit --allow-open-relay for legacy/open relay mode"
-    )]
+    #[error("relay setup token is required; pass a readable non-empty --setup-token-file")]
+    MissingSetupToken,
+    #[error("daemon registry path is required; pass --daemon-registry <PATH>")]
     MissingDaemonRegistry,
-    #[error("relay setup token requires --daemon-registry so successful registrations can persist")]
-    SetupTokenWithoutRegistry,
     #[error("failed to initialize relay daemon registry")]
     RelayRegistry(#[from] crate::ws::RegisterDaemonError),
 }
@@ -80,13 +78,7 @@ async fn main() -> Result<(), MainError> {
         }
         RelayCommand::Serve(args) => args,
     };
-    let listener = TcpListener::bind(args.listen)
-        .await
-        .map_err(|source| MainError::Bind {
-            addr: args.listen,
-            source,
-        })?;
-
+    let state = relay_state_from_args(&args)?;
     let tls = match (args.tls_cert, args.tls_key) {
         (Some(cert_path), Some(key_path)) => Some(TlsPaths {
             cert_path,
@@ -94,19 +86,31 @@ async fn main() -> Result<(), MainError> {
         }),
         _ => None,
     };
+    let listener = TcpListener::bind(args.listen)
+        .await
+        .map_err(|source| MainError::Bind {
+            addr: args.listen,
+            source,
+        })?;
 
-    info!(
-        listen = %args.listen,
-        tls = tls.is_some(),
-        web = args.web,
-        allow_open_relay = args.allow_open_relay,
-        "starting trusted termrelay"
-    );
+    info!(listen = %args.listen, tls = tls.is_some(), web = args.web, "starting trusted termrelay");
 
+    serve_listener(listener, state, tls, args.web).await
+}
+
+fn relay_state_from_args(args: &Args) -> Result<RelayState, MainError> {
+    let setup_token = args
+        .setup_token
+        .clone()
+        .ok_or(MainError::MissingSetupToken)?;
+    let daemon_registry_path = args
+        .daemon_registry_path
+        .clone()
+        .ok_or(MainError::MissingDaemonRegistry)?;
     let daemon_credentials = args
         .daemon_registry
         .daemons
-        .into_iter()
+        .iter()
         .filter_map(|daemon| {
             daemon
                 .runtime_credential()
@@ -121,24 +125,12 @@ async fn main() -> Result<(), MainError> {
                 .map(|credential| credential.with_public_key(daemon.daemon_public_key.clone()))
         })
         .collect::<Vec<_>>();
-    if args.setup_token.is_some() && args.daemon_registry_path.is_none() {
-        return Err(MainError::SetupTokenWithoutRegistry);
-    }
-
-    let state = if args.setup_token.is_some() || !daemon_credentials.is_empty() {
-        RelayState::new_trusted_with_registry(
-            daemon_credentials,
-            args.setup_token,
-            args.daemon_registry_path,
-        )?
-    } else {
-        if !args.allow_open_relay {
-            return Err(MainError::MissingDaemonRegistry);
-        }
-        RelayState::new()
-    };
-
-    serve_listener(listener, state, tls, args.web).await
+    RelayState::new_trusted_with_registry(
+        daemon_credentials,
+        Some(setup_token),
+        Some(daemon_registry_path),
+    )
+    .map_err(MainError::from)
 }
 
 fn installer_options<I, S>(args: I) -> Option<terminstall::Options>
@@ -167,7 +159,6 @@ fn help_text() -> String {
             "  --listen, -l <HOST:PORT>      Listen address, default 127.0.0.1:8080\n",
             "  --setup-token-file <PATH>     Read daemon registration setup token from a file\n",
             "  --daemon-registry <PATH>      JSON daemon registry enabling trusted relay admission\n",
-            "  --allow-open-relay            Explicitly allow legacy/open relay mode without daemon registry\n",
             "  --tls-cert <CERT_PEM>         TLS certificate path\n",
             "  --tls-key <KEY_PEM>           TLS private key path; must be paired with --tls-cert\n",
             "  --web                         Serve embedded Web UI\n",
@@ -176,7 +167,6 @@ fn help_text() -> String {
             "INSTALLATION:\n",
             "  Run `termrelay install --help` or `termrelay uninstall --help` for managed installation options.\n\n",
             "EXAMPLES:\n",
-            "  termrelay --listen 127.0.0.1:8080 --allow-open-relay\n",
             "  termrelay --listen 0.0.0.0:8080 --setup-token-file /etc/termd/termrelay_setup_token --daemon-registry /var/lib/termrelay/daemon-registry.json\n"
         ),
         env!("CARGO_PKG_VERSION")
@@ -321,6 +311,60 @@ mod tests {
         assert!(installer_options(["termrelay", "--web"]).is_none());
         assert!(help_text().contains("termrelay install [OPTIONS]"));
         assert!(help_text().contains("termrelay uninstall [OPTIONS]"));
+        assert!(!help_text().contains("--allow-open-relay"));
+    }
+
+    #[test]
+    fn trusted_runtime_requires_setup_token_and_registry_path() {
+        let missing_both = Args::parse_from(["termrelay"]).unwrap();
+        assert!(matches!(
+            relay_state_from_args(&missing_both),
+            Err(MainError::MissingSetupToken)
+        ));
+
+        let token_path = std::env::temp_dir().join(format!(
+            "termrelay-required-setup-token-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        fs::write(&token_path, "relay-setup-secret-required-test\n").unwrap();
+        let setup_only = Args::parse_from([
+            OsString::from("termrelay"),
+            OsString::from("--setup-token-file"),
+            token_path.clone().into_os_string(),
+        ])
+        .unwrap();
+        let error = relay_state_from_args(&setup_only).unwrap_err();
+        assert!(matches!(error, MainError::MissingDaemonRegistry));
+        assert!(error.to_string().contains("--daemon-registry <PATH>"));
+        fs::remove_file(token_path).ok();
+    }
+
+    #[test]
+    fn blank_registry_is_initialized_to_valid_json() {
+        let unique = format!("{}-{}", std::process::id(), uuid::Uuid::new_v4());
+        let token_path =
+            std::env::temp_dir().join(format!("termrelay-blank-registry-token-{unique}"));
+        let registry_path =
+            std::env::temp_dir().join(format!("termrelay-blank-registry-{unique}.json"));
+        fs::write(&token_path, "relay-setup-secret-blank-registry-test\n").unwrap();
+        fs::write(&registry_path, " \n\t\n").unwrap();
+        let args = Args::parse_from([
+            OsString::from("termrelay"),
+            OsString::from("--setup-token-file"),
+            token_path.clone().into_os_string(),
+            OsString::from("--daemon-registry"),
+            registry_path.clone().into_os_string(),
+        ])
+        .unwrap();
+
+        let _state = relay_state_from_args(&args).unwrap();
+
+        let registry: serde_json::Value =
+            serde_json::from_slice(&fs::read(&registry_path).unwrap()).unwrap();
+        assert_eq!(registry["daemons"], serde_json::json!([]));
+        fs::remove_file(token_path).ok();
+        fs::remove_file(registry_path).ok();
     }
 
     #[tokio::test(flavor = "multi_thread")]
