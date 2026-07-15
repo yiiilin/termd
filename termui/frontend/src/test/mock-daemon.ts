@@ -246,6 +246,7 @@ export class MockDaemon {
   public readonly sessionSearchRequests: SessionSearchPayload[] = [];
   public daemonStatusRequests = 0;
   public pingMessages = 0;
+  public metadataPingMessages = 0;
   public acceptedConnections = 0;
   public v070MetadataConnections = 0;
   public v070TerminalConnections = 0;
@@ -812,6 +813,7 @@ export class MockDaemon {
         payload?: { timestamp_ms?: unknown };
       };
       if (message.type === "metadata.ping") {
+        this.metadataPingMessages += 1;
         socket.send(JSON.stringify({
           type: "metadata.pong",
           payload: { timestamp_ms: message.payload?.timestamp_ms },

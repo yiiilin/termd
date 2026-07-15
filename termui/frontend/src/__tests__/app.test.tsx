@@ -8,7 +8,7 @@ import App, {
   APP_CONNECTION_TIMEOUT_MS,
   browserReachableWsUrl,
   isExclusiveMetadataClient,
-  DAEMON_STATUS_POLL_INTERVAL_MS,
+  DAEMON_LATENCY_POLL_INTERVAL_MS,
   defaultWsUrlFromPage,
   knownServerWsUrlCandidates,
   latencyLevelClass,
@@ -1065,7 +1065,7 @@ describe("termui web 工作台", () => {
     await screen.findByText(/termd-e2e-ready/);
     await waitFor(() => expect(daemon.v070MetadataConnections).toBeGreaterThan(0));
 
-    await new Promise((resolve) => window.setTimeout(resolve, DAEMON_STATUS_POLL_INTERVAL_MS * 2 + 500));
+    await new Promise((resolve) => window.setTimeout(resolve, DAEMON_LATENCY_POLL_INTERVAL_MS * 2 + 500));
 
     expect(
       daemon.receivedHttpRequests.some((request) => request.path === "/api/control/daemon/status"),
@@ -1135,7 +1135,7 @@ describe("termui web 工作台", () => {
     setDocumentVisibility("hidden");
     daemon.pushSessionData(DEFAULT_SESSION_ID, "hidden-live-output\n");
     await screen.findByText(/hidden-live-output/);
-    await new Promise((resolve) => window.setTimeout(resolve, DAEMON_STATUS_POLL_INTERVAL_MS + 250));
+    await new Promise((resolve) => window.setTimeout(resolve, DAEMON_LATENCY_POLL_INTERVAL_MS + 250));
 
     expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID]);
     expect(daemon.v070MetadataConnections).toBe(1);
@@ -1477,7 +1477,7 @@ describe("termui web 工作台", () => {
       expect(daemon.receivedPackets.some((packet) => packet.method === "metadata.subscribe")).toBe(true),
     );
 
-    await new Promise((resolve) => window.setTimeout(resolve, DAEMON_STATUS_POLL_INTERVAL_MS * 2 + 500));
+    await new Promise((resolve) => window.setTimeout(resolve, DAEMON_LATENCY_POLL_INTERVAL_MS * 2 + 500));
 
     expect(
       daemon.receivedHttpRequests.some((request) => request.path === "/api/control/daemon/status"),
@@ -1953,6 +1953,21 @@ describe("termui web 工作台", () => {
     });
     expect(within(status).queryByText(/RTT/)).toBeNull();
     expect(daemon.v070MetadataConnections).toBeGreaterThan(0);
+  });
+
+  it("通过 metadata WebSocket 每秒更新网络延迟", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await waitFor(() => expect(daemon.metadataPingMessages).toBeGreaterThanOrEqual(1));
+    const initialPingCount = daemon.metadataPingMessages;
+
+    await waitFor(
+      () => expect(daemon.metadataPingMessages).toBeGreaterThan(initialPingCount),
+      { timeout: DAEMON_LATENCY_POLL_INTERVAL_MS + 1_000 },
+    );
   });
 
   it("标题栏 RTT 按延迟阈值返回颜色等级", () => {

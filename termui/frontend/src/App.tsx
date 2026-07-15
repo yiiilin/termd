@@ -106,7 +106,6 @@ const CONNECTION_AUTO_RETRY_DELAY_MS = 1500;
 const CONNECTION_AUTO_RETRY_LIMIT = 3;
 const ATTACH_RECONNECT_DELAYS_MS = [250, 1000, 2500, 5000, 10000, 20000];
 const ATTACH_SWITCH_COALESCE_DELAY_MS = 80;
-const DAEMON_METADATA_STATUS_INTERVAL_MS = 3000;
 const DAEMON_METADATA_RETRY_DELAY_MS = 1500;
 const TEXT_FILE_EDITOR_MAX_BYTES = 1024 * 1024;
 const FILE_TRANSFER_MEMORY_FALLBACK_MAX_BYTES = 16 * 1024 * 1024;
@@ -122,7 +121,7 @@ const CPU_BAR_CHART_WIDTH = 56;
 const CPU_BAR_CHART_HEIGHT = 18;
 const CPU_BAR_CHART_COUNT = 18;
 export const APP_VERSION = packageMetadata.version;
-export const DAEMON_STATUS_POLL_INTERVAL_MS = 1000;
+export const DAEMON_LATENCY_POLL_INTERVAL_MS = 1000;
 // 普通前端操作走同一条可靠 WebSocket；relay 下终端输出可能排在 RPC 响应前面。
 // 5 秒给公网 relay 和浏览器调度留出缓冲，避免把短暂排队误报成“操作超时”。
 export const APP_CONNECTION_TIMEOUT_MS = 5000;
@@ -3035,6 +3034,9 @@ export default function App() {
 
     void (async () => {
       let client: V070Client | undefined;
+      let unsubscribeMetadata: (() => void) | undefined;
+      let latencyTimer: number | undefined;
+      let latencyInFlight = false;
       try {
         client = await authenticatedWorkspaceClient(APP_CONNECTION_TIMEOUT_MS);
         if (!isCurrentMetadataClient()) {
@@ -3046,7 +3048,7 @@ export default function App() {
           return;
         }
         setMetadataReady(true);
-        const unsubscribe = client.watchMetadata((_revision: number, metadata: any) => {
+        unsubscribeMetadata = client.watchMetadata((_revision: number, metadata: any) => {
           if (!isCurrentMetadataClient()) return;
           if (Array.isArray(metadata.clients)) {
             applyDaemonClientsSnapshot(metadata.clients as DaemonClientSummaryPayload[]);
@@ -3072,11 +3074,27 @@ export default function App() {
             setSessions(orderSessions(sortSessionsNewestFirst(visibleSessions), nextOrder));
           }
         });
-        void client.measureLatency().then((latencyMs) => {
-          if (isCurrentMetadataClient()) {
-            setDaemonNetworkLatencyMs(latencyMs);
+        const latencyClient = client;
+        const measureLatency = async () => {
+          if (latencyInFlight || isPagePaused() || !isCurrentMetadataClient()) {
+            return;
           }
-        }).catch(() => undefined);
+          latencyInFlight = true;
+          try {
+            const latencyMs = await latencyClient.measureLatency();
+            if (isCurrentMetadataClient()) {
+              setDaemonNetworkLatencyMs(latencyMs);
+            }
+          } catch {
+            // Latency is auxiliary status; keep the last good sample on a transient timeout.
+          } finally {
+            latencyInFlight = false;
+          }
+        };
+        void measureLatency();
+        latencyTimer = window.setInterval(() => {
+          void measureLatency();
+        }, DAEMON_LATENCY_POLL_INTERVAL_MS);
         await new Promise<void>((resolve) => {
           if (abortController.signal.aborted) {
             resolve();
@@ -3084,7 +3102,6 @@ export default function App() {
           }
           abortController.signal.addEventListener("abort", () => resolve(), { once: true });
         });
-        unsubscribe();
       } catch (caught) {
         if (!isCurrentMetadataClient()) {
           return;
@@ -3098,6 +3115,10 @@ export default function App() {
         setMetadataReady(false);
         scheduleMetadataRetry();
       } finally {
+        if (latencyTimer !== undefined) {
+          window.clearInterval(latencyTimer);
+        }
+        unsubscribeMetadata?.();
         if (metadataClientAbortControllerRef.current === abortController) {
           metadataClientAbortControllerRef.current = undefined;
         }
