@@ -1955,19 +1955,33 @@ describe("termui web 工作台", () => {
     expect(daemon.v070MetadataConnections).toBeGreaterThan(0);
   });
 
-  it("通过 metadata WebSocket 每秒更新网络延迟", async () => {
+  it("收到 metadata pong 一秒后才发起下一次延迟检测", async () => {
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [
+        {
+          session_id: DEFAULT_SESSION_ID,
+          state: "running",
+          size: { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 },
+        },
+      ],
+      attachOutput: "termd-e2e-ready\n",
+      metadataPingDelayMs: 250,
+    });
     const user = userEvent.setup();
     render(<App />);
 
     await pairWithInvite(user, daemon);
     await waitForWorkspaceSession();
-    await waitFor(() => expect(daemon.metadataPingMessages).toBeGreaterThanOrEqual(1));
-    const initialPingCount = daemon.metadataPingMessages;
-
     await waitFor(
-      () => expect(daemon.metadataPingMessages).toBeGreaterThan(initialPingCount),
-      { timeout: DAEMON_LATENCY_POLL_INTERVAL_MS + 1_000 },
+      () => expect(daemon.metadataPingReceivedAtMs).toHaveLength(2),
+      { timeout: DAEMON_LATENCY_POLL_INTERVAL_MS + 2_000 },
     );
+    expect(daemon.metadataPongSentAtMs).toHaveLength(1);
+    expect(
+      daemon.metadataPingReceivedAtMs[1] - daemon.metadataPongSentAtMs[0],
+    ).toBeGreaterThanOrEqual(DAEMON_LATENCY_POLL_INTERVAL_MS);
   });
 
   it("标题栏 RTT 按延迟阈值返回颜色等级", () => {

@@ -868,13 +868,10 @@ export default function App() {
     setDaemonClients(clients);
   }, []);
 
-  const applyDaemonStatusSnapshot = useCallback((status: DaemonStatusResultPayload, latencyMs?: number) => {
+  const applyDaemonStatusSnapshot = useCallback((status: DaemonStatusResultPayload) => {
     const nextNetworkSample = networkCounterSampleFromStatus(status, Date.now());
     setDaemonNetworkRate(networkRateFromSamples(daemonNetworkSampleRef.current, nextNetworkSample));
     daemonNetworkSampleRef.current = nextNetworkSample;
-    if (latencyMs !== undefined) {
-      setDaemonNetworkLatencyMs(latencyMs);
-    }
     setDaemonStatus(status);
     // CPU 历史只保留当前页面内缓存，避免把监控数据写入持久状态。
     setDaemonCpuHistory((current) => appendCpuSample(current, status.cpu_percent));
@@ -1816,13 +1813,12 @@ export default function App() {
     try {
       const client = await authenticatedWorkspaceClient();
       try {
-        // 中文注释：状态栏和 RTT 是非终端 segment，仍复用工作台可靠 WebSocket。
+        // 中文注释：状态栏是非终端 segment，仍复用工作台可靠 WebSocket。
         const status = await client.getDaemonStatus();
-        const latencyMs = await client.measureLatency().catch(() => undefined);
         if (!isCurrentRequest()) {
           return;
         }
-        applyDaemonStatusSnapshot(status, latencyMs);
+        applyDaemonStatusSnapshot(status);
       } catch (caught) {
         throw caught;
       }
@@ -3036,7 +3032,6 @@ export default function App() {
       let client: V070Client | undefined;
       let unsubscribeMetadata: (() => void) | undefined;
       let latencyTimer: number | undefined;
-      let latencyInFlight = false;
       try {
         client = await authenticatedWorkspaceClient(APP_CONNECTION_TIMEOUT_MS);
         if (!isCurrentMetadataClient()) {
@@ -3075,26 +3070,34 @@ export default function App() {
           }
         });
         const latencyClient = client;
-        const measureLatency = async () => {
-          if (latencyInFlight || isPagePaused() || !isCurrentMetadataClient()) {
+        const scheduleNextLatencyMeasurement = () => {
+          if (!isCurrentMetadataClient()) {
             return;
           }
-          latencyInFlight = true;
+          latencyTimer = window.setTimeout(() => {
+            latencyTimer = undefined;
+            if (isPagePaused()) {
+              scheduleNextLatencyMeasurement();
+              return;
+            }
+            void measureLatency();
+          }, DAEMON_LATENCY_POLL_INTERVAL_MS);
+        };
+        const measureLatency = async () => {
+          if (isPagePaused() || !isCurrentMetadataClient()) {
+            return;
+          }
           try {
             const latencyMs = await latencyClient.measureLatency();
             if (isCurrentMetadataClient()) {
               setDaemonNetworkLatencyMs(latencyMs);
+              scheduleNextLatencyMeasurement();
             }
           } catch {
-            // Latency is auxiliary status; keep the last good sample on a transient timeout.
-          } finally {
-            latencyInFlight = false;
+            // An unanswered ping must not start another measurement on the same connection.
           }
         };
         void measureLatency();
-        latencyTimer = window.setInterval(() => {
-          void measureLatency();
-        }, DAEMON_LATENCY_POLL_INTERVAL_MS);
         await new Promise<void>((resolve) => {
           if (abortController.signal.aborted) {
             resolve();
@@ -3116,7 +3119,7 @@ export default function App() {
         scheduleMetadataRetry();
       } finally {
         if (latencyTimer !== undefined) {
-          window.clearInterval(latencyTimer);
+          window.clearTimeout(latencyTimer);
         }
         unsubscribeMetadata?.();
         if (metadataClientAbortControllerRef.current === abortController) {

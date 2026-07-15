@@ -120,6 +120,7 @@ interface MockDaemonOptions {
   sessionCloseDelayMs?: number;
   closeSessionUnownedError?: ErrorPayload;
   pingDelayMs?: number;
+  metadataPingDelayMs?: number;
   sessionTokenExpiresAtMs?: number;
   sessionScopeExpiresAtMs?: number;
 }
@@ -247,6 +248,8 @@ export class MockDaemon {
   public daemonStatusRequests = 0;
   public pingMessages = 0;
   public metadataPingMessages = 0;
+  public readonly metadataPingReceivedAtMs: number[] = [];
+  public readonly metadataPongSentAtMs: number[] = [];
   public acceptedConnections = 0;
   public v070MetadataConnections = 0;
   public v070TerminalConnections = 0;
@@ -814,10 +817,21 @@ export class MockDaemon {
       };
       if (message.type === "metadata.ping") {
         this.metadataPingMessages += 1;
-        socket.send(JSON.stringify({
-          type: "metadata.pong",
-          payload: { timestamp_ms: message.payload?.timestamp_ms },
-        }));
+        this.metadataPingReceivedAtMs.push(Date.now());
+        const sendPong = () => {
+          if (socket.readyState !== socket.OPEN) return;
+          this.metadataPongSentAtMs.push(Date.now());
+          socket.send(JSON.stringify({
+            type: "metadata.pong",
+            payload: { timestamp_ms: message.payload?.timestamp_ms },
+          }));
+        };
+        const delayMs = Math.max(0, this.options.metadataPingDelayMs ?? 0);
+        if (delayMs > 0) {
+          setTimeout(sendPong, delayMs);
+        } else {
+          sendPong();
+        }
       }
     });
   }
