@@ -169,6 +169,7 @@ export function TerminalPane(props: TerminalPaneProps) {
   const mobileInputModeRef = useRef(Boolean(props.mobileInputMode));
   const mobileKeyboardOpenRef = useRef(Boolean(props.mobileKeyboardOpen));
   const mobileCursorVisibleRowsRef = useRef<number | undefined>(undefined);
+  const mobileCursorTargetScrollTopRef = useRef<number | undefined>(undefined);
   const resizeRef = useRef<((source?: ResizeSource) => void) | undefined>(undefined);
   const stabilizeRef = useRef<((source?: ResizeSource) => void) | undefined>(undefined);
   const pendingResizeAfterSnapshotRef = useRef<ResizeSource | undefined>(undefined);
@@ -791,6 +792,7 @@ export function TerminalPane(props: TerminalPaneProps) {
   };
   const resetMobileCursorViewportWindow = () => {
     mobileCursorVisibleRowsRef.current = undefined;
+    mobileCursorTargetScrollTopRef.current = undefined;
     const scrollport = scrollportRef.current;
     if (scrollport) {
       scrollport.scrollTop = 0;
@@ -799,6 +801,7 @@ export function TerminalPane(props: TerminalPaneProps) {
     canvasRef.current?.style.removeProperty("min-height");
     frameRef.current?.style.removeProperty("height");
     frameRef.current?.style.removeProperty("min-height");
+    frameRef.current?.style.removeProperty("top");
   };
   const visibleRowsForMobileViewport = (terminal: TerminalRendererTerminal) => {
     const proposedRows = fitRef.current?.proposeDimensions?.()?.rows;
@@ -825,7 +828,11 @@ export function TerminalPane(props: TerminalPaneProps) {
     mobileCursorVisibleRowsRef.current = visibleRows;
     return visibleRows;
   };
-  const syncMobileBottomViewportWindow = (terminal: TerminalRendererTerminal, visibleRows: number) => {
+  const syncMobileCursorViewportWindow = (
+    terminal: TerminalRendererTerminal,
+    visibleRows: number,
+    cursorLine: number,
+  ) => {
     const scrollport = scrollportRef.current;
     const canvas = canvasRef.current;
     const frame = frameRef.current;
@@ -840,7 +847,13 @@ export function TerminalPane(props: TerminalPaneProps) {
       0,
       scrollport.clientHeight - insetTop - insetBottom,
     );
-    const rowHeight = visibleWindowHeight > 0 ? visibleWindowHeight / visibleRows : 0;
+    const terminalSurfaceHeight = resolveTerminalSurfaceElement(host)?.getBoundingClientRect().height ?? 0;
+    const measuredRowHeight = terminalSurfaceHeight > 0 ? terminalSurfaceHeight / terminal.rows : 0;
+    const rowHeight = measuredRowHeight > 0
+      ? measuredRowHeight
+      : visibleWindowHeight > 0
+        ? visibleWindowHeight / visibleRows
+        : 0;
     if (!Number.isFinite(rowHeight) || rowHeight <= 0) {
       return;
     }
@@ -848,18 +861,29 @@ export function TerminalPane(props: TerminalPaneProps) {
     frame.style.height = `${fullGridHeight}px`;
     frame.style.minHeight = `${fullGridHeight}px`;
 
-    canvas.style.height = `${fullGridHeight}px`;
-    canvas.style.minHeight = `${fullGridHeight}px`;
+    const nextScrollState = rendererRef.current?.scrollState(terminal);
+    const viewportY = nextScrollState?.viewportY ?? 0;
+    const cursorViewportRow = clampNumber(cursorLine - viewportY, 0, Math.max(0, terminal.rows - 1));
+    const leadingSpacerHeight = Math.max(0, scrollport.clientHeight / 2 - insetTop - rowHeight / 2);
+    const trailingSpacerHeight = Math.max(0, scrollport.clientHeight / 2 - insetBottom - rowHeight / 2);
+    frame.style.top = `${leadingSpacerHeight}px`;
 
-    // 中文注释：快捷键栏贴在可视 viewport 底部；这里始终把完整 PTY 网格的底边贴到
-    // 快捷键栏上方，不再追加半屏 spacer 把输入点抬到键盘上方中线。
+    const cursorCenter = leadingSpacerHeight + insetTop + (cursorViewportRow + 0.5) * rowHeight;
+    const targetScrollTop = Math.max(0, cursorCenter - scrollport.clientHeight / 2);
+    const scrollableHeight = Math.ceil(leadingSpacerHeight + fullGridHeight + trailingSpacerHeight);
+    canvas.style.height = `${scrollableHeight}px`;
+    canvas.style.minHeight = `${scrollableHeight}px`;
+
+    // 中文注释：外层 workspace 继续贴住标题栏和键盘边界；leading/trailing spacer
+    // 只移动完整 xterm 网格，使渲染光标、helper textarea 和 IME 锚点保持同一坐标。
     const maxScrollTop = Math.max(
-      (Math.max(scrollport.scrollHeight, fullGridHeight) || fullGridHeight) - scrollport.clientHeight,
+      (Math.max(scrollport.scrollHeight, scrollableHeight) || scrollableHeight) - scrollport.clientHeight,
       0,
     );
-    scrollport.scrollTop = maxScrollTop;
+    scrollport.scrollTop = Math.min(targetScrollTop, maxScrollTop);
+    mobileCursorTargetScrollTopRef.current = scrollport.scrollTop;
   };
-  const alignMobileViewportToTerminalBottom = (terminal = terminalRef.current) => {
+  const centerMobileViewportOnCursor = (terminal = terminalRef.current) => {
     if (!terminal || !mobileInputModeRef.current || !mobileKeyboardOpenRef.current) {
       resetMobileCursorViewportWindow();
       return false;
@@ -868,18 +892,17 @@ export function TerminalPane(props: TerminalPaneProps) {
     if (!scrollState || terminal.rows <= 0) {
       return false;
     }
-    // 中文注释：键盘打开后目标是“终端底部贴住快捷键上方”，不是追随隐藏
-    // textarea/输入光标。内部 xterm viewport 保持在 buffer 底部，外层 scrollport
-    // 再裁出最后一屏，避免输入焦点被推到键盘上方中线。
+    // 中文注释：xterm viewport 始终保持在 baseY，避免原生输入的 scrollOnUserInput
+    // 或 helper textarea/IME 锚点使用不同坐标；居中只由外层 canvas 完成。
     const visibleRows = visibleRowsForMobileViewport(terminal);
     const targetViewportY = scrollState.baseY;
     if (Math.abs(scrollState.viewportY - targetViewportY) < TERMINAL_BOTTOM_EPSILON) {
-      syncMobileBottomViewportWindow(terminal, visibleRows);
+      syncMobileCursorViewportWindow(terminal, visibleRows, scrollState.cursorLine);
       return false;
     }
     terminal.scrollToLine(targetViewportY);
     syncTerminalInputAnchor(terminal, "scroll");
-    syncMobileBottomViewportWindow(terminal, visibleRows);
+    syncMobileCursorViewportWindow(terminal, visibleRows, scrollState.cursorLine);
     return true;
   };
   const scheduleScrollToBottom = (generation: number, passes = 2) => {
@@ -914,7 +937,7 @@ export function TerminalPane(props: TerminalPaneProps) {
       return;
     }
     if (mobileInputModeRef.current && mobileKeyboardOpenRef.current) {
-      alignMobileViewportToTerminalBottom();
+      centerMobileViewportOnCursor();
       return;
     }
     if (wasPinnedToBottom) {
@@ -1726,7 +1749,8 @@ export function TerminalPane(props: TerminalPaneProps) {
     if (!mobileInputModeRef.current || !props.attached || event.pointerType === "mouse") {
       return;
     }
-    if (!hitTerminalSurfaceAtPoint(event.target, event.clientX, event.clientY)) {
+    const hitSurface = hitTerminalSurfaceAtPoint(event.target, event.clientX, event.clientY);
+    if (!hitSurface && !hitTerminalInteractionArea(event.target, event.clientX, event.clientY)) {
       mobileScrollGestureRef.current = undefined;
       return;
     }
@@ -1749,7 +1773,11 @@ export function TerminalPane(props: TerminalPaneProps) {
       lastClientY: event.clientY,
       active: false,
     };
-    scheduleMobileSelectionLongPress(event.pointerId, event.clientX, event.clientY);
+    if (hitSurface) {
+      scheduleMobileSelectionLongPress(event.pointerId, event.clientX, event.clientY);
+    } else {
+      clearMobileSelectionLongPress();
+    }
   };
   const handleMobileTerminalScrollPointerMove = (event: ReactPointerEvent<HTMLDivElement>) => {
     const gesture = mobileScrollGestureRef.current;
@@ -1920,7 +1948,7 @@ export function TerminalPane(props: TerminalPaneProps) {
         return;
       }
       lastCursorReportAtRef.current = nowForThrottle();
-      alignMobileViewportToTerminalBottom(terminal);
+      centerMobileViewportOnCursor(terminal);
     });
   };
 
@@ -1946,6 +1974,23 @@ export function TerminalPane(props: TerminalPaneProps) {
       cursorReportTimerRef.current = undefined;
       requestCursorReportFrame();
     }, CURSOR_REPORT_INTERVAL_MS - elapsed);
+  };
+
+  const handleTerminalScrollportScroll = () => {
+    const scrollport = scrollportRef.current;
+    const targetScrollTop = mobileCursorTargetScrollTopRef.current;
+    if (
+      !scrollport ||
+      !mobileInputModeRef.current ||
+      !mobileKeyboardOpenRef.current ||
+      targetScrollTop === undefined ||
+      Math.abs(scrollport.scrollTop - targetScrollTop) <= 1
+    ) {
+      return;
+    }
+    // 中文注释：移动浏览器可能在 focused textarea 输入后迟到地滚动 overflow:hidden
+    // 祖先。直接监听偏离目标的 scroll，比猜测默认动作会落在哪一帧更稳定。
+    queueCursorReport({ immediate: true });
   };
 
   const requestTerminalScrollFrame = () => {
@@ -2586,6 +2631,23 @@ export function TerminalPane(props: TerminalPaneProps) {
       clientY <= rect.bottom
     );
   };
+  const hitTerminalInteractionArea = (
+    target: EventTarget | null,
+    clientX: number,
+    clientY: number,
+  ) => {
+    if (hitTerminalSurfaceAtPoint(target, clientX, clientY)) {
+      return true;
+    }
+    const element = target instanceof Element ? target : null;
+    const canvas = canvasRef.current;
+    return Boolean(
+      mobileKeyboardOpenRef.current &&
+      element &&
+      canvas &&
+      (element === canvas || element.closest(".terminal-canvas") === canvas),
+    );
+  };
   const hasActiveTerminalFocus = () => focusedRef.current && windowActiveRef.current;
   const terminalInputHasDomFocus = () => {
     const terminalHost = hostRef.current;
@@ -2681,7 +2743,8 @@ export function TerminalPane(props: TerminalPaneProps) {
   const focusTerminalFromTerminalClick = (event: MouseEvent<HTMLDivElement>) => {
     const target = event.target instanceof Element ? event.target : null;
     const hitSurface = hitTerminalSurfaceAtPoint(target, event.clientX, event.clientY);
-    const hitActivationTarget = hitSurface || isTerminalActivationTarget(target);
+    const hitInteractionArea = hitSurface || hitTerminalInteractionArea(target, event.clientX, event.clientY);
+    const hitActivationTarget = hitInteractionArea || isTerminalActivationTarget(target);
     if (!hitActivationTarget) {
       return;
     }
@@ -3006,6 +3069,12 @@ export function TerminalPane(props: TerminalPaneProps) {
         chunkLength: data.length,
       });
       onInputRef.current(data);
+      if (mobileInputModeRef.current && mobileKeyboardOpenRef.current) {
+        // 中文注释：移动浏览器可能在原生键盘/IME 输入时自动把 focused textarea 的
+        // 外层 scrollport 推到末尾；PTY 无回显时没有后续 cursor/output 事件可供恢复。
+        // 先合并一次重算；迟到的默认滚动再由 scrollport 的目标偏离监听恢复。
+        queueCursorReport({ immediate: true });
+      }
     });
     const helperTextarea = renderer.getInputElement(host);
     if (helperTextarea) {
@@ -3118,8 +3187,8 @@ export function TerminalPane(props: TerminalPaneProps) {
       }
       scheduleTerminalScrollPosition();
     });
-    const terminalFrame = frameRef.current;
-    terminalFrame?.addEventListener("wheel", handleTerminalWheel, { capture: true, passive: false });
+    const terminalInteractionSurface = canvasRef.current;
+    terminalInteractionSurface?.addEventListener("wheel", handleTerminalWheel, { capture: true, passive: false });
     const handleTerminalCopyShortcut = (event: KeyboardEvent) => {
       if (event.defaultPrevented || !isTerminalCopyShortcut(event)) {
         return;
@@ -3279,7 +3348,7 @@ export function TerminalPane(props: TerminalPaneProps) {
         // xterm 重新锚定到新网格，导致移动浏览器认为输入目标失稳而收起键盘。
         applyFontSize(terminal, currentTerminalFontSize());
         terminal.refresh(0, Math.max(0, terminal.rows - 1));
-        alignMobileViewportToTerminalBottom(terminal);
+        centerMobileViewportOnCursor(terminal);
         syncTerminalInputAnchor(terminal, "refresh");
         queueCursorReport({ immediate: true });
         return;
@@ -3705,7 +3774,7 @@ export function TerminalPane(props: TerminalPaneProps) {
       helperTextarea?.removeEventListener("beforeinput", handleMobileBeforeInput, true);
       helperTextarea?.removeEventListener("paste", handleMobilePaste, true);
       host.removeEventListener("focusin", handleHostFocusBridge, true);
-      terminalFrame?.removeEventListener("wheel", handleTerminalWheel, true);
+      terminalInteractionSurface?.removeEventListener("wheel", handleTerminalWheel, true);
       document.removeEventListener("keydown", handleTerminalCopyShortcut, true);
       document.removeEventListener("keydown", handleTerminalPasteShortcut, true);
       document.removeEventListener("copy", handleTerminalCopyEvent, true);
@@ -3902,22 +3971,25 @@ export function TerminalPane(props: TerminalPaneProps) {
       className="terminal-pane"
       data-testid="terminal-pane"
     >
-      <div className="terminal-scrollport" ref={scrollportRef}>
-        <div className="terminal-canvas" ref={canvasRef}>
+      <div className="terminal-scrollport" ref={scrollportRef} onScroll={handleTerminalScrollportScroll}>
+        <div
+          className="terminal-canvas"
+          ref={canvasRef}
+          onMouseDownCapture={handleTerminalMouseDownCapture}
+          onClickCapture={focusTerminalFromTerminalClick}
+          onPointerDownCapture={handleMobileTerminalScrollPointerDown}
+          onPointerMoveCapture={handleMobileTerminalScrollPointerMove}
+          onPointerUpCapture={handleMobileTerminalScrollPointerEnd}
+          onPointerCancelCapture={handleMobileTerminalScrollPointerEnd}
+          onPointerDown={handleMobileDirectionPointerDown}
+          onPointerMove={handleMobileDirectionPointerMove}
+          onPointerUp={handleMobileDirectionPointerEnd}
+          onPointerCancel={handleMobileDirectionPointerEnd}
+          onContextMenuCapture={handleTerminalContextMenu}
+        >
           <div
             className="terminal-frame"
             ref={frameRef}
-            onMouseDownCapture={handleTerminalMouseDownCapture}
-            onClickCapture={focusTerminalFromTerminalClick}
-            onPointerDownCapture={handleMobileTerminalScrollPointerDown}
-            onPointerMoveCapture={handleMobileTerminalScrollPointerMove}
-            onPointerUpCapture={handleMobileTerminalScrollPointerEnd}
-            onPointerCancelCapture={handleMobileTerminalScrollPointerEnd}
-            onPointerDown={handleMobileDirectionPointerDown}
-            onPointerMove={handleMobileDirectionPointerMove}
-            onPointerUp={handleMobileDirectionPointerEnd}
-            onPointerCancel={handleMobileDirectionPointerEnd}
-            onContextMenuCapture={handleTerminalContextMenu}
           >
             <div
               className="terminal-host"

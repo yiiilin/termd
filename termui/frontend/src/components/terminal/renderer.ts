@@ -71,6 +71,7 @@ export interface TerminalRendererInputAnchorOptions {
 export interface TerminalRendererScrollState {
   viewportY: number;
   baseY: number;
+  cursorLine: number;
   cursorBottomLine: number;
   length: number;
 }

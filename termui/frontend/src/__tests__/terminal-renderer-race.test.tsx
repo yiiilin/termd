@@ -76,6 +76,7 @@ function fakeRenderer(label: string): TerminalRendererInstance {
     scrollState: () => ({
       viewportY: 0,
       baseY: 0,
+      cursorLine: 0,
       cursorBottomLine: 0,
       length: 24,
     }),

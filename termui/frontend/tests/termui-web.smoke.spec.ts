@@ -349,13 +349,214 @@ test("mobile keyboard open 会重排 shell 高度且不写回 PTY", async ({ pag
     await page.waitForTimeout(900);
     expect(daemon.sessionResizes.length).toBe(resizeCountBeforeKeyboardOpen);
 
-    daemon.pushSessionData(sessionId, "mobile-keyboard-cursor-anchor\n");
+    // 中文注释：把 PTY 光标移到当前终端网格第 5 行。旧的“始终贴底”实现会把
+    // 这一行裁到标题栏上方；正确实现应只滚动终端内部并将它放到可见区中线。
+    daemon.pushSessionData(sessionId, "\u001b[5;1Hmobile-keyboard-cursor-anchor");
     await expectTerminalLine(page, "mobile-keyboard-cursor-anchor", 8_000);
-    await expect
-      .poll(async () =>
-        page.locator(".terminal-scrollport").evaluate((element) => Math.round((element as HTMLElement).scrollTop)),
-      )
-      .toBeGreaterThan(0);
+    const readMobileCursorGeometry = (cursorRow: number) => page.locator(".terminal-scrollport").evaluate(
+      (element, expectedCursorRow) => {
+        const scrollport = element as HTMLElement;
+        const pane = scrollport.closest<HTMLElement>(".terminal-pane");
+        const toolbar = document.querySelector<HTMLElement>(".toolbar");
+        const shortcuts = pane?.querySelector<HTMLElement>(".terminal-mobile-shortcuts");
+        const host = pane?.querySelector<HTMLElement>(".terminal-host");
+        const screen = host?.querySelector<HTMLElement>(".xterm-screen");
+        const input = host?.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
+        if (!pane || !toolbar || !shortcuts || !host || !screen || !input) {
+          return undefined;
+        }
+        const scrollportRect = scrollport.getBoundingClientRect();
+        const paneRect = pane.getBoundingClientRect();
+        const toolbarRect = toolbar.getBoundingClientRect();
+        const shortcutsRect = shortcuts.getBoundingClientRect();
+        const screenRect = screen.getBoundingClientRect();
+        const inputRect = input.getBoundingClientRect();
+        const terminalRows = Number(host.dataset.termdActualRows);
+        const viewportLinesAboveBottom = Number(host.dataset.termdViewportYRaw);
+        if (!terminalRows || !Number.isFinite(viewportLinesAboveBottom) || screenRect.height <= 0) {
+          return undefined;
+        }
+        const rowHeight = screenRect.height / terminalRows;
+        const cursorViewportRow = expectedCursorRow + viewportLinesAboveBottom;
+        const cursorCenter = screenRect.top + (cursorViewportRow + 0.5) * rowHeight;
+        const visibleCenter = (scrollportRect.top + scrollportRect.bottom) / 2;
+        const visualBottom = (window.visualViewport?.offsetTop ?? 0) + (window.visualViewport?.height ?? window.innerHeight);
+        return {
+          paneStartsAtToolbar: paneRect.top >= toolbarRect.bottom - 1,
+          paneEndsAtKeyboard: Math.abs(paneRect.bottom - visualBottom) <= 2,
+          terminalEndsAtShortcuts: Math.abs(scrollportRect.bottom - shortcutsRect.top) <= 2,
+          cursorVisible: cursorCenter >= scrollportRect.top && cursorCenter <= scrollportRect.bottom,
+          cursorCentered: Math.abs(cursorCenter - visibleCenter) <= 2,
+          inputAnchorAligned: Math.abs(inputRect.top - (cursorCenter - rowHeight / 2)) <= 2,
+        };
+      },
+      cursorRow,
+    );
+    const expectedMobileCursorGeometry = {
+      paneStartsAtToolbar: true,
+      paneEndsAtKeyboard: true,
+      terminalEndsAtShortcuts: true,
+      cursorVisible: true,
+      cursorCentered: true,
+      inputAnchorAligned: true,
+    };
+    await expect.poll(() => readMobileCursorGeometry(4)).toEqual(expectedMobileCursorGeometry);
+
+    // 中文注释：移动浏览器可能在原生键盘输入时滚动 focused textarea 的祖先。
+    // daemon 故意不回显，确保光标与 IME 锚点无需等待 PTY 输出也能恢复居中。
+    const noEchoInputBaseline = daemon.decryptedInputs.join("");
+    await page.keyboard.type("x");
+    await expect.poll(() => daemon.decryptedInputs.join("").slice(noEchoInputBaseline.length)).toBe("x");
+    await expect.poll(() => readMobileCursorGeometry(4)).toEqual(expectedMobileCursorGeometry);
+
+    daemon.pushSessionData(sessionId, "\u001b[1;1Hmobile-keyboard-top-anchor");
+    await expectTerminalLine(page, "mobile-keyboard-top-anchor", 8_000);
+    await expect.poll(() => readMobileCursorGeometry(0)).toEqual(expectedMobileCursorGeometry);
+
+    // 中文注释：首行居中后，上半屏是 canvas 的本地 leading spacer；这里也必须
+    // 保持完整终端交互，点击它应从工具栏重新拿回 helper textarea 焦点。
+    const mobileMenuToggle = page.locator(".mobile-menu-toggle");
+    await mobileMenuToggle.focus();
+    await expect(mobileMenuToggle).toBeFocused();
+    const scrollportBox = await page.locator(".terminal-scrollport").boundingBox();
+    if (!scrollportBox) {
+      throw new Error("mobile terminal scrollport has no layout box");
+    }
+    await page.touchscreen.tap(scrollportBox.x + 16, scrollportBox.y + 8);
+    await expect(terminalInput).toBeFocused();
+
+    // 中文注释：spacer 是完整的聚焦/滚动交互区，但不是终端 cell；静止长按不能
+    // 被钳制到首行并误启动文字选区。
+    await page.locator(".terminal-scrollport").evaluate((element) => {
+      const scrollport = element as HTMLElement;
+      const canvas = scrollport.querySelector<HTMLElement>(".terminal-canvas");
+      if (!canvas) {
+        throw new Error("mobile terminal canvas is missing");
+      }
+      const rect = scrollport.getBoundingClientRect();
+      canvas.dispatchEvent(new PointerEvent("pointerdown", {
+        bubbles: true,
+        cancelable: true,
+        pointerId: 90,
+        pointerType: "touch",
+        buttons: 1,
+        clientX: rect.left + 20,
+        clientY: rect.top + 8,
+      }));
+    });
+    await page.waitForTimeout(700);
+    await page.locator(".terminal-scrollport").evaluate((element) => {
+      const scrollport = element as HTMLElement;
+      const canvas = scrollport.querySelector<HTMLElement>(".terminal-canvas");
+      const rect = scrollport.getBoundingClientRect();
+      canvas?.dispatchEvent(new PointerEvent("pointerup", {
+        bubbles: true,
+        cancelable: true,
+        pointerId: 90,
+        pointerType: "touch",
+        buttons: 0,
+        clientX: rect.left + 20,
+        clientY: rect.top + 8,
+      }));
+    });
+    await expect(page.locator(".terminal-host")).toHaveAttribute("data-termd-has-selection", "false");
+
+    const terminalRows = await page.locator(".terminal-host").evaluate((host) =>
+      Number((host as HTMLElement).dataset.termdActualRows),
+    );
+    expect(terminalRows).toBeGreaterThan(0);
+    daemon.pushSessionData(sessionId, `\u001b[${terminalRows};1Hmobile-keyboard-bottom-anchor`);
+    await expectTerminalLine(page, "mobile-keyboard-bottom-anchor", 8_000);
+    await expect.poll(() => readMobileCursorGeometry(terminalRows - 1)).toEqual(expectedMobileCursorGeometry);
+
+    // 中文注释：末行居中后，下半屏是 trailing spacer。触摸拖动必须由终端滚动
+    // 手势消费，不能让外层 scrollport 自己漂移。
+    const spacerDrag = await page.locator(".terminal-scrollport").evaluate((element) => {
+      const scrollport = element as HTMLElement;
+      const canvas = scrollport.querySelector<HTMLElement>(".terminal-canvas");
+      if (!canvas) {
+        return undefined;
+      }
+      const rect = scrollport.getBoundingClientRect();
+      const clientX = rect.left + 20;
+      const startY = rect.bottom - 100;
+      const endY = rect.bottom - 20;
+      const scrollTopBefore = scrollport.scrollTop;
+      canvas.dispatchEvent(new PointerEvent("pointerdown", {
+        bubbles: true,
+        cancelable: true,
+        pointerId: 91,
+        pointerType: "touch",
+        buttons: 1,
+        clientX,
+        clientY: startY,
+      }));
+      const moveAccepted = canvas.dispatchEvent(new PointerEvent("pointermove", {
+        bubbles: true,
+        cancelable: true,
+        pointerId: 91,
+        pointerType: "touch",
+        buttons: 1,
+        clientX,
+        clientY: endY,
+      }));
+      canvas.dispatchEvent(new PointerEvent("pointerup", {
+        bubbles: true,
+        cancelable: true,
+        pointerId: 91,
+        pointerType: "touch",
+        buttons: 0,
+        clientX,
+        clientY: endY,
+      }));
+      return {
+        movePrevented: !moveAccepted,
+        scrollTopBefore,
+        scrollTopAfter: scrollport.scrollTop,
+      };
+    });
+    expect(spacerDrag).toBeDefined();
+    expect(spacerDrag?.movePrevented).toBe(true);
+    expect(spacerDrag?.scrollTopAfter).toBe(spacerDrag?.scrollTopBefore);
+    await expect.poll(() => page.locator(".terminal-host").evaluate((host) =>
+      Number((host as HTMLElement).dataset.termdViewportYRaw),
+    )).toBeGreaterThan(0);
+
+    const restoreBottomInputBaseline = daemon.decryptedInputs.join("");
+    await page.keyboard.type("z");
+    await expect.poll(() => daemon.decryptedInputs.join("").slice(restoreBottomInputBaseline.length)).toBe("z");
+    await expect.poll(() => readMobileCursorGeometry(terminalRows - 1)).toEqual(expectedMobileCursorGeometry);
+    expect(daemon.sessionResizes.length).toBe(resizeCountBeforeKeyboardOpen);
+
+    await page.evaluate(() => {
+      (window as typeof window & {
+        __TERMD_TEST_SET_VISUAL_VIEWPORT__?: (next: { layoutHeight: number; visualHeight: number; offsetTop: number }) => void;
+      }).__TERMD_TEST_SET_VISUAL_VIEWPORT__?.({
+        layoutHeight: 820,
+        visualHeight: 820,
+        offsetTop: 0,
+      });
+    });
+    await expect(shell).not.toHaveClass(/mobile-keyboard-open/);
+    await expect.poll(() => page.locator(".terminal-scrollport").evaluate((element) => {
+      const scrollport = element as HTMLElement;
+      const frame = scrollport.querySelector<HTMLElement>(".terminal-frame");
+      const canvas = scrollport.querySelector<HTMLElement>(".terminal-canvas");
+      const host = scrollport.querySelector<HTMLElement>(".terminal-host");
+      return {
+        scrollTop: scrollport.scrollTop,
+        frameTop: frame?.style.top ?? "missing",
+        frameHeight: frame?.style.height ?? "missing",
+        canvasHeight: canvas?.style.height ?? "missing",
+        viewportLinesAboveBottom: Number(host?.dataset.termdViewportYRaw),
+      };
+    })).toEqual({
+      scrollTop: 0,
+      frameTop: "",
+      frameHeight: "",
+      canvasHeight: "",
+      viewportLinesAboveBottom: 0,
+    });
   } finally {
     await daemon.stop();
   }

@@ -5358,7 +5358,7 @@ describe("TerminalPane terminal sizing", () => {
     expect(onTerminalResync).not.toHaveBeenCalled();
   });
 
-  it("移动端键盘打开后会把终端底边贴住快捷键上方", () => {
+  it("移动端键盘打开后会在边界内尽量把 PTY 光标保持居中", () => {
     vi.useFakeTimers();
     const viewport = installMutableVisualViewport(820, 820, 0);
     try {
@@ -5470,19 +5470,51 @@ describe("TerminalPane terminal sizing", () => {
       expect(onResize).not.toHaveBeenCalled();
       const baseYAfterKeyboardOpen = terminal?.baseY() ?? 0;
       expect(baseYAfterKeyboardOpen).toBeGreaterThan(8);
-      // 中文注释：软键盘打开后仍保持 24 行 session 网格；外层 scrollport 裁剪出底部
-      // 12 行，让终端底边贴住快捷键上方，而不是把 xterm viewport 滚到输入焦点附近。
+      // 中文注释：软键盘打开后仍保持 24 行 session 网格；光标位于第 5 行时，
+      // 外层本地 spacer 移动完整 xterm 网格，不拆开渲染光标与 IME 输入锚点。
       expect(terminal?.viewportY()).toBe(baseYAfterKeyboardOpen);
       expect(frame!.style.height).toBe(`${24 * 16}px`);
-      expect(canvas!.style.height).toBe(`${24 * 16}px`);
-      expect(scrollport!.scrollTop).toBe(12 * 16);
+      expect(frame!.style.top).toBe("88px");
+      expect(canvas!.style.height).toBe("560px");
+      expect(scrollport!.scrollTop).toBe(64);
+
+      (globalThis as { __TERMD_TEST_FIT_DIMENSIONS__?: { rows: number; cols: number } }).__TERMD_TEST_FIT_DIMENSIONS__ = {
+        rows: 24,
+        cols: 80,
+      };
+      viewport.setMetrics(820, 820, 0);
+      rerender(
+        <TerminalPane
+          attached
+          sessionSize={{ rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 }}
+          mobileInputMode
+          mobileKeyboardOpen={false}
+          mobileViewportHeight={820}
+          mobileViewportOffsetTop={0}
+          outputResetVersion={0}
+          takeOutput={takeOutput}
+          registerOutputDrain={registerOutputDrain}
+          onInput={vi.fn()}
+          onResize={onResize}
+          onTerminalResync={onTerminalResync}
+          onCursorChange={vi.fn()}
+        />,
+      );
+      act(() => {
+        vi.advanceTimersByTime(animationFrameMs * 12);
+      });
+      expect(terminal?.viewportY()).toBe(baseYAfterKeyboardOpen);
+      expect(frame!.style.top).toBe("");
+      expect(frame!.style.height).toBe("");
+      expect(canvas!.style.height).toBe("");
+      expect(scrollport!.scrollTop).toBe(0);
     } finally {
       viewport.restore();
       vi.useRealTimers();
     }
   });
 
-  it("移动端光标在终端底部时打开键盘不会制造底部留白", () => {
+  it("移动端光标在终端底部时会用本地尾部空间尽量保持居中", () => {
     vi.useFakeTimers();
     const viewport = installMutableVisualViewport(820, 820, 0);
     try {
@@ -5573,9 +5605,9 @@ describe("TerminalPane terminal sizing", () => {
       expect(onResize).not.toHaveBeenCalled();
       expect(terminal?.baseY()).toBeGreaterThan(8);
       // 中文注释：键盘打开不改变 terminal.rows；这里光标位于 buffer 最底部，
-      // 外层 scrollport 只需要裁剪出最后一屏，不能再追加半屏底部留白把光标抬到中线。
+      // canvas 只增加本地居中所需的 spacer，不把空白或 resize 写回 PTY。
       expect(terminal?.viewportY()).toBe(57);
-      expect(scrollport?.scrollTop).toBe(12 * 16);
+      expect(scrollport?.scrollTop).toBe(368);
     } finally {
       viewport.restore();
       vi.useRealTimers();
@@ -5698,7 +5730,7 @@ describe("TerminalPane terminal sizing", () => {
     }
   });
 
-  it("移动端键盘态重建终端时会清理上一 session 的可视行缓存", () => {
+  it("移动端键盘态重建终端时会保留实际 xterm 网格行高", () => {
     vi.useFakeTimers();
     const viewport = installMutableVisualViewport(820, 460, 20);
     try {
@@ -5752,8 +5784,8 @@ describe("TerminalPane terminal sizing", () => {
       });
       expect(frame!.style.height).toBe("384px");
 
-      // 中文注释：session rebuild 期间如果不清 mobileCursorVisibleRowsRef，
-      // 新 renderer 会沿用上一 session 的 12 行窗口；这里把 fit 恢复成 24 行来暴露缓存泄漏。
+      // 中文注释：fit rows 只是可见高度的取整结果，不能据此反推 xterm 行高。
+      // rebuild 后即使 proposal 恢复成 24 行，完整 24 行网格仍应沿用实测的 16px cell。
       (globalThis as { __TERMD_TEST_FIT_DIMENSIONS__?: { rows: number; cols: number } }).__TERMD_TEST_FIT_DIMENSIONS__ = {
         rows: 24,
         cols: 80,
@@ -5778,7 +5810,7 @@ describe("TerminalPane terminal sizing", () => {
         vi.advanceTimersByTime(animationFrameMs * 12);
       });
 
-      expect(frame!.style.height).toBe("192px");
+      expect(frame!.style.height).toBe("384px");
     } finally {
       viewport.restore();
       vi.useRealTimers();

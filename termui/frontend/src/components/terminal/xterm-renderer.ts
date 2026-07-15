@@ -463,6 +463,7 @@ export function createXtermRenderer(options: CreateTerminalRendererOptions): Ter
       return {
         viewportY: activeBuffer.viewportY,
         baseY: activeBuffer.baseY,
+        cursorLine: activeBuffer.baseY + activeBuffer.cursorY,
         cursorBottomLine: activeBuffer.baseY,
         length: activeBuffer.length,
       };
