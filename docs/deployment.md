@@ -240,7 +240,7 @@ installer 保留 daemon identity、配对设备和普通配置。supervisor comp
 
 ## installer 与 service 行为
 
-release 资产和 GHCR 镜像由同一个 tag 驱动。release 中的 `install-*.sh` 已带默认仓库和版本；直接运行源码树中的模板脚本时才需要 `TERMD_GITHUB_REPO=owner/repo`。
+release 资产和 GHCR 镜像由同一个 tag 驱动。当前 latest 0.8.2 使用 `install-*.sh`；包含本改动的下一 release 才会同时发布稳定名称的 raw binary 及其内嵌 installer。直接运行源码树中的模板脚本时需要 `TERMD_GITHUB_REPO=owner/repo`。
 
 - `termd` installer 创建 `termd.service` 和 `/etc/termd/termd.env`。`KillMode=process` 使普通 daemon restart 不会把独立 supervisor 一起终止。
 - `termrelay` installer 创建 `termrelay.service`、setup token 和 daemon registry；relay 本身不承担 supervisor 生命周期。
@@ -296,9 +296,9 @@ sudo sqlite3 -readonly /var/lib/termd/daemon-state.sqlite \
   输出中的同一流程。
 - tag 推送后，GitHub Actions 会：
   - 运行 workspace 测试，确认 release tag 与 `Cargo.toml` 版本一致。
-  - 构建 `termd`、`termrelay`、`termctl` 的 Linux amd64 release tarball。二进制使用 `x86_64-unknown-linux-musl` 静态链接，并在打包前先构建 `termui/frontend` 的静态资源，确保 `termd` 和 `termrelay` 的内嵌 Web 可用。
+  - 构建 `termd`、`termrelay`、`termctl` 的 Linux amd64 原始二进制和版本化 tarball。二进制使用 `x86_64-unknown-linux-musl` 静态链接，并在打包前先构建 `termui/frontend` 的静态资源，确保 `termd` 和 `termrelay` 的内嵌 Web 可用。
   - 当前不发布 Linux arm64 tarball；arm64 安装脚本会跳过 release asset 并从源码构建，不承诺不存在的 arm64 资产。
-  - 生成 `checksums.txt` 和带默认仓库/版本的安装脚本，并上传到 GitHub Release。
+  - 为原始二进制和 tarball 生成 `checksums.txt`，连同带默认仓库/版本的兼容安装脚本上传到 GitHub Release。
   - 推送 `ghcr.io/<owner>/termd:<tag>`、`ghcr.io/<owner>/termrelay:<tag>`、`ghcr.io/<owner>/termctl:<tag>` 镜像。
   - 这些镜像使用 `scratch` 运行层；`termd` 和 `termrelay` 同样会内嵌 Web 静态资源。
 

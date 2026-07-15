@@ -12,6 +12,23 @@ REPO="${TERMD_GITHUB_REPO:-${GITHUB_REPOSITORY:-}}"
 VERSION="${TERMD_VERSION:-}"
 ACTION="install"
 LOG_EMITTED=0
+SELF_INSTALL_MODE_SET=0
+SELF_INSTALL_BINARY_SET=0
+SELF_INSTALL_ENABLED=0
+SELF_INSTALL_MODE=""
+SELF_INSTALL_BINARY=""
+
+# 内嵌安装器通过 proc fd 传入已经打开的运行中可执行文件。先捕获再立即清除，
+# 避免内部控制变量继续传给版本探测或后续命令。
+if [[ -v TERMD_INSTALL_SELF_MODE ]]; then
+  SELF_INSTALL_MODE_SET=1
+  SELF_INSTALL_MODE="$TERMD_INSTALL_SELF_MODE"
+fi
+if [[ -v TERMD_INSTALL_SELF_BINARY ]]; then
+  SELF_INSTALL_BINARY_SET=1
+  SELF_INSTALL_BINARY="$TERMD_INSTALL_SELF_BINARY"
+fi
+unset TERMD_INSTALL_SELF_MODE TERMD_INSTALL_SELF_BINARY TERMD_INSTALL_ASSUME_YES
 
 log() {
   if [[ "$LOG_EMITTED" -eq 1 ]]; then
@@ -53,6 +70,31 @@ normalize_proxy_environment() {
   normalize_proxy_pair https_proxy HTTPS_PROXY
   normalize_proxy_pair all_proxy ALL_PROXY
   normalize_proxy_pair no_proxy NO_PROXY
+}
+
+validate_self_install_request() {
+  local reported_version
+
+  if [[ "$SELF_INSTALL_MODE_SET" -ne "$SELF_INSTALL_BINARY_SET" ]]; then
+    die "embedded self-install identity is invalid"
+  fi
+  if [[ "$SELF_INSTALL_MODE_SET" -eq 0 ]]; then
+    return 0
+  fi
+
+  SELF_INSTALL_ENABLED=1
+  [[ "$SELF_INSTALL_MODE" == "embedded-v1" ]] || die "embedded self-install identity is invalid"
+  [[ -n "$VERSION" ]] || die "embedded self-install identity is invalid"
+  if [[ ! "$SELF_INSTALL_BINARY" =~ ^/proc/([0-9]+)/fd/([0-9]+)$ ]] || \
+    [[ "${BASH_REMATCH[1]}" != "$PPID" ]]; then
+    die "embedded self-install path is invalid"
+  fi
+  [[ -f "$SELF_INSTALL_BINARY" && -r "$SELF_INSTALL_BINARY" && -x "$SELF_INSTALL_BINARY" ]] || \
+    die "embedded self-install path is invalid"
+  if ! reported_version="$("$SELF_INSTALL_BINARY" --version 2>/dev/null)"; then
+    die "embedded self-install identity is invalid"
+  fi
+  [[ "$reported_version" == "$BIN_NAME $VERSION" ]] || die "embedded self-install identity is invalid"
 }
 
 require_root() {
@@ -209,6 +251,22 @@ install_from_source() {
   rm -rf "$src_dir"
 }
 
+install_from_self_binary() {
+  local staging_dir candidate
+
+  staging_dir="$(mktemp -d)"
+  candidate="${staging_dir}/${BIN_NAME}"
+  if ! install -m0755 -- "$SELF_INSTALL_BINARY" "$candidate"; then
+    rm -rf -- "$staging_dir"
+    return 1
+  fi
+  if ! install -Dm0755 -- "$candidate" "${INSTALL_PREFIX}/bin/${BIN_NAME}"; then
+    rm -rf -- "$staging_dir"
+    return 1
+  fi
+  rm -rf -- "$staging_dir"
+}
+
 uninstall_component() {
   rm -f "${INSTALL_PREFIX}/bin/${BIN_NAME}"
   log "uninstalled ${BIN_NAME}; user pairing state files were not removed"
@@ -217,6 +275,7 @@ uninstall_component() {
 main() {
   parse_args "$@"
   normalize_proxy_environment
+  validate_self_install_request
   require_root
   if [[ "$ACTION" == "uninstall" ]]; then
     uninstall_component
@@ -224,20 +283,24 @@ main() {
   fi
 
   require_cmd install
-  require_cmd tar
-  require_cmd sha256sum
-  require_cmd python3
-  [[ -n "$REPO" ]] || die "set TERMD_GITHUB_REPO=owner/repo before running the installer"
-
-  resolve_version
+  if [[ "$SELF_INSTALL_ENABLED" -eq 0 ]]; then
+    require_cmd tar
+    require_cmd sha256sum
+    require_cmd python3
+    [[ -n "$REPO" ]] || die "set TERMD_GITHUB_REPO=owner/repo before running the installer"
+    resolve_version
+  fi
   log "installing ${BIN_NAME} ${VERSION} into ${INSTALL_PREFIX}/bin"
 
-  if ! install_from_release; then
+  if [[ "$SELF_INSTALL_ENABLED" -eq 1 ]]; then
+    install_from_self_binary || die "failed to stage embedded self-install binary"
+  elif ! install_from_release; then
     install_from_source
   fi
 
   log "installed ${BIN_NAME} ${VERSION}"
-  "${INSTALL_PREFIX}/bin/${BIN_NAME}" --version >/dev/null
+  [[ "$("${INSTALL_PREFIX}/bin/${BIN_NAME}" --version 2>/dev/null)" == "$BIN_NAME $VERSION" ]] || \
+    die "installed binary identity is invalid"
 }
 
 main "$@"

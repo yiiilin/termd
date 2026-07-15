@@ -36,7 +36,12 @@ const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(2);
 const RECONNECT_MAX_ATTEMPTS: u32 = 30;
 
 #[derive(Debug, Parser)]
-#[command(name = "termctl", version, about = "termd direct WebSocket CLI")]
+#[command(
+    name = "termctl",
+    version,
+    about = "termd direct WebSocket CLI",
+    after_help = "INSTALLATION:\n  termctl install [OPTIONS]\n  termctl uninstall [OPTIONS]\n\nRun `termctl install --help` or `termctl uninstall --help` for managed installation options."
+)]
 pub struct Cli {
     /// 覆盖本地状态文件路径；默认优先 TERMD_CTL_STATE，然后是 $HOME/.termd/termctl-state.json。
     #[arg(long, global = true)]
@@ -1046,12 +1051,20 @@ fn session_json(session: SessionSummaryPayload) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use base64::Engine as _;
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
     use termd_proto::UnixTimestampMillis;
 
     use super::*;
 
     const FUTURE_PAIRING_EXPIRES_AT_MS: u64 = 4_102_444_800_000;
+
+    #[test]
+    fn top_level_help_lists_managed_installation_commands() {
+        let help = Cli::command().render_long_help().to_string();
+
+        assert!(help.contains("termctl install [OPTIONS]"));
+        assert!(help.contains("termctl uninstall [OPTIONS]"));
+    }
 
     fn daemon_public_key() -> PublicKey {
         PublicKey("ed25519-v1:daemon-public".to_owned())

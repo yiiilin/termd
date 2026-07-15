@@ -8,12 +8,20 @@ mod crypto;
 mod error;
 mod state;
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 
 use clap::Parser;
 
 #[tokio::main]
 async fn main() {
+    if let Some(options) = installer_options(std::env::args_os()) {
+        if let Err(error) = terminstall::run(terminstall::Component::Termctl, options) {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     install_rustls_crypto_provider();
 
     let cli = match cli::Cli::try_parse() {
@@ -35,6 +43,14 @@ async fn main() {
         eprintln!("{}", error.user_message());
         std::process::exit(error.exit_code());
     }
+}
+
+fn installer_options<I, S>(args: I) -> Option<terminstall::Options>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<OsString>,
+{
+    terminstall::Options::from_subcommand(env!("CARGO_PKG_VERSION"), None, args.into_iter().skip(1))
 }
 
 fn install_rustls_crypto_provider() {
@@ -93,5 +109,18 @@ mod tests {
                 .expect("message should be a string")
                 .contains("--bad")
         );
+    }
+
+    #[test]
+    fn recognizes_install_and_uninstall_before_clap_parsing() {
+        assert!(matches!(
+            installer_options(["termctl", "install", "--help"]),
+            Some(terminstall::Options::Install(_))
+        ));
+        assert!(matches!(
+            installer_options(["termctl", "uninstall", "--dry-run"]),
+            Some(terminstall::Options::Uninstall(_))
+        ));
+        assert!(installer_options(["termctl", "list"]).is_none());
     }
 }

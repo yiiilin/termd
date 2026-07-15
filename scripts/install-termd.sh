@@ -57,6 +57,56 @@ INSTALL_SERVICE_WAS_ENABLED=0
 INSTALL_ROLLBACK_DIR=""
 INSTALL_BINARY_COMMITTED=0
 SUPERVISOR_VERSION_PERSIST_DEFERRED=0
+SELF_INSTALL_MODE_SET=0
+SELF_INSTALL_BINARY_SET=0
+SELF_INSTALL_ENABLED=0
+SELF_INSTALL_MODE=""
+SELF_INSTALL_BINARY=""
+INSTALL_ALLOW_SESSION_LOSS=0
+INTERNAL_INSTALL_ARGUMENT_INVALID=0
+INTERNAL_INSTALL_ARGUMENTS_PRESENT=0
+INTERNAL_ARG_RELAY_URL=""
+INTERNAL_ARG_RELAY_DAEMON_TOKEN_FILE=""
+INTERNAL_ARG_RELAY_SETUP_TOKEN_FILE=""
+INTERNAL_ARG_PROXY=""
+INTERNAL_ARG_TLS_KEY=""
+
+if [[ -v TERMD_INSTALL_SELF_MODE ]]; then
+  SELF_INSTALL_MODE_SET=1
+  SELF_INSTALL_MODE="$TERMD_INSTALL_SELF_MODE"
+fi
+if [[ -v TERMD_INSTALL_SELF_BINARY ]]; then
+  SELF_INSTALL_BINARY_SET=1
+  SELF_INSTALL_BINARY="$TERMD_INSTALL_SELF_BINARY"
+fi
+if [[ -v TERMD_INSTALL_ARG_RELAY_URL ]]; then
+  INTERNAL_INSTALL_ARGUMENTS_PRESENT=1
+  INTERNAL_ARG_RELAY_URL="$TERMD_INSTALL_ARG_RELAY_URL"
+  [[ -n "$INTERNAL_ARG_RELAY_URL" ]] || INTERNAL_INSTALL_ARGUMENT_INVALID=1
+fi
+if [[ -v TERMD_INSTALL_ARG_RELAY_DAEMON_TOKEN_FILE ]]; then
+  INTERNAL_INSTALL_ARGUMENTS_PRESENT=1
+  INTERNAL_ARG_RELAY_DAEMON_TOKEN_FILE="$TERMD_INSTALL_ARG_RELAY_DAEMON_TOKEN_FILE"
+  [[ -n "$INTERNAL_ARG_RELAY_DAEMON_TOKEN_FILE" ]] || INTERNAL_INSTALL_ARGUMENT_INVALID=1
+fi
+if [[ -v TERMD_INSTALL_ARG_RELAY_SETUP_TOKEN_FILE ]]; then
+  INTERNAL_INSTALL_ARGUMENTS_PRESENT=1
+  INTERNAL_ARG_RELAY_SETUP_TOKEN_FILE="$TERMD_INSTALL_ARG_RELAY_SETUP_TOKEN_FILE"
+  [[ -n "$INTERNAL_ARG_RELAY_SETUP_TOKEN_FILE" ]] || INTERNAL_INSTALL_ARGUMENT_INVALID=1
+fi
+if [[ -v TERMD_INSTALL_ARG_PROXY ]]; then
+  INTERNAL_INSTALL_ARGUMENTS_PRESENT=1
+  INTERNAL_ARG_PROXY="$TERMD_INSTALL_ARG_PROXY"
+  [[ -n "$INTERNAL_ARG_PROXY" ]] || INTERNAL_INSTALL_ARGUMENT_INVALID=1
+fi
+if [[ -v TERMD_INSTALL_ARG_TLS_KEY ]]; then
+  INTERNAL_INSTALL_ARGUMENTS_PRESENT=1
+  INTERNAL_ARG_TLS_KEY="$TERMD_INSTALL_ARG_TLS_KEY"
+  [[ -n "$INTERNAL_ARG_TLS_KEY" ]] || INTERNAL_INSTALL_ARGUMENT_INVALID=1
+fi
+unset TERMD_INSTALL_SELF_MODE TERMD_INSTALL_SELF_BINARY TERMD_INSTALL_ASSUME_YES
+unset TERMD_INSTALL_ARG_RELAY_URL TERMD_INSTALL_ARG_RELAY_DAEMON_TOKEN_FILE
+unset TERMD_INSTALL_ARG_RELAY_SETUP_TOKEN_FILE TERMD_INSTALL_ARG_PROXY TERMD_INSTALL_ARG_TLS_KEY
 
 # 只有用户显式传入 TERMD_SUPERVISOR_VERSION 或 --supervisor-version 时，
 # supervisor 版本才表示兼容性切换请求；release 脚本中的默认值不能触发清 session。
@@ -109,6 +159,65 @@ normalize_proxy_environment() {
   normalize_proxy_pair https_proxy HTTPS_PROXY
   normalize_proxy_pair all_proxy ALL_PROXY
   normalize_proxy_pair no_proxy NO_PROXY
+}
+
+validate_internal_install_request() {
+  local reported_version
+
+  [[ "$INTERNAL_INSTALL_ARGUMENT_INVALID" -eq 0 ]] || die "embedded installer arguments are invalid"
+  if [[ "$SELF_INSTALL_MODE_SET" -ne "$SELF_INSTALL_BINARY_SET" ]]; then
+    die "embedded self-install identity is invalid"
+  fi
+  if [[ "$SELF_INSTALL_MODE_SET" -eq 0 ]]; then
+    [[ "$INTERNAL_INSTALL_ARGUMENTS_PRESENT" -eq 0 ]] || die "embedded installer arguments are invalid"
+    return 0
+  fi
+
+  SELF_INSTALL_ENABLED=1
+  [[ "$SELF_INSTALL_MODE" == "embedded-v1" ]] || die "embedded self-install identity is invalid"
+  [[ -n "$VERSION" ]] || die "embedded self-install identity is invalid"
+  if [[ ! "$SELF_INSTALL_BINARY" =~ ^/proc/([0-9]+)/fd/([0-9]+)$ ]] || \
+    [[ "${BASH_REMATCH[1]}" != "$PPID" ]]; then
+    die "embedded self-install path is invalid"
+  fi
+  [[ -f "$SELF_INSTALL_BINARY" && -r "$SELF_INSTALL_BINARY" && -x "$SELF_INSTALL_BINARY" ]] || \
+    die "embedded self-install path is invalid"
+  if ! reported_version="$("$SELF_INSTALL_BINARY" --version 2>/dev/null)"; then
+    die "embedded self-install identity is invalid"
+  fi
+  [[ "$reported_version" == "$BIN_NAME $VERSION" ]] || die "embedded self-install identity is invalid"
+}
+
+apply_internal_install_arguments() {
+  if [[ -n "$INTERNAL_ARG_RELAY_URL" ]]; then
+    TERMD_RELAY_URLS="$INTERNAL_ARG_RELAY_URL"
+    INSTALL_SET_RELAY_URLS=1
+  fi
+  if [[ -n "$INTERNAL_ARG_RELAY_DAEMON_TOKEN_FILE" ]]; then
+    TERMD_RELAY_DAEMON_TOKEN_FILE="$INTERNAL_ARG_RELAY_DAEMON_TOKEN_FILE"
+    INSTALL_SET_RELAY_DAEMON_TOKEN_FILE=1
+  fi
+  if [[ -n "$INTERNAL_ARG_RELAY_SETUP_TOKEN_FILE" ]]; then
+    TERMD_RELAY_SETUP_TOKEN_FILE="$INTERNAL_ARG_RELAY_SETUP_TOKEN_FILE"
+    INSTALL_SET_RELAY_SETUP_TOKEN_FILE=1
+  fi
+  if [[ -n "$INTERNAL_ARG_PROXY" ]]; then
+    http_proxy="$INTERNAL_ARG_PROXY"
+    https_proxy="$INTERNAL_ARG_PROXY"
+    HTTP_PROXY="$INTERNAL_ARG_PROXY"
+    HTTPS_PROXY="$INTERNAL_ARG_PROXY"
+    INSTALL_SET_PROXY=1
+  fi
+  if [[ -n "$INTERNAL_ARG_TLS_KEY" ]]; then
+    TERMD_TLS_KEY="$INTERNAL_ARG_TLS_KEY"
+    INSTALL_SET_TLS_KEY=1
+  fi
+
+  INTERNAL_ARG_RELAY_URL=""
+  INTERNAL_ARG_RELAY_DAEMON_TOKEN_FILE=""
+  INTERNAL_ARG_RELAY_SETUP_TOKEN_FILE=""
+  INTERNAL_ARG_PROXY=""
+  INTERNAL_ARG_TLS_KEY=""
 }
 
 is_enabled() {
@@ -196,6 +305,7 @@ Options:
   --tls-cert <PATH>             Set TLS certificate path.
   --tls-key <PATH>              Set TLS private key path.
   --supervisor-version <VER>    Set the target supervisor compatibility version.
+  --allow-session-loss          Non-interactively confirm session loss only when supervisor compatibility changes.
   --user <USER>                 Run termd.service as this Linux user; default: existing service user, then termd.
   --uninstall                   Stop service and remove termd program files.
   --purge                       Implies --uninstall; also remove /var/lib/termd and system user.
@@ -298,6 +408,10 @@ parse_args() {
         SUPERVISOR_VERSION_EXPLICIT=1
         INSTALL_SET_SUPERVISOR_VERSION=1
         shift 2
+        ;;
+      --allow-session-loss)
+        INSTALL_ALLOW_SESSION_LOSS=1
+        shift
         ;;
       --user)
         [[ $# -ge 2 && -n "$2" ]] || die "--user requires a non-empty value"
@@ -672,6 +786,12 @@ install_from_source() {
   rm -rf "$src_dir"
 }
 
+install_from_self_binary() {
+  local destination="$1"
+
+  install -m0755 -- "$SELF_INSTALL_BINARY" "$destination"
+}
+
 upsert_env_var() {
   local key="$1"
   local value="$2"
@@ -807,6 +927,10 @@ apply_service_env_defaults() {
 prompt_confirmation() {
   local message="$1"
   local answer confirm_fd
+
+  if [[ "$INSTALL_ALLOW_SESSION_LOSS" -eq 1 ]]; then
+    return 0
+  fi
 
   if [[ -n "${TERMD_INSTALL_CONFIRM_FD:-}" ]]; then
     confirm_fd="$TERMD_INSTALL_CONFIRM_FD"
@@ -1891,6 +2015,11 @@ uninstall_component() {
 
 main() {
   parse_args "$@"
+  if [[ "$ACTION" != "install" && "$INSTALL_ALLOW_SESSION_LOSS" -eq 1 ]]; then
+    die "--allow-session-loss is valid only for installation"
+  fi
+  validate_internal_install_request
+  apply_internal_install_arguments
   normalize_proxy_environment
   require_root
   inherit_existing_service_identity
@@ -1901,14 +2030,15 @@ main() {
   fi
 
   require_cmd install
-  require_cmd tar
-  require_cmd sha256sum
   require_cmd python3
   require_cmd systemctl
   require_cmd useradd
-  [[ -n "$REPO" ]] || die "set TERMD_GITHUB_REPO=owner/repo before running the installer"
-
-  resolve_version
+  if [[ "$SELF_INSTALL_ENABLED" -eq 0 ]]; then
+    require_cmd tar
+    require_cmd sha256sum
+    [[ -n "$REPO" ]] || die "set TERMD_GITHUB_REPO=owner/repo before running the installer"
+    resolve_version
+  fi
   resolve_service_identity
   resolve_supervisor_version
   assert_session_ownership_quiescent
@@ -1917,7 +2047,9 @@ main() {
   INSTALL_STAGING_DIR="$(mktemp -d)"
   trap cleanup_install_staging EXIT
   local candidate_binary="${INSTALL_STAGING_DIR}/${BIN_NAME}"
-  if ! install_from_release "$candidate_binary"; then
+  if [[ "$SELF_INSTALL_ENABLED" -eq 1 ]]; then
+    install_from_self_binary "$candidate_binary" || die "failed to stage embedded self-install binary"
+  elif ! install_from_release "$candidate_binary"; then
     install_from_source "$candidate_binary"
   fi
   if ! install_staged_candidate "$candidate_binary"; then

@@ -40,6 +40,7 @@ jobs:
               "proto/Cargo.toml",
               "termd/Cargo.toml",
               "termctl/Cargo.toml",
+              "terminstall/Cargo.toml",
               "termrelay/Cargo.toml",
               "termweb/Cargo.toml",
           ]
@@ -161,6 +162,7 @@ jobs:
             local binary_path="target/${STATIC_TARGET}/release/${binary}"
             strip "$binary_path"
             assert_static_binary "$binary_path"
+            install -m 0755 "$binary_path" "$out_dir/${binary}-linux-amd64"
             local archive="$out_dir/${binary}-${tag}-linux-amd64.tar.gz"
             tar -C "target/${STATIC_TARGET}/release" -czf "$archive" "$binary"
           }
@@ -171,7 +173,7 @@ jobs:
 
           (
             cd "$out_dir"
-            sha256sum *.tar.gz > checksums.txt
+            sha256sum *-linux-amd64 *.tar.gz > checksums.txt
           )
 
           ls -lah "$out_dir"
@@ -241,7 +243,7 @@ jobs:
           fi
           cd dist/release
 
-          files=(*.tar.gz checksums.txt install-*.sh)
+          files=(*-linux-amd64 *.tar.gz checksums.txt install-*.sh)
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release upload "$tag" "${files[@]}" --clobber
             gh release edit "$tag" --title "$tag" --notes-file "$notes_file"

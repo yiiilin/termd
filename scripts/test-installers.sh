@@ -86,6 +86,17 @@ grep -Fq 'STATE_DIR="${TERMD_STATE_DIR:-/var/lib/termd}"' "${ROOT_DIR}/scripts/i
 grep -q 'REQUIRED_SUPERVISOR_VERSION="${TERMD_REQUIRED_SUPERVISOR_VERSION:-}"' "${ROOT_DIR}/scripts/install-termd.sh"
 grep -q 'TERMD_REQUIRED_SUPERVISOR_VERSION:-' "${ROOT_DIR}/.github/workflows/release.yml"
 ! grep -q 'TERMD_SUPERVISOR_VERSION:-.*supervisor_version' "${ROOT_DIR}/.github/workflows/release.yml"
+grep -Fq '"terminstall/Cargo.toml"' "${ROOT_DIR}/.github/workflows/release.yml"
+grep -Fq 'install -m 0755 "$binary_path" "$out_dir/${binary}-linux-amd64"' "${ROOT_DIR}/.github/workflows/release.yml"
+grep -Fq 'sha256sum *-linux-amd64 *.tar.gz > checksums.txt' "${ROOT_DIR}/.github/workflows/release.yml"
+grep -Fq 'files=(*-linux-amd64 *.tar.gz checksums.txt install-*.sh)' "${ROOT_DIR}/.github/workflows/release.yml"
+if grep -Eq 'releases/latest/download/[^[:space:]"]*-linux-amd64' \
+  "${ROOT_DIR}/README.md" "${ROOT_DIR}/docs/installation.md"; then
+  printf '0.8.2 documentation must use install-*.sh instead of unavailable raw latest assets\n' >&2
+  exit 1
+fi
+grep -Fq 'releases/latest/download/install-termd.sh' "${ROOT_DIR}/README.md"
+grep -Fq 'releases/latest/download/install-termrelay.sh' "${ROOT_DIR}/docs/installation.md"
 test -s "${ROOT_DIR}/SUPERVISOR_VERSION"
 python3 - "${ROOT_DIR}" <<'PY'
 import json
@@ -166,6 +177,229 @@ test_installers_normalize_standard_proxy_environment() (
       bash -c '[[ "$HTTP_PROXY" == "$http_proxy" && "$HTTPS_PROXY" == "$https_proxy" && "$ALL_PROXY" == "$all_proxy" && "$NO_PROXY" == "$no_proxy" ]]'
     )
   done
+)
+
+test_termctl_embedded_self_binary_is_strict_and_isolated() (
+  local root script source_binary pinned_binary installed_binary probe output status
+  root="$(mktemp -d)"
+  trap 'rm -rf "$root"' EXIT
+  script="${ROOT_DIR}/scripts/install-termctl.sh"
+  source_binary="${root}/source-termctl"
+  pinned_binary="${root}/pinned-termctl"
+  installed_binary="${root}/prefix/bin/termctl"
+  probe="${root}/env-probe"
+
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'printf "%s:%s\n" "${TERMD_INSTALL_SELF_MODE+x}" "${TERMD_INSTALL_SELF_BINARY+x}" >>"$SELF_ENV_PROBE"' \
+    'if [[ "${1:-}" == "--version" ]]; then printf "%s\n" "${SELF_BINARY_VERSION:-termctl 0.8.2}"; exit 0; fi' \
+    'exit 64' >"$source_binary"
+  chmod 0755 "$source_binary"
+
+  output="$(
+    exec {self_binary_fd}<"$source_binary"
+    mv "$source_binary" "$pinned_binary"
+    printf '#!/usr/bin/env bash\nprintf "termctl 9.9.9\\n"\n' >"$source_binary"
+    chmod 0755 "$source_binary"
+    TERMD_INSTALL_PREFIX="${root}/prefix" \
+      TERMD_VERSION=0.8.2 \
+      TERMD_INSTALL_SELF_MODE=embedded-v1 \
+      TERMD_INSTALL_SELF_BINARY="/proc/${BASHPID}/fd/${self_binary_fd}" \
+      SELF_ENV_PROBE="$probe" \
+      bash -c '
+        source <(sed '\''/^main "\$@"/,$d'\'' "$1")
+        require_root() { :; }
+        main
+      ' bash "$script" 2>&1
+  )"
+  [[ "$output" == *"installed termctl 0.8.2"* ]]
+  [[ -x "$installed_binary" ]]
+  cmp "$pinned_binary" "$installed_binary"
+  [[ "$(wc -l <"$probe")" -eq 2 ]]
+  [[ "$(sort -u "$probe")" == ":" ]]
+
+  assert_rejected() {
+    local mode_set="$1"
+    local mode="$2"
+    local path_set="$3"
+    local path="$4"
+    local reported_version="$5"
+    local -a environment=(
+      "TERMD_INSTALL_PREFIX=${root}/rejected-prefix"
+      "TERMD_VERSION=0.8.2"
+      "SELF_ENV_PROBE=${root}/rejected-probe"
+      "SELF_BINARY_VERSION=${reported_version}"
+    )
+    if [[ "$mode_set" -eq 1 ]]; then
+      environment+=("TERMD_INSTALL_SELF_MODE=${mode}")
+    fi
+    if [[ "$path_set" -eq 1 ]]; then
+      environment+=("TERMD_INSTALL_SELF_BINARY=${path}")
+    fi
+
+    set +e
+    output="$(
+      env "${environment[@]}" bash -c '
+        source <(sed '\''/^main "\$@"/,$d'\'' "$1")
+        require_root() { :; }
+        main
+      ' bash "$script" 2>&1
+    )"
+    status=$?
+    set -e
+    [[ "$status" -ne 0 ]]
+    [[ "$output" == *"embedded self-install"* ]]
+    [[ "$output" != *"$path"* ]]
+    [[ ! -e "${root}/rejected-prefix/bin/termctl" ]]
+  }
+
+  assert_rejected 1 wrong-mode-marker 1 "$source_binary" "termctl 0.8.2"
+  assert_rejected 1 embedded-v1 0 absent-path-marker "termctl 0.8.2"
+  (
+    cd "$root"
+    assert_rejected 1 embedded-v1 1 source-termctl "termctl 0.8.2"
+  )
+  ln -s "$source_binary" "${root}/source-link"
+  assert_rejected 1 embedded-v1 1 "${root}/source-link" "termctl 0.8.2"
+  assert_rejected 1 embedded-v1 1 "$source_binary" "termd 0.8.2"
+  assert_rejected 1 embedded-v1 1 "$source_binary" "termctl 9.9.9"
+
+  assert_pinned_rejected() {
+    local reported_version="$1"
+
+    set +e
+    output="$(
+      exec {self_binary_fd}<"$pinned_binary"
+      TERMD_INSTALL_PREFIX="${root}/rejected-prefix" \
+        TERMD_VERSION=0.8.2 \
+        TERMD_INSTALL_SELF_MODE=embedded-v1 \
+        TERMD_INSTALL_SELF_BINARY="/proc/${BASHPID}/fd/${self_binary_fd}" \
+        SELF_ENV_PROBE="${root}/rejected-probe" \
+        SELF_BINARY_VERSION="$reported_version" \
+        bash -c '
+          source <(sed '\''/^main "\$@"/,$d'\'' "$1")
+          require_root() { :; }
+          main
+        ' bash "$script" 2>&1
+    )"
+    status=$?
+    set -e
+    [[ "$status" -ne 0 ]]
+    [[ "$output" == *"embedded self-install identity is invalid"* ]]
+    [[ ! -e "${root}/rejected-prefix/bin/termctl" ]]
+  }
+
+  assert_pinned_rejected "termd 0.8.2"
+  assert_pinned_rejected "termctl 9.9.9"
+)
+
+test_termrelay_embedded_self_binary_stages_in_isolation() (
+  local root script source_binary candidate probe output setup_token tls_key
+  root="$(mktemp -d)"
+  trap 'rm -rf "$root"' EXIT
+  script="${ROOT_DIR}/scripts/install-termrelay.sh"
+  source_binary="${root}/source-termrelay"
+  candidate="${root}/candidate-termrelay"
+  probe="${root}/env-probe"
+  setup_token="${root}/private/setup-token"
+  tls_key="${root}/private/tls-key.pem"
+
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'for name in TERMD_INSTALL_SELF_MODE TERMD_INSTALL_SELF_BINARY TERMD_INSTALL_ARG_SETUP_TOKEN_FILE TERMD_INSTALL_ARG_TLS_KEY; do' \
+    '  if [[ -v "$name" ]]; then printf "%s\n" "$name" >>"$SELF_ENV_PROBE"; fi' \
+    'done' \
+    '[[ "${1:-}" == "--version" ]] || exit 64' \
+    'printf "%s\n" "termrelay 0.8.2"' >"$source_binary"
+  chmod 0755 "$source_binary"
+
+  output="$(
+    exec {self_binary_fd}<"$source_binary"
+    TERMD_VERSION=0.8.2 \
+      TERMD_INSTALL_SELF_MODE=embedded-v1 \
+      TERMD_INSTALL_SELF_BINARY="/proc/${BASHPID}/fd/${self_binary_fd}" \
+      TERMD_INSTALL_ARG_SETUP_TOKEN_FILE="$setup_token" \
+      TERMD_INSTALL_ARG_TLS_KEY="$tls_key" \
+      SELF_ENV_PROBE="$probe" \
+      EXPECTED_SETUP_TOKEN="$setup_token" \
+      EXPECTED_TLS_KEY="$tls_key" \
+      bash -c '
+        source <(sed '\''/^main "\$@"/,$d'\'' "$1")
+        validate_internal_install_request
+        apply_internal_install_arguments
+        [[ "$TERMRELAY_SETUP_TOKEN_FILE" == "$EXPECTED_SETUP_TOKEN" ]]
+        [[ "$TERMRELAY_TLS_KEY" == "$EXPECTED_TLS_KEY" ]]
+        [[ -z "$INTERNAL_ARG_SETUP_TOKEN_FILE" && -z "$INTERNAL_ARG_TLS_KEY" ]]
+        install_from_self_binary "$2"
+      ' bash "$script" "$candidate" 2>&1
+  )"
+
+  [[ -z "$output" ]]
+  [[ -x "$candidate" ]]
+  cmp "$source_binary" "$candidate"
+  [[ ! -s "$probe" ]]
+)
+
+test_termd_embedded_self_binary_stages_in_isolation() (
+  local root script source_binary candidate probe output relay daemon_token setup_token proxy tls_key
+  root="$(mktemp -d)"
+  trap 'rm -rf "$root"' EXIT
+  script="${ROOT_DIR}/scripts/install-termd.sh"
+  source_binary="${root}/source-termd"
+  candidate="${root}/candidate-termd"
+  probe="${root}/env-probe"
+  relay="wss://relay-user:relay-password@relay.example/ws"
+  daemon_token="${root}/private/daemon-token"
+  setup_token="${root}/private/setup-token"
+  proxy="http://proxy-user:proxy-password@proxy.example"
+  tls_key="${root}/private/tls-key.pem"
+
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'for name in TERMD_INSTALL_SELF_MODE TERMD_INSTALL_SELF_BINARY TERMD_INSTALL_ARG_RELAY_URL TERMD_INSTALL_ARG_RELAY_DAEMON_TOKEN_FILE TERMD_INSTALL_ARG_RELAY_SETUP_TOKEN_FILE TERMD_INSTALL_ARG_PROXY TERMD_INSTALL_ARG_TLS_KEY; do' \
+    '  if [[ -v "$name" ]]; then printf "%s\n" "$name" >>"$SELF_ENV_PROBE"; fi' \
+    'done' \
+    '[[ "${1:-}" == "--version" ]] || exit 64' \
+    'printf "%s\n" "termd 0.8.2"' >"$source_binary"
+  chmod 0755 "$source_binary"
+
+  output="$(
+    exec {self_binary_fd}<"$source_binary"
+    TERMD_VERSION=0.8.2 \
+      TERMD_INSTALL_SELF_MODE=embedded-v1 \
+      TERMD_INSTALL_SELF_BINARY="/proc/${BASHPID}/fd/${self_binary_fd}" \
+      TERMD_INSTALL_ARG_RELAY_URL="$relay" \
+      TERMD_INSTALL_ARG_RELAY_DAEMON_TOKEN_FILE="$daemon_token" \
+      TERMD_INSTALL_ARG_RELAY_SETUP_TOKEN_FILE="$setup_token" \
+      TERMD_INSTALL_ARG_PROXY="$proxy" \
+      TERMD_INSTALL_ARG_TLS_KEY="$tls_key" \
+      SELF_ENV_PROBE="$probe" \
+      EXPECTED_RELAY="$relay" \
+      EXPECTED_DAEMON_TOKEN="$daemon_token" \
+      EXPECTED_SETUP_TOKEN="$setup_token" \
+      EXPECTED_PROXY="$proxy" \
+      EXPECTED_TLS_KEY="$tls_key" \
+      bash -c '
+        source <(sed '\''/^main "\$@"/,$d'\'' "$1")
+        parse_args --allow-session-loss
+        validate_internal_install_request
+        apply_internal_install_arguments
+        [[ "$TERMD_RELAY_URLS" == "$EXPECTED_RELAY" ]]
+        [[ "$TERMD_RELAY_DAEMON_TOKEN_FILE" == "$EXPECTED_DAEMON_TOKEN" ]]
+        [[ "$TERMD_RELAY_SETUP_TOKEN_FILE" == "$EXPECTED_SETUP_TOKEN" ]]
+        [[ "$http_proxy" == "$EXPECTED_PROXY" && "$https_proxy" == "$EXPECTED_PROXY" ]]
+        [[ "$TERMD_TLS_KEY" == "$EXPECTED_TLS_KEY" ]]
+        [[ -z "$INTERNAL_ARG_RELAY_URL" && -z "$INTERNAL_ARG_RELAY_DAEMON_TOKEN_FILE" ]]
+        [[ -z "$INTERNAL_ARG_RELAY_SETUP_TOKEN_FILE" && -z "$INTERNAL_ARG_PROXY" && -z "$INTERNAL_ARG_TLS_KEY" ]]
+        prompt_confirmation "must not read from a terminal"
+        install_from_self_binary "$2"
+      ' bash "$script" "$candidate" 2>&1
+  )"
+
+  [[ -z "$output" ]]
+  [[ -x "$candidate" ]]
+  cmp "$source_binary" "$candidate"
+  [[ ! -s "$probe" ]]
 )
 
 test_termd_installer_supports_stdin_pipe_execution() (
@@ -962,9 +1196,7 @@ test_termd_required_supervisor_version_mismatch_prompts_and_clears_runtime_state
   seed_termd_runtime_sqlite "$sqlite_file" "v-old"
   create_stale_supervisor_socket "$socket_file"
 
-  export TERMD_INSTALL_CONFIRM_FD=0
-  run_fake_termd_install "$unit_file" <<<"y" >/dev/null
-  unset TERMD_INSTALL_CONFIRM_FD
+  run_fake_termd_install "$unit_file" --allow-session-loss </dev/null >/dev/null
 
   python3 - "$sqlite_file" "$socket_file" "$ROOT_DIR/SUPERVISOR_VERSION" <<'PY'
 import pathlib
@@ -1161,12 +1393,15 @@ test_termd_required_supervisor_version_mismatch_decline_preserves_runtime_state(
   seed_termd_runtime_sqlite "$sqlite_file" "v-old"
   create_stale_supervisor_socket "$socket_file"
 
-  export TERMD_INSTALL_CONFIRM_FD=0
+  # The outer binary's --yes must not turn into session-loss authorization.
+  # Keep the old internal marker hostile to prove it has no remaining semantics.
+  TERMD_INSTALL_ASSUME_YES=1
+  export TERMD_INSTALL_ASSUME_YES TERMD_INSTALL_CONFIRM_FD=0
   set +e
-  (run_fake_termd_install "$unit_file" <<<"n" >/dev/null 2>/dev/null)
+  (run_fake_termd_install "$unit_file" </dev/null >/dev/null 2>/dev/null)
   status=$?
   set -e
-  unset TERMD_INSTALL_CONFIRM_FD
+  unset TERMD_INSTALL_ASSUME_YES TERMD_INSTALL_CONFIRM_FD
 
   [[ "$status" -ne 0 ]]
 
@@ -2915,6 +3150,9 @@ run_test() {
 
 run_test test_termd_installer_supports_stdin_pipe_execution
 run_test test_installers_normalize_standard_proxy_environment
+run_test test_termctl_embedded_self_binary_is_strict_and_isolated
+run_test test_termrelay_embedded_self_binary_stages_in_isolation
+run_test test_termd_embedded_self_binary_stages_in_isolation
 run_test test_termd_fresh_install_initializes_schema_before_supervisor_baseline
 run_test test_termd_reinstall_recovers_installer_poisoned_state
 run_test test_termd_poisoned_state_repair_never_modifies_user_state

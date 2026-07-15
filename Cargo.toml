@@ -1,5 +1,5 @@
 [workspace]
-members = ["proto", "termd", "termctl", "termrelay", "termweb"]
+members = ["proto", "termd", "termctl", "terminstall", "termrelay", "termweb"]
 resolver = "3"
 
 [workspace.package]

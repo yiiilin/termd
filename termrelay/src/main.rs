@@ -7,6 +7,7 @@ mod args;
 mod router;
 mod ws;
 
+use std::ffi::OsString;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -22,6 +23,8 @@ use crate::ws::{RelayDaemonCredential, RelayState};
 
 #[derive(Debug, Error)]
 enum MainError {
+    #[error(transparent)]
+    Install(#[from] terminstall::Error),
     #[error(transparent)]
     Args(#[from] ArgsError),
     #[error("failed to bind relay HTTP listener at {addr}")]
@@ -58,6 +61,11 @@ struct TlsPaths {
 
 #[tokio::main]
 async fn main() -> Result<(), MainError> {
+    if let Some(options) = installer_options(std::env::args_os()) {
+        terminstall::run(terminstall::Component::Termrelay, options)?;
+        return Ok(());
+    }
+
     install_rustls_crypto_provider();
     init_tracing();
 
@@ -133,6 +141,14 @@ async fn main() -> Result<(), MainError> {
     serve_listener(listener, state, tls, args.web).await
 }
 
+fn installer_options<I, S>(args: I) -> Option<terminstall::Options>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<OsString>,
+{
+    terminstall::Options::from_subcommand(env!("CARGO_PKG_VERSION"), None, args.into_iter().skip(1))
+}
+
 fn install_rustls_crypto_provider() {
     // 中文注释：reqwest/tokio-rustls 可能同时启用 rustls 的 aws-lc 和 ring provider；
     // 启动时显式选定 provider，避免 TLS listener 首次使用 rustls 时 panic。
@@ -144,7 +160,9 @@ fn help_text() -> String {
         concat!(
             "termrelay {}\n\n",
             "USAGE:\n",
-            "  termrelay [OPTIONS]\n\n",
+            "  termrelay [OPTIONS]\n",
+            "  termrelay install [OPTIONS]\n",
+            "  termrelay uninstall [OPTIONS]\n\n",
             "OPTIONS:\n",
             "  --listen, -l <HOST:PORT>      Listen address, default 127.0.0.1:8080\n",
             "  --setup-token-file <PATH>     Read daemon registration setup token from a file\n",
@@ -155,6 +173,8 @@ fn help_text() -> String {
             "  --web                         Serve embedded Web UI\n",
             "  -h, --help                    Print help\n",
             "  -V, --version                 Print version\n\n",
+            "INSTALLATION:\n",
+            "  Run `termrelay install --help` or `termrelay uninstall --help` for managed installation options.\n\n",
             "EXAMPLES:\n",
             "  termrelay --listen 127.0.0.1:8080 --allow-open-relay\n",
             "  termrelay --listen 0.0.0.0:8080 --setup-token-file /etc/termd/termrelay_setup_token --daemon-registry /var/lib/termrelay/daemon-registry.json\n"
@@ -287,6 +307,21 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn recognizes_install_and_uninstall_before_relay_argument_parsing() {
+        assert!(matches!(
+            installer_options(["termrelay", "install", "--help"]),
+            Some(terminstall::Options::Install(_))
+        ));
+        assert!(matches!(
+            installer_options(["termrelay", "uninstall", "--dry-run"]),
+            Some(terminstall::Options::Uninstall(_))
+        ));
+        assert!(installer_options(["termrelay", "--web"]).is_none());
+        assert!(help_text().contains("termrelay install [OPTIONS]"));
+        assert!(help_text().contains("termrelay uninstall [OPTIONS]"));
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn tls_listener_serves_healthz() {

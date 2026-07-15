@@ -36,6 +36,8 @@ curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-ter
 
 需要 HTTP/SOCKS 代理时，先按[代理安装说明](docs/installation.md#通过代理安装)导出代理变量并显式传给 sudo。
 
+截至 0.8.2，`latest` release 仍以 `install-*.sh` 为安装入口，不提供稳定名称的 raw binary。当前源码构建出的二进制和包含本改动的下一 release 才支持 `<binary> install|uninstall`；详见[完整安装指南](docs/installation.md#下一-release-与源码构建)。
+
 安装后立即验证：
 
 ```bash

@@ -1,4 +1,5 @@
 use std::error::Error;
+use std::ffi::OsString;
 use std::fmt;
 use std::fmt::Write as FmtWrite;
 use std::fs;
@@ -46,7 +47,9 @@ const HELP_TEXT: &str = concat!(
     "\n\n",
     "USAGE:\n",
     "  termd [OPTIONS]\n",
-    "  termd pair [OPTIONS]\n\n",
+    "  termd pair [OPTIONS]\n",
+    "  termd install [OPTIONS]\n",
+    "  termd uninstall [OPTIONS]\n\n",
     "OPTIONS:\n",
     "  --listen <HOST:PORT>           Listen address, default 127.0.0.1:8765\n",
     "  --relay <WS_URL>               Connect to one relay\n",
@@ -59,6 +62,8 @@ const HELP_TEXT: &str = concat!(
     "  --web                          Serve embedded Web UI\n",
     "  -h, --help                     Print help\n",
     "  -V, --version                  Print version\n\n",
+    "INSTALLATION:\n",
+    "  Run `termd install --help` or `termd uninstall --help` for managed installation options.\n\n",
     "PAIR OPTIONS:\n",
     "  --url <HTTP_URL>               Local daemon URL, default http://127.0.0.1:8765\n",
     "  --qr                           Print a QR invite code for Web/mobile pairing\n",
@@ -87,6 +92,11 @@ async fn main() -> ExitCode {
 }
 
 async fn run() -> Result<(), Box<dyn Error>> {
+    if let Some(options) = installer_options(std::env::args_os()) {
+        terminstall::run(terminstall::Component::Termd, options)?;
+        return Ok(());
+    }
+
     install_rustls_crypto_provider();
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -140,6 +150,18 @@ async fn run() -> Result<(), Box<dyn Error>> {
     }
 
     Ok(())
+}
+
+fn installer_options<I, S>(args: I) -> Option<terminstall::Options>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<OsString>,
+{
+    terminstall::Options::from_subcommand(
+        env!("CARGO_PKG_VERSION"),
+        Some(terminstall::supervisor_version()),
+        args.into_iter().skip(1),
+    )
 }
 
 fn install_rustls_crypto_provider() {
@@ -1171,6 +1193,21 @@ mod tests {
             CliCommand::parse(["pair".to_owned(), "--help".to_owned()]).unwrap(),
             CliCommand::Help
         );
+        assert!(HELP_TEXT.contains("termd install [OPTIONS]"));
+        assert!(HELP_TEXT.contains("termd uninstall [OPTIONS]"));
+    }
+
+    #[test]
+    fn recognizes_install_and_uninstall_before_daemon_argument_parsing() {
+        assert!(matches!(
+            installer_options(["termd", "install", "--help"]),
+            Some(terminstall::Options::Install(_))
+        ));
+        assert!(matches!(
+            installer_options(["termd", "uninstall", "--dry-run"]),
+            Some(terminstall::Options::Uninstall(_))
+        ));
+        assert!(installer_options(["termd", "pair", "--help"]).is_none());
     }
 
     #[test]

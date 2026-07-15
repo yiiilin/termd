@@ -1872,6 +1872,7 @@ dependencies = [
  "tempfile",
  "termd",
  "termd-proto",
+ "terminstall",
  "thiserror 2.0.18",
  "tokio",
  "tokio-tungstenite",
@@ -1904,6 +1905,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "termd-proto",
+ "terminstall",
  "termweb",
  "thiserror 2.0.18",
  "tokio",
@@ -1931,6 +1933,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "terminstall"
+version = "0.8.2"
+
+[[package]]
 name = "termrelay"
 version = "0.8.2"
 dependencies = [
@@ -1947,6 +1953,7 @@ dependencies = [
  "sha2",
  "termd",
  "termd-proto",
+ "terminstall",
  "termweb",
  "thiserror 2.0.18",
  "tokio",

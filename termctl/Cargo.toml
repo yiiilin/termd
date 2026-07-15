@@ -18,6 +18,7 @@ serde_json.workspace = true
 rustls = "0.23"
 termd = { path = "../termd" }
 termd-proto = { path = "../proto" }
+terminstall = { path = "../terminstall" }
 thiserror.workspace = true
 tokio = { version = "1", features = ["io-std", "io-util", "macros", "rt-multi-thread", "signal", "time"] }
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }

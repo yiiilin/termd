@@ -40,6 +40,21 @@ curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-ter
 
 这些变量负责安装过程的联网。若 `termd` 运行后连接 relay 也必须长期经过代理，安装时另加 `--proxy <URL>`，或在 `/etc/termd/termd.env` 中配置 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 和 `NO_PROXY` 后重启服务。包含账号密码的代理 URL 属于敏感信息，不要写入 issue、聊天或共享日志。
 
+## 下一 release 与源码构建
+
+截至 0.8.2，GitHub `latest` 只提供版本化 tarball 和 `install-*.sh`，不提供 `termd-linux-amd64` 等稳定名称的 raw binary；本页当前安装、升级和卸载命令因此继续使用 release script。
+
+当前源码构建出的三个二进制已经支持内嵌 installer。完成 Web 构建和 Rust release build 后，可先用无副作用计划检查参数，再执行安装：
+
+```bash
+(cd termui/frontend && npm ci && npm run build)
+cargo build --release --locked -p termd -p termrelay -p termctl
+sudo target/release/termd install --dry-run --web --user "$(id -un)"
+sudo target/release/termd install --yes --web --user "$(id -un)"
+```
+
+包含本改动的下一 release 会同时发布可校验的稳定名称 raw binary，届时才能把下载后的 `<binary> install|uninstall` 作为 release 安装入口。`--yes` 只确认普通安装计划；supervisor compatibility 确实变化且允许丢失 session 时，仍必须单独显式传 `--allow-session-loss`。
+
 ### Linux arm64
 
 arm64 没有预编译 release archive。安装器会 clone 当前 release tag 并执行 `cargo build --release --locked`：

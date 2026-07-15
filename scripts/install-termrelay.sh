@@ -33,6 +33,36 @@ INSTALL_STAGING_ONLY=0
 INSTALL_ANY_FILE_COMMITTED=0
 INSTALL_SERVICE_WAS_ACTIVE=0
 INSTALL_SERVICE_WAS_ENABLED=0
+SELF_INSTALL_MODE_SET=0
+SELF_INSTALL_BINARY_SET=0
+SELF_INSTALL_ENABLED=0
+SELF_INSTALL_MODE=""
+SELF_INSTALL_BINARY=""
+INTERNAL_INSTALL_ARGUMENT_INVALID=0
+INTERNAL_INSTALL_ARGUMENTS_PRESENT=0
+INTERNAL_ARG_SETUP_TOKEN_FILE=""
+INTERNAL_ARG_TLS_KEY=""
+
+if [[ -v TERMD_INSTALL_SELF_MODE ]]; then
+  SELF_INSTALL_MODE_SET=1
+  SELF_INSTALL_MODE="$TERMD_INSTALL_SELF_MODE"
+fi
+if [[ -v TERMD_INSTALL_SELF_BINARY ]]; then
+  SELF_INSTALL_BINARY_SET=1
+  SELF_INSTALL_BINARY="$TERMD_INSTALL_SELF_BINARY"
+fi
+if [[ -v TERMD_INSTALL_ARG_SETUP_TOKEN_FILE ]]; then
+  INTERNAL_INSTALL_ARGUMENTS_PRESENT=1
+  INTERNAL_ARG_SETUP_TOKEN_FILE="$TERMD_INSTALL_ARG_SETUP_TOKEN_FILE"
+  [[ -n "$INTERNAL_ARG_SETUP_TOKEN_FILE" ]] || INTERNAL_INSTALL_ARGUMENT_INVALID=1
+fi
+if [[ -v TERMD_INSTALL_ARG_TLS_KEY ]]; then
+  INTERNAL_INSTALL_ARGUMENTS_PRESENT=1
+  INTERNAL_ARG_TLS_KEY="$TERMD_INSTALL_ARG_TLS_KEY"
+  [[ -n "$INTERNAL_ARG_TLS_KEY" ]] || INTERNAL_INSTALL_ARGUMENT_INVALID=1
+fi
+unset TERMD_INSTALL_SELF_MODE TERMD_INSTALL_SELF_BINARY TERMD_INSTALL_ASSUME_YES
+unset TERMD_INSTALL_ARG_SETUP_TOKEN_FILE TERMD_INSTALL_ARG_TLS_KEY
 
 log() {
   if [[ "$LOG_EMITTED" -eq 1 ]]; then
@@ -74,6 +104,46 @@ normalize_proxy_environment() {
   normalize_proxy_pair https_proxy HTTPS_PROXY
   normalize_proxy_pair all_proxy ALL_PROXY
   normalize_proxy_pair no_proxy NO_PROXY
+}
+
+validate_internal_install_request() {
+  local reported_version
+
+  [[ "$INTERNAL_INSTALL_ARGUMENT_INVALID" -eq 0 ]] || die "embedded installer arguments are invalid"
+  if [[ "$SELF_INSTALL_MODE_SET" -ne "$SELF_INSTALL_BINARY_SET" ]]; then
+    die "embedded self-install identity is invalid"
+  fi
+  if [[ "$SELF_INSTALL_MODE_SET" -eq 0 ]]; then
+    [[ "$INTERNAL_INSTALL_ARGUMENTS_PRESENT" -eq 0 ]] || die "embedded installer arguments are invalid"
+    return 0
+  fi
+
+  SELF_INSTALL_ENABLED=1
+  [[ "$SELF_INSTALL_MODE" == "embedded-v1" ]] || die "embedded self-install identity is invalid"
+  [[ -n "$VERSION" ]] || die "embedded self-install identity is invalid"
+  if [[ ! "$SELF_INSTALL_BINARY" =~ ^/proc/([0-9]+)/fd/([0-9]+)$ ]] || \
+    [[ "${BASH_REMATCH[1]}" != "$PPID" ]]; then
+    die "embedded self-install path is invalid"
+  fi
+  [[ -f "$SELF_INSTALL_BINARY" && -r "$SELF_INSTALL_BINARY" && -x "$SELF_INSTALL_BINARY" ]] || \
+    die "embedded self-install path is invalid"
+  if ! reported_version="$("$SELF_INSTALL_BINARY" --version 2>/dev/null)"; then
+    die "embedded self-install identity is invalid"
+  fi
+  [[ "$reported_version" == "$BIN_NAME $VERSION" ]] || die "embedded self-install identity is invalid"
+}
+
+apply_internal_install_arguments() {
+  if [[ -n "$INTERNAL_ARG_SETUP_TOKEN_FILE" ]]; then
+    TERMRELAY_SETUP_TOKEN_FILE="$INTERNAL_ARG_SETUP_TOKEN_FILE"
+    INSTALL_SET_SETUP_TOKEN_FILE=1
+  fi
+  if [[ -n "$INTERNAL_ARG_TLS_KEY" ]]; then
+    TERMRELAY_TLS_KEY="$INTERNAL_ARG_TLS_KEY"
+    INSTALL_SET_TLS_KEY=1
+  fi
+  INTERNAL_ARG_SETUP_TOKEN_FILE=""
+  INTERNAL_ARG_TLS_KEY=""
 }
 
 is_enabled() {
@@ -371,6 +441,12 @@ install_from_source() {
   fi
   install -Dm0755 "$src_dir/repo/target/release/$BIN_NAME" "$destination"
   rm -rf "$src_dir"
+}
+
+install_from_self_binary() {
+  local destination="$1"
+
+  install -m0755 -- "$SELF_INSTALL_BINARY" "$destination"
 }
 
 upsert_env_var() {
@@ -899,6 +975,8 @@ uninstall_component() {
 
 main() {
   parse_args "$@"
+  validate_internal_install_request
+  apply_internal_install_arguments
   normalize_proxy_environment
   require_root
   if [[ "$ACTION" == "uninstall" ]]; then
@@ -907,20 +985,23 @@ main() {
   fi
 
   require_cmd install
-  require_cmd tar
-  require_cmd sha256sum
   require_cmd python3
   require_cmd systemctl
   require_cmd useradd
-  [[ -n "$REPO" ]] || die "set TERMD_GITHUB_REPO=owner/repo before running the installer"
-
-  resolve_version
+  if [[ "$SELF_INSTALL_ENABLED" -eq 0 ]]; then
+    require_cmd tar
+    require_cmd sha256sum
+    [[ -n "$REPO" ]] || die "set TERMD_GITHUB_REPO=owner/repo before running the installer"
+    resolve_version
+  fi
   log "installing ${BIN_NAME} ${VERSION}"
 
   INSTALL_STAGING_DIR="$(mktemp -d)"
   trap cleanup_install_staging EXIT
   local candidate_binary="${INSTALL_STAGING_DIR}/${BIN_NAME}"
-  if ! install_from_release "$candidate_binary"; then
+  if [[ "$SELF_INSTALL_ENABLED" -eq 1 ]]; then
+    install_from_self_binary "$candidate_binary" || die "failed to stage embedded self-install binary"
+  elif ! install_from_release "$candidate_binary"; then
     install_from_source "$candidate_binary"
   fi
 
