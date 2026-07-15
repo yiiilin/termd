@@ -398,6 +398,14 @@ impl RelayRegistry {
         (count, latest_connection_id)
     }
 
+    pub(super) fn daemon_control_connected(&self, server_id: ServerId) -> Option<bool> {
+        self.rooms.lock().ok().map(|rooms| {
+            rooms
+                .get(&server_id)
+                .is_some_and(|room| room.daemon_control.is_some())
+        })
+    }
+
     pub(super) fn close_server(&self, server_id: ServerId) -> Result<bool, RelayError> {
         let mut rooms = self.rooms.lock().map_err(|_| RelayError::Poisoned)?;
         let Some(mut room) = rooms.remove(&server_id) else {

@@ -3,6 +3,7 @@ use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::File;
 use std::io::{self, IsTerminal, Write};
+use std::mem::MaybeUninit;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -161,10 +162,14 @@ impl fmt::Debug for Options {
 pub enum Error {
     UnknownArgument(String),
     DuplicateArgument(&'static str),
+    ConflictingArguments(&'static str, &'static str),
+    ArgumentRequires(&'static str, &'static str),
     MissingValue(&'static str),
     EmptyValue(&'static str),
     PurgeUnsupported,
     NonInteractive,
+    RelayTokenRequired,
+    EmptyRelayToken,
     Cancelled,
     OpenSelfExecutable(io::Error),
     Input(io::Error),
@@ -185,6 +190,12 @@ impl fmt::Display for Error {
             Self::DuplicateArgument(flag) => {
                 write!(formatter, "{flag} may be specified only once")
             }
+            Self::ConflictingArguments(first, second) => {
+                write!(formatter, "{first} conflicts with {second}; do not use them together")
+            }
+            Self::ArgumentRequires(argument, required) => {
+                write!(formatter, "{argument} requires {required}")
+            }
             Self::MissingValue(flag) => write!(formatter, "{flag} requires a value"),
             Self::EmptyValue(flag) => write!(formatter, "{flag} requires a non-empty value"),
             Self::PurgeUnsupported => formatter.write_str(
@@ -193,6 +204,10 @@ impl fmt::Display for Error {
             Self::NonInteractive => formatter.write_str(
                 "installer confirmation requires a TTY; review with --dry-run, then rerun with --yes for non-interactive execution",
             ),
+            Self::RelayTokenRequired => formatter.write_str(
+                "trusted relay setup token is required for non-interactive installation; pass --relay-token <TOKEN> or --relay-setup-token-file <PATH>",
+            ),
+            Self::EmptyRelayToken => formatter.write_str("relay setup token cannot be empty"),
             Self::Cancelled => formatter.write_str("installation cancelled"),
             Self::OpenSelfExecutable(_) => {
                 formatter.write_str("failed to pin the running executable")
@@ -244,6 +259,9 @@ struct ParsedOptions {
     help: bool,
     purge: bool,
     allow_session_loss: bool,
+    allow_open_relay: bool,
+    relay_explicit: bool,
+    prompt_relay_token: bool,
     script_args: Vec<OsString>,
     script_env: Vec<(&'static str, OsString)>,
     summary: Vec<String>,
@@ -269,6 +287,9 @@ impl ParsedOptions {
             help: false,
             purge: false,
             allow_session_loss: false,
+            allow_open_relay: false,
+            relay_explicit: false,
+            prompt_relay_token: false,
             script_args: Vec::new(),
             script_env: Vec::new(),
             summary: Vec::new(),
@@ -332,6 +353,22 @@ impl ParsedOptions {
                             {
                                 return Err(Error::DuplicateArgument("--relay"));
                             }
+                            if let Some(flag) = match environment_name {
+                                "TERMD_INSTALL_ARG_RELAY_SETUP_TOKEN" => Some("--relay-token"),
+                                "TERMD_INSTALL_ARG_RELAY_SETUP_TOKEN_FILE" => {
+                                    Some("--relay-setup-token-file")
+                                }
+                                _ => None,
+                            } && parsed
+                                .script_env
+                                .iter()
+                                .any(|(name, _)| *name == environment_name)
+                            {
+                                return Err(Error::DuplicateArgument(flag));
+                            }
+                            if environment_name == "TERMD_INSTALL_ARG_RELAY_URL" {
+                                parsed.relay_explicit = true;
+                            }
                             parsed.script_env.push((environment_name, value));
                             "configured".to_owned()
                         } else {
@@ -346,6 +383,11 @@ impl ParsedOptions {
                         if inline_value.is_some() {
                             return Err(Error::UnknownArgument(safe_unknown_argument(flag)));
                         }
+                        if component == Component::Termd
+                            && specification.flag == "--allow-open-relay"
+                        {
+                            parsed.allow_open_relay = true;
+                        }
                         parsed.script_args.push(OsString::from(specification.flag));
                         parsed
                             .summary
@@ -354,6 +396,43 @@ impl ParsedOptions {
                 }
                 _ => return Err(Error::UnknownArgument(safe_unknown_argument(flag))),
             }
+        }
+        let has_direct_relay_token = parsed
+            .script_env
+            .iter()
+            .any(|(name, _)| *name == "TERMD_INSTALL_ARG_RELAY_SETUP_TOKEN");
+        let has_relay_token_file = parsed
+            .script_env
+            .iter()
+            .any(|(name, _)| *name == "TERMD_INSTALL_ARG_RELAY_SETUP_TOKEN_FILE");
+        if has_direct_relay_token && has_relay_token_file {
+            return Err(Error::ConflictingArguments(
+                "--relay-token",
+                "--relay-setup-token-file",
+            ));
+        }
+        if parsed.allow_open_relay && !parsed.relay_explicit {
+            return Err(Error::ArgumentRequires("--allow-open-relay", "--relay"));
+        }
+        if parsed.allow_open_relay && (has_direct_relay_token || has_relay_token_file) {
+            return Err(Error::ConflictingArguments(
+                "--allow-open-relay",
+                if has_direct_relay_token {
+                    "--relay-token"
+                } else {
+                    "--relay-setup-token-file"
+                },
+            ));
+        }
+        if parsed.relay_explicit
+            && !parsed.allow_open_relay
+            && !has_direct_relay_token
+            && !has_relay_token_file
+        {
+            parsed.prompt_relay_token = true;
+            parsed
+                .summary
+                .push("relay setup token: will prompt securely during installation".to_owned());
         }
         Ok(parsed)
     }
@@ -403,6 +482,10 @@ fn install_flag(component: Component, flag: &str) -> Option<FlagSpecification> {
             Some(boolean_flag("--no-web", "embedded Web UI disabled"))
         }
         (Component::Termd, "--public") => Some(boolean_flag("--public", "public listen alias")),
+        (Component::Termd, "--allow-open-relay") => Some(boolean_flag(
+            "--allow-open-relay",
+            "allow explicit open relay mode",
+        )),
         (Component::Termd, "--listen") => Some(value_flag("--listen", "listen address", None)),
         (Component::Termd, "--relay") | (Component::Termd, "--relay-url") => Some(value_flag(
             "--relay",
@@ -418,6 +501,11 @@ fn install_flag(component: Component, flag: &str) -> Option<FlagSpecification> {
             "--relay-setup-token-file",
             "relay setup token file",
             Some("TERMD_INSTALL_ARG_RELAY_SETUP_TOKEN_FILE"),
+        )),
+        (Component::Termd, "--relay-token") => Some(value_flag(
+            "--relay-token",
+            "relay setup token",
+            Some("TERMD_INSTALL_ARG_RELAY_SETUP_TOKEN"),
         )),
         (Component::Termd, "--proxy") | (Component::Termd, "--relay-proxy") => Some(value_flag(
             "--proxy",
@@ -489,6 +577,7 @@ trait Runtime {
     fn install_prefix(&self) -> PathBuf;
     fn write_output(&mut self, message: &str) -> Result<(), Error>;
     fn confirm(&mut self, prompt: &str) -> Result<bool, Error>;
+    fn read_secret(&mut self, prompt: &str) -> Result<OsString, Error>;
     fn execute(&mut self, invocation: &Invocation) -> Result<ExecutionStatus, Error>;
 }
 
@@ -538,6 +627,49 @@ impl Runtime for SystemRuntime {
             answer.trim().to_ascii_lowercase().as_str(),
             "y" | "yes"
         ))
+    }
+
+    fn read_secret(&mut self, prompt: &str) -> Result<OsString, Error> {
+        let mut stderr = io::stderr().lock();
+        stderr.write_all(prompt.as_bytes()).map_err(Error::Output)?;
+        stderr.flush().map_err(Error::Output)?;
+
+        let stdin = io::stdin();
+        let fd = stdin.as_raw_fd();
+        let mut original = MaybeUninit::<libc::termios>::uninit();
+        if unsafe { libc::tcgetattr(fd, original.as_mut_ptr()) } != 0 {
+            return Err(Error::Input(io::Error::last_os_error()));
+        }
+        let original = unsafe { original.assume_init() };
+        let mut hidden = original;
+        hidden.c_lflag &= !libc::ECHO;
+        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &hidden) } != 0 {
+            return Err(Error::Input(io::Error::last_os_error()));
+        }
+
+        struct EchoGuard {
+            fd: i32,
+            original: libc::termios,
+        }
+        impl Drop for EchoGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::tcsetattr(self.fd, libc::TCSANOW, &self.original);
+                }
+            }
+        }
+        let guard = EchoGuard { fd, original };
+        let mut value = String::new();
+        let read_result = stdin.read_line(&mut value);
+        drop(guard);
+        stderr.write_all(b"\n").map_err(Error::Output)?;
+        stderr.flush().map_err(Error::Output)?;
+        read_result.map_err(Error::Input)?;
+        let value = value.trim().to_owned();
+        if value.is_empty() {
+            return Err(Error::EmptyRelayToken);
+        }
+        Ok(OsString::from(value))
     }
 
     fn execute(&mut self, invocation: &Invocation) -> Result<ExecutionStatus, Error> {
@@ -607,6 +739,9 @@ fn run_with(
     if parsed.dry_run {
         return Ok(());
     }
+    if parsed.prompt_relay_token && !runtime.is_tty() {
+        return Err(Error::RelayTokenRequired);
+    }
     if !parsed.yes {
         if !runtime.is_tty() {
             return Err(Error::NonInteractive);
@@ -616,6 +751,11 @@ fn run_with(
         }
     }
 
+    let prompted_relay_token = if parsed.prompt_relay_token {
+        Some(runtime.read_secret("Relay setup token (input hidden): ")?)
+    } else {
+        None
+    };
     let mut script_args = parsed.script_args;
     if parsed.action == Action::Uninstall {
         script_args.insert(0, OsString::from("--uninstall"));
@@ -633,6 +773,9 @@ fn run_with(
         ),
     ];
     env.extend(parsed.script_env);
+    if let Some(token) = prompted_relay_token {
+        env.push(("TERMD_INSTALL_ARG_RELAY_SETUP_TOKEN", token));
+    }
     if component == Component::Termd
         && let Some(supervisor_version) = parsed.supervisor_version
     {
@@ -727,7 +870,7 @@ fn help_text(component: Component, action: Action) -> String {
     }
     match component {
         Component::Termd => output.push_str(
-            "\ntermd options:\n  --web | --no-web\n  --listen <HOST:PORT> | --public\n  --relay <WS_URL>\n  --relay-daemon-token-file <PATH>\n  --relay-setup-token-file <PATH>\n  --proxy <URL>\n  --tls-cert <PATH> --tls-key <PATH>\n  --user <USER>\n  --supervisor-version <VERSION>\n  --allow-session-loss  Permit an incompatible supervisor upgrade to remove sessions\n",
+            "\ntermd options:\n  --web | --no-web\n  --listen <HOST:PORT> | --public\n  --relay <WS_URL>\n  --relay-token <TOKEN>\n  --relay-daemon-token-file <PATH>\n  --relay-setup-token-file <PATH>\n  --allow-open-relay  Explicitly connect without trusted relay registration\n  --proxy <URL>\n  --tls-cert <PATH> --tls-key <PATH>\n  --user <USER>\n  --supervisor-version <VERSION>\n  --allow-session-loss  Permit an incompatible supervisor upgrade to remove sessions\n",
         ),
         Component::Termrelay => output.push_str(
             "\ntermrelay options:\n  --web | --no-web\n  --listen <HOST:PORT> | --public\n  --setup-token-file <PATH>\n  --daemon-registry <PATH>\n  --allow-open-relay\n  --tls-cert <PATH> --tls-key <PATH>\n",
@@ -748,6 +891,8 @@ mod tests {
         execute_calls: usize,
         invocation_args: Vec<OsString>,
         invocation_env: Vec<(&'static str, OsString)>,
+        secret_input: OsString,
+        secret_reads: usize,
         status: ExecutionStatus,
     }
 
@@ -760,6 +905,8 @@ mod tests {
                 execute_calls: 0,
                 invocation_args: Vec::new(),
                 invocation_env: Vec::new(),
+                secret_input: OsString::from("prompted-relay-setup-token"),
+                secret_reads: 0,
                 status: ExecutionStatus {
                     success: true,
                     description: "exit status: 0".to_owned(),
@@ -792,6 +939,11 @@ mod tests {
 
         fn confirm(&mut self, _prompt: &str) -> Result<bool, Error> {
             Ok(self.confirmation)
+        }
+
+        fn read_secret(&mut self, _prompt: &str) -> Result<OsString, Error> {
+            self.secret_reads += 1;
+            Ok(self.secret_input.clone())
         }
 
         fn execute(&mut self, invocation: &Invocation) -> Result<ExecutionStatus, Error> {
@@ -933,6 +1085,196 @@ mod tests {
             );
             assert!(!runtime.output.contains(value));
         }
+    }
+
+    #[test]
+    fn direct_relay_token_uses_environment_without_disclosure() {
+        let relay_token = "direct-relay-setup-secret";
+        let options = Options::Install(InstallOptions::new(
+            "1.2.3",
+            None,
+            [
+                "--relay",
+                "wss://relay.example",
+                "--relay-token",
+                relay_token,
+                "--yes",
+            ],
+        ));
+        let mut runtime = FakeRuntime::default();
+
+        run_with(Component::Termd, options, &mut runtime).unwrap();
+
+        assert_eq!(runtime.secret_reads, 0);
+        assert!(runtime.invocation_args.is_empty());
+        assert!(runtime.invocation_env.contains(&(
+            "TERMD_INSTALL_ARG_RELAY_SETUP_TOKEN",
+            OsString::from(relay_token)
+        )));
+        assert!(!runtime.output.contains(relay_token));
+    }
+
+    #[test]
+    fn relay_token_sources_conflict_without_disclosing_secret() {
+        let relay_token = "conflicting-relay-setup-secret";
+        let options = Options::Install(InstallOptions::new(
+            "1.2.3",
+            None,
+            [
+                "--relay-token",
+                relay_token,
+                "--relay-setup-token-file",
+                "/tmp/relay-setup-token",
+            ],
+        ));
+
+        let error = match ParsedOptions::parse(Component::Termd, options) {
+            Ok(_) => panic!("conflicting relay token sources were accepted"),
+            Err(error) => error,
+        };
+        let rendered = format!("{error:?}\n{error}");
+
+        assert!(matches!(
+            error,
+            Error::ConflictingArguments("--relay-token", "--relay-setup-token-file")
+        ));
+        assert!(!rendered.contains(relay_token));
+    }
+
+    #[test]
+    fn explicit_relay_prompts_securely_only_for_live_tty_install() {
+        let dry_run_options = Options::Install(InstallOptions::new(
+            "1.2.3",
+            None,
+            ["--relay", "wss://relay.example", "--dry-run"],
+        ));
+        let mut dry_run = FakeRuntime {
+            tty: false,
+            ..FakeRuntime::default()
+        };
+        run_with(Component::Termd, dry_run_options, &mut dry_run).unwrap();
+        assert_eq!(dry_run.secret_reads, 0);
+        assert_eq!(dry_run.execute_calls, 0);
+        assert!(
+            dry_run
+                .output
+                .contains("relay setup token: will prompt securely during installation")
+        );
+
+        let live_options = Options::Install(InstallOptions::new(
+            "1.2.3",
+            None,
+            ["--relay", "wss://relay.example", "--yes"],
+        ));
+        let mut live = FakeRuntime::default();
+        run_with(Component::Termd, live_options, &mut live).unwrap();
+        assert_eq!(live.secret_reads, 1);
+        assert!(live.invocation_env.contains(&(
+            "TERMD_INSTALL_ARG_RELAY_SETUP_TOKEN",
+            OsString::from("prompted-relay-setup-token")
+        )));
+        assert!(!live.output.contains("prompted-relay-setup-token"));
+    }
+
+    #[test]
+    fn explicit_relay_without_token_has_actionable_noninteractive_error() {
+        let options = Options::Install(InstallOptions::new(
+            "1.2.3",
+            None,
+            ["--relay", "wss://relay.example", "--yes"],
+        ));
+        let mut runtime = FakeRuntime {
+            tty: false,
+            ..FakeRuntime::default()
+        };
+
+        let error = run_with(Component::Termd, options, &mut runtime).unwrap_err();
+
+        assert!(matches!(error, Error::RelayTokenRequired));
+        assert!(format!("{error}").contains("--relay-token"));
+        assert!(format!("{error}").contains("--relay-setup-token-file"));
+        assert_eq!(runtime.secret_reads, 0);
+        assert_eq!(runtime.execute_calls, 0);
+    }
+
+    #[test]
+    fn upgrade_without_explicit_relay_does_not_require_setup_token() {
+        let options = Options::Install(InstallOptions::new("1.2.3", None, ["--yes"]));
+        let mut runtime = FakeRuntime {
+            tty: false,
+            ..FakeRuntime::default()
+        };
+
+        run_with(Component::Termd, options, &mut runtime).unwrap();
+
+        assert_eq!(runtime.secret_reads, 0);
+        assert_eq!(runtime.execute_calls, 1);
+    }
+
+    #[test]
+    fn explicit_open_relay_skips_setup_token_in_noninteractive_install() {
+        let options = Options::Install(InstallOptions::new(
+            "1.2.3",
+            None,
+            [
+                "--relay",
+                "ws://relay.example",
+                "--allow-open-relay",
+                "--yes",
+            ],
+        ));
+        let mut runtime = FakeRuntime {
+            tty: false,
+            ..FakeRuntime::default()
+        };
+
+        run_with(Component::Termd, options, &mut runtime).unwrap();
+
+        assert_eq!(runtime.secret_reads, 0);
+        assert_eq!(runtime.execute_calls, 1);
+        assert!(
+            runtime
+                .invocation_args
+                .contains(&OsString::from("--allow-open-relay"))
+        );
+        assert!(!runtime.invocation_env.iter().any(|(name, _)| {
+            matches!(
+                *name,
+                "TERMD_INSTALL_ARG_RELAY_SETUP_TOKEN" | "TERMD_INSTALL_ARG_RELAY_SETUP_TOKEN_FILE"
+            )
+        }));
+    }
+
+    #[test]
+    fn open_relay_flag_requires_relay_and_rejects_setup_token() {
+        let without_relay =
+            Options::Install(InstallOptions::new("1.2.3", None, ["--allow-open-relay"]));
+        assert!(matches!(
+            ParsedOptions::parse(Component::Termd, without_relay),
+            Err(Error::ArgumentRequires("--allow-open-relay", "--relay"))
+        ));
+
+        let with_token = Options::Install(InstallOptions::new(
+            "1.2.3",
+            None,
+            [
+                "--relay",
+                "ws://relay.example",
+                "--allow-open-relay",
+                "--relay-token",
+                "must-not-leak",
+            ],
+        ));
+        let error = match ParsedOptions::parse(Component::Termd, with_token) {
+            Ok(_) => panic!("open relay accepted a setup token"),
+            Err(error) => error,
+        };
+        let rendered = format!("{error:?}\n{error}");
+        assert!(matches!(
+            error,
+            Error::ConflictingArguments("--allow-open-relay", "--relay-token")
+        ));
+        assert!(!rendered.contains("must-not-leak"));
     }
 
     #[test]

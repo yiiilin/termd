@@ -24,6 +24,7 @@ pub fn router(state: RelayState, web_enabled: bool) -> Router {
         .route("/ws/metadata", get(relay_metadata_ws))
         .route("/ws/terminal", get(relay_terminal_ws))
         .route("/api/relay/daemon/register", post(register_daemon))
+        .route("/api/relay/daemon/status", post(daemon_status))
         .merge(http_api_tunnel_router())
         .method_not_allowed_fallback(api_method_not_allowed);
 
@@ -252,7 +253,14 @@ fn authorize_relay_http_request(
     path: &str,
     headers: &HeaderMap,
 ) -> Result<(), Response> {
-    if !state.trusted_admission_enabled() {
+    let trusted_admission = state.trusted_admission_mode().map_err(|_| {
+        relay_json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "relay_admission_unavailable",
+            "relay admission state is unavailable",
+        )
+    })?;
+    if !trusted_admission {
         return Ok(());
     }
     let Some(requirement) = relay_http_admission_requirement(path) else {
@@ -359,6 +367,87 @@ struct RegisterDaemonRequest {
     daemon_public_key: Option<termd_proto::PublicKey>,
 }
 
+#[derive(Debug, Deserialize)]
+struct DaemonStatusRequest {
+    server_id: ServerId,
+}
+
+#[derive(Debug, Serialize)]
+struct DaemonStatusResponse {
+    server_id: ServerId,
+    connected: bool,
+}
+
+async fn daemon_status(
+    State(state): State<RelayState>,
+    headers: HeaderMap,
+    request: Result<Json<DaemonStatusRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match request {
+        Ok(request) => request,
+        Err(_) => {
+            return relay_json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_json",
+                "request body must be valid JSON",
+            );
+        }
+    };
+    let setup_token = headers
+        .get("x-termd-relay-setup-token")
+        .and_then(|value| value.to_str().ok());
+    let trusted_admission = match state.trusted_admission_mode() {
+        Ok(trusted_admission) => trusted_admission,
+        Err(_) => {
+            return relay_json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "relay_status_unavailable",
+                "relay connection state is unavailable",
+            );
+        }
+    };
+    if trusted_admission {
+        match state.authorize_setup_token(setup_token) {
+            Ok(()) => {}
+            Err(
+                RegisterDaemonError::SetupTokenMissing | RegisterDaemonError::SetupTokenRejected,
+            ) => {
+                return relay_json_error(
+                    StatusCode::UNAUTHORIZED,
+                    "setup_token_invalid",
+                    "relay setup token is missing or invalid",
+                );
+            }
+            Err(RegisterDaemonError::SetupTokenNotConfigured) => {
+                return relay_json_error(
+                    StatusCode::NOT_IMPLEMENTED,
+                    "relay_status_unavailable",
+                    "trusted relay status is not configured",
+                );
+            }
+            Err(_) => {
+                return relay_json_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "relay_status_unavailable",
+                    "relay connection state is unavailable",
+                );
+            }
+        }
+    }
+    match state.daemon_control_connected(request.server_id) {
+        Some(connected) => Json(DaemonStatusResponse {
+            server_id: request.server_id,
+            connected,
+        })
+        .into_response(),
+        None => relay_json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "relay_status_unavailable",
+            "relay connection state is unavailable",
+        ),
+    }
+}
+
 async fn register_daemon(
     State(state): State<RelayState>,
     headers: HeaderMap,
@@ -431,15 +520,26 @@ struct HealthzPayload {
     trusted_admission: bool,
 }
 
-async fn healthz(State(state): State<RelayState>) -> Json<HealthzPayload> {
+async fn healthz(State(state): State<RelayState>) -> Response {
+    let trusted_admission = match state.trusted_admission_mode() {
+        Ok(trusted_admission) => trusted_admission,
+        Err(_) => {
+            return relay_json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "relay_health_unavailable",
+                "relay health state is unavailable",
+            );
+        }
+    };
     let (daemon_controls, latest_daemon_control_connection_id) = state.daemon_control_stats();
     Json(HealthzPayload {
         status: "ok",
         rooms: state.room_count(),
         daemon_controls,
         latest_daemon_control_connection_id,
-        trusted_admission: state.trusted_admission_enabled(),
+        trusted_admission,
     })
+    .into_response()
 }
 
 async fn relay_ws(
@@ -1496,6 +1596,154 @@ mod tests {
             }),
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn daemon_status_reports_only_the_requested_server_control() {
+        let online_server_id = ServerId::new();
+        let offline_server_id = ServerId::new();
+        let registry_path = temp_registry_path("daemon-status");
+        let state = RelayState::new_trusted_with_registry(
+            vec![crate::ws::RelayDaemonCredential::plain_token(
+                online_server_id,
+                "online-daemon-secret".to_owned(),
+            )],
+            Some("relay-setup-secret-1".to_owned()),
+            Some(registry_path.clone()),
+        )
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_state = state.clone();
+        let relay_server = tokio::spawn(async move {
+            axum::serve(listener, router(server_state, false))
+                .await
+                .unwrap();
+        });
+        let (mut daemon_control, _) = connect_async(format!("ws://{addr}/ws")).await.unwrap();
+        register_route_with_admission(
+            &mut daemon_control,
+            online_server_id,
+            RouteRole::DaemonControl,
+            Some(RelayAdmissionPayload::Daemon {
+                token: "online-daemon-secret".to_owned(),
+            }),
+        )
+        .await;
+
+        for (server_id, expected_connected) in
+            [(online_server_id, true), (offline_server_id, false)]
+        {
+            let response = router(state.clone(), false)
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/api/relay/daemon/status")
+                        .header(CONTENT_TYPE, "application/json")
+                        .header("x-termd-relay-setup-token", "relay-setup-secret-1")
+                        .body(Body::from(
+                            serde_json::json!({"server_id": server_id}).to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["server_id"], server_id.0.to_string());
+            assert_eq!(body["connected"], expected_connected);
+        }
+
+        let unauthorized = router(state, false)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/relay/daemon/status")
+                    .header(CONTENT_TYPE, "application/json")
+                    .header("x-termd-relay-setup-token", "wrong-setup-secret")
+                    .body(Body::from(
+                        serde_json::json!({"server_id": online_server_id}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        drop(daemon_control);
+        relay_server.abort();
+        let _ = fs::remove_file(registry_path);
+    }
+
+    #[tokio::test]
+    async fn open_relay_daemon_status_allows_no_setup_token() {
+        let server_id = ServerId::new();
+        let state = RelayState::new();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_state = state.clone();
+        let relay_server = tokio::spawn(async move {
+            axum::serve(listener, router(server_state, false))
+                .await
+                .unwrap();
+        });
+        let (mut daemon_control, _) = connect_async(format!("ws://{addr}/ws")).await.unwrap();
+        register_route(&mut daemon_control, server_id, RouteRole::DaemonControl).await;
+
+        let response = router(state, false)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/relay/daemon/status")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"server_id": server_id}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["server_id"], server_id.0.to_string());
+        assert_eq!(body["connected"], true);
+
+        drop(daemon_control);
+        relay_server.abort();
+    }
+
+    #[tokio::test]
+    async fn daemon_status_fails_closed_when_admission_state_is_unavailable() {
+        let server_id = ServerId::new();
+        let state = RelayState::new();
+        state.poison_admission_lock();
+
+        let response = router(state, false)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/relay/daemon/status")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"server_id": server_id}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["code"], "relay_status_unavailable");
     }
 
     #[tokio::test]

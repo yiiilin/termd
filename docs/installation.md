@@ -201,10 +201,9 @@ sudo ./termrelay-linux-amd64 install --web --listen 127.0.0.1:8080
 termrelay --version
 sudo systemctl is-active termrelay
 curl -fsS http://127.0.0.1:8080/healthz | python3 -m json.tool
-sudo ls -l /etc/termd/termrelay_setup_token
 ```
 
-安装器创建 `/etc/termd/termrelay_setup_token` 和 `/var/lib/termrelay/daemon-registry.json`。setup token 只用于注册 daemon，不要放进 URL、argv、聊天或日志。
+安装器创建 `/etc/termd/termrelay_setup_token` 和 `/var/lib/termrelay/daemon-registry.json`，并在成功结尾直接打印当前 setup token（新装和升级都一样）。输出会明确标记为敏感值；只通过 SSH 终端、密码管理器等受控通道传给 daemon 主机，不要放进 URL、聊天或普通日志。使用 `--allow-open-relay` 时没有 setup token，安装器会明确说明不适用。
 
 按[公网部署方案](deployment.md#tls-与反向代理)配置 `relay.example.com:443` 的 TLS 反向代理，再验证：
 
@@ -214,38 +213,53 @@ curl -fsS https://relay.example.com/healthz | python3 -m json.tool
 
 `relay.example.com` 必须先替换成真实域名。
 
-### 2. 安全传送 setup token
-
-通过 SSH、密码管理器或其他受控通道，把 relay 主机的 setup token 文件内容传到 daemon 主机。daemon 主机上的目标必须是 root-only 临时文件。例如收到文件后：
-
-```bash
-sudo install -m 0600 /secure/received/termrelay_setup_token \
-  /run/termd-relay-setup-token
-```
-
-`/secure/received/termrelay_setup_token` 是占位路径，必须替换。不要把 token 直接写在 shell 命令行中。
-
-### 3. 安装并注册 daemon
+### 2. 安装 daemon，并隐藏输入 setup token
 
 在 daemon 主机的普通登录用户 shell 执行：
 
 ```bash
 ./termd-linux-amd64 install --dry-run \
-      --web \
-      --user "$(id -un)" \
-      --relay wss://relay.example.com \
-      --relay-setup-token-file /run/termd-relay-setup-token
+  --web \
+  --user "$(id -un)" \
+  --relay wss://relay.example.com
 sudo ./termd-linux-amd64 install \
-      --web \
-      --user "$(id -un)" \
-      --relay wss://relay.example.com \
-      --relay-setup-token-file /run/termd-relay-setup-token
+  --web \
+  --user "$(id -un)" \
+  --relay wss://relay.example.com
+```
+
+dry-run 不读取 token，只会说明正式安装将询问。正式安装确认计划后显示 `Relay setup token (input hidden):`；粘贴 relay 安装器打印的 token 并回车，输入不会回显。`wss://relay.example.com` 必须替换成真实 relay URL。
+
+安装器会生成 `/etc/termd/termd_daemon_token`，并把 daemon token hash 与 daemon public key 注册到 relay；setup token 只用于这次 identity 注册。relay 不保存 pair ticket、device certificate 或设备私钥。
+
+### 3. 非交互安装
+
+非交互执行必须显式选择一种 token 来源：
+
+- `--relay-token <TOKEN>`：直接参数，适合受控自动化，但会短暂出现在调用进程 argv，且可能进入 shell history。
+- `--relay-setup-token-file <PATH>`：推荐的自动化方式；文件应归 root 所有且权限为 `0600`。
+- `--allow-open-relay`：仅当 relay 也明确使用 open 模式时与 `--relay` 同时传入；该模式不提示 setup token，也不能与两种 token 参数并用。
+
+token 文件方式示例：
+
+```bash
+sudo install -m 0600 /secure/received/termrelay_setup_token /run/termd-relay-setup-token
+sudo ./termd-linux-amd64 install \
+  --yes \
+  --web \
+  --user "$(id -un)" \
+  --relay wss://relay.example.com \
+  --relay-setup-token-file /run/termd-relay-setup-token
 sudo rm -f /run/termd-relay-setup-token
 ```
 
-`wss://relay.example.com` 必须替换成真实 relay URL。安装器会生成 `/etc/termd/termd_daemon_token`，并把 daemon token hash 与 daemon public key 注册到 relay；它不会把 pair ticket、device certificate 或设备私钥存到 relay。
+`/secure/received/termrelay_setup_token` 是占位路径，必须替换。直接 token 与 token 文件不能同时提供。未显式传 `--relay` 的普通升级不会要求重新输入 setup token。
 
 ### 4. 端到端验证与配对
+
+注册完成后，安装器读取本机 `/healthz` 的 `server_id`，再向 relay 查询这个 id 的 control 连接；不会用其他 daemon 在线或全局连接数冒充。trusted relay 的查询仍需 setup token；显式 open relay 查询不带 token。成功时打印 `SUCCESS: daemon ... is connected to relay ...`；超时则打印 `FAILED`。随后安装器实际执行 `termd pair --qr --url <LOCAL_URL>`，直接输出二维码和 `termd-pair:v2:...` 邀请码。
+
+本机 health、relay control 或 pairing 任一失败时，安装命令以非零状态结束，并打印 `local service installed but post-install verification/pairing failed`。这表示二进制和 systemd service 已落盘，不会伪装成回滚成功；按紧随其后的 `retry with:`/`then run:` 命令修复并重试。
 
 ```bash
 termd --version

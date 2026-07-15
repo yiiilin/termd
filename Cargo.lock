@@ -1935,6 +1935,9 @@ dependencies = [
 [[package]]
 name = "terminstall"
 version = "0.8.4"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "termrelay"

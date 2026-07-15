@@ -522,11 +522,27 @@ impl RelayState {
         self.inner.daemon_control_stats()
     }
 
-    pub fn trusted_admission_enabled(&self) -> bool {
+    pub fn daemon_control_connected(&self, server_id: ServerId) -> Option<bool> {
+        self.inner.daemon_control_connected(server_id)
+    }
+
+    pub fn trusted_admission_mode(&self) -> Result<bool, RegisterDaemonError> {
         self.admission
             .read()
             .map(|admission| admission.trusted)
-            .unwrap_or(false)
+            .map_err(|_| RegisterDaemonError::Poisoned)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn poison_admission_lock(&self) {
+        let admission = Arc::clone(&self.admission);
+        let _ = std::thread::spawn(move || {
+            let _guard = admission
+                .write()
+                .expect("test should acquire admission lock");
+            panic!("poison relay admission lock for testing");
+        })
+        .join();
     }
 
     pub fn register_daemon(
@@ -535,17 +551,7 @@ impl RelayState {
         daemon_token: String,
         setup_token: Option<&str>,
     ) -> Result<RegisterDaemonOutcome, RegisterDaemonError> {
-        let expected_setup_token = self
-            .setup_token
-            .as_deref()
-            .ok_or(RegisterDaemonError::SetupTokenNotConfigured)?;
-        let provided_setup_token = setup_token.ok_or(RegisterDaemonError::SetupTokenMissing)?;
-        if !relay_auth_token_has_safe_length(expected_setup_token)
-            || !relay_auth_token_has_safe_length(provided_setup_token)
-            || !relay_auth_token_constant_time_eq(expected_setup_token, provided_setup_token)
-        {
-            return Err(RegisterDaemonError::SetupTokenRejected);
-        }
+        self.authorize_setup_token(setup_token)?;
         if !relay_auth_token_has_safe_length(&daemon_token) {
             return Err(RegisterDaemonError::DaemonTokenTooShort);
         }
@@ -575,6 +581,24 @@ impl RelayState {
             server_id,
             replaced,
         })
+    }
+
+    pub fn authorize_setup_token(
+        &self,
+        setup_token: Option<&str>,
+    ) -> Result<(), RegisterDaemonError> {
+        let expected_setup_token = self
+            .setup_token
+            .as_deref()
+            .ok_or(RegisterDaemonError::SetupTokenNotConfigured)?;
+        let provided_setup_token = setup_token.ok_or(RegisterDaemonError::SetupTokenMissing)?;
+        if !relay_auth_token_has_safe_length(expected_setup_token)
+            || !relay_auth_token_has_safe_length(provided_setup_token)
+            || !relay_auth_token_constant_time_eq(expected_setup_token, provided_setup_token)
+        {
+            return Err(RegisterDaemonError::SetupTokenRejected);
+        }
+        Ok(())
     }
 
     pub fn register_daemon_identity(

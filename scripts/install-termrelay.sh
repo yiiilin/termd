@@ -973,6 +973,29 @@ uninstall_component() {
   log "uninstalled ${BIN_NAME}"
 }
 
+print_relay_setup_token() {
+  local token
+
+  if ! trusted_registry_defaults_enabled; then
+    log "open relay mode is enabled; no trusted relay setup token applies"
+    return 0
+  fi
+  if [[ -z "${TERMRELAY_SETUP_TOKEN_FILE:-}" || ! -r "$TERMRELAY_SETUP_TOKEN_FILE" ]]; then
+    log "trusted relay is installed, but its setup token file is unreadable"
+    return 1
+  fi
+  IFS= read -r token <"$TERMRELAY_SETUP_TOKEN_FILE" || true
+  if [[ -z "$token" ]]; then
+    log "trusted relay is installed, but its setup token is empty"
+    return 1
+  fi
+
+  log "SENSITIVE relay setup token (share only through a secure channel):"
+  printf '%s\n' "$token"
+  log "on the termd host, run 'sudo termd install --relay <WS_URL>' and enter this token when prompted"
+  log "automation may use '--relay-token <TOKEN>'; '--relay-setup-token-file <PATH>' avoids shell history and process-list exposure"
+}
+
 main() {
   parse_args "$@"
   validate_internal_install_request
@@ -1012,10 +1035,7 @@ main() {
   trap - EXIT
 
   log "installed ${BIN_NAME} ${VERSION} and started ${SERVICE_NAME}.service"
-  if [[ -r "${TERMRELAY_SETUP_TOKEN_FILE:-}" ]]; then
-    log "relay setup token file: ${TERMRELAY_SETUP_TOKEN_FILE}"
-    log "read it locally with: sudo cat ${TERMRELAY_SETUP_TOKEN_FILE}"
-  fi
+  print_relay_setup_token || die "failed to report the trusted relay setup token"
 }
 
 main "$@"
