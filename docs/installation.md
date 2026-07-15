@@ -6,11 +6,11 @@
 
 | 平台 | 安装方式 | 说明 |
 | --- | --- | --- |
-| Linux x86_64/amd64 + systemd | 预编译 release | 推荐；安装器校验 release checksum |
+| Linux x86_64/amd64 + systemd | 预编译 release | 推荐；下载后先校验 release checksum，再运行内嵌 installer |
 | Linux arm64/aarch64 + systemd | 源码编译 fallback | 需要 Rust 1.85+；Web 构建还需要 Node.js 22 + npm |
 | 非 Linux 或无 systemd | 不支持一键安装 | 可用于开发，但本文的 service 命令不适用 |
 
-安装器必须以 root 运行，并依赖 `install`、`tar`、`sha256sum`、`python3`、`systemctl`、`useradd` 以及 `curl` 或 `wget`。Ubuntu/Debian x86_64 可先安装基础依赖：
+实际安装必须以 root 运行，并依赖 `install`、`python3`、`systemctl` 和 `useradd`；下载和校验还需要 `curl` 与 `sha256sum`。Ubuntu/Debian x86_64 可先安装基础依赖：
 
 ```bash
 sudo apt-get update
@@ -18,42 +18,63 @@ sudo apt-get install -y \
   ca-certificates coreutils curl findutils gawk grep passwd python3 sed tar
 ```
 
-x86_64 安装器在 release archive 或 checksum 无法下载、缺失或校验失败时也会回退到源码编译。要让该回退可用，还需预装 Git、Rust 1.85+ 和系统构建工具；使用 `--web` 时还需 Node.js 22 与 npm。否则安装器会停止并保留原有安装，不会跳过 checksum 继续使用下载文件。
+x86_64 的主流程直接下载自带 installer 的 release binary；checksum 缺失或校验失败时必须停止，不能继续执行。兼容 `install-*.sh` 仍会在预编译 archive 不可用时回退到源码编译；该路径还需 Git、Rust 1.85+、系统构建工具，以及 Web 构建所需的 Node.js 22 与 npm。
+
+## 下载并校验 Linux amd64 release
+
+先把 `component` 设为当前要安装的 `termd`、`termrelay` 或 `termctl`，再逐步下载、校验并检查帮助：
+
+```bash
+component=termd
+curl -fL "https://github.com/yiiilin/termd/releases/latest/download/${component}-linux-amd64" \
+  -o "${component}-linux-amd64"
+curl -fL https://github.com/yiiilin/termd/releases/latest/download/checksums.txt \
+  -o checksums.txt
+sha256sum --ignore-missing --check checksums.txt
+chmod 0755 "${component}-linux-amd64"
+"./${component}-linux-amd64" --version
+"./${component}-linux-amd64" install --help
+```
+
+checksum 输出必须包含对应文件的 `OK`；否则删除下载文件并停止。后续各节使用同一目录里的已校验二进制。安装完成后可以删除下载文件和 `checksums.txt`。
 
 ## 通过代理安装
 
-三个 release installer 都支持标准的 `http_proxy`、`https_proxy`、`all_proxy` 和 `no_proxy` 环境变量，也接受对应的大写形式。大小写同时存在时以小写值为准。代理会用于 release 查询、archive/checksum 下载，以及 arm64 或下载失败后的 Git、Cargo 和 npm 源码构建。
+`curl` 支持标准的 `http_proxy`、`https_proxy`、`all_proxy` 和 `no_proxy` 环境变量，也接受对应的大写形式。内嵌 installer 直接复制当前已校验二进制，不再联网，因此不需要把下载代理传给 sudo。兼容 `install-*.sh` 也支持这些变量，并会把它们用于 release 下载及 arm64 的 Git、Cargo 和 npm 源码构建。
 
-`sudo` 默认可能丢弃代理变量。先在普通用户 shell 导出变量，再只允许 sudo 保留这些变量：
+先在普通用户 shell 导出代理，再执行上一节的下载和校验命令：
 
 ```bash
 export http_proxy=http://127.0.0.1:7890
 export https_proxy="$http_proxy"
 export no_proxy=127.0.0.1,localhost
 
-curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termd.sh \
-  | sudo --preserve-env=http_proxy,https_proxy,all_proxy,no_proxy \
-      bash -s -- --web --user "$(id -un)"
+component=termd
+curl -fL "https://github.com/yiiilin/termd/releases/latest/download/${component}-linux-amd64" \
+  -o "${component}-linux-amd64"
+curl -fL https://github.com/yiiilin/termd/releases/latest/download/checksums.txt \
+  -o checksums.txt
+sha256sum --ignore-missing --check checksums.txt
+chmod 0755 "${component}-linux-amd64"
+sudo ./termd-linux-amd64 install --web --user "$(id -un)"
 ```
 
-第一段 `curl` 使用当前用户导出的代理，sudo 后的 installer 继续使用同一组变量。`no_proxy` 应至少保留 `127.0.0.1,localhost`，否则安装后的本机 health、pairing 和 relay 注册检查可能被送进代理。安装 `termrelay` 或 `termctl` 时使用相同写法，只替换 installer URL 和参数。
+两个 `curl` 使用当前用户导出的代理；内嵌 installer 不使用该下载代理。`no_proxy` 应至少保留 `127.0.0.1,localhost`，避免后续本机 health、pairing 和 relay 注册检查被送进代理。安装 `termrelay` 或 `termctl` 时只替换 `component` 和安装参数。
 
 这些变量负责安装过程的联网。若 `termd` 运行后连接 relay 也必须长期经过代理，安装时另加 `--proxy <URL>`，或在 `/etc/termd/termd.env` 中配置 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 和 `NO_PROXY` 后重启服务。包含账号密码的代理 URL 属于敏感信息，不要写入 issue、聊天或共享日志。
 
-## 下一 release 与源码构建
+## 源码构建与兼容脚本
 
-截至 0.8.2，GitHub `latest` 只提供版本化 tarball 和 `install-*.sh`，不提供 `termd-linux-amd64` 等稳定名称的 raw binary；本页当前安装、升级和卸载命令因此继续使用 release script。
-
-当前源码构建出的三个二进制已经支持内嵌 installer。完成 Web 构建和 Rust release build 后，可先用无副作用计划检查参数，再执行安装：
+源码构建出的三个二进制同样包含 installer。完成 Web 构建和 Rust release build 后，可先用无副作用计划检查参数，再执行安装：
 
 ```bash
 (cd termui/frontend && npm ci && npm run build)
 cargo build --release --locked -p termd -p termrelay -p termctl
-sudo target/release/termd install --dry-run --web --user "$(id -un)"
-sudo target/release/termd install --yes --web --user "$(id -un)"
+target/release/termd install --dry-run --web --user "$(id -un)"
+sudo target/release/termd install --web --user "$(id -un)"
 ```
 
-包含本改动的下一 release 会同时发布可校验的稳定名称 raw binary，届时才能把下载后的 `<binary> install|uninstall` 作为 release 安装入口。`--yes` 只确认普通安装计划；supervisor compatibility 确实变化且允许丢失 session 时，仍必须单独显式传 `--allow-session-loss`。
+`install-*.sh` 继续作为 arm64 源码 fallback 和旧自动化的兼容入口。非交互环境可在审阅 `--dry-run` 后传 `--yes`；它只确认普通安装计划。supervisor compatibility 确实变化且允许丢失 session 时，仍必须单独显式传 `--allow-session-loss`。
 
 ### Linux arm64
 
@@ -105,8 +126,8 @@ curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-ter
 从要运行 session 的普通 Linux 用户 shell 执行：
 
 ```bash
-curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termd.sh \
-  | sudo bash -s -- --web --user "$(id -un)"
+./termd-linux-amd64 install --dry-run --web --user "$(id -un)"
+sudo ./termd-linux-amd64 install --web --user "$(id -un)"
 ```
 
 `--user "$(id -un)"` 让 Web 创建的 session 使用当前用户的 HOME 和 login shell。省略它会使用受限的 `termd` system user。
@@ -145,8 +166,8 @@ ssh -N -L 8765:127.0.0.1:8765 alice@terminal-host
 仅在确认网络可信且有防火墙限制时使用：
 
 ```bash
-curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termd.sh \
-  | sudo bash -s -- --web --user "$(id -un)" --listen 0.0.0.0:8765
+./termd-linux-amd64 install --dry-run --web --user "$(id -un)" --listen 0.0.0.0:8765
+sudo ./termd-linux-amd64 install --web --user "$(id -un)" --listen 0.0.0.0:8765
 ```
 
 从其他设备打开 `http://DAEMON_LAN_IP:8765`。`DAEMON_LAN_IP` 是占位符，**必须替换成 daemon 的真实 LAN/VPN 地址，不能原样使用**。该路径是明文 HTTP，可信 relay 也不是它的自动 TLS 层；不要通过路由器端口转发把 8765 暴露到互联网。
@@ -174,8 +195,8 @@ curl -fsS http://127.0.0.1:8765/healthz | python3 -m json.tool
 在 relay 主机执行：
 
 ```bash
-curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termrelay.sh \
-  | sudo bash -s -- --web --listen 127.0.0.1:8080
+./termrelay-linux-amd64 install --dry-run --web --listen 127.0.0.1:8080
+sudo ./termrelay-linux-amd64 install --web --listen 127.0.0.1:8080
 
 termrelay --version
 sudo systemctl is-active termrelay
@@ -209,8 +230,12 @@ sudo install -m 0600 /secure/received/termrelay_setup_token \
 在 daemon 主机的普通登录用户 shell 执行：
 
 ```bash
-curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termd.sh \
-  | sudo bash -s -- \
+./termd-linux-amd64 install --dry-run \
+      --web \
+      --user "$(id -un)" \
+      --relay wss://relay.example.com \
+      --relay-setup-token-file /run/termd-relay-setup-token
+sudo ./termd-linux-amd64 install \
       --web \
       --user "$(id -un)" \
       --relay wss://relay.example.com \
@@ -236,8 +261,8 @@ curl -fsS https://relay.example.com/healthz | python3 -m json.tool
 `termctl` 主要用于配对和诊断，不是 Web 的替代安装条件：
 
 ```bash
-curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termctl.sh \
-  | sudo bash
+./termctl-linux-amd64 install --dry-run
+sudo ./termctl-linux-amd64 install
 termctl --version
 ```
 
@@ -248,8 +273,8 @@ termctl --version
 重复运行原安装命令。显式传入的 `--web`、`--listen`、`--user` 会更新对应设置；未传入的设置沿用 `/etc/termd/termd.env` 和现有 systemd user。
 
 ```bash
-curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termd.sh \
-  | sudo bash -s -- --web --user "$(id -un)"
+./termd-linux-amd64 install --dry-run --web --user "$(id -un)"
+sudo ./termd-linux-amd64 install --web --user "$(id -un)"
 ```
 
 升级前后都执行：
@@ -266,10 +291,10 @@ installer 默认保留 daemon identity、已配对设备、配置和 `/var/lib/t
 
 顺序固定为：
 
-1. 在 relay 主机重复运行 `install-termrelay.sh`。
+1. 在 relay 主机重新下载并校验 `termrelay-linux-amd64`，再运行其 `install` 子命令。
 2. 验证本机和公网 `/healthz`。
 3. 安全复制 setup token 到 daemon 主机的 root-only 临时文件。
-4. 在 daemon 主机重复运行 `install-termd.sh --relay ... --relay-setup-token-file ...`。
+4. 在 daemon 主机重新下载并校验 `termd-linux-amd64`，再按原参数运行其 `install` 子命令。
 5. 删除临时 setup token，并验证 daemon health、relay health 和 Web attach。
 
 这样 relay registry 会包含当前 daemon public key。不要只升级 Web/relay 而长期混跑不同 release 的 daemon 和 client。
@@ -279,21 +304,16 @@ installer 默认保留 daemon identity、已配对设备、配置和 `/var/lib/t
 默认卸载程序与 service，但保留状态，便于重装：
 
 ```bash
-curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termd.sh \
-  | sudo bash -s -- --uninstall
-curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termrelay.sh \
-  | sudo bash -s -- --uninstall
-curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termctl.sh \
-  | sudo bash -s -- --uninstall
+sudo termd uninstall
+sudo termrelay uninstall
+sudo termctl uninstall
 ```
 
 `--purge` 会不可恢复地删除 identity、已配对设备、registry 和 session 状态，并可能终止仍在使用的 session。只有确认备份和影响后才执行：
 
 ```bash
-curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termd.sh \
-  | sudo bash -s -- --uninstall --purge
-curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termrelay.sh \
-  | sudo bash -s -- --uninstall --purge
+sudo termd uninstall --purge
+sudo termrelay uninstall --purge
 ```
 
 ## 故障排查
@@ -318,7 +338,7 @@ sudo ss -ltnp | grep -E ':(8765|8080)'
 
 ### 旧安装器报 `BASH_SOURCE[0]: unbound variable`
 
-这是旧 release installer 从 stdin/pipe 执行时的错误。使用包含该修复的新 release，再按本文的 `curl ... | sudo bash -s -- ...` 命令重试。不要为绕过它改成来源不明的脚本副本。
+这是旧 release installer 从 stdin/pipe 执行时的错误。amd64 请改用本文的已校验 raw binary 和内嵌 installer；arm64 请重新下载当前 `install-termd.sh`。不要为绕过它改用来源不明的脚本副本。
 
 ### 旧 0.8.1 fresh install 反复重启
 

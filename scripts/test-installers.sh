@@ -90,13 +90,11 @@ grep -Fq '"terminstall/Cargo.toml"' "${ROOT_DIR}/.github/workflows/release.yml"
 grep -Fq 'install -m 0755 "$binary_path" "$out_dir/${binary}-linux-amd64"' "${ROOT_DIR}/.github/workflows/release.yml"
 grep -Fq 'sha256sum *-linux-amd64 *.tar.gz > checksums.txt' "${ROOT_DIR}/.github/workflows/release.yml"
 grep -Fq 'files=(*-linux-amd64 *.tar.gz checksums.txt install-*.sh)' "${ROOT_DIR}/.github/workflows/release.yml"
-if grep -Eq 'releases/latest/download/[^[:space:]"]*-linux-amd64' \
-  "${ROOT_DIR}/README.md" "${ROOT_DIR}/docs/installation.md"; then
-  printf '0.8.2 documentation must use install-*.sh instead of unavailable raw latest assets\n' >&2
-  exit 1
-fi
-grep -Fq 'releases/latest/download/install-termd.sh' "${ROOT_DIR}/README.md"
-grep -Fq 'releases/latest/download/install-termrelay.sh' "${ROOT_DIR}/docs/installation.md"
+grep -Fq 'releases/latest/download/termd-linux-amd64' "${ROOT_DIR}/README.md"
+grep -Fq 'releases/latest/download/${component}-linux-amd64' "${ROOT_DIR}/docs/installation.md"
+grep -Fq 'sha256sum --ignore-missing --check checksums.txt' "${ROOT_DIR}/README.md"
+grep -Fq 'sha256sum --ignore-missing --check checksums.txt' "${ROOT_DIR}/docs/installation.md"
+grep -Fq 'releases/latest/download/install-termd.sh' "${ROOT_DIR}/docs/installation.md"
 test -s "${ROOT_DIR}/SUPERVISOR_VERSION"
 python3 - "${ROOT_DIR}" <<'PY'
 import json

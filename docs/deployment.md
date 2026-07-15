@@ -211,9 +211,9 @@ daemon registry JSON 示例：
 
 ## 升级顺序
 
-1. 先在 relay 主机重复运行当前 `install-termrelay.sh`，确认本机和公网 `GET /healthz` 正常。
+1. 先在 relay 主机重新下载、校验并运行当前 `termrelay-linux-amd64 install`，确认本机和公网 `GET /healthz` 正常。
 2. 把 relay setup token 安全复制到 daemon 主机的 root-only 临时文件。
-3. 再运行当前 `install-termd.sh --relay ... --relay-setup-token-file ...`，重新注册 daemon token hash 与 daemon public key。
+3. 再下载、校验并运行当前 `termd-linux-amd64 install --relay ... --relay-setup-token-file ...`，重新注册 daemon token hash 与 daemon public key。
 4. 删除 daemon 主机上的临时 setup token，重新加载 Web，并验证已有 session attach。
 
 installer 保留 daemon identity、配对设备和普通配置。supervisor compatibility 相同时不会清空既有 session；如果 release 确实改变 compatibility，installer 会先说明影响并要求确认。不要根据旧版本号手工删除 session、SQLite 或 supervisor socket。可复制的完整命令见[公网 trusted relay：两主机流程](installation.md#公网-trusted-relay两主机流程)。
@@ -240,7 +240,7 @@ installer 保留 daemon identity、配对设备和普通配置。supervisor comp
 
 ## installer 与 service 行为
 
-release 资产和 GHCR 镜像由同一个 tag 驱动。当前 latest 0.8.2 使用 `install-*.sh`；包含本改动的下一 release 才会同时发布稳定名称的 raw binary 及其内嵌 installer。直接运行源码树中的模板脚本时需要 `TERMD_GITHUB_REPO=owner/repo`。
+release 资产和 GHCR 镜像由同一个 tag 驱动。Linux amd64 优先下载稳定名称的 raw binary、校验 `checksums.txt`，再运行其内嵌 installer；`install-*.sh` 保留为 arm64 源码 fallback 和旧自动化兼容入口。直接运行源码树中的模板脚本时需要 `TERMD_GITHUB_REPO=owner/repo`。
 
 - `termd` installer 创建 `termd.service` 和 `/etc/termd/termd.env`。`KillMode=process` 使普通 daemon restart 不会把独立 supervisor 一起终止。
 - `termrelay` installer 创建 `termrelay.service`、setup token 和 daemon registry；relay 本身不承担 supervisor 生命周期。
