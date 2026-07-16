@@ -1817,6 +1817,37 @@ read_relay_setup_token() {
   read_first_line "$TERMD_RELAY_SETUP_TOKEN_FILE"
 }
 
+relay_setup_token_is_safe() {
+  local token="$1"
+
+  [[ -n "$token" && "$token" != *$'\r'* && "$token" != *$'\n'* ]]
+}
+
+relay_curl_url_is_safe() {
+  local url="$1"
+
+  [[ -n "$url" && "$url" != *$'\r'* && "$url" != *$'\n'* ]]
+}
+
+write_relay_curl_header_file() {
+  local path="$1"
+  local setup_token="$2"
+  local old_umask
+
+  relay_setup_token_is_safe "$setup_token" || return 1
+  old_umask="$(umask)"
+  umask 077
+  if ! {
+    printf 'content-type: application/json\n'
+    printf 'x-termd-relay-setup-token: %s\n' "$setup_token"
+  } >"$path"; then
+    umask "$old_umask"
+    return 1
+  fi
+  umask "$old_umask"
+  chmod 0600 "$path"
+}
+
 validate_relay_install_mode() {
   if [[ "$INSTALL_SET_RELAY_URLS" -eq 1 && -z "${TERMD_RELAY_SETUP_TOKEN:-}" && -z "${TERMD_RELAY_SETUP_TOKEN_FILE:-}" ]]; then
     die "trusted relay setup token is required; use --relay-token or --relay-setup-token-file with the termd install command"
@@ -1831,8 +1862,10 @@ relay_connection_verification_requested() {
 
 register_daemon_with_relay() (
   local health_response="$1"
-  local server_id daemon_public_key relay_url register_url setup_token tmp_dir curl_config payload_file
+  local server_id daemon_public_key relay_url register_url setup_token tmp_dir header_file payload_file
   tmp_dir=""
+  setup_token=""
+  export -n TERMD_RELAY_SETUP_TOKEN setup_token
   cleanup_relay_registration_files() {
     [[ -z "$tmp_dir" ]] || rm -rf -- "$tmp_dir"
   }
@@ -1841,6 +1874,10 @@ register_daemon_with_relay() (
   trap 'exit 143' TERM
 
   [[ -n "${TERMD_RELAY_URLS:-}" ]] || return 0
+  if ! relay_curl_url_is_safe "$TERMD_RELAY_URLS"; then
+    log "relay URL contains CR/LF"
+    return 1
+  fi
   if [[ -z "${TERMD_RELAY_SETUP_TOKEN:-}" && -z "${TERMD_RELAY_SETUP_TOKEN_FILE:-}" ]]; then
     warn_missing_relay_registration_token
     return 0
@@ -1849,8 +1886,8 @@ register_daemon_with_relay() (
     log "relay setup token was provided, but daemon token file is missing"
     return 1
   }
-  if ! setup_token="$(read_relay_setup_token)" || [[ -z "$setup_token" ]]; then
-    log "relay setup token is empty or unreadable"
+  if ! setup_token="$(read_relay_setup_token)" || ! relay_setup_token_is_safe "$setup_token"; then
+    log "relay setup token is empty, unreadable, or contains CR/LF"
     return 1
   fi
 
@@ -1862,6 +1899,10 @@ register_daemon_with_relay() (
   [[ -n "$relay_url" ]] || return 0
   if ! register_url="$(relay_api_url "$relay_url" "/api/relay/daemon/register")"; then
     log "cannot derive relay registration URL from ${relay_url}"
+    return 1
+  fi
+  if ! relay_curl_url_is_safe "$register_url"; then
+    log "relay registration URL contains CR/LF"
     return 1
   fi
 
@@ -1878,7 +1919,7 @@ register_daemon_with_relay() (
     log "failed to secure temporary directory for relay registration"
     return 1
   fi
-  curl_config="${tmp_dir}/curl.conf"
+  header_file="${tmp_dir}/headers"
   payload_file="${tmp_dir}/register.json"
   if ! python3 - "$server_id" "$daemon_public_key" "$TERMD_RELAY_DAEMON_TOKEN_FILE" >"$payload_file" <<'PY'
 import json
@@ -1898,25 +1939,15 @@ PY
     log "failed to secure relay registration payload"
     return 1
   fi
-  if ! {
-    printf 'url = "%s"\n' "$register_url"
-    printf 'request = "POST"\n'
-    printf 'fail\n'
-    printf 'silent\n'
-    printf 'show-error\n'
-    printf 'header = "content-type: application/json"\n'
-    printf 'header = "x-termd-relay-setup-token: %s"\n' "$setup_token"
-    printf 'data-binary = "@%s"\n' "$payload_file"
-  } >"$curl_config"; then
+  if ! write_relay_curl_header_file "$header_file" "$setup_token"; then
     log "failed to prepare relay registration request"
     return 1
   fi
-  if ! chmod 0600 "$curl_config"; then
-    log "failed to secure relay registration request"
-    return 1
-  fi
 
-  if ! curl --disable --config "$curl_config" >/dev/null; then
+  if ! curl --disable --globoff --fail --silent --show-error --request POST \
+    --header "@${header_file}" \
+    --data-binary "@${payload_file}" \
+    --url "$register_url" >/dev/null; then
     log "relay registration failed at ${register_url}"
     return 1
   fi
@@ -1925,8 +1956,10 @@ PY
 
 verify_daemon_relay_connected() (
   local health_response="$1"
-  local server_id relay_url status_url setup_token tmp_dir curl_config payload_file response connected
+  local server_id relay_url status_url setup_token tmp_dir header_file payload_file response connected
   tmp_dir=""
+  setup_token=""
+  export -n TERMD_RELAY_SETUP_TOKEN setup_token
   cleanup_relay_status_files() {
     [[ -z "$tmp_dir" ]] || rm -rf -- "$tmp_dir"
   }
@@ -1935,6 +1968,10 @@ verify_daemon_relay_connected() (
   trap 'exit 143' TERM
 
   [[ -n "${TERMD_RELAY_URLS:-}" ]] || return 0
+  if ! relay_curl_url_is_safe "$TERMD_RELAY_URLS"; then
+    log "FAILED: relay URL contains CR/LF"
+    return 1
+  fi
   server_id="$(printf '%s' "$health_response" | python3 -c 'import json,sys; print(json.load(sys.stdin)["server_id"])')" || return 1
   read -r -a relay_urls <<<"${TERMD_RELAY_URLS}"
   relay_url="${relay_urls[0]:-}"
@@ -1943,9 +1980,12 @@ verify_daemon_relay_connected() (
     log "FAILED: cannot derive relay status URL from ${relay_url}"
     return 1
   fi
-  setup_token=""
-  if ! setup_token="$(read_relay_setup_token)" || [[ -z "$setup_token" ]]; then
-    log "FAILED: relay setup token is empty or unreadable"
+  if ! relay_curl_url_is_safe "$status_url"; then
+    log "FAILED: relay status URL contains CR/LF"
+    return 1
+  fi
+  if ! setup_token="$(read_relay_setup_token)" || ! relay_setup_token_is_safe "$setup_token"; then
+    log "FAILED: relay setup token is empty, unreadable, or contains CR/LF"
     return 1
   fi
   if ! command -v curl >/dev/null 2>&1; then
@@ -1961,7 +2001,7 @@ verify_daemon_relay_connected() (
     log "FAILED: failed to secure temporary directory for relay verification"
     return 1
   fi
-  curl_config="${tmp_dir}/curl.conf"
+  header_file="${tmp_dir}/headers"
   payload_file="${tmp_dir}/status.json"
   if ! printf '{"server_id":"%s"}\n' "$server_id" >"$payload_file"; then
     log "FAILED: failed to prepare relay verification payload"
@@ -1971,28 +2011,16 @@ verify_daemon_relay_connected() (
     log "FAILED: failed to secure relay verification payload"
     return 1
   fi
-  if ! {
-    printf 'url = "%s"\n' "$status_url"
-    printf 'request = "POST"\n'
-    printf 'fail\n'
-    printf 'silent\n'
-    printf 'show-error\n'
-    printf 'header = "content-type: application/json"\n'
-    if [[ -n "$setup_token" ]]; then
-      printf 'header = "x-termd-relay-setup-token: %s"\n' "$setup_token"
-    fi
-    printf 'data-binary = "@%s"\n' "$payload_file"
-  } >"$curl_config"; then
+  if ! write_relay_curl_header_file "$header_file" "$setup_token"; then
     log "FAILED: failed to prepare relay verification request"
-    return 1
-  fi
-  if ! chmod 0600 "$curl_config"; then
-    log "FAILED: failed to secure relay verification request"
     return 1
   fi
 
   for _ in {1..40}; do
-    if response="$(curl --disable --config "$curl_config" 2>/dev/null)" && \
+    if response="$(curl --disable --globoff --fail --silent --show-error --request POST \
+      --header "@${header_file}" \
+      --data-binary "@${payload_file}" \
+      --url "$status_url" 2>/dev/null)" && \
       connected="$(printf '%s' "$response" | python3 -c 'import json,sys; payload=json.load(sys.stdin); print("true" if payload.get("server_id") == sys.argv[1] and payload.get("connected") is True else "false")' "$server_id")" && \
       [[ "$connected" == "true" ]]; then
       log "SUCCESS: daemon ${server_id} is connected to relay ${relay_url}"

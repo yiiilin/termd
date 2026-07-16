@@ -526,6 +526,39 @@ test_termrelay_old_open_env_migrates_to_trusted_files() (
   [[ "$(sha256sum "$TERMRELAY_DAEMON_REGISTRY")" == "$registry_before" ]]
 )
 
+assert_secure_relay_curl_invocation() {
+  local expected_url="$1"
+  local expected_setup_token="$2"
+  shift 2
+  local argument header_file payload_file expected_headers token_declaration
+
+  [[ "$#" -eq 13 ]]
+  [[ "$1" == "--disable" ]]
+  [[ "$2" == "--globoff" ]]
+  [[ "$3" == "--fail" && "$4" == "--silent" && "$5" == "--show-error" ]]
+  [[ "$6" == "--request" && "$7" == "POST" ]]
+  [[ "$8" == "--header" && "$9" == @* ]]
+  [[ "${10}" == "--data-binary" && "${11}" == @* ]]
+  [[ "${12}" == "--url" && "${13}" == "$expected_url" ]]
+  for argument in "$@"; do
+    [[ "$argument" != "--config" && "$argument" != "-K" ]]
+    [[ "$argument" != *"$expected_setup_token"* ]]
+  done
+
+  header_file="${9#@}"
+  payload_file="${11#@}"
+  [[ -f "$header_file" && "$(stat -c %a "$header_file")" == "600" ]]
+  [[ -f "$payload_file" && "$(stat -c %a "$payload_file")" == "600" ]]
+  printf -v expected_headers \
+    'content-type: application/json\nx-termd-relay-setup-token: %s' \
+    "$expected_setup_token"
+  [[ "$(<"$header_file")" == "$expected_headers" ]]
+  token_declaration="$(declare -p TERMD_RELAY_SETUP_TOKEN 2>/dev/null || true)"
+  [[ "$token_declaration" != "declare -x "* ]]
+
+  printf '%s' "$payload_file"
+}
+
 test_termd_relay_verification_requires_matching_server_id() (
   load_termd_installer_functions
 
@@ -536,8 +569,10 @@ test_termd_relay_verification_requires_matching_server_id() (
   unset TERMD_RELAY_SETUP_TOKEN_FILE
   sleep() { :; }
   curl() {
-    [[ "$#" -eq 3 && "$1" == "--disable" && "$2" == "--config" ]]
-    grep -Fq 'x-termd-relay-setup-token: relay-setup-secret' "$3"
+    assert_secure_relay_curl_invocation \
+      "https://relay.example/api/relay/daemon/status" \
+      "relay-setup-secret" \
+      "$@" >/dev/null
     printf '{"server_id":"00000000-0000-0000-0000-000000000002","connected":true}'
   }
 
@@ -548,8 +583,10 @@ test_termd_relay_verification_requires_matching_server_id() (
   [[ "$failed_output" == *"FAILED: daemon 00000000-0000-0000-0000-000000000001"* ]]
 
   curl() {
-    [[ "$#" -eq 3 && "$1" == "--disable" && "$2" == "--config" ]]
-    grep -Fq 'x-termd-relay-setup-token: relay-setup-secret' "$3"
+    assert_secure_relay_curl_invocation \
+      "https://relay.example/api/relay/daemon/status" \
+      "relay-setup-secret" \
+      "$@" >/dev/null
     printf '{"server_id":"00000000-0000-0000-0000-000000000001","connected":true}'
   }
   success_output="$(verify_daemon_relay_connected "$health_response")"
@@ -575,8 +612,121 @@ test_termd_relay_verification_requires_setup_token() (
     printf 'relay verification unexpectedly accepted a missing setup token\n' >&2
     return 1
   fi
-  [[ "$output" == *"FAILED: relay setup token is empty or unreadable"* ]]
+  [[ "$output" == *"FAILED: relay setup token is empty, unreadable, or contains CR/LF"* ]]
   [[ ! -e "$curl_marker" ]]
+)
+
+test_termd_relay_curl_treats_hostile_values_as_data() (
+  load_termd_installer_functions
+
+  local tmp_dir daemon_token_file hostile_token hostile_register_endpoint hostile_status_endpoint output
+  tmp_dir="$(mktemp -d)"
+  trap 'rm -rf "$tmp_dir"' EXIT
+  daemon_token_file="${tmp_dir}/daemon-token"
+  printf 'daemon-secret\n' >"$daemon_token_file"
+  hostile_token='relay-secret-" config = "/tmp/not-a-config" --config /tmp/not-a-config'
+  hostile_register_endpoint='https://{relay.example,attacker.example}/register[1-2]"--config=/tmp/not-a-config'
+  hostile_status_endpoint='https://{relay.example,attacker.example}/status[1-2]"--config=/tmp/not-a-config'
+  TERMD_RELAY_URLS="wss://relay.example/ws"
+  TERMD_RELAY_DAEMON_TOKEN_FILE="$daemon_token_file"
+  TERMD_RELAY_SETUP_TOKEN="$hostile_token"
+  unset TERMD_RELAY_SETUP_TOKEN_FILE
+  export TERMD_RELAY_SETUP_TOKEN
+  sleep() { :; }
+  relay_api_url() {
+    case "$2" in
+      /api/relay/daemon/register) printf '%s' "$hostile_register_endpoint" ;;
+      /api/relay/daemon/status) printf '%s' "$hostile_status_endpoint" ;;
+      *) return 1 ;;
+    esac
+  }
+  curl() {
+    local payload_file
+    case "${13}" in
+      "$hostile_register_endpoint")
+        payload_file="$(assert_secure_relay_curl_invocation "$hostile_register_endpoint" "$hostile_token" "$@")" || return 1
+        python3 - "$payload_file" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as payload_file:
+    payload = json.load(payload_file)
+assert payload["server_id"] == "server-v070", payload
+PY
+        ;;
+      "$hostile_status_endpoint")
+        assert_secure_relay_curl_invocation "$hostile_status_endpoint" "$hostile_token" "$@" >/dev/null || return 1
+        printf '{"server_id":"server-v070","connected":true}'
+        ;;
+      *) return 1 ;;
+    esac
+  }
+
+  output="$(register_daemon_with_relay \
+    '{"server_id":"server-v070","daemon_public_key":"ed25519-v1:daemon-public"}')"
+  [[ "$output" == *"registered local daemon server-v070"* ]]
+  [[ "$output" != *"$hostile_token"* ]]
+  output="$(verify_daemon_relay_connected '{"server_id":"server-v070"}')"
+  [[ "$output" == *"SUCCESS: daemon server-v070"* ]]
+  [[ "$output" != *"$hostile_token"* ]]
+)
+
+test_termd_relay_curl_rejects_crlf_inputs_without_disclosure() (
+  load_termd_installer_functions
+
+  local tmp_dir daemon_token_file hostile_token hostile_url output curl_marker
+  tmp_dir="$(mktemp -d)"
+  trap 'rm -rf "$tmp_dir"' EXIT
+  daemon_token_file="${tmp_dir}/daemon-token"
+  curl_marker="${tmp_dir}/curl-called"
+  printf 'daemon-secret\n' >"$daemon_token_file"
+  TERMD_RELAY_URLS="wss://relay.example/ws"
+  TERMD_RELAY_DAEMON_TOKEN_FILE="$daemon_token_file"
+  unset TERMD_RELAY_SETUP_TOKEN_FILE
+  curl() {
+    : >"$curl_marker"
+    return 0
+  }
+
+  hostile_token=$'relay-secret-"\r\noutput = "/tmp/not-created"'
+  TERMD_RELAY_SETUP_TOKEN="$hostile_token"
+  export TERMD_RELAY_SETUP_TOKEN
+  if output="$(register_daemon_with_relay \
+    '{"server_id":"server-v070","daemon_public_key":"ed25519-v1:daemon-public"}')"; then
+    printf 'relay registration unexpectedly accepted a CR/LF setup token\n' >&2
+    return 1
+  fi
+  [[ "$output" == *"relay setup token is empty, unreadable, or contains CR/LF"* ]]
+  [[ "$output" != *"$hostile_token"* && ! -e "$curl_marker" ]]
+  if output="$(verify_daemon_relay_connected '{"server_id":"server-v070"}')"; then
+    printf 'relay status unexpectedly accepted a CR/LF setup token\n' >&2
+    return 1
+  fi
+  [[ "$output" == *"relay setup token is empty, unreadable, or contains CR/LF"* ]]
+  [[ "$output" != *"$hostile_token"* && ! -e "$curl_marker" ]]
+
+  TERMD_RELAY_SETUP_TOKEN="safe-relay-setup-token"
+  export TERMD_RELAY_SETUP_TOKEN
+  for hostile_url in \
+    $'wss://relay.example\r@attacker.example/ws' \
+    $'wss://relay.example\n@attacker.example/ws' \
+    $'wss://relay.example\r\n@attacker.example/ws'
+  do
+    TERMD_RELAY_URLS="$hostile_url"
+    if output="$(register_daemon_with_relay \
+      '{"server_id":"server-v070","daemon_public_key":"ed25519-v1:daemon-public"}')"; then
+      printf 'relay registration unexpectedly accepted a CR/LF URL\n' >&2
+      return 1
+    fi
+    [[ "$output" == *"relay URL contains CR/LF"* ]]
+    [[ "$output" != *"safe-relay-setup-token"* && ! -e "$curl_marker" ]]
+    if output="$(verify_daemon_relay_connected '{"server_id":"server-v070"}')"; then
+      printf 'relay status unexpectedly accepted a CR/LF URL\n' >&2
+      return 1
+    fi
+    [[ "$output" == *"FAILED: relay URL contains CR/LF"* ]]
+    [[ "$output" != *"safe-relay-setup-token"* && ! -e "$curl_marker" ]]
+  done
 )
 
 test_termd_upgrade_skips_inherited_relay_verification_without_explicit_options() (
@@ -716,8 +866,12 @@ test_termd_sensitive_curl_temp_files_are_removed_on_failure() (
   TERMD_RELAY_SETUP_TOKEN_FILE="$setup_token_file"
   unset TERMD_RELAY_SETUP_TOKEN
   curl() {
-    [[ "$#" -eq 3 && "$1" == "--disable" && "$2" == "--config" ]]
-    dirname "$3" >"$marker"
+    local payload_file
+    payload_file="$(assert_secure_relay_curl_invocation \
+      "https://relay.example/api/relay/daemon/register" \
+      "setup-secret" \
+      "$@")" || return 1
+    dirname "$payload_file" >"$marker"
     return 22
   }
 
@@ -940,9 +1094,11 @@ test_termd_relay_registration_uses_only_daemon_token_and_public_key() (
   TERMD_RELAY_SETUP_TOKEN_FILE="$setup_token_file"
 
   curl() {
-    [[ "$#" -eq 3 && "$1" == "--disable" && "$2" == "--config" ]]
     local payload_file
-    payload_file="$(sed -n 's/^data-binary = "@\(.*\)"$/\1/p' "$3")"
+    payload_file="$(assert_secure_relay_curl_invocation \
+      "https://relay.example/api/relay/daemon/register" \
+      "setup-secret" \
+      "$@")" || return 1
     python3 - "$payload_file" <<'PY'
 import json
 import sys
@@ -3514,6 +3670,8 @@ run_test test_termrelay_install_reports_sensitive_setup_token
 run_test test_termrelay_old_open_env_migrates_to_trusted_files
 run_test test_termd_relay_verification_requires_matching_server_id
 run_test test_termd_relay_verification_requires_setup_token
+run_test test_termd_relay_curl_treats_hostile_values_as_data
+run_test test_termd_relay_curl_rejects_crlf_inputs_without_disclosure
 run_test test_termd_upgrade_skips_inherited_relay_verification_without_explicit_options
 run_test test_termd_postinstall_health_timeout_is_failure
 run_test test_termd_invalid_pairing_url_retries_full_relay_install
