@@ -3151,9 +3151,13 @@ mod tests {
         for cert in certs {
             root_store.add(cert).unwrap();
         }
-        let config = rustls::ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
+        let config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
         let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config));
         let server_name = rustls::pki_types::ServerName::try_from("localhost")
             .unwrap()
