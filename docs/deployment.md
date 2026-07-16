@@ -211,12 +211,11 @@ daemon registry JSON 示例：
 
 ## 升级顺序
 
-1. 先在 relay 主机重新下载、校验并运行当前 `termrelay-linux-amd64 install`，确认本机和公网 `GET /healthz` 正常。
-2. 把 relay setup token 安全复制到 daemon 主机的 root-only 临时文件。
-3. 再下载、校验并运行当前 `termd-linux-amd64 install --relay ... --relay-setup-token-file ...`，重新注册 daemon token hash 与 daemon public key。
-4. 删除 daemon 主机上的临时 setup token，重新加载 Web，并验证已有 session attach。
+1. 先在 relay 主机运行 `sudo termrelay upgrade`，确认本机和公网 `GET /healthz` 正常。
+2. 再在 daemon 主机运行 `sudo termd upgrade`，重新加载 Web，并验证已有 session attach。
+3. 使用 CLI 的主机最后运行 `sudo termctl upgrade`。
 
-installer 保留 daemon identity、配对设备和普通配置。supervisor compatibility 相同时不会清空既有 session；如果 release 确实改变 compatibility，installer 会先说明影响并要求确认。不要根据旧版本号手工删除 session、SQLite 或 supervisor socket。可复制的完整命令见[公网 trusted relay：两主机流程](installation.md#公网-trusted-relay两主机流程)。
+`upgrade` 严格比较 semver、下载当前 amd64/arm64 裸二进制、校验 GitHub release asset digest，再调用新程序的内嵌 installer 原子替换并重启相关 service。普通升级保留 relay registry、daemon identity、配对设备和配置，不需要重新传 setup token；仅从旧 open relay 进行 breaking admission 迁移时按[公网 trusted relay：两主机流程](installation.md#公网-trusted-relay两主机流程)重新注册。supervisor compatibility 相同时不会清空既有 session；如果 release 确实改变 compatibility，`termd` 会额外说明会话丢失影响并要求独立确认，普通 `--yes` 不会授权该操作。不要根据旧版本号手工删除 session、SQLite 或 supervisor socket。
 
 ## Health check
 
@@ -226,7 +225,7 @@ installer 保留 daemon identity、配对设备和普通配置。supervisor comp
 
 ## 安装入口
 
-使用 release 安装器完成 setup token、daemon token、registry 注册和 systemd 配置，不要手工生成 `server_id` 映射。两台主机的逐步命令和每一步验证统一维护在[安装、升级与卸载](installation.md#公网-trusted-relay两主机流程)，避免从本页的 Nginx 片段误推安装参数。
+使用 release 裸二进制自带的 installer 完成 setup token、daemon token、registry 注册和 systemd 配置，不要手工生成 `server_id` 映射。两台主机的逐步命令和每一步验证统一维护在[安装、升级与卸载](installation.md#公网-trusted-relay两主机流程)，避免从本页的 Nginx 片段误推安装参数。
 
 同一份 `termd pair --qr` 邀请码可用于 daemon Web 和 relay Web。pair ticket 由 daemon 最终验证，pairing 成功后浏览器保存持久 device certificate，后续请求不再复用 pair ticket。
 
@@ -240,7 +239,7 @@ installer 保留 daemon identity、配对设备和普通配置。supervisor comp
 
 ## installer 与 service 行为
 
-release 资产和 GHCR 镜像由同一个 tag 驱动。Linux amd64 优先下载稳定名称的 raw binary、校验 `checksums.txt`，再运行其内嵌 installer；`install-*.sh` 保留为 arm64 源码 fallback 和旧自动化兼容入口。直接运行源码树中的模板脚本时需要 `TERMD_GITHUB_REPO=owner/repo`。
+release 资产和 GHCR 镜像由同一个 tag 驱动。项目上传的 GitHub Release assets 恰好是 `termd`、`termrelay`、`termctl` 的 Linux amd64 与 arm64 六个裸二进制；项目不上传自有的 `tar.gz`、checksum 文件或 `install-*.sh`。GitHub 自动生成的 Source code（zip/tar.gz）归档不属于项目上传的 assets，也无法由 release workflow 禁用。首次安装按[安装、升级与卸载](installation.md#下载-linux-release)选择架构并运行二进制自带的 installer；仓库中的模板脚本只保留给源码开发和旧自动化兼容，不是 Release 安装入口。
 
 - `termd` installer 创建 `termd.service` 和 `/etc/termd/termd.env`。`KillMode=process` 使普通 daemon restart 不会把独立 supervisor 一起终止。
 - `termrelay` installer 创建 `termrelay.service`、setup token 和 daemon registry；relay 本身不承担 supervisor 生命周期。
@@ -296,9 +295,8 @@ sudo sqlite3 -readonly /var/lib/termd/daemon-state.sqlite \
   输出中的同一流程。
 - tag 推送后，GitHub Actions 会：
   - 运行 workspace 测试，确认 release tag 与 `Cargo.toml` 版本一致。
-  - 构建 `termd`、`termrelay`、`termctl` 的 Linux amd64 原始二进制和版本化 tarball。二进制使用 `x86_64-unknown-linux-musl` 静态链接，并在打包前先构建 `termui/frontend` 的静态资源，确保 `termd` 和 `termrelay` 的内嵌 Web 可用。
-  - 当前不发布 Linux arm64 tarball；arm64 安装脚本会跳过 release asset 并从源码构建，不承诺不存在的 arm64 资产。
-  - 为原始二进制和 tarball 生成 `checksums.txt`，连同带默认仓库/版本的兼容安装脚本上传到 GitHub Release。
+  - 使用 `x86_64-unknown-linux-musl` 和 `aarch64-unknown-linux-musl` 分别构建 amd64、arm64 静态二进制；构建前生成 `termui/frontend` 静态资源，确保 `termd` 和 `termrelay` 的内嵌 Web 可用。
+  - 上传并严格检查恰好六个稳定名称的裸二进制，拒绝项目 workflow 生成额外的压缩包、checksum 文件或 installer 脚本资产。
   - 推送 `ghcr.io/<owner>/termd:<tag>`、`ghcr.io/<owner>/termrelay:<tag>`、`ghcr.io/<owner>/termctl:<tag>` 镜像。
   - 这些镜像使用 `scratch` 运行层；`termd` 和 `termrelay` 同样会内嵌 Web 静态资源。
 

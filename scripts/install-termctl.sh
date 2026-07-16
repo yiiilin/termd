@@ -251,20 +251,99 @@ install_from_source() {
   rm -rf "$src_dir"
 }
 
-install_from_self_binary() {
-  local staging_dir candidate
+termctl_binary_identity_valid() {
+  local binary="$1"
+  local reported_version
 
-  staging_dir="$(mktemp -d)"
-  candidate="${staging_dir}/${BIN_NAME}"
-  if ! install -m0755 -- "$SELF_INSTALL_BINARY" "$candidate"; then
-    rm -rf -- "$staging_dir"
+  [[ -f "$binary" && -x "$binary" ]] || return 1
+  reported_version="$("$binary" --version 2>/dev/null)" || return 1
+  [[ "$reported_version" == "$BIN_NAME $VERSION" ]]
+}
+
+restore_termctl_binary() {
+  local target="$1"
+  local rollback="$2"
+  local had_target="$3"
+
+  if [[ "$had_target" -eq 1 ]]; then
+    mv -fT -- "$rollback" "$target"
+  else
+    rm -f -- "$target"
+  fi
+}
+
+install_from_self_binary() {
+  local target_dir target staged rollback had_target status
+
+  target_dir="${INSTALL_PREFIX}/bin"
+  target="${target_dir}/${BIN_NAME}"
+  staged=""
+  rollback=""
+  had_target=0
+  status=0
+
+  install -d -m 0755 "$target_dir" || return $?
+  staged="$(mktemp "${target_dir}/.${BIN_NAME}.install.XXXXXX")" || return $?
+  if install -m 0755 -- "$SELF_INSTALL_BINARY" "$staged"; then
+    :
+  else
+    status=$?
+    rm -f -- "$staged"
+    return "$status"
+  fi
+  if ! termctl_binary_identity_valid "$staged"; then
+    rm -f -- "$staged"
     return 1
   fi
-  if ! install -Dm0755 -- "$candidate" "${INSTALL_PREFIX}/bin/${BIN_NAME}"; then
-    rm -rf -- "$staging_dir"
+
+  if [[ -d "$target" && ! -L "$target" ]]; then
+    rm -f -- "$staged"
+    printf '[%s-install] refusing to replace binary target because it is a directory\n' "$COMPONENT" >&2
     return 1
   fi
-  rm -rf -- "$staging_dir"
+
+  if [[ -e "$target" || -L "$target" ]]; then
+    had_target=1
+    rollback="$(mktemp "${target_dir}/.${BIN_NAME}.rollback.XXXXXX")" || {
+      status=$?
+      rm -f -- "$staged"
+      return "$status"
+    }
+    rm -f -- "$rollback"
+    if cp -a -- "$target" "$rollback"; then
+      :
+    else
+      status=$?
+      rm -f -- "$staged" "$rollback"
+      return "$status"
+    fi
+  fi
+
+  if mv -fT -- "$staged" "$target"; then
+    :
+  else
+    status=$?
+    rm -f -- "$staged" "$rollback"
+    return "$status"
+  fi
+  staged=""
+  if termctl_binary_identity_valid "$target"; then
+    rm -f -- "$rollback"
+    return 0
+  fi
+
+  status=1
+  if ! restore_termctl_binary "$target" "$rollback" "$had_target"; then
+    local recovery_path="$target"
+    if [[ "$had_target" -eq 1 ]]; then
+      recovery_path="$rollback"
+    fi
+    printf '[%s-install] failed to restore the previous binary after replacement validation failed; recovery copy retained at %q\n' "$COMPONENT" "$recovery_path" >&2
+    rm -f -- "$staged"
+    return "$status"
+  fi
+  rm -f -- "$staged" "$rollback"
+  return "$status"
 }
 
 uninstall_component() {

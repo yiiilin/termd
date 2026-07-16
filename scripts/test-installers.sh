@@ -87,17 +87,30 @@ grep -Fq 'trap cleanup_relay_status_files EXIT' "${ROOT_DIR}/scripts/install-ter
 grep -q 'SUPERVISOR_VERSION="${TERMD_SUPERVISOR_VERSION:-}"' "${ROOT_DIR}/scripts/install-termd.sh"
 grep -Fq 'STATE_DIR="${TERMD_STATE_DIR:-/var/lib/termd}"' "${ROOT_DIR}/scripts/install-termd.sh"
 grep -q 'REQUIRED_SUPERVISOR_VERSION="${TERMD_REQUIRED_SUPERVISOR_VERSION:-}"' "${ROOT_DIR}/scripts/install-termd.sh"
-grep -q 'TERMD_REQUIRED_SUPERVISOR_VERSION:-' "${ROOT_DIR}/.github/workflows/release.yml"
-! grep -q 'TERMD_SUPERVISOR_VERSION:-.*supervisor_version' "${ROOT_DIR}/.github/workflows/release.yml"
 grep -Fq '"terminstall/Cargo.toml"' "${ROOT_DIR}/.github/workflows/release.yml"
-grep -Fq 'install -m 0755 "$binary_path" "$out_dir/${binary}-linux-amd64"' "${ROOT_DIR}/.github/workflows/release.yml"
-grep -Fq 'sha256sum *-linux-amd64 *.tar.gz > checksums.txt' "${ROOT_DIR}/.github/workflows/release.yml"
-grep -Fq 'files=(*-linux-amd64 *.tar.gz checksums.txt install-*.sh)' "${ROOT_DIR}/.github/workflows/release.yml"
-grep -Fq 'releases/latest/download/termd-linux-amd64' "${ROOT_DIR}/README.md"
-grep -Fq 'releases/latest/download/${component}-linux-amd64' "${ROOT_DIR}/docs/installation.md"
-grep -Fq 'sha256sum --ignore-missing --check checksums.txt' "${ROOT_DIR}/README.md"
-grep -Fq 'sha256sum --ignore-missing --check checksums.txt' "${ROOT_DIR}/docs/installation.md"
-grep -Fq 'releases/latest/download/install-termd.sh' "${ROOT_DIR}/docs/installation.md"
+grep -Fq 'target: x86_64-unknown-linux-musl' "${ROOT_DIR}/.github/workflows/release.yml"
+grep -Fq 'target: aarch64-unknown-linux-musl' "${ROOT_DIR}/.github/workflows/release.yml"
+grep -Fq 'runner: ubuntu-24.04-arm' "${ROOT_DIR}/.github/workflows/release.yml"
+grep -Fq 'install -m 0755 "$binary_path" "$out_dir/${binary}-linux-${ASSET_ARCH}"' "${ROOT_DIR}/.github/workflows/release.yml"
+for component in termd termctl termrelay; do
+  grep -Fq "${component}-linux-amd64" "${ROOT_DIR}/.github/workflows/release.yml"
+  grep -Fq "${component}-linux-arm64" "${ROOT_DIR}/.github/workflows/release.yml"
+done
+grep -Fq 'needs: [validate, package]' "${ROOT_DIR}/.github/workflows/release.yml"
+grep -Fq 'merge-multiple: true' "${ROOT_DIR}/.github/workflows/release.yml"
+grep -Fq 'Validate exact release asset set' "${ROOT_DIR}/.github/workflows/release.yml"
+! grep -Fq 'Build release archives' "${ROOT_DIR}/.github/workflows/release.yml"
+! grep -Fq 'Render installer assets' "${ROOT_DIR}/.github/workflows/release.yml"
+! grep -Eq '(^|[[:space:]])tar[[:space:]].*-czf' "${ROOT_DIR}/.github/workflows/release.yml"
+! grep -Eq 'sha256sum .*checksums\.txt' "${ROOT_DIR}/.github/workflows/release.yml"
+! grep -Eq 'gh release (upload|create).*install-.*\.sh' "${ROOT_DIR}/.github/workflows/release.yml"
+grep -Fq 'releases/latest/download/${asset}' "${ROOT_DIR}/README.md"
+grep -Fq 'releases/latest/download/${asset}' "${ROOT_DIR}/docs/installation.md"
+grep -Fq 'sudo termrelay upgrade' "${ROOT_DIR}/docs/installation.md"
+grep -Fq 'sudo termd upgrade' "${ROOT_DIR}/docs/installation.md"
+! grep -Fq 'sha256sum --ignore-missing --check checksums.txt' "${ROOT_DIR}/README.md"
+! grep -Fq 'sha256sum --ignore-missing --check checksums.txt' "${ROOT_DIR}/docs/installation.md"
+! grep -Fq 'releases/latest/download/install-termd.sh' "${ROOT_DIR}/docs/installation.md"
 test -s "${ROOT_DIR}/SUPERVISOR_VERSION"
 python3 - "${ROOT_DIR}" <<'PY'
 import json
@@ -216,7 +229,7 @@ test_termctl_embedded_self_binary_is_strict_and_isolated() (
   [[ "$output" == *"installed termctl 0.8.2"* ]]
   [[ -x "$installed_binary" ]]
   cmp "$pinned_binary" "$installed_binary"
-  [[ "$(wc -l <"$probe")" -eq 2 ]]
+  [[ "$(wc -l <"$probe")" -eq 4 ]]
   [[ "$(sort -u "$probe")" == ":" ]]
 
   assert_rejected() {
@@ -292,6 +305,118 @@ test_termctl_embedded_self_binary_is_strict_and_isolated() (
 
   assert_pinned_rejected "termd 0.8.2"
   assert_pinned_rejected "termctl 9.9.9"
+)
+
+test_termctl_self_install_replacement_is_atomic() (
+  local root script candidate old_binary target status identity_validator identity_calls
+  local output restore_validator retained_path escaped_path
+  root="$(mktemp -d)"
+  trap 'rm -rf "$root"' EXIT
+  script="${ROOT_DIR}/scripts/install-termctl.sh"
+  candidate="${root}/candidate-termctl"
+  old_binary="${root}/old-termctl"
+  target="${root}/prefix/bin/termctl"
+
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'if [[ "${1:-}" == "--version" ]]; then printf "termctl 0.8.2\n"; exit 0; fi' \
+    'printf "new termctl\n"' >"$candidate"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'if [[ "${1:-}" == "--version" ]]; then printf "termctl 0.8.1\n"; exit 0; fi' \
+    'printf "old termctl\n"' >"$old_binary"
+  chmod 0755 "$candidate" "$old_binary"
+
+  TERMD_INSTALL_PREFIX="${root}/prefix"
+  TERMD_VERSION=0.8.2
+  # shellcheck source=/dev/null
+  source <(sed '/^main "\$@"/,$d' "$script")
+  SELF_INSTALL_BINARY="$candidate"
+
+  # Existing targets are replaced with the verified candidate using mode 0755.
+  install -D -m 0755 "$old_binary" "$target"
+  install_from_self_binary
+  cmp "$candidate" "$target"
+  [[ "$(stat -c %a "$target")" == "755" ]]
+  ! compgen -G "${root}/prefix/bin/.termctl.*" >/dev/null
+
+  # A first install uses the same atomic target-directory staging path.
+  rm -f "$target"
+  install_from_self_binary
+  cmp "$candidate" "$target"
+  [[ "$(stat -c %a "$target")" == "755" ]]
+  ! compgen -G "${root}/prefix/bin/.termctl.*" >/dev/null
+
+  # Failure at the rename boundary leaves the old binary byte-for-byte intact.
+  install -m 0755 "$old_binary" "$target"
+  mv() { return 73; }
+  if install_from_self_binary; then
+    printf 'termctl self-install unexpectedly succeeded when atomic rename failed\n' >&2
+    return 1
+  else
+    status=$?
+  fi
+  unset -f mv
+  [[ "$status" -eq 73 ]]
+  cmp "$old_binary" "$target"
+  ! compgen -G "${root}/prefix/bin/.termctl.*" >/dev/null
+
+  # A post-commit identity failure restores the snapshotted old binary atomically.
+  identity_validator="$(declare -f termctl_binary_identity_valid)"
+  identity_calls=0
+  termctl_binary_identity_valid() {
+    ((identity_calls += 1))
+    [[ "$identity_calls" -eq 1 ]]
+  }
+  if install_from_self_binary; then
+    printf 'termctl self-install unexpectedly accepted an invalid committed binary\n' >&2
+    return 1
+  fi
+  eval "$identity_validator"
+  cmp "$old_binary" "$target"
+  ! compgen -G "${root}/prefix/bin/.termctl.*" >/dev/null
+
+  # A directory at the binary path is rejected without moving the candidate into it.
+  rm -f "$target"
+  mkdir -p "$target"
+  if install_from_self_binary; then
+    printf 'termctl self-install unexpectedly replaced a target directory\n' >&2
+    return 1
+  else
+    status=$?
+  fi
+  [[ "$status" -eq 1 ]]
+  [[ -d "$target" ]]
+  [[ -z "$(find "$target" -mindepth 1 -print -quit)" ]]
+  ! compgen -G "${root}/prefix/bin/.termctl.*" >/dev/null
+  rmdir "$target"
+
+  # If restoring the old binary fails, retain and report the recovery copy.
+  install -m 0755 "$old_binary" "$target"
+  identity_calls=0
+  termctl_binary_identity_valid() {
+    ((identity_calls += 1))
+    [[ "$identity_calls" -eq 1 ]]
+  }
+  restore_validator="$(declare -f restore_termctl_binary)"
+  restore_termctl_binary() { return 74; }
+  if output="$(install_from_self_binary 2>&1)"; then
+    printf 'termctl self-install unexpectedly succeeded when rollback restore failed\n' >&2
+    return 1
+  else
+    status=$?
+  fi
+  eval "$identity_validator"
+  eval "$restore_validator"
+  [[ "$status" -eq 1 ]]
+  cmp "$candidate" "$target"
+  retained_path="$(find "${root}/prefix/bin" -maxdepth 1 -type f -name '.termctl.rollback.*' -print -quit)"
+  [[ -n "$retained_path" ]]
+  [[ "$(find "${root}/prefix/bin" -maxdepth 1 -type f -name '.termctl.rollback.*' | wc -l)" -eq 1 ]]
+  cmp "$old_binary" "$retained_path"
+  printf -v escaped_path '%q' "$retained_path"
+  [[ "$output" == *"recovery copy retained at ${escaped_path}"* ]]
+  ! compgen -G "${root}/prefix/bin/.termctl.install.*" >/dev/null
 )
 
 test_termrelay_embedded_self_binary_stages_in_isolation() (
@@ -3680,6 +3805,7 @@ run_test test_termd_sensitive_curl_temp_files_are_removed_on_failure
 run_test test_termd_sensitive_curl_stops_when_temp_directory_creation_fails
 run_test test_installers_normalize_standard_proxy_environment
 run_test test_termctl_embedded_self_binary_is_strict_and_isolated
+run_test test_termctl_self_install_replacement_is_atomic
 run_test test_termrelay_embedded_self_binary_stages_in_isolation
 run_test test_termd_embedded_self_binary_stages_in_isolation
 run_test test_termd_fresh_install_initializes_schema_before_supervisor_baseline

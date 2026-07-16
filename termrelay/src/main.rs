@@ -59,12 +59,12 @@ struct TlsPaths {
 
 #[tokio::main]
 async fn main() -> Result<(), MainError> {
+    install_rustls_crypto_provider();
     if let Some(options) = installer_options(std::env::args_os()) {
         terminstall::run(terminstall::Component::Termrelay, options)?;
         return Ok(());
     }
 
-    install_rustls_crypto_provider();
     init_tracing();
 
     let args = match RelayCommand::from_env()? {
@@ -154,7 +154,8 @@ fn help_text() -> String {
             "USAGE:\n",
             "  termrelay [OPTIONS]\n",
             "  termrelay install [OPTIONS]\n",
-            "  termrelay uninstall [OPTIONS]\n\n",
+            "  termrelay uninstall [OPTIONS]\n",
+            "  termrelay upgrade [OPTIONS]\n\n",
             "OPTIONS:\n",
             "  --listen, -l <HOST:PORT>      Listen address, default 127.0.0.1:8080\n",
             "  --setup-token-file <PATH>     Read daemon registration setup token from a file\n",
@@ -165,7 +166,7 @@ fn help_text() -> String {
             "  -h, --help                    Print help\n",
             "  -V, --version                 Print version\n\n",
             "INSTALLATION:\n",
-            "  Run `termrelay install --help` or `termrelay uninstall --help` for managed installation options.\n\n",
+            "  Run `termrelay install --help`, `termrelay uninstall --help` or `termrelay upgrade --help` for managed installation options.\n\n",
             "EXAMPLES:\n",
             "  termrelay --listen 0.0.0.0:8080 --setup-token-file /etc/termd/termrelay_setup_token --daemon-registry /var/lib/termrelay/daemon-registry.json\n"
         ),
@@ -299,7 +300,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
-    fn recognizes_install_and_uninstall_before_relay_argument_parsing() {
+    fn recognizes_managed_commands_before_relay_argument_parsing() {
         assert!(matches!(
             installer_options(["termrelay", "install", "--help"]),
             Some(terminstall::Options::Install(_))
@@ -308,9 +309,14 @@ mod tests {
             installer_options(["termrelay", "uninstall", "--dry-run"]),
             Some(terminstall::Options::Uninstall(_))
         ));
+        assert!(matches!(
+            installer_options(["termrelay", "upgrade", "--help"]),
+            Some(terminstall::Options::Upgrade(_))
+        ));
         assert!(installer_options(["termrelay", "--web"]).is_none());
         assert!(help_text().contains("termrelay install [OPTIONS]"));
         assert!(help_text().contains("termrelay uninstall [OPTIONS]"));
+        assert!(help_text().contains("termrelay upgrade [OPTIONS]"));
         assert!(!help_text().contains("--allow-open-relay"));
     }
 

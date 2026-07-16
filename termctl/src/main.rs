@@ -14,6 +14,7 @@ use clap::Parser;
 
 #[tokio::main]
 async fn main() {
+    install_rustls_crypto_provider();
     if let Some(options) = installer_options(std::env::args_os()) {
         if let Err(error) = terminstall::run(terminstall::Component::Termctl, options) {
             eprintln!("{error}");
@@ -21,8 +22,6 @@ async fn main() {
         }
         return;
     }
-
-    install_rustls_crypto_provider();
 
     let cli = match cli::Cli::try_parse() {
         Ok(cli) => cli,
@@ -112,7 +111,7 @@ mod tests {
     }
 
     #[test]
-    fn recognizes_install_and_uninstall_before_clap_parsing() {
+    fn recognizes_managed_commands_before_clap_parsing() {
         assert!(matches!(
             installer_options(["termctl", "install", "--help"]),
             Some(terminstall::Options::Install(_))
@@ -120,6 +119,10 @@ mod tests {
         assert!(matches!(
             installer_options(["termctl", "uninstall", "--dry-run"]),
             Some(terminstall::Options::Uninstall(_))
+        ));
+        assert!(matches!(
+            installer_options(["termctl", "upgrade", "--help"]),
+            Some(terminstall::Options::Upgrade(_))
         ));
         assert!(installer_options(["termctl", "list"]).is_none());
     }

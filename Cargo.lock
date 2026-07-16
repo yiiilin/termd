@@ -1937,6 +1937,13 @@ name = "terminstall"
 version = "0.8.5"
 dependencies = [
  "libc",
+ "reqwest",
+ "rustls",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]

@@ -49,7 +49,8 @@ const HELP_TEXT: &str = concat!(
     "  termd [OPTIONS]\n",
     "  termd pair [OPTIONS]\n",
     "  termd install [OPTIONS]\n",
-    "  termd uninstall [OPTIONS]\n\n",
+    "  termd uninstall [OPTIONS]\n",
+    "  termd upgrade [OPTIONS]\n\n",
     "OPTIONS:\n",
     "  --listen <HOST:PORT>           Listen address, default 127.0.0.1:8765\n",
     "  --relay <WS_URL>               Connect to one relay\n",
@@ -63,7 +64,7 @@ const HELP_TEXT: &str = concat!(
     "  -h, --help                     Print help\n",
     "  -V, --version                  Print version\n\n",
     "INSTALLATION:\n",
-    "  Run `termd install --help` or `termd uninstall --help` for managed installation options.\n\n",
+    "  Run `termd install --help`, `termd uninstall --help` or `termd upgrade --help` for managed installation options.\n\n",
     "PAIR OPTIONS:\n",
     "  --url <HTTP_URL>               Local daemon URL, default http://127.0.0.1:8765\n",
     "  --qr                           Print a QR invite code for Web/mobile pairing\n",
@@ -92,12 +93,12 @@ async fn main() -> ExitCode {
 }
 
 async fn run() -> Result<(), Box<dyn Error>> {
+    install_rustls_crypto_provider();
     if let Some(options) = installer_options(std::env::args_os()) {
         terminstall::run(terminstall::Component::Termd, options)?;
         return Ok(());
     }
 
-    install_rustls_crypto_provider();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -1195,10 +1196,11 @@ mod tests {
         );
         assert!(HELP_TEXT.contains("termd install [OPTIONS]"));
         assert!(HELP_TEXT.contains("termd uninstall [OPTIONS]"));
+        assert!(HELP_TEXT.contains("termd upgrade [OPTIONS]"));
     }
 
     #[test]
-    fn recognizes_install_and_uninstall_before_daemon_argument_parsing() {
+    fn recognizes_managed_commands_before_daemon_argument_parsing() {
         assert!(matches!(
             installer_options(["termd", "install", "--help"]),
             Some(terminstall::Options::Install(_))
@@ -1206,6 +1208,10 @@ mod tests {
         assert!(matches!(
             installer_options(["termd", "uninstall", "--dry-run"]),
             Some(terminstall::Options::Uninstall(_))
+        ));
+        assert!(matches!(
+            installer_options(["termd", "upgrade", "--help"]),
+            Some(terminstall::Options::Upgrade(_))
         ));
         assert!(installer_options(["termd", "pair", "--help"]).is_none());
     }

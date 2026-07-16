@@ -1,12 +1,21 @@
 use std::error::Error as StdError;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::fs::File;
-use std::io::{self, IsTerminal, Write};
+use std::fs::{self, File};
+use std::io::{self, IsTerminal, Read, Write};
 use std::mem::MaybeUninit;
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Duration;
+
+use reqwest::blocking::{Client, Response};
+use reqwest::header::{ACCEPT, HeaderValue};
+use semver::Version;
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
+use tempfile::NamedTempFile;
 
 const TERMD_INSTALLER: &str = include_str!("../../scripts/install-termd.sh");
 const TERMRELAY_INSTALLER: &str = include_str!("../../scripts/install-termrelay.sh");
@@ -15,6 +24,10 @@ const SELF_INSTALL_MODE: &str = "embedded-v1";
 const INSTALLER_SHELL: &str = "/bin/bash";
 const INSTALLER_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
 const INSTALLER_LOCALE: &str = "C";
+const DEFAULT_GITHUB_REPO: &str = "yiiilin/termd";
+const GITHUB_API_ACCEPT: &str = "application/vnd.github+json";
+const MAX_RELEASE_RESPONSE_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_BINARY_BYTES: u64 = 256 * 1024 * 1024;
 
 pub fn supervisor_version() -> &'static str {
     include_str!("../../SUPERVISOR_VERSION").trim()
@@ -42,6 +55,14 @@ impl Component {
             Self::Termrelay => TERMRELAY_INSTALLER,
             Self::Termctl => TERMCTL_INSTALLER,
         }
+    }
+
+    fn release_asset(self, architecture: Architecture) -> String {
+        format!(
+            "{}-linux-{}",
+            self.binary_name(),
+            architecture.asset_suffix()
+        )
     }
 }
 
@@ -94,6 +115,34 @@ pub struct UninstallOptions {
     args: Vec<OsString>,
 }
 
+pub struct UpgradeOptions {
+    version: &'static str,
+    args: Vec<OsString>,
+}
+
+impl UpgradeOptions {
+    pub fn new<I, S>(version: &'static str, args: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<OsString>,
+    {
+        Self {
+            version,
+            args: args.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl fmt::Debug for UpgradeOptions {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("UpgradeOptions")
+            .field("version", &self.version)
+            .field("argument_count", &self.args.len())
+            .finish()
+    }
+}
+
 impl UninstallOptions {
     pub fn new<I, S>(version: &'static str, args: I) -> Self
     where
@@ -120,6 +169,7 @@ impl fmt::Debug for UninstallOptions {
 pub enum Options {
     Install(InstallOptions),
     Uninstall(UninstallOptions),
+    Upgrade(UpgradeOptions),
 }
 
 impl Options {
@@ -143,6 +193,8 @@ impl Options {
             )))
         } else if command == OsStr::new("uninstall") {
             Some(Self::Uninstall(UninstallOptions::new(version, remaining)))
+        } else if command == OsStr::new("upgrade") {
+            Some(Self::Upgrade(UpgradeOptions::new(version, remaining)))
         } else {
             None
         }
@@ -154,6 +206,7 @@ impl fmt::Debug for Options {
         match self {
             Self::Install(options) => options.fmt(formatter),
             Self::Uninstall(options) => options.fmt(formatter),
+            Self::Upgrade(options) => options.fmt(formatter),
         }
     }
 }
@@ -180,6 +233,8 @@ pub enum Error {
         component: Component,
         status: String,
     },
+    Upgrade(UpgradeError),
+    UpgradeThreadPanicked,
 }
 
 impl fmt::Display for Error {
@@ -218,6 +273,8 @@ impl fmt::Display for Error {
             Self::ChildFailed { component, status } => {
                 write!(formatter, "embedded {component} installer exited with {status}")
             }
+            Self::Upgrade(source) => source.fmt(formatter),
+            Self::UpgradeThreadPanicked => formatter.write_str("upgrade worker terminated unexpectedly"),
         }
     }
 }
@@ -231,13 +288,21 @@ impl StdError for Error {
             | Self::Spawn(source)
             | Self::WriteInstaller(source)
             | Self::Wait(source) => Some(source),
+            Self::Upgrade(source) => Some(source),
             _ => None,
         }
     }
 }
 
 pub fn run(component: Component, options: Options) -> Result<(), Error> {
-    run_with(component, options, &mut SystemRuntime)
+    match options {
+        Options::Upgrade(options) => std::thread::spawn(move || {
+            run_upgrade_with(component, options, &mut SystemUpgradeRuntime).map_err(Error::Upgrade)
+        })
+        .join()
+        .map_err(|_| Error::UpgradeThreadPanicked)?,
+        options => run_with(component, options, &mut SystemRuntime),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -272,6 +337,7 @@ impl ParsedOptions {
                 options.args,
             ),
             Options::Uninstall(options) => (Action::Uninstall, options.version, None, options.args),
+            Options::Upgrade(_) => unreachable!("upgrade options use the dedicated upgrade path"),
         };
         let mut parsed = Self {
             action,
@@ -843,6 +909,781 @@ fn help_text(component: Component, action: Action) -> String {
         Component::Termctl => {}
     }
     output
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Architecture {
+    Amd64,
+    Arm64,
+}
+
+impl Architecture {
+    fn detect(os: &str, architecture: &str) -> Result<Self, UpgradeError> {
+        match (os, architecture) {
+            ("linux", "x86_64") | ("linux", "amd64") => Ok(Self::Amd64),
+            ("linux", "aarch64") | ("linux", "arm64") => Ok(Self::Arm64),
+            _ => Err(UpgradeError::UnsupportedPlatform {
+                os: os.to_owned(),
+                architecture: architecture.to_owned(),
+            }),
+        }
+    }
+
+    const fn asset_suffix(self) -> &'static str {
+        match self {
+            Self::Amd64 => "amd64",
+            Self::Arm64 => "arm64",
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum UpgradeError {
+    UnknownArgument(String),
+    NonInteractive,
+    UnsupportedPlatform { os: String, architecture: String },
+    InvalidRepository,
+    InvalidCurrentVersion(String),
+    InvalidLatestVersion(String),
+    HttpClient(reqwest::Error),
+    LatestRequest(reqwest::Error),
+    LatestHttpStatus(u16),
+    LatestResponseTooLarge,
+    LatestRead(io::Error),
+    LatestDecode(serde_json::Error),
+    MissingAsset(String),
+    DuplicateAsset(String),
+    InvalidAssetUrl(String),
+    InvalidAssetDigest(String),
+    AssetTooLarge(String),
+    RootRequired(String),
+    DownloadRequest(reqwest::Error),
+    DownloadHttpStatus(u16),
+    DownloadRead(io::Error),
+    DownloadTooLarge(String),
+    TemporaryFile(io::Error),
+    DigestMismatch(String),
+    CandidatePermissions(io::Error),
+    CandidateSpawn(io::Error),
+    CandidateVersionFailed(String),
+    CandidateIdentity { expected: String, actual: String },
+    InstallerSpawn(io::Error),
+    InstallerFailed(String),
+    Input(io::Error),
+    Output(io::Error),
+}
+
+impl fmt::Display for UpgradeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownArgument(argument) => write!(formatter, "unknown upgrade argument: {argument}"),
+            Self::NonInteractive => formatter.write_str(
+                "upgrade confirmation requires a TTY; rerun with --yes for non-interactive execution",
+            ),
+            Self::UnsupportedPlatform { os, architecture } => write!(
+                formatter,
+                "upgrade supports only Linux x86_64/amd64 and aarch64/arm64; detected {os}/{architecture}"
+            ),
+            Self::InvalidRepository => formatter.write_str(
+                "TERMD_GITHUB_REPO must be in owner/repository form using letters, digits, '.', '_' or '-'",
+            ),
+            Self::InvalidCurrentVersion(version) => {
+                write!(formatter, "current version is not valid semver: {version}")
+            }
+            Self::InvalidLatestVersion(version) => {
+                write!(formatter, "latest release tag is not valid semver: {version}")
+            }
+            Self::HttpClient(source) => write!(
+                formatter,
+                "failed to initialize the HTTPS upgrade client: {}",
+                reqwest_error_reason(source)
+            ),
+            Self::LatestRequest(source) => write!(
+                formatter,
+                "failed to query the latest GitHub release: {}",
+                reqwest_error_reason(source)
+            ),
+            Self::LatestHttpStatus(status) => {
+                write!(formatter, "GitHub latest release request returned HTTP {status}")
+            }
+            Self::LatestResponseTooLarge => {
+                formatter.write_str("GitHub latest release response exceeded the safety limit")
+            }
+            Self::LatestRead(source) => write!(
+                formatter,
+                "failed to read the latest GitHub release response: {source}"
+            ),
+            Self::LatestDecode(source) => write!(
+                formatter,
+                "GitHub latest release response was invalid JSON: {source}"
+            ),
+            Self::MissingAsset(asset) => write!(formatter, "latest release is missing required asset {asset}"),
+            Self::DuplicateAsset(asset) => {
+                write!(formatter, "latest release contains duplicate asset {asset}")
+            }
+            Self::InvalidAssetUrl(asset) => write!(
+                formatter,
+                "latest release asset {asset} does not have a valid HTTPS download URL"
+            ),
+            Self::InvalidAssetDigest(asset) => write!(
+                formatter,
+                "latest release asset {asset} must provide digest sha256:<64 hex characters>"
+            ),
+            Self::AssetTooLarge(asset) => {
+                write!(formatter, "latest release asset {asset} exceeds the safety limit")
+            }
+            Self::RootRequired(command) => write!(
+                formatter,
+                "upgrade requires root to replace the installed binary and manage any service; rerun: {command}"
+            ),
+            Self::DownloadRequest(source) => write!(
+                formatter,
+                "failed to download the release candidate: {}",
+                reqwest_error_reason(source)
+            ),
+            Self::DownloadHttpStatus(status) => {
+                write!(formatter, "release candidate download returned HTTP {status}")
+            }
+            Self::DownloadRead(source) => {
+                write!(formatter, "failed while streaming the release candidate: {source}")
+            }
+            Self::DownloadTooLarge(asset) => {
+                write!(formatter, "downloaded release asset {asset} exceeded the safety limit")
+            }
+            Self::TemporaryFile(source) => write!(
+                formatter,
+                "failed to create or write the protected upgrade file: {source}"
+            ),
+            Self::DigestMismatch(asset) => {
+                write!(formatter, "SHA-256 verification failed for release asset {asset}")
+            }
+            Self::CandidatePermissions(source) => write!(
+                formatter,
+                "failed to make the verified release candidate executable: {source}"
+            ),
+            Self::CandidateSpawn(source) => {
+                write!(formatter, "failed to run the verified release candidate: {source}")
+            }
+            Self::CandidateVersionFailed(status) => write!(
+                formatter,
+                "verified release candidate --version failed with {status}"
+            ),
+            Self::CandidateIdentity { expected, actual } => write!(
+                formatter,
+                "release candidate identity mismatch: expected {expected:?}, got {actual:?}"
+            ),
+            Self::InstallerSpawn(source) => write!(
+                formatter,
+                "failed to start the verified candidate installer: {source}"
+            ),
+            Self::InstallerFailed(status) => write!(
+                formatter,
+                "verified candidate installer exited with {status}; see the managed installer output above"
+            ),
+            Self::Input(source) => write!(formatter, "failed to read upgrade confirmation: {source}"),
+            Self::Output(source) => write!(formatter, "failed to write upgrade output: {source}"),
+        }
+    }
+}
+
+impl StdError for UpgradeError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            Self::HttpClient(source)
+            | Self::LatestRequest(source)
+            | Self::DownloadRequest(source) => Some(source),
+            Self::LatestRead(source)
+            | Self::DownloadRead(source)
+            | Self::TemporaryFile(source)
+            | Self::CandidatePermissions(source)
+            | Self::CandidateSpawn(source)
+            | Self::InstallerSpawn(source)
+            | Self::Input(source)
+            | Self::Output(source) => Some(source),
+            Self::LatestDecode(source) => Some(source),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GithubRelease {
+    tag_name: String,
+    assets: Vec<GithubAsset>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GithubAsset {
+    name: String,
+    browser_download_url: String,
+    digest: Option<String>,
+    #[serde(default)]
+    size: u64,
+}
+
+#[derive(Debug, Clone)]
+struct ReleaseAsset {
+    name: String,
+    download_url: String,
+    digest: [u8; 32],
+    size: u64,
+}
+
+struct UpgradeCandidate {
+    path: PathBuf,
+    _temporary_file: Option<NamedTempFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CandidateInvocation {
+    path: PathBuf,
+    args: Vec<OsString>,
+    install_prefix: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct UpgradeExecutionStatus {
+    success: bool,
+    description: String,
+}
+
+trait UpgradeRuntime {
+    fn is_tty(&self) -> bool;
+    fn is_root(&self) -> bool;
+    fn platform(&self) -> (&str, &str);
+    fn repository(&self) -> Result<String, UpgradeError>;
+    fn current_executable(&self) -> PathBuf;
+    fn configured_install_prefix(&self) -> Option<PathBuf>;
+    fn write_output(&mut self, message: &str) -> Result<(), UpgradeError>;
+    fn confirm(&mut self, prompt: &str) -> Result<bool, UpgradeError>;
+    fn latest_release(
+        &mut self,
+        repository: &str,
+        component: Component,
+        current_version: &str,
+    ) -> Result<GithubRelease, UpgradeError>;
+    fn download(
+        &mut self,
+        component: Component,
+        current_version: &str,
+        asset: &ReleaseAsset,
+    ) -> Result<UpgradeCandidate, UpgradeError>;
+    fn candidate_version(
+        &mut self,
+        candidate: &UpgradeCandidate,
+    ) -> Result<UpgradeExecutionStatus, UpgradeError>;
+    fn install_candidate(
+        &mut self,
+        invocation: &CandidateInvocation,
+    ) -> Result<UpgradeExecutionStatus, UpgradeError>;
+}
+
+struct SystemUpgradeRuntime;
+
+impl UpgradeRuntime for SystemUpgradeRuntime {
+    fn is_tty(&self) -> bool {
+        io::stdin().is_terminal() && io::stderr().is_terminal()
+    }
+
+    fn is_root(&self) -> bool {
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    fn platform(&self) -> (&str, &str) {
+        (std::env::consts::OS, std::env::consts::ARCH)
+    }
+
+    fn repository(&self) -> Result<String, UpgradeError> {
+        match std::env::var("TERMD_GITHUB_REPO") {
+            Ok(repository) => Ok(repository),
+            Err(std::env::VarError::NotPresent) => Ok(DEFAULT_GITHUB_REPO.to_owned()),
+            Err(std::env::VarError::NotUnicode(_)) => Err(UpgradeError::InvalidRepository),
+        }
+    }
+
+    fn current_executable(&self) -> PathBuf {
+        std::env::current_exe().unwrap_or_default()
+    }
+
+    fn configured_install_prefix(&self) -> Option<PathBuf> {
+        std::env::var_os("TERMD_INSTALL_PREFIX")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    }
+
+    fn write_output(&mut self, message: &str) -> Result<(), UpgradeError> {
+        let mut stdout = io::stdout().lock();
+        stdout
+            .write_all(message.as_bytes())
+            .and_then(|_| stdout.flush())
+            .map_err(UpgradeError::Output)
+    }
+
+    fn confirm(&mut self, prompt: &str) -> Result<bool, UpgradeError> {
+        let mut stderr = io::stderr().lock();
+        stderr
+            .write_all(prompt.as_bytes())
+            .map_err(UpgradeError::Output)?;
+        stderr.flush().map_err(UpgradeError::Output)?;
+        let mut answer = String::new();
+        io::stdin()
+            .read_line(&mut answer)
+            .map_err(UpgradeError::Input)?;
+        Ok(matches!(
+            answer.trim().to_ascii_lowercase().as_str(),
+            "y" | "yes"
+        ))
+    }
+
+    fn latest_release(
+        &mut self,
+        repository: &str,
+        component: Component,
+        current_version: &str,
+    ) -> Result<GithubRelease, UpgradeError> {
+        let client = upgrade_http_client(component, current_version)?;
+        let url = format!("https://api.github.com/repos/{repository}/releases/latest");
+        let response = client
+            .get(url)
+            .header(ACCEPT, GITHUB_API_ACCEPT)
+            .send()
+            .map_err(UpgradeError::LatestRequest)?;
+        read_latest_release(response)
+    }
+
+    fn download(
+        &mut self,
+        component: Component,
+        current_version: &str,
+        asset: &ReleaseAsset,
+    ) -> Result<UpgradeCandidate, UpgradeError> {
+        let client = upgrade_http_client(component, current_version)?;
+        let response = client
+            .get(&asset.download_url)
+            .send()
+            .map_err(UpgradeError::DownloadRequest)?;
+        download_candidate(response, asset)
+    }
+
+    fn candidate_version(
+        &mut self,
+        candidate: &UpgradeCandidate,
+    ) -> Result<UpgradeExecutionStatus, UpgradeError> {
+        let output = Command::new(&candidate.path)
+            .arg("--version")
+            .output()
+            .map_err(UpgradeError::CandidateSpawn)?;
+        Ok(UpgradeExecutionStatus {
+            success: output.status.success(),
+            description: if output.status.success() {
+                String::from_utf8_lossy(&output.stdout).trim().to_owned()
+            } else {
+                output.status.to_string()
+            },
+        })
+    }
+
+    fn install_candidate(
+        &mut self,
+        invocation: &CandidateInvocation,
+    ) -> Result<UpgradeExecutionStatus, UpgradeError> {
+        let status = Command::new(&invocation.path)
+            .args(&invocation.args)
+            .env("TERMD_INSTALL_PREFIX", &invocation.install_prefix)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .map_err(UpgradeError::InstallerSpawn)?;
+        Ok(UpgradeExecutionStatus {
+            success: status.success(),
+            description: status.to_string(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ParsedUpgradeOptions {
+    yes: bool,
+    help: bool,
+    allow_session_loss: bool,
+}
+
+impl ParsedUpgradeOptions {
+    fn parse(component: Component, args: Vec<OsString>) -> Result<Self, UpgradeError> {
+        let mut parsed = Self {
+            yes: false,
+            help: false,
+            allow_session_loss: false,
+        };
+        for argument in args {
+            let raw_argument = argument
+                .to_str()
+                .ok_or_else(|| UpgradeError::UnknownArgument("<non-UTF-8>".to_owned()))?;
+            let (flag, has_inline_value) = match raw_argument.split_once('=') {
+                Some((flag, _)) => (flag, true),
+                None => (raw_argument, false),
+            };
+            match flag {
+                "-h" | "--help" if !has_inline_value => parsed.help = true,
+                "--yes" if !has_inline_value => parsed.yes = true,
+                "--allow-session-loss" if !has_inline_value && component == Component::Termd => {
+                    parsed.allow_session_loss = true;
+                }
+                _ => {
+                    return Err(UpgradeError::UnknownArgument(safe_unknown_argument(flag)));
+                }
+            }
+        }
+        Ok(parsed)
+    }
+}
+
+fn run_upgrade_with(
+    component: Component,
+    options: UpgradeOptions,
+    runtime: &mut dyn UpgradeRuntime,
+) -> Result<(), UpgradeError> {
+    let parsed = ParsedUpgradeOptions::parse(component, options.args)?;
+    if parsed.help {
+        return runtime.write_output(&upgrade_help_text(component));
+    }
+
+    let (os, platform_architecture) = runtime.platform();
+    let architecture = Architecture::detect(os, platform_architecture)?;
+    let current_version = Version::parse(options.version)
+        .map_err(|_| UpgradeError::InvalidCurrentVersion(options.version.to_owned()))?;
+    let repository = runtime.repository()?;
+    validate_repository(&repository)?;
+    runtime.write_output(&format!(
+        "Checking GitHub {repository} for the latest {component} release...\n"
+    ))?;
+    let release = runtime.latest_release(&repository, component, options.version)?;
+    let latest_version = parse_release_version(&release.tag_name)?;
+    if latest_version <= current_version {
+        return runtime.write_output(&format!(
+            "{component} is up to date (current {}, latest {}).\n",
+            current_version, latest_version
+        ));
+    }
+
+    let asset_name = component.release_asset(architecture);
+    let asset = select_release_asset(&release, &asset_name)?;
+    runtime.write_output(&format!(
+        "Upgrade available:\n  component: {component}\n  current: {current_version}\n  latest: {latest_version}\n  asset: {}\n",
+        asset.name
+    ))?;
+
+    if !parsed.yes {
+        if !runtime.is_tty() {
+            return Err(UpgradeError::NonInteractive);
+        }
+        let prompt = if component == Component::Termctl {
+            "Download, verify and install now? [y/N] "
+        } else {
+            "Download, verify, install and restart now? [y/N] "
+        };
+        if !runtime.confirm(prompt)? {
+            return runtime.write_output("Upgrade cancelled; no files or services were changed.\n");
+        }
+    }
+
+    if !runtime.is_root() {
+        let mut command = format!("sudo {component} upgrade");
+        if parsed.yes {
+            command.push_str(" --yes");
+        }
+        if parsed.allow_session_loss {
+            command.push_str(" --allow-session-loss");
+        }
+        return Err(UpgradeError::RootRequired(command));
+    }
+
+    runtime.write_output(&format!("Downloading and verifying {}...\n", asset.name))?;
+    let candidate = runtime.download(component, options.version, &asset)?;
+    let expected_identity = format!("{component} {latest_version}");
+    let candidate_status = runtime.candidate_version(&candidate)?;
+    if !candidate_status.success {
+        return Err(UpgradeError::CandidateVersionFailed(
+            candidate_status.description,
+        ));
+    }
+    if candidate_status.description != expected_identity {
+        return Err(UpgradeError::CandidateIdentity {
+            expected: expected_identity,
+            actual: candidate_status.description,
+        });
+    }
+
+    let install_prefix = resolve_upgrade_prefix(
+        runtime.configured_install_prefix(),
+        &runtime.current_executable(),
+        component,
+    );
+    let mut args = vec![OsString::from("install"), OsString::from("--yes")];
+    if parsed.allow_session_loss {
+        args.push(OsString::from("--allow-session-loss"));
+    }
+    let invocation = CandidateInvocation {
+        path: candidate.path.clone(),
+        args,
+        install_prefix,
+    };
+    let status = runtime.install_candidate(&invocation)?;
+    if !status.success {
+        return Err(UpgradeError::InstallerFailed(status.description));
+    }
+    runtime.write_output(&format!("Upgraded {component} to {latest_version}.\n"))
+}
+
+fn upgrade_help_text(component: Component) -> String {
+    let mut output = format!(
+        "Usage: {component} upgrade [OPTIONS]\n\nChecks the latest yiiilin/termd GitHub release, verifies the selected Linux binary\nwith its release asset SHA-256 digest, then uses that binary's managed installer.\nExisting configuration and state are preserved."
+    );
+    if component == Component::Termctl {
+        output.push_str(" termctl has no managed service to restart.\n");
+    } else {
+        output.push_str(" The managed service is restarted after replacement.\n");
+    }
+    output.push_str(
+        "\nOptions:\n  --yes      Confirm the normal upgrade without prompting\n  -h, --help Show this help\n",
+    );
+    if component == Component::Termd {
+        output.push_str(
+            "  --allow-session-loss  Separately authorize deleting sessions only if supervisor compatibility changed\n\nWithout --allow-session-loss, an incompatible supervisor upgrade still requires a\nsecond interactive confirmation even when --yes is present.\n",
+        );
+    }
+    output.push_str(
+        "\nEnvironment:\n  TERMD_GITHUB_REPO    Override owner/repository for forks or tests\n  TERMD_INSTALL_PREFIX Override the managed installation prefix\n  http_proxy, https_proxy, all_proxy, no_proxy and uppercase variants are honored\n",
+    );
+    output
+}
+
+fn validate_repository(repository: &str) -> Result<(), UpgradeError> {
+    let mut components = repository.split('/');
+    let owner = components.next().unwrap_or_default();
+    let name = components.next().unwrap_or_default();
+    if components.next().is_some()
+        || owner.is_empty()
+        || name.is_empty()
+        || !owner.chars().all(valid_repository_character)
+        || !name.chars().all(valid_repository_character)
+    {
+        return Err(UpgradeError::InvalidRepository);
+    }
+    Ok(())
+}
+
+fn valid_repository_character(character: char) -> bool {
+    character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-')
+}
+
+fn parse_release_version(tag: &str) -> Result<Version, UpgradeError> {
+    let version = tag.strip_prefix('v').unwrap_or(tag);
+    Version::parse(version).map_err(|_| UpgradeError::InvalidLatestVersion(tag.to_owned()))
+}
+
+fn select_release_asset(
+    release: &GithubRelease,
+    expected_name: &str,
+) -> Result<ReleaseAsset, UpgradeError> {
+    let matches = release
+        .assets
+        .iter()
+        .filter(|asset| asset.name == expected_name)
+        .collect::<Vec<_>>();
+    let asset = match matches.as_slice() {
+        [] => return Err(UpgradeError::MissingAsset(expected_name.to_owned())),
+        [asset] => *asset,
+        _ => return Err(UpgradeError::DuplicateAsset(expected_name.to_owned())),
+    };
+    let url = reqwest::Url::parse(&asset.browser_download_url)
+        .map_err(|_| UpgradeError::InvalidAssetUrl(expected_name.to_owned()))?;
+    if url.scheme() != "https"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.host_str().is_none()
+    {
+        return Err(UpgradeError::InvalidAssetUrl(expected_name.to_owned()));
+    }
+    if asset.size > MAX_BINARY_BYTES {
+        return Err(UpgradeError::AssetTooLarge(expected_name.to_owned()));
+    }
+    let digest = parse_sha256_digest(asset.digest.as_deref())
+        .ok_or_else(|| UpgradeError::InvalidAssetDigest(expected_name.to_owned()))?;
+    Ok(ReleaseAsset {
+        name: asset.name.clone(),
+        download_url: asset.browser_download_url.clone(),
+        digest,
+        size: asset.size,
+    })
+}
+
+fn parse_sha256_digest(digest: Option<&str>) -> Option<[u8; 32]> {
+    let hexadecimal = digest?.strip_prefix("sha256:")?;
+    if hexadecimal.len() != 64 || !hexadecimal.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut output = [0_u8; 32];
+    for (index, pair) in hexadecimal.as_bytes().chunks_exact(2).enumerate() {
+        let pair = std::str::from_utf8(pair).ok()?;
+        output[index] = u8::from_str_radix(pair, 16).ok()?;
+    }
+    Some(output)
+}
+
+fn reqwest_error_reason(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "request timed out"
+    } else if error.is_connect() {
+        "connection failed"
+    } else if error.is_redirect() {
+        "redirect was rejected"
+    } else if error.is_decode() {
+        "response decoding failed"
+    } else if error.is_body() {
+        "response body failed"
+    } else if error.is_builder() {
+        "request configuration was invalid"
+    } else {
+        "request failed"
+    }
+}
+
+fn upgrade_http_client(
+    component: Component,
+    current_version: &str,
+) -> Result<Client, UpgradeError> {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let user_agent = HeaderValue::from_str(&format!("{component}/{current_version}"))
+        .unwrap_or_else(|_| HeaderValue::from_static("termd-upgrade"));
+    Client::builder()
+        .user_agent(user_agent)
+        .connect_timeout(Duration::from_secs(20))
+        .timeout(Duration::from_secs(600))
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() < 10
+                && attempt.url().scheme() == "https"
+                && attempt.url().host_str().is_some()
+                && attempt.url().username().is_empty()
+                && attempt.url().password().is_none()
+            {
+                attempt.follow()
+            } else {
+                attempt.stop()
+            }
+        }))
+        .build()
+        .map_err(UpgradeError::HttpClient)
+}
+
+fn read_latest_release(response: Response) -> Result<GithubRelease, UpgradeError> {
+    let status = response.status();
+    if !status.is_success() {
+        return Err(UpgradeError::LatestHttpStatus(status.as_u16()));
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_RELEASE_RESPONSE_BYTES)
+    {
+        return Err(UpgradeError::LatestResponseTooLarge);
+    }
+    let mut bytes = Vec::new();
+    response
+        .take(MAX_RELEASE_RESPONSE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(UpgradeError::LatestRead)?;
+    if bytes.len() as u64 > MAX_RELEASE_RESPONSE_BYTES {
+        return Err(UpgradeError::LatestResponseTooLarge);
+    }
+    serde_json::from_slice(&bytes).map_err(UpgradeError::LatestDecode)
+}
+
+fn download_candidate(
+    response: Response,
+    asset: &ReleaseAsset,
+) -> Result<UpgradeCandidate, UpgradeError> {
+    let status = response.status();
+    if !status.is_success() {
+        return Err(UpgradeError::DownloadHttpStatus(status.as_u16()));
+    }
+    let content_length = response.content_length();
+    if content_length.is_some_and(|length| length > MAX_BINARY_BYTES) {
+        return Err(UpgradeError::DownloadTooLarge(asset.name.clone()));
+    }
+    stage_candidate(response, content_length, asset)
+}
+
+fn stage_candidate(
+    mut reader: impl Read,
+    content_length: Option<u64>,
+    asset: &ReleaseAsset,
+) -> Result<UpgradeCandidate, UpgradeError> {
+    if content_length.is_some_and(|length| length > MAX_BINARY_BYTES) {
+        return Err(UpgradeError::DownloadTooLarge(asset.name.clone()));
+    }
+    let mut temporary_file = NamedTempFile::new().map_err(UpgradeError::TemporaryFile)?;
+    temporary_file
+        .as_file()
+        .set_permissions(fs::Permissions::from_mode(0o600))
+        .map_err(UpgradeError::TemporaryFile)?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut total = 0_u64;
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .map_err(UpgradeError::DownloadRead)?;
+        if read == 0 {
+            break;
+        }
+        total = total
+            .checked_add(read as u64)
+            .ok_or_else(|| UpgradeError::DownloadTooLarge(asset.name.clone()))?;
+        if total > MAX_BINARY_BYTES {
+            return Err(UpgradeError::DownloadTooLarge(asset.name.clone()));
+        }
+        digest.update(&buffer[..read]);
+        temporary_file
+            .write_all(&buffer[..read])
+            .map_err(UpgradeError::TemporaryFile)?;
+    }
+    if asset.size != 0 && total != asset.size {
+        return Err(UpgradeError::DigestMismatch(asset.name.clone()));
+    }
+    let actual: [u8; 32] = digest.finalize().into();
+    if actual != asset.digest {
+        return Err(UpgradeError::DigestMismatch(asset.name.clone()));
+    }
+    temporary_file
+        .flush()
+        .and_then(|_| temporary_file.as_file().sync_all())
+        .map_err(UpgradeError::TemporaryFile)?;
+    temporary_file
+        .as_file()
+        .set_permissions(fs::Permissions::from_mode(0o700))
+        .map_err(UpgradeError::CandidatePermissions)?;
+    Ok(UpgradeCandidate {
+        path: temporary_file.path().to_owned(),
+        _temporary_file: Some(temporary_file),
+    })
+}
+
+fn resolve_upgrade_prefix(
+    configured_prefix: Option<PathBuf>,
+    current_executable: &Path,
+    component: Component,
+) -> PathBuf {
+    if let Some(prefix) = configured_prefix {
+        return prefix;
+    }
+    if current_executable.file_name() == Some(OsStr::new(component.binary_name()))
+        && current_executable.parent().and_then(Path::file_name) == Some(OsStr::new("bin"))
+        && let Some(prefix) = current_executable.parent().and_then(Path::parent)
+    {
+        return prefix.to_owned();
+    }
+    PathBuf::from("/usr/local")
 }
 
 #[cfg(test)]
@@ -1533,5 +2374,515 @@ uname -m >/dev/null
     fn embedded_supervisor_version_is_non_empty() {
         assert!(!supervisor_version().is_empty());
         assert!(!supervisor_version().contains('\n'));
+    }
+
+    struct FakeUpgradeRuntime {
+        tty: bool,
+        root: bool,
+        os: &'static str,
+        architecture: &'static str,
+        repository: String,
+        current_executable: PathBuf,
+        configured_prefix: Option<PathBuf>,
+        confirmation: bool,
+        output: String,
+        latest_calls: usize,
+        download_calls: usize,
+        version_calls: usize,
+        install_calls: usize,
+        release: GithubRelease,
+        download_fails_digest: bool,
+        candidate_status: UpgradeExecutionStatus,
+        installer_status: UpgradeExecutionStatus,
+        invocation: Option<CandidateInvocation>,
+    }
+
+    impl Default for FakeUpgradeRuntime {
+        fn default() -> Self {
+            Self {
+                tty: true,
+                root: true,
+                os: "linux",
+                architecture: "x86_64",
+                repository: DEFAULT_GITHUB_REPO.to_owned(),
+                current_executable: PathBuf::from("/opt/termd/bin/termd"),
+                configured_prefix: None,
+                confirmation: true,
+                output: String::new(),
+                latest_calls: 0,
+                download_calls: 0,
+                version_calls: 0,
+                install_calls: 0,
+                release: fake_release("1.3.0", "termd-linux-amd64"),
+                download_fails_digest: false,
+                candidate_status: UpgradeExecutionStatus {
+                    success: true,
+                    description: "termd 1.3.0".to_owned(),
+                },
+                installer_status: UpgradeExecutionStatus {
+                    success: true,
+                    description: "exit status: 0".to_owned(),
+                },
+                invocation: None,
+            }
+        }
+    }
+
+    impl UpgradeRuntime for FakeUpgradeRuntime {
+        fn is_tty(&self) -> bool {
+            self.tty
+        }
+
+        fn is_root(&self) -> bool {
+            self.root
+        }
+
+        fn platform(&self) -> (&str, &str) {
+            (self.os, self.architecture)
+        }
+
+        fn repository(&self) -> Result<String, UpgradeError> {
+            Ok(self.repository.clone())
+        }
+
+        fn current_executable(&self) -> PathBuf {
+            self.current_executable.clone()
+        }
+
+        fn configured_install_prefix(&self) -> Option<PathBuf> {
+            self.configured_prefix.clone()
+        }
+
+        fn write_output(&mut self, message: &str) -> Result<(), UpgradeError> {
+            self.output.push_str(message);
+            Ok(())
+        }
+
+        fn confirm(&mut self, _prompt: &str) -> Result<bool, UpgradeError> {
+            Ok(self.confirmation)
+        }
+
+        fn latest_release(
+            &mut self,
+            _repository: &str,
+            _component: Component,
+            _current_version: &str,
+        ) -> Result<GithubRelease, UpgradeError> {
+            self.latest_calls += 1;
+            Ok(self.release.clone())
+        }
+
+        fn download(
+            &mut self,
+            _component: Component,
+            _current_version: &str,
+            asset: &ReleaseAsset,
+        ) -> Result<UpgradeCandidate, UpgradeError> {
+            self.download_calls += 1;
+            if self.download_fails_digest {
+                return Err(UpgradeError::DigestMismatch(asset.name.clone()));
+            }
+            Ok(UpgradeCandidate {
+                path: PathBuf::from("/tmp/verified-upgrade-candidate"),
+                _temporary_file: None,
+            })
+        }
+
+        fn candidate_version(
+            &mut self,
+            _candidate: &UpgradeCandidate,
+        ) -> Result<UpgradeExecutionStatus, UpgradeError> {
+            self.version_calls += 1;
+            Ok(self.candidate_status.clone())
+        }
+
+        fn install_candidate(
+            &mut self,
+            invocation: &CandidateInvocation,
+        ) -> Result<UpgradeExecutionStatus, UpgradeError> {
+            self.install_calls += 1;
+            self.invocation = Some(invocation.clone());
+            Ok(self.installer_status.clone())
+        }
+    }
+
+    fn fake_release(version: &str, asset_name: &str) -> GithubRelease {
+        GithubRelease {
+            tag_name: version.to_owned(),
+            assets: vec![GithubAsset {
+                name: asset_name.to_owned(),
+                browser_download_url: format!(
+                    "https://github.com/yiiilin/termd/releases/download/{version}/{asset_name}"
+                ),
+                digest: Some(format!("sha256:{}", "ab".repeat(32))),
+                size: 123,
+            }],
+        }
+    }
+
+    fn upgrade_options(version: &'static str, args: &[&str]) -> UpgradeOptions {
+        UpgradeOptions::new(version, args.iter().copied())
+    }
+
+    #[test]
+    fn recognizes_upgrade_for_all_components() {
+        for component in [Component::Termd, Component::Termctl, Component::Termrelay] {
+            assert!(matches!(
+                Options::from_subcommand("1.2.3", None, ["upgrade", "--help"]),
+                Some(Options::Upgrade(_))
+            ));
+            assert!(ParsedUpgradeOptions::parse(component, vec![OsString::from("--help")]).is_ok());
+        }
+    }
+
+    #[test]
+    fn upgrade_help_has_no_network_or_install_side_effects() {
+        let mut runtime = FakeUpgradeRuntime::default();
+
+        run_upgrade_with(
+            Component::Termd,
+            upgrade_options("1.2.3", &["--help"]),
+            &mut runtime,
+        )
+        .unwrap();
+
+        assert!(runtime.output.contains("Usage: termd upgrade"));
+        assert!(runtime.output.contains("--allow-session-loss"));
+        assert_eq!(runtime.latest_calls, 0);
+        assert_eq!(runtime.download_calls, 0);
+    }
+
+    #[test]
+    fn no_newer_release_exits_without_download() {
+        let mut runtime = FakeUpgradeRuntime {
+            release: fake_release("1.2.3", "termd-linux-amd64"),
+            ..FakeUpgradeRuntime::default()
+        };
+
+        run_upgrade_with(
+            Component::Termd,
+            upgrade_options("1.2.3", &[]),
+            &mut runtime,
+        )
+        .unwrap();
+
+        assert!(runtime.output.contains("is up to date"));
+        assert_eq!(runtime.download_calls, 0);
+        assert_eq!(runtime.install_calls, 0);
+    }
+
+    #[test]
+    fn declined_upgrade_does_not_download_or_modify() {
+        let mut runtime = FakeUpgradeRuntime {
+            confirmation: false,
+            ..FakeUpgradeRuntime::default()
+        };
+
+        run_upgrade_with(
+            Component::Termd,
+            upgrade_options("1.2.3", &[]),
+            &mut runtime,
+        )
+        .unwrap();
+
+        assert!(runtime.output.contains("Upgrade cancelled"));
+        assert_eq!(runtime.download_calls, 0);
+        assert_eq!(runtime.install_calls, 0);
+    }
+
+    #[test]
+    fn non_tty_upgrade_requires_yes_before_download() {
+        let mut runtime = FakeUpgradeRuntime {
+            tty: false,
+            ..FakeUpgradeRuntime::default()
+        };
+
+        let error = run_upgrade_with(
+            Component::Termd,
+            upgrade_options("1.2.3", &[]),
+            &mut runtime,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, UpgradeError::NonInteractive));
+        assert_eq!(runtime.download_calls, 0);
+    }
+
+    #[test]
+    fn unsupported_platform_fails_before_network() {
+        let mut runtime = FakeUpgradeRuntime {
+            os: "macos",
+            architecture: "aarch64",
+            ..FakeUpgradeRuntime::default()
+        };
+
+        let error = run_upgrade_with(
+            Component::Termd,
+            upgrade_options("1.2.3", &["--yes"]),
+            &mut runtime,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, UpgradeError::UnsupportedPlatform { .. }));
+        assert_eq!(runtime.latest_calls, 0);
+    }
+
+    #[test]
+    fn release_requires_exactly_one_asset_with_sha256_digest() {
+        let missing = GithubRelease {
+            tag_name: "1.3.0".to_owned(),
+            assets: Vec::new(),
+        };
+        assert!(matches!(
+            select_release_asset(&missing, "termd-linux-amd64"),
+            Err(UpgradeError::MissingAsset(_))
+        ));
+
+        let mut duplicate = fake_release("1.3.0", "termd-linux-amd64");
+        duplicate.assets.push(duplicate.assets[0].clone());
+        assert!(matches!(
+            select_release_asset(&duplicate, "termd-linux-amd64"),
+            Err(UpgradeError::DuplicateAsset(_))
+        ));
+
+        for digest in [
+            None,
+            Some("sha256:1234".to_owned()),
+            Some("md5:bad".to_owned()),
+        ] {
+            let mut release = fake_release("1.3.0", "termd-linux-amd64");
+            release.assets[0].digest = digest;
+            assert!(matches!(
+                select_release_asset(&release, "termd-linux-amd64"),
+                Err(UpgradeError::InvalidAssetDigest(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn digest_mismatch_stops_before_candidate_execution() {
+        let mut runtime = FakeUpgradeRuntime {
+            download_fails_digest: true,
+            ..FakeUpgradeRuntime::default()
+        };
+
+        let error = run_upgrade_with(
+            Component::Termd,
+            upgrade_options("1.2.3", &["--yes"]),
+            &mut runtime,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, UpgradeError::DigestMismatch(_)));
+        assert_eq!(runtime.version_calls, 0);
+        assert_eq!(runtime.install_calls, 0);
+    }
+
+    #[test]
+    fn staged_candidate_rejects_mismatched_sha256() {
+        let bytes = b"not the authenticated release binary";
+        let asset = ReleaseAsset {
+            name: "termd-linux-amd64".to_owned(),
+            download_url: "https://github.com/example/release".to_owned(),
+            digest: [0_u8; 32],
+            size: bytes.len() as u64,
+        };
+
+        let error = match stage_candidate(io::Cursor::new(bytes), Some(bytes.len() as u64), &asset)
+        {
+            Ok(_) => panic!("mismatched candidate digest was accepted"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, UpgradeError::DigestMismatch(name) if name == asset.name));
+    }
+
+    #[test]
+    fn candidate_version_must_match_component_and_latest_release() {
+        let mut runtime = FakeUpgradeRuntime {
+            candidate_status: UpgradeExecutionStatus {
+                success: true,
+                description: "termrelay 1.3.0".to_owned(),
+            },
+            ..FakeUpgradeRuntime::default()
+        };
+
+        let error = run_upgrade_with(
+            Component::Termd,
+            upgrade_options("1.2.3", &["--yes"]),
+            &mut runtime,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, UpgradeError::CandidateIdentity { .. }));
+        assert_eq!(runtime.install_calls, 0);
+    }
+
+    #[test]
+    fn successful_upgrade_runs_candidate_installer_with_derived_prefix() {
+        let mut runtime = FakeUpgradeRuntime::default();
+
+        run_upgrade_with(
+            Component::Termd,
+            upgrade_options("1.2.3", &["--yes"]),
+            &mut runtime,
+        )
+        .unwrap();
+
+        let invocation = runtime.invocation.unwrap();
+        assert_eq!(
+            invocation.path,
+            PathBuf::from("/tmp/verified-upgrade-candidate")
+        );
+        assert_eq!(invocation.install_prefix, PathBuf::from("/opt/termd"));
+        assert_eq!(
+            invocation.args,
+            ["install", "--yes"]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn explicit_prefix_overrides_installed_binary_path() {
+        let mut runtime = FakeUpgradeRuntime {
+            configured_prefix: Some(PathBuf::from("/srv/termd")),
+            ..FakeUpgradeRuntime::default()
+        };
+
+        run_upgrade_with(
+            Component::Termd,
+            upgrade_options("1.2.3", &["--yes"]),
+            &mut runtime,
+        )
+        .unwrap();
+
+        assert_eq!(
+            runtime.invocation.unwrap().install_prefix,
+            PathBuf::from("/srv/termd")
+        );
+    }
+
+    #[test]
+    fn termctl_rejects_session_loss_flag() {
+        let error = ParsedUpgradeOptions::parse(
+            Component::Termctl,
+            vec![OsString::from("--allow-session-loss")],
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, UpgradeError::UnknownArgument(_)));
+        assert!(!upgrade_help_text(Component::Termctl).contains("--allow-session-loss"));
+    }
+
+    #[test]
+    fn unknown_upgrade_arguments_never_disclose_values() {
+        let inline_secret = "http://proxy-user:proxy-password@proxy.example";
+        let options = UpgradeOptions::new(
+            "1.2.3",
+            [
+                format!("--proxy={inline_secret}"),
+                "bare-token-secret".to_owned(),
+            ],
+        );
+        let options_debug = format!("{options:?}");
+        assert!(!options_debug.contains(inline_secret));
+        assert!(!options_debug.contains("bare-token-secret"));
+
+        let error = ParsedUpgradeOptions::parse(
+            Component::Termd,
+            vec![OsString::from(format!("--proxy={inline_secret}"))],
+        )
+        .unwrap_err();
+        let display = error.to_string();
+        let debug = format!("{error:?}");
+        assert_eq!(display, "unknown upgrade argument: --proxy");
+        assert!(!display.contains(inline_secret));
+        assert!(!debug.contains(inline_secret));
+
+        let error = ParsedUpgradeOptions::parse(
+            Component::Termd,
+            vec![OsString::from("bare-token-secret")],
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "unknown upgrade argument: <argument>");
+        assert!(!format!("{error:?}").contains("bare-token-secret"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_upgrade_argument_uses_safe_placeholder() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let error = ParsedUpgradeOptions::parse(
+            Component::Termd,
+            vec![OsString::from_vec(vec![
+                b'-', b'-', 0xff, b'=', b's', b'e', b'c',
+            ])],
+        )
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "unknown upgrade argument: <non-UTF-8>");
+    }
+
+    #[test]
+    fn yes_never_implies_session_loss_authorization() {
+        let mut runtime = FakeUpgradeRuntime::default();
+
+        run_upgrade_with(
+            Component::Termd,
+            upgrade_options("1.2.3", &["--yes"]),
+            &mut runtime,
+        )
+        .unwrap();
+
+        assert!(
+            !runtime
+                .invocation
+                .unwrap()
+                .args
+                .contains(&OsString::from("--allow-session-loss"))
+        );
+    }
+
+    #[test]
+    fn explicit_termd_session_loss_authorization_is_forwarded() {
+        let mut runtime = FakeUpgradeRuntime::default();
+
+        run_upgrade_with(
+            Component::Termd,
+            upgrade_options("1.2.3", &["--yes", "--allow-session-loss"]),
+            &mut runtime,
+        )
+        .unwrap();
+
+        assert!(
+            runtime
+                .invocation
+                .unwrap()
+                .args
+                .contains(&OsString::from("--allow-session-loss"))
+        );
+    }
+
+    #[test]
+    fn non_root_upgrade_stops_before_download_with_actionable_command() {
+        let mut runtime = FakeUpgradeRuntime {
+            root: false,
+            ..FakeUpgradeRuntime::default()
+        };
+
+        let error = run_upgrade_with(
+            Component::Termd,
+            upgrade_options("1.2.3", &["--yes"]),
+            &mut runtime,
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(error, UpgradeError::RootRequired(command) if command == "sudo termd upgrade --yes")
+        );
+        assert_eq!(runtime.download_calls, 0);
     }
 }

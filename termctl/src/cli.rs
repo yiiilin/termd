@@ -40,7 +40,7 @@ const RECONNECT_MAX_ATTEMPTS: u32 = 30;
     name = "termctl",
     version,
     about = "termd direct WebSocket CLI",
-    after_help = "INSTALLATION:\n  termctl install [OPTIONS]\n  termctl uninstall [OPTIONS]\n\nRun `termctl install --help` or `termctl uninstall --help` for managed installation options."
+    after_help = "INSTALLATION:\n  termctl install [OPTIONS]\n  termctl uninstall [OPTIONS]\n  termctl upgrade [OPTIONS]\n\nRun the managed command with `--help` for installation or upgrade options."
 )]
 pub struct Cli {
     /// 覆盖本地状态文件路径；默认优先 TERMD_CTL_STATE，然后是 $HOME/.termd/termctl-state.json。

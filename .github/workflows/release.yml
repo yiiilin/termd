@@ -9,9 +9,6 @@ permissions:
   contents: write
   packages: write
 
-env:
-  STATIC_TARGET: x86_64-unknown-linux-musl
-
 jobs:
   validate:
     name: validate release metadata
@@ -100,9 +97,22 @@ jobs:
           fi
 
   package:
-    name: build release assets
+    name: build ${{ matrix.asset_arch }} release binaries
     needs: validate
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            asset_arch: amd64
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            asset_arch: arm64
+    env:
+      STATIC_TARGET: ${{ matrix.target }}
+      ASSET_ARCH: ${{ matrix.asset_arch }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -132,11 +142,10 @@ jobs:
           npm ci
           npm run build
 
-      - name: Build release archives
+      - name: Build static release binaries
         run: |
           set -euo pipefail
 
-          tag="${GITHUB_REF_NAME}"
           out_dir="dist/release"
           mkdir -p "$out_dir"
 
@@ -155,73 +164,71 @@ jobs:
             fi
           }
 
-          build_archive() {
+          build_binary() {
             local package="$1"
             local binary="$2"
             cargo build --release --locked --target "$STATIC_TARGET" -p "$package" --bin "$binary"
             local binary_path="target/${STATIC_TARGET}/release/${binary}"
             strip "$binary_path"
             assert_static_binary "$binary_path"
-            install -m 0755 "$binary_path" "$out_dir/${binary}-linux-amd64"
-            local archive="$out_dir/${binary}-${tag}-linux-amd64.tar.gz"
-            tar -C "target/${STATIC_TARGET}/release" -czf "$archive" "$binary"
+            install -m 0755 "$binary_path" "$out_dir/${binary}-linux-${ASSET_ARCH}"
           }
 
-          build_archive termd termd
-          build_archive termrelay termrelay
-          build_archive termctl termctl
+          build_binary termd termd
+          build_binary termrelay termrelay
+          build_binary termctl termctl
 
-          (
-            cd "$out_dir"
-            sha256sum *-linux-amd64 *.tar.gz > checksums.txt
+          expected=(
+            "termd-linux-${ASSET_ARCH}"
+            "termctl-linux-${ASSET_ARCH}"
+            "termrelay-linux-${ASSET_ARCH}"
           )
+          mapfile -t actual < <(find "$out_dir" -maxdepth 1 -type f -printf '%f\n' | sort)
+          mapfile -t expected_sorted < <(printf '%s\n' "${expected[@]}" | sort)
+          diff -u <(printf '%s\n' "${expected_sorted[@]}") <(printf '%s\n' "${actual[@]}")
 
           ls -lah "$out_dir"
 
-      - name: Render installer assets
+      - name: Upload architecture binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-binaries-${{ matrix.asset_arch }}
+          path: dist/release/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: publish release binaries
+    needs: [validate, package]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download architecture binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-binaries-*
+          path: dist/release
+          merge-multiple: true
+
+      - name: Validate exact release asset set
         run: |
           set -euo pipefail
-
-          tag="${GITHUB_REF_NAME}"
-          repo="${GITHUB_REPOSITORY}"
-          python3 - "$tag" "$repo" <<'PY'
-          import pathlib
-          import stat
-          import sys
-
-          tag = sys.argv[1]
-          repo = sys.argv[2]
-          supervisor_version = pathlib.Path("SUPERVISOR_VERSION").read_text().strip()
-          if not supervisor_version:
-              raise SystemExit("SUPERVISOR_VERSION is empty")
-          out_dir = pathlib.Path("dist/release")
-          scripts = [
-              pathlib.Path("scripts/install-termctl.sh"),
-              pathlib.Path("scripts/install-termd.sh"),
-              pathlib.Path("scripts/install-termrelay.sh"),
-          ]
-          common_replacements = {
-              'REPO="${TERMD_GITHUB_REPO:-${GITHUB_REPOSITORY:-}}"': 'REPO="${TERMD_GITHUB_REPO:-' + repo + '}"',
-              'VERSION="${TERMD_VERSION:-}"': 'VERSION="${TERMD_VERSION:-' + tag + '}"',
-          }
-
-          for src in scripts:
-              text = src.read_text()
-              replacements = dict(common_replacements)
-              if src.name == "install-termd.sh":
-                  replacements['REQUIRED_SUPERVISOR_VERSION="${TERMD_REQUIRED_SUPERVISOR_VERSION:-}"'] = (
-                      'REQUIRED_SUPERVISOR_VERSION="${TERMD_REQUIRED_SUPERVISOR_VERSION:-'
-                      + supervisor_version
-                      + '}"'
-                  )
-              for old, new in replacements.items():
-                  if old not in text:
-                      raise SystemExit(f"{src} did not contain expected assignment: {old}")
-                  text = text.replace(old, new, 1)
-              dest = out_dir / src.name
-              dest.write_text(text)
-              dest.chmod(dest.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-          PY
+          expected=(
+            termctl-linux-amd64
+            termctl-linux-arm64
+            termd-linux-amd64
+            termd-linux-arm64
+            termrelay-linux-amd64
+            termrelay-linux-arm64
+          )
+          mapfile -t actual < <(find dist/release -maxdepth 1 -type f -printf '%f\n' | sort)
+          diff -u <(printf '%s\n' "${expected[@]}") <(printf '%s\n' "${actual[@]}")
+          if find dist/release -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.sh' -o -name 'checksums.txt' \) | grep -q .; then
+            printf 'forbidden release asset generated\n' >&2
+            exit 1
+          fi
 
       - name: Publish GitHub release assets
         env:
@@ -243,17 +250,33 @@ jobs:
           fi
           cd dist/release
 
-          files=(*-linux-amd64 *.tar.gz checksums.txt install-*.sh)
+          files=(
+            termctl-linux-amd64
+            termctl-linux-arm64
+            termd-linux-amd64
+            termd-linux-arm64
+            termrelay-linux-amd64
+            termrelay-linux-arm64
+          )
           if gh release view "$tag" >/dev/null 2>&1; then
+            mapfile -t remote_assets < <(gh release view "$tag" --json assets --jq '.assets[].name')
+            for asset in "${remote_assets[@]}"; do
+              case " ${files[*]} " in
+                *" ${asset} "*) ;;
+                *) gh release delete-asset "$tag" "$asset" --yes ;;
+              esac
+            done
             gh release upload "$tag" "${files[@]}" --clobber
             gh release edit "$tag" --title "$tag" --notes-file "$notes_file"
           else
             gh release create "$tag" "${files[@]}" --title "$tag" --notes-file "$notes_file"
           fi
+          mapfile -t published < <(gh release view "$tag" --json assets --jq '.assets[].name' | sort)
+          diff -u <(printf '%s\n' "${files[@]}" | sort) <(printf '%s\n' "${published[@]}")
 
   images:
     name: build and push images
-    needs: [validate, package]
+    needs: [validate, publish]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
