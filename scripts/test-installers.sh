@@ -2376,7 +2376,7 @@ test_installers_reject_non_root_before_install() (
   for script in scripts/install-termd.sh scripts/install-termrelay.sh; do
     if [[ "$EUID" -eq 0 ]]; then
       command -v runuser >/dev/null 2>&1
-      if output="$(runuser -u nobody -- bash "${ROOT_DIR}/${script}" --web 2>&1)"; then
+      if output="$(runuser -u nobody -- bash -s -- --web <"${ROOT_DIR}/${script}" 2>&1)"; then
         printf 'expected %s to reject a non-root install\n' "$script" >&2
         exit 1
       fi
