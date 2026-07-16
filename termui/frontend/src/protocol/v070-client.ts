@@ -80,6 +80,8 @@ async function readBlobArrayBuffer(blob: Blob): Promise<ArrayBuffer> {
   });
 }
 
+export type MetadataDeliveryKind = "snapshot" | "update";
+
 export class V070Client {
   readonly serverId: UUID;
   readonly deviceId: UUID;
@@ -95,7 +97,11 @@ export class V070Client {
   private metadataReconnectTimer?: ReturnType<typeof globalThis.setTimeout>;
   private metadataWaiters: Array<{ resolve: () => void; reject: (error: unknown) => void }> = [];
   private metadataPingWaiters = new Map<number, PendingMetadataPing>();
-  private metadataListeners = new Set<(revision: number, state: WorkspaceMetadataState) => void>();
+  private metadataListeners = new Set<(
+    revision: number,
+    state: WorkspaceMetadataState,
+    deliveryKind: MetadataDeliveryKind,
+  ) => void>();
   private terminalSessionId?: UUID;
   private terminalOpen?: PendingTerminalOpen;
   private terminalGeneration = 0;
@@ -138,10 +144,14 @@ export class V070Client {
 
   async subscribeMetadata(): Promise<void> { await this.ensureMetadata(); }
 
-  watchMetadata(listener: (revision: number, state: WorkspaceMetadataState) => void): () => void {
+  watchMetadata(listener: (
+    revision: number,
+    state: WorkspaceMetadataState,
+    deliveryKind: MetadataDeliveryKind,
+  ) => void): () => void {
     this.metadataListeners.add(listener);
     if (this.metadataRevision !== undefined && this.metadataState !== undefined) {
-      listener(this.metadataRevision, this.metadataState);
+      listener(this.metadataRevision, this.metadataState, "snapshot");
     }
     return () => this.metadataListeners.delete(listener);
   }
@@ -568,7 +578,8 @@ export class V070Client {
     this.metadataReconnectNeeded = false;
     this.clearMetadataReconnectTimer();
     for (const waiter of this.metadataWaiters.splice(0)) waiter.resolve();
-    for (const listener of this.metadataListeners) listener(revision, metadataState);
+    const deliveryKind = message.type === "metadata.snapshot" ? "snapshot" : "update";
+    for (const listener of this.metadataListeners) listener(revision, metadataState, deliveryKind);
   }
 
   private handleTerminal(data: unknown): void {

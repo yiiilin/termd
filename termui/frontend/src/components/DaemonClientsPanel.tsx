@@ -1,52 +1,55 @@
-import { Trash2 } from "lucide-react";
-import type { DaemonClientSummaryPayload, UUID } from "../protocol/types";
+import type { DaemonClientSummaryPayload, SessionSummaryPayload, UUID } from "../protocol/types";
 import { useI18n, type Translate } from "../i18n";
+import { fallbackSessionDisplayName, sessionDisplayName } from "../session-names";
 
 interface DaemonClientsPanelProps {
   clients: DaemonClientSummaryPayload[];
+  sessions: readonly SessionSummaryPayload[];
   currentDeviceId?: UUID;
-  forgettingClientIds?: ReadonlySet<UUID>;
-  onForgetOfflineClient?: (deviceId: UUID) => void;
 }
 
 export function DaemonClientsPanel({
   clients,
+  sessions,
   currentDeviceId,
-  forgettingClientIds,
-  onForgetOfflineClient,
 }: DaemonClientsPanelProps) {
   const { t } = useI18n();
+  const onlineClients = clients.filter((client) => client.online);
+  const sessionNames = new Map(
+    sessions.map((session) => [session.session_id, sessionDisplayName(session)]),
+  );
   return (
     <section className="panel daemon-clients" aria-label={t("clients.panelAria")}>
       <div className="panel-title">{t("clients.title")}</div>
-      {clients.length === 0 ? <div className="empty-list">{t("clients.empty")}</div> : null}
-      {clients.map((client) => {
+      {onlineClients.length === 0 ? <div className="empty-list">{t("clients.empty")}</div> : null}
+      {onlineClients.map((client) => {
         const label = clientLabel(client, currentDeviceId, t);
         const showPeerIp = Boolean(client.peer_ip && client.peer_ip !== label);
-        const forgetting = forgettingClientIds?.has(client.device_id) ?? false;
+        const attachedSessions = client.attached_session_ids.map((sessionId) => ({
+          id: sessionId,
+          name: sessionNames.get(sessionId) ?? fallbackSessionDisplayName(sessionId),
+        }));
         return (
           <div className="client-row" key={client.client_id}>
             <div className="client-row-main">
-              <span className={client.online ? "status-dot online" : "status-dot offline"} aria-hidden="true" />
+              <span className="status-dot online" aria-hidden="true" />
               <strong>{label}</strong>
-              <span>{client.online ? t("clients.online") : t("clients.offline")}</span>
+              <span>{t("clients.online")}</span>
             </div>
-            <div className="client-row-meta">
-              <span>{attachedLabel(client.attached_session_ids, t)}</span>
+            <div
+              className="client-row-meta"
+              aria-label={attachedSessions.length === 0
+                ? t("clients.notViewingSession")
+                : t("clients.viewingSessions", { sessions: attachedSessions.map(({ name }) => name).join(", ") })}
+            >
+              {attachedSessions.length === 0 ? <span>{t("clients.notViewingSession")}</span> : (
+                <>
+                  <span>{t("clients.viewing")}</span>
+                  {attachedSessions.map((session) => <span key={session.id}>{session.name}</span>)}
+                </>
+              )}
               {showPeerIp ? <span>{client.peer_ip}</span> : null}
             </div>
-            {!client.online && onForgetOfflineClient ? (
-              <button
-                type="button"
-                className="icon-button danger client-forget-button"
-                aria-label={t("clients.deleteOffline", { label })}
-                disabled={forgetting}
-                aria-busy={forgetting}
-                onClick={() => onForgetOfflineClient(client.device_id)}
-              >
-                <Trash2 size={15} aria-hidden="true" />
-              </button>
-            ) : null}
           </div>
         );
       })}
@@ -59,14 +62,4 @@ function clientLabel(client: DaemonClientSummaryPayload, currentDeviceId: UUID |
     return t("clients.thisBrowser");
   }
   return client.name?.trim() || client.peer_ip || t("clients.webClient");
-}
-
-function attachedLabel(sessionIds: string[], t: Translate): string {
-  if (sessionIds.length === 0) {
-    return t("clients.detached");
-  }
-  if (sessionIds.length === 1) {
-    return t("clients.attached");
-  }
-  return t("clients.attachedSessions", { count: sessionIds.length });
 }

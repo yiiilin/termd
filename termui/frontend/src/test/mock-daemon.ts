@@ -121,6 +121,7 @@ interface MockDaemonOptions {
   closeSessionUnownedError?: ErrorPayload;
   pingDelayMs?: number;
   metadataPingDelayMs?: number;
+  closeMetadataOnPingNumber?: number;
   sessionTokenExpiresAtMs?: number;
   sessionScopeExpiresAtMs?: number;
 }
@@ -818,6 +819,10 @@ export class MockDaemon {
       if (message.type === "metadata.ping") {
         this.metadataPingMessages += 1;
         this.metadataPingReceivedAtMs.push(Date.now());
+        if (this.metadataPingMessages === this.options.closeMetadataOnPingNumber) {
+          socket.close();
+          return;
+        }
         const sendPong = () => {
           if (socket.readyState !== socket.OPEN) return;
           this.metadataPongSentAtMs.push(Date.now());

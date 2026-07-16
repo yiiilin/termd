@@ -197,8 +197,10 @@ describe("V070Client", () => {
       device,
       transport,
     );
-    const states: Array<{ revision: number; state: any }> = [];
-    const unsubscribe = client.watchMetadata((revision, state) => states.push({ revision, state }));
+    const states: Array<{ revision: number; state: any; deliveryKind: "snapshot" | "update" }> = [];
+    const unsubscribe = client.watchMetadata((revision, state, deliveryKind) => {
+      states.push({ revision, state, deliveryKind });
+    });
 
     transport.onMetadata?.(JSON.stringify({
       type: "metadata.snapshot",
@@ -232,6 +234,11 @@ describe("V070Client", () => {
       type: "metadata.update",
       payload: { revision: 8, state: { sessions: [], clients: [{ device_id: "device-b" }], daemon: { cpu_percent: 2 } } },
     }));
+    const cachedDeliveries: Array<{ revision: number; deliveryKind: "snapshot" | "update" }> = [];
+    const unsubscribeCached = client.watchMetadata((revision, _state, deliveryKind) => {
+      cachedDeliveries.push({ revision, deliveryKind });
+    });
+    unsubscribeCached();
     unsubscribe();
     transport.onMetadata?.(JSON.stringify({
       type: "metadata.update",
@@ -241,6 +248,7 @@ describe("V070Client", () => {
     expect(states).toEqual([
       {
         revision: 7,
+        deliveryKind: "snapshot",
         state: expect.objectContaining({
           clients: [{ device_id: "device-a" }],
           sessions: [
@@ -263,8 +271,13 @@ describe("V070Client", () => {
           ],
         }),
       },
-      { revision: 8, state: expect.objectContaining({ clients: [{ device_id: "device-b" }] }) },
+      {
+        revision: 8,
+        deliveryKind: "update",
+        state: expect.objectContaining({ clients: [{ device_id: "device-b" }] }),
+      },
     ]);
+    expect(cachedDeliveries).toEqual([{ revision: 8, deliveryKind: "snapshot" }]);
   });
 
   it("measures RTT from an echoed metadata ping timestamp instead of snapshot rtt_ms", async () => {
@@ -810,14 +823,18 @@ describe("V070Client", () => {
       device,
       transport,
     );
-    const states: number[] = [];
-    client.watchMetadata((revision) => states.push(revision));
+    const states: Array<{ revision: number; deliveryKind: "snapshot" | "update" }> = [];
+    client.watchMetadata((revision, _state, deliveryKind) => states.push({ revision, deliveryKind }));
     const initial = client.listSessions();
     transport.onMetadata?.(JSON.stringify({
       type: "metadata.snapshot",
       payload: { revision: 1, state: { sessions: [{ session_id: "session-a" }] } },
     }));
     await initial;
+    transport.onMetadata?.(JSON.stringify({
+      type: "metadata.update",
+      payload: { revision: 2, state: { sessions: [{ session_id: "session-a" }] } },
+    }));
 
     transport.onMetadataClose?.();
     await Promise.resolve();
@@ -826,11 +843,15 @@ describe("V070Client", () => {
     expect(transport.reconnectMetadata).toHaveBeenCalledTimes(2);
     transport.onMetadata?.(JSON.stringify({
       type: "metadata.snapshot",
-      payload: { revision: 2, state: { sessions: [{ session_id: "session-b" }] } },
+      payload: { revision: 3, state: { sessions: [{ session_id: "session-b" }] } },
     }));
 
     await expect(client.listSessions()).resolves.toMatchObject({ sessions: [{ session_id: "session-b" }] });
-    expect(states).toEqual([1, 2]);
+    expect(states).toEqual([
+      { revision: 1, deliveryKind: "snapshot" },
+      { revision: 2, deliveryKind: "update" },
+      { revision: 3, deliveryKind: "snapshot" },
+    ]);
     client.close();
   });
 

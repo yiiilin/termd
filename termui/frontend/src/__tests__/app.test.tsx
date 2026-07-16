@@ -6,13 +6,16 @@ import userEvent from "@testing-library/user-event";
 import App, {
   APP_VERSION,
   APP_CONNECTION_TIMEOUT_MS,
+  aiActivityTransitions,
   browserReachableWsUrl,
   isExclusiveMetadataClient,
   DAEMON_LATENCY_POLL_INTERVAL_MS,
   defaultWsUrlFromPage,
   knownServerWsUrlCandidates,
   latencyLevelClass,
+  metadataAiActivityTransitions,
   networkRateFromSamples,
+  notifyAiActivityTransitions,
   pairingWsUrlCandidates,
 } from "../App";
 import { decodeSupervisorTerminalClientFrame } from "../protocol/supervisor-terminal";
@@ -36,6 +39,7 @@ import { MockDaemon } from "../test/mock-daemon";
 import { fallbackSessionDisplayName } from "../session-names";
 import { resetFileEditorDialogMonacoCacheForTests } from "../components/FileEditorDialog";
 import { SessionFilesPanel } from "../components/SessionFilesPanel";
+import { createTranslator } from "../i18n";
 
 const DEFAULT_SESSION_ID = "00000000-0000-0000-0000-000000000401";
 const DEFAULT_SESSION_NAME = fallbackSessionDisplayName(DEFAULT_SESSION_ID);
@@ -49,6 +53,112 @@ describe("metadata effect client ownership", () => {
     expect(isExclusiveMetadataClient(client, replacement, undefined, undefined)).toBe(false);
     expect(isExclusiveMetadataClient(client, client, client, undefined)).toBe(false);
     expect(isExclusiveMetadataClient(client, client, undefined, client)).toBe(false);
+  });
+});
+
+describe("AI activity notifications", () => {
+  const size = { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 };
+  const activity = (state: "idle" | "running" | "attention" | "completed", changedAt: number) => ({
+    kind: "ai" as const,
+    agent: "codex" as const,
+    state,
+    changed_at_ms: changedAt,
+  });
+
+  it("hydrates the first metadata frame and only emits running to non-running transitions", () => {
+    const runningSessions = [
+      { session_id: "one", name: "One", state: "running" as const, size, activity: activity("running", 1) },
+      { session_id: "two", name: "Two", state: "running" as const, size, activity: activity("running", 1) },
+      { session_id: "three", name: "Three", state: "running" as const, size, activity: activity("running", 1) },
+      { session_id: "removed", state: "running" as const, size, activity: activity("running", 1) },
+    ];
+    const settledSessions = [
+      { ...runningSessions[0], activity: activity("completed", 2) },
+      { ...runningSessions[1], activity: activity("attention", 2) },
+      { ...runningSessions[2], activity: activity("idle", 2) },
+      { session_id: "new", state: "running" as const, size, activity: activity("completed", 2) },
+    ];
+
+    expect(metadataAiActivityTransitions("snapshot", undefined, settledSessions)).toEqual([]);
+    expect(metadataAiActivityTransitions("snapshot", runningSessions, settledSessions)).toEqual([]);
+    expect(metadataAiActivityTransitions("update", runningSessions, settledSessions).map(({ session, activity }) => [
+      session.session_id,
+      activity.state,
+    ])).toEqual([
+      ["one", "completed"],
+      ["two", "attention"],
+      ["three", "idle"],
+    ]);
+    expect(metadataAiActivityTransitions("update", settledSessions, settledSessions)).toEqual([]);
+  });
+
+  it("uses independent per-session tags without the background-output throttle", () => {
+    const originalNotification = Object.getOwnPropertyDescriptor(globalThis, "Notification");
+    const calls: Array<{ title: string; options?: NotificationOptions }> = [];
+    class TestNotification {
+      static permission = "granted";
+      constructor(title: string, options?: NotificationOptions) {
+        calls.push({ title, options });
+      }
+    }
+    Object.defineProperty(globalThis, "Notification", {
+      configurable: true,
+      value: TestNotification,
+    });
+    try {
+      const previous = [
+        { session_id: "one", name: "Build", state: "running" as const, size, activity: activity("running", 1) },
+        { session_id: "two", name: "Review", state: "running" as const, size, activity: activity("running", 1) },
+      ];
+      const next = [
+        { ...previous[0], activity: activity("completed", 2) },
+        { ...previous[1], activity: activity("attention", 2) },
+      ];
+
+      notifyAiActivityTransitions(
+        aiActivityTransitions(previous, next),
+        { language: "en-US", theme: "light", notifications: "mentions", mobileShortcuts: [] },
+        createTranslator("en-US"),
+      );
+
+      expect(calls).toEqual([
+        {
+          title: "Termd",
+          options: {
+            body: "Build: Codex finished",
+            tag: "termd-session-activity-one",
+            silent: true,
+          },
+        },
+        {
+          title: "Termd",
+          options: {
+            body: "Review: Codex needs attention",
+            tag: "termd-session-activity-two",
+            silent: true,
+          },
+        },
+      ]);
+
+      notifyAiActivityTransitions(
+        aiActivityTransitions(previous, next),
+        { language: "en-US", theme: "light", notifications: "off", mobileShortcuts: [] },
+        createTranslator("en-US"),
+      );
+      TestNotification.permission = "denied";
+      notifyAiActivityTransitions(
+        aiActivityTransitions(previous, next),
+        { language: "en-US", theme: "light", notifications: "all", mobileShortcuts: [] },
+        createTranslator("en-US"),
+      );
+      expect(calls).toHaveLength(2);
+    } finally {
+      if (originalNotification) {
+        Object.defineProperty(globalThis, "Notification", originalNotification);
+      } else {
+        Reflect.deleteProperty(globalThis, "Notification");
+      }
+    }
   });
 });
 
@@ -1955,7 +2065,7 @@ describe("termui web 工作台", () => {
     expect(daemon.v070MetadataConnections).toBeGreaterThan(0);
   });
 
-  it("收到 metadata pong 一秒后才发起下一次延迟检测", async () => {
+  it("持续在每次 metadata pong 一秒后发起下一次延迟检测", async () => {
     await daemon.stop();
     daemon = await MockDaemon.start({
       token: "secret-token",
@@ -1968,19 +2078,26 @@ describe("termui web 工作台", () => {
       ],
       attachOutput: "termd-e2e-ready\n",
       metadataPingDelayMs: 250,
+      closeMetadataOnPingNumber: 2,
     });
     const user = userEvent.setup();
     render(<App />);
 
     await pairWithInvite(user, daemon);
     await waitForWorkspaceSession();
+    await clickSessionCard(user);
+    await screen.findByText(/termd-e2e-ready/);
     await waitFor(
-      () => expect(daemon.metadataPingReceivedAtMs).toHaveLength(2),
-      { timeout: DAEMON_LATENCY_POLL_INTERVAL_MS + 2_000 },
+      () => expect(daemon.metadataPingReceivedAtMs).toHaveLength(4),
+      { timeout: DAEMON_LATENCY_POLL_INTERVAL_MS * 2 + 1_000 },
     );
-    expect(daemon.metadataPongSentAtMs).toHaveLength(1);
+    expect(daemon.v070MetadataConnections).toBeGreaterThanOrEqual(2);
+    expect(daemon.metadataPongSentAtMs).toHaveLength(2);
     expect(
       daemon.metadataPingReceivedAtMs[1] - daemon.metadataPongSentAtMs[0],
+    ).toBeGreaterThanOrEqual(DAEMON_LATENCY_POLL_INTERVAL_MS);
+    expect(
+      daemon.metadataPingReceivedAtMs[3] - daemon.metadataPongSentAtMs[1],
     ).toBeGreaterThanOrEqual(DAEMON_LATENCY_POLL_INTERVAL_MS);
   });
 
@@ -6796,7 +6913,7 @@ describe("termui web 工作台", () => {
     expect(within(panel).queryByText("stale.log")).toBeNull();
   });
 
-  it("显示 daemon 级客户端和 operator 身份，但不显示客户端光标位置或焦点", async () => {
+  it("Clients 按钮打开仅在线客户端面板并显示其正在查看的会话", async () => {
     const user = userEvent.setup();
     await daemon.stop();
     daemon = await MockDaemon.start({
@@ -6804,6 +6921,13 @@ describe("termui web 工作台", () => {
       sessions: [
         {
           session_id: "00000000-0000-0000-0000-000000000410",
+          name: "Build agent",
+          state: "running",
+          size: { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 },
+        },
+        {
+          session_id: "00000000-0000-0000-0000-000000000411",
+          name: "Review agent",
           state: "running",
           size: { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 },
         },
@@ -6816,7 +6940,10 @@ describe("termui web 工作台", () => {
           online: true,
           connected_at_ms: 1_710_000_000_000,
           last_seen_at_ms: 1_710_000_000_000,
-          attached_session_ids: ["00000000-0000-0000-0000-000000000410"],
+          attached_session_ids: [
+            "00000000-0000-0000-0000-000000000410",
+            "00000000-0000-0000-0000-000000000411",
+          ],
           cursor_session_id: "00000000-0000-0000-0000-000000000410",
           cursor_row: 12,
           cursor_col: 8,
@@ -6853,16 +6980,11 @@ describe("termui web 工作台", () => {
     const clientPanel = await screen.findByLabelText("daemon clients");
     await within(clientPanel).findByText("Clients");
     await within(clientPanel).findByText("192.0.2.41");
-    await within(clientPanel).findByText("198.51.100.9");
     await within(clientPanel).findByText("online");
-    await within(clientPanel).findByText("offline");
-    await within(clientPanel).findByText("attached");
-    await within(clientPanel).findByText("detached");
-
-    const deleteOfflineClient = within(clientPanel).getByRole("button", { name: /Delete offline client/ });
-    await user.dblClick(deleteOfflineClient);
-    await waitFor(() => expect(within(clientPanel).queryByText("198.51.100.9")).toBeNull());
-    expect(screen.queryByText("invalid_envelope")).toBeNull();
+    await within(clientPanel).findByText("Build agent");
+    await within(clientPanel).findByText("Review agent");
+    expect(within(clientPanel).queryByText("198.51.100.9")).toBeNull();
+    expect(within(clientPanel).queryByText("offline")).toBeNull();
   });
 
   it("Session 卡片点击即打开，标题行保留管理按钮", async () => {

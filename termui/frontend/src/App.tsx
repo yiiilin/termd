@@ -16,7 +16,7 @@ import {
   UsersRound,
   X,
 } from "lucide-react";
-import { V070Client } from "./protocol/v070-client";
+import { V070Client, type MetadataDeliveryKind } from "./protocol/v070-client";
 import { ProtocolClientError, toSafeError } from "./protocol/errors";
 import { migrateDeviceCertificate, pairDeviceOverHttp } from "./protocol/pairing-client";
 import { parsePairingQrPayload } from "./protocol/pairing-payload";
@@ -27,6 +27,7 @@ import type {
   EffectiveTheme,
   PairedServerState,
   SafeError,
+  SessionAiActivityPayload,
   SessionCreatedPayload,
   SessionAttachedPayload,
   SessionFileEntryPayload,
@@ -362,7 +363,6 @@ export default function App() {
   const terminalCreateOwnsAttachRef = useRef(false);
   const [newOutputSessionIds, setNewOutputSessionIds] = useState<Set<UUID>>(() => new Set());
   const [daemonClients, setDaemonClients] = useState<DaemonClientSummaryPayload[]>([]);
-  const [forgettingClientIds, setForgettingClientIds] = useState<Set<UUID>>(() => new Set());
   const [clientsOpen, setClientsOpen] = useState(false);
   const [daemonStatus, setDaemonStatus] = useState<DaemonStatusResultPayload | undefined>();
   const [daemonCpuHistory, setDaemonCpuHistory] = useState<number[]>([]);
@@ -524,7 +524,6 @@ export default function App() {
   const suppressMobileTitleClickRef = useRef(false);
   const closingSessionIdsRef = useRef<Set<UUID>>(new Set());
   const closedSessionIdsRef = useRef<Set<UUID>>(new Set());
-  const forgettingClientIdsRef = useRef<Set<UUID>>(new Set());
   const renamingSessionIdRef = useRef<UUID | undefined>(undefined);
   const filesPanelWidthRef = useRef(DEFAULT_FILES_PANEL_WIDTH);
   const filesPanelResizeRef = useRef<{
@@ -562,6 +561,10 @@ export default function App() {
   const effectiveTheme = resolveTheme(preferences.theme, systemTheme);
   const effectiveLocale = resolveLocale(preferences.language);
   const t = useMemo(() => createTranslator(effectiveLocale), [effectiveLocale]);
+  const notificationPreferencesRef = useRef(preferences);
+  const notificationTranslatorRef = useRef(t);
+  notificationPreferencesRef.current = preferences;
+  notificationTranslatorRef.current = t;
   const visibleFileTransferProgress = visibleProgressForSession(attachedSessionId);
   const clearSessionFiles = useCallback(() => {
     fileEditorResetRef.current();
@@ -2874,32 +2877,6 @@ export default function App() {
     [authenticatedWorkspaceClient, handleRefresh, setSafeError],
   );
 
-  const handleForgetOfflineClient = useCallback(
-    async (deviceId: UUID) => {
-      if (forgettingClientIdsRef.current.has(deviceId)) {
-        return;
-      }
-      setError(undefined);
-      forgettingClientIdsRef.current.add(deviceId);
-      setForgettingClientIds((current) => new Set(current).add(deviceId));
-      try {
-        const client = await authenticatedWorkspaceClient();
-        await client.forgetDaemonClient(deviceId);
-        setDaemonClients((current) => current.filter((candidate) => candidate.device_id !== deviceId));
-      } catch (caught) {
-        setSafeError(caught);
-      } finally {
-        forgettingClientIdsRef.current.delete(deviceId);
-        setForgettingClientIds((current) => {
-          const next = new Set(current);
-          next.delete(deviceId);
-          return next;
-        });
-      }
-    },
-    [authenticatedWorkspaceClient, setSafeError],
-  );
-
   const handleTerminalInput = useCallback(
     async (data: string) => {
       // 中文注释：终端输入必须和终端输出落在当前 session 的同一条可靠 WebSocket 上，靠 segment 顺序
@@ -3032,6 +3009,9 @@ export default function App() {
       let client: V070Client | undefined;
       let unsubscribeMetadata: (() => void) | undefined;
       let latencyTimer: number | undefined;
+      let latencyInFlight = false;
+      let latencyRestartPending = false;
+      let previousMetadataSessions: SessionSummaryPayload[] | undefined;
       try {
         client = await authenticatedWorkspaceClient(APP_CONNECTION_TIMEOUT_MS);
         if (!isCurrentMetadataClient()) {
@@ -3043,7 +3023,48 @@ export default function App() {
           return;
         }
         setMetadataReady(true);
-        unsubscribeMetadata = client.watchMetadata((_revision: number, metadata: any) => {
+        const latencyClient = client;
+        const scheduleNextLatencyMeasurement = () => {
+          if (!isCurrentMetadataClient() || latencyTimer !== undefined) {
+            return;
+          }
+          latencyTimer = window.setTimeout(() => {
+            latencyTimer = undefined;
+            if (isPagePaused()) {
+              scheduleNextLatencyMeasurement();
+              return;
+            }
+            latencyRestartPending = false;
+            void measureLatency();
+          }, DAEMON_LATENCY_POLL_INTERVAL_MS);
+        };
+        const measureLatency = async () => {
+          if (isPagePaused() || !isCurrentMetadataClient() || latencyInFlight) {
+            return;
+          }
+          latencyInFlight = true;
+          try {
+            const latencyMs = await latencyClient.measureLatency();
+            if (isCurrentMetadataClient()) {
+              setDaemonNetworkLatencyMs(latencyMs);
+              scheduleNextLatencyMeasurement();
+            }
+          } catch {
+            // The next metadata snapshot restarts measurement after this connection recovers.
+          } finally {
+            latencyInFlight = false;
+            if (
+              latencyRestartPending &&
+              latencyTimer === undefined &&
+              !isPagePaused() &&
+              isCurrentMetadataClient()
+            ) {
+              latencyRestartPending = false;
+              void measureLatency();
+            }
+          }
+        };
+        unsubscribeMetadata = client.watchMetadata((_revision: number, metadata: any, deliveryKind) => {
           if (!isCurrentMetadataClient()) return;
           if (Array.isArray(metadata.clients)) {
             applyDaemonClientsSnapshot(metadata.clients as DaemonClientSummaryPayload[]);
@@ -3054,6 +3075,12 @@ export default function App() {
           if (Array.isArray(metadata.sessions)) {
             const visibleSessions = (metadata.sessions as SessionSummaryPayload[])
               .filter((session) => !closedSessionIdsRef.current.has(session.session_id));
+            notifyAiActivityTransitions(
+              metadataAiActivityTransitions(deliveryKind, previousMetadataSessions, visibleSessions),
+              notificationPreferencesRef.current,
+              notificationTranslatorRef.current,
+            );
+            previousMetadataSessions = visibleSessions;
             const currentAttachedSession = visibleSessions.find(
               (session) => session.session_id === attachedSessionRef.current,
             );
@@ -3068,36 +3095,14 @@ export default function App() {
             setSessionOrder(nextOrder);
             setSessions(orderSessions(sortSessionsNewestFirst(visibleSessions), nextOrder));
           }
+          if (deliveryKind === "snapshot") {
+            latencyRestartPending = true;
+            if (latencyTimer === undefined && !latencyInFlight) {
+              latencyRestartPending = false;
+              void measureLatency();
+            }
+          }
         });
-        const latencyClient = client;
-        const scheduleNextLatencyMeasurement = () => {
-          if (!isCurrentMetadataClient()) {
-            return;
-          }
-          latencyTimer = window.setTimeout(() => {
-            latencyTimer = undefined;
-            if (isPagePaused()) {
-              scheduleNextLatencyMeasurement();
-              return;
-            }
-            void measureLatency();
-          }, DAEMON_LATENCY_POLL_INTERVAL_MS);
-        };
-        const measureLatency = async () => {
-          if (isPagePaused() || !isCurrentMetadataClient()) {
-            return;
-          }
-          try {
-            const latencyMs = await latencyClient.measureLatency();
-            if (isCurrentMetadataClient()) {
-              setDaemonNetworkLatencyMs(latencyMs);
-              scheduleNextLatencyMeasurement();
-            }
-          } catch {
-            // An unanswered ping must not start another measurement on the same connection.
-          }
-        };
-        void measureLatency();
         await new Promise<void>((resolve) => {
           if (abortController.signal.aborted) {
             resolve();
@@ -3756,9 +3761,8 @@ export default function App() {
                   <Suspense fallback={<LazyPanelFallback className="daemon-clients" />}>
                     <DaemonClientsPanel
                       clients={daemonClients}
+                      sessions={sessions}
                       currentDeviceId={state.device?.device_id}
-                      forgettingClientIds={forgettingClientIds}
-                      onForgetOfflineClient={handleForgetOfflineClient}
                     />
                   </Suspense>
                 </div>
@@ -4576,6 +4580,64 @@ function daemonAddressForTitle(rawUrl: string): string {
 
 function terminalSizeDisplay(size: TerminalSize): string {
   return `${size.cols}x${size.rows}`;
+}
+
+export interface SessionAiActivityTransition {
+  session: SessionSummaryPayload;
+  activity: SessionAiActivityPayload;
+}
+
+export function aiActivityTransitions(
+  previousSessions: readonly SessionSummaryPayload[] | undefined,
+  nextSessions: readonly SessionSummaryPayload[],
+): SessionAiActivityTransition[] {
+  if (previousSessions === undefined) {
+    return [];
+  }
+  const previousById = new Map(previousSessions.map((session) => [session.session_id, session]));
+  return nextSessions.flatMap((session) => {
+    const previousActivity = previousById.get(session.session_id)?.activity;
+    const activity = session.activity;
+    if (
+      previousActivity?.state !== "running" ||
+      !activity ||
+      (activity.state !== "idle" && activity.state !== "attention" && activity.state !== "completed")
+    ) {
+      return [];
+    }
+    return [{ session, activity }];
+  });
+}
+
+export function metadataAiActivityTransitions(
+  deliveryKind: MetadataDeliveryKind,
+  previousSessions: readonly SessionSummaryPayload[] | undefined,
+  nextSessions: readonly SessionSummaryPayload[],
+): SessionAiActivityTransition[] {
+  return deliveryKind === "snapshot" ? [] : aiActivityTransitions(previousSessions, nextSessions);
+}
+
+export function notifyAiActivityTransitions(
+  transitions: readonly SessionAiActivityTransition[],
+  preferences: BrowserPreferences,
+  t: Translate,
+): void {
+  if (preferences.notifications === "off" || typeof Notification === "undefined" || Notification.permission !== "granted") {
+    return;
+  }
+  for (const { session, activity } of transitions) {
+    const agent = t(`sessions.activity.agent.${activity.agent}`);
+    const status = t(`sessions.activity.${activity.state}`, { agent });
+    try {
+      new Notification("Termd", {
+        body: t("sessions.activity.notification", { name: sessionDisplayName(session), status }),
+        tag: `termd-session-activity-${session.session_id}`,
+        silent: true,
+      });
+    } catch {
+      // 浏览器通知失败不应影响 metadata 主链路。
+    }
+  }
 }
 
 function maybeNotifyBrowser(
