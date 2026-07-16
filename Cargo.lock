@@ -1857,7 +1857,7 @@ dependencies = [
 
 [[package]]
 name = "termctl"
-version = "0.8.5"
+version = "0.8.6"
 dependencies = [
  "base64",
  "clap",
@@ -1883,7 +1883,7 @@ dependencies = [
 
 [[package]]
 name = "termd"
-version = "0.8.5"
+version = "0.8.6"
 dependencies = [
  "axum",
  "axum-core",
@@ -1924,7 +1924,7 @@ dependencies = [
 
 [[package]]
 name = "termd-proto"
-version = "0.8.5"
+version = "0.8.6"
 dependencies = [
  "base64",
  "serde",
@@ -1934,7 +1934,7 @@ dependencies = [
 
 [[package]]
 name = "terminstall"
-version = "0.8.5"
+version = "0.8.6"
 dependencies = [
  "libc",
  "reqwest",
@@ -1948,7 +1948,7 @@ dependencies = [
 
 [[package]]
 name = "termrelay"
-version = "0.8.5"
+version = "0.8.6"
 dependencies = [
  "axum",
  "axum-core",
@@ -1979,7 +1979,7 @@ dependencies = [
 
 [[package]]
 name = "termweb"
-version = "0.8.5"
+version = "0.8.6"
 dependencies = [
  "axum",
  "brotli",
